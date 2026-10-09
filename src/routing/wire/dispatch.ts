@@ -48,8 +48,8 @@ import {
 import { buildRoleLadder, roleTierOrder, routerTierIds } from "../engine/ladders";
 import { decideRole } from "../engine/kernel";
 import type { Candidate, ChosenDispatch, Decision, HostAgentInfo, Ladder, RoleLadder } from "../engine/types";
-import { classify } from "../classify";
-import type { ClassifyResult, Detection, TaskFacts } from "../classify/types";
+import { CLASS_IMPLIED_NEEDS, FACT_SOURCES, NEEDS, RISKS, SCOPES, TASK_CLASSES, classify, classifyNeedMatches } from "../classify";
+import type { ClassifyResult, Detection, Need, RouteLine, TaskFacts } from "../classify/types";
 import { resolveVerifyBudget, type RouterConfig } from "../../router/config";
 import { resolveEnforcementMode } from "../../router/enforcement";
 import { roleGuardProfile } from "../../router/guard-profile";
@@ -65,7 +65,7 @@ import { execFile } from "node:child_process";
 import { realpathSync } from "node:fs";
 import {
   consumeRunnerDispatch, consumeRunnerDispatchLoose, forgetDispatch, lookupDispatch, rememberDispatch, runnerDescription,
-  type DetectionDepth, type DispatchInput, type DispatchRecord,
+  type CarriedVerification, type DetectionDepth, type DispatchInput, type DispatchRecord,
 } from "../../router/sessions";
 import { randomBytes } from "node:crypto";
 import {
@@ -175,6 +175,11 @@ export interface RoleRouted {
   readonly nextTier: string | null;
   /** The effective task class of the dispatch (re-dispatch signal, handoff 17); null when unknown. */
   readonly class: string | null;
+  /**
+   * QA-G-A1-2: a delegate's dispatch (`decideDelegateRoleDispatch`: unparsed, the floor rung of the local-only window). The adapter
+   * never consumes an authority request on it. Absent for every orchestrator dispatch.
+   */
+  readonly delegate?: true;
 }
 
 /**
@@ -315,6 +320,8 @@ interface RoleCommit {
   readonly outcomes: boolean;
   /** The pending binding entry to register (a fresh dispatch); null on a resume. */
   readonly pending: { readonly nonce: string; readonly grant: DispatchGrant; readonly budget: number; readonly description: string; readonly decisionID: string | null } | null;
+  /** QA-G-B-1: the verification this dispatch carries to its resumes (its own, or the one it carried itself); null: none. */
+  readonly verification: CarriedVerification | null;
 }
 
 /** A committed dispatch, kept until its call ends. */
@@ -580,7 +587,23 @@ export function roleRouterGate(input: {
    */
   readonly outsideWorkRoot?: boolean;
 }): boolean {
-  if (input.bypassed || input.deferred === true || input.outsideWorkRoot === true || input.acceptance !== "deterministic") return false;
+  if (input.deferred === true || input.acceptance !== "deterministic") return false;
+  return roleVerificationRuns(input);
+}
+
+/**
+ * #84 QA-G-B-7: the router's gate verifies this role dispatch at all — `enforcement.mode ≠ off` (env gate included), the router is
+ * not bypassed (`/bypass`), `verify.require ≠ never`, and the requested cwd is not outside the root the gate verifies in
+ * (`outsideWorkRoot`). When it does not, nothing checks the work: the dispatch's detection is `none` (`effectiveDetection`'s
+ * `verifies`), whatever its claim or `[acceptance]` block says. Fails toward "does not run" on any error.
+ */
+export function roleVerificationRuns(input: {
+  readonly cfg: RouterConfig;
+  readonly bypassed: boolean;
+  readonly env?: Readonly<Record<string, string | undefined>>;
+  readonly outsideWorkRoot?: boolean;
+}): boolean {
+  if (input.bypassed || input.outsideWorkRoot === true) return false;
   let mode = "off";
   try {
     mode = resolveEnforcementMode({ config: input.cfg, env: { ...(input.env ?? process.env) } }).mode;
@@ -777,6 +800,8 @@ function placeCallerModel(
 
 /** QA-P21-2-2: the note of a resume raised after a verification FAIL (`raise:verification-fail:<tier>`). */
 export const RESUME_RAISE_NOTE = "raise:verification-fail:";
+/** QA-G-B-1: the note of a resume that carries the `[acceptance]` block of the dispatch it resumes (appended to its prompt). */
+export const CARRIED_ACCEPTANCE_NOTE = "acceptance carried from the resumed dispatch";
 
 /** The higher of two tiers on `order` (unknown or null ones ignored); null when neither is on it. */
 function higherTier(order: readonly string[], a: string | null, b: string | null): string | null {
@@ -788,13 +813,79 @@ function higherTier(order: readonly string[], a: string | null, b: string | null
 
 /**
  * QA-P21-2-1: the grant of a resume of an EXACTLY bound child: what the child holds (its bound grant) plus the actions widened for
- * this resume. Only adds; `router_run` stays withheld without a work root (I9). The work root is the bound one, else the resume's.
+ * this resume. Only adds; `router_run` and `edit` stay withheld from a child bound without a work root (I9, QA-G-B-2). The work root
+ * is the bound one, else the resume's.
  */
 function resumedGrant(boundGrant: DispatchGrant, widened: readonly AuthorityAction[], workRoot: string | null): DispatchGrant {
   const root = boundGrant.workRoot ?? workRoot;
   const actions = new Set<AuthorityAction>([...boundGrant.actions, ...widened]);
-  if (root === null) actions.delete("router_run");
+  if (boundGrant.workRoot === null) {
+    // QA-G-B-2 (R7 null-root contract, I3): a child bound without a validated work root gets no run and no write, whatever root the
+    // resume's own route line names — as binding.ts `widen` (the enforced grant) refuses them.
+    actions.delete("router_run");
+    actions.delete("edit");
+  }
   return { actions, notes: [...boundGrant.notes], workRoot: root };
+}
+
+/** verify/dod.ts `OPEN_TAG_RE` / `CLOSE_TAG_RE`: the lines that open and close an `[acceptance]` block. */
+const ACCEPTANCE_OPEN_LINE = /^\s*\[(acceptance|dod)\]\s*$/i;
+const ACCEPTANCE_CLOSE_LINE = /^\s*\[\/(acceptance|dod)\]\s*$/i;
+/** A whole-line `VERIFY:` / `VERIFY_WAIT:` directive (verify/directives.ts). */
+const VERIFY_DIRECTIVE_LINE = /^\s*VERIFY(?:_WAIT)?\s*:/i;
+
+/**
+ * #84 QA-G-B-1: what a role dispatch's verification is built from — its first `[acceptance]` block, found as verify/dod.ts
+ * `parseAcceptanceBlock` finds it (verbatim lines; null without a closed block), and its whole-line `VERIFY:` / `VERIFY_WAIT:`
+ * directives outside that block.
+ */
+export function verificationParts(prompt: string): { readonly block: string | null; readonly directives: readonly string[] } {
+  const lines = prompt.split(/\r?\n/);
+  const open = lines.findIndex((line) => ACCEPTANCE_OPEN_LINE.test(line));
+  const close = open < 0 ? -1 : lines.findIndex((line, i) => i > open && ACCEPTANCE_CLOSE_LINE.test(line));
+  const inBlock = (i: number): boolean => close >= 0 && i >= open && i <= close;
+  return {
+    block: close < 0 ? null : lines.slice(open, close + 1).join("\n"),
+    directives: lines.flatMap((line, i) => (!inBlock(i) && VERIFY_DIRECTIVE_LINE.test(line) ? [line.trim()] : [])),
+  };
+}
+
+/**
+ * #84 QA-G-B-1 (I2, §2.3): the task facts a role RESUME is decided with. A resume prompt ("continue", "address the findings") is not
+ * the task: the class, confidence, source and needs come from the dispatch it resumes (the registry's record; its needs widened by
+ * the resume's own), and risk/scope are the max of that record and the resume's effective facts (its classification and route line,
+ * raise-only). Without a record the resume's own facts. Values outside the classifier's vocabularies fall back to the resume's.
+ */
+function resumeFactsOf(original: DispatchRecord["facts"] | undefined, current: TaskFacts): TaskFacts {
+  if (original === undefined) return current;
+  const member = <T extends string>(values: readonly T[], value: unknown): value is T => typeof value === "string" && (values as readonly string[]).includes(value);
+  const higher = <T extends string>(order: readonly T[], a: unknown, b: T): T => (member(order, a) && order.indexOf(a) > order.indexOf(b) ? a : b);
+  const needs = Array.isArray(original.needs) ? original.needs : [];
+  return {
+    class: member(TASK_CLASSES, original.class) ? original.class : current.class,
+    risk: higher(RISKS, original.risk, current.risk),
+    scope: higher(SCOPES, original.scope, current.scope),
+    needs: NEEDS.filter((need) => needs.includes(need) || current.needs.includes(need)),
+    confidence: typeof original.confidence === "number" && Number.isFinite(original.confidence) ? original.confidence : current.confidence,
+    source: member(FACT_SOURCES, original.source) ? original.source : current.source,
+  };
+}
+
+/**
+ * #84 QA-G-B-3 (2), a dynamic role's needs (fixed roles, and a dispatch without a route line, unchanged):
+ * - the route line names `needs=` → that list plus the route class's implied needs (`network` ⇒ `shell`) are authoritative;
+ * - the route line names only `class=` → the needs the text itself names (`textNeeds`, never a class's implied ones) plus the
+ *   route class's implied needs: the class the route line replaced takes its implied needs with it (DF-2: "a new file" made the
+ *   rules class `implement`, whose `edit` outlived `class=other`).
+ * Narrow only: the result is intersected with the classifier's needs, so nothing is ever added; the role max still bounds the
+ * grant (`grantFor`).
+ */
+function roleNeedsOf(facts: TaskFacts, line: RouteLine | null, spec: RoleSpec, textNeeds: ReadonlySet<Need>): TaskFacts {
+  if (spec.authority.mode === "fixed" || line === null || (line.needs === undefined && line.class === undefined)) return facts;
+  const keep = new Set<Need>([...(line.needs ?? textNeeds), ...CLASS_IMPLIED_NEEDS[facts.class]]);
+  if (keep.has("network")) keep.add("shell");
+  const needs = NEEDS.filter((need) => keep.has(need) && facts.needs.includes(need));
+  return needs.length === facts.needs.length ? facts : { ...facts, needs };
 }
 
 /** QA-P21-1-1: the note of a delegate's role dispatch (unparsed, floor rung of the unknown-binding window). */
@@ -1029,6 +1120,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       facts: before.facts, agent: before.agent, model: before.model, variant: before.variant, tier: before.tier, acceptance: before.acceptance,
       parentSessionID: before.parentSessionID, attemptId: before.attemptId, decisionID: before.decisionID, step: before.step,
       outcomes: before.outcomes, picked: before.picked, keepExecution: true,
+      ...(before.verification === undefined ? {} : { verification: before.verification }),
     });
   };
 
@@ -1326,61 +1418,102 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     if (prompt === null) throw new RoleDispatchRefusal(agent, ROLE_REFUSALS.noPrompt);
     const description = typeof args.description === "string" ? args.description : "";
     const sessionDirectory = session.directory ?? deps.directory;
-
-    // 1. classify; a malformed first route line refuses the dispatch (handoff 4).
-    const result = await classify({ description, prompt, cwd: sessionDirectory }, rp.classifyDeps);
-    if (result.trace.routeLines.malformed === true) throw new RoleDispatchRefusal(agent, ROLE_REFUSALS.malformed);
-    const routeLine = result.trace.routeLine;
     const resumeID = str(args.sessionID);
     const resumed = resumeID !== null;
 
+    // 1. the route line, from a rules-only pass (never the backend); a malformed first route line refuses the dispatch (handoff 4).
+    const lined = await classify({ description, prompt, cwd: sessionDirectory }, { ...rp.classifyDeps, backend: null });
+    if (lined.trace.routeLines.malformed === true) throw new RoleDispatchRefusal(agent, ROLE_REFUSALS.malformed);
+
     // 2. work root: `root=` from the trace only, text-compared with `git worktree list --porcelain` before any filesystem call.
-    const root = await resolveRoleWorkRoot({ root: routeLine?.root ?? null, sessionDirectory }, workRootDeps);
-
-    // 3. grant (widened actions of a resume recompute the floor, handoff 36). QA-P21-2-1: a resume of an EXACTLY bound child keeps
-    // what that child holds (its bound grant) plus the widened actions — the resume prompt alone ("continue") would lose them.
+    const root = await resolveRoleWorkRoot({ root: lined.trace.routeLine?.root ?? null, sessionDirectory }, workRootDeps);
     const bound = resumeID === null ? undefined : currentBinding(resumeID, { maxOf: (name) => roleMaxActions(rp.roles.get(name)) });
+
+    // 3. classify in the dispatch's own root (QA-G-B-3 (1)): an absolute path inside it is no `external_dir`. A resume of an exactly
+    // bound child is classified in its bound root (QA-P33F1-1-1); without a `root=` (the work root is the session directory) or a
+    // validated one, in the session directory as the host names it.
+    const requestedRoot = root.requested !== null ? root.workRoot : null;
+    const classifyCwd = (bound?.kind === "exact" ? bound.grant.workRoot : null) ?? requestedRoot ?? sessionDirectory;
+    const result = await classify({ description, prompt, cwd: classifyCwd }, rp.classifyDeps);
+    if (result.trace.routeLines.malformed === true) throw new RoleDispatchRefusal(agent, ROLE_REFUSALS.malformed);
+    const routeLine = result.trace.routeLine;
+    // QA-G-B-3 (2): a dynamic role's route line decides its needs (narrow-only). QA-G-B-1: a resume is decided on the facts of the
+    // dispatch it resumes (class, confidence, needs; risk/scope the max with its own, raise-only).
+    const matches = classifyNeedMatches({ description, prompt, cwd: classifyCwd }, rp.classifyDeps);
+    const original = resumeID === null ? undefined : lookupDispatch(resumeID);
+    const ownFacts = effectiveFactsOf({ facts: roleNeedsOf(result.facts, routeLine, rp.spec, new Set(matches.map((m) => m.need))), trace: result.trace });
+    const taskFacts = resumeFactsOf(original?.facts, ownFacts);
+    const classified: ClassifyResult = { ...result, facts: taskFacts };
+    // QA-G-B-3 (3): why each need could be there (before any narrowing), for the decision row's trace.
+    const needTerms = [
+      ...matches.map((m) => `${m.need}:${m.term}`),
+      ...(routeLine?.needs ?? []).map((need) => `${need}:route-line`),
+      // the implied needs of the rules' class and of the final class (the route line's, or the backend's)
+      ...[...new Set([result.trace.rules.class, result.facts.class])].flatMap((cls) => CLASS_IMPLIED_NEEDS[cls].map((need) => `${need}:class=${cls}`)),
+      ...(original === undefined ? [] : original.facts.needs.map((need) => `${need}:resumed-dispatch`)),
+    ];
+
+    // 4. grant (widened actions of a resume recompute the floor, handoff 36). QA-P21-2-1: a resume of an EXACTLY bound child keeps
+    // what that child holds (its bound grant) plus the widened actions — the resume prompt alone ("continue") would lose them.
     const grant: DispatchGrant = bound?.kind === "exact" ? resumedGrant(bound.grant, call.widened ?? [], root.workRoot)
-      : grantFor(rp.spec, result.facts, call.widened ?? [], root.workRoot, routeLine);
+      : grantFor(rp.spec, taskFacts, call.widened ?? [], root.workRoot, routeLine);
 
-    // 4. effective detection (S10/P-9, A34; handoff 5): never `result.detection` as is.
-    const acceptance = detectionOf(prompt);
+    // 5. effective detection (S10/P-9, A34; handoff 5): never `result.detection` as is. QA-G-B-1: a resume that names no
+    // `[acceptance]` block of its own carries the one of the dispatch it resumes (and its `VERIFY:` lines, when it names none), so
+    // the floor and the router's gate see the same acceptance as that dispatch — the block is appended to the resume's prompt.
+    const own = verificationParts(prompt);
+    const carried = resumed && own.block === null ? original?.verification ?? null : null;
+    const carriedText = carried === null ? null : [...(own.directives.length === 0 ? carried.directives : []), carried.block].join("\n");
+    const verifyPrompt = carriedText === null ? prompt : withLastLine(prompt, carriedText);
+    const verification: CarriedVerification | null = own.block !== null
+      ? { block: own.block, directives: own.directives }
+      : carried === null ? null : { block: carried.block, directives: own.directives.length > 0 ? own.directives : carried.directives };
+    const acceptance = detectionOf(verifyPrompt);
+    const bypassed = deps.isBypassed?.(call.sessionID) === true;
+    const env = deps.env === undefined ? {} : { env: deps.env };
+    const verifyRoot = verifyRootOf(grant, sessionDirectory, workRootDeps.realpath);
     const routerGate = roleRouterGate({
-      cfg: rp.cfg, bypassed: deps.isBypassed?.(call.sessionID) === true, acceptance, ...(deps.env === undefined ? {} : { env: deps.env }),
+      cfg: rp.cfg, bypassed, acceptance, ...env,
       // QA-P21-1-2, QA-P21-2 nit 3
-      deferred: roleGateDeferred(rp.cfg, prompt, description, { verifyEnabled: deps.routerVerifyEnabled?.() !== false }),
-      outsideWorkRoot: roleGateOutsideWorkRoot(grant.workRoot, prompt, description, args.cwd), // DF2-F1, QA-P33F1-1-1, nit 3
+      deferred: roleGateDeferred(rp.cfg, verifyPrompt, description, { verifyEnabled: deps.routerVerifyEnabled?.() !== false }),
+      outsideWorkRoot: roleGateOutsideWorkRoot(grant.workRoot, verifyPrompt, description, args.cwd), // DF2-F1, QA-P33F1-1-1, nit 3
     });
-    const detection = effectiveDetection({ routerGate, claim: result.detection, acceptance });
+    // QA-G-B-7: the gate verifies nothing at all (enforcement off, /bypass, `require: never`, a cwd outside the root it verifies in)
+    // → detection `none`.
+    const verifies = roleVerificationRuns({
+      cfg: rp.cfg, bypassed, ...env, outsideWorkRoot: roleGateOutsideWorkRoot(verifyRoot, verifyPrompt, description, args.cwd),
+    });
+    const detection = effectiveDetection({ routerGate, claim: result.detection, acceptance, verifies });
 
-    // 5. bounds on the one role tier order (handoff 9); a resume passes the child's running tier. QA-P21-2-2: the raise recorded
+    // 6. bounds on the one role tier order (handoff 9); a resume passes the child's running tier. QA-P21-2-2: the raise recorded
     // after a verification FAIL of this child (for this parent) is a raise-only floor, like `floorTier`; consumed on success.
     const running = resumeID === null ? null : await runningRungOf(resumeID);
     const tiers = roleTierOrder(rp.cfg, rp.session);
     const raised = resumeID === null ? null : pendingResumeRaise(resumeID, call.sessionID);
     const floorTier = higherTier(tiers, rp.cfg.enforcement?.escalate?.floorTier ?? null, raised);
-    const bounds = tierBounds(rp.spec, grant, result, detection, {
+    const bounds = tierBounds(rp.spec, grant, classified, detection, {
       floorTier,
       runningTier: running?.tier ?? null,
       pinTier: routeLine?.tier ?? null,
       tiers,
     });
 
-    // 6. kernel (handoff 10: kernel.ts / ladders.ts); `dispatch === null` refuses, never a fallback (handoff 6).
+    // 7. kernel (handoff 10: kernel.ts / ladders.ts); `dispatch === null` refuses, never a fallback (handoff 6).
     const ladder = buildRoleLadder({
-      cfg: rp.cfg, facts: result.facts, role: agent, window: bounds, pricing: (model) => rp.catalog.pricing(model), logger: deps.logger, session: rp.session,
+      cfg: rp.cfg, facts: taskFacts, role: agent, window: bounds, pricing: (model) => rp.catalog.pricing(model), logger: deps.logger, session: rp.session,
     });
     const decisionID = `${call.sessionID}:${safeNow(now)}:${instanceNonce}:${++sequence}`;
     const rd = decideRole({
-      classified: result, ladder, detection, engine: rp.engine, routing: rp.routing, store: rp.store,
+      classified, ladder, detection, engine: rp.engine, routing: rp.routing, store: rp.store,
       resume: running === null ? null : { model: running.model, variant: running.variant },
       exploration: { rate: rp.exploration, decisionID },
     });
     if (rd.dispatch === null) throw new RoleDispatchRefusal(agent, ROLE_REFUSALS.noCandidate(bounds.floor, bounds.ceiling, rd.reasons));
 
-    // 7. an explicit caller `model` is kept only inside the bounds, and never over a route-line pin (QA-P21-1-5: the pinned rung,
+    // 8. an explicit caller `model` is kept only inside the bounds, and never over a route-line pin (QA-P21-1-5: the pinned rung,
     // raised to the running rung on a resume, wins); then the host catalog decides whether the variant exists.
     const notes: string[] = [...(root.note === null ? [] : [root.note]), ...grant.notes];
+    if (carried !== null) notes.push(CARRIED_ACCEPTANCE_NOTE);
     // #84 P2.3 (T2.3.3): the row of a resume records the authority it widens (the actions new to this child's grant).
     const widenedNow = (call.widened ?? []).filter((action) => grant.actions.has(action) && bound?.grant.actions.has(action) !== true);
     if (widenedNow.length > 0) notes.push(BINDING_NOTES.widened(widenedNow));
@@ -1392,6 +1525,9 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         ? { candidate: rd.dispatch, code: PIN_OVER_CALLER_REASON }
         : placeCallerModel(ladder, callerRef, rd.dispatch, resumed);
     const picked: Candidate = placed === null ? rd.dispatch : placed.candidate;
+    // QA-G-B nit N1: an explicit caller `model` that wins over an exploration draw makes the dispatch no exploration (a route-line
+    // pin over the caller keeps the kernel's pick, so its draw stands).
+    const explored = rd.explore && (placed === null || placed.code === PIN_OVER_CALLER_REASON);
     const variantPlace = placeInCatalog(ladder, picked, rp.catalog);
     if (variantPlace === null) {
       throw new RoleDispatchRefusal(agent, ROLE_REFUSALS.noCandidate(bounds.floor, bounds.ceiling, [...rd.reasons, VARIANT_NO_CANDIDATE_REASON]));
@@ -1401,16 +1537,18 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     const model = refOf(dispatch.model, finalVariant);
     const tier = dispatch.tier;
 
-    // 8. binding markers (a fresh dispatch only; handoff 31): nonce at the END of the description, nonce line LAST in the prompt.
+    // 9. binding markers (a fresh dispatch only; handoff 31): nonce at the END of the description, nonce line LAST in the prompt.
+    // QA-G-B-1: a resume's carried verification is appended instead (it has no nonce).
     const nonce = resumed ? null : newDispatchNonce();
-    const outPrompt = nonce === null ? result.stripped : withLastLine(result.stripped, noncePromptLine(nonce));
+    const outPrompt = nonce !== null ? withLastLine(result.stripped, noncePromptLine(nonce))
+      : carriedText === null ? result.stripped : withLastLine(result.stripped, carriedText);
     const outDescription = nonce === null ? null : `${description}${nonceTitleSuffix(nonce)}`;
     const routeBudget = routeLine?.budget ?? null;
     const budget = roleGuardProfile(rp.spec, tier, routeBudget).budget;
 
-    // 9. the decision row with the role extension (no row when the engine is static).
+    // 10. the decision row with the role extension (no row when the engine is static).
     const decision = rd.decision;
-    const facts = effectiveFactsOf(result);
+    const facts = taskFacts;
     const cls = facts.class;
     const ran: ChosenDispatch = { agent: { origin: "role", id: agent }, model: dispatch.model, variant: finalVariant };
     let row: DecisionRow | null = null;
@@ -1422,7 +1560,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       const argmin = decision.argmin !== null && decision.argmin.key !== decision.best?.key ? decision.argmin : null;
       const head = resumed
         ? `${RESUME_REASON}: a role dispatch that resumes a child is never switched or explored (A30); engine decision: ${reasonText(decision)}`
-        : rd.explore
+        : explored
           ? `explore: exploration draw (propensity ${rd.propensity}); engine decision: ${reasonText(decision)}`
           : placed !== null
             ? `${placed.code}: the call named model ${callerRef}; engine decision: ${reasonText(decision)}`
@@ -1450,7 +1588,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         reason: `${head}; role @${agent} on ${tier} in ${bounds.floor}..${bounds.ceiling}${extra.length > 0 ? ` [${extra.join("; ")}]` : ""}`,
         step: "dispatch",
         resume: resumed,
-        trace: traceOf(result, argmin),
+        trace: { ...traceOf(result, argmin), needTerms }, // QA-G-B-3 (3)
         detection: {
           effective: detection,
           ...(result.detection !== undefined && result.detection !== null && result.detection !== detection ? { claimed: result.detection } : {}),
@@ -1460,7 +1598,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         tier,
         grant: [...grant.actions].sort(),
         boundsReasons: [...bounds.reasons],
-        explore: rd.explore,
+        explore: explored,
         propensity: rd.propensity,
         ...(binding === undefined ? {} : { binding }),
       };
@@ -1476,7 +1614,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       window: { floor: bounds.floor, ceiling: bounds.ceiling, pinned: bounds.pinned },
       grant,
       workRoot: root.workRoot,
-      verifyRoot: verifyRootOf(grant, sessionDirectory, workRootDeps.realpath),
+      verifyRoot,
       requestedRoot: root.requested,
       notes,
       detection,
@@ -1509,6 +1647,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         tier,
         outcomes: mode !== "static",
         pending: nonce === null ? null : { nonce, grant, budget, description: outDescription ?? description, decisionID: logged },
+        verification,
       },
     });
     trim(decided, MAX_PENDING);
@@ -1573,6 +1712,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       resumeID,
       nextTier: nextRoleTier(tiers, rp.spec.tierRange.ceiling, tier),
       class: null,
+      delegate: true, // QA-G-A1-2: the adapter never consumes an authority request on this path
     };
     rememberRoutedRole(routed);
     return { mode: rp.engine, model, role: routed };
@@ -1687,8 +1827,14 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         }
         if (ran === null) return; // nothing to record a step against
         const { agent, model, variant } = ran;
+        const resumeID = str(final.sessionID);
+        // QA-2.2-R2-1: remember what the registry held for a resumed child, in case the host then rejects the resume.
+        const previous = resumeID === null ? undefined : lookupDispatch(resumeID);
+        // QA-G-B-1: a role resume never overwrites the class the child was dispatched under, so an attempt raised after a FAIL is
+        // recorded (and scored) under the original class.
+        const facts = d.role !== undefined && previous !== undefined ? { ...d.facts, class: previous.facts.class } : d.facts;
         const dispatched: DispatchInput = {
-          facts: d.facts,
+          facts,
           agent,
           model,
           variant,
@@ -1699,12 +1845,10 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
           step: "dispatch",
           picked: d.picked,
           ...(d.role !== undefined && !d.role.outcomes ? { outcomes: false } : {}),
+          ...(d.role?.verification == null ? {} : { verification: d.role.verification }),
         };
         const t = now();
         sweep(t);
-        const resumeID = str(final.sessionID);
-        // QA-2.2-R2-1: remember what the registry held for a resumed child, in case the host then rejects the resume.
-        const previous = resumeID === null ? undefined : lookupDispatch(resumeID);
         const entry: Entry = {
           callID, parentSessionID: d.parentSessionID, agent, description: d.description, input: dispatched, at: t,
           state: resumeID === null ? "waiting" : "resumed",

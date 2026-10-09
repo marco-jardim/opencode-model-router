@@ -6,7 +6,7 @@
  * - Not a role child, or a fixed role → refused (fixed authority is never widened), naming the role to use.
  * - Dynamic role: actions inside the role max (allow − deny; `execute` never) are recorded for the child and
  *   the child is told to stop with `ESCALATE: authority`; actions outside it are refused, naming the role that
- *   has them (egress → `researcher`, …); `router_run` without a bound work root is refused (I9); actions
+ *   has them (egress → `researcher`, …); `router_run` and `edit` without a bound work root are refused (I9, QA-G-B-2); actions
  *   already granted are reported as such. A request needs no binding and no known call: unknown children can
  *   use the ladder.
  * - A replay (every action already on the unattached record) changes nothing and returns the same text.
@@ -124,7 +124,8 @@ export const AUTHORITY_TEXT = {
   execute: "`execute` (Code Mode) is never granted to role agents — dispatch a tier agent explicitly",
   shell: "raw shell is outside roles mode — request `router_run` for repository scripts, or dispatch a tier agent explicitly",
   unknown: `unknown action; requestable: ${REQUESTABLE}`,
-  noWorkRoot: "router_run needs a work root bound to this dispatch (root=) — return `ESCALATE: authority` so the parent re-dispatches with root=",
+  // QA-G-B-2 (R7 null-root contract, I3): `edit` is refused like `router_run` — without a bound work root it would land in the base checkout.
+  noWorkRoot: "router_run and edit need a work root bound to this dispatch (root=) — return `ESCALATE: authority` so the parent re-dispatches with root=",
   outside: (agent: string, role: string | undefined): string => role === undefined
     ? `outside ${agent}'s authority and no role grants it — dispatch a tier agent explicitly`
     : `outside ${agent}'s authority — dispatch \`${role}\` for it`,
@@ -133,6 +134,8 @@ export const AUTHORITY_TEXT = {
     otherCall: "authority request not applied: it belongs to another call than the one being resumed",
     notDynamic: "authority request not applied: the session is no longer a dynamic role",
     notBound: "authority request not applied: the session had no binding when it was resumed — ask again with `router_request_authority`",
+    /** QA-G-A1-2: only the session the request was escalated to (the record's parent) may apply it. */
+    otherParent: "authority request not applied: the session resuming this task is not the one the request was escalated to",
     /** Q1 (P2.1 call site): only an exact binding widens. */
     bindingUnknown: "authority request not applied: binding unknown: dispatch a fresh task",
   },
@@ -307,7 +310,7 @@ export function requestAuthority(childSessionID: string, input: AuthorityRequest
     else if (!max.has(action)) refused.push({ action, reason: AUTHORITY_TEXT.outside(role.agent, roleFor(action, roles)) });
     else if (grant?.actions.has(action)) granted.push(action);
     else if (fixed) refused.push({ action, reason: AUTHORITY_TEXT.fixed(role.agent) });
-    else if (action === "router_run" && !grant?.workRoot) refused.push({ action, reason: AUTHORITY_TEXT.noWorkRoot });
+    else if ((action === "router_run" || action === "edit") && !grant?.workRoot) refused.push({ action, reason: AUTHORITY_TEXT.noWorkRoot });
     else inside.push(action);
   }
   if (inside.length === 0) return done([], granted, false);
@@ -364,22 +367,50 @@ export function discardAuthority(childSessionID: string, callID: string): void {
 }
 
 /**
- * Resume path (P2.1, `execute.before` of a resume of `childSessionID`; `afterCall` = the call being resumed
- * after). Applies the request only when it is attached to `afterCall`: recorded ∩ the current role max →
- * `widen`. The record is cleared in every case — a request widens at most once, on the first resume after its
- * call; a dropped request carries the reason (P2.1 shows it).
+ * What the resume path checks before it applies a request ({@link consumeAuthority} / {@link previewAuthority}).
+ * - `afterCall`: the call being resumed after; the request must be attached to it.
+ * - `parentSessionID` (QA-G-A1-2): the session resuming the child; when given, it must be the record's parent (the session the
+ *   request was escalated to), else the request is dropped with {@link AUTHORITY_TEXT}.dropped.otherParent.
+ * - `exactOnly` (Q1, QA-G-A1-3): a binding that is not `exact` drops the request with {@link AUTHORITY_TEXT}.dropped.bindingUnknown.
  */
-export function consumeAuthority(childSessionID: string, deps: AuthorityDeps, opts: { afterCall: string }): ConsumeResult {
+export interface AuthorityResumeOptions {
+  afterCall: string;
+  parentSessionID?: string;
+  exactOnly?: boolean;
+}
+
+/** The first reason a live record cannot be applied for this resume, or the binding it widens. */
+function resumeCheck(
+  childSessionID: string,
+  record: RequestRecord,
+  deps: AuthorityDeps,
+  opts: AuthorityResumeOptions,
+): { reason: string } | { max: ReadonlySet<AuthorityAction>; binding: Binding } {
+  if (!record.annotated) return { reason: AUTHORITY_TEXT.dropped.notAnnotated };
+  if (opts.parentSessionID !== undefined && record.parentSessionID !== opts.parentSessionID) return { reason: AUTHORITY_TEXT.dropped.otherParent };
+  if (record.callID !== opts.afterCall) return { reason: AUTHORITY_TEXT.dropped.otherCall };
+  const role = deps.roleOf(childSessionID);
+  if (role === undefined || role.authority.mode === "fixed") return { reason: AUTHORITY_TEXT.dropped.notDynamic };
+  const max = roleMax(role);
+  const binding = bindingFor(childSessionID, deps, max);
+  if (binding === undefined) return { reason: AUTHORITY_TEXT.dropped.notBound };
+  if (opts.exactOnly === true && binding.kind !== "exact") return { reason: AUTHORITY_TEXT.dropped.bindingUnknown };
+  return { max, binding };
+}
+
+/**
+ * Resume path (P2.1, `execute.before` of a resume of `childSessionID`; `afterCall` = the call being resumed
+ * after). Applies the request only when it is attached to `afterCall` (and, with the options, escalated to the resuming
+ * session and held by an exact binding): recorded ∩ the current role max → `widen`. The record is cleared in every case — a
+ * request widens at most once, on the first resume after its call; a dropped request carries the reason (P2.1 shows it).
+ */
+export function consumeAuthority(childSessionID: string, deps: AuthorityDeps, opts: AuthorityResumeOptions): ConsumeResult {
   const record = liveRecord(childSessionID);
   if (record === undefined) return { status: "none" };
   state().requests.delete(childSessionID);
-  if (!record.annotated) return { status: "dropped", reason: AUTHORITY_TEXT.dropped.notAnnotated };
-  if (record.callID !== opts.afterCall) return { status: "dropped", reason: AUTHORITY_TEXT.dropped.otherCall };
-  const role = deps.roleOf(childSessionID);
-  if (role === undefined || role.authority.mode === "fixed") return { status: "dropped", reason: AUTHORITY_TEXT.dropped.notDynamic };
-  const max = roleMax(role);
-  const binding = bindingFor(childSessionID, deps, max);
-  if (binding === undefined) return { status: "dropped", reason: AUTHORITY_TEXT.dropped.notBound };
+  const checked = resumeCheck(childSessionID, record, deps, opts);
+  if ("reason" in checked) return { status: "dropped", reason: checked.reason };
+  const { max, binding } = checked;
   const actions = sorted(record.actions).filter((a) => max.has(a));
   const grant = (deps.widen ?? widenBinding)(childSessionID, actions, max);
   return { status: "widened", grant, widened: sorted(grant.actions).filter((a) => !binding.grant.actions.has(a)) };
@@ -399,18 +430,13 @@ export type AuthorityPreview =
 export function previewAuthority(
   childSessionID: string,
   deps: AuthorityDeps,
-  opts: { afterCall: string; exactOnly?: boolean },
+  opts: AuthorityResumeOptions,
 ): AuthorityPreview {
   const record = state().requests.get(childSessionID);
   if (record === undefined || Date.now() - record.at >= AUTHORITY_TTL_MS) return { status: "none" };
-  if (!record.annotated) return { status: "dropped", reason: AUTHORITY_TEXT.dropped.notAnnotated };
-  if (record.callID !== opts.afterCall) return { status: "dropped", reason: AUTHORITY_TEXT.dropped.otherCall };
-  const role = deps.roleOf(childSessionID);
-  if (role === undefined || role.authority.mode === "fixed") return { status: "dropped", reason: AUTHORITY_TEXT.dropped.notDynamic };
-  const max = roleMax(role);
-  const binding = bindingFor(childSessionID, deps, max);
-  if (binding === undefined) return { status: "dropped", reason: AUTHORITY_TEXT.dropped.notBound };
-  if (opts.exactOnly === true && binding.kind !== "exact") return { status: "dropped", reason: AUTHORITY_TEXT.dropped.bindingUnknown };
+  const checked = resumeCheck(childSessionID, record, deps, opts);
+  if ("reason" in checked) return { status: "dropped", reason: checked.reason };
+  const { max, binding } = checked;
   return { status: "widened", widened: sorted(record.actions).filter((a) => max.has(a) && !binding.grant.actions.has(a)) };
 }
 

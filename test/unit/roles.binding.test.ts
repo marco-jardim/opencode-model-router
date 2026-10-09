@@ -225,7 +225,9 @@ describe("bind: the role max bounds every grant", () => {
       expect(acts(b).every((a) => LOCAL.includes(a) && MAX[agent]!.includes(a)), agent).toBe(true);
       if (agent === "implementer") expect([...policy.actions]).toContain("edit"); // what grantFor would give
     }
-    expect(BINDING_NOTES.unknown).toContain("router_request_authority");
+    // QA-G-A1-4 (R8(4)): this pinned the defect — the note sent an unknown binding to the ladder, whose requests are dropped.
+    expect(BINDING_NOTES.unknown).not.toContain("router_request_authority");
+    expect(BINDING_NOTES.unknown).toContain("dispatch a fresh task");
   });
 
   it("a max that is undefined, throws, is missing or holds execute fails closed", async () => {
@@ -486,12 +488,19 @@ describe("widen", () => {
     expect(narrowed.notes).toContain(BINDING_NOTES.beyondMax(["grep", "router_run", "edit"]));
   });
 
-  it("never adds router_run to a binding without a work root (unknown)", async () => {
+  it("never adds router_run or edit to a binding without a work root (unknown, or exact with a null root; QA-G-B-2)", async () => {
     expect((await bind("ses_child", lookup(), OPTS)).kind).toBe("unknown");
     const g = widen("ses_child", ["router_run", "edit"], MAX.implementer!);
-    expect(acts(g)).toEqual([...LOCAL, "edit"]);
+    // QA-G-B-2 (R7 null-root contract): this pinned the defect — `edit` was added to a binding with no work root.
+    expect(acts(g)).toEqual([...LOCAL]);
     expect(g.workRoot).toBeNull();
     expect(g.notes).toContain(BINDING_NOTES.noWorkRoot);
+    registerPending(pending("call_N", { grant: grant(["read"], null) }));
+    expect((await bind("ses_null", lookup(marked(nz("call_N"))), OPTS)).kind).toBe("exact");
+    const exactNull = widen("ses_null", ["edit"], MAX.implementer!);
+    expect(acts(exactNull)).toEqual(["read"]);
+    expect(exactNull.notes).toContain(BINDING_NOTES.noWorkRoot);
+    expect(acts(currentBinding("ses_null", OPTS)!)).toEqual(["read"]);
   });
 
   it("keeps an egress grant egress-only", async () => {

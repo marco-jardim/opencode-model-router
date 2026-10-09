@@ -13,7 +13,7 @@ import ModelRouterPlugin from "../../src/index";
 import type { RouterPluginInput } from "../../src/compat/child-session";
 import { invalidateConfigCache, overridePath, validateConfig, type RouterConfig } from "../../src/router/config";
 import { resolveRoles } from "../../src/router/roles";
-import { markRunnerDispatch, rememberDispatch, resetDispatchRegistry, resetRunnerTokens, runnerDescription } from "../../src/router/sessions";
+import { lookupDispatch, markRunnerDispatch, rememberDispatch, resetDispatchRegistry, resetRunnerTokens, runnerDescription } from "../../src/router/sessions";
 import { TASK_CLASSES } from "../../src/routing/classify/types";
 import { buildRoleLadder, roleTierOrder } from "../../src/routing/engine/ladders";
 import { acquireOutcomes } from "../../src/routing/outcomes";
@@ -21,7 +21,7 @@ import type { DecisionRow, OutcomesBundle } from "../../src/routing/outcomes/typ
 import { resetIngestState } from "../../src/routing/outcomes/ingest";
 import { bind, resetBindingRegistryForTests } from "../../src/routing/roles/binding";
 import {
-  PIN_OVER_CALLER_REASON, RoleDispatchRefusal, VARIANT_NO_CANDIDATE_REASON, createDispatchRouter, pendingResumeRaise, resetDispatchRouting,
+  CARRIED_ACCEPTANCE_NOTE, PIN_OVER_CALLER_REASON, RoleDispatchRefusal, VARIANT_NO_CANDIDATE_REASON, createDispatchRouter, pendingResumeRaise, resetDispatchRouting,
   roleEscalationAfterFail, roleGateDeferred, roleMaxActions, routedRoleOf, type DispatchRouter, type RouteOutcome,
 } from "../../src/routing/wire/dispatch";
 import { createEngineRuntime, type EngineRuntime } from "../../src/routing/wire/runtime";
@@ -358,7 +358,11 @@ describe("QA round 2: the resume path", () => {
     const deterministic = await resume(`continue\n${acceptance}`);
     expect([...deterministic.grant.actions]).toEqual(expect.arrayContaining(["edit", "router_run"]));
     expect(deterministic.tier).toBe("medium"); // write + exec, deterministic
-    expect((await resume("continue")).tier).toBe("heavy"); // write + exec, no detection
+    // QA-G-B-1: this pinned the defect (`heavy`: the resume's own text, "continue", has no acceptance). A resume without its own
+    // [acceptance] carries the resumed dispatch's (and its VERIFY: lines): still write + exec, deterministic → medium.
+    const plain = await resume("continue");
+    expect(plain.detection).toBe("deterministic");
+    expect(plain.tier).toBe("medium");
   });
 
   it("QA-P21-2-2: a raise recorded after a FAIL is applied by that parent's next resume only, once", async () => {
@@ -389,6 +393,107 @@ describe("QA round 2: the resume path", () => {
     expect((await withVerify.router.route(call(withVerify, { agent: "implementer", prompt }))).role!.detection).not.toBe("deterministic");
     const withoutVerify = makeWorld(cfg, { routerVerifyEnabled: () => false });
     expect((await withoutVerify.router.route(call(withoutVerify, { agent: "implementer", prompt }))).role!.detection).toBe("deterministic");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #84 P3.3 global QA round 1 (QA-G-B-1, QA-G-B nit N1)
+// ---------------------------------------------------------------------------
+
+describe("P3.3 global QA round 1: resumes keep the resumed dispatch's facts and acceptance", () => {
+  const maxOf = (cfg: RouterConfig) => (agent: string) => roleMaxActions(resolveRoles(cfg, "v2").get(agent));
+
+  /** A fresh dispatch committed, claimed by `child` and bound exactly to it; the routed outcome. */
+  async function freshChild(world: World, child: string, input: { agent: string; prompt: string; description: string }) {
+    const c = call(world, input);
+    const fresh = await world.router.route(c);
+    world.router.commit(c.callID, applied(input, fresh));
+    world.router.onSessionCreated({ sessionID: child, parentID: "root", agent: input.agent, title: fresh.description });
+    const binding = await bind(child, async () => ({ parentID: "root", agent: input.agent, title: fresh.description!, firstText: fresh.prompt! }), { maxOf: maxOf(world.cfg) });
+    expect(binding.kind).toBe("exact");
+    return fresh;
+  }
+
+  it("QA-G-B-1: a 'continue' resume of a high-risk local child with edit widened is floored on the child's risk (heavy), under its class", async () => {
+    const world = makeWorld(config({ delegation: "roles", engine: "shadow", ...outcomesDir() }));
+    const fresh = await freshChild(world, "child-s", { agent: "general", prompt: "[route class=search risk=high]\nlook at how the parser reports errors", description: "look" });
+    expect([...fresh.role!.grant.actions]).not.toContain("edit");
+    expect(lookupDispatch("child-s")?.facts).toMatchObject({ class: "search", risk: "high" });
+    const resumeInput = { agent: "general", sessionID: "child-s", prompt: "continue" };
+    const rc = { ...call(world, resumeInput), widened: ["edit" as const] };
+    const resumed = await world.router.route(rc);
+    expect([...resumed.role!.grant.actions]).toContain("edit");
+    expect(resumed.role!.window.floor).toBe("heavy"); // write without exec, no detection, risk high (§2.3); was medium on "continue"'s own risk
+    expect(resumed.role!.class).toBe("search");
+    world.router.commit(rc.callID, applied(resumeInput, resumed));
+    const row = (await world.rows()).find((r) => r.decisionID === resumed.decisionID)!;
+    expect(row.facts).toMatchObject({ class: "search", risk: "high" });
+    expect(lookupDispatch("child-s")?.facts).toMatchObject({ class: "search", risk: "high" });
+  });
+
+  it("QA-G-B-1: an attempt raised after a FAIL is recorded under the class the child was dispatched under", async () => {
+    const world = makeWorld(config({ delegation: "roles", engine: "shadow", ...outcomesDir() }));
+    await freshChild(world, "child-f", { agent: "general", prompt: "[route class=search risk=low scope=single]\nfind where the lexer is built", description: "find" });
+    expect(lookupDispatch("child-f")?.tier).toBe("fast");
+    expect(roleEscalationAfterFail(world.cfg, "child-f", "root")).toContain("the router raises it to medium");
+    const resumeInput = { agent: "general", sessionID: "child-f", prompt: "[route class=debug risk=low scope=single]\naddress the findings" };
+    const rc = call(world, resumeInput);
+    const raised = await world.router.route(rc);
+    expect(raised.role!.tier).toBe("medium");
+    expect(raised.role!.class).toBe("search");
+    world.router.commit(rc.callID, applied(resumeInput, raised));
+    expect(lookupDispatch("child-f")).toMatchObject({ tier: "medium", facts: { class: "search" } });
+  });
+
+  it("QA-G-B-1: a budget resume ('continue and finish') of a write+exec child with deterministic acceptance keeps the original floor and is verified on it", async () => {
+    const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+    const acceptance = `[acceptance]\ncheck: fileExists path=${join(world.main, "out.txt")}\n[/acceptance]`;
+    const fresh = await freshChild(world, "child-w", {
+      agent: "implementer", description: "build",
+      prompt: `[route class=implement risk=low scope=single needs=edit,shell root=${world.main}]\nVERIFY: required\nbuild the generator and run its script\n${acceptance}`,
+    });
+    expect([...fresh.role!.grant.actions]).toEqual(expect.arrayContaining(["edit", "router_run"]));
+    expect(fresh.role!.detection).toBe("deterministic");
+    expect(fresh.role!.window.floor).toBe("medium"); // write + exec, deterministic
+    expect(lookupDispatch("child-w")?.verification).toEqual({ block: acceptance, directives: ["VERIFY: required"] });
+    const resumeInput = { agent: "implementer", sessionID: "child-w", prompt: "continue and finish" };
+    const rc = call(world, resumeInput);
+    const resumed = await world.router.route(rc);
+    expect(resumed.role!.detection).toBe("deterministic");
+    expect(resumed.role!.window.floor).toBe("medium"); // was heavy: write + exec without detection
+    expect(resumed.role!.notes).toContain(CARRIED_ACCEPTANCE_NOTE);
+    // The router's gate verifies the resume on the same acceptance: it is carried in the prompt the host runs.
+    expect(resumed.prompt).toBe(`continue and finish\nVERIFY: required\n${acceptance}`);
+    world.router.commit(rc.callID, applied(resumeInput, resumed));
+    expect(lookupDispatch("child-w")?.verification).toEqual({ block: acceptance, directives: ["VERIFY: required"] }); // a 2nd resume carries it too
+    // A resume naming its own acceptance keeps its own (nothing carried).
+    const own = await world.router.route(call(world, { agent: "implementer", sessionID: "child-w", prompt: "fix it\n[acceptance]\ncriteria: the generator runs\n[/acceptance]" }));
+    expect(own.prompt).toBeUndefined();
+    expect(own.role!.notes).not.toContain(CARRIED_ACCEPTANCE_NOTE);
+  });
+
+  it("QA-G-B nit N1: an explicit caller model that wins after an exploration draw is recorded as no exploration", async () => {
+    const world = makeWorld(config({ delegation: "roles", engine: "enforce", exploration: { rate: 0.2 }, ...outcomesDir() }));
+    const medium = tierRef(world.cfg, "medium");
+    // explorer (fast..medium), class review: the static default is medium, the floor fast — the draw can go down to fast.
+    const prompt = `[route class=review risk=low scope=single]\nVERIFY: required\nreview the parser\n[acceptance]\ncheck: fileExists path=${join(world.main, "x.txt")}\n[/acceptance]`;
+    const ids: string[] = [];
+    for (let i = 0; i < 60; i++) {
+      const input = { agent: "explorer", prompt, model: medium };
+      const c = call(world, input);
+      const outcome = await world.router.route(c);
+      expect(outcome.model).toBe(medium); // the caller's model wins every time
+      world.router.commit(c.callID, applied(input, outcome));
+      ids.push(outcome.decisionID!);
+    }
+    const rows = (await world.rows()).filter((r) => ids.includes(r.decisionID));
+    expect(rows).toHaveLength(60);
+    const drawn = rows.filter((r) => /[[;] ?explore[;\]]/.test(r.reason)); // the kernel's own draw (its reason list)
+    expect(drawn.length).toBeGreaterThan(0);
+    for (const row of rows) {
+      expect(row.explore).toBe(false);
+      expect(row.reason.startsWith("kept:caller-model")).toBe(true);
+    }
   });
 });
 

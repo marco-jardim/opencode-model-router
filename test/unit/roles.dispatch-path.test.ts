@@ -330,16 +330,22 @@ describe("role dispatch path", () => {
     if (ref.includes("#")) expect(outcome.role!.notes.some((note) => note.includes("is not in the host catalog"))).toBe(true);
   });
 
-  it("effective detection: deterministic only when the router's gate runs the acceptance checks (S10/P-9)", async () => {
+  it("effective detection: deterministic only when the router's gate runs the acceptance checks (S10/P-9); none when nothing verifies (QA-G-B-7)", async () => {
     const prompt = `[route class=implement risk=low scope=single needs=edit d=deterministic]\nchange x\n[acceptance]\ncheck: fileExists path=${PACKAGE_JSON}\n[/acceptance]`;
     const on = makeWorld({ delegation: "roles", engine: "static" });
     expect((await on.router.route(call(on, { agent: "implementer", prompt }))).role!.detection).toBe("deterministic");
+    // QA-G-B-7: these three pinned the defect (`grader`) — enforcement off, /bypass and `require: never` run no verification at all.
     const off = makeWorld({ delegation: "roles", engine: "static" }, { extra: { enforcement: { mode: "off" } } });
-    expect((await off.router.route(call(off, { agent: "implementer", prompt }))).role!.detection).toBe("grader");
+    expect((await off.router.route(call(off, { agent: "implementer", prompt }))).role!.detection).toBe("none");
     const bypassed = makeWorld({ delegation: "roles", engine: "static" }, { bypassed: true });
-    expect((await bypassed.router.route(call(bypassed, { agent: "implementer", prompt }))).role!.detection).toBe("grader");
+    expect((await bypassed.router.route(call(bypassed, { agent: "implementer", prompt }))).role!.detection).toBe("none");
     const never = makeWorld({ delegation: "roles", engine: "static" }, { extra: { enforcement: { verify: { require: "never" } } } });
-    expect((await never.router.route(call(never, { agent: "implementer", prompt }))).role!.detection).toBe("grader");
+    expect((await never.router.route(call(never, { agent: "implementer", prompt }))).role!.detection).toBe("none");
+    // A gate that runs but cannot back `deterministic` (a criteria-only block: the checker) stays `grader`.
+    const criteria = `[route class=implement risk=low scope=single needs=edit d=grader]\nchange x\n[acceptance]\ncriteria: the change is minimal\n[/acceptance]`;
+    expect((await on.router.route(call(on, { agent: "implementer", prompt: criteria }))).role!.detection).toBe("grader");
+    // …and a cwd outside the root the gate verifies in runs nothing either (the gate refuses it: unverifiable).
+    expect((await on.router.route(call(on, { agent: "implementer", prompt: criteria, cwd: on.outside }))).role!.detection).toBe("none");
   });
 
   it("a delegate's dispatch is not parsed, but runs on the floor rung of the local-only window (QA-P21-1-1)", async () => {
@@ -350,6 +356,51 @@ describe("role dispatch path", () => {
     expect(outcome.description).toBeUndefined(); // no nonce, no pending entry
     expect(outcome.role!.tier).toBe("fast");
     expect(outcome.model).toBe(tierRef(world.cfg, "fast"));
+  });
+
+  // #84 P3.3 DF-2 (live): the authority-ladder probe dispatched `general` into a sibling worktree; the classifier ran in the SESSION
+  // directory, so the probe file's absolute path inside the worktree read as `external_dir`.
+  it("QA-G-B-3: the DF-2 ladder probe — classified in its own root: no edit, no external_dir, a local grant; the matched need terms are traced", async () => {
+    const world = makeWorld({ delegation: "roles", engine: "shadow" });
+    const file = join(world.worktree, "tmp.txt");
+    const prompt = `[route class=other risk=low scope=single root=${world.worktree}]\nPut the text \`ladder ok\` into a new file named ${file} using your file tool. `
+      + "If your file tool is refused, do not paste the text anywhere else: call router_request_authority for the action you need and stop.";
+    const input = { agent: "general", prompt, description: "ladder probe" };
+    const c = call(world, input);
+    const outcome = await world.router.route(c);
+    expect(outcome.role!.workRoot).toBe(world.worktree);
+    expect([...outcome.role!.grant.actions]).toEqual(["read", "glob", "grep", "router_git"]);
+    world.router.commit(c.callID, applied(input, outcome));
+    const row = (await world.rows()).find((r) => r.decisionID === outcome.decisionID)!;
+    expect(row.facts.needs).toEqual([]); // was ["edit", "external_dir"]
+    expect(row.grant).toEqual(["glob", "grep", "read", "router_git"]);
+    // "a new file" made the rules class `implement`; `class=other` replaced it, and its implied edit with it.
+    expect(row.trace?.needTerms).toEqual(["edit:class=implement"]);
+    // The same path outside the work root is still `external_dir` (and traced).
+    const elsewhere = call(world, { agent: "general", prompt: prompt.replace(file, join(world.outside, "tmp.txt")), description: "elsewhere" });
+    const out = await world.router.route(elsewhere);
+    world.router.commit(elsewhere.callID, applied({ agent: "general", prompt, description: "elsewhere" }, out));
+    const outRow = (await world.rows()).find((r) => r.decisionID === out.decisionID)!;
+    expect(outRow.facts.needs).toEqual(["external_dir"]);
+    expect(outRow.trace?.needTerms).toEqual([`external_dir:${join(world.outside, "tmp.txt")}`, "edit:class=implement"]);
+  });
+
+  it("QA-G-B-3: a dynamic role's route-line needs= is authoritative, narrow-only; the text's terms are traced; a fixed role is unchanged", async () => {
+    const world = makeWorld({ delegation: "roles", engine: "shadow" });
+    const text = "Read the release notes and write a short summary into your answer only.";
+    const narrowed = call(world, { agent: "general", prompt: `[route class=other risk=low scope=single needs=web]\n${text}` });
+    const outcome = await world.router.route(narrowed);
+    expect([...outcome.role!.grant.actions]).not.toContain("edit"); // the text's "write" no longer adds edit
+    world.router.commit(narrowed.callID, applied(narrowed.args, outcome));
+    const row = (await world.rows()).find((r) => r.decisionID === outcome.decisionID)!;
+    expect(row.facts.needs).toEqual(["web"]);
+    expect(row.trace?.needTerms).toEqual(expect.arrayContaining(["edit:write", "web:route-line"]));
+    // Without needs= the classifier's union stands (unchanged): the text's edit need grants edit.
+    const union = await world.router.route(call(world, { agent: "general", prompt: `[route class=other risk=low scope=single]\n${text}` }));
+    expect([...union.role!.grant.actions]).toContain("edit");
+    // The route class's implied needs stay: class=implement keeps edit even when needs= names only shell.
+    const implied = await world.router.route(call(world, { agent: "general", prompt: `[route class=implement risk=low scope=single needs=shell]\nrun the build and fix it` }));
+    expect([...implied.role!.grant.actions]).toEqual(expect.arrayContaining(["edit", "router_run"]));
   });
 });
 

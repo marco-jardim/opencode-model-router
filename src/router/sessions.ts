@@ -618,6 +618,16 @@ export function createSessionStore(options: SessionStoreOptions = {}) {
 /** `routing.detection` keys: how strongly the dispatch's acceptance checks detect a failure (D8). */
 export type DetectionDepth = "deterministic" | "grader" | "none";
 
+/**
+ * #84 QA-G-B-1: what a role dispatch's verification was built from — the first `[acceptance]` block of its prompt (verbatim lines)
+ * and its whole-line `VERIFY:` / `VERIFY_WAIT:` directives — so a resume that names none of its own ("continue and finish") is
+ * verified, and its tier floor computed, on the same acceptance as the dispatch it resumes.
+ */
+export interface CarriedVerification {
+  readonly block: string;
+  readonly directives: readonly string[];
+}
+
 export interface DispatchInput {
   /** Typed task facts of the dispatch (1.2 `TaskFacts` is assignable). */
   facts: DecisionFacts;
@@ -659,6 +669,8 @@ export interface DispatchInput {
    * resume or a ladder attempt is a new execution and starts from nothing.
    */
   keepExecution?: boolean;
+  /** #84 QA-G-B-1, role dispatches only: the verification its resumes carry ({@link CarriedVerification}). Absent: none. */
+  verification?: CarriedVerification | null;
 }
 
 export interface DispatchRecord {
@@ -680,6 +692,8 @@ export interface DispatchRecord {
   /** See `DispatchInput.outcomes`: false = ingestion was off where this child was registered. */
   readonly outcomes: boolean;
   readonly registeredAt: number;
+  /** See `DispatchInput.verification`; present only on a role dispatch that carries one. */
+  readonly verification?: CarriedVerification;
 }
 
 interface DispatchSlot {
@@ -749,6 +763,10 @@ export function rememberDispatch(
     step: input.step ?? "dispatch",
     outcomes: input.outcomes ?? true,
     registeredAt: nowMs,
+    // Only when there is one: every other record keeps its exact shape.
+    ...(input.verification === undefined || input.verification === null
+      ? {}
+      : { verification: Object.freeze({ block: input.verification.block, directives: Object.freeze([...input.verification.directives]) }) }),
   });
   // Delete first so a re-registration moves to the young end of the insertion order.
   // QA-2.3-1a: a registration of the same execution keeps what was observed of it (see `DispatchInput.keepExecution`).

@@ -306,6 +306,7 @@ function readTrace(x: unknown): DecisionTrace | undefined {
     backend,
     ...(x.backendSkipped === "credentials" ? { backendSkipped: "credentials" as const } : {}),
     ...(argmin === null ? {} : { argmin }),
+    ...(isStringArray(x.needTerms) ? { needTerms: [...x.needTerms] } : {}),
   };
 }
 function readLadderStep(x: unknown): (typeof LADDER_STEP_KINDS)[number] | null {
