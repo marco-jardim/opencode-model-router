@@ -1330,6 +1330,17 @@ describe("docs drift: #84 P3.3 global QA (R9, R10)", () => {
     expect(adr).toContain("amendments R0–R10 and adversarial QA");
     expect(adr).not.toContain("amendments R0–R8");
   });
+
+  it("the README's v1-freeze note links to the 2.5.0 release, whose first `### Changed` holds the freeze entry", () => {
+    const readme = read("README.md");
+    expect(readme).toContain("[changelog entry](CHANGELOG.md#250---2026-10-09)");
+    expect(readme).not.toContain("CHANGELOG.md#unreleased");
+    const changelog = read("CHANGELOG.md").replace(/\r\n/g, "\n");
+    expect(anchorsOf(changelog).has("250---2026-10-09")).toBe(true);
+    const release = /^## \[2\.5\.0\] - 2026-10-09$([\s\S]*?)^## \[/m.exec(changelog)?.[1] ?? "";
+    const firstChanged = release.split(/^### /m).find((section) => /^Changed\n/.test(section)) ?? "";
+    expect(firstChanged).toContain("OpenCode v1 support is in feature freeze");
+  });
 });
 
 // ---------------------------------------------------------------------------

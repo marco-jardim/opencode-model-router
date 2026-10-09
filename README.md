@@ -278,7 +278,7 @@ function from `src/index.ts`. Existing v1 configuration does not need to change.
 > **OpenCode v1: feature freeze.** Since 2026-10-09, v1 support gets fixes for
 > regressions and security issues only. Every new feature targets OpenCode v2 and
 > stays inert on v1 (at most one notice, no behaviour), as roles mode already does.
-> See the [changelog entry](CHANGELOG.md#unreleased).
+> See the [changelog entry](CHANGELOG.md#250---2026-10-09).
 
 Routing, tool guards and verification use the same engine on both versions. V2
 uses its native `subagent` tool to create real child sessions, preserving the

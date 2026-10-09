@@ -67,4 +67,10 @@ On `msd/main` after the merge (`de35c9d`): 14 touched files incl. goldens, 642 p
 ## Verdict
 
 P3.1 DONE: 0 open blocking/critical/major. Residuals: GA-3 (other-directory session), C-7 (selector from source),
-A13a (bare package name after publish: gate for closing #90).
+A13a (bare package name after publish: gate for closing #90), and the owner check whether the empty composer box
+adds a blank line above the prompt in the main session (post-release; a gap is fixed in 2.5.1).
+
+## Release review (P3.2, heavy reviewer, `8b7fab5`)
+
+RELEASABLE. F1 README v1-freeze link moved to `CHANGELOG.md#250---2026-10-09` with a docs-drift pin; F2 added to the
+residuals above; F3 accepted (2.0.20–2.0.23 behaviour is in `docs/TUI_STATUS.md`); F4, F5 plan text fixed.

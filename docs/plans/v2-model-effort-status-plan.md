@@ -359,7 +359,7 @@ Evidence: `D:\git\omr-msd-main\docs\qa\model-effort-status\spikes.md`.
   fixed in a 2.5.1 before closing. (b) T2.1.2 is satisfied by CI `smoke-keyless` (OpenCode 1.18.19, `smoke:keyless`) on
   the PR head instead of a local `smoke:v1` with 1.18.35: the local v1 smokes are not env-isolated (follow-up issue).
   (c) A1 refinements in code: a call timeout (10 s) retries with the `unavailable` backoff, other errors pause the
-  session for 30 s; while a session runs and no effort was answered yet, up to 3 quick re-pulls 1 s apart; a reopened
+  session for 30 s; while a delegated session runs and no effort was answered yet, up to 3 quick re-pulls 1 s apart (root sessions keep the normal cadence); a reopened
   view starts from the session's last answer. A3 refinement: an applied effort recorded on a turn that ran with a
   variant is stale for G1 (`effort default`). (d) DF-1 did not write the owner's TUI config: the server config already
   lists the package, so the TUI auto-loads (A4). (e) The effort-channel registration no longer delays setup (started,
