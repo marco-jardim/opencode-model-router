@@ -12,6 +12,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking (requirement): Node.js 20 is no longer supported.** Node.js 20 reached end-of-life in April 2026; the
   minimum is now Node.js 22 (`engines.node` is `>=22`, and the CI matrix runs Node 22 and 24).
 
+### Fixed
+
+- A file edited by another writer during verification (for example LF lines appended to a CRLF file) could be
+  misreported as a checkout line-ending conversion, which made the reference approximate and turned a provable
+  rejection into an unverifiable result. The drift diff is now re-taken, limited to those paths, before they are
+  flagged. A re-diffed path gets the dependency and workspace-link drift checks and is then judged like any file
+  edited after dispatch: it is flagged only when the reference's checkout converted it (still the case under
+  `* text=auto` with native CRLF), and a failed re-diff keeps the flag (#88).
+
 ## [2.6.1] - 2026-10-09
 
 ### Fixed

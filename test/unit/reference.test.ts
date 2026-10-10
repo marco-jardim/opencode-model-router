@@ -780,6 +780,27 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
     await expectCleanConversion(["a.txt"]);
   });
 
+  it("#88: a successful re-diff never clears a real conversion (QA-1.5-18 file, no concurrent edit, stays flagged)", async () => {
+    await fsp.rm(join(repo, "a.txt"));
+    await git(repo, "-c", "core.autocrlf=true", "checkout", "--", "a.txt");
+    await new Promise((r) => setTimeout(r, 1100)); // not racily clean
+    await git(repo, "-c", "core.autocrlf=true", "update-index", "--refresh");
+    const ref = await capture();
+    let diffs = 0;
+    const counting: CaptureDeps["argv"] = async (cmd, args, o) => {
+      if (args.includes("diff") && args.includes("--no-ext-diff")) diffs++;
+      return argv(cmd, args, o);
+    };
+    const handle = await mat(ref, { argv: counting });
+    try {
+      expect(handle.exact).toBe(false);
+      expect(handle.inexactReasons).toContainEqual({ cause: "checkout-conversion", path: "a.txt" });
+      expect(diffs).toBe(2);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
   it("QA-1.5-18: GIT_LITERAL_PATHSPECS=1 in the environment does not disable the eol check", async () => {
     await fsp.writeFile(join(repo, ".gitattributes"), "*.txt text eol=crlf\n");
     await git(repo, "add", ".gitattributes");
@@ -801,6 +822,140 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
     try {
       expect(handle.exact).toBe(false);
       expect(handle.inexactReasons).toEqual([{ cause: "checkout-conversion", path: "" }]);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  // #88: another writer appends LF lines to a clean CRLF file after the step-7 drift diff and before
+  // the live `ls-files --eol` listing. The file is then in neither set and its live `w/` (mixed)
+  // differs from the reference's (crlf) with no checkout conversion behind it.
+  type RediffFault = "none" | "code128" | "throw";
+  const racingEol = async (file = "a.txt", opts: { link?: boolean } = {}) => {
+    if (opts.link) {
+      await fsp.mkdir(join(repo, "node_modules", "@s"));
+      await fsp.symlink(join(repo, "packages", "a"), join(repo, "node_modules", "@s", "a"), linkType);
+    }
+    await fsp.writeFile(join(repo, file), "a0\r\n");
+    await git(repo, "add", file);
+    await git(repo, "commit", "-q", "-m", "crlf");
+    expect(await git(repo, "status", "--porcelain")).toBe("");
+    const ref = await capture();
+    expect(ref.tracked.size).toBe(0);
+    const realRepo = await fsp.realpath(repo);
+    const state = { appended: false, diffs: 0 };
+    const wrap = (fault: RediffFault = "none", onRediff?: () => void): CaptureDeps["argv"] => async (cmd, args, o) => {
+      if (args.includes("--eol") && !state.appended && o?.cwd !== undefined && (await fsp.realpath(o.cwd)) === realRepo) {
+        state.appended = true;
+        await fsp.appendFile(join(repo, file), "x\n");
+      }
+      if (args.includes("diff") && args.includes("--no-ext-diff") && ++state.diffs === 2) {
+        onRediff?.();
+        if (fault === "code128") return { code: 128, stdout: "", stderr: "fatal: simulated", timedOut: false };
+        if (fault === "throw") throw new Error("simulated seam failure");
+      }
+      return argv(cmd, args, o);
+    };
+    return { ref, state, wrap };
+  };
+
+  it("#88: a clean file edited by another writer during verification is re-diffed, not flagged as a checkout conversion", async () => {
+    const { ref, state, wrap } = await racingEol();
+    const handle = await mat(ref, { argv: wrap() });
+    try {
+      expect(handle.inexactReasons).toEqual([]);
+      expect(handle.exact).toBe(true);
+      expect(state.appended).toBe(true);
+      expect(state.diffs).toBe(2);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it("#88: a failing re-diff keeps the checkout-conversion flag (fail safe)", async () => {
+    const { ref, state, wrap } = await racingEol();
+    const handle = await mat(ref, { argv: wrap("code128") });
+    try {
+      expect(handle.exact).toBe(false);
+      expect(handle.inexactReasons).toContainEqual({ cause: "checkout-conversion", path: "a.txt" });
+      expect(state.appended).toBe(true);
+      expect(state.diffs).toBe(2);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it("#88: a seam error during the re-diff keeps the checkout-conversion flag and is logged", async () => {
+    const { ref, state, wrap } = await racingEol();
+    const handle = await mat(ref, { argv: wrap("throw") });
+    try {
+      expect(handle.exact).toBe(false);
+      expect(handle.inexactReasons).toContainEqual({ cause: "checkout-conversion", path: "a.txt" });
+      expect(state.diffs).toBe(2);
+      expect(warnings).toContain("reference eol re-diff failed: flags kept");
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it("#88: a throw from the re-diff's private-index read keeps the flag and is logged", async () => {
+    const { ref, state, wrap } = await racingEol();
+    const failing: ReferenceDeps["fs"] = {
+      ...nodeReferenceFs,
+      readFile: (path, options) => {
+        if (state.appended && String(path).endsWith("index")) throw new Error("simulated index read failure");
+        return nodeReferenceFs.readFile(path, options);
+      },
+    };
+    const handle = await mat(ref, { argv: wrap(), fs: failing });
+    try {
+      expect(handle.exact).toBe(false);
+      expect(handle.inexactReasons).toContainEqual({ cause: "checkout-conversion", path: "a.txt" });
+      expect(warnings).toContain("reference eol re-diff failed: flags kept");
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it("#88: a caller abort during the re-diff -> ok:false aborted", async () => {
+    const { ref, wrap } = await racingEol();
+    const controller = new AbortController();
+    const result = await materialize(ref, undefined, controller.signal, deps({ argv: wrap("none", () => controller.abort()) }));
+    expect(result).toMatchObject({ ok: false, reason: "aborted" });
+  });
+
+  it("#88: a race on a workspace-linked file is still workspace-link-drift (check d runs on re-diffed paths)", async () => {
+    const { ref, wrap } = await racingEol("packages/a/index.js", { link: true });
+    const handle = await mat(ref, { argv: wrap() });
+    try {
+      expect(handle.exact).toBe(false);
+      expect(handle.inexactReasons).toContainEqual({ cause: "workspace-link-drift", path: "packages/a" });
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it("#88: a race on a manifest is still dependency-drift (check c runs on re-diffed paths)", async () => {
+    const { ref, wrap } = await racingEol("package.json");
+    const handle = await mat(ref, { argv: wrap() });
+    try {
+      expect(handle.exact).toBe(false);
+      expect(handle.inexactReasons).toContainEqual({ cause: "dependency-drift", path: "package.json" });
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it("#88: without a live-vs-reference eol difference materialize takes exactly one drift diff", async () => {
+    let diffs = 0;
+    const counting: CaptureDeps["argv"] = async (cmd, args, o) => {
+      if (args.includes("diff") && args.includes("--no-ext-diff")) diffs++;
+      return argv(cmd, args, o);
+    };
+    const handle = await mat(await capture(), { argv: counting });
+    try {
+      expect(handle.exact).toBe(true);
+      expect(diffs).toBe(1);
     } finally {
       await handle.dispose();
     }

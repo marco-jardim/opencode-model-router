@@ -101,7 +101,16 @@
 //       "a0\r\n" while exact stayed true. LF files under text=auto are common
 //       on win32 (e.g. Prettier's default endOfLine: lf). Each differing path
 //       adds "checkout-conversion" for it, up to MAX_CONVERSION_REASONS, then
-//       one "" reason.
+//       one "" reason. A file another writer edits between the drift diff
+//       and the live listing is in neither set, so when the listing finds a
+//       live-vs-reference `w/` difference the diff is taken again, limited
+//       to those paths, and the paths it reports join the changed set
+//       before flagging (#88). They get checks (c) and (d) and are then
+//       judged like any file edited after dispatch (the QA-1.5-16 rule
+//       above: flagged only when the reference's `w/` differs from its
+//       `i/`; under `* text=auto` with native CRLF still flagged,
+//       QA-1.5-19). A failed or unaffordable re-diff (budget spent, more
+//       than MAX_REDIFF_PATHS paths) keeps every flag.
 //   (f) No index entry is assume-unchanged or skip-worktree at capture
 //       (QA-1.5-6b). Git skips such entries, so neither stash create nor the
 //       drift diff sees a local edit to them (live "v2-local" became "v1" at
@@ -312,11 +321,22 @@
 //      "checkout-conversion" for it. A path in the drift set but not in
 //      ref.tracked (edited after capture, QA-1.5-16) has unknown dispatch
 //      bytes, so it adds "checkout-conversion" when the reference's own `w/`
-//      class differs from its `i/` class (the checkout converted it). This is
-//      the last step, so these calls get the
-//      remaining budget with the caller's signal only: a budget that runs out
-//      here, or a failing call, adds "" instead of failing materialize; a
-//      caller abort returns ok:false "aborted".
+//      class differs from its `i/` class (the checkout converted it). When
+//      the lists show a path with a live-vs-reference `w/` difference that is
+//      in neither set (#88: edited by another writer after the step-7 diff),
+//      the step-7 diff (private index, `--literal-pathspecs`, limited to
+//      those paths, at most MAX_REDIFF_PATHS) is taken again. The paths it
+//      reports join the drift set, get the (c)/(d) checks of step 7, and are
+//      then judged by the QA-1.5-16 rule above (a re-diffed path whose
+//      checkout converted it, w/ != i/, stays flagged, QA-1.5-19). A failed
+//      re-diff (logged), a spent budget or too many paths keeps every flag.
+//      This is the last step, so the two listings get the remaining budget
+//      with the caller's signal only: a budget that runs out here, or a
+//      failing call, adds "" instead of failing materialize; a caller abort
+//      returns ok:false "aborted". The re-diff is the exception: like step 7
+//      it runs under the budget's signal (its private-index copy), so a
+//      spent budget there skips it and keeps the flags, while a caller abort
+//      returns "aborted" and an UnsafeReferencePathError "unsafe-path".
 //   8. Return { ok: true, reference: { dir, exact, inexactReasons,
 //      unreproduced, links, toRefPath, dispose } }. toRefPath(p) maps an
 //      absolute live path under root, or under realpath(root), to the same
@@ -661,6 +681,12 @@
 //     reference inexact. Avoiding it needs each path's `w/` class at capture,
 //     i.e. a full `ls-files --eol` inside the capture budget; not done, since
 //     the error only yields "unverifiable", never a wrong excuse.
+//   - The QA-1.5-16 rule cannot see a legacy-checkout conversion (QA-1.5-18
+//     class: old core.autocrlf, `crlf` attribute) in a file edited after
+//     dispatch, because the reference's `i/` equals its `w/` there. That was
+//     already true for edits before the step-7 diff; the step-7b re-diff
+//     (#88) extends it to edits in the window between the diff and the live
+//     listing.
 //   - Output cap (QA-1.5-24, owner 2.1): the seam caps each stream (p12
 //     runArgv default 10 M chars) and a cut listing is a failed call. Capture's
 //     `ls-files --stage` hits the cap first, at ~95-150k tracked paths (path
@@ -889,6 +915,8 @@ export const MAX_UNTRACKED_BYTES = 64 * 1024 * 1024;
 export const MAX_SWEEP_ENTRIES = 500_000;
 /** Per-path "checkout-conversion" reasons from the eol comparison (section 2e); beyond it, one "" reason. */
 export const MAX_CONVERSION_REASONS = 100;
+/** Most paths the step-7b re-diff (#88) is limited to; more than this keeps every conversion flag. */
+const MAX_REDIFF_PATHS = 64;
 /** Marker value for an untracked symbolic link (not a sha256, so it never matches a file hash). */
 export const UNTRACKED_SYMLINK = "symlink";
 /** Basenames whose drift between commit and the live tree makes a linked node_modules stale (section 2c). */
@@ -1802,10 +1830,17 @@ export async function materialize(
     const scratchEnv: PrivateIndexEnv = {
       argv: deps.argv, fs, root, tmpdir: tmp, platform, pid: deps.pid ?? process.pid, logger: deps.logger,
     };
-    const diff = await withPrivateIndex(scratchEnv, budget, (copy) =>
-      runGit(deps.argv, ["-c", "core.splitIndex=false", "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", ref.commit, "--"], {
-        cwd: root, timeoutMs: budget.remaining(), signal: budget.signal, env: { GIT_INDEX_FILE: copy },
-      }));
+    // `only`: the step-7b re-diff (#88) is limited to the paths it must classify, as literal
+    // pathspecs whatever GIT_LITERAL_PATHSPECS says.
+    const driftDiff = (only: readonly string[] = []) =>
+      withPrivateIndex(scratchEnv, budget, (copy) =>
+        runGit(deps.argv, [
+          ...(only.length > 0 ? ["--literal-pathspecs"] : []),
+          "-c", "core.splitIndex=false", "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", ref.commit, "--", ...only,
+        ], {
+          cwd: root, timeoutMs: budget.remaining(), signal: budget.signal, env: { GIT_INDEX_FILE: copy },
+        }));
+    const diff = await driftDiff();
     const nowUntracked = await git(["ls-files", "--others", "--exclude-standard", "-z"]);
     if (budget.spent()) return await abandon("aborted", "aborted during drift checks");
     if (!diff || diff.code !== 0 || !nowUntracked || nowUntracked.code !== 0) {
@@ -1813,10 +1848,6 @@ export async function materialize(
     }
     for (const rel of splitZ(diff.stdout)) changed.add(rel);
     for (const rel of splitZ(nowUntracked.stdout)) if (!ref.untracked.has(rel)) changed.add(rel);
-    const changedSorted = [...changed].sort(byCodeUnit);
-    for (const rel of changedSorted) {
-      if (DEPENDENCY_FILES.has(rel.split("/").at(-1) ?? "")) reasons.push({ cause: "dependency-drift", path: rel });
-    }
     const realRoot = p.resolve(await fs.realpath(root));
     const workspaceDirs = new Set<string>();
     for (const target of linkTargets) {
@@ -1837,12 +1868,22 @@ export async function materialize(
       }
     }
     const fold = (s: string) => (platform === "win32" ? s.toLowerCase() : s);
-    for (const rel of [...workspaceDirs].sort(byCodeUnit)) {
-      const prefix = fold(rel) + "/";
-      if (changedSorted.some((c) => fold(c) === fold(rel) || fold(c).startsWith(prefix))) {
-        reasons.push({ cause: "workspace-link-drift", path: rel });
+    // Section 2 (c) and (d) over a set of drifted paths; run on the step-7 set and, in step 7b, on
+    // the paths its re-diff adds (#88), so a late edit is judged like any other drift.
+    const driftReasons = (paths: readonly string[]) => {
+      const sorted = [...paths].sort(byCodeUnit);
+      for (const rel of sorted) {
+        if (DEPENDENCY_FILES.has(rel.split("/").at(-1) ?? "")) reasons.push({ cause: "dependency-drift", path: rel });
       }
-    }
+      for (const rel of [...workspaceDirs].sort(byCodeUnit)) {
+        const prefix = fold(rel) + "/";
+        if (reasons.some((r) => r.cause === "workspace-link-drift" && r.path === rel)) continue;
+        if (sorted.some((c) => fold(c) === fold(rel) || fold(c).startsWith(prefix))) {
+          reasons.push({ cause: "workspace-link-drift", path: rel });
+        }
+      }
+    };
+    driftReasons([...changed]);
 
     // 7b. Clean-file checkout conversion (section 2e, QA-1.5-13): the working-tree eol class
     //     of every tracked path that is neither hashed above (ref.tracked) nor changed since
@@ -1872,14 +1913,41 @@ export async function materialize(
       if (!liveEol || !refEol) {
         conversion(""); // not compared: budget spent or git failed
       } else {
+        // #88: a writer that edits a file between the step-7 diff and the live listing leaves it
+        // in neither set; its live `w/` then differs from the reference's with no checkout
+        // conversion behind it. Take the diff again, limited to those paths (at most
+        // MAX_REDIFF_PATHS; beyond that the flags stay), before flagging them. A failed or
+        // unaffordable re-diff changes nothing, so every flag stays (fail safe). Paths it adds go
+        // through the (c)/(d) drift checks and then the QA-1.5-16 rule below.
+        const unexplained = (rel: string, w: string) => {
+          if (ref.tracked.has(rel) || changed.has(rel)) return false;
+          const live = liveEol.get(rel);
+          return live !== undefined && live.w !== w;
+        };
+        const suspects = [...refEol].filter(([rel, { w }]) => unexplained(rel, w)).map(([rel]) => rel).sort(byCodeUnit);
+        if (suspects.length > 0 && suspects.length <= MAX_REDIFF_PATHS && !budget.spent()) {
+          let again: ExecResult | undefined;
+          try {
+            again = await driftDiff(suspects);
+          } catch (error) {
+            if (signal.aborted || error instanceof UnsafeReferencePathError) throw error;
+            deps.logger?.warn("reference eol re-diff failed: flags kept", { error: describeError(error) });
+          }
+          if (signal.aborted) return await abandon("aborted", "aborted during the eol comparison");
+          if (again && again.code === 0) {
+            const added = splitZ(again.stdout).filter((rel) => !changed.has(rel));
+            for (const rel of added) changed.add(rel);
+            driftReasons(added);
+          } else if (again) {
+            deps.logger?.warn("reference eol re-diff failed: flags kept", { code: again.code, stderr: again.stderr.trim() });
+          }
+        }
         // QA-1.5-16: a path edited since capture (in changed, not in ref.tracked) has unknown
         // dispatch bytes; it is flagged when the reference's checkout converted it (w/ != i/).
         const differing = [...refEol]
           .filter(([rel, { i, w }]) => {
-            if (ref.tracked.has(rel)) return false;
-            if (changed.has(rel)) return i !== "" && w !== "" && i !== w;
-            const live = liveEol.get(rel);
-            return live !== undefined && live.w !== w;
+            if (changed.has(rel) && !ref.tracked.has(rel)) return i !== "" && w !== "" && i !== w;
+            return unexplained(rel, w);
           })
           .map(([rel]) => rel)
           .sort(byCodeUnit);
