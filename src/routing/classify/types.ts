@@ -297,6 +297,18 @@ export interface RouteLine {
    *   `git worktree list --porcelain` BEFORE any filesystem call on it; no match → no work root.
    */
   readonly root?: string;
+  /**
+   * `repo=<name>`: cross-repo (Phase 1): a repository name below `routing.repoParents`, as written (case kept).
+   * One directory name, `[A-Za-z0-9][A-Za-z0-9._-]{0,99}`, not `.` / `..`; separators are rejected at parse.
+   * Parse and validation only: resolution against `routing.repoParents` happens later.
+   */
+  readonly repo?: string;
+  /**
+   * `branch=<ref>`: the branch whose worktree to bind; declare-then-check (the declared branch is verified against
+   * the worktree later). Case kept. 1..200 chars of `[A-Za-z0-9._/-]`; rejected at parse: `..`, `//`, a leading
+   * `-` or `/`, a trailing `/`, `.` or `.lock`.
+   */
+  readonly branch?: string;
   /** Bare `pin` flag (or `pin=true|yes|1`). */
   readonly pin: boolean;
   /** Keys that were unknown or whose values were invalid (for logging only). */

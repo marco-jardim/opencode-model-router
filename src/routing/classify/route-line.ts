@@ -61,6 +61,28 @@ function isWorkRootPath(value: string): boolean {
   return WORK_ROOT_RE.test(value) && !PARENT_SEGMENT_RE.test(value) && !value.includes("\0");
 }
 
+const REPO_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
+const BRANCH_REF_RE = /^[A-Za-z0-9._/-]{1,200}$/;
+
+/** `repo=` value: a single directory name (no separators), not `.` / `..`. Case is kept. */
+function isRepoName(value: string): boolean {
+  return REPO_NAME_RE.test(value) && value !== "." && value !== "..";
+}
+
+/** `branch=` value: a conservative git ref name. Case is kept; declare-then-check happens later. */
+function isBranchRef(value: string): boolean {
+  return (
+    BRANCH_REF_RE.test(value) &&
+    !value.includes("..") &&
+    !value.includes("//") &&
+    !value.startsWith("-") &&
+    !value.startsWith("/") &&
+    !value.endsWith("/") &&
+    !value.endsWith(".") &&
+    !value.endsWith(".lock")
+  );
+}
+
 function isMember<T extends string>(values: readonly T[], value: string): value is T {
   return (values as readonly string[]).includes(value);
 }
@@ -98,6 +120,8 @@ function parseFields(body: string): RouteLine {
   let tier: string | undefined;
   let budget: number | undefined;
   let root: string | undefined;
+  let repo: string | undefined;
+  let branch: string | undefined;
   const ignored: string[] = [];
   const seen = new Set<string>();
 
@@ -168,6 +192,18 @@ function parseFields(body: string): RouteLine {
         else ignored.push(key);
         break;
       }
+      case "repo": {
+        const candidate = rawValue === null ? undefined : stripTail(rawValue);
+        if (candidate !== undefined && isRepoName(candidate)) repo = candidate;
+        else ignored.push(key);
+        break;
+      }
+      case "branch": {
+        const candidate = rawValue === null ? undefined : stripTail(rawValue);
+        if (candidate !== undefined && isBranchRef(candidate)) branch = candidate;
+        else ignored.push(key);
+        break;
+      }
       default:
         ignored.push(key);
     }
@@ -182,6 +218,8 @@ function parseFields(body: string): RouteLine {
     ...(tier ? { tier } : {}),
     ...(budget !== undefined ? { budget } : {}),
     ...(root ? { root } : {}),
+    ...(repo ? { repo } : {}),
+    ...(branch ? { branch } : {}),
     pin,
     ignored,
   };
@@ -207,7 +245,7 @@ function isRecognisable(line: string, inFence: boolean): boolean {
 }
 
 function canonical(line: RouteLine): string {
-  return JSON.stringify([line.class, line.risk, line.scope, line.needs, line.detection, line.pin, line.tier, line.budget, line.root]);
+  return JSON.stringify([line.class, line.risk, line.scope, line.needs, line.detection, line.pin, line.tier, line.budget, line.root, line.repo, line.branch]);
 }
 
 /**
@@ -242,6 +280,8 @@ function resolveConflict(lines: readonly RouteLine[]): RouteLine {
   const tier = keep("tier", first.tier, (l) => l.tier);
   const budget = keep("budget", first.budget, (l) => l.budget);
   const root = keep("root", first.root, (l) => l.root);
+  const repo = keep("repo", first.repo, (l) => l.repo);
+  const branch = keep("branch", first.branch, (l) => l.branch);
   if (lines.some((l) => l.detection !== undefined)) ignored.push("conflict:d");
   return {
     ...(taskClass ? { class: taskClass } : {}),
@@ -251,6 +291,8 @@ function resolveConflict(lines: readonly RouteLine[]): RouteLine {
     ...(tier ? { tier } : {}),
     ...(budget !== undefined ? { budget } : {}),
     ...(root ? { root } : {}),
+    ...(repo ? { repo } : {}),
+    ...(branch ? { branch } : {}),
     // The first line is the directive; a later line cannot take its pin away or add one (A22).
     pin: first.pin,
     ignored,

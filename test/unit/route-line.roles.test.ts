@@ -52,6 +52,106 @@ describe("route line roles keys", () => {
   });
 });
 
+describe("route line cross-repo keys (repo, branch)", () => {
+  it("parses repo and keeps its case", () => {
+    expect(parse("[route repo=app-a]").line?.repo).toBe("app-a");
+    const { line } = parse("[route repo=App-A.v2_x]");
+    expect(line?.repo).toBe("App-A.v2_x");
+    expect(line?.ignored).toEqual([]);
+  });
+
+  it("accepts a 100-char repo and ignores a 101-char one", () => {
+    expect(parse(`[route repo=${"a".repeat(100)}]`).line?.repo).toBe("a".repeat(100));
+    const { line } = parse(`[route repo=${"a".repeat(101)}]`);
+    expect(line?.repo).toBeUndefined();
+    expect(line?.ignored).toContain("repo");
+  });
+
+  it.each([["../x"], ["a/b"], ["-x"], ["."], [".."], ["a\\b"], [".x"], [""]])("ignores the invalid repo %j", (value) => {
+    const { line } = parse(`[route repo=${value}]`);
+    expect(line?.repo).toBeUndefined();
+    expect(line?.ignored).toContain("repo");
+  });
+
+  it("ignores a bare repo key", () => {
+    const { line } = parse("[route repo]");
+    expect(line?.repo).toBeUndefined();
+    expect(line?.ignored).toContain("repo");
+  });
+
+  it("parses branch and keeps its case", () => {
+    const { line } = parse("[route branch=feat/Login-2]");
+    expect(line?.branch).toBe("feat/Login-2");
+    expect(line?.ignored).toEqual([]);
+    expect(parse("[route branch=release_1.2.x]").line?.branch).toBe("release_1.2.x");
+  });
+
+  it("accepts a 200-char branch and ignores a 201-char one", () => {
+    expect(parse(`[route branch=${"b".repeat(200)}]`).line?.branch).toBe("b".repeat(200));
+    const { line } = parse(`[route branch=${"b".repeat(201)}]`);
+    expect(line?.branch).toBeUndefined();
+    expect(line?.ignored).toContain("branch");
+  });
+
+  it.each([["-x"], ["/x"], ["x/"], ["a..b"], ["a//b"], ["x.lock"], ["x."], ["a~b"], ["a:b"], ["a\\b"], [""]])(
+    "ignores the invalid branch %j",
+    (value) => {
+      const { line } = parse(`[route branch=${value}]`);
+      expect(line?.branch).toBeUndefined();
+      expect(line?.ignored).toContain("branch");
+    },
+  );
+
+  it("splits a branch at whitespace: the first token is the value, the rest is an unknown key", () => {
+    const { line } = parse("[route branch=has space]");
+    expect(line?.branch).toBe("has");
+    expect(line?.ignored).toEqual(["space"]);
+  });
+
+  it("strips a trailing comma or semicolon from the values", () => {
+    const { line } = parse("[route repo=app-a, branch=feat/x;]");
+    expect(line?.repo).toBe("app-a");
+    expect(line?.branch).toBe("feat/x");
+  });
+
+  it("reports duplicates as dup:repo / dup:branch and keeps the first", () => {
+    const { line } = parse("[route repo=a repo=b branch=x branch=y]");
+    expect(line?.repo).toBe("a");
+    expect(line?.branch).toBe("x");
+    expect(line?.ignored).toEqual(["dup:repo", "dup:branch"]);
+  });
+
+  it("keeps root, repo and branch together", () => {
+    const { line } = parse("[route tier=medium root=D:\\git\\wt\\feat repo=App-A branch=feat/Login-2]");
+    expect(line?.root).toBe("D:\\git\\wt\\feat");
+    expect(line?.repo).toBe("App-A");
+    expect(line?.branch).toBe("feat/Login-2");
+    expect(line?.tier).toBe("medium");
+    expect(line?.ignored).toEqual([]);
+  });
+
+  it("treats route lines that differ only in repo or branch as a conflict", () => {
+    const byBranch = parse("[route repo=a branch=x]\n[route repo=a branch=y]", "any");
+    expect(byBranch.conflict).toBe(true);
+    expect(byBranch.line?.branch).toBeUndefined();
+    expect(byBranch.line?.repo).toBe("a");
+    expect(byBranch.line?.ignored).toContain("conflict:branch");
+    const byRepo = parse("[route repo=a]\n[route repo=b]", "any");
+    expect(byRepo.conflict).toBe(true);
+    expect(byRepo.line?.repo).toBeUndefined();
+    expect(byRepo.line?.ignored).toContain("conflict:repo");
+    expect(parse("[route repo=a branch=x]\n[route repo=a branch=x]", "any").conflict).toBe(false);
+  });
+
+  it("still applies the 500-char cap to a line carrying repo and branch", () => {
+    const text = `[route repo=app-a branch=${"b".repeat(480)}]\nbody`;
+    const r = parse(text);
+    expect(r.line).toBeNull();
+    expect(r.malformed).toBe(true);
+    expect(r.stripped).toBe(text);
+  });
+});
+
 describe("QA-P12-1-6: work roots are local paths; a malformed first route line is flagged", () => {
   it.each([
     ["UNC", "\\\\host\\share\\repo"],
