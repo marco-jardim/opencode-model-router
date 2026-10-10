@@ -1,6 +1,6 @@
 # Cross-repo work in roles mode
 
-**Status:** Accepted 2026-10-10 (owner). Phase 0 implemented (P0.1–P0.4); phase QA pending.
+**Status:** Accepted 2026-10-10 (owner). Phase 0 implemented (P0.1–P0.4); QA round 1 fixes applied; QA round 2 pending.
 **Scope:** roles mode on OpenCode v2 (`routing.delegation: "roles"`). Phase 0 changes the shared verification engine and applies to both hosts.
 **Configuration keys** marked *proposed (not implemented)* do not exist yet.
 **File references** are `path:line` as of 2026-10-10. Line numbers drift; the function names are the stable reference.
@@ -177,14 +177,17 @@ Allow once = this dispatch only. Allow always = until it expires. Reject = no wo
 
   `router_git_*` runs only in W.
 - **I2 — Capture anchored at W.** The change baseline, change set and reference are captured in W and P, never in a check cwd.
-- **I3 — Coverage.** If any absolute changed path lies outside the git top level of every check root, the verdict is never pass. This includes change sets that are partly inside.
+- **I3 — Coverage.** If any absolute changed path lies outside the git top level of every check root, the verdict is never pass. This includes change sets that are partly inside, and change sets that are entirely outside. It holds on both verifiers (deterministic and grader), and a relative path that climbs out (`../x`, resolved against the base) counts as outside.
 - **I4 — Perimeter changes.** A change in P outside W during the dispatch:
   - if the producer lineage ran an unattributable writer → unverifiable;
   - otherwise → a note. The reference is handled by I6.
 - **I5 — Empty change with writers.** If no change was observed in P and the lineage ran an unattributable writer, a pass carries a caveat. It renders as UNVERIFIED (`docs/VERIFICATION.md:242`).
-  - *Unattributable writer:* a tool that is neither in `WRITE_TOOLS` (`src/verify/dispatch.ts:101`) nor in `NON_WRITING_TOOLS` (`dispatch.ts:114-119`), and is not a read-only router tool (`router_git_*`, `src/router/git-tools.ts:11`; `router_request_authority`, `src/routing/roles/authority.ts:28`). This covers `bash`, `router_run`, MCP tools and unknown tools.
-- **I6 — Reference exactness.** A package link in a linked `node_modules` whose real path is outside the repository and has no `node_modules` segment makes the reference approximate unless it is pinned (Phase 2). An approximate reference never excuses a failure (`baseline.ts:162-165`).
-- **I7 — Branch continuity.** W's branch at return equals its branch at dispatch. At `router_verify`, it equals its branch at return. A HEAD that moved by commits on the same branch is handled as today (`wiring.ts:1118-1140`). A carried role attempt is also compared with the tree of the attempt that introduced its acceptance block.
+  - *Unattributable writer:* a tool that is not a write tool (`WRITE_TOOLS`, `src/verify/dispatch.ts`) and not non-writing. Non-writing is the existing `NON_WRITING_TOOLS` names plus these exact names: `router_git_status`, `router_git_log`, `router_git_diff`, `router_git_show`, `router_git_blame`, `router_git_ls_files`, `router_request_authority`, `context7_resolve-library-id`, `context7_query-docs`, `context7_get-library-docs` and the Brave search tools. This covers `bash`, `router_run`, MCP tools and unknown tools.
+  - The delegating tools `task`, `delegate` and `subagent` always count as writers, because a nested child's writes are not in the producer lineage. They still do not contaminate captures.
+  - A writer is also counted in the before-hook once the guard allows the call, so a call that errors still counts. Tool names in the caveat are sanitised.
+  - Known limit: the allow-list is exact names, so a user MCP server named `router`, `context7` or `brave` that exposes those exact names would be treated as non-writing.
+- **I6 — Reference exactness.** A package link in a linked `node_modules` whose real path is outside the repository (and is not a package store: a real path whose parent is `node_modules` or `node_modules/@scope`), or is the repository root or an ancestor (`root-link`), makes the reference approximate unless it is pinned (Phase 2). An approximate reference never excuses a failure (`baseline.ts:162-165`).
+- **I7 — Branch continuity.** W's branch at return equals its branch at dispatch. At `router_verify`, it equals its branch at return. A HEAD that moved by commits on the same branch is handled as today (`wiring.ts:1118-1140`). A carried role attempt is compared with the tree of the attempt that introduced its acceptance block; the reflog window applies within one dispatch and between return and router_verify.
 - **I8 — Scoped pass.** When `routing.repoParents` is configured, a pass's evidence names P (repository, branch, short HEAD) and every link target that was not observed.
 - **I9 — Inert by default.** Without `routing.repoParents` and without approvals, the protocol text, dispatch header, banners and goldens are byte-identical. On v1 the new keys are inert, with one notice (`touched`, `config.ts:3215-3216`).
 - **I10 — Reads never widen writes.** Read authority never widens write authority or the change baseline.
@@ -315,9 +318,9 @@ The first sentence of the working-directory paragraph is today's text (`src/rout
 - **Phase 3 spike:** test whether `vitest related <real path in B>` run in A finds A's importers through symlinked packages. Jest stays S6.
 
 **Reference contamination.**
-- Materialize links the live `node_modules` (`reference.ts:1764-1798`). Workspace-link drift checks only targets inside the repository (`reference.ts:1820-1845`); a link to `D:\git\lib-b` is skipped (`:1833-1834`).
-- **P0.4 rule.** A package entry (top level, and one level under each `@scope`, as `packageEntries` reads them) is a link whose real path is outside root and realRoot and contains no `node_modules` segment → the reason `external-link`, and the reference is approximate.
-- **What stays exact:** a `node_modules` that is itself a junction to an outside store, as in `test/unit/reference.test.ts:1291-1358`, and a link into a store path that contains `node_modules`.
+- Materialize links the live `node_modules` (`reference.ts:1764-1798`). Workspace-link drift checks only targets inside the repository (`reference.ts:1820-1845`); a link to `D:\git\lib-b` was skipped there before P0.4.
+- **P0.4 rule.** A package entry (top level, and one level under each `@scope`, as `packageEntries` reads them) is a link whose real path is outside root and realRoot and is not a package store (its parent is not `node_modules` or `node_modules/@scope`) → the reason `external-link`, and the reference is approximate. A link to the root or an ancestor → `root-link`.
+- **What stays exact:** a `node_modules` that is itself a junction to an outside store, as in `test/unit/reference.test.ts:1291-1358`, and a link into a package store (a real path whose parent is `node_modules`).
 
 **Pinning (Phase 2).**
 - At dispatch, snapshot each admitted link target as part of P. Add a bounded digest of the ignored files under the target, excluding `node_modules`. The digest matters because `snapshotTree` hashes status, diffs and untracked files only (`tree.ts:214-243`), while linked packages often load an ignored `dist/`.
@@ -355,14 +358,35 @@ Each slice lands test-first: the failing test reproduces the scenario row, then 
 - Follow-up: `snapshotTree` gives up on repositories with submodules (`tree.ts:233`) and returns no root, so the coverage root falls back to the base there.
 
 **P0.2 — Branch switch (S9, S12)**
-- `src/verify/tree.ts` `snapshotTree` (`:201-256`): add `branch`, from `git symbolic-ref -q HEAD`. Exit 1 means detached (`null`); any other failure means unknown.
+- `src/verify/tree.ts` `snapshotTree` (`:201-256`): add `branch`, first from `git symbolic-ref -q HEAD`; after QA round 1 from the same `git rev-parse HEAD --symbolic-full-name HEAD` call as the head (`HEAD` means detached, `null`).
 - `wiring.ts` `observeChange` (`:1469-1520`): compare the dispatch snapshot's branch with the return snapshot's. When HEAD moved and either branch is unknown, treat it as a switch.
 - `src/verify/pending.ts` registration (R3, `:41-71`): store the branch at return. `wiring.ts` `prepareClaim` (`:1818-1850`) compares it with the `snapshotFor` result (`:1773-1788`).
 - `gate.ts`: a branch switch → unverifiable, for both branches of the gate. The reason: `the working tree <root> switched from branch <a> to <b> during the dispatch (since the producer returned); the checks would verify another branch`.
 - Implemented: `src/verify/branch.ts` (`branchSwitched`, `branchSwitchReason`, `branchUnconfirmedReason`), `GitExitError` / `readBranch` in `tree.ts`; a switch during the dispatch on the deferred path returns `{ deferred: false, reason: "branch-switched" }` so the required gate refuses.
 - Detached → detached at another commit counts as a switch (the verb is "moved"): commits on a detached HEAD cannot be told from a checkout without the reflog.
-- Known difference: when the gate snapshot is missing on the synchronous path, behaviour is unchanged (the change baseline is unavailable); the deferred path refuses in the same situation with "cannot confirm the branch". "Cannot confirm" is not retryable unless the router_verify call itself was cut short.
+- Known difference: when the gate snapshot is missing on the synchronous path, behaviour is unchanged (the change baseline is unavailable); the deferred path refuses in the same situation with "cannot confirm the branch". After QA round 1 the `router_verify` form of "cannot confirm" is retryable (see below).
 - Roles lineage: the carried baseline (`VerificationBaseline` in `src/router/sessions.ts`) records the introducing attempt's tree and any switch already found; a carried attempt is checked against it ("since the attempt that introduced this acceptance").
+
+**After QA round 1 (head-state design)**
+- The dispatch reads a cheap head state: one `git rev-parse --show-toplevel HEAD --symbolic-full-name HEAD` plus `git rev-list --walk-reflogs --count HEAD`. It is kept even when the full snapshot is contaminated or unavailable. The gate, and `router_verify` for a deferred result, read it again and apply `treeMove`, in this order:
+  1. another top-level → relocated;
+  2. another branch name → switched ("moved" when both sides are detached);
+  3. both reflog counts known: a count that shrank → rewritten ("the reflog has fewer entries than before"); the same count with another HEAD → rewritten ("HEAD moved without a reflog entry");
+  4. a reflog window since the dispatch (`readReflogWindow`: `git log -g -n <k+1> --format=%H%x09%gs HEAD`), judged by what moved HEAD. It must start at the dispatch head and end at the current head, otherwise → rewritten ("the reflog window does not line up with the recorded HEAD"). An entry whose commit equals the previous entry's is HEAD-neutral and ignored (`git stash`, an unstaging `git reset`, a checkout of the current branch, `merge --abort`, `cherry-pick --abort`). An entry that moved HEAD is accepted only for commits (including amend, initial and merge), `merge`, `cherry-pick`, `revert`, `am` and `pull` without rebase; anything else (checkout, reset, rebase, `pull --rebase`, an unnamed `update-ref`: "an unnamed reflog entry") → rewritten. The reason quotes `reflog: "<detail>"`, cleaned, at most 120 characters. Commits only, including commits on a detached HEAD, are no move;
+  5. no window, or a reflog count of 0 (reflogs disabled) → the old fail-closed name rule.
+- Reason texts (`<when>` is "during the dispatch" or "since the producer returned"):
+  - switched: `the working tree <root> switched from <A> to <B> <when>; the checks would verify another branch. Check out <A> again and re-dispatch, or send a fresh [acceptance] block on the current branch.`
+  - rewritten: `the working tree <root> moved or was rewritten <when> (reflog: "<detail>"); the checks could verify a tree without the producer's work. Re-dispatch, or send a fresh [acceptance] block.`
+  - relocated: `the working tree <root> is now <root2> <when>; the checks would verify another tree. Re-dispatch in the intended worktree.`
+- Fail-closed cases:
+  - No repository, or an unborn HEAD, when the dispatch started (the producer runs `git init` or makes the first commit) → nothing is compared and nothing is refused.
+  - Dispatch head read failed → the dispatch snapshot's head and branch stand in. Only when both are unknown → "cannot confirm the branch of <root>: the working tree could not be read when the dispatch started, so the checks could verify another branch. Re-dispatch, or send a fresh [acceptance] block." The dispatch-time head read gets the whole `baselineTimeoutMs` per git process.
+  - A reflog that grew but whose entries cannot be read → rewritten ("the reflog entries could not be read").
+  - Gate head unreadable → the snapshot name comparison is the fallback.
+  - On a move the commit diff is not run (`committed` "unavailable"), so no cross-branch path enters the change set.
+- `router_verify`: the registration records the head state at return (root, head, branch, reflog count). `router_verify` reads the head state again in parallel with its other work and applies `treeMove` "since the producer returned"; it no longer depends on the full snapshot for this check. "Cannot confirm the branch of <root>: the working tree could not be read at router_verify, …" is given only when the head state cannot be read, and it is retryable: the tool reports the handle as not judged and asks for another `router_verify` call. Entries registered without root or reflog use the name rule only. A switch the deferred finish detected is carried to the required gate even if the gate's own read misses it.
+- Roles carried attempts: a "cannot confirm" reason is no longer recorded as the lineage's switch, and a switch the deferred finish saw is folded into the attempt before the role lineage records it. A switch found by any attempt is stored in the lineage and inherited; an inherited reason is prefixed "in an earlier attempt of this acceptance: ". A carried attempt with no readable tree, while the introducing attempt recorded a branch, gives "cannot confirm the branch of <root>: the working tree could not be read for this carried attempt, …". Carried attempts compare names and heads only (Q6).
+- Known limit: one branch checked out in two worktrees (`--ignore-other-worktrees`): commits made in the other worktree move this HEAD on the same branch and become part of the change set.
 
 **P0.3 — Unattributable writers (S1, S3, S10)**
 - `src/verify/dispatch.ts`:
@@ -371,11 +395,12 @@ Each slice lands test-first: the failing test reproduces the scenario row, then 
   - `delta` (`:374-446`): return `unattributedWriters`.
 - `gate.ts`: a pass with an empty change set and writers gets the caveat `no change was observed in <root> but the producer ran <tools>; a write those tools made cannot be seen, so this is not a verified pass` (`<root>`: the change root, else the base directory; at most five tools, then "and N more"), on both branches.
 - The deferred no-change shortcut (`wiring.ts:1639-1644`) already falls through to the required gate, which then applies the caveat.
-- Implemented: `isUnattributedWriter` / `isNonWritingTool` in `src/verify/dispatch.ts` (exact names for read-only router, context7 and Brave tools; prefixes are not trusted); `unattributedWritersCaveat` in `src/verify/gate.ts`; carried to the gate on the task, delegate and deferred paths and through the roles carried baseline (`VerificationBaseline.writers`).
+- Implemented: `isUnattributedWriter` / `isNonWritingTool` in `src/verify/dispatch.ts` (exact names for read-only router, context7 and Brave tools; prefixes are not trusted; `task`, `delegate` and `subagent` always count as writers); `unattributedWritersCaveat` in `src/verify/gate.ts`; carried to the gate on the task, delegate and deferred paths and through the roles carried baseline (`VerificationBaseline.writers`).
 - The rule turns a passing verdict into `unverifiable` (accepted with a caveat, rejected under `strictUnverifiable`), like the other P0 refusals.
 
 **P0.4 — External link at the reference (S6, S7)**
 - `src/verify/reference.ts` materialize step 7 (`:1820-1845`): apply the P0.4 rule from section 6. Add `"external-link"` to the cause union (`:802-812`).
+- After QA round 1: a package link to the repository root or an ancestor gives cause `root-link`; labels are root-relative even when the linked `node_modules` lives outside the repository; only a real path whose parent is `node_modules` (or `node_modules/@scope`) counts as a package store; dot-entries such as `node_modules/.cache` are ignored. Residual limits: nested links and yarn PnP `portal:`/`link:` are not detected. Cost: a worktree whose `node_modules` is a junction to another checkout makes every package link into that checkout `external-link`.
 - Docs: `docs/VERIFICATION.md` (the approximate-reference causes and the junction note).
 
 **Phase 0 docs:** amend ADR 0002 (`docs/adr/0002-acceptance-gate.md:78` says attribution is "never a global diff", while `dispatch.ts:403-404` adds the status delta of the whole repository).
@@ -443,9 +468,9 @@ Each slice lands test-first: the failing test reproduces the scenario row, then 
 | Slice | Tests |
 |---|---|
 | P0.1 | gate: role and tier mixed sets, grader branch with an outside path, coverage root from the snapshot, a relative path that climbs out, the reason capped at five paths; one integration test that fails when the `changeRoot` threading is removed (synchronous and deferred paths). |
-| P0.2 | `test/unit/tree.test.ts`: branch, detached, unknown. Checkout during the dispatch → unverifiable (`test/unit/baseline-wiring.test.ts`). Checkout after return → unverifiable at `router_verify` (`test/integration/deferred-verification.test.ts`). |
+| P0.2 | `test/unit/tree.test.ts`: branch, detached, unknown. Checkout during the dispatch → unverifiable (`test/unit/baseline-wiring.test.ts`). Checkout after return → unverifiable at `router_verify` (`test/integration/branch-switch.test.ts`, `test/integration/branch-switch-deferred.test.ts`). |
 | P0.3 | Changed-file store: writers per session and folded over the lineage; `router_git_*` and `router_request_authority` are not writers. Gate: empty set plus writers → caveat; non-empty set plus writers → no caveat. The deferred no-change shortcut → caveat. |
-| P0.4 | `reference.test.ts`: a package link into a git repository outside root → `exact: false`, cause `external-link`; a link target under a `node_modules` segment → exact; the store junction case unchanged; judgement: approximate → unverifiable. |
+| P0.4 | `reference.test.ts`: a package link into a git repository outside root → `exact: false`, cause `external-link`; a link target in a package store (parent `node_modules`) → exact; a link to the root or an ancestor → `root-link`; the store junction case unchanged; judgement: approximate → unverifiable. |
 | P1 | Config: sanitising (glob, UNC, 8.3, `..`), stripping from the project layer, the v1 notice once (reset with `resetRolesWarnings`, `config.ts:3196`). Route line: `repo=` and `branch=` (`test/unit/route-line.roles.test.ts`). Admission: depth, the parent itself, a junction leading out, exclude, a non-top-level directory, a worktree outside the parents found by text. Names: collision, several worktrees, `repo` + `branch`. `roleAuthorityDecision`: reads in R allowed, edits outside W refused with the location and corrected path (`test/unit/v2-hooks.test.ts`). `checkWorktree` uses the binding's repository. `router_git` in an admitted repository. Registration pattern `D:\git\*`. Working set and header. A new golden case for the configured protocol. Rows S1, S2, S8, S13 and S14 as integration tests (`test/integration/roles-dispatch.test.ts`) with temporary repositories and win32 junctions. |
 | P2 | Per-check `cwd=`/`scope=` parsing; capture stays at W when checks move; consumer caveat; pinning exact and approximate; deferred P drift (S7, S8, S11). |
 | P4 | Store round trip and atomic write; sliding expiry and the 90-day cap; identity mismatch (S16); `routing.repoExclude` wins over an approval; protected locations are never asked; `once` / `always` / `reject` / no reply; non-interactive run → no work root; challenge with altered text, wrong answer, replayed or expired code → no approval (S17); an agent tool call or route-line field cannot create an approval (I16); hook-level allow only inside the bound grant, never for other actions or unknown bindings, and a configured deny stays final (I18); v1 inert with one notice. |
@@ -461,7 +486,22 @@ Each slice lands test-first: the failing test reproduces the scenario row, then 
 - **R is wide.** Every repository below the parents is readable by every local role, including files such as `.env`. Roles hold no egress together with local actions (`policy.ts:171-174`), but results flow through the orchestrator (`docs/ROLES.md:163-164`).
 - **Names follow folder basenames.** Renaming a folder renames the repository.
 - **Snapshot cost and failure.** Snapshot cost grows with the working set. A snapshot that times out leaves a root unobserved, and repositories with submodules are never observed (`tree.ts:233`).
-- **Branch detection costs one git process per snapshot** (`git symbolic-ref -q HEAD`); measured on this machine, a full snapshot of a typical repository takes 0.15–0.4 s, up to 1.8 s on the slowest repository under D:\git.
+- **Branch detection costs git processes.** The cheap head state is one `git rev-parse` plus one `git rev-list --walk-reflogs --count`, read at dispatch, at the gate and at `router_verify`; the snapshot reads its head and branch in the same `git rev-parse HEAD --symbolic-full-name HEAD` call it already made for the head, so it adds no process. Measured on this machine, a full snapshot of a typical repository takes 0.15–0.4 s, up to 1.8 s on the slowest repository under D:\git.
+- **Known follow-ups (QA round 2, minor), accepted for now:**
+  - **F5.** Dispatch head known but gate head unreadable falls back to the snapshot name rule; `router_verify` refuses in the same case.
+  - **F8.** Carried attempts compare the snapshot name and head only (no root, no reflog).
+  - **F9.** The dispatch head read may complete after the producer's first git command when `VERIFY_WAIT:0s`.
+  - **F10.** The retryable "cannot confirm" is matched by text.
+  - **F11.** The wording of the anchor and count rewrite reasons.
+  - **N2.** The grader path refuses a deliverable written outside the cwd.
+  - **N3.** Every delegating producer with an empty change set gets the unobservable-writer caveat.
+  - **N4.** Entries created only by `noteWriter` are not swept.
+  - **N5.** The comment about `subagent` and `observeEdit`.
+  - **N6.** Relative paths are resolved against different bases by the two refusals.
+  - **N7.** An empty or null child ID in metadata blocks the fallback.
+  - **N8.** A call that throws after `noteWriter` counts as a writer.
+  - **N9.** `storeLike` exempts an outside real path whose parent is named `node_modules`.
+  - **N10.** File paths in refusal reasons are not sanitised.
 - **Consumers** are discovered only in the working set, and only through `node_modules` links. Python editable installs, Go `replace`, Cargo path dependencies, and `../` or alias imports are not discovered (Q2).
 - **A consumer check's failures** are unverifiable, never "fail". The dependency is the changed repository, so the reference can neither excuse nor prove them.
 - **`router_run` scripts** remain trusted repository content (`run-tools.ts:11-13`).
@@ -476,11 +516,12 @@ Each slice lands test-first: the failing test reproduces the scenario row, then 
 - **Q3.** Concurrent sibling writes into P. Phase 1 fails closed: unverifiable, with a reason naming the dispatches whose W is that repository. Should changes matching a sibling's tool-observed edits be attributed to the sibling instead?
 - **Q4.** Decided 2026-10-10: hook-level allow approved (D13, I18).
 - **Q5.** Approval defaults: 14 days after last use and a 90-day cap. Should an approval offer a read-only variant (R only, never W)?
+- **Q6.** Same-branch history rewrite across a roles lineage: carried attempts compare names and heads only.
 
 **To verify during implementation**
 - That the host's `*` matches across separators on the installed version.
 - Whether a config hot reload re-registers role agents.
-- The `git symbolic-ref` exit codes.
+- The `git symbolic-ref` exit codes (settled: the snapshot no longer uses `symbolic-ref`; head and branch come from one `rev-parse`).
 - Snapshot time for a working set of 5–10 repositories within `baselineTimeoutMs`.
 - Which agent grader sessions run as (`wiring.ts:1299-1306` passes none).
 - Spikes T1–T5 (section 3).

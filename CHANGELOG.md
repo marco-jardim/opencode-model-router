@@ -26,31 +26,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `router_verify`, the one recorded at registration), so edits in sibling packages of one monorepo are not flagged. Any absolute changed path outside the repository, for example a
   scratch file in the temp directory written by a write tool, mixed with repository edits, now makes the result
   unverifiable; there is no temp-directory exemption (fail closed). A relative path that climbs out of the root
-  (`../x.ts`) counts as outside. A change set that is entirely outside keeps its existing message.
+  (`../x.ts`, resolved against the base) counts as outside. A change set that is entirely outside keeps its existing
+  message, and that all-outside safety net now also applies on the grader path (it used to run on the deterministic
+  path only).
 - **`verify`: the pre-existing-failure reference is now approximate (cause `external-link`) when a package in a linked
-  `node_modules` is a link to a directory outside the repository**, for example an npm `file:`/`link:` or `npm link`
-  package. Previously the rerun loaded that directory's live code, so a failure caused by a change there was also
-  reproduced at the reference and excused as pre-existing. An approximate reference never excuses a failure, so such a
-  run is now unverifiable.
+  `node_modules` is a link to a directory outside the repository**, for example an npm `file:` dependency or
+  `npm link`, a yarn/pnpm `link:`/`portal:` package, or a workspace link. Previously the rerun loaded that directory's
+  live code, so a failure caused by a change there was also reproduced at the reference and excused as pre-existing.
+  An approximate reference never excuses a failure, so such a run is now unverifiable.
+- **`verify`: a package link to the repository root or to an ancestor of it is now an approximate reference too (cause
+  `root-link`).** The label is root-relative even when the linked `node_modules` itself lives outside the repository.
+  Only a real path whose parent directory is `node_modules` (or `node_modules/@scope`) counts as a package store and is
+  exempt from `external-link`; dot-entries such as `node_modules/.cache` are ignored. Residual limits: nested links
+  (`node_modules/<pkg>/node_modules/<dep>`, `.pnpm/*/node_modules/<dep>` for a transitive `link:`) and yarn PnP
+  `portal:`/`link:` are not detected. Cost: in a worktree whose `node_modules` is a junction to another checkout, every
+  package link into that checkout is an `external-link`, so failing tests there are unverifiable.
 - **A branch switch of the verified working tree now makes the result unverifiable instead of passing on the other
   branch.** Previously the diff between the two heads became the change set, so the checks verified another branch.
-  The gate now reports `unverifiable` ("the working tree `<root>` switched from `<A>` to `<B>` during the dispatch; the
-  checks would verify another branch") for a checkout during the dispatch, and the same with "since the producer
-  returned" for a checkout between the producer's return and `router_verify`. Detached to detached at another commit
-  counts as a switch (reported as "moved"), and so does a new branch created at the same commit (fail closed).
-  `router_verify` refuses when a branch was recorded at return but the working tree cannot be read ("cannot confirm
-  the branch of `<root>`"). Each verification snapshot runs one more git process (`git symbolic-ref -q HEAD`).
+  The dispatch reads a cheap head state (top-level, HEAD, branch name and the reflog entry count; one
+  `git rev-parse` and one `git rev-list --walk-reflogs --count HEAD`), kept even when the full snapshot is contaminated
+  or unavailable, and the gate reads it again. The gate reports `unverifiable` ("the working tree `<root>` switched
+  from `<A>` to `<B>` during the dispatch; the checks would verify another branch") for another branch name, and
+  "moved or was rewritten … (reflog: "<detail>")" for a same-branch history rewrite: a reflog that shrank, a HEAD
+  that moved without a reflog entry, a reflog window that does not start at the dispatch head and end at the current
+  head, or a reflog entry that moved HEAD for any reason other than a commit (including amend, initial and merge),
+  `merge`, `cherry-pick`, `revert`, `am` or `pull` without rebase (so checkout, reset, rebase, `pull --rebase` and an
+  unnamed `update-ref` count). Entries that left HEAD where it was (`git stash`, an unstaging `git reset`, a checkout
+  of the current branch, `merge --abort`, `cherry-pick --abort`) are ignored, and commits alone, also on a detached
+  HEAD, are not a move. A reflog count of 0 (reflogs disabled) leaves the decision to the branch-name rule. A
+  relocated top-level is reported too. The same checks with "since
+  the producer returned" cover a checkout between the producer's return and `router_verify`. `router_verify` now reads
+  the head state itself and no longer depends on the full snapshot for this check. Detached to detached at another
+  commit counts as a switch (reported as "moved"), and so does a new branch created at the same commit (fail closed).
+  Nothing is compared when there was no repository, or HEAD was unborn, at dispatch start (a producer that runs
+  `git init` or makes the first commit). If the dispatch head read failed, the dispatch snapshot's head and branch
+  stand in; only when both are unknown does the gate refuse ("cannot confirm the branch of `<root>`"). The dispatch
+  head read gets the whole `baselineTimeoutMs` per git process. `router_verify` gives the retryable form of that
+  message, and reports the handle as not judged, only when the head state cannot be read at all. On a move the commit diff is not run, so no path from the
+  other branch enters the change set. A switch the deferred finish already detected is carried to the required gate.
 - **A pass on an empty change set is no longer reported as verified when the producer ran a tool whose writes the
   router cannot observe** (`bash`, `router_run`, Code Mode `execute`, MCP and unknown tools). The result is
   `unverifiable` with the caveat `no change was observed in <root> but the producer ran <tools>; a write those tools
   made cannot be seen, so this is not a verified pass`, on the deterministic and the grader path, and at
   `router_verify`. Read-only router tools (`router_git_*`, `router_request_authority`) and the context7 and Brave
-  documentation and search tools count as non-writing; they also no longer discard an in-flight change capture. Tool
-  names are matched case-insensitively.
+  documentation and search tools count as non-writing, matched by exact name; they also no longer discard an
+  in-flight change capture. The delegating tools `task`, `delegate` and `subagent` always count as writers (a nested
+  child's writes are not in the producer's lineage) but still do not contaminate captures. A writer is counted in the
+  before-hook once the guard allows the call, so a call that errors still counts. Tool names are matched
+  case-insensitively and sanitised in the caveat. Known limit: a user MCP server named `router`, `context7` or `brave`
+  that exposes those exact tool names would be treated as non-writing.
 - **Roles mode: a carried role attempt now inherits the lineage's branch check and its unobservable-writer tally.** A
   carried attempt is a resume that re-checks an earlier attempt's acceptance block. A branch switch since the attempt
-  that introduced the block (`... since the attempt that introduced this acceptance; ...`), or a switch an earlier
-  attempt already found, now makes it unverifiable. Previously only the current dispatch's own window was checked.
+  that introduced the block (`... since the attempt that introduced this acceptance; ...`), or a switch any earlier
+  attempt already found (stored in the lineage; an inherited reason is prefixed "in an earlier attempt of this
+  acceptance: "), now makes it unverifiable. A carried attempt whose tree cannot be read, while the introducing attempt
+  recorded a branch, is unverifiable too. A "cannot confirm" reason is not recorded as the lineage's switch, and a
+  switch the deferred finish saw is folded into the attempt before the lineage records it. Carried attempts compare
+  names and heads only. Previously only the current dispatch's own window was checked.
+- **OpenCode v2: a tier `subagent` call now passes the child session ID (from `result.output.sessionID`) to
+  verification**, so the child's edits and unobservable writers join the producer's lineage. Visible effects on
+  OpenCode v2 tier calls: a child's shell writes now count as unobservable writers; a child's edits reach the change
+  set; `VERIFY:deferred` tier calls now really defer and return a `vrf_` handle; and the trivial-dispatch skip,
+  outcome ingestion and false-refusal detection now run for tier children.
+- **These verification fixes also change verdicts on OpenCode v1.** v1 shares the verification engine, and the v1
+  freeze allows integrity fixes; the changes only make verdicts stricter (a pass can become `unverifiable`, never the
+  reverse).
 
 ## [2.6.1] - 2026-10-09
 
