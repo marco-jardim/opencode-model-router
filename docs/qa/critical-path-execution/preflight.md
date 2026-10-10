@@ -60,8 +60,23 @@ Plan: `D:\git\omr-cpx-main\docs\plans\critical-path-execution-plan.md`. Handover
 
 The router is loaded from a moving working tree, so DF-0 switches. Precondition at the base: `npm run typecheck` green.
 Tag `cpx/df0` = `b716ee9` (pushed); worktree `D:\git\omr-cpx-dogfood-df0` added `--detach` at `cpx/df0`; `npm ci` ran
-there; `git status` clean. The process-scoped config points at it. The self-check runs after the owner's restart
-(result in the handover).
+there; `git status` clean. The process-scoped config points at it.
+
+**Self-check after the owner's restart (2026-10-10 19:46 local): PASS.**
+- The plan's host runs as its own private server (`opencode --standalone -s ses_ed82f88a7ffej5iKaRHuwIa6fd
+  D:\git\omr-cpx-main`, server process `serve --stdio`, log run id `461f3bf1`), with
+  `OPENCODE_CONFIG_DIR=C:\Users\Marquinho\AppData\Local\omr-cpx\opencode-config`.
+- `C:\Users\Marquinho\.local\share\opencode\log\opencode.log` (shared by every OpenCode server on the machine), run
+  `461f3bf1`: `loading plugin` exactly once for `D:\\git\\omr-cpx-dogfood-df0` (entrypoint
+  `file:///D:/git/omr-cpx-dogfood-df0/server.ts`) and once for `D:\\git\\opencode-anthropic-fix`; no plugin load from
+  `D:\git\opencode-model-router`. The only lines of that run naming the main checkout are the host's read-only watcher
+  on this worktree's `HEAD` inside the shared git directory (`…\.git\worktrees\omr-cpx-main\HEAD`), which is how a
+  linked worktree resolves its git directory.
+- The session's tool list has exactly one `router_verify`.
+- Observed, not caused by this plan: the background service (run `c6586e70`) still loads the router from the main
+  checkout for the owner's other windows, and the other implementation runs its own standalone server loading
+  `D:\git\opencode-model-router-cross-repo` (run `3b25a462`). `opencode-telegram-plugin` is listed in the config but
+  loaded by neither the background service nor this server (same behavior as before the switch).
 
 ## 0.P.2 — Baseline
 

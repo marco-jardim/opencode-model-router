@@ -330,7 +330,7 @@ Everything else is work: resolve it, record it, continue.
 
 ## 7. Live state (§0.11 — keep current)
 
-**Next action:** DF-0 self-check (after the owner's restart, below), then 0.P.QA.
+**Next action:** 0.P.QA round 1 (heavy reviewer) at the pre-flight commit.
 
 **Orchestrator session:** `ses_ed82f88a7ffej5iKaRHuwIa6fd` (directory `D:\git\omr-cpx-main`).
 
@@ -341,7 +341,7 @@ Everything else is work: resolve it, record it, continue.
 
 | Phase | State | QA round | Notes |
 |---|---|---|---|
-| 0.P | running | — | started 2026-10-10 18:55; 0.P.1, 0.P.3 (pending owner consent), 0.P.2, 0.P.4 done; 0.P.6 prepared, restart pending; `preflight.md` written |
+| 0.P | running | — | started 2026-10-10 18:55; 0.P.1, 0.P.3 (pending owner consent), 0.P.2, 0.P.4 done; 0.P.6 done (DF-0 self-check PASS 19:46); `preflight.md` written |
 | 0.1 | waiting | — | |
 | 1.1 · 1.2 · 1.3 · 1.4 | waiting | — | |
 | 2.1 | waiting | — | |
@@ -366,7 +366,7 @@ Writes: `test\unit\v2-hooks.test.ts`) — done, verified deterministic, committe
 `$env:LOCALAPPDATA\omr-cpx\overrides.backup.jsonc`).
 
 **Router build in use:** before the restart, the main checkout `D:\git\opencode-model-router` (moving tree, global
-plugin entry, shared background service). After the DF-0 restart: `D:\git\omr-cpx-dogfood-df0` at `cpx/df0`
+plugin entry, shared background service). Since the DF-0 restart (2026-10-10 19:46, self-check PASS): `D:\git\omr-cpx-dogfood-df0` at `cpx/df0`
 (`b716ee9`), loaded through the process-scoped config.
 
 **Plugin-entry scope and revert command (0.P.3.f):** process-scoped (§0.12-2 option 1). Config directory
