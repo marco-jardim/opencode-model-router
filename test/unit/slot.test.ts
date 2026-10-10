@@ -30,7 +30,7 @@ const HOLDER = resolve(__dirname, "../fixtures/slot/holder.mjs");
 const dirs: string[] = [];
 const children: ChildProcess[] = [];
 const handles: SlotHandle[] = [];
-/** JS build of slot.ts for the child processes (Node 20 has no type stripping). */
+/** JS build of slot.ts for the child processes (Node before 22.18 has no default type stripping). */
 let slotJs = "";
 
 beforeAll(async () => {

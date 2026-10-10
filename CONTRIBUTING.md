@@ -12,7 +12,7 @@ npm run typecheck # tsc --noEmit
 ```
 
 There is no build step — the plugin ships TypeScript sources directly. CI runs the same
-two commands on Node 20, 22 and 24, across ubuntu-latest and windows-latest.
+two commands on Node 22 and 24, across ubuntu-latest and windows-latest.
 
 ## Golden snapshots
 

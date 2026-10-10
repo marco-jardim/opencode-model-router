@@ -423,7 +423,7 @@ The statistics report includes **D17 mode (use the DF4→DF5 enforce-period wind
 
 **The script does not read the router config.** When `routing.outcomes.path` is set, pass `--dir <routing.outcomes.path>` explicitly (for example `node scripts/routing-stats.ts --dir "D:\\routing-outcomes"`); otherwise it reads the default temp trajectory directory, not your configured store.
 
-Both print the same table for a time window and produce the same text for the same store and window. `/router stats [--since <ISO>] [--until <ISO>] [--json] [--dir <path>]` flushes the live store first, then renders; `npm run routing:stats -- --since <ISO>` (PowerShell swallows a bare `--`: write `npm run routing:stats '--' --since <ISO>`) reads the files. The script is plain Node with type stripping (**Node 22.18 / 23.6 or newer**; the plugin itself still runs on Node 20), is a repository tool and is **not part of the npm package**; `/router stats` is the in-session equivalent. `--dir` means what `routing.outcomes.path` means.
+Both print the same table for a time window and produce the same text for the same store and window. `/router stats [--since <ISO>] [--until <ISO>] [--json] [--dir <path>]` flushes the live store first, then renders; `npm run routing:stats -- --since <ISO>` (PowerShell swallows a bare `--`: write `npm run routing:stats '--' --since <ISO>`) reads the files. The script is plain Node with type stripping (**Node 22.18 / 23.6 or newer**; the plugin itself runs on Node 22 and later), is a repository tool and is **not part of the npm package**; `/router stats` is the in-session equivalent. `--dir` means what `routing.outcomes.path` means.
 
 | Line | Meaning |
 |---|---|

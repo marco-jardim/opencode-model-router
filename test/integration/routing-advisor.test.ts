@@ -641,7 +641,7 @@ describe("D18 /router stats and the checkpoint line", { timeout: 60_000 }, () =>
     decisionRow("D2", "2026-10-06T11:00:00.000Z", { resume: true }),
   ];
 
-  // The subprocess needs default TS stripping; module-level stats tests still run on Node 20.
+  // The subprocess needs default TS stripping; module-level stats tests still run on Node 22 before 22.18.
   it.skipIf(!supportsPlainNodeTypeScript())("D18: prints exactly the stdout of scripts/routing-stats.ts for the same store and window", async () => {
     seed(...ROWS);
     const hooks = await plugin({ engine: "shadow", outcomes: { path: store } });

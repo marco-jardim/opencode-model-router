@@ -1309,7 +1309,7 @@ These are character counts of the prompts the shipped config actually produces, 
 ## Requirements
 
 - [OpenCode](https://opencode.ai) v1 (`>=1.0.0 <2.0.0`) or v2 **2.0.20+** (TUI status: 2.0.24+)
-- Node.js 20+
+- Node.js 22+
 - Provider API keys configured in OpenCode
 
 ## License
