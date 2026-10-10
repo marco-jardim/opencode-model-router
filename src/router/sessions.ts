@@ -647,6 +647,8 @@ export interface VerificationBaseline {
   readonly tree?: { readonly head: string; readonly branch?: string | null };
   /** A branch-switch reason already found in an earlier attempt of this lineage; carried attempts inherit it. */
   readonly switched?: string;
+  /** I5 (P0.3): tools the lineage ran whose writes the router cannot observe (sorted); carried attempts are judged with them. */
+  readonly writers?: readonly string[];
 }
 
 export interface DispatchInput {
@@ -817,6 +819,7 @@ function frozenVerification(v: CarriedVerification): CarriedVerification {
         ...(v.baseline.tree === undefined ? {} : { tree: Object.freeze({ head: v.baseline.tree.head,
           ...(v.baseline.tree.branch === undefined ? {} : { branch: v.baseline.tree.branch }) }) }),
         ...(v.baseline.switched === undefined ? {} : { switched: v.baseline.switched }),
+        ...(v.baseline.writers === undefined ? {} : { writers: Object.freeze([...v.baseline.writers]) }),
       }),
     }),
   });

@@ -40,6 +40,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counts as a switch (reported as "moved"), and so does a new branch created at the same commit (fail closed).
   `router_verify` refuses when a branch was recorded at return but the working tree cannot be read ("cannot confirm
   the branch of `<root>`"). Each verification snapshot runs one more git process (`git symbolic-ref -q HEAD`).
+- **A pass on an empty change set is no longer reported as verified when the producer ran a tool whose writes the
+  router cannot observe** (`bash`, `router_run`, Code Mode `execute`, MCP and unknown tools). The result is
+  `unverifiable` with the caveat `no change was observed in <root> but the producer ran <tools>; a write those tools
+  made cannot be seen, so this is not a verified pass`, on the deterministic and the grader path, and at
+  `router_verify`. Read-only router tools (`router_git_*`, `router_request_authority`) and the context7 and Brave
+  documentation and search tools count as non-writing; they also no longer discard an in-flight change capture. Tool
+  names are matched case-insensitively.
+- **Roles mode: a carried role attempt now inherits the lineage's branch check and its unobservable-writer tally.** A
+  carried attempt is a resume that re-checks an earlier attempt's acceptance block. A branch switch since the attempt
+  that introduced the block (`... since the attempt that introduced this acceptance; ...`), or a switch an earlier
+  attempt already found, now makes it unverifiable. Previously only the current dispatch's own window was checked.
 
 ## [2.6.1] - 2026-10-09
 

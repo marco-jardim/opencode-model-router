@@ -898,6 +898,12 @@ export interface RoleAttemptChanges {
   readonly reference: ReferenceState;
   readonly snapshot?: Pick<TreeSnapshot, "cwd" | "root" | "head" | "branch"> | undefined;
   readonly branchSwitch?: string | undefined;
+  readonly unattributedWriters?: string[] | undefined;
+}
+
+/** I5 (P0.3): the sorted union of two writer lists. */
+function unionWriters(older: readonly string[] | undefined, newer: readonly string[] | undefined): string[] {
+  return [...new Set([...(older ?? []), ...(newer ?? [])])].sort();
 }
 
 /** The union of two change sets, keyed by path (separators unified, case folded on win32); `newer` wins. */
@@ -928,15 +934,20 @@ export function roleAttemptVerification<T extends RoleAttemptChanges>(childSessi
   if (!opts.carried) {
     const tree = now === undefined ? {} : { tree: { head: now.head, ...(now.branch === undefined ? {} : { branch: now.branch }) } };
     const switched = prepared.branchSwitch === undefined ? {} : { switched: prepared.branchSwitch };
-    updateDispatchVerification(childSessionID, { ...verification, baseline: { reference: prepared.reference, changed: own, ...tree, ...switched } });
+    const ownWriters = unionWriters(undefined, prepared.unattributedWriters);
+    const writers = ownWriters.length === 0 ? {} : { writers: ownWriters };
+    updateDispatchVerification(childSessionID, { ...verification, baseline: { reference: prepared.reference, changed: own, ...tree, ...switched, ...writers } });
     return prepared;
   }
   const baseline = verification.baseline;
   if (baseline === undefined) return { ...prepared, changeBaseline: "unavailable", reference: CARRIED_NO_REFERENCE };
   const changed = unionChanges(baseline.changed, own);
+  // I5 (P0.3): a write an earlier attempt made through a tool the router cannot observe is part of the carried change too.
+  const lineageWriters = unionWriters(baseline.writers, prepared.unattributedWriters);
   updateDispatchVerification(childSessionID, { ...verification, baseline: { reference: baseline.reference, changed,
     ...(baseline.tree === undefined ? {} : { tree: baseline.tree }),
-    ...(baseline.switched === undefined ? {} : { switched: baseline.switched }) } });
+    ...(baseline.switched === undefined ? {} : { switched: baseline.switched }),
+    ...(lineageWriters.length === 0 ? {} : { writers: lineageWriters }) } });
   // I7 across attempts. Precedence: a switch seen during this dispatch, then one inherited from an earlier attempt,
   // then a switch between the introducing attempt's tree and this one.
   const lineageSwitch = prepared.branchSwitch !== undefined ? undefined
@@ -949,6 +960,7 @@ export function roleAttemptVerification<T extends RoleAttemptChanges>(childSessi
     changeBaseline: changed === "unavailable" ? "unavailable" : "available",
     reference: baseline.reference,
     ...(lineageSwitch === undefined ? {} : { branchSwitch: lineageSwitch }),
+    ...(lineageWriters.length === 0 ? {} : { unattributedWriters: lineageWriters }),
   };
 }
 

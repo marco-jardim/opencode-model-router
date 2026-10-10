@@ -1678,6 +1678,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 changeBaseline: verification.changeBaseline,
                 ...(verification.snapshot?.root !== undefined ? { changeRoot: verification.snapshot.root } : {}),
                 ...(verification.branchSwitch !== undefined ? { branchSwitch: verification.branchSwitch } : {}),
+                ...(verification.unattributedWriters !== undefined && verification.unattributedWriters.length > 0
+                  ? { unattributedWriters: verification.unattributedWriters } : {}),
                 finalReturnText: producerText,
                 declaredOutputs: dod.deliverable ? [dod.deliverable] : [],
                 producerSessionID: producerSid,
@@ -2481,6 +2483,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               changeBaseline: verification.changeBaseline,
               ...(verification.snapshot?.root !== undefined ? { changeRoot: verification.snapshot.root } : {}),
               ...(verification.branchSwitch !== undefined ? { branchSwitch: verification.branchSwitch } : {}),
+              ...(verification.unattributedWriters !== undefined && verification.unattributedWriters.length > 0
+                ? { unattributedWriters: verification.unattributedWriters } : {}),
               finalReturnText,
               declaredOutputs: dod.deliverable ? [dod.deliverable] : [],
               producerSessionID: childSessionID ?? "",

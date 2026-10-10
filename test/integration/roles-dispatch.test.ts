@@ -604,6 +604,21 @@ describe("P3.3 global QA round 1: resumes keep the resumed dispatch's facts and 
       const carried = roleAttemptVerification("child-h", attemptOf(world, "A", "main"), { carried: true });
       expect(carried.branchSwitch).toBe(INHERITED);
     });
+
+    it("the unattributed writers of the introducing attempt are unioned into the carried attempts (P0.3)", async () => {
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+      await acceptanceChild(world, "child-w1");
+      await acceptanceChild(world, "child-w2");
+      const withWriters = (...writers: string[]): RoleAttemptChanges => ({ ...attemptOf(world, "A", "main"), ...(writers.length > 0 ? { unattributedWriters: writers } : {}) });
+      // Own attempts: the writers of the attempt itself are returned.
+      expect(roleAttemptVerification("child-w1", withWriters("bash"), { carried: false }).unattributedWriters).toEqual(["bash"]);
+      roleAttemptVerification("child-w2", withWriters("bash"), { carried: false });
+      await resume(world, "child-w1"); await resume(world, "child-w2"); // the baseline goes through frozenVerification
+      // A carried attempt that ran nothing unobservable still reports the introducing attempt's writers.
+      expect(roleAttemptVerification("child-w1", withWriters(), { carried: true }).unattributedWriters).toEqual(["bash"]);
+      // A carried attempt with another tool: the union, sorted and without duplicates.
+      expect(roleAttemptVerification("child-w2", withWriters("router_run"), { carried: true }).unattributedWriters).toEqual(["bash", "router_run"]);
+    });
   });
 });
 

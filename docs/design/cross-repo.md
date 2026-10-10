@@ -1,6 +1,6 @@
 # Cross-repo work in roles mode
 
-**Status:** Accepted 2026-10-10 (owner). Phase 0 in progress (P0.1, P0.2 and P0.4 done).
+**Status:** Accepted 2026-10-10 (owner). Phase 0 implemented (P0.1–P0.4); phase QA pending.
 **Scope:** roles mode on OpenCode v2 (`routing.delegation: "roles"`). Phase 0 changes the shared verification engine and applies to both hosts.
 **Configuration keys** marked *proposed (not implemented)* do not exist yet.
 **File references** are `path:line` as of 2026-10-10. Line numbers drift; the function names are the stable reference.
@@ -184,7 +184,7 @@ Allow once = this dispatch only. Allow always = until it expires. Reject = no wo
 - **I5 — Empty change with writers.** If no change was observed in P and the lineage ran an unattributable writer, a pass carries a caveat. It renders as UNVERIFIED (`docs/VERIFICATION.md:242`).
   - *Unattributable writer:* a tool that is neither in `WRITE_TOOLS` (`src/verify/dispatch.ts:101`) nor in `NON_WRITING_TOOLS` (`dispatch.ts:114-119`), and is not a read-only router tool (`router_git_*`, `src/router/git-tools.ts:11`; `router_request_authority`, `src/routing/roles/authority.ts:28`). This covers `bash`, `router_run`, MCP tools and unknown tools.
 - **I6 — Reference exactness.** A package link in a linked `node_modules` whose real path is outside the repository and has no `node_modules` segment makes the reference approximate unless it is pinned (Phase 2). An approximate reference never excuses a failure (`baseline.ts:162-165`).
-- **I7 — Branch continuity.** W's branch at return equals its branch at dispatch. At `router_verify`, it equals its branch at return. A HEAD that moved by commits on the same branch is handled as today (`wiring.ts:1118-1140`).
+- **I7 — Branch continuity.** W's branch at return equals its branch at dispatch. At `router_verify`, it equals its branch at return. A HEAD that moved by commits on the same branch is handled as today (`wiring.ts:1118-1140`). A carried role attempt is also compared with the tree of the attempt that introduced its acceptance block.
 - **I8 — Scoped pass.** When `routing.repoParents` is configured, a pass's evidence names P (repository, branch, short HEAD) and every link target that was not observed.
 - **I9 — Inert by default.** Without `routing.repoParents` and without approvals, the protocol text, dispatch header, banners and goldens are byte-identical. On v1 the new keys are inert, with one notice (`touched`, `config.ts:3215-3216`).
 - **I10 — Reads never widen writes.** Read authority never widens write authority or the change baseline.
@@ -362,14 +362,17 @@ Each slice lands test-first: the failing test reproduces the scenario row, then 
 - Implemented: `src/verify/branch.ts` (`branchSwitched`, `branchSwitchReason`, `branchUnconfirmedReason`), `GitExitError` / `readBranch` in `tree.ts`; a switch during the dispatch on the deferred path returns `{ deferred: false, reason: "branch-switched" }` so the required gate refuses.
 - Detached → detached at another commit counts as a switch (the verb is "moved"): commits on a detached HEAD cannot be told from a checkout without the reflog.
 - Known difference: when the gate snapshot is missing on the synchronous path, behaviour is unchanged (the change baseline is unavailable); the deferred path refuses in the same situation with "cannot confirm the branch". "Cannot confirm" is not retryable unless the router_verify call itself was cut short.
+- Roles lineage: the carried baseline (`VerificationBaseline` in `src/router/sessions.ts`) records the introducing attempt's tree and any switch already found; a carried attempt is checked against it ("since the attempt that introduced this acceptance").
 
 **P0.3 — Unattributable writers (S1, S3, S10)**
 - `src/verify/dispatch.ts`:
   - `record` (`:468-488`): collect `writers` per session (definition in I5).
   - `DispatchRecord` (`:174-206`) and `fold`: union the writers over the lineage.
   - `delta` (`:374-446`): return `unattributedWriters`.
-- `gate.ts`: a pass with an empty change set and writers gets the caveat `no change was observed in <P> but the producer ran <tools>; a write outside <P> cannot be seen, so this is not a verified pass`, on both branches.
+- `gate.ts`: a pass with an empty change set and writers gets the caveat `no change was observed in <root> but the producer ran <tools>; a write those tools made cannot be seen, so this is not a verified pass` (`<root>`: the change root, else the base directory; at most five tools, then "and N more"), on both branches.
 - The deferred no-change shortcut (`wiring.ts:1639-1644`) already falls through to the required gate, which then applies the caveat.
+- Implemented: `isUnattributedWriter` / `isNonWritingTool` in `src/verify/dispatch.ts` (exact names for read-only router, context7 and Brave tools; prefixes are not trusted); `unattributedWritersCaveat` in `src/verify/gate.ts`; carried to the gate on the task, delegate and deferred paths and through the roles carried baseline (`VerificationBaseline.writers`).
+- The rule turns a passing verdict into `unverifiable` (accepted with a caveat, rejected under `strictUnverifiable`), like the other P0 refusals.
 
 **P0.4 — External link at the reference (S6, S7)**
 - `src/verify/reference.ts` materialize step 7 (`:1820-1845`): apply the P0.4 rule from section 6. Add `"external-link"` to the cause union (`:802-812`).

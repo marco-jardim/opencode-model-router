@@ -180,6 +180,11 @@ export interface PreparedVerification {
    * seen. The artefact builders hand it to the gate (Artefact.branchSwitch), which then refuses on either verifier.
    */
   branchSwitch?: string;
+  /**
+   * I5 (P0.3, S1/S3/S10): tools the producer lineage ran whose writes the router cannot observe (store.delta); the artefact
+   * builders hand them to the gate (Artefact.unattributedWriters). Absent or empty: none.
+   */
+  unattributedWriters?: string[];
 }
 
 /**
@@ -1699,6 +1704,8 @@ export function createVerificationWiring(deps: {
         // adds the caveats to its verdict.
         ...(change.concurrentDispatches !== undefined && change.concurrentDispatches > 0 ? { concurrentDispatches: change.concurrentDispatches } : {}),
         ...(change.contaminatedBy !== undefined ? { contaminatedBy: change.contaminatedBy } : {}),
+        // I5 (P0.3): router_verify's gate adds the caveat to a pass on an empty change set.
+        ...(change.unattributedWriters !== undefined && change.unattributedWriters.length > 0 ? { unattributedWriters: change.unattributedWriters } : {}),
       });
       if (!reg.ok) {
         // QA-2.4-4: never a delegation without a verdict path: the caller runs the required gate.
@@ -1875,6 +1882,7 @@ export function createVerificationWiring(deps: {
         reference,
         snapshot: tree,
         ...(branchSwitch !== undefined ? { branchSwitch } : {}),
+        ...(entry.unattributedWriters !== undefined ? { unattributedWriters: [...entry.unattributedWriters] } : {}),
       },
       drift,
       root,
@@ -1910,6 +1918,8 @@ export function createVerificationWiring(deps: {
       changeBaseline: prep.prepared.changeBaseline,
       ...(prep.root !== undefined ? { changeRoot: prep.root } : {}),
       ...(prep.prepared.branchSwitch !== undefined ? { branchSwitch: prep.prepared.branchSwitch } : {}),
+      ...(prep.prepared.unattributedWriters !== undefined && prep.prepared.unattributedWriters.length > 0
+        ? { unattributedWriters: prep.prepared.unattributedWriters } : {}),
       // Not stored (R3): a testsPass DoD is deterministic, and no deterministic check reads it.
       finalReturnText: "",
       declaredOutputs: dod.deliverable ? [dod.deliverable] : [],

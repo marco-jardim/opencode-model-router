@@ -489,6 +489,11 @@ export interface PendingRegistration {
    * on another branch by then, or one it cannot read while a branch was recorded. Absent: no snapshot then, and no check.
    */
   readonly returnedTree?: ReturnedTree;
+  /**
+   * I5 (P0.3): tools the producer lineage ran whose writes the router cannot observe (sorted). With an empty change set,
+   * router_verify's pass carries a caveat. Absent: none.
+   */
+  readonly unattributedWriters?: readonly string[];
 }
 
 /** I7 (P0.2): HEAD and branch at return (TreeSnapshot.head / .branch: a short name, null when detached, absent when unknown). */
@@ -548,6 +553,8 @@ export interface PendingEntry {
   readonly contaminatedBy?: string;
   /** PendingRegistration.returnedTree, as registered. */
   readonly returnedTree?: ReturnedTree;
+  /** PendingRegistration.unattributedWriters, as registered. */
+  readonly unattributedWriters?: readonly string[];
   readonly createdAt: number;
   readonly state: PendingState;
   /** Set while state is "verifying". */
@@ -747,6 +754,7 @@ interface EntryRecord {
   readonly concurrentDispatches: number | undefined;
   readonly contaminatedBy: string | undefined;
   readonly returnedTree: ReturnedTree | undefined;
+  readonly unattributedWriters: readonly string[] | undefined;
   dod: DoD | undefined;
   reference: Promise<ReferenceState>;
   changedFiles: readonly ChangedPath[] | "unavailable";
@@ -843,6 +851,7 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       ...(rec.concurrentDispatches !== undefined ? { concurrentDispatches: rec.concurrentDispatches } : {}),
       ...(rec.contaminatedBy !== undefined ? { contaminatedBy: rec.contaminatedBy } : {}),
       ...(rec.returnedTree !== undefined ? { returnedTree: rec.returnedTree } : {}),
+      ...(rec.unattributedWriters !== undefined ? { unattributedWriters: rec.unattributedWriters } : {}),
       createdAt: rec.createdAt,
       state: rec.state,
       verifyingSince: rec.verifyingSince,
@@ -1084,6 +1093,8 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       concurrentDispatches: reg.concurrentDispatches,
       contaminatedBy: reg.contaminatedBy,
       returnedTree: reg.returnedTree !== undefined ? Object.freeze({ ...reg.returnedTree }) : undefined,
+      unattributedWriters: reg.unattributedWriters !== undefined && reg.unattributedWriters.length > 0
+        ? Object.freeze([...reg.unattributedWriters]) : undefined,
       dod: reg.dod,
       reference,
       changedFiles,

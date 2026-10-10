@@ -231,6 +231,8 @@ Unverifiable means the router could not tell whether the change broke tests. It 
 - **the change set spans repositories**: at least one changed path lies outside the git top-level the change was observed in (an absolute path, or a relative one that climbs out with `..`), mixed with paths inside it (a change set entirely outside has its own reason). The checks, or a grader, would cover only the inside paths, so the gate never passes the whole set; see [`cwd`-scoped verification](#cwd-scoped-verification);
 - **the working tree switched branch**: HEAD moved to another branch during the dispatch, or between the producer's return and `router_verify` (detached → detached at another commit counts, and so does a new branch created at the same commit; fail closed). The diff between the two heads would become the change set and the checks would verify another branch. See [Branch switch](#branch-switch);
 - **the branch cannot be confirmed**: a branch was recorded when the producer returned, but the working tree could not be read at `router_verify`, so the router cannot tell whether the checks would run on the same branch;
+- **an empty change set after a tool whose writes cannot be observed**: no change was observed, but the producer ran `bash`, `router_run`, Code Mode `execute`, an MCP tool or an unknown tool, so a write it made cannot be seen. See [Unobservable writes](#unobservable-writes);
+- **a carried role attempt on another branch**: a resumed role attempt that re-checks an earlier attempt's acceptance block runs on a branch other than the one the attempt that introduced the block saw, or an earlier attempt of the lineage already found a switch. See [Branch switch](#branch-switch);
 - the command is not allowlisted, the check errored, or the lineage caveat applies.
 
 By default an unverifiable result is **returned with a caveat** that names the reason. Set `verify.strictUnverifiable: true` to reject it instead. Unverifiable never counts as verified. It is not proof that the tests pass, and it is never labelled accepted or verified (plan G2). A gate that timed out, for example, renders:
@@ -266,7 +268,7 @@ Residual limits: only tests that **name** the module run. A test that reaches th
 While a dispatch's tree snapshot or reference capture is still in flight (a `VERIFY_WAIT` shorter than the capture, or `VERIFY_WAIT:0s`), a write would land in the baseline and hide itself: "no changed files", or a failure that looks pre-existing at the reference. So the router fails closed (Phase 3.1, E2E-3):
 
 - Only tools known not to write leave an in-flight snapshot or capture alone: `read`, `glob`, `grep`, `list`, `ls`, `codesearch`, `webfetch`, `websearch`, `lsp`, `todoread`, `todowrite`, `question`, `skill`, `plan_enter`, `plan_exit`, `invalid`, `task`, `list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource`, `delegate` and `router_verify` (`NON_WRITING_TOOLS` in `src/verify/dispatch.ts`).
-- Any other tool that runs in an overlapping directory during that window counts as a write: the shells, the edit tools, and every tool the router does not know, **MCP tools** (named `<server>_<tool>`, even read-only ones) and custom or plugin tools included. A tool without a `cwd` argument overlaps every pending capture. That dispatch's change set becomes unavailable and its reference none, so its `testsPass` result is **unverifiable**, never a pass.
+- Any other tool that runs in an overlapping directory during that window counts as a write: the shells, the edit tools, and every tool the router does not know, **MCP tools** (named `<server>_<tool>`, even read-only ones, except the exact names of the read-only router tools `router_git_*` and `router_request_authority` and the context7 and Brave documentation and search tools, which are non-writing and leave the capture alone) and custom or plugin tools included. A tool without a `cwd` argument overlaps every pending capture. That dispatch's change set becomes unavailable and its reference none, so its `testsPass` result is **unverifiable**, never a pass.
 - `task` and `delegate` start sessions whose own tool calls are observed, so parallel dispatches do not contaminate each other by starting. Outside the capture window nothing changes.
 
 Residual limits: a write with no tool event (an external editor, an MCP server that writes after its call returned, the user's own `!` shell) cannot be seen by any hook. A tool that writes under a non-writing name (for example a custom tool called `lsp`) is not caught.
@@ -365,10 +367,27 @@ A switch of the verified working tree to another branch makes the result **unver
 
 - `the working tree <root> switched from <A> to <B> during the dispatch; the checks would verify another branch`
 - `the working tree <root> switched from <A> to <B> since the producer returned; the checks would verify another branch`
+- `the working tree <root> switched from <A> to <B> since the attempt that introduced this acceptance; the checks would verify another branch`
 - when both sides are detached, `moved` replaces `switched`: commits on a detached HEAD cannot be told from a checkout without the reflog.
 - `cannot confirm the branch of <root>: the working tree could not be read at router_verify, so the checks could verify another branch`
 
 A switch during the dispatch on the deferred path is not deferred: the required gate refuses it. "Cannot confirm" is not retryable unless the `router_verify` call itself was cut short. Each verification snapshot runs one more git process for this.
+
+In roles mode, a **carried** role attempt (a resume that re-checks an earlier attempt's acceptance block) inherits the lineage's branch check: its tree is compared with the tree of the attempt that introduced the block, and a switch an earlier attempt of the lineage already found is carried forward, so the attempt is unverifiable. Before, only the current dispatch's own window was checked.
+
+#### Unobservable writes
+
+A pass on an **empty change set** is not a verified pass when the producer ran a tool whose writes the router cannot observe. The router attributes changes from the tree snapshot and the write tools' own events; a `bash` or `router_run` script, a Code Mode `execute` call, an MCP tool or a tool the router does not know can write without either. The result is **unverifiable** (also a caveat), on the deterministic and the grader path and at `router_verify`:
+
+- `no change was observed in <root> but the producer ran <tools>; a write those tools made cannot be seen, so this is not a verified pass`
+
+Which tools count:
+
+- **Unobservable writers**: every tool that is not known to be non-writing, among them `bash`, `router_run`, Code Mode `execute`, MCP tools (named `<server>_<tool>`) and unknown or custom tools.
+- **Non-writing** (not counted, and they leave an in-flight change capture alone, see [Dispatch capture and unknown tools](#dispatch-capture-and-unknown-tools)): the read-only router tools (`router_git_*`, `router_request_authority`) and the context7 and Brave documentation and search tools, matched by their exact names; a name prefix is not trusted.
+- Tool names are matched case-insensitively.
+
+A non-empty change set carries no such caveat: the observed changes are checked as usual. The writers of a role lineage are folded across its attempts, so a carried attempt keeps the tally. The usual `strictUnverifiable` policy applies: accepted with a caveat by default, rejected when strict.
 
 ## `verify` config keys
 
