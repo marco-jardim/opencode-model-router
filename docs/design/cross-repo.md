@@ -317,7 +317,7 @@ The first sentence of the working-directory paragraph is today's text (`src/rout
 **Reference contamination.**
 - Materialize links the live `node_modules` (`reference.ts:1764-1798`). Workspace-link drift checks only targets inside the repository (`reference.ts:1820-1845`); a link to `D:\git\lib-b` is skipped (`:1833-1834`).
 - **P0.4 rule.** A package entry (top level, and one level under each `@scope`, as `packageEntries` reads them) is a link whose real path is outside root and realRoot and contains no `node_modules` segment → the reason `external-link`, and the reference is approximate.
-- **What stays exact:** a `node_modules` that is itself a junction to an outside store, as in `test/unit/reference.test.ts:1232-1299`, and a link into a store path that contains `node_modules`.
+- **What stays exact:** a `node_modules` that is itself a junction to an outside store, as in `test/unit/reference.test.ts:1291-1358`, and a link into a store path that contains `node_modules`.
 
 **Pinning (Phase 2).**
 - At dispatch, snapshot each admitted link target as part of P. Add a bounded digest of the ignored files under the target, excluding `node_modules`. The digest matters because `snapshotTree` hashes status, diffs and untracked files only (`tree.ts:214-243`), while linked packages often load an ignored `dist/`.
@@ -428,7 +428,7 @@ Each slice lands test-first: the failing test reproduces the scenario row, then 
 **Must stay green**
 - Every golden in `test/golden/`, including the default roles protocol (`test/golden/roles-protocol.golden.test.ts:26-55`, template test `:101-108`), the dispatch header and the banners.
 - `test/unit/runner.test.ts:741-777`.
-- `test/unit/reference.test.ts:1232-1299` (`node_modules` as a junction to an outside store stays exact).
+- `test/unit/reference.test.ts:1291-1358` (`node_modules` as a junction to an outside store stays exact).
 - The docs-drift pins.
 - `npm run smoke:v1`.
 
