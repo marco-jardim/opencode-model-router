@@ -160,10 +160,16 @@ that have a workaround — is resolved without asking.
   `D:\git\omr-cpx-p21\src\compat\background.ts`; in an executor slot, the slot root. Before every dispatch and every
   file read of its own, the orchestrator checks that nothing it sends or runs names `D:\git\opencode-model-router`: the
   guard applies to `root=`, `cwd:`, `Writes:`/`Reads:` lines, tool arguments and shell commands; prose that names the
-  off-limits checkout is allowed. A hit is a defect and is never sent (§0.13). *Amended by QA-0.P-10:* the same guard
-  rejects a `root=`, `cwd:` or `Writes:` line naming `D:\git\omr-cpx-dogfood-` (dogfood worktrees are valid git
-  worktrees, so the router would accept them, but they are never edited, §0.12-1), and anything naming the other
-  implementation's worktree `D:\git\opencode-model-router-cross-repo`.
+  off-limits checkout is allowed. A hit is a defect and is never sent (§0.13). *Amended by QA-0.P-10/QA-0.P-20:* the
+  guard compares **normalized** paths (case-folded, `/` → `\`, trailing separator trimmed; a prefix match), because the
+  router normalizes `root=` before validating it, and it has one scope list:
+  - `D:\git\opencode-model-router` and the other implementation's worktree `D:\git\opencode-model-router-cross-repo`:
+    never in `root=`, `cwd:`, `Writes:`/`Reads:`, a tool argument or a shell command that reads, writes or runs there;
+  - `D:\git\omr-cpx-dogfood-*`: never in `root=`, `cwd:` or `Writes:`, and never written by a command (they are valid
+    git worktrees, so the router would accept them, but a dogfood worktree is never edited, §0.12-1); running its
+    scripts read-only (§0.12-5 `routing-stats.ts`) is allowed.
+
+  Prose, and log-search patterns that only match text in a log file, are allowed for all three.
 - The substitution also applies to the orchestrator's own reads and writes of phase files (phase reports, implementation
   notes, handoffs): they live in the phase worktree. Only these are literal paths in `D:\git\omr-cpx-main`: the
   handover, `CHANGELOG.md`, `dogfood.md`, `preflight.md`, `global.md`, the plan file and its amendments, ADR 0007
@@ -748,11 +754,14 @@ because role agents get no authority in `D:\git\omr-cpx-main` without `routing.w
       `D:\git\omr-cpx-main\.opencode\opencode-model-router.overrides.jsonc` (project layer, gitignored), never globally;
     - the global override gets only `routing.workRoots` entries `D:/git/omr-cpx-main`, `D:/git/omr-cpx-p*`,
       `D:/git/omr-cpx-pdf*`, `D:/git/omr-cpx-scratch*`, `D:/git/omr-cpx-e2e*` (additive; not the dogfood worktrees).
-      *Amended by QA-0.P-1:* the scratch and e2e entries are globs because a literal entry is resolved with `realpath`
-      at plugin start and dropped when the directory does not exist yet (`D:\git\omr-cpx-main\src\router\role-agents.ts`
-      ≈198-205, ≈257-260); both directories are created after a restart. Validate with
-      `externalDirectoryPatterns([], <entries>)` (`problems: []`). The executor keys are set later, in the DF-2
-      pre-flight.
+      *Amended by QA-0.P-1/QA-0.P-15:* the scratch and e2e entries are globs because a literal entry is resolved with
+      `realpath` whenever the role agents are registered — at plugin start and at every refresh after a config-file
+      change (`D:\git\omr-cpx-main\src\compat\v2-hooks.ts` ≈1174-1182, ≈1354) — and dropped when the directory does
+      not exist at that moment (`D:\git\omr-cpx-main\src\router\role-agents.ts` ≈198-205, ≈257-260); both directories
+      are created later. Validate with `externalDirectoryPatterns([], <entries>)` (`problems: []`). **An edit to the
+      global override reaches every running router on the machine at its next prompt**, the other implementation's
+      included; the owner is told before each such edit, and it is recorded in the handover. The executor keys are set
+      later, in the DF-2 pre-flight.
 
     Without the work roots, role agents get no write or run authority in phase worktrees
     (`D:\git\omr-cpx-main\docs\ROLES.md` ≈179-193). If something is missing, the human adds it and restarts OpenCode;
@@ -788,11 +797,15 @@ because role agents get no authority in `D:\git\omr-cpx-main` without `routing.w
   tool is registered, and OpenCode's plugin-load log (the newest file under the log directory recorded in 0.P.3.f)
   names `D:\git\omr-cpx-dogfood-df0`. *Amended by QA-0.P-6/QA-0.P-9 (applies to every DF self-check, DF1.4.a and
   DF2.4.0 included):* the log file is shared by every OpenCode server on the machine, so the check is scoped to the
-  plan server's run: the orchestrator runs a marker shell command (`Write-Output omr-selfcheck-<nonce>`) and takes the
-  `run=` id of the log's `spawning process` line carrying that nonce. Within that run there must be exactly one
-  `loading plugin` line for `D:\\git\\omr-cpx-dogfood-df<n>` and zero `loading plugin` lines for
-  `D:\\git\\opencode-model-router` (the host's watcher on `…\.git\worktrees\omr-cpx-main\HEAD` is expected), and the
-  server process is the versioned OpenCode executable recorded in 0.P.3.a (the version ADR 0007 records).
+  plan server's run: the orchestrator runs a marker shell command with a **fresh literal nonce**
+  (`Write-Output omr-selfcheck-<nonce>`, never reused) and takes the `run=` id of the **newest** `spawning process`
+  line carrying it. *Amended by QA-0.P-18:* within that run the set of `loading plugin` ids must **equal** the plugin
+  list of the regenerated process-scoped `opencode.json`, each exactly once, with the router entry's entrypoint
+  exactly `file:///D:/git/omr-cpx-dogfood-df<n>[.<k>]/server.ts` of the build being switched to (so no second router
+  build — an older dogfood build, a phase worktree or the main checkout — can be loaded; the host's watcher on
+  `…\.git\worktrees\omr-cpx-main\HEAD` is expected), and the server process is the versioned OpenCode executable
+  recorded in 0.P.3.a (the version ADR 0007 records). The handover records each build that passes; a rollback
+  (§0.12-6) returns to the **last build that passed its self-check**.
   Writes: none (the handover records the result). Reads: the 0.P.3.f record in the handover.
 - **0.P.QA** [tier:heavy] Senior QA of the setup. CAP:none — reason: needs the setup, the configuration and the plan
   together.
@@ -1827,7 +1840,10 @@ Phases 2.2–2.4 and 3.x build in parallel against this fixed contract, and `src
       only under `routing.leases.run: "refuse"`;
     - `execute.after` of `glob` and `grep` calls `filterSearchResults` and adds a one-line note;
     - leases are released on child execution end, interrupt or failure.
-  - 2.1.5.f v2 only: one startup info log `[router] plugin root <realpath>`.
+  - 2.1.5.f v2 only: one startup info log `[router] plugin root <realpath>`. *QA-0.P-16:* the phase records where
+    the line lands (the router logger writes through `console.warn` when it has no client,
+    `D:\git\omr-cpx-main\src\router\logger.ts` ≈103-110) and whether that sink tags it with the server's run id; Phase
+    2.1 QA checks it. The DF gates do not depend on it.
   [acceptance]
   cwd: D:\git\omr-cpx-p21
   check: buildPasses
@@ -2011,12 +2027,14 @@ verifications are then exercised for real, by the plan's remaining phases.
   `D:\git\omr-cpx-main`, and type `continue`.
 - **DF1.4** Self-check probes on the new build. Create `D:\git\omr-cpx-scratch` with
   `git -C D:\git\omr-cpx-main worktree add -b cpx/scratch-df1 D:\git\omr-cpx-scratch cpx/main`, then `npm ci`.
-  Writes: `D:\git\omr-cpx-scratch\docs\dogfood-probe.md` (DF1.4.c only). Reads: `D:\git\omr-cpx-scratch\`, the router
-  log, `/router stats`.
-  - DF1.4.a **Build loaded.** Pass when the startup log line `[router] plugin root <realpath>` (2.1.5.f) in the router
-    log (the newest file under OpenCode's log directory recorded in 0.P.3.f) names `D:\git\omr-cpx-dogfood-df1`,
-    `git -C <root> rev-parse HEAD` equals `git -C D:\git\omr-cpx-main rev-parse cpx/df1^{commit}`, and exactly one
-    `router_verify` tool is registered.
+  Writes: `D:\git\omr-cpx-scratch\docs\dogfood-probe.md` (DF1.4.c only). Reads: `D:\git\omr-cpx-scratch\`,
+  `C:\Users\Marquinho\.local\share\opencode\log\opencode.log` (QA-0.P-16), `/router stats`.
+  - DF1.4.a **Build loaded.** *Amended by QA-0.P-16:* pass when the run-scoped self-check of 0.P.6 (marker run id,
+    `loading plugin` set equal to the regenerated config, router entrypoint
+    `file:///D:/git/omr-cpx-dogfood-df1/server.ts`, versioned server executable) passes in
+    `C:\Users\Marquinho\.local\share\opencode\log\opencode.log`, `git -C <root> rev-parse HEAD` equals
+    `git -C D:\git\omr-cpx-main rev-parse cpx/df1^{commit}`, and exactly one `router_verify` tool is registered. The
+    2.1.5.f `[router] plugin root <realpath>` line is supporting evidence only when its sink tags it with that run.
   - DF1.4.b **Background.** Dispatch a runner with an acceptance block containing `check: testsPass`:
     [route class=other risk=low scope=single needs=shell d=deterministic root=D:\git\omr-cpx-scratch tier=fast pin]
     ```
@@ -3733,7 +3751,10 @@ executor's slots for this plan, under the trusted `slotsDir` `D:\git\.omr-cpx-sl
 - [ ] `D:\git\omr-cpx-main\.opencode\opencode-model-router.overrides.jsonc` (project layer) has
       `routing.executor.capacityCooldownMs: 600000` (§0.6-11). The global override gets, additively, the trusted
       `routing.executor.slotsDir` = `D:/git/.omr-cpx-slots` and
-      `routing.executor.phaseSuite: [{"script": "test-files", "args": ["--maxWorkers=<n>"]}]`.
+      `routing.executor.phaseSuite: [{"script": "test-files", "args": ["--maxWorkers=<n>"]}]`. *QA-0.P-15:* the global
+      override reaches every running router at its next prompt, so before writing these keys the orchestrator tells the
+      owner (a build without them, such as the other implementation's, logs "ignoring unknown routing key: executor")
+      and records it in the handover.
 - [ ] A hand count of this plan (tasks per phase including pre-flight items, and the edges of its "Depends on" and
       "Order:" lines) is recorded in the handover, for DF2.4.c.
 - [ ] Phase 6.1's pre-flight (§0.9 and its own items) ran on `cpx/main`, and
@@ -3762,12 +3783,14 @@ executor's slots for this plan, under the trusted `slotsDir` `D:\git\.omr-cpx-sl
 - **DF2.3** Planned human action: restart OpenCode in the recorded way, continue the same session in
   `D:\git\omr-cpx-main`, and type `continue`.
 - **DF2.4** Self-check probes.
-  Writes: none. Reads: `D:\git\omr-cpx-scratch\`, the router log,
-  `D:\git\omr-cpx-main\docs\plans\critical-path-execution-plan.md`, the handover.
-  - DF2.4.0 **Build loaded.** Pass when the startup log line `[router] plugin root <realpath>` (2.1.5.f) in the router
-    log (the newest file under OpenCode's log directory recorded in 0.P.3.f) names `D:\git\omr-cpx-dogfood-df2`,
-    `git -C <root> rev-parse HEAD` equals `git -C D:\git\omr-cpx-main rev-parse cpx/df2^{commit}`, and exactly one
-    `router_verify` tool is registered.
+  Writes: none. Reads: `D:\git\omr-cpx-scratch\`, `C:\Users\Marquinho\.local\share\opencode\log\opencode.log`
+  (QA-0.P-16), `D:\git\omr-cpx-main\docs\plans\critical-path-execution-plan.md`, the handover.
+  - DF2.4.0 **Build loaded.** *Amended by QA-0.P-16:* pass when the run-scoped self-check of 0.P.6 (marker run id,
+    `loading plugin` set equal to the regenerated config, router entrypoint
+    `file:///D:/git/omr-cpx-dogfood-df2/server.ts`, versioned server executable) passes in
+    `C:\Users\Marquinho\.local\share\opencode\log\opencode.log`, `git -C <root> rev-parse HEAD` equals
+    `git -C D:\git\omr-cpx-main rev-parse cpx/df2^{commit}`, and exactly one `router_verify` tool is registered. The
+    2.1.5.f `[router] plugin root <realpath>` line is supporting evidence only when its sink tags it with that run.
   - DF2.4.a **Pending survives a restart.** `router_verify` on the DF2.1.b handle returns a verdict, not "unknown
     handle". Then remove the `verify.pendingTtlMs` override set in DF1.2.
   - DF2.4.b **Executor registered.** `router_plan` and `/plan` exist; recovery ran once at startup, with no ledgers yet.
@@ -3830,7 +3853,8 @@ Deviations and the 6.1.4 metrics go to `$env:LOCALAPPDATA\omr-cpx\handover-df2.m
   Heavy re-reviews per §0.7.
 
 **Fallback:** if a DF-2 fault blocks the executor and has no workaround:
-1. Roll back to `cpx/df1` (§0.12-6).
+1. Roll back to the last build that passed its self-check (`cpx/df1` or its latest `cpx/df1.<k>`, as recorded in the
+   handover; QA-0.P-18) (§0.12-6).
 2. Run Phase 6.1 as a normal phase in `D:\git\omr-cpx-p61`.
 3. Record G13 as not met, with the fault, and report it to the owner in the 6.2.4 PR body. It is not a 6.2 finding.
 

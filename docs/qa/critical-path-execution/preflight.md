@@ -28,7 +28,7 @@ Plan: `D:\git\omr-cpx-main\docs\plans\critical-path-execution-plan.md`. Handover
 | OpenCode 1.x for v1 smokes | `C:\Users\Marquinho\scoop\apps\opencode\1.18.35\opencode.exe` (1.18.35); not first on `PATH` (the `opencode` shim is v2.0.26). *QA-0.P-7:* **every** v1-host smoke (`smoke:v1`, `smoke:keyless`, §0.10-8) runs with `C:\Users\Marquinho\scoop\apps\opencode\1.18.35` prepended to `PATH`; `smoke:keyless` has no preflight of its own. Proven: with that prepend, `node scripts/smoke-v1-preflight.mjs` printed `smoke:v1 preflight: OpenCode 1.18.35 is first on PATH`, exit 0. |
 | 0.P.3.b tools | node v24.21.0; git 2.51.0.windows.1; pnpm 11.22.0; uv 0.11.7; gh 2.79.0, `gh auth status` OK (account `marco-jardim`); bun 1.3.14; free space on `D:` 323.8 GB; **16 cores → `--maxWorkers=14`** for scoped runs (split when two worktrees test at once). Python (*QA-0.P-12*, commands as run): `py -3 --version` → `Python 3.14.7`; `py -3 -m venv -h` → `usage: python.exe -m venv [-h] …`; `py -3 -m pip --version` → `pip 26.2.1 from C:\Users\Marquinho\AppData\Local\Programs\Python\Python314\Lib\site-packages\pip (python 3.14)`. |
 | 0.P.3.c `routing.delegation` | `"roles"` is already set in the global override, so it is in effect for `D:\git\omr-cpx-main`; no project layer needed. |
-| 0.P.3.c `routing.workRoots` | Was **missing**. Added to the global override `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc` (additive; backup `$env:LOCALAPPDATA\omr-cpx\overrides.backup.jsonc`): `D:/git/omr-cpx-main`, `D:/git/omr-cpx-p*`, `D:/git/omr-cpx-pdf*`, `D:/git/omr-cpx-scratch*`, `D:/git/omr-cpx-e2e*`. *QA-0.P-1:* the scratch and e2e entries were first literal; a literal entry is `realpath`-resolved at plugin start and dropped when the directory does not exist (`D:\git\omr-cpx-main\src\router\role-agents.ts` ≈198-205, ≈257-260), and both are created later, so they are globs now (plan 0.P.3.c amended). Validated with the base's own code under bun: `resolveRolesRouting(loadConfig(), "v2")` → delegation `roles`, the five entries, `run.commands` = `test-files`; `externalDirectoryPatterns([], workRoots)` → `D:\git\omr-cpx-main\*`, `D:\git\omr-cpx-p*`, `D:\git\omr-cpx-pdf*`, `D:\git\omr-cpx-scratch*`, `D:\git\omr-cpx-e2e*`, `problems: []`. None matches `D:\git\omr-cpx-dogfood-*`. Effective at the next host start (the DF-1 restart at the latest). |
+| 0.P.3.c `routing.workRoots` | Was **missing**. Added to the global override `C:\Users\Marquinho\.config\opencode\opencode-model-router.overrides.jsonc` (additive; backup `$env:LOCALAPPDATA\omr-cpx\overrides.backup.jsonc`): `D:/git/omr-cpx-main`, `D:/git/omr-cpx-p*`, `D:/git/omr-cpx-pdf*`, `D:/git/omr-cpx-scratch*`, `D:/git/omr-cpx-e2e*`. *QA-0.P-1:* the scratch and e2e entries were first literal; a literal entry is `realpath`-resolved at plugin start and dropped when the directory does not exist (`D:\git\omr-cpx-main\src\router\role-agents.ts` ≈198-205, ≈257-260), and both are created later, so they are globs now (plan 0.P.3.c amended). Validated with the base's own code under bun: `resolveRolesRouting(loadConfig(), "v2")` → delegation `roles`, the five entries, `run.commands` = `test-files`; `externalDirectoryPatterns([], workRoots)` → `D:\git\omr-cpx-main\*`, `D:\git\omr-cpx-p*`, `D:\git\omr-cpx-pdf*`, `D:\git\omr-cpx-scratch*`, `D:\git\omr-cpx-e2e*`, `problems: []`. None matches `D:\git\omr-cpx-dogfood-*`. *QA-0.P-15:* registration re-runs at plugin start and at every refresh after a config-file change (`D:\git\omr-cpx-main\src\compat\v2-hooks.ts` ≈1174-1182, ≈1354), so the edit was live at the next prompt of every running router on the machine — this server, the background service and the other implementation's server; there it only widens their role agents' external-directory policy to `D:\git\omr-cpx-*` (told to the owner). |
 | 0.P.3.d shell | The orchestrator has a pwsh shell tool (git, npm, gh all ran). |
 | 0.P.3.e `test-files` | Not overridden; the shipped default entry `test-files` resolves (see above). |
 
@@ -51,16 +51,24 @@ Plan: `D:\git\omr-cpx-main\docs\plans\critical-path-execution-plan.md`. Handover
   of `OPENCODE_CONFIG_DIR` (`D:\git\omr-cpx-main\src\router\config.ts` ≈551), so it stays shared (additive keys only).
 - **Sync caveat (QA-0.P-14):** hard links follow in-place writes only; a tool that saves by replacing the file breaks
   the link silently, and the `opencode.json` copy never sees later global changes. **At every DF switch** the
-  orchestrator regenerates `opencode.json` from the current global file (changing only the router entry), checks that
-  each hard-linked file still has the same hash as its global original (re-linking any that differ), and records it.
+  orchestrator regenerates `opencode.json` from the current global file (changing only the router entry), mirrors the
+  global directory's current top-level entries (*QA-0.P-23*: new files hard-linked, new directories junctioned, removed
+  ones removed, same exclusions), checks that each hard-linked file still has the same hash as its global original
+  (re-linking any that differ), and records it.
+- **Smoke isolation (QA-0.P-17):** the plan's server exports `OPENCODE_CONFIG_DIR` to the orchestrator's shell, and
+  OpenCode 1.18.35 merges that directory **additively** (probe: with it set, v1 `opencode debug config` listed
+  `file:///D:/git/opencode-model-router` **and** `file:///D:/git/omr-cpx-dogfood-df0`). Every orchestrator smoke shell
+  therefore removes it first; the deferred-catalog smoke host, which passed the whole environment through, now strips
+  `OPENCODE_*` like its siblings (`46dac26`; run with the variable still set and v1 first on `PATH`: 1/1 passed).
 - **Launch (QA-0.P-9):** the versioned executable, not the moving `current` shim:
   `$env:OPENCODE_CONFIG_DIR = "$env:LOCALAPPDATA\omr-cpx\opencode-config"; $env:OPENCODE_V2_BIN = "C:\Users\Marquinho\scoop\apps\opencode2\2.0.26\opencode.exe"; & $env:OPENCODE_V2_BIN --standalone -s ses_ed82f88a7ffej5iKaRHuwIa6fd D:\git\omr-cpx-main`.
   (The DF-0 restart used the `opencode` shim; its server process resolved to the 2.0.26 executable, checked below.)
 - **Switch (DF-n):** regenerate as above with the router entry `D:\\git\\omr-cpx-dogfood-df<n>`; the owner restarts with
   the launch command.
-- **Revert (QA-0.P-11):** *DF-0 only:* relaunch without `OPENCODE_CONFIG_DIR` and without `--standalone` (back to the
-  global config, which loads the main checkout). *DF-n with n ≥ 1:* point the copy's router entry back at
-  `D:\\git\\omr-cpx-dogfood-df<n-1>` and relaunch with the same launch command (§0.12-6).
+- **Revert (QA-0.P-11/-18):** *back to before DF-0 only:* relaunch without `OPENCODE_CONFIG_DIR` and without
+  `--standalone` (back to the global config, which loads the main checkout). *After DF-1 or later:* point the copy's
+  router entry back at the **last build that passed its self-check** (recorded in the handover) and relaunch with the
+  same launch command (§0.12-6).
 - **Owner consent:** requested at the 0.P.3 stop (two dogfood restarts DF-1/DF-2, dogfood spend capped by §0.6-11, the
   process-scoped config). **Granted 2026-10-10.**
 
@@ -70,7 +78,8 @@ The router is loaded from a moving working tree, so DF-0 switches. Precondition 
 Tag `cpx/df0` = `b716ee9` (pushed); worktree `D:\git\omr-cpx-dogfood-df0` added `--detach` at `cpx/df0`; `npm ci` ran
 there; `git status` clean. The process-scoped config points at it.
 
-**Self-check after the owner's restart (2026-10-10 19:46 local): PASS.** Method (plan 0.P.6 as amended by QA-0.P-6):
+**Self-check after the owner's restart (restart 2026-10-10 19:46 local; the run-scoped checks below ran between 19:47
+and 20:07): PASS.** Method (plan 0.P.6 as amended by QA-0.P-6/-18):
 - **Run id of the plan server:** the orchestrator ran the marker command `Write-Output omr-selfcheck-7f3a91c2d4`; the
   log's `spawning process` line carrying that literal is tagged `run=461f3bf1`. The server process (pid 29860,
   `serve --stdio --port 0`, parent: the TUI launched with `--standalone -s ses_ed82f88a7ffej5iKaRHuwIa6fd
@@ -113,6 +122,10 @@ there; `git status` clean. The process-scoped config points at it.
     `test/unit/routing-advisor.bundled.test.ts`, `test/unit/security-scrub.test.ts`,
     `test/unit/store-eviction.test.ts`, `test/unit/tests-pass-pipeline.test.ts`, `test/unit/tmp-guard.test.ts`,
     `test/unit/verify.criteria.test.ts`, `test/unit/wiring.test.ts`, `test/unit/v2-hooks.test.ts`.
+  - **Runtime skip gates** (*QA-0.P-22*) that did not fire in this run: `ctx.skip()` in
+    `test/integration/roles-authority.test.ts` ≈391 (link creation) and ≈1335, and in
+    `test/unit/tests-pass-pipeline.test.ts` ≈1515 and ≈1601 (8.3 short names); `it.runIf(process.platform === "win32")`
+    in `test/unit/baseline.test.ts` ≈364 (ran). A later run whose skip count grows must check these first.
   - **The 2 skipped tests** are POSIX-only by design (`it.skipIf(process.platform === "win32")`):
     `test/integration/roles-authority.test.ts` ≈369 "QA-P23-A1 (POSIX): `<root>/link/../x` resolves through the link,
     outside the root", and `test/unit/roles.runtime.test.ts` ≈879 "QA-P33F1-1-2 (POSIX): a cwd `<root>/link/..` is
@@ -179,3 +192,19 @@ The same table is recorded in the handover §7.
 | QA-0.P-12 | minor | `py -3` commands not recorded | Recorded with output |
 | QA-0.P-13 | minor | Baseline not reproducible (files, skipped tests) | 49 paths and the 2 skipped tests listed |
 | QA-0.P-14 | nit | Hard-link "stay in sync" overstated | Caveat and per-switch regeneration recorded |
+
+### Round 2 (heavy reviewer, session `ses_ed7ed7507ffeGyZbT2YjMmOSjj`, at `add3cd4`) — 9 findings (3 major, 3 minor, 3 nit)
+
+Round-1 fixes judged correct except where these findings say otherwise.
+
+| Id | Sev. | Finding | Fix |
+|---|---|---|---|
+| QA-0.P-15 | major | Global-override edits are live at the next prompt of every running router, not "at the next host start"; effect on the other implementation unrecorded; DF-2 executor keys would reach it too | Statements corrected (here, handover §7, plan 0.P.3.c); effect recorded and told to the owner; DF-2 pre-flight amended with an owner notice; ROLES.md wording handed off to Phase 2.1 (PF-2) |
+| QA-0.P-16 | major | DF1.4.a / DF2.4.0 were not amended and rely on a router log line with no defined, run-tagged sink | DF1.4.a and DF2.4.0 amended in place (run-scoped check; Reads = `opencode.log`); 2.1.5.f must record its sink, checked by Phase 2.1 QA; the line is supporting evidence only |
+| QA-0.P-17 | major | `OPENCODE_CONFIG_DIR` leaks into v1 smoke hosts | v1 merge proven by probe; per-shell removal recorded; deferred-catalog smoke host fixed (`46dac26`), smoke 1/1 with the variable set |
+| QA-0.P-18 | minor | Self-check allowed a second router build, ignored `.k` builds, no nonce freshness, guard clash | Plugin-set equality with the exact entrypoint, fresh nonce + newest line, rollback to the last passing build (plan 0.P.6, Wave-6 fallback, handover) |
+| QA-0.P-19 | minor | Dispatch-log times contradict commit times | Times restated as commit-time bounds; `Get-Date` at every dispatch boundary from now on; self-check run window recorded |
+| QA-0.P-20 | minor | Guard is literal-text and its scope is stated three ways | Plan §0.4 and handover §2: normalized-path prefix match, one scope list, prose and log patterns allowed |
+| QA-0.P-21 | nit | Two stale handover statements | Fixed |
+| QA-0.P-22 | nit | Runtime skip gates not listed | Listed under 0.P.2 |
+| QA-0.P-23 | nit | Switch sync ignores files added later | Switch mirrors the top-level entries |
