@@ -484,6 +484,17 @@ export interface PendingRegistration {
   readonly concurrentDispatches?: number;
   /** QA-3.1-3: the tool whose call discarded the dispatch snapshot (the change set is then unavailable). */
   readonly contaminatedBy?: string;
+  /**
+   * I7 (P0.2, S12): the checkout the producer returned on (the deferred finish's tree snapshot). router_verify refuses a tree
+   * on another branch by then, or one it cannot read while a branch was recorded. Absent: no snapshot then, and no check.
+   */
+  readonly returnedTree?: ReturnedTree;
+}
+
+/** I7 (P0.2): HEAD and branch at return (TreeSnapshot.head / .branch: a short name, null when detached, absent when unknown). */
+export interface ReturnedTree {
+  readonly head: string;
+  readonly branch?: string | null;
 }
 
 /** What a verification of one handle produced (2.4.3 builds it from the gate result). */
@@ -535,6 +546,8 @@ export interface PendingEntry {
   readonly concurrentDispatches?: number;
   /** PendingRegistration.contaminatedBy, as registered. */
   readonly contaminatedBy?: string;
+  /** PendingRegistration.returnedTree, as registered. */
+  readonly returnedTree?: ReturnedTree;
   readonly createdAt: number;
   readonly state: PendingState;
   /** Set while state is "verifying". */
@@ -733,6 +746,7 @@ interface EntryRecord {
   readonly changedFilesDropped: number;
   readonly concurrentDispatches: number | undefined;
   readonly contaminatedBy: string | undefined;
+  readonly returnedTree: ReturnedTree | undefined;
   dod: DoD | undefined;
   reference: Promise<ReferenceState>;
   changedFiles: readonly ChangedPath[] | "unavailable";
@@ -828,6 +842,7 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       digests: rec.digests,
       ...(rec.concurrentDispatches !== undefined ? { concurrentDispatches: rec.concurrentDispatches } : {}),
       ...(rec.contaminatedBy !== undefined ? { contaminatedBy: rec.contaminatedBy } : {}),
+      ...(rec.returnedTree !== undefined ? { returnedTree: rec.returnedTree } : {}),
       createdAt: rec.createdAt,
       state: rec.state,
       verifyingSince: rec.verifyingSince,
@@ -1068,6 +1083,7 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       changedFilesDropped,
       concurrentDispatches: reg.concurrentDispatches,
       contaminatedBy: reg.contaminatedBy,
+      returnedTree: reg.returnedTree !== undefined ? Object.freeze({ ...reg.returnedTree }) : undefined,
       dod: reg.dod,
       reference,
       changedFiles,

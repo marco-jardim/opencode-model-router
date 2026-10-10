@@ -75,6 +75,7 @@ import {
 } from "./dispatch";
 import { runArgv, runShell } from "./exec";
 import { snapshotTree } from "./tree";
+import { branchSwitched, branchSwitchReason, branchUnconfirmedReason } from "./branch";
 import { captureReference, DEFAULT_CAPTURE_TIMEOUT_MS, gcStaleReferences, nodeReferenceFs, type DispatchReference } from "./reference";
 import type { PluginLogger } from "../router/logger";
 import { REFERENCE_NONE } from "./baseline";
@@ -174,6 +175,11 @@ export interface PreparedVerification {
   concurrentDispatches?: number;
   /** QA-3.1-3: the tool whose call discarded the dispatch snapshot, which left the change set unavailable. */
   contaminatedBy?: string;
+  /**
+   * I7 (P0.2, S9/S12): the gate's unverifiable reason when the working tree switched branch (branch.ts); absent: no switch
+   * seen. The artefact builders hand it to the gate (Artefact.branchSwitch), which then refuses on either verifier.
+   */
+  branchSwitch?: string;
 }
 
 /**
@@ -434,9 +440,11 @@ export type DeferredFinish =
        * "unregistered": the registry refused the entry (registry-full, handle-collision,
        * invalid-input); "no-change": an attributed empty change set of a testsPass-only DoD, which
        * the required gate passes with no process (section 1.5-6; QA-G-1: any other DoD is deferred
-       * with the empty set instead, noChangeGateSpawnsNothing); "error": the finish itself failed.
+       * with the empty set instead, noChangeGateSpawnsNothing); "error": the finish itself failed;
+       * "branch-switched" (I7, P0.2): the working tree switched branch during the dispatch, so no handle is issued that could
+       * verify the other branch later; the required gate refuses it at once (its observeChange sees the same switch).
        */
-      readonly reason: "unregistered" | "no-change" | "error";
+      readonly reason: "unregistered" | "no-change" | "error" | "branch-switched";
       readonly detail: string;
     };
 
@@ -1509,13 +1517,20 @@ export function createVerificationWiring(deps: {
       deadline?.signal.removeEventListener("abort", onAbort);
       controller.abort();
     }
-    const committed = await committedSinceDispatch(store.baselineSnapshot(id), snapshot, deadline);
+    const before = store.baselineSnapshot(id);
+    const committed = await committedSinceDispatch(before, snapshot, deadline);
     const contaminatedBy = store.snapshotContaminatedBy(id);
+    // I7 (P0.2, S9): the tree switched branch since the dispatch snapshot. The commit diff above would then be the other
+    // branch's net change, verified as the producer's. Either snapshot missing: today's handling (no change baseline).
+    const branchSwitch = before !== undefined && snapshot !== undefined && branchSwitched(before, snapshot)
+      ? branchSwitchReason(snapshot.root ?? base, before, snapshot, "during the dispatch")
+      : undefined;
     return {
       ...store.delta(id, childID, snapshot, base, committed),
       snapshot,
       concurrentDispatches: store.concurrentDispatches(id, snapshot?.root),
       ...(contaminatedBy !== undefined ? { contaminatedBy } : {}),
+      ...(branchSwitch !== undefined ? { branchSwitch } : {}),
     };
   };
 
@@ -1631,6 +1646,9 @@ export function createVerificationWiring(deps: {
     let deferred = false;
     try {
       const change = await observeChange(store, input.dispatchID, input.producerSessionID, input.cwd, deadline);
+      // I7 (P0.2): a branch switch during the dispatch is never deferred: a handle could verify the other branch later. The
+      // caller's required gate refuses it now (its own observeChange sees the switch). Before the no-change shortcut below.
+      if (change.branchSwitch !== undefined) return { deferred: false, reason: "branch-switched", detail: change.branchSwitch };
       // QA-2.4-10: an attributed empty change set is passed by the required gate with no process
       // (section 1.5-6): nothing to defer. The caller runs that gate, with the same outcome.
       // QA-G-1: only for a testsPass-only DoD. Any other check (build, lint, run, fileExists,
@@ -1669,6 +1687,8 @@ export function createVerificationWiring(deps: {
         description: input.description,
         cwd: resolveBaseDir(input.cwd, directory),
         root: change.snapshot?.root,
+        // I7 (P0.2, S12): the checkout the producer returned on; router_verify refuses a tree on another branch by then.
+        ...(change.snapshot !== undefined ? { returnedTree: { head: change.snapshot.head, branch: change.snapshot.branch } } : {}),
         dispatchedAt: input.dispatchedAt,
         dod: input.dod,
         reference,
@@ -1834,6 +1854,17 @@ export function createVerificationWiring(deps: {
       snapshot,
     ]);
     const changed = entry.changedFiles;
+    const root = entry.root ?? tree?.root;
+    // I7 (P0.2, S12): the tree must still be on the checkout the producer returned on. A branch recorded at return with no
+    // current tree to compare is refused too ("cannot confirm": terminal unless the call was cut); nothing recorded: no check.
+    const atReturn = entry.returnedTree;
+    const branchSwitch = atReturn === undefined
+      ? undefined
+      : tree === undefined
+        ? (atReturn.branch !== undefined ? branchUnconfirmedReason(root ?? entry.cwd) : undefined)
+        : branchSwitched(atReturn, tree)
+          ? branchSwitchReason(tree.root ?? root ?? entry.cwd, atReturn, tree, "since the producer returned")
+          : undefined;
     return {
       prepared: {
         changedFiles: changed === "unavailable"
@@ -1843,9 +1874,10 @@ export function createVerificationWiring(deps: {
         changeBaseline: changed === "unavailable" ? "unavailable" : "available",
         reference,
         snapshot: tree,
+        ...(branchSwitch !== undefined ? { branchSwitch } : {}),
       },
       drift,
-      root: entry.root ?? tree?.root,
+      root,
     };
   };
 
@@ -1877,6 +1909,7 @@ export function createVerificationWiring(deps: {
       changedFiles: prep.prepared.changedFiles,
       changeBaseline: prep.prepared.changeBaseline,
       ...(prep.root !== undefined ? { changeRoot: prep.root } : {}),
+      ...(prep.prepared.branchSwitch !== undefined ? { branchSwitch: prep.prepared.branchSwitch } : {}),
       // Not stored (R3): a testsPass DoD is deterministic, and no deterministic check reads it.
       finalReturnText: "",
       declaredOutputs: dod.deliverable ? [dod.deliverable] : [],

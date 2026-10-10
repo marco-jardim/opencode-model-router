@@ -32,6 +32,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   package. Previously the rerun loaded that directory's live code, so a failure caused by a change there was also
   reproduced at the reference and excused as pre-existing. An approximate reference never excuses a failure, so such a
   run is now unverifiable.
+- **A branch switch of the verified working tree now makes the result unverifiable instead of passing on the other
+  branch.** Previously the diff between the two heads became the change set, so the checks verified another branch.
+  The gate now reports `unverifiable` ("the working tree `<root>` switched from `<A>` to `<B>` during the dispatch; the
+  checks would verify another branch") for a checkout during the dispatch, and the same with "since the producer
+  returned" for a checkout between the producer's return and `router_verify`. Detached to detached at another commit
+  counts as a switch (reported as "moved"), and so does a new branch created at the same commit (fail closed).
+  `router_verify` refuses when a branch was recorded at return but the working tree cannot be read ("cannot confirm
+  the branch of `<root>`"). Each verification snapshot runs one more git process (`git symbolic-ref -q HEAD`).
 
 ## [2.6.1] - 2026-10-09
 

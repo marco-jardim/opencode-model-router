@@ -1,6 +1,6 @@
 # Cross-repo work in roles mode
 
-**Status:** Accepted 2026-10-10 (owner). Phase 0 in progress (P0.1 and P0.4 done).
+**Status:** Accepted 2026-10-10 (owner). Phase 0 in progress (P0.1, P0.2 and P0.4 done).
 **Scope:** roles mode on OpenCode v2 (`routing.delegation: "roles"`). Phase 0 changes the shared verification engine and applies to both hosts.
 **Configuration keys** marked *proposed (not implemented)* do not exist yet.
 **File references** are `path:line` as of 2026-10-10. Line numbers drift; the function names are the stable reference.
@@ -359,6 +359,9 @@ Each slice lands test-first: the failing test reproduces the scenario row, then 
 - `wiring.ts` `observeChange` (`:1469-1520`): compare the dispatch snapshot's branch with the return snapshot's. When HEAD moved and either branch is unknown, treat it as a switch.
 - `src/verify/pending.ts` registration (R3, `:41-71`): store the branch at return. `wiring.ts` `prepareClaim` (`:1818-1850`) compares it with the `snapshotFor` result (`:1773-1788`).
 - `gate.ts`: a branch switch → unverifiable, for both branches of the gate. The reason: `the working tree <root> switched from branch <a> to <b> during the dispatch (since the producer returned); the checks would verify another branch`.
+- Implemented: `src/verify/branch.ts` (`branchSwitched`, `branchSwitchReason`, `branchUnconfirmedReason`), `GitExitError` / `readBranch` in `tree.ts`; a switch during the dispatch on the deferred path returns `{ deferred: false, reason: "branch-switched" }` so the required gate refuses.
+- Detached → detached at another commit counts as a switch (the verb is "moved"): commits on a detached HEAD cannot be told from a checkout without the reflog.
+- Known difference: when the gate snapshot is missing on the synchronous path, behaviour is unchanged (the change baseline is unavailable); the deferred path refuses in the same situation with "cannot confirm the branch". "Cannot confirm" is not retryable unless the router_verify call itself was cut short.
 
 **P0.3 — Unattributable writers (S1, S3, S10)**
 - `src/verify/dispatch.ts`:
@@ -455,6 +458,7 @@ Each slice lands test-first: the failing test reproduces the scenario row, then 
 - **R is wide.** Every repository below the parents is readable by every local role, including files such as `.env`. Roles hold no egress together with local actions (`policy.ts:171-174`), but results flow through the orchestrator (`docs/ROLES.md:163-164`).
 - **Names follow folder basenames.** Renaming a folder renames the repository.
 - **Snapshot cost and failure.** Snapshot cost grows with the working set. A snapshot that times out leaves a root unobserved, and repositories with submodules are never observed (`tree.ts:233`).
+- **Branch detection costs one git process per snapshot** (`git symbolic-ref -q HEAD`); measured on this machine, a full snapshot of a typical repository takes 0.15–0.4 s, up to 1.8 s on the slowest repository under D:\git.
 - **Consumers** are discovered only in the working set, and only through `node_modules` links. Python editable installs, Go `replace`, Cargo path dependencies, and `../` or alias imports are not discovered (Q2).
 - **A consumer check's failures** are unverifiable, never "fail". The dependency is the changed repository, so the reference can neither excuse nor prove them.
 - **`router_run` scripts** remain trusted repository content (`run-tools.ts:11-13`).
