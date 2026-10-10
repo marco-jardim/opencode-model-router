@@ -333,7 +333,7 @@ Everything else is work: resolve it, record it, continue.
 
 ## 7. Live state (§0.11 — keep current)
 
-**Next action:** 0.P.QA round 3 (heavy; limited to the fixes of round-2 majors QA-0.P-15, -16, -17; the last round).
+**Next action:** start Phase 0.1 (pre-flight §0.9 + its own items; worktree `D:\git\omr-cpx-p01`).
 
 **Orchestrator session:** `ses_ed82f88a7ffej5iKaRHuwIa6fd` (directory `D:\git\omr-cpx-main`).
 
@@ -344,7 +344,7 @@ implementation's worktree `D:\git\opencode-model-router-cross-repo` (branch `fea
 
 | Phase | State | QA round | Notes |
 |---|---|---|---|
-| 0.P | QA round 3 pending | 2 done (r1: 14, r2: 9 findings; all fixed or dispositioned) | started 2026-10-10 18:55; 0.P.1, 0.P.3 (consent granted), 0.P.6 (DF-0 self-check PASS), 0.P.2, 0.P.4 done; `preflight.md` written |
+| 0.P | **done** 2026-10-10 ≈20:45 | 3 (r1: 14, r2: 9, r3: 1 — all fixed or dispositioned; 7 minor/nit deferred to the DF-1 pre-flight) | started 18:55; `preflight.md` verdict: done |
 | 0.1 | waiting | — | |
 | 1.1 · 1.2 · 1.3 · 1.4 | waiting | — | |
 | 2.1 | waiting | — | |
@@ -368,6 +368,7 @@ orchestrator takes `Get-Date` at every dispatch start and end.
 | after r1 → before 20:03:23 (`9c8efd6`) | implementer (QA-0.P-3) | `ses_ed7f25ed7ffe2aF7jc1XBiILR2` | `D:\git\omr-cpx-main` | W: `test\unit\v2-hooks.test.ts`, `test\unit\roles.registration.test.ts` / R: same | `9c8efd6`, reverted `674f037` (it lowered a 60 s describe timeout) |
 | after 20:07:20 (`add3cd4`) → ≈20:15 | reviewer (heavy, QA-0.P r2) | `ses_ed7ed7507ffeGyZbT2YjMmOSjj` | `D:\git\omr-cpx-main` @ `add3cd4` | W: none / R: `D:\git\omr-cpx-main\` | 9 findings |
 | ≈20:18 → before 20:26:39 (`46dac26`) | implementer (QA-0.P-17) | `ses_ed7dd3c29ffeOXxyWz6FDP0VQs` | `D:\git\omr-cpx-main` | W: `test\smoke\deferred-catalog.smoke.test.ts` / R: same, `test\smoke\registration.smoke.test.ts` | done, verified deterministic, `46dac26` |
+| after 20:30 (`093ade6`) → ≈20:40 | reviewer (heavy, QA-0.P r3) | `ses_ed7d93d91ffeKN16UPoxY33h3p` | `D:\git\omr-cpx-main` @ `093ade6` | W: none / R: `D:\git\omr-cpx-main\` | 15/16/17 fixed; 1 new major (QA-0.P-24, fixed) |
 
 The DF-0 run-scoped self-check (marker `omr-selfcheck-7f3a91c2d4`, server executable) ran between 19:47 and 20:07.
 
@@ -432,8 +433,8 @@ process-scoped config.
 | Phase 2.2 pre-flight (`--git-common-dir`) | ≈2056 | ≈2124 |
 | Phase 2.4 pre-flight | ≈236-238 · ≈346-356 · ≈859-907 · ≈1296 · ≈1663-1673 · ≈1764-1845 | ≈245-247 · ≈366-376 · ≈885-935 · ≈1324 · ≈1691-1701 · ≈1792-1886 (drift region rewritten by #88: `driftDiff`, `driftReasons`) + new step 7b ≈1913-1953 |
 
-**QA round counters:** 0.P: round 1 (14 findings) and round 2 (9 findings) fixed; round 3 limited to the fixes of
-QA-0.P-15, -16, -17.
+**QA round counters:** 0.P: closed after round 3 (QA-0.P-24 fixed in plan 0.P.6; QA-0.P-25..31 deferred to the DF-1
+pre-flight, listed in `preflight.md` "Deferred findings").
 
 **Amendments:**
 1. QA-0.P-1/-15 — plan 0.P.3.c: scratch/e2e `workRoots` are globs; global-override edits are live at the next prompt of

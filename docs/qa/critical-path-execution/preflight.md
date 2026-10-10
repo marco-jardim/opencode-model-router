@@ -84,6 +84,9 @@ and 20:07): PASS.** Method (plan 0.P.6 as amended by QA-0.P-6/-18):
   log's `spawning process` line carrying that literal is tagged `run=461f3bf1`. The server process (pid 29860,
   `serve --stdio --port 0`, parent: the TUI launched with `--standalone -s ses_ed82f88a7ffej5iKaRHuwIa6fd
   D:\git\omr-cpx-main`) runs `C:\Users\Marquinho\scoop\apps\opencode2\2.0.26\opencode.exe` — the version under test.
+- **Plugin set (QA-0.P-24):** the config lists anthropic-fix, df0 and telegram; the run loaded anthropic-fix and df0.
+  `opencode-telegram-plugin` is loaded by no server on this machine (before or after the switch), so the amended
+  0.P.6 rule allows exactly that absence; no plugin outside the list was loaded. PASS under the amended rule.
 - **Plugins of run `461f3bf1`:** `loading plugin` exactly once for `D:\\git\\omr-cpx-dogfood-df0` (entrypoint
   `file:///D:/git/omr-cpx-dogfood-df0/server.ts`) and once for `D:\\git\\opencode-anthropic-fix`; zero for
   `D:\git\opencode-model-router`. The only lines of that run naming the main checkout are the host's read-only watcher
@@ -208,3 +211,41 @@ Round-1 fixes judged correct except where these findings say otherwise.
 | QA-0.P-21 | nit | Two stale handover statements | Fixed |
 | QA-0.P-22 | nit | Runtime skip gates not listed | Listed under 0.P.2 |
 | QA-0.P-23 | nit | Switch sync ignores files added later | Switch mirrors the top-level entries |
+
+### Round 3 (heavy reviewer, session `ses_ed7d93d91ffeKN16UPoxY33h3p`, at `093ade6`; the last round, limited to the fixes of QA-0.P-15, -16, -17)
+
+QA-0.P-15, -16 and -17: **fixed** (evidence in the review). One new finding:
+
+| Id | Sev. | Finding | Fix |
+|---|---|---|---|
+| QA-0.P-24 | major | The plugin-set equality rule fails the recorded DF-0 baseline (telegram is listed but never loaded); the exception lived only in the handover | Plan 0.P.6 amended: `D:\\git\\opencode-telegram-plugin` may be absent, nothing outside the list may appear; DF1.4.a and DF2.4.0 inherit it by reference; DF-0 record updated. Verified against the run `461f3bf1` evidence (no further review, §0.7) |
+
+## Deferred findings
+
+Recorded after round 2 (§0.7: minor and nit are not fixed after round 2). Each is re-checked by the DF-1 pre-flight
+(the first step that depends on it), which fixes what it finds.
+
+- QA-0.P-25 (minor): handover §4.1 "New worktrees need authority" still says a new worktree gets authority only through a
+  glob or after a restart; a refresh after a config change also re-registers (same correction as PF-2).
+- QA-0.P-26 (minor): plan DF-2 pre-flight quotes the notice as "…key: executor"; the actual text is "ignoring unknown
+  routing key: routing.executor" (`D:\git\omr-cpx-main\src\router\config.ts` ≈2534, ≈2571). The "no other change" claim
+  about the other implementation's build is read from the base code, not from that build.
+- QA-0.P-27 (minor): a build that knows `routing.executor` but rejects a value drops override layers at startup
+  (`D:\git\omr-cpx-main\src\router\config.ts` ≈2672-2711); before writing the DF-2 executor keys, validate them with the
+  DF-2 build's loader.
+- QA-0.P-28 (minor): DF1.4.a / DF2.4.0 `git -C <root> rev-parse HEAD` no longer defines `<root>`; it is
+  `D:\git\omr-cpx-dogfood-df<n>[.<k>]`.
+- QA-0.P-29 (minor): the DF1.4 / DF2.4 Reads lines omit the regenerated
+  `$env:LOCALAPPDATA\omr-cpx\opencode-config\opencode.json` that the equality check reads.
+- QA-0.P-30 (nit): §0.12-6.1 still says "previous dogfood worktree"; the 0.P.6 amendment ("last build that passed its
+  self-check") governs.
+- QA-0.P-31 (nit): handover §7 says the other routers' policy now allows `D:\git\omr-cpx-*`; precisely, the five
+  patterns, which exclude `omr-cpx-dogfood-*`.
+
+## Verdict
+
+0.P is **done**: QA-0.P has zero open blocking, critical or major findings (rounds 1-3: 24 findings fixed or
+dispositioned; QA-0.P-3 not reproduced), 7 minor/nit deferred to the DF-1 pre-flight. Acceptance: `cpx/main` is at the
+recorded `origin/master` commit `b716ee9` plus the plan, its README entry, the handover, the QA record and three
+test-only pre-flight fixes; every binary, configuration item and authority path is present; anchors are re-based; the
+router build is pinned (DF-0, self-check PASS).

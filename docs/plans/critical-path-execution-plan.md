@@ -799,8 +799,10 @@ because role agents get no authority in `D:\git\omr-cpx-main` without `routing.w
   DF2.4.0 included):* the log file is shared by every OpenCode server on the machine, so the check is scoped to the
   plan server's run: the orchestrator runs a marker shell command with a **fresh literal nonce**
   (`Write-Output omr-selfcheck-<nonce>`, never reused) and takes the `run=` id of the **newest** `spawning process`
-  line carrying it. *Amended by QA-0.P-18:* within that run the set of `loading plugin` ids must **equal** the plugin
-  list of the regenerated process-scoped `opencode.json`, each exactly once, with the router entry's entrypoint
+  line carrying it. *Amended by QA-0.P-18/QA-0.P-24:* within that run the set of `loading plugin` ids must **equal** the
+  plugin list of the regenerated process-scoped `opencode.json`, each exactly once, except that
+  `D:\\git\\opencode-telegram-plugin` may be absent (recorded baseline: no OpenCode server on this machine loads it,
+  before or after the DF-0 switch); no id outside that list may appear, with the router entry's entrypoint
   exactly `file:///D:/git/omr-cpx-dogfood-df<n>[.<k>]/server.ts` of the build being switched to (so no second router
   build — an older dogfood build, a phase worktree or the main checkout — can be loaded; the host's watcher on
   `…\.git\worktrees\omr-cpx-main\HEAD` is expected), and the server process is the versioned OpenCode executable
