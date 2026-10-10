@@ -236,6 +236,72 @@ describe("accept() — outside-directory safety net", () => {
     });
   });
 
+  // I5 (P0.3, S1/S3/S10): an empty change set after a tool the router cannot observe is never a verified pass.
+  describe("unattributable writers with an empty change set (Artefact.unattributedWriters)", () => {
+    const empty = (writers: string[] | undefined, changeBaseline: "available" | "unavailable" = "available", paths: string[] = []) =>
+      ({ ...changed(paths), changeBaseline, ...(writers !== undefined ? { unattributedWriters: writers } : {}) });
+    const caveat = (tools: string) =>
+      `no change was observed in ${base} but the producer ran ${tools}; a write those tools made cannot be seen, so this is not a verified pass`;
+
+    it("a passing deterministic verdict becomes unverifiable with the caveat; strict rejects it", async () => {
+      const { exec, d, dod } = setup();
+      const r = await accept({ dod }, empty(["bash", "router_run"]), d);
+      expect(exec).toHaveBeenCalled();
+      expect(r.verdict.pass).toBe(false);
+      expect(r.verdict.outcome).toBe("unverifiable");
+      expect(r.verdict.caveats).toEqual([caveat("bash, router_run")]);
+      expect(r.verdict.reasons).toContain(caveat("bash, router_run"));
+      expect(r.accepted).toBe(true);
+      const strict = await accept({ dod }, empty(["bash"]), { ...d, strictUnverifiable: true });
+      expect(strict.verdict.outcome).toBe("unverifiable");
+      expect(strict.accepted).toBe(false);
+    });
+
+    it("applies on the grader path too", async () => {
+      const { d } = setup();
+      const dispatchGrader = vi.fn<CheckerDeps["dispatchGrader"]>().mockResolvedValue({ sessionID: "grader", text: '{"pass":true,"reasons":[]}' });
+      const r = await accept({ dod: checkerDoD(), cwd: base }, empty(["execute"]), { ...d, checker: { ...d.checker, dispatchGrader } });
+      expect(dispatchGrader).toHaveBeenCalled();
+      expect(r.verdict.outcome).toBe("unverifiable");
+      expect(r.verdict.caveats).toEqual([caveat("execute")]);
+    });
+
+    it("names the change root when the artefact carries one", async () => {
+      const { d, dod } = setup();
+      const root = join(tmpdir(), "gate-root");
+      const r = await accept({ dod }, { ...empty(["bash"]), changeRoot: root }, d);
+      expect(r.verdict.caveats).toEqual([`no change was observed in ${root} but the producer ran bash; a write those tools made cannot be seen, so this is not a verified pass`]);
+    });
+
+    it("lists at most five writers, then 'and N more'", async () => {
+      const { d, dod } = setup();
+      const tools = ["a_1", "a_2", "a_3", "a_4", "a_5", "a_6", "a_7"];
+      const r = await accept({ dod }, empty(tools), d);
+      expect(r.verdict.caveats).toEqual([caveat("a_1, a_2, a_3, a_4, a_5 and 2 more")]);
+    });
+
+    it.each([
+      ["no writers", empty(undefined)],
+      ["an empty writer list", empty([])],
+      ["a non-empty change set", empty(["bash"], "available", [join(base, "inside.ts")])],
+      ["an unavailable change baseline", empty(["bash"], "unavailable")],
+    ])("adds nothing with %s", async (_label, art) => {
+      const { d, dod } = setup();
+      const r = await accept({ dod }, art, d);
+      expect(r.verdict.outcome).toBe("pass");
+      expect(r.verdict.caveats ?? []).toEqual([]);
+    });
+
+    it("leaves a failing verdict as it is", async () => {
+      const exec = vi.fn<DeterministicDeps["exec"]>().mockResolvedValue({ code: 1, stdout: "NO", stderr: "" });
+      const d = deps({ deterministic: { ...fakeDeterministicDeps(), cwd: base, exec } });
+      const dod = normalizeDoD({ ...detDoD(), checks: [{ kind: "run", command: "node verify.js", expect: "OK" }] });
+      const r = await accept({ dod }, empty(["bash"]), d);
+      expect(r.verdict.outcome ?? (r.verdict.pass ? "pass" : "fail")).toBe("fail");
+      expect(r.verdict.caveats ?? []).not.toContain(caveat("bash"));
+    });
+  });
+
   // I7 (P0.2, S9/S12): a branch switch of the verified tree refuses before anything runs, on both verifiers.
   describe("a branch switch of the working tree (Artefact.branchSwitch)", () => {
     const reason = "the working tree /repo switched from branch main to branch feat/x during the dispatch; the checks would verify another branch";

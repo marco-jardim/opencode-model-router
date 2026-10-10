@@ -122,6 +122,38 @@ const NON_WRITING_TOOLS = new Set([
   "list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource",
   "delegate", "router_verify",
 ]);
+/**
+ * P0.3: router tools that only read (copied, not imported: this module takes no plugin SDK; a pin
+ * test compares them with the sources). Exact names: a `context7_*` prefix would also admit a
+ * future write tool.
+ */
+const READ_ONLY_ROUTER_TOOLS = new Set([
+  "router_git_status", "router_git_log", "router_git_diff", "router_git_show", "router_git_blame", "router_git_ls_files",
+  "router_request_authority",
+]);
+const BRAVE_TOOLS = ["web_search", "local_search", "news_search", "image_search", "video_search", "summarizer", "llm_context"]
+  .map(t => `brave_${t}`);
+const READ_ONLY_MCP_TOOLS = new Set([
+  "context7_resolve-library-id", "context7_query-docs", "context7_get-library-docs",
+  // The server may be mounted as `brave` with tools already named `brave_*`.
+  ...BRAVE_TOOLS, ...BRAVE_TOOLS.map(t => `brave_${t}`),
+]);
+
+/** Whether `tool` is known never to write the workspace (case-insensitive). */
+export function isNonWritingTool(tool: string): boolean {
+  const n = tool.toLowerCase();
+  return NON_WRITING_TOOLS.has(n) || READ_ONLY_ROUTER_TOOLS.has(n) || READ_ONLY_MCP_TOOLS.has(n);
+}
+
+/**
+ * P0.3 (invariant I5): a tool that may write but whose writes the router cannot attribute to files
+ * (shells, `router_run`, `execute`, MCP and custom tools). An empty change set from a producer
+ * that ran one of these is not proof that nothing changed.
+ */
+export function isUnattributedWriter(tool: string): boolean {
+  const n = tool.toLowerCase();
+  return !WRITE_TOOLS.has(n) && !isNonWritingTool(n);
+}
 
 export interface ChangedFile {
   path: string;
@@ -132,7 +164,8 @@ export interface ChangedFile {
 
 /** Derive a {path,status} record from a write/edit tool call, or null. */
 export function extractChangedFile(tool: string, args: unknown): ChangedFile | null {
-  if (!WRITE_TOOLS.has(tool)) return null;
+  const name = tool.toLowerCase();
+  if (!WRITE_TOOLS.has(name)) return null;
   const a = (args ?? {}) as Record<string, unknown>;
   const path =
     typeof a.filePath === "string"
@@ -143,7 +176,7 @@ export function extractChangedFile(tool: string, args: unknown): ChangedFile | n
           ? a.file
           : "";
   if (!path) return null;
-  const status = tool === "write" ? "written" : "modified";
+  const status = name === "write" ? "written" : "modified";
   return { path, status };
 }
 
@@ -208,6 +241,8 @@ interface DispatchRecord {
    * gate judges the cumulative change since the reference, not only its own attempt's edits.
    */
   observed: Map<string, ChangedFile>;
+  /** P0.3: the unattributable writers (isUnattributedWriter) of every session in `producers`. */
+  writers: Set<string>;
 }
 
 /**
@@ -218,12 +253,14 @@ interface DispatchRecord {
 export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
   const now = options.now ?? Date.now;
   const bySession = new Map<string, Map<string, string>>();
+  /** P0.3: per session, the lowercased names of the unattributable writers it ran. */
+  const writersBySession = new Map<string, Set<string>>();
   const lastTouch = new Map<string, number>();
   const dispatches = new Map<string, DispatchRecord>();
 
   function observeEdit(tool: string, cwd?: string): void {
     // E2E-3: fail closed. Only a tool known not to write leaves an in-flight snapshot or capture alone.
-    if (NON_WRITING_TOOLS.has(tool.toLowerCase())) return;
+    if (isNonWritingTool(tool)) return;
     // Unknown directory is conservatively treated as overlapping every capture.
     const overlaps = (other: string) => !cwd || pathKey(cwd) === pathKey(other)
       || pathKey(cwd).startsWith(pathKey(other) + "/") || pathKey(other).startsWith(pathKey(cwd) + "/");
@@ -267,12 +304,14 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
       const prev = d.observed.get(key);
       d.observed.set(key, { path: absolute, status: prev?.status === "written" ? "written" : status });
     }
+    for (const tool of writersBySession.get(sessionID) ?? []) d.writers.add(tool);
   }
 
   function evict(sessionID: string): void {
     // A retry's session is cleared after its gate: keep its edits in every lineage it belongs to.
     for (const d of dispatches.values()) if (d.producers.has(sessionID)) fold(d, sessionID);
     bySession.delete(sessionID);
+    writersBySession.delete(sessionID);
     lastTouch.delete(sessionID);
     const d = dispatches.get(sessionID);
     d?.captureController.abort();
@@ -294,6 +333,7 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
       const existing = dispatches.get(id);
       if (existing) return existing.settled;
       bySession.delete(id);
+      writersBySession.delete(id);
       const window: DispatchWindow = { cwd, overlapping: new Set() };
       // QA-3.1-2: every live dispatch overlaps this one's window, and this one overlaps theirs.
       for (const other of dispatches.values()) {
@@ -307,7 +347,7 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
         reference: Promise.resolve(deps.uncaptured ?? none(REFERENCE_NONE.notRequested)),
         ready: Promise.resolve(), settled: Promise.resolve(),
         // The delegate ladder's dispatch id is its first producer session.
-        producers: new Set([id]), observed: new Map(),
+        producers: new Set([id]), observed: new Map(), writers: new Set(),
         window,
       };
       dispatches.set(id, d);
@@ -382,7 +422,7 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
       current?: TreeSnapshot,
       fallbackCwd?: string,
       committed?: readonly ChangedFile[] | "unavailable",
-    ): { changedFiles: ChangedFile[]; changeBaseline: "available" | "unavailable" } {
+    ): { changedFiles: ChangedFile[]; changeBaseline: "available" | "unavailable"; unattributedWriters: string[] } {
       const d = dispatches.get(id);
       const snapshot = d?.snapshot;
       const files = new Map<string, ChangedFile>();
@@ -447,7 +487,12 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
           else if (prev.previousPath === undefined && file.previousPath !== undefined) files.set(key, { ...prev, previousPath: file.previousPath });
         }
       }
-      return { changedFiles: [...files.values()], changeBaseline: available ? "available" : "unavailable" };
+      const writers = d ? d.writers : (writersBySession.get(childID) ?? new Set<string>());
+      return {
+        changedFiles: [...files.values()],
+        changeBaseline: available ? "available" : "unavailable",
+        unattributedWriters: [...writers].sort(),
+      };
     },
     /** The dispatch-time snapshot (QA-2.1-2: the gate digests its listed paths); undefined until settled. */
     baselineSnapshot(id: string): TreeSnapshot | undefined {
@@ -473,6 +518,11 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
     record(sessionID: string, tool: string, args: unknown): void {
       touch(sessionID);
       observeEdit(tool, dispatches.get(sessionID)?.cwd);
+      if (isUnattributedWriter(tool)) {
+        const w = writersBySession.get(sessionID) ?? new Set<string>();
+        w.add(tool.toLowerCase());
+        writersBySession.set(sessionID, w);
+      }
       if (tool.toLowerCase() === "apply_patch") {
         const a = args && typeof args === "object" ? args as Record<string, unknown> : {};
         const patch = typeof a.patchText === "string" ? a.patchText : typeof a.patch === "string" ? a.patch : "";

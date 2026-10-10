@@ -46,6 +46,11 @@ export interface Artefact {
    * either verifier and nothing runs, since the change set and the checks would describe another branch.
    */
   branchSwitch?: string;
+  /**
+   * I5 (P0.3, S1/S3/S10): tools the producer lineage ran that can write files the router cannot observe (dispatch.ts
+   * isUnattributedWriter), sorted. With an empty, available change set, a pass carries a caveat and is never a verified pass.
+   */
+  unattributedWriters?: string[];
   changedFiles: { path: string; status: string }[];
   finalReturnText: string;
   declaredOutputs: string[];
@@ -334,5 +339,21 @@ export async function accept(
     );
   }
 
+  // I5 (P0.3): nothing observed changed, but the producer ran a tool whose writes the router cannot see. The checks passed on
+  // a tree that may not hold the producer's work, so the pass is not a verified pass.
+  const writers = artefact.unattributedWriters ?? [];
+  if (writers.length > 0 && artefact.changeBaseline === "available" && artefact.changedFiles.length === 0
+    && (verdict.outcome ?? (verdict.pass ? "pass" : "fail")) === "pass") {
+    const caveat = unattributedWritersCaveat(artefact.changeRoot ?? effectiveBaseDir, writers);
+    verdict = { ...verdict, pass: false, outcome: "unverifiable", reasons: [...verdict.reasons, caveat], caveats: [...(verdict.caveats ?? []), caveat] };
+  }
+
   return gateResult(verdict, dodSource, deps.strictUnverifiable);
+}
+
+/** I5 (P0.3): the caveat for an empty change set when the producer ran tools whose writes the router cannot observe. */
+export function unattributedWritersCaveat(root: string, writers: readonly string[]): string {
+  const listed = writers.slice(0, MAX_OUTSIDE_LISTED).join(", ")
+    + (writers.length > MAX_OUTSIDE_LISTED ? ` and ${writers.length - MAX_OUTSIDE_LISTED} more` : "");
+  return `no change was observed in ${root} but the producer ran ${listed}; a write those tools made cannot be seen, so this is not a verified pass`;
 }
