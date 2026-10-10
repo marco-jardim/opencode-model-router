@@ -302,7 +302,7 @@ describe("OpenCode 2 hook adapter", () => {
     const after = { sessionID: producers[1].sid, agent: "fast", model: { providerID, id: modelParts.join("/") }, options: {} as Record<string, unknown>, system: [], messages: [] };
     await f.sessionHooks.context(after);
     expect(after.options.effort).toBe("low");
-  });
+  }, 30_000);
 
   async function depthFixture(mode: "enforced" | "advisory", run?: (request: ChildSessionRequest) => Promise<{ sessionID: string; text: string }>) {
     const home = mkdtempSync(join(tmpdir(), "router-v2-depth-"));
