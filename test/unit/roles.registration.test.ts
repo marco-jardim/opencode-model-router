@@ -520,7 +520,7 @@ describe("v2 adapter in roles mode", { timeout: 60_000 }, () => {
     expect(legacy?.subagent_type).toBe("explorer");
     expect(event.input.agent).toBe("explorer");
     expect(Object.hasOwn(event.input, "subagent_type")).toBe(false);
-  }, 30_000);
+  });
 
   it("tiers mode: no role agent, general untouched, explore not aliased (I1)", async () => {
     home();
