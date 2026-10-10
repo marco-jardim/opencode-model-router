@@ -78,6 +78,12 @@ export function treeMove(
 ): TreeMove | undefined {
   if (!sameRoot(before.root, now.root, platform)) return { kind: "relocated" };
   if (before.branch !== now.branch) return { kind: "switched" };
+  // Every HEAD update writes a reflog entry: a reflog that shrank, or a HEAD that moved with no new entry, is another history
+  // in place (a replaced repository, an expired or edited reflog). Fail closed.
+  if (before.reflog !== undefined && now.reflog !== undefined) {
+    if (now.reflog < before.reflog) return { kind: "rewritten", detail: "the reflog has fewer entries than before" };
+    if (now.reflog === before.reflog && now.head !== before.head) return { kind: "rewritten", detail: "HEAD moved without a reflog entry" };
+  }
   if (subjects !== undefined) {
     const hit = subjects.find((subject) => /^(checkout|reset|rebase)\b/i.test(subject));
     return hit === undefined ? undefined : { kind: "rewritten", detail: cleanSubject(hit) };

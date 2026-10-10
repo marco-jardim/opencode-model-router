@@ -119,6 +119,15 @@ describe("treeMove", () => {
     expect(treeMove(H(A, "main"), H(B, "main"), ["precheckout: x", "recommit: reset"])).toBeUndefined();
   });
 
+  it("a reflog that shrank, or a HEAD that moved with no new entry, is another history in place", () => {
+    expect(treeMove(H(A, "main", "/repo", 5), H(A, "main", "/repo", 3), [])).toEqual({ kind: "rewritten", detail: "the reflog has fewer entries than before" });
+    expect(treeMove(H(A, "main", "/repo", 5), H(B, "main", "/repo", 5), [])).toEqual({ kind: "rewritten", detail: "HEAD moved without a reflog entry" });
+    // Same count and same HEAD: nothing happened.
+    expect(treeMove(H(A, "main", "/repo", 5), H(A, "main", "/repo", 5), [])).toBeUndefined();
+    // A grown count with commits only stays no move.
+    expect(treeMove(H(A, "main", "/repo", 5), H(B, "main", "/repo", 6), ["commit: x"])).toBeUndefined();
+  });
+
   it("without a window, the fail-closed branchSwitched rule applies", () => {
     expect(treeMove(H(A, "main"), H(B, "main"), undefined)).toBeUndefined();
     expect(treeMove(H(A, null), H(A, null), undefined)).toBeUndefined();
