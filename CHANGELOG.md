@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **Breaking (requirement): Node.js 20 is no longer supported.** Node.js 20 reached end-of-life in April 2026; the
+  minimum is now Node.js 22 (`engines.node` is `>=22`, and the CI matrix runs Node 22 and 24).
+
 ## [2.6.1] - 2026-10-09
 
 ### Fixed

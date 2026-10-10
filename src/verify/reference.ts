@@ -386,7 +386,7 @@
 //      so a junction created after the sweep costs nothing (QA-1.5-3 repro:
 //      `git worktree remove` in this slot deleted the late junction's target
 //      contents; fs.rm left them intact). The sweep stays, because fs.rm's
-//      non-following is proven only on Node v24.21.0 and engines is >=20. If
+//      non-following is proven only on Node v24.21.0 and engines is >=22. If
 //      dir still exists afterwards (EBUSY from a process whose cwd is inside),
 //      warn and leave it for GC; git is not run.
 //   4. Only once dir is gone, and while the admin entry is still registered:
