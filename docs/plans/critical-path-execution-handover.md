@@ -386,7 +386,8 @@ Global `opencode.json` unchanged (backup `$env:LOCALAPPDATA\omr-cpx\opencode-con
 `D:\git\opencode-model-router`; `config.get` through the session lists the router once.
 
 **Owner consent (0.P.3.f):** requested 2026-10-10 (DF-1 and DF-2 restarts, dogfood spend capped by §0.6-11,
-process-scoped config). Not yet recorded.
+process-scoped config). **Granted 2026-10-10** ("autorizo tudo"): DF-1 and DF-2 restarts, dogfood spend, process-scoped
+config.
 
 **Amendments:** none.
 
