@@ -888,16 +888,23 @@ describe("QA-2.2-23 to QA-2.2-25: batched gates keep the verdict of batchWindowM
     exactReference();
     state.failing = { c: ["t2"], d: ["t1"] };
     state.fifo = true;
-    state.runMs = 1_000;
-    // Both members fit the pooled schedule when the window closes, but another check holds the
-    // one slot for 6.5 s. Pooled after that wait, d's recheck (two distinct references: two
-    // rechecks) would start at 10.5 s with 9.5 s left; alone it starts at 9.5 s with 10.5 s left.
+    // The estimate e is f's lone run, 1 s (one input). A run of two inputs, the union of c and d,
+    // takes 4 s; the members' own runs and the rechecks (one input each) take 1 s.
+    state.runMsFor = inputs => (inputs >= 2 ? 4_000 : 1_000);
+    // Both members fit the pooled schedule when the window closes (21.5 s - 11 s floor - 5 e = 5.5
+    // s of slack), but another check holds the one slot for 6.5 s, so the pooled wait is cut at
+    // 5.5 s and the members run alone. Alone, d's recheck (two distinct references: two rechecks)
+    // starts at 9.5 s with 12 s left, 2 s above the 10 s threshold: the wall-clock overhead of
+    // planning, scopes and report files can use that 2 s without changing the scenario. Had the
+    // batch waited and pooled, d's recheck would start at 6.5 + 4 (union) + 3 = 13.5 s with 8 s
+    // left, 2 s below it: the unverifiable verdict this test refuses. The budget is derived from
+    // this schedule (hold + runs + threshold + margin), so machine speed does not decide the case.
     const { batched, alone } = await twice(async wiring => {
       const held = occupySlot(6_500);
       void barrier(2);
       const verdicts = await Promise.all([
-        gate(wiring, "c", { reference: captured("c".repeat(40)), budgetMs: 20_000 }),
-        gate(wiring, "d", { reference: captured("d".repeat(40)), budgetMs: 20_000 }),
+        gate(wiring, "c", { reference: captured("c".repeat(40)), budgetMs: 21_500 }),
+        gate(wiring, "d", { reference: captured("d".repeat(40)), budgetMs: 21_500 }),
       ]);
       await held;
       return verdicts;

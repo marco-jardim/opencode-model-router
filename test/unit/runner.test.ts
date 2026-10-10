@@ -975,6 +975,9 @@ function treeSearch(files: Record<string, string>, root = "/r"): TestSearchSeam 
   };
 }
 
+/** A bound for a hang, not a performance assertion: real git spawns are slow under Windows load and v8 coverage (issue #88). */
+const REAL_GIT_TIMEOUT_MS = 60_000;
+
 /**
  * QA-G-10: runs `fn` with a TestSearchSeam over a real git repository holding the /r files of
  * `files`, with the wiring's argv (git grep -l -z -F [-w] --untracked; git ls-files with bracketed
@@ -1207,14 +1210,14 @@ describe("E2E-1: pytest maps a changed module to the tests that import it, and f
       expect(spec(await plan(files, ["app/mod02.py"], { search })).inputs).toEqual(CORPUS_HITS);
       expect(search.findByContent).toHaveBeenCalledWith("/r", "mod02", [...PY_TEST_GLOBS, ":(glob)**/conftest.py"], { word: true });
     });
-  });
+  }, REAL_GIT_TIMEOUT_MS);
 
   it("QA-G-10 (C1) through real git: app/app.py maps to its importer only, not to the fixture's `from app.modNN` tests", async () => {
     const files = fixture({ "/r/app/app.py": "X = 1\n", "/r/tests/test_app_use.py": "from app.app import (\r\n    X,\r\n)\r\n" });
     await withGitTree(files, async (search) => {
       expect(spec(await plan(files, ["app/app.py"], { search })).inputs).toEqual(["/r/tests/test_app_use.py"]);
     });
-  });
+  }, REAL_GIT_TIMEOUT_MS);
 
   it("QA-G-10: regex metacharacter stems match literally, through real git", async () => {
     const files = fixture({
@@ -1233,7 +1236,7 @@ describe("E2E-1: pytest maps a changed module to the tests that import it, and f
       expect(spec(await plan(files, ["app/mod.1.py"], { search })).inputs).toEqual(["/r/tests/test_lit_dot.py"]);
       expect(spec(await plan(files, ["app/a(b).py"], { search })).inputs).toEqual(["/r/tests/test_lit_paren.py"]);
     });
-  });
+  }, REAL_GIT_TIMEOUT_MS);
 
   it("QA-G-10: index.py is searched by its own name (QA-G-2 searched app/index.py as `app.app`)", async () => {
     const files = fixture({
@@ -1512,7 +1515,7 @@ describe("E2E-1: pytest maps a changed module to the tests that import it, and f
       await withGitTree(X1, async (search) => {
         expect(spec(await plan(X1, ["app/index.py"], { search })).inputs).toEqual([...APP, "/r/tests/test_util.py"]);
       });
-    });
+    }, REAL_GIT_TIMEOUT_MS);
   });
 
   describe("QA-G-10: app/app.py keeps a hit it cannot prove is not an importer", () => {
