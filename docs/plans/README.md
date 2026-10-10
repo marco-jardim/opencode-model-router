@@ -69,6 +69,16 @@ This directory holds design/implementation plans for `opencode-model-router`.
   - Handover: [`v2-model-effort-status-handover.md`](./v2-model-effort-status-handover.md)
     — kickoff prompt, state, environment and troubleshooting.
 
+- [`critical-path-execution-plan.md`](./critical-path-execution-plan.md)
+  — Critical-Path Execution (OpenCode v2 only, v1 in feature freeze):
+  background-first dispatch with every router guarantee applied at child
+  completion, a cache-stable turn-state tail, persistent pending verifications,
+  file leases, dispatch telemetry, and a plan executor that compiles a plan into
+  a durable dependency graph, runs ready tasks in parallel in isolated worktree
+  slots and integrates them through a serial, always-green queue.
+  - Handover: [`critical-path-execution-handover.md`](./critical-path-execution-handover.md)
+    — kickoff prompt, worktrees, operating rules, troubleshooting and live state.
+
 ## Related records
 
 - Architecture decision records: [`../adr/`](../adr/)
