@@ -208,6 +208,15 @@ named on the route line with `root=<absolute path>` (and repeated in ENVIRONMENT
   its routed work root by default; a `cwd:` outside that root is refused. When the checks cannot run in the work root,
   the dispatch's detection is not `deterministic`, so the [floor](#tier-floor) is computed without the router's gate.
 
+### Repositories below parent directories (cross-repo)
+
+`routing.repoParents`, `routing.repoDepth` and `routing.repoExclude` (global only, OpenCode v2 roles mode, inert on v1)
+name the directories whose repositories role dispatches may work in besides the session repository, without a
+per-repository list: a git top level 1 to `routing.repoDepth` levels below a parent (default 2) is admissible, and so
+are its worktrees. A dispatch still has one work root; the route line names it with `root=`, or by `repo=<name>` and
+`branch=<ref>`, which the router checks against git. The admission rules, the read set and the verification perimeter
+are specified in [the cross-repo design](./design/cross-repo.md).
+
 ## Tier floor
 
 The window of a role dispatch is `[floor, ceiling]`:

@@ -769,6 +769,7 @@ describe("docs drift: roles delegation keys (#84)", () => {
     "routing.delegation", "roleAgents", "roleAgents.<name>.enabled", "roleAgents.<name>.description", "roleAgents.<name>.prompt",
     "roleAgents.<name>.tierRange", "roleAgents.<name>.budget", "roleAgents.<name>.deny", "routing.exploration.rate",
     "routing.exploration.requireDetection", "routing.run.scripts", "routing.run.commands", "routing.run.timeoutMs", "routing.workRoots",
+    "routing.repoParents", "routing.repoDepth", "routing.repoExclude",
   ];
 
   it("documents every key, and a missing one is detected", () => {
@@ -787,6 +788,10 @@ describe("docs drift: roles delegation keys (#84)", () => {
     expect(cell("roleAgents")).toBe("`{}`");
     expect(cell("routing.workRoots")).toBe("`[]`");
     expect(defaults.workRoots).toEqual([]);
+    expect(cell("routing.repoParents")).toBe("`[]`");
+    expect(cell("routing.repoDepth")).toBe(defaultCell(defaults.repoDepth));
+    expect(cell("routing.repoExclude")).toBe("`[]`");
+    expect([defaults.repoParents, defaults.repoDepth, defaults.repoExclude]).toEqual([[], 2, []]);
     expect(Object.keys(defaults.run.commands)).toEqual(["test-files"]);
   });
 
@@ -1124,7 +1129,8 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     const denied = `${ROLE_DENIED_ACTIONS.slice(0, -1).map(tick).join(", ")} and ${tick(ROLE_DENIED_ACTIONS[ROLE_DENIED_ACTIONS.length - 1]!)} denied explicitly`;
     expect(flat).toContain(denied);
     for (const key of ["routing.delegation", "roleAgents", "routing.exploration.rate", "routing.exploration.requireDetection", "routing.run.scripts",
-      "routing.run.commands", "routing.run.timeoutMs", "routing.workRoots"]) expect(guide, key).toContain(`\`${key}`);
+      "routing.run.commands", "routing.run.timeoutMs", "routing.workRoots", "routing.repoParents", "routing.repoDepth",
+      "routing.repoExclude"]) expect(guide, key).toContain(`\`${key}`);
   });
 
   it("ADR 0006 has D1–D13 in order, the evidence E1–E13 and only the literature L1–L14", () => {

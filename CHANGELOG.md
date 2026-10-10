@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - README: 90-second demo video below the title.
+- **Cross-repo work in roles mode (OpenCode v2; inert on v1), in progress (#107).** New global-only keys
+  `routing.repoParents`, `routing.repoDepth` (1–4, default 2) and `routing.repoExclude` name the directories whose
+  repositories role dispatches may work in; the route line accepts `repo=<name>` and `branch=<ref>` (case kept). The
+  binding that uses them follows; until then they are validated and have no effect.
 
 ### Removed
 

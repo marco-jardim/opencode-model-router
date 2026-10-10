@@ -40,6 +40,8 @@ export const DEFAULT_RUN_COMMANDS: RunConfig["commands"] = Object.freeze({
   }),
 });
 export const DEFAULT_RUN_TIMEOUT_MS = 600_000;
+/** `routing.repoDepth` default: repositories one or two levels below a parent (`D:/git/x`, `D:/git/org/x`). */
+export const DEFAULT_REPO_DEPTH = 2;
 export const RUN_TIMEOUT_BOUNDS = { min: 1_000, max: 3_600_000 } as const;
 export const ROLES_V1_NOTICE = "roles delegation requires OpenCode v2; using tiers";
 
@@ -243,6 +245,64 @@ export function sanitizeWorkRoots(value: unknown): Sanitized<string[]> {
   return { value: out, issues };
 }
 
+/**
+ * A `routing.repoParents` entry (cross-repo, Phase 1): a literal, local, absolute directory in canonical long form. No glob
+ * (a parent is one directory), no network or device path, then {@link workRootProblem}'s rules (static prefix, no `.`/`..`,
+ * no 8.3 segment).
+ */
+export function repoParentProblem(entry: string): string | undefined {
+  // Network and device paths first: `\\?\C:\x` carries a `?` but is refused for what it is.
+  if (/^[\\/]{2}/.test(entry)) return "is a network or device path; use a local directory";
+  if (/[*?[\]{}]/.test(entry)) return "contains a glob character; a parent is a literal directory";
+  return workRootProblem(entry);
+}
+
+function sanitizePathList(
+  key: "repoParents" | "repoExclude",
+  value: unknown,
+  problemOf: (entry: string) => string | undefined,
+  what: string,
+): Sanitized<string[]> {
+  const issues: RolesIssue[] = [];
+  if (value === undefined) return { value: undefined, issues };
+  if (!Array.isArray(value)) {
+    issues.push({ path: `routing.${key}`, message: `routing.${key} must be an array of ${what} (got ${show(value)}); ignored` });
+    return { value: undefined, issues };
+  }
+  const out: string[] = [];
+  value.forEach((entry: unknown, i) => {
+    const path = `routing.${key}[${i}]`;
+    if (typeof entry !== "string") {
+      issues.push({ path, message: `${path} must be a string (got ${show(entry)}); entry dropped` });
+      return;
+    }
+    const problem = problemOf(entry);
+    if (problem !== undefined) {
+      issues.push({ path, message: `${path} ${show(entry)} ${problem}; entry dropped` });
+      return;
+    }
+    if (!out.includes(entry)) out.push(entry);
+  });
+  return { value: out, issues };
+}
+
+export function sanitizeRepoParents(value: unknown): Sanitized<string[]> {
+  return sanitizePathList("repoParents", value, repoParentProblem, "absolute directories");
+}
+
+export function sanitizeRepoExclude(value: unknown): Sanitized<string[]> {
+  return sanitizePathList("repoExclude", value, workRootProblem, "absolute globs");
+}
+
+export function sanitizeRepoDepth(value: unknown): Sanitized<number> {
+  if (value === undefined) return { value: undefined, issues: [] };
+  if (typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 4) return { value, issues: [] };
+  return {
+    value: undefined,
+    issues: [{ path: "routing.repoDepth", message: `routing.repoDepth must be an integer from 1 to 4 (got ${show(value)}); ignored` }],
+  };
+}
+
 export function sanitizeRoleAgents(value: unknown): Sanitized<Record<string, RoleAgentCustomisation>> {
   const issues: RolesIssue[] = [];
   if (value === undefined) return { value: undefined, issues };
@@ -424,6 +484,9 @@ export function collectRolesIssues(rawRouting: unknown, rawRoleAgents: unknown):
     ...sanitizeExploration(r.exploration).issues,
     ...sanitizeRun(r.run).issues,
     ...sanitizeWorkRoots(r.workRoots).issues,
+    ...sanitizeRepoParents(r.repoParents).issues,
+    ...sanitizeRepoDepth(r.repoDepth).issues,
+    ...sanitizeRepoExclude(r.repoExclude).issues,
     ...sanitizeRoleAgents(rawRoleAgents).issues,
   ];
 }
