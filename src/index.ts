@@ -96,6 +96,7 @@ import { applyV1Roles, hasExplicitV1Roles, v1AgentInfos } from "./routing/comman
 import type { HostAgentInfo } from "./routing/engine/types";
 import { createEngineRuntime } from "./routing/wire/runtime";
 import type { EngineRuntime } from "./routing/wire/runtime";
+import { forgetWorkingSet } from "./routing/wire/working-set";
 import {
   advisorSettings,
   catalogFromProviders,
@@ -2679,6 +2680,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             }
             warnedNoCallID.delete(id);
             forgetRoleSession(id); // #84 P2.1 (the binding and authority registries are evicted by the v2 adapter)
+            forgetWorkingSet(id); // cross-repo P1.4: the orchestrator's bound repository locations
             // 2.4.2b: a deleted orchestrator's handles, tombstones and lineage records go with it.
             // 2.4.5: so do its background requests and late notices; its run in flight is aborted.
             background?.forgetSession(id);

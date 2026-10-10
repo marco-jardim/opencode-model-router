@@ -31,6 +31,7 @@ import {
   BINDING_NOTES, bind, currentBinding, evict as evictBinding, evictCall, type Binding, type SessionLookup,
 } from "../routing/roles/binding";
 import type { DispatchGrant } from "../routing/roles/policy";
+import { forgetWorkingSet } from "../routing/wire/working-set";
 import {
   AUTHORITY_TEXT, AUTHORITY_TOOL_NAME, consumeAuthority, discardAuthority, evictAuthority, markAnnotated, previewAuthority, quoteChildText,
   requestedAuthority, type AuthorityDeps,
@@ -1845,6 +1846,7 @@ export async function registerV2Hooks(
             // authority requests go with it.
             if (typeof data.sessionID === "string") {
               evictBinding(data.sessionID);
+              forgetWorkingSet(data.sessionID); // cross-repo P1.4: the orchestrator's bound repository locations
               evictAuthority(data.sessionID);
               ownOutputs.delete(data.sessionID); // QA-P23-2-A1
               lookupNamedAgent.delete(data.sessionID);

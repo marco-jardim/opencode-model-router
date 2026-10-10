@@ -26,6 +26,9 @@ import {
   roleEscalationAfterFail, roleGateDeferred, roleMaxActions, routedRoleOf, type DispatchRouter, type RouteOutcome,
 } from "../../src/routing/wire/dispatch";
 import { createEngineRuntime, type EngineRuntime } from "../../src/routing/wire/runtime";
+import { execFileSync } from "node:child_process";
+import type { Admission, AdmissionConfig, AdmissionService } from "../../src/routing/roles/admission";
+import { forgetWorkingSet, workingSetOf } from "../../src/routing/wire/working-set";
 
 const bundled = JSON.parse(readFileSync(join(process.cwd(), "tiers.json"), "utf-8")) as Record<string, unknown>;
 const logger = { warn: vi.fn() };
@@ -76,7 +79,10 @@ function temp(prefix: string): string {
   return dir;
 }
 
-function makeWorld(cfg: RouterConfig, opts: { catalog?: Catalog; main?: string; routerVerifyEnabled?: () => boolean } = {}): World {
+function makeWorld(cfg: RouterConfig, opts: {
+  catalog?: Catalog; main?: string; routerVerifyEnabled?: () => boolean;
+  createAdmission?: (config: AdmissionConfig) => Pick<AdmissionService, "admit" | "resolve">;
+} = {}): World {
   const main = opts.main ?? temp("omr-p21-int-main-");
   let captured: OutcomesBundle | null = null;
   const runtime = createEngineRuntime({
@@ -99,6 +105,7 @@ function makeWorld(cfg: RouterConfig, opts: { catalog?: Catalog; main?: string; 
     listWorktrees: async () => `worktree ${main.replace(/\\/g, "/")}\nHEAD 0\nbranch refs/heads/main\n`,
     env: {},
     ...(opts.routerVerifyEnabled === undefined ? {} : { routerVerifyEnabled: opts.routerVerifyEnabled }),
+    ...(opts.createAdmission === undefined ? {} : { createAdmission: opts.createAdmission }),
   });
   cleanups.push(async () => { await runtime.dispose(); });
   return {
@@ -693,6 +700,59 @@ describe("P3.3 global QA round 1: resumes keep the resumed dispatch's facts and 
 // ---------------------------------------------------------------------------
 // E6 / E7 through the plugin's hook shapes
 // ---------------------------------------------------------------------------
+
+describe("cross-repo P1.4: the work root bound through admission", () => {
+  beforeEach(() => forgetWorkingSet("root"));
+  afterEach(() => forgetWorkingSet("root"));
+
+  it("[route … repo=<name>] binds that repository below routing.repoParents: the location on the grant, the working set updated", async () => {
+    const parent = temp("omr-p14-parent-");
+    for (const name of ["alpha", "beta"]) {
+      mkdirSync(join(parent, name));
+      execFileSync("git", ["init", "-q", "-b", "main", join(parent, name)], { stdio: "ignore" });
+    }
+    const beta = realpathSync.native(join(parent, "beta"));
+    const world = makeWorld(config({ delegation: "roles", engine: "static", repoParents: [parent] }));
+    const outcome = await world.router.route(call(world, {
+      agent: "implementer", prompt: "[route class=implement risk=low scope=single needs=edit repo=beta]\nchange x",
+    }));
+    expect(outcome.role!.workRoot).toBe(beta);
+    expect(outcome.role!.grant.workRoot).toBe(beta);
+    expect(outcome.role!.grant.location).toMatchObject({ name: "beta", repository: beta, worktree: beta, branch: "main" });
+    expect([...outcome.role!.grant.actions]).toContain("edit");
+    expect(workingSetOf("root").map((location) => location.worktree)).toEqual([beta]);
+  });
+
+  it("I9: without routing.repoParents and without repo=/branch= no admission is built; branch= alone builds one (once per config) and asks it", async () => {
+    const created: AdmissionConfig[] = [];
+    const reason = "repo=main branch=feat: no worktree of main is on feat (main): no work root.";
+    const resolve = vi.fn(async (): Promise<Admission> => ({ ok: false, reason }));
+    const admit = vi.fn(async (): Promise<Admission> => ({ ok: false, reason: "never" }));
+    const world = makeWorld(config({ delegation: "roles", engine: "static" }), {
+      createAdmission: (admissionConfig) => {
+        created.push(admissionConfig);
+        return { admit, resolve };
+      },
+    });
+    const plain = await world.router.route(call(world, {
+      agent: "implementer", prompt: `[route class=implement risk=low scope=single needs=edit root=${world.main}]\nchange x`,
+    }));
+    expect(plain.role!.workRoot).toBe(world.main);
+    expect(plain.role!.grant.location).toBeUndefined();
+    expect(created).toEqual([]);
+
+    const branched = await world.router.route(call(world, { agent: "implementer", prompt: "[route class=implement risk=low scope=single needs=edit branch=feat]\nchange x" }));
+    expect(branched.role!.workRoot).toBeNull();
+    expect([...branched.role!.grant.actions]).not.toContain("edit");
+    expect(resolve).toHaveBeenCalledWith({ branch: "feat" }, { sessionRepository: world.main, known: [world.main] });
+    await world.router.route(call(world, { agent: "implementer", prompt: "[route class=implement risk=low scope=single needs=edit branch=feat]\nchange y" }));
+    expect(resolve).toHaveBeenCalledTimes(2);
+    expect(created).toHaveLength(1);
+    expect(created[0]?.parents).toEqual([]);
+    expect(admit).not.toHaveBeenCalled();
+    expect(workingSetOf("root")).toEqual([]);
+  });
+});
 
 describe("E6/E7 through the hook shapes", () => {
   async function rolesPlugin(): Promise<Record<string, any>> {

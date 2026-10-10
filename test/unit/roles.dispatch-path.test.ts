@@ -30,6 +30,7 @@ import {
   type RouteOutcome,
 } from "../../src/routing/wire/dispatch";
 import { createEngineRuntime, type EngineRuntime } from "../../src/routing/wire/runtime";
+import type { Admission, RepoLocation } from "../../src/routing/roles/admission";
 import { resolveRoles } from "../../src/router/roles";
 
 const bundled = JSON.parse(readFileSync(join(process.cwd(), "tiers.json"), "utf-8")) as Record<string, unknown>;
@@ -449,6 +450,85 @@ describe("exported helpers for the adapter (P2.1-C)", () => {
     listWorktrees.mockRejectedValueOnce(new Error("not a git repository"));
     expect((await resolveRoleWorkRoot({ root: "D:\\git\\omr-rta-x", sessionDirectory: "D:\\git\\main" }, deps)).workRoot).toBeNull();
     expect((await resolveRoleWorkRoot({ root: null, sessionDirectory: "D:\\git\\main" }, deps)).workRoot).toBe("CANON(D:\\git\\main)");
+  });
+
+  describe("cross-repo P1.4: resolveRoleWorkRoot binds through admission", () => {
+    const located = (worktree: string, over: Partial<RepoLocation> = {}): RepoLocation => ({
+      repository: worktree, name: worktree.split("\\").pop() ?? worktree, worktree, branch: "main", head: "abc1234def", worktrees: [], ...over,
+    });
+    const fakeDeps = () => ({
+      listWorktrees: vi.fn(async () => "worktree D:/git/main\n"),
+      realpath: vi.fn((path: string) => `CANON(${path})`),
+      platform: "win32" as const,
+    });
+    const fakeAdmission = (result: Admission) => ({ admit: vi.fn(async () => result), resolve: vi.fn(async () => result) });
+
+    it("I9: without an admission, or with nothing for it to bind, today's text match is unchanged and admission is never asked", async () => {
+      const deps = fakeDeps();
+      const admission = fakeAdmission({ ok: false, reason: "never" });
+      expect(await resolveRoleWorkRoot({ root: null, sessionDirectory: "D:\\git\\main" }, deps, { admission }))
+        .toEqual({ workRoot: "CANON(D:\\git\\main)", requested: null, note: null });
+      expect(await resolveRoleWorkRoot({ root: "d:\\GIT\\main", sessionDirectory: "D:\\git\\main" }, deps, { admission }))
+        .toEqual({ workRoot: "CANON(D:\\git\\main)", requested: "d:\\GIT\\main", note: null });
+      // repo= without an admission: the old path, the old note
+      expect(await resolveRoleWorkRoot({ root: "D:\\git\\api", sessionDirectory: "D:\\git\\main" }, deps, { repo: "api" })).toEqual({
+        workRoot: null, requested: "D:\\git\\api",
+        note: "root=D:\\git\\api is neither the session directory nor a worktree listed by `git worktree list --porcelain`: no work root",
+      });
+      expect(admission.admit).not.toHaveBeenCalled();
+      expect(admission.resolve).not.toHaveBeenCalled();
+    });
+
+    it("repo= with an admission: resolve() binds the canonical worktree, the location is returned, no note", async () => {
+      const deps = fakeDeps();
+      const bound = located("D:\\src\\api");
+      const admission = fakeAdmission({ ok: true, location: bound });
+      expect(await resolveRoleWorkRoot({ root: null, sessionDirectory: "D:\\git\\main" }, deps, { repo: "api", admission, known: ["D:\\git\\main", "D:\\git\\wt"] }))
+        .toEqual({ workRoot: "CANON(D:\\src\\api)", requested: null, note: null, location: bound });
+      expect(admission.resolve).toHaveBeenCalledWith({ repo: "api" }, { sessionRepository: "D:\\git\\main", known: ["D:\\git\\main", "D:\\git\\wt"] });
+      expect(admission.admit).not.toHaveBeenCalled();
+      expect(deps.listWorktrees).not.toHaveBeenCalled(); // declared names never go through the text match
+    });
+
+    it("a refusal: no work root, and the note is the refusal's reason", async () => {
+      const reason = "repo=api matches no repository below routing.repoParents (searched D:\\src): no work root.";
+      expect(await resolveRoleWorkRoot({ root: null, sessionDirectory: "D:\\git\\main" }, fakeDeps(), { repo: "api", admission: fakeAdmission({ ok: false, reason }) }))
+        .toEqual({ workRoot: null, requested: null, note: reason });
+      const thrown = { admit: vi.fn(async (): Promise<Admission> => { throw new Error("boom"); }), resolve: vi.fn(async (): Promise<Admission> => { throw new Error("boom"); }) };
+      const failed = await resolveRoleWorkRoot({ root: null, sessionDirectory: "D:\\git\\main" }, fakeDeps(), { repo: "api", admission: thrown });
+      expect(failed.workRoot).toBeNull();
+      expect(failed.note).toContain("boom");
+    });
+
+    it("a root= the session repository does not list: the text match runs first, then admit(); admitted → bound, refused → the reason", async () => {
+      const deps = fakeDeps();
+      const bound = located("D:\\src\\lib");
+      const admission = fakeAdmission({ ok: true, location: bound });
+      expect(await resolveRoleWorkRoot({ root: "D:\\src\\lib", sessionDirectory: "D:\\git\\main" }, deps, { admission, known: ["D:\\git\\wt"] }))
+        .toEqual({ workRoot: "CANON(D:\\src\\lib)", requested: "D:\\src\\lib", note: null, location: bound });
+      expect(deps.listWorktrees).toHaveBeenCalledTimes(1);
+      expect(admission.admit).toHaveBeenCalledWith("D:\\src\\lib", ["D:\\git\\main", "D:\\git\\wt"]);
+      expect(admission.resolve).not.toHaveBeenCalled();
+      const reason = "root=D:\\src\\lib is not below routing.repoParents and no known repository lists it: no work root.";
+      expect(await resolveRoleWorkRoot({ root: "D:\\src\\lib", sessionDirectory: "D:\\git\\main" }, deps, { admission: fakeAdmission({ ok: false, reason }) }))
+        .toEqual({ workRoot: null, requested: "D:\\src\\lib", note: reason });
+    });
+
+    it("branch= alone goes through resolve() against the session repository; root= with branch= too, so the branch must agree", async () => {
+      const deps = fakeDeps();
+      const bound = located("D:\\git\\main-feat", { repository: "D:\\git\\main", name: "main", branch: "feat" });
+      const admission = fakeAdmission({ ok: true, location: bound });
+      expect(await resolveRoleWorkRoot({ root: null, sessionDirectory: "D:\\git\\main" }, deps, { branch: "feat", admission }))
+        .toEqual({ workRoot: "CANON(D:\\git\\main-feat)", requested: null, note: null, location: bound });
+      expect(admission.resolve).toHaveBeenCalledWith({ branch: "feat" }, { sessionRepository: "D:\\git\\main", known: ["D:\\git\\main"] });
+      const mismatch = "root=D:\\git\\main declares branch=feat, but that worktree is on main (HEAD abc1234): no work root.";
+      const refusing = fakeAdmission({ ok: false, reason: mismatch });
+      // the session directory matches root= as text, but the declared branch still has to agree
+      expect(await resolveRoleWorkRoot({ root: "D:\\git\\main", sessionDirectory: "D:\\git\\main" }, deps, { branch: "feat", admission: refusing }))
+        .toEqual({ workRoot: null, requested: "D:\\git\\main", note: mismatch });
+      expect(refusing.resolve).toHaveBeenCalledWith({ root: "D:\\git\\main", branch: "feat" }, { sessionRepository: "D:\\git\\main", known: ["D:\\git\\main"] });
+      expect(deps.listWorktrees).not.toHaveBeenCalled();
+    });
   });
 
   it("the role-aware escalation hint resumes the same task id on the next tier (P-8)", () => {

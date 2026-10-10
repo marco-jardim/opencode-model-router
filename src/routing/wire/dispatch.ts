@@ -50,7 +50,7 @@ import { decideRole } from "../engine/kernel";
 import type { Candidate, ChosenDispatch, Decision, HostAgentInfo, Ladder, RoleLadder } from "../engine/types";
 import { CLASS_IMPLIED_NEEDS, FACT_SOURCES, NEEDS, RISKS, SCOPES, TASK_CLASSES, classify, classifyNeedMatches } from "../classify";
 import type { ClassifyResult, Detection, Need, RouteLine, TaskFacts } from "../classify/types";
-import { resolveVerifyBudget, type RouterConfig } from "../../router/config";
+import { resolveRolesRouting, resolveVerifyBudget, type RouterConfig } from "../../router/config";
 import { resolveEnforcementMode } from "../../router/enforcement";
 import { roleGuardProfile } from "../../router/guard-profile";
 import { resolveRoles, type AuthorityAction, type RoleSpec } from "../../router/roles";
@@ -62,6 +62,8 @@ import {
   BINDING_NOTES, LOCAL_ACTIONS, currentBinding, evictCall, newDispatchNonce, noncePromptLine, nonceTitleSuffix, registerPending, type Binding,
 } from "../roles/binding";
 import { realpathSync } from "node:fs";
+import type { Admission, AdmissionConfig, AdmissionService, RepoLocation } from "../roles/admission";
+import { addToWorkingSet, workingSetOf } from "./working-set";
 import {
   consumeRunnerDispatch, consumeRunnerDispatchLoose, forgetDispatch, lookupDispatch, rememberDispatch, runnerDescription,
   updateDispatchVerification, type CarriedVerification, type DetectionDepth, type DispatchInput, type DispatchRecord,
@@ -257,6 +259,11 @@ export interface DispatchRouter {
 }
 
 export interface DispatchRouterDeps {
+  /**
+   * Cross-repo (P1.4): builds the admission of a resolved `{ repoParents, repoDepth, repoExclude }` (once per triple); default
+   * `createAdmission` (`roles/admission.ts`). Tests inject a fake.
+   */
+  readonly createAdmission?: (config: AdmissionConfig) => Pick<AdmissionService, "admit" | "resolve">;
   readonly runtime: EngineRuntime;
   /** `ctx.session.get({ sessionID })`. */
   readonly getSession: (sessionID: string) => Promise<unknown>;
@@ -509,6 +516,24 @@ export interface WorkRootResolution {
   readonly requested: string | null;
   /** Why there is no work root (for the grant notes and the dispatch header); null when resolved. */
   readonly note: string | null;
+  /** Cross-repo (P1.4): where the work root lies, when admission bound it. */
+  readonly location?: RepoLocation;
+}
+
+/**
+ * Cross-repo (P1.4): what admission needs to bind a role dispatch's work root. Without `admission`, `resolveRoleWorkRoot` is
+ * today's text match (invariant I9).
+ */
+export interface WorkRootAdmissionInput {
+  /** The route line's `repo=`, as written. */
+  readonly repo?: string | null | undefined;
+  /** The route line's `branch=`, as written. */
+  readonly branch?: string | null | undefined;
+  readonly admission?: Pick<AdmissionService, "admit" | "resolve"> | undefined;
+  /** The session repository; the session directory when absent. */
+  readonly sessionRepository?: string | undefined;
+  /** Repositories whose worktrees are admissible by rule 2 (the session directory, the working set). */
+  readonly known?: readonly string[] | undefined;
 }
 
 export interface WorkRootDeps {
@@ -551,6 +576,7 @@ export async function gitWorktreeList(cwd: string): Promise<string> {
 export async function resolveRoleWorkRoot(
   input: { readonly root: string | null; readonly sessionDirectory: string },
   deps: WorkRootDeps,
+  cross?: WorkRootAdmissionInput,
 ): Promise<WorkRootResolution> {
   const canonical = (path: string): string | null => {
     try {
@@ -560,6 +586,31 @@ export async function resolveRoleWorkRoot(
       return null;
     }
   };
+  // Cross-repo (P1.4): admission binds `repo=` / `branch=` (with or without `root=`), and a `root=` the text match below did not find.
+  const admission = cross?.admission;
+  const sessionRepository = cross?.sessionRepository ?? input.sessionDirectory;
+  const known = [...new Set([sessionRepository, ...(cross?.known ?? [])])];
+  const admitted = async (run: () => Promise<Admission>): Promise<WorkRootResolution> => {
+    let result: Admission;
+    try {
+      result = await run();
+    } catch (error) {
+      result = { ok: false, reason: `admission failed: ${describeError(error)}: no work root.` };
+    }
+    if (!result.ok) return { workRoot: null, requested: input.root, note: result.reason };
+    const resolved = canonical(result.location.worktree);
+    return resolved === null
+      ? { workRoot: null, requested: input.root, note: `${result.location.worktree} does not resolve on disk: no work root` }
+      : { workRoot: resolved, requested: input.root, note: null, location: result.location };
+  };
+  const repo = cross?.repo?.trim() || undefined;
+  const branch = cross?.branch?.trim() || undefined;
+  if (admission !== undefined && (repo !== undefined || branch !== undefined)) {
+    return admitted(() => admission.resolve(
+      { ...(input.root === null ? {} : { root: input.root }), ...(repo === undefined ? {} : { repo }), ...(branch === undefined ? {} : { branch }) },
+      { sessionRepository, known },
+    ));
+  }
   if (input.root === null) {
     const dir = canonical(input.sessionDirectory);
     return dir === null
@@ -578,6 +629,10 @@ export async function resolveRoleWorkRoot(
     match = listed.find((path) => normalizeRootText(path, deps.platform) === want);
   }
   const none = `root=${input.root} is neither the session directory nor a worktree listed by \`git worktree list --porcelain\`: no work root`;
+  if (match === undefined && admission !== undefined) {
+    const root = input.root;
+    return admitted(() => admission.admit(root, known));
+  }
   if (match === undefined) return { workRoot: null, requested: input.root, note: none };
   const resolved = canonical(match);
   return resolved === null
@@ -847,7 +902,7 @@ function resumedGrant(boundGrant: DispatchGrant, widened: readonly AuthorityActi
     actions.delete("router_run");
     actions.delete("edit");
   }
-  return { actions, notes: [...boundGrant.notes], workRoot: root };
+  return { actions, notes: [...boundGrant.notes], workRoot: root, ...(boundGrant.location === undefined ? {} : { location: boundGrant.location }) };
 }
 
 /** verify/dod.ts `OPEN_TAG_RE` / `CLOSE_TAG_RE`: the lines that open and close an `[acceptance]` block. */
@@ -1512,6 +1567,38 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     platform: deps.platform ?? process.platform,
   };
 
+  // Cross-repo (P1.4): one admission per resolved `{ repoParents, repoDepth, repoExclude }` (it caches its git results for 5 s).
+  let admissionMemo: { readonly key: string; readonly service: Pick<AdmissionService, "admit" | "resolve"> } | undefined;
+  const admissionFor = async (config: AdmissionConfig): Promise<Pick<AdmissionService, "admit" | "resolve">> => {
+    const key = JSON.stringify([config.parents, config.depth, config.exclude]);
+    if (admissionMemo !== undefined && admissionMemo.key === key) return admissionMemo.service;
+    // Loaded lazily: admission.ts imports this module, so no import cycle is evaluated at load time.
+    const service = deps.createAdmission !== undefined ? deps.createAdmission(config) : (await import("../roles/admission")).createAdmission(config);
+    admissionMemo = { key, service };
+    return service;
+  };
+
+  /**
+   * Cross-repo (P1.4): the admission input of a role dispatch. Undefined — today's text match, nothing else (I9) — unless roles mode
+   * is active on v2 and `routing.repoParents` is set or the route line declares `repo=` / `branch=` (`branch=` alone needs no parent:
+   * the session repository answers it). `known`: the session directory and the worktrees of the orchestrator's working set.
+   */
+  const crossRepoOf = async (
+    cfg: RouterConfig,
+    orchestratorSessionID: string,
+    sessionDirectory: string,
+    line: Pick<RouteLine, "repo" | "branch"> | null | undefined,
+  ): Promise<WorkRootAdmissionInput | undefined> => {
+    const routing = resolveRolesRouting(cfg, "v2");
+    const repo = line?.repo ?? undefined;
+    const branch = line?.branch ?? undefined;
+    if (routing.delegation !== "roles") return undefined;
+    if (routing.repoParents.length === 0 && repo === undefined && branch === undefined) return undefined;
+    const admission = await admissionFor({ parents: routing.repoParents, depth: routing.repoDepth, exclude: routing.repoExclude });
+    const known = [...new Set([sessionDirectory, ...workingSetOf(orchestratorSessionID).map((location) => location.worktree)])];
+    return { repo, branch, admission, sessionRepository: sessionDirectory, known };
+  };
+
   /**
    * The rung a resumed child runs on: the dispatch registry's record (its `tier` is the role tier the router registered), else the
    * child session's own model; unknown → a model off every ladder, which the kernel lifts to the window ceiling (never below).
@@ -1559,13 +1646,17 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     if (lined.trace.routeLines.malformed === true) throw new RoleDispatchRefusal(agent, ROLE_REFUSALS.malformed);
 
     // 2. work root: `root=` from the trace only, text-compared with `git worktree list --porcelain` before any filesystem call.
-    const root = await resolveRoleWorkRoot({ root: lined.trace.routeLine?.root ?? null, sessionDirectory }, workRootDeps);
+    // Cross-repo (P1.4): `repo=` / `branch=`, and a `root=` the text match does not find, are bound through admission.
+    const declaredLine = lined.trace.routeLine;
+    const root = await resolveRoleWorkRoot(
+      { root: declaredLine?.root ?? null, sessionDirectory }, workRootDeps, await crossRepoOf(rp.cfg, call.sessionID, sessionDirectory, declaredLine),
+    );
     const bound = resumeID === null ? undefined : currentBinding(resumeID, { maxOf: (name) => roleMaxActions(rp.roles.get(name)) });
 
     // 3. classify in the dispatch's own root (QA-G-B-3 (1)): an absolute path inside it is no `external_dir`. A resume of an exactly
     // bound child is classified in its bound root (QA-P33F1-1-1); without a `root=` (the work root is the session directory) or a
     // validated one, in the session directory as the host names it.
-    const requestedRoot = root.requested !== null ? root.workRoot : null;
+    const requestedRoot = root.requested !== null || root.location !== undefined ? root.workRoot : null;
     const classifyCwd = (bound?.kind === "exact" ? bound.grant.workRoot : null) ?? requestedRoot ?? sessionDirectory;
     const result = await classify({ description, prompt, cwd: classifyCwd }, rp.classifyDeps);
     if (result.trace.routeLines.malformed === true) throw new RoleDispatchRefusal(agent, ROLE_REFUSALS.malformed);
@@ -1589,7 +1680,9 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     // 4. grant (widened actions of a resume recompute the floor, handoff 36). QA-P21-2-1: a resume of an EXACTLY bound child keeps
     // what that child holds (its bound grant) plus the widened actions — the resume prompt alone ("continue") would lose them.
     const grant: DispatchGrant = bound?.kind === "exact" ? resumedGrant(bound.grant, call.widened ?? [])
-      : grantFor(rp.spec, taskFacts, call.widened ?? [], root.workRoot, routeLine);
+      : grantFor(rp.spec, taskFacts, call.widened ?? [], root.workRoot, routeLine, root.location);
+    // Cross-repo (P1.4): a root bound through admission joins the orchestrator's working set (rule 2 for its later dispatches).
+    if (root.location !== undefined && root.workRoot !== null) addToWorkingSet(call.sessionID, root.location);
 
     // 5. effective detection (S10/P-9, A34; handoff 5): never `result.detection` as is. QA-G-B-1: a resume that names no
     // `[acceptance]` block of its own carries the one of the dispatch it resumes (and its `VERIFY:` lines, when it names none), so
