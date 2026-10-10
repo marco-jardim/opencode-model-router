@@ -68,10 +68,10 @@ Start now with Pre-flight 0.P (order: 0.P.1 → 0.P.3 → 0.P.6 → 0.P.2 → 0.
 
 | What | Where |
 |---|---|
-| **Working directory (plan home, integration worktree)** | `D:\git\omr-cpx-main`, branch `cpx/main`, from `origin/master` `b716ee9` (release 2.7.0), **no upstream** (unset on purpose, so a bare `git push` cannot target `master`; 0.P.1 runs `push -u origin cpx/main`). Its `.git` is a file: `gitdir: D:/git/opencode-model-router/.git/worktrees/omr-cpx-main`. |
+| **Working directory (plan home, integration worktree)** | `D:\git\omr-cpx-main`, branch `cpx/main`, from `origin/master` `b716ee9` (release 2.7.0). Upstream `origin/cpx/main` since 0.P.1 (it had none at plan time, on purpose, so a bare `git push` could not target `master`). Its `.git` is a file: `gitdir: D:/git/opencode-model-router/.git/worktrees/omr-cpx-main`. |
 | **Base repository directory (main checkout) — OFF-LIMITS** | `D:\git\opencode-model-router`, local `master` at `71dcfab` ("docs(design): add cross-repo work design for roles mode"), 1 commit ahead of and 6 behind `origin/master` on 2026-10-10. Another implementation is in progress there. Its working tree was clean when the plan file was moved out of it. |
-| Plan (binding) | `D:\git\omr-cpx-main\docs\plans\critical-path-execution-plan.md`, **untracked**, committed by 0.P.1 |
-| This handover | `D:\git\omr-cpx-main\docs\plans\critical-path-execution-handover.md`, **untracked**, committed by 0.P.1 |
+| Plan (binding) | `D:\git\omr-cpx-main\docs\plans\critical-path-execution-plan.md`, committed by 0.P.1 (`d6a6610`); amendments committed in `D:\git\omr-cpx-main` |
+| This handover | `D:\git\omr-cpx-main\docs\plans\critical-path-execution-handover.md`, committed by 0.P.1 (`d6a6610`) |
 | Orchestrator session | Moved to `D:\git\omr-cpx-main` on 2026-10-10. After any restart, continue the same session there. |
 | Worktrees to be created | Phases: `D:\git\omr-cpx-p<id>` (branch `cpx/p<id>`, base tag `cpx/p<id>-base`). Dogfood: `D:\git\omr-cpx-dogfood-df<n>`. Probes: `D:\git\omr-cpx-scratch`, `D:\git\omr-cpx-e2e`. Dogfood fixes: `D:\git\omr-cpx-pdf<n>-<k>`. All are created from `cpx/main` with `git -C D:\git\omr-cpx-main …`, all sit outside the base directory, under `D:\git\`. |
 | QA reports | `D:\git\omr-cpx-main\docs\qa\critical-path-execution\`: `preflight.md`, `phase-<id>.md` (written in the phase worktree), `dogfood.md`, `global.md` |
@@ -111,7 +111,9 @@ it. Example ENVIRONMENT line:
 - **Full paths everywhere** (prefix `D:\git\omr-cpx-main\`, substituted to the dispatch's worktree, §0.4). The only
   exception is command-line arguments.
 - **Never touch `D:\git\opencode-model-router`** (§0.13). Before every dispatch, check that no `root=`, `cwd:`,
-  `Writes:`/`Reads:` line, tool argument or shell command names it.
+  `Writes:`/`Reads:` line, tool argument or shell command names it. The same guard (QA-0.P-10) rejects a `root=`,
+  `cwd:` or `Writes:` line naming `D:\git\omr-cpx-dogfood-` (the running build; never edited, §0.12-1) and anything
+  naming the other implementation's worktree `D:\git\opencode-model-router-cross-repo`.
 
 ---
 
@@ -149,7 +151,7 @@ it. Example ENVIRONMENT line:
 - Nothing records dispatch durations.
 - A plan is a flat list keyed by line numbers.
 
-Anchors come from `b7984b3`; the base is `b716ee9`. 0.P.4 re-bases them.
+Anchors come from `b7984b3`; the base is `b716ee9`. 0.P.4 re-based them: only `src\verify\reference.ts` changed between the two (table in §7).
 
 ### 3.3 Host facts gathered during planning (Phase 0.1 pins them; do not trust them blindly)
 
@@ -330,18 +332,18 @@ Everything else is work: resolve it, record it, continue.
 
 ## 7. Live state (§0.11 — keep current)
 
-**Next action:** 0.P.QA round 1 (heavy reviewer) at the pre-flight commit.
+**Next action:** 0.P.QA round 2 (heavy reviewer re-reviews the round-1 fixes at the new fixed commit).
 
 **Orchestrator session:** `ses_ed82f88a7ffej5iKaRHuwIa6fd` (directory `D:\git\omr-cpx-main`).
 
-**Worktrees:** working (plan home) `D:\git\omr-cpx-main` (branch `cpx/main`); dogfood `D:\git\omr-cpx-dogfood-df0`
-(detached at `cpx/df0` = `b716ee9`); phase worktrees in flight: none. Base repository directory
-`D:\git\opencode-model-router` is off-limits (§0.13); so is the other implementation's worktree
-`D:\git\opencode-model-router-cross-repo` (branch `feat/cross-repo`, seen in `git worktree list` on 2026-10-10).
+**Worktrees:** working (plan home) `D:\git\omr-cpx-main` (branch `cpx/main`, upstream `origin/cpx/main`); dogfood
+`D:\git\omr-cpx-dogfood-df0` (detached at `cpx/df0` = `b716ee9`, loaded by the plan's host); phase worktrees in
+flight: none. Base repository directory `D:\git\opencode-model-router` is off-limits (§0.13); so is the other
+implementation's worktree `D:\git\opencode-model-router-cross-repo` (branch `feat/cross-repo`).
 
 | Phase | State | QA round | Notes |
 |---|---|---|---|
-| 0.P | running | — | started 2026-10-10 18:55; 0.P.1, 0.P.3 (pending owner consent), 0.P.2, 0.P.4 done; 0.P.6 done (DF-0 self-check PASS 19:46); `preflight.md` written |
+| 0.P | QA round 2 pending | 1 done (14 findings, all fixed or dispositioned) | started 2026-10-10 18:55; 0.P.1, 0.P.3 (consent granted), 0.P.6 (DF-0 self-check PASS 19:46), 0.P.2, 0.P.4 done; `preflight.md` written |
 | 0.1 | waiting | — | |
 | 1.1 · 1.2 · 1.3 · 1.4 | waiting | — | |
 | 2.1 | waiting | — | |
@@ -355,46 +357,82 @@ Everything else is work: resolve it, record it, continue.
 
 **In-flight dispatches** (role, session id, worktree, `Writes:`/`Reads:`): none.
 
-**Dispatch log:** implementer `ses_ed8271885ffegiA4OlgFaJZA4W` (v2-hooks flake timeout, `D:\git\omr-cpx-main`,
-Writes: `test\unit\v2-hooks.test.ts`) — done, verified deterministic, committed `7e6903f`.
+**Dispatch log** (local time, 2026-10-10):
+| Start → end | Role | Session | Worktree | Writes / Reads | Result |
+|---|---|---|---|---|---|
+| ≈19:05 → 19:08 | implementer | `ses_ed8271885ffegiA4OlgFaJZA4W` | `D:\git\omr-cpx-main` | W: `test\unit\v2-hooks.test.ts` / R: same | done, verified deterministic, `7e6903f` |
+| ≈19:50 → ≈20:05 | reviewer (heavy, QA-0.P r1) | `ses_ed7ffbdc8ffe4mtPc6Vrr3VI5Y` | `D:\git\omr-cpx-main` @ `d39a700` | W: none / R: `D:\git\omr-cpx-main\` | 14 findings |
+| ≈20:06 → ≈20:10 | implementer (QA-0.P-3) | `ses_ed7f25ed7ffe2aF7jc1XBiILR2` | `D:\git\omr-cpx-main` | W: `test\unit\v2-hooks.test.ts`, `test\unit\roles.registration.test.ts` / R: same | `9c8efd6`, reverted `674f037` (lowered a 60 s describe timeout) |
 
 **Plan base / `origin/master` sync:** `b716ee9` (fetched 2026-10-10 by 0.P.1; `origin/master` unchanged, no merge).
 
-**Environment:** `OPENCODE_V2_BIN` = `C:\Users\Marquinho\scoop\apps\opencode2\2.0.26\opencode.exe` (user scope, set by
-0.P.3; v2.0.26). OpenCode 1.x: `C:\Users\Marquinho\scoop\apps\opencode\1.18.35\opencode.exe`. Scoped test workers:
-`--maxWorkers=14` (16 cores). Global override now has `routing.workRoots` (backup
-`$env:LOCALAPPDATA\omr-cpx\overrides.backup.jsonc`).
+**Environment:**
+- `OPENCODE_V2_BIN` = `C:\Users\Marquinho\scoop\apps\opencode2\2.0.26\opencode.exe` (v2.0.26, the version under test).
+  Not set at user scope (removed by QA-0.P-8); set in the launch command and per orchestrator shell run.
+- OpenCode 1.x: `C:\Users\Marquinho\scoop\apps\opencode\1.18.35\opencode.exe`. **Every v1-host smoke** (`smoke:v1`,
+  `smoke:keyless`) runs with `C:\Users\Marquinho\scoop\apps\opencode\1.18.35` prepended to `PATH` (QA-0.P-7).
+- Scoped test workers: `--maxWorkers=14` (16 cores).
+- Smoke evidence: every smoke run sets `OMR_SMOKE_EVIDENCE_DIR=$env:TEMP\omr-evidence` (from Phase 0.1 on).
+- Global override has `routing.workRoots` `D:/git/omr-cpx-main`, `D:/git/omr-cpx-p*`, `D:/git/omr-cpx-pdf*`,
+  `D:/git/omr-cpx-scratch*`, `D:/git/omr-cpx-e2e*` (backup `$env:LOCALAPPDATA\omr-cpx\overrides.backup.jsonc`).
+  Loaded at the next host start (the DF-1 restart at the latest); until then a phase worktree created now gets role
+  authority only if the running build's registration already covers it — check the first dispatch's refusal message.
 
-**Router build in use:** before the restart, the main checkout `D:\git\opencode-model-router` (moving tree, global
-plugin entry, shared background service). Since the DF-0 restart (2026-10-10 19:46, self-check PASS): `D:\git\omr-cpx-dogfood-df0` at `cpx/df0`
-(`b716ee9`), loaded through the process-scoped config.
+**Router build in use:** since the DF-0 restart (2026-10-10 19:46, self-check PASS): `D:\git\omr-cpx-dogfood-df0` at
+`cpx/df0` (`b716ee9`), loaded through the process-scoped config, server run id `461f3bf1`.
 
-**Plugin-entry scope and revert command (0.P.3.f):** process-scoped (§0.12-2 option 1). Config directory
+**Plugin-entry scope, launch and revert (0.P.3.f):** process-scoped (§0.12-2 option 1). Config directory
 `$env:LOCALAPPDATA\omr-cpx\opencode-config` (files hard-linked and directories junctioned from
 `C:\Users\Marquinho\.config\opencode`, except `opencode.json`, a copy whose router entry is the dogfood worktree).
 Global `opencode.json` unchanged (backup `$env:LOCALAPPDATA\omr-cpx\opencode-config.backup`).
-- **Launch (DF-n restart):** close the plan's OpenCode window, then in a new pwsh:
-  `$env:OPENCODE_CONFIG_DIR = "$env:LOCALAPPDATA\omr-cpx\opencode-config"; opencode --standalone -s ses_ed82f88a7ffej5iKaRHuwIa6fd D:\git\omr-cpx-main`
+- **Launch (every DF-n restart; versioned executable, QA-0.P-9):** close the plan's OpenCode window, then in a new pwsh:
+  `$env:OPENCODE_CONFIG_DIR = "$env:LOCALAPPDATA\omr-cpx\opencode-config"; $env:OPENCODE_V2_BIN = "C:\Users\Marquinho\scoop\apps\opencode2\2.0.26\opencode.exe"; & $env:OPENCODE_V2_BIN --standalone -s ses_ed82f88a7ffej5iKaRHuwIa6fd D:\git\omr-cpx-main`
   and type `continue`.
-- **Switch:** edit the router entry in `$env:LOCALAPPDATA\omr-cpx\opencode-config\opencode.json` to
-  `D:\\git\\omr-cpx-dogfood-df<n>`.
-- **Revert:** close the plan's OpenCode window, then in a new pwsh (no `OPENCODE_CONFIG_DIR`, no `--standalone`):
-  `Remove-Item Env:OPENCODE_CONFIG_DIR -ErrorAction SilentlyContinue; opencode -s ses_ed82f88a7ffej5iKaRHuwIa6fd D:\git\omr-cpx-main`.
+- **Switch (QA-0.P-14):** regenerate `$env:LOCALAPPDATA\omr-cpx\opencode-config\opencode.json` from the current global
+  `opencode.json`, changing only the router entry to `D:\\git\\omr-cpx-dogfood-df<n>`; re-check every hard-linked
+  file's hash against its global original (re-link any that differ); record it here.
+- **Revert (QA-0.P-11):**
+  - *DF-0 only:* close the plan's window, then `Remove-Item Env:OPENCODE_CONFIG_DIR -ErrorAction SilentlyContinue; opencode -s ses_ed82f88a7ffej5iKaRHuwIa6fd D:\git\omr-cpx-main`
+    (global config; loads the main checkout's moving build).
+  - *DF-n, n ≥ 1:* set the copy's router entry back to `D:\\git\\omr-cpx-dogfood-df<n-1>` and relaunch with the
+    launch command above (§0.12-6).
 
-**DF-0 self-check (to run after the restart):** exactly one `router_verify` tool is registered; the newest file under
-`C:\Users\Marquinho\.local\share\opencode\log` names `D:\git\omr-cpx-dogfood-df0` and not
-`D:\git\opencode-model-router`; `config.get` through the session lists the router once.
+**DF self-check (amended 0.P.6, QA-0.P-6/-9):** run `Write-Output omr-selfcheck-<literal nonce>`; take the `run=` id of
+the `spawning process` log line carrying it in `C:\Users\Marquinho\.local\share\opencode\log\opencode.log` (shared by
+every server); in that run exactly one `loading plugin` for `D:\\git\\omr-cpx-dogfood-df<n>`, zero for
+`D:\\git\\opencode-model-router`; the server process executable is the 2.0.26 path above; exactly one `router_verify`
+tool. DF-0 result: run `461f3bf1`, PASS.
 
-**Owner consent (0.P.3.f):** requested 2026-10-10 (DF-1 and DF-2 restarts, dogfood spend capped by §0.6-11,
-process-scoped config). **Granted 2026-10-10** ("autorizo tudo"): DF-1 and DF-2 restarts, dogfood spend, process-scoped
-config.
+**Owner consent (0.P.3.f):** **Granted 2026-10-10** ("autorizo tudo"): DF-1 and DF-2 restarts, dogfood spend,
+process-scoped config.
 
-**Amendments:** none.
+**Re-based anchors (0.P.4; `b7984b3` → `b716ee9`; only `src\verify\reference.ts` changed):**
+| Plan location | At `b7984b3` | At `b716ee9` |
+|---|---|---|
+| §1.1 D10 | ≈71-78 | ≈71-78 |
+| Phase 2.1 (reference GC at plugin start) | ≈2052 | ≈2120 |
+| Phase 2.2 pre-flight (`--git-common-dir`) | ≈2056 | ≈2124 |
+| Phase 2.4 pre-flight | ≈236-238 · ≈346-356 · ≈859-907 · ≈1296 · ≈1663-1673 · ≈1764-1845 | ≈245-247 · ≈366-376 · ≈885-935 · ≈1324 · ≈1691-1701 · ≈1792-1886 (drift region rewritten by #88: `driftDiff`, `driftReasons`) + new step 7b ≈1913-1953 |
 
-**Takeovers (§0.14-2):** 0.P.4 anchor re-base done by the orchestrator in its shell (a `git diff` between the anchor
-commit and the base settled it; plan §0.P lists 0.P steps as orchestrator-shell work).
+**QA round counters:** 0.P: round 1 done (14 findings), round 2 pending.
+
+**Amendments:**
+1. QA-0.P-1 — plan 0.P.3.c: scratch/e2e `workRoots` entries are globs (`D:/git/omr-cpx-scratch*`, `D:/git/omr-cpx-e2e*`).
+2. QA-0.P-6/-9 — plan 0.P.6 (applies to DF1.4.a and DF2.4.0): self-check scoped to the plan server's run id (marker
+   command), plus the server executable = the version under test.
+3. QA-0.P-10 — plan §0.4: the pre-dispatch guard also rejects `D:\git\omr-cpx-dogfood-` and the cross-repo worktree in
+   `root=`/`cwd:`/`Writes:`.
+4. Recorded deviations (QA-0.P-5): (a) `7e6903f` wrote `test\unit\v2-hooks.test.ts`, outside 0.P's write set — a
+   pre-flight flake fix under §0.7 ("fix everything it finds"), done in `cpx/main` while no phase was in flight; the
+   file's owning phases (1.2, 2.1, 3.1) inherit it. (b) 0.P.2, 0.P.4 and the 19:05 implementer dispatch ran before the
+   0.P.6 restart (order 0.P.1 → 0.P.3 → 0.P.6 → 0.P.2 → 0.P.4), i.e. on the main checkout's unpinned build; their
+   results do not depend on the router build (typecheck, vitest, `git diff`), and the dispatch was verified
+   deterministically. (c) The DF-0 self-check criterion was re-scoped (amendment 2).
+
+**Takeovers (§0.14-2):** 0.P.4 anchor re-base and its QA-0.P-2 completion done by the orchestrator in its shell (a
+`git diff` and line reads at two commits settled them; plan §0.P lists 0.P steps as orchestrator-shell work).
 
 **Dogfood faults:** none.
 
-**Pre-existing findings:** PF-1 `npm audit` critical ×2 (`seroval` via `solid-js@1.9.15`, pinned to the host
-typings) — reported to the owner, out of plan scope (`preflight.md`).
+**Pre-existing findings:** PF-1 `npm audit` critical ×2 (`seroval` via the devDependency `solid-js@1.9.15`, pinned to the
+host typings) — reported to the owner, out of plan scope (`preflight.md`; QA-0.P confirmed).

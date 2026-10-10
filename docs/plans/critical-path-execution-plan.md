@@ -160,7 +160,10 @@ that have a workaround — is resolved without asking.
   `D:\git\omr-cpx-p21\src\compat\background.ts`; in an executor slot, the slot root. Before every dispatch and every
   file read of its own, the orchestrator checks that nothing it sends or runs names `D:\git\opencode-model-router`: the
   guard applies to `root=`, `cwd:`, `Writes:`/`Reads:` lines, tool arguments and shell commands; prose that names the
-  off-limits checkout is allowed. A hit is a defect and is never sent (§0.13).
+  off-limits checkout is allowed. A hit is a defect and is never sent (§0.13). *Amended by QA-0.P-10:* the same guard
+  rejects a `root=`, `cwd:` or `Writes:` line naming `D:\git\omr-cpx-dogfood-` (dogfood worktrees are valid git
+  worktrees, so the router would accept them, but they are never edited, §0.12-1), and anything naming the other
+  implementation's worktree `D:\git\opencode-model-router-cross-repo`.
 - The substitution also applies to the orchestrator's own reads and writes of phase files (phase reports, implementation
   notes, handoffs): they live in the phase worktree. Only these are literal paths in `D:\git\omr-cpx-main`: the
   handover, `CHANGELOG.md`, `dogfood.md`, `preflight.md`, `global.md`, the plan file and its amendments, ADR 0007
@@ -744,8 +747,12 @@ because role agents get no authority in `D:\git\omr-cpx-main` without `routing.w
     - if `routing.delegation: "roles"` is not already in effect for sessions in `D:\git\omr-cpx-main`, set it in
       `D:\git\omr-cpx-main\.opencode\opencode-model-router.overrides.jsonc` (project layer, gitignored), never globally;
     - the global override gets only `routing.workRoots` entries `D:/git/omr-cpx-main`, `D:/git/omr-cpx-p*`,
-      `D:/git/omr-cpx-pdf*`, `D:/git/omr-cpx-scratch`, `D:/git/omr-cpx-e2e` (additive; not the dogfood worktrees). The
-      executor keys are set later, in the DF-2 pre-flight.
+      `D:/git/omr-cpx-pdf*`, `D:/git/omr-cpx-scratch*`, `D:/git/omr-cpx-e2e*` (additive; not the dogfood worktrees).
+      *Amended by QA-0.P-1:* the scratch and e2e entries are globs because a literal entry is resolved with `realpath`
+      at plugin start and dropped when the directory does not exist yet (`D:\git\omr-cpx-main\src\router\role-agents.ts`
+      ≈198-205, ≈257-260); both directories are created after a restart. Validate with
+      `externalDirectoryPatterns([], <entries>)` (`problems: []`). The executor keys are set later, in the DF-2
+      pre-flight.
 
     Without the work roots, role agents get no write or run authority in phase worktrees
     (`D:\git\omr-cpx-main\docs\ROLES.md` ≈179-193). If something is missing, the human adds it and restarts OpenCode;
@@ -779,7 +786,13 @@ because role agents get no authority in `D:\git\omr-cpx-main` without `routing.w
   precondition) to tag `cpx/df0` = the plan base in `D:\git\omr-cpx-dogfood-df0`, with the recorded
   scope. Otherwise record that the current target is pinned. Self-check after a switch: exactly one `router_verify`
   tool is registered, and OpenCode's plugin-load log (the newest file under the log directory recorded in 0.P.3.f)
-  names `D:\git\omr-cpx-dogfood-df0`.
+  names `D:\git\omr-cpx-dogfood-df0`. *Amended by QA-0.P-6/QA-0.P-9 (applies to every DF self-check, DF1.4.a and
+  DF2.4.0 included):* the log file is shared by every OpenCode server on the machine, so the check is scoped to the
+  plan server's run: the orchestrator runs a marker shell command (`Write-Output omr-selfcheck-<nonce>`) and takes the
+  `run=` id of the log's `spawning process` line carrying that nonce. Within that run there must be exactly one
+  `loading plugin` line for `D:\\git\\omr-cpx-dogfood-df<n>` and zero `loading plugin` lines for
+  `D:\\git\\opencode-model-router` (the host's watcher on `…\.git\worktrees\omr-cpx-main\HEAD` is expected), and the
+  server process is the versioned OpenCode executable recorded in 0.P.3.a (the version ADR 0007 records).
   Writes: none (the handover records the result). Reads: the 0.P.3.f record in the handover.
 - **0.P.QA** [tier:heavy] Senior QA of the setup. CAP:none — reason: needs the setup, the configuration and the plan
   together.
