@@ -40,6 +40,12 @@ export interface Artefact {
    * in for it.
    */
   changeRoot?: string;
+  /**
+   * I7 (P0.2, S9/S12): the working tree switched branch during the dispatch or since the producer returned; the reason, worded
+   * by the wiring (branch.ts branchSwitchReason / branchUnconfirmedReason). Present: the verdict is unverifiable with it on
+   * either verifier and nothing runs, since the change set and the checks would describe another branch.
+   */
+  branchSwitch?: string;
   changedFiles: { path: string; status: string }[];
   finalReturnText: string;
   declaredOutputs: string[];
@@ -258,6 +264,12 @@ export async function accept(
   );
   // Backstop for a caller that did not check its cwd: lexical only (no filesystem call); a checked canonical cwd always passes.
   if (workRoot !== undefined && !isWithinDir(effectiveBaseDir, workRoot)) return refuseCwd(effectiveBaseDir);
+  // I7 (P0.2, S9/S12): the verified tree switched branch. The change set and either verifier would describe another branch, so
+  // nothing runs; before the all-outside and mixed checks, whose reasons would then be about the wrong change set.
+  if (artefact.branchSwitch !== undefined) {
+    const reason = artefact.branchSwitch;
+    return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] }, dodSource, deps.strictUnverifiable);
+  }
   const canonical = deps.canonicalPath ?? ((path: string) => path);
   // S4/F3: some changes inside the change root and some absolute ones outside it. Neither verifier can see the outside ones
   // (the runner drops them with a note; the grader checks against, and runs in, the working directory), so the change set

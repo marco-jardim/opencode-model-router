@@ -1,10 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { resolve } from "node:path";
 import { constants as osConstants } from "node:os";
-import { execGit, snapshotTree, SNAPSHOT_GIT_MAX_BUFFER, SNAPSHOT_GIT_TIMEOUT_MS, type SnapshotGitOptions } from "../../src/verify/tree";
+import { execGit, GitExitError, gitExitCode, snapshotTree, SNAPSHOT_GIT_MAX_BUFFER, SNAPSHOT_GIT_TIMEOUT_MS, type SnapshotGitOptions } from "../../src/verify/tree";
 
 const state = vi.hoisted(() => ({
   head: "head1", status: "", diff: "", index: "", untracked: "", content: "", stage: "", error: false,
+  /** What `symbolic-ref -q HEAD` prints, and its exit code (I7: 1 on a detached HEAD). */
+  branchRef: "refs/heads/main", branchCode: 0,
   calls: [] as string[][], directories: [] as string[], binaries: [] as string[],
   priorities: [] as [number, number][], priorityThrows: false,
 }));
@@ -32,11 +34,12 @@ vi.mock("node:child_process", async () => {
         : command.startsWith("status") ? state.status
         : command.startsWith("diff HEAD") ? state.diff
         : command.startsWith("diff --cached") ? state.index
+        : command === "symbolic-ref -q HEAD" ? state.branchRef
         : command === "ls-files --stage" ? state.stage : state.untracked;
       const child = Object.assign(new EventEmitter(), { pid: 4242, stdout: new EventEmitter() });
       setImmediate(() => {
         if (output) child.stdout.emit("data", Buffer.from(output));
-        child.emit("close", state.error ? 1 : 0, null);
+        child.emit("close", state.error ? 1 : command === "symbolic-ref -q HEAD" ? state.branchCode : 0, null);
       });
       return child;
     },
@@ -50,6 +53,7 @@ vi.mock("node:fs/promises", () => ({
 }));
 beforeEach(() => Object.assign(state, {
   head: "head1", status: "", diff: "", index: "", untracked: "", content: "", stage: "", error: false,
+  branchRef: "refs/heads/main", branchCode: 0,
   calls: [], directories: [], binaries: [], priorities: [], priorityThrows: false,
 }));
 const capture = () => snapshotTree(process.cwd(), new AbortController().signal);
@@ -88,15 +92,15 @@ describe("Git tree fingerprint adapter", () => {
     };
     const signal = new AbortController().signal;
     expect(await snapshotTree(process.cwd(), signal, { lowPriority: true, git })).toBeDefined();
-    // rev-parse x2, status, diff x2, ls-files --stage, ls-files --others.
-    expect(seen).toHaveLength(7);
+    // rev-parse x2, symbolic-ref (I7, P0.2: one more process per snapshot), status, diff x2, ls-files --stage, ls-files --others.
+    expect(seen).toHaveLength(8);
     for (const opts of seen) {
       expect(opts).toMatchObject({ lowPriority: true, timeoutMs: SNAPSHOT_GIT_TIMEOUT_MS, maxBuffer: SNAPSHOT_GIT_MAX_BUFFER });
       expect(opts.signal).toBe(signal);
     }
     seen.length = 0;
     expect(await snapshotTree(process.cwd(), signal, { git })).toBeDefined();
-    expect(seen.map(o => o.lowPriority)).toEqual(Array(7).fill(false));
+    expect(seen.map(o => o.lowPriority)).toEqual(Array(8).fill(false));
   });
   it("QA-3.1-8: the default git seam lowers the process's priority as exec.ts does", async () => {
     // Generous timeout: this test is about priority, and a 5 ms timer could fire on a slow
@@ -120,5 +124,57 @@ describe("Git tree fingerprint adapter", () => {
     expect(await execGit(["--no-pager", "rev-parse", "HEAD"], { ...opts, lowPriority: false })).toBe("head1");
     expect(state.binaries).toEqual(["git"]);
     expect(state.priorities).toEqual([]);
+  });
+
+  describe("the checked-out branch (I7, P0.2)", () => {
+    const symbolicRefCalls = () => state.calls.filter(args => args.slice(1).join(" ") === "symbolic-ref -q HEAD");
+
+    it("attached: the short name of refs/heads/<name>", async () => {
+      state.branchRef = "refs/heads/feat/x";
+      const snapshot = await capture();
+      expect(snapshot?.branch).toBe("feat/x");
+      expect(symbolicRefCalls()).toHaveLength(1);
+    });
+
+    it("detached (exit 1, no output): null, and the snapshot is kept", async () => {
+      state.branchRef = ""; state.branchCode = 1;
+      const snapshot = await capture();
+      expect(snapshot).toBeDefined();
+      expect(snapshot?.head).toBe("head1");
+      expect(snapshot?.branch).toBeNull();
+    });
+
+    it("unknown (any other exit): undefined, and the snapshot is kept", async () => {
+      state.branchRef = ""; state.branchCode = 128;
+      const snapshot = await capture();
+      expect(snapshot).toBeDefined();
+      expect(snapshot?.head).toBe("head1");
+      expect(snapshot?.branch).toBeUndefined();
+      expect(symbolicRefCalls()).toHaveLength(1);
+    });
+
+    it("through the seam: an exitCode of 1 is detached; an error without an exit code (a timeout) is unknown", async () => {
+      const seam = (fail: () => unknown) => async (args: readonly string[], opts: SnapshotGitOptions) => {
+        if (args.includes("symbolic-ref")) throw fail();
+        return execGit(args, opts);
+      };
+      const signal = new AbortController().signal;
+      expect((await snapshotTree(process.cwd(), signal, { git: seam(() => new GitExitError(1)) }))?.branch).toBeNull();
+      expect((await snapshotTree(process.cwd(), signal, { git: seam(() => Object.assign(new Error("x"), { exitCode: 1 })) }))?.branch).toBeNull();
+      const unknown = await snapshotTree(process.cwd(), signal, { git: seam(() => new Error("git timed out after 10000 ms")) });
+      expect(unknown).toBeDefined();
+      expect(unknown?.branch).toBeUndefined();
+    });
+
+    it("execGit rejects a non-zero exit with a GitExitError carrying the code, with the same message as before", async () => {
+      state.branchRef = ""; state.branchCode = 1;
+      const opts = { cwd: process.cwd(), signal: new AbortController().signal, timeoutMs: 30_000, maxBuffer: 1024, lowPriority: false };
+      const err = await execGit(["--no-pager", "symbolic-ref", "-q", "HEAD"], opts).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(GitExitError);
+      expect(err).toMatchObject({ exitCode: 1, message: "git exited with code 1" });
+      expect(gitExitCode(err)).toBe(1);
+      // The message is never parsed as the contract.
+      expect(gitExitCode(new Error("git exited with code 1"))).toBeUndefined();
+    });
   });
 });

@@ -236,6 +236,52 @@ describe("accept() — outside-directory safety net", () => {
     });
   });
 
+  // I7 (P0.2, S9/S12): a branch switch of the verified tree refuses before anything runs, on both verifiers.
+  describe("a branch switch of the working tree (Artefact.branchSwitch)", () => {
+    const reason = "the working tree /repo switched from branch main to branch feat/x during the dispatch; the checks would verify another branch";
+    const refused = { pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] };
+
+    it("is unverifiable on the deterministic path and runs nothing; strict rejects it", async () => {
+      const { exec, d, dod } = setup();
+      const r = await accept({ dod }, { ...changed([join(base, "inside.ts")]), branchSwitch: reason }, d);
+      expect(r.verdict).toEqual(refused);
+      expect(r.accepted).toBe(true);
+      const strict = await accept({ dod }, { ...changed([join(base, "inside.ts")]), branchSwitch: reason }, { ...d, strictUnverifiable: true });
+      expect(strict.verdict).toEqual(refused);
+      expect(strict.accepted).toBe(false);
+      expect(exec).not.toHaveBeenCalled();
+    });
+
+    it("comes before the all-outside and mixed checks", async () => {
+      const { exec, d, dod } = setup();
+      for (const paths of [[join(outside, "o.ts")], [join(base, "inside.ts"), join(outside, "o.ts")]]) {
+        const r = await accept({ dod }, { ...changed(paths), branchSwitch: reason }, d);
+        expect(r.verdict.reasons).toEqual([reason]);
+      }
+      expect(exec).not.toHaveBeenCalled();
+    });
+
+    it("is unverifiable on the grader path and dispatches no grader; strict rejects it", async () => {
+      const { d } = setup();
+      const dispatchGrader = vi.fn<CheckerDeps["dispatchGrader"]>().mockResolvedValue({ sessionID: "grader", text: '{"pass":true,"reasons":[]}' });
+      const graded = { ...d, checker: { ...d.checker, dispatchGrader } };
+      const r = await accept({ dod: checkerDoD(), cwd: base }, { ...changed([join(base, "inside.ts")]), branchSwitch: reason }, graded);
+      expect(r.verdict).toEqual(refused);
+      expect(r.accepted).toBe(true);
+      const strict = await accept({ dod: checkerDoD(), cwd: base }, { ...changed([join(base, "inside.ts")]), branchSwitch: reason }, { ...graded, strictUnverifiable: true });
+      expect(strict.verdict).toEqual(refused);
+      expect(strict.accepted).toBe(false);
+      expect(dispatchGrader).not.toHaveBeenCalled();
+    });
+
+    it("an artefact without branchSwitch is judged as before", async () => {
+      const { exec, d, dod } = setup();
+      const r = await accept({ dod }, changed([join(base, "inside.ts")]), d);
+      expect(r.verdict.outcome).toBe("pass");
+      expect(exec).toHaveBeenCalled();
+    });
+  });
+
   it("treats a sibling-prefix directory as outside", async () => {
     const { exec, d, dod } = setup();
     const r = await accept({ dod }, changed([join(`${base}-v2`, "file.ts")]), d);

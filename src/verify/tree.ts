@@ -65,6 +65,22 @@ function killGitTree(child: ChildProcess): void {
 }
 
 /**
+ * A git process that ran and exited non-zero (I7, P0.2). `exitCode` tells an expected exit apart from a failure without
+ * parsing the message (`symbolic-ref -q HEAD` exits 1 on a detached HEAD). The message is the one execGit always used.
+ */
+export class GitExitError extends Error {
+  constructor(readonly exitCode: number) {
+    super(`git exited with code ${exitCode}`);
+  }
+}
+
+/** The exit code a SnapshotGit rejection carries (a GitExitError, or a seam's error with a numeric `exitCode`); else undefined. */
+export function gitExitCode(err: unknown): number | undefined {
+  const code = err && typeof err === "object" && "exitCode" in err ? (err as { exitCode: unknown }).exitCode : undefined;
+  return typeof code === "number" ? code : undefined;
+}
+
+/**
  * The default SnapshotGit. QA-3.1-8: `lowPriority` applies exec.ts's rule: on POSIX
  * `nice -n 10 -- git …` (inherited from birth), on Windows PRIORITY_BELOW_NORMAL set on the child
  * right after the spawn (its descendants inherit the class). QA-G-6: an abort, the timeout or a
@@ -113,7 +129,7 @@ export const execGit: SnapshotGit = (args, opts) => new Promise<string>((ok, fai
   child.on("error", (e) => settle(e));
   child.on("close", (code, signal) => {
     if (code === 0) settle(undefined, Buffer.concat(chunks).toString("utf8"));
-    else settle(new Error(`git exited with ${code === null ? signal : `code ${code}`}`));
+    else settle(code === null ? new Error(`git exited with ${signal}`) : new GitExitError(code));
   });
 });
 
@@ -198,6 +214,21 @@ async function digestPaths(
   }
 }
 
+/**
+ * I7 (P0.2): the checked-out branch, by `git symbolic-ref -q HEAD`: its short name (`feat/x` from `refs/heads/feat/x`); null
+ * on a detached HEAD (exit 1, no output); undefined when unknown (any other failure, a timeout or an abort). Its own try: a
+ * failure here never drops the snapshot.
+ */
+async function readBranch(git: (args: string[]) => Promise<string>): Promise<string | null | undefined> {
+  try {
+    const ref = (await git(["symbolic-ref", "-q", "HEAD"])).trim();
+    if (ref === "") return undefined;
+    return ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref;
+  } catch (err) {
+    return gitExitCode(err) === 1 ? null : undefined;
+  }
+}
+
 export async function snapshotTree(cwd: string, signal: AbortSignal, options: SnapshotOptions = {}): Promise<TreeSnapshot | undefined> {
   let gitCwd = cwd;
   const run = options.git ?? execGit;
@@ -211,6 +242,8 @@ export async function snapshotTree(cwd: string, signal: AbortSignal, options: Sn
     // missing same-path edits in sibling packages that tests may import.
     gitCwd = root;
     const head = (await git(["rev-parse", "HEAD"])).trim();
+    // Read right after HEAD, so the two describe the same checkout as closely as possible.
+    const branch = await readBranch(git);
     const status = await git(["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
     const files: ChangedFile[] = [];
     const records = status.split("\0");
@@ -248,7 +281,7 @@ export async function snapshotTree(cwd: string, signal: AbortSignal, options: Sn
       options.maxDigestBytes ?? MAX_DIGEST_BYTES,
     );
     if (signal.aborted) return undefined;
-    return { cwd: await realpath(cwd), root: await realpath(root), head, fingerprint: hash.digest("hex"), dirty: files.length > 0, files, digests };
+    return { cwd: await realpath(cwd), root: await realpath(root), head, branch, fingerprint: hash.digest("hex"), dirty: files.length > 0, files, digests };
   } catch {
     // Not a Git checkout, unreadable file, timeout or concurrent deletion: no baseline.
     return undefined;

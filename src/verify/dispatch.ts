@@ -26,6 +26,11 @@ export interface TreeSnapshot {
   /** Real path of `git rev-parse --show-toplevel` at capture time. */
   root?: string;
   head: string;
+  /**
+   * I7 (P0.2): the branch checked out at capture (`git symbolic-ref -q HEAD`): its short name (`feat/x`), or null for a
+   * detached HEAD. Absent or undefined: unknown (the command failed, timed out or was aborted). branch.ts compares two.
+   */
+  branch?: string | null;
   fingerprint: string;
   dirty: boolean;
   files: ChangedFile[];
