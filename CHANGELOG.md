@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- README: 90-second demo video below the title.
+
 ### Removed
 
 - **Breaking (requirement): Node.js 20 is no longer supported.** Node.js 20 reached end-of-life in April 2026; the

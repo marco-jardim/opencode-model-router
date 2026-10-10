@@ -2,6 +2,8 @@
 
 [![npm version](https://img.shields.io/npm/v/opencode-model-router)](https://www.npmjs.com/package/opencode-model-router)
 
+https://github.com/user-attachments/assets/ad521e3b-a978-475c-a07f-7a5908253057
+
 > **Use the cheapest model that can do the job. Automatically.**
 
 An [OpenCode](https://opencode.ai) plugin that routes every coding task to the right-priced AI tier — automatically, on every message, with 3,249–6,357 characters of system-prompt overhead depending on the orchestrator and enforcement mode.
