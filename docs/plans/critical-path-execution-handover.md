@@ -330,16 +330,18 @@ Everything else is work: resolve it, record it, continue.
 
 ## 7. Live state (§0.11 — keep current)
 
-**Next action:** 0.P.3.
+**Next action:** DF-0 self-check (after the owner's restart, below), then 0.P.QA.
 
-**Worktrees:** working (plan home) `D:\git\omr-cpx-main` (branch `cpx/main`); phase worktrees in flight: none.
-Base repository directory `D:\git\opencode-model-router` is off-limits (§0.13); so is the other implementation's
-worktree `D:\git\opencode-model-router-cross-repo` (branch `feat/cross-repo`, seen in `git worktree list` on
-2026-10-10).
+**Orchestrator session:** `ses_ed82f88a7ffej5iKaRHuwIa6fd` (directory `D:\git\omr-cpx-main`).
+
+**Worktrees:** working (plan home) `D:\git\omr-cpx-main` (branch `cpx/main`); dogfood `D:\git\omr-cpx-dogfood-df0`
+(detached at `cpx/df0` = `b716ee9`); phase worktrees in flight: none. Base repository directory
+`D:\git\opencode-model-router` is off-limits (§0.13); so is the other implementation's worktree
+`D:\git\opencode-model-router-cross-repo` (branch `feat/cross-repo`, seen in `git worktree list` on 2026-10-10).
 
 | Phase | State | QA round | Notes |
 |---|---|---|---|
-| 0.P | running | — | started 2026-10-10; 0.P.1 done |
+| 0.P | running | — | started 2026-10-10 18:55; 0.P.1, 0.P.3 (pending owner consent), 0.P.2, 0.P.4 done; 0.P.6 prepared, restart pending; `preflight.md` written |
 | 0.1 | waiting | — | |
 | 1.1 · 1.2 · 1.3 · 1.4 | waiting | — | |
 | 2.1 | waiting | — | |
@@ -353,14 +355,45 @@ worktree `D:\git\opencode-model-router-cross-repo` (branch `feat/cross-repo`, se
 
 **In-flight dispatches** (role, session id, worktree, `Writes:`/`Reads:`): none.
 
+**Dispatch log:** implementer `ses_ed8271885ffegiA4OlgFaJZA4W` (v2-hooks flake timeout, `D:\git\omr-cpx-main`,
+Writes: `test\unit\v2-hooks.test.ts`) — done, verified deterministic, committed `7e6903f`.
+
 **Plan base / `origin/master` sync:** `b716ee9` (fetched 2026-10-10 by 0.P.1; `origin/master` unchanged, no merge).
 
-**Router build in use:** not yet recorded (0.P.3.f).
+**Environment:** `OPENCODE_V2_BIN` = `C:\Users\Marquinho\scoop\apps\opencode2\2.0.26\opencode.exe` (user scope, set by
+0.P.3; v2.0.26). OpenCode 1.x: `C:\Users\Marquinho\scoop\apps\opencode\1.18.35\opencode.exe`. Scoped test workers:
+`--maxWorkers=14` (16 cores). Global override now has `routing.workRoots` (backup
+`$env:LOCALAPPDATA\omr-cpx\overrides.backup.jsonc`).
 
-**Plugin-entry scope and revert command:** not yet recorded (0.P.3.f).
+**Router build in use:** before the restart, the main checkout `D:\git\opencode-model-router` (moving tree, global
+plugin entry, shared background service). After the DF-0 restart: `D:\git\omr-cpx-dogfood-df0` at `cpx/df0`
+(`b716ee9`), loaded through the process-scoped config.
+
+**Plugin-entry scope and revert command (0.P.3.f):** process-scoped (§0.12-2 option 1). Config directory
+`$env:LOCALAPPDATA\omr-cpx\opencode-config` (files hard-linked and directories junctioned from
+`C:\Users\Marquinho\.config\opencode`, except `opencode.json`, a copy whose router entry is the dogfood worktree).
+Global `opencode.json` unchanged (backup `$env:LOCALAPPDATA\omr-cpx\opencode-config.backup`).
+- **Launch (DF-n restart):** close the plan's OpenCode window, then in a new pwsh:
+  `$env:OPENCODE_CONFIG_DIR = "$env:LOCALAPPDATA\omr-cpx\opencode-config"; opencode --standalone -s ses_ed82f88a7ffej5iKaRHuwIa6fd D:\git\omr-cpx-main`
+  and type `continue`.
+- **Switch:** edit the router entry in `$env:LOCALAPPDATA\omr-cpx\opencode-config\opencode.json` to
+  `D:\\git\\omr-cpx-dogfood-df<n>`.
+- **Revert:** close the plan's OpenCode window, then in a new pwsh (no `OPENCODE_CONFIG_DIR`, no `--standalone`):
+  `Remove-Item Env:OPENCODE_CONFIG_DIR -ErrorAction SilentlyContinue; opencode -s ses_ed82f88a7ffej5iKaRHuwIa6fd D:\git\omr-cpx-main`.
+
+**DF-0 self-check (to run after the restart):** exactly one `router_verify` tool is registered; the newest file under
+`C:\Users\Marquinho\.local\share\opencode\log` names `D:\git\omr-cpx-dogfood-df0` and not
+`D:\git\opencode-model-router`; `config.get` through the session lists the router once.
+
+**Owner consent (0.P.3.f):** requested 2026-10-10 (DF-1 and DF-2 restarts, dogfood spend capped by §0.6-11,
+process-scoped config). Not yet recorded.
 
 **Amendments:** none.
 
-**Takeovers (§0.14-2):** none.
+**Takeovers (§0.14-2):** 0.P.4 anchor re-base done by the orchestrator in its shell (a `git diff` between the anchor
+commit and the base settled it; plan §0.P lists 0.P steps as orchestrator-shell work).
 
 **Dogfood faults:** none.
+
+**Pre-existing findings:** PF-1 `npm audit` critical ×2 (`seroval` via `solid-js@1.9.15`, pinned to the host
+typings) — reported to the owner, out of plan scope (`preflight.md`).
