@@ -808,6 +808,7 @@ export type InexactCause =
   | "untracked-unsafe-path"
   | "dependency-drift"
   | "workspace-link-drift"
+  | "external-link"
   | "index-flags"
   | "checkout-conversion";
 
@@ -1818,7 +1819,11 @@ export async function materialize(
       if (DEPENDENCY_FILES.has(rel.split("/").at(-1) ?? "")) reasons.push({ cause: "dependency-drift", path: rel });
     }
     const realRoot = p.resolve(await fs.realpath(root));
+    const fold = (s: string) => (platform === "win32" ? s.toLowerCase() : s);
     const workspaceDirs = new Set<string>();
+    // P0.4: package links whose real path is outside the repository (and not a store-like
+    // path under a node_modules segment) load code the reference cannot pin.
+    const externalLinks = new Set<string>();
     for (const target of linkTargets) {
       for (const entry of await packageEntries(fs, target, platform)) {
         const stats = await lstatOrMissing(fs, entry);
@@ -1831,12 +1836,18 @@ export async function materialize(
           continue;
         }
         const base = [realRoot, root].find((candidateRoot) => isStrictlyInside(real, candidateRoot, platform));
-        if (!base) continue;
+        if (!base) {
+          if (!real.split(/[\\/]/).some((segment) => fold(segment) === "node_modules")) {
+            const entryBase = [root, realRoot].find((candidateRoot) => isStrictlyInside(entry, candidateRoot, platform)) ?? root;
+            externalLinks.add(p.relative(entryBase, entry).split(p.sep).join("/"));
+          }
+          continue;
+        }
         const rel = p.relative(base, real).split(p.sep).join("/");
         if (!rel.split("/").includes("node_modules")) workspaceDirs.add(rel);
       }
     }
-    const fold = (s: string) => (platform === "win32" ? s.toLowerCase() : s);
+    for (const rel of [...externalLinks].sort(byCodeUnit)) reasons.push({ cause: "external-link", path: rel });
     for (const rel of [...workspaceDirs].sort(byCodeUnit)) {
       const prefix = fold(rel) + "/";
       if (changedSorted.some((c) => fold(c) === fold(rel) || fold(c).startsWith(prefix))) {

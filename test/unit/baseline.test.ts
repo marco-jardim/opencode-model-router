@@ -525,6 +525,16 @@ describe("judgeScoped verdict algebra (deterministic.ts T5-T7)", () => {
   };
   const cells = Object.entries(table).flatMap(([row, byCol]) => Object.entries(byCol).map(([c, want]) => [row, c, ...want] as const));
 
+  it("an approximate reference with cause external-link is unverifiable, never no worse than before", () => {
+    const recheck: RecheckOutcome = { kind: "approximate", inexactReasons: [{ cause: "external-link", path: "node_modules/lib-b" }] };
+    const j = judgeScoped(rows.R2, recheck);
+    expect(j.ok).toBe(false);
+    expect(j.unverifiable).toBe(true);
+    expect(j.reason).toBe(`testsPass: cannot attribute failures: the dispatch reference is approximate (external-link node_modules/lib-b)${OBS}`);
+    expect(j.reason).toContain("external-link node_modules/lib-b");
+    expect(JSON.stringify(j)).not.toContain("no worse than before");
+  });
+
   it.each(cells)("%s x %s -> ok=%s unverifiable=%s", (row, c, ok, unv, reason) => {
     const j = judgeScoped(rows[row], cols[c]);
     expect(j.ok).toBe(ok);

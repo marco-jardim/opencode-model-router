@@ -662,6 +662,65 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
     expect(await fsp.readFile(join(repo, "packages", "a", "index.js"), "utf8")).toBe("module.exports = 1;\n");
   });
 
+  it("P0.4: package link to a directory outside the repository -> inexact external-link", async () => {
+    const outside = join(base, "outside lib-b");
+    await fsp.mkdir(outside);
+    await fsp.writeFile(join(outside, "index.js"), "module.exports = 'b0';\n");
+    await fsp.symlink(outside, join(repo, "node_modules", "lib-b"), linkType);
+    const handle = await mat(await capture());
+    try {
+      expect(handle.exact).toBe(false);
+      expect(handle.inexactReasons).toContainEqual({ cause: "external-link", path: "node_modules/lib-b" });
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it("P0.4: package link into a git repository outside root -> inexact external-link", async () => {
+    const outside = join(base, "outside repo lib-b");
+    await fsp.mkdir(outside);
+    await git(outside, "init", "-q");
+    await fsp.writeFile(join(outside, "index.js"), "module.exports = 'b0';\n");
+    await git(outside, "add", "-A");
+    await git(outside, "-c", "user.email=t@example.com", "-c", "user.name=t", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "init");
+    await fsp.symlink(outside, join(repo, "node_modules", "lib-b"), linkType);
+    const handle = await mat(await capture());
+    try {
+      expect(handle.exact).toBe(false);
+      expect(handle.inexactReasons).toContainEqual({ cause: "external-link", path: "node_modules/lib-b" });
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it("P0.4: scoped package link to a directory outside the repository -> inexact external-link", async () => {
+    const outside = join(base, "outside scoped b");
+    await fsp.mkdir(outside);
+    await fsp.mkdir(join(repo, "node_modules", "@s"));
+    await fsp.symlink(outside, join(repo, "node_modules", "@s", "b"), linkType);
+    const handle = await mat(await capture());
+    try {
+      expect(handle.exact).toBe(false);
+      expect(handle.inexactReasons).toContainEqual({ cause: "external-link", path: "node_modules/@s/b" });
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it("P0.4: package link to an outside store path with a node_modules segment stays exact", async () => {
+    const store = join(base, "store", "node_modules", "lib-c");
+    await fsp.mkdir(store, { recursive: true });
+    await fsp.writeFile(join(store, "index.js"), "module.exports = 'c0';\n");
+    await fsp.symlink(store, join(repo, "node_modules", "lib-c"), linkType);
+    const handle = await mat(await capture());
+    try {
+      expect(handle.inexactReasons.filter((r) => r.cause === "external-link")).toEqual([]);
+      expect(handle.exact).toBe(true);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
   it("QA-1.5-6a: core.autocrlf=true or input -> inexact checkout-conversion", async () => {
     for (const value of ["true", "input"]) {
       await git(repo, "config", "core.autocrlf", value);

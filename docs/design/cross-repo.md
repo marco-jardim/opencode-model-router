@@ -1,6 +1,6 @@
 # Cross-repo work in roles mode
 
-**Status:** Accepted 2026-10-10 (owner). Phase 0 in progress (P0.1).
+**Status:** Accepted 2026-10-10 (owner). Phase 0 in progress (P0.1 and P0.4 done).
 **Scope:** roles mode on OpenCode v2 (`routing.delegation: "roles"`). Phase 0 changes the shared verification engine and applies to both hosts.
 **Configuration keys** marked *proposed (not implemented)* do not exist yet.
 **File references** are `path:line` as of 2026-10-10. Line numbers drift; the function names are the stable reference.
@@ -181,7 +181,7 @@ Allow once = this dispatch only. Allow always = until it expires. Reject = no wo
 - **I4 — Perimeter changes.** A change in P outside W during the dispatch:
   - if the producer lineage ran an unattributable writer → unverifiable;
   - otherwise → a note. The reference is handled by I6.
-- **I5 — Empty change with writers.** If no change was observed in P and the lineage ran an unattributable writer, a pass carries a caveat. It renders as UNVERIFIED (`docs/VERIFICATION.md:241`).
+- **I5 — Empty change with writers.** If no change was observed in P and the lineage ran an unattributable writer, a pass carries a caveat. It renders as UNVERIFIED (`docs/VERIFICATION.md:242`).
   - *Unattributable writer:* a tool that is neither in `WRITE_TOOLS` (`src/verify/dispatch.ts:101`) nor in `NON_WRITING_TOOLS` (`dispatch.ts:114-119`), and is not a read-only router tool (`router_git_*`, `src/router/git-tools.ts:11`; `router_request_authority`, `src/routing/roles/authority.ts:28`). This covers `bash`, `router_run`, MCP tools and unknown tools.
 - **I6 — Reference exactness.** A package link in a linked `node_modules` whose real path is outside the repository and has no `node_modules` segment makes the reference approximate unless it is pinned (Phase 2). An approximate reference never excuses a failure (`baseline.ts:162-165`).
 - **I7 — Branch continuity.** W's branch at return equals its branch at dispatch. At `router_verify`, it equals its branch at return. A HEAD that moved by commits on the same branch is handled as today (`wiring.ts:1118-1140`).
@@ -315,9 +315,9 @@ The first sentence of the working-directory paragraph is today's text (`src/rout
 - **Phase 3 spike:** test whether `vitest related <real path in B>` run in A finds A's importers through symlinked packages. Jest stays S6.
 
 **Reference contamination.**
-- Materialize links the live `node_modules` (`reference.ts:333-356`). Workspace-link drift checks only targets inside the repository (`reference.ts:1822-1845`); a link to `D:\git\lib-b` is skipped (`:1833-1834`).
+- Materialize links the live `node_modules` (`reference.ts:1764-1798`). Workspace-link drift checks only targets inside the repository (`reference.ts:1820-1845`); a link to `D:\git\lib-b` is skipped (`:1833-1834`).
 - **P0.4 rule.** A package entry (top level, and one level under each `@scope`, as `packageEntries` reads them) is a link whose real path is outside root and realRoot and contains no `node_modules` segment → the reason `external-link`, and the reference is approximate.
-- **What stays exact:** a `node_modules` that is itself a junction to an outside store, as in `test/unit/reference.test.ts:1259-1279`, and a link into a store path that contains `node_modules`.
+- **What stays exact:** a `node_modules` that is itself a junction to an outside store, as in `test/unit/reference.test.ts:1232-1299`, and a link into a store path that contains `node_modules`.
 
 **Pinning (Phase 2).**
 - At dispatch, snapshot each admitted link target as part of P. Add a bounded digest of the ignored files under the target, excluding `node_modules`. The digest matters because `snapshotTree` hashes status, diffs and untracked files only (`tree.ts:214-243`), while linked packages often load an ignored `dist/`.
@@ -346,7 +346,7 @@ Each slice lands test-first: the failing test reproduces the scenario row, then 
 ### Phase 0 — integrity fixes in the shared engine, both hosts
 
 **P0.1 — Mixed change set (S4)**
-- `src/verify/gate.ts` `accept` (`:254-292`):
+- `src/verify/gate.ts` `accept` (`:155-310`; the mixed check is `refuseMixedOutside`):
   - The coverage root is the git top level of the base: the gate snapshot's root (`observeChange` returns it, `wiring.ts:1514-1519`), else the base. On the deferred path, the root recorded at registration.
   - Any absolute changed path outside it → unverifiable, for both the deterministic and the grader branch. A relative path that climbs out of the root counts as outside.
   - The all-outside reason stays byte-identical. Mixed sets get a new reason that lists at most five outside paths.
@@ -356,7 +356,7 @@ Each slice lands test-first: the failing test reproduces the scenario row, then 
 
 **P0.2 — Branch switch (S9, S12)**
 - `src/verify/tree.ts` `snapshotTree` (`:201-256`): add `branch`, from `git symbolic-ref -q HEAD`. Exit 1 means detached (`null`); any other failure means unknown.
-- `wiring.ts` `observeChange` (`~:1480-1520`): compare the dispatch snapshot's branch with the return snapshot's. When HEAD moved and either branch is unknown, treat it as a switch.
+- `wiring.ts` `observeChange` (`:1469-1520`): compare the dispatch snapshot's branch with the return snapshot's. When HEAD moved and either branch is unknown, treat it as a switch.
 - `src/verify/pending.ts` registration (R3, `:41-71`): store the branch at return. `wiring.ts` `prepareClaim` (`:1818-1850`) compares it with the `snapshotFor` result (`:1773-1788`).
 - `gate.ts`: a branch switch → unverifiable, for both branches of the gate. The reason: `the working tree <root> switched from branch <a> to <b> during the dispatch (since the producer returned); the checks would verify another branch`.
 
@@ -369,7 +369,7 @@ Each slice lands test-first: the failing test reproduces the scenario row, then 
 - The deferred no-change shortcut (`wiring.ts:1639-1644`) already falls through to the required gate, which then applies the caveat.
 
 **P0.4 — External link at the reference (S6, S7)**
-- `src/verify/reference.ts` materialize step 7 (`:1820-1845`): apply the P0.4 rule from section 6. Add `"external-link"` to the cause union (`:810`).
+- `src/verify/reference.ts` materialize step 7 (`:1820-1845`): apply the P0.4 rule from section 6. Add `"external-link"` to the cause union (`:802-812`).
 - Docs: `docs/VERIFICATION.md` (the approximate-reference causes and the junction note).
 
 **Phase 0 docs:** amend ADR 0002 (`docs/adr/0002-acceptance-gate.md:78` says attribution is "never a global diff", while `dispatch.ts:403-404` adds the status delta of the whole repository).
@@ -428,7 +428,7 @@ Each slice lands test-first: the failing test reproduces the scenario row, then 
 **Must stay green**
 - Every golden in `test/golden/`, including the default roles protocol (`test/golden/roles-protocol.golden.test.ts:26-55`, template test `:101-108`), the dispatch header and the banners.
 - `test/unit/runner.test.ts:741-777`.
-- `test/unit/reference.test.ts:1259-1279` (`node_modules` as a junction to an outside store stays exact).
+- `test/unit/reference.test.ts:1232-1299` (`node_modules` as a junction to an outside store stays exact).
 - The docs-drift pins.
 - `npm run smoke:v1`.
 

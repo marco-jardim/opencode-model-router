@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scratch file in the temp directory written by a write tool, mixed with repository edits, now makes the result
   unverifiable; there is no temp-directory exemption (fail closed). A relative path that climbs out of the root
   (`../x.ts`) counts as outside. A change set that is entirely outside keeps its existing message.
+- **`verify`: the pre-existing-failure reference is now approximate (cause `external-link`) when a package in a linked
+  `node_modules` is a link to a directory outside the repository**, for example an npm `file:`/`link:` or `npm link`
+  package. Previously the rerun loaded that directory's live code, so a failure caused by a change there was also
+  reproduced at the reference and excused as pre-existing. An approximate reference never excuses a failure, so such a
+  run is now unverifiable.
 
 ## [2.6.1] - 2026-10-09
 
