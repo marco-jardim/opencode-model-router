@@ -809,6 +809,7 @@ export type InexactCause =
   | "dependency-drift"
   | "workspace-link-drift"
   | "external-link"
+  | "root-link"
   | "index-flags"
   | "checkout-conversion";
 
@@ -1763,7 +1764,9 @@ export async function materialize(
     }
 
     // 6. Link node_modules (section 5), parents before children (git's order).
-    const linkTargets: string[] = [];
+    // Each target keeps the root-relative path of the candidate node_modules it came from,
+    // so drift reasons never leak a path outside root (a node_modules that is itself a link).
+    const linkTargets: { readonly target: string; readonly label: string }[] = [];
     for (const entry of candidates) {
       if (budget.spent()) return await abandon("aborted", "aborted while linking node_modules");
       const rel = entry.replace(/\/$/, "");
@@ -1795,7 +1798,7 @@ export async function materialize(
       }
       links.push(linkPath);
       await fs.symlink(target, linkPath, platform === "win32" ? "junction" : "dir");
-      linkTargets.push(target);
+      linkTargets.push({ target, label: rel });
     }
 
     // 7. Drift checks (section 2 c and d). Porcelain `git diff` rewrites the index
@@ -1824,7 +1827,17 @@ export async function materialize(
     // P0.4: package links whose real path is outside the repository (and not a store-like
     // path under a node_modules segment) load code the reference cannot pin.
     const externalLinks = new Set<string>();
-    for (const target of linkTargets) {
+    // A package link to the root itself, or to an ancestor of it, would load the live tree.
+    const rootLinks = new Set<string>();
+    // Package-store layouts (pnpm `.pnpm/x@1/node_modules/x`, a global virtual store, a custom
+    // virtualStoreDir) all place the package directly under a node_modules dir (or its @scope).
+    const storeLike = (real: string): boolean => {
+      const parent = p.dirname(real);
+      const parentName = fold(p.basename(parent));
+      if (parentName === "node_modules") return true;
+      return parentName.startsWith("@") && fold(p.basename(p.dirname(parent))) === "node_modules";
+    };
+    for (const { target, label } of linkTargets) {
       for (const entry of await packageEntries(fs, target, platform)) {
         const stats = await lstatOrMissing(fs, entry);
         if (!stats || !stats.isSymbolicLink()) continue;
@@ -1837,9 +1850,11 @@ export async function materialize(
         }
         const base = [realRoot, root].find((candidateRoot) => isStrictlyInside(real, candidateRoot, platform));
         if (!base) {
-          if (!real.split(/[\\/]/).some((segment) => fold(segment) === "node_modules")) {
-            const entryBase = [root, realRoot].find((candidateRoot) => isStrictlyInside(entry, candidateRoot, platform)) ?? root;
-            externalLinks.add(p.relative(entryBase, entry).split(p.sep).join("/"));
+          // Dot-entries (`.cache`, `.bin`) are tool state, not packages.
+          if (!p.basename(entry).startsWith(".")) {
+            const entryLabel = [label, ...p.relative(target, entry).split(p.sep)].join("/");
+            if (insideOrEqual(realRoot, real, platform) || insideOrEqual(root, real, platform)) rootLinks.add(entryLabel);
+            else if (!storeLike(real)) externalLinks.add(entryLabel);
           }
           continue;
         }
@@ -1847,6 +1862,7 @@ export async function materialize(
         if (!rel.split("/").includes("node_modules")) workspaceDirs.add(rel);
       }
     }
+    for (const rel of [...rootLinks].sort(byCodeUnit)) reasons.push({ cause: "root-link", path: rel });
     for (const rel of [...externalLinks].sort(byCodeUnit)) reasons.push({ cause: "external-link", path: rel });
     for (const rel of [...workspaceDirs].sort(byCodeUnit)) {
       const prefix = fold(rel) + "/";

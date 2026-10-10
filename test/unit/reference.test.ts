@@ -721,6 +721,111 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
     }
   });
 
+  describe("external-link / root-link rules", () => {
+    const reasonsOf = async (cause: "external-link" | "root-link") => {
+      const handle = await mat(await capture());
+      try {
+        return { exact: handle.exact, reasons: handle.inexactReasons.filter((r) => r.cause === cause) };
+      } finally {
+        await handle.dispose();
+      }
+    };
+
+    it("C3: package link to the repository root -> root-link", async () => {
+      await fsp.symlink(repo, join(repo, "node_modules", "self"), linkType);
+      const { exact, reasons } = await reasonsOf("root-link");
+      expect(reasons).toEqual([{ cause: "root-link", path: "node_modules/self" }]);
+      expect(exact).toBe(false);
+    });
+
+    it("C3: package link to an ancestor of the repository root -> root-link", async () => {
+      await fsp.symlink(base, join(repo, "node_modules", "up"), linkType);
+      const { exact, reasons } = await reasonsOf("root-link");
+      expect(reasons).toEqual([{ cause: "root-link", path: "node_modules/up" }]);
+      expect(exact).toBe(false);
+    });
+
+    it("C3: dangling outside package link -> no reason", async () => {
+      const gone = join(base, "gone-lib");
+      await fsp.mkdir(gone);
+      await fsp.symlink(gone, join(repo, "node_modules", "dangling"), linkType);
+      await fsp.rm(gone, { recursive: true });
+      const handle = await mat(await capture());
+      try {
+        expect(handle.inexactReasons.filter((r) => r.cause === "external-link" || r.cause === "root-link")).toEqual([]);
+        expect(handle.exact).toBe(true);
+      } finally {
+        await handle.dispose();
+      }
+    });
+
+    it("C4: outside link inside a nested packages/a/node_modules -> root-relative label", async () => {
+      const outside = join(base, "outside nested x");
+      await fsp.mkdir(outside);
+      await fsp.mkdir(join(repo, "packages", "a", "node_modules"), { recursive: true });
+      await fsp.symlink(outside, join(repo, "packages", "a", "node_modules", "x"), linkType);
+      const { reasons } = await reasonsOf("external-link");
+      expect(reasons).toEqual([{ cause: "external-link", path: "packages/a/node_modules/x" }]);
+    });
+
+    it("C4: node_modules located outside root -> label stays root-relative", async () => {
+      const outsideModules = join(base, "main checkout", "node_modules");
+      const outsideLib = join(base, "outside lib-z");
+      await fsp.mkdir(outsideModules, { recursive: true });
+      await fsp.mkdir(outsideLib);
+      await fsp.symlink(outsideLib, join(outsideModules, "z"), linkType);
+      await fsp.rm(join(repo, "node_modules"), { recursive: true, force: true });
+      await fsp.symlink(outsideModules, join(repo, "node_modules"), linkType);
+      const { reasons } = await reasonsOf("external-link");
+      expect(reasons).toEqual([{ cause: "external-link", path: "node_modules/z" }]);
+    });
+
+    it("C5: store-like target directly under node_modules stays exact", async () => {
+      const store = join(base, "store", "node_modules", "pkg");
+      await fsp.mkdir(store, { recursive: true });
+      await fsp.symlink(store, join(repo, "node_modules", "pkg"), linkType);
+      const { exact, reasons } = await reasonsOf("external-link");
+      expect(reasons).toEqual([]);
+      expect(exact).toBe(true);
+    });
+
+    it("C5: store-like scoped target (node_modules/@s/pkg) stays exact", async () => {
+      const store = join(base, "store", "node_modules", "@s", "pkg");
+      await fsp.mkdir(store, { recursive: true });
+      await fsp.symlink(store, join(repo, "node_modules", "pkg"), linkType);
+      const { exact, reasons } = await reasonsOf("external-link");
+      expect(reasons).toEqual([]);
+      expect(exact).toBe(true);
+    });
+
+    it("C5: node_modules segment that is not the parent -> external-link", async () => {
+      const target = join(base, "x", "node_modules", "foo", "src", "pkg");
+      await fsp.mkdir(target, { recursive: true });
+      await fsp.symlink(target, join(repo, "node_modules", "pkg"), linkType);
+      const { exact, reasons } = await reasonsOf("external-link");
+      expect(reasons).toEqual([{ cause: "external-link", path: "node_modules/pkg" }]);
+      expect(exact).toBe(false);
+    });
+
+    it.runIf(process.platform === "win32")("C5: Node_Modules parent basename is exempt on win32", async () => {
+      const store = join(base, "store", "Node_Modules", "pkg");
+      await fsp.mkdir(store, { recursive: true });
+      await fsp.symlink(store, join(repo, "node_modules", "pkg"), linkType);
+      const { exact, reasons } = await reasonsOf("external-link");
+      expect(reasons).toEqual([]);
+      expect(exact).toBe(true);
+    });
+
+    it("C7: dot-entry in node_modules linking outside -> exact", async () => {
+      const outside = join(base, "outside cache");
+      await fsp.mkdir(outside);
+      await fsp.symlink(outside, join(repo, "node_modules", ".cache"), linkType);
+      const { exact, reasons } = await reasonsOf("external-link");
+      expect(reasons).toEqual([]);
+      expect(exact).toBe(true);
+    });
+  });
+
   it("QA-1.5-6a: core.autocrlf=true or input -> inexact checkout-conversion", async () => {
     for (const value of ["true", "input"]) {
       await git(repo, "config", "core.autocrlf", value);
