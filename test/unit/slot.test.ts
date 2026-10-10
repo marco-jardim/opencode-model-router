@@ -3,10 +3,12 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { open as fsOpen, unlink as fsUnlink, utimes as fsUtimes } from "node:fs/promises";
+import { getEventListeners } from "node:events";
 import { createRequire } from "node:module";
 import { hostname, tmpdir, userInfo } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { removeDirWhenReleased } from "../helpers/remove-dir";
 import {
   acquireSlot,
   exitReleaseFailures,
@@ -115,6 +117,20 @@ async function waitUntil(cond: () => boolean, ms = 5_000): Promise<void> {
     await sleep(10);
   }
 }
+/** The real timer, captured before any test spies on `setTimeout` or fakes timers (the deadline must stay real). */
+const REAL_SET_TIMEOUT = globalThis.setTimeout;
+/** Fails with a clear error when `p` has not settled within `ms` real milliseconds (a hang must not end as a bare test timeout). */
+async function within<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = REAL_SET_TIMEOUT(() => reject(new Error(`${what} did not settle within ${ms} ms`)), ms);
+  });
+  try {
+    return await Promise.race([p, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 /** The default read of slot.ts, for seams that wrap it. */
 async function realRead(path: string): Promise<FileSnapshot> {
   const fh = await fsOpen(path, "r");
@@ -197,20 +213,28 @@ async function startTogether(dir: string, cfgs: Array<Record<string, unknown>>):
 }
 
 afterEach(async () => {
+  // A test that hangs or fails must not leave fake timers or a setTimeout spy behind for the next one.
+  vi.useRealTimers();
+  vi.restoreAllMocks();
   for (const h of handles.splice(0)) await h.release();
   for (const c of children.splice(0)) if (c.exitCode === null && c.signalCode === null) killHard(c);
 });
-afterAll(() => {
-  // A hard-killed child may still hold a lock or ticket for a moment (EBUSY/EPERM on Windows):
-  // retry, and never let one busy directory strand the rest (omr-slot-* leaked otherwise).
-  for (const d of dirs.splice(0)) {
-    try {
-      rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
-    } catch {
-      // Best effort: a directory still busy after the retries is left to the OS temp cleanup.
-    }
-  }
-});
+afterAll(async () => {
+  // A hard-killed child may still hold a lock or ticket for a moment (EBUSY/EPERM on Windows): each dir is retried
+  // until the helper's budget, in parallel so the hook stays within its timeout however many dirs there are, and
+  // one busy directory never strands the rest. A dir that still cannot go fails the hook with its path.
+  const failures: string[] = [];
+  await Promise.all(
+    dirs.splice(0).map(async (d) => {
+      try {
+        await removeDirWhenReleased(d);
+      } catch (error) {
+        failures.push(error instanceof Error ? error.message : String(error));
+      }
+    }),
+  );
+  if (failures.length > 0) throw new Error(failures.join("\n"));
+}, 30_000); // above the helper's 8 s budget (REMOVE_DIR_BUDGET_MS)
 
 function intervals(log: string): Array<[number, number]> {
   const enter = new Map<string, number>();
@@ -507,15 +531,19 @@ describe("slot: shared observations outlive a call and a process (QA-1.4-21)", (
     const deps = { heartbeatMs: 1_000, staleMs: 3_000 }; // the looks must be less than 2 heartbeats minus both looks' slacks (2 x 1 s - 2 x 200 ms = 1.6 s) apart
     const out: Array<{ r: string; at: number }> = [];
     for (let i = 0; i < 5; i++) {
-      await sleep(Math.max(0, planted + i * 900 - Date.now()));
-      const at = Date.now() - planted;
-      const h = runHolder({ dir, max: 1, waitMs: 0, mode: "exit", deps });
+      // Each fresh process looks at a frozen virtual instant (planted + i x 900 ms) given to it, so how long a
+      // loaded runner takes to start it cannot stretch the gaps between looks or shift the total.
+      const at = i * 900;
+      const h = runHolder({ dir, max: 1, waitMs: 0, mode: "exit", deps, virtualNowMs: planted + at });
       const r = await h.waitFor(/^(HELD|BUSY)$/);
       await h.exit;
       out.push({ r, at });
     }
     const first = out.findIndex((x) => x.r === "HELD");
-    // Looks before staleMs (children 0-2 start by 1.8 s) are busy; one of the last two takes it.
+    // Looks before staleMs (children 0-2 look by 1.8 s) are busy; one of the last two takes it. Not pinned to exactly
+    // 4: lockVerdict (slot.ts:598-605) makes look 3 (2.7 s) "fresh" and look 4 (3.6 s) "stale" with the frozen clocks,
+    // but the lock's real mtime (a file-system timestamp, coarse on some Windows volumes) also enters the wall-age
+    // test, so a coarse mtime could legitimately let look 3 reclaim it.
     expect(first, JSON.stringify(out)).toBeGreaterThanOrEqual(3);
     expect(out.slice(0, first).every((x) => x.r === "BUSY"), JSON.stringify(out)).toBe(true);
     expect(existsSync(p)).toBe(false); // the child that took it released it at exit
@@ -1007,26 +1035,54 @@ describe("slot: fairness between processes (QA-1.4-9)", () => {
   it("a waiter heartbeats its ticket while a slow attempt runs, so the others keep deferring to it (QA-1.4-24)", async () => {
     const dir = freshDir();
     const p = join(dir, "slot-0.lock");
-    const holder = held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { heartbeatMs: 200 })));
-    // Ticket TTL = 2 heartbeats = 400 ms, while each of the waiter's attempts takes over 1 s.
-    const slow = async (path: string) => {
-      if (path === p) await sleep(1_000);
-      return realRead(path);
-    };
-    const waiting = acquireSlot({ max: 1, waitMs: 10_000, meta }, fast(dir, { heartbeatMs: 200, read: slow }));
-    await waitUntil(() => readdirSync(dir).some((n) => n.endsWith(".ticket")));
-    let ticketDeletes = 0;
-    const unlink = async (path: string) => {
-      if (path.endsWith(".ticket")) ticketDeletes++;
-      await fsUnlink(path);
-    };
-    for (let i = 0; i < 8; i++) {
-      expect(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { heartbeatMs: 200, unlink }))).toEqual({ busy: true });
-      await sleep(150);
+    // Virtual time: the processes' clocks and the waiter's heartbeat interval are driven by the test, so the
+    // result no longer depends on how late a loaded runner fires a real 200 ms timer. Only setInterval is faked
+    // (the heartbeat); the wait loop's own backoff timers and the file system stay real.
+    let clock = Date.now();
+    const clocks = { now: () => clock, mono: () => clock };
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const waiterAbort = new AbortController();
+    let openGate!: () => void;
+    const gate = new Promise<void>((r) => (openGate = r));
+    try {
+      const holder = held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { heartbeatMs: 200 })));
+      // The holder's own heartbeat interval is already counted: the waiter's is the one that raises the count.
+      const baseTimers = vi.getTimerCount();
+      // Ticket TTL = 2 heartbeats = 400 ms, while the waiter's attempt is stuck (slow) for the whole test: only
+      // its heartbeat can keep the ticket alive. The attempt is held on a gate instead of a timed sleep.
+      const slow = async (path: string) => {
+        if (path === p) await gate;
+        return realRead(path);
+      };
+      const waiting = acquireSlot({ max: 1, waitMs: 10_000, meta, signal: waiterAbort.signal }, fast(dir, { heartbeatMs: 200, read: slow, ...clocks }));
+      // The ticket is on disk and the waiter's heartbeat interval armed (right after the ticket is written).
+      await waitUntil(() => readdirSync(dir).some((n) => n.endsWith(".ticket")) && vi.getTimerCount() > baseTimers);
+      const ticketFile = join(dir, readdirSync(dir).find((n) => n.endsWith(".ticket"))!);
+      let ticketDeletes = 0;
+      const unlink = async (path: string) => {
+        if (path.endsWith(".ticket")) ticketDeletes++;
+        await fsUnlink(path);
+      };
+      for (let i = 0; i < 8; i++) {
+        // One heartbeat period passes (200 ms, the waiter beats once) and the ticket is touched at the new time.
+        clock += 200;
+        const due = clock;
+        vi.advanceTimersByTime(200);
+        await waitUntil(() => Math.abs(statSync(ticketFile).mtimeMs - due) < 2);
+        expect(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { heartbeatMs: 200, unlink, ...clocks }))).toEqual({ busy: true });
+      }
+      // 1.6 s of virtual time passed against a 400 ms TTL: only the heartbeat kept the ticket alive.
+      expect(ticketDeletes).toBe(0);
+      await holder.release();
+      openGate();
+      const won = held(await within(waiting, 10_000, "the waiter (it should win the slot once the holder released and the gate opened)"));
+      await won.release();
+    } finally {
+      // A failed or hung test must not leave the waiter running, its read stuck or the timers faked.
+      waiterAbort.abort();
+      openGate();
+      vi.useRealTimers();
     }
-    expect(ticketDeletes).toBe(0);
-    await holder.release();
-    held(await waiting);
   }, 20_000);
 });
 
@@ -1069,12 +1125,54 @@ describe("slot: waiting", () => {
     const timers = () => process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
     const before = timers();
     const ac = new AbortController();
-    const p = acquireSlot({ max: 1, waitMs: 60_000, meta, signal: ac.signal }, { dir, backoffMinMs: 2_000, backoffMaxMs: 2_000 });
-    await new Promise((r) => setTimeout(r, 100));
-    const t0 = Date.now();
-    ac.abort();
-    expect(await p).toEqual({ busy: true });
-    expect(Date.now() - t0).toBeLessThan(100);
+    // Watch the loop's backoff sleep (2 s) instead of timing the abort: wait until it is armed, then abort and
+    // require that the wait resolved while that sleep had NOT fired, i.e. the abort woke it, not the timer. The sleep
+    // is identified as the timer armed right after the loop's random() call (slot.ts:1531 -> 1537, one synchronous
+    // run), not by its duration, so an unrelated 2 s timer cannot be mistaken for it.
+    const realSetTimeout = globalThis.setTimeout;
+    let loopArming = false;
+    let armed: (() => void) | undefined;
+    const sleepArmed = new Promise<void>((r) => (armed = r));
+    let backoffFired = false;
+    const spy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) => {
+      if (!loopArming) return realSetTimeout(fn, ms);
+      loopArming = false;
+      const h = realSetTimeout(() => {
+        backoffFired = true;
+        fn();
+      }, ms);
+      armed?.();
+      return h;
+    }) as typeof setTimeout);
+    let result: Awaited<ReturnType<typeof acquireSlot>>;
+    let abortToResolveMs = Number.POSITIVE_INFINITY;
+    try {
+      const p = acquireSlot(
+        { max: 1, waitMs: 60_000, meta, signal: ac.signal },
+        {
+          dir,
+          backoffMinMs: 2_000,
+          backoffMaxMs: 2_000,
+          random: () => {
+            loopArming = true;
+            return 0;
+          },
+        },
+      );
+      await within(sleepArmed, 10_000, "the wait loop's backoff sleep to be armed");
+      // The loop is parked on its sleep with exactly one abort listener (it is removed again when the sleep ends).
+      expect(getEventListeners(ac.signal, "abort")).toHaveLength(1);
+      const t0 = performance.now();
+      ac.abort();
+      result = await within(p, 10_000, "the aborted wait");
+      abortToResolveMs = performance.now() - t0;
+    } finally {
+      spy.mockRestore();
+      ac.abort(); // a failed assertion above must not leave the wait running
+    }
+    expect(result).toEqual({ busy: true });
+    expect(backoffFired).toBe(false);
+    expect(abortToResolveMs).toBeLessThan(1_000); // loose: far below the 2 s sleep it would otherwise have waited out
     expect(timers()).toBeLessThanOrEqual(before);
     expect(await acquireSlot({ max: 1, waitMs: 1_000, meta, signal: AbortSignal.abort() }, fast(dir))).toEqual({ busy: true });
   }, 20_000);
@@ -1125,10 +1223,16 @@ describe("slot: waiting", () => {
     const stamps: number[] = [];
     const ac = new AbortController();
     const sleeps: number[] = [];
+    let loopArming = false;
     const realSetTimeout = globalThis.setTimeout;
     const spy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) => {
-      // Only the timers armed between the first and the third attempt: the loop's backoff sleeps.
-      if (stamps.length >= 1 && stamps.length < 3) sleeps.push(ms ?? 0);
+      // Only the loop's own backoff sleeps: it calls random() and then arms its timer in the same synchronous
+      // run, so the timer armed right after a random() call is its sleep. Unrelated timers of this process
+      // (other tests' heartbeats, vitest) never follow a random() call and are ignored.
+      if (loopArming) {
+        loopArming = false;
+        sleeps.push(ms ?? 0);
+      }
       return realSetTimeout(fn, ms);
     }) as typeof setTimeout);
     let r: Awaited<ReturnType<typeof acquireSlot>> | undefined;
@@ -1139,7 +1243,10 @@ describe("slot: waiting", () => {
           dir,
           backoffMinMs: floor,
           backoffMaxMs: cap,
-          random: () => 0,
+          random: () => {
+            loopArming = true;
+            return 0;
+          },
           onAttempt: () => {
             stamps.push(performance.now());
             if (stamps.length >= 3) ac.abort();
@@ -1154,7 +1261,8 @@ describe("slot: waiting", () => {
     // Wall-clock gaps: load only lengthens them, so the floor side is deterministic (5 ms timer slack).
     expect(stamps[1]! - stamps[0]!).toBeGreaterThanOrEqual(nextBackoffMs(0, 0, floor, cap) - 5);
     expect(stamps[2]! - stamps[1]!).toBeGreaterThanOrEqual(nextBackoffMs(1, 0, floor, cap) - 5);
-    // The sleeps the loop asked for: exactly the two backoff steps, each within [floor, cap].
+    // The sleeps the loop asked for (the timers armed right after its random() calls, see above): exactly the
+    // two backoff steps, each within [floor, cap].
     expect(sleeps).toEqual([nextBackoffMs(0, 0, floor, cap), nextBackoffMs(1, 0, floor, cap)]);
     for (const ms of sleeps) {
       expect(ms).toBeGreaterThanOrEqual(floor);
