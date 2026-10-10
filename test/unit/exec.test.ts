@@ -1,19 +1,32 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { execFileSync, spawn } from "node:child_process";
 import { getEventListeners } from "node:events";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { removeDirWhenReleased } from "../helpers/remove-dir";
 import { DEFAULT_TIMEOUT_MS, KILL_GRACE_MS, SWEEP_TIMEOUT_MS, deadlineOf, runArgv, runShell, setSweeperExecutableForTests, trackingForTests } from "../../src/verify/exec";
 
 // Real processes, no mocks: the defect this guards against only exists in how
 // the OS tears a process tree down, which a fake child_process cannot model.
 const node = `"${process.execPath}"`;
 const dirs: string[] = [];
-// Retries: on Windows a just-killed process can still hold its cwd (a scratch
-// dir) for a few hundred ms after `alive()` reports it dead (QA-1.2-30).
-afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); });
+// On Windows a dir cannot be removed while a process has it as its cwd (the holder of tree.cjs, the fork fixture's
+// grandchild), and a just-killed process can still hold it for a few hundred ms after `alive()` reports it dead
+// (QA-1.2-30). The tests wait for those processes to be gone (release(), waitForExit); here the removal is retried
+// until a deadline, and a dir that still cannot go fails the hook with its path.
+afterEach(async () => {
+  const failures: string[] = [];
+  for (const d of dirs.splice(0)) {
+    try {
+      await removeDirWhenReleased(d);
+    } catch (error) {
+      failures.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+  if (failures.length > 0) throw new Error(failures.join("\n"));
+}, 30_000); // each removal has its own 8 s budget (REMOVE_DIR_BUDGET_MS): the hook timeout must stay above it
 
 /** A shell -> node -> grandchild node chain, like `cmd /c npm test` -> vitest -> workers. */
 function forkingFixture() {
@@ -413,7 +426,12 @@ function tree(mode: "early-exit" | "unreachable" | "broken-tree") {
       writeFileSync(join(dir, "release"), "");
       if (!existsSync(file("holder"))) return;
       const holder = Number(readFileSync(file("holder"), "utf8"));
-      if (!(await waitForExit(holder))) process.kill(holder);
+      if (!(await waitForExit(holder))) {
+        process.kill(holder);
+        // Not done until it is really gone: in the host.mjs tests (runArgv with cwd: dir) it has the scratch dir as its
+        // cwd, and Windows will not remove a dir that is a process's cwd.
+        await waitForExit(holder, 10_000);
+      }
     },
   };
 }
@@ -615,6 +633,7 @@ describe("process lifecycle around the direct child's exit", () => {
     const t = tree("early-exit");
     const h = startHost(["hung-sweeper", t.dir]);
     let standIn = 0;
+    let passed = false;
     try {
       const first = await h.firstLine;
       expect(first.line, h.stderr()).not.toBe("");
@@ -630,10 +649,16 @@ describe("process lifecycle around the direct child's exit", () => {
       expect(exited.at - first.at).toBeLessThan(5000);
       // Nor did the sweeper outlive the host: a direct child, it dies with libuv's job.
       expect(await waitForExit(standIn, 3000)).toBe(true);
+      passed = true;
     } finally {
       h.kill();
       killIfAlive(standIn);
+      // The stand-in sweeper's cwd is the guarded tmpdir (src/verify/exec.ts:646), not a dir this file removes: a
+      // survivor is reported by the home-guard's afterAll, which cannot remove that tmpdir. So it fails here, with its
+      // PID, but only after the test's own assertions passed (a throw in this finally would mask them).
+      const standInGone = standIn <= 0 || (await waitForExit(standIn, 10_000));
       await t.release();
+      if (passed && !standInGone) throw new Error(`stand-in sweeper ${standIn} (cwd: ${tmpdir()}) is still alive 10 s after being killed`);
     }
   }, 60000);
 
@@ -641,6 +666,7 @@ describe("process lifecycle around the direct child's exit", () => {
     const t = tree("early-exit");
     const h = startHost(["late-sweeper", t.dir]);
     let standIn = 0;
+    let passed = false;
     try {
       const first = await h.firstLine;
       expect(first.line, h.stderr()).not.toBe("");
@@ -654,10 +680,15 @@ describe("process lifecycle around the direct child's exit", () => {
       expect(out.result.stderr).not.toMatch(/output streams force-closed/);
       expect(alive(t.pid("holder"))).toBe(false);
       expect((await h.exited).code).toBe(0);
+      passed = true;
     } finally {
       h.kill();
       killIfAlive(standIn);
+      // The stand-in's cwd is the guarded tmpdir (src/verify/exec.ts:646): a survivor is reported by the home-guard's
+      // afterAll, so it fails here too, but only after the test's own assertions passed (see the first sweeper test).
+      const standInGone = standIn <= 0 || (await waitForExit(standIn, 10_000));
       await t.release();
+      if (passed && !standInGone) throw new Error(`stand-in sweeper ${standIn} (cwd: ${tmpdir()}) is still alive 10 s after being killed`);
     }
   }, 60000);
 
@@ -665,6 +696,7 @@ describe("process lifecycle around the direct child's exit", () => {
     const t = tree("early-exit");
     const h = startHost(["unpinned-sweeper", t.dir]);
     let standIn = 0;
+    let passed = false;
     try {
       const first = await h.firstLine;
       expect(first.line, h.stderr()).not.toBe("");
@@ -678,10 +710,15 @@ describe("process lifecycle around the direct child's exit", () => {
       // pinned-count condition is what kept the natural result.
       expect(out.settledIn).toBeGreaterThanOrEqual(KILL_GRACE_MS - 50);
       expect((await h.exited).code).toBe(0);
+      passed = true;
     } finally {
       h.kill();
       killIfAlive(standIn);
+      // The stand-in's cwd is the guarded tmpdir (src/verify/exec.ts:646): a survivor is reported by the home-guard's
+      // afterAll, so it fails here too, but only after the test's own assertions passed (see the first sweeper test).
+      const standInGone = standIn <= 0 || (await waitForExit(standIn, 10_000));
       await t.release();
+      if (passed && !standInGone) throw new Error(`stand-in sweeper ${standIn} (cwd: ${tmpdir()}) is still alive 10 s after being killed`);
     }
   }, 60000);
 });

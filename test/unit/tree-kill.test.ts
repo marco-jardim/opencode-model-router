@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { removeDirWhenReleased } from "../helpers/remove-dir";
 import { execGit, type SnapshotGitOptions } from "../../src/verify/tree";
 
 // QA-G-6: real git, real processes. A `core.fsmonitor` hook is a process git spawns (through its
@@ -12,21 +13,30 @@ import { execGit, type SnapshotGitOptions } from "../../src/verify/tree";
 const dirs: string[] = [];
 const hooks: number[] = [];
 
-afterEach(() => {
-  for (const pid of hooks.splice(0)) if (alive(pid)) process.kill(pid);
-  for (const d of dirs.splice(0)) removeScratch(d);
-});
-
-// Windows can hold a handle on the scratch repo briefly after the killed process tree exits
-// (EBUSY on rmdir). Retry, then leave the temp dir behind with a warning rather than fail the test.
-function removeScratch(d: string): void {
-  try {
-    rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code !== "EBUSY" && code !== "EPERM" && code !== "ENOTEMPTY") throw err;
-    console.warn(`tree-kill: left scratch dir ${d} behind after retries (${code})`);
+// The hook (and git, and the shell between them) runs with the scratch repo as its current directory, and on Windows
+// a directory cannot be removed while a process has it as cwd. So the scratch dirs are removed only once every PID of
+// the tree is gone (the registered hook PIDs), and a dir that still cannot be removed fails the hook with its path
+// instead of being left behind (the leftover would only fail the whole file later, in the home-guard's afterAll).
+//
+// The removal has its own 8 s budget (REMOVE_DIR_BUDGET_MS); the explicit 30 s hook timeout stays well above it, so the
+// helper's error naming the path is what surfaces, never "Hook timed out".
+afterEach(async () => {
+  const pids = hooks.splice(0);
+  const failures: string[] = [];
+  for (const d of dirs.splice(0)) {
+    try {
+      await removeDirWhenReleased(d, { pids });
+    } catch (error) {
+      failures.push(error instanceof Error ? error.message : String(error));
+    }
   }
+  if (failures.length > 0) throw new Error(failures.join("\n"));
+}, 30_000);
+
+/** Drops a hook PID the test has confirmed dead, so the cleanup can never kill a PID the OS has recycled since. */
+function forget(pid: number): void {
+  const at = hooks.indexOf(pid);
+  if (at >= 0) hooks.splice(at, 1);
 }
 
 function alive(pid: number): boolean {
@@ -85,6 +95,7 @@ describe("QA-G-6: the snapshot's git is ended with its whole tree", () => {
     await expect(pending).rejects.toThrow(/aborted/);
     expect(Date.now() - abortedAt).toBeLessThan(1000);
     expect(await waitFor(() => !alive(pid), 3000)).toBe(true);
+    forget(pid);
   }, 40_000);
 
   it("the timeout ends what git spawned too", async () => {
@@ -92,9 +103,11 @@ describe("QA-G-6: the snapshot's git is ended with its whole tree", () => {
     const pending = execGit(["--no-pager", "status", "--porcelain=v1"], options(repo, new AbortController().signal, 3000));
     pending.catch(() => undefined);
     expect(await waitFor(() => hookPid() > 0, 20_000)).toBe(true);
-    hooks.push(hookPid());
+    const pid = hookPid();
+    hooks.push(pid);
     await expect(pending).rejects.toThrow(/timed out after 3000 ms/);
-    expect(await waitFor(() => !alive(hookPid()), 3000)).toBe(true);
+    expect(await waitFor(() => !alive(pid), 3000)).toBe(true);
+    forget(pid);
   }, 40_000);
 
   it("resolves stdout, rejects a non-zero exit, output past maxBuffer and an already-aborted signal", async () => {

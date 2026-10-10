@@ -204,9 +204,26 @@ for (const name of readdirSync(guard.realTmp)) {
   }
 }
 
+/**
+ * Removes one of the private dirs. On Windows a dir cannot go while a process has it (or something inside it) as its
+ * current directory or holds a handle there; the tests that spawn process trees wait for them before they finish
+ * (test/helpers/remove-dir.ts), so this is only a bounded safety net. A failure names the path (a bare
+ * `EBUSY ... rmdir` points at a sub-directory and hides which dir the guard was removing) and is reported after the
+ * environment has been restored.
+ */
+function removeGuardDir(path: string, failures: string[]): void {
+  try {
+    // One call: rmSync retries internally (linear backoff, about 11 s at most), and it blocks the process meanwhile.
+    rmSync(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  } catch (error) {
+    failures.push(`home-guard: cannot remove ${path}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 afterAll(() => {
-  rmSync(guard.isolatedHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
-  rmSync(guard.isolatedTmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  const failures: string[] = [];
+  removeGuardDir(guard.isolatedHome, failures);
+  removeGuardDir(guard.isolatedTmp, failures);
   for (const [name, value] of Object.entries(guard.original)) {
     if (value === undefined) delete process.env[name];
     else process.env[name] = value;
@@ -215,4 +232,5 @@ afterAll(() => {
     if (value === undefined) delete process.env[name];
     else process.env[name] = value;
   }
+  if (failures.length > 0) throw new Error(failures.join("\n"));
 });
