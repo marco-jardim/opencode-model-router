@@ -243,6 +243,7 @@ export function externalDirectoryPatterns(
   worktrees: readonly string[],
   workRoots: readonly string[],
   realpath: Realpath = nativeRealpath,
+  parents: readonly string[] = [],
 ): { patterns: string[]; problems: string[] } {
   const patterns: string[] = [];
   const problems: string[] = [];
@@ -257,6 +258,12 @@ export function externalDirectoryPatterns(
   for (const entry of workRoots) {
     const result = workRootPattern(entry, realpath);
     if (result.pattern === undefined) problems.push(`routing.workRoots entry ${entry} ${result.problem ?? "is not usable"}; not granted`);
+    else add(result.pattern);
+  }
+  // P1.6: one `<parent><sep>*` per `routing.repoParents` entry; the host's `*` crosses separators, so it covers every depth.
+  for (const parent of parents) {
+    const result = workRootPattern(`${parent.replace(/[\\/]+$/, "")}/*`, realpath);
+    if (result.pattern === undefined) problems.push(`routing.repoParents entry ${parent} ${result.problem ?? "is not usable"}; not granted`);
     else add(result.pattern);
   }
   return { patterns, problems };
@@ -344,7 +351,7 @@ export async function registerRoleAgents(
         opts.warn("roles:worktrees", `${PREFIX}the repository's worktrees could not be listed (${errorText(error)}); role agents get no worktree external_directory rule`);
       }
     }
-    const found = externalDirectoryPatterns(worktrees, routing.workRoots, opts.realpath ?? nativeRealpath);
+    const found = externalDirectoryPatterns(worktrees, routing.workRoots, opts.realpath ?? nativeRealpath, routing.repoParents);
     for (const problem of found.problems) opts.warn(`roles:external:${problem}`, `${PREFIX}${problem}`);
     externalDirectory = found.patterns;
     built = new Map();

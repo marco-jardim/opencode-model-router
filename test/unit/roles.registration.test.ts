@@ -197,6 +197,28 @@ describe("external_directory patterns (P-11, S11)", () => {
     expect(workRootPattern(base)).toEqual({ pattern: join(base, "*") });
   });
 
+  it("P1.6: a repoParents entry becomes `<canonical parent><sep>*`; a missing one gives no pattern and a problem", () => {
+    const base = temp();
+    const sep = process.platform === "win32" ? "\\" : "/";
+    const found = externalDirectoryPatterns([], [], undefined, [base.replaceAll("\\", "/"), `${base}${sep}`, join(base, "missing")]);
+    expect(found.patterns).toEqual([`${base}${sep}*`]);
+    expect(found.problems).toHaveLength(1);
+    expect(found.problems[0]).toContain("routing.repoParents");
+    expect(found.problems[0]).toContain("missing");
+  });
+
+  it("P1.6: parents and workRoots give both patterns, de-duplicated; no parents is unchanged", () => {
+    const base = temp();
+    const sep = process.platform === "win32" ? "\\" : "/";
+    const root = base.replaceAll("\\", "/");
+    const both = externalDirectoryPatterns([], [`${root}/omr-*`], undefined, [root]);
+    expect(both.patterns).toEqual([`${base}${sep}omr-*`, `${base}${sep}*`]);
+    expect(both.problems).toEqual([]);
+    const dup = externalDirectoryPatterns([], [`${root}/*`], undefined, [root]);
+    expect(dup.patterns).toEqual([`${base}${sep}*`]);
+    expect(externalDirectoryPatterns([], [`${root}/omr-*`], undefined, [])).toEqual(externalDirectoryPatterns([], [`${root}/omr-*`]));
+  });
+
   it("fails closed: wildcard-only, relative, 8.3, dot segments and missing prefixes give no pattern", () => {
     const base = temp();
     for (const entry of ["*", "/**", "D:/**", "relative/x-*", `${base}/PROGRA~1/x`, `${base}/a/../b-*`, join(base, "nope", "x-*"), join(base, "nope")]) {
@@ -237,6 +259,24 @@ describe("registerRoleAgents", () => {
     expect(listWorktreesSpy).not.toHaveBeenCalled();
     expect(resolveTable).not.toHaveBeenCalled();
     expect(opts.warn).not.toHaveBeenCalled();
+  });
+
+  it("P1.6: routing.repoParents become `<parent><sep>*` allow rules in local roles only; a missing parent warns", async () => {
+    const base = temp();
+    const sep = process.platform === "win32" ? "\\" : "/";
+    const cfg = rolesMode(home(), {});
+    (cfg.routing as { repoParents?: string[] }).repoParents = [base.replaceAll("\\", "/"), join(base, "missing-parent")];
+    const agents: Record<string, Record<string, unknown>> = {};
+    const opts = options();
+    const result = await registerRoleAgents(agents, cfg, opts);
+    expect(result.failed).toBe(false);
+    expect(result.externalDirectory).toEqual([`${base}${sep}*`]);
+    expect(opts.warn).toHaveBeenCalledTimes(1);
+    expect(String(opts.warn.mock.calls[0]![1])).toContain("routing.repoParents");
+    for (const spec of SHIPPED_ROLE_SPECS) {
+      const own = rules(agents[spec.agent]!).filter((rule) => rule.action === "external_directory");
+      expect([spec.agent, own.map((rule) => rule.resource)]).toEqual([spec.agent, spec.agent === "researcher" ? [] : [`${base}${sep}*`]]);
+    }
   });
 
   it("roles mode: every role registered, general replaced, floor model, worktree + workRoots rules", async () => {
