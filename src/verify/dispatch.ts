@@ -20,7 +20,7 @@ import type { DispatchReference } from "./reference";
 import { REFERENCE_NONE } from "./baseline";
 import { neutralizeDirectives } from "./pending";
 import { withTimeout } from "./timeout";
-import type { HeadState } from "./head";
+import type { HeadRead } from "./head";
 
 export interface TreeSnapshot {
   cwd: string;
@@ -61,10 +61,11 @@ export interface DispatchCaptureDeps {
   /** The reference when `capture` is absent. Default: none (REFERENCE_NONE.notRequested). */
   uncaptured?: ReferenceState;
   /**
-   * The cheap head-state read (src/verify/head.ts readHeadState) the branch-switch rule compares at the gate. Independent of
+   * The cheap head-state read (src/verify/head.ts readHead; "none": no repository or an unborn HEAD) the branch-switch rule
+ * compares at the gate. Independent of
    * the snapshot: a snapshot that failed, timed out or was discarded does not lose it. Absent: no head baseline.
    */
-  headState?: (cwd: string, signal: AbortSignal) => Promise<HeadState | undefined>;
+  headState?: (cwd: string, signal: AbortSignal) => Promise<HeadRead>;
   /** Bounds the snapshot, the head read and the capture, each (baselineTimeoutMs). */
   timeoutMs: number;
 }
@@ -237,7 +238,7 @@ interface DispatchRecord {
    * The head state read when the dispatch began (branch-switch baseline). Never discarded on contamination: a write does not
    * change what HEAD was. Resolves undefined when the read failed or timed out; never rejects.
    */
-  head?: Promise<HeadState | undefined>;
+  head?: Promise<HeadRead>;
   capturePending: boolean;
   /** An overlapping edit was observed while the capture was in flight: the reference is none. */
   captureContaminated: boolean;
@@ -396,7 +397,7 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
       })();
       const readHead = deps.headState;
       if (readHead !== undefined) {
-        d.head = (async (): Promise<HeadState | undefined> => {
+        d.head = (async (): Promise<HeadRead> => {
           const controller = new AbortController();
           try {
             return await withTimeout(readHead(cwd, controller.signal), deps.timeoutMs, "dispatch head");
@@ -541,7 +542,7 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
       return dispatches.get(id)?.snapshot;
     },
     /** The head state read when the dispatch began; undefined when untracked or no head reader was given. */
-    baselineHead(id: string): Promise<HeadState | undefined> | undefined {
+    baselineHead(id: string): Promise<HeadRead> | undefined {
       return dispatches.get(id)?.head;
     },
     /**

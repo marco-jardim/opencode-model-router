@@ -20,6 +20,7 @@ import * as path from "node:path";
 import ModelRouterPlugin from "../../src/index";
 import * as gateModule from "../../src/verify/gate";
 import * as headModule from "../../src/verify/head";
+import * as dispatchModule from "../../src/routing/wire/dispatch";
 import { invalidateConfigCache } from "../../src/router/config";
 
 type Tree = Awaited<ReturnType<typeof import("../../src/verify/tree").snapshotTree>>;
@@ -115,7 +116,7 @@ async function produce(hooks: any, sessionID: string, after?: () => void): Promi
 }
 
 /** A plugin whose directory is the repository. `onProducer` runs the producer's work inside its prompt. */
-async function makePlugin(onProducer: (hooks: any, sessionID: string) => Promise<void>) {
+async function makePlugin(onProducer: (hooks: any, sessionID: string) => Promise<void>, opts: { pin?: boolean } = {}) {
   const created: string[] = [];
   const holder: { hooks: any } = { hooks: undefined };
   const ctx = {
@@ -143,8 +144,8 @@ async function makePlugin(onProducer: (hooks: any, sessionID: string) => Promise
     },
   };
   holder.hooks = await ModelRouterPlugin(ctx as unknown as Parameters<typeof ModelRouterPlugin>[0]);
-  // The clean tree, on the initial branch, that the dispatch snapshot sees.
-  await pinTree();
+  // The clean tree, on the initial branch, that the dispatch snapshot sees (pin: false: the dispatch starts with no pinned tree).
+  if (opts.pin !== false) await pinTree();
   return holder.hooks;
 }
 
@@ -330,4 +331,91 @@ describe("a branch switch is decided from the head state, before the commit diff
     expect(artefacts()).toHaveLength(1);
     expect(artefacts()[0]?.branchSwitch).toMatch(DURING);
   }, 90_000);
+
+  /**
+   * QA round 2 F4 (the closest test, not a full roles flow): a switch the deferred finish saw, when the required gate's own head
+   * read missed it, is folded into the verification BEFORE the role lineage records it. The dispatch is made a routed role dispatch by
+   * spying `routedRoleOf` (a minimal record for the call), and `roleAttemptVerification` is spied (calling through) to see what the
+   * lineage receives.
+   */
+  it("F4: the deferred finish saw the switch and the gate's own head read failed: the role lineage receives the switch, with an unavailable change set", async () => {
+    const actual = headModule.readHeadState;
+    let observed = 0;
+    vi.spyOn(headModule, "readHeadState").mockImplementation(async (cwd, opts) => {
+      if (opts?.timeoutMs === undefined) return actual(cwd, opts);
+      observed += 1;
+      return observed === 2 ? undefined : actual(cwd, opts);
+    });
+    const routed = { callID: "call1", parentSessionID: "not-orch", agent: "implementer", carried: false, resumeID: null, verifyRoot: repo };
+    const actualRouted = dispatchModule.routedRoleOf;
+    vi.spyOn(dispatchModule, "routedRoleOf").mockImplementation(callID =>
+      callID === "call1" ? routed as unknown as ReturnType<typeof dispatchModule.routedRoleOf> : actualRouted(callID));
+    const lineageSpy = vi.spyOn(dispatchModule, "roleAttemptVerification");
+    const hooks = await makePlugin(async () => undefined);
+    pinned.absent = true;
+    const out = await runTask(hooks, `Implement it.\n${DEFERRED_DOD}`, () => {
+      pinned.absent = false;
+      checkout();
+    });
+    expect(out).toMatch(DURING);
+    expect(lineageSpy).toHaveBeenCalledTimes(1);
+    const [childSessionID, verification, opts] = lineageSpy.mock.calls[0] ?? [];
+    expect(childSessionID).toBe("child1");
+    expect(opts).toEqual({ carried: false });
+    expect(verification?.branchSwitch).toMatch(DURING);
+    expect(verification?.changeBaseline).toBe("unavailable");
+  }, 90_000);
+  /**
+   * QA round 2 F3: the dispatch-time head read tells "no branch existed" ("none": no repository, or an unborn HEAD) from "unknown"
+   * (undefined: the read failed). The first never refuses; the second falls back to the dispatch snapshot's branch.
+   */
+  describe.each(["no repository", "an unborn repository"] as const)("F3a: the dispatch starts with %s", start => {
+    it("the producer creates the repository and its first commit during the dispatch: no branch reason, no \"cannot confirm\"", async () => {
+      fs.rmSync(path.join(repo, ".git"), { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+      if (start === "an unborn repository") git("init", "-q");
+      const hooks = await makePlugin(async () => undefined, { pin: false });
+      const out = await runTask(hooks, `Implement it.\n${SYNC_DOD}`, () => {
+        if (start === "no repository") git("init", "-q");
+        git("add", "-A");
+        git("commit", "-q", "-m", "first");
+      });
+      expect(out).not.toMatch(/cannot confirm/);
+      expect(out).not.toMatch(ANY_BRANCH_REASON);
+      expect(artefacts()).toHaveLength(1);
+      expect(artefacts()[0]?.branchSwitch).toBeUndefined();
+    }, 90_000);
+  });
+
+  describe("F3b: the dispatch-time head read fails while the dispatch snapshot recorded the branch", () => {
+    /** The first readHead call (the dispatch-time one: observeChange reads through readHeadState) resolves undefined. */
+    const failDispatchRead = (): MockInstance<typeof headModule.readHead> => {
+      const actual = headModule.readHead;
+      let calls = 0;
+      return vi.spyOn(headModule, "readHead").mockImplementation(async (cwd, opts) => {
+        calls += 1;
+        return calls === 1 ? undefined : actual(cwd, opts);
+      });
+    };
+
+    it("(i) no switch: the snapshot's branch stands in, no refusal", async () => {
+      const readSpy = failDispatchRead();
+      const hooks = await makePlugin(async () => undefined);
+      const out = await runTask(hooks, `Implement it.\n${SYNC_DOD}`);
+      expect(readSpy).toHaveBeenCalledTimes(1);
+      expect(out).not.toMatch(/cannot confirm/);
+      expect(out).not.toMatch(ANY_BRANCH_REASON);
+      expect(out).toMatch(/verified: deterministic/);
+      expect(artefacts()[0]?.branchSwitch).toBeUndefined();
+    }, 60_000);
+
+    it("(ii) a checkout of another branch during the dispatch: the \"switched\" reason, by the snapshot's branch name", async () => {
+      const readSpy = failDispatchRead();
+      const hooks = await makePlugin(async () => undefined);
+      const out = await runTask(hooks, `Implement it.\n${SYNC_DOD}`, checkout);
+      expect(readSpy).toHaveBeenCalledTimes(1);
+      expect(out).toMatch(DURING);
+      expect(out).not.toMatch(/cannot confirm/);
+      expect(artefacts()[0]?.branchSwitch).toMatch(DURING);
+    }, 60_000);
+  });
 });

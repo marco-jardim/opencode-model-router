@@ -2487,6 +2487,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               gateDeadline.dispose();
               throw error;
             }
+            // QA2 F4: a switch the deferred finish saw (and this gate's own read missed) is part of this attempt before the role
+            // lineage records it; its change set may hold the other branch's commits, so it is unavailable.
+            if (deferredSwitch !== undefined && verification.branchSwitch === undefined) {
+              verification = { ...verification, branchSwitch: deferredSwitch, changeBaseline: "unavailable" as const };
+            }
             // #84 QA-G-B-2-1: the role child's lineage — this attempt starts it (its own block) or is judged on everything the child
             // changed since the attempt that introduced the carried block, against that attempt's reference.
             if (routedRole !== undefined && childSessionID) verification = roleAttemptVerification(childSessionID, verification, { carried: carriedRole });

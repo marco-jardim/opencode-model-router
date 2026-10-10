@@ -76,7 +76,7 @@ import {
 import { runArgv, runShell } from "./exec";
 import { snapshotTree } from "./tree";
 import { branchSwitched, branchSwitchReason, branchUnconfirmedReason, treeMove, treeMoveReason } from "./branch";
-import { readHeadState, readReflogWindow, type HeadState, type ReflogEntry } from "./head";
+import { readHead, readHeadState, readReflogWindow, type HeadState, type ReflogEntry } from "./head";
 import { captureReference, DEFAULT_CAPTURE_TIMEOUT_MS, gcStaleReferences, nodeReferenceFs, type DispatchReference } from "./reference";
 import type { PluginLogger } from "../router/logger";
 import { REFERENCE_NONE } from "./baseline";
@@ -1353,7 +1353,9 @@ export function createVerificationWiring(deps: {
       snapshot: (at: string, signal: AbortSignal) =>
         sharedSnapshots(flightKey(at), shared => snapshotTree(at, shared, { lowPriority: budget.lowPriority }), signal),
       // The branch-switch baseline: independent of the snapshot, so it survives a discarded or failed one.
-      headState: (at: string, signal: AbortSignal) => readHeadState(at, { signal, lowPriority: budget.lowPriority }),
+      // QA2 F3b: each git process gets the whole baseline budget (a loaded runner outlasts readHead's 5 s default).
+      headState: (at: string, signal: AbortSignal) =>
+        readHead(at, { signal, timeoutMs: budget.baselineTimeoutMs, lowPriority: budget.lowPriority }),
       timeoutMs: budget.baselineTimeoutMs,
     };
     if (!judgedByTests) return { ...base, uncaptured: { kind: "none", reason: REFERENCE_NONE.notRequested } };
@@ -1471,7 +1473,7 @@ export function createVerificationWiring(deps: {
       // QA-3.1-8), and no reference.
       deps = {
         snapshot: (at, signal) => snapshotTree(at, signal, { lowPriority: true }),
-        headState: (at, signal) => readHeadState(at, { signal, lowPriority: true }),
+        headState: (at, signal) => readHead(at, { signal, lowPriority: true }),
         timeoutMs: DEFAULT_CAPTURE_TIMEOUT_MS,
         uncaptured: { kind: "none", reason: `${REFERENCE_NONE.failed} (${errorText(err)})` },
       };
@@ -1542,7 +1544,15 @@ export function createVerificationWiring(deps: {
       const bound = deadline ? deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS) : GRADE_SNAPSHOT_TIMEOUT_MS;
       if (bound > 0 && deadline?.signal.aborted !== true) {
         const signalOpt = deadline ? { signal: deadline.signal } : {};
-        const startHead = await withTimeout(baselineHead, bound, "dispatch head").catch(() => undefined);
+        const startRead = await withTimeout(baselineHead, bound, "dispatch head").catch(() => undefined);
+        // QA2 F3: "none" = no repository or an unborn HEAD at dispatch (e.g. the producer ran git init or made the first
+        // commit): there was no branch to switch from. Unknown (a failed or late read): the dispatch snapshot's head and branch
+        // stand in when it recorded them (no root or reflog then: the name rule decides).
+        const startHead: HeadState | "none" | undefined = startRead === "none" || startRead !== undefined
+          ? startRead
+          : before !== undefined && before.branch !== undefined
+            ? { root: before.root ?? base, head: before.head, branch: before.branch }
+            : undefined;
         const nowHead = await withTimeout(
           readHeadState(base, { ...signalOpt, timeoutMs: bound, lowPriority: configuredLowPriority() }),
           bound,
@@ -1551,9 +1561,11 @@ export function createVerificationWiring(deps: {
         if (nowHead !== undefined) {
           headRead = true;
           gateHead = nowHead;
-          if (startHead === undefined) {
-            // The dispatch-time head is unknown (unreadable, timed out, or an unborn repository): fail closed.
-            headSwitch = `cannot confirm the branch of ${nowHead.root}: the working tree could not be read when the dispatch started, so the checks could verify another branch. Re-dispatch.`;
+          if (startHead === "none") {
+            // No branch existed at dispatch: nothing to compare.
+          } else if (startHead === undefined) {
+            // The dispatch-time head is unknown (an unreadable or late read, and no snapshot head): fail closed.
+            headSwitch = `cannot confirm the branch of ${nowHead.root}: the working tree could not be read when the dispatch started, so the checks could verify another branch. Re-dispatch, or send a fresh [acceptance] block.`;
           } else {
             let window: ReflogEntry[] | undefined;
             if (startHead.reflog !== undefined && nowHead.reflog !== undefined && nowHead.reflog >= startHead.reflog) {

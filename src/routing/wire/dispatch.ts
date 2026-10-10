@@ -901,6 +901,11 @@ export interface RoleAttemptChanges {
   readonly unattributedWriters?: string[] | undefined;
 }
 
+/** QA2 F3c: a "cannot confirm the branch" reason (an unreadable tree), as opposed to an observed switch. */
+function isUnconfirmedBranch(reason: string): boolean {
+  return reason.startsWith("cannot confirm the branch of ");
+}
+
 /** I5 (P0.3): the sorted union of two writer lists. */
 function unionWriters(older: readonly string[] | undefined, newer: readonly string[] | undefined): string[] {
   return [...new Set([...(older ?? []), ...(newer ?? [])])].sort();
@@ -933,7 +938,9 @@ export function roleAttemptVerification<T extends RoleAttemptChanges>(childSessi
   const now = prepared.snapshot;
   if (!opts.carried) {
     const tree = now === undefined ? {} : { tree: { head: now.head, ...(now.branch === undefined ? {} : { branch: now.branch }), root: now.root ?? now.cwd } };
-    const switched = prepared.branchSwitch === undefined ? {} : { switched: prepared.branchSwitch };
+    // QA2 F3c: an attempt that only could not confirm its branch is not a switch of the lineage (a later attempt with a
+    // readable tree is judged on its own); only a real switch is recorded and inherited.
+    const switched = prepared.branchSwitch === undefined || isUnconfirmedBranch(prepared.branchSwitch) ? {} : { switched: prepared.branchSwitch };
     const ownWriters = unionWriters(undefined, prepared.unattributedWriters);
     const writers = ownWriters.length === 0 ? {} : { writers: ownWriters };
     updateDispatchVerification(childSessionID, { ...verification, baseline: { reference: prepared.reference, changed: own, ...tree, ...switched, ...writers } });
@@ -950,7 +957,8 @@ export function roleAttemptVerification<T extends RoleAttemptChanges>(childSessi
     : baseline.tree !== undefined && now !== undefined && branchSwitched(baseline.tree, now)
       ? branchSwitchReason(now.root ?? now.cwd, baseline.tree, now, "since the attempt that introduced this acceptance") : undefined;
   // B3: the first switch the lineage finds is recorded, so every later carried attempt inherits it.
-  const recordedSwitch = baseline.switched ?? prepared.branchSwitch ?? computedSwitch;
+  const ownSwitch = prepared.branchSwitch !== undefined && !isUnconfirmedBranch(prepared.branchSwitch) ? prepared.branchSwitch : undefined;
+  const recordedSwitch = baseline.switched ?? ownSwitch ?? computedSwitch;
   updateDispatchVerification(childSessionID, { ...verification, baseline: { reference: baseline.reference, changed,
     ...(baseline.tree === undefined ? {} : { tree: baseline.tree }),
     ...(recordedSwitch === undefined ? {} : { switched: recordedSwitch }),

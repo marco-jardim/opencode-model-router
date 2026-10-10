@@ -647,6 +647,22 @@ describe("P3.3 global QA round 1: resumes keep the resumed dispatch's facts and 
       expect(roleAttemptVerification("child-b11b", attemptOf(world, "A", "other", SWITCH), { carried: true }).branchSwitch).toBe(SWITCH);
     });
 
+    it("QA2 F3c: an own attempt that could not confirm its branch is not the lineage's switch; a later readable carried attempt on the branch has none", async () => {
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+      await acceptanceChild(world, "child-f3c");
+      const UNCONFIRMED = `cannot confirm the branch of ${world.main}: the working tree could not be read when the dispatch started, so the checks could verify another branch. Re-dispatch, or send a fresh [acceptance] block.`;
+      // The own attempt still reports its own reason to its own gate ...
+      expect(roleAttemptVerification("child-f3c", attemptOf(world, "A", "main", UNCONFIRMED), { carried: false }).branchSwitch).toBe(UNCONFIRMED);
+      await resume(world, "child-f3c");
+      // ... but it is not recorded: the carried attempt, readable and on the same branch, inherits nothing.
+      expect(roleAttemptVerification("child-f3c", attemptOf(world, "A", "main"), { carried: true }).branchSwitch).toBeUndefined();
+      // The same for a carried attempt that itself could not confirm: it is not recorded for the next one either.
+      await resume(world, "child-f3c");
+      expect(roleAttemptVerification("child-f3c", attemptOf(world, "A", "main", UNCONFIRMED), { carried: true }).branchSwitch).toBe(UNCONFIRMED);
+      await resume(world, "child-f3c");
+      expect(roleAttemptVerification("child-f3c", attemptOf(world, "A", "main"), { carried: true }).branchSwitch).toBeUndefined();
+    });
+
     it("control: carried attempts on the same branch with snapshots record no switch", async () => {
       const world = makeWorld(config({ delegation: "roles", engine: "static" }));
       await acceptanceChild(world, "child-ctl");
