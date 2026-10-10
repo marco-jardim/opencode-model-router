@@ -76,7 +76,7 @@ import {
 import { runArgv, runShell } from "./exec";
 import { snapshotTree } from "./tree";
 import { branchSwitched, branchSwitchReason, branchUnconfirmedReason, treeMove, treeMoveReason } from "./branch";
-import { readHeadState, readReflogSubjects } from "./head";
+import { readHeadState, readReflogSubjects, type HeadState } from "./head";
 import { captureReference, DEFAULT_CAPTURE_TIMEOUT_MS, gcStaleReferences, nodeReferenceFs, type DispatchReference } from "./reference";
 import type { PluginLogger } from "../router/logger";
 import { REFERENCE_NONE } from "./baseline";
@@ -181,6 +181,8 @@ export interface PreparedVerification {
    * seen. The artefact builders hand it to the gate (Artefact.branchSwitch), which then refuses on either verifier.
    */
   branchSwitch?: string;
+  /** The cheap head state read at the gate (observeChange); absent when it was not read. The deferred finish registers it. */
+  head?: HeadState;
   /**
    * I5 (P0.3, S1/S3/S10): tools the producer lineage ran whose writes the router cannot observe (store.delta); the artefact
    * builders hand them to the gate (Artefact.unattributedWriters). Absent or empty: none.
@@ -618,6 +620,9 @@ const TRANSIENT_REASON = new RegExp(
       escapeRegExp(ABANDONED_REASON),
       escapeRegExp(DISPOSED_REASON),
       "router_verify was cancelled",
+      // branch.ts branchUnconfirmedReason: the head state could not be read at router_verify; reading it again can settle it.
+      // Not the "when the dispatch started" variant, nor a "switched"/"checked out or reset" reason: those are terminal.
+      "cannot confirm the branch of [^\\r\\n]*?: the working tree could not be read at router_verify",
     ].join("|") +
     ")",
   "i",
@@ -1531,6 +1536,7 @@ export function createVerificationWiring(deps: {
     // a diff across branches would be the other branch's net change, verified as the producer's, and must never reach the store.
     let headSwitch: string | undefined;
     let headRead = false;
+    let gateHead: HeadState | undefined;
     const baselineHead = store.baselineHead(id);
     if (baselineHead !== undefined) {
       const bound = deadline ? deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS) : GRADE_SNAPSHOT_TIMEOUT_MS;
@@ -1544,6 +1550,7 @@ export function createVerificationWiring(deps: {
         ).catch(() => undefined);
         if (nowHead !== undefined) {
           headRead = true;
+          gateHead = nowHead;
           if (startHead === undefined) {
             // The dispatch-time head is unknown (unreadable, timed out, or an unborn repository): fail closed.
             headSwitch = `cannot confirm the branch of ${nowHead.root}: the working tree could not be read when the dispatch started, so the checks could verify another branch. Re-dispatch.`;
@@ -1579,6 +1586,7 @@ export function createVerificationWiring(deps: {
       concurrentDispatches: store.concurrentDispatches(id, snapshot?.root),
       ...(contaminatedBy !== undefined ? { contaminatedBy } : {}),
       ...(branchSwitch !== undefined ? { branchSwitch } : {}),
+      ...(gateHead !== undefined ? { head: gateHead } : {}),
     };
   };
 
@@ -1736,7 +1744,19 @@ export function createVerificationWiring(deps: {
         cwd: resolveBaseDir(input.cwd, directory),
         root: change.snapshot?.root,
         // I7 (P0.2, S12): the checkout the producer returned on; router_verify refuses a tree on another branch by then.
-        ...(change.snapshot !== undefined ? { returnedTree: { head: change.snapshot.head, branch: change.snapshot.branch } } : {}),
+        // B4/B12: from the cheap head state the gate read (root and reflog count too); the snapshot's only without one.
+        ...(change.head !== undefined
+          ? {
+            returnedTree: {
+              root: change.head.root,
+              head: change.head.head,
+              branch: change.head.branch,
+              ...(change.head.reflog !== undefined ? { reflog: change.head.reflog } : {}),
+            },
+          }
+          : change.snapshot !== undefined
+            ? { returnedTree: { head: change.snapshot.head, branch: change.snapshot.branch } }
+            : {}),
         dispatchedAt: input.dispatchedAt,
         dod: input.dod,
         reference,
@@ -1896,25 +1916,70 @@ export function createVerificationWiring(deps: {
       snapshot = snapshotFor(entry.cwd, deadline, lowPriority);
       snapshots.set(entry.cwd, snapshot);
     }
-    const [reference, drift, tree] = await Promise.all([
+    const atReturn = entry.returnedTree;
+    // B4: the branch check reads the cheap head state, not the full tree snapshot (slow, and unavailable for large dirty
+    // trees and submodules). Read in parallel with the rest, bounded by the deadline.
+    const readNowHead = async (): Promise<HeadState | undefined> => {
+      if (atReturn === undefined) return undefined;
+      const bound = deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS);
+      if (bound <= 0 || deadline.signal.aborted) return undefined;
+      return withTimeout(
+        readHeadState(entry.cwd, { signal: deadline.signal, timeoutMs: bound, lowPriority }),
+        bound,
+        "router_verify head",
+      ).catch(() => undefined);
+    };
+    const [reference, drift, tree, nowHead] = await Promise.all([
       // The same bound as the store's reference(id, signal): a capture still pending at the deadline
       // is "no reference (gate budget)".
       untilAborted<ReferenceState>(entry.reference, deadline.signal, () => ({ kind: "none", reason: REFERENCE_NONE.gateBudget })),
       checkDrift(entry, deadline),
       snapshot,
+      readNowHead(),
     ]);
     const changed = entry.changedFiles;
     const root = entry.root ?? tree?.root;
     // I7 (P0.2, S12): the tree must still be on the checkout the producer returned on. A branch recorded at return with no
-    // current tree to compare is refused too ("cannot confirm": terminal unless the call was cut); nothing recorded: no check.
-    const atReturn = entry.returnedTree;
-    const branchSwitch = atReturn === undefined
-      ? undefined
-      : tree === undefined
-        ? (atReturn.branch !== undefined ? branchUnconfirmedReason(root ?? entry.cwd) : undefined)
-        : branchSwitched(atReturn, tree)
-          ? branchSwitchReason(tree.root ?? root ?? entry.cwd, atReturn, tree, "since the producer returned")
-          : undefined;
+    // current head state to compare is refused too ("cannot confirm": retryable); nothing recorded: no check.
+    let branchSwitch: string | undefined;
+    if (atReturn !== undefined) {
+      if (nowHead === undefined) {
+        if (atReturn.branch !== undefined) branchSwitch = branchUnconfirmedReason(atReturn.root ?? root ?? entry.cwd);
+      } else if (atReturn.branch === undefined) {
+        // Registered without a branch (an unknown one): any HEAD move is a switch (branch.ts branchSwitched).
+        if (branchSwitched(atReturn, nowHead)) {
+          branchSwitch = branchSwitchReason(nowHead.root, atReturn, nowHead, "since the producer returned");
+        }
+      } else {
+        const before: HeadState = {
+          root: atReturn.root ?? nowHead.root,
+          head: atReturn.head,
+          branch: atReturn.branch,
+          ...(atReturn.reflog !== undefined ? { reflog: atReturn.reflog } : {}),
+        };
+        let subjects: string[] | undefined;
+        const comparable = before.reflog !== undefined && nowHead.reflog !== undefined && nowHead.reflog >= before.reflog;
+        if (comparable) {
+          const bound = deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS);
+          subjects = bound > 0 && !deadline.signal.aborted
+            ? await withTimeout(
+              readReflogSubjects(nowHead.root, (nowHead.reflog ?? 0) - (before.reflog ?? 0), {
+                signal: deadline.signal, timeoutMs: bound, lowPriority,
+              }),
+              bound,
+              "router_verify reflog",
+            ).catch(() => undefined)
+            : undefined;
+        }
+        // The reflog grew but its entries cannot be read: a checkout or reset cannot be ruled out (fail closed).
+        const unreadWindow = subjects === undefined && before.reflog !== undefined && nowHead.reflog !== undefined
+          && nowHead.reflog > before.reflog;
+        const move = unreadWindow
+          ? { kind: "rewritten" as const, detail: "the reflog entries could not be read" }
+          : treeMove(before, nowHead, subjects);
+        if (move !== undefined) branchSwitch = treeMoveReason(nowHead.root, before, nowHead, move, "since the producer returned");
+      }
+    }
     return {
       prepared: {
         changedFiles: changed === "unavailable"

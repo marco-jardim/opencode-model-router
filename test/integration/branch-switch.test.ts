@@ -12,12 +12,14 @@
  * and real tree snapshots that the test takes itself, without a time bound, and pins through the `src/verify/tree` mock seam.
  * Every case is deterministic: no retries.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import ModelRouterPlugin from "../../src/index";
+import * as gateModule from "../../src/verify/gate";
+import * as headModule from "../../src/verify/head";
 import { invalidateConfigCache } from "../../src/router/config";
 
 type Tree = Awaited<ReturnType<typeof import("../../src/verify/tree").snapshotTree>>;
@@ -198,11 +200,14 @@ describe("a branch switch of the verified working tree is never verified (I7, P0
       expect(await verify(hooks, handle)).toMatch(SINCE);
     }, 90_000);
 
-    it("a current tree that cannot be read at router_verify cannot confirm the recorded branch", async () => {
+    it("an absent full snapshot with a readable HEAD on the same branch does not say \"cannot confirm\" at router_verify", async () => {
+      // The branch is decided from the cheap head state (git, not mocked here); the pinned snapshot seam only removes the full tree.
       const { hooks, out, handle } = await deferredRun();
       expect(handle, out).toBeDefined();
       pinned.absent = true;
-      expect(await verify(hooks, handle)).toMatch(UNCONFIRMED);
+      const verdict = await verify(hooks, handle);
+      expect(verdict).not.toMatch(UNCONFIRMED);
+      expect(verdict).not.toMatch(ANY_BRANCH_REASON);
     }, 90_000);
 
     it("no switch: router_verify gives no branch reason (control)", async () => {
@@ -211,4 +216,118 @@ describe("a branch switch of the verified working tree is never verified (I7, P0
       expect(await verify(hooks, handle)).not.toMatch(ANY_BRANCH_REASON);
     }, 90_000);
   });
+});
+
+/**
+ * Commit 7c757ae: a switch is decided from the head state (src/verify/head.ts, real git on the temporary repository, not mocked),
+ * before the commit diff, and kept even when the dispatch snapshot is unavailable. gateModule.accept and headModule.readHeadState
+ * are spied (calling through) to see the artefact the gate got and to fail one precise head read.
+ */
+describe("a branch switch is decided from the head state, before the commit diff (7c757ae)", () => {
+  type Artefact = Parameters<typeof gateModule.accept>[1];
+  let acceptSpy: MockInstance<typeof gateModule.accept>;
+
+  beforeEach(() => {
+    acceptSpy = vi.spyOn(gateModule, "accept");
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const artefacts = (): Artefact[] => acceptSpy.mock.calls.map(call => call[1]);
+  const commit = (file: string): void => {
+    fs.writeFileSync(path.join(repo, file), `export const x = "${file}";\n`);
+    git("add", file);
+    git("commit", "-q", "-m", `add ${file}`);
+  };
+  /** `git checkout -b feat`, a commit there, then back: the branch name is the same at both ends. */
+  const roundTrip = (): void => {
+    git("checkout", "-q", "-b", "feat");
+    commit("feat.ts");
+    git("checkout", "-q", "-");
+  };
+
+  describe.each(["task", "delegate"] as const)("synchronous gate, %s path", dispatch => {
+    /** `snapshotAbsent`: the dispatch-time snapshot resolves undefined (the gate-time one is the real, pinned tree). */
+    async function run(after: () => void, snapshotAbsent = false): Promise<string> {
+      const during = snapshotAbsent
+        ? (): void => {
+          pinned.absent = false;
+          after();
+        }
+        : after;
+      if (dispatch === "task") {
+        const hooks = await makePlugin(async () => undefined);
+        pinned.absent = snapshotAbsent;
+        return runTask(hooks, `Implement it.\n${SYNC_DOD}`, during);
+      }
+      const hooks = await makePlugin((h, sid) => produce(h, sid, during));
+      pinned.absent = snapshotAbsent;
+      return String(await hooks.tool.delegate.execute({ task: `Implement it.\n${SYNC_DOD}`, tier: "fast" }, { sessionID: "orch" }));
+    }
+
+    // B1
+    it("the dispatch snapshot unavailable and a checkout of another branch during the dispatch: unverifiable, from the head state", async () => {
+      expect(await run(checkout, true)).toMatch(DURING);
+    }, 60_000);
+
+    // B5
+    it("a round trip (checkout -b feat, commit, checkout back) during the dispatch: unverifiable, by the reflog", async () => {
+      const out = await run(roundTrip);
+      expect(out).toContain('reflog: "checkout:');
+      expect(out).not.toMatch(/verified: deterministic/);
+    }, 60_000);
+
+    it("commits on the same branch during the dispatch are not refused for a branch reason, and are in the change set", async () => {
+      const out = await run(() => commit("committed.ts"));
+      expect(out).not.toMatch(ANY_BRANCH_REASON);
+      expect(out).not.toContain("reflog:");
+      expect(out).toMatch(/verified: deterministic/);
+      expect(artefacts()).toHaveLength(1);
+      const artefact = artefacts()[0];
+      expect(artefact?.branchSwitch).toBeUndefined();
+      expect(artefact?.changeBaseline).toBe("available");
+      const files = artefact?.changedFiles.map(file => path.basename(file.path));
+      expect(files).toContain("committed.ts");
+      expect(files).toContain("index.ts");
+    }, 60_000);
+
+    // B8
+    it("on a switch the other branch's committed files are not in the change set the gate gets", async () => {
+      const out = await run(() => {
+        checkout();
+        commit("other-only.ts");
+      });
+      expect(out).toMatch(DURING);
+      expect(artefacts()).toHaveLength(1);
+      const artefact = artefacts()[0];
+      expect(artefact?.branchSwitch).toMatch(DURING);
+      expect(artefact?.changeBaseline).toBe("unavailable");
+      expect(artefact?.changedFiles.map(file => path.basename(file.path))).not.toContain("other-only.ts");
+    }, 60_000);
+  });
+
+  // B2
+  it("deferred: the gate's own head read fails after finishDeferred saw the switch: still unverifiable, with the finish's reason", async () => {
+    const actual = headModule.readHeadState;
+    // The observeChange reads carry timeoutMs (the dispatch-time read does not): the first is finishDeferred's, the second the gate's.
+    let observed = 0;
+    const headSpy = vi.spyOn(headModule, "readHeadState").mockImplementation(async (cwd, opts) => {
+      if (opts?.timeoutMs === undefined) return actual(cwd, opts);
+      observed += 1;
+      return observed === 2 ? undefined : actual(cwd, opts);
+    });
+    const hooks = await makePlugin(async () => undefined);
+    // The dispatch snapshot is unavailable too, so the snapshot comparison cannot supply the reason: only the finish's detail can.
+    pinned.absent = true;
+    const out = await runTask(hooks, `Implement it.\n${DEFERRED_DOD}`, () => {
+      pinned.absent = false;
+      checkout();
+    });
+    expect(headSpy.mock.calls.filter(([, opts]) => opts?.timeoutMs !== undefined)).toHaveLength(2);
+    expect(/vrf_[0-9a-f]{24}/.exec(out)?.[0], out).toBeUndefined();
+    expect(out).toMatch(DURING);
+    expect(artefacts()).toHaveLength(1);
+    expect(artefacts()[0]?.branchSwitch).toMatch(DURING);
+  }, 90_000);
 });

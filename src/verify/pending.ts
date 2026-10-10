@@ -500,6 +500,10 @@ export interface PendingRegistration {
 export interface ReturnedTree {
   readonly head: string;
   readonly branch?: string | null;
+  /** HeadState.root at return (realpath of the toplevel); absent on an entry registered without a head state. */
+  readonly root?: string;
+  /** HeadState.reflog at return: the HEAD reflog entry count; absent when it could not be counted. */
+  readonly reflog?: number;
 }
 
 /** What a verification of one handle produced (2.4.3 builds it from the gate result). */
