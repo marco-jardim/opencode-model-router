@@ -333,7 +333,8 @@ Everything else is work: resolve it, record it, continue.
 
 ## 7. Live state (§0.11 — keep current)
 
-**Next action:** start Phase 0.1 (pre-flight §0.9 + its own items; worktree `D:\git\omr-cpx-p01`).
+**Next action:** Phase 0.1 — finish pre-flight (smoke:keyless baseline running in `D:\git\omr-cpx-p01`), merge `cpx/main`
+(`9943abe` revert + amendment A-0.1-1) into `cpx/p01`, write `phase-0.1.md` `## Pre-flight`, then dispatch 0.1.0.
 
 **Orchestrator session:** `ses_ed82f88a7ffej5iKaRHuwIa6fd` (directory `D:\git\omr-cpx-main`).
 
@@ -345,7 +346,7 @@ implementation's worktree `D:\git\opencode-model-router-cross-repo` (branch `fea
 | Phase | State | QA round | Notes |
 |---|---|---|---|
 | 0.P | **done** 2026-10-10 ≈20:45 | 3 (r1: 14, r2: 9, r3: 1 — all fixed or dispositioned; 7 minor/nit deferred to the DF-1 pre-flight) | started 18:55; `preflight.md` verdict: done |
-| 0.1 | waiting | — | |
+| 0.1 | running (pre-flight) | — | started 20:37; worktree `D:\git\omr-cpx-p01`, base tag `cpx/p01-base` = `584e0cf` |
 | 1.1 · 1.2 · 1.3 · 1.4 | waiting | — | |
 | 2.1 | waiting | — | |
 | DF-1 | waiting | — | |
@@ -379,7 +380,9 @@ The DF-0 run-scoped self-check (marker `omr-selfcheck-7f3a91c2d4`, server execut
   Not set at user scope (removed by QA-0.P-8); set in the launch command and per orchestrator shell run.
 - **Every orchestrator smoke shell** first runs `Remove-Item Env:OPENCODE_CONFIG_DIR -ErrorAction SilentlyContinue`
   (QA-0.P-17: the plan's host exports it; OpenCode 1.18.35 merges it additively, so a smoke host would load the
-  dogfood router as a second router). The deferred-catalog smoke host now strips `OPENCODE_*` itself (`46dac26`).
+  dogfood router as a second router). This per-shell removal is the only mitigation: the harness fix `46dac26` was
+  reverted (`9943abe`) because `test\smoke\deferred-catalog.smoke.test.ts` is v1-frozen (scenario `6-v1-untouched` of
+  `test\smoke\routing-engine.smoke.test.ts` pins it to `bd1ecd1`).
 - OpenCode 1.x: `C:\Users\Marquinho\scoop\apps\opencode\1.18.35\opencode.exe`. Every v1-host smoke (`smoke:v1`,
   `smoke:keyless`) runs with `C:\Users\Marquinho\scoop\apps\opencode\1.18.35` prepended to `PATH` (QA-0.P-7).
 - Scoped test workers: `--maxWorkers=14` (16 cores).
@@ -444,7 +447,11 @@ pre-flight, listed in `preflight.md` "Deferred findings").
    build; the 2.1.5.f line is supporting evidence only.
 3. QA-0.P-10/-20 — plan §0.4: the pre-dispatch guard works on normalized paths with one scope list.
 4. QA-0.P-15 — DF-2 pre-flight: owner notice before writing the executor keys to the global override.
-5. Recorded deviations (QA-0.P-5): (a) `7e6903f` and `46dac26` wrote test files outside 0.P's write set — pre-flight
+5. A-0.1-1 (Phase 0.1 pre-flight) — Phases 0.1 and 6.1 write `test\smoke\helpers\cpx-scripted-provider.ts` and its
+   test (new) instead of the v1-frozen `scripted-provider.ts` / `scripted-provider.test.ts` (pinned to `V1_BASE_COMMIT`
+   `bd1ecd1` by scenario `6-v1-untouched`); `smoke:cpx` also runs the new unit tests. The same pin made `46dac26` a v1
+   regression; reverted in `9943abe`.
+6. Recorded deviations (QA-0.P-5): (a) `7e6903f` and `46dac26` wrote test files outside 0.P's write set — pre-flight
    fixes under §0.7 ("fix everything it finds"), done in `cpx/main` while no phase was in flight; `v2-hooks.test.ts`'s
    owning phases (1.2, 2.1, 3.1) inherit the first; `deferred-catalog.smoke.test.ts` is owned by no phase. (b) 0.P.2,
    0.P.4 and the first implementer dispatch ran before the 0.P.6 restart (order 0.P.1 → 0.P.3 → 0.P.6 → 0.P.2 →
@@ -466,5 +473,5 @@ were last registered (at plugin start, or at a refresh after a config change) is
 **Pre-existing findings:** PF-1 `npm audit` critical ×2 (`seroval` via the devDependency `solid-js@1.9.15`, pinned to the
 host typings) — reported to the owner, out of plan scope. PF-2 ROLES.md registration wording (handoff above). PF-3
 `D:\git\omr-cpx-main\test\smoke\deferred-catalog.smoke.test.ts` leaked `OPENCODE_*` into its host — fixed in `46dac26`
-(QA-0.P-17). `test\setup\smoke-tmp-guard.ts` `keyedSmokeEnv` also passes the environment through (keyed smokes use the
+(QA-0.P-17), then reverted in `9943abe` (v1-frozen file); the leak stays mitigated per shell. `test\setup\smoke-tmp-guard.ts` `keyedSmokeEnv` also passes the environment through (keyed smokes use the
 real config on purpose); covered by the per-shell `OPENCODE_CONFIG_DIR` removal.

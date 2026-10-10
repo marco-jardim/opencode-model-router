@@ -680,7 +680,7 @@ orchestrator.
 | Phase | Owns (writes); *(new)* = created by the phase |
 |---|---|
 | orchestrator | `D:\git\omr-cpx-main\CHANGELOG.md` (only in `D:\git\omr-cpx-main`); `D:\git\omr-cpx-main\docs\plans\critical-path-execution-plan.md` (copy in `cpx/main`, amendments); `D:\git\omr-cpx-main\docs\plans\critical-path-execution-handover.md` *(new)*; `D:\git\omr-cpx-main\docs\plans\README.md` (0.P entry: links only the plan and the handover); `D:\git\omr-cpx-main\src\executor\types.ts` (ADR amendments only, in `D:\git\omr-cpx-main`); `D:\git\omr-cpx-main\docs\adr\0007-critical-path-execution.md` (amendments, in `D:\git\omr-cpx-main`; none during the DF-2 freeze); `D:\git\omr-cpx-main\docs\qa\critical-path-execution\dogfood.md` *(new)*; every phase report; the dogfood worktrees `D:\git\omr-cpx-dogfood-df<n>` and the plugin entry of the OpenCode config (§0.12); merges and tags |
-| 0.1 | `D:\git\omr-cpx-main\test\smoke\cpx-host-contract.smoke.test.ts` *(new)*, `D:\git\omr-cpx-main\test\smoke\probe\cpx-probe-plugin.js` *(new)*, `D:\git\omr-cpx-main\test\smoke\helpers\routing-host.ts`, `D:\git\omr-cpx-main\test\smoke\helpers\scripted-provider.ts`, `D:\git\omr-cpx-main\test\smoke\helpers\scripted-provider.test.ts`, `D:\git\omr-cpx-main\package.json`, `D:\git\omr-cpx-main\docs\adr\0007-critical-path-execution.md` *(new)* |
+| 0.1 | `D:\git\omr-cpx-main\test\smoke\cpx-host-contract.smoke.test.ts` *(new)*, `D:\git\omr-cpx-main\test\smoke\probe\cpx-probe-plugin.js` *(new)*, `D:\git\omr-cpx-main\test\smoke\helpers\routing-host.ts`, `D:\git\omr-cpx-main\test\smoke\helpers\cpx-scripted-provider.ts` *(new)*, `D:\git\omr-cpx-main\test\smoke\helpers\cpx-scripted-provider.test.ts` *(new)* (amendment A-0.1-1: the v1-frozen `scripted-provider.ts` and its test are read only), `D:\git\omr-cpx-main\package.json`, `D:\git\omr-cpx-main\docs\adr\0007-critical-path-execution.md` *(new)* |
 | 1.1 | `D:\git\omr-cpx-main\src\routing\outcomes\types.ts`, `D:\git\omr-cpx-main\src\routing\outcomes\persist.ts`, `D:\git\omr-cpx-main\src\routing\outcomes\timings.ts` *(new)*, `D:\git\omr-cpx-main\src\routing\outcomes\durations.ts` *(new)*, `D:\git\omr-cpx-main\src\routing\outcomes\stats.ts`, `D:\git\omr-cpx-main\src\routing\outcomes\index.ts`, `D:\git\omr-cpx-main\src\routing\commands\stats.ts`, the existing tests of `D:\git\omr-cpx-main\src\routing\commands\stats.ts` (listed in pre-flight), `D:\git\omr-cpx-main\scripts\routing-stats.ts`, `D:\git\omr-cpx-main\docs\ROUTING_ENGINE.md`, `D:\git\omr-cpx-main\test\integration\routing-advisor.test.ts`, `D:\git\omr-cpx-main\test\unit\outcomes-timings.test.ts` *(new)*, `D:\git\omr-cpx-main\test\unit\outcomes-durations.test.ts` *(new)*, `D:\git\omr-cpx-main\test\unit\outcomes-turns.test.ts` *(new)* |
 | 1.2 | `D:\git\omr-cpx-main\src\compat\turn-state.ts` *(new)*, `D:\git\omr-cpx-main\src\index.ts`, `D:\git\omr-cpx-main\src\routing\wire\hint.ts`, `D:\git\omr-cpx-main\src\compat\v2-hooks.ts`, `D:\git\omr-cpx-main\src\router\config.ts`, `D:\git\omr-cpx-main\docs\CONFIG_REFERENCE.md`, `D:\git\omr-cpx-main\docs\VERIFICATION.md`, `D:\git\omr-cpx-main\docs\OPENCODE_V2.md`, `D:\git\omr-cpx-main\test\unit\docs-drift.test.ts`, `D:\git\omr-cpx-main\test\golden\` (new v2 snapshots only), `D:\git\omr-cpx-main\test\unit\v2-hooks.test.ts`, `D:\git\omr-cpx-main\test\unit\turn-state.test.ts` *(new)*, `D:\git\omr-cpx-main\test\integration\v2-turn-state.test.ts` *(new)*, `D:\git\omr-cpx-main\test\smoke\cpx-cache-prefix.smoke.test.ts` *(new)* |
 | 1.3 | `D:\git\omr-cpx-main\src\router\leases.ts` *(new)*, `D:\git\omr-cpx-main\src\router\tool-paths.ts` *(new)*, `D:\git\omr-cpx-main\src\verify\dispatch.ts`, the existing tests of `D:\git\omr-cpx-main\src\verify\dispatch.ts` (listed in pre-flight), `D:\git\omr-cpx-main\test\unit\leases.test.ts` *(new)*, `D:\git\omr-cpx-main\test\unit\tool-paths.test.ts` *(new)* |
@@ -694,7 +694,7 @@ orchestrator.
 | 4.1 | `D:\git\omr-cpx-main\src\executor\tool.ts` *(new)*, `D:\git\omr-cpx-main\src\executor\command.ts` *(new)*, `D:\git\omr-cpx-main\src\router\config.ts`, `D:\git\omr-cpx-main\src\commands\output.ts`, `D:\git\omr-cpx-main\docs\CONFIG_REFERENCE.md`, `D:\git\omr-cpx-main\docs\EXECUTOR.md` *(new)*, `D:\git\omr-cpx-main\docs\OPENCODE_V2.md`, `D:\git\omr-cpx-main\test\unit\docs-drift.test.ts`, `D:\git\omr-cpx-main\src\executor\instructions.ts` *(new)*, `D:\git\omr-cpx-main\test\unit\executor-instructions.test.ts` *(new)*, the existing tests of `D:\git\omr-cpx-main\src\commands\output.ts` and of `D:\git\omr-cpx-main\src\router\config.ts` (listed in pre-flight), `D:\git\omr-cpx-main\test\unit\executor-tool.test.ts` *(new)*, `D:\git\omr-cpx-main\test\unit\executor-command.test.ts` *(new)*, `D:\git\omr-cpx-main\test\unit\config-executor.test.ts` *(new)* |
 | 4.2 | `D:\git\omr-cpx-main\src\executor\unattended.ts` *(new)*, `D:\git\omr-cpx-main\src\executor\qa-loop.ts` *(new)*, `D:\git\omr-cpx-main\src\executor\recovery.ts` *(new)*, `D:\git\omr-cpx-main\src\executor\runtime.ts`, `D:\git\omr-cpx-main\src\compat\background.ts`, `D:\git\omr-cpx-main\test\unit\executor-unattended.test.ts` *(new)*, `D:\git\omr-cpx-main\test\unit\executor-qa-loop.test.ts` *(new)*, `D:\git\omr-cpx-main\test\unit\executor-recovery.test.ts` *(new)*, `D:\git\omr-cpx-main\test\integration\executor-recovery-restart.test.ts` *(new)* |
 | 5.1 | `D:\git\omr-cpx-main\src\executor\create.ts` *(new)*, `D:\git\omr-cpx-main\src\v2.ts`, `D:\git\omr-cpx-main\src\index.ts`, `D:\git\omr-cpx-main\src\router\role-agents.ts`, `D:\git\omr-cpx-main\docs\EXECUTOR.md`, `D:\git\omr-cpx-main\docs\ROLES.md`, `D:\git\omr-cpx-main\test\unit\docs-drift.test.ts`, `D:\git\omr-cpx-main\test\golden\` (new v1-map snapshot only), the existing tests of `D:\git\omr-cpx-main\src\v2.ts` and `D:\git\omr-cpx-main\src\router\role-agents.ts` (listed in pre-flight), `D:\git\omr-cpx-main\test\integration\v2-executor-assembly.test.ts` *(new)* |
-| 6.1 | `D:\git\omr-cpx-main\test\smoke\cpx-e2e.smoke.test.ts` *(new)*, `D:\git\omr-cpx-main\test\fixtures\cpx\e2e\` *(new)*, `D:\git\omr-cpx-main\test\smoke\helpers\scripted-provider.ts`, `D:\git\omr-cpx-main\test\smoke\helpers\scripted-provider.test.ts`, `D:\git\omr-cpx-main\docs\EXECUTOR.md`, `D:\git\omr-cpx-main\README.md`, `D:\git\omr-cpx-main\docs\OPENCODE_V2.md`, `D:\git\omr-cpx-main\docs\ROLES.md`, `D:\git\omr-cpx-main\docs\adr\0007-critical-path-execution.md`, `D:\git\omr-cpx-main\docs\plans\README.md`, `D:\git\omr-cpx-main\test\unit\docs-drift.test.ts` |
+| 6.1 | `D:\git\omr-cpx-main\test\smoke\cpx-e2e.smoke.test.ts` *(new)*, `D:\git\omr-cpx-main\test\fixtures\cpx\e2e\` *(new)*, `D:\git\omr-cpx-main\test\smoke\helpers\cpx-scripted-provider.ts`, `D:\git\omr-cpx-main\test\smoke\helpers\cpx-scripted-provider.test.ts` (amendment A-0.1-1), `D:\git\omr-cpx-main\docs\EXECUTOR.md`, `D:\git\omr-cpx-main\README.md`, `D:\git\omr-cpx-main\docs\OPENCODE_V2.md`, `D:\git\omr-cpx-main\docs\ROLES.md`, `D:\git\omr-cpx-main\docs\adr\0007-critical-path-execution.md`, `D:\git\omr-cpx-main\docs\plans\README.md`, `D:\git\omr-cpx-main\test\unit\docs-drift.test.ts` |
 | 6.2 | `D:\git\omr-cpx-main\docs\EXECUTOR.md` and `D:\git\omr-cpx-main\docs\adr\0007-critical-path-execution.md` (6.2.0); any file named by a global QA finding; the orchestrator serializes fixes so each file has one writer at a time |
 
 ---
@@ -868,9 +868,16 @@ next action = "start Phase 0.1".
 - **0.1.0** [tier:medium] VERIFY:required Harness extensions.
   [route class=implement risk=medium scope=multi needs=edit,shell d=deterministic root=D:\git\omr-cpx-p01 tier=medium pin]
   Writes: `D:\git\omr-cpx-main\test\smoke\helpers\routing-host.ts`,
-  `D:\git\omr-cpx-main\test\smoke\helpers\scripted-provider.ts`,
-  `D:\git\omr-cpx-main\test\smoke\helpers\scripted-provider.test.ts`.
-  Reads: `D:\git\omr-cpx-main\test\smoke\probe\probe-plugin.js`, `D:\git\omr-cpx-main\test\smoke\v2-registration.smoke.test.ts`.
+  `D:\git\omr-cpx-main\test\smoke\helpers\cpx-scripted-provider.ts` *(new)*,
+  `D:\git\omr-cpx-main\test\smoke\helpers\cpx-scripted-provider.test.ts` *(new)*.
+  Reads: `D:\git\omr-cpx-main\test\smoke\helpers\scripted-provider.ts`, `D:\git\omr-cpx-main\test\smoke\v2-registration.smoke.test.ts`.
+  *Amendment A-0.1-1 (Phase 0.1 pre-flight):* `test\smoke\helpers\scripted-provider.ts`, its test, `fetch-safe-port.ts`,
+  the four v1 smoke files, `vitest.smoke.config.ts`, `test\setup\smoke-tmp-guard.ts` and `scripts\smoke-v1-preflight.mjs`
+  are pinned byte-identical to `V1_BASE_COMMIT` `bd1ecd1` by `D:\git\omr-cpx-main\test\smoke\routing-engine.smoke.test.ts`
+  scenario `6-v1-untouched` (v1 feature freeze). The 0.1.0.c/d additions therefore live in a new
+  `CpxScriptedProvider` (`cpx-scripted-provider.ts`) that reuses `ScriptedProvider` without changing it, and
+  `routing-host.ts` accepts it through a new option; the unit tests go to `cpx-scripted-provider.test.ts`, run with the
+  smoke config and by `smoke:cpx`.
   - 0.1.0.a `HostOptions.extraPlugins` (absolute paths, loaded after the router).
   - 0.1.0.b `RoutingHost.restart()`, which stops the host process and starts it again with the same root and XDG state.
   - 0.1.0.c Scripted provider additions:
@@ -878,7 +885,7 @@ next action = "start Phase 0.1".
     - a per-request delay;
     - cache usage fields (`cache_read_input_tokens`, `cache_creation_input_tokens`);
     - capture of every request body, readable by the test.
-  - 0.1.0.d Unit tests for each addition in `D:\git\omr-cpx-main\test\smoke\helpers\scripted-provider.test.ts`.
+  - 0.1.0.d Unit tests for each addition in `D:\git\omr-cpx-main\test\smoke\helpers\cpx-scripted-provider.test.ts`.
     `npm run smoke:keyless` stays green (orchestrator shell).
   - 0.1.0.e An `OMR_SMOKE_EVIDENCE_DIR` override in `D:\git\omr-cpx-main\test\smoke\helpers\routing-host.ts`.
     When it is set, evidence goes to that directory instead of the tracked evidence files. Unset, behavior is unchanged.
@@ -919,7 +926,8 @@ next action = "start Phase 0.1".
   Reads: `D:\git\omr-cpx-main\test\smoke\probe\cpx-probe-plugin.js`, `D:\git\omr-cpx-main\test\smoke\helpers\routing-host.ts`,
   `D:\git\omr-cpx-main\test\smoke\helpers\scripted-provider.ts`, `D:\git\omr-cpx-main\test\smoke\depth-effort.smoke.test.ts`.
   - 0.1.2.a Scripts:
-    - `"smoke:cpx": "cross-env RUN_OC_SMOKE_CPX=1 vitest run --config vitest.smoke.config.ts test/smoke/cpx-host-contract test/smoke/cpx-cache-prefix test/smoke/cpx-background"`;
+    - `"smoke:cpx": "cross-env RUN_OC_SMOKE_CPX=1 vitest run --config vitest.smoke.config.ts test/smoke/helpers/cpx-scripted-provider test/smoke/cpx-host-contract test/smoke/cpx-cache-prefix test/smoke/cpx-background"`
+      (A-0.1-1 adds the provider's unit tests);
     - `"smoke:cpx:provision": "cross-env RUN_OC_SMOKE_CPX=1 vitest run --config vitest.smoke.config.ts test/smoke/cpx-provision"`;
     - `"smoke:cpx:e2e": "cross-env RUN_OC_SMOKE_CPX=1 vitest run --config vitest.smoke.config.ts test/smoke/cpx-e2e"`.
   - 0.1.2.b Gate `const RUN = process.env.RUN_OC_SMOKE_CPX === "1"; const d = RUN ? describe : describe.skip;`. Fail hard
@@ -3900,7 +3908,8 @@ documentation. The dogfood comparison (§0.12-5) is written in 6.2.0.
 **Tasks**
 - **6.1.1** [tier:medium] VERIFY:required Scripted-provider additions, with unit tests.
   [route class=implement risk=medium scope=multi needs=edit,shell d=deterministic root=D:\git\omr-cpx-p61 tier=medium pin]
-  Writes: `D:\git\omr-cpx-main\test\smoke\helpers\scripted-provider.ts`, `D:\git\omr-cpx-main\test\smoke\helpers\scripted-provider.test.ts`.
+  Writes: `D:\git\omr-cpx-main\test\smoke\helpers\cpx-scripted-provider.ts`, `D:\git\omr-cpx-main\test\smoke\helpers\cpx-scripted-provider.test.ts`
+  (amendment A-0.1-1: the v1-frozen `scripted-provider.ts` and its test stay byte-identical).
   Reads: the pre-flight list in `D:\git\omr-cpx-main\docs\qa\critical-path-execution\phase-6.1.md`.
   [acceptance]
   cwd: D:\git\omr-cpx-p61
