@@ -1761,14 +1761,20 @@ export async function registerV2Hooks(
       }
       const text = event.tool === "subagent" && structured && typeof structured === "object" && typeof structured.output === "string"
         ? structured.output : contentText(event.result.content);
-      // QA-P21-1-3: the plugin's signals and gate read the child from the legacy metadata; a role result names it there too when
-      // the host reports it only in the structured output (spike S1: `result.output.sessionID`). Tier calls: unchanged.
+      // QA-P21-1-3: the plugin's signals and gate read the child from the legacy metadata; a result names it there when the host
+      // reports it only in the structured output (spike S1: `result.output.sessionID`). A role call takes the child the role
+      // path resolved; a tier subagent call takes the structured output's non-empty string `sessionID`, as v1 always had it, so the
+      // child's tool-observed edits and unobservable-writer tally reach the producer lineage. Metadata that already names the
+      // child (`sessionID` or `sessionId`) is never overwritten; every other call's metadata passes through unchanged.
       const resultMetadata = event.result.metadata as Record<string, unknown> | undefined;
+      const structuredChild = event.tool === "subagent" && typeof structured?.sessionID === "string" && structured.sessionID !== ""
+        ? structured.sessionID : undefined;
+      const namedChild = role?.child != null ? role.child : structuredChild;
       const output = {
         title: "", output: text,
         metadata: {
           ...resultMetadata,
-          ...(role?.child != null && resultMetadata?.sessionID === undefined && resultMetadata?.sessionId === undefined ? { sessionID: role.child } : {}),
+          ...(namedChild !== undefined && resultMetadata?.sessionID === undefined && resultMetadata?.sessionId === undefined ? { sessionID: namedChild } : {}),
         },
       };
       await within(hookContext(event), async () => {

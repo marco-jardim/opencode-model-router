@@ -903,6 +903,35 @@ describe("OpenCode 2 hook adapter", () => {
     expect(event.result.output.output).toBe("native child result accepted");
   });
 
+  it("names the structured child in the legacy metadata of a tier subagent call", async () => {
+    const f = fixture(); const seen: any[] = [];
+    await f.start({ "tool.execute.after": async (_input: any, output: any) => { seen.push(output.metadata); } });
+    const event = { ...call, tool: "subagent", input: { agent: "fast" }, status: "completed", result: { output: { sessionID: "child", status: "completed", output: "native child result" } } };
+    await f.toolHooks["execute.after"](event);
+    expect(seen).toHaveLength(1);
+    expect(seen[0].sessionID).toBe("child");
+  });
+
+  it("keeps the child the host already reported in the legacy metadata of a tier call", async () => {
+    const f = fixture(); const seen: any[] = [];
+    await f.start({ "tool.execute.after": async (_input: any, output: any) => { seen.push(output.metadata); } });
+    const withId = { ...call, id: "call-a", tool: "subagent", input: { agent: "fast" }, status: "completed", result: { metadata: { sessionID: "meta-child" }, output: { sessionID: "child", status: "completed", output: "done" } } };
+    const withLower = { ...call, id: "call-b", tool: "subagent", input: { agent: "fast" }, status: "completed", result: { metadata: { sessionId: "meta-lower" }, output: { sessionID: "child", status: "completed", output: "done" } } };
+    await f.toolHooks["execute.after"](withId);
+    await f.toolHooks["execute.after"](withLower);
+    expect(seen[0]).toEqual({ sessionID: "meta-child" });
+    expect(seen[1]).toEqual({ sessionId: "meta-lower" });
+  });
+
+  it("adds no child to the legacy metadata when the structured output has none or is not a subagent call", async () => {
+    const f = fixture(); const seen: any[] = [];
+    await f.start({ "tool.execute.after": async (_input: any, output: any) => { seen.push(output.metadata); } });
+    await f.toolHooks["execute.after"]({ ...call, id: "call-c", tool: "subagent", input: { agent: "fast" }, status: "completed", result: { output: { sessionID: "", status: "completed", output: "x" } } });
+    await f.toolHooks["execute.after"]({ ...call, id: "call-d", tool: "read", input: { path: "a.ts" }, status: "completed", result: { content: "x", output: { sessionID: "child" } } });
+    expect(seen[0]).toEqual({});
+    expect(seen[1]).toEqual({});
+  });
+
   it("preserves returned source text while translating an appended router notice", async () => {
     const f = fixture();
     const source = 'const task_id = "Task(subagent_type=fast)";';
