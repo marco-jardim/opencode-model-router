@@ -106,6 +106,9 @@ import {
 } from "../../src/routing/wire/dispatch";
 import { createEngineRuntime } from "../../src/routing/wire/runtime";
 import { resolveRoles } from "../../src/router/roles";
+import type { AuthorityAction } from "../../src/router/roles";
+import { createRepoProbe, readSetPredicate } from "../../src/routing/roles/read-set";
+import { addToWorkingSet, forgetWorkingSet } from "../../src/routing/wire/working-set";
 
 // Each adapter test starts the real plugin (several seconds on a loaded machine): above vitest's 5 s default.
 vi.setConfig({ testTimeout: 60_000 });
@@ -480,6 +483,67 @@ describe("enforcement helpers (T2.3.1, T2.3.2)", () => {
     expect(decide(egress, "webfetch")).toBe(true);
     expect(decide(egress, "read", [join(root, "a.ts")])).toBe(false);
   });
+
+  it("cross-repo P1.5: the read set R admits reads, search roots and (with a read action) external_directory; an edit outside W names where it lands", () => {
+    const base = temp("omr-p15-");
+    const w = join(base, "app-a-login");
+    const main = join(base, "app-a");
+    const lib = join(base, "lib-b");
+    const notes = join(base, "notes");
+    for (const dir of [w, main, lib, notes]) mkdirSync(dir);
+    const slash = (p: string) => p.replaceAll("\\", "/");
+    const entry = (path: string, branch: string) => ({ path: slash(path), head: "0", branch, detached: false, bare: false, prunable: false });
+    const location = { repository: main, name: "app-a", worktree: w, branch: "feat/login", head: "1", worktrees: [entry(main, "main"), entry(w, "feat/login")] };
+    const inReadSet = (target: string) => (insideWorkRoot(target, lib) ? { repository: lib, name: "lib-b", branch: "main" }
+      : insideWorkRoot(target, main) ? { repository: main, name: "app-a", branch: "main" } : undefined);
+    type Bound = Parameters<typeof roleAuthorityDecision>[0]["binding"];
+    const exact = (actions: readonly AuthorityAction[], withLocation = true): Bound => (
+      { kind: "exact", grant: { actions: new Set(actions), notes: [], workRoot: w, ...(withLocation ? { location } : {}) } });
+    const decide = (binding: Bound, action: string, paths: string[], withSet = true) => roleAuthorityDecision({
+      action, paths, binding, dynamic: false, sessionDirectory: w, fallbackRoot: w, ...(withSet ? { inReadSet } : {}),
+    });
+    const outside = (action: string, path: string) => ({ allow: false, reason: `${action}: ${path} is outside this dispatch's work root ${w} (use an absolute path inside it)` });
+    const reader = exact(["read", "glob", "grep", "router_git", "edit"]);
+    const libFile = join(lib, "src", "index.ts");
+    const notesFile = join(notes, "a.md");
+    // read / glob / grep: W or R
+    expect(decide(reader, "read", [join(w, "a.ts")])).toEqual({ allow: true });
+    expect(decide(reader, "read", [libFile])).toEqual({ allow: true });
+    expect(decide(reader, "read", [join(main, "a.ts")])).toEqual({ allow: true });
+    expect(decide(reader, "glob", [lib])).toEqual({ allow: true });
+    expect(decide(reader, "grep", [join(lib, "src")])).toEqual({ allow: true });
+    expect(decide(reader, "read", [notesFile])).toEqual(outside("read", notesFile));
+    expect(decide(reader, "glob", [notes])).toEqual(outside("glob", notes));
+    // external_directory: R only for a grant with a local read action (router_git alone keeps W only)
+    expect(decide(reader, "external_directory", [`${slash(lib)}/src/*`])).toEqual({ allow: true });
+    expect(decide(exact(["router_git"]), "external_directory", [`${slash(w)}/*`])).toEqual({ allow: true });
+    expect(decide(exact(["router_git"]), "external_directory", [`${slash(lib)}/*`]))
+      .toEqual({ allow: false, reason: `external_directory: ${slash(lib)}/* is outside this dispatch's work root ${w}` });
+    expect(decide(reader, "external_directory", [`${slash(notes)}/*`]))
+      .toEqual({ allow: false, reason: `external_directory: ${slash(notes)}/* is outside this dispatch's work root ${w}` });
+    // edit: W only; outside it the refusal names the location and the fix
+    expect(decide(reader, "edit", [join(w, "src", "auth.ts")])).toEqual({ allow: true });
+    expect(decide(reader, "edit", [libFile])).toEqual({ allow: false, reason: `edit: ${libFile} is in repository lib-b (branch main), which this dispatch may read `
+      + "but not edit. Finish the app-a part and return NEED MORE: naming the lib-b change; it needs a dispatch with repo=lib-b." });
+    const mainFile = join(main, "src", "auth.ts");
+    expect(decide(reader, "edit", [mainFile])).toEqual({ allow: false, reason: `edit: ${mainFile} is in worktree ${main} (repository app-a, branch main); this `
+      + `dispatch edits only in ${w} (branch feat/login). The same file in your work root is ${join(w, "src", "auth.ts")}.` });
+    expect(decide(reader, "edit", [notesFile])).toEqual(outside("edit", notesFile));
+    // No read set (no repoParents, no working set): every decision and text as before
+    const plain = exact(["read", "glob", "grep", "router_git", "edit"], false);
+    expect(decide(plain, "read", [libFile], false)).toEqual(outside("read", libFile));
+    expect(decide(plain, "glob", [lib], false)).toEqual(outside("glob", lib));
+    expect(decide(plain, "edit", [mainFile], false)).toEqual(outside("edit", mainFile));
+    expect(decide(plain, "edit", [libFile], false)).toEqual(outside("edit", libFile));
+    expect(decide(plain, "external_directory", [`${slash(lib)}/*`], false))
+      .toEqual({ allow: false, reason: `external_directory: ${slash(lib)}/* is outside this dispatch's work root ${w}` });
+    // I9: an unknown binding or a grant without a work root never reads R
+    const unknown: Bound = { kind: "unknown", grant: { actions: new Set(["read", "glob", "grep", "router_git"] as const), notes: [], workRoot: null } };
+    expect(decide(unknown, "read", [libFile]).allow).toBe(false);
+    expect(decide(unknown, "external_directory", [`${slash(lib)}/*`]).allow).toBe(false);
+    const noRoot: Bound = { kind: "exact", grant: { actions: new Set(["read"] as const), notes: [], workRoot: null } };
+    expect(decide(noRoot, "read", [libFile]).allow).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -827,6 +891,96 @@ describe("work roots (I3, P-13): the dispatch's own worktree only", () => {
     const replaced = await evaluate(v2, "x2", "explorer", "external_directory", [`${slash(wt2)}/*`]);
     expect(replaced.effect).toBe("deny");
     expect(replaced.message).toMatch(/no longer a worktree/);
+  }, 60_000);
+
+  it.skipIf(!hasGit())("cross-repo P1.5: the read-set predicate (sync, real git) finds a repository below routing.repoParents; a plain directory is not in R", () => {
+    const parent = temp("omr-p15-parent-");
+    const lib = join(parent, "lib-b");
+    mkdirSync(join(lib, "src"), { recursive: true });
+    git(["init", "-q", "-b", "trunk"], lib);
+    git(["commit", "-q", "--allow-empty", "-m", "init"], lib);
+    git(["worktree", "add", "-q", "-b", "feat/x", join(parent, "lib-b-x")], lib);
+    const notes = join(parent, "notes");
+    mkdirSync(notes);
+    const config = { parents: [parent], depth: 2, exclude: [] as string[] };
+    const inR = readSetPredicate(config, [], createRepoProbe())!;
+    expect(inR).toBeTypeOf("function");
+    const libRepo = { repository: lib, name: "lib-b", branch: "trunk" };
+    expect(inR(join(lib, "src", "index.ts"))).toEqual(libRepo);
+    expect(inR(lib)).toEqual(libRepo);
+    expect(inR(join(lib, "src", "deep", "er", "x.ts"))).toEqual(libRepo); // any depth below the repository top
+    // a linked worktree: its `.git` file → gitdir → HEAD
+    expect(inR(join(parent, "lib-b-x", "a.ts"))).toEqual({ repository: join(parent, "lib-b-x"), name: "lib-b-x", branch: "feat/x" });
+    expect(inR(join(notes, "a.md"))).toBeUndefined();
+    expect(inR(parent)).toBeUndefined();
+    expect(inR(join(dirname(parent), "elsewhere", "a.ts"))).toBeUndefined();
+    expect(readSetPredicate({ ...config, depth: 1 }, [], createRepoProbe())!(join(lib, "src", "x.ts"))).toEqual(libRepo);
+    expect(readSetPredicate({ ...config, exclude: [join(parent, "lib-*")] }, [], createRepoProbe())!(join(lib, "a.ts"))).toBeUndefined();
+    // I9: no parents and no working set → no predicate at all (nothing beyond W)
+    expect(readSetPredicate({ parents: [], depth: 2, exclude: [] }, [], createRepoProbe())).toBeUndefined();
+    // the orchestrator's working set: its worktrees are in R whatever lies around them
+    const bound = { repository: lib, name: "lib-b", worktree: notes, branch: "b", head: null, worktrees: [] };
+    expect(readSetPredicate({ parents: [], depth: 2, exclude: [] }, [bound], createRepoProbe())!(join(notes, "a.md")))
+      .toEqual({ repository: lib, name: "lib-b", branch: "b" });
+  });
+
+  it.skipIf(!hasGit())("cross-repo P1.5 / D13 (I18): reads in R pass; a host ask for external_directory inside W or R is lifted to allow for an exact binding only", async () => {
+    const base = temp("omr-p15-repo-");
+    const main = join(base, "main");
+    mkdirSync(main);
+    git(["init", "-q"], main);
+    writeFileSync(join(main, "a.ts"), "export const a = 1;\n");
+    git(["add", "a.ts"], main);
+    git(["commit", "-q", "-m", "init"], main);
+    git(["worktree", "add", "-q", "-b", "b1", join(base, "wt-1")], main);
+    const wt1 = realpathSync.native(join(base, "wt-1"));
+    const lib = join(base, "lib-b");
+    mkdirSync(lib);
+    git(["init", "-q"], lib);
+    const other = join(base, "other");
+    mkdirSync(other);
+    const away = temp("omr-p15-away-"); // a working-set worktree outside every parent
+    const slash = (p: string) => p.replaceAll("\\", "/");
+    // routing.repoParents = base: the role agents get `<base>/*` (P1.6) and lib-b, a repository below base, is in R.
+    const { cfg } = home({ routing: { delegation: "roles", repoParents: [base] } });
+    const hooks = await plugin(main);
+    const sessions: Sessions = {};
+    const v2 = host(main, cfg, sessions, [{ action: "external_directory", resource: `${slash(wt1)}/secret/*`, effect: "deny" }]);
+    await v2.start(hooks, { listWorktrees: gitWorktreeList });
+    await dispatch(v2, sessions, "e1", "x1", "explorer", `[route class=search risk=low scope=single root=${wt1}]\nfind the parser`, main);
+    expect(routedRoleOf("e1")?.workRoot).toBe(wt1);
+    expect(await catalog(v2, "x1", "explorer")).toContain("read");
+    addToWorkingSet("root", { repository: away, name: "away", worktree: away, branch: "main", head: null, worktrees: [] });
+    try {
+      const ext = (path: string, effect = "ask", session = "x1") => evaluate(v2, session, "explorer", "external_directory", [`${slash(path)}/*`], effect);
+      expect((await ext(wt1)).effect).toBe("allow"); // inside W
+      expect((await ext(join(wt1, "src"))).effect).toBe("allow");
+      const inR = await ext(lib); // inside R (a repository below routing.repoParents)
+      expect(inR.message).toBeUndefined();
+      expect(inR.effect).toBe("allow");
+      // In R through the working set, but outside every registered pattern: the role agent's own `"*": "deny"` is final (I18).
+      const unregistered = await ext(away);
+      expect(unregistered.effect).toBe("deny");
+      expect(unregistered.message).toBe("Permission denied by read-only agent explorer: external_directory");
+      const outside = await ext(other);
+      expect(outside.effect).toBe("deny"); // outside both: the existing narrowing
+      expect(outside.message).toMatch(/outside this dispatch's work root/);
+      expect((await ext(wt1, "deny")).effect).toBe("deny"); // a host deny is final
+      expect((await ext(join(wt1, "secret"))).effect).toBe("deny"); // a configured (static) deny is final
+      expect((await evaluate(v2, "x1", "explorer", "read", [join(wt1, "a.ts")], "ask")).effect).toBe("ask"); // never another action
+      // reads in R (evaluate and execute.before); outside R as before
+      expect((await evaluate(v2, "x1", "explorer", "read", [join(lib, "x.ts")])).effect).toBe("allow");
+      await toolCall(v2, "x1", "explorer", "grep", { pattern: "x", path: lib });
+      expect((await evaluate(v2, "x1", "explorer", "read", [join(other, "x.ts")])).effect).toBe("deny");
+      await expect(toolCall(v2, "x1", "explorer", "read", { path: join(other, "x.ts") })).rejects.toThrow(/outside this dispatch's work root/);
+      // an unknown binding is never lifted
+      sessions.lost = { id: "lost", parentID: "root", agent: "explorer", title: "no marker", location: { directory: main } };
+      const lost = await ext(wt1, "ask", "lost");
+      expect(lost.effect).toBe("deny");
+      expect(lost.message).toMatch(/binding unknown/);
+    } finally {
+      forgetWorkingSet("root");
+    }
   }, 60_000);
 
   // #84 P3.3 DF2-F1 (DF-2 step 4, live): an implementer dispatched with root=<sibling worktree> and `check: fileExists
