@@ -75,7 +75,8 @@ import {
 } from "./dispatch";
 import { runArgv, runShell } from "./exec";
 import { snapshotTree } from "./tree";
-import { branchSwitched, branchSwitchReason, branchUnconfirmedReason } from "./branch";
+import { branchSwitched, branchSwitchReason, branchUnconfirmedReason, treeMove, treeMoveReason } from "./branch";
+import { readHeadState, readReflogSubjects } from "./head";
 import { captureReference, DEFAULT_CAPTURE_TIMEOUT_MS, gcStaleReferences, nodeReferenceFs, type DispatchReference } from "./reference";
 import type { PluginLogger } from "../router/logger";
 import { REFERENCE_NONE } from "./baseline";
@@ -1346,6 +1347,8 @@ export function createVerificationWiring(deps: {
       // QA-3.1-8: the snapshot's git processes run at the configured priority, as the capture's do.
       snapshot: (at: string, signal: AbortSignal) =>
         sharedSnapshots(flightKey(at), shared => snapshotTree(at, shared, { lowPriority: budget.lowPriority }), signal),
+      // The branch-switch baseline: independent of the snapshot, so it survives a discarded or failed one.
+      headState: (at: string, signal: AbortSignal) => readHeadState(at, { signal, lowPriority: budget.lowPriority }),
       timeoutMs: budget.baselineTimeoutMs,
     };
     if (!judgedByTests) return { ...base, uncaptured: { kind: "none", reason: REFERENCE_NONE.notRequested } };
@@ -1463,6 +1466,7 @@ export function createVerificationWiring(deps: {
       // QA-3.1-8), and no reference.
       deps = {
         snapshot: (at, signal) => snapshotTree(at, signal, { lowPriority: true }),
+        headState: (at, signal) => readHeadState(at, { signal, lowPriority: true }),
         timeoutMs: DEFAULT_CAPTURE_TIMEOUT_MS,
         uncaptured: { kind: "none", reason: `${REFERENCE_NONE.failed} (${errorText(err)})` },
       };
@@ -1523,13 +1527,52 @@ export function createVerificationWiring(deps: {
       controller.abort();
     }
     const before = store.baselineSnapshot(id);
-    const committed = await committedSinceDispatch(before, snapshot, deadline);
-    const contaminatedBy = store.snapshotContaminatedBy(id);
-    // I7 (P0.2, S9): the tree switched branch since the dispatch snapshot. The commit diff above would then be the other
-    // branch's net change, verified as the producer's. Either snapshot missing: today's handling (no change baseline).
-    const branchSwitch = before !== undefined && snapshot !== undefined && branchSwitched(before, snapshot)
+    // I7 (P0.2, S9): did the tree switch branch since the dispatch? Decided from the cheap head state, before the commit diff:
+    // a diff across branches would be the other branch's net change, verified as the producer's, and must never reach the store.
+    let headSwitch: string | undefined;
+    let headRead = false;
+    const baselineHead = store.baselineHead(id);
+    if (baselineHead !== undefined) {
+      const bound = deadline ? deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS) : GRADE_SNAPSHOT_TIMEOUT_MS;
+      if (bound > 0 && deadline?.signal.aborted !== true) {
+        const signalOpt = deadline ? { signal: deadline.signal } : {};
+        const startHead = await withTimeout(baselineHead, bound, "dispatch head").catch(() => undefined);
+        const nowHead = await withTimeout(
+          readHeadState(base, { ...signalOpt, timeoutMs: bound, lowPriority: configuredLowPriority() }),
+          bound,
+          "gate head",
+        ).catch(() => undefined);
+        if (nowHead !== undefined) {
+          headRead = true;
+          if (startHead === undefined) {
+            // The dispatch-time head is unknown (unreadable, timed out, or an unborn repository): fail closed.
+            headSwitch = `cannot confirm the branch of ${nowHead.root}: the working tree could not be read when the dispatch started, so the checks could verify another branch. Re-dispatch.`;
+          } else {
+            let subjects: string[] | undefined;
+            if (startHead.reflog !== undefined && nowHead.reflog !== undefined && nowHead.reflog >= startHead.reflog) {
+              subjects = await readReflogSubjects(nowHead.root, nowHead.reflog - startHead.reflog, {
+                ...signalOpt, timeoutMs: bound, lowPriority: configuredLowPriority(),
+              });
+            }
+            // The reflog grew but its entries cannot be read: a checkout or reset cannot be ruled out (fail closed).
+            const unreadWindow = subjects === undefined && startHead.reflog !== undefined && nowHead.reflog !== undefined
+              && nowHead.reflog > startHead.reflog;
+            const move = unreadWindow
+              ? { kind: "rewritten" as const, detail: "the reflog entries could not be read" }
+              : treeMove(startHead, nowHead, subjects);
+            if (move !== undefined) headSwitch = treeMoveReason(nowHead.root, startHead, nowHead, move, "during the dispatch");
+          }
+        }
+      }
+    }
+    // Head state unavailable at the gate (or no head reader for this dispatch): the snapshot comparison, when both exist.
+    const snapshotSwitch = !headRead && before !== undefined && snapshot !== undefined && branchSwitched(before, snapshot)
       ? branchSwitchReason(snapshot.root ?? base, before, snapshot, "during the dispatch")
       : undefined;
+    const branchSwitch = headSwitch ?? snapshotSwitch;
+    // B8: on a switch the commit diff is not run; "unavailable" keeps the whole change set unavailable (the gate refuses anyway).
+    const committed = branchSwitch !== undefined ? "unavailable" as const : await committedSinceDispatch(before, snapshot, deadline);
+    const contaminatedBy = store.snapshotContaminatedBy(id);
     return {
       ...store.delta(id, childID, snapshot, base, committed),
       snapshot,

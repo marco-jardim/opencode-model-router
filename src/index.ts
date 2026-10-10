@@ -1653,6 +1653,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 await disposeChildSession(producerSid);
                 return { sessionID: producerSid, text: producerText, deferredFooter: finish.footer };
               }
+              // B2: the finish saw the tree switch branch; the gate's own read below may not (it can fail), so the finish's
+              // reason is carried into the artefact.
+              const deferredSwitch = finish !== undefined && !finish.deferred && finish.reason === "branch-switched" ? finish.detail : undefined;
               // Once a delegation is gated, every later attempt of its ladder is gated too.
               if (finish !== undefined && dispatchStart !== undefined) {
                 dispatchStart = { ...dispatchStart, directives: { ...dispatchStart.directives, mode: "required" } };
@@ -1677,7 +1680,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 changedFiles: verification.changedFiles,
                 changeBaseline: verification.changeBaseline,
                 ...(verification.snapshot?.root !== undefined ? { changeRoot: verification.snapshot.root } : {}),
-                ...(verification.branchSwitch !== undefined ? { branchSwitch: verification.branchSwitch } : {}),
+                ...((verification.branchSwitch ?? deferredSwitch) !== undefined ? { branchSwitch: verification.branchSwitch ?? deferredSwitch } : {}),
                 ...(verification.unattributedWriters !== undefined && verification.unattributedWriters.length > 0
                   ? { unattributedWriters: verification.unattributedWriters } : {}),
                 finalReturnText: producerText,
@@ -2442,6 +2445,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               : false;
             // QA-2.4-10: `trivial` as the gate sees it below; a dispatch the gate would skip is not
             // deferred (isDeferred). QA-2.4-2: only a proven root orchestrator defers.
+            // B2: the reason a deferred finish refused for a branch switch, carried into the artefact below.
+            let deferredSwitch: string | undefined;
             if (!scope.outside && !carriedRole && isDeferred(dod, start.directives, trivial) && await isProvenRootCaller(orchestratorSessionID)) {
               // Section 1.5-16: no gate, no test process; the result goes back now with the
               // footer, which is appended last and never says accepted or verified.
@@ -2465,6 +2470,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 if (childSessionID) changedFileStore.clear(childSessionID);
                 return;
               }
+              if (finish.reason === "branch-switched") deferredSwitch = finish.detail;
               // QA-2.4-4 / QA-2.4-10: not deferred after all; today's required gate runs below.
             }
             // Same bound as the delegate gate: one deadline per invocation,
@@ -2490,7 +2496,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               changedFiles: verification.changedFiles,
               changeBaseline: verification.changeBaseline,
               ...(verification.snapshot?.root !== undefined ? { changeRoot: verification.snapshot.root } : {}),
-              ...(verification.branchSwitch !== undefined ? { branchSwitch: verification.branchSwitch } : {}),
+              ...((verification.branchSwitch ?? deferredSwitch) !== undefined ? { branchSwitch: verification.branchSwitch ?? deferredSwitch } : {}),
               ...(verification.unattributedWriters !== undefined && verification.unattributedWriters.length > 0
                 ? { unattributedWriters: verification.unattributedWriters } : {}),
               finalReturnText,

@@ -20,6 +20,7 @@ import type { DispatchReference } from "./reference";
 import { REFERENCE_NONE } from "./baseline";
 import { neutralizeDirectives } from "./pending";
 import { withTimeout } from "./timeout";
+import type { HeadState } from "./head";
 
 export interface TreeSnapshot {
   cwd: string;
@@ -59,7 +60,12 @@ export interface DispatchCaptureDeps {
   capture?: (cwd: string, signal: AbortSignal) => Promise<DispatchReference | undefined>;
   /** The reference when `capture` is absent. Default: none (REFERENCE_NONE.notRequested). */
   uncaptured?: ReferenceState;
-  /** Bounds the snapshot and the capture, each (baselineTimeoutMs). */
+  /**
+   * The cheap head-state read (src/verify/head.ts readHeadState) the branch-switch rule compares at the gate. Independent of
+   * the snapshot: a snapshot that failed, timed out or was discarded does not lose it. Absent: no head baseline.
+   */
+  headState?: (cwd: string, signal: AbortSignal) => Promise<HeadState | undefined>;
+  /** Bounds the snapshot, the head read and the capture, each (baselineTimeoutMs). */
   timeoutMs: number;
 }
 
@@ -227,6 +233,11 @@ interface DispatchRecord {
   /** QA-3.1-2: this dispatch's lifetime, for concurrentDispatches. */
   window: DispatchWindow;
   snapshot?: TreeSnapshot;
+  /**
+   * The head state read when the dispatch began (branch-switch baseline). Never discarded on contamination: a write does not
+   * change what HEAD was. Resolves undefined when the read failed or timed out; never rejects.
+   */
+  head?: Promise<HeadState | undefined>;
   capturePending: boolean;
   /** An overlapping edit was observed while the capture was in flight: the reference is none. */
   captureContaminated: boolean;
@@ -383,6 +394,19 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
         if (snapshot?.root !== undefined) window.root = snapshot.root;
         if (snapshot && !d.snapshotContaminated && dispatches.get(id) === d) d.snapshot = snapshot;
       })();
+      const readHead = deps.headState;
+      if (readHead !== undefined) {
+        d.head = (async (): Promise<HeadState | undefined> => {
+          const controller = new AbortController();
+          try {
+            return await withTimeout(readHead(cwd, controller.signal), deps.timeoutMs, "dispatch head");
+          } catch {
+            return undefined; // Unreadable at dispatch: the gate fails closed when the head is readable then.
+          } finally {
+            controller.abort();
+          }
+        })();
+      }
       const capture = deps.capture;
       if (capture !== undefined) {
         d.reference = (async (): Promise<ReferenceState> => {
@@ -401,7 +425,7 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
           return captured ? { kind: "captured", reference: captured } : none(REFERENCE_NONE.failed);
         })();
       }
-      d.settled = Promise.all([d.ready, d.reference]).then(() => undefined);
+      d.settled = Promise.all([d.ready, d.reference, d.head]).then(() => undefined);
       return d.settled;
     },
     observeEdit,
@@ -515,6 +539,10 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
     /** The dispatch-time snapshot (QA-2.1-2: the gate digests its listed paths); undefined until settled. */
     baselineSnapshot(id: string): TreeSnapshot | undefined {
       return dispatches.get(id)?.snapshot;
+    },
+    /** The head state read when the dispatch began; undefined when untracked or no head reader was given. */
+    baselineHead(id: string): Promise<HeadState | undefined> | undefined {
+      return dispatches.get(id)?.head;
     },
     /**
      * QA-3.1-2: how many other dispatches were live at some moment of this one's window so far and

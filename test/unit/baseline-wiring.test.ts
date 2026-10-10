@@ -88,7 +88,8 @@ const dod: DoD = { kind: "deterministic", source: "explicit", criteria: [], deli
 const REF: DispatchReference = { root: cwd, head: "HEAD", commit: "HEAD", untracked: new Map(), tracked: new Map(), captureReasons: [], capturedAt: 0 };
 beforeEach(() => Object.assign(state, {
   // Like snapshotTree, it digests its listed paths (QA-2.1-2).
-  snapshot: { cwd, head: "HEAD", fingerprint: "before", dirty: true, files: [{ path: resolve(cwd, "old.ts"), status: " M" }], digests: new Map([[resolve(cwd, "old.ts"), "file:old"]]) },
+  // A real snapshot always reads the branch (tree.ts: one rev-parse); an unknown branch with a moved head is a switch (I7).
+  snapshot: { cwd, head: "HEAD", branch: "main", fingerprint: "before", dirty: true, files: [{ path: resolve(cwd, "old.ts"), status: " M" }], digests: new Map([[resolve(cwd, "old.ts"), "file:old"]]) },
   commands: [], captures: [], captureResult: REF, held: false, finish: undefined,
   captureDelayMs: undefined, captureThrows: false, gcCalls: [], gcRejects: false,
   gcRemoved: [], gcArgv: false, snapshotImpl: undefined, argvImpl: undefined, execOpts: [], captureArgv: undefined, hookDeps: undefined, scopeDeps: undefined,
