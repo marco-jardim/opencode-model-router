@@ -602,7 +602,59 @@ describe("P3.3 global QA round 1: resumes keep the resumed dispatch's facts and 
       roleAttemptVerification("child-h", attemptOf(world, "A", "main", INHERITED), { carried: false });
       await resume(world, "child-h");
       const carried = roleAttemptVerification("child-h", attemptOf(world, "A", "main"), { carried: true });
-      expect(carried.branchSwitch).toBe(INHERITED);
+      expect(carried.branchSwitch).toBe(`in an earlier attempt of this acceptance: ${INHERITED}`);
+    });
+
+    it("B3: a switch found by a carried attempt is recorded and inherited by the next carried attempt, even back on the branch", async () => {
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+      await acceptanceChild(world, "child-b3");
+      roleAttemptVerification("child-b3", attemptOf(world, "A", "main"), { carried: false });
+      await resume(world, "child-b3");
+      // Carried attempt 2 finds a switch of its own.
+      expect(roleAttemptVerification("child-b3", attemptOf(world, "A", "other", SWITCH), { carried: true }).branchSwitch).toBe(SWITCH);
+      await resume(world, "child-b3");
+      // Carried attempt 3: no switch of its own, the tree is back on main.
+      const third = roleAttemptVerification("child-b3", attemptOf(world, "A", "main"), { carried: true });
+      expect(third.branchSwitch).toBeDefined();
+      expect(third.branchSwitch).toContain(SWITCH);
+    });
+
+    it("B9: a carried attempt with a recorded tree but no current snapshot cannot confirm the branch, and names the recorded root", async () => {
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+      await acceptanceChild(world, "child-b9");
+      roleAttemptVerification("child-b9", attemptOf(world, "A", "main"), { carried: false });
+      await resume(world, "child-b9");
+      const blind: RoleAttemptChanges = { ...attemptOf(world, "A", "main"), snapshot: undefined };
+      expect(roleAttemptVerification("child-b9", blind, { carried: true }).branchSwitch).toBe(
+        `cannot confirm the branch of ${world.main}: the working tree could not be read for this carried attempt, so the checks could verify another branch. Send a fresh [acceptance] block, or re-dispatch.`);
+    });
+
+    it("B11: an inherited switch reason carries the 'earlier attempt' prefix exactly once across carried attempts", async () => {
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+      await acceptanceChild(world, "child-b11");
+      const PREFIX = "in an earlier attempt of this acceptance: ";
+      roleAttemptVerification("child-b11", attemptOf(world, "A", "main", INHERITED), { carried: false });
+      await resume(world, "child-b11");
+      expect(roleAttemptVerification("child-b11", attemptOf(world, "A", "main"), { carried: true }).branchSwitch).toBe(`${PREFIX}${INHERITED}`);
+      await resume(world, "child-b11");
+      const second = roleAttemptVerification("child-b11", attemptOf(world, "A", "main"), { carried: true }).branchSwitch;
+      expect(second).toBe(`${PREFIX}${INHERITED}`);
+      expect(second!.split(PREFIX)).toHaveLength(2);
+      // A switch found by the carried attempt itself is returned unprefixed.
+      await acceptanceChild(world, "child-b11b");
+      roleAttemptVerification("child-b11b", attemptOf(world, "A", "main"), { carried: false });
+      await resume(world, "child-b11b");
+      expect(roleAttemptVerification("child-b11b", attemptOf(world, "A", "other", SWITCH), { carried: true }).branchSwitch).toBe(SWITCH);
+    });
+
+    it("control: carried attempts on the same branch with snapshots record no switch", async () => {
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+      await acceptanceChild(world, "child-ctl");
+      roleAttemptVerification("child-ctl", attemptOf(world, "A", "main"), { carried: false });
+      await resume(world, "child-ctl");
+      expect(roleAttemptVerification("child-ctl", attemptOf(world, "A", "main"), { carried: true }).branchSwitch).toBeUndefined();
+      await resume(world, "child-ctl");
+      expect(roleAttemptVerification("child-ctl", attemptOf(world, "B", "main"), { carried: true }).branchSwitch).toBeUndefined();
     });
 
     it("the unattributed writers of the introducing attempt are unioned into the carried attempts (P0.3)", async () => {

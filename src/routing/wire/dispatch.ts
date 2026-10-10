@@ -932,7 +932,7 @@ export function roleAttemptVerification<T extends RoleAttemptChanges>(childSessi
   const own: readonly ChangedFile[] | "unavailable" = prepared.changeBaseline === "available" ? prepared.changedFiles : "unavailable";
   const now = prepared.snapshot;
   if (!opts.carried) {
-    const tree = now === undefined ? {} : { tree: { head: now.head, ...(now.branch === undefined ? {} : { branch: now.branch }) } };
+    const tree = now === undefined ? {} : { tree: { head: now.head, ...(now.branch === undefined ? {} : { branch: now.branch }), root: now.root ?? now.cwd } };
     const switched = prepared.branchSwitch === undefined ? {} : { switched: prepared.branchSwitch };
     const ownWriters = unionWriters(undefined, prepared.unattributedWriters);
     const writers = ownWriters.length === 0 ? {} : { writers: ownWriters };
@@ -944,16 +944,26 @@ export function roleAttemptVerification<T extends RoleAttemptChanges>(childSessi
   const changed = unionChanges(baseline.changed, own);
   // I5 (P0.3): a write an earlier attempt made through a tool the router cannot observe is part of the carried change too.
   const lineageWriters = unionWriters(baseline.writers, prepared.unattributedWriters);
-  updateDispatchVerification(childSessionID, { ...verification, baseline: { reference: baseline.reference, changed,
-    ...(baseline.tree === undefined ? {} : { tree: baseline.tree }),
-    ...(baseline.switched === undefined ? {} : { switched: baseline.switched }),
-    ...(lineageWriters.length === 0 ? {} : { writers: lineageWriters }) } });
   // I7 across attempts. Precedence: a switch seen during this dispatch, then one inherited from an earlier attempt,
   // then a switch between the introducing attempt's tree and this one.
-  const lineageSwitch = prepared.branchSwitch !== undefined ? undefined
-    : baseline.switched !== undefined ? baseline.switched
+  const computedSwitch = prepared.branchSwitch !== undefined || baseline.switched !== undefined ? undefined
     : baseline.tree !== undefined && now !== undefined && branchSwitched(baseline.tree, now)
       ? branchSwitchReason(now.root ?? now.cwd, baseline.tree, now, "since the attempt that introduced this acceptance") : undefined;
+  // B3: the first switch the lineage finds is recorded, so every later carried attempt inherits it.
+  const recordedSwitch = baseline.switched ?? prepared.branchSwitch ?? computedSwitch;
+  updateDispatchVerification(childSessionID, { ...verification, baseline: { reference: baseline.reference, changed,
+    ...(baseline.tree === undefined ? {} : { tree: baseline.tree }),
+    ...(recordedSwitch === undefined ? {} : { switched: recordedSwitch }),
+    ...(lineageWriters.length === 0 ? {} : { writers: lineageWriters }) } });
+  const INHERITED_PREFIX = "in an earlier attempt of this acceptance: ";
+  // B11: a switch inherited from an earlier attempt says so (once); one found by this attempt is returned as it is.
+  const lineageSwitch = prepared.branchSwitch !== undefined ? undefined
+    : baseline.switched !== undefined ? (baseline.switched.startsWith(INHERITED_PREFIX) ? baseline.switched : `${INHERITED_PREFIX}${baseline.switched}`)
+    : computedSwitch !== undefined ? computedSwitch
+    // B9: a recorded branch but no current snapshot: this attempt cannot be confirmed to be on it.
+    : baseline.tree?.branch !== undefined && now === undefined
+      ? `cannot confirm the branch of ${baseline.tree.root ?? "the work root"}: the working tree could not be read for this carried attempt, so the checks could verify another branch. Send a fresh [acceptance] block, or re-dispatch.`
+      : undefined;
   return {
     ...prepared,
     changedFiles: changed === "unavailable" ? prepared.changedFiles : changed,
