@@ -1082,7 +1082,7 @@ export async function inspectGit(operation: GitOperation, input: GitInput, direc
  *   checkout rather than a sibling worktree (S11, P-10).
  * Any other answer, or a throwing resolver, is reported as a tool error; nothing is spawned.
  */
-export type WorkRootAnswer = { role: false } | { role: true; root: string | null };
+export type WorkRootAnswer = { role: false } | { role: true; root: string | null; repository?: string };
 /**
  * P1.3 injects, P2.1 wires it to the dispatch binding. Shared by router_git_* and
  * router_run (QA-P13-2-8); router_run refuses `{ role: false }` (it exists for role
@@ -1106,7 +1106,13 @@ export function checkWorkRootAnswer(answer: unknown): WorkRootAnswer {
     if (role === true && "root" in answer) {
       const { root } = answer as { root: unknown };
       if (root === null) return { role: true, root: null };
-      if (typeof root === "string" && isFullPath(root)) return { role: true, root };
+      if (typeof root === "string" && isFullPath(root)) {
+        // Cross-repo (P1.5): the binding's repository, when the dispatch recorded one, replaces the session directory's.
+        const { repository } = answer as { repository?: unknown };
+        if (repository === undefined) return { role: true, root };
+        if (typeof repository === "string" && isFullPath(repository)) return { role: true, root, repository };
+        throw new Error("Bound repository is not an absolute path");
+      }
       throw new Error("Bound work root is not an absolute path");
     }
   }
@@ -1136,9 +1142,11 @@ export function gitTools(opts: GitToolsOptions = {}) {
           const answer = checkWorkRootAnswer(opts.resolveWorkRoot(context.sessionID));
           if (answer.role) {
             if (answer.root === null) return "[router_git] error: refused: this role session has no bound work root (I9)";
+            // Cross-repo (P1.5): a binding's repository is the expected one; without it, the plugin's directory.
+            const expected = answer.repository ?? opts.dispatchRepository;
             return await inspectGit(operation, inputSchema.parse(input), answer.root, context.abort, {
               executables, guards: workRootGuards(answer.root),
-              role: opts.dispatchRepository ? { dispatchRepository: opts.dispatchRepository } : {},
+              role: expected ? { dispatchRepository: expected } : {},
             });
           }
         }

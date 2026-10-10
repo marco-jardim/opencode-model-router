@@ -569,7 +569,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     const answer = resolveWorkRoot(sessionID);
     if (!answer.role) return answer;
     const grant = currentBinding(sessionID, { maxOf: roleMaxOf })?.grant;
-    return grant !== undefined && grant.actions.has(action) ? answer : { role: true, root: null };
+    if (grant === undefined || !grant.actions.has(action)) return { role: true, root: null };
+    // Cross-repo (P1.5): a binding that carries its repository makes it the repository `router_git_*` expects.
+    const repository = grant.location?.repository;
+    return repository !== undefined && answer.root !== null ? { ...answer, repository } : answer;
   };
   /** What a routed role dispatch decided for its child's guard (QA-G-A3-3): the dispatched tier and the route line's `budget=`. */
   interface RoutedGuardInput { readonly agent: string; readonly tier: string; readonly routeBudget: number | null }
