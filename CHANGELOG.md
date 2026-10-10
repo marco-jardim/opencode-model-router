@@ -16,6 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking (requirement): Node.js 20 is no longer supported.** Node.js 20 reached end-of-life in April 2026; the
   minimum is now Node.js 22 (`engines.node` is `>=22`, and the CI matrix runs Node 22 and 24).
 
+### Fixed
+
+- **A change set that mixes paths inside and outside the observed repository is no longer verified as a pass on the
+  inside paths alone.** The runner dropped the outside paths with a note and ran the scoped checks on the rest, and a
+  grader, which checks against and runs in the working directory, could not inspect them. The gate now reports
+  `unverifiable` ("the producer also changed files outside `<root>`: …", at most five paths named) on both the
+  deterministic and the grader path, where `<root>` is the git top-level the change set was observed in (for a deferred
+  `router_verify`, the one recorded at registration), so edits in sibling packages of one monorepo are not flagged. Any absolute changed path outside the repository, for example a
+  scratch file in the temp directory written by a write tool, mixed with repository edits, now makes the result
+  unverifiable; there is no temp-directory exemption (fail closed). A relative path that climbs out of the root
+  (`../x.ts`) counts as outside. A change set that is entirely outside keeps its existing message.
+
 ## [2.6.1] - 2026-10-09
 
 ### Fixed

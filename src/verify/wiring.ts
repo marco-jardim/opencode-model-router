@@ -1876,6 +1876,7 @@ export function createVerificationWiring(deps: {
     const artefact = {
       changedFiles: prep.prepared.changedFiles,
       changeBaseline: prep.prepared.changeBaseline,
+      ...(prep.root !== undefined ? { changeRoot: prep.root } : {}),
       // Not stored (R3): a testsPass DoD is deterministic, and no deterministic check reads it.
       finalReturnText: "",
       declaredOutputs: dod.deliverable ? [dod.deliverable] : [],

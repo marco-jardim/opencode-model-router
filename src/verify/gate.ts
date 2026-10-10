@@ -25,12 +25,21 @@ import { runDeterministic } from "./deterministic";
 import { incompleteVerdict, isIncompleteVerdict, runChecker } from "./checker";
 import type { ArtefactView, CheckerDeps } from "./checker";
 import type { BudgetSnapshot } from "../guard/enforce";
-import { isAbsolute } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { isWithinDir, resolveBaseDir } from "./paths";
+
+/** How many outside paths the mixed-change-set reason names before "and N more". */
+const MAX_OUTSIDE_LISTED = 5;
 
 /** The concrete, inspectable result of a delegation (artefact contract §3.3). */
 export interface Artefact {
   changeBaseline?: "available" | "unavailable";
+  /**
+   * The git top-level the change set was observed in (snapshot.root). Paths outside it (absolute, or relative ones that climb
+   * out with `..`), mixed with paths inside, make the verdict unverifiable (S4/F3). Absent: the effective base directory stands
+   * in for it.
+   */
+  changeRoot?: string;
   changedFiles: { path: string; status: string }[];
   finalReturnText: string;
   declaredOutputs: string[];
@@ -250,6 +259,24 @@ export async function accept(
   // Backstop for a caller that did not check its cwd: lexical only (no filesystem call); a checked canonical cwd always passes.
   if (workRoot !== undefined && !isWithinDir(effectiveBaseDir, workRoot)) return refuseCwd(effectiveBaseDir);
   const canonical = deps.canonicalPath ?? ((path: string) => path);
+  // S4/F3: some changes inside the change root and some absolute ones outside it. Neither verifier can see the outside ones
+  // (the runner drops them with a note; the grader checks against, and runs in, the working directory), so the change set
+  // cannot be verified as a whole. A relative path is root-relative, hence inside unless it climbs out (`../x`). The root is
+  // the observed git top-level, else the base directory.
+  const refuseMixedOutside = (): GateResult | undefined => {
+    // No absolute path and no `..` segment: nothing can be outside, and no canonicalisation (a filesystem call) is needed.
+    if (!artefact.changedFiles.some(({ path }) => isAbsolute(path) || path.split(/[\\/]/).includes(".."))) return undefined;
+    const root = artefact.changeRoot ?? effectiveBaseDir;
+    const canonicalRoot = canonical(root);
+    const outsideRoot = artefact.changedFiles
+      .map(({ path }) => path)
+      .filter(path => !isWithinDir(canonical(isAbsolute(path) ? path : resolve(root, path)), canonicalRoot));
+    if (outsideRoot.length === 0 || outsideRoot.length === artefact.changedFiles.length) return undefined;
+    const listed = outsideRoot.slice(0, MAX_OUTSIDE_LISTED).join(", ")
+      + (outsideRoot.length > MAX_OUTSIDE_LISTED ? ` and ${outsideRoot.length - MAX_OUTSIDE_LISTED} more` : "");
+    const reason = `the producer also changed files outside ${root}: ${listed}; checks scoped to ${root} cannot see them, so the change set cannot be verified as a whole. Verify those paths in their own repository, or dispatch that work separately.`;
+    return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] }, dodSource, deps.strictUnverifiable);
+  };
 
   let verdict: Verdict;
   if (dod.kind === "deterministic") {
@@ -268,12 +295,16 @@ export async function accept(
       const reason = `the producer changed files only outside ${effectiveBaseDir} (e.g. ${artefact.changedFiles[0].path}); checks run there cannot see them. ${hint}`;
       return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] }, dodSource, deps.strictUnverifiable);
     }
+    const mixed = refuseMixedOutside();
+    if (mixed) return mixed;
     verdict = await runDeterministic(dod, {
       ...deps.deterministic,
       cwd: effectiveBaseDir,
     });
   } else {
     // "checker" is the only remaining checkable kind.
+    const mixed = refuseMixedOutside();
+    if (mixed) return mixed;
     verdict = await runChecker(
       {
         criteria: dod.criteria,

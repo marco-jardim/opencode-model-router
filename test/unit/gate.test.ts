@@ -126,15 +126,114 @@ describe("accept() — outside-directory safety net", () => {
   });
 
   it.each([
-    [join(base, "inside.ts"), join(outside, "outside.ts")],
     ["relative.ts"],
-    ["relative.ts", join(outside, "outside.ts")],
     [],
-  ])("runs checks unless all changes are absolute and outside: %j", async (...paths) => {
+  ])("runs checks when no change is absolute and outside: %j", async (...paths) => {
     const { exec, d, dod } = setup();
     const r = await accept({ dod }, changed(paths), d);
     expect(r.verdict.outcome).toBe("pass");
     expect(exec).toHaveBeenCalled();
+  });
+
+  // S4/F3: a mixed change set used to pass on the inside paths alone (the runner drops the outside ones with a note).
+  // A relative path is root-relative, so it counts as inside (unless it climbs out: see the `../` test below).
+  it.each([
+    [[join(base, "inside.ts"), join(outside, "outside.ts")], [join(outside, "outside.ts")]],
+    [["relative.ts", join(outside, "outside.ts")], [join(outside, "outside.ts")]],
+    [[join(base, "inside.ts"), join(outside, "a.ts"), join(outside, "b.ts")], [join(outside, "a.ts"), join(outside, "b.ts")]],
+  ])("a change set mixing inside and outside paths is unverifiable and runs nothing: %j", async (paths, outsidePaths) => {
+    const { exec, d, dod } = setup();
+    const reason = `the producer also changed files outside ${base}: ${outsidePaths.join(", ")}; checks scoped to ${base} cannot see them, so the change set cannot be verified as a whole. Verify those paths in their own repository, or dispatch that work separately.`;
+    const r = await accept({ dod }, changed(paths), d);
+    expect(r.verdict).toEqual({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] });
+    expect(r.accepted).toBe(true);
+    expect(exec).not.toHaveBeenCalled();
+    const strict = await accept({ dod }, changed(paths), { ...d, strictUnverifiable: true });
+    expect(strict.accepted).toBe(false);
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("names at most five outside paths, then 'and N more'", async () => {
+    const { exec, d, dod } = setup();
+    const many = Array.from({ length: 7 }, (_, i) => join(outside, `f${i}.ts`));
+    const r = await accept({ dod }, changed([join(base, "inside.ts"), ...many]), d);
+    const reason = `the producer also changed files outside ${base}: ${many.slice(0, 5).join(", ")} and 2 more; checks scoped to ${base} cannot see them, so the change set cannot be verified as a whole. Verify those paths in their own repository, or dispatch that work separately.`;
+    expect(r.verdict.reasons).toEqual([reason]);
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("a relative path that climbs out of the root is outside, not root-relative", async () => {
+    const { exec, d, dod } = setup();
+    const r = await accept({ dod }, changed(["inside.ts", join("..", "other", "x.ts")]), d);
+    expect(r.verdict.outcome).toBe("unverifiable");
+    expect(r.verdict.reasons.join("\n")).toContain(`also changed files outside ${base}: ${join("..", "other", "x.ts")}`);
+    expect(exec).not.toHaveBeenCalled();
+    // `..cache` is a child named like a climb, and a `..` that stays inside is inside.
+    const ok = await accept({ dod }, changed(["..cache/x.ts", join("sub", "..", "y.ts")]), d);
+    expect(ok.verdict.outcome).toBe("pass");
+  });
+
+  it("the grader path with only relative paths canonicalises nothing", async () => {
+    const { d } = setup();
+    const canonicalPath = vi.fn((path: string) => path);
+    const dispatchGrader = vi.fn<CheckerDeps["dispatchGrader"]>().mockResolvedValue({ sessionID: "grader", text: '{"pass":true,"reasons":[]}' });
+    const r = await accept({ dod: checkerDoD() }, changed(["a.ts", "b.ts"]), { ...d, canonicalPath, checker: { ...d.checker, dispatchGrader } });
+    expect(r.verdict.outcome).toBe("pass");
+    expect(canonicalPath).not.toHaveBeenCalled();
+  });
+
+  it("the grader path flags a mixed change set too and dispatches no grader", async () => {
+    const { d } = setup();
+    const dispatchGrader = vi.fn<CheckerDeps["dispatchGrader"]>().mockResolvedValue({ sessionID: "grader", text: '{"pass":true,"reasons":[]}' });
+    const r = await accept({ dod: checkerDoD(), cwd: base }, changed([join(base, "inside.ts"), join(outside, "outside.ts")]), { ...d, checker: { ...d.checker, dispatchGrader } });
+    expect(r.verdict.outcome).toBe("unverifiable");
+    expect(r.verdict.reasons.join("\n")).toContain(`also changed files outside ${base}: ${join(outside, "outside.ts")}`);
+    expect(dispatchGrader).not.toHaveBeenCalled();
+  });
+
+  describe("with the change root (git top-level) on the artefact", () => {
+    const mono = join(tmpdir(), "gate-mono");
+    const pkgA = join(mono, "packages", "a");
+    const pkgB = join(mono, "packages", "b");
+    const withRoot = (paths: string[], changeRoot: string | undefined = mono) =>
+      artefact({ changedFiles: paths.map(path => ({ path, status: "M" })), ...(changeRoot !== undefined ? { changeRoot } : {}) });
+    function monoSetup() {
+      const exec = vi.fn<DeterministicDeps["exec"]>().mockResolvedValue({ code: 0, stdout: "OK", stderr: "" });
+      const d = deps({ deterministic: { ...fakeDeterministicDeps(), cwd: pkgA, exec } });
+      const dod = normalizeDoD({ ...detDoD(), checks: [{ kind: "run", command: "node verify.js", expect: "OK" }] });
+      return { exec, d, dod };
+    }
+
+    it("edits in sibling packages of one repo are not flagged (cwd = packages/a)", async () => {
+      const { exec, d, dod } = monoSetup();
+      const r = await accept({ dod, cwd: pkgA }, withRoot([join(pkgA, "x.ts"), join(pkgB, "y.ts")]), d);
+      expect(r.verdict.outcome).toBe("pass");
+      expect(exec).toHaveBeenCalled();
+    });
+
+    it("the grader path does not flag sibling packages either", async () => {
+      const { d } = monoSetup();
+      const dispatchGrader = vi.fn<CheckerDeps["dispatchGrader"]>().mockResolvedValue({ sessionID: "grader", text: '{"pass":true,"reasons":[]}' });
+      const r = await accept({ dod: checkerDoD(), cwd: pkgA }, withRoot([join(pkgA, "x.ts"), join(pkgB, "y.ts")]), { ...d, checker: { ...d.checker, dispatchGrader } });
+      expect(r.verdict.outcome).toBe("pass");
+      expect(dispatchGrader).toHaveBeenCalled();
+    });
+
+    it.runIf(process.platform === "win32")("compares the change root case-insensitively on win32", async () => {
+      const { exec, d, dod } = monoSetup();
+      const r = await accept({ dod, cwd: pkgA }, withRoot([join(pkgA, "x.ts"), join(pkgB, "y.ts").toUpperCase()], mono.toLowerCase()), d);
+      expect(r.verdict.outcome).toBe("pass");
+      expect(exec).toHaveBeenCalled();
+    });
+
+    it("a path outside the change root is flagged against the root, naming the root", async () => {
+      const { exec, d, dod } = monoSetup();
+      const stray = join(tmpdir(), "gate-other-repo", "z.ts");
+      const r = await accept({ dod, cwd: pkgA }, withRoot([join(pkgA, "x.ts"), join(pkgB, "y.ts"), stray]), d);
+      expect(r.verdict.outcome).toBe("unverifiable");
+      expect(r.verdict.reasons.join("\n")).toContain(`also changed files outside ${mono}: ${stray}`);
+      expect(exec).not.toHaveBeenCalled();
+    });
   });
 
   it("treats a sibling-prefix directory as outside", async () => {

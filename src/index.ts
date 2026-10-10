@@ -1676,6 +1676,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               const artefact = {
                 changedFiles: verification.changedFiles,
                 changeBaseline: verification.changeBaseline,
+                ...(verification.snapshot?.root !== undefined ? { changeRoot: verification.snapshot.root } : {}),
                 finalReturnText: producerText,
                 declaredOutputs: dod.deliverable ? [dod.deliverable] : [],
                 producerSessionID: producerSid,
@@ -2477,6 +2478,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             const artefact = {
               changedFiles: verification.changedFiles,
               changeBaseline: verification.changeBaseline,
+              ...(verification.snapshot?.root !== undefined ? { changeRoot: verification.snapshot.root } : {}),
               finalReturnText,
               declaredOutputs: dod.deliverable ? [dod.deliverable] : [],
               producerSessionID: childSessionID ?? "",
