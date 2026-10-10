@@ -27,6 +27,7 @@ import type { ArtefactView, CheckerDeps } from "./checker";
 import type { BudgetSnapshot } from "../guard/enforce";
 import { isAbsolute, resolve } from "node:path";
 import { isWithinDir, resolveBaseDir } from "./paths";
+import { toolLabel } from "./dispatch";
 
 /** How many outside paths the mixed-change-set reason names before "and N more". */
 const MAX_OUTSIDE_LISTED = 5;
@@ -295,23 +296,36 @@ export async function accept(
     return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] }, dodSource, deps.strictUnverifiable);
   };
 
+  // Every change is outside the base directory (neither verifier can see any of them): an absolute path outside the canonical
+  // base, or a relative one that climbs out of it (`../x`, resolved against the base). Same refusal for both verifiers (C1).
+  const refuseAllOutside = (): GateResult | undefined => {
+    if (artefact.changedFiles.length === 0) return undefined;
+    // No absolute path and no `..` segment: nothing can be outside, and no canonicalisation (a filesystem call) is needed.
+    if (!artefact.changedFiles.some(({ path }) => isAbsolute(path) || path.split(/[\\/]/).includes(".."))) return undefined;
+    const canonicalBase = canonical(effectiveBaseDir);
+    const isOutside = (path: string): boolean => {
+      if (isAbsolute(path)) return !isWithinDir(canonical(path), canonicalBase);
+      // A relative path without a `..` segment cannot leave the base: no canonicalisation (a filesystem call) is needed.
+      if (!path.split(/[\\/]/).includes("..")) return false;
+      return !isWithinDir(canonical(resolve(effectiveBaseDir, path)), canonicalBase);
+    };
+    if (!artefact.changedFiles.every(({ path }) => isOutside(path))) return undefined;
+    // QA-P33F1-1 nit 1: a cwd: narrower than the work root, with work elsewhere in the root → widen (or drop) the cwd:.
+    const narrowed = workRoot !== undefined && !isWithinDir(canonical(workRoot), canonicalBase)
+      && artefact.changedFiles.some(({ path }) => isAbsolute(path) && isWithinDir(canonical(path), canonical(workRoot)));
+    const hint = workRoot === undefined
+      ? `Add "cwd: <dir>" to the [acceptance] block to verify where the work landed.`
+      : narrowed
+        ? `The [acceptance] block's "cwd:" narrows verification to ${effectiveBaseDir} inside the work root ${workRoot}: widen "cwd:" to where the work landed, or remove it (the checks then run in the work root).`
+        : `A role dispatch is verified only inside its work root ${workRoot}: the work belongs there.`;
+    const reason = `the producer changed files only outside ${effectiveBaseDir} (e.g. ${artefact.changedFiles[0].path}); checks run there cannot see them. ${hint}`;
+    return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] }, dodSource, deps.strictUnverifiable);
+  };
+
   let verdict: Verdict;
   if (dod.kind === "deterministic") {
-    const canonicalBase = canonical(effectiveBaseDir);
-    if (artefact.changedFiles.length > 0 && artefact.changedFiles.every(
-      ({ path }) => isAbsolute(path) && !isWithinDir(canonical(path), canonicalBase),
-    )) {
-      // QA-P33F1-1 nit 1: a cwd: narrower than the work root, with work elsewhere in the root → widen (or drop) the cwd:.
-      const narrowed = workRoot !== undefined && !isWithinDir(canonical(workRoot), canonicalBase)
-        && artefact.changedFiles.some(({ path }) => isWithinDir(canonical(path), canonical(workRoot)));
-      const hint = workRoot === undefined
-        ? `Add "cwd: <dir>" to the [acceptance] block to verify where the work landed.`
-        : narrowed
-          ? `The [acceptance] block's "cwd:" narrows verification to ${effectiveBaseDir} inside the work root ${workRoot}: widen "cwd:" to where the work landed, or remove it (the checks then run in the work root).`
-          : `A role dispatch is verified only inside its work root ${workRoot}: the work belongs there.`;
-      const reason = `the producer changed files only outside ${effectiveBaseDir} (e.g. ${artefact.changedFiles[0].path}); checks run there cannot see them. ${hint}`;
-      return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] }, dodSource, deps.strictUnverifiable);
-    }
+    const allOutside = refuseAllOutside();
+    if (allOutside) return allOutside;
     const mixed = refuseMixedOutside();
     if (mixed) return mixed;
     verdict = await runDeterministic(dod, {
@@ -320,6 +334,8 @@ export async function accept(
     });
   } else {
     // "checker" is the only remaining checkable kind.
+    const allOutside = refuseAllOutside();
+    if (allOutside) return allOutside;
     const mixed = refuseMixedOutside();
     if (mixed) return mixed;
     verdict = await runChecker(
@@ -353,7 +369,7 @@ export async function accept(
 
 /** I5 (P0.3): the caveat for an empty change set when the producer ran tools whose writes the router cannot observe. */
 export function unattributedWritersCaveat(root: string, writers: readonly string[]): string {
-  const listed = writers.slice(0, MAX_OUTSIDE_LISTED).join(", ")
+  const listed = writers.slice(0, MAX_OUTSIDE_LISTED).map(toolLabel).join(", ")
     + (writers.length > MAX_OUTSIDE_LISTED ? ` and ${writers.length - MAX_OUTSIDE_LISTED} more` : "");
   return `no change was observed in ${root} but the producer ran ${listed}; a write those tools made cannot be seen, so this is not a verified pass`;
 }

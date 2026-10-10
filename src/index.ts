@@ -2255,7 +2255,13 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         }
       }
       const sid = input?.sessionID;
+      // F1: the unattributed-writer tally is also kept before the call runs: a call that ends in error never reaches the
+      // after-hook's record(). Reached only by calls the router did not refuse (a refusal throws below, before this runs).
+      const noteWriter = (): void => {
+        if (typeof sid === "string" && typeof input?.tool === "string") changedFileStore.noteWriter(sid, input.tool);
+      };
       if (!sid || !sessionStore.isSubagent(sid) || typeof input?.tool !== "string") {
+        noteWriter();
         return;
       }
       // Start-of-call refresh: the idle TTL must cover the tool's runtime, not
@@ -2278,6 +2284,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           ...(profile === undefined ? {} : { profile }),
         });
       } catch {
+        noteWriter(); // the call proceeds
         return; // never break a real session on a guard-internal error
       }
       if (res.block) {
@@ -2289,6 +2296,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         });
         throw new Error(res.message);
       }
+      noteWriter();
     },
 
     // -----------------------------------------------------------------------

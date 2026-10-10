@@ -282,6 +282,31 @@ describe("dispatch reference capture in the changed-file store", () => {
     expect(isUnattributedWriter(tool)).toBe(true);
     expect(h.store.delta("none", "s").unattributedWriters).toEqual([tool]);
   });
+  // F1: a call that ends in error never reaches the after-hook's record(); the before-hook notes the writer instead.
+  it("noteWriter() tallies an unattributable writer without any record()", () => {
+    const h = harness();
+    h.store.noteWriter("s", "Bash");
+    h.store.noteWriter("s", "bash");
+    h.store.noteWriter("s", "read");
+    h.store.noteWriter("s", "write");
+    expect(h.store.delta("none", "s").unattributedWriters).toEqual(["bash"]);
+    expect(h.store.delta("none", "other").unattributedWriters).toEqual([]);
+  });
+
+  it("noteWriter() reaches the dispatch lineage like record()", () => {
+    const h = harness();
+    h.store.noteWriter("retry", "execute");
+    expect(h.store.delta("none", "retry").unattributedWriters).toEqual(["execute"]);
+  });
+
+  // F2: a nested child's writes are not in the producer's lineage, so delegating tools are writers for the tally only.
+  it.each(["task", "delegate", "subagent", "Task"])("%s counts as an unattributed writer but still does not contaminate", (tool) => {
+    expect(isUnattributedWriter(tool)).toBe(true);
+    const h = harness();
+    h.store.record("s", tool, {});
+    expect(h.store.delta("none", "s").unattributedWriters).toEqual([tool.toLowerCase()]);
+  });
+
   it("delta() returns the unattributable writers sorted, lowercased and de-duplicated", () => {
     const h = harness();
     for (const tool of ["execute", "Bash", "bash", "router_run", "execute", "read"]) h.store.record("s", tool, {});

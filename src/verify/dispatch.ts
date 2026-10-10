@@ -152,8 +152,14 @@ export function isNonWritingTool(tool: string): boolean {
  */
 export function isUnattributedWriter(tool: string): boolean {
   const n = tool.toLowerCase();
+  // F2: a nested child's own writes are attributed to the child's session, not to this producer's lineage, so delegating
+  // tools count as writers here. They stay non-writing for observeEdit (they do not contaminate captures).
+  if (DELEGATING_TOOLS.has(n)) return true;
   return !WRITE_TOOLS.has(n) && !isNonWritingTool(n);
 }
+
+/** F2: tools that start a child session whose writes are not in the caller's lineage. */
+const DELEGATING_TOOLS = new Set(["task", "delegate", "subagent"]);
 
 export interface ChangedFile {
   path: string;
@@ -295,6 +301,17 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
     lastTouch.set(sessionID, now());
   }
 
+  /**
+   * F1: notes, before a call runs, that `sessionID` is about to run a tool whose writes the router cannot attribute. A call
+   * that ends in error (or is bypassed) never reaches the after-hook's record(), so the tally is also kept here (a Set: idempotent).
+   */
+  function noteWriter(sessionID: string, tool: string): void {
+    if (!isUnattributedWriter(tool)) return;
+    const w = writersBySession.get(sessionID) ?? new Set<string>();
+    w.add(tool.toLowerCase());
+    writersBySession.set(sessionID, w);
+  }
+
   /** QA-2.1-1: folds one producer session's tool-observed files into its dispatch's lineage. */
   function fold(d: DispatchRecord, sessionID: string): void {
     for (const [path, status] of bySession.get(sessionID) ?? []) {
@@ -388,6 +405,7 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
       return d.settled;
     },
     observeEdit,
+    noteWriter,
     /**
      * The dispatch's ReferenceState. An untracked (or swept) dispatch has none. `signal` bounds the
      * wait for a capture still in flight: once it aborts, the reference is none (gate budget).

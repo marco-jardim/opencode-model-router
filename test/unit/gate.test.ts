@@ -280,6 +280,23 @@ describe("accept() — outside-directory safety net", () => {
       expect(r.verdict.caveats).toEqual([caveat("a_1, a_2, a_3, a_4, a_5 and 2 more")]);
     });
 
+    // F2: a nested task/delegate/subagent child's writes are not in the producer's lineage.
+    it("a delegating tool with an empty change set carries the caveat", async () => {
+      const { d, dod } = setup();
+      const r = await accept({ dod }, empty(["task"]), d);
+      expect(r.verdict.outcome).toBe("unverifiable");
+      expect(r.verdict.caveats).toEqual([caveat("task")]);
+    });
+
+    // F4: tool names reach the plugin from MCP servers and custom tools: sanitised like every other router text.
+    it("sanitises the writer names in the caveat", async () => {
+      const { d, dod } = setup();
+      const long = `evil"\n${"x".repeat(80)}`;
+      const r = await accept({ dod }, empty([long, "mcp srv/tool"]), d);
+      const label = `evil??${"x".repeat(80)}`.slice(0, 63) + "…";
+      expect(r.verdict.caveats).toEqual([caveat(`${label}, mcp?srv?tool`)]);
+    });
+
     it.each([
       ["no writers", empty(undefined)],
       ["an empty writer list", empty([])],
@@ -391,12 +408,42 @@ describe("accept() — outside-directory safety net", () => {
     expect(exec).toHaveBeenCalledWith("node verify.js", expect.objectContaining({ cwd: outside }));
   });
 
-  it("does not apply the safety net to a checker DoD", async () => {
+  // C1: the grader path refuses an all-outside change set exactly as the deterministic path does (it used to grade it).
+  it("refuses an all-outside change set on a checker DoD, with the deterministic reason, and dispatches no grader", async () => {
     const { d } = setup();
     const dispatchGrader = vi.fn<CheckerDeps["dispatchGrader"]>().mockResolvedValue({ sessionID: "grader", text: '{"pass":true,"reasons":[]}' });
-    const r = await accept({ dod: checkerDoD() }, changed([join(outside, "file.ts")]), { ...d, checker: { ...d.checker, dispatchGrader } });
+    const firstPath = join(outside, "file.ts");
+    const r = await accept({ dod: checkerDoD() }, changed([firstPath, join(outside, "b.ts")]), { ...d, checker: { ...d.checker, dispatchGrader } });
+    const reason = `the producer changed files only outside ${base} (e.g. ${firstPath}); checks run there cannot see them. Add "cwd: <dir>" to the [acceptance] block to verify where the work landed.`;
+    expect(r.verdict).toEqual({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] });
+    expect(dispatchGrader).not.toHaveBeenCalled();
+  });
+
+  // F3: a relative path that climbs out of the base is outside; so is a mix of absolute-outside and `../` paths.
+  it.each([
+    ["only a ../ path", ["../other/a.ts"]],
+    ["absolute-outside and ../ paths", [join(outside, "a.ts"), "../other/b.ts"]],
+  ])("refuses a change set entirely outside the base: %s (deterministic)", async (_label, paths) => {
+    const { exec, d, dod } = setup();
+    const r = await accept({ dod }, changed(paths), d);
+    const reason = `the producer changed files only outside ${base} (e.g. ${paths[0]}); checks run there cannot see them. Add "cwd: <dir>" to the [acceptance] block to verify where the work landed.`;
+    expect(r.verdict).toEqual({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] });
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("refuses ../ paths on the grader path and dispatches no grader", async () => {
+    const { d } = setup();
+    const dispatchGrader = vi.fn<CheckerDeps["dispatchGrader"]>().mockResolvedValue({ sessionID: "grader", text: '{"pass":true,"reasons":[]}' });
+    const r = await accept({ dod: checkerDoD() }, changed(["../other/a.ts"]), { ...d, checker: { ...d.checker, dispatchGrader } });
+    expect(r.verdict.outcome).toBe("unverifiable");
+    expect(dispatchGrader).not.toHaveBeenCalled();
+  });
+
+  it("still runs checks when a ../ path stays inside the base", async () => {
+    const { exec, d, dod } = setup();
+    const r = await accept({ dod }, changed(["sub/../a.ts"]), d);
     expect(r.verdict.outcome).toBe("pass");
-    expect(dispatchGrader).toHaveBeenCalled();
+    expect(exec).toHaveBeenCalled();
   });
 });
 
