@@ -22,7 +22,7 @@ import { resetIngestState } from "../../src/routing/outcomes/ingest";
 import { bind, resetBindingRegistryForTests } from "../../src/routing/roles/binding";
 import {
   CARRIED_ACCEPTANCE_NOTE, PIN_OVER_CALLER_REASON, RoleDispatchRefusal, VARIANT_NO_CANDIDATE_REASON, createDispatchRouter, pendingResumeRaise, resetDispatchRouting,
-  roleAttemptVerification,
+  roleAttemptVerification, type RoleAttemptChanges,
   roleEscalationAfterFail, roleGateDeferred, roleMaxActions, routedRoleOf, type DispatchRouter, type RouteOutcome,
 } from "../../src/routing/wire/dispatch";
 import { createEngineRuntime, type EngineRuntime } from "../../src/routing/wire/runtime";
@@ -545,6 +545,65 @@ describe("P3.3 global QA round 1: resumes keep the resumed dispatch's facts and 
     const resumed = await resumeOf();
     expect(resumed.carried).toBe(true);
     expect(resumed.detection).toBe("deterministic");
+  });
+
+  describe("QA-G-B-2-1 / I7: a carried acceptance is judged on the tree its introducing attempt was gated on", () => {
+    const REF = { kind: "none" as const, reason: "test" };
+    const SWITCH = "the working tree X switched from branch main to branch feat/x during the dispatch; the checks would verify another branch";
+    const INHERITED = "the working tree X switched from branch main to branch inherited during the dispatch; the checks would verify another branch";
+    const snapOf = (world: World, head: string, branch?: string | null) => ({ cwd: world.main, root: world.main, head, ...(branch === undefined ? {} : { branch }) });
+    const acceptanceChild = (world: World, child: string) => freshChild(world, child, {
+      agent: "implementer", description: "tests",
+      prompt: `[route class=implement risk=low scope=single needs=edit root=${world.main}]\nVERIFY: required\nchange the generator\n[acceptance]\ncheck: testsPass\n[/acceptance]`,
+    });
+    /** Route and commit the "continue and finish" resume of `child`: it carries the acceptance (the baseline is re-registered). */
+    const attemptOf = (world: World, head: string, branch?: string | null, branchSwitch?: string): RoleAttemptChanges => ({
+      changedFiles: [], changeBaseline: "available", reference: REF, snapshot: snapOf(world, head, branch), ...(branchSwitch === undefined ? {} : { branchSwitch }),
+    });
+    async function resume(world: World, child: string): Promise<void> {
+      const input = { agent: "implementer", sessionID: child, prompt: "continue and finish" };
+      const rc = call(world, input);
+      const routed = await world.router.route(rc);
+      expect(routed.role!.carried).toBe(true);
+      world.router.commit(rc.callID, applied(input, routed));
+    }
+
+    it("carries the branch switch and the snapshot of the attempt through: own, carried without a baseline, carried with one", async () => {
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+      await acceptanceChild(world, "child-i1");
+      const snapshot = snapOf(world, "A", "main");
+      const prepared = attemptOf(world, "A", "main", SWITCH);
+      // Own path.
+      expect(roleAttemptVerification("child-i1", prepared, { carried: false })).toMatchObject({ branchSwitch: SWITCH, snapshot });
+      // Carried with a baseline, the current tree on another branch: the switch of this very dispatch takes precedence.
+      const onOther = attemptOf(world, "A", "other", SWITCH);
+      expect(roleAttemptVerification("child-i1", onOther, { carried: true })).toMatchObject({ branchSwitch: SWITCH, snapshot: onOther.snapshot });
+      // Carried without a baseline (the introducing attempt was never gated).
+      await acceptanceChild(world, "child-i2");
+      const noBaseline = roleAttemptVerification("child-i2", prepared, { carried: true });
+      expect(noBaseline).toMatchObject({ branchSwitch: SWITCH, snapshot, changeBaseline: "unavailable" });
+    });
+
+    it("a carried attempt on another branch than the introducing attempt's is a switch; staying on the branch is not", async () => {
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+      await acceptanceChild(world, "child-l1");
+      await acceptanceChild(world, "child-l2");
+      const own = (child: string) => roleAttemptVerification(child, attemptOf(world, "A", "main"), { carried: false });
+      own("child-l1"); own("child-l2");
+      await resume(world, "child-l1"); await resume(world, "child-l2"); // the baseline goes through frozenVerification
+      const carried = (child: string, branch: string) => roleAttemptVerification(child, attemptOf(world, "A", branch), { carried: true });
+      expect(carried("child-l1", "other").branchSwitch).toMatch(/switched from branch main to branch other since the attempt that introduced this acceptance/);
+      expect(carried("child-l2", "main").branchSwitch).toBeUndefined();
+    });
+
+    it("a switch found during the introducing attempt is inherited by the carried attempts, even on the branch the tree came back to", async () => {
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+      await acceptanceChild(world, "child-h");
+      roleAttemptVerification("child-h", attemptOf(world, "A", "main", INHERITED), { carried: false });
+      await resume(world, "child-h");
+      const carried = roleAttemptVerification("child-h", attemptOf(world, "A", "main"), { carried: true });
+      expect(carried.branchSwitch).toBe(INHERITED);
+    });
   });
 });
 

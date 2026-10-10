@@ -66,7 +66,8 @@ import {
   consumeRunnerDispatch, consumeRunnerDispatchLoose, forgetDispatch, lookupDispatch, rememberDispatch, runnerDescription,
   updateDispatchVerification, type CarriedVerification, type DetectionDepth, type DispatchInput, type DispatchRecord,
 } from "../../router/sessions";
-import type { ChangedFile } from "../../verify/dispatch";
+import type { ChangedFile, TreeSnapshot } from "../../verify/dispatch";
+import { branchSwitchReason, branchSwitched } from "../../verify/branch";
 import type { ReferenceState } from "../../verify/types";
 import { randomBytes } from "node:crypto";
 import {
@@ -895,6 +896,8 @@ export interface RoleAttemptChanges {
   readonly changedFiles: ChangedFile[];
   readonly changeBaseline: "available" | "unavailable";
   readonly reference: ReferenceState;
+  readonly snapshot?: Pick<TreeSnapshot, "cwd" | "root" | "head" | "branch"> | undefined;
+  readonly branchSwitch?: string | undefined;
 }
 
 /** The union of two change sets, keyed by path (separators unified, case folded on win32); `newer` wins. */
@@ -921,19 +924,31 @@ export function roleAttemptVerification<T extends RoleAttemptChanges>(childSessi
   const verification = lookupDispatch(childSessionID)?.verification;
   if (verification === undefined) return prepared;
   const own: readonly ChangedFile[] | "unavailable" = prepared.changeBaseline === "available" ? prepared.changedFiles : "unavailable";
+  const now = prepared.snapshot;
   if (!opts.carried) {
-    updateDispatchVerification(childSessionID, { ...verification, baseline: { reference: prepared.reference, changed: own } });
+    const tree = now === undefined ? {} : { tree: { head: now.head, ...(now.branch === undefined ? {} : { branch: now.branch }) } };
+    const switched = prepared.branchSwitch === undefined ? {} : { switched: prepared.branchSwitch };
+    updateDispatchVerification(childSessionID, { ...verification, baseline: { reference: prepared.reference, changed: own, ...tree, ...switched } });
     return prepared;
   }
   const baseline = verification.baseline;
   if (baseline === undefined) return { ...prepared, changeBaseline: "unavailable", reference: CARRIED_NO_REFERENCE };
   const changed = unionChanges(baseline.changed, own);
-  updateDispatchVerification(childSessionID, { ...verification, baseline: { reference: baseline.reference, changed } });
+  updateDispatchVerification(childSessionID, { ...verification, baseline: { reference: baseline.reference, changed,
+    ...(baseline.tree === undefined ? {} : { tree: baseline.tree }),
+    ...(baseline.switched === undefined ? {} : { switched: baseline.switched }) } });
+  // I7 across attempts. Precedence: a switch seen during this dispatch, then one inherited from an earlier attempt,
+  // then a switch between the introducing attempt's tree and this one.
+  const lineageSwitch = prepared.branchSwitch !== undefined ? undefined
+    : baseline.switched !== undefined ? baseline.switched
+    : baseline.tree !== undefined && now !== undefined && branchSwitched(baseline.tree, now)
+      ? branchSwitchReason(now.root ?? now.cwd, baseline.tree, now, "since the attempt that introduced this acceptance") : undefined;
   return {
     ...prepared,
     changedFiles: changed === "unavailable" ? prepared.changedFiles : changed,
     changeBaseline: changed === "unavailable" ? "unavailable" : "available",
     reference: baseline.reference,
+    ...(lineageSwitch === undefined ? {} : { branchSwitch: lineageSwitch }),
   };
 }
 

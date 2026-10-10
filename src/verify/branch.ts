@@ -36,7 +36,7 @@ export function branchSwitchReason(
   root: string,
   before: BranchState,
   now: BranchState,
-  when: "during the dispatch" | "since the producer returned",
+  when: "during the dispatch" | "since the producer returned" | "since the attempt that introduced this acceptance",
 ): string {
   const verb = before.branch === null && now.branch === null ? "moved" : "switched";
   return `the working tree ${root} ${verb} from ${describeBranch(before)} to ${describeBranch(now)} ${when}; the checks would verify another branch`;

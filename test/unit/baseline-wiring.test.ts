@@ -938,3 +938,23 @@ describe("child session disposal memo", () => {
     expect(del).toHaveBeenCalledTimes(DISPOSED_MEMO_MAX + 3);
   });
 });
+
+describe("deferred finish: branch switch during the dispatch (I7)", () => {
+  const finishInput = { dispatchID: "d", orchestratorSessionID: "orch", producerSessionID: "child", producerTier: "fast", description: "x", cwd: undefined, dod, dispatchedAt: 0 } as const;
+  const finishAfter = async (branchNow: string) => {
+    const { wiring, store } = harness();
+    state.snapshot = { ...state.snapshot!, root: cwd, branch: "main" };
+    await wiring.beginVerification(store, "d", undefined, dod);
+    state.snapshot = { ...state.snapshot!, branch: branchNow };
+    return wiring.finishDeferred(store, finishInput);
+  };
+
+  it("a tree switched from main to another branch during the dispatch is not deferred", async () => {
+    expect(await finishAfter("other")).toMatchObject({
+      deferred: false, reason: "branch-switched", detail: expect.stringContaining("switched from branch main to branch other during the dispatch"),
+    });
+  });
+  it("the same branch is not a switch", async () => {
+    expect(await finishAfter("main")).not.toMatchObject({ reason: "branch-switched" });
+  });
+});
