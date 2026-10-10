@@ -215,18 +215,15 @@ async function digestPaths(
 }
 
 /**
- * I7 (P0.2): the checked-out branch, by `git symbolic-ref -q HEAD`: its short name (`feat/x` from `refs/heads/feat/x`); null
- * on a detached HEAD (exit 1, no output); undefined when unknown (any other failure, a timeout or an abort). Its own try: a
- * failure here never drops the snapshot.
+ * I7 (P0.2): the checked-out branch from line 2 of `git rev-parse HEAD --symbolic-full-name HEAD`: the short name
+ * (`feat/x` from `refs/heads/feat/x`); null on a detached HEAD (`HEAD`); another ref kept whole; undefined when the line is
+ * missing or empty.
  */
-async function readBranch(git: (args: string[]) => Promise<string>): Promise<string | null | undefined> {
-  try {
-    const ref = (await git(["symbolic-ref", "-q", "HEAD"])).trim();
-    if (ref === "") return undefined;
-    return ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref;
-  } catch (err) {
-    return gitExitCode(err) === 1 ? null : undefined;
-  }
+function parseBranchLine(line: string | undefined): string | null | undefined {
+  const ref = line?.trim();
+  if (ref === undefined || ref === "") return undefined;
+  if (ref === "HEAD") return null;
+  return ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref;
 }
 
 export async function snapshotTree(cwd: string, signal: AbortSignal, options: SnapshotOptions = {}): Promise<TreeSnapshot | undefined> {
@@ -241,9 +238,10 @@ export async function snapshotTree(cwd: string, signal: AbortSignal, options: Sn
     // ls-files otherwise scopes untracked contents to a subdirectory cwd,
     // missing same-path edits in sibling packages that tests may import.
     gitCwd = root;
-    const head = (await git(["rev-parse", "HEAD"])).trim();
-    // Read right after HEAD, so the two describe the same checkout as closely as possible.
-    const branch = await readBranch(git);
+    // One process, so HEAD and its branch describe the same checkout.
+    const [headLine, refLine] = (await git(["rev-parse", "HEAD", "--symbolic-full-name", "HEAD"])).split(/\r?\n/);
+    const head = (headLine ?? "").trim();
+    const branch = parseBranchLine(refLine);
     const status = await git(["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
     const files: ChangedFile[] = [];
     const records = status.split("\0");
