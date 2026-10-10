@@ -76,7 +76,7 @@ import {
 import { runArgv, runShell } from "./exec";
 import { snapshotTree } from "./tree";
 import { branchSwitched, branchSwitchReason, branchUnconfirmedReason, treeMove, treeMoveReason } from "./branch";
-import { readHeadState, readReflogSubjects, type HeadState } from "./head";
+import { readHeadState, readReflogWindow, type HeadState, type ReflogEntry } from "./head";
 import { captureReference, DEFAULT_CAPTURE_TIMEOUT_MS, gcStaleReferences, nodeReferenceFs, type DispatchReference } from "./reference";
 import type { PluginLogger } from "../router/logger";
 import { REFERENCE_NONE } from "./baseline";
@@ -1555,18 +1555,18 @@ export function createVerificationWiring(deps: {
             // The dispatch-time head is unknown (unreadable, timed out, or an unborn repository): fail closed.
             headSwitch = `cannot confirm the branch of ${nowHead.root}: the working tree could not be read when the dispatch started, so the checks could verify another branch. Re-dispatch.`;
           } else {
-            let subjects: string[] | undefined;
+            let window: ReflogEntry[] | undefined;
             if (startHead.reflog !== undefined && nowHead.reflog !== undefined && nowHead.reflog >= startHead.reflog) {
-              subjects = await readReflogSubjects(nowHead.root, nowHead.reflog - startHead.reflog, {
+              window = await readReflogWindow(nowHead.root, nowHead.reflog - startHead.reflog, {
                 ...signalOpt, timeoutMs: bound, lowPriority: configuredLowPriority(),
               });
             }
             // The reflog grew but its entries cannot be read: a checkout or reset cannot be ruled out (fail closed).
-            const unreadWindow = subjects === undefined && startHead.reflog !== undefined && nowHead.reflog !== undefined
+            const unreadWindow = window === undefined && startHead.reflog !== undefined && nowHead.reflog !== undefined
               && nowHead.reflog > startHead.reflog;
             const move = unreadWindow
               ? { kind: "rewritten" as const, detail: "the reflog entries could not be read" }
-              : treeMove(startHead, nowHead, subjects);
+              : treeMove(startHead, nowHead, window);
             if (move !== undefined) headSwitch = treeMoveReason(nowHead.root, startHead, nowHead, move, "during the dispatch");
           }
         }
@@ -1957,13 +1957,13 @@ export function createVerificationWiring(deps: {
           branch: atReturn.branch,
           ...(atReturn.reflog !== undefined ? { reflog: atReturn.reflog } : {}),
         };
-        let subjects: string[] | undefined;
+        let window: ReflogEntry[] | undefined;
         const comparable = before.reflog !== undefined && nowHead.reflog !== undefined && nowHead.reflog >= before.reflog;
         if (comparable) {
           const bound = deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS);
-          subjects = bound > 0 && !deadline.signal.aborted
+          window = bound > 0 && !deadline.signal.aborted
             ? await withTimeout(
-              readReflogSubjects(nowHead.root, (nowHead.reflog ?? 0) - (before.reflog ?? 0), {
+              readReflogWindow(nowHead.root, (nowHead.reflog ?? 0) - (before.reflog ?? 0), {
                 signal: deadline.signal, timeoutMs: bound, lowPriority,
               }),
               bound,
@@ -1972,11 +1972,11 @@ export function createVerificationWiring(deps: {
             : undefined;
         }
         // The reflog grew but its entries cannot be read: a checkout or reset cannot be ruled out (fail closed).
-        const unreadWindow = subjects === undefined && before.reflog !== undefined && nowHead.reflog !== undefined
+        const unreadWindow = window === undefined && before.reflog !== undefined && nowHead.reflog !== undefined
           && nowHead.reflog > before.reflog;
         const move = unreadWindow
           ? { kind: "rewritten" as const, detail: "the reflog entries could not be read" }
-          : treeMove(before, nowHead, subjects);
+          : treeMove(before, nowHead, window);
         if (move !== undefined) branchSwitch = treeMoveReason(nowHead.root, before, nowHead, move, "since the producer returned");
       }
     }

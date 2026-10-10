@@ -1,7 +1,7 @@
 // Impure, cheap HEAD reader: where a working tree is checked out, and how many HEAD reflog entries it has.
 // Kept apart from tree.ts on purpose: several tests mock that module with `snapshotTree` alone.
 import { realpath } from "node:fs/promises";
-import { execGit } from "./tree";
+import { execGit, gitExitCode } from "./tree";
 
 /** What the branch-switch rule reads of a working tree (see branch.ts `treeMove`). */
 export interface HeadState {
@@ -23,7 +23,7 @@ export interface HeadReadOptions {
 
 const DEFAULT_TIMEOUT_MS = 5000;
 const MAX_BUFFER = 1024 * 1024;
-const MAX_SUBJECTS = 1000;
+const MAX_WINDOW = 1000;
 
 function runner(cwd: string, opts: HeadReadOptions | undefined): (args: readonly string[]) => Promise<string> {
   const signal = opts?.signal ?? new AbortController().signal;
@@ -33,11 +33,17 @@ function runner(cwd: string, opts: HeadReadOptions | undefined): (args: readonly
 }
 
 /**
- * The toplevel, HEAD and branch of the checkout at `cwd` (one git process), plus its HEAD reflog count (a second one).
- * undefined when the first fails (not a repository, unborn branch, timeout, abort) or its output cannot be parsed; a failing
- * count only leaves `reflog` absent.
+ * What a head read found: the state, `"none"` when git RAN and exited non-zero (not a repository, an unborn branch: there is
+ * no HEAD to compare), or undefined when the answer is unknown (timeout, abort, spawn failure, unparsable output).
  */
-export async function readHeadState(cwd: string, opts?: HeadReadOptions): Promise<HeadState | undefined> {
+export type HeadRead = HeadState | "none" | undefined;
+
+/**
+ * The toplevel, HEAD and branch of the checkout at `cwd` (one git process), plus its HEAD reflog count (a second one).
+ * `"none"` only for a git exit code (never decided from git's localised message); every other failure is undefined. A failing
+ * count, or a count of 0 (reflogs disabled: `core.logAllRefUpdates=false`), only leaves `reflog` absent.
+ */
+export async function readHead(cwd: string, opts?: HeadReadOptions): Promise<HeadRead> {
   const git = runner(cwd, opts);
   let root: string;
   let head: string;
@@ -50,26 +56,51 @@ export async function readHeadState(cwd: string, opts?: HeadReadOptions): Promis
     if (top === "" || !/^[0-9a-f]{40,64}$/i.test(head) || ref === "") return undefined;
     branch = ref === "HEAD" ? null : ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref;
     root = await realpath(top);
-  } catch {
-    return undefined;
+  } catch (err) {
+    return gitExitCode(err) !== undefined ? "none" : undefined;
   }
   try {
     const text = (await git(["rev-list", "--walk-reflogs", "--count", "HEAD"])).trim();
-    if (/^\d+$/.test(text)) return { root, head, branch, reflog: Number(text) };
+    // HEAD exists, so a reflog of 0 entries means there is none (reflogs off), not an empty one.
+    if (/^\d+$/.test(text) && Number(text) > 0) return { root, head, branch, reflog: Number(text) };
   } catch {
     // The count is optional.
   }
   return { root, head, branch };
 }
 
-/** The newest `count` (clamped to 1..1000) HEAD reflog subjects, newest first; [] for count <= 0 without running git; undefined on failure. */
-export async function readReflogSubjects(cwd: string, count: number, opts?: HeadReadOptions): Promise<string[] | undefined> {
+/** `readHead` for callers that treat "no repository / unborn" and "unknown" alike: undefined for both. */
+export async function readHeadState(cwd: string, opts?: HeadReadOptions): Promise<HeadState | undefined> {
+  const read = await readHead(cwd, opts);
+  return read === "none" ? undefined : read;
+}
+
+/** One HEAD reflog entry: the commit HEAD pointed at after it, and its subject (`%gs`). */
+export interface ReflogEntry {
+  readonly commit: string;
+  readonly subject: string;
+}
+
+/**
+ * The HEAD reflog window since a recorded count, read in ONE git process so it is anchored: `count` new entries plus the one
+ * that was newest at the earlier read, newest first. [] for count <= 0 without running git; undefined on failure, on a count
+ * above 1000, or when the output cannot be parsed.
+ */
+export async function readReflogWindow(cwd: string, count: number, opts?: HeadReadOptions): Promise<ReflogEntry[] | undefined> {
   if (!(count > 0)) return [];
-  const n = Math.min(MAX_SUBJECTS, Math.max(1, Math.floor(count)));
+  const n = Math.floor(count);
+  if (n > MAX_WINDOW) return undefined;
   try {
-    const lines = (await runner(cwd, opts)(["log", "-g", "-n", String(n), "--format=%gs", "HEAD"])).split(/\r?\n/);
+    const lines = (await runner(cwd, opts)(["log", "-g", "-n", String(n + 1), "--format=%H%x09%gs", "HEAD"])).split(/\r?\n/);
     if (lines[lines.length - 1] === "") lines.pop();
-    return lines;
+    const entries: ReflogEntry[] = [];
+    for (const line of lines) {
+      const tab = line.indexOf("\t");
+      const commit = tab < 0 ? line : line.slice(0, tab);
+      if (!/^[0-9a-f]{40,64}$/i.test(commit)) return undefined;
+      entries.push({ commit, subject: tab < 0 ? "" : line.slice(tab + 1) });
+    }
+    return entries;
   } catch {
     return undefined;
   }

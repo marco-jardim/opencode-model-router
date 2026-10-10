@@ -7,7 +7,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { branchSwitched, branchSwitchReason, branchUnconfirmedReason, describeBranch, treeMove, treeMoveReason } from "../../src/verify/branch";
-import type { HeadState } from "../../src/verify/head";
+import type { HeadState, ReflogEntry } from "../../src/verify/head";
 
 const A = "a".repeat(40);
 const B = "b".repeat(40);
@@ -77,9 +77,15 @@ describe("branchSwitchReason", () => {
 const H = (head: string, branch: string | null, root = "/repo", reflog?: number): HeadState =>
   reflog === undefined ? { root, head, branch } : { root, head, branch, reflog };
 
+const C = "c".repeat(40);
+const E = (commit: string, subject: string): ReflogEntry => ({ commit, subject });
+/** `before` at A (reflog 5) and `now` at B (reflog 6), one entry in between: the window is [newest, the old newest]. */
+const oneMove = (subject: string): ReturnType<typeof treeMove> =>
+  treeMove(H(A, "main", "/repo", 5), H(B, "main", "/repo", 6), [E(B, subject), E(A, "commit: old")]);
+
 describe("treeMove", () => {
   it("roots that differ are a relocation, before anything else", () => {
-    expect(treeMove(H(A, "main", "/repo"), H(A, "feat", "/other"), ["checkout: moving from main to feat"], "linux")).toEqual({ kind: "relocated" });
+    expect(treeMove(H(A, "main", "/repo"), H(A, "feat", "/other"), [E(A, "checkout: moving from main to feat"), E(A, "x")], "linux")).toEqual({ kind: "relocated" });
     expect(treeMove(H(A, "main", "/repo"), H(A, "main", "/other"), undefined, "linux")).toEqual({ kind: "relocated" });
   });
 
@@ -90,42 +96,122 @@ describe("treeMove", () => {
   });
 
   it("names that differ are a switch, even with a window of commits only", () => {
-    expect(treeMove(H(A, "main"), H(A, "feat"), ["commit: x"])).toEqual({ kind: "switched" });
+    expect(treeMove(H(A, "main"), H(A, "feat"), [E(A, "commit: x"), E(A, "commit: y")])).toEqual({ kind: "switched" });
     expect(treeMove(H(A, "main"), H(A, null), undefined)).toEqual({ kind: "switched" });
     expect(treeMove(H(A, null), H(A, "main"), [])).toEqual({ kind: "switched" });
   });
 
   it.each([
-    ["checkout", "checkout: moving from main to main"],
-    ["reset", "reset: moving to HEAD~1"],
-    ["rebase", "rebase (finish): returning to refs/heads/main"],
-    ["a capitalised verb", "Checkout: moving from a to b"],
-  ])("a reflog window with %s is a rewrite, quoting the first such subject", (_name, subject) => {
-    expect(treeMove(H(A, "main"), H(B, "main"), ["commit: two", subject, "checkout: later"])).toEqual({ kind: "rewritten", detail: subject });
+    "commit: x",
+    "commit (amend): x",
+    "commit (initial): x",
+    "commit (merge): x",
+    "merge feat: Fast-forward",
+    "merge feat/x: Merge made by the 'ort' strategy.",
+    "cherry-pick: x",
+    "revert: x",
+    "am: x",
+    "pull: Fast-forward",
+    "pull origin main: Merge made by the 'ort' strategy.",
+    "Commit: capitalised",
+  ])("a HEAD move with the subject %j is the producer's own work", (subject) => {
+    expect(oneMove(subject)).toBeUndefined();
+  });
+
+  it.each([
+    "pull --rebase origin (start): checkout abc",
+    "pull origin main (start): checkout abc",
+    "pull --rebase origin (pick): x",
+    "rebase (start): checkout main",
+    "rebase (finish): returning to refs/heads/main",
+    "reset: moving to HEAD~1",
+    "checkout: moving from a to b",
+    "Checkout: moving from a to b",
+    "switch: moving from a to b",
+    "precheckout: x",
+    "recommit: x",
+    "commit-tree: x",
+    "merged: x",
+    "amend: x",
+    "random text",
+  ])("a HEAD move with the subject %j is a rewrite quoting it", (subject) => {
+    expect(oneMove(subject)).toEqual({ kind: "rewritten", detail: subject });
+  });
+
+  it("an empty subject that moved HEAD is an unnamed rewrite", () => {
+    expect(oneMove("")).toEqual({ kind: "rewritten", detail: "an unnamed reflog entry" });
+  });
+
+  it("HEAD-neutral entries (same commit as the older entry) are ignored, whatever their subject", () => {
+    const before = H(A, "main", "/repo", 5);
+    const now = H(A, "main", "/repo", 9);
+    const window = [
+      E(A, "reset: moving to HEAD"), // git stash
+      E(A, "reset: moving to HEAD"), // git reset (unstage)
+      E(A, "checkout: moving from main to main"),
+      E(A, "reset: moving to HEAD"), // merge --abort
+      E(A, "commit: old"),
+    ];
+    expect(treeMove(before, now, window)).toBeUndefined();
+  });
+
+  it("a neutral entry between commits does not hide a later move", () => {
+    const window = [E(C, "commit: c"), E(B, "reset: moving to HEAD"), E(B, "commit: b"), E(A, "commit: old")];
+    expect(treeMove(H(A, "main", "/repo", 5), H(C, "main", "/repo", 8), window)).toBeUndefined();
+    const bad = [E(C, "commit: c"), E(B, "reset: moving to HEAD"), E(B, "checkout: moving from x to main"), E(A, "commit: old")];
+    expect(treeMove(H(A, "main", "/repo", 5), H(C, "main", "/repo", 8), bad)).toEqual({ kind: "rewritten", detail: "checkout: moving from x to main" });
+  });
+
+  it("the first moving entry, newest first, is the one quoted", () => {
+    const window = [E(C, "reset: newer"), E(B, "checkout: older"), E(A, "commit: old")];
+    expect(treeMove(H(A, "main", "/repo", 5), H(C, "main", "/repo", 7), window)).toEqual({ kind: "rewritten", detail: "reset: newer" });
+  });
+
+  it("a round trip that ends where it began is still a move (the name and head are the same)", () => {
+    const window = [E(A, "checkout: moving from x to main"), E(B, "commit: on x"), E(A, "checkout: moving from main to x"), E(A, "commit: old")];
+    // The checkout -b is neutral, the commit on x moves, and the checkout back moves HEAD again: caught by the window.
+    expect(treeMove(H(A, "main", "/repo", 5), H(A, "main", "/repo", 8), window)).toEqual({ kind: "rewritten", detail: "checkout: moving from x to main" });
+  });
+
+  it.each<[string, readonly ReflogEntry[]]>([
+    ["the newest entry is not now.head", [E(C, "commit: x"), E(A, "commit: old")]],
+    ["the oldest entry is not before.head", [E(B, "commit: x"), E(C, "commit: old")]],
+    ["the window is shorter than the count", [E(B, "commit: x")]],
+    ["the window is longer than the count", [E(B, "commit: x"), E(C, "commit: y"), E(A, "commit: old")]],
+    ["the window is empty while the count grew", []],
+  ])("an anchor mismatch is a rewrite: %s", (_name, window) => {
+    expect(treeMove(H(A, "main", "/repo", 5), H(B, "main", "/repo", 6), window))
+      .toEqual({ kind: "rewritten", detail: "the reflog window does not line up with the recorded HEAD" });
+  });
+
+  it("with equal counts the window is the one old entry (or empty) and must line up", () => {
+    expect(treeMove(H(A, "main", "/repo", 5), H(A, "main", "/repo", 5), [])).toBeUndefined();
+    expect(treeMove(H(A, "main", "/repo", 5), H(A, "main", "/repo", 5), [E(A, "commit: old")])).toBeUndefined();
+    expect(treeMove(H(A, "main", "/repo", 5), H(A, "main", "/repo", 5), [E(B, "commit: old")]))
+      .toEqual({ kind: "rewritten", detail: "the reflog window does not line up with the recorded HEAD" });
+  });
+
+  it("without reflog counts, a window is still anchored on its own length and ends", () => {
+    expect(treeMove(H(A, "main"), H(B, "main"), [E(B, "commit: x"), E(A, "commit: old")])).toBeUndefined();
+    expect(treeMove(H(A, "main"), H(B, "main"), [E(B, "reset: x"), E(A, "commit: old")])).toEqual({ kind: "rewritten", detail: "reset: x" });
+    expect(treeMove(H(A, "main"), H(B, "main"), [E(B, "commit: x"), E(C, "commit: old")]))
+      .toEqual({ kind: "rewritten", detail: "the reflog window does not line up with the recorded HEAD" });
+    expect(treeMove(H(A, "main"), H(B, "main"), [])).toEqual({ kind: "rewritten", detail: "the reflog window does not line up with the recorded HEAD" });
+    expect(treeMove(H(A, "main"), H(A, "main"), [])).toBeUndefined();
   });
 
   it("the detail has control characters removed and is capped at 120 characters", () => {
-    const move = treeMove(H(A, "main"), H(B, "main"), [`reset: ${"x".repeat(200)}\u001b[31m\n`]);
+    const move = oneMove(`reset: ${"x".repeat(200)}\u001b[31m\n`);
     expect(move?.kind).toBe("rewritten");
     expect(move?.detail).toHaveLength(120);
     expect(move?.detail).not.toMatch(/[\u0000-\u001f]/);
-    expect(treeMove(H(A, "main"), H(B, "main"), ["reset: a\u001b[31mb\n"])?.detail).toBe("reset: a[31mb");
-  });
-
-  it("a window of commits only is not a move, detached to detached included", () => {
-    expect(treeMove(H(A, "main"), H(B, "main"), ["commit: two", "commit (amend): one", "commit (merge): m", "pull: Fast-forward"])).toBeUndefined();
-    expect(treeMove(H(A, null), H(B, null), ["commit: on detached"])).toBeUndefined();
-    expect(treeMove(H(A, "main"), H(A, "main"), [])).toBeUndefined();
-    expect(treeMove(H(A, "main"), H(B, "main"), ["precheckout: x", "recommit: reset"])).toBeUndefined();
+    expect(oneMove("reset: a\u001b[31mb\n")?.detail).toBe("reset: a[31mb");
   });
 
   it("a reflog that shrank, or a HEAD that moved with no new entry, is another history in place", () => {
     expect(treeMove(H(A, "main", "/repo", 5), H(A, "main", "/repo", 3), [])).toEqual({ kind: "rewritten", detail: "the reflog has fewer entries than before" });
     expect(treeMove(H(A, "main", "/repo", 5), H(B, "main", "/repo", 5), [])).toEqual({ kind: "rewritten", detail: "HEAD moved without a reflog entry" });
-    // Same count and same HEAD: nothing happened.
     expect(treeMove(H(A, "main", "/repo", 5), H(A, "main", "/repo", 5), [])).toBeUndefined();
-    // A grown count with commits only stays no move.
-    expect(treeMove(H(A, "main", "/repo", 5), H(B, "main", "/repo", 6), ["commit: x"])).toBeUndefined();
   });
 
   it("without a window, the fail-closed branchSwitched rule applies", () => {
@@ -154,7 +240,7 @@ describe("treeMoveReason", () => {
 
   it("words a rewrite with the reflog subject", () => {
     expect(treeMoveReason("/repo", H(A, "main"), H(B, "main"), { kind: "rewritten", detail: "reset: moving to HEAD~1" }, "since the producer returned"))
-      .toBe("the working tree /repo was checked out or reset since the producer returned (reflog: \"reset: moving to HEAD~1\"); the checks could verify a tree without the producer's work. Re-dispatch, or send a fresh [acceptance] block.");
+      .toBe("the working tree /repo moved or was rewritten since the producer returned (reflog: \"reset: moving to HEAD~1\"); the checks could verify a tree without the producer's work. Re-dispatch, or send a fresh [acceptance] block.");
   });
 
   it("words a relocation", () => {

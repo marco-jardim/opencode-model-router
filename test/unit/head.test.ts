@@ -6,7 +6,8 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { readHeadState, readReflogSubjects } from "../../src/verify/head";
+import { treeMove, type TreeMove } from "../../src/verify/branch";
+import { readHead, readHeadState, readReflogWindow, type HeadState, type ReflogEntry } from "../../src/verify/head";
 
 const base = mkdtempSync(join(tmpdir(), "head-test-"));
 afterAll(() => rmSync(base, { recursive: true, force: true }));
@@ -103,41 +104,202 @@ describe("readHeadState", () => {
   });
 });
 
-describe("readReflogSubjects", () => {
-  it("newest first", async () => {
+describe("readHead", () => {
+  it("a repository gives the same state as readHeadState", async () => {
     const dir = repo();
+    expect(await readHead(dir)).toEqual(await readHeadState(dir));
+    expect(typeof (await readHead(dir) as HeadState).head).toBe("string");
+  });
+
+  it("a directory that is not a repository is \"none\" (git ran and exited non-zero)", async () => {
+    expect(await readHead(fresh())).toBe("none");
+  });
+
+  it("an unborn branch is \"none\"", async () => {
+    const dir = fresh();
+    git(dir, "init", "-q", "-b", "main");
+    expect(await readHead(dir)).toBe("none");
+  });
+
+  it("an aborted signal is undefined (unknown), not \"none\"", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    expect(await readHead(repo(), { signal: controller.signal })).toBeUndefined();
+  });
+
+  it("a spawn failure (cwd that does not exist) is undefined", async () => {
+    expect(await readHead(join(base, "no-such-dir"))).toBeUndefined();
+  });
+
+  it("reflogs disabled: a count of 0 leaves reflog absent", async () => {
+    const dir = fresh();
+    git(dir, "init", "-q", "-b", "main");
+    git(dir, "config", "core.logAllRefUpdates", "false");
+    commit(dir, "one");
+    const state = await readHead(dir);
+    expect(state).toEqual({ root: realpathSync.native(dir), head: git(dir, "rev-parse", "HEAD"), branch: "main" });
+    expect(state).not.toHaveProperty("reflog");
+  });
+});
+
+describe("readReflogWindow", () => {
+  it("count + 1 entries, newest first, with the commit and the subject", async () => {
+    const dir = repo();
+    const one = git(dir, "rev-parse", "HEAD");
     commit(dir, "two");
+    const two = git(dir, "rev-parse", "HEAD");
     git(dir, "checkout", "-q", "-b", "feat");
     git(dir, "reset", "-q", "--hard", "HEAD");
-    const subjects = await readReflogSubjects(dir, 10);
-    expect(subjects).toEqual([
-      "reset: moving to HEAD",
-      "checkout: moving from main to feat",
-      "commit: two",
-      "commit (initial): one",
+    expect(await readReflogWindow(dir, 3)).toEqual([
+      { commit: two, subject: "reset: moving to HEAD" },
+      { commit: two, subject: "checkout: moving from main to feat" },
+      { commit: two, subject: "commit: two" },
+      { commit: one, subject: "commit (initial): one" },
     ]);
   });
 
-  it("returns only the newest N", async () => {
+  it("the extra entry is the one that was newest at the earlier read", async () => {
     const dir = repo();
     commit(dir, "two");
+    const before = await readHead(dir) as HeadState;
     commit(dir, "three");
-    expect(await readReflogSubjects(dir, 2)).toEqual(["commit: three", "commit: two"]);
+    commit(dir, "four");
+    const now = await readHead(dir) as HeadState;
+    const window = await readReflogWindow(dir, (now.reflog ?? 0) - (before.reflog ?? 0));
+    expect(window?.map((e) => e.subject)).toEqual(["commit: four", "commit: three", "commit: two"]);
+    expect(window?.[0]?.commit).toBe(now.head);
+    expect(window?.[2]?.commit).toBe(before.head);
+  });
+
+  it("fewer entries than asked for returns what exists", async () => {
+    const dir = repo();
+    expect(await readReflogWindow(dir, 5)).toHaveLength(1);
+  });
+
+  it("an empty subject is kept as an empty string", async () => {
+    const dir = repo();
+    commit(dir, "two");
+    git(dir, "update-ref", "HEAD", "HEAD~1");
+    const window = await readReflogWindow(dir, 1);
+    expect(window?.[0]?.subject).toBe("");
+    expect(window?.[0]?.commit).toBe(git(dir, "rev-parse", "HEAD"));
   });
 
   it("a count of 0 or less is [] without running git (even outside a repository)", async () => {
     const outside = fresh();
-    expect(await readReflogSubjects(outside, 0)).toEqual([]);
-    expect(await readReflogSubjects(outside, -5)).toEqual([]);
-    expect(await readReflogSubjects(outside, Number.NaN)).toEqual([]);
+    expect(await readReflogWindow(outside, 0)).toEqual([]);
+    expect(await readReflogWindow(outside, -5)).toEqual([]);
+    expect(await readReflogWindow(outside, Number.NaN)).toEqual([]);
   });
 
-  it("a count above 1000 is clamped, not rejected", async () => {
-    const dir = repo();
-    expect(await readReflogSubjects(dir, 5000)).toEqual(["commit (initial): one"]);
+  it("a count above 1000 is undefined (not clamped: the anchor would be lost)", async () => {
+    expect(await readReflogWindow(repo(), 1001)).toBeUndefined();
+    expect(await readReflogWindow(repo(), 1000)).toHaveLength(1);
   });
 
   it("failure is undefined", async () => {
-    expect(await readReflogSubjects(fresh(), 3)).toBeUndefined();
+    expect(await readReflogWindow(fresh(), 3)).toBeUndefined();
+  });
+});
+
+/** The tree-move verdict between a recorded head state and now, the way the wiring computes it. */
+async function moveSince(dir: string, before: HeadState): Promise<TreeMove | undefined> {
+  const now = await readHead(dir) as HeadState;
+  let window: ReflogEntry[] | undefined;
+  if (before.reflog !== undefined && now.reflog !== undefined && now.reflog >= before.reflog) {
+    window = await readReflogWindow(dir, now.reflog - before.reflog);
+  }
+  return treeMove(before, now, window);
+}
+
+describe("readHead + readReflogWindow + treeMove, real git", () => {
+  const started = async (): Promise<{ dir: string; before: HeadState }> => {
+    const dir = repo();
+    commit(dir, "two");
+    return { dir, before: await readHead(dir) as HeadState };
+  };
+
+  it("git stash and git stash pop with a dirty file is not a move", async () => {
+    const { dir, before } = await started();
+    writeFileSync(join(dir, "f.txt"), "dirty\n");
+    git(dir, "stash");
+    git(dir, "stash", "pop");
+    expect(await moveSince(dir, before)).toBeUndefined();
+  });
+
+  it("git stash -u with an untracked file is not a move", async () => {
+    const { dir, before } = await started();
+    writeFileSync(join(dir, "new.txt"), "untracked\n");
+    git(dir, "stash", "-u");
+    git(dir, "stash", "pop");
+    expect(await moveSince(dir, before)).toBeUndefined();
+  });
+
+  it("git reset (unstage) is not a move", async () => {
+    const { dir, before } = await started();
+    writeFileSync(join(dir, "f.txt"), "staged\n");
+    git(dir, "add", "f.txt");
+    git(dir, "reset", "-q");
+    expect(await moveSince(dir, before)).toBeUndefined();
+  });
+
+  it("git checkout <the current branch> is not a move", async () => {
+    const { dir, before } = await started();
+    git(dir, "checkout", "-q", "main");
+    expect(await moveSince(dir, before)).toBeUndefined();
+  });
+
+  it("a commit is not a move", async () => {
+    const { dir, before } = await started();
+    commit(dir, "three");
+    expect(await moveSince(dir, before)).toBeUndefined();
+  });
+
+  it("checkout -b x, a commit, checkout main is a move although the branch name is the same", async () => {
+    const { dir, before } = await started();
+    git(dir, "checkout", "-q", "-b", "x");
+    commit(dir, "on x");
+    git(dir, "checkout", "-q", "main");
+    const now = await readHead(dir) as HeadState;
+    expect(now.branch).toBe(before.branch);
+    expect(now.head).toBe(before.head);
+    expect(await moveSince(dir, before)).toEqual({ kind: "rewritten", detail: "checkout: moving from x to main" });
+  });
+
+  it("git reset --hard HEAD~1 is a rewrite", async () => {
+    const { dir, before } = await started();
+    git(dir, "reset", "-q", "--hard", "HEAD~1");
+    expect(await moveSince(dir, before)).toEqual({ kind: "rewritten", detail: "reset: moving to HEAD~1" });
+  });
+
+  it("git update-ref HEAD HEAD~1 (an empty subject) is a rewrite", async () => {
+    const { dir, before } = await started();
+    git(dir, "update-ref", "HEAD", "HEAD~1");
+    expect(await moveSince(dir, before)).toEqual({ kind: "rewritten", detail: "an unnamed reflog entry" });
+  });
+
+  it("an amend and a merge commit are the producer's own work", async () => {
+    const dir = repo();
+    git(dir, "checkout", "-q", "-b", "side");
+    commit(dir, "side work");
+    git(dir, "checkout", "-q", "main");
+    writeFileSync(join(dir, "m.txt"), "main work\n");
+    git(dir, "add", "-A");
+    git(dir, "commit", "-q", "-m", "main work");
+    const before = await readHead(dir) as HeadState;
+    git(dir, "commit", "-q", "--amend", "-m", "main work, amended");
+    git(dir, "merge", "-q", "--no-ff", "-m", "merge side", "side");
+    expect(await moveSince(dir, before)).toBeUndefined();
+  });
+
+  it("a reflog-less repository (logAllRefUpdates=false) has no count, so the name rule decides", async () => {
+    const dir = fresh();
+    git(dir, "init", "-q", "-b", "main");
+    git(dir, "config", "core.logAllRefUpdates", "false");
+    commit(dir, "one");
+    const before = await readHead(dir) as HeadState;
+    commit(dir, "two");
+    expect(before.reflog).toBeUndefined();
+    expect(await moveSince(dir, before)).toBeUndefined();
   });
 });

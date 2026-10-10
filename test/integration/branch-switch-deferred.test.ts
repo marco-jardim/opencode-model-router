@@ -48,11 +48,11 @@ vi.mock("../../src/verify/head", async importOriginal => {
 
 const DEFERRED_DOD = `VERIFY:deferred\n[acceptance]\ncheck: testsPass command="npm test"\ncheck: fileExists path=index.ts\n[/acceptance]`;
 const SINCE = /the working tree \S+ switched from branch \S+ to branch other since the producer returned; the checks would verify another branch/;
-const ROUND_TRIP = /was checked out or reset since the producer returned \(reflog: "checkout:/;
+const ROUND_TRIP = /moved or was rewritten since the producer returned \(reflog: "checkout:/;
 const UNCONFIRMED = /cannot confirm the branch of \S+: the working tree could not be read at router_verify, so the checks could verify another branch/;
 const RELOCATED = /the working tree \S+ is now \S+ since the producer returned; the checks would verify another tree/;
-const REPLACED = /was checked out or reset since the producer returned \(reflog: "HEAD moved without a reflog entry"\)/;
-const ANY_BRANCH_REASON = /switched from|moved from|cannot confirm the branch|checked out or reset|is now \S+ since the producer returned/;
+const REPLACED = /moved or was rewritten since the producer returned \(reflog: "HEAD moved without a reflog entry"\)/;
+const ANY_BRANCH_REASON = /switched from|moved from|cannot confirm the branch|moved or was rewritten|is now \S+ since the producer returned/;
 
 let home = "";
 let repo = "";
