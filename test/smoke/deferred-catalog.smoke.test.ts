@@ -190,15 +190,11 @@ beforeAll(async () => {
   );
 
   port = await freePort();
-  const serverEnv = { ...process.env };
-  for (const name of Object.keys(serverEnv)) {
-    if (/^OPENCODE_/i.test(name)) delete serverEnv[name];
-  }
   server = spawn("opencode", ["serve", "--port", String(port)], {
     cwd: projectDir,
     // NO --print-logs: it redirects the log to stderr, which would destroy
     // the stderr assertion below.
-    env: { ...serverEnv, HOME: homeDir, USERPROFILE: homeDir },
+    env: { ...process.env, HOME: homeDir, USERPROFILE: homeDir },
     stdio: ["ignore", "pipe", "pipe"],
   });
   server.stdout?.setEncoding("utf8");
