@@ -82,6 +82,10 @@ function temp(prefix: string): string {
 function makeWorld(cfg: RouterConfig, opts: {
   catalog?: Catalog; main?: string; routerVerifyEnabled?: () => boolean;
   createAdmission?: (config: AdmissionConfig) => Pick<AdmissionService, "admit" | "resolve">;
+  /** The session directory's worktree top level (`git rev-parse --show-toplevel`); undefined: the real hardened git. */
+  showToplevel?: (cwd: string) => Promise<string | undefined>;
+  /** Real git for the worktree list, the admission and the toplevel (no fakes). */
+  realGit?: boolean;
 } = {}): World {
   const main = opts.main ?? temp("omr-p21-int-main-");
   let captured: OutcomesBundle | null = null;
@@ -102,7 +106,8 @@ function makeWorld(cfg: RouterConfig, opts: {
     graderAgent: "router-grader",
     directory: main,
     logger,
-    listWorktrees: async () => `worktree ${main.replace(/\\/g, "/")}\nHEAD 0\nbranch refs/heads/main\n`,
+    ...(opts.realGit === true ? {} : { listWorktrees: async () => `worktree ${main.replace(/\\/g, "/")}\nHEAD 0\nbranch refs/heads/main\n` }),
+    ...(opts.showToplevel === undefined ? {} : { showToplevel: opts.showToplevel }),
     env: {},
     ...(opts.routerVerifyEnabled === undefined ? {} : { routerVerifyEnabled: opts.routerVerifyEnabled }),
     ...(opts.createAdmission === undefined ? {} : { createAdmission: opts.createAdmission }),
@@ -810,7 +815,7 @@ describe("cross-repo P1.4: the work root bound through admission", () => {
         // the real admission refuses a `root=` that is not a worktree root; without `root=` it answers by branch
         const resolve = vi.fn(async (decl: { root?: string }): Promise<Admission> => decl.root === undefined
           ? { ok: true, location: locationOf(top) } : { ok: false, reason: `root=${decl.root} is not a worktree root: no work root.` });
-        const world = makeWorld(config({ delegation: "roles", engine: "static" }), { main: sub, createAdmission: () => ({ admit: vi.fn(), resolve }) });
+        const world = makeWorld(config({ delegation: "roles", engine: "static" }), { main: sub, showToplevel: async () => top, createAdmission: () => ({ admit: vi.fn(), resolve }) });
         return { world, top, sub, resolve };
       };
 
@@ -839,6 +844,47 @@ describe("cross-repo P1.4: the work root bound through admission", () => {
         const outcome = await other.router.route(call(other, { agent: "implementer", prompt: EDIT_PROMPT(`root="${sub}" branch=main`) }));
         expect(outcome.role!.workRoot).toBeNull();
         expect(outcome.role!.notes).toContain("root mismatch: no work root.");
+      });
+    });
+
+    describe("QA round 2: the session directory must belong to the bound worktree (real git)", () => {
+      const git = (cwd: string, ...args: string[]): void => {
+        execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t.test", ...args], { cwd, stdio: "ignore" });
+      };
+      const repoWithFeatWorktree = (): { top: string; feat: string } => {
+        const top = temp("omr-qa2-top-");
+        git(top, "init", "-q", "-b", "main");
+        git(top, "commit", "--allow-empty", "-q", "-m", "init");
+        mkdirSync(join(top, ".wt"));
+        git(top, "worktree", "add", "-q", join(top, ".wt", "feat"), "-b", "feat");
+        return { top, feat: realpathSync.native(join(top, ".wt", "feat")) };
+      };
+
+      it("(a) a session in a worktree nested inside main's, with branch=main: never the nested worktree under main's location", async () => {
+        const { top, feat } = repoWithFeatWorktree();
+        const world = makeWorld(config({ delegation: "roles", engine: "static" }), { main: feat, realGit: true });
+        const outcome = await world.router.route(call(world, { agent: "implementer", prompt: EDIT_PROMPT("branch=main") }));
+        expect(outcome.role!.workRoot).not.toBe(feat);
+        expect(outcome.role!.grant.location?.worktree).toBe(top);
+        expect(outcome.role!.workRoot).toBe(top);
+      });
+
+      it("(b) root=<session directory> branch=main with the session in the nested worktree is refused", async () => {
+        const { feat } = repoWithFeatWorktree();
+        const world = makeWorld(config({ delegation: "roles", engine: "static" }), { main: feat, realGit: true });
+        const outcome = await world.router.route(call(world, { agent: "implementer", prompt: EDIT_PROMPT(`root="${feat}" branch=main`) }));
+        expect(outcome.role!.workRoot).toBeNull();
+        expect([...outcome.role!.grant.actions]).not.toContain("edit");
+      });
+
+      it("(c) a plain subdirectory of main with branch=main keeps the session directory as the work root", async () => {
+        const { top } = repoWithFeatWorktree();
+        const sub = join(top, "sub");
+        mkdirSync(sub);
+        const world = makeWorld(config({ delegation: "roles", engine: "static" }), { main: sub, realGit: true });
+        const outcome = await world.router.route(call(world, { agent: "implementer", prompt: EDIT_PROMPT("branch=main") }));
+        expect(outcome.role!.workRoot).toBe(sub);
+        expect(outcome.role!.grant.location?.worktree).toBe(top);
       });
     });
   });

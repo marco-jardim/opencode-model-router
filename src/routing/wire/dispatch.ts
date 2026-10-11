@@ -62,6 +62,7 @@ import {
   BINDING_NOTES, LOCAL_ACTIONS, currentBinding, evictCall, newDispatchNonce, noncePromptLine, nonceTitleSuffix, registerPending, type Binding,
 } from "../roles/binding";
 import { realpathSync } from "node:fs";
+import { dirname } from "node:path";
 import type { Admission, AdmissionConfig, AdmissionService, RepoLocation } from "../roles/admission";
 import { addToWorkingSet, workingSetOf } from "./working-set";
 import {
@@ -278,6 +279,11 @@ export interface DispatchRouterDeps {
    * {@link gitWorktreeList} (the hardened spawn, 5 s timeout). Injected by tests.
    */
   readonly listWorktrees?: (cwd: string) => Promise<string>;
+  /**
+   * Cross-repo QA round 2: hardened `git rev-parse --show-toplevel` in `cwd` (default `gitShowToplevel`, `roles/admission.ts`), used
+   * to check that the session directory belongs to the bound worktree before it stays the work root. Injected by tests.
+   */
+  readonly showToplevel?: (cwd: string) => Promise<string | undefined>;
   /** #84 P2.1: canonical long form of an existing path (default `realpathSync.native`). Only called on an already matched root. */
   readonly realpath?: (path: string) => string;
   /** #84 P2.1: path rules of the work-root comparison (default `process.platform`). */
@@ -1576,6 +1582,10 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     platform: deps.platform ?? process.platform,
   };
 
+  // QA round 2: the hardened `git rev-parse --show-toplevel` of admission (loaded lazily, see `admissionFor`); tests inject a fake.
+  const showToplevel = async (cwd: string): Promise<string | undefined> =>
+    deps.showToplevel !== undefined ? deps.showToplevel(cwd) : (await import("../roles/admission")).gitShowToplevel(cwd);
+
   // Cross-repo (P1.4): one admission per resolved `{ repoParents, repoDepth, repoExclude }` (it caches its git results for 5 s).
   let admissionMemo: { readonly key: string; readonly service: Pick<AdmissionService, "admit" | "resolve"> } | undefined;
   const admissionFor = async (config: AdmissionConfig): Promise<Pick<AdmissionService, "admit" | "resolve">> => {
@@ -1650,16 +1660,44 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       }
     };
     const platform = workRootDeps.platform;
+    /**
+     * QA round 2: `worktree` holds the session directory — not merely by text: a worktree or repository NESTED inside `worktree`
+     * (`.worktrees/`, `.claude/worktrees/`) lies below it too. Walking up from the canonical session directory to `worktree`, the
+     * first directory that is itself a git top level (hardened `rev-parse --show-toplevel`, whose ceiling is the directory's parent,
+     * so a plain subdirectory answers nothing) must be `worktree`; any other top level on the way, or anything unreadable, is "no".
+     */
+    const sessionBelongsTo = async (worktree: string): Promise<boolean> => {
+      if (!strictlyWithin(worktree, sessionDirectory)) return false;
+      const start = canonicalSession();
+      if (start === null) return false;
+      try {
+        const bound = normalizeRootText(workRootDeps.realpath(worktree), platform);
+        let dir = start;
+        for (let depth = 0; depth < 64; depth++) {
+          const here = normalizeRootText(dir, platform);
+          if (here === bound) return true;
+          if (!strictlyWithin(bound, here)) return false;
+          const top = await showToplevel(dir);
+          if (top !== undefined && top !== "" && normalizeRootText(workRootDeps.realpath(top), platform) === here) return false;
+          const parent = dirname(dir);
+          if (parent === dir) return false;
+          dir = parent;
+        }
+        return false;
+      } catch {
+        return false;
+      }
+    };
     const atSession = declaredRoot !== null && line?.branch !== undefined && cross?.admission !== undefined
       && normalizeRootText(declaredRoot, platform) === normalizeRootText(sessionDirectory, platform);
     if (atSession && first.workRoot === null) {
       // The session directory may be inside a worktree rather than its top level: bind by branch, then check it holds the session.
       const retry = await resolveRoleWorkRoot({ root: null, sessionDirectory }, workRootDeps, cross);
-      const inside = retry.location !== undefined && retry.workRoot !== null && strictlyWithin(retry.location.worktree, sessionDirectory);
+      const inside = retry.location !== undefined && retry.workRoot !== null && await sessionBelongsTo(retry.location.worktree);
       const dir = inside ? canonicalSession() : null;
       return dir === null ? first : { ...retry, workRoot: dir, requested: declaredRoot };
     }
-    if (declaredRoot === null && first.workRoot !== null && first.location !== undefined && strictlyWithin(first.location.worktree, sessionDirectory)) {
+    if (declaredRoot === null && first.workRoot !== null && first.location !== undefined && await sessionBelongsTo(first.location.worktree)) {
       const dir = canonicalSession();
       if (dir !== null) return { ...first, workRoot: dir };
     }
