@@ -330,7 +330,16 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
         const request = host.requestsOf(rootID).find(r => r.kind === "primary");
         const system = request?.system ?? "";
         const rLines = (text: string) => text.split(/\r?\n/).filter(line => /^R:/.test(line.trim()) || line.includes("by class:"));
-        const hintLines = system.split(/\r?\n/).filter(line => /Route hint: for |^Why:/.test(line));
+        // v2: the hint is rendered into the LAST <router-state> user message, never into the system blocks (QA-1.2-3)
+        const textOf = (m: unknown): string => {
+          const content = obj(m).content;
+          if (typeof content === "string") return content;
+          return arr(content).map(b => { const t = obj(b).text; return typeof t === "string" ? t : ""; }).join("\n");
+        };
+        const lastStateText = (r: { messages: unknown[] } | undefined): string => (r?.messages ?? []).map(textOf).filter(t => t.includes("<router-state>")).at(-1) ?? "";
+        const stateText = lastStateText(request);
+        const hintLines = stateText.split(/\r?\n/).filter(line => /Route hint: for |^Why:/.test(line));
+        const hintInSystem = /Route hint: for /.test(system);
         // advise never changes a dispatch: the orchestrator asks for fast and the host's child is fast, while the row says it would move to explore
         const dispatched = await host.dispatch(rootID, { agent: "fast", description: "Find usages", prompt: SEARCH_PROMPT, background: false });
         const child = await host.client.session.get({ sessionID: dispatched.childID });
@@ -340,6 +349,9 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
         s.observed.rootRequest = { catalogModel: request?.catalogModel, agent: request?.agent, systemChars: system.length, rLines: rLines(system), hintLines };
         s.observed.controlRLines = rLines(controlSystem);
         s.observed.controlHasHint = /Route hint: for /.test(controlSystem);
+        s.observed.hintInSystem = hintInSystem;
+        s.observed.hintInLastRouterState = hintLines.length > 0;
+        s.observed.routerStateMessages = (request?.messages ?? []).filter(m => textOf(m).includes("<router-state>")).length;
         s.observed.routeLineParagraphPresent = /\[route class=/.test(system);
         s.observed.hostChild = { id: dispatched.childID, agent: child.agent, model: child.model };
         s.observed.row = rows[0];
@@ -347,7 +359,7 @@ d("routing engine on the real OpenCode v2 host (Phase 3.2)", () => {
         const row = rows[0]!;
         const seededLine = rLines(system).join("\n");
         const controlLine = rLines(controlSystem).join("\n");
-        const ok = request !== undefined && /Route hint: for search work like this turn, prefer @explore/.test(system) && !/Route hint: for /.test(controlSystem)
+        const ok = request !== undefined && /Route hint: for search work like this turn, prefer @explore/.test(stateText) && !hintInSystem && !/Route hint: for /.test(controlSystem)
           && seededLine !== controlLine && /search.{0,4}@explore/.test(seededLine) && !/@explore/.test(controlLine)
           && child.agent === "fast" && sameModel(child.model, SONNET, "low")
           && row.mode === "advise" && row.switched === true && row.chosen.agent === "fast" && row.best?.agent === "explore"

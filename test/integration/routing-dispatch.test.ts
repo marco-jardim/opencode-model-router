@@ -24,6 +24,7 @@ import type { DecisionRow, OutcomesBundle } from "../../src/routing/outcomes/typ
 import { resetIngestState } from "../../src/routing/outcomes/ingest";
 import { summarize } from "../../src/routing/outcomes/stats";
 import { legacyPresets } from "../helpers/legacy-presets";
+import ModelRouterPlugin from "../../src/index";
 
 const logger = { warn: vi.fn() };
 
@@ -899,6 +900,33 @@ describe("advise: input untouched, protocol and hint through the context hook", 
     expect(texts[0]!.replace(/\n\nRouting line \(optional\)[\s\S]*$/, "")).toBe(shipped.replace(buildTaskTaxonomy(cfg), () => `${buildTaskTaxonomy(cfg)} | by class: search→@explore recon→@explore`));
     expect(texts[1]).toBe("Route hint: for recon work like this turn, prefer @explore (Fast read-only codebase exploration).");
     expect(texts[1]!.split("\n")).toHaveLength(1);
+  });
+
+  it("through the real plugin (which attaches the turn-state registry) the real hint rides in the tail and not in the system array", async () => {
+    const world = await makeWorld({ engine: "advise", margin: 0.1, roles: { search: ["explore"], recon: ["explore"] } });
+    world.seed(KEYS.fast, 0, 20);
+    world.seed(KEYS.explore, 20, 0);
+    world.seed(KEYS.reconFast, 0, 20);
+    world.seed(KEYS.reconExplore, 20, 0);
+    const hooks = await ModelRouterPlugin({
+      directory: world.home,
+      worktree: world.home,
+      project: {},
+      serverUrl: new URL("http://localhost"),
+      $: () => undefined,
+      routerHost: "v2",
+      client: { session: { get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id } }) } },
+    } as unknown as Parameters<typeof ModelRouterPlugin>[0]);
+    await world.start(hooks as unknown as Record<string, unknown>);
+    const event = turn("Find all the usages of parseConfig in the repository");
+    await world.sessionHooks.context(event);
+
+    const systemTexts = event.system.map((part: { text: string }) => part.text) as string[];
+    expect(systemTexts.some((text) => text.includes("Route hint: for"))).toBe(false);
+    const tail = event.messages[event.messages.length - 1];
+    expect(tail.role).toBe("user");
+    expect(tail.content[0].text).toContain("<router-state>");
+    expect(tail.content[0].text).toContain("Route hint: for recon work like this turn, prefer @explore (Fast read-only codebase exploration).");
   });
 
   it("without evidence the R: line is the shipped one and there is no hint, only the route paragraph", async () => {

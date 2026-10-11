@@ -1,0 +1,13 @@
+<router-state>
+[router] Background verification found introduced failures:
+- <handle-1> · late work · failing: a.test.ts > t2
+[router] Nothing was retried; decide whether to re-dispatch.
+[router] Call `router_verify` with a handle for its full verdict; nothing is run again.
+
+[router] Unverified delegations in this session (newest first):
+- <handle-2> · risk low · work 2
+- <handle-3> · risk high · work 1
+[router] Before your final answer, call `router_verify` with the handles that matter, or with `pending: true` for all of them.
+
+Route hint: for implement work like this turn, prefer @heavy (Opus for architecture and hard debugging).
+</router-state>

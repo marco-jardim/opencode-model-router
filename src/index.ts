@@ -90,6 +90,7 @@ import { isAnnotationRow, verdictGraderOf, verdictOf, type LogRow } from "./rout
 import { createPersister, nodePersistDeps, summarizeRoles } from "./routing/outcomes";
 import { roleAgentSteps } from "./router/role-agents";
 import type { HostBudgetObservation } from "./compat/v2-hooks";
+import { ROUTER_TURN_STATE_ATTACH, TURN_STATE_ROOT, type TurnStateRegistry } from "./compat/turn-state";
 import { checkpointLine, formatStatsReply, runStatsCommand } from "./routing/commands/stats";
 import { buildAnnotateDirectives } from "./routing/commands/annotate-plan";
 import { applyV1Roles, hasExplicitV1Roles, v1AgentInfos } from "./routing/commands/v1-roles";
@@ -132,8 +133,8 @@ import { access, readFile as fsReadFile } from "node:fs/promises";
 import { tool } from "@opencode-ai/plugin";
 import { scrubText } from "./guard/scrub";
 import { accept, unverifiableGateResult } from "./verify/gate";
-import { applyDispatchCaveats, createVerificationWiring, dispatchDirectiveText, extractAssistantText, parseRouterVerifyArgs, type DispatchStart } from "./verify/wiring";
-import { appendRouterFooter, buildLateNoticeBlock, buildPendingListBlock } from "./verify/pending";
+import { applyDispatchCaveats, createVerificationWiring, dispatchDirectiveText, extractAssistantText, parseRouterVerifyArgs, type DispatchStart, type HandleReport } from "./verify/wiring";
+import { appendRouterFooter, buildLateNoticeBlock, buildPendingListBlock, type LateNotice } from "./verify/pending";
 import { createDeadline } from "./verify/deterministic";
 import {
   DEFAULT_DELEGATE_PROMPT_TIMEOUT_MS,
@@ -353,6 +354,68 @@ const V1_HOST_BUILTIN_AGENTS: Record<string, { mode: string }> = {
 
 const SESSION_ROOT_MEMO_MAX = 500;
 const SESSION_LOOKUP_RETRY_MS = DEPTH_LOOKUP_RETRY_MS;
+
+/** Phase 1.2 (v2 only): bounds of the late-notice buffer behind the `late` turn-state provider. */
+const LATE_BUFFER_PER_SESSION = 50;
+const LATE_BUFFER_SESSIONS = 100;
+
+/**
+ * Late notices retained per session until `router_verify` answers their handle, so a request that fails after the
+ * transform read them does not lose them (the v1 path delivers them once). First-seen order; a repeated handle replaces
+ * its notice in place; the oldest notice and the least recently used session go at the bounds.
+ */
+interface LateBuffer {
+  add(sessionID: string, notices: readonly LateNotice[]): void;
+  list(sessionID: string): LateNotice[];
+  release(sessionID: string, handles: readonly string[]): void;
+  /** Marks the session as most recently used (a render read its notices). */
+  touch(sessionID: string): void;
+  /** Drops the session's buffer (`session.deleted`). */
+  forget(sessionID: string): void;
+}
+
+function createLateBuffer(): LateBuffer {
+  const sessions = new Map<string, Map<string, LateNotice>>();
+  return {
+    add(sessionID, notices) {
+      if (notices.length === 0) return;
+      const buffer = sessions.get(sessionID) ?? new Map<string, LateNotice>();
+      sessions.delete(sessionID);
+      sessions.set(sessionID, buffer);
+      for (const notice of notices) buffer.set(notice.handle, notice);
+      while (buffer.size > LATE_BUFFER_PER_SESSION) buffer.delete(buffer.keys().next().value!);
+      while (sessions.size > LATE_BUFFER_SESSIONS) sessions.delete(sessions.keys().next().value!);
+    },
+    list(sessionID) {
+      return [...(sessions.get(sessionID)?.values() ?? [])];
+    },
+    release(sessionID, handles) {
+      const buffer = sessions.get(sessionID);
+      if (buffer === undefined) return;
+      for (const handle of handles) buffer.delete(handle);
+      if (buffer.size === 0) sessions.delete(sessionID);
+    },
+    touch(sessionID) {
+      const buffer = sessions.get(sessionID);
+      if (buffer === undefined) return;
+      sessions.delete(sessionID);
+      sessions.set(sessionID, buffer);
+    },
+    forget(sessionID) {
+      sessions.delete(sessionID);
+    },
+  };
+}
+
+/** The handles a router_verify report answers: a verdict, an unknown input, an expired handle. A run that outlived the call ("elsewhere") has no verdict yet. */
+function answeredHandles(items: readonly HandleReport[]): string[] {
+  const handles: string[] = [];
+  for (const item of items) {
+    if (item.kind === "verdict" || item.kind === "expired") handles.push(item.handle);
+    else if (item.kind === "unknown") handles.push(item.input);
+  }
+  return handles;
+}
 
 const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // Project directory this plugin instance serves. Hosts that run several
@@ -755,6 +818,67 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // QA-2.1-11: deferred (unref'd timer), so plugin start never holds the project directory with a
   // git child; dispose cancels it.
   const stopReferenceGc = startReferenceGc();
+
+  // Phase 1.2 (v2 only): the turn-state registry the adapter injects. Without it (v1, or a v2 host that injects none) nothing
+  // below is registered or buffered, and the system transform keeps pushing the pending list and the late notices.
+  // The registry arrives through the ROUTER_TURN_STATE_ATTACH hook the v2 adapter calls (the only channel); the hook
+  // returns whether the registry was accepted.
+  let turnState: TurnStateRegistry | undefined;
+  const lateBuffer: LateBuffer | undefined = isV2Host ? createLateBuffer() : undefined;
+  const unregisterTurnStateProviders: Array<() => void> = [];
+  let warnedSecondRegistry = false;
+  const attachTurnState = (registry: TurnStateRegistry): boolean => {
+    if (turnState !== undefined) {
+      if (turnState !== registry && !warnedSecondRegistry) {
+        warnedSecondRegistry = true;
+        logger.warn("[router] turn state: a second registry was ignored");
+      }
+      return turnState === registry;
+    }
+    turnState = registry;
+    if (lateBuffer === undefined) return true;
+    try {
+      // Late notices of background runs that did not pass: buffered before the block is built (a builder throw loses
+      // nothing) and kept until router_verify answers their handle.
+      unregisterTurnStateProviders.push(turnState.registerTurnStateProvider({
+        name: "late",
+        order: 10,
+        render(sid) {
+          if (background === undefined) return undefined;
+          lateBuffer.add(sid, background.takeNotices(sid));
+          lateBuffer.touch(sid);
+          return buildLateNoticeBlock(lateBuffer.list(sid));
+        },
+        active(sid) {
+          return lateBuffer.list(sid).length > 0;
+        },
+      }));
+      // This orchestrator's still-unverified delegations (the same arguments the v1 transform passes).
+      unregisterTurnStateProviders.push(turnState.registerTurnStateProvider({
+        name: "pending",
+        order: 20,
+        render(sid) {
+          return buildPendingListBlock(pending.listPending(sid, { verifying: background !== undefined }));
+        },
+        active(sid) {
+          return pending.listPending(sid, { verifying: background !== undefined }).length > 0;
+        },
+      }));
+    } catch (error) {
+      logger.warn("[router] turn state: late/pending providers not registered", { error: scrubText(String(error)) });
+      // Nothing stays half registered: the system transform keeps delivering through the system array.
+      for (const unregister of unregisterTurnStateProviders.splice(0)) {
+        try {
+          unregister();
+        } catch (unregisterError) {
+          logger.warn("[router] turn state: unregistering a provider failed", { error: scrubText(String(unregisterError)) });
+        }
+      }
+      turnState = undefined;
+      return false;
+    }
+    return true;
+  };
 
   // Best-effort, secret-free delegate scorecard dump (counts only).
   const dumpDelegateScorecard = (
@@ -1286,13 +1410,15 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     roleBudgetPeaks.delete(sessionID);
     for (const [callID, sent] of roleDispatchTexts) if (sent.parentSessionID === sessionID) roleDispatchTexts.delete(callID);
   };
-  return {
+  const routerHooks: Awaited<ReturnType<Plugin>> = {
     // Warnings post to /log fire-and-forget, which loses the message when the
     // process is about to exit — `opencode run` and `opencode debug` are short
     // enough for that to be the normal case. Verified against opencode 1.18.16
     // that dispose is both called and awaited, so flushing here is enough.
     dispose: async () => {
       stopReferenceGc();
+      // Phase 1.2: the turn-state providers of this instance leave the (adapter-owned) registry.
+      for (const unregister of unregisterTurnStateProviders.splice(0)) unregister();
       // Stop new advisor work and finish state/claim writes and lock removal before teardown.
       await advisorNotifier?.dispose();
       // 2.4.5: abort a background run and drop its queue and notices before the registry goes.
@@ -1934,6 +2060,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             // R6: handles are scoped by the calling session; without one, every handle is unknown.
             const sessionID = typeof toolCtx?.sessionID === "string" ? toolCtx.sessionID : "";
             const report = await verifyHandles(sessionID, target, toolCtx?.abort !== undefined ? { signal: toolCtx.abort } : {});
+            // Phase 1.2 (v2 only): the late notices this report answers stop being retained for the turn-state tail.
+            lateBuffer?.release(sessionID, answeredHandles(report.items));
             return report.text;
           } catch (error) {
             logger.warn("[verify] router_verify failed", { error: scrubText(String(error)) });
@@ -2651,6 +2779,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               if (key.startsWith(`${id}:`)) depthBanners.delete(key);
             }
             warnedNoCallID.delete(id);
+            lateBuffer?.forget(id);
             forgetRoleSession(id); // #84 P2.1 (the binding and authority registries are evicted by the v2 adapter)
             // 2.4.2b: a deleted orchestrator's handles, tombstones and lineage records go with it.
             // 2.4.5: so do its background requests and late notices; its run in flight is aborted.
@@ -3047,27 +3176,34 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       // a system part that changes would cost the orchestrator its prompt cache (QA-2.4-9).
       advisorNotifier?.poll();
 
-      // 2.4.4, section 1.5-20: this orchestrator's still-unverified delegations (at most 5 shown,
-      // newest first), as one short block. Nothing is pushed when the list is empty, so the prompt
-      // does not grow for sessions that never defer. Orchestrator path only: every child returned
-      // above. With background mode on, an entry the queue is verifying right now is still
-      // unverified to the orchestrator, so it stays listed until its run settles.
-      try {
-        // QA-2.4-3: plus background verdicts that did not pass, until router_verify replays them.
-        const open = pending.listPending(sessionID, { verifying: background !== undefined });
-        const block = buildPendingListBlock(open);
-        if (block !== undefined) output.system.push(block);
-      } catch (error) {
-        logger.warn("[verify] pending list not injected", { error: scrubText(String(error)) });
-      }
-      // 2.4.5, section 1.5-19 (`background: true` only): late notices of background runs that did
-      // not pass, each delivered once (takeNotices marks them delivered).
-      if (background !== undefined) {
+      if (turnState !== undefined) {
+        // Phase 1.2 (v2 only): the pending list, the late notices and the route hint are rendered into the turn-state tail
+        // by the context hook, never into the system array (which stays byte-identical between requests). This point is
+        // reached for root sessions only (every child returned above): the flag tells the hook to build the tail.
+        output[TURN_STATE_ROOT] = true;
+      } else {
+        // 2.4.4, section 1.5-20: this orchestrator's still-unverified delegations (at most 5 shown,
+        // newest first), as one short block. Nothing is pushed when the list is empty, so the prompt
+        // does not grow for sessions that never defer. Orchestrator path only: every child returned
+        // above. With background mode on, an entry the queue is verifying right now is still
+        // unverified to the orchestrator, so it stays listed until its run settles.
         try {
-          const late = buildLateNoticeBlock(background.takeNotices(sessionID));
-          if (late !== undefined) output.system.push(late);
+          // QA-2.4-3: plus background verdicts that did not pass, until router_verify replays them.
+          const open = pending.listPending(sessionID, { verifying: background !== undefined });
+          const block = buildPendingListBlock(open);
+          if (block !== undefined) output.system.push(block);
         } catch (error) {
-          logger.warn("[verify] late notices not injected", { error: scrubText(String(error)) });
+          logger.warn("[verify] pending list not injected", { error: scrubText(String(error)) });
+        }
+        // 2.4.5, section 1.5-19 (`background: true` only): late notices of background runs that did
+        // not pass, each delivered once (takeNotices marks them delivered).
+        if (background !== undefined) {
+          try {
+            const late = buildLateNoticeBlock(background.takeNotices(sessionID));
+            if (late !== undefined) output.system.push(late);
+          } catch (error) {
+            logger.warn("[verify] late notices not injected", { error: scrubText(String(error)) });
+          }
         }
       }
     },
@@ -3237,6 +3373,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       }
     },
   };
+  if (isV2Host) {
+    // Phase 1.2 (v2 only): non-enumerable, so spreading or enumerating the hooks never sees it.
+    Object.defineProperty(routerHooks, ROUTER_TURN_STATE_ATTACH, { value: attachTurnState, enumerable: false });
+  }
+  return routerHooks;
 };
 
 export default ModelRouterPlugin;
