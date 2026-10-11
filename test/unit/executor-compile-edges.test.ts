@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import { Reach, conflictEdges, contractEdges, minimalCycle, type EdgeTask } from "../../src/executor/compile/edges";
 import { UNKNOWN_WRITES } from "../../src/executor/compile/footprint";
+import { parsePlan } from "../../src/executor/compile/parse";
 import { ExecutorError, type LedgerV1 } from "../../src/executor/types";
 import { compileOpts, edgeKeys, makeHarness, planPathOf } from "../fixtures/cpx/plans/harness";
 import { fixturePath } from "../fixtures/cpx/plans/loader";
@@ -82,7 +83,9 @@ describe("executor compile: edges (2.3.4)", () => {
       const edges = conflictEdges(tasks, reachOf(tasks), false);
       const keys = edges.map((e) => `${e.from}>${e.to}`);
       expect(keys).toContain("u>v");
-      expect(keys).toContain("u>x");
+      // x conflicts with both u and v; the nearest predecessor links first and u>x is then implied (u>v>x).
+      expect(keys).toContain("v>x");
+      expect(keys).not.toContain("u>x");
       expect(keys).not.toContain("v>u");
       expect(keys.some((k) => k.includes("w"))).toBe(false);
       expect(edges.every((e) => e.kind === "conflict")).toBe(true);
@@ -99,6 +102,26 @@ describe("executor compile: edges (2.3.4)", () => {
       const edges = conflictEdges(tasks, reachOf(tasks), false);
       expect(edges).toHaveLength(1);
       expect(edges[0]?.confidence).toBe("low");
+    });
+
+    it("QA-2.3-4: 300 unknown-footprint tasks get at most n-1 conflict edges, fast", () => {
+      const n = 300;
+      const tasks = Array.from({ length: n }, (_, i) => et(`t${i}`, { planIndex: i, writes: UNKNOWN_WRITES, confidence: "unknown" }));
+      const started = Date.now();
+      const edges = conflictEdges(tasks, reachOf(tasks), false);
+      expect(Date.now() - started).toBeLessThan(2000);
+      expect(edges.length).toBeLessThanOrEqual(n - 1);
+      // The nearest predecessor links first: the chain t0 > t1 > … is what remains.
+      expect(edges.map((e) => `${e.from}>${e.to}`)).toContain("t298>t299");
+    });
+
+    it("QA-2.3-4: a ⊤ task after disjoint writers links each of them once", () => {
+      const tasks = [
+        et("a", { planIndex: 0, writes: ["src/a.ts"] }),
+        et("b", { planIndex: 1, writes: ["src/b.ts"] }),
+        et("top", { planIndex: 2, writes: UNKNOWN_WRITES, confidence: "unknown" }),
+      ];
+      expect(conflictEdges(tasks, reachOf(tasks), false).map((e) => `${e.from}>${e.to}`).sort()).toEqual(["a>top", "b>top"]);
     });
 
     it("ignores qa reads and non-launchable tasks", () => {
@@ -132,7 +155,7 @@ describe("executor compile: edges (2.3.4)", () => {
           task("1.1.3", "Step three", "src/alpha/format.ts"),
           task("1.1.4", "Step four", "src/beta/util.ts"),
         ].join(""),
-        "Order: 1.1.1 → (1.1.2 ∥ 1.1.3) → 1.1.4\n\n",
+        "**Order:** 1.1.1 → (1.1.2 ∥ 1.1.3) → 1.1.4\n\n",
       )}`;
       const { draft } = await compileInline(text);
       const keys = edgeKeys(draft);
@@ -162,6 +185,30 @@ describe("executor compile: edges (2.3.4)", () => {
     });
   });
 
+  describe("QA-2.3 round 1 (batch B)", () => {
+    it("QA-2.3-17: a wave made only of dogfood phases does not break the wave-gate chain", async () => {
+      const text = `# P\n\n## Wave 1\n\n${phase("1.1", task("1.1.1", "A", "src/alpha/core.ts"))}\n## Wave 2\n\n### Dogfood switch DF-1 Switch\n\n- DF1.1 Flip it by hand.\n\n## Wave 3\n\n${phase(
+        "3.1",
+        task("3.1.1", "B", "src/beta/util.ts"),
+      )}`;
+      // The middle wave really holds a dogfood phase (not an empty wave that would pass for another reason).
+      const parsed = parsePlan(text);
+      expect(parsed.phases.find((p) => p.id === "DF1")?.dogfood).toBe(true);
+      expect(parsed.waves.find((w) => w.phases.includes("DF1"))?.phases).toEqual(["DF1"]);
+      const { draft } = await compileInline(text);
+      expect(edgeKeys(draft)).toContain("gate:1.1>3.1.1");
+    });
+
+    it("QA-2.3-10: a graph edge to a phase outside the run is reported, not dropped silently", async () => {
+      const text = `# P\n\n## Wave 1\n\n${phase("1.1", task("1.1.1", "A", "src/alpha/core.ts"))}\n${phase(
+        "1.2",
+        task("1.2.1", "B", "src/beta/util.ts"),
+      )}\n\`\`\`\n1.1 --> 1.2\n\`\`\`\n`;
+      const { warnings } = await compileInline(text, { phases: ["1.1"] });
+      expect(warnings.some((w) => w.startsWith("ref-outside-run"))).toBe(true);
+    });
+  });
+
   describe("graph blocks", () => {
     it("reads ->, → and --> chains and mermaid blocks", async () => {
       const { draft } = await compileFixture("synthetic/graph-arrows.md");
@@ -188,7 +235,7 @@ describe("executor compile: edges (2.3.4)", () => {
       `# P\n\n## Wave 1\n\n${phase(
         "1.1",
         `- **1.1.1** \`[tier:medium]\` Step one; ${phrase} 1.1.2 to exist.\n  Writes: \`src/alpha/core.ts\`\n${task("1.1.2", "Step two", "src/alpha/helpers.ts")}`,
-        "Order: 1.1.1 → 1.1.2\n\n",
+        "**Order:** 1.1.1 → 1.1.2\n\n",
       )}`;
     const unknownRef = (phrase: string): string =>
       `# P\n\n## Wave 1\n\n${phase("1.1", `- **1.1.1** \`[tier:medium]\` Step one; ${phrase} 9.9 landing first.\n  Writes: \`src/alpha/core.ts\`\n`)}`;

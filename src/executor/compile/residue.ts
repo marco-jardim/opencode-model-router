@@ -107,7 +107,9 @@ function residueTaskIdsUncapped(draft: LedgerV1): TaskId[] {
 /**
  * Tasks the architect is asked about: editing tasks whose footprint is `unknown` or `inferred`, in plan order,
  * capped at `RESIDUE_MAX_TASKS`. Pure from the draft, so the digest is recomputable at validation time.
- * (Suffix/basename-mapped writes are not recorded in the ledger; they are `inferred` and so already included.)
+ * Footprints that are `explicit` or `ownership` are never asked about, even when a suffix/basename match made them
+ * low-confidence: the ledger does not record that flag. An ownership-assumed footprint is `inferred` (QA-2.3-5), so it
+ * is asked about and the architect may add to it.
  */
 export function residueTaskIds(draft: LedgerV1): TaskId[] {
   return residueTaskIdsUncapped(draft).slice(0, RESIDUE_MAX_TASKS);
@@ -422,13 +424,16 @@ function normalizeList(
   list: readonly string[],
   at: string,
   roots: ReadonlyArray<{ text: string; ci: boolean }>,
+  ci: boolean,
 ): { ok: true; value: string[] } | { ok: false; at: string; path: string; reason: string } {
   const out: string[] = [];
+  const keys = new Set<string>();
   for (let i = 0; i < list.length; i++) {
     const raw = list[i] as string;
     const r = normalizeResiduePath(raw, roots);
     if (!r.ok) return { ok: false, at: `${at}[${i}]`, path: raw, reason: r.reason };
-    if (!out.includes(r.path)) out.push(r.path);
+    const k = foldKey(r.path, ci);
+    if (!keys.has(k)) { keys.add(k); out.push(r.path); }
   }
   return { ok: true, value: out };
 }
@@ -550,16 +555,31 @@ function newEdges(draft: LedgerV1, r: ResidueResponse): ResidueEdgeEntry[] {
 
 // --- validate --------------------------------------------------------------------------------------------------
 
-function setEquals(a: readonly string[], b: readonly string[]): boolean {
-  return a.length === b.length && a.every((x) => b.includes(x)) && b.every((x) => a.includes(x));
+function foldKey(p: string, ci: boolean): string {
+  return ci ? p.toLowerCase() : p;
+}
+
+function setEquals(a: readonly string[], b: readonly string[], ci: boolean): boolean {
+  const ka = new Set(a.map((x) => foldKey(x, ci)));
+  const kb = new Set(b.map((x) => foldKey(x, ci)));
+  return ka.size === kb.size && [...ka].every((x) => kb.has(x));
+}
+
+/** The members of `old` that `now` does not contain (compared by folded key). */
+function missingFrom(old: readonly string[], now: readonly string[], ci: boolean): string[] {
+  const keys = new Set(now.map((x) => foldKey(x, ci)));
+  return old.filter((p) => !keys.has(foldKey(p, ci)));
 }
 
 /**
  * Validates a parsed response against the draft. Order (first failure wins): `residue-json`, `residue-delete`,
- * `residue-schema`, `residue-digest`, `residue-unknown-task`, `residue-weaken`, `residue-path`, `residue-cycle`.
- * On success the value carries normalized repo-relative paths.
+ * `residue-schema`, `residue-digest`, `residue-unknown-task` (also a task that was not part of the request),
+ * `residue-path`, `residue-weaken`, `residue-cycle`. Paths are normalized before the weaken check and compared by
+ * case-folded key when `o.ci` (default true, the safe side for a response). On success the value carries normalized
+ * repo-relative paths.
  */
-export function validateResidue(draft: LedgerV1, v: unknown): ResidueValidation {
+export function validateResidue(draft: LedgerV1, v: unknown, o: { ci?: boolean } = {}): ResidueValidation {
+  const ci = o.ci ?? true;
   if (v === undefined) return fail("residue-json", "$", { reason: "no parseable JSON" });
 
   const del = findDeleteKey(v);
@@ -575,9 +595,12 @@ export function validateResidue(draft: LedgerV1, v: unknown): ResidueValidation 
   }
 
   const phaseIds = new Set(draft.phases.map((p) => p.id));
+  // QA-2.3-6: footprints and noChange may only name the tasks that were asked about (the capped request set).
+  const asked = new Set(residueTaskIds(draft));
   for (let i = 0; i < r.footprints.length; i++) {
     const id = (r.footprints[i] as ResidueFootprintEntry).taskId;
     if (!has(draft.tasks, id)) return fail("residue-unknown-task", `$.footprints[${i}].taskId`, { id });
+    if (!asked.has(id)) return fail("residue-unknown-task", `$.footprints[${i}].taskId`, { id, reason: "not part of the request" });
   }
   for (let i = 0; i < r.edges.length; i++) {
     const e = r.edges[i] as ResidueEdgeEntry;
@@ -588,14 +611,27 @@ export function validateResidue(draft: LedgerV1, v: unknown): ResidueValidation 
   for (let i = 0; i < r.noChange.length; i++) {
     const id = r.noChange[i] as string;
     if (!has(draft.tasks, id)) return fail("residue-unknown-task", `$.noChange[${i}]`, { id });
+    if (!asked.has(id)) return fail("residue-unknown-task", `$.noChange[${i}]`, { id, reason: "not part of the request" });
   }
 
+  // QA-2.3-15: paths are normalized first, then compared by case-folded key (a response may respell the case).
+  const roots = [rootKey(draft.repo.toplevel), rootKey(draft.integration.worktree)];
+  const value: ResidueResponse = { ...r, footprints: [] };
   for (let i = 0; i < r.footprints.length; i++) {
     const e = r.footprints[i] as ResidueFootprintEntry;
+    const writes = normalizeList(e.writes, `$.footprints[${i}].writes`, roots, ci);
+    if (!writes.ok) return fail("residue-path", writes.at, { path: writes.path, reason: writes.reason });
+    const reads = normalizeList(e.reads, `$.footprints[${i}].reads`, roots, ci);
+    if (!reads.ok) return fail("residue-path", reads.at, { path: reads.path, reason: reads.reason });
+    value.footprints.push({ ...e, writes: writes.value, reads: reads.value });
+  }
+
+  for (let i = 0; i < value.footprints.length; i++) {
+    const e = value.footprints[i] as ResidueFootprintEntry;
     const old = (draft.tasks[e.taskId] as TaskNode).footprint;
     const at = `$.footprints[${i}]`;
     if (old.confidence === "explicit" || old.confidence === "ownership") {
-      if (!setEquals(e.writes, old.writes) || !setEquals(e.reads, old.reads)) {
+      if (!setEquals(e.writes, old.writes, ci) || !setEquals(e.reads, old.reads, ci)) {
         return fail("residue-weaken", at, {
           reason: `changes the footprint of a ${old.confidence} task`,
           taskId: e.taskId,
@@ -603,8 +639,8 @@ export function validateResidue(draft: LedgerV1, v: unknown): ResidueValidation 
         });
       }
     }
-    const missingWrites = old.writes.filter((p) => !e.writes.includes(p));
-    const missingReads = old.reads.filter((p) => !e.reads.includes(p));
+    const missingWrites = missingFrom(old.writes, e.writes, ci);
+    const missingReads = missingFrom(old.reads, e.reads, ci);
     if (missingWrites.length > 0 || missingReads.length > 0) {
       return fail("residue-weaken", at, {
         reason: "omits existing paths",
@@ -613,17 +649,6 @@ export function validateResidue(draft: LedgerV1, v: unknown): ResidueValidation 
         missingReads,
       });
     }
-  }
-
-  const roots = [rootKey(draft.repo.toplevel), rootKey(draft.integration.worktree)];
-  const value: ResidueResponse = { ...r, footprints: [] };
-  for (let i = 0; i < r.footprints.length; i++) {
-    const e = r.footprints[i] as ResidueFootprintEntry;
-    const writes = normalizeList(e.writes, `$.footprints[${i}].writes`, roots);
-    if (!writes.ok) return fail("residue-path", writes.at, { path: writes.path, reason: writes.reason });
-    const reads = normalizeList(e.reads, `$.footprints[${i}].reads`, roots);
-    if (!reads.ok) return fail("residue-path", reads.at, { path: reads.path, reason: reads.reason });
-    value.footprints.push({ ...e, writes: writes.value, reads: reads.value });
   }
 
   const nodes: string[] = [...Object.keys(draft.tasks), ...draft.phases.map((p) => gateName(p.id))];
@@ -644,9 +669,13 @@ export function validateResidue(draft: LedgerV1, v: unknown): ResidueValidation 
 // Merge
 // ---------------------------------------------------------------------------------------------------------------
 
-function union(a: readonly string[], b: readonly string[]): string[] {
+function union(a: readonly string[], b: readonly string[], ci: boolean): string[] {
   const out = [...a];
-  for (const p of b) if (!out.includes(p)) out.push(p);
+  const keys = new Set(a.map((p) => foldKey(p, ci)));
+  for (const p of b) {
+    const k = foldKey(p, ci);
+    if (!keys.has(k)) { keys.add(k); out.push(p); }
+  }
   return out;
 }
 
@@ -656,7 +685,8 @@ function union(a: readonly string[], b: readonly string[]): string[] {
  * New edges are `kind:"llm"` with at most `medium` confidence; existing pairs are skipped. Status, `seq` and the
  * `conflict` edges are the caller's (`index.mergeResidue`). The input is not modified.
  */
-export function mergeResidueInto(draft: LedgerV1, r: ResidueResponse): LedgerV1 {
+export function mergeResidueInto(draft: LedgerV1, r: ResidueResponse, o: { ci?: boolean } = {}): LedgerV1 {
+  const ci = o.ci ?? true;
   const tasks: Record<TaskId, TaskNode> = { ...draft.tasks };
   for (const e of r.footprints) {
     const t = tasks[e.taskId];
@@ -665,8 +695,8 @@ export function mergeResidueInto(draft: LedgerV1, r: ResidueResponse): LedgerV1 
     tasks[e.taskId] = {
       ...t,
       footprint: {
-        writes: union(fp.writes, e.writes),
-        reads: union(fp.reads, e.reads),
+        writes: union(fp.writes, e.writes, ci),
+        reads: union(fp.reads, e.reads, ci),
         confidence: fp.confidence === "unknown" ? "inferred" : fp.confidence,
         sources: fp.sources.includes("llm") ? [...fp.sources] : [...fp.sources, "llm"],
       },

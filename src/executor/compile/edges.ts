@@ -323,18 +323,25 @@ export function structuralEdges(p: ParsedPlan, tasks: readonly EdgeTask[], cross
 
   if (crossPhase === "gate") {
     const waves = [...p.waves].sort((a, b) => a.line - b.line);
-    for (let k = 1; k < waves.length; k += 1) {
-      const prev = at(waves, k - 1);
-      const cur = at(waves, k);
-      for (const pid of prev.phases) {
-        const pph = phaseById.get(pid);
-        if (pph === undefined || pph.dogfood) continue;
-        for (const qid of cur.phases) {
-          for (const s of core.sources.get(qid) ?? []) {
-            out.add(mkEdge(gateOf(pid), s, "structural", "high", evidenceOf("wave-gate", cur.line, `wave ${prev.id} before wave ${cur.id}`)));
+    // A wave made only of dogfood phases has no gates: the chain goes through to the previous gated wave.
+    const gated = (w: (typeof waves)[number]): boolean => w.phases.some((pid) => {
+      const pph = phaseById.get(pid);
+      return pph !== undefined && !pph.dogfood;
+    });
+    let prev: (typeof waves)[number] | undefined;
+    for (const cur of waves) {
+      if (prev !== undefined) {
+        for (const pid of prev.phases) {
+          const pph = phaseById.get(pid);
+          if (pph === undefined || pph.dogfood) continue;
+          for (const qid of cur.phases) {
+            for (const s of core.sources.get(qid) ?? []) {
+              out.add(mkEdge(gateOf(pid), s, "structural", "high", evidenceOf("wave-gate", cur.line, `wave ${prev.id} before wave ${cur.id}`)));
+            }
           }
         }
       }
+      if (gated(cur)) prev = cur;
     }
   }
   return out.list();
@@ -385,8 +392,16 @@ export function graphEdges(p: ParsedPlan, tasks: readonly EdgeTask[]): { edges: 
     for (const e of g.edges) {
       const from = resolve(e.from);
       const to = resolve(e.to);
-      // Unknown nodes were already reported by the parser (`graph-node-unknown`).
-      if (from === null || to === null || (from.kind === to.kind && from.id === to.id)) continue;
+      // A node that is not a task, phase or wave of this run (a phase outside the run, or one the parser already
+      // reported as `graph-node-unknown`) drops the edge, loudly.
+      if (from === null || to === null) {
+        const missing = [from === null ? e.from : null, to === null ? e.to : null].filter((x): x is string => x !== null);
+        for (const m of missing) {
+          warnings.push({ code: "ref-outside-run", line: e.line, message: `graph edge ${e.raw.trim()} dropped: ${m} is not part of this run` });
+        }
+        continue;
+      }
+      if (from.kind === to.kind && from.id === to.id) continue;
       const evidence = evidenceOf("graph", e.line, e.raw);
       for (const a of from.pred) for (const b of to.succ) out.add(mkEdge(a, b, "graph", "high", evidence));
     }
@@ -594,7 +609,8 @@ export function conflictEdges(tasks: readonly EdgeTask[], reach: Reach, ci: bool
         for (const path of vPaths) index.collect(path, cand);
         for (const u of tops) cand.add(u);
       }
-      for (const ui of [...cand].sort((a, b) => a - b)) {
+      // Nearest predecessor first: once linked, earlier ones are no longer concurrent with v (linear, not quadratic).
+      for (const ui of [...cand].sort((a, b) => b - a)) {
         const u = at(ord, ui);
         if (!reach.concurrent(u.id, v.id)) continue;
         const why = classify(u, v, ci);

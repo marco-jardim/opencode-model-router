@@ -13,6 +13,72 @@ function phaseDoc(id: string, item: string): string {
   return `# Plan\n\n## Phase ${id} Title\n\n**Tasks**\n${item}\n`;
 }
 
+describe("executor compile: parse, QA-2.3 round 1 (batch B)", () => {
+  const phases = (...ids: string[]): string => ids.map((id) => `## Phase ${id} T\n\n**Tasks**\n- **${id}.1** \`[tier:fast]\` Do it.\n  Writes: \`src/p${id}.ts\`\n`).join("\n");
+  const depsOf = (text: string, id: string): string[] => (parsePlan(text).phases.find((p) => p.id === id)?.dependsOn ?? []).map((d) => d.id);
+
+  it("QA-2.3-7: `Depends on:` keeps ids on both sides of `;` and joins continuation lines before cutting", () => {
+    const text = `# Plan\n\n${phases("1.1", "1.3")}\n## Phase 2.1 T\n\n**Depends on:** 1.1 (config); 1.3\n\n**Tasks**\n- **2.1.1** \`[tier:fast]\` Do it.\n`;
+    expect(depsOf(text, "2.1")).toEqual(expect.arrayContaining(["1.1", "1.3"]));
+    const wrapped = `# Plan\n\n${phases("1.1", "1.3")}\n## Phase 2.1 T\n\n**Depends on:** 1.1,\n  1.3 · **Worktree:** x\n\n**Tasks**\n- **2.1.1** \`[tier:fast]\` Do it.\n`;
+    expect(depsOf(wrapped, "2.1")).toEqual(expect.arrayContaining(["1.1", "1.3"]));
+  });
+
+  it("QA-2.3-7: ids governed by a `parallel with` phrase are not dependencies", () => {
+    const text = `# Plan\n\n${phases("1.1", "1.3")}\n## Phase 2.1 T\n\n**Depends on:** 1.1; runs in parallel with 1.3\n\n**Tasks**\n- **2.1.1** \`[tier:fast]\` Do it.\n`;
+    const deps = depsOf(text, "2.1");
+    expect(deps).toContain("1.1");
+    expect(deps).not.toContain("1.3");
+  });
+
+  it("QA-2.3-7: a task-level `Depends on:` line is an explicit phrase", () => {
+    const text = `# Plan\n\n${phases("1.1")}\n## Phase 2.1 T\n\n**Tasks**\n- **2.1.1** \`[tier:fast]\` Do it.\n  Depends on: 1.1.1; 1.1\n`;
+    const refs = parsePlan(text).phrases.filter((p) => p.subject.id === "2.1.1").flatMap((p) => p.refs);
+    expect(refs).toEqual(expect.arrayContaining(["1.1.1", "1.1"]));
+  });
+
+  it("QA-2.3-8: an item with the phase's own id prefix is a task even inside a metadata block", () => {
+    const text = `# Plan\n\n## Phase 1.1 T\n\n**Tasks**\n- **1.1.1** \`[tier:fast]\` One.\n\n**Acceptance criteria**\n- a plain bullet\n- **1.1.2** \`[tier:fast]\` Two.\n`;
+    expect(idsOf(text)).toEqual(expect.arrayContaining(["1.1.1", "1.1.2"]));
+  });
+
+  it("QA-2.3-8: an id'd item of another prefix inside a metadata block is reported, not dropped silently", () => {
+    const text = `# Plan\n\n## Phase 1.1 T\n\n**Tasks**\n- **1.1.1** \`[tier:fast]\` One.\n\n**Acceptance criteria**\n- **9.9.1** foreign.\n`;
+    const p = parsePlan(text);
+    expect(p.tasks.map((t) => t.id)).not.toContain("9.9.1");
+    expect(p.warnings.some((w) => w.code === "item-in-metadata-block")).toBe(true);
+  });
+
+  it("QA-2.3-8: a Pre-flight block ends at another bold label and an own-prefix id", () => {
+    const text = `# Plan\n\n## Phase 1.1 T\n\n**Pre-flight**\n- check the tree\n- **1.1.1** \`[tier:fast]\` Real task.\n\n**Goal:** x\n- stray\n`;
+    const p = parsePlan(text);
+    expect(p.tasks.filter((t) => t.kind === "preflight")).toHaveLength(1);
+    expect(p.tasks.map((t) => t.id)).toContain("1.1.1");
+    const text2 = `# Plan\n\n## Phase 1.1 T\n\n**Pre-flight**\n- check the tree\n**Goal:** x\n- stray\n`;
+    expect(parsePlan(text2).tasks.filter((t) => t.kind === "preflight")).toHaveLength(1);
+  });
+
+  it("QA-2.3-8: prose that merely starts with a block word is not a label", () => {
+    const text = `# Plan\n\n## Phase 1.1 T\n\nTasks 1.1.2 and 1.1.3 start after review.\n\n**Tasks**\n- **1.1.1** \`[tier:fast]\` One.\n`;
+    expect(idsOf(text)).toEqual(["1.1.1"]);
+  });
+
+  it("QA-2.3-11: a `Writes:` inside inline code is not a label", () => {
+    const text = phaseDoc("1.1", "- **1.1.1** `[tier:fast]` Document `Writes: nothing` handling.\n  Writes: `src/real.ts`\n");
+    const json = JSON.stringify(parsePlan(text).tasks[0]?.writesLine ?? null);
+    expect(json).toContain("src/real.ts");
+    expect(json).not.toContain("nothing");
+  });
+
+  it("QA-2.3-12: a graph block inside an HTML comment is ignored", () => {
+    const fence = "```\n1.1 --> 1.2\n```";
+    const inComment = `# Plan\n\n${phases("1.1", "1.2")}\n<!--\n${fence}\n-->\n`;
+    expect(parsePlan(inComment).graphs).toHaveLength(0);
+    const live = `# Plan\n\n${phases("1.1", "1.2")}\n<!-- note -->\n\n${fence}\n`;
+    expect(parsePlan(live).graphs).toHaveLength(1);
+  });
+});
+
 describe("executor compile: parse (2.3.2)", () => {
   describe("id forms (plan:2347)", () => {
     it.each([

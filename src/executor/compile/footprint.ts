@@ -53,16 +53,21 @@ export interface OwnershipInput { path: string; owners: string[]; line: number }
 /**
  * `evidence[].line` and `ignored[].line` are plan lines for paths that come from a `Writes:`/`Reads:` line and
  * 1-based lines of `body` for every other path. `ignored[].reason` is a `PathOutcome` reason, `"repo-root"` (a read of
- * the whole repository was dropped, info) or `"dir-write-unbounded"` (a directory write matches no tracked file or more
- * than `MAX_DIR_EXPANSION`; the footprint is then `unknown`, i.e. writes ⊤, D4/O2). `foreignRoots` lists the leading
+ * the whole repository was dropped, info), `"dir-write-unbounded"` (a directory write matches no tracked file or more
+ * than `MAX_DIR_EXPANSION`; the footprint is then `unknown`, i.e. writes ⊤, D4/O2) or `"write-unresolved"` (a write
+ * path that cannot be represented; also ⊤). A write path that does not exist is kept as a new write, never ignored
+ * (QA-2.3-1). `foreignRoots` lists the leading
  * roots dropped by suffix matches.
  */
 export interface TaskFootprint {
   footprint: Footprint;
   editing: boolean;
   lowConfidence: boolean;
+  /** True when the writes are the phase's whole ownership set assumed for lack of evidence (confidence `inferred`). */
+  ownershipAssumed: boolean;
   evidence: Array<{ path: string; access: "write" | "read"; source: Footprint["sources"][number]; line: number; rule: string }>;
-  ignored: Array<{ raw: string; reason: string; line: number }>;
+  /** `write` is true for a candidate found in a write context (`Writes:` line or after a write verb). */
+  ignored: Array<{ raw: string; reason: string; line: number; write?: boolean }>;
   foreignRoots: string[];
 }
 
@@ -234,12 +239,23 @@ function badSegment(s: string): boolean {
   return s.includes(":") || s.includes("\0");
 }
 
+/** Lower-cased mirror of a created-directory set, extended incrementally (the set only grows, in insertion order). */
+const createdFolded = new WeakMap<ReadonlySet<string>, { seen: number; keys: Set<string> }>();
+
 function createdHas(created: ReadonlySet<string>, p: string, ci: boolean): boolean {
   if (created.has(p)) return true;
   if (!ci) return false;
-  const k = p.toLowerCase();
-  for (const c of created) if (c.toLowerCase() === k) return true;
-  return false;
+  let e = createdFolded.get(created);
+  if (e === undefined || e.seen > created.size) { e = { seen: 0, keys: new Set() }; createdFolded.set(created, e); }
+  if (e.seen < created.size) {
+    let i = 0;
+    for (const c of created) {
+      if (i >= e.seen) e.keys.add(c.toLowerCase());
+      i += 1;
+    }
+    e.seen = created.size;
+  }
+  return e.keys.has(p.toLowerCase());
 }
 
 /** Canonical (git-case) spelling and kind of `rel` when it is a tracked file or a directory of one. */
@@ -251,6 +267,20 @@ function lookup(repo: RepoView, rel: string): { path: string; dir: boolean } | n
   const d = idx.dirKeys.get(k);
   if (d !== undefined) return { path: d, dir: true };
   return null;
+}
+
+/** Lexical '/'-separated spelling of a relative `raw` that is not tracked; null on an escape or an unusable segment. */
+function lexicalNew(raw: string): string | null {
+  const stack: string[] = [];
+  for (const s of raw.trim().split(/[\\/]+/)) {
+    if (s === "" || s === ".") continue;
+    if (s === "..") {
+      if (stack.length === 0) return null;
+      stack.pop();
+    } else stack.push(s);
+  }
+  if (stack.length === 0 || stack.some(badSegment)) return null;
+  return stack.join("/");
 }
 
 /** Rule 9: an unknown path is accepted only when `allowNew` and its parent exists or is created earlier. */
@@ -492,7 +522,7 @@ function scanText(text: string, firstLine: number): Cand[] {
 // ---------------------------------------------------------------------------------------------------------------
 
 const WRITE_VERB =
-  /\b(?:implement(?:s|ed|ing)?|creat(?:e|es|ed|ing)|add(?:s|ed|ing)?|modif(?:y|ies|ied|ying)|updat(?:e|es|ed|ing)|replac(?:e|es|ed|ing)|mov(?:e|es|ed|ing)|delet(?:e|es|ed|ing)|extend(?:s|ed|ing)?|writ(?:e|es|ing)|wrote|edit(?:s|ed|ing)?|keys?\s+in)\b/i;
+  /\b(?:implement(?:s|ed|ing)?|creat(?:e|es|ed|ing)|add(?:s|ed|ing)?|modif(?:y|ies|ied|ying)|updat(?:e|es|ed|ing)|replac(?:e|es|ed|ing)|mov(?:e|es|ed|ing)|delet(?:e|es|ed|ing)|extend(?:s|ed|ing)?|writ(?:e|es|ing)|wrote|edit(?:s|ed|ing)?|fix(?:es|ed|ing)?|refactor(?:s|ed|ing)?|renam(?:e|es|ed|ing)|remov(?:e|es|ed|ing)|rework(?:s|ed|ing)?|chang(?:e|es|ed|ing)|keys?\s+in)\b/i;
 /** "wire … in `X`", "document … in `X`", "record … in `X`": the verb, up to four tokens, then `in` right before the path. */
 const WRITE_VERB_IN = /\b(?:wir(?:e|es|ed|ing)|document(?:s|ed|ing)?|record(?:s|ed|ing)?)\b(?:\s+\S+){0,4}?\s+in\s*$/i;
 const CREATE_VERB = /^(?:implement|creat|add)/i;
@@ -557,6 +587,8 @@ export function extractFootprint(
   let owned = false;
   let unbounded = false;
   let weak = false;
+  let writeIgnored = false;
+  let assumed = false;
 
   const note = (s: Source): void => { if (!sources.includes(s)) sources.push(s); };
   const created = (p: string): void => {
@@ -576,6 +608,39 @@ export function extractFootprint(
     if (report) ignored.push({ raw: r.outcome.raw, reason: r.outcome.reason, line });
     return null;
   };
+  /**
+   * Resolve a path found in a write context (QA-2.3-1). A path that is `not-found` is kept as a new write (lexically
+   * normalized, escape-checked) so a dropped candidate never leaves an `explicit` footprint short; an `ambiguous`
+   * basename writes every match; a glob or path that cannot be represented makes the task write ⊤. Only truly outside
+   * spellings (url, device, unc, other drive, escape, outside) are ignored: they return null and set `writeIgnored`.
+   */
+  const resolveWrites = (raw: string, line: number, allowNew: boolean): Ok[] | null => {
+    const r = resolveDetailed(raw, repo, { allowNew, createdEarlier });
+    if (r.outcome.ok) {
+      if (r.foreignRoot !== null && !foreignRoots.includes(r.foreignRoot)) foreignRoots.push(r.foreignRoot);
+      return [r.outcome];
+    }
+    const o = r.outcome;
+    if (o.reason === "ambiguous") {
+      const ms = repo.byBasename.get(touchKey(raw.trim().replace(/[\\/]+$/, ""), ci)) ?? [];
+      if (ms.length > 1) return ms.map((path): Ok => ({ ok: true, path, via: "basename", dir: false }));
+    }
+    if (o.reason === "not-found") {
+      if (raw.split(/[\\/]/).some((s) => GLOB_CHARS.test(s))) {
+        unbounded = true;
+        ignored.push({ raw, reason: "dir-write-unbounded", line });
+        return [];
+      }
+      const lex = lexicalNew(raw);
+      if (lex !== null) return [{ ok: true, path: lex, via: "new", dir: false }];
+      unbounded = true;
+      ignored.push({ raw, reason: "write-unresolved", line });
+      return [];
+    }
+    writeIgnored = true;
+    ignored.push({ raw: o.raw, reason: o.reason, line, write: true });
+    return null;
+  };
   const putWrite = (p: string, source: Source, line: number, rule: string): void => {
     const key = touchKey(p, ci);
     if (!writeKeys.has(key)) { writeKeys.add(key); writes.push(p); }
@@ -592,6 +657,8 @@ export function extractFootprint(
         return;
       }
       for (const f of files) putWrite(f, source, line, rule);
+      // QA-2.3-16: the directory itself stays a key so a file created below it later still overlaps this write.
+      if (ok.path !== "") putWrite(ok.path, source, line, rule);
       return;
     }
     if (ok.via === "suffix" || ok.via === "basename") weak = true;
@@ -616,10 +683,11 @@ export function extractFootprint(
     } else {
       for (const c of scanText(t.writesLine.text, t.writesLine.line)) {
         declared.add(c.raw);
-        const ok = resolve(c.raw, c.line, true, true);
-        if (ok === null) continue;
+        const oks = resolveWrites(c.raw, c.line, true);
+        if (oks === null) continue;
         explicit = true;
-        addWrite(ok, c.raw, "writes-line", c.line, "writes-line");
+        if (oks.length === 0) note("writes-line");
+        for (const ok of oks) addWrite(ok, c.raw, "writes-line", c.line, "writes-line");
       }
     }
   }
@@ -640,11 +708,14 @@ export function extractFootprint(
         const marked = NEW_MARKER.test(c.text.slice(c.end));
         const verb = t.writesLine === null ? verbBefore(c) : null;
         if (verb !== null) {
-          const ok = resolve(c.raw, c.line, verb.create || marked, true);
-          if (ok === null) continue;
+          const oks = resolveWrites(c.raw, c.line, verb.create || marked);
+          if (oks === null) continue;
           explicit = true;
-          mentions.push(ok);
-          addWrite(ok, c.raw, "path", c.line, verb.rule);
+          if (oks.length === 0) note("path");
+          for (const ok of oks) {
+            mentions.push(ok);
+            addWrite(ok, c.raw, "path", c.line, verb.rule);
+          }
         } else if (t.readsLine === null) {
           const ok = resolve(c.raw, c.line, marked, true);
           if (ok === null) {
@@ -680,11 +751,13 @@ export function extractFootprint(
   // phase's write set ("Owns (writes)"), so this is a bounded over-approximation (low confidence) instead of ⊤.
   const editsByDefault = !t.manual && !NEVER_EDITING_KINDS.has(t.kind)
     && (needs !== undefined ? needs.includes("edit") : cls === undefined || !NON_EDITING_CLASSES.has(cls));
-  if (wantOwnership && editsByDefault && writes.length === 0 && !unbounded && !explicit) {
+  // QA-2.3-5: skipped when a write candidate was ignored (the task keeps ⊤), and the result is `inferred`, not
+  // `ownership`, so the residue may still add to it.
+  if (wantOwnership && editsByDefault && writes.length === 0 && !unbounded && !explicit && !writeIgnored) {
     for (const row of phaseOwnership) {
       const rp = resolve(row.path, row.line, true, false);
       if (rp === null || rp.path === "") continue;
-      owned = true;
+      assumed = true;
       weak = true;
       addWrite(rp, row.path, "ownership", row.line, "ownership-phase");
     }
@@ -701,6 +774,7 @@ export function extractFootprint(
   if (unbounded) confidence = "unknown";
   else if (explicit) confidence = "explicit";
   else if (owned) confidence = "ownership";
+  else if (assumed) confidence = "inferred";
   else confidence = editing ? "unknown" : "inferred";
   const lowConfidence = editing && (confidence === "unknown" || confidence === "inferred" || weak);
 
@@ -708,6 +782,7 @@ export function extractFootprint(
     footprint: { writes, reads: finalReads, confidence, sources },
     editing,
     lowConfidence,
+    ownershipAssumed: assumed,
     evidence,
     ignored,
     foreignRoots,

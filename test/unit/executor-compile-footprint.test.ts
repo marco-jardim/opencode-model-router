@@ -142,6 +142,40 @@ describe("executor compile: footprint (2.3.3)", () => {
     });
   });
 
+  describe("round-1 regressions (batch A)", () => {
+    it("QA-2.3-1: a Writes: path whose directory does not exist is kept as a new write", () => {
+      const created = new Set<string>();
+      const fp = extractFootprint(input({ writesLine: line("`zz-missing-dir/sub/new.ts`") }), [], repo, created);
+      expect(fp.footprint.writes).toEqual(["zz-missing-dir/sub/new.ts"]);
+      expect(fp.footprint.confidence).toBe("explicit");
+      expect(created.has("zz-missing-dir/sub")).toBe(true);
+    });
+
+    it("QA-2.3-1: a glob into a directory that does not exist makes the task write top", () => {
+      const fp = extractFootprint(input({ writesLine: line("`zz-missing-dir/**/*.ts`") }), [], repo, new Set<string>());
+      expect(fp.footprint.confidence).toBe("unknown");
+    });
+
+    it("QA-2.3-1: an escaping write path stays ignored and reported", () => {
+      const fp = extractFootprint(input({ writesLine: line("`../../outside/new.ts`") }), [], repo, new Set<string>());
+      expect(fp.footprint.writes).toEqual([]);
+      expect(fp.ignored.some((i) => i.reason === "escape" && i.write === true)).toBe(true);
+    });
+
+    it("QA-2.3-14: fix, refactor, rename, remove, rework and change are write verbs", () => {
+      for (const verb of ["Fix", "Refactor", "Rename", "Remove", "Rework", "Change"]) {
+        const fp = extractFootprint(input({ body: `${verb} \`zz-missing-dir/b.ts\` now.` }), [], repo, new Set<string>());
+        expect(fp.footprint.writes, verb).toEqual(["zz-missing-dir/b.ts"]);
+      }
+    });
+
+    it("QA-2.3-17: another drive is ignored and reported (plan 2544)", () => {
+      const fp = extractFootprint(input({ writesLine: line("`Z:\\elsewhere\\x\\new.ts`") }), [], repo, new Set<string>());
+      expect(fp.footprint.writes).toEqual([]);
+      expect(fp.ignored.some((i) => i.reason === "other-drive")).toBe(true);
+    });
+  });
+
   describe("extractFootprint", () => {
     it("takes a Writes/Reads line as the closed footprint (D5)", () => {
       const fp = extractFootprint(

@@ -199,9 +199,11 @@ function closureErrors(l: LedgerV1, all: readonly TaskNode[], edges: readonly Ed
   for (const t of all) {
     if (!LAUNCHABLE_KINDS.has(t.kind) || SETTLED_STATES.has(t.state)) continue;
     const strict = (p: string): boolean => isStrictRepoPath(p);
+    // QA-2.3-1: a write path that is not a strict repo path cannot be compared, so the task writes ⊤ (the path itself is
+    // reported as `path-outside`); it is never dropped silently.
     live.push({
       node: t,
-      top: isTopNode(t),
+      top: isTopNode(t) || !t.footprint.writes.every(strict),
       writes: t.footprint.writes.filter(strict),
       reads: t.kind === "qa" ? [] : t.footprint.reads.filter(strict),
     });

@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import { INTEGRATION_ESTIMATE_MS, formatSummary, planEstimate, taskEstimate } from "../../src/executor/compile/estimate";
 import { planIdOf } from "../../src/executor/compile/index";
+import { parsePlan } from "../../src/executor/compile/parse";
 import { VALIDATION_CODES, isStrictRepoPath, validateLedger } from "../../src/executor/compile/validate";
 import { ExecutorError, PLAN_ID_PATTERN, executorDefaults, isLedgerV1, type LedgerV1 } from "../../src/executor/types";
 import { NOW, compileOpts, constantDurations, edgeKeys, makeHarness, planPathOf, type Harness } from "../fixtures/cpx/plans/harness";
@@ -141,7 +142,7 @@ describe("executor compile: drafts (2.3.6)", () => {
       expect(e.from.startsWith("gate:")).toBe(true);
       expect(draft.phases.find((p) => `gate:${p.id}` === e.from)?.gate).toBe("passed");
     }
-    expect(draft.planId).toBe("graph-arrows-1-2");
+    expect(draft.planId).toBe("graph-arrows-1-2-db-1-2"); // QA-2.3-17: doneBefore is part of the plan id
     expect(h.compiler.validate(draft)).toEqual([]);
   });
 
@@ -167,7 +168,10 @@ describe("executor compile: drafts (2.3.6)", () => {
 
   it("derives plan ids from the file name and the selected phases", () => {
     expect(planIdOf("D:\\plans\\My Plan.v2.md", undefined)).toBe("my-plan-v2");
-    expect(planIdOf("/x/plan.md", ["1.1", "2.1"])).toBe("plan-1-1-2-1");
+    expect(planIdOf("/x/plan.md", ["1.1", "2.1"])).toBe("plan-1-1--2-1");
+    // QA-2.3-17: `["1.1.2"]` and `["1.1","2"]` no longer collide; doneBefore separates runs of one phase list
+    expect(planIdOf("/x/plan.md", ["1.1.2"])).not.toBe(planIdOf("/x/plan.md", ["1.1", "2"]));
+    expect(planIdOf("/x/plan.md", ["1.1"], "1.2")).not.toBe(planIdOf("/x/plan.md", ["1.1"]));
     const long = planIdOf(`D:\\plans\\${"very-long-name-".repeat(8)}.md`, undefined);
     expect(long.length).toBeLessThanOrEqual(41);
     expect(long).toMatch(PLAN_ID_PATTERN);
@@ -445,6 +449,78 @@ describe.skipIf(!FROZEN)("executor compile: frozen real plans", () => {
       for (const d of deps) expect(rec?.dependsOn, `${phase} depends on ${d}`).toContain(d);
     }
   }
+
+  // QA-2.3-9: exact assertions (not just "present").
+  for (const name of PLAN_NAMES) {
+    it(`${name}: parsed phase dependencies and the Order-edge set equal counts.json exactly`, async () => {
+      const c = counts()[name];
+      if (c === undefined) throw new Error(`no hand counts for ${name}`);
+      const text = readFixture(name);
+      const lines = text.split(/\r?\n/);
+      const parsed = parsePlan(text);
+      const phaseIds = new Set(parsed.phases.map((p) => p.id));
+      // Independent of the parser: the phase-level `Depends on:` clauses read straight from the phase's lines (clause ends at
+      // `. `, `;` or "parallel with"; only two-component phase ids count). Task-level lines (indented list items) are skipped.
+      for (const ph of parsed.phases) {
+        if (ph.synthetic) continue; // a `.post` phase shares the span of its parent and depends on it by construction
+        const want = new Set<string>();
+        for (const l of lines.slice(ph.span.line - 1, ph.span.endLine)) {
+          if (/^\s{2,}/.test(l)) continue;
+          const m = /Depends on(?::\*\*|\*\*:|:)\s*(.*)$/i.exec(l);
+          if (m === null) continue;
+          const clause = (m[1] ?? "").split(/\.\s|;|parallel with/i)[0] ?? "";
+          for (const id of clause.matchAll(/(?<![\w.])(\d+\.(?:\d+|P)(?![\w]|\.\d)|DF-?\d+)/g)) {
+            const pid = (id[1] ?? "").replace("DF-", "DF");
+            if (phaseIds.has(pid) && pid !== ph.id) want.add(pid);
+          }
+        }
+        const got = [...new Set(ph.dependsOn.filter((d) => !d.external).map((d) => d.id))].sort();
+        expect(got, `${ph.id} Depends on`).toEqual([...want].sort());
+      }
+      for (const [p, deps] of Object.entries(c.dependsOn)) {
+        const ph = parsed.phases.find((x) => x.id === p);
+        expect(ph, `${p} is a parsed phase`).toBeDefined();
+        for (const d of deps) expect(phaseIds.has(d), `${p} -> ${d}`).toBe(true);
+      }
+      const { draft } = await compileName(name);
+      const order = draft.edges.filter((e) => e.evidence.startsWith("order ")).map((e) => `${e.from}>${e.to}`).sort();
+      // counts.json lists the Depends-on gate edges (`gate:P>task`) next to the Order edges; only the latter carry `order` evidence.
+      const hand = c.orderEdges.filter((k) => !k.startsWith("gate:")).sort();
+      // counts.json lists the complete Order-edge set of the three smaller plans. For the cpx plan it lists only the
+      // notable hand-checked edges (the other ~130 are chain/stage edges nobody hand-listed), so there it is a subset check.
+      if (name === "critical-path-execution-plan.md") expect(order).toEqual(expect.arrayContaining(hand));
+      else expect(order).toEqual(hand);
+    });
+
+    it(`${name}: every Writes:/Reads: path of a task is in its footprint`, async () => {
+      const { draft, h } = await compileName(name);
+      const parsed = parsePlan(readFixture(name));
+      const plain = /^[\w-]+(?:\/[\w.-]+)*\.[A-Za-z][A-Za-z0-9]{0,7}$/;
+      for (const t of parsed.tasks) {
+        const node = draft.tasks[t.id];
+        if (node === undefined) continue;
+        for (const [label, list, have] of [
+          ["Writes", t.writesLine, node.footprint.writes],
+          ["Reads", t.readsLine, node.footprint.reads.concat(node.footprint.writes)],
+        ] as const) {
+          if (list === null || list.none) continue;
+          for (const m of list.text.matchAll(/`([^`]+)`/g)) {
+            const tok = (m[1] ?? "").replace(/\\/g, "/");
+            // a Reads: path that is not tracked cannot be resolved and is reported as ignored, not kept; Writes: are always kept
+            const tracked = [...h.repoView.files].some((f) => f.toLowerCase() === tok.toLowerCase());
+            if (plain.test(tok) && (label === "Writes" || tracked)) expect(have.map((x) => x.toLowerCase()), `${t.id} ${label} ${tok}`).toContain(tok.toLowerCase());
+          }
+        }
+      }
+    });
+  }
+
+  it("D4: the 6.1 scenario has exactly these task ids", async () => {
+    const { draft } = await compileName("critical-path-execution-plan.md", { phases: ["6.1"], doneBefore: "6.1" });
+    expect(Object.keys(draft.tasks).sort()).toEqual([
+      "6.1.1", "6.1.2", "6.1.3", "6.1.4", "6.1.5", "6.1.PF1", "6.1.PF2", "6.1.PF3", "6.1.QA",
+    ]);
+  });
 
   it("D4: compiles phase 6.1 of the cpx plan with everything earlier done", async () => {
     const { draft } = await compileName("critical-path-execution-plan.md", { phases: ["6.1"], doneBefore: "6.1" });

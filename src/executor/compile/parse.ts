@@ -139,7 +139,7 @@ const GENERIC_HEADING_RE = new RegExp(`^ {0,3}#{2,4}[ \\t]+(?:\\*\\*)?(${PID})(?
 const ANY_HEADING_RE = /^ {0,3}#{1,6}[ \t]+(.*)$/;
 /** `Task`/`Steps` (singular or looser wording) label a task list only when marked (heading or bold), never as plain prose. */
 const BLOCK_LABEL_RE =
-  /^ {0,3}(?:(?:#{1,6}[ \t]+|\*\*|__)(Task|Steps)(?=(?:\*\*|__)?[ \t]*:?(?:\*\*|__)?[ \t]*$)|(?:#{1,6}[ \t]+|\*\*|__)?(Pre-flight|Tasks|New tests|Acceptance criteria|Definition of Done|QA review|Order)\b)/;
+  /^ {0,3}(?:(?:#{1,6}[ \t]+|\*\*|__)(Task|Steps)(?=(?:\*\*|__)?[ \t]*:?(?:\*\*|__)?[ \t]*$)|(?:#{1,6}[ \t]+|\*\*|__)(Pre-flight|Tasks|New tests|Acceptance criteria|Definition of Done|QA review|Order)\b|(Pre-flight|Tasks|New tests|Acceptance criteria|Definition of Done|QA review|Order)(?=[ \t]*(?:\([^)\n]*\))?[ \t]*:))/;
 
 /**
  * Any other bold label at the start of a line (`**Fallback:** …`, `**Goal:** …`) ends a Tasks block: the list under it is
@@ -291,6 +291,11 @@ const WRITES_READS_LABEL_RE = /\b(Writes|Reads)(?:[ \t]*\([^)\n]*\))?(?:\*\*|__)
 const ROUTE_START_LINE_RE = /^\s*\[route\b/;
 const NESTED_ITEM_RE = /^[ \t]*(?:[-*+]|\d{1,9}[.)])[ \t]+/;
 
+/** `Writes:`/`Reads:` labels of a line, outside inline code (offsets stay those of the original line). */
+function labelsOf(line: string): RegExpMatchArray[] {
+  return [...line.replace(INLINE_CODE_RE, (m) => " ".repeat(m.length)).matchAll(WRITES_READS_LABEL_RE)];
+}
+
 function escapeRe(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -434,7 +439,7 @@ function parseLabels(body: readonly string[], firstLine: number, parentId: strin
         if (n !== "") subtasks.push(n);
       }
     }
-    const labels = [...l.matchAll(WRITES_READS_LABEL_RE)];
+    const labels = labelsOf(l);
     for (let k = 0; k < labels.length; k += 1) {
       const lab = labels[k] as RegExpMatchArray;
       const start = (lab.index ?? 0) + lab[0].length;
@@ -443,7 +448,7 @@ function parseLabels(body: readonly string[], firstLine: number, parentId: strin
       if (k + 1 === labels.length) {
         for (let j = i + 1; j < body.length; j += 1) {
           const next = body[j] as string;
-          if (inAcceptance[j] === true || stops(next) || [...next.matchAll(WRITES_READS_LABEL_RE)].length > 0) break;
+          if (inAcceptance[j] === true || stops(next) || labelsOf(next).length > 0) break;
           text += ` ${next.trim()}`;
         }
       }
@@ -535,9 +540,12 @@ const DF_TOKEN_RE = /\bDF-(\d+)\b/g;
 const PID_TOKEN_RE = /(?<![A-Za-z0-9.])[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*(?![A-Za-z0-9])/g;
 const DOTTED_ID_RE = /^[A-Za-z]?\d+(?:\.[A-Za-z0-9]+)+$/;
 
-/** End of the dependency clause: the next bold label, a middle dot, a sentence end (`. ` / `;`) or a "parallel with"-style phrase. */
+/**
+ * End of the dependency clause: the next bold label, a middle dot or a "parallel with"-style phrase (the ids such a
+ * phrase governs are dropped with the rest). Not `;` nor `. `: `1.1 (config); 1.3` keeps both ids.
+ */
 const DEPENDS_CLAUSE_END_RE =
-  /\*\*[A-Za-z][^*\n]*:\*\*|·|;|\.(?=\s|$)|\b(?:in parallel|parallel with|parallel to|alongside|independent of)\b/i;
+  /\*\*[A-Za-z][^*\n]*:\*\*|·|\b(?:in parallel|parallel with|parallel to|alongside|independent of)\b/i;
 
 /** The part of a `Depends on:` line that names dependencies (cut at the clause end, see DEPENDS_CLAUSE_END_RE). */
 function dependsText(line: string): string | null {
@@ -607,8 +615,20 @@ function graphEdgesOfLine(line: string, lineNo: number): GraphBlock["edges"] {
   return edges;
 }
 
-/** Fenced blocks (any info string) with at least one arrow line. */
-function scanGraphs(lines: readonly string[], fm: readonly boolean[]): GraphBlock[] {
+/**
+ * Is the fence at line `i` inside an HTML comment? The structure mask also covers comments, the fence-only mask does not: the
+ * nearest masked line before the fence that is not a fence line is a comment line, still open unless it holds the `-->`.
+ */
+function insideComment(lines: readonly string[], fm: readonly boolean[], mask: readonly boolean[], i: number): boolean {
+  for (let k = i - 1; k >= 0 && mask[k] === true; k -= 1) {
+    if (fm[k] === true) continue;
+    return !(lines[k] as string).includes("-->");
+  }
+  return false;
+}
+
+/** Fenced blocks (any info string) with at least one arrow line, except those inside HTML comments. */
+function scanGraphs(lines: readonly string[], fm: readonly boolean[], mask: readonly boolean[]): GraphBlock[] {
   const out: GraphBlock[] = [];
   let i = 0;
   while (i < lines.length) {
@@ -618,6 +638,10 @@ function scanGraphs(lines: readonly string[], fm: readonly boolean[]): GraphBloc
     }
     let end = i;
     while (end + 1 < lines.length && fm[end + 1] === true) end += 1;
+    if (insideComment(lines, fm, mask, i)) {
+      i = end + 1;
+      continue;
+    }
     const last = end > i && FENCE_CLOSER_RE.test(lines[end] as string) ? end : end + 1;
     const edges: GraphBlock["edges"] = [];
     let hasArrow = false;
@@ -670,12 +694,20 @@ function clausesOf(text: string): string[] {
 
 function scanAfterLike(text: string, line: number, subject: ExplicitPhrase["subject"], out: ExplicitPhrase[]): boolean {
   let any = false;
+  const seen = new Set<string>();
+  // Phrases are collected in line order: only the tail written for this very line can duplicate.
+  for (let k = out.length - 1; k >= 0; k -= 1) {
+    const p = out[k] as ExplicitPhrase;
+    if (p.line < line) break;
+    if (p.line === line && p.subject.id === subject.id && p.verb === "after" && p.refs[0] !== undefined) seen.add(p.refs[0]);
+  }
   for (const clause of clausesOf(text)) {
     for (const re of AFTER_LIKE_RES) {
       for (const m of clause.matchAll(re)) {
         any = true;
         const ref = m[1] as string;
-        if (out.some((p) => p.line === line && p.subject.id === subject.id && p.verb === "after" && p.refs[0] === ref)) continue;
+        if (seen.has(ref)) continue;
+        seen.add(ref);
         out.push({ subject, verb: "after", refs: [m[1] as string], line, excerpt: m[0].slice(0, 160) });
       }
     }
@@ -1054,7 +1086,20 @@ export function parsePlan(text: string): ParsedPlan {
   // --- block labels (step 3) ---------------------------------------------------------------------------------
   const blockAt: Array<BlockName | null> = new Array<BlockName | null>(lines.length).fill(null);
   const blocks: BlockSpan[] = [];
+  /** Lines (0-based) of explicit-id items, by the draft's own id prefix. */
+  const ownIdLines = (d: PhaseDraft): Set<number> => {
+    const own = new Set<number>();
+    if (d.phase.dogfood) return own;
+    for (const info of infos) {
+      if (info.ex === null || RESERVED_AUTHORED_RE.test(info.ex[1] as string)) continue;
+      const idx = info.step.line - 1;
+      if (idx <= d.head || idx >= d.end) continue;
+      if (bareId(info.ex[1] as string).split(".").slice(0, -1).join(".") === bareId(d.phase.id)) own.add(idx);
+    }
+    return own;
+  };
   for (const d of drafts) {
+    const ownIdAt = ownIdLines(d);
     let cur: BlockSpan | null = null;
     const close = (end: number): void => {
       if (cur !== null) {
@@ -1069,11 +1114,14 @@ export function parsePlan(text: string): ParsedPlan {
         const m = BLOCK_LABEL_RE.exec(l);
         if (m !== null) {
           close(i);
-          const name = blockNameOf((m[1] ?? m[2]) as string);
+          const name = blockNameOf((m[1] ?? m[2] ?? m[3]) as string);
           cur = { draft: d, name, start: i, end: i + 1 };
           d.hasLabels = true;
           if (name === "tasks") d.hasTasksBlock = true;
-        } else if (cur !== null && (cur as BlockSpan).name === "tasks" && OTHER_LABEL_RE.test(l)) {
+        } else if (cur !== null && ((cur as BlockSpan).name === "tasks" || (cur as BlockSpan).name === "pre-flight") && OTHER_LABEL_RE.test(l)) {
+          close(i);
+        } else if (cur !== null && (cur as BlockSpan).name !== "tasks" && ownIdAt.has(i)) {
+          // An item carrying the phase's own id prefix is a task of the phase: it closes any metadata block.
           close(i);
         }
       }
@@ -1094,14 +1142,15 @@ export function parsePlan(text: string): ParsedPlan {
     for (let i = d.head + 1; i < d.end; i += 1) {
       if (mask[i] === true || inStep[i] === true || ANY_HEADING_RE.test(lines[i] as string)) continue;
       const l = lines[i] as string;
-      const dep = dependsText(l);
-      if (dep !== null) {
-        let t = dep;
+      if (DEPENDS_LABEL_RE.test(l)) {
+        // Join the continuation lines first, then cut: the clause may run over several lines.
+        let joined = l;
         for (let j = i + 1; j < d.end && (lines[j] as string).trim() !== "" && mask[j] !== true && !ITEM_RE.test(lines[j] as string) &&
           !ANY_HEADING_RE.test(lines[j] as string) && !BLOCK_LABEL_RE.test(lines[j] as string); j += 1) {
-          t += ` ${lines[j] as string}`;
+          joined += ` ${lines[j] as string}`;
         }
-        d.dependsTexts.push({ text: t, line: i + 1 });
+        const t = dependsText(joined);
+        if (t !== null) d.dependsTexts.push({ text: t, line: i + 1 });
         continue;
       }
       if (blockAt[i] === "order") continue;
@@ -1197,7 +1246,10 @@ export function parsePlan(text: string): ParsedPlan {
       addTask(build({ ...base, id: `${d.phase.id}.PF${d.pfCount}`, idSource: "preflight", phase: d.phase.id, idToken: info.ex === null ? null : info.ex[0], hashItems: true, dogfood: false, forceKind: "preflight" }), d.phase);
       continue;
     }
-    if (d !== undefined && (block === "new-tests" || block === "acceptance" || block === "dod" || block === "order" || block === "qa-review")) continue;
+    if (d !== undefined && (block === "new-tests" || block === "acceptance" || block === "dod" || block === "order" || block === "qa-review")) {
+      if (info.ex !== null) warn(warnings, "item-in-metadata-block", step.line, `item ${info.ex[1] as string} sits in the ${block} block of ${d.phase.id}; not a task`);
+      continue;
+    }
 
     const first = lines[idx] as string;
     const token = /^(?:\*\*|__)?([A-Za-z0-9][A-Za-z0-9.-]*)/.exec(info.lead)?.[1] ?? "";
@@ -1330,7 +1382,7 @@ export function parsePlan(text: string): ParsedPlan {
   // --- ownership, graphs, phrases ----------------------------------------------------------------------------------
   const ownership: OwnershipRow[] = [];
   scanTables(lines, mask, knownPhaseIds, ownership, phrases);
-  graphs.push(...scanGraphs(lines, fm));
+  graphs.push(...scanGraphs(lines, fm, mask));
   graphs.sort((a, b) => a.line - b.line);
   const knownNodes = new Set<string>([...knownPhaseIds, ...taskById.keys(), ...waveById.keys()]);
   for (const g of graphs) {
@@ -1342,7 +1394,22 @@ export function parsePlan(text: string): ParsedPlan {
     const bodyLines = t.body.split(LINE_SPLIT_RE);
     for (let k = 0; k < bodyLines.length; k += 1) {
       const l = bodyLines[k] as string;
-      if (DEPENDS_LABEL_RE.test(l)) continue;
+      if (DEPENDS_LABEL_RE.test(l)) {
+        // A task-level `Depends on:` line is an explicit `after` phrase on the task (continuation lines joined before the cut).
+        let joined = l;
+        for (let j = k + 1; j < bodyLines.length && (bodyLines[j] as string).trim() !== "" && !NESTED_ITEM_RE.test(bodyLines[j] as string); j += 1) {
+          joined += ` ${bodyLines[j] as string}`;
+        }
+        const clause = (dependsText(joined) ?? "").replace(/§\S+/g, " ").replace(/`/g, " ");
+        const refs: string[] = [];
+        for (const m of clause.matchAll(PID_TOKEN_RE)) {
+          if (ID_SHAPED_RE.test(m[0]) && !refs.includes(m[0])) refs.push(m[0]);
+        }
+        if (refs.length > 0) {
+          phrases.push({ subject: { kind: "task", id: t.id }, verb: "after", refs, line: t.span.line + k, excerpt: l.trim().slice(0, 160) });
+        }
+        continue;
+      }
       scanPhrases(l, t.span.line + k, { kind: "task", id: t.id }, phrases);
     }
   }

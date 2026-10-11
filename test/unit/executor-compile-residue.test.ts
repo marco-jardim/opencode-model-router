@@ -108,6 +108,99 @@ describe("executor compile: residue (2.3.5)", () => {
     });
   });
 
+  describe("round-1 regressions (batch A)", () => {
+    it("QA-2.3-1: a write path that does not exist is kept, and the two tasks get a conflict edge", async () => {
+      const gap = [
+        "# Gap", "", "## Wave 1", "", "### Phase 1.1 Gap", "", "**Tasks**",
+        "- **1.1.1** `[tier:medium]` Create the shared file.", "  Writes: `src/gen/shared.ts`",
+        "- **1.1.2** `[tier:medium]` Also create the shared file.", "  Writes: `src/gen/shared.ts`", "",
+      ].join("\n");
+      const g = makeHarness({ inline: { "gap.md": gap } });
+      const r = await g.compiler.compile(planPathOf("gap.md"), compileOpts(g));
+      for (const id of ["1.1.1", "1.1.2"]) {
+        expect(r.draft.tasks[id]?.footprint.writes).toEqual(["src/gen/shared.ts"]);
+        expect(r.draft.tasks[id]?.footprint.confidence).toBe("explicit");
+      }
+      expect(r.draft.edges.some((e) => e.kind === "conflict" && e.from === "1.1.1" && e.to === "1.1.2")).toBe(true);
+      expect(g.compiler.validate(r.draft)).toEqual([]);
+    });
+
+    it("QA-2.3-6: with 61 unknown tasks only the first 60 may be listed", async () => {
+      const lines = ["# Many", "", "## Wave 1", "", "### Phase 1.1 Many", "", "**Tasks**"];
+      for (let i = 1; i <= 61; i += 1) lines.push(`- **1.1.${i}** \`[tier:medium]\` Make it better somehow ${i}.`);
+      const m = makeHarness({ inline: { "many.md": lines.join("\n") } });
+      const r = await m.compiler.compile(planPathOf("many.md"), compileOpts(m));
+      expect(r.residueRequest?.taskIds).toHaveLength(60);
+      const body = JSON.stringify({
+        requestDigest: residueDigestOf(r.draft.planDigest, r.residueRequest?.taskIds ?? []),
+        footprints: [{ taskId: "1.1.61", writes: ["src/x.ts"], reads: [], evidence: "e" }],
+        edges: [],
+      });
+      const res = validateResidue(r.draft, JSON.parse(body) as unknown);
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.code).toBe("residue-unknown-task");
+    });
+
+    function codeOf(fn: () => unknown): string {
+      try {
+        fn();
+      } catch (e) {
+        if (e instanceof ExecutorError) return e.code;
+        throw e;
+      }
+      return "none";
+    }
+
+    it("QA-2.3-3: addTasks rejects a task for a phase whose gate has passed", () => {
+      const closed: LedgerV1 = { ...draft, phases: draft.phases.map((p) => ({ ...p, gate: "passed" as const })) };
+      const frag = "- **1.1.9** `[tier:medium]` Add a helper.\n  Writes: `src/alpha/helper.ts`\n";
+      expect(codeOf(() => h.compiler.addTasks(closed, frag))).toBe("E_INVALID_INPUT");
+      expect(codeOf(() => h.compiler.addTasks(draft, frag))).toBe("none");
+    });
+
+    it("QA-2.3-2: addTasks rejects a write outside the repository and a broken fragment with E_INVALID_INPUT", () => {
+      const outside = "- **1.1.9** `[tier:medium]` Add a helper.\n  Writes: `Z:\\elsewhere\\x\\helper.ts`\n";
+      expect(codeOf(() => h.compiler.addTasks(draft, outside))).toBe("E_INVALID_INPUT");
+      const dup = "- **1.1.9** `[tier:medium]` One.\n  Writes: `src/alpha/a1.ts`\n- **1.1.9** `[tier:medium]` Two.\n  Writes: `src/alpha/a2.ts`\n";
+      expect(codeOf(() => h.compiler.addTasks(draft, dup))).toBe("E_INVALID_INPUT");
+    });
+
+    it("QA-2.3-2: a fragment may order a new task before an existing one (reference to the ledger)", () => {
+      const frag = "- **1.1.9** `[tier:medium]` Add a helper.\n  1.1.9 must run before 1.1.2.\n  Writes: `src/alpha/helper.ts`\n";
+      const added = h.compiler.addTasks(draft, frag);
+      expect(added.edges.some((e) => e.from === "1.1.9" && e.to === "1.1.2")).toBe(true);
+    });
+
+    it("QA-2.3-10: an external dependency needs doneBefore", async () => {
+      const ext = [
+        "# Ext", "", "## Wave 1", "", "### Phase 1.1 First", "", "**Tasks**",
+        "- **1.1.1** `[tier:medium]` One.", "  Writes: `src/alpha/one.ts`", "",
+        "### Phase 1.2 Second", "", "**Depends on:** DF-9", "", "**Tasks**",
+        "- **1.2.1** `[tier:medium]` Two.", "  Writes: `src/alpha/two.ts`", "",
+      ].join("\n");
+      const x = makeHarness({ inline: { "ext.md": ext } });
+      let code = "none";
+      try {
+        await x.compiler.compile(planPathOf("ext.md"), compileOpts(x));
+      } catch (e) {
+        code = e instanceof ExecutorError ? e.code : "other";
+      }
+      expect(code).toBe("E_INVALID_INPUT");
+      const ok = await x.compiler.compile(planPathOf("ext.md"), compileOpts(x, { doneBefore: "1.2" }));
+      expect(ok.summary.warnings.some((w) => w.startsWith("depends-external-unknown"))).toBe(true);
+    });
+
+    it("QA-2.3-15: a response may respell the case of an existing path", () => {
+      const old = draft.tasks["1.1.3"]?.footprint.reads ?? [];
+      const res = validateResidue(draft, {
+        requestDigest: digest,
+        footprints: [{ taskId: "1.1.3", writes: [], reads: old.map((p) => p.toUpperCase()), evidence: "e" }],
+        edges: [],
+      });
+      expect(res.ok).toBe(true);
+    });
+  });
+
   describe("parsing", () => {
     it("takes the last json block of an answer, else the whole text", () => {
       expect(parseResidue('DONE:\n```json\n{"a":1}\n```\ntext\n```json\n{"a":2}\n```')).toEqual({ a: 2 });
@@ -149,11 +242,13 @@ describe("executor compile: residue (2.3.5)", () => {
       expect((await rejection(variant((r) => { entries(r, "footprints")[0]!["taskId"] = "9.9.9"; }))).detail.code).toBe("residue-unknown-task");
     });
 
-    it("residue-weaken: changing the write set of an explicit task", async () => {
+    it("residue-unknown-task: an explicit task was not asked about, so it cannot be listed (QA-2.3-6)", async () => {
       const text = variant((r) => {
         entries(r, "footprints").push({ taskId: "1.1.1", writes: ["src/alpha/other.ts"], reads: [], evidence: "wrong" });
       });
-      expect((await rejection(text)).detail.code).toBe("residue-weaken");
+      expect((await rejection(text)).detail.code).toBe("residue-unknown-task");
+      const noChange = variant((r) => { r["noChange"] = ["1.1.1"]; });
+      expect((await rejection(noChange)).detail.code).toBe("residue-unknown-task");
     });
 
     it("residue-weaken: omitting an existing path", async () => {

@@ -72,9 +72,11 @@ function baseName(p: string): string {
 }
 
 /** Slug of the plan file name (plus the selected phases); at most 41 chars, else cut to 34 plus `-` and 6 hex of its sha1. */
-export function planIdOf(planPath: string, phases: readonly string[] | undefined): PlanId {
+export function planIdOf(planPath: string, phases: readonly string[] | undefined, doneBefore?: string): PlanId {
   let id = slug(baseName(planPath));
-  if (phases !== undefined && phases.length > 0) id = `${id}-${slug(phases.join("-"))}`;
+  // QA-2.3-17: `--` cannot occur inside a slugged phase id, so ["1.1.2"] and ["1.1","2"] stay distinct; doneBefore is part of the id.
+  if (phases !== undefined && phases.length > 0) id = `${id}-${phases.map(slug).join("--")}`;
+  if (doneBefore !== undefined) id = `${id}-db-${slug(doneBefore)}`;
   if (id === "") id = "plan";
   if (id.length > 41) id = `${id.slice(0, 34).replace(/-+$/, "")}-${sha1Hex(id).slice(0, 6)}`;
   if (!PLAN_ID_PATTERN.test(id)) id = `p-${sha1Hex(id).slice(0, 8)}`;
@@ -113,7 +115,30 @@ function configProblem(c: ExecutorConfig): string | null {
   if (c.land !== "ff-when-clean" && c.land !== "manual") return "config.land must be ff-when-clean or manual";
   if (c.slotsDir !== null && typeof c.slotsDir !== "string") return "config.slotsDir must be a string or null";
   if (typeof c.python !== "string") return "config.python must be a string";
+  // QA-2.3-17: the command-valued settings are checked here too, so a bad draft is rejected at the input.
+  if (!(c.integrationChecks === "auto" || isRunCommandRefs(c.integrationChecks))) {
+    return "config.integrationChecks must be \"auto\" or a list of {script, args}";
+  }
+  if (!(c.phaseSuite === "auto" || c.phaseSuite === "off" || isRunCommandRefs(c.phaseSuite))) {
+    return "config.phaseSuite must be \"auto\", \"off\" or a list of {script, args}";
+  }
+  const prov: unknown = c.provision;
+  const provOk = prov === "auto" || (typeof prov === "object" && prov !== null && !Array.isArray(prov)
+    && Object.values(prov).every((m: unknown) => Array.isArray(m) && m.every(isStringArray)));
+  if (!provOk) return "config.provision must be \"auto\" or a map of string[][]";
   return null;
+}
+
+function isStringArray(v: unknown): boolean {
+  return Array.isArray(v) && v.every((s) => typeof s === "string");
+}
+
+function isRunCommandRefs(v: unknown): boolean {
+  return Array.isArray(v) && v.every((r: unknown) => {
+    if (typeof r !== "object" || r === null) return false;
+    const o = r as { script?: unknown; args?: unknown };
+    return typeof o.script === "string" && isStringArray(o.args);
+  });
 }
 
 /** Deep copy of a JSON-shaped config. */
@@ -263,8 +288,18 @@ function countPrior(tasks: readonly TaskNode[]): number {
 
 /** Everything the compiler touches outside memory; stubbed in tests. */
 export interface CompilerDeps {
-  fs: { readText(absPath: string): Promise<string> };
+  fs: {
+    readText(absPath: string): Promise<string>;
+    /** Optional seam (QA-2.3-17): the real path of the common git dir, used as `repo.key`. */
+    realpath?(absPath: string): Promise<string>;
+  };
   git: RepoGit;
+  /**
+   * Optional seam (QA-2.3-3): the tracked files (repo-relative, '/'-separated) of the repository at `toplevel`, for
+   * `addTasks`, which is synchronous. When absent, `addTasks` uses the files recorded by the last `compile` of the same
+   * repository (`repo.key`) and, failing that, only the paths the ledger already knows.
+   */
+  listTrackedFiles?: (toplevel: string) => readonly string[];
   durations: DurationModel;
   /** Bound to `annotateSteps`. */
   annotate: (steps: readonly PlanStep[]) => Promise<AnnotatedPlan>;
@@ -275,6 +310,9 @@ export interface CompilerDeps {
 }
 
 const SETTLED: ReadonlySet<TaskState> = new Set<TaskState>(["done", "cancelled", "integrated"]);
+
+/** `PathOutcome` reasons for a spelling that leaves the repository (a write there is rejected by `addTasks`). */
+const OUTSIDE_REASONS: ReadonlySet<string> = new Set(["url", "outside", "other-drive", "unc", "device", "escape"]);
 
 function defaultCi(): boolean {
   return process.platform === "win32";
@@ -294,12 +332,15 @@ async function gitText(git: RepoGit, args: readonly string[], cwd: string): Prom
   return r.stdout.trim();
 }
 
-async function readRepo(git: RepoGit, cwd: string, toplevel: string): Promise<LedgerV1["repo"]> {
+async function readRepo(deps: CompilerDeps, cwd: string, toplevel: string): Promise<LedgerV1["repo"]> {
+  const git = deps.git;
   const common = await gitText(git, ["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd);
   const baseCommit = await gitText(git, ["rev-parse", "HEAD"], cwd);
   const baseBranch = await gitText(git, ["rev-parse", "--abbrev-ref", "HEAD"], cwd);
   const abs = /^(?:[A-Za-z]:[\\/]|\\\\|\/)/.test(common) ? common : (/^[A-Za-z]:/.test(cwd) ? win32.resolve(cwd, common) : posix.resolve(cwd, common));
-  return { key: abs, toplevel, baseBranch, baseCommit };
+  // QA-2.3-17: the key is the real path of the common git dir, so two spellings of one repository get one key.
+  const key = deps.fs.realpath === undefined ? abs : await deps.fs.realpath(abs);
+  return { key, toplevel, baseBranch, baseCommit };
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -342,7 +383,15 @@ function selectPhases(parsed: ParsedPlan, opts: { phases?: readonly string[]; do
     for (const d of p.dependsOn) {
       if (includedIds.has(d.id)) continue;
       if (d.external && !byId.has(d.id)) {
-        warnings.push({ code: "depends-external-unknown", line: d.line, message: `phase ${p.id} depends on ${d.id}, which is not in this plan; ignored` });
+        // QA-2.3-10: an external (dogfood) dependency cannot be checked here; the caller must vouch for it with doneBefore.
+        if (opts.doneBefore === undefined) {
+          throw new ExecutorError(
+            "E_INVALID_INPUT",
+            `phase ${p.id} depends on ${d.id}, which is not in this plan; pass doneBefore to run without it`,
+            { phase: p.id, dependsOn: d.id },
+          );
+        }
+        warnings.push({ code: "depends-external-unknown", line: d.line, message: `phase ${p.id} depends on ${d.id}, which is not in this plan; ignored (doneBefore is set)` });
         continue;
       }
       throw new ExecutorError(
@@ -413,6 +462,13 @@ function footprintWarnings(t: ParsedTask, fp: TaskFootprint, out: CompileIssue[]
   }
   for (const r of fp.foreignRoots) {
     out.push({ code: "foreign-root", line: t.span.line, message: `${t.id}: paths under ${r} were mapped into this repository` });
+  }
+  if (fp.ownershipAssumed) {
+    out.push({
+      code: "ownership-assumed",
+      line: t.span.line,
+      message: `${t.id}: no write evidence; assumed to write everything its phase owns (confidence inferred)`,
+    });
   }
 }
 
@@ -522,7 +578,38 @@ function draftInvalid(errors: ReadonlyArray<{ code: string; message: string; tas
   return new ExecutorError("E_COMPILE", `compiled draft is invalid: ${first === undefined ? (extra[0] ?? "unknown") : `${first.code}: ${first.message}`}`, detail);
 }
 
+/**
+ * QA-2.3-2: `parsePlan` keeps a phrase or graph reference only when it names a node of the same text, so a fragment's
+ * `before 1.1.2` to a ledger task would be dropped. The fragment is parsed a second time with one stub item per ledger
+ * task appended (after a blank line, so the fragment's own items are untouched); only the phrases and graph blocks of
+ * that second parse are used, the tasks, phases and ownership stay those of the fragment alone.
+ */
+function fragmentWithLedgerRefs(frag: ParsedPlan, text: string, ledger: LedgerV1): ParsedPlan {
+  const ids = Object.keys(ledger.tasks).filter((id) => /^(?:T|P)?\d+(?:\.(?:\d+|[A-Z]{1,4}))+[a-z]?$/.test(id));
+  if (ids.length === 0) return frag;
+  const stubbed = `${text.replace(/\s+$/, "")}\n\n**Tasks**\n${ids.map((id) => `- **${id}** (ledger task)`).join("\n")}\n`;
+  const withStubs = parsePlan(stubbed);
+  const own = new Set(frag.tasks.map((t) => t.id));
+  const fromLedger = (id: string): boolean => !own.has(id) && ids.includes(id);
+  return {
+    ...frag,
+    phrases: withStubs.phrases.filter((p) => !fromLedger(p.subject.id)),
+    graphs: withStubs.graphs,
+    warnings: [
+      ...frag.warnings.filter((w) => w.code !== "explicit-ref-unknown" && w.code !== "graph-node-unknown"),
+      ...withStubs.warnings.filter((w) => w.code === "explicit-ref-unknown" || w.code === "graph-node-unknown"),
+    ],
+  };
+}
+
 export function createPlanCompiler(deps: CompilerDeps): PlanCompiler {
+  // Per-instance state (QA-2.3-13, QA-2.3-3), keyed by `repo.key`: the case flag (`core.ignorecase`) and the tracked files
+  // read by `compile`. `mergeResidue`, `addTasks` and `validate` use them; a repository this instance never compiled
+  // (a ledger resumed in a new process) falls back to the platform default and to the paths the ledger knows.
+  const ciByRepo = new Map<string, boolean>();
+  const filesByRepo = new Map<string, readonly string[]>();
+  const ciFor = (repo: LedgerV1["repo"]): boolean => ciByRepo.get(repo.key) ?? defaultCi();
+
   async function compile(
     planPath: string,
     opts: { phases?: string[]; doneBefore?: string; config: ExecutorConfig; orchestratorSessionID: string; now: string },
@@ -571,7 +658,16 @@ export function createPlanCompiler(deps: CompilerDeps): PlanCompiler {
       });
     });
     const built = buildEdges(pp, edgeTasks, { crossPhase: config.crossPhase, ci });
-    issues.push(...built.warnings);
+    // QA-2.3-10: a prose reference to a phase or wave of the plan that is outside this run is not an unresolved
+    // reference; it gets its own warning and does not feed the residue.
+    const planNodes = new Set([...parsed.phases.map((p) => p.id), ...parsed.waves.map((w) => w.id)]);
+    const runNodes = new Set([...includedIds, ...pp.waves.map((w) => w.id)]);
+    for (const w of built.warnings) {
+      const ref = w.code === "explicit-ref-unknown" ? /^unknown (?:reference|subject) (\S+?):/.exec(w.message)?.[1] : undefined;
+      if (ref !== undefined && planNodes.has(ref) && !runNodes.has(ref)) {
+        issues.push({ code: "ref-outside-run", line: w.line, message: `${ref} is not part of this run: ${w.message}` });
+      } else issues.push(w);
+    }
 
     // doneBefore projection
     const materialized = new Set(universe.filter((t) => t.phase === null || sel.selected.has(t.phase)).map((t) => t.id));
@@ -581,12 +677,8 @@ export function createPlanCompiler(deps: CompilerDeps): PlanCompiler {
     for (const e of built.edges) {
       let from: string = e.from;
       let evidence = e.evidence;
-      if (from.startsWith("gate:")) {
-        if (!includedIds.has(from.slice("gate:".length))) {
-          issues.push({ code: "edge-dropped-unselected-phase", line: 0, message: `edge ${e.from} -> ${e.to} dropped: phase is not part of this run` });
-          continue;
-        }
-      } else if (!materialized.has(from)) {
+      // buildEdges only knows the included phases, so every `gate:` source is part of this run.
+      if (!from.startsWith("gate:") && !materialized.has(from)) {
         const ph = phaseOfTask.get(from) ?? null;
         if (ph === null || !includedIds.has(ph)) continue;
         from = `gate:${ph}`;
@@ -633,8 +725,11 @@ export function createPlanCompiler(deps: CompilerDeps): PlanCompiler {
       if (!waves.some((w) => w.id === p.wave)) waves.push({ id: p.wave, phases: phases.filter((q) => q.wave === p.wave).map((q) => q.id) });
     }
 
-    const planId = planIdOf(planPath, opts.phases);
-    const repo = await readRepo(deps.git, cwd, view.toplevel);
+    const planId = planIdOf(planPath, opts.phases, opts.doneBefore);
+    const repo = await readRepo(deps, cwd, view.toplevel);
+    // QA-2.3-13 / QA-2.3-3: remember the case flag and the tracked files of this repository for the later calls.
+    ciByRepo.set(repo.key, ci);
+    filesByRepo.set(repo.key, [...view.files]);
     const roots = [view.toplevel, ...view.worktrees];
     const sharedContext = sharedContextOf(parsed.sharedContextRaw, roots, ci, config.sharedContextChars, issues);
 
@@ -680,12 +775,12 @@ export function createPlanCompiler(deps: CompilerDeps): PlanCompiler {
   }
 
   function mergeResidue(draft: LedgerV1, responseText: string): { draft: LedgerV1; summary: CompileSummary } {
-    const checked = validateResidue(draft, parseResidue(responseText));
+    const ci = ciFor(draft.repo);
+    const checked = validateResidue(draft, parseResidue(responseText), { ci });
     if (!checked.ok) {
       throw new ExecutorError("E_RESIDUE", `residue rejected (${checked.code} at ${checked.at})`, { code: checked.code, at: checked.at, detail: checked.detail });
     }
-    const merged = mergeResidueInto(draft, checked.value);
-    const ci = defaultCi();
+    const merged = mergeResidueInto(draft, checked.value, { ci });
     const rest = merged.edges.filter((e) => e.kind !== "conflict");
     const all = Object.values(merged.tasks);
     const phaseOf = new Map(all.map((t) => [t.id, t.phase] as const));
@@ -708,16 +803,32 @@ export function createPlanCompiler(deps: CompilerDeps): PlanCompiler {
     return { draft: next, summary: summaryOf(next, []) };
   }
 
+  /** The contract allows only E_CYCLE and E_INVALID_INPUT: a parse failure (E_COMPILE) becomes E_INVALID_INPUT. */
   function addTasks(ledger: LedgerV1, text: string): { tasks: TaskNode[]; edges: Edge[]; reopened: TaskId[] } {
-    const frag = parsePlan(text);
+    try {
+      return addTasksChecked(ledger, text);
+    } catch (e) {
+      if (e instanceof ExecutorError && e.code === "E_COMPILE") {
+        throw new ExecutorError("E_INVALID_INPUT", e.message, e.detail ?? null);
+      }
+      throw e;
+    }
+  }
+
+  function addTasksChecked(ledger: LedgerV1, text: string): { tasks: TaskNode[]; edges: Edge[]; reopened: TaskId[] } {
+    const frag = fragmentWithLedgerRefs(parsePlan(text), text, ledger);
     if (frag.tasks.length === 0) throw new ExecutorError("E_INVALID_INPUT", "the fragment contains no tasks", null);
-    const ci = defaultCi();
+    const ci = ciFor(ledger.repo);
     const phaseIds = new Set(ledger.phases.map((p) => p.id));
     const taken = new Set(Object.keys(ledger.tasks).map((k) => k.toLowerCase()));
 
-    // lexical-only repo view: the files the ledger already knows (no git, this method is synchronous)
-    const known = new Set<string>();
-    for (const t of Object.values(ledger.tasks)) for (const p of [...t.footprint.writes, ...t.footprint.reads]) known.add(p);
+    // repo view: the tracked files (seam, else the files recorded at compile); only when neither exists, the paths the
+    // ledger already knows (this method is synchronous, so no git here)
+    const tracked = deps.listTrackedFiles?.(ledger.repo.toplevel) ?? filesByRepo.get(ledger.repo.key);
+    const known = new Set<string>(tracked ?? []);
+    if (tracked === undefined) {
+      for (const t of Object.values(ledger.tasks)) for (const p of [...t.footprint.writes, ...t.footprint.reads]) known.add(p);
+    }
     const view = repoViewFrom({
       toplevel: ledger.repo.toplevel,
       worktrees: [ledger.repo.toplevel, ledger.integration.worktree],
@@ -737,7 +848,16 @@ export function createPlanCompiler(deps: CompilerDeps): PlanCompiler {
       const prefix = t.id.includes(".") ? t.id.slice(0, t.id.lastIndexOf(".")) : null;
       const phase = t.phase !== null && phaseIds.has(t.phase) ? t.phase : prefix !== null && phaseIds.has(prefix) ? prefix : null;
       if (phase === null) throw new ExecutorError("E_INVALID_INPUT", `task ${t.id} belongs to no phase of the ledger`, { taskId: t.id, phase: t.phase });
+      // QA-2.3-3: a phase whose gate has passed is closed; a task added there would never be waited for.
+      if (ledger.phases.find((p) => p.id === phase)?.gate === "passed") {
+        throw new ExecutorError("E_INVALID_INPUT", `phase ${phase} has already passed its gate; task ${t.id} cannot be added to it`, { taskId: t.id, phase });
+      }
       const fp = extractFootprint(t, ownershipOf(frag, t.phase), view, created);
+      // QA-2.3-2: a write path that leaves the repository is rejected here, not silently dropped.
+      const outside = fp.ignored.find((x) => x.write === true && OUTSIDE_REASONS.has(x.reason));
+      if (outside !== undefined) {
+        throw new ExecutorError("E_INVALID_INPUT", `task ${t.id} writes ${JSON.stringify(outside.raw)}, which is outside the repository (${outside.reason})`, { taskId: t.id, path: outside.raw, reason: outside.reason });
+      }
       footprintWarnings(t, fp, issues);
       const node = nodeOf(deps, t, phase, fp, "pending", issues);
       newNodes.push(node);
@@ -745,7 +865,22 @@ export function createPlanCompiler(deps: CompilerDeps): PlanCompiler {
     });
     const newIds = new Set(newNodes.map((n) => n.id));
 
-    const built = buildEdges(frag, edgeTasks, { crossPhase: ledger.config.crossPhase, ci });
+    // QA-2.3-2: references of the fragment resolve against the ledger and the fragment together. The ledger's tasks
+    // and phases are passed to the edge passes (earlier in plan order) so `before X`, `Depends on:` and graph blocks can
+    // name them; only the edges that involve a new task are kept.
+    const existing = Object.values(ledger.tasks);
+    const fragPhaseIds = new Set(frag.phases.map((p) => p.id));
+    const fragView: ParsedPlan = {
+      ...frag,
+      phases: [
+        ...ledger.phases.filter((p) => !fragPhaseIds.has(p.id)).map((p): ParsedPhase => ({
+          id: p.id, title: p.title, wave: p.wave, span: { line: 0, endLine: 0 }, dogfood: false, synthetic: false,
+          dependsOn: [], order: null, fixTemplate: null, intro: "", newTests: null,
+        })),
+        ...frag.phases,
+      ],
+    };
+    const built = buildEdges(fragView, [...existing.map((t, i) => edgeTaskOf(t, i)), ...edgeTasks], { crossPhase: ledger.config.crossPhase, ci });
     const newEdges: Edge[] = [];
     const seen = new Set(ledger.edges.map((e) => `${e.from}>${e.to}`));
     const push = (e: Edge): void => {
@@ -758,8 +893,21 @@ export function createPlanCompiler(deps: CompilerDeps): PlanCompiler {
       if (e.from.startsWith("gate:") && !phaseIds.has(e.from.slice("gate:".length))) {
         throw new ExecutorError("E_INVALID_INPUT", `edge ${e.from} -> ${e.to} names a phase that is not in the ledger`, { from: e.from, to: e.to });
       }
+      const fromNew = newIds.has(e.from);
+      const toNew = newIds.has(e.to);
+      if (!fromNew && !toNew) continue;
+      if (e.kind === "structural" && !(toNew && (fromNew || e.from.startsWith("gate:")))) continue;
+      // conflicts and contracts are recomputed below with the whole ledger's reach; keep the new-to-new ones only
+      if ((e.kind === "conflict" || e.kind === "contract") && !(fromNew && toNew)) continue;
+      if (fromNew && !toNew) {
+        const state = ledger.tasks[e.to]?.state;
+        if (state !== "pending" && state !== "ready") {
+          throw new ExecutorError("E_INVALID_INPUT", `edge ${e.from} -> ${e.to}: ${e.to} is ${state ?? "unknown"} and cannot wait for a new task`, { from: e.from, to: e.to });
+        }
+      }
       push(e);
     }
+    for (const w of built.warnings) issues.push(w);
 
     // conflicts against the live tasks of the ledger (existing tasks come first in plan order)
     const allTasks = [...Object.values(ledger.tasks), ...newNodes];
@@ -800,5 +948,5 @@ export function createPlanCompiler(deps: CompilerDeps): PlanCompiler {
     return { tasks: newNodes, edges: newEdges, reopened };
   }
 
-  return { compile, mergeResidue, addTasks, validate: (ledger) => validateLedger(ledger) };
+  return { compile, mergeResidue, addTasks, validate: (ledger) => validateLedger(ledger, { ci: ciFor(ledger.repo) }) };
 }
