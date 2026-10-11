@@ -2,16 +2,41 @@
 // Phase 1.4 task 1.4.4: unit tests for the cross-phase executor contract in src/executor/types.ts (memo §12).
 import { describe, expect, it } from "vitest";
 import {
+  ABSOLUTE_PATH_PATTERN,
   ATTEMPT_OUTCOMES,
   CHILD_END_GRACE_MS,
+  ContextSupersededError,
   DURABLE_TASK_STATES,
   EXECUTOR_DEFAULTS,
   EXECUTOR_LIMITS,
   ExecutorError,
   FINDINGS_FORMAT,
+  FIX_TASKS_PER_ROUND_LIMIT,
   GATE_STATES,
   GATE_TRANSITIONS,
+  GATE_TRANSITION_OWNERS,
+  GATE_TRANSITION_TRIGGERS,
+  GIT_ID_PATTERN,
   HEAVY_CAP_PER_PROVIDER,
+  INBOX_ID_PATTERN,
+  INBOX_ID_PREFIX,
+  PHASE_ID_PATTERN,
+  QA_CAP_OPTIONS,
+  QA_ROUND_LIMIT,
+  QA_UNPARSABLE_CONTEXT_PREFIX,
+  WAVE_ID_PATTERN,
+  canonicalFindingsJson,
+  executorDefaults,
+  fixTaskId,
+  formatInboxId,
+  formatLaunchPrompt,
+  isContextSupersededError,
+  isHistoryEvent,
+  ledgerViolations,
+  looksLikePlanPrompt,
+  nextInboxNumber,
+  qaUnparsableCount,
+  reviewTaskId,
   LAUNCH_CONFIRM_TIMEOUT_MS,
   LAUNCH_HEADER_PATTERN,
   LEDGER_SCHEMA,
@@ -47,6 +72,18 @@ import {
 import type {
   Attempt,
   AttemptOutcome,
+  BatchBuilder,
+  ContextRef,
+  GateOwner,
+  GateTransitionKey,
+  GateTrigger,
+  InboxKind,
+  OpenIntegrationEntry,
+  PhaseRecord,
+  LaunchConfirmation,
+  LaunchGate,
+  LaunchHooks,
+  ResumeReport,
   CapacityController,
   CapacityView,
   ChildEnd,
@@ -107,6 +144,14 @@ import type {
 
 const NONCE = "0123456789abcdef0123456789abcdef";
 const T0 = "2026-10-11T00:00:00.000Z";
+const SHA_A = "a".repeat(40);
+const SHA_B = "b".repeat(40);
+const SHA_C = "c".repeat(40);
+
+/** A distinct valid nonce per attempt number (QA-1.4-8: the fixture must satisfy `nonce-duplicate`). */
+function nonceFor(n: number): string {
+  return Math.max(0, Math.trunc(n)).toString(16).padStart(32, "0");
+}
 
 function clone<T>(v: T): T {
   return JSON.parse(JSON.stringify(v));
@@ -125,7 +170,7 @@ function mulberry32(seed: number): () => number {
 
 function attempt(n: number, outcome: AttemptOutcome | null, verdict: Verdict | null = null, patch: Partial<Attempt> = {}): Attempt {
   return {
-    n, nonce: NONCE, callID: null, childSessionID: null, startedAt: T0, endedAt: outcome === null ? null : T0,
+    n, nonce: nonceFor(n), callID: null, childSessionID: null, startedAt: T0, endedAt: outcome === null ? null : T0,
     outcome, verdict, context: "", ...patch,
   };
 }
@@ -150,22 +195,25 @@ function buildLedger(): LedgerV1 {
     planId: "plan-one",
     planPath: "C:/repo/PLAN.md",
     planDigest: "ab".repeat(32),
-    repo: { key: "repo-key", toplevel: "C:/repo", baseBranch: "main", baseCommit: "c0ffee" },
-    integration: { branch: "omr/plan-one/integration", worktree: "C:/slots/integration", head: "c0ffee" },
+    repo: { key: "repo-key", toplevel: "C:/repo", baseBranch: "main", baseCommit: SHA_C },
+    integration: { branch: "omr/plan-one/integration", worktree: "C:/slots/integration", head: SHA_C },
     launcher: "A",
     status: "running",
     orchestrator: { sessionID: "ses-0", boundAt: T0 },
     config,
     sharedContext: "shared notes",
     waves: [{ id: "w1", phases: ["p1"] }],
-    phases: [{ id: "p1", title: "Phase 1", wave: "w1", dependsOn: ["p0"], gate: "pending", qaRound: 0, paused: false, tag: null }],
+    phases: [{ id: "p1", title: "Phase 1", wave: "w1", dependsOn: [], gate: "pending", qaRound: 1, paused: false, tag: null }],
     tasks: {
       T1: taskNode("T1", {
-        state: "integrated", slot: "slot-1", branch: "omr/plan-one/t/T1", acceptance: "criteria",
+        state: "integrated", slot: null, branch: "omr/plan-one/t/T1", acceptance: "criteria",
         attempts: [attempt(1, "succeeded", "pass", { callID: "call-1", childSessionID: "ses-1" })],
-        integrated: { from: "aaa", to: "bbb" },
+        integrated: { from: SHA_A, to: SHA_B },
       }),
-      T2: taskNode("T2", { state: "running", slot: "slot-2", attempts: [attempt(1, "failed", "fail"), attempt(2, null)] }),
+      T2: taskNode("T2", {
+        state: "running", slot: "slot-2",
+        attempts: [attempt(1, "failed"), attempt(2, null, null, { childSessionID: "ses-2" })],
+      }),
       T3: taskNode("T3"),
       M1: taskNode("M1", { kind: "manual", state: "ready", phase: null }),
     },
@@ -238,6 +286,32 @@ function wrongValues(v: unknown, path: Path): unknown[] {
   return [...nul, "x", 1, [], true];
 }
 
+function pick<T>(rng: () => number, items: readonly T[]): T {
+  return items[Math.floor(rng() * items.length)] as T;
+}
+
+function taskOf(l: LedgerV1, id: string): TaskNode {
+  const t = l.tasks[id];
+  if (t === undefined) throw new Error(`no task ${id}`);
+  return t;
+}
+
+function attemptOf(t: TaskNode, i: number): Attempt {
+  const a = t.attempts[i];
+  if (a === undefined) throw new Error(`no attempt ${i}`);
+  return a;
+}
+
+function phaseOf(l: LedgerV1, i = 0): PhaseRecord {
+  const p = l.phases[i];
+  if (p === undefined) throw new Error(`no phase ${i}`);
+  return p;
+}
+
+function codesOf(v: unknown): Set<string> {
+  return new Set(ledgerViolations(v).map((x) => x.code));
+}
+
 function shuffled<T>(items: readonly T[], rng: () => number): T[] {
   const a = [...items];
   for (let i = a.length - 1; i > 0; i--) {
@@ -247,23 +321,6 @@ function shuffled<T>(items: readonly T[], rng: () => number): T[] {
     a[j] = x;
   }
   return a;
-}
-
-function randomJson(rng: () => number, depth: number): unknown {
-  const pick = Math.floor(rng() * (depth > 2 ? 4 : 6));
-  switch (pick) {
-    case 0: return null;
-    case 1: return rng() < 0.5;
-    case 2: return Math.floor(rng() * 1000) - 500;
-    case 3: return `s${Math.floor(rng() * 1e6).toString(36)}`;
-    case 4: return Array.from({ length: Math.floor(rng() * 4) }, () => randomJson(rng, depth + 1));
-    default: {
-      const o: Record<string, unknown> = {};
-      const n = Math.floor(rng() * 5);
-      for (let i = 0; i < n; i++) o[`k${Math.floor(rng() * 30)}`] = randomJson(rng, depth + 1);
-      return o;
-    }
-  }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -387,6 +444,14 @@ describe("task state machine (§3.1)", () => {
     expect([...used].sort()).toEqual([...ALL_TRIGGERS].sort());
   });
 
+  it("the three *>blocked rows are owned by the queue only (A1-2)", () => {
+    for (const key of ["ready>blocked", "dispatched>blocked", "running>blocked"] as const) {
+      expect(TRANSITION_OWNERS[key], key).toEqual(["Q"]);
+      expect(TRANSITION_TRIGGERS[key], key).toEqual(["dep-reverted"]);
+    }
+    expect(TRANSITION_OWNERS["pending>blocked"]).toEqual(["P"]);
+  });
+
   it("re-entering a state is never a transition", () => {
     for (const s of TASK_STATES) expect(canTransition(s, s), s).toBe(false);
   });
@@ -485,10 +550,62 @@ describe("gate state machine (§3.3), cell by cell", () => {
     pending: ["suite-running", "awaiting-qa"],
     "suite-running": ["awaiting-qa", "suite-failed"],
     "suite-failed": ["pending", "suite-running"],
-    "awaiting-qa": ["qa-running", "passed"],
+    "awaiting-qa": ["qa-running", "passed", "pending"],
     "qa-running": ["awaiting-qa", "pending", "passed"],
     passed: [],
   };
+
+  const ALL_GATE_TRIGGERS: readonly GateTrigger[] = [
+    "phase-integrated", "suite-passed", "suite-culprit-found", "culprit-reverted", "suite-rerun", "qa-dispatched",
+    "qa-requeued", "qa-cap", "qa-next-round", "qa-clean", "no-open-qa", "cap-accepted", "cap-fix",
+  ];
+  const ALL_GATE_OWNERS: readonly GateOwner[] = ["Rt", "Q", "P", "Rc", "QL"];
+  /** A1-1 table, written out independently of the source constants: [from, to, triggers, owners]. */
+  const EXPECTED_ROWS: Array<[GateState, GateState, GateTrigger[], GateOwner[]]> = [
+    ["pending", "suite-running", ["phase-integrated"], ["Q"]],
+    ["pending", "awaiting-qa", ["phase-integrated"], ["Q"]],
+    ["suite-running", "awaiting-qa", ["suite-passed"], ["Q"]],
+    ["suite-running", "suite-failed", ["suite-culprit-found"], ["Q"]],
+    ["suite-failed", "pending", ["culprit-reverted"], ["Q"]],
+    ["suite-failed", "suite-running", ["suite-rerun"], ["Q"]],
+    ["awaiting-qa", "qa-running", ["qa-dispatched"], ["Rt", "Rc"]],
+    ["awaiting-qa", "passed", ["no-open-qa", "cap-accepted"], ["QL"]],
+    ["awaiting-qa", "pending", ["cap-fix"], ["QL"]],
+    ["qa-running", "awaiting-qa", ["qa-requeued", "qa-cap"], ["Rt", "P", "Q", "QL"]],
+    ["qa-running", "pending", ["qa-next-round"], ["QL"]],
+    ["qa-running", "passed", ["qa-clean"], ["QL"]],
+  ];
+
+  it("has exactly the 12 A1-1 rows, each with its triggers and owners; illegal cells have neither", () => {
+    expect(EXPECTED_ROWS).toHaveLength(12);
+    const keys = EXPECTED_ROWS.map(([a, b]) => `${a}>${b}`).sort();
+    expect(Object.keys(GATE_TRANSITION_TRIGGERS).sort()).toEqual(keys);
+    expect(Object.keys(GATE_TRANSITION_OWNERS).sort()).toEqual(keys);
+    for (const [a, b, triggers, owners] of EXPECTED_ROWS) {
+      const key = `${a}>${b}` as GateTransitionKey;
+      expect(canGateTransition(a, b), key).toBe(true);
+      expect(GATE_TRANSITION_TRIGGERS[key], key).toEqual(triggers);
+      expect(GATE_TRANSITION_OWNERS[key], key).toEqual(owners);
+      for (const t of triggers) expect(ALL_GATE_TRIGGERS).toContain(t);
+      for (const o of owners) expect(ALL_GATE_OWNERS).toContain(o);
+    }
+    for (const a of GATE_STATES) {
+      for (const b of GATE_STATES) {
+        if (canGateTransition(a, b)) continue;
+        expect(GATE_TRANSITION_TRIGGERS[`${a}>${b}` as GateTransitionKey], `${a}>${b}`).toBeUndefined();
+        expect(GATE_TRANSITION_OWNERS[`${a}>${b}` as GateTransitionKey], `${a}>${b}`).toBeUndefined();
+      }
+    }
+    const used = new Set(Object.values(GATE_TRANSITION_TRIGGERS).flatMap((t) => t ?? []));
+    expect([...used].sort()).toEqual([...ALL_GATE_TRIGGERS].sort());
+  });
+
+  it("awaiting-qa > pending is legal (cap-fix, QaLoop) and passed has no exits", () => {
+    expect(canGateTransition("awaiting-qa", "pending")).toBe(true);
+    expect(GATE_TRANSITION_TRIGGERS["awaiting-qa>pending"]).toEqual(["cap-fix"]);
+    expect(GATE_TRANSITION_OWNERS["awaiting-qa>pending"]).toEqual(["QL"]);
+    for (const b of GATE_STATES) expect(canGateTransition("passed", b), b).toBe(false);
+  });
 
   it("matches the expected 6x6 table", () => {
     let legalCount = 0;
@@ -499,7 +616,7 @@ describe("gate state machine (§3.3), cell by cell", () => {
         if (expected) legalCount++;
       }
     }
-    expect(legalCount).toBe(11);
+    expect(legalCount).toBe(12);
     expect(GATE_STATES.length * GATE_STATES.length).toBe(36);
   });
 
@@ -635,6 +752,12 @@ describe("provider error classification (R3)", () => {
 // §7 Launch header
 // ---------------------------------------------------------------------------------------------------------------
 
+const SHARED = "shared notes";
+/** A prompt with `line` at the strict fixed position. */
+function promptOf(line: string, shared: string = SHARED): string {
+  return `PLAN CONTEXT\n${shared}\n\n${line}\n\nTASK\nDo the thing.`;
+}
+
 describe("launch header", () => {
   it("renders the documented line", () => {
     expect(formatLaunchHeader({ planId: "plan-one", taskId: "T1", attempt: 2, nonce: NONCE })).toBe(`[plan plan-one:T1#2] nonce=${NONCE}`);
@@ -649,39 +772,99 @@ describe("launch header", () => {
         for (const attemptN of attempts) {
           const fields = { planId, taskId, attempt: attemptN, nonce: NONCE };
           const header = formatLaunchHeader(fields);
-          expect(parseLaunchHeader(header)).toEqual(fields);
+          expect(parseLaunchHeader(promptOf(header), SHARED)).toEqual(fields);
+          expect(parseLaunchHeader(formatLaunchPrompt(SHARED, fields, "TASK\nbody"), SHARED)).toEqual(fields);
           expect(LAUNCH_HEADER_PATTERN.test(header)).toBe(true);
         }
       }
     }
   });
 
-  it("finds the header line inside a full prompt", () => {
+  it("finds the header line at the fixed position of a full prompt", () => {
     const fields = { planId: "plan-one", taskId: "T2", attempt: 3, nonce: NONCE };
-    const prompt = `PLAN CONTEXT\nshared\n\n${formatLaunchHeader(fields)}\n\nTASK\nDo the thing.`;
-    expect(parseLaunchHeader(prompt)).toEqual(fields);
+    expect(parseLaunchHeader(promptOf(formatLaunchHeader(fields)), SHARED)).toEqual(fields);
+    // an empty and a multi-line shared context
+    expect(parseLaunchHeader(promptOf(formatLaunchHeader(fields), ""), "")).toEqual(fields);
+    const multi = "line one\n\nline two\n";
+    expect(parseLaunchHeader(promptOf(formatLaunchHeader(fields), multi), multi)).toEqual(fields);
   });
 
   it("returns null when there is no header or the header is malformed", () => {
-    expect(parseLaunchHeader("")).toBeNull();
-    expect(parseLaunchHeader("no header here")).toBeNull();
-    expect(parseLaunchHeader(`[plan plan-one:T1#0] nonce=${NONCE}`)).toBeNull();
-    expect(parseLaunchHeader(`[plan plan-one:T1#10000] nonce=${NONCE}`)).toBeNull();
-    expect(parseLaunchHeader(`[plan plan-one:T1#1] nonce=${NONCE.toUpperCase()}`)).toBeNull();
-    expect(parseLaunchHeader(`[plan plan-one:T1#1] nonce=${NONCE.slice(1)}`)).toBeNull();
-    expect(parseLaunchHeader(`[plan PLAN:T1#1] nonce=${NONCE}`)).toBeNull();
-    expect(parseLaunchHeader(`[plan plan-one:T1#1] nonce=${NONCE} trailing`)).toBeNull();
-    expect(parseLaunchHeader(`[plan plan-one:T 1#1] nonce=${NONCE}`)).toBeNull();
+    const bad = (line: string) => parseLaunchHeader(promptOf(line), SHARED);
+    expect(parseLaunchHeader("", SHARED)).toBeNull();
+    expect(parseLaunchHeader("no header here", SHARED)).toBeNull();
+    expect(parseLaunchHeader(`PLAN CONTEXT\n${SHARED}\n\n`, SHARED)).toBeNull();
+    expect(bad("no header here")).toBeNull();
+    expect(bad(`[plan plan-one:T1#0] nonce=${NONCE}`)).toBeNull();
+    expect(bad(`[plan plan-one:T1#10000] nonce=${NONCE}`)).toBeNull();
+    expect(bad(`[plan plan-one:T1#1] nonce=${NONCE.toUpperCase()}`)).toBeNull();
+    expect(bad(`[plan plan-one:T1#1] nonce=${NONCE.slice(1)}`)).toBeNull();
+    expect(bad(`[plan PLAN:T1#1] nonce=${NONCE}`)).toBeNull();
+    expect(bad(`[plan plan-one:T1#1] nonce=${NONCE} trailing`)).toBeNull();
+    expect(bad(`[plan plan-one:T 1#1] nonce=${NONCE}`)).toBeNull();
+    // a single newline after a valid header does not end the header line
+    expect(parseLaunchHeader(`PLAN CONTEXT\n${SHARED}\n\n[plan plan-one:T1#1] nonce=${NONCE}\nTASK`, SHARED)).toBeNull();
+  });
+
+  it("strict parsing is position based: a header-shaped line elsewhere or a different shared context is not a header", () => {
+    const fields = { planId: "plan-one", taskId: "T1", attempt: 1, nonce: NONCE };
+    const line = formatLaunchHeader(fields);
+    const other = { ...fields, nonce: "f".repeat(32) };
+    // header-shaped line inside the shared context, real header after it
+    const forged = `PLAN CONTEXT\n${formatLaunchHeader(other)}\n\n${line}\n\nTASK\nx`;
+    expect(parseLaunchHeader(forged, formatLaunchHeader(other))).toBeNull();
+    // the same prompt read with the ledger's real shared context finds no header at the fixed position
+    expect(parseLaunchHeader(forged, SHARED)).toBeNull();
+    // header only in the task block
+    expect(parseLaunchHeader(`PLAN CONTEXT\n${SHARED}\n\nTASK\n${line}`, SHARED)).toBeNull();
+    // wrong prefix
+    expect(parseLaunchHeader(`${line}\n\nTASK`, SHARED)).toBeNull();
+    expect(parseLaunchHeader(promptOf(line).replace("PLAN CONTEXT", "CONTEXT"), SHARED)).toBeNull();
+  });
+
+  it("looksLikePlanPrompt is loose: any header-shaped line matches", () => {
+    const line = formatLaunchHeader({ planId: "plan-one", taskId: "T1", attempt: 1, nonce: NONCE });
+    expect(looksLikePlanPrompt(promptOf(line))).toBe(true);
+    expect(looksLikePlanPrompt(`anything\n${line}\nelse`)).toBe(true);
+    expect(looksLikePlanPrompt(line)).toBe(true);
+    expect(looksLikePlanPrompt("")).toBe(false);
+    expect(looksLikePlanPrompt("[plan plan-one:T1#1] nonce=short")).toBe(false);
+    expect(looksLikePlanPrompt(`prefix ${line}`)).toBe(false);
+  });
+
+  it("formatLaunchPrompt renders the §7 grammar and refuses a forged shared context or a task block without TASK", () => {
+    const fields = { planId: "plan-one", taskId: "T1", attempt: 2, nonce: NONCE };
+    const prompt = formatLaunchPrompt(SHARED, fields, "TASK\nT1 body");
+    expect(prompt).toBe(`PLAN CONTEXT\n${SHARED}\n\n[plan plan-one:T1#2] nonce=${NONCE}\n\nTASK\nT1 body`);
+    expect(parseLaunchHeader(prompt, SHARED)).toEqual(fields);
+    const codeOf = (fn: () => unknown): string | undefined => {
+      try {
+        fn();
+      } catch (e) {
+        return e instanceof ExecutorError ? e.code : "other";
+      }
+      return undefined;
+    };
+    expect(codeOf(() => formatLaunchPrompt(`x\n${formatLaunchHeader(fields)}\ny`, fields, "TASK"))).toBe("E_LAUNCH_TASK");
+    expect(codeOf(() => formatLaunchPrompt(SHARED, fields, "Do it"))).toBe("E_LAUNCH_TASK");
+    expect(codeOf(() => formatLaunchPrompt(SHARED, fields, ""))).toBe("E_LAUNCH_TASK");
+    expect(codeOf(() => formatLaunchPrompt(SHARED, { ...fields, attempt: 0 }, "TASK"))).toBe("E_LAUNCH_TASK");
   });
 
   it("rejects integer-like task ids", () => {
     for (const taskId of ["1", "42", "0123", "9999999"]) {
       expect(() => formatLaunchHeader({ planId: "plan-one", taskId, attempt: 1, nonce: NONCE }), taskId).toThrow(ExecutorError);
-      expect(parseLaunchHeader(`[plan plan-one:${taskId}#1] nonce=${NONCE}`), taskId).toBeNull();
+      expect(parseLaunchHeader(promptOf(`[plan plan-one:${taskId}#1] nonce=${NONCE}`), SHARED), taskId).toBeNull();
     }
   });
 
-  it("formatLaunchHeader throws ExecutorError E_INVALID_INPUT on invalid fields", () => {
+  it("the exported pattern keeps the corrected task-id lookahead (QA-1.4-12: consumers import it)", () => {
+    expect(LAUNCH_HEADER_PATTERN.source).toContain("(?!\\d+#)");
+    expect(LAUNCH_HEADER_PATTERN.test(`[plan plan-one:1a#1] nonce=${NONCE}`)).toBe(true);
+    expect(LAUNCH_HEADER_PATTERN.test(`[plan plan-one:12#1] nonce=${NONCE}`)).toBe(false);
+  });
+
+  it("formatLaunchHeader throws ExecutorError E_LAUNCH_TASK on invalid fields", () => {
     const base = { planId: "plan-one", taskId: "T1", attempt: 1, nonce: NONCE };
     const bad = [
       { ...base, planId: "ab" },
@@ -717,7 +900,7 @@ describe("launch header", () => {
       }
       expect(caught, JSON.stringify(fields)).toBeInstanceOf(ExecutorError);
       const err = caught as ExecutorError;
-      expect(err.code).toBe("E_INVALID_INPUT");
+      expect(err.code).toBe("E_LAUNCH_TASK");
       expect(err.name).toBe("ExecutorError");
       expect(err).toBeInstanceOf(Error);
       expect(err.detail).toMatchObject({ planId: fields.planId, taskId: fields.taskId });
@@ -939,10 +1122,11 @@ describe("ledger guards", () => {
   it("isTaskNode accepts a node in every state when its invariants hold", () => {
     for (const state of TASK_STATES) {
       const inFlight = state === "dispatched" || state === "running";
+      const slotHeld = !["pending", "blocked", "parked", "done", "cancelled", "integrated", "reverted"].includes(state);
       const node = taskNode("T5", {
-        state, slot: "slot-1", branch: "omr/plan-one/t/T5",
-        attempts: inFlight ? [attempt(1, null)] : [attempt(1, "succeeded", "pass")],
-        integrated: state === "integrated" ? { from: "a", to: "b" } : null,
+        state, slot: slotHeld ? "slot-1" : null, branch: "omr/plan-one/t/T5",
+        attempts: inFlight ? [attempt(1, null, null, { childSessionID: "ses-5" })] : [attempt(1, "succeeded", "pass")],
+        integrated: state === "integrated" ? { from: SHA_A, to: SHA_B } : null,
       });
       expect(isTaskNode(node), state).toBe(true);
     }
@@ -973,6 +1157,580 @@ describe("ledger guards", () => {
 // ---------------------------------------------------------------------------------------------------------------
 // Guard fuzzing (seeded)
 // ---------------------------------------------------------------------------------------------------------------
+
+describe("ledgerViolations: one rejection row per invariant code (A1-7, QA-1.4-8)", () => {
+  const header = `[plan plan-one:T1#1] nonce=${NONCE}`;
+  const addQa = (l: LedgerV1, id: string, patch: Partial<TaskNode>): void => {
+    l.tasks[id] = taskNode(id, { kind: "qa", ...patch });
+  };
+
+  const ROWS: Array<[code: string, name: string, apply: (l: LedgerV1) => void]> = [
+    // codes that existed before A1
+    ["shape", "wrong type", (l) => { Reflect.set(l, "planId", 7); }],
+    ["shape", "launcher", (l) => { Reflect.set(l, "launcher", "B"); }],
+    ["shape", "config missing", (l) => { Reflect.deleteProperty(l, "config"); }],
+    ["schema", "newer schema", (l) => { Reflect.set(l, "schema", 2); }],
+    ["config-limits", "maxParallel 9", (l) => { l.config.maxParallel = 9; }],
+    ["config-limits", "fractional batchMax", (l) => { l.config.batchMax = 1.5; }],
+    ["task-key", "key differs from id", (l) => { taskOf(l, "T3").id = "T4"; }],
+    ["task-phase", "unknown phase", (l) => { taskOf(l, "T3").phase = "p9"; }],
+    ["phase-wave", "unknown wave", (l) => { phaseOf(l).wave = "w9"; }],
+    ["edge-endpoint", "unknown target", (l) => { const e = l.edges[0]; if (e) e.to = "T99"; }],
+    ["edge-endpoint", "unknown gate", (l) => { const e = l.edges[1]; if (e) e.from = "gate:p9"; }],
+    ["seq", "zero", (l) => { l.seq = 0; }],
+    ["attempt-n", "off by one", (l) => { attemptOf(taskOf(l, "T2"), 1).n = 3; }],
+    ["open-attempt", "running task without open attempt", (l) => {
+      const a = attemptOf(taskOf(l, "T2"), 1);
+      a.outcome = "failed";
+      a.endedAt = T0;
+    }],
+    ["open-attempt", "ready task with an open attempt", (l) => { taskOf(l, "T2").state = "ready"; }],
+    ["slot-required", "running without slot", (l) => { taskOf(l, "T2").slot = null; }],
+    ["branch-required", "verifying without branch", (l) => {
+      const t = taskOf(l, "T2");
+      t.state = "verifying";
+      const a = attemptOf(t, 1);
+      a.outcome = "succeeded";
+      a.endedAt = T0;
+    }],
+    ["integrated-missing", "integrated without range", (l) => { taskOf(l, "T1").integrated = null; }],
+    ["manual-attempts", "manual task with attempts", (l) => { taskOf(l, "M1").attempts = [attempt(1, "failed")]; }],
+    ["shared-context-length", "too long", (l) => { l.sharedContext = "x".repeat(12001); }],
+    ["shared-context-slot-path", "carries slotsDir", (l) => { l.sharedContext = "see C:/slots/slot-1"; }],
+    // codes added by A1-7 in isTaskNode
+    ["attempt-ended-pair", "closed attempt without endedAt", (l) => { attemptOf(taskOf(l, "T1"), 0).endedAt = null; }],
+    ["attempt-ended-pair", "open attempt with endedAt", (l) => { attemptOf(taskOf(l, "T2"), 1).endedAt = T0; }],
+    ["attempt-ended-pair", "endedAt before startedAt", (l) => { attemptOf(taskOf(l, "T1"), 0).endedAt = "2026-10-10T23:59:59.999Z"; }],
+    ["verdict-unsucceeded", "verdict on a failed attempt", (l) => { attemptOf(taskOf(l, "T2"), 0).verdict = "pass"; }],
+    ["verdict-unsucceeded", "verdict on an open attempt", (l) => { attemptOf(taskOf(l, "T2"), 1).verdict = "fail"; }],
+    ["nonce-duplicate", "same nonce twice", (l) => { const t = taskOf(l, "T2"); attemptOf(t, 1).nonce = attemptOf(t, 0).nonce; }],
+    ["running-without-child", "running, latest attempt has no child", (l) => { attemptOf(taskOf(l, "T2"), 1).childSessionID = null; }],
+    ["slot-forbidden", "pending task holds a slot", (l) => { taskOf(l, "T3").slot = "slot-9"; }],
+    ["slot-forbidden", "integrated task holds a slot", (l) => { taskOf(l, "T1").slot = "slot-1"; }],
+    ["git-id", "short from", (l) => { taskOf(l, "T1").integrated = { from: "abc", to: SHA_B }; }],
+    ["git-id", "upper-case to", (l) => { taskOf(l, "T1").integrated = { from: SHA_A, to: SHA_B.toUpperCase() }; }],
+    ["qa-without-phase", "qa task without a phase", (l) => { const t = taskOf(l, "T3"); t.kind = "qa"; t.phase = null; }],
+    // codes added by A1-7 in isLedgerV1
+    ["path-not-absolute", "planPath", (l) => { l.planPath = "docs/PLAN.md"; }],
+    ["path-not-absolute", "repo.toplevel", (l) => { l.repo.toplevel = "repo"; }],
+    ["path-not-absolute", "integration.worktree", (l) => { l.integration.worktree = "slots/integration"; }],
+    ["path-not-absolute", "config.slotsDir", (l) => { l.config.slotsDir = "slots"; }],
+    ["git-id", "repo.baseCommit", (l) => { l.repo.baseCommit = "c0ffee"; }],
+    ["git-id", "integration.head", (l) => { l.integration.head = SHA_C.toUpperCase(); }],
+    ["phase-id", "double dot", (l) => { phaseOf(l).id = "a..b"; }],
+    ["phase-id", "trailing dot", (l) => { phaseOf(l).id = "p1."; }],
+    ["phase-id", ".lock suffix", (l) => { phaseOf(l).id = "p1.lock"; }],
+    ["phase-duplicate", "same id twice", (l) => { l.phases.push({ ...phaseOf(l) }); }],
+    ["wave-id", "space", (l) => { const w = l.waves[0]; if (w) w.id = "w 1"; }],
+    ["wave-duplicate", "same id twice", (l) => { const w = l.waves[0]; if (w) l.waves.push({ ...w }); }],
+    ["wave-membership", "phase listed in no wave", (l) => { const w = l.waves[0]; if (w) w.phases = []; }],
+    ["wave-membership", "phase listed in two waves", (l) => { l.waves.push({ id: "w2", phases: ["p1"] }); }],
+    ["wave-membership", "wave lists an unknown phase", (l) => { l.waves.push({ id: "w2", phases: ["p9"] }); }],
+    ["phase-depends", "self dependency", (l) => { phaseOf(l).dependsOn = ["p1"]; }],
+    ["phase-depends", "unknown dependency", (l) => { phaseOf(l).dependsOn = ["p9"]; }],
+    ["slots-dir-unresolved", "running with slotsDir null", (l) => { l.config.slotsDir = null; }],
+    ["inbox-id", "unknown prefix", (l) => { const i = l.inbox[0]; if (i) i.id = "X-1"; }],
+    ["inbox-id", "prefix of another kind", (l) => { const i = l.inbox[0]; if (i) i.id = "F-1"; }],
+    ["inbox-id", "leading zero", (l) => { const i = l.inbox[0]; if (i) i.id = "Q-01"; }],
+    ["inbox-duplicate", "same id twice", (l) => { const i = l.inbox[0]; if (i) l.inbox.push({ ...i }); }],
+    ["inbox-duplicate", "same number, other prefix", (l) => { const i = l.inbox[0]; if (i) l.inbox.push({ ...i, id: "F-1", kind: "failure" }); }],
+    ["inbox-task", "unknown task", (l) => { const i = l.inbox[0]; if (i) i.taskId = "T99"; }],
+    ["shared-context-header", "header-shaped line", (l) => { l.sharedContext = `notes\n${header}\nmore`; }],
+    ["qa-multiple-open", "two open qa tasks", (l) => { addQa(l, "QA-a", {}); addQa(l, "QA-b", {}); }],
+    ["qa-round", "zero", (l) => { phaseOf(l).qaRound = 0; }],
+    ["qa-round", "above the limit", (l) => { phaseOf(l).qaRound = QA_ROUND_LIMIT + 1; }],
+    ["qa-gate", "in-flight qa task but gate pending", (l) => { taskOf(l, "T2").kind = "qa"; }],
+    ["qa-gate", "qa-running without any qa task", (l) => { phaseOf(l).gate = "qa-running"; }],
+    ["qa-gate", "qa-running with only cancelled qa tasks", (l) => {
+      phaseOf(l).gate = "qa-running";
+      addQa(l, "QA-a", { state: "cancelled" });
+    }],
+    ["qa-gate", "qa-running with a pending qa task", (l) => {
+      phaseOf(l).gate = "qa-running";
+      addQa(l, "QA-a", {});
+    }],
+  ];
+
+  it("a valid ledger has no violations", () => {
+    expect(ledgerViolations(buildLedger())).toEqual([]);
+  });
+
+  it.each(ROWS)("%s: %s", (code, _name, apply) => {
+    const l = clone(buildLedger());
+    apply(l);
+    const violations = ledgerViolations(l);
+    expect(violations.map((v) => v.code)).toContain(code);
+    for (const v of violations) expect(v.at.startsWith("$"), v.at).toBe(true);
+    expect(isLedgerV1(l)).toBe(false);
+  });
+
+  it("covers every A1-7 code at least once", () => {
+    const covered = new Set(ROWS.map((r) => r[0]));
+    for (const code of [
+      "shape", "schema", "config-limits", "task-key", "task-phase", "phase-wave", "edge-endpoint", "seq", "attempt-n", "open-attempt",
+      "slot-required", "branch-required", "integrated-missing", "manual-attempts", "shared-context-length", "shared-context-slot-path",
+      "attempt-ended-pair", "verdict-unsucceeded", "nonce-duplicate", "running-without-child", "slot-forbidden", "git-id",
+      "qa-without-phase", "path-not-absolute", "phase-id", "phase-duplicate", "wave-id", "wave-duplicate", "wave-membership",
+      "phase-depends", "slots-dir-unresolved", "inbox-id", "inbox-duplicate", "inbox-task", "shared-context-header",
+      "qa-multiple-open", "qa-round", "qa-gate",
+    ]) expect(covered.has(code), code).toBe(true);
+  });
+
+  it("reports precise paths", () => {
+    const l = clone(buildLedger());
+    taskOf(l, "T3").slot = "slot-9";
+    expect(ledgerViolations(l)).toEqual([{ code: "slot-forbidden", at: "$.tasks.T3.slot" }]);
+    const m = clone(buildLedger());
+    m.planPath = "rel";
+    expect(ledgerViolations(m)).toEqual([{ code: "path-not-absolute", at: "$.planPath" }]);
+  });
+
+  it("accepts the legitimate neighbours of each rule", () => {
+    const ok: Array<[string, (l: LedgerV1) => void]> = [
+      ["qa task in flight with gate qa-running", (l) => { taskOf(l, "T2").kind = "qa"; phaseOf(l).gate = "qa-running"; }],
+      ["qa-running with a settled done qa task", (l) => {
+        phaseOf(l).gate = "qa-running";
+        addQa(l, "QA-a", { state: "done" });
+        addQa(l, "QA-b", { state: "cancelled" });
+      }],
+      ["aborted plan with qa-running gate and a cancelled qa task", (l) => {
+        l.status = "aborted";
+        phaseOf(l).gate = "qa-running";
+        addQa(l, "QA-a", { state: "cancelled" });
+      }],
+      ["one open qa task next to a done one", (l) => { addQa(l, "QA-a", { state: "done" }); addQa(l, "QA-b", {}); }],
+      ["compiling plan with slotsDir null", (l) => { l.status = "compiling"; l.config.slotsDir = null; }],
+      ["awaiting-approval plan with slotsDir null", (l) => { l.status = "awaiting-approval"; l.config.slotsDir = null; }],
+      ["UNC, POSIX and backslash absolute paths", (l) => {
+        l.planPath = "\\\\server\\share\\PLAN.md";
+        l.repo.toplevel = "/home/me/repo";
+        l.integration.worktree = "D:\\slots\\integration";
+      }],
+      ["64-hex (sha256) git ids", (l) => { l.repo.baseCommit = "d".repeat(64); l.integration.head = "e".repeat(64); }],
+      ["dependent phase", (l) => {
+        l.phases.push({ id: "p2", title: "Phase 2", wave: "w1", dependsOn: ["p1"], gate: "pending", qaRound: 2, paused: true, tag: "t" });
+        const w = l.waves[0];
+        if (w) w.phases.push("p2");
+      }],
+      ["inbox ids of several prefixes with distinct numbers", (l) => {
+        l.inbox.push({ ...INBOX_SAMPLE, id: "F-2", kind: "failure" }, { ...INBOX_SAMPLE, id: "R-3", kind: "qa-cap" });
+      }],
+      ["a reverted task without a slot", (l) => { taskOf(l, "T3").state = "reverted"; }],
+      ["a failed task keeping its slot", (l) => { const t = taskOf(l, "T3"); t.state = "failed"; t.slot = "slot-3"; }],
+    ];
+    for (const [name, apply] of ok) {
+      const l = clone(buildLedger());
+      apply(l);
+      expect(ledgerViolations(l), name).toEqual([]);
+      expect(isLedgerV1(l), name).toBe(true);
+    }
+  });
+
+  it("isLedgerV1(v) === (ledgerViolations(v).length === 0) for valid and invalid values", () => {
+    const samples: unknown[] = [buildLedger(), null, 1, [], {}, { schema: 1 }, ...ROWS.map(([, , apply]) => { const l = clone(buildLedger()); apply(l); return l; })];
+    for (const s of samples) expect(isLedgerV1(s)).toBe(ledgerViolations(s).length === 0);
+  });
+
+  it("non-records report a single shape violation at the root", () => {
+    for (const v of [null, undefined, 3, "x", []]) expect(ledgerViolations(v)).toEqual([{ code: "shape", at: "$" }]);
+  });
+});
+
+const INBOX_SAMPLE: InboxItem = { id: "Q-1", kind: "question", severity: "info", taskId: null, text: "t", options: [], answer: null, createdAt: T0 };
+
+describe("patterns, ids and QA helpers (A1-1, A1-7)", () => {
+  it("PHASE_ID_PATTERN / WAVE_ID_PATTERN", () => {
+    expect(WAVE_ID_PATTERN).toBe(PHASE_ID_PATTERN);
+    for (const ok of ["p1", "1", "A", "a.b", "a-b_c", "lock", "a".repeat(40), "9".repeat(40)]) expect(PHASE_ID_PATTERN.test(ok), ok).toBe(true);
+    for (const bad of ["", ".a", "-a", "_a", "a..b", "a.", "a.lock", "a".repeat(41), "a b", "a/b", "a:b", "a\\b", "a\nb"]) {
+      expect(PHASE_ID_PATTERN.test(bad), JSON.stringify(bad)).toBe(false);
+    }
+  });
+
+  it("GIT_ID_PATTERN and ABSOLUTE_PATH_PATTERN", () => {
+    for (const ok of ["a".repeat(40), "0".repeat(64), SHA_A]) expect(GIT_ID_PATTERN.test(ok)).toBe(true);
+    for (const bad of ["", "a".repeat(39), "a".repeat(41), "a".repeat(63), "a".repeat(65), "A".repeat(40), "g".repeat(40)]) {
+      expect(GIT_ID_PATTERN.test(bad), String(bad.length)).toBe(false);
+    }
+    for (const ok of ["C:/x", "C:\\x", "c:/", "\\\\srv\\share", "\\\\srv\\share\\x", "/usr", "/"]) expect(ABSOLUTE_PATH_PATTERN.test(ok), ok).toBe(true);
+    for (const bad of ["", "x", "./a", "../a", "C:", "C:x", "\\\\srv", "\\a", "a/b"]) expect(ABSOLUTE_PATH_PATTERN.test(bad), bad).toBe(false);
+  });
+
+  it("INBOX_ID_PREFIX, INBOX_ID_PATTERN and formatInboxId per kind", () => {
+    const kinds: InboxKind[] = ["question", "failure", "usage-limit", "landing", "flaky", "qa-cap", "breaker"];
+    expect(Object.keys(INBOX_ID_PREFIX).sort()).toEqual([...kinds].sort());
+    expect(kinds.map((k) => INBOX_ID_PREFIX[k]).join("")).toBe("QFULKRB");
+    for (const kind of kinds) {
+      const id = formatInboxId(kind, 12);
+      expect(id).toBe(`${INBOX_ID_PREFIX[kind]}-12`);
+      const m = INBOX_ID_PATTERN.exec(id);
+      expect(m?.[1]).toBe(INBOX_ID_PREFIX[kind]);
+      expect(m?.[2]).toBe("12");
+    }
+    expect(formatInboxId("breaker", 999_999_999)).toBe("B-999999999");
+    for (const ok of ["Q-1", "F-10", "B-999999999"]) expect(INBOX_ID_PATTERN.test(ok), ok).toBe(true);
+    for (const bad of ["Q-0", "Q-01", "X-1", "Q-", "q-1", "Q-1000000000", "Q1", "Q-1 ", "-1", ""]) expect(INBOX_ID_PATTERN.test(bad), bad).toBe(false);
+    for (const n of [0, -1, 1.5, 1_000_000_000, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => formatInboxId("question", n), String(n)).toThrow(ExecutorError);
+    }
+  });
+
+  it("nextInboxNumber is 1 + the largest number across all prefixes", () => {
+    const item = (id: string): InboxItem => ({ ...INBOX_SAMPLE, id });
+    expect(nextInboxNumber({ inbox: [] })).toBe(1);
+    expect(nextInboxNumber({ inbox: [item("Q-1")] })).toBe(2);
+    expect(nextInboxNumber({ inbox: [item("Q-1"), item("F-5"), item("R-3")] })).toBe(6);
+    expect(nextInboxNumber({ inbox: [item("B-40"), item("Q-2")] })).toBe(41);
+    expect(nextInboxNumber({ inbox: [item("garbage"), item("Q-3")] })).toBe(4);
+    expect(nextInboxNumber(buildLedger())).toBe(2);
+  });
+
+  it("fixTaskId / reviewTaskId match TASK_ID_PATTERN at the limits and throw beyond them", () => {
+    expect(QA_ROUND_LIMIT).toBe(999);
+    expect(FIX_TASKS_PER_ROUND_LIMIT).toBe(999);
+    const phases = ["p", "A", "1", "9".repeat(40), "a".repeat(40), "a-".repeat(20), "x.y-z_1", "p1"];
+    for (const p of phases) {
+      expect(PHASE_ID_PATTERN.test(p), p).toBe(true);
+      for (const round of [1, 2, 998, 999]) {
+        for (const k of [1, 2, 999]) {
+          const id = fixTaskId(p, round, k);
+          expect(id).toBe(`${p}.FIX${round}-${k}`);
+          expect(TASK_ID_PATTERN.test(id), id).toBe(true);
+        }
+      }
+      for (const round of [2, 3, 999]) {
+        const id = reviewTaskId(p, round);
+        expect(id).toBe(`${p}.QA${round}`);
+        expect(TASK_ID_PATTERN.test(id), id).toBe(true);
+      }
+    }
+    const code = (fn: () => unknown): string | undefined => {
+      try {
+        fn();
+      } catch (e) {
+        return e instanceof ExecutorError ? e.code : "other";
+      }
+      return undefined;
+    };
+    expect(code(() => fixTaskId("p1", 0, 1))).toBe("E_INVALID_INPUT");
+    expect(code(() => fixTaskId("p1", 1000, 1))).toBe("E_INVALID_INPUT");
+    expect(code(() => fixTaskId("p1", 1, 0))).toBe("E_INVALID_INPUT");
+    expect(code(() => fixTaskId("p1", 1, 1000))).toBe("E_INVALID_INPUT");
+    expect(code(() => fixTaskId("p1", 1.5, 1))).toBe("E_INVALID_INPUT");
+    expect(code(() => fixTaskId("p1", 1, Number.NaN))).toBe("E_INVALID_INPUT");
+    for (const bad of ["", "a..b", "p.", "p.lock", "-a", "a".repeat(41), "a b"]) {
+      expect(code(() => fixTaskId(bad, 1, 1)), bad).toBe("E_INVALID_INPUT");
+      expect(code(() => reviewTaskId(bad, 2)), bad).toBe("E_INVALID_INPUT");
+    }
+    expect(code(() => reviewTaskId("p1", 1))).toBe("E_INVALID_INPUT");
+    expect(code(() => reviewTaskId("p1", 0))).toBe("E_INVALID_INPUT");
+    expect(code(() => reviewTaskId("p1", 1000))).toBe("E_INVALID_INPUT");
+    expect(code(() => reviewTaskId("p1", 2.5))).toBe("E_INVALID_INPUT");
+  });
+
+  it("qaUnparsableCount counts attempts whose context starts with the prefix", () => {
+    expect(QA_UNPARSABLE_CONTEXT_PREFIX).toBe("QA OUTPUT UNPARSABLE: ");
+    expect(qaUnparsableCount(taskNode("Q1"))).toBe(0);
+    const t = taskNode("Q1", {
+      attempts: [
+        attempt(1, "failed", null, { context: `${QA_UNPARSABLE_CONTEXT_PREFIX}no json` }),
+        attempt(2, "failed", null, { context: "an answer replaced the context" }),
+        attempt(3, "failed", null, { context: `x ${QA_UNPARSABLE_CONTEXT_PREFIX}not a prefix` }),
+        attempt(4, "failed", null, { context: `${QA_UNPARSABLE_CONTEXT_PREFIX}` }),
+        attempt(5, null),
+      ],
+    });
+    expect(qaUnparsableCount(t)).toBe(2);
+  });
+
+  it("canonicalFindingsJson is stable, schema ordered and parses back to the same report", () => {
+    const report: FindingsReport = {
+      findings: [
+        { id: "F1", severity: "blocking", files: ["src/a.ts", "src/b.ts"], problem: "p1", fix: "f1" },
+        { id: "F2", severity: "nit", files: [], problem: "p2 \"quoted\"\n", fix: "" },
+      ],
+    };
+    const json = canonicalFindingsJson(report);
+    expect(json).toBe(JSON.stringify({ findings: report.findings }));
+    const parsed: unknown = JSON.parse(json);
+    expect(isFindingsReport(parsed)).toBe(true);
+    expect(parsed).toEqual(report);
+    expect(canonicalFindingsJson(parsed as FindingsReport)).toBe(json);
+    // key order is the schema's, whatever order the input had
+    const shuffledKeys: FindingsReport = {
+      findings: [{ fix: "f", problem: "p", files: ["a"], severity: "major", id: "Z" }],
+    };
+    expect(Object.keys((JSON.parse(canonicalFindingsJson(shuffledKeys)) as { findings: object[] }).findings[0] as object))
+      .toEqual(["id", "severity", "files", "problem", "fix"]);
+    expect(canonicalFindingsJson({ findings: [] })).toBe('{"findings":[]}');
+  });
+
+  it("QA_CAP_OPTIONS offers accept and fix", () => {
+    expect([...QA_CAP_OPTIONS]).toEqual(["accept", "fix"]);
+  });
+});
+
+describe("context pin and history events (A1-3, A1-4)", () => {
+  it("ContextSupersededError carries both refs; isContextSupersededError matches by name", () => {
+    const requested: ContextRef = { bootID: BOOT_ID, epoch: 1, callID: "c1" };
+    const current: ContextRef = { bootID: BOOT_ID, epoch: 2, callID: "c2" };
+    const e = new ContextSupersededError(requested, current);
+    expect(e).toBeInstanceOf(Error);
+    expect(e.name).toBe("ContextSupersededError");
+    expect(e.message).toBe("retained context superseded");
+    expect(e.requested).toBe(requested);
+    expect(e.current).toBe(current);
+    expect(new ContextSupersededError(requested, null).current).toBeNull();
+    expect(isContextSupersededError(e)).toBe(true);
+    // a plain object from another realm
+    expect(isContextSupersededError({ name: "ContextSupersededError", requested, current })).toBe(true);
+    const foreign = new Error("x");
+    foreign.name = "ContextSupersededError";
+    expect(isContextSupersededError(foreign)).toBe(true);
+    for (const v of [new Error("x"), { name: "Other" }, {}, "ContextSupersededError", null, undefined, 3, new ExecutorError("E_NO_CONTEXT", "m")]) {
+      expect(isContextSupersededError(v)).toBe(false);
+    }
+  });
+
+  it("isHistoryEvent is true for exactly the four history types", () => {
+    for (const type of ["metric", "integration-step", "attempt-verdict", "wake"]) expect(isHistoryEvent({ type }), type).toBe(true);
+    for (const type of [
+      "ledger-init", "draft-replaced", "status-changed", "plan-approved", "orchestrator-bound", "lock-takeover", "task-created",
+      "edge-added", "task-transition", "attempt-started", "attempt-child", "attempt-adopted", "attempt-ended", "attempt-context",
+      "task-slot", "task-footprint", "task-integrated", "integration-head", "gate-changed", "phase-paused", "phase-tagged",
+      "inbox-added", "inbox-answered", "", "Wake",
+    ]) expect(isHistoryEvent({ type }), type).toBe(false);
+  });
+
+  it("task-footprint is durable; the context-age metric is not", () => {
+    const e: ExecutorEventInput = { type: "task-footprint", taskId: "T2", footprint: { writes: [], reads: [], confidence: "unknown", sources: [] } };
+    expect(isDurableEvent(e)).toBe(true);
+    const m: ExecutorEventInput = {
+      type: "metric",
+      metric: {
+        name: "context-age", taskId: "T3", attempt: 1, bootID: BOOT_ID, epoch: 1, callID: "c", capturedAt: T0, ageMs: 5, result: "superseded",
+      },
+    };
+    expect(isDurableEvent(m)).toBe(false);
+  });
+
+  it("launch failure vocabularies are the A1-5 ones (compile-time and runtime)", () => {
+    const reasons: LaunchConfirmation[] = (["timeout", "threw", "superseded", "task-error", "hook-failed"] as const)
+      .map((reason) => ({ kind: "unconfirmed", reason, error: null }));
+    expect(reasons).toHaveLength(5);
+    const lost: ChildEnd[] = (["unconfirmed", "unrequested-interrupt", "runner-error", "restart", "context-superseded", "refused"] as const)
+      .map((reason) => ({ kind: "lost", childSessionID: null, reason, endedAt: T0 }));
+    expect(new Set(lost.map((l) => (l.kind === "lost" ? l.reason : ""))).size).toBe(6);
+    const gates: LaunchGate[] = [
+      { ok: true, context: CONTEXT_INFO, ageMs: 0 },
+      { ok: false, reason: "disposed", wake: null },
+      { ok: false, reason: "no-context", wake: { reason: "stale-context", stateKey: `no-context:${BOOT_ID}:ses-0:1` } },
+      { ok: false, reason: "awaiting-first-router-call", wake: { reason: "stale-context", stateKey: `await-router-call:${BOOT_ID}:ses-0` } },
+      { ok: false, reason: "context-stale", wake: { reason: "stale-context", stateKey: `stale-context:${BOOT_ID}:1` } },
+    ];
+    // every non-ok reason except `disposed` has a wake
+    for (const g of gates) if (!g.ok) expect(g.wake === null, g.reason).toBe(g.reason === "disposed");
+    const hooks: LaunchHooks = { onLateChild: async () => "adopt", onChildCreated: async () => undefined };
+    expect(typeof hooks.onChildCreated).toBe("function");
+  });
+});
+
+describe("EXECUTOR_DEFAULTS is read-only by type and executorDefaults() returns a fresh mutable copy (QA-1.4-15)", () => {
+  type Equals<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false;
+  type WritableKeys<T> = { [K in keyof T]-?: Equals<{ [P in K]: T[P] }, { -readonly [P in K]: T[P] }> extends true ? K : never }[keyof T];
+
+  it("has no writable property, top level or nested (compile-time)", () => {
+    const top: [WritableKeys<typeof EXECUTOR_DEFAULTS>] extends [never] ? true : false = true;
+    const nested: [WritableKeys<typeof EXECUTOR_DEFAULTS.circuitBreaker>] extends [never] ? true : false = true;
+    expect(top && nested).toBe(true);
+  });
+
+  it("returns an equal, unfrozen copy each call; editing it never touches the constant", () => {
+    const a = executorDefaults();
+    const b = executorDefaults();
+    expect(a).toEqual(EXECUTOR_DEFAULTS);
+    expect(a).not.toBe(b);
+    expect(a.circuitBreaker).not.toBe(b.circuitBreaker);
+    expect(a.circuitBreaker).not.toBe(EXECUTOR_DEFAULTS.circuitBreaker);
+    expect(Object.isFrozen(a)).toBe(false);
+    expect(Object.isFrozen(a.circuitBreaker)).toBe(false);
+    a.maxParallel = 8;
+    a.circuitBreaker.failureRatio = 1;
+    a.slotsDir = "C:/slots";
+    expect(b.maxParallel).toBe(4);
+    expect(b.circuitBreaker.failureRatio).toBe(0.4);
+    expect(EXECUTOR_DEFAULTS.maxParallel).toBe(4);
+    expect(EXECUTOR_DEFAULTS.circuitBreaker.failureRatio).toBe(0.4);
+    expect(EXECUTOR_DEFAULTS.slotsDir).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// QA-1.4-11: seeded generator of WELL-TYPED but inconsistent nodes, checked against an independent oracle.
+// The oracle below restates the memo/A1 invariants directly; it never calls the guards under test.
+// ---------------------------------------------------------------------------------------------------------------
+
+const ORACLE_TASK_CODES = [
+  "attempt-n", "open-attempt", "slot-required", "slot-forbidden", "branch-required", "integrated-missing", "git-id", "manual-attempts",
+  "attempt-ended-pair", "verdict-unsucceeded", "nonce-duplicate", "running-without-child", "qa-without-phase",
+] as const;
+
+function oracleTaskCodes(t: TaskNode): Set<string> {
+  const out = new Set<string>();
+  const A = t.attempts;
+  const flying = t.state === "dispatched" || t.state === "running";
+  const openAt = A.flatMap((a, i) => (a.outcome === null ? [i] : []));
+  if (A.some((a, i) => a.n !== i + 1)) out.add("attempt-n");
+  if (flying ? !(openAt.length === 1 && openAt[0] === A.length - 1) : openAt.length > 0) out.add("open-attempt");
+  const holdsSlot = ["dispatched", "running", "completed", "verifying", "verified", "integrating"];
+  const noSlot = ["pending", "blocked", "parked", "done", "cancelled", "integrated", "reverted"];
+  if (holdsSlot.includes(t.state) && t.slot === null) out.add("slot-required");
+  if (noSlot.includes(t.state) && t.slot !== null) out.add("slot-forbidden");
+  if (["verifying", "verified", "integrating"].includes(t.state) && t.branch === null) out.add("branch-required");
+  if (t.state === "integrated" && t.integrated === null) out.add("integrated-missing");
+  if (t.integrated !== null) {
+    const hex40 = (s: string): boolean => s.length === 40 && /^[0-9a-f]+$/.test(s);
+    if (!hex40(t.integrated.from) || !hex40(t.integrated.to)) out.add("git-id");
+  }
+  if ((t.kind === "manual" || t.kind === "preflight") && A.length > 0) out.add("manual-attempts");
+  for (const a of A) {
+    if ((a.outcome !== null) !== (a.endedAt !== null) || (a.endedAt !== null && a.endedAt < a.startedAt)) out.add("attempt-ended-pair");
+    if (a.verdict !== null && a.outcome !== "succeeded") out.add("verdict-unsucceeded");
+  }
+  const nonces = A.map((a) => a.nonce);
+  if (nonces.some((n, i) => nonces.indexOf(n) !== i)) out.add("nonce-duplicate");
+  const latest = A[A.length - 1];
+  if (t.state === "running" && latest !== undefined && latest.childSessionID === null) out.add("running-without-child");
+  if (t.kind === "qa" && t.phase === null) out.add("qa-without-phase");
+  return out;
+}
+
+function oracleQaCodes(l: LedgerV1): Set<string> {
+  const out = new Set<string>();
+  const settled = (t: TaskNode): boolean => t.state === "done" || t.state === "cancelled";
+  for (const p of l.phases) {
+    const qa = Object.values(l.tasks).filter((t) => t.kind === "qa" && t.phase === p.id);
+    if (qa.filter((t) => !settled(t)).length > 1) out.add("qa-multiple-open");
+    if (l.status === "aborted") continue;
+    const flying = qa.filter((t) => t.state === "dispatched" || t.state === "running");
+    if (flying.length > 0 && p.gate !== "qa-running") out.add("qa-gate");
+    if (p.gate === "qa-running") {
+      const resultPending = flying.length === 0 && qa.length > 0 && qa.every(settled) && qa.some((t) => t.state === "done");
+      if (flying.length !== 1 && !resultPending) out.add("qa-gate");
+    }
+  }
+  return out;
+}
+
+/** A node whose invariants all hold, shaped by `state` and `kind`. */
+function genConsistentTask(rng: () => number, id: string, state: TaskState, wantedKind: TaskNode["kind"]): TaskNode {
+  const flying = state === "dispatched" || state === "running";
+  const kind = (wantedKind === "manual" || wantedKind === "preflight") && flying ? "task" : wantedKind;
+  const attempts: Attempt[] = [];
+  if (kind !== "manual" && kind !== "preflight") {
+    const closed = Math.floor(rng() * 3);
+    for (let i = 1; i <= closed; i++) {
+      const outcome = pick(rng, ATTEMPT_OUTCOMES);
+      const verdict = outcome === "succeeded" && rng() < 0.7 ? pick(rng, VERDICTS) : null;
+      attempts.push(attempt(i, outcome, verdict, { childSessionID: rng() < 0.5 ? `ses-${i}` : null }));
+    }
+    if (flying) {
+      const child = state === "running" || rng() < 0.5 ? `ses-${closed + 1}` : null;
+      attempts.push(attempt(closed + 1, null, null, { childSessionID: child }));
+    }
+  }
+  const slotRequired = ["dispatched", "running", "completed", "verifying", "verified", "integrating"].includes(state);
+  const slotForbidden = ["pending", "blocked", "parked", "done", "cancelled", "integrated", "reverted"].includes(state);
+  const branchRequired = ["verifying", "verified", "integrating"].includes(state);
+  return taskNode(id, {
+    kind, state, attempts,
+    slot: slotRequired ? "slot-1" : slotForbidden ? null : rng() < 0.5 ? "slot-1" : null,
+    branch: branchRequired || rng() < 0.5 ? `omr/plan-one/t/${id}` : null,
+    integrated: state === "integrated" || rng() < 0.3 ? { from: SHA_A, to: SHA_B } : null,
+  });
+}
+
+type Mutation = (t: TaskNode, rng: () => number) => void;
+const lastAttempt = (t: TaskNode): Attempt | undefined => t.attempts[t.attempts.length - 1];
+const MUTATIONS: Mutation[] = [
+  (t) => { t.slot = t.slot === null ? "slot-7" : null; },
+  (t) => { t.branch = t.branch === null ? "b" : null; },
+  (t, rng) => { t.state = pick(rng, TASK_STATES); },
+  (t) => { const a = t.attempts[0]; if (a) a.n += 1; },
+  (t) => { const a = lastAttempt(t); if (a) a.endedAt = a.endedAt === null ? T0 : null; },
+  (t) => { const a = lastAttempt(t); if (a) a.outcome = a.outcome === null ? "failed" : null; },
+  (t) => { const a = t.attempts[0]; if (a) a.verdict = "fail"; },
+  (t) => { const a = lastAttempt(t); if (a) a.childSessionID = null; },
+  (t) => { const a = t.attempts[1]; const first = t.attempts[0]; if (a && first) a.nonce = first.nonce; },
+  (t) => { const a = t.attempts[0]; if (a) a.endedAt = "2020-01-01T00:00:00.000Z"; },
+  (t) => { t.attempts.push(attempt(t.attempts.length + 1, null)); },
+  (t) => { t.integrated = t.integrated === null ? { from: SHA_A, to: SHA_B } : null; },
+  (t) => { t.integrated = { from: "xyz", to: SHA_B }; },
+  (t) => { t.integrated = { from: SHA_A, to: SHA_B.toUpperCase() }; },
+  (t, rng) => { t.kind = pick(rng, TASK_KINDS); },
+  (t) => { t.attempts = []; },
+];
+
+describe("oracle-checked fuzzing of well-typed task nodes (QA-1.4-11)", () => {
+  it("the guards agree with an independent invariant oracle on 1500 seeded task nodes (accept and reject)", () => {
+    const rng = mulberry32(0x11a1);
+    const seen = new Set<string>();
+    let accepted = 0;
+    let rejected = 0;
+    for (let i = 0; i < 1500; i++) {
+      const node = genConsistentTask(rng, "T9", pick(rng, TASK_STATES), pick(rng, TASK_KINDS));
+      const mutations = rng() < 0.35 ? 0 : 1 + Math.floor(rng() * 2);
+      for (let m = 0; m < mutations; m++) pick(rng, MUTATIONS)(node, rng);
+      // qa tasks are placed without a phase so that the ledger-level qa rules stay out of this oracle
+      if (node.kind === "qa") node.phase = null;
+
+      const expected = oracleTaskCodes(node);
+      const l = clone(buildLedger());
+      l.tasks["T9"] = clone(node);
+      const actual = codesOf(l);
+      expect([...actual].sort(), JSON.stringify(node)).toEqual([...expected].sort());
+      expect(isTaskNode(clone(node)), JSON.stringify(node)).toBe(expected.size === 0);
+      expect(isLedgerV1(l)).toBe(expected.size === 0);
+      for (const c of expected) seen.add(c);
+      if (expected.size === 0) accepted++;
+      else rejected++;
+    }
+    expect(accepted).toBeGreaterThanOrEqual(200);
+    expect(rejected).toBeGreaterThanOrEqual(500);
+    expect([...seen].sort()).toEqual([...ORACLE_TASK_CODES].sort());
+  });
+
+  it("the qa-gate and qa-multiple-open rules agree with the oracle on 500 seeded phase/qa-task combinations", () => {
+    const rng = mulberry32(0x9a7e);
+    const seen = new Set<string>();
+    let clean = 0;
+    for (let i = 0; i < 500; i++) {
+      const l = clone(buildLedger());
+      l.status = pick(rng, ["running", "paused", "aborted", "completed"] as const);
+      phaseOf(l).gate = pick(rng, GATE_STATES);
+      const count = Math.floor(rng() * 4);
+      for (let k = 0; k < count; k++) {
+        const id = `QA-${k}`;
+        l.tasks[id] = genConsistentTask(rng, id, pick(rng, TASK_STATES), "qa");
+      }
+      const expected = oracleQaCodes(l);
+      expect([...codesOf(l)].sort(), JSON.stringify(l.tasks)).toEqual([...expected].sort());
+      expect(isLedgerV1(l)).toBe(expected.size === 0);
+      for (const c of expected) seen.add(c);
+      if (expected.size === 0) clean++;
+    }
+    expect(clean).toBeGreaterThanOrEqual(60);
+    expect([...seen].sort()).toEqual(["qa-gate", "qa-multiple-open"]);
+  });
+
+  it("the oracle itself flags every hand-built violation (sanity check of the oracle)", () => {
+    const base = taskNode("T9", { state: "running", slot: "s", attempts: [attempt(1, null, null, { childSessionID: "c" })] });
+    expect([...oracleTaskCodes(base)]).toEqual([]);
+    const bad = clone(base);
+    bad.slot = null;
+    expect([...oracleTaskCodes(bad)]).toEqual(["slot-required"]);
+  });
+});
 
 describe("ledger guard fuzzing (seeded PRNG)", () => {
   const base = buildLedger();
@@ -1022,10 +1780,8 @@ describe("ledger guard fuzzing (seeded PRNG)", () => {
     expect(rejected).toBe(60);
   });
 
-  it("rejects 100 random JSON values and 40 ledgers corrupted by two simultaneous mutations", () => {
+  it("rejects 40 ledgers corrupted by two simultaneous mutations", () => {
     const rng = mulberry32(0x5eed);
-    for (let i = 0; i < 100; i++) expect(isLedgerV1(randomJson(rng, 0)), String(i)).toBe(false);
-
     const nodes: WalkNode[] = [];
     walk(clone(base), [], false, nodes);
     const paths = nodes.filter((n) => n.path.length > 0);
@@ -1190,7 +1946,12 @@ describe("isDurableEvent (§6)", () => {
       { type: "task-slot", taskId: "T2", slot: null, branch: null },
       { type: "task-integrated", taskId: "T1", from: "a", to: "b" },
       { type: "integration-head", head: "abc" },
-      { type: "gate-changed", phaseId: "p1", from: "pending", to: "awaiting-qa", qaRound: 0 },
+      { type: "task-footprint", taskId: "T2", footprint: { writes: ["src/b.ts"], reads: [], confidence: "explicit", sources: ["learned"] } },
+      {
+        type: "integration-step", edge: "start", step: "rebase", result: null, detail: null, failingIds: [], closes: false,
+        entry: { id: "i-6", kind: "task", phaseId: "p1", taskIds: ["T1"], slot: null, baseHead: SHA_A, candidate: null },
+      },
+      { type: "gate-changed", phaseId: "p1", from: "pending", to: "awaiting-qa", trigger: "phase-integrated", qaRound: 1 },
       { type: "phase-paused", phaseId: "p1", paused: true, reason: "r" },
       { type: "phase-tagged", phaseId: "p1", tag: "t" },
       { type: "inbox-added", item: { id: "Q-2", kind: "question", severity: "info", taskId: null, text: "t", options: [], answer: null, createdAt: T0 } },
@@ -1229,12 +1990,20 @@ const SLOT_RECORD: SlotRecord = {
   owner: null, commit: null, managers: [], manifests: {}, createdAt: T0, updatedAt: T0,
 };
 const INBOX_ITEM: InboxItem = { id: "Q-1", kind: "question", severity: "info", taskId: null, text: "t", options: [], answer: null, createdAt: T0 };
+const BOOT_ID = "0123456789abcdef";
+const CONTEXT_REF: ContextRef = { bootID: BOOT_ID, epoch: 1, callID: "call-1" };
 const REQUEST: LaunchRequest = {
-  planId: "plan-one", taskId: "T3", attempt: 1, nonce: NONCE, orchestratorSessionID: "ses-0", contextEpoch: 1, route: ROUTE,
+  planId: "plan-one", taskId: "T3", attempt: 1, nonce: NONCE, orchestratorSessionID: "ses-0", context: CONTEXT_REF, route: ROUTE,
   role: "implementer", grant: [], workRoot: "C:/slots/slot-1",
-  prompt: formatLaunchHeader({ planId: "plan-one", taskId: "T3", attempt: 1, nonce: NONCE }),
+  prompt: formatLaunchPrompt("shared notes", { planId: "plan-one", taskId: "T3", attempt: 1, nonce: NONCE }, "TASK\nT3"),
 };
-const CONTEXT_INFO: RetainedContextInfo = { sessionID: "ses-0", callID: "call-1", messageID: "m-1", agent: "orchestrator", capturedAt: T0, epoch: 1 };
+const CONTEXT_INFO: RetainedContextInfo = {
+  sessionID: "ses-0", callID: "call-1", messageID: "m-1", agent: "orchestrator", capturedAt: T0, bootID: BOOT_ID, epoch: 1,
+};
+const OPEN_ENTRY: OpenIntegrationEntry = {
+  entry: { id: "i-7", kind: "task", phaseId: "p1", taskIds: ["T1"], slot: "integration", baseHead: SHA_A, candidate: null },
+  startSeq: 7, step: "rebase", edge: "start", result: null,
+};
 const PROC: ProcessResult = { code: 0, signal: null, stdout: "", stderr: "", truncated: false, durationMs: 1 };
 const HOST_ERROR: HostError = { type: "provider.rate-limit", status: 429, message: "slow down" };
 const EDGE: Edge = { from: "T1", to: "T3", kind: "learned", confidence: "low", evidence: "e" };
@@ -1267,15 +2036,24 @@ describe("typed test doubles for every interface", () => {
     const writer: LedgerWriter = {
       planId: "plan-one",
       ledger: LEDGER,
-      append: async () => hit("append", LEDGER),
+      append: async (batch) => {
+        // A builder runs against the current ledger; a plain array is taken as is.
+        const events = typeof batch === "function" ? batch(LEDGER) : batch;
+        return hit(`append:${events.length}`, LEDGER);
+      },
+      openIntegration: () => hit("openIntegration", [OPEN_ENTRY]),
       snapshot: async () => hit("snapshot", undefined),
       close: async () => hit("close", undefined),
     };
     expect(writer.planId).toBe("plan-one");
-    expect(await writer.append([{ type: "integration-head", head: "abc" }])).toBe(LEDGER);
+    expect(await writer.append([{ type: "integration-head", head: SHA_A }])).toBe(LEDGER);
+    const builder: BatchBuilder = (l) => [{ type: "integration-head", head: l.integration.head }, { type: "phase-tagged", phaseId: "p1", tag: "t" }];
+    expect(await writer.append(builder)).toBe(LEDGER);
+    expect(await writer.append(() => [])).toBe(LEDGER);
+    expect(writer.openIntegration()).toEqual([OPEN_ENTRY]);
     await writer.snapshot();
     await writer.close();
-    expect(calls).toEqual(["append", "snapshot", "close"]);
+    expect(calls).toEqual(["append:1", "append:2", "append:0", "openIntegration", "snapshot", "close"]);
   });
 
   it("PlanCompiler", async () => {
@@ -1339,7 +2117,7 @@ describe("typed test doubles for every interface", () => {
     const { calls, hit } = tracker();
     const queue: IntegrationQueue = {
       enqueue: () => void hit("enqueue", 0),
-      resume: async () => hit("resume", { completed: [], rolledBack: [] }),
+      resume: async () => hit("resume", { completed: [], rolledBack: [], halted: false, entries: [] }),
       checkPhase: async () => hit("checkPhase", undefined),
       land: async () => hit("land", { landed: true, inbox: null }),
       abort: async () => hit("abort", undefined),
@@ -1347,7 +2125,8 @@ describe("typed test doubles for every interface", () => {
       dispose: async () => hit("dispose", undefined),
     };
     queue.enqueue(["T1"]);
-    expect(await queue.resume()).toEqual({ completed: [], rolledBack: [] });
+    const report: ResumeReport = await queue.resume();
+    expect(report).toEqual({ completed: [], rolledBack: [], halted: false, entries: [] });
     await queue.checkPhase("p1");
     expect((await queue.land()).landed).toBe(true);
     await queue.abort();
@@ -1395,6 +2174,7 @@ describe("typed test doubles for every interface", () => {
     expect(controller.limit("anthropic")).toBe(4);
     expect(controller.canAcquire("anthropic", false)).toBe(true);
     const token = controller.acquire("anthropic", false, "T1", 1);
+    controller.acquire("anthropic", false, "T1", 2, { force: true });
     controller.release(token, "success");
     expect(controller.onSignal({
       source: "retry-hook", sessionID: "ses-1", stepKey: "k", provider: "anthropic", error: HOST_ERROR, at: T0,
@@ -1402,14 +2182,14 @@ describe("typed test doubles for every interface", () => {
     expect(controller.shouldStopRetry({ sessionID: "ses-1", stepKey: "k", provider: "anthropic", planChild: true })).toBe(false);
     expect(controller.pausedUntil("anthropic")).toBeNull();
     expect(controller.snapshot()).toEqual({ anthropic: 4 });
-    expect(calls).toEqual(["limit", "canAcquire", "acquire", "release", "onSignal", "shouldStopRetry", "pausedUntil", "snapshot"]);
+    expect(calls).toEqual(["limit", "canAcquire", "acquire", "acquire", "release", "onSignal", "shouldStopRetry", "pausedUntil", "snapshot"]);
   });
 
   it("TaskLauncher", async () => {
     const { calls, hit } = tracker();
     const end: ChildEnd = { kind: "completed", childSessionID: "ses-1", text: "done", endedAt: T0 };
     const handle: LaunchHandle = {
-      taskId: "T3", attempt: 1, nonce: NONCE, contextEpoch: 1, contextAgeMs: 0, startedAt: T0,
+      taskId: "T3", attempt: 1, nonce: NONCE, context: CONTEXT_REF, contextAgeMs: 0, startedAt: T0,
       confirmation: Promise.resolve({ kind: "confirmed", childSessionID: "ses-1", latencyMs: 1 }),
       completion: Promise.resolve(end),
     };
@@ -1525,11 +2305,13 @@ describe("typed test doubles for every interface", () => {
       parse: () => hit("parse", { ok: true as const, report: { findings: [] } }),
       onQaResult: async () => hit("onQaResult", "passed" as const),
       onAwaitingQa: async () => hit("onAwaitingQa", undefined),
+      onCapAnswer: async (_id, choice) => hit("onCapAnswer", choice === "accept" ? ("passed" as const) : ("next-round" as const)),
     };
     expect(qa.parse("```json\n{\"findings\":[]}\n```")).toEqual({ ok: true, report: { findings: [] } });
     expect(await qa.onQaResult("p1.QA1", { findings: [] })).toBe("passed");
     await qa.onAwaitingQa("p1");
-    expect(calls).toEqual(["parse", "onQaResult", "onAwaitingQa"]);
+    expect(await qa.onCapAnswer("R-1", "accept")).toBe("passed");
+    expect(calls).toEqual(["parse", "onQaResult", "onAwaitingQa", "onCapAnswer"]);
   });
 
   it("RouteResolver, RoleBindings, DispatchBookkeeping and SlotVerifier", async () => {
@@ -1641,6 +2423,7 @@ describe("typed test doubles for every seam", () => {
   it("ChildRunner", async () => {
     const { calls, hit } = tracker();
     const runner: ChildRunner = {
+      bootID: BOOT_ID,
       run: async () => hit("run", { sessionID: "ses-1", text: "done" }),
       dispose: async () => hit("dispose", undefined),
       retainedContext: () => hit("retainedContext", CONTEXT_INFO),
@@ -1649,8 +2432,9 @@ describe("typed test doubles for every seam", () => {
     const controller = new AbortController();
     const result = await runner.run({
       parentSessionID: "ses-0", prompt: REQUEST.prompt, agent: "implementer", model: ROUTE.model, cwd: "C:/slots/slot-1",
-      signal: controller.signal, detached: true, onCreated: async () => undefined,
+      signal: controller.signal, detached: true, context: CONTEXT_REF, onCreated: async () => undefined,
     });
+    expect(runner.bootID).toBe(BOOT_ID);
     expect(result).toEqual({ sessionID: "ses-1", text: "done" });
     await runner.dispose("ses-1");
     expect(runner.retainedContext("ses-0")).toBe(CONTEXT_INFO);
