@@ -13,6 +13,11 @@
  *   CPX_PROBE_RETAINED_COUNT retained-launch only, optional: children per batch, an integer 1..32 (default 3, anything else: 3).
  *   CPX_PROBE_CHILD_PROMPT retained-launch only, optional: prompt of the launched children, `{n}` replaced by the child number
  *                          (1..CPX_PROBE_RETAINED_COUNT). Unset: "CPX_RETAINED_CHILD <n>". Lets a harness script a tool call in the children's own turn.
+ *   CPX_PROBE_CHILD_AGENT / CPX_PROBE_CHILD_MODEL  retained-launch only, optional: agent id and `model` argument (e.g. "provider/id#variant")
+ *                          of the launched `subagent` calls. Unset: the probe's own agent pick (general) and no `model` key.
+ *   CPX_PROBE_USE_RETAINED_SIGNAL  retained-launch only: "1" passes the retained context's own `signal` to the launches instead of the probe's
+ *                          300 s controller (default: the probe's controller; `progress` is always replaced by a recorder).
+ *                          The "retained-launch-batch" line records `signalReplaced`, `retainedSignalAbortedAtLaunch`.
  *   CPX_PROBE_TOOL_URL     retained-launch only, optional: file URL of a module exporting `tool` (from @opencode-ai/plugin),
  *                          used to build the input schema of `cpx_probe_capture` when the bare specifier does not resolve.
  *
@@ -28,8 +33,11 @@
  *   append-tail-system     context hook: push a LAST message { role: "system" } holding "CPX_TAIL_MARKER <request counter>".
  *   append-tail-user       same with role "user".
  *   append-tail-newest     context hook: add the marker as a new text part to the newest existing message.
- *   cache-hint-1h          context hook: try a 1-hour cache hint on the last system part (a cache field present on the part), else
- *                          as a provider option of the request (session.d.ts:20-21); what was set is recorded.
+ *   cache-hint-1h          context hook: set `cache: { type: "ephemeral", ttlSeconds: 3600 }` (the plugin API's CacheHint, @opencode/ai
+ *                          schema/messages.d.ts + options.d.ts; the key is created) on the LAST system part; what was set is recorded.
+ *   cache-hint-1h-message  same CacheHint on the last text part of the last real message.
+ *   append-tail-user+hint-last-real  append-tail-user, and BEFORE the tail a manual `cache: { type: "ephemeral" }` on the last text part of
+ *                          the last real message (records "cache-hint-last-real").
  *   mutate-subagent-prompt execute.before of subagent: append " CPX_MUTATED" to the prompt.
  *   filter-grep            execute.after of grep / glob: drop result lines containing CPX_LEASED, append "[cpx: 1 hidden]".
  *   rewrite-compaction     compaction hook: CPX_HELD_ORIGINAL -> CPX_HELD_PLACEHOLDER in the messages / system parts.
@@ -41,7 +49,7 @@ import { appendFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 
 const MODES = new Set([
-  "rewrite-completion", "append-tail-system", "append-tail-user", "append-tail-newest", "cache-hint-1h",
+  "rewrite-completion", "append-tail-system", "append-tail-user", "append-tail-newest", "cache-hint-1h", "cache-hint-1h-message", "append-tail-user+hint-last-real",
   "mutate-subagent-prompt", "filter-grep", "rewrite-compaction", "retained-launch",
 ]);
 const OBSERVED_TOOLS = new Set([
@@ -172,6 +180,16 @@ function describeResult(result) {
     resultStatus: structured.status,
     resultSessionID: structured.sessionID,
   };
+}
+
+/** Copy of `message` whose LAST text part carries `cache: hint` (the key is created); undefined when it has no array of parts with a text part. */
+function withLastTextCache(message, hint) {
+  if (!message || !Array.isArray(message.content)) return undefined;
+  let partIndex = -1;
+  message.content.forEach((part, i) => { if (part && typeof part === "object" && part.type === "text") partIndex = i; });
+  if (partIndex < 0) return undefined;
+  const content = message.content.map((part, i) => (i === partIndex ? { ...part, cache: hint } : part));
+  return { message: Object.assign(Object.create(Object.getPrototypeOf(message)), message, { content }), partIndex };
 }
 
 const scalars = (data) => {
@@ -313,8 +331,16 @@ export default {
           replaced.push({ index: i, id: messages[i] && messages[i].id, role: messages[i] && messages[i].role, count, original: cut(deepStrings(messages[i]).find((text) => COMPLETION.test(text)), 300) });
         }
         rec("rewrite-completion", { ...base, did: replaced.length > 0, replaced });
-      } else if (mode === "append-tail-system" || mode === "append-tail-user") {
+      } else if (mode === "append-tail-system" || mode === "append-tail-user" || mode === "append-tail-user+hint-last-real") {
         const role = mode === "append-tail-system" ? "system" : "user";
+        if (mode === "append-tail-user+hint-last-real") {
+          // O8: a MANUAL breakpoint on the last REAL message (before the tail is added).
+          const index = messages.length - 1;
+          const hint = { type: "ephemeral" };
+          const hinted = withLastTextCache(messages[index], hint);
+          if (hinted) e.messages[index] = hinted.message;
+          rec("cache-hint-last-real", { ...base, did: Boolean(hinted), index, id: messages[index] && messages[index].id, role: messages[index] && messages[index].role, partIndex: hinted ? hinted.partIndex : null, set: hint });
+        }
         e.messages.push({ role, content: [{ type: "text", text: marker }] });
         rec(mode, { ...base, role, marker, messageCountAfter: e.messages.length });
       } else if (mode === "append-tail-newest") {
@@ -327,30 +353,24 @@ export default {
           rec("append-tail-newest", { ...base, did: true, marker, index, id: newest.id, role: newest.role, partCountAfter: newest.content.length + 1 });
         }
       } else if (mode === "cache-hint-1h") {
+        // The plugin API's own lever: `SystemPart.cache` / `TextPart.cache` = CacheHint { type: "ephemeral" | "persistent", ttlSeconds? } (@opencode/ai
+        // schema/messages.d.ts, options.d.ts); the Anthropic protocol maps ttlSeconds >= 3600 to `ttl: "1h"`. The key is CREATED when the part has none.
         const system = Array.isArray(e.system) ? e.system : [];
         const index = system.length - 1;
         const part = system[index];
-        const hint = { type: "ephemeral", ttl: "1h" };
-        const fields = part && typeof part === "object" ? Object.keys(part) : [];
-        const direct = ["cacheControl", "cache_control", "cache"].find((key) => fields.includes(key));
-        const nested = ["providerOptions", "providerMetadata", "options"].find((key) => fields.includes(key));
-        const providerID = e.model && e.model.providerID;
-        if (direct) {
-          e.system = [...system.slice(0, index), { ...part, [direct]: { ...(part[direct] && typeof part[direct] === "object" ? part[direct] : {}), ...hint } }, ...system.slice(index + 1)];
-          rec("cache-hint-1h", { ...base, did: true, via: `system part field ${direct}`, set: hint, partKeys: fields });
-        } else if (nested && providerID) {
-          const existing = part[nested] && typeof part[nested] === "object" ? part[nested] : {};
-          const value = { ...existing, [providerID]: { ...(existing[providerID] && typeof existing[providerID] === "object" ? existing[providerID] : {}), cacheControl: hint } };
-          e.system = [...system.slice(0, index), { ...part, [nested]: value }, ...system.slice(index + 1)];
-          rec("cache-hint-1h", { ...base, did: true, via: `system part field ${nested}.${providerID}.cacheControl`, set: hint, partKeys: fields });
-        } else if (providerID && e.options && typeof e.options === "object") {
-          // No cache field on the system part: SessionRequestOptions accepts any other key as a provider option (session.d.ts:20-21).
-          const existing = e.options[providerID] && typeof e.options[providerID] === "object" ? e.options[providerID] : {};
-          e.options[providerID] = { ...existing, cacheControl: hint };
-          rec("cache-hint-1h", { ...base, did: true, via: `request option ${providerID}.cacheControl (not a documented field; attempt only)`, set: hint, partKeys: fields });
+        if (!part || typeof part !== "object") {
+          rec("cache-hint-1h", { ...base, did: false, reason: "no system part" });
         } else {
-          rec("cache-hint-1h", { ...base, did: false, reason: "no cache field on the system part and no request options", partKeys: fields });
+          const hint = { type: "ephemeral", ttlSeconds: 3600 };
+          e.system = [...system.slice(0, index), { ...part, cache: hint }, ...system.slice(index + 1)];
+          rec("cache-hint-1h", { ...base, did: true, via: "system part field `cache` (created)", target: `system[${index}]`, set: hint, hadCacheKey: "cache" in part, partKeys: Object.keys(part), systemParts: system.length });
         }
+      } else if (mode === "cache-hint-1h-message") {
+        const index = messages.length - 1;
+        const hint = { type: "ephemeral", ttlSeconds: 3600 };
+        const hinted = withLastTextCache(messages[index], hint);
+        if (hinted) e.messages[index] = hinted.message;
+        rec("cache-hint-1h-message", { ...base, did: Boolean(hinted), via: "text part field `cache` (created) on the last text part of the last real message", index, id: messages[index] && messages[index].id, role: messages[index] && messages[index].role, partIndex: hinted ? hinted.partIndex : null, set: hint, messageCount: messages.length });
       }
     }));
 
@@ -409,6 +429,9 @@ export default {
 
     const requestedCount = Number(process.env.CPX_PROBE_RETAINED_COUNT);
     const retainedCount = Number.isInteger(requestedCount) && requestedCount >= 1 && requestedCount <= 32 ? requestedCount : 3;
+    const childAgent = process.env.CPX_PROBE_CHILD_AGENT || undefined;
+    const childModel = process.env.CPX_PROBE_CHILD_MODEL || undefined;
+    const useRetainedSignal = process.env.CPX_PROBE_USE_RETAINED_SIGNAL === "1";
     const childPromptTemplate = process.env.CPX_PROBE_CHILD_PROMPT;
     const childPrompt = (n) => (childPromptTemplate && childPromptTemplate.length > 0 ? childPromptTemplate.split("{n}").join(String(n)) : `CPX_RETAINED_CHILD ${n}`);
 
@@ -427,7 +450,13 @@ export default {
         rec("retained-launch-error", { batch, label, parentID, error: "native subagent tool not found in ctx.tool.list()" });
         return;
       }
-      rec("retained-launch-batch", { batch, label, parentID, agent: chosen.agent, agents: chosen.available, agentError: chosen.error, contextKeys: Object.keys(context) });
+      const agent = childAgent ?? chosen.agent;
+      rec("retained-launch-batch", {
+        batch, label, parentID, agent, requestedAgent: childAgent ?? null, requestedModel: childModel ?? null, agents: chosen.available, agentError: chosen.error, contextKeys: Object.keys(context),
+        // What the probe changes in the retained context for its launches: `signal` (own controller unless CPX_PROBE_USE_RETAINED_SIGNAL=1) and `progress` (records only).
+        signalReplaced: !(useRetainedSignal && Boolean(context.signal)), progressReplaced: true, retainedSignalType: typeof context.signal,
+        retainedSignalAbortedAtLaunch: context.signal && typeof context.signal.aborted === "boolean" ? context.signal.aborted : null,
+      });
       await Promise.allSettled(Array.from({ length: retainedCount }, (_, i) => i + 1).map(async (n) => {
         const id = `${batch}.${n}`;
         const controller = new AbortController();
@@ -437,10 +466,10 @@ export default {
         rec("retained-launch-attempt", { batch, n, id, label, parentID, agent: chosen.agent, description: `cpx-retained-${n}`, prompt: cut(childPrompt(n), 300) });
         try {
           const result = await native.execute(
-            { agent: chosen.agent, description: `cpx-retained-${n}`, prompt: childPrompt(n), background: false },
+            { agent: childAgent ?? chosen.agent, ...(childModel ? { model: childModel } : {}), description: `cpx-retained-${n}`, prompt: childPrompt(n), background: false },
             {
               ...context,
-              signal: controller.signal,
+              signal: useRetainedSignal && context.signal ? context.signal : controller.signal,
               // The parent's call has ended, so the host would reject a progress update on its context: only record it.
               async progress(metadata) {
                 const sessionID = metadata && metadata.sessionID;

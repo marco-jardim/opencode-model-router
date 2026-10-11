@@ -35,7 +35,7 @@ import { pathToFileURL } from "node:url";
 import { removeDirWhenReleased } from "../helpers/remove-dir";
 import type { CpxFront, CpxRequest, FaultKind } from "./helpers/cpx-scripted-provider";
 import {
-  RoutingHost, ROOT, agentWithoutModel, arr, clip, obj, redact, scriptLine, stopAllHosts, str, waitFor, type Dispatched, type HostOptions, type Obj,
+  RoutingHost, ROOT, agentWithoutModel, arr, clip, obj, redact, ref, scriptLine, stopAllHosts, str, waitFor, type Dispatched, type HostOptions, type Obj,
 } from "./helpers/routing-host";
 
 const RUN = process.env.RUN_OC_SMOKE_CPX === "1";
@@ -54,7 +54,7 @@ const CHILD_ENDED = new Set(["session.execution.succeeded", "session.execution.f
 /** Verification off, so the router does not rewrite `background: true` into a foreground call (role-spikes S6B); engine shadow as everywhere. */
 const BASE: HostOptions = { routing: { engine: "shadow" }, overrides: { enforcement: { mode: "off" } }, hostConfig: { agents: { [CHILD]: agentWithoutModel() } } };
 
-type ProbeMode = "rewrite-completion" | "append-tail-system" | "append-tail-user" | "append-tail-newest" | "cache-hint-1h" | "filter-grep" | "mutate-subagent-prompt" | "rewrite-compaction" | "retained-launch";
+type ProbeMode = "rewrite-completion" | "append-tail-system" | "append-tail-user" | "append-tail-newest" | "cache-hint-1h" | "cache-hint-1h-message" | "append-tail-user+hint-last-real" | "filter-grep" | "mutate-subagent-prompt" | "rewrite-compaction" | "retained-launch";
 /** One probe JSON line: `{ t, kind, ...fields }` (see cpx-probe-plugin.js). */
 interface ProbeLine extends Obj { t: number; kind: string }
 
@@ -423,7 +423,8 @@ d("C5 context-hook tail: sent to the provider, not persisted, earlier prefix byt
     await observeContract("C5", async o => {
       const variants: Obj = {};
       o.observed.variants = variants;
-      for (const [name, mode] of [["system", "append-tail-system"], ["user", "append-tail-user"], ["newest", "append-tail-newest"]] as const) {
+      // `userHint` (O8): the user tail plus a MANUAL breakpoint on the last REAL message; where does cache_control land on consecutive requests?
+      for (const [name, mode] of [["system", "append-tail-system"], ["user", "append-tail-user"], ["newest", "append-tail-newest"], ["userHint", "append-tail-user+hint-last-real"]] as const) {
         await withHost(`C5-${name}`, mode, o, async s => {
           const { arrivals } = instrument(s.host);
           const root = await s.host.newRoot(`C5 ${name} root`);
@@ -433,7 +434,17 @@ d("C5 context-hook tail: sent to the provider, not persisted, earlier prefix byt
           const tails = (await probeLines(s.probeFile)).filter(l => l.kind === mode && l.sessionID === root);
           o.relied.push(...tails.slice(0, 3));
           const stored = await storedView(s.host, root);
+          // O8: every cache_control on the wire, per request, and on which message it sits relative to the last REAL message (= the one before the tail).
+          const breakpoints = requests.map(r => {
+            const count = bodyMessages(r).length;
+            const paths = findKeys(obj(r.body), /^cache_?control$/i).map(c => `${String(c.path)}=${json(c.value)}`);
+            const onMessage = (index: number) => paths.some(p => p.startsWith(`$.messages[${index}]`));
+            return { index: r.index, messageCount: count, paths, onTail: onMessage(count - 1), onLastReal: onMessage(count - 2), onSystem: paths.some(p => p.startsWith("$.system")) };
+          });
+          const hintLines = (await probeLines(s.probeFile)).filter(l => l.kind === "cache-hint-last-real" && l.sessionID === root);
+          o.relied.push(...hintLines.slice(0, 2));
           const view: Obj = {
+            breakpoints, hintLines: hintLines.map(l => ({ requestNo: l.requestNo, did: l.did, index: l.index, partIndex: l.partIndex, set: l.set })),
             probeMode: mode, tailLines: tails.map(l => ({ requestNo: l.requestNo, marker: l.marker, role: l.role, did: l.did, index: l.index })),
             parentRequests: requests.map(r => requestView(r, arrivals)), storedHasMarker: stored.messages.some(m => m.hasMarker === true), storedHistory: stored.messages,
           };
@@ -484,15 +495,18 @@ const terminalOf = (lines: readonly ProbeLine[], session: string, since = 0): Pr
 
 // ---------------------------------------------------------------------------- C6 ----
 d("C6 one-hour cache hint set by a plugin in the context hook", () => {
-  it("records what the probe tried and every cache_control the provider request carries", async () => {
+  it("sets the plugin API's own `cache` hint (ttlSeconds 3600) on the last system part, then on the last message, and records every cache_control the provider request carries", async () => {
     await observeContract("C6", async o => {
-      await withHost("C6", "cache-hint-1h", o, async s => {
+      const variants: Obj = {};
+      o.observed.variants = variants;
+      for (const [name, mode] of [["system", "cache-hint-1h"], ["message", "cache-hint-1h-message"]] as const) {
+      await withHost(`C6-${name}`, mode, o, async s => {
         const { arrivals } = instrument(s.host);
         const root = await s.host.newRoot("C6 root");
         await s.host.prompt(root, "C6 first turn");
         await s.host.prompt(root, "C6 second turn");
         const lines = await probeLines(s.probeFile);
-        const hints = lines.filter(l => l.kind === "cache-hint-1h");
+        const hints = lines.filter(l => l.kind === mode);
         const shape = lines.find(l => l.kind === "context-shape");
         o.relied.push(...hints.slice(0, 2), ...(shape ? [shape] : []));
         const requests = parentRequests(s.host, root);
@@ -505,16 +519,27 @@ d("C6 one-hour cache hint set by a plugin in the context hook", () => {
             cacheControl: occurrences, ttl: findKeys(body, /^ttl$/), oneHourStrings: stringPaths(body, /^1h$/),
             systemCacheControl: occurrences.filter(c => String(c.path).startsWith("$.system")),
             oneHourOnSystem: occurrences.some(c => String(c.path).startsWith("$.system") && /"ttl":"1h"/.test(json(c.value))),
+            messageCacheControl: occurrences.filter(c => String(c.path).startsWith("$.messages")),
+            oneHourOnMessage: occurrences.some(c => String(c.path).startsWith("$.messages") && /"ttl":"1h"/.test(json(c.value))),
           };
         });
-        o.observed.probeTried = hints.map(l => ({ requestNo: l.requestNo, did: l.did, via: l.via, set: l.set, partKeys: l.partKeys, reason: l.reason }));
-        o.observed.contextShape = shape ? { eventKeys: shape.eventKeys, systemPartKeys: shape.systemPartKeys, messageKeys: shape.messageKeys, partKeys: shape.partKeys, optionKeys: shape.optionKeys } : null;
-        o.observed.requests = views;
-        o.observed.providerCarriesOneHourOnSystem = views.some(v => v.oneHourOnSystem);
-        o.observed.providerCarriesOneHourAnywhere = views.some(v => v.cacheControl.some(c => /"ttl":"1h"/.test(json(c.value))) || v.oneHourStrings.length > 0);
+        // Where the probe put the hint (what it set, on which part) and what the wire carries: the plugin API's `cache` field -> Anthropic `cache_control`.
+        variants[name] = {
+          probeMode: mode,
+          probeTried: hints.map(l => ({ requestNo: l.requestNo, did: l.did, via: l.via, target: l.target, index: l.index, partIndex: l.partIndex, set: l.set, hadCacheKey: l.hadCacheKey, partKeys: l.partKeys, reason: l.reason })),
+          contextShape: shape ? { eventKeys: shape.eventKeys, systemPartKeys: shape.systemPartKeys, messageKeys: shape.messageKeys, partKeys: shape.partKeys, optionKeys: shape.optionKeys } : null,
+          requests: views,
+          oneHourOnSystem: views.some(v => v.oneHourOnSystem), oneHourOnMessage: views.some(v => v.oneHourOnMessage),
+          oneHourAnywhere: views.some(v => v.cacheControl.some(c => /"ttl":"1h"/.test(json(c.value))) || v.oneHourStrings.length > 0),
+          hintsApplied: hints.length > 0 && hints.every(l => l.did === true),
+        };
       });
+      }
+      o.observed.providerCarriesOneHourOnSystem = at(variants, "system", "oneHourOnSystem");
+      o.observed.providerCarriesOneHourOnMessage = at(variants, "message", "oneHourOnMessage");
+      o.observed.providerCarriesOneHourAnywhere = at(variants, "system", "oneHourAnywhere") === true || at(variants, "message", "oneHourAnywhere") === true;
     });
-  }, 300_000);
+  }, 600_000);
 });
 
 // ---------------------------------------------------------------------------- C7 ----
@@ -1026,20 +1051,74 @@ d("C13 concurrent background children, host cap, parent interrupt", () => {
 });
 
 // ---------------------------------------------------------------------------- C14 ----
-interface Span { from: number; to: number }
-const peakOverlap = (spans: readonly Span[]): number => Math.max(0, ...spans.map(a => spans.filter(b => b.from <= a.from && a.from < b.to).length));
 const RETAINED_NAME = "cpx-retained.txt";
 /** Fills every heading of the host's compaction summary template (same text as the frozen routing-spikes harness uses). */
 const COMPACTION_SUMMARY = ["## Objective", "cpx", "## Requirements", "none", "## Decisions", "none", "## Work State", "### Completed", "none", "### Active", "none", "### Blocked", "none", "## Next Move", "reply", "## Relevant Files", "none", "## Important Context", "none"].join("\n");
 /** Children per retained-launch batch (O3: ADR 0007 proved 3; D13/D14 clamp `maxParallel` to 8, so 8 must run concurrently). */
 const RETAINED_COUNT = 8;
-/** Prompt of the retained-launch children (probe `{n}` = child number): the RoutingProvider marker `READ_ONLY_PROBE=<json>` makes the fixture answer with a `read` call. */
-const retainedPrompt = (file: string): string => `CPX_RETAINED_CHILD {n} READ_ONLY_PROBE=${JSON.stringify({ tool: "read", input: { path: file } })}`;
-/** Probe env of C14; the child prompt names a file of the host's project, so it is resolved in `prepare` (see {@link ProbeEnv}). */
-const retainedEnv: ProbeEnv = project => ({
-  CPX_PROBE_TOOL_URL: pathToFileURL(path.join(ROOT, "node_modules", "@opencode-ai", "plugin", "dist", "tool.js")).href, CPX_PROBE_RELAUNCH_MS: "60000", CPX_PROBE_RETAINED_COUNT: String(RETAINED_COUNT),
-  CPX_PROBE_CHILD_PROMPT: retainedPrompt(path.join(project, RETAINED_NAME)),
+/** Children of the control / retained-signal hosts (they only need to show the router-only effect and the signal effect). */
+const LIGHT_COUNT = 3;
+/** Identical `read` calls each retained child makes (CHILD_SCRIPT64 steps): the router's redundancy / read-budget guards refuse the later ones when they apply to the child. */
+const RETAINED_READS = 6;
+/** Prompt of the retained-launch children (probe `{n}` = child number). `C14G_<n>x` is the token `Gates` parks the child's first request on; the CHILD_SCRIPT64 marker
+ * makes RoutingProvider script `RETAINED_READS` identical `read` calls of `file` in the child's own turn, then answer CHILD_OK. */
+const retainedPrompt = (file: string): string => `C14G_{n}x ${scriptLine(Array.from({ length: RETAINED_READS }, () => ({ tool: "read", input: { path: file } })), "CHILD_OK")}`;
+/** Probe env of the C14 hosts; the child prompt names a file of the host's project, so it is resolved in `prepare` (see {@link ProbeEnv}). Children use the non-default agent
+ * `cpx-child` and an explicit model, so the contract "agent and model are honoured for retained launches" is observable. */
+const retainedEnvFor = (count: number, relaunchMs: number | undefined, extra: Readonly<Record<string, string>> = {}): ProbeEnv => project => ({
+  CPX_PROBE_TOOL_URL: pathToFileURL(path.join(ROOT, "node_modules", "@opencode-ai", "plugin", "dist", "tool.js")).href, CPX_PROBE_RETAINED_COUNT: String(count),
+  ...(relaunchMs === undefined ? {} : { CPX_PROBE_RELAUNCH_MS: String(relaunchMs) }),
+  CPX_PROBE_CHILD_PROMPT: retainedPrompt(path.join(project, RETAINED_NAME)), CPX_PROBE_CHILD_AGENT: CHILD, CPX_PROBE_CHILD_MODEL: `${SONNET}#low`, ...extra,
 });
+const retainedEnv: ProbeEnv = retainedEnvFor(RETAINED_COUNT, 60_000);
+/** Host options of the C14 hosts: router ENFORCED (guards live), the harness probe's lifecycle log (permission evaluations), the read target in the project. */
+const retainedHostOptions = (overrides: Partial<HostOptions> = {}): HostOptions => ({
+  ...BASE, overrides: { enforcement: { mode: "enforced" } }, probe: { lifecycle: true },
+  prepare: async ({ project }) => { await writeFile(path.join(project, RETAINED_NAME), "retained child read target\n"); }, ...overrides,
+});
+/** Per retained child: the agent / model it ACTUALLY ran with (session record, provider request headers and bodies), the tool results the model got back, and the router-only
+ * observable: a router guard refusal text (`DENIED: …`) in a tool result, which only the router can produce (the control host without the router never shows one). */
+async function childContracts(host: RoutingHost, ids: readonly string[]): Promise<Obj[]> {
+  const hooks = await host.hooks();
+  return Promise.all(ids.map(async id => {
+    const mine = front(host).requests.filter(r => hdr(r, "x-proof-session") === id && hdr(r, "x-proof-kind") === "primary");
+    const results = mine.filter(r => lastIsToolResult(r)).map(r => toolResultText(r));
+    const refusals = results.filter(t => /DENIED:|Refused/.test(t));
+    const session = await host.client.session.get({ sessionID: id }).then(g => ({ agent: g.agent, parentID: g.parentID, model: g.model ? ref(g.model) : undefined }), error => ({ error: String(error) }));
+    return {
+      sessionID: id, session, wireModels: [...new Set(mine.map(r => str(obj(r.body).model)))], catalogModels: [...new Set(mine.map(r => hdr(r, "x-proof-model")))],
+      providerRequests: mine.length, toolResults: results.length, toolResultSamples: results.slice(0, 3).map(t => t.slice(0, 160)),
+      routerRefusals: refusals.length, firstRefusal: refusals[0]?.slice(0, 300),
+      readHooksBefore: hooks.filter(h => h.sessionID === id && h.hook === "before" && h.tool === "read").length,
+      readHooksAfterOk: hooks.filter(h => h.sessionID === id && h.hook === "after" && h.tool === "read" && h.status === "completed").length,
+    };
+  }));
+}
+/** A light C14 host (3 children, no relaunch): used as the CONTROL (`withoutRouter`: same launch, no router) and for the retained-`signal` variant. */
+async function lightRetained(o: Observation, tag: string, options: HostOptions, extraEnv: Readonly<Record<string, string>>, parkMs: number): Promise<Obj> {
+  let summary: Obj = {};
+  await withHost(tag, "retained-launch", o, async s => {
+    const { host } = s;
+    const root = await host.newRoot(`${tag} root`);
+    const gates = new Gates(host, root, tokensOf("C14G", LIGHT_COUNT));
+    await host.prompt(root, `READ_ONLY_PROBE=${JSON.stringify({ tool: "cpx_probe_capture", input: {} })}`);
+    const parked = await tryWait(`${LIGHT_COUNT} retained children parked (${tag})`, () => (gates.arrivals.filter(a => a.session !== root).length >= LIGHT_COUNT ? true : undefined), parkMs);
+    const peakWaiting = gates.peakWaiting;
+    gates.releaseAll();
+    const results = await tryWait(`${LIGHT_COUNT} launch results (${tag})`, async () => { const ls = (await probeLines(s.probeFile)).filter(l => l.kind === "retained-launch-result"); return ls.length >= LIGHT_COUNT ? ls : undefined; }, 90_000);
+    const lines = await probeLines(s.probeFile);
+    const launchResults = lines.filter(l => l.kind === "retained-launch-result");
+    const ids = [...new Set(launchResults.map(l => str(l.childSessionID)).filter((x): x is string => x !== undefined))];
+    o.relied.push(...lines.filter(l => l.kind === "retained-launch-batch"));
+    summary = {
+      tag, withoutRouter: options.withoutRouter === true, parked: parked === true, peakWaiting, resultsReturned: results !== undefined,
+      batchLine: clip(lines.find(l => l.kind === "retained-launch-batch"), 900),
+      results: launchResults.map(l => ({ n: l.n, ok: l.ok, status: l.status, error: l.error, name: l.name, childSessionID: l.childSessionID })),
+      children: await childContracts(host, ids),
+    };
+  }, options, retainedEnvFor(LIGHT_COUNT, undefined, extraEnv));
+  return summary;
+}
 
 d("C14 launch with a retained tool context outside any LLM tool call", () => {
   it("captures the context in cpx_probe_capture, ends the turn, and records the probe's launches (now and 60 s later)", async () => {
@@ -1047,11 +1126,16 @@ d("C14 launch with a retained tool context outside any LLM tool call", () => {
       await withHost("C14", "retained-launch", o, async s => {
         const { host } = s;
         const retainedFile = path.join(host.project, RETAINED_NAME);
-        const { arrivals } = instrument(host);
-        host.provider.holdMarked("CPX_RETAINED_CHILD", 3_000);
         const root = await host.newRoot("C14 root");
+        // QA-5 (O3): batch 1 is parked by `Gates` (not a timed hold) until all RETAINED_COUNT children's first provider requests are waiting at once, then released.
+        const gates = new Gates(host, root, tokensOf("C14G", RETAINED_COUNT));
+        const arrivals = gates.stamps;
         const ids = async () => (await host.client.session.context({ sessionID: root })).map(m => str(m.id) ?? str(m.type));
         await host.prompt(root, `READ_ONLY_PROBE=${JSON.stringify({ tool: "cpx_probe_capture", input: {} })}`);
+        const parked = await tryWait(`${RETAINED_COUNT} retained children parked at the provider`, () => (gates.arrivals.filter(a => a.session !== root).length >= RETAINED_COUNT ? true : undefined), 90_000);
+        const peakWaiting = gates.peakWaiting;
+        const parkedSessions = new Set(gates.arrivals.map(a => a.session)).size;
+        gates.releaseAll();
         const history: Obj = { afterCaptureTurn: await ids() };
         const batchDone = (batch: number) => async () => { const ls = (await probeLines(s.probeFile)).filter(l => l.kind === "retained-launch-result" && l.batch === batch); return ls.length >= RETAINED_COUNT ? ls : undefined; };
         const first = await tryWait("batch 1 results", batchDone(1), 120_000);
@@ -1062,7 +1146,6 @@ d("C14 launch with a retained tool context outside any LLM tool call", () => {
         const retained = lines.filter(l => l.kind.startsWith("retained-") || l.kind === "probe-error");
         o.relied.push(...retained.slice(0, 12));
         const childIDs = [...new Set(retained.map(l => str(l.childSessionID) ?? str(l.seenInProgress)).filter((x): x is string => x !== undefined))];
-        const holds = host.provider.holds.filter(h => h.session !== undefined && childIDs.includes(h.session));
         const byBatch = (batch: number) => retained.filter(l => l.batch === batch);
         o.observed.registration = { toolRegistered: clip(lines.find(l => l.kind === "retained-tool-registered"), 400), capture: clip(lines.find(l => l.kind === "retained-capture"), 600), probeErrors: clip(lines.filter(l => l.kind === "probe-error"), 600) };
         o.observed.launches = [1, 2].map(batch => ({
@@ -1074,11 +1157,19 @@ d("C14 launch with a retained tool context outside any LLM tool call", () => {
           delivered: batch === 1 ? first !== undefined : second !== undefined,
         }));
         o.observed.childrenRan = Object.fromEntries(childIDs.map(id => [id, front(host).requests.filter(r => hdr(r, "x-proof-session") === id).map(r => ({ index: r.index, arrivedAt: arrivals.get(r.index), served: r.served }))]));
+        // Batch 1 only: every child's first request is parked by Gates until all are waiting; peakWaiting is the number of provider requests parked at the same moment.
         o.observed.concurrency = {
-          holdSpans: holds.map(h => ({ session: h.session, arrivedAt: h.arrivedAt, releasedAt: h.releasedAt })),
-          peakOverlapAllChildren: peakOverlap(holds.map(h => ({ from: h.arrivedAt, to: h.releasedAt ?? Number.POSITIVE_INFINITY }))),
-          peakOverlapBatch1: peakOverlap(holds.filter(h => h.arrivedAt < (byBatch(2).find(l => l.kind === "retained-launch-batch")?.t ?? Number.POSITIVE_INFINITY)).map(h => ({ from: h.arrivedAt, to: h.releasedAt ?? Number.POSITIVE_INFINITY }))),
+          launched: RETAINED_COUNT, allParked: parked === true, peakWaiting, parkedSessions,
+          arrivals: gates.arrivals.map(a => ({ token: a.token, at: a.at, releasedAt: a.releasedAt })),
         };
+        // QA-12: what the probe changes in the retained context for its launches (the batch lines record signal / progress replacement and the retained signal's state).
+        const batchLine = byBatch(1).find(l => l.kind === "retained-launch-batch");
+        o.observed.launchContext = {
+          signalReplaced: batchLine?.signalReplaced, progressReplaced: batchLine?.progressReplaced, retainedSignalType: batchLine?.retainedSignalType,
+          retainedSignalAbortedAtLaunch: batchLine?.retainedSignalAbortedAtLaunch, requestedAgent: batchLine?.requestedAgent, requestedModel: batchLine?.requestedModel,
+          note: "the probe launches with its own 300 s AbortController as `signal` and a recording `progress`; the `retainedSignal` host below launches with the retained signal itself",
+        };
+        o.observed.childContract = await childContracts(host, childIDs);
         const toolLines = lines.filter(l => (l.kind === "execute.before" || l.kind === "execute.after") && typeof l.sessionID === "string" && childIDs.includes(l.sessionID));
         const harnessHooks = (await host.hooks()).filter(h => childIDs.includes(h.sessionID));
         const hostEvents = await host.events();
@@ -1110,16 +1201,21 @@ d("C14 launch with a retained tool context outside any LLM tool call", () => {
           childPrompt: retainedPrompt(retainedFile), file: retainedFile,
           childPromptCanTriggerTool: triggered, probeHookLinesForChildren: toolLines.length, harnessHookRecordsForChildren: harnessHooks.length,
           tools: [...new Set([...toolLines.map(l => l.tool), ...harnessHooks.map(h => h.tool)])],
-          routerGuardsOrGrantsRan: perChild.some(c => c.permissionEvaluations.length > 0 || c.routerDecisionRows > 0 || c.harnessRouterSeen.some(h => h.hook === "after" && json(h.result).includes("router"))),
+          // NOT router evidence: the harness probe's own evaluate hook (lifecycle) also produces permission evaluations. The router-only observable is `childContract[*].routerRefusals`, measured against `control`.
+          anyPermissionOrDecisionEvidence: perChild.some(c => c.permissionEvaluations.length > 0 || c.routerDecisionRows > 0 || c.harnessRouterSeen.some(h => h.hook === "after" && json(h.result).includes("router"))),
           routerLogLines: host.routerLogLines().slice(-10).map(l => l.slice(0, 300)),
           subagentHooksOnRootAfterCapture: lines.filter(l => (l.kind === "execute.before" || l.kind === "execute.after") && l.tool === "subagent" && l.sessionID === root).length,
           perChild,
         };
         const kids = await host.children(root);
         o.observed.parentHistory = { ...history, unchangedAcrossLaunches: json(history.afterCaptureTurn) === json(history.afterBatch1) && json(history.afterBatch1) === json(history.afterBatch2), childrenListedUnderRoot: kids.map(k => ({ id: k.id, parentID: k.parentID, agent: k.agent })), session: await sessionState(host, root) };
-      }, { ...BASE, probe: { lifecycle: true }, prepare: async ({ project }) => { await writeFile(path.join(project, RETAINED_NAME), "retained child read target\n"); } }, retainedEnv);
+      }, retainedHostOptions(), retainedEnv);
+      // QA-2a CONTROL: the same launch on a host WITHOUT the router. Anything the router adds to a retained child (guard refusals) is absent here.
+      o.observed.control = await lightRetained(o, "C14-control", retainedHostOptions({ withoutRouter: true }), {}, 60_000);
+      // QA-12: the same launch with the RETAINED context's own `signal` instead of the probe's controller (the capture call has ended by then).
+      o.observed.retainedSignal = await lightRetained(o, "C14-signal", retainedHostOptions(), { CPX_PROBE_USE_RETAINED_SIGNAL: "1" }, 30_000);
     });
-  }, 900_000);
+  }, 1_200_000);
 });
 
 // ---------------------------------------------------------------------------- C15 ----
@@ -1335,11 +1431,24 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
     const markerIndex = Number(list(at(first, "markerAt"))[0]);
     check(o, "C5/D4", at(user, "tailLines", 0, "role") === "user" && markerIndex === Number(at(first, "messageCount")) - 1, "the turn-state tail must be a `user` message appended LAST in the request's messages (the host moves nothing after it)");
     check(o, "C5/D4", at(user, "prefix", "messages", "identical") === true && at(user, "prefix", "systemIdentical") === true && at(user, "prefix", "otherFieldsIdentical") === true, "everything before the tail (system, other request fields, earlier messages) must be byte-identical across consecutive requests, or the prompt cache prefix breaks (D4/P4)");
+    // O8 (second breakpoint): the host's automatic policy puts a breakpoint on the final message only (the tail); a manual hint on the last REAL message is
+    // kept as a second breakpoint. Whether the earlier request's bytes survive the moved hint is recorded in variants.userHint.prefix (not asserted).
+    for (const i of [0, 1]) {
+      check(o, "C5/D4/O8", at(user, "breakpoints", i, "onTail") === true && at(user, "breakpoints", i, "onLastReal") === false, `request ${i + 1} without a manual hint: the automatic breakpoint must sit on the tail (last message) only, not on the last real message`);
+    }
+    const hinted = at(variants, "userHint");
+    check(o, "C5/D4/O8", at(hinted, "hintLines", 0, "did") === true, "the probe must be able to put a manual cache hint on the last real message in the context hook");
+    for (const i of [0, 1]) {
+      check(o, "C5/D4/O8", at(hinted, "breakpoints", i, "onLastReal") === true && at(hinted, "breakpoints", i, "onTail") === true, `request ${i + 1} with a manual hint: a breakpoint on the last real message must reach the wire together with the automatic tail breakpoint`);
+    }
   },
   C6: o => {
     const ob = o.observed;
-    check(o, "C6/D5", at(ob, "providerCarriesOneHourAnywhere") === false && at(ob, "providerCarriesOneHourOnSystem") === false, "a 1-hour cache ttl now reaches the provider request: REOPEN D5 (it was withdrawn because a plugin had no lever for it)");
-    check(o, "C6/D5", !list(at(ob, "contextShape", "optionKeys")).some(k => /cache/i.test(String(k))), "the context event now exposes a cache-related request option: REOPEN D5");
+    // The plugin API's own lever is the part field `cache: {type, ttlSeconds}` (SystemPart / TextPart, @opencode/ai schema/messages.d.ts + options.d.ts);
+    // the Anthropic protocol maps ttlSeconds >= 3600 to `cache_control {type: "ephemeral", ttl: "1h"}` (protocols/anthropic-messages.js).
+    check(o, "C6/D5", at(ob, "variants", "system", "hintsApplied") === true && at(ob, "variants", "message", "hintsApplied") === true, "the probe must be able to set `cache` on the last system part and on the last text part of the last message in the context hook (no lever => D5 stays withdrawn)");
+    check(o, "C6/D5", at(ob, "providerCarriesOneHourOnSystem") === true, "D5 decision: a `cache: {type: ephemeral, ttlSeconds: 3600}` hint on the last system part must reach the provider as cache_control ttl 1h on the system block; if it does not, D5 stays withdrawn (re-decide D5 from variants.system in C6.json)");
+    check(o, "C6/D5", at(ob, "providerCarriesOneHourOnMessage") === true, "D5 decision: the same hint on the last text part of the last message must reach the provider as cache_control ttl 1h on that message block; if it does not, re-decide D5 from variants.message in C6.json");
   },
   C7: o => {
     const ob = o.observed;
@@ -1441,9 +1550,18 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
       check(o, "C14/D14", at(l, "delivered") === true && results.length === RETAINED_COUNT && results.every(r => at(r, "ok") === true && at(r, "status") === "completed") && list(at(l, "errors")).length === 0, `batch ${batch + 1}: ${RETAINED_COUNT} retained-context launches must all complete (batch 2 runs 60 s after the turn); launcher A (D14) rests on it`);
     }
     const hooks = at(ob, "hooksForChildren");
-    check(o, "C14/D14", at(hooks, "childPromptCanTriggerTool") === true && Number(at(hooks, "harnessHookRecordsForChildren")) > 0 && at(hooks, "routerGuardsOrGrantsRan") === true && list(at(hooks, "perChild")).length === RETAINED_COUNT * 2 && list(at(hooks, "perChild")).every(c => list(at(c, "probeBefore")).some(b => at(b, "tool") === "read")), "the retained-context children's own tool calls must fire the router's and the probe's hooks, with permission evaluation, for every child");
+    check(o, "C14/D14", at(hooks, "childPromptCanTriggerTool") === true && Number(at(hooks, "harnessHookRecordsForChildren")) > 0 && list(at(hooks, "perChild")).length === RETAINED_COUNT * 2 && list(at(hooks, "perChild")).every(c => list(at(c, "probeBefore")).some(b => at(b, "tool") === "read")), "the retained-context children's own tool calls must fire the tool hooks (the probe's execute.before, the harness probe's records) for every child; the router-only part is asserted separately through the guard refusals");
     check(o, "C14/D14", at(hooks, "subagentHooksOnRootAfterCapture") === 0, "a retained-context launch must fire no subagent hook on the root");
-    check(o, "C14/O3", at(ob, "concurrency", "peakOverlapBatch1") === RETAINED_COUNT, `O3: ${RETAINED_COUNT} retained children must run concurrently (peak overlap ${RETAINED_COUNT}); if the host caps lower, clamp D13/D14 maxParallel to the observed peak (${String(at(ob, "concurrency", "peakOverlapBatch1"))})`);
+    check(o, "C14/O3", at(ob, "concurrency", "allParked") === true && at(ob, "concurrency", "peakWaiting") === RETAINED_COUNT && at(ob, "concurrency", "parkedSessions") === RETAINED_COUNT, `O3: all ${RETAINED_COUNT} retained children's first provider requests must be waiting at once (peakWaiting ${RETAINED_COUNT}, held by Gates until all arrived); if the host caps lower, clamp D13/D14 maxParallel to the observed peak (${String(at(ob, "concurrency", "peakWaiting"))})`);
+    // QA-0.1-2: the router's own effect on retained children (enforced mode), measured against the control host without the router, for EVERY child of both batches.
+    const children = list(at(ob, "childContract"));
+    const control = list(at(ob, "control", "children"));
+    const wire = "claude-sonnet-5-5";
+    check(o, "C14/D14", children.length === RETAINED_COUNT * 2 && children.every(c => at(c, "session", "agent") === CHILD), `every retained child (${RETAINED_COUNT * 2}) must run with the requested non-default agent ${CHILD} (session.get agent); D14 binds role/agent at launch`);
+    check(o, "C14/D14", children.every(c => same(at(c, "wireModels"), [wire]) && same(at(c, "catalogModels"), [`${SONNET}#low`])), `every retained child must run on the requested model (${SONNET}#low): the provider request body model and the host's catalog model header must match; D14 binds the model at launch`);
+    check(o, "C14/D14", children.every(c => Number(at(c, "readHooksBefore")) >= 1), "every retained child's own `read` call must pass the tool hooks (execute.before)");
+    check(o, "C14/D14", children.every(c => Number(at(c, "routerRefusals")) >= 1), "D14 guards: with the router ENFORCED, every retained child's repeated identical `read` calls must meet a router guard refusal (`DENIED: …` in the tool result); if not, the router's guards do not apply to children launched with a retained context and D14's six guards must be re-decided (compare control.children)");
+    check(o, "C14/D14", control.length === LIGHT_COUNT && control.every(c => Number(at(c, "routerRefusals")) === 0 && Number(at(c, "toolResults")) === RETAINED_READS && at(c, "session", "agent") === CHILD), `control host WITHOUT the router: the same launch must show no refusal and all ${RETAINED_READS} reads must succeed (the refusal above is therefore the router's)`);
     check(o, "C14/D14", at(ob, "parentHistory", "unchangedAcrossLaunches") === true, "the parent's history must get no message from retained-context launches");
   },
   C14b: o => {
