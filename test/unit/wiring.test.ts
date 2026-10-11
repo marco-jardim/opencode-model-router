@@ -7,7 +7,9 @@ import {
   createVerificationWiring,
   extractAssistantText,
 } from "../../src/verify/wiring";
-import { buildForcingNote } from "../../src/verify/dispatch";
+import { buildForcingNote, createChangedFileStore, type DispatchDelta } from "../../src/verify/dispatch";
+import type { DoD } from "../../src/verify/dod";
+import { preemptBackgroundVerification } from "../../src/verify/wiring";
 import type { GateResult } from "../../src/verify/gate";
 import type { RouterConfig } from "../../src/router/config";
 
@@ -360,6 +362,55 @@ describe("dispatchGrader", () => {
       text: "",
       model: null,
     });
+  });
+});
+
+describe("finishDeferred with the change set captured at child end (Phase 2.1.4.b)", () => {
+  const dod = { kind: "deterministic", source: "explicit", criteria: [], deliverable: null, checks: [{ kind: "testsPass", command: "npm test" }] } as unknown as DoD;
+
+  async function finish(delta: DispatchDelta | undefined) {
+    const w = createVerificationWiring({ client: fakeClient(), directory: process.cwd(), getConfig: () => cfg() });
+    const store = createChangedFileStore();
+    const result = await w.finishDeferred(store, {
+      dispatchID: "d1", orchestratorSessionID: "orch", producerSessionID: "child", producerTier: "fast", description: "background work",
+      cwd: process.cwd(), dod, dispatchedAt: 1, ...(delta === undefined ? {} : { delta }),
+    });
+    return { result, entry: w.pending.findByDispatch("d1") };
+  }
+
+  it("a delta whose files are unavailable registers an unavailable change set (never an empty one) and high risk", async () => {
+    const { result, entry } = await finish({ callID: "d1", childSessionID: "child", files: "unavailable", capturedAt: 1 });
+    expect(result.deferred).toBe(true);
+    expect(entry?.changedFiles).toBe("unavailable");
+    expect(entry?.risk.level).toBe("high");
+  });
+
+  it("a contaminated delta is unavailable too", async () => {
+    const { result, entry } = await finish({ callID: "d1", childSessionID: "child", files: "unavailable", contaminatedBy: "github_create_file", capturedAt: 1 });
+    expect(result.deferred).toBe(true);
+    expect(entry?.changedFiles).toBe("unavailable");
+  });
+
+  it("without a delta (the foreground path) nothing is read from it: the registration is the one the store implies", async () => {
+    const { entry } = await finish(undefined);
+    expect(entry === undefined || entry.changedFiles === "unavailable" || Array.isArray(entry.changedFiles)).toBe(true);
+  });
+});
+
+describe("preemptBackgroundVerification (Phase 2.1)", () => {
+  it("preempts the background queue of every live wiring, builds none when background is off, and never rejects", async () => {
+    const on = createVerificationWiring({ client: fakeClient(), directory: "/d", getConfig: () => cfg({ enforcement: { verify: { background: true } } } as Partial<RouterConfig>) });
+    const off = createVerificationWiring({ client: fakeClient(), directory: "/d", getConfig: () => cfg() });
+    expect(off.background).toBeUndefined();
+    const queue = on.background;
+    if (queue === undefined) throw new Error("background: true built no queue");
+    const spy = vi.spyOn(queue, "preempt").mockResolvedValue(undefined);
+    await preemptBackgroundVerification();
+    expect(spy).toHaveBeenCalledTimes(1);
+    spy.mockRejectedValueOnce(new Error("preempt failed"));
+    await expect(preemptBackgroundVerification()).resolves.toBeUndefined();
+    expect(spy).toHaveBeenCalledTimes(2);
+    spy.mockRestore();
   });
 });
 

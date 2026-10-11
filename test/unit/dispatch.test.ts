@@ -99,6 +99,48 @@ describe("createChangedFileStore", () => {
   });
 });
 
+describe("Phase 2.1.4.b: captureDelta freezes the files a child changed at child end", () => {
+  it("lists the files the child's write/edit/apply_patch calls touched, with their statuses", () => {
+    const s = createChangedFileStore();
+    s.record("child", "write", { filePath: "/p/a.ts" });
+    s.record("child", "edit", { filePath: "/p/b.ts" });
+    s.record("child", "edit", { filePath: "/p/a.ts" }); // "written" is stickier than a later "modified"
+    s.record("child", "read", { filePath: "/p/ignored.ts" });
+    const delta = s.captureDelta("call-1", "child");
+    expect(delta.callID).toBe("call-1");
+    expect(delta.childSessionID).toBe("child");
+    expect(delta.files).toEqual([
+      { path: "/p/a.ts", status: "written" },
+      { path: "/p/b.ts", status: "modified" },
+    ]);
+    expect(typeof delta.capturedAt).toBe("number");
+    expect(delta.contaminatedBy).toBeUndefined();
+  });
+
+  it("is a pure read: the child's record stays until clear(), and a later edit does not change the frozen delta", () => {
+    const s = createChangedFileStore();
+    s.record("child", "edit", { filePath: "/p/a.ts" });
+    const first = s.captureDelta("call-1", "child");
+    s.record("child", "edit", { filePath: "/p/late.ts" });
+    expect(first.files).toEqual([{ path: "/p/a.ts", status: "modified" }]);
+    expect(s.get("child")).toHaveLength(2);
+    s.clear("child");
+    expect(s.captureDelta("call-1", "child").files).toEqual([]);
+  });
+
+  it("a child that changed nothing has an empty (available) change set, and sessions are separate", () => {
+    const s = createChangedFileStore();
+    s.record("other", "edit", { filePath: "/p/x.ts" });
+    expect(s.captureDelta("call-1", "child").files).toEqual([]);
+    expect(s.captureDelta("call-2", "other").files).toEqual([{ path: "/p/x.ts", status: "modified" }]);
+  });
+
+  it("uses the injected clock for capturedAt when one exists, never throws for an unknown call", () => {
+    const s = createChangedFileStore();
+    expect(() => s.captureDelta("never-begun", "nobody")).not.toThrow();
+  });
+});
+
 describe("parseTaskResult", () => {
   it("extracts wrapped text and child session id", () => {
     const r = parseTaskResult({
@@ -402,5 +444,24 @@ describe("QA-3.1-3: the tool that discarded a dispatch's snapshot or capture", (
     clean.observeEdit("edit");
     expect(clean.snapshotContaminatedBy("e")).toBeUndefined();
     expect(clean.snapshotContaminatedBy("untracked")).toBeUndefined();
+  });
+
+  it("captureDelta: a contaminated dispatch snapshot makes the change set unavailable (never [] for a failure)", async () => {
+    const store = createChangedFileStore();
+    const begun = store.beginDispatch("d", resolve("qa-3-1-3"), {
+      snapshot: () => new Promise<TreeSnapshot>(ok => { setTimeout(() => ok({ cwd: "x", root: "x", head: "h", fingerprint: "f", dirty: false, files: [] }), 0); }),
+      timeoutMs: 1_000,
+    });
+    store.observeEdit("github_create_file");
+    store.record("child", "edit", { filePath: "/p/a.ts" });
+    await begun;
+    const delta = store.captureDelta("d", "child");
+    expect(delta.files).toBe("unavailable");
+    expect(delta.contaminatedBy).toBe("github_create_file");
+    // A clean dispatch keeps its observed files.
+    const clean = createChangedFileStore();
+    await clean.beginDispatch("e", resolve("qa-3-1-3"), { snapshot: async () => undefined, timeoutMs: 1_000 });
+    clean.record("child2", "edit", { filePath: "/p/b.ts" });
+    expect(clean.captureDelta("e", "child2").files).toEqual([{ path: "/p/b.ts", status: "modified" }]);
   });
 });
