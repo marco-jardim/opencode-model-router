@@ -10,6 +10,8 @@
  *   CPX_PROBE_MODE         at most one mutation mode (unset / empty: observe only). An unknown value records a "probe-error"
  *                          line and the probe observes only.
  *   CPX_PROBE_RELAUNCH_MS  retained-launch only: launch a second batch of three children this many ms after the first.
+ *   CPX_PROBE_CHILD_PROMPT retained-launch only, optional: prompt of the launched children, `{n}` replaced by the child number
+ *                          (1..3). Unset: "CPX_RETAINED_CHILD <n>". Lets a harness script a tool call in the children's own turn.
  *   CPX_PROBE_TOOL_URL     retained-launch only, optional: file URL of a module exporting `tool` (from @opencode-ai/plugin),
  *                          used to build the input schema of `cpx_probe_capture` when the bare specifier does not resolve.
  *
@@ -402,6 +404,9 @@ export default {
       }
     };
 
+    const childPromptTemplate = process.env.CPX_PROBE_CHILD_PROMPT;
+    const childPrompt = (n) => (childPromptTemplate && childPromptTemplate.length > 0 ? childPromptTemplate.split("{n}").join(String(n)) : `CPX_RETAINED_CHILD ${n}`);
+
     const launchBatch = async (parentID, context, label) => {
       batchNo += 1;
       const batch = batchNo;
@@ -424,10 +429,10 @@ export default {
         const timer = setTimeout(() => controller.abort(), 300000);
         timer.unref();
         let childID;
-        rec("retained-launch-attempt", { batch, n, id, label, parentID, agent: chosen.agent, description: `cpx-retained-${n}` });
+        rec("retained-launch-attempt", { batch, n, id, label, parentID, agent: chosen.agent, description: `cpx-retained-${n}`, prompt: cut(childPrompt(n), 300) });
         try {
           const result = await native.execute(
-            { agent: chosen.agent, description: `cpx-retained-${n}`, prompt: `CPX_RETAINED_CHILD ${n}`, background: false },
+            { agent: chosen.agent, description: `cpx-retained-${n}`, prompt: childPrompt(n), background: false },
             {
               ...context,
               signal: controller.signal,

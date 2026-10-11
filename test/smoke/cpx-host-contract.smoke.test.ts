@@ -87,11 +87,17 @@ async function writeProbePlugin(out: string, mode: ProbeMode | undefined, extraE
   const plugin = path.join(dir, "cpx-probe");
   await mkdir(plugin, { recursive: true });
   await writeFile(path.join(plugin, "package.json"), JSON.stringify({ name: "cpx-probe", type: "module", exports: { ".": "./server.mjs", "./server": "./server.mjs" } }));
+  await writeProbeServer(plugin, out, mode, extraEnv);
+  return plugin;
+}
+/** (Re)writes `server.mjs` of a wrapped probe: the env preamble, then the unchanged probe source. */
+async function writeProbeServer(plugin: string, out: string, mode: ProbeMode | undefined, extraEnv: Readonly<Record<string, string>>): Promise<void> {
   const env: Record<string, string> = { CPX_PROBE_OUT: out, ...(mode ? { CPX_PROBE_MODE: mode } : {}), ...extraEnv };
   const header = Object.entries(env).map(([name, value]) => `process.env.${name} = ${JSON.stringify(value)};`).join("\n");
   await writeFile(path.join(plugin, "server.mjs"), `${header}\n${await readFile(PROBE_SOURCE, "utf8")}`);
-  return plugin;
 }
+/** Probe env that needs the host's project directory (known only once the host root exists): resolved in `HostOptions.prepare`, before the host process starts. */
+type ProbeEnv = Readonly<Record<string, string>> | ((project: string) => Readonly<Record<string, string>>);
 
 /** Reads a probe JSON-lines file (missing: no lines). A torn last line (write in flight) is skipped; any other error propagates. */
 async function probeLines(file: string): Promise<ProbeLine[]> {
@@ -121,11 +127,15 @@ interface Observation { observed: Obj; relied: ProbeLine[]; hosts: Obj[] }
 interface Scenario { host: RoutingHost; probeFile: string; tag: string }
 
 /** Starts one host (probe + CpxFront), runs `body`, records the probe summary of the host, ALWAYS stops the host. */
-async function withHost(tag: string, mode: ProbeMode | undefined, o: Observation, body: (s: Scenario) => Promise<void>, options: HostOptions = BASE, probeEnv: Readonly<Record<string, string>> = {}): Promise<void> {
+async function withHost(tag: string, mode: ProbeMode | undefined, o: Observation, body: (s: Scenario) => Promise<void>, options: HostOptions = BASE, probeEnv: ProbeEnv = {}): Promise<void> {
   const probeFile = path.join(await obsDir(), `${tag}-${RUN_ID}.probe.jsonl`);
   await writeFile(probeFile, "");
-  const plugin = await writeProbePlugin(probeFile, mode, probeEnv);
-  const host = await RoutingHost.start(`cpx-${tag.toLowerCase()}`, { ...options, extraPlugins: [...(options.extraPlugins ?? []), plugin], provider: options.provider ?? {} });
+  const plugin = await writeProbePlugin(probeFile, mode, typeof probeEnv === "function" ? {} : probeEnv);
+  const prepare: HostOptions["prepare"] = async dirs => {
+    await options.prepare?.(dirs);
+    if (typeof probeEnv === "function") await writeProbeServer(plugin, probeFile, mode, probeEnv(dirs.project));
+  };
+  const host = await RoutingHost.start(`cpx-${tag.toLowerCase()}`, { ...options, prepare, extraPlugins: [...(options.extraPlugins ?? []), plugin], provider: options.provider ?? {} });
   try {
     await waitForProbe(probeFile, `the cpx-probe plugin to load (${tag})`, lines => lines.find(l => l.kind === "loaded"), 30_000);
     await body({ host, probeFile, tag });
@@ -961,13 +971,21 @@ d("C13 concurrent background children, host cap, parent interrupt", () => {
 // ---------------------------------------------------------------------------- C14 ----
 interface Span { from: number; to: number }
 const peakOverlap = (spans: readonly Span[]): number => Math.max(0, ...spans.map(a => spans.filter(b => b.from <= a.from && a.from < b.to).length));
-const RETAINED_ENV = { CPX_PROBE_TOOL_URL: pathToFileURL(path.join(ROOT, "node_modules", "@opencode-ai", "plugin", "dist", "tool.js")).href, CPX_PROBE_RELAUNCH_MS: "60000" };
+const RETAINED_NAME = "cpx-retained.txt";
+/** Prompt of the retained-launch children (probe `{n}` = child number): the RoutingProvider marker `READ_ONLY_PROBE=<json>` makes the fixture answer with a `read` call. */
+const retainedPrompt = (file: string): string => `CPX_RETAINED_CHILD {n} READ_ONLY_PROBE=${JSON.stringify({ tool: "read", input: { path: file } })}`;
+/** Probe env of C14; the child prompt names a file of the host's project, so it is resolved in `prepare` (see {@link ProbeEnv}). */
+const retainedEnv: ProbeEnv = project => ({
+  CPX_PROBE_TOOL_URL: pathToFileURL(path.join(ROOT, "node_modules", "@opencode-ai", "plugin", "dist", "tool.js")).href, CPX_PROBE_RELAUNCH_MS: "60000",
+  CPX_PROBE_CHILD_PROMPT: retainedPrompt(path.join(project, RETAINED_NAME)),
+});
 
 d("C14 launch with a retained tool context outside any LLM tool call", () => {
   it("captures the context in cpx_probe_capture, ends the turn, and records the probe's launches (now and 60 s later)", async () => {
     await observeContract("C14", async o => {
       await withHost("C14", "retained-launch", o, async s => {
         const { host } = s;
+        const retainedFile = path.join(host.project, RETAINED_NAME);
         const { arrivals } = instrument(host);
         host.provider.holdMarked("CPX_RETAINED_CHILD", 3_000);
         const root = await host.newRoot("C14 root");
@@ -1000,16 +1018,45 @@ d("C14 launch with a retained tool context outside any LLM tool call", () => {
           peakOverlapAllChildren: peakOverlap(holds.map(h => ({ from: h.arrivedAt, to: h.releasedAt ?? Number.POSITIVE_INFINITY }))),
           peakOverlapBatch1: peakOverlap(holds.filter(h => h.arrivedAt < (byBatch(2).find(l => l.kind === "retained-launch-batch")?.t ?? Number.POSITIVE_INFINITY)).map(h => ({ from: h.arrivedAt, to: h.releasedAt ?? Number.POSITIVE_INFINITY }))),
         };
-        const childHooks = lines.filter(l => (l.kind === "execute.before" || l.kind === "execute.after") && typeof l.sessionID === "string" && childIDs.includes(l.sessionID));
+        const toolLines = lines.filter(l => (l.kind === "execute.before" || l.kind === "execute.after") && typeof l.sessionID === "string" && childIDs.includes(l.sessionID));
         const harnessHooks = (await host.hooks()).filter(h => childIDs.includes(h.sessionID));
+        const hostEvents = await host.events();
+        const decisions = await host.decisionRows();
+        const sentInput = { path: retainedFile };
+        // The child's prompt makes the fixture emit a `read` call (READ_ONLY_PROBE marker) in the child's own turn: those calls pass through the router's hooks
+        // (loaded first), then this file's probe, then the harness probe (loaded last, so it sees what the earlier hooks left).
+        const perChild = childIDs.map(id => {
+          const probe = toolLines.filter(l => l.sessionID === id);
+          const harness = harnessHooks.filter(h => h.sessionID === id);
+          const mine = front(host).requests.filter(r => hdr(r, "x-proof-session") === id && hdr(r, "x-proof-kind") === "primary");
+          const toolResultRequest = mine.find(r => lastIsToolResult(r));
+          const lifecycleEvents = hostEvents.filter(e => e.type === "probe.lifecycle" && e.sessionID === id);
+          return {
+            sessionID: id, agent: harness[0]?.agent,
+            probeBefore: probe.filter(l => l.kind === "execute.before").map(l => ({ tool: l.tool, argKeys: l.argKeys, args: l.args, agent: l.agent, t: l.t })),
+            probeAfter: probe.filter(l => l.kind === "execute.after").map(l => ({ tool: l.tool, status: l.status, contentText: l.contentText, outputText: l.outputText, error: l.error, t: l.t })),
+            harnessRouterSeen: harness.map(h => ({ hook: h.hook, tool: h.tool, callID: h.callID, agent: h.agent, input: clip(h.input, 400), status: h.status, result: clip(h.result, 600), error: clip(h.error, 400) })),
+            inputUnchangedByRouter: harness.filter(h => h.hook === "before").map(h => json(h.input) === json(sentInput)),
+            permissionEvaluations: lifecycleEvents.filter(e => e.point === "evaluate").map(e => ({ action: e.action, resources: clip(e.resources, 300), effectIn: e.effectIn, effectOut: e.effectOut, messageIn: e.messageIn, denied: e.denied })),
+            firstContext: lifecycleEvents.filter(e => e.point === "context").map(e => ({ agent: e.agent, messageCount: arr(e.messages).length, options: clip(e.options, 300) })),
+            childProviderRequests: mine.map(r => ({ index: r.index, arrivedAt: arrivals.get(r.index), lastIsToolResult: lastIsToolResult(r), toolNames: arr(obj(r.body).tools).map(t => str(obj(t).name)) })),
+            modelGotToolResult: toolResultRequest ? toolResultText(toolResultRequest).slice(0, 300) : null,
+            routerDecisionRows: decisions.filter(row => json(row).includes(id)).length,
+          };
+        });
+        const triggered = perChild.some(c => c.probeBefore.some(b => b.tool === "read"));
         o.observed.hooksForChildren = {
-          childPromptCanTriggerTool: false, why: "the probe's child prompt is the fixed text `CPX_RETAINED_CHILD <n>`; RoutingProvider only scripts tool calls from READ_ONLY_PROBE / SPIKE_* / CHILD_SCRIPT64 markers in a user text, so the children answer plain text",
-          probeHookLinesForChildren: childHooks.length, harnessHookRecordsForChildren: harnessHooks.length, tools: [...new Set([...childHooks.map(l => l.tool), ...harnessHooks.map(h => h.tool)])],
+          childPrompt: retainedPrompt(retainedFile), file: retainedFile,
+          childPromptCanTriggerTool: triggered, probeHookLinesForChildren: toolLines.length, harnessHookRecordsForChildren: harnessHooks.length,
+          tools: [...new Set([...toolLines.map(l => l.tool), ...harnessHooks.map(h => h.tool)])],
+          routerGuardsOrGrantsRan: perChild.some(c => c.permissionEvaluations.length > 0 || c.routerDecisionRows > 0 || c.harnessRouterSeen.some(h => h.hook === "after" && json(h.result).includes("router"))),
+          routerLogLines: host.routerLogLines().slice(-10).map(l => l.slice(0, 300)),
           subagentHooksOnRootAfterCapture: lines.filter(l => (l.kind === "execute.before" || l.kind === "execute.after") && l.tool === "subagent" && l.sessionID === root).length,
+          perChild,
         };
         const kids = await host.children(root);
         o.observed.parentHistory = { ...history, unchangedAcrossLaunches: json(history.afterCaptureTurn) === json(history.afterBatch1) && json(history.afterBatch1) === json(history.afterBatch2), childrenListedUnderRoot: kids.map(k => ({ id: k.id, parentID: k.parentID, agent: k.agent })), session: await sessionState(host, root) };
-      }, BASE, RETAINED_ENV);
+      }, { ...BASE, probe: { lifecycle: true }, prepare: async ({ project }) => { await writeFile(path.join(project, RETAINED_NAME), "retained child read target\n"); } }, retainedEnv);
     });
   }, 900_000);
 });
