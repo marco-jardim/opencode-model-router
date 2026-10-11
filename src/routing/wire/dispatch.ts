@@ -57,6 +57,8 @@ import { resolveRoles, type AuthorityAction, type RoleSpec } from "../../router/
 import { parseVerifyDirectives } from "../../verify/directives";
 import { buildDelegationDoD } from "../../verify/dispatch";
 import { requestedVerificationCwd, verificationScope } from "../roles/work-root";
+import { resolveCheckPlacements } from "../roles/check-placement";
+import { createRepoProbe, readSetPredicate } from "../roles/read-set";
 import { effectiveDetection, effectiveFactsOf, grantFor, tierBounds, type DispatchGrant, type EffectiveDetection } from "../roles/policy";
 import {
   BINDING_NOTES, LOCAL_ACTIONS, currentBinding, evictCall, newDispatchNonce, noncePromptLine, nonceTitleSuffix, registerPending, type Binding,
@@ -719,7 +721,10 @@ export function roleGateDeferred(cfg: RouterConfig, prompt: string, description:
       defaultVerify: budget.defaultVerify, captureWaitMs: budget.captureWaitMs, baselineTimeoutMs: budget.baselineTimeoutMs,
     });
     if (directives.mode !== "deferred") return false;
-    return buildDelegationDoD({ prompt, description }).checks.some((check) => check.kind === "testsPass");
+    const checks = buildDelegationDoD({ prompt, description }).checks;
+    // P2.5 (SD8, interim): a DoD with per-check keys (`cwd=`/`scope=`) is never classified as deferred.
+    if (checks.some((check) => check.cwd !== undefined || check.scope !== undefined)) return false;
+    return checks.some((check) => check.kind === "testsPass");
   } catch {
     return true;
   }
@@ -737,10 +742,17 @@ export function roleGateDeferred(cfg: RouterConfig, prompt: string, description:
  * only the return shows (every change outside the work root, a timeout, a verifier error) does not rewrite the row — its verdict
  * carries the caveat (`[router ⚠ UNVERIFIED …]`) and is never accepted as verified.
  */
-export function roleGateOutsideWorkRoot(workRoot: string | null, prompt: string, description: string, argsCwd?: unknown): boolean {
+export function roleGateOutsideWorkRoot(
+  workRoot: string | null, prompt: string, description: string, argsCwd?: unknown, inReadSet?: (absPath: string) => boolean,
+): boolean {
   if (workRoot === null) return true;
   try {
-    return verificationScope(requestedVerificationCwd(argsCwd, buildDelegationDoD({ prompt, description }).cwd), workRoot).outside;
+    const dod = buildDelegationDoD({ prompt, description });
+    const scope = verificationScope(requestedVerificationCwd(argsCwd, dod.cwd), workRoot);
+    if (scope.outside) return true;
+    // P2.5 (SD4): a check's own `cwd=` / `scope=` must resolve too (inside W, or an absolute path in the read set R `inReadSet`);
+    // one that is refused makes the gate refuse the delegation, so the router's gate cannot back `deterministic`.
+    return resolveCheckPlacements(dod, scope, inReadSet === undefined ? {} : { inReadSet }).refused !== undefined;
   } catch {
     return true;
   }
@@ -1586,6 +1598,22 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
   const showToplevel = async (cwd: string): Promise<string | undefined> =>
     deps.showToplevel !== undefined ? deps.showToplevel(cwd) : (await import("../roles/admission")).gitShowToplevel(cwd);
 
+  // Cross-repo P2.5: the read set R of this dispatch's role session beyond its work root, for the per-check `cwd=` roots the gate
+  // places (the same inputs as the read guard: the dispatching session's working set, `routing.repoParents/Depth/Exclude`, one
+  // cached probe). Undefined when R adds nothing, or on any error: only roots inside W are valid (fail closed).
+  const readSetProbe = createRepoProbe();
+  const readSetFor = (cfg: RouterConfig, orchestratorSessionID: string): ((absPath: string) => boolean) | undefined => {
+    try {
+      const routing = resolveRolesRouting(cfg, "v2");
+      const inSet = readSetPredicate(
+        { parents: routing.repoParents, depth: routing.repoDepth, exclude: routing.repoExclude }, workingSetOf(orchestratorSessionID), readSetProbe,
+      );
+      return inSet === undefined ? undefined : (absPath) => inSet(absPath) !== undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
   // Cross-repo (P1.4): one admission per resolved `{ repoParents, repoDepth, repoExclude }` (it caches its git results for 5 s).
   let admissionMemo: { readonly key: string; readonly service: Pick<AdmissionService, "admit" | "resolve"> } | undefined;
   const admissionFor = async (config: AdmissionConfig): Promise<Pick<AdmissionService, "admit" | "resolve">> => {
@@ -1806,6 +1834,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     const bypassed = deps.isBypassed?.(call.sessionID) === true;
     const env = deps.env === undefined ? {} : { env: deps.env };
     const verifyRoot = verifyRootOf(grant, sessionDirectory, workRootDeps.realpath);
+    const inReadSet = readSetFor(rp.cfg, call.sessionID);
     const routerGate = roleRouterGate({
       cfg: rp.cfg, bypassed, acceptance, ...env,
       // QA-P21-1-2, QA-P21-2 nit 3. QA-G-B-2-1: a carried acceptance is never deferred (its gate runs at the return); its change-set
@@ -1814,12 +1843,12 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       deferred: carried === null
         ? roleGateDeferred(rp.cfg, verifyPrompt, description, { verifyEnabled: deps.routerVerifyEnabled?.() !== false })
         : (carried.baseline === undefined || carried.baseline.changed === "unavailable") && carriedChecksChangeSet(carried.block),
-      outsideWorkRoot: roleGateOutsideWorkRoot(grant.workRoot, verifyPrompt, description, args.cwd), // DF2-F1, QA-P33F1-1-1, nit 3
+      outsideWorkRoot: roleGateOutsideWorkRoot(grant.workRoot, verifyPrompt, description, args.cwd, inReadSet), // DF2-F1, QA-P33F1-1-1, nit 3
     });
     // QA-G-B-7: the gate verifies nothing at all (enforcement off, /bypass, `require: never`, a cwd outside the root it verifies in)
     // → detection `none`.
     const verifies = roleVerificationRuns({
-      cfg: rp.cfg, bypassed, ...env, outsideWorkRoot: roleGateOutsideWorkRoot(verifyRoot, verifyPrompt, description, args.cwd),
+      cfg: rp.cfg, bypassed, ...env, outsideWorkRoot: roleGateOutsideWorkRoot(verifyRoot, verifyPrompt, description, args.cwd, inReadSet),
     });
     const detection = effectiveDetection({ routerGate, claim, acceptance, verifies });
 

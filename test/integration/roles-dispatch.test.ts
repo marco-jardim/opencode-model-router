@@ -23,7 +23,7 @@ import { bind, resetBindingRegistryForTests } from "../../src/routing/roles/bind
 import {
   CARRIED_ACCEPTANCE_NOTE, PIN_OVER_CALLER_REASON, RoleDispatchRefusal, VARIANT_NO_CANDIDATE_REASON, createDispatchRouter, pendingResumeRaise, resetDispatchRouting,
   roleAttemptVerification, type RoleAttemptChanges,
-  roleEscalationAfterFail, roleGateDeferred, roleMaxActions, routedRoleOf, type DispatchRouter, type RouteOutcome,
+  roleEscalationAfterFail, roleGateDeferred, roleGateOutsideWorkRoot, roleMaxActions, routedRoleOf, type DispatchRouter, type RouteOutcome,
 } from "../../src/routing/wire/dispatch";
 import { createEngineRuntime, type EngineRuntime } from "../../src/routing/wire/runtime";
 import { execFileSync } from "node:child_process";
@@ -344,6 +344,55 @@ describe("detection and binding rows", () => {
       [exact.decisionID, "child-e", "note:binding:exact", "exact"],
       [unknown.decisionID, "child-u", "note:binding:unknown", "unknown"],
     ]);
+  });
+});
+
+describe("detection with per-check check roots (P2.5)", () => {
+  const detectionOf = async (world: World, checks: string, opts: { verify?: boolean } = {}): Promise<string | undefined> => {
+    const verify = opts.verify === false ? "" : "VERIFY: required\n";
+    const prompt = `[route class=implement risk=low scope=single needs=edit root=${world.main}]\n${verify}change x\n[acceptance]\n${checks}\n[/acceptance]`;
+    return (await world.router.route(call(world, { agent: "implementer", prompt }))).role!.detection;
+  };
+
+  it("every check root in W → deterministic", async () => {
+    const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+    mkdirSync(join(world.main, "pkg"), { recursive: true });
+    expect(await detectionOf(world, "check: testsPass cwd=pkg\ncheck: fileExists path=x.txt scope=full")).toBe("deterministic");
+  });
+
+  it("a check cwd outside W and outside R → not deterministic", async () => {
+    const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+    const outside = temp("omr-p25-outside-");
+    expect(await detectionOf(world, `check: testsPass cwd=${outside}`)).not.toBe("deterministic");
+    expect(await detectionOf(world, "check: testsPass cwd=../escape")).not.toBe("deterministic");
+  });
+
+  it("an invalid scope= → not deterministic", async () => {
+    const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+    expect(await detectionOf(world, "check: testsPass scope=everything")).not.toBe("deterministic");
+  });
+
+  it("VERIFY:deferred (the default) with per-check keys is not deferred; without keys it is unchanged", async () => {
+    const cfg = config({ delegation: "roles", engine: "static" });
+    const world = makeWorld(cfg);
+    mkdirSync(join(world.main, "pkg"), { recursive: true });
+    const keyed = "[acceptance]\ncheck: testsPass cwd=pkg\n[/acceptance]";
+    const plain = "[acceptance]\ncheck: testsPass\n[/acceptance]";
+    expect(roleGateDeferred(cfg, `change x\n${keyed}`, "")).toBe(false);
+    expect(roleGateDeferred(cfg, `change x\n[acceptance]\ncheck: testsPass scope=full\n[/acceptance]`, "")).toBe(false);
+    expect(roleGateDeferred(cfg, `change x\n${plain}`, "")).toBe(true);
+    expect(await detectionOf(world, "check: testsPass cwd=pkg", { verify: false })).toBe("deterministic");
+    expect(await detectionOf(world, "check: testsPass", { verify: false })).not.toBe("deterministic");
+  });
+
+  it("roleGateOutsideWorkRoot accepts a check root in the read set and refuses it without one", () => {
+    const root = temp("omr-p25-w-");
+    const elsewhere = temp("omr-p25-r-");
+    const prompt = `change x\n[acceptance]\ncheck: testsPass cwd=${elsewhere}\n[/acceptance]`;
+    expect(roleGateOutsideWorkRoot(root, prompt, "")).toBe(true);
+    expect(roleGateOutsideWorkRoot(root, prompt, "", undefined, () => false)).toBe(true);
+    expect(roleGateOutsideWorkRoot(root, prompt, "", undefined, () => true)).toBe(false);
+    expect(roleGateOutsideWorkRoot(root, "change x\n[acceptance]\ncheck: testsPass\n[/acceptance]", "")).toBe(false);
   });
 });
 
