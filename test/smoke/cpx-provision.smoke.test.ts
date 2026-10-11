@@ -273,11 +273,15 @@ describe.skipIf(!RUN)("cpx provisioning smoke (real pnpm and pip)", () => {
     if (provisioner === undefined) throw new Error("the provisioner was not created (see beforeAll)");
     const ws = join(base, "ws-slot");
     cpSync(join(FIXTURES, "pnpm-workspace"), ws, { recursive: true });
-    const tracked = ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "packages/a/package.json"];
+    const tracked = ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "packages/a/package.json", "packages/b/package.json"];
     const d = await provisioner.detect(ws, tracked);
     expect(d).toMatchObject({ managers: ["pnpm"], pnpmWorkspace: true });
     await provisioner.provision(ws, d, { fresh: false });
-    expect(existsSync(join(ws, "node_modules"))).toBe(true);
+    // packages/b depends on "a": "workspace:*" (pnpm-lock.yaml: `a: link:../a`), so a real install links packages/a
+    // into packages/b/node_modules. (A workspace without dependencies leaves no node_modules at all.)
+    const link = join(ws, "packages", "b", "node_modules", "a");
+    expect(existsSync(link), `the workspace link ${link} was not created by the install`).toBe(true);
+    expect(realpathSync.native(link).toLowerCase()).toBe(realpathSync.native(join(ws, "packages", "a")).toLowerCase());
   }, 600_000);
 
   it("a second task reuses the slot without reinstalling (timed)", async () => {

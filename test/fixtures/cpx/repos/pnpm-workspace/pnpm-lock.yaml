@@ -9,3 +9,9 @@ importers:
   .: {}
 
   packages/a: {}
+
+  packages/b:
+    dependencies:
+      a:
+        specifier: workspace:*
+        version: link:../a

@@ -800,6 +800,128 @@ describe("createProvisioner", () => {
     expect(clock.pending()).toBe(0);
   });
 
+  it("a heartbeat write still in flight when the step ends is discarded: no stale temp file, no lock left behind", async () => {
+    const { spawner, provisioner, clock, fs, lock } = setup();
+    const realWrite = fs.writeText.bind(fs);
+    let armed = false;
+    let writeStarted = false;
+    let openWrite: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => { openWrite = resolve; });
+    fs.writeText = async (p, data, o) => {
+      if (armed && p.endsWith(".tmp")) {
+        writeStarted = true;
+        await gate;
+      }
+      await realWrite(p, data, o);
+    };
+    const run = provisioner.provision(slot(1), detection(["uv"]), { fresh: false });
+    await settle();
+    expect(fs.nodes.has(key(lock("uv")))).toBe(true);
+    armed = true;
+    clock.advance(10_000);
+    await settle();
+    expect(writeStarted).toBe(true);
+    spawner.hold = false;
+    spawner.calls[0]?.resolve();
+    await settle();
+    openWrite();
+    await run;
+    expect(fs.nodes.has(key(lock("uv")))).toBe(false);
+    expect([...fs.nodes.keys()].filter(k => k.endsWith(".tmp"))).toEqual([]);
+    expect(clock.pending()).toBe(0);
+  });
+
+  it("refuses to remove a stale dependency directory with more than half a million entries", async () => {
+    const { spawner, provisioner, fs } = setup();
+    const venv = `${slot(1)}${WIN ? "\\" : "/"}.venv`;
+    fs.nodes.set(key(venv), "dir");
+    const realReaddir = fs.readdir.bind(fs);
+    fs.readdir = async (p) => (key(p) === key(venv) ? Array.from({ length: 500_001 }, (_, i) => `f${i}`) : realReaddir(p));
+    spawner.hold = false;
+    await expect(provisioner.provision(slot(1), detection(["poetry"]), { fresh: true })).rejects.toThrow(/more than 500000 entries/);
+    expect(fs.removed).toEqual([]);
+    expect(spawner.calls).toEqual([]);
+  });
+
+  describe("fresh installs clear the old environment", () => {
+    const sep = WIN ? "\\" : "/";
+    const venvOf = (n: number): string => `${slot(n)}${sep}.venv`;
+    /** What was removed besides the manager's own lock file. */
+    const removals = (fs: MemFs): Array<{ path: string; recursive: boolean }> => fs.removed.filter(r => !r.path.endsWith(".lock"));
+
+    it("unlinks links below it without following them, then removes the directory", async () => {
+      const { spawner, provisioner, fs } = setup();
+      const venv = venvOf(1);
+      fs.nodes.set(key(venv), "dir");
+      fs.nodes.set(key(`${venv}${sep}lib`), "dir");
+      fs.nodes.set(key(`${venv}${sep}lib${sep}shared`), "junction");
+      fs.put(`${venv}${sep}lib${sep}mod.py`, "x");
+      const realReaddir = fs.readdir.bind(fs);
+      // A name that vanished between the listing and the stat is skipped.
+      fs.readdir = async (p) => [...await realReaddir(p), ...(key(p) === key(venv) ? ["ghost"] : [])];
+      spawner.hold = false;
+      await provisioner.provision(slot(1), detection(["poetry"]), { fresh: true });
+      expect(removals(fs)).toEqual([
+        { path: `${venv}${sep}lib${sep}shared`, recursive: false },
+        { path: venv, recursive: true },
+      ]);
+    });
+
+    it("removes a link in its place without descending into it", async () => {
+      const { spawner, provisioner, fs } = setup();
+      const venv = venvOf(2);
+      fs.nodes.set(key(venv), "junction");
+      let listed = 0;
+      const realReaddir = fs.readdir.bind(fs);
+      fs.readdir = async (p) => { listed += 1; return realReaddir(p); };
+      spawner.hold = false;
+      await provisioner.provision(slot(2), detection(["poetry"]), { fresh: true });
+      expect(removals(fs)).toEqual([{ path: venv, recursive: false }]);
+      expect(listed).toBe(0);
+    });
+
+    it("does nothing when there is no old environment", async () => {
+      const { spawner, provisioner, fs } = setup();
+      spawner.hold = false;
+      await provisioner.provision(slot(3), detection(["poetry"]), { fresh: true });
+      expect(removals(fs)).toEqual([]);
+    });
+
+    it("goes on when a directory vanishes during the sweep, and fails on any other listing error", async () => {
+      const gone = setup();
+      const venv = venvOf(4);
+      gone.fs.nodes.set(key(venv), "dir");
+      gone.fs.readdir = async (p) => { throw errno("ENOENT", p); };
+      gone.spawner.hold = false;
+      await gone.provisioner.provision(slot(4), detection(["poetry"]), { fresh: true });
+      expect(removals(gone.fs)).toEqual([{ path: venv, recursive: true }]);
+
+      const denied = setup();
+      denied.fs.nodes.set(key(venv), "dir");
+      denied.fs.readdir = async (p) => { throw errno("EACCES", p); };
+      denied.spawner.hold = false;
+      await expect(denied.provisioner.provision(slot(4), detection(["poetry"]), { fresh: true })).rejects.toMatchObject({ code: "EACCES" });
+      expect(removals(denied.fs)).toEqual([]);
+    });
+
+    it("ignores a directory that is already gone when it is removed, and surfaces a failure that is not transient", async () => {
+      const raced = setup();
+      const venv = venvOf(5);
+      raced.fs.nodes.set(key(venv), "dir");
+      raced.fs.rm = async (p) => { throw errno("ENOENT", p); };
+      raced.spawner.hold = false;
+      await raced.provisioner.provision(slot(5), detection(["poetry"]), { fresh: true });
+
+      const broken = setup();
+      broken.fs.nodes.set(key(venv), "dir");
+      let attempts = 0;
+      broken.fs.rm = async (p) => { attempts += 1; throw errno("ENOSPC", p); };
+      broken.spawner.hold = false;
+      await expect(broken.provisioner.provision(slot(5), detection(["poetry"]), { fresh: true })).rejects.toMatchObject({ code: "ENOSPC" });
+      expect(attempts).toBe(1);
+    });
+  });
+
   it("runs two provisions of the same manager one after the other", async () => {
     const { spawner, provisioner, fs, lock } = setup();
     const a = provisioner.provision(slot(1), detection(["uv"]), { fresh: false });

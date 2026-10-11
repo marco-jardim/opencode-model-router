@@ -760,14 +760,14 @@ function record(slot: string, over: Partial<SlotRecord> = {}): SlotRecord {
   };
 }
 
-function seeded(recs: SlotRecord[], dirs: string[] = []): Harness {
+function seeded(recs: SlotRecord[], dirs: string[] = [], maxParallel?: number): Harness {
   const fs = memFs();
   for (const r of recs) fs.put(markerPath(MARKERS, r.planId, r.slot), JSON.stringify(r));
   for (const d of dirs) {
     fs.dir(d);
     fs.put(win32.join(d, "requirements.txt"), "pytest\n");
   }
-  return harness({ fs });
+  return harness({ fs, ...(maxParallel === undefined ? {} : { maxParallel }) });
 }
 
 describe("SlotPool claims that meet a changed slot", () => {
@@ -790,6 +790,68 @@ describe("SlotPool claims that meet a changed slot", () => {
     expect(h.prov.calls).toHaveLength(0);
     expect(h.git.log).toEqual([]);
     expect(slotEnvFor(slotPath("slot-1"), "win32")).toBeNull();
+  });
+});
+
+describe("SlotPool broken slots", () => {
+  it("a failed install breaks the slot in memory even when the broken marker cannot be written", async () => {
+    const h = harness();
+    await h.pool.open();
+    h.prov.error = new Error("install exploded");
+    const realWrite = h.fs.writeText.bind(h.fs);
+    h.fs.writeText = async (p, data, o) => {
+      if (/"state":\s*"broken"/.test(data)) throw errno("ENOSPC", p);
+      return realWrite(p, data, o);
+    };
+    await expect(h.pool.acquire(PLAN, "t1", C1)).rejects.toMatchObject({ code: "E_SLOT_BROKEN" });
+    expect(h.warnings.some(w => w.includes("could not write the broken marker of slot-1"))).toBe(true);
+    // The marker on disk still says provisioning, but the pool no longer hands the slot out.
+    expect(h.marker("slot-1").state).toBe("provisioning");
+    expect(await h.pool.get("slot-1")).toMatchObject({ state: "broken", owner: null });
+    expect(slotEnvFor(slotPath("slot-1"), "win32")).toBeNull();
+  });
+
+  it("with every slot taken, the longest broken one is retired and its number is not reused", async () => {
+    const older = autoClock().iso(Date.parse("2026-10-10T00:00:00.000Z"));
+    const h = seeded([
+      record("slot-1", { state: "broken", owner: null }),
+      record("slot-2", { state: "broken", owner: null, updatedAt: older }),
+    ], [slotPath("slot-1"), slotPath("slot-2")], 2);
+    await h.pool.open();
+    const lease = await h.pool.acquire(PLAN, "t3", C1);
+    expect(lease.slot).toBe("slot-3");
+    expect(h.marker("slot-2")).toMatchObject({ state: "retired", owner: null });
+    expect(h.marker("slot-1").state).toBe("broken");
+  });
+
+  it("broken slots of equal age are retired in slot order", async () => {
+    const h = seeded([
+      record("slot-2", { state: "broken", owner: null }),
+      record("slot-1", { state: "broken", owner: null }),
+    ], [slotPath("slot-1"), slotPath("slot-2")], 2);
+    await h.pool.open();
+    const lease = await h.pool.acquire(PLAN, "t3", C1);
+    expect(lease.slot).toBe("slot-3");
+    expect(h.marker("slot-1").state).toBe("retired");
+    expect(h.marker("slot-2").state).toBe("broken");
+  });
+
+  it("folders without a marker are never adopted: with every slot number taken on disk, acquire reports E_SLOT_UNAVAILABLE", async () => {
+    const h = harness();
+    for (let n = 1; n <= 999; n++) h.fs.dir(slotPath(`slot-${n}`));
+    await h.pool.open();
+    await expect(h.pool.acquire(PLAN, "t1", C1)).rejects.toMatchObject({ code: "E_SLOT_UNAVAILABLE" });
+    expect(h.git.log).toEqual([]);
+    expect(await h.pool.list()).toEqual([]);
+  });
+
+  it("with every slot taken and none broken, acquire reports E_SLOT_UNAVAILABLE", async () => {
+    const h = seeded([
+      record("slot-1", { state: "leased", owner: "t1" }),
+      record("slot-2", { state: "leased", owner: "t2" }),
+    ], [slotPath("slot-1"), slotPath("slot-2")], 2);
+    await h.pool.open();
+    await expect(h.pool.acquire(PLAN, "t3", C1)).rejects.toMatchObject({ code: "E_SLOT_UNAVAILABLE" });
   });
 });
 
