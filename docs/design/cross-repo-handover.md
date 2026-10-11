@@ -24,7 +24,7 @@ Read this first in a new session. The design is `docs/design/cross-repo.md`, and
 |---|---|
 | P0: integrity fixes in the shared verification engine (both hosts) | Done. QA'd twice. Live check: the unobservable-writers caveat appeared on a real dispatch. |
 | P1: v2 roles cross-repo (P1.1–P1.10) | Done. QA'd twice. Docs updated. Live dogfood done (see "Phase 1 live dogfood"). |
-| P2 lot 1: P2a–P2d + P2g (plan `docs/design/cross-repo-phase2-plan.md`) | Done. QA'd twice (round 1: 4 major + 9 minor fixed; round 2: 3 major fixed, minors recorded in design §9). Docs and CHANGELOG updated. **Live dogfood pending** (needs a restart). |
+| P2 lot 1: P2a–P2d + P2g (plan `docs/design/cross-repo-phase2-plan.md`) | Done. QA'd twice (round 1: 4 major + 9 minor fixed; round 2: 3 major fixed, minors recorded in design §9). Docs and CHANGELOG updated. Live dogfood done (see "Phase 2 live dogfood"); findings F-D1, F-D2 wait for the owner. |
 | P2 lot 2: P2e (deferred P), owner decision OD4 | Not started. Until it lands, a dispatch with per-check keys or a perimeter is verified synchronously. |
 | P3 / P4 | Not started |
 
@@ -35,7 +35,7 @@ Last checks (HEAD after the round 2 fixes):
 
 ## Next steps
 
-1. **Owner: restart the dogfood instance** and run the Phase 2 live dogfood (script below).
+1. ~~Phase 2 live dogfood~~: done (see "Phase 2 live dogfood"). Owner decisions Q9 (F-D1) and Q10 (F-D2) are open.
 2. **Owner decision Q8** (design §10): the role dispatch header is emitted for every roles-mode dispatch with a work root. I9 says routing output is unchanged when cross-repo is not configured. Keep it always on, or only when `repoParents`, `repo=`/`branch=`/`root=` is used, or W differs from the session directory?
 3. **Open owner decision Q7:** role agents are registered from a catch-all `*: deny`, so D13 cannot open worktrees outside the parents. The fix would turn the generated catch-all into `ask`; the risk is a background child waiting on a prompt. Do not change this without the owner.
 4. **Phase 2 lot 2 (P2e)**, plan `docs/design/cross-repo-phase2-plan.md`: store P and placements in the pending registration, observe P in the deferred finish, `prepareClaim` sets `prepared.perimeter`, S11 drift caveat, lift the interim rule; fix `noChangeGateSpawnsNothing` with `testScope:"full"` (F13). Own heavy QA after it.
@@ -57,6 +57,27 @@ Run in the restarted dogfood instance, from an orchestrator session in this work
   8. `VERIFY:deferred` with per-check keys: verified at once, no handle.
   9. Tier `medium` with a per-check `cwd=`: unverifiable, "honoured only in roles mode".
   10. A role in this worktree with an untracked failing test and `testsPass ... scope=full`, lib unchanged: the reference has no `external-link` cause (pin exact); "no worse than before" only if `core.autocrlf` is false.
+
+## Phase 2 live dogfood (2026-10-11)
+
+Run in the restarted dogfood instance at HEAD `97fa7fb`..`eb9c78d`, `repoParents: ["D:/git"]`, `core.autocrlf=input`, with the junction `node_modules\omr-xr-dogfood-lib` → `D:\git\omr-xr-dogfood-lib` (removed afterwards with `cmd /c rmdir`; the scratch repository was cleaned).
+
+| # | Dispatch | Result |
+|---|---|---|
+| 1 | `explorer` `repo=opencode-model-router branch=feat/cross-repo` | Pass. The child's prompt starts with `[router] You are @explorer…`, `Working directory: D:\git\opencode-model-router-cross-repo (repository opencode-model-router, branch feat/cross-repo at eb9c78d)…`, `Repositories in this session: opencode-model-router (feat/cross-repo). You may read any repository below D:/git.`, then the separator; nonce last. |
+| 2 | `implementer` `repo=omr-xr-dogfood-lib`, `fileExists` only | Pass. UNVERIFIED: `opencode-model-router at D:\git\opencode-model-router-cross-repo links this work root (node_modules/omr-xr-dogfood-lib) and no check ran there; add a check such as: check: testsPass cwd="D:\git\opencode-model-router-cross-repo" scope=full`. |
+| 3 | Same + `check: run command="node .dogfood-consumer.cjs" expect=value=1 cwd="<this worktree>"` | Pass. `✓ verified`, `verified scope: omr-xr-dogfood-lib (main @ 2d133c4); also observed: opencode-model-router (feat/cross-repo @ eb9c78d)`. (`node -p` is refused by the allowlist; an unquoted `command=` stops at the first space.) |
+| 4 | A failing consumer check | Pass. UNVERIFIED, never FAIL: `a check in another repository (…) failed; … can be neither excused nor attributed: expected substring not found: "1"`. |
+| 5 | Consumer `testsPass` without `scope=full` | Pass. `check 2 (testsPass) runs in another repository (…) and must use scope=full: …`. |
+| 6 | Only a consumer check | Pass. `the change in D:\git\omr-xr-dogfood-lib\index.js is not covered by any check root (D:\git\opencode-model-router-cross-repo); nothing ran`. |
+| 7 | `cwd="C:\Windows"`; `scope=everything` | Pass. `check 2 (fileExists) cwd=C:\Windows is outside the work root D:\git\omr-xr-dogfood-lib and its read set; nothing ran`; `check 1 (fileExists) scope=everything is not affected or full; nothing ran`. |
+| 8 | `VERIFY:deferred` with per-check keys | Pass. Verified at once, no handle. |
+| 9 | Tier `medium` with a per-check `cwd=` | Pass. `check 2 (fileExists) cwd=D:\git\omr-xr-dogfood-lib: a per-check cwd= is honoured only in roles mode; nothing ran`. |
+| 10 | Role in this worktree, an untracked failing test that requires the lib, `testsPass command="npx vitest run <file>" scope=full`, lib untouched | Partial, as planned for autocrlf on: `the dispatch reference is approximate (checkout-conversion)`. The causes list every reason (`baseline.ts:163`), and `external-link` is absent, so the pinned link stayed exact. |
+
+Findings:
+- **F-D1 (medium, owner decision Q9).** A role dispatch whose declared `repo=`/`branch=`/`root=` is refused at admission runs anyway with no work root, and nobody is told: the note is stored on the routed decision (`dispatch.ts:1883`, `:1987`) and the decision row only. The child gets no header, keeps read access in the plugin's directory (`v2-hooks.ts:706` fallback), and its refusals call that fallback "this dispatch's work root". No write is possible (`policy.ts:184-189`), so it is a silent wrong-repository read, not a false pass. Reproduced with `repo=opencode-model-router-cross-repo` (the worktree directory, not the repository name). Options: refuse the dispatch with the note (preferred; flips `roles-dispatch.test.ts:817-830`, `:898` and ROLES.md:179, :268-269), or keep it running and add the note to the result notices and the child's header.
+- **F-D2 (owner decision Q10).** `repo=` takes the repository name only. A delegate fix that also matched a linked worktree's directory name was reverted as a design change; a regression test for the correct form (`repo=<repository> branch=<branch>`, with the session in a linked worktree) was added (`eb9c78d`).
 
 ## Phase 2 lot 1 session notes (2026-10-11)
 
