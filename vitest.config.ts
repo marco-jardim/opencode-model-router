@@ -29,6 +29,14 @@ export const MERGED_PER_FILE_GATED = [
   "src/tui/status-model.ts",
   "src/tui/effort-channel.ts",
 ] as const;
+/**
+ * Directory-prefix gates on the merged report (scripts/coverage-merge.mjs): every merged file under a
+ * prefix (which ends with "/") must meet the declared minimums, functions included, and a prefix that
+ * matches no file fails. Phase 1.4.3 / QA-1.4-9: the executor gate (src/executor/**) is enforced in CI
+ * here, as the glob threshold below is off there (OMR_COVERAGE_ARTIFACT=1) and an exact list would
+ * leave every new executor file ungated.
+ */
+export const MERGED_PREFIX_GATED = [{ prefix: "src/executor/", lines: 90, branches: 90, functions: 90 }] as const;
 
 const mergedGates =
   process.env.OMR_COVERAGE_MERGED === "1"
@@ -70,6 +78,7 @@ export default defineConfig({
         "src/guard/**/*.ts": { branches: 90, lines: 90, functions: 90 },
         "src/verify/**/*.ts": { branches: 90, lines: 90, functions: 90 },
         "src/router/**/*.ts": { branches: 90, lines: 90, functions: 90 },
+        "src/executor/**/*.ts": { branches: 90, lines: 90, functions: 90 },
         "src/escalate/**/*.ts": { branches: 95, lines: 95, functions: 95 },
         "src/telemetry/**/*.ts": { branches: 95, lines: 95, functions: 95 },
         ...mergedGates,
