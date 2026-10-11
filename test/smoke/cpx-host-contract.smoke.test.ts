@@ -20,9 +20,11 @@
  * per scenario, so the config is fixed per host (it also survives `RoutingHost.restart()`).
  *
  * Output: OBS_DIR = `<OMR_CPX_PROBE_DIR | OMR_SMOKE_REAL_TMPDIR | os.tmpdir()>/omr-cpx-probe`. The smoke globalSetup (test/setup/smoke-tmp-guard.ts)
- * points TEMP at a per-run directory it deletes at the end, so the REAL temp directory it recorded is used (same as role-spikes); both
- * paths are written into every C<n>.json (`obsDir`, `vitestTmpdir`). One probe JSON-lines file per host and run:
- * `<OBS_DIR>/<tag>-<runId>.probe.jsonl`; one summary per contract: `<OBS_DIR>/C<n>.json`.
+ * points TEMP at a per-run directory it deletes at the end, so the REAL temp directory it recorded is used (same as role-spikes). Every run
+ * writes into its own directory RUN_DIR = `<OBS_DIR>/<runId>/` (runs never overwrite each other): one probe JSON-lines file per host
+ * (`<RUN_DIR>/<tag>-<runId>.probe.jsonl`) and one summary per contract (`<RUN_DIR>/C<n>.json`). To find the latest run without knowing the
+ * run id: `<OBS_DIR>/latest.json` = `{ runId, runDir }` (the run dir of the most recent contract written) and `<OBS_DIR>/latest/C<n>.json` is
+ * a copy of the most recent summary of each contract. The paths are also written into every C<n>.json (`obsDir`, `runDir`, `vitestTmpdir`).
  */
 import { afterAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
@@ -67,21 +69,32 @@ if (RUN && !BIN) {
 // ----------------------------------------------------------------------- scaffolding ----
 const scratch: string[] = [];
 afterAll(async () => {
-  await stopAllHosts();
-  for (const dir of scratch.splice(0)) await removeDirWhenReleased(dir);
+  // Every cleanup step is attempted even when an earlier one fails; the collected errors are rethrown at the end.
+  const errors: string[] = [];
+  const attempt = async (label: string, step: () => Promise<unknown>): Promise<void> => {
+    try { await step(); } catch (error) { errors.push(`${label}: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`); }
+  };
+  await attempt("stopAllHosts", stopAllHosts);
+  for (const dir of scratch.splice(0)) await attempt(`remove ${dir}`, () => removeDirWhenReleased(dir));
+  if (errors.length > 0) throw new Error(`cpx-host-contract cleanup failed (${errors.length}):\n${errors.join("\n")}`);
 }, 120_000);
 
-/** Directory of the observations (see the file header); created on first use. */
+/** Base directory of the observations (see the file header): `<...>/omr-cpx-probe`. */
+const obsBaseDir = (): string => path.join(process.env.OMR_CPX_PROBE_DIR || process.env.OMR_SMOKE_REAL_TMPDIR || tmpdir(), "omr-cpx-probe");
+/** Directory of THIS run's observations: `<OBS_DIR>/<runId>/`; created on first use. */
 async function obsDir(): Promise<string> {
-  const dir = path.join(process.env.OMR_CPX_PROBE_DIR || process.env.OMR_SMOKE_REAL_TMPDIR || tmpdir(), "omr-cpx-probe");
+  const dir = path.join(obsBaseDir(), RUN_ID);
   await mkdir(dir, { recursive: true });
   return dir;
 }
 
-/** `OPENCODE_V2_BIN --version`: the scenario's host version record. */
+/** `OPENCODE_V2_BIN --version`: the scenario's host version record. Never throws (a spawn failure is recorded as text, so the observation is still written). */
 function hostVersion(): string {
   const result = spawnSync(BIN ?? "", ["--version"], { encoding: "utf8", timeout: 15_000, windowsHide: true });
-  return `${result.stdout.trim()}${result.stderr.trim() ? ` (stderr: ${result.stderr.trim()})` : ""}`;
+  const stdout = String(result.stdout ?? "").trim();
+  const stderr = String(result.stderr ?? "").trim();
+  const spawnError = result.error ? `spawn error: ${result.error.message}` : "";
+  return [stdout, stderr ? `(stderr: ${stderr})` : "", spawnError ? `(${spawnError})` : ""].filter(Boolean).join(" ");
 }
 
 /** The probe wrapped for loading by path: `<tmp>/cpx-probe/{package.json,server.mjs}`; server.mjs = `process.env` assignments + the probe source. */
@@ -94,8 +107,12 @@ async function writeProbePlugin(out: string, mode: ProbeMode | undefined, extraE
   await writeProbeServer(plugin, out, mode, extraEnv);
   return plugin;
 }
-/** (Re)writes `server.mjs` of a wrapped probe: the env preamble, then the unchanged probe source. */
+/** Same pattern as `CREDENTIAL_NAME` in test/smoke/helpers/routing-host.ts (not exported there): env names the harness treats as credentials. Keep in sync. */
+const CREDENTIAL_NAME = /(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|ANTHROPIC|OPENAI|COPILOT|GITHUB|^GH_|GEMINI|GOOGLE|AZURE|AWS_)/i;
+/** (Re)writes `server.mjs` of a wrapped probe: the env preamble, then the unchanged probe source. Refuses (throws) an extra env key that looks like a credential. */
 async function writeProbeServer(plugin: string, out: string, mode: ProbeMode | undefined, extraEnv: Readonly<Record<string, string>>): Promise<void> {
+  const credentialLike = Object.keys(extraEnv).filter(name => CREDENTIAL_NAME.test(name));
+  if (credentialLike.length > 0) throw new Error(`refusing to write credential-like env key(s) into the generated probe server.mjs: ${credentialLike.join(", ")}`);
   const env: Record<string, string> = { CPX_PROBE_OUT: out, ...(mode ? { CPX_PROBE_MODE: mode } : {}), ...extraEnv };
   const header = Object.entries(env).map(([name, value]) => `process.env.${name} = ${JSON.stringify(value)};`).join("\n");
   await writeFile(path.join(plugin, "server.mjs"), `${header}\n${await readFile(PROBE_SOURCE, "utf8")}`);
@@ -151,14 +168,21 @@ async function withHost(tag: string, mode: ProbeMode | undefined, o: Observation
     const lines = await probeLines(probeFile);
     const kinds: Record<string, number> = {};
     for (const line of lines) kinds[line.kind] = (kinds[line.kind] ?? 0) + 1;
-    o.hosts.push({ tag, mode: mode ?? null, probeFile, probeLoaded: (kinds.loaded ?? 0) >= 1, probeKinds: kinds, probeErrors: clip(lines.filter(l => l.kind === "probe-error"), 800), hostErrors: clip(host.errorLines(), 400) });
-    await host.stop();
+    const hostErrors = clip(host.errorLines(), 400);
+    // QA-0.1-14: the teardown result is asserted (a leaked host process / port / scratch root would poison the next scenario) and recorded.
+    let teardown: Obj;
+    try { teardown = { ...(await host.stop()) }; } catch (error) { teardown = { stopError: error instanceof Error ? (error.stack ?? error.message) : String(error) }; }
+    o.hosts.push({ tag, mode: mode ?? null, probeFile, probeLoaded: (kinds.loaded ?? 0) >= 1, probeKinds: kinds, probeErrors: clip(lines.filter(l => l.kind === "probe-error"), 800), hostErrors, teardown });
+    check(o, `${tag.replace(/-.*$/, "")}/teardown`, teardown.stopError === undefined && teardown.rootRemoved === true && teardown.hostPortClosed === true, `${tag}: host.stop() must remove the scratch root and close the host port (rootRemoved=${String(teardown.rootRemoved)}, hostPortClosed=${String(teardown.hostPortClosed)}${teardown.stopError === undefined ? "" : `, stopError=${String(teardown.stopError).slice(0, 300)}`}); a leaked host or directory affects the next scenario`);
   }
 }
 
 /** Runs one contract: `body` fills the observation; the file is written BEFORE any assertion (and also when `body` throws), then
  * the only assertions of this phase: the file exists and the probe loaded in every host. */
 async function observeContract(id: string, body: (o: Observation) => Promise<void>): Promise<void> {
+  // A contract without a DECISIONS entry would pass silently: refuse to run it.
+  const decide: ((o: Observation) => void) | undefined = Object.hasOwn(DECISIONS, id) ? DECISIONS[id] : undefined;
+  if (!decide) throw new Error(`${id}: no entry in the DECISIONS table; every contract needs its decided-branch checks (add DECISIONS.${id})`);
   const startedAt = Date.now();
   const o: Observation = { observed: {}, relied: [], hosts: [], checks: [] };
   let failure: unknown;
@@ -167,15 +191,21 @@ async function observeContract(id: string, body: (o: Observation) => Promise<voi
     o.observed.scenarioError = error instanceof Error ? (error.stack ?? error.message) : String(error);
   }
   if (failure === undefined) {
-    try { DECISIONS[id]?.(o); } catch (error) { check(o, `${id}/checks`, false, `the decided-branch check code itself failed (an observation key is missing or malformed): ${String(error)}`); }
+    try { decide(o); } catch (error) { check(o, `${id}/checks`, false, `the decided-branch check code itself failed (an observation key is missing or malformed): ${String(error)}`); }
   }
   const dir = await obsDir();
+  const base = obsBaseDir();
   const file = path.join(dir, `${id}.json`);
   const record = {
-    contract: id, runId: RUN_ID, recordedAt: new Date().toISOString(), hostVersion: hostVersion(), obsDir: dir, vitestTmpdir: tmpdir(),
+    contract: id, runId: RUN_ID, recordedAt: new Date().toISOString(), hostVersion: hostVersion(), obsDir: base, runDir: dir, vitestTmpdir: tmpdir(),
     durationMs: Date.now() - startedAt, hosts: o.hosts, checks: o.checks, probeLinesRelied: clip(o.relied, 1500), observed: clip(o.observed, 3000),
   };
-  await writeFile(file, `${JSON.stringify(redact(record), null, 2)}\n`);
+  const text = `${JSON.stringify(redact(record), null, 2)}\n`;
+  await writeFile(file, text);
+  // Stable locations for the orchestrator: `<OBS_DIR>/latest/C<n>.json` (copy) and `<OBS_DIR>/latest.json` (the run dir of the most recent write).
+  await mkdir(path.join(base, "latest"), { recursive: true });
+  await writeFile(path.join(base, "latest", `${id}.json`), text);
+  await writeFile(path.join(base, "latest.json"), `${JSON.stringify({ runId: RUN_ID, runDir: dir, recordedAt: new Date().toISOString() }, null, 2)}\n`);
   console.log(`[cpx-host-contract] ${id} observation written to ${file}`);
   if (failure !== undefined) throw failure;
   // Decided branches (ADR 0007): every failed check names its contract/decision; all of them are reported at once.
@@ -792,7 +822,14 @@ d("C10 provider errors: 429, 529 and usage limit", () => {
           const requests = front(host).requests.filter(mine);
           const stored = await host.client.session.context({ sessionID: root });
           const events = (await host.events()).filter(e => obj(e.data).sessionID === root && !/(delta|streamed)/.test(e.type));
+          // D13 provider source: the probe records no `session.step.started`, so it is read from the harness event log: the last one BEFORE the first retry event.
+          const firstRetry = events.findIndex(e => e.type === "session.retry.scheduled");
+          const precedingStep = firstRetry < 0 ? undefined : events.slice(0, firstRetry).filter(e => e.type === "session.step.started").at(-1);
+          const stepStartedBeforeRetry = precedingStep
+            ? { dataKeys: Object.keys(obj(precedingStep.data)), data: clip(precedingStep.data, 600), providerID: str(obj(obj(precedingStep.data).model).providerID), modelID: str(obj(obj(precedingStep.data).model).id) ?? str(obj(obj(precedingStep.data).model).modelID) }
+            : null;
           cases[c.name] = {
+            stepStartedCount: events.filter(e => e.type === "session.step.started").length, stepStartedBeforeRetry,
             kind: c.kind, mode: c.mode, capMs: c.capMs, promptedAt, resetAt: c.kind === "usage-limit" ? new Date(resetAtMs).toISOString() : undefined,
             outcome: stillRetrying ? "still retrying at the cap (faults cleared, root interrupted)" : terminal?.kind, rootIdleAfter: idle === true,
             turnCompleted: json(stored).includes("CHILD_OK"), terminal: terminal ? lineBrief(terminal) : null,
@@ -945,12 +982,21 @@ d("C12 background children in flight across a host restart", () => {
         const aArrival = gates.arrivals.find(a => a.token === "C12_A");
         const aRequest = aArrival ? front(host).requests.find(r => r.index === aArrival.index) : undefined;
         const forwarded = await tryWait("A's request to be forwarded to the fixture", () => (aRequest?.served === "forwarded" ? true : undefined), 15_000);
+        // QA-0.1-6: A is only "finished just before the restart" once its terminal probe line AND its completion envelope in the parent's stored history exist; wait for both.
+        const aID = ids.C12_A;
+        const aTerminalBefore = aID ? await tryWait("child A's terminal probe line before the restart", async () => terminalOf(await probeLines(s.probeFile), aID), 45_000) : undefined;
+        if (aTerminalBefore) o.relied.push(aTerminalBefore);
+        const aEnvelopeBefore = aID ? await tryWait("child A's completion envelope stored in the parent before the restart", async () => { const v = await storedView(host, root); return envelopeStates(v.envelopes).some(e => e.sessionID === aID) ? v : undefined; }, 45_000) : undefined;
         const restartStartedAt = Date.now();
         await host.restart();
         const restartEndedAt = Date.now();
         gates.release("C12_B");
         const bReleasedAt = Date.now();
-        o.observed.timing = { aReleasedAt: releasedAt, aForwarded: forwarded === true, restartStartedAt, restartEndedAt, bReleasedAt, restartMs: restartEndedAt - restartStartedAt, note: "A's request was released and forwarded before restart() was called; restart() kills and relaunches in one call, so the downtime itself cannot be hit" };
+        o.observed.timing = {
+          aReleasedAt: releasedAt, aForwarded: forwarded === true, restartStartedAt, restartEndedAt, bReleasedAt, restartMs: restartEndedAt - restartStartedAt,
+          aTerminalBeforeRestart: aTerminalBefore !== undefined && aTerminalBefore.t < restartStartedAt, aTerminalAt: aTerminalBefore?.t, aEnvelopeStoredBeforeRestart: aEnvelopeBefore !== undefined,
+          note: "A's terminal event and stored completion are awaited before restart() is called; restart() kills and relaunches in one call, so the downtime itself cannot be hit",
+        };
         const perChild: Obj = {};
         for (const t of gates.tokens) {
           const id = ids[t];
@@ -969,8 +1015,16 @@ d("C12 background children in flight across a host restart", () => {
         const woke = await tryWait("a parent request after the restart", () => parentRequests(host, root)[parentRequestsBefore], 30_000);
         const stored = await tryWait("completion envelopes of both children", async () => { const v = await storedView(host, root); return envelopeStates(v.envelopes).length >= 2 ? v : undefined; }, 30_000);
         const after = stored ?? await storedView(host, root);
+        // The wake request (first parent request after the pre-release snapshot) against the restart window; arrival stamps come from `Gates` (front delayMs, same clock).
+        const wakeAt = woke ? gates.stamps.get(woke.index) : undefined;
+        const allParentRequests = parentRequests(host, root);
+        const carriesA = (r: CpxRequest): boolean => envelopeStates(bodyMessages(r)).some(e => e.sessionID === aID);
+        // Wire deliveries of A's completion = parent requests that carry A's envelope although the previous parent request did not (a re-sent history is not a new delivery).
+        const aWireDeliveries = allParentRequests.filter((r, i) => carriesA(r) && (i === 0 || !carriesA(allParentRequests[i - 1]!))).length;
         o.observed.parent = {
-          wokeAfterRestart: woke !== undefined, parentRequestsAfter: parentRequests(host, root).length, parentRequestsBefore,
+          wokeBeforeRestart: wakeAt !== undefined && wakeAt < restartStartedAt, wokeAfterRestart: wakeAt !== undefined && wakeAt >= restartStartedAt, wakeArrivedAt: wakeAt, wakeRequestIndex: woke?.index,
+          aEnvelopesStored: envelopeStates(after.envelopes).filter(e => e.sessionID === aID).length, aWireDeliveries, aWireRequestsCarrying: allParentRequests.filter(carriesA).map(r => r.index),
+          parentRequestsAfter: allParentRequests.length, parentRequestsBefore,
           envelopeStates: envelopeStates(after.envelopes), envelopes: after.envelopes, messageCountAfter: after.messages.length, session: await sessionState(host, root), active: await isActive(host, root),
         };
         o.observed.rootLinesAfterRestart = linesOf(await probeLines(s.probeFile), root).filter(l => l.t >= restartStartedAt).map(lineBrief);
@@ -1183,6 +1237,8 @@ d("C14 launch with a retained tool context outside any LLM tool call", () => {
           const mine = front(host).requests.filter(r => hdr(r, "x-proof-session") === id && hdr(r, "x-proof-kind") === "primary");
           const toolResultRequest = mine.find(r => lastIsToolResult(r));
           const lifecycleEvents = hostEvents.filter(e => e.type === "probe.lifecycle" && e.sessionID === id);
+          const contextTimes = lifecycleEvents.filter(e => e.point === "context").map(e => e.__t).filter((t): t is number => typeof t === "number");
+          const toolTimes = harness.filter(h => h.hook === "before").map(h => h.__t);
           return {
             sessionID: id, agent: harness[0]?.agent,
             probeBefore: probe.filter(l => l.kind === "execute.before").map(l => ({ tool: l.tool, argKeys: l.argKeys, args: l.args, agent: l.agent, t: l.t })),
@@ -1194,6 +1250,10 @@ d("C14 launch with a retained tool context outside any LLM tool call", () => {
             childProviderRequests: mine.map(r => ({ index: r.index, arrivedAt: arrivals.get(r.index), lastIsToolResult: lastIsToolResult(r), toolNames: arr(obj(r.body).tools).map(t => str(obj(t).name)) })),
             modelGotToolResult: toolResultRequest ? toolResultText(toolResultRequest).slice(0, 300) : null,
             routerDecisionRows: decisions.filter(row => json(row).includes(id)).length,
+            // D14: the context hook (agent / model binding) must have run for the child BEFORE its first tool call; `__t` = harness clock (Date.now) of the lifecycle event / hook record.
+            firstContextAt: contextTimes.length > 0 ? Math.min(...contextTimes) : undefined,
+            firstToolAt: toolTimes.length > 0 ? Math.min(...toolTimes) : undefined,
+            firstContextBeforeFirstTool: contextTimes.length > 0 && toolTimes.length > 0 ? Math.min(...contextTimes) < Math.min(...toolTimes) : undefined,
           };
         });
         const triggered = perChild.some(c => c.probeBefore.some(b => b.tool === "read"));
@@ -1431,16 +1491,18 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
     const markerIndex = Number(list(at(first, "markerAt"))[0]);
     check(o, "C5/D4", at(user, "tailLines", 0, "role") === "user" && markerIndex === Number(at(first, "messageCount")) - 1, "the turn-state tail must be a `user` message appended LAST in the request's messages (the host moves nothing after it)");
     check(o, "C5/D4", at(user, "prefix", "messages", "identical") === true && at(user, "prefix", "systemIdentical") === true && at(user, "prefix", "otherFieldsIdentical") === true, "everything before the tail (system, other request fields, earlier messages) must be byte-identical across consecutive requests, or the prompt cache prefix breaks (D4/P4)");
-    // O8 (second breakpoint): the host's automatic policy puts a breakpoint on the final message only (the tail); a manual hint on the last REAL message is
-    // kept as a second breakpoint. Whether the earlier request's bytes survive the moved hint is recorded in variants.userHint.prefix (not asserted).
+    // O8 (second breakpoint), observed on OpenCode v2.0.26: without a manual hint the message breakpoint sits on the tail (last message) only; with a manual
+    // hint on the last REAL message the message breakpoint is on that message and NOT on the tail (the hint replaces the tail breakpoint; wire breakpoints:
+    // system[0], system[4], tools[17] and the last real message). Whether the earlier request's bytes survive the moved hint is recorded in variants.userHint.prefix (not asserted).
     for (const i of [0, 1]) {
-      check(o, "C5/D4/O8", at(user, "breakpoints", i, "onTail") === true && at(user, "breakpoints", i, "onLastReal") === false, `request ${i + 1} without a manual hint: the automatic breakpoint must sit on the tail (last message) only, not on the last real message`);
+      check(o, "C5/D4/O8", at(user, "breakpoints", i, "onTail") === true && at(user, "breakpoints", i, "onLastReal") === false, `request ${i + 1} without a manual hint: the message breakpoint must sit on the tail (last message) only, not on the last real message`);
     }
     const hinted = at(variants, "userHint");
     check(o, "C5/D4/O8", at(hinted, "hintLines", 0, "did") === true, "the probe must be able to put a manual cache hint on the last real message in the context hook");
     for (const i of [0, 1]) {
-      check(o, "C5/D4/O8", at(hinted, "breakpoints", i, "onLastReal") === true && at(hinted, "breakpoints", i, "onTail") === true, `request ${i + 1} with a manual hint: a breakpoint on the last real message must reach the wire together with the automatic tail breakpoint`);
+      check(o, "C5/D4/O8", at(hinted, "breakpoints", i, "onLastReal") === true && at(hinted, "breakpoints", i, "onTail") === false, `request ${i + 1} with a manual hint on the last real message: the message breakpoint must sit on that message and not on the tail (the hint replaces the automatic tail breakpoint)`);
     }
+    check(o, "C5/D4/O8", at(hinted, "wire", "firstMarkerSent") === true && at(hinted, "wire", "secondMarkerSent") === true && at(hinted, "storedHasMarker") === false && at(hinted, "wire", "firstMarkerStillInSecond") === false, "userHint: the tail must still be sent, not stored and absent from the next request when a manual hint is set on the last real message");
   },
   C6: o => {
     const ob = o.observed;
@@ -1494,6 +1556,9 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
       check(o, "C10/D13", at(c, "turnCompleted") === true && at(c, "outcome") === TERMINAL.ok && list(at(c, "stepFailed")).length === 0, `${name}: a single provider fault must be retried by the host and the turn must complete, with no session.step.failed`);
       check(o, "C10/D13", list(at(c, "retryScheduled")).length >= 1 && at(c, "retryScheduled", 0, "error", "status") === status, `${name}: the capacity signal must be session.retry.scheduled with data.error.status ${status}`);
       if (type) check(o, "C10/D13", at(c, "retryScheduled", 0, "error", "type") === type, `${name}: data.error.type must be ${type}`);
+      // ADR 0007 C10 / D13: the provider of a capacity signal comes from the session's preceding `session.step.started` `data.model.providerID`.
+      const providerID = at(c, "stepStartedBeforeRetry", "providerID");
+      check(o, "C10/D13", typeof providerID === "string" && providerID !== "", `${name}: the session.step.started preceding the retry must carry data.model.providerID (D13 reads the provider there; see stepStartedBeforeRetry.dataKeys in C10.json and re-decide the provider source if the field moved)`);
     }
     const overloadType = at(kase("overloaded-once"), "retryScheduled", 0, "error", "type");
     check(o, "C10/D13", overloadType === "provider.internal", "529 retry error.type changed — update D13's signal table");
@@ -1524,7 +1589,11 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
     const envelopes = list(at(ob, "parent", "envelopeStates"));
     check(o, "C12/D16", at(ob, "perChild", "C12_B", "terminal") === null && at(ob, "perChild", "C12_B", "active") === false && same(at(ob, "perChild", "C12_B", "context", "roles"), ["user"]), "a child that was in flight at a host restart must have no terminal event, be inactive and hold only its user message; recovery must re-queue it (if the host now resumes or finishes it, the recovery fallback can be relaxed)");
     check(o, "C12/D16", !envelopes.some(e => at(e, "sessionID") === b), "the parent must get no completion for a child that was in flight at the restart");
-    check(o, "C12/D2", at(ob, "parent", "wokeAfterRestart") === true && envelopes.some(e => at(e, "sessionID") === a && at(e, "state") === "completed"), "the completion of a child that finished just before the restart must be delivered after the restart (D2 dedupes against the persisted store)");
+    check(o, "C12/D2", at(ob, "timing", "aTerminalBeforeRestart") === true && at(ob, "timing", "aEnvelopeStoredBeforeRestart") === true, "scenario precondition: child A's terminal event and its stored completion envelope must exist before restart() is called");
+    // The wake request is classified against the restart window; either side is acceptable, but exactly one, and A's completion is delivered and processed exactly once.
+    check(o, "C12/D2", (at(ob, "parent", "wokeBeforeRestart") === true) !== (at(ob, "parent", "wokeAfterRestart") === true), "the parent must be woken for A's completion exactly once, classified as wokeBeforeRestart xor wokeAfterRestart (see parent.wakeArrivedAt vs timing.restartStartedAt)");
+    check(o, "C12/D2", envelopes.some(e => at(e, "sessionID") === a && at(e, "state") === "completed") && at(ob, "parent", "aEnvelopesStored") === 1, "A's completion must be stored exactly once as `completed` across the restart (D2 dedupes against the persisted store)");
+    check(o, "C12/D2", at(ob, "parent", "aWireDeliveries") === 1, "A's completion must reach the model (a provider request newly carrying A's envelope) exactly once across the restart; a second delivery means the host re-processes a stored completion after a restart and D2 must dedupe");
   },
   C13: o => {
     const ob = o.observed;
@@ -1541,6 +1610,9 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
     const act = at(ob, "parentInterrupt", "background-active");
     check(o, "C13/O4a", at(act, "interrupt", "result", "interrupted") === true, "O4a: interrupting an active root (a held turn) with background children must report interrupted=true");
     check(o, "C13/O4a", at(act, "allEndedAfterRelease") === true && list(at(act, "perChild")).length === 3, "O4a: every background child must reach a terminal event after an active-root interrupt (none may be orphaned); the observed fate is recorded in parentInterrupt.background-active");
+    // O4a resolved in ADR 0007: interrupting an ACTIVE root does not kill its background children; they keep running and finish succeeded.
+    check(o, "C13/O4a", at(act, "afterInterrupt", "activeChildren") === 3, "O4a (ADR 0007): after interrupting an active root all 3 background children must still be active (an active-root interrupt does not kill background children)");
+    check(o, "C13/O4a", list(at(act, "perChild")).length === 3 && list(at(act, "perChild")).every(c => at(c, "terminal", "kind") === TERMINAL.ok), "O4a (ADR 0007): every background child of an interrupted active root must end with session.execution.succeeded");
   },
   C14: o => {
     const ob = o.observed;
@@ -1552,6 +1624,9 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
     const hooks = at(ob, "hooksForChildren");
     check(o, "C14/D14", at(hooks, "childPromptCanTriggerTool") === true && Number(at(hooks, "harnessHookRecordsForChildren")) > 0 && list(at(hooks, "perChild")).length === RETAINED_COUNT * 2 && list(at(hooks, "perChild")).every(c => list(at(c, "probeBefore")).some(b => at(b, "tool") === "read")), "the retained-context children's own tool calls must fire the tool hooks (the probe's execute.before, the harness probe's records) for every child; the router-only part is asserted separately through the guard refusals");
     check(o, "C14/D14", at(hooks, "subagentHooksOnRootAfterCapture") === 0, "a retained-context launch must fire no subagent hook on the root");
+    const perChildHooks = list(at(hooks, "perChild"));
+    check(o, "C14/D14", perChildHooks.length === RETAINED_COUNT * 2 && perChildHooks.every(c => at(c, "routerDecisionRows") === 0), "retained-context launches must leave no router decision row for any child (routerDecisionRows === 0): the router records decisions in subagent tool hooks, which a retained launch never fires");
+    check(o, "C14/D14", perChildHooks.length === RETAINED_COUNT * 2 && perChildHooks.every(c => at(c, "firstContextBeforeFirstTool") === true), "for every retained child the first context hook must run before its first tool call (firstContextAt < firstToolAt); D14 binds role / agent / model in the context hook");
     check(o, "C14/O3", at(ob, "concurrency", "allParked") === true && at(ob, "concurrency", "peakWaiting") === RETAINED_COUNT && at(ob, "concurrency", "parkedSessions") === RETAINED_COUNT, `O3: all ${RETAINED_COUNT} retained children's first provider requests must be waiting at once (peakWaiting ${RETAINED_COUNT}, held by Gates until all arrived); if the host caps lower, clamp D13/D14 maxParallel to the observed peak (${String(at(ob, "concurrency", "peakWaiting"))})`);
     // QA-0.1-2: the router's own effect on retained children (enforced mode), measured against the control host without the router, for EVERY child of both batches.
     const children = list(at(ob, "childContract"));
@@ -1569,6 +1644,8 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
     check(o, "C14b/O4b", at(ob, "setup", "childrenHeld") === true && at(ob, "setup", "rootHeld") === true, "scenario precondition: 3 retained children and the root's turn must be in flight when the root is interrupted");
     check(o, "C14b/O4b", at(ob, "interrupt", "result", "interrupted") === true, "O4b: interrupting an active root must report interrupted=true");
     check(o, "C14b/O4b", at(ob, "launchResults", "allThreeReturned") === true, "O4b: every retained launch must return (ok or error) after an active-root interrupt; none may hang. The fate (killed or finished) is recorded in afterInterrupt / perChild / launchResults");
+    const launches = list(at(ob, "launchResults", "results"));
+    check(o, "C14b/O4b", launches.length === 3 && launches.every(r => at(r, "ok") === true && at(r, "status") === "completed"), "O4b (ADR 0007): every retained launch must return ok with status completed after an active-root interrupt (the interrupt does not abort retained-context launches)");
   },
   C15: o => {
     const ob = o.observed;
@@ -1577,7 +1654,10 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
     // and, when a client API still returns the pre-compaction messages, on the full log (recorded in fullLog; if none does, the snapshot is the evidence).
     check(o, "C15/D3", at(ob, "preCompaction", "hasOriginal") === true && at(ob, "preCompaction", "hasPlaceholder") === false, "before compaction the stored history must hold the original text and no placeholder (the held placeholder is applied per request only)");
     const apiResults = Object.values(at(ob, "fullLog", "apis") as object);
-    check(o, "C15/D3", at(ob, "stored", "hasPlaceholder") === false && apiResults.every(a => at(a, "hasPlaceholder") === false), "the placeholder must not be persisted anywhere: not in the post-compaction context, not in the full message log or export");
+    // O5 (ADR 0007): a full-log API must return the pre-compaction messages; this also makes the `every` below non-vacuous.
+    check(o, "C15/O5", apiResults.some(a => at(a, "status") === "ok" && at(a, "hasOriginal") === true), "O5: at least one full-log client API (message.list / session.export) must answer ok and still hold the original text after compaction; if none does, the stored-original claim rests only on the pre-compaction snapshot and must be re-decided");
+    check(o, "C15/O5", at(ob, "fullLog", "anyApiReturnsPreCompaction") === true, "O5: a full-log API must return the pre-compaction history (fullLog.anyApiReturnsPreCompaction)");
+    check(o, "C15/D3", at(ob, "stored", "hasPlaceholder") === false && apiResults.length > 0 && apiResults.every(a => at(a, "hasPlaceholder") === false), "the placeholder must not be persisted anywhere: not in the post-compaction context, not in the full message log or export");
     check(o, "C15/O5", at(ob, "compaction", "succeeded") === true, "O5: the scripted compaction must succeed (the summary follows the host's template)");
     check(o, "C15/O5", at(ob, "compaction", "requestKind") === "compaction" && at(ob, "compaction", "requestHasPlaceholder") === true && at(ob, "compaction", "requestHasOriginal") === false && typeof at(ob, "compaction", "placeholderLeaf") === "string", "O5: the compaction request body must carry the placeholder (asserted at a leaf path) and not the original");
     check(o, "C15/O5", at(ob, "compaction", "summaryHasOriginal") === false, "O5: the stored compaction summary must not contain the original text");
@@ -1585,6 +1665,7 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
   O6: o => {
     const ob = o.observed;
     check(o, "O6/D15", at(ob, "synthetic", "api", "onClient") === true && at(ob, "synthetic", "tries", 1, "error") === undefined, "client.session.synthetic must exist on the client and accept {sessionID, text, description, metadata, resume}");
+    check(o, "O6/D15", at(ob, "synthetic", "tries", 0, "input", "resume") === false && at(ob, "synthetic", "tries", 0, "error") === undefined && at(ob, "synthetic", "tries", 0, "woke") === false, "O6 (ADR 0007): a synthetic message posted with resume=false must be accepted and must NOT wake an idle parent (no new provider request)");
     check(o, "O6/D15", at(ob, "synthetic", "tries", 1, "woke") === true && at(ob, "synthetic", "tries", 1, "wireCarriesText") === true, "O6: a synthetic message posted with resume=true must wake an idle parent (a new provider request carrying the text); D3 delivery and the D15 wake channel depend on it");
   },
 };

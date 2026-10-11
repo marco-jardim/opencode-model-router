@@ -15,7 +15,7 @@
     "smoke:routing": "cross-env RUN_OC_SMOKE_ROUTING=1 vitest run --config vitest.smoke.config.ts test/smoke/routing-engine.smoke.test.ts",
     "smoke:v2:e2e": "cross-env RUN_OC_SMOKE_V2_E2E=1 vitest run --config vitest.smoke.config.ts test/smoke/v2-provider-e2e.smoke.test.ts",
     "smoke:tui": "cross-env RUN_OC_SMOKE_TUI=1 vitest run --config vitest.smoke.config.ts test/smoke/tui-status.smoke.test.ts",
-    "smoke:cpx": "cross-env RUN_OC_SMOKE_CPX=1 vitest run --config vitest.smoke.config.ts test/smoke/helpers/cpx-scripted-provider test/smoke/cpx-host-contract test/smoke/cpx-cache-prefix test/smoke/cpx-background",
+    "smoke:cpx": "cross-env RUN_OC_SMOKE_CPX=1 vitest run --config vitest.smoke.config.ts test/smoke/helpers/cpx-scripted-provider test/smoke/helpers/routing-host test/smoke/cpx-host-contract test/smoke/cpx-cache-prefix test/smoke/cpx-background",
     "smoke:cpx:provision": "cross-env RUN_OC_SMOKE_CPX=1 vitest run --config vitest.smoke.config.ts test/smoke/cpx-provision",
     "smoke:cpx:e2e": "cross-env RUN_OC_SMOKE_CPX=1 vitest run --config vitest.smoke.config.ts test/smoke/cpx-e2e",
     "routing:stats": "node scripts/routing-stats.ts",
