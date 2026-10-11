@@ -527,8 +527,6 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
     const refused: string[] = [];
     const searched: string[] = [];
     const seen = new Set<string>();
-    /** Locations matched by their worktree's directory name only (Q10), not by the repository's name. */
-    const viaDirectory = new Set<RepoLocation>();
     let visited = 0;
     let capped = false;
     for (const parent of parents) {
@@ -557,16 +555,13 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
           if (seen.has(key)) continue;
           seen.add(key);
           found.push(result.location);
-          if (!byName) viaDirectory.add(result.location);
         }
         if (capped || level === depth) break;
         frontier = frontier.flatMap(scanned);
       }
       if (capped) break;
     }
-    // A worktree directory X of a repository that is itself named X, found below the parents, is that repository: not a second match.
-    const named = new Set(found.filter((location) => !viaDirectory.has(location)).map((location) => text(location.repository)));
-    return { found: found.filter((location) => !viaDirectory.has(location) || !named.has(text(location.repository))), refused, searched, capped };
+    return { found, refused, searched, capped };
   };
 
   /** The worktree of a repository (`worktrees`, git's order) for `branch`, or the only one; admitted (and gated) by `admit`. */
@@ -619,10 +614,15 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
       const admitted = await admit(root, unique([...known, ...named.map((location) => location.repository)]));
       if (!admitted.ok) return admitted;
       const location = admitted.location;
-      if (repo !== undefined && !sameName(location.name, repo)) {
-        const hint = named.length === 1
-          ? ` The repository ${repo} is ${named[0]?.repository ?? ""} — use repo=${repo}${branch === undefined ? "" : ` branch=${branch}`}.`
-          : ` Use repo=${location.name}, or name a worktree of ${repo} with root="<path>".`;
+      // Q10: repo= agrees with the repository's name or with the directory name of this very worktree.
+      if (repo !== undefined && !sameName(location.name, repo) && !sameName(paths.basename(location.worktree), repo)) {
+        const [only] = named;
+        let hint = ` Use repo=${location.name}, or name a worktree of ${repo} with root="<path>".`;
+        if (named.length === 1 && only !== undefined) {
+          hint = sameName(only.name, repo)
+            ? ` The repository ${repo} is ${only.repository} — use repo=${repo}${branch === undefined ? "" : ` branch=${branch}`}.`
+            : ` repo=${repo} is the work root ${only.worktree} (repository ${only.name}) — use root=${only.worktree}, or repo=${location.name} for this worktree.`;
+        }
         return refuse(`root=${root} declares repo=${repo}, but that worktree belongs to repo=${location.name} (${location.repository}): no work root.${hint}`);
       }
       if (branch !== undefined && location.branch !== branch) return refuse(branchMismatch(root, location, branch));
@@ -641,7 +641,7 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
       if (found.length > 1) {
         // Q10: a match by a worktree's directory name is a work root, not a repository: list each as path, repository and branch.
         if (found.some((location) => !sameName(location.name, repo))) {
-          const roots = found.map((location) => `${location.worktree} (repository ${location.name}, branch ${location.branch ?? `detached at ${short(location.head)}`})`);
+          const roots = found.map((location) => `${location.worktree} (repository ${location.name}, ${location.branch !== null ? `branch ${location.branch}` : `detached at ${short(location.head)}`})`);
           return refuse(`repo=${repo} matches ${String(found.length)} work roots: ${joinAnd(roots)}: no work root. Name one with root="<path>".`);
         }
         return refuse(`repo=${repo} matches ${String(found.length)} repositories: ${joinAnd(found.map((location) => location.repository))}: no work root. Name one with root="<path>".`);

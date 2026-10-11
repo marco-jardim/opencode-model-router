@@ -371,10 +371,59 @@ describe("Q10 (real git): repo= also matches the directory name of a linked work
     git(join(parent, "a1"), "worktree", "add", "-q", "-b", "a-twin", join(parent, "twin"));
     repo(join(parent, "b1"));
     git(join(parent, "b1"), "worktree", "add", "-q", "-b", "b-twin", join(parent, "org", "twin"));
+    // A worktree directory c-wt of repository c1 (a unique name).
+    repo(join(parent, "c1"));
+    git(join(parent, "c1"), "worktree", "add", "-q", "-b", "c-branch", join(parent, "c-wt"));
+    // Two detached worktree directories named dtwin, of different repositories.
+    repo(join(parent, "dt1"));
+    git(join(parent, "dt1"), "worktree", "add", "-q", "--detach", join(parent, "dtwin"));
+    repo(join(parent, "dt2"));
+    git(join(parent, "dt2"), "worktree", "add", "-q", "--detach", join(parent, "org", "dtwin"));
   }, 120_000);
 
   afterAll(() => {
     if (base !== "") rmSync(base, { recursive: true, force: true });
+  });
+
+  it("admits root= + repo= when repo= is the directory name of that very worktree (or its repository name)", async () => {
+    const admission = createAdmission(config(), defaultAdmissionDeps());
+    const wt = join(parent, "lib-wt");
+    expect(await admission.resolve({ root: wt, repo: "lib-wt" }, session())).toMatchObject({ ok: true, location: { name: "lib-main", worktree: wt, branch: "wt-branch" } });
+    expect(await admission.resolve({ root: wt, repo: "lib-wt", branch: "wt-branch" }, session())).toMatchObject({ ok: true, location: { worktree: wt } });
+    expect(await admission.resolve({ root: wt, repo: "lib-main" }, session())).toMatchObject({ ok: true, location: { worktree: wt } });
+  });
+
+  it("refuses root= + repo= naming the directory of another worktree, with a hint that never suggests the refused name", async () => {
+    const admission = createAdmission(config(), defaultAdmissionDeps());
+    const wt = join(parent, "lib-wt");
+    const cwt = join(parent, "c-wt");
+    const result = await admission.resolve({ root: wt, repo: "c-wt" }, session());
+    expect(result).toEqual({
+      ok: false,
+      reason: `root=${wt} declares repo=c-wt, but that worktree belongs to repo=lib-main (${join(parent, "lib-main")}): no work root. repo=c-wt is the work root ${cwt} (repository c1) — use root=${cwt}, or repo=lib-main for this worktree.`,
+    });
+    // An ambiguous directory name (two repositories have a worktree twin) falls back to the repository name of the root.
+    expect(await admission.resolve({ root: wt, repo: "twin" }, session())).toEqual({
+      ok: false,
+      reason: `root=${wt} declares repo=twin, but that worktree belongs to repo=lib-main (${join(parent, "lib-main")}): no work root. Use repo=lib-main, or name a worktree of twin with root="<path>".`,
+    });
+    // The main checkout of the same repository is not the worktree lib-wt either.
+    const main = await admission.resolve({ root: join(parent, "lib-main"), repo: "lib-wt" }, session());
+    expect(main.ok).toBe(false);
+    const reason = main.ok ? "" : main.reason;
+    expect(reason).toContain("belongs to repo=lib-main");
+    expect(reason).toContain("repo=lib-main for this worktree");
+    expect(reason).not.toContain("use repo=lib-wt");
+  });
+
+  it("renders a detached worktree in an ambiguity list as detached at <sha7>", async () => {
+    const sha = (dir: string): string => git(dir, "rev-parse", "HEAD").slice(0, 7);
+    const result = await createAdmission(config(), defaultAdmissionDeps()).resolve({ repo: "dtwin" }, session());
+    expect(result).toEqual({
+      ok: false,
+      reason: `repo=dtwin matches 2 work roots: ${join(parent, "dtwin")} (repository dt1, detached at ${sha(join(parent, "dt1"))}) and ${join(parent, "org", "dtwin")} (repository dt2, detached at ${sha(join(parent, "dt2"))}): no work root. Name one with root="<path>".`,
+    });
+    expect(result.ok ? "" : result.reason).not.toContain("branch detached");
   });
 
   it("binds the linked worktree whose directory is named X", async () => {
