@@ -924,3 +924,211 @@ describe("runDeterministic — secret scrubbing", () => {
     expect(verdict.reasons.join(" ")).not.toContain(secret);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Cross-repo P2.4: per-check placements
+// ---------------------------------------------------------------------------
+
+describe("runDeterministic — per-check placements (P2.4)", () => {
+  const OTHER = "/other/repo";
+  const here = { cwd: "/fake/cwd", top: "/fake/cwd", foreign: false } as const;
+  const home = { cwd: OTHER, top: OTHER, foreign: false } as const;
+  const foreign = { cwd: OTHER, top: OTHER, foreign: true } as const;
+  const norm = (p: string): string => p.replace(/\\/g, "/");
+  const ranWith = (code: number): CommandOutcome => ({ kind: "ran", exec: { code, stdout: "", stderr: "" }, notes: [] });
+
+  /** Records the cwd every exec / fileExists / readFile saw. */
+  function spies(code = 0) {
+    const execCwds: (string | undefined)[] = [];
+    const paths: string[] = [];
+    const deps: Partial<DeterministicDeps> = {
+      exec: async (_cmd, opts) => { execCwds.push(opts?.cwd); return { code, stdout: "", stderr: "" }; },
+      fs: {
+        fileExists: async p => { paths.push(norm(p)); return true; },
+        readFile: async p => { paths.push(norm(p)); return "{}"; },
+      },
+    };
+    return { execCwds, paths, deps };
+  }
+
+  it("without placements the verdict is the one it always was (absent, empty and all-undefined alike)", async () => {
+    const dod = makeDoD([
+      { kind: "fileExists", path: "a.txt" },
+      { kind: "run", command: "node check.js" },
+      { kind: "buildPasses", command: "npm run build" },
+      { kind: "testsPass", command: "npm test" },
+      { kind: "schemaMatch", path: "a.json", schema: "{}" },
+    ]);
+    const run = (placements?: readonly undefined[]) =>
+      runDeterministic(dod, makeDeps({ testsPass: testsPassHook().fn, ...(placements ? { placements } : {}) }));
+    const base = await run();
+    expect(base.outcome).toBe("pass");
+    expect(base.method).toBe("deterministic");
+    expect(base.reasons).toEqual(["all 5 deterministic checks passed"]);
+    expect(base.evidence).toBe("exists: a.txt\n---\nexit 0: node check.js\n---\nexit 0: npm run build\n---\ntestsPass: affected tests passed (full, 1 tests)");
+    expect(await run([])).toEqual(base);
+    expect(await run([undefined, undefined, undefined, undefined, undefined])).toEqual(base);
+
+    const failing = makeDoD([{ kind: "fileExists", path: "a.txt" }, { kind: "run", command: "node check.js" }]);
+    const failures: string[] = [];
+    const v = await runDeterministic(failing, makeDeps({ exec: failExec(3), onFailure: r => failures.push(r) }));
+    const w = await runDeterministic(failing, makeDeps({ exec: failExec(3), placements: [undefined, undefined] }));
+    expect(w).toEqual(v);
+    expect(v.outcome).toBe("fail");
+    expect(failures).toEqual(["command exited 3: node check.js"]);
+  });
+
+  it("the placement cwd is the cwd of the run, build and lint hooks, the mutex key and the base of fileExists / schemaMatch", async () => {
+    const s = spies();
+    const keys: string[] = [];
+    const mutex = { runExclusive: <T>(key: string, fn: () => Promise<T>): Promise<T> => { keys.push(key); return fn(); } };
+    const verdict = await runDeterministic(
+      makeDoD([
+        { kind: "run", command: "node check.js" },
+        { kind: "buildPasses", command: "npm run build" },
+        { kind: "lintClean", command: "npx eslint ." },
+        { kind: "fileExists", path: "a.txt" },
+        { kind: "schemaMatch", path: "a.json", schema: "{}" },
+        { kind: "run", command: "node unplaced.js" },
+      ]),
+      makeDeps({ ...s.deps, mutex, placements: [home, home, home, home, home, undefined] }),
+    );
+    expect(verdict.outcome).toBe("pass");
+    expect(s.execCwds).toEqual([OTHER, OTHER, OTHER, "/fake/cwd"]);
+    // Only buildPasses and lintClean take the per-cwd lock.
+    expect(keys).toEqual([OTHER, OTHER]);
+    const read = s.paths.filter(p => p.endsWith("/a.txt") || p.endsWith("/a.json"));
+    expect(read).toHaveLength(2);
+    expect(read.every(p => p.includes("other/repo/"))).toBe(true);
+  });
+
+  it("a missing file names the placement cwd", async () => {
+    const verdict = await runDeterministic(
+      makeDoD([{ kind: "fileExists", path: "gone.ts" }]),
+      makeDeps({ fs: { fileExists: async () => false, readFile: async () => "{}" }, placements: [home] }),
+    );
+    expect(verdict.reasons).toEqual([`file not found in ${OTHER}: gone.ts`]);
+  });
+
+  it("the placement cwd is the cwd of the scoped hooks too (openScope, runShell)", async () => {
+    const opened: string[] = [];
+    const shells: (string | undefined)[] = [];
+    const unused = async (): Promise<never> => { throw new Error("not used"); };
+    const openScope: OpenCheckScope = meta => {
+      opened.push(meta.cwd);
+      return {
+        execute: unused, rechecker: () => unused,
+        runShell: async (_c, cwd) => { shells.push(cwd); return ranWith(0); },
+        runLint: async () => ranWith(0),
+        close: async () => {},
+      };
+    };
+    await runDeterministic(
+      makeDoD([{ kind: "run", command: "node check.js" }]),
+      makeDeps({ openScope, placements: [home], exec: async () => { throw new Error("scoped"); } }),
+    );
+    expect(opened).toEqual([OTHER]);
+    expect(shells).toEqual([OTHER]);
+  });
+
+  it("testsPass runs in the placement cwd; scope=full requests testScope full, scope=affected keeps the budget's", async () => {
+    const hook = testsPassHook();
+    const budget = { ...resolveVerifyBudget(undefined, { cores: 8 }), testScope: "full" as const };
+    const dod = makeDoD([{ kind: "testsPass", command: "npm test" }, { kind: "testsPass", command: "npm test" }, { kind: "testsPass", command: "npm test" }]);
+    await runDeterministic(dod, makeDeps({
+      testsPass: hook.fn, budget,
+      placements: [{ ...home, scope: "affected" }, { ...home, scope: "full" }, undefined],
+    }));
+    expect(hook.requests.map(r => r.cwd)).toEqual([OTHER, OTHER, "/fake/cwd"]);
+    // "affected" in a placement is the check's own word; only an absent scope defers to the budget.
+    expect(hook.requests.map(r => r.testScope)).toEqual(["affected", "full", "full"]);
+
+    const plain = testsPassHook();
+    await runDeterministic(makeDoD([{ kind: "testsPass", command: "npm test" }, { kind: "testsPass", command: "npm test" }]), makeDeps({
+      testsPass: plain.fn, budget: { ...budget, testScope: "affected" }, placements: [home, { ...home, scope: "full" }],
+    }));
+    expect(plain.requests.map(r => r.testScope)).toEqual(["affected", "full"]);
+  });
+
+  it("lintClean with scope=full runs unscoped: planLint is not called; scope=affected still plans", async () => {
+    const planned: string[] = [];
+    const shells: string[] = [];
+    const unused = async (): Promise<never> => { throw new Error("not used"); };
+    const openScope: OpenCheckScope = meta => ({
+      execute: unused, rechecker: () => unused,
+      runShell: async c => { shells.push(c); return ranWith(0); },
+      runLint: async () => { shells.push(`lint ${meta.command}`); return ranWith(0); },
+      close: async () => {},
+    });
+    const planLint: DeterministicDeps["planLint"] = async input => { planned.push(input.cwd); return { unscoped: true, reason: "x" }; };
+    const verdict = await runDeterministic(
+      makeDoD([{ kind: "lintClean", command: "npx eslint ." }, { kind: "lintClean", command: "npx eslint ." }]),
+      makeDeps({ openScope, planLint, exec: async () => { throw new Error("scoped"); }, placements: [{ ...home, scope: "full" }, { ...home, scope: "affected" }] }),
+    );
+    expect(verdict.outcome).toBe("pass");
+    expect(planned).toEqual([OTHER]);
+    expect(shells).toEqual(["npx eslint .", "npx eslint ."]);
+  });
+
+  it("F6: a failure in a foreign check is unverifiable with the consumer reason, and onFailure is not called", async () => {
+    const failures: string[] = [];
+    const verdict = await runDeterministic(
+      makeDoD([{ kind: "run", command: "node check.js" }]),
+      makeDeps({ exec: failExec(2, "boom"), onFailure: r => failures.push(r), placements: [foreign] }),
+    );
+    const reason = `a check in another repository (${OTHER}) failed; the change under verification is in the work root, so this failure can be neither excused nor attributed: command exited 2: node check.js`;
+    expect(verdict.outcome).toBe("unverifiable");
+    expect(verdict.pass).toBe(false);
+    expect(verdict.reasons).toEqual([reason]);
+    expect(verdict.caveats).toEqual([reason]);
+    expect(verdict.evidence).toContain("boom");
+    expect(failures).toEqual([]);
+  });
+
+  it("a foreign failure beside a work-root failure: the work-root one still fails the gate and is recorded", async () => {
+    const failures: string[] = [];
+    const verdict = await runDeterministic(
+      makeDoD([{ kind: "run", command: "node a.js" }, { kind: "run", command: "node b.js" }]),
+      makeDeps({ exec: failExec(1), onFailure: r => failures.push(r), placements: [foreign, here] }),
+    );
+    expect(verdict.outcome).toBe("fail");
+    expect(failures).toEqual(["command exited 1: node b.js"]);
+  });
+
+  it("a foreign check gets reference none (also when failureRecheck is off); a work-root check keeps the default", async () => {
+    const hook = testsPassHook();
+    const off = { ...resolveVerifyBudget(undefined, { cores: 8 }), failureRecheck: false };
+    await runDeterministic(
+      makeDoD([{ kind: "testsPass", command: "npm test" }, { kind: "testsPass", command: "npm test" }]),
+      makeDeps({ testsPass: hook.fn, budget: off, reference: { kind: "disabled" }, placements: [foreign, here] }),
+    );
+    expect(hook.requests[0]?.reference.kind).toBe("none");
+    expect(hook.requests[1]?.reference).toEqual({ kind: "disabled" });
+    const refs = testsPassHook();
+    await runDeterministic(makeDoD([{ kind: "testsPass", command: "npm test" }]), makeDeps({ testsPass: refs.fn, placements: [foreign] }));
+    expect(refs.requests[0]?.reference).toMatchObject({ kind: "none" });
+  });
+
+  it("a foreign pass is a normal pass", async () => {
+    const failures: string[] = [];
+    const verdict = await runDeterministic(
+      makeDoD([{ kind: "run", command: "node check.js" }, { kind: "testsPass", command: "npm test" }]),
+      makeDeps({ testsPass: testsPassHook().fn, onFailure: r => failures.push(r), placements: [foreign, foreign] }),
+    );
+    expect(verdict.outcome).toBe("pass");
+    expect(verdict.pass).toBe(true);
+    expect(verdict.reasons).toEqual(["all 2 deterministic checks passed"]);
+    expect(failures).toEqual([]);
+  });
+
+  it("a non-foreign placement failure behaves as without a placement (onFailure called, outcome fail)", async () => {
+    const failures: string[] = [];
+    const verdict = await runDeterministic(
+      makeDoD([{ kind: "run", command: "node check.js" }]),
+      makeDeps({ exec: failExec(4), onFailure: r => failures.push(r), placements: [home] }),
+    );
+    expect(verdict.outcome).toBe("fail");
+    expect(verdict.reasons).toEqual(["command exited 4: node check.js"]);
+    expect(failures).toEqual(["command exited 4: node check.js"]);
+  });
+});

@@ -1486,12 +1486,15 @@ function fromJudgement(j: TestsPassJudgement): CheckResult {
   };
 }
 
+/** Cross-repo P2.4: the reference of a check placed in another repository (the dispatch captured the work root only). */
+export const FOREIGN_REFERENCE_NONE = "the check runs in another repository; the dispatch reference covers the work root only";
+
 function defaultReference(deps: DeterministicDeps): ReferenceState {
   return deps.budget?.failureRecheck === false ? { kind: "disabled" } : { kind: "none", reason: REFERENCE_NONE.untracked };
 }
 
 /** P0-P8 for one testsPass check whose command already passed the allowlist (P1). Never rejects. */
-async function runTestsPass(command: string, deps: DeterministicDeps, timeoutMs: number): Promise<CheckResult> {
+async function runTestsPass(command: string, deps: DeterministicDeps, timeoutMs: number, scope?: "affected" | "full"): Promise<CheckResult> {
   if (!deps.testsPass) return { ok: false, unverifiable: true, reason: `${NO_TESTS_PASS_HOOK}: ${command}` };
   if (!deps.cwd || !isAbsolute(deps.cwd)) {
     return { ok: false, unverifiable: true, reason: `testsPass cannot run without an absolute working directory: ${command}` };
@@ -1503,7 +1506,7 @@ async function runTestsPass(command: string, deps: DeterministicDeps, timeoutMs:
       const run = await hook({
         command,
         cwd,
-        testScope: deps.budget?.testScope ?? "affected",
+        testScope: scope ?? deps.budget?.testScope ?? "affected",
         changedFiles: deps.changedFiles ?? "unavailable",
         reference: deps.reference ?? defaultReference(deps),
         deadline,
@@ -1525,6 +1528,7 @@ async function runCommandCheck(
   deps: DeterministicDeps,
   allowlist: string[],
   timeoutMs: number,
+  scope?: "affected" | "full",
 ): Promise<CheckResult> {
   let command = resolveRepoCommand(check, kind, deps.defaults);
   if (kind === "buildPasses" && !check.command && !deps.defaults?.buildCommand) {
@@ -1552,7 +1556,7 @@ async function runCommandCheck(
     if (!isCommandAllowed(command, allowlist)) {
       return { ok: false, unverifiable: true, reason: `command not allowlisted: ${command}` };
     }
-    return runTestsPass(command, deps, timeoutMs);
+    return runTestsPass(command, deps, timeoutMs, scope);
   }
 
   const fn = async (): Promise<CheckResult> => {
@@ -1562,7 +1566,8 @@ async function runCommandCheck(
       }
       let launch: Launch = (scope, deadline) => scope.runShell(command, deps.cwd, deadline);
       let scopedTo: number | undefined;
-      if (kind === "lintClean" && deps.openScope) {
+      // Cross-repo P2.4: scope=full runs the lint unscoped.
+      if (kind === "lintClean" && deps.openScope && scope !== "full") {
         // T8: NoAffected passes with its note and takes no slot; Unscoped runs the command as today.
         const plan = await planLint(command, deps);
         if (isNoAffected(plan)) {
@@ -1666,23 +1671,29 @@ export async function runDeterministic(dod: DoD, deps: DeterministicDeps): Promi
   const results: CheckResult[] = [];
 
   // Sequential for deterministic mutex semantics and stable evidence order.
-  for (const check of checks) {
+  for (const [index, check] of checks.entries()) {
     let result: CheckResult;
+    // Cross-repo P2.4: a placed check runs with its own cwd (also the mutex key and the base of relative paths); a foreign one
+    // has no dispatch reference. Without a placement `cd` is `deps` itself.
+    const placement = deps.placements?.[index];
+    const cd: DeterministicDeps = placement
+      ? { ...deps, cwd: placement.cwd, ...(placement.foreign ? { reference: { kind: "none", reason: FOREIGN_REFERENCE_NONE } satisfies ReferenceState } : {}) }
+      : deps;
 
     switch (check.kind) {
       case "fileExists":
-        result = await runFileExists(check, deps);
+        result = await runFileExists(check, cd);
         break;
       case "run":
-        result = await runRun(check, deps, allowlist, timeoutMs);
+        result = await runRun(check, cd, allowlist, timeoutMs);
         break;
       case "testsPass":
       case "buildPasses":
       case "lintClean":
-        result = await runCommandCheck(check, check.kind, deps, allowlist, timeoutMs);
+        result = await runCommandCheck(check, check.kind, cd, allowlist, timeoutMs, placement?.scope);
         break;
       case "schemaMatch":
-        result = await runSchemaMatch(check, deps);
+        result = await runSchemaMatch(check, cd);
         break;
       default: {
         // Defensive: TypeScript proves this is unreachable; guards runtime extensions.
@@ -1690,6 +1701,19 @@ export async function runDeterministic(dod: DoD, deps: DeterministicDeps): Promi
         result = { ok: false, reason: `unknown check kind: ${exhaustive}` };
         break;
       }
+    }
+
+    // F6: the change under verification is in the work root, so a failure in a foreign repository is the consumer's:
+    // unverifiable, never recorded as a failure (gate.ts turns a recorded failure into "fail").
+    if (placement?.foreign === true && !result.ok && !result.unverifiable) {
+      // The failing ids are dropped with the verdict: nothing in the work root's reference says whom they belong to.
+      result = {
+        ok: false,
+        unverifiable: true,
+        ...(result.note !== undefined ? { note: result.note } : {}),
+        ...(result.evidence !== undefined ? { evidence: result.evidence } : {}),
+        reason: `a check in another repository (${placement.cwd}) failed; the change under verification is in the work root, so this failure can be neither excused nor attributed: ${result.reason ?? "check failed"}`,
+      };
     }
 
     results.push(result);

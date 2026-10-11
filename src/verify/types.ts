@@ -124,6 +124,11 @@ export interface DeterministicDeps {
   /** Preserve completed failures if an outer gate budget expires later. */
   onFailure?: (reason: string) => void;
   /**
+   * Cross-repo P2.4: per-check placements, index-aligned with `dod.checks` (undefined: the check runs in `cwd` with the budget's
+   * scope, as without this field). A foreign placement's failure is unverifiable, never "fail", and never reaches `onFailure`.
+   */
+  placements?: readonly (CheckPlacement | undefined)[];
+  /**
    * #84 QA-G-B-2-1: set for a CARRIED acceptance (a role resume re-checking the block of an earlier attempt): a testsPass or
    * lintClean check that ran no process (NoAffected: nothing of the change set maps to a test or a lintable file) is unverifiable
    * with this reason, never a pass. Absent (every other gate, I1): NoAffected passes with its note, as before.
