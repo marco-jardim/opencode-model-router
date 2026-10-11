@@ -32,6 +32,7 @@ import {
 import { createEngineRuntime, type EngineRuntime } from "../../src/routing/wire/runtime";
 import type { Admission, RepoLocation } from "../../src/routing/roles/admission";
 import { resolveRoles } from "../../src/router/roles";
+import { resumedGrant } from "../../src/routing/wire/dispatch";
 
 const bundled = JSON.parse(readFileSync(join(process.cwd(), "tiers.json"), "utf-8")) as Record<string, unknown>;
 const logger = { warn: vi.fn() };
@@ -453,12 +454,13 @@ describe("exported helpers for the adapter (P2.1-C)", () => {
   });
 
   describe("cross-repo P1.4: resolveRoleWorkRoot binds through admission", () => {
+    // Admission returns the canonical worktree (RepoLocation.worktree); the fake realpath is idempotent on canonical paths.
     const located = (worktree: string, over: Partial<RepoLocation> = {}): RepoLocation => ({
-      repository: worktree, name: worktree.split("\\").pop() ?? worktree, worktree, branch: "main", head: "abc1234def", worktrees: [], ...over,
+      repository: worktree, name: worktree.split("\\").pop() ?? worktree, worktree: `CANON(${worktree})`, branch: "main", head: "abc1234def", worktrees: [], ...over,
     });
     const fakeDeps = () => ({
       listWorktrees: vi.fn(async () => "worktree D:/git/main\n"),
-      realpath: vi.fn((path: string) => `CANON(${path})`),
+      realpath: vi.fn((path: string) => (path.startsWith("CANON(") ? path : `CANON(${path})`)),
       platform: "win32" as const,
     });
     const fakeAdmission = (result: Admission) => ({ admit: vi.fn(async () => result), resolve: vi.fn(async () => result) });
@@ -528,6 +530,40 @@ describe("exported helpers for the adapter (P2.1-C)", () => {
         .toEqual({ workRoot: null, requested: "D:\\git\\main", note: mismatch });
       expect(refusing.resolve).toHaveBeenCalledWith({ root: "D:\\git\\main", branch: "feat" }, { sessionRepository: "D:\\git\\main", known: ["D:\\git\\main"] });
       expect(deps.listWorktrees).not.toHaveBeenCalled();
+    });
+
+    it("QA-R1 F1: with an admission, a root= the session repository lists binds only if admit() admits it", async () => {
+      const deps = { ...fakeDeps(), listWorktrees: vi.fn(async () => "worktree D:/git/main\n\nworktree D:/git/secret-wt\n") };
+      const reason = "root=D:\\git\\secret-wt is excluded by routing.repoExclude (D:\\git\\secret*): no work root.";
+      const refusing = fakeAdmission({ ok: false, reason });
+      expect(await resolveRoleWorkRoot({ root: "D:\\git\\secret-wt", sessionDirectory: "D:\\git\\main" }, deps, { admission: refusing }))
+        .toEqual({ workRoot: null, requested: "D:\\git\\secret-wt", note: reason });
+      expect(refusing.admit).toHaveBeenCalledWith("D:\\git\\secret-wt", ["D:\\git\\main"]);
+      // I9: without an admission the text match is unchanged
+      expect((await resolveRoleWorkRoot({ root: "D:\\git\\secret-wt", sessionDirectory: "D:\\git\\main" }, deps)).workRoot).toBe("CANON(D:/git/secret-wt)");
+    });
+
+    it("QA-R1 F8: an admitted worktree that now resolves elsewhere binds nothing; a case-only difference is the same path", async () => {
+      const bound = { ...located("D:\\src\\api"), worktree: "D:\\src\\api" };
+      const moved = { ...fakeDeps(), realpath: vi.fn((path: string) => (path === "D:\\src\\api" ? "D:\\elsewhere\\victim" : path)) };
+      const refused = await resolveRoleWorkRoot({ root: null, sessionDirectory: "D:\\git\\main" }, moved, { repo: "api", admission: fakeAdmission({ ok: true, location: bound }) });
+      expect(refused).toMatchObject({ workRoot: null, requested: null });
+      expect(refused.note).toContain("D:\\elsewhere\\victim");
+      expect(refused.location).toBeUndefined();
+      const cased = { ...fakeDeps(), realpath: vi.fn(() => "d:\\SRC\\api") };
+      expect(await resolveRoleWorkRoot({ root: null, sessionDirectory: "D:\\git\\main" }, cased, { repo: "api", admission: fakeAdmission({ ok: true, location: bound }) }))
+        .toEqual({ workRoot: "d:\\SRC\\api", requested: null, note: null, location: bound });
+    });
+
+    it("QA-R1 F10: a resumed grant keeps the location only with its validated work root", () => {
+      type Grant = Parameters<typeof resumedGrant>[0];
+      type Action = Parameters<typeof resumedGrant>[1][number];
+      const bound = located("D:\\src\\api");
+      const without: Grant = { actions: new Set<Action>(), notes: [], workRoot: null, location: bound };
+      expect(resumedGrant(without, []).location).toBeUndefined();
+      expect("location" in resumedGrant(without, [])).toBe(false);
+      const withRoot: Grant = { actions: new Set<Action>(), notes: [], workRoot: "CANON(D:\\src\\api)", location: bound };
+      expect(resumedGrant(withRoot, []).location).toBe(bound);
     });
   });
 

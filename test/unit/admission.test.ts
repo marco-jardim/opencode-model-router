@@ -9,6 +9,7 @@ import {
   parseWorktreeEntries,
   type AdmissionDeps,
 } from "../../src/routing/roles/admission";
+import { gitWorktreeList, resolveRoleWorkRoot } from "../../src/routing/wire/dispatch";
 
 const isWin = process.platform === "win32";
 const SHA = "3f2c1a9b8e7d6c5b4a39281706f5e4d3c2b1a090";
@@ -22,6 +23,8 @@ function recording(base: AdmissionDeps): { deps: AdmissionDeps; calls: string[] 
     realpath: (path) => { calls.push(`realpath ${path}`); return base.realpath(path); },
     isDirectory: (path) => { calls.push(`isDirectory ${path}`); return base.isDirectory(path); },
     readdir: (path) => { calls.push(`readdir ${path}`); return base.readdir(path); },
+    commonDir: (cwd) => { calls.push(`commonDir ${cwd}`); return base.commonDir(cwd); },
+    gitEntry: (dir) => { calls.push(`gitEntry ${dir}`); return base.gitEntry(dir); },
     platform: base.platform,
     now: () => base.now(),
   };
@@ -33,7 +36,7 @@ function untouchable(platform: NodeJS.Platform): AdmissionDeps {
   const boom = (what: string) => (): never => { throw new Error(`unexpected ${what}`); };
   return {
     listWorktrees: boom("listWorktrees"), showToplevel: boom("showToplevel"), realpath: boom("realpath"),
-    isDirectory: boom("isDirectory"), readdir: boom("readdir"), platform, now: () => 0,
+    isDirectory: boom("isDirectory"), readdir: boom("readdir"), commonDir: boom("commonDir"), gitEntry: boom("gitEntry"), platform, now: () => 0,
   };
 }
 
@@ -42,6 +45,8 @@ function fakeWin(clock: { t: number }): AdmissionDeps {
   return {
     listWorktrees: async () => `worktree D:/Git/App\nHEAD ${SHA}\nbranch refs/heads/main\n\n`,
     showToplevel: async () => "D:/Git/App",
+    commonDir: async () => "D:/Git/App/.git",
+    gitEntry: () => true,
     realpath: (path) => {
       const native = path.replace(/\//g, "\\");
       if (/^d:\\git\\app$/i.test(native)) return "D:\\Git\\App";
@@ -146,6 +151,36 @@ describe("admission without git (fake deps)", () => {
     clock.t = 6_000;
     expect((await admission.admit("D:\\Git\\App")).ok).toBe(true);
     expect([count("showToplevel"), count("listWorktrees")]).toEqual([2, 2]);
+  });
+
+  it("QA-R1 F7: repo= skips dot-dirs, node_modules and excluded dirs, runs no git without a .git entry, and caps the notes", async () => {
+    const children = ["node_modules", ".cache", "skipped", ...Array.from({ length: 12 }, (_, i) => `o${String(i + 1)}`)];
+    const { deps, calls } = recording({
+      ...fakeWin({ t: 0 }),
+      showToplevel: async () => undefined,
+      gitEntry: (dir) => !/\\o12\\x$/i.test(dir),
+      readdir: (path) => (/^d:\\git$/i.test(path) ? children : []),
+    });
+    const admission = createAdmission({ parents: ["D:\\git"], depth: 2, exclude: ["D:\\git\\skipped"] }, deps);
+    const result = await admission.resolve({ repo: "x" }, { sessionRepository: "D:\\git\\app" });
+    const reason = result.ok ? "" : result.reason;
+    expect(result.ok).toBe(false);
+    expect(calls.filter((call) => /node_modules|\\\.cache|\\skipped/i.test(call))).toEqual([]);
+    expect(calls).toContain("showToplevel D:\\git\\o11\\x");
+    expect(calls).not.toContain("showToplevel D:\\git\\o12\\x");
+    // 13 refusals (D:\git\x and o1..o12): 10 quoted, then a count
+    expect(reason.match(/is not the top level of a git repository/g)?.length).toBe(10);
+    expect(reason).toContain("and 3 more");
+
+    const wide = recording({
+      ...fakeWin({ t: 0 }),
+      gitEntry: () => false,
+      readdir: (path) => (/^d:\\git$/i.test(path) ? Array.from({ length: 3000 }, (_, i) => `d${String(i)}`) : []),
+    });
+    const capped = await createAdmission({ parents: ["D:\\git"], depth: 2, exclude: [] }, wide.deps).resolve({ repo: "x" }, { sessionRepository: "D:\\git\\app" });
+    expect(capped.ok ? "" : capped.reason).toContain("stopped after 2000 directories");
+    expect(new Set(wide.calls.filter((call) => call.startsWith("isDirectory "))).size).toBe(2000);
+    expect(wide.calls.filter((call) => call.startsWith("showToplevel "))).toEqual([]);
   });
 
   it("refuses when no root, repo or branch is declared", async () => {
@@ -294,5 +329,84 @@ describe("admission with real git", { timeout: 60_000 }, () => {
   it.runIf(isWin)("matches case-insensitively on win32", async () => {
     const result = await createAdmission(config(), defaultAdmissionDeps()).admit(join(parent.toUpperCase(), "ALPHA"));
     expect(result).toMatchObject({ ok: true, location: { worktree: join(parent, "alpha"), name: "alpha" } });
+  });
+});
+
+describe("QA round 1 (real git): every admission passes the final gates", { timeout: 60_000 }, () => {
+  let base = "";
+  let parent = "";
+  let outside = "";
+  const env: NodeJS.ProcessEnv = {};
+
+  const git = (cwd: string, ...args: string[]): string =>
+    execFileSync("git", args, { cwd, env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  const repo = (dir: string): void => {
+    mkdirSync(dir, { recursive: true });
+    git(dir, "init", "-q", "-b", "main");
+    git(dir, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "init");
+  };
+  const app = (): string => join(parent, "app");
+  const config = () => ({ parents: [parent], depth: 2, exclude: [join(parent, "secret*")] });
+
+  beforeAll(() => {
+    base = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-admission-qa-")));
+    for (const [key, value] of Object.entries(process.env)) if (!key.toUpperCase().startsWith("GIT_")) env[key] = value;
+    writeFileSync(join(base, "gitconfig"), "");
+    env.GIT_CONFIG_GLOBAL = join(base, "gitconfig");
+    env.GIT_CONFIG_NOSYSTEM = "1";
+    parent = join(base, "parent");
+    outside = join(base, "outside");
+    repo(app());
+    git(app(), "worktree", "add", "-q", "-b", "secret", join(parent, "secret-wt"));
+    git(app(), "worktree", "add", "-q", "-b", "wt-in", join(parent, "wt-in"));
+    git(app(), "worktree", "add", "-q", "-b", "wt-out", join(outside, "wt-out"));
+    repo(join(outside, "victim"));
+    // Two listed worktrees of app are swapped for links to a separate repository.
+    for (const listed of [join(parent, "wt-in"), join(outside, "wt-out")]) {
+      rmSync(listed, { recursive: true, force: true });
+      symlinkSync(join(outside, "victim"), listed, isWin ? "junction" : "dir");
+    }
+    repo(join(parent, "org"));
+  }, 120_000);
+
+  afterAll(() => {
+    if (base !== "") rmSync(base, { recursive: true, force: true });
+  });
+
+  it("F1: an excluded linked worktree of an admitted repository is refused by admit, by repo= + branch= and by the text match", async () => {
+    const secret = join(parent, "secret-wt");
+    const admission = createAdmission(config(), defaultAdmissionDeps());
+    expect(await admission.admit(secret, [app()])).toEqual({ ok: false, reason: expect.stringContaining("is excluded by routing.repoExclude") });
+    expect(await admission.resolve({ repo: "app", branch: "secret" }, { sessionRepository: app() }))
+      .toEqual({ ok: false, reason: expect.stringContaining("is excluded by routing.repoExclude") });
+    const viaText = await resolveRoleWorkRoot(
+      { root: secret, sessionDirectory: app() },
+      { listWorktrees: gitWorktreeList, realpath: (path) => realpathSync.native(path), platform: process.platform },
+      { admission },
+    );
+    expect(viaText).toMatchObject({ workRoot: null, note: expect.stringContaining("is excluded by routing.repoExclude") });
+    // the repository itself is still admitted
+    expect(await admission.resolve({ repo: "app", branch: "main" }, { sessionRepository: app() })).toMatchObject({ ok: true, location: { worktree: app() } });
+  });
+
+  it("F2: a listed worktree that leads out through a link is refused, naming the link; rule 2 never overturns rule 1", async () => {
+    const admission = createAdmission(config(), defaultAdmissionDeps());
+    const victim = join(outside, "victim");
+    const inside = join(parent, "wt-in");
+    const below = await admission.admit(inside, [app()]);
+    expect(below).toEqual({ ok: false, reason: expect.stringContaining(`root=${inside} leads outside ${parent} through a link`) });
+    expect(below.ok ? "" : below.reason).toContain(victim);
+    const out = join(outside, "wt-out");
+    const listed = await admission.admit(out, [app()]);
+    expect(listed).toEqual({ ok: false, reason: expect.stringContaining(`root=${out}`) });
+    expect(listed.ok ? "" : listed.reason).toContain("through a link");
+    expect(listed.ok ? "" : listed.reason).toContain(victim);
+  });
+
+  it("F4: a repository that is itself a configured parent is refused, whichever parent would admit it", async () => {
+    const org = join(parent, "org");
+    const admission = createAdmission({ parents: [parent, org], depth: 2, exclude: [] }, defaultAdmissionDeps());
+    expect(await admission.admit(org)).toEqual({ ok: false, reason: expect.stringContaining("routing.repoParents entry") });
+    expect(await admission.admit(app())).toMatchObject({ ok: true, location: { worktree: app() } });
   });
 });

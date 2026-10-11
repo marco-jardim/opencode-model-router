@@ -273,6 +273,13 @@ export type FetchLike = (
 /** Environment lookup (process.env in production, a plain object in tests). */
 export type EnvLike = Readonly<Record<string, string | undefined>>;
 
+/** A `repo=` / `branch=` declaration of a route line that was not accepted (see {@link RouteLine.invalidCrossRepo}). */
+export interface InvalidCrossRepo {
+  readonly key: "repo" | "branch";
+  /** The value as written (empty for a bare key). */
+  readonly value: string;
+}
+
 /** Parsed `[route …]` line (D13). Absent fields were missing or invalid. */
 export interface RouteLine {
   readonly class?: TaskClass;
@@ -305,10 +312,17 @@ export interface RouteLine {
   readonly repo?: string;
   /**
    * `branch=<ref>`: the branch whose worktree to bind; declare-then-check (the declared branch is verified against
-   * the worktree later). Case kept. 1..200 chars of `[A-Za-z0-9._/-]`; rejected at parse: `..`, `//`, a leading
-   * `-` or `/`, a trailing `/`, `.` or `.lock`.
+   * the worktree later). Case kept. 1..200 chars, git `check-ref-format` rules for a branch name: no ASCII control,
+   * space, `~ ^ : ? * [ \`; rejected at parse: `..`, `@{`, `@` alone, `//`, a leading `-` or `/`, a trailing `/` or
+   * `.`, a component starting with `.` or ending in `.lock`. The value is only ever compared with porcelain output.
    */
   readonly branch?: string;
+  /**
+   * `repo=` / `branch=` the line declared but the parser could not accept (invalid value, bare key, duplicate or
+   * conflicting key), with the value as written. The route flow gives such a dispatch NO work root and a note: an
+   * invalid declaration never falls back to the session directory. Absent when every declaration was valid.
+   */
+  readonly invalidCrossRepo?: readonly InvalidCrossRepo[];
   /** Bare `pin` flag (or `pin=true|yes|1`). */
   readonly pin: boolean;
   /** Keys that were unknown or whose values were invalid (for logging only). */

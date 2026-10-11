@@ -27,7 +27,7 @@ import {
 } from "../../src/routing/wire/dispatch";
 import { createEngineRuntime, type EngineRuntime } from "../../src/routing/wire/runtime";
 import { execFileSync } from "node:child_process";
-import type { Admission, AdmissionConfig, AdmissionService } from "../../src/routing/roles/admission";
+import type { Admission, AdmissionConfig, AdmissionService, RepoLocation } from "../../src/routing/roles/admission";
 import { forgetWorkingSet, workingSetOf } from "../../src/routing/wire/working-set";
 
 const bundled = JSON.parse(readFileSync(join(process.cwd(), "tiers.json"), "utf-8")) as Record<string, unknown>;
@@ -751,6 +751,96 @@ describe("cross-repo P1.4: the work root bound through admission", () => {
     expect(created[0]?.parents).toEqual([]);
     expect(admit).not.toHaveBeenCalled();
     expect(workingSetOf("root")).toEqual([]);
+  });
+
+  const locationOf = (worktree: string): RepoLocation => ({ repository: worktree, name: "app", worktree, branch: "main", head: "abc1234", worktrees: [] });
+  const EDIT_PROMPT = (fields: string): string => `[route class=implement risk=low scope=single needs=edit ${fields}]\nchange x`;
+
+  describe("QA round 1", () => {
+    it("F3: an invalid branch= / repo= gives no work root and a note; admission is never asked", async () => {
+      const resolve = vi.fn(async (): Promise<Admission> => ({ ok: true, location: locationOf("never") }));
+      const admit = vi.fn(async (): Promise<Admission> => ({ ok: true, location: locationOf("never") }));
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }), { createAdmission: () => ({ admit, resolve }) });
+      const badBranch = await world.router.route(call(world, { agent: "implementer", prompt: EDIT_PROMPT("branch=a..b") }));
+      expect(badBranch.role!.workRoot).toBeNull();
+      expect(badBranch.role!.notes).toContain("branch=a..b is not a valid branch name: no work root. Fix the route line.");
+      expect([...badBranch.role!.grant.actions]).not.toContain("edit");
+      const badRepo = await world.router.route(call(world, { agent: "implementer", prompt: EDIT_PROMPT("repo=.dotfiles branch=main") }));
+      expect(badRepo.role!.workRoot).toBeNull();
+      expect(badRepo.role!.notes).toContain("repo=.dotfiles is not a valid repository name: no work root. Fix the route line.");
+      const dup = await world.router.route(call(world, { agent: "implementer", prompt: EDIT_PROMPT("branch=main branch=other") }));
+      expect(dup.role!.workRoot).toBeNull();
+      expect(dup.role!.notes).toContain("branch=other is not a valid branch name: no work root. Fix the route line.");
+      expect(resolve).not.toHaveBeenCalled();
+      expect(admit).not.toHaveBeenCalled();
+    });
+
+    it("F3: a git-valid but unusual branch (renovate/foo+bar) is bound through admission", async () => {
+      const resolve = vi.fn(async (): Promise<Admission> => ({ ok: true, location: locationOf(world.main) }));
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }), { createAdmission: () => ({ admit: vi.fn(), resolve }) });
+      const outcome = await world.router.route(call(world, { agent: "implementer", prompt: EDIT_PROMPT("branch=renovate/foo+bar") }));
+      expect(resolve).toHaveBeenCalledWith({ branch: "renovate/foo+bar" }, expect.anything());
+      expect(outcome.role!.workRoot).toBe(world.main);
+    });
+
+    it("F9: without routing.repoParents a bound branch= does not grow the working set", async () => {
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }), {
+        createAdmission: () => ({ admit: vi.fn(), resolve: async (): Promise<Admission> => ({ ok: true, location: locationOf(world.main) }) }),
+      });
+      const outcome = await world.router.route(call(world, { agent: "implementer", prompt: EDIT_PROMPT("branch=main") }));
+      expect(outcome.role!.workRoot).toBe(world.main);
+      expect(outcome.role!.grant.location).toBeDefined();
+      expect(workingSetOf("root")).toEqual([]);
+    });
+
+    it("F5: with routing.repoParents the working set gets the GRANT's location once the dispatch is accepted", async () => {
+      const parent = temp("omr-qa1-parent-");
+      const world = makeWorld(config({ delegation: "roles", engine: "static", repoParents: [parent] }), {
+        createAdmission: () => ({ admit: vi.fn(), resolve: async (): Promise<Admission> => ({ ok: true, location: locationOf(world.main) }) }),
+      });
+      const outcome = await world.router.route(call(world, { agent: "implementer", prompt: EDIT_PROMPT("branch=main") }));
+      expect(workingSetOf("root")).toEqual([outcome.role!.grant.location]);
+    });
+
+    describe("F6: the session started in a subdirectory", () => {
+      const subWorld = (): { world: World; top: string; sub: string; resolve: ReturnType<typeof vi.fn> } => {
+        const top = temp("omr-qa1-top-");
+        const sub = join(top, "sub");
+        mkdirSync(sub);
+        // the real admission refuses a `root=` that is not a worktree root; without `root=` it answers by branch
+        const resolve = vi.fn(async (decl: { root?: string }): Promise<Admission> => decl.root === undefined
+          ? { ok: true, location: locationOf(top) } : { ok: false, reason: `root=${decl.root} is not a worktree root: no work root.` });
+        const world = makeWorld(config({ delegation: "roles", engine: "static" }), { main: sub, createAdmission: () => ({ admit: vi.fn(), resolve }) });
+        return { world, top, sub, resolve };
+      };
+
+      it("branch= alone keeps the session directory as the work root; the location is the worktree's", async () => {
+        const { world, top, sub } = subWorld();
+        const outcome = await world.router.route(call(world, { agent: "implementer", prompt: EDIT_PROMPT("branch=main") }));
+        expect(outcome.role!.workRoot).toBe(sub);
+        expect(outcome.role!.grant.location?.worktree).toBe(top);
+      });
+
+      it("root=<session directory> branch= is accepted when the worktree on that branch contains it", async () => {
+        const { world, top, sub, resolve } = subWorld();
+        const outcome = await world.router.route(call(world, { agent: "implementer", prompt: EDIT_PROMPT(`root="${sub}" branch=main`) }));
+        expect(outcome.role!.workRoot).toBe(sub);
+        expect(outcome.role!.requestedRoot).toBe(sub);
+        expect(outcome.role!.grant.location?.worktree).toBe(top);
+        expect(resolve).toHaveBeenCalledTimes(2);
+      });
+
+      it("root=<session directory> branch= is still refused when the branch's worktree does not contain it", async () => {
+        const { sub } = subWorld();
+        const elsewhere = temp("omr-qa1-else-");
+        const resolve = vi.fn(async (decl: { root?: string }): Promise<Admission> => decl.root === undefined
+          ? { ok: true, location: locationOf(elsewhere) } : { ok: false, reason: "root mismatch: no work root." });
+        const other = makeWorld(config({ delegation: "roles", engine: "static" }), { main: sub, createAdmission: () => ({ admit: vi.fn(), resolve }) });
+        const outcome = await other.router.route(call(other, { agent: "implementer", prompt: EDIT_PROMPT(`root="${sub}" branch=main`) }));
+        expect(outcome.role!.workRoot).toBeNull();
+        expect(outcome.role!.notes).toContain("root mismatch: no work root.");
+      });
+    });
   });
 });
 

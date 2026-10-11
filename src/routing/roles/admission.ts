@@ -7,16 +7,24 @@
  * 1. it lies 1..`repoDepth` segments below a `routing.repoParents` entry (text first, then the canonical form, never the parent
  *    itself), no `routing.repoExclude` glob matches it, and hardened git prints it for `rev-parse --show-toplevel`; or
  * 2. its TEXT equals a worktree that a known repository (the session repository, the working set, the named repository) lists in
- *    `git worktree list --porcelain`, and the repository still lists it after `realpath`.
+ *    `git worktree list --porcelain`, the repository still lists it after `realpath`, and hardened git run in it names the same
+ *    repository (`rev-parse --git-common-dir`), so a listed path swapped for a link to another repository is not admitted.
+ *
+ * QA round 1: whichever rule admits a directory, a final gate refuses it when `routing.repoExclude` matches its text or its
+ * canonical form, when its text lies below a parent but its canonical form does not lie below that parent's canonical form (it
+ * leads out through a link), or when its canonical form is, or contains, a parent. A rule-1 refusal for an exclusion, a link or
+ * the parent itself is final: rule 2 never admits what rule 1 refused for those. Git never runs in a candidate without a `.git`
+ * entry, and a `repo=` lookup skips dot-directories, `node_modules` and excluded directories and stops after
+ * {@link LOOKUP_MAX_DIRS} directories.
  *
  * Text is compared before any filesystem call on a path outside the parents: git never runs in a directory that the text did
  * not place below a parent and that no known repository lists. Network and device paths (`\\host`, `//host`, `\\?\`, `\\.\`),
  * 8.3 short-name segments, `..` segments and relative paths are refused before any call at all.
  *
- * All I/O goes through {@link AdmissionDeps}; git results are cached for 5 s per normalised path. Nothing calls this module yet.
+ * All I/O goes through {@link AdmissionDeps}; git results are cached for 5 s per normalised path.
  */
-import { readdirSync, realpathSync, statSync } from "node:fs";
-import { dirname, posix, win32 } from "node:path";
+import { lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { dirname, isAbsolute, join, posix, win32 } from "node:path";
 import { permissionMatches } from "../../router/read-only";
 import { gitWorktreeList, normalizeRootText } from "../wire/dispatch";
 
@@ -52,7 +60,7 @@ export interface AdmissionConfig {
   readonly parents: readonly string[];
   /** `routing.repoDepth`: repositories are admitted 1..depth segments below a parent. */
   readonly depth: number;
-  /** `routing.repoExclude`: absolute globs matched against the canonical path of a candidate. */
+  /** `routing.repoExclude`: absolute globs matched against the text and the canonical path of a candidate. */
   readonly exclude: readonly string[];
 }
 
@@ -61,6 +69,10 @@ export interface AdmissionDeps {
   listWorktrees(cwd: string): Promise<string>;
   /** Hardened `git rev-parse --show-toplevel` in `cwd`; undefined on failure. */
   showToplevel(cwd: string): Promise<string | undefined>;
+  /** Hardened `git rev-parse --git-common-dir` in `cwd`, absolute (a relative answer joined to `cwd`); undefined on failure. */
+  commonDir(cwd: string): Promise<string | undefined>;
+  /** Whether `dir` holds a `.git` entry (`lstat`: a file, a directory or a link, not followed). Git never runs without one. */
+  gitEntry(dir: string): boolean;
   /** `realpathSync.native`; throws when the path does not resolve. */
   realpath(path: string): string;
   isDirectory(path: string): boolean;
@@ -74,15 +86,19 @@ export interface Declaration { readonly repo?: string; readonly branch?: string;
 export interface DeclarationContext { readonly sessionRepository: string; readonly known?: readonly string[] }
 
 export interface AdmissionService {
-  /** Rule 1 (below a parent), then rule 2 (a worktree that a repository in `known` lists). */
+  /** Rule 1 (below a parent), then rule 2 (a worktree that a repository in `known` lists); every admission passes the final gate. */
   admit(root: string, known?: readonly string[]): Promise<Admission>;
   /** Resolve `root=` / `repo=` / `branch=`; every declaration must agree. */
   resolve(decl: Declaration, ctx: DeclarationContext): Promise<Admission>;
 }
 
-/** How long a `show-toplevel` or worktree-list result is reused, per normalised path. */
+/** How long a `show-toplevel`, common-dir or worktree-list result is reused, per normalised path. */
 export const ADMISSION_CACHE_MS = 5_000;
 const CACHE_MAX = 256;
+/** QA round 1 (F7): a `repo=` lookup visits at most this many directories, across all parents and levels. */
+export const LOOKUP_MAX_DIRS = 2_000;
+/** QA round 1 (F7): a `repo=` refusal quotes at most this many notes, then counts the rest. */
+export const LOOKUP_MAX_NOTES = 10;
 
 /**
  * The entries of `git worktree list --porcelain`: blocks separated by blank lines, the first block the main worktree. Unlike
@@ -124,35 +140,55 @@ export function parseWorktreeEntries(porcelain: string): WorktreeEntry[] {
 }
 
 /**
- * Hardened `git rev-parse --show-toplevel` in `cwd`, as `gitWorktreeList` (dispatch.ts) spawns git: the absolute executable
- * selected outside `workRootGuards(cwd)`, `hardeningArgs()`, the user's `safe.directory` values, `gitEnvironment()`, no shell,
- * bounded to 5 s and 64 KiB. `GIT_CEILING_DIRECTORIES` stops discovery at `cwd`'s parent, so a directory inside a repository
- * never reports that repository. Undefined on any failure.
+ * Hardened `git rev-parse <args>` in `cwd`, as `gitWorktreeList` (dispatch.ts) spawns git: the absolute executable selected
+ * outside `workRootGuards(cwd)`, `hardeningArgs()`, the user's `safe.directory` values, `gitEnvironment()`, no shell, bounded to
+ * 5 s and 64 KiB. `GIT_CEILING_DIRECTORIES` stops discovery at `cwd`'s parent, so a directory inside a repository never reports
+ * that repository. Undefined on any failure.
  */
-export async function gitShowToplevel(cwd: string): Promise<string | undefined> {
+async function gitRevParse(cwd: string, args: readonly string[]): Promise<string | undefined> {
   try {
     const { gitEnvironment, gitExecutable, hardeningArgs, inheritedSafeDirectoryArgs, spawnBounded, workRootGuards } = await import("../../router/git-tools");
     const started = performance.now();
     const executable = gitExecutable(workRootGuards(cwd));
     const trusted = await inheritedSafeDirectoryArgs(executable, 5_000);
     const above = dirname(cwd);
-    const result = await spawnBounded(executable, [...hardeningArgs(), ...trusted, "rev-parse", "--show-toplevel"], cwd, {
+    const result = await spawnBounded(executable, [...hardeningArgs(), ...trusted, "rev-parse", ...args], cwd, {
       env: gitEnvironment(above === cwd ? {} : { GIT_CEILING_DIRECTORIES: above }),
       timeoutMs: Math.max(1, 5_000 - (performance.now() - started)),
       maxBytes: 64 * 1024,
     });
     if (result.code !== 0 || result.truncated) return undefined;
-    const top = result.output.toString("utf8").trim();
-    return top === "" ? undefined : top;
+    const out = result.output.toString("utf8").trim();
+    return out === "" ? undefined : out;
   } catch {
     return undefined;
   }
+}
+
+/** Hardened `git rev-parse --show-toplevel` in `cwd` ({@link gitRevParse}). Undefined on any failure. */
+export function gitShowToplevel(cwd: string): Promise<string | undefined> {
+  return gitRevParse(cwd, ["--show-toplevel"]);
+}
+
+/** Hardened `git rev-parse --git-common-dir` in `cwd` ({@link gitRevParse}); a relative answer is joined to `cwd`. */
+export async function gitCommonDir(cwd: string): Promise<string | undefined> {
+  const dir = await gitRevParse(cwd, ["--git-common-dir"]);
+  return dir === undefined ? undefined : isAbsolute(dir) ? dir : join(cwd, dir);
 }
 
 export function defaultAdmissionDeps(): AdmissionDeps {
   return {
     listWorktrees: gitWorktreeList,
     showToplevel: gitShowToplevel,
+    commonDir: gitCommonDir,
+    gitEntry: (dir) => {
+      try {
+        lstatSync(join(dir, ".git"));
+        return true;
+      } catch {
+        return false;
+      }
+    },
     realpath: (path) => realpathSync.native(path),
     isDirectory: (path) => {
       try {
@@ -219,6 +255,13 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
   const parentList = parents.length === 0 ? "none configured" : parents.join(", ");
   const range = depth === 1 ? "1 level" : `1 to ${String(depth)} levels`;
   const refuse = (reason: string): Admission => ({ ok: false, reason });
+  /** QA round 1 (F1, F2): refusals no later rule may overturn (an exclusion, a link out of a parent, the parent itself). */
+  const finals = new WeakSet<Admission>();
+  const refuseFinal = (reason: string): Admission => {
+    const result = refuse(reason);
+    finals.add(result);
+    return result;
+  };
   const sameName = (a: string, b: string): boolean => (win ? a.toLowerCase() === b.toLowerCase() : a === b);
   const short = (sha: string | null): string => (sha === null ? "unknown" : sha.slice(0, 7));
 
@@ -255,6 +298,9 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
     const input = win ? path.toLowerCase() : path;
     return cfg.exclude.find((pattern) => pattern.trim() !== "" && permissionMatches(input, win ? pattern.toLowerCase() : pattern));
   };
+  /** {@link excludedBy} on the path as given and, on win32, with native separators (git prints `/`). */
+  const excludedText = (path: string): string | undefined =>
+    excludedBy(path) ?? (win && path.includes("/") ? excludedBy(path.replace(/\//g, "\\")) : undefined);
   const unique = (items: readonly string[]): string[] => {
     const seen = new Set<string>();
     const out: string[] = [];
@@ -269,6 +315,7 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
 
   // ── 5 s caches keyed by normalised path ──────────────────────────────────────────────────────────────────────────────
   const toplevels = new Map<string, CacheEntry<string | undefined>>();
+  const commons = new Map<string, CacheEntry<string | undefined>>();
   const lists = new Map<string, CacheEntry<string>>();
   const cached = <T>(cache: Map<string, CacheEntry<T>>, key: string, load: () => Promise<T>): Promise<T> => {
     const now = deps.now();
@@ -301,13 +348,31 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
         return undefined;
       }
     });
+  const commonDirOf = (cwd: string): Promise<string | undefined> =>
+    cached(commons, text(cwd), async () => {
+      try {
+        return await deps.commonDir(cwd);
+      } catch {
+        return undefined;
+      }
+    });
   const worktrees = async (cwd: string): Promise<WorktreeEntry[]> =>
     parseWorktreeEntries(await cached(lists, text(cwd), () => deps.listWorktrees(cwd)));
 
-  /** Whether hardened git prints `real` (canonical) as the top level of the repository in `real`. */
+  /** Whether hardened git prints `real` (canonical) as the top level of the repository in `real`; no git without a `.git` entry (F7). */
   const isToplevel = async (real: string): Promise<boolean> => {
+    if (!deps.gitEntry(real)) return false;
     const top = (await toplevel(real))?.trim();
     return top !== undefined && top !== "" && samePath(top, real);
+  };
+
+  /** QA round 1 (F2): git run in the canonical work root `real` names the repository git names in `repository` (common dir). */
+  const sameRepository = async (real: string, repository: string): Promise<boolean> => {
+    const [mine, theirs] = await Promise.all([commonDirOf(real), commonDirOf(repository)]);
+    if (mine === undefined || theirs === undefined) return false;
+    const a = canonical(mine);
+    const b = canonical(theirs);
+    return a !== null && b !== null && text(a) === text(b);
   };
 
   /** The location of the canonical work root `real`, from the worktree list run in `listFrom`. */
@@ -332,22 +397,22 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
 
   /** Rule 1 for `shown`, already placed 1..depth below `parent` by its text. */
   const belowParent = async (shown: string, parent: string): Promise<Admission> => {
-    const textExcluded = excludedBy(shown);
-    if (textExcluded !== undefined) return refuse(`root=${shown} is excluded by routing.repoExclude (${textExcluded}): no work root.`);
+    const textExcluded = excludedText(shown);
+    if (textExcluded !== undefined) return refuseFinal(`root=${shown} is excluded by routing.repoExclude (${textExcluded}): no work root.`);
     const realParent = canonical(parent);
     if (realParent === null) return refuse(`root=${shown}: the routing.repoParents entry ${parent} does not resolve: no work root.`);
     if (!deps.isDirectory(shown)) return refuse(`root=${shown} is not a directory: no work root.`);
     const real = canonical(shown);
     if (real === null) return refuse(`root=${shown} does not resolve: no work root.`);
     const levels = levelsBelow(text(real), text(realParent));
-    if (levels === undefined || levels === 0) return refuse(`root=${shown} leads outside ${parent} through a link (it resolves to ${real}): no work root.`);
-    const excluded = excludedBy(real);
-    if (excluded !== undefined) return refuse(`root=${shown} is excluded by routing.repoExclude (${excluded}): no work root.`);
+    if (levels === undefined || levels === 0) return refuseFinal(`root=${shown} leads outside ${parent} through a link (it resolves to ${real}): no work root.`);
+    const excluded = excludedText(real);
+    if (excluded !== undefined) return refuseFinal(`root=${shown} is excluded by routing.repoExclude (${excluded}): no work root.`);
     if (!(await isToplevel(real))) return refuse(`root=${shown} is not the top level of a git repository: no work root.`);
     return locate(shown, real, real);
   };
 
-  /** Rule 1: undefined when the text lies below no parent. */
+  /** Rule 1: undefined when the text lies below no parent. A final refusal under any parent ends the rule. */
   const ruleOne = async (shown: string): Promise<Admission | undefined> => {
     const rootText = text(shown);
     let first: Admission | undefined;
@@ -355,10 +420,10 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
       const levels = levelsBelow(rootText, text(parent));
       if (levels === undefined) continue;
       let result: Admission;
-      if (levels === 0) result = refuse(`root=${shown} is itself a parent in routing.repoParents; repositories are admitted ${range} below a parent: no work root.`);
+      if (levels === 0) result = refuseFinal(`root=${shown} is itself a parent in routing.repoParents; repositories are admitted ${range} below a parent: no work root.`);
       else if (levels > depth) result = refuse(`root=${shown} is ${String(levels)} levels below ${parent}; repositories are admitted ${range} below a parent (routing.repoDepth).`);
       else result = await belowParent(shown, parent);
-      if (result.ok) return result;
+      if (result.ok || finals.has(result)) return result;
       first ??= result;
     }
     return first;
@@ -393,35 +458,87 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
         return refuse(`root=${shown} is no longer a worktree of ${repository}: no work root.`);
       }
       if (!(await isToplevel(real))) return refuse(`root=${shown} is not the top level of a git repository: no work root.`);
+      // QA round 1 (F2): the re-check above resolves the listed path through the same link; confirm from the worktree side.
+      if (!(await sameRepository(real, repository))) {
+        const where = text(real) === rootText ? "but the directory there" : `but it leads through a link to ${real}, which`;
+        return refuseFinal(`root=${shown} is listed by git worktree list of ${repository}, ${where} belongs to another repository (git rev-parse --git-common-dir differs): no work root.`);
+      }
       return locate(shown, real, repository);
     }
     return undefined;
+  };
+
+  /**
+   * QA round 1 (F1, F2, F4): the last check on every admission, whichever rule admitted it. Refuses when `routing.repoExclude`
+   * matches the text or the canonical work root, when the canonical work root is or contains a canonical parent, and when the
+   * text lies below a parent whose canonical form does not hold the canonical work root.
+   */
+  const gate = (shown: string, result: Admission): Admission => {
+    if (!result.ok) return result;
+    const real = result.location.worktree;
+    const excluded = excludedText(shown) ?? excludedText(real);
+    if (excluded !== undefined) return refuse(`root=${shown} is excluded by routing.repoExclude (${excluded}): no work root.`);
+    const shownText = text(shown);
+    const realText = text(real);
+    for (const parent of parents) {
+      const parentText = text(parent);
+      const realParent = canonical(parent);
+      const realParentText = realParent === null ? parentText : text(realParent);
+      if (levelsBelow(parentText, shownText) !== undefined || levelsBelow(realParentText, realText) !== undefined) {
+        return refuse(`root=${shown} resolves to ${real}, which is or contains the routing.repoParents entry ${parent}; repositories are admitted ${range} below a parent: no work root.`);
+      }
+      if (levelsBelow(shownText, parentText) === undefined) continue;
+      if (realParent === null) return refuse(`root=${shown}: the routing.repoParents entry ${parent} does not resolve: no work root.`);
+      const levels = levelsBelow(realText, realParentText);
+      if (levels === undefined || levels === 0) return refuse(`root=${shown} leads outside ${parent} through a link (it resolves to ${real}): no work root.`);
+    }
+    return result;
   };
 
   const admit = async (root: string, known: readonly string[] = []): Promise<Admission> => {
     const shown = root.trim();
     const problem = rootTextProblem(shown, platform);
     if (problem !== undefined) return refuse(`root=${shown} ${problem}: no work root.`);
+    // QA round 1 (F1): an excluded text is refused before any call, whichever rule would admit it.
+    const textExcluded = excludedText(shown);
+    if (textExcluded !== undefined) return refuse(`root=${shown} is excluded by routing.repoExclude (${textExcluded}): no work root.`);
     const one = await ruleOne(shown);
-    if (one?.ok === true) return one;
+    if (one !== undefined && (one.ok || finals.has(one))) return gate(shown, one);
     const two = await ruleTwo(shown, known);
-    if (two !== undefined) return two;
+    if (two !== undefined) return gate(shown, two);
     if (one !== undefined) return one;
     const hint = parents[0] === undefined ? "" : ` Clone it or add a worktree below ${parents[0]}.`;
     return refuse(`root=${shown} is not below routing.repoParents (${parentList}) and is not a worktree of a repository in this session: no work root.${hint}`);
   };
 
-  /** `repo=X`: `<parent>\X`, then `<parent>\*\X` while the depth allows (one listing per level); admitted by rule 1, named X. */
-  const lookup = async (name: string): Promise<{ found: RepoLocation[]; refused: string[]; searched: string[] }> => {
+  /** The directories a `repo=` scan descends into below `dir`: no dot-directories, no `node_modules`, nothing excluded (F7). */
+  const scanned = (dir: string): string[] =>
+    deps.readdir(dir)
+      .filter((child) => !child.startsWith(".") && !sameName(child, "node_modules"))
+      .map((child) => paths.join(dir, child))
+      .filter((path) => excludedText(path) === undefined);
+
+  /**
+   * `repo=X`: `<parent>\X`, then `<parent>\*\X` while the depth allows (one listing per level); admitted by rule 1, named X.
+   * At most {@link LOOKUP_MAX_DIRS} directories are visited (`capped`).
+   */
+  const lookup = async (name: string): Promise<{ found: RepoLocation[]; refused: string[]; searched: string[]; capped: boolean }> => {
     const found: RepoLocation[] = [];
     const refused: string[] = [];
     const searched: string[] = [];
     const seen = new Set<string>();
+    let visited = 0;
+    let capped = false;
     for (const parent of parents) {
       let frontier = [parent];
       for (let level = 1; level <= depth; level++) {
         searched.push(paths.join(parent, ...Array.from({ length: level - 1 }, () => "*"), name));
         for (const dir of frontier) {
+          if (visited >= LOOKUP_MAX_DIRS) {
+            capped = true;
+            break;
+          }
+          visited++;
           const candidate = paths.join(dir, name);
           if (!deps.isDirectory(candidate)) continue;
           const result = await ruleOne(candidate);
@@ -436,14 +553,15 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
           seen.add(key);
           found.push(result.location);
         }
-        if (level === depth) break;
-        frontier = frontier.flatMap((dir) => deps.readdir(dir).map((child) => paths.join(dir, child)));
+        if (capped || level === depth) break;
+        frontier = frontier.flatMap(scanned);
       }
+      if (capped) break;
     }
-    return { found, refused, searched };
+    return { found, refused, searched, capped };
   };
 
-  /** The worktree of a repository (`worktrees`, git's order) for `branch`, or the only one. */
+  /** The worktree of a repository (`worktrees`, git's order) for `branch`, or the only one; admitted (and gated) by `admit`. */
   const pick = async (label: string, view: { readonly repository: string; readonly name: string; readonly worktrees: readonly WorktreeEntry[] }, branch: string | undefined, known: readonly string[]): Promise<Admission> => {
     const usable = view.worktrees.filter((entry) => !entry.bare && !entry.prunable);
     const knownHere = unique([...known, view.repository]);
@@ -504,10 +622,13 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
     }
 
     if (repo !== undefined) {
-      const { found, refused, searched } = await lookup(repo);
+      const { found, refused, searched, capped } = await lookup(repo);
       if (found.length === 0) {
-        const notes = refused.length === 0 ? "" : ` ${refused.join(" ")}`;
-        return refuse(`repo=${repo} matches no repository below routing.repoParents (searched ${searched.length === 0 ? "nothing: none configured" : searched.join(", ")}): no work root.${notes}`);
+        const quoted = refused.slice(0, LOOKUP_MAX_NOTES);
+        const more = refused.length - quoted.length;
+        const notes = `${quoted.length === 0 ? "" : ` ${quoted.join(" ")}`}${more > 0 ? ` … and ${String(more)} more.` : ""}`;
+        const stopped = capped ? ` The search stopped after ${String(LOOKUP_MAX_DIRS)} directories.` : "";
+        return refuse(`repo=${repo} matches no repository below routing.repoParents (searched ${searched.length === 0 ? "nothing: none configured" : searched.join(", ")}): no work root.${notes}${stopped}`);
       }
       if (found.length > 1) {
         return refuse(`repo=${repo} matches ${String(found.length)} repositories: ${joinAnd(found.map((location) => location.repository))}: no work root. Name one with root="<path>".`);

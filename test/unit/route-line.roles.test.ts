@@ -102,6 +102,47 @@ describe("route line cross-repo keys (repo, branch)", () => {
     },
   );
 
+  it.each([["renovate/foo+bar"], ["feat/ação"], ["a@b"], ["release/1.2+build#5"], ["wip{x}"]])(
+    "accepts the git-valid branch %j",
+    (value) => {
+      const { line } = parse(`[route branch=${value}]`);
+      expect(line?.branch).toBe(value);
+      expect(line?.ignored).toEqual([]);
+      expect(line?.invalidCrossRepo).toBeUndefined();
+    },
+  );
+
+  it.each([["a..b"], ["x.lock"], ["@"], ["a@{b"], ["a\u0001b"], ["a/.hidden"], ["a.lock/b"], ["a?b"], ["a*b"], ["a[b"], ["a^b"], ["a\u007fb"]])(
+    "ignores the git-invalid branch %j and marks it declared-but-invalid",
+    (value) => {
+      const { line } = parse(`[route branch=${value}]`);
+      expect(line?.branch).toBeUndefined();
+      expect(line?.ignored).toContain("branch");
+      expect(line?.invalidCrossRepo).toEqual([{ key: "branch", value }]);
+    },
+  );
+
+  it("marks an invalid repo, a bare repo / branch key, and keeps the value as written", () => {
+    expect(parse("[route repo=.dotfiles branch=main]").line?.invalidCrossRepo).toEqual([{ key: "repo", value: ".dotfiles" }]);
+    expect(parse("[route repo]").line?.invalidCrossRepo).toEqual([{ key: "repo", value: "" }]);
+    expect(parse("[route branch]").line?.invalidCrossRepo).toEqual([{ key: "branch", value: "" }]);
+    expect(parse("[route branch=A..B,]").line?.invalidCrossRepo).toEqual([{ key: "branch", value: "A..B" }]);
+  });
+
+  it("marks a duplicate repo / branch key (the first value is still kept)", () => {
+    const { line } = parse("[route repo=a repo=b branch=x branch=y]");
+    expect(line?.repo).toBe("a");
+    expect(line?.invalidCrossRepo).toEqual([{ key: "repo", value: "b" }, { key: "branch", value: "y" }]);
+  });
+
+  it("marks a repo / branch the route lines contradict, so a conflict never binds the session directory", () => {
+    const byBranch = parse("[route repo=a branch=x]\n[route repo=a branch=y]", "any");
+    expect(byBranch.line?.invalidCrossRepo).toEqual([{ key: "branch", value: "x" }]);
+    const byRepo = parse("[route repo=a]\n[route repo=b]", "any");
+    expect(byRepo.line?.invalidCrossRepo).toEqual([{ key: "repo", value: "a" }]);
+    expect(parse("[route repo=a branch=x]\n[route repo=a branch=x]", "any").line?.invalidCrossRepo).toBeUndefined();
+  });
+
   it("splits a branch at whitespace: the first token is the value, the rest is an unknown key", () => {
     const { line } = parse("[route branch=has space]");
     expect(line?.branch).toBe("has");
