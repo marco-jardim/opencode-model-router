@@ -1076,6 +1076,84 @@ describe("SlotPool sidecars, stages and gc locking (QA-2.4-25 to QA-2.4-29)", ()
     expect(h.warnings.some(w => w.includes(".bins"))).toBe(true);
   });
 
+  it("QA-2.4-31: on win32 only .exe and .com files are recorded", async () => {
+    const h = harness();
+    const original = h.prov.provision.bind(h.prov);
+    h.prov.provision = async (slot, detection, o) => {
+      await original(slot, detection, o);
+      for (const name of ["python.exe", "tool.com", "pip.cmd", "activate.bat", "Activate.ps1", "exe"]) h.fs.put(win32.join(slot, ".venv", "Scripts", name), "x");
+    };
+    await h.pool.open();
+    const lease = await h.pool.acquire(PLAN, "t1", C1);
+    const paths = (slotEnvFor(lease.path, "win32")?.bins ?? []).map(b => win32.basename(b.path)).sort();
+    expect(paths).toEqual(["python.exe", "tool.com"]);
+  });
+
+  it("QA-2.4-31: on win32 node_modules\\.bin is not recorded, however many shims it holds", async () => {
+    const h = harness();
+    h.git.files = { "package.json": "{}\n", "package-lock.json": "{}\n" };
+    const original = h.prov.provision.bind(h.prov);
+    h.prov.provision = async (slot, detection, o) => {
+      await original(slot, detection, o);
+      for (let n = 0; n < 600; n++) h.fs.put(win32.join(slot, "node_modules", ".bin", `shim-${n}.exe`), "x");
+    };
+    await h.pool.open();
+    const lease = await h.pool.acquire(PLAN, "t1", C1);
+    expect(h.prov.calls[0]?.managers).toContain("npm");
+    expect(slotEnvFor(lease.path, "win32")?.bins).toEqual([]);
+    expect(JSON.parse(h.fs.text(sidecar(lease.slot, "bins")) ?? "null")).toEqual([]);
+  });
+
+  it("QA-2.4-31: a large .bins list is not written, the slot still leases and router_run falls back to PATH", async () => {
+    const h = harness();
+    const original = h.prov.provision.bind(h.prov);
+    h.prov.provision = async (slot, detection, o) => {
+      await original(slot, detection, o);
+      for (let n = 0; n < 600; n++) h.fs.put(win32.join(slot, ".venv", "Scripts", `a-rather-long-tool-name-${String(n).padStart(4, "0")}.exe`), "x");
+    };
+    await h.pool.open();
+    const lease = await h.pool.acquire(PLAN, "t1", C1);
+    expect(lease.slot).toBe("slot-1");
+    expect(h.fs.text(sidecar(lease.slot, "bins"))).toBeNull();
+    expect(slotEnvFor(lease.path, "win32")?.bins).toEqual([]);
+    expect(h.warnings.some(w => w.includes(".bins") && w.includes("exceed"))).toBe(true);
+    expect(h.marker(lease.slot).state).toBe("leased");
+  });
+
+  it("QA-2.4-31: a large produced list is not written but is kept in memory for the next clean", async () => {
+    const h = harness();
+    h.git.preview = () => Array.from({ length: 600 }, (_, n) => `${"build-output-directory-".padEnd(120, "x")}${String(n).padStart(4, "0")}/`);
+    await h.pool.open();
+    const lease = await h.pool.acquire(PLAN, "t1", C1);
+    expect(h.fs.text(sidecar(lease.slot, "produced"))).toBeNull();
+    expect(h.warnings.some(w => w.includes(".produced") && w.includes("exceed"))).toBe(true);
+    await h.pool.release(lease.slot);
+    await h.pool.acquire(PLAN, "t2", C1);
+    expect(h.git.resetKeeps[0]).toContain(`/${"build-output-directory-".padEnd(120, "x")}0599`);
+  });
+
+  it("a clean candidate whose parent directory is already gone is skipped by the link sweep (no leftover entries)", async () => {
+    const h = harness();
+    h.git.preview = () => ["gone/deep/file.txt"];
+    await h.pool.open();
+    const first = await h.pool.acquire(PLAN, "t1", C1);
+    await h.pool.release(first.slot);
+    await expect(h.pool.acquire(PLAN, "t2", C1)).resolves.toMatchObject({ slot: first.slot });
+  });
+
+  it("a reset to a commit without any manifest drops the install records of the slot", async () => {
+    const h = harness();
+    await h.pool.open();
+    const lease = await h.pool.acquire(PLAN, "t1", C1);
+    expect(h.fs.text(sidecar(lease.slot, "bins"))).not.toBeNull();
+    h.git.files = { "README.md": "docs\n" };
+    await h.pool.reset(lease.slot, C2);
+    expect(h.prov.calls).toHaveLength(1);
+    expect(h.fs.text(sidecar(lease.slot, "bins"))).toBeNull();
+    expect(h.fs.text(sidecar(lease.slot, "produced"))).toBeNull();
+    expect(h.marker(lease.slot).managers).toEqual([]);
+  });
+
   it("QA-2.4-28: provisioning and the pool share one sweep cap", () => {
     expect(SLOT_SWEEP_MAX_ENTRIES).toBe(2_000_000);
     expect(PROVISION_SWEEP_MAX_ENTRIES).toBe(SLOT_SWEEP_MAX_ENTRIES);
@@ -1436,6 +1514,16 @@ describe("SlotPool gc", () => {
     );
     expect(out.removed).toEqual([path]);
   });
+
+  it("still collects from the explicit slotsDir when the repository has no drive-letter default", async () => {
+    const h = harness();
+    const path = await leased(h);
+    const out = await gcSlots(
+      { repoKey: "repo-key", toplevel: "\\\\server\\share\\repo", slotsDir: SLOTS, markersDir: MARKERS, executorHome: HOME, git: h.git, fs: h.fs, clock: h.clock, platform: "win32" },
+      async () => true,
+    );
+    expect(out.removed).toEqual([path]);
+  });
 });
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1486,6 +1574,22 @@ describe("SlotPool QA round 1 (git.ts / pool.ts)", () => {
     await h.pool.reset(lease.slot, C2);
     expect(h.fs.removed).toContainEqual({ path: win32.join(lease.path, "tools", "node_modules", "x"), recursive: false });
     expect(h.git.log.indexOf(`clean ${key(lease.path)}`)).toBeGreaterThan(h.git.log.indexOf(`checkout ${key(lease.path)} 22`));
+  });
+
+  it("a tracked link that the clean lists is left alone, an untracked one is removed", async () => {
+    const h = harness();
+    await h.pool.open();
+    const lease = await h.pool.acquire(PLAN, "t1", C1);
+    h.fs.dir("D:\\precious");
+    for (const name of ["tracked-link", "stray-link"]) {
+      h.fs.nodes.set(key(win32.join(lease.path, name)), "junction");
+      h.fs.targets.set(key(win32.join(lease.path, name)), "D:\\precious");
+    }
+    h.git.links = ["tracked-link"];
+    h.git.preview = () => ["tracked-link", "stray-link"];
+    await h.pool.cleanForChecks(lease.slot);
+    expect(h.fs.removed).toContainEqual({ path: win32.join(lease.path, "stray-link"), recursive: false });
+    expect(h.fs.removed).not.toContainEqual({ path: win32.join(lease.path, "tracked-link"), recursive: false });
   });
 
   // QA-2.4-2

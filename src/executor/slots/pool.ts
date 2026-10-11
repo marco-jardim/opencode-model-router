@@ -342,11 +342,18 @@ async function readMarkerFile(x: FileCtx, file: string): Promise<MarkerRead> {
   return { ok: true, rec: value };
 }
 
-async function writeSidecar(x: FileCtx, planId: PlanId, slot: string, extension: string, text: string): Promise<void> {
+/**
+ * Writes a sidecar. A sidecar is an optimisation, never a reason to refuse a slot (QA-2.4-31): one over the cap is
+ * not written (a stale one is removed) with a warning, and false is returned so the caller keeps its list in memory only.
+ */
+async function writeSidecar(x: FileCtx, planId: PlanId, slot: string, extension: string, text: string): Promise<boolean> {
   if (Buffer.byteLength(text, "utf8") > MARKER_MAX_BYTES) {
-    throw new ExecutorError("E_SLOT_BROKEN", `the .${extension} file of ${slot} would exceed ${MARKER_MAX_BYTES} bytes`, { slot });
+    x.logger?.warn(`slot ${slot}: the .${extension} file would exceed ${MARKER_MAX_BYTES} bytes; it is not written`);
+    await removeSidecar(x, planId, slot, extension);
+    return false;
   }
   await writeAtomic(x, sidecarPath(x.markersDir, planId, slot, extension), text);
+  return true;
 }
 
 /** The text of a sidecar, or null when it is missing, not a regular file, too large or unreadable (a warning for the last three). */
@@ -832,6 +839,7 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
     const berry = managers.includes("yarn") && await d.fs.lstat(api.join(rec.path, ".yarnrc.yml")) !== null;
     const listed = await d.git.cleanPreview(rec.path, keepFor(managers, berry));
     const patterns = listed.map((p) => `/${p.replace(/\/+$/, "").replace(/[\\*?[\]]/g, "\\$&")}`);
+    // Too large for a sidecar: the patterns stay in memory only (a restart then warns and keeps nothing).
     await writeSidecar(fileCtx, rec.planId, rec.slot, "produced", `${JSON.stringify(patterns)}\n`);
     produced.set(rec.slot, patterns);
   }
@@ -840,17 +848,20 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
   async function recordBins(rec: SlotRecord, managers: readonly string[]): Promise<void> {
     const dirs: string[] = [];
     if (managers.some((m) => PYTHON_MANAGER_NAMES.includes(m))) dirs.push(api.join(rec.path, ".venv", platform === "win32" ? "Scripts" : "bin"));
-    if (managers.some((m) => NODE_MANAGER_NAMES.includes(m))) dirs.push(api.join(rec.path, "node_modules", ".bin"));
+    // router_run only takes .exe/.com on win32, where node_modules\.bin holds none (only .cmd/.ps1 shims): skip it (QA-2.4-31).
+    if (platform !== "win32" && managers.some((m) => NODE_MANAGER_NAMES.includes(m))) dirs.push(api.join(rec.path, "node_modules", ".bin"));
     const bins: SlotBin[] = [];
     for (const dir of dirs) {
       for (const name of await readdirOrEmpty(d.fs, dir)) {
+        if (platform === "win32" && !/\.(exe|com)$/i.test(name)) continue;
         const file = api.join(dir, name);
         const st = await d.fs.lstat(file);
         if (st !== null && (st.kind === "file" || st.kind === "symlink")) bins.push({ path: file, size: st.size, mtimeMs: st.mtimeMs });
       }
     }
-    await writeSidecar(fileCtx, rec.planId, rec.slot, "bins", `${JSON.stringify(bins)}\n`);
-    binsOf.set(rec.slot, bins);
+    // Too large for a sidecar: no snapshot at all, so router_run falls back to PATH for this slot.
+    if (await writeSidecar(fileCtx, rec.planId, rec.slot, "bins", `${JSON.stringify(bins)}\n`)) binsOf.set(rec.slot, bins);
+    else binsOf.delete(rec.slot);
   }
 
   /** The slot has no install (no managers, retired, recreated): forget what the previous one produced. */
@@ -1169,7 +1180,7 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
         // The restoring checkout can only touch tracked paths: a whole-slot sweep (dependency dirs skipped) covers it.
         const walk = await sweepLinks(ctx, rec.path, { skipDependencyDirs: true, tracked });
         if (walk.truncated) throw new ExecutorError("E_SLOT_BROKEN", `more than ${SLOT_SWEEP_MAX_ENTRIES} entries in ${slot}`, { slot });
-        // The agent's files include links anywhere; the clean removes whatever `clean -ndx -e <keep>` lists, so sweep
+        // The agent's files include links anywhere; the clean removes whatever `clean -ffndx -e <keep>` lists, so sweep
         // exactly that list in full (a `node_modules` below the root is deleted unless excluded with the same anchoring).
         const keep = await keepList(rec);
         const sweep = await sweepLinks(ctx, rec.path, { skipDependencyDirs: false, tracked, starts: await d.git.cleanPreview(rec.path, keep) });
