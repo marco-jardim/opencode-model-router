@@ -336,7 +336,7 @@ export function createInFlightRegistry(deps: {
   const calls = new Map<string, CallRecord | Attempt>();
   const attempts = new Map<string, Attempt>();
   const newestByChild = new Map<string, string>();
-  const earlyEnds = new Map<string, EndFact>();
+  const earlyEnds = new Map<string, { end: EndFact; seen: number }>();
 
   function dropAttempt(key: string): void {
     const a = attempts.get(key);
@@ -447,15 +447,16 @@ export function createInFlightRegistry(deps: {
 
     noteEarlyEnd(child, end) {
       earlyEnds.delete(child);
-      earlyEnds.set(child, end);
+      // The TTL runs on this process's clock from the moment the end was parked, not on the host event's own timestamp.
+      earlyEnds.set(child, { end, seen: deps.now() });
       trimMap(earlyEnds, MAX_EARLY_ENDS, () => false);
     },
 
     takeEarlyEnd(child) {
-      const end = earlyEnds.get(child);
-      if (end === undefined) return undefined;
+      const parked = earlyEnds.get(child);
+      if (parked === undefined) return undefined;
       earlyEnds.delete(child);
-      return deps.now() - end.at > EARLY_END_TTL_MS ? undefined : end;
+      return deps.now() - parked.seen > EARLY_END_TTL_MS ? undefined : parked.end;
     },
 
     listForParent(parent) {
@@ -490,7 +491,7 @@ export function createInFlightRegistry(deps: {
         closeOpen(a, "sweep");
         closed.push(a);
       }
-      for (const [child, end] of earlyEnds) if (now - end.at > EARLY_END_TTL_MS) earlyEnds.delete(child);
+      for (const [child, parked] of earlyEnds) if (now - parked.seen > EARLY_END_TTL_MS) earlyEnds.delete(child);
       for (const [callID, rec] of calls) {
         if (!isAttempt(rec) && now - rec.at > ATTEMPT_SWEEP_AGE_MS) calls.delete(callID);
       }
@@ -1409,6 +1410,18 @@ export function createLeaseGuard(deps: LeaseGuardDeps): LeaseGuard {
         const targets = toolTargets(e.tool, e.args, a.dir, gitRoot === undefined ? undefined : { gitRoot });
         const holder = holderOf(e.sessionID, a);
         const registry = deps.registry;
+
+        if (targets.access !== "write" && targets.gitRootRequired === true) {
+          // A git call with no known git root names no concrete target: an unknown target (leases.ts handoffs). Outside any
+          // repository the registry cannot scope the check to one, so a child is refused while any other holder has leases.
+          if (!holder.isChild) return {};
+          const snapshot = registry.snapshot();
+          const others = snapshot.holders.filter((h) => h.holderID !== holder.holderID && snapshot.leases.some((l) => l.holderID === h.holderID));
+          if (others.length === 0) return {};
+          return {
+            refuse: `[router] Refused: this ${e.tool} call names no file the router can check, and ${holderLabels(deps, others)} is editing files in this repository. Pass the file path explicitly, or return \`NEED MORE: lease ${holder.tree}\`.`,
+          };
+        }
 
         if (targets.access === "write") {
           const known = targets.paths.length > 0 && targets.gitRootRequired !== true;

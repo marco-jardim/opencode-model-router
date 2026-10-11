@@ -15,6 +15,7 @@ import { dirname, join } from "node:path";
 import { vi } from "vitest";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import type { Hooks } from "@opencode-ai/plugin";
+import { ROUTER_FINISH_ATTACH, type HeldResults } from "../../src/compat/background";
 import { registerV2Hooks } from "../../src/compat/v2-hooks";
 import ModelRouterPlugin from "../../src/index";
 import { invalidateConfigCache, overridePath } from "../../src/router/config";
@@ -32,6 +33,8 @@ export interface SyntheticCall {
   description?: string;
   metadata?: Record<string, unknown>;
   resume?: boolean;
+  /** How the fake host delivered the entry: a steer to a busy parent, a wake to an idle one. */
+  delivery?: "steer" | "wake";
 }
 
 export interface ToolEvent {
@@ -55,6 +58,12 @@ export interface BgHost {
   /** `session.context(child)` answers; `undefined` = an empty context. */
   childContext: Map<string, unknown[]>;
   synthetic: SyntheticCall[];
+  /** Count of `resume: true` entries delivered as a steer / as a wake. */
+  deliveries: { steer: number; wake: number };
+  /** Marks a session as mid-turn (busy) or idle for the delivery of `synthetic` entries. */
+  setBusy(sessionID: string, busy: boolean): void;
+  /** The held store the plugin's gate posts verdicts through (the sink the adapter attached). */
+  heldSink: HeldResults;
   sessionHooks: Record<string, (event: never) => Promise<void>>;
   toolHooks: Record<string, (event: never) => Promise<void>>;
   hooks: Hooks;
@@ -108,6 +117,8 @@ export async function bootBgHost(options: BootOptions = {}): Promise<BgHost> {
   const sessions = new Map<string, SessionSpec>(Object.entries(options.sessions ?? {}));
   const childContext = new Map<string, unknown[]>();
   const synthetic: SyntheticCall[] = [];
+  const busy = new Set<string>();
+  const deliveries = { steer: 0, wake: 0 };
   const sessionHooks: Record<string, (event: never) => Promise<void>> = {};
   const toolHooks: Record<string, (event: never) => Promise<void>> = {};
   const queue: unknown[] = [];
@@ -143,8 +154,11 @@ export async function bootBgHost(options: BootOptions = {}): Promise<BgHost> {
     },
   };
   if (options.omitSynthetic !== true) {
+    // A host delivers a `resume: true` entry as a steer to a parent that is mid-turn and as one wake to an idle parent.
     session.synthetic = async (input: SyntheticCall) => {
-      synthetic.push(input);
+      const delivery = busy.has(input.sessionID) ? "steer" : "wake";
+      if (input.resume === true) deliveries[delivery] += 1;
+      synthetic.push({ ...input, delivery });
     };
   }
 
@@ -193,7 +207,23 @@ export async function bootBgHost(options: BootOptions = {}): Promise<BgHost> {
     client: { session: { get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id } }) } },
   } as unknown as Parameters<typeof ModelRouterPlugin>[0]);
 
-  const cleanup = await registerV2Hooks(ctx as unknown as Context, hooks);
+  // The sink the adapter hands the plugin's finish API: the gate's verdicts reach the held store through it.
+  const attachFinish: unknown = Reflect.get(hooks, ROUTER_FINISH_ATTACH);
+  let captured: HeldResults | undefined;
+  // The attach slot is read-only on the plugin's hooks object, so the adapter gets a copy whose slot records the sink.
+  const descriptors = Object.getOwnPropertyDescriptors(hooks);
+  Reflect.deleteProperty(descriptors, ROUTER_FINISH_ATTACH);
+  const seen: Hooks = Object.create(Object.getPrototypeOf(hooks), descriptors);
+  if (typeof attachFinish === "function") {
+    Object.defineProperty(seen, ROUTER_FINISH_ATTACH, {
+      value: (input: { held: HeldResults }): unknown => {
+        captured = input.held;
+        return Reflect.apply(attachFinish, hooks, [input]);
+      },
+    });
+  }
+
+  const cleanup = await registerV2Hooks(ctx as unknown as Context, seen);
 
   const turns = async (n = 40): Promise<void> => {
     for (let i = 0; i < n; i += 1) await Promise.resolve();
@@ -210,6 +240,15 @@ export async function bootBgHost(options: BootOptions = {}): Promise<BgHost> {
     sessions,
     childContext,
     synthetic,
+    deliveries,
+    setBusy(sessionID, isBusy) {
+      if (isBusy) busy.add(sessionID);
+      else busy.delete(sessionID);
+    },
+    get heldSink(): HeldResults {
+      if (captured === undefined) throw new Error("the plugin did not attach the finish API");
+      return captured;
+    },
     sessionHooks,
     toolHooks,
     hooks,

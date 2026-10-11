@@ -1978,12 +1978,18 @@ export async function registerV2Hooks(
       // Phase 2.1 (memo §4.2): authority checks first, then the held refusal, then the leases (all before the legacy hook).
       if (bgActive()) {
         adoptSession(String(event.sessionID));
-        const heldRefusal = held.refusal(String(event.sessionID), event.tool, args);
+        // `args` (scopedArgs) rewrites `task_id` from `sessionID`: a call that names the child by `task_id` must still be seen.
+        const rawInput = event.input !== null && typeof event.input === "object" ? event.input as Record<string, unknown> : undefined;
+        const heldArgs = rawInput === undefined || args === null || typeof args !== "object" || typeof rawInput.task_id !== "string"
+          ? args
+          : { ...args, task_id: rawInput.task_id };
+        const heldRefusal = held.refusal(String(event.sessionID), event.tool, heldArgs);
         if (heldRefusal !== undefined) throw refused(heldRefusal, callerRole);
       }
-      // Only the tools the guard checks (file tools, `router_git_*`, `router_run`) reach it: no host call for any other tool.
+      // Only the tools the guard checks (file tools, `router_git_*`, `router_run`) and the search tools (`glob`/`grep`, whose
+      // result the guard filters, so the actor must be resolved before them) reach it: no host call for any other tool.
       const leaseClass = roleActionOf(event.tool);
-      if (leaseGuard !== undefined && (leaseClass === "read" || leaseClass === "edit" || event.tool.startsWith("router_git_") || event.tool === "router_run")) {
+      if (leaseGuard !== undefined && (leaseClass === "read" || leaseClass === "edit" || event.tool === "glob" || event.tool === "grep" || event.tool.startsWith("router_git_") || event.tool === "router_run")) {
         const lease = await leaseGuard.before({ sessionID: String(event.sessionID), tool: event.tool, args, callID: event.id });
         if (lease.refuse !== undefined) throw refused(lease.refuse, callerRole);
         if (lease.runNote !== undefined) {

@@ -3489,6 +3489,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       if (pendingFile === undefined) return;
       // `inflight` and `hold` records are fsync'd (memo §11.2); the rest only when the caller asks.
       const fsync = opts?.fsync === true || record.kind === "inflight" || record.kind === "hold";
+      // The file journal makes its directory once; a directory removed since (a cleaned store, a tmp sweep) must not turn every
+      // later append (`processed`, `posting`, `posted`) into an ENOENT, so it is made again before each append.
+      if (pendingDir !== undefined && !existsSync(pendingDir)) mkdirSync(pendingDir, { recursive: true });
       await pendingFile.append(record, fsync ? { fsync: true } : undefined);
     },
     hasProcessed: (key) => processedKeys.has(key),

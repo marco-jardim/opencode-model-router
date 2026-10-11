@@ -8,13 +8,12 @@
  * written by a previous process: the reload / adoption path (memo 11.3, R20) is the one a restart takes, and it exercises the
  * same matcher the live path uses.
  *
- * Source observations are pinned as `it.fails("Dn: ...")` (they pass the suite while the defect exists and turn red when it is
- * fixed): D2 early end not processed at the ack, D3 held verdict never posted (journal append fails), D4 resume by `task_id`
- * of a held child not refused, D5 a lost child (empty history) is never annotated.
- * Verdict posting to a busy / idle parent (PASS, FAIL: one `synthetic` with `resume: true`) is unit-tested in
- * completion-processor.test.ts and by the smoke (cpx-background.smoke.test.ts, a later dispatch).
+ * The defects found by 2.1.8 are fixed and pinned by plain tests named "Dn: ...": D2 early end processed at the ack, D3 held
+ * verdict posted (the pending journal survives a removed directory), D4 resume by `task_id` of a held child refused, D5 a lost
+ * child (empty history) annotated. Verdict posting through the real adapter to a busy and to an idle parent (PASS, FAIL: one
+ * `synthetic` with `resume: true`) is tested in "held verdicts posted to the parent" below.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { bootBgHost, restoreEnv, type BgHost, type ToolEvent } from "../helpers/v2-bg-host";
 
 let host: BgHost | undefined;
@@ -193,11 +192,9 @@ describe("background dispatch: acknowledgement, in-flight list, completion annot
     expect(allText(after)).toContain('state="held"');
   });
 
-  // D2 (observed): with the child's end event delivered BEFORE the host's running acknowledgement, the parked end is not
-  // processed at the ack. src/compat/v2-hooks.ts:2344-2345 (`void processor?.process(resultChild, { kind: "early-end", end: early })`)
-  // runs after the ack, but the next request still lists the attempt as "In flight (background): 1" and the Held entry, as if
-  // no end was seen. Expected: the attempt is processed (no longer in flight), as in the ack -> end order above.
-  it.fails("D2: an end event seen before the acknowledgement is processed at the ack (R3)", async () => {
+  // D2: with the child's end event delivered BEFORE the host's running acknowledgement, the parked end is processed at the ack
+  // (memo §4.3 step 2, R3), as in the ack -> end order above.
+  it("D2: an end event seen before the acknowledgement is processed at the ack (R3)", async () => {
     const h = await boot("auto");
     h.emit(created(CHILD, ORCH));
     childSays(h, CHILD, "fast result");
@@ -238,11 +235,8 @@ describe("background dispatch: acknowledgement, in-flight list, completion annot
     expect(state).toContain("[router] In flight (background): 1");
   });
 
-  // D3 (observed): a held child that ENDED FAILED must get an UNVERIFIABLE verdict entry (completion processor, memo 4.7 step 7).
-  // The host logs `[router] held verdict journal failed` and `ctx.session.synthetic` is never called, so the placeholder and the
-  // "Held for verification ... verifying" tail entry stay forever. Source: HeldResults.verdict -> post -> `journal.append`
-  // (src/compat/background.ts:~697 `posting` record) rejects; the shared journal comes from finishApi.journal (src/compat/v2-hooks.ts:1190-1199).
-  it.fails("D3: a failed held child gets an UNVERIFIABLE verdict entry posted to the parent (R9)", async () => {
+  // D3: a held child that ENDED FAILED gets an UNVERIFIABLE verdict entry (completion processor, memo 4.7 step 7).
+  it("D3: a failed held child gets an UNVERIFIABLE verdict entry posted to the parent (R9)", async () => {
     const h = await boot("auto");
     h.emit(created(CHILD, ORCH));
     const call = await h.before(dispatch({ background: true }));
@@ -250,6 +244,8 @@ describe("background dispatch: acknowledgement, in-flight list, completion annot
     childSays(h, CHILD, "partial work");
     h.emit(ended(CHILD, "failed"));
     await h.drain();
+    // The processor journals (file I/O) before it posts, which microtask turns alone do not cover.
+    await vi.waitFor(() => expect(h.synthetic.filter((s) => s.text.startsWith("<router-verdict "))).toHaveLength(1));
     const verdicts = h.synthetic.filter((s) => s.text.startsWith("<router-verdict "));
     expect(verdicts).toHaveLength(1);
     expect(verdicts[0]?.text).toContain('verdict="UNVERIFIABLE"');
@@ -319,11 +315,8 @@ describe("held results across a restart (R20): placeholder, refusal, compaction"
     await expect(h.before(dispatch({ sessionID: CHILD }))).rejects.toThrow(`[router] Refused: session ${CHILD} is held for verification (${HANDLE}).`);
   });
 
-  // D4 (observed): HeldResults.refusal honours `task_id` (unit-verified in completion-processor.test.ts), but the adapter's
-  // execute.before lets a resume of a held child through when the call names it by `task_id`: the call resolves, the input
-  // is rewritten as a plain fresh dispatch (background:false) and the host would run it. src/compat/v2-hooks.ts:1979-1983
-  // calls `held.refusal(sessionID, event.tool, args)`; `args` (scopedArgs) apparently does not carry `task_id`.
-  it.fails("D4: a resume of a held child by task_id is refused", async () => {
+  // D4: HeldResults.refusal honours `task_id`; execute.before hands it the raw input, not the scoped arguments.
+  it("D4: a resume of a held child by task_id is refused", async () => {
     const h = await boot("auto", { journalText: holdJournal(HANDLE, CHILD, "call-old") });
     await request(h, [user("hello")]);
     await expect(h.before(dispatch({ task_id: CHILD }))).rejects.toThrow(/held for verification/);
@@ -362,6 +355,40 @@ describe("held results across a restart (R20): placeholder, refusal, compaction"
   });
 });
 
+describe("held verdicts posted to the parent (memo 5, 7.3)", () => {
+  // The gate settles behind `finish` and hands its verdict to the held store through the sink the adapter gave the plugin
+  // (`h.heldSink`); the store posts ONE `synthetic` entry with `resume: true`. The fake host delivers it as a steer to a parent
+  // that is mid-turn (busy) and as exactly one wake to a parent that is idle.
+  for (const verdict of ["PASS", "FAIL"] as const) {
+    for (const parent of ["busy", "idle"] as const) {
+      it(`a ${verdict} verdict is posted once to a ${parent} parent`, async () => {
+        const h = await boot("auto");
+        h.emit(created(CHILD, ORCH));
+        const call = await h.before(dispatch({ background: true }));
+        await h.after({ ...call, status: "completed", result: structuredClone(RUNNING) });
+        const handle = /vrf_[0-9a-f]{24}/.exec(tail(await request(h, [user("go on")])))?.[0];
+        expect(handle).toBeDefined();
+        h.setBusy(ORCH, parent === "busy");
+        await h.heldSink.verdict(handle ?? "", { verdict, text: `the ${verdict} result` });
+        await h.drain();
+        expect(h.synthetic).toHaveLength(1);
+        const posted = h.synthetic[0];
+        expect(posted?.text).toContain(`<router-verdict handle="${handle}" sessionID="${CHILD}" verdict="${verdict}">`);
+        expect(posted?.text).toContain(`the ${verdict} result`);
+        expect(posted?.sessionID).toBe(ORCH);
+        expect(posted?.resume).toBe(true);
+        expect(posted?.delivery).toBe(parent === "busy" ? "steer" : "wake");
+        expect(h.deliveries).toEqual({ steer: parent === "busy" ? 1 : 0, wake: parent === "busy" ? 0 : 1 });
+        // The hold is released: the placeholder stays, the tail no longer lists the child as held.
+        expect(tail(await request(h, [user("go on")]))).not.toContain("Held for verification");
+        // A second verdict for the same handle posts nothing more.
+        await h.heldSink.verdict(handle ?? "", { verdict, text: "again" });
+        expect(h.synthetic).toHaveLength(1);
+      });
+    }
+  }
+});
+
 describe("a restart between the ack and the end (R18)", () => {
   it("an inflight record without processed is recovered when its parent is seen: finished -> processed", async () => {
     const journal = `${JSON.stringify({ v: 1, kind: "inflight", key: `${CHILD}\u0000call-old`, callID: "call-old", parentSessionID: ORCH, childSessionID: CHILD, label: "fast \"x\"", agent: "fast", description: "x", verifying: false, verificationMode: "none", hold: null, at: Date.now() })}\n`;
@@ -373,17 +400,17 @@ describe("a restart between the ack and the end (R18)", () => {
     expect(state).toContain("[router] Completed since your last turn:");
   });
 
-  // D5 (observed): an adopted `inflight` record whose child has an EMPTY history (lost, R18) must end annotated "[router] the
-  // dispatch was lost in a restart" (src/compat/background.ts body(): recovery/lost branch) and show in the tail. Neither the
-  // request that adopts the session nor the next one carries any router state (no tail, no pending line, no annotation); the
-  // same record with a finished child (previous test) renders. Recovery: src/compat/v2-hooks.ts:2240-2271.
-  it.fails("D5: a lost child (no result in its history) is annotated as lost in the restart", async () => {
-    const journal = `${JSON.stringify({ v: 1, kind: "inflight", key: `${CHILD}\u0000call-old`, callID: "call-old", parentSessionID: ORCH, childSessionID: CHILD, label: "fast \"x\"", agent: "fast", description: "x", verifying: false, verificationMode: "none", hold: null, at: Date.now() })}\n`;
+  // D5: an adopted `inflight` record whose child has an EMPTY history (lost, R18) ends annotated "[router] the dispatch was lost
+  // in a restart" and shows in the tail, like the same record with a finished child (previous test).
+  it("D5: a lost child (no result in its history) is annotated as lost in the restart", async () => {
+    // A call id of its own: the in-flight registry's `bg:<callID>` claims are process-wide, and the test above already took call-old.
+    const journal = `${JSON.stringify({ v: 1, kind: "inflight", key: `${CHILD}\u0000call-lost`, callID: "call-lost", parentSessionID: ORCH, childSessionID: CHILD, label: "fast \"x\"", agent: "fast", description: "x", verifying: false, verificationMode: "none", hold: null, at: Date.now() })}\n`;
     const h = await boot("auto", { journalText: journal });
-    const first = await request(h, [user("hello")]);
+    await request(h, [user("hello")]);
     await h.drain();
-    const second = await request(h, [user("hello")]);
-    // Whatever the first request caught (the pending line), the next one carries the annotation.
-    expect(allText(first) + allText(second)).toContain("the dispatch was lost in a restart");
+    // The recovery reads the child's history and journals before it annotates (file I/O): a later request carries the line.
+    await vi.waitFor(async () => {
+      expect(allText(await request(h, [user("hello")]))).toContain("the dispatch was lost in a restart");
+    });
   });
 });

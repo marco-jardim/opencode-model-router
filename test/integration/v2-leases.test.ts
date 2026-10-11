@@ -178,10 +178,8 @@ describe("leases: search results", () => {
     return { leased, free, text: JSON.stringify(after.result) };
   }
 
-  // D1 (source observation): afterSearch filters only for a child whose actor an earlier read / edit / run call resolved
-  // (the actor cache is filled by resolveActor() in LeaseGuard.before, src/compat/background.ts:~1362; v2-hooks.ts:1986 only
-  // calls before() for file / git / run tools); a child whose FIRST tool call is a grep sees the leased path unfiltered.
-  it.fails("D1: a grep result is filtered even when it is the child's first tool call", async () => {
+  // D1: afterSearch resolves the child's actor itself, so a grep that is the child's first tool call is filtered too.
+  it("D1: a grep result is filtered even when it is the child's first tool call", async () => {
     const h = await boot();
     const { leased, text } = await grepAfter(h, false);
     expect(text).not.toContain(leased.replace(/\\/g, "\\\\"));
@@ -249,12 +247,10 @@ describe("leases: release", () => {
 });
 
 describe("leases: unknown targets", () => {
-  // D6 (observed, memo 14.1/17): `toolTargets` reports `gitRootRequired` for a router_git_* call when no git root is known, and the
-  // guard must then refuse it as an unknown target while another child edits files. Here the session directory is not inside a
-  // git repository (gitRootOf -> undefined), child A holds a write lease, and child B's `router_git_diff {}` is ALLOWED
-  // (v2-hooks.ts:1986-1988 -> LeaseGuard.before returned neither refuse nor runNote). I did not read tool-paths.ts, so the
-  // expectation is the memo's, not a confirmed reading of the code.
-  it.fails("D6: a router_git_* call without a git root names no file the router can check, while another child edits", async () => {
+  // D6 (memo 14.1/17): `toolTargets` reports `gitRootRequired` for a router_git_* call when no git root is known, and the
+  // guard refuses it as an unknown target while another child edits files. Here the session directory is not inside a
+  // git repository (gitRootOf -> undefined) and child A holds a write lease.
+  it("D6: a router_git_* call without a git root names no file the router can check, while another child edits", async () => {
     const h = await boot();
     await h.before(edit(A, file(h, "g.ts")));
     await expect(h.before(tool(B, "router_git_diff", {}))).rejects.toThrow(/names no file the router can check, and session child-a is editing files/);
