@@ -382,9 +382,11 @@
 import { randomBytes } from "node:crypto";
 
 import type { DoD } from "./dod";
+import type { PerimeterObservation } from "./gate";
+import type { LinkPin } from "./pin";
 import type { RiskAssessment, RiskLevel } from "./risk";
 import type { ChangedPath } from "./runner";
-import type { ReferenceState, Verdict } from "./types";
+import type { CheckPlacement, ReferenceState, Verdict } from "./types";
 
 // ---------------------------------------------------------------------------------------------
 // Constants (R2, R7, R9)
@@ -456,6 +458,25 @@ export const REPORTED_MEMO_MAX = TOMBSTONE_MAX;
 
 export type PendingState = "unverified" | "verifying" | "verified";
 
+/**
+ * R3 cross-repo P2e: the frozen perimeter of a deferred entry (data only; the registry stores it, nothing here
+ * interprets it). `pins` is kept by identity (pinNow admission is keyed by the array's identity); a rejection
+ * normalises to [] for readers.
+ */
+export interface DeferredPerimeter {
+  readonly observation: PerimeterObservation;
+  readonly workingSet: readonly { readonly root: string; readonly name?: string }[];
+  readonly links: readonly {
+    readonly at: string;
+    readonly root: string;
+    readonly name?: string;
+    readonly head: string;
+    readonly fingerprint: string;
+    readonly admit?: (root: string) => boolean;
+  }[];
+  readonly pins: Promise<readonly LinkPin[]>;
+}
+
 /** Absolute path -> sha256 hex of the file bytes, or ABSENT_DIGEST for a missing path (R3). */
 export type FileDigests = ReadonlyMap<string, string>;
 export const ABSENT_DIGEST = "absent";
@@ -494,6 +515,10 @@ export interface PendingRegistration {
    * router_verify's pass carries a caveat. Absent: none.
    */
   readonly unattributedWriters?: readonly string[];
+  /** R3 cross-repo P2e: the frozen perimeter of a deferred entry. Absent: none (the entry has no such key). */
+  readonly perimeter?: DeferredPerimeter;
+  /** R3 cross-repo P2e: the check placements of a deferred entry (an `undefined` slot: no placement). Absent: none. */
+  readonly placements?: readonly (CheckPlacement | undefined)[];
 }
 
 /** I7 (P0.2): HEAD and branch at return (TreeSnapshot.head / .branch: a short name, null when detached, absent when unknown). */
@@ -559,6 +584,10 @@ export interface PendingEntry {
   readonly returnedTree?: ReturnedTree;
   /** PendingRegistration.unattributedWriters, as registered. */
   readonly unattributedWriters?: readonly string[];
+  /** PendingRegistration.perimeter, frozen; `pins` never rejects. Absent when not provided or released. */
+  readonly perimeter?: DeferredPerimeter;
+  /** PendingRegistration.placements, frozen. Absent when not provided or released. */
+  readonly placements?: readonly (CheckPlacement | undefined)[];
   readonly createdAt: number;
   readonly state: PendingState;
   /** Set while state is "verifying". */
@@ -759,6 +788,8 @@ interface EntryRecord {
   readonly contaminatedBy: string | undefined;
   readonly returnedTree: ReturnedTree | undefined;
   readonly unattributedWriters: readonly string[] | undefined;
+  perimeter: DeferredPerimeter | undefined;
+  placements: readonly (CheckPlacement | undefined)[] | undefined;
   dod: DoD | undefined;
   reference: Promise<ReferenceState>;
   changedFiles: readonly ChangedPath[] | "unavailable";
@@ -781,6 +812,23 @@ type LookupMiss = Extract<Lookup, { readonly kind: "expired" | "unknown" }>;
 interface LedgerRecord {
   readonly record: RejectionRecord;
   readonly recordedAt: number;
+}
+
+/**
+ * P2e: a frozen copy of a deferred perimeter. `pins` is kept by identity (the resolved array is never copied):
+ * only a rejection is normalised, to [] (so readers never see one and none goes unhandled).
+ */
+function freezePerimeter(perimeter: DeferredPerimeter | undefined): DeferredPerimeter | undefined {
+  if (perimeter === undefined) return undefined;
+  return Object.freeze({
+    observation: perimeter.observation,
+    workingSet: Object.freeze(perimeter.workingSet.map((w) => Object.freeze({ ...w }))),
+    links: Object.freeze(perimeter.links.map((l) => Object.freeze({ ...l }))),
+    pins: perimeter.pins.then(
+      (pins) => pins,
+      (): readonly LinkPin[] => [],
+    ),
+  });
 }
 
 function defaultRandom(bytes: number): Uint8Array {
@@ -856,6 +904,8 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       ...(rec.contaminatedBy !== undefined ? { contaminatedBy: rec.contaminatedBy } : {}),
       ...(rec.returnedTree !== undefined ? { returnedTree: rec.returnedTree } : {}),
       ...(rec.unattributedWriters !== undefined ? { unattributedWriters: rec.unattributedWriters } : {}),
+      ...(rec.perimeter !== undefined ? { perimeter: rec.perimeter } : {}),
+      ...(rec.placements !== undefined ? { placements: rec.placements } : {}),
       createdAt: rec.createdAt,
       state: rec.state,
       verifyingSince: rec.verifyingSince,
@@ -882,13 +932,19 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
     byHandle.delete(rec.handle);
     counters.weight -= rec.pathWeight + rec.refWeight;
     addTombstone(rec.handle, rec.orchestratorSessionID);
-    const hook = options.onEvict;
-    if (hook === undefined) return;
     try {
-      hook(snapshot(rec), cause);
-    } catch {
-      // A logging hook must never break the registry (PendingRegistryOptions.onEvict).
-      counters.hookFailures += 1;
+      const hook = options.onEvict;
+      if (hook === undefined) return;
+      try {
+        hook(snapshot(rec), cause);
+      } catch {
+        // A logging hook must never break the registry (PendingRegistryOptions.onEvict).
+        counters.hookFailures += 1;
+      }
+    } finally {
+      // P2e: an evicted entry is gone; it keeps neither its perimeter nor its placements.
+      rec.perimeter = undefined;
+      rec.placements = undefined;
     }
   }
 
@@ -897,6 +953,8 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
     rec.pathWeight = 0;
     rec.refWeight = 0;
     rec.released = true;
+    rec.perimeter = undefined;
+    rec.placements = undefined;
     rec.dod = undefined;
     rec.digests = undefined;
     rec.changedFiles = "unavailable";
@@ -1031,7 +1089,12 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       if (incoming.length > MAX_STORED_CHANGED_FILES) changedFilesDropped = incoming.length;
       else changedFiles = Object.freeze([...incoming]);
     }
-    const pathWeight = changedFiles === "unavailable" ? 0 : changedFiles.length;
+    const perimeter = freezePerimeter(reg.perimeter);
+    const placements = reg.placements !== undefined ? Object.freeze([...reg.placements]) : undefined;
+    const pathWeight =
+      (changedFiles === "unavailable" ? 0 : changedFiles.length) +
+      (perimeter !== undefined ? perimeter.workingSet.length + perimeter.links.length : 0) +
+      (placements !== undefined ? placements.length : 0);
 
     // Plan the evictions first: a registration that cannot fit evicts nothing.
     const session = sessions.get(reg.orchestratorSessionID);
@@ -1099,6 +1162,8 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       returnedTree: reg.returnedTree !== undefined ? Object.freeze({ ...reg.returnedTree }) : undefined,
       unattributedWriters: reg.unattributedWriters !== undefined && reg.unattributedWriters.length > 0
         ? Object.freeze([...reg.unattributedWriters]) : undefined,
+      perimeter,
+      placements,
       dod: reg.dod,
       reference,
       changedFiles,
