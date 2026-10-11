@@ -6,7 +6,7 @@ import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { validateConfig, type RouterConfig } from "../../src/router/config";
-import { DISPATCH_HEADER_PREFIX, DISPATCH_HEADER_SEPARATOR, stripDispatchHeader } from "../../src/router/dispatch-header";
+import { buildRoleDispatchHeader, DISPATCH_HEADER_PREFIX, DISPATCH_HEADER_SEPARATOR, stripDispatchHeader } from "../../src/router/dispatch-header";
 import { rememberDispatch, resetDispatchRegistry } from "../../src/router/sessions";
 import { buildRoleLadder } from "../../src/routing/engine/ladders";
 import { acquireOutcomes } from "../../src/routing/outcomes";
@@ -696,6 +696,38 @@ describe("role dispatch header (P2g, OD6)", () => {
     const off = makeWorld({ delegation: "roles", engine: "static" }, { extra: { dispatchHeader: false } });
     const plain = await off.router.route(call(off, { agent: "explorer", prompt: "[route class=search risk=low scope=single]\nfind x" }));
     expect(plain.prompt).toBe(`find x\nOMR_NONCE=${plain.role!.nonce}`);
+  });
+
+  it("a header the orchestrator copied from another dispatch is replaced by the router's (QA round 1 #11)", async () => {
+    const world = makeWorld({ delegation: "roles", engine: "static" });
+    const copied = buildRoleDispatchHeader({ agent: "implementer", workRoot: world.outside, edits: true });
+    const outcome = await world.router.route(call(world, { agent: "explorer", prompt: `${copied}find where the config is loaded` }));
+    const prompt = outcome.prompt!;
+    expect(outcome.role!.workRoot).toBe(world.main);
+    expect(prompt.split(DISPATCH_HEADER_PREFIX)).toHaveLength(2); // exactly one router header
+    expect(prompt.startsWith(`${DISPATCH_HEADER_PREFIX}explorer. Execute this dispatch yourself.\n\n`)).toBe(true);
+    expect(headerOf(prompt)).toContain(`Working directory: ${world.main}. You are already there`);
+    expect(prompt).not.toContain(world.outside);
+    expect(prompt).not.toContain("@implementer");
+    expect(stripDispatchHeader(prompt)).toBe(`find where the config is loaded\nOMR_NONCE=${outcome.role!.nonce}`);
+  });
+
+  it("dispatchHeader:false still tells a work root other than the session directory, with the work-root line only (QA round 1 #12)", async () => {
+    const off = makeWorld({ delegation: "roles", engine: "static" }, { extra: { dispatchHeader: false } });
+    const outcome = await off.router.route(call(off, {
+      agent: "implementer", prompt: `[route class=implement risk=low scope=single needs=edit root=${off.worktree}]\nadd a guard`,
+    }));
+    expect(outcome.role!.workRoot).toBe(off.worktree);
+    const header = headerOf(outcome.prompt!);
+    expect(header).toBe(
+      `${DISPATCH_HEADER_PREFIX}implementer. Execute this dispatch yourself.\n\nWorking directory: ${off.worktree}. You are already there — do not ask permission to read or write inside it.${DISPATCH_HEADER_SEPARATOR}`,
+    );
+    expect(header).not.toContain("Repositories in this session");
+    expect(header).not.toContain("You may read any repository");
+    expect(stripDispatchHeader(outcome.prompt!)).toBe(`add a guard\nOMR_NONCE=${outcome.role!.nonce}`);
+    // the session directory itself is not announced
+    const same = await off.router.route(call(off, { agent: "explorer", prompt: "[route class=search risk=low scope=single]\nfind x" }));
+    expect(same.prompt).toBe(`find x\nOMR_NONCE=${same.role!.nonce}`);
   });
 
   it("exact resume: header without head; carried block last", async () => {

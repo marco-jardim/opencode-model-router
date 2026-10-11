@@ -66,7 +66,7 @@ import {
 import { realpathSync } from "node:fs";
 import { dirname } from "node:path";
 import type { Admission, AdmissionConfig, AdmissionService, RepoLocation } from "../roles/admission";
-import { buildRoleDispatchHeader, DISPATCH_HEADER_PREFIX } from "../../router/dispatch-header";
+import { buildRoleDispatchHeader, stripDispatchHeader } from "../../router/dispatch-header";
 import { addToWorkingSet, workingSetOf } from "./working-set";
 import {
   consumeRunnerDispatch, consumeRunnerDispatchLoose, forgetDispatch, lookupDispatch, rememberDispatch, runnerDescription,
@@ -2004,20 +2004,39 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     // P2g (OD6): a role delegate is told its work root. The header goes FIRST; the nonce line / carried block stay last. Only a
     // grant with a work root and read access gets one; a resume only when its binding is exact (the bound grant is what it holds).
     const exactResume = resumed && bound?.kind === "exact";
-    const headerWanted = rp.cfg.dispatchHeader !== false && grant.workRoot !== null
+    // QA round 1 #11: the router's header is always the one the delegate reads. A header the orchestrator copied from another
+    // dispatch (it names that dispatch's work root) is stripped first and replaced, never kept in place of ours.
+    // QA round 1 #12: `dispatchHeader: false` turns the header off, except that a work root other than the session directory is
+    // still told (the work-root rule points to ENVIRONMENT, which is the session directory): then a MINIMAL header, the identity
+    // paragraph (so stripDispatchHeader still removes it before DoD inference) and the `Working directory:` paragraph, no
+    // repositories paragraph.
+    const headerEligible = grant.workRoot !== null
       && (grant.actions.has("read") || grant.actions.has("glob") || grant.actions.has("grep"))
-      && (!resumed || exactResume)
-      && !outPrompt.startsWith(DISPATCH_HEADER_PREFIX); // like the tier path: a prompt that already begins with a router header is left as is
+      && (!resumed || exactResume);
+    const headerOn = rp.cfg.dispatchHeader !== false;
+    const tellsOtherRoot = (root: string): boolean => {
+      const platform = workRootDeps.platform;
+      const same = (candidate: string): boolean => normalizeRootText(root, platform) === normalizeRootText(candidate, platform);
+      if (same(sessionDirectory)) return false;
+      try {
+        const real = workRootDeps.realpath(sessionDirectory);
+        return !(typeof real === "string" && real !== "" && same(real));
+      } catch {
+        return true;
+      }
+    };
+    const headerWanted = headerEligible && grant.workRoot !== null && (headerOn || tellsOtherRoot(grant.workRoot));
     const finalPrompt = headerWanted && grant.workRoot !== null
       ? `${buildRoleDispatchHeader({
         agent,
         workRoot: grant.workRoot,
         edits: grant.actions.has("edit"),
         ...(grant.location === undefined ? {} : { location: grant.location }),
-        workingSet: workingSetOf(call.sessionID),
-        readParents: resolveRolesRouting(rp.cfg, "v2").repoParents,
+        ...(headerOn
+          ? { workingSet: workingSetOf(call.sessionID), readParents: resolveRolesRouting(rp.cfg, "v2").repoParents }
+          : {}),
         ...(exactResume ? { exactResume: true } : {}),
-      })}${outPrompt}`
+      })}${stripDispatchHeader(outPrompt)}`
       : outPrompt;
 
     decided.set(call.callID, {

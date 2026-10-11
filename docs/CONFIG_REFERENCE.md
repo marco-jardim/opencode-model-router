@@ -196,9 +196,15 @@ tiers, non-string prompts, router bypass, and prompts already beginning with
 `[router] You are @` are unchanged. An absent or empty directory omits that paragraph.
 The cap follows `tierCaps[tier] ?? DEFAULT_TIER_CAPS[tier] ?? 5`.
 
-`dispatchHeader: false` also turns off the role header: on Claude Code v2 in roles mode, a routed role dispatch with a
-work root and read access gets a shorter header (role name, work root, and the repository location when the grant has
-one; no cap or budget text), see [Roles mode](./ROLES.md#repositories-below-parent-directories-cross-repo). Inert on Claude Code v1.
+On Claude Code v2 in roles mode, a routed role dispatch with a work root and read access gets a shorter header (role name,
+work root, and the repository location when the grant has one; no cap or budget text), see
+[Roles mode](./ROLES.md#repositories-below-parent-directories-cross-repo). The router's header is always the one the
+delegate reads: a header the orchestrator copied from another dispatch is removed and replaced. A read-only role is told
+where it may read, without the edit clause. `dispatchHeader: false` also turns off the role header, with one exception: when the
+work root differs from the session directory (`root=`, `repo=`, `branch=`), the delegate is still told it, because the
+role prompt's work-root rule points to ENVIRONMENT, which is the session directory. That minimal header holds the role name
+and the `Working directory:` paragraph only (no repositories paragraph); a work root equal to the session directory gets
+no header. Inert on Claude Code v1.
 
 Measured using the pure builder's string length: **1,031 characters** for `@fast`,
 cap `8`, and cwd `D:\git\opencode-model-router`, including LF paragraph separators

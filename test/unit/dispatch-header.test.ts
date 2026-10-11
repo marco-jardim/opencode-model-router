@@ -157,6 +157,31 @@ describe("buildRoleDispatchHeader (P2g, OD6)", () => {
     );
   });
 
+  it("a read-only role's repositories paragraph has no edit clause (QA round 1 nit)", () => {
+    const readOnly = { ...base, agent: "explorer", edits: false };
+    expect(buildRoleDispatchHeader({ ...readOnly, readParents: ["D:\\git"] })).toContain(
+      "\n\nYou may read any repository below D:\\git.",
+    );
+    const both = buildRoleDispatchHeader({
+      ...readOnly,
+      location,
+      workingSet: [{ name: "app-a", branch: "feat/login" }, { name: "lib-c", branch: null }],
+      readParents: ["D:\\git", "D:\\work"],
+    });
+    expect(both.split("\n\n")[2]).toBe(
+      "Repositories in this session: app-a (feat/login), lib-c (detached). You may read any repository below D:\\git, D:\\work.",
+    );
+    expect(buildRoleDispatchHeader({ ...readOnly, workingSet: [{ name: "lib-b", branch: "main" }] })).toContain(
+      "\n\nRepositories in this session: lib-b (main). You read only in your working directory.",
+    );
+    for (const header of [
+      buildRoleDispatchHeader({ ...readOnly, readParents: ["D:\\git"] }),
+      buildRoleDispatchHeader({ ...readOnly, workingSet: [{ name: "lib-b", branch: "main" }] }),
+    ]) {
+      expect(header).not.toMatch(/edit|run only|write/);
+    }
+  });
+
   it("carries no CAP:, VERIFY:, route-line or nonce token and no inner separator", () => {
     const header = buildRoleDispatchHeader({
       ...base,

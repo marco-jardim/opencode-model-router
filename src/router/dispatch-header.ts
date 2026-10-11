@@ -4,7 +4,7 @@ import { displaySafe } from "../routing/roles/read-set";
 /** First characters of every router dispatch header (index.ts never adds a second one). */
 export const DISPATCH_HEADER_PREFIX = "[router] You are @";
 
-/** What index.ts puts between the header and the orchestrator's prompt. */
+/** What index.ts (tiers) and the role dispatch path put between a header and the orchestrator's prompt. */
 export const DISPATCH_HEADER_SEPARATOR = "\n\n---\n\n";
 
 /** The header's last paragraph: the end of a header whose separator is missing. */
@@ -79,6 +79,8 @@ function locationParagraphs(
     workingSet?: readonly HeaderRepository[];
     readParents?: readonly string[];
     verb: string;
+    /** A read-only role: the repositories paragraph carries no edit clause. Absent: the tier wording, byte-identical. */
+    readOnly?: boolean;
   },
 ): string[] {
   const where = input.location === undefined
@@ -91,10 +93,14 @@ function locationParagraphs(
     const listed = set.length > 0
       ? `Repositories in this session: ${set.map((entry) => `${entry.name} (${entry.branch ?? "detached"})`).join(", ")}. `
       : "";
-    const rest = parents.length > 0
-      ? `You may read any repository below ${parents.join(", ")}; you edit and run only in your working directory.`
-      : "You edit and run only in your working directory.";
-    paragraphs.push(`${listed}${rest}`);
+    const rest = input.readOnly === true
+      ? (parents.length > 0
+        ? `You may read any repository below ${parents.join(", ")}.`
+        : "You read only in your working directory.")
+      : parents.length > 0
+        ? `You may read any repository below ${parents.join(", ")}; you edit and run only in your working directory.`
+        : "You edit and run only in your working directory.";
+    paragraphs.push(`${listed}${rest}`.trimEnd());
   }
   return paragraphs;
 }
@@ -105,7 +111,9 @@ function locationParagraphs(
  * the tier header and the protocol. Every name, branch and path goes through displaySafe, so a newline, a bracket or a
  * `\n\n---\n\n` in a directory, repository or branch name can neither end the header early nor forge a line.
  * `edits` false (a read-only role): "do not ask permission to read inside it". `exactResume`: the head may be stale, so the
- * head clause is left out (as for a null head).
+ * head clause is left out (as for a null head). A read-only role's repositories paragraph carries no edit clause ("You may
+ * read any repository below <parents>."): it cannot edit or run anywhere, so telling it where it may is noise. A caller that
+ * wants only the work root (`dispatchHeader: false` with a `root=`/`repo=` work root) passes no `workingSet` / `readParents`.
  */
 export function buildRoleDispatchHeader(input: {
   agent: string;
@@ -131,6 +139,7 @@ export function buildRoleDispatchHeader(input: {
       workingSet: input.workingSet?.map((entry) => ({ name: displaySafe(entry.name), branch: safeBranch(entry.branch) })),
       readParents: input.readParents?.map((parent) => displaySafe(parent)),
       verb: input.edits ? "read or write" : "read",
+      ...(input.edits ? {} : { readOnly: true }),
     }),
   ];
   return `${paragraphs.join("\n\n")}${DISPATCH_HEADER_SEPARATOR}`;

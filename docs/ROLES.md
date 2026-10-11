@@ -240,8 +240,11 @@ branch and head: `Working directory: <root> (repository app-a, branch feat/login
 do not ask permission to read or write inside it.` A read-only role is told `read` instead of `read or write`. With
 parents set, a second paragraph lists the session's repositories and where the role may read. The nonce line (or the
 carried `[acceptance]` block of a resume) stays the last line of the prompt. A resume gets the header only when its
-binding is exact, and without the head clause, which may be stale. No header: no work root, no `read`/`glob`/`grep`
-(`researcher`), a delegate's dispatch, a non-exact resume, or `dispatchHeader: false`.
+binding is exact, and without the head clause, which may be stale. A header the orchestrator copied from another dispatch
+is removed and replaced by the router's own. A read-only role's repositories paragraph says only where it may read. No
+header: no work root, no `read`/`glob`/`grep` (`researcher`), a delegate's dispatch, a non-exact resume, or
+`dispatchHeader: false` (which still sends the role name and the `Working directory:` paragraph when the work root is not
+the session directory).
 
 **Admission.** On a v2 roles dispatch, when parents are set or `repo=`/`branch=` is given, the work root is bound
 through admission. It is admitted when either:
