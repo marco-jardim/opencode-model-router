@@ -451,6 +451,75 @@ describe("role dispatch through the adapter (P2.1-C, P-5)", () => {
     expect(Object.hasOwn(tier.input, "background")).toBe(false);
   });
 
+  it("P2g: the role dispatch header reaches the child with and without a route line (v2)", async () => {
+    const { dir, cfg } = home(ROLES, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    const v2 = host(dir, cfg);
+    await v2.start(hooks, { isBypassed: () => false });
+    // Fresh dispatches of one orchestrator session: no route line, a recon/single/small-budget line, a debug/multi line.
+    const prefixes = ["", "[route class=recon risk=low scope=single budget=6]\n", "[route class=debug risk=medium scope=multi budget=25]\n"];
+    for (const [i, prefix] of prefixes.entries()) {
+      const role = { sessionID: "root", agent: "build", messageID: `m${i}`, id: `p2g-c${i}`, tool: "subagent", input: { agent: "explorer", description: "find parser", prompt: `${prefix}Find the parser entry point` } as Record<string, unknown> };
+      await v2.toolHooks["execute.before"](role);
+      const prompt = String(role.input.prompt);
+      expect(prompt, `case ${i}`).toMatch(/^\[router\] You are @explorer\. Execute this dispatch yourself\.\n\nWorking directory: /);
+      expect(prompt, `case ${i}`).toContain("Find the parser entry point");
+    }
+  });
+
+  it("P2g: a repo=/branch= route line on a repository below routing.repoParents still gets the header (v2)", async () => {
+    const parent = temp("omr-p2g-parent-");
+    // A REAL repository (admission asks git): `lib-b` on branch main with one commit, below the parent.
+    const { execFileSync } = await import("node:child_process");
+    const repo = join(parent, "lib-b");
+    mkdirSync(repo, { recursive: true });
+    const git = (...args: string[]): void => { execFileSync("git", args, { cwd: repo, stdio: "ignore" }); };
+    git("init", "-q", "-b", "main");
+    writeFileSync(join(repo, "a.ts"), "x");
+    git("add", "a.ts");
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init");
+    const { dir, cfg } = home({ routing: { delegation: "roles", repoParents: [parent] } }, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    const v2 = host(dir, cfg);
+    await v2.start(hooks, { isBypassed: () => false });
+    const role = {
+      sessionID: "root", agent: "build", messageID: "m-repo", id: "p2g-repo", tool: "subagent",
+      input: { agent: "explorer", description: "find parser", prompt: "[route class=recon risk=low scope=single repo=lib-b branch=main budget=6]\nFind the parser entry point" } as Record<string, unknown>,
+    };
+    await v2.toolHooks["execute.before"](role);
+    const prompt = String(role.input.prompt);
+    expect(prompt).toMatch(/^\[router\] You are @explorer\. Execute this dispatch yourself\.\n\nWorking directory: /);
+    expect(prompt).toMatch(/\nOMR_NONCE=[A-Za-z0-9_-]{16,128}$/);
+  });
+
+  it("P2g: repo=<repository> branch=<the session worktree's branch> gets the header when the session is a linked worktree (v2)", async () => {
+    const parent = temp("omr-p2g-wt-");
+    const { execFileSync } = await import("node:child_process");
+    const main = join(parent, "lib-main");
+    mkdirSync(main, { recursive: true });
+    const git = (cwd: string, ...args: string[]): void => { execFileSync("git", args, { cwd, stdio: "ignore" }); };
+    git(main, "init", "-q", "-b", "master");
+    writeFileSync(join(main, "a.ts"), "x");
+    git(main, "add", "a.ts");
+    git(main, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init");
+    // Live shape: the session directory is itself a linked worktree (branch feat/x) of a repository on master, and both live below
+    // routing.repoParents; the route line names the repository (`repo=lib-main`) and the worktree's branch (`branch=feat/x`).
+    const worktree = join(parent, "lib-wt");
+    git(main, "worktree", "add", "-q", "-b", "feat/x", worktree);
+    const { cfg } = home({ routing: { delegation: "roles", repoParents: [parent] } }, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(worktree); // the session directory is the linked worktree itself
+    const v2 = host(worktree, cfg);
+    await v2.start(hooks, { isBypassed: () => false });
+    const role = {
+      sessionID: "root", agent: "build", messageID: "m-wt", id: "p2g-wt", tool: "subagent",
+      input: { agent: "explorer", description: "find parser", prompt: "[route class=recon risk=low scope=single repo=lib-main branch=feat/x budget=6]\nFind the parser entry point" } as Record<string, unknown>,
+    };
+    await v2.toolHooks["execute.before"](role);
+    const prompt = String(role.input.prompt);
+    expect(prompt).toMatch(/^\[router\] You are @explorer\. Execute this dispatch yourself\.\n\nWorking directory: /);
+    expect(prompt).toMatch(/\nOMR_NONCE=[A-Za-z0-9_-]{16,128}$/);
+  });
+
   it("handoff 30: a stripped route line's root reaches the tier dispatch header (v2 shadow)", async () => {
     const { dir, cfg } = home({ routing: { engine: "shadow" } });
     const { hooks } = await plugin(dir);
