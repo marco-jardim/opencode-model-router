@@ -893,6 +893,11 @@ export function createPlanCompiler(deps: CompilerDeps): PlanCompiler {
       if (ledger.phases.find((p) => p.id === phase)?.gate === "passed") {
         throw new ExecutorError("E_INVALID_INPUT", `phase ${phase} has already passed its gate; task ${t.id} cannot be added to it`, { taskId: t.id, phase });
       }
+      // QA-2.3-33: the phase's QA reviews every task of the phase, so it must still be able to wait for a new one.
+      const phaseQa = Object.values(ledger.tasks).find((x) => x.phase === phase && x.id.toLowerCase() === `${phase}.qa`.toLowerCase());
+      if (phaseQa !== undefined && phaseQa.state !== "pending" && phaseQa.state !== "ready") {
+        throw new ExecutorError("E_INVALID_INPUT", `the phase's QA has already started (${phaseQa.id} is ${phaseQa.state}); add task ${t.id} to a later phase`, { taskId: t.id, phase, qa: phaseQa.id });
+      }
       const fp = extractFootprint(t, ownershipOf(frag, t.phase), view, created);
       // QA-2.3-2: a write path that leaves the repository is rejected here, not silently dropped.
       const outside = fp.ignored.find((x) => x.write === true && OUTSIDE_REASONS.has(x.reason));
@@ -951,7 +956,24 @@ export function createPlanCompiler(deps: CompilerDeps): PlanCompiler {
         // QA-2.3-19: existing -> new (pre-flight, gates, earlier stages) and new -> existing while that task can still wait.
         if (!toNew) {
           const state = ledger.tasks[e.to]?.state;
-          if (state !== "pending" && state !== "ready") continue;
+          if (state !== "pending" && state !== "ready") {
+            // QA-2.3-33: the target is past ready (e.g. `<phase>.TESTS` done); the new task is linked to the target's
+            // successors instead, transitively, until a task that can still wait (as D3 contracts a virtual item).
+            if (fromNew) {
+              const visited = new Set<string>([e.to]);
+              const queue: string[] = [e.to];
+              for (const cur of queue) {
+                for (const s of ledger.edges) {
+                  if (s.kind !== "structural" || s.from !== cur || visited.has(s.to)) continue;
+                  visited.add(s.to);
+                  const sState = ledger.tasks[s.to]?.state;
+                  if (sState === "pending" || sState === "ready") push({ ...e, to: s.to });
+                  else if (ledger.tasks[s.to] !== undefined) queue.push(s.to);
+                }
+              }
+            }
+            continue;
+          }
         }
       }
       // conflicts and contracts are recomputed below with the whole ledger's reach; keep the new-to-new ones only
@@ -996,10 +1018,8 @@ export function createPlanCompiler(deps: CompilerDeps): PlanCompiler {
     for (const e of newEdges) {
       const target = ledger.tasks[e.to];
       if (target === undefined || target.state !== "ready" || reopened.includes(e.to)) continue;
-      const satisfied = e.from.startsWith("gate:")
-        ? ledger.phases.find((p) => p.id === e.from.slice("gate:".length))?.gate === "passed"
-        : ["done", "integrated"].includes(ledger.tasks[e.from]?.state ?? "pending");
-      if (!satisfied) reopened.push(e.to);
+      // every reopen candidate comes from a new task (still pending), so a ready target always has to wait for it
+      reopened.push(e.to);
     }
     return { tasks: newNodes, edges: newEdges, reopened };
   }

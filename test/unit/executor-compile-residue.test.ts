@@ -205,6 +205,41 @@ describe("executor compile: residue (2.3.5)", () => {
       expect(added.edges.some((e) => e.from === "gate:1.1" && e.to === "1.2.9")).toBe(true);
     });
 
+    const WITH_TESTS = PHASED.replace(
+      "\n**QA review**",
+      "- **1.2.2** `[tier:medium]` New tests for two.\n  Writes: `test/alpha/two.test.ts`\n\n**QA review**",
+    );
+
+    it("QA-2.3-33: a task added after the phase TESTS is done waits for the phase QA instead", async () => {
+      const p = makeHarness({ inline: { "with-tests.md": WITH_TESTS } });
+      const r = await p.compiler.compile(planPathOf("with-tests.md"), compileOpts(p));
+      const nodes = Object.values(r.draft.tasks);
+      const tests = nodes.find((t) => t.kind === "tests" && t.phase === "1.2");
+      const qa = nodes.find((t) => t.kind === "qa" && t.phase === "1.2");
+      expect(tests).toBeDefined();
+      expect(qa).toBeDefined();
+      const tasks = { ...r.draft.tasks };
+      for (const t of nodes) if (t.phase === "1.2" && t.kind !== "qa") tasks[t.id] = { ...t, state: "done" };
+      if (qa !== undefined) tasks[qa.id] = { ...qa, state: "ready" };
+      const ledger: LedgerV1 = { ...r.draft, tasks };
+      const added = p.compiler.addTasks(ledger, "- **1.2.9** `[tier:medium]` Three.\n  Writes: `src/alpha/three.ts`\n");
+      const has = (from: string, to: string): boolean => added.edges.some((e) => e.from === from && e.to === to);
+      expect(has("1.2.9", tests?.id ?? "")).toBe(false);
+      expect(has("1.2.9", qa?.id ?? "")).toBe(true);
+      expect(added.reopened).toContain(qa?.id);
+    });
+
+    it("QA-2.3-33: addTasks refuses a task for a phase whose QA has already started", async () => {
+      const p = makeHarness({ inline: { "with-tests2.md": WITH_TESTS } });
+      const r = await p.compiler.compile(planPathOf("with-tests2.md"), compileOpts(p));
+      const qa = Object.values(r.draft.tasks).find((t) => t.kind === "qa" && t.phase === "1.2");
+      expect(qa).toBeDefined();
+      const tasks = { ...r.draft.tasks };
+      if (qa !== undefined) tasks[qa.id] = { ...qa, state: "running" };
+      const ledger: LedgerV1 = { ...r.draft, tasks };
+      expect(codeOf(() => p.compiler.addTasks(ledger, "- **1.2.9** `[tier:medium]` Three.\n  Writes: `src/alpha/three.ts`\n"))).toBe("E_INVALID_INPUT");
+    });
+
     it("QA-2.3-22: addTasks fails closed on an unknown reference, subject or Depends on id", () => {
       const refs = [
         "- **1.1.9** `[tier:medium]` Add a helper.\n  1.1.9 must run before 7.7.7.\n  Writes: `src/alpha/helper.ts`\n",
