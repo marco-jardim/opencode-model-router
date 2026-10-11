@@ -938,6 +938,82 @@ describe("deferred P (P2e)", () => {
     expect(out).toMatch(ROUTER_SCOPE_LINE);
     expect(artefacts().at(-1)?.perimeter?.roots.map(root => [root.name, root.status])).toEqual([["lib-b", "unchanged"]]);
   }, 90_000);
+
+  /** `count` working-set roots (plain directories, their snapshots pinned unchanged), in order. */
+  const extraRoots = (count: number): string[] => {
+    const extras = Array.from({ length: count }, (_, i) => path.join(parent, `extra-${i + 1}`));
+    for (const dir of extras) {
+      fs.mkdirSync(dir, { recursive: true });
+      addToWorkingSet("orch", location(dir, path.basename(dir)));
+      // A pinned stand-in tree (as QA-1 F2's fakeTree): the root is not a real repository.
+      seam.pins.set(seam.key(dir), {
+        cwd: dir, root: dir, head: "b".repeat(40), branch: "main", fingerprint: `fake:${dir}`, dirty: false, files: [],
+      } as unknown as NonNullable<Tree>);
+    }
+    return extras;
+  };
+
+  it("P2e QA-1 #1: a working-set consumer past the cap is still discovered at router_verify (D6)", async () => {
+    watchPlugin();
+    extraRoots(PERIMETER_MAX);
+    // The consumer is the (PERIMETER_MAX + 1)th working-set root: past the cap, a fixed "unobserved" root.
+    const consumer = path.join(parent, "consumer-c");
+    const consumerLink = path.join(consumer, "node_modules", "app-a");
+    fs.mkdirSync(path.dirname(consumerLink), { recursive: true });
+    fs.symlinkSync(repo, consumerLink, "junction");
+    try {
+      addToWorkingSet("orch", location(consumer, "consumer-c"));
+      routeAsRole(location(repo, "app-a"));
+      const hooks = await makePlugin();
+      await pin(repo);
+      const handle = handleIn(await runTask(hooks, `Implement it.\n${DEFERRED_DOD}`, async () => {
+        fs.writeFileSync(path.join(repo, "index.ts"), "export const v = 1;\n");
+        await pin(repo);
+      }));
+      expect(entryOf(handle).perimeter?.workingSet.map(root => seam.key(root.root))).toContain(seam.key(consumer));
+      const out = await verify(hooks, handle);
+      expect(out).toMatch(/consumer-c at \S+ links this work root \(node_modules\/app-a\) and no check ran there/);
+      expect(outcomeOf(out, handle), out).not.toBe("pass");
+    } finally {
+      fs.rmSync(consumerLink, { recursive: false, force: true });
+    }
+  }, 90_000);
+
+  it("P2e QA-1 #1: a link target past the cap was never observed: not deferred (cross-repo)", async () => {
+    // PERIMETER_MAX - 1 working-set roots fill the observed slots; W's link target comes next, past the cap.
+    extraRoots(PERIMETER_MAX - 1);
+    const hooks = await linked();
+    const out = await runTask(hooks, `Implement it.\n${DEFERRED_DOD}`, async () => undefined);
+    expect(HANDLE.exec(out)?.[0], out).toBeUndefined();
+    expect(artefacts()).toHaveLength(1);
+    expect(artefacts()[0]?.perimeter?.roots.find(root => root.name === "lib-b")?.status).toBe("unobserved");
+  }, 90_000);
+
+  it("P2e QA-1 #3: the dispatch's nested link admission survives the deferral: router_verify's pinNow pins lib-b with lib-c", async () => {
+    const libC = path.join(parent, "lib-c");
+    initRepo(libC, { "index.ts": "export const c = 0;\n" });
+    execFileSync("git", ["config", "core.autocrlf", "false"], { cwd: libC, stdio: "ignore" });
+    const nestedLink = path.join(lib, "node_modules", "lib-c");
+    fs.mkdirSync(path.dirname(nestedLink), { recursive: true });
+    fs.symlinkSync(libC, nestedLink, "junction");
+    try {
+      const opener = vi.spyOn(deterministicModule, "createScopeOpener");
+      const hooks = await linked();
+      await pinWithIgnored(libC);
+      const handle = handleIn(await runTask(hooks, `Implement it.\n${DEFERRED_DOD}`, async () => undefined));
+      const frozenPins = await entryOf(handle).perimeter?.pins;
+      const dispatchPin = frozenPins?.[0];
+      expect(dispatchPin?.kind === "pinned" ? dispatchPin.nested.map(pin => [pin.kind, seam.key(pin.root)]) : dispatchPin)
+        .toEqual([["pinned", seam.key(libC)]]);
+      await verify(hooks, handle);
+      const pinNow = opener.mock.calls.at(-1)?.[0].reference?.pinNow;
+      expect(pinNow).toBeTypeOf("function");
+      const now = await pinNow?.(lib);
+      expect(now?.kind === "pinned" ? now.nested.map(pin => [pin.kind, seam.key(pin.root)]) : now).toEqual([["pinned", seam.key(libC)]]);
+    } finally {
+      fs.rmSync(nestedLink, { recursive: false, force: true });
+    }
+  }, 90_000);
 });
 
 describe("consumer discovery (§6)", () => {

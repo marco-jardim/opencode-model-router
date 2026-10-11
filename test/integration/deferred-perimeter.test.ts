@@ -40,7 +40,20 @@ const state = vi.hoisted(() => ({
   discoveries: [] as { w: string; roots: string[] }[],
   /** The reference deps (pinNow) of every scope opener the wiring built. */
   openers: [] as { pinNow: (root: string) => Promise<unknown> }[],
+  /** P2e QA-1 #5b: paths whose fs/promises realpath fails, with the error code. */
+  realpathFails: new Map<string, string>(),
 }));
+
+vi.mock("node:fs/promises", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  const realReal = actual.realpath as (p: string, ...rest: unknown[]) => Promise<string>;
+  const realpath = async (p: string, ...rest: unknown[]): Promise<string> => {
+    const code = state.realpathFails.get(String(p));
+    if (code !== undefined) throw Object.assign(new Error(`${code}: realpath ${String(p)}`), { code });
+    return realReal(p, ...rest);
+  };
+  return { ...actual, realpath, default: { ...actual, realpath } };
+});
 
 const captured = vi.hoisted(() => ({ wiring: undefined as import("../../src/verify/wiring").VerificationWiring | undefined }));
 
@@ -99,6 +112,16 @@ const junctions: string[] = [];
 const junction = (target: string, at: string): void => {
   fs.symlinkSync(target, at, process.platform === "win32" ? "junction" : "dir");
   junctions.push(at);
+};
+/** W links `target` through node_modules/<name> (a package link, as at dispatch). */
+const linkInW = (target: string, name = path.basename(target)): void => {
+  fs.mkdirSync(path.join(work, "node_modules"), { recursive: true });
+  junction(target, path.join(work, "node_modules", name));
+};
+/** Removes W's node_modules/<name> link itself (never recursing through it). */
+const unlinkInW = (target: string, name = path.basename(target)): void => {
+  void target;
+  fs.rmSync(path.join(work, "node_modules", name), { recursive: false, force: true });
 };
 
 const treeOf = (rootDir: string, head: string): TreeSnapshot => ({
@@ -213,6 +236,7 @@ beforeEach(() => {
   state.calls.length = 0;
   state.discoveries.length = 0;
   state.openers.length = 0;
+  state.realpathFails.clear();
   state.fallback = treeOf(work, HEAD_W);
   acceptSpy = vi.spyOn(gateModule, "accept");
 });
@@ -322,6 +346,7 @@ describe("S11 link drift (P2e.4a)", () => {
 
   it("unchanged → pass", async () => {
     const h = await makePlugin();
+    linkInW(libB);
     state.byDir.set(libB, treeOf(libB, HEAD_B));
     const handle = register({ perimeter: frozen("unchanged", { links: [libLink()] }) });
     const out = await verify(h, handle);
@@ -333,6 +358,7 @@ describe("S11 link drift (P2e.4a)", () => {
 
   it("changed since return → UNVERIFIED with the S11 caveat", async () => {
     const h = await makePlugin();
+    linkInW(libB);
     state.byDir.set(libB, treeOf(libB, "c".repeat(40)));
     const handle = register({ perimeter: frozen("unchanged", { links: [libLink()] }) });
     const out = await verify(h, handle);
@@ -342,6 +368,7 @@ describe("S11 link drift (P2e.4a)", () => {
 
   it("fail stays fail + caveat", async () => {
     const h = await makePlugin();
+    linkInW(libB);
     state.byDir.set(libB, { ...treeOf(libB, HEAD_B), fingerprint: "fp-changed" });
     const dod: DoD = { ...FILE_DOD, checks: [{ kind: "fileExists", path: "missing.ts" }] };
     const handle = register({ dod, perimeter: frozen("unchanged", { links: [libLink()] }) });
@@ -352,10 +379,13 @@ describe("S11 link drift (P2e.4a)", () => {
 
   it("cannot be re-observed → never pass", async () => {
     const h = await makePlugin();
+    linkInW(libB);
     state.byDir.set(libB, undefined);
     const handle = register({ perimeter: frozen("unchanged", { links: [libLink()] }) });
     const out = await verify(h, handle);
-    expect(outcomeOf(out, handle)).toBe("unverifiable");
+    // P2e QA-1 #5a: an unobserved link is transient: not judged (the handle stays open), never a pass.
+    expect(out).toMatch(new RegExp(`^- ${handle} \u00b7 .* \u00b7 not judged`, "m"));
+    expect(outcomeOf(out, handle)).toBeUndefined();
     expect(out).toContain(LINK_DRIFT_CAVEAT.unobserved("lib-b", libB));
   });
 
@@ -450,5 +480,100 @@ describe("placements at router_verify (P2e.4b)", () => {
     expect(outcomeOf(out, handle)).toBe("pass");
     const delegation = acceptSpy.mock.calls[0]?.[0];
     expect(delegation !== undefined && "checkPlacements" in delegation).toBe(false);
+  });
+});
+
+describe("P2e QA round 1", () => {
+  /** A frozen link target `dir` (named after it) whose state at return is treeOf(dir, HEAD_B). */
+  const linkTo = (dir: string): DeferredPerimeter["links"][number] =>
+    ({ at: dir, root: dir, name: path.basename(dir), head: HEAD_B, fingerprint: `fp-${path.basename(dir)}` });
+  const notJudged = (out: string, handle: string): boolean => new RegExp(`^- ${handle} \u00b7 .* \u00b7 not judged`, "m").test(out);
+
+  it("#2 a link retargeted after return → UNVERIFIED with S11 (the old target and the new one), no git on the new one", async () => {
+    const h = await makePlugin();
+    const libX = path.join(home, "lib-x");
+    fs.mkdirSync(libX, { recursive: true });
+    linkInW(libB);
+    state.byDir.set(libB, treeOf(libB, HEAD_B));
+    const handle = register({ perimeter: frozen("unchanged", { links: [linkTo(libB)] }) });
+    // After return: W's node_modules/lib-b now points at lib-x.
+    unlinkInW(libB);
+    linkInW(libX, "lib-b");
+    const out = await verify(h, handle);
+    expect(outcomeOf(out, handle), out).toBe("unverifiable");
+    expect(out).toContain(LINK_DRIFT_CAVEAT.changed("lib-b", libB));
+    expect(out).toContain(LINK_DRIFT_CAVEAT.changed("lib-x", fs.realpathSync.native(libX)));
+    expect(state.calls).not.toContain(fs.realpathSync.native(libX));
+  });
+
+  it("#4 a link target swapped to a non-admitted directory → unobserved, never snapshotted", async () => {
+    const h = await makePlugin();
+    const libC = path.join(home, "lib-c");
+    const outside = path.join(home, "outside");
+    fs.mkdirSync(libC, { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    linkInW(libC);
+    state.byDir.set(libC, treeOf(libC, HEAD_B));
+    const handle = register({ perimeter: frozen("unchanged", { links: [{ ...linkTo(libC), admit: root => !root.includes("outside") }] }) });
+    // After return: lib-c itself is replaced by a junction to a directory its admission refuses.
+    fs.rmSync(libC, { recursive: true, force: true });
+    junction(outside, libC);
+    const out = await verify(h, handle);
+    expect(out).toContain(LINK_DRIFT_CAVEAT.unobserved("lib-c", libC));
+    expect(outcomeOf(out, handle)).not.toBe("pass");
+    // No snapshot (no git) of lib-c, nor of where it now points.
+    expect(state.calls).not.toContain(libC);
+    expect(state.calls).not.toContain(fs.realpathSync.native(outside));
+  });
+
+  it("#5a an unobserved link (no snapshot in time) → not judged: the handle stays open for another router_verify", async () => {
+    const h = await makePlugin();
+    linkInW(libB);
+    state.byDir.set(libB, undefined);
+    const handle = register({ perimeter: frozen("unchanged", { links: [linkTo(libB)] }) });
+    const out = await verify(h, handle);
+    expect(notJudged(out, handle), out).toBe(true);
+    expect(out).toContain(LINK_DRIFT_CAVEAT.unobserved("lib-b", libB));
+    expect(captured.wiring?.pending.listUnverified("orch").map(entry => entry.handle)).toContain(handle);
+    // Observable again: the next call judges it.
+    state.byDir.set(libB, treeOf(libB, HEAD_B));
+    const again = await verify(h, handle);
+    expect(outcomeOf(again, handle), again).toBe("pass");
+  });
+
+  it("#5a control: a changed link stays a final UNVERIFIED", async () => {
+    const h = await makePlugin();
+    linkInW(libB);
+    state.byDir.set(libB, treeOf(libB, "c".repeat(40)));
+    const handle = register({ perimeter: frozen("unchanged", { links: [linkTo(libB)] }) });
+    const out = await verify(h, handle);
+    expect(outcomeOf(out, handle), out).toBe("unverifiable");
+    expect(captured.wiring?.pending.listUnverified("orch").map(entry => entry.handle)).not.toContain(handle);
+  });
+
+  it("#5b a placement whose realpath fails with EPERM → not judged (could not be checked), not drift", async () => {
+    const h = await makePlugin();
+    fs.mkdirSync(path.join(libB, ".git"), { recursive: true });
+    const placedDod: DoD = { ...FILE_DOD, checks: [{ kind: "fileExists", path: "index.ts" }, { kind: "fileExists", path: "lib.txt" }] };
+    const handle = register({ dod: placedDod, placements: [undefined, { cwd: libB, top: libB, foreign: true }] });
+    state.realpathFails.set(libB, "EPERM");
+    const out = await verify(h, handle);
+    expect(notJudged(out, handle), out).toBe(true);
+    expect(out).toMatch(/check 2 \(fileExists\) cwd=\S+ could not be checked since the producer returned \(EPERM\); nothing ran/);
+    expect(out).not.toMatch(/no longer resolves to the same repository/);
+    expect(acceptSpy).not.toHaveBeenCalled();
+  });
+
+  it("#5b control: a placement whose cwd is gone (ENOENT) is drift: final, nothing ran", async () => {
+    const h = await makePlugin();
+    const gone = path.join(home, "gone");
+    fs.mkdirSync(path.join(gone, ".git"), { recursive: true });
+    const placedDod: DoD = { ...FILE_DOD, checks: [{ kind: "fileExists", path: "index.ts" }, { kind: "fileExists", path: "lib.txt" }] };
+    const cwd = fs.realpathSync.native(gone);
+    const handle = register({ dod: placedDod, placements: [undefined, { cwd, top: cwd, foreign: true }] });
+    fs.rmSync(gone, { recursive: true, force: true });
+    const out = await verify(h, handle);
+    expect(outcomeOf(out, handle), out).toBe("unverifiable");
+    expect(out).toMatch(/no longer resolves to the same repository since the producer returned; nothing ran/);
   });
 });

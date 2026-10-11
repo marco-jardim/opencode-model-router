@@ -59,7 +59,7 @@ import {
   type SettledVerification,
   type VerificationResult,
 } from "./pending";
-import { assessRisk, type RiskAssessment } from "./risk";
+import { assessRisk, FULL_SCOPE_PLAN, type FullScopePlan, type RiskAssessment } from "./risk";
 import { resolveBaseDir } from "./paths";
 import { DEFAULT_IDLE_TTL_MS } from "../router/idle-sweep";
 import {
@@ -76,9 +76,9 @@ import {
 } from "./dispatch";
 import { runArgv, runShell } from "./exec";
 import { snapshotTree } from "./tree";
-import { discoverConsumers, planPerimeter, type ConsumerDiscovery } from "./perimeter";
+import { discoverConsumers, linkedTargets, planPerimeter, type ConsumerDiscovery } from "./perimeter";
 import { defaultExternalLinks, pinTarget, type LinkPin } from "./pin";
-import { gitTopOf, perimeterKey } from "./git-top";
+import { depthBelow, gitTopOf, perimeterKey } from "./git-top";
 import type { DispatchPerimeter, PerimeterEntry } from "./dispatch";
 import { branchSwitched, branchSwitchReason, branchUnconfirmedReason, treeMove, treeMoveReason } from "./branch";
 import { readHead, readHeadState, readReflogWindow, type HeadState, type ReflogEntry } from "./head";
@@ -1880,17 +1880,25 @@ export function createVerificationWiring(deps: {
     let linkUnobserved = false;
     for (const { entry, before, now } of planned.snapshots) {
       const seed = entry.seed;
-      if (seed.fixed !== undefined) continue;
-      // As perimeterAtGate names the root: its known top level when admitted, else where it was planned.
-      const known = now?.root ?? before?.root;
+      const fixed = seed.fixed;
+      // As perimeterAtGate names the root: its known top level when admitted, else where it was planned (a fixed root: there).
+      const known = fixed === undefined ? now?.root ?? before?.root : undefined;
       const refused = known !== undefined && seed.admit !== undefined && !seed.admit(known);
       const root = known !== undefined && !refused ? known : seed.at;
       const key = perimeterKey(root);
-      if (key === wKey) continue;
+      // W's own repository is W's snapshot (a fixed placeholder at W's path is kept, as perimeterAtGate keeps it).
+      if (fixed === undefined && key === wKey) continue;
+      // P2e QA-1 #1: a working-set root past the cap (fixed) is still a consumer candidate, as perimeterAtGate scans it.
       if (seed.origin === "working-set" && !workingSet.has(key)) {
         workingSet.set(key, { root, ...(seed.name !== undefined ? { name: seed.name } : {}) });
       }
-      if (seed.origin !== "link" && seed.linked !== true) continue;
+      const isLink = seed.origin === "link" || seed.linked === true;
+      if (fixed !== undefined) {
+        // P2e QA-1 #1: a link target past the cap was never observed: not deferred (X7). An unadmitted one is never observed.
+        if (fixed === "unobserved" && isLink) linkUnobserved = true;
+        continue;
+      }
+      if (!isLink) continue;
       if (refused || before === undefined || now === undefined || now.root === undefined) {
         linkUnobserved = true;
         continue;
@@ -2098,6 +2106,9 @@ export function createVerificationWiring(deps: {
    * Cross-repo P2e: with `placements` (index-aligned with `dod.checks`), each testsPass check is planned at its placement's
    * cwd; a placement with `scope === "full"` is not planned (it runs in full); a foreign placement is S6
    * (attribution-unavailable). A check without a placement, or no placements at all: the base dir, as before.
+   *
+   * P2e QA-1 #6: with `fullScope` (OD-P2e-2) no testsPass check is planned as affected (each runs in full); when every testsPass
+   * check runs in full, the result is the neutral FULL_SCOPE plan, never the unfinished S6 one.
    */
   const staticScoping = async (
     dod: DoD,
@@ -2105,11 +2116,13 @@ export function createVerificationWiring(deps: {
     changedFiles: readonly ChangedPath[],
     deadline: Deadline,
     placements?: readonly (CheckPlacement | undefined)[],
-  ): Promise<StaticScoping> => {
+    fullScope?: boolean,
+  ): Promise<StaticScoping | FullScopePlan> => {
     const unfinished: StaticScoping = { unverifiable: true, code: "search-failed", reason: STATIC_SCOPING_UNFINISHED_REASON };
     const budget = resolveVerifyBudget(getConfig());
     const base = resolveBaseDir(cwd, directory);
     const plans: StaticScoping[] = [];
+    let ranFull = false;
     for (const [index, check] of dod.checks.entries()) {
       if (check.kind !== "testsPass") continue;
       const command = resolveRepoCommand(check, "testsPass", undefined);
@@ -2118,7 +2131,10 @@ export function createVerificationWiring(deps: {
         continue;
       }
       const placement = placements?.[index];
-      if (placement?.scope === "full") continue;
+      if (fullScope === true || placement?.scope === "full") {
+        ranFull = true;
+        continue;
+      }
       if (placement?.foreign === true) {
         plans.push({
           unverifiable: true,
@@ -2143,6 +2159,8 @@ export function createVerificationWiring(deps: {
         plans.push(unfinished);
       }
     }
+    // P2e QA-1 #6: every testsPass check runs in full: the neutral plan (never the unfinished S6 one).
+    if (plans.length === 0 && ranFull) return FULL_SCOPE_PLAN;
     return plans.find(p => "unverifiable" in p) ?? plans[0] ?? unfinished;
   };
 
@@ -2217,7 +2235,7 @@ export function createVerificationWiring(deps: {
           ...(f.previousPath !== undefined ? { previousPath: f.previousPath } : {}),
         }));
         changedFiles = paths;
-        const scopingPlan = await staticScoping(input.dod, input.cwd, paths, deadline, input.placements);
+        const scopingPlan = await staticScoping(input.dod, input.cwd, paths, deadline, input.placements, input.fullScope);
         risk = assessRisk({ changedFiles: paths, reference: referenceCaptured, producerTier, scopingPlan, root: change.snapshot?.root });
         // QA-2.4-8: the drift baseline is taken BEFORE the result is released (fs reads only, under
         // the same DEFERRED_FINISH_MS bound). An edit that lands right after the return is then
@@ -2418,28 +2436,39 @@ export function createVerificationWiring(deps: {
    * returned: its real path is not its (canonical) cwd any more (a junction swapped under it, or gone), or its git top level is
    * not the frozen `top`. The reason names it ("nothing ran"); undefined when every placement still resolves as it did.
    */
-  const placementDriftOf = async (entry: PendingEntry): Promise<string | undefined> => {
+  const placementDriftOf = async (entry: PendingEntry): Promise<{ readonly kind: "drift" | "unchecked"; readonly reason: string } | undefined> => {
     const placements = entry.placements;
     if (placements === undefined) return undefined;
-    const drifted = await Promise.all(placements.map(async (placement): Promise<boolean> => {
-      if (placement === undefined) return false;
+    // Per placement: "same", "drift", or the code of a transient error (P2e QA-1 #5b: EPERM, EBUSY, EACCES…: not a drift).
+    const states = await Promise.all(placements.map(async (placement): Promise<string> => {
+      if (placement === undefined) return "same";
       let real: string;
       try {
         real = await realpath(placement.cwd);
-      } catch {
-        return true;
+      } catch (err) {
+        const code = typeof err === "object" && err !== null && "code" in err ? String((err as { code: unknown }).code) : "unknown";
+        // The directory is gone (or a file now stands in its path): it no longer resolves.
+        return code === "ENOENT" || code === "ENOTDIR" ? "drift" : code;
       }
-      if (perimeterKey(real) !== perimeterKey(placement.cwd)) return true;
+      if (perimeterKey(real) !== perimeterKey(placement.cwd)) return "drift";
       const top = gitTopOf(placement.cwd);
-      return top === undefined || placement.top === undefined
+      const moved = top === undefined || placement.top === undefined
         ? top !== placement.top
         : perimeterKey(top) !== perimeterKey(placement.top);
+      return moved ? "drift" : "same";
     }));
-    const index = drifted.indexOf(true);
-    if (index < 0) return undefined;
-    const placement = placements[index];
-    const kind = entry.dod?.checks?.[index]?.kind ?? "check";
-    return `check ${index + 1} (${kind}) cwd=${placement?.cwd ?? ""} no longer resolves to the same repository since the producer returned; nothing ran`;
+    const label = (index: number): string =>
+      `check ${index + 1} (${entry.dod?.checks?.[index]?.kind ?? "check"}) cwd=${placements[index]?.cwd ?? ""}`;
+    const drifted = states.indexOf("drift");
+    if (drifted >= 0) {
+      return { kind: "drift", reason: `${label(drifted)} no longer resolves to the same repository since the producer returned; nothing ran` };
+    }
+    const unchecked = states.findIndex(state => state !== "same");
+    if (unchecked < 0) return undefined;
+    return {
+      kind: "unchecked",
+      reason: `${label(unchecked)} could not be checked since the producer returned (${states[unchecked]}); nothing ran`,
+    };
   };
 
   /**
@@ -2472,6 +2501,11 @@ export function createVerificationWiring(deps: {
      * runs nothing). Absent: no placements, or all still resolve as at return.
      */
     readonly placementDrift?: string;
+    /**
+     * P2e QA-1 #5b: the first frozen check placement whose cwd could not be checked now (a transient filesystem error, not a
+     * missing directory): nothing runs, and the handle stays open (retryable). Absent: every placement could be checked.
+     */
+    readonly placementUnchecked?: string;
   }
 
   /** One claimed entry after its gate: a final result, or the raw gate result still to be judged. */
@@ -2591,7 +2625,15 @@ export function createVerificationWiring(deps: {
       // the call's entries through `snapshots`). Working-set roots are not: the I4 window ended at return.
       type FrozenLink = NonNullable<PendingEntry["perimeter"]>["links"][number];
       type Drift = { readonly name: string; readonly root: string; readonly why: "changed" | "unobserved" };
-      const observeLink = async (link: FrozenLink): Promise<Drift | undefined> => {
+      // `real`: where link.at resolves now (fs only); `targets`: W's package link targets now (linkedTargets: fs only, no git).
+      const observeLink = async (link: FrozenLink, real: string | undefined, targets: readonly string[]): Promise<Drift | undefined> => {
+        const name = link.name ?? basename(link.root);
+        // P2e QA-1 #4 (I12): no git where the link no longer resolves inside its frozen root, or where its admission refuses.
+        if (real === undefined || depthBelow(real, link.root) < 0 || link.admit?.(link.root) === false) {
+          return { name, root: link.root, why: "unobserved" };
+        }
+        // P2e QA-1 #2: W no longer links into it (retargeted or removed): the checks ran against another link target.
+        if (!targets.some(target => depthBelow(target, link.root) >= 0)) return { name, root: link.root, why: "changed" };
         const key = `link\0${perimeterKey(link.at)}`;
         let pending = snapshots.get(key);
         if (pending === undefined) {
@@ -2599,7 +2641,6 @@ export function createVerificationWiring(deps: {
           snapshots.set(key, pending);
         }
         const now = await pending;
-        const name = link.name ?? basename(link.root);
         const top = now?.root;
         if (now === undefined) return { name, root: link.root, why: "unobserved" };
         if (top !== undefined && link.admit !== undefined && !link.admit(top)) return { name, root: link.root, why: "unobserved" };
@@ -2608,8 +2649,32 @@ export function createVerificationWiring(deps: {
         }
         return undefined;
       };
-      const observeLinks = async (): Promise<Drift[]> =>
-        (await Promise.all(frozen.links.map(observeLink))).filter((drift): drift is Drift => drift !== undefined);
+      const observeLinks = async (): Promise<Drift[]> => {
+        const reals = await Promise.all(frozen.links.map(link => realpath(link.at).catch(() => undefined)));
+        const wRoot = frozen.observation.w.root;
+        let targets: string[];
+        try {
+          targets = linkedTargets(wRoot);
+        } catch {
+          targets = []; // Never expected (it skips what it cannot read): every frozen link is then "changed".
+        }
+        const drifts = await Promise.all(frozen.links.map((link, index) => observeLink(link, reals[index], targets)));
+        // P2e QA-1 #2: a link target of W now that none of the perimeter frozen at return covers is new: "changed", named by
+        // its top level (found without git). W's own repository is W's snapshot, as at dispatch (planPerimeter).
+        const covering = [
+          ...frozen.links.map(link => link.root),
+          ...reals.filter((real): real is string => real !== undefined),
+          ...frozen.observation.roots.map(root => root.root),
+        ];
+        const fresh = new Map<string, Drift>();
+        for (const target of targets) {
+          if (covering.some(root => depthBelow(target, root) >= 0)) continue;
+          const top = gitTopOf(target) ?? target;
+          if (depthBelow(top, wRoot) >= 0 || depthBelow(wRoot, top) >= 0) continue;
+          if (!fresh.has(perimeterKey(top))) fresh.set(perimeterKey(top), { name: basename(top), root: top, why: "changed" });
+        }
+        return [...drifts.filter((drift): drift is Drift => drift !== undefined), ...fresh.values()];
+      };
       const [found, pins, drifted] = await Promise.all([discoverFrozen(), awaitPins(), observeLinks()]);
       if (drifted.length > 0) linkDrift = drifted;
       perimeter = {
@@ -2618,12 +2683,16 @@ export function createVerificationWiring(deps: {
         ...(found.incomplete.length > 0 ? { consumersIncomplete: found.incomplete } : {}),
       };
       if (reference.kind === "captured" && pins.length > 0) {
-        // pinNow admits exactly the frozen links' roots, keyed by this pins array (buildGateDeps).
-        const admitted = new Set<string>();
-        for (const link of frozen.links) {
-          if (link.admit === undefined || link.admit(link.root)) admitted.add(perimeterKey(link.root));
+        // pinNow admits as the dispatch admitted, keyed by this pins array (buildGateDeps). P2e QA-1 #3: the deferred finish
+        // registered the dispatch's own admission for it (freeLinkPins: nested link targets included); it is kept. Only without
+        // one (an entry registered directly) the frozen links' roots stand in.
+        if (!pinAdmissions.has(pins)) {
+          const admitted = new Set<string>();
+          for (const link of frozen.links) {
+            if (link.admit === undefined || link.admit(link.root)) admitted.add(perimeterKey(link.root));
+          }
+          pinAdmissions.set(pins, admitted);
         }
-        pinAdmissions.set(pins, admitted);
         gateReference = { ...reference, reference: { ...reference.reference, pins } };
       }
     }
@@ -2643,7 +2712,8 @@ export function createVerificationWiring(deps: {
       drift,
       root,
       ...(linkDrift !== undefined ? { linkDrift } : {}),
-      ...(placementDrift !== undefined ? { placementDrift } : {}),
+      ...(placementDrift?.kind === "drift" ? { placementDrift: placementDrift.reason } : {}),
+      ...(placementDrift?.kind === "unchecked" ? { placementUnchecked: placementDrift.reason } : {}),
     };
   };
 
@@ -2668,6 +2738,10 @@ export function createVerificationWiring(deps: {
     if (dod === undefined) return { kind: "final", result: { verdict: unverifiableVerdict(ROUTER_VERIFY_RELEASED_REASON), retryable: false } };
     // Cross-repo P2e.4b: a placed check whose cwd no longer resolves to the same repository would run elsewhere: nothing runs.
     if (prep.placementDrift !== undefined) return { kind: "final", result: { verdict: unverifiableVerdict(prep.placementDrift), retryable: false } };
+    // P2e QA-1 #5b: a placement that could not be checked now: nothing runs; another router_verify may check it.
+    if (prep.placementUnchecked !== undefined) {
+      return { kind: "final", result: { verdict: unverifiableVerdict(prep.placementUnchecked), retryable: true } };
+    }
     const strict = cfg.enforcement?.verify?.strictUnverifiable ?? false;
     const inFlight = new Set<string>();
     const completedFailures: string[] = [];
@@ -2743,7 +2817,8 @@ export function createVerificationWiring(deps: {
    */
   const judgeVerdict = (entry: PendingEntry, prep: ClaimPreparation, gate: ClaimGate, cfg: RouterConfig): VerificationResult => {
     if (gate.kind === "final") return gate.result;
-    const { strict, retryable } = gate;
+    const { strict } = gate;
+    let retryable = gate.retryable;
     // QA-3.1-2 / QA-3.1-3: the dispatch's own context, recorded when the producer returned.
     const res = applyDispatchCaveats(
       lineageDowngrade(gate.res, { orchestratorSessionID: entry.orchestratorSessionID, root: prep.root, dispatchedAt: entry.dispatchedAt, strictUnverifiable: strict }),
@@ -2771,6 +2846,10 @@ export function createVerificationWiring(deps: {
       // report (formatVerifyReport: a verdict not accepted shows its reasons) names them.
       const caveats = prep.linkDrift.map(link => LINK_DRIFT_CAVEAT[link.why](link.name, link.root));
       const outcome = verdict.outcome ?? (verdict.pass ? "pass" : "fail");
+      // P2e QA-1 #5a: a would-be pass held back only by links that could not be observed (a snapshot not in time, a link that
+      // cannot be resolved now) is transient: retryable, so the handle stays open for another router_verify. A changed link
+      // is certain: final. A fail stays final.
+      if (outcome === "pass" && prep.linkDrift.every(link => link.why === "unobserved")) retryable = true;
       verdict = gateResult(
         {
           ...verdict,
