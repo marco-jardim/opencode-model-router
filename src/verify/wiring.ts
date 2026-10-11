@@ -431,6 +431,11 @@ export interface DeferredFinishInput {
    * the gate runs as before (I1).
    */
   readonly workRoot?: string;
+  /**
+   * Cross-repo I2 (P2.3): where the change capture observes a role dispatch (its work root W). Absent: `cwd`, as before.
+   * Only the observation uses it; the registration keeps `cwd`, the base the checks run in (F5).
+   */
+  readonly captureRoot?: string;
 }
 
 /** Deferred budget snapshots kept for `router_verify` (by handle; oldest dropped first, like the pending registry's bound). */
@@ -1848,7 +1853,7 @@ export function createVerificationWiring(deps: {
     let deferred = false;
     try {
       // Cross-repo P1.8: the perimeter is observed by the required gate only (a dispatch with one is never deferred, below).
-      const change = await observeChange(store, input.dispatchID, input.producerSessionID, input.cwd, deadline, false);
+      const change = await observeChange(store, input.dispatchID, input.producerSessionID, input.captureRoot ?? input.cwd, deadline, false);
       // I7 (P0.2): a branch switch during the dispatch is never deferred: a handle could verify the other branch later. The
       // caller's required gate refuses it now (its own observeChange sees the switch). Before the no-change shortcut below.
       if (change.branchSwitch !== undefined) return { deferred: false, reason: "branch-switched", detail: change.branchSwitch };

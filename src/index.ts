@@ -151,7 +151,7 @@ import {
   buildForcingNote,
   buildAcceptedSuffix,
 } from "./verify/dispatch";
-import { canonicalAuthorityPath, insideWorkRoot, requestedVerificationCwd, requestedVerificationCwdSource, verificationScope, type VerificationScope } from "./routing/roles/work-root";
+import { canonicalAuthorityPath, captureRootOf, insideWorkRoot, requestedVerificationCwd, requestedVerificationCwdSource, verificationScope, type VerificationScope } from "./routing/roles/work-root";
 import { resolveCheckPlacements } from "./routing/roles/check-placement";
 import { createRepoProbe, displaySafe, readSetEligible, readSetPredicate } from "./routing/roles/read-set";
 import { newLadderState, recordAttempt, nextAction, advance, buildEscalatePolicy, formatLadderScorecard, startCostRatio } from "./escalate/ladder";
@@ -2219,9 +2219,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           // 2.4.2b: the directives come from the orchestrator's own prompt, read here before the
           // dispatch header or any repair touches it, and are kept for the after hook. The capture
           // is awaited for at most VERIFY_WAIT (section 1.5-14) and continues in the background.
-          // DF2-F1: a role dispatch's capture is taken in its verification root (never in a refused cwd).
+          // DF2-F1 / I2 (P2.3): a role dispatch's capture is taken in its work root W (never in a refused cwd or a check
+          // subdirectory); a tier dispatch has no workRoot, so this is its explicit cwd, as before.
           await startDispatch(changedFileStore, `task:${input.sessionID}:${input.callID}`,
-            verificationScopeOf(input.callID, output?.args, dod).cwd,
+            captureRootOf(verificationScopeOf(input.callID, output?.args, dod)),
             dod,
             dispatchDirectiveText(prompt, description),
             true);
@@ -2532,6 +2533,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 producerTier,
                 description: taskDescription?.trim() ? taskDescription : (taskPrompt ?? ""),
                 cwd: effectiveCwd,
+                // I2 (P2.3): the change observation stays in W; the registration's cwd above is the check base (F5).
+                ...(scope.workRoot !== undefined ? { captureRoot: captureRootOf(scope) } : {}),
                 // #84 P3.3 DF2-F1 (fix-1 review nit): router_verify's gate re-checks containment in the role's work root.
                 ...(scope.workRoot !== undefined ? { workRoot: scope.workRoot } : {}),
                 dod,
@@ -2557,7 +2560,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             const gateDeadline = createDeadline(gateBudgetMs);
             let verification;
             try {
-              verification = await prepareVerification(changedFileStore, dispatchID, childSessionID ?? "", effectiveCwd, gateDeadline);
+              verification = await prepareVerification(changedFileStore, dispatchID, childSessionID ?? "", captureRootOf(scope), gateDeadline);
             } catch (error) {
               gateDeadline.dispose();
               throw error;

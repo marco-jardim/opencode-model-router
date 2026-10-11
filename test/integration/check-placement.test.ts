@@ -39,6 +39,36 @@ vi.mock("../../src/verify/tree", async importOriginal => {
   };
 });
 
+// A pass-through spy on the verification wiring: the cwd each dispatch's capture, preparation and deferral use (the pattern of
+// roles-authority.test.ts), and the deferral's registration base (`cwd`) next to its capture root.
+const wired = vi.hoisted(() => ({
+  calls: [] as Array<{ kind: "start" | "prepare" | "defer"; id: string; cwd: string | undefined; captureRoot?: string }>,
+}));
+vi.mock("../../src/verify/wiring", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../src/verify/wiring")>();
+  return {
+    ...actual,
+    createVerificationWiring: (...args: Parameters<typeof actual.createVerificationWiring>) => {
+      const wiring = actual.createVerificationWiring(...args);
+      return {
+        ...wiring,
+        startDispatch: (...a: Parameters<typeof wiring.startDispatch>) => {
+          wired.calls.push({ kind: "start", id: a[1], cwd: a[2] });
+          return wiring.startDispatch(...a);
+        },
+        prepareVerification: (...a: Parameters<typeof wiring.prepareVerification>) => {
+          wired.calls.push({ kind: "prepare", id: a[1], cwd: a[3] });
+          return wiring.prepareVerification(...a);
+        },
+        finishDeferred: (...a: Parameters<typeof wiring.finishDeferred>) => {
+          wired.calls.push({ kind: "defer", id: a[1].dispatchID, cwd: a[1].cwd, captureRoot: a[1].captureRoot });
+          return wiring.finishDeferred(...a);
+        },
+      };
+    },
+  };
+});
+
 const dod = (checks: string[]): string => `VERIFY:deferred\n[acceptance]\n${checks.map(check => `check: ${check}`).join("\n")}\n[/acceptance]`;
 const PLAIN = ['testsPass command="npm test"', "fileExists path=index.ts"];
 const HANDLE = /vrf_[0-9a-f]{24}/;
@@ -99,6 +129,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks();
   seam.pins.clear();
+  wired.calls.length = 0;
   for (const key of ["HOME", "USERPROFILE"] as const) {
     if (saved[key] === undefined) delete process.env[key];
     else process.env[key] = saved[key];
@@ -178,5 +209,74 @@ describe("interim deferral (P2.7 interim)", () => {
     await pin(repo);
     const out = await runTask(hooks, `Implement it.\n${dod(['testsPass command="npm test" scope=full', "fileExists path=inner.ts cwd=sub"])}`);
     expect(HANDLE.exec(out)?.[0], out).toBeDefined();
+  }, 90_000);
+});
+
+/** A path as the platform compares it (case on Windows, separators). */
+const same = (a: string | undefined, b: string): boolean => a !== undefined && seam.key(a) === seam.key(b);
+/** An acceptance block with a block-level `cwd:`. */
+const blockAt = (cwd: string, checks: string[], deferred: boolean): string =>
+  `${deferred ? "VERIFY:deferred\n" : ""}[acceptance]\ncwd: ${cwd}\n${checks.map(check => `check: ${check}`).join("\n")}\n[/acceptance]`;
+const callsOf = (kind: "start" | "prepare" | "defer") => wired.calls.filter(call => call.kind === kind && call.id === "task:orch:call1");
+
+describe("capture anchored at W (I2, P2.3)", () => {
+  it("(a) a role dispatch with a block cwd: sub captures and prepares at W; the checks keep the block cwd", async () => {
+    routeAsRole();
+    const hooks = await makePlugin();
+    await pin(repo);
+    const out = await runTask(hooks, `Implement it.\n${blockAt("sub", ["fileExists path=inner.ts"], false)}`);
+    const [start] = callsOf("start");
+    const [prepare] = callsOf("prepare");
+    expect(same(start?.cwd, repo), `start: ${start?.cwd}`).toBe(true);
+    expect(same(prepare?.cwd, repo), `prepare: ${prepare?.cwd}`).toBe(true);
+    expect(callsOf("defer")).toHaveLength(0);
+    // The checks ran in `sub`: `inner.ts` exists there (and is not at W), so the dispatch is not rejected for a missing file.
+    expect(out).not.toMatch(/inner\.ts[^\n]*(not found|missing|does not exist)/i);
+  }, 90_000);
+
+  it("(b) a deferred role dispatch with cwd: sub observes at W; the registration keeps sub as the check base", async () => {
+    routeAsRole();
+    const hooks = await makePlugin();
+    await pin(repo);
+    const out = await runTask(hooks, `Implement it.\n${blockAt("sub", ['testsPass command="npm test"', "fileExists path=inner.ts"], true)}`);
+    expect(HANDLE.exec(out)?.[0], out).toBeDefined();
+    const [start] = callsOf("start");
+    const [defer] = callsOf("defer");
+    expect(same(start?.cwd, repo), `start: ${start?.cwd}`).toBe(true);
+    expect(same(defer?.captureRoot, repo), `captureRoot: ${defer?.captureRoot}`).toBe(true);
+    expect(same(defer?.cwd, path.join(repo, "sub")), `cwd: ${defer?.cwd}`).toBe(true);
+  }, 90_000);
+
+  it("(c) a role dispatch without a cwd: captures at W, as before", async () => {
+    routeAsRole();
+    const hooks = await makePlugin();
+    await pin(repo);
+    await runTask(hooks, `Implement it.\n${dod(PLAIN)}`);
+    const [start] = callsOf("start");
+    const [defer] = callsOf("defer");
+    expect(same(start?.cwd, repo), `start: ${start?.cwd}`).toBe(true);
+    expect(same(defer?.captureRoot, repo)).toBe(true);
+    expect(same(defer?.cwd, repo)).toBe(true);
+  }, 90_000);
+
+  it("(d) a tier dispatch with cwd: sub captures at the verification cwd, unchanged (no capture root)", async () => {
+    // No routeAsRole(): routedRoleOf("call1") is undefined.
+    const hooks = await makePlugin();
+    await pin(repo);
+    const out = await runTask(hooks, `Implement it.\n${blockAt("sub", ['testsPass command="npm test"', "fileExists path=inner.ts"], true)}`);
+    expect(HANDLE.exec(out)?.[0], out).toBeDefined();
+    const [start] = callsOf("start");
+    const [defer] = callsOf("defer");
+    expect(start?.cwd).toBe("sub");
+    expect(defer?.cwd).toBe("sub");
+    expect(defer?.captureRoot).toBeUndefined();
+  }, 90_000);
+
+  it("(e) a non-deferred tier dispatch prepares at its verification cwd, unchanged", async () => {
+    const hooks = await makePlugin();
+    await pin(repo);
+    await runTask(hooks, `Implement it.\n${blockAt("sub", ["fileExists path=inner.ts"], false)}`);
+    expect(callsOf("start")[0]?.cwd).toBe("sub");
+    expect(callsOf("prepare")[0]?.cwd).toBe("sub");
   }, 90_000);
 });
