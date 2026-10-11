@@ -333,20 +333,23 @@ Everything else is work: resolve it, record it, continue.
 
 ## 7. Live state (§0.11 — keep current)
 
-**Next action:** Phase 0.1 QA round 2 (heavy) at the p01 head after merging `cpx/main` (A-0.1-2) into `cpx/p01`.
+**Next action:** Wave 2 — pre-flight and design for 2.1, 2.2, 2.3, 2.4 in `D:\git\omr-cpx-p21`…`p24` (branches `cpx/p21`…`cpx/p24`, base tags `cpx/p2x-base` = `558e5b8`). Then DF-1 after 2.1.
 
 **Orchestrator session:** `ses_ed82f88a7ffej5iKaRHuwIa6fd` (directory `D:\git\omr-cpx-main`).
 
 **Worktrees:** working (plan home) `D:\git\omr-cpx-main` (branch `cpx/main`, upstream `origin/cpx/main`); dogfood
 `D:\git\omr-cpx-dogfood-df0` (detached at `cpx/df0` = `b716ee9`, loaded by the plan's host); phase worktrees in
-flight: none. Base repository directory `D:\git\opencode-model-router` is off-limits (§0.13); so is the other
+flight: `D:\git\omr-cpx-p21`, `p22`, `p23`, `p24` (Wave 2). Done and merged: `p01`, `p11`, `p12`, `p13`, `p14` (kept until the end; never edit). Base repository directory `D:\git\opencode-model-router` is off-limits (§0.13); so is the other
 implementation's worktree `D:\git\opencode-model-router-cross-repo` (branch `feat/cross-repo`).
 
 | Phase | State | QA round | Notes |
 |---|---|---|---|
 | 0.P | **done** 2026-10-10 ≈20:45 | 3 (r1: 14, r2: 9, r3: 1 — all fixed or dispositioned; 7 minor/nit deferred to the DF-1 pre-flight) | started 18:55; `preflight.md` verdict: done |
-| 0.1 | QA round 2 pending | 1 done (16 findings: 2 critical, 6 major, 7 minor, 1 nit — all fixed) | started 20:37; tasks 0.1.0–0.1.6 done; smoke:cpx 3× green after the round-1 fixes (51/51, 2026-10-11 00:20–00:47); ADR 0007 regenerated `25d2ec4`; A-0.1-2 applied in `cpx/main` |
-| 1.1 · 1.2 · 1.3 · 1.4 | waiting | — | |
+| 0.1 | **done** 2026-10-11 ≈06:20 | 3 (r1: 16, r2: 13, r3: 2 major — all fixed; r3 minors recorded) | D5 withdrawn (C6 `all`: tools breakpoint keeps 5 min); final gate 1× by owner decision: smoke:cpx 52/52 at `915b96a`, smoke:keyless = baseline; merged `915b96a` |
+| 1.1 | **done** 2026-10-11 | 3 (r1: 17, r2: 9, r3: 1 major — fixed) | merged `d4d731b`; 2.1 handoff in `phase-1.1.md` |
+| 1.2 | **done** 2026-10-11 | 3 (r1: 13, r2: 6, r3: clean) | merged `a9e32c1`; cache-prefix smoke and routing-engine 2/4 green on 2.0.26 |
+| 1.3 | **done** 2026-10-11 | 3 (r1: 17, r2: 17, r3: clean) | merged `6d310eb` |
+| 1.4 | **done** 2026-10-11 | 3 (r1: 20, r2: 11, r3: 3 major — fixed) | merged `12d42b7`; contract addenda A1–A3 in `phase-1.4.md` |
 | 2.1 | waiting | — | |
 | DF-1 | waiting | — | |
 | 2.2 · 2.3 · 2.4 | waiting | — | |
@@ -356,7 +359,13 @@ implementation's worktree `D:\git\opencode-model-router-cross-repo` (branch `fea
 | DF-2 | waiting | — | |
 | 6.1 · 6.2 | waiting | — | |
 
-**In-flight dispatches** (role, session id, worktree, `Writes:`/`Reads:`): none.
+**In-flight dispatches** (role, session id, worktree, `Writes:`/`Reads:`): Wave 2 pre-flight (see the phase reports).
+
+**Plan amendments since A-0.1-2:** A-0.1-3, A-1.1-1, A-1.2-1, A-1.3-1, A-1.4-1 (logged in the plan's Plan QA record "Amendment log"). Wave 1 dispatch details are in each phase report (session ids per task and QA round).
+
+**Owner decisions 2026-10-11:** proceed to Wave 1 while 0.1 round-2 follow-ups finished; 0.1 final gate reduced to one `smoke:cpx` run.
+
+**Lessons (Wave 1):** the router's read guard denies reads after 3 consecutive non-producing actions — every dispatch says "read, edit, read"; v1 smokes (`smoke:keyless`, `smoke:v1`) must run with OpenCode 1.18.35 first on PATH (a run without it fails 18 tests, all environmental).
 
 **Dispatch log** (local time, 2026-10-10). *QA-0.P-19:* until now times were not taken at dispatch boundaries; the
 host log does not record child sessions, so each row gives bounds from the git commit times; from now on the
