@@ -942,6 +942,11 @@ d("C10 provider errors: 429, 529 and usage limit", () => {
           const surfaced = failedError ?? retryError;
           const resetPaths = surfaced ? stringPaths(surfaced, new RegExp(resetIsoSent.replace(/[.]/g, "\\."))) : [];
           const responseFields = surfaced ? findKeys(surfaced, /^(headers|response|responseHeaders|retryAfter|resetAt|resetsAt)$/i).map(k => ({ path: k.path, value: clip(k.value, 300) })) : [];
+          // ADR 0007 D13: what must not reach the error are the provider's response HEADERS (`retry-after` / reset headers). A field named `headers` / `responseHeaders` at any depth
+          // (which includes `response.headers`) is such a field; a `response` object that carries only a `body` is not. The body is recorded (`responseBodySurfaced`), not judged.
+          const headerFields = surfaced ? findKeys(surfaced, /^(headers|responseHeaders)$/i).map(k => ({ path: k.path, value: clip(k.value, 300) })) : [];
+          const responseBodies = surfaced ? findKeys(surfaced, /^response$/i).filter(k => obj(k.value).body !== undefined).map(k => ({ path: `${k.path}.body`, value: clip(obj(k.value).body, 600) })) : [];
+          const responseBodySurfaced = { present: responseBodies.length > 0, paths: responseBodies.map(b => b.path), values: responseBodies.map(b => b.value) };
           // QA-0.1-7c: the plugin retry hook's calls (retry-observe / retry-stop modes) and what the probe set.
           const probeAll = await probeLines(s.probeFile);
           const retryHookCalls = probeAll.filter(l => l.kind === "retry-hook" && l.sessionID === root);
@@ -950,7 +955,7 @@ d("C10 provider errors: 429, 529 and usage limit", () => {
           cases[c.name] = {
             variant: c.variant ?? (c.kind === "usage-limit" ? "reset-sentence" : undefined), probeMode: c.probe ?? null, observationWindowMs: c.capMs,
             classification, classifiedBy: failedError ? "session.step.failed" : retryError ? "session.retry.scheduled" : null,
-            resetRecoverable: { sentIso: c.kind === "usage-limit" ? resetIsoSent : undefined, inMessage: surfaced ? String(surfaced.message ?? "").includes(resetIsoSent) : false, paths: resetPaths, responseFields, surfacedError: clip(surfaced, 800) },
+            resetRecoverable: { sentIso: c.kind === "usage-limit" ? resetIsoSent : undefined, inMessage: surfaced ? String(surfaced.message ?? "").includes(resetIsoSent) : false, paths: resetPaths, responseFields, headerFields, responseBodySurfaced, surfacedError: clip(surfaced, 800) },
             retryHook: {
               available: probeAll.find(l => l.kind === "retry-hook-available")?.available,
               calls: retryHookCalls.map(l => ({ t: l.t, attempt: l.attempt, errorType: l.errorType, errorStatus: l.errorStatus, errorMessage: l.errorMessage, errorKeys: l.errorKeys, eventKeys: l.eventKeys, decisionKeys: l.decisionKeys, decisionReceived: l.decisionReceived })),
@@ -1464,12 +1469,37 @@ d("C14 launch with a retained tool context outside any LLM tool call", () => {
         o.observed.parentHistory = { ...history, unchangedAcrossLaunches: json(history.afterCaptureTurn) === json(history.afterBatch1) && json(history.afterBatch1) === json(history.afterBatch2), childrenListedUnderRoot: kids.map(k => ({ id: k.id, parentID: k.parentID, agent: k.agent })), session: await sessionState(host, root) };
         // QA-0.1-23g positive control (last step, so it changes neither the parent history nor the children list recorded above): this very host (same router, same decision log) writes
         // decision rows for an ORDINARY subagent call made by the root; only then does `routerDecisionRows === 0` for the retained children mean "the retained launch is invisible to the
-        // router" and not "this host writes no decision rows at all".
+        // router" and not "this host writes no decision rows at all". The host runs engine "shadow" (BASE), so rows ARE written; but the persister flushes the first write at once and
+        // then at most every 30 s (D15), so a read right after the call sees none: the rows are awaited by polling the log (RoutingHost's decision-row waiter), never by a fixed sleep.
         const rowsBeforeControl = (await host.decisionRows()).length;
+        const controlStartedAt = Date.now();
         const controlCall = await host.call(root, "subagent", childInput("C14POS", false));
-        const rowsAfterControl = await host.decisionRows();
-        const controlRows = rowsAfterControl.filter(row => (controlCall.childID !== undefined && json(row).includes(controlCall.childID)) || json(row).includes(controlCall.callID));
-        o.observed.decisionRowControl = { childID: controlCall.childID, callID: controlCall.callID, rowsTotalBefore: rowsBeforeControl, rowsTotalAfter: rowsAfterControl.length, rowsForOrdinaryCall: controlRows.length, sample: clip(controlRows[0], 500) };
+        // A fresh dispatch's row names no child (`childSessionID: null`, dispatch.ts) and may not carry the call id: it is attributed by id when it has one, else as a `dispatch` row of
+        // the root written at or after the control call started (the retained launches ran before it and have no root-session dispatch).
+        const isControlRow = (row: unknown): boolean => {
+          const r = obj(row);
+          const ts = typeof r.ts === "string" ? Date.parse(r.ts) : Number.NaN;
+          return (controlCall.childID !== undefined && json(row).includes(controlCall.childID)) || json(row).includes(controlCall.callID)
+            || (r.sessionID === root && r.step === "dispatch" && ts >= controlStartedAt);
+        };
+        let rowsAfterControl = await host.decisionRows();
+        let controlWaitError: string | undefined;
+        if (!rowsAfterControl.some(isControlRow)) {
+          try {
+            rowsAfterControl = await host.waitForRows("C14 decision row of the ordinary subagent call", rows => rows.some(isControlRow), 45_000);
+          } catch (error) {
+            controlWaitError = String(error); // recorded: the check below then fails with rowsForOrdinaryCall 0 after the persister's full flush interval
+            rowsAfterControl = await host.decisionRows();
+          }
+        }
+        const controlRows = rowsAfterControl.filter(isControlRow);
+        // The persister writes in order: once the control's row is on disk, every row queued before it (the retained children's, were there any) is on disk too. The per-child count is
+        // therefore taken from THIS read, not from the earlier one (which could precede the persister's 30 s flush).
+        for (const c of perChild) c.routerDecisionRows = rowsAfterControl.filter(row => json(row).includes(c.sessionID)).length;
+        o.observed.decisionRowControl = {
+          childID: controlCall.childID, callID: controlCall.callID, engine: "shadow (BASE routing.engine)", rowsTotalBefore: rowsBeforeControl, rowsTotalAfter: rowsAfterControl.length,
+          rowsForOrdinaryCall: controlRows.length, retainedChildRowsAfterFlush: perChild.map(c => c.routerDecisionRows), waitError: controlWaitError, sample: clip(controlRows[0], 500), // waitError set: no row for the ordinary call within 45 s (> the 30 s flush interval)
+        };
       }, retainedHostOptions(), retainedEnv);
       // QA-2a CONTROL: the same launch on a host WITHOUT the router. Anything the router adds to a retained child (guard refusals) is absent here.
       o.observed.control = await lightRetained(o, "C14-control", retainedHostOptions({ withoutRouter: true }), {}, 60_000);
@@ -1946,8 +1976,11 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
     // QA-0.1-23d: on a usage limit the hook receives the host's own decision already set to {retry: false}; and the provider's response headers never reach the surfaced error (every usage-limit case).
     check(o, "C10/D13", list(at(quotaObserved, "retryHook", "calls")).length >= 1 && list(at(quotaObserved, "retryHook", "calls")).every(x => at(x, "decisionReceived", "retry") === false), `usage limit with the retry hook registered: the hook must be called and receive the decision {retry: false} (calls ${list(at(quotaObserved, "retryHook", "calls")).length}, decisions received ${json(list(at(quotaObserved, "retryHook", "calls")).map(x => at(x, "decisionReceived")))}); if it receives retry:true the host would retry a quota error and D13 must stop it itself`);
     for (const name of Object.keys(EXPECTED_CLASSIFICATION)) {
-      const headerFields = list(at(kase(name), "resetRecoverable", "responseFields")).filter(f => /\.(headers|response|responseHeaders)$/i.test(String(at(f, "path"))));
-      check(o, "C10/D13", headerFields.length === 0, `${name}: the provider's response headers must NOT reach the surfaced error (step.failed / session.retry.scheduled error carry no headers / response field; found ${json(headerFields)}); D13 therefore reads the reset time from the message text only — if headers appear, re-decide where the reset time is read`);
+      // Only a field that can carry headers fails: `headers` / `responseHeaders` at any depth (so also `response.headers`). A `response` object holding just a `body` is not a header
+      // (C10.json of run 6974ae7c: `$.response = { body }` in all five cases); the body is recorded as `responseBodySurfaced`, not judged.
+      const headerFields = list(at(kase(name), "resetRecoverable", "headerFields"));
+      const bodySurfaced = at(kase(name), "resetRecoverable", "responseBodySurfaced");
+      check(o, "C10/D13", headerFields.length === 0, `${name}: the provider's response headers must NOT reach the surfaced error (step.failed / session.retry.scheduled error carry no \`headers\` / \`responseHeaders\` / \`response.headers\` field; found ${json(headerFields)}); response.body surfaced: ${String(at(bodySurfaced, "present"))} (${json(at(bodySurfaced, "paths"))}), so the reset time is readable from the message text AND from the body text, but no retry-after / reset header reaches the error — if a headers field appears, re-decide where the reset time is read`);
     }
     const stopCase = kase("rate-limit-persistent-retry-stop");
     const stopCalls = list(at(stopCase, "retryHook", "calls"));
@@ -2014,10 +2047,10 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
     check(o, "C14/D14", at(hooks, "subagentHooksOnRootAfterCapture") === 0, "a retained-context launch must fire no subagent hook on the root");
     const perChildHooks = list(at(hooks, "perChild"));
     // QA-0.1-23g positive control: the same host writes decision rows for an ordinary subagent call, so "0 rows for the retained children" below is a real absence.
-    check(o, "C14/D14", Number(at(ob, "decisionRowControl", "rowsForOrdinaryCall")) >= 1, `positive control: an ordinary subagent call made by the root in this same host must produce at least one router decision row (rows for it: ${String(at(ob, "decisionRowControl", "rowsForOrdinaryCall"))}); if this host writes none, routerDecisionRows === 0 for the retained children proves nothing`);
+    check(o, "C14/D14", Number(at(ob, "decisionRowControl", "rowsForOrdinaryCall")) >= 1, `positive control: an ordinary subagent call made by the root in this same host must produce at least one router decision row (rows for it: ${String(at(ob, "decisionRowControl", "rowsForOrdinaryCall"))}; engine ${String(at(ob, "decisionRowControl", "engine"))}; rows awaited by polling the decision log for the persister's flush${at(ob, "decisionRowControl", "waitError") === undefined ? "" : `, wait ended with: ${String(at(ob, "decisionRowControl", "waitError"))}`}); if this host writes none, routerDecisionRows === 0 for the retained children proves nothing`);
     // QA-0.1-23e: every pinned C14 check ran with the probe's OWN signal and a recording progress (not the retained ones); the retained-signal host below is recorded, not pinned.
     check(o, "C14/D14", at(ob, "launchContext", "signalReplaced") === true && at(ob, "launchContext", "progressReplaced") === true, `the pinned C14 launches must use the probe's own signal and a recording progress (launchContext.signalReplaced ${String(at(ob, "launchContext", "signalReplaced"))}, progressReplaced ${String(at(ob, "launchContext", "progressReplaced"))}); otherwise the other C14 checks describe a different launch than the one D14 assumes`);
-    check(o, "C14/D14", perChildHooks.length === RETAINED_COUNT * 2 && perChildHooks.every(c => at(c, "routerDecisionRows") === 0), "retained-context launches must leave no router decision row for any child (routerDecisionRows === 0): the router records decisions in subagent tool hooks, which a retained launch never fires");
+    check(o, "C14/D14", perChildHooks.length === RETAINED_COUNT * 2 && perChildHooks.every(c => at(c, "routerDecisionRows") === 0), "retained-context launches must leave no router decision row for any child (routerDecisionRows === 0, counted in the decision log read AFTER the ordinary call's row was flushed — the positive control above — so a late flush cannot hide one): the router records decisions in subagent tool hooks, which a retained launch never fires");
     check(o, "C14/D14", perChildHooks.length === RETAINED_COUNT * 2 && perChildHooks.every(c => at(c, "firstContextBeforeFirstTool") === true), "for every retained child the first context hook must run before its first tool call (firstContextAt < firstToolAt); D14 binds role / agent / model in the context hook");
     check(o, "C14/O3", at(ob, "concurrency", "allParked") === true && at(ob, "concurrency", "peakWaiting") === RETAINED_COUNT && at(ob, "concurrency", "parkedSessions") === RETAINED_COUNT, `O3: all ${RETAINED_COUNT} retained children's first provider requests must be waiting at once (peakWaiting ${RETAINED_COUNT}, held by Gates until all arrived); if the host caps lower, clamp D13/D14 maxParallel to the observed peak (${String(at(ob, "concurrency", "peakWaiting"))})`);
     // QA-0.1-2: the router's own effect on retained children (enforced mode), measured against the control host without the router, for EVERY child of both batches.
