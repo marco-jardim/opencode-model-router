@@ -2,6 +2,10 @@
 // Nothing here touches the filesystem, the clock or the process at module load.
 import { randomBytes } from "node:crypto";
 import * as nodeFsp from "node:fs/promises";
+import { constants as nodeFsConstants } from "node:fs";
+
+/** `appendText` options as the ledger passes them: `create: false` means "the file must already exist" (ENOENT = fenced). */
+type AppendOptions = { fsync: boolean; create?: boolean };
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { isPlanId, planDir, SLOT_MARKERS_DIRNAME } from "./paths.js";
@@ -1289,11 +1293,16 @@ class StoreWriter implements LedgerWriter {
     const durable = inputs.some(isDurableEvent);
     const journal = await this.ensureJournal();
     try {
-      await this.env.fs.appendText(join(this.env.dir, journal.name), `${lines.join("\n")}\n`, { fsync: durable });
+      // Never create the journal here: a missing file means a takeover rotated it away, so this writer is fenced (QA-2.2-24).
+      const opts: AppendOptions = { fsync: durable, create: false };
+      await this.env.fs.appendText(join(this.env.dir, journal.name), `${lines.join("\n")}\n`, opts);
       this.journalUnsynced = !durable;
     } catch (e) {
       // The file may now end in a partial batch: never append to it again.
       this.needsRotate = true;
+      if (fsErrorCode(e) === "ENOENT") {
+        throw new ExecutorError("E_LOCK_LOST", `journal ${journal.name} no longer exists: the writer lock was taken over`);
+      }
       throw e;
     }
     // A takeover between the lock check and the write fences this batch, but the new owner may have loaded before or after the write: the
@@ -1499,6 +1508,15 @@ class StoreWriter implements LedgerWriter {
     const { fs, dir } = this.env;
     const N = this.current.seq;
     const { chain } = trustedChain(journalsOf(names));
+    // Same trust rules as `loadMain`: a file of an older epoch than the newest snapshot counts only up to that snapshot's seq.
+    const newest = newestSnapshotEpoch(names);
+    let snapshotSeq = N;
+    if (newest !== null) {
+      const snapName = snapshotName(newest);
+      const snapText = await readOptional(fs, join(dir, snapName));
+      if (snapText !== null) snapshotSeq = Math.min(N, checkLedger(parseSnapshot(snapText, snapName), snapName).seq);
+    }
+    const snapshotEpoch = newest ?? 0;
     const lines: JournalLine[] = [];
     for (let i = 0; i < chain.length; i++) {
       const f = chain[i] as JournalFile;
@@ -1506,9 +1524,12 @@ class StoreWriter implements LedgerWriter {
       const next = chain[i + 1];
       const text = await readOptional(fs, join(dir, f.name));
       if (text === null) continue;
-      for (const l of parseJournal(text, f.name).lines) {
-        if (l.event.seq <= N && (next === undefined || l.event.seq < next.first)) lines.push(l);
-      }
+      const fenced = f.epoch < snapshotEpoch;
+      const kept = parseJournal(text, f.name).lines.filter(
+        (l) => l.event.seq <= N && (next === undefined || l.event.seq < next.first) && (!fenced || l.event.seq <= snapshotSeq),
+      );
+      // Framing per file against the first seq in its name; an incomplete trailing batch is never history.
+      for (const l of frameJournal(kept, f.name, f.first).lines) lines.push(l);
     }
     const hl = await loadHistory(fs, dir, N, lines);
     if (!hl.rewrite && hl.added.length === 0) return;
@@ -2106,7 +2127,9 @@ export function createNodeFileSystem(): FileSystem {
       }
     },
     async appendText(p, data, o) {
-      const fh = await nodeFsp.open(p, "a");
+      // `create: false` (journal appends): O_APPEND without O_CREAT, so a fenced writer whose file was deleted cannot re-create it.
+      const noCreate = (o as AppendOptions).create === false;
+      const fh = await nodeFsp.open(p, noCreate ? nodeFsConstants.O_WRONLY | nodeFsConstants.O_APPEND : "a");
       try {
         await fh.appendFile(data, "utf8");
         if (o.fsync) await fh.sync();

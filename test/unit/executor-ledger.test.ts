@@ -2132,6 +2132,36 @@ describe("fencing", () => {
     await again.close();
   });
 
+  it("QA-2.2-24: a hung fenced writer's late append never re-creates its deleted journal; two rotations later no history leaks", async () => {
+    const h = holdOnce((c) => c.op === "appendText" && /events\.\d+\.\d+\.jsonl$/.test(c.path) && (c.data ?? "") !== "");
+    const root = await newRoot();
+    const a = await mk({ root, pid: 100, fs: interceptFs(realFs, h.hook) });
+    const b = await mk({ root, pid: 200, clock: a.clock, snapshotEvery: 1 });
+    const c = await mk({ root, pid: 300, clock: a.clock });
+    const old = await a.store.create(buildDraft(1), a.holder("session-a"));
+    const before = await ls(a.dir);
+    h.arm();
+    const late = old.append([metric(91)]); // W1 passes its lock check, then hangs before the journal write
+    await h.g.reached;
+    const fresh = await b.store.takeover(PLAN_ID, b.holder("session-b"), "hung"); // W2's start rotation deletes W1's journal
+    const w1Journals = before.filter((n) => /^events\.\d+\.1\.jsonl$/.test(n));
+    expect(w1Journals.length).toBeGreaterThan(0);
+    await fresh.append([addTask("B1")]); // each append snapshots and rotates: W2's takeover file is deleted by a later rotation
+    await fresh.append([addTask("B2")]);
+    await fresh.append([addTask("B3")]);
+    for (const n of w1Journals) expect(await ls(a.dir)).not.toContain(n);
+    h.g.open();
+    expect((await failure(late)).code).toBe("E_LOCK_LOST");
+    for (const n of w1Journals) expect(await ls(a.dir)).not.toContain(n); // not re-created
+    await fresh.append([addTask("B4")]);
+    await fresh.close();
+    const history = (await readLines(join(a.dir, "history.jsonl"))).map((l) => JSON.parse(l) as ExecutorEvent);
+    expect(history.filter((e) => e.type === "metric")).toEqual([]);
+    const again = await c.store.open(PLAN_ID, c.holder("session-c"));
+    expect(Object.keys(again.ledger.tasks)).toEqual(["T1", "B1", "B2", "B3", "B4"]);
+    await again.close();
+  });
+
   it("QA-2.2-2b: a fenced writer's late snapshot (inside close) is refused right before its rename; close leaves the new lock", async () => {
     const h = holdOnce((c) => c.op === "writeText" && /ledger\.\d+\.json\.tmp-/.test(c.path));
     const root = await newRoot();
