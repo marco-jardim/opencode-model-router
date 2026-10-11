@@ -8,6 +8,7 @@ import {
   createPersister,
   createSideLogs,
   durationSeamsFor,
+  isSideLogLabel,
   nodePersistFs,
   nodeScheduler,
   parseLogLine,
@@ -1309,6 +1310,24 @@ describe("side logs: validation, observer, serialized appends (QA-1.1-5, -7, -16
     const row = timing({ model: "anthropic/claude-sonnet-5-5#low", callID: "toolu_01:A.b@c+d-e", scope: "src/a.ts", role: "plan-reviewer" });
     await side.appendTimings([row]);
     expect((await side.readTimings()).rows).toEqual([row]);
+  });
+
+  it("model ids with a bracketed suffix, a Vertex @version or a Bedrock -v1:0 are accepted (QA-1.1-19)", async () => {
+    const { deps } = memDeps();
+    const side = createSideLogs(OUT, deps);
+    const models = ["anthropic/claude-opus-5-5[1m]", "google-vertex-anthropic/claude-sonnet-5@20250101", "amazon-bedrock/anthropic.claude-sonnet-5-v1:0"];
+    const rows = models.map((model, i) => timing({ model, callID: `call-${i}` }));
+    await side.appendTimings(rows);
+    expect((await side.readTimings()).rows).toEqual(rows);
+  });
+
+  it("isSideLogLabel: printable non-whitespace ASCII of 1 to 256 characters (QA-1.1-26)", () => {
+    for (const ok of ["a", "anthropic/claude-opus-5-5[1m]", "x@20250101", "v1:0", "~", "!", "a".repeat(256), "toolu_01:A.b@c+d-e", "{braces}", "q?x=1&y=2"]) {
+      expect(isSideLogLabel(ok), ok).toBe(true);
+    }
+    for (const bad of ["", " ", "a b", "a\tb", "a\nb", "a".repeat(257), "caf\u00e9", "a\u0000b", "a\u007fb", "\u3042", " lead", "trail "]) {
+      expect(isSideLogLabel(bad), JSON.stringify(bad)).toBe(false);
+    }
   });
 
   it("an empty label is refused", async () => {

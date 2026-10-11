@@ -4,13 +4,15 @@
 // Estimates how long a child dispatch of (role, class, scope) takes, from the rows of `timings.jsonl`
 // (`DispatchTimingRow`). Pure module: no I/O of its own, the rows come through the injected `readTimings` seam
 // and the clock through `now`. Like every module under src/routing/outcomes/ it must stay runnable under Node's
-// type stripping: `import type` only, no enum, namespace or parameter property.
+// type stripping: type imports use `import type`, the one value import is MAX_FUTURE_SKEW_MS from ./timings; no enum,
+// namespace or parameter property.
 //
 // Rules:
 //   - fallback: exact (role, class, scope) -> (role, class) -> role -> prior. A level answers p50 only with at least
 //     `minSamples` samples; otherwise the next, coarser level is tried. p90 needs at least `p90MinSamples` (10): it
 //     comes from the finest level, from the p50 level on, that has them, else from the prior (never below p50);
-//   - rows that ended more than a day after `now()` are ignored (a clock jump wrote them);
+//   - rows that ended more than `MAX_FUTURE_SKEW_MS` (timings.ts, one day) after `now()` are dropped by `observe` and
+//     `load`, never kept in a window (a clock jump wrote them; QA-1.1-21);
 //   - only rows with `outcome: "succeeded"` count, and rows whose `capacity` is not null are excluded (ADR 0007 D6:
 //     a provider capacity condition says nothing about how long the work takes);
 //   - p50 / p90 are nearest-rank percentiles (rank = ceil(p * n), 1-based) over the newest `window` rows of the key
@@ -23,6 +25,7 @@
 // folds a live row in at any time. A row seen twice (from the file and from `observe`) counts once.
 // ---------------------------------------------------------------------------
 
+import { MAX_FUTURE_SKEW_MS } from "./timings";
 import type { DispatchTimingRow } from "./types";
 
 export const DURATION_WINDOW = 50;
@@ -33,8 +36,6 @@ export const DURATION_MIN_SAMPLES = 5;
 export const DURATION_P90_MIN_SAMPLES = 10;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-/** A row that ended later than `now` by more than this is ignored (QA-1.1-9: the clock that wrote it jumped forward). */
-const MAX_FUTURE_ENDED_MS = DAY_MS;
 const SEP = "\u0000";
 
 export type DurationSource = "exact" | "role-class" | "role" | "prior";
@@ -42,9 +43,14 @@ export type DurationSource = "exact" | "role-class" | "role" | "prior";
 export interface DurationEstimate {
   readonly p50: number;
   readonly p90: number;
-  /** Samples behind the estimate (0 for the prior). */
+  /** Samples behind the p50 (0 for the prior). */
   readonly n: number;
+  /** Level the p50 came from. */
   readonly source: DurationSource;
+  /** Level the p90 came from (QA-1.1-22): the finest level from the p50 level on with enough samples, else `"prior"`. */
+  readonly p90Source: DurationSource;
+  /** Samples behind the p90 (0 when it is the prior). `source`/`n` describe the p50 only. */
+  readonly p90N: number;
 }
 
 export interface DurationQuery {
@@ -144,6 +150,9 @@ export function createDurationModel(seams: DurationSeams, opts: DurationOptions 
   function observe(row: DispatchTimingRow): void {
     if (row.outcome !== "succeeded" || row.capacity !== null) return;
     if (!Number.isFinite(row.endedAt) || !Number.isFinite(row.durationMs) || row.durationMs < 0) return;
+    // QA-1.1-21: a row from the future (a clock jump wrote it) is dropped, not kept in the window where it would displace real samples.
+    const t = seams.now();
+    if (row.endedAt > (Number.isFinite(t) ? t : Date.now()) + MAX_FUTURE_SKEW_MS) return;
     const sample: Sample = {
       endedAt: row.endedAt,
       durationMs: row.durationMs,
@@ -175,19 +184,26 @@ export function createDurationModel(seams: DurationSeams, opts: DurationOptions 
     const t = seams.now();
     const now = Number.isFinite(t) ? t : Date.now();
     const cutoff = now - maxAgeMs;
-    const ceiling = now + MAX_FUTURE_ENDED_MS;
+    const ceiling = now + MAX_FUTURE_SKEW_MS;
     const levels: Array<{ readonly source: DurationSource; readonly durations: number[] }> = [
       { source: "exact", durations: durationsOf(exact, `${query.role}${SEP}${query.class}${SEP}${query.scope}`, cutoff, ceiling) },
       { source: "role-class", durations: durationsOf(roleClass, `${query.role}${SEP}${query.class}`, cutoff, ceiling) },
       { source: "role", durations: durationsOf(role, query.role, cutoff, ceiling) },
     ];
     const start = levels.findIndex((level) => level.durations.length >= minSamples);
-    if (start < 0) return { p50: priorMs, p90: priorMs, n: 0, source: "prior" };
+    if (start < 0) return { p50: priorMs, p90: priorMs, n: 0, source: "prior", p90Source: "prior", p90N: 0 };
     const chosen = levels[start] as (typeof levels)[number];
     const p50 = nearestRank(chosen.durations, 0.5);
     const tail = levels.slice(start).find((level) => level.durations.length >= p90MinSamples);
     const p90 = tail === undefined ? priorMs : nearestRank(tail.durations, 0.9);
-    return { p50, p90: Math.max(p90, p50), n: chosen.durations.length, source: chosen.source };
+    return {
+      p50,
+      p90: Math.max(p90, p50),
+      n: chosen.durations.length,
+      source: chosen.source,
+      p90Source: tail === undefined ? "prior" : tail.source,
+      p90N: tail === undefined ? 0 : tail.durations.length,
+    };
   }
 
   function load(): Promise<void> {

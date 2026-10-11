@@ -10,7 +10,9 @@ import {
   MAX_OPEN_STARTS,
   MAX_ROOT_SESSIONS,
   MAX_SEEN_EVENT_IDS,
+  MAX_UNBOUND_OUTCOMES,
   OPEN_START_TTL_MS,
+  UNBOUND_OUTCOME_TTL_MS,
   acquireTimingRecorder,
   classifyCapacity,
   createTimingRecorder,
@@ -115,6 +117,8 @@ describe("timing recorder: constants", () => {
   it("documents its bounds", () => {
     expect(MAX_OPEN_STARTS).toBe(1000);
     expect(OPEN_START_TTL_MS).toBe(6 * 60 * 60 * 1000);
+    expect(MAX_UNBOUND_OUTCOMES).toBe(200);
+    expect(UNBOUND_OUTCOME_TTL_MS).toBe(10 * 60 * 1000);
   });
 });
 
@@ -281,10 +285,13 @@ describe("timing recorder: duplicates and double outcomes", () => {
     expect(timingRows()).toHaveLength(2);
   });
 
-  it("a second start for an open child under ANOTHER callID closes the first as unknown at the new start (QA-1.1-2)", async () => {
+  it("a second start for an open child under ANOTHER callID closes the first as unknown at the new start once it is confirmed (QA-1.1-2, QA-1.1-18)", async () => {
     const rec = recorder();
     rec.recordDispatchStart(startInput({ at: NOW, callID: "first" }));
     rec.recordDispatchStart(startInput({ at: NOW + 1_000, callID: "second" }));
+    await rec.flush();
+    expect(timingRows()).toEqual([]); // not confirmed yet: the older call is still open
+    rec.bindChild("second", "child-1"); // the router's commit
     await rec.flush(); // the older row is written in the background
     expect(timingRows()).toHaveLength(1);
     expect(timingRows()[0]).toMatchObject({ callID: "first", outcome: "unknown", startedAt: NOW, endedAt: NOW + 1_000, durationMs: 1_000 });
@@ -297,6 +304,7 @@ describe("timing recorder: duplicates and double outcomes", () => {
     const rec = recorder();
     rec.recordDispatchStart(startInput({ at: NOW, callID: "first" }));
     rec.recordDispatchStart(startInput({ at: NOW + 1_000, callID: "second" }));
+    rec.bindChild("second", "child-1");
     await rec.flush();
     const rows = timingRows();
     const model = createDurationModel({ readTimings: () => Array.from({ length: 6 }, () => rows[0] as DispatchTimingRow), now }, { minSamples: 1 });
@@ -633,14 +641,104 @@ describe("timing recorder: keyed by callID (QA-1.1-1)", () => {
     expect(timingRows()[0]).toMatchObject({ callID: "call-x", childSessionID: "child-x", durationMs: 800 });
   });
 
-  it("an outcome before the child is bound finds nothing and consumes nothing", async () => {
+  it("an outcome before the child is bound is remembered and applied by bindChild (QA-1.1-18)", async () => {
     const rec = recorder();
     rec.recordDispatchStart(startInput({ callID: "call-x", childSessionID: null }));
-    await rec.onExecutionOutcome("child-x", "evt-1", "succeeded", NOW + 1);
-    expect(timingRows()).toEqual([]);
+    await rec.onExecutionOutcome("child-x", "evt-1", "succeeded", NOW + 1_500);
+    expect(timingRows()).toEqual([]); // no start for the child yet: nothing written now
     rec.bindChild("call-x", "child-x");
-    await rec.onExecutionOutcome("child-x", "evt-1", "succeeded", NOW + 2);
+    await rec.flush();
     expect(timingRows()).toHaveLength(1);
+    expect(timingRows()[0]).toMatchObject({ callID: "call-x", childSessionID: "child-x", durationMs: 1_500, outcome: "succeeded" });
+    await rec.onExecutionOutcome("child-x", "evt-1", "succeeded", NOW + 2_000); // the same end again: ignored
+    await rec.flush();
+    expect(timingRows()).toHaveLength(1);
+  });
+
+  it("an outcome older than the start is not applied to it", async () => {
+    const rec = recorder();
+    await rec.onExecutionOutcome("child-x", "evt-old", "succeeded", NOW - 5_000); // belongs to an earlier dispatch
+    rec.recordDispatchStart(startInput({ callID: "call-x", childSessionID: null, at: NOW }));
+    rec.bindChild("call-x", "child-x");
+    await rec.flush();
+    expect(timingRows()).toEqual([]);
+    await rec.onExecutionOutcome("child-x", "evt-new", "failed", NOW + 10);
+    expect(timingRows()).toMatchObject([{ callID: "call-x", outcome: "failed", durationMs: 10 }]);
+  });
+
+  it("remembered outcomes are bounded in number and age", async () => {
+    const rec = recorder();
+    for (let i = 0; i < MAX_UNBOUND_OUTCOMES + 5; i++) await rec.onExecutionOutcome(`c-${i}`, `evt-${i}`, "succeeded", NOW + 1);
+    rec.recordDispatchStart(startInput({ callID: "call-0", childSessionID: null }));
+    rec.bindChild("call-0", "c-0"); // the oldest was pushed out
+    rec.recordDispatchStart(startInput({ callID: "call-last", childSessionID: null }));
+    rec.bindChild("call-last", `c-${MAX_UNBOUND_OUTCOMES + 4}`);
+    await rec.flush();
+    expect(timingRows().map(r => r.callID)).toEqual(["call-last"]);
+    await rec.onExecutionOutcome("late", "evt-late", "succeeded", NOW + 1);
+    clockNow = NOW + UNBOUND_OUTCOME_TTL_MS + 1;
+    rec.recordDispatchStart(startInput({ callID: "call-late", childSessionID: null, at: NOW }));
+    rec.bindChild("call-late", "late"); // expired
+    await rec.flush();
+    expect(timingRows().map(r => r.callID)).toEqual(["call-last"]);
+  });
+
+  it("foreground resume: the child's end arrives before the result binds it (QA-1.1-18)", async () => {
+    const rec = recorder();
+    rec.recordDispatchStart(startInput({ callID: "call-1", childSessionID: "child-r", at: NOW }));
+    await rec.onExecutionOutcome("child-r", "evt-1", "succeeded", NOW + 1_000);
+    expect(timingRows()).toHaveLength(1);
+    // Resume of the same child: the router knows its id only at commit.
+    clockNow = NOW + 5_000;
+    rec.recordDispatchStart(startInput({ callID: "call-2", childSessionID: null, at: NOW + 5_000 }));
+    await rec.onExecutionOutcome("child-r", "evt-2", "succeeded", NOW + 7_000); // ends before the result
+    rec.bindChild("call-2", "child-r");
+    await rec.flush();
+    expect(timingRows().map(r => [r.callID, r.durationMs, r.outcome])).toEqual([
+      ["call-1", 1_000, "succeeded"],
+      ["call-2", 2_000, "succeeded"],
+    ]);
+  });
+
+  it("a rejected resume of a live child leaves the live call alone (QA-1.1-18)", async () => {
+    const rec = recorder();
+    rec.recordDispatchStart(startInput({ callID: "call-1", childSessionID: "child-r", at: NOW }));
+    rec.recordDispatchStart(startInput({ callID: "call-2", childSessionID: "child-r", at: NOW + 100 })); // the resume
+    rec.cancelStart("call-2"); // the hook chain rejected it
+    await rec.flush();
+    expect(timingRows()).toEqual([]); // the live call was not closed
+    await rec.onExecutionOutcome("child-r", "evt-1", "succeeded", NOW + 900);
+    expect(timingRows()).toMatchObject([{ callID: "call-1", durationMs: 900, outcome: "succeeded" }]);
+  });
+
+  it("a confirmed newer call closes the older open one as unknown at its start; an outcome closes the oldest first", async () => {
+    const rec = recorder();
+    rec.recordDispatchStart(startInput({ callID: "call-1", childSessionID: "child-r", at: NOW }));
+    rec.recordDispatchStart(startInput({ callID: "call-2", childSessionID: "child-r", at: NOW + 100 }));
+    await rec.onExecutionOutcome("child-r", "evt-1", "succeeded", NOW + 300); // two open: the oldest closes
+    expect(timingRows().map(r => r.callID)).toEqual(["call-1"]);
+    rec.recordDispatchStart(startInput({ callID: "call-3", childSessionID: "child-r", at: NOW + 400 }));
+    rec.bindChild("call-3", "child-r"); // commit: call-2 ended without an outcome of its own
+    await rec.flush();
+    expect(timingRows().map(r => [r.callID, r.outcome, r.durationMs])).toEqual([
+      ["call-1", "succeeded", 300],
+      ["call-2", "unknown", 300],
+    ]);
+    await rec.onExecutionOutcome("child-r", "evt-2", "succeeded", NOW + 900);
+    expect(timingRows().map(r => r.callID)).toEqual(["call-1", "call-2", "call-3"]);
+  });
+
+  it("binding a call to a second child leaves the first child's other call alone", async () => {
+    const rec = recorder();
+    rec.recordDispatchStart(startInput({ callID: "call-1", childSessionID: "child-a", at: NOW }));
+    rec.recordDispatchStart(startInput({ callID: "call-2", childSessionID: "child-a", at: NOW + 10 }));
+    rec.bindChild("call-2", "child-b"); // call-2 turned out to run another child
+    await rec.onExecutionOutcome("child-a", "evt-1", "succeeded", NOW + 50);
+    await rec.onExecutionOutcome("child-b", "evt-2", "succeeded", NOW + 60);
+    expect(timingRows().map(r => [r.callID, r.childSessionID])).toEqual([
+      ["call-1", "child-a"],
+      ["call-2", "child-b"],
+    ]);
   });
 
   it("bindChild is re-callable: the last child wins and the earlier one no longer finds the call", async () => {
@@ -750,10 +848,42 @@ describe("timing recorder: clamped rows (QA-1.1-9)", () => {
   });
 });
 
-describe("timing recorder: label validation reaches the recorder (QA-1.1-5)", () => {
-  it("a role with spaces is refused by the side log: no row, one warning", async () => {
+describe("timing recorder: label validation reaches the recorder (QA-1.1-5, QA-1.1-19)", () => {
+  it("a label with spaces is written as unknown: the row is kept, the free text is not", async () => {
     const rec = recorder();
     rec.recordDispatchStart(startInput({ role: "some free text" }));
+    await rec.onExecutionOutcome("child-1", "evt-1", "succeeded", NOW + 1);
+    expect(timingRows()).toHaveLength(1);
+    expect(timingRows()[0]?.role).toBe("unknown");
+    expect(readFileSync(join(dir, "timings.jsonl"), "utf8")).not.toContain("free text");
+    expect(logger.warns).toEqual([]);
+  });
+
+  it.each([
+    ["a bracketed context suffix", "anthropic/claude-opus-5-5[1m]"],
+    ["a Vertex version", "google-vertex-anthropic/claude-sonnet-5@20250101"],
+    ["a Bedrock version", "amazon-bedrock/anthropic.claude-sonnet-5-v1:0"],
+    ["a variant tag", "anthropic/claude-sonnet-5-5#low"],
+  ])("keeps %s in the model label", async (_name, model) => {
+    const rec = recorder();
+    rec.recordDispatchStart(startInput({ model }));
+    await rec.onExecutionOutcome("child-1", "evt-1", "succeeded", NOW + 1);
+    expect(timingRows()).toHaveLength(1);
+    expect(timingRows()[0]?.model).toBe(model);
+    expect(logger.warns).toEqual([]);
+  });
+
+  it("an empty tier, class, scope or model, and an over-long role, become unknown", async () => {
+    const rec = recorder();
+    rec.recordDispatchStart(startInput({ tier: "", class: "", scope: "", model: "", role: "r".repeat(300) }));
+    await rec.onExecutionOutcome("child-1", "evt-1", "succeeded", NOW + 1);
+    expect(timingRows()[0]).toMatchObject({ tier: "unknown", class: "unknown", scope: "unknown", model: "unknown", role: "unknown" });
+    expect(logger.warns).toEqual([]);
+  });
+
+  it("a session id with a space stays strict: the side log refuses the row", async () => {
+    const rec = recorder();
+    rec.recordDispatchStart(startInput({ parentSessionID: "root 1" }));
     await rec.onExecutionOutcome("child-1", "evt-1", "succeeded", NOW + 1);
     expect(existsSync(join(dir, "timings.jsonl"))).toBe(false);
     expect(logger.warns).toHaveLength(1);
@@ -762,6 +892,81 @@ describe("timing recorder: label validation reaches the recorder (QA-1.1-5)", ()
 
 describe("timing recorder: turns (QA-1.1-4, QA-1.1-15)", () => {
   const step = { input: 10, cacheRead: 20, cacheWrite: 30 };
+
+  it("the idle sweep skips a root that has an open dispatch start (QA-1.1-20)", async () => {
+    const rec = recorder();
+    rec.markRootSession("root-1");
+    rec.markRootSession("root-2");
+    rec.onRootStep("root-1", step);
+    rec.onRootStep("root-2", step);
+    rec.recordDispatchStart(startInput({ parentSessionID: "root-1", at: NOW }));
+    await rec.sweep(NOW + DEFAULT_TURN_IDLE_MS + 1);
+    expect(turnRows().map(r => r.sessionID)).toEqual(["root-2"]); // root-1 waits for its child
+    await rec.onExecutionOutcome("child-1", "evt-1", "succeeded", NOW + 10);
+    await rec.sweep(NOW + DEFAULT_TURN_IDLE_MS + 2);
+    expect(turnRows().map(r => r.sessionID)).toEqual(["root-2", "root-1"]);
+  });
+
+  it("the idle sweep flushes the turn once the start TTL closed the dispatch", async () => {
+    const rec = recorder();
+    rec.markRootSession("root-1");
+    rec.onRootStep("root-1", step);
+    rec.recordDispatchStart(startInput({ parentSessionID: "root-1", at: NOW }));
+    await rec.sweep(NOW + OPEN_START_TTL_MS + 1);
+    expect(timingRows().map(r => r.outcome)).toEqual(["unknown"]);
+    expect(turnRows().map(r => r.sessionID)).toEqual(["root-1"]);
+  });
+
+  it("flush waits for an append an unawaited outcome started (QA-1.1-25)", async () => {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>(resolveGate => {
+      release = resolveGate;
+    });
+    const written: string[] = [];
+    const sideLogs = fakeSideLogs({
+      appendTimings: async rows => {
+        await gate;
+        for (const row of rows) written.push(row.childSessionID);
+        return { ok: true };
+      },
+    });
+    const rec = recorder({ sideLogs });
+    rec.recordDispatchStart(startInput());
+    void rec.onExecutionOutcome("child-1", "evt-1", "succeeded", NOW + 1); // nobody awaits it
+    const flushed = rec.flush();
+    let done = false;
+    void flushed.then(() => {
+      done = true;
+    });
+    await new Promise<void>(resolveTick => setTimeout(resolveTick, 10));
+    expect(done).toBe(false);
+    release();
+    await flushed;
+    expect(written).toEqual(["child-1"]);
+  });
+
+  it("flush waits for the turn row an unawaited prompt started (QA-1.1-25)", async () => {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>(resolveGate => {
+      release = resolveGate;
+    });
+    let appended = 0;
+    const sideLogs = fakeSideLogs({
+      appendTurns: async rows => {
+        await gate;
+        appended += rows.length;
+        return { ok: true };
+      },
+    });
+    const rec = recorder({ sideLogs });
+    rec.markRootSession("root-1");
+    rec.onRootStep("root-1", step);
+    void rec.onRootPrompt("root-1", NOW);
+    const flushed = rec.flush();
+    release();
+    await flushed;
+    expect(appended).toBe(1);
+  });
 
   it("sweep leaves a turn that still receives steps open; the prompt then writes one row", async () => {
     const rec = recorder();
@@ -951,6 +1156,49 @@ describe("timing recorder: shared per directory (QA-1.1-3)", () => {
     b.recordDispatchStart(startInput({ at: NOW + 5 }));
     await b.onExecutionOutcome("child-1", "evt-2", "succeeded", NOW + 6);
     expect(seen).toEqual(["dispatch-timing"]);
+  });
+
+  it("a later acquirer with other settings is told once, at info; the first caller's settings apply (QA-1.1-24)", () => {
+    const infos: Logged[] = [];
+    const infoLogger: TimingLogger = {
+      warn: () => undefined,
+      info: (message, extra) => {
+        infos.push({ message, extra });
+      },
+    };
+    const first = acquireTimingRecorder({ dir, now, logger: infoLogger, turnIdleMs: 1_000 });
+    holders.push(first);
+    holders.push(acquireTimingRecorder({ dir, now, logger: infoLogger, turnIdleMs: 1_000 })); // identical: silent
+    expect(infos).toEqual([]);
+    holders.push(acquireTimingRecorder({ dir, now, logger: infoLogger, turnIdleMs: 5_000 }));
+    holders.push(acquireTimingRecorder({ dir, now: () => NOW + 1, logger: infoLogger }));
+    expect(infos).toHaveLength(1);
+    expect(infos[0]?.extra).toEqual({ dir });
+  });
+
+  it("a later acquirer with a different clock or logger is told too, on that logger (QA-1.1-24)", () => {
+    const infos: Logged[] = [];
+    holders.push(acquire());
+    holders.push(
+      acquireTimingRecorder({
+        dir,
+        now,
+        logger: {
+          warn: () => undefined,
+          info: (message, extra) => {
+            infos.push({ message, extra });
+          },
+        },
+      }),
+    );
+    expect(infos).toHaveLength(1);
+  });
+
+  it("a later acquirer that passes nothing different, or whose logger has no info, is silent", () => {
+    holders.push(acquire());
+    expect(() => holders.push(acquireTimingRecorder({ dir, now, logger: { warn: () => undefined }, turnIdleMs: 9 }))).not.toThrow();
+    holders.push(acquireTimingRecorder({ dir, now }));
+    expect(logger.warns).toEqual([]);
   });
 
   it("a throwing observer does not stop the write or the other observers", async () => {

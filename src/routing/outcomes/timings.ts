@@ -14,7 +14,7 @@
 // ---------------------------------------------------------------------------
 
 import { resolve } from "node:path";
-import { createSideLogs, nodePersistDeps } from "./persist";
+import { createSideLogs, isSideLogLabel, nodePersistDeps } from "./persist";
 import type {
   Clock,
   DispatchCapacity,
@@ -37,8 +37,15 @@ export const MAX_SEEN_EVENT_IDS = 5000;
 export const MAX_ROOT_SESSIONS = 1000;
 /** A turn with no step for this long is flushed by {@link TimingRecorder.sweep}; a turn still receiving steps is left open. */
 export const DEFAULT_TURN_IDLE_MS = 30 * 60 * 1000;
-/** A row whose `endedAt` is later than `now` by more than this is ignored by the estimator (clock-jump guard). */
+/**
+ * A row whose `endedAt` is later than `now` by more than this is dropped (clock-jump guard, QA-1.1-21): the duration estimator
+ * and the stats table both drop it when they observe or load it, so it never sits in a window. One shared constant.
+ */
 export const MAX_FUTURE_SKEW_MS = 24 * 60 * 60 * 1000;
+/** Outcomes of children without an open start kept for a later `bindChild` (QA-1.1-18); past this the oldest is forgotten. */
+export const MAX_UNBOUND_OUTCOMES = 200;
+/** An outcome of a child without an open start is forgotten after this long. */
+export const UNBOUND_OUTCOME_TTL_MS = 10 * 60 * 1000;
 
 /** Plugin logger subset; `debug` is optional (only the missing-start notice uses it). */
 export interface TimingLogger extends OutcomeLogger {
@@ -84,20 +91,28 @@ export interface TimingRecorderOptions {
 
 export interface TimingRecorder {
   /**
-   * Opens the timing of a dispatch, keyed by `callID`. Again for an open `callID`: no-op (refreshes its LRU position). A start
-   * for a child whose timing is open under ANOTHER callID closes that older timing as `unknown` at the new `at` first.
+   * Opens the timing of a dispatch, keyed by `callID`. Again for an open `callID`: no-op (refreshes its LRU position). A child
+   * may have several open calls (oldest first); a start naming a child that has an older open call does NOT close that call:
+   * it is closed as `unknown` only when the newer one is confirmed by {@link bindChild} (QA-1.1-18).
+   * Labels (role, class, scope, tier, model) that are not printable non-whitespace ASCII become `unknown`; ids stay strict.
    */
   recordDispatchStart(input: DispatchStartInput): void;
-  /** Tells which child session runs the open `callID`. Re-callable (the last child wins). Unknown `callID`: ignored. */
+  /**
+   * Confirms which child session runs the open `callID` (the router's commit point). Re-callable (the last child wins).
+   * Every OLDER open call of that child is closed as `unknown` at this call's start. An outcome that arrived for the child
+   * before it was bound (remembered, see {@link MAX_UNBOUND_OUTCOMES}) is applied when its time is not before the start.
+   * Unknown `callID`: ignored.
+   */
   bindChild(callID: string, childSessionID: string): void;
-  /** Drops the open timing of `callID` without a row: the call was rejected, no dispatch happened. */
+  /** Drops the open timing of `callID` without a row: the call was rejected, no dispatch happened. Older calls of the child are untouched. */
   cancelStart(callID: string): void;
   /** Sets the background flag of an open `callID` (known only after the host acknowledged the call). */
   setBackground(callID: string, background: boolean): void;
   /**
-   * Closes the open timing of `childSessionID` and appends its row (`durationMs = at − startedAt`; an end before the start is
-   * clamped to 0 and written as `unknown`). Ignored when the child has no open timing (closed already, evicted, never
-   * started: logged once at debug); an event id is consumed only when a timing was open, and a seen id is ignored.
+   * Closes the OLDEST open timing of `childSessionID` and appends its row (`durationMs = at − startedAt`; an end before the
+   * start is clamped to 0 and written as `unknown`). A child with no open timing: the outcome is remembered for a later
+   * {@link bindChild} (a resume bound after its end) and logged once at debug; an event id is consumed only when a timing
+   * was closed, and a seen id is ignored.
    */
   onExecutionOutcome(childSessionID: string, eventId: string, outcome: DispatchTimingOutcome, at: number): Promise<void>;
   /** Records the latest provider capacity class on the OPEN timing of `childSessionID`; the row carries it. Ignored once closed. */
@@ -118,7 +133,8 @@ export interface TimingRecorder {
   onRootStep(sessionID: string, tokens: RootStepTokens, eventId?: string): boolean;
   /**
    * Housekeeping: closes open starts older than {@link OPEN_START_TTL_MS} as `unknown` and appends the turns idle for at least
-   * `turnIdleMs` (a turn still receiving steps stays open). `at` defaults to now. A forward clock jump of more than 6 hours
+   * `turnIdleMs` (a turn still receiving steps stays open, and so does the turn of a root that still has an open dispatch
+   * start: it waits for its children; the start TTL bounds that). `at` defaults to now. A forward clock jump of more than 6 hours
    * (a suspended machine) therefore closes every running dispatch as `unknown`, which no estimate uses.
    */
   sweep(at?: number): Promise<void>;
@@ -134,6 +150,17 @@ interface OpenStart {
   background: boolean;
   readonly startedAt: number;
   capacity: DispatchCapacity | null;
+}
+
+/** An outcome delivered for a child that had no open start yet. */
+interface UnboundOutcome {
+  readonly child: string;
+  readonly eventId: string;
+  readonly outcome: DispatchTimingOutcome;
+  /** The outcome's own time (epoch ms). */
+  readonly at: number;
+  /** When it was remembered (epoch ms of the recorder's clock), for the TTL. */
+  readonly storedAt: number;
 }
 
 interface RootTurn {
@@ -166,6 +193,11 @@ function rememberOnce(seen: Set<string>, key: string, cap: number): boolean {
     if (oldest.done !== true) seen.delete(oldest.value);
   }
   return true;
+}
+
+/** A label as written to the side log: itself when valid, else `unknown` (a refused label would drop the whole row). */
+function safeLabel(value: string): string {
+  return typeof value === "string" && isSideLogLabel(value) ? value : "unknown";
 }
 
 /** True for a non-empty event id (an absent or empty id cannot be deduplicated). */
@@ -203,8 +235,10 @@ export function createTimingRecorder(options: TimingRecorderOptions): TimingReco
 
   /** Insertion order = recency: the first key is the least recently used. Keyed by callID. */
   const open = new Map<string, OpenStart>();
-  /** child session → callID of its open timing. */
-  const childIndex = new Map<string, string>();
+  /** child session → callIDs of its open timings, oldest first (every listed callID is in `open`). */
+  const childCalls = new Map<string, string[]>();
+  /** Outcomes of children that had no open start (insertion order = age), kept for a later `bindChild`. */
+  const unbound: UnboundOutcome[] = [];
   const seenEvents = new Set<string>();
   const roots = new Map<string, RootTurn>();
   const warned = new Set<string>();
@@ -237,9 +271,48 @@ export function createTimingRecorder(options: TimingRecorderOptions): TimingReco
     });
   }
 
+  function unlinkChild(callID: string, child: string): void {
+    const calls = childCalls.get(child);
+    if (calls === undefined) return;
+    const index = calls.indexOf(callID);
+    if (index >= 0) calls.splice(index, 1);
+    if (calls.length === 0) childCalls.delete(child);
+  }
+
+  function linkChild(callID: string, child: string): void {
+    const calls = childCalls.get(child);
+    if (calls === undefined) childCalls.set(child, [callID]);
+    else if (!calls.includes(callID)) calls.push(callID);
+  }
+
   function removeOpen(callID: string, entry: OpenStart): void {
     open.delete(callID);
-    if (entry.child !== null && childIndex.get(entry.child) === callID) childIndex.delete(entry.child);
+    if (entry.child !== null) unlinkChild(callID, entry.child);
+  }
+
+  /** The oldest open call of `child`, if any. */
+  function oldestOpen(child: string): { readonly callID: string; readonly entry: OpenStart } | undefined {
+    for (const callID of childCalls.get(child) ?? []) {
+      const entry = open.get(callID);
+      if (entry !== undefined) return { callID, entry };
+    }
+    return undefined;
+  }
+
+  function pruneUnbound(t: number): void {
+    for (;;) {
+      const oldest = unbound[0];
+      if (oldest === undefined) return;
+      if (unbound.length <= MAX_UNBOUND_OUTCOMES && t - oldest.storedAt <= UNBOUND_OUTCOME_TTL_MS) return;
+      unbound.shift();
+    }
+  }
+
+  /** Counts per parent session the open starts (the idle sweep leaves a root with a running dispatch alone, QA-1.1-20). */
+  function parentsWithOpenStarts(): Set<string> {
+    const parents = new Set<string>();
+    for (const entry of open.values()) parents.add(entry.input.parentSessionID);
+    return parents;
   }
 
   /** The row of a closed timing; null when the dispatch never got a child session (nothing to attribute the row to). */
@@ -296,12 +369,21 @@ export function createTimingRecorder(options: TimingRecorderOptions): TimingReco
     return row;
   }
 
-  async function appendTimingRows(rows: readonly DispatchTimingRow[]): Promise<void> {
-    if (rows.length > 0) checkWrite("timings", await sideLogs.appendTimings(rows));
+  /** Every append goes through `track`, so `flush` waits for it whoever awaits it (QA-1.1-25). */
+  function appendTimingRows(rows: readonly DispatchTimingRow[]): Promise<void> {
+    const work = (async (): Promise<void> => {
+      if (rows.length > 0) checkWrite("timings", await sideLogs.appendTimings(rows));
+    })();
+    track(work);
+    return work;
   }
 
-  async function appendTurnRows(rows: readonly OrchestratorTurnRow[]): Promise<void> {
-    if (rows.length > 0) checkWrite("turns", await sideLogs.appendTurns(rows));
+  function appendTurnRows(rows: readonly OrchestratorTurnRow[]): Promise<void> {
+    const work = (async (): Promise<void> => {
+      if (rows.length > 0) checkWrite("turns", await sideLogs.appendTurns(rows));
+    })();
+    track(work);
+    return work;
   }
 
   function touchRoot(sessionID: string, state: RootTurn): void {
@@ -311,8 +393,10 @@ export function createTimingRecorder(options: TimingRecorderOptions): TimingReco
 
   async function flushTurns(idleOnly: boolean, t: number): Promise<void> {
     const turns: OrchestratorTurnRow[] = [];
+    // The idle sweep leaves a root with an open dispatch start alone (it is waiting for its children); the start TTL bounds that.
+    const busy = idleOnly ? parentsWithOpenStarts() : new Set<string>();
     for (const [sessionID, state] of roots) {
-      if (idleOnly && t - state.lastStepAt < turnIdleMs) continue;
+      if (idleOnly && (busy.has(sessionID) || t - state.lastStepAt < turnIdleMs)) continue;
       const row = takeTurn(sessionID, state);
       if (row !== null) turns.push(row);
     }
@@ -343,18 +427,18 @@ export function createTimingRecorder(options: TimingRecorderOptions): TimingReco
           return;
         }
         const startedAt = stamp(input.at);
-        if (input.childSessionID !== null) {
-          // QA-1.1-2: the child runs another dispatch already: that one ended without an outcome event of its own.
-          const olderCall = childIndex.get(input.childSessionID);
-          const older = olderCall === undefined ? undefined : open.get(olderCall);
-          if (olderCall !== undefined && older !== undefined) {
-            removeOpen(olderCall, older);
-            const row = timingRow(older, "unknown", startedAt);
-            if (row !== null) track(appendTimingRows([row]));
-          }
-        }
-        open.set(input.callID, { input, child: input.childSessionID, background: input.background, startedAt, capacity: null });
-        if (input.childSessionID !== null) childIndex.set(input.childSessionID, input.callID);
+        // QA-1.1-19: a label the side log would refuse (the whole row would be lost) is written as `unknown`; ids stay strict.
+        const clean: DispatchStartInput = {
+          ...input,
+          role: safeLabel(input.role),
+          class: safeLabel(input.class),
+          scope: safeLabel(input.scope),
+          tier: safeLabel(input.tier),
+          model: safeLabel(input.model),
+        };
+        // QA-1.1-18: an older open call of the same child stays open until this one is confirmed by `bindChild`.
+        open.set(input.callID, { input: clean, child: input.childSessionID, background: input.background, startedAt, capacity: null });
+        if (input.childSessionID !== null) linkChild(input.callID, input.childSessionID);
         while (open.size > MAX_OPEN_STARTS) {
           const oldest = open.entries().next();
           if (oldest.done === true) break;
@@ -369,9 +453,31 @@ export function createTimingRecorder(options: TimingRecorderOptions): TimingReco
       try {
         const entry = open.get(callID);
         if (entry === undefined || typeof childSessionID !== "string" || childSessionID === "") return;
-        if (entry.child !== null && childIndex.get(entry.child) === callID) childIndex.delete(entry.child);
-        entry.child = childSessionID; // the last call wins
-        childIndex.set(childSessionID, callID);
+        if (entry.child !== null && entry.child !== childSessionID) unlinkChild(callID, entry.child); // the last child wins
+        entry.child = childSessionID;
+        linkChild(callID, childSessionID);
+        const t = clock();
+        // Confirmed: every older open call of this child ended without an outcome event of its own (QA-1.1-2, QA-1.1-18).
+        const olderRows: DispatchTimingRow[] = [];
+        for (const otherID of [...(childCalls.get(childSessionID) ?? [])]) {
+          const other = open.get(otherID);
+          if (otherID === callID || other === undefined || other.startedAt > entry.startedAt) continue;
+          removeOpen(otherID, other);
+          const row = timingRow(other, "unknown", entry.startedAt);
+          if (row !== null) olderRows.push(row);
+        }
+        if (olderRows.length > 0) void appendTimingRows(olderRows);
+        // An outcome that arrived before the bind (a foreground resume ending before its result) closes this call now.
+        pruneUnbound(t);
+        const index = unbound.findIndex((item) => item.child === childSessionID && item.at >= entry.startedAt);
+        if (index >= 0) {
+          const [item] = unbound.splice(index, 1);
+          if (item !== undefined && (!hasId(item.eventId) || rememberOnce(seenEvents, `${namespace}|end|${item.eventId}`, MAX_SEEN_EVENT_IDS))) {
+            removeOpen(callID, entry);
+            const row = timingRow(entry, item.outcome, item.at);
+            if (row !== null) void appendTimingRows([row]);
+          }
+        }
       } catch (error) {
         warnOnce("internal", "[router] timing recorder failed to bind a child session", error);
       }
@@ -397,16 +503,24 @@ export function createTimingRecorder(options: TimingRecorderOptions): TimingReco
 
     async onExecutionOutcome(childSessionID: string, eventId: string, outcome: DispatchTimingOutcome, at: number): Promise<void> {
       try {
-        const callID = childIndex.get(childSessionID);
-        const entry = callID === undefined ? undefined : open.get(callID);
-        if (callID === undefined || entry === undefined) {
+        const found = oldestOpen(childSessionID);
+        if (found === undefined) {
           // QA-1.1-3: an end id is consumed only by a delivery that found a start, so it cannot be spent on an unknown child.
           if (!noticedMissingStart) {
             noticedMissingStart = true;
             logger.debug?.("[router] execution outcome without an open dispatch start; no timing row", { childSessionID });
           }
+          // QA-1.1-18: remember it; a resume bound to this child right after (`bindChild`) takes it.
+          const t = clock();
+          const seen = hasId(eventId) && seenEvents.has(`${namespace}|end|${eventId}`);
+          const duplicate = hasId(eventId) && unbound.some((item) => item.eventId === eventId && item.child === childSessionID);
+          if (!seen && !duplicate && typeof childSessionID === "string" && childSessionID !== "") {
+            unbound.push({ child: childSessionID, eventId: hasId(eventId) ? eventId : "", outcome, at: stamp(at), storedAt: t });
+          }
+          pruneUnbound(t);
           return;
         }
+        const { callID, entry } = found;
         // Same dedupe style as Ingest.onExecutionEnded: an event id is consumed by its first delivery.
         if (hasId(eventId) && !rememberOnce(seenEvents, `${namespace}|end|${eventId}`, MAX_SEEN_EVENT_IDS)) return;
         removeOpen(callID, entry); // closed before the append, so a concurrent outcome finds nothing
@@ -419,9 +533,8 @@ export function createTimingRecorder(options: TimingRecorderOptions): TimingReco
 
     onCapacitySignal(childSessionID: string, capacity: DispatchCapacity, _at: number): void {
       try {
-        const callID = childIndex.get(childSessionID);
-        const entry = callID === undefined ? undefined : open.get(callID);
-        if (entry !== undefined) entry.capacity = capacity;
+        const found = oldestOpen(childSessionID);
+        if (found !== undefined) found.entry.capacity = capacity;
       } catch (error) {
         warnOnce("internal", "[router] timing recorder failed to record a capacity signal", error);
       }
@@ -441,7 +554,7 @@ export function createTimingRecorder(options: TimingRecorderOptions): TimingReco
           const [evictedID, evicted] = oldest.value;
           roots.delete(evictedID);
           const row = takeTurn(evictedID, evicted); // a turn in progress is not lost with its session
-          if (row !== null) track(appendTurnRows([row]));
+          if (row !== null) void appendTurnRows([row]);
         }
       } catch (error) {
         warnOnce("internal", "[router] timing recorder failed to mark a root session", error);
@@ -530,6 +643,10 @@ export interface TimingRecorderHolder extends TimingRecorder {
 interface RegistryEntry {
   readonly recorder: TimingRecorder;
   readonly observers: Set<(row: DispatchTimingRow | OrchestratorTurnRow) => void>;
+  /** What the first acquirer asked for (the settings that apply). */
+  readonly first: { readonly now: Clock; readonly logger: TimingLogger; readonly turnIdleMs: number | undefined };
+  /** True once a later caller with other settings was told (once per recorder). */
+  noticedMismatch: boolean;
   refs: number;
 }
 
@@ -567,8 +684,20 @@ export function acquireTimingRecorder(options: AcquireTimingRecorderOptions): Ti
         }
       },
     });
-    entry = { recorder, observers, refs: 0 };
+    entry = { recorder, observers, refs: 0, first: { now: options.now, logger, turnIdleMs: options.turnIdleMs }, noticedMismatch: false };
     registry.set(id, entry);
+  } else if (!entry.noticedMismatch) {
+    // QA-1.1-24: the first acquirer's settings apply; a later caller that asked for others is told once.
+    const { first } = entry;
+    const differs = options.now !== first.now || options.turnIdleMs !== first.turnIdleMs || (options.logger !== undefined && options.logger !== first.logger);
+    if (differs) {
+      entry.noticedMismatch = true;
+      try {
+        (options.logger ?? first.logger).info?.("[router] timing recorder already acquired for this directory; the first caller's clock, logger and turnIdleMs apply", { dir: options.dir });
+      } catch {
+        entry.noticedMismatch = true; // a failing logger must not reach the caller; the notice is not repeated
+      }
+    }
   }
   const shared = entry;
   shared.refs += 1;

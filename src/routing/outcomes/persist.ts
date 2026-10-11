@@ -865,10 +865,11 @@ const TIMING_OUTCOMES: readonly string[] = ["succeeded", "failed", "interrupted"
 const CAPACITIES: readonly string[] = ["rate-limit", "overload", "usage-limit"];
 /**
  * A label (role, class, scope, tier, model, ids) is one token of at most 256 characters, no whitespace: anything longer or
- * with spaces could be free text, so the row is refused rather than stored (QA-1.1-5). Model ids such as
- * `anthropic/claude-sonnet-5-5#low` match.
+ * with spaces could be free text, so the row is refused rather than stored (QA-1.1-5). Printable non-whitespace ASCII, so model ids
+ * such as `anthropic/claude-sonnet-5-5#low`, `anthropic/claude-opus-5-5[1m]`, Vertex `@20250101` and Bedrock `-v1:0` match
+ * (QA-1.1-19). The timing recorder maps a label that still fails to `unknown` instead of losing the row.
  */
-const LABEL_RE = /^[A-Za-z0-9._:#/@+-]{1,256}$/;
+const LABEL_RE = /^[!-~]{1,256}$/;
 
 function isLabel(x: unknown): x is string {
   return typeof x === "string" && LABEL_RE.test(x);

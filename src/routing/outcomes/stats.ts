@@ -727,6 +727,9 @@ function rowInWindow(ts: string, window: StatsWindow): boolean {
  * Role × p50/p90/n over the timing rows with `since ≤ ts < until`. The percentiles are the duration estimator's own
  * (`createDurationModel`: succeeded rows with `capacity === null`, nearest rank), asked at its role level with no row
  * limit, no age limit and a minimum of one sample, so this table and the estimator never disagree. Sorted by role.
+ * A row that ended more than `MAX_FUTURE_SKEW_MS` (timings.ts) after the current time is dropped by the model's `observe`
+ * (QA-1.1-21), so a clock-jump row is in neither the estimate nor this table. `n` is the p50's sample count; the model's
+ * `p90Source`/`p90N` (QA-1.1-22) are not shown (with p90MinSamples 1 the p90 level is the p50 level), so the table is unchanged.
  */
 export function summarizeDurations(rows: readonly DispatchTimingRow[], window: StatsWindow): DurationStatsRow[] {
   const model = createDurationModel(
