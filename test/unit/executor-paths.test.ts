@@ -71,6 +71,32 @@ describe("resolveExecutorHome (seams)", () => {
     const unc: GitRunner = async () => ({ code: 0, stdout: "\\\\server\\share\\.git\n", stderr: "" });
     await expect(resolveExecutorHome(MAIN, { git: unc, realpath: identity })).rejects.toThrow(/network or device path/);
   });
+
+  // QA-2.2-10: a local-looking answer whose realpath crosses a junction or symlink onto a share is refused too.
+  it("refuses a common dir whose realpath is a UNC path", async () => {
+    const toShare = async (): Promise<string> => "\\\\server\\share\\repo\\.git";
+    await expect(resolveExecutorHome(MAIN, { git: fakeGit, realpath: toShare })).rejects.toThrow(
+      /resolves to a network or device path/,
+    );
+    await expect(resolveExecutorHome(LINKED, { git: fakeGit, realpath: toShare })).rejects.toThrow(
+      /resolves to a network or device path/,
+    );
+  });
+
+  // QA-2.2-10: a relative answer resolved against a UNC working directory is refused before realpath runs.
+  it.runIf(process.platform === "win32")("refuses a relative common dir that resolves onto a share", async () => {
+    const shareDir = "\\\\server\\share\\repo";
+    const relative: GitRunner = async () => ({ code: 0, stdout: ".git\n", stderr: "" });
+    const seen: string[] = [];
+    const spy = async (p: string): Promise<string> => {
+      seen.push(p);
+      return p;
+    };
+    await expect(resolveExecutorHome(shareDir, { git: relative, realpath: spy })).rejects.toThrow(
+      /resolves to a network or device path/,
+    );
+    expect(seen).toEqual([]);
+  });
 });
 
 describe("resolveExecutorHome (real git, linked worktree)", () => {
@@ -154,6 +180,15 @@ describe("plan ids and directories", () => {
     }
     expect(() => assertPlanId("../etc")).toThrow(/Invalid plan id/);
     expect(assertPlanId("p-20261011-abcdef")).toBe("p-20261011-abcdef");
+  });
+
+  // QA-2.2-14: the slot markers directory name is reserved, so no plan directory can collide with it.
+  it("the slot markers directory name is not a plan id", () => {
+    expect(SLOT_MARKERS_DIRNAME).toBe("slots");
+    expect(isPlanId(SLOT_MARKERS_DIRNAME)).toBe(false);
+    expect(() => assertPlanId(SLOT_MARKERS_DIRNAME)).toThrow(/Invalid plan id/);
+    expect(() => planDir(resolve("/h/omr-executor"), SLOT_MARKERS_DIRNAME as PlanId)).toThrow(/Invalid plan id/);
+    expect(isPlanId("slots-1")).toBe(PLAN_ID_PATTERN.test("slots-1")); // only the exact name is reserved
   });
 
   it("planDir and slotMarkersDir join under the home", () => {

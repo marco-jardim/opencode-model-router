@@ -91,13 +91,21 @@ export async function resolveExecutorHome(dir: string, deps: ExecutorPathsDeps =
   const reported = run.stdout.replace(/\r?\n$/, "");
   if (reported.trim() === "") throw new Error(`git reported no common directory for ${dir}`);
   if (isNetworkOrDevicePath(reported)) throw new Error("Refusing executor home: git reports a network or device path");
-  const common = await real(resolve(dir, reported));
+  // A relative answer resolved against `dir`, or a realpath that crosses a junction or symlink, can land on a network or device path
+  // that the reported text did not show: check both results as well.
+  const resolved = resolve(dir, reported);
+  if (isNetworkOrDevicePath(resolved)) throw new Error("Refusing executor home: the git common directory resolves to a network or device path");
+  const common = await real(resolved);
+  if (isNetworkOrDevicePath(common)) throw new Error("Refusing executor home: the git common directory resolves to a network or device path");
   return join(common, EXECUTOR_HOME_DIRNAME);
 }
 
-/** True when `id` is a well-formed plan id (`PLAN_ID_PATTERN`, 2.2.1.c). */
+/**
+ * True when `id` is a well-formed plan id (`PLAN_ID_PATTERN`, 2.2.1.c). The slot markers directory name (`slots`) is reserved, compared
+ * case-insensitively because the home lives on a case-insensitive filesystem on Windows: a plan of that name would collide with it.
+ */
 export function isPlanId(id: unknown): id is PlanId {
-  return typeof id === "string" && PLAN_ID_PATTERN.test(id);
+  return typeof id === "string" && PLAN_ID_PATTERN.test(id) && id.toLowerCase() !== SLOT_MARKERS_DIRNAME;
 }
 
 /** Returns `id` or throws unless it matches `PLAN_ID_PATTERN`: the id becomes a path segment, so it is never trusted unchecked. */

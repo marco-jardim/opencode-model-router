@@ -7,6 +7,7 @@ import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  ADOPT_TAKEOVER_REASON,
   createLedgerStore,
   createNodeClock,
   createNodeFileSystem,
@@ -142,7 +143,10 @@ function gate(): { reached: Promise<void>; markReached(): void; wait: Promise<vo
   return { reached, markReached, wait, open };
 }
 
-/** Plants a plan directory by hand: `events.1.jsonl` from `lines` (+ raw `tail`), an optional snapshot. Returns the plan dir. */
+/**
+ * Plants a plan directory by hand: `events.1.1.jsonl` (writer epoch 1) from `lines` (+ raw `tail`), an optional snapshot stamped with
+ * writer epoch 1. Returns the plan dir.
+ */
 async function plant(
   home: string,
   lines: readonly string[],
@@ -150,8 +154,11 @@ async function plant(
 ): Promise<string> {
   const dir = join(home, PLAN_ID);
   await mkdir(dir, { recursive: true });
-  await writeFile(join(dir, "events.1.jsonl"), `${lines.join("\n")}\n${extra.tail ?? ""}`, "utf8");
-  if (extra.snapshot !== undefined) await writeFile(join(dir, "ledger.json"), JSON.stringify(extra.snapshot), "utf8");
+  await writeFile(join(dir, "events.1.1.jsonl"), `${lines.join("\n")}\n${extra.tail ?? ""}`, "utf8");
+  if (extra.snapshot !== undefined) {
+    const snap = typeof extra.snapshot === "object" && extra.snapshot !== null ? { ...extra.snapshot, writerEpoch: 1 } : extra.snapshot;
+    await writeFile(join(dir, "ledger.json"), JSON.stringify(snap), "utf8");
+  }
   if (extra.snapshotRaw !== undefined) await writeFile(join(dir, "ledger.json"), extra.snapshotRaw, "utf8");
   return dir;
 }
@@ -206,7 +213,7 @@ describe("round trip", () => {
 
   it("a plan id that is not a path segment is refused by every entry point", async () => {
     const e = await mk();
-    for (const id of ["../x", "", "a/b", "A"]) {
+    for (const id of ["../x", "", "a/b", "A", "slots"]) { // "slots" is the reserved slot markers directory (QA-2.2-14)
       expect((await failure(e.store.read(id))).code).toBe("E_INVALID_INPUT");
       expect((await failure(e.store.open(id, e.holder("s")))).code).toBe("E_INVALID_INPUT");
       expect((await failure(e.store.remove(id))).code).toBe("E_INVALID_INPUT");
@@ -235,7 +242,7 @@ describe("round trip", () => {
     await a.close();
     await b.close();
     await mkdir(join(e.home, "plan-c"), { recursive: true });
-    await writeFile(join(e.home, "plan-c", "events.1.jsonl"), "not json at all\nnot json either\n", "utf8");
+    await writeFile(join(e.home, "plan-c", "events.1.1.jsonl"), "not json at all\nnot json either\n", "utf8");
     const rows = await e.store.list();
     expect(rows.map((r) => r.planId)).toEqual(["plan-a", "plan-b"]);
     expect(rows[0]).toEqual({ planId: "plan-a", status: "running", toplevel: "C:/repo", orchestratorSessionID: "ses-0", seq: 1 });
@@ -251,19 +258,19 @@ describe("snapshot cadence and journal rotation", () => {
   it("snapshots every N events and rotates: the new journal exists, the old one is deleted", async () => {
     const e = await mk({ snapshotEvery: 5 });
     const w = await e.store.create(buildDraft(1), e.holder("s1"));
-    expect(await ls(e.dir)).toEqual(["events.1.jsonl", "ledger.json", "writer.lock"]);
+    expect(await ls(e.dir)).toEqual(["events.1.1.jsonl", "ledger.json", "writer.lock"]);
     for (let i = 2; i <= 5; i++) await w.append([addTask(`N${i}`)]);
     // Four events since the last snapshot: no rotation yet.
-    expect(await ls(e.dir)).toEqual(["events.1.jsonl", "history.jsonl", "ledger.json", "writer.lock"]);
+    expect(await ls(e.dir)).toEqual(["events.1.1.jsonl", "history.jsonl", "ledger.json", "writer.lock"]);
     expect(asLedger(await readJson(join(e.dir, "ledger.json"))).seq).toBe(1);
 
     await w.append([addTask("N6")]); // the fifth event since the snapshot
-    expect(await ls(e.dir)).toEqual(["events.7.jsonl", "history.jsonl", "ledger.json", "writer.lock"]);
+    expect(await ls(e.dir)).toEqual(["events.7.1.jsonl", "history.jsonl", "ledger.json", "writer.lock"]);
     expect(asLedger(await readJson(join(e.dir, "ledger.json"))).seq).toBe(6);
-    expect(await readLines(join(e.dir, "events.7.jsonl"))).toEqual([]);
+    expect(await readLines(join(e.dir, "events.7.1.jsonl"))).toEqual([]);
 
     for (let i = 7; i <= 11; i++) await w.append([addTask(`N${i}`)]);
-    expect(await ls(e.dir)).toEqual(["events.12.jsonl", "history.jsonl", "ledger.json", "writer.lock"]);
+    expect(await ls(e.dir)).toEqual(["events.12.1.jsonl", "history.jsonl", "ledger.json", "writer.lock"]);
     expect(asLedger(await readJson(join(e.dir, "ledger.json"))).seq).toBe(11);
     expect(await e.store.read(PLAN_ID)).toEqual(w.ledger);
     expect(e.warnings).toEqual([]);
@@ -273,7 +280,7 @@ describe("snapshot cadence and journal rotation", () => {
     const e = await mk({ snapshotEvery: 3 });
     const w = await e.store.create(buildDraft(1), e.holder("s1"));
     await w.append([addTask("A"), addTask("B"), addTask("C")]);
-    expect(await ls(e.dir)).toEqual(["events.5.jsonl", "history.jsonl", "ledger.json", "writer.lock"]);
+    expect(await ls(e.dir)).toEqual(["events.5.1.jsonl", "history.jsonl", "ledger.json", "writer.lock"]);
     expect(asLedger(await readJson(join(e.dir, "ledger.json"))).seq).toBe(4);
   });
 
@@ -282,7 +289,7 @@ describe("snapshot cadence and journal rotation", () => {
     const w = await e.store.create(buildDraft(1), e.holder("s1"));
     await w.append([addTask("A"), addTask("B"), addTask("C")]);
     await w.append([metric(1)]);
-    const lines = (await readLines(join(e.dir, "events.1.jsonl"))).map((l) => JSON.parse(l) as ExecutorEvent);
+    const lines = (await readLines(join(e.dir, "events.1.1.jsonl"))).map((l) => JSON.parse(l) as ExecutorEvent);
     expect(lines.map((l) => [l.seq, l.batch, l.last])).toEqual([
       [1, 1, true],
       [2, 2, false],
@@ -297,22 +304,22 @@ describe("snapshot cadence and journal rotation", () => {
     const e = await mk();
     const w = await e.store.create(buildDraft(1), e.holder("s1"));
     await w.snapshot(); // nothing new since create
-    expect(await ls(e.dir)).toEqual(["events.1.jsonl", "ledger.json", "writer.lock"]);
+    expect(await ls(e.dir)).toEqual(["events.1.1.jsonl", "ledger.json", "writer.lock"]);
     await w.append([addTask("A")]);
     await w.snapshot();
-    expect(await ls(e.dir)).toEqual(["events.3.jsonl", "history.jsonl", "ledger.json", "writer.lock"]);
+    expect(await ls(e.dir)).toEqual(["events.3.1.jsonl", "history.jsonl", "ledger.json", "writer.lock"]);
     expect(asLedger(await readJson(join(e.dir, "ledger.json"))).seq).toBe(2);
     await w.append([addTask("B")]);
     await w.close();
-    expect(await ls(e.dir)).toEqual(["events.4.jsonl", "history.jsonl", "ledger.json"]);
+    expect(await ls(e.dir)).toEqual(["events.4.1.jsonl", "history.jsonl", "ledger.json"]);
     expect(asLedger(await readJson(join(e.dir, "ledger.json"))).seq).toBe(3);
     await w.close(); // idempotent
   });
 
   it.each([
     ["before the snapshot is renamed into place", (c: FsCall) => c.op === "rename" && /ledger\.json\.tmp-/.test(c.path)],
-    ["after the rename, before the new journal exists", (c: FsCall) => c.op === "writeText" && /events\.4\.jsonl$/.test(c.path)],
-    ["when the old journal is deleted", (c: FsCall) => c.op === "rm" && /events\.1\.jsonl$/.test(c.path)],
+    ["after the rename, before the new journal exists", (c: FsCall) => c.op === "writeText" && /events\.4\.1\.jsonl$/.test(c.path)],
+    ["when the old journal is deleted", (c: FsCall) => c.op === "rm" && /events\.1\.1\.jsonl$/.test(c.path)],
   ])("a concurrent reader sees a consistent ledger while the writer is paused in rotation: %s", async (_name, pausesAt) => {
     const g = gate();
     let armed = false;
@@ -339,7 +346,7 @@ describe("snapshot cadence and journal rotation", () => {
     g.open();
     await pending;
     expect(await reader.store.read(PLAN_ID)).toEqual(writer.ledger);
-    expect(await ls(w.dir)).toEqual(["events.4.jsonl", "history.jsonl", "ledger.json", "writer.lock"]);
+    expect(await ls(w.dir)).toEqual(["events.4.1.jsonl", "history.jsonl", "ledger.json", "writer.lock"]);
   });
 
   it("a reader whose snapshot and journal listing disagree retries and then succeeds", async () => {
@@ -350,8 +357,8 @@ describe("snapshot cadence and journal rotation", () => {
     await writer.append([addTask("B")]);
     let rotated = false;
     const hook: FsInterceptor = async (call) => {
-      // After the reader has read the old snapshot and listed events.1.jsonl, the writer rotates under it.
-      if (!rotated && call.op === "readText" && /events\.\d+\.jsonl$/.test(call.path)) {
+      // After the reader has read the old snapshot and listed events.1.1.jsonl, the writer rotates under it.
+      if (!rotated && call.op === "readText" && /events\.\d+\.\d+\.jsonl$/.test(call.path)) {
         rotated = true;
         await writer.snapshot();
       }
@@ -370,7 +377,7 @@ describe("snapshot cadence and journal rotation", () => {
     const writer = await w.store.create(buildDraft(1), w.holder("s1"));
     await writer.append([addTask("A")]);
     const hook: FsInterceptor = (call) => {
-      if (call.op === "readText" && /events\.\d+\.jsonl$/.test(call.path)) throw fsError("ENOENT");
+      if (call.op === "readText" && /events\.\d+\.\d+\.jsonl$/.test(call.path)) throw fsError("ENOENT");
     };
     const reader = await mk({ root, pid: 200, clock: w.clock, fs: interceptFs(realFs, hook) });
     const err = await failure(reader.store.read(PLAN_ID));
@@ -395,12 +402,12 @@ describe("load errors", () => {
     const ledger = await e.store.read(PLAN_ID);
     expect(ledger.seq).toBe(2);
     expect(Object.keys(ledger.tasks)).toEqual(["T1", "T2", "T2x"]);
-    expect(e.warnings).toEqual(["events.1.jsonl: torn last line dropped"]);
+    expect(e.warnings).toEqual(["events.1.1.jsonl: torn last line dropped"]);
 
     const w = await e.store.open(PLAN_ID, e.holder("s1"));
     expect(w.ledger.seq).toBe(2);
-    // Appending to the torn file would glue bytes onto the torn tail: the open rotated to a fresh journal.
-    expect(await ls(dir)).toEqual(["events.3.jsonl", "history.jsonl", "ledger.json", "writer.lock"]);
+    // Appending to the torn file would glue bytes onto the torn tail: the open rotated to a fresh journal (writer epoch 2).
+    expect(await ls(dir)).toEqual(["events.3.2.jsonl", "history.jsonl", "ledger.json", "writer.lock"]);
     await w.append([addTask("T3")]);
     await w.close();
     expect((await e.store.read(PLAN_ID)).seq).toBe(3);
@@ -410,14 +417,14 @@ describe("load errors", () => {
     const e = await mk();
     await plant(e.home, [init(), created("A", 2), "{\"seq\":3,\"at\":"]);
     expect((await e.store.read(PLAN_ID)).seq).toBe(2);
-    expect(e.warnings).toEqual(["events.1.jsonl: torn last line dropped"]);
+    expect(e.warnings).toEqual(["events.1.1.jsonl: torn last line dropped"]);
   });
 
   it("a last line that parses but is not an event envelope is torn too", async () => {
     const e = await mk();
     await plant(e.home, [init(), created("A", 2), "{\"hello\":1}"]);
     expect((await e.store.read(PLAN_ID)).seq).toBe(2);
-    expect(e.warnings).toEqual(["events.1.jsonl: torn last line dropped"]);
+    expect(e.warnings).toEqual(["events.1.1.jsonl: torn last line dropped"]);
   });
 
   it("a trailing batch without its last event is dropped whole with one warning", async () => {
@@ -441,7 +448,7 @@ describe("load errors", () => {
     expect(err.code).toBe("E_SEQ_GAP");
     expect(err.message).toMatch(/seq 4 follows 2/);
     expect((await failure(e.store.open(PLAN_ID, e.holder("s")))).code).toBe("E_SEQ_GAP");
-    expect(await ls(join(e.home, PLAN_ID))).toEqual(["events.1.jsonl"]); // the failed open released its lock
+    expect(await ls(join(e.home, PLAN_ID))).toEqual(["events.1.1.jsonl"]); // the failed open released its lock
   });
 
   it.each([
@@ -460,7 +467,7 @@ describe("load errors", () => {
     const e = await mk();
     const dir = join(e.home, PLAN_ID);
     await mkdir(dir, { recursive: true });
-    await writeFile(join(dir, "events.5.jsonl"), `${created("A", 5)}\n`, "utf8");
+    await writeFile(join(dir, "events.5.1.jsonl"), `${created("A", 5)}\n`, "utf8");
     expect((await failure(e.store.read(PLAN_ID))).code).toBe("E_SEQ_GAP");
   });
 
@@ -471,7 +478,7 @@ describe("load errors", () => {
     const e2 = await mk();
     const dir = join(e2.home, PLAN_ID);
     await mkdir(dir, { recursive: true });
-    await writeFile(join(dir, "events.1.jsonl"), "", "utf8");
+    await writeFile(join(dir, "events.1.1.jsonl"), "", "utf8");
     expect((await failure(e2.store.read(PLAN_ID))).code).toBe("E_LEDGER_NOT_FOUND");
   });
 
@@ -483,7 +490,7 @@ describe("load errors", () => {
     expect(err.code).toBe("E_ILLEGAL_TRANSITION");
     expect(err.detail).toEqual({ event: { seq: 2, batch: 2, type: "task-transition" }, codes: ["transition-from-mismatch"] });
     expect((await failure(e.store.open(PLAN_ID, e.holder("s")))).code).toBe("E_ILLEGAL_TRANSITION");
-    expect(await ls(join(e.home, PLAN_ID))).toEqual(["events.1.jsonl"]);
+    expect(await ls(join(e.home, PLAN_ID))).toEqual(["events.1.1.jsonl"]);
   });
 
   it("a wrong trigger, a missing task and a batch that ends in an invalid ledger are all E_ILLEGAL_TRANSITION", async () => {
@@ -580,18 +587,33 @@ describe("load errors", () => {
     snap.seq = 5;
     // The journal continues at seq 2, but the snapshot says 5 and no later file covers it.
     const dir = await plant(e.home, [init(), created("A", 2)], { snapshot: snap });
-    await writeFile(join(dir, "events.9.jsonl"), `${created("Z", 9)}\n`, "utf8");
+    await writeFile(join(dir, "events.9.1.jsonl"), `${created("Z", 9)}\n`, "utf8");
     expect((await failure(e.store.open(PLAN_ID, e.holder("s")))).code).toBe("E_SEQ_GAP");
   });
 
   it("a journal that ends inside a batch before the next journal starts is E_SEQ_GAP", async () => {
     const e = await mk();
     const dir = await plant(e.home, [init(), eventLine(addTask("A"), 2, 2, false)]);
-    await writeFile(join(dir, "events.3.jsonl"), `${created("B", 3)}\n`, "utf8");
+    await writeFile(join(dir, "events.3.1.jsonl"), `${created("B", 3)}\n`, "utf8");
+    const err = await failure(e.store.read(PLAN_ID));
+    expect(err.code).toBe("E_SEQ_GAP");
+    expect(err.message).toMatch(/ends inside a batch/);
+  });
+
+  // QA-2.2-7: a listed journal that starts beyond S+1 is a mismatch even when it is empty (readers retry, writers E_SEQ_GAP).
+  it("an empty journal that starts beyond the snapshot's next seq is a mismatch", async () => {
+    const e = await mk();
     const snap = buildDraft(2);
     snap.seq = 1;
-    await writeFile(join(dir, "ledger.json"), JSON.stringify(snap), "utf8");
-    expect((await failure(e.store.read(PLAN_ID))).code).toBe("E_SEQ_GAP");
+    const dir = await plant(e.home, [init()], { snapshot: snap });
+    await writeFile(join(dir, "events.5.1.jsonl"), "", "utf8");
+    const err = await failure(e.store.read(PLAN_ID));
+    expect(err.code).toBe("E_SEQ_GAP");
+    expect(err.message).toMatch(/never agreed/);
+    expect(e.clock.sleeps).toHaveLength(8);
+    const werr = await failure(e.store.open(PLAN_ID, e.holder("s")));
+    expect(werr.code).toBe("E_SEQ_GAP");
+    expect(werr.message).toMatch(/events\.5\.1\.jsonl starts at seq 5/);
   });
 
   it("unknown extra fields are preserved through load, append, snapshot and reload", async () => {
@@ -701,10 +723,13 @@ describe("writer lock", () => {
 
     clock.advance(59_000);
     expect((await failure(other.store.takeover(PLAN_ID, other.holder("session-b"), "r"))).code).toBe("E_LOCK_HELD");
-    // a heartbeat at t+59s refreshes the lock
+    // a heartbeat at t+59s refreshes the holder's beat file; writer.lock itself is never rewritten by a heartbeat (QA-2.2-1)
+    const lockBefore = await readFile(join(a.dir, "writer.lock"), "utf8");
     clock.fire();
     await w.append([]); // serialised after the heartbeat
-    expect((await readJson(join(a.dir, "writer.lock")) as LockHolder).heartbeatAt).toBe(clock.iso());
+    const lock = JSON.parse(lockBefore) as LockHolder & { token: string };
+    expect((await readJson(join(a.dir, `writer.${lock.token}.beat`)) as { heartbeatAt: string }).heartbeatAt).toBe(clock.iso());
+    expect(await readFile(join(a.dir, "writer.lock"), "utf8")).toBe(lockBefore);
     expect(clock.heldCount()).toBe(1); // re-armed
     clock.advance(59_000); // 118 s after the start, 59 s after the heartbeat
     expect((await failure(other.store.takeover(PLAN_ID, other.holder("session-b"), "r"))).code).toBe("E_LOCK_HELD");
@@ -728,14 +753,28 @@ describe("writer lock", () => {
     await tw.close();
   });
 
-  it("a takeover with an `adopt` reason replaces a live lock", async () => {
+  // QA-2.2-4: only the exact ADOPT_TAKEOVER_REASON replaces a live lock, and only one held by this same process (pid + host).
+  it("a takeover with exactly ADOPT_TAKEOVER_REASON replaces a live lock of the same process; anything else is refused", async () => {
+    expect(ADOPT_TAKEOVER_REASON).toBe("adopt");
     const root = await newRoot();
     const a = await mk({ root, pid: 100 });
     const b = await mk({ root, pid: 200, clock: a.clock });
+    const same = await mk({ root, pid: 100, clock: a.clock }); // another store in process 100
+    const sameOtherHost = await mk({ root, pid: 100, host: "host-b", clock: a.clock });
     b.proc.alive.add(100);
+    same.proc.alive.add(100);
     const w = await a.store.create(buildDraft(1), a.holder("session-a"));
-    const tw = await b.store.takeover(PLAN_ID, b.holder("session-b"), "adopt: new orchestrator");
-    expect((await readJson(join(b.dir, "writer.lock")) as LockHolder).sessionID).toBe("session-b");
+    // another process, even with the exact reason
+    expect((await failure(b.store.takeover(PLAN_ID, b.holder("session-b"), ADOPT_TAKEOVER_REASON))).code).toBe("E_LOCK_HELD");
+    // the same pid on another host
+    expect((await failure(sameOtherHost.store.takeover(PLAN_ID, sameOtherHost.holder("s"), ADOPT_TAKEOVER_REASON))).code).toBe("E_LOCK_HELD");
+    // the same process, but a reason that only starts with "adopt"
+    for (const reason of ["adopt: new orchestrator", "adopted", "Adopt", " adopt"]) {
+      expect((await failure(same.store.takeover(PLAN_ID, same.holder("session-c"), reason))).code).toBe("E_LOCK_HELD");
+    }
+    await w.append([addTask("A")]); // still the holder
+    const tw = await same.store.takeover(PLAN_ID, same.holder("session-c"), ADOPT_TAKEOVER_REASON);
+    expect((await readJson(join(a.dir, "writer.lock")) as LockHolder).sessionID).toBe("session-c");
     expect((await failure(w.append([addTask("late")]))).code).toBe("E_LOCK_LOST");
     await tw.close();
   });
@@ -835,7 +874,7 @@ describe("writer lock", () => {
   it("readers are never blocked: read, list and exportPlan work while a writer holds the lock and is stuck mid-append", async () => {
     const g = gate();
     const hook: FsInterceptor = async (call) => {
-      if (call.op === "appendText" && /events\.1\.jsonl$/.test(call.path) && (call.data ?? "").includes("\"T9\"")) {
+      if (call.op === "appendText" && /events\.1\.1\.jsonl$/.test(call.path) && (call.data ?? "").includes("\"T9\"")) {
         g.markReached();
         await g.wait;
       }
@@ -895,7 +934,7 @@ describe("writer lock", () => {
     const e = await mk();
     await plant(e.home, [initLine(buildDraft(1)), "garbage", eventLine(addTask("A"), 3, 3, true)]);
     expect((await failure(e.store.remove(PLAN_ID))).code).toBe("E_SEQ_GAP");
-    expect(await ls(e.dir)).toEqual(["events.1.jsonl"]);
+    expect(await ls(e.dir)).toEqual(["events.1.1.jsonl"]);
   });
 
   it("takeover is journaled in the history copy of the plan's events only through the main journal (export merges both)", async () => {
@@ -981,13 +1020,11 @@ describe("production defaults", () => {
     expect((await realFs.lstat(join(root, "sub")))?.kind).toBe("dir");
     expect(await realFs.lstat(join(root, "missing"))).toBeNull();
     expect(await realFs.realpath(root)).toBeTruthy();
-    await realFs.fsyncDir(root);
-    await realFs.fsyncDir(join(root, "missing-dir")).then(
-      () => undefined,
-      (e: unknown) => {
-        expect((e as { code?: string }).code).toBe("ENOENT");
-      },
-    );
+    // QA-2.2-11: fsyncDir is async (fs.promises open + sync); only EPERM/EACCES/EISDIR on win32 are ignored, never ENOENT.
+    const pending = realFs.fsyncDir(root);
+    expect(pending).toBeInstanceOf(Promise);
+    await pending;
+    await expect(realFs.fsyncDir(join(root, "missing-dir"))).rejects.toMatchObject({ code: "ENOENT" });
     await realFs.rm(p, { recursive: false });
     await realFs.rm(join(root, "sub"), { recursive: true });
     await realFs.rm(join(root, "never-existed"), { recursive: false });
@@ -1168,13 +1205,13 @@ describe("replay: every precondition refuses an illegal event and writes nothing
   it.each(ILLEGAL)("%s", async (_name, batch, code) => {
     const e = await mk();
     const w = await e.store.create(richDraft(), e.holder("s1"));
-    const before = { ledger: clone(w.ledger), journal: await readFile(join(e.dir, "events.1.jsonl"), "utf8") };
+    const before = { ledger: clone(w.ledger), journal: await readFile(join(e.dir, "events.1.1.jsonl"), "utf8") };
     const err = await failure(w.append(batch));
     expect(err.code).toBe("E_ILLEGAL_TRANSITION");
     expect((err.detail as { codes: string[] }).codes).toEqual([code]);
     expect(err.message).toContain(code);
     expect(w.ledger).toEqual(before.ledger);
-    expect(await readFile(join(e.dir, "events.1.jsonl"), "utf8")).toBe(before.journal);
+    expect(await readFile(join(e.dir, "events.1.1.jsonl"), "utf8")).toBe(before.journal);
     // And the writer is still usable.
     await w.append([addTask("after")]);
     expect(w.ledger.seq).toBe(2);
@@ -1245,15 +1282,16 @@ describe("replay: legal lifecycles are applied, persisted and reloaded identical
     await w.append([{ type: "attempt-context", taskId: "A", n: 1, context: "feedback" }, transition("A", "completed", "verifying", "committed")]);
     await w.append([{ type: "attempt-verdict", taskId: "A", n: 1, verdict: "pass", ref: "r1" }]);
     await w.append([transition("A", "verifying", "verified", "verify-pass")]);
+    // The entry names A: an integrating task needs an open entry at every batch end (A1-3a).
     await w.append((l) => [
-      step("start", `i-${l.seq + 1}`, "rebase"),
+      step("start", `i-${l.seq + 1}`, "rebase", { taskIds: ["A"] }),
       transition("A", "verified", "integrating", "dequeued"),
     ]);
     const entryId = `i-${w.ledger.seq - 1}`;
     expect(w.openIntegration().map((o) => [o.entry.id, o.step, o.edge, o.result])).toEqual([[entryId, "rebase", "start", null]]);
-    await w.append([step("end", entryId, "rebase"), step("start", entryId, "fast-forward", { candidate: SHA2 })]);
+    await w.append([step("end", entryId, "rebase", { taskIds: ["A"] }), step("start", entryId, "fast-forward", { candidate: SHA2, taskIds: ["A"] })]);
     await w.append([
-      step("end", entryId, "fast-forward", { candidate: SHA2, closes: true }),
+      step("end", entryId, "fast-forward", { candidate: SHA2, closes: true, taskIds: ["A"] }),
       { type: "task-integrated", taskId: "A", from: SHA1, to: SHA2 },
       { type: "integration-head", head: SHA2 },
       { type: "task-slot", taskId: "A", slot: null, branch: `omr/${PLAN_ID}/t/A` },
@@ -1378,10 +1416,10 @@ describe("replay: legal lifecycles are applied, persisted and reloaded identical
       return [addTask(`B${l.seq}`)];
     });
     expect(seen).toEqual([1, 2]);
-    const journal = await readFile(join(e.dir, "events.1.jsonl"), "utf8");
+    const journal = await readFile(join(e.dir, "events.1.1.jsonl"), "utf8");
     expect(await w.append([])).toBe(w.ledger);
     expect(await w.append(() => [])).toBe(w.ledger);
-    expect(await readFile(join(e.dir, "events.1.jsonl"), "utf8")).toBe(journal);
+    expect(await readFile(join(e.dir, "events.1.1.jsonl"), "utf8")).toBe(journal);
   });
 
   it("concurrent appends are serialised in call order", async () => {
@@ -1418,6 +1456,68 @@ describe("replay: legal lifecycles are applied, persisted and reloaded identical
     expect(err.code).toBe("E_ILLEGAL_TRANSITION");
     expect(err.detail).toEqual({ taskId: "I", codes: ["integrating-without-entry"] });
     expect(await ls(e.dir)).not.toContain("writer.lock");
+  });
+
+  // QA-2.2-3 (A1-3a): an integrating task whose last entry closed rolled-back needs no open entry, at open and at batch end; any other
+  // batch that leaves a task integrating without an open entry is refused at the batch end and writes nothing.
+  it("an entry that closed rolled-back lets its task stay integrating; a batch that orphans an integrating task is refused", async () => {
+    const e = await mk();
+    const w = await e.store.create(richDraft(), e.holder("s1"));
+    const rolledBackEnd = (id: string): ExecutorEventInput => ({
+      type: "integration-step",
+      edge: "end",
+      entry: entryOf(id),
+      step: "rebase",
+      result: "rolled-back",
+      detail: null,
+      failingIds: [],
+      closes: true,
+    });
+    await w.append((l) => [step("start", `i-${l.seq + 1}`, "rebase")]);
+    const first = `i-${w.ledger.seq}`;
+    await w.append([rolledBackEnd(first)]);
+    expect(w.openIntegration()).toEqual([]);
+    expect(w.ledger.tasks.I?.state).toBe("integrating");
+    await w.append([addTask("other")]); // the exempt task does not block later batches
+    await w.close();
+
+    const again = await e.store.open(PLAN_ID, e.holder("s2")); // reopen is no longer refused
+    expect(again.ledger.tasks.I?.state).toBe("integrating");
+    await again.append((l) => [step("start", `i-${l.seq + 1}`, "rebase")]);
+    const second = `i-${again.ledger.seq}`;
+    const journalBefore = (await ls(e.dir)).filter((n) => n.startsWith("events."));
+    const seq = again.ledger.seq;
+    // Closing the new entry with `ok` while the task stays integrating orphans it: refused at the batch end.
+    const err = await failure(again.append([step("end", second, "rebase", { closes: true })]));
+    expect(err.code).toBe("E_ILLEGAL_TRANSITION");
+    expect(err.detail).toMatchObject({ eventIndex: null, codes: ["integrating-without-entry"], taskId: "I" });
+    expect(again.ledger.seq).toBe(seq);
+    expect(again.openIntegration().map((o) => o.entry.id)).toEqual([second]);
+    expect((await ls(e.dir)).filter((n) => n.startsWith("events."))).toEqual(journalBefore);
+    // Rolled back again: accepted, and a reopen accepts it too.
+    await again.append([rolledBackEnd(second)]);
+    await again.close();
+    const third = await e.store.open(PLAN_ID, e.holder("s3"));
+    expect(third.openIntegration()).toEqual([]);
+    await third.close();
+  });
+
+  // QA-2.2-12: wakeKeys() is a live view, the same set every call, updated in place when a batch commits (and only then).
+  it("wakeKeys returns one live set that a committed batch updates in place", async () => {
+    const e = await mk();
+    const w = await e.store.create(buildDraft(1), e.holder("s1"));
+    const keys = w.wakeKeys();
+    expect(w.wakeKeys()).toBe(keys);
+    expect([...keys]).toEqual([]);
+    await w.append([{ type: "wake", reason: "inbox", stateKey: "k-1" }]);
+    expect(w.wakeKeys()).toBe(keys);
+    expect([...keys]).toEqual(["k-1"]);
+    // A refused batch does not leak its keys into the view.
+    await failure(w.append([{ type: "wake", reason: "inbox", stateKey: "k-2" }, addTask("T1")]));
+    expect([...keys]).toEqual(["k-1"]);
+    await w.append([{ type: "wake", reason: "manual-ready", stateKey: "k-3" }]);
+    expect([...keys].sort()).toEqual(["k-1", "k-3"]);
+    await w.close();
   });
 
   it("open integration entries and wake keys survive a close/open cycle through history.jsonl", async () => {
@@ -1462,7 +1562,7 @@ describe("faults: journal, history, snapshot, heartbeat", () => {
   it("a failed journal write changes nothing in memory; the next append rotates past the torn bytes", async () => {
     let failNext = false;
     const hook: FsInterceptor = (call) => {
-      if (failNext && call.op === "appendText" && /events\.\d+\.jsonl$/.test(call.path)) {
+      if (failNext && call.op === "appendText" && /events\.\d+\.\d+\.jsonl$/.test(call.path)) {
         failNext = false;
         return { writePartial: 12 };
       }
@@ -1483,10 +1583,10 @@ describe("faults: journal, history, snapshot, heartbeat", () => {
     expect(err?.code).toBe("EIO");
     expect(w.ledger.seq).toBe(2);
     expect(w.ledger.tasks.B).toBeUndefined();
-    expect((await readFile(join(e.dir, "events.1.jsonl"), "utf8")).endsWith("\n")).toBe(false); // torn tail on disk
+    expect((await readFile(join(e.dir, "events.1.1.jsonl"), "utf8")).endsWith("\n")).toBe(false); // torn tail on disk
 
     await w.append([addTask("C")]);
-    expect(await ls(e.dir)).toEqual(["events.3.jsonl", "history.jsonl", "ledger.json", "writer.lock"]);
+    expect(await ls(e.dir)).toEqual(["events.3.1.jsonl", "history.jsonl", "ledger.json", "writer.lock"]);
     const seen = await e.store.read(PLAN_ID);
     expect(Object.keys(seen.tasks)).toEqual(["T1", "A", "C"]);
     expect(seen.seq).toBe(3);
@@ -1536,7 +1636,7 @@ describe("faults: journal, history, snapshot, heartbeat", () => {
     expect(asLedger(await readJson(join(e.dir, "ledger.json"))).seq).toBe(1);
     await w.append([addTask("C")]); // retried
     expect(asLedger(await readJson(join(e.dir, "ledger.json"))).seq).toBe(4);
-    expect(await ls(e.dir)).toEqual(["events.5.jsonl", "history.jsonl", "ledger.json", "writer.lock"]);
+    expect(await ls(e.dir)).toEqual(["events.5.1.jsonl", "history.jsonl", "ledger.json", "writer.lock"]);
   });
 
   it("an explicit snapshot failure is thrown; a temp file that cannot be removed is warned about", async () => {
@@ -1602,45 +1702,51 @@ describe("faults: journal, history, snapshot, heartbeat", () => {
     f.arm();
     await w.snapshot();
     expect(e.warnings.some((m) => m.startsWith("could not list "))).toBe(true);
-    expect(await ls(e.dir)).toContain("events.1.jsonl"); // superseded, never read
-    expect(await ls(e.dir)).toContain("events.3.jsonl");
+    expect(await ls(e.dir)).toContain("events.1.1.jsonl"); // superseded, never read
+    expect(await ls(e.dir)).toContain("events.3.1.jsonl");
     f.disarm();
     expect((await e.store.read(PLAN_ID)).seq).toBe(2);
 
     const e2 = await mk({
       fs: interceptFs(realFs, (call) => {
-        if (call.op === "rm" && /events\.1\.jsonl$/.test(call.path)) throw fsError("EACCES");
+        if (call.op === "rm" && /events\.1\.1\.jsonl$/.test(call.path)) throw fsError("EACCES");
         return undefined;
       }),
     });
     const w2 = await e2.store.create(buildDraft(1), e2.holder("s1"));
     await w2.append([addTask("A")]);
     await w2.snapshot();
-    expect(e2.warnings.some((m) => m.startsWith("could not delete old journal events.1.jsonl"))).toBe(true);
+    expect(e2.warnings.some((m) => m.startsWith("could not delete old journal events.1.1.jsonl"))).toBe(true);
     expect((await e2.store.read(PLAN_ID)).seq).toBe(2);
   });
 
-  it("a failed heartbeat is warned about and re-armed; a temp lock that cannot be removed is warned about too", async () => {
+  it("a failed heartbeat is warned about and re-armed; a temp beat file that cannot be removed is warned about too", async () => {
+    const isBeatTmp = (p: string): boolean => /writer\.[A-Za-z0-9_-]+\.beat\.tmp-/.test(p);
     const f = armable((call) => {
-      if (call.op === "rename" && /writer\.lock\.tmp-/.test(call.path)) throw fsError("EIO");
-      if (call.op === "rm" && /writer\.lock\.tmp-/.test(call.path)) throw fsError("EACCES");
+      if (call.op === "rename" && isBeatTmp(call.path)) throw fsError("EIO");
+      if (call.op === "rm" && isBeatTmp(call.path)) throw fsError("EACCES");
       return undefined;
     });
     const e = await mk({ fs: interceptFs(realFs, f.hook) });
     const w = await e.store.create(buildDraft(1), e.holder("s1"));
+    const lockText = await readFile(join(e.dir, "writer.lock"), "utf8");
+    const token = (JSON.parse(lockText) as { token: string }).token;
     expect(e.clock.heldCount()).toBe(1);
     f.arm();
     e.clock.fire();
     await w.append([]);
     expect(e.warnings.some((m) => m.includes("heartbeat of plan-one failed"))).toBe(true);
-    expect(e.warnings.some((m) => m.includes("could not remove temp lock"))).toBe(true);
+    expect(e.warnings.some((m) => m.includes("could not remove temp beat"))).toBe(true);
     expect(e.clock.heldCount()).toBe(1); // re-armed
     f.disarm();
+    e.clock.advance(1_000);
     e.clock.fire();
     await w.append([]);
-    expect((await readJson(join(e.dir, "writer.lock"))) as LockHolder).toMatchObject({ sessionID: "s1" });
+    expect((await readJson(join(e.dir, `writer.${token}.beat`)) as { heartbeatAt: string }).heartbeatAt).toBe(e.clock.iso());
+    expect(await readFile(join(e.dir, "writer.lock"), "utf8")).toBe(lockText); // never rewritten
     await w.close();
     expect(e.clock.heldCount()).toBe(0); // close disarms the heartbeat
+    expect((await ls(e.dir)).filter((n) => n.endsWith(".beat") || n === "writer.lock")).toEqual([]); // close removes lock and beat
   });
 
   it("the heartbeat of a fenced writer fails once and is not re-armed", async () => {
@@ -1731,6 +1837,7 @@ describe("faults: create, open and takeover", () => {
       }),
     });
     expect((await failure(e.store.create(buildDraft(1), e.holder("s1")))).code).toBe("E_EXISTS");
+    expect(await ls(e.dir)).toEqual(["writer.lock"]); // the other creator's directory is left alone
 
     const e2 = await mk({
       fs: interceptFs(realFs, (call) => {
@@ -1739,6 +1846,20 @@ describe("faults: create, open and takeover", () => {
       }),
     });
     await expect(e2.store.create(buildDraft(1), e2.holder("s1"))).rejects.toMatchObject({ code: "EIO" });
+    // QA-2.2-8: the empty plan directory this create made is removed again; nothing is left in the home.
+    expect(await readdir(e2.home)).toEqual([]);
+
+    // A directory that is no longer empty (someone else wrote into it meanwhile) is not removed.
+    const e3 = await mk({
+      fs: interceptFs(realFs, async (call) => {
+        if (call.op === "writeText" && /writer\.lock$/.test(call.path)) {
+          await realFs.writeText(join(call.path, "..", "foreign.txt"), "x", { exclusive: true });
+          throw fsError("EIO");
+        }
+      }),
+    });
+    await expect(e3.store.create(buildDraft(1), e3.holder("s1"))).rejects.toMatchObject({ code: "EIO" });
+    expect(await ls(e3.dir)).toEqual(["foreign.txt"]);
   });
 
   it("takeover passes through a guard I/O error, and a guard that vanishes mid-way is a takeover in progress", async () => {
@@ -1829,9 +1950,9 @@ describe("faults: create, open and takeover", () => {
   it("an open of a plan that has no snapshot yet writes one", async () => {
     const e = await mk();
     const dir = await plant(e.home, [initLine(buildDraft(2))]);
-    expect(await ls(dir)).toEqual(["events.1.jsonl"]);
+    expect(await ls(dir)).toEqual(["events.1.1.jsonl"]);
     const w = await e.store.open(PLAN_ID, e.holder("s1"));
-    expect(await ls(dir)).toEqual(["events.2.jsonl", "history.jsonl", "ledger.json", "writer.lock"]);
+    expect(await ls(dir)).toEqual(["events.2.2.jsonl", "history.jsonl", "ledger.json", "writer.lock"]);
     expect(asLedger(await readJson(join(dir, "ledger.json"))).seq).toBe(1);
     await w.close();
   });
@@ -1908,7 +2029,7 @@ describe("history journal", () => {
     const e = await mk({ snapshotEvery: 3 });
     const w = await e.store.create(buildDraft(1), e.holder("s1"));
     for (let i = 1; i <= 4; i++) await w.append([metric(i), addTask(`A${i}`)]);
-    expect(await ls(e.dir)).not.toContain("events.1.jsonl");
+    expect(await ls(e.dir)).not.toContain("events.1.1.jsonl");
     const { snapshot, events } = await e.store.exportPlan(PLAN_ID);
     expect(snapshot.seq).toBe(9);
     const seqs = events.map((x) => x.seq);
@@ -1916,5 +2037,329 @@ describe("history journal", () => {
     expect(new Set(seqs).size).toBe(seqs.length);
     expect(events.filter((x) => x.type === "metric").map((x) => x.seq)).toEqual([2, 4, 6, 8]);
     await w.close();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Fencing: writer epochs, beat files, lock checks before destructive steps (QA-2.2 round 1)
+// ---------------------------------------------------------------------------------------------------------------
+
+/** A hook that holds the first call matching `at` once armed: `g.reached` resolves there, `g.open()` lets it continue. */
+function holdOnce(at: (call: FsCall) => boolean): { hook: FsInterceptor; arm(): void; g: ReturnType<typeof gate> } {
+  const g = gate();
+  let armed = false;
+  return {
+    g,
+    arm: () => {
+      armed = true;
+    },
+    hook: async (call) => {
+      if (armed && at(call)) {
+        armed = false;
+        g.markReached();
+        await g.wait;
+      }
+    },
+  };
+}
+
+const isBeatTmpPath = (p: string): boolean => /writer\.[A-Za-z0-9_-]+\.beat\.tmp-/.test(p);
+
+describe("fencing", () => {
+  it.each([
+    ["the beat file's temp write", (c: FsCall) => c.op === "writeText" && isBeatTmpPath(c.path)],
+    ["the beat file's rename", (c: FsCall) => c.op === "rename" && isBeatTmpPath(c.path)],
+  ])("QA-2.2-1: a heartbeat held at %s across a takeover never restores the old lock", async (_name, at) => {
+    const h = holdOnce(at);
+    const root = await newRoot();
+    const a = await mk({ root, pid: 100, fs: interceptFs(realFs, h.hook) });
+    const b = await mk({ root, pid: 200, clock: a.clock });
+    const old = await a.store.create(buildDraft(1), a.holder("session-a"));
+    h.arm();
+    a.clock.fire(); // the old writer's heartbeat passes its lock check and is held
+    await h.g.reached;
+    const fresh = await b.store.takeover(PLAN_ID, b.holder("session-b"), "hung");
+    const lockAfterTakeover = await readFile(join(a.dir, "writer.lock"), "utf8");
+    expect((JSON.parse(lockAfterTakeover) as LockHolder).sessionID).toBe("session-b");
+    h.g.open();
+    // Serialised after the released heartbeat: the old writer is fenced, the new one keeps the lock.
+    expect((await failure(old.append([addTask("late")]))).code).toBe("E_LOCK_LOST");
+    expect(await readFile(join(a.dir, "writer.lock"), "utf8")).toBe(lockAfterTakeover);
+    await fresh.append([addTask("B")]);
+    expect(Object.keys((await b.store.read(PLAN_ID)).tasks)).toEqual(["T1", "B"]);
+    await old.close();
+    expect(await readFile(join(a.dir, "writer.lock"), "utf8")).toBe(lockAfterTakeover);
+    await fresh.close();
+  });
+
+  it("QA-2.2-2a: both writers appending: the fenced writer's late batch is refused to its caller and never read", async () => {
+    const h = holdOnce((c) => c.op === "appendText" && /events\.\d+\.\d+\.jsonl$/.test(c.path));
+    const root = await newRoot();
+    const a = await mk({ root, pid: 100, fs: interceptFs(realFs, h.hook) });
+    const b = await mk({ root, pid: 200, clock: a.clock });
+    const c = await mk({ root, pid: 300, clock: a.clock });
+    const old = await a.store.create(buildDraft(1), a.holder("session-a"));
+    await old.append([addTask("A")]);
+    h.arm();
+    const late = old.append([addTask("LATE")]); // passes its lock check, then hangs before the write
+    await h.g.reached;
+    const fresh = await b.store.takeover(PLAN_ID, b.holder("session-b"), "hung");
+    await fresh.append([addTask("B")]);
+    h.g.open();
+    expect((await failure(late)).code).toBe("E_LOCK_LOST"); // the write landed in a fenced file; the caller is told
+    expect((await failure(old.append([addTask("LATER")]))).code).toBe("E_LOCK_LOST");
+    const seen = await c.store.read(PLAN_ID);
+    expect(Object.keys(seen.tasks)).toEqual(["T1", "A", "B"]);
+    expect(seen).toEqual(fresh.ledger);
+    expect((await c.store.exportPlan(PLAN_ID)).snapshot).toEqual(fresh.ledger);
+    await fresh.append([addTask("C")]);
+    await fresh.close();
+    expect((await ls(a.dir)).filter((n) => /^events\.\d+\.1\.jsonl$/.test(n))).toEqual([]); // the fenced epoch's files are gone
+    const again = await c.store.open(PLAN_ID, c.holder("session-c"));
+    expect(Object.keys(again.ledger.tasks)).toEqual(["T1", "A", "B", "C"]);
+    await again.close();
+  });
+
+  it("QA-2.2-2b: a fenced writer's late snapshot (inside close) is refused right before its rename; close leaves the new lock", async () => {
+    const h = holdOnce((c) => c.op === "writeText" && /ledger\.json\.tmp-/.test(c.path));
+    const root = await newRoot();
+    const a = await mk({ root, pid: 100, fs: interceptFs(realFs, h.hook) });
+    const b = await mk({ root, pid: 200, clock: a.clock });
+    const old = await a.store.create(buildDraft(1), a.holder("session-a"));
+    await old.append([addTask("A")]);
+    h.arm();
+    const closing = old.close(); // snapshots seq 2 before releasing: held at the snapshot's temp write
+    await h.g.reached;
+    const fresh = await b.store.takeover(PLAN_ID, b.holder("session-b"), "hung");
+    await fresh.append([addTask("B")]);
+    const snapshot = await readFile(join(a.dir, "ledger.json"), "utf8");
+    const lock = await readFile(join(a.dir, "writer.lock"), "utf8");
+    h.g.open();
+    await closing; // E_LOCK_LOST is not thrown by close
+    expect(await readFile(join(a.dir, "ledger.json"), "utf8")).toBe(snapshot);
+    expect(await readFile(join(a.dir, "writer.lock"), "utf8")).toBe(lock);
+    expect((await ls(a.dir)).filter((n) => n.includes(".tmp-"))).toEqual([]);
+    expect(await b.store.read(PLAN_ID)).toEqual(fresh.ledger);
+    await fresh.close();
+  });
+
+  it("QA-2.2-2c: a fenced writer's late history copy is dropped by readers and repaired on the next open", async () => {
+    const h = holdOnce((c) => c.op === "appendText" && /history\.jsonl$/.test(c.path) && (c.data ?? "") !== "");
+    const root = await newRoot();
+    const a = await mk({ root, pid: 100, fs: interceptFs(realFs, h.hook) });
+    const b = await mk({ root, pid: 200, clock: a.clock });
+    const c = await mk({ root, pid: 300, clock: a.clock });
+    const old = await a.store.create(buildDraft(1), a.holder("session-a"));
+    h.arm();
+    const late = old.append([metric(1)]); // seq 2 reaches the journal; its history copy is held after the lock check
+    await h.g.reached;
+    const fresh = await b.store.takeover(PLAN_ID, b.holder("session-b"), "hung"); // copies seq 2 itself; lock-takeover is seq 3
+    await fresh.append([metric(2)]); // seq 4
+    h.g.open();
+    await late.then(
+      () => undefined,
+      (x: unknown) => {
+        expect((x as ExecutorError).code).toBe("E_LOCK_LOST");
+      },
+    );
+    const file = join(a.dir, "history.jsonl");
+    const lines = await readLines(file);
+    expect(lines.map((l) => (JSON.parse(l) as ExecutorEvent).seq)).toEqual([2, 4, 2]); // the late duplicate landed last
+    // Plus a fenced writer's copy of an event the trusted journal does not hold, at the takeover's seq.
+    await writeFile(file, `${[lines[0], eventLine(metric(77), 3, 3, true), lines[1], lines[2]].join("\n")}\n`, "utf8");
+    const exported = await c.store.exportPlan(PLAN_ID); // readers tolerate it
+    expect(exported.events.map((x) => [x.seq, x.type])).toEqual([[2, "metric"], [3, "lock-takeover"], [4, "metric"]]);
+    const tw = await c.store.takeover(PLAN_ID, c.holder("session-c"), "b is gone"); // pid 200 is unknown to c: stale
+    expect(lines.length).toBe(3);
+    expect((await readLines(file)).map((l) => (JSON.parse(l) as ExecutorEvent).seq)).toEqual([2, 4]);
+    expect(await readLines(file)).toEqual([lines[0], lines[1]]);
+    await tw.close();
+  });
+
+  it("QA-2.2-2c: a fenced writer's late history rewrite is refused right before its rename", async () => {
+    let failHistory = false;
+    const h = holdOnce((c) => c.op === "writeText" && /history\.jsonl\.tmp-/.test(c.path));
+    const root = await newRoot();
+    const a = await mk({
+      root,
+      pid: 100,
+      fs: interceptFs(realFs, async (call) => {
+        if (failHistory && call.op === "appendText" && /history\.jsonl$/.test(call.path)) {
+          failHistory = false;
+          throw fsError("EIO");
+        }
+        await h.hook(call);
+      }),
+    });
+    const b = await mk({ root, pid: 200, clock: a.clock });
+    const old = await a.store.create(buildDraft(1), a.holder("session-a"));
+    failHistory = true;
+    await old.append([metric(1)]); // history copy fails: the next append rewrites history
+    expect(a.warnings.some((m) => m.includes("will be repaired"))).toBe(true);
+    h.arm();
+    const late = old.append([metric(2)]);
+    await h.g.reached;
+    const fresh = await b.store.takeover(PLAN_ID, b.holder("session-b"), "hung");
+    await fresh.append([metric(3)]);
+    const file = join(a.dir, "history.jsonl");
+    const before = await readFile(file, "utf8");
+    h.g.open();
+    expect((await failure(late)).code).toBe("E_LOCK_LOST");
+    expect(await readFile(file, "utf8")).toBe(before);
+    expect((await readLines(file)).map((l) => (JSON.parse(l) as ExecutorEvent).seq)).toEqual([2, 3, 5]);
+    expect((await ls(a.dir)).filter((n) => n.includes(".tmp-"))).toEqual([]);
+    await fresh.close();
+  });
+
+  it("QA-2.2-2d: close never releases a lock that names another writer", async () => {
+    let reads = 0;
+    const h = holdOnce((c) => c.op === "readText" && /writer\.lock$/.test(c.path) && ++reads === 2);
+    const root = await newRoot();
+    const a = await mk({ root, pid: 100, fs: interceptFs(realFs, h.hook) });
+    const b = await mk({ root, pid: 200, clock: a.clock });
+    const old = await a.store.create(buildDraft(1), a.holder("session-a"));
+    h.arm();
+    const closing = old.close(); // its lock check passes; held where it reads the lock again to release it
+    await h.g.reached;
+    const fresh = await b.store.takeover(PLAN_ID, b.holder("session-b"), "hung");
+    const lock = await readFile(join(a.dir, "writer.lock"), "utf8");
+    h.g.open();
+    await closing;
+    expect(await readFile(join(a.dir, "writer.lock"), "utf8")).toBe(lock);
+    await fresh.append([addTask("B")]); // still the holder
+    await fresh.close();
+  });
+
+  it("QA-2.2-2: loaders trust only the newest writer epoch past the snapshot", async () => {
+    const e = await mk();
+    const init = initLine(buildDraft(2));
+    const dir = await plant(e.home, [init, eventLine(addTask("A"), 2, 2, true), eventLine(addTask("B"), 3, 3, true)]);
+    const at3 = await e.store.read(PLAN_ID);
+    // Epoch 2 snapshotted seq 3; a fenced epoch-1 writer then appended seq 4 to its old file.
+    await writeFile(join(dir, "ledger.json"), JSON.stringify({ ...at3, writerEpoch: 2 }), "utf8");
+    await writeFile(join(dir, "events.1.1.jsonl"), `${eventLine(addTask("X"), 4, 4, true)}\n`, { flag: "a" });
+    expect(await e.store.read(PLAN_ID)).toEqual(at3);
+    // Epoch 2's journal and a fenced epoch-1 file that starts at the same seq: only epoch 2 counts.
+    await writeFile(join(dir, "events.4.2.jsonl"), `${eventLine(addTask("C"), 4, 4, true)}\n`, "utf8");
+    await writeFile(join(dir, "events.4.1.jsonl"), `${eventLine(addTask("Y"), 4, 4, true)}\n`, "utf8");
+    expect(Object.keys((await e.store.read(PLAN_ID)).tasks)).toEqual(["T1", "T2", "A", "B", "C"]);
+    // A writer's open deletes the fenced files and keeps the trusted state.
+    const w = await e.store.open(PLAN_ID, e.holder("s1"));
+    expect(Object.keys(w.ledger.tasks)).toEqual(["T1", "T2", "A", "B", "C"]);
+    expect((await ls(dir)).filter((n) => n.startsWith("events."))).toEqual(["events.5.3.jsonl"]);
+    await w.close();
+
+    // A snapshot from an older epoch than a journal that starts at or before it came from a fenced writer: a mismatch.
+    const e2 = await mk();
+    const dir2 = await plant(e2.home, [init, eventLine(addTask("A"), 2, 2, true), eventLine(addTask("B"), 3, 3, true)]);
+    const l3 = await e2.store.read(PLAN_ID);
+    await writeFile(join(dir2, "ledger.json"), JSON.stringify({ ...l3, writerEpoch: 1 }), "utf8");
+    await writeFile(join(dir2, "events.2.2.jsonl"), `${eventLine(addTask("Z"), 2, 2, true)}\n`, "utf8");
+    expect((await failure(e2.store.read(PLAN_ID))).message).toMatch(/never agreed/);
+    expect((await failure(e2.store.open(PLAN_ID, e2.holder("s")))).code).toBe("E_SEQ_GAP");
+  });
+
+  it("QA-2.2-5: a takeover that finds no lock creates it exclusively and loses to an open that got there first", async () => {
+    const root = await newRoot();
+    const a = await mk({ root, pid: 100 });
+    const c = await mk({ root, pid: 300 });
+    await (await a.store.create(buildDraft(1), a.holder("session-a"))).close();
+    let winner: LedgerWriter | null = null;
+    const b = await mk({
+      root,
+      pid: 200,
+      clock: a.clock,
+      fs: interceptFs(realFs, async (call) => {
+        if (winner === null && call.op === "writeText" && /writer\.lock$/.test(call.path)) {
+          winner = await c.store.open(PLAN_ID, c.holder("session-c")); // an open wins the race for the free lock
+        }
+      }),
+    });
+    expect((await failure(b.store.takeover(PLAN_ID, b.holder("session-b"), "no lock"))).code).toBe("E_LOCK_HELD");
+    expect((await readJson(join(a.dir, "writer.lock")) as LockHolder).sessionID).toBe("session-c");
+    const w = winner as LedgerWriter | null;
+    if (w === null) throw new Error("the racing open did not run");
+    await w.append([addTask("A")]);
+    await w.close();
+    expect(await ls(a.dir)).not.toContain("writer.lock.guard");
+  });
+
+  it("QA-2.2-5: remove takes the guarded path, and a stale guard is deleted only if its content is unchanged", async () => {
+    const root = await newRoot();
+    const a = await mk({ root, pid: 100 });
+    const w = await a.store.create(buildDraft(1), a.holder("session-a"));
+    await w.append([{ type: "status-changed", from: "running", to: "completed", reason: "done" }]);
+    await w.close();
+    const guard = join(a.dir, "writer.lock.guard");
+    await writeFile(guard, "{}", "utf8");
+    a.clock.set(Date.now());
+    const busy = await failure(a.store.remove(PLAN_ID));
+    expect(busy.code).toBe("E_LOCK_HELD");
+    expect(busy.message).toMatch(/another takeover/);
+    expect(await ls(a.dir)).toContain("ledger.json");
+
+    // The guard is stale, but another taker re-creates it while this one breaks it: the new guard is left alone.
+    a.clock.set(Date.now() + 60_000);
+    const b = await mk({
+      root,
+      pid: 200,
+      clock: a.clock,
+      fs: interceptFs(realFs, async (call) => {
+        if (call.op === "writeText" && /writer\.lock\.guard\.break$/.test(call.path)) await realFs.writeText(guard, "{\"other\":1}");
+      }),
+    });
+    const err = await failure(b.store.takeover(PLAN_ID, b.holder("session-b"), "r"));
+    expect(err.message).toMatch(/another takeover/);
+    expect(await readFile(guard, "utf8")).toBe("{\"other\":1}");
+    expect(await ls(a.dir)).not.toContain("writer.lock.guard.break");
+    await realFs.rm(guard, { recursive: false });
+    expect(await a.store.remove(PLAN_ID)).toBe(true);
+  });
+
+  it("QA-2.2-6: an open always rotates to its own epoch's events.(S+1) file; a snapshot fsyncs the journal before its rename", async () => {
+    const e = await mk();
+    const dir = await plant(e.home, [initLine(buildDraft(2)), eventLine(addTask("A"), 2, 2, true)]);
+    const w = await e.store.open(PLAN_ID, e.holder("s1"));
+    expect((await ls(dir)).filter((n) => n.startsWith("events."))).toEqual(["events.3.2.jsonl"]);
+    await w.close();
+
+    const calls: FsCall[] = [];
+    const e2 = await mk({
+      fs: interceptFs(realFs, (call) => {
+        calls.push(call);
+      }),
+    });
+    const w2 = await e2.store.create(buildDraft(1), e2.holder("s1"));
+    await w2.append([metric(1)]); // not durable: appended without fsync
+    calls.length = 0;
+    await w2.snapshot();
+    const fsyncAt = calls.findIndex((c) => c.op === "appendText" && /events\.1\.1\.jsonl$/.test(c.path) && c.fsync === true);
+    const renameAt = calls.findIndex((c) => c.op === "rename" && isSnapshotTmp(c.path));
+    expect(fsyncAt).toBeGreaterThanOrEqual(0);
+    expect(renameAt).toBeGreaterThan(fsyncAt);
+    await w2.close();
+  });
+
+  it("QA-2.2-9: the store stamps the lock's token, start time and epoch; identity is the token", async () => {
+    const e = await mk();
+    e.clock.advance(5_000);
+    const old = "1999-01-01T00:00:00.000Z";
+    const w = await e.store.create(buildDraft(1), { pid: e.proc.pid, hostname: e.proc.hostname, sessionID: "s1", startedAt: old, heartbeatAt: old });
+    const lock = (await readJson(join(e.dir, "writer.lock"))) as LockHolder & { token: string; epoch: number };
+    expect(lock.startedAt).toBe(e.clock.iso());
+    expect(lock.heartbeatAt).toBe(e.clock.iso());
+    expect(lock.token).toMatch(/^[A-Za-z0-9_-]+$/);
+    expect(lock.epoch).toBe(1);
+    await w.close();
+    const w2 = await e.store.open(PLAN_ID, e.holder("s1"));
+    const lock2 = (await readJson(join(e.dir, "writer.lock"))) as LockHolder & { token: string; epoch: number };
+    expect(lock2.token).not.toBe(lock.token);
+    expect(lock2.epoch).toBe(2);
+    // A lock that matches in everything but its token names another holder.
+    await writeFile(join(e.dir, "writer.lock"), JSON.stringify({ ...lock2, token: "forged" }), "utf8");
+    expect((await failure(w2.append([addTask("A")]))).code).toBe("E_LOCK_LOST");
+    // The event names the public holder only (no token, no epoch).
+    const ev = (await failure(e.store.open(PLAN_ID, e.holder("s2")))).detail as Record<string, unknown>;
+    expect(Object.keys(ev).sort()).toEqual(["heartbeatAt", "hostname", "pid", "sessionID", "startedAt"]);
   });
 });

@@ -103,12 +103,23 @@ async function crashAt(point: string): Promise<{ home: string; parked: Parked }>
 
 const planFiles = async (home: string): Promise<string[]> => (await readdir(join(home, PLAN_ID))).sort();
 
+/** Writer epochs of the journal files (`events.<first>.<epoch>.jsonl`). */
+const journalEpochs = async (home: string): Promise<number[]> =>
+  (await planFiles(home))
+    .map((f) => /^events\.\d+\.(\d+)\.jsonl$/.exec(f))
+    .filter((m): m is RegExpExecArray => m !== null)
+    .map((m) => Number(m[1]));
+
 /** Reload as a reader and as the next writer (the dead child's lock is stale by dead pid). */
 async function reloadBoth(home: string, expectedSeq: number): Promise<LedgerV1> {
   const store = createLedgerStore({ home });
   const asReader = await store.read(PLAN_ID);
   expect(asReader.seq).toBe(expectedSeq);
+  const deadEpochs = await journalEpochs(home);
+  expect(deadEpochs.length).toBeGreaterThan(0);
   const writer = await store.takeover(PLAN_ID, holderOf("parent", process.pid, hostname()), "recover after crash");
+  // QA-2.2-2: the takeover writes under a new writer epoch, above every epoch the dead writer left behind.
+  expect(await journalEpochs(home)).toEqual([Math.max(...deadEpochs) + 1]);
   try {
     // Same ledger, plus the journaled lock-takeover event.
     expect(writer.ledger.seq).toBe(expectedSeq + 1);
@@ -117,6 +128,8 @@ async function reloadBoth(home: string, expectedSeq: number): Promise<LedgerV1> 
   } finally {
     await writer.close();
   }
+  // QA-2.2-1: heartbeats live in per-holder beat files; neither the dead writer's nor ours is left after close.
+  expect((await planFiles(home)).filter((f) => f.endsWith(".beat") || f === "writer.lock")).toEqual([]);
   const after = await store.read(PLAN_ID);
   expect(after.seq).toBe(expectedSeq + 1);
   return asReader;
