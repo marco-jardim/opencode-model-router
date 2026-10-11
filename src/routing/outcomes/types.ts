@@ -704,6 +704,57 @@ export interface RefusalRow extends LogRowBase {
 export type LogRow = DecisionRow | VerdictRow | RefusalRow;
 
 // ---------------------------------------------------------------------------
+// Side logs: dispatch timings and orchestrator turns (timings.jsonl, turns.jsonl). Counters and labels only:
+// no prompt, output or tool text is ever stored. They are NOT part of `LogRow` (decisions.jsonl is unchanged).
+// ---------------------------------------------------------------------------
+
+/** Schema version of both side-log rows; a reader skips rows with a greater `v`. */
+export const SIDE_ROW_VERSION = 1;
+
+export type DispatchTimingOutcome = "succeeded" | "failed" | "interrupted" | "unknown";
+export type DispatchCapacity = "rate-limit" | "overload" | "usage-limit";
+
+/** One finished (or abandoned) child dispatch: how long it took and how it ended. */
+export interface DispatchTimingRow {
+  readonly kind: "dispatch-timing";
+  readonly v: typeof SIDE_ROW_VERSION;
+  /** ISO-8601 UTC time the row was written. */
+  readonly ts: string;
+  readonly parentSessionID: string;
+  readonly childSessionID: string;
+  readonly callID: string;
+  readonly role: string;
+  readonly class: string;
+  readonly scope: string;
+  readonly tier: string;
+  readonly model: string;
+  readonly background: boolean;
+  /** Epoch ms. */
+  readonly startedAt: number;
+  /** Epoch ms. */
+  readonly endedAt: number;
+  readonly durationMs: number;
+  readonly outcome: DispatchTimingOutcome;
+  /** Provider capacity condition that ended the dispatch, if any. */
+  readonly capacity: DispatchCapacity | null;
+}
+
+/** Token counters of one orchestrator turn (the steps between two prompt events of a root session). */
+export interface OrchestratorTurnRow {
+  readonly kind: "orchestrator-turn";
+  readonly v: typeof SIDE_ROW_VERSION;
+  /** ISO-8601 UTC time the row was written. */
+  readonly ts: string;
+  readonly sessionID: string;
+  /** 1-based (or as numbered by the writer) turn index within the session. */
+  readonly turn: number;
+  readonly steps: number;
+  readonly input: number;
+  readonly cacheRead: number;
+  readonly cacheWrite: number;
+}
+
+// ---------------------------------------------------------------------------
 // Persistence (persist.ts) — D15, A3
 // ---------------------------------------------------------------------------
 
@@ -725,6 +776,12 @@ export const DECISIONS_ROTATED_RE = /^decisions\.(\d{8}T\d{9}Z)-(\d+)\.jsonl$/;
 /** D15: rotate before the live log would exceed 5 MiB. */
 export const DECISIONS_MAX_BYTES = 5 * 1024 * 1024;
 export const DECISIONS_MAX_GENERATIONS = 3;
+/** Side logs next to `decisions.jsonl`; same append path, size limit and generation count as the decision log. */
+export const TIMINGS_FILE = "timings.jsonl";
+export const TURNS_FILE = "turns.jsonl";
+/** Rotated generations: `timings.<YYYYMMDDTHHMMSSmmmZ>-<pid>.jsonl` / `turns.<...>-<pid>.jsonl`. */
+export const TIMINGS_ROTATED_RE = /^timings\.(\d{8}T\d{9}Z)-(\d+)\.jsonl$/;
+export const TURNS_ROTATED_RE = /^turns\.(\d{8}T\d{9}Z)-(\d+)\.jsonl$/;
 /** D15: at most one flush per 30 s. */
 export const FLUSH_MIN_INTERVAL_MS = 30_000;
 export const FLUSH_BATCH_ROWS = 1_000;
@@ -826,6 +883,28 @@ export interface ReadRowsResult {
   readonly oldestTs: string | null;
   /** Rotated generations that were read (0 = the log never rotated, or its older generations were pruned and none remain). */
   readonly generations: number;
+}
+
+/** Result of reading one side log (`timings.jsonl` or `turns.jsonl`), oldest generation first. */
+export interface ReadSideRowsResult<Row> {
+  readonly rows: Row[];
+  /** Lines that failed JSON parsing or validation (a torn last line after a crash is expected); one warning per read. */
+  readonly skipped: number;
+  /** Rows written by a newer schema (`v` above {@link SIDE_ROW_VERSION}); skipped without a warning. */
+  readonly newer: number;
+  readonly files: string[];
+}
+
+/** Append/read access to `timings.jsonl` and `turns.jsonl` of one outcomes directory. Neither ever throws. */
+export interface SideLogs {
+  readonly dir: string;
+  readonly timingsPath: string;
+  readonly turnsPath: string;
+  /** One append per call; rotates first when the live file would pass `maxBytes`. */
+  appendTimings(rows: readonly DispatchTimingRow[]): Promise<WriteResult>;
+  appendTurns(rows: readonly OrchestratorTurnRow[]): Promise<WriteResult>;
+  readTimings(): Promise<ReadSideRowsResult<DispatchTimingRow>>;
+  readTurns(): Promise<ReadSideRowsResult<OrchestratorTurnRow>>;
 }
 
 /**
