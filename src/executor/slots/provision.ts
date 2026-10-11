@@ -125,6 +125,10 @@ async function detectNode(slot: string, tracked: ReadonlySet<string>, fs: FileSy
   }
   const lockfiles: Array<[string, Manager]> = [["pnpm-lock.yaml", "pnpm"], ["package-lock.json", "npm"], ["yarn.lock", "yarn"]];
   const present = lockfiles.filter(([file]) => tracked.has(file));
+  // A Node manager looks for its project upward from the slot: without a root package.json it could adopt one outside.
+  if (present.length > 0 && pkg === null) {
+    throw fail(`lockfile without package.json at ${slot} (${present.map(([file]) => file).join(", ")}); commit a package.json at the repository root or set executor.provision`);
+  }
   if (present.length === 1) return [present[0]![1]];
   if (present.length > 1) {
     throw fail(`ambiguous lockfiles in ${slot} (${present.map(([file]) => file).join(", ")}); set packageManager or executor.provision`);
@@ -403,10 +407,11 @@ export function planProvision(slot: string, d: Detection, host: ProvisionHost, c
     }
     switch (manager) {
       case "npm":
-        steps.push(step("npm", node().node, [...npmFlags(), "ci", "--prefer-offline", "--no-audit", "--no-fund"], "npm ci"));
+        steps.push(step("npm", node().node, [...npmFlags(), "--prefix", slot, "ci", "--prefer-offline", "--no-audit", "--no-fund"], "npm ci"));
         break;
       case "pnpm": {
-        const args = ["install", "--frozen-lockfile", "--prefer-offline", "--config.confirm-modules-purge=false"];
+        // --dir pins the project to the slot and --ignore-workspace stops pnpm adopting a pnpm-workspace.yaml above it.
+        const args = ["--dir", slot, "install", "--ignore-workspace", "--frozen-lockfile", "--prefer-offline", "--config.confirm-modules-purge=false"];
         const exe = findExecutable("pnpm", host);
         if (exe !== undefined) {
           steps.push(step("pnpm", exe, args, "pnpm install"));
@@ -421,7 +426,9 @@ export function planProvision(slot: string, d: Detection, host: ProvisionHost, c
         break;
       }
       case "yarn": {
-        const args = d.yarnBerry ? ["install", "--immutable"] : ["install", "--frozen-lockfile", "--non-interactive"];
+        // Classic takes --cwd. Berry has no such flag: it runs with cwd=slot and finds its project by the slot's own
+        // yarn.lock (detection requires a lockfile and a package.json there), so it stays inside the slot.
+        const args = d.yarnBerry ? ["install", "--immutable"] : ["--cwd", slot, "install", "--frozen-lockfile", "--non-interactive"];
         let entry: string | undefined;
         if (d.yarnBerry && d.yarnPath !== undefined) {
           const wanted = p.resolve(slot, d.yarnPath);

@@ -121,7 +121,8 @@ export function applySlotEnv(env: NodeJS.ProcessEnv, s: SlotEnv | null, platform
   }
 
   if (s.prependPath.length > 0) {
-    const existing = envLookup(out, "PATH");
+    // POSIX environment names are case-sensitive: only the exact `PATH` is the search path there.
+    const existing = win ? envLookup(out, "PATH") : out["PATH"];
     const keys = named("PATH");
     const key = keys.find((k) => out[k] === existing) ?? keys[0] ?? "PATH";
     for (const other of keys) if (other !== key) delete out[other];

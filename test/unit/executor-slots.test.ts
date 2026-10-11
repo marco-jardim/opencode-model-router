@@ -13,6 +13,89 @@ import { ExecutorError, GIT_ID_PATTERN, type Clock, type ExecutorConfig, type Fi
 // Fakes: file system, clock, git, provisioner
 // ---------------------------------------------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------------------------------------------
+// Slot environment: platform variants, PATH key handling (the registry is process-wide: every test cleans up)
+// ---------------------------------------------------------------------------------------------------------------
+
+describe("slot environment: platform variants", () => {
+  // A lower-case, non-existent root: its registry key and a lower-case cwd compare equal on every platform, so the
+  // POSIX layout can be asked for while running on Windows.
+  const ENV_ROOT = process.platform === "win32" ? "c:\\omr-env-variants\\slot" : "/omr-env-variants/slot";
+  afterEach(() => { unregisterSlot(ENV_ROOT); });
+
+  it("lays out a Python slot with the POSIX venv directory and a Node slot with node_modules/.bin", () => {
+    registerSlot({ root: ENV_ROOT, managers: ["uv", "pnpm"] });
+    const both = slotEnvFor(ENV_ROOT, "linux");
+    expect(both?.root).toBe(ENV_ROOT);
+    expect(both?.set).toEqual({ VIRTUAL_ENV: `${ENV_ROOT}/.venv` });
+    expect(both?.prependPath).toEqual([`${ENV_ROOT}/.venv/bin`, `${ENV_ROOT}/node_modules/.bin`]);
+    expect(both?.unset).toEqual(["PYTHONPATH", "PYTHONHOME", "NODE_PATH", "UV_PROJECT_ENVIRONMENT"]);
+
+    registerSlot({ root: ENV_ROOT, managers: ["npm"] });
+    const node = slotEnvFor(ENV_ROOT, "linux");
+    expect(node?.set).toEqual({});
+    expect(node?.prependPath).toEqual([`${ENV_ROOT}/node_modules/.bin`]);
+
+    registerSlot({ root: ENV_ROOT, managers: [] });
+    expect(slotEnvFor(ENV_ROOT, "linux")).toMatchObject({ set: {}, prependPath: [] });
+  });
+
+  it("uses the Windows layout for the same slot when asked for win32", () => {
+    registerSlot({ root: ENV_ROOT, managers: ["pip"] });
+    const env = slotEnvFor(ENV_ROOT, "win32");
+    expect(env?.prependPath).toEqual([win32.join(ENV_ROOT, ".venv", "Scripts")]);
+    expect(env?.set).toEqual({ VIRTUAL_ENV: win32.join(ENV_ROOT, ".venv") });
+  });
+
+  it("forgets an unregistered slot and ignores one it never knew", () => {
+    registerSlot({ root: ENV_ROOT, managers: ["pip"] });
+    expect(slotEnvFor(ENV_ROOT, "linux")).not.toBeNull();
+    unregisterSlot(ENV_ROOT);
+    unregisterSlot(ENV_ROOT);
+    expect(slotEnvFor(ENV_ROOT, "linux")).toBeNull();
+  });
+
+  it("applySlotEnv returns the very same object without a slot, and leaves PATH alone when nothing is prepended", () => {
+    const env: NodeJS.ProcessEnv = { PATH: "/bin", PYTHONPATH: "/elsewhere" };
+    expect(applySlotEnv(env, null, "linux")).toBe(env);
+    const out = applySlotEnv(env, { root: "/s", set: {}, prependPath: [], unset: ["PYTHONPATH"] }, "linux");
+    expect(out).not.toBe(env);
+    expect(out).toEqual({ PATH: "/bin" });
+    expect(env["PYTHONPATH"]).toBe("/elsewhere");
+  });
+
+  it("applySlotEnv on POSIX is case-sensitive and joins PATH with a colon", () => {
+    const env: NodeJS.ProcessEnv = { PATH: "/usr/bin", pythonpath: "keep", PYTHONPATH: "drop", virtual_env: "keep" };
+    const out = applySlotEnv(env, { root: "/s", set: { VIRTUAL_ENV: "/s/.venv" }, prependPath: ["/s/.venv/bin", "/s/node_modules/.bin"], unset: ["PYTHONPATH"] }, "linux");
+    expect(out).toEqual({ PATH: "/s/.venv/bin:/s/node_modules/.bin:/usr/bin", pythonpath: "keep", virtual_env: "keep", VIRTUAL_ENV: "/s/.venv" });
+  });
+
+  // POSIX names are case-sensitive: a `Path` variable that precedes `PATH` is left alone and never read as the search path.
+  it("D1: applySlotEnv on POSIX prepends to the PATH variable, not to a differently-cased Path", () => {
+    const env: NodeJS.ProcessEnv = { Path: "keep", PATH: "/usr/bin" };
+    const out = applySlotEnv(env, { root: "/s", set: {}, prependPath: ["/s/node_modules/.bin"], unset: [] }, "linux");
+    expect(out).toEqual({ Path: "keep", PATH: "/s/node_modules/.bin:/usr/bin" });
+  });
+
+  it("applySlotEnv on win32 matches names case-insensitively and keeps a single PATH key", () => {
+    const env: NodeJS.ProcessEnv = { pythonpath: "drop", Virtual_Env: "old", Path: "C:\\Windows", PATH: "C:\\Windows", Other: "x" };
+    const out = applySlotEnv(env, { root: "C:\\s", set: { VIRTUAL_ENV: "C:\\s\\.venv" }, prependPath: ["C:\\s\\.venv\\Scripts"], unset: ["PYTHONPATH"] }, "win32");
+    expect(Object.keys(out).filter(k => k.toLowerCase() === "path")).toHaveLength(1);
+    expect(Object.entries(out).find(([k]) => k.toLowerCase() === "path")?.[1]).toBe("C:\\s\\.venv\\Scripts;C:\\Windows");
+    expect(out["VIRTUAL_ENV"]).toBe("C:\\s\\.venv");
+    expect(Object.keys(out).filter(k => k.toLowerCase() === "virtual_env")).toEqual(["VIRTUAL_ENV"]);
+    expect(Object.keys(out).filter(k => k.toLowerCase() === "pythonpath")).toEqual([]);
+    expect(out["Other"]).toBe("x");
+  });
+
+  it("applySlotEnv creates PATH when there is none, and ignores an empty one", () => {
+    const slot = { root: "/s", set: {}, prependPath: ["/s/node_modules/.bin"], unset: [] };
+    expect(applySlotEnv({}, slot, "linux")).toEqual({ PATH: "/s/node_modules/.bin" });
+    expect(applySlotEnv({ PATH: "" }, slot, "linux")).toEqual({ PATH: "/s/node_modules/.bin" });
+    expect(applySlotEnv({ Path: "" }, { ...slot, prependPath: ["C:\\s\\node_modules\\.bin"] }, "win32")).toEqual({ Path: "C:\\s\\node_modules\\.bin" });
+  });
+});
+
 const PLAN = "p-20261010-abc123";
 const TOP = "D:\\repo\\main";
 const HOME = "D:\\omr-home";
@@ -660,6 +743,29 @@ function seeded(recs: SlotRecord[], dirs: string[] = []): Harness {
   return harness({ fs });
 }
 
+describe("SlotPool claims that meet a changed slot", () => {
+  it("a slot released to ready between the claim and the work is claimed again for the same owner", async () => {
+    const h = seeded([record("slot-1", { state: "ready", owner: "t1", commit: C1, managers: ["pip"] })], [slotPath("slot-1")]);
+    await h.pool.open();
+    const lease = await h.pool.acquire(PLAN, "t1", C3);
+    expect(lease).toMatchObject({ slot: "slot-1", owner: "t1", commit: C3 });
+    // The seeded record carries no manifest digests, so the reset also finds drift and provisions again.
+    expect(h.states("slot-1")).toEqual(["resetting", "provisioning", "leased"]);
+    expect(h.git.log).toEqual([`checkout ${key(slotPath("slot-1"))} 33`, `clean ${key(slotPath("slot-1"))}`]);
+    expect(h.marker("slot-1")).toMatchObject({ state: "leased", owner: "t1", commit: C3 });
+  });
+
+  it("a slot that is broken when the work starts is reported as broken, not leased", async () => {
+    const h = seeded([record("slot-1", { state: "broken", owner: "t1", managers: ["pip"] })], [slotPath("slot-1")]);
+    await h.pool.open();
+    await expect(h.pool.acquire(PLAN, "t1", C1)).rejects.toMatchObject({ code: "E_SLOT_BROKEN", message: expect.stringContaining("slot-1 is broken") });
+    expect(h.marker("slot-1").state).toBe("broken");
+    expect(h.prov.calls).toHaveLength(0);
+    expect(h.git.log).toEqual([]);
+    expect(slotEnvFor(slotPath("slot-1"), "win32")).toBeNull();
+  });
+});
+
 describe("SlotPool repair", () => {
   it("creating, directory missing: adds the worktree again and provisions fresh", async () => {
     const h = seeded([record("slot-1", { state: "creating" })]);
@@ -1121,6 +1227,35 @@ describe("slot name, marker path, lock reason and safe dir", () => {
 // ---------------------------------------------------------------------------------------------------------------
 // slotEnvFor, applySlotEnv and the verify/exec merge (real directories, real child processes)
 // ---------------------------------------------------------------------------------------------------------------
+
+describe("SlotPool check-cleanup failures", () => {
+  it.each([
+    ["git clean", "cleanForChecks", new ExecutorError("E_GIT", "clean failed", { op: "clean", code: 1, stderr: "" })],
+    ["pointer verification", "verifySlotPointers", new ExecutorError("E_SLOT_BROKEN", "slot .git is missing", {})],
+  ] as Array<[string, string, ExecutorError]>)("a failing %s is reported as E_SLOT_BROKEN and leaves the leased slot with its owner", async (_name, op, error) => {
+    const h = harness();
+    await h.pool.open();
+    await h.pool.acquire(PLAN, "task-1", C1);
+    h.git.fail.set(op, { error, times: 1 });
+    await expect(h.pool.cleanForChecks("slot-1")).rejects.toMatchObject({ code: "E_SLOT_BROKEN" });
+    // Only the stage states (creating, provisioning, resetting) break a slot; a lease stays with its owner.
+    expect(h.marker("slot-1")).toMatchObject({ state: "leased", owner: "task-1" });
+    expect(slotEnvFor(slotPath("slot-1"), "win32")).not.toBeNull();
+    await h.pool.cleanForChecks("slot-1");
+    // The failed attempt never reached the git clean log line (it threw first); the retry did.
+    expect(h.git.log.filter(l => l.startsWith("cleanForChecks"))).toHaveLength(1);
+  });
+
+  it("keeps the original error message of a non-ExecutorError failure in the wrapped error", async () => {
+    const h = harness();
+    await h.pool.open();
+    await h.pool.acquire(PLAN, "task-1", C1);
+    h.git.fail.set("cleanForChecks", { error: Object.assign(new Error("disk on fire"), { code: "EIO" }), times: 1 });
+    await expect(h.pool.cleanForChecks("slot-1")).rejects.toMatchObject({
+      code: "E_SLOT_BROKEN", message: expect.stringContaining("slot slot-1: disk on fire"),
+    });
+  });
+});
 
 describe("slot environment", () => {
   const WIN = process.platform === "win32";

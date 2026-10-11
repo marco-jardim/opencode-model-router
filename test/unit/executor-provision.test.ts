@@ -7,6 +7,7 @@ import {
   createProvisioner, detectManagers, managerLockPath, needsProvision, planProvision, PROVISION_MANIFESTS,
   type Detection, type ProvisionHost,
 } from "../../src/executor/slots/provision";
+import { CLEANUP_RETRIES, CLEANUP_RETRY_BASE_MS, TRANSIENT_FS_CODES } from "../../src/verify/reference";
 import type { Clock, ExecutorConfig, FileSystem, FsStat, ProcessResult, ProcOpts, Spawner } from "../../src/executor/types";
 
 type Cfg = Pick<ExecutorConfig, "provision" | "python">;
@@ -205,6 +206,16 @@ describe("detectManagers: node", () => {
     await expect(detect({ "package.json": "{ nope" })).rejects.toMatchObject({ code: "E_PROVISION" });
   });
 
+  it.each(["package-lock.json", "pnpm-lock.yaml", "yarn.lock"])(
+    "%s without a package.json at the slot root is E_PROVISION, never a project found above the slot", async (lock) => {
+      await expect(detect({ [lock]: "lock" })).rejects.toMatchObject({
+        code: "E_PROVISION", message: expect.stringContaining(`lockfile without package.json at ${SLOT}`),
+      });
+      // A package.json that is not tracked at the root (only in a subdirectory) does not count.
+      await expect(detect({ [lock]: "lock", "sub/package.json": PKG })).rejects.toThrow(/lockfile without package.json/);
+      await expect(detect({ [lock]: "lock", "package.json": PKG })).resolves.toMatchObject({ managers: expect.any(Array) });
+    });
+
   it("reads package.json only when it is tracked", async () => {
     await expect(detect({ "package.json": PKG_DEPS }, [])).resolves.toMatchObject({ managers: [] });
   });
@@ -359,7 +370,9 @@ describe("planProvision", () => {
     expect(rest).toHaveLength(0);
     expect(step).toMatchObject({ manager: "pnpm", cwd: SLOT, label: "pnpm install" });
     expect(step?.command).toBe(join(bin, exe("pnpm")));
-    expect(step?.args).toEqual(["install", "--frozen-lockfile", "--prefer-offline", "--config.confirm-modules-purge=false"]);
+    // The project is the slot, never a pnpm workspace above it (a pnpm-workspace.yaml in an ancestor, e.g. the home directory).
+    expect(step?.args).toEqual(["--dir", SLOT, "install", "--ignore-workspace", "--frozen-lockfile", "--prefer-offline",
+      "--config.confirm-modules-purge=false"]);
     const env = Object.fromEntries(Object.entries(step?.env ?? {}).map(([k, v]) => [k.toUpperCase(), v]));
     expect(env["CI"]).toBe("1");
     expect(env["PIP_NO_INPUT"]).toBe("1");
@@ -472,6 +485,194 @@ describe("planProvision", () => {
     it("accept an absolute executable", () => {
       expect(plan([join(bin, exe("pytool")), "go"])[0]).toMatchObject({ command: join(bin, exe("pytool")), args: ["go"] });
     });
+
+    it("refuse an absolute executable that does not exist and a script that needs a shell", () => {
+      expect(() => plan([join(bin, exe("ghost"))])).toThrow(/was not found as an executable outside the work root/);
+      expect(() => plan(["setup.ps1"])).toThrow(/needs a shell/);
+      expect(() => plan(["C:\\tools\\fetch.CMD"])).toThrow(/needs a shell/);
+    });
+
+    it("resolve `python` through the launcher when executor.python is auto, or the configured bare name", () => {
+      const auto = planProvision(SLOT, det(["pip"]), hostWith(bin), { provision: { pip: [["python", "-V"]] }, python: "auto" })[0];
+      expect(auto?.command).toBe(join(bin, WIN ? "py.exe" : "python3"));
+      expect(auto?.args).toEqual(WIN ? ["-3", "-V"] : ["-V"]);
+      const named = planProvision(SLOT, det(["pip"]), hostWith(bin), { provision: { pip: [["python", "-V"]] }, python: "pytool" })[0];
+      expect(named).toMatchObject({ command: join(bin, exe("pytool")), args: ["-V"] });
+      expect(() => planProvision(SLOT, det(["pip"]), hostWith(bin), { provision: { pip: [["python", "-V"]] }, python: "no-such-python" }))
+        .toThrow(/executor\.python "no-such-python" was not found as an absolute file or an executable on PATH/);
+    });
+  });
+
+  it("passes executor.python to uv even when the detection carries none", () => {
+    const python = join(bin, exe("pytool"));
+    const [step] = planProvision(SLOT, det(["uv"]), hostWith(bin), { provision: "auto", python });
+    expect(step?.args).toEqual(["sync", "--frozen", "--python", python]);
+  });
+
+  it("plans pip with only the requirement files that exist and no editable install", () => {
+    const only = planProvision(SLOT, det(["pip"], { manifests: { "requirements-dev.txt": "h" } }), hostWith(bin), AUTO);
+    expect(only.map(s => s.label)).toEqual(["pip venv", "pip install"]);
+    expect(only[1]?.args.slice(-2)).toEqual(["-r", "requirements-dev.txt"]);
+    expect(only[1]?.args).not.toContain("requirements.txt");
+    expect(planProvision(SLOT, det(["pip"]), hostWith(bin), AUTO).map(s => s.label)).toEqual(["pip venv"]);
+  });
+
+  it("finds tools on a PATH written as Path with quoted and relative entries", () => {
+    const env: NodeJS.ProcessEnv = {};
+    for (const [k, v] of Object.entries(process.env)) if (k.toLowerCase() !== "path") env[k] = v;
+    env[WIN ? "Path" : "PATH"] = [`"${bin}"`, "relative-dir", "", ...(WIN ? [] : ["/usr/bin", "/bin"])].join(delimiter);
+    const host: ProvisionHost = { env, platform: process.platform, nodeExecPath: process.execPath, guards: [] };
+    expect(planProvision(SLOT, det(["uv"]), host, AUTO)[0]?.command).toBe(join(bin, exe("uv")));
+  });
+
+  it.skipIf(!WIN)("replaces inherited variables of the fixed environment whatever their case", () => {
+    const [step] = planProvision(SLOT, det(["poetry"]), hostWith(bin, { ci: "0", Pip_No_Input: "0", poetry_virtualenvs_in_project: "false" }), AUTO);
+    const keys = Object.keys(step?.env ?? {});
+    for (const name of ["CI", "PIP_NO_INPUT", "POETRY_VIRTUALENVS_IN_PROJECT"]) {
+      expect(keys.filter(k => k.toUpperCase() === name)).toEqual([name]);
+    }
+    expect(step?.env["CI"]).toBe("1");
+    expect(step?.env["POETRY_VIRTUALENVS_IN_PROJECT"]).toBe("true");
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// planProvision for the node managers, against a stand-in node install
+// ---------------------------------------------------------------------------------------------------------------
+
+describe("planProvision: node package managers", () => {
+  let root = "";
+  let withCorepack = "";
+  let bareNode = "";
+  let emptyBin = "";
+  let yarnBin = "";
+  let slotDir = "";
+  let pnpmBin = "";
+  const exe = (name: string): string => (WIN ? `${name}.exe` : name);
+  const touch = (path: string): void => {
+    mkdirSync(join(path, ".."), { recursive: true });
+    writeFileSync(path, "");
+  };
+
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), "omr-prov-node-"));
+    withCorepack = join(root, "node-a", exe("node"));
+    bareNode = join(root, "node-b", exe("node"));
+    emptyBin = join(root, "empty");
+    yarnBin = join(root, "yarn-bin");
+    pnpmBin = join(root, "pnpm-bin");
+    slotDir = join(root, "slot");
+    mkdirSync(emptyBin);
+    touch(withCorepack);
+    touch(join(root, "node-a", "node_modules", "corepack", "dist", "pnpm.js"));
+    touch(join(root, "node-a", "node_modules", "corepack", "dist", "yarn.js"));
+    touch(bareNode);
+    touch(join(yarnBin, WIN ? "yarn.cmd" : "yarn"));
+    touch(join(yarnBin, "node_modules", "yarn", "bin", "yarn.js"));
+    touch(join(pnpmBin, "pnpm.cmd"));
+    touch(join(pnpmBin, "node_modules", "pnpm", "bin", "pnpm.cjs"));
+    touch(join(slotDir, ".yarn", "releases", "yarn-4.0.0.cjs"));
+  });
+  afterAll(() => { rmSync(root, { recursive: true, force: true }); });
+
+  function hostWith(dir: string, nodeExecPath: string | undefined): ProvisionHost {
+    const env: NodeJS.ProcessEnv = {};
+    for (const [k, v] of Object.entries(process.env)) if (k.toLowerCase() !== "path") env[k] = v;
+    env.PATH = [dir, ...(WIN ? [] : ["/usr/bin", "/bin"])].join(delimiter);
+    return { env, platform: process.platform, nodeExecPath, guards: [] };
+  }
+
+  const det = (managers: Detection["managers"], more: Partial<Detection> = {}): Detection => ({
+    managers, yarnBerry: false, editable: false, manifests: {}, python: null, ...more,
+  });
+
+  it("plans npm ci through the node install's npm-cli.js with hardening flags", () => {
+    const [step, ...rest] = planProvision(SLOT, det(["npm"]), hostWith(emptyBin, process.execPath), AUTO);
+    expect(rest).toHaveLength(0);
+    expect(step).toMatchObject({ manager: "npm", label: "npm ci", command: process.execPath, cwd: SLOT });
+    expect(step?.args.at(0)).toMatch(/npm-cli\.js$/);
+    expect(step?.args.slice(-6)).toEqual(["--prefix", SLOT, "ci", "--prefer-offline", "--no-audit", "--no-fund"]);
+    expect(step?.args.indexOf("--prefix")).toBeLessThan(step?.args.indexOf("ci") ?? -1);
+    expect(step?.args).not.toContain("--workspaces=false");
+  });
+
+  it("runs an `npm` override through npm-cli.js too", () => {
+    const [step] = planProvision(SLOT, det(["npm"]), hostWith(emptyBin, process.execPath),
+      { provision: { npm: [["npm", "rebuild", "esbuild"]] }, python: "auto" });
+    expect(step?.label).toBe("npm override 1");
+    expect(step?.command).toBe(process.execPath);
+    expect(step?.args.at(0)).toMatch(/npm-cli\.js$/);
+    expect(step?.args.slice(-2)).toEqual(["rebuild", "esbuild"]);
+  });
+
+  it("plans npm as E_PROVISION when the node install has no npm-cli.js", () => {
+    expect(() => planProvision(SLOT, det(["npm"]), hostWith(emptyBin, bareNode), AUTO)).toThrow(/npm-cli\.js: npm-cli\.js not found/);
+  });
+
+  it("plans pnpm through corepack's pnpm.js when no pnpm executable is on PATH", () => {
+    const [step] = planProvision(SLOT, det(["pnpm"]), hostWith(emptyBin, withCorepack), AUTO);
+    expect(step).toMatchObject({ manager: "pnpm", command: withCorepack, label: "pnpm install" });
+    expect(step?.args).toEqual([join(root, "node-a", "node_modules", "corepack", "dist", "pnpm.js"),
+      "--dir", SLOT, "install", "--ignore-workspace", "--frozen-lockfile", "--prefer-offline", "--config.confirm-modules-purge=false"]);
+  });
+
+  it.skipIf(!WIN)("plans pnpm through pnpm.cjs beside a pnpm.cmd launcher", () => {
+    const [step] = planProvision(SLOT, det(["pnpm"]), hostWith(pnpmBin, withCorepack), AUTO);
+    expect(step?.command).toBe(withCorepack);
+    expect(step?.args[0]).toBe(join(pnpmBin, "node_modules", "pnpm", "bin", "pnpm.cjs"));
+  });
+
+  it("refuses pnpm that is neither on PATH nor in corepack", () => {
+    const attempt = (): unknown => planProvision(SLOT, det(["pnpm"]), hostWith(emptyBin, bareNode), AUTO);
+    expect(attempt).toThrow(/pnpm was not found/);
+    try {
+      attempt();
+    } catch (error) {
+      expect(error).toMatchObject({ code: "E_PROVISION" });
+    }
+  });
+
+  it("plans yarn classic through yarn.js beside the launcher, then through corepack", () => {
+    const beside = planProvision(SLOT, det(["yarn"]), hostWith(yarnBin, withCorepack), AUTO)[0];
+    expect(beside).toMatchObject({ manager: "yarn", command: withCorepack, label: "yarn install" });
+    expect(beside?.args).toEqual([join(yarnBin, "node_modules", "yarn", "bin", "yarn.js"),
+      "--cwd", SLOT, "install", "--frozen-lockfile", "--non-interactive"]);
+    const viaCorepack = planProvision(SLOT, det(["yarn"]), hostWith(emptyBin, withCorepack), AUTO)[0];
+    expect(viaCorepack?.args[0]).toBe(join(root, "node-a", "node_modules", "corepack", "dist", "yarn.js"));
+  });
+
+  it("plans yarn berry with the committed yarnPath, or corepack when none is named", () => {
+    const named = planProvision(slotDir, det(["yarn"], { yarnBerry: true, yarnPath: ".yarn/releases/yarn-4.0.0.cjs" }), hostWith(emptyBin, withCorepack), AUTO)[0];
+    expect(named?.args).toEqual([join(slotDir, ".yarn", "releases", "yarn-4.0.0.cjs"), "install", "--immutable"]);
+    expect(named?.cwd).toBe(slotDir);
+    const unnamed = planProvision(slotDir, det(["yarn"], { yarnBerry: true }), hostWith(yarnBin, withCorepack), AUTO)[0];
+    expect(unnamed?.args).toEqual([join(root, "node-a", "node_modules", "corepack", "dist", "yarn.js"), "install", "--immutable"]);
+  });
+
+  it.each([
+    ["a yarnPath that does not exist", ".yarn/releases/missing.cjs"],
+    ["a yarnPath outside the slot", "../outside.cjs"],
+  ])("refuses %s", (_name, yarnPath) => {
+    expect(() => planProvision(slotDir, det(["yarn"], { yarnBerry: true, yarnPath }), hostWith(emptyBin, withCorepack), AUTO))
+      .toThrow(/is missing or outside/);
+  });
+
+  it("refuses yarn that is neither beside a launcher nor in corepack", () => {
+    expect(() => planProvision(SLOT, det(["yarn"]), hostWith(emptyBin, bareNode), AUTO)).toThrow(/yarn was not found/);
+    expect(() => planProvision(slotDir, det(["yarn"], { yarnBerry: true }), hostWith(emptyBin, bareNode), AUTO)).toThrow(/yarn was not found/);
+  });
+
+  it("reports an unusable node executable as E_PROVISION", () => {
+    const missing = join(root, "nowhere", exe("node"));
+    expect(() => planProvision(SLOT, det(["yarn"]), hostWith(yarnBin, missing), AUTO)).toThrow(/node executable: .*not an absolute path to a file/);
+    expect(() => planProvision(SLOT, det(["npm"]), hostWith(yarnBin, missing), AUTO)).toThrow(/node executable/);
+    const guarded = { ...hostWith(yarnBin, withCorepack), guards: [join(root, "node-a")] };
+    expect(() => planProvision(SLOT, det(["yarn"]), guarded, AUTO)).toThrow(/inside the work root/);
+  });
+
+  it("runs a `node` override with the resolved node and the slot as cwd", () => {
+    const [step] = planProvision(SLOT, det(["pnpm"]), hostWith(emptyBin, withCorepack), { provision: { pnpm: [["node", "scripts/x.js"]] }, python: "auto" });
+    expect(step).toMatchObject({ command: withCorepack, args: ["scripts/x.js"], cwd: SLOT, label: "pnpm override 1" });
   });
 });
 
@@ -803,5 +1004,328 @@ describe("createProvisioner", () => {
     const provisioner = createProvisioner({ spawner, fs, clock: fakeClock(), host: h, config: AUTO });
     await expect(provisioner.provision(slot(1), detection(["uv"]), { fresh: false })).rejects.toMatchObject({ code: "E_PROVISION" });
     expect(fs.nodes.size).toBe(0);
+  });
+
+  // -------------------------------------------------------------------------------------------------------------
+  // Lock takeover races, release failures, aborts, heartbeat failures
+  // -------------------------------------------------------------------------------------------------------------
+
+  const STALE_LOCK = JSON.stringify({ pid: 1, hostname: "other", startedAt: 0, heartbeatAt: 0 });
+  const liveLock = (clock: Clock, pid = 9): string => {
+    const now = clock.now();
+    return JSON.stringify({ pid, hostname: "other", startedAt: now, heartbeatAt: now });
+  };
+  const outcomeOf = (run: Promise<void>): Promise<unknown> => run.then(() => null, (e: unknown) => e);
+
+  it("treats a stale lock that vanishes before it can be moved aside as taken over", async () => {
+    const { spawner, provisioner, clock, fs, lock } = setup();
+    fs.put(lock("uv"), STALE_LOCK);
+    const realRename = fs.rename.bind(fs);
+    let renames = 0;
+    fs.rename = async (a, b) => {
+      renames += 1;
+      if (renames === 1) fs.nodes.delete(key(a));
+      await realRename(a, b);
+    };
+    const done = provisioner.provision(slot(1), detection(["uv"]), { fresh: false });
+    await settle();
+    clock.advance(1_000);
+    await settle();
+    expect(renames).toBe(1);
+    expect(spawner.calls).toHaveLength(1);
+    spawner.calls[0]?.resolve();
+    await done;
+    expect(fs.nodes.has(key(lock("uv")))).toBe(false);
+  });
+
+  it("surfaces a failure to move a stale lock aside and frees the in-process queue", async () => {
+    const { spawner, provisioner, clock, fs, lock } = setup();
+    fs.put(lock("uv"), STALE_LOCK);
+    const realRename = fs.rename.bind(fs);
+    fs.rename = async () => { throw errno("EIO", "rename"); };
+    const failed = outcomeOf(provisioner.provision(slot(1), detection(["uv"]), { fresh: false }));
+    await settle();
+    clock.advance(1_000);
+    await settle();
+    expect(await failed).toMatchObject({ code: "EIO" });
+    expect(spawner.calls).toHaveLength(0);
+    fs.rename = realRename;
+    const next = provisioner.provision(slot(2), detection(["uv"]), { fresh: false });
+    await settle();
+    clock.advance(1_000);
+    await settle();
+    expect(spawner.calls).toHaveLength(1);
+    expect(spawner.calls[0]?.opts.cwd).toBe(slot(2));
+    spawner.calls[0]?.resolve();
+    await next;
+  });
+
+  it.each([[false], [true]])("puts back a lock its owner refreshed while it was being moved aside (a newer lock exists: %s)", async (newerExists) => {
+    const { spawner, provisioner, clock, fs, lock } = setup();
+    fs.put(lock("uv"), STALE_LOCK);
+    let refreshed = "";
+    let newer = "";
+    const realRename = fs.rename.bind(fs);
+    let moved = false;
+    fs.rename = async (a, b) => {
+      if (!moved && key(a) === key(lock("uv"))) {
+        moved = true;
+        refreshed = liveLock(clock, 9);
+        newer = liveLock(clock, 10);
+        fs.put(a, refreshed);
+        await realRename(a, b);
+        if (newerExists) fs.put(a, newer);
+        return;
+      }
+      await realRename(a, b);
+    };
+    const done = provisioner.provision(slot(1), detection(["uv"]), { fresh: false });
+    await settle();
+    clock.advance(1_000);
+    await settle();
+    expect(moved).toBe(true);
+    expect(spawner.calls).toHaveLength(0);
+    expect(await fs.readText(lock("uv"))).toBe(newerExists ? newer : refreshed);
+    expect([...fs.nodes.keys()].some(k => k.endsWith(".stale"))).toBe(false);
+    fs.nodes.delete(key(lock("uv")));
+    clock.advance(500);
+    await settle();
+    expect(spawner.calls).toHaveLength(1);
+    spawner.calls[0]?.resolve();
+    await done;
+  });
+
+  it("surfaces a failure to put a refreshed lock back", async () => {
+    const { spawner, provisioner, clock, fs, lock } = setup();
+    fs.put(lock("uv"), STALE_LOCK);
+    const realRename = fs.rename.bind(fs);
+    const realWrite = fs.writeText.bind(fs);
+    let moved = false;
+    fs.rename = async (a, b) => {
+      if (!moved && key(a) === key(lock("uv"))) {
+        moved = true;
+        fs.put(a, liveLock(clock));
+      }
+      await realRename(a, b);
+    };
+    fs.writeText = async (p, data, o) => {
+      if (moved && o?.exclusive === true && key(p) === key(lock("uv"))) throw errno("EIO", p);
+      await realWrite(p, data, o);
+    };
+    const failed = outcomeOf(provisioner.provision(slot(1), detection(["uv"]), { fresh: false }));
+    await settle();
+    clock.advance(1_000);
+    await settle();
+    expect(await failed).toMatchObject({ code: "EIO" });
+    expect(spawner.calls).toHaveLength(0);
+  });
+
+  it("does not take over a lock that changed during the staleness recheck", async () => {
+    const { spawner, provisioner, clock, fs, lock } = setup();
+    fs.put(lock("uv"), STALE_LOCK);
+    const done = provisioner.provision(slot(1), detection(["uv"]), { fresh: false });
+    await settle();
+    fs.put(lock("uv"), liveLock(clock));
+    clock.advance(1_000);
+    await settle();
+    expect(spawner.calls).toHaveLength(0);
+    expect([...fs.nodes.keys()].some(k => k.endsWith(".stale"))).toBe(false);
+    fs.nodes.delete(key(lock("uv")));
+    clock.advance(500);
+    await settle();
+    expect(spawner.calls).toHaveLength(1);
+    spawner.calls[0]?.resolve();
+    await done;
+  });
+
+  it("goes on at once when a stale lock disappears during the recheck", async () => {
+    const { spawner, provisioner, clock, fs, lock } = setup();
+    fs.put(lock("uv"), STALE_LOCK);
+    const done = provisioner.provision(slot(1), detection(["uv"]), { fresh: false });
+    await settle();
+    fs.nodes.delete(key(lock("uv")));
+    clock.advance(1_000);
+    await settle();
+    expect(spawner.calls).toHaveLength(1);
+    spawner.calls[0]?.resolve();
+    await done;
+  });
+
+  it("surfaces a lock that cannot be read", async () => {
+    const { spawner, provisioner, fs, lock } = setup();
+    fs.put(lock("uv"), liveLock(fakeClock()));
+    const realRead = fs.readText.bind(fs);
+    fs.readText = async (p) => {
+      if (key(p) === key(lock("uv"))) throw errno("EIO", p);
+      return realRead(p);
+    };
+    await expect(provisioner.provision(slot(1), detection(["uv"]), { fresh: false })).rejects.toMatchObject({ code: "EIO" });
+    expect(spawner.calls).toHaveLength(0);
+  });
+
+  it("creates the lock directory chain, tolerating a concurrent mkdir and refusing other errors", async () => {
+    const racy = setup();
+    racy.spawner.hold = false;
+    const realMkdir = racy.fs.mkdir.bind(racy.fs);
+    let raced = false;
+    racy.fs.mkdir = async (p) => {
+      if (!raced) {
+        raced = true;
+        await realMkdir(p);
+        throw errno("EEXIST", p);
+      }
+      await realMkdir(p);
+    };
+    await racy.provisioner.provision(slot(1), detection(["uv"]), { fresh: false });
+    expect(raced).toBe(true);
+    expect(racy.spawner.calls).toHaveLength(1);
+    const denied = setup();
+    denied.fs.mkdir = async (p) => { throw errno("EACCES", p); };
+    await expect(denied.provisioner.provision(slot(1), detection(["uv"]), { fresh: false })).rejects.toMatchObject({ code: "EACCES" });
+    expect(denied.spawner.calls).toHaveLength(0);
+  });
+
+  it("reports an install lock that cannot be released, but the step's own failure wins", async () => {
+    const stuck = setup();
+    stuck.spawner.hold = false;
+    const realRm = stuck.fs.rm.bind(stuck.fs);
+    stuck.fs.rm = async (p, o) => {
+      if (key(p) === key(stuck.lock("uv"))) throw errno("EIO", p);
+      await realRm(p, o);
+    };
+    const released = await outcomeOf(stuck.provisioner.provision(slot(1), detection(["uv"]), { fresh: false }));
+    expect(released).toMatchObject({ code: "E_PROVISION", message: expect.stringContaining("could not release the uv install lock") });
+    expect((released as Error).message).toContain("EIO");
+
+    const both = setup();
+    both.spawner.hold = false;
+    both.spawner.reply = () => ({ code: 3, stderr: "boom" });
+    const realRm2 = both.fs.rm.bind(both.fs);
+    both.fs.rm = async (p, o) => {
+      if (key(p) === key(both.lock("uv"))) throw errno("EIO", p);
+      await realRm2(p, o);
+    };
+    const failed = await outcomeOf(both.provisioner.provision(slot(1), detection(["uv"]), { fresh: false }));
+    expect((failed as Error).message).toContain("uv sync failed");
+    expect((failed as Error).message).not.toContain("release");
+  });
+
+  it("retries a transient failure to remove the lock with a growing delay, then gives up", async () => {
+    const transient = [...TRANSIENT_FS_CODES][0] ?? "EBUSY";
+    const drive = async (failures: number) => {
+      const s = setup();
+      s.spawner.hold = false;
+      const realRm = s.fs.rm.bind(s.fs);
+      let attempts = 0;
+      s.fs.rm = async (p, o) => {
+        if (key(p) === key(s.lock("uv"))) {
+          attempts += 1;
+          if (attempts <= failures) throw errno(transient, p);
+        }
+        await realRm(p, o);
+      };
+      const outcome = outcomeOf(s.provisioner.provision(slot(1), detection(["uv"]), { fresh: false }));
+      for (let i = 0; i < CLEANUP_RETRIES + 2; i++) {
+        await settle();
+        s.clock.advance(CLEANUP_RETRY_BASE_MS * 2 ** CLEANUP_RETRIES);
+      }
+      return { result: await outcome, attempts, s };
+    };
+    const recovered = await drive(2);
+    expect(recovered.result).toBeNull();
+    expect(recovered.attempts).toBe(3);
+    expect(recovered.s.fs.nodes.has(key(recovered.s.lock("uv")))).toBe(false);
+    const hopeless = await drive(Number.MAX_SAFE_INTEGER);
+    expect(hopeless.result).toMatchObject({ code: "E_PROVISION", message: expect.stringContaining("could not release") });
+    expect(hopeless.attempts).toBe(CLEANUP_RETRIES + 1);
+  });
+
+  it("stops waiting for a held lock when the signal aborts", async () => {
+    const { spawner, provisioner, clock, fs, lock } = setup();
+    fs.put(lock("uv"), liveLock(clock));
+    const ac = new AbortController();
+    const outcome = outcomeOf(provisioner.provision(slot(1), detection(["uv"]), { fresh: false, signal: ac.signal }));
+    await settle();
+    ac.abort();
+    await settle();
+    expect(await outcome).toMatchObject({ code: "E_PROVISION", message: expect.stringContaining("was aborted") });
+    expect(spawner.calls).toHaveLength(0);
+    expect(clock.pending()).toBe(0);
+  });
+
+  it("does not start the next step of a slot once the signal aborted", async () => {
+    const python = join(bin, exe("pytool"));
+    const { spawner, provisioner, fs, lock } = setup({ provision: "auto", python });
+    const ac = new AbortController();
+    const d = detection(["pip"], { python, manifests: { "requirements.txt": "h" } });
+    const outcome = outcomeOf(provisioner.provision(slot(1), d, { fresh: false, signal: ac.signal }));
+    await settle();
+    expect(spawner.calls).toHaveLength(1);
+    ac.abort();
+    spawner.calls[0]?.resolve();
+    expect(await outcome).toMatchObject({ code: "E_PROVISION", message: expect.stringContaining("was aborted") });
+    expect(spawner.calls).toHaveLength(1);
+    expect(fs.nodes.has(key(lock("pip")))).toBe(false);
+  });
+
+  it("survives a failed heartbeat write and beats again on the next interval", async () => {
+    const { spawner, provisioner, clock, fs, lock } = setup();
+    const realRename = fs.rename.bind(fs);
+    let renames = 0;
+    fs.rename = async (a, b) => {
+      renames += 1;
+      if (renames === 1) throw errno("EIO", a);
+      await realRename(a, b);
+    };
+    const done = provisioner.provision(slot(1), detection(["uv"]), { fresh: false });
+    await settle();
+    const first = await fs.readText(lock("uv"));
+    clock.advance(10_000);
+    await settle();
+    expect(await fs.readText(lock("uv"))).toBe(first);
+    clock.advance(10_000);
+    await settle();
+    expect(JSON.parse(await fs.readText(lock("uv"))).heartbeatAt).toBeGreaterThan(JSON.parse(first).heartbeatAt);
+    spawner.calls[0]?.resolve();
+    await done;
+    expect(renames).toBe(2);
+  });
+
+  it("keeps only the last twelve lines of a failed step and names an unknown signal", async () => {
+    const lines = Array.from({ length: 20 }, (_v, i) => `L${String(i + 1).padStart(2, "0")}`);
+    const long = setup();
+    long.spawner.hold = false;
+    long.spawner.reply = () => ({ code: 1, stderr: lines.join("\r\n") });
+    const message = ((await outcomeOf(long.provisioner.provision(slot(1), detection(["uv"]), { fresh: false }))) as Error).message;
+    expect(message).toContain("L20");
+    expect(message).toContain("L09");
+    expect(message).not.toContain("L08");
+    const unknown = setup();
+    unknown.spawner.hold = false;
+    unknown.spawner.reply = () => ({ code: null, signal: null });
+    await expect(unknown.provisioner.provision(slot(1), detection(["uv"]), { fresh: false })).rejects.toThrow(/signal unknown/);
+    const odd = setup();
+    odd.spawner.hold = false;
+    odd.spawner.reply = () => ({ code: 0, signal: "SIGTERM" });
+    await expect(odd.provisioner.provision(slot(1), detection(["uv"]), { fresh: false })).rejects.toThrow(/exit 0/);
+  });
+
+  it("wraps a non-Error spawn rejection as a could-not-run failure", async () => {
+    const { spawner, provisioner, fs, lock } = setup();
+    spawner.run = () => Promise.reject<ProcessResult>("boom");
+    const error = await outcomeOf(provisioner.provision(slot(1), detection(["poetry"]), { fresh: false }));
+    expect(error).toMatchObject({ code: "E_PROVISION", message: expect.stringContaining("poetry install could not run") });
+    expect((error as Error).message).toContain("boom");
+    expect((error as Error).message).toContain("poetry lock");
+    expect(fs.nodes.has(key(lock("poetry")))).toBe(false);
+  });
+
+  it.skipIf(!WIN)("treats a failing `uv cache dir` spawn as no override", async () => {
+    const { spawner, provisioner } = setup(AUTO, true);
+    const realRun = spawner.run.bind(spawner);
+    spawner.hold = false;
+    spawner.run = (command, args, opts) => (args[0] === "cache" ? Promise.reject(new Error("spawn failed")) : realRun(command, args, opts));
+    await provisioner.provision(slot(1), detection(["uv"]), { fresh: false });
+    expect(spawner.calls.find(c => c.args[0] === "sync")?.opts.env?.["UV_CACHE_DIR"]).toBeUndefined();
   });
 });

@@ -181,6 +181,10 @@ describe.skipIf(!RUN)("cpx provisioning smoke (real pnpm and pip)", () => {
     git(repo, "config", "user.email", "smoke.tester@example.test");
     git(repo, "config", "core.autocrlf", "false");
     for (const f of ["node-pnpm", "py-pip"]) cpSync(join(FIXTURES, f), repo, { recursive: true, filter: (src) => !src.includes("fixpkg") });
+    // pnpm must find its project (package.json + pnpm-lock.yaml) at the slot root, never in an ancestor's workspace.
+    for (const f of ["package.json", "pnpm-lock.yaml"]) {
+      if (!existsSync(join(repo, f))) throw new Error(`the node-pnpm fixture must provide ${f} at the repository root`);
+    }
     writeFileSync(join(repo, ".gitignore"), "__pycache__/\n.pytest_cache/\n");
     git(repo, "add", "--all");
     git(repo, "-c", "commit.gpgSign=false", "commit", "-q", "--no-verify", "-m", "fixtures");
