@@ -521,6 +521,19 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // -------------------------------------------------------------------------
   const isV2Host = ctx.routerHost === "v2";
   /**
+   * Cross-repo P2e.6 (OD-P2e-2): a dispatch runs the full scope when the host is OpenCode v2 and the effective testScope is
+   * "full"; the deferred finish then never treats an empty change set as nothing to run. Always false on v1. Never throws (an
+   * unreadable verify block is not full).
+   */
+  const fullScopeOf = (cfg: Parameters<typeof resolveVerifyBudget>[0]): boolean => {
+    if (!isV2Host) return false;
+    try {
+      return resolveVerifyBudget(cfg).testScope === "full";
+    } catch {
+      return false;
+    }
+  };
+  /**
    * QA-P21-1-8 (plan R8): the role runtime exists only when the plugin STARTED in roles mode — its role tools are registered at
    * start and its role agents only then (the v2 adapter logs "restart OpenCode" when the config switches to roles at runtime).
    */
@@ -1695,6 +1708,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                     dispatchedAt: dispatchStart.dispatchedAt,
                     // Handoff 24, R7 (I1/I8 exemption: the I7 budget-incomplete rule): router_verify judges the budget at return.
                     budget: captureBudget(producerSid, sessionStore.readCapReached(producerSid)),
+                    // Cross-repo P2e.6 (OD-P2e-2): the full scope on v2; a delegate dispatch has no per-check placements.
+                    ...(fullScopeOf(activeCfg) ? { fullScope: true } : {}),
                   })
                 : undefined;
               // QA-2.4-4 / QA-2.4-10: a finish that did not defer falls through to the required gate
@@ -2519,14 +2534,14 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             // earlier attempt is gated at once (never deferred) on the child's cumulative change set (roleAttemptVerification).
             const routedRole = typeof input.callID === "string" ? routedRoleOf(input.callID) : undefined;
             const carriedRole = routedRole?.carried === true && childSessionID !== null && routedRole.resumeID === childSessionID;
-            // Cross-repo P2a.3 (v2 only): where each check of a routed role dispatch runs. The gate does not receive the placements yet.
-            // P2.7 interim: a DoD with any per-check `cwd=`/`scope=` is verified at once, never deferred (a later handle would not
-            // run the checks where they were placed). Tier dispatches resolve nothing and defer as before.
+            // Cross-repo P2a.3 (v2 only): where each check of a routed role dispatch runs. Tier dispatches resolve nothing.
+            // P2e.6: valid per-check `cwd=`/`scope=` keys may be deferred (the placements travel with the handle, and router_verify
+            // runs each check where it was placed); only a refusal is verified at once, below.
             const placement = routedRole === undefined ? undefined : resolveCheckPlacements(dod, scope, { inReadSet: roleReadSetFor(routedRole) });
             // P2b.7 (OD1=B, v2 only): a tier dispatch with a per-check `cwd=` is unverifiable (the gate refuses it); it is never deferred.
             const tierRefusal = routedRole === undefined && ctx.routerHost === "v2" ? tierCheckCwdRefusal(dod) : undefined;
-            const perCheckPlacement = tierRefusal !== undefined
-              || (placement !== undefined && dod.checks.some((check) => check.cwd !== undefined || check.scope !== undefined));
+            // P2e.6: a refused placement or the OD1 tier refusal is certain now: verified at once, never deferred.
+            const placementRefused = tierRefusal !== undefined || placement?.refused !== undefined;
             const orchestratorSessionID = typeof input.sessionID === "string" ? input.sessionID : "";
             const taskPrompt = typeof input?.args?.prompt === "string" ? input.args.prompt : undefined;
             const taskDescription = typeof input?.args?.description === "string" ? input.args.description : undefined;
@@ -2539,7 +2554,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             // deferred (isDeferred). QA-2.4-2: only a proven root orchestrator defers.
             // B2: the reason a deferred finish refused for a branch switch, carried into the artefact below.
             let deferredSwitch: string | undefined;
-            if (!scope.outside && !carriedRole && !perCheckPlacement && isDeferred(dod, start.directives, trivial) && await isProvenRootCaller(orchestratorSessionID)) {
+            if (!scope.outside && !carriedRole && !placementRefused && isDeferred(dod, start.directives, trivial) && await isProvenRootCaller(orchestratorSessionID)) {
               // Section 1.5-16: no gate, no test process; the result goes back now with the
               // footer, which is appended last and never says accepted or verified.
               const finish = await finishDeferred(changedFileStore, {
@@ -2557,6 +2572,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 dispatchedAt: start.dispatchedAt,
                 // Handoff 24, R7 (I1/I8 exemption: the I7 budget-incomplete rule): router_verify judges the budget at return.
                 budget: captureBudget(childSessionID ?? "", childSessionID ? sessionStore.readCapReached(childSessionID) : undefined),
+                // Cross-repo P2e.6: the checks' placements (registered with the handle), and the full scope on v2 (OD-P2e-2).
+                ...(placement?.placements !== undefined ? { placements: placement.placements } : {}),
+                ...(fullScopeOf(cfg) ? { fullScope: true } : {}),
               });
               if (finish.deferred) {
                 output.output = appendRouterFooter(typeof output.output === "string" ? output.output : "", finish.footer);

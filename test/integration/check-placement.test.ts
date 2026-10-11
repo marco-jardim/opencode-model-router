@@ -1,10 +1,11 @@
 /**
  * test/integration/check-placement.test.ts
  *
- * Cross-repo Phase 2 (docs/design/cross-repo-phase2-plan.md P2a.3, P2.7 interim): a routed role dispatch whose DoD has any per-check
- * `cwd=` or `scope=` is never deferred; it is verified at once, and the gate receives its placements or refusal (P2b.5). A tier
- * dispatch, and a role dispatch without per-check keys, defer as before; on a v2 host a tier dispatch with a per-check `cwd=` is
- * unverifiable (P2b.7, OD1=B).
+ * Cross-repo Phase 2 (docs/design/cross-repo-phase2-plan.md P2a.3, P2e.6): a routed role dispatch whose DoD has valid per-check
+ * `cwd=` or `scope=` keys may be deferred (P2e lifts the P2.7 interim rule); router_verify runs each check where it was placed.
+ * Only a refusal is verified at once: a refused `cwd=`, or, on a v2 host, a tier dispatch with a per-check `cwd=` (P2b.7,
+ * OD1=B). The gate receives the placements or the refusal (P2b.5). A tier dispatch on v1 defers as before. `fullScope`
+ * (OD-P2e-2) reaches the deferred finish only on a v2 host whose testScope is "full".
  *
  * The harness is test/integration/perimeter.test.ts's: a real temporary git repository, the real plugin and gate, `routedRoleOf`
  * spied to make the dispatch a routed role dispatch, tree snapshots pinned through the `src/verify/tree` mock seam.
@@ -45,7 +46,15 @@ vi.mock("../../src/verify/tree", async importOriginal => {
 // A pass-through spy on the verification wiring: the cwd each dispatch's capture, preparation and deferral use (the pattern of
 // roles-authority.test.ts), and the deferral's registration base (`cwd`) next to its capture root.
 const wired = vi.hoisted(() => ({
-  calls: [] as Array<{ kind: "start" | "prepare" | "defer"; id: string; cwd: string | undefined; captureRoot?: string }>,
+  calls: [] as Array<{
+    kind: "start" | "prepare" | "defer";
+    id: string;
+    cwd: string | undefined;
+    captureRoot?: string;
+    /** P2e.6: the deferral's placements and fullScope, as index.ts passed them. */
+    placements?: readonly ({ readonly cwd: string } | undefined)[];
+    fullScope?: boolean;
+  }>,
 }));
 vi.mock("../../src/verify/wiring", async importOriginal => {
   const actual = await importOriginal<typeof import("../../src/verify/wiring")>();
@@ -64,7 +73,11 @@ vi.mock("../../src/verify/wiring", async importOriginal => {
           return wiring.prepareVerification(...a);
         },
         finishDeferred: (...a: Parameters<typeof wiring.finishDeferred>) => {
-          wired.calls.push({ kind: "defer", id: a[1].dispatchID, cwd: a[1].cwd, captureRoot: a[1].captureRoot });
+          wired.calls.push({
+            kind: "defer", id: a[1].dispatchID, cwd: a[1].cwd, captureRoot: a[1].captureRoot,
+            ...(a[1].placements !== undefined ? { placements: a[1].placements } : {}),
+            ...(a[1].fullScope !== undefined ? { fullScope: a[1].fullScope } : {}),
+          });
           return wiring.finishDeferred(...a);
         },
       };
@@ -186,21 +199,37 @@ async function runTask(hooks: any, prompt: string, work?: () => Promise<void>): 
   return output.output;
 }
 
-describe("interim deferral (P2.7 interim)", () => {
-  it("(a) a deferred role dispatch with a per-check cwd= inside W is verified at once, without a handle", async () => {
+// P2e.6 (flipped on purpose): this was "interim deferral (P2.7 interim)", where any per-check key made a role dispatch verified
+// at once. Now valid keys defer; only a refusal (a refused cwd=, or OD1's v2 tier cwd=) is verified at once.
+describe("deferral with per-check keys (P2e)", () => {
+  const verify = async (hooks: any, handle: string): Promise<string> =>
+    hooks.tool.router_verify.execute({ handles: [handle] }, { sessionID: "orch" });
+  const handleIn = (out: string): string => {
+    const handle = HANDLE.exec(out)?.[0];
+    if (handle === undefined) throw new Error(`not deferred:\n${out}`);
+    return handle;
+  };
+
+  it("(a) a deferred role dispatch with a per-check cwd= inside W gets a handle; router_verify runs the check in sub", async () => {
     routeAsRole();
     const hooks = await makePlugin();
     await pin(repo);
-    const out = await runTask(hooks, `Implement it.\n${dod(['testsPass command="npm test"', "fileExists path=inner.ts cwd=sub"])}`);
-    expect(HANDLE.exec(out)?.[0], out).toBeUndefined();
+    const handle = handleIn(await runTask(hooks, `Implement it.\n${dod(['testsPass command="npm test"', "fileExists path=inner.ts cwd=sub"])}`));
+    expect(acceptSpy).not.toHaveBeenCalled();
+    const [defer] = callsOf("defer");
+    expect(same(defer?.placements?.[1]?.cwd, path.join(repo, "sub")), `placement: ${defer?.placements?.[1]?.cwd}`).toBe(true);
+    // inner.ts exists only in sub: the pass shows check 2 ran there.
+    const out = await verify(hooks, handle);
+    expect(out).toMatch(new RegExp(`^- ${handle} \u00b7 .* \u00b7 pass`, "m"));
+    expect(same(lastDelegation()?.checkPlacements?.[1]?.cwd, path.join(repo, "sub"))).toBe(true);
   }, 90_000);
 
-  it("(b) the same with only scope=full on a check", async () => {
+  it("(b) the same with only scope=full on a check: a handle", async () => {
     routeAsRole();
     const hooks = await makePlugin();
     await pin(repo);
     const out = await runTask(hooks, `Implement it.\n${dod(['testsPass command="npm test" scope=full', "fileExists path=index.ts"])}`);
-    expect(HANDLE.exec(out)?.[0], out).toBeUndefined();
+    expect(HANDLE.exec(out)?.[0], out).toBeDefined();
   }, 90_000);
 
   it("(c) control: a role dispatch without per-check keys is deferred, with a handle", async () => {
@@ -218,7 +247,73 @@ describe("interim deferral (P2.7 interim)", () => {
     const out = await runTask(hooks, `Implement it.\n${dod(['testsPass command="npm test" scope=full', "fileExists path=inner.ts cwd=sub"])}`);
     expect(HANDLE.exec(out)?.[0], out).toBeDefined();
   }, 90_000);
+
+  it("(e) a refused cwd= is verified at once (no handle) with the refusal", async () => {
+    routeAsRole();
+    const hooks = await makePlugin();
+    await pin(repo);
+    const elsewhere = slashed(path.join(parent, "elsewhere"));
+    const out = await runTask(hooks, `Implement it.\n${dod(['testsPass command="npm test"', `fileExists path=index.ts cwd=${elsewhere}`])}`);
+    expect(HANDLE.exec(out)?.[0], out).toBeUndefined();
+    expect(out).toContain("check 2 (fileExists) cwd=");
+    expect(out).toContain("is outside the work root");
+    expect(callsOf("defer")).toHaveLength(0);
+  }, 90_000);
+
+  it("(f) a v2 tier dispatch with cwd= is verified at once with the roles-only reason", async () => {
+    const hooks = await makePlugin("v2");
+    await pin(repo);
+    const out = await runTask(hooks, `Implement it.\n${dod(['testsPass command="npm test"', "fileExists path=inner.ts cwd=sub"])}`);
+    expect(HANDLE.exec(out)?.[0], out).toBeUndefined();
+    expect(out).toContain("check 2 (fileExists) cwd=sub: a per-check cwd= is honoured only in roles mode; nothing ran");
+    expect(callsOf("defer")).toHaveLength(0);
+  }, 90_000);
 });
+
+describe("fullScope reaches the deferred finish (OD-P2e-2)", () => {
+  /** The effective testScope from the user's overrides file. */
+  const testScope = (scope: "full" | "affected"): void => {
+    const file = path.join(home, ".config/opencode/opencode-model-router.overrides.jsonc");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ enforcement: { verify: { testScope: scope } } }), "utf-8");
+    invalidateConfigCache();
+  };
+
+  it("(a) v2 with testScope full: finishDeferred gets fullScope true", async () => {
+    testScope("full");
+    routeAsRole();
+    const hooks = await makePlugin("v2");
+    await pin(repo);
+    handleOf(await runTask(hooks, `Implement it.\n${dod(PLAIN)}`));
+    expect(callsOf("defer")[0]?.fullScope).toBe(true);
+  }, 90_000);
+
+  it("(b) v2 with testScope affected: not full", async () => {
+    testScope("affected");
+    routeAsRole();
+    const hooks = await makePlugin("v2");
+    await pin(repo);
+    handleOf(await runTask(hooks, `Implement it.\n${dod(PLAIN)}`));
+    expect(callsOf("defer")[0]?.fullScope).not.toBe(true);
+  }, 90_000);
+
+  it("(c) v1 with testScope full: not full (v1 unchanged)", async () => {
+    testScope("full");
+    routeAsRole();
+    const hooks = await makePlugin();
+    await pin(repo);
+    handleOf(await runTask(hooks, `Implement it.\n${dod(PLAIN)}`));
+    expect(callsOf("defer")[0]?.fullScope).not.toBe(true);
+    expect(callsOf("defer")[0]?.placements).toBeUndefined();
+  }, 90_000);
+});
+
+/** The deferred handle in a dispatch's output, or the test fails showing the output. */
+function handleOf(out: string): string {
+  const handle = HANDLE.exec(out)?.[0];
+  if (handle === undefined) throw new Error(`not deferred:\n${out}`);
+  return handle;
+}
 
 const required = (checks: string[]): string => `VERIFY:required\n[acceptance]\n${checks.map(check => `check: ${check}`).join("\n")}\n[/acceptance]`;
 const slashed = (p: string): string => p.replace(/\\/g, "/");
