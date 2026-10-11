@@ -64,6 +64,7 @@ import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { posix, win32 } from "node:path";
 import { tool } from "@opencode-ai/plugin";
+import { applySlotEnv, slotEnvFor, type SlotEnv } from "../executor/slots/env";
 import type { RunConfig } from "./roles";
 import {
   checkWorkRootAnswer, dropPartialCredential, envLookup, errorMessage, firstOutside, isFullPath, readBoundedRegularFile as readBounded,
@@ -175,7 +176,11 @@ export interface RunPlan {
  * any configuration, so it was removed rather than kept as a dead knob: credential-like
  * variables are always dropped.
  */
-export interface RunHost { platform: NodeJS.Platform; env: NodeJS.ProcessEnv; nodeExecPath?: string }
+export interface RunHost {
+  platform: NodeJS.Platform; env: NodeJS.ProcessEnv; nodeExecPath?: string;
+  /** The executor-slot environment for a work root (default: the slot registry); null outside a slot. */
+  slotEnv?: (cwd: string, p: NodeJS.Platform) => SlotEnv | null;
+}
 
 class RunRefused extends Error {}
 const refuse = (message: string) => new RunRefused(message);
@@ -786,7 +791,7 @@ export function planRun(input: RunInput, root: string, config: RunConfig, host: 
   }
   return {
     kind: command !== undefined ? "command" : "script", name, executable, argv, cwd: root,
-    env: runEnvironment(host.env, host.platform, shell, { guards: guarded() }), timeoutMs,
+    env: applySlotEnv(runEnvironment(host.env, host.platform, shell, { guards: guarded() }), (host.slotEnv ?? slotEnvFor)(root, host.platform), host.platform), timeoutMs,
   };
 }
 
