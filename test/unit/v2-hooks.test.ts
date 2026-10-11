@@ -22,6 +22,8 @@ import { V2_GRADER_AGENT } from "../../src/compat/v2-client";
 import { DEPTH_BANNER, TASK_VERIFICATION, type ChildSessionRequest, type RouterPluginInput } from "../../src/compat/child-session";
 import { depthAdvisoryBanner, depthLimitMessage } from "../../src/router/depth-guard";
 import { appendRouterFooter } from "../../src/verify/pending";
+import { createLeaseGuard } from "../../src/compat/background";
+import { createLeaseRegistry } from "../../src/router/leases";
 import { evaluatePermission, READ_ONLY_CANARIES, readOnlyPermissions } from "../../src/router/read-only";
 import type { PermissionEvaluation } from "@opencode/plugin/promise/permission";
 
@@ -35,6 +37,48 @@ afterEach(async () => {
 // The two eviction tests drive the real execute.before 1000+ times (each call reloads the config from disk, ~4 ms): ~4-5 s on an
 // idle machine, so the default 5 s is flaky under load. The 1000 bound is the behaviour under test, so the loop cannot shrink.
 const BOUNDED_LIMIT_TIMEOUT_MS = 30_000;
+
+describe("lease guard: glob/grep results as the v2 host delivers them (Phase 2.1 gap 4)", () => {
+  async function fixtureGuard() {
+    const dir = join(tmpdir(), "omr-lease-search");
+    const leased = join(dir, "a.ts");
+    const free = join(dir, "b.ts");
+    const registry = createLeaseRegistry({ realpath: (path) => path, repoKeyOf: () => undefined, now: () => 1 }, { runMode: "annotate" });
+    registry.acquireWrite({ holderID: "holder", tree: dir, isChild: true, scope: "until-complete" }, leased);
+    const guard = createLeaseGuard({
+      registry, sessionKind: async () => "child", sessionDir: async () => dir, gitRootOf: () => undefined,
+      holderLabel: (id) => `session ${id}`, planTaskOf: () => undefined, events: { onRelease: () => () => {} },
+    });
+    await guard.before({ sessionID: "reader", tool: "read", args: { path: free }, callID: "c1" }); // resolves the reader's actor
+    return { guard, leased, free };
+  }
+
+  it("filters a grep result's text parts and its structured matches together, and adds one note", async () => {
+    const { guard, leased, free } = await fixtureGuard();
+    const result = {
+      content: [{ type: "text", text: `${leased}:3:needle\n${free}:5:needle` }],
+      output: [{ entry: { path: leased }, line: 3 }, { entry: { path: free }, line: 5 }],
+    };
+    const searched = guard.afterSearch({ sessionID: "reader", tool: "grep", result });
+    expect(searched?.result).toEqual({
+      content: [{ type: "text", text: `${free}:5:needle` }],
+      output: [{ entry: { path: free }, line: 5 }],
+    });
+    expect(searched?.note).toBe("[router] 1 result(s) omitted: under edit by session holder.");
+    expect(result.output).toHaveLength(2); // the host's object is never mutated
+  });
+
+  it("filters a glob result given as a text string with a list of paths", async () => {
+    const { guard, leased, free } = await fixtureGuard();
+    const searched = guard.afterSearch({ sessionID: "reader", tool: "glob", result: { content: `${leased}\n${free}`, output: [leased, free] } });
+    expect(searched?.result).toEqual({ content: free, output: [free] });
+  });
+
+  it("leaves a result without a leased entry alone", async () => {
+    const { guard, free } = await fixtureGuard();
+    expect(guard.afterSearch({ sessionID: "reader", tool: "glob", result: { content: [{ type: "text", text: free }], output: [free] } })).toBeUndefined();
+  });
+});
 
 function fixture() {
   const registrations: Array<{ dispose: ReturnType<typeof vi.fn> }> = [];

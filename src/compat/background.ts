@@ -194,9 +194,39 @@ export interface FinishApi {
   /** `pending.reserveHandle`. */
   reserveHeld(parentSessionID: string, callID: string): string | undefined;
   finish(input: FinishInput): Promise<FinishResult>;
+  /**
+   * The ONE journal (memo §11): `pending.jsonl`, shared by the pending store, the in-flight registry and the held results.
+   * `inflight` and `hold` appends are fsync'd by the caller (`{fsync: true}`).
+   */
+  journal: InflightJournal;
+  /** The change set of a dispatch at child end (verify/dispatch.ts `captureDelta`, 2.1.4.b); absent = none. */
+  captureDelta?(callID: string, childSessionID: string): Promise<unknown>;
+  /**
+   * Memo §4.1 step 3 / §11.3: reloads `pending.jsonl` (parsed per line, folded by key, TTL applied) and keeps the surviving
+   * records dormant. Rejects when the file cannot be read (the caller then fails closed, §12).
+   */
+  reload(): Promise<void>;
+  /**
+   * Memo §11.3: this process saw `sessionID`. Takes the exclusive claim file `pending.claims\<id>` and hands over the dormant
+   * records of that session; `undefined` when there are none or another live process holds the claim. Synchronous, once per session.
+   */
+  adopt(sessionID: string): AdoptedRecords | undefined;
 }
 
-export type FinishAttach = (deps: { host: "v2"; held: HeldSink }) => FinishApi | undefined;
+/** The reloaded records of one adopted parent session (memo §11.3). */
+export interface AdoptedRecords {
+  /** `hold` records not yet posted or forgotten (for `HeldResults.restore`). */
+  holds: readonly PersistedRecord[];
+  /** `inflight` records without a `processed` record (for recovery). */
+  inflight: readonly PersistedRecord[];
+}
+
+export type FinishAttach = (deps: {
+  host: "v2";
+  held: HeldSink;
+  /** The lease gate before plugin verification runs (memo §2.5); absent when `routing.leases.mode` is not `enforce`. */
+  leaseGate?: Pick<LeaseGuard, "waitTreeFree">;
+}) => FinishApi | undefined;
 
 // ---- in-flight registry ----------------------------------------------------------------------
 
@@ -1264,6 +1294,12 @@ export interface LeaseGuard {
   /** Before a file / git / run tool call: a refusal text, and/or a note to append to a run's result. */
   before(e: { sessionID: string; tool: string; args: unknown; callID: string }): Promise<{ refuse?: string; runNote?: string }>;
   /** After a host `glob`/`grep` of a child session: the filtered result plus one note line; `undefined` = unchanged. */
+  /**
+   * `e.result` is the host's `execute.after` result of a `glob`/`grep` call, exactly as received: `content` is a string or an array
+   * of `{type:"text", text}` parts (the model-facing text, one hit per line), and `output` is the structured form (a string, an
+   * object with a string `output`, or an array of hits: a path string, `{path}` or `{entry:{path}}`). Returns the rewritten host
+   * result (both forms filtered together) plus one note line, or `undefined` when nothing is omitted.
+   */
   afterSearch(e: { sessionID: string; tool: "glob" | "grep"; result: unknown }): { result: unknown; note?: string } | undefined;
   /** Until-complete leases only; until-integrated ones are retained (leases.ts §5). */
   releaseChild(child: string): void;
@@ -1443,29 +1479,75 @@ export function createLeaseGuard(deps: LeaseGuardDeps): LeaseGuard {
         const a = actors.get(e.sessionID);
         if (a === undefined || a.kind !== "child") return undefined;
         const actor = actorOf(holderOf(e.sessionID, a));
-        const isText = typeof e.result === "string";
-        const entries: string[] | undefined = isText
-          ? (e.result as string).split("\n")
-          : Array.isArray(e.result) && e.result.every((x: unknown) => typeof x === "string")
-            ? (e.result as string[])
-            : undefined;
-        if (entries === undefined) return undefined;
-        const paths = entries.map((line) => searchEntryPath(e.tool, line));
-        const r = deps.registry.filterSearchResults(actor, actor.tree, paths);
-        if (r.omitted === 0) return undefined;
-        const left = new Map<string, number>();
-        for (const p of r.kept) left.set(p, (left.get(p) ?? 0) + 1);
-        const kept = entries.filter((_, i) => {
-          const p = paths[i] ?? "";
-          const n = left.get(p) ?? 0;
-          if (n === 0) return false;
-          left.set(p, n - 1);
-          return true;
-        });
-        return {
-          result: isText ? kept.join("\n") : kept,
-          note: `[router] ${r.omitted} result(s) omitted: under edit by ${holderLabels(deps, r.holders)}.`,
+        /** Filters `items` by the path each names; an item naming no path is always kept. */
+        const filterBy = <T,>(items: readonly T[], pathOf: (item: T) => string | undefined): { kept: T[]; omitted: number; label: string } | undefined => {
+          const paths = items.map(pathOf);
+          const named = paths.filter((p): p is string => p !== undefined);
+          const r = deps.registry.filterSearchResults(actor, actor.tree, named);
+          if (r.omitted === 0) return undefined;
+          const left = new Map<string, number>();
+          for (const p of r.kept) left.set(p, (left.get(p) ?? 0) + 1);
+          const kept = items.filter((_, i) => {
+            const p = paths[i];
+            if (p === undefined) return true;
+            const n = left.get(p) ?? 0;
+            if (n === 0) return false;
+            left.set(p, n - 1);
+            return true;
+          });
+          return { kept, omitted: r.omitted, label: holderLabels(deps, r.holders) };
         };
+        const noteOf = (omitted: number, label: string): string => `[router] ${omitted} result(s) omitted: under edit by ${label}.`;
+        // Plain text or a list of lines (callers that already extracted the text).
+        if (typeof e.result === "string") {
+          const f = filterBy(e.result.split("\n"), (line) => searchEntryPath(e.tool, line));
+          return f === undefined ? undefined : { result: f.kept.join("\n"), note: noteOf(f.omitted, f.label) };
+        }
+        if (Array.isArray(e.result) && e.result.every((x: unknown) => typeof x === "string")) {
+          const f = filterBy(e.result as string[], (line) => searchEntryPath(e.tool, line));
+          return f === undefined ? undefined : { result: f.kept, note: noteOf(f.omitted, f.label) };
+        }
+        // The host's `execute.after` result: `content` (text or text parts) and `output` (text, `{output}` or an array of hits).
+        const host = asRecord(e.result);
+        if (host === undefined || (!("content" in host) && !("output" in host))) return undefined;
+        let omitted = 0;
+        let label = "";
+        const lines = (text: string): string => {
+          const f = filterBy(text.split("\n"), (line) => searchEntryPath(e.tool, line));
+          if (f === undefined) return text;
+          if (f.omitted > omitted) { omitted = f.omitted; label = f.label; }
+          return f.kept.join("\n");
+        };
+        const next: Record<string, unknown> = { ...host };
+        const content = host.content;
+        if (typeof content === "string") next.content = lines(content);
+        else if (Array.isArray(content)) {
+          next.content = content.map((part: unknown) => {
+            const p = asRecord(part);
+            if (p === undefined || typeof p.text !== "string" || (p.type !== undefined && p.type !== "text")) return part;
+            const text = lines(p.text);
+            return text === p.text ? part : { ...p, text };
+          });
+        }
+        const output = host.output;
+        if (typeof output === "string") next.output = lines(output);
+        else if (Array.isArray(output)) {
+          const f = filterBy(output as unknown[], (item) => {
+            if (typeof item === "string") return item;
+            const rec = asRecord(item);
+            const entry = asRecord(rec?.entry);
+            const path = entry?.path ?? rec?.path;
+            return typeof path === "string" ? path : undefined;
+          });
+          if (f !== undefined) {
+            next.output = f.kept;
+            if (f.omitted > omitted) { omitted = f.omitted; label = f.label; }
+          }
+        } else {
+          const wrapped = asRecord(output);
+          if (wrapped !== undefined && typeof wrapped.output === "string") next.output = { ...wrapped, output: lines(wrapped.output) };
+        }
+        return omitted === 0 ? undefined : { result: next, note: noteOf(omitted, label) };
       } catch (error) {
         warnOnce("search-fault", "[router] lease search filter failed; result unchanged", { error: errorText(error) });
         return undefined;

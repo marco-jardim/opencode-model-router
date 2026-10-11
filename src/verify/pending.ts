@@ -380,8 +380,9 @@
 // ===============================================================================================
 
 import { randomBytes } from "node:crypto";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { appendFile, mkdir, open, readFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 
 import type { DoD } from "./dod";
 import type { RiskAssessment, RiskLevel } from "./risk";
@@ -920,6 +921,129 @@ export function createPendingFileJournal(path: string): PendingFileJournal {
       return records;
     },
   };
+}
+
+// ---- Phase 2.1 section 11.3: reload of the in-flight / hold records (v2 only) -----------------------------------------
+
+/** The records of one parent session that survived a restart; dormant until the new process sees that session. */
+export interface DormantSession {
+  /** `hold` records not yet posted, tombstoned or forgotten (no TTL, section 11.3). */
+  holds: PendingRecord[];
+  /** `inflight` records without a `processed` record, younger than the TTL. */
+  inflight: PendingRecord[];
+}
+
+/** The idempotency key of a `processed` record: its `key`, else `child NUL callID` (section 10). */
+export function processedKeyOf(record: Readonly<Record<string, unknown>>): string | undefined {
+  if (typeof record.key === "string" && record.key !== "") return record.key;
+  if (typeof record.child === "string" && typeof record.callID === "string") return `${record.child}\u0000${record.callID}`;
+  return undefined;
+}
+
+/**
+ * Folds the parsed records of `pending.jsonl` (section 11.3): `forget` removes a session's earlier records, `processed` closes an
+ * `inflight`, `posted` / `tomb` close a `hold` (and a tombstoned `callID` closes its `inflight`). Inflight records older than
+ * `ttlMs` are dropped; hold records never expire. Pure.
+ */
+export function foldDormantRecords(
+  records: readonly PendingRecord[],
+  opts: { now: number; ttlMs: number },
+): { sessions: Map<string, DormantSession>; processed: Set<string> } {
+  const processed = new Set<string>();
+  const inflight = new Map<string, PendingRecord>();
+  const holds = new Map<string, PendingRecord>();
+  const str = (value: unknown): string | undefined => (typeof value === "string" && value !== "" ? value : undefined);
+  /** The adapter writes `parentSessionID` / `childSessionID` on `inflight`, `parent` / `child` on `hold`: both are read. */
+  const parentOf = (rec: PendingRecord): string | undefined => str(rec.parent) ?? str(rec.parentSessionID);
+  const childOf = (rec: PendingRecord): string | undefined => str(rec.child) ?? str(rec.childSessionID);
+  for (const rec of records) {
+    switch (rec.kind) {
+      case "inflight": {
+        const callID = str(rec.callID);
+        if (callID !== undefined && parentOf(rec) !== undefined && childOf(rec) !== undefined) inflight.set(callID, rec);
+        break;
+      }
+      case "processed": {
+        const key = processedKeyOf(rec);
+        if (key !== undefined) processed.add(key);
+        const callID = str(rec.callID);
+        if (callID !== undefined) inflight.delete(callID);
+        break;
+      }
+      case "hold": {
+        const handle = str(rec.handle);
+        if (handle !== undefined && parentOf(rec) !== undefined && childOf(rec) !== undefined) holds.set(handle, rec);
+        break;
+      }
+      case "posted": {
+        const handle = str(rec.handle);
+        if (handle !== undefined) holds.delete(handle);
+        break;
+      }
+      case "tomb": {
+        const handle = str(rec.handle);
+        const callID = str(rec.callID);
+        if (handle !== undefined) holds.delete(handle);
+        if (callID !== undefined) inflight.delete(callID);
+        break;
+      }
+      case "forget": {
+        const session = str(rec.session);
+        if (session === undefined) break;
+        for (const [key, value] of inflight) if (parentOf(value) === session) inflight.delete(key);
+        for (const [key, value] of holds) if (parentOf(value) === session) holds.delete(key);
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  const sessions = new Map<string, DormantSession>();
+  const sessionOf = (parent: string): DormantSession => {
+    let session = sessions.get(parent);
+    if (session === undefined) {
+      session = { holds: [], inflight: [] };
+      sessions.set(parent, session);
+    }
+    return session;
+  };
+  for (const rec of inflight.values()) {
+    const at = typeof rec.at === "number" ? rec.at : 0;
+    if (opts.now - at > opts.ttlMs) continue;
+    sessionOf(parentOf(rec) ?? "").inflight.push(rec);
+  }
+  for (const rec of holds.values()) sessionOf(parentOf(rec) ?? "").holds.push(rec);
+  return { sessions, processed };
+}
+
+/**
+ * Section 11.3: the exclusive claim file `<claimsDir>\<id>` (`wx`, `{pid, at}`) that stops two host processes from verifying or
+ * posting for one session twice. A claim of a dead pid (or of this process) is stale and is taken over. True when this process owns it.
+ */
+export function claimPendingSession(
+  claimsDir: string,
+  sessionID: string,
+  seams: { pid: number; now: number; isAlive(pid: number): boolean },
+): boolean {
+  const file = join(claimsDir, encodeURIComponent(sessionID));
+  const body = `${JSON.stringify({ pid: seams.pid, at: seams.now })}\n`;
+  mkdirSync(claimsDir, { recursive: true });
+  try {
+    writeFileSync(file, body, { flag: "wx" });
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  let owner: unknown;
+  try {
+    owner = JSON.parse(readFileSync(file, "utf8"));
+  } catch {
+    owner = undefined; // an unreadable claim is stale
+  }
+  const pid = typeof owner === "object" && owner !== null ? (owner as { pid?: unknown }).pid : undefined;
+  if (typeof pid === "number" && pid !== seams.pid && seams.isAlive(pid)) return false;
+  writeFileSync(file, body);
+  return true;
 }
 
 /**

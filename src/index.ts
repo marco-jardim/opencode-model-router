@@ -91,7 +91,7 @@ import { createPersister, nodePersistDeps, summarizeRoles } from "./routing/outc
 import { roleAgentSteps } from "./router/role-agents";
 import type { HostBudgetObservation } from "./compat/v2-hooks";
 import { ROUTER_TURN_STATE_ATTACH, TURN_STATE_ROOT, type TurnStateRegistry } from "./compat/turn-state";
-import { ROUTER_FINISH_ATTACH, type FinishApi, type FinishAttach, type FinishInput, type FinishResult, type HeldSink } from "./compat/background";
+import { ROUTER_FINISH_ATTACH, type AdoptedRecords, type FinishApi, type FinishAttach, type FinishInput, type FinishResult, type HeldSink, type InflightJournal, type LeaseGuard } from "./compat/background";
 import type { DispatchDelta } from "./verify/dispatch";
 import { configuredV2OnlyKeys } from "./router/config";
 
@@ -140,8 +140,8 @@ import { access, readFile as fsReadFile } from "node:fs/promises";
 import { tool } from "@opencode-ai/plugin";
 import { scrubText } from "./guard/scrub";
 import { accept, unverifiableGateResult } from "./verify/gate";
-import { applyDispatchCaveats, createVerificationWiring, dispatchDirectiveText, extractAssistantText, parseRouterVerifyArgs, type DispatchStart, type HandleReport } from "./verify/wiring";
-import { createPendingFileJournal, appendRouterFooter, buildLateNoticeBlock, buildPendingListBlock, unattributedRisk, type LateNotice, type PendingEntry, type SettledVerification } from "./verify/pending";
+import { applyDispatchCaveats, createVerificationWiring, DEFAULT_PENDING_TTL_MS, dispatchDirectiveText, extractAssistantText, parseRouterVerifyArgs, type DispatchStart, type HandleReport } from "./verify/wiring";
+import { claimPendingSession, createPendingFileJournal, foldDormantRecords, processedKeyOf, appendRouterFooter, buildLateNoticeBlock, buildPendingListBlock, unattributedRisk, type DormantSession, type LateNotice, type PendingEntry, type SettledVerification } from "./verify/pending";
 import { createDeadline } from "./verify/deterministic";
 import {
   DEFAULT_DELEGATE_PROMPT_TIMEOUT_MS,
@@ -814,9 +814,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   };
 
   // Phase 2.1 (v2 only): pending.jsonl, next to the outcome store. On v1 there is no journal, no held state and no restore.
-  const pendingFile = isV2Host
-    ? createPendingFileJournal(join(resolveOutcomesDir(cfg.routing?.outcomes?.path, { tmpdir: tmpdir(), homedir: homedir() }), "pending.jsonl"))
-    : undefined;
+  const pendingDir = isV2Host ? resolveOutcomesDir(cfg.routing?.outcomes?.path, { tmpdir: tmpdir(), homedir: homedir() }) : undefined;
+  const pendingFile = pendingDir === undefined ? undefined : createPendingFileJournal(join(pendingDir, "pending.jsonl"));
+  /** Late-bound: the lease guard exists only once the v2 adapter attaches (FinishAttach `leaseGate`); the wiring reads it per use. */
+  let leaseGateRef: Pick<LeaseGuard, "waitTreeFree"> | undefined;
   const {
     graderSessions, dispatchGrader, buildGateDeps, disposeChildSession,
     prepareVerification, startReferenceGc,
@@ -835,6 +836,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     ...(pendingFile === undefined ? {} : {
       pending: { persist: pendingFile, onVerdict: (entry: PendingEntry, result: SettledVerification) => postHeldVerdict(entry, result) },
       pendingRestore: pendingFile.load(),
+      // v2 only. Delegating: the guard arrives with the adapter's attach; until then (or without `leases: enforce`) nothing waits.
+      leaseGate: {
+        waitTreeFree: async (tree, owner, deadlineMs, signal) =>
+          leaseGateRef === undefined ? { waitedMs: 0, holders: [], fileCount: 0 } : leaseGateRef.waitTreeFree(tree, owner, deadlineMs, signal),
+      },
     }),
   });
   // 2.1.5b: sweep reference dirs a crashed instance left behind. Fire-and-forget; never throws.
@@ -3471,7 +3477,46 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     return `task_id: ${childSessionID} (for resuming to continue this task if needed)\n\n<task_result>\n${text}\n</task_result>`;
   }
 
+  // ONE journal (memo §11): the same `pending.jsonl` the pending store and the held results append to. Absent on v1 (accepts and forgets).
+  const processedKeys = new Set<string>();
+  let dormantSessions = new Map<string, DormantSession>();
+  const sharedJournal: InflightJournal = {
+    async append(record, opts) {
+      if (record.kind === "processed") {
+        const key = processedKeyOf(record);
+        if (key !== undefined) processedKeys.add(key);
+      }
+      if (pendingFile === undefined) return;
+      // `inflight` and `hold` records are fsync'd (memo §11.2); the rest only when the caller asks.
+      const fsync = opts?.fsync === true || record.kind === "inflight" || record.kind === "hold";
+      await pendingFile.append(record, fsync ? { fsync: true } : undefined);
+    },
+    hasProcessed: (key) => processedKeys.has(key),
+  };
+  const pidAlive = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "EPERM";
+    }
+  };
   const finishApi: FinishApi = {
+    journal: sharedJournal,
+    captureDelta: async (callID, childSessionID) => changedFileStore.captureDelta(callID, childSessionID),
+    async reload() {
+      if (pendingFile === undefined) return;
+      const folded = foldDormantRecords(await pendingFile.load(), { now: Date.now(), ttlMs: DEFAULT_PENDING_TTL_MS });
+      dormantSessions = folded.sessions;
+      for (const key of folded.processed) processedKeys.add(key);
+    },
+    adopt(sessionID): AdoptedRecords | undefined {
+      const session = dormantSessions.get(sessionID);
+      if (session === undefined || pendingDir === undefined) return undefined;
+      dormantSessions.delete(sessionID);
+      if (!claimPendingSession(join(pendingDir, "pending.claims"), sessionID, { pid: process.pid, now: Date.now(), isAlive: pidAlive })) return undefined;
+      return { holds: session.holds, inflight: session.inflight };
+    },
     verificationFor(callID) {
       const args = taskArgsByCall.get(callID);
       if (args === undefined) return undefined;
@@ -3563,8 +3608,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       return { outputText: fin.outputText + suffix, suffix, verification, metadata: {} };
     },
   };
-  const attachFinish: FinishAttach = ({ held }) => {
+  const attachFinish: FinishAttach = ({ held, leaseGate }) => {
     heldSink = held;
+    leaseGateRef = leaseGate;
     return finishApi;
   };
 
