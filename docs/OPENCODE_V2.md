@@ -77,6 +77,51 @@ list replaces the earlier list in full, and `[]` clears it. V1 ignores this list
 and instead follows the host capability flag: `capabilities.temperature: false`
 prevents the router from setting grader temperature.
 
+## Per-turn router state
+
+The system prompt of an orchestrator must not move between turns, or the host's prompt
+cache misses on everything after the first part that changed. The router therefore keeps
+everything that changes from turn to turn out of the system array and delivers it as the
+per-turn router state.
+
+**What it contains.** The late verification notices (see
+[VERIFICATION.md](VERIFICATION.md)), the list of still-unverified delegations, and, in
+`advise` mode, the route hint. Later phases add more sections. Sections come in a fixed
+order, separated by a blank line; a section with nothing to say is left out, and with no
+section at all there is no state and the request is left untouched.
+
+**Where it goes.** The state is rendered into a `<router-state>` text wrapped in a last
+`user` message that the router appends after the conversation on every request. It is
+regenerated for each request and never persisted: it is not in the session history, so
+the next request carries the current state, not the previous one. The system parts and
+the earlier messages are never copied, reordered or rewritten for it. Only root
+orchestrator sessions get it: child sessions, graders and role sessions get no state and
+no hint.
+
+**Bound.** The whole message, wrapper included, is at most 6000 characters. When the
+sections are longer, whole lines are dropped from the end and the last line says how many
+were left out (`… 12 more lines`; a line ends with ` (router_plan action=status)` when a
+plan section is active). Lines are never cut in the middle.
+
+**Cache hint.** The router puts one ephemeral cache breakpoint (`{ "type": "ephemeral" }`)
+on the last non-empty text part of the last real message (the last message that has one,
+so a trailing tool result is skipped and the hint lands on the text before it). The state
+message itself never carries it, and no system part gets one. It carries no 1-hour TTL:
+OpenCode v2.0.26 cannot set the TTL of the tools breakpoint, so a longer TTL on the
+message breakpoint alone would not keep the prefix cached (ADR 0007, decision D5,
+withdrawn); the router has no setting for the cache hint's lifetime.
+
+**The `R:` line.** In `advise` and `enforce` mode the `R:` line of the protocol is
+generated from recorded outcomes. With the state in place it is frozen per session: the
+first request of a session fixes it, and it is reused while the configuration, the agent
+catalog and the orchestrator's model are unchanged. A change to any of these, or a new
+session, regenerates it, and that request misses the cache. Fresh routing evidence still
+reaches the model through the route hint, which is in the state; `enforce` decides at
+dispatch.
+
+**v1.** OpenCode v1 keeps the old delivery, unchanged: the pending list and the late
+notices (once) are system parts there, and there is no route hint (it is a v2 feature).
+
 ## Child sessions, cancellation and verification
 
 The v2 public session creation method cannot set `parentID`. Creating a standalone

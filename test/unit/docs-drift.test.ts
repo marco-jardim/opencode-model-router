@@ -1610,6 +1610,56 @@ function tuiJsonProblems(text: string): string[] {
   return problems;
 }
 
+describe("docs drift: the per-turn router state on OpenCode v2 (Phase 1.2.6)", () => {
+  const v2Doc = read("docs/OPENCODE_V2.md");
+  const verification = read("docs/VERIFICATION.md");
+  const state = sectionOf(v2Doc, "## Per-turn router state");
+  const flatState = state.replace(/\s+/g, " ");
+  const flatVerification = verification.replace(/\s+/g, " ");
+
+  it("OPENCODE_V2.md has the section and states what it contains, where it goes, its bound and its cache hint", () => {
+    expect(state).not.toBe("");
+    expect(flatState).toMatch(/late verification notices/);
+    expect(flatState).toMatch(/list of still-unverified delegations/);
+    expect(flatState).toMatch(/the route hint/);
+    expect(flatState).toContain("`<router-state>`");
+    expect(flatState).toMatch(/last `user` message that the router appends after the conversation on every request/);
+    expect(flatState).toMatch(/regenerated for each request and never persisted/);
+    expect(flatState).toMatch(/not in the session history/);
+    expect(flatState).toMatch(/child sessions, graders and role sessions get no state and no hint/);
+    expect(flatState).toMatch(/at most 6000 characters/);
+    expect(flatState).toContain("`… 12 more lines`");
+    expect(flatState).toContain("` (router_plan action=status)`");
+    expect(flatState).toMatch(/one ephemeral cache breakpoint/);
+    expect(flatState).toMatch(/last non-empty text part of the last real message/);
+    expect(flatState).toMatch(/no 1-hour TTL/);
+    expect(flatState).toMatch(/OpenCode v2\.0\.26 cannot set the TTL of the tools breakpoint/);
+    expect(flatState).toMatch(/ADR 0007, decision D5, withdrawn/);
+    expect(flatState).toMatch(/frozen per session/);
+    expect(flatState).toMatch(/configuration, the agent catalog and the orchestrator's model are unchanged/);
+    expect(flatState).toMatch(/OpenCode v1 keeps the old delivery, unchanged/);
+    expect(longProseLines(state)).toEqual([]);
+  });
+
+  it("the bound in the guide is the code's, and no cache-lifetime setting exists", () => {
+    expect(read("src/compat/turn-state.ts")).toMatch(/export const TURN_STATE_MAX_CHARS = 6000;/);
+    expect(read("src/compat/turn-state.ts")).toContain("type: \"ephemeral\"");
+    expect(withoutComments(read("src/compat/turn-state.ts"))).not.toMatch(/\bttl(Seconds)?\b/i);
+    for (const path of ["docs/CONFIG_REFERENCE.md", "docs/OPENCODE_V2.md", "src/router/config.ts"]) {
+      expect(read(path), path).not.toContain("promptCache");
+    }
+  });
+
+  it("VERIFICATION.md says the pending list and the late notices arrive in the per-turn state on v2 and notices stay until read", () => {
+    expect(flatVerification).toMatch(/On OpenCode v2 the pending list and the late notices arrive in the per-turn router state/);
+    expect(flatVerification).toMatch(/a `<router-state>` message the router appends after the conversation on every request and never stores in the session history/);
+    expect(flatVerification).toMatch(/stays there on every turn until `router_verify` returns its handle/);
+    expect(flatVerification).toMatch(/On OpenCode v1 the notice is a one-time block in the orchestrator's system prompt/);
+    expect(flatVerification).toContain("(OPENCODE_V2.md#Per-turn-router-state)");
+    expect(anchorsOf(v2Doc).has("per-turn-router-state")).toBe(true);
+  });
+});
+
 describe("docs drift: OpenCode v2 TUI status (#90 P2.2)", () => {
   const guide = read("docs/TUI_STATUS.md");
   const flat = guide.replace(/\s+/g, " ");
