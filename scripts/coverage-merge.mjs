@@ -61,7 +61,7 @@ function repoRelative(p) {
 }
 
 const merged = libCoverage.createCoverageMap({});
-const branchCounts = new Map(); // rel -> max branch-path count seen in a single input
+const mapSizes = new Map(); // rel -> max branch-path count and max function count seen in a single input
 for (const input of inputs) {
   const raw = JSON.parse(readFileSync(input, "utf8"));
   let files = 0;
@@ -71,7 +71,11 @@ for (const input of inputs) {
     const abs = resolve(rel);
     const fc = libCoverage.createFileCoverage({ ...data, path: abs });
     const count = Object.values(fc.b).reduce((n, arr) => n + arr.length, 0);
-    branchCounts.set(rel, Math.max(branchCounts.get(rel) ?? 0, count));
+    const prev = mapSizes.get(rel);
+    mapSizes.set(rel, {
+      branches: Math.max(prev?.branches ?? 0, count),
+      functions: Math.max(prev?.functions ?? 0, Object.keys(fc.f).length),
+    });
     merged.addFileCoverage(fc);
     files++;
   }
@@ -83,13 +87,17 @@ writeFileSync(join(outDir, "coverage-final.json"), JSON.stringify(merged.toJSON(
 
 // Summaries of every merged src/ file, keyed by repo-relative path, for the pure gate decision.
 const stats = new Map();
-for (const rel of branchCounts.keys()) {
+for (const [rel, seen] of mapSizes) {
   const fc = merged.fileCoverageFor(resolve(rel));
   const s = fc.toSummary();
   const merges = Object.values(fc.b).reduce((n, arr) => n + arr.length, 0);
-  // Location-keyed merge must not grow the branch set: a larger count means the
+  const fnMerges = Object.keys(fc.f).length;
+  // Location-keyed merge must not grow the branch or function set: a larger count means the
   // two OSes mapped the same source to different locations (e.g. CRLF drift).
-  const drift = merges > (branchCounts.get(rel) ?? 0) ? `  WARN branch map drift ${branchCounts.get(rel)}->${merges}` : "";
+  const drifts = [];
+  if (merges > seen.branches) drifts.push(`branch map drift ${seen.branches}->${merges}`);
+  if (fnMerges > seen.functions) drifts.push(`function map drift ${seen.functions}->${fnMerges}`);
+  const drift = drifts.length > 0 ? `  WARN ${drifts.join("; ")}` : "";
   stats.set(rel, { lines: s.lines, branches: s.branches, functions: s.functions, note: drift });
 }
 

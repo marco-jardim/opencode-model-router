@@ -16,6 +16,9 @@ import {
   GATE_TRANSITIONS,
   GATE_TRANSITION_OWNERS,
   GATE_TRANSITION_TRIGGERS,
+  GATE_TRIGGER_OWNERS,
+  RESERVED_TASK_IDS,
+  isTaskId,
   GIT_ID_PATTERN,
   HEAVY_CAP_PER_PROVIDER,
   INBOX_ID_PATTERN,
@@ -363,6 +366,28 @@ describe("constants and enumerations", () => {
     }
   });
 
+  it("task ids that collide with Object.prototype names are reserved (QA-1.4-31)", () => {
+    const reserved = ["constructor", "toString", "__proto__", "hasOwnProperty", "valueOf", "prototype"];
+    for (const id of reserved) {
+      expect(RESERVED_TASK_IDS.has(id), id).toBe(true);
+      expect(isTaskId(id), id).toBe(false);
+      expect(isTaskNode({ ...taskNode("T1"), id }), id).toBe(false);
+    }
+    for (const ok of ["T1", "constructors", "toString2", "value"]) {
+      expect(isTaskId(ok), ok).toBe(true);
+    }
+    expect(isTaskId(5)).toBe(false);
+    expect(isTaskNode(taskNode("T1"))).toBe(true);
+  });
+
+  it("a `__proto__` key in tasks stays an own entry and is reported, not interpreted", () => {
+    const l = JSON.parse(JSON.stringify({ ...LEDGER, tasks: {} })) as LedgerV1;
+    Object.defineProperty(l.tasks, "__proto__", { value: taskNode("T1"), enumerable: true, configurable: true, writable: true });
+    expect(isLedgerV1(l)).toBe(false);
+    expect(ledgerViolations(l).some((v) => v.code === "task-key")).toBe(true);
+    expect(Object.getPrototypeOf(l.tasks)).toBe(Object.prototype);
+  });
+
   it("EXECUTOR_DEFAULTS sit within EXECUTOR_LIMITS and are frozen", () => {
     const L = EXECUTOR_LIMITS;
     const D = EXECUTOR_DEFAULTS;
@@ -605,6 +630,38 @@ describe("gate state machine (§3.3), cell by cell", () => {
     expect(GATE_TRANSITION_TRIGGERS["awaiting-qa>pending"]).toEqual(["cap-fix"]);
     expect(GATE_TRANSITION_OWNERS["awaiting-qa>pending"]).toEqual(["QL"]);
     for (const b of GATE_STATES) expect(canGateTransition("passed", b), b).toBe(false);
+  });
+
+  it("GATE_TRIGGER_OWNERS covers every trigger and refines the pair owners (QA-1.4-29)", () => {
+    expect(Object.keys(GATE_TRIGGER_OWNERS).sort()).toEqual([...ALL_GATE_TRIGGERS].sort());
+    expect(GATE_TRIGGER_OWNERS["qa-requeued"]).toEqual(["Rt", "P", "Q"]);
+    expect(GATE_TRIGGER_OWNERS["qa-cap"]).toEqual(["QL"]);
+    for (const [a, b, triggers, owners] of EXPECTED_ROWS) {
+      const union = new Set(triggers.flatMap((t) => GATE_TRIGGER_OWNERS[t]));
+      expect([...union].sort(), `${a}>${b}`).toEqual([...owners].sort());
+      for (const t of triggers) {
+        for (const o of GATE_TRIGGER_OWNERS[t]) expect(owners, `${t}:${o}`).toContain(o);
+      }
+    }
+  });
+
+  it("row 4b of a qa task writes G1 then G2 as a legal chain that returns to the phase's gate (QA-1.4-24)", () => {
+    const start: GateState = "awaiting-qa";
+    const batch: Array<{ from: GateState; to: GateState; trigger: GateTrigger; owner: GateOwner }> = [
+      { from: "awaiting-qa", to: "qa-running", trigger: "qa-dispatched", owner: "Rt" },
+      { from: "qa-running", to: "awaiting-qa", trigger: "qa-requeued", owner: "Rt" },
+    ];
+    let gate: GateState = start;
+    for (const e of batch) {
+      expect(e.from, e.trigger).toBe(gate); // the replay check `from === phase.gate`
+      expect(canGateTransition(e.from, e.to), e.trigger).toBe(true);
+      expect(GATE_TRANSITION_TRIGGERS[`${e.from}>${e.to}` as GateTransitionKey], e.trigger).toContain(e.trigger);
+      expect(GATE_TRIGGER_OWNERS[e.trigger], e.trigger).toContain(e.owner);
+      gate = e.to;
+    }
+    expect(gate).toBe(start);
+    // Writing only G2 (or only G1) would be illegal against the phase's gate.
+    expect(canGateTransition("awaiting-qa", "awaiting-qa")).toBe(false);
   });
 
   it("matches the expected 6x6 table", () => {
@@ -1589,8 +1646,9 @@ function oracleTaskCodes(t: TaskNode): Set<string> {
   if (["verifying", "verified", "integrating"].includes(t.state) && t.branch === null) out.add("branch-required");
   if (t.state === "integrated" && t.integrated === null) out.add("integrated-missing");
   if (t.integrated !== null) {
-    const hex40 = (s: string): boolean => s.length === 40 && /^[0-9a-f]+$/.test(s);
-    if (!hex40(t.integrated.from) || !hex40(t.integrated.to)) out.add("git-id");
+    // SHA-1 (40) or SHA-256 (64) lowercase hex (A1-7), written independently of GIT_ID_PATTERN.
+    const hexId = (s: string): boolean => (s.length === 40 || s.length === 64) && /^[0-9a-f]+$/.test(s);
+    if (!hexId(t.integrated.from) || !hexId(t.integrated.to)) out.add("git-id");
   }
   if ((t.kind === "manual" || t.kind === "preflight") && A.length > 0) out.add("manual-attempts");
   for (const a of A) {
@@ -1646,7 +1704,9 @@ function genConsistentTask(rng: () => number, id: string, state: TaskState, want
     kind, state, attempts,
     slot: slotRequired ? "slot-1" : slotForbidden ? null : rng() < 0.5 ? "slot-1" : null,
     branch: branchRequired || rng() < 0.5 ? `omr/plan-one/t/${id}` : null,
-    integrated: state === "integrated" || rng() < 0.3 ? { from: SHA_A, to: SHA_B } : null,
+    integrated: state === "integrated" || rng() < 0.3
+      ? (rng() < 0.4 ? { from: SHA_A.repeat(2).slice(0, 64), to: SHA_B.repeat(2).slice(0, 64) } : { from: SHA_A, to: SHA_B })
+      : null,
   });
 }
 
@@ -1667,6 +1727,9 @@ const MUTATIONS: Mutation[] = [
   (t) => { t.integrated = t.integrated === null ? { from: SHA_A, to: SHA_B } : null; },
   (t) => { t.integrated = { from: "xyz", to: SHA_B }; },
   (t) => { t.integrated = { from: SHA_A, to: SHA_B.toUpperCase() }; },
+  (t) => { t.integrated = { from: "a".repeat(64), to: "b".repeat(64) }; }, // SHA-256 ids are valid
+  (t) => { t.integrated = { from: "a".repeat(63), to: "b".repeat(64) }; },
+  (t) => { t.integrated = { from: "a".repeat(41), to: SHA_B }; },
   (t, rng) => { t.kind = pick(rng, TASK_KINDS); },
   (t) => { t.attempts = []; },
 ];
@@ -2042,6 +2105,7 @@ describe("typed test doubles for every interface", () => {
         return hit(`append:${events.length}`, LEDGER);
       },
       openIntegration: () => hit("openIntegration", [OPEN_ENTRY]),
+      wakeKeys: () => hit("wakeKeys", new Set(["inbox:i1", "stale-context:b1:1"])),
       snapshot: async () => hit("snapshot", undefined),
       close: async () => hit("close", undefined),
     };
@@ -2051,9 +2115,11 @@ describe("typed test doubles for every interface", () => {
     expect(await writer.append(builder)).toBe(LEDGER);
     expect(await writer.append(() => [])).toBe(LEDGER);
     expect(writer.openIntegration()).toEqual([OPEN_ENTRY]);
+    expect(writer.wakeKeys().has("inbox:i1")).toBe(true);
+    expect(writer.wakeKeys().has("inbox:i2")).toBe(false);
     await writer.snapshot();
     await writer.close();
-    expect(calls).toEqual(["append:1", "append:2", "append:0", "openIntegration", "snapshot", "close"]);
+    expect(calls).toEqual(["append:1", "append:2", "append:0", "openIntegration", "wakeKeys", "wakeKeys", "snapshot", "close"]);
   });
 
   it("PlanCompiler", async () => {
@@ -2137,8 +2203,42 @@ describe("typed test doubles for every interface", () => {
 
   it("LeaseView / LeaseService, CapacityView and Scheduler", () => {
     const { calls, hit } = tracker();
-    const leases: LeaseService = { holder: () => hit("holder", { taskId: "T1", sessionID: "ses-1" }) };
+    // A stateful LeaseService double (QA-1.4-22): all-or-nothing acquire, idempotent release, rebuild from the ledger.
+    const held = new Map<string, { taskId: string; sessionID: string | null }>();
+    const leases: LeaseService = {
+      holder: () => hit("holder", { taskId: "T1", sessionID: "ses-1" }),
+      acquireTask: (taskId, sessionID, writes) => {
+        const holders = writes.flatMap((p) => {
+          const h = held.get(p);
+          return h !== undefined && h.taskId !== taskId ? [{ taskId: h.taskId, sessionID: h.sessionID ?? "" }] : [];
+        });
+        if (holders.length > 0) return { ok: false, holders };
+        for (const p of writes) held.set(p, { taskId, sessionID });
+        return { ok: true };
+      },
+      releaseTask: (taskId) => {
+        for (const [p, h] of [...held]) if (h.taskId === taskId) held.delete(p);
+      },
+      rebuild: (tasks) => {
+        held.clear();
+        for (const t of tasks) if (t.slot !== null) for (const p of t.footprint.writes) held.set(p, { taskId: t.id, sessionID: null });
+      },
+    };
     const view: LeaseView = leases;
+    expect(leases.acquireTask("T1", null, ["src/a.ts", "src/b.ts"])).toEqual({ ok: true });
+    expect(leases.acquireTask("T1", "ses-1", ["src/a.ts"])).toEqual({ ok: true });
+    expect(leases.acquireTask("T2", "ses-2", ["src/b.ts", "src/c.ts"])).toEqual({
+      ok: false, holders: [{ taskId: "T1", sessionID: "" }],
+    });
+    expect(held.has("src/c.ts")).toBe(false);
+    leases.releaseTask("T1");
+    leases.releaseTask("T1");
+    expect(held.size).toBe(0);
+    leases.rebuild([
+      { id: "T3", slot: "s1", footprint: { ...taskNode("T3").footprint, writes: ["src/z.ts"] } },
+      { id: "T4", slot: null, footprint: { ...taskNode("T4").footprint, writes: ["src/y.ts"] } },
+    ]);
+    expect([...held.keys()]).toEqual(["src/z.ts"]);
     const capacity: CapacityView = {
       routeOf: () => hit("routeOf", ROUTE),
       free: () => hit("free", 2),

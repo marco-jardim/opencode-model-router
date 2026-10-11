@@ -24,6 +24,20 @@ export const LEDGER_SCHEMA = 1 as const;
 export const PLAN_ID_PATTERN = /^[a-z0-9][a-z0-9-]{2,40}$/;
 /** Task id grammar: never integer-like (R14); contains no ':', '#', ']' or space (§5). */
 export const TASK_ID_PATTERN = /^(?!\d+$)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+/**
+ * Task ids that match `TASK_ID_PATTERN` but collide with `Object.prototype` / function property names (QA-1.4-31).
+ * Rejected by `isTaskId` (used by the guard and `isTaskNode`). Maps keyed by task id (`tasks`, `slots`, ...) must
+ * still use own-property lookups (`Object.hasOwn`, `Map`), never `obj[id]` or `id in obj`.
+ * (`__proto__` already fails the pattern: it starts with `_`.)
+ */
+export const RESERVED_TASK_IDS: ReadonlySet<string> = new Set([
+  "constructor", "toString", "__proto__", "hasOwnProperty", "valueOf", "prototype",
+  "isPrototypeOf", "propertyIsEnumerable", "toLocaleString",
+]);
+/** True iff `v` is a string that matches `TASK_ID_PATTERN` and is not in `RESERVED_TASK_IDS`. */
+export function isTaskId(v: unknown): v is TaskId {
+  return typeof v === "string" && TASK_ID_PATTERN.test(v) && !RESERVED_TASK_IDS.has(v);
+}
 /** Attempt nonce: 128 random bits as lowercase hex (§5). */
 export const NONCE_PATTERN = /^[0-9a-f]{32}$/;
 /** Phase id grammar (A1-7): also a valid git ref component, no "..", no trailing ".", no ".lock" suffix. */
@@ -435,7 +449,7 @@ export const GATE_TRANSITIONS: Readonly<Record<GateState, readonly GateState[]>>
   passed: [],
 };
 
-/** Why a gate changed; one per `gate-changed` event (A1-1). */
+/** Why a gate changed; one per `gate-changed` event (A1-1). Owners per trigger: `GATE_TRIGGER_OWNERS`. */
 export type GateTrigger =
   | "phase-integrated" | "suite-passed" | "suite-culprit-found" | "culprit-reverted" | "suite-rerun"
   | "qa-dispatched" | "qa-requeued" | "qa-cap" | "qa-next-round" | "qa-clean" | "no-open-qa" | "cap-accepted" | "cap-fix";
@@ -476,6 +490,32 @@ export const GATE_TRANSITION_OWNERS: Readonly<Partial<Record<GateTransitionKey, 
   "qa-running>awaiting-qa": ["Rt", "P", "Q", "QL"],
   "qa-running>pending": ["QL"],
   "qa-running>passed": ["QL"],
+};
+
+/**
+ * Who may journal each trigger (A2, QA-1.4-29). Refines `GATE_TRANSITION_OWNERS`: for every legal pair, the union of the
+ * owners of its triggers equals the pair's owners. Only the pair `qa-running>awaiting-qa` splits: `qa-requeued` is written
+ * by `Rt`/`P`/`Q` (a task ending or being parked/requeued), `qa-cap` only by `QL`.
+ *
+ * Row 4b (A2, QA-1.4-24): for a `kind: "qa"` task, a launch with a task-class prep error journals `[TS], AS, TT ready->dispatched, AE(failed),
+ * AX(error), TT dispatched->failed, G1, G2` with G1 = `awaiting-qa>qa-running` (`qa-dispatched`, owner Rt) and G2 = `qa-running>awaiting-qa`
+ * (`qa-requeued`, owner Rt). Both gate events are written (never only one, never none) so each `from` equals the phase's gate at that point
+ * (`awaiting-qa`, then `qa-running`) and the batch ends where it started; the failed qa task then returns through the normal retry path.
+ */
+export const GATE_TRIGGER_OWNERS: Readonly<Record<GateTrigger, readonly GateOwner[]>> = {
+  "phase-integrated": ["Q"],
+  "suite-passed": ["Q"],
+  "suite-culprit-found": ["Q"],
+  "culprit-reverted": ["Q"],
+  "suite-rerun": ["Q"],
+  "qa-dispatched": ["Rt", "Rc"],
+  "qa-requeued": ["Rt", "P", "Q"],
+  "qa-cap": ["QL"],
+  "qa-next-round": ["QL"],
+  "qa-clean": ["QL"],
+  "no-open-qa": ["QL"],
+  "cap-accepted": ["QL"],
+  "cap-fix": ["QL"],
 };
 
 /** True iff `a -> b` is a legal gate transition (§3.3). */
@@ -765,7 +805,7 @@ export interface LedgerViolation {
 /** Types, enums, finite numbers and patterns of a task node; no cross-field invariants. */
 function isTaskShape(v: unknown): v is TaskNode {
   if (!isRec(v)) return false;
-  if (!isStr(v.id) || !TASK_ID_PATTERN.test(v.id) || !isStr(v.title)) return false;
+  if (!isTaskId(v.id) || !isStr(v.title)) return false;
   if (!isStrOrNull(v.phase) || !isOneOf(TASK_KINDS, v.kind) || !isStr(v.text) || !isStrArr(v.subtasks)) return false;
   const r = v.route;
   if (!isRec(r) || !isStr(r.line) || !isStr(r.role) || !(r.tier === null || isOneOf(["fast", "medium", "heavy"] as const, r.tier)) ||
@@ -958,7 +998,8 @@ export function ledgerViolations(v: unknown): LedgerViolation[] {
   }
 
   // tasks
-  const tasks: Record<string, TaskNode> = {};
+  // Null prototype: a `__proto__` key must stay a plain entry (QA-1.4-31).
+  const tasks: Record<string, TaskNode> = Object.create(null);
   let tasksOk = false;
   if (!isRec(v.tasks)) add("shape", "$.tasks");
   else {
@@ -1261,11 +1302,15 @@ export interface LedgerStore {
   /** pre: no plan dir; isLedgerV1(draft) and `draft.seq === 1`; post: dir, snapshot, journal (ledger-init `{seq: 1, batch: 1, last: true}`), lock held.
    *  err E_EXISTS, E_SCHEMA_INVALID (including any other draft seq) */
   create(draft: LedgerV1, holder: LockHolder): Promise<LedgerWriter>;
-  /** Takes the writer lock. err E_LEDGER_NOT_FOUND, E_LOCK_HELD (detail = holder), E_SCHEMA_NEWER, E_SEQ_GAP, E_ILLEGAL_TRANSITION (detail names the event) */
+  /** Takes the writer lock. Load rules (A2, QA-1.4-25): batch framing applies to the main journal only: rule (2) a torn last line is dropped,
+   *  rule (3) a trailing incomplete batch (events before the `last: true` event) is dropped whole with one warning, and a batch that is
+   *  malformed anywhere else is E_SEQ_GAP. The history journal is checked for strictly increasing `seq` and a torn last line only (no batches).
+   *  err E_LEDGER_NOT_FOUND, E_LOCK_HELD (detail = holder), E_SCHEMA_NEWER, E_SEQ_GAP, E_ILLEGAL_TRANSITION (detail names the event) */
   open(planId: PlanId, holder: LockHolder): Promise<LedgerWriter>;
   /** Only when the lock is stale (dead pid on this host, or heartbeat > 60 s) or the caller is adopting; journals lock-takeover. err E_LOCK_HELD */
   takeover(planId: PlanId, holder: LockHolder, reason: string): Promise<LedgerWriter>;
-  /** Lock-free consistent read (retries while snapshot seq != first journal seq). A torn last line is dropped with one warning. */
+  /** Lock-free consistent read (retries while snapshot seq != first journal seq). A torn last line is dropped with one warning, and so is a
+   *  trailing incomplete batch (rule (3), main journal only; A2, QA-1.4-25), so a reader never sees half a batch. */
   read(planId: PlanId): Promise<LedgerV1>;
   list(): Promise<Array<{ planId: PlanId; status: LedgerStatus; toplevel: string; orchestratorSessionID: string; seq: number }>>;
   /** snapshot = current ledger; events = every history event since seq 1 merged with every event of the current main journal, deduplicated
@@ -1287,6 +1332,9 @@ export interface LedgerWriter {
   append(batch: readonly ExecutorEventInput[] | BatchBuilder): Promise<Readonly<LedgerV1>>;
   /** Integration entries still open in the history journal (A1-3); updated on every append. */
   openIntegration(): readonly OpenIntegrationEntry[];
+  /** Wake keys already written (A1-6): built from the history journal at `open`, updated on every append. Lets the `Waker` stay idempotent
+   *  across restarts without scanning the ledger. (QA-1.4-23) */
+  wakeKeys(): ReadonlySet<string>;
   /** Also every 200 events, then rotates the journal. */
   snapshot(): Promise<void>;
   /** Snapshot, then release the lock; idempotent. */
@@ -1357,7 +1405,11 @@ export interface IntegrationListener {
   onInbox(item: InboxItem): void;
 }
 
-/** Serial rebase/check/fast-forward queue, phase suite and landing (3.2). */
+/**
+ * Serial rebase/check/fast-forward queue, phase suite and landing (3.2).
+ * Leases (A2, QA-1.4-22): the queue releases a task's leases (`LeaseService.releaseTask`) in the same step that releases its slot
+ * (A1-2.4), i.e. after the fsync of the batch that moves it to integrated, reverted or cancelled (never before).
+ */
 export interface IntegrationQueue {
   /** pre: each id is verified with slot and branch. Idempotent (an id already queued or integrating is ignored).
    *  Dequeue only while `status === "running"` and the task's phase is null or not paused (A1-8): a queued task of a paused phase is
@@ -1365,11 +1417,20 @@ export interface IntegrationQueue {
    *  Dequeue journals verified->integrating (durable) before any git step. err E_PLAN_STATE, E_DISPOSED */
   enqueue(taskIds: readonly TaskId[]): void;
   /** Runs once per plan before the first dequeue, whatever the task states, in running and paused (A1-3); starts no new step except its reruns.
-   *  Step 0 reconciles the integration branch tip with `integration.head` (complete a fast-forward that landed, else pause and halt);
+   *  Step 0 reconciles the integration branch tip with `integration.head` (complete a fast-forward that landed, else halt). A halt writes `status-changed running->paused` only when the plan is
+   *  `running` (an already paused plan stays paused, no event) and always raises the inbox item (A2, QA-1.4-26);
    *  step 1 handles each open history entry oldest first by kind (rollback and requeue, rerun the revert, rerun the suite, tag, land).
    *  Idempotent. */
   resume(): Promise<ResumeReport>;
-  /** Starts the phase suite when §3.3's precondition holds and the plan is running with the phase not paused; idempotent. */
+  /** Starts the phase suite when §3.3's precondition holds and the plan is running with the phase not paused; idempotent.
+   *  Batch rules (A2, QA-1.4-21): the gate change into `suite-running` (trigger `phase-integrated`, or `suite-rerun` from `suite-failed`) and the
+   *  suite's opening `integration-step` (ISS) are ONE Q batch; the suite's closing ISE and the gate change out of `suite-running`
+   *  (`suite-passed` / `suite-culprit-found`) are ONE batch (same for a `suite-rerun` suite). A crash therefore never leaves the gate in
+   *  `suite-running` with a half-written pair, except through rollback while paused (below).
+   *  On gate `suite-running` with NO open phase-suite entry in `openIntegration()`: "start the suite, no gate event" (journal the ISS only;
+   *  the gate already is `suite-running`, so no `gate-changed` is written). Recovery row: gate `suite-running`, no open entry -> `checkPhase`.
+   *  The runtime calls `checkPhase` for each phase whose gate is `suite-running` or whose precondition holds when a paused plan resumes
+   *  (`status-changed paused->running`), so no phase stays in `suite-running` forever. */
   checkPhase(phaseId: PhaseId): Promise<void>;
   /** ff-when-clean or manual; never force, never non-ff. */
   land(): Promise<{ landed: boolean; inbox: InboxItem | null }>;
@@ -1383,6 +1444,24 @@ export interface IntegrationQueue {
 /** Who holds a path lease (2.1, scope `until-integrated`). */
 export interface LeaseView {
   holder(path: string): { taskId: TaskId | null; sessionID: string } | null;
+}
+
+/**
+ * The mutable lease seam of the executor (A2, QA-1.4-22): the one object `TaskLauncher`, `IntegrationQueue`, `UnattendedPolicy` and the
+ * runtime share. Mapped onto Phase 1.3's registry: `acquireTask` = `acquireWrite` for every path with scope `until-integrated` and
+ * `taskRef = taskId` (all-or-nothing: on conflict nothing is acquired and every holder is listed); `releaseTask` = release by `taskRef`
+ * (idempotent); `rebuild` = `restore` from the ledger at open (every task with a slot that is not yet integrated/reverted/cancelled
+ * holds its footprint writes). `holder` is the inherited read view.
+ */
+export interface LeaseService extends LeaseView {
+  /** `sessionID` is the child session once known, else null. `writes` are the task's footprint writes. */
+  acquireTask(
+    taskId: TaskId, sessionID: string | null, writes: readonly string[],
+  ): { ok: true } | { ok: false; holders: Array<{ taskId: TaskId | null; sessionID: string }> };
+  /** Idempotent. Called by `IntegrationQueue` and `UnattendedPolicy` on integrated, reverted, cancelled and parked-for-good (A1-2.4). */
+  releaseTask(taskId: TaskId): void;
+  /** Replaces all task leases from the ledger (open, takeover). */
+  rebuild(tasks: ReadonlyArray<Pick<TaskNode, "id" | "slot" | "footprint">>): void;
 }
 export interface TaskRoute {
   agent: string;
@@ -1532,6 +1611,11 @@ export type LaunchConfirmation =
 
 export type CancelReason = "abort" | "blocked" | "superseded" | "dispose";
 
+/**
+ * How a child ended. `endedAt` is the launcher's wall-clock reading and may precede `Attempt.startedAt` (clock step, restart).
+ * The runtime journals `attempt-ended.endedAt = max(end.endedAt, attempt.startedAt)` so the ledger invariant
+ * `endedAt >= startedAt` (`attempt-time`) always holds (A2, QA-1.4-27); it never rewrites `startedAt`.
+ */
 export type ChildEnd =
   | { kind: "completed"; childSessionID: string; text: string; endedAt: IsoTime }
   | { kind: "failed"; childSessionID: string; error: HostError; endedAt: IsoTime }
@@ -1582,6 +1666,13 @@ export interface TaskLauncher {
  * never the same stateKey twice (D15 668-671).
  */
 export interface Waker {
+  /* Rules (A1-6, QA-1.4-23):
+   *  - Dedupe source: the `stateKey` of every `wake` event of the plan, i.e. `LedgerWriter.wakeKeys()` (history at open + this writer since).
+   *  - A key is burned when its `wake` event is journaled (durable, before `synthetic`): the same key never wakes twice -> "duplicate".
+   *  - "debounced" (inside `wakeDebounceMs` of the last wake) journals nothing and burns nothing.
+   *  - "failed" (the `synthetic` call threw) burns the key. The caller may retry the same situation at most twice, each at least
+   *    `wakeDebounceMs` after the previous, with the keys `<key>#2` and `<key>#3`.
+   *  - `inbox:<id>` keys are plan-unique already. */
   wake(reason: WakeReason, stateKey: string): Promise<"sent" | "debounced" | "duplicate" | "failed">;
 }
 
@@ -1651,7 +1742,9 @@ export interface UnattendedPolicy {
   /** Dedupe: an open item with the same kind+taskId+text is returned instead. Journals inbox-added (durable); wakes ("inbox", "inbox:<id>") unless closed at creation. */
   raise(i: Omit<InboxItem, "id" | "createdAt" | "answer"> & { answer?: string }): Promise<InboxItem>;
   /** From running (escalate|ambiguity|qa-unparsable) or conflict|failed|reverted (exhausted). post: parked; transitive **pending** dependents
-   *  -> blocked (a dependent of an un-integrated task cannot be ready or in flight, R9/R10); one inbox item. */
+   *  -> blocked (a dependent of an un-integrated task cannot be ready or in flight, R9/R10); one inbox item.
+   *  Leases are held exactly while `slot !== null` (A1-2.4): parking releases the slot and so calls `LeaseService.releaseTask`; the answered
+   *  task re-acquires through `LeaseService.acquireTask` when it is launched again (A2, QA-1.4-22). */
   park(taskId: TaskId, cause: "escalate" | "ambiguity" | "qa-unparsable" | "exhausted", text: string): Promise<InboxItem>;
   /** pre: item open. post: inbox-answered; attempt-context on the latest attempt; parked -> ready. A critical `qa-cap` item goes to
    *  `QaLoop.onCapAnswer` instead (the answer must be one of its options). err E_INVALID_INPUT */
@@ -1687,8 +1780,6 @@ export interface RouteResolver {
 export interface RoleBindings {
   bind(i: { childSessionID: string; role: string; agent: string; workRoot: string; grant: string[] }): void;
 }
-/** Path leases of scope `until-integrated` (2.1); provides `LeaseView`. */
-export type LeaseService = LeaseView;
 /** Dispatch bookkeeping the launcher drives around a launch (D2): decision row, dispatch start, in-flight registry. */
 export interface DispatchBookkeeping {
   decisionRow(req: LaunchRequest): void;

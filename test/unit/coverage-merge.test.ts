@@ -1,6 +1,11 @@
 // QA-1.4-9: unit tests for the pure gate decision of scripts/coverage-merge.mjs
 // (scripts/coverage-gate.ts) and for the gate declarations in vitest.config.ts.
-import { describe, expect, it } from "vitest";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { afterAll, describe, expect, it } from "vitest";
 import { evaluateGates, type FileStat } from "../../scripts/coverage-gate.ts";
 import { MERGED_PER_FILE_GATED, MERGED_PER_FILE_MIN, MERGED_PREFIX_GATED } from "../../vitest.config.ts";
 
@@ -155,5 +160,90 @@ describe("gate declarations in vitest.config.ts", () => {
     expect(MERGED_PER_FILE_GATED).toContain("src/verify/exec.ts");
     expect(MERGED_PER_FILE_GATED).toContain("src/tui/status-model.ts");
     for (const rel of MERGED_PER_FILE_GATED) expect(rel.endsWith("/")).toBe(false);
+  });
+});
+
+// QA-1.4-30: the script itself, run as CI runs it (plain node, types stripped) on tiny istanbul fixtures.
+const ROOT = fileURLToPath(new URL("../../", import.meta.url));
+const [nodeMajor = 0, nodeMinor = 0] = process.versions.node.split(".").map(Number);
+// `--experimental-strip-types` exists from Node 22.6 (default-on from 22.18 / 23.6, where the flag is still accepted).
+const canStrip = nodeMajor > 22 || (nodeMajor === 22 && nodeMinor >= 6);
+const WORK = mkdtempSync(join(tmpdir(), "omr-cov-"));
+afterAll(() => rmSync(WORK, { recursive: true, force: true }));
+
+function pos(line: number) {
+  return { start: { line, column: 0 }, end: { line, column: 10 } };
+}
+
+/** One-statement, one-function istanbul file at `/fixture/src/executor/fixture.ts`; `fnLine` moves the function location. */
+function fixtureCoverage(fnHits: number, fnLine = 1): string {
+  const path = "/fixture/src/executor/fixture.ts";
+  return JSON.stringify({
+    [path]: {
+      path,
+      statementMap: { 0: pos(1) },
+      s: { 0: 1 },
+      fnMap: { 0: { name: "f", decl: pos(fnLine), loc: pos(fnLine), line: fnLine } },
+      f: { 0: fnHits },
+      branchMap: {},
+      b: {},
+    },
+  });
+}
+
+function runMerge(name: string, inputs: string[]) {
+  const dir = join(WORK, name);
+  mkdirSync(dir, { recursive: true });
+  const files = inputs.map((text, i) => {
+    const file = join(dir, `in${i}.json`);
+    writeFileSync(file, text);
+    return file;
+  });
+  const soft = MERGED_PER_FILE_GATED.flatMap((rel) => ["--warn-only", rel]); // the fixture covers none of the exact files
+  const r = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", "scripts/coverage-merge.mjs", ...soft, join(dir, "out"), ...files],
+    { cwd: ROOT, encoding: "utf8" },
+  );
+  return { status: r.status, out: `${r.stdout}\n${r.stderr}` };
+}
+
+describe.skipIf(!canStrip)("scripts/coverage-merge.mjs on fixture summaries", () => {
+  it("passes a prefix-gated file that meets every minimum", () => {
+    const r = runMerge("pass", [fixtureCoverage(1)]);
+    expect(r.out).toContain("src/executor/fixture.ts");
+    expect(r.out).toContain("coverage gate passed");
+    expect(r.status).toBe(0);
+  });
+
+  it("fails on functions below the prefix gate", () => {
+    const r = runMerge("fn-fail", [fixtureCoverage(0)]);
+    expect(r.out).toMatch(/src\/executor\/fixture\.ts.*FAIL/);
+    expect(r.status).toBe(1);
+  });
+
+  it("reports function-map drift when two inputs map the same source to different function locations", () => {
+    const r = runMerge("drift", [fixtureCoverage(1, 1), fixtureCoverage(1, 2)]);
+    expect(r.out).toContain("WARN function map drift 1->2");
+    expect(r.status).toBe(0);
+  });
+
+  it("exits 2 on bad input", () => {
+    const r = spawnSync(process.execPath, ["--experimental-strip-types", "scripts/coverage-merge.mjs"], { cwd: ROOT, encoding: "utf8" });
+    expect(r.status).toBe(2);
+  });
+});
+
+describe.skipIf(!canStrip)("scripts/coverage-gate.ts", () => {
+  it("uses only erasable syntax: node --experimental-strip-types imports it and runs evaluateGates", () => {
+    const url = pathToFileURL(join(ROOT, "scripts", "coverage-gate.ts")).href;
+    const code =
+      `const m = await import(${JSON.stringify(url)});` +
+      `const o = m.evaluateGates({ exact: [], exactMin: { lines: 90, branches: 90 }, prefixes: [], files: new Map() });` +
+      `console.log(JSON.stringify(o));`;
+    const r = spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", code], { cwd: ROOT, encoding: "utf8" });
+    expect(r.stderr).not.toMatch(/SyntaxError|ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX/);
+    expect(r.status).toBe(0);
+    expect(JSON.parse(r.stdout)).toEqual({ results: [], emptyPrefixes: [], warnings: [], failed: false });
   });
 });

@@ -1,6 +1,9 @@
 // Pure gate decision of scripts/coverage-merge.mjs, kept free of I/O so it can be unit-tested
-// (test/unit/coverage-merge.test.ts). Node strips the types when the script imports this file, so
-// only erasable TypeScript syntax is used here.
+// (test/unit/coverage-merge.test.ts). Node strips the types when the script imports this file
+// (`--experimental-strip-types`, the default from Node 22.18/23.6), so ONLY erasable TypeScript syntax
+// may be used here: type annotations, `interface`, `type`, `import type`. No `enum`, `namespace`, parameter
+// properties, `import x = require()`, `export =`, or angle-bracket assertions (QA-1.4-30). The test
+// "coverage-gate.ts uses only erasable syntax" runs it through `node --experimental-strip-types`.
 
 export interface Metric {
   pct: number;
@@ -8,7 +11,7 @@ export interface Metric {
   total: number;
 }
 
-/** Istanbul summary of one merged file, plus an optional free-text note (branch-map drift). */
+/** Istanbul summary of one merged file, plus an optional free-text note (branch- or function-map drift). */
 export interface FileStat {
   lines: Metric;
   branches: Metric;
