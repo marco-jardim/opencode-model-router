@@ -226,7 +226,7 @@ needs no restart. Changing `repoParents` does need one, and a parent must exist 
 
 **Naming the work root.** A dispatch still has one work root and edits only there. The route line names it with
 `root=`, or by repository name and branch, which the router checks against git (values keep their case; an invalid
-value gives no work root, see below):
+value refuses the dispatch, see below):
 
 ```text
 [route class=implement needs=edit repo=app-a branch=feat/login]
@@ -236,20 +236,23 @@ value gives no work root, see below):
 one of its linked worktrees below the parents (that worktree is the work root; with `branch=`, the worktree of its
 repository on that branch). A name that matches several repositories or worktree directories (each listed as
 `<worktree path> (repository <name>, branch <branch>)`), or a repository
-with several worktrees and no `branch=`, refuses the dispatch and the candidates are listed. `root`, `repo` and `branch` must
+with several worktrees and no `branch=`, refuses the dispatch and the candidates are listed. `root=<dir> branch=<b>` must
+agree: the worktree at `<dir>` must be on `<b>`. `repo=<dir> branch=<b>` instead binds the worktree of that directory's
+repository that is on `<b>`, which may lie outside the parents (admission rule 2 below). `root`, `repo` and `branch` must
 agree when given together. With parents set, the protocol tells the orchestrator: name another repository with
 `repo=<name>` (and `branch=<ref>` when it has several worktrees) instead of `root=`; each dispatch edits one
 repository, and a role may read the others below `routing.repoParents`. A routed role dispatch that has a work root and
 read access starts with a role header (`[router] You are @<role>. Execute this dispatch yourself.`), so the delegate is
 told where it works. The header is emitted only when cross-repo is configured (`routing.repoParents` is set), the route
 line declares a target (`repo=`, `branch=` or `root=`), or the work root differs from the session directory; otherwise the
-role prompt is byte-identical to what it was before the header existed (invariant I9). A fresh dispatch gets the header, the work root, and, when the grant is located, the repository,
+dispatch prompt is byte-identical to what it was before the header existed (invariant I9). A fresh dispatch gets the header, the work root, and, when the grant is located, the repository,
 branch and head: `Working directory: <root> (repository app-a, branch feat/login at 3f2c1a9). You are already there —
 do not ask permission to read or write inside it.` A read-only role is told `read` instead of `read or write`. With
 parents set, a second paragraph lists the session's repositories and where the role may read. The nonce line (or the
 carried `[acceptance]` block of a resume) stays the last line of the prompt. A resume gets the header only when its
 binding is exact, and without the head clause, which may be stale. A header the orchestrator copied from another dispatch
-is removed and replaced by the router's own. A read-only role's repositories paragraph says only where it may read. No
+is always removed, and replaced only when the router adds its own (so a dispatch that gets no header keeps no copied one
+either). A read-only role's repositories paragraph says only where it may read. No
 header: no work root, no `read`/`glob`/`grep` (`researcher`), a delegate's dispatch, a non-exact resume, a dispatch for
 which the header is not relevant (see above), or `dispatchHeader: false` (which still sends the role name and the `Working directory:` paragraph when the work root is not
 the session directory).
@@ -262,7 +265,8 @@ through admission. It is admitted when either:
 2. it is a worktree that a known repository lists: the session repository, or a repository in the session's working
    set. Its `git rev-parse --git-common-dir` must match that repository's, and it must still resolve to itself.
 
-Text checks come before any git call: UNC, device, 8.3 and `..` paths are refused. A final gate runs on every
+Text checks come before any git call: UNC, device, 8.3 and `..` paths are refused, and the refusal ends the dispatch
+(`[router] role dispatch @<agent> refused: <note>`). A final gate runs on every
 admission: `repoExclude` applies to both the shown and the canonical path, a candidate is never a configured parent or
 an ancestor of one, and a path whose text lies below a parent must also lie below it canonically. An excluded or
 link-escaping candidate is refused outright, with no fallback to rule 2. When admission is in use, a `root=` other than
@@ -274,8 +278,19 @@ grant's location and after the dispatch is registered; `branch=` alone still bin
 not grow it.
 
 **Invalid route fields.** An invalid or duplicated `repo=` or `branch=`, or one that conflicts between route lines,
-gives no work root, and so refuses the dispatch with the note `<key>=<value> is not a valid repository name / branch
-name: no work root. Fix the route line.` Branch names follow `git check-ref-format`, so `renovate/foo+bar` and `feat/ação` are valid. Names,
+is an invalid declaration and refuses the dispatch with the note `<key>=<value> is not a valid repository name / branch
+name: no work root. Fix the route line.` The same holds for a `root=` the route-line parser rejected (an invalid value, a
+bare `root`, a duplicate or a conflicting one): the dispatch is refused with `root=<value> is not a valid absolute work root: no work root. Fix the route line.`
+A refused dispatch fails the `task` call with `[router] role dispatch @<agent> refused: <note>`.
+
+**Resume and the work root.** A resume of an exactly bound child keeps that child's work root. If its route line declares
+another target (a `root=` that is neither the bound work root nor its worktree, another `repo=` name, another `branch=`,
+or an invalid declaration), the resume is refused: `this child is bound to <work root> (repository <name>, branch
+<branch>); a resume cannot change its work root: dispatch a new child`. A resume that declares nothing, or the bound
+target, is unchanged. A route line is read from the first line of the prompt only: one placed after a copied header is
+ignored (the copied header is stripped).
+
+Branch names follow `git check-ref-format`, so `renovate/foo+bar` and `feat/ação` are valid. Names,
 branches and paths echoed in refusals are quoted when they contain unsafe characters; an invalid branch shows as
 `(unknown)`.
 

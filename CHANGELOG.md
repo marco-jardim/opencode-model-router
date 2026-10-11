@@ -9,14 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Roles mode (cross-repo, #107, owner decision Q10): a route line's `repo=<name>` also matches a linked worktree whose directory name is `<name>` below `routing.repoParents`, and binds that worktree (with `branch=`, the worktree of its repository on that branch). A repository and a worktree directory sharing the name, or two such worktree directories of different repositories, are refused as ambiguous, each candidate listed as `<worktree path> (repository <name>, branch <branch>)`.
-
+- **Roles mode (OpenCode v2; cross-repo, #107, owner decision Q10): `repo=` also matches a worktree directory name.** A
+  route line's `repo=<name>` also matches a linked worktree whose directory name is `<name>` below `routing.repoParents`,
+  and binds that worktree (with `branch=`, the worktree of its repository on that branch). A repository and a worktree
+  directory sharing the name, or two such worktree directories of different repositories, are refused as ambiguous, each
+  candidate listed as `<worktree path> (repository <name>, branch <branch>)`.
 - **Role dispatch header (OpenCode v2 roles mode; inert on v1) (#107).** A routed role dispatch with a work root and
   read access now starts with a short header naming the role, the work root and, when known, the repository, branch and
   head, so a role delegate is told where it works; the nonce line or carried acceptance block stays last. A header the
-  orchestrator copied from another dispatch is stripped and replaced by the router's own. The header is emitted only
-  when it is relevant (owner decision Q8, invariant I9): `routing.repoParents` is set, the route line declares `repo=`,
-  `branch=` or `root=`, or the work root differs from the session directory; otherwise the role prompt is unchanged. No
+  orchestrator copied from another dispatch is always stripped, and replaced only when the router adds its own. The
+  header is emitted only when it is relevant (owner decision Q8, invariant I9): `routing.repoParents` is set, the route
+  line declares `repo=`, `branch=` or `root=`, or the work root differs from the session directory; otherwise the
+  dispatch prompt is unchanged. No
   header for a delegate's dispatch or a non-exact resume; with `dispatchHeader: false` there is no header either, except that a work root other
   than the session directory still gets a minimal header (the identity and `Working directory:` paragraphs). The role
   work-root rule now points to the `Working directory:` line. A read-only role is told "You read only in your working
@@ -53,19 +57,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Cross-repo hardening after two QA rounds.** Only fully qualified paths and explicit search roots reach the read set;
   a relative path stays judged against the work root. A final admission gate checks `repoExclude` on the shown and the
   canonical path and refuses a candidate that is a parent, an ancestor of one, or a link out of it, with no fallback to
-  the worktree rule. An invalid, duplicated or conflicting `repo=`/`branch=` now gives no work root and a note
-  (`<key>=<value> is not a valid repository name / branch name: no work root. Fix the route line.`), instead of being
-  ignored. The verification perimeter is planned for every routed role dispatch with a work root whenever
+  the worktree rule. An invalid, duplicated or conflicting `repo=`/`branch=` is no longer ignored: it is an invalid
+  declaration, and the dispatch is refused with the note
+  (`<key>=<value> is not a valid repository name / branch name: no work root. Fix the route line.`, see the owner
+  decision Q9 entry under Changed). The verification perimeter is planned for every routed role dispatch with a work root whenever
   `routing.repoParents` is set, even without `repo=`; a pass shows `verified scope: …` and link targets are named
   `(not admitted)` or `(not observed)`.
 
 ### Changed
 
 - **Roles mode (OpenCode v2; cross-repo, #107, owner decision Q9): a refused declared target refuses the dispatch.** When
-  a role dispatch's route line declares `repo=`, `branch=` or `root=` (or an invalid `repo=`/`branch=`) and the router
-  cannot bind a work root for it, the `task` call now fails with `[router] role dispatch @<agent> refused: <note>`
-  instead of running with no work root in the session directory. A dispatch that declares nothing, a delegate's
-  dispatch and a resume of an exactly bound child are unchanged.
+  a role dispatch's route line declares `repo=`, `branch=` or `root=` (or an invalid `repo=`, `branch=` or `root=`: a
+  rejected, bare, duplicate or conflicting value, noted `root=<value> is not a valid absolute work root: no work root.
+  Fix the route line.`) and the router cannot bind a work root for it, the `task` call now fails with
+  `[router] role dispatch @<agent> refused: <note>` instead of running with no work root in the session directory. An
+  exact resume whose route line names a different target than the child's bound root is refused too (`this child is
+  bound to <work root>; a resume cannot change its work root: dispatch a new child`). A dispatch that declares nothing,
+  a delegate's dispatch and a resume that declares nothing or the bound target are unchanged.
 
 ### Removed
 
