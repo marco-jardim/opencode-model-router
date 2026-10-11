@@ -669,6 +669,14 @@ describe("SlotPool special slots", () => {
     expect(h.git.log).toContain(`remove ${key(slotPath("ci"))}`);
   });
 
+  it("a broken special slot whose marker changed on disk is not retired", async () => {
+    const h = seeded([record("ci", { state: "broken", owner: "ci" })], [slotPath("ci")]);
+    await h.pool.open();
+    h.fs.put(markerPath(MARKERS, PLAN, "ci"), JSON.stringify(record("ci", { state: "broken", owner: "ci", path: slotPath("ci", "D:\\omr-slots\\other") })));
+    await expect(h.pool.acquireSpecial(PLAN, "ci")).rejects.toThrow(/marker changed while collecting/);
+    expect(h.git.log).not.toContain(`remove ${key(slotPath("ci"))}`);
+  });
+
   it("rejects unknown kinds and another plan's id", async () => {
     const h = harness();
     await h.pool.open();
@@ -932,6 +940,16 @@ describe("SlotPool repair", () => {
       await expect(h.pool.acquire(PLAN, "t1", C1)).rejects.toMatchObject({ code: "E_SLOT_BROKEN" });
       expect(h.marker("slot-1").state).toBe("broken");
     }
+  });
+
+  it("resetting, directory gone after the pointers were verified: broken, naming the missing directory", async () => {
+    const h = seeded([record("slot-1", { state: "resetting", managers: ["pip"] })]);
+    h.git.verifySlotPointers = async () => ({ gitdir: `${TOP}\\.git\\worktrees\\x`, common: `${TOP}\\.git` });
+    await h.pool.open();
+    await expect(h.pool.acquire(PLAN, "t1", C1)).rejects.toMatchObject({
+      code: "E_SLOT_BROKEN", message: expect.stringContaining("is not a real directory (missing)"),
+    });
+    expect(h.marker("slot-1").state).toBe("broken");
   });
 
   it("provisioning: installs again from scratch", async () => {

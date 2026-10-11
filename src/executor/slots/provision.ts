@@ -647,7 +647,7 @@ export function createProvisioner(deps: {
   }
 
   /** Heartbeat write: tmp + rename, but only while `held()` is true, so a release can never be undone by a late beat. */
-  async function writeLock(path: string, body: LockBody, held: () => boolean = () => true): Promise<void> {
+  async function writeLock(path: string, body: LockBody, held: () => boolean): Promise<void> {
     const tmp = `${path}.${clock.randomHex(8)}.tmp`;
     await fs.writeText(tmp, JSON.stringify(body), { fsync: true });
     if (!held()) {

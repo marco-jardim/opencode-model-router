@@ -11,6 +11,7 @@ import { CLEANUP_RETRIES, CLEANUP_RETRY_BASE_MS, TRANSIENT_FS_CODES } from "../.
 import type { Clock, ExecutorConfig, FileSystem, FsStat, ProcessResult, ProcOpts, Spawner } from "../../src/executor/types";
 
 type Cfg = Pick<ExecutorConfig, "provision" | "python">;
+// Auto-detect both the provisioning plan and the python interpreter.
 const AUTO: Cfg = { provision: "auto", python: "auto" };
 const WIN = process.platform === "win32";
 const SLOT = WIN ? "C:\\omr-test\\slots\\slot-1" : "/omr-test/slots/slot-1";
@@ -454,6 +455,27 @@ describe("planProvision", () => {
       expect(venv?.command).toBe(join(bin, "python3"));
       expect(venv?.args).toEqual(["-m", "venv", ".venv"]);
     }
+  });
+
+  // A posix host needs /bin/sh for the step environment (planning fails earlier on Windows), so these two run on posix only.
+  it.skipIf(WIN)("names the remedy when python3 is missing on a non-Windows host", () => {
+    const posix: ProvisionHost = { ...hostWith(emptyBin), platform: "linux" };
+    try {
+      planProvision(SLOT, det(["pip"]), posix, AUTO);
+      expect.unreachable("planProvision should refuse a host without python3");
+    } catch (error) {
+      expect(error).toMatchObject({ code: "E_PROVISION" });
+      expect(String(error)).toMatch(/python3 was not found on PATH.*set executor\.python/);
+    }
+  });
+
+  it.skipIf(WIN)("resolves python3 on a non-Windows host", () => {
+    const posixBin = join(root, "posix-bin");
+    mkdirSync(posixBin, { recursive: true });
+    writeFileSync(join(posixBin, "python3"), "", { mode: 0o755 });
+    const [venv] = planProvision(SLOT, det(["pip"]), { ...hostWith(posixBin), platform: "linux" }, AUTO);
+    expect(venv?.command).toBe(join(posixBin, "python3"));
+    expect(venv?.args).toEqual(["-m", "venv", ".venv"]);
   });
 
   it.each([
@@ -1356,6 +1378,19 @@ describe("createProvisioner", () => {
     denied.fs.mkdir = async (p) => { throw errno("EACCES", p); };
     await expect(denied.provisioner.provision(slot(1), detection(["uv"]), { fresh: false })).rejects.toMatchObject({ code: "EACCES" });
     expect(denied.spawner.calls).toHaveLength(0);
+  });
+
+  it("refuses a lock directory failure that carries no errno code, or no error object at all", async () => {
+    const plain = setup();
+    plain.fs.mkdir = async () => { throw new Error("disk on fire"); };
+    await expect(plain.provisioner.provision(slot(1), detection(["uv"]), { fresh: false })).rejects.toThrow("disk on fire");
+    expect(plain.spawner.calls).toHaveLength(0);
+    const odd = setup();
+    odd.fs.mkdir = () => Promise.reject("not an error object");
+    await expect(odd.provisioner.provision(slot(1), detection(["uv"]), { fresh: false })).rejects.toBe("not an error object");
+    const numeric = setup();
+    numeric.fs.mkdir = async () => { throw Object.assign(new Error("numeric"), { code: 5 }); };
+    await expect(numeric.provisioner.provision(slot(1), detection(["uv"]), { fresh: false })).rejects.toThrow("numeric");
   });
 
   it("reports an install lock that cannot be released, but the step's own failure wins", async () => {

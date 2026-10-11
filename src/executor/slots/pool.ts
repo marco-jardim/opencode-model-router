@@ -872,10 +872,11 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
       case "provisioning":
         await d.git.verifySlotPointers(rec.path);
         return stageProvision(rec, true);
+      // The callers (work, reset) only pass creating, provisioning and resetting: work() has already returned or thrown
+      // for leased, broken and retired and turned ready into resetting, and reset() rejects every other state.
       case "resetting":
-        return stageReset(rec);
       default:
-        throw new ExecutorError("E_SLOT_BROKEN", `slot ${rec.slot} is ${rec.state}`, { slot: rec.slot, state: rec.state });
+        return stageReset(rec);
     }
   }
 
