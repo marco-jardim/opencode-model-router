@@ -15,7 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   orchestrator copied from another dispatch is stripped and replaced by the router's own. No header for a delegate's
   dispatch or a non-exact resume; with `dispatchHeader: false` there is no header either, except that a work root other
   than the session directory still gets a minimal header (the identity and `Working directory:` paragraphs). The role
-  work-root rule now points to the `Working directory:` line.
+  work-root rule now points to the `Working directory:` line. A read-only role is told "You read only in your working
+  directory." in the header wording, although its read set can also include the working set.
 - **Checks in other repositories (OpenCode v2, roles mode) (#107).** A check of the `[acceptance]` block can run in
   another repository of the read set: `check: testsPass cwd="<repo>" scope=full`. A relative `cwd=` stays inside the
   work root; an absolute one must be in the read set; one outside it, or a `scope=` that is neither `affected` nor
@@ -26,7 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or run check placed in it is UNVERIFIED, with the suggested check line. Consumers are discovered by package name
   (a `node_modules` link into the work root) in the working set only; when discovery stops on its budget before
   finishing a worktree, a pass with a change is UNVERIFIED (`consumer discovery stopped before finishing …`), so a
-  consumer may remain undiscovered. A link target pinned at dispatch and
+  consumer may remain undiscovered. The link scan is bounded, and consumer discovery runs under the gate deadline. A
+  check placed in a consumer clears that incomplete-discovery caveat. When the change of the work root could not be
+  observed and no check covers it, the result is refused. A link target pinned at dispatch and
   unchanged since keeps the reference exact (link pins). A tier dispatch on v2 refuses a per-check `cwd=`
   (`a per-check cwd= is honoured only in roles mode`); `scope=` alone is ignored; v1 ignores both keys. A dispatch with
   per-check keys is verified synchronously, never deferred. The configured roles protocol (`routing.repoParents`)

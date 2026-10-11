@@ -24,19 +24,47 @@ Read this first in a new session. The design is `docs/design/cross-repo.md`, and
 |---|---|
 | P0: integrity fixes in the shared verification engine (both hosts) | Done. QA'd twice. Live check: the unobservable-writers caveat appeared on a real dispatch. |
 | P1: v2 roles cross-repo (P1.1–P1.10) | Done. QA'd twice. Docs updated. Live dogfood done (see "Phase 1 live dogfood"). |
-| P2 / P3 / P4 | Not started |
+| P2 lot 1: P2a–P2d + P2g (plan `docs/design/cross-repo-phase2-plan.md`) | Done. QA'd twice (round 1: 4 major + 9 minor fixed; round 2: 3 major fixed, minors recorded in design §9). Docs and CHANGELOG updated. **Live dogfood pending** (needs a restart). |
+| P2 lot 2: P2e (deferred P), owner decision OD4 | Not started. Until it lands, a dispatch with per-check keys or a perimeter is verified synchronously. |
+| P3 / P4 | Not started |
 
-Last checks (HEAD `be7c0b3`):
+Last checks (HEAD after the round 2 fixes):
 - `npm run typecheck`: clean.
-- Goldens unchanged.
-- Full `npx vitest run`: 9 failures in 6 files. Five of those files pass in full when run alone. The sixth, `test/unit/exec.test.ts`, is a known late-sweep timing test that fails under load; its isolated run was not confirmed.
+- Goldens: all `test/golden/` pass; only the configured roles-protocol golden changed (OD5) and the new `dispatch-header.golden.test.ts` was added.
+- Full `npx vitest run`: 50 failures in 15 files, every time it ran next to a reviewer's own test runs. Every failing file passes when run alone or in small groups, except the known `test/unit/exec.test.ts` timing tests. New in the load-sensitive list: `test/integration/unattributed-writers.test.ts`, `test/integration/branch-switch.test.ts`, `test/integration/branch-switch-deferred.test.ts`, `test/unit/tree-kill.test.ts`, `test/integration/perimeter.test.ts`, `test/integration/roles-authority.test.ts`, `test/integration/failover-compose.test.ts`, `test/integration/layer2-wiring.test.ts`, `test/integration/modeB-e2e.test.ts` (possibly related to round 2 m8, the extra pin snapshots). A clean full run with nothing else running has not been done yet.
 
 ## Next steps
 
-1. ~~Dogfood P1 live~~: done, see "Phase 1 live dogfood".
-2. **Open owner decision Q7:** role agents are registered from a catch-all `*: deny`, so D13 cannot open worktrees outside the parents. The fix would turn the generated catch-all into `ask`; the risk is a background child waiting on a prompt. Do not change this without the owner.
-3. **Phase 2** (design §7): per-check `cwd=` / `scope=`, consumer checks, pinning of linked repositories (including ignored `dist/`), and deferred verification across the perimeter.
-4. **Accepted minors** from the P0 and P1 QA rounds are listed in design §9 ("Known follow-ups"). Revisit them only if they become relevant.
+1. **Owner: restart the dogfood instance** and run the Phase 2 live dogfood (script below).
+2. **Owner decision Q8** (design §10): the role dispatch header is emitted for every roles-mode dispatch with a work root. I9 says routing output is unchanged when cross-repo is not configured. Keep it always on, or only when `repoParents`, `repo=`/`branch=`/`root=` is used, or W differs from the session directory?
+3. **Open owner decision Q7:** role agents are registered from a catch-all `*: deny`, so D13 cannot open worktrees outside the parents. The fix would turn the generated catch-all into `ask`; the risk is a background child waiting on a prompt. Do not change this without the owner.
+4. **Phase 2 lot 2 (P2e)**, plan `docs/design/cross-repo-phase2-plan.md`: store P and placements in the pending registration, observe P in the deferred finish, `prepareClaim` sets `prepared.perimeter`, S11 drift caveat, lift the interim rule; fix `noChangeGateSpawnsNothing` with `testScope:"full"` (F13). Own heavy QA after it.
+5. **Accepted minors** from the P0, P1 and P2 QA rounds are listed in design §9 ("Known follow-ups"). Revisit them only if they become relevant.
+
+## Phase 2 live dogfood script
+
+Run in the restarted dogfood instance, from an orchestrator session in this worktree.
+- Setup: `New-Item -ItemType Junction -Path D:\git\opencode-model-router-cross-repo\node_modules\omr-xr-dogfood-lib -Target D:\git\omr-xr-dogfood-lib`. The scratch repository `D:\git\omr-xr-dogfood-lib` (branch `main`) must be clean.
+- Remove the junction with `cmd /c rmdir <path>`, never `Remove-Item -Recurse` (it follows the junction).
+- Dispatches (expected result in parentheses):
+  1. Any role in this worktree: the delegate's prompt starts with `[router] You are @<role>` and a `Working directory:` line naming this worktree, branch and head.
+  2. `implementer` `repo=omr-xr-dogfood-lib`, edit a file there, `check: fileExists`: UNVERIFIED by the consumer caveat naming this worktree (it links the lib), with the suggested check line.
+  3. Same, plus a `check: run command="node -e ..."` or `testsPass ... cwd="D:\git\opencode-model-router-cross-repo" scope=full`: ✓ verified, no caveat.
+  4. A consumer check that fails: UNVERIFIED, never FAIL.
+  5. A consumer `testsPass` without `scope=full`: unverifiable ("must use scope=full").
+  6. Only a consumer check, no check in the lib: unverifiable ("is not covered by any check root").
+  7. `cwd="C:\Windows"`: refused, nothing ran. `scope=everything`: refused.
+  8. `VERIFY:deferred` with per-check keys: verified at once, no handle.
+  9. Tier `medium` with a per-check `cwd=`: unverifiable, "honoured only in roles mode".
+  10. A role in this worktree with an untracked failing test and `testsPass ... scope=full`, lib unchanged: the reference has no `external-link` cause (pin exact); "no worse than before" only if `core.autocrlf` is false.
+
+## Phase 2 lot 1 session notes (2026-10-11)
+
+- **The live router loads this worktree's `src/`.** Every edit by a delegate must leave `src/` loadable. A half-applied edit once broke a dispatch with `captureRootOf is not defined`. Put this rule in every implementer dispatch.
+- **"Agent not found" on parallel implementer dispatches** usually means the child did start: its edits appear in the tree. Check `git status`, then resume the same `sessionID` with "continue and finish". Fresh dispatches of one at a time fail less.
+- **Delegates often skip "tests first"** under the read-budget guard. They say so in their reports; the tests exist and were reviewed.
+- **The gate's `testsPass` cannot scope this repo's changes** ("attribution-unavailable"), so every implementer result came back UNVERIFIED. Every change was verified in the shell: typecheck plus the touched test files.
+- **`subagent` no longer contaminates captures or pins** (round 2 M3), like `task` and `delegate`.
 
 ## Phase 1 live dogfood (2026-10-10)
 

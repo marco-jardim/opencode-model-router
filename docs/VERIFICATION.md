@@ -287,7 +287,9 @@ A package inside a linked `node_modules` (npm `file:` dependencies and `npm link
 - its ignored-files digest is over the bounds, or it has skip-worktree or assume-unchanged entries;
 - a deeper external link exists (a target's own external links are followed one level);
 - an unattributable writer ran while the pin was computed;
-- the dispatch is deferred, or the gate is a retry gate (pins are used by the first required gate only).
+- the pin was not ready within the gate bound;
+- the target's perimeter snapshot was discarded by an overlapping write;
+- the gate is a retry gate (pins are used by the first required gate only).
 
 Link pins apply to roles mode on OpenCode v2. Otherwise a link is approximate as follows:
 

@@ -562,6 +562,17 @@ After QA rounds 1 and 2 (facts checked at HEAD effcdb3):
   - Pins are freed after the first gate, so a retry gate of the same dispatch treats links as approximate (fails safe).
   - A gate deadline that fires mid-scan is only tested with a pre-aborted signal.
   - The role header is emitted for every roles user with a work root, pending the owner's reading of I9 (see Q8).
+- **Known follow-ups (Phase 2 QA round 2, minor), accepted for now:**
+  - m1: A copied router header is stripped only when the router adds its own header. It is not stripped with `dispatchHeader: false` and W equal to the session directory, without read access, or on a non-exact resume.
+  - m2: Stripping a copied header removes everything up to the first `\n\n---\n\n`. A partial header without its separator, followed by a markdown rule, can cut the task text.
+  - m3: The UNC check covers only the first hop of a link's text. Relative links to UNC links, symlinked `node_modules`/`@scope` directories, symlinked `package.json`/workspace directories and materialize steps 6 and 7 can still reach a network path. Skipped UNC links are dropped instead of kept as unadmitted (I12), and a local `\\?\C:\` or POSIX `//x` link is treated as UNC.
+  - m4: The manifest size bound for the package-name lookup is checked after reading the file. A symlinked `package.json` to a device or FIFO is not bounded.
+  - m5: `admittedLinks` can leak an entry when a pin finishes after its dispatch's pins were freed.
+  - m6: An attributed write into a link target during the pin window is not detected. Only unattributable writers drop pins.
+  - m7: Working-set seeds now carry the admission predicate the gate uses. A top spelled differently (junction, subst drive) and not below a parent is reported unobserved. A pin keyed by the working-set spelling is not found at materialize, which fails safe.
+  - m8: Each link target gets a second hardened snapshot per role dispatch for its pin, and consumer discovery is sequential. The P0 timing tests (`unattributed-writers`, `branch-switch`, `branch-switch-deferred`) became sensitive to full-suite load.
+  - `subagent` (like `task` and `delegate`) no longer contaminates captures or pins (round 2 M3 fix). The child's own writes are still observed.
+  - Nits: `CONFIG_REFERENCE.md` and a comment in `src/routing/wire/dispatch.ts` say the work-root rule points to ENVIRONMENT, while `roles.ts` uses the `Working directory:` line first. A read-only role is told "You read only in your working directory." although R includes the working set. With `dispatchHeader: false`, a junction-spelled W equal to the session directory gets a minimal header. QA comment labels mix "QA-1"/"QA-2"/"QA-3" for round-1 items. A block-level `cwd: .git` is still accepted.
 - **Consumers** are discovered only in the working set, and only through `node_modules` links. Python editable installs, Go `replace`, Cargo path dependencies, and `../` or alias imports are not discovered (Q2).
 - **A consumer check's failures** are unverifiable, never "fail". The dependency is the changed repository, so the reference can neither excuse nor prove them.
 - **`router_run` scripts** remain trusted repository content (`run-tools.ts:11-13`).
