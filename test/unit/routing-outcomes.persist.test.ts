@@ -6,6 +6,7 @@ import {
   compactStamp,
   createFlusher,
   createPersister,
+  createSideLogs,
   nodePersistFs,
   nodeScheduler,
   parseLogLine,
@@ -26,10 +27,16 @@ import {
   OUTCOMES_SCHEMA_ID,
   OUTCOMES_TMP_PREFIX,
   STALE_TMP_MS,
+  TIMINGS_FILE,
+  TIMINGS_ROTATED_RE,
+  TURNS_FILE,
+  TURNS_ROTATED_RE,
   makeKey,
 } from "../../src/routing/outcomes/types";
 import type {
   DecisionRow,
+  DispatchTimingRow,
+  OrchestratorTurnRow,
   FlushScheduler,
   LogRow,
   OutcomeLogger,
@@ -1049,6 +1056,174 @@ describe("parseLogLine", () => {
 // ---------------------------------------------------------------------------
 // Coexistence with the scorecard writer
 // ---------------------------------------------------------------------------
+
+function timingRow(i: number, partial: Partial<DispatchTimingRow> = {}): DispatchTimingRow {
+  return {
+    kind: "dispatch-timing",
+    v: 1,
+    ts: new Date(T0 + i).toISOString(),
+    parentSessionID: "ses_parent",
+    childSessionID: `ses_child_${i}`,
+    callID: `call_${i}`,
+    role: "implementer",
+    class: "implement",
+    scope: "small",
+    tier: "medium",
+    model: "anthropic/claude-sonnet-5-5",
+    background: i % 2 === 0,
+    startedAt: T0 + i,
+    endedAt: T0 + i + 1500,
+    durationMs: 1500,
+    outcome: "succeeded",
+    capacity: null,
+    ...partial,
+  };
+}
+
+function turnRow(i: number, partial: Partial<OrchestratorTurnRow> = {}): OrchestratorTurnRow {
+  return {
+    kind: "orchestrator-turn",
+    v: 1,
+    ts: new Date(T0 + i).toISOString(),
+    sessionID: "ses_root",
+    turn: i,
+    steps: 3,
+    input: 1200,
+    cacheRead: 800,
+    cacheWrite: 50,
+    ...partial,
+  };
+}
+
+describe("side logs: timings.jsonl and turns.jsonl", () => {
+  it("round-trips both row kinds next to decisions.jsonl", async () => {
+    const { mem, dir, deps } = setup();
+    const side = createSideLogs(dir, deps);
+    const timings = [timingRow(0), timingRow(1, { outcome: "failed", capacity: "rate-limit" })];
+    const turns = [turnRow(1), turnRow(2)];
+    expect(await side.appendTimings(timings)).toEqual({ ok: true });
+    expect(await side.appendTurns(turns)).toEqual({ ok: true });
+    expect(side.timingsPath).toBe(join(dir, TIMINGS_FILE));
+    expect(side.turnsPath).toBe(join(dir, TURNS_FILE));
+    expect(mem.files.has(join(dir, DECISIONS_FILE))).toBe(false);
+
+    const t = await side.readTimings();
+    expect(t.rows).toEqual(timings);
+    expect(t).toMatchObject({ skipped: 0, newer: 0, files: [join(dir, TIMINGS_FILE)] });
+    const u = await side.readTurns();
+    expect(u.rows).toEqual(turns);
+    expect(u.skipped).toBe(0);
+  });
+
+  it("writes only the declared fields: no prompt or output text is stored", async () => {
+    const { mem, dir, deps } = setup();
+    const side = createSideLogs(dir, deps);
+    const withText = { ...timingRow(0), prompt: "secret prompt", output: "secret output" };
+    const turnText = { ...turnRow(1), text: "secret output" };
+    await side.appendTimings([withText]);
+    await side.appendTurns([turnText]);
+    const timingsText = mem.files.get(join(dir, TIMINGS_FILE))?.text ?? "";
+    const turnsText = mem.files.get(join(dir, TURNS_FILE))?.text ?? "";
+    expect(timingsText).not.toContain("secret");
+    expect(turnsText).not.toContain("secret");
+    expect(Object.keys(JSON.parse(timingsText.trim()) as object)).toHaveLength(17);
+    expect(Object.keys(JSON.parse(turnsText.trim()) as object)).toHaveLength(9);
+  });
+
+  it("rotates while appending with the decision log's rule, per file", async () => {
+    const { c, mem, dir, deps } = setup();
+    const side = createSideLogs(dir, deps, { maxBytes: 600, maxGenerations: 2 });
+    for (let i = 0; i < 12; i++) {
+      c.advance(1);
+      expect(await side.appendTimings([timingRow(i)])).toEqual({ ok: true });
+      expect(await side.appendTurns([turnRow(i)])).toEqual({ ok: true });
+    }
+    const names = [...mem.files.keys()].map((p) => basename(p));
+    const rotatedTimings = names.filter((n) => TIMINGS_ROTATED_RE.test(n)).sort();
+    const rotatedTurns = names.filter((n) => TURNS_ROTATED_RE.test(n)).sort();
+    expect(rotatedTimings).toHaveLength(2); // pruned to maxGenerations
+    expect(rotatedTurns).toHaveLength(2);
+    expect(rotatedTimings[0]).toMatch(new RegExp(`-${PID}\\.jsonl$`));
+    expect(names).toContain(TIMINGS_FILE);
+    expect(names).toContain(TURNS_FILE);
+    // oldest generation first, newest row last; nothing is duplicated
+    const t = await side.readTimings();
+    const turnsRead = await side.readTurns();
+    expect(t.rows.at(-1)?.callID).toBe("call_11");
+    expect(turnsRead.rows.at(-1)?.turn).toBe(11);
+    expect(new Set(t.rows.map((r) => r.callID)).size).toBe(t.rows.length);
+    expect(t.files).toHaveLength(3);
+    expect(t.rows.map((r) => r.startedAt)).toEqual([...t.rows.map((r) => r.startedAt)].sort((a, b) => a - b));
+  });
+
+  it("skips a torn last line with ONE warning and does not glue the next batch to it", async () => {
+    const { mem, dir, deps, logger } = setup();
+    const side = createSideLogs(dir, deps);
+    const good = JSON.stringify(timingRow(0));
+    const torn = JSON.stringify(timingRow(1)).slice(0, 40);
+    mem.files.set(join(dir, TIMINGS_FILE), { text: `${good}\n${torn}`, mtimeMs: T0 });
+    const first = await side.readTimings();
+    expect(first.rows).toEqual([timingRow(0)]);
+    expect(first.skipped).toBe(1);
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+
+    await side.appendTimings([timingRow(2)]);
+    logger.warn.mockClear();
+    const second = await side.readTimings();
+    expect(second.rows.map((r) => r.callID)).toEqual(["call_0", "call_2"]);
+    expect(second.skipped).toBe(1);
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+
+    const clean = createSideLogs(dir, { ...deps, fs: createMemFs(() => T0).fs });
+    logger.warn.mockClear();
+    expect((await clean.readTurns()).rows).toEqual([]);
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it("skips rows with a future schema version without a warning, and invalid rows as skipped", async () => {
+    const { mem, dir, deps, logger } = setup();
+    const side = createSideLogs(dir, deps);
+    const lines = [
+      JSON.stringify(turnRow(1)),
+      JSON.stringify({ ...turnRow(2), v: 2, futureField: true }),
+      JSON.stringify({ ...turnRow(3), input: -1 }),
+      JSON.stringify(timingRow(4)), // the other kind
+      JSON.stringify(turnRow(5)),
+    ];
+    mem.files.set(join(dir, TURNS_FILE), { text: lines.join("\n") + "\n", mtimeMs: T0 });
+    const result = await side.readTurns();
+    expect(result.rows.map((r) => r.turn)).toEqual([1, 5]);
+    expect(result.newer).toBe(1);
+    expect(result.skipped).toBe(2);
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+
+    mem.files.set(join(dir, TIMINGS_FILE), {
+      text: JSON.stringify({ ...timingRow(1), v: 2 }) + "\n" + JSON.stringify({ ...timingRow(2), outcome: "weird" }) + "\n",
+      mtimeMs: T0,
+    });
+    logger.warn.mockClear();
+    const timings = await side.readTimings();
+    expect(timings.rows).toEqual([]);
+    expect(timings.newer).toBe(1);
+    expect(timings.skipped).toBe(1);
+  });
+
+  it("never throws: a failing append is reported, an unreadable directory reads as empty", async () => {
+    const { mem, dir, deps, logger } = setup();
+    const side = createSideLogs(dir, deps);
+    mem.hooks.appendText = () => {
+      throw fsError("EACCES");
+    };
+    const failed = await side.appendTurns([turnRow(1)]);
+    expect(failed).toMatchObject({ ok: false, code: "EACCES" });
+    mem.hooks.appendText = undefined;
+    mem.hooks.readdir = () => {
+      throw fsError("EIO");
+    };
+    expect(await side.readTurns()).toEqual({ rows: [], skipped: 0, newer: 0, files: [] });
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe("coexistence with *.scorecard.log (D15)", () => {
   it("never opens, renames, deletes or lists scorecard files, whatever load/save/rotate/prune do", async () => {

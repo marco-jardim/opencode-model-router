@@ -13,6 +13,9 @@ import { isAbsolute, join, normalize, resolve } from "node:path";
 import type {
   DecisionRow,
   DecisionTrace,
+  DispatchCapacity,
+  DispatchTimingOutcome,
+  DispatchTimingRow,
   FlusherDeps,
   ForeignCheck,
   FlusherOptions,
@@ -25,6 +28,7 @@ import type {
   OutcomeKey,
   OutcomeSnapshot,
   OutcomeStore,
+  OrchestratorTurnRow,
   OutcomesFile,
   PersistDeps,
   PersistFs,
@@ -32,8 +36,10 @@ import type {
   Persister,
   PersisterOptions,
   ReadRowsResult,
+  ReadSideRowsResult,
   RefusalRow,
   RouteChoice,
+  SideLogs,
   SignalKind,
   VerdictRow,
   WriteResult,
@@ -59,7 +65,12 @@ import {
   OUTCOMES_SCHEMA_VERSION,
   OUTCOMES_TMP_PREFIX,
   RENAME_RETRY_DELAYS_MS,
+  SIDE_ROW_VERSION,
   STALE_TMP_MS,
+  TIMINGS_FILE,
+  TIMINGS_ROTATED_RE,
+  TURNS_FILE,
+  TURNS_ROTATED_RE,
   parseKey,
   safeNow,
 } from "./types";
@@ -842,6 +853,291 @@ export function createPersister(dir: string, deps: PersistDeps, options: Persist
       }
       return { rows, skipped, files, oldestTs, generations };
     },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Side logs: timings.jsonl and turns.jsonl (counters and labels only, never prompt or output text)
+// ---------------------------------------------------------------------------
+
+const TIMING_OUTCOMES: readonly string[] = ["succeeded", "failed", "interrupted", "unknown"];
+const CAPACITIES: readonly string[] = ["rate-limit", "overload", "usage-limit"];
+/** A label longer than this is not a label: the row is refused rather than risk storing free text. */
+const MAX_LABEL_LENGTH = 256;
+
+function isLabel(x: unknown): x is string {
+  return typeof x === "string" && x.length <= MAX_LABEL_LENGTH;
+}
+
+function isCount(x: unknown): x is number {
+  return isFiniteNum(x) && x >= 0;
+}
+
+function isIsoTs(x: unknown): x is string {
+  return typeof x === "string" && Number.isFinite(Date.parse(x));
+}
+
+/** `"newer"`: a valid JSON row of a later schema (skipped quietly); `null`: not a row of this kind. */
+type SideParse<Row> = Row | "newer" | null;
+
+function sideEnvelope(line: string, kind: string): Rec | "newer" | null {
+  let json: unknown;
+  try {
+    json = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (!isRec(json) || json.kind !== kind) return null;
+  if (isFiniteNum(json.v) && json.v > SIDE_ROW_VERSION) return "newer";
+  return json.v === SIDE_ROW_VERSION ? json : null;
+}
+
+/** Validate one `timings.jsonl` line. Unknown extra fields are dropped. */
+export function parseTimingLine(line: string): SideParse<DispatchTimingRow> {
+  const json = sideEnvelope(line, "dispatch-timing");
+  if (json === null || json === "newer") return json;
+  const { ts, parentSessionID, childSessionID, callID, role, scope, tier, model, background, startedAt, endedAt, durationMs, outcome, capacity } = json;
+  const cls = json.class;
+  if (!isIsoTs(ts) || !isLabel(parentSessionID) || !isLabel(childSessionID) || !isLabel(callID)) return null;
+  if (!isLabel(role) || !isLabel(cls) || !isLabel(scope) || !isLabel(tier) || !isLabel(model)) return null;
+  if (typeof background !== "boolean" || !isCount(startedAt) || !isCount(endedAt) || !isCount(durationMs)) return null;
+  if (!oneOf(TIMING_OUTCOMES, outcome)) return null;
+  if (capacity !== null && !oneOf(CAPACITIES, capacity)) return null;
+  return {
+    kind: "dispatch-timing",
+    v: SIDE_ROW_VERSION,
+    ts,
+    parentSessionID,
+    childSessionID,
+    callID,
+    role,
+    class: cls,
+    scope,
+    tier,
+    model,
+    background,
+    startedAt,
+    endedAt,
+    durationMs,
+    outcome: outcome as DispatchTimingOutcome,
+    capacity: capacity as DispatchCapacity | null,
+  };
+}
+
+/** Validate one `turns.jsonl` line. Unknown extra fields are dropped. */
+export function parseTurnLine(line: string): SideParse<OrchestratorTurnRow> {
+  const json = sideEnvelope(line, "orchestrator-turn");
+  if (json === null || json === "newer") return json;
+  const { ts, sessionID, turn, steps, input, cacheRead, cacheWrite } = json;
+  if (!isIsoTs(ts) || !isLabel(sessionID)) return null;
+  if (!isCount(turn) || !isCount(steps) || !isCount(input) || !isCount(cacheRead) || !isCount(cacheWrite)) return null;
+  return { kind: "orchestrator-turn", v: SIDE_ROW_VERSION, ts, sessionID, turn, steps, input, cacheRead, cacheWrite };
+}
+
+/** Only the declared fields are written, so a row carrying anything extra never reaches the disk with it. */
+function serializeTiming(row: DispatchTimingRow): string {
+  return JSON.stringify({
+    kind: row.kind,
+    v: row.v,
+    ts: row.ts,
+    parentSessionID: row.parentSessionID,
+    childSessionID: row.childSessionID,
+    callID: row.callID,
+    role: row.role,
+    class: row.class,
+    scope: row.scope,
+    tier: row.tier,
+    model: row.model,
+    background: row.background,
+    startedAt: row.startedAt,
+    endedAt: row.endedAt,
+    durationMs: row.durationMs,
+    outcome: row.outcome,
+    capacity: row.capacity,
+  });
+}
+
+function serializeTurn(row: OrchestratorTurnRow): string {
+  return JSON.stringify({
+    kind: row.kind,
+    v: row.v,
+    ts: row.ts,
+    sessionID: row.sessionID,
+    turn: row.turn,
+    steps: row.steps,
+    input: row.input,
+    cacheRead: row.cacheRead,
+    cacheWrite: row.cacheWrite,
+  });
+}
+
+interface SideSpec<Row> {
+  readonly file: string;
+  /** Rotated names are `<prefix>.<stamp>-<pid>.jsonl`. */
+  readonly prefix: string;
+  readonly rotatedRe: RegExp;
+  readonly parse: (line: string) => SideParse<Row>;
+  readonly serialize: (row: Row) => string;
+}
+
+const TIMINGS_SPEC: SideSpec<DispatchTimingRow> = {
+  file: TIMINGS_FILE,
+  prefix: "timings",
+  rotatedRe: TIMINGS_ROTATED_RE,
+  parse: parseTimingLine,
+  serialize: serializeTiming,
+};
+
+const TURNS_SPEC: SideSpec<OrchestratorTurnRow> = {
+  file: TURNS_FILE,
+  prefix: "turns",
+  rotatedRe: TURNS_ROTATED_RE,
+  parse: parseTurnLine,
+  serialize: serializeTurn,
+};
+
+/**
+ * `timings.jsonl` and `turns.jsonl` next to `decisions.jsonl`: the same append path (one `appendText`, a torn last
+ * line is not glued to the next batch) and the same rotation rule as the decision log, generalized over the file name
+ * (the decision-log code itself is untouched). Readers skip a torn last line with one warning per read and rows of a
+ * newer schema without one.
+ */
+export function createSideLogs(dir: string, deps: PersistDeps, options: PersisterOptions = {}): SideLogs {
+  const { fs, sleep, logger, pid } = deps;
+  const now = (): number => safeNow(deps.now);
+  const maxBytes = options.maxBytes ?? DECISIONS_MAX_BYTES;
+  const maxGenerations = Math.max(0, Math.floor(options.maxGenerations ?? DECISIONS_MAX_GENERATIONS));
+  const delays = options.renameRetryDelaysMs ?? RENAME_RETRY_DELAYS_MS;
+
+  function createFile<Row>(spec: SideSpec<Row>): {
+    readonly path: string;
+    append(rows: readonly Row[]): Promise<WriteResult>;
+    read(): Promise<ReadSideRowsResult<Row>>;
+  } {
+    const path = join(dir, spec.file);
+    let knownEnd: number | null = null;
+    const rotated = (names: readonly string[]): string[] => names.filter((name) => spec.rotatedRe.test(name)).sort();
+
+    async function sizeOrNull(target: string): Promise<number | null> {
+      try {
+        return (await fs.stat(target))?.size ?? null;
+      } catch (error) {
+        logger.info?.("[router] side log stat failed", { path: target, error: describeError(error) });
+        return null;
+      }
+    }
+
+    async function rotate(): Promise<void> {
+      try {
+        let ms = now();
+        const newest = rotated(await fs.readdir(dir)).at(-1);
+        const match = newest === undefined ? null : spec.rotatedRe.exec(newest);
+        const newestMs = match === null ? null : stampToMs(match[1] as string);
+        if (newestMs !== null && ms <= newestMs) ms = newestMs + 1; // names stay unique and chronological
+        const target = join(dir, `${spec.prefix}.${compactStamp(ms)}-${pid}.jsonl`);
+        try {
+          // Another process may have rotated while we listed generations. Do not rotate its small new file.
+          const current = await fs.stat(path);
+          if (current === null || current.size < maxBytes) return;
+          await renameWithRetry(fs, path, target, sleep, delays);
+        } catch (error) {
+          if (errorCode(error) !== "ENOENT") throw error; // ENOENT: another process rotated first
+        }
+        const generations = rotated(await fs.readdir(dir));
+        for (const name of generations.slice(0, Math.max(0, generations.length - maxGenerations))) {
+          try {
+            await fs.unlink(join(dir, name));
+          } catch (error) {
+            logger.warn("[router] could not prune a rotated side log", { name, error: describeError(error) });
+          }
+        }
+      } catch (error) {
+        logger.warn("[router] side log rotation failed; appending to the live file", { file: spec.file, error: describeError(error) });
+      }
+    }
+
+    return {
+      path,
+      async append(rows: readonly Row[]): Promise<WriteResult> {
+        if (rows.length === 0) return { ok: true };
+        try {
+          await fs.mkdirp(dir);
+          const body = rows.map((row) => spec.serialize(row)).join("\n") + "\n";
+          let size = (await sizeOrNull(path)) ?? 0;
+          if (size > 0 && size + Buffer.byteLength(body, "utf8") + 1 > maxBytes) {
+            await rotate();
+            size = (await sizeOrNull(path)) ?? 0;
+          }
+          // A crash can leave a torn last line without its newline: the batch that follows starts on a fresh line.
+          let lead = "";
+          if (size > 0 && size !== knownEnd) {
+            try {
+              const existing = await fs.readText(path);
+              if (existing !== null && !existing.endsWith("\n")) lead = "\n";
+            } catch (readError) {
+              lead = "\n"; // cannot tell: a blank line is harmless, a glued row is not
+              logger.info?.("[router] side log end not checked", { file: spec.file, error: describeError(readError) });
+            }
+          }
+          await fs.appendText(path, lead + body);
+          knownEnd = size + Buffer.byteLength(lead + body, "utf8");
+          return { ok: true };
+        } catch (error) {
+          return failure(error);
+        }
+      },
+      async read(): Promise<ReadSideRowsResult<Row>> {
+        const rows: Row[] = [];
+        const files: string[] = [];
+        let skipped = 0;
+        let newer = 0;
+        let names: string[];
+        try {
+          names = await fs.readdir(dir);
+        } catch (error) {
+          logger.warn("[router] side log directory unreadable", { dir, error: describeError(error) });
+          return { rows, skipped, newer, files };
+        }
+        for (const name of [...rotated(names), spec.file]) {
+          const target = join(dir, name);
+          let text: string | null;
+          try {
+            text = await withRetry(() => fs.readText(target), sleep, delays);
+          } catch (error) {
+            logger.warn("[router] side log unreadable; skipped", { path: target, error: describeError(error) });
+            continue;
+          }
+          if (text === null) continue;
+          files.push(target);
+          for (const line of (text.charCodeAt(0) === 0xfeff ? text.slice(1) : text).split(/\r?\n/)) {
+            if (line.trim() === "") continue;
+            const row = spec.parse(line);
+            if (row === null) skipped += 1;
+            else if (row === "newer") newer += 1;
+            else rows.push(row);
+          }
+        }
+        if (skipped > 0) {
+          logger.warn("[router] side log had unreadable lines (a torn last line is expected after a crash); they were skipped", {
+            file: spec.file,
+            skipped,
+          });
+        }
+        return { rows, skipped, newer, files };
+      },
+    };
+  }
+
+  const timings = createFile(TIMINGS_SPEC);
+  const turns = createFile(TURNS_SPEC);
+  return {
+    dir,
+    timingsPath: timings.path,
+    turnsPath: turns.path,
+    appendTimings: timings.append,
+    appendTurns: turns.append,
+    readTimings: timings.read,
+    readTurns: turns.read,
   };
 }
 
