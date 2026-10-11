@@ -725,7 +725,7 @@ export function isLedgerV1(v: unknown): v is LedgerV1 {
  * The child's first-context fail-closed check (3.1.7.a) refuses every tool call of an unbound child whose prompt matches.
  */
 export const LAUNCH_HEADER_PATTERN =
-  /^\[plan ([a-z0-9][a-z0-9-]{2,40}):((?!\d+\])[A-Za-z0-9][A-Za-z0-9._-]{0,63})#([1-9][0-9]{0,3})\] nonce=([0-9a-f]{32})$/m;
+  /^\[plan ([a-z0-9][a-z0-9-]{2,40}):((?!\d+#)[A-Za-z0-9][A-Za-z0-9._-]{0,63})#([1-9][0-9]{0,3})\] nonce=([0-9a-f]{32})$/m;
 
 /** The four fields a launch header carries (§7). */
 export interface LaunchHeaderFields {

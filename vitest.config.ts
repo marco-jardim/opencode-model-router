@@ -25,6 +25,8 @@ export const MERGED_PER_FILE_GATED = [
   "src/verify/directives.ts",
   "src/verify/risk.ts",
   "src/verify/pending.ts",
+  // Phase 1.4.3: the executor gate (src/executor/**) is enforced in CI per file, as the glob threshold is off there.
+  "src/executor/types.ts",
   // #90 (C-6): the pure TUI status model and the server side of the TUI effort channel.
   "src/tui/status-model.ts",
   "src/tui/effort-channel.ts",
@@ -70,6 +72,7 @@ export default defineConfig({
         "src/guard/**/*.ts": { branches: 90, lines: 90, functions: 90 },
         "src/verify/**/*.ts": { branches: 90, lines: 90, functions: 90 },
         "src/router/**/*.ts": { branches: 90, lines: 90, functions: 90 },
+        "src/executor/**/*.ts": { branches: 90, lines: 90, functions: 90 },
         "src/escalate/**/*.ts": { branches: 95, lines: 95, functions: 95 },
         "src/telemetry/**/*.ts": { branches: 95, lines: 95, functions: 95 },
         ...mergedGates,
