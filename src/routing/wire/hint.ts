@@ -5,9 +5,12 @@
  *  - swap the taxonomy line of the delegation protocol for `generateTaxonomy(...)` (a class moves only when the winner
  *    has ≥ 5 recorded outcomes, so the line stays the shipped one until evidence exists, D2), and append the route-line
  *    paragraph of `protocol.ts`;
- *  - in advise only, add one extra system part, the per-turn hint: stable class and destination text, computed from the
- *    latest user message with the RULES classifier only (a hint never costs a model call) and cached for the turn, so the
- *    system prompt does not change between the steps of one turn.
+ *  - in advise only, add the per-turn hint: stable class and destination text, computed from the latest user message with
+ *    the RULES classifier only (a hint never costs a model call) and cached for the turn, so it does not change between the
+ *    steps of one turn. Without a turn-state registry it is one extra system part; with one (Phase 1.2) nothing is pushed:
+ *    the hint is kept per session and rendered by the `route-hint` provider into the turn-state tail, and the generated `R:`
+ *    line is frozen per session (reused while the config object and the dispatching agent, model and permissions are the
+ *    same) so no router system part changes between turns. Fresh routing evidence still reaches the model through the hint.
  *
  * The hint and the generated `R:` line come from the same kernel, but the hint is only emitted when the kernel says
  * `switched` for the class's static tier, i.e. when it agrees with a move the line itself could make (QA focus: a hint
@@ -15,7 +18,7 @@
  *
  * Roles mode (`routing.delegation: "roles"`, plan #84 T2.2.1): nothing is added or rewritten — no per-turn hint, no tier
  * `R:` line, no route-line paragraph. The roles protocol carries its own class → role line and route-line keys, and a
- * hint or a tier line would name tiers; a system part that changes per turn would also cost the orchestrator its
+ * hint or a tier line would name tiers; a router text that changes per turn would also cost the orchestrator its
  * prompt cache. The check is the roles protocol's heading among the router's own parts, i.e. the text the orchestrator
  * actually carries: a roles config with no enabled role falls back to the tiers protocol, augmented as in tiers mode.
  */
@@ -29,6 +32,7 @@ import {
 /** The roles heading only counts at the start of a line (QA-P22-2-4): a part that merely quotes it mid-line is not the roles protocol. */
 const ROLES_HEADING_LINE = /^## Role Delegation Protocol \(MANDATORY\)$/m;
 
+import type { TurnStateRegistry } from "../../compat/turn-state";
 import { classify } from "../classify";
 import { CLASS_STATIC_TIER, type TaskFacts } from "../classify/types";
 import { buildLadder, decide, floorRankOf, generateTaxonomy, resolveChosen } from "../engine";
@@ -95,7 +99,8 @@ export interface ContextInput {
 export interface SystemAugmenter {
   /**
    * Called by the context hook after the legacy hook has pushed its text. Rewrites the protocol text in `system` in place
-   * and pushes the hint, registering both in `added` (the texts whose vocabulary the adapter translates). Never throws.
+   * and pushes the hint, registering both in `added` (the texts whose vocabulary the adapter translates); with a turn-state
+   * registry the hint is kept for the `route-hint` provider instead and nothing is pushed. Never throws.
    */
   augment(input: ContextInput, system: string[], added: Set<string>): Promise<void>;
 }
@@ -105,6 +110,8 @@ export interface SystemAugmenterDeps {
   readonly getSession: (sessionID: string) => Promise<unknown>;
   readonly logger: WireLogger;
   readonly now?: () => number;
+  /** v2 only (Phase 1.2): when present the hint goes to the turn-state tail instead of the system array and the `R:` line is frozen per session. */
+  readonly turnState?: TurnStateRegistry;
 }
 
 function describeError(error: unknown): string {
@@ -116,10 +123,42 @@ export function createSystemAugmenter(deps: SystemAugmenterDeps): SystemAugmente
   // QA-2.2-9: the line depends on the config, the dispatching agent, its (and its session's) permissions and the orchestrator's model.
   const taxonomyMemo = new Map<string, { cfg: Prepared["cfg"]; at: number; line: string }>();
   const hints = new Map<string, { key: string; hint: string | null }>();
+  // Phase 1.2 (v2 only): the hint of the current request per session, read by the `route-hint` provider; and the frozen `R:` line.
+  const routeHints = new Map<string, string>();
+  const frozenLines = new Map<string, { memoKey: string; cfg: Prepared["cfg"]; line: string }>();
+
+  if (deps.turnState !== undefined) {
+    try {
+      deps.turnState.registerTurnStateProvider({
+        name: "route-hint",
+        order: 90,
+        render: (sid) => routeHints.get(sid),
+      });
+    } catch (error) {
+      deps.logger.warn("[router] turn state: the route-hint provider could not be registered", { error: describeError(error) });
+    }
+  }
 
   const taxonomyLine = (prepared: Prepared, view: AgentView, input: ContextInput): string => {
-    const t = now();
     const memoKey = `${input.agent}\u0000${input.parentModel ?? ""}\u0000${JSON.stringify(view.parentRules)}`;
+    if (deps.turnState === undefined) return computedTaxonomyLine(prepared, view, input, memoKey);
+    // 1.2.4.d: reused while the key and the config object are unchanged, so the system prompt does not move between turns. Accepted
+    // cache breaks: a config/env change, an agent catalog refresh, a model switch.
+    const frozen = frozenLines.get(input.sessionID);
+    if (frozen !== undefined && frozen.memoKey === memoKey && frozen.cfg === prepared.cfg) {
+      frozenLines.delete(input.sessionID);
+      frozenLines.set(input.sessionID, frozen);
+      return frozen.line;
+    }
+    const line = computedTaxonomyLine(prepared, view, input, memoKey);
+    frozenLines.delete(input.sessionID);
+    frozenLines.set(input.sessionID, { memoKey, cfg: prepared.cfg, line });
+    while (frozenLines.size > HINT_MEMO_LIMIT) frozenLines.delete(frozenLines.keys().next().value as string);
+    return line;
+  };
+
+  const computedTaxonomyLine = (prepared: Prepared, view: AgentView, input: ContextInput, memoKey: string): string => {
+    const t = now();
     const memo = taxonomyMemo.get(memoKey);
     if (memo !== undefined && memo.cfg === prepared.cfg && t - memo.at < TAXONOMY_TTL_MS) return memo.line;
     const line = generateTaxonomy({
@@ -184,6 +223,8 @@ export function createSystemAugmenter(deps: SystemAugmenterDeps): SystemAugmente
 
   return {
     async augment(input, system, added): Promise<void> {
+      // A request that returns early below (roles, static, shadow, no orchestrator) must leave no hint of an earlier one behind.
+      routeHints.delete(input.sessionID);
       try {
         // Roles mode: no hint part, and the protocol text stays exactly as the legacy hook built it. Keyed on the roles
         // protocol the orchestrator actually carries (QA-P22-1-5): `delegation: "roles"` with no enabled role keeps the
@@ -211,8 +252,14 @@ export function createSystemAugmenter(deps: SystemAugmenterDeps): SystemAugmente
         }
         const hint = mode === "advise" ? await hintFor(prepared, view, input) : null;
         if (hint !== null) {
-          added.add(hint);
-          system.push(hint);
+          if (deps.turnState !== undefined) {
+            // The tail carries the hint (provider `route-hint`); nothing is pushed into the system array.
+            routeHints.set(input.sessionID, hint);
+            while (routeHints.size > HINT_MEMO_LIMIT) routeHints.delete(routeHints.keys().next().value as string);
+          } else {
+            added.add(hint);
+            system.push(hint);
+          }
         }
       } catch (error) {
         deps.logger.warn("[router] routing: the protocol could not be adapted to the engine; the shipped text stays", { error: describeError(error) });
