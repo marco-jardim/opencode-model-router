@@ -235,7 +235,12 @@ const CONTRACT_FILE_RE = /(?:^|\/)(?:types\.ts|[^/]*\.d\.ts|schema[^/]*|contract
 
 function isContractTask(title: string, writes: readonly string[]): boolean {
   if (CONTRACT_TITLE_RE.test(title) && CONTRACT_VERB_RE.test(title)) return true;
-  return writes.some((w) => CONTRACT_FILE_RE.test(w));
+  // QA-2.3-32: a directory write also keeps its directory key (QA-2.3-16); that key (a prefix of another write) is not a file.
+  const dirs = new Set<string>();
+  for (const w of writes) {
+    for (let cut = w.lastIndexOf("/"); cut > 0; cut = w.lastIndexOf("/", cut - 1)) dirs.add(w.slice(0, cut).toLowerCase());
+  }
+  return writes.some((w) => !dirs.has(w.toLowerCase()) && CONTRACT_FILE_RE.test(w));
 }
 
 function formatIssue(i: CompileIssue): string {
@@ -311,8 +316,11 @@ export interface CompilerDeps {
 
 const SETTLED: ReadonlySet<TaskState> = new Set<TaskState>(["done", "cancelled", "integrated"]);
 
-/** `PathOutcome` reasons for a spelling that leaves the repository (a write there is rejected by `addTasks`). */
-const OUTSIDE_REASONS: ReadonlySet<string> = new Set(["url", "outside", "other-drive", "unc", "device", "escape"]);
+/**
+ * `PathOutcome` reasons for a spelling that leaves the repository (a write there is rejected by `addTasks`). A URL is not
+ * among them (QA-2.3-23): it is never a write target, so it is ignored like a read.
+ */
+const OUTSIDE_REASONS: ReadonlySet<string> = new Set(["outside", "other-drive", "unc", "device", "escape"]);
 
 function defaultCi(): boolean {
   return process.platform === "win32";
@@ -399,6 +407,32 @@ function selectPhases(parsed: ParsedPlan, opts: { phases?: readonly string[]; do
         `phase ${p.id} depends on ${d.id}, which is neither selected nor earlier than doneBefore`,
         { phase: p.id, dependsOn: d.id },
       );
+    }
+  }
+  // QA-2.3-25: the same dependency rule for graph edges: an edge from a phase (or a task of a phase) that is neither
+  // selected nor earlier than doneBefore into a selected phase would be dropped silently, so the run is refused.
+  if (opts.phases !== undefined) {
+    const taskPhase = new Map(parsed.tasks.map((t) => [t.id, t.phase] as const));
+    const waveById = new Map(parsed.waves.map((w) => [w.id, w] as const));
+    const phasesOf = (id: string): string[] => {
+      if (byId.has(id)) return [id];
+      const w = waveById.get(id);
+      if (w !== undefined) return [...w.phases];
+      const ph = taskPhase.get(id);
+      return ph === undefined || ph === null ? [] : [ph];
+    };
+    for (const g of parsed.graphs) {
+      for (const e of g.edges) {
+        const into = phasesOf(e.to).filter((id) => selected.has(id));
+        if (into.length === 0) continue;
+        const outside = phasesOf(e.from).find((id) => !includedIds.has(id) && byId.get(id)?.dogfood !== true);
+        if (outside === undefined) continue;
+        throw new ExecutorError(
+          "E_INVALID_INPUT",
+          `graph edge ${e.raw.trim()} (line ${e.line}) comes from phase ${outside}, which is neither selected nor earlier than doneBefore`,
+          { phase: into[0] ?? null, dependsOn: outside, line: e.line },
+        );
+      }
     }
   }
   return { included, selected, earlier };
@@ -578,6 +612,9 @@ function draftInvalid(errors: ReadonlyArray<{ code: string; message: string; tas
   return new ExecutorError("E_COMPILE", `compiled draft is invalid: ${first === undefined ? (extra[0] ?? "unknown") : `${first.code}: ${first.message}`}`, detail);
 }
 
+/** QA-2.3-22: warnings that make `addTasks` refuse a fragment (a reference it cannot resolve would be lost silently). */
+const FAIL_CLOSED_CODES: ReadonlySet<string> = new Set(["explicit-ref-unknown", "graph-node-unknown", "depends-unknown"]);
+
 /**
  * QA-2.3-2: `parsePlan` keeps a phrase or graph reference only when it names a node of the same text, so a fragment's
  * `before 1.1.2` to a ledger task would be dropped. The fragment is parsed a second time with one stub item per ledger
@@ -596,8 +633,8 @@ function fragmentWithLedgerRefs(frag: ParsedPlan, text: string, ledger: LedgerV1
     phrases: withStubs.phrases.filter((p) => !fromLedger(p.subject.id)),
     graphs: withStubs.graphs,
     warnings: [
-      ...frag.warnings.filter((w) => w.code !== "explicit-ref-unknown" && w.code !== "graph-node-unknown"),
-      ...withStubs.warnings.filter((w) => w.code === "explicit-ref-unknown" || w.code === "graph-node-unknown"),
+      ...frag.warnings.filter((w) => !FAIL_CLOSED_CODES.has(w.code)),
+      ...withStubs.warnings.filter((w) => FAIL_CLOSED_CODES.has(w.code)),
     ],
   };
 }
@@ -657,11 +694,11 @@ export function createPlanCompiler(deps: CompilerDeps): PlanCompiler {
         isContract: isContractTask(t.title, fp.footprint.writes),
       });
     });
-    const built = buildEdges(pp, edgeTasks, { crossPhase: config.crossPhase, ci });
-    // QA-2.3-10: a prose reference to a phase or wave of the plan that is outside this run is not an unresolved
-    // reference; it gets its own warning and does not feed the residue.
-    const planNodes = new Set([...parsed.phases.map((p) => p.id), ...parsed.waves.map((w) => w.id)]);
-    const runNodes = new Set([...includedIds, ...pp.waves.map((w) => w.id)]);
+    // QA-2.3-10 / QA-2.3-21: a prose reference to a phase, wave or task of the plan that is outside this run is not an
+    // unresolved reference; it gets its own warning and does not feed the residue.
+    const planNodes = new Set([...parsed.phases.map((p) => p.id), ...parsed.waves.map((w) => w.id), ...parsed.tasks.map((t) => t.id)]);
+    const runNodes = new Set([...includedIds, ...pp.waves.map((w) => w.id), ...universe.map((t) => t.id)]);
+    const built = buildEdges(pp, edgeTasks, { crossPhase: config.crossPhase, ci, planNodes });
     for (const w of built.warnings) {
       const ref = w.code === "explicit-ref-unknown" ? /^unknown (?:reference|subject) (\S+?):/.exec(w.message)?.[1] : undefined;
       if (ref !== undefined && planNodes.has(ref) && !runNodes.has(ref)) {
@@ -762,7 +799,7 @@ export function createPlanCompiler(deps: CompilerDeps): PlanCompiler {
 
     // residue
     const overflow = residueOverflow(draft);
-    if (overflow > 0) issues.push({ code: "residue-capped", line: 0, message: `${overflow} editing task(s) over the residue cap keep an unknown (top) write set` });
+    if (overflow > 0) issues.push({ code: "residue-capped", line: 0, message: `${overflow} editing task(s) over the residue cap keep their write set unrefined (unknown ones stay top; ownership-assumed ones keep the paths their phase owns)` });
     const candidates = residueCandidates({ parsedTasks: parsedById, nodes, edges, phases, issues, parsed: pp, repo: view });
     const residueRequest = residueRequestOf(draft, candidates);
     if (residueRequest !== undefined) draft.status = "awaiting-residue";
@@ -803,7 +840,11 @@ export function createPlanCompiler(deps: CompilerDeps): PlanCompiler {
     return { draft: next, summary: summaryOf(next, []) };
   }
 
-  /** The contract allows only E_CYCLE and E_INVALID_INPUT: a parse failure (E_COMPILE) becomes E_INVALID_INPUT. */
+  /**
+   * The contract allows only E_CYCLE and E_INVALID_INPUT: a parse failure (E_COMPILE) becomes E_INVALID_INPUT.
+   * QA-2.3-22: a reference the fragment cannot resolve (`explicit-ref-unknown`, `graph-node-unknown`, `depends-unknown`)
+   * fails closed with E_INVALID_INPUT; every other warning is dropped, because the contract returns no warnings.
+   */
   function addTasks(ledger: LedgerV1, text: string): { tasks: TaskNode[]; edges: Edge[]; reopened: TaskId[] } {
     try {
       return addTasksChecked(ledger, text);
@@ -870,17 +911,27 @@ export function createPlanCompiler(deps: CompilerDeps): PlanCompiler {
     // name them; only the edges that involve a new task are kept.
     const existing = Object.values(ledger.tasks);
     const fragPhaseIds = new Set(frag.phases.map((p) => p.id));
+    // QA-2.3-19: the phase view comes from the ledger (`dependsOn`, `waves`), so a new task gets the gate edges of its phase.
+    const ledgerDeps = (id: string): Array<{ id: string; external: boolean; line: number }> =>
+      (ledger.phases.find((q) => q.id === id)?.dependsOn ?? []).map((d) => ({ id: d, external: false, line: 0 }));
     const fragView: ParsedPlan = {
       ...frag,
       phases: [
         ...ledger.phases.filter((p) => !fragPhaseIds.has(p.id)).map((p): ParsedPhase => ({
           id: p.id, title: p.title, wave: p.wave, span: { line: 0, endLine: 0 }, dogfood: false, synthetic: false,
-          dependsOn: [], order: null, fixTemplate: null, intro: "", newTests: null,
+          dependsOn: ledgerDeps(p.id), order: null, fixTemplate: null, intro: "", newTests: null,
         })),
-        ...frag.phases,
+        ...frag.phases.map((p): ParsedPhase => (phaseIds.has(p.id) ? { ...p, dependsOn: [...ledgerDeps(p.id), ...p.dependsOn.filter((d) => !ledger.phases.some((q) => q.id === p.id && q.dependsOn.includes(d.id)))] } : p)),
       ],
+      // the fragment's own wave headings are not used: its tasks must belong to phases of the ledger
+      waves: ledger.waves.map((w, i) => ({ id: w.id, title: "", line: i + 1, phases: [...w.phases] })),
     };
     const built = buildEdges(fragView, [...existing.map((t, i) => edgeTaskOf(t, i)), ...edgeTasks], { crossPhase: ledger.config.crossPhase, ci });
+    // QA-2.3-22: a reference the fragment cannot resolve fails closed instead of being dropped silently.
+    const unresolved = [...frag.warnings, ...built.warnings].find((w) => FAIL_CLOSED_CODES.has(w.code));
+    if (unresolved !== undefined) {
+      throw new ExecutorError("E_INVALID_INPUT", `the fragment has an unresolved reference: ${formatIssue(unresolved)}`, { code: unresolved.code, line: unresolved.line });
+    }
     const newEdges: Edge[] = [];
     const seen = new Set(ledger.edges.map((e) => `${e.from}>${e.to}`));
     const push = (e: Edge): void => {
@@ -896,7 +947,13 @@ export function createPlanCompiler(deps: CompilerDeps): PlanCompiler {
       const fromNew = newIds.has(e.from);
       const toNew = newIds.has(e.to);
       if (!fromNew && !toNew) continue;
-      if (e.kind === "structural" && !(toNew && (fromNew || e.from.startsWith("gate:")))) continue;
+      if (e.kind === "structural") {
+        // QA-2.3-19: existing -> new (pre-flight, gates, earlier stages) and new -> existing while that task can still wait.
+        if (!toNew) {
+          const state = ledger.tasks[e.to]?.state;
+          if (state !== "pending" && state !== "ready") continue;
+        }
+      }
       // conflicts and contracts are recomputed below with the whole ledger's reach; keep the new-to-new ones only
       if ((e.kind === "conflict" || e.kind === "contract") && !(fromNew && toNew)) continue;
       if (fromNew && !toNew) {
@@ -907,7 +964,6 @@ export function createPlanCompiler(deps: CompilerDeps): PlanCompiler {
       }
       push(e);
     }
-    for (const w of built.warnings) issues.push(w);
 
     // conflicts against the live tasks of the ledger (existing tasks come first in plan order)
     const allTasks = [...Object.values(ledger.tasks), ...newNodes];

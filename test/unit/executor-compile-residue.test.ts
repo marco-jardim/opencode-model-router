@@ -171,6 +171,59 @@ describe("executor compile: residue (2.3.5)", () => {
       expect(added.edges.some((e) => e.from === "1.1.9" && e.to === "1.1.2")).toBe(true);
     });
 
+    const PHASED = [
+      "# Phased", "", "## Wave 1", "", "### Phase 1.1 First", "", "**Tasks**",
+      "- **1.1.1** `[tier:medium]` One.", "  Writes: `src/alpha/one.ts`", "",
+      "### Phase 1.2 Second", "", "**Depends on:** 1.1", "", "**Pre-flight**",
+      "- Check the branch is clean.", "", "**Tasks**",
+      "- **1.2.1** `[tier:medium]` Two.", "  Writes: `src/alpha/two.ts`", "",
+      "**QA review**",
+      "- Review phase 1.2.", "",
+    ].join("\n");
+
+    it("QA-2.3-19: a task added to a pending phase waits for its pre-flight and dependency gate, and the phase QA waits for it", async () => {
+      const p = makeHarness({ inline: { "phased.md": PHASED } });
+      const r = await p.compiler.compile(planPathOf("phased.md"), compileOpts(p));
+      const nodes = Object.values(r.draft.tasks);
+      const pre = nodes.find((t) => t.kind === "preflight" && t.phase === "1.2");
+      const qa = nodes.find((t) => t.kind === "qa" && t.phase === "1.2");
+      expect(pre).toBeDefined();
+      expect(qa).toBeDefined();
+      const added = p.compiler.addTasks(r.draft, "- **1.2.9** `[tier:medium]` Three.\n  Writes: `src/alpha/three.ts`\n");
+      const has = (from: string, to: string): boolean => added.edges.some((e) => e.from === from && e.to === to);
+      expect(has(pre?.id ?? "", "1.2.9")).toBe(true);
+      expect(has("1.2.9", qa?.id ?? "")).toBe(true);
+      // the dependency gate of 1.2 is reached through the pre-flight, which already waits for gate:1.1
+      expect(r.draft.edges.some((e) => e.from === "gate:1.1" && e.to === pre?.id)).toBe(true);
+    });
+
+    it("QA-2.3-19: without a pre-flight a new task of a dependent phase gets the gate edge itself", async () => {
+      const text = PHASED.replace("**Pre-flight**\n- Check the branch is clean.\n\n", "");
+      const p = makeHarness({ inline: { "phased2.md": text } });
+      const r = await p.compiler.compile(planPathOf("phased2.md"), compileOpts(p));
+      const added = p.compiler.addTasks(r.draft, "- **1.2.9** `[tier:medium]` Three.\n  Writes: `src/alpha/three.ts`\n");
+      expect(added.edges.some((e) => e.from === "gate:1.1" && e.to === "1.2.9")).toBe(true);
+    });
+
+    it("QA-2.3-22: addTasks fails closed on an unknown reference, subject or Depends on id", () => {
+      const refs = [
+        "- **1.1.9** `[tier:medium]` Add a helper.\n  1.1.9 must run before 7.7.7.\n  Writes: `src/alpha/helper.ts`\n",
+        "- **1.1.9** `[tier:medium]` Add a helper.\n  Depends on: 7.7.7\n  Writes: `src/alpha/helper.ts`\n",
+      ];
+      for (const frag of refs) expect(codeOf(() => h.compiler.addTasks(draft, frag)), frag).toBe("E_INVALID_INPUT");
+      expect(codeOf(() => h.compiler.addTasks(draft, "- **1.1.9** `[tier:medium]` Add a helper.\n  Depends on: 1.1.1\n  Writes: `src/alpha/helper.ts`\n"))).toBe("none");
+    });
+
+    it("QA-2.3-28: the residue-capped message also covers ownership-assumed tasks", async () => {
+      const lines = ["# Many", "", "## Wave 1", "", "### Phase 1.1 Many", "", "**Tasks**"];
+      for (let i = 1; i <= 61; i += 1) lines.push(`- **1.1.${i}** \`[tier:medium]\` Make it better somehow ${i}.`);
+      const m = makeHarness({ inline: { "many2.md": lines.join("\n") } });
+      const r = await m.compiler.compile(planPathOf("many2.md"), compileOpts(m));
+      const capped = r.summary.warnings.find((w) => w.startsWith("residue-capped"));
+      expect(capped).toContain("ownership-assumed");
+      expect(capped).toContain("unknown ones stay top");
+    });
+
     it("QA-2.3-10: an external dependency needs doneBefore", async () => {
       const ext = [
         "# Ext", "", "## Wave 1", "", "### Phase 1.1 First", "", "**Tasks**",

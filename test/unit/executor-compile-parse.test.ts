@@ -37,6 +37,32 @@ describe("executor compile: parse, QA-2.3 round 1 (batch B)", () => {
     expect(refs).toEqual(expect.arrayContaining(["1.1.1", "1.1"]));
   });
 
+  it("QA-2.3-27: a phase-level `Depends on:` clause ends at a sentence boundary unless an id follows", () => {
+    const head = `# Plan\n\n${phases("1.1", "1.3")}\n## Phase 2.1 T\n\n`;
+    const tail = "\n\n**Tasks**\n- **2.1.1** `[tier:fast]` Do it.\n";
+    const ended = depsOf(`${head}**Depends on:** 1.1. Background reading is in 1.3 only.${tail}`, "2.1");
+    expect(ended).toContain("1.1");
+    expect(ended).not.toContain("1.3");
+    const wrapped = depsOf(`${head}**Depends on:** 1.1.\n  1.3${tail}`, "2.1");
+    expect(wrapped).toEqual(expect.arrayContaining(["1.1", "1.3"]));
+    expect(depsOf(`${head}**Depends on:** 1.1 (config); 1.3${tail}`, "2.1")).toEqual(expect.arrayContaining(["1.1", "1.3"]));
+  });
+
+  it("QA-2.3-27: a task-level `Depends on:` join stops at the Writes:, Reads: and [route lines", () => {
+    const text = `# Plan\n\n${phases("1.1")}\n## Phase 2.1 T\n\n**Tasks**\n- **2.1.1** \`[tier:fast]\` Do it.\n  Depends on: 1.1.1\n  Writes: \`src/x.ts\` (shares 1.1.2)\n  Reads: \`src/y.ts\` after 1.1.3\n`;
+    const refs = parsePlan(text).phrases.filter((p) => p.subject.id === "2.1.1" && p.verb === "after").flatMap((p) => p.refs);
+    expect(refs).toEqual(["1.1.1"]);
+  });
+
+  it("QA-2.3-31: a block label that is the whole line is accepted without a colon", () => {
+    const text = "# Plan\n\n## Phase 1.1 T\n\nPre-flight\n- check the tree\n\n**Tasks**\n- **1.1.1** `[tier:fast]` Real task.\n";
+    const p = parsePlan(text);
+    expect(p.tasks.filter((t) => t.kind === "preflight")).toHaveLength(1);
+    expect(p.tasks.map((t) => t.id)).toContain("1.1.1");
+    const prose = "# Plan\n\n## Phase 1.1 T\n\nPre-flight checks are described below.\n\n**Tasks**\n- **1.1.1** `[tier:fast]` Real task.\n";
+    expect(parsePlan(prose).tasks.filter((t) => t.kind === "preflight")).toHaveLength(0);
+  });
+
   it("QA-2.3-8: an item with the phase's own id prefix is a task even inside a metadata block", () => {
     const text = `# Plan\n\n## Phase 1.1 T\n\n**Tasks**\n- **1.1.1** \`[tier:fast]\` One.\n\n**Acceptance criteria**\n- a plain bullet\n- **1.1.2** \`[tier:fast]\` Two.\n`;
     expect(idsOf(text)).toEqual(expect.arrayContaining(["1.1.1", "1.1.2"]));

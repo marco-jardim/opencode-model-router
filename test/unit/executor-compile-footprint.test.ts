@@ -176,6 +176,71 @@ describe("executor compile: footprint (2.3.3)", () => {
     });
   });
 
+  describe("round-2 regressions", () => {
+    it("QA-2.3-18: an unknown identifier after a write verb is not a write (the task stays top)", () => {
+      const fp = extractFootprint(input({ body: "Update `Foo.bar` to match the new shape." }), [], repo, new Set<string>());
+      expect(fp.footprint.writes).toEqual([]);
+      expect(fp.footprint.confidence).toBe("unknown");
+      expect(fp.ignored.some((i) => i.raw === "Foo.bar" && i.reason === "not-found")).toBe(true);
+    });
+
+    it("QA-2.3-18: Footprint.confidence after a write verb stays top, a create verb or (new) still writes", () => {
+      const a = extractFootprint(input({ body: "Modify `Footprint.confidence` for the ownership case." }), [], repo, new Set<string>());
+      expect(a.footprint.confidence).toBe("unknown");
+      const b = extractFootprint(input({ body: "Create `Brand.new`." }), [], repo, new Set<string>());
+      expect(b.footprint.writes).toEqual(["Brand.new"]);
+      const c = extractFootprint(input({ body: "Update `Other.new` (new)." }), [], repo, new Set<string>());
+      expect(c.footprint.writes).toEqual(["Other.new"]);
+    });
+
+    it("QA-2.3-18: an unknown path with a separator after a write verb is still a write; a Writes: line keeps a bare name", () => {
+      const a = extractFootprint(input({ body: "Update `zz-missing-dir/x.ts`." }), [], repo, new Set<string>());
+      expect(a.footprint.writes).toEqual(["zz-missing-dir/x.ts"]);
+      const b = extractFootprint(input({ writesLine: line("`Foo.bar`") }), [], repo, new Set<string>());
+      expect(b.footprint.writes).toEqual(["Foo.bar"]);
+    });
+
+    it("QA-2.3-20: a Reads: path to a file that is not tracked yet is kept", () => {
+      const fp = extractFootprint(
+        input({ writesLine: line("`src/alpha/core.ts`"), readsLine: line("`zz-missing-dir/made-earlier.ts`") }),
+        [], repo, new Set<string>(),
+      );
+      expect(fp.footprint.reads).toEqual(["zz-missing-dir/made-earlier.ts"]);
+    });
+
+    it("QA-2.3-23: a URL is never a write target and does not widen the task", () => {
+      const fp = extractFootprint(
+        input({ writesLine: line("`src/alpha/core.ts`, `https://example.com/spec.md`") }), [], repo, new Set<string>(),
+      );
+      expect(fp.footprint.writes).toEqual(["src/alpha/core.ts"]);
+      expect(fp.ignored.some((i) => i.reason === "url" && i.write !== true)).toBe(true);
+      const body = extractFootprint(input({ body: "Update https://example.com/spec.md today." }), [], repo, new Set<string>());
+      expect(body.footprint.writes).toEqual([]);
+      expect(body.footprint.confidence).toBe("unknown");
+    });
+
+    it("QA-2.3-30: an ownership row whose directory does not exist yet is still assumed", () => {
+      const fp = extractFootprint(
+        input({ body: "Implement the new area." }),
+        [{ path: "zz-new-area/impl/file.ts", owners: ["1.1"], line: 3 }],
+        repo, new Set<string>(),
+      );
+      expect(fp.footprint.writes).toEqual(["zz-new-area/impl/file.ts"]);
+      expect(fp.footprint.confidence).toBe("inferred");
+      expect(fp.ownershipAssumed).toBe(true);
+    });
+
+    it("Writes: ./ names the repository root: no write of \".\", the task writes top", () => {
+      for (const spelling of ["`./`", "`.`"]) {
+        const fp = extractFootprint(input({ writesLine: line(spelling) }), [], repo, new Set<string>());
+        expect(fp.footprint.writes, spelling).not.toContain(".");
+        expect(fp.footprint.writes, spelling).toEqual([]);
+      }
+      const root = extractFootprint(input({ writesLine: line("`./`") }), [], repo, new Set<string>());
+      expect(root.footprint.confidence).toBe("unknown");
+    });
+  });
+
   describe("extractFootprint", () => {
     it("takes a Writes/Reads line as the closed footprint (D5)", () => {
       const fp = extractFootprint(

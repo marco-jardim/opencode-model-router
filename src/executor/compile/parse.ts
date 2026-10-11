@@ -139,7 +139,7 @@ const GENERIC_HEADING_RE = new RegExp(`^ {0,3}#{2,4}[ \\t]+(?:\\*\\*)?(${PID})(?
 const ANY_HEADING_RE = /^ {0,3}#{1,6}[ \t]+(.*)$/;
 /** `Task`/`Steps` (singular or looser wording) label a task list only when marked (heading or bold), never as plain prose. */
 const BLOCK_LABEL_RE =
-  /^ {0,3}(?:(?:#{1,6}[ \t]+|\*\*|__)(Task|Steps)(?=(?:\*\*|__)?[ \t]*:?(?:\*\*|__)?[ \t]*$)|(?:#{1,6}[ \t]+|\*\*|__)(Pre-flight|Tasks|New tests|Acceptance criteria|Definition of Done|QA review|Order)\b|(Pre-flight|Tasks|New tests|Acceptance criteria|Definition of Done|QA review|Order)(?=[ \t]*(?:\([^)\n]*\))?[ \t]*:))/;
+  /^ {0,3}(?:(?:#{1,6}[ \t]+|\*\*|__)(Task|Steps)(?=(?:\*\*|__)?[ \t]*:?(?:\*\*|__)?[ \t]*$)|(?:#{1,6}[ \t]+|\*\*|__)(Pre-flight|Tasks|New tests|Acceptance criteria|Definition of Done|QA review|Order)\b|(Pre-flight|Tasks|New tests|Acceptance criteria|Definition of Done|QA review|Order)(?=[ \t]*(?:\([^)\n]*\))?[ \t]*(?::|$)))/;
 
 /**
  * Any other bold label at the start of a line (`**Fallback:** …`, `**Goal:** …`) ends a Tasks block: the list under it is
@@ -542,10 +542,11 @@ const DOTTED_ID_RE = /^[A-Za-z]?\d+(?:\.[A-Za-z0-9]+)+$/;
 
 /**
  * End of the dependency clause: the next bold label, a middle dot or a "parallel with"-style phrase (the ids such a
- * phrase governs are dropped with the rest). Not `;` nor `. `: `1.1 (config); 1.3` keeps both ids.
+ * phrase governs are dropped with the rest), or a sentence boundary `. ` unless an id follows (QA-2.3-27). Not `;`:
+ * `1.1 (config); 1.3` keeps both ids, and so does a clause wrapped as `1.1.` + newline + `1.3`.
  */
 const DEPENDS_CLAUSE_END_RE =
-  /\*\*[A-Za-z][^*\n]*:\*\*|·|\b(?:in parallel|parallel with|parallel to|alongside|independent of)\b/i;
+  /\*\*[A-Za-z][^*\n]*:\*\*|·|\.[ \t]+(?![ \t]*`?(?:DF-?\d|[A-Za-z]?\d+\.[A-Za-z0-9]))|\b(?:in parallel|parallel with|parallel to|alongside|independent of)\b/i;
 
 /** The part of a `Depends on:` line that names dependencies (cut at the clause end, see DEPENDS_CLAUSE_END_RE). */
 function dependsText(line: string): string | null {
@@ -1397,7 +1398,9 @@ export function parsePlan(text: string): ParsedPlan {
       if (DEPENDS_LABEL_RE.test(l)) {
         // A task-level `Depends on:` line is an explicit `after` phrase on the task (continuation lines joined before the cut).
         let joined = l;
-        for (let j = k + 1; j < bodyLines.length && (bodyLines[j] as string).trim() !== "" && !NESTED_ITEM_RE.test(bodyLines[j] as string); j += 1) {
+        // QA-2.3-27: the join ends at a `Writes:`/`Reads:` line or a `[route …]` line, which never continue the clause.
+        for (let j = k + 1; j < bodyLines.length && (bodyLines[j] as string).trim() !== "" && !NESTED_ITEM_RE.test(bodyLines[j] as string) &&
+          !/^\s*(?:[-*]\s+)?(?:\*\*|__)?(?:Writes|Reads)\b|^\s*(?:[-*]\s+)?`?\[route\b/i.test(bodyLines[j] as string); j += 1) {
           joined += ` ${bodyLines[j] as string}`;
         }
         const clause = (dependsText(joined) ?? "").replace(/§\S+/g, " ").replace(/`/g, " ");

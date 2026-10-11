@@ -212,6 +212,14 @@ describe.skipIf(!FROZEN)("executor compile: the one frozen plan that compiles to
     expect(Object.keys(draft.tasks).some((id) => id.endsWith(".FIX"))).toBe(false);
   });
 
+  it("QA-2.3-18: T3.4.5 (rta:1002) names `Footprint.confidence` after a write verb and stays top", async () => {
+    const { draft } = await compileName(name);
+    const fp = draft.tasks["T3.4.5"]?.footprint;
+    // no explicit write: the identifier is not a file; the phase's ownership rows (if any) give at most an `inferred` set
+    expect(fp?.confidence).not.toBe("explicit");
+    expect(fp?.writes.some((w) => w.includes("Footprint"))).toBe(false);
+  });
+
   it("is deterministic: two compiles give the same ids and edges", async () => {
     const a = await compileName(name);
     const b = await compileName(name);
@@ -371,7 +379,8 @@ describe.skipIf(!FROZEN)("executor compile: frozen real plans", () => {
   // D3 (fixed in parse.ts): an id-shaped heading is a phase only when a task id of its own section has that prefix.
   // D4 (fixed): Pre-flight items of a `Dogfood switch DF-<n>` section are `DF<n>.PF<k>`; Worktrees/Acceptance/DoD lists
   // of a DF section are not tasks (cpx:2041, 2156).
-  // D5 (fixed): only the dependency clause of a `Depends on:` line counts (up to `. `, `;` or "parallel with"), so
+  // D5 (fixed): only the dependency clause of a `Depends on:` line counts (up to a sentence boundary `. ` not followed by an
+  // id, a bold label, a middle dot or "parallel with"; `;` does not end it, see QA-2.3-7 and QA-2.3-27), so
   // `**Depends on:** 2.3 merged. Parallel with 3.2.` (dd:1385, dd:1426) no longer closes a 3.1/3.2 cycle.
   // D6 (fixed): the numbered section heading `## 3. Waves, phases, tasks` (vrb:468) is not a phase, and a synthetic
   // wave never shares an id with a real `Wave N` heading.
@@ -490,6 +499,33 @@ describe.skipIf(!FROZEN)("executor compile: frozen real plans", () => {
       // notable hand-checked edges (the other ~130 are chain/stage edges nobody hand-listed), so there it is a subset check.
       if (name === "critical-path-execution-plan.md") expect(order).toEqual(expect.arrayContaining(hand));
       else expect(order).toEqual(hand);
+
+      // QA-2.3-24: the Order edges derived independently from the plan's own `Order:` lines (like the Depends-on check above)
+      // must equal the compiled set exactly, for the cpx plan too. Arrows chain groups; `∥` and parentheses make a group;
+      // an item that is no task (FIX) is dropped; a pre-flight item not listed feeds the first group; QA closes the chain.
+      const taskIds = new Set(parsed.tasks.map((t) => t.id));
+      const wantOrder = new Set<string>();
+      for (const ph of parsed.phases) {
+        if (ph.synthetic) continue;
+        const own = lines.slice(ph.span.line - 1, ph.span.endLine).filter((l) => !/^\s{2,}/.test(l));
+        const raw = own.map((l) => /^\W*Order\W+(.*)$/i.exec(l)?.[1]).find((x) => x !== undefined);
+        if (raw === undefined) continue;
+        const clause = raw.split(/\.\s/)[0] ?? "";
+        const groups: string[][] = clause.split("→").map((part) =>
+          [...part.matchAll(/(?<![\w.])(?:\d+\.(?:\d+|P)\.\w+|QA|FIX)(?![\w])/g)]
+            .map((m) => (m[0] === "QA" ? `${ph.id}.QA` : m[0]))
+            .filter((id) => taskIds.has(id)),
+        ).filter((g) => g.length > 0);
+        const listed = new Set(groups.flat());
+        const pre = parsed.tasks.filter((t) => t.phase === ph.id && t.kind === "preflight" && !listed.has(t.id)).map((t) => t.id);
+        const chain = [...(pre.length > 0 && groups.length > 0 ? [pre] : []), ...groups];
+        const qaId = `${ph.id}.QA`;
+        if (!listed.has(qaId) && taskIds.has(qaId) && groups.length > 0) chain.push([qaId]);
+        for (let i = 0; i + 1 < chain.length; i += 1) {
+          for (const a of chain[i] ?? []) for (const b of chain[i + 1] ?? []) wantOrder.add(`${a}>${b}`);
+        }
+      }
+      expect(order).toEqual([...wantOrder].sort());
     });
 
     it(`${name}: every Writes:/Reads: path of a task is in its footprint`, async () => {

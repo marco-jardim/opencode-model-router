@@ -6,7 +6,7 @@ import { UNKNOWN_WRITES } from "../../src/executor/compile/footprint";
 import { parsePlan } from "../../src/executor/compile/parse";
 import { ExecutorError, type LedgerV1 } from "../../src/executor/types";
 import { compileOpts, edgeKeys, makeHarness, planPathOf } from "../fixtures/cpx/plans/harness";
-import { fixturePath } from "../fixtures/cpx/plans/loader";
+import { fixturePath, readRepoViewFixture } from "../fixtures/cpx/plans/loader";
 
 async function compileInline(text: string, extra: { phases?: string[]; doneBefore?: string } = {}): Promise<{ draft: LedgerV1; warnings: string[] }> {
   const h = makeHarness({ inline: { "inline.md": text } });
@@ -50,6 +50,77 @@ function phase(id: string, body: string, extra = ""): string {
 }
 
 describe("executor compile: edges (2.3.4)", () => {
+  describe("round-2 regressions", () => {
+    const TWO = [
+      "# Two", "", "## Wave 1", "",
+      "### Phase 1.1 First", "", "**Tasks**", task("1.1.1", "One.", "src/alpha/one.ts"),
+      "### Phase 1.2 Second", "", "**Tasks**", task("1.2.1", "Two.", "src/alpha/two.ts"),
+    ].join("\n");
+    const withGraph = (arrow: string): string => `${TWO}\n\`\`\`mermaid\ngraph TD\n${arrow}\n\`\`\`\n`;
+
+    it("QA-2.3-25: a graph edge into a selected phase from an unselected, non-earlier phase is refused", async () => {
+      const e = await failure(compileInline(withGraph("1.1 --> 1.2"), { phases: ["1.2"] }));
+      expect(e.code).toBe("E_INVALID_INPUT");
+      const ok = await compileInline(withGraph("1.1 --> 1.2"), { phases: ["1.2"], doneBefore: "1.2" });
+      expect(ok.draft.tasks["1.2.1"]?.state).toBe("pending");
+    });
+
+    it("QA-2.3-26: ref-outside-run is emitted only for nodes the plan knows", async () => {
+      const outside = await compileInline(withGraph("1.1 --> 1.2"), { phases: ["1.1"] });
+      expect(outside.warnings.some((w) => w.startsWith("ref-outside-run"))).toBe(true);
+      const unknown = await compileInline(withGraph("1.1 --> 9.9"));
+      expect(unknown.warnings.some((w) => w.startsWith("graph-node-unknown"))).toBe(true);
+      expect(unknown.warnings.some((w) => w.startsWith("ref-outside-run"))).toBe(false);
+    });
+
+    it("QA-2.3-20: a Reads: path to a file another task creates gives the reader an edge from the creator", async () => {
+      const plan = [
+        "# Reader", "", "## Wave 1", "", "### Phase 1.1 First", "", "**Tasks**",
+        task("1.1.1", "Create the generated file.", "src/alpha/zz-generated.ts"),
+        "- **1.1.2** `[tier:medium]` Check the shape.\n  Reads: `src/alpha/zz-generated.ts`\n  Writes: `src/alpha/two.ts`\n",
+      ].join("\n");
+      const r = await compileInline(plan);
+      expect(r.draft.tasks["1.1.2"]?.footprint.reads).toEqual(["src/alpha/zz-generated.ts"]);
+      expect(r.draft.edges.some((e) => e.from === "1.1.1" && e.to === "1.1.2")).toBe(true);
+    });
+
+    it("QA-2.3-29: the merged-first matching uses the repository case flag", async () => {
+      const plan = [
+        "# Case", "", "## Wave 1 — Core (contract commit of 1.1 merged first)", "",
+        "### Phase 1.1 First", "", "**Tasks**", task("1.1.1", "Define the contract types.", "src/alpha/newc.ts"),
+        "### Phase 1.2 Second", "", "**Tasks**", task("1.2.1", "Use the contract.", "src/alpha/NewC.ts"),
+      ].join("\n");
+      const explicit = async (caseInsensitive: boolean): Promise<boolean> => {
+        const h = makeHarness({ inline: { "case.md": plan }, view: { caseInsensitive } });
+        const r = await h.compiler.compile(planPathOf("case.md"), compileOpts(h));
+        return r.draft.edges.some((e) => e.kind === "explicit" && e.from === "1.1.1" && e.to === "1.2.1");
+      };
+      expect(await explicit(true)).toBe(true);
+      expect(await explicit(false)).toBe(false);
+    });
+
+    it("QA-2.3-32: the directory key of a directory write does not make the task a contract task", async () => {
+      const files = [...readRepoViewFixture().files, "src/schema-dir/a.ts", "src/schema-dir/b.ts"];
+      const plan = [
+        "# Dir", "", "## Wave 1", "", "### Phase 1.1 First", "", "**Tasks**",
+        task("1.1.1", "Tidy the helpers.", "src/schema-dir/"),
+        "- **1.1.2** `[tier:medium]` Use a helper.\n  Reads: `src/schema-dir/a.ts`\n  Writes: `src/alpha/two.ts`\n",
+      ].join("\n");
+      const h = makeHarness({ inline: { "dir.md": plan }, view: { files } });
+      const r = await h.compiler.compile(planPathOf("dir.md"), compileOpts(h));
+      expect(r.draft.tasks["1.1.1"]?.footprint.writes).toEqual(expect.arrayContaining(["src/schema-dir/a.ts", "src/schema-dir/b.ts"]));
+      expect(r.draft.edges.some((e) => e.kind === "contract")).toBe(false);
+      expect(r.draft.edges.some((e) => e.kind === "conflict" && e.from === "1.1.1" && e.to === "1.1.2")).toBe(true);
+    });
+
+    it("QA-2.3-21: a phrase about a task outside the run is not an unresolved reference", async () => {
+      const text = TWO.replace("Writes: `src/alpha/one.ts`", "Writes: `src/alpha/one.ts`\n  1.1.1 must run before 1.2.1.");
+      const r = await compileInline(text, { phases: ["1.1"] });
+      expect(r.warnings.some((w) => w.startsWith("ref-outside-run"))).toBe(true);
+      expect(r.warnings.some((w) => w.startsWith("explicit-ref-unknown"))).toBe(false);
+    });
+  });
+
   describe("primitives", () => {
     it("computes transitive reachability and concurrency", () => {
       const tasks = [et("a"), et("b"), et("c"), et("d")];

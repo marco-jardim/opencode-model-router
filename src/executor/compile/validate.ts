@@ -1,5 +1,4 @@
 import {
-  LAUNCH_HEADER_PATTERN,
   RESERVED_TASK_IDS,
   isTaskId,
   ledgerViolations,
@@ -108,8 +107,9 @@ export function validateLedger(l: LedgerV1, o: ValidateOptions = {}): Validation
   // id-invalid / id-reserved / id-duplicate
   const folded = new Map<string, string>();
   for (const id of ids) {
-    if (!isTaskId(id)) errors.push({ code: "id-invalid", message: `task id ${JSON.stringify(id)} is not a valid task id`, taskIds: [id] });
-    else if (RESERVED_TASK_IDS.has(id)) errors.push({ code: "id-reserved", message: `task id ${id} is reserved`, taskIds: [id] });
+    // QA-2.3 coverage: the reserved check comes first, because `isTaskId` rejects the reserved names too.
+    if (RESERVED_TASK_IDS.has(id)) errors.push({ code: "id-reserved", message: `task id ${id} is reserved`, taskIds: [id] });
+    else if (!isTaskId(id)) errors.push({ code: "id-invalid", message: `task id ${JSON.stringify(id)} is not a valid task id`, taskIds: [id] });
     const key = id.toLowerCase();
     const first = folded.get(key);
     if (first === undefined) folded.set(key, id);
@@ -176,13 +176,7 @@ export function validateLedger(l: LedgerV1, o: ValidateOptions = {}): Validation
     if (list.length > 1) errors.push({ code: "qa-multiple", message: `phase ${phase} has ${list.length} live qa tasks: ${list.join(", ")}`, taskIds: list });
   }
 
-  // shared-context-header
-  const headerRe = new RegExp(LAUNCH_HEADER_PATTERN.source, LAUNCH_HEADER_PATTERN.flags.replace(/[gy]/g, ""));
-  const alreadyReported = errors.some((e) => e.code === "ledger:shared-context-header");
-  if (!alreadyReported && l.sharedContext.split(/\r\n|\n|\r/).some((line) => headerRe.test(line))) {
-    errors.push({ code: "shared-context-header", message: "sharedContext contains a line shaped like a launch header", taskIds: [] });
-  }
-
+  // A launch-header-shaped line in sharedContext is reported by `ledgerViolations` above (`ledger:shared-context-header`).
   errors.push(...closureErrors(l, tasks, validEdges, ci));
   return errors;
 }

@@ -376,6 +376,9 @@ function resolveRelative(
 function resolveBare(
   raw: string, repo: RepoView, o: { allowNew: boolean; createdEarlier: ReadonlySet<string> },
 ): Resolved {
+  // `./` is the repository root, never a new file named "." (without `allowNew` it stays `not-found`, as before).
+  if (raw === "." && o.allowNew) return good("", "relative", true);
+  if (raw === "..") return fail("escape", raw);
   if (badSegment(raw)) return fail("outside", raw);
   const matches = repo.byBasename.get(touchKey(raw, repo.caseInsensitive));
   if (matches !== undefined && matches.length === 1) return good(matches[0] ?? raw, "basename", false);
@@ -614,7 +617,7 @@ export function extractFootprint(
    * basename writes every match; a glob or path that cannot be represented makes the task write ⊤. Only truly outside
    * spellings (url, device, unc, other drive, escape, outside) are ignored: they return null and set `writeIgnored`.
    */
-  const resolveWrites = (raw: string, line: number, allowNew: boolean): Ok[] | null => {
+  const resolveWrites = (raw: string, line: number, allowNew: boolean, creates: boolean): Ok[] | null => {
     const r = resolveDetailed(raw, repo, { allowNew, createdEarlier });
     if (r.outcome.ok) {
       if (r.foreignRoot !== null && !foreignRoots.includes(r.foreignRoot)) foreignRoots.push(r.foreignRoot);
@@ -631,15 +634,39 @@ export function extractFootprint(
         ignored.push({ raw, reason: "dir-write-unbounded", line });
         return [];
       }
+      // QA-2.3-18: an unknown candidate in prose ("Update `Foo.bar`") is a write only when the context says it creates
+      // a file (Writes: line, create verb, `(new)`) or when it is spelled as a path (it has a separator).
+      if (!creates && !/[\\/]/.test(raw.trim().replace(/[\\/]+$/, ""))) {
+        ignored.push({ raw, reason: "not-found", line });
+        return null;
+      }
       const lex = lexicalNew(raw);
       if (lex !== null) return [{ ok: true, path: lex, via: "new", dir: false }];
       unbounded = true;
       ignored.push({ raw, reason: "write-unresolved", line });
       return [];
     }
+    if (o.reason === "url") {
+      // QA-2.3-23: a URL is never a write target; it is ignored like a read and does not widen the task.
+      ignored.push({ raw: o.raw, reason: o.reason, line });
+      return null;
+    }
     writeIgnored = true;
     ignored.push({ raw: o.raw, reason: o.reason, line, write: true });
     return null;
+  };
+  /**
+   * An ownership row: resolved like a new write; a row whose parent directory does not exist yet (a phase that creates
+   * the tree) falls back to its lexical spelling, the same fallback `resolveWrites` applies (QA-2.3-30).
+   */
+  const resolveRow = (raw: string, line: number): Ok | null => {
+    const ok = resolve(raw, line, true, false);
+    if (ok !== null) return ok;
+    const r = resolveDetailed(raw, repo, { allowNew: true, createdEarlier });
+    if (r.outcome.ok || r.outcome.reason !== "not-found") return null;
+    if (raw.split(/[\\/]/).some((s) => GLOB_CHARS.test(s))) return null;
+    const lex = lexicalNew(raw);
+    return lex === null ? null : { ok: true, path: lex, via: "new", dir: /[\\/]$/.test(raw.trim()) };
   };
   const putWrite = (p: string, source: Source, line: number, rule: string): void => {
     const key = touchKey(p, ci);
@@ -650,7 +677,8 @@ export function extractFootprint(
   const addWrite = (ok: Ok, raw: string, source: Source, line: number, rule: string): void => {
     note(source);
     if (ok.dir) {
-      const files = expandDir(repo, ok.path);
+      // A write of the repository root itself is unbounded (⊤): it names no file.
+      const files = ok.path === "" ? null : expandDir(repo, ok.path);
       if (files === null) {
         unbounded = true;
         ignored.push({ raw, reason: "dir-write-unbounded", line });
@@ -683,7 +711,7 @@ export function extractFootprint(
     } else {
       for (const c of scanText(t.writesLine.text, t.writesLine.line)) {
         declared.add(c.raw);
-        const oks = resolveWrites(c.raw, c.line, true);
+        const oks = resolveWrites(c.raw, c.line, true, true);
         if (oks === null) continue;
         explicit = true;
         if (oks.length === 0) note("writes-line");
@@ -695,8 +723,18 @@ export function extractFootprint(
   if (t.readsLine !== null && !t.readsLine.none) {
     for (const c of scanText(t.readsLine.text, t.readsLine.line)) {
       declared.add(c.raw);
-      const ok = resolve(c.raw, c.line, false, true);
-      if (ok !== null) addRead(ok, c.raw, "writes-line", c.line, "reads-line");
+      const ok = resolve(c.raw, c.line, false, false);
+      if (ok !== null) {
+        addRead(ok, c.raw, "writes-line", c.line, "reads-line");
+        continue;
+      }
+      // QA-2.3-20: a declared read of a file that is not tracked yet is kept (lexically), so the task that creates it
+      // gets an edge to this reader.
+      const r = resolveDetailed(c.raw, repo, { allowNew: false, createdEarlier });
+      const lex = !r.outcome.ok && r.outcome.reason === "not-found" && !c.raw.split(/[\\/]/).some((s) => GLOB_CHARS.test(s))
+        ? lexicalNew(c.raw) : null;
+      if (lex !== null) addRead({ ok: true, path: lex, via: "new", dir: false }, c.raw, "writes-line", c.line, "reads-line");
+      else ignored.push({ raw: r.outcome.ok ? c.raw : r.outcome.raw, reason: r.outcome.ok ? "not-found" : r.outcome.reason, line: c.line });
     }
   }
   // Body mentions: write verbs (no Writes: line) and reads (no Reads: line).
@@ -708,7 +746,7 @@ export function extractFootprint(
         const marked = NEW_MARKER.test(c.text.slice(c.end));
         const verb = t.writesLine === null ? verbBefore(c) : null;
         if (verb !== null) {
-          const oks = resolveWrites(c.raw, c.line, verb.create || marked);
+          const oks = resolveWrites(c.raw, c.line, verb.create || marked, verb.create || marked);
           if (oks === null) continue;
           explicit = true;
           if (oks.length === 0) note("path");
@@ -720,7 +758,7 @@ export function extractFootprint(
           const ok = resolve(c.raw, c.line, marked, true);
           if (ok === null) {
             if (wantOwnership) {
-              const guess = resolve(c.raw, c.line, true, false);
+              const guess = resolveRow(c.raw, c.line);
               if (guess !== null) mentions.push(guess);
             }
             continue;
@@ -728,7 +766,7 @@ export function extractFootprint(
           mentions.push(ok);
           addRead(ok, c.raw, "path", c.line, "mention");
         } else if (wantOwnership) {
-          const ok = resolve(c.raw, c.line, true, false);
+          const ok = resolveRow(c.raw, c.line);
           if (ok !== null) mentions.push(ok);
         }
       }
@@ -737,7 +775,7 @@ export function extractFootprint(
   // Ownership rows of the task's phase that the task mentions (no Writes: line).
   if (wantOwnership) {
     for (const row of phaseOwnership) {
-      const rp = resolve(row.path, row.line, true, false);
+      const rp = resolveRow(row.path, row.line);
       if (rp === null || rp.path === "") continue;
       if (!mentions.some((m) => overlaps(m.path, rp.path, ci))) continue;
       owned = true;
@@ -755,7 +793,7 @@ export function extractFootprint(
   // `ownership`, so the residue may still add to it.
   if (wantOwnership && editsByDefault && writes.length === 0 && !unbounded && !explicit && !writeIgnored) {
     for (const row of phaseOwnership) {
-      const rp = resolve(row.path, row.line, true, false);
+      const rp = resolveRow(row.path, row.line);
       if (rp === null || rp.path === "") continue;
       assumed = true;
       weak = true;

@@ -559,12 +559,6 @@ function foldKey(p: string, ci: boolean): string {
   return ci ? p.toLowerCase() : p;
 }
 
-function setEquals(a: readonly string[], b: readonly string[], ci: boolean): boolean {
-  const ka = new Set(a.map((x) => foldKey(x, ci)));
-  const kb = new Set(b.map((x) => foldKey(x, ci)));
-  return ka.size === kb.size && [...ka].every((x) => kb.has(x));
-}
-
 /** The members of `old` that `now` does not contain (compared by folded key). */
 function missingFrom(old: readonly string[], now: readonly string[], ci: boolean): string[] {
   const keys = new Set(now.map((x) => foldKey(x, ci)));
@@ -630,15 +624,8 @@ export function validateResidue(draft: LedgerV1, v: unknown, o: { ci?: boolean }
     const e = value.footprints[i] as ResidueFootprintEntry;
     const old = (draft.tasks[e.taskId] as TaskNode).footprint;
     const at = `$.footprints[${i}]`;
-    if (old.confidence === "explicit" || old.confidence === "ownership") {
-      if (!setEquals(e.writes, old.writes, ci) || !setEquals(e.reads, old.reads, ci)) {
-        return fail("residue-weaken", at, {
-          reason: `changes the footprint of a ${old.confidence} task`,
-          taskId: e.taskId,
-          confidence: old.confidence,
-        });
-      }
-    }
+    // An explicit or ownership task is never in the residue task list, so an entry for it is rejected earlier
+    // (`residue-unknown-task`, "not part of the request"); only the omitted-paths rule remains here.
     const missingWrites = missingFrom(old.writes, e.writes, ci);
     const missingReads = missingFrom(old.reads, e.reads, ci);
     if (missingWrites.length > 0 || missingReads.length > 0) {

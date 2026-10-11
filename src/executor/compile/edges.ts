@@ -383,7 +383,13 @@ function makeResolver(p: ParsedPlan, tasks: readonly EdgeTask[], sources: Readon
 // ---------------------------------------------------------------------------------------------------------------
 // Graph pass
 
-export function graphEdges(p: ParsedPlan, tasks: readonly EdgeTask[]): { edges: Edge[]; warnings: CompileIssue[] } {
+/**
+ * `known` (QA-2.3-26): the ids the whole plan defines (tasks, phases, waves). When given, `ref-outside-run` is emitted only
+ * for a node in it; any other node is unknown to the plan and the parser already reported it (`graph-node-unknown`).
+ */
+export function graphEdges(
+  p: ParsedPlan, tasks: readonly EdgeTask[], known?: ReadonlySet<string>,
+): { edges: Edge[]; warnings: CompileIssue[] } {
   const sorted = [...tasks].sort(byPlanIndex);
   const resolve = makeResolver(p, sorted, intraCore(p, sorted).sources);
   const out = new EdgeSet();
@@ -397,6 +403,7 @@ export function graphEdges(p: ParsedPlan, tasks: readonly EdgeTask[]): { edges: 
       if (from === null || to === null) {
         const missing = [from === null ? e.from : null, to === null ? e.to : null].filter((x): x is string => x !== null);
         for (const m of missing) {
+          if (known !== undefined && !known.has(m)) continue;
           warnings.push({ code: "ref-outside-run", line: e.line, message: `graph edge ${e.raw.trim()} dropped: ${m} is not part of this run` });
         }
         continue;
@@ -430,13 +437,12 @@ function firstOverlap(a: readonly string[], b: readonly string[], ci: boolean): 
   return null;
 }
 
-export function explicitEdges(p: ParsedPlan, tasks: readonly EdgeTask[]): { edges: Edge[]; warnings: CompileIssue[] } {
+export function explicitEdges(p: ParsedPlan, tasks: readonly EdgeTask[], ci = false): { edges: Edge[]; warnings: CompileIssue[] } {
   const sorted = [...tasks].sort(byPlanIndex);
   const resolve = makeResolver(p, sorted, intraCore(p, sorted).sources);
   const out = new EdgeSet();
   const warnings: CompileIssue[] = [];
   const waveById = new Map(p.waves.map((w) => [w.id, w]));
-  const ci = false;
 
   const emit = (a: readonly string[], b: readonly string[], conf: Edge["confidence"], evidence: string): void => {
     for (const x of a) for (const y of b) out.add(mkEdge(x, y, "explicit", conf, evidence));
@@ -747,7 +753,7 @@ export function minimalCycle(nodes: readonly string[], edges: readonly Pick<Edge
 export function buildEdges(
   p: ParsedPlan,
   tasks: readonly EdgeTask[],
-  o: { crossPhase: "gate" | "inferred"; ci: boolean },
+  o: { crossPhase: "gate" | "inferred"; ci: boolean; planNodes?: ReadonlySet<string> },
 ): { edges: Edge[]; warnings: CompileIssue[] } {
   const sorted = [...tasks].sort(byPlanIndex);
   const warnings: CompileIssue[] = [];
@@ -756,7 +762,7 @@ export function buildEdges(
   // 1. structural, 2. graph
   for (const e of structuralEdges(p, sorted, o.crossPhase)) set.add(e);
   warnings.push(...structuralWarnings(p, sorted));
-  const graph = graphEdges(p, sorted);
+  const graph = graphEdges(p, sorted, o.planNodes);
   for (const e of graph.edges) set.add(e);
   warnings.push(...graph.warnings);
 
@@ -780,7 +786,7 @@ export function buildEdges(
   for (const e of set.list()) reach.add(e.from, e.to);
 
   // 3. explicit: an edge that would close a cycle is dropped; the pair stays ordered the other way.
-  const explicit = explicitEdges(p, sorted);
+  const explicit = explicitEdges(p, sorted, o.ci);
   warnings.push(...explicit.warnings);
   for (const e of explicit.edges) {
     if (set.has(e.from, e.to)) continue;
