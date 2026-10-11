@@ -119,7 +119,7 @@ The orchestrator (or `/annotate-plan`) may describe the work in one line:
 
 ### The generated `R:` line and the hint
 
-In `advise` and `enforce` the taxonomy line of the delegation protocol is replaced by a generated one: the shipped line (`buildTaskTaxonomy`), plus an optional ` | by class: c→@agent` suffix. **A class moves only when the winning agent has at least 5 effective outcomes for that class** (see [When `enforce` switches](#when-enforce-switches-a-dispatch) for what "effective" means), so with no evidence the line is the shipped one byte for byte (D2, a tested property). The line is memoized for 60 s per config, agent and permission set, so evidence that arrives inside the window shows up at most a minute later. **Only `advise` emits the hint**; `enforce` already routes and emits none. The hint classifies the latest user message with the rules classifier only (a hint never costs a model call), and appears only when the kernel would switch. Its one line names only the class and destination: `Route hint: for <class> work like this turn, prefer @<agent> (<description>).` It contains no live numbers, previous pick or decision reason. It is the last system part: changing it can invalidate the cached history after the system prefix, so merely separating it from the protocol does **not** preserve that history's cache. With the same class and destination, new outcomes and turns leave its text byte-identical.
+In `advise` and `enforce` the taxonomy line of the delegation protocol is replaced by a generated one: the shipped line (`buildTaskTaxonomy`), plus an optional ` | by class: c→@agent` suffix. **A class moves only when the winning agent has at least 5 effective outcomes for that class** (see [When `enforce` switches](#when-enforce-switches-a-dispatch) for what "effective" means), so with no evidence the line is the shipped one byte for byte (D2, a tested property). The line is memoized for 60 s per config, agent and permission set, so evidence that arrives inside the window shows up at most a minute later. **Only `advise` emits the hint**; `enforce` already routes and emits none. The hint classifies the latest user message with the rules classifier only (a hint never costs a model call), and appears only when the kernel would switch. Its one line names only the class and destination: `Route hint: for <class> work like this turn, prefer @<agent> (<description>).` It contains no live numbers, previous pick or decision reason. On OpenCode v2 the hint is delivered in the per-turn router state, a message appended after the conversation and never persisted, so it no longer changes the system prompt and does not touch the cached history; on v1 it remains the last system part. With the same class and destination, new outcomes and turns leave its text byte-identical.
 
 ### `/annotate-plan`
 
@@ -404,6 +404,8 @@ Everything is written under one directory, `routing.outcomes.path` (global overr
 |---|---|
 | `outcomes.json` | The scoreboard: per key, the Beta counts, measured USD/tokens, false refusals, variant-step successes. Written atomically (temp file and rename), at most every 30 s, flushed on `session.idle` and `session.deleted`, never on a dispatch's hot path. An unparseable file is moved aside as `outcomes.corrupt.<time>-<pid>.json` (the newest 3 are kept) and the store starts clean. |
 | `decisions.jsonl` | Append-only, one JSON row per line; rotated at about 5 MiB (3 generations kept, `decisions.<time>-<pid>.jsonl`). A batch or concurrent processes may exceed the cap; the live size is checked again immediately before rotation. |
+| `timings.jsonl` | Append-only, one `dispatch-timing` row per finished or abandoned child dispatch. See [Timing logs](#timing-logs-and-the-duration-estimator). |
+| `turns.jsonl` | Append-only, one `orchestrator-turn` row per turn of a root session. See [Timing logs](#timing-logs-and-the-duration-estimator). |
 | `advisor-notice.<hash>.json` and `.lock` | The cost doctor's notice state, one pair per project. See [The cost doctor](#the-cost-doctor). |
 
 **Decision rows** (`kind: "decision"`): `v`, `ts`, `sessionID` (the orchestrator), `decisionID`, `mode`, `childSessionID` (null for a fresh dispatch decided before the child exists), `facts` (`class`, `risk`, `scope`, `needs`, `confidence`, `source`), `chosen` and `best` (each `{ key, agent, origin, model, variant }`), `switched`, `pinned`, `unit` (`usd` or `ratio`), `costs` (`C(k)` per candidate key), `confidence` (the class confidence × n/(n+5) of the winner: reported, not decisive), `reason`, `step` (`dispatch`, `variant`, `retry`, `escalate`), `resume`, and `trace`: how many route lines the prompt carried (`routeLines`: `count`, `conflict`, `edgeOnly`), what the backend did (`backend`: `status`, `latencyMs`, `label`, `rejected`, `disagrees`), `backendSkipped` (`"credentials"`), and the A27 `argmin` (the cheapest option the evidence gate held back). Routed dispatch rows also carry (A34) `detection`, `{ effective, claimed? }`: the depth the kernel used (the weaker of the route line's `d` and the prompt's `[acceptance]` block), plus the route line's claim only when it differs; and `capability`, `{ pick, dispatched }`: the pick's capability rank and the capability rank of what the host was handed after the legacy hook (`null` = unknown). Rows written before A34 do not have these fields and are still read. A ladder attempt's row carries the delegation's class confidence.
@@ -416,6 +418,33 @@ Everything is written under one directory, `routing.outcomes.path` (global overr
 **What the store covers: trusted classes only (QA-2.1-10).** Verdict rows, refusal rows and the store itself are written only for dispatches whose class confidence reached `routing.minClassConfidence` and whose class is not `unknown`. A below-threshold dispatch still has its decision row. So `routing:stats` shows **more dispatches than verdicts by design**, and the verdict and false-refusal rates describe trusted classes only (the output says so in a footnote). Read `Dispatches` against `Pass + Fail + Unverifiable` before judging agreement or savings: with the rules classifier a share of dispatches (long briefs, ambiguous wording) sits below the threshold. **Role dispatches have fewer verdict rows still:** a role dispatch checked by an LLM grader that is not independent of it (tier below the producer's, the same model, or unknown) writes no verdict row and no signal row, and moves no store evidence; an independent grader's verdict is a verdict row (store weight 0.5) plus a `grader` signal row, never a `verdict` signal row. The other signal rows of a role dispatch (`run`, `incomplete`, `redispatch`, `budget`, `authority`) are routing statistics only: `routing:stats` reads them, and they never move the outcome store the kernel reads.
 
 **Deferred verification is invisible to the rates.** The verdicts of deferred verification (`VERIFY:deferred`, `finishDeferred`) and of `router_verify` replays are not recorded, so a deferred dispatch has a decision row and no verdict row. Only synchronous verifications feed the scoreboard.
+
+### Timing logs and the duration estimator
+
+Two more append-only logs sit next to `decisions.jsonl` in the same directory. They are written on OpenCode v2 whatever `routing.engine` is (`static` included): the recorder needs no store, no flusher and no decision log. Neither log holds prompt, output or tool text; every field is a counter, a timestamp or a short label (a string over 256 characters is rejected on read). Both rotate like `decisions.jsonl`: at about 5 MiB, 3 generations kept, named `timings.<time>-<pid>.jsonl` and `turns.<time>-<pid>.jsonl`. A write failure is logged once per kind and the rows are dropped, never retried; rows written by a newer schema (`v` above 1) are skipped on read.
+
+**`timings.jsonl`** (`kind: "dispatch-timing"`): one row per child dispatch that finished or was abandoned.
+
+| Field | Meaning |
+|---|---|
+| `v`, `ts` | Row version (1) and the time the row was written. |
+| `parentSessionID`, `childSessionID`, `callID` | The orchestrator, the child and the tool call that started it. |
+| `role`, `class`, `scope`, `tier`, `model` | What was dispatched: the role agent (or agent) id, the task class and scope, the tier and the model. |
+| `background` | Whether the dispatch ran in the background. |
+| `startedAt`, `endedAt`, `durationMs` | Epoch milliseconds; `durationMs = endedAt − startedAt`, never negative (clock skew is clamped to 0). |
+| `outcome` | `succeeded`, `failed`, `interrupted` or `unknown`. A start still open after 6 hours is closed as `unknown` by the periodic sweep. |
+| `capacity` | `null`, or the last provider capacity signal seen while the dispatch was open: `rate-limit`, `overload` or `usage-limit`. |
+
+**`turns.jsonl`** (`kind: "orchestrator-turn"`): one row per turn of a root session that had at least one step. A turn ends at the next prompt of that session (or at the sweep). Fields: `v`, `ts`, `sessionID`, `turn` (1-based), `steps`, and the token counters summed over the turn's steps, `input`, `cacheRead` and `cacheWrite`. Only root sessions are aggregated.
+
+**The duration estimator** answers "how long does a dispatch of this role, class and scope usually take?" from `timings.jsonl`, with `p50` and `p90`, the sample count and where the answer came from:
+
+- **Fallback.** Exact `(role, class, scope)` first, then `(role, class)`, then `role`, then a fixed prior of 480000 ms (`p50 = p90`, 0 samples, source `prior`). A level answers only with **at least 5 samples**; with fewer, the next coarser level is tried.
+- **Which rows count.** Only rows with `outcome: "succeeded"`. A row slowed by a provider capacity signal (`capacity` not `null`) is excluded: a rate limit or an overload says nothing about how long the work takes.
+- **Window.** The newest 50 rows of a key, and only those that ended within the last 30 days.
+- **Percentiles** are nearest rank: the value at position `ceil(p × n)` of the sorted durations.
+
+A row seen twice (from the file and live) counts once. An unreadable file leaves the estimator on the prior; it never fails a dispatch.
 
 ### `/router stats` and `npm run routing:stats`
 
@@ -441,6 +470,11 @@ Both print the same table for a time window and produce the same text for the sa
 | `High-risk d=none rows that ran below the pick's capability rank` | The D9 never-down audit (A34): routed dispatch rows (fresh and resumed) with `risk == high` and `detection.effective == none` whose `capability.dispatched < capability.pick`, out of those that record both ranks. **Expected 0.** `n/a` when no row in the window records `detection` and `capability` (rows written before A34). |
 
 Below the table: **By class**, **By key** (dispatches, attempts, pass/fail/unverifiable, pass rate, false refusals and refusal rate, USD per attempt over the key's lifetime; **these are raw lifetime counts of the window's rows and the store, not the decayed effective counts of the evidence gate**, so a key can show 5 attempts and still be below the gate), **Gated by evidence (`trace.argmin`)** and **Resume vs fresh** (`variant`, `retry`, `escalate` rows). The `trace.argmin` table counts every row in which a cheaper candidate without evidence existed, **including rows where the chosen dispatch was best anyway**, so it is not the same quantity as `Kept for lack of evidence`. The script prints notes (no outcome data, skipped lines, a rotated log) on stderr; `/router stats` appends them after the table.
+
+Two sections come from the [timing logs](#timing-logs-and-the-duration-estimator). `/router stats` is v2 only; `scripts/routing-stats.ts` renders them whenever the store holds rows of that kind, and leaves them out otherwise:
+
+- **Dispatch durations**: a table with one line per role (`Role`, `p50`, `p90`, `n`; seconds), over the timing rows of the window. It uses the estimator's own rules (succeeded rows without a capacity signal, nearest rank) at the role level, but without the 50-row and 30-day limits: the window is the one you pass with `--since` / `--until`.
+- **Orchestrator cache-read share**: one line, `Orchestrator cache-read share: p50 …%, p10 …% over N turns`: the p50 and the p10, over the turns of the window, of `cacheRead / (input + cacheRead + cacheWrite)` per turn (nearest rank; turns with no tokens are left out). A low p10 means some turns re-read little of the cached prefix.
 
 ## The cost doctor
 

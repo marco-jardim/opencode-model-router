@@ -5,6 +5,9 @@
 // Design: docs/qa/cost-aware-routing/phase-1.3.md "Design (1.3.1)" §7.
 // No I/O of its own: `runStatsCli` gets every read and write through `StatsCliIO`. Runnable under Node
 // type stripping (type-only imports use `import type`).
+//
+// Phase 1.1.4 (v2 only): the "Dispatch durations" and "Orchestrator cache-read share" sections are rendered from the
+// timing and turn side logs, only when those rows exist; `runStatsCli` renders them for host v2 alone.
 // ---------------------------------------------------------------------------
 
 import type {
@@ -12,6 +15,8 @@ import type {
   CostUnit,
   CostUnitRow,
   DecisionRow,
+  DispatchTimingRow,
+  OrchestratorTurnRow,
   KeyStatsRow,
   LogRow,
   MeanStat,
@@ -23,6 +28,7 @@ import type {
   RoleStatsTable,
   RoleTierStatsRow,
   SavingsRow,
+  SideLogs,
   SignalKind,
   SignalKindStats,
   StatsCliIO,
@@ -33,6 +39,7 @@ import type {
 } from "./types";
 import { DECISIONS_MAX_GENERATIONS, FLOOR_LIFT_REASON, LADDER_STEP_KINDS, SIGNAL_KINDS, STATS_EXIT, isAnnotationRow, parseKey } from "./types";
 import { createOutcomeStore } from "./store";
+import { createDurationModel } from "./durations";
 import { signalMass } from "./signals";
 
 // ---------------------------------------------------------------------------
@@ -688,6 +695,98 @@ export function renderRoleMarkdown(table: RoleStatsTable): string {
 }
 
 // ---------------------------------------------------------------------------
+// Dispatch durations and orchestrator cache-read share (Phase 1.1.4; side logs timings.jsonl / turns.jsonl)
+// ---------------------------------------------------------------------------
+
+/** One role's dispatch durations (milliseconds, nearest rank) over the window. */
+export interface DurationStatsRow {
+  readonly role: string;
+  readonly p50: number;
+  readonly p90: number;
+  readonly n: number;
+}
+
+/** Cache-read share of the orchestrator turns of the window: `cacheRead / (input + cacheRead + cacheWrite)` per turn. */
+export interface CacheShareStats {
+  readonly p50: number;
+  readonly p10: number;
+  readonly turns: number;
+}
+
+/** Matches no real class: asks the duration model for its role level (no `(role, class)` or exact key can answer). */
+const ROLE_LEVEL_CLASS = "\u0001";
+
+function rowInWindow(ts: string, window: StatsWindow): boolean {
+  const since = finiteOrNull(window.since);
+  const until = finiteOrNull(window.until);
+  const t = Date.parse(ts);
+  return Number.isFinite(t) && (since === null || t >= since) && (until === null || t < until);
+}
+
+/**
+ * Role × p50/p90/n over the timing rows with `since ≤ ts < until`. The percentiles are the duration estimator's own
+ * (`createDurationModel`: succeeded rows with `capacity === null`, nearest rank), asked at its role level with no row
+ * limit, no age limit and a minimum of one sample, so this table and the estimator never disagree. Sorted by role.
+ */
+export function summarizeDurations(rows: readonly DispatchTimingRow[], window: StatsWindow): DurationStatsRow[] {
+  const model = createDurationModel(
+    { readTimings: () => [], now: () => Date.now() },
+    { window: Number.MAX_SAFE_INTEGER, maxAgeDays: 1e9, minSamples: 1 },
+  );
+  const roles = new Set<string>();
+  for (const row of rows) {
+    if (!rowInWindow(row.ts, window)) continue;
+    model.observe(row);
+    if (row.outcome === "succeeded" && row.capacity === null) roles.add(row.role);
+  }
+  const out: DurationStatsRow[] = [];
+  for (const role of [...roles].sort(compareCodeUnits)) {
+    const estimate = model.estimate({ role, class: ROLE_LEVEL_CLASS, scope: "" });
+    if (estimate.n > 0) out.push({ role, p50: estimate.p50, p90: estimate.p90, n: estimate.n });
+  }
+  return out;
+}
+
+/** Nearest rank (rank = ceil(p * n), 1-based) on an ascending-sorted, non-empty list: the rule of durations.ts. */
+function nearestRankOf(sorted: readonly number[], p: number): number {
+  const rank = Math.min(sorted.length, Math.max(1, Math.ceil(p * sorted.length)));
+  return sorted[rank - 1] as number;
+}
+
+/** p50 and p10 of the per-turn cache-read share over the turn rows with `since ≤ ts < until`; turns with no tokens are left out. `null` without a turn. */
+export function summarizeCacheShare(rows: readonly OrchestratorTurnRow[], window: StatsWindow): CacheShareStats | null {
+  const shares: number[] = [];
+  for (const row of rows) {
+    if (!rowInWindow(row.ts, window)) continue;
+    const denominator = row.input + row.cacheRead + row.cacheWrite;
+    if (!Number.isFinite(denominator) || denominator <= 0 || !Number.isFinite(row.cacheRead)) continue;
+    shares.push(row.cacheRead / denominator);
+  }
+  if (shares.length === 0) return null;
+  shares.sort((a, b) => a - b);
+  return { p50: nearestRankOf(shares, 0.5), p10: nearestRankOf(shares, 0.1), turns: shares.length };
+}
+
+function fmtSeconds(ms: number): string {
+  return `${fix(ms / 1000, 1)}s`;
+}
+
+/** The "Dispatch durations" section; same determinism rules as {@link renderMarkdown}. */
+export function renderDurationsMarkdown(rows: readonly DurationStatsRow[]): string {
+  const table = [
+    "| Role | p50 | p90 | n |",
+    "|---|---|---|---|",
+    ...rows.map((r) => `| ${cell(r.role)} | ${fmtSeconds(r.p50)} | ${fmtSeconds(r.p90)} | ${r.n} |`),
+  ].join("\n");
+  return ["### Dispatch durations", table].join("\n\n") + "\n";
+}
+
+/** The "Orchestrator cache-read share" line. */
+export function renderCacheShareMarkdown(stats: CacheShareStats): string {
+  return `Orchestrator cache-read share: p50 ${(100 * stats.p50).toFixed(1)}%, p10 ${(100 * stats.p10).toFixed(1)}% over ${stats.turns} turn${stats.turns === 1 ? "" : "s"}\n`;
+}
+
+// ---------------------------------------------------------------------------
 // Arguments and CLI
 // ---------------------------------------------------------------------------
 
@@ -799,6 +898,14 @@ export function parseStatsArgs(argv: readonly string[]): ParseStatsResult {
   return { ok: true, args: { since, until, json, dir, help } };
 }
 
+/**
+ * Where `runStatsCli` reads the side logs (timings.jsonl, turns.jsonl) of the directory it reports on. Passed only by callers
+ * that render the 1.1.4 sections: the script, and `/router stats` on v2. Without it (v1) the output is unchanged.
+ */
+export interface StatsSideLogs {
+  open(dir: string): Pick<SideLogs, "readTimings" | "readTurns">;
+}
+
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -808,7 +915,7 @@ function messageOf(error: unknown): string {
  * a usage error exits 2, a corrupt or too-new store exits 1 with a clear message, an unexpected error
  * writes `routing-stats: <message>` and exits 1. A missing store is an empty table with exit 0.
  */
-export async function runStatsCli(argv: readonly string[], io: StatsCliIO): Promise<number> {
+export async function runStatsCli(argv: readonly string[], io: StatsCliIO, side?: StatsSideLogs): Promise<number> {
   try {
     const parsed = parseStatsArgs(argv);
     if (!parsed.ok) {
@@ -854,13 +961,32 @@ export async function runStatsCli(argv: readonly string[], io: StatsCliIO): Prom
     const table = summarize(store, read.rows, { since: args.since, until: args.until });
     const roles = summarizeRoles(store, read.rows, { since: args.since, until: args.until });
     const withRoles = hasRoleRows(roles);
-    io.stdout(
-      args.json
-        ? JSON.stringify(withRoles ? { ...table, roles } : table, null, 2) + "\n"
-        : withRoles
-          ? `${renderMarkdown(table)}\n${renderRoleMarkdown(roles)}`
-          : renderMarkdown(table),
-    );
+
+    // 1.1.4: the side-log sections exist only where the caller supplies side logs (the script, and `/router stats` on v2),
+    // and only when the window holds rows; without them the output is exactly what it was before.
+    let durations: DurationStatsRow[] = [];
+    let cacheShare: CacheShareStats | null = null;
+    if (side !== undefined) {
+      const sideLogs = side.open(source.dir);
+      const window = { since: args.since, until: args.until };
+      durations = summarizeDurations((await sideLogs.readTimings()).rows, window);
+      cacheShare = summarizeCacheShare((await sideLogs.readTurns()).rows, window);
+    }
+
+    if (args.json) {
+      const extra = {
+        ...(withRoles ? { roles } : {}),
+        ...(durations.length > 0 ? { durations } : {}),
+        ...(cacheShare !== null ? { cacheShare } : {}),
+      };
+      io.stdout(JSON.stringify(Object.keys(extra).length > 0 ? { ...table, ...extra } : table, null, 2) + "\n");
+    } else {
+      const sections = [renderMarkdown(table)];
+      if (withRoles) sections.push(renderRoleMarkdown(roles));
+      if (durations.length > 0) sections.push(renderDurationsMarkdown(durations));
+      if (cacheShare !== null) sections.push(renderCacheShareMarkdown(cacheShare));
+      io.stdout(sections.join("\n"));
+    }
     return STATS_EXIT.ok;
   } catch (error) {
     try {

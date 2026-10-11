@@ -15,8 +15,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import ModelRouterPlugin from "../../src/index";
 import type { RouterPluginInput } from "../../src/compat/child-session";
 import { invalidateConfigCache, loadConfig, overridePath, routerStatusLines, validateConfig } from "../../src/router/config";
-import { DECISIONS_FILE, acquireOutcomes, makeKey } from "../../src/routing/outcomes";
-import type { DecisionRow } from "../../src/routing/outcomes";
+import { DECISIONS_FILE, acquireOutcomes, createSideLogs, makeKey, nodePersistDeps } from "../../src/routing/outcomes";
+import type { DecisionRow, DispatchTimingRow, OrchestratorTurnRow } from "../../src/routing/outcomes";
 import { readLastCheckpoint } from "../../src/routing/commands/stats";
 import { advisorSettings, createAdvisorNotifier, noticeFiles } from "../../src/routing/advisor";
 import type { AdvisorFs, AdvisorNotifierDeps, AdvisorSettings } from "../../src/routing/advisor";
@@ -658,6 +658,83 @@ describe("D18 /router stats and the checkpoint line", { timeout: 60_000 }, () =>
     // no window: all three rows; and the JSON form is the script's too
     expect(`${await ask(hooks, "stats")}\n`).toBe(script("--dir", store).stdout);
     expect(`${await ask(hooks, "stats --json")}\n`).toBe(script("--dir", store, "--json").stdout);
+  });
+
+  // 1.1.4: the dispatch-duration table and the cache-read share line, from the side logs of the same directory.
+  it.skipIf(!supportsPlainNodeTypeScript())("D18: with seeded timing and turn rows both renderers print the same text, and the base output is unchanged", async () => {
+    seed(...ROWS);
+    const hooks = await plugin({ engine: "shadow", outcomes: { path: store } });
+    const since = "2026-10-06T00:00:00Z";
+    const without = script("--dir", store, "--since", since).stdout;
+    expect(without).not.toContain("Dispatch durations");
+    expect(without).not.toContain("cache-read share");
+    expect(`${await ask(hooks, `stats --since ${since}`)}\n`).toBe(without);
+
+    const logs = createSideLogs(store, nodePersistDeps({ warn: () => undefined }));
+    const timing = (n: number, role: string, durationMs: number, over: Partial<DispatchTimingRow> = {}): DispatchTimingRow => ({
+      kind: "dispatch-timing",
+      v: 1,
+      ts: "2026-10-06T12:00:00.000Z",
+      parentSessionID: "s1",
+      childSessionID: `c${n}`,
+      callID: `call${n}`,
+      role,
+      class: "implement",
+      scope: "single",
+      tier: "medium",
+      model: "anthropic/claude-sonnet-5-5",
+      background: false,
+      startedAt: Date.parse("2026-10-06T12:00:00.000Z"),
+      endedAt: Date.parse("2026-10-06T12:00:00.000Z") + durationMs,
+      durationMs,
+      outcome: "succeeded",
+      capacity: null,
+      ...over,
+    });
+    const turn = (n: number, ts: string, input: number, cacheRead: number, cacheWrite: number): OrchestratorTurnRow => ({
+      kind: "orchestrator-turn",
+      v: 1,
+      ts,
+      sessionID: "s1",
+      turn: n,
+      steps: 1,
+      input,
+      cacheRead,
+      cacheWrite,
+    });
+    await logs.appendTimings([
+      timing(1, "builder", 10_000),
+      timing(2, "builder", 20_000),
+      timing(3, "builder", 30_000),
+      timing(4, "builder", 90_000, { outcome: "failed" }), // not succeeded: excluded
+      timing(5, "builder", 900_000, { capacity: "rate-limit" }), // capacity: excluded
+      timing(6, "reviewer", 4_000),
+      timing(7, "builder", 500_000, { ts: "2026-10-05T12:00:00.000Z" }), // before the window
+    ]);
+    await logs.appendTurns([
+      turn(1, "2026-10-06T12:00:00.000Z", 100, 900, 0), // 90 %
+      turn(2, "2026-10-06T13:00:00.000Z", 500, 500, 0), // 50 %
+      turn(3, "2026-10-06T14:00:00.000Z", 0, 0, 0), // zero denominator: excluded
+      turn(4, "2026-10-05T14:00:00.000Z", 1, 0, 99), // before the window
+    ]);
+
+    const reference = script("--dir", store, "--since", since);
+    expect(reference.status).toBe(0);
+    const text = await ask(hooks, `stats --since ${since}`);
+    expect(`${text}\n`).toBe(reference.stdout);
+    expect(reference.stdout.startsWith(without)).toBe(true); // the new rows only append
+    expect(text).toContain("### Dispatch durations");
+    expect(text).toContain("| builder | 20.0s | 30.0s | 3 |");
+    expect(text).toContain("| reviewer | 4.0s | 4.0s | 1 |");
+    expect(text).toContain("Orchestrator cache-read share: p50 50.0%, p10 50.0% over 2 turns");
+    expect(`${await ask(hooks, "stats --json")}\n`).toBe(script("--dir", store, "--json").stdout);
+
+    // v1 never renders the new sections.
+    const v1 = await plugin({ engine: "shadow", outcomes: { path: store } }, "v1");
+    const v1Text = await ask(v1, `stats --since ${since}`);
+    expect(v1Text).not.toContain("Dispatch durations");
+    expect(v1Text).not.toContain("cache-read share");
+    expect(`${v1Text}\n`).toBe(without);
   });
 
   it("flushes the rows still queued in memory first, so the table is current", async () => {

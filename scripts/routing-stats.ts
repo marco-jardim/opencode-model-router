@@ -31,11 +31,16 @@ const deps = outcomes.nodePersistDeps({ warn() {} }); // the CLI reports through
 // `--dir` means what `routing.outcomes.path` means: `~` is the home directory and a relative path is taken under
 // the default directory (not the cwd), so a value copied from the config selects the same directory.
 const env = { tmpdir: tmpdir(), homedir: homedir() };
-process.exitCode = await outcomes.runStatsCli(process.argv.slice(2), {
-  defaultDir: outcomes.resolveOutcomesDir(null, env),
-  open: (dir) => outcomes.createPersister(outcomes.resolveOutcomesDir(dir, env), deps),
-  stdout: (text) => void process.stdout.write(text),
-  stderr: (text) => void process.stderr.write(text),
-});
+process.exitCode = await outcomes.runStatsCli(
+  process.argv.slice(2),
+  {
+    defaultDir: outcomes.resolveOutcomesDir(null, env),
+    open: (dir) => outcomes.createPersister(outcomes.resolveOutcomesDir(dir, env), deps),
+    stdout: (text) => void process.stdout.write(text),
+    stderr: (text) => void process.stderr.write(text),
+  },
+  // 1.1.4: the dispatch-duration and cache-read-share sections, rendered whenever the rows exist (as `/router stats` does on v2).
+  { open: (dir) => outcomes.createSideLogs(dir, deps) },
+);
 
 export {};
