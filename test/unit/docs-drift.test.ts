@@ -1212,7 +1212,8 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
       [gate, "and no check ran there; add a check such as: check: testsPass cwd="],
       [gate, "the change in the work root could not be observed and no check runs there ("],
       [gate, "consumer discovery stopped before finishing "],
-      [gate, "; a repository there may link this work root unchecked"],
+      [gate, "; a repository there may link this work root unchecked; add a check such as: check: testsPass cwd="],
+      [gate, "no check root"],
       [deterministic, "runs in another repository ("],
       [deterministic, "and must use scope=full: affected tests cannot be attributed to a change in the work root"],
       [deterministic, "failed; the change under verification is in the work root, so this failure can be neither excused nor attributed: "],
@@ -1225,7 +1226,8 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     // the user-facing syntax and the caveats of the section
     for (const text of ["check: testsPass cwd=\"D:\\git\\app-a\" scope=full", "`scope=affected|full`", "A relative `cwd=` stays inside `W`", "must be inside `W` or in the read set",
       "unverifiable** and nothing runs", "unverifiable, never a fail", "gets no reference", "UNVERIFIED", "never deferred", "A `scope=` alone is ignored there",
-      "On OpenCode v1 the keys are ignored", "(I2)", "(I3)", "gives no run signal"]) expect(section, text).toContain(text);
+      "On OpenCode v1 the keys are ignored", "(I2)", "(I3)", "gives no run signal",
+      "a check whose repository top contains the change root", "(no check root)"]) expect(section, text).toContain(text);
     expect(read("docs/ROLES.md").replace(/\s+/g, " ")).toContain("(./VERIFICATION.md#checks-in-other-repositories)");
     expect(verification).toContain("link pins");
     // the configured protocol teaches cwd= / scope=full; the default one does not

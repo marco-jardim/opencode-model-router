@@ -670,7 +670,7 @@ describe("accept() — per-check placements (P2.4)", () => {
     const { exec, d, dod } = setup();
     const r = await accept({ dod, workRoot: W, checkPlacements: [{ cwd: join(C, "pkg"), top: undefined, foreign: true }] }, wrote("a.ts"), d);
     expect(r.verdict.outcome).toBe("unverifiable");
-    expect(r.verdict.reasons[0]).toContain("is not covered by any check root ()");
+    expect(r.verdict.reasons[0]).toContain("is not covered by any check root (no check root)");
     expect(exec).not.toHaveBeenCalled();
   });
 
@@ -736,6 +736,44 @@ describe("accept() — per-check placements (P2.4)", () => {
       expect(lastRunArgs().placements).toEqual([inW, foreign]);
     }
     expect(exec).toHaveBeenCalledTimes(4);
+  });
+
+  it("QA round 2 M1: an unavailable baseline with a check only in a nested repository inside W is unverifiable, and nothing runs", async () => {
+    const { exec, d, dod } = setup();
+    const nested = join(W, "vendor");
+    const inNested: CheckPlacement = { cwd: nested, top: nested, foreign: false };
+    const unobserved = artefact({ changeRoot: W, changedFiles: [], changeBaseline: "unavailable" });
+    const r = await accept({ dod, workRoot: W, checkPlacements: [inNested] }, unobserved, d);
+    const reason = `the change in the work root could not be observed and no check runs there (${nested}); nothing ran`;
+    expect(r.verdict).toEqual({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] });
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("QA round 2 M1: an unplaced check beside the nested-repository check covers the change root and both run", async () => {
+    const { exec, d, dod } = setup([runCheck, runCheck]);
+    const nested = join(W, "vendor");
+    const inNested: CheckPlacement = { cwd: nested, top: nested, foreign: false };
+    const unobserved = artefact({ changeRoot: W, changedFiles: [], changeBaseline: "unavailable" });
+    const r = await accept({ dod, workRoot: W, checkPlacements: [undefined, inNested] }, unobserved, d);
+    expect(r.verdict.outcome).toBe("pass");
+    expect(exec).toHaveBeenCalledTimes(2);
+  });
+
+  it("QA round 2 M1: a check whose top contains the change root covers it", async () => {
+    const { d, dod } = setup();
+    const unobserved = artefact({ changeRoot: join(W, "pkg"), changedFiles: [], changeBaseline: "unavailable" });
+    const r = await accept({ dod, workRoot: W, checkPlacements: [{ cwd: W, top: W, foreign: false }] }, unobserved, d);
+    expect(r.verdict.outcome).toBe("pass");
+  });
+
+  it("QA round 2 M1: when every top is unknown the reason says so", async () => {
+    const { exec, d, dod } = setup();
+    const unknown: CheckPlacement = { cwd: join(C, "pkg"), top: undefined, foreign: true };
+    const unobserved = artefact({ changeRoot: W, changedFiles: [], changeBaseline: "unavailable" });
+    const r = await accept({ dod, workRoot: W, checkPlacements: [unknown] }, unobserved, d);
+    const reason = "the change in the work root could not be observed and no check runs there (no check root); nothing ran";
+    expect(r.verdict.reasons).toEqual([reason]);
+    expect(exec).not.toHaveBeenCalled();
   });
 
   it("QA-2 #5: a non-foreign check with an unknown top (W not a git repository) covers the change root", async () => {
@@ -841,8 +879,8 @@ describe("accept() — consumer caveat (D6)", () => {
     const art = (over: Partial<Artefact> = {}): Artefact =>
       wrote({ perimeter: { ...perimeter(), consumersIncomplete: incomplete }, ...over });
     const caveats = [
-      `consumer discovery stopped before finishing app-c at ${C}; a repository there may link this work root unchecked`,
-      `consumer discovery stopped before finishing ${incomplete[1].root} at ${incomplete[1].root}; a repository there may link this work root unchecked`,
+      `consumer discovery stopped before finishing app-c at ${C}; a repository there may link this work root unchecked; add a check such as: check: testsPass cwd="${C}" scope=full`,
+      `consumer discovery stopped before finishing ${incomplete[1].root} at ${incomplete[1].root}; a repository there may link this work root unchecked; add a check such as: check: testsPass cwd="${incomplete[1].root}" scope=full`,
     ];
     const r = await accept({ dod, workRoot: W }, art(), d);
     expect(r.verdict.pass).toBe(false);
@@ -855,6 +893,21 @@ describe("accept() — consumer caveat (D6)", () => {
     const empty = await accept({ dod, workRoot: W }, art({ changedFiles: [], changeBaseline: "available" }), d);
     expect(empty.verdict.outcome).toBe("pass");
     expect(empty.verdict.caveats ?? []).toEqual([]);
+  });
+
+  it("QA round 2 M2: an incomplete root is cleared by a consumer check placed there, and not by a fileExists", async () => {
+    const incompleteOnly = (): Artefact => wrote({ perimeter: { ...perimeter(), consumersIncomplete: [{ root: C, name: "app-c" }] } });
+    const caveat = `consumer discovery stopped before finishing app-c at ${C}; a repository there may link this work root unchecked; add a check such as: check: testsPass cwd="${C}" scope=full`;
+    for (const check of [testsCheck, runCheck]) {
+      const { d, dod } = setup([runCheck, check]);
+      const r = await accept({ dod, workRoot: W, checkPlacements: [undefined, inConsumer()] }, incompleteOnly(), d);
+      expect(r.verdict.caveats ?? [], check.kind).not.toContain(caveat);
+      expect(r.verdict.reasons, check.kind).not.toContain(caveat);
+    }
+    const { d, dod } = setup([runCheck, existsCheck]);
+    const kept = await accept({ dod, workRoot: W, checkPlacements: [undefined, { cwd: C, top: C, foreign: true }] }, incompleteOnly(), d);
+    expect(kept.verdict.outcome).toBe("unverifiable");
+    expect(kept.verdict.caveats).toEqual([caveat]);
   });
 
   it("a fail stays a fail, without the consumer caveat", async () => {

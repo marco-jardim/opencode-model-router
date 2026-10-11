@@ -404,16 +404,18 @@ export async function accept(
     if (artefact.changedFiles.length === 0 && !baselineUnavailable) return undefined;
     const changeRoot = artefact.changeRoot ?? effectiveBaseDir;
     const tops: string[] = [];
-    let coversChangeRoot = false;
     for (let index = 0; index < (dod.checks ?? []).length; index++) {
       const placement = placements[index];
       // QA-3 #5: an unplaced check, or a non-foreign placement without a top, runs in (covers) the change root.
-      if (placement === undefined || placement.foreign !== true) coversChangeRoot = true;
       const top = placement === undefined || (placement.foreign !== true && placement.top === undefined) ? changeRoot : placement.top;
       if (top !== undefined && !tops.includes(top)) tops.push(top);
     }
+    // QA round 2 M1: coverage is decided by tops. A placement inside W whose top is a nested repository (submodule, vendored)
+    // does not run in the change root, so it does not cover it (the same placement is refused by I3 when the baseline is known).
+    const canonicalChangeRoot = canonical(changeRoot);
+    const coversChangeRoot = tops.some(top => isWithinDir(canonicalChangeRoot, canonical(top)));
     if (baselineUnavailable && !coversChangeRoot) {
-      const reason = `the change in the work root could not be observed and no check runs there (${tops.join(", ")}); nothing ran`;
+      const reason = `the change in the work root could not be observed and no check runs there (${tops.length > 0 ? tops.join(", ") : "no check root"}); nothing ran`;
       return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] }, dodSource, deps.strictUnverifiable);
     }
     if (artefact.changedFiles.length === 0) return undefined;
@@ -427,7 +429,7 @@ export async function accept(
     if (uncovered.length === 0) return undefined;
     const listed = uncovered.slice(0, MAX_OUTSIDE_LISTED).join(", ")
       + (uncovered.length > MAX_OUTSIDE_LISTED ? ` and ${uncovered.length - MAX_OUTSIDE_LISTED} more` : "");
-    const reason = `the change in ${listed} is not covered by any check root (${tops.join(", ")}); nothing ran`;
+    const reason = `the change in ${listed} is not covered by any check root (${tops.length > 0 ? tops.join(", ") : "no check root"}); nothing ran`;
     return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] }, dodSource, deps.strictUnverifiable);
   };
 
@@ -535,8 +537,10 @@ function unverifiedConsumerCaveats(
     .filter(consumer => !covered.has(perimeterKey(consumer.root)))
     .map(consumer => `${consumer.name ?? consumer.root} at ${consumer.root} links this work root (node_modules/${consumer.entry}) and no check ran there; add a check such as: check: testsPass cwd="${consumer.root}" scope=full`);
   // QA-2 #2: discovery stopped on its budget; a repository there may link this work root unchecked.
+  // QA round 2 M2: cleared by the same coverage as a consumer (a consumer check placed with its top equal to that root).
   const incomplete = (artefact.perimeter?.consumersIncomplete ?? [])
-    .map(entry => `consumer discovery stopped before finishing ${entry.name ?? entry.root} at ${entry.root}; a repository there may link this work root unchecked`);
+    .filter(entry => !covered.has(perimeterKey(entry.root)))
+    .map(entry => `consumer discovery stopped before finishing ${entry.name ?? entry.root} at ${entry.root}; a repository there may link this work root unchecked; add a check such as: check: testsPass cwd="${entry.root}" scope=full`);
   return [...unchecked, ...incomplete];
 }
 
