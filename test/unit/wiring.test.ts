@@ -6,10 +6,13 @@ import {
   createSharedFlight,
   createVerificationWiring,
   extractAssistantText,
+  noChangeGateSpawnsNothing,
 } from "../../src/verify/wiring";
 import { buildForcingNote } from "../../src/verify/dispatch";
 import type { GateResult } from "../../src/verify/gate";
 import type { RouterConfig } from "../../src/router/config";
+import type { DoD } from "../../src/verify/dod";
+import type { CheckPlacement } from "../../src/verify/types";
 
 function cfg(over: Partial<RouterConfig> = {}): RouterConfig {
   return {
@@ -52,6 +55,40 @@ function respondToPrompt(client: ReturnType<typeof fakeClient>, response: any): 
     return response;
   };
 }
+
+describe("noChangeGateSpawnsNothing (F13)", () => {
+  const testsOnly: DoD = { kind: "deterministic", checks: [{ kind: "testsPass" }], criteria: [], deliverable: null, source: "explicit" };
+  const placed = (scope?: "affected" | "full"): CheckPlacement => ({
+    cwd: "/repo/pkg",
+    top: "/repo",
+    foreign: false,
+    ...(scope !== undefined ? { scope } : {}),
+  });
+
+  it("false with a placed scope=full", () => {
+    expect(noChangeGateSpawnsNothing(testsOnly, { placements: [placed("full")] })).toBe(false);
+    const two: DoD = { ...testsOnly, checks: [{ kind: "testsPass" }, { kind: "testsPass" }] };
+    expect(noChangeGateSpawnsNothing(two, { placements: [undefined, placed("full")] })).toBe(false);
+  });
+
+  it("false with fullScope", () => {
+    expect(noChangeGateSpawnsNothing(testsOnly, { fullScope: true })).toBe(false);
+    expect(noChangeGateSpawnsNothing(testsOnly, { fullScope: true, placements: [placed("affected")] })).toBe(false);
+  });
+
+  it("true otherwise (unchanged)", () => {
+    expect(noChangeGateSpawnsNothing(testsOnly)).toBe(true);
+    expect(noChangeGateSpawnsNothing(testsOnly, {})).toBe(true);
+    expect(noChangeGateSpawnsNothing(testsOnly, { fullScope: false })).toBe(true);
+    expect(noChangeGateSpawnsNothing(testsOnly, { placements: [placed("affected")] })).toBe(true);
+    expect(noChangeGateSpawnsNothing(testsOnly, { placements: [placed()] })).toBe(true);
+    expect(noChangeGateSpawnsNothing(testsOnly, { placements: [undefined] })).toBe(true);
+    // The rest of the rule is as before: any other check or a criterion still means a process or a grader.
+    expect(noChangeGateSpawnsNothing({ ...testsOnly, checks: [] })).toBe(false);
+    expect(noChangeGateSpawnsNothing({ ...testsOnly, criteria: ["x"] })).toBe(false);
+    expect(noChangeGateSpawnsNothing({ ...testsOnly, checks: [{ kind: "testsPass" }, { kind: "lintClean" }] })).toBe(false);
+  });
+});
 
 describe("extractAssistantText", () => {
   it("joins the text parts", () => {

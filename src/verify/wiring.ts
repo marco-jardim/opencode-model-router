@@ -87,7 +87,7 @@ import type { PluginLogger } from "../router/logger";
 import { REFERENCE_NONE } from "./baseline";
 import { scrubText } from "../guard/scrub";
 import type { DoD } from "./dod";
-import type { ArgvSeam, Deadline, ExecOptions, ExecResult as SeamResult, ExecSeam, ReferenceState, TestsPassHook, Verdict } from "./types";
+import type { ArgvSeam, CheckPlacement, Deadline, ExecOptions, ExecResult as SeamResult, ExecSeam, ReferenceState, TestsPassHook, Verdict } from "./types";
 import { planScopedRun, planStaticScoping, type ChangedPath, type RunnerFs, type StaticScoping, type TestSearchSeam } from "./runner";
 import {
   DEFAULT_GATE_BUDGET_MS,
@@ -439,6 +439,13 @@ export interface DeferredFinishInput {
    * Only the observation uses it; the registration keeps `cwd`, the base the checks run in (F5).
    */
   readonly captureRoot?: string;
+  /**
+   * Cross-repo P2e: the DoD's per-check placements (index-aligned with `dod.checks`), as the dispatch resolved them. Only the
+   * static scoping plan and the no-change shortcut read them. Absent: every check runs at `cwd` and in its default scope.
+   */
+  readonly placements?: readonly (CheckPlacement | undefined)[];
+  /** Cross-repo P2e: the dispatch runs the full scope (the whole suite), so an empty change set still spawns the suite. */
+  readonly fullScope?: boolean;
 }
 
 /** Deferred budget snapshots kept for `router_verify` (by handle; oldest dropped first, like the pending registry's bound). */
@@ -510,8 +517,19 @@ export function hasTestsPass(dod: DoD): boolean {
  * there is no criterion. Only such a delegation takes finishDeferred's "no-change" answer
  * (QA-2.4-10); any other deferred DoD is registered with the empty change set instead, so its
  * build, lint, run, file and criteria checks run on router_verify, never synchronously.
+ *
+ * Cross-repo P2e (F13): a full scope runs the whole suite even with no changed file
+ * (deterministic.ts), so the gate spawns it: false when `fullScope` is set and the DoD has a
+ * testsPass or lintClean check, or when such a check's placement has `scope === "full"`. Without
+ * `opts`: as before.
  */
-export function noChangeGateSpawnsNothing(dod: DoD): boolean {
+export function noChangeGateSpawnsNothing(
+  dod: DoD,
+  opts?: { readonly placements?: readonly (CheckPlacement | undefined)[] | undefined; readonly fullScope?: boolean | undefined },
+): boolean {
+  const scoped = (kind: DoD["checks"][number]["kind"]): boolean => kind === "testsPass" || kind === "lintClean";
+  if (opts?.fullScope === true && dod.checks.some(c => scoped(c.kind))) return false;
+  if (opts?.placements !== undefined && dod.checks.some((c, i) => scoped(c.kind) && opts.placements?.[i]?.scope === "full")) return false;
   return dod.checks.length > 0 && dod.checks.every(c => c.kind === "testsPass") && dod.criteria.length === 0;
 }
 
@@ -2002,24 +2020,40 @@ export function createVerificationWiring(deps: {
    * for each testsPass check, with the command and cwd the gate would use. The first S6 result wins;
    * a command outside the allowlist is S6 too (the gate reports it unverifiable). Bounded by the
    * deferred-finish deadline; an unfinished plan counts as impossible (raises the risk, never lowers it).
+   *
+   * Cross-repo P2e: with `placements` (index-aligned with `dod.checks`), each testsPass check is planned at its placement's
+   * cwd; a placement with `scope === "full"` is not planned (it runs in full); a foreign placement is S6
+   * (attribution-unavailable). A check without a placement, or no placements at all: the base dir, as before.
    */
   const staticScoping = async (
     dod: DoD,
     cwd: string | undefined,
     changedFiles: readonly ChangedPath[],
     deadline: Deadline,
+    placements?: readonly (CheckPlacement | undefined)[],
   ): Promise<StaticScoping> => {
     const unfinished: StaticScoping = { unverifiable: true, code: "search-failed", reason: STATIC_SCOPING_UNFINISHED_REASON };
     const budget = resolveVerifyBudget(getConfig());
-    const at = resolveBaseDir(cwd, directory);
+    const base = resolveBaseDir(cwd, directory);
     const plans: StaticScoping[] = [];
-    for (const check of dod.checks) {
+    for (const [index, check] of dod.checks.entries()) {
       if (check.kind !== "testsPass") continue;
       const command = resolveRepoCommand(check, "testsPass", undefined);
       if (!isCommandAllowed(command, DEFAULT_ALLOWLIST)) {
         plans.push({ unverifiable: true, code: "unsupported-command", reason: `command not allowlisted: ${scrubText(command)}` });
         continue;
       }
+      const placement = placements?.[index];
+      if (placement?.scope === "full") continue;
+      if (placement?.foreign === true) {
+        plans.push({
+          unverifiable: true,
+          code: "attribution-unavailable",
+          reason: "the check runs in another repository, whose changes are not attributed to this dispatch",
+        });
+        continue;
+      }
+      const at = placement?.cwd ?? base;
       const ms = deadline.remaining();
       if (ms <= 0) {
         plans.push(unfinished);
@@ -2069,7 +2103,7 @@ export function createVerificationWiring(deps: {
       // DoD stays deferred as a whole, with the attributed empty change set (risk low).
       if (
         change.changeBaseline === "available" && change.changedFiles.length === 0 && !deadline.signal.aborted &&
-        noChangeGateSpawnsNothing(input.dod)
+        noChangeGateSpawnsNothing(input.dod, { placements: input.placements, fullScope: input.fullScope })
       ) {
         return { deferred: false, reason: "no-change", detail: "the producer changed no file" };
       }
@@ -2083,7 +2117,7 @@ export function createVerificationWiring(deps: {
           ...(f.previousPath !== undefined ? { previousPath: f.previousPath } : {}),
         }));
         changedFiles = paths;
-        const scopingPlan = await staticScoping(input.dod, input.cwd, paths, deadline);
+        const scopingPlan = await staticScoping(input.dod, input.cwd, paths, deadline, input.placements);
         risk = assessRisk({ changedFiles: paths, reference: referenceCaptured, producerTier, scopingPlan, root: change.snapshot?.root });
         // QA-2.4-8: the drift baseline is taken BEFORE the result is released (fs reads only, under
         // the same DEFERRED_FINISH_MS bound). An edit that lands right after the return is then

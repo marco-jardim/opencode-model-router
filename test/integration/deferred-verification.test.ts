@@ -34,6 +34,8 @@ import { REASONS } from "../../src/verify/risk";
 import type { RouterConfig } from "../../src/router/config";
 import type { DoD } from "../../src/verify/dod";
 import type { DispatchReference } from "../../src/verify/reference";
+import type { CheckPlacement } from "../../src/verify/types";
+import { resolveBaseDir } from "../../src/verify/paths";
 
 const state = vi.hoisted(() => ({
   /** What snapshotTree resolves with (undefined = unavailable). */
@@ -53,7 +55,33 @@ const state = vi.hoisted(() => ({
   slotAcquires: 0,
   /** createBackgroundQueue calls (2.4.5: never when background is off). */
   queues: 0,
+  /** P2e: the cwd of every planStaticScoping call (the deferred finish's static scoping). */
+  scopingCwds: [] as string[],
+  /** P2e: the scopingPlan every assessRisk call received. */
+  scopingPlans: [] as import("../../src/verify/runner").StaticScoping[],
 }));
+
+vi.mock("../../src/verify/risk", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../src/verify/risk")>();
+  return {
+    ...actual,
+    assessRisk: (input: Parameters<typeof actual.assessRisk>[0]) => {
+      state.scopingPlans.push(input.scopingPlan);
+      return actual.assessRisk(input);
+    },
+  };
+});
+
+vi.mock("../../src/verify/runner", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../src/verify/runner")>();
+  return {
+    ...actual,
+    planStaticScoping: (input: Parameters<typeof actual.planStaticScoping>[0]) => {
+      state.scopingCwds.push(input.cwd);
+      return actual.planStaticScoping(input);
+    },
+  };
+});
 
 vi.mock("../../src/verify/slot", async importOriginal => {
   const actual = await importOriginal<typeof import("../../src/verify/slot")>();
@@ -187,6 +215,8 @@ beforeEach(() => {
     testsPassHooks: 0,
     slotAcquires: 0,
     queues: 0,
+    scopingCwds: [],
+    scopingPlans: [],
   });
 });
 
@@ -600,6 +630,126 @@ describe("wiring (2.4.2a)", () => {
 
     it("canonicalTier lowercases and trims", () => {
       expect(canonicalTier("  HEAVY ")).toBe("heavy");
+    });
+  });
+
+  // Cross-repo P2e.2 (F13): a full scope runs the whole suite with no changed file, so the required gate would spawn it.
+  describe("P2e: no-change with full scope", () => {
+    const input = (over: Partial<Parameters<ReturnType<typeof makeWiring>["wiring"]["finishDeferred"]>[1]> = {}) => ({
+      dispatchID: "task:orch:1",
+      orchestratorSessionID: "orch",
+      producerSessionID: "child",
+      producerTier: "medium",
+      description: "add the parser",
+      cwd: root,
+      dod: TESTS_DOD,
+      dispatchedAt: 0,
+      ...over,
+    });
+    const fullHere: CheckPlacement = { cwd: root, top: root, foreign: false, scope: "full" };
+
+    it("a no-change dispatch with fullScope is not the cheap shortcut", async () => {
+      for (const [i, over] of [{ fullScope: true }, { placements: [fullHere] }].entries()) {
+        const { wiring, store } = makeWiring();
+        const id = `task:orch:${i}`;
+        await wiring.startDispatch(store, id, root, TESTS_DOD, "", false);
+        const finish = deferredOf(await wiring.finishDeferred(store, input({ dispatchID: id, ...over })));
+        expect(finish.handle).toMatch(HANDLE_PATTERN);
+        const listed = wiring.pending.listUnverified("orch");
+        expect(listed.map(e => e.handle)).toEqual([finish.handle]);
+        expect(listed[0].changedFiles).toEqual([]);
+      }
+      // Deferred, so nothing ran at return: the full suite is left to router_verify.
+      expect(state.commands).toEqual([]);
+      expect(state.scopeOpeners).toBe(0);
+      expect(state.testsPassHooks).toBe(0);
+      expect(state.slotAcquires).toBe(0);
+    });
+
+    it("the existing control is unchanged: no inputs, fullScope false or an affected placement -> no-change", async () => {
+      const affectedHere: CheckPlacement = { cwd: root, top: root, foreign: false, scope: "affected" };
+      for (const [i, over] of [{}, { fullScope: false }, { placements: [affectedHere] }, { placements: [undefined] }].entries()) {
+        const { wiring, store } = makeWiring();
+        const id = `task:orch:${i}`;
+        await wiring.startDispatch(store, id, root, TESTS_DOD, "", false);
+        expect(await wiring.finishDeferred(store, input({ dispatchID: id, ...over }))).toMatchObject({ deferred: false, reason: "no-change" });
+        expect(wiring.pending.stats().entries).toBe(0);
+      }
+    });
+  });
+
+  // Cross-repo P2e.2: the deferred finish's static scoping plans each testsPass check where it runs.
+  describe("P2e: static scoping per placement", () => {
+    const TWO_TESTS_DOD: DoD = { ...TESTS_DOD, checks: [{ kind: "testsPass", command: "npm test" }, { kind: "testsPass", command: "npm test" }] };
+    const input = (over: Partial<Parameters<ReturnType<typeof makeWiring>["wiring"]["finishDeferred"]>[1]> = {}) => ({
+      dispatchID: "task:orch:1",
+      orchestratorSessionID: "orch",
+      producerSessionID: "child",
+      producerTier: "medium",
+      description: "add the parser",
+      cwd: root,
+      dod: TWO_TESTS_DOD,
+      dispatchedAt: 0,
+      ...over,
+    });
+    const pkgA = resolve(root, "packages", "a");
+    const pkgB = resolve(root, "packages", "b");
+    const elsewhere = resolve("deferred-verification-other");
+    const changed = () => snap([{ path: resolve(root, "packages", "a", "src", "a.ts"), status: " M" }], "after");
+
+    it("planned at the placement cwd (a check without a placement stays at the base dir)", async () => {
+      const { wiring, store } = makeWiring();
+      await wiring.startDispatch(store, "task:orch:1", root, TWO_TESTS_DOD, "", false);
+      state.snapshot = changed();
+      deferredOf(await wiring.finishDeferred(store, input({ placements: [undefined, { cwd: pkgA, top: root, foreign: false }] })));
+      expect(state.scopingCwds).toEqual([resolveBaseDir(root, root), pkgA]);
+      // Without placements: both at the base dir, as before.
+      state.scopingCwds = [];
+      state.snapshot = snap([], "clean");
+      await wiring.startDispatch(store, "task:orch:2", root, TWO_TESTS_DOD, "", false);
+      state.snapshot = changed();
+      deferredOf(await wiring.finishDeferred(store, input({ dispatchID: "task:orch:2" })));
+      expect(state.scopingCwds).toEqual([resolveBaseDir(root, root), resolveBaseDir(root, root)]);
+    });
+
+    it("scope=full not planned", async () => {
+      const { wiring, store } = makeWiring();
+      await wiring.startDispatch(store, "task:orch:1", root, TWO_TESTS_DOD, "", false);
+      state.snapshot = changed();
+      deferredOf(await wiring.finishDeferred(store, input({
+        placements: [{ cwd: pkgA, top: root, foreign: false, scope: "full" }, { cwd: pkgB, top: root, foreign: false, scope: "affected" }],
+      })));
+      expect(state.scopingCwds).toEqual([pkgB]);
+      // A foreign check in full is not planned either, and is not S6 for being foreign.
+      state.scopingCwds = [];
+      state.scopingPlans = [];
+      state.snapshot = snap([], "clean");
+      await wiring.startDispatch(store, "task:orch:2", root, TWO_TESTS_DOD, "", false);
+      state.snapshot = changed();
+      deferredOf(await wiring.finishDeferred(store, input({
+        dispatchID: "task:orch:2",
+        placements: [{ cwd: elsewhere, top: elsewhere, foreign: true, scope: "full" }, { cwd: pkgB, top: root, foreign: false }],
+      })));
+      expect(state.scopingCwds).toEqual([pkgB]);
+      expect(state.scopingPlans).toHaveLength(1);
+      expect(state.scopingPlans[0]).not.toMatchObject({ code: "attribution-unavailable" });
+      expect(state.commands).toEqual([]);
+    });
+
+    it("foreign without full is S6", async () => {
+      const { wiring, store } = makeWiring();
+      await wiring.startDispatch(store, "task:orch:1", root, TESTS_DOD, "", false);
+      state.snapshot = changed();
+      const finish = deferredOf(await wiring.finishDeferred(store, input({
+        dod: TESTS_DOD,
+        placements: [{ cwd: elsewhere, top: elsewhere, foreign: true, scope: "affected" }],
+      })));
+      // Not planned (no attribution in that repository) and S6 attribution-unavailable: the risk of today's S6.
+      expect(state.scopingCwds).toEqual([]);
+      expect(state.scopingPlans).toEqual([expect.objectContaining({ unverifiable: true, code: "attribution-unavailable" })]);
+      expect(finish.risk.reasons).toContain(REASONS.unverifiable);
+      expect(finish.risk.level).not.toBe("low");
+      expect(state.commands).toEqual([]);
     });
   });
 
