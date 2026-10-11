@@ -25,12 +25,18 @@ export const MERGED_PER_FILE_GATED = [
   "src/verify/directives.ts",
   "src/verify/risk.ts",
   "src/verify/pending.ts",
-  // Phase 1.4.3: the executor gate (src/executor/**) is enforced in CI per file, as the glob threshold is off there.
-  "src/executor/types.ts",
   // #90 (C-6): the pure TUI status model and the server side of the TUI effort channel.
   "src/tui/status-model.ts",
   "src/tui/effort-channel.ts",
 ] as const;
+/**
+ * Directory-prefix gates on the merged report (scripts/coverage-merge.mjs): every merged file under a
+ * prefix (which ends with "/") must meet the declared minimums, functions included, and a prefix that
+ * matches no file fails. Phase 1.4.3 / QA-1.4-9: the executor gate (src/executor/**) is enforced in CI
+ * here, as the glob threshold below is off there (OMR_COVERAGE_ARTIFACT=1) and an exact list would
+ * leave every new executor file ungated.
+ */
+export const MERGED_PREFIX_GATED = [{ prefix: "src/executor/", lines: 90, branches: 90, functions: 90 }] as const;
 
 const mergedGates =
   process.env.OMR_COVERAGE_MERGED === "1"
