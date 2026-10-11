@@ -574,7 +574,16 @@ After QA rounds 1 and 2 (facts checked at HEAD effcdb3):
   - m8: Each link target gets a second hardened snapshot per role dispatch for its pin, and consumer discovery is sequential. The P0 timing tests (`unattributed-writers`, `branch-switch`, `branch-switch-deferred`) became sensitive to full-suite load.
   - `subagent` (like `task` and `delegate`) no longer contaminates captures or pins (round 2 M3 fix). The child's own writes are still observed.
   - Nits: `CONFIG_REFERENCE.md` and a comment in `src/routing/wire/dispatch.ts` say the work-root rule points to ENVIRONMENT, while `roles.ts` uses the `Working directory:` line first. A read-only role is told "You read only in your working directory." although R includes the working set. With `dispatchHeader: false`, a junction-spelled W equal to the session directory gets a minimal header. QA comment labels mix "QA-1"/"QA-2"/"QA-3" for round-1 items. A block-level `cwd: .git` is still accepted.
-- **Known follow-ups (Q8–Q10 QA), accepted for now:** none remaining, except that a route line placed after a copied header is not on the first line of the prompt, so its target is ignored (the copied header itself is stripped). m1 above is superseded: a copied header is now always stripped, and replaced only when the router adds its own.
+- **Known follow-ups (Q8–Q10 QA), accepted for now:** a route line placed after a copied header is not on the first line of the prompt, so its target is ignored and the dispatch runs in the session directory (the copied header itself is stripped). m1 above is superseded: a copied header is stripped, and replaced only when the router adds its own.
+- **Known follow-ups (Q8–Q10 QA round 2, minor), accepted for now:**
+  - A copied header is stripped only when the prompt starts with it: one behind leading blank lines (left by removing a route line), with CRLF separators, or without its separator survives, so the delegate can read two work roots.
+  - Stripping drops everything up to the first `\n\n---\n\n` when the prompt starts with `[router] You are @`, which can remove orchestrator text after a header-like opening; it should check that every paragraph before the separator is a header paragraph.
+  - A refusal note is quoted as a whole by `displaySafe` when any character is unsafe, so backslashes double and non-ASCII text becomes escapes.
+  - Detached worktrees are worded three ways (`branch (detached)`, `detached at <sha>`, `branch detached`).
+  - A duplicate or conflicting valid value is reported as "is not a valid …", and an identical duplicate `root=` repeats the note.
+  - A child bound by `root=` without admission refuses any `repo=`/`branch=` on resume.
+  - When `repo=` matches nothing, the hint "name a worktree of <repo> with root=" reads oddly.
+  - An explicit `root=` with `repo=X` is accepted by directory name even when a repository named X also exists (`root=` is explicit).
 - **Consumers** are discovered only in the working set, and only through `node_modules` links. Python editable installs, Go `replace`, Cargo path dependencies, and `../` or alias imports are not discovered (Q2).
 - **A consumer check's failures** are unverifiable, never "fail". The dependency is the changed repository, so the reference can neither excuse nor prove them.
 - **`router_run` scripts** remain trusted repository content (`run-tools.ts:11-13`).
