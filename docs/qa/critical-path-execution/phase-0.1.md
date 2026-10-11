@@ -84,6 +84,9 @@ Pre-flight finding, fixed by amendment:
 | QA-0.1-15 | minor | 0.1.0 harness additions (`restart`, plugin order, front wiring, listen slicing) had no unit tests |
 | QA-0.1-16 | nit | Missing `DECISIONS` entry passes silently; empty `smoke:cpx:*` scripts; `hostVersion` throws pre-observation; preamble bypasses the credential check; O2 pin landed after the cited commit |
 
+### Round 2 (heavy reviewer `ses_ed6d2b4f0ffemMGmg0LRz4rF5A`, at `c05fc6a`) — 13 findings (5 major, 6 minor, 2 nit)
+
+QA-0.1-17 (major) D5 reinstated without testing the full 1-hour layout (tools, first and last system part, message) and the provider's TTL ordering rule; -18 (major) the O11 real-provider gate was open-ended ("or the first DF session"); -19 (major) launcher A's binding timing unproven (`progress` awaited before the child's first context; session move); -20 (major) quota / host-ended rate-limit attempts counted toward `maxAttempts`; -21 (major) 3.1.4.a launcher prompt order and stale acceptance; -22 launcher B leftovers; -23 ADR facts stated as checked but only recorded (C5 marker count, C6 both requests, C10 persistent 529, retry hook on usage limits, headers, C13 empty children, C14 refusal count, decision-row control); -24 C12 delivery measured loosely (last parent request, new process after restart, long absence waits); -25 the runner could use the retained `signal`/`progress`; -26 `router_git_*` tools missing from the D7 table; -27 capacity signals on retry-hook stops and quota calls; -28 (nit) probe agent log and stale C10 comment, report rows for QA-0.1-3/-8; -29 (nit) observation run dirs never pruned.
 ## Fixes
 
 ### Round 1
@@ -92,12 +95,12 @@ Pre-flight finding, fixed by amendment:
 |---|---|---|
 | QA-0.1-1 | Probe sets `cache: {type:"ephemeral", ttlSeconds:3600}` on the last system part (`cache-hint-1h`) and on the last real message (`cache-hint-1h-message`); C6 asserts the observed branch: **1 h ttl reaches the wire on both** → C6 holds, D5 to be reinstated in the ADR. C5 adds `append-tail-user+hint-last-real`: with a manual hint on the last real message the wire breakpoint moves to that message and off the tail (asserted, both requests); plain user tail → breakpoint on the tail. | `672c727`, `4f63434` |
 | QA-0.1-2 | C14 runs the router **enforced**; children launched as `cpx-child` with an explicit `model`; each child repeats a `read` so the router's guards refuse (`DENIED:`); per-child checks for agent, wire model, read hook and a router refusal; a `withoutRouter` control host shows no refusal. | `672c727` |
-| QA-0.1-3 | ADR regenerated from the round-1 runs (pending: heavy architect after the 3× green runs). | — |
+| QA-0.1-3 | ADR regenerated from the round-1 runs. | `25d2ec4` |
 | QA-0.1-4 | O4a/O4b fates, O5 full log (`anyApiReturnsPreCompaction`), O6 `resume:false` no wake, D13 `session.step.started` `model.providerID`, D14 `routerDecisionRows === 0` and first-context-before-first-tool are asserted. | `4f63434` |
 | QA-0.1-5 | C14 batch 1 parked with `Gates` until all 8 wait at once (`peakWaiting === 8`). | `672c727` |
 | QA-0.1-6 | C12 waits for A's terminal line and stored completion before `restart()`, classifies the wake against the restart window, and asserts exactly one stored completion and one wire delivery for A. | `4f63434` |
 | QA-0.1-7 | CpxFront usage-limit variants; host classification observed and asserted: "usage limit" wording → `provider.quota` (with or without reset sentence or headers), the control 429 → `provider.rate-limit`; only the message text carries the reset time (headers are not surfaced); persistent-fault claims scoped to the 75 s window; `session.hook("retry")` observed, and setting `decision = {retry:false}` makes the host fail the step (`retry-stop` branch "stops"). | `b95f74a` |
-| QA-0.1-8 | Plan amendment A-0.1-2 in `cpx/main` (pending, after the ADR revision). | — |
+| QA-0.1-8 | Plan amendment A-0.1-2 in `cpx/main`. | `71242b2` |
 | QA-0.1-9 | Unadvertised `list`/`router_run`: only `advertised === false` asserted; keys recorded as unobserved. | `b95f74a` |
 | QA-0.1-10 | C9 model-side request selected by `tool_use_id`; `promptError` asserted undefined. | `b95f74a` |
 | QA-0.1-11 | `status === "completed"` required; summary claim dropped; C15-real compacts a session holding a real `<subagent>` completion with completion+compaction rewrites; asserted placeholder on the wire, no raw envelope. Observed: the host compacts the history except the latest turn when the session has more than one turn. | `b95f74a`, `7b11504` |
@@ -109,8 +112,40 @@ Pre-flight finding, fixed by amendment:
 
 Post-phase smoke checks (orchestrator shell, 2026-10-10/11): `npm run smoke:keyless` 5 files, 27 passed, 11 skipped (= baseline); `routing-engine.smoke.test.ts` scenario `6-v1-untouched` passed; full `routing-engine` smoke 12/13 — scenario `5-advisor` fails **also at the phase base** (`cpx/p01-base`, scratch worktree, same message), so it is pre-existing on OpenCode 2.0.26 (PF-4, recorded in the handover), not caused by this phase.
 
+### Round 2
+
+| Id | Fix | Commit |
+|---|---|---|
+| QA-0.1-17 | C6 `all` variant: 1 h hints on the first and last system part, the last tool and the last real message. Observed on 2.0.26: system and message blocks carry `ttl:"1h"`, the tools breakpoint keeps the host's 5-minute marker (no cache field on the context event's tools), so the provider's TTL order would be violated → **D5 withdrawn** (ADR 0007, A-0.1-3); Phase 1.2 built without D5. | `6e9b645`, ADR `915b96a` |
+| QA-0.1-18 | O11 moot with D5 withdrawn; "or the first DF session" removed. | ADR/plan `915b96a` |
+| QA-0.1-19 | Probe `progress` awaits 2 s and calls `ctx.session.move`; C14 asserts `progress` resolved before each child's first context hook and every move ok (2 batches × 8 children). | `6e9b645` |
+| QA-0.1-20 | `capacity` and `lost` outcomes uncounted (ADR D13, executor contract `src\executor\types.ts`). | ADR `915b96a`, 1.4 |
+| QA-0.1-21 | Launch prompt order PLAN CONTEXT → header → TASK (ADR D14, plan 3.1.4.a, `formatLaunchPrompt`). | ADR/plan `915b96a`, 1.4 |
+| QA-0.1-22 | Launcher B removed from ADR D14, C11, D15, the 3.1 row and the consequences. | `915b96a` |
+| QA-0.1-23 | Asserted: C5 1–4 markers with exactly one message marker per request; C6 per request (≥ 2 requests); C10 no `step.failed` and no terminal event within 75 s for 429 and 529; usage-limit retry hook receives `{retry:false}`; no `headers` field reaches the error (a `response.body` with the provider's JSON does — recorded as `responseBodySurfaced`); C13 non-empty children; C14 `signalReplaced`/`progressReplaced`, duplicate-read refusals 5 of 6 per child, and a decision-row positive control (waits for the flushed row of an ordinary call, then recounts the retained children from the same read). Retry delays recorded, not asserted. | `582f309`, `4072d97` |
+| QA-0.1-24 | C12: A's completion exactly once in the last parent request, no wake for A after the restart, a second probe `loaded` line from a new pid, absence waits 10 s. | `582f309` |
+| QA-0.1-10 (re-opened) | C9 requires `selectedBy === "tool_use_id"`; the fallback is recorded and fails. | `582f309` |
+| QA-0.1-25 | ADR D14: launches never use the retained `signal` nor forward `progress`. | `915b96a` |
+| QA-0.1-26 | ADR D7 table: `router_git_*` row; `shell`/`execute` not covered (Phase 1.3 `toolTargets`). | `915b96a` |
+| QA-0.1-27 | ADR D13 capacity-signal bullet. | `915b96a` |
+| QA-0.1-28 | Probe logs `childAgent ?? chosen.agent`; stale comment replaced; report rows above. | `6e9b645` |
+| QA-0.1-29 | `pruneOldRuns()` keeps the 5 newest run dirs (8-hex names only). | `6e9b645` |
+
+Smoke runs on 2.0.26: full contract file at `582f309` (16/18; the two failures were the new C10 header check over-matching a body-only `response` and the C14 control reading before the 30 s flush — both checks corrected in `4072d97`); C10 and C14 re-run at `4072d97` green.
+### Round 3 (heavy reviewer `ses_ed5c949ecffet2FVBH5Vxy4oBH`, at `915b96a`; majors only) — 2 major
+
+QA-0.1-18, -19, -21 fixed; -17 fixed in smoke/probe/ADR/src; -20 counting fixed. New: QA-0.1-30 (major) `provider.internal` with any status classified as capacity (contradicting ADR D6/D13 and the timing classifier; a persistent 5xx would loop uncounted) → fixed: overload only at 529, consistency test against `classifyCapacity` (`558e5b8`); QA-0.1-31 (major) live plan text still required the withdrawn TTL (1.2.3 block, 1.2.5 Reads/acceptance, G4) → fixed (`558e5b8`, A-0.1-3 log).
+Recorded, not fixed (minor/nit): the withdrawal premise (tools breakpoint stays 5-minute) is recorded, not asserted, and two C6 check texts still say "D5 decision"; the ADR evidence header names `7b11504` and the D5 withdrawal / C14 binding cite no run; `progressTookMs ≥ 2000` and `directoryAfter` not asserted; D13 does not mention `interrupted` as uncounted; ADR/plan show the launch header without ` nonce=<32 hex>`, and 3.1.4's acceptance does not pin the prompt order (3.1 owns it); O11(b) wording; probe-mode list misses `cache-hint-1h-all`.
+
+Final gate (orchestrator shell, 1× by the owner's decision): `npm run smoke:cpx` at `915b96a` — 4 files, 52/52 passed (host contract incl. all round-2 checks, cache-prefix, harness tests); `npm run smoke:keyless` (OpenCode 1.18.35 on PATH) — 27 passed, 11 skipped (= baseline); typecheck 0.
 ## Deferred findings
+
+- Round-3 recorded minors above: ADR wording items go to the Phase 6.1 ADR finalization (the plan schedules ADR finalization there); the launch-header nonce and prompt-order pins go to 3.1 (owner of the launcher and its tests).
 
 ## Handoffs
 
+- Phase 1.2 built without D5 (withdrawn); 1.4 carries QA-0.1-20/-21/-25 in the executor contract; 1.3 carries QA-0.1-26 in `toolTargets`.
+
 ## Verdict
+
+PASS after QA round 3 (round-3 majors QA-0.1-30/-31 fixed in `558e5b8`; no round 4 by rule).
