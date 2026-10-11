@@ -18,6 +18,13 @@ import { ScriptedProvider, type HostVersion } from "./scripted-provider";
 
 /** Fault shapes the front can answer instead of forwarding (all are Anthropic error envelopes `{type:"error",error:{type,message}}`). */
 export type FaultKind = "rate-limit" | "overloaded" | "usage-limit" | "invalid-request";
+/** `usage-limit` answer variants (QA-0.1-7: which feature makes the host classify a 429 as a quota error is not known, so each is probed alone):
+ *  - `reset-sentence` (default): "Usage limit reached. Your limit will reset at <ISO>." + retry-after + requests/tokens/unified reset headers;
+ *  - `header-only`: body "Usage limit reached." (no reset sentence), the `anthropic-ratelimit-unified-reset` header only (no retry-after);
+ *  - `alt-wording`: body "You have reached your usage limit" (no reset sentence), same headers as the default;
+ *  - `retry-after-only`: body "Usage limit reached.", a `retry-after` header only;
+ *  - `no-usage-wording`: CONTROL, a 429 `rate_limit_error` with the default's headers but a per-minute rate-limit text. */
+export type UsageLimitVariant = "reset-sentence" | "header-only" | "alt-wording" | "retry-after-only" | "no-usage-wording";
 /** Cache token counters added to the Anthropic `usage` object. */
 export interface CacheUsage { read: number; creation: number }
 /** One request seen by the front. `headers` never contain `authorization`, `x-api-key` or `proxy-authorization`. */
@@ -40,6 +47,8 @@ export interface FaultOptions {
   retryAfterSeconds?: number;
   /** `usage-limit` (and the `anthropic-ratelimit-*-reset` headers): when the limit resets (default: one hour after the answer). */
   resetAt?: Date | string;
+  /** `usage-limit` only: which answer shape (default `reset-sentence`, the original). */
+  variant?: UsageLimitVariant;
   /** Only requests for which this returns true consume and receive the fault (default: every request). */
   when?: (request: CpxRequest) => boolean;
 }
@@ -71,6 +80,7 @@ const iso = (value: Date | string | undefined, fallback: number): string => {
  * - `usage-limit`: 429, `retry-after: <seconds until reset, >= 1>`, `anthropic-ratelimit-requests-reset`, `anthropic-ratelimit-tokens-reset`
  *   and `anthropic-ratelimit-unified-reset` all `<ISO reset time>`, `anthropic-ratelimit-*-remaining: 0`; body
  *   `{"type":"error","error":{"type":"rate_limit_error","message":"Usage limit reached. Your limit will reset at <ISO reset time>."}}`.
+ *   `options.variant` selects other shapes (see {@link UsageLimitVariant}).
  * - `invalid-request`: 400, no `retry-after`; body `{"type":"error","error":{"type":"invalid_request_error","message":"cpx scripted invalid request"}}`.
  *   A NON-retryable failure answered by the front itself (never forwarded), so the fixture behind it records no error of its own.
  */
@@ -87,12 +97,26 @@ export function faultAnswer(kind: FaultKind, options: FaultOptions = {}, now = D
     return { status: 429, headers, body: envelope("rate_limit_error", "Number of request tokens has exceeded your per-minute rate limit") };
   }
   const reset = iso(options.resetAt, now + 3_600_000);
-  headers["retry-after"] = String(Math.max(1, Math.ceil((Date.parse(reset) - now) / 1000)));
+  const variant = options.variant ?? "reset-sentence";
+  const retryAfter = String(Math.max(1, Math.ceil((Date.parse(reset) - now) / 1000)));
+  if (variant === "header-only") {
+    // Same short body as "retry-after-only"; the ONLY reset signal is the unified-reset header.
+    headers["anthropic-ratelimit-unified-reset"] = reset;
+    return { status: 429, headers, body: envelope("rate_limit_error", "Usage limit reached.") };
+  }
+  if (variant === "retry-after-only") {
+    headers["retry-after"] = retryAfter;
+    return { status: 429, headers, body: envelope("rate_limit_error", "Usage limit reached.") };
+  }
+  headers["retry-after"] = retryAfter;
   for (const name of ["requests", "tokens"]) {
     headers[`anthropic-ratelimit-${name}-remaining`] = "0";
     headers[`anthropic-ratelimit-${name}-reset`] = reset;
   }
   headers["anthropic-ratelimit-unified-reset"] = reset;
+  if (variant === "alt-wording") return { status: 429, headers, body: envelope("rate_limit_error", "You have reached your usage limit") };
+  // Control: every header of the default answer, but a plain per-minute rate-limit text (no usage wording, no reset time in the body).
+  if (variant === "no-usage-wording") return { status: 429, headers, body: envelope("rate_limit_error", "Number of request tokens has exceeded your per-minute rate limit") };
   return { status: 429, headers, body: envelope("rate_limit_error", `Usage limit reached. Your limit will reset at ${reset}.`) };
 }
 

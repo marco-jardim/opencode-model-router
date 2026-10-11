@@ -35,7 +35,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { removeDirWhenReleased } from "../helpers/remove-dir";
-import type { CpxFront, CpxRequest, FaultKind } from "./helpers/cpx-scripted-provider";
+import type { CpxFront, CpxRequest, FaultKind, UsageLimitVariant } from "./helpers/cpx-scripted-provider";
 import {
   RoutingHost, ROOT, agentWithoutModel, arr, clip, obj, redact, ref, scriptLine, stopAllHosts, str, waitFor, type Dispatched, type HostOptions, type Obj,
 } from "./helpers/routing-host";
@@ -56,7 +56,7 @@ const CHILD_ENDED = new Set(["session.execution.succeeded", "session.execution.f
 /** Verification off, so the router does not rewrite `background: true` into a foreground call (role-spikes S6B); engine shadow as everywhere. */
 const BASE: HostOptions = { routing: { engine: "shadow" }, overrides: { enforcement: { mode: "off" } }, hostConfig: { agents: { [CHILD]: agentWithoutModel() } } };
 
-type ProbeMode = "rewrite-completion" | "append-tail-system" | "append-tail-user" | "append-tail-newest" | "cache-hint-1h" | "cache-hint-1h-message" | "append-tail-user+hint-last-real" | "filter-grep" | "mutate-subagent-prompt" | "rewrite-compaction" | "retained-launch";
+type ProbeMode = "rewrite-completion" | "append-tail-system" | "append-tail-user" | "append-tail-newest" | "cache-hint-1h" | "cache-hint-1h-message" | "append-tail-user+hint-last-real" | "filter-grep" | "mutate-subagent-prompt" | "rewrite-compaction" | "retained-launch" | "rewrite-completion+compaction" | "retry-observe" | "retry-stop" | "plugin-session-api";
 /** One probe JSON line: `{ t, kind, ...fields }` (see cpx-probe-plugin.js). */
 interface ProbeLine extends Obj { t: number; kind: string }
 
@@ -727,6 +727,8 @@ function toolInput(tool: string, props: readonly string[], project: string): Obj
   if (tool === "patch" || tool === "apply_patch") return { [pick("patchText", "patch", "input")]: "*** Begin Patch\n*** End Patch" };
   return input;
 }
+/** `tool_use_id` of the tool_result blocks in the LAST message of a provider request. */
+const toolResultIds = (r: CpxRequest): string[] => arr(bodyMessages(r).at(-1)?.content).map(obj).filter(b => b.type === "tool_result").flatMap(b => { const id = str(b.tool_use_id); return id === undefined ? [] : [id]; });
 /** Text of the tool_result blocks in the LAST message of a provider request: what the model was handed back. */
 function toolResultText(r: CpxRequest): string {
   const last = bodyMessages(r).at(-1);
@@ -738,6 +740,7 @@ d("C9 tool hooks: execute.before paths, execute.after result rewriting", () => {
     await observeContract("C9", async o => {
       await withHost("C9", "filter-grep", o, async s => {
         const { host } = s;
+        const { arrivals } = instrument(host);
         const project = host.project;
         await writeFile(path.join(project, "CPX_LEASED-a.txt"), "other content\n");
         await writeFile(path.join(project, "visible.txt"), "CPX_LEASED row\nkept row\n");
@@ -761,11 +764,21 @@ d("C9 tool hooks: execute.before paths, execute.after result rewriting", () => {
           const after = lines.find(l => l.kind === "execute.after");
           const filter = after ? (await probeLines(s.probeFile)).find(l => l.kind === "filter-grep" && l.callID === after.callID) : undefined;
           o.relied.push(...[before, after, filter].filter((l): l is ProbeLine => l !== undefined));
-          const seen = parentRequests(host, root).filter(r => lastIsToolResult(r)).at(-1);
+          // QA-0.1-10: the request that carried THIS call's result: the one whose tool_result.tool_use_id is the call id; else the first tool-result request that arrived after the prompt started.
+          const callID = str(before?.callID);
+          const candidates = parentRequests(host, root).filter(r => lastIsToolResult(r));
+          const byId = callID === undefined ? undefined : candidates.find(r => toolResultIds(r).includes(callID));
+          const firstAfterStart = candidates.find(r => (arrivals.get(r.index) ?? 0) >= startedAt);
+          const seen = byId ?? firstAfterStart;
+          const selectedBy = byId ? "tool_use_id" : firstAfterStart ? "first-after-start" : null;
           const modelText = seen ? toolResultText(seen) : undefined;
+          const advertised = defs.has(tool);
           perTool[tool] = {
-            advertised: defs.has(tool), inputSent: input, promptError,
-            executeBefore: before ? { argKeys: before.argKeys, args: before.args, agent: before.agent } : null,
+            advertised, inputSent: input, promptError, callID, selectedBy, toolResultIdsInSelected: seen ? toolResultIds(seen) : [],
+            // QA-0.1-9: for a tool the host does not advertise the input keys are the test's own input, not an observation: recorded as unobserved.
+            executeBefore: before
+              ? (advertised ? { argKeys: before.argKeys, args: before.args, agent: before.agent } : { argKeys: null, args: null, agent: before.agent, inputKeysUnobserved: true, reason: "the host does not advertise this tool in this fixture, so the arguments are the test's own input" })
+              : null,
             executeAfter: after ? { status: after.status, resultKeys: after.resultKeys, contentText: after.contentText, outputText: after.outputText, error: after.error } : null,
             filter: filter ? { mutable: filter.mutable, removedLines: filter.removedLines, sawLeasedFull: filter.sawLeasedFull, error: filter.error, note: filter.note } : null,
             modelSaw: modelText === undefined ? null : { text: modelText.slice(0, 500), containsLeased: modelText.includes("CPX_LEASED"), containsHiddenNote: modelText.includes("[cpx: 1 hidden]"), requestIndex: seen?.index },
@@ -780,14 +793,32 @@ d("C9 tool hooks: execute.before paths, execute.after result rewriting", () => {
 });
 
 // --------------------------------------------------------------------------- C10 ----
-interface FaultCase { name: string; kind: FaultKind; mode: "once" | "persistent" | "until-reset"; capMs: number }
+interface FaultCase { name: string; kind: FaultKind; mode: "once" | "persistent" | "until-reset"; capMs: number; variant?: UsageLimitVariant; probe?: ProbeMode }
+/** Observation window of the persistent-fault cases (ms): "no step.failed" is only claimed within it (QA-0.1-7b). */
+const PERSISTENT_WINDOW_MS = 75_000;
 const FAULT_CASES: readonly FaultCase[] = [
   { name: "rate-limit-once", kind: "rate-limit", mode: "once", capMs: 90_000 },
   { name: "overloaded-once", kind: "overloaded", mode: "once", capMs: 90_000 },
-  { name: "rate-limit-persistent", kind: "rate-limit", mode: "persistent", capMs: 75_000 },
-  { name: "overloaded-persistent", kind: "overloaded", mode: "persistent", capMs: 75_000 },
+  { name: "rate-limit-persistent", kind: "rate-limit", mode: "persistent", capMs: PERSISTENT_WINDOW_MS },
+  { name: "overloaded-persistent", kind: "overloaded", mode: "persistent", capMs: PERSISTENT_WINDOW_MS },
   { name: "usage-limit-until-reset", kind: "usage-limit", mode: "until-reset", capMs: 120_000 },
+  // QA-0.1-7a: which feature of the usage-limit answer makes the host classify it as provider.quota? One run per variant (default = the case above).
+  { name: "usage-limit-header-only", kind: "usage-limit", mode: "until-reset", capMs: 120_000, variant: "header-only" },
+  { name: "usage-limit-alt-wording", kind: "usage-limit", mode: "until-reset", capMs: 120_000, variant: "alt-wording" },
+  { name: "usage-limit-retry-after-only", kind: "usage-limit", mode: "until-reset", capMs: 120_000, variant: "retry-after-only" },
+  { name: "usage-limit-control-no-wording", kind: "usage-limit", mode: "until-reset", capMs: 120_000, variant: "no-usage-wording" },
+  // QA-0.1-7c: the plugin API's session.hook("retry"): observed on a single 429 and on a quota error; `retry-stop` on the persistent 429 (can D13 stop endless retries?).
+  { name: "rate-limit-once-retry-observe", kind: "rate-limit", mode: "once", capMs: 90_000, probe: "retry-observe" },
+  { name: "usage-limit-retry-observe", kind: "usage-limit", mode: "until-reset", capMs: 120_000, probe: "retry-observe" },
+  { name: "rate-limit-persistent-retry-stop", kind: "rate-limit", mode: "persistent", capMs: PERSISTENT_WINDOW_MS, probe: "retry-stop" },
 ];
+/** How the host classifies each usage-limit variant (the error type of step.failed, else of the first session.retry.scheduled).
+ *  "reset-sentence" is the observed baseline of the earlier run. The other entries are UNCONFIRMED hypotheses (wording-driven classification) until the
+ *  first run of this file: set each to the value recorded in C10.json (`cases.<name>.classification`) and keep the message; do not loosen the check. */
+const EXPECTED_CLASSIFICATION: Record<string, string> = {
+  "usage-limit-until-reset": "provider.quota", "usage-limit-header-only": "provider.quota", "usage-limit-alt-wording": "provider.quota",
+  "usage-limit-retry-after-only": "provider.quota", "usage-limit-control-no-wording": "provider.rate-limit",
+};
 const RESET_AHEAD_MS = 10_000;
 
 d("C10 provider errors: 429, 529 and usage limit", () => {
@@ -796,7 +827,7 @@ d("C10 provider errors: 429, 529 and usage limit", () => {
       const cases: Obj = {};
       o.observed.cases = cases;
       for (const c of FAULT_CASES) {
-        await withHost(`C10-${c.name}`, undefined, o, async s => {
+        await withHost(`C10-${c.name}`, c.probe, o, async s => {
           const { host } = s;
           const { arrivals } = instrument(host);
           const root = await host.newRoot(`C10 ${c.name} root`);
@@ -804,7 +835,7 @@ d("C10 provider errors: 429, 529 and usage limit", () => {
           const mine = (r: CpxRequest): boolean => hdr(r, "x-proof-session") === root && hdr(r, "x-proof-kind") === "primary";
           // once: one failure; persistent: every root request fails until the cap; until-reset: every root request fails until resetAt has passed.
           front(host).failWhen(r => mine(r) && (c.mode !== "until-reset" || Date.now() < resetAtMs), c.kind, {
-            times: c.mode === "once" ? 1 : Infinity, retryAfterSeconds: 2, ...(c.kind === "usage-limit" ? { resetAt: new Date(resetAtMs) } : {}),
+            times: c.mode === "once" ? 1 : Infinity, retryAfterSeconds: 2, ...(c.kind === "usage-limit" ? { resetAt: new Date(resetAtMs), ...(c.variant ? { variant: c.variant } : {}) } : {}),
           });
           const promptedAt = Date.now();
           await host.client.session.prompt({ sessionID: root, text: "C10 turn" });
@@ -828,7 +859,28 @@ d("C10 provider errors: 429, 529 and usage limit", () => {
           const stepStartedBeforeRetry = precedingStep
             ? { dataKeys: Object.keys(obj(precedingStep.data)), data: clip(precedingStep.data, 600), providerID: str(obj(obj(precedingStep.data).model).providerID), modelID: str(obj(obj(precedingStep.data).model).id) ?? str(obj(obj(precedingStep.data).model).modelID) }
             : null;
+          // QA-0.1-7a: the host's classification of this answer = the error type of the first step.failed, else of the first retry event; and where the reset time can be read from.
+          const failedError = lines.filter(l => l.kind === "session.step.failed").map(l => parseJsonObject(l.error))[0];
+          const retryError = events.filter(e => e.type === "session.retry.scheduled").map(e => obj(obj(e.data).error))[0];
+          const classification = failedError ? str(failedError.type) ?? "step.failed without type" : retryError ? str(retryError.type) ?? "retry without type" : "none";
+          const resetIsoSent = new Date(resetAtMs).toISOString();
+          const surfaced = failedError ?? retryError;
+          const resetPaths = surfaced ? stringPaths(surfaced, new RegExp(resetIsoSent.replace(/[.]/g, "\\."))) : [];
+          const responseFields = surfaced ? findKeys(surfaced, /^(headers|response|responseHeaders|retryAfter|resetAt|resetsAt)$/i).map(k => ({ path: k.path, value: clip(k.value, 300) })) : [];
+          // QA-0.1-7c: the plugin retry hook's calls (retry-observe / retry-stop modes) and what the probe set.
+          const probeAll = await probeLines(s.probeFile);
+          const retryHookCalls = probeAll.filter(l => l.kind === "retry-hook" && l.sessionID === root);
+          const retryStops = probeAll.filter(l => l.kind === "retry-stop" && l.sessionID === root);
+          o.relied.push(...retryHookCalls.slice(0, 3), ...retryStops.slice(0, 2));
           cases[c.name] = {
+            variant: c.variant ?? (c.kind === "usage-limit" ? "reset-sentence" : undefined), probeMode: c.probe ?? null, observationWindowMs: c.capMs,
+            classification, classifiedBy: failedError ? "session.step.failed" : retryError ? "session.retry.scheduled" : null,
+            resetRecoverable: { sentIso: c.kind === "usage-limit" ? resetIsoSent : undefined, inMessage: surfaced ? String(surfaced.message ?? "").includes(resetIsoSent) : false, paths: resetPaths, responseFields, surfacedError: clip(surfaced, 800) },
+            retryHook: {
+              available: probeAll.find(l => l.kind === "retry-hook-available")?.available,
+              calls: retryHookCalls.map(l => ({ t: l.t, attempt: l.attempt, errorType: l.errorType, errorStatus: l.errorStatus, errorMessage: l.errorMessage, errorKeys: l.errorKeys, eventKeys: l.eventKeys, decisionKeys: l.decisionKeys, decisionReceived: l.decisionReceived })),
+              stops: retryStops.map(l => ({ t: l.t, attempt: l.attempt, assigned: l.assigned, error: l.error, decisionAfter: l.decisionAfter })),
+            },
             stepStartedCount: events.filter(e => e.type === "session.step.started").length, stepStartedBeforeRetry,
             kind: c.kind, mode: c.mode, capMs: c.capMs, promptedAt, resetAt: c.kind === "usage-limit" ? new Date(resetAtMs).toISOString() : undefined,
             outcome: stillRetrying ? "still retrying at the cap (faults cleared, root interrupted)" : terminal?.kind, rootIdleAfter: idle === true,
@@ -843,7 +895,7 @@ d("C10 provider errors: 429, 529 and usage limit", () => {
             stepFailed: lines.filter(l => l.kind === "session.step.failed").map(lineBrief),
             probeSessionLines: lines.map(l => ({ kind: l.kind, t: l.t, error: l.error })),
             // O2: the retry event's error (type / status / message) and the parsed step.failed error, as the host emitted them.
-            retryScheduled: events.filter(e => e.type === "session.retry.scheduled").map(e => ({ attempt: obj(e.data).attempt, at: obj(e.data).at, error: { type: obj(obj(e.data).error).type, status: obj(obj(e.data).error).status, message: str(obj(obj(e.data).error).message)?.slice(0, 300) } })),
+            retryScheduled: events.filter(e => e.type === "session.retry.scheduled").map(e => ({ attempt: obj(e.data).attempt, at: obj(e.data).at, error: { type: obj(obj(e.data).error).type, status: obj(obj(e.data).error).status, message: str(obj(obj(e.data).error).message)?.slice(0, 300), keys: Object.keys(obj(obj(e.data).error)) } })),
             stepFailedParsed: lines.filter(l => l.kind === "session.step.failed").map(l => parseJsonObject(l.error)),
             hostEvents: events.slice(0, 60).map(e => ({ type: e.type, created: e.created, data: clip(e.data, 400) })),
             hostLogLines: host.tail(150_000).split(/\r?\n/).filter(line => /retr|429|529|overload|rate.?limit|usage/i.test(line)).slice(-30).map(line => line.slice(0, 300)),
@@ -852,7 +904,7 @@ d("C10 provider errors: 429, 529 and usage limit", () => {
         });
       }
     });
-  }, 1_500_000);
+  }, 3_000_000);
 });
 
 // ------------------------------------------------------------------ batch 3 helpers ----
@@ -1305,11 +1357,11 @@ d("C15 compaction hook: can a plugin rewrite the compaction request", () => {
         const hooks = lines.filter(l => l.kind === "compaction" || l.kind === "rewrite-compaction" || l.kind === "compaction-hook-available");
         o.relied.push(...hooks);
         const requests = front(host).requests.slice(requestsBefore);
-        const OPEN = new Set(["pending", "running", "queued", "active"]);
-        const settledContext = await tryWait("the compaction record to reach a final status", async () => {
+        // QA-0.1-11: success is `status === "completed"` of the compaction record; there is no "any non-failed status after a timeout" branch.
+        const settledContext = await tryWait("the compaction record to reach status completed", async () => {
           const c = await host.client.session.context({ sessionID: root });
           const records = c.filter(m => m.type === "compaction");
-          return records.length > 0 && records.every(m => typeof m.status === "string" && !OPEN.has(m.status)) ? c : undefined;
+          return records.length > 0 && records.every(m => m.status === "completed") ? c : undefined;
         }, 60_000);
         const stored = settledContext ?? await host.client.session.context({ sessionID: root });
         const compactionRecords = stored.filter(m => m.type === "compaction");
@@ -1317,11 +1369,13 @@ d("C15 compaction hook: can a plugin rewrite the compaction request", () => {
         o.observed.compaction = {
           // O5: a successful compaction. `status` and `error` are the host's own record; the request is the one the host sent with kind "compaction".
           records: compactionRecords.map(m => clip({ status: m.status, reason: m.reason, error: m.error, summary: m.summary }, 700)),
-          succeeded: compactionRecords.length > 0 && compactionRecords.every(m => m.status !== "failed" && m.error === undefined),
+          statuses: compactionRecords.map(m => str(m.status)),
+          succeeded: compactionRecords.length > 0 && compactionRecords.every(m => m.status === "completed" && m.error === undefined),
           requestKind: compactionRequest ? hdr(compactionRequest, "x-proof-kind") : null, requestIndex: compactionRequest?.index,
           requestHasPlaceholder: compactionRequest ? json(compactionRequest.body).includes("CPX_HELD_PLACEHOLDER") : null,
           requestHasOriginal: compactionRequest ? json(compactionRequest.body).includes("CPX_HELD_ORIGINAL") : null,
           placeholderLeaf: compactionRequest ? stringPaths(compactionRequest.body, /CPX_HELD_PLACEHOLDER/)[0] : null,
+          // Recorded only, NOT asserted (QA-0.1-11): it holds by construction, the summary is the scripted COMPACTION_SUMMARY, which never contains the original text.
           summaryHasOriginal: json(compactionRecords).includes("CPX_HELD_ORIGINAL"),
           summaryTexts: compactionRecords.map(m => textsOf(m).map(t => t.slice(0, 200))),
         };
@@ -1361,8 +1415,47 @@ d("C15 compaction hook: can a plugin rewrite the compaction request", () => {
           summaryLike: clip(stored.filter(m => /compact|summary/i.test(json(m).slice(0, 300))), 1200),
         };
       });
+      // QA-0.1-11 variant: the compacted session holds a REAL background `<subagent …>` completion; both rewrite modes are active in one probe.
+      await withHost("C15-real", "rewrite-completion+compaction", o, async s => {
+        const { host } = s;
+        const bg = await launchBackground(s, "C15R_HOLD", 1_500);
+        const childEnd = await awaitChildEnd(s, bg.childID, o);
+        const wake = await observeWake(s, bg, 30_000);
+        const stored = await tryWait("the real completion envelope in the parent's stored history", async () => { const v = await storedView(host, bg.root); return v.envelopes.length > 0 ? v : undefined; }, 30_000);
+        await host.prompt(bg.root, `C15R note ${scriptLine([], COMPACTION_SUMMARY)}`); // the template-conforming compaction reply, as in the main variant
+        const compact = sessionMethod(host, "compact");
+        const requestsBefore = front(host).requests.length;
+        const calledAt = Date.now();
+        let compactError: string | undefined;
+        if (compact) { try { await compact({ sessionID: bg.root }); } catch (error) { compactError = String(error); } }
+        const hook = await tryWait("the probe's compaction hook line (real completion)", async () => (await probeLines(s.probeFile)).find(l => l.kind === "compaction" && l.sessionID === bg.root && l.t >= calledAt), 60_000);
+        const settled = await tryWait("the compaction record (real completion) to reach status completed", async () => {
+          const c = await host.client.session.context({ sessionID: bg.root });
+          const records = c.filter(m => m.type === "compaction");
+          return records.length > 0 && records.every(m => m.status === "completed") ? c : undefined;
+        }, 90_000);
+        const after = settled ?? await host.client.session.context({ sessionID: bg.root });
+        const records = after.filter(m => m.type === "compaction");
+        const lines = await probeLines(s.probeFile);
+        const rewrite = lines.find(l => l.kind === "rewrite-compaction" && l.sessionID === bg.root && l.t >= calledAt);
+        const request = front(host).requests.slice(requestsBefore).find(r => hdr(r, "x-proof-kind") === "compaction" && hdr(r, "x-proof-session") === bg.root);
+        if (hook) o.relied.push(hook);
+        if (rewrite) o.relied.push(rewrite);
+        o.observed.realCompletion = {
+          childEnd, parentWoke: wake !== undefined, storedEnvelopeBeforeCompact: stored !== undefined, storedEnvelopeStates: stored ? envelopeStates(stored.envelopes) : [],
+          compactApi: compact !== undefined, compactError,
+          hookFired: hook !== undefined, hookSawEnvelope: hook ? ENVELOPE.test(json(hook.messages)) : false, hookMessages: clip(hook?.messages, 800),
+          completionReplacements: Number(rewrite?.completionReplacements ?? 0), heldReplacements: Number(rewrite?.replacements ?? 0), rewriteLine: clip(rewrite, 400),
+          requestKind: request ? hdr(request, "x-proof-kind") : null, requestIndex: request?.index,
+          requestHasPlaceholder: request ? json(request.body).includes(PLACEHOLDER) : null, requestHasEnvelope: request ? ENVELOPE.test(json(bodyMessages(request))) : null,
+          placeholderLeaf: request ? stringPaths(request.body, /verdict pending \(probe\)/)[0] : null,
+          statuses: records.map(m => str(m.status)), succeeded: records.length > 0 && records.every(m => m.status === "completed" && m.error === undefined), records: records.map(m => clip({ status: m.status, error: m.error, summary: m.summary }, 500)),
+          // Whether the context hook (not only the compaction hook) ran for the compaction request: context-hook lines of the root after the compact call.
+          contextHookCallsAfterCompact: lines.filter(l => l.kind === "context" && l.sessionID === bg.root && l.t >= calledAt).length,
+        };
+      });
     });
-  }, 600_000);
+  }, 900_000);
 });
 
 // --------------------------------------------------------------------------- C14b ----
@@ -1438,6 +1531,52 @@ d("O6 synthetic message with resume: does it wake an idle parent", () => {
           api: { onClient: synthetic !== undefined, via: "host.client.session.synthetic(input)" }, tries,
           stored: clip(stored.filter(m => json(m).includes("O6 synthetic note")), 1500), storedTypes: stored.map(m => str(m.type)),
           parentRequests: parentRequests(host, root).length,
+        };
+      });
+    });
+  }, 300_000);
+});
+
+// --------------------------------------------------------------------------- O6b ----
+const SYNTHETIC_TEXT = "CPX_PLUGIN_SYNTHETIC wake";
+d("O6b plugin-side session API: synthetic with resume, context, interrupt", () => {
+  it("calls ctx.session.context / interrupt / synthetic({ resume: true }) from the probe plugin once the root is idle and records inputs and results", async () => {
+    await observeContract("O6b", async o => {
+      await withHost("O6b", "plugin-session-api", o, async s => {
+        const { host } = s;
+        const { arrivals } = instrument(host);
+        // A background child held at the provider for 25 s: the target of the plugin-side interrupt.
+        const bg = await launchBackground(s, "O6B_HOLD", 25_000);
+        const held = await tryWait("the held child's provider request", () => host.provider.holds.find(h => h.session === bg.childID && h.releasedAt === undefined), 30_000);
+        const requestsBefore = parentRequests(host, bg.root).length;
+        const armedAt = Date.now();
+        // The root's turn calls the probe tool (it only arms the probe); the plugin API calls run when this turn's execution ends and the root is idle.
+        await host.prompt(bg.root, `READ_ONLY_PROBE=${JSON.stringify({ tool: "cpx_probe_session_api", input: { interruptSessionID: bg.childID } })}`);
+        const syntheticCall = await tryWait("the plugin-side synthetic call", async () => (await probeLines(s.probeFile)).find(l => l.kind === "session-api-call" && l.name === "synthetic" && l.t >= armedAt), 60_000);
+        const carries = (r: CpxRequest): boolean => json(bodyMessages(r)).includes(SYNTHETIC_TEXT);
+        const wake = await tryWait("a parent provider request carrying the plugin-side synthetic text", () => parentRequests(host, bg.root).find(r => carries(r)), 45_000);
+        if (wake) await host.settle(bg.root);
+        const childEnd = bg.childID ? await tryWait("terminal execution event of the held child", async () => terminalOf(await probeLines(s.probeFile), bg.childID ?? "", armedAt), 45_000) : undefined;
+        const lines = await probeLines(s.probeFile);
+        const calls = lines.filter(l => l.kind === "session-api-call");
+        o.relied.push(...lines.filter(l => l.kind === "session-api-armed" || l.kind === "session-api-start" || l.kind === "session-api-context"), ...calls, ...(childEnd ? [childEnd] : []));
+        const callOf = (name: string): ProbeLine | undefined => calls.find(l => l.name === name);
+        const stored = await storedView(host, bg.root);
+        const requests = parentRequests(host, bg.root);
+        o.observed.pluginApi = {
+          childID: bg.childID, childHeldWhenCalled: held !== undefined, requestsBefore, armedAt,
+          armed: clip(lines.find(l => l.kind === "session-api-armed"), 400), start: clip(lines.find(l => l.kind === "session-api-start"), 600),
+          signatures: "ctx.session.context({ sessionID }), ctx.session.interrupt({ sessionID }), ctx.session.synthetic({ sessionID, text, description, metadata, resume }) (SessionDomain = Pick<SessionApi, ...>, @opencode/plugin dist/promise/session.d.ts:143)",
+          calls: calls.map(l => ({ name: l.name, status: l.status, input: l.input, resultKind: l.resultKind, resultLength: l.resultLength, result: l.result, error: l.error, t: l.t })),
+          context: clip(lines.find(l => l.kind === "session-api-context"), 800),
+          interruptResult: parseJsonObject(callOf("interrupt")?.result),
+          childTerminal: childEnd ? lineBrief(childEnd) : null,
+          syntheticWake: {
+            syntheticCallAt: syntheticCall?.t, woke: wake !== undefined, requestIndex: wake?.index, arrivedAt: wake ? arrivals.get(wake.index) : undefined, wireCarriesText: wake ? carries(wake) : false,
+            lastMessage: wake ? clip(bodyMessages(wake).at(-1), 600) : null, parentRequestsFinal: requests.length,
+          },
+          storedHasText: json(await host.client.session.context({ sessionID: bg.root })).includes(SYNTHETIC_TEXT),
+          storedTypes: stored.messages.map(m => str(m.type)),
         };
       });
     });
@@ -1538,8 +1677,20 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
   C9: o => {
     const ob = o.observed;
     const expected: Record<string, string[]> = { read: ["path"], write: ["content", "path"], edit: ["newString", "oldString", "path"], glob: ["path", "pattern"], grep: ["path", "pattern"], list: ["filePath"], router_run: ["cwd", "script"] };
+    // QA-0.1-9: the keys of a tool the host does not advertise are the test's own input: only `advertised === false` is asserted (keys recorded as unobserved).
+    const UNADVERTISED_IN_FIXTURE = new Set(["list", "router_run"]);
     for (const [tool, keys] of Object.entries(expected)) {
-      check(o, "C9/D7", sortedKeys(at(ob, "perTool", tool, "executeBefore", "argKeys")) === sortedKeys(keys), `${tool}: execute.before must receive exactly the arguments {${keys.join(", ")}}; the lease checks read these keys`);
+      if (UNADVERTISED_IN_FIXTURE.has(tool)) {
+        check(o, "C9/D7", at(ob, "perTool", tool, "advertised") === false, `${tool}: the host does not advertise this tool in this fixture, so its input keys are NOT observed (recorded as unobserved); if it is advertised now, move ${tool} to the key assertion above`);
+        continue;
+      }
+      check(o, "C9/D7", at(ob, "perTool", tool, "advertised") === true && sortedKeys(at(ob, "perTool", tool, "executeBefore", "argKeys")) === sortedKeys(keys), `${tool}: execute.before must receive exactly the arguments {${keys.join(", ")}}; the lease checks read these keys`);
+    }
+    for (const tool of Object.keys(obj(at(ob, "perTool")))) {
+      check(o, "C9/D7", at(ob, "perTool", tool, "promptError") === undefined, `${tool}: the scripted tool call's prompt must complete without error (promptError: ${String(at(ob, "perTool", tool, "promptError")).slice(0, 200)})`);
+    }
+    for (const tool of ["glob", "grep"]) {
+      check(o, "C9/D7", at(ob, "perTool", tool, "selectedBy") !== null && at(ob, "perTool", tool, "selectedBy") !== undefined, `${tool}: the provider request that carried the call's result must be identified (by tool_use_id, else first after the call started); "what the model saw" is read from it`);
     }
     for (const tool of ["glob", "grep"]) {
       check(o, "C9/D7", at(ob, "perTool", tool, "filter", "mutable") === true && Number(at(ob, "perTool", tool, "filter", "removedLines")) >= 1 && at(ob, "perTool", tool, "filter", "sawLeasedFull") === true, `${tool}: execute.after must be able to rewrite the result (search filtering): the full pre-filter text held the leased line and the probe removed it`);
@@ -1567,13 +1718,38 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
       const c = kase(name);
       check(o, "C10/D13", list(at(c, "retryScheduled")).length >= 2 && at(c, "retryScheduled", 0, "error", "status") === status, `${name}: a persistent fault must keep producing session.retry.scheduled (status ${status})`);
     }
-    check(o, "C10/D13", list(at(kase("rate-limit-persistent"), "stepFailed")).length === 0, "a persistent 429 must not produce session.step.failed within the observation window");
+    // QA-0.1-7b: the claim is scoped to the observation window; the host may still fail the step later.
+    for (const name of ["rate-limit-persistent"]) {
+      const windowMs = Number(at(kase(name), "observationWindowMs"));
+      check(o, "C10/D13", windowMs === PERSISTENT_WINDOW_MS && list(at(kase(name), "stepFailed")).length === 0, `${name}: a persistent fault must not produce session.step.failed — no step.failed within ${PERSISTENT_WINDOW_MS} ms (the observation window; nothing is claimed beyond it, so D13 must not rely on the host giving up on its own)`);
+    }
     const quota = kase("usage-limit-until-reset");
     const parsed = at(quota, "stepFailedParsed", 0);
     const resetIso = /reset at (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)/.exec(String(at(parsed, "message")))?.[1];
     check(o, "C10/D13", list(at(quota, "stepFailed")).length >= 1 && at(parsed, "type") === "provider.quota" && at(parsed, "status") === 429 && at(quota, "outcome") === TERMINAL.fail, "a usage limit must surface as session.step.failed with error.type provider.quota (status 429) and end the execution as failed");
     check(o, "C10/D13", list(at(quota, "retryScheduled")).length === 0, "a usage limit must not be retried by the host (no session.retry.scheduled)");
-    check(o, "C10/D13", resetIso !== undefined && resetIso === at(quota, "resetAt"), "the usage-limit message must carry the reset time as `reset at <ISO-8601>` and it must equal the time the provider sent");
+    check(o, "C10/D13", resetIso !== undefined && resetIso === at(quota, "resetAt"), "the usage-limit message must carry the reset time as `reset at <ISO-8601>` and it must equal the time the provider sent (this is the test's OWN body sentence: it proves the message text is passed through, not that a real provider's usage limit is classified the same way)");
+    // QA-0.1-7a: which features of the answer make the host say provider.quota. The observed classification per variant is asserted (EXPECTED_CLASSIFICATION);
+    // whether the reset time is recoverable from the surfaced error is recorded per case (resetRecoverable) and summarised in ob.usageLimitVariants.
+    const summary: Obj = {};
+    for (const [name, expected] of Object.entries(EXPECTED_CLASSIFICATION)) {
+      const c = kase(name);
+      summary[name] = { variant: at(c, "variant"), classification: at(c, "classification"), classifiedBy: at(c, "classifiedBy"), resetInMessage: at(c, "resetRecoverable", "inMessage"), resetPaths: at(c, "resetRecoverable", "paths"), responseFields: at(c, "resetRecoverable", "responseFields") };
+      check(o, "C10/D13", at(c, "classification") === expected, `${name} (variant ${String(at(c, "variant"))}): the host must classify this usage-limit answer as ${expected}, observed ${String(at(c, "classification"))} (by ${String(at(c, "classifiedBy"))}); D13's quota-versus-retry rule rests on which feature of the answer triggers provider.quota (see usageLimitVariants in C10.json)`);
+    }
+    ob.usageLimitVariants = summary;
+    // QA-0.1-7c: session.hook("retry") of the plugin API. Calls are recorded in cases.<name>.retryHook; `retry-stop` decides whether D13 can stop endless retries.
+    const observed = kase("rate-limit-once-retry-observe");
+    const firstCall = at(observed, "retryHook", "calls", 0);
+    check(o, "C10/D13", at(observed, "retryHook", "available") === true && list(at(observed, "retryHook", "calls")).length >= 1 && at(firstCall, "errorStatus") === 429 && list(at(firstCall, "decisionKeys")).includes("retry") && at(observed, "outcome") === TERMINAL.ok, "session.hook(\"retry\") must be registrable and be called for a retryable 429 with error.status 429 and a `decision` carrying `retry` (observe only: the turn still completes)");
+    const quotaObserved = kase("usage-limit-retry-observe");
+    check(o, "C10/D13", at(quotaObserved, "classification") === "provider.quota" && at(quotaObserved, "retryHook", "available") === true, `usage limit with the retry hook registered: still classified provider.quota (the hook was called ${list(at(quotaObserved, "retryHook", "calls")).length} time(s) for it; see retryHook.calls)`);
+    const stopCase = kase("rate-limit-persistent-retry-stop");
+    const stopCalls = list(at(stopCase, "retryHook", "calls"));
+    const stopFailed = list(at(stopCase, "stepFailedParsed"));
+    const branch = stopCalls.length === 0 ? "hook-not-called" : !list(at(stopCase, "retryHook", "stops")).some(x => at(x, "assigned") === true) ? "decision-not-assignable" : stopFailed.length >= 1 && at(stopFailed, 0, "status") === 429 ? "stops" : "ignored";
+    ob.retryStopBranch = { branch, hookCalls: stopCalls.length, stepFailed: stopFailed.length, outcome: at(stopCase, "outcome"), windowMs: at(stopCase, "observationWindowMs") };
+    check(o, "C10/D13", branch === "stops" && at(stopCase, "outcome") === TERMINAL.fail, `a plugin retry hook that sets decision {retry:false} must make the host fail the step with the 429 (session.step.failed status 429, execution failed) within ${PERSISTENT_WINDOW_MS} ms; observed branch "${branch}" — if it is not "stops", D13 cannot stop endless retries through the retry hook (re-decide: external interrupt only)`);
   },
   C11: o => {
     const ob = o.observed;
@@ -1658,9 +1834,24 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
     check(o, "C15/O5", apiResults.some(a => at(a, "status") === "ok" && at(a, "hasOriginal") === true), "O5: at least one full-log client API (message.list / session.export) must answer ok and still hold the original text after compaction; if none does, the stored-original claim rests only on the pre-compaction snapshot and must be re-decided");
     check(o, "C15/O5", at(ob, "fullLog", "anyApiReturnsPreCompaction") === true, "O5: a full-log API must return the pre-compaction history (fullLog.anyApiReturnsPreCompaction)");
     check(o, "C15/D3", at(ob, "stored", "hasPlaceholder") === false && apiResults.length > 0 && apiResults.every(a => at(a, "hasPlaceholder") === false), "the placeholder must not be persisted anywhere: not in the post-compaction context, not in the full message log or export");
-    check(o, "C15/O5", at(ob, "compaction", "succeeded") === true, "O5: the scripted compaction must succeed (the summary follows the host's template)");
+    check(o, "C15/O5", at(ob, "compaction", "succeeded") === true && list(at(ob, "compaction", "statuses")).length >= 1, "O5: the scripted compaction must succeed: every compaction record has status `completed` and no error (the summary follows the host's template)");
     check(o, "C15/O5", at(ob, "compaction", "requestKind") === "compaction" && at(ob, "compaction", "requestHasPlaceholder") === true && at(ob, "compaction", "requestHasOriginal") === false && typeof at(ob, "compaction", "placeholderLeaf") === "string", "O5: the compaction request body must carry the placeholder (asserted at a leaf path) and not the original");
-    check(o, "C15/O5", at(ob, "compaction", "summaryHasOriginal") === false, "O5: the stored compaction summary must not contain the original text");
+    // QA-0.1-11: variant with a REAL background completion in the compacted history and both rewrite modes active.
+    const v = at(ob, "realCompletion");
+    check(o, "C15/D3", at(v, "storedEnvelopeBeforeCompact") === true, "scenario precondition: the history to compact must hold a real `<subagent …>` completion envelope (a real background child's completion)");
+    check(o, "C15/D3", at(v, "hookSawEnvelope") === true && Number(at(v, "completionReplacements")) >= 1, "the compaction hook must see the real completion envelope in event.messages and be able to replace it with the placeholder (D3 held results in compaction)");
+    check(o, "C15/D3", at(v, "requestKind") === "compaction" && at(v, "requestHasPlaceholder") === true && at(v, "requestHasEnvelope") === false, "the compaction request must carry the placeholder and NOT the raw completion envelope when a real background completion is in the compacted history");
+    check(o, "C15/O5", at(v, "statuses") !== undefined && list(at(v, "statuses")).length >= 1 && at(v, "succeeded") === true, "the compaction of a session holding a real completion must complete: every compaction record has status `completed` and no error");
+  },
+  O6b: o => {
+    const ob = o.observed;
+    const calls = list(at(ob, "pluginApi", "calls"));
+    const call = (name: string): unknown => calls.find(c => at(c, "name") === name);
+    check(o, "O6b/D15", at(ob, "pluginApi", "childHeldWhenCalled") === true && at(ob, "pluginApi", "armed") !== undefined && at(ob, "pluginApi", "start", "sessionMethods") !== undefined, "scenario precondition: the probe tool must arm the plugin API run once the root's turn ended, with the target child held at the provider");
+    check(o, "O6b/D15", at(call("context"), "status") === "ok" && at(call("context"), "resultKind") === "array" && Number(at(call("context"), "resultLength")) >= 2, "ctx.session.context({ sessionID }) from a plugin must return the session's messages (an array with the prompts of the turn)");
+    check(o, "O6b/D15", at(call("synthetic"), "status") === "ok" && at(call("synthetic"), "input", "resume") === true, "ctx.session.synthetic({ sessionID, text, description, metadata, resume: true }) must exist on the plugin session API and be accepted");
+    check(o, "O6b/D15", at(ob, "pluginApi", "syntheticWake", "woke") === true && at(ob, "pluginApi", "syntheticWake", "wireCarriesText") === true && at(ob, "pluginApi", "storedHasText") === true, "a plugin-side synthetic message with resume=true must wake the idle parent: a new provider request carrying the text, and the text is stored (D3 delivery / D15 wake from a plugin)");
+    check(o, "O6b/D15", at(call("interrupt"), "status") === "ok" && at(ob, "pluginApi", "interruptResult", "interrupted") === true && at(ob, "pluginApi", "childTerminal", "kind") === TERMINAL.interrupted, "ctx.session.interrupt({ sessionID }) from a plugin on a held running child must report interrupted=true and the child must end with session.execution.interrupted (same as client.session.interrupt, C7)");
   },
   O6: o => {
     const ob = o.observed;

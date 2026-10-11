@@ -1,6 +1,6 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { createServer } from "node:http";
-import { CpxFront, CpxScriptedProvider, faultAnswer, withCacheUsageJson, withCacheUsageSse, type CpxProviderOptions } from "./cpx-scripted-provider";
+import { CpxFront, CpxScriptedProvider, faultAnswer, withCacheUsageJson, withCacheUsageSse, type CpxProviderOptions, type UsageLimitVariant } from "./cpx-scripted-provider";
 import { EVIDENCE_DIR, RoutingHost, evidenceDir } from "./routing-host";
 import { ScriptedProvider } from "./scripted-provider";
 import { isFetchSafePort } from "./fetch-safe-port";
@@ -132,6 +132,37 @@ it("builds fault answers purely from the injected clock", () => {
   expect(faultAnswer("rate-limit", {}, now).headers).toMatchObject({ "retry-after": "1", "anthropic-ratelimit-requests-reset": "2026-10-10T12:00:01.000Z" });
   expect(faultAnswer("overloaded", {}, now)).toMatchObject({ status: 529 });
   expect(() => faultAnswer("usage-limit", { resetAt: "not a date" }, now)).toThrow("Invalid resetAt");
+});
+
+it("answers each usage-limit variant with exactly its own features (default unchanged)", () => {
+  const now = Date.parse("2026-10-10T12:00:00.000Z");
+  const resetAt = "2026-10-10T13:00:00.000Z";
+  const answer = (variant?: UsageLimitVariant) => faultAnswer("usage-limit", { resetAt, ...(variant ? { variant } : {}) }, now);
+  const message = (body: string): string => (JSON.parse(body) as { error: { message: string } }).error.message;
+  expect(answer()).toEqual(answer("reset-sentence"));
+  expect(message(answer().body)).toBe(`Usage limit reached. Your limit will reset at ${resetAt}.`);
+
+  const headerOnly = answer("header-only");
+  expect(headerOnly.status).toBe(429);
+  expect(message(headerOnly.body)).toBe("Usage limit reached.");
+  expect(headerOnly.headers["anthropic-ratelimit-unified-reset"]).toBe(resetAt);
+  expect(headerOnly.headers["retry-after"]).toBeUndefined();
+
+  const retryOnly = answer("retry-after-only");
+  expect(retryOnly.status).toBe(429);
+  expect(message(retryOnly.body)).toBe("Usage limit reached.");
+  expect(retryOnly.headers["retry-after"]).toBe("3600");
+  expect(Object.keys(retryOnly.headers).filter(name => name.startsWith("anthropic-ratelimit"))).toEqual([]);
+
+  const alt = answer("alt-wording");
+  expect(message(alt.body)).toBe("You have reached your usage limit");
+  expect(alt.headers).toMatchObject({ "retry-after": "3600", "anthropic-ratelimit-unified-reset": resetAt });
+
+  const control = answer("no-usage-wording");
+  expect(control.status).toBe(429);
+  expect(message(control.body)).not.toMatch(/usage limit|reset at/i);
+  expect(JSON.parse(control.body)).toMatchObject({ error: { type: "rate_limit_error" } });
+  expect(control.headers).toMatchObject({ "retry-after": "3600", "anthropic-ratelimit-unified-reset": resetAt });
 });
 
 it("serves a fault `times` times, then forwards", async () => {

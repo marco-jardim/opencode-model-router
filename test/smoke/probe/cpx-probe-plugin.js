@@ -41,6 +41,17 @@
  *   mutate-subagent-prompt execute.before of subagent: append " CPX_MUTATED" to the prompt.
  *   filter-grep            execute.after of grep / glob: drop result lines containing CPX_LEASED, append "[cpx: 1 hidden]".
  *   rewrite-compaction     compaction hook: CPX_HELD_ORIGINAL -> CPX_HELD_PLACEHOLDER in the messages / system parts.
+ *   rewrite-completion+compaction  both of the above at once: the context hook rewrites completion envelopes as in rewrite-completion, and the
+ *                          compaction hook rewrites CPX_HELD_ORIGINAL as in rewrite-compaction AND replaces any text holding a subagent
+ *                          completion envelope with the same placeholder (recorded in "rewrite-compaction" as `completionReplacements`).
+ *   retry-observe          registers session.hook("retry") (SessionRetry: error, attempt, mutable decision); records every call as "retry-hook"
+ *                          (error type / status / message, attempt, the keys of the event and of the decision, the decision as received). Mutates nothing.
+ *   retry-stop             retry-observe, and sets `e.decision = { retry: false }` on every call (records "retry-stop" with the decision read back).
+ *   plugin-session-api     registers tool cpx_probe_session_api (optional arg `interruptSessionID`). The call is only recorded ("session-api-armed");
+ *                          when that session's execution ends (the parent is idle), the PLUGIN-side session API is exercised on it:
+ *                          ctx.session.context({ sessionID }), ctx.session.interrupt({ sessionID: interruptSessionID }) when given, then
+ *                          ctx.session.synthetic({ sessionID, text: "CPX_PLUGIN_SYNTHETIC wake", description, metadata, resume: true }).
+ *                          Every input and result (or error) is recorded as "session-api-call".
  *   retained-launch        registers tool cpx_probe_capture (no args, returns "captured") that retains its tool context; when the
  *                          turn that called it ends, starts CPX_PROBE_RETAINED_COUNT (default THREE) concurrent native `subagent` children with that retained context
  *                          (the way src/compat/v2-client.ts does), and again after CPX_PROBE_RELAUNCH_MS if set.
@@ -51,9 +62,10 @@ import { createHash } from "node:crypto";
 const MODES = new Set([
   "rewrite-completion", "append-tail-system", "append-tail-user", "append-tail-newest", "cache-hint-1h", "cache-hint-1h-message", "append-tail-user+hint-last-real",
   "mutate-subagent-prompt", "filter-grep", "rewrite-compaction", "retained-launch",
+  "rewrite-completion+compaction", "retry-observe", "retry-stop", "plugin-session-api",
 ]);
 const OBSERVED_TOOLS = new Set([
-  "subagent", "read", "write", "edit", "multiedit", "patch", "apply_patch", "glob", "grep", "list", "router_run", "cpx_probe_capture",
+  "subagent", "read", "write", "edit", "multiedit", "patch", "apply_patch", "glob", "grep", "list", "router_run", "cpx_probe_capture", "cpx_probe_session_api",
 ]);
 const PICKED_ARGS = ["path", "filePath", "pattern", "cwd", "directory", "background", "agent", "subagent_type", "description", "script", "sessionID"];
 const PLACEHOLDER = "held \u2014 verdict pending (probe)";
@@ -92,6 +104,15 @@ const guard = (where, body) => async (event) => {
     return undefined;
   }
 };
+
+/** JSON text of `value` cut to `n` characters; a failed serialisation is returned as text. */
+function jsonCut(value, n) {
+  try {
+    return cut(JSON.stringify(value, bigintSafe), n);
+  } catch (error) {
+    return `unserializable: ${String(error)}`;
+  }
+}
 
 const sha256 = (text) => createHash("sha256").update(text).digest("hex");
 
@@ -322,7 +343,7 @@ export default {
       }
       const marker = `CPX_TAIL_MARKER ${requestNo}`;
       const base = { sessionID: e.sessionID, mode, requestNo };
-      if (mode === "rewrite-completion") {
+      if (mode === "rewrite-completion" || mode === "rewrite-completion+compaction") {
         const replaced = [];
         for (let i = 0; i < messages.length; i += 1) {
           const [next, count] = mapStrings(messages[i], (text) => (COMPLETION.test(text) ? PLACEHOLDER : undefined));
@@ -384,14 +405,24 @@ export default {
           sessionID: e.sessionID, agent: e.agent, messageCount: messages.length, messages: messages.map(summarizeMessage), ...systemInfo(e.system),
           hasResult: e.result !== undefined,
         });
-        if (mode !== "rewrite-compaction") return;
+        if (mode !== "rewrite-compaction" && mode !== "rewrite-completion+compaction") return;
         const swap = (text) => (text.includes("CPX_HELD_ORIGINAL") ? text.split("CPX_HELD_ORIGINAL").join("CPX_HELD_PLACEHOLDER") : undefined);
+        const swapCompletion = (text) => (COMPLETION.test(text) ? PLACEHOLDER : undefined);
+        const combined = mode === "rewrite-completion+compaction";
         let replacements = 0;
+        let completionReplacements = 0;
         for (let i = 0; i < messages.length; i += 1) {
           const [next, count] = mapStrings(messages[i], swap);
           if (count) {
             e.messages[i] = next;
             replacements += count;
+          }
+          if (combined) {
+            const [rewritten, n] = mapStrings(e.messages[i], swapCompletion);
+            if (n) {
+              e.messages[i] = rewritten;
+              completionReplacements += n;
+            }
           }
         }
         if (Array.isArray(e.system)) {
@@ -402,7 +433,7 @@ export default {
           });
           e.system = system;
         }
-        rec("rewrite-compaction", { sessionID: e.sessionID, did: replacements > 0, replacements });
+        rec("rewrite-compaction", { sessionID: e.sessionID, mode, did: replacements + completionReplacements > 0, replacements, completionReplacements });
       }));
       compactionAvailable = true;
     } catch (error) {
@@ -528,6 +559,91 @@ export default {
       }
     }
 
+    // ---- retry hook (retry-observe / retry-stop) -------------------------------------------------------------------
+    if (mode === "retry-observe" || mode === "retry-stop") {
+      let retryRegistered = false;
+      let retryReason;
+      try {
+        // SessionRetry (@opencode/plugin dist/promise/session.d.ts): readonly sessionID/agent/model/error/attempt + mutable `decision: { retry: false } | { retry: true, delay }`.
+        await ctx.session.hook("retry", guard("retry", (e) => {
+          const received = e.decision && typeof e.decision === "object" ? { ...e.decision } : e.decision;
+          const error = e.error && typeof e.error === "object" ? e.error : {};
+          rec("retry-hook", {
+            sessionID: e.sessionID, agent: e.agent, attempt: e.attempt, model: e.model && `${e.model.providerID}/${e.model.id}`,
+            errorType: error.type, errorStatus: error.status, errorMessage: cut(error.message, 300), errorKeys: Object.keys(error), error: jsonCut(e.error, 800),
+            eventKeys: Object.keys(e), decisionKeys: received && typeof received === "object" ? Object.keys(received) : null, decisionReceived: received,
+          });
+          if (mode !== "retry-stop") return;
+          let failure;
+          try {
+            e.decision = { retry: false };
+          } catch (assignError) {
+            failure = String(assignError);
+          }
+          rec("retry-stop", { sessionID: e.sessionID, attempt: e.attempt, assigned: failure === undefined, error: failure, decisionAfter: e.decision && typeof e.decision === "object" ? { ...e.decision } : e.decision });
+        }));
+        retryRegistered = true;
+      } catch (error) {
+        retryReason = String(error);
+      }
+      rec("retry-hook-available", { available: retryRegistered, reason: retryReason });
+    }
+
+    // ---- plugin-side session API (plugin-session-api) ------------------------------------------------------------------
+    const apiPending = new Map(); // sessionID of the cpx_probe_session_api call -> { interruptSessionID }
+    const apiDone = new Set();
+    const apiCall = async (name, input) => {
+      const fn = ctx.session && ctx.session[name];
+      if (typeof fn !== "function") {
+        rec("session-api-call", { name, input, status: "absent" });
+        return undefined;
+      }
+      try {
+        const result = await fn.call(ctx.session, input);
+        rec("session-api-call", { name, input, status: "ok", resultKind: Array.isArray(result) ? "array" : typeof result, resultLength: Array.isArray(result) ? result.length : null, result: jsonCut(result, 1500) });
+        return result;
+      } catch (error) {
+        rec("session-api-call", { name, input, status: "error", error: String(error) });
+        return undefined;
+      }
+    };
+    const runSessionApi = async (sessionID) => {
+      const armed = apiPending.get(sessionID);
+      if (!armed || apiDone.has(sessionID)) return;
+      apiDone.add(sessionID);
+      apiPending.delete(sessionID);
+      rec("session-api-start", { sessionID, sessionMethods: Object.keys(ctx.session ?? {}), interruptSessionID: armed.interruptSessionID ?? null });
+      const messages = await apiCall("context", { sessionID });
+      if (Array.isArray(messages)) rec("session-api-context", { sessionID, count: messages.length, types: messages.map((m) => (m && (m.type ?? m.role))) });
+      if (armed.interruptSessionID) await apiCall("interrupt", { sessionID: armed.interruptSessionID });
+      await apiCall("synthetic", {
+        sessionID, text: "CPX_PLUGIN_SYNTHETIC wake", description: "cpx plugin-side synthetic", metadata: { source: "cpx-probe", resume: true }, resume: true,
+      });
+    };
+
+    if (mode === "plugin-session-api") {
+      const loaded = await loadTool();
+      if (!loaded.tool) {
+        rec("probe-error", { where: "plugin-session-api", error: "cannot build the tool input schema; cpx_probe_session_api not registered", failures: loaded.failures });
+      } else {
+        await ctx.tool.transform((editor) => {
+          editor.add({
+            name: "cpx_probe_session_api",
+            description: "Test probe: when this session's turn has ended, calls the plugin-side session API on it. Optional interruptSessionID names a session to interrupt.",
+            input: loaded.tool.schema.object({ interruptSessionID: loaded.tool.schema.string().optional() }),
+            options: { codemode: false },
+            execute: async (args, context) => {
+              const interruptSessionID = args && typeof args.interruptSessionID === "string" && args.interruptSessionID.length > 0 ? args.interruptSessionID : undefined;
+              apiPending.set(context.sessionID, { interruptSessionID });
+              rec("session-api-armed", { sessionID: context.sessionID, interruptSessionID: interruptSessionID ?? null });
+              return { content: "armed" };
+            },
+          });
+        });
+        rec("session-api-tool-registered", { from: loaded.from });
+      }
+    }
+
     // ---- event stream ----------------------------------------------------------------------------------------------
     void (async () => {
       try {
@@ -542,6 +658,10 @@ export default {
                 eventID: event.id, sessionID: data.sessionID, parentID: data.parentID, agent: data.agent, title: cut(data.title, 200),
                 data: scalars(data), ...errorFields(data),
               });
+            }
+            if (mode === "plugin-session-api" && ["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"].includes(type)
+              && typeof data.sessionID === "string") {
+              void runSessionApi(data.sessionID).catch((error) => rec("probe-error", { where: "runSessionApi", error: String(error) }));
             }
             if (mode === "retained-launch" && ["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"].includes(type)
               && typeof data.sessionID === "string") {
