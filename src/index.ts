@@ -151,7 +151,8 @@ import {
   buildForcingNote,
   buildAcceptedSuffix,
 } from "./verify/dispatch";
-import { requestedVerificationCwd, requestedVerificationCwdSource, verificationScope, type VerificationScope } from "./routing/roles/work-root";
+import { canonicalAuthorityPath, insideWorkRoot, requestedVerificationCwd, requestedVerificationCwdSource, verificationScope, type VerificationScope } from "./routing/roles/work-root";
+import { createRepoProbe, readSetPredicate } from "./routing/roles/read-set";
 import { newLadderState, recordAttempt, nextAction, advance, buildEscalatePolicy, formatLadderScorecard, startCostRatio } from "./escalate/ladder";
 import { createCatalogLookup, planFirstAttempt, planNextAttempt } from "./escalate/resume";
 import type { AttemptPlan, CatalogLookup } from "./escalate/resume";
@@ -573,6 +574,38 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     // Cross-repo (P1.5): a binding that carries its repository makes it the repository `router_git_*` expects.
     const repository = grant.location?.repository;
     return repository !== undefined && answer.root !== null ? { ...answer, repository } : answer;
+  };
+  /**
+   * Cross-repo (P1.9, v2 only): the provenance line of a role's `read`, `glob` or `grep` whose target (the file, or the search root)
+   * canonicalises outside the session's work root but inside its read set (`routing/roles/read-set.ts`: the orchestrator's working
+   * set and the repositories below `routing.repoParents`). Undefined for a non-role session, an unbound or rootless one, a target in
+   * the work root, a target outside the read set, and whenever cross-repo is not in use (no parents and no working set: I9).
+   */
+  const repoProbe = createRepoProbe();
+  const readProvenanceLine = async (input: any): Promise<string | undefined> => {
+    const sid: unknown = input?.sessionID;
+    if (ctx.routerHost !== "v2" || typeof sid !== "string" || !["read", "glob", "grep"].includes(input?.tool)) return undefined;
+    if (roleOfSession(sid) === undefined) return undefined;
+    const binding = currentBinding(sid, { maxOf: roleMaxOf });
+    const workRoot = binding?.kind === "exact" ? binding.grant.workRoot : null;
+    if (workRoot === null || workRoot === undefined) return undefined;
+    const args: Record<string, unknown> = input?.args && typeof input.args === "object" ? input.args : {};
+    const named = input.tool === "read" ? [args.filePath, args.path, args.file_path] : [args.path];
+    const target = named.find((value): value is string => typeof value === "string" && value !== "");
+    if (target === undefined) return undefined; // no path: the session directory, inside the work root
+    const canonical = canonicalAuthorityPath(target, workRoot);
+    if (canonical === undefined || insideWorkRoot(canonical, workRoot)) return undefined;
+    const routing = resolveRolesRouting(cfg, "v2");
+    // The orchestrator that dispatched this role: its dispatch record, else the session's parent (as the v2 adapter's readSetOf).
+    let orchestrator = lookupDispatch(sid)?.parentSessionID ?? undefined;
+    if (orchestrator === undefined || orchestrator === "") {
+      const res = await ctx.client.session.get({ path: { id: sid } });
+      const parentID = res?.data?.parentID;
+      orchestrator = typeof parentID === "string" && parentID !== "" ? parentID : undefined;
+    }
+    const workingSet = orchestrator === undefined ? [] : workingSetOf(orchestrator);
+    const member = readSetPredicate({ parents: routing.repoParents, depth: routing.repoDepth, exclude: routing.repoExclude }, workingSet, repoProbe)?.(canonical);
+    return member === undefined ? undefined : `[router: read from ${member.name} (${member.branch ?? "detached"}) at ${member.repository} — read-only in this dispatch]`;
   };
   /** What a routed role dispatch decided for its child's guard (QA-G-A3-3): the dispatched tier and the route line's `budget=`. */
   interface RoutedGuardInput { readonly agent: string; readonly tier: string; readonly routeBudget: number | null }
@@ -2413,6 +2446,16 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         } catch {
           // best-effort: enforcement must never crash a real session
         }
+      }
+
+      // Cross-repo (P1.9): a role's read from outside its work root says where it came from. Last, after every router banner.
+      try {
+        const provenance = await readProvenanceLine(input);
+        if (provenance !== undefined && typeof output?.output === "string") {
+          output.output = `${output.output}${output.output.endsWith("\n") ? "" : "\n"}${provenance}`;
+        }
+      } catch {
+        // best-effort: a provenance line must never break a tool result
       }
 
       // Option (i): verify-dispatch around the built-in `task` tool (advisory-grade —

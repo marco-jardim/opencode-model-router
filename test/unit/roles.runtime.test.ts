@@ -23,7 +23,8 @@ import { resolveRoles } from "../../src/router/roles";
 import { resetDispatchRegistry } from "../../src/router/sessions";
 import { buildRoleLadder, roleTierOrder } from "../../src/routing/engine/ladders";
 import { resetIngestState, type Ingest } from "../../src/routing/outcomes/ingest";
-import { bind, currentBinding, resetBindingRegistryForTests } from "../../src/routing/roles/binding";
+import { bind, currentBinding, noncePromptLine, registerPending, resetBindingRegistryForTests } from "../../src/routing/roles/binding";
+import { addToWorkingSet, forgetWorkingSet } from "../../src/routing/wire/working-set";
 import {
   AUTHORITY_TEXT, markAnnotated, previewAuthority, requestAuthority, requestedAuthority, resetAuthorityForTests,
 } from "../../src/routing/roles/authority";
@@ -490,6 +491,94 @@ describe("signals with the real guard state (handoffs 15, 23)", () => {
     const output = { title: "", output: "ESCALATE: blocked", metadata: { sessionId: "x3" } };
     await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", agent: "build", callID: "p1", args: { subagent_type: "explorer", prompt: "Find" } }, output);
     expect(onSignal.mock.calls.filter(([child, observation]) => child === "x3" && observation.kind === "incomplete")).toEqual([]);
+  });
+});
+
+describe("read provenance of a role read outside its work root (cross-repo P1.9)", () => {
+  const CHILD = "prov-child";
+
+  /** A work root W, a parent P holding the repository `lib-b` (branch main) and the plain directory `plain`. */
+  function fixture() {
+    const work = temp("omr-p19-work-");
+    writeFileSync(join(work, "in.ts"), "x");
+    const parent = temp("omr-p19-parent-");
+    mkdirSync(join(parent, "lib-b", ".git"), { recursive: true });
+    writeFileSync(join(parent, "lib-b", ".git", "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(join(parent, "lib-b", "a.ts"), "x");
+    mkdirSync(join(parent, "plain"), { recursive: true });
+    writeFileSync(join(parent, "plain", "x.ts"), "x");
+    return { work, parent, repo: join(parent, "lib-b") };
+  }
+
+  /** Binds `CHILD` exactly to a dispatch of `root` with the local actions and a work root `workRoot`, and lets the plugin know it. */
+  async function bindRole(hooks: Record<string, any>, workRoot: string, dir: string): Promise<void> {
+    const nonce = "nonce-prov-child-0000000000";
+    registerPending({
+      parentSessionID: "root", callID: "call_prov", agent: "explorer", description: "task", nonce,
+      grant: { actions: new Set(["read", "glob", "grep"]), notes: [], workRoot }, budget: 80, decisionID: null, registeredAt: Date.now(),
+    });
+    const bound = await bind(CHILD, async () => ({ parentID: "root", agent: "explorer", title: "task", firstText: noncePromptLine(nonce) }),
+      { maxOf: () => ["read", "glob", "grep", "router_git"] });
+    expect(bound.kind).toBe("exact");
+    await hooks["tool.execute.before"]({ tool: "read", sessionID: CHILD, agent: "explorer", callID: "prov-0" }, { args: { filePath: join(dir, "a.ts") } });
+  }
+
+  async function after(hooks: Record<string, any>, sessionID: string, agent: string, tool: string, args: Record<string, unknown>): Promise<string> {
+    const output = { title: "", output: "found", metadata: {} };
+    await hooks["tool.execute.after"]({ tool, sessionID, agent, callID: `prov-${tool}`, args }, output);
+    return output.output;
+  }
+
+  const lineOf = (name: string, branch: string, repository: string): string =>
+    `[router: read from ${name} (${branch}) at ${repository} — read-only in this dispatch]`;
+
+  it("a read, glob and grep in a repository of the read set get the line; a read inside W, a plain directory and a non-role session do not", async () => {
+    const { work, parent, repo } = fixture();
+    const { dir } = home({ routing: { delegation: "roles", repoParents: [parent] } }, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    await bindRole(hooks, work, dir);
+    const line = lineOf("lib-b", "main", repo);
+
+    expect((await after(hooks, CHILD, "explorer", "read", { filePath: join(repo, "a.ts") })).endsWith(line)).toBe(true);
+    expect((await after(hooks, CHILD, "explorer", "glob", { pattern: "*.ts", path: repo })).endsWith(line)).toBe(true);
+    expect((await after(hooks, CHILD, "explorer", "grep", { pattern: "x", path: repo })).endsWith(line)).toBe(true);
+
+    expect(await after(hooks, CHILD, "explorer", "read", { filePath: join(work, "in.ts") })).not.toContain("[router: read from");
+    expect(await after(hooks, CHILD, "explorer", "glob", { pattern: "*.ts" })).not.toContain("[router: read from");
+    expect(await after(hooks, CHILD, "explorer", "read", { filePath: join(parent, "plain", "x.ts") })).not.toContain("[router: read from");
+    expect(await after(hooks, CHILD, "explorer", "read", { filePath: join(repo, "missing.ts") })).toContain(line);
+    // Not a read tool: untouched.
+    expect(await after(hooks, CHILD, "explorer", "webfetch", { filePath: join(repo, "a.ts") })).not.toContain("[router: read from");
+    // A non-role session (the orchestrator): never.
+    expect(await after(hooks, "root", "build", "read", { filePath: join(repo, "a.ts") })).not.toContain("[router: read from");
+  });
+
+  it("a detached head reads as detached", async () => {
+    const { work, parent, repo } = fixture();
+    writeFileSync(join(repo, ".git", "HEAD"), "3f2c1a9d5e7b00000000000000000000000000aa\n");
+    const { dir } = home({ routing: { delegation: "roles", repoParents: [parent] } }, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    await bindRole(hooks, work, dir);
+    expect((await after(hooks, CHILD, "explorer", "read", { filePath: join(repo, "a.ts") })).endsWith(lineOf("lib-b", "detached", repo))).toBe(true);
+  });
+
+  it("without routing.repoParents and without a working set there is no line (I9: inert)", async () => {
+    const { work, parent, repo } = fixture();
+    const { dir } = home(ROLES, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    await bindRole(hooks, work, dir);
+    expect(await after(hooks, CHILD, "explorer", "read", { filePath: join(repo, "a.ts") })).not.toContain("[router: read from");
+    expect(parent).toBeDefined();
+  });
+
+  it("a working-set repository is in the read set without any parent", async () => {
+    const { work, repo } = fixture();
+    const { dir } = home(ROLES, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    addToWorkingSet("root", { repository: repo, name: "lib-b", worktree: repo, branch: "main", head: null, worktrees: [] });
+    cleanups.push(async () => { forgetWorkingSet("root"); });
+    await bindRole(hooks, work, dir);
+    expect((await after(hooks, CHILD, "explorer", "read", { filePath: join(repo, "a.ts") })).endsWith(lineOf("lib-b", "main", repo))).toBe(true);
   });
 });
 
