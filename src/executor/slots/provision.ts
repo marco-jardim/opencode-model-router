@@ -64,7 +64,8 @@ export const PROVISION_STEP_TIMEOUT_MS = 1_200_000;
 export const PROVISION_OUTPUT_KEEP_BYTES = 16 * 1024;
 const PROBE_TIMEOUT_MS = 60_000;
 const TAIL_LINES = 12;
-const LINK_SWEEP_MAX_ENTRIES = 500_000;
+/** Entries one recursive slot sweep may visit before it refuses (provisioning and the pool share it). */
+export const SLOT_SWEEP_MAX_ENTRIES = 2_000_000;
 const LOCK_HEARTBEAT_MS = 10_000;
 const LOCK_STALE_MS = 60_000;
 const LOCK_STALE_RECHECK_MS = 1_000;
@@ -338,14 +339,24 @@ function resolvePython(d: Detection, config: Provision, host: ProvisionHost): Re
   return resolved;
 }
 
-function stepEnv(host: ProvisionHost, shell: string, extra: Record<string, string>): Record<string, string> {
+/** The user's Python environment must not leak into an install step: it would install into the user's venv or site. */
+const FOREIGN_PYTHON_ENV: readonly string[] = [
+  "VIRTUAL_ENV", "CONDA_PREFIX", "CONDA_DEFAULT_ENV", "PYTHONHOME", "PYTHONPATH", "PIP_TARGET", "PIP_PREFIX", "PIP_USER",
+  "POETRY_VIRTUALENVS_PATH",
+];
+
+function stepEnv(host: ProvisionHost, shell: string, slot: string, extra: Record<string, string>): Record<string, string> {
   const base = runEnvironment(host.env, host.platform, shell, { guards: host.guards });
   const env: Record<string, string> = {};
+  const foreign = new Set(FOREIGN_PYTHON_ENV.map((name) => (host.platform === "win32" ? name.toUpperCase() : name)));
   for (const [key, value] of Object.entries(base)) {
-    if (value !== undefined && !isCredentialEnv(key)) env[key] = value;
+    if (value === undefined || isCredentialEnv(key)) continue;
+    if (foreign.has(host.platform === "win32" ? key.toUpperCase() : key)) continue;
+    env[key] = value;
   }
   const fixed: Record<string, string> = {
-    CI: "1", COREPACK_ENABLE_DOWNLOAD_PROMPT: "0", PIP_NO_INPUT: "1", UV_PYTHON_DOWNLOADS: "never", ...extra,
+    CI: "1", COREPACK_ENABLE_DOWNLOAD_PROMPT: "0", PIP_NO_INPUT: "1", UV_PYTHON_DOWNLOADS: "never",
+    UV_PROJECT_ENVIRONMENT: api(host.platform).join(slot, ".venv"), ...extra,
   };
   for (const [name, value] of Object.entries(fixed)) {
     if (host.platform === "win32") {
@@ -374,7 +385,7 @@ export function planProvision(slot: string, d: Detection, host: ProvisionHost, c
 
   const step = (manager: Manager, command: string, args: string[], label: string,
     extra: Record<string, string> = {}, condition?: string[]): ProvisionStep => ({
-    manager, command, args, env: stepEnv(host, shell, extra), cwd: slot, timeoutMs: PROVISION_STEP_TIMEOUT_MS, label,
+    manager, command, args, env: stepEnv(host, shell, slot, extra), cwd: slot, timeoutMs: PROVISION_STEP_TIMEOUT_MS, label,
     ...(condition === undefined ? {} : { condition }),
   });
 
@@ -618,8 +629,8 @@ export function createProvisioner(deps: {
       }
       for (const name of names) {
         seen += 1;
-        if (seen > LINK_SWEEP_MAX_ENTRIES) {
-          throw fail(`more than ${LINK_SWEEP_MAX_ENTRIES} entries below ${root}; refusing to remove it recursively`, { path: root });
+        if (seen > SLOT_SWEEP_MAX_ENTRIES) {
+          throw fail(`more than ${SLOT_SWEEP_MAX_ENTRIES} entries below ${root}; refusing to remove it recursively`, { path: root });
         }
         const child = p.join(dir, name);
         const st = await fs.lstat(child);

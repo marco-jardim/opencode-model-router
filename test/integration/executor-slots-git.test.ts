@@ -340,6 +340,34 @@ describe("QA-2.4-1: the clean never reaches through a junction, at any depth or 
     expect(existsSync(join(lease.path, ".venv", "pyvenv.cfg"))).toBe(true);
   });
 
+  // QA-2.4-24: the preview must use the same -ff as the real clean, or a nested repository is only skipped by the preview
+  // while the real clean deletes it (and whatever junction it holds) unswept.
+  it("cleanForChecks and reset sweep a junction inside a nested repository that the real clean removes", async () => {
+    const { repo, c1 } = pythonRepo("repo-qa24");
+    const s = makePool(repo, "qa24");
+    await s.pool.open();
+    const lease = await s.pool.acquire(PLAN, "task-1", c1);
+    const outside = outsideWith("outside-qa24");
+    const plant = (): void => {
+      git(lease.path, "init", "-q", "sub");
+      mkdirSync(join(lease.path, "sub", "node_modules"), { recursive: true });
+      symlinkSync(outside, join(lease.path, "sub", "node_modules", "x"), "junction");
+    };
+    plant();
+    const preview = await s.ops.cleanPreview(lease.path, ["/.venv"]);
+    expect(preview.some((p) => p.startsWith("sub/"))).toBe(true);
+    expect(preview.every((p) => !p.startsWith("Would skip"))).toBe(true);
+    await s.pool.cleanForChecks(lease.slot);
+    expect(survives(outside)).toBe(true);
+    expect(existsSync(join(lease.path, "sub"))).toBe(false);
+    plant();
+    await s.pool.release(lease.slot);
+    await s.pool.acquire(PLAN, "task-2", c1);
+    expect(survives(outside)).toBe(true);
+    expect(existsSync(join(lease.path, "sub"))).toBe(false);
+    expect(existsSync(join(lease.path, ".venv", "pyvenv.cfg"))).toBe(true);
+  });
+
   // QA-2.4-8 on real git
   it("cleanForChecks restores tracked files the agent changed or deleted and leaves a clean status", async () => {
     const { repo, c1 } = pythonRepo("repo-qa8");

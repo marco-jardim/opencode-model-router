@@ -53,8 +53,24 @@ function userEnvironment(extra: Readonly<Record<string, string>> | undefined): N
 }
 
 /**
+ * Hardened env: `gitEnvironment(extra)` with the C locale forced (`LC_ALL=C`, `LANGUAGE=`), so the git messages the
+ * executor parses (`Would remove ...`) are never translated.
+ */
+export function hardenedEnvironment(extra: Readonly<Record<string, string>> | undefined): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...gitEnvironment({ ...(extra ?? {}) }) };
+  for (const key of Object.keys(env)) {
+    const upper = key.toUpperCase();
+    if (upper === "LC_ALL" || upper === "LANGUAGE") delete env[key];
+  }
+  env.LC_ALL = "C";
+  env.LANGUAGE = "";
+  return env;
+}
+
+/**
  * Production GitRunner: `spawnBounded(gitExecutable(workRootGuards(toplevel)), args, cwd, {env, timeoutMs, maxBytes, signal})`.
- * mode "hardened": env = `gitEnvironment(o.env ?? {})` (`o.env` is EXTRA, never a replacement).
+ * mode "hardened": env = `gitEnvironment(o.env ?? {})` (`o.env` is EXTRA, never a replacement) with `LC_ALL=C` and an
+ * empty `LANGUAGE` forced.
  * mode "user": the process environment minus GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR, GIT_INDEX_FILE,
  * GIT_OBJECT_DIRECTORY, GIT_ALTERNATE_OBJECT_DIRECTORIES, GIT_NAMESPACE and GIT_CEILING_DIRECTORIES, plus
  * GIT_TERMINAL_PROMPT=0; used for the identity read only.
@@ -67,7 +83,7 @@ export function createGitRunner(o: { mode: "hardened" | "user"; toplevel: string
     async run(args: readonly string[], p: ProcOpts): Promise<ProcessResult> {
       if (p.stdin !== undefined) throw new Error("the git runner does not support stdin");
       executable ??= gitExecutable(workRootGuards(o.toplevel));
-      const env = o.mode === "hardened" ? gitEnvironment({ ...(p.env ?? {}) }) : userEnvironment(p.env);
+      const env = o.mode === "hardened" ? hardenedEnvironment(p.env) : userEnvironment(p.env);
       const started = Date.now();
       const bounds = { env, timeoutMs: p.timeoutMs, maxBytes: p.maxOutputBytes ?? GIT_MAX_OUTPUT_BYTES, settleOnFailure: true };
       const result = await spawnBounded(executable, args, p.cwd, p.signal === undefined ? bounds : { ...bounds, signal: p.signal });
@@ -352,7 +368,7 @@ export interface GitOps {
    * be empty (E_GIT listing the dirty paths otherwise). Tracked changes are reverted: 3.1 commits before it calls this.
    */
   cleanForChecks(slot: string, keep: readonly string[]): Promise<void>;
-  /** The paths `clean -ndx -e <keep>...` would remove (same vector as the real clean), "/"-separated, directories end in "/". */
+  /** The paths `clean -ffndx -e <keep>...` would remove (same vector as the real clean), "/"-separated, directories end in "/". */
   cleanPreview(slot: string, keep: readonly string[]): Promise<string[]>;
   /** `ls-files -z --cached` (index), optionally limited to literal pathspecs. */
   lsFiles(slot: string, pathspecs?: readonly string[]): Promise<string[]>;
@@ -693,11 +709,11 @@ export function createGitOps(d: GitOpsDeps): GitOps {
   }
 
   /**
-   * The paths `git clean -ndx -e <keep>` would delete, relative to the slot with "/" separators (a directory ends in "/").
+   * The paths `git clean -ffndx -e <keep>` would delete, relative to the slot with "/" separators (a directory ends in "/").
    * The same argument vector as the real clean (`cleanTracked`, `cleanForChecks`), so the caller can sweep exactly what git deletes.
    */
   async function cleanPreview(slot: string, keep: readonly string[]): Promise<string[]> {
-    const r = await ok(inSlot(slot, { op: "clean -n", args: ["-c", "core.quotePath=false", "clean", "-ndx", ...cleanExcludes(keep)] }), "clean -n");
+    const r = await ok(inSlot(slot, { op: "clean -n", args: ["-c", "core.quotePath=false", "clean", "-ffndx", ...cleanExcludes(keep)] }), "clean -n");
     const out: string[] = [];
     for (const raw of r.stdout.split("\n")) {
       const line = raw.replace(/\r$/, "");
@@ -722,7 +738,7 @@ export function createGitOps(d: GitOpsDeps): GitOps {
     const excludes = cleanExcludes(keep);
     await ok(inSlot(slot, { op: "checkout", identity: true, args: ["checkout", "--force", "HEAD", "--", "."] }), "checkout");
     await ok(inSlot(slot, { op: "clean", args: ["clean", "-q", "-ffdx", ...excludes] }), "clean");
-    const left = await ok(inSlot(slot, { op: "clean -n", args: ["clean", "-ndx", ...excludes] }), "clean -n");
+    const left = await ok(inSlot(slot, { op: "clean -n", args: ["clean", "-ffndx", ...excludes] }), "clean -n");
     if (left.stdout.trim() !== "") {
       throw new ExecutorError("E_GIT", "files remain after clean", { op: "clean -n", code: 0, stderr: tailBytes(left.stdout, GIT_STDERR_TAIL_BYTES) });
     }

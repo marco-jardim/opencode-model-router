@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
-  createProvisioner, detectManagers, managerLockPath, needsProvision, planProvision, PROVISION_MANIFESTS,
+  createProvisioner, detectManagers, managerLockPath, needsProvision, planProvision, PROVISION_MANIFESTS, SLOT_SWEEP_MAX_ENTRIES,
   type Detection, type ProvisionHost,
 } from "../../src/executor/slots/provision";
 import { CLEANUP_RETRIES, CLEANUP_RETRY_BASE_MS, TRANSIENT_FS_CODES } from "../../src/verify/reference";
@@ -432,6 +432,38 @@ describe("planProvision", () => {
     expect(step?.env["POETRY_VIRTUALENVS_IN_PROJECT"]).toBe("true");
   });
 
+  // QA-2.4-23
+  describe("install steps do not inherit the user's Python environment", () => {
+    const foreign = {
+      VIRTUAL_ENV: "/user/venv", CONDA_PREFIX: "/user/conda", CONDA_DEFAULT_ENV: "base", PYTHONHOME: "/user/home", PYTHONPATH: "/user/lib",
+      PIP_TARGET: "/user/target", PIP_PREFIX: "/user/prefix", PIP_USER: "1", POETRY_VIRTUALENVS_PATH: "/user/poetry", UV_PROJECT_ENVIRONMENT: "/user/uv",
+    };
+    const uvEnvironment = join(SLOT, ".venv");
+
+    function expectClean(env: Record<string, string> | undefined): void {
+      const upper = Object.fromEntries(Object.entries(env ?? {}).map(([k, v]) => [k.toUpperCase(), v]));
+      for (const name of Object.keys(foreign)) if (name !== "UV_PROJECT_ENVIRONMENT") expect(upper[name], name).toBeUndefined();
+      expect(upper["UV_PROJECT_ENVIRONMENT"]).toBe(uvEnvironment);
+    }
+
+    it.each([["pnpm"], ["uv"], ["poetry"]] as const)("%s", manager => {
+      const [step] = planProvision(SLOT, det([manager]), hostWith(bin, foreign), AUTO);
+      expectClean(step?.env);
+    });
+
+    it("pip", () => {
+      const python = join(bin, exe("pytool"));
+      const steps = planProvision(SLOT, det(["pip"], { manifests: { "requirements.txt": "h" }, python }), hostWith(bin, foreign), { provision: "auto", python });
+      expect(steps.length).toBeGreaterThan(0);
+      for (const step of steps) expectClean(step.env);
+    });
+
+    it.skipIf(!WIN)("matches the names case-insensitively on win32", () => {
+      const [step] = planProvision(SLOT, det(["uv"]), hostWith(bin, { virtual_env: "C:\\user\\venv", Pythonpath: "C:\\lib" }), AUTO);
+      expect(Object.keys(step?.env ?? {}).filter(k => ["VIRTUAL_ENV", "PYTHONPATH"].includes(k.toUpperCase()))).toEqual([]);
+    });
+  });
+
   it("plans pip as venv, requirements and a conditional editable install", () => {
     const python = join(bin, exe("pytool"));
     const manifests = { "requirements.txt": "h", "requirements-dev.txt": "h2" };
@@ -853,17 +885,17 @@ describe("createProvisioner", () => {
     expect(clock.pending()).toBe(0);
   });
 
-  it("refuses to remove a stale dependency directory with more than half a million entries", async () => {
+  it("refuses to remove a stale dependency directory with more than the shared sweep cap of entries (QA-2.4-28)", async () => {
     const { spawner, provisioner, fs } = setup();
     const venv = `${slot(1)}${WIN ? "\\" : "/"}.venv`;
     fs.nodes.set(key(venv), "dir");
     const realReaddir = fs.readdir.bind(fs);
-    fs.readdir = async (p) => (key(p) === key(venv) ? Array.from({ length: 500_001 }, (_, i) => `f${i}`) : realReaddir(p));
+    fs.readdir = async (p) => (key(p) === key(venv) ? Array.from({ length: SLOT_SWEEP_MAX_ENTRIES + 1 }, (_, i) => `f${i}`) : realReaddir(p));
     spawner.hold = false;
-    await expect(provisioner.provision(slot(1), detection(["poetry"]), { fresh: true })).rejects.toThrow(/more than 500000 entries/);
+    await expect(provisioner.provision(slot(1), detection(["poetry"]), { fresh: true })).rejects.toThrow(/more than 2000000 entries/);
     expect(fs.removed).toEqual([]);
     expect(spawner.calls).toEqual([]);
-  });
+  }, 120_000);
 
   describe("fresh installs clear the old environment", () => {
     const sep = WIN ? "\\" : "/";

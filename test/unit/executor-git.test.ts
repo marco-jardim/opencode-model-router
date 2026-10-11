@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { hardenedEnvironment } from "../../src/executor/git";
 import {
   COMMIT_SUBJECT_PATTERN, SLOT_EXCLUDES_CONTENT, commitTypeFor, createGitOps, encodeRefId, executorGitArgs, formatCommitMessage,
   integrationBranchName, phaseTagName, planRefPrefix, readCommitIdentity, taskBranchName,
@@ -797,13 +798,13 @@ describe("GitOps in a slot", () => {
       ["clean", "-q", "-ffdx", "-e", "node_modules", "-e", "/foo.egg-info"],
       ["checkout", "--force", "HEAD", "--", "."],
       ["clean", "-q", "-ffdx", "-e", "node_modules", "-e", "/.venv"],
-      ["clean", "-ndx", "-e", "node_modules", "-e", "/.venv"],
+      ["clean", "-ffndx", "-e", "node_modules", "-e", "/.venv"],
       ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=all"],
     ]);
   });
 
   it("cleanForChecks fails when files remain and refuses a malformed exclusion", async () => {
-    const left = slotOps(args => (sub(args)[1] === "-ndx" ? { stdout: "Would remove dist/\n" } : undefined));
+    const left = slotOps(args => (sub(args)[1] === "-ffndx" ? { stdout: "Would remove dist/\n" } : undefined));
     await expect(left.ops.cleanForChecks(slot, [])).rejects.toThrow(/files remain/);
     const { git, ops } = slotOps();
     for (const bad of ["", "a\nb", "x".repeat(401)]) {
@@ -829,8 +830,28 @@ describe("GitOps in a slot", () => {
     const out = "Would remove tools/node_modules/\nWould remove a.txt\nWould remove \"we\\\"ird\\tname\"\nWould remove \"caf\\303\\251/\"\nWould skip repository sub/\n";
     const { git, ops } = slotOps(args => (sub(args)[0] === "clean" ? { stdout: out } : undefined));
     await expect(ops.cleanPreview(slot, ["/.venv"])).resolves.toEqual(["tools/node_modules/", "a.txt", "we\"ird\tname", "café/", "sub/"]);
-    expect(subs(git)[0]).toEqual(["clean", "-ndx", "-e", "/.venv"]);
+    expect(subs(git)[0]).toEqual(["clean", "-ffndx", "-e", "/.venv"]);
     await expect(slotOps(() => ({ stdout: "surprise\n" })).ops.cleanPreview(slot, [])).rejects.toMatchObject({ code: "E_GIT" });
+  });
+
+  // QA-2.4-22
+  it("the hardened git environment forces the C locale and cleanPreview rejects a translated line", async () => {
+    const saved = { ...process.env };
+    process.env.LANG = "de_DE.UTF-8";
+    process.env.LC_ALL = "de_DE.UTF-8";
+    process.env.LANGUAGE = "de";
+    try {
+      const env = hardenedEnvironment({ LC_MESSAGES: "de_DE.UTF-8" });
+      expect(env.LC_ALL).toBe("C");
+      expect(env.LANGUAGE).toBe("");
+    } finally {
+      for (const key of ["LANG", "LC_ALL", "LANGUAGE"]) {
+        const old = saved[key];
+        if (old === undefined) delete process.env[key]; else process.env[key] = old;
+      }
+    }
+    const german = slotOps(args => (sub(args)[0] === "clean" ? { stdout: "Würde a.txt entfernen\n" } : undefined));
+    await expect(german.ops.cleanPreview(slot, [])).rejects.toMatchObject({ code: "E_GIT" });
   });
 
   // QA-2.4-17

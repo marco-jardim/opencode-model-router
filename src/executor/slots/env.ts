@@ -21,12 +21,22 @@ export interface SlotEnv {
   prependPath: readonly string[];
   /** PYTHONPATH, PYTHONHOME, NODE_PATH, UV_PROJECT_ENVIRONMENT (and VIRTUAL_ENV when the slot has no Python manager). */
   unset: readonly string[];
+  /** The tool files the install left (QA-2.4-27): router_run takes a slot executable only when it matches one of these. */
+  bins: readonly SlotBin[];
+}
+
+/** One executable recorded right after provisioning: its path as the pool saw it, its size and its mtime (ms). */
+export interface SlotBin {
+  path: string;
+  size: number;
+  mtimeMs: number;
 }
 
 interface RegisteredSlot {
   /** The native real path of the slot root. */
   root: string;
   managers: readonly string[];
+  bins: readonly SlotBin[];
 }
 
 const REGISTRY_KEY = Symbol.for("omr.executor.slots");
@@ -58,9 +68,9 @@ function fold(path: string, platform: NodeJS.Platform): string {
 }
 
 /** A slot became usable (pool states ready, leased, resetting, provisioning). */
-export function registerSlot(r: { root: string; managers: readonly string[] }): void {
+export function registerSlot(r: { root: string; managers: readonly string[]; bins?: readonly SlotBin[] }): void {
   const real = realOrResolved(r.root);
-  registry().set(fold(real, process.platform), { root: real, managers: [...r.managers] });
+  registry().set(fold(real, process.platform), { root: real, managers: [...r.managers], bins: (r.bins ?? []).map((b) => ({ ...b })) });
 }
 
 /** A slot is gone or unusable (pool states broken, retired). */
@@ -82,7 +92,7 @@ function buildSlotEnv(slot: RegisteredSlot, platform: NodeJS.Platform): SlotEnv 
     prependPath.push(p.join(slot.root, "node_modules", ".bin"));
   }
   // A slot without a Python manager must not inherit another checkout's virtual environment.
-  return { root: slot.root, set, prependPath, unset: python ? UNSET_NAMES : [...UNSET_NAMES, "VIRTUAL_ENV"] };
+  return { root: slot.root, set, prependPath, unset: python ? UNSET_NAMES : [...UNSET_NAMES, "VIRTUAL_ENV"], bins: slot.bins };
 }
 
 /**

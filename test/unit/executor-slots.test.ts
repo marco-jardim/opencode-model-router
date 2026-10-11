@@ -4,9 +4,9 @@ import { join, win32 } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { runArgv } from "../../src/verify/exec";
 import type { GitOps, StatusEntry } from "../../src/executor/git";
-import { assertSafeSlotDir, createSlotPool, defaultSlotsDir, gcSlots, isSlotRecord, markerPath, slotLockReason, SLOT_NAME_PATTERN, UNKNOWN_PLAN_GC_AGE_MS } from "../../src/executor/slots/pool";
+import { assertSafeSlotDir, createSlotPool, defaultSlotsDir, gcSlots, isSlotRecord, markerPath, slotLockReason, SLOT_NAME_PATTERN, SLOT_SWEEP_MAX_ENTRIES, UNKNOWN_PLAN_GC_AGE_MS } from "../../src/executor/slots/pool";
 import { applySlotEnv, registerSlot, slotEnvFor, unregisterSlot } from "../../src/executor/slots/env";
-import { detectManagers } from "../../src/executor/slots/provision";
+import { detectManagers, SLOT_SWEEP_MAX_ENTRIES as PROVISION_SWEEP_MAX_ENTRIES } from "../../src/executor/slots/provision";
 import type { Detection, Provisioner } from "../../src/executor/slots/provision";
 import { ExecutorError, GIT_ID_PATTERN, type Clock, type ExecutorConfig, type FileSystem, type FsStat, type SlotRecord } from "../../src/executor/types";
 
@@ -59,7 +59,7 @@ describe("slot environment: platform variants", () => {
   it("applySlotEnv returns the very same object without a slot, and leaves PATH alone when nothing is prepended", () => {
     const env: NodeJS.ProcessEnv = { PATH: "/bin", PYTHONPATH: "/elsewhere" };
     expect(applySlotEnv(env, null, "linux")).toBe(env);
-    const out = applySlotEnv(env, { root: "/s", set: {}, prependPath: [], unset: ["PYTHONPATH"] }, "linux");
+    const out = applySlotEnv(env, { root: "/s", set: {}, prependPath: [], unset: ["PYTHONPATH"], bins: [] }, "linux");
     expect(out).not.toBe(env);
     expect(out).toEqual({ PATH: "/bin" });
     expect(env["PYTHONPATH"]).toBe("/elsewhere");
@@ -67,20 +67,20 @@ describe("slot environment: platform variants", () => {
 
   it("applySlotEnv on POSIX is case-sensitive and joins PATH with a colon", () => {
     const env: NodeJS.ProcessEnv = { PATH: "/usr/bin", pythonpath: "keep", PYTHONPATH: "drop", virtual_env: "keep" };
-    const out = applySlotEnv(env, { root: "/s", set: { VIRTUAL_ENV: "/s/.venv" }, prependPath: ["/s/.venv/bin", "/s/node_modules/.bin"], unset: ["PYTHONPATH"] }, "linux");
+    const out = applySlotEnv(env, { root: "/s", set: { VIRTUAL_ENV: "/s/.venv" }, prependPath: ["/s/.venv/bin", "/s/node_modules/.bin"], unset: ["PYTHONPATH"], bins: [] }, "linux");
     expect(out).toEqual({ PATH: "/s/.venv/bin:/s/node_modules/.bin:/usr/bin", pythonpath: "keep", virtual_env: "keep", VIRTUAL_ENV: "/s/.venv" });
   });
 
   // POSIX names are case-sensitive: a `Path` variable that precedes `PATH` is left alone and never read as the search path.
   it("D1: applySlotEnv on POSIX prepends to the PATH variable, not to a differently-cased Path", () => {
     const env: NodeJS.ProcessEnv = { Path: "keep", PATH: "/usr/bin" };
-    const out = applySlotEnv(env, { root: "/s", set: {}, prependPath: ["/s/node_modules/.bin"], unset: [] }, "linux");
+    const out = applySlotEnv(env, { root: "/s", set: {}, prependPath: ["/s/node_modules/.bin"], unset: [], bins: [] }, "linux");
     expect(out).toEqual({ Path: "keep", PATH: "/s/node_modules/.bin:/usr/bin" });
   });
 
   it("applySlotEnv on win32 matches names case-insensitively and keeps a single PATH key", () => {
     const env: NodeJS.ProcessEnv = { pythonpath: "drop", Virtual_Env: "old", Path: "C:\\Windows", PATH: "C:\\Windows", Other: "x" };
-    const out = applySlotEnv(env, { root: "C:\\s", set: { VIRTUAL_ENV: "C:\\s\\.venv" }, prependPath: ["C:\\s\\.venv\\Scripts"], unset: ["PYTHONPATH"] }, "win32");
+    const out = applySlotEnv(env, { root: "C:\\s", set: { VIRTUAL_ENV: "C:\\s\\.venv" }, prependPath: ["C:\\s\\.venv\\Scripts"], unset: ["PYTHONPATH"], bins: [] }, "win32");
     expect(Object.keys(out).filter(k => k.toLowerCase() === "path")).toHaveLength(1);
     expect(Object.entries(out).find(([k]) => k.toLowerCase() === "path")?.[1]).toBe("C:\\s\\.venv\\Scripts;C:\\Windows");
     expect(out["VIRTUAL_ENV"]).toBe("C:\\s\\.venv");
@@ -90,7 +90,7 @@ describe("slot environment: platform variants", () => {
   });
 
   it("applySlotEnv creates PATH when there is none, and ignores an empty one", () => {
-    const slot = { root: "/s", set: {}, prependPath: ["/s/node_modules/.bin"], unset: [] };
+    const slot = { root: "/s", set: {}, prependPath: ["/s/node_modules/.bin"], unset: [], bins: [] };
     expect(applySlotEnv({}, slot, "linux")).toEqual({ PATH: "/s/node_modules/.bin" });
     expect(applySlotEnv({ PATH: "" }, slot, "linux")).toEqual({ PATH: "/s/node_modules/.bin" });
     expect(applySlotEnv({ Path: "" }, { ...slot, prependPath: ["C:\\s\\node_modules\\.bin"] }, "win32")).toEqual({ Path: "C:\\s\\node_modules\\.bin" });
@@ -354,7 +354,6 @@ function harness(o: { maxParallel?: number; fs?: MemFs; config?: Pick<ExecutorCo
     planId: PLAN, repoKey: "repo-key", toplevel: TOP, slotsDir: SLOTS, markersDir: MARKERS, executorHome: HOME,
     maxParallel: o.maxParallel ?? 4, git, fs, clock, provisioner: prov, platform: "win32",
     logger: { warn: (m) => { warnings.push(m); } }, onProvision: (slot, managers) => { provisioned.push(`${slot}:${managers.join(",")}`); },
-    ...(o.config === undefined ? {} : { config: o.config }),
   });
   const read = (slot: string): SlotRecord => {
     const text = fs.text(markerPath(MARKERS, PLAN, slot));
@@ -1012,6 +1011,89 @@ describe("SlotPool repair", () => {
 // ---------------------------------------------------------------------------------------------------------------
 // GC
 // ---------------------------------------------------------------------------------------------------------------
+
+describe("SlotPool sidecars, stages and gc locking (QA-2.4-25 to QA-2.4-29)", () => {
+  const sidecar = (slot: string, extension: string): string => markerPath(MARKERS, PLAN, slot).replace(/\.json$/, `.${extension}`);
+
+  it("QA-2.4-25: the produced-keep list is written beside the marker, restored by open() and kept by the next reset", async () => {
+    const h = harness();
+    h.git.preview = () => ["foo.egg-info/"];
+    await h.pool.open();
+    const lease = await h.pool.acquire(PLAN, "t1", C1);
+    expect(JSON.parse(h.fs.text(sidecar(lease.slot, "produced")) ?? "null")).toEqual(["/foo.egg-info"]);
+    await h.pool.release(lease.slot);
+
+    const again = harness({ fs: h.fs });
+    await again.pool.open();
+    await again.pool.acquire(PLAN, "t2", C1);
+    expect(again.git.resetKeeps[0]).toContain("/foo.egg-info");
+    expect(again.git.previewKeeps[0]).toContain("/foo.egg-info");
+  });
+
+  it("QA-2.4-25: a retired slot, and a slot without managers, lose the produced list", async () => {
+    const h = harness();
+    h.git.preview = () => ["foo.egg-info/"];
+    await h.pool.open();
+    const lease = await h.pool.acquire(PLAN, "t1", C1);
+    await h.pool.release(lease.slot);
+    await h.pool.gc(async () => true);
+    expect(h.fs.text(sidecar(lease.slot, "produced"))).toBeNull();
+    expect(h.fs.text(sidecar(lease.slot, "bins"))).toBeNull();
+
+    const bare = seeded([record("slot-1", { state: "ready", owner: null, managers: [] })], [slotPath("slot-1")]);
+    bare.fs.put(sidecar("slot-1", "produced"), JSON.stringify(["/stale"]));
+    await bare.pool.open();
+    expect(bare.fs.text(sidecar("slot-1", "produced"))).toBeNull();
+    await bare.pool.acquire(PLAN, "t2", C1);
+    expect(bare.git.resetKeeps[0]).not.toContain("/stale");
+  });
+
+  it("QA-2.4-27: the executables found after provisioning are recorded, written beside the marker and restored", async () => {
+    const h = harness();
+    const original = h.prov.provision.bind(h.prov);
+    h.prov.provision = async (slot, detection, o) => {
+      await original(slot, detection, o);
+      h.fs.put(win32.join(slot, ".venv", "Scripts", "python.exe"), "exe");
+    };
+    await h.pool.open();
+    const lease = await h.pool.acquire(PLAN, "t1", C1);
+    const exe = { path: win32.join(lease.path, ".venv", "Scripts", "python.exe"), size: 3, mtimeMs: 0 };
+    expect(slotEnvFor(lease.path, "win32")?.bins).toEqual([exe]);
+    expect(JSON.parse(h.fs.text(sidecar(lease.slot, "bins")) ?? "null")).toEqual([exe]);
+    await h.pool.release(lease.slot);
+
+    unregisterSlot(lease.path);
+    const again = harness({ fs: h.fs });
+    await again.pool.open();
+    expect(slotEnvFor(lease.path, "win32")?.bins).toEqual([exe]);
+  });
+
+  it("QA-2.4-27: a slot without a usable .bins file registers no executables and warns", async () => {
+    const h = seeded([record("slot-1", { state: "ready", owner: null, managers: ["pip"] })], [slotPath("slot-1")]);
+    h.fs.put(sidecar("slot-1", "bins"), "{ not json");
+    await h.pool.open();
+    expect(slotEnvFor(slotPath("slot-1"), "win32")?.bins).toEqual([]);
+    expect(h.warnings.some(w => w.includes(".bins"))).toBe(true);
+  });
+
+  it("QA-2.4-28: provisioning and the pool share one sweep cap", () => {
+    expect(SLOT_SWEEP_MAX_ENTRIES).toBe(2_000_000);
+    expect(PROVISION_SWEEP_MAX_ENTRIES).toBe(SLOT_SWEEP_MAX_ENTRIES);
+  });
+
+  it("QA-2.4-26: gc of an unfinished plan does not wait for a slot that is busy", async () => {
+    const h = harness();
+    let open!: () => void;
+    h.prov.gate = new Promise<void>(resolve => { open = resolve; });
+    await h.pool.open();
+    const acquiring = h.pool.acquire(PLAN, "t1", C1);
+    for (let n = 0; n < 200 && h.prov.calls.length === 0; n++) await new Promise<void>(resolve => { setTimeout(resolve, 0); });
+    expect(h.prov.calls).toHaveLength(1);
+    await expect(h.pool.gc(async () => false)).resolves.toEqual({ removed: [], reported: [] });
+    open();
+    await expect(acquiring).resolves.toMatchObject({ slot: "slot-1" });
+  });
+});
 
 describe("SlotPool gc", () => {
   async function leased(h: Harness, owner = "t1"): Promise<string> {

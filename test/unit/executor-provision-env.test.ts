@@ -41,4 +41,13 @@ describe("slot environment: VIRTUAL_ENV (QA-2.4-18)", () => {
     expect(env["PATH"]?.startsWith(join(pySlot, ".venv", process.platform === "win32" ? "Scripts" : "bin"))).toBe(true);
     expect(env["PATH"]).toContain(join(pySlot, "node_modules", ".bin"));
   });
+
+  // QA-2.4-27
+  it("carries the executable snapshot registered with the slot (empty when none was given)", () => {
+    const bin = { path: join(pySlot, ".venv", "bin", "python"), size: 12, mtimeMs: 34 };
+    registerSlot({ root: pySlot, managers: ["pip", "pnpm"], bins: [bin] });
+    expect(slotEnvFor(pySlot)?.bins).toEqual([bin]);
+    registerSlot({ root: pySlot, managers: ["pip", "pnpm"] });
+    expect(slotEnvFor(pySlot)?.bins).toEqual([]);
+  });
 });

@@ -59,12 +59,12 @@
  *   absolute, drive, UNC or URL path or a `..` segment, but a symlink or junction inside
  *   the work root, and the contents of an `@response` file, are repository content.
  */
-import { realpathSync, statSync } from "node:fs";
+import { lstatSync, realpathSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { posix, win32 } from "node:path";
 import { tool } from "@opencode-ai/plugin";
-import { applySlotEnv, slotEnvFor, type SlotEnv } from "../executor/slots/env";
+import { applySlotEnv, slotEnvFor, type SlotBin, type SlotEnv } from "../executor/slots/env";
 import type { RunConfig } from "./roles";
 import {
   checkWorkRootAnswer, dropPartialCredential, envLookup, errorMessage, firstOutside, isFullPath, readBoundedRegularFile as readBounded,
@@ -428,13 +428,29 @@ function stemOf(path: string): string {
   return win32.basename(path).replace(/\.(exe|com|cmd|bat|ps1|js)$/i, "").toLowerCase();
 }
 
+/** The file is one of the recorded executables: same path (folded on win32), size and mtime as at provisioning (QA-2.4-27). */
+function matchesSnapshot(found: string, bins: readonly SlotBin[], platform: NodeJS.Platform): boolean {
+  const key = (p: string): string => (platform === "win32" ? p.replace(/\//g, "\\").toLowerCase() : p);
+  const wanted = key(pathApi(platform).normalize(found));
+  const recorded = bins.find((bin) => key(pathApi(platform).normalize(bin.path)) === wanted);
+  if (recorded === undefined) return false;
+  try {
+    const st = lstatSync(found);
+    return st.size === recorded.size && st.mtimeMs === recorded.mtimeMs;
+  } catch { return false; }
+}
+
 /**
  * The one narrow exception to "no executable inside the work root" (QA-2.4-6): when the work root is an
  * executor slot, a BARE name is looked up first in the slot's own tool directories (`.venv\Scripts` / `.venv/bin`,
- * `node_modules/.bin`), so `pytest` or `vitest` runs the slot's install. The file must be a regular file whose
- * real path is inside the slot root; a virtualenv interpreter may instead be a link to one outside every guarded
- * directory. The same name rules apply as everywhere (no shells, node or npm, `.exe`/`.com` only on win32).
- * Absolute paths, names not found there, and every work root that is not a slot fall through unchanged.
+ * `node_modules/.bin`), so `pytest` or `vitest` runs the slot's install. The file must match the snapshot (path, size,
+ * mtime) the pool recorded right after provisioning (`SlotEnv.bins`): anything an agent wrote there later falls back to
+ * PATH. It must be a regular file whose real path is inside the slot root; a virtualenv interpreter may instead be a
+ * link to one outside every guarded directory. The same name rules apply as everywhere (no shells, node or npm,
+ * `.exe`/`.com` only on win32). On Windows the Node tools in `node_modules\.bin` are `.cmd`/`.ps1` shims, which are not
+ * executables here, so only Python `.exe` files (the virtualenv's `Scripts`) are taken from the slot on that platform;
+ * on POSIX the `.bin` entries are links to the package scripts and are taken. Absolute paths, names not found there, and every work root that is not
+ * a slot fall through unchanged.
  */
 function slotToolExecutable(program: string, slotEnv: SlotEnv | null, host: RunHost, guards: () => readonly string[]): string | undefined {
   if (slotEnv === null || !/^[A-Za-z0-9_][A-Za-z0-9_.+-]{0,99}$/.test(program)) return undefined;
@@ -449,6 +465,7 @@ function slotToolExecutable(program: string, slotEnv: SlotEnv | null, host: RunH
     const linkedOut = !inSlot && P.basename(dir).toLowerCase() !== ".bin" && !insideAny(file.real, guards());
     if (!inSlot && !linkedOut) continue;
     if (!insideAny(file.found, [slotEnv.root])) continue;
+    if (!matchesSnapshot(file.found, slotEnv.bins, host.platform)) continue;
     refuseProgramStem(stemOf(program), program);
     refuseProgramStem(stemOf(file.real), program);
     if (win && (!/\.(exe|com)$/i.test(file.found) || !/\.(exe|com)$/i.test(file.real))) continue;

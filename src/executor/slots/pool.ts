@@ -8,13 +8,14 @@ import { posix, win32 } from "node:path";
 import { CLEANUP_RETRIES, CLEANUP_RETRY_BASE_MS, TRANSIENT_FS_CODES, isStrictlyInside } from "../../verify/reference";
 import type { GitOps } from "../git";
 import { ExecutorError, GIT_ID_PATTERN, PLAN_ID_PATTERN } from "../types";
-import type { Clock, ExecutorConfig, FileSystem, PlanId, SlotLease, SlotPool, SlotRecord } from "../types";
+import type { Clock, FileSystem, PlanId, SlotLease, SlotPool, SlotRecord } from "../types";
 import { registerSlot, unregisterSlot } from "./env";
-import { DEPENDENCY_DIRS, detectManagers, needsProvision } from "./provision";
+import type { SlotBin } from "./env";
+import { DEPENDENCY_DIRS, SLOT_SWEEP_MAX_ENTRIES, needsProvision } from "./provision";
 import type { Detection, Provisioner } from "./provision";
 
 export const UNKNOWN_PLAN_GC_AGE_MS = 7 * 24 * 3_600_000;
-export const SLOT_SWEEP_MAX_ENTRIES = 2_000_000; // confirm with M10
+export { SLOT_SWEEP_MAX_ENTRIES }; // one cap, defined next to the provisioner's own sweep
 export const SLOT_RM_BUDGET_MS = 120_000; // per slot, confirm with M7
 export const RESET_RETRY_DELAY_MS = 2_000;
 export const SLOT_NAME_PATTERN = /^(?:slot-[1-9][0-9]{0,2}|integration|ci)$/;
@@ -34,14 +35,9 @@ export interface SlotPoolDeps {
   maxParallel: number; git: GitOps; fs: FileSystem; clock: Clock; provisioner: Provisioner;
   platform?: NodeJS.Platform; logger?: { warn(m: string): void };
   onProvision?: (slot: string, managers: readonly string[]) => void; // test and smoke hook
-  /**
-   * `executor.provision` / `executor.python`, used for manager detection (the provisioner holds its own copy for the steps).
-   * Default `{provision:"auto", python:"auto"}`. Not in memo 4: detection needs it and the pool had no other way to get it.
-   */
-  config?: Pick<ExecutorConfig, "provision" | "python">;
 }
 
-type GcDeps = Omit<SlotPoolDeps, "planId" | "maxParallel" | "provisioner" | "onProvision" | "config">;
+type GcDeps = Omit<SlotPoolDeps, "planId" | "maxParallel" | "provisioner" | "onProvision">;
 
 // ---------------------------------------------------------------------------------------------------------------
 // Pure helpers
@@ -102,6 +98,46 @@ function compareSlots(a: string, b: string): number {
 function timeOf(iso: string): number {
   const t = Date.parse(iso);
   return Number.isNaN(t) ? 0 : t;
+}
+
+/** A `.produced` sidecar: a JSON array of clean exclusions (each 1-400 characters, no newline). */
+function parseStringArray(text: string | null): string[] | null {
+  if (text === null) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    // A torn or foreign file is treated like a missing one; the caller warns.
+    return null;
+  }
+  if (!Array.isArray(value)) return null;
+  const out: string[] = [];
+  for (const item of value as unknown[]) {
+    if (typeof item !== "string" || item.length === 0 || item.length > 400 || item.includes("\n")) return null;
+    out.push(item);
+  }
+  return out;
+}
+
+/** A `.bins` sidecar: a JSON array of `{path, size, mtimeMs}`. */
+function parseBins(text: string | null): SlotBin[] | null {
+  if (text === null) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    // A torn or foreign file is treated like a missing one; the caller warns.
+    return null;
+  }
+  if (!Array.isArray(value)) return null;
+  const out: SlotBin[] = [];
+  for (const item of value as unknown[]) {
+    if (!isPlainRecord(item)) return null;
+    const { path, size, mtimeMs } = item;
+    if (typeof path !== "string" || path.length === 0 || typeof size !== "number" || typeof mtimeMs !== "number") return null;
+    out.push({ path, size, mtimeMs });
+  }
+  return out;
 }
 
 function cloneRecord(r: SlotRecord): SlotRecord {
@@ -245,15 +281,26 @@ async function removeFile(x: FileCtx, p: string): Promise<void> {
   }
 }
 
+/** Sidecars beside a marker: `<slot>.produced` (the keep list) and `<slot>.bins` (the executable snapshot, QA-2.4-27). */
+const SIDECAR_EXTENSIONS: readonly string[] = ["produced", "bins"];
+
+function sidecarPath(markersDir: string, planId: PlanId, slot: string, extension: string): string {
+  return markerPath(markersDir, planId, slot).replace(/\.json$/, `.${extension}`);
+}
+
 /** Temp file with fsync, rename, then fsyncDir (memo 3). */
 async function writeMarkerFile(x: FileCtx, rec: SlotRecord): Promise<void> {
-  const api = pathApi(x.platform);
-  const final = markerPath(x.markersDir, rec.planId, rec.slot);
-  const dir = api.dirname(final);
   const text = `${JSON.stringify(rec)}\n`;
   if (Buffer.byteLength(text, "utf8") > MARKER_MAX_BYTES) {
     throw new ExecutorError("E_SLOT_BROKEN", `the marker of ${rec.slot} would exceed ${MARKER_MAX_BYTES} bytes`, { slot: rec.slot });
   }
+  await writeAtomic(x, markerPath(x.markersDir, rec.planId, rec.slot), text);
+}
+
+/** The marker's atomic write for any file in the plan's marker directory. */
+async function writeAtomic(x: FileCtx, final: string, text: string): Promise<void> {
+  const api = pathApi(x.platform);
+  const dir = api.dirname(final);
   await mkdirp(x.fs, dir, x.platform);
   const tmp = `${final}.${x.clock.randomHex(8)}.tmp`;
   await x.fs.writeText(tmp, text, { exclusive: true, fsync: true });
@@ -293,6 +340,34 @@ async function readMarkerFile(x: FileCtx, file: string): Promise<MarkerRead> {
   }
   if (!isSlotRecord(value)) return { ok: false, reason: "not a slot record", missing: false };
   return { ok: true, rec: value };
+}
+
+async function writeSidecar(x: FileCtx, planId: PlanId, slot: string, extension: string, text: string): Promise<void> {
+  if (Buffer.byteLength(text, "utf8") > MARKER_MAX_BYTES) {
+    throw new ExecutorError("E_SLOT_BROKEN", `the .${extension} file of ${slot} would exceed ${MARKER_MAX_BYTES} bytes`, { slot });
+  }
+  await writeAtomic(x, sidecarPath(x.markersDir, planId, slot, extension), text);
+}
+
+/** The text of a sidecar, or null when it is missing, not a regular file, too large or unreadable (a warning for the last three). */
+async function readSidecar(x: FileCtx, planId: PlanId, slot: string, extension: string): Promise<string | null> {
+  const file = sidecarPath(x.markersDir, planId, slot, extension);
+  const st = await x.fs.lstat(file);
+  if (st === null) return null;
+  if (st.kind !== "file" || st.size > MARKER_MAX_BYTES) {
+    x.logger?.warn(`ignoring ${file}: not a regular file of at most ${MARKER_MAX_BYTES} bytes`);
+    return null;
+  }
+  try {
+    return await x.fs.readText(file);
+  } catch (error) {
+    if (errorCode(error) !== "ENOENT") x.logger?.warn(`could not read ${file}: ${messageOf(error)}`);
+    return null;
+  }
+}
+
+async function removeSidecar(x: FileCtx, planId: PlanId, slot: string, extension: string): Promise<void> {
+  await removeFile(x, sidecarPath(x.markersDir, planId, slot, extension));
 }
 
 async function readdirOrEmpty(fs: FileSystem, dir: string): Promise<string[]> {
@@ -343,6 +418,7 @@ async function deleteMarker(x: FileCtx, rec: SlotRecord): Promise<void> {
   const file = markerPath(x.markersDir, rec.planId, rec.slot);
   const dir = api.dirname(file);
   await removeFile(x, file);
+  for (const extension of SIDECAR_EXTENSIONS) await removeSidecar(x, rec.planId, rec.slot, extension);
   await x.fs.fsyncDir(dir);
   try {
     if ((await readdirOrEmpty(x.fs, dir)).length === 0) await x.fs.rm(dir, { recursive: false });
@@ -601,6 +677,12 @@ export async function gcSlots(
 
 type ClaimMode = "same" | "reset" | "create" | "recreate";
 
+type StageRecord = SlotRecord & { state: "creating" | "provisioning" | "resetting" };
+
+function isStage(rec: SlotRecord): rec is StageRecord {
+  return rec.state === "creating" || rec.state === "provisioning" || rec.state === "resetting";
+}
+
 interface AcquireSpec {
   kind: SlotRecord["kind"];
   owner: string;
@@ -619,7 +701,6 @@ function keepFor(managers: readonly string[], yarnBerry: boolean): string[] {
 export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<void>; close(): void } {
   const platform = d.platform ?? process.platform;
   const api = pathApi(platform);
-  const config = d.config ?? { provision: "auto" as const, python: "auto" as const };
   const logger = d.logger;
   const fileCtx: FileCtx = {
     fs: d.fs, clock: d.clock, markersDir: d.markersDir, platform,
@@ -637,6 +718,8 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
   const abort = new AbortController();
   /** Paths provisioning produced besides the dependency dirs (for example `*.egg-info`), per slot: kept by every clean. */
   const produced = new Map<string, string[]>();
+  /** The executable snapshot of each provisioned slot (path, size, mtime), registered with the slot environment. */
+  const binsOf = new Map<string, SlotBin[]>();
 
   const slotLock = (slot: string): Mutex => {
     let m = slotLocks.get(slot);
@@ -684,7 +767,7 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
   }
 
   function syncEnv(rec: SlotRecord): void {
-    if (rec.managers.length > 0) registerSlot({ root: rec.path, managers: rec.managers });
+    if (rec.managers.length > 0) registerSlot({ root: rec.path, managers: rec.managers, bins: binsOf.get(rec.slot) ?? [] });
     else unregisterSlot(rec.path);
   }
 
@@ -741,17 +824,61 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
     return [...keepFor(rec.managers, berry), ...(produced.get(rec.slot) ?? [])];
   }
 
-  /** Right after an install the slot was clean, so whatever `clean -x` would now delete besides the kept dirs was produced by it. */
+  /**
+   * Right after an install the slot was clean, so whatever `clean -x` would now delete besides the kept dirs was produced by it.
+   * The list is also written beside the marker (`<slot>.produced`, QA-2.4-25), so a later process keeps the same paths.
+   */
   async function recordProduced(rec: SlotRecord, managers: readonly string[]): Promise<void> {
     const berry = managers.includes("yarn") && await d.fs.lstat(api.join(rec.path, ".yarnrc.yml")) !== null;
     const listed = await d.git.cleanPreview(rec.path, keepFor(managers, berry));
-    produced.set(rec.slot, listed.map((p) => `/${p.replace(/\/+$/, "").replace(/[\\*?[\]]/g, "\\$&")}`));
+    const patterns = listed.map((p) => `/${p.replace(/\/+$/, "").replace(/[\\*?[\]]/g, "\\$&")}`);
+    await writeSidecar(fileCtx, rec.planId, rec.slot, "produced", `${JSON.stringify(patterns)}\n`);
+    produced.set(rec.slot, patterns);
+  }
+
+  /** The executables the install left in the slot's tool directories: the only files router_run takes from the slot (QA-2.4-27). */
+  async function recordBins(rec: SlotRecord, managers: readonly string[]): Promise<void> {
+    const dirs: string[] = [];
+    if (managers.some((m) => PYTHON_MANAGER_NAMES.includes(m))) dirs.push(api.join(rec.path, ".venv", platform === "win32" ? "Scripts" : "bin"));
+    if (managers.some((m) => NODE_MANAGER_NAMES.includes(m))) dirs.push(api.join(rec.path, "node_modules", ".bin"));
+    const bins: SlotBin[] = [];
+    for (const dir of dirs) {
+      for (const name of await readdirOrEmpty(d.fs, dir)) {
+        const file = api.join(dir, name);
+        const st = await d.fs.lstat(file);
+        if (st !== null && (st.kind === "file" || st.kind === "symlink")) bins.push({ path: file, size: st.size, mtimeMs: st.mtimeMs });
+      }
+    }
+    await writeSidecar(fileCtx, rec.planId, rec.slot, "bins", `${JSON.stringify(bins)}\n`);
+    binsOf.set(rec.slot, bins);
+  }
+
+  /** The slot has no install (no managers, retired, recreated): forget what the previous one produced. */
+  async function clearProvisioned(rec: SlotRecord): Promise<void> {
+    produced.delete(rec.slot);
+    binsOf.delete(rec.slot);
+    for (const extension of SIDECAR_EXTENSIONS) await removeSidecar(fileCtx, rec.planId, rec.slot, extension);
   }
 
   async function install(rec: SlotRecord, detection: Detection, fresh: boolean): Promise<void> {
     await d.provisioner.provision(rec.path, detection, { fresh, signal: abort.signal });
     await recordProduced(rec, detection.managers);
+    await recordBins(rec, detection.managers);
     d.onProvision?.(rec.slot, detection.managers);
+  }
+
+  /** `open()`: the sidecars of a slot that has managers; an unreadable or malformed one is ignored with a warning. */
+  async function restoreProvisioned(rec: SlotRecord): Promise<void> {
+    if (rec.managers.length === 0) {
+      await clearProvisioned(rec);
+      return;
+    }
+    const keep = parseStringArray(await readSidecar(fileCtx, rec.planId, rec.slot, "produced"));
+    if (keep === null) logger?.warn(`slot ${rec.slot}: no usable .produced file; build outputs are not kept by a clean`);
+    else produced.set(rec.slot, keep);
+    const bins = parseBins(await readSidecar(fileCtx, rec.planId, rec.slot, "bins"));
+    if (bins === null) logger?.warn(`slot ${rec.slot}: no usable .bins file; router_run falls back to PATH for this slot`);
+    else binsOf.set(rec.slot, bins);
   }
 
   /** Re-detects and, on drift (memo 4.4), writes `provisioning` and installs. The returned record is not yet saved with the new digests. */
@@ -760,6 +887,7 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
     if (!needsProvision(rec, detection)) return { rec, drifted: false };
     const prov = await save({ ...rec, state: "provisioning" });
     if (detection.managers.length > 0) await install(prov, detection, true);
+    else await clearProvisioned(prov);
     return { rec: { ...prov, managers: [...detection.managers], manifests: { ...detection.manifests } }, drifted: true };
   }
 
@@ -767,6 +895,7 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
     const prov = rec.state === "provisioning" ? rec : await save({ ...rec, state: "provisioning" });
     const detection = await detectFor(prov);
     if (detection.managers.length > 0) await install(prov, detection, fresh);
+    else await clearProvisioned(prov);
     const done = await save({
       ...prov, managers: [...detection.managers], manifests: { ...detection.manifests },
       state: prov.owner === null ? "ready" : "leased",
@@ -799,6 +928,7 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
       } else {
         await retireSlot(retireCtx, rec, Number.POSITIVE_INFINITY, d.slotsDir);
         records.delete(rec.slot);
+        await clearProvisioned(rec);
         await save({ ...rec, state: "creating" });
       }
     }
@@ -865,19 +995,22 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
   }
 
   /** Runs the stage the marker is in, from its start (also the repair of an interrupted stage, memo 4.1). */
-  async function driveStage(rec: SlotRecord, firstRun: boolean): Promise<SlotRecord> {
+  async function driveStage(rec: StageRecord, firstRun: boolean): Promise<SlotRecord> {
     switch (rec.state) {
       case "creating":
         return stageCreate(rec, firstRun);
       case "provisioning":
         await d.git.verifySlotPointers(rec.path);
         return stageProvision(rec, true);
-      // The callers (work, reset) only pass creating, provisioning and resetting: work() has already returned or thrown
-      // for leased, broken and retired and turned ready into resetting, and reset() rejects every other state.
       case "resetting":
-      default:
         return stageReset(rec);
     }
+  }
+
+  /** The destructive reset must never run for a state that is not a stage (QA-2.4-29): the type says so, this checks it. */
+  function staged(rec: SlotRecord): StageRecord {
+    if (isStage(rec)) return rec;
+    throw new ExecutorError("E_SLOT_BROKEN", `slot ${rec.slot} is ${rec.state}, not in a stage`, { slot: rec.slot, state: rec.state });
   }
 
   // ---- acquire ----------------------------------------------------------------------------------------------
@@ -922,6 +1055,7 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
     if (broken !== undefined) {
       unregisterSlot(broken.path);
       await save({ ...broken, state: "retired", owner: null });
+      await clearProvisioned(broken);
       return createNewTaskSlot(owner, base);
     }
     throw unavailable();
@@ -958,6 +1092,7 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
         unregisterSlot(rec.path);
         await retireSlot(retireCtx, rec, Number.POSITIVE_INFINITY, d.slotsDir);
         records.delete(slot);
+        await clearProvisioned(rec);
         rec = await save(newRecord(slot, spec.owner, spec.base));
         firstRun = true;
       } else if (rec.state === "ready") {
@@ -976,7 +1111,7 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
         // A special slot is leased at its current HEAD; the queue resets it afterwards.
         rec = await save({ ...rec, commit: await d.git.revParse(rec.path, "HEAD") });
       }
-      return leaseOf(await driveStage(rec, firstRun));
+      return leaseOf(await driveStage(staged(rec), firstRun));
     } catch (error) {
       throw await failStage(slot, error);
     }
@@ -1010,9 +1145,9 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
         throw new ExecutorError("E_INVALID_INPUT", `slot ${slot} is ${rec.state}, not leased`, { slot, state: rec.state });
       }
       try {
-        if (rec.state === "creating" || rec.state === "provisioning") rec = await driveStage(rec, false);
+        if (rec.state === "creating" || rec.state === "provisioning") rec = await driveStage(staged(rec), false);
         const resetting = await save({ ...rec, state: "resetting", commit: oid });
-        await driveStage(resetting, false);
+        await driveStage(staged(resetting), false);
       } catch (error) {
         throw await failStage(slot, error);
       }
@@ -1111,6 +1246,7 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
         continue;
       }
       records.set(rec.slot, rec);
+      if (rec.state !== "retired") await restoreProvisioned(rec);
       if (rec.state === "ready" || rec.state === "leased") syncEnv(rec);
     }
     opened = true;
@@ -1130,21 +1266,25 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
   async function gc(isFinished: (planId: PlanId) => Promise<boolean | null>): Promise<{ removed: string[]; reported: string[] }> {
     assertOpen();
     // A gc that is about to collect this very plan closes the pool first: no new acquire, and provisioning in flight stops.
-    let ownFinished = false;
+    // The answer is asked once and reused for this plan below (QA-2.4-26): `false` means gcSlots will not touch this plan's slots.
+    let ownAnswer: boolean | null | undefined;
     try {
-      ownFinished = (await isFinished(d.planId)) === true;
+      ownAnswer = await isFinished(d.planId);
     } catch (error) {
       logger?.warn(`gc: could not tell whether plan ${d.planId} is finished: ${messageOf(error)}`);
     }
-    if (ownFinished) close();
+    if (ownAnswer === true) close();
+    const asked = (planId: PlanId): Promise<boolean | null> =>
+      planId === d.planId && ownAnswer !== undefined ? Promise.resolve(ownAnswer) : isFinished(planId);
     return poolLock.run(() => {
-      // Under the mutex of every slot of this plan, so no acquire, reset or clean runs on a slot while it is deleted.
-      const mine = [...records.keys()].sort(compareSlots);
+      // Under the mutex of every slot of this plan, so no acquire, reset or clean runs on a slot while it is deleted;
+      // an unfinished plan keeps its slots, so a gc of other plans must not wait for its running work.
+      const mine = ownAnswer === false ? [] : [...records.keys()].sort(compareSlots);
       const collect = async (): Promise<{ removed: string[]; reported: string[] }> => {
         const out = await gcSlots({
           repoKey: d.repoKey, toplevel: d.toplevel, slotsDir: d.slotsDir, markersDir: d.markersDir, executorHome: d.executorHome,
           git: d.git, fs: d.fs, clock: d.clock, platform, ...(logger === undefined ? {} : { logger }),
-        }, isFinished);
+        }, asked);
         for (const rec of [...records.values()]) {
           const read = await readMarkerFile(fileCtx, markerPath(d.markersDir, rec.planId, rec.slot));
           if (read.ok) {
@@ -1153,6 +1293,8 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
           } else if (read.missing) {
             records.delete(rec.slot);
             unregisterSlot(rec.path);
+            produced.delete(rec.slot);
+            binsOf.delete(rec.slot);
           }
         }
         return out;
