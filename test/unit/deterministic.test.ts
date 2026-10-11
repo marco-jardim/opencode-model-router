@@ -1100,12 +1100,12 @@ describe("runDeterministic — per-check placements (P2.4)", () => {
     const off = { ...resolveVerifyBudget(undefined, { cores: 8 }), failureRecheck: false };
     await runDeterministic(
       makeDoD([{ kind: "testsPass", command: "npm test" }, { kind: "testsPass", command: "npm test" }]),
-      makeDeps({ testsPass: hook.fn, budget: off, reference: { kind: "disabled" }, placements: [foreign, here] }),
+      makeDeps({ testsPass: hook.fn, budget: off, reference: { kind: "disabled" }, placements: [{ ...foreign, scope: "full" }, here] }),
     );
     expect(hook.requests[0]?.reference.kind).toBe("none");
     expect(hook.requests[1]?.reference).toEqual({ kind: "disabled" });
     const refs = testsPassHook();
-    await runDeterministic(makeDoD([{ kind: "testsPass", command: "npm test" }]), makeDeps({ testsPass: refs.fn, placements: [foreign] }));
+    await runDeterministic(makeDoD([{ kind: "testsPass", command: "npm test" }]), makeDeps({ testsPass: refs.fn, placements: [{ ...foreign, scope: "full" }] }));
     expect(refs.requests[0]?.reference).toMatchObject({ kind: "none" });
   });
 
@@ -1113,12 +1113,97 @@ describe("runDeterministic — per-check placements (P2.4)", () => {
     const failures: string[] = [];
     const verdict = await runDeterministic(
       makeDoD([{ kind: "run", command: "node check.js" }, { kind: "testsPass", command: "npm test" }]),
-      makeDeps({ testsPass: testsPassHook().fn, onFailure: r => failures.push(r), placements: [foreign, foreign] }),
+      makeDeps({ testsPass: testsPassHook().fn, onFailure: r => failures.push(r), placements: [foreign, { ...foreign, scope: "full" }] }),
     );
     expect(verdict.outcome).toBe("pass");
     expect(verdict.pass).toBe(true);
     expect(verdict.reasons).toEqual(["all 2 deterministic checks passed"]);
     expect(failures).toEqual([]);
+  });
+
+  describe("a foreign testsPass / lintClean must use scope=full (design cross-repo.md)", () => {
+    const reasonOf = (n: number, kind: string): string =>
+      `check ${n} (${kind}) runs in another repository (${OTHER}) and must use scope=full: affected tests cannot be attributed to a change in the work root`;
+
+    it("foreign testsPass without scope: unverifiable, the tests hook is not called, onFailure is not called", async () => {
+      const hook = testsPassHook();
+      const failures: string[] = [];
+      const verdict = await runDeterministic(
+        makeDoD([{ kind: "testsPass", command: "npm test" }]),
+        makeDeps({ testsPass: hook.fn, onFailure: r => failures.push(r), placements: [foreign] }),
+      );
+      expect(verdict.outcome).toBe("unverifiable");
+      expect(verdict.pass).toBe(false);
+      expect(verdict.reasons).toEqual([reasonOf(1, "testsPass")]);
+      expect(verdict.caveats).toEqual([reasonOf(1, "testsPass")]);
+      expect(hook.requests).toEqual([]);
+      expect(failures).toEqual([]);
+    });
+
+    it("foreign testsPass with scope=affected: the same", async () => {
+      const hook = testsPassHook();
+      const verdict = await runDeterministic(
+        makeDoD([{ kind: "run", command: "node a.js" }, { kind: "testsPass", command: "npm test" }]),
+        makeDeps({ testsPass: hook.fn, placements: [undefined, { ...foreign, scope: "affected" }] }),
+      );
+      expect(verdict.outcome).toBe("unverifiable");
+      expect(verdict.reasons).toEqual([reasonOf(2, "testsPass")]);
+      expect(hook.requests).toEqual([]);
+    });
+
+    it("foreign lintClean without full: unverifiable, nothing runs", async () => {
+      const execCwds: (string | undefined)[] = [];
+      const verdict = await runDeterministic(
+        makeDoD([{ kind: "lintClean", command: "npx eslint ." }, { kind: "lintClean", command: "npx eslint ." }]),
+        makeDeps({
+          exec: async (_c, opts) => { execCwds.push(opts?.cwd); return { code: 0, stdout: "", stderr: "" }; },
+          placements: [foreign, { ...foreign, scope: "affected" }],
+        }),
+      );
+      expect(verdict.outcome).toBe("unverifiable");
+      expect(verdict.reasons).toEqual([reasonOf(1, "lintClean"), reasonOf(2, "lintClean")]);
+      expect(execCwds).toEqual([]);
+    });
+
+    it("foreign testsPass and lintClean with scope=full run", async () => {
+      const hook = testsPassHook();
+      const execCwds: (string | undefined)[] = [];
+      const verdict = await runDeterministic(
+        makeDoD([{ kind: "testsPass", command: "npm test" }, { kind: "lintClean", command: "npx eslint ." }]),
+        makeDeps({
+          testsPass: hook.fn,
+          exec: async (_c, opts) => { execCwds.push(opts?.cwd); return { code: 0, stdout: "", stderr: "" }; },
+          placements: [{ ...foreign, scope: "full" }, { ...foreign, scope: "full" }],
+        }),
+      );
+      expect(verdict.outcome).toBe("pass");
+      expect(hook.requests.map(r => r.cwd)).toEqual([OTHER]);
+      expect(execCwds).toEqual([OTHER]);
+    });
+
+    it("a non-foreign testsPass without scope runs as today", async () => {
+      const hook = testsPassHook();
+      const verdict = await runDeterministic(
+        makeDoD([{ kind: "testsPass", command: "npm test" }, { kind: "testsPass", command: "npm test" }, { kind: "testsPass", command: "npm test" }]),
+        makeDeps({ testsPass: hook.fn, placements: [here, home, undefined] }),
+      );
+      expect(verdict.outcome).toBe("pass");
+      expect(hook.requests).toHaveLength(3);
+    });
+
+    it("foreign buildPasses, run, fileExists without scope are unchanged", async () => {
+      const s = spies();
+      const verdict = await runDeterministic(
+        makeDoD([
+          { kind: "buildPasses", command: "npm run build" },
+          { kind: "run", command: "node check.js" },
+          { kind: "fileExists", path: "a.txt" },
+        ]),
+        makeDeps({ ...s.deps, placements: [foreign, foreign, foreign] }),
+      );
+      expect(verdict.outcome).toBe("pass");
+      expect(s.execCwds).toEqual([OTHER, OTHER]);
+    });
   });
 
   it("a non-foreign placement failure behaves as without a placement (onFailure called, outcome fail)", async () => {

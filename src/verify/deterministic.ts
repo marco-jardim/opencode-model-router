@@ -1680,6 +1680,17 @@ export async function runDeterministic(dod: DoD, deps: DeterministicDeps): Promi
       ? { ...deps, cwd: placement.cwd, ...(placement.foreign ? { reference: { kind: "none", reason: FOREIGN_REFERENCE_NONE } satisfies ReferenceState } : {}) }
       : deps;
 
+    // A test or lint check in a consumer repository must use scope=full: the change under verification is in the work root, so
+    // an affected-only run cannot be attributed to it. Unverifiable without running; never a recorded failure.
+    if (placement?.foreign === true && (check.kind === "testsPass" || check.kind === "lintClean") && placement.scope !== "full") {
+      results.push({
+        ok: false,
+        unverifiable: true,
+        reason: `check ${index + 1} (${check.kind}) runs in another repository (${placement.cwd}) and must use scope=full: affected tests cannot be attributed to a change in the work root`,
+      });
+      continue;
+    }
+
     switch (check.kind) {
       case "fileExists":
         result = await runFileExists(check, cd);
