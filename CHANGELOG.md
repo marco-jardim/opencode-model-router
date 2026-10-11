@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Checks in other repositories (OpenCode v2, roles mode) (#107).** A check of the `[acceptance]` block can run in
+  another repository of the read set: `check: testsPass cwd="<repo>" scope=full`. A relative `cwd=` stays inside the
+  work root; an absolute one must be in the read set; one outside it, or a `scope=` that is neither `affected` nor
+  `full`, is unverifiable and nothing runs. Changes are always captured in the work root; a change that no check root
+  covers is unverifiable (`is not covered by any check root`). A `testsPass` or `lintClean` check in another repository
+  must use `scope=full`; its failure there is unverifiable, never a fail, and it gets no reference. A working-set
+  worktree whose `node_modules` links into the work root is a consumer: a pass with a change and no tests, build, lint
+  or run check placed in it is UNVERIFIED, with the suggested check line. A link target pinned at dispatch and
+  unchanged since keeps the reference exact (link pins). A tier dispatch on v2 refuses a per-check `cwd=`
+  (`a per-check cwd= is honoured only in roles mode`); `scope=` alone is ignored; v1 ignores both keys. A dispatch with
+  per-check keys is verified synchronously, never deferred. The configured roles protocol (`routing.repoParents`)
+  teaches the syntax.
 - README: 90-second demo video below the title.
 - **Cross-repo work in roles mode (OpenCode v2; inert on v1) (#107).** New global-only keys `routing.repoParents`,
   `routing.repoDepth` (1–4, default 2) and `routing.repoExclude` name the directories whose repositories role

@@ -65,7 +65,7 @@ export function buildRolesProtocol(cfg: RouterConfig, roles: ReadonlyMap<string,
     : `For a command, ask the user or dispatch a tier agent explicitly.`;
   // Cross-repo (P1.7): one sentence, only when `routing.repoParents` is configured; otherwise the text is unchanged.
   const crossRepo = (cfg.routing?.repoParents?.length ?? 0) > 0
-    ? ` Cross-repo: name another repository with repo=<name> (and branch=<ref> when it has several worktrees) instead of root=; each dispatch edits one repository, and a role may read the others below routing.repoParents.`
+    ? ` Cross-repo: name another repository with repo=<name> (and branch=<ref> when it has several worktrees) instead of root=; each dispatch edits one repository, and a role may read the others below routing.repoParents. A check may run in another repository of the read set with cwd= and must then use scope=full, e.g. \`check: testsPass cwd="<repo>" scope=full\`.`
     : "";
   return [
     ROLES_PROTOCOL_HEADING,

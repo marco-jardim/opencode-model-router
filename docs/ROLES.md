@@ -315,6 +315,10 @@ more than one root shows its scope as a note, `verified scope: <W> (<branch> @ <
 repository without writers is marked `changed during the dispatch`. Such a dispatch is not deferred (reason
 `cross-repo`).
 
+- **Checks in other repositories.** A check may run in another repository of the read set with `cwd=` and `scope=full`
+  (`check: testsPass cwd="D:\git\app-a" scope=full`); the change is still captured in the work root. Syntax, refusals
+  and the consumer caveat are in [Checks in other repositories](./VERIFICATION.md#checks-in-other-repositories).
+
 **Limits.**
 
 - A worktree outside the parents (for example under `%TEMP%`) is admitted by rule 2, but the registered policy ends in

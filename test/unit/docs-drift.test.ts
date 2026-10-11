@@ -29,6 +29,7 @@ import { ROUTER_BUDGET_NOTE_PREFIX } from "../../src/router/prompts";
 import { authorityFloor, effectiveDetection, GRANT_NOTES } from "../../src/routing/roles/policy";
 import { REDISPATCH_WINDOW_MS, runSignal, SIGNAL_MASS_CAPS, SIGNAL_WEIGHTS } from "../../src/routing/outcomes/signals";
 import { CRITERIA_BUDGET_CHARS } from "../../src/verify/dod";
+import { FOREIGN_REFERENCE_NONE } from "../../src/verify/deterministic";
 import { RENDERED_REASONS_MAX } from "../../src/verify/dispatch";
 import { GRADER_REASONS_MAX } from "../../src/verify/checker";
 import { oneLineReason } from "../../src/routing/roles/authority";
@@ -1163,6 +1164,47 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     expect(unreleased).toContain("the `run` signal matches npm-script-form checks only");
     expect(unreleased).toContain("A role dispatch's acceptance checks run in its work root; a `cwd:` outside it is refused.");
     expect(unreleased).not.toContain("budgetUsed");
+  });
+
+  it("P2b.6: checks in other repositories — the texts of the code are in VERIFICATION.md, the protocol and the [Unreleased] entry", () => {
+    const verification = read("docs/VERIFICATION.md").replace(/\s+/g, " ");
+    const section = /## Checks in other repositories([\s\S]*?)\n## /.exec(read("docs/VERIFICATION.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
+    expect(section).not.toBe("");
+    const gate = read("src/verify/gate.ts");
+    const deterministic = read("src/verify/deterministic.ts");
+    // code-to-doc: each fragment is in the source that emits it AND in the section
+    const pinned: Array<[string, string]> = [
+      [gate, "a per-check cwd= is honoured only in roles mode; nothing ran"],
+      [gate, "is not affected or full; nothing ran"],
+      [gate, "and its read set; nothing ran"],
+      [gate, "is not covered by any check root ("],
+      [gate, "links this work root (node_modules/"],
+      [gate, "and no check ran there; add a check such as: check: testsPass cwd="],
+      [deterministic, "runs in another repository ("],
+      [deterministic, "and must use scope=full: affected tests cannot be attributed to a change in the work root"],
+      [deterministic, "failed; the change under verification is in the work root, so this failure can be neither excused nor attributed: "],
+    ];
+    for (const [source, fragment] of pinned) {
+      expect(source, fragment).toContain(fragment);
+      expect(section, fragment).toContain(fragment);
+    }
+    expect(section).toContain(`\`${FOREIGN_REFERENCE_NONE}\``);
+    // the user-facing syntax and the caveats of the section
+    for (const text of ["check: testsPass cwd=\"D:\\git\\app-a\" scope=full", "`scope=affected|full`", "A relative `cwd=` stays inside `W`", "must be inside `W` or in the read set",
+      "unverifiable** and nothing runs", "unverifiable, never a fail", "gets no reference", "UNVERIFIED", "never deferred", "A `scope=` alone is ignored there",
+      "On OpenCode v1 the keys are ignored", "(I2)", "(I3)", "gives no run signal"]) expect(section, text).toContain(text);
+    expect(read("docs/ROLES.md").replace(/\s+/g, " ")).toContain("(./VERIFICATION.md#checks-in-other-repositories)");
+    expect(verification).toContain("link pins");
+    // the configured protocol teaches cwd= / scope=full; the default one does not
+    const protocol = read("src/router/protocol.ts");
+    expect(protocol).toContain("A check may run in another repository of the read set with cwd= and must then use scope=full");
+    expect(protocol).toContain("check: testsPass cwd=\"<repo>\" scope=full");
+    // the changelog entry
+    const unreleased = /## \[Unreleased\]([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
+    for (const item of ["**Checks in other repositories (OpenCode v2, roles mode) (#107).**", "check: testsPass cwd=\"<repo>\" scope=full", "`is not covered by any check root`",
+      "never a fail", "is a consumer", "UNVERIFIED", "(link pins)", "`a per-check cwd= is honoured only in roles mode`", "verified synchronously, never deferred"]) {
+      expect(unreleased, item).toContain(item);
+    }
   });
 
   it("QA-P32-2: a missing d= is none, graders weigh half only when independent, run matching by entry name, R9(5), code map", () => {

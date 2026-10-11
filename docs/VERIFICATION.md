@@ -428,6 +428,28 @@ Which tools count:
 
 A non-empty change set carries no such caveat: the observed changes are checked as usual. The writers of a role lineage are folded across its attempts, so a carried attempt keeps the tally. The usual `strictUnverifiable` policy applies: accepted with a caveat by default, rejected when strict.
 
+## Checks in other repositories
+
+A role dispatch edits one repository, its work root `W`. A check of the `[acceptance]` block may still run in another repository of the read set, for example a consumer of `W`. Each check takes two optional keys:
+
+```text
+check: testsPass cwd="D:\git\app-a" scope=full
+```
+
+- **Syntax.** `cwd=<dir>` is where the check runs; `scope=affected|full` (case-insensitive) says whether `testsPass` and `lintClean` run on the affected files or in full. Roles mode on OpenCode v2 only.
+- **Where `cwd=` may point.** A relative `cwd=` stays inside `W`; one that leaves `W` is refused even when it lands in the read set. An absolute `cwd=` must be inside `W` or in the read set (see [Read set](./ROLES.md#repositories-below-parent-directories-cross-repo)). A check with only `scope=` runs where the block runs.
+- **Refusals.** The first offending check refuses the whole block: the verdict is **unverifiable** and nothing runs, whichever verifier the DoD names.
+  - `check <n> (<kind>) cwd=<text> is outside the work root <W> and its read set; nothing ran`
+  - `check <n> (<kind>) scope=<text> is not affected or full; nothing ran`
+- **Tier dispatches.** On OpenCode v2 a tier dispatch (no routed role) honours no per-check `cwd=`: it is unverifiable and nothing runs, `check <n> (<kind>) cwd=<text>: a per-check cwd= is honoured only in roles mode; nothing ran`. A `scope=` alone is ignored there. On OpenCode v1 the keys are ignored (v1 is in feature freeze).
+- **Changes are captured in `W`.** The change set is always the one observed in `W` (I2); a check in another repository does not move it. With placed checks, every changed path must lie inside some check root (the repository of a placed check, or `W` for an unplaced one); otherwise the verdict is unverifiable: `the change in <paths> is not covered by any check root (<roots>); nothing ran` (I3).
+- **A check in another repository.** `testsPass` and `lintClean` must use `scope=full`, because affected tests cannot be attributed to a change in `W`. Without it the check is unverifiable and does not run: `check <n> (<kind>) runs in another repository (<cwd>) and must use scope=full: affected tests cannot be attributed to a change in the work root`. A failure of any check in another repository is **unverifiable, never a fail**: `a check in another repository (<cwd>) failed; the change under verification is in the work root, so this failure can be neither excused nor attributed: <reason>`. Such a check gets no reference: `the check runs in another repository; the dispatch reference covers the work root only`.
+- **Consumers.** A working-set worktree whose `node_modules` links into `W` is a consumer of `W`. A pass with a change and no `testsPass`, `buildPasses`, `lintClean` or `run` check placed in the consumer is **UNVERIFIED**, with the check to add: `<name> at <root> links this work root (node_modules/<entry>) and no check ran there; add a check such as: check: testsPass cwd="<root>" scope=full`. A `fileExists` or `schemaMatch` check in the consumer does not count. An empty change set and a fail carry no such caveat.
+- **Synchronous verification.** A dispatch with per-check keys is verified at once, never deferred. This is interim until deferred verification supports the perimeter.
+- **No run signal.** A check with its own `cwd=` gives no run signal to the [outcome signals](./ROLES.md#outcome-signals).
+
+A link into a repository that was pinned at dispatch and has not changed since keeps the reference exact (link pins): it is not an `external-link`, see [Package links to outside code](#package-links-to-outside-code).
+
 ## `verify` config keys
 
 | key | default | notes |

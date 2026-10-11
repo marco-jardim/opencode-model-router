@@ -56,7 +56,7 @@ const GOLDEN = [
 
 /** P1.7: the configured protocol (`routing.repoParents` non-empty) is GOLDEN plus one sentence after the "Work root:" sentence. */
 const CROSS_REPO_SENTENCE =
-  "Cross-repo: name another repository with repo=<name> (and branch=<ref> when it has several worktrees) instead of root=; each dispatch edits one repository, and a role may read the others below routing.repoParents.";
+  "Cross-repo: name another repository with repo=<name> (and branch=<ref> when it has several worktrees) instead of root=; each dispatch edits one repository, and a role may read the others below routing.repoParents. A check may run in another repository of the read set with cwd= and must then use scope=full, e.g. `check: testsPass cwd=\"<repo>\" scope=full`.";
 const GOLDEN_CROSS_REPO = GOLDEN.replace(
   "and in ENVIRONMENT.\n",
   `and in ENVIRONMENT. ${CROSS_REPO_SENTENCE}\n`,
