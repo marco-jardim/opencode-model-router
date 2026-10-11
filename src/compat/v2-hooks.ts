@@ -40,8 +40,7 @@ import { ROUTER_BUDGET_NOTE_PREFIX } from "../router/prompts";
 import { parseReturnPrefix } from "../routing/outcomes/signals";
 import { lookupDispatch } from "../router/sessions";
 import { createSystemAugmenter } from "../routing/wire/hint";
-import { ROUTER_TURN_STATE_ATTACH } from "../index";
-import { createTurnStateRegistry, placeTurnState, TURN_STATE_ROOT, type TurnStateRegistry } from "./turn-state";
+import { createTurnStateRegistry, placeTurnState, ROUTER_TURN_STATE_ATTACH, TURN_STATE_ROOT, type TurnStateRegistry } from "./turn-state";
 import { CONTEXT7_DOC_TOOLS, evaluatePermission, permissionMatches, permissionRules, publishReadOnlyPermissions } from "../router/read-only";
 import { filterSensitiveGrep, isSensitivePath } from "../router/sensitive-paths";
 import { canonicalAuthorityPath, insideWorkRoot } from "../routing/roles/work-root";
@@ -747,9 +746,11 @@ export async function registerV2Hooks(
   // through the attach hook; the system augmenter registers the route hint; `buildContext` places the tail (root sessions only).
   const turnState = createTurnStateRegistry({ logger: ingestLogger, translate: v2Instructions });
   const attachTurnState = (hooks as unknown as Record<PropertyKey, unknown>)[ROUTER_TURN_STATE_ATTACH];
+  /** The plugin accepted the registry (its attach function returned `true`): only then does the tail carry the route hint. */
+  let turnStateAttached = false;
   if (typeof attachTurnState === "function") {
     try {
-      (attachTurnState as (registry: TurnStateRegistry) => void)(turnState);
+      turnStateAttached = (attachTurnState as (registry: TurnStateRegistry) => unknown)(turnState) === true;
     } catch (error) {
       ingestLogger.warn("[router] turn state: the plugin could not attach the registry", { error: String(error) });
     }
@@ -1042,7 +1043,11 @@ export async function registerV2Hooks(
   };
   /** P-3: role children whose catalog failure is already annotated for the parent's current call (cleared when it ends). */
   const catalogFailures = new Set<string>();
-  const systemAugmenter = createSystemAugmenter({ runtime: engine, getSession: sessionOf, logger: ingestLogger, turnState });
+  // The augmenter keeps the hint in the tail only when the plugin accepted the registry; otherwise (stub or spread hooks, a failed
+  // attach) nothing would render the tail's hint, so it takes the old system push.
+  const systemAugmenter = createSystemAugmenter({
+    runtime: engine, getSession: sessionOf, logger: ingestLogger, turnState: turnStateAttached ? turnState : undefined,
+  });
   let eventTask: Promise<void> | undefined;
   let disposed = false;
   const within = <T>(context: ToolContext, operation: () => Promise<T>): Promise<T> =>

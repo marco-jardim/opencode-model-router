@@ -147,7 +147,7 @@ describe("buildTurnState", () => {
     // 5000 + 1 + 969 + wrapper = 6001
     expect(`<router-state>\n${first}\n${second}\n</router-state>`.length).toBe(6001);
     const out = registry.buildTurnState("s")!;
-    expect(out).toBe(`<router-state>\n${first}\n… 1 more lines\n</router-state>`);
+    expect(out).toBe(`<router-state>\n${first}\n… 1 more line\n</router-state>`);
     expect(out.length).toBeLessThanOrEqual(6000);
   });
 
@@ -180,6 +180,23 @@ describe("buildTurnState", () => {
     // body: 4 lines of 2000 chars + a blank separator → only the first two lines and the blank separator fit.
     const out = registry.buildTurnState("s")!;
     expect(out).toBe(`<router-state>\n${"c".repeat(2000)}\n${"d".repeat(2000)}\n… 2 more lines\n</router-state>`);
+  });
+
+  it("trims a 20 000-line overflow in one pass, correctly and fast", () => {
+    const { registry } = setup();
+    const lines = Array.from({ length: 20_000 }, (_, i) => `row ${String(i).padStart(5, "0")}`);
+    registry.registerTurnStateProvider(provider("a", 1, lines.join("\n")));
+    const started = Date.now();
+    const out = registry.buildTurnState("s")!;
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(out.length).toBeLessThanOrEqual(TURN_STATE_MAX_CHARS);
+    const body = out.slice("<router-state>\n".length, -"\n</router-state>".length).split("\n");
+    const overflow = body.pop()!;
+    expect(body).toEqual(lines.slice(0, body.length));
+    expect(overflow).toBe(`… ${20_000 - body.length} more lines`);
+    // The longest prefix: one more kept line would exceed the bound.
+    const longer = `<router-state>\n${lines.slice(0, body.length + 1).join("\n")}\n… ${20_000 - body.length - 1} more lines\n</router-state>`;
+    expect(longer.length).toBeGreaterThan(TURN_STATE_MAX_CHARS);
   });
 
   it("falls back to the overflow line alone when not even one line fits", () => {
@@ -267,7 +284,7 @@ describe("buildTurnState", () => {
     // 2985 "@" translate to 5970 characters: only the translated text overflows.
     registry.registerTurnStateProvider(provider("a", 1, `${"a".repeat(100)}\n${"@".repeat(2985)}`));
     const out = registry.buildTurnState("s")!;
-    expect(out).toBe(`<router-state>\n${"a".repeat(100)}\n… 1 more lines\n</router-state>`);
+    expect(out).toBe(`<router-state>\n${"a".repeat(100)}\n… 1 more line\n</router-state>`);
     // And the translated text is what is kept when it fits.
     const small = setup((text) => text.toUpperCase());
     small.registry.registerTurnStateProvider(provider("a", 1, "hello"));
@@ -354,25 +371,40 @@ describe("placeTurnState", () => {
     expect(hints(messages)).toEqual([]);
   });
 
-  it("walks past a message with no text (a tool result) to the last text part", () => {
-    const toolResult: Msg = { role: "tool", content: [{ type: "tool-result", id: "t1" }] };
-    const messages = deepFreeze([user("ask"), { role: "assistant", content: [{ type: "text", text: "calling" }, { type: "tool-call", id: "t1" }] }, toolResult]);
+  it("hints the last part of a tool-result-only last message and never walks back to an earlier message", () => {
+    const messages = deepFreeze<Msg[]>([
+      user("ask"),
+      { role: "assistant", content: [{ type: "text", text: "calling" }, { type: "tool-call", id: "t1" }] },
+      { role: "tool", content: [{ type: "tool-result", id: "t1" }, { type: "tool-result", id: "t2" }] },
+    ]);
     const placed = placeTurnState(messages, "T", makeTail)!;
-    expect(hints(placed)).toEqual([{ message: 1, part: 0 }]);
-    expect(placed[2]).toBe(toolResult);
-    expect(placed[1]!.content[1]).toBe(messages[1]!.content[1]);
+    expect(hints(placed)).toEqual([{ message: 2, part: 1 }]);
+    expect(placed[2]!.content[1]).toEqual({ type: "tool-result", id: "t2", cache: { type: "ephemeral" } });
+    expect(placed[2]!.content[0]).toBe(messages[2]!.content[0]);
+    expect(placed[1]).toBe(messages[1]);
+    expect(hints(messages)).toEqual([]);
   });
 
-  it("skips empty text parts and non-string text", () => {
+  it("prefers the last visible text part of the last message over later non-text parts", () => {
     const messages = deepFreeze<Msg[]>([
       user("real"),
       { role: "user", content: [{ type: "text", text: "kept" }, { type: "text", text: "" }, { type: "text" }, { type: "image" }] },
-      { role: "user", content: [{ type: "text", text: "" }] },
     ]);
     const placed = placeTurnState(messages, "T", makeTail)!;
     expect(hints(placed)).toEqual([{ message: 1, part: 0 }]);
     expect(placed[1]!.content).toHaveLength(4);
-    expect(placed[2]).toBe(messages[2]);
+    expect(placed[0]).toBe(messages[0]);
+  });
+
+  it("treats whitespace-only text as no text (the host drops it) and hints the last part instead", () => {
+    const messages = deepFreeze<Msg[]>([
+      user("real"),
+      { role: "user", content: [{ type: "text", text: "kept" }, { type: "image" }, { type: "text", text: " \n\t " }] },
+    ]);
+    const placed = placeTurnState(messages, "T", makeTail)!;
+    expect(hints(placed)).toEqual([{ message: 1, part: 0 }]);
+    const onlyBlank = deepFreeze<Msg[]>([user("real"), { role: "user", content: [{ type: "text", text: "   " }] }]);
+    expect(hints(placeTurnState(onlyBlank, "T", makeTail)!)).toEqual([{ message: 1, part: 0 }]);
   });
 
   it("adds the tail with no hint when no message has any text", () => {
@@ -392,7 +424,7 @@ describe("placeTurnState", () => {
     const odd = { role: "user", content: "plain" } as unknown as Msg;
     const messages = deepFreeze([user("before"), odd]);
     const placed = placeTurnState(messages, "T", makeTail)!;
-    expect(hints(placed)).toEqual([{ message: 0, part: 0 }]);
+    expect(hints(placed)).toEqual([]);
     expect(placed[1]).toBe(odd);
     expect(placeTurnState([null as unknown as Msg], "T", makeTail)).toHaveLength(2);
   });

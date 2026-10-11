@@ -19,7 +19,8 @@ import type { Context } from "@opencode/plugin/promise/plugin";
 import type { Hooks } from "@opencode-ai/plugin";
 import { registerV2Hooks } from "../../src/compat/v2-hooks";
 import { TURN_STATE_MAX_CHARS, type TurnStateRegistry } from "../../src/compat/turn-state";
-import ModelRouterPlugin, { ROUTER_TURN_STATE_ATTACH } from "../../src/index";
+import { ROUTER_TURN_STATE_ATTACH } from "../../src/compat/turn-state";
+import ModelRouterPlugin from "../../src/index";
 import { invalidateConfigCache } from "../../src/router/config";
 import type { LateNotice, PendingRegistry } from "../../src/verify/pending";
 import type { DoD } from "../../src/verify/dod";
@@ -139,7 +140,7 @@ describe("v2 turn state goldens (Phase 1.2)", () => {
     Object.defineProperty(observed, ROUTER_TURN_STATE_ATTACH, {
       value: (attached: TurnStateRegistry) => {
         registry = attached;
-        (attach as (r: TurnStateRegistry) => void)(attached);
+        return (attach as (r: TurnStateRegistry) => unknown)(attached);
       },
     });
     const host = hostFixture();
@@ -280,7 +281,7 @@ describe("v2 turn state goldens (Phase 1.2)", () => {
     await expect(normalize(JSON.stringify(e.messages, null, 2))).toMatchFileSnapshot("__snapshots__/v2-turn-state.messages-user-text.json");
   });
 
-  it("v2-turn-state-messages-tool-result: the cache hint skips a tool result and lands on the last text before it (O12)", async () => {
+  it("v2-turn-state-messages-tool-result: the cache hint lands on the last part of a tool-result-only last message (O12)", async () => {
     const { hook } = await boot();
     register(1);
     const messages: Message[] = [
@@ -293,8 +294,9 @@ describe("v2 turn state goldens (Phase 1.2)", () => {
     await hook(e);
 
     expect(e.messages).toHaveLength(4);
-    expect(e.messages[1]?.content[0]?.cache).toEqual({ type: "ephemeral" });
-    expect(e.messages[2]).toBe(messages[2]);
+    expect(e.messages[2]?.content[0]?.cache).toEqual({ type: "ephemeral" });
+    expect(e.messages[1]).toBe(messages[1]);
+    expect(messages[2]?.content[0]).not.toHaveProperty("cache");
     await expect(normalize(JSON.stringify(e.messages, null, 2))).toMatchFileSnapshot("__snapshots__/v2-turn-state.messages-tool-result.json");
   });
 

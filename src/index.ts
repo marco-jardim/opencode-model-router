@@ -90,13 +90,7 @@ import { isAnnotationRow, verdictGraderOf, verdictOf, type LogRow } from "./rout
 import { createPersister, nodePersistDeps, summarizeRoles } from "./routing/outcomes";
 import { roleAgentSteps } from "./router/role-agents";
 import type { HostBudgetObservation } from "./compat/v2-hooks";
-import { TURN_STATE_ROOT, type TurnStateRegistry } from "./compat/turn-state";
-
-/**
- * Phase 1.2 (v2 only): the v2 adapter owns the turn-state registry and hands it to this plugin by calling the function
- * stored under this key on the returned hooks object (non-enumerable; absent on v1).
- */
-export const ROUTER_TURN_STATE_ATTACH: unique symbol = Symbol.for("router.turnState.attach");
+import { ROUTER_TURN_STATE_ATTACH, TURN_STATE_ROOT, type TurnStateRegistry } from "./compat/turn-state";
 import { checkpointLine, formatStatsReply, runStatsCommand } from "./routing/commands/stats";
 import { buildAnnotateDirectives } from "./routing/commands/annotate-plan";
 import { applyV1Roles, hasExplicitV1Roles, v1AgentInfos } from "./routing/commands/v1-roles";
@@ -374,6 +368,10 @@ interface LateBuffer {
   add(sessionID: string, notices: readonly LateNotice[]): void;
   list(sessionID: string): LateNotice[];
   release(sessionID: string, handles: readonly string[]): void;
+  /** Marks the session as most recently used (a render read its notices). */
+  touch(sessionID: string): void;
+  /** Drops the session's buffer (`session.deleted`). */
+  forget(sessionID: string): void;
 }
 
 function createLateBuffer(): LateBuffer {
@@ -396,6 +394,15 @@ function createLateBuffer(): LateBuffer {
       if (buffer === undefined) return;
       for (const handle of handles) buffer.delete(handle);
       if (buffer.size === 0) sessions.delete(sessionID);
+    },
+    touch(sessionID) {
+      const buffer = sessions.get(sessionID);
+      if (buffer === undefined) return;
+      sessions.delete(sessionID);
+      sessions.set(sessionID, buffer);
+    },
+    forget(sessionID) {
+      sessions.delete(sessionID);
     },
   };
 }
@@ -814,21 +821,22 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
   // Phase 1.2 (v2 only): the turn-state registry the adapter injects. Without it (v1, or a v2 host that injects none) nothing
   // below is registered or buffered, and the system transform keeps pushing the pending list and the late notices.
-  // The registry arrives either on the legacy ctx (tests) or through the ROUTER_TURN_STATE_ATTACH hook the v2 adapter calls.
+  // The registry arrives through the ROUTER_TURN_STATE_ATTACH hook the v2 adapter calls (the only channel); the hook
+  // returns whether the registry was accepted.
   let turnState: TurnStateRegistry | undefined;
   const lateBuffer: LateBuffer | undefined = isV2Host ? createLateBuffer() : undefined;
   const unregisterTurnStateProviders: Array<() => void> = [];
   let warnedSecondRegistry = false;
-  const attachTurnState = (registry: TurnStateRegistry): void => {
+  const attachTurnState = (registry: TurnStateRegistry): boolean => {
     if (turnState !== undefined) {
       if (turnState !== registry && !warnedSecondRegistry) {
         warnedSecondRegistry = true;
         logger.warn("[router] turn state: a second registry was ignored");
       }
-      return;
+      return turnState === registry;
     }
     turnState = registry;
-    if (lateBuffer === undefined) return;
+    if (lateBuffer === undefined) return true;
     try {
       // Late notices of background runs that did not pass: buffered before the block is built (a builder throw loses
       // nothing) and kept until router_verify answers their handle.
@@ -838,6 +846,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         render(sid) {
           if (background === undefined) return undefined;
           lateBuffer.add(sid, background.takeNotices(sid));
+          lateBuffer.touch(sid);
           return buildLateNoticeBlock(lateBuffer.list(sid));
         },
         active(sid) {
@@ -858,11 +867,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     } catch (error) {
       logger.warn("[router] turn state: late/pending providers not registered", { error: scrubText(String(error)) });
     }
+    return true;
   };
-  if (isV2Host) {
-    const injected = (ctx as RouterPluginInput & { routerTurnState?: TurnStateRegistry }).routerTurnState;
-    if (injected !== undefined) attachTurnState(injected);
-  }
 
   // Best-effort, secret-free delegate scorecard dump (counts only).
   const dumpDelegateScorecard = (
@@ -2763,6 +2769,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               if (key.startsWith(`${id}:`)) depthBanners.delete(key);
             }
             warnedNoCallID.delete(id);
+            lateBuffer?.forget(id);
             forgetRoleSession(id); // #84 P2.1 (the binding and authority registries are evicted by the v2 adapter)
             // 2.4.2b: a deleted orchestrator's handles, tombstones and lineage records go with it.
             // 2.4.5: so do its background requests and late notices; its run in flight is aborted.

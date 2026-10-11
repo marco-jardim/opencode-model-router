@@ -12,6 +12,14 @@ export const TURN_STATE_MAX_CHARS = 6000;
 /** The reserved provider name of the plan section (order 0..9 is reserved for it). */
 export const PLAN_PROVIDER_NAME = "plan";
 
+/**
+ * Phase 1.2 (v2 only): the v2 adapter owns the turn-state registry and hands it to the plugin by calling the function
+ * stored under this key on the returned hooks object (non-enumerable; absent on v1). It lives here, not in the plugin
+ * entry module, because that module must export only `default` (old v1 loaders call every export). The attach function
+ * returns `true` when the registry was accepted.
+ */
+export const ROUTER_TURN_STATE_ATTACH: unique symbol = Symbol.for("router.turnState.attach");
+
 /** Set on the legacy transform's output bag when the request belongs to a root session. */
 export const TURN_STATE_ROOT: unique symbol = Symbol("router.turnState.root");
 
@@ -116,16 +124,34 @@ export function createTurnStateRegistry(deps: TurnStateDeps): TurnStateRegistry 
 
       const planActive = providers.some((provider) => provider.name === PLAN_PROVIDER_NAME && isActive(provider, sid));
       const lines = body.split("\n");
-      const overflowLine = (from: number): string =>
-        `… ${lines.slice(from).filter((line) => line.trim() !== "").length} more lines${planActive ? PLAN_SUFFIX : ""}`;
-      for (let keep = lines.length - 1; keep > 0; keep--) {
-        const kept = lines.slice(0, keep);
-        while (kept.length > 0 && kept[kept.length - 1]!.trim() === "") kept.pop();
-        const out = OPEN + (kept.length > 0 ? kept.join("\n") + "\n" : "") + overflowLine(keep) + CLOSE;
-        if (out.length <= TURN_STATE_MAX_CHARS) return out;
+      const totalNonBlank = lines.filter((line) => line.trim() !== "").length;
+      const overflowLine = (remaining: number): string =>
+        `… ${remaining} more ${remaining === 1 ? "line" : "lines"}${planActive ? PLAN_SUFFIX : ""}`;
+      // One forward pass: the largest `keep` (lines kept before the overflow line) whose result fits the bound.
+      let best = 0;
+      let runLen = 0;
+      let keptLen = 0;
+      let hasKept = false;
+      let seenNonBlank = 0;
+      for (let i = 0; i < lines.length - 1; i++) {
+        const line = lines[i]!;
+        runLen = i === 0 ? line.length : runLen + 1 + line.length;
+        if (line.trim() !== "") {
+          seenNonBlank++;
+          keptLen = runLen;
+          hasKept = true;
+        }
+        const outLen = OPEN.length + (hasKept ? keptLen + 1 : 0) + overflowLine(totalNonBlank - seenNonBlank).length + CLOSE.length;
+        if (outLen <= TURN_STATE_MAX_CHARS) best = i + 1;
       }
-      // Worst case: the wrapper and the overflow line alone (a few dozen characters, always within the bound).
-      return OPEN + overflowLine(0) + CLOSE;
+      if (best === 0) {
+        // Worst case: the wrapper and the overflow line alone (a few dozen characters, always within the bound).
+        return OPEN + overflowLine(totalNonBlank) + CLOSE;
+      }
+      const kept = lines.slice(0, best);
+      while (kept.length > 0 && kept[kept.length - 1]!.trim() === "") kept.pop();
+      const remaining = lines.slice(best).filter((line) => line.trim() !== "").length;
+      return OPEN + (kept.length > 0 ? kept.join("\n") + "\n" : "") + overflowLine(remaining) + CLOSE;
     },
 
     hasActivity(sid) {
@@ -138,34 +164,41 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-/** The last non-empty text part of a message (also none for a message without a parts array). */
-function lastTextPart(message: unknown): { content: unknown[]; index: number; part: Record<string, unknown> } | undefined {
+/**
+ * The part that carries the cache hint: the last text part with visible text (the host drops whitespace-only text),
+ * else the last part of the message whatever its type (a tool-result-only message). None for a message without parts.
+ */
+function hintTarget(message: unknown): { content: unknown[]; index: number; part: Record<string, unknown> } | undefined {
   if (!isRecord(message) || !Array.isArray(message.content)) return undefined;
   const content: unknown[] = message.content;
   for (let index = content.length - 1; index >= 0; index--) {
     const part = content[index];
-    if (isRecord(part) && part.type === "text" && typeof part.text === "string" && part.text !== "") return { content, index, part };
+    if (isRecord(part) && part.type === "text" && typeof part.text === "string" && part.text.trim() !== "") return { content, index, part };
   }
-  return undefined;
+  const index = content.length - 1;
+  const last = content[index];
+  return isRecord(last) ? { content, index, part: last } : undefined;
 }
 
 /**
- * Appends the tail as a new last message and puts the one router cache hint on the last non-empty text part of the
- * last message that has one (the O12 walk). Pure: host messages, content arrays and parts are never mutated; the
- * changed message is a prototype-preserving copy. `undefined` tail → `undefined` (the caller leaves the messages alone).
+ * Appends the tail as a new last message and puts the one router cache hint on the last real message only: on its
+ * last non-blank text part, else on its last part (never on an earlier message, so a tool loop does not pin the
+ * breakpoint). Pure: host messages, content arrays and parts are never mutated; the changed message is a
+ * prototype-preserving copy. `undefined` tail → `undefined` (the caller leaves the messages alone).
  */
 export function placeTurnState<M>(messages: readonly M[], tail: string | undefined, makeTail: (text: string) => M): M[] | undefined {
   if (tail === undefined) return undefined;
   const next = messages.slice();
-  for (let i = next.length - 1; i >= 0; i--) {
-    const message = next[i];
-    const target = lastTextPart(message);
-    if (target === undefined) continue;
-    const content = target.content.slice();
-    content[target.index] = { ...target.part, cache: routerCacheHint() };
-    const copy: M = Object.assign(Object.create(Object.getPrototypeOf(message)), message, { content });
-    next[i] = copy;
-    break;
+  const lastIndex = next.length - 1;
+  if (lastIndex >= 0) {
+    const message = next[lastIndex];
+    const target = hintTarget(message);
+    if (target !== undefined) {
+      const content = target.content.slice();
+      content[target.index] = { ...target.part, cache: routerCacheHint() };
+      const copy: M = Object.assign(Object.create(Object.getPrototypeOf(message)), message, { content });
+      next[lastIndex] = copy;
+    }
   }
   next.push(makeTail(tail));
   return next;

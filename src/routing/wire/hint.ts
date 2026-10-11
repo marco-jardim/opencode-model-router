@@ -142,8 +142,9 @@ export function createSystemAugmenter(deps: SystemAugmenterDeps): SystemAugmente
   const taxonomyLine = (prepared: Prepared, view: AgentView, input: ContextInput): string => {
     const memoKey = `${input.agent}\u0000${input.parentModel ?? ""}\u0000${JSON.stringify(view.parentRules)}`;
     if (deps.turnState === undefined) return computedTaxonomyLine(prepared, view, input, memoKey);
-    // 1.2.4.d: reused while the key and the config object are unchanged, so the system prompt does not move between turns. Accepted
-    // cache breaks: a config/env change, an agent catalog refresh, a model switch.
+    // 1.2.4.d: reused while the key (agent name, parent model, parent rules) and the config object are unchanged, so the system prompt
+    // does not move between turns. The line is regenerated (an accepted cache break) only when one of those changes: a config/env
+    // change, a model switch, other rules. A changed agent catalog alone does not refresh it (a removed host agent can stay named).
     const frozen = frozenLines.get(input.sessionID);
     if (frozen !== undefined && frozen.memoKey === memoKey && frozen.cfg === prepared.cfg) {
       frozenLines.delete(input.sessionID);

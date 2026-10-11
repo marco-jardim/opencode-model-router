@@ -19,7 +19,8 @@ import type { Hooks } from "@opencode-ai/plugin";
 import { V2_GRADER_AGENT } from "../../src/compat/v2-client";
 import { registerV2Hooks } from "../../src/compat/v2-hooks";
 import type { TurnStateRegistry } from "../../src/compat/turn-state";
-import ModelRouterPlugin, { ROUTER_TURN_STATE_ATTACH } from "../../src/index";
+import { ROUTER_TURN_STATE_ATTACH } from "../../src/compat/turn-state";
+import ModelRouterPlugin from "../../src/index";
 import { invalidateConfigCache } from "../../src/router/config";
 import { acquireOutcomes, DEFAULT_OUTCOME_TUNING, makeKey } from "../../src/routing/outcomes";
 import type { LateNotice, PendingRegistry } from "../../src/verify/pending";
@@ -165,7 +166,7 @@ describe("v2 turn state (Phase 1.2, integration)", () => {
     Object.defineProperty(observed, ROUTER_TURN_STATE_ATTACH, {
       value: (attached: TurnStateRegistry) => {
         registry = attached;
-        (attach as (r: TurnStateRegistry) => void)(attached);
+        return (attach as (r: TurnStateRegistry) => unknown)(attached);
       },
     });
     const host = hostFixture(options.parents ?? {});
@@ -333,23 +334,71 @@ describe("v2 turn state (Phase 1.2, integration)", () => {
     expect(JSON.stringify(e)).not.toMatch(/"ttl"/);
   });
 
-  it("O12: when the last real message is a tool result, the hint goes to the nearest earlier text part", async () => {
+  it("O12: when the last real message is a tool result, the hint goes to its last part and never to an earlier message", async () => {
     const { hook } = await boot();
     register(1);
-    const toolResult: Message = { role: "tool", content: [{ type: "tool-result", id: "t1" }] };
     const messages = deepFreeze([
       user("Read the config and tell me what is wrong"),
       assistant({ type: "text", text: "Reading the file" }, { type: "tool-call", id: "t1" }),
-      toolResult,
+      { role: "tool", content: [{ type: "tool-result", id: "t1" }] } satisfies Message,
     ]);
     const e = event(messages);
     await hook(e);
 
     expect(e.messages).toHaveLength(4);
-    expect(cacheMarks(e.messages)).toEqual([{ message: 1, part: 0 }]);
-    expect(e.messages[2]).toBe(toolResult);
+    expect(cacheMarks(e.messages)).toEqual([{ message: 2, part: 0 }]);
+    expect(e.messages[2]?.content[0]).toEqual({ type: "tool-result", id: "t1", cache: { type: "ephemeral" } });
+    expect(e.messages[1]).toBe(messages[1]);
     expect(e.messages[3]?.content.every(part => part.cache === undefined)).toBe(true);
   });
+
+  it("a whitespace-only text part is not a hint target: the hint goes to the last visible text part", async () => {
+    const { hook } = await boot();
+    register(1);
+    const e = event([user("ask"), { role: "user", content: [{ type: "text", text: "real" }, { type: "text", text: "  \n " }] }]);
+    await hook(e);
+    expect(cacheMarks(e.messages)).toEqual([{ message: 1, part: 0 }]);
+  });
+
+  it("session.deleted drops the session's retained late notices", async () => {
+    const { queue, hook, hooks } = await boot();
+    vi.spyOn(queue, "takeNotices").mockReturnValueOnce([lateNotice()]);
+    const first = event([user("Go on")]);
+    await hook(first);
+    expect(tailOf(first)).toContain(LATE_HANDLE);
+
+    await hooks.event?.({ event: { type: "session.deleted", properties: { info: { id: SESSION } } } } as unknown as Parameters<NonNullable<Hooks["event"]>>[0]);
+
+    const after = event([user("Go on")]);
+    await hook(after);
+    expect(hasTail(after)).toBe(false);
+  });
+
+  it("rendering a session refreshes its place in the late buffer's LRU", async () => {
+    const { queue, hook } = await boot();
+    const handleOf = (n: number): string => `vrf_${n.toString(16).padStart(24, "0")}`;
+    const served = new Set<string>();
+    vi.spyOn(queue, "takeNotices").mockImplementation((sid: string) => {
+      if (served.has(sid)) return [];
+      served.add(sid);
+      return [lateNotice(handleOf(Number(sid.slice(1))))];
+    });
+    // Session "s0" is the oldest; the buffer holds 100 sessions.
+    await hook(event([user("Go on")], { sessionID: "s0" }));
+    for (let n = 1; n < 100; n++) await hook(event([user("Go on")], { sessionID: `s${n}` }));
+    // Rendering s0 again makes it the most recently used; s1 is now the oldest.
+    await hook(event([user("Go on")], { sessionID: "s0" }));
+    await hook(event([user("Go on")], { sessionID: "s100" }));
+
+    const kept = event([user("Go on")], { sessionID: "s0" });
+    await hook(kept);
+    expect(tailOf(kept)).toContain(handleOf(0));
+    const evicted = event([user("Go on")], { sessionID: "s1" });
+    await hook(evicted);
+    expect(hasTail(evicted)).toBe(false);
+  });
+
+
 
   it("late notice: rendered on two consecutive turns, gone once router_verify answers its handle", async () => {
     const { queue, hook, hooks } = await boot();

@@ -15,10 +15,7 @@
     "content": [
       {
         "type": "text",
-        "text": "Reading the file",
-        "cache": {
-          "type": "ephemeral"
-        }
+        "text": "Reading the file"
       },
       {
         "type": "tool-call",
@@ -31,7 +28,10 @@
     "content": [
       {
         "type": "tool-result",
-        "id": "t1"
+        "id": "t1",
+        "cache": {
+          "type": "ephemeral"
+        }
       }
     ]
   },

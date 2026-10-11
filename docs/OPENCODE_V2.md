@@ -104,8 +104,9 @@ were left out (`… 12 more lines`; a line ends with ` (router_plan action=statu
 plan section is active). Lines are never cut in the middle.
 
 **Cache hint.** The router puts one ephemeral cache breakpoint (`{ "type": "ephemeral" }`)
-on the last non-empty text part of the last real message (the last message that has one,
-so a trailing tool result is skipped and the hint lands on the text before it). The state
+on the last text part with visible text of the last real message or, when that message has
+no such part (a tool-result-only message), on its last part whatever its type. It never
+moves to an earlier message, so during a tool loop it follows the newest message. The state
 message itself never carries it, and no system part gets one. It carries no 1-hour TTL:
 OpenCode v2.0.26 cannot set the TTL of the tools breakpoint, so a longer TTL on the
 message breakpoint alone would not keep the prefix cached (ADR 0007, decision D5,
@@ -113,9 +114,11 @@ withdrawn); the router has no setting for the cache hint's lifetime.
 
 **The `R:` line.** In `advise` and `enforce` mode the `R:` line of the protocol is
 generated from recorded outcomes. With the state in place it is frozen per session: the
-first request of a session fixes it, and it is reused while the configuration, the agent
-catalog and the orchestrator's model are unchanged. A change to any of these, or a new
-session, regenerates it, and that request misses the cache. Fresh routing evidence still
+first request of a session fixes it, and it is reused while the agent name, the
+orchestrator's model, the agent's permission rules and the configuration are unchanged. A
+change to any of these, or a new session, regenerates it, and that request misses the
+cache. A change of the agent catalog alone does not regenerate it: an agent removed from
+the host can stay named in the line until one of those changes. Fresh routing evidence still
 reaches the model through the route hint, which is in the state; `enforce` decides at
 dispatch.
 

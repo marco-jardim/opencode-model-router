@@ -1631,12 +1631,16 @@ describe("docs drift: the per-turn router state on OpenCode v2 (Phase 1.2.6)", (
     expect(flatState).toContain("`… 12 more lines`");
     expect(flatState).toContain("` (router_plan action=status)`");
     expect(flatState).toMatch(/one ephemeral cache breakpoint/);
-    expect(flatState).toMatch(/last non-empty text part of the last real message/);
+    expect(flatState).toMatch(/last text part with visible text of the last real message/);
+    expect(flatState).toMatch(/on its last part whatever its type/);
+    expect(flatState).toMatch(/never moves to an earlier message/);
     expect(flatState).toMatch(/no 1-hour TTL/);
     expect(flatState).toMatch(/OpenCode v2\.0\.26 cannot set the TTL of the tools breakpoint/);
     expect(flatState).toMatch(/ADR 0007, decision D5, withdrawn/);
     expect(flatState).toMatch(/frozen per session/);
-    expect(flatState).toMatch(/configuration, the agent catalog and the orchestrator's model are unchanged/);
+    expect(flatState).toMatch(/agent name, the orchestrator's model, the agent's permission rules and the configuration are unchanged/);
+    expect(flatState).toMatch(/A change of the agent catalog alone does not regenerate it/);
+    expect(flatState).not.toMatch(/the agent catalog and the orchestrator's model are unchanged/);
     expect(flatState).toMatch(/OpenCode v1 keeps the old delivery, unchanged/);
     expect(longProseLines(state)).toEqual([]);
   });
