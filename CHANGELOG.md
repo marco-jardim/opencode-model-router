@@ -21,6 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the working set and `node_modules`-linked repositories; an unattributable write there makes the result
   unverifiable. The protocol and the tier dispatch header gain a cross-repo sentence. Limit: a worktree outside the
   parents still needs a `routing.workRoots` glob or a restart.
+- **Cross-repo hardening after two QA rounds.** Only fully qualified paths and explicit search roots reach the read set;
+  a relative path stays judged against the work root. A final admission gate checks `repoExclude` on the shown and the
+  canonical path and refuses a candidate that is a parent, an ancestor of one, or a link out of it, with no fallback to
+  the worktree rule. An invalid, duplicated or conflicting `repo=`/`branch=` now gives no work root and a note
+  (`<key>=<value> is not a valid repository name / branch name: no work root. Fix the route line.`), instead of being
+  ignored. The verification perimeter is planned for every routed role dispatch with a work root whenever
+  `routing.repoParents` is set, even without `repo=`; a pass shows `verified scope: …` and link targets are named
+  `(not admitted)` or `(not observed)`.
 
 ### Removed
 

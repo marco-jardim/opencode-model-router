@@ -1,6 +1,6 @@
 # Cross-repo work in roles mode
 
-**Status:** Accepted 2026-10-10 (owner). Phase 0 implemented and QA'd; Phase 1 implemented (P1.1–P1.10); Phase 1 QA pending.
+**Status:** Accepted 2026-10-10 (owner). Phase 0 and Phase 1 implemented, two QA rounds each; dogfooding pending.
 **Scope:** roles mode on OpenCode v2 (`routing.delegation: "roles"`). Phase 0 changes the shared verification engine and applies to both hosts.
 **Configuration keys** marked *proposed (not implemented)* do not exist yet.
 **File references** are `path:line` as of 2026-10-10. Line numbers drift; the function names are the stable reference.
@@ -193,7 +193,7 @@ Allow once = this dispatch only. Allow always = until it expires. Reject = no wo
 - **I10 — Reads never widen writes.** Read authority never widens write authority or the change baseline.
 - **I11 — Admission.** `routing.repoParents`, `routing.repoDepth`, `routing.repoExclude` and `routing.repoApprovalDays` are global-layer only. Parents are literal, absolute, canonical long-form directories: no glob, no `.` or `..`, no 8.3 segment, no UNC or device path. A directory is admitted only by git (top-level equality, depth 1..N below a parent, never the parent, canonical form stays below the parent), as a worktree that an admitted repository lists, or by a valid first-use approval (I16, I17). Text comparison comes before every filesystem call on a path outside the parents, except composing a first-use approval prompt.
 - **I12 — Where git runs.** The router runs git only in admitted repositories, the session repository and its worktrees, and (Phase 4) in a candidate for a first-use approval prompt. A link target outside them is not snapshotted: it is reported as "not observed" and is never pinned.
-- **I13 — P is fixed at dispatch.** P is the working set at dispatch start, plus W, plus the admitted link targets of W. A repository bound later is not observed by an earlier dispatch.
+- **I13 — P is fixed at dispatch.** P is the working set at dispatch start, plus W, plus the admitted link targets of W. A repository bound later is not observed by an earlier dispatch. The perimeter is planned for every routed role dispatch with a work root whenever `routing.repoParents` is set, even without `repo=`; it is also planned when the grant has a location or the working set holds other roots.
 - **I14 — Names are resolved, never guessed.** An ambiguous name or worktree is refused with the candidates listed.
 - **I15 — Hosts.** Phase 0 applies to both hosts. Phase 1 and later are v2-only.
 - **I16 — Approvals come from a human.** An approval is created only by a human reply to a prompt the router composed from git. No agent tool call, route-line field, dispatch text or project-layer configuration can create, extend or widen one.
@@ -430,6 +430,36 @@ Each slice lands test-first: the failing test reproduces the scenario row, then 
 - **Link roots named by basename.** The perimeter names a repository reached through `node_modules` links by the basename of its root.
 - **The perimeter does not defer.** A role dispatch with a cross-repo location, or whose session working set holds other repositories, is not deferred (reason `cross-repo`).
 
+After QA rounds 1 and 2 (facts checked at HEAD effcdb3):
+
+- **Admission.**
+  - A final gate runs on every admission: `repoExclude` on both the shown and the canonical path; a candidate is never a configured parent or an ancestor of one; a path whose text lies below a parent must also lie below it canonically.
+  - An excluded or link-escaping candidate is refused outright; there is no fallback to rule 2.
+  - Rule 2 also requires the candidate's `git rev-parse --git-common-dir` to match its repository's.
+  - When admission is in use, a `root=` other than the session directory binds only through admission. The admitted worktree must still realpath to itself.
+  - The `repo=` lookup needs a `.git` entry before running git, skips dot-dirs, `node_modules` and excluded dirs, visits at most 2000 directories and lists at most 10 notes.
+- **Route line.**
+  - An invalid or duplicated `repo=`/`branch=`, or one that conflicts between lines, gives no work root and the note `<key>=<value> is not a valid repository name / branch name: no work root. Fix the route line.`
+  - Branch names follow git check-ref-format, so `renovate/foo+bar` and `feat/ação` are valid.
+- **Working set.** It grows only when `routing.repoParents` is set, from the accepted grant's location, after the dispatch is registered. `branch=` alone still binds through declare-then-check but does not grow it.
+- **Session in a subdirectory.** W stays the session directory when the bound worktree contains it and no other git top level lies between them. A session in a worktree nested inside another (for example `.wt/feat` inside main) is not kept.
+- **Read set R.**
+  - Only paths written fully qualified, or explicit search roots, reach R. A relative path, as written in any argument (`filePath`, `path`, `file_path`, patch paths), or a pathless search, is judged against W only and keeps the old refusal.
+  - A repository in R needs a real `.git`: either `HEAD` plus `objects` or `commondir`, or a gitdir file whose target has `HEAD`. Links are refused. The gitdir target is checked for network paths after realpath. `HEAD` is read only from a regular file of at most 4 KiB.
+  - `repoExclude` applies to every ancestor. `.git` internals are never read outside W.
+- **Echoed values.** Names, branches and paths in edit refusals and provenance are quoted when they contain unsafe characters (`quoteGitPath` style, `[`/`]` escaped). An invalid branch shows as `(unknown)`.
+- **D13 lift.** Only for the work root and the read set (never the session's own tool-output directory), and only when cross-repo is in use.
+- **Perimeter.**
+  - Planned for every routed role dispatch with a work root when `routing.repoParents` is set, even without `repo=`; also when the grant has a location or the working set holds other roots.
+  - A pending snapshot of another repository is discarded when an unattributable writer runs, not only when it writes an overlapping cwd. That repository is then "could not be observed".
+  - Roots past the cap of 16 are kept as unobserved.
+  - Links are de-duplicated by repository top level, found by walking up to `.git` with no git call.
+  - Repositories are admitted (depth, `repoExclude`, working set) before any git runs, and snapshotted with hardened git that keeps the inherited core settings (`autocrlf`, `eol`, `safecrlf`, `longpaths`, `quotepath`) unless the repository sets them.
+  - A link target that is not admitted is named `(not admitted)`; an unobserved one is named `(not observed)`.
+  - A pass shows the scope as a note: `verified scope: <W> (<branch> @ <head7>); also observed: …`. A changed repository without writers is marked `changed during the dispatch`.
+  - A planning failure fails closed (placeholder root "the verification perimeter could not be planned…").
+  - For a sibling worktree of W's own repository the I4 reason suggests `branch=` instead of `repo=`.
+
 ### Phase 2 — consumer checks, pinning, deferred P
 
 | Step | File:function | Change |
@@ -512,6 +542,21 @@ Each slice lands test-first: the failing test reproduces the scenario row, then 
   - **N8.** A call that throws after `noteWriter` counts as a writer.
   - **N9.** `storeLike` exempts an outside real path whose parent is named `node_modules`.
   - **N10.** File paths in refusal reasons are not sanitised.
+- **Known follow-ups (Phase 1 QA), accepted for now:**
+  - Rule 2 can still be fooled by a junction to a directory whose `.git` file points at the right repository's `worktrees/x` (needs write access to both paths).
+  - An invalid `root=` next to a valid `repo=` is dropped silently.
+  - The conflict note says "not a valid name" for two conflicting lines.
+  - Admission notes and the plain "outside this dispatch's work root" refusal are not escaped.
+  - R's exclude globs match only the canonical parent spelling.
+  - A `root=` in the canonical spelling of a junctioned parent is refused.
+  - A configured parent inside the session repository refuses that repository for `branch=`.
+  - Contamination of perimeter snapshots is global across parallel dispatches.
+  - Planning reruns on retries that already had no perimeter.
+  - The fail-closed planning catch wraps the role check.
+  - Ignored build output (for example `dist/`) in a linked repository is not observed, so a pass covers tracked and untracked files only (P2 pinning).
+  - A repository with submodules is never observed, so with writers its dispatches are unverifiable.
+  - The dispatch-header location line is dead code (headers are built only for tier dispatches).
+  - The evaluate hook still accepts host-relative resources (`hostRelative`), and relies on `execute.before` refusing the relative form first.
 - **Consumers** are discovered only in the working set, and only through `node_modules` links. Python editable installs, Go `replace`, Cargo path dependencies, and `../` or alias imports are not discovered (Q2).
 - **A consumer check's failures** are unverifiable, never "fail". The dependency is the changed repository, so the reference can neither excuse nor prove them.
 - **`router_run` scripts** remain trusted repository content (`run-tools.ts:11-13`).

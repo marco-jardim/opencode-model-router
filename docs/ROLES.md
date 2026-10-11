@@ -223,7 +223,7 @@ needs no restart. Changing `repoParents` does need one, and a parent must exist 
 
 **Naming the work root.** A dispatch still has one work root and edits only there. The route line names it with
 `root=`, or by repository name and branch, which the router checks against git (values keep their case; an invalid
-value is ignored):
+value gives no work root, see below):
 
 ```text
 [route class=implement needs=edit repo=app-a branch=feat/login]
@@ -243,16 +243,38 @@ through admission. It is admitted when either:
 1. it is a git top level 1 to `repoDepth` levels below a parent (never the parent itself), its canonical path stays
    below that parent, and it is not excluded by `repoExclude`; or
 2. it is a worktree that a known repository lists: the session repository, or a repository in the session's working
-   set.
+   set. Its `git rev-parse --git-common-dir` must match that repository's, and it must still resolve to itself.
 
-Text checks come before any git call: UNC, device, 8.3 and `..` paths are refused. The grant carries the repository,
-branch and worktree. The orchestrator session keeps a working set of up to 16 bound roots, forgotten when the session
-is deleted.
+Text checks come before any git call: UNC, device, 8.3 and `..` paths are refused. A final gate runs on every
+admission: `repoExclude` applies to both the shown and the canonical path, a candidate is never a configured parent or
+an ancestor of one, and a path whose text lies below a parent must also lie below it canonically. An excluded or
+link-escaping candidate is refused outright, with no fallback to rule 2. When admission is in use, a `root=` other than
+the session directory binds only through admission. The `repo=` lookup needs a `.git` entry before it runs git, skips
+dot-directories, `node_modules` and excluded directories, visits at most 2000 directories and lists at most 10 notes.
+The grant carries the repository, branch and worktree. The orchestrator session keeps a working set of up to 16 bound
+roots, forgotten when the session is deleted. It grows only when `routing.repoParents` is set, from the accepted
+grant's location and after the dispatch is registered; `branch=` alone still binds through declare-then-check but does
+not grow it.
+
+**Invalid route fields.** An invalid or duplicated `repo=` or `branch=`, or one that conflicts between route lines,
+gives no work root and the note `<key>=<value> is not a valid repository name / branch name: no work root. Fix the
+route line.` Branch names follow `git check-ref-format`, so `renovate/foo+bar` and `feat/ação` are valid. Names,
+branches and paths echoed in refusals are quoted when they contain unsafe characters; an invalid branch shows as
+`(unknown)`.
+
+**Session in a subdirectory.** The work root stays the session directory when the bound worktree contains it and no
+other git top level lies between them. A session in a worktree nested inside another (for example `.wt/feat` inside
+main) is not kept.
 
 **Read set.** A role may read, `glob` and `grep` in the work root, in the worktrees of the working set, and in
 directories inside an admissible repository below the parents (checked with a synchronous `.git` probe, cached for 5
-seconds). `external_directory` access to those directories is allowed in addition when the action is a read. A read
-outside the work root but inside the read set is annotated:
+seconds). `external_directory` access to those directories is allowed in addition when the action is a read. Only paths
+written fully qualified, or explicit search roots, reach the read set. A relative path, in any argument (`filePath`,
+`path`, `file_path`, patch paths), or a pathless search is judged against the work root only and keeps the earlier
+refusal. A repository in the read set needs a real `.git` (`HEAD` plus `objects` or `commondir`, or a gitdir file whose
+target has `HEAD`); links are refused, a gitdir target is checked for network paths after realpath, and `HEAD` is read
+only from a regular file of at most 4 KiB. `repoExclude` applies to every ancestor, and `.git` internals are never read
+outside the work root. A read outside the work root but inside the read set is annotated:
 
 ```text
 [router: read from lib-b (main) at D:\git\lib-b — read-only in this dispatch]
@@ -270,17 +292,27 @@ where the path lives and what to do:
 Any other path outside the read set keeps the earlier text (`read: <path> is outside this dispatch's work root <root>
 (use an absolute path inside it)`). The worktree re-checks and `router_git_*` check against the binding's repository.
 A host `ask` for `external_directory` inside the work root or the read set is lifted to `allow` for an exactly bound
-session; a deny is never changed.
+session when cross-repo is in use; a deny is never changed, and the session's own tool-output directory is never
+lifted.
 
-**Verification perimeter.** For a role dispatch with a cross-repo location, or whose session working set holds other
-repositories, the perimeter is the work root's repository, the working-set worktrees, and the admitted repositories
-the work root links to through `node_modules` (store links excluded), at most 16, snapshotted at dispatch and at the
-gate. When a root in the perimeter changed, or could not be observed, while the producer ran a tool that can write
-anywhere, the result is unverifiable: `the repository <name> at <root> also changed during the dispatch, and the
+**Verification perimeter.** The perimeter is planned for every routed role dispatch with a work root when
+`routing.repoParents` is set, even without `repo=`, and also when the grant has a cross-repo location or the session
+working set holds other roots. It is the work root's repository, the working-set worktrees, and the admitted
+repositories the work root links to through `node_modules` (store links excluded), at most 16 (roots past the cap are
+kept as unobserved), snapshotted at dispatch and at the gate. Links are de-duplicated by repository top level, found by
+walking up to `.git` with no git call. Repositories are admitted (depth, `repoExclude`, working set) before any git
+runs, and snapshotted with hardened git that keeps the inherited core settings (`autocrlf`, `eol`, `safecrlf`,
+`longpaths`, `quotepath`) unless the repository sets them. A link target that is not admitted is named `(not
+admitted)`; one that could not be snapshotted is named `(not observed)`. A pending snapshot of another repository is
+discarded when an unattributable writer runs, not only when it writes an overlapping directory, and that repository is
+then "could not be observed". A planning failure fails closed, with a placeholder root "the verification perimeter
+could not be planned…". When a root in the perimeter changed, or could not be observed, while the producer ran a tool
+that can write anywhere, the result is unverifiable (for a sibling worktree of the work root's own repository the
+reason suggests `branch=` instead of `repo=`): `the repository <name> at <root> also changed during the dispatch, and the
 producer ran <tools>; a write there cannot be attributed, so the checks in <W> do not cover it. Dispatch that work with
 repo=<name>, or verify it there.` (`could not be observed during the dispatch` for a missing snapshot). A pass with
-more than one root carries the evidence line `verified scope: <W> (<branch> @ <head7>); also observed: …` in the
-verdict reasons; accepted results do not display pass reasons today. Such a dispatch is not deferred (reason
+more than one root shows its scope as a note, `verified scope: <W> (<branch> @ <head7>); also observed: …`; a changed
+repository without writers is marked `changed during the dispatch`. Such a dispatch is not deferred (reason
 `cross-repo`).
 
 **Limits.**
