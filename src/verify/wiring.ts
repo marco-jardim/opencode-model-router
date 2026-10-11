@@ -96,7 +96,7 @@ import {
   withTimeout,
 } from "./timeout";
 import { resolveRolesRouting, resolveVerifyBudget, type RouterConfig, type VerifyBudget } from "../router/config";
-import { accept, gateResult, PERIMETER_UNPLANNED, unverifiableGateResult, type GateDeps, type GateResult, type PerimeterObservation, type PerimeterRoot } from "./gate";
+import { accept, gateResult, PERIMETER_UNPLANNED, perimeterChangeReasons, unverifiableGateResult, type GateDeps, type GateResult, type PerimeterObservation, type PerimeterRoot } from "./gate";
 // The grader request shape is owned by checker.ts, which builds it. Re-exported
 // here because this module is where it is consumed, and because keeping a
 // second local copy is exactly how `cwd` got dropped: the checker set it, the
@@ -473,8 +473,9 @@ export type DeferredFinish =
        * with the empty set instead, noChangeGateSpawnsNothing); "error": the finish itself failed;
        * "branch-switched" (I7, P0.2): the working tree switched branch during the dispatch, so no handle is issued that could
        * verify the other branch later; the required gate refuses it at once (its observeChange sees the same switch);
-       * "cross-repo" (P1.8): the dispatch's perimeter spans several repositories, which a later handle would not observe as
-       * they were when the producer returned; the required gate verifies it at once.
+       * "cross-repo" (P1.8, P2e.5 X7): the dispatch's perimeter, observed at return, cannot be frozen for a later handle: a
+       * repository of it changed while an unattributable writer ran (I4), or a linked repository could not be observed within
+       * the deferral bound; the required gate verifies it at once.
        */
       readonly reason: "unregistered" | "no-change" | "error" | "branch-switched" | "cross-repo";
       readonly detail: string;
@@ -1775,6 +1776,9 @@ export function createVerificationWiring(deps: {
     snapshot: TreeSnapshot | undefined,
     base: string,
     deadline?: Deadline,
+    // Cross-repo P2e.5 (return mode): `discover: false` skips consumer discovery (router_verify discovers over the frozen
+    // working set instead); nothing else differs.
+    options: { readonly discover?: boolean } = {},
   ): Promise<PerimeterObservation | undefined> => {
     if (planned === undefined) return undefined;
     const key = (at: string): string => {
@@ -1831,7 +1835,9 @@ export function createVerificationWiring(deps: {
         deadline?.signal.removeEventListener("abort", onAbort);
       }
     };
-    const { consumers, incomplete } = workingSet.size === 0 ? { consumers: [], incomplete: [] } : await discover();
+    const { consumers, incomplete } = workingSet.size === 0 || options.discover === false
+      ? { consumers: [], incomplete: [] }
+      : await discover();
     return {
       w: {
         root: wRoot,
@@ -1843,6 +1849,64 @@ export function createVerificationWiring(deps: {
       ...(consumers.length > 0 ? { consumers } : {}),
       ...(incomplete.length > 0 ? { consumersIncomplete: incomplete } : {}),
     };
+  };
+
+  /** Cross-repo P2e.5: what a deferred entry freezes of its dispatch's perimeter (pending.ts DeferredPerimeter, without the pins). */
+  type FrozenPerimeter = NonNullable<PendingEntry["perimeter"]>;
+
+  /**
+   * Cross-repo P2e.5 (X4, X5): the perimeter frozen when a deferred producer returns. The observation is perimeterAtGate's in
+   * return mode (no consumer discovery inside the deferral bound: router_verify discovers over the frozen working set). Next to
+   * it: the working-set roots (origin "working-set", never W), and the link targets (origin "link" or `linked`, never fixed)
+   * with the top level, head and fingerprint of their return-time snapshot and their admission. `linkUnobserved`: a link root
+   * whose status is "unobserved" (no snapshot at either end, or a top it does not admit): X7, not deferred. Undefined when the
+   * dispatch has no perimeter or none of it remains beyond W.
+   */
+  const perimeterAtReturn = async (
+    planned: { name?: string; snapshots: PerimeterSnapshots } | undefined,
+    snapshot: TreeSnapshot | undefined,
+    base: string,
+  ): Promise<{
+    observation: PerimeterObservation;
+    workingSet: FrozenPerimeter["workingSet"];
+    links: FrozenPerimeter["links"];
+    linkUnobserved: boolean;
+  } | undefined> => {
+    const observation = await perimeterAtGate(planned, snapshot, base, undefined, { discover: false });
+    if (planned === undefined || observation === undefined) return undefined;
+    const wKey = perimeterKey(observation.w.root);
+    const workingSet = new Map<string, FrozenPerimeter["workingSet"][number]>();
+    const links = new Map<string, FrozenPerimeter["links"][number]>();
+    let linkUnobserved = false;
+    for (const { entry, before, now } of planned.snapshots) {
+      const seed = entry.seed;
+      if (seed.fixed !== undefined) continue;
+      // As perimeterAtGate names the root: its known top level when admitted, else where it was planned.
+      const known = now?.root ?? before?.root;
+      const refused = known !== undefined && seed.admit !== undefined && !seed.admit(known);
+      const root = known !== undefined && !refused ? known : seed.at;
+      const key = perimeterKey(root);
+      if (key === wKey) continue;
+      if (seed.origin === "working-set" && !workingSet.has(key)) {
+        workingSet.set(key, { root, ...(seed.name !== undefined ? { name: seed.name } : {}) });
+      }
+      if (seed.origin !== "link" && seed.linked !== true) continue;
+      if (refused || before === undefined || now === undefined || now.root === undefined) {
+        linkUnobserved = true;
+        continue;
+      }
+      if (!links.has(key)) {
+        links.set(key, {
+          at: seed.at,
+          root,
+          name: seed.name ?? basename(root),
+          head: now.head,
+          fingerprint: now.fingerprint,
+          ...(seed.admit !== undefined ? { admit: seed.admit } : {}),
+        });
+      }
+    }
+    return { observation, workingSet: [...workingSet.values()], links: [...links.values()], linkUnobserved };
   };
 
   /**
@@ -2096,16 +2160,42 @@ export function createVerificationWiring(deps: {
     let risk: RiskAssessment = unattributedRisk();
     let deferred = false;
     try {
-      // Cross-repo P1.8: the perimeter is observed by the required gate only (a dispatch with one is never deferred, below).
-      const change = await observeChange(store, input.dispatchID, input.producerSessionID, input.captureRoot ?? input.cwd, deadline, false);
+      // Cross-repo P2e.5 (X4): a dispatch with a perimeter has it observed in return mode, its snapshots started now so they run
+      // concurrently with W's own (never rejects; bounded by the same DEFERRED_FINISH_MS deadline). Without one: nothing extra.
+      const changeCwd = input.captureRoot ?? input.cwd;
+      const perimeterSnapshots = store.perimeterOf(input.dispatchID) !== undefined
+        ? perimeterSnapshotsAtGate(store, input.dispatchID, deadline).catch(() => undefined)
+        : undefined;
+      const change = await observeChange(store, input.dispatchID, input.producerSessionID, changeCwd, deadline, false);
       // I7 (P0.2): a branch switch during the dispatch is never deferred: a handle could verify the other branch later. The
       // caller's required gate refuses it now (its own observeChange sees the switch). Before the no-change shortcut below.
       if (change.branchSwitch !== undefined) return { deferred: false, reason: "branch-switched", detail: change.branchSwitch };
-      // Cross-repo P1.8 (I4, I13): a handle verified later would not see the perimeter's other repositories as they were when the
-      // producer returned; the caller's required gate verifies the dispatch now. Before the no-change shortcut below.
-      if (store.perimeterOf(input.dispatchID) !== undefined) {
-        return { deferred: false, reason: "cross-repo", detail: "the perimeter spans several repositories; verified synchronously" };
+      // Cross-repo P2e.5 (X5, X7): the perimeter as it was at return is frozen for router_verify, unless it cannot be: I4 already
+      // holds (a root changed while an unattributable writer ran), or a link target was not observed. The caller's required
+      // gate then verifies the dispatch now. Before the no-change shortcut below.
+      let frozen: Awaited<ReturnType<typeof perimeterAtReturn>>;
+      if (perimeterSnapshots !== undefined) {
+        const base = resolve(directory, changeCwd || ".");
+        frozen = await perimeterAtReturn(await perimeterSnapshots, change.snapshot, base);
+        const writers = change.unattributedWriters ?? [];
+        if (frozen !== undefined && perimeterChangeReasons({ perimeter: frozen.observation, unattributedWriters: [...writers] }, base).length > 0) {
+          return {
+            deferred: false,
+            reason: "cross-repo",
+            detail: "a repository of the perimeter changed during the dispatch while an unattributable writer ran; verified synchronously",
+          };
+        }
+        if (frozen?.linkUnobserved === true) {
+          return { deferred: false, reason: "cross-repo", detail: "a linked repository could not be observed within the deferral bound; verified synchronously" };
+        }
       }
+      // P2e.5 (X3): the frozen pins settle only once the registration succeeded (below); never rejects.
+      let settlePins: (pins: readonly LinkPin[]) => void = () => undefined;
+      const frozenPins = frozen !== undefined
+        ? new Promise<readonly LinkPin[]>(settle => {
+          settlePins = settle;
+        })
+        : undefined;
       // QA-2.4-10: an attributed empty change set is passed by the required gate with no process
       // (section 1.5-6): nothing to defer. The caller runs that gate, with the same outcome.
       // QA-G-1: only for a testsPass-only DoD. Any other check (build, lint, run, fileExists,
@@ -2170,11 +2260,36 @@ export function createVerificationWiring(deps: {
         ...(change.contaminatedBy !== undefined ? { contaminatedBy: change.contaminatedBy } : {}),
         // I5 (P0.3): router_verify's gate adds the caveat to a pass on an empty change set.
         ...(change.unattributedWriters !== undefined && change.unattributedWriters.length > 0 ? { unattributedWriters: change.unattributedWriters } : {}),
+        // Cross-repo P2e.5: the perimeter frozen at return (router_verify gates with it) and the dispatch's placements.
+        ...(frozen !== undefined && frozenPins !== undefined
+          ? { perimeter: { observation: frozen.observation, workingSet: frozen.workingSet, links: frozen.links, pins: frozenPins } }
+          : {}),
+        ...(input.placements !== undefined ? { placements: input.placements } : {}),
       });
       if (!reg.ok) {
+        // P2e.5 (X3): nothing reads it; the dispatch's own pins are left untouched for the required gate.
+        settlePins([]);
         // QA-2.4-4: never a delegation without a verdict path: the caller runs the required gate.
         logger.warn("[verify] deferred delegation not registered; verifying synchronously", { code: reg.code, detail: reg.detail });
         return { deferred: false, reason: "unregistered", detail: `${reg.code}: ${reg.detail}` };
+      }
+      if (frozen !== undefined) {
+        // P2e.5 (X3): the dispatch's link pins are taken now, before store.clear (below), then freed; the entry keeps the SAME
+        // array (pinNow admission is keyed by its identity). Never rejects: a failure is [].
+        const dispatchID = input.dispatchID;
+        void linkPinsAtGate(store, dispatchID, undefined).then(
+          pins => {
+            freeLinkPins(dispatchID, pins);
+            settlePins(pins);
+          },
+          () => {
+            freeLinkPins(dispatchID, []);
+            settlePins([]);
+          },
+        );
+      } else if (perimeterSnapshots !== undefined) {
+        // A perimeter with nothing to freeze beyond W: no gate takes this dispatch's pins any more.
+        freeLinkPins(input.dispatchID, []);
       }
       deferred = true;
       // #84 P2.1 (handoff 24, R7): the budget captured at return travels with the handle to `router_verify`.

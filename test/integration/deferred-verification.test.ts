@@ -36,12 +36,15 @@ import type { DoD } from "../../src/verify/dod";
 import type { DispatchReference } from "../../src/verify/reference";
 import type { CheckPlacement } from "../../src/verify/types";
 import { resolveBaseDir } from "../../src/verify/paths";
+import * as perimeterModule from "../../src/verify/perimeter";
 
 const state = vi.hoisted(() => ({
   /** What snapshotTree resolves with (undefined = unavailable). */
   snapshot: undefined as TreeSnapshot | undefined,
   /** Replaces the snapshot mock when set. */
   snapshotImpl: undefined as (() => Promise<TreeSnapshot | undefined>) | undefined,
+  /** P2e.5: a snapshot per directory, before `snapshotImpl` / `snapshot` (empty: every directory gets those). */
+  snapshotsByDir: new Map<string, TreeSnapshot>(),
   /** Every shell or argv spawn, as "file arg…" or the shell string. */
   commands: [] as string[],
   captures: 0,
@@ -105,7 +108,8 @@ vi.mock("../../src/verify/pending", async importOriginal => {
 });
 
 vi.mock("../../src/verify/tree", () => ({
-  snapshotTree: async () => (state.snapshotImpl ? state.snapshotImpl() : state.snapshot),
+  snapshotTree: async (at?: string) =>
+    (at !== undefined && state.snapshotsByDir.has(at) ? state.snapshotsByDir.get(at) : state.snapshotImpl ? state.snapshotImpl() : state.snapshot),
 }));
 vi.mock("../../src/verify/exec", () => ({
   runShell: async (command: string) => {
@@ -207,6 +211,7 @@ beforeEach(() => {
   Object.assign(state, {
     snapshot: snap([], "clean"),
     snapshotImpl: undefined,
+    snapshotsByDir: new Map(),
     commands: [],
     captures: 0,
     captureResult: REF,
@@ -576,6 +581,27 @@ describe("wiring (2.4.2a)", () => {
       await new Promise(resolveTick => setTimeout(resolveTick, 0));
       expect(store.reference("task:orch:1")).toBe(reference);
       expect(store.baselineSnapshot("task:orch:1")).toBeDefined();
+    });
+
+    it("P2e.5: a refused registration starts no pins: the dispatch's link pins stay for the required gate", async () => {
+      // A dispatch whose perimeter holds one admitted link target (lib), the same at dispatch and at return (no I4, observed).
+      const lib = resolve("deferred-verification-lib");
+      const plan = vi.spyOn(perimeterModule, "planPerimeter").mockImplementation(() => ({ roots: [{ at: lib, origin: "link" as const, admit: () => true }] }));
+      try {
+        state.snapshotsByDir.set(lib, { ...snap([], "lib"), cwd: lib, root: lib, head: "L", ignored: "ign" } as TreeSnapshot);
+        const { wiring, store } = makeWiring();
+        await wiring.startDispatch(store, "task:orch:1", root, TESTS_DOD, "", false);
+        state.snapshot = snap([{ path: resolve(root, "src", "a.ts"), status: " M" }], "after");
+        const finish = await wiring.finishDeferred(store, input({ producerSessionID: "" }));
+        expect(finish).toMatchObject({ deferred: false, reason: "unregistered" });
+        // The required gate still takes the dispatch's pin with its reference: a pin consumed by the refused finish would be gone.
+        const prepared = await wiring.prepareVerification(store, "task:orch:1", "child1", root);
+        expect(prepared.reference?.kind).toBe("captured");
+        const pins = prepared.reference?.kind === "captured" ? prepared.reference.reference.pins : undefined;
+        expect(pins?.map(pin => pin.root)).toEqual([lib]);
+      } finally {
+        plan.mockRestore();
+      }
     });
 
     it("QA-2.4-10: an attributed empty change set is not deferred; the record stays for the required gate", async () => {

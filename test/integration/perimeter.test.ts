@@ -8,7 +8,9 @@
  * - I4 needs both: lib-b changed without writers, or writers with lib-b unchanged (then I5 alone), is not refused by it.
  * - I9: a role dispatch with no location and no working set takes no extra snapshot, and its output is a plain dispatch's.
  * - I8: a pass with P > 1 names P. A pass renders no reasons, so the line is read from the gate result (`gate.accept` spied).
- * - A deferred DoD with a perimeter is verified at once (no handle).
+ * - P2e: a deferred DoD with a perimeter and no I4 at return is deferred (a handle); router_verify gates it with the perimeter
+ *   frozen at return (I4/I8 as at return, S11 link drift, the frozen pins). I4 at return, or a link not observed then, is not
+ *   deferred: the required gate decides.
  * - Link discovery: a junction to an admitted repository is in P; a store-like link is not.
  * - A write while an extra root's dispatch snapshot is in flight discards that snapshot ("could not be observed").
  *
@@ -28,6 +30,8 @@ import * as dispatchModule from "../../src/routing/wire/dispatch";
 import { addToWorkingSet, forgetWorkingSet } from "../../src/routing/wire/working-set";
 import type { RepoLocation } from "../../src/routing/roles/admission";
 import { createChangedFileStore } from "../../src/verify/dispatch";
+import * as storeModule from "../../src/verify/dispatch";
+import * as pendingModule from "../../src/verify/pending";
 import * as perimeterModule from "../../src/verify/perimeter";
 import * as deterministicModule from "../../src/verify/deterministic";
 import { samePin, type LinkPin } from "../../src/verify/pin";
@@ -286,12 +290,13 @@ describe("the verification perimeter of a cross-repo role dispatch (P1.8)", () =
     expect(out).toMatch(SCOPE_LINE);
   }, 60_000);
 
-  it("defer-cross-repo: a deferred DoD with a perimeter is verified at once, without a handle", async () => {
+  // P2e.5 (flipped on purpose): before P2e a dispatch with a perimeter was never deferred ("cross-repo"). Now, with no I4 at
+  // return, it is deferred with the perimeter frozen; no gate runs at return.
+  it("defer-cross-repo: a deferred DoD with a perimeter and no I4 at return gets a handle", async () => {
     const hooks = await crossRepo();
     const out = await runTask(hooks, `Implement it.\n${DEFERRED_DOD}`, async () => undefined);
-    expect(HANDLE.exec(out)?.[0], out).toBeUndefined();
-    expect(artefacts()).toHaveLength(1);
-    expect(artefacts()[0]?.perimeter?.roots[0]?.name).toBe("lib-b");
+    expect(HANDLE.exec(out)?.[0], out).toBeDefined();
+    expect(artefacts()).toHaveLength(0);
   }, 90_000);
 
   it("defer-control: the same role dispatch without a perimeter is deferred", async () => {
@@ -766,6 +771,172 @@ describe("link pins at dispatch (P2.6)", () => {
     await runTask(hooks, `Implement it.\n${TESTS_DOD}`, async () => undefined);
     expect(pinsOf(gateReferences()[0])).toBeUndefined();
     expect(seam.calls).not.toContain(seam.key(lib));
+  }, 90_000);
+});
+
+describe("deferred P (P2e)", () => {
+  /** The plugin's pending registry (createPendingRegistry spied before the plugin is built). */
+  let registry: ReturnType<typeof pendingModule.createPendingRegistry> | undefined;
+  /** The plugin's change store's `clear` (createChangedFileStore spied before the plugin is built). */
+  let clearSpy: MockInstance | undefined;
+  const watchPlugin = (): void => {
+    registry = undefined;
+    clearSpy = undefined;
+    const realRegistry = pendingModule.createPendingRegistry;
+    vi.spyOn(pendingModule, "createPendingRegistry").mockImplementation((...args) => {
+      registry = realRegistry(...args);
+      return registry;
+    });
+    const realStore = storeModule.createChangedFileStore;
+    vi.spyOn(storeModule, "createChangedFileStore").mockImplementation((...args) => {
+      const store = realStore(...args);
+      clearSpy = vi.spyOn(store, "clear");
+      return store;
+    });
+  };
+  const entryOf = (handle: string) => {
+    const found = registry?.get("orch", handle);
+    if (found?.kind !== "found") throw new Error(`no pending entry ${handle}`);
+    return found.entry;
+  };
+  const verify = async (hooks: any, handle: string): Promise<string> =>
+    hooks.tool.router_verify.execute({ handles: [handle] }, { sessionID: "orch" });
+  const outcomeOf = (out: string, handle: string): string | undefined =>
+    new RegExp(`^- ${handle} \u00b7 .* \u00b7 (pass|fail|unverifiable)`, "m").exec(out)?.[1];
+  const S11_CHANGED = /the linked repository lib-b at \S+ changed since the producer returned; the checks ran against its new state/;
+  const ROUTER_SCOPE_LINE = /verified scope: app-a \([^ ()]+ @ [0-9a-f]{7}\); also observed: lib-b \([^ ()]+ @ [0-9a-f]{7}\)/;
+
+  /** Pins `dir` as the router will see it: a real snapshot that also digests the ignored files. */
+  async function pinWithIgnored(dir: string): Promise<void> {
+    const keys = [seam.key(dir), seam.key(fs.realpathSync.native(dir))];
+    for (const key of keys) seam.pins.delete(key);
+    const { snapshotTree } = await vi.importActual<typeof import("../../src/verify/tree")>("../../src/verify/tree");
+    const tree = await snapshotTree(dir, new AbortController().signal, { digestPaths: [], ignoredDigest: true });
+    if (tree === undefined) throw new Error(`the real snapshot of ${dir} failed`);
+    for (const key of keys) seam.pins.set(key, tree);
+  }
+  /** W is app-a; lib-b is in the orchestrator's working set (not a link). */
+  async function crossRepo(): Promise<any> {
+    watchPlugin();
+    addToWorkingSet("orch", location(lib, "lib-b"));
+    routeAsRole(location(repo, "app-a"));
+    const hooks = await makePlugin();
+    await pin(repo);
+    await pin(lib);
+    return hooks;
+  }
+  /** W (app-a) links lib-b through node_modules (an admitted link target); lib-b is not in the working set. */
+  async function linked(): Promise<any> {
+    watchPlugin();
+    for (const dir of [repo, lib]) execFileSync("git", ["config", "core.autocrlf", "false"], { cwd: dir, stdio: "ignore" });
+    routeAsRole(location(repo, "app-a"));
+    const modules = path.join(repo, "node_modules");
+    fs.mkdirSync(modules, { recursive: true });
+    fs.symlinkSync(lib, path.join(modules, "lib-b"), "junction");
+    const realPlan = perimeterModule.planPerimeter;
+    vi.spyOn(perimeterModule, "planPerimeter").mockImplementation((id, cwd) => realPlan(id, cwd, () => ({ parents: [parent], depth: 1, exclude: [] })));
+    const hooks = await makePlugin();
+    await pin(repo);
+    await pinWithIgnored(lib);
+    return hooks;
+  }
+  /** lib-b's tracked file changes; the changed tree is pinned (with its ignored digest, as a link target is seen). */
+  const changeLib = async (): Promise<void> => {
+    fs.writeFileSync(path.join(lib, "index.ts"), "export const b = 1;\n");
+    await pinWithIgnored(lib);
+  };
+  /** The deferred handle in a dispatch's output, or the test fails showing the output. */
+  const handleIn = (out: string): string => {
+    const handle = HANDLE.exec(out)?.[0];
+    if (handle === undefined) throw new Error(`not deferred:\n${out}`);
+    return handle;
+  };
+
+  afterEach(() => {
+    // The junction is removed itself (never recursed through) before the temporary trees.
+    const junction = path.join(repo, "node_modules", "lib-b");
+    if (fs.existsSync(junction)) fs.rmSync(junction, { recursive: false, force: true });
+  });
+
+  it("I4 at return → not deferred (cross-repo), required gate gives the I4 reason", async () => {
+    const hooks = await crossRepo();
+    const out = await runTask(hooks, `Implement it.\n${DEFERRED_DOD}`, async (h, sid) => {
+      await runTool(h, sid, "bash", { command: "echo hi" });
+      fs.writeFileSync(path.join(lib, "index.ts"), "export const b = 1;\n");
+      await pin(lib);
+    });
+    expect(HANDLE.exec(out)?.[0], out).toBeUndefined();
+    expect(out).toMatch(I4_REASON("bash"));
+    expect(artefacts()).toHaveLength(1);
+  }, 90_000);
+
+  it("a link unobserved at return → required gate", async () => {
+    const hooks = await linked();
+    const out = await runTask(hooks, `Implement it.\n${DEFERRED_DOD}`, async () => {
+      // From now on lib-b cannot be snapshotted (the return-time observation, and the required gate's).
+      for (const key of [seam.key(lib), seam.key(fs.realpathSync.native(lib))]) seam.pins.set(key, Promise.resolve(undefined));
+    });
+    expect(HANDLE.exec(out)?.[0], out).toBeUndefined();
+    expect(artefacts()).toHaveLength(1);
+    expect(artefacts()[0]?.perimeter?.roots.map(root => [root.name, root.status])).toEqual([["lib-b", "unobserved"]]);
+  }, 90_000);
+
+  it("S11 end to end: deferred, lib changes after return, router_verify → UNVERIFIED with the S11 caveat", async () => {
+    const hooks = await linked();
+    const handle = handleIn(await runTask(hooks, `Implement it.\n${DEFERRED_DOD}`, async () => undefined));
+    expect(artefacts()).toHaveLength(0);
+    await changeLib();
+    const out = await verify(hooks, handle);
+    expect(outcomeOf(out, handle), out).toBe("unverifiable");
+    expect(out).toMatch(S11_CHANGED);
+  }, 90_000);
+
+  it("S11 control: lib unchanged → ✓ verified with the scope line", async () => {
+    const hooks = await linked();
+    const handle = handleIn(await runTask(hooks, `Implement it.\n${DEFERRED_DOD}`, async () => undefined));
+    const out = await verify(hooks, handle);
+    expect(outcomeOf(out, handle), out).toBe("pass");
+    expect(out).toContain("✓ verified");
+    expect(out).toMatch(ROUTER_SCOPE_LINE);
+    expect(out).not.toMatch(/the linked repository /);
+  }, 90_000);
+
+  it("pins reach router_verify (same array)", async () => {
+    const hooks = await linked();
+    const handle = handleIn(await runTask(hooks, `Implement it.\n${DEFERRED_DOD}`, async () => undefined));
+    const frozenPins = await entryOf(handle).perimeter?.pins;
+    expect(frozenPins?.map(pin => [pin.kind, seam.key(pin.root)])).toEqual([["pinned", seam.key(lib)]]);
+    await verify(hooks, handle);
+    const reference = acceptSpy.mock.calls.at(-1)?.[2]?.deterministic?.reference;
+    expect(reference?.kind).toBe("captured");
+    if (reference?.kind === "captured") expect(reference.reference.pins).toBe(frozenPins);
+  }, 90_000);
+
+  it("I9: no perimeter → no extra snapshot and no perimeter key", async () => {
+    watchPlugin();
+    routeAsRole();
+    const hooks = await makePlugin();
+    await pin(repo);
+    seam.calls.length = 0;
+    seam.hardened.length = 0;
+    const handle = handleIn(await runTask(hooks, `Implement it.\n${DEFERRED_DOD}`, async () => undefined));
+    expect(seam.calls).not.toContain(seam.key(lib));
+    expect(seam.hardened).toEqual([]);
+    const entry = entryOf(handle);
+    expect("perimeter" in entry).toBe(false);
+    expect("placements" in entry).toBe(false);
+  }, 90_000);
+
+  it("the frozen perimeter survives store.clear", async () => {
+    const hooks = await crossRepo();
+    const handle = handleIn(await runTask(hooks, `Implement it.\n${DEFERRED_DOD}`, async () => undefined));
+    // The dispatch record goes once its reference settled (finishDeferred's finally).
+    await vi.waitFor(() => expect(clearSpy?.mock.calls.length ?? 0).toBeGreaterThan(0), { timeout: 30_000 });
+    expect(entryOf(handle).perimeter?.observation.roots.map(root => [root.name, root.status])).toEqual([["lib-b", "unchanged"]]);
+    const out = await verify(hooks, handle);
+    expect(outcomeOf(out, handle), out).toBe("pass");
+    expect(out).toMatch(ROUTER_SCOPE_LINE);
+    expect(artefacts().at(-1)?.perimeter?.roots.map(root => [root.name, root.status])).toEqual([["lib-b", "unchanged"]]);
   }, 90_000);
 });
 
