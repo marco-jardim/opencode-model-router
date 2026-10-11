@@ -248,7 +248,9 @@ export default {
       rec("execute.after", { ...base, ...describeInput(e.input), ...shape });
       if (mode !== "filter-grep" || (e.tool !== "grep" && e.tool !== "glob") || e.status !== "completed") return;
       let removed = 0;
+      let sawLeasedFull = false; // the leased token in the FULL pre-filter text (the execute.after line above only keeps a 300-character preview)
       const filter = (text) => {
+        if (text.includes("CPX_LEASED")) sawLeasedFull = true;
         const lines = text.split("\n");
         const kept = lines.filter((line) => !line.includes("CPX_LEASED"));
         if (kept.length === lines.length) return undefined;
@@ -261,7 +263,7 @@ export default {
       const outputIsObject = result && result.output && typeof result.output === "object" && typeof result.output.output === "string";
       const [output, outputCount] = outputIsString || outputIsObject ? mapStrings(result.output, filter) : [undefined, 0];
       if (contentCount + outputCount === 0) {
-        rec("filter-grep", { ...base, mutable: null, removedLines: 0, note: "no CPX_LEASED line in the result" });
+        rec("filter-grep", { ...base, mutable: null, removedLines: 0, sawLeasedFull, note: "no CPX_LEASED line in the result" });
         return;
       }
       const next = { ...result };
@@ -275,7 +277,7 @@ export default {
         mutable = false;
         failure = String(error);
       }
-      rec("filter-grep", { ...base, mutable: mutable && e.result === next, removedLines: removed, error: failure });
+      rec("filter-grep", { ...base, mutable: mutable && e.result === next, removedLines: removed, sawLeasedFull, error: failure });
     }));
 
     // ---- session context hook --------------------------------------------------------------------------------------

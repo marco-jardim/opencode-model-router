@@ -51,6 +51,16 @@ Pre-flight finding, fixed by amendment:
 
 ## Implementation notes
 
+| Task | Dispatch | Commit(s) | Result |
+|---|---|---|---|
+| 0.1.0 harness | implementer `ses_ed7caa421ffe2GuCUQq18En3n1` | `06e9840` | `HostOptions.extraPlugins`, `RoutingHost.restart()`, `HostOptions.provider` → `CpxFront` in front of the host's `RoutingProvider` (faults rate-limit / overloaded / usage-limit, later invalid-request; per-request delay; cache usage fields; request capture), `evidenceDir()` honouring `OMR_SMOKE_EVIDENCE_DIR`. Note: the host uses its own `RoutingProvider`, not `ScriptedProvider`, so the front wraps any fixture; `CpxScriptedProvider extends ScriptedProvider` exists for standalone use. `cpx-scripted-provider.test.ts` 22 → 24 tests, green. v1-frozen files byte-identical (A-0.1-1). |
+| 0.1.1 probe | implementer `ses_ed7c5ff2dffeQKgDuOStO4Kr40` | `b996991` | `test\smoke\probe\cpx-probe-plugin.js`, default export `{ id, setup(ctx) }`, loaded through a generated plugin directory (`server.mjs` + `package.json` exports) whose preamble sets the probe env. |
+| 0.1.2 observation smoke | implementer `ses_ed7c16461ffeBRBUvVmPUV3FQ6` (3 batches + C14 hooks) | `aef7992`, `a138c8c`, `4b1af17`, `8592eb3` | `smoke:cpx`, `smoke:cpx:provision`, `smoke:cpx:e2e` scripts (`smoke:cpx` also runs the provider unit tests, A-0.1-1); C1–C15 in observation mode, one `C<n>.json` per contract under `%TEMP%\omr-cpx-probe`. |
+| 0.1.3 three runs | orchestrator shell | — | First set: runs 1 and 3 failed in C7 only — a race between the C7 failure mechanism (a fixture error) and `callMany`'s `provider.errors` abort (isolated C7: FAIL, FAIL, PASS). Fixed deterministically in `1e8566b` (the failing child gets a non-retryable `invalid-request` fault from the front; isolated C7 4/4). Second set: 3/3 green (39/39 each, 415-433 s). Digest of the three sets: `tmp\cpx-obs\digest.txt` (gitignored), variance recorded in the ADR evidence table. |
+| 0.1.4 ADR text | architect, heavy pin `ses_ed780d877ffeBExnn0buXlUxCE` | — | Branches decided; D5 withdrawn (C6 does not hold); C12 does not hold for children in flight; launcher A; tail as a last `user` message; `maxParallel` clamp 8; C10 signals are `session.retry.scheduled` fields; open observations O1–O10. |
+| 0.1.5 ADR file | orchestrator shell (verbatim copy of the 0.1.4 text; takeover: mechanical copy) | `54531a8` | `docs\adr\0007-critical-path-execution.md`; one link fixed (`phase-0.1.md`). |
+| 0.1.6 assertions | implementer `ses_ed7c16461ffeBRBUvVmPUV3FQ6` | `ddb0376` + C15 check fix | Every contract asserts its decided branch (`C<n>/D<k>` in the message) after writing its observation; O1–O6 observed and asserted (O3: 8 concurrent retained launches; O5: a successful compaction carries the placeholder; O6: `session.synthetic` with `resume: true` wakes an idle parent). The C15 "original kept" check now uses a pre-compaction snapshot and the full message log, because a successful compaction collapses `session.context`. |
+
 ## Findings
 
 ## Fixes

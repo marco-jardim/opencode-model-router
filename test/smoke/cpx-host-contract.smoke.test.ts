@@ -712,9 +712,10 @@ d("C9 tool hooks: execute.before paths, execute.after result rewriting", () => {
             advertised: defs.has(tool), inputSent: input, promptError,
             executeBefore: before ? { argKeys: before.argKeys, args: before.args, agent: before.agent } : null,
             executeAfter: after ? { status: after.status, resultKeys: after.resultKeys, contentText: after.contentText, outputText: after.outputText, error: after.error } : null,
-            filter: filter ? { mutable: filter.mutable, removedLines: filter.removedLines, error: filter.error, note: filter.note } : null,
+            filter: filter ? { mutable: filter.mutable, removedLines: filter.removedLines, sawLeasedFull: filter.sawLeasedFull, error: filter.error, note: filter.note } : null,
             modelSaw: modelText === undefined ? null : { text: modelText.slice(0, 500), containsLeased: modelText.includes("CPX_LEASED"), containsHiddenNote: modelText.includes("[cpx: 1 hidden]"), requestIndex: seen?.index },
-            probeSawLeasedBeforeFilter: after ? json([after.contentText, after.outputText]).includes("CPX_LEASED") : undefined,
+            // The execute.after line keeps only a ~300-character preview of the result; `filter.sawLeasedFull` is the probe's check on the FULL pre-filter text.
+            probeSawLeasedInPreview: after ? json([after.contentText, after.outputText]).includes("CPX_LEASED") : undefined,
           };
         }
         o.observed.fixtureErrors = host.provider.errors.map(e => e.slice(0, 300));
@@ -1370,7 +1371,7 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
       check(o, "C9/D7", sortedKeys(at(ob, "perTool", tool, "executeBefore", "argKeys")) === sortedKeys(keys), `${tool}: execute.before must receive exactly the arguments {${keys.join(", ")}}; the lease checks read these keys`);
     }
     for (const tool of ["glob", "grep"]) {
-      check(o, "C9/D7", at(ob, "perTool", tool, "filter", "mutable") === true && Number(at(ob, "perTool", tool, "filter", "removedLines")) >= 1 && at(ob, "perTool", tool, "probeSawLeasedBeforeFilter") === true, `${tool}: execute.after must be able to rewrite the result (search filtering)`);
+      check(o, "C9/D7", at(ob, "perTool", tool, "filter", "mutable") === true && Number(at(ob, "perTool", tool, "filter", "removedLines")) >= 1 && at(ob, "perTool", tool, "filter", "sawLeasedFull") === true, `${tool}: execute.after must be able to rewrite the result (search filtering): the full pre-filter text held the leased line and the probe removed it`);
       check(o, "C9/D7", at(ob, "perTool", tool, "modelSaw", "containsLeased") === false && at(ob, "perTool", tool, "modelSaw", "containsHiddenNote") === true, `${tool}: the model must receive the rewritten result (leased lines removed, note present)`);
     }
     const unexpected = ["multiedit", "patch", "apply_patch"].filter(t => at(ob, "advertisedTools", t) !== undefined);
