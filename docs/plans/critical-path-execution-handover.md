@@ -333,8 +333,8 @@ Everything else is work: resolve it, record it, continue.
 
 ## 7. Live state (§0.11 — keep current)
 
-**Next action:** Phase 0.1 — finish pre-flight (smoke:keyless baseline running in `D:\git\omr-cpx-p01`), merge `cpx/main`
-(`9943abe` revert + amendment A-0.1-1) into `cpx/p01`, write `phase-0.1.md` `## Pre-flight`, then dispatch 0.1.0.
+**Next action:** Phase 0.1 — 0.1.3 (three `smoke:cpx` runs, running in the orchestrator shell since 21:20; observations
+copied to `$env:TEMP\omr-cpx-runs\run<n>`), then 0.1.4 heavy ADR text.
 
 **Orchestrator session:** `ses_ed82f88a7ffej5iKaRHuwIa6fd` (directory `D:\git\omr-cpx-main`).
 
@@ -346,7 +346,7 @@ implementation's worktree `D:\git\opencode-model-router-cross-repo` (branch `fea
 | Phase | State | QA round | Notes |
 |---|---|---|---|
 | 0.P | **done** 2026-10-10 ≈20:45 | 3 (r1: 14, r2: 9, r3: 1 — all fixed or dispositioned; 7 minor/nit deferred to the DF-1 pre-flight) | started 18:55; `preflight.md` verdict: done |
-| 0.1 | running (pre-flight) | — | started 20:37; worktree `D:\git\omr-cpx-p01`, base tag `cpx/p01-base` = `584e0cf` |
+| 0.1 | running (0.1.3) | — | started 20:37; worktree `D:\git\omr-cpx-p01`, base tag `cpx/p01-base` = `584e0cf`; pre-flight `d65c3f2`; 0.1.0 `06e9840`; 0.1.1 `b996991`; 0.1.2 `aef7992`, `a138c8c`, `4b1af17`, `8592eb3` |
 | 1.1 · 1.2 · 1.3 · 1.4 | waiting | — | |
 | 2.1 | waiting | — | |
 | DF-1 | waiting | — | |
@@ -369,7 +369,11 @@ orchestrator takes `Get-Date` at every dispatch start and end.
 | after r1 → before 20:03:23 (`9c8efd6`) | implementer (QA-0.P-3) | `ses_ed7f25ed7ffe2aF7jc1XBiILR2` | `D:\git\omr-cpx-main` | W: `test\unit\v2-hooks.test.ts`, `test\unit\roles.registration.test.ts` / R: same | `9c8efd6`, reverted `674f037` (it lowered a 60 s describe timeout) |
 | after 20:07:20 (`add3cd4`) → ≈20:15 | reviewer (heavy, QA-0.P r2) | `ses_ed7ed7507ffeGyZbT2YjMmOSjj` | `D:\git\omr-cpx-main` @ `add3cd4` | W: none / R: `D:\git\omr-cpx-main\` | 9 findings |
 | ≈20:18 → before 20:26:39 (`46dac26`) | implementer (QA-0.P-17) | `ses_ed7dd3c29ffeOXxyWz6FDP0VQs` | `D:\git\omr-cpx-main` | W: `test\smoke\deferred-catalog.smoke.test.ts` / R: same, `test\smoke\registration.smoke.test.ts` | done, verified deterministic, `46dac26` |
-| after 20:30 (`093ade6`) → ≈20:40 | reviewer (heavy, QA-0.P r3) | `ses_ed7d93d91ffeKN16UPoxY33h3p` | `D:\git\omr-cpx-main` @ `093ade6` | W: none / R: `D:\git\omr-cpx-main\` | 15/16/17 fixed; 1 new major (QA-0.P-24, fixed) |
+| after 20:30 (`093ade6`) → ≈20:36 | reviewer (heavy, QA-0.P r3) | `ses_ed7d93d91ffeKN16UPoxY33h3p` | `D:\git\omr-cpx-main` @ `093ade6` | W: none / R: `D:\git\omr-cpx-main\` | 15/16/17 fixed; 1 new major (QA-0.P-24, fixed) |
+| 20:38 → 20:43 | explorer (0.1 pre-flight) | `ses_ed7d1437fffefP40S5OZKDZqXM` | `D:\git\omr-cpx-p01` | W: none / R: harness files | anchors, harness facts |
+| 20:45 → 20:50 | implementer (0.1.0) | `ses_ed7caa421ffe2GuCUQq18En3n1` | `D:\git\omr-cpx-p01` | W: `routing-host.ts`, `cpx-scripted-provider(.test).ts` | `06e9840`; provider tests 22/22 |
+| 20:50 → 20:55 | implementer (0.1.1) | `ses_ed7c5ff2dffeQKgDuOStO4Kr40` | `D:\git\omr-cpx-p01` | W: `test\smoke\probe\cpx-probe-plugin.js` | `b996991` |
+| 20:55 → 21:19 | implementer (0.1.2, 4 resumes) | `ses_ed7c16461ffeBRBUvVmPUV3FQ6` | `D:\git\omr-cpx-p01` | W: `cpx-host-contract.smoke.test.ts`, `package.json`, probe (C14) | C1-C15 observed on 2.0.26 |
 
 The DF-0 run-scoped self-check (marker `omr-selfcheck-7f3a91c2d4`, server executable) ran between 19:47 and 20:07.
 
