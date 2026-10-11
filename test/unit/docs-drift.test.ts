@@ -1631,8 +1631,8 @@ describe("docs drift: the per-turn router state on OpenCode v2 (Phase 1.2.6)", (
     expect(flatState).toContain("`… 12 more lines`");
     expect(flatState).toContain("` (router_plan action=status)`");
     expect(flatState).toMatch(/one ephemeral cache breakpoint/);
-    expect(flatState).toMatch(/last text part with visible text of the last real message/);
-    expect(flatState).toMatch(/on its last part whatever its type/);
+    expect(flatState).toMatch(/on the last non-blank text part of the last real message or, when that message has no such part, on its last `tool-result` or `media` part/);
+    expect(flatState).toMatch(/When it has neither, there is no hint: the tail is still added, and the host may then mark the tail itself/);
     expect(flatState).toMatch(/never moves to an earlier message/);
     expect(flatState).toMatch(/no 1-hour TTL/);
     expect(flatState).toMatch(/OpenCode v2\.0\.26 cannot set the TTL of the tools breakpoint/);

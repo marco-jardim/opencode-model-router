@@ -104,9 +104,10 @@ were left out (`… 12 more lines`; a line ends with ` (router_plan action=statu
 plan section is active). Lines are never cut in the middle.
 
 **Cache hint.** The router puts one ephemeral cache breakpoint (`{ "type": "ephemeral" }`)
-on the last text part with visible text of the last real message or, when that message has
-no such part (a tool-result-only message), on its last part whatever its type. It never
-moves to an earlier message, so during a tool loop it follows the newest message. The state
+on the last non-blank text part of the last real message or, when that message has no such
+part, on its last `tool-result` or `media` part. When it has neither, there is no hint: the
+tail is still added, and the host may then mark the tail itself. It never moves to an
+earlier message, so during a tool loop it follows the newest message. The state
 message itself never carries it, and no system part gets one. It carries no 1-hour TTL:
 OpenCode v2.0.26 cannot set the TTL of the tools breakpoint, so a longer TTL on the
 message breakpoint alone would not keep the prefix cached (ADR 0007, decision D5,
