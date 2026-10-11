@@ -4,14 +4,15 @@
  *   npm run smoke:cpx:provision            (sets RUN_OC_SMOKE_CPX=1)
  *
  * Gate: RUN_OC_SMOKE_CPX=1. Unset, every test of the file is skipped, so `npm test` never runs it (and vitest.config.ts
- * excludes test/smoke/** anyway). Set, it needs on PATH: git, pnpm (or corepack), Python 3 (Windows: the py launcher)
- * with pytest installed for that Python. A missing tool fails the test with the remedy; nothing is downloaded except
- * what pnpm and pip decide for a project with zero dependencies (nothing).
+ * excludes test/smoke/** anyway). Set, it needs on PATH: git, pnpm (or corepack), Python 3.11+ (Windows: the py launcher).
+ * A missing tool fails the test with the remedy; nothing is downloaded except what pnpm and pip decide for a project
+ * with zero dependencies (nothing).
  *
  * - A slot of a repository with the node-pnpm and py-pip fixtures is provisioned for real (pnpm install, python -m venv,
  *   pip install -r requirements.txt).
- * - pytest runs through verify/exec runArgv in the slot, with PYTHONPATH pointing at the main checkout: it must report
- *   the slot's module path.
+ * - The bare `python` runs through verify/exec runArgv in the slot with `-P` and a decoy `mypkg` on PYTHONPATH: it must
+ *   be the slot's .venv interpreter and import the slot's module.
+ * - The pnpm-workspace fixture (root pnpm-workspace.yaml + one package) is provisioned for real without --ignore-workspace.
  * - A second task reuses the slot without reinstalling: onProvision is not called again; both acquire times are logged
  *   (informational, not a threshold).
  */
@@ -25,7 +26,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createGitOps, createGitRunner, type GitOps } from "../../src/executor/git";
 import { createSlotPool } from "../../src/executor/slots/pool";
-import { createProvisioner, planProvision, type Detection, type ProvisionHost } from "../../src/executor/slots/provision";
+import { createProvisioner, planProvision, type Detection, type ProvisionHost, type Provisioner } from "../../src/executor/slots/provision";
 import type { Clock, FileSystem, FsStat, ProcessResult, Spawner } from "../../src/executor/types";
 import { runArgv } from "../../src/verify/exec";
 import { removeDirWhenReleased } from "../helpers/remove-dir";
@@ -151,23 +152,13 @@ function git(cwd: string, ...args: string[]): string {
   return r.stdout.trim();
 }
 
-/** The interpreter that has pytest, by absolute path (the py launcher would follow VIRTUAL_ENV into the slot). */
-function pytestPython(): string {
-  const [launcher, args] = WIN ? ["py", ["-3"]] as const : ["python3", []] as const;
-  const r = spawnSync(launcher, [...args, "-c", "import sys, pytest; print(sys.executable)"], { encoding: "utf8", windowsHide: true });
-  const exe = r.stdout?.trim() ?? "";
-  if (r.error !== undefined || r.status !== 0 || exe === "") {
-    throw new Error(`${launcher} ${args.join(" ")} with pytest is required for this smoke: install Python 3 and run "${launcher} ${args.join(" ")} -m pip install pytest"`);
-  }
-  return exe;
-}
-
 describe.skipIf(!RUN)("cpx provisioning smoke (real pnpm and pip)", () => {
   let base = "";
   let repo = "";
   let head = "";
   let ops: GitOps | undefined;
   let pool: ReturnType<typeof createSlotPool> | undefined;
+  let provisioner: Provisioner | undefined;
   let slotPath = "";
   const provisioned: string[] = [];
   const times: Record<string, number> = {};
@@ -209,10 +200,11 @@ describe.skipIf(!RUN)("cpx provisioning smoke (real pnpm and pip)", () => {
       git: createGitRunner({ mode: "hardened", toplevel: repo }), userGit: createGitRunner({ mode: "user", toplevel: repo }),
       fs, planId: PLAN, toplevel: repo, executorHome: home,
     });
+    provisioner = createProvisioner({ spawner: nodeSpawner(), fs, clock: realClock(), host, config });
     pool = createSlotPool({
       planId: PLAN, repoKey: "smoke", toplevel: repo, slotsDir: join(base, "slots", PLAN), markersDir: join(home, "markers"),
       executorHome: home, maxParallel: 2, git: ops, fs, clock: realClock(),
-      provisioner: createProvisioner({ spawner: nodeSpawner(), fs, clock: realClock(), host, config }),
+      provisioner,
       onProvision: (slot, managers) => { provisioned.push(`${slot}:${managers.join(",")}`); },
       logger: { warn: (m) => { console.warn(`[cpx-provision smoke] ${m}`); } },
     });
@@ -245,26 +237,48 @@ describe.skipIf(!RUN)("cpx provisioning smoke (real pnpm and pip)", () => {
     expect(Object.keys(rec?.manifests ?? {})).toEqual(expect.arrayContaining(["package.json", "pnpm-lock.yaml", "requirements.txt"]));
   }, 600_000);
 
-  it("pytest in the slot imports the slot's module, not PYTHONPATH's", async () => {
+  it("the slot's own python (found on PATH) imports the slot's module, not a decoy on PYTHONPATH", async () => {
     expect(slotPath).not.toBe("");
-    const python = pytestPython();
+    // A decoy `mypkg` on PYTHONPATH: if the slot environment leaked PYTHONPATH it would win over the slot's module,
+    // which the script appends last. -P (Python 3.11+) keeps the working directory off sys.path, so the module can only
+    // come from PYTHONPATH (leak) or from the explicit append (slot). The bare `python` is the slot's .venv one only
+    // when the slot's PATH prepending reaches the child.
+    const decoy = join(base, "decoy");
+    mkdirSync(join(decoy, "mypkg"), { recursive: true });
+    writeFileSync(join(decoy, "mypkg", "__init__.py"), "");
     const saved = process.env["PYTHONPATH"];
-    process.env["PYTHONPATH"] = repo;
+    process.env["PYTHONPATH"] = decoy;
     try {
-      const r = await runArgv(python, ["-m", "pytest", "-q", "-s", "-p", "no:cacheprovider", "tests/test_where.py"], { cwd: slotPath, timeoutMs: 180_000 });
-      expect(r.code, `${r.stdout}\n${r.stderr}`).toBe(0);
-      const line = r.stdout.split(/\r?\n/).find((l) => l.includes("MODULE_PATH="));
-      expect(line, r.stdout).toBeDefined();
-      const module = (line ?? "").slice((line ?? "").indexOf("MODULE_PATH=") + "MODULE_PATH=".length).trim();
-      console.info(`[cpx-provision smoke] pytest module path: ${module}`);
-      expect(realpathSync.native(module).toLowerCase().startsWith(`${slotPath.toLowerCase()}${WIN ? "\\" : "/"}`)).toBe(true);
-      const env = await runArgv(python, ["-c", "import os; print(os.environ.get('PYTHONPATH'))"], { cwd: slotPath, timeoutMs: 60_000 });
+      const script = "import os, sys; sys.path.append(os.getcwd()); import mypkg; print('PREFIX=' + sys.prefix); print('MODULE_PATH=' + mypkg.__file__)";
+      const r = await runArgv("python", ["-P", "-c", script], { cwd: slotPath, timeoutMs: 180_000 });
+      expect(r.code, `${r.stdout}\n${r.stderr} (-P needs Python 3.11 or newer)`).toBe(0);
+      const field = (name: string): string => {
+        const line = r.stdout.split(/\r?\n/).find((l) => l.startsWith(`${name}=`));
+        expect(line, r.stdout).toBeDefined();
+        return (line ?? "").slice(name.length + 1).trim();
+      };
+      const inside = (path: string): boolean => realpathSync.native(path).toLowerCase().startsWith(`${slotPath.toLowerCase()}${WIN ? "\\" : "/"}`);
+      console.info(`[cpx-provision smoke] slot python prefix: ${field("PREFIX")}; module path: ${field("MODULE_PATH")}`);
+      expect(inside(field("PREFIX"))).toBe(true);
+      expect(inside(field("MODULE_PATH"))).toBe(true);
+      const env = await runArgv("python", ["-c", "import os; print(os.environ.get('PYTHONPATH'))"], { cwd: slotPath, timeoutMs: 60_000 });
       expect(env.stdout.trim()).toBe("None");
     } finally {
       if (saved === undefined) delete process.env["PYTHONPATH"];
       else process.env["PYTHONPATH"] = saved;
     }
   }, 300_000);
+
+  it("provisions a pnpm workspace root for real, keeping the workspace", async () => {
+    if (provisioner === undefined) throw new Error("the provisioner was not created (see beforeAll)");
+    const ws = join(base, "ws-slot");
+    cpSync(join(FIXTURES, "pnpm-workspace"), ws, { recursive: true });
+    const tracked = ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "packages/a/package.json"];
+    const d = await provisioner.detect(ws, tracked);
+    expect(d).toMatchObject({ managers: ["pnpm"], pnpmWorkspace: true });
+    await provisioner.provision(ws, d, { fresh: false });
+    expect(existsSync(join(ws, "node_modules"))).toBe(true);
+  }, 600_000);
 
   it("a second task reuses the slot without reinstalling (timed)", async () => {
     const first = await thePool().get("slot-1");

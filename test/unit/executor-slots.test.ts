@@ -6,6 +6,7 @@ import { runArgv } from "../../src/verify/exec";
 import type { GitOps, StatusEntry } from "../../src/executor/git";
 import { assertSafeSlotDir, createSlotPool, defaultSlotsDir, gcSlots, isSlotRecord, markerPath, slotLockReason, SLOT_NAME_PATTERN, UNKNOWN_PLAN_GC_AGE_MS } from "../../src/executor/slots/pool";
 import { applySlotEnv, registerSlot, slotEnvFor, unregisterSlot } from "../../src/executor/slots/env";
+import { detectManagers } from "../../src/executor/slots/provision";
 import type { Detection, Provisioner } from "../../src/executor/slots/provision";
 import { ExecutorError, GIT_ID_PATTERN, type Clock, type ExecutorConfig, type FileSystem, type FsStat, type SlotRecord } from "../../src/executor/types";
 
@@ -246,6 +247,15 @@ interface FakeGit extends GitOps {
   fail: Map<string, { error: Error; times: number }>;
   badPointers: Set<string>;
   cleanKeeps: string[][];
+  /** keep lists of every cleanTracked (reset) and cleanPreview call. */
+  resetKeeps: string[][];
+  previewKeeps: string[][];
+  /** What `git clean -ndx` lists (slot-relative paths), per call; a function sees the slot and the keep list. */
+  preview: (slot: string, keep: readonly string[]) => string[];
+  /** Tracked links of the index. */
+  links: string[];
+  /** Admin entries of the added worktrees: key(path) -> lock reason. Seed it for folders that were not added through the fake. */
+  worktrees: Map<string, string>;
 }
 
 function fakeGit(fs: MemFs): FakeGit {
@@ -255,8 +265,15 @@ function fakeGit(fs: MemFs): FakeGit {
   };
   const g: FakeGit = {
     planId: PLAN, log: [], heads: new Map(), files: { "requirements.txt": "pytest\n" }, status: [], topHead: C1,
-    fail: new Map(), badPointers: new Set(), cleanKeeps: [],
-    version: unused, checkRefFormat: unused, worktreeList: unused, addAll: unused, commit: unused, rebaseOnto: unused,
+    fail: new Map(), badPointers: new Set(), cleanKeeps: [], resetKeeps: [], previewKeeps: [],
+    preview: () => [], links: [], worktrees: new Map(),
+    version: unused, checkRefFormat: unused, addAll: unused,
+    async worktreeList() {
+      return [...g.worktrees.entries()].map(([path, locked]) => ({ path: path.replace(/\//g, "\\"), head: null, branch: null, locked }));
+    },
+    async cleanPreview(slot, keep) { g.previewKeeps.push([...keep]); return g.preview(slot, keep); },
+    async lsFiles() { return Object.keys(g.files); },
+    async trackedLinks() { return [...g.links]; }, commit: unused, rebaseOnto: unused,
     rebaseAbort: unused, cherryPick: unused, revert: unused, mergeFfOnly: unused, isAncestor: unused, tag: unused,
     deleteRefs: unused, branchForce: unused,
     async verifySlotPointers(slot) {
@@ -266,17 +283,23 @@ function fakeGit(fs: MemFs): FakeGit {
       }
       return { gitdir: `${TOP}\\.git\\worktrees\\x`, common: `${TOP}\\.git` };
     },
-    async worktreeAdd(path, commit) {
+    async worktreeAdd(path, commit, lockReason) {
       maybeFail("worktreeAdd");
       g.log.push(`add ${key(path)}`);
+      g.worktrees.set(key(path), lockReason);
       g.badPointers.delete(key(path));
       fs.dir(path);
       for (const [rel, text] of Object.entries(g.files)) fs.put(win32.join(path, ...rel.split("/")), text);
       g.heads.set(key(path), commit);
     },
-    async worktreeRemove(path) { g.log.push(`remove ${key(path)}`); },
+    async worktreeRemove(path, lockReason) {
+      g.log.push(`remove ${key(path)}`);
+      const held = g.worktrees.get(key(path));
+      if (held !== undefined && held !== lockReason) throw new ExecutorError("E_GIT", "worktree is locked by someone else", { op: "worktree remove" });
+      g.worktrees.delete(key(path));
+    },
     async checkoutDetach(slot, commit) { maybeFail("checkoutDetach"); g.log.push(`checkout ${key(slot)} ${commit.slice(0, 2)}`); g.heads.set(key(slot), commit); },
-    async cleanTracked(slot) { maybeFail("cleanTracked"); g.log.push(`clean ${key(slot)}`); },
+    async cleanTracked(slot, keep) { maybeFail("cleanTracked"); g.log.push(`clean ${key(slot)}`); g.resetKeeps.push([...keep]); },
     async cleanForChecks(slot, keep) { maybeFail("cleanForChecks"); g.log.push(`cleanForChecks ${key(slot)}`); g.cleanKeeps.push([...keep]); },
     async statusPorcelain() { return g.status; },
     async revParse(cwd, rev) {
@@ -291,16 +314,20 @@ function fakeGit(fs: MemFs): FakeGit {
 
 interface FakeProvisioner extends Provisioner {
   calls: Array<{ slot: string; managers: string[]; fresh: boolean }>;
+  /** The AbortSignal each provision call received. */
+  signals: Array<AbortSignal | undefined>;
   error: Error | null;
   /** When set, provision waits for it. */
   gate: Promise<void> | null;
 }
 
-function fakeProvisioner(): FakeProvisioner {
+function fakeProvisioner(fs: FileSystem, config: Pick<ExecutorConfig, "provision" | "python"> = { provision: "auto", python: "auto" }): FakeProvisioner {
   const p: FakeProvisioner = {
-    calls: [], error: null, gate: null,
-    async provision(slot: string, d: Detection, o: { fresh: boolean }) {
+    calls: [], error: null, gate: null, signals: [],
+    detect: (slot, tracked) => detectManagers(slot, tracked, fs, config),
+    async provision(slot: string, d: Detection, o: { fresh: boolean; signal?: AbortSignal }) {
       p.calls.push({ slot, managers: [...d.managers], fresh: o.fresh });
+      p.signals.push(o.signal);
       if (p.gate !== null) await p.gate;
       if (p.error !== null) throw p.error;
     },
@@ -320,7 +347,7 @@ function harness(o: { maxParallel?: number; fs?: MemFs; config?: Pick<ExecutorCo
   const fs = o.fs ?? memFs();
   const git = fakeGit(fs);
   const clock = autoClock();
-  const prov = fakeProvisioner();
+  const prov = fakeProvisioner(fs, o.config);
   const provisioned: string[] = [];
   const warnings: string[] = [];
   const pool = createSlotPool({
@@ -456,11 +483,11 @@ describe("SlotPool lifecycle", () => {
     const h = harness();
     await h.pool.open();
     await h.pool.acquire(PLAN, "task-1", C1);
-    h.git.fail.set("checkoutDetach", { error: new Error("EBUSY"), times: 1 });
+    h.git.fail.set("checkoutDetach", { error: Object.assign(new Error("EBUSY"), { code: "EBUSY" }), times: 1 });
     await h.pool.reset("slot-1", C2);
     expect(h.clock.slept).toContain(2000);
     expect(h.marker("slot-1").state).toBe("leased");
-    h.git.fail.set("checkoutDetach", { error: new Error("EBUSY"), times: 5 });
+    h.git.fail.set("checkoutDetach", { error: Object.assign(new Error("EBUSY"), { code: "EBUSY" }), times: 5 });
     await expect(h.pool.reset("slot-1", C3)).rejects.toMatchObject({ code: "E_SLOT_BROKEN", message: expect.stringContaining("held by a running process") });
     expect(h.marker("slot-1")).toMatchObject({ state: "broken", owner: null });
     expect(slotEnvFor(slotPath("slot-1"), "win32")).toBeNull();
@@ -670,7 +697,7 @@ describe("SlotPool input validation and open()", () => {
     const fs = over.fs ?? memFs();
     return createSlotPool({
       planId: PLAN, repoKey: "repo-key", toplevel: over.toplevel ?? TOP, slotsDir, markersDir: MARKERS, executorHome: HOME,
-      maxParallel: over.maxParallel ?? 4, git: fakeGit(fs), fs, clock: autoClock(), provisioner: fakeProvisioner(), platform: "win32",
+      maxParallel: over.maxParallel ?? 4, git: fakeGit(fs), fs, clock: autoClock(), provisioner: fakeProvisioner(fs), platform: "win32",
     });
   }
 
@@ -781,7 +808,8 @@ describe("SlotPool repair", () => {
     const h = seeded([record("slot-1", { state: "creating" })], [slotPath("slot-1")]);
     await h.pool.open();
     await h.pool.acquire(PLAN, "t1", C1);
-    expect(h.git.log).toEqual([]);
+    // QA-2.4-13: the half-made checkout is brought to the recorded commit before provisioning.
+    expect(h.git.log).toEqual([`checkout ${key(slotPath("slot-1"))} 11`, `clean ${key(slotPath("slot-1"))}`]);
     expect(h.states("slot-1")).toEqual(["provisioning", "leased"]);
   });
 
@@ -802,12 +830,35 @@ describe("SlotPool repair", () => {
     h.fs.dir(slotPath("slot-1"));
     h.fs.put(win32.join(slotPath("slot-1"), "junk.txt"), "x");
     h.git.badPointers.add(key(slotPath("slot-1")));
+    h.git.worktrees.set(key(slotPath("slot-1")), slotLockReason(PLAN, "slot-1"));
     await h.pool.open();
     await h.pool.acquire(PLAN, "t1", C1);
     expect(h.fs.text(win32.join(slotPath("slot-1"), "junk.txt"))).toBeNull();
     expect(h.states("slot-1")).toContain("retired");
     expect(h.git.log).toContain(`add ${key(slotPath("slot-1"))}`);
     expect(h.marker("slot-1")).toMatchObject({ state: "leased", owner: "t1" });
+  });
+
+  // QA-2.4-3: a folder git does not list as locked by the executor for this slot is never wiped.
+  it("creating, non-empty directory git does not list as ours: nothing is deleted and the slot breaks", async () => {
+    const h = seeded([record("slot-1", { state: "creating" })]);
+    h.fs.dir(slotPath("slot-1"));
+    h.fs.put(win32.join(slotPath("slot-1"), "precious.txt"), "keep");
+    h.git.badPointers.add(key(slotPath("slot-1")));
+    await h.pool.open();
+    await expect(h.pool.acquire(PLAN, "t1", C1)).rejects.toMatchObject({ code: "E_SLOT_BROKEN" });
+    expect(h.fs.text(win32.join(slotPath("slot-1"), "precious.txt"))).toBe("keep");
+    h.git.worktrees.set(key(slotPath("slot-1")), "somebody else's lock");
+    expect(h.fs.removed.some(r => key(r.path) === key(slotPath("slot-1")))).toBe(false);
+  });
+
+  // QA-2.4-12
+  it("a special slot folder without a marker is never adopted", async () => {
+    const h = harness();
+    h.fs.dir(slotPath("integration"));
+    await h.pool.open();
+    await expect(h.pool.acquireSpecial(PLAN, "integration")).rejects.toMatchObject({ code: "E_SLOT_UNAVAILABLE" });
+    expect(h.git.log).toEqual([]);
   });
 
   it("creating, directory is a file or a link: broken", async () => {
@@ -955,6 +1006,7 @@ describe("SlotPool gc", () => {
     h.fs.dir(dir);
     h.fs.dir(slotPath("slot-1", dir));
     h.fs.dir(slotPath("slot-2", dir));
+    h.git.worktrees.set(key(slotPath("slot-1", dir)), slotLockReason(other, "slot-1"));
     const out = await h.pool.gc(async (planId) => planId === other);
     expect(out.removed).toEqual([slotPath("slot-1", dir)]);
     expect(await h.fs.lstat(slotPath("slot-2", dir))).not.toBeNull();
@@ -1138,15 +1190,67 @@ describe("SlotPool gc", () => {
     expect(h.marker("slot-1").state).toBe("retired");
   });
 
-  it("invalid git pointers: the directory is removed, the worktree entry is left and reported", async () => {
+  // QA-2.4-3: the entry is dropped by path + lock reason even when the pointers were invalid.
+  it("invalid git pointers: the directory is removed, the worktree entry is dropped by path and lock reason, and it is reported", async () => {
     const h = harness();
     const path = await leased(h);
     h.git.badPointers.add(key(path));
     const out = await h.pool.gc(async () => true);
     expect(out.removed).toEqual([path]);
-    expect(out.reported[0]).toContain("left for manual removal");
-    expect(h.git.log).not.toContain(`remove ${key(path)}`);
+    expect(out.reported[0]).toContain("git pointers were invalid");
+    expect(h.git.log).toContain(`remove ${key(path)}`);
+    expect(h.git.worktrees.size).toBe(0);
     expect(await h.fs.lstat(path)).toBeNull();
+  });
+
+  // QA-2.4-3
+  it("deletes nothing when git does not list the folder locked with this slot's reason", async () => {
+    const h = harness();
+    const path = await leased(h);
+    h.fs.put(win32.join(path, "gold.txt"), "keep");
+    h.git.worktrees.set(key(path), "somebody else's lock");
+    const unlisted = await h.pool.gc(async () => true);
+    expect(unlisted.removed).toEqual([]);
+    expect(unlisted.reported[0]).toContain("nothing was deleted");
+    h.git.worktrees.delete(key(path));
+    const none = await h.pool.gc(async () => true);
+    expect(none.removed).toEqual([]);
+    expect(none.reported[0]).toContain("nothing was deleted");
+    expect(h.fs.text(win32.join(path, "gold.txt"))).toBe("keep");
+    expect(h.marker("slot-1").state).toBe("retired");
+  });
+
+  // QA-2.4-3
+  it("requires the trusted slots folder to be the real one", async () => {
+    const h = harness();
+    const path = await leased(h);
+    h.fs.targets.set(key(SLOTS), "D:\\elsewhere");
+    const out = await h.pool.gc(async () => true);
+    expect(out.removed).toEqual([]);
+    expect(out.reported[0]).toContain("resolves through a link");
+    expect(await h.fs.lstat(path)).not.toBeNull();
+  });
+
+  // QA-2.4-3
+  it("removes a link planted at the slot's .git during the sweep", async () => {
+    const h = harness();
+    const path = await leased(h);
+    h.fs.nodes.set(key(win32.join(path, ".git")), "junction");
+    h.fs.targets.set(key(win32.join(path, ".git")), "D:\\precious");
+    const out = await h.pool.gc(async () => true);
+    expect(out.removed).toEqual([path]);
+    expect(h.fs.removed).toContainEqual({ path: win32.join(path, ".git"), recursive: false });
+  });
+
+  // QA-2.4-3
+  it("still drops the worktree entry, keyed by path and lock reason, once the folder is already gone", async () => {
+    const h = harness();
+    const path = await leased(h);
+    await h.fs.rm(path, { recursive: true });
+    const out = await h.pool.gc(async () => true);
+    expect(out.removed).toEqual([path]);
+    expect(h.git.log).toContain(`remove ${key(path)}`);
+    expect(h.git.worktrees.size).toBe(0);
   });
 
   it("a gc deadline in the past collects nothing", async () => {
@@ -1175,6 +1279,121 @@ describe("SlotPool gc", () => {
 // ---------------------------------------------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------------------------------------------
+// Phase 2.4 QA round 1, batch A
+// ---------------------------------------------------------------------------------------------------------------
+
+describe("SlotPool QA round 1 (git.ts / pool.ts)", () => {
+  const settle = (): Promise<void> => new Promise((resolve) => { setImmediate(resolve); });
+
+  // QA-2.4-1
+  it("sweeps exactly the paths git clean lists, whatever their depth or name: a nested node_modules junction goes", async () => {
+    const h = harness();
+    await h.pool.open();
+    const lease = await h.pool.acquire(PLAN, "t1", C1);
+    h.fs.dir("D:\\precious");
+    h.fs.put("D:\\precious\\keep.txt", "keep");
+    h.fs.dir(win32.join(lease.path, "tools"));
+    h.fs.dir(win32.join(lease.path, "tools", "node_modules"));
+    h.fs.nodes.set(key(win32.join(lease.path, "tools", "node_modules", "x")), "junction");
+    h.fs.targets.set(key(win32.join(lease.path, "tools", "node_modules", "x")), "D:\\precious");
+    h.fs.dir(win32.join(lease.path, "pkg"));
+    h.fs.nodes.set(key(win32.join(lease.path, "pkg", "node_modules")), "junction");
+    h.fs.targets.set(key(win32.join(lease.path, "pkg", "node_modules")), "D:\\precious");
+    h.git.preview = () => ["tools/node_modules/", "pkg/node_modules/"];
+    await h.pool.cleanForChecks(lease.slot);
+    expect(h.fs.removed).toContainEqual({ path: win32.join(lease.path, "tools", "node_modules", "x"), recursive: false });
+    expect(h.fs.removed).toContainEqual({ path: win32.join(lease.path, "pkg", "node_modules"), recursive: false });
+    expect(h.fs.removed.some((r) => key(r.path).startsWith("d:/precious"))).toBe(false);
+    expect(h.fs.text("D:\\precious\\keep.txt")).toBe("keep");
+    expect(h.git.log).toContain(`cleanForChecks ${key(lease.path)}`);
+  });
+
+  // QA-2.4-1
+  it("a reset sweeps what the reset clean lists before cleaning", async () => {
+    const h = harness();
+    await h.pool.open();
+    const lease = await h.pool.acquire(PLAN, "t1", C1);
+    h.fs.dir("D:\\precious");
+    h.fs.dir(win32.join(lease.path, "tools"));
+    h.fs.dir(win32.join(lease.path, "tools", "node_modules"));
+    h.fs.nodes.set(key(win32.join(lease.path, "tools", "node_modules", "x")), "junction");
+    h.fs.targets.set(key(win32.join(lease.path, "tools", "node_modules", "x")), "D:\\precious");
+    h.git.preview = () => ["tools/node_modules/"];
+    await h.pool.reset(lease.slot, C2);
+    expect(h.fs.removed).toContainEqual({ path: win32.join(lease.path, "tools", "node_modules", "x"), recursive: false });
+    expect(h.git.log.indexOf(`clean ${key(lease.path)}`)).toBeGreaterThan(h.git.log.indexOf(`checkout ${key(lease.path)} 22`));
+  });
+
+  // QA-2.4-2
+  it("refuses a slot that resolves through a link before any sweep or clean", async () => {
+    const h = harness();
+    await h.pool.open();
+    const lease = await h.pool.acquire(PLAN, "t1", C1);
+    h.fs.targets.set(key(lease.path), "D:\\elsewhere");
+    await expect(h.pool.cleanForChecks(lease.slot)).rejects.toMatchObject({ code: "E_SLOT_BROKEN", message: expect.stringContaining("resolves through a link") });
+    expect(h.git.log.some((l) => l.startsWith("cleanForChecks"))).toBe(false);
+  });
+
+  // QA-2.4-14
+  it("keeps what provisioning produced (egg-info) in cleanForChecks and in a reset clean", async () => {
+    const h = harness();
+    h.git.preview = () => ["foo.egg-info/", "odd[1]/"];
+    await h.pool.open();
+    const lease = await h.pool.acquire(PLAN, "t1", C1);
+    const expected = ["/.venv", "/foo.egg-info", "/odd\\[1\\]"];
+    await h.pool.cleanForChecks(lease.slot);
+    expect(h.git.cleanKeeps.at(-1)).toEqual(expected);
+    await h.pool.release(lease.slot);
+    await h.pool.acquire(PLAN, "t2", C2);
+    expect(h.git.resetKeeps.at(-1)).toEqual(expected);
+  });
+
+  // QA-2.4-7
+  it("a gc that collects this plan closes the pool and aborts provisioning in flight", async () => {
+    const h = harness();
+    await h.pool.open();
+    let open: () => void = () => undefined;
+    h.prov.gate = new Promise<void>((resolve) => { open = resolve; });
+    const acquiring = h.pool.acquire(PLAN, "t1", C1).then(() => null, (error: unknown) => error);
+    for (let n = 0; n < 50 && h.prov.calls.length === 0; n++) await settle();
+    expect(h.prov.calls).toHaveLength(1);
+    const signal = h.prov.signals[0];
+    expect(signal?.aborted).toBe(false);
+    const collecting = h.pool.gc(async () => true);
+    await settle();
+    expect(signal?.aborted).toBe(true);
+    await expect(h.pool.acquire(PLAN, "t2", C1)).rejects.toMatchObject({ code: "E_PLAN_STATE" });
+    h.prov.error = new Error("provisioning of slot-1 was aborted");
+    open();
+    expect(await acquiring).not.toBeNull();
+    const out = await collecting;
+    expect(out.removed).toEqual([slotPath("slot-1")]);
+  });
+
+  // QA-2.4-7
+  it("a gc of an unfinished plan neither closes the pool nor aborts anything", async () => {
+    const h = harness();
+    await h.pool.open();
+    await h.pool.acquire(PLAN, "t1", C1);
+    await h.pool.gc(async () => false);
+    expect(h.prov.signals[0]?.aborted).toBe(false);
+    await expect(h.pool.acquire(PLAN, "t2", C2)).resolves.toMatchObject({ slot: "slot-2" });
+  });
+
+  // QA-2.4-21
+  it("blames a running process only for transient filesystem codes", async () => {
+    const h = harness();
+    await h.pool.open();
+    await h.pool.acquire(PLAN, "task-1", C1);
+    h.git.fail.set("checkoutDetach", { error: new Error("boom"), times: 2 });
+    const error: unknown = await h.pool.reset("slot-1", C3).then(() => null, (e: unknown) => e);
+    expect(error).toMatchObject({ code: "E_SLOT_BROKEN" });
+    expect(String((error as Error).message)).toContain("reset of slot-1 failed: boom");
+    expect(String((error as Error).message)).not.toContain("held by a running process");
+  });
+});
 
 describe("slot name, marker path, lock reason and safe dir", () => {
   it.each(["slot-1", "slot-12", "slot-999", "integration", "ci"])("accepts %s", name => { expect(SLOT_NAME_PATTERN.test(name)).toBe(true); });

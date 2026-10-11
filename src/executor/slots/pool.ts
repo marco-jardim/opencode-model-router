@@ -1,6 +1,8 @@
 // Slot pool (phase 2.4.3), see docs/qa/critical-path-execution/phase-2.4.md sections 3 and 4.
 // Layout: <slotsDir>\slot-<n>, <slotsDir>\integration, <slotsDir>\ci. Markers: <markersDir>\<planId>\<slot>.json (DV1).
 // All I/O goes through the seams (GitOps, FileSystem, Clock, Provisioner); no node:fs here.
+// Every destructive clean is preceded by a sweep of exactly the paths `git clean -n` lists (GitOps.cleanPreview), because
+// git's recursive delete can follow a junction. Phase 3.1 commits before it calls `cleanForChecks`.
 
 import { posix, win32 } from "node:path";
 import { CLEANUP_RETRIES, CLEANUP_RETRY_BASE_MS, TRANSIENT_FS_CODES, isStrictlyInside } from "../../verify/reference";
@@ -21,8 +23,6 @@ const MARKER_MAX_BYTES = 64 * 1024;
 const MAX_TASK_SLOT_NUMBER = 999;
 const OWNER_PATTERN = /^[\x20-\x7e]{1,128}$/;
 const MANIFEST_DIGEST_PATTERN = /^[0-9a-f]{64}$/;
-const EMPTY_TREE_SHA1 = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-const EMPTY_TREE_SHA256 = "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b426cc5da2dd8ae8";
 const SLOT_STATES: readonly SlotRecord["state"][] = ["creating", "provisioning", "ready", "leased", "resetting", "broken", "retired"];
 const STAGE_STATES: readonly SlotRecord["state"][] = ["creating", "provisioning", "resetting"];
 const DEPENDENCY_DIR_NAMES: ReadonlySet<string> = new Set(Object.values(DEPENDENCY_DIRS).flat());
@@ -359,17 +359,48 @@ interface SweepCtx { fs: FileSystem; clock: Clock; platform: NodeJS.Platform }
 
 /**
  * lstat walk: a symlink or junction is removed with a non-recursive `fs.rm`, never descended into; before each `readdir` the
- * `realpath` of the directory must be inside the `realpath` of the slot. `tracked` links (pre-clean mode) are left alone and
- * `skipDependencyDirs` skips `node_modules` and `.venv`.
+ * `realpath` of the directory must be inside the `realpath` of the slot. `tracked` links (pre-clean mode) are left alone.
+ * Two shapes: the whole slot (`starts` null; `skipDependencyDirs` then skips `node_modules` and `.venv`, which is only safe
+ * when the destructive op cannot enter them), or exactly the given slot-relative `starts` (the output of `cleanPreview`),
+ * each swept in full with no skipping. `removeRootGitLink` also removes a link at `<root>/.git` (retire only).
  */
 async function sweepLinks(
-  x: SweepCtx, root: string, o: { skipDependencyDirs: boolean; tracked: ReadonlySet<string> | null },
+  x: SweepCtx, root: string,
+  o: { skipDependencyDirs: boolean; tracked: ReadonlySet<string> | null; starts?: readonly string[]; removeRootGitLink?: boolean },
 ): Promise<{ removed: string[]; truncated: boolean }> {
   const api = pathApi(x.platform);
   const realRoot = await x.fs.realpath(root);
   const removed: string[] = [];
   let seen = 0;
-  const stack: string[] = [""];
+  const isLink = (kind: string): boolean => kind === "symlink" || kind === "junction";
+  const stack: string[] = [];
+  if (o.starts === undefined) stack.push("");
+  else {
+    for (const start of o.starts) {
+      const rel = start.replace(/\/+$/, "");
+      if (rel === "" || rel.split("/").some((s) => s === "" || s === "." || s === "..")) {
+        throw new ExecutorError("E_SLOT_BROKEN", `unsafe clean candidate ${JSON.stringify(start)}`, { start: start.slice(0, 200) });
+      }
+      // Every parent of a candidate is walked by lstat: a link in the middle is removed, never followed.
+      const parts = rel.split("/");
+      let cur = "";
+      for (let n = 0; n < parts.length; n++) {
+        cur = cur === "" ? parts[n] ?? "" : `${cur}/${parts[n] ?? ""}`;
+        const path = api.join(root, ...cur.split("/"));
+        const st = await x.fs.lstat(path);
+        if (st === null) break;
+        if (isLink(st.kind)) {
+          if (o.tracked === null || !o.tracked.has(cur)) {
+            await withRetry(x.clock, () => x.fs.rm(path, { recursive: false }));
+            removed.push(cur);
+          }
+          break;
+        }
+        if (n === parts.length - 1 && st.kind === "dir") stack.push(cur);
+        if (st.kind !== "dir") break;
+      }
+    }
+  }
   for (;;) {
     const rel = stack.pop();
     if (rel === undefined) break;
@@ -381,22 +412,41 @@ async function sweepLinks(
     for (const name of await x.fs.readdir(dir)) {
       seen++;
       if (seen > SLOT_SWEEP_MAX_ENTRIES) return { removed, truncated: true };
-      if (rel === "" && name === ".git") continue;
       const childRel = rel === "" ? name : `${rel}/${name}`;
       const child = api.join(dir, name);
       const st = await x.fs.lstat(child);
       if (st === null) continue;
-      if (st.kind === "symlink" || st.kind === "junction") {
+      if (rel === "" && name === ".git") {
+        if (o.removeRootGitLink === true && isLink(st.kind)) {
+          await withRetry(x.clock, () => x.fs.rm(child, { recursive: false }));
+          removed.push(childRel);
+        }
+        continue;
+      }
+      if (isLink(st.kind)) {
         if (o.tracked !== null && o.tracked.has(childRel)) continue;
         await withRetry(x.clock, () => x.fs.rm(child, { recursive: false }));
         removed.push(childRel);
       } else if (st.kind === "dir") {
-        if (o.skipDependencyDirs && DEPENDENCY_DIR_NAMES.has(name)) continue;
+        if (o.skipDependencyDirs && o.starts === undefined && DEPENDENCY_DIR_NAMES.has(name)) continue;
         stack.push(childRel);
       }
     }
   }
   return { removed, truncated: false };
+}
+
+/** The slot itself must be a real directory whose real path is its parent's real path plus its own name. */
+async function assertRealSlotDir(fs: FileSystem, path: string, platform: NodeJS.Platform): Promise<void> {
+  const api = pathApi(platform);
+  const st = await fs.lstat(path);
+  if (st === null || st.kind !== "dir") {
+    throw new ExecutorError("E_SLOT_BROKEN", `${path} is not a real directory (${st === null ? "missing" : st.kind})`, { path });
+  }
+  const expected = api.join(await fs.realpath(api.dirname(path)), api.basename(path));
+  if (comparable(await fs.realpath(path), platform) !== comparable(expected, platform)) {
+    throw new ExecutorError("E_SLOT_BROKEN", `${path} resolves through a link`, { path });
+  }
 }
 
 interface RetireCtx extends FileCtx { git: GitOps; toplevel: string }
@@ -406,40 +456,50 @@ interface RetireCtx extends FileCtx { git: GitOps; toplevel: string }
  * `git worktree remove` only once the directory is gone, marker deleted. Any failure leaves the marker `retired` and throws.
  * Returns a note when the worktree entry had to be left for manual removal.
  */
-async function retireSlot(x: RetireCtx, rec: SlotRecord, deadline: number): Promise<string | null> {
-  const api = pathApi(x.platform);
-  const file = markerPath(x.markersDir, rec.planId, rec.slot);
-  const read = await readMarkerFile(x, file);
+async function retireSlot(x: RetireCtx, rec: SlotRecord, deadline: number, trustedParent: string): Promise<string | null> {
+  const read = await readMarkerFile(x, markerPath(x.markersDir, rec.planId, rec.slot));
   if (!read.ok) throw new Error(`marker is ${read.reason}`);
   const cur = read.rec;
   if (cur.planId !== rec.planId || cur.slot !== rec.slot || comparable(cur.path, x.platform) !== comparable(rec.path, x.platform)) {
     throw new Error("marker changed while collecting");
   }
-  const parent = api.dirname(cur.path);
-  assertSafeSlotDir(cur.path, cur.slot, parent, x.platform);
+  // The parent is the folder the caller trusts for this plan, never one derived from the marker's own path.
+  assertSafeSlotDir(cur.path, cur.slot, trustedParent, x.platform);
   if (isInsideOrEqual(cur.path, x.toplevel, x.platform)) throw new Error("slot is inside the repository");
+  const parentStat = await x.fs.lstat(trustedParent);
+  if (parentStat !== null) {
+    if (parentStat.kind !== "dir" || comparable(await x.fs.realpath(trustedParent), x.platform) !== comparable(trustedParent, x.platform)) {
+      throw new Error(`${trustedParent} is not the real slots directory (it resolves through a link)`);
+    }
+  }
+  const reason = slotLockReason(cur.planId, cur.slot);
   await writeMarkerFile(x, { ...cur, state: "retired", owner: null, updatedAt: x.clock.iso() });
 
   let st = await x.fs.lstat(cur.path);
   let note: string | null = null;
-  let pointersOk = true;
   if (st !== null) {
+    if (st.kind !== "dir") throw new Error(`not a real directory (${st.kind})`);
+    // Only a folder git itself lists as locked by this executor for this slot is ever deleted.
+    const entry = (await x.git.worktreeList()).find((w) => comparable(w.path, x.platform) === comparable(cur.path, x.platform));
+    if (entry === undefined || entry.locked !== reason) {
+      throw new Error("git does not list the folder as a worktree locked by the executor for this slot; nothing was deleted");
+    }
     try {
       await x.git.verifySlotPointers(cur.path);
     } catch (error) {
-      pointersOk = false;
-      note = `git pointers invalid (${messageOf(error)}); the worktree entry was left for manual removal`;
+      note = `git pointers were invalid (${messageOf(error)}); the worktree entry was dropped by path and lock reason`;
     }
-    assertSafeSlotDir(cur.path, cur.slot, parent, x.platform);
+    assertSafeSlotDir(cur.path, cur.slot, trustedParent, x.platform);
     if (st.kind !== "dir") throw new Error(`not a real directory (${st.kind})`);
-    const sweep = await sweepLinks(x, cur.path, { skipDependencyDirs: false, tracked: null });
+    const sweep = await sweepLinks(x, cur.path, { skipDependencyDirs: false, tracked: null, removeRootGitLink: true });
     if (sweep.truncated) throw new Error(`more than ${SLOT_SWEEP_MAX_ENTRIES} entries; link sweep stopped`);
     const limit = Math.min(x.clock.now() + SLOT_RM_BUDGET_MS, deadline);
     await withRetry(x.clock, () => x.fs.rm(cur.path, { recursive: true }), limit);
     st = await x.fs.lstat(cur.path);
-    if (st !== null) throw new Error("directory still present after removal (held by a running process?)");
+    if (st !== null) throw new Error("directory still present after removal");
   }
-  if (pointersOk) await x.git.worktreeRemove(cur.path, slotLockReason(cur.planId, cur.slot));
+  // The folder is gone: drop the admin entry keyed by path and lock reason (a no-op when git no longer lists it).
+  await x.git.worktreeRemove(cur.path, reason);
   await deleteMarker(x, cur);
   return note;
 }
@@ -467,6 +527,7 @@ export async function gcSlots(
   const reported: string[] = [];
 
   const valid: SlotRecord[] = [];
+  const trustedFor = new Map<string, string>();
   for (const planId of await listPlanDirs(x)) {
     const plan = await readPlanMarkers(x, planId);
     for (const bad of plan.invalid) reported.push(`${bad.file}: ${bad.reason}`);
@@ -485,6 +546,7 @@ export async function gcSlots(
         if (trustedParent === undefined) throw new Error("parent is not a known slots directory");
         assertSafeSlotDir(rec.path, rec.slot, trustedParent, platform);
         if (isInsideOrEqual(rec.path, d.toplevel, platform)) throw new Error("slot is inside the repository");
+        trustedFor.set(comparable(rec.path, platform), trustedParent);
       } catch (error) {
         reported.push(`${file}: ${messageOf(error)}`);
         continue;
@@ -509,7 +571,7 @@ export async function gcSlots(
       continue;
     }
     try {
-      const note = await retireSlot(x, rec, deadline);
+      const note = await retireSlot(x, rec, deadline, trustedFor.get(comparable(rec.path, platform)) ?? d.slotsDir);
       known.delete(comparable(rec.path, platform));
       removed.push(rec.path);
       if (note !== null) reported.push(`${rec.path}: ${note}`);
@@ -554,7 +616,7 @@ function keepFor(managers: readonly string[], yarnBerry: boolean): string[] {
   return keep;
 }
 
-export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<void> } {
+export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<void>; close(): void } {
   const platform = d.platform ?? process.platform;
   const api = pathApi(platform);
   const config = d.config ?? { provision: "auto" as const, python: "auto" as const };
@@ -570,6 +632,11 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
   const poolLock = new Mutex();
   const slotLocks = new Map<string, Mutex>();
   let opened = false;
+  /** Set by `close()` and by a gc of this very plan: no new acquire, and in-flight provisioning is aborted. */
+  let closed = false;
+  const abort = new AbortController();
+  /** Paths provisioning produced besides the dependency dirs (for example `*.egg-info`), per slot: kept by every clean. */
+  const produced = new Map<string, string[]>();
 
   const slotLock = (slot: string): Mutex => {
     let m = slotLocks.get(slot);
@@ -583,6 +650,10 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
 
   const assertOpen = (): void => {
     if (!opened) throw new ExecutorError("E_PLAN_STATE", "the slot pool is not open", { planId: d.planId });
+  };
+  const assertLive = (): void => {
+    assertOpen();
+    if (closed) throw new ExecutorError("E_PLAN_STATE", "the slot pool is closed", { planId: d.planId });
   };
   const assertSlot = (slot: string): void => {
     if (typeof slot !== "string" || !SLOT_NAME_PATTERN.test(slot)) {
@@ -655,18 +726,31 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
 
   // ---- tree, detection, provisioning ------------------------------------------------------------------------
 
-  /** The tracked paths of HEAD: `diff --name-only <empty tree> HEAD` (GitOps has no ls-files). */
-  async function trackedFiles(path: string): Promise<string[]> {
-    const head = await d.git.revParse(path, "HEAD");
-    return d.git.diffNames(path, head.length === 64 ? EMPTY_TREE_SHA256 : EMPTY_TREE_SHA1, head);
+  /** The tracked paths of the index (`ls-files -z`). Phase 3.1 commits before `cleanForChecks`, so index and HEAD agree there. */
+  function trackedFiles(path: string): Promise<string[]> {
+    return d.git.lsFiles(path);
   }
 
   async function detectFor(rec: SlotRecord): Promise<Detection> {
-    return detectManagers(rec.path, await trackedFiles(rec.path), d.fs, config);
+    return d.provisioner.detect(rec.path, await trackedFiles(rec.path));
+  }
+
+  /** What a clean of this slot must keep: the dependency dirs of its managers and what provisioning produced (QA-2.4-14). */
+  async function keepList(rec: SlotRecord): Promise<string[]> {
+    const berry = rec.managers.includes("yarn") && await d.fs.lstat(api.join(rec.path, ".yarnrc.yml")) !== null;
+    return [...keepFor(rec.managers, berry), ...(produced.get(rec.slot) ?? [])];
+  }
+
+  /** Right after an install the slot was clean, so whatever `clean -x` would now delete besides the kept dirs was produced by it. */
+  async function recordProduced(rec: SlotRecord, managers: readonly string[]): Promise<void> {
+    const berry = managers.includes("yarn") && await d.fs.lstat(api.join(rec.path, ".yarnrc.yml")) !== null;
+    const listed = await d.git.cleanPreview(rec.path, keepFor(managers, berry));
+    produced.set(rec.slot, listed.map((p) => `/${p.replace(/\/+$/, "").replace(/[\\*?[\]]/g, "\\$&")}`));
   }
 
   async function install(rec: SlotRecord, detection: Detection, fresh: boolean): Promise<void> {
-    await d.provisioner.provision(rec.path, detection, { fresh });
+    await d.provisioner.provision(rec.path, detection, { fresh, signal: abort.signal });
+    await recordProduced(rec, detection.managers);
     d.onProvision?.(rec.slot, detection.managers);
   }
 
@@ -698,16 +782,22 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
     const st = await d.fs.lstat(rec.path);
     if (st !== null) {
       if (st.kind !== "dir") throw new ExecutorError("E_SLOT_BROKEN", `${rec.path} is not a real directory (${st.kind})`, { slot: rec.slot });
+      let pointersOk = false;
       try {
         await d.git.verifySlotPointers(rec.path);
-        return;
+        pointersOk = true;
       } catch (error) {
         logger?.warn(`slot ${rec.slot} is half created (${messageOf(error)}); recreating it`);
+      }
+      if (pointersOk) {
+        // The checkout of an interrupted `worktree add` may be partial or dirty: bring it to the base commit first.
+        await resetRoutine(rec);
+        return;
       }
       if ((await d.fs.readdir(rec.path)).length === 0) {
         await withRetry(d.clock, () => d.fs.rm(rec.path, { recursive: true }));
       } else {
-        await retireSlot(retireCtx, rec, Number.POSITIVE_INFINITY);
+        await retireSlot(retireCtx, rec, Number.POSITIVE_INFINITY, d.slotsDir);
         records.delete(rec.slot);
         await save({ ...rec, state: "creating" });
       }
@@ -730,11 +820,18 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
     const commit = need(rec.commit, "commit", rec.slot);
     await d.git.verifySlotPointers(rec.path);
     const attempt = async (): Promise<void> => {
-      const tracked = new Set(await trackedFiles(rec.path));
-      const sweep = await sweepLinks({ fs: d.fs, clock: d.clock, platform }, rec.path, { skipDependencyDirs: true, tracked });
+      await assertRealSlotDir(d.fs, rec.path, platform);
+      const tracked = new Set(await d.git.trackedLinks(rec.path));
+      const ctx = { fs: d.fs, clock: d.clock, platform };
+      // The checkout can only touch tracked paths: the whole-slot sweep (dependency dirs skipped) covers it.
+      const sweep = await sweepLinks(ctx, rec.path, { skipDependencyDirs: true, tracked });
       if (sweep.truncated) throw new ExecutorError("E_SLOT_BROKEN", `more than ${SLOT_SWEEP_MAX_ENTRIES} entries in ${rec.slot}`, { slot: rec.slot });
       await d.git.checkoutDetach(rec.path, commit);
-      await d.git.cleanTracked(rec.path);
+      // The clean is different: sweep exactly what git is about to delete, whatever its depth or name.
+      const keep = await keepList(rec);
+      const doomed = await sweepLinks(ctx, rec.path, { skipDependencyDirs: false, tracked, starts: await d.git.cleanPreview(rec.path, keep) });
+      if (doomed.truncated) throw new ExecutorError("E_SLOT_BROKEN", `more than ${SLOT_SWEEP_MAX_ENTRIES} entries in ${rec.slot}`, { slot: rec.slot });
+      await d.git.cleanTracked(rec.path, keep);
       const head = await d.git.revParse(rec.path, "HEAD");
       if (head !== commit) throw new ExecutorError("E_SLOT_BROKEN", `HEAD of ${rec.slot} is ${head}, expected ${commit}`, { slot: rec.slot });
       const status = await d.git.statusPorcelain(rec.path);
@@ -748,8 +845,11 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
       try {
         await attempt();
       } catch (second) {
+        const code = errorCode(second);
+        const transient = code !== undefined && TRANSIENT_FS_CODES.has(code);
         throw new ExecutorError(
-          "E_SLOT_BROKEN", `files in ${rec.slot} are held by a running process; stop it and retry`,
+          "E_SLOT_BROKEN",
+          transient ? `files in ${rec.slot} are held by a running process; stop it and retry` : `reset of ${rec.slot} failed: ${messageOf(second).slice(0, 200)}`,
           { slot: rec.slot, cause: messageOf(second).slice(0, 300) },
         );
       }
@@ -832,6 +932,10 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
       if (corrupt.has(kind)) {
         throw new ExecutorError("E_SLOT_UNAVAILABLE", `the marker of ${kind} is unreadable; run router_plan action=gc`, { slot: kind });
       }
+      // A folder with no marker is somebody else's: never adopt it (the task slots check the same in createNewTaskSlot).
+      if (await d.fs.lstat(slotPath(kind)) !== null) {
+        throw new ExecutorError("E_SLOT_UNAVAILABLE", `${slotPath(kind)} exists without a slot marker; run router_plan action=gc or remove it`, { slot: kind });
+      }
       await save(newRecord(kind, kind, base));
       return { slot: kind, mode: "create" };
     }
@@ -851,7 +955,7 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
       let firstRun = mode === "create" || mode === "reset";
       if (mode === "recreate" && (rec.state === "broken" || rec.state === "retired")) {
         unregisterSlot(rec.path);
-        await retireSlot(retireCtx, rec, Number.POSITIVE_INFINITY);
+        await retireSlot(retireCtx, rec, Number.POSITIVE_INFINITY, d.slotsDir);
         records.delete(slot);
         rec = await save(newRecord(slot, spec.owner, spec.base));
         firstRun = true;
@@ -880,7 +984,7 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
   async function acquireSlot(
     claim: () => Promise<{ slot: string; mode: ClaimMode }>, spec: AcquireSpec,
   ): Promise<SlotLease> {
-    assertOpen();
+    assertLive();
     const scheduled = await poolLock.run(async () => {
       const { slot, mode } = await claim();
       // Queued on the slot mutex before the pool mutex is released, so nothing runs on this slot ahead of the claim.
@@ -892,7 +996,7 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
   // ---- reset, cleanForChecks, release -----------------------------------------------------------------------
 
   async function reset(slot: string, commit: string): Promise<void> {
-    assertOpen();
+    assertLive();
     assertSlot(slot);
     if (typeof commit !== "string" || !GIT_ID_PATTERN.test(commit)) {
       throw new ExecutorError("E_INVALID_INPUT", "commit must be a full git object id", { commit: String(commit).slice(0, 80) });
@@ -915,7 +1019,7 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
   }
 
   async function cleanForChecks(slot: string): Promise<void> {
-    assertOpen();
+    assertLive();
     assertSlot(slot);
     await slotLock(slot).run(async () => {
       const rec = records.get(slot);
@@ -923,11 +1027,18 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
       if (rec.state !== "leased") throw new ExecutorError("E_INVALID_INPUT", `slot ${slot} is ${rec.state}, not leased`, { slot, state: rec.state });
       try {
         await d.git.verifySlotPointers(rec.path);
-        const tracked = new Set(await trackedFiles(rec.path));
-        const sweep = await sweepLinks({ fs: d.fs, clock: d.clock, platform }, rec.path, { skipDependencyDirs: true, tracked });
+        await assertRealSlotDir(d.fs, rec.path, platform);
+        const tracked = new Set(await d.git.trackedLinks(rec.path));
+        const ctx = { fs: d.fs, clock: d.clock, platform };
+        // The restoring checkout can only touch tracked paths: a whole-slot sweep (dependency dirs skipped) covers it.
+        const walk = await sweepLinks(ctx, rec.path, { skipDependencyDirs: true, tracked });
+        if (walk.truncated) throw new ExecutorError("E_SLOT_BROKEN", `more than ${SLOT_SWEEP_MAX_ENTRIES} entries in ${slot}`, { slot });
+        // The agent's files include links anywhere; the clean removes whatever `clean -ndx -e <keep>` lists, so sweep
+        // exactly that list in full (a `node_modules` below the root is deleted unless excluded with the same anchoring).
+        const keep = await keepList(rec);
+        const sweep = await sweepLinks(ctx, rec.path, { skipDependencyDirs: false, tracked, starts: await d.git.cleanPreview(rec.path, keep) });
         if (sweep.truncated) throw new ExecutorError("E_SLOT_BROKEN", `more than ${SLOT_SWEEP_MAX_ENTRIES} entries in ${slot}`, { slot });
-        const berry = rec.managers.includes("yarn") && await d.fs.lstat(api.join(rec.path, ".yarnrc.yml")) !== null;
-        await d.git.cleanForChecks(rec.path, keepFor(rec.managers, berry));
+        await d.git.cleanForChecks(rec.path, keep);
         const drift = await driftProvision(rec);
         if (drift.drifted) syncEnv(await save({ ...drift.rec, state: "leased" }));
       } catch (error) {
@@ -1017,27 +1128,52 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
 
   async function gc(isFinished: (planId: PlanId) => Promise<boolean | null>): Promise<{ removed: string[]; reported: string[] }> {
     assertOpen();
-    return poolLock.run(async () => {
-      const out = await gcSlots({
-        repoKey: d.repoKey, toplevel: d.toplevel, slotsDir: d.slotsDir, markersDir: d.markersDir, executorHome: d.executorHome,
-        git: d.git, fs: d.fs, clock: d.clock, platform, ...(logger === undefined ? {} : { logger }),
-      }, isFinished);
-      for (const rec of [...records.values()]) {
-        const read = await readMarkerFile(fileCtx, markerPath(d.markersDir, rec.planId, rec.slot));
-        if (read.ok) {
-          records.set(rec.slot, read.rec);
-          if (read.rec.state === "retired" || read.rec.state === "broken") unregisterSlot(read.rec.path);
-        } else if (read.missing) {
-          records.delete(rec.slot);
-          unregisterSlot(rec.path);
+    // A gc that is about to collect this very plan closes the pool first: no new acquire, and provisioning in flight stops.
+    let ownFinished = false;
+    try {
+      ownFinished = (await isFinished(d.planId)) === true;
+    } catch (error) {
+      logger?.warn(`gc: could not tell whether plan ${d.planId} is finished: ${messageOf(error)}`);
+    }
+    if (ownFinished) close();
+    return poolLock.run(() => {
+      // Under the mutex of every slot of this plan, so no acquire, reset or clean runs on a slot while it is deleted.
+      const mine = [...records.keys()].sort(compareSlots);
+      const collect = async (): Promise<{ removed: string[]; reported: string[] }> => {
+        const out = await gcSlots({
+          repoKey: d.repoKey, toplevel: d.toplevel, slotsDir: d.slotsDir, markersDir: d.markersDir, executorHome: d.executorHome,
+          git: d.git, fs: d.fs, clock: d.clock, platform, ...(logger === undefined ? {} : { logger }),
+        }, isFinished);
+        for (const rec of [...records.values()]) {
+          const read = await readMarkerFile(fileCtx, markerPath(d.markersDir, rec.planId, rec.slot));
+          if (read.ok) {
+            records.set(rec.slot, read.rec);
+            if (read.rec.state === "retired" || read.rec.state === "broken") unregisterSlot(read.rec.path);
+          } else if (read.missing) {
+            records.delete(rec.slot);
+            unregisterSlot(rec.path);
+          }
         }
-      }
-      return out;
+        return out;
+      };
+      const nest = (n: number): Promise<{ removed: string[]; reported: string[] }> => {
+        const slot = mine[n];
+        return slot === undefined ? collect() : slotLock(slot).run(() => nest(n + 1));
+      };
+      return nest(0);
     });
+  }
+
+  /** Refuses new acquires from now on and aborts provisioning in flight; idempotent. */
+  function close(): void {
+    if (closed) return;
+    closed = true;
+    abort.abort();
   }
 
   return {
     open,
+    close,
     async acquire(planId, owner, baseCommit) {
       if (planId !== d.planId) throw new ExecutorError("E_INVALID_INPUT", "plan id differs from the pool's plan", { planId: String(planId).slice(0, 80) });
       if (typeof baseCommit !== "string" || !GIT_ID_PATTERN.test(baseCommit)) {
@@ -1046,14 +1182,14 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
       if (typeof owner !== "string" || !OWNER_PATTERN.test(owner)) {
         throw new ExecutorError("E_INVALID_INPUT", "owner must be 1-128 printable characters", { length: typeof owner === "string" ? owner.length : -1 });
       }
-      assertOpen();
+      assertLive();
       const base = await d.git.revParse(d.toplevel, baseCommit);
       return acquireSlot(() => claimTask(owner, base), { kind: "task", owner, base });
     },
     async acquireSpecial(planId, kind) {
       if (planId !== d.planId) throw new ExecutorError("E_INVALID_INPUT", "plan id differs from the pool's plan", { planId: String(planId).slice(0, 80) });
       if (kind !== "integration" && kind !== "ci") throw new ExecutorError("E_INVALID_INPUT", "kind must be integration or ci", { kind: String(kind).slice(0, 40) });
-      assertOpen();
+      assertLive();
       const base = await d.git.revParse(d.toplevel, "HEAD");
       return acquireSlot(() => claimSpecial(kind, base), { kind, owner: kind, base });
     },

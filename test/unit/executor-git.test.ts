@@ -142,6 +142,7 @@ const OID_B = "b".repeat(40);
 const HOME = join(tmpdir(), "omr-git-unit-home");
 const TOP = join(tmpdir(), "omr-git-unit-top");
 const LOCK = "omr-executor slot test";
+const SLOT_PATH = join(tmpdir(), "omr-slots-x", "slot-1");
 
 interface Recorded { args: string[]; cwd: string }
 type Handler = (args: string[], cwd: string) => Partial<ProcessResult> | undefined;
@@ -181,11 +182,14 @@ function enoent(p: string): NodeJS.ErrnoException {
   return Object.assign(new Error(`ENOENT: ${p}`), { code: "ENOENT" });
 }
 
-function memoryFs(seed: Record<string, "dir" | string> = {}): FileSystem & { entries: Map<string, "dir" | string> } {
+/** A value of "dir" is a directory, "junction" a junction, anything else a file with that content; `reals` overrides realpath. */
+function memoryFs(seed: Record<string, "dir" | string> = {}): FileSystem & { entries: Map<string, "dir" | string>; reals: Map<string, string> } {
   const entries = new Map<string, "dir" | string>();
+  const reals = new Map<string, string>();
   for (const [p, v] of Object.entries(seed)) entries.set(resolve(p), v);
   return {
     entries,
+    reals,
     async readText(p) { const v = entries.get(resolve(p)); if (v === undefined || v === "dir") throw enoent(p); return v; },
     async writeText(p, data) { entries.set(resolve(p), data); },
     async appendText(p, data) { entries.set(resolve(p), `${entries.get(resolve(p)) ?? ""}${data}`); },
@@ -199,9 +203,9 @@ function memoryFs(seed: Record<string, "dir" | string> = {}): FileSystem & { ent
     async lstat(p) {
       const v = entries.get(resolve(p));
       if (v === undefined) return null;
-      return { kind: v === "dir" ? "dir" : "file", size: v === "dir" ? 0 : v.length, mtimeMs: 0 };
+      return { kind: v === "dir" ? "dir" : v === "junction" ? "junction" : "file", size: v === "dir" ? 0 : v.length, mtimeMs: 0 };
     },
-    async realpath(p) { return resolve(p); },
+    async realpath(p) { return reals.get(resolve(p)) ?? resolve(p); },
     async fsyncDir() { /* nothing to flush in memory */ },
   };
 }
@@ -472,6 +476,19 @@ describe("GitOps refs", () => {
     expect(git.calls.some(c => c.args.includes("check-ref-format"))).toBe(true);
   });
 
+  // QA-2.4-4
+  it("deleteRefs skips a branch that is checked out in any worktree", async () => {
+    const out = (ref: string) => `${ref}\0${OID_A}\n`;
+    const git = fakeRunner(args => {
+      const s = sub(args);
+      if (s[0] === "for-each-ref") return { stdout: out(`refs/heads/omr/${PLAN}/t/1`) + out(`refs/heads/omr/${PLAN}/t/2`) };
+      if (s[0] === "worktree") return { stdout: `worktree ${SLOT_PATH}\nHEAD ${OID_A}\nbranch refs/heads/omr/${PLAN}/t/1\n\n` };
+      return undefined;
+    });
+    await expect(makeOps(git).deleteRefs(`omr/${PLAN}/`)).resolves.toEqual([`refs/heads/omr/${PLAN}/t/2`]);
+    expect(subs(git).filter(s => s[0] === "update-ref")).toEqual([["update-ref", "-d", "--no-deref", `refs/heads/omr/${PLAN}/t/2`, OID_A]]);
+  });
+
   it("deleteRefs accepts a deeper slash-terminated prefix of the plan", async () => {
     const git = fakeRunner();
     await expect(makeOps(git).deleteRefs(`omr/${PLAN}/t/`)).resolves.toEqual([]);
@@ -502,7 +519,7 @@ describe("GitOps refs", () => {
     const ops = makeOps(git);
     for (const name of ["main", "omr/", `omr/${PLAN}/`, "omr/other-plan-9/t/1", "cpx/p24", `omr/${PLAN}`]) {
       await expect(ops.tag(name, OID_A)).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
-      await expect(ops.branchForce(name, OID_A)).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
+      await expect(ops.branchForce(name, OID_A, null)).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
     }
     await expect(ops.tag(`omr/${PLAN}/phase/2`, "nope")).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
     expect(subs(git)).toHaveLength(0);
@@ -514,29 +531,55 @@ describe("GitOps refs", () => {
     expect(subs(git)).toEqual([["tag", `omr/${PLAN}/phase/2`, OID_A]]);
   });
 
-  it("branchForce passes the expected old value, zeros for null, and nothing when omitted", async () => {
+  // QA-2.4-4
+  it("branchForce always compares and swaps with --no-deref: the old id, or zeros for a branch that must not exist", async () => {
     const name = `omr/${PLAN}/t/1`;
-    const git = fakeRunner();
+    const git = fakeRunner(args => (sub(args)[0] === "symbolic-ref" ? { code: 1 } : undefined));
     const ops = makeOps(git);
-    await ops.branchForce(name, OID_A);
     await ops.branchForce(name, OID_A, OID_B);
     await ops.branchForce(name, OID_A, null);
     const updates = subs(git).filter(s => s[0] === "update-ref");
     expect(updates).toEqual([
-      ["update-ref", `refs/heads/${name}`, OID_A],
-      ["update-ref", `refs/heads/${name}`, OID_A, OID_B],
-      ["update-ref", `refs/heads/${name}`, OID_A, "0".repeat(40)],
+      ["update-ref", "--no-deref", `refs/heads/${name}`, OID_A, OID_B],
+      ["update-ref", "--no-deref", `refs/heads/${name}`, OID_A, "0".repeat(40)],
     ]);
     await expect(ops.branchForce(name, OID_A, "short")).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
-    await expect(ops.branchForce(name, "short")).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
+    await expect(ops.branchForce(name, OID_A, undefined as unknown as string)).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
+    await expect(ops.branchForce(name, "short", null)).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
+  });
+
+  // QA-2.4-4
+  it("branchForce refuses a symbolic ref and runs update-ref for nothing else", async () => {
+    const name = `omr/${PLAN}/t/1`;
+    const symbolic = fakeRunner(args => (sub(args)[0] === "symbolic-ref" ? { code: 0, stdout: "refs/heads/main\n" } : undefined));
+    await expect(makeOps(symbolic).branchForce(name, OID_A, OID_B)).rejects.toThrow(/symbolic ref/);
+    expect(subs(symbolic).find(s => s[0] === "symbolic-ref")).toEqual(["symbolic-ref", "-q", `refs/heads/${name}`]);
+    expect(subs(symbolic).some(s => s[0] === "update-ref")).toBe(false);
+    const failing = fakeRunner(args => (sub(args)[0] === "symbolic-ref" ? { code: 128 } : undefined));
+    await expect(makeOps(failing).branchForce(name, OID_A, OID_B)).rejects.toMatchObject({ code: "E_GIT" });
   });
 
   it("branchForce refuses a branch checked out in a worktree", async () => {
     const name = `omr/${PLAN}/t/1`;
     const git = fakeRunner(args => (sub(args)[1] === "list"
       ? { stdout: `worktree ${TOP}\nHEAD ${OID_A}\nbranch refs/heads/${name}\n\n` } : undefined));
-    await expect(makeOps(git).branchForce(name, OID_A)).rejects.toThrow(/checked out in a worktree/);
+    await expect(makeOps(git).branchForce(name, OID_A, OID_B)).rejects.toThrow(/checked out in a worktree/);
     expect(subs(git).some(s => s[0] === "update-ref")).toBe(false);
+  });
+
+  // QA-2.4-19
+  it("passes the identity -c on every ref-writing op: tag, update-ref and worktree add", async () => {
+    const name = `omr/${PLAN}/t/1`;
+    const git = fakeRunner(args => (sub(args)[0] === "symbolic-ref" ? { code: 1 } : args.includes("--version") ? { stdout: "git version 2.45.0\n" } : undefined));
+    const ops = makeOps(git);
+    await ops.tag(`omr/${PLAN}/phase/2`, OID_A);
+    await ops.branchForce(name, OID_A, null);
+    await ops.worktreeAdd(SLOT_PATH, OID_A, LOCK);
+    for (const verb of ["tag", "update-ref", "worktree"]) {
+      const call = git.calls.find(c => sub(c.args)[0] === verb && (verb !== "worktree" || sub(c.args)[1] === "add"));
+      expect(call?.args, verb).toContain("user.name=Ann Dev");
+      expect(call?.args, verb).toContain("user.email=ann@example.test");
+    }
   });
 });
 
@@ -600,7 +643,7 @@ describe("GitOps in a slot", () => {
   });
   afterAll(() => { rmSync(root, { recursive: true, force: true }); });
 
-  const BACK = () => ({ [join(gitdir, "gitdir")]: `${join(slot, ".git")}\n` });
+  const BACK = () => ({ [slot]: "dir", [join(gitdir, "gitdir")]: `${join(slot, ".git")}\n` });
 
   function slotOps(handler: Handler = () => undefined, seed: Record<string, string> = {}, user: GitRunner = identityRunner()) {
     const git = fakeRunner(handler);
@@ -614,8 +657,9 @@ describe("GitOps in a slot", () => {
   });
 
   it("verifySlotPointers refuses every broken pointer with E_SLOT_BROKEN", async () => {
-    const { ops } = slotOps();
+    const { ops, fs } = slotOps();
     const other = mkdtempSync(join(root, "bad-"));
+    fs.entries.set(resolve(other), "dir");
     await expect(ops.verifySlotPointers(other)).rejects.toMatchObject({ code: "E_SLOT_BROKEN" });
     mkdirSync(join(other, ".git"));
     await expect(ops.verifySlotPointers(other)).rejects.toThrow(/not a regular file/);
@@ -633,15 +677,44 @@ describe("GitOps in a slot", () => {
     writeFileSync(join(outside, "commondir"), `${common}\n`);
     const target = mkdtempSync(join(root, "co-"));
     writeFileSync(join(target, ".git"), `gitdir: ${outside}\n`);
-    await expect(slotOps().ops.verifySlotPointers(target)).rejects.toThrow(/not under <common>\/worktrees/);
+    const withTarget = slotOps();
+    withTarget.fs.entries.set(resolve(target), "dir");
+    await expect(withTarget.ops.verifySlotPointers(target)).rejects.toThrow(/not under <common>\/worktrees/);
     await expect(slotOps(() => undefined, { [join(gitdir, "gitdir")]: `${join(root, "elsewhere", ".git")}\n` }).ops.verifySlotPointers(slot))
       .rejects.toThrow(/does not return to the slot/);
     const missing = createGitOps({
-      git: fakeRunner(), userGit: identityRunner(), fs: memoryFs(), planId: PLAN, toplevel: top, executorHome: HOME,
+      git: fakeRunner(), userGit: identityRunner(), fs: memoryFs({ [slot]: "dir" }), planId: PLAN, toplevel: top, executorHome: HOME,
     });
     await expect(missing.verifySlotPointers(slot)).rejects.toThrow(/back-pointer/);
     await expect(slotOps(() => undefined, { [join(gitdir, "gitdir")]: "\n" }).ops.verifySlotPointers(slot)).rejects.toThrow(/unusable/);
     await expect(slotOps(() => undefined, { [join(gitdir, "gitdir")]: "\\\\host\\share\\x\n" }).ops.verifySlotPointers(slot)).rejects.toThrow(/unusable/);
+  });
+
+  // QA-2.4-2
+  it("verifySlotPointers refuses a slot that is missing, a link, or resolves through one, before reading any pointer", async () => {
+    const gone = createGitOps({ git: fakeRunner(), userGit: identityRunner(), fs: memoryFs(), planId: PLAN, toplevel: top, executorHome: HOME });
+    await expect(gone.verifySlotPointers(slot)).rejects.toThrow(/does not exist/);
+    const junction = slotOps();
+    junction.fs.entries.set(resolve(slot), "junction");
+    await expect(junction.ops.verifySlotPointers(slot)).rejects.toThrow(/not a real directory \(junction\)/);
+    const through = slotOps();
+    through.fs.reals.set(resolve(slot), join(root, "elsewhere", "slot-1"));
+    await expect(through.ops.verifySlotPointers(slot)).rejects.toThrow(/resolves through a link/);
+    await expect(through.ops.addAll(slot)).rejects.toMatchObject({ code: "E_SLOT_BROKEN" });
+    expect(through.git.calls).toHaveLength(0);
+  });
+
+  // QA-2.4-2
+  it("compares the back-pointer lexically (slashes and case) and never follows a link in it", async () => {
+    const forward = join(slot, ".git").replace(/\\/g, "/");
+    await expect(slotOps(() => undefined, { [join(gitdir, "gitdir")]: `${forward}\n` }).ops.verifySlotPointers(slot)).resolves.toEqual({ gitdir, common });
+    if (process.platform === "win32") {
+      await expect(slotOps(() => undefined, { [join(gitdir, "gitdir")]: `${forward.toUpperCase()}\n` }).ops.verifySlotPointers(slot)).resolves.toEqual({ gitdir, common });
+    }
+    const decoy = join(root, "decoy", ".git");
+    const trick = slotOps(() => undefined, { [join(gitdir, "gitdir")]: `${decoy}\n` });
+    trick.fs.reals.set(resolve(decoy), resolve(join(slot, ".git")));
+    await expect(trick.ops.verifySlotPointers(slot)).rejects.toThrow(/does not return to the slot/);
   });
 
   it("scopes every slot call with --git-dir and --work-tree, cwd = slot, after the pointer check", async () => {
@@ -656,7 +729,7 @@ describe("GitOps in a slot", () => {
     expect(broken.git.calls).toHaveLength(0);
   });
 
-  it("passes the identity with -c only on commit, rebase, cherry-pick and revert", async () => {
+  it("passes the identity with -c on the ref-writing ops only (commit, rebase, cherry-pick, revert, checkout, merge)", async () => {
     const { git, ops } = slotOps(args => (sub(args)[0] === "rev-parse" ? { stdout: `${OID_A}\n` } : undefined));
     const msg = formatCommitMessage({ type: "feat", scope: "x", title: "t", planId: PLAN, taskId: "1" });
     await ops.commit(slot, msg);
@@ -664,7 +737,7 @@ describe("GitOps in a slot", () => {
     await ops.cherryPick(slot, [OID_A]);
     await ops.revert(slot, OID_A, msg);
     await ops.checkoutDetach(slot, OID_A);
-    await ops.cleanTracked(slot);
+    await ops.cleanTracked(slot, []);
     await ops.cleanForChecks(slot, ["node_modules"]);
     await ops.statusPorcelain(slot);
     await ops.addAll(slot);
@@ -678,8 +751,8 @@ describe("GitOps in a slot", () => {
       const verb = sub(c.args)[0] ?? "";
       (c.args.includes("user.name=Ann Dev") && c.args.includes("user.email=ann@example.test") ? withIdentity : without).add(verb);
     }
-    expect([...withIdentity].sort()).toEqual(["cherry-pick", "commit", "rebase", "revert"]);
-    for (const verb of ["checkout", "clean", "status", "add", "rev-parse", "diff", "merge", "merge-base"]) expect(without.has(verb)).toBe(true);
+    expect([...withIdentity].sort()).toEqual(["checkout", "cherry-pick", "commit", "merge", "rebase", "revert"]);
+    for (const verb of ["clean", "status", "add", "rev-parse", "diff", "merge-base"]) expect(without.has(verb)).toBe(true);
     expect(git.calls.some(c => c.args.some(a => a.startsWith("user.") && a !== "user.useConfigOnly=true" && !a.startsWith("user.name=") && !a.startsWith("user.email=")))).toBe(false);
   });
 
@@ -715,14 +788,17 @@ describe("GitOps in a slot", () => {
     await expect(clean.ops.checkoutDetach(slot, "HEAD")).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
   });
 
-  it("cleanTracked leaves ignored files alone, cleanForChecks excludes the dependency directories and verifies", async () => {
+  // QA-2.4-14
+  it("cleanTracked is -x with only the kept paths surviving, cleanForChecks restores tracked files first and verifies after", async () => {
     const { git, ops } = slotOps();
-    await ops.cleanTracked(slot);
+    await ops.cleanTracked(slot, ["node_modules", "/foo.egg-info"]);
     await ops.cleanForChecks(slot, ["node_modules", "/.venv"]);
     expect(subs(git)).toEqual([
-      ["clean", "-q", "-ffd"],
+      ["clean", "-q", "-ffdx", "-e", "node_modules", "-e", "/foo.egg-info"],
+      ["checkout", "--force", "HEAD", "--", "."],
       ["clean", "-q", "-ffdx", "-e", "node_modules", "-e", "/.venv"],
       ["clean", "-ndx", "-e", "node_modules", "-e", "/.venv"],
+      ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=all"],
     ]);
   });
 
@@ -730,10 +806,66 @@ describe("GitOps in a slot", () => {
     const left = slotOps(args => (sub(args)[1] === "-ndx" ? { stdout: "Would remove dist/\n" } : undefined));
     await expect(left.ops.cleanForChecks(slot, [])).rejects.toThrow(/files remain/);
     const { git, ops } = slotOps();
-    for (const bad of ["", "a\nb", "x".repeat(201)]) {
+    for (const bad of ["", "a\nb", "x".repeat(401)]) {
       await expect(ops.cleanForChecks(slot, [bad])).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
+      await expect(ops.cleanTracked(slot, [bad])).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
+      await expect(ops.cleanPreview(slot, [bad])).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
     }
     expect(git.calls).toHaveLength(0);
+  });
+
+  // QA-2.4-8
+  it("cleanForChecks fails listing the paths that still differ from HEAD", async () => {
+    const dirty = slotOps(args => (sub(args)[0] === "status" ? { stdout: " M src/a.ts\0?? stray.txt\0" } : undefined));
+    const error: unknown = await dirty.ops.cleanForChecks(slot, []).then(() => null, (e: unknown) => e);
+    expect(error).toMatchObject({ code: "E_GIT" });
+    expect(JSON.stringify(error)).toContain("src/a.ts");
+    expect(JSON.stringify(error)).toContain("stray.txt");
+    expect(subs(dirty.git)[0]).toEqual(["checkout", "--force", "HEAD", "--", "."]);
+  });
+
+  // QA-2.4-1
+  it("cleanPreview runs the same clean -ndx vector and parses plain and C-quoted paths", async () => {
+    const out = "Would remove tools/node_modules/\nWould remove a.txt\nWould remove \"we\\\"ird\\tname\"\nWould remove \"caf\\303\\251/\"\nWould skip repository sub/\n";
+    const { git, ops } = slotOps(args => (sub(args)[0] === "clean" ? { stdout: out } : undefined));
+    await expect(ops.cleanPreview(slot, ["/.venv"])).resolves.toEqual(["tools/node_modules/", "a.txt", "we\"ird\tname", "café/", "sub/"]);
+    expect(subs(git)[0]).toEqual(["clean", "-ndx", "-e", "/.venv"]);
+    await expect(slotOps(() => ({ stdout: "surprise\n" })).ops.cleanPreview(slot, [])).rejects.toMatchObject({ code: "E_GIT" });
+  });
+
+  // QA-2.4-17
+  it("lsFiles reads the index with -z and literal pathspecs, trackedLinks keeps only mode 120000", async () => {
+    const { git, ops } = slotOps(args => {
+      const s = sub(args);
+      if (s[0] === "ls-files" && s.includes("-s")) return { stdout: ["100644", "120000", "100755"].map((mode, n) => `${mode} ${OID_A} 0\t${["a.txt", "link dir/l", "run.sh"][n] ?? ""}\0`).join("") };
+      if (s[0] === "ls-files") return { stdout: "a.txt\0d/b.txt\0" };
+      return undefined;
+    });
+    await expect(ops.lsFiles(slot)).resolves.toEqual(["a.txt", "d/b.txt"]);
+    await expect(ops.lsFiles(slot, ["d"])).resolves.toEqual(["a.txt", "d/b.txt"]);
+    await expect(ops.trackedLinks(slot)).resolves.toEqual(["link dir/l"]);
+    expect(subs(git)).toEqual([
+      ["ls-files", "-z", "--cached", "--full-name"],
+      ["ls-files", "-z", "--cached", "--full-name", "--", ":(literal)d"],
+      ["ls-files", "-s", "-z", "--full-name"],
+    ]);
+    await expect(ops.lsFiles(slot, [""])).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
+  });
+
+  // QA-2.4-20
+  it("re-checks the hooks directory before every git call, not only when the context is built", async () => {
+    const { git, fs, ops } = slotOps();
+    await ops.addAll(slot);
+    const hook = join(HOME, "git", "no-hooks", "pre-commit");
+    fs.entries.set(resolve(hook), "#!/bin/sh");
+    const before = git.calls.length;
+    await expect(ops.addAll(slot)).rejects.toThrow(/hooks directory is not empty/);
+    await expect(ops.checkoutDetach(slot, OID_A)).rejects.toThrow(/hooks directory is not empty/);
+    await expect(ops.revParse(top, "HEAD")).rejects.toThrow(/hooks directory is not empty/);
+    expect(git.calls.length).toBe(before);
+    fs.entries.delete(resolve(hook));
+    await ops.addAll(slot);
+    expect(git.calls.length).toBe(before + 1);
   });
 
   it("statusPorcelain parses -z entries, renames and rejects garbage", async () => {

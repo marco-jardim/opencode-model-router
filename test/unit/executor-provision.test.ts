@@ -246,14 +246,25 @@ describe("detectManagers: python", () => {
     ["requirements.txt", { "requirements.txt": "pytest\n" }, ["pip"], false],
     ["uv.lock", { "uv.lock": "version = 1\n", "pyproject.toml": "[project]\nname='x'\n" }, ["uv"], false],
     ["poetry.lock", { "poetry.lock": "x", "pyproject.toml": "[project]\nname='x'\n" }, ["poetry"], false],
-    ["uv.lock beats poetry.lock and requirements", { "uv.lock": "x", "poetry.lock": "x", "requirements.txt": "x" }, ["uv"], false],
-    ["poetry.lock beats requirements", { "poetry.lock": "x", "requirements.txt": "x" }, ["poetry"], false],
+    ["uv.lock beats poetry.lock and requirements", { "uv.lock": "x", "poetry.lock": "x", "requirements.txt": "x", "pyproject.toml": "[project]\nname='x'\n" }, ["uv"], false],
+    ["poetry.lock beats requirements", { "poetry.lock": "x", "requirements.txt": "x", "pyproject.toml": "[project]\nname='x'\n" }, ["poetry"], false],
     ["build-system without lock", { "pyproject.toml": PYPROJECT_SETUPTOOLS }, ["pip"], true],
     ["flit backend is not editable-by-setuptools", { "pyproject.toml": '[build-system]\nrequires=["flit"]\nbuild-backend = "flit_core.buildapi"\n' }, ["pip"], false],
     ["setup.py with requirements", { "requirements.txt": "x", "setup.py": "from setuptools import setup\n" }, ["pip"], true],
     ["pyproject without build-system or lock", { "pyproject.toml": "[project]\nname='x'\n" }, [], false],
   ] as Array<[string, Record<string, string>, string[], boolean]>)("%s", async (_name, files, managers, editable) => {
     await expect(detect(files)).resolves.toMatchObject({ managers, editable });
+  });
+
+  it.each(["uv", "poetry"])("%s.lock without a tracked root pyproject.toml is E_PROVISION, never a project found above the slot", async (manager) => {
+    const lock = `${manager}.lock`;
+    await expect(detect({ [lock]: "x" })).rejects.toMatchObject({
+      code: "E_PROVISION", message: expect.stringContaining(`${manager} needs a pyproject.toml at the repository root of ${SLOT}`),
+    });
+    // A pyproject.toml in a subdirectory, or one that exists on disk but is not tracked, does not count.
+    await expect(detect({ [lock]: "x", "sub/pyproject.toml": "[project]\n" })).rejects.toThrow(/needs a pyproject\.toml/);
+    await expect(detect({ [lock]: "x", "pyproject.toml": "[project]\n" }, [lock])).rejects.toThrow(/needs a pyproject\.toml/);
+    await expect(detect({ [lock]: "x", "pyproject.toml": "[project]\n" })).resolves.toMatchObject({ managers: [manager] });
   });
 
   it("sorts node and python managers together", async () => {
@@ -288,8 +299,13 @@ describe("detectManagers: overrides", () => {
   });
 
   it("an override replaces auto-detection within its ecosystem only", async () => {
-    const d = await detect({ "package.json": PKG, "package-lock.json": "l", "uv.lock": "x" }, undefined, { provision: { pnpm: [["pnpm", "i"]] }, python: "auto" });
+    const d = await detect({ "package.json": PKG, "package-lock.json": "l", "uv.lock": "x", "pyproject.toml": "[project]\n" }, undefined, { provision: { pnpm: [["pnpm", "i"]] }, python: "auto" });
     expect(d.managers).toEqual(["pnpm", "uv"]);
+  });
+
+  it("an override carries its own argv, so uv or poetry forced by it need no pyproject.toml", async () => {
+    const d = await detect({}, [], { provision: { uv: [["uv", "sync"]], poetry: [["poetry", "install"]] }, python: "auto" });
+    expect(d.managers).toEqual(["poetry", "uv"]);
   });
 
   it("ignores override keys that are not managers and carries executor.python", async () => {
@@ -323,7 +339,7 @@ describe("needsProvision (drift)", () => {
   it("flags a different manager set, an added manifest and a removed manifest", async () => {
     const pip = await detect({ "requirements.txt": "x" });
     const rec = { managers: [...pip.managers], manifests: { ...pip.manifests } };
-    expect(needsProvision(rec, await detect({ "uv.lock": "x" }))).toBe(true);
+    expect(needsProvision(rec, await detect({ "uv.lock": "x", "pyproject.toml": "[project]\n" }))).toBe(true);
     expect(needsProvision(rec, await detect({ "requirements.txt": "x", "requirements-dev.txt": "y" }))).toBe(true);
     expect(needsProvision({ managers: ["pip"], manifests: { "requirements.txt": sha("x"), "requirements-dev.txt": sha("y") } }, pip)).toBe(true);
     expect(needsProvision({ managers: [], manifests: {} }, await detect({}))).toBe(false);
@@ -381,17 +397,37 @@ describe("planProvision", () => {
     expect(JSON.stringify(step?.env)).not.toContain("secret");
   });
 
+  it("keeps the pnpm workspace (no --ignore-workspace) when the slot tracks a root pnpm-workspace.yaml", () => {
+    const [step] = planProvision(SLOT, det(["pnpm"], { pnpmWorkspace: true }), hostWith(bin), AUTO);
+    expect(step?.args).toEqual(["--dir", SLOT, "install", "--frozen-lockfile", "--prefer-offline", "--config.confirm-modules-purge=false"]);
+    const withoutFlag = planProvision(SLOT, det(["pnpm"], { pnpmWorkspace: false }), hostWith(bin), AUTO);
+    expect(withoutFlag[0]?.args).toContain("--ignore-workspace");
+  });
+
+  it("detects a tracked root pnpm-workspace.yaml and records it as a pnpm manifest", async () => {
+    const files = { "package.json": PKG, "pnpm-lock.yaml": "l", "pnpm-workspace.yaml": "packages:\n  - 'packages/*'\n", "packages/a/package.json": PKG };
+    const d = await detect(files);
+    expect(d).toMatchObject({ managers: ["pnpm"], pnpmWorkspace: true });
+    expect(Object.keys(d.manifests)).toContain("pnpm-workspace.yaml");
+    // A workspace file that is not at the root, or not tracked, does not make the slot a workspace.
+    expect((await detect({ "package.json": PKG, "pnpm-lock.yaml": "l", "sub/pnpm-workspace.yaml": "x" })).pnpmWorkspace).toBeUndefined();
+    expect((await detect(files, ["package.json", "pnpm-lock.yaml"])).pnpmWorkspace).toBeUndefined();
+    // Changing the workspace file is drift.
+    const rec = { managers: [...d.managers], manifests: { ...d.manifests } };
+    expect(needsProvision(rec, await detect({ ...files, "pnpm-workspace.yaml": "packages:\n  - 'other/*'\n" }))).toBe(true);
+  });
+
   it("plans uv sync --frozen, with --python when executor.python is set", () => {
     const host = hostWith(bin);
-    expect(planProvision(SLOT, det(["uv"]), host, AUTO)[0]).toMatchObject({ manager: "uv", args: ["sync", "--frozen"], label: "uv sync" });
+    expect(planProvision(SLOT, det(["uv"]), host, AUTO)[0]).toMatchObject({ manager: "uv", args: ["--project", SLOT, "sync", "--frozen"], label: "uv sync" });
     const python = join(bin, exe("pytool"));
     const withPython = planProvision(SLOT, det(["uv"], { python }), host, { provision: "auto", python });
-    expect(withPython[0]?.args).toEqual(["sync", "--frozen", "--python", python]);
+    expect(withPython[0]?.args).toEqual(["--project", SLOT, "sync", "--frozen", "--python", python]);
   });
 
   it("plans poetry into an in-project virtual environment", () => {
     const [step] = planProvision(SLOT, det(["poetry"]), hostWith(bin), AUTO);
-    expect(step).toMatchObject({ manager: "poetry", args: ["install", "--no-interaction"] });
+    expect(step).toMatchObject({ manager: "poetry", args: ["--directory", SLOT, "install", "--no-interaction"] });
     expect(step?.env["POETRY_VIRTUALENVS_IN_PROJECT"]).toBe("true");
   });
 
@@ -506,7 +542,7 @@ describe("planProvision", () => {
   it("passes executor.python to uv even when the detection carries none", () => {
     const python = join(bin, exe("pytool"));
     const [step] = planProvision(SLOT, det(["uv"]), hostWith(bin), { provision: "auto", python });
-    expect(step?.args).toEqual(["sync", "--frozen", "--python", python]);
+    expect(step?.args).toEqual(["--project", SLOT, "sync", "--frozen", "--python", python]);
   });
 
   it("plans pip with only the requirement files that exist and no editable install", () => {
@@ -797,12 +833,12 @@ describe("createProvisioner", () => {
     const { spawner, provisioner, fs, lock } = setup();
     const done = provisioner.provision(slot(1), detection(["poetry", "uv"]), { fresh: false });
     await settle();
-    expect(spawner.calls.map(c => c.args[0])).toEqual(["install"]);
+    expect(spawner.calls.map(c => c.args[2])).toEqual(["install"]);
     expect(fs.nodes.has(key(lock("poetry")))).toBe(true);
     spawner.calls[0]?.resolve();
     await settle();
     expect(fs.nodes.has(key(lock("poetry")))).toBe(false);
-    expect(spawner.calls.map(c => c.args[0])).toEqual(["install", "sync"]);
+    expect(spawner.calls.map(c => c.args[2])).toEqual(["install", "sync"]);
     spawner.calls[1]?.resolve();
     await done;
   });
@@ -896,6 +932,21 @@ describe("createProvisioner", () => {
     expect(dependencyRemovals(kept.fs)).toHaveLength(0);
   });
 
+  it("fresh removes every link below .venv non-recursively before the recursive removal (QA-2.4-15)", async () => {
+    const python = join(bin, exe("pytool"));
+    const { spawner, provisioner, fs } = setup({ provision: "auto", python });
+    spawner.hold = false;
+    const venv = join(slot(1), ".venv");
+    const lib = join(venv, "lib");
+    const link = join(lib, "escape");
+    fs.nodes.set(key(venv), "dir");
+    fs.nodes.set(key(lib), "dir");
+    fs.nodes.set(key(link), "junction");
+    await provisioner.provision(slot(1), detection(["pip"], { python }), { fresh: true });
+    const removals = fs.removed.filter(r => !r.path.endsWith(".lock"));
+    expect(removals).toEqual([{ path: link, recursive: false }, { path: venv, recursive: true }]);
+  });
+
   it("takes over a lock whose owner died on this host", async () => {
     const { spawner, provisioner, clock, fs, lock } = setup();
     const now = clock.now();
@@ -977,7 +1028,7 @@ describe("createProvisioner", () => {
     spawner.reply = (_c, args) => (args[0] === "cache" ? { stdout: "E:\\cache\\uv\n" } : undefined);
     await provisioner.provision(slot(1), detection(["uv"]), { fresh: false });
     await provisioner.provision(slot(2), detection(["uv"]), { fresh: false });
-    const syncs = spawner.calls.filter(c => c.args[0] === "sync");
+    const syncs = spawner.calls.filter(c => c.args.includes("sync"));
     expect(syncs).toHaveLength(2);
     for (const c of syncs) expect(c.opts.env?.["UV_CACHE_DIR"]).toBe("C:\\.omr-cache\\uv");
     expect(spawner.calls.filter(c => c.args[0] === "cache")).toHaveLength(1);
@@ -988,12 +1039,12 @@ describe("createProvisioner", () => {
     same.spawner.hold = false;
     same.spawner.reply = (_c, args) => (args[0] === "cache" ? { stdout: "c:\\cache\\uv\n" } : undefined);
     await same.provisioner.provision(slot(1), detection(["uv"]), { fresh: false });
-    expect(same.spawner.calls.find(c => c.args[0] === "sync")?.opts.env?.["UV_CACHE_DIR"]).toBeUndefined();
+    expect(same.spawner.calls.find(c => c.args.includes("sync"))?.opts.env?.["UV_CACHE_DIR"]).toBeUndefined();
     const failed = setup(AUTO, true);
     failed.spawner.hold = false;
     failed.spawner.reply = (_c, args) => (args[0] === "cache" ? { code: 1 } : undefined);
     await failed.provisioner.provision(slot(1), detection(["uv"]), { fresh: false });
-    expect(failed.spawner.calls.find(c => c.args[0] === "sync")?.opts.env?.["UV_CACHE_DIR"]).toBeUndefined();
+    expect(failed.spawner.calls.find(c => c.args.includes("sync"))?.opts.env?.["UV_CACHE_DIR"]).toBeUndefined();
   });
 
   it("refuses to plan when the manager binary is missing, before taking any lock", async () => {
@@ -1310,6 +1361,13 @@ describe("createProvisioner", () => {
     await expect(odd.provisioner.provision(slot(1), detection(["uv"]), { fresh: false })).rejects.toThrow(/exit 0/);
   });
 
+  it("detect() runs detectManagers with the provisioner's own config (QA-2.4-10)", async () => {
+    const forced = setup({ provision: { pnpm: [["pnpm", "install"]] }, python: "auto" });
+    await expect(forced.provisioner.detect(slot(1), [])).resolves.toMatchObject({ managers: ["pnpm"] });
+    const auto = setup();
+    await expect(auto.provisioner.detect(slot(1), [])).resolves.toMatchObject({ managers: [] });
+  });
+
   it("wraps a non-Error spawn rejection as a could-not-run failure", async () => {
     const { spawner, provisioner, fs, lock } = setup();
     spawner.run = () => Promise.reject<ProcessResult>("boom");
@@ -1326,6 +1384,6 @@ describe("createProvisioner", () => {
     spawner.hold = false;
     spawner.run = (command, args, opts) => (args[0] === "cache" ? Promise.reject(new Error("spawn failed")) : realRun(command, args, opts));
     await provisioner.provision(slot(1), detection(["uv"]), { fresh: false });
-    expect(spawner.calls.find(c => c.args[0] === "sync")?.opts.env?.["UV_CACHE_DIR"]).toBeUndefined();
+    expect(spawner.calls.find(c => c.args.includes("sync"))?.opts.env?.["UV_CACHE_DIR"]).toBeUndefined();
   });
 });

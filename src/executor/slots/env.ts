@@ -19,7 +19,7 @@ export interface SlotEnv {
   set: Readonly<Record<string, string>>;
   /** `<root>\.venv\Scripts` or `.venv/bin` (Python), `<root>\node_modules\.bin` (Node). */
   prependPath: readonly string[];
-  /** PYTHONPATH, PYTHONHOME, NODE_PATH, UV_PROJECT_ENVIRONMENT. */
+  /** PYTHONPATH, PYTHONHOME, NODE_PATH, UV_PROJECT_ENVIRONMENT (and VIRTUAL_ENV when the slot has no Python manager). */
   unset: readonly string[];
 }
 
@@ -72,7 +72,8 @@ function buildSlotEnv(slot: RegisteredSlot, platform: NodeJS.Platform): SlotEnv 
   const p = platform === "win32" ? nodePath.win32 : nodePath.posix;
   const set: Record<string, string> = {};
   const prependPath: string[] = [];
-  if (slot.managers.some((m) => PYTHON_MANAGERS.has(m))) {
+  const python = slot.managers.some((m) => PYTHON_MANAGERS.has(m));
+  if (python) {
     const venv = p.join(slot.root, ".venv");
     set.VIRTUAL_ENV = venv;
     prependPath.push(p.join(venv, platform === "win32" ? "Scripts" : "bin"));
@@ -80,7 +81,8 @@ function buildSlotEnv(slot: RegisteredSlot, platform: NodeJS.Platform): SlotEnv 
   if (slot.managers.some((m) => NODE_MANAGERS.has(m))) {
     prependPath.push(p.join(slot.root, "node_modules", ".bin"));
   }
-  return { root: slot.root, set, prependPath, unset: UNSET_NAMES };
+  // A slot without a Python manager must not inherit another checkout's virtual environment.
+  return { root: slot.root, set, prependPath, unset: python ? UNSET_NAMES : [...UNSET_NAMES, "VIRTUAL_ENV"] };
 }
 
 /**

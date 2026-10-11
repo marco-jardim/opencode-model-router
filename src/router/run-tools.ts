@@ -429,6 +429,35 @@ function stemOf(path: string): string {
 }
 
 /**
+ * The one narrow exception to "no executable inside the work root" (QA-2.4-6): when the work root is an
+ * executor slot, a BARE name is looked up first in the slot's own tool directories (`.venv\Scripts` / `.venv/bin`,
+ * `node_modules/.bin`), so `pytest` or `vitest` runs the slot's install. The file must be a regular file whose
+ * real path is inside the slot root; a virtualenv interpreter may instead be a link to one outside every guarded
+ * directory. The same name rules apply as everywhere (no shells, node or npm, `.exe`/`.com` only on win32).
+ * Absolute paths, names not found there, and every work root that is not a slot fall through unchanged.
+ */
+function slotToolExecutable(program: string, slotEnv: SlotEnv | null, host: RunHost, guards: () => readonly string[]): string | undefined {
+  if (slotEnv === null || !/^[A-Za-z0-9_][A-Za-z0-9_.+-]{0,99}$/.test(program)) return undefined;
+  const win = host.platform === "win32";
+  if (win && /\.(cmd|bat|ps1)$/i.test(program)) return undefined;
+  const P = pathApi(host.platform);
+  const name = win && !/\.(exe|com)$/i.test(program) ? `${program}.exe` : program;
+  for (const dir of slotEnv.prependPath) {
+    const file = foundFile(P.join(dir, name), host.platform);
+    if (file === undefined) continue;
+    const inSlot = insideAny(file.real, [slotEnv.root]);
+    const linkedOut = !inSlot && P.basename(dir).toLowerCase() !== ".bin" && !insideAny(file.real, guards());
+    if (!inSlot && !linkedOut) continue;
+    if (!insideAny(file.found, [slotEnv.root])) continue;
+    refuseProgramStem(stemOf(program), program);
+    refuseProgramStem(stemOf(file.real), program);
+    if (win && (!/\.(exe|com)$/i.test(file.found) || !/\.(exe|com)$/i.test(file.real))) continue;
+    return file.found;
+  }
+  return undefined;
+}
+
+/**
  * The node that runs npm-cli.js (verify/runner.ts F.1 rules): the explicit seam; else
  * process.execPath when the runtime really is node (opencode hosts plugins in Bun);
  * else the first node on an absolute PATH entry that is not Bun's temporary link. The
@@ -742,6 +771,7 @@ export function planRun(input: RunInput, root: string, config: RunConfig, host: 
   let shell: string | undefined;
   let guards: string[] | undefined;
   const guarded = () => (guards ??= workRootGuards(root));
+  const slotEnv = (host.slotEnv ?? slotEnvFor)(root, host.platform);
   if (command !== undefined) {
     if (!Array.isArray(command.argv) || command.argv.length === 0 || command.argv.some(part => typeof part !== "string" || part === "")) {
       throw refuse(`routing.run.commands.${name} has no valid argv`);
@@ -770,7 +800,7 @@ export function planRun(input: RunInput, root: string, config: RunConfig, host: 
       shell = launch.shell;
       argv = [launch.cli, ...launch.flags, ...fixed, ...args];
     } else {
-      executable = resolveCommandExecutable(program!, host, guarded());
+      executable = slotToolExecutable(program!, slotEnv, host, guarded) ?? resolveCommandExecutable(program!, host, guarded());
       argv = [...fixed, ...args];
     }
   } else if (scriptAllowed(config.scripts ?? [], name)) {
@@ -791,7 +821,7 @@ export function planRun(input: RunInput, root: string, config: RunConfig, host: 
   }
   return {
     kind: command !== undefined ? "command" : "script", name, executable, argv, cwd: root,
-    env: applySlotEnv(runEnvironment(host.env, host.platform, shell, { guards: guarded() }), (host.slotEnv ?? slotEnvFor)(root, host.platform), host.platform), timeoutMs,
+    env: applySlotEnv(runEnvironment(host.env, host.platform, shell, { guards: guarded() }), slotEnv, host.platform), timeoutMs,
   };
 }
 

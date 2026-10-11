@@ -56,6 +56,57 @@ function project(dir: string, scripts: Record<string, string> = { test: "node pr
     "if (process.argv[2] === 'exit') process.exit(Number(process.argv[3]));",
   ].join("\n"));
 }
+describe("planRun inside an executor slot (QA-2.4-6)", () => {
+  const exe = (name: string): string => (WIN ? `${name}.exe` : name);
+  const binDir = (): string => join(root, "node_modules", ".bin");
+  const venvDir = (): string => join(root, ".venv", WIN ? "Scripts" : "bin");
+  const slotEnv = (dirs: string[]) => () => ({ root, set: {}, prependPath: dirs, unset: [] });
+  const cmds = (name: string): RunConfig => config({ commands: { [name]: { argv: [name] } } });
+  const hostFor = (dirs: string[] | null) => ({
+    platform: process.platform, env: testEnv(), slotEnv: dirs === null ? () => null : slotEnv(dirs),
+  });
+  const touch = (dir: string, file: string): string => {
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, file);
+    writeFileSync(path, "");
+    return path;
+  };
+
+  const plan = (script: string, cfg: RunConfig, dirs: string[] | null) => planRun({ script, cwd: root }, root, cfg, hostFor(dirs));
+
+  it("finds a bare name in the slot's node_modules/.bin and .venv before PATH", () => {
+    const tool = touch(binDir(), exe("slottool"));
+    const py = touch(venvDir(), exe("slotpy"));
+    const dirs = [venvDir(), binDir()];
+    expect(plan("slottool", cmds("slottool"), dirs).executable).toBe(tool);
+    expect(plan("slotpy", cmds("slotpy"), dirs).executable).toBe(py);
+  });
+
+  it("outside a slot the same bare name is still refused as not found", () => {
+    touch(binDir(), exe("slottool"));
+    expect(() => plan("slottool", cmds("slottool"), null)).toThrow(/not found on an absolute PATH entry/);
+  });
+
+  it("an absolute path inside the work root stays refused, slot or not", () => {
+    const tool = touch(binDir(), exe("slottool"));
+    const absolute: RunConfig = config({ commands: { abs: { argv: [tool] } } });
+    expect(() => plan("abs", absolute, [binDir()])).toThrow(/inside the work root/);
+  });
+
+  it("a shell found in the slot's bin directory is still refused", () => {
+    const shell = WIN ? "cmd" : "sh";
+    touch(binDir(), exe(shell));
+    expect(() => plan(shell, cmds(shell), [binDir()])).toThrow(/is a shell/);
+  });
+
+  it.skipIf(WIN)("a node_modules/.bin entry that links outside the slot is not used", () => {
+    const outside = touch(sibling, "elsewhere");
+    mkdirSync(binDir(), { recursive: true });
+    symlinkSync(outside, join(binDir(), "linked"));
+    expect(() => plan("linked", cmds("linked"), [binDir()])).toThrow(/not found on an absolute PATH entry/);
+  });
+});
+
 type Execute = (args: unknown, context: unknown) => Promise<string>;
 function git(dir: string, ...args: string[]): string {
   return execFileSync(gitExecutable(), ["-c", "gc.auto=0", "-c", "maintenance.auto=false", ...args], { cwd: dir, env: gitEnvironment(), encoding: "utf8" });

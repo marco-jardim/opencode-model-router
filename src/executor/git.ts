@@ -345,8 +345,19 @@ export interface GitOps {
   worktreeList(): Promise<WorktreeEntry[]>;
   // cwd = slot, explicit --git-dir/--work-tree
   checkoutDetach(slot: string, commit: string): Promise<void>;
-  cleanTracked(slot: string): Promise<void>;
+  /** `clean -q -ffdx -e <keep>...`: ignored files of the previous owner go too; only `keep` survives. */
+  cleanTracked(slot: string, keep: readonly string[]): Promise<void>;
+  /**
+   * `checkout --force HEAD -- .`, `clean -q -ffdx -e <keep>...`, then nothing may remain to clean and `statusPorcelain` must
+   * be empty (E_GIT listing the dirty paths otherwise). Tracked changes are reverted: 3.1 commits before it calls this.
+   */
   cleanForChecks(slot: string, keep: readonly string[]): Promise<void>;
+  /** The paths `clean -ndx -e <keep>...` would remove (same vector as the real clean), "/"-separated, directories end in "/". */
+  cleanPreview(slot: string, keep: readonly string[]): Promise<string[]>;
+  /** `ls-files -z --cached` (index), optionally limited to literal pathspecs. */
+  lsFiles(slot: string, pathspecs?: readonly string[]): Promise<string[]>;
+  /** Index entries of mode 120000. */
+  trackedLinks(slot: string): Promise<string[]>;
   statusPorcelain(slot: string): Promise<StatusEntry[]>;
   addAll(slot: string): Promise<void>;
   /** Validates `message` against COMMIT_SUBJECT_PATTERN; returns the new HEAD. */
@@ -362,7 +373,11 @@ export interface GitOps {
   isAncestor(a: string, b: string): Promise<boolean>;
   tag(name: string, commit: string): Promise<void>;
   deleteRefs(prefix: string): Promise<string[]>;
-  branchForce(name: string, commit: string, expectedOld?: string | null): Promise<void>;
+  /**
+   * Compare-and-swap move of `refs/heads/<name>` (`update-ref --no-deref`); `expectedOld` is required, `null` meaning the
+   * branch must not exist. Refuses a symbolic ref and a branch checked out in any worktree.
+   */
+  branchForce(name: string, commit: string, expectedOld: string | null): Promise<void>;
 }
 
 interface OpsContext { args: string[]; identity: CommitIdentity }
@@ -440,9 +455,17 @@ export function createGitOps(d: GitOpsDeps): GitOps {
     return wanted === true ? ["-c", `user.name=${x.identity.name}`, "-c", `user.email=${x.identity.email}`] : [];
   }
 
+  /** The hooks directory is re-checked before every call: an op can run a hook only from a non-empty directory. */
+  async function assertHooksEmpty(): Promise<void> {
+    const st = await d.fs.lstat(hooksDir);
+    if (st === null || st.kind !== "dir") throw new ExecutorError("E_GIT", "hooks directory is not a real directory", { path: hooksDir });
+    if ((await d.fs.readdir(hooksDir)).length !== 0) throw new ExecutorError("E_GIT", "hooks directory is not empty", { path: hooksDir });
+  }
+
   /** cwd = toplevel. */
   async function inRepo(c: Call): Promise<ProcessResult> {
     const x = await context();
+    await assertHooksEmpty();
     return exec(c.op, toplevel, [...x.args, ...identityArgs(x, c.identity), ...c.args], c.timeoutMs ?? timeoutMs);
   }
 
@@ -450,6 +473,7 @@ export function createGitOps(d: GitOpsDeps): GitOps {
   async function inSlot(slot: string, c: Call): Promise<ProcessResult> {
     const { gitdir } = await verifySlotPointers(slot);
     const x = await context();
+    await assertHooksEmpty();
     const scope = [`--git-dir=${gitdir}`, `--work-tree=${slot}`];
     return exec(c.op, slot, [...x.args, ...identityArgs(x, c.identity), ...scope, ...c.args], c.timeoutMs ?? timeoutMs);
   }
@@ -531,6 +555,17 @@ export function createGitOps(d: GitOpsDeps): GitOps {
   async function verifySlotPointers(slot: string): Promise<{ gitdir: string; common: string }> {
     if (typeof slot !== "string" || !isAbsolute(slot)) throw invalid("slot path must be absolute", { slot: String(slot).slice(0, 200) });
     const broken = (why: string) => new ExecutorError("E_SLOT_BROKEN", `slot ${slot}: ${why}`, { slot, why });
+    const slotStat = await d.fs.lstat(slot);
+    if (slotStat === null) throw broken("the slot directory does not exist");
+    if (slotStat.kind !== "dir") throw broken(`the slot is not a real directory (${slotStat.kind})`);
+    try {
+      // The slot itself must not be a link: its real path is its parent's real path plus its own name.
+      const parentReal = await d.fs.realpath(dirname(slot));
+      if (foldCase(await d.fs.realpath(slot)) !== foldCase(join(parentReal, basename(slot)))) throw broken("the slot resolves through a link");
+    } catch (error) {
+      if (error instanceof ExecutorError) throw error;
+      throw broken(`cannot resolve the slot (${errorText(error)})`);
+    }
     let pointers;
     try { pointers = gitPointers(slot); } catch (error) { throw broken(errorText(error)); }
     if (pointers === undefined) throw broken(".git is missing or names no git directory");
@@ -547,7 +582,8 @@ export function createGitOps(d: GitOpsDeps): GitOps {
     }
     const target = (back.split(/\r?\n/, 1)[0] ?? "").trim();
     if (target === "" || back.length > 4096 || isNetworkOrDevicePath(target)) throw broken("its back-pointer is unusable");
-    if (!(await samePath(resolve(pointers.gitdir, target), join(slot, ".git")))) throw broken("its back-pointer does not return to the slot");
+    // Lexical on purpose: a realpath would follow a link planted at the slot's `.git` or at the back-pointer's target.
+    if (foldCase(resolve(pointers.gitdir, target)) !== foldCase(resolve(join(slot, ".git")))) throw broken("its back-pointer does not return to the slot");
     return { gitdir: pointers.gitdir, common };
   }
 
@@ -582,7 +618,7 @@ export function createGitOps(d: GitOpsDeps): GitOps {
     requireLockReason(lockReason);
     await version();
     await ok(inRepo({
-      op: "worktree add", timeoutMs: GIT_WORKTREE_ADD_TIMEOUT_MS,
+      op: "worktree add", timeoutMs: GIT_WORKTREE_ADD_TIMEOUT_MS, identity: true,
       args: ["worktree", "add", "--detach", "--lock", "--reason", lockReason, path, commit],
     }), "worktree add");
   }
@@ -624,24 +660,98 @@ export function createGitOps(d: GitOpsDeps): GitOps {
       for (const file of state.files) present = present || await exists(join(gitdir, file));
       if (present) await ok(inSlot(slot, { op: state.quit.join(" "), args: state.quit }), state.quit.join(" "));
     }
-    await ok(inSlot(slot, { op: "checkout", args: ["checkout", "--detach", "--force", commit, "--"] }), "checkout");
+    await ok(inSlot(slot, { op: "checkout", identity: true, args: ["checkout", "--detach", "--force", commit, "--"] }), "checkout");
   }
 
-  async function cleanTracked(slot: string): Promise<void> {
-    await ok(inSlot(slot, { op: "clean", args: ["clean", "-q", "-ffd"] }), "clean");
-  }
-
-  async function cleanForChecks(slot: string, keep: readonly string[]): Promise<void> {
+  function cleanExcludes(keep: readonly string[]): string[] {
     const excludes: string[] = [];
     for (const k of keep) {
-      if (typeof k !== "string" || k === "" || k.length > 200 || /[\u0000-\u001f\u007f]/.test(k)) throw invalid("invalid clean exclusion", { keep: String(k).slice(0, 80) });
+      if (typeof k !== "string" || k === "" || k.length > 400 || /[\u0000-\u001f\u007f]/.test(k)) throw invalid("invalid clean exclusion", { keep: String(k).slice(0, 80) });
       excludes.push("-e", k);
     }
+    return excludes;
+  }
+
+  /** Reads one git C-quoted path (`"a\tb"`, octal escapes are UTF-8 bytes) or returns the text unchanged. */
+  function unquoteGitPath(text: string): string {
+    if (text.length < 2 || !text.startsWith("\"") || !text.endsWith("\"")) return text;
+    const bytes: number[] = [];
+    const body = text.slice(1, -1);
+    const simple: Readonly<Record<string, number>> = { a: 7, b: 8, f: 12, n: 10, r: 13, t: 9, v: 11, "\\": 92, "\"": 34 };
+    for (let n = 0; n < body.length; n++) {
+      const c = body.charAt(n);
+      if (c !== "\\") { bytes.push(...Buffer.from(c, "utf8")); continue; }
+      const next = body.charAt(n + 1);
+      const octal = /^[0-3][0-7]{2}$/.exec(body.slice(n + 1, n + 4));
+      if (octal !== null) { bytes.push(parseInt(octal[0], 8)); n += 3; continue; }
+      const code = simple[next];
+      if (code === undefined) { bytes.push(92); continue; }
+      bytes.push(code);
+      n += 1;
+    }
+    return Buffer.from(bytes).toString("utf8");
+  }
+
+  /**
+   * The paths `git clean -ndx -e <keep>` would delete, relative to the slot with "/" separators (a directory ends in "/").
+   * The same argument vector as the real clean (`cleanTracked`, `cleanForChecks`), so the caller can sweep exactly what git deletes.
+   */
+  async function cleanPreview(slot: string, keep: readonly string[]): Promise<string[]> {
+    const r = await ok(inSlot(slot, { op: "clean -n", args: ["-c", "core.quotePath=false", "clean", "-ndx", ...cleanExcludes(keep)] }), "clean -n");
+    const out: string[] = [];
+    for (const raw of r.stdout.split("\n")) {
+      const line = raw.replace(/\r$/, "");
+      if (line === "") continue;
+      const prefix = line.startsWith("Would remove ") ? "Would remove " : line.startsWith("Would skip repository ") ? "Would skip repository " : null;
+      if (prefix === null) throw new ExecutorError("E_GIT", "unparseable git clean preview line", { op: "clean -n", code: 0, stderr: line.slice(0, 200) });
+      out.push(unquoteGitPath(line.slice(prefix.length)));
+    }
+    return out;
+  }
+
+  /** Reset-time clean: `-x` so ignored files of the previous owner do not carry over; only `keep` survives. */
+  async function cleanTracked(slot: string, keep: readonly string[]): Promise<void> {
+    await ok(inSlot(slot, { op: "clean", args: ["clean", "-q", "-ffdx", ...cleanExcludes(keep)] }), "clean");
+  }
+
+  /**
+   * Before the clean: `checkout --force HEAD -- .` restores every tracked file the agent changed or deleted (the 3.1 task
+   * runner commits before it calls this, so nothing worth keeping is reverted). After it the status must be empty.
+   */
+  async function cleanForChecks(slot: string, keep: readonly string[]): Promise<void> {
+    const excludes = cleanExcludes(keep);
+    await ok(inSlot(slot, { op: "checkout", identity: true, args: ["checkout", "--force", "HEAD", "--", "."] }), "checkout");
     await ok(inSlot(slot, { op: "clean", args: ["clean", "-q", "-ffdx", ...excludes] }), "clean");
     const left = await ok(inSlot(slot, { op: "clean -n", args: ["clean", "-ndx", ...excludes] }), "clean -n");
     if (left.stdout.trim() !== "") {
       throw new ExecutorError("E_GIT", "files remain after clean", { op: "clean -n", code: 0, stderr: tailBytes(left.stdout, GIT_STDERR_TAIL_BYTES) });
     }
+    const dirty = await statusPorcelain(slot);
+    if (dirty.length !== 0) {
+      throw new ExecutorError("E_GIT", `${dirty.length} path(s) still differ from HEAD after the clean`, {
+        op: "status", code: 0, stderr: dirty.slice(0, 20).map(e => `${e.xy} ${e.path}`).join("\n").slice(0, GIT_STDERR_TAIL_BYTES),
+      });
+    }
+  }
+
+  /** The tracked paths of the index (pathspec-limited with `pathspecs`, matched literally), "/"-separated. */
+  async function lsFiles(slot: string, pathspecs: readonly string[] = []): Promise<string[]> {
+    for (const p of pathspecs) if (typeof p !== "string" || p === "" || /[\u0000-\u001f\u007f]/.test(p)) throw invalid("invalid pathspec", { pathspec: String(p).slice(0, 80) });
+    const r = await ok(inSlot(slot, {
+      op: "ls-files", args: ["ls-files", "-z", "--cached", "--full-name", ...(pathspecs.length === 0 ? [] : ["--", ...pathspecs.map(p => `:(literal)${p}`)])],
+    }), "ls-files");
+    return splitNul(r.stdout);
+  }
+
+  /** The tracked paths whose index mode is 120000 (symlinks): the only links a sweep must leave in place. */
+  async function trackedLinks(slot: string): Promise<string[]> {
+    const r = await ok(inSlot(slot, { op: "ls-files -s", args: ["ls-files", "-s", "-z", "--full-name"] }), "ls-files -s");
+    const out: string[] = [];
+    for (const entry of splitNul(r.stdout)) {
+      const tab = entry.indexOf("\t");
+      if (tab > 0 && entry.startsWith("120000 ")) out.push(entry.slice(tab + 1));
+    }
+    return out;
   }
 
   async function statusPorcelain(slot: string): Promise<StatusEntry[]> {
@@ -754,7 +864,7 @@ export function createGitOps(d: GitOpsDeps): GitOps {
     requireCommit(commitId, "commit");
     const before = await revParse(cwd, "HEAD");
     if (!(await isAncestor(before, commitId))) return { ok: false, head: before };
-    await ok(inDir(cwd, { op: "merge", args: ["merge", "--ff-only", "--no-edit", commitId] }), "merge");
+    await ok(inDir(cwd, { op: "merge", identity: true, args: ["merge", "--ff-only", "--no-edit", commitId] }), "merge");
     return { ok: true, head: await revParse(cwd, "HEAD") };
   }
 
@@ -763,7 +873,7 @@ export function createGitOps(d: GitOpsDeps): GitOps {
   async function tag(name: string, commitId: string): Promise<void> {
     requireCommit(commitId, "commit");
     await planRef(name, "tag name");
-    await ok(inRepo({ op: "tag", args: ["tag", name, commitId] }), "tag");
+    await ok(inRepo({ op: "tag", identity: true, args: ["tag", name, commitId] }), "tag");
   }
 
   async function deleteRefs(prefix: string): Promise<string[]> {
@@ -786,28 +896,34 @@ export function createGitOps(d: GitOpsDeps): GitOps {
       if (!under || !GIT_ID_PATTERN.test(oid)) continue;
       found.push({ ref, oid });
     }
+    const checkedOut = new Set((await worktreeList()).map(w => w.branch).filter((b): b is string => b !== null));
     const deleted: string[] = [];
     for (const { ref, oid } of found) {
-      await ok(inRepo({ op: "update-ref -d", args: ["update-ref", "-d", "--no-deref", ref, oid] }), "update-ref -d");
+      if (checkedOut.has(ref)) continue;
+      await ok(inRepo({ op: "update-ref -d", identity: true, args: ["update-ref", "-d", "--no-deref", ref, oid] }), "update-ref -d");
       deleted.push(ref);
     }
     return deleted;
   }
 
-  async function branchForce(name: string, commitId: string, expectedOld?: string | null): Promise<void> {
+  async function branchForce(name: string, commitId: string, expectedOld: string | null): Promise<void> {
     requireCommit(commitId, "commit");
     await planRef(name, "branch name");
-    const old = expectedOld === undefined ? [] : [expectedOld === null ? "0".repeat(commitId.length) : requireCommit(expectedOld, "expectedOld")];
+    if (expectedOld !== null && (typeof expectedOld !== "string" || expectedOld === "")) throw invalid("expectedOld is required: a full object id, or null for a branch that must not exist");
+    const old = expectedOld === null ? "0".repeat(commitId.length) : requireCommit(expectedOld, "expectedOld");
     const ref = `refs/heads/${name}`;
     if ((await worktreeList()).some(w => w.branch === ref)) {
       throw new ExecutorError("E_GIT", "branch is checked out in a worktree", { op: "update-ref", code: null, stderr: name.slice(0, 200) });
     }
-    await ok(inRepo({ op: "update-ref", args: ["update-ref", ref, commitId, ...old] }), "update-ref");
+    const symbolic = await inRepo({ op: "symbolic-ref", args: ["symbolic-ref", "-q", ref] });
+    if (symbolic.code === 0) throw new ExecutorError("E_GIT", "branch is a symbolic ref", { op: "symbolic-ref", code: 0, stderr: name.slice(0, 200) });
+    if (symbolic.code !== 1) throw gitFailure("symbolic-ref", symbolic);
+    await ok(inRepo({ op: "update-ref", identity: true, args: ["update-ref", "--no-deref", ref, commitId, old] }), "update-ref");
   }
 
   return {
     planId: d.planId, version, checkRefFormat, verifySlotPointers, worktreeAdd, worktreeRemove, worktreeList,
-    checkoutDetach, cleanTracked, cleanForChecks, statusPorcelain, addAll, commit, revParse, diffNames,
+    checkoutDetach, cleanTracked, cleanForChecks, cleanPreview, lsFiles, trackedLinks, statusPorcelain, addAll, commit, revParse, diffNames,
     rebaseOnto, rebaseAbort, cherryPick, revert, mergeFfOnly, isAncestor, tag, deleteRefs, branchForce,
   };
 }

@@ -24,7 +24,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { createGitOps, createGitRunner, formatCommitMessage, type GitOps } from "../../src/executor/git";
 import { createSlotPool, markerPath, slotLockReason } from "../../src/executor/slots/pool";
 import { slotEnvFor } from "../../src/executor/slots/env";
-import { createProvisioner, type Detection, type Provisioner } from "../../src/executor/slots/provision";
+import { createProvisioner, detectManagers, type Detection, type Provisioner } from "../../src/executor/slots/provision";
 import type { Clock, FileSystem, FsStat, GitRunner, ProcessResult, Spawner } from "../../src/executor/types";
 import { runArgv } from "../../src/verify/exec";
 import { removeDirWhenReleased } from "../helpers/remove-dir";
@@ -224,6 +224,7 @@ interface PoolSetup {
 /** Writes the dependency directories the way an installer would (offline). */
 function recordingProvisioner(calls: PoolSetup["provisions"]): Provisioner {
   return {
+    detect: (slot, tracked) => detectManagers(slot, tracked, nodeFs(), { provision: "auto", python: "auto" }),
     async provision(slot: string, d: Detection, o: { fresh: boolean }) {
       calls.push({ slot, managers: [...d.managers], fresh: o.fresh });
       if (d.managers.some((m) => m === "npm" || m === "pnpm" || m === "yarn")) {
@@ -279,6 +280,81 @@ afterEach(() => {
 // ---------------------------------------------------------------------------------------------------------------
 // The lifecycle
 // ---------------------------------------------------------------------------------------------------------------
+
+// QA-2.4-1 (critical). M4 (does git follow junctions?) measured here on the real git of this machine: the first test runs a
+// plain `git clean -ffdx` over a junction and records whether the target survived; the pool tests do not depend on the answer,
+// they require the target to survive whatever git does.
+describe("QA-2.4-1: the clean never reaches through a junction, at any depth or name", () => {
+  const outsideWith = (name: string): string => {
+    const outside = join(base, name);
+    mkdirSync(join(outside, "sub"), { recursive: true });
+    writeFileSync(join(outside, "keep.txt"), "keep\n");
+    writeFileSync(join(outside, "sub", "deep.txt"), "deep\n");
+    return outside;
+  };
+  const survives = (outside: string): boolean => existsSync(join(outside, "keep.txt")) && existsSync(join(outside, "sub", "deep.txt"));
+  const pythonRepo = (name: string): { repo: string; c1: string } => {
+    const repo = newRepo(name, ["py-pip"]);
+    git(repo, "config", "user.name", "Slot Tester");
+    git(repo, "config", "user.email", "slot.tester@example.test");
+    git(repo, "config", "core.autocrlf", "false");
+    git(repo, "config", "core.eol", "lf");
+    return { repo, c1: commitAll(repo, "c1") };
+  };
+
+  it("M4 measurement: plain `git clean -ffdx` over an untracked tools/node_modules/x junction (recorded result: target survives)", () => {
+    const { repo } = pythonRepo("repo-m4-raw");
+    const outside = outsideWith("outside-m4-raw");
+    mkdirSync(join(repo, "tools", "node_modules"), { recursive: true });
+    symlinkSync(outside, join(repo, "tools", "node_modules", "x"), "junction");
+    git(repo, "clean", "-q", "-ffdx");
+    const followed = !survives(outside);
+    expect(followed).toBe(false);
+  });
+
+  it("cleanForChecks and reset keep the target of a node_modules junction below the root of a Python-only slot", async () => {
+    const { repo, c1 } = pythonRepo("repo-m4");
+    const s = makePool(repo, "m4");
+    await s.pool.open();
+    const lease = await s.pool.acquire(PLAN, "task-1", c1);
+    expect(s.provisions[0]?.managers).toEqual(["pip"]);
+    const outside = outsideWith("outside-m4");
+    const plant = (): void => {
+      mkdirSync(join(lease.path, "tools", "node_modules"), { recursive: true });
+      symlinkSync(outside, join(lease.path, "tools", "node_modules", "x"), "junction");
+      mkdirSync(join(lease.path, "pkg"), { recursive: true });
+      symlinkSync(outside, join(lease.path, "pkg", "node_modules"), "junction");
+    };
+    plant();
+    await s.pool.cleanForChecks(lease.slot);
+    expect(survives(outside)).toBe(true);
+    expect(existsSync(join(lease.path, "tools", "node_modules"))).toBe(false);
+    expect(existsSync(join(lease.path, "pkg", "node_modules"))).toBe(false);
+    expect(existsSync(join(lease.path, ".venv", "pyvenv.cfg"))).toBe(true);
+    plant();
+    await s.pool.release(lease.slot);
+    const again = await s.pool.acquire(PLAN, "task-2", c1);
+    expect(again.slot).toBe(lease.slot);
+    expect(survives(outside)).toBe(true);
+    expect(existsSync(join(lease.path, "tools", "node_modules"))).toBe(false);
+    expect(existsSync(join(lease.path, ".venv", "pyvenv.cfg"))).toBe(true);
+  });
+
+  // QA-2.4-8 on real git
+  it("cleanForChecks restores tracked files the agent changed or deleted and leaves a clean status", async () => {
+    const { repo, c1 } = pythonRepo("repo-qa8");
+    const s = makePool(repo, "qa8");
+    await s.pool.open();
+    const lease = await s.pool.acquire(PLAN, "task-1", c1);
+    const original = read(join(lease.path, "requirements.txt"));
+    writeFileSync(join(lease.path, "requirements.txt"), "tampered\n");
+    writeFileSync(join(lease.path, "stray.txt"), "x\n");
+    await s.pool.cleanForChecks(lease.slot);
+    expect(read(join(lease.path, "requirements.txt"))).toBe(original);
+    expect(existsSync(join(lease.path, "stray.txt"))).toBe(false);
+    expect(await s.ops.statusPorcelain(lease.path)).toEqual([]);
+  });
+});
 
 describe("slot pool on real git", () => {
   let s: PoolSetup;

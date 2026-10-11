@@ -42,7 +42,7 @@ function underDependencyDir(repoPath: string): boolean {
  */
 export const PROVISION_MANIFESTS: Readonly<Record<Manager, (repoPath: string) => boolean>> = {
   npm: (p) => !underDependencyDir(p) && DEPENDENCY_FILES.has(baseName(p)),
-  pnpm: (p) => !underDependencyDir(p) && DEPENDENCY_FILES.has(baseName(p)),
+  pnpm: (p) => !underDependencyDir(p) && (DEPENDENCY_FILES.has(baseName(p)) || p === "pnpm-workspace.yaml"),
   yarn: (p) => !underDependencyDir(p) && DEPENDENCY_FILES.has(baseName(p)),
   pip: (p) => !underDependencyDir(p)
     && (/^requirements.*\.txt$/.test(baseName(p)) || ["pyproject.toml", "setup.py", "setup.cfg"].includes(baseName(p))),
@@ -64,6 +64,7 @@ export const PROVISION_STEP_TIMEOUT_MS = 1_200_000;
 export const PROVISION_OUTPUT_KEEP_BYTES = 16 * 1024;
 const PROBE_TIMEOUT_MS = 60_000;
 const TAIL_LINES = 12;
+const LINK_SWEEP_MAX_ENTRIES = 500_000;
 const LOCK_HEARTBEAT_MS = 10_000;
 const LOCK_STALE_MS = 60_000;
 const LOCK_STALE_RECHECK_MS = 1_000;
@@ -79,6 +80,8 @@ export interface Detection {
   python: string | null;
   /** Yarn berry: the `yarnPath` of `.yarnrc.yml` (slot-relative), when it names one. */
   yarnPath?: string;
+  /** The slot tracks a root `pnpm-workspace.yaml`: pnpm then keeps its workspace instead of ignoring it. */
+  pnpmWorkspace?: boolean;
 }
 
 function fail(message: string, detail: Record<string, string | number> = {}): ExecutorError {
@@ -146,10 +149,24 @@ async function detectPython(slot: string, tracked: ReadonlySet<string>, fs: File
   const buildSystem = pyproject !== null && /^\s*\[build-system\]/m.test(pyproject);
   const backend = pyproject === null ? null : /^\s*build-backend\s*=\s*["']([^"']+)["']/m.exec(pyproject)?.[1] ?? null;
   const editable = backend === "setuptools.build_meta" || (backend === null && tracked.has("setup.py"));
+  // uv and poetry look for their project upward from the slot: without a root pyproject.toml they could adopt one outside.
+  const needRoot = (managers: readonly Manager[]): void => {
+    const rooted = managers.filter((m) => m === "uv" || m === "poetry");
+    if (rooted.length > 0 && pyproject === null) {
+      throw fail(`${rooted.join(", ")} needs a pyproject.toml at the repository root of ${slot}; commit one or set executor.provision`, { manager: rooted[0]! });
+    }
+  };
   const fromOverride = forced.filter((m) => PYTHON_MANAGERS.includes(m));
+  // An override carries its own argv, so it is not held to the root pyproject.toml.
   if (fromOverride.length > 0) return { managers: fromOverride, editable: fromOverride.includes("pip") && editable };
-  if (tracked.has("uv.lock")) return { managers: ["uv"], editable: false };
-  if (tracked.has("poetry.lock")) return { managers: ["poetry"], editable: false };
+  if (tracked.has("uv.lock")) {
+    needRoot(["uv"]);
+    return { managers: ["uv"], editable: false };
+  }
+  if (tracked.has("poetry.lock")) {
+    needRoot(["poetry"]);
+    return { managers: ["poetry"], editable: false };
+  }
   if (tracked.has("requirements.txt") || buildSystem) return { managers: ["pip"], editable };
   return { managers: [], editable: false };
 }
@@ -187,6 +204,7 @@ export async function detectManagers(slot: string, tracked: readonly string[], f
     managers, yarnBerry, editable: python.editable, manifests,
     python: config.python === "auto" ? null : config.python,
     ...(yarnPath === undefined ? {} : { yarnPath }),
+    ...(managers.includes("pnpm") && set.has("pnpm-workspace.yaml") ? { pnpmWorkspace: true } : {}),
   };
 }
 
@@ -410,8 +428,10 @@ export function planProvision(slot: string, d: Detection, host: ProvisionHost, c
         steps.push(step("npm", node().node, [...npmFlags(), "--prefix", slot, "ci", "--prefer-offline", "--no-audit", "--no-fund"], "npm ci"));
         break;
       case "pnpm": {
-        // --dir pins the project to the slot and --ignore-workspace stops pnpm adopting a pnpm-workspace.yaml above it.
-        const args = ["--dir", slot, "install", "--ignore-workspace", "--frozen-lockfile", "--prefer-offline", "--config.confirm-modules-purge=false"];
+        // --dir pins the project to the slot. Without a tracked root pnpm-workspace.yaml, --ignore-workspace stops pnpm
+        // adopting one above the slot; with one, pnpm stops at the slot's own file, so the workspace installs whole.
+        const args = ["--dir", slot, "install", ...(d.pnpmWorkspace === true ? [] : ["--ignore-workspace"]),
+          "--frozen-lockfile", "--prefer-offline", "--config.confirm-modules-purge=false"];
         const exe = findExecutable("pnpm", host);
         if (exe !== undefined) {
           steps.push(step("pnpm", exe, args, "pnpm install"));
@@ -449,12 +469,12 @@ export function planProvision(slot: string, d: Detection, host: ProvisionHost, c
       case "uv": {
         const exe = requireTool("uv", host, "install uv (https://docs.astral.sh/uv/)");
         const python = d.python ?? (config.python === "auto" ? null : config.python);
-        steps.push(step("uv", exe, ["sync", "--frozen", ...(python === null ? [] : ["--python", python])], "uv sync"));
+        steps.push(step("uv", exe, ["--project", slot, "sync", "--frozen", ...(python === null ? [] : ["--python", python])], "uv sync"));
         break;
       }
       case "poetry": {
         const exe = requireTool("poetry", host, "install poetry");
-        steps.push(step("poetry", exe, ["install", "--no-interaction"], "poetry install", { POETRY_VIRTUALENVS_IN_PROJECT: "true" }));
+        steps.push(step("poetry", exe, ["--directory", slot, "install", "--no-interaction"], "poetry install", { POETRY_VIRTUALENVS_IN_PROJECT: "true" }));
         break;
       }
       case "pip": {
@@ -487,6 +507,8 @@ export function managerLockPath(m: Manager, env: NodeJS.ProcessEnv, platform: No
 }
 
 export interface Provisioner {
+  /** `detectManagers` with this provisioner's own config: detection and provisioning never disagree. */
+  detect(slot: string, tracked: readonly string[]): Promise<Detection>;
   provision(slot: string, d: Detection, o: { fresh: boolean; signal?: AbortSignal }): Promise<void>;
 }
 
@@ -579,11 +601,41 @@ export function createProvisioner(deps: {
     }
   }
 
-  /** lstat gate: a real directory is removed recursively; a link or a file only itself, never what a link points to. */
+  /**
+   * Removes every symlink/junction below `root` (non-recursively, never descending into one), so the recursive
+   * removal that follows cannot reach what a link points to. Real directories are descended iteratively.
+   */
+  async function sweepLinks(root: string): Promise<void> {
+    const pending = [root];
+    let seen = 0;
+    for (let dir = pending.pop(); dir !== undefined; dir = pending.pop()) {
+      let names: string[];
+      try {
+        names = await fs.readdir(dir);
+      } catch (error) {
+        if (errorCode(error) === "ENOENT") continue;
+        throw error;
+      }
+      for (const name of names) {
+        seen += 1;
+        if (seen > LINK_SWEEP_MAX_ENTRIES) {
+          throw fail(`more than ${LINK_SWEEP_MAX_ENTRIES} entries below ${root}; refusing to remove it recursively`, { path: root });
+        }
+        const child = p.join(dir, name);
+        const st = await fs.lstat(child);
+        if (st === null) continue;
+        if (st.kind === "symlink" || st.kind === "junction") await removeRetrying(child, false);
+        else if (st.kind === "dir") pending.push(child);
+      }
+    }
+  }
+
+  /** lstat gate: a real directory is swept of links, then removed recursively; a link or a file only itself. */
   async function removeDependencyDir(slot: string, rel: string): Promise<void> {
     const target = p.join(slot, rel);
     const st = await fs.lstat(target);
     if (st === null) return;
+    if (st.kind === "dir") await sweepLinks(target);
     await removeRetrying(target, st.kind === "dir");
   }
 
@@ -773,6 +825,7 @@ export function createProvisioner(deps: {
   }
 
   return {
+    detect: (slot, tracked) => detectManagers(slot, tracked, fs, config),
     async provision(slot, d, o) {
       const steps = planProvision(slot, d, host, config);
       aborted(slot, o.signal);
