@@ -63,8 +63,7 @@ The definitive solution has two parts that share one engine:
 - On a dedicated fixture run with no 429, no question and no restart: makespan ≤ 1.3 × max(CP, W/p, ΣI), where CP and W
   come from task durations scripted before the run, p is the configured `maxParallel` and ΣI is the measured serial
   integration time.
-- No idle-with-ready interval longer than 10 s: whenever a ready task and free capacity exist, it is launched (or, with the
-  by-reference launcher, offered to the orchestrator with a wake-up).
+- No idle-with-ready interval longer than 10 s: whenever a ready task and free capacity exist, it is launched (launcher A, ADR 0007 D14). *Amended by A-0.1-2.*
 - No file is written by two agents at once.
 - No file in a shared working tree is read through an agent's file or search tools while a child agent holds its write
   lease. A `router_run` started in that tree is annotated as possibly contaminated, or refused under
@@ -574,23 +573,23 @@ the real host, the owner's real subscriptions and this real plan. Both are requi
 | D1 | **Background-first** (`routing.background.mode`, default `auto`). An explicit model `background` value is honored. When it is unset, the dispatch runs in the background if any of these holds: the estimate has `n ≥ minSamples` and p50 ≥ `routing.background.minPredictedMs` (default 45000); the acceptance block has `testsPass` or `buildPasses`; it is a plan task. An estimate whose `source` is `"prior"` never selects background by itself. Required verification runs in the background only when C4 and C15 hold (D3); otherwise it stays in the foreground, as today. `off` reproduces today's `nativeArgs` exactly: `background:false` only for verifying or routed role calls; otherwise the caller's value passes through and no key is added. |
 | D2 | **Guarantees at completion.** A completion processor keyed by child session id runs everything that today's `execute.after` does for a finished dispatch: budget and authority signals, deferred-verification registration, change-set capture at child end, verification enqueue, timing. It runs exactly once per child attempt, triggered by whichever comes first: the child's execution-end event or the completion message seen in the parent's context. User-backgrounded dispatches (P3) get the same guarantees. **Foreground** dispatches keep today's in-result annotation in `execute.after`; the end-event trigger is suppressed while that call's `execute.after` is pending, so `off` and foreground output stay byte-identical. For **background** dispatches, the annotations (budget, authority, depth banner, verification handle) go in the turn-state tail's "completed" section (Appendix B), on every request of the parent's next turn. When the context hook builds the first request after a completion, it waits up to 2000 ms for `settled(child)`. If the child is not settled by then, the section shows "router guarantees pending" and the annotation appears in the next request. Past messages are never rewritten for annotations, and nothing is appended to history for them. |
 | D3 | **Held results** (only when C4 and C15 hold). For a background dispatch under required verification, the host's completion message is rewritten, for the life of the session, to a fixed placeholder (`held — verdict pending (vrf_…)`) that never changes, including in compaction (C15). On the verdict, a new synthetic entry delivers the output with the verdict (PASS) or the findings (FAIL) and wakes the parent once (`resume: true`). A `subagent` resume of a held child is refused until its verdict. Plan tasks never need holding: their output is consumed by the executor, and integration requires a PASS. |
-| D4 | **Cache-stable turn state.** On v2, all per-turn router state is rendered by one builder into a tail, regenerated on every request and never persisted. The state covers: in-flight dispatches, held results, pending verdicts, unread late notices (kept until `router_verify` reads them), the advise hint, plan state and inbox. The tail is placed per C5. The system prompt stays byte-stable. v1 keeps today's system-prompt path. If C5 allows no tail placement that keeps the prefix stable, ADR 0007 records G4 as unattainable and v2 keeps today's delivery. |
-| D5 | **Prompt-cache TTL.** When the host lets a plugin set a cache hint (C6), the stable system part gets a 1-hour TTL while the session has background activity or a running plan (`routing.promptCache.ttl`, default `auto`). Otherwise the key is not added. |
-| D6 | **Telemetry.** Every dispatch's start, end, role, class, scope, tier, model and outcome goes to `timings.jsonl`; every orchestrator turn's input, cache-read and cache-write tokens go to `turns.jsonl`; both live in the outcome store. An estimator gives p50/p90 per (role, class, scope), falling back to (role, class), then role, then a prior of 480000 ms. |
+| D4 | **Cache-stable turn state.** On v2, all per-turn router state is rendered by one builder into a tail, regenerated on every request and never persisted. The state covers: in-flight dispatches, held results, pending verdicts, unread late notices (kept until `router_verify` reads them), the advise hint, plan state and inbox. *Amended by A-0.1-2:* The tail is a new last message with role `user` (C5). The context hook also sets `cache: {type: "ephemeral"}` on a copy of the last text part of the last real message, so the host's only message breakpoint sits on real history and never on the tail (ADR 0007 D4; C5/D4/O8). The system prompt stays byte-stable. v1 keeps today's system-prompt path. |
+| D5 | **Prompt-cache TTL.** *Amended by A-0.1-2:* C6 holds: the plugin `CacheHint` `cache: {type: "ephemeral", ttlSeconds: 3600}` reaches the wire as `cache_control {type: "ephemeral", ttl: "1h"}`. `routing.promptCache.ttl` (`"auto" | "5m" | "1h"`, default `"auto"` = `1h` while the session has background activity or a running plan, otherwise the host default). While it resolves to `1h`, a copy of the last system part and the D4 hint part carry the hint; every other breakpoint stays the host's. No TTL is emitted until the real-provider acceptance check of ADR 0007 O11 is recorded. |
+| D6 | **Telemetry.** Every dispatch's start, end, role, class, scope, tier, model and outcome goes to `timings.jsonl`; every orchestrator turn's input, cache-read and cache-write tokens go to `turns.jsonl`; both live in the outcome store. An estimator gives p50/p90 per (role, class, scope), falling back to (role, class), then role, then a prior of 480000 ms. *Amended by A-0.1-2:* A timing row also carries `capacity` (`"rate-limit" | "overload" | "usage-limit" | null`: the last capacity class the child met, from event fields, ADR 0007 D13); rows with a non-null `capacity` are excluded from estimates. The retained-context age of each launcher A launch is an Appendix D metric. |
 | D7 | **File leases.** Only **child (delegated) sessions** take leases: on first write, an exclusive lease on the file, keyed by repository and normalized repo-relative path. A root session (the orchestrator or any plain user session) takes none; its writes are refused only while a child holds that file. While a child holds a write lease in a working tree, another session in the **same tree** is affected as follows: a **read** of that file is refused, naming the holder; a **directory search** omits leased files and adds a count; a **`router_run`** runs, and its result carries `[router] ran while <holder> edits <n> file(s); result may be contaminated` (refused instead when `routing.leases.run` is `"refuse"`); a **plugin verification run** is deferred until the lease ends or its deadline passes, then runs with today's contamination caveat. A child's leases end at its execution end, its interrupt, or the 6 h sweep. Plan-task leases end at integration. Predicted footprints are scheduling hints; leases are the enforcement. |
 | D8 | **Ledger.** The ledger lives under `<git common dir>\omr-executor\<planId>\`: a rotated journal plus an atomic snapshot, with a single-writer lock, a schema version, and an fsync before any externally visible step. The ledger, not the conversation, is the source of truth. |
 | D9 | **Compiler.** It runs in four steps. 1. Deterministic extraction: waves, phases, task ids, subtasks, annotations (backticked or not), acceptance blocks, ownership tables, dependency graph blocks, explicit dependency phrases, file paths. 2. One architect dispatch for the residue; its JSON is merged **monotonically** and can only add edges and footprints. 3. Validation: acyclic, known ids, paths inside the repository, concurrency closure. 4. An estimate. Unannotated tasks are classified by the routing engine. |
 | D10 | **Isolation.** Plan tasks run in a pool of git worktree slots on the repository's drive. Each slot has its own dependencies, installed once: never a shared `node_modules` or virtualenv, because workspace links and editable installs would load another checkout's code (`D:\git\omr-cpx-main\src\verify\reference.ts` ≈71-78). Between tasks a slot is reset to the integration head; ignored dependency directories survive. A dependency manifest change for any supported manager triggers a re-provision. Integration checks and phase suites first remove every other ignored file. Slot markers live in the executor home, outside every worktree. |
 | D11 | **Integration queue.** One per repository, serial. A verified task is rebased onto the integration head in its slot, integration checks run there, and the integration branch moves by **fast-forward only**. A conflict re-queues the task with the conflict as context. Waiting tasks are checked in batches and bisected on failure. When a phase is fully integrated, its full suite runs on the integration commit. A failure is bisected to the culprit, whose revert is built and checked in a slot before it is fast-forwarded, and the culprit is reopened. |
 | D12 | **Scheduler.** A task is ready when its dependencies (including phase gates) are integrated or `done`, capacity is free, and its predicted writes are not held. Priority is the bottom level (longest remaining path by estimated duration); ties go by plan order. |
-| D13 | **Adaptive capacity.** Per provider, additive-increase/multiplicative-decrease on rate-limit, overload and usage-limit errors. It is capped by `routing.executor.maxParallel` (default 4, because subscription limits are unknown), which is clamped to the largest concurrency proven by C13. |
-| D14 | **Launcher.** The plugin API has no session `create`, but the router already starts children itself: its child runner (`D:\git\omr-cpx-main\src\compat\v2-client.ts` ≈96-222) calls the native `subagent` tool with a retained parent context, and the grader and background verification use it. If C14 holds, the executor launches plan tasks itself through that path (**launcher A**: no orchestrator turn per task). It binds each child's role, grant and work root explicitly, and it refreshes the retained context on every orchestrator tool call. Otherwise the orchestrator dispatches by reference (`[plan <planId>:<taskId>]`, **launcher B**). Either way, a shared plan-context block comes first in every task prompt, so children of the same role reuse the provider cache. |
-| D15 | **Unattended operation.** Questions and exhausted tasks are parked in an inbox while independent branches continue. QA steps run as plan tasks that return structured findings; the executor turns the findings into fix tasks and re-review tasks (always [tier:heavy]) until zero findings, with the owner's bounded-round policy: findings of rounds 1 and 2 all produce fix tasks; from round 3 on only `blocking`, `critical` and `major` findings do; the cap is `executor.qaMaxRounds` rounds (default 3), then raises an inbox item. A circuit breaker pauses a phase on systemic failure. The orchestrator is woken only for inbox items, a paused phase, plan completion, (launcher B) ready work and `manual` tasks. A `manual` task entering `ready` wakes the orchestrator once, under both launchers. |
-| D16 | **Recovery.** On plugin start, every running ledger of the repository is reconciled with host evidence. Recovery adopts only ledgers whose `repo.toplevel` is the plugin session's toplevel. Finished children are processed. Children still alive are adopted, never re-dispatched. Lost children are re-queued. A half-done integration is completed or rolled back idempotently. `/plan adopt <planId>` rebinds a plan to a new orchestrator session. |
+| D13 | **Adaptive capacity.** Per provider, additive-increase/multiplicative-decrease on rate-limit, overload and usage-limit errors. It is capped by `routing.executor.maxParallel` (default 4, because subscription limits are unknown), *Amended by A-0.1-2:* whose valid range is 1–8, the largest concurrency proven by C13 (background children) and C14 (retained launches); raising it needs an ADR amendment backed by `smoke:cpx`. Signals come from event fields (ADR 0007 D13): `session.retry.scheduled` or the `session.hook("retry")` call (429 `provider.rate-limit`, 529 `provider.internal`) and `session.step.failed` (`provider.quota`); the provider comes from the preceding `session.step.started` `model.providerID`. For plan children only, the retry hook stops host retries when the provider is paused or a step has retried longer than `capacityCooldownMs`. |
+| D14 | *Amended by A-0.1-2:* **Launcher A** (C14 holds; ADR 0007 D14). The executor launches plan tasks through the router's child runner (`D:\git\omr-cpx-main\src\compat\v2-client.ts` ≈96-236). The runner calls the native `subagent` tool, awaited with `background: false`, using the context retained from the bound orchestrator's latest router tool call, an executor-owned `signal` and a record-only `progress`. It binds the role (agent), model, grant and work root explicitly at child creation (`onCreated`); the child's first context hook fails closed for an unbound plan child. The executor writes the decision row and the timing start itself, because a retained launch fires no `subagent` hook. It applies ADR 0007's six launch guards. Launcher B is not built. A shared plan-context block comes first in every task prompt, so children of the same role reuse the provider cache. |
+| D15 | **Unattended operation.** Questions and exhausted tasks are parked in an inbox while independent branches continue. QA steps run as plan tasks that return structured findings; the executor turns the findings into fix tasks and re-review tasks (always [tier:heavy]) until zero findings, with the owner's bounded-round policy: findings of rounds 1 and 2 all produce fix tasks; from round 3 on only `blocking`, `critical` and `major` findings do; the cap is `executor.qaMaxRounds` rounds (default 3), then raises an inbox item. A circuit breaker pauses a phase on systemic failure. *Amended by A-0.1-2:* The orchestrator is woken only for inbox items, a paused phase, plan completion, a `manual` or `preflight` task entering `ready` (once), and a stale launch context (ADR 0007 D14 guard 3). Wakes use the plugin's `ctx.session.synthetic({…, resume: true})` (ADR 0007 O6/O6b), debounced and never twice for the same state. |
+| D16 | **Recovery.** On plugin start, every running ledger of the repository is reconciled with host evidence. Recovery adopts only ledgers whose `repo.toplevel` is the plugin session's toplevel. Finished children are processed. Children still alive are adopted, never re-dispatched. *Amended by A-0.1-2:* Lost children are re-queued with a new attempt of outcome `lost`, which does not count toward `maxAttempts`. A child in flight at a host restart is lost (C12: no terminal event, inactive, no completion). Processing dedupes against the persisted pending store and the ledger. A half-done integration is completed or rolled back idempotently. `/plan adopt <planId>` rebinds a plan to a new orchestrator session. |
 | D17 | **Gates.** A phase's QA loop gates the next wave (`routing.executor.crossPhase`, default `gate`). With `inferred`, a later task starts when its own inferred dependencies are integrated. |
 | D18 | **Trust.** The keys that execute commands or widen permissions (`executor.slotsDir`, `executor.provision`, `executor.python`, `executor.integrationChecks`, `executor.phaseSuite`) are honored only from `tiers.json` and the global override, never from a project-local override, under the existing trust layer (`D:\git\omr-cpx-main\docs\CONFIG_REFERENCE.md` ≈883-885). `slotsDir` must be: absolute; on the repository's drive; not a drive root; neither inside nor an ancestor of the repository; free of `*`. |
 | D19 | **v1 inert.** Nothing in this plan changes v1 behavior or output (§0.10-8). |
-| D20 | **Out of scope.** Cross-repository plans (a separate plan; the ledger is keyed by repository so it can extend), a background mode for `router_run` (long shells run as background runner dispatches or as plugin-run integration checks), and dispatch through an API the host does not offer. |
+| D20 | **Out of scope.** Cross-repository plans (a separate plan; the ledger is keyed by repository so it can extend), a background mode for `router_run` (long shells run as background runner dispatches or as plugin-run integration checks), *Amended by A-0.1-2:* launching through `session.create` (listed by the v2.0.26 client and plugin session API; parent link, binding, hooks and completion delivery unobserved, ADR 0007 O14), and intercepting provider requests outside the plugin API. |
 
 ### 1.2 Executor architecture
 
@@ -598,7 +597,7 @@ the real host, the owner's real subscriptions and this real plan. Both are requi
 plan.md ──/plan run──▶ compiler ──▶ ledger (DAG, footprints, states, metrics)  ◀── recovery (plugin start)
                                          │
                        scheduler + capacity ──▶ launcher A: child runner (retained context)   ─┐
-                                         │      launcher B: turn-state "ready" → orchestrator ─┤
+                                         │                                                      │
                                          ▼                                                     ▼
                           child in slot-k (background, role bound, leases until integrated)
                                          │ ends
@@ -638,6 +637,14 @@ tests assert it.
 | C13 | Six background children, and then `maxParallel` children, run concurrently; a parent interrupt does not kill them | `maxParallel` clamp = largest count observed | record the cap; on parent interrupt the runtime re-queues killed children |
 | C14 | The child runner path (`D:\git\omr-cpx-main\src\compat\v2-client.ts` ≈96-222) can start a child outside any LLM tool call, using a retained orchestrator context that stays valid for hours (or is refreshed on each orchestrator tool call). The child's own tool calls fire the router's hooks (guards, grants, leases). Several such children run concurrently. The parent's history gets no message from them. | **launcher A** | **launcher B** |
 | C15 | The compaction request of a session can be rewritten by a plugin (`session.hook("compaction")` or an equivalent) | held placeholder applied in compaction (D3) | no holding (same as C4 fallback) |
+
+*Amended by A-0.1-2:* **Decided (ADR 0007, revision 2026-10-11).** The rows above keep their pre-observation wording. The decided
+branches are: C6 holds (part `cache` hint; 1 h gated by O11); C10 holds on different events (429/529 →
+`session.retry.scheduled`, no `session.step.failed` within 75 s; usage limit → `session.step.failed`
+`provider.quota`; reset instant only in `error.message`; the retry hook can stop retries); C9 holds for
+`read`/`write`/`edit`/`glob`/`grep` (`list`, `multiedit`, `patch`, `apply_patch` not advertised; `router_run`
+keys from its own schema); C12 does not hold for children in flight; C13 cap 8; C14 holds (launcher A, router
+guards apply to retained children, agent and model honoured).
 
 ---
 
@@ -1002,11 +1009,11 @@ next action = "start Phase 0.1".
 - The contract smoke: 15 scenarios. Edge cases inside them:
   - completion during a busy parent step (C3);
   - a failed and an interrupted child (C7);
-  - restart with two children in flight, one finishing during the downtime (C12);
+  - *Amended by A-0.1-2:* restart with one child finished before it and one in flight (C12; `restart()` is one call, so the downtime is not hit: ADR 0007 O10);
   - 6 children, `maxParallel` children, and a parent interrupt (C13);
   - 429 followed by success (C10);
-  - retained-context launch after the turn ended and 60 s later, three children at once, child hooks observed, parent
-    history unchanged (C14);
+  - *Amended by A-0.1-2:* retained-context launch after the turn ended and 60 s later, eight children at once, router enforced with a no-router control,
+    agent and model honoured, parent history unchanged (C14), and an active-root interrupt during retained launches (C14b);
   - compaction with a held placeholder (C15).
 
 **Acceptance criteria:**
@@ -1058,7 +1065,7 @@ predicts how long the next dispatch will take.
   Writes: `D:\git\omr-cpx-main\src\routing\outcomes\types.ts`, `D:\git\omr-cpx-main\src\routing\outcomes\persist.ts`.
   Reads: `D:\git\omr-cpx-main\src\routing\outcomes\ingest.ts`, `D:\git\omr-cpx-main\src\routing\outcomes\stats.ts`.
   - 1.1.1.a `DispatchTimingRow {kind: "dispatch-timing", v: 1, ts, parentSessionID, childSessionID, callID, role, class,
-    scope, tier, model, background, startedAt, endedAt, durationMs, outcome: "succeeded"|"failed"|"interrupted"|"unknown"}`.
+    scope, tier, model, background, startedAt, endedAt, durationMs, outcome: "succeeded"|"failed"|"interrupted"|"unknown", capacity: "rate-limit"|"overload"|"usage-limit"|null}` (*Amended by A-0.1-2*).
   - 1.1.1.b `OrchestratorTurnRow {kind: "orchestrator-turn", v: 1, ts, sessionID, turn, steps, input, cacheRead,
     cacheWrite}`. A turn is the set of steps between two prompt events of a root session.
   - 1.1.1.c `timings.jsonl` and `turns.jsonl` next to `decisions.jsonl`. They use the same append path and rotation rule,
@@ -1075,11 +1082,13 @@ predicts how long the next dispatch will take.
   `D:\git\omr-cpx-main\src\routing\outcomes\persist.ts`, `D:\git\omr-cpx-main\src\routing\outcomes\ingest.ts` (read only).
   - 1.1.2.a `createTimingRecorder({dir, now})` is independent of `routing.engine` and works with `static`.
     `D:\git\omr-cpx-main\src\routing\outcomes\ingest.ts` is not changed; `onExecutionEnded` stays untouched. The
-    recorder exposes `recordDispatchStart`, `onExecutionOutcome`, `markRootSession`, `onRootPrompt`, `onRootStep` and
+    recorder exposes `recordDispatchStart`, `onExecutionOutcome`, `markRootSession`, `onRootPrompt`, `onRootStep`, `onCapacitySignal` (*Amended by A-0.1-2*) and
     `sweep`:
     - `recordDispatchStart({childSessionID, parentSessionID, callID, role, class, scope, tier, model, background, at})`;
     - `onExecutionOutcome(childSessionID, eventId, outcome, at)`, which closes the timing and appends the row, deduped
-      by `eventId` like the existing end path.
+      by `eventId` like the existing end path;
+    - *Amended by A-0.1-2:* `onCapacitySignal(childSessionID, capacity, at)` records the latest capacity class on an open timing
+      (ADR 0007 D6/D13); a closed timing ignores it.
   - 1.1.2.b Root sessions:
     - `markRootSession(sessionID)` (from `session.created` without `parentID`, or lazily on the first step of an
       unregistered session whose `ctx.session.get` has no `parentID`);
@@ -1104,7 +1113,7 @@ predicts how long the next dispatch will take.
   `D:\git\omr-cpx-main\src\routing\outcomes\timings.ts`.
   - 1.1.3.a `createDurationModel(seams: {readTimings, now}, opts?: {window?: 50, maxAgeDays?: 30, priorMs?: 480000,
     minSamples?: 5})` provides:
-    - `estimate({role, class, scope}) → {p50, p90, n, source: "exact"|"role-class"|"role"|"prior"}`;
+    - `estimate({role, class, scope}) → {p50, p90, n, source: "exact"|"role-class"|"role"|"prior"}`; *Amended by A-0.1-2:* rows whose `capacity` is not null are excluded;
     - `observe(row)` for live updates.
   - 1.1.3.b Estimation rules:
     - fallback order: exact, then (role, class), then role, then the prior;
@@ -1194,7 +1203,8 @@ predicts how long the next dispatch will take.
   - a duplicate `eventId` is ignored;
   - with 1001 open starts the oldest is evicted;
   - a start older than 6 h is closed as `unknown` and excluded from estimates;
-  - each row is on disk when the recorder call returns (no coalesced flush).
+  - each row is on disk when the recorder call returns (no coalesced flush);
+  - *Amended by A-0.1-2:* a row with a non-null `capacity` round-trips and is excluded from estimates.
 - Estimator:
   - 0, 4, 5 and 60 samples per level;
   - the full fallback chain;
@@ -1255,12 +1265,15 @@ per C5, unread late notices persist until read, and v1 is unchanged.
   Writes: none. Reads (pasted): the pre-flight excerpts, the C5 and C6 rows of
   `D:\git\omr-cpx-main\docs\adr\0007-critical-path-execution.md`.
   The memo covers:
-  - the tail placement per C5;
+  - *Amended by A-0.1-2:* the tail placement per C5 (new last `user` message) and the D4 breakpoint hint: on a copy of the last text part of
+    the last real message, never on the tail, never left on an earlier message; the rule when the last real message has
+    no text part (ADR 0007 O12);
   - keeping host part identity and order in the system array;
   - the provider registry API;
   - the size bound and the overflow line;
   - determinism rules: no clocks in the system; ages rounded to minutes in the tail only;
-  - the TTL rule per C6;
+  - *Amended by A-0.1-2:* the TTL rule per C6/D5: the parts that carry `ttlSeconds: 3600` (last system part, D4 hint); how the last system part
+    is replaced by a copy without breaking 1.2.5.b; the O11 gate (how the real-provider check is run and recorded);
   - the late-notice retention rule (kept and rendered until `router_verify` returns the handle);
   - a proof that v1 does not regress.
 - **1.2.2** [tier:medium] VERIFY:required `D:\git\omr-cpx-main\src\compat\turn-state.ts`.
@@ -1283,8 +1296,9 @@ per C5, unread late notices persist until read, and v1 is unchanged.
   criteria: output is deterministic for equal provider outputs; the 6000-character bound holds
   [/acceptance]
 - **1.2.3** [tier:medium] VERIFY:required Config `routing.promptCache.ttl` (`"auto" | "5m" | "1h"`, default `"auto"`, which
-  means `1h` while `hasActivity`, otherwise the host default). **Only if ADR 0007 decided C6 = available.** Otherwise
-  this task adds nothing and records "not added (C6)" in the report.
+  means `1h` while `hasActivity`, otherwise the host default). *Amended by A-0.1-2:* ADR 0007 decided C6 = available (D5). The resolved TTL emits no hint until the O11 real-provider check (a keyed
+  request with the host's markers plus the 1 h hint, or the first DF session) is recorded in the Phase 1.2 report;
+  until then `auto` and `1h` behave as `5m`.
   [route class=implement risk=low scope=multi needs=edit,shell d=deterministic root=D:\git\omr-cpx-p12 tier=medium pin]
   Writes: `D:\git\omr-cpx-main\src\router\config.ts`, `D:\git\omr-cpx-main\docs\CONFIG_REFERENCE.md`.
   Reads: `D:\git\omr-cpx-main\test\unit\docs-drift.test.ts`.
@@ -1311,15 +1325,19 @@ per C5, unread late notices persist until read, and v1 is unchanged.
 - **1.2.5** [tier:medium] VERIFY:required Context hook.
   [route class=implement risk=high scope=single needs=edit,shell d=deterministic root=D:\git\omr-cpx-p12 tier=medium pin]
   Writes: `D:\git\omr-cpx-main\src\compat\v2-hooks.ts`. Reads: `D:\git\omr-cpx-main\src\compat\turn-state.ts`, `D:\git\omr-cpx-main\src\router\config.ts`.
-  - 1.2.5.a On every request of a root session with non-empty state, append the tail per C5.
-  - 1.2.5.b Never change a system part's identity or order.
-  - 1.2.5.c Per C6, set the 1-hour cache hint on the stable system part while the TTL resolves to `1h`.
-  - 1.2.5.d Child sessions get no tail.
+  - 1.2.5.a *Amended by A-0.1-2:* On every request of a root session with non-empty state, append the tail as a new last `user` message (C5), and set
+    `cache: {type: "ephemeral"}` on a copy of the last text part of the last real message (D4; O12 rule when it has
+    none). Host message objects are never mutated.
+  - 1.2.5.b *Amended by A-0.1-2:* Never change a system part's identity, order or text. The one exception is the last system part, which is
+    replaced by a copy that carries `cache` while the TTL resolves to `1h` (D5).
+  - 1.2.5.c *Amended by A-0.1-2:* Per C6/D5, while the TTL resolves to `1h` and O11 is recorded, set `cache: {type: "ephemeral", ttlSeconds: 3600}` on
+    the last system part and on the D4 hint part; no other part gets a hint.
+  - 1.2.5.d *Amended by A-0.1-2:* Child sessions get no tail and no hint.
   [acceptance]
   cwd: D:\git\omr-cpx-p12
   check: buildPasses
   check: testsPass
-  criteria: consecutive context builds keep event.system deep-equal and host parts identical by reference while the state changes
+  criteria: consecutive context builds keep event.system deep-equal and host parts identical by reference while the state changes and the TTL resolution does not; when it resolves to `1h` only the last system part's `cache` differs
   [/acceptance]
 - **1.2.6** [tier:medium] VERIFY:required Docs, drift pins and goldens.
   [route class=implement risk=low scope=multi needs=edit,shell d=deterministic root=D:\git\omr-cpx-p12 tier=medium pin]
@@ -1361,7 +1379,8 @@ per C5, unread late notices persist until read, and v1 is unchanged.
   - a provider exception breaking a request;
   - late notices lost;
   - v1 drift;
-  - the TTL set when C6 says unsupported;
+  - *Amended by A-0.1-2:* a TTL emitted before the O11 check is recorded;
+  - a hint on the tail, on more than one message, or left on an earlier message;
   - a tail in child sessions.
 - **1.2.FIX** [tier:medium] Fix every QA-1.2 finding.
   [route class=debug risk=medium scope=multi needs=edit,shell d=deterministic root=D:\git\omr-cpx-p12 tier=medium pin]
@@ -1386,12 +1405,16 @@ per C5, unread late notices persist until read, and v1 is unchanged.
   - three context builds while the pending list goes 0 → 2 → 1: `event.system` is deep-equal and host parts are identical
     by reference, while the tail differs;
   - the advise hint is in the tail;
-  - child sessions get no tail;
+  - *Amended by A-0.1-2:* child sessions get no tail and no hint;
+  - the hint is on the last real message's last text part and never on the tail; the O12 fallback;
   - an unread late notice is rendered on two consecutive turns and disappears after `router_verify`.
 - v1: the legacy system transform output is byte-identical to the existing golden.
 - Smoke (scripted provider):
-  - request N+1 equals request N byte for byte through the end of request N's messages;
-  - with C6 available, the TTL field appears only while activity is true.
+  - *Amended by A-0.1-2:* request N+1 equals request N byte for byte through request N's last real message, except for the `cache_control`
+    object request N put on that message (the moved D4 hint); request N's tail is absent from request N+1;
+  - the single message breakpoint sits on the last real message, never on the tail; one request whose last real message
+    is a tool result is recorded (O12);
+  - `ttl: "1h"` appears on the last system block and on the hinted block only while activity is true and O11 is recorded.
 
 **Acceptance criteria:**
 - On v2 no router-generated system part changes between the turns of a session.
@@ -1456,10 +1479,13 @@ and one extractor that turns any file, search or `router_run` tool call into nor
   Reads: the C9 row of `D:\git\omr-cpx-main\docs\adr\0007-critical-path-execution.md`, the existing tests of
   `D:\git\omr-cpx-main\src\verify\dispatch.ts`.
   - 1.3.2.a `toolTargets(tool, args, cwd) → {access: "read"|"write"|"search"|"run"|"none", paths, roots}`. It handles:
-    - `read`, `write`, `edit`, `multiedit`, `patch`;
-    - `apply_patch`: multi-file add, update, delete and move, where both the old and the new path are writes;
-    - `glob`, `grep`, `list`;
-    - `router_run`, whose access is `run` with its cwd as the root.
+    - *Amended by A-0.1-2:* `read`, `write`, `edit` (`path`; observed, C9);
+    - `multiedit`, `patch`, `list` (shapes from the existing router code only; not advertised by v2.0.26, ADR 0007 O9);
+    - `apply_patch`: multi-file add, update, delete and move, where both the old and the new path are writes (shape from the existing router code only; not advertised, ADR 0007 O9);
+    - `glob`, `grep` (`path` root + `pattern`; observed);
+    - `router_run`, whose access is `run` with its cwd as the root (`cwd` from the router's own schema, `src\router\run-tools.ts` ≈160, ≈882-885);
+    - a write-class call whose target cannot be extracted returns `access: "write"` with no paths, which 2.1 refuses for a
+      child session while a foreign write lease exists in the tree.
   - 1.3.2.b The `apply_patch` header parser moves here, and `D:\git\omr-cpx-main\src\verify\dispatch.ts` imports it
     back with unchanged behavior.
   [acceptance]
@@ -1574,7 +1600,8 @@ and one extractor that turns any file, search or `router_run` tool call into nor
 Phases 2.2–2.4 and 3.x build in parallel against this fixed contract, and `src/executor/**` is gated by coverage.
 
 **Pre-flight (in addition to §0.9)**
-- [ ] Appendix A; ADR 0007 decisions C7, C11, C13, C14 (they shape the launcher and runtime seams).
+- [ ] Appendix A; *Amended by A-0.1-2:* ADR 0007 decisions C7, C13, C14, D13, D14 and D16 (launcher A, its six guards, the `capacity` and `lost` attempt
+  outcomes and the counting rule).
 - [ ] Sample the style of `D:\git\omr-cpx-main\src\verify\types.ts` and
       `D:\git\omr-cpx-main\src\compat\child-session.ts`; read the coverage thresholds in
       `D:\git\omr-cpx-main\vitest.config.ts` ≈18-31 and ≈65-76.
@@ -1603,7 +1630,7 @@ Phases 2.2–2.4 and 3.x build in parallel against this fixed contract, and `src
   - the guards `isLedgerV1` and `isTaskNode`;
   - `FINDINGS_FORMAT`, the JSON schema a QA task returns: `{findings: [{id, severity, files, problem, fix}]}`;
   - the interfaces (`LedgerStore` includes `remove(planId)`) `LedgerStore`, `PlanCompiler`, `SlotPool`, `IntegrationQueue`, `Scheduler`, `CapacityController`,
-    `TaskLauncher` (implemented as A or B), `ExecutorRuntime`, `RecoveryService`, `UnattendedPolicy`, `QaLoop`;
+    `TaskLauncher` (launcher A only, ADR 0007 D14; *Amended by A-0.1-2*), `ExecutorRuntime`, `RecoveryService`, `UnattendedPolicy`, `QaLoop`;
   - `ExecutorConfig`.
   [acceptance]
   cwd: D:\git\omr-cpx-p14
@@ -1637,7 +1664,8 @@ Phases 2.2–2.4 and 3.x build in parallel against this fixed contract, and `src
   - a missing state for restart adoption, a parent interrupt, an abort or a revert;
   - seams that force real I/O in unit tests;
   - unserializable fields;
-  - a `TaskLauncher` contract that cannot express both A and B.
+  - *Amended by A-0.1-2:* a `TaskLauncher` contract that cannot express the D14 guards (confirmation timeout, stale context, refresh wake,
+    recorded age, unrequested interrupt, no launch after a restart before the first router tool call).
 - **1.4.FIX** [tier:medium] Fix every QA-1.4 finding.
   [route class=debug risk=medium scope=multi needs=edit,shell d=deterministic root=D:\git\omr-cpx-p14 tier=medium pin]
   Writes: the 1.4-owned files named by the findings. Reads: `D:\git\omr-cpx-main\docs\qa\critical-path-execution\phase-1.4.md`.
@@ -1696,7 +1724,7 @@ Phases 2.2–2.4 and 3.x build in parallel against this fixed contract, and `src
       timing-recorder calls to wire).
 - [ ] The Wave 1 APIs in `cpx/main`:
   - from 1.1: `createTimingRecorder` (`recordDispatchStart`, `onExecutionOutcome`, `markRootSession`, `onRootPrompt`,
-    `onRootStep`, `sweep`) and `createDurationModel`;
+    `onRootStep`, `onCapacitySignal`, `sweep`) and `createDurationModel`; *Amended by A-0.1-2*
   - from 1.2: `registerTurnStateProvider`;
   - from 1.3: `createLeaseRegistry`, `toolTargets`.
 - [ ] List the existing tests of `D:\git\omr-cpx-main\src\verify\wiring.ts`,
@@ -1714,7 +1742,8 @@ Phases 2.2–2.4 and 3.x build in parallel against this fixed contract, and `src
   - the dispatch state machine: decided → acknowledged → child-ended → processed → annotated | held → verdict →
     released;
   - the race matrix for every ordering of acknowledgement, execution-end event, completion message, verdict, parent
-    interrupt, child resume, compaction and restart;
+    interrupt, child resume, compaction (including a held completion in the latest turn, which the host keeps out of
+    the compaction request: ADR 0007 O13), verdict delivery to a busy parent, and restart (*Amended by A-0.1-2*);
   - idempotency keys;
   - the bounded wait in the context hook (2000 ms);
   - the single `finishDispatch` path shared by foreground and background;
@@ -1765,7 +1794,8 @@ Phases 2.2–2.4 and 3.x build in parallel against this fixed contract, and `src
     - exposes `settled(childSessionID, timeoutMs)`.
   - 2.1.3.d `HeldResults`, only when holding is available:
     - the placeholder text is a pure function of the handle and never changes;
-    - on the verdict, it posts one synthetic entry (`resume: true`) with the output and the verdict (PASS) or the
+    - on the verdict, it posts one synthetic entry through the plugin API (`ctx.session.synthetic({sessionID, text,
+      description, metadata, resume: true})`, ADR 0007 O6b; *Amended by A-0.1-2*) with the output and the verdict (PASS) or the
       findings (FAIL);
     - it refuses a `subagent` resume of a held child until the verdict.
   [acceptance]
@@ -1829,6 +1859,9 @@ Phases 2.2–2.4 and 3.x build in parallel against this fixed contract, and `src
   - 2.1.5.c Event loop (≈1819-1880), per the 1.1 handoff. On v2 it creates the timing recorder
     (`createTimingRecorder`) whatever `routing.engine` is, and `createDurationModel` over `timings.jsonl`; it calls
     `observe` for each row the recorder appends, and `decideBackground` receives `estimate({role, class, scope})`:
+    - *Amended by A-0.1-2:* `session.retry.scheduled` (`provider.rate-limit` → rate-limit,
+      `provider.internal`/529 → overload, other types by status) and `session.step.failed` with `provider.quota`
+      (→ usage-limit) call `onCapacitySignal` for that session (ADR 0007 D6/D13);
     - a child execution end calls `CompletionProcessor.process` and `onExecutionOutcome` (outcome taken from the event
       type);
     - `session.created` without `parentID` calls `markRootSession`, and lazily, on the first step of an unregistered
@@ -1836,10 +1869,13 @@ Phases 2.2–2.4 and 3.x build in parallel against this fixed contract, and `src
     - a root prompt calls `onRootPrompt`;
     - root step tokens feed the turn rows through `onRootStep`.
   - 2.1.5.d Context hook:
-    - held placeholders are applied (C4);
+    - *Amended by A-0.1-2:* held placeholders are applied (C4) by replacing the held child's `<subagent sessionID="<id>" …>…</subagent>`
+      element wherever it occurs in a text part (a whole message, or embedded text such as the compaction record's
+      retained latest turn; ADR 0007 D3, O13);
     - turn-state providers "in flight" and "held" are registered (Appendix B);
     - turn-state provider "completed" (Appendix B);
-    - when C15 holds, the compaction hook applies the held placeholders.
+    - *Amended by A-0.1-2:* the compaction hook applies the held placeholders with the same matcher (C15 holds; the hook receives every turn
+      except the latest).
   - 2.1.5.e Leases, for every v2 child session (C9); root sessions take none (D7):
     - file tools and `router_run` in `execute.before` go through `toolTargets`, then `acquireWrite`, `checkRead` or
       `checkRun`;
@@ -1967,7 +2003,8 @@ Phases 2.2–2.4 and 3.x build in parallel against this fixed contract, and `src
   - required verification with holding: the placeholder never changes across 3 requests; PASS posts output and verdict
     and wakes once; FAIL posts findings;
   - a resume while held is refused;
-  - compaction keeps the placeholder;
+  - *Amended by A-0.1-2:* compaction keeps the placeholder, including a held completion in the latest turn (smoke, O13);
+  - the verdict entry reaches a busy parent and an idle one (smoke);
   - without holding, the dispatch stays in the foreground.
 - A user-backgrounded verified call is verified at completion (P3 fixed).
 - Pending persistence:
@@ -2771,14 +2808,14 @@ The result is safe to run in parallel.
 
 **Goal:** the runtime drives a compiled plan to completion:
 - it computes the ready set by critical-path priority within adaptive capacity;
-- it launches ready tasks into slots with the launcher ADR 0007 selected (A: executor-direct through the child runner;
-  B: by reference through the orchestrator);
+- it launches ready tasks into slots with launcher A (ADR 0007 D14: executor-direct through the child runner) (*Amended by A-0.1-2*);
 - it binds each child's role and work root;
 - it holds plan-task leases until integration and hands verified tasks to the integration queue through its interface;
 - it records the metrics of Appendix D.
 
 **Pre-flight (in addition to §0.9)**
-- [ ] ADR 0007 decisions C10, C11, C13 and C14 (launcher A or B, context refresh, binding).
+- [ ] *Amended by A-0.1-2:* ADR 0007 decisions C10, C13, C14, D13 and D14 (launcher A and its six guards, context capture, binding, launch
+  signal and progress, capacity signals, the retry-hook stop).
 - [ ] The Wave 2 APIs in `cpx/main`:
   - `CompletionProcessor` and the turn-state providers (2.1);
   - `LedgerStore` (2.2);
@@ -2805,9 +2842,12 @@ The result is safe to run in parallel.
   The memo covers:
   - the runtime event model;
   - the ready-set algorithm and its priority order;
-  - the capacity AIMD parameters;
-  - the selected launcher: retained-context refresh and expiry, child binding, the attempt nonce (A), or expansion per
-    C11 and the refusal rules (B);
+  - *Amended by A-0.1-2:* the capacity AIMD parameters and the retry-hook stop rule (plan children only; provider paused, or retried longer than
+    `capacityCooldownMs`);
+  - launcher A: context capture (router tool calls of the bound orchestrator) and staleness; the six D14 guards and their
+    timeouts; binding at `onCreated` and the fail-closed first-context check; the attempt nonce; the executor-owned
+    signal and the record-only progress; the dispatch-time work the executor does itself (decision row, timing start,
+    in-flight registration);
   - liveness: who wakes the orchestrator and when, with debouncing and never twice for the same state;
   - the plan-task verification path: verified in the slot, integrated only after PASS;
   - learned edges from `NEED MORE: lease`;
@@ -2833,13 +2873,18 @@ The result is safe to run in parallel.
   [route class=implement risk=medium scope=single needs=edit,shell d=deterministic root=D:\git\omr-cpx-p31 tier=medium pin]
   Writes: `D:\git\omr-cpx-main\src\executor\capacity.ts`. Reads: `D:\git\omr-cpx-main\src\executor\types.ts`, the C10 and C13
   rows of `D:\git\omr-cpx-main\docs\adr\0007-critical-path-execution.md`.
-  - 3.1.3.a Each provider starts at `maxParallel`, clamped to the C13 cap, with a per-provider heavy cap of 2
+  - 3.1.3.a Each provider starts at `maxParallel` (valid range 1–8, ADR 0007 D13; *Amended by A-0.1-2*), with a per-provider heavy cap of 2
     ([tier:heavy] dispatches).
-  - 3.1.3.b On a rate-limit or overload error, capacity halves (floor 1) and holds for `capacityCooldownMs`. After each
+  - 3.1.3.b *Amended by A-0.1-2:* On the first retry signal of a step (`session.hook("retry")` or `session.retry.scheduled`, deduped per session and
+    attempt) with `provider.rate-limit`/429 or `provider.internal`/529 (unknown type: by status), capacity halves (floor 1) and holds for `capacityCooldownMs`. After each
     success with no signal within the cooldown, it grows by 1, up to the cap.
-  - 3.1.3.c A usage-limit error pauses the provider until the parsed reset time, or for `capacityPauseMs`, and raises one
+  - 3.1.3.c *Amended by A-0.1-2:* A `session.step.failed` with `error.type = "provider.quota"` pauses the provider until the first ISO-8601 instant in
+    `error.message` that lies in the future, or else for `capacityPauseMs` (headers are not surfaced, C10), and raises one
     inbox item through `UnattendedPolicy`.
   - 3.1.3.d Every change emits a `metric` event.
+  - 3.1.3.e *Amended by A-0.1-2:* For plan-task children only, the `session.hook("retry")` handler sets `decision.retry = false` when
+    the provider is paused or the step's first retry signal is older than `capacityCooldownMs`. The attempt ends
+    `capacity` and the task returns to `ready` uncounted. Other sessions are observed only (decision unchanged).
   [acceptance]
   cwd: D:\git\omr-cpx-p31
   check: buildPasses
@@ -2866,37 +2911,31 @@ The result is safe to run in parallel.
     expansion, and so does a rewritten slot path longer than 260 characters unless `core.longpaths` is set in the slot.
     `TASK` carries a MUST NOT DO section: no AI attribution in code, comments or docs; never run git; write only the
     `Writes:` paths.
-  - 3.1.4.b Launcher B only:
-    - recognize exactly `^\[plan ([a-z0-9][a-z0-9-]{2,40}):([A-Za-z0-9][A-Za-z0-9.-]{0,63})\]\s*$` as the first line,
-      or as the line right after a route line (that route line is discarded);
-    - under the C11 fallback, keep the route line, `VERIFY:required`, `[acceptance]` and `[plan P:T]` in `args.prompt`,
-      and render only `PLAN CONTEXT` and `TASK` for the child's context hook.
   [acceptance]
   cwd: D:\git\omr-cpx-p31
   check: buildPasses
   check: testsPass
   criteria: the expansion is byte-stable per attempt; the reference grammar accepts S-style fallback ids; plan text never reaches the route line
   [/acceptance]
-- **3.1.5** [tier:medium] VERIFY:required `D:\git\omr-cpx-main\src\executor\launch.ts` (`TaskLauncher`, only the
-  implementation ADR 0007 selected).
+- **3.1.5** [tier:medium] VERIFY:required `D:\git\omr-cpx-main\src\executor\launch.ts` (`TaskLauncher`, launcher A) (*Amended by A-0.1-2*).
   [route class=implement risk=high scope=multi needs=edit,shell d=deterministic root=D:\git\omr-cpx-p31 tier=medium pin]
   Writes: `D:\git\omr-cpx-main\src\executor\launch.ts`, `D:\git\omr-cpx-main\src\compat\v2-client.ts`,
   `D:\git\omr-cpx-main\src\routing\roles\binding.ts`. Reads: `D:\git\omr-cpx-main\src\executor\expand.ts`, the C14 row of
   `D:\git\omr-cpx-main\docs\adr\0007-critical-path-execution.md`.
   - 3.1.5.a Launcher A:
-    - launch through the child runner, using a retained orchestrator context that is refreshed on every orchestrator tool
-      call. If no context is valid, wake the orchestrator once to make a cheap `router_plan action=status` call.
-    - before the child's first tool call (`onCreated`), bind its role, grant and work root (= slot) through
-      `D:\git\omr-cpx-main\src\routing\roles\binding.ts`;
+    - *Amended by A-0.1-2:* launch through the child runner with the context retained from the bound orchestrator's latest router tool call,
+      an executor-owned `signal` and a record-only `progress`; `background: false`, awaited;
+    - in `onCreated` (before the child is prompted), bind its role, grant and work root (= slot) through
+      `D:\git\omr-cpx-main\src\routing\roles\binding.ts`; pass `agent` and `model` explicitly (C14: honoured);
     - select the model through the routing kernel from the task's route line;
+    - write the decision row, `recordDispatchStart` and the in-flight registration itself (a retained launch fires no
+      `subagent` hook: C14 `routerDecisionRows === 0`);
     - record the child id and the attempt nonce (fsynced, D8) before awaiting;
-    - run in the background inside the plugin; completion is the runner's result.
-  - 3.1.5.b Launcher B:
-    - the turn-state "ready" section, with a wake-up when the ready set grows and the orchestrator is idle;
-    - `execute.before` accepts `[plan …]` as the first line, or right after a route line (that route line is
-      discarded); sets `args.agent` and `args.model` from the task's route; such a dispatch is refused when not ready,
-      at capacity, without a slot, or duplicate;
-    - completion through the 2.1 processor.
+    - apply the six D14 guards: confirmation within 30 s; a stale context returns the task to `ready` uncounted and
+      stops further launches with it; one refresh wake through `ctx.session.synthetic({…, resume: true})`; the context
+      age as a `metric` event; an unrequested `session.execution.interrupted` is `lost`; no launch after a restart before
+      the first router tool call in the adopted session;
+    - completion is the runner's result, with the child's `session.execution.*` event as the fallback trigger (D2).
   [acceptance]
   cwd: D:\git\omr-cpx-p31
   check: buildPasses
@@ -2926,9 +2965,8 @@ The result is safe to run in parallel.
     - `integrated` → release the leases and the slot, then re-evaluate the successors.
     - `conflict` → reset the slot; back to `ready` with the conflict context.
     - `failed` → handled as in 3.1.6.b.
-  - 3.1.6.d **Liveness.** Launcher A launches immediately. Launcher B wakes the orchestrator once per new ready set after
-    `wakeDebounceMs` of idleness. A `manual` or `preflight` task entering `ready` wakes the orchestrator once, under
-    both launchers.
+  - 3.1.6.d **Liveness.** *Amended by A-0.1-2:* Launcher A launches immediately. An inbox item, a paused phase, plan completion, a `manual` or `preflight` task
+    entering `ready`, and a stale launch context each wake the orchestrator once (D15), debounced by `wakeDebounceMs`.
   - 3.1.6.e **Metrics.** `metric` events record idle-with-ready intervals, wake-ups and launches. Turn-state provider
     "plan" (Appendix B).
   - 3.1.6.f `manual` and `preflight` tasks are never launched; they are listed in the turn-state ready section as
@@ -2944,10 +2982,12 @@ The result is safe to run in parallel.
   [route class=implement risk=high scope=multi needs=edit,shell d=deterministic root=D:\git\omr-cpx-p31 tier=medium pin]
   Writes: `D:\git\omr-cpx-main\src\compat\v2-hooks.ts`, `D:\git\omr-cpx-main\src\compat\background.ts`.
   Reads: `D:\git\omr-cpx-main\src\executor\runtime.ts`, `D:\git\omr-cpx-main\src\executor\launch.ts`.
-  - 3.1.7.a Retained-context refresh on every orchestrator tool call (A), or the `[plan …]` hook before routing and,
-    under the C11 fallback, the child's context hook (B).
+  - 3.1.7.a *Amended by A-0.1-2:* Retained-context capture on every router tool call of the bound orchestrator session. In the child's first
+    context hook, a child whose prompt carries a plan task header and has no binding is refused every tool call (fail
+    closed).
   - 3.1.7.b Plan-task leases use the `until-integrated` scope.
-  - 3.1.7.c `session.step.failed` feeds the capacity signals.
+  - 3.1.7.c *Amended by A-0.1-2:* `session.retry.scheduled`, `session.step.failed` and the registered `session.hook("retry")` handler feed the
+    capacity signals (ADR 0007 D13); the provider comes from the preceding `session.step.started` `model.providerID`.
   - 3.1.7.d Plan-task completions are routed to the runtime.
   - 3.1.7.e Root-session idle tracking.
   [acceptance]
@@ -2989,7 +3029,9 @@ The result is safe to run in parallel.
   - an expired retained context that silently stalls the plan;
   - an expansion that is not byte-stable;
   - plan text injected into the route line;
-  - lost or looping wake-ups (B);
+  - *Amended by A-0.1-2:* lost or looping wake-ups (stale-context and D15 wakes);
+  - a launch that uses the retained `signal` or `progress`;
+  - a retry-hook stop applied to a non-plan session;
   - leases released before integration;
   - missing metric events.
 - **3.1.FIX** [tier:medium] Fix every QA-3.1 finding.
@@ -3010,8 +3052,9 @@ The result is safe to run in parallel.
   - a learned edge;
   - `done` satisfies its dependents;
   - the 100-seed bound and the reference comparison.
-- Capacity: one 429, three in a row, recovery after the cooldown, a usage-limit pause with one inbox item, two providers.
-- Expansion: byte-stable per attempt and different for the next attempt; the B grammar; route line root and tier; the
+- Capacity: one 429, three in a row, recovery after the cooldown, a usage-limit pause with one inbox item, two providers; *Amended by A-0.1-2:* a retry-hook stop for a plan child (attempt `capacity`, uncounted); the orchestrator's and user
+  sessions' retries untouched; a quota message without a future instant → `capacityPauseMs`; an unknown type by status.
+- Expansion: byte-stable per attempt and different for the next attempt; the launch header `[plan <planId>:<taskId>#<attempt>]` (*amended by A-0.1-2:* no launcher B grammar); route line root and tier; the
   acceptance `cwd`; the QA findings instruction; the MUST NOT DO section of `TASK`; Phase 6.1 of the frozen copy of this
   plan, with the worktree list (`D:\git\omr-cpx-main`, declared root `D:\git\omr-cpx-p61`) injected through the
   `GitRunner` seam and `path.win32` used for drive paths on every OS, expands with no `D:\git\omr-cpx-p61` and no
@@ -3022,17 +3065,17 @@ The result is safe to run in parallel.
   - a refreshed context;
   - an expired context, which wakes the orchestrator once;
   - a nonce recorded before the await;
-  - no parent-history message.
-- Launcher B:
-  - refusals when not ready, at capacity, without a slot, or duplicate;
-  - a wake-up once per ready set, and none while busy;
-  - a `[plan …]` reference right after a route line is accepted and the route line discarded.
-- Manual tasks: a manual task becoming ready wakes the orchestrator once under launcher A and under launcher B.
+  - no parent-history message;
+  - *Amended by A-0.1-2:* a confirmation timeout; a stale context (no attempt counted, no further launch with it); one
+    refresh wake per stale period; the age metric; an unrequested interrupt → `lost`; no launch after a restart before
+    the first router tool call; the launch never uses the retained `signal` or `progress`; the decision row and timing
+    start written by the executor; an unbound plan child refused in its first context hook.
+- Manual tasks: *Amended by A-0.1-2:* a manual task becoming ready wakes the orchestrator once.
 - Runtime: the full lifecycle with test doubles; FAIL with attempts left and exhausted; a conflict; a no-change task
   reaching `done`; a commit failure; leases held until integration.
 
 **Acceptance criteria:**
-- Ready work is launched immediately (A), or offered with a wake-up within the debounce (B).
+- *Amended by A-0.1-2:* Ready work is launched immediately (launcher A); a stale context produces exactly one wake.
 - Capacity adapts to errors.
 - Plan tasks are verified before integration and keep their leases until integrated.
 - The metrics are recorded.
@@ -3358,9 +3401,7 @@ The result is safe to run in parallel.
   `D:\git\omr-cpx-main\test\unit\executor-instructions.test.ts` (new). Reads: `D:\git\omr-cpx-main\src\executor\tool.ts`,
   `D:\git\omr-cpx-main\src\executor\expand.ts`, `D:\git\omr-cpx-main\src\compat\turn-state.ts`.
   - 4.1.6.a The text:
-    - launcher B — dispatch each ready ref as a `subagent` call whose prompt is exactly `[plan <planId>:<taskId>]` (no
-      route line), all ready refs in one message;
-    - both launchers — run `manual` tasks listed in the router state and report them with `router_plan action=done`;
+    - *Amended by A-0.1-2:* run `manual` tasks listed in the router state and report them with `router_plan action=done`;
       never edit a slot or the plan file; never report the plan done while `router_plan action=status` says running;
       answer inbox items only with the human's answer or with text this plan already states.
   - 4.1.6.b The module exports a turn-state provider (the `registerTurnStateProvider` shape of 1.2); its registration is a
@@ -3499,7 +3540,8 @@ The result is safe to run in parallel.
     - `ready` with a live child that carries its nonce → adopt it;
     - `dispatched` or `running` whose child finished (C7) → process the result;
     - a child still alive → adopt it;
-    - a lost child → reset the slot, then `ready` with attempt + 1;
+    - *Amended by A-0.1-2:* a lost child (C12: in flight at the restart) → reset the slot, then `ready` with a new attempt of outcome `lost`,
+      which does not count toward `maxAttempts`;
     - `completed` or `verifying` → run verification again;
     - `verified` → re-enqueue;
     - `integrating` → `IntegrationQueue.resume()`.
@@ -4209,7 +4251,7 @@ interface LedgerV1 {
   planDigest: string;                      // sha256 of the plan text at compile time
   repo: { key: string; toplevel: string; baseBranch: string; baseCommit: string };  // key = realpath(git common dir)
   integration: { branch: string; worktree: string; head: string };                  // branch = omr/<planId>/integration
-  launcher: "A" | "B";                     // ADR 0007
+  launcher: "A";                           // ADR 0007 D14
   status: "compiling" | "awaiting-residue" | "awaiting-approval" | "running" | "paused" | "completed" | "aborted";
   orchestrator: { sessionID: string; boundAt: string };
   config: ExecutorConfig;                  // resolved snapshot at approval
@@ -4243,7 +4285,7 @@ interface Edge { from: string; to: string;
   kind: "structural" | "explicit" | "graph" | "contract" | "conflict" | "llm" | "learned";
   confidence: "high" | "medium" | "low"; evidence: string }
 interface Attempt { n: number; nonce: string; callID: string | null; childSessionID: string | null; startedAt: string;
-  endedAt: string | null; outcome: "succeeded" | "failed" | "interrupted" | "lost" | null;
+  endedAt: string | null; outcome: "succeeded" | "failed" | "interrupted" | "lost" | "capacity" | null;
   verdict: "pass" | "fail" | "unverifiable" | null; context: string }   // conflict, findings or answer
 interface InboxItem { id: string; kind: "question" | "failure" | "usage-limit" | "landing" | "flaky" | "qa-cap" | "breaker";
   severity: "info" | "blocking" | "critical"; taskId: string | null; text: string; options: string[];
@@ -4259,21 +4301,21 @@ before any externally visible step (D8).
 | pending | ready | dependencies are `integrated` or `done` |
 | pending | blocked | a dependency was parked, or failed terminally |
 | pending | cancelled | plan aborted |
-| ready | dispatched | launch (A), or an accepted `[plan …]` dispatch (B) |
+| ready | dispatched | launch (launcher A) |
 | ready | blocked | a dependency was reverted |
 | ready | cancelled | abort |
 | ready | running | recovery adopts a live child carrying this attempt's nonce |
 | ready | done | a `manual` or `preflight` task reported done (`router_plan action=done`) |
 | ready | pending | `add-tasks` added an unsatisfied dependency |
 | dispatched | running | child created or acknowledged |
-| dispatched | ready | launch refused or aborted before start |
+| dispatched | ready | launch refused, aborted before start, or not confirmed (stale context, D14 guard 2; attempt outcome `lost`) |
 | dispatched | failed | host error |
 | dispatched | blocked | a dependency was reverted |
 | dispatched | cancelled | abort |
 | running | completed | child ended |
 | running | failed | child failed |
 | running | parked | `ESCALATE: human` |
-| running | ready | child lost (recovery, attempt + 1), or `NEED MORE: lease` |
+| running | ready | child lost (recovery or an unrequested interrupt; outcome `lost`), a capacity stop (D13; outcome `capacity`), or `NEED MORE: lease` |
 | running | blocked | a dependency was reverted |
 | running | cancelled | abort |
 | completed | verifying | committed in the slot |
@@ -4299,6 +4341,8 @@ before any externally visible step (D8).
 through `verified` → `integrating`. Tasks are created `pending`, or `done` through a `task-created` event (for
 `doneBefore`). A `manual` or `preflight` task stays `ready` until reported done; its failures go through `add-tasks`.
 
+*Amended by A-0.1-2:* Attempts whose outcome is `lost` or `capacity` do not count toward `maxAttempts` (ADR 0007 D13, D14, D16).
+
 ## Appendix B — Turn-state tail (v2, regenerated on every request, never persisted)
 
 ```
@@ -4308,13 +4352,14 @@ completed (1): ses_gh78 implementer "add ledger" 9m — budget 31/40 · verifica
 held (1): ses_ef56 verdict pending (vrf_9f2c) — do not use its output yet
 verdicts unread (1): vrf_7a10 FAIL — router_verify vrf_7a10 for the findings
 plan p-20261010-a1b2c3 · launcher A · wave 2 · phase 2.1 · integrated 14/52 · in flight 4 · capacity anthropic 3/4, openai 1/2 · QA 1.4 passed
-ready (2): [plan p-20261010-a1b2c3:2.1.5] [plan p-20261010-a1b2c3:2.2.1] — launcher B only: dispatch all of them now, one subagent call each
 inbox (1): Q-3 (question, 2.3.4) — router_plan action=status
 </router-state>
 ```
 
 **Rules:**
 - Section order is fixed; empty sections are omitted.
+- *Amended by A-0.1-2:* A stale launch context (D14) appends `· launch context stale — call router_plan action=status` to the plan
+  line until a router tool call refreshes it.
 - Elapsed times are rounded to minutes.
 - Total size is at most 6000 characters, with an overflow line.
 - Root sessions only.
@@ -4328,12 +4373,12 @@ All keys are v2 only. They are documented as rows of the routing table in
 
 | Key | Type | Default | Range / values | Trusted only (D18) | Phase |
 |---|---|---|---|---|---|
-| `routing.promptCache.ttl` | string | `"auto"` | `"auto"`, `"5m"`, `"1h"` (only if C6 holds) | no | 1.2 |
+| `routing.promptCache.ttl` | string | `"auto"` | `"auto"`, `"5m"`, `"1h"` (C6 holds; no TTL is emitted until ADR 0007 O11 is recorded) | no | 1.2 |
 | `routing.background.mode` | string | `"auto"` | `"auto"`, `"model"`, `"off"` | no | 2.1 |
 | `routing.background.minPredictedMs` | integer | `45000` | 0–3600000 | no | 2.1 |
 | `routing.leases.mode` | string | `"enforce"` | `"enforce"`, `"off"` | no | 2.1 |
 | `routing.leases.run` | string | `"annotate"` | `"annotate"`, `"refuse"` | no | 2.1 |
-| `routing.executor.maxParallel` | integer | `4` | 1–16, clamped to the C13 cap | no | 4.1 |
+| `routing.executor.maxParallel` | integer | `4` | 1–8 (largest concurrency proven by C13 and C14; ADR 0007 D13) | no | 4.1 |
 | `routing.executor.slotsDir` | string or null | `null` (computed: `<repo parent>\.omr-slots\<repo>-<hash>`) | absolute; on the repository's drive; not a drive root; neither inside nor an ancestor of the repository; no `*` | **yes** | 4.1 |
 | `routing.executor.approve` | string | `"ask"` | `"ask"`, `"auto"` | no | 4.1 |
 | `routing.executor.crossPhase` | string | `"gate"` | `"gate"`, `"inferred"` | no | 4.1 |
@@ -4366,12 +4411,13 @@ asserted in Phase 6.1.
 | Metric | Definition | Source |
 |---|---|---|
 | Plan efficiency | makespan / max(CP, W/p, ΣI) | ledger task timestamps, scripted or estimated durations, integration-step events |
-| Idle-with-ready | intervals during which a ready task and free capacity existed with nothing launched (A) or offered (B) | runtime `metric` events |
+| Idle-with-ready | intervals during which a ready task and free capacity existed with nothing launched | runtime `metric` events |
 | Orchestrator cache-read share | p50 and p10 of cacheRead / (input + cacheRead + cacheWrite) per orchestrator turn | `turns.jsonl` (1.1) |
 | Conflict rate | integration conflicts / integrated tasks | queue events |
 | Rework rate | attempts beyond the first / tasks | ledger attempts |
 | Integration wait | p50 and p90 of the time from `verified` to `integrated` | integration-step events |
-| Capacity events | decreases, pauses and recoveries per provider | capacity `metric` events |
+| Capacity events | decreases, pauses, recoveries and retry-hook stops per provider | capacity `metric` events |
+| Retained-context age | age of the retained orchestrator context at each launcher A launch; the largest age at which a launch succeeded (6.2.0 writes it into ADR 0007) | runtime `metric` events (3.1) |
 | Human stops | inbox items of severity blocking or critical, and their time to answer | ledger inbox |
 
 ---
