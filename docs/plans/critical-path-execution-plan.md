@@ -376,7 +376,7 @@ If heavy's direction also fails after 2 attempts, it is a stop condition (§0.1-
      written without the `routing.` prefix (`| \`executor.maxParallel\` |`); object defaults expand into leaf rows.
    - is pinned by `D:\git\omr-cpx-main\test\unit\docs-drift.test.ts` (≈306-314).
 8. **v1.** Every new behavior and every registration is gated on `ctx.routerHost === "v2"`.
-   - On v1, a configured `routing.background.*`, `routing.leases.*`, `routing.promptCache.*` or `routing.executor.*` key
+   - On v1, a configured `routing.background.*`, `routing.leases.*` or `routing.executor.*` key
      logs one notice per process (`<feature> requires OpenCode v2; ignored`).
    - v1 goldens, v1 help text and v1 `/router stats` output stay byte-identical.
    - Run `npm run smoke:v1` when an OpenCode 1.x executable is on `PATH`.
@@ -573,8 +573,8 @@ the real host, the owner's real subscriptions and this real plan. Both are requi
 | D1 | **Background-first** (`routing.background.mode`, default `auto`). An explicit model `background` value is honored. When it is unset, the dispatch runs in the background if any of these holds: the estimate has `n ≥ minSamples` and p50 ≥ `routing.background.minPredictedMs` (default 45000); the acceptance block has `testsPass` or `buildPasses`; it is a plan task. An estimate whose `source` is `"prior"` never selects background by itself. Required verification runs in the background only when C4 and C15 hold (D3); otherwise it stays in the foreground, as today. `off` reproduces today's `nativeArgs` exactly: `background:false` only for verifying or routed role calls; otherwise the caller's value passes through and no key is added. |
 | D2 | **Guarantees at completion.** A completion processor keyed by child session id runs everything that today's `execute.after` does for a finished dispatch: budget and authority signals, deferred-verification registration, change-set capture at child end, verification enqueue, timing. It runs exactly once per child attempt, triggered by whichever comes first: the child's execution-end event or the completion message seen in the parent's context. User-backgrounded dispatches (P3) get the same guarantees. **Foreground** dispatches keep today's in-result annotation in `execute.after`; the end-event trigger is suppressed while that call's `execute.after` is pending, so `off` and foreground output stay byte-identical. For **background** dispatches, the annotations (budget, authority, depth banner, verification handle) go in the turn-state tail's "completed" section (Appendix B), on every request of the parent's next turn. When the context hook builds the first request after a completion, it waits up to 2000 ms for `settled(child)`. If the child is not settled by then, the section shows "router guarantees pending" and the annotation appears in the next request. Past messages are never rewritten for annotations, and nothing is appended to history for them. |
 | D3 | **Held results** (only when C4 and C15 hold). For a background dispatch under required verification, the host's completion message is rewritten, for the life of the session, to a fixed placeholder (`held — verdict pending (vrf_…)`) that never changes, including in compaction (C15). On the verdict, a new synthetic entry delivers the output with the verdict (PASS) or the findings (FAIL) and wakes the parent once (`resume: true`). A `subagent` resume of a held child is refused until its verdict. Plan tasks never need holding: their output is consumed by the executor, and integration requires a PASS. |
-| D4 | **Cache-stable turn state.** On v2, all per-turn router state is rendered by one builder into a tail, regenerated on every request and never persisted. The state covers: in-flight dispatches, held results, pending verdicts, unread late notices (kept until `router_verify` reads them), the advise hint, plan state and inbox. *Amended by A-0.1-2:* The tail is a new last message with role `user` (C5). The context hook also sets `cache: {type: "ephemeral"}` on a copy of the last text part of the last real message, so the host's only message breakpoint sits on real history and never on the tail (ADR 0007 D4; C5/D4/O8). The system prompt stays byte-stable. v1 keeps today's system-prompt path. |
-| D5 | **Prompt-cache TTL.** *Amended by A-0.1-2:* C6 holds: the plugin `CacheHint` `cache: {type: "ephemeral", ttlSeconds: 3600}` reaches the wire as `cache_control {type: "ephemeral", ttl: "1h"}`. `routing.promptCache.ttl` (`"auto" | "5m" | "1h"`, default `"auto"` = `1h` while the session has background activity or a running plan, otherwise the host default). While it resolves to `1h`, a copy of the last system part and the D4 hint part carry the hint; every other breakpoint stays the host's. No TTL is emitted until the real-provider acceptance check of ADR 0007 O11 is recorded. |
+| D4 | **Cache-stable turn state.** On v2, all per-turn router state is rendered by one builder into a tail, regenerated on every request and never persisted. The state covers: in-flight dispatches, held results, pending verdicts, unread late notices (kept until `router_verify` reads them), the advise hint, plan state and inbox. *Amended by A-0.1-2:* The tail is a new last message with role `user` (C5). The context hook also sets `cache: {type: "ephemeral"}` on a copy of the last text part of the last real message, so the host's only message breakpoint sits on real history and never on the tail (ADR 0007 D4; C5/D4/O8). *Amended by A-1.2-1:* the hint target is the last non-blank text part of the last real message, else its last `tool-result` or `media` part, else no hint, never an earlier message; "never on the tail" holds while the host's four-marker budget is used (with a single system part, no tools or no router hint the host may mark the tail itself). The system prompt stays byte-stable. v1 keeps today's system-prompt path. |
+| D5 | **Prompt-cache TTL.** *Withdrawn by A-0.1-3 (QA-0.1-17), OpenCode v2.0.26: no `routing.promptCache.ttl` key, no TTL hint, the system array is never changed; the text below is superseded and kept as history. Reinstating needs a host that lets plugins set the tools breakpoint TTL (ADR 0007 D5).* *Amended by A-0.1-2:* C6 holds: the plugin `CacheHint` `cache: {type: "ephemeral", ttlSeconds: 3600}` reaches the wire as `cache_control {type: "ephemeral", ttl: "1h"}`. `routing.promptCache.ttl` (`"auto" | "5m" | "1h"`, default `"auto"` = `1h` while the session has background activity or a running plan, otherwise the host default). While it resolves to `1h`, a copy of the last system part and the D4 hint part carry the hint; every other breakpoint stays the host's. No TTL is emitted until the real-provider acceptance check of ADR 0007 O11 is recorded. |
 | D6 | **Telemetry.** Every dispatch's start, end, role, class, scope, tier, model and outcome goes to `timings.jsonl`; every orchestrator turn's input, cache-read and cache-write tokens go to `turns.jsonl`; both live in the outcome store. An estimator gives p50/p90 per (role, class, scope), falling back to (role, class), then role, then a prior of 480000 ms. *Amended by A-0.1-2:* A timing row also carries `capacity` (`"rate-limit" | "overload" | "usage-limit" | null`: the last capacity class the child met, from event fields, ADR 0007 D13); rows with a non-null `capacity` are excluded from estimates. The retained-context age of each launcher A launch is an Appendix D metric. |
 | D7 | **File leases.** Only **child (delegated) sessions** take leases: on first write, an exclusive lease on the file, keyed by repository and normalized repo-relative path. A root session (the orchestrator or any plain user session) takes none; its writes are refused only while a child holds that file. While a child holds a write lease in a working tree, another session in the **same tree** is affected as follows: a **read** of that file is refused, naming the holder; a **directory search** omits leased files and adds a count; a **`router_run`** runs, and its result carries `[router] ran while <holder> edits <n> file(s); result may be contaminated` (refused instead when `routing.leases.run` is `"refuse"`); a **plugin verification run** is deferred until the lease ends or its deadline passes, then runs with today's contamination caveat. A child's leases end at its execution end, its interrupt, or the 6 h sweep. Plan-task leases end at integration. Predicted footprints are scheduling hints; leases are the enforcement. |
 | D8 | **Ledger.** The ledger lives under `<git common dir>\omr-executor\<planId>\`: a rotated journal plus an atomic snapshot, with a single-writer lock, a schema version, and an fsync before any externally visible step. The ledger, not the conversation, is the source of truth. |
@@ -639,7 +639,7 @@ tests assert it.
 | C15 | The compaction request of a session can be rewritten by a plugin (`session.hook("compaction")` or an equivalent) | held placeholder applied in compaction (D3) | no holding (same as C4 fallback) |
 
 *Amended by A-0.1-2:* **Decided (ADR 0007, revision 2026-10-11).** The rows above keep their pre-observation wording. The decided
-branches are: C6 holds (part `cache` hint; 1 h gated by O11); C10 holds on different events (429/529 →
+branches are: C6 holds on the wire but D5 is withdrawn (A-0.1-3: the host's tools breakpoint keeps its 5-minute TTL; no TTL hint, no O11); C10 holds on different events (429/529 →
 `session.retry.scheduled`, no `session.step.failed` within 75 s; usage limit → `session.step.failed`
 `provider.quota`; reset instant only in `error.message`; the retry hook can stop retries); C9 holds for
 `read`/`write`/`edit`/`glob`/`grep` (`list`, `multiedit`, `patch`, `apply_patch` not advertised; `router_run`
@@ -1265,15 +1265,14 @@ per C5, unread late notices persist until read, and v1 is unchanged.
   Writes: none. Reads (pasted): the pre-flight excerpts, the C5 and C6 rows of
   `D:\git\omr-cpx-main\docs\adr\0007-critical-path-execution.md`.
   The memo covers:
-  - *Amended by A-0.1-2:* the tail placement per C5 (new last `user` message) and the D4 breakpoint hint: on a copy of the last text part of
-    the last real message, never on the tail, never left on an earlier message; the rule when the last real message has
-    no text part (ADR 0007 O12);
+  - *Amended by A-0.1-2 and A-1.2-1:* the tail placement per C5 (new last `user` message) and the D4 breakpoint hint: on a copy of the last non-blank text part of
+    the last real message, else its last `tool-result` or `media` part, else no hint; never on an earlier message; the
+    host may mark the tail itself when its four-marker budget is not used (ADR 0007 D4, O12);
   - keeping host part identity and order in the system array;
   - the provider registry API;
   - the size bound and the overflow line;
   - determinism rules: no clocks in the system; ages rounded to minutes in the tail only;
-  - *Amended by A-0.1-2:* the TTL rule per C6/D5: the parts that carry `ttlSeconds: 3600` (last system part, D4 hint); how the last system part
-    is replaced by a copy without breaking 1.2.5.b; the O11 gate (how the real-provider check is run and recorded);
+  - *Not applicable (A-0.1-3):* the TTL rule per C6/D5 (D5 is withdrawn; no `ttlSeconds` hint, the system array is never changed, no O11 gate);
   - the late-notice retention rule (kept and rendered until `router_verify` returns the handle);
   - a proof that v1 does not regress.
 - **1.2.2** [tier:medium] VERIFY:required `D:\git\omr-cpx-main\src\compat\turn-state.ts`.
@@ -1295,7 +1294,7 @@ per C5, unread late notices persist until read, and v1 is unchanged.
   check: testsPass
   criteria: output is deterministic for equal provider outputs; the 6000-character bound holds
   [/acceptance]
-- **1.2.3** [tier:medium] VERIFY:required Config `routing.promptCache.ttl` (`"auto" | "5m" | "1h"`, default `"auto"`, which
+- **1.2.3** [tier:medium] VERIFY:required **Not applicable (A-0.1-3, QA-0.1-17): ADR 0007 D5 is withdrawn on OpenCode v2.0.26. No `routing.promptCache.ttl` key is added, with no config row and no drift pin; no TTL hint is emitted; O11 does not apply.** Superseded text, kept as history: Config `routing.promptCache.ttl` (`"auto" | "5m" | "1h"`, default `"auto"`, which
   means `1h` while `hasActivity`, otherwise the host default). *Amended by A-0.1-2:* ADR 0007 decided C6 = available (D5). The resolved TTL emits no hint until the O11 real-provider check (a keyed
   request with the host's markers plus the 1 h hint, or the first DF session) is recorded in the Phase 1.2 report;
   until then `auto` and `1h` behave as `5m`.
@@ -1325,13 +1324,12 @@ per C5, unread late notices persist until read, and v1 is unchanged.
 - **1.2.5** [tier:medium] VERIFY:required Context hook.
   [route class=implement risk=high scope=single needs=edit,shell d=deterministic root=D:\git\omr-cpx-p12 tier=medium pin]
   Writes: `D:\git\omr-cpx-main\src\compat\v2-hooks.ts`. Reads: `D:\git\omr-cpx-main\src\compat\turn-state.ts`, `D:\git\omr-cpx-main\src\router\config.ts`.
-  - 1.2.5.a *Amended by A-0.1-2:* On every request of a root session with non-empty state, append the tail as a new last `user` message (C5), and set
-    `cache: {type: "ephemeral"}` on a copy of the last text part of the last real message (D4; O12 rule when it has
-    none). Host message objects are never mutated.
-  - 1.2.5.b *Amended by A-0.1-2:* Never change a system part's identity, order or text. The one exception is the last system part, which is
-    replaced by a copy that carries `cache` while the TTL resolves to `1h` (D5).
-  - 1.2.5.c *Amended by A-0.1-2:* Per C6/D5, while the TTL resolves to `1h` and O11 is recorded, set `cache: {type: "ephemeral", ttlSeconds: 3600}` on
-    the last system part and on the D4 hint part; no other part gets a hint.
+  - 1.2.5.a *Amended by A-0.1-2 and A-1.2-1:* On every request of a root session with non-empty state, append the tail as a new last `user` message (C5), and set
+    `cache: {type: "ephemeral"}` (no TTL) on a copy of the last non-blank `text` part of the last real message; if that
+    message has none, on its last `tool-result` or `media` part; if it has neither, no hint (never an earlier message;
+    D4, O12 observed on v2.0.26). Host message objects are never mutated.
+  - 1.2.5.b *Not applicable (A-0.1-3):* D5 is withdrawn. A system part's identity, order and text are never changed; the system array is never changed.
+  - 1.2.5.c *Not applicable (A-0.1-3):* D5 is withdrawn; no `ttlSeconds` hint is set on any part. No part other than the D4 hint part gets a hint.
   - 1.2.5.d *Amended by A-0.1-2:* Child sessions get no tail and no hint.
   [acceptance]
   cwd: D:\git\omr-cpx-p12
@@ -1379,7 +1377,7 @@ per C5, unread late notices persist until read, and v1 is unchanged.
   - a provider exception breaking a request;
   - late notices lost;
   - v1 drift;
-  - *Amended by A-0.1-2:* a TTL emitted before the O11 check is recorded;
+  - *Not applicable (A-0.1-3):* TTL emission (D5 is withdrawn); instead, any `ttlSeconds` or any change to the system array is a defect;
   - a hint on the tail, on more than one message, or left on an earlier message;
   - a tail in child sessions.
 - **1.2.FIX** [tier:medium] Fix every QA-1.2 finding.
@@ -1406,15 +1404,14 @@ per C5, unread late notices persist until read, and v1 is unchanged.
     by reference, while the tail differs;
   - the advise hint is in the tail;
   - *Amended by A-0.1-2:* child sessions get no tail and no hint;
-  - the hint is on the last real message's last text part and never on the tail; the O12 fallback;
+  - *Amended by A-1.2-1:* the hint is on the last non-blank text part of the last real message, else on its last `tool-result` or `media` part, else absent, and never on an earlier message;
   - an unread late notice is rendered on two consecutive turns and disappears after `router_verify`.
 - v1: the legacy system transform output is byte-identical to the existing golden.
 - Smoke (scripted provider):
   - *Amended by A-0.1-2:* request N+1 equals request N byte for byte through request N's last real message, except for the `cache_control`
     object request N put on that message (the moved D4 hint); request N's tail is absent from request N+1;
-  - the single message breakpoint sits on the last real message, never on the tail; one request whose last real message
-    is a tool result is recorded (O12);
-  - `ttl: "1h"` appears on the last system block and on the hinted block only while activity is true and O11 is recorded.
+  - *Amended by A-1.2-1:* the single message breakpoint sits on the last real message, never on the tail, while the host's four-marker budget is used (with a single system part, no tools, or no router hint the host may mark the tail itself); on v2.0.26 a request whose last real message is a tool result carries the marker on the `tool_result` block (O12, observed);
+  - *Not applicable (A-0.1-3):* no `ttl: "1h"` appears on any block.
 
 **Acceptance criteria:**
 - On v2 no router-generated system part changes between the turns of a session.
@@ -1509,11 +1506,17 @@ and one extractor that turns any file, search or `router_run` tool call into nor
     - `sweep()`, `snapshot()`, `restore(snapshot)`.
 
     A holder is `{holderID, tree, isChild, taskRef?, scope, acquiredAt}`.
-  - 1.3.3.b Conflict rules:
+  - 1.3.3.b *Amended by A-1.3-1 (Phase 1.3, ADR 0007 D7):* Conflict rules:
     - a write conflicts across every tree of the same repository;
-    - a read or run conflicts only in the same physical tree, with a different holder;
+    - a read or run conflicts only in the same physical tree, with a different **owner** (ownership is the task,
+      `taskRef ?? holderID`, not the session: sessions of one task never conflict with each other); the read, search and
+      run restrictions apply to another child session only, and a root session is never refused a read, a search or a
+      run;
+    - a run also conflicts with leases under the run directory (include leases), not only those of the run tree;
+    - a path spelling that cannot be keyed and may still name any file (device path, drive-relative path, rooted path
+      without a drive, 8.3 short name in a missing path) fails closed;
     - a root (non-child) session never acquires a lease; its write to a file a child holds is refused.
-  - 1.3.3.c Limits: a cap of 10 000 leases, with a clear refusal when full; O(1) checks.
+  - 1.3.3.c *Amended by A-1.3-1:* Limits: a cap of 10 000 leases, with a clear refusal when full. The `checkRun` cost is the leases of the run tree plus those under the run directory, not O(1) (all leases, up to the cap, when a child's run directory cannot be keyed).
   [acceptance]
   cwd: D:\git\omr-cpx-p13
   check: buildPasses
@@ -1856,8 +1859,10 @@ Phases 2.2–2.4 and 3.x build in parallel against this fixed contract, and `src
     - a resume of a held child is refused.
   - 2.1.5.b `execute.after` with `status === "running"` (≈1746-1761) registers the dispatch in flight, including
     user-backgrounded calls (C8), instead of returning without guarantees.
-  - 2.1.5.c Event loop (≈1819-1880), per the 1.1 handoff. On v2 it creates the timing recorder
-    (`createTimingRecorder`) whatever `routing.engine` is, and `createDurationModel` over `timings.jsonl`; it calls
+  - 2.1.5.c Event loop (≈1819-1880), per the 1.1 handoff. *Amended by A-1.1-1:* the recorder is acquired with
+    `acquireTimingRecorder`, and the call points are those of the "Handoffs" section of
+    `D:\git\omr-cpx-main\docs\qa\critical-path-execution\phase-1.1.md`, which is binding. On v2 it creates the timing recorder
+    (`acquireTimingRecorder`, replacing `createTimingRecorder`) whatever `routing.engine` is, and `createDurationModel` over `timings.jsonl`; it calls
     `observe` for each row the recorder appends, and `decideBackground` receives `estimate({role, class, scope})`:
     - *Amended by A-0.1-2:* `session.retry.scheduled` (`provider.rate-limit` → rate-limit,
       `provider.internal`/529 → overload, other types by status) and `session.step.failed` with `provider.quota`
@@ -2838,7 +2843,7 @@ The result is safe to run in parallel.
 **Tasks**
 - **3.1.1** [tier:heavy] CAP:6 Design memo (returned; recorded by the orchestrator).
   [route class=design risk=high scope=repo d=none root=D:\git\omr-cpx-p31 tier=heavy pin]
-  Writes: none. Reads (pasted): the pre-flight excerpts and ADR decisions.
+  Writes: none. Reads (pasted): the pre-flight excerpts and ADR decisions. *Amended by A-1.4-1:* the lease seam of the runtime follows addendum A3 of `D:\git\omr-cpx-main\docs\qa\critical-path-execution\phase-1.4.md`, which is binding.
   The memo covers:
   - the runtime event model;
   - the ready-set algorithm and its priority order;
@@ -2895,14 +2900,17 @@ The result is safe to run in parallel.
   [route class=implement risk=medium scope=single needs=edit,shell d=deterministic root=D:\git\omr-cpx-p31 tier=medium pin]
   Writes: `D:\git\omr-cpx-main\src\executor\expand.ts`. Reads: `D:\git\omr-cpx-main\src\executor\types.ts`,
   the design memo in `D:\git\omr-cpx-main\docs\qa\critical-path-execution\phase-3.1.md` (`## Implementation notes`).
-  - 3.1.4.a The prompt is assembled from these parts, in order:
-    - the task's route line, with `root=<slot>` and `tier=X pin` when the task carries `[tier:X]`;
-    - `VERIFY:required`;
-    - the acceptance block with `cwd: <slot>`;
+  - 3.1.4.a *Amended by A-0.1-3 (QA-0.1-21):* The prompt sent to the child is assembled from these parts, in order:
     - `PLAN CONTEXT` (shared and identical for every task);
+    - the launch header `[plan <planId>:<taskId>#<attempt>]`;
     - `TASK`: id, title, text, subtasks, `Writes:`/`Reads:` from the footprint, ENVIRONMENT for the slot, and the attempt
       context (conflict, findings or the human's answer);
     - for `kind: "qa"`, the `FINDINGS_FORMAT` instruction.
+
+    The task's route line (with `root=<slot>` and `tier=X pin` when the task carries `[tier:X]`), `VERIFY:required` and
+    the acceptance block (with `cwd: <slot>`) are consumed by the executor and are not sent verbatim. *Amended by
+    A-1.4-1:* `formatLaunchPrompt` follows the addenda A1–A3 of
+    `D:\git\omr-cpx-main\docs\qa\critical-path-execution\phase-1.4.md`, which are binding.
 
     The prompt is byte-identical for the same task attempt. The expansion rewrites, in the route line, the acceptance
     block (`cwd:` and every `path=`), the task text and the subtasks, every absolute path whose prefix is a worktree
@@ -2917,7 +2925,7 @@ The result is safe to run in parallel.
   check: testsPass
   criteria: the expansion is byte-stable per attempt; the reference grammar accepts S-style fallback ids; plan text never reaches the route line
   [/acceptance]
-- **3.1.5** [tier:medium] VERIFY:required `D:\git\omr-cpx-main\src\executor\launch.ts` (`TaskLauncher`, launcher A) (*Amended by A-0.1-2*).
+- **3.1.5** [tier:medium] VERIFY:required `D:\git\omr-cpx-main\src\executor\launch.ts` (`TaskLauncher`, launcher A) (*Amended by A-0.1-2*). *Amended by A-1.4-1:* the `bootID` and the context pin follow the addenda A1–A3 of `D:\git\omr-cpx-main\docs\qa\critical-path-execution\phase-1.4.md`, which are binding.
   [route class=implement risk=high scope=multi needs=edit,shell d=deterministic root=D:\git\omr-cpx-p31 tier=medium pin]
   Writes: `D:\git\omr-cpx-main\src\executor\launch.ts`, `D:\git\omr-cpx-main\src\compat\v2-client.ts`,
   `D:\git\omr-cpx-main\src\routing\roles\binding.ts`. Reads: `D:\git\omr-cpx-main\src\executor\expand.ts`, the C14 row of
@@ -3153,7 +3161,7 @@ The result is safe to run in parallel.
     - Pass → fast-forward all of them.
     - Fail → bisect by halves; innocent tasks integrate.
   - 3.2.3.c Every step is journaled (I4), and so are the `integration-step` start and end events (Appendix D).
-    `resume()` completes or rolls back the step in progress.
+    `resume()` completes or rolls back the step in progress. *Amended by A-1.4-1:* `resume()` and the history journal follow addenda A1-3 and A2 of `D:\git\omr-cpx-main\docs\qa\critical-path-execution\phase-1.4.md`, which are binding.
   [acceptance]
   cwd: D:\git\omr-cpx-p32
   check: buildPasses
@@ -3490,6 +3498,7 @@ The result is safe to run in parallel.
   Writes: `D:\git\omr-cpx-main\src\executor\unattended.ts`. Reads: the design memo in
   `D:\git\omr-cpx-main\docs\qa\critical-path-execution\phase-4.2.md` (`## Implementation notes`),
   `D:\git\omr-cpx-main\src\executor\types.ts`.
+  - *Amended by A-1.4-1:* the `qa-cap` inbox item and its answers (`accept`, `fix`) follow addendum A1 (QA8, QA9) of `D:\git\omr-cpx-main\docs\qa\critical-path-execution\phase-1.4.md`, which is binding.
   - 4.2.2.a Inbox items: `{id, kind, severity, taskId, text, options}`.
   - 4.2.2.b Parking:
     - a task is parked on `ESCALATE: human`, on an ambiguity, or when its attempts are exhausted;
@@ -4243,6 +4252,8 @@ Phase 6.2 is the global senior QA review: [tier:heavy], adversarial. Every findi
 
 ## Appendix A — Ledger schema v1 and task state machine
 
+*Amended by A-1.4-1:* where the contract addenda A1–A3 of `D:\git\omr-cpx-main\docs\qa\critical-path-execution\phase-1.4.md` change this appendix, those addenda are binding.
+
 ```ts
 interface LedgerV1 {
   schema: 1;
@@ -4373,7 +4384,7 @@ All keys are v2 only. They are documented as rows of the routing table in
 
 | Key | Type | Default | Range / values | Trusted only (D18) | Phase |
 |---|---|---|---|---|---|
-| `routing.promptCache.ttl` | string | `"auto"` | `"auto"`, `"5m"`, `"1h"` (C6 holds; no TTL is emitted until ADR 0007 O11 is recorded) | no | 1.2 |
+| `routing.promptCache.ttl` | — | — | **Not added (A-0.1-3):** ADR 0007 D5 is withdrawn on OpenCode v2.0.26; no key, no TTL hint | — | — |
 | `routing.background.mode` | string | `"auto"` | `"auto"`, `"model"`, `"off"` | no | 2.1 |
 | `routing.background.minPredictedMs` | integer | `45000` | 0–3600000 | no | 2.1 |
 | `routing.leases.mode` | string | `"enforce"` | `"enforce"`, `"off"` | no | 2.1 |
@@ -4523,5 +4534,12 @@ transition; DF-0 runs before the first role dispatch.
 at the owner's request: 6.1 metrics reach ADR 0007 through 6.2.0; the DF-1 lease probe holds its lease long enough;
 `phaseSuite`/`integrationChecks` resolution; `deleteRefs`; literal paths are orchestrator-only; DF-0 resume point;
 Node ≥ 22.18; DF-2 switch procedure and the 24 h pending TTL from DF-1; QA tasks return JSON only.
+
+**Amendment log** (inline markers read *Amended by A-…*; A-0.1-1 and A-0.1-2 are listed in the handover file's "Amendments"):
+- **A-0.1-3** (QA-0.1-17, -18, -20, -21, -22, -25, -26, -27) — applies ADR 0007's QA revision of 2026-10-11 to Phase 0.1: D5 is withdrawn on OpenCode v2.0.26 (no `routing.promptCache.ttl`, no TTL hint, the system array is never changed; 1.2.3 and 1.2.5.b/c do not apply; O11 does not apply); `provider.quota` and host-ended `provider.rate-limit` / `provider.internal` close an attempt as `capacity` (uncounted, outside the circuit breaker); the retry-hook stop and quota retry-hook calls are capacity signals; launcher-A prompt order is PLAN CONTEXT, launch header, TASK; launcher B leftovers removed; launches never use the retained `signal` and never forward `progress`; D7 lists the `router_git_*` tools, and `shell`/`execute` are not covered by leases. Items marked A-0.1-3 in the text: D5 row, C6 decided branch, 1.2.1 memo, 1.2.3, 1.2.5.b/c, the 1.2 QA focus and smoke bullets, 3.1.4.a, Appendix C `routing.promptCache.ttl`.
+- **A-1.1-1** (Phase 1.1) — 2.1.5.c acquires the timing recorder with `acquireTimingRecorder` and makes the calls listed under "Handoffs" in `docs\qa\critical-path-execution\phase-1.1.md`.
+- **A-1.2-1** (QA-1.2-12, -16) — the D4 hint goes on the last non-blank text part of the last real message, else on its last `tool-result` or `media` part, else no hint, never an earlier message. Observed on v2.0.26: the `tool_result` block carries the marker. "Never on the tail" holds only while the host's four-marker budget is used. Changed in the D4 row, 1.2.1 memo, 1.2.5.a and the 1.2 test bullets.
+- **A-1.3-1** (Phase 1.3, ADR 0007 D7) — 1.3.3.b/c: read, search and run restrictions apply to another child session (root sessions are never refused); lease ownership is the task (`taskRef`); read/run conflicts are decided per owner; a run also conflicts with leases under the run directory; unkeyable spellings fail closed; `checkRun` costs the leases of the run tree plus those under the run directory, not O(1).
+- **A-1.4-1** (Phase 1.4 contract addenda A1–A3) — `docs\qa\critical-path-execution\phase-1.4.md` addenda are binding where they change Appendix A, 3.1.1 (lease seam, A3), 3.1.4 (`formatLaunchPrompt`), 3.1.5 (`bootID`, context pin), 3.2.3.c (`resume()`, A1-3/A2) and 4.2.2 (`qa-cap` answers). The addenda are not copied into the plan.
 
 **Owner execution rules for the implementation session** — §0.14 (continuous iteration, momentary takeover, atomic delegation with [tier:heavy] for complex coding and lighter test runs, bounded QA rounds, pre-flight fix-or-document, Linear not used, worktree reporting), the testing policy (§0.6-9: scoped, accelerated, full suite only in 6.2), the bounded executor QA loop (default 3 rounds), and the handover's kickoff prompt.

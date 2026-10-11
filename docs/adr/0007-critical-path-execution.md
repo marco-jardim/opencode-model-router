@@ -3,7 +3,7 @@
 > **Status:** Accepted (measurements pending Phase 6.1) **Date:** 2026-10-10, revised 2026-10-11 **Wave/Phase:** Critical-Path Execution, Phase 0.1 (tasks 0.1.4, 0.1.FIX)
 > **Supersedes:** none **Depends on:** ADR 0002 (acceptance gate), ADR 0005 (cost-aware routing engine), ADR 0006 (role × tier × assurance delegation)
 > **Deciders:** owner (Marco Jardim); host observations, adversarial QA round 1 (QA-0.1-1 … QA-0.1-16) and its fixes are recorded in the Phase 0.1 report (`docs/qa/critical-path-execution/phase-0.1.md`)
-> **Plan:** [`../plans/critical-path-execution-plan.md`](../plans/critical-path-execution-plan.md) (amendment A-0.1-2 applies this revision) **Handover:** [`../plans/critical-path-execution-handover.md`](../plans/critical-path-execution-handover.md)
+> **Plan:** [`../plans/critical-path-execution-plan.md`](../plans/critical-path-execution-plan.md) (amendments A-0.1-2 and A-0.1-3 apply this revision) **Handover:** [`../plans/critical-path-execution-handover.md`](../plans/critical-path-execution-handover.md)
 > **Host version under test:** OpenCode v2.0.26 (`C:\Users\Marquinho\scoop\apps\opencode2\2.0.26\opencode.exe`)
 > **Evidence:** `npm run smoke:cpx` at test commit `7b11504` (branch head `3873d7f` adds only the phase report), three green runs on 2026-10-11, 51/51 tests each: `5eb6a5a6` (03:20–03:28 UTC), `ff9762e2` (03:29–03:37 UTC), `a0de2aa6` (03:37–03:46 UTC), that is 00:20–00:47 local time (UTC−3)
 > **Issue:** none
@@ -74,7 +74,7 @@ show how the host classifies those answers, not what a real provider sends (O15)
 | C3 | The child ended while a parent request was in flight (`midTurn.childEndedDuringSlowRequest=true`). The completion reached provider request 3 and was stored (`delivery.lostFromWire=false`, `delivery.storedHasEnvelope=true`). | none | `C3/D2` (smoke ≈1638-1639) |
 | C4 | The parent's context hook first saw the completion in request 4 (`hook.firstSeen.requestNo=4`) and replaced it in requests 4 and 5 (`hook.rewriteLines[3,4].did=true`). No provider body carried the raw completion (`rawEnvelopeInAnyProviderBody=false`); the placeholder reached bodies 3 and 4 (`placeholderInProviderBodies=[3,4]`). Stored history kept the original and never the placeholder (`stored.originalKept=true`, `stored.placeholderPersisted=false`). | none | `C4/D3` (smoke ≈1643-1645) |
 | C5 | Four placements, two consecutive requests each. A `system`-role tail is folded by the host into the last user message as a `<system-update>…</system-update>` part (`$.messages[0].content[1]`), the same position as the `newest` placement. A separate `user` tail is the last message (`$.messages[1].content[0]`, then `$.messages[3].content[0]`). Every placement was sent, not stored, and absent from the next request (`wire.firstMarkerStillInSecond=false`, `storedHasMarker=false`). For the `user` tail, the system, the other fields and the earlier messages were byte-identical (`variants.user.prefix.*`). **Breakpoints:** the host emits four `cache_control {type: "ephemeral"}` markers per request: `$.system[0]`, `$.system[4]`, `$.tools[17]` and exactly one message block (`breakpoints[*].paths`). Without a manual hint, the message marker sits on the tail (`variants.user.breakpoints[*].onTail=true`, `onLastReal=false`). With a manual `cache: {type: "ephemeral"}` on the last text part of the last real message, the marker sits on that message and not on the tail (`variants.userHint.breakpoints[*].onLastReal=true`, `onTail=false`). The earlier request's last real message then differs from its next-request copy only by the moved marker (`variants.userHint.prefix.messages.firstDiff`: `{"type":"text","text":"C5 first turn","cache_control":{"type":"ephemeral"}}` vs `{"type":"text","text":"C5 first turn"}`); the system and every other field are identical. | none | `C5/D4`, `C5/D4/O8` (smoke ≈1651-1669) |
-| C6 | The plugin API's part field `cache` is absent until the plugin creates it (`probeTried[*].hadCacheKey=false`, part keys `type, text`). Set to `{type: "ephemeral", ttlSeconds: 3600}`: on the last system part it reached the wire as `$.system[4].cache_control={type: "ephemeral", ttl: "1h"}` in both requests (`variants.system.oneHourOnSystem=true`); on the last text part of the last real message it reached the wire as `$.messages[0]` / `$.messages[2]` `.content[0].cache_control={type: "ephemeral", ttl: "1h"}` (`variants.message.oneHourOnMessage=true`). Every other marker stayed `{type: "ephemeral"}` (`$.system[0]`, `$.tools[17]`, and the message marker in the system variant). The context event's `options` has only `maxTokens`. | none | `C6/D5` (smoke ≈1675-1677) |
+| C6 | The plugin API's part field `cache` is absent until the plugin creates it (`probeTried[*].hadCacheKey=false`, part keys `type, text`). Set to `{type: "ephemeral", ttlSeconds: 3600}`: on the last system part it reached the wire as `$.system[4].cache_control={type: "ephemeral", ttl: "1h"}` in both requests (`variants.system.oneHourOnSystem=true`); on the last text part of the last real message it reached the wire as `$.messages[0]` / `$.messages[2]` `.content[0].cache_control={type: "ephemeral", ttl: "1h"}` (`variants.message.oneHourOnMessage=true`). Every other marker stayed `{type: "ephemeral"}` (`$.system[0]`, `$.tools[17]`, and the message marker in the system variant). The context event's `options` has only `maxTokens`. **Consequence (QA-0.1-17):** the context event's `tools` has no cache field, so `$.tools[17]` keeps the host's default 5-minute marker while system and message markers can be raised to 1 hour; the provider requires longer TTLs to precede shorter ones in prefix order tools → system → messages, so that layout is invalid and D5 is withdrawn on v2.0.26. | none | `C6/D5` (smoke ≈1675-1677) |
 | C7 | Each child produced its own terminal event carrying its session id: `session.execution.succeeded`, `.failed` (a scripted non-retryable 400 `provider.invalid-request`, one host attempt: `failure.retriedByHost=false`) or `.interrupted` (after `client.session.interrupt({sessionID})` returned `{interrupted: true}`). `context({sessionID: child})` returned `user, assistant, idle`; the last message is `{type: "idle", outcome}`. The OK child's final text is in the last `assistant` message (`perChild.C7_OK.context.finalTexts=["CHILD_OK"]`, `finalTextPaths=["$.content[0].text"]`). The failed child's `assistant` carries `error {type: "provider.invalid-request", status: 400}`; the interrupted child's carries `error {type: "aborted", message: "Step interrupted"}`. The parent stored three completions with states `error, cancelled, completed`. | none | `C7/D2`, `C7/O1` (smoke ≈1685-1694) |
 | C8 | `client.session.background({sessionID: parent})` moved a running foreground `subagent` call to the background (`background.attempts[0].ok=true`). Its `execute.after` then reported `resultStatus="running"` before the child ended (`background.afterBeforeChildEnd=true`), with the same shape as C1 apart from ids (`comparisonWithC1Ack.sameShapeModuloIds=true`). | `background.executeAfter.afterMs` 22 \| 12 \| 12 | `C8/D2` (smoke ≈1698-1700) |
 | C9 | Tools advertised in the fixture include: `read {path, offset, limit}`, `write {path, content}`, `edit {path, oldString, newString, replaceAll}`, `glob {pattern, path, hidden, limit}`, `grep {pattern, path, include, literal, caseSensitive, limit}`, `subagent {agent, description, prompt, model, sessionID, background}`, `shell {command, workdir, timeout, background}`, `execute {code}`. `execute.before` received exactly `read {path}`, `write {path, content}`, `edit {path, oldString, newString}`, `glob {path, pattern}` and `grep {path, pattern}`. `list` and `router_run` are not advertised in the fixture, so their argument keys are **unobserved** (`perTool.list.advertised=false`, `perTool.list.executeBefore.inputKeysUnobserved=true`; the same for `router_run`). `multiedit`, `patch` and `apply_patch` are not advertised. `execute.after` could rewrite `glob` and `grep` results (`filter.mutable=true`, `removedLines=1`; the full pre-filter text held the leased line: `filter.sawLeasedFull=true`). The request that carried each result, selected by `tool_use_id`, shows the model got the rewritten text (`modelSaw.containsLeased=false`, `containsHiddenNote=true`). | none | `C9/D7`, `C9/O9` (smoke ≈1709-1725) |
@@ -99,12 +99,12 @@ show how the host classifies those answers, not what a real provider sends (O15)
 | C3 | holds | No undelivered set and no re-post. | `C3/D2` |
 | C4 | holds | D3 held placeholder in the context hook. | `C4/D3` |
 | C5 | holds (`user` tail) | D4: the tail is a new last `user` message, and the last real message gets a manual `cache` hint, so the host's only message breakpoint sits on real history. | `C5/D4`, `C5/D4/O8` |
-| C6 | holds on the wire | D5 reinstated: `routing.promptCache.ttl`, with the part `cache` hint. A 1 h TTL is emitted only after O11 is closed. | `C6/D5` |
+| C6 | holds on the wire, but not usable | D5 is withdrawn on v2.0.26 (QA-0.1-17): the `tools` breakpoint keeps its 5-minute TTL, so no 1-hour hint is emitted. No `routing.promptCache.ttl` key. | `C6/D5` |
 | C7 | holds | The processor triggers on the child's terminal event. Recovery reads `context({sessionID: child})`: the last message is `{type: "idle", outcome}`, and the result text is in the last `assistant` message. | `C7/D2`, `C7/O1` |
 | C8 | holds | Covered through C1. | `C8/D2` |
 | C9 | holds for the advertised file tools | Leases are enforced in the tool hooks, and search filtering is available. Argument keys per D7. | `C9/D7`, `C9/O9` |
-| C10 | holds, on different events | D13 signals come from event fields. 429/529 → `session.retry.scheduled`; usage limit → `session.step.failed` `provider.quota`. The reset instant comes only from message text. For plan children, the retry hook stops host retries. | `C10/D13` |
-| C11 | holds | No launcher B. Stays pinned because today's `execute.before` changes to `subagent` arguments must stay out of the parent's history (cache stability). | `C11/D4` |
+| C10 | holds, on different events | D13 signals come from event fields. 429/529 → `session.retry.scheduled`; usage limit → `session.step.failed` `provider.quota`. The reset instant comes only from message text. For plan children, the retry hook stops host retries; that stop and the quota retry-hook calls are capacity signals (QA-0.1-27). | `C10/D13` |
+| C11 | holds | Launcher A is the only launcher. Stays pinned because today's `execute.before` changes to `subagent` arguments must stay out of the parent's history (cache stability). | `C11/D4` |
 | C12 | does not hold for a child in flight | D16 fallback: recovery reads state and result through C7 and re-queues a lost child without counting an attempt. Processing dedupes against the persisted store. | `C12/D16`, `C12/D2` |
 | C13 | holds for 6 and 8 background children; an interrupt kills only foreground children | `maxParallel` valid range 1–8. | `C13/D13`, `C13/D14`, `C13/O4a` |
 | C14 | holds (validity proven for 60 s) | **Launcher A.** | `C14/D14`, `C14/O3`, `C14b/O4b` |
@@ -242,10 +242,13 @@ placeholder, `held — verdict pending (vrf_…)`, for the life of the session.
 - **Breakpoint hint.** In the same hook, the router sets `cache: {type: "ephemeral"}` on a copy of the last text part
   of the **last real message**, which is the message that was last before the tail was appended. This is how the C5
   probe did it (`test/smoke/probe/cpx-probe-plugin.js` ≈206-212). Host message objects are not mutated, so no earlier
-  message keeps a hint. Under D5 the hint also carries `ttlSeconds: 3600`. The tail never carries a hint, and no other
+  message keeps a hint. The hint carries no TTL (D5 is withdrawn). The tail never carries a hint, and no other
   message part gets one.
-- **Last real message without a text part** (for example a tool result; O12): until Phase 1.2 observes whether `cache`
-  on such a part reaches the wire, the hint goes on the last text part of the nearest earlier message that has one.
+- **Hint target (O12; QA-1.2-12, QA-1.2-16).** The hint goes on the last non-blank `text` part of the last real
+  message; if that message has none, on its last `tool-result` or `media` part; if it has neither, no hint. It never
+  goes on an earlier message. Observed on v2.0.26 (`cpx-cache-prefix` smoke): the `tool_result` block carries the
+  marker. "Never on the tail" holds only while the host's four-marker budget is used: with a single system part or no
+  tools, or when the router sets no hint, the host may mark the tail itself.
 - With empty state, neither a tail nor a hint is added; the host's own breakpoint then sits on the last real message.
 - The system prompt stays byte-stable. v1 keeps today's system-prompt path.
 
@@ -266,7 +269,8 @@ placeholder, `held — verdict pending (vrf_…)`, for the life of the session.
   therefore unchanged; only the breakpoint marker moves. Whether the provider serves request N+1's prefix through
   message *k* from the entry request N wrote is a provider property. The provider documents this marker-on-latest-message
   pattern for multi-turn caching. A scripted front cannot measure it, so Phase 6.1 measures it as the orchestrator
-  cache-read share (O11). The byte-identity check is asserted on the plain `user` variant; for the hinted variant the
+  cache-read share (not as a gate; O11 is not applicable). The smoke asserts the C5 marker count (≤ 4, with exactly
+  one message marker). The byte-identity check is asserted on the plain `user` variant; for the hinted variant the
   marker difference is recorded, not asserted (smoke ≈1658-1660).
 
 **Rationale.** P4: each change in the system prompt invalidates the whole cached history. The hint keeps the tail
@@ -280,21 +284,27 @@ outside every cache entry.
 - A `user` tail without the hint: the only message breakpoint lands on the volatile tail (`C5/D4/O8`).
 - Persisted synthetic messages: history grows, and stale state becomes permanent.
 
-### D5 — Prompt-cache TTL (reinstated: C6 holds)
+### D5 — Prompt-cache TTL (WITHDRAWN on OpenCode v2.0.26, QA-0.1-17)
 
 **Decision.**
 
-- `routing.promptCache.ttl` is `"auto" | "5m" | "1h"`, default `"auto"`.
-  - `auto` resolves to `1h` while the session has background activity or a running plan, and to `5m` otherwise.
-  - `5m` adds no TTL; the host's default `{type: "ephemeral"}` stays.
-  - `1h`: while the TTL resolves to `1h`, the router sets the plugin API's `CacheHint`
-    `cache: {type: "ephemeral", ttlSeconds: 3600}` on a copy of the **last system part** and on the **D4 hint part**.
-    Every other breakpoint stays the host's.
-- Root sessions only; v2 only (D19).
-- **Gate (O11).** No TTL is emitted, whatever the key says, until a request with this marker layout has been accepted
-  by the real provider and the result recorded. Phase 1.2 records it from a keyed request or from the first DF session,
-  whichever comes first. If the provider rejects the layout, D5 is withdrawn again by ADR amendment; the key stays and
-  resolves to the host default.
+- D5 is withdrawn. There is no `routing.promptCache.ttl` key, no TTL hint, and the system array is never changed.
+  Plan 1.2.3 and 1.2.5.b/c do not apply.
+- O11 (the real-provider gate) is not applicable. The "or the first DF session" way of closing it is moot (QA-0.1-18).
+- Reinstating D5 needs a host that lets plugins set the TTL of the tools breakpoint.
+
+**Evidence (C6, `all` variant, v2.0.26).** The plugin's `CacheHint` `{type: "ephemeral", ttlSeconds: 3600}` reached the
+wire as `ttl: "1h"` on `$.system[0]`, `$.system[4]` and the message block. `$.tools[17]` kept the host's default
+5-minute marker, because the context event's `tools` has no cache field. The provider requires longer TTLs to precede
+shorter ones in prefix order (tools → system → messages), so 1-hour system and message markers after a 5-minute tools
+marker are invalid.
+
+**What had been decided before the withdrawal (history, not in force).**
+
+- `routing.promptCache.ttl` was `"auto" | "5m" | "1h"`, default `"auto"`.
+  - `auto` resolved to `1h` while the session has background activity or a running plan, and to `5m` otherwise.
+  - `1h` set `CacheHint` `cache: {type: "ephemeral", ttlSeconds: 3600}` on a copy of the **last system part** and on the **D4 hint part**.
+- It was gated by O11: no TTL until the real provider accepted the layout.
 
 **Deciding facts (C6).**
 
@@ -304,13 +314,12 @@ outside every cache entry.
 - Both held in both requests and in all three runs (`C6/D5`, smoke ≈1675-1677).
 - The field is absent until the plugin creates it, and it is the plugin API's documented part field (smoke ≈1673-1674).
 
-**Why the gate.** The host keeps its own 5-minute markers on `$.tools[17]` and `$.system[0]`. In the provider's prefix
-order (tools → system → messages), they precede any 1-hour marker the plugin can set. The provider documents that
-longer-TTL entries must come before shorter ones, and the scripted front does not check this.
+**Why it is withdrawn.** The host keeps its own 5-minute marker on `$.tools[17]`, and the plugin cannot change it. In
+the provider's prefix order (tools → system → messages), that marker precedes any 1-hour marker the plugin can set. The
+provider documents that longer-TTL entries must come before shorter ones, and the scripted front does not check this.
 
-**Rationale.** The orchestrator idles while background children run, often for longer than the 5-minute lifetime. On
-wake-up, a 1-hour entry spares the rewrite of the whole history. A 1-hour write is priced higher than a 5-minute write;
-Phase 6.1 measures the net effect.
+**Rationale (original, for reinstatement).** The orchestrator idles while background children run, often for longer than
+the 5-minute lifetime. On wake-up, a 1-hour entry would spare the rewrite of the whole history.
 
 **Alternatives rejected.**
 
@@ -359,7 +368,9 @@ such a dispatch is not a sample of its own work.
 - Only child (delegated) sessions take leases. On first write a child takes an exclusive lease on the file, keyed by
   repository and normalized repo-relative path.
 - A root session takes no leases. Its writes are refused only while a child holds that file.
-- While a child holds a write lease in a working tree, another session in the same tree is affected as follows:
+- Lease ownership is the task (`taskRef`), not the session.
+- While a child holds a write lease in a working tree, another **child** session in the same tree is affected as
+  follows (root sessions are never refused reads, searches or runs; Phase 1.3):
   - a **read** of that file is refused in `execute.before`, naming the holder;
   - a **directory search** omits leased files and adds a count, by rewriting the result in `execute.after`;
   - a **`router_run`** runs, and its result carries `[router] ran while <holder> edits <n> file(s); result may be
@@ -377,7 +388,8 @@ such a dispatch is not a sample of its own work.
 | `glob`, `grep` | `path` (search root) and `pattern` | `C9/D7`: exact keys `{path, pattern}` |
 | `router_run` | `cwd` (with `script`, `args`) | The router's own tool schema (`src/router/run-tools.ts` ≈160, ≈882-885). It is registered in roles mode only (`src/index.ts` ≈1313-1317), so it was not advertised in the C9 fixture and its keys were not observed through the host. |
 | `list`, `multiedit`, `patch`, `apply_patch` | unobserved | Not advertised by v2.0.26 in the fixture (`C9/D7`, `C9/O9`) |
-| `shell`, `execute` | not covered | `shell {command, workdir, timeout, background}` and `execute {code}` are advertised (O9) |
+| `router_git_blame`, `router_git_diff`, `router_git_log`, `router_git_ls_files`, `router_git_show`, `router_git_status` | `path` (a repository-relative path argument); `gitRoot` is required | Advertised by the host (QA-0.1-26). Working-tree reads are classified read (`router_git_blame` without a `ref`) or search (`router_git_diff` without a ref or with a single ref, `router_git_status`, `router_git_ls_files`); committed objects (`router_git_log`, `router_git_show`, blame at a ref, a cached or commit-to-commit diff) are class none. Paths are relative to the repository top level, so `gitRoot` (absolute) is required; without it the target is unknown and handled as an unextractable target. |
+| `shell`, `execute` | not covered by leases | `shell {command, workdir, timeout, background}` and `execute {code}` are advertised (O9); leases do not apply to them |
 
 - Search filtering is available: `glob` and `grep` results can be rewritten in `execute.after`, and the model receives
   the rewrite (`C9/D7`).
@@ -532,7 +544,18 @@ Priority is the bottom level (the longest remaining path by estimated duration).
   `session.execution.failed` (`C10/D13` `retry-stop`, smoke ≈1777). The executor knows the stop is its own, so the
   attempt ends with outcome `capacity` and the task returns to `ready`. For every other session (the orchestrator and
   user dispatches) the handler only observes and leaves `decision` unchanged.
-- **Attempt counting.** Rate-limit, overload and usage-limit outcomes never count as failed attempts.
+- **Capacity signals (QA-0.1-27).** The router's own retry-hook stop and its quota retry-hook calls are capacity
+  signals, like the event fields in the table above.
+- **Attempt counting (QA-0.1-20).** An execution failure with error type `provider.quota` (usage limit), or a
+  `provider.rate-limit` / `provider.internal` failure ended by the host (for example after the router's retry hook
+  stopped retries), closes the attempt with outcome `capacity`. It is not counted toward `maxAttempts` and is
+  excluded from the circuit breaker. A lost child closes its in-flight attempt as `lost`, also uncounted. Rate-limit,
+  overload and usage-limit outcomes never count as failed attempts.
+- **Asserted facts (QA-0.1-23, -24).** The smoke asserts, for C10: persistent 429 and 529 produce no
+  `session.step.failed` and no terminal event within 75 s; the usage-limit retry hook receives `{retry: false}`;
+  response headers never reach the error, while `response.body` holds the provider's error JSON, so the reset time
+  is readable from the message and from the body text. Retry delays for persistent faults are recorded, not asserted
+  (observed 2.4–12 s despite `retry-after: 2`).
 
 **Rationale.** Limits are unknown and shared with the owner's other sessions (§0.6-11). A plan child stuck in host
 retries holds a slot forever unless the router can end it.
@@ -548,7 +571,7 @@ retries holds a slot forever unless the router can end it.
 ### D14 — Launcher (C14 holds: launcher A)
 
 **Decision.** The executor launches plan tasks itself through the router's child runner (`src/compat/v2-client.ts`
-≈96-236). No orchestrator turn is spent per task. Launcher B (dispatch by reference) is not built.
+≈96-236). No orchestrator turn is spent per task. Launcher A is the only launcher.
 
 - **Mechanism.** The runner calls the native `subagent` tool, found through `ctx.tool.list()`, with the context
   retained from the bound orchestrator's latest router tool call.
@@ -579,7 +602,8 @@ retries holds a slot forever unless the router can end it.
 - Every pinned C14 and C14b check used exactly this configuration (`launchContext.signalReplaced=true`,
   `progressReplaced=true`; `cpx-probe-plugin.js` ≈493-511).
 - A launch with the retained signal itself completed in the C14 signal host. That is recorded, not pinned, and it ran
-  only right after the capture turn; the retained `progress` was never exercised. Neither is used.
+  only right after the capture turn; the retained `progress` was never exercised. Launches never use the retained
+  context's `signal` and never forward `progress` (QA-0.1-25): an orchestrator interrupt must not abort plan children.
 
 **The executor does the dispatch-time work itself.** A retained launch fires no `subagent` hook. The executor therefore
 calls, directly, the functions the `subagent` hook path uses:
@@ -602,6 +626,9 @@ calls, directly, the functions the `subagent` hook path uses:
 - **Fail closed.** The child's first context hook runs before its first tool call (`C14/D14`). There, a child whose
   prompt carries a plan task header `[plan <planId>:<taskId>#<attempt>]` but has no binding is refused every tool call.
   The header goes after the shared plan-context block, so children of one role still share the provider cache.
+- **Prompt order (QA-0.1-21).** The launched prompt is PLAN CONTEXT → launch header
+  `[plan <planId>:<taskId>#<attempt>]` → TASK. The route line, `VERIFY` and the acceptance block are consumed by the
+  executor and are not sent verbatim.
 - From then on, guards, grants and leases apply to the child as to any child.
 
 **Refreshing the retained context.**
@@ -663,7 +690,7 @@ range as `maxParallel` (D13).
 - a `manual` or `preflight` task entering `ready` (once);
 - a stale launch context (D14, guard 3).
 
-The plan's "(launcher B) ready work" wake does not exist.
+There is no wake for ready work: launcher A launches it directly.
 
 - **Channel.** Wakes are posted from the plugin with `ctx.session.synthetic({sessionID, text, description, metadata,
   resume: true})`. This wakes an idle parent (`O6b/D15`; also from the client, `O6/D15`).
@@ -731,7 +758,7 @@ when it is opened.
 ### D19 — v1 inert
 
 **Decision.** Nothing in this ADR changes v1 behaviour or output. Every registration is gated on `ctx.routerHost ===
-"v2"`. On v1, a configured `routing.background.*`, `routing.leases.*`, `routing.promptCache.*` or `routing.executor.*`
+"v2"`. On v1, a configured `routing.background.*`, `routing.leases.*` or `routing.executor.*`
 key logs one notice per process (plan §0.10-8).
 
 **Alternative rejected.** Porting to v1 violates the feature freeze (AGENTS.md, "Host support policy").
@@ -755,12 +782,12 @@ Each phase implements only the branch named here (plan §0.2).
 
 | Topic | Phase | Branch implemented |
 |---|---|---|
-| C5/D4: tail and breakpoint hint | 1.2 | The tail is a new last `user` message, regenerated per request and never persisted. `cache: {type: "ephemeral"}` (plus `ttlSeconds: 3600` under D5) goes on a copy of the last text part of the last real message; O12 fallback; children get no tail and no hint. `test/smoke/cpx-cache-prefix.smoke.test.ts` asserts: the message breakpoint is on the last real message and never on the tail; consecutive requests are identical through the previous request's last real message except for the moved `cache_control` object; the previous tail is absent. |
-| C6/D5: TTL | 1.2 | `routing.promptCache.ttl` (`auto`/`5m`/`1h`, default `auto`), with its `CONFIG_REFERENCE.md` row and docs-drift pin. While the TTL resolves to `1h`, `ttlSeconds: 3600` goes on a copy of the last system part and on the D4 hint, and is emitted only after O11 is recorded. |
-| C9/D7: leases | 1.3, 2.1 | Leases in the tool hooks: refusal in `execute.before`, rewriting of `glob`/`grep` results in `execute.after`. Argument keys per the D7 table (`router_run` from the router's own schema; `list`, `multiedit`, `patch`, `apply_patch` unobserved). Unextractable write-class targets are refused for children under a foreign lease. `shell` and `execute` are documented as not covered. |
+| C5/D4: tail and breakpoint hint | 1.2 | The tail is a new last `user` message, regenerated per request and never persisted. `cache: {type: "ephemeral"}` (no TTL; D5 is withdrawn) goes on a copy of the last non-blank text part of the last real message, else on its last `tool-result` or `media` part, else no hint (O12); children get no tail and no hint. `test/smoke/cpx-cache-prefix.smoke.test.ts` asserts: the message breakpoint is on the last real message and never on the tail; consecutive requests are identical through the previous request's last real message except for the moved `cache_control` object; the previous tail is absent. |
+| C6/D5: TTL | 1.2 | Not applicable: D5 is withdrawn on v2.0.26 (QA-0.1-17). No `routing.promptCache.ttl` key, no TTL hint, and the system array is never changed. |
+| C9/D7: leases | 1.3, 2.1 | Leases in the tool hooks: refusal in `execute.before`, rewriting of `glob`/`grep` results in `execute.after`. Argument keys per the D7 table (`router_run` from the router's own schema; `list`, `multiedit`, `patch`, `apply_patch` unobserved). Unextractable write-class targets are refused for children under a foreign lease. The host's `router_git_*` tools take a `path` argument and need `gitRoot`. Read, search and run restrictions apply to another child session only, never to a root session; ownership is the task (`taskRef`). `shell` and `execute` are documented as not covered by leases. |
 | C10/D13: capacity | 1.1, 2.1, 3.1 | 1.1: timing row `capacity` and recorder `onCapacitySignal`. 2.1: `session.retry.scheduled` and `session.step.failed` feed it. 3.1: the controller (provider from the preceding `session.step.started`, quota pause with message instant or `capacityPauseMs`, by-status fallback) and the `session.hook("retry")` stop for plan children. |
 | C11 | none | Pinned because the router's `execute.before` changes to `subagent` arguments must not enter the parent's history (cache stability). |
-| C14/D14: launcher | 1.4, 3.1 | 1.4: `TaskLauncher` is launcher A only; `Attempt.outcome` gains `capacity`; `lost` and `capacity` attempts do not count toward `maxAttempts`. 3.1: awaited native `subagent` launches from the retained router-tool context with an executor-owned signal and a record-only progress; explicit agent, model, grant and work-root binding at `onCreated`; fail-closed check in the child's first context hook; decision row and timing start written by the executor; the six guards. No launcher B code or types. |
+| C14/D14: launcher | 1.4, 3.1 | 1.4: `TaskLauncher` is launcher A only; `Attempt.outcome` gains `capacity`; `lost` and `capacity` attempts do not count toward `maxAttempts`. 3.1: awaited native `subagent` launches from the retained router-tool context with an executor-owned signal and a record-only progress; explicit agent, model, grant and work-root binding at `onCreated`; fail-closed check in the child's first context hook; decision row and timing start written by the executor; the six guards. Launcher A is the only launcher; there is no other launcher code or types. |
 | C13/C14: concurrency | 1.4, 3.1, 4.1 | `maxParallel` default 4, valid range 1–8; per-provider capacity within it. |
 | C4/C15/D3: held results | 2.1 | Held results are possible and built. The substring matcher runs in the context and compaction hooks. The verdict is posted with plugin `ctx.session.synthetic(…, resume: true)`. The Phase 2.1 smoke asserts a held completion in the latest turn at compaction (O13) and the verdict entry reaching a busy parent. |
 | C12/C7/D16: recovery | 2.1, 4.2 | `ctx.session.context({sessionID: child})`: a last message `{type: "idle", outcome}` means finished, and the result comes from the last `assistant` message, else from the parent's completion body. A child neither finished nor active is re-queued as `lost`, not counted. Pending verifications are persisted (P5); processing dedupes against the persisted store. Cancellation uses `ctx.session.interrupt({sessionID})`. |
@@ -777,8 +804,8 @@ ADR's status, and 6.2.0 records the retained-context age proven under DF-2.
 
 ## Open observations
 
-Each open item keeps the conservative branch chosen above until its assertion is pinned in `smoke:cpx` (or, for O11 and
-O15, recorded against the real provider).
+Each open item keeps the conservative branch chosen above until its assertion is pinned in `smoke:cpx` (or, for O15 and
+O11(b), recorded against the real provider).
 
 **Resolved and pinned (round 1):**
 
@@ -813,13 +840,13 @@ O15, recorded against the real provider).
   downtime, and a completion stored but not delivered at the kill, are unobserved. D2's persisted dedupe and D16's
   re-queue cover them.
 - **O11 — Provider-side cache behaviour.**
-  - (a) Whether the real provider accepts a 1-hour marker after the host's 5-minute markers on `$.tools[17]` and
-    `$.system[0]`. The provider documents that longer TTLs must come first; the scripted front does not check. This
-    gates D5 and closes in Phase 1.2 (a keyed request) or the first DF session.
+  - (a) **Not applicable (QA-0.1-17, -18).** D5 is withdrawn, so no real-provider gate is needed; the "or the first DF
+    session" way of closing it is moot.
   - (b) Whether moving the D4 hint between requests yields cache reads. Phase 6.1 measures it (orchestrator cache-read
     share).
-- **O12 — Hint on a last real message without a text part** (a tool result). Whether `cache` on such a part reaches the
-  wire is unobserved; D4's fallback applies. Phase 1.2's smoke observes it.
+- **O12 — Hint on a last real message without a text part** (a tool result). Observed on v2.0.26 (`cpx-cache-prefix`
+  smoke): the `tool_result` block carries the marker, so D4's hint target applies (last non-blank text part, else last
+  `tool-result` or `media` part, else no hint; never an earlier message).
 - **O13 — A held completion in the latest turn at compaction.** The host keeps the latest turn out of the compaction
   request and carries it as `recent` text. Whether that text reaches later requests through the context hook is
   unobserved (`realCompletion.contextHookCallsAfterCompact=0`). D3's substring matcher is the conservative branch;
@@ -853,7 +880,7 @@ O15, recorded against the real provider).
   completion, including for user-backgrounded calls (P1–P3).
 - Required verification runs in parallel, and the model never reads output that is not yet verified (D3).
 - The orchestrator's history up to the last real message has the same text on every request (D4). The tail stays out
-  of every cache entry. Once O11 is closed, a 1-hour TTL can cover long background waits (D5).
+  of every cache entry.
 - Launcher A runs plan tasks with no orchestrator turn per task. Its children run on the requested agent and model and
   are guarded, granted and leased like any child (C14, router enforced).
 - Leases refuse concurrent reads and writes of a leased file through file tools, and hide leased files from search.
@@ -864,14 +891,14 @@ O15, recorded against the real provider).
 
 ### Negative
 
-- **1-hour cache is gated.** Until O11 is recorded, the orchestrator pays a full cache write on wake-up after an idle
-  gap longer than the 5-minute lifetime. If the provider rejects the marker layout, that stays the case.
+- **No 1-hour cache (D5 withdrawn).** The orchestrator pays a full cache write on wake-up after an idle gap longer than
+  the 5-minute lifetime, until a host lets plugins set the tools breakpoint TTL.
 - **The cache benefit of the moving hint is unmeasured.** It rests on the provider's documented lookup of earlier
-  breakpoints and is measured only in Phase 6.1. Requests whose last real message is a tool result use an earlier
-  breakpoint until O12 is observed.
+  breakpoints and is measured only in Phase 6.1. When the last real message is a tool result, the hint goes on its
+  `tool-result` part (O12, observed).
 - **Restarts lose children in flight** (C12). Their work is re-run and their spend is lost.
 - **Launcher A's context validity is proven only for 60 s.** Longer validity rests on guards and telemetry. A stale
-  context costs one orchestrator wake: B's cost, for that launch only.
+  context costs one orchestrator wake, for that launch only.
 - **Two dispatch paths.** Retained launches bypass the `subagent` hook path (no decision row), so the executor must
   call the same dispatch-time functions itself, and the two paths must be kept consistent.
 - **An orchestrator interrupt no longer stops background or retained work** (O4a, O4b). Stopping is explicit:
@@ -902,3 +929,21 @@ O15, recorded against the real provider).
   - "Resolved" items are now pinned (QA-0.1-4).
   - Departures from the plan (D5, D4 hint, C10 branch, D6 `capacity` and age, D13 range 1–8, launcher A only, D15 wakes,
     attempt counting) are applied by plan amendment A-0.1-2 (QA-0.1-8).
+- **2026-10-11** — QA round 2 of Phase 0.1 and the Phase 1.2–1.4 memos. Changes, applied to the plan by amendments
+  A-0.1-3, A-1.2-1, A-1.3-1, A-1.4-1 and A-1.1-1:
+  - D5 is withdrawn on OpenCode v2.0.26; O11(a) is not applicable (QA-0.1-17, -18).
+  - `provider.quota`, and host-ended `provider.rate-limit` / `provider.internal`, close an attempt as `capacity`; a lost
+    child's in-flight attempt closes as `lost`; neither counts toward `maxAttempts` (QA-0.1-20).
+  - Launcher-A prompt order is PLAN CONTEXT → launch header → TASK (QA-0.1-21); launcher B leftovers are removed
+    (QA-0.1-22); launches never use the retained `signal` or `progress` (QA-0.1-25).
+  - D7 lists the `router_git_*` tools and states that `shell`/`execute` are not covered by leases (QA-0.1-26); read,
+    search and run restrictions apply to child sessions only, and lease ownership is the task (Phase 1.3).
+  - The retry-hook stop and quota retry-hook calls are capacity signals (QA-0.1-27).
+  - Facts the smoke only recorded are now asserted (QA-0.1-23, -24): C5 marker count ≤ 4 with exactly one message
+    marker; C6 per request; C10 persistent faults (no `session.step.failed` or terminal event within 75 s for 429 and
+    529), the usage-limit retry hook receiving `{retry: false}`, response headers never reaching the error while
+    `response.body` carries the provider's error JSON; C12 delivered exactly once in the last parent request and by a
+    new process after the restart; C13 non-empty children; C14 duplicate-read refusals (5 of 6 per child) and a
+    decision-row positive control. Retry delays for persistent faults are recorded, not asserted.
+  - D4's hint target is the last non-blank text part of the last real message, else its last `tool-result` or `media`
+    part, else no hint (QA-1.2-12, -16; O12 observed).

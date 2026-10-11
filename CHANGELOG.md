@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **OpenCode v2: `/router stats` shows a "Dispatch durations" table and an "Orchestrator cache-read share" line** when
+  timing logs exist. The logs are written once the router wires the timing recorder.
+
+### Changed
+
+- **OpenCode v2: per-turn router state moves out of the system prompt.** The pending-verification list, late
+  verification notices and the route hint are delivered in a per-turn `<router-state>` message appended after the
+  conversation, so the system prompt stays byte-stable across turns. Late notices are repeated every turn until
+  `router_verify` reads them. OpenCode v1 is unchanged.
+
 ## [2.7.0] - 2026-10-10
 
 ### Added
