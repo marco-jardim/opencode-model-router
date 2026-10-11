@@ -263,15 +263,15 @@ describe("role dispatch path", () => {
     expect(row.chosen.origin).toBe("role");
   });
 
-  it("root= outside the session's worktrees: no work root, a note, write withheld — and no filesystem call on it", async () => {
+  // Q9: FLIPPED ON PURPOSE — the dispatch used to run with no work root, a note and write withheld; a declared target that was
+  // refused now refuses the dispatch with the note.
+  it("root= outside the session's worktrees: the dispatch is refused with the note — and no filesystem call on it", async () => {
     const world = makeWorld({ delegation: "roles", engine: "static" });
     const input = { agent: "implementer", prompt: `[route class=implement risk=low scope=single needs=edit root=${world.outside}]\nchange x` };
-    const outcome = await world.router.route(call(world, input));
-    const role = outcome.role!;
-    expect(role.workRoot).toBeNull();
-    expect(role.requestedRoot).toBe(world.outside);
-    expect(role.notes.some((note) => note.includes("neither the session directory nor a worktree"))).toBe(true);
-    expect([...role.grant.actions]).not.toContain("edit");
+    const refusal = await world.router.route(call(world, input)).catch((error: unknown) => error);
+    expect(refusal).toBeInstanceOf(RoleDispatchRefusal);
+    expect((refusal as RoleDispatchRefusal).reason).toContain("neither the session directory nor a worktree");
+    expect((refusal as RoleDispatchRefusal).message).toMatch(/^\[router\] role dispatch @implementer refused: /);
     expect(world.realpath).not.toHaveBeenCalledWith(world.outside);
   });
 
@@ -613,9 +613,33 @@ describe("role dispatch header (P2g, OD6)", () => {
       maxOf: (name) => roleMaxActions(resolveRoles(world.cfg, "v2").get(name)),
     });
 
-  it("fresh: canonical work root, route line gone, nonce last, child binds exact", async () => {
+  // Q8 (I9): the header is emitted only when relevant. No repoParents, no repo=/branch=/root= and a work root equal to the session
+  // directory: the prompt is the route-stripped text + the nonce line, byte for byte (no header).
+  it("Q8: nothing declared, no repoParents, work root = session directory: no header, child binds exact", async () => {
     const world = makeWorld({ delegation: "roles", engine: "static" });
     const input = { agent: "explorer", prompt: "[route class=search risk=low scope=single]\nfind where the config is loaded", description: "find loader" };
+    const c = call(world, input);
+    const outcome = await world.router.route(c);
+    const role = outcome.role!;
+    expect(role.workRoot).toBe(world.main);
+    expect(outcome.prompt!.startsWith(DISPATCH_HEADER_PREFIX)).toBe(false);
+    expect(outcome.prompt).toBe(`find where the config is loaded\nOMR_NONCE=${role.nonce}`);
+    world.router.commit(c.callID, applied(input, outcome));
+    expect((await bindsExact(world, "child-h0", outcome, "explorer")).kind).toBe("exact");
+  });
+
+  it("Q8: routing.repoParents set: the header is emitted even when the route line declares nothing", async () => {
+    const parent = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-q8-parent-")));
+    cleanups.push(async () => rmSync(parent, { recursive: true, force: true }));
+    const world = makeWorld({ delegation: "roles", engine: "static", repoParents: [parent] });
+    const outcome = await world.router.route(call(world, { agent: "explorer", prompt: "[route class=search risk=low scope=single]\nfind x" }));
+    expect(outcome.prompt!.startsWith(`${DISPATCH_HEADER_PREFIX}explorer. Execute this dispatch yourself.\n\n`)).toBe(true);
+    expect(stripDispatchHeader(outcome.prompt!)).toBe(`find x\nOMR_NONCE=${outcome.role!.nonce}`);
+  });
+
+  it("fresh: canonical work root, route line gone, nonce last, child binds exact (root= declared)", async () => {
+    const world = makeWorld({ delegation: "roles", engine: "static" });
+    const input = { agent: "explorer", prompt: `[route class=search risk=low scope=single root=${world.main}]\nfind where the config is loaded`, description: "find loader" };
     const c = call(world, input);
     const outcome = await world.router.route(c);
     const role = outcome.role!;
@@ -670,11 +694,11 @@ describe("role dispatch header (P2g, OD6)", () => {
 
   it("none: null work root, researcher, delegate, non-exact resume, dispatchHeader:false", async () => {
     const hasHeader = (prompt: string | undefined): boolean => prompt !== undefined && prompt.startsWith(DISPATCH_HEADER_PREFIX);
-    // a null work root (root= outside the session's worktrees)
+    // Q9 (FLIPPED ON PURPOSE: a root= outside the session's worktrees used to give a null work root and no header; the dispatch is
+    // now REFUSED with the note, see "root= outside the session's worktrees" above)
     const world = makeWorld({ delegation: "roles", engine: "static" });
-    const nowhere = await world.router.route(call(world, { agent: "implementer", prompt: `[route class=implement risk=low scope=single needs=edit root=${world.outside}]\nchange x` }));
-    expect(nowhere.role!.workRoot).toBeNull();
-    expect(hasHeader(nowhere.prompt)).toBe(false);
+    await expect(world.router.route(call(world, { agent: "implementer", prompt: `[route class=implement risk=low scope=single needs=edit root=${world.outside}]\nchange x` })))
+      .rejects.toBeInstanceOf(RoleDispatchRefusal);
     // a role without read, glob or grep
     const researcher = await world.router.route(call(world, { agent: "researcher", prompt: "[route class=research risk=low scope=single]\nlook up x" }));
     expect(["read", "glob", "grep"].some((action) => researcher.role!.grant.actions.has(action as never))).toBe(false);
@@ -699,7 +723,9 @@ describe("role dispatch header (P2g, OD6)", () => {
   });
 
   it("a header the orchestrator copied from another dispatch is replaced by the router's (QA round 1 #11)", async () => {
-    const world = makeWorld({ delegation: "roles", engine: "static" });
+    const parent = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-q8-copied-")));
+    cleanups.push(async () => rmSync(parent, { recursive: true, force: true }));
+    const world = makeWorld({ delegation: "roles", engine: "static", repoParents: [parent] }); // Q8: a header is emitted only when relevant
     const copied = buildRoleDispatchHeader({ agent: "implementer", workRoot: world.outside, edits: true });
     const outcome = await world.router.route(call(world, { agent: "explorer", prompt: `${copied}find where the config is loaded` }));
     const prompt = outcome.prompt!;

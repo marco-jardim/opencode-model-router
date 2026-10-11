@@ -176,8 +176,11 @@ named on the route line with `root=<absolute path>` (and repeated in ENVIRONMENT
 
 - **Resolution.** The `root=` text is normalised and compared with the session directory and with every entry of
   `git worktree list --porcelain` before any filesystem call on it; a match becomes its canonical long form. Anything
-  else gives **no work root**: the dispatch keeps local reads in the session directory, and `edit` and `router_run` are
-  withheld (note "no valid work root: write and run withheld").
+  else gives **no work root**, and a route line that declared `root=`, `repo=` or `branch=` and got none **refuses the
+  dispatch**: the task call fails with `[router] role dispatch @<agent> refused: <note>` and the child never runs in the
+  session directory instead. A dispatch that declared nothing is not refused (no declared target, no refusal); if it still has no work root, it keeps
+  local reads in the session directory, and `edit` and `router_run` are withheld (note "no valid work root: write and
+  run withheld").
 - **`edit` and `router_run` need a validated work root.** On a fresh dispatch, on a resume and through the
   [ladder](#dynamic-authority-and-the-ladder) alike, a dispatch without one gets neither; `edit` never falls back to
   the session or plugin directory (only the local reads do).
@@ -229,21 +232,26 @@ value gives no work root, see below):
 [route class=implement needs=edit repo=app-a branch=feat/login]
 ```
 
-`repo=` looks up `<parent>\<name>`, then `<parent>\*\<name>`. A name that matches several repositories, or a repository
-with several worktrees and no `branch=`, is refused and the candidates are listed. `root`, `repo` and `branch` must
+`repo=` looks up `<parent>\<name>`, then `<parent>\*\<name>`; `<name>` is a repository name, or the directory name of
+one of its linked worktrees below the parents (that worktree is the work root; with `branch=`, the worktree of its
+repository on that branch). A name that matches several repositories or worktree directories (each listed as
+`<worktree path> (repository <name>, branch <branch>)`), or a repository
+with several worktrees and no `branch=`, refuses the dispatch and the candidates are listed. `root`, `repo` and `branch` must
 agree when given together. With parents set, the protocol tells the orchestrator: name another repository with
 `repo=<name>` (and `branch=<ref>` when it has several worktrees) instead of `root=`; each dispatch edits one
 repository, and a role may read the others below `routing.repoParents`. A routed role dispatch that has a work root and
 read access starts with a role header (`[router] You are @<role>. Execute this dispatch yourself.`), so the delegate is
-told where it works. A fresh dispatch gets the header, the work root, and, when the grant is located, the repository,
+told where it works. The header is emitted only when cross-repo is configured (`routing.repoParents` is set), the route
+line declares a target (`repo=`, `branch=` or `root=`), or the work root differs from the session directory; otherwise the
+role prompt is byte-identical to what it was before the header existed (invariant I9). A fresh dispatch gets the header, the work root, and, when the grant is located, the repository,
 branch and head: `Working directory: <root> (repository app-a, branch feat/login at 3f2c1a9). You are already there —
 do not ask permission to read or write inside it.` A read-only role is told `read` instead of `read or write`. With
 parents set, a second paragraph lists the session's repositories and where the role may read. The nonce line (or the
 carried `[acceptance]` block of a resume) stays the last line of the prompt. A resume gets the header only when its
 binding is exact, and without the head clause, which may be stale. A header the orchestrator copied from another dispatch
 is removed and replaced by the router's own. A read-only role's repositories paragraph says only where it may read. No
-header: no work root, no `read`/`glob`/`grep` (`researcher`), a delegate's dispatch, a non-exact resume, or
-`dispatchHeader: false` (which still sends the role name and the `Working directory:` paragraph when the work root is not
+header: no work root, no `read`/`glob`/`grep` (`researcher`), a delegate's dispatch, a non-exact resume, a dispatch for
+which the header is not relevant (see above), or `dispatchHeader: false` (which still sends the role name and the `Working directory:` paragraph when the work root is not
 the session directory).
 
 **Admission.** On a v2 roles dispatch, when parents are set or `repo=`/`branch=` is given, the work root is bound
@@ -266,8 +274,8 @@ grant's location and after the dispatch is registered; `branch=` alone still bin
 not grow it.
 
 **Invalid route fields.** An invalid or duplicated `repo=` or `branch=`, or one that conflicts between route lines,
-gives no work root and the note `<key>=<value> is not a valid repository name / branch name: no work root. Fix the
-route line.` Branch names follow `git check-ref-format`, so `renovate/foo+bar` and `feat/ação` are valid. Names,
+gives no work root, and so refuses the dispatch with the note `<key>=<value> is not a valid repository name / branch
+name: no work root. Fix the route line.` Branch names follow `git check-ref-format`, so `renovate/foo+bar` and `feat/ação` are valid. Names,
 branches and paths echoed in refusals are quoted when they contain unsafe characters; an invalid branch shows as
 `(unknown)`.
 

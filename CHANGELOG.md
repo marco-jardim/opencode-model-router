@@ -9,11 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Roles mode (cross-repo, #107, owner decision Q10): a route line's `repo=<name>` also matches a linked worktree whose directory name is `<name>` below `routing.repoParents`, and binds that worktree (with `branch=`, the worktree of its repository on that branch). A repository and a worktree directory sharing the name, or two such worktree directories of different repositories, are refused as ambiguous, each candidate listed as `<worktree path> (repository <name>, branch <branch>)`.
+
 - **Role dispatch header (OpenCode v2 roles mode; inert on v1) (#107).** A routed role dispatch with a work root and
   read access now starts with a short header naming the role, the work root and, when known, the repository, branch and
   head, so a role delegate is told where it works; the nonce line or carried acceptance block stays last. A header the
-  orchestrator copied from another dispatch is stripped and replaced by the router's own. No header for a delegate's
-  dispatch or a non-exact resume; with `dispatchHeader: false` there is no header either, except that a work root other
+  orchestrator copied from another dispatch is stripped and replaced by the router's own. The header is emitted only
+  when it is relevant (owner decision Q8, invariant I9): `routing.repoParents` is set, the route line declares `repo=`,
+  `branch=` or `root=`, or the work root differs from the session directory; otherwise the role prompt is unchanged. No
+  header for a delegate's dispatch or a non-exact resume; with `dispatchHeader: false` there is no header either, except that a work root other
   than the session directory still gets a minimal header (the identity and `Working directory:` paragraphs). The role
   work-root rule now points to the `Working directory:` line. A read-only role is told "You read only in your working
   directory." in the header wording, although its read set can also include the working set.
@@ -54,6 +58,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ignored. The verification perimeter is planned for every routed role dispatch with a work root whenever
   `routing.repoParents` is set, even without `repo=`; a pass shows `verified scope: …` and link targets are named
   `(not admitted)` or `(not observed)`.
+
+### Changed
+
+- **Roles mode (OpenCode v2; cross-repo, #107, owner decision Q9): a refused declared target refuses the dispatch.** When
+  a role dispatch's route line declares `repo=`, `branch=` or `root=` (or an invalid `repo=`/`branch=`) and the router
+  cannot bind a work root for it, the `task` call now fails with `[router] role dispatch @<agent> refused: <note>`
+  instead of running with no work root in the session directory. A dispatch that declares nothing, a delegate's
+  dispatch and a resume of an exactly bound child are unchanged.
 
 ### Removed
 

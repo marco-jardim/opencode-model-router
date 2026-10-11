@@ -117,6 +117,34 @@ describe("role dispatch header docs (P2g, OD6)", () => {
     expect(flat("docs/CONFIG_REFERENCE.md")).toContain("`dispatchHeader: false` also turns off the role header");
     expect(flat("docs/ROLES.md")).toContain("or `dispatchHeader: false`");
   });
+
+  // Q8 (D14): the role header follows I9 — only when relevant.
+  it("the role header is emitted only when relevant (ROLES, CONFIG_REFERENCE, design, CHANGELOG)", () => {
+    expect(flat("docs/ROLES.md")).toContain(
+      "The header is emitted only when cross-repo is configured (`routing.repoParents` is set), the route line declares a target (`repo=`, `branch=` or `root=`), or the work root differs from the session directory; otherwise the role prompt is byte-identical to what it was before the header existed (invariant I9).",
+    );
+    expect(flat("docs/CONFIG_REFERENCE.md")).toContain(
+      "The role header is emitted only when it is relevant (invariant I9): `routing.repoParents` is set, the route line declares `repo=`, `branch=` or `root=`, or the work root differs from the session directory; otherwise the role prompt carries no header.",
+    );
+    const design = flat("docs/design/cross-repo.md");
+    expect(design).toContain("- **Q8.** Decided 2026-10-11: the role dispatch header (OD6) follows I9.");
+    expect(design).toContain("| D14 | 2026-10-11 | Q8 decided: the role dispatch header follows I9.");
+    expect(design).not.toContain("pending the owner's reading of I9");
+    expect(flat("CHANGELOG.md")).toContain("The header is emitted only when it is relevant (owner decision Q8, invariant I9)");
+  });
+
+  // Q9 (D15): a refused declared target refuses the dispatch.
+  it("a refused declared target refuses the role dispatch (ROLES, design, CHANGELOG)", () => {
+    const roles = flat("docs/ROLES.md");
+    expect(roles).toContain("a route line that declared `root=`, `repo=` or `branch=` and got none **refuses the dispatch**: the task call fails with `[router] role dispatch @<agent> refused: <note>`");
+    expect(roles).toContain("A dispatch that declared nothing is not refused (no declared target, no refusal);");
+    expect(roles).not.toContain("Anything else gives **no work root**: the dispatch keeps local reads");
+    expect(roles).toContain("gives no work root, and so refuses the dispatch with the note `<key>=<value> is not a valid repository name / branch name: no work root. Fix the route line.`");
+    const design = flat("docs/design/cross-repo.md");
+    expect(design).toContain("- **Q9.** Decided 2026-10-11: a role dispatch whose route line declared `repo=`, `branch=` or `root=`");
+    expect(design).toContain("| D15 | 2026-10-11 | Q9 decided: a declared target");
+    expect(flat("CHANGELOG.md")).toContain("a refused declared target refuses the dispatch.**");
+  });
 });
 const undocumentedKeys = (doc: string, keys: readonly string[]) =>
   keys.filter((key) => !doc.includes(`\`${key}\``));

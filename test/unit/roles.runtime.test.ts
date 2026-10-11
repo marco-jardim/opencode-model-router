@@ -451,7 +451,9 @@ describe("role dispatch through the adapter (P2.1-C, P-5)", () => {
     expect(Object.hasOwn(tier.input, "background")).toBe(false);
   });
 
-  it("P2g: the role dispatch header reaches the child with and without a route line (v2)", async () => {
+  // Q8 (I9): FLIPPED ON PURPOSE — without routing.repoParents, a declared repo=/branch=/root= or a work root other than the session
+  // directory, the role prompt carries NO header (it used to start with `[router] You are @explorer.`).
+  it("Q8: no repoParents, no route target, work root = session directory: no header, the nonce line last (v2)", async () => {
     const { dir, cfg } = home(ROLES, { MODEL_ROUTER_ENFORCE: "0" });
     const { hooks } = await plugin(dir);
     const v2 = host(dir, cfg);
@@ -462,9 +464,39 @@ describe("role dispatch through the adapter (P2.1-C, P-5)", () => {
       const role = { sessionID: "root", agent: "build", messageID: `m${i}`, id: `p2g-c${i}`, tool: "subagent", input: { agent: "explorer", description: "find parser", prompt: `${prefix}Find the parser entry point` } as Record<string, unknown> };
       await v2.toolHooks["execute.before"](role);
       const prompt = String(role.input.prompt);
+      expect(prompt, `case ${i}`).not.toMatch(/^\[router\] You are @/);
+      expect(prompt, `case ${i}`).not.toContain("Working directory: ");
+      expect(prompt, `case ${i}`).toMatch(/^Find the parser entry point\n[\s\S]*OMR_NONCE=[A-Za-z0-9_-]{16,128}$/);
+    }
+  });
+
+  it("Q8: routing.repoParents set: the header reaches the child with and without a route line (v2)", async () => {
+    const { dir, cfg } = home({ ...ROLES, routing: { delegation: "roles", repoParents: [temp("omr-q8-parent-")] } }, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    const v2 = host(dir, cfg);
+    await v2.start(hooks, { isBypassed: () => false });
+    const prefixes = ["", "[route class=recon risk=low scope=single budget=6]\n", "[route class=debug risk=medium scope=multi budget=25]\n"];
+    for (const [i, prefix] of prefixes.entries()) {
+      const role = { sessionID: "root", agent: "build", messageID: `m${i}`, id: `q8-rp${i}`, tool: "subagent", input: { agent: "explorer", description: "find parser", prompt: `${prefix}Find the parser entry point` } as Record<string, unknown> };
+      await v2.toolHooks["execute.before"](role);
+      const prompt = String(role.input.prompt);
       expect(prompt, `case ${i}`).toMatch(/^\[router\] You are @explorer\. Execute this dispatch yourself\.\n\nWorking directory: /);
       expect(prompt, `case ${i}`).toContain("Find the parser entry point");
+      expect(prompt, `case ${i}`).toMatch(/\nOMR_NONCE=[A-Za-z0-9_-]{16,128}$/);
     }
+  });
+
+  it("Q8: a route line declaring root= gets the header even without repoParents (v2)", async () => {
+    const { dir, cfg } = home(ROLES, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    const v2 = host(dir, cfg);
+    await v2.start(hooks, { isBypassed: () => false });
+    const root = dir.replace(/\\/g, "/");
+    const role = { sessionID: "root", agent: "build", messageID: "m-root", id: "q8-root", tool: "subagent", input: { agent: "explorer", description: "find parser", prompt: `[route class=recon risk=low scope=single root=${root}]\nFind the parser entry point` } as Record<string, unknown> };
+    await v2.toolHooks["execute.before"](role);
+    const prompt = String(role.input.prompt);
+    expect(prompt).toMatch(/^\[router\] You are @explorer\. Execute this dispatch yourself\.\n\nWorking directory: /);
+    expect(prompt).toMatch(/\nOMR_NONCE=[A-Za-z0-9_-]{16,128}$/);
   });
 
   it("P2g: a repo=/branch= route line on a repository below routing.repoParents still gets the header (v2)", async () => {
@@ -517,6 +549,34 @@ describe("role dispatch through the adapter (P2.1-C, P-5)", () => {
     await v2.toolHooks["execute.before"](role);
     const prompt = String(role.input.prompt);
     expect(prompt).toMatch(/^\[router\] You are @explorer\. Execute this dispatch yourself\.\n\nWorking directory: /);
+    expect(prompt).toMatch(/\nOMR_NONCE=[A-Za-z0-9_-]{16,128}$/);
+  });
+
+  it("Q10: repo=<directory name of the session's linked worktree> branch=<its branch> gets the header of the owning repository (v2)", async () => {
+    const parent = temp("omr-q10-wt-");
+    const { execFileSync } = await import("node:child_process");
+    const main = join(parent, "lib-main");
+    mkdirSync(main, { recursive: true });
+    const git = (cwd: string, ...args: string[]): void => { execFileSync("git", args, { cwd, stdio: "ignore" }); };
+    git(main, "init", "-q", "-b", "master");
+    writeFileSync(join(main, "a.ts"), "x");
+    git(main, "add", "a.ts");
+    git(main, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init");
+    // The session directory is the linked worktree `lib-wt` (branch feat/x) of repository `lib-main`; the route line names the
+    // worktree by its directory name (`repo=lib-wt`), which resolves to the repository it belongs to.
+    const worktree = join(parent, "lib-wt");
+    git(main, "worktree", "add", "-q", "-b", "feat/x", worktree);
+    const { cfg } = home({ routing: { delegation: "roles", repoParents: [parent] } }, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(worktree);
+    const v2 = host(worktree, cfg);
+    await v2.start(hooks, { isBypassed: () => false });
+    const role = {
+      sessionID: "root", agent: "build", messageID: "m-q10", id: "q10-wt", tool: "subagent",
+      input: { agent: "explorer", description: "find parser", prompt: "[route class=recon risk=low scope=single repo=lib-wt branch=feat/x budget=6]\nFind the parser entry point" } as Record<string, unknown>,
+    };
+    await v2.toolHooks["execute.before"](role);
+    const prompt = String(role.input.prompt);
+    expect(prompt).toMatch(/^\[router\] You are @explorer\. Execute this dispatch yourself\.\n\nWorking directory: .*lib-wt.* \(repository lib-main, branch feat\/x at [0-9a-f]{7}\)/);
     expect(prompt).toMatch(/\nOMR_NONCE=[A-Za-z0-9_-]{16,128}$/);
   });
 
@@ -1010,11 +1070,11 @@ describe("QA round 1 (P2.1)", () => {
     expect(routedRoleOf("df1a")!.verifyRoot).toBe(root);
     expect(await route("df1b", `[route class=implement risk=low scope=single]\n${block("sub")}`)).toBe("deterministic");
     expect(await route("df1c", `[route class=implement risk=low scope=single]\n${block(join(root, ".."))}`)).not.toBe("deterministic");
-    // root= naming no worktree of this repository: no work root, so the gate cannot back a deterministic detection; it is
-    // verified in the canonical session directory (QA-P33F1-1-3).
-    expect(await route("df1d", `[route class=implement risk=low scope=single root=${join(root, "..")}]\n${block()}`)).not.toBe("deterministic");
-    expect(routedRoleOf("df1d")!.workRoot).toBeNull();
-    expect(routedRoleOf("df1d")!.verifyRoot).toBe(root);
+    // Q9 (FLIPPED ON PURPOSE: this dispatch used to run with no work root, verified in the canonical session directory,
+    // QA-P33F1-1-3): a root= naming no worktree of this repository is a declared target that was refused — the dispatch is refused.
+    await expect(route("df1d", `[route class=implement risk=low scope=single root=${join(root, "..")}]\n${block()}`))
+      .rejects.toThrow(/role dispatch @implementer refused: root=.*neither the session directory nor a worktree/);
+    expect(routedRoleOf("df1d")).toBeUndefined();
     // QA-P33F1-1 nit 3: the call's own cwd argument wins over the block's cwd:, exactly as in the after-hook.
     expect(roleGateOutsideWorkRoot(root, block(), "", join(root, ".."))).toBe(true);
     expect(roleGateOutsideWorkRoot(root, block(join(root, "..")), "", root)).toBe(false);

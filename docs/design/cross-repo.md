@@ -189,7 +189,7 @@ Allow once = this dispatch only. Allow always = until it expires. Reject = no wo
 - **I6 — Reference exactness.** A package link in a linked `node_modules` whose real path is outside the repository (and is not a package store: a real path whose parent is `node_modules` or `node_modules/@scope`), or is the repository root or an ancestor (`root-link`), makes the reference approximate unless it is pinned (Phase 2). An approximate reference never excuses a failure (`baseline.ts:162-165`).
 - **I7 — Branch continuity.** W's branch at return equals its branch at dispatch. At `router_verify`, it equals its branch at return. A HEAD that moved by commits on the same branch is handled as today (`wiring.ts:1118-1140`). A carried role attempt is compared with the tree of the attempt that introduced its acceptance block; the reflog window applies within one dispatch and between return and router_verify.
 - **I8 — Scoped pass.** When `routing.repoParents` is configured, a pass's evidence names P (repository, branch, short HEAD) and every link target that was not observed.
-- **I9 — Inert by default.** Without `routing.repoParents` and without approvals, the protocol text, dispatch header, banners and goldens are byte-identical. On v1 the new keys are inert, with one notice (`touched`, `config.ts:3215-3216`).
+- **I9 — Inert by default.** Without `routing.repoParents` and without approvals, the protocol text, dispatch header, banners and goldens are byte-identical. The role dispatch header follows I9 (Q8, D14): it is emitted only when cross-repo is configured, a target is declared, or the work root differs from the session directory. On v1 the new keys are inert, with one notice (`touched`, `config.ts:3215-3216`).
 - **I10 — Reads never widen writes.** Read authority never widens write authority or the change baseline.
 - **I11 — Admission.** `routing.repoParents`, `routing.repoDepth`, `routing.repoExclude` and `routing.repoApprovalDays` are global-layer only. Parents are literal, absolute, canonical long-form directories: no glob, no `.` or `..`, no 8.3 segment, no UNC or device path. A directory is admitted only by git (top-level equality, depth 1..N below a parent, never the parent, canonical form stays below the parent), as a worktree that an admitted repository lists, or by a valid first-use approval (I16, I17). Text comparison comes before every filesystem call on a path outside the parents, except composing a first-use approval prompt.
 - **I12 — Where git runs.** The router runs git only in admitted repositories, the session repository and its worktrees, and (Phase 4) in a candidate for a first-use approval prompt. A link target outside them is not snapshotted: it is reported as "not observed" and is never pinned.
@@ -221,6 +221,7 @@ An invalid `branch=` or `repo=` gives no work root and a note. The router never 
 | `root` | as today, plus admission (section 3) |
 | `repo` | The repository's only worktree. With several worktrees: refused with the "worktree → branch" list. |
 | `repo` + `branch` | the worktree of `repo` that has `refs/heads/<branch>` checked out |
+| `repo` = directory name of a linked worktree (D16, Q10) | That worktree, found as `<parent>\<name>` or `<parent>\*\<name>`. With `branch`: the worktree of the repository it belongs to on that branch, whatever its directory is called. A repository named `<name>` and a worktree directory `<name>` of another repository, or two such directories of different repositories, are refused as ambiguous, each listed as `<worktree path> (repository <name>, branch <branch>)`. |
 | `branch` | the session repository's worktree on that branch |
 | `root` + `branch` / `root` + `repo` / all three | All declarations must agree; otherwise no work root and a note with the agreeing values. |
 
@@ -561,7 +562,7 @@ After QA rounds 1 and 2 (facts checked at HEAD effcdb3):
   - Placements are resolved with the read set at return, while dispatch-time detection uses the read set at dispatch, so a working set that changes in between can make them disagree (the gate is authoritative).
   - Pins are freed after the first gate, so a retry gate of the same dispatch treats links as approximate (fails safe).
   - A gate deadline that fires mid-scan is only tested with a pre-aborted signal.
-  - The role header is emitted for every roles user with a work root, pending the owner's reading of I9 (see Q8).
+  - The role header was emitted for every roles user with a work root; resolved by Q8 (D14): it is emitted only when relevant.
 - **Known follow-ups (Phase 2 QA round 2, minor), accepted for now:**
   - m1: A copied router header is stripped only when the router adds its own header. It is not stripped with `dispatchHeader: false` and W equal to the session directory, without read access, or on a non-exact resume.
   - m2: Stripping a copied header removes everything up to the first `\n\n---\n\n`. A partial header without its separator, followed by a markdown rule, can cut the task text.
@@ -589,7 +590,9 @@ After QA rounds 1 and 2 (facts checked at HEAD effcdb3):
 - **Q5.** Approval defaults: 14 days after last use and a 90-day cap. Should an approval offer a read-only variant (R only, never W)?
 - **Q6.** Same-branch history rewrite across a roles lineage: carried attempts compare names and heads only.
 - **Q7.** Make the router's generated external_directory catch-all `ask` instead of `deny`, so the router decides (owner call; a background child could wait on a prompt if the hook does not run).
-- **Q8.** I9 says routing output is unchanged when cross-repo is not configured; the role dispatch header (OD6) is emitted for every roles-mode dispatch with a work root. Keep it always on, or only when `routing.repoParents` is set, `repo=`/`branch=`/`root=` is used, or the work root differs from the session directory?
+- **Q8.** Decided 2026-10-11: the role dispatch header (OD6) follows I9. It is emitted only when `routing.repoParents` is set, the route line declares `repo=`, `branch=` or `root=`, or the work root differs from the session directory; otherwise the role prompt is byte-identical to what it was before the header existed (D14).
+- **Q9.** Decided 2026-10-11: a role dispatch whose route line declared `repo=`, `branch=` or `root=` (or an invalid `repo=`/`branch=`) and whose work root was refused is refused: the `task` call fails with `[router] role dispatch @<agent> refused: <note>`. It no longer runs with no work root in the session directory. A dispatch that declares nothing is unchanged (D15).
+- **Q10.** Decided 2026-10-11: `repo=` also matches the directory name of a linked worktree below the parents; a name shared by a repository and a worktree directory is ambiguous (D16).
 
 **To verify during implementation**
 - That the host's `*` matches across separators on the installed version.
@@ -616,6 +619,9 @@ After QA rounds 1 and 2 (facts checked at HEAD effcdb3):
 | D11 | 2026-10-10 | The approval prompt is composed by the router from git; approvals come only from a human reply, are bound to repository identity and expire (I16, I17). |
 | D12 | 2026-10-10 | P0.1 fails closed for any outside path a write tool touched; no temp-directory exemption. |
 | D13 | 2026-10-10 | Hook-level allow approved (Q4): in a role session with an exact binding, the router lifts the host's `ask` to `allow` for `external_directory` resources inside the grant's W or R; a configured `deny` stays final (I18). This replaces the rule that the router only narrows role decisions (`v2-hooks.ts:1257`). |
+| D14 | 2026-10-11 | Q8 decided: the role dispatch header follows I9. It is emitted only when `routing.repoParents` is set, the route line declares `repo=`/`branch=`/`root=`, or the work root differs from the session directory (`dispatch.ts`, `headerRelevant`); `dispatchHeader: false` keeps its minimal-header exception. Without any of these the role prompt is unchanged. |
+| D15 | 2026-10-11 | Q9 decided: a declared target (`repo=`, `branch=`, `root=`, or an invalid `repo=`/`branch=`) whose binding was refused refuses the role dispatch with `RoleDispatchRefusal(agent, note)`; the task call fails with `[router] role dispatch @<agent> refused: <note>`. A dispatch that declared nothing, a delegate's dispatch and a resume of an exactly bound child are unchanged. |
+| D16 | 2026-10-11 | Q10 decided: `repo=<name>` also matches a linked worktree whose directory name is `<name>` below `routing.repoParents` (`createAdmission` lookup/resolve). It binds that worktree; with `branch=`, the worktree of the repository it belongs to on that branch. A repository and a worktree directory sharing the name, or two such directories of different repositories, are refused as ambiguous with each candidate listed. |
 
 ## 12. Alternatives considered
 

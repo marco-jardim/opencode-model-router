@@ -1246,17 +1246,13 @@ describe("work roots (I3, P-13): the dispatch's own worktree only", () => {
     expect(named.text).toContain("[router \u2713 verified: deterministic]");
     expect(named.text).not.toMatch(/outside this role dispatch's work root/);
 
-    // 1-3: a root= that is no worktree → no work root; verified in the canonical session directory: the outside cwd: is
-    // refused, never deferred, and nothing runs in it.
-    const nullRoot = await dispatch(v2, sessions, "nr1", "k2", "implementer",
-      `[route class=implement risk=low scope=single needs=edit root=${other}]\nDo it\n[acceptance]\ncwd: ${other}\ncheck: testsPass\n[/acceptance]`, main, "null root");
-    expect(routedRoleOf("nr1")!.workRoot).toBeNull();
-    expect(routedRoleOf("nr1")!.verifyRoot).toBe(main);
-    expect(routedRoleOf("nr1")!.detection).not.toBe("deterministic");
-    const refused = await finish("nr1", "k2", nullRoot);
-    expect(refused).toMatch(/outside this role dispatch's work root/);
-    expect(at("start", "nr1")).toEqual([main]);
-    expect(at("prepare", "nr1")).toEqual([main]);
+    // 1-3 / Q9 (FLIPPED ON PURPOSE: a root= that is no worktree used to give no work root, verified in the canonical session
+    // directory with the outside cwd: refused): the declared target was refused, so the dispatch itself is refused; nothing runs.
+    await expect(dispatch(v2, sessions, "nr1", "k2", "implementer",
+      `[route class=implement risk=low scope=single needs=edit root=${other}]\nDo it\n[acceptance]\ncwd: ${other}\ncheck: testsPass\n[/acceptance]`, main, "null root"))
+      .rejects.toThrow(/\[router\] role dispatch @implementer refused: root=.*neither the session directory nor a worktree/);
+    expect(routedRoleOf("nr1")).toBeUndefined();
+    expect(at("start", "nr1")).toEqual([]);
     expect(at("defer", "nr1")).toEqual([]);
 
     // nit 2: a deferred role dispatch is captured and deferred in its worktree, not the session directory.
@@ -1709,33 +1705,19 @@ describe("P3.3 global QA round 1 (QA-G-B-2, QA-G-A1-2)", () => {
     expect(decide("read", [join(session, "a.ts")]).allow).toBe(true); // local reads keep the fallback
   });
 
-  it("QA-G-B-2: root= that is no worktree → the ladder refuses edit; even a request on record never widens; evaluate and the tool call refuse", async () => {
+  // Q9 (FLIPPED ON PURPOSE): this test dispatched with a root= that is no worktree to get a child bound WITHOUT a work root, and
+  // checked that the ladder, `evaluate` and the tool call refuse its edit. That dispatch is now refused, so such a child can no
+  // longer be created through the router; the no-work-root decision itself stays pinned by the previous test.
+  it("QA-G-B-2 / Q9: root= that is no worktree → the dispatch is refused with the note; nothing is routed", async () => {
     const { dir, cfg } = home(ROLES);
     const hooks = await plugin(dir);
     const sessions: Sessions = {};
     const v2 = host(dir, cfg, sessions);
     await v2.start(hooks);
     const other = temp("omr-g-other-");
-    await dispatch(v2, sessions, "n1", "gn", "general", `[route class=other risk=low scope=single root=${other}]\nlook at the parser`, dir);
-    expect(routedRoleOf("n1")!.workRoot).toBeNull();
-    expect([...routedRoleOf("n1")!.grant.actions]).toEqual(["read", "glob", "grep", "router_git"]);
-    expect(await catalog(v2, "gn", "general")).toContain("router_request_authority");
-    expect(kindOf(cfg, "gn")).toBe("exact");
-    await toolCall(v2, "gn", "general", "read", { path: join(dir, "a.ts") }); // a granted call (local reads keep the fallback root)
-    const tools = hooks.tool as Record<string, { execute: (args: unknown, ctx: unknown) => Promise<string> }>;
-    expect(await tools.router_request_authority!.execute({ actions: ["edit"], reason: "the fix needs an edit" }, toolCtx("gn")))
-      .toMatch(/^Refused: edit \(router_run and edit need a work root bound to this dispatch/);
-    expect(requestedAuthority("gn")).toBeUndefined();
-    plant(cfg, "gn", other);
-    await v2.toolHooks["execute.after"]!(parentCall("n1", "gn", "general", "ESCALATE: authority\nedit is needed"));
-    const resume = { sessionID: "root", agent: "build", messageID: "m", id: "n2", tool: "subagent", input: { agent: "general", sessionID: "gn", prompt: "continue" } as Record<string, unknown> };
-    await v2.toolHooks["execute.before"]!(resume);
-    expect([...routedRoleOf("n2")!.grant.actions]).not.toContain("edit");
-    const maxOf = (agent: string) => roleMaxActions(resolveRoles(cfg, "v2").get(agent));
-    expect(currentBinding("gn", { maxOf })!.grant.actions.has("edit")).toBe(false);
-    const file = join(dir, "a.ts");
-    expect((await evaluate(v2, "gn", "general", "edit", [file])).effect).toBe("deny");
-    await expect(toolCall(v2, "gn", "general", "edit", { path: file, oldString: "a", newString: "b" })).rejects.toThrow(/Refused for role agent general/);
+    await expect(dispatch(v2, sessions, "n1", "gn", "general", `[route class=other risk=low scope=single root=${other}]\nlook at the parser`, dir))
+      .rejects.toThrow(/\[router\] role dispatch @general refused: root=.*neither the session directory nor a worktree/);
+    expect(routedRoleOf("n1")).toBeUndefined();
   });
 
   it("QA-G-A1-2: a delegate's resume never consumes the request; another session's resume drops it with a notice", async () => {

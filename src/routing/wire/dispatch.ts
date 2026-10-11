@@ -166,7 +166,7 @@ export interface RoleRouted {
   readonly verifyRoot: string;
   /** The route line's `root=` as written, or null. */
   readonly requestedRoot: string | null;
-  /** Work-root, grant and catalog notes (for the dispatch header / parent result). */
+  /** Grant and catalog notes (decision-row / diagnostic text; they are not shown in the dispatch header or the parent result). */
   readonly notes: readonly string[];
   readonly detection: EffectiveDetection;
   /** The dispatch's total call budget (`roleGuardProfile(spec, tier, routeLine.budget).budget`). */
@@ -198,7 +198,7 @@ export interface RoleRouted {
 
 /**
  * #84 P2.1: a role dispatch the router refuses (malformed first route line, no candidate inside the tier window, the router could not
- * route it). `route()` THROWS it — the one exception to "never throws" — so the adapter's `execute.before` fails the call with this
+ * route it, or a declared `repo=` / `branch=` / `root=` target the router refused — Q9). `route()` THROWS it — the one exception to "never throws" — so the adapter's `execute.before` fails the call with this
  * message and the host never runs the child. It never falls back to a tier agent (QA-P12-1-5).
  */
 export class RoleDispatchRefusal extends Error {
@@ -523,7 +523,7 @@ export interface WorkRootResolution {
   readonly workRoot: string | null;
   /** The route line's `root=` as written, or null. */
   readonly requested: string | null;
-  /** Why there is no work root (for the grant notes and the dispatch header); null when resolved. */
+  /** Why there is no work root; null when resolved. A dispatch that declared `repo=`/`branch=`/`root=` is refused with this note (Q9). */
   readonly note: string | null;
   /** Cross-repo (P1.4): where the work root lies, when admission bound it. */
   readonly location?: RepoLocation;
@@ -1784,6 +1784,12 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     const declaredLine = lined.trace.routeLine;
     const root = await bindWorkRoot(rp.cfg, call.sessionID, sessionDirectory, declaredLine);
     const bound = resumeID === null ? undefined : currentBinding(resumeID, { maxOf: (name) => roleMaxActions(rp.roles.get(name)) });
+    // Q9: a dispatch that DECLARED a target (`repo=` / `branch=` / `root=`, or an invalid `repo=` / `branch=`) whose binding was
+    // refused is refused with the note — it never runs in the session directory instead. A dispatch that declared nothing is
+    // untouched. A resume of an exactly bound child keeps the child's bound root whatever its route line says, so it is not refused.
+    const declaredTarget = declaredLine !== null && declaredLine !== undefined
+      && (declaredLine.repo !== undefined || declaredLine.branch !== undefined || declaredLine.root !== undefined || (declaredLine.invalidCrossRepo?.length ?? 0) > 0);
+    if (declaredTarget && root.workRoot === null && root.note !== null && bound?.kind !== "exact") throw new RoleDispatchRefusal(agent, root.note);
 
     // 3. classify in the dispatch's own root (QA-G-B-3 (1)): an absolute path inside it is no `external_dir`. A resume of an exactly
     // bound child is classified in its bound root (QA-P33F1-1-1); without a `root=` (the work root is the session directory) or a
@@ -2025,7 +2031,14 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         return true;
       }
     };
-    const headerWanted = headerEligible && grant.workRoot !== null && (headerOn || tellsOtherRoot(grant.workRoot));
+    // Q8 (invariant I9): the header is emitted only when it is relevant — cross-repo is configured (`routing.repoParents`), the route
+    // line declared `repo=` / `branch=` / `root=`, or the work root differs from the session directory. Otherwise the role prompt
+    // is byte-identical to what it was before the header existed (route-stripped text + nonce / carried block).
+    const headerRelevant = (root: string): boolean =>
+      resolveRolesRouting(rp.cfg, "v2").repoParents.length > 0
+      || declaredLine?.repo !== undefined || declaredLine?.branch !== undefined || declaredLine?.root !== undefined
+      || tellsOtherRoot(root);
+    const headerWanted = headerEligible && grant.workRoot !== null && headerRelevant(grant.workRoot) && (headerOn || tellsOtherRoot(grant.workRoot));
     const finalPrompt = headerWanted && grant.workRoot !== null
       ? `${buildRoleDispatchHeader({
         agent,
