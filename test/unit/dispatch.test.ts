@@ -97,6 +97,39 @@ describe("createChangedFileStore", () => {
     s.record("S1", "read", { filePath: "x.ts" });
     expect(s.get("S1")).toEqual([]);
   });
+
+  describe("onUnattributedWriter", () => {
+    it("is called for an unattributable writer, by observeEdit (no session) and by record (with its session)", () => {
+      const s = createChangedFileStore();
+      const calls: Array<[string, string | undefined]> = [];
+      s.onUnattributedWriter((tool, sessionID) => calls.push([tool, sessionID]));
+      s.observeEdit("bash", "/w");
+      s.record("S1", "router_run", {});
+      expect(calls).toEqual([["bash", undefined], ["router_run", "S1"]]);
+    });
+    it("is not called for a write tool or a non-writing tool", () => {
+      const s = createChangedFileStore();
+      const calls: string[] = [];
+      s.onUnattributedWriter(tool => calls.push(tool));
+      s.observeEdit("edit", "/w");
+      s.record("S1", "write", { filePath: "x.ts" });
+      s.record("S1", "read", { filePath: "x.ts" });
+      s.observeEdit("grep", "/w");
+      expect(calls).toEqual([]);
+    });
+    it("stops after unsubscribe, and a throwing listener does not break the store or the others", () => {
+      const s = createChangedFileStore();
+      const calls: string[] = [];
+      const off = s.onUnattributedWriter(tool => calls.push(tool));
+      s.onUnattributedWriter(() => {
+        throw new Error("boom");
+      });
+      s.record("S1", "bash", {});
+      off();
+      s.record("S1", "bash", {});
+      expect(calls).toEqual(["bash"]);
+    });
+  });
 });
 
 describe("parseTaskResult", () => {

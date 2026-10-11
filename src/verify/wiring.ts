@@ -1532,23 +1532,15 @@ export function createVerificationWiring(deps: {
     }
   };
   /**
-   * QA-2 #9c: the store's own writer signal (observeEdit before a call, record after it: the calls that contaminate an in-flight
-   * perimeter snapshot) also reaches the pins. Installed once per store, by the first dispatch that pins a link target.
+   * QA-2 #9c: the store's own writer signal (store.onUnattributedWriter: observeEdit before a call, record after it, the calls
+   * that contaminate an in-flight perimeter snapshot) also reaches the pins. Subscribed once per store, by the first dispatch
+   * that pins a link target; the subscription is bounded by the store's own lifetime (it holds the pins map only).
    */
   const watchedStores = new WeakSet<object>();
   const watchWritersFor = (store: ReturnType<typeof createChangedFileStore>): void => {
     if (watchedStores.has(store)) return;
     watchedStores.add(store);
-    const observeEdit = store.observeEdit;
-    const record = store.record;
-    store.observeEdit = (tool, cwd) => {
-      contaminateLinkPins(tool);
-      observeEdit(tool, cwd);
-    };
-    store.record = (sessionID, tool, args) => {
-      contaminateLinkPins(tool);
-      record(sessionID, tool, args);
-    };
+    store.onUnattributedWriter(tool => contaminateLinkPins(tool));
   };
   /**
    * Cross-repo P2d.3 (P2.6): the current pin of a link target at materialize time (hardened, ignored files digested), admitted

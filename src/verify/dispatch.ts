@@ -338,7 +338,31 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
   const lastTouch = new Map<string, number>();
   const dispatches = new Map<string, DispatchRecord>();
 
+  /** Cross-repo QA-2 #9c: subscribers told when a call by an unattributable writer (isUnattributedWriter) is seen. */
+  const unattributedWriterListeners = new Set<(tool: string, sessionID?: string) => void>();
+  function onUnattributedWriter(listener: (tool: string, sessionID?: string) => void): () => void {
+    unattributedWriterListeners.add(listener);
+    return () => {
+      unattributedWriterListeners.delete(listener);
+    };
+  }
+  function notifyUnattributedWriter(tool: string, sessionID?: string): void {
+    if (!isUnattributedWriter(tool)) return;
+    for (const listener of [...unattributedWriterListeners]) {
+      try {
+        listener(tool, sessionID);
+      } catch {
+        // a subscriber never breaks the store
+      }
+    }
+  }
+
   function observeEdit(tool: string, cwd?: string): void {
+    notifyUnattributedWriter(tool);
+    contaminateCaptures(tool, cwd);
+  }
+
+  function contaminateCaptures(tool: string, cwd?: string): void {
     // E2E-3: fail closed. Only a tool known not to write leaves an in-flight snapshot or capture alone.
     if (isNonWritingTool(tool)) return;
     // Unknown directory is conservatively treated as overlapping every capture.
@@ -527,6 +551,11 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
       return d.settled;
     },
     observeEdit,
+    /**
+     * Cross-repo QA-2 #9c: subscribes `listener` to the calls of an unattributable writer (isUnattributedWriter): observeEdit
+     * (before a call, no session) and record (after it, with its session). Returns the unsubscribe function.
+     */
+    onUnattributedWriter,
     noteWriter,
     /**
      * The dispatch's ReferenceState. An untracked (or swept) dispatch has none. `signal` bounds the
@@ -664,8 +693,9 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
       return dispatches.get(id)?.perimeter;
     },
     record(sessionID: string, tool: string, args: unknown): void {
+      notifyUnattributedWriter(tool, sessionID);
       touch(sessionID);
-      observeEdit(tool, dispatches.get(sessionID)?.cwd);
+      contaminateCaptures(tool, dispatches.get(sessionID)?.cwd);
       if (isUnattributedWriter(tool)) {
         const w = writersBySession.get(sessionID) ?? new Set<string>();
         w.add(tool.toLowerCase());
