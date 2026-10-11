@@ -78,7 +78,7 @@ import { runArgv, runShell } from "./exec";
 import { snapshotTree } from "./tree";
 import { discoverConsumers, planPerimeter, type ConsumerDiscovery } from "./perimeter";
 import { defaultExternalLinks, pinTarget, type LinkPin } from "./pin";
-import { perimeterKey } from "./git-top";
+import { gitTopOf, perimeterKey } from "./git-top";
 import type { DispatchPerimeter, PerimeterEntry } from "./dispatch";
 import { branchSwitched, branchSwitchReason, branchUnconfirmedReason, treeMove, treeMoveReason } from "./branch";
 import { readHead, readHeadState, readReflogWindow, type HeadState, type ReflogEntry } from "./head";
@@ -602,6 +602,16 @@ export const ROUTER_VERIFY_NO_RETRY_TEXT = "[router] Nothing was retried or esca
 export const DRIFT_NOTICE = "tree drifted since delegation; verdict reflects current state";
 /** No per-file proof either way (no stored or current digests): a pass is never kept then. */
 export const DRIFT_UNCHECKED_NOTICE = "drift since delegation could not be checked; verdict reflects current state";
+/**
+ * Cross-repo P2e.4a (S11, OD-P2e-1 = UNVERIFIED): the caveat of a frozen link target that router_verify found changed, or could
+ * not observe again, since the producer returned. A would-be pass then is unverifiable; a fail stays a fail with the caveat.
+ */
+export const LINK_DRIFT_CAVEAT = {
+  changed: (name: string, root: string): string =>
+    `the linked repository ${name} at ${root} changed since the producer returned; the checks ran against its new state`,
+  unobserved: (name: string, root: string): string =>
+    `the linked repository ${name} at ${root} could not be observed again since the producer returned`,
+} as const;
 export const ROUTER_VERIFY_CANCELLED_REASON = "router_verify was cancelled before a verdict";
 export const ROUTER_VERIFY_RELEASED_REASON = "the delegation's verification data was released";
 /** Drifted paths named per handle; the rest are counted. */
@@ -2269,6 +2279,55 @@ export function createVerificationWiring(deps: {
   };
 
   /**
+   * Cross-repo P2e.4a (S11): a frozen link target observed again at router_verify, hardened as the perimeter snapshots it
+   * (perimeterSnapshotsAtGate), bounded by the claim deadline. Undefined when it cannot be taken in time. Never throws.
+   */
+  const hardenedSnapshotFor = async (at: string, deadline: Deadline, lowPriority: boolean): Promise<TreeSnapshot | undefined> => {
+    const controller = new AbortController();
+    const onAbort = (): void => controller.abort();
+    deadline.signal.addEventListener("abort", onAbort, { once: true });
+    try {
+      const bound = deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS);
+      if (bound <= 0 || controller.signal.aborted) return undefined;
+      return await withTimeout(snapshotTree(at, controller.signal, { lowPriority, hardened: true }), bound, "router_verify link fingerprint");
+    } catch {
+      return undefined;
+    } finally {
+      deadline.signal.removeEventListener("abort", onAbort);
+      controller.abort();
+    }
+  };
+
+  /**
+   * Cross-repo P2e.4b: the first frozen check placement whose cwd no longer resolves to the same repository since the producer
+   * returned: its real path is not its (canonical) cwd any more (a junction swapped under it, or gone), or its git top level is
+   * not the frozen `top`. The reason names it ("nothing ran"); undefined when every placement still resolves as it did.
+   */
+  const placementDriftOf = async (entry: PendingEntry): Promise<string | undefined> => {
+    const placements = entry.placements;
+    if (placements === undefined) return undefined;
+    const drifted = await Promise.all(placements.map(async (placement): Promise<boolean> => {
+      if (placement === undefined) return false;
+      let real: string;
+      try {
+        real = await realpath(placement.cwd);
+      } catch {
+        return true;
+      }
+      if (perimeterKey(real) !== perimeterKey(placement.cwd)) return true;
+      const top = gitTopOf(placement.cwd);
+      return top === undefined || placement.top === undefined
+        ? top !== placement.top
+        : perimeterKey(top) !== perimeterKey(placement.top);
+    }));
+    const index = drifted.indexOf(true);
+    if (index < 0) return undefined;
+    const placement = placements[index];
+    const kind = entry.dod?.checks?.[index]?.kind ?? "check";
+    return `check ${index + 1} (${kind}) cwd=${placement?.cwd ?? ""} no longer resolves to the same repository since the producer returned; nothing ran`;
+  };
+
+  /**
    * 2.4.3a, section 1.5-18: the producer's files now against their digests right after it returned.
    * "unchecked" whenever either side is missing (no change set, no stored digests, a digest that
    * could not be taken, or the deadline): never a claim of "no drift" without proof.
@@ -2288,6 +2347,16 @@ export function createVerificationWiring(deps: {
     readonly drift: DriftCheck;
     /** R11 root: the registered one, else the current tree's. */
     readonly root: string | undefined;
+    /**
+     * Cross-repo P2e.4a (S11): the frozen link targets that changed, or could not be observed again, since the producer
+     * returned. Absent: no frozen perimeter, or every link is as it was at return.
+     */
+    readonly linkDrift?: readonly { readonly name: string; readonly root: string; readonly why: "changed" | "unobserved" }[];
+    /**
+     * Cross-repo P2e.4b: the first frozen check placement whose cwd no longer resolves to the same repository (the gate then
+     * runs nothing). Absent: no placements, or all still resolve as at return.
+     */
+    readonly placementDrift?: string;
   }
 
   /** One claimed entry after its gate: a final result, or the raw gate result still to be judged. */
@@ -2320,13 +2389,15 @@ export function createVerificationWiring(deps: {
         "router_verify head",
       ).catch(() => undefined);
     };
-    const [reference, drift, tree, nowHead] = await Promise.all([
+    const [reference, drift, tree, nowHead, placementDrift] = await Promise.all([
       // The same bound as the store's reference(id, signal): a capture still pending at the deadline
       // is "no reference (gate budget)".
       untilAborted<ReferenceState>(entry.reference, deadline.signal, () => ({ kind: "none", reason: REFERENCE_NONE.gateBudget })),
       checkDrift(entry, deadline),
       snapshot,
       readNowHead(),
+      // Cross-repo P2e.4b: no placements, no work (resolves undefined at once).
+      placementDriftOf(entry),
     ]);
     const changed = entry.changedFiles;
     const root = entry.root ?? tree?.root;
@@ -2375,6 +2446,7 @@ export function createVerificationWiring(deps: {
     // never re-snapshotted); the consumers (D6) are discovered now over its frozen working set, bounded by the claim deadline.
     let perimeter: PerimeterObservation | undefined;
     let gateReference: ReferenceState = reference;
+    let linkDrift: ClaimPreparation["linkDrift"];
     const frozen = entry.perimeter;
     if (frozen !== undefined) {
       const discoverFrozen = async (): Promise<ConsumerDiscovery> => {
@@ -2400,7 +2472,31 @@ export function createVerificationWiring(deps: {
         if (bound <= 0 || deadline.signal.aborted) return [];
         return withTimeout(frozen.pins, bound, "router_verify link pins").catch(() => []);
       };
-      const [found, pins] = await Promise.all([discoverFrozen(), awaitPins()]);
+      // Cross-repo P2e.4a (S11): each frozen link target observed again (one hardened snapshot per root per call, shared by
+      // the call's entries through `snapshots`). Working-set roots are not: the I4 window ended at return.
+      type FrozenLink = NonNullable<PendingEntry["perimeter"]>["links"][number];
+      type Drift = { readonly name: string; readonly root: string; readonly why: "changed" | "unobserved" };
+      const observeLink = async (link: FrozenLink): Promise<Drift | undefined> => {
+        const key = `link\0${perimeterKey(link.at)}`;
+        let pending = snapshots.get(key);
+        if (pending === undefined) {
+          pending = hardenedSnapshotFor(link.at, deadline, lowPriority);
+          snapshots.set(key, pending);
+        }
+        const now = await pending;
+        const name = link.name ?? basename(link.root);
+        const top = now?.root;
+        if (now === undefined) return { name, root: link.root, why: "unobserved" };
+        if (top !== undefined && link.admit !== undefined && !link.admit(top)) return { name, root: link.root, why: "unobserved" };
+        if (top === undefined || perimeterKey(top) !== perimeterKey(link.root) || now.fingerprint !== link.fingerprint || now.head !== link.head) {
+          return { name, root: link.root, why: "changed" };
+        }
+        return undefined;
+      };
+      const observeLinks = async (): Promise<Drift[]> =>
+        (await Promise.all(frozen.links.map(observeLink))).filter((drift): drift is Drift => drift !== undefined);
+      const [found, pins, drifted] = await Promise.all([discoverFrozen(), awaitPins(), observeLinks()]);
+      if (drifted.length > 0) linkDrift = drifted;
       perimeter = {
         ...frozen.observation,
         ...(found.consumers.length > 0 ? { consumers: found.consumers } : {}),
@@ -2431,6 +2527,8 @@ export function createVerificationWiring(deps: {
       },
       drift,
       root,
+      ...(linkDrift !== undefined ? { linkDrift } : {}),
+      ...(placementDrift !== undefined ? { placementDrift } : {}),
     };
   };
 
@@ -2453,6 +2551,8 @@ export function createVerificationWiring(deps: {
     const dod = entry.dod;
     // A claimed entry is never released (release happens on a terminal settle only).
     if (dod === undefined) return { kind: "final", result: { verdict: unverifiableVerdict(ROUTER_VERIFY_RELEASED_REASON), retryable: false } };
+    // Cross-repo P2e.4b: a placed check whose cwd no longer resolves to the same repository would run elsewhere: nothing runs.
+    if (prep.placementDrift !== undefined) return { kind: "final", result: { verdict: unverifiableVerdict(prep.placementDrift), retryable: false } };
     const strict = cfg.enforcement?.verify?.strictUnverifiable ?? false;
     const inFlight = new Set<string>();
     const completedFailures: string[] = [];
@@ -2480,7 +2580,12 @@ export function createVerificationWiring(deps: {
     const workRoot = deferredWorkRoots.get(entry.handle);
     try {
       res = await withTimeout(
-        accept({ dod, trivial: false, mode: "modeA", cwd: entry.cwd, ...(workRoot !== undefined ? { workRoot } : {}) }, artefact, gateDeps),
+        accept({
+          dod, trivial: false, mode: "modeA", cwd: entry.cwd,
+          ...(workRoot !== undefined ? { workRoot } : {}),
+          // Cross-repo P2e.4b: the placements frozen at return (each still resolves as it did: prepareClaim).
+          ...(entry.placements !== undefined ? { checkPlacements: entry.placements } : {}),
+        }, artefact, gateDeps),
         deadline.remaining(),
         "verification gate",
       );
@@ -2540,6 +2645,23 @@ export function createVerificationWiring(deps: {
           ...verdict,
           ...(outcome === "pass" ? { pass: false, outcome: "unverifiable" as const } : {}),
           caveats: [...(verdict.caveats ?? []), notice],
+        },
+        res.dodSource,
+        strict,
+      ).verdict;
+    }
+    if (prep.linkDrift !== undefined && prep.linkDrift.length > 0) {
+      // Cross-repo P2e.4a (S11, OD-P2e-1): a linked repository not as it was at return never lets a pass stand; it is
+      // unverifiable with one caveat per link. A fail stays a fail and carries the caveats too. They are reasons as well, so the
+      // report (formatVerifyReport: a verdict not accepted shows its reasons) names them.
+      const caveats = prep.linkDrift.map(link => LINK_DRIFT_CAVEAT[link.why](link.name, link.root));
+      const outcome = verdict.outcome ?? (verdict.pass ? "pass" : "fail");
+      verdict = gateResult(
+        {
+          ...verdict,
+          ...(outcome === "pass" ? { pass: false, outcome: "unverifiable" as const } : {}),
+          reasons: [...verdict.reasons, ...caveats],
+          caveats: [...(verdict.caveats ?? []), ...caveats],
         },
         res.dodSource,
         strict,

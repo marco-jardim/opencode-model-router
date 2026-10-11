@@ -26,6 +26,9 @@ import type { DoD } from "../../src/verify/dod";
 import type { DispatchReference } from "../../src/verify/reference";
 import type { DeferredPerimeter } from "../../src/verify/pending";
 import type { LinkPin } from "../../src/verify/pin";
+import type { CheckPlacement } from "../../src/verify/types";
+import { createHash } from "node:crypto";
+import { LINK_DRIFT_CAVEAT } from "../../src/verify/wiring";
 
 const state = vi.hoisted(() => ({
   /** What snapshotTree resolves with for a directory (else `fallback`). */
@@ -91,6 +94,12 @@ let libB = "";
 let consumer = "";
 let acceptSpy: MockInstance<typeof gateModule.accept>;
 const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+/** Junctions a test made; each is removed itself (never recursed through) before the temporary home. */
+const junctions: string[] = [];
+const junction = (target: string, at: string): void => {
+  fs.symlinkSync(target, at, process.platform === "win32" ? "junction" : "dir");
+  junctions.push(at);
+};
 
 const treeOf = (rootDir: string, head: string): TreeSnapshot => ({
   cwd: rootDir, root: rootDir, head, branch: "main", fingerprint: `fp-${path.basename(rootDir)}`, dirty: true,
@@ -130,7 +139,13 @@ interface Registered {
   perimeter?: DeferredPerimeter;
   unattributedWriters?: readonly string[];
   captured?: boolean;
+  dod?: DoD;
+  placements?: readonly (CheckPlacement | undefined)[];
 }
+
+/** The digests of the producer's file right after it returned (the file is never touched again: no drift). */
+const digestsOf = (file: string): Map<string, string> =>
+  new Map([[file, createHash("sha256").update(fs.readFileSync(file)).digest("hex")]]);
 
 /** Registers a pending entry of the plugin's own wiring (as the deferred finish would) and returns its handle. */
 function register(reg: Registered): string {
@@ -145,7 +160,8 @@ function register(reg: Registered): string {
     cwd: work,
     root: work,
     dispatchedAt: Date.now(),
-    dod: FILE_DOD,
+    dod: reg.dod ?? FILE_DOD,
+    digests: Promise.resolve(digestsOf(resolve(work, "index.ts"))),
     reference: Promise.resolve(reg.captured === true
       ? { kind: "captured" as const, reference: { ...REF, root: work } }
       : { kind: "none" as const, reason: "not requested" }),
@@ -153,6 +169,7 @@ function register(reg: Registered): string {
     risk: { level: "low", reasons: [] } as unknown as Parameters<typeof wiring.pending.register>[0]["risk"],
     ...(reg.unattributedWriters !== undefined ? { unattributedWriters: reg.unattributedWriters } : {}),
     ...(reg.perimeter !== undefined ? { perimeter: reg.perimeter } : {}),
+    ...(reg.placements !== undefined ? { placements: reg.placements } : {}),
   });
   if (!result.ok) throw new Error(`register failed: ${result.code} ${result.detail}`);
   return result.handle;
@@ -174,7 +191,8 @@ const gateResults = async (): Promise<string> => JSON.stringify(await Promise.al
 
 beforeEach(() => {
   home = fs.mkdtempSync(path.join(os.tmpdir(), "omr-deferred-perimeter-"));
-  const real = (dir: string): string => fs.realpathSync(dir);
+  // Native: the long form of every path (os.tmpdir() can be an 8.3 short name on Windows), as a canonical placement cwd is.
+  const real = (dir: string): string => fs.realpathSync.native(dir);
   fs.mkdirSync(path.join(home, "app-a"), { recursive: true });
   work = real(path.join(home, "app-a"));
   libB = path.join(home, "lib-b");
@@ -210,6 +228,7 @@ afterEach(() => {
   invalidateConfigCache();
   // The consumer's link is removed itself first: rmSync must never recurse through a junction into app-a.
   fs.rmSync(path.join(consumer, "node_modules", "app-a"), { recursive: false, force: true });
+  for (const junction of junctions.splice(0)) fs.rmSync(junction, { recursive: false, force: true });
   fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
@@ -289,5 +308,147 @@ describe("deferred perimeter at router_verify", () => {
     const reference = acceptSpy.mock.calls[0]?.[2].deterministic.reference;
     expect(reference?.kind).toBe("captured");
     if (reference?.kind === "captured") expect("pins" in reference.reference).toBe(false);
+  });
+});
+
+/** The outcome router_verify reported for `handle` (its first report line). */
+const outcomeOf = (out: string, handle: string): string | undefined =>
+  new RegExp(`^- ${handle} \u00b7 .* \u00b7 (pass|fail|unverifiable)`, "m").exec(out)?.[1];
+const ANY_LINK_CAVEAT = /the linked repository /;
+
+describe("S11 link drift (P2e.4a)", () => {
+  /** lib-b as W's frozen link target: its head and fingerprint at return are treeOf(libB, HEAD_B)'s. */
+  const libLink = (): DeferredPerimeter["links"][number] => ({ at: libB, root: libB, name: "lib-b", head: HEAD_B, fingerprint: "fp-lib-b" });
+
+  it("unchanged → pass", async () => {
+    const h = await makePlugin();
+    state.byDir.set(libB, treeOf(libB, HEAD_B));
+    const handle = register({ perimeter: frozen("unchanged", { links: [libLink()] }) });
+    const out = await verify(h, handle);
+    expect(outcomeOf(out, handle)).toBe("pass");
+    expect(out).not.toMatch(ANY_LINK_CAVEAT);
+    // One hardened snapshot of the link root for the call.
+    expect(state.calls.filter(at => at === libB)).toHaveLength(1);
+  });
+
+  it("changed since return → UNVERIFIED with the S11 caveat", async () => {
+    const h = await makePlugin();
+    state.byDir.set(libB, treeOf(libB, "c".repeat(40)));
+    const handle = register({ perimeter: frozen("unchanged", { links: [libLink()] }) });
+    const out = await verify(h, handle);
+    expect(outcomeOf(out, handle)).toBe("unverifiable");
+    expect(out).toContain(LINK_DRIFT_CAVEAT.changed("lib-b", libB));
+  });
+
+  it("fail stays fail + caveat", async () => {
+    const h = await makePlugin();
+    state.byDir.set(libB, { ...treeOf(libB, HEAD_B), fingerprint: "fp-changed" });
+    const dod: DoD = { ...FILE_DOD, checks: [{ kind: "fileExists", path: "missing.ts" }] };
+    const handle = register({ dod, perimeter: frozen("unchanged", { links: [libLink()] }) });
+    const out = await verify(h, handle);
+    expect(outcomeOf(out, handle)).toBe("fail");
+    expect(out).toContain(LINK_DRIFT_CAVEAT.changed("lib-b", libB));
+  });
+
+  it("cannot be re-observed → never pass", async () => {
+    const h = await makePlugin();
+    state.byDir.set(libB, undefined);
+    const handle = register({ perimeter: frozen("unchanged", { links: [libLink()] }) });
+    const out = await verify(h, handle);
+    expect(outcomeOf(out, handle)).toBe("unverifiable");
+    expect(out).toContain(LINK_DRIFT_CAVEAT.unobserved("lib-b", libB));
+  });
+
+  it("a working-set root that is not a link changed → no caveat", async () => {
+    const h = await makePlugin();
+    state.byDir.set(libB, treeOf(libB, "c".repeat(40)));
+    const handle = register({ perimeter: frozen("unchanged", { workingSet: [{ root: libB, name: "lib-b" }], links: [] }) });
+    const out = await verify(h, handle);
+    expect(outcomeOf(out, handle)).toBe("pass");
+    expect(out).not.toMatch(ANY_LINK_CAVEAT);
+    expect(state.calls).not.toContain(libB);
+  });
+
+  it("no perimeter → no link snapshot", async () => {
+    const h = await makePlugin();
+    state.byDir.set(libB, treeOf(libB, "c".repeat(40)));
+    const handle = register({});
+    const out = await verify(h, handle);
+    expect(outcomeOf(out, handle)).toBe("pass");
+    expect(out).not.toMatch(ANY_LINK_CAVEAT);
+    expect(new Set(state.calls)).toEqual(new Set([work]));
+  });
+});
+
+describe("placements at router_verify (P2e.4b)", () => {
+  const NOTHING_RAN = /check 2 \(fileExists\) cwd=\S+ no longer resolves to the same repository since the producer returned; nothing ran/;
+  /** Check 1 runs in W (it covers W's change, I3); check 2 is placed in lib-b, a git repository holding lib.txt (W does not). */
+  const placedDod: DoD = { ...FILE_DOD, checks: [{ kind: "fileExists", path: "index.ts" }, { kind: "fileExists", path: "lib.txt" }] };
+  const gitRepo = (dir: string): void => {
+    fs.mkdirSync(path.join(dir, ".git"), { recursive: true });
+  };
+
+  it("the gate gets the frozen placements; a placed check runs in its cwd", async () => {
+    const h = await makePlugin();
+    gitRepo(libB);
+    fs.writeFileSync(path.join(libB, "lib.txt"), "lib\n", "utf-8");
+    const placements: readonly (CheckPlacement | undefined)[] = [undefined, { cwd: libB, top: libB, foreign: true }];
+    const handle = register({ dod: placedDod, placements });
+    const out = await verify(h, handle);
+    // The registry froze a copy at register (R3): the gate gets that copy, equal to what was registered.
+    expect(acceptSpy.mock.calls[0]?.[0].checkPlacements).toEqual(placements);
+    // lib.txt exists only in lib-b: the pass proves check 2 ran there.
+    expect(outcomeOf(out, handle)).toBe("pass");
+  });
+
+  it("I3 uncovered → unverifiable", async () => {
+    const h = await makePlugin();
+    gitRepo(libB);
+    fs.writeFileSync(path.join(libB, "lib.txt"), "lib\n", "utf-8");
+    const dod: DoD = { ...FILE_DOD, checks: [{ kind: "fileExists", path: "lib.txt" }] };
+    const handle = register({ dod, placements: [{ cwd: libB, top: libB, foreign: true }] });
+    const out = await verify(h, handle);
+    expect(outcomeOf(out, handle)).toBe("unverifiable");
+    expect(out).toMatch(/is not covered by any check root/);
+  });
+
+  it("a junction swapped under the placement → nothing ran", async () => {
+    const h = await makePlugin();
+    gitRepo(libB);
+    const libC = path.join(home, "lib-c");
+    fs.mkdirSync(libC, { recursive: true });
+    gitRepo(libC);
+    const placed = fs.realpathSync(libC);
+    const handle = register({ dod: placedDod, placements: [undefined, { cwd: placed, top: placed, foreign: true }] });
+    // After return: lib-c is replaced by a junction to lib-b (another repository).
+    fs.rmSync(libC, { recursive: true, force: true });
+    junction(libB, libC);
+    const out = await verify(h, handle);
+    expect(outcomeOf(out, handle)).toBe("unverifiable");
+    expect(out).toMatch(NOTHING_RAN);
+    expect(acceptSpy).not.toHaveBeenCalled();
+  });
+
+  it("git top changed → nothing ran", async () => {
+    const h = await makePlugin();
+    gitRepo(libB);
+    const sub = path.join(libB, "sub");
+    fs.mkdirSync(sub, { recursive: true });
+    const handle = register({ dod: placedDod, placements: [undefined, { cwd: sub, top: libB, foreign: true }] });
+    // After return: sub became its own repository, so its top is no longer lib-b.
+    gitRepo(sub);
+    const out = await verify(h, handle);
+    expect(outcomeOf(out, handle)).toBe("unverifiable");
+    expect(out).toMatch(NOTHING_RAN);
+    expect(acceptSpy).not.toHaveBeenCalled();
+  });
+
+  it("no placements → accept gets no checkPlacements key", async () => {
+    const h = await makePlugin();
+    const handle = register({});
+    const out = await verify(h, handle);
+    expect(outcomeOf(out, handle)).toBe("pass");
+    const delegation = acceptSpy.mock.calls[0]?.[0];
+    expect(delegation !== undefined && "checkPlacements" in delegation).toBe(false);
   });
 });
