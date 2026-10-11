@@ -45,6 +45,27 @@ import { CONTEXT7_DOC_TOOLS, evaluatePermission, permissionMatches, permissionRu
 import { filterSensitiveGrep, isSensitivePath } from "../router/sensitive-paths";
 import { canonicalAuthorityPath, insideWorkRoot } from "../routing/roles/work-root";
 import { appliedEffort, appliedThinkingBudget, createEffortStore, registerEffortChannel } from "../tui/effort-channel";
+import {
+  acquireLeaseRegistry, attemptLabel, COMPLETION_SETTLE_MS, createCompletionProcessor, createHeldResults, createInFlightRegistry,
+  createLeaseGuard, decideBackground, PENDING_GUARANTEES_TEXT, PROVIDER_ORDER, renderCompleted, renderHeld, renderInFlight,
+  ROUTER_FINISH_ATTACH,
+} from "./background";
+import { acquireTimingRecorder, classifyCapacity } from "../routing/outcomes/timings";
+import type { TimingRecorderHolder } from "../routing/outcomes/timings";
+import { createSideLogs, durationSeamsFor, nodePersistDeps, resolveOutcomesDir } from "../routing/outcomes/persist";
+import { homedir, tmpdir } from "node:os";
+import { installGitSearchFilter, nearestRepository, repositoryIdentity } from "../router/git-tools";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { resolveRouting } from "../router/config";
+
+/** 2.1.5.f: the plugin-root notice is logged once per process. */
+let pluginRootLogged = false;
+import { createDurationModel, DURATION_MIN_SAMPLES } from "../routing/outcomes/durations";
+import type { DurationModel } from "../routing/outcomes/durations";
+import type {
+  Attempt, CompletionProcessor, FinishApi, FinishAttach, HeldResults, InFlightRegistry, InflightJournal, LeaseGuard, PersistedRecord,
+} from "./background";
 
 /** Translate the router's own v1 tool vocabulary at the v2 boundary. */
 export function v2Instructions(text: string): string {
@@ -77,14 +98,16 @@ function taskArgs(toolName: string, input: unknown): any {
 }
 
 /**
- * `foreground` (#84 P-5): a role dispatch is forced to the foreground whatever the verification settings, so the router can
- * annotate its result (budget, authority) in `execute.after`. A separate flag: it never marks the call as verifying.
+ * `background` (#84 P-5, Phase 2.1 D1): the `background` key the router sets on a `subagent` call, from `decideBackground`
+ * (`undefined` = no key). With `routing.background.mode: "off"` that is `verifying || roleRouted ? false : undefined`: a role
+ * dispatch or a verifying call is forced to the foreground, so the router can annotate its result (budget, authority) in
+ * `execute.after`. It never marks the call as verifying.
  */
-function nativeArgs(toolName: string, args: any, original: any, verifying: boolean, foreground = false): any {
+function nativeArgs(toolName: string, args: any, original: any, background: boolean | undefined): any {
   if (!args || typeof args !== "object") return args;
   if (toolName === "subagent") {
     const { subagent_type, task_id, ...rest } = args;
-    return { ...rest, agent: subagent_type, ...(task_id === undefined ? {} : { sessionID: task_id }), ...(verifying || foreground ? { background: false } : {}) };
+    return { ...rest, agent: subagent_type, ...(task_id === undefined ? {} : { sessionID: task_id }), ...(background === undefined ? {} : { background }) };
   }
   if (toolName === "shell") { const { cwd, ...rest } = args; return { ...rest, ...(cwd === undefined ? {} : { workdir: cwd }) }; }
   if (["read", "write", "edit"].includes(toolName)) {
@@ -673,6 +696,32 @@ export function normalizeAgentOptions(options: Readonly<Record<string, unknown>>
 }
 
 /** Register the existing router engine on the public OpenCode 2 domain APIs. */
+/** One host completion element `<subagent sessionID="X" state="S">body</subagent>` in a message text (memo §4.4, C2). */
+interface CompletionElement { child: string; state: "completed" | "error" | "cancelled"; body: string }
+const COMPLETION_ELEMENT = /<subagent sessionID="([^"]+)" state="([^"]+)">([\s\S]*?)(?:<\/subagent>|$)/g;
+
+/** The completion elements of a text part that STARTS with one (the host writes a completion as a whole message, C2). */
+function completionElementsOf(text: string): CompletionElement[] {
+  if (!text.startsWith("<subagent sessionID=\"")) return [];
+  const found: CompletionElement[] = [];
+  for (const m of text.matchAll(COMPLETION_ELEMENT)) {
+    const state = m[2];
+    if (state !== "completed" && state !== "error" && state !== "cancelled") continue;
+    found.push({ child: m[1] ?? "", state, body: m[3] ?? "" });
+  }
+  return found;
+}
+
+/** Applies `defang` to the body of every `<subagent …>` element of a text (a pure rewrite; the element tags stay). */
+function defangSubagentBodies(text: string, defang: (body: string) => string): string {
+  if (!text.includes("<subagent sessionID=\"")) return text;
+  return text.replace(COMPLETION_ELEMENT, (whole: string, child: string, state: string, body: string) => {
+    const next = defang(body);
+    if (next === body) return whole;
+    return `<subagent sessionID="${child}" state="${state}">${next}${whole.endsWith("</subagent>") ? "</subagent>" : ""}`;
+  });
+}
+
 export async function registerV2Hooks(
   ctx: Context,
   hooks: Hooks,
@@ -1063,10 +1112,194 @@ export async function registerV2Hooks(
   const hookContext = (event: { sessionID: any; agent: any; messageID: any; id: any }): ToolContext => ({
     ...event, signal: abort.signal, progress: async () => {},
   });
+  // ---------------------------------------------------------------------------------------------------------------------
+  // Phase 2.1 startup (memo §4.1). Everything below is v2-only (this module is loaded by server.ts alone) and inert under
+  // `routing.background.mode: "off"` + `routing.leases.mode: "off"` except the timing rows (telemetry, not visible to the user).
+  // ---------------------------------------------------------------------------------------------------------------------
+  const startRouting = resolveRouting(loadConfig(ctx.location.directory), "v2", ingestLogger);
+  const outcomesDir = resolveOutcomesDir(startRouting.outcomes.path, { tmpdir: tmpdir(), homedir: homedir() });
+  const nowMs = (): number => Date.now();
+  /** Disposers run by `cleanup` (timers, shared registries, installed filters), in reverse order. */
+  const bgDisposers: Array<() => void | Promise<void>> = [];
+  /** 1.1: the timing recorder (whatever `routing.engine` is) and the duration model fed by its rows. */
+  let timings: TimingRecorderHolder | undefined;
+  let durations: DurationModel | undefined;
+  try {
+    const model = createDurationModel(durationSeamsFor(createSideLogs(outcomesDir, nodePersistDeps(ingestLogger)), nowMs));
+    durations = model;
+    void model.load(); // not awaited: until it loads, estimates are the prior (never selects a dispatch)
+    const holder = acquireTimingRecorder({
+      dir: outcomesDir, now: nowMs, logger: ingestLogger,
+      onRow: (row) => { if (row.kind === "dispatch-timing") model.observe(row); },
+    });
+    timings = holder;
+    bgDisposers.push(() => holder.release());
+  } catch (error) {
+    ingestLogger.warn("[router] timing: the recorder could not start; dispatch timings are not recorded", { error: String(error) });
+  }
+  /** Session kinds seen so far (bounded): `root` has no parent. A failed lookup is never cached (root semantics, memo §14.1). */
+  const sessionKinds = new Map<string, "root" | "child">();
+  const noteSessionKind = (sessionID: string, kind: "root" | "child"): void => {
+    sessionKinds.delete(sessionID);
+    sessionKinds.set(sessionID, kind);
+    while (sessionKinds.size > 1000) sessionKinds.delete(sessionKinds.keys().next().value!);
+  };
+  const sessionKindOf = async (sessionID: string): Promise<"root" | "child"> => {
+    const known = sessionKinds.get(sessionID);
+    if (known !== undefined) return known;
+    try {
+      const session = await sessionOf(sessionID) as { parentID?: unknown } | undefined;
+      const kind = typeof session?.parentID === "string" && session.parentID !== "" ? "child" : "root";
+      noteSessionKind(sessionID, kind);
+      return kind;
+    } catch (error) {
+      ingestLogger.warn("[router] leases: the session kind could not be read; treated as a root session", { error: String(error) });
+      return "root";
+    }
+  };
+  /**
+   * The kind of a session WITHOUT a host call (`session.created` and the `prompt` hook record it): an unknown session is a root,
+   * as in the lease guard (memo §14.1). The dispatch path must not add host calls (a static session stays silent, §1.2).
+   */
+  const knownKindOf = (sessionID: string): "root" | "child" => sessionKinds.get(sessionID) ?? "root";
+  /** The in-flight registry and held results exist whatever the mode; they hold nothing until a background dispatch is acknowledged. */
+  const bgMode = startRouting.background.mode;
+  const inflight: InFlightRegistry = createInFlightRegistry({
+    now: nowMs, logger: ingestLogger,
+    onClosed: (attempt, cause) => { void closeAttempt?.(attempt, cause); },
+  });
+  let closeAttempt: ((attempt: Attempt, cause: string) => Promise<void>) | undefined;
+  /** In-memory journal until the §11 persistence lands (see the report): accepts and forgets, so a restart loses holds fail-closed. */
+  const processedKeys = new Set<string>();
+  const journal: InflightJournal = {
+    append: async (record: PersistedRecord): Promise<void> => {
+      if (record.kind === "processed" && typeof record.key === "string") processedKeys.add(record.key);
+    },
+    hasProcessed: (key) => processedKeys.has(key),
+  };
+  const syntheticRaw: unknown = Reflect.get(ctx.session, "synthetic");
+  const syntheticOk = typeof syntheticRaw === "function";
+  /** The held store, for the compaction hook registered before it exists. */
+  let heldRef: HeldResults | undefined;
+  /** Memo §4.4 step 5: the compaction hook runs the same matcher over the messages being summarised (C15). Registered only when mode ≠ off. */
+  let compactionRegistered = false;
+  if (bgMode !== "off") {
+    try {
+      registrations.push(await ctx.session.hook("compaction", async (event) => {
+        const messages = event.messages;
+        if (heldRef === undefined || !Array.isArray(messages)) return;
+        const shaped = messages.map((source) => ({ source, parts: (source as { content?: unknown }).content }));
+        const result = heldRef.apply(String(event.sessionID), shaped);
+        if (result === undefined) return;
+        result.forEach((entry, index) => {
+          if (entry.parts !== (entry.source as { content?: unknown }).content) {
+            messages[index] = Object.assign(Object.create(Object.getPrototypeOf(entry.source)), entry.source, { content: entry.parts });
+          }
+        });
+      }));
+      compactionRegistered = true;
+    } catch (error) {
+      ingestLogger.warn("[router] background: the compaction hook could not be registered; held results are unavailable", { error: String(error) });
+    }
+  }
+  const held: HeldResults = createHeldResults({
+    synthetic: async (input) => { if (typeof syntheticRaw === "function") await Reflect.apply(syntheticRaw, ctx.session, [input]); },
+    journal, available: syntheticOk && compactionRegistered, logger: ingestLogger,
+  });
+  heldRef = held;
+  /** The legacy plugin's finish API (2.1.4). Absent (or `off`): no background processing, the guarantees behave as `off`. */
+  let finishApi: FinishApi | undefined;
+  if (bgMode !== "off") {
+    const attachFinish = (hooks as unknown as Record<PropertyKey, unknown>)[ROUTER_FINISH_ATTACH];
+    if (typeof attachFinish === "function") {
+      try {
+        finishApi = (attachFinish as FinishAttach)({ host: "v2", held });
+      } catch (error) {
+        ingestLogger.warn("[router] background: the plugin could not attach the finish API; no background processing", { error: String(error) });
+      }
+    }
+  }
+  /** Background guarantees apply: mode ≠ off AND the finish API attached. Otherwise every code path below behaves as `off`. */
+  const bgActive = (): boolean => bgMode !== "off" && finishApi !== undefined;
+  /** `router_run` contamination notes from `execute.before`, appended in `execute.after` (bounded). */
+  const runNotes = new Map<string, string>();
+  /** 1.3: the process-wide lease registry and the guard over it (every v2 child; roots take none). */
+  let leaseHandle: ReturnType<typeof acquireLeaseRegistry> | undefined;
+  let leaseGuard: LeaseGuard | undefined;
+  const holderLabel = (holderID: string): string => {
+    const attempt = inflight.byChild(holderID);
+    return attempt === undefined ? `session ${holderID}` : `${attemptLabel(attempt)} (session ${holderID})`;
+  };
+  if (startRouting.leases.mode === "enforce") {
+    try {
+      const snapshotPath = join(outcomesDir, "leases.json");
+      const handle = acquireLeaseRegistry({
+        runMode: startRouting.leases.run,
+        seams: { realpath: (path) => realpathSync.native(path), repoKeyOf: repositoryIdentity, now: nowMs },
+        snapshotPath, logger: ingestLogger,
+      });
+      leaseHandle = handle;
+      bgDisposers.push(() => handle.release());
+      try {
+        handle.registry.restore(JSON.parse(readFileSync(snapshotPath, "utf8")) as unknown, { dropCompleteHolders: true });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") ingestLogger.warn("[router] leases: the snapshot could not be restored", { error: String(error) });
+      }
+      leaseGuard = createLeaseGuard({
+        registry: handle.registry, sessionKind: sessionKindOf, sessionDir: sessionDirectoryOf, gitRootOf: nearestRepository,
+        holderLabel, planTaskOf: () => undefined, events: { onRelease: (cb) => handle.onRelease(cb) }, logger: ingestLogger, now: nowMs,
+      });
+      // `router_git_ls_files` searches: child sessions see no entry under edit by another holder (memo §15.1).
+      bgDisposers.push(installGitSearchFilter(({ sessionID, root, paths }) => {
+        if (sessionKinds.get(sessionID) !== "child") return { kept: paths };
+        const tree = repositoryIdentity(root)?.tree ?? root;
+        const absolute = paths.map((path) => join(root, path));
+        const result = handle.registry.filterSearchResults({ holderID: sessionID, tree, isChild: true }, tree, absolute);
+        if (result.omitted === 0 && result.invalid === undefined) return { kept: paths };
+        const keptSet = new Set(result.kept);
+        return {
+          kept: paths.filter((_, index) => keptSet.has(absolute[index]!)),
+          note: `[router] ${result.omitted} result(s) omitted: under edit by ${result.holders.map((h) => holderLabel(h.holderID)).join(", ")}.`,
+        };
+      }));
+    } catch (error) {
+      leaseGuard = undefined;
+      ingestLogger.warn("[router] leases: the lease registry could not start; no lease checks", { error: String(error) });
+    }
+  }
+  // Sweeps on an unref'd 5-minute interval (memo §4.1): the timing recorder, the in-flight registry and the leases.
+  const sweepTimer = setInterval(() => {
+    try {
+      if (timings !== undefined) void Promise.resolve(timings.sweep()).catch((error: unknown) => ingestLogger.warn("[router] timing: sweep failed", { error: String(error) }));
+      for (const attempt of inflight.sweep(nowMs())) void closeAttempt?.(attempt, "sweep");
+      leaseHandle?.registry.sweep();
+    } catch (error) {
+      ingestLogger.warn("[router] background: the periodic sweep failed", { error: String(error) });
+    }
+  }, 5 * 60_000);
+  sweepTimer.unref?.();
+  bgDisposers.push(() => clearInterval(sweepTimer));
+  // 2.1.5.f: where the plugin runs from (QA records the sink). Logged once per process.
+  if (!pluginRootLogged) {
+    pluginRootLogged = true;
+    try {
+      // Debug level: a static, no-routing session stays silent on warn/info (§1.2); QA reads the debug sink.
+      console.debug(`[router] plugin root ${realpathSync.native(join(fileURLToPath(new URL(".", import.meta.url)), "..", ".."))}`);
+    } catch (error) {
+      ingestLogger.warn("[router] plugin root could not be resolved", { error: String(error) });
+    }
+  }
   const cleanup = async () => {
     if (disposed) return;
     disposed = true;
     abort.abort();
+    for (const dispose of bgDisposers.reverse()) {
+      try {
+        await dispose();
+      } catch (error) {
+        ingestLogger.warn("[router] background: a disposer failed", { error: String(error) });
+      }
+    }
     await runtime?.dispose?.();
     // Before the event task: disposing releases a step handler that waits for the model catalog (QA-2.1-5).
     await ingest.dispose();
@@ -1372,6 +1605,17 @@ export async function registerV2Hooks(
 
     registrations.push(await ctx.session.hook("prompt", async (event) => {
       const session = await ctx.session.get({ sessionID: event.sessionID });
+      // Phase 2.1 (memo §4.5): a session without a parent is a root: its turns are timed and its kind is known to the leases.
+      noteSessionKind(String(event.sessionID), session.parentID ? "child" : "root");
+      if (!session.parentID && timings !== undefined) {
+        const rootTimings = timings;
+        try {
+          rootTimings.markRootSession(String(event.sessionID));
+          void rootTimings.onRootPrompt(String(event.sessionID), nowMs()).catch((error: unknown) => ingestLogger.warn("[router] timing: the turn boundary could not be recorded", { error: String(error) }));
+        } catch (error) {
+          ingestLogger.warn("[router] timing: the root prompt could not be recorded", { error: String(error) });
+        }
+      }
       const output = { message: { agent: session.agent }, parts: [{ type: "text", text: event.prompt.text }] };
       await legacy["chat.message"]?.({ sessionID: event.sessionID, agent: session.agent }, output);
       event.prompt.text = output.parts.map((part) => part.text).join("\n\n");
@@ -1385,8 +1629,73 @@ export async function registerV2Hooks(
         }
       }
     }));
+    // ---- Phase 2.1 message helpers (memo §4.4): `HeldResults.apply` reads `parts`; the host's context messages carry `content`. ----
+    const withContent = (source: ContextMessage, content: ContextMessage["content"]): ContextMessage =>
+      Object.assign(Object.create(Object.getPrototypeOf(source)), source, { content });
+    /** The held-result matcher over context messages (copies; `undefined` = unchanged). */
+    const applyHeldTo = (sid: string, messages: readonly ContextMessage[]): ContextMessage[] | undefined => {
+      const shaped = messages.map((source) => ({ source, parts: source.content }));
+      const result = held.apply(sid, shaped);
+      if (result === undefined) return undefined;
+      return result.map((entry) => (entry.parts === entry.source.content ? entry.source : withContent(entry.source, entry.parts)));
+    };
+    /** Auto/model: `[router` line starts in every `<subagent …>` element body are defanged (parity with `defangChildResult`). */
+    const defangMessages = (messages: readonly ContextMessage[]): ContextMessage[] | undefined => {
+      let changed = false;
+      const next = messages.map((message) => {
+        if (!Array.isArray(message.content)) return message;
+        let touched = false;
+        const content = message.content.map((part) => {
+          if (part.type !== "text") return part;
+          const text = defangSubagentBodies(part.text, defangRouterLines);
+          if (text === part.text) return part;
+          touched = true;
+          return { ...part, text };
+        });
+        if (!touched) return message;
+        changed = true;
+        return withContent(message, content);
+      });
+      return changed ? next : undefined;
+    };
+    /**
+     * A root session's request: every completion element of an acknowledged attempt starts its processing (not awaited), and the
+     * first request that sees an attempt waits for it at most COMPLETION_SETTLE_MS (one shared budget, never again for that attempt).
+     */
+    const scanCompletions = async (sid: string, messages: readonly ContextMessage[]): Promise<void> => {
+      if (processor === undefined) return;
+      const waits: string[] = [];
+      for (const message of messages) {
+        if (!Array.isArray(message.content)) continue;
+        for (const part of message.content) {
+          if (part.type !== "text") continue;
+          for (const element of completionElementsOf(part.text)) {
+            const attempt = inflight.byChild(element.child);
+            if (attempt === undefined || attempt.parentSessionID !== sid) continue;
+            if (attempt.state === "acknowledged" || attempt.state === "child-ended") {
+              void processor.process(element.child, { kind: "completion", state: element.state, body: element.body, at: nowMs() });
+            }
+            if (!attempt.waitedOnce && !waits.includes(element.child)) {
+              attempt.waitedOnce = true;
+              waits.push(element.child);
+            }
+          }
+        }
+      }
+      if (waits.length > 0) await Promise.all(waits.map((child) => processor?.settled(child, COMPLETION_SETTLE_MS)));
+    };
     /** The context hook's body (QA-P23-B5: declared before the hook that calls it). */
     async function buildContext(event: SessionContext, role: string | undefined): Promise<void> {
+      // Phase 2.1 (memo §4.4 step 1-2): FIRST, before `chat.params` and before the augmenter reads `event.messages`: no held output
+      // reaches the request, and (auto/model) child text cannot pose as a router line. Mode `off`: no matcher, no defang.
+      const rawMessages = event.messages;
+      if (bgActive() && event.messages !== undefined) {
+        const sid = String(event.sessionID);
+        const hidden = applyHeldTo(sid, event.messages);
+        if (hidden !== undefined) event.messages = hidden;
+        const defanged = defangMessages(event.messages);
+        if (defanged !== undefined) event.messages = defanged;
+      }
       if (protectedAgent(event.agent)) {
         try {
           // Catalogs use merged session rules; remove widened tools from this
@@ -1499,6 +1808,14 @@ export async function registerV2Hooks(
       // Phase 1.2: a root session's turn state (pending list, late notices, route hint) rides in a trailing user message; the
       // system parts above are never changed for it. A failure here only loses the tail, never the request.
       if (output[TURN_STATE_ROOT] === true && event.messages !== undefined) {
+        if (bgActive() && rawMessages !== undefined) {
+          // The ORIGINAL completion text (before the matcher) feeds the processor; failures never cost the request.
+          try {
+            await scanCompletions(String(event.sessionID), rawMessages);
+          } catch (error) {
+            ingestLogger.warn("[router] background: completions could not be scanned", { error: String(error) });
+          }
+        }
         try {
           const placed = placeTurnState(event.messages, turnState.buildTurnState(String(event.sessionID)), tailMessage);
           if (placed !== undefined) event.messages = placed;
@@ -1571,6 +1888,22 @@ export async function registerV2Hooks(
           refusal = "the router could not check this dispatch's authority (fail closed)";
         }
         if (refusal !== undefined) throw refused(`[router] Refused for role agent ${callerRole} in this dispatch: ${refusal}`, callerRole);
+      }
+      // Phase 2.1 (memo §4.2): authority checks first, then the held refusal, then the leases (all before the legacy hook).
+      if (bgActive()) {
+        const heldRefusal = held.refusal(String(event.sessionID), event.tool, args);
+        if (heldRefusal !== undefined) throw refused(heldRefusal, callerRole);
+      }
+      // Only the tools the guard checks (file tools, `router_git_*`, `router_run`) reach it: no host call for any other tool.
+      const leaseClass = roleActionOf(event.tool);
+      if (leaseGuard !== undefined && (leaseClass === "read" || leaseClass === "edit" || event.tool.startsWith("router_git_") || event.tool === "router_run")) {
+        const lease = await leaseGuard.before({ sessionID: String(event.sessionID), tool: event.tool, args, callID: event.id });
+        if (lease.refuse !== undefined) throw refused(lease.refuse, callerRole);
+        if (lease.runNote !== undefined) {
+          runNotes.delete(event.id);
+          runNotes.set(event.id, lease.runNote);
+          while (runNotes.size > 1000) runNotes.delete(runNotes.keys().next().value!);
+        }
       }
       // #84 P-5: a routed role dispatch runs in the foreground (separate from `verifying`).
       let roleForeground = false;
@@ -1664,13 +1997,56 @@ export async function registerV2Hooks(
           const prompt = typeof original?.prompt === "string" ? original.prompt : typeof original?.description === "string" ? original.description : "";
           output.args.prompt = translateAdded(prompt, output.args.prompt);
         }
-        event.input = nativeArgs(event.tool, output.args, original, verifying, roleForeground);
+        // Phase 2.1 (memo §4.2 step 5, §6): under `off` (or without the finish API) this is today's `verifying || roleRouted ? false : undefined`.
+        let background: boolean | undefined = verifying || roleForeground ? false : undefined;
+        if (event.tool === "subagent" && bgActive() && finishApi !== undefined) {
+          const parent = String(event.sessionID);
+          const info = dispatchRouter.decisionOf(event.id);
+          const roleLabel = info?.role ?? "unknown";
+          const verification = finishApi.verificationFor(event.id);
+          const decision = decideBackground({
+            mode: startRouting.background.mode,
+            explicit: typeof output.args?.background === "boolean" ? output.args.background : undefined,
+            verifying, verificationMode: verification?.mode ?? "none", roleRouted: roleForeground,
+            estimate: info === undefined ? undefined : durations?.estimate({ role: roleLabel, class: info.class, scope: info.scope }),
+            minPredictedMs: startRouting.background.minPredictedMs, minSamples: DURATION_MIN_SAMPLES,
+            acceptance: verification?.acceptance ?? { testsPass: false, buildPasses: false },
+            planTask: false,
+            holdingAvailable: held.available && finishApi.canHold(parent),
+            parentIsRoot: knownKindOf(parent) === "root", liveCount: inflight.liveCount(),
+          });
+          background = decision.background;
+          inflight.decide({
+            callID: event.id, parentSessionID: parent, agent: String(output.args?.agent ?? ""), ...(info?.role === undefined ? {} : { role: info.role }),
+            description: typeof output.args?.description === "string" ? output.args.description : "", verifying,
+            verificationMode: verification?.mode ?? "none", decision,
+            ...(typeof output.args?.sessionID === "string" && output.args.sessionID !== "" ? { resumeOf: output.args.sessionID } : {}),
+            at: nowMs(),
+          });
+        }
+        event.input = nativeArgs(event.tool, output.args, original, background);
       } catch (error) {
         dispatchRouter.onCallFinished(event.id); // the hook chain rejected the call: it will never reach execute.after (2.2)
+        inflight.cancel(event.id);
         throw error;
       }
       // The input the host will execute (after the legacy hook): the dispatch is registered for ingestion from it, not from what the engine decided (2.2).
       dispatchRouter.commit(event.id, event.input);
+      // 1.1 handoff: the timing starts after `commit` (not inside it); a hook-chain rejection above makes no call.
+      if (event.tool === "subagent" && timings !== undefined) {
+        try {
+          const info = dispatchRouter.decisionOf(event.id);
+          const sent = event.input as { sessionID?: unknown; background?: unknown };
+          const resumed = sent.sessionID;
+          timings.recordDispatchStart({
+            callID: event.id, childSessionID: typeof resumed === "string" && resumed !== "" ? resumed : null, parentSessionID: String(event.sessionID),
+            role: info?.role ?? "unknown", class: info?.class ?? "unknown", scope: info?.scope ?? "unknown",
+            tier: info?.tier ?? "unknown", model: info?.model ?? "unknown", background: sent.background === true, at: nowMs(),
+          });
+        } catch (error) {
+          ingestLogger.warn("[router] timing: the dispatch start could not be recorded", { error: String(error) });
+        }
+      }
     }));
     /**
      * #84 P2.1 (T2.1.4; handoffs 28, 34, 37): the parent's `subagent` call of a role child ended. Computed BEFORE the legacy hook
@@ -1726,17 +2102,124 @@ export async function registerV2Hooks(
               rememberLastCall(child, end.id);
               if (!running) catalogFailures.delete(child); // P-3: the next attempt's catalog failure is annotated again
             }
-            evictCall(end.sessionID, end.id);
+            // Phase 2.1: a running ack under background guarantees keeps the pending binding: the processor evicts it at completion
+            // (otherwise an auto-backgrounded role child loses its binding before its first request).
+            if (!(running && bgActive() && inflight.byCall(end.id) !== undefined)) evictCall(end.sessionID, end.id);
           } catch (error) {
             ingestLogger.warn("[router] roles: the finished role dispatch could not be released", { error: String(error) });
           }
         },
       };
     };
+    // Phase 2.1 (memo §4.7): the completion processor. Only when the plugin attached its finish API; otherwise nothing is processed.
+    let processor: CompletionProcessor | undefined;
+    if (finishApi !== undefined) {
+      const api = finishApi;
+      processor = createCompletionProcessor(inflight, {
+        finish: (input) => within(hookContext({ sessionID: input.parentSessionID, agent: inflight.byCall(input.callID)?.agent, messageID: "", id: input.callID }), () => api.finish(input)),
+        readChildResult: async (child) => {
+          const history = await ctx.session.context({ sessionID: child } as Parameters<typeof ctx.session.context>[0]);
+          const messages: readonly unknown[] = Array.isArray(history) ? history : [];
+          for (let index = messages.length - 1; index >= 0; index--) {
+            const message = messages[index] as { role?: unknown; content?: unknown } | undefined;
+            if (message?.role === "assistant") return { text: contentText(message.content) };
+          }
+          return undefined;
+        },
+        // The `!running` half of `roleAfterCall`: budget and authority notices, plus its evictions (run through its own `finish`).
+        roleCompletion: async (attempt, text) => {
+          const completed = await roleAfterCall({
+            id: attempt.callID, sessionID: attempt.parentSessionID, status: "completed",
+            result: { output: { status: "completed", output: text, sessionID: attempt.childSessionID }, content: [{ type: "text", text }] },
+            input: { agent: attempt.agent },
+          });
+          if (completed === undefined) return [];
+          completed.finish();
+          evictCall(attempt.parentSessionID, attempt.callID);
+          return completed.notice === undefined ? [] : [completed.notice];
+        },
+        releaseLeases: (holderID) => { leaseGuard?.releaseChild(holderID); leaseHandle?.notifyReleased(); },
+        held, persist: journal, now: nowMs, logger: ingestLogger,
+      });
+      const closing = processor;
+      closeAttempt = (attempt, cause) => closing.closeUnknown(attempt, cause);
+    }
+    // Phase 2.1 (memo §13): the three turn-state providers. They render nothing (and are not registered) under `off`.
+    if (bgActive() && processor !== undefined) {
+      const completing = processor;
+      const LIVE_STATES: ReadonlySet<Attempt["state"]> = new Set<Attempt["state"]>(["acknowledged", "child-ended", "processing"]);
+      const unregisters = [
+          turnState.registerTurnStateProvider({
+            name: "completed", order: PROVIDER_ORDER.completed,
+            render: (sid) => renderCompleted(completing.completedFor(sid)),
+            active: (sid) => completing.completedFor(sid).length > 0,
+          }),
+          turnState.registerTurnStateProvider({
+            name: "held", order: PROVIDER_ORDER.held,
+            render: (sid) => renderHeld(held.heldFor(sid)),
+            active: (sid) => held.heldFor(sid).length > 0,
+          }),
+          turnState.registerTurnStateProvider({
+            name: "in-flight", order: PROVIDER_ORDER.inFlight,
+            render: (sid) => renderInFlight(inflight.listForParent(sid).filter((attempt) => LIVE_STATES.has(attempt.state)), nowMs()),
+            active: (sid) => inflight.listForParent(sid).some((attempt) => LIVE_STATES.has(attempt.state)),
+          }),
+      ];
+      registrations.push({ dispose: async () => { for (const unregister of unregisters) unregister(); } });
+    }
     registrations.push(await ctx.tool.hook("execute.after", async (event) => {
       // 2.2: the result names the child. A dispatch still waiting for it is registered under it, and a heuristic claim that picked
       // the wrong child is corrected here, before the legacy hook below records the verdict. A call without a result is just dropped.
-      dispatchRouter.onCallResult(event.id, event.status === "completed" ? childSessionOf(event.result) : null);
+      const resultChild = event.status === "completed" ? childSessionOf(event.result) : null;
+      dispatchRouter.onCallResult(event.id, resultChild);
+      const runNote = runNotes.get(event.id);
+      runNotes.delete(event.id);
+      // Phase 2.1 (memo §4.3 steps 1-2). Timing: a non-null child binds the open start; a null child drops it.
+      let ackText: string | undefined;
+      if (event.tool === "subagent") {
+        const running = resultChild !== null && ((event as { result?: { output?: { status?: unknown } } }).result)?.output?.status === "running";
+        if (timings !== undefined) {
+          try {
+            if (resultChild === null) timings.cancelStart(event.id);
+            else {
+              timings.bindChild(event.id, resultChild);
+              if (running) timings.setBackground(event.id, true);
+            }
+          } catch (error) {
+            ingestLogger.warn("[router] timing: the dispatch result could not be recorded", { error: String(error) });
+          }
+        }
+        if (resultChild === null) inflight.cancel(event.id);
+        // A running result under mode ≠ off with a root parent: register the attempt (and its hold) BEFORE anything can render a completion.
+        const parent = String(event.sessionID);
+        const rec = running && bgActive() && finishApi !== undefined ? inflight.byCall(event.id) : undefined;
+        if (rec !== undefined && resultChild !== null && knownKindOf(parent) === "root") {
+          try {
+            const hold = verifyingCalls.has(event.id) && rec.verificationMode === "required" && held.available && finishApi?.canHold(parent) === true;
+            const handle = hold ? finishApi?.reserveHeld(parent, event.id) : undefined;
+            const attempt = inflight.acknowledge(event.id, resultChild, {
+              userBackgrounded: rec.decision.background !== true, ...(handle === undefined ? {} : { hold: { handle } }),
+            });
+            if (attempt !== undefined) {
+              const notRunning = `[router] Running in the background (${resultChild}).`;
+              ackText = handle !== undefined ? `${notRunning} Its result is held until verification finishes.`
+                : verifyingCalls.has(event.id) ? `${notRunning} Its result will arrive unverified; the verdict follows in the router state.`
+                : `${notRunning} Router guarantees apply when it completes.`;
+              await journal.append({
+                v: 1, kind: "inflight", key: attempt.key, callID: event.id, parentSessionID: parent, childSessionID: resultChild,
+                label: attemptLabel(attempt), ...(handle === undefined ? {} : { handle }), at: nowMs(),
+              }, { fsync: true });
+              if (handle !== undefined) {
+                await held.hold({ handle, parentSessionID: parent, childSessionID: resultChild, callID: event.id, label: attemptLabel(attempt) });
+              }
+              const early = inflight.takeEarlyEnd(resultChild);
+              if (early !== undefined) void processor?.process(resultChild, { kind: "early-end", end: early });
+            }
+          } catch (error) {
+            ingestLogger.warn("[router] background: the dispatch could not be registered as running", { error: String(error) });
+          }
+        }
+      }
       const role = event.tool === "subagent" ? await roleAfterCall({
         id: event.id, sessionID: String(event.sessionID), status: event.status,
         result: (event as { result?: unknown }).result, input: (event as { input?: unknown }).input,
@@ -1753,7 +2236,21 @@ export async function registerV2Hooks(
         const agent = roleAgentName(event.agent) ?? (typeof event.agent === "string" && event.agent !== "" ? undefined : knownRoleSession(String(event.sessionID)));
         if (agent !== undefined) options.recordRefusal?.(String(event.sessionID), agent, event.tool, (event as { input?: unknown }).input);
       }
-      if (event.status !== "completed") return;
+      if (event.status !== "completed") {
+        if (event.tool === "subagent") inflight.cancel(event.id);
+        return;
+      }
+      // Phase 2.1: a completed (non-running) subagent result is terminal for the processor: the legacy path ran in-line.
+      if (event.tool === "subagent" && resultChild !== null && ackText === undefined
+        && (event.result as { output?: { status?: unknown } } | undefined)?.output?.status !== "running") {
+        inflight.foreground(event.id, resultChild);
+      }
+      // 1.3 (memo §14.3): a `router_run` result carries the contamination note the lease check produced in `execute.before`.
+      if (event.tool === "router_run" && runNote !== undefined) {
+        const base = Array.isArray(event.result.content) ? [...event.result.content]
+          : typeof event.result.content === "string" ? [{ type: "text" as const, text: event.result.content }] : [];
+        event.result = { ...event.result, content: [...base, { type: "text" as const, text: runNote }] };
+      }
       if (event.tool === "grep" && protectedAgent(event.agent)) {
         const content = event.result.content;
         event.result = {
@@ -1776,12 +2273,39 @@ export async function registerV2Hooks(
       if (role !== undefined && event.tool === "subagent" && event.result.output?.status !== "running") {
         event.result = defangChildResult(event.result);
       }
+      // 1.3 (memo §14.2): `glob`/`grep` of a child session: entries under edit by another holder are left out, plus one note line.
+      if (leaseGuard !== undefined && (event.tool === "glob" || event.tool === "grep")) {
+        try {
+          const searched = leaseGuard.afterSearch({ sessionID: String(event.sessionID), tool: event.tool, result: contentText(event.result.content) });
+          if (searched !== undefined && typeof searched.result === "string") {
+            const filtered = searched.result;
+            const entryPath = (item: unknown): string | undefined => {
+              if (typeof item === "string") return item;
+              const rec = item !== null && typeof item === "object" ? item as { entry?: { path?: unknown }; path?: unknown } : undefined;
+              const path = rec?.entry?.path ?? rec?.path;
+              return typeof path === "string" ? path : undefined;
+            };
+            const text = searched.note === undefined ? filtered : `${filtered.trimEnd()}\n${searched.note}`;
+            event.result = {
+              ...event.result,
+              content: [{ type: "text" as const, text }],
+              ...(Array.isArray(event.result.output) ? { output: event.result.output.filter((item: unknown) => {
+                const path = entryPath(item);
+                return path === undefined || filtered.includes(path);
+              }) } : {}),
+            };
+          }
+        } catch (error) {
+          ingestLogger.warn("[router] leases: a search result could not be filtered", { error: String(error) });
+        }
+      }
       const structured = event.result.output;
       // A user can background a foreground subagent while it is running. That
       // acknowledgement is not a final result and must never enter acceptance.
       if (event.tool === "subagent" && structured?.status === "running") {
         const notices = [
-          ...(verifying ? ["[router] This subagent is still running. Its result has not been verified; automatic acceptance requires a completed foreground return."] : []),
+          ...(ackText !== undefined ? [ackText]
+            : verifying ? ["[router] This subagent is still running. Its result has not been verified; automatic acceptance requires a completed foreground return."] : []),
           ...(banner === undefined ? [] : [banner]),
         ];
         if (!notices.length) return;
@@ -1862,6 +2386,49 @@ export async function registerV2Hooks(
           if (HOST_TOOL_SUCCESS_EVENT.test(event.type) && data && Array.isArray(data.outputPaths)) {
             rememberOutputs(data.sessionID, data.outputPaths.filter((path: unknown): path is string => typeof path === "string"));
           }
+          // Phase 2.1 (memo §4.6): timing, leases and the completion processor, before any existing `continue` below.
+          if (typeof data?.sessionID === "string") {
+            const sid: string = data.sessionID;
+            if (event.type === "session.created") {
+              noteSessionKind(sid, data.parentID ? "child" : "root");
+              if (!data.parentID) timings?.markRootSession(sid);
+            } else if (event.type === "session.step.ended") {
+              if (timings !== undefined) {
+                if (timings.isRootSession(sid)) {
+                  const tokens = typeof data.tokens === "object" && data.tokens !== null ? data.tokens as Record<string, any> : {};
+                  timings.onRootStep(sid, {
+                    input: Number(tokens.input) || 0, cacheRead: Number(tokens.cache?.read) || 0, cacheWrite: Number(tokens.cache?.write) || 0,
+                  }, event.id);
+                } else if (!sessionKinds.has(sid)) {
+                  const recorder = timings; // one lazy lookup per unregistered session (cached by sessionKindOf), not awaited
+                  void sessionKindOf(sid).then((kind) => { if (kind === "root") recorder.markRootSession(sid); });
+                }
+              }
+            } else if (event.type === "session.step.failed" || event.type === "session.retry.scheduled") {
+              const failure: unknown = data.error ?? data;
+              const detail = typeof failure === "object" && failure !== null ? failure as { type?: unknown; status?: unknown } : {};
+              const capacity = classifyCapacity({
+                type: typeof detail.type === "string" ? detail.type : null, status: typeof detail.status === "number" ? detail.status : null,
+              });
+              if (capacity !== null) timings?.onCapacitySignal(sid, capacity, nowMs());
+            } else if (event.type === "session.execution.succeeded" || event.type === "session.execution.failed" || event.type === "session.execution.interrupted") {
+              const outcome = event.type === "session.execution.succeeded" ? "succeeded" : event.type === "session.execution.failed" ? "failed" : "interrupted";
+              const created: unknown = (event as { created?: unknown }).created;
+              const at = created instanceof Date ? created.getTime() : typeof created === "number" ? created : nowMs();
+              if (timings !== undefined) await timings.onExecutionOutcome(sid, event.id, outcome, at);
+              leaseGuard?.releaseChild(sid);
+              leaseHandle?.notifyReleased();
+              if (bgActive() && processor !== undefined) {
+                const attempt = inflight.byChild(sid);
+                if (attempt !== undefined) {
+                  if (attempt.state === "acknowledged") void processor.process(sid, { kind: "end-event", outcome, eventID: event.id, at });
+                } else if (sessionKinds.get(sid) === "child") {
+                  inflight.noteEarlyEnd(sid, { outcome, eventID: event.id, at });
+                }
+                if (sessionKinds.get(sid) === "root") processor.endTurn(sid);
+              }
+            }
+          }
           if (event.type === "session.step.ended" || event.type === "session.step.failed") {
             // Cost and tokens of a registered child dispatch (ingest ignores every other session).
             await ingesting(event.type, () => ingest.onStepEnded(event));
@@ -1881,6 +2448,13 @@ export async function registerV2Hooks(
               lastCallOfChild.delete(data.sessionID);
               hostBudget.forget(data.sessionID);
               effortStore.forget(data.sessionID); // #90 P1.2: a deleted session is no longer answered
+              // Phase 2.1 (memo §4.6): the session's attempts, holds, leases and cached kind go with it.
+              inflight.forgetSession(data.sessionID);
+              processor?.forgetSession(data.sessionID);
+              held.forgetSession(data.sessionID);
+              leaseGuard?.releaseChild(data.sessionID);
+              leaseHandle?.notifyReleased();
+              sessionKinds.delete(data.sessionID);
             }
             await ingesting("session.deleted", () => ingest.onSessionGone(data.sessionID));
           } else if (FLUSH_EVENT_TYPES.has(event.type)) {

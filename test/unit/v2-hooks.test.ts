@@ -1209,7 +1209,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     await barrier(f, forgetSession, "barrier-2");
     expect(lastStepContext("child-1")).toBe(1100);
     await cleanup();
-    expect(readdirSync(outcomes)).toEqual([]); // memory only: nothing was written
+    expect(readdirSync(outcomes).filter((name) => name !== "pending.jsonl")).toEqual([]); // v2 pending journal (2.1.4) is the one visible file // memory only: nothing was written
     rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
@@ -1231,7 +1231,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     await barrier(f, forgetSession, "barrier-3");
     expect(lastStepContext("child-1")).toBe(1100);
     await cleanup();
-    expect(readdirSync(outcomes)).toEqual([]);
+    expect(readdirSync(outcomes).filter((name) => name !== "pending.jsonl")).toEqual([]); // v2 pending journal (2.1.4) is the one visible file
     rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });  it("ignores step events of sessions that are not registered children", async () => {
     const { home, outcomes } = routingHome({ engine: "shadow" });
@@ -1242,7 +1242,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     f.emit({ id: "e2", type: "session.step.ended", data: { assistantMessageID: "no-session" } });
     await barrier(f, forgetSession, "barrier");
     await cleanup();
-    expect(readdirSync(outcomes)).toEqual([]);
+    expect(readdirSync(outcomes).filter((name) => name !== "pending.jsonl")).toEqual([]); // v2 pending journal (2.1.4) is the one visible file
     expect(model.list).not.toHaveBeenCalled();
     rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
@@ -1261,7 +1261,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     f.emit({ id: "i1", type: "session.execution.succeeded", data: { sessionID: "child-1" } });
     await barrier(f, forgetSession, "barrier");
     await cleanup();
-    expect(readdirSync(outcomes)).toEqual([]);
+    expect(readdirSync(outcomes).filter((name) => name !== "pending.jsonl")).toEqual([]); // v2 pending journal (2.1.4) is the one visible file
     // tmpdir() is private to this file (QA-2.1-4), but earlier tests of the file leave scorecards in its default directory:
     // what must not appear there is an outcome store or a decision log.
     const defaultDir = join(tmpdir(), DEFAULT_OUTCOMES_DIRNAME);
@@ -1278,7 +1278,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     f.emit(stepEvent("e1", "child-low", { finish: "stop" }));
     await barrier(f, forgetSession, "barrier");
     await cleanup();
-    expect(readdirSync(outcomes)).toEqual([]);
+    expect(readdirSync(outcomes).filter((name) => name !== "pending.jsonl")).toEqual([]); // v2 pending journal (2.1.4) is the one visible file
     rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 

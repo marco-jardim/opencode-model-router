@@ -20,6 +20,13 @@ export interface GitInspectOptions {
    * dispatch) the common directory must be that repository's. QA-G-A2-4: paths and output are limited to the work root.
    */
   role?: { dispatchRepository?: string };
+  /**
+   * Phase 2.1 (leases): a git search lists paths (`ls_files`). With this set, the listed repository-relative paths (`/`-separated, as
+   * git prints them) go through it and only `kept` is shown; a non-empty `note` is appended as the last line. It runs on the
+   * decoded path list (the same names `ls-files -z` reports), so a name git would quote is matched by its real spelling. A throwing
+   * filter fails the call closed (nothing is listed).
+   */
+  filterSearch?: (root: string, paths: readonly string[]) => { kept: readonly string[]; note?: string };
 }
 
 const MAX_BYTES = 64 * 1024;
@@ -921,10 +928,47 @@ async function diffNames(executable: string, argv: string[], root: string, env: 
   return withWarnings(result.truncated ? `${text}[truncated: output exceeds ${MAX_BYTES} bytes]` : text, result);
 }
 
-function nearestRepository(directory: string): string | undefined {
+/**
+ * Phase 2.1: `ls-files` with its listing filtered (leases). The listing is read NUL-separated, so a name git would quote is still
+ * matched by its real spelling; the filter's `kept` paths are printed one per line, then its note. A `[truncated: …]` marker the
+ * bounded runner appended stays last. A throwing filter propagates: the call fails and lists nothing (fail closed).
+ */
+async function filteredListing(executable: string, argv: string[], root: string, env: NodeJS.ProcessEnv, budget: Budget,
+  filter: NonNullable<GitInspectOptions["filterSearch"]>): Promise<string> {
+  const at = argv.indexOf("ls-files");
+  const run = (args: string[]) => runBoundedProcess(executable, args, root, { signal: budget.signal, timeoutMs: budget.timeoutMs(), env });
+  if (at < 0) return await run(argv); // not a listing argv: nothing to filter
+  const raw = await run([...argv.slice(0, at + 1), "-z", ...argv.slice(at + 1)]);
+  const marker = /\n?\[truncated:[^\]]*\]\s*$/.exec(raw);
+  const body = marker === null ? raw : raw.slice(0, marker.index);
+  const listed = body.split("\0").filter(name => name !== "");
+  const { kept, note } = filter(root, listed);
+  const lines = [...kept, ...(note === undefined || note === "" ? [] : [note])];
+  const text = lines.length === 0 ? "" : `${lines.join("\n")}\n`;
+  return marker === null ? text : `${text}${marker[0].replace(/^\n/, "")}`;
+}
+
+export function nearestRepository(directory: string): string | undefined {
   for (let current = directory; ; current = dirname(current)) {
     if (existsSync(join(current, ".git"))) return current;
     if (dirname(current) === current) return undefined;
+  }
+}
+
+/**
+ * Phase 2.1 (`LeaseSeams.repoKeyOf`): the repository and work tree containing `dir`, or undefined outside any (and when its `.git`
+ * cannot be read safely). `repo` is the common git directory, so every linked worktree of one repository shares it; `tree` is the
+ * checkout. Both are real paths. Reads `.git` pointers only (bounded, never followed onto a network or device path); spawns nothing.
+ */
+export function repositoryIdentity(dir: string): { repo: string; tree: string } | undefined {
+  try {
+    const checkout = nearestRepository(dir);
+    if (checkout === undefined) return undefined;
+    const pointers = gitPointers(checkout);
+    if (pointers === undefined) return undefined;
+    return { repo: realpath(pointers.common), tree: realpath(checkout) };
+  } catch {
+    return undefined; // unreadable or refused (link, network/device path): outside any repository for the lease keys
   }
 }
 
@@ -1058,9 +1102,12 @@ export async function inspectGit(operation: GitOperation, input: GitInput, direc
     inspected = { ...input, ref: oid };
   }
   const argv = gitArgv(operation, inspected, root, { config, exclude: linked, ...(scope === undefined ? {} : { scope }) });
-  const raw = operation === "diff" && input.mode === "name-only"
-    ? await diffNames(executable, argv, root, env, budget)
-    : await runBoundedProcess(executable, argv, root, { signal, timeoutMs: budget.timeoutMs(), env });
+  const searchFilter = operation === "ls_files" ? options.filterSearch : undefined;
+  const raw = searchFilter !== undefined
+    ? await filteredListing(executable, argv, root, env, budget, searchFilter)
+    : operation === "diff" && input.mode === "name-only"
+      ? await diffNames(executable, argv, root, env, budget)
+      : await runBoundedProcess(executable, argv, root, { signal, timeoutMs: budget.timeoutMs(), env });
   let output = ["show", "diff", "log"].includes(operation) ? filterSensitiveDiff(raw) : raw;
   if (operation === "show" || operation === "log") output = await annotateWithheld(output, executable, base, root, env, budget, scopeSpec);
   if (linked.length === 0) return output;
@@ -1113,6 +1160,15 @@ export function checkWorkRootAnswer(answer: unknown): WorkRootAnswer {
   throw new Error("Invalid work-root answer: expected { role: false } or { role: true, root }");
 }
 
+/** Phase 2.1: a process-wide filter for the listings of `router_git_ls_files` (leases); installed by the v2 adapter only. */
+export type GitSearchFilter = (e: { sessionID: string; root: string; paths: readonly string[] }) => { kept: readonly string[]; note?: string };
+let installedSearchFilter: GitSearchFilter | undefined;
+/** Install the listing filter; the returned function removes it (only while it is still the installed one). */
+export function installGitSearchFilter(filter: GitSearchFilter): () => void {
+  installedSearchFilter = filter;
+  return () => { if (installedSearchFilter === filter) installedSearchFilter = undefined; };
+}
+
 export function gitTools(opts: GitToolsOptions = {}) {
   // G4: resolve the git executable once, at plugin load.
   const executables = defaultCandidates();
@@ -1132,6 +1188,9 @@ export function gitTools(opts: GitToolsOptions = {}) {
     },
     async execute(input, context) {
       try {
+        const searchFilter = installedSearchFilter;
+        const filtering: Pick<GitInspectOptions, "filterSearch"> = searchFilter === undefined ? {}
+          : { filterSearch: (root, paths) => searchFilter({ sessionID: context.sessionID, root, paths }) };
         if (opts.resolveWorkRoot) {
           const answer = checkWorkRootAnswer(opts.resolveWorkRoot(context.sessionID));
           if (answer.role) {
@@ -1139,10 +1198,11 @@ export function gitTools(opts: GitToolsOptions = {}) {
             return await inspectGit(operation, inputSchema.parse(input), answer.root, context.abort, {
               executables, guards: workRootGuards(answer.root),
               role: opts.dispatchRepository ? { dispatchRepository: opts.dispatchRepository } : {},
+              ...filtering,
             });
           }
         }
-        return await inspectGit(operation, inputSchema.parse(input), context.directory, context.abort, { worktree: context.worktree, executables });
+        return await inspectGit(operation, inputSchema.parse(input), context.directory, context.abort, { worktree: context.worktree, executables, ...filtering });
       } catch (error) {
         // G12: report, never throw into the session; messages are credential-redacted.
         return `[router_git] error: ${stripUrlUserinfo(errorMessage(error))}`;
