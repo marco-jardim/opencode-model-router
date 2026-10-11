@@ -40,8 +40,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   observed and no check covers it, the result is refused. A link target pinned at dispatch and
   unchanged since keeps the reference exact (link pins). A tier dispatch on v2 refuses a per-check `cwd=`
   (`a per-check cwd= is honoured only in roles mode`); `scope=` alone is ignored; v1 ignores both keys. A dispatch with
-  per-check keys is verified synchronously, never deferred. The configured roles protocol (`routing.repoParents`)
-  teaches the syntax.
+  per-check keys may be deferred, see "Deferred verification across repositories" below. The configured roles protocol
+  (`routing.repoParents`) teaches the syntax.
+- **Deferred verification across repositories (OpenCode v2, roles mode) (#107).** A role dispatch with a perimeter or
+  with per-check `cwd=`/`scope=` keys may now be deferred (`VERIFY:deferred`, the default). At return the router freezes
+  the perimeter (the statuses for I4 and I8, the working-set roots, the observed link targets, the placements and the
+  link pins). It stays synchronous (reason `cross-repo`) when I4 already refuses at return, when a linked repository
+  could not be observed within the deferral bound, and when a placement or a v2 tier per-check `cwd=` is refused. At
+  `router_verify` the I4 window is the dispatch (never decided again), consumers are discovered over the frozen
+  working-set roots, and link targets are observed again: one that changed since the producer returned, or cannot be
+  observed again, turns a pass UNVERIFIED with a caveat (a fail keeps it); a placement whose path or git top changed
+  since return runs nothing; link pins kept for the deferred entry keep the reference exact. With `routing.repoParents`
+  set, role dispatches are now deferred by default where they used to be synchronous; a "continue and finish" resume of
+  a deferred attempt cannot back a `deterministic` detection (see `docs/ROLES.md`).
 - README: 90-second demo video below the title.
 - **Cross-repo work in roles mode (OpenCode v2; inert on v1) (#107).** New global-only keys `routing.repoParents`,
   `routing.repoDepth` (1–4, default 2) and `routing.repoExclude` name the directories whose repositories role
@@ -82,6 +93,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A full-scope `testsPass`/`lintClean` is never the cheap no-change shortcut (OpenCode v2) (#107).** A check with
+  `scope=full`, and every `testsPass`/`lintClean` when config `testScope` is `"full"` (OpenCode v2 only; v1 is
+  unchanged), now runs even when the producer changed nothing, instead of being passed as "no changed files" (owner
+  decision OD-P2e-2).
 - **A change set that mixes paths inside and outside the observed repository is no longer verified as a pass on the
   inside paths alone.** The runner dropped the outside paths with a note and ran the scoped checks on the rest, and a
   grader, which checks against and runs in the working directory, could not inspect them. The gate now reports

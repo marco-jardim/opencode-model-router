@@ -1268,7 +1268,7 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     expect(section).toContain(`\`${FOREIGN_REFERENCE_NONE}\``);
     // the user-facing syntax and the caveats of the section
     for (const text of ["check: testsPass cwd=\"D:\\git\\app-a\" scope=full", "`scope=affected|full`", "A relative `cwd=` stays inside `W`", "must be inside `W` or in the read set",
-      "unverifiable** and nothing runs", "unverifiable, never a fail", "gets no reference", "UNVERIFIED", "never deferred", "A `scope=` alone is ignored there",
+      "unverifiable** and nothing runs", "unverifiable, never a fail", "gets no reference", "UNVERIFIED", "may be deferred like any other (`VERIFY:deferred`, the default)", "It is verified synchronously (reason `cross-repo`) only in the cases listed there.", "A `scope=` alone is ignored there",
       "On OpenCode v1 the keys are ignored", "(I2)", "(I3)", "gives no run signal",
       "a check whose repository top contains the change root", "(no check root)"]) expect(section, text).toContain(text);
     expect(read("docs/ROLES.md").replace(/\s+/g, " ")).toContain("(./VERIFICATION.md#checks-in-other-repositories)");
@@ -1280,9 +1280,41 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     // the changelog entry
     const unreleased = /## \[Unreleased\]([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
     for (const item of ["**Checks in other repositories (OpenCode v2, roles mode) (#107).**", "check: testsPass cwd=\"<repo>\" scope=full", "`is not covered by any check root`",
-      "never a fail", "is a consumer", "UNVERIFIED", "(link pins)", "`a per-check cwd= is honoured only in roles mode`", "verified synchronously, never deferred"]) {
+      "never a fail", "is a consumer", "UNVERIFIED", "(link pins)", "`a per-check cwd= is honoured only in roles mode`",
+      "A dispatch with per-check keys may be deferred, see \"Deferred verification across repositories\" below.",
+      "**Deferred verification across repositories (OpenCode v2, roles mode) (#107).**", "stays synchronous (reason `cross-repo`)",
+      "link targets are observed again", "turns a pass UNVERIFIED with a caveat (a fail keeps it)",
+      "**A full-scope `testsPass`/`lintClean` is never the cheap no-change shortcut (OpenCode v2) (#107).**", "owner decision OD-P2e-2"]) {
       expect(unreleased, item).toContain(item);
     }
+    expect(unreleased).not.toContain("verified synchronously, never deferred");
+  });
+
+  it("P2e: deferred verification across repositories is documented as the code words it (S11 caveat, cross-repo reasons, placement identity)", () => {
+    const wiring = read("src/verify/wiring.ts");
+    const verificationFlat = read("docs/VERIFICATION.md").replace(/\s+/g, " ");
+    const pinned: Array<[string, string]> = [
+      ["the linked repository ", "S11 caveat prefix"],
+      [" changed since the producer returned; the checks ran against its new state", "S11 changed"],
+      [" could not be observed again since the producer returned", "S11 unobserved"],
+      [" no longer resolves to the same repository since the producer returned; nothing ran", "placement identity"],
+      ["a linked repository could not be observed within the deferral bound; verified synchronously", "cross-repo detail"],
+    ];
+    for (const [fragment, why] of pinned) {
+      expect(wiring, why).toContain(fragment);
+      expect(verificationFlat, why).toContain(fragment);
+    }
+    expect(verificationFlat).toContain("a repository of the perimeter changed during the dispatch while an unattributable writer ran; verified synchronously");
+    expect(verificationFlat).toContain("### Deferred verification across repositories");
+    expect(verificationFlat).not.toContain("never deferred");
+    expect(verificationFlat).not.toContain("interim until deferred verification supports the perimeter");
+    const roles = read("docs/ROLES.md").replace(/\s+/g, " ");
+    expect(roles).toContain("(./VERIFICATION.md#deferred-verification-across-repositories)");
+    const config = read("docs/CONFIG_REFERENCE.md").replace(/\s+/g, " ");
+    expect(config).toContain("A deferred dispatch with a perimeter.");
+    expect(config).toContain("(per-check, or config `testScope: \"full\"` on OpenCode v2 only)");
+    const design = read("docs/design/cross-repo.md").replace(/\s+/g, " ");
+    for (const text of ["| D18 |", "| D19 |", "### Phase 2 implemented (notes)", "LINK_DRIFT_CAVEAT"]) expect(design, text).toContain(text);
   });
 
   it("QA-P32-2: a missing d= is none, graders weigh half only when independent, run matching by entry name, R9(5), code map", () => {

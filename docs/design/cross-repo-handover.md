@@ -25,7 +25,7 @@ Read this first in a new session. The design is `docs/design/cross-repo.md`, and
 | P0: integrity fixes in the shared verification engine (both hosts) | Done. QA'd twice. Live check: the unobservable-writers caveat appeared on a real dispatch. |
 | P1: v2 roles cross-repo (P1.1–P1.10) | Done. QA'd twice. Docs updated. Live dogfood done (see "Phase 1 live dogfood"). |
 | P2 lot 1: P2a–P2d + P2g (plan `docs/design/cross-repo-phase2-plan.md`) | Done. QA'd twice (round 1: 4 major + 9 minor fixed; round 2: 3 major fixed, minors recorded in design §9). Docs and CHANGELOG updated. Live dogfood done (see "Phase 2 live dogfood"); findings F-D1, F-D2 wait for the owner. |
-| P2 lot 2: P2e (deferred P), owner decision OD4 | Not started. Until it lands, a dispatch with per-check keys or a perimeter is verified synchronously. |
+| P2 lot 2: P2e (deferred P), owner decision OD4 | Implemented (`3037ab8`..`722c5db`, docs after): a role dispatch with a perimeter or per-check keys defers; P frozen at return; S11 caveat (OD-P2e-1 = UNVERIFIED); F13 v2-only (OD-P2e-2). **Heavy QA and live dogfood pending.** |
 | P3 / P4 | Not started |
 
 Last checks (HEAD after the round 2 fixes):

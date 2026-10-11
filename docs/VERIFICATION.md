@@ -455,10 +455,30 @@ check: testsPass cwd="D:\git\app-a" scope=full
 - **Changes are captured in `W`.** The change set is always the one observed in `W` (I2); a check in another repository does not move it. With placed checks, every changed path must lie inside some check root (the repository of a placed check, or `W` for an unplaced one); otherwise the verdict is unverifiable: `the change in <paths> is not covered by any check root (<roots>); nothing ran` (I3); `<roots>` reads `(no check root)` when no check root is known. When the change baseline is unavailable the change in `W` is unknown, not empty: unless an unplaced check, or a check whose repository top contains the change root, runs there (a check in a nested repository inside `W`, such as a submodule or vendored repository, does not cover it), the verdict is unverifiable and nothing runs: `the change in the work root could not be observed and no check runs there (<roots>); nothing ran`.
 - **A check in another repository.** `testsPass` and `lintClean` must use `scope=full`, because affected tests cannot be attributed to a change in `W`. Without it the check is unverifiable and does not run: `check <n> (<kind>) runs in another repository (<cwd>) and must use scope=full: affected tests cannot be attributed to a change in the work root`. A failure of any check in another repository is **unverifiable, never a fail**: `a check in another repository (<cwd>) failed; the change under verification is in the work root, so this failure can be neither excused nor attributed: <reason>`. Such a check gets no reference: `the check runs in another repository; the dispatch reference covers the work root only`.
 - **Consumers.** A working-set worktree whose `node_modules` links into `W` is a consumer of `W`. A pass with a change and no `testsPass`, `buildPasses`, `lintClean` or `run` check placed in the consumer is **UNVERIFIED**, with the check to add: `<name> at <root> links this work root (node_modules/<entry>) and no check ran there; add a check such as: check: testsPass cwd="<root>" scope=full`. A `fileExists` or `schemaMatch` check in the consumer does not count. An unavailable change baseline counts as a change. When consumer discovery stopped on its budget before finishing a worktree, a pass with a change (or an unavailable baseline) is likewise **UNVERIFIED**, once per worktree: `consumer discovery stopped before finishing <name> at <root>; a repository there may link this work root unchecked; add a check such as: check: testsPass cwd="<root>" scope=full`. A `testsPass`, `buildPasses`, `lintClean` or `run` check placed in that root clears it, as for a consumer. An empty, available change set and a fail carry no such caveat.
-- **Synchronous verification.** A dispatch with per-check keys is verified at once, never deferred. This is interim until deferred verification supports the perimeter.
+- **Deferral.** A dispatch with per-check keys may be deferred like any other (`VERIFY:deferred`, the default); see "Deferred verification across repositories" below. It is verified synchronously (reason `cross-repo`) only in the cases listed there.
 - **No run signal.** A dispatch where any check has its own `cwd=` (even a relative one inside `W`) gives no run signal at all to the [outcome signals](./ROLES.md#outcome-signals).
 
 A link into a repository that was pinned at dispatch and has not changed since keeps the reference exact (link pins): it is not an `external-link`, see [Package links to outside code](#package-links-to-outside-code).
+
+### Deferred verification across repositories
+
+A role dispatch with a perimeter (a read set below `routing.repoParents`, a working set of several repositories) or with per-check `cwd=`/`scope=` keys may be deferred (`VERIFY:deferred`, the default). OpenCode v2, roles mode only; on v1 nothing changes.
+
+- **Frozen at return.** When the producer returns, the router freezes the perimeter for the handle: the statuses that I4 (no unobserved writer in a repository of the perimeter) and I8 read, the working-set roots, the observed link targets, the check placements and the link pins. A `routing.repoParents` dispatch is therefore deferred by default where it used to be synchronous.
+- **Stays synchronous.** The delegation is verified before return, with reason `cross-repo`, when:
+  - I4 already refuses at return: `a repository of the perimeter changed during the dispatch while an unattributable writer ran; verified synchronously`;
+  - a linked repository could not be observed within the deferral bound: `a linked repository could not be observed within the deferral bound; verified synchronously`;
+  - a check placement is refused, or a v2 tier dispatch carries a per-check `cwd=` (see above).
+- **At `router_verify`.**
+  - The I4 window is the dispatch. It is not decided again: a write made after the producer returned does not turn the verdict.
+  - Consumers (see "Consumers" above) are discovered over the frozen working-set roots, at the gate that runs the checks.
+  - Link targets are observed again (S11). A link target that changed since the producer returned, or cannot be observed again, turns a pass **UNVERIFIED** with a caveat; a fail stays a fail and carries it:
+    - `the linked repository <name> at <root> changed since the producer returned; the checks ran against its new state`
+    - `the linked repository <name> at <root> could not be observed again since the producer returned`
+  - A placement whose path or git top changed since the producer returned runs nothing: `check <n> (<kind>) cwd=<cwd> no longer resolves to the same repository since the producer returned; nothing ran`.
+  - Link pins kept for the deferred entry keep the reference exact.
+- **A full scope is never the no-change shortcut.** A `testsPass` or `lintClean` check with `scope=full` is never settled by the cheap "no changed files" shortcut, even when the producer changed nothing; it runs. The same holds for config `testScope: "full"` on OpenCode v2 (OpenCode v1 is unchanged).
+- **A deferred pass names the producer's repository as it was at return.** Consequences for roles (a "continue and finish" resume of a deferred attempt, detection no longer `deterministic`) are in [ROLES](./ROLES.md#repositories-below-parent-directories-cross-repo).
 
 ## `verify` config keys
 

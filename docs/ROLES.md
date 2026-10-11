@@ -344,8 +344,23 @@ reason suggests `branch=` instead of `repo=`): `the repository <name> at <root> 
 producer ran <tools>; a write there cannot be attributed, so the checks in <W> do not cover it. Dispatch that work with
 repo=<name>, or verify it there.` (`could not be observed during the dispatch` for a missing snapshot). A pass with
 more than one root shows its scope as a note, `verified scope: <W> (<branch> @ <head7>); also observed: …`; a changed
-repository without writers is marked `changed during the dispatch`. Such a dispatch is not deferred (reason
-`cross-repo`).
+repository without writers is marked `changed during the dispatch`. A dispatch whose I4 already refuses at return (the
+unattributable-writer case above) is verified synchronously (reason `cross-repo`: `a repository of the perimeter changed
+during the dispatch while an unattributable writer ran; verified synchronously`).
+
+**Deferred verification across repositories.** A role dispatch with a perimeter, or with per-check `cwd=`/`scope=`, may
+be deferred (`VERIFY:deferred`, the default; OpenCode v2). At return the router freezes the perimeter (the statuses for
+I4 and I8, the working-set roots, the observed link targets, the check placements and the link pins). The I4 window is the
+dispatch and is never decided again; `router_verify` discovers consumers over the frozen working-set roots and observes
+the link targets again (a changed or unobservable one turns a pass UNVERIFIED). It stays synchronous (reason
+`cross-repo`) when I4 already refuses at return, when a linked repository could not be observed within the deferral
+bound (`a linked repository could not be observed within the deferral bound; verified synchronously`), and when a
+placement or a v2 tier per-check `cwd=` is refused. Details are in
+[Deferred verification across repositories](./VERIFICATION.md#deferred-verification-across-repositories).
+
+- **With `routing.repoParents` set**, role dispatches are deferred by default where they used to be synchronous. A
+  "continue and finish" resume of a deferred attempt therefore finds an attempt that was never gated (see "What a resume
+  keeps"), and the detection is no longer `deterministic` for its change-set checks.
 
 - **Checks in other repositories.** A check may run in another repository of the read set with `cwd=` and `scope=full`
   (`check: testsPass cwd="D:\git\app-a" scope=full`); the change is still captured in the work root. Syntax, refusals
