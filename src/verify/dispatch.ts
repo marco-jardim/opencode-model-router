@@ -20,6 +20,7 @@ import type { DispatchReference } from "./reference";
 import { REFERENCE_NONE } from "./baseline";
 import { neutralizeDirectives } from "./pending";
 import { withTimeout } from "./timeout";
+import { applyPatchHeaderPaths } from "../router/tool-paths";
 
 export interface TreeSnapshot {
   cwd: string;
@@ -69,13 +70,16 @@ function none(reason: string): ReferenceState {
  * appended (a deleted file keeps its directory's canonical spelling); lexical `resolve` when no
  * ancestor resolves.
  */
-export function canonicalPath(path: string): string {
+export function canonicalPath(
+  path: string,
+  realpath: (p: string) => string = realpathSync.native,
+): string {
   const absolute = resolve(path);
   let head = absolute;
   const tail: string[] = [];
   for (;;) {
     try {
-      const real = realpathSync.native(head);
+      const real = realpath(head);
       return tail.length === 0 ? real : join(real, ...tail.reverse());
     } catch {
       const parent = dirname(head);
@@ -469,10 +473,8 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
       touch(sessionID);
       observeEdit(tool, dispatches.get(sessionID)?.cwd);
       if (tool.toLowerCase() === "apply_patch") {
-        const a = args && typeof args === "object" ? args as Record<string, unknown> : {};
-        const patch = typeof a.patchText === "string" ? a.patchText : typeof a.patch === "string" ? a.patch : "";
         const files = bySession.get(sessionID) ?? new Map<string, string>();
-        for (const match of patch.matchAll(/^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)$/gm)) files.set(match[1].trim(), "modified");
+        for (const p of applyPatchHeaderPaths(args)) files.set(p, "modified");
         bySession.set(sessionID, files);
       }
       const cf = extractChangedFile(tool, args);
