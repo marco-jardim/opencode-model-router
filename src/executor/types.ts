@@ -1408,7 +1408,7 @@ export interface IntegrationListener {
 /**
  * Serial rebase/check/fast-forward queue, phase suite and landing (3.2).
  * Leases (A2, QA-1.4-22): the queue releases a task's leases (`LeaseService.releaseTask`) in the same step that releases its slot
- * (A1-2.4), i.e. after the fsync of the batch that moves it to integrated, reverted or cancelled (never before).
+ * (A1-2.4), i.e. after the fsync of the batch that moves it to integrated, cancelled or blocked (never before).
  */
 export interface IntegrationQueue {
   /** pre: each id is verified with slot and branch. Idempotent (an id already queued or integrating is ignored).
@@ -1441,27 +1441,47 @@ export interface IntegrationQueue {
   dispose(): Promise<void>;
 }
 
-/** Who holds a path lease (2.1, scope `until-integrated`). */
-export interface LeaseView {
-  holder(path: string): { taskId: TaskId | null; sessionID: string } | null;
+/** Registry taskRef of a plan task; unique per process (PLAN_ID and TASK_ID grammars exclude ':'). */
+export function leaseTaskRef(planId: PlanId, taskId: TaskId): string { return `${planId}:${taskId}`; }
+/** Registry holderID of a plan task's own lease holder (before and independent of any child session). */
+export function leaseHolderID(planId: PlanId, taskId: TaskId): string { return `plan:${planId}:${taskId}`; }
+export interface LeaseHolderInfo {
+  /** null: not a plan task (an ad-hoc child session). */
+  planId: PlanId | null;
+  taskId: TaskId | null;
+  /** Registry holderID: a child session id, or leaseHolderID(...). */
+  holderID: string;
 }
-
+/** Who holds a path lease (2.1). `path` is repo-relative (Footprint rules); answered by logical key, so any worktree of the repo matches. */
+export interface LeaseView { holder(path: string): LeaseHolderInfo | null; }
 /**
- * The mutable lease seam of the executor (A2, QA-1.4-22): the one object `TaskLauncher`, `IntegrationQueue`, `UnattendedPolicy` and the
- * runtime share. Mapped onto Phase 1.3's registry: `acquireTask` = `acquireWrite` for every path with scope `until-integrated` and
- * `taskRef = taskId` (all-or-nothing: on conflict nothing is acquired and every holder is listed); `releaseTask` = release by `taskRef`
- * (idempotent); `rebuild` = `restore` from the ledger at open (every task with a slot that is not yet integrated/reverted/cancelled
- * holds its footprint writes). `holder` is the inherited read view.
+ * Per-plan lease seam over the ONE process-wide Phase 1.3 registry (A2/A3, QA-1.4-22/-32/-33).
+ * Holder of every task lease: { holderID: leaseHolderID(planId, id), tree, isChild: true,
+ *   taskRef: leaseTaskRef(planId, id), scope: "until-integrated" }.
+ * Child sessions join through the 2.1 guard with their own holderID, the same taskRef and scope, and tree = slot path;
+ * they are re-entrant (same owner) and end with releaseTask. Never calls registry.restore.
  */
 export interface LeaseService extends LeaseView {
-  /** `sessionID` is the child session once known, else null. `writes` are the task's footprint writes. */
-  acquireTask(
-    taskId: TaskId, sessionID: string | null, writes: readonly string[],
-  ): { ok: true } | { ok: false; holders: Array<{ taskId: TaskId | null; sessionID: string }> };
-  /** Idempotent. Called by `IntegrationQueue` and `UnattendedPolicy` on integrated, reverted, cancelled and parked-for-good (A1-2.4). */
+  readonly planId: PlanId;
+  /** tree = the task's slot path (SlotLease.path). writes = footprint.writes.
+   *  [] -> { ok: true } with no registry call (never pass [] to acquireWrite: it is an unknown-target write).
+   *  Otherwise ONE acquireWrite(holder, writes): atomic all-or-nothing in the registry.
+   *  held | unknown-target -> "held" with the holder(s) the registry names (at least one; not necessarily all). */
+  acquireTask(i: { taskId: TaskId; tree: string; writes: readonly string[] }):
+    | { ok: true }
+    | { ok: false; reason: "held"; holders: LeaseHolderInfo[] }
+    | { ok: false; reason: "cap" | "invalid"; message: string };
+  /** registry.releaseTask(leaseTaskRef(planId, taskId)); idempotent.
+   *  Called after the fsync of every batch that writes TS(null) for the task, by the module that wrote it (A1-2.4 release column):
+   *  Rt rows 6, 9, 14, 15qa, 18b, 20, 22, 24, 27, 29, 39 (abort included); Q rows 5, 13, 19, 30, 33; P rows 17, 36.
+   *  For a live child being cancelled, after its completion settles. */
   releaseTask(taskId: TaskId): void;
-  /** Replaces all task leases from the ledger (open, takeover). */
-  rebuild(tasks: ReadonlyArray<Pick<TaskNode, "id" | "slot" | "footprint">>): void;
+  /** At open/takeover, after the slots are resolved. For every task: releaseTask(id); then for each task with
+   *  slot !== null and writes non-empty: acquireTask({ taskId: id, tree, writes: footprint.writes }).
+   *  Touches no holder outside this plan's taskRefs. Returns the tasks whose leases could not be re-taken
+   *  (the runtime raises one inbox item per entry; it does not throw). */
+  rebuild(tasks: ReadonlyArray<{ id: TaskId; slot: string | null; tree: string | null; footprint: Footprint }>):
+    Array<{ taskId: TaskId; holders: LeaseHolderInfo[] }>;
 }
 export interface TaskRoute {
   agent: string;
@@ -1483,7 +1503,8 @@ export interface ScheduledTask {
 export interface Scheduler {
   /** Tasks that are ready, not manual/preflight, not in inFlight, in an unpaused phase of a running plan, with every edge satisfied
    *  (task source integrated|done; gate source passed), R16, no held predicted write (soft), within free capacity counted down greedily.
-   *  Order: bottom level desc, ties by plan order. */
+   *  Order: bottom level desc, ties by plan order.
+   *  `leases.holder(path)` answering a holder whose `planId` is another plan or null is "not a plan task" under R6 -> lease-unresolvable. */
   readySet(ledger: LedgerV1, inFlight: ReadonlySet<TaskId>, leases: LeaseView, capacity: CapacityView): ScheduledTask[];
   /** pending->ready and blocked->ready candidates. */
   promotable(ledger: LedgerV1): { toReady: TaskId[]; unblock: TaskId[] };
@@ -1644,7 +1665,7 @@ export interface LaunchHandle {
 export interface TaskLauncher {
   /** Pure read of in-memory state. ok only with a capture from `orchestratorSessionID` taken in this process (guard 6) whose epoch is not stale. */
   gate(orchestratorSessionID: string): LaunchGate;
-  /** pre: gate ok and `req.context` is the current capture of `orchestratorSessionID`; the task is dispatched with its open attempt fsynced; the capacity token, slot and leases are held.
+  /** pre: gate ok and `req.context` is the current capture of `orchestratorSessionID`; the task is dispatched with its open attempt fsynced; the capacity token and slot are held, and the task's leases were acquired by Rt (`LeaseService.acquireTask`) before the row-4 batch and are released if the append fails or the builder returns [].
    *  Does: the decision row, recordDispatchStart and the D2 in-flight registration (DispatchBookkeeping); then ChildRunner.run with detached:true,
    *  `context: req.context`, an executor-owned AbortController (combined with the plugin lifetime), explicit agent and model, cwd = workRoot.
    *  Emits the context-age metric. The launcher never journals (Rt does, A1-5). markStale only for "timeout" and "threw". Classifies the end:
@@ -1743,7 +1764,7 @@ export interface UnattendedPolicy {
   raise(i: Omit<InboxItem, "id" | "createdAt" | "answer"> & { answer?: string }): Promise<InboxItem>;
   /** From running (escalate|ambiguity|qa-unparsable) or conflict|failed|reverted (exhausted). post: parked; transitive **pending** dependents
    *  -> blocked (a dependent of an un-integrated task cannot be ready or in flight, R9/R10); one inbox item.
-   *  Leases are held exactly while `slot !== null` (A1-2.4): parking releases the slot and so calls `LeaseService.releaseTask`; the answered
+   *  Leases are held exactly while `slot !== null` (A1-2.4): parking releases the slot and so calls `LeaseService.releaseTask` after the fsync of the park batch (P rows 17, 36); the answered
    *  task re-acquires through `LeaseService.acquireTask` when it is launched again (A2, QA-1.4-22). */
   park(taskId: TaskId, cause: "escalate" | "ambiguity" | "qa-unparsable" | "exhausted", text: string): Promise<InboxItem>;
   /** pre: item open. post: inbox-answered; attempt-context on the latest attempt; parked -> ready. A critical `qa-cap` item goes to

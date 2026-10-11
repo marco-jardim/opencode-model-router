@@ -19,6 +19,8 @@ import {
   GATE_TRIGGER_OWNERS,
   RESERVED_TASK_IDS,
   isTaskId,
+  leaseHolderID,
+  leaseTaskRef,
   GIT_ID_PATTERN,
   HEAVY_CAP_PER_PROVIDER,
   INBOX_ID_PATTERN,
@@ -108,6 +110,7 @@ import type {
   IntegrationQueue,
   LaunchHandle,
   LaunchRequest,
+  LeaseHolderInfo,
   LeaseService,
   LeaseView,
   LedgerStatus,
@@ -2201,44 +2204,97 @@ describe("typed test doubles for every interface", () => {
     expect(calls).toEqual(["enqueue", "resume", "checkPhase", "land", "abort", "queued", "dispose"]);
   });
 
+  it("leaseTaskRef / leaseHolderID are unique per plan and task (QA-1.4-32/-33)", () => {
+    expect(leaseTaskRef("plan-one", "T1")).toBe("plan-one:T1");
+    expect(leaseHolderID("plan-one", "T1")).toBe("plan:plan-one:T1");
+    // The same task id in two plans gives different refs and holder ids.
+    expect(leaseTaskRef("plan-one", "T1")).not.toBe(leaseTaskRef("plan-two", "T1"));
+    expect(leaseHolderID("plan-one", "T1")).not.toBe(leaseHolderID("plan-two", "T1"));
+    // Neither id grammar allows ':' so the separator is unambiguous.
+    expect(isTaskId("T:1")).toBe(false);
+  });
+
   it("LeaseView / LeaseService, CapacityView and Scheduler", () => {
     const { calls, hit } = tracker();
-    // A stateful LeaseService double (QA-1.4-22): all-or-nothing acquire, idempotent release, rebuild from the ledger.
-    const held = new Map<string, { taskId: string; sessionID: string | null }>();
-    const leases: LeaseService = {
-      holder: () => hit("holder", { taskId: "T1", sessionID: "ses-1" }),
-      acquireTask: (taskId, sessionID, writes) => {
+    // A stateful per-plan LeaseService double over one shared registry (QA-1.4-22/-32/-33): all-or-nothing acquire,
+    // release by taskRef (idempotent), rebuild that never touches a holder outside the plan.
+    type Held = { planId: string | null; taskId: string | null; holderID: string; taskRef: string; tree: string };
+    const registry = new Map<string, Held>();
+    let acquireWriteCalls = 0;
+    const makeLeases = (planId: string): LeaseService => {
+      const releaseTask = (taskId: string): void => {
+        const ref = leaseTaskRef(planId, taskId);
+        for (const [p, h] of [...registry]) if (h.taskRef === ref) registry.delete(p);
+      };
+      const info = (h: Held): LeaseHolderInfo => ({ planId: h.planId, taskId: h.taskId, holderID: h.holderID });
+      const acquireTask: LeaseService["acquireTask"] = ({ taskId, tree, writes }) => {
+        if (writes.length === 0) return { ok: true };
+        acquireWriteCalls++;
+        const ref = leaseTaskRef(planId, taskId);
         const holders = writes.flatMap((p) => {
-          const h = held.get(p);
-          return h !== undefined && h.taskId !== taskId ? [{ taskId: h.taskId, sessionID: h.sessionID ?? "" }] : [];
+          const h = registry.get(p);
+          return h !== undefined && h.taskRef !== ref ? [info(h)] : [];
         });
-        if (holders.length > 0) return { ok: false, holders };
-        for (const p of writes) held.set(p, { taskId, sessionID });
+        if (holders.length > 0) return { ok: false, reason: "held", holders };
+        for (const p of writes) registry.set(p, { planId, taskId, holderID: leaseHolderID(planId, taskId), taskRef: ref, tree });
         return { ok: true };
-      },
-      releaseTask: (taskId) => {
-        for (const [p, h] of [...held]) if (h.taskId === taskId) held.delete(p);
-      },
-      rebuild: (tasks) => {
-        held.clear();
-        for (const t of tasks) if (t.slot !== null) for (const p of t.footprint.writes) held.set(p, { taskId: t.id, sessionID: null });
-      },
+      };
+      return {
+        planId,
+        holder: (path) => {
+          hit("holder", undefined);
+          const h = registry.get(path);
+          return h === undefined ? null : info(h);
+        },
+        acquireTask,
+        releaseTask,
+        rebuild: (tasks) => {
+          for (const t of tasks) releaseTask(t.id);
+          const failed: Array<{ taskId: string; holders: LeaseHolderInfo[] }> = [];
+          for (const t of tasks) {
+            if (t.slot === null || t.tree === null || t.footprint.writes.length === 0) continue;
+            const r = acquireTask({ taskId: t.id, tree: t.tree, writes: t.footprint.writes });
+            if (!r.ok && r.reason === "held") failed.push({ taskId: t.id, holders: r.holders });
+          }
+          return failed;
+        },
+      };
     };
+    const leases = makeLeases("plan-one");
     const view: LeaseView = leases;
-    expect(leases.acquireTask("T1", null, ["src/a.ts", "src/b.ts"])).toEqual({ ok: true });
-    expect(leases.acquireTask("T1", "ses-1", ["src/a.ts"])).toEqual({ ok: true });
-    expect(leases.acquireTask("T2", "ses-2", ["src/b.ts", "src/c.ts"])).toEqual({
-      ok: false, holders: [{ taskId: "T1", sessionID: "" }],
+    expect(leases.planId).toBe("plan-one");
+    expect(leases.acquireTask({ taskId: "T1", tree: "C:/slots/slot-1", writes: ["src/a.ts", "src/b.ts"] })).toEqual({ ok: true });
+    expect(leases.acquireTask({ taskId: "T1", tree: "C:/slots/slot-1", writes: ["src/a.ts"] })).toEqual({ ok: true });
+    expect(leases.acquireTask({ taskId: "T2", tree: "C:/slots/slot-2", writes: ["src/b.ts", "src/c.ts"] })).toEqual({
+      ok: false, reason: "held", holders: [{ planId: "plan-one", taskId: "T1", holderID: "plan:plan-one:T1" }],
     });
-    expect(held.has("src/c.ts")).toBe(false);
+    expect(registry.has("src/c.ts")).toBe(false);
     leases.releaseTask("T1");
     leases.releaseTask("T1");
-    expect(held.size).toBe(0);
-    leases.rebuild([
-      { id: "T3", slot: "s1", footprint: { ...taskNode("T3").footprint, writes: ["src/z.ts"] } },
-      { id: "T4", slot: null, footprint: { ...taskNode("T4").footprint, writes: ["src/y.ts"] } },
+    expect(registry.size).toBe(0);
+    // acquireTask with no writes makes no registry call.
+    const callsBefore = acquireWriteCalls;
+    expect(leases.acquireTask({ taskId: "T9", tree: "C:/slots/slot-9", writes: [] })).toEqual({ ok: true });
+    expect(acquireWriteCalls).toBe(callsBefore);
+    expect(registry.size).toBe(0);
+    // rebuild keeps holders outside the plan (another plan, an ad-hoc child) and re-takes this plan's slot leases.
+    const other = makeLeases("plan-two");
+    expect(other.acquireTask({ taskId: "T3", tree: "C:/slots/other", writes: ["src/other.ts"] })).toEqual({ ok: true });
+    registry.set("src/adhoc.ts", { planId: null, taskId: null, holderID: "ses-adhoc", taskRef: "adhoc", tree: "C:/repo" });
+    leases.acquireTask({ taskId: "T4", tree: "C:/slots/slot-4", writes: ["src/stale.ts"] });
+    const notRetaken = leases.rebuild([
+      { id: "T3", slot: "s1", tree: "C:/slots/s1", footprint: { ...taskNode("T3").footprint, writes: ["src/z.ts"] } },
+      { id: "T4", slot: null, tree: null, footprint: { ...taskNode("T4").footprint, writes: ["src/y.ts"] } },
+      { id: "T5", slot: "s2", tree: "C:/slots/s2", footprint: { ...taskNode("T5").footprint, writes: ["src/other.ts"] } },
     ]);
-    expect([...held.keys()]).toEqual(["src/z.ts"]);
+    expect([...registry.keys()].sort()).toEqual(["src/adhoc.ts", "src/other.ts", "src/z.ts"]);
+    expect(registry.get("src/other.ts")?.taskRef).toBe("plan-two:T3");
+    expect(registry.get("src/adhoc.ts")?.holderID).toBe("ses-adhoc");
+    expect(notRetaken).toEqual([
+      { taskId: "T5", holders: [{ planId: "plan-two", taskId: "T3", holderID: "plan:plan-two:T3" }] },
+    ]);
+    registry.clear();
+    registry.set("src/a.ts", { planId: "plan-one", taskId: "T1", holderID: "ses-1", taskRef: "plan-one:T1", tree: "C:/slots/slot-1" });
     const capacity: CapacityView = {
       routeOf: () => hit("routeOf", ROUTE),
       free: () => hit("free", 2),
@@ -2249,7 +2305,7 @@ describe("typed test doubles for every interface", () => {
       manualReady: () => hit("manualReady", ["M1"]),
       addLearnedEdge: () => hit("addLearnedEdge", EDGE),
     };
-    expect(view.holder("src/a.ts")).toEqual({ taskId: "T1", sessionID: "ses-1" });
+    expect(view.holder("src/a.ts")).toEqual({ planId: "plan-one", taskId: "T1", holderID: "ses-1" });
     expect(capacity.routeOf(taskNode("T3"))).toBe(ROUTE);
     expect(capacity.free("anthropic", false)).toBe(2);
     expect(scheduler.readySet(LEDGER, new Set<string>(), leases, capacity)[0]?.taskId).toBe("T3");
