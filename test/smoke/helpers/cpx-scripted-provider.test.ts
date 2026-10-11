@@ -75,6 +75,39 @@ it("answers a 529 overloaded error", async () => {
   expect(provider.captures).toHaveLength(0);
 });
 
+it("answers a non-retryable 400 invalid-request error without forwarding (the fixture records nothing)", async () => {
+  const { provider, front, url } = await start();
+  front.failNext("invalid-request");
+  const response = await post(url);
+  expect(response.status).toBe(400);
+  expect(response.headers.get("retry-after")).toBeNull();
+  expect(response.headers.get("content-type")).toBe("application/json");
+  expect(await response.json()).toEqual({ type: "error", error: { type: "invalid_request_error", message: "cpx scripted invalid request" } });
+  expect(provider.captures).toHaveLength(0);
+  expect(front.requests.map(r => r.served)).toEqual(["invalid-request"]);
+  expect(front.frontErrors).toEqual([]);
+  expect(faultAnswer("invalid-request")).toMatchObject({ status: 400, headers: { "request-id": "req_cpx_invalid-request" } });
+});
+
+it("serves invalid-request by count and by predicate like the other kinds", async () => {
+  const { provider, front, url } = await start();
+  front.failWhen(r => (r.body as { stream?: boolean }).stream === true, "invalid-request", { times: 2 });
+  expect((await post(url, { ...ask, stream: false })).status).toBe(200);
+  expect(front.pendingFaults).toBe(2);
+  expect((await post(url, { ...ask, stream: true })).status).toBe(400);
+  expect((await post(url, { ...ask, stream: true })).status).toBe(400);
+  expect((await post(url, { ...ask, stream: true })).status).toBe(200);
+  expect(front.pendingFaults).toBe(0);
+  expect(front.requests.map(r => r.served)).toEqual(["forwarded", "invalid-request", "invalid-request", "forwarded"]);
+  expect(provider.captures).toHaveLength(2);
+  front.failNext("invalid-request", { times: Infinity });
+  expect(front.pendingFaults).toBe(1);
+  expect((await post(url)).status).toBe(400);
+  expect((await post(url)).status).toBe(400);
+  front.clearFaults();
+  expect((await post(url)).status).toBe(200);
+});
+
 it("answers a usage-limit 429 that names the reset time in the body and the reset headers", async () => {
   const { front, url } = await start();
   const resetAt = new Date(Date.now() + 7_200_000);

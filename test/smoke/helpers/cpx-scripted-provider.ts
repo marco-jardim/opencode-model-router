@@ -17,7 +17,7 @@ import { listenOnFetchSafePort } from "./fetch-safe-port";
 import { ScriptedProvider, type HostVersion } from "./scripted-provider";
 
 /** Fault shapes the front can answer instead of forwarding (all are Anthropic error envelopes `{type:"error",error:{type,message}}`). */
-export type FaultKind = "rate-limit" | "overloaded" | "usage-limit";
+export type FaultKind = "rate-limit" | "overloaded" | "usage-limit" | "invalid-request";
 /** Cache token counters added to the Anthropic `usage` object. */
 export interface CacheUsage { read: number; creation: number }
 /** One request seen by the front. `headers` never contain `authorization`, `x-api-key` or `proxy-authorization`. */
@@ -71,10 +71,13 @@ const iso = (value: Date | string | undefined, fallback: number): string => {
  * - `usage-limit`: 429, `retry-after: <seconds until reset, >= 1>`, `anthropic-ratelimit-requests-reset`, `anthropic-ratelimit-tokens-reset`
  *   and `anthropic-ratelimit-unified-reset` all `<ISO reset time>`, `anthropic-ratelimit-*-remaining: 0`; body
  *   `{"type":"error","error":{"type":"rate_limit_error","message":"Usage limit reached. Your limit will reset at <ISO reset time>."}}`.
+ * - `invalid-request`: 400, no `retry-after`; body `{"type":"error","error":{"type":"invalid_request_error","message":"cpx scripted invalid request"}}`.
+ *   A NON-retryable failure answered by the front itself (never forwarded), so the fixture behind it records no error of its own.
  */
 export function faultAnswer(kind: FaultKind, options: FaultOptions = {}, now = Date.now()): FaultAnswer {
   const headers: OutgoingHttpHeaders = { "content-type": "application/json", "request-id": `req_cpx_${kind}` };
   const envelope = (type: string, message: string) => JSON.stringify({ type: "error", error: { type, message } });
+  if (kind === "invalid-request") return { status: 400, headers, body: envelope("invalid_request_error", "cpx scripted invalid request") };
   if (kind === "overloaded") return { status: 529, headers, body: envelope("overloaded_error", "Overloaded") };
   if (kind === "rate-limit") {
     const seconds = options.retryAfterSeconds ?? 1;

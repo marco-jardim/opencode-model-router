@@ -516,10 +516,13 @@ d("C7 child terminal events carry the child id; the context reads back the final
         const { arrivals } = instrument(host);
         host.provider.holdMarked("C7_HOLD", 8_000);
         const root = await host.newRoot("C7 root");
-        // Failure mechanism: the fixture answers HTTP 400 `invalid_request_error` (non-retryable) when a request asks for a tool the child does not advertise:
-        // `SPIKE_DELEGATE=` in the child's prompt makes it request `delegate` (RoutingProvider.handle). Whether the child advertises `delegate` is recorded.
+        // Failure mechanism: the FRONT answers every provider request of the C7_FAIL child (non-root session, last message carries the token) with HTTP 400
+        // `invalid_request_error` (fault kind "invalid-request", non-retryable, never forwarded). The fixture behind it raises no error, so `callMany`'s
+        // "scripted provider error" abort can never fire; the number of fault answers served is the host's attempt count for that child.
+        const failChild = (r: CpxRequest): boolean => hdr(r, "x-proof-session") !== root && hdr(r, "x-proof-kind") === "primary" && json(bodyMessages(r).at(-1)).includes("C7_FAIL");
+        front(host).failWhen(failChild, "invalid-request", { times: Number.POSITIVE_INFINITY });
         const child = (token: string, extra = ""): Obj => ({ agent: CHILD, description: `C7 ${token}`, prompt: `C7_HOLD ${token}${extra}`, model: `${SONNET}#low`, background: true });
-        const calls = await host.callMany(root, [child("C7_OK"), child("C7_FAIL", " SPIKE_DELEGATE={\"x\":1}"), child("C7_INT")]);
+        const calls = await host.callMany(root, [child("C7_OK"), child("C7_FAIL"), child("C7_INT")]);
         const ids = Object.fromEntries(["C7_OK", "C7_FAIL", "C7_INT"].map(token => [token, calls.find(c => str(obj(c.before.input).prompt)?.includes(token))?.childID]));
         o.observed.children = ids;
         const intID = ids.C7_INT;
@@ -549,6 +552,13 @@ d("C7 child terminal events carry the child id; the context reads back the final
         }
         o.observed.perChild = perChild;
         o.observed.fixtureErrors = host.provider.errors.map(e => e.slice(0, 300));
+        const failServed = front(host).requests.filter(r => r.served === "invalid-request");
+        o.observed.failure = {
+          mechanism: "CpxFront.failWhen(<non-root, primary, last message carries C7_FAIL>, \"invalid-request\", { times: Infinity }): HTTP 400 invalid_request_error answered by the front",
+          faultAnswersServed: failServed.length, hostAttemptsForFailChild: failServed.map(r => ({ index: r.index, arrivedAt: arrivals.get(r.index), session: hdr(r, "x-proof-session") })),
+          retriedByHost: failServed.length > 1, pendingFaultEntries: front(host).pendingFaults,
+        };
+        front(host).clearFaults();
         // The parent: which completion envelopes (and states) did it get?
         const stored = await tryWait("three completion envelopes in the parent", async () => { const v = await storedView(host, root); return envelopeStates(v.envelopes).length >= 3 ? v : undefined; }, 30_000);
         const view = stored ?? await storedView(host, root);
