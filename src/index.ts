@@ -29,7 +29,7 @@ import { buildPluginAgentDefinition, mergeHostAgentEntry, pluginAgentMarker } fr
 import { filterSensitiveGrep } from "./router/sensitive-paths";
 import { selectTierPrompt, TOOL_AUTHORITY_CLAUSE } from "./router/prompts";
 import { stripDelegateInstructions } from "./router/instructions";
-import { buildDispatchHeader, DISPATCH_HEADER_PREFIX, DISPATCH_HEADER_SEPARATOR, routeLineRoot } from "./router/dispatch-header";
+import { buildDispatchHeader, DISPATCH_HEADER_PREFIX, DISPATCH_HEADER_SEPARATOR, routeLineRoot, stripDispatchHeader } from "./router/dispatch-header";
 import { detectFalseRefusal, parseTaskResult as parseRefusalTaskResult } from "./router/false-refusal";
 import {
   buildTiersOutput,
@@ -1196,8 +1196,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
    */
   const roleDispatchCap = (prompt: unknown): Cap | null => {
     if (typeof prompt !== "string") return null;
-    const parsed = parseCapDirective(prompt);
-    return parsed === "none" && !/\breason:/i.test(prompt) ? null : parsed;
+    // P2g.3 (OD6): the orchestrator's own text — a router role header (a work root such as `.../CAP:9`) is never read as the cap.
+    const text = stripDispatchHeader(prompt);
+    const parsed = parseCapDirective(text);
+    return parsed === "none" && !/\breason:/i.test(text) ? null : parsed;
   };
   /** Caps of fresh role dispatches, by the parent's call, until the child binds (bounded, oldest out). */
   const pendingRoleCaps = new Map<string, { agent: string; cap: Cap }>();
@@ -1232,8 +1234,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
    */
   const verificationScopeOf = (callID: unknown, args: Record<string, unknown> | undefined, dod: { cwd?: string }): VerificationScope =>
     verificationScope(requestedVerificationCwd(args?.cwd, dod.cwd), typeof callID === "string" ? routedRoleOf(callID)?.verifyRoot : undefined);
-  /** The prompt as the orchestrator wrote it: without the router's nonce line (handoff 18; role dispatches carry no header). */
-  const withoutNonceLine = (prompt: string): string => prompt.replace(/\r?\n?OMR_NONCE=[A-Za-z0-9_-]+\s*$/, "");
+  /** The prompt as the orchestrator wrote it: without the router's role dispatch header (P2g.3, OD6) and its nonce line (handoff 18). */
+  const withoutNonceLine = (prompt: string): string => stripDispatchHeader(prompt).replace(/\r?\n?OMR_NONCE=[A-Za-z0-9_-]+\s*$/, "");
   /**
    * The parent's `task` call of a routed role dispatch (before it runs): a resume opens a new guard round for the child (its
    * budget and `budgetExhausted` are per round), and the re-dispatch signal (P1.4, handoff 16) compares the dispatch with the
@@ -2296,14 +2298,12 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               // Handoff 30, R7 (I1/I8 exemption: T1.5.3a, the header names `root=`): on v2 shadow/advise/enforce the engine stripped the
               // route line already; its `root=` comes from the router. No root → the header is byte-identical to before.
               const root = routeLineRoot(args.prompt) ?? (typeof input.callID === "string" ? strippedRouteRoot(input.callID) : undefined);
-              // Cross-repo (P1.7, v2 only): the location of a routed role dispatch, the orchestrator's working set and the read
-              // parents. All empty unless cross-repo is in use, so the header is then byte-identical to before.
-              const location = typeof input.callID === "string" ? routedRoleOf(input.callID)?.grant.location : undefined;
+              // Cross-repo (P1.7, v2 only): the orchestrator's working set and the read parents (a tier call has no routed role,
+              // hence no location). All empty unless cross-repo is in use, so the header is then byte-identical to before.
               const crossRepo = ctx.routerHost === "v2" ? resolveRolesRouting(cfg, "v2") : undefined;
               const workingSet = ctx.routerHost === "v2" && typeof input.sessionID === "string" ? workingSetOf(input.sessionID) : [];
               const prompt = buildDispatchHeader({
                 tier, cap, projectDirectory: ctx.directory, root,
-                ...(location === undefined ? {} : { location }),
                 ...(workingSet.length === 0 ? {} : { workingSet }),
                 ...(crossRepo === undefined || crossRepo.repoParents.length === 0 ? {} : { readParents: crossRepo.repoParents }),
               }) + DISPATCH_HEADER_SEPARATOR + args.prompt;

@@ -41,7 +41,7 @@ import {
   AUTHORITY_BINDING_UNKNOWN_DROP, createHostBudgetObserver, HOST_CONTEXT_OVERFLOW_ERROR, ROLES_RESTART_NOTICE, type HostBudgetObserver,
 } from "../../src/compat/v2-hooks";
 import { roleAgentSteps } from "../../src/router/role-agents";
-import { buildDispatchHeader, DISPATCH_HEADER_SEPARATOR } from "../../src/router/dispatch-header";
+import { buildDispatchHeader, buildRoleDispatchHeader, DISPATCH_HEADER_SEPARATOR } from "../../src/router/dispatch-header";
 import { DEFAULT_TIER_CAPS } from "../../src/router/sessions";
 import { buildForcingNote, createChangedFileStore } from "../../src/verify/dispatch";
 import { buildEscalatePolicy, newLadderState, nextAction } from "../../src/escalate/ladder";
@@ -1342,6 +1342,97 @@ describe("QA round 1 (P2.1)", () => {
   it("P2.2: the budget note starts with the protocol's prefix", () => {
     expect(roleBudgetNotice("explorer", "x").startsWith(`${ROUTER_BUDGET_NOTE_PREFIX} `)).toBe(true);
     expect(roleBudgetNotice("explorer", "x", "host").startsWith(`${ROUTER_BUDGET_NOTE_PREFIX} `)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P2g.3 (OD6): the consumers of a role dispatch header
+// ---------------------------------------------------------------------------
+
+describe("role dispatch header consumers (P2g.3, OD6)", () => {
+  // Built from strings only: the work root names a `CAP:9` directory and never touches the filesystem.
+  const header = (workRoot = "/work/CAP:9/repo"): string => buildRoleDispatchHeader({ agent: "explorer", workRoot, edits: false });
+
+  it("the read cap is the orchestrator's CAP:, never one inside the header", async () => {
+    let snapshot: ((child: string) => ReturnType<typeof captureBudget>) | undefined;
+    const { dir, cfg } = home(ROLES, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir, "v2", { routerOnBudgetSnapshot: (read: typeof snapshot) => { snapshot = read; } });
+    const sessions: Record<string, Record<string, unknown>> = {};
+    const v2 = host(dir, cfg, sessions);
+    await v2.start(hooks, { budgetSnapshot: snapshot! });
+    expect(header()).toContain("CAP:9");
+    const fresh = async (callID: string, child: string, prompt: string) => {
+      const event = { sessionID: "root", agent: "build", messageID: "m", id: callID, tool: "subagent", input: { agent: "explorer", description: "find", prompt } as Record<string, unknown> };
+      await v2.toolHooks["execute.before"](event);
+      sessions[child] = { id: child, parentID: "root", agent: "explorer", title: event.input.description, location: { directory: dir } };
+    };
+    const read = async (child: string, i: number): Promise<string> => {
+      const args = { path: join(dir, `${child}-${i}.ts`) };
+      await v2.toolHooks["execute.before"]({ sessionID: child, agent: "explorer", messageID: "m", id: `${child}-${i}`, tool: "read", input: { ...args } });
+      const output = { title: "", output: `content ${i}`, metadata: {} };
+      await hooks["tool.execute.after"]({ tool: "read", sessionID: child, agent: "explorer", callID: `${child}-${i}`, args: { filePath: args.path } }, output);
+      return output.output;
+    };
+    // The orchestrator's CAP:3 wins over the header's CAP:9.
+    await fresh("h1", "hcapped", `${header()}CAP:3\nFind the loader`);
+    expect(await read("hcapped", 1)).toContain("[cap: 1/3]");
+    expect(await read("hcapped", 2)).toContain("[cap: 2/3]");
+    expect(await read("hcapped", 3)).toContain("CAP REACHED (3/3)");
+    // No CAP: of its own: no cap at all, not 9.
+    await fresh("h2", "huncapped", `${header()}Find the loader`);
+    expect(await read("huncapped", 1)).not.toContain("[cap:");
+    expect(snapshot!("huncapped").readCapReached).toBe(false);
+  });
+
+  it("the re-dispatch signal compares the orchestrator's text: the same task under different headers is the same task", async () => {
+    // A live engine (shadow) gives each routed dispatch a decision id: without one the re-dispatch signal has no row to land on.
+    const outcomes = temp("omr-p2g3-out-");
+    const { dir, cfg } = home({ routing: { delegation: "roles", engine: "shadow", outcomes: { path: outcomes } } }, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks, ingest } = await plugin(dir, "v2");
+    const sessions: Record<string, Record<string, unknown>> = {};
+    const v2 = host(dir, cfg, sessions);
+    await v2.start(hooks);
+    const onSignal = vi.spyOn(ingest!, "onSignal");
+    const kinds = (child: string) => onSignal.mock.calls.filter(([c]) => c === child).map(([, observation]) => observation.kind);
+    const task = "Locate the configuration loader in the repository, list its entry points with file and line, and report which modules import it.";
+    const run = async (callID: string, child: string, prompt: string) => {
+      const event = { sessionID: "root", agent: "build", messageID: "m", id: callID, tool: "subagent", input: { agent: "explorer", description: "find", prompt } as Record<string, unknown> };
+      await v2.toolHooks["execute.before"](event);
+      sessions[child] = { id: child, parentID: "root", agent: "explorer", title: "find", location: { directory: dir } };
+      await v2.toolHooks["execute.after"](parentCall(callID, child, "explorer", "DONE: loader.ts:1 loadConfig"));
+    };
+    // Control: no header at all.
+    await run("rd1", "rd-first", `[route tier=fast]\n${task}`);
+    await run("rd2", "rd-second", `[route tier=medium]\n${task}`);
+    expect(kinds("rd-first")).toContain("redispatch");
+    // The same orchestrator text under a header: still that task. The router puts the header on after routing (the route line is
+    // read from the first line), so the headered prompt is noted by a second pass over the already routed call.
+    const other = "Summarise the release notes of the last three versions and list every breaking change they mention, grouped by package.";
+    const noted = async (callID: string, prompt: string) => hooks["tool.execute.before"](
+      { tool: "task", sessionID: "root", callID },
+      { args: { subagent_type: "explorer", description: "find", prompt } },
+    );
+    // The first attempt names a ticket id (P1.5); the retry does not, but the header's work root carries another one (p1.4): read
+    // as part of the retry's text, the header would make the two ids differ and the retry a different task.
+    await run("rd3", "rd-third", `[route tier=fast]\n${other} (P1.5)`);
+    // The retry is routed (tier=medium) and still running: the router keeps its routed role until its result is delivered.
+    await v2.toolHooks["execute.before"]({
+      sessionID: "root", agent: "build", messageID: "m", id: "rd4", tool: "subagent",
+      input: { agent: "explorer", description: "find", prompt: "[route tier=medium]\nCount the lines of every test file under the unit directory and report the five longest." },
+    });
+    expect(kinds("rd-third")).toEqual([]); // unrelated task: no signal yet
+    await new Promise((resolve) => setTimeout(resolve, 5)); // the retry is strictly later than the first attempt
+    await noted("rd4", `${header("/work/p1.4/repo")}${other}`);
+    expect(kinds("rd-third")).toContain("redispatch");
+  });
+
+  it("a tier dispatch keeps the tier header byte-identical", async () => {
+    const { dir, cfg } = home({}, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    const output = { args: { subagent_type: "fast", description: "look", prompt: "Look around" } as Record<string, unknown> };
+    await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "th1" }, output);
+    const cap = cfg.tierCaps?.fast ?? DEFAULT_TIER_CAPS.fast ?? 5;
+    expect(output.args.prompt).toBe(buildDispatchHeader({ tier: "fast", cap, projectDirectory: dir }) + DISPATCH_HEADER_SEPARATOR + "Look around");
   });
 });
 
