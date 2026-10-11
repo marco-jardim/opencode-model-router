@@ -150,9 +150,9 @@ d("cpx background: dispatch, holding and leases on a real v2 host", () => {
     await scenario("background-dispatch", { routing: { engine: "advise", background: { mode: "auto" }, leases: { mode: "off" } } }, async ({ host, observed, check }) => {
       host.provider.holdMarked(HOLD_MARKER, CHILD_HOLD_MS);
       const root = await host.newRoot("cpx background root");
-      const call = await host.dispatch(root, { agent: "fast", description: "Implement feature", prompt: `${IMPLEMENT_PROMPT}\n${HOLD_MARKER}`, background: true });
+      const call = await host.dispatch(root, { agent: "fast", description: "Implement feature", prompt: `${IMPLEMENT_PROMPT}\n${HOLD_MARKER}\nVERIFY:deferred`, background: true });
       const rootRequests = primaryRequests(host, root);
-      const endEventsAtReturn = (await host.eventsOf(call.childID)).filter(e => /^session\.execution\./.test(e.type)).map(e => e.type);
+      const endEventsAtReturn = (await host.eventsOf(call.childID)).filter(e => /^session\.execution\.(succeeded|failed|interrupted)$/.test(e.type)).map(e => e.type);
       observed.ack = clip(resultText(call), 800);
       observed.endEventsAtReturn = endEventsAtReturn;
       observed.tailsBeforeEnd = rootRequests.map(tailOf).map(t => clip(t, 800));
@@ -223,13 +223,29 @@ d("cpx background: dispatch, holding and leases on a real v2 host", () => {
       const edit = (to: string) => scriptLine([{ tool: "edit", input: { path: shared, oldString: "ORIGINAL", newString: to } }], CHILD_OUTPUT);
       const root = await host.newRoot("cpx background leases root");
       const first = await host.dispatch(root, { agent: "fast", description: "First writer", prompt: `${IMPLEMENT_PROMPT}\n${LEASE_ONE}\n${edit("ONE")}`, background: true });
-      const firstEdit = await waitFor("the first writer's edit", async () => (await host.hooks()).find(h => h.hook === "after" && h.sessionID === first.childID && h.tool === "edit"), 60_000, 250);
-      const second = await host.dispatch(root, { agent: "fast", description: "Second writer", prompt: `${IMPLEMENT_PROMPT}\n${LEASE_TWO}\n${edit("TWO")}`, background: true });
-      const secondEdit = await waitFor("the second writer's edit result", async () => (await host.hooks()).find(h => h.hook === "after" && h.sessionID === second.childID && h.tool === "edit"), 60_000, 250);
-      observed.firstEdit = clip(firstEdit, 600);
-      observed.secondEdit = clip(secondEdit, 800);
-      check("first-writes", secondEdit.__t > firstEdit.__t && firstEdit.error === undefined, `the first writer's edit must succeed (${json(firstEdit.error)})`);
-      check("second-refused", /is being edited by/.test(json(secondEdit.error)), `the second writer's edit must be refused by the lease registry, naming the holder (got ${json(secondEdit.error)})`);
+      const editHook = (child: string, kind: "before" | "after") => async () => (await host.hooks()).find(h => h.hook === kind && h.sessionID === child && h.tool === "edit");
+      // Every hook of the two writers, for the observation (a refusal thrown in `execute.before` leaves no `execute.after`).
+      const trail = async (): Promise<unknown> => (await host.hooks()).filter(h => [first.childID, second?.childID].includes(h.sessionID)).map(h => ({ hook: h.hook, session: h.sessionID, tool: h.tool, error: h.error, status: h.status }));
+      let second: (Dispatched & { childID: string }) | undefined;
+      try {
+        await waitFor("the first writer's edit call", editHook(first.childID, "before"), 60_000, 250);
+        const firstEdit = await waitFor("the first writer's edit result", editHook(first.childID, "after"), 60_000, 250);
+        second = await host.dispatch(root, { agent: "fast", description: "Second writer", prompt: `${IMPLEMENT_PROMPT}\n${LEASE_TWO}\n${edit("TWO")}`, background: true });
+        const secondBefore = await waitFor("the second writer's edit call", editHook(second.childID, "before"), 60_000, 250);
+        // The lease refusal is thrown in `execute.before`: the host emits no `execute.after` for it, the writer's next request carries the error result.
+        const secondChild = second.childID;
+        const refusedRequest = await waitFor("a request of the second writer carrying the lease refusal", () => front(host).requests.find(r => hdr(r, "x-proof-session") === secondChild && /is being edited by/.test(json(r.body))), 60_000, 250);
+        const secondAfter = (await editHook(secondChild, "after")());
+        const refusal = secondAfter?.error !== undefined ? json(secondAfter.error) : json(refusedRequest.body).slice(Math.max(0, json(refusedRequest.body).search(/is being edited by/) - 200));
+        observed.firstEdit = clip(firstEdit, 600);
+        observed.secondEdit = clip(secondAfter ?? secondBefore, 800);
+        observed.secondRefusal = clip(refusal, 800);
+        check("first-writes", secondBefore.__t > firstEdit.__t && firstEdit.error === undefined, `the first writer's edit must succeed (${json(firstEdit.error)})`);
+        check("second-refused", /is being edited by/.test(refusal), `the second writer's edit must be refused by the lease registry, naming the holder (got ${refusal})`);
+      } finally {
+        observed.hookTrail = clip(await trail(), 1500);
+      }
+      if (second === undefined) throw new Error("the second writer was never dispatched");
       await childEnded(host, second.childID);
       await childEnded(host, first.childID);
       const onDisk = await readFile(shared, "utf8");
@@ -241,8 +257,18 @@ d("cpx background: dispatch, holding and leases on a real v2 host", () => {
   it("a resume of a held child is refused", async () => {
     await scenario("background-resume-refused", { routing: BG_ROUTING }, async ({ host, observed, check }) => {
       const { root, call } = await heldDispatch(host);
-      const resume = await host.call(root, "subagent", { agent: "fast", description: "Resume the held child", prompt: "Continue the work.", sessionID: call.childID, background: false });
-      const error = json(resume.after.error);
+      // A refusal thrown in `execute.before` never reaches `execute.after` on the host: `host.call` would wait for it in vain. The refusal
+      // is the error tool_result the root's next request carries.
+      const seen = new Set((await host.hooks()).filter(h => h.hook === "before" && h.sessionID === root && h.tool === "subagent").map(h => h.callID));
+      const input = { agent: "fast", description: "Resume the held child", prompt: "Continue the work.", sessionID: call.childID, background: false };
+      await host.client.session.prompt({ sessionID: root, text: `SPIKE_CALL=${json(input)}` });
+      const resumeBefore = await waitFor("the resume's subagent execute.before", async () => (await host.hooks()).find(h => h.hook === "before" && h.sessionID === root && h.tool === "subagent" && !seen.has(h.callID)), 120_000, 250);
+      await host.settle(root);
+      const refusing = await waitFor("a root request carrying the refusal", () => primaryRequests(host, root).find(r => /is held for verification \(/.test(historyOf(r))), 60_000, 250);
+      const afterHooks = (await host.hooks()).filter(h => h.hook === "after" && h.callID === resumeBefore.callID);
+      observed.resumeAfterHooks = afterHooks.length;
+      const history = historyOf(refusing);
+      const error = history.slice(Math.max(0, history.search(/\[router\] Refused: session/)), history.length);
       observed.refusal = clip(error, 800);
       check("refused", /held for verification/.test(error), `the resume must be refused with the held-for-verification message (got ${error})`);
       check("same-child-ends-once", (await childEnded(host, call.childID)) !== "", "the held child still ends normally after the refusal");

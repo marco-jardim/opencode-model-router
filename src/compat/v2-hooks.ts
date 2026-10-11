@@ -144,6 +144,7 @@ function messageText(message: unknown): string | undefined {
   if (!message || typeof message !== "object") return undefined;
   const m = message as Record<string, unknown>;
   if (typeof m.text === "string") return m.text;
+  if (typeof m.content === "string") return m.content;
   const parts = Array.isArray(m.content) ? m.content : Array.isArray(m.parts) ? m.parts : undefined;
   if (parts === undefined) return undefined;
   const texts = parts.flatMap((part) => part && typeof part === "object" && (part as Record<string, unknown>).type === "text"
@@ -698,11 +699,12 @@ export function normalizeAgentOptions(options: Readonly<Record<string, unknown>>
 /** Register the existing router engine on the public OpenCode 2 domain APIs. */
 /** One host completion element `<subagent sessionID="X" state="S">body</subagent>` in a message text (memo §4.4, C2). */
 interface CompletionElement { child: string; state: "completed" | "error" | "cancelled"; body: string }
-const COMPLETION_ELEMENT = /<subagent sessionID="([^"]+)" state="([^"]+)">([\s\S]*?)(?:<\/subagent>|$)/g;
+// Further attributes after `state` (the host may add some) are tolerated and kept.
+const COMPLETION_ELEMENT = /<subagent sessionID="([^"]+)" state="([^"]+)"[^>]*>([\s\S]*?)(?:<\/subagent>|$)/g;
 
 /** The completion elements of a text part that STARTS with one (the host writes a completion as a whole message, C2). */
 function completionElementsOf(text: string): CompletionElement[] {
-  if (!text.startsWith("<subagent sessionID=\"")) return [];
+  if (!text.trimStart().startsWith("<subagent sessionID=\"")) return [];
   const found: CompletionElement[] = [];
   for (const m of text.matchAll(COMPLETION_ELEMENT)) {
     const state = m[2];
@@ -715,20 +717,24 @@ function completionElementsOf(text: string): CompletionElement[] {
 /** Applies `defang` to the body of every `<subagent …>` element of a text (a pure rewrite; the element tags stay). */
 function defangSubagentBodies(text: string, defang: (body: string) => string): string {
   if (!text.includes("<subagent sessionID=\"")) return text;
-  return text.replace(COMPLETION_ELEMENT, (whole: string, child: string, state: string, body: string) => {
+  return text.replace(COMPLETION_ELEMENT, (whole: string, _child: string, _state: string, body: string) => {
     const next = defang(body);
     if (next === body) return whole;
-    return `<subagent sessionID="${child}" state="${state}">${next}${whole.endsWith("</subagent>") ? "</subagent>" : ""}`;
+    const closed = whole.endsWith("</subagent>");
+    const open = whole.slice(0, whole.length - body.length - (closed ? "</subagent>".length : 0));
+    return `${open}${next}${closed ? "</subagent>" : ""}`;
   });
 }
 
 /** Memo §12 (fail closed): replaces the body of every completion element whose child `isProcessed` rejects. Pure; the element tags stay. */
 function redactUnprocessedElements(text: string, isProcessed: (child: string) => boolean): string {
   if (!text.includes("<subagent sessionID=\"")) return text;
-  return text.replace(COMPLETION_ELEMENT, (whole: string, child: string, state: string) => {
+  return text.replace(COMPLETION_ELEMENT, (whole: string, child: string, _state: string, was: string) => {
     if (isProcessed(child)) return whole;
     const body = `[router] The result of session ${child} is withheld: the router could not restore its verification state.`;
-    return `<subagent sessionID="${child}" state="${state}">${body}${whole.endsWith("</subagent>") ? "</subagent>" : ""}`;
+    const closed = whole.endsWith("</subagent>");
+    const open = whole.slice(0, whole.length - was.length - (closed ? "</subagent>".length : 0));
+    return `${open}${body}${closed ? "</subagent>" : ""}`;
   });
 }
 
@@ -1737,7 +1743,12 @@ export async function registerV2Hooks(
           if (part.type !== "text") continue;
           for (const element of completionElementsOf(part.text)) {
             const attempt = inflight.byChild(element.child);
-            if (attempt === undefined || attempt.parentSessionID !== sid) continue;
+            if (attempt === undefined || attempt.parentSessionID !== sid) {
+              ingestLogger.warn("[router] background: a completion element names a child with no attempt of this parent", {
+                parent: sid, child: element.child, state: element.state, attempt: attempt === undefined ? "none" : attempt.parentSessionID,
+              });
+              continue;
+            }
             if (attempt.state === "acknowledged" || attempt.state === "child-ended") {
               void processor.process(element.child, { kind: "completion", state: element.state, body: element.body, at: nowMs() });
             }
@@ -2211,9 +2222,20 @@ export async function registerV2Hooks(
       const history = await ctx.session.context({ sessionID: child } as Parameters<typeof ctx.session.context>[0]);
       const messages: readonly unknown[] = Array.isArray(history) ? history : [];
       for (let index = messages.length - 1; index >= 0; index--) {
-        const message = messages[index] as { role?: unknown; content?: unknown } | undefined;
-        if (message?.role === "assistant") return { text: contentText(message.content) };
+        // The host's context entries are discriminated by `type` ("user" | "assistant" | "synthetic", see the instruction filter in
+        // the system hook); the model-facing messages of the context hook use `role`. Both name the assistant the same way.
+        const message = messages[index] as { type?: unknown; role?: unknown } | undefined;
+        if (message?.type === "assistant" || message?.role === "assistant") {
+          const text = messageText(message);
+          if (text !== undefined) return { text };
+        }
       }
+      ingestLogger.warn("[router] background: the child's context holds no assistant message", {
+        child,
+        shape: Array.isArray(history) ? `array(${messages.length})` : typeof history,
+        keys: history !== null && typeof history === "object" ? Object.keys(history).slice(0, 12).join(",") : "",
+        lastMessage: JSON.stringify(messages.at(-1) ?? null)?.slice(0, 300) ?? "",
+      });
       return undefined;
     };
     if (finishApi !== undefined) {
@@ -2550,7 +2572,9 @@ export async function registerV2Hooks(
                 const attempt = inflight.byChild(sid);
                 if (attempt !== undefined) {
                   if (attempt.state === "acknowledged") void processor.process(sid, { kind: "end-event", outcome, eventID: event.id, at });
-                } else if (sessionKinds.get(sid) === "child") {
+                  else ingestLogger.warn("[router] background: an end event met an attempt that is not awaiting one", { child: sid, state: attempt.state, outcome });
+                } else if (sessionKinds.get(sid) !== "root") {
+                  // A session whose kind is not yet known may be a child whose acknowledgement is still to come (bounded, TTL).
                   inflight.noteEarlyEnd(sid, { outcome, eventID: event.id, at });
                 }
                 if (sessionKinds.get(sid) === "root") processor.endTurn(sid);

@@ -193,6 +193,42 @@ describe("background dispatch: acknowledgement, in-flight list, completion annot
     expect(allText(after)).toContain('state="held"');
   });
 
+  // Real OpenCode 2 shapes (smoke cpx-background): `ctx.session.context(child)` entries are discriminated by `type`, not `role`.
+  it("the child's result is read from a host context entry typed `assistant` (no `role`): the end event completes the processing", async () => {
+    const h = await boot("auto");
+    h.emit(created(CHILD, ORCH));
+    const call = await h.before(dispatch({ background: true }));
+    await h.after({ ...call, status: "completed", result: structuredClone(RUNNING) });
+    await request(h, [user("continue")]); // the root request that teaches the adapter the parent is a root
+    h.childContext.set(CHILD, [
+      { type: "user", id: "m1", content: [{ type: "text", text: "do the work" }] },
+      { type: "assistant", id: "m2", content: [{ type: "text", text: "real host result" }] },
+    ]);
+    // A unique event id: the adapter drops an end event id it has already seen in this process.
+    h.emit({ type: "session.execution.succeeded", id: "ev-end-typed-assistant", created: 2, data: { sessionID: CHILD } });
+    await h.drain();
+    // The end handler awaits the timing store before it starts the processor: poll the tail until the attempt left the in-flight list.
+    await vi.waitFor(async () => {
+      const state = tail(await request(h, [user("continue")]));
+      expect(state).not.toContain("In flight (background)");
+      expect(state).not.toContain("router guarantees pending");
+    }, { timeout: 5000, interval: 50 });
+  });
+
+  it("a completion element with further attributes still completes a child whose context could not be read", async () => {
+    const h = await boot("auto");
+    h.emit(created(CHILD, ORCH));
+    const call = await h.before(dispatch({ background: true }));
+    await h.after({ ...call, status: "completed", result: structuredClone(RUNNING) });
+    h.emit(ended(CHILD)); // empty child context: nothing readable at the end event
+    await h.drain();
+    const body = `<subagent sessionID="${CHILD}" state="completed" agent="fast">late result</subagent>`;
+    await request(h, [user("continue"), { id: "m3", role: "user", content: [{ type: "text", text: body }] }]);
+    await h.drain();
+    const state = tail(await request(h, [user("continue")]));
+    expect(state).not.toContain("router guarantees pending");
+  });
+
   // D2: with the child's end event delivered BEFORE the host's running acknowledgement, the parked end is processed at the ack
   // (memo §4.3 step 2, R3), as in the ack -> end order above.
   it("D2: an end event seen before the acknowledgement is processed at the ack (R3)", async () => {

@@ -987,6 +987,11 @@ export function createCompletionProcessor(reg: InFlightRegistry, deps: Completio
       const read = await readSafe(a.childSessionID);
       if (read?.text === undefined) {
         // Nothing to process yet: wait for the completion trigger (the context-hook wait covers it).
+        warnSafe(deps.logger, "[router] child result not readable yet; waiting for the completion trigger", {
+          child: a.childSessionID,
+          trigger: trigger.kind,
+          readShape: read === undefined ? "undefined" : Object.keys(read).join(","),
+        });
         a.state = "child-ended";
         a.endedAt = end.at;
         a.outcome = end.status;
@@ -1084,9 +1089,18 @@ export function createCompletionProcessor(reg: InFlightRegistry, deps: Completio
   async function run(child: string, trigger: Trigger): Promise<void> {
     // Everything up to the first await is synchronous: the state flip below is what makes a second trigger a no-op.
     const a = reg.byChild(child);
-    if (a === undefined) return;
-    if (a.state !== "acknowledged" && a.state !== "child-ended") return;
-    if (wasProcessed(a.key)) return;
+    if (a === undefined) {
+      warnSafe(deps.logger, "[router] completion trigger ignored: no attempt for the child", { child, trigger: trigger.kind });
+      return;
+    }
+    if (a.state !== "acknowledged" && a.state !== "child-ended") {
+      warnSafe(deps.logger, "[router] completion trigger ignored: attempt not open", { child, trigger: trigger.kind, state: a.state });
+      return;
+    }
+    if (wasProcessed(a.key)) {
+      warnSafe(deps.logger, "[router] completion trigger ignored: already processed", { child, trigger: trigger.kind });
+      return;
+    }
     a.state = "processing";
     let done: () => void = () => undefined;
     settling.set(
