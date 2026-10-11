@@ -45,6 +45,7 @@ import {
   buildLineageCaveat,
   buildPendingListBlock,
   createPendingRegistry,
+  type PendingRecord,
   driftedPaths,
   formatRisk,
   neutralizeDirectives,
@@ -124,7 +125,7 @@ function captured(untracked: number, tracked: number): ReferenceState {
 function reg(overrides: Partial<PendingRegistration> = {}): PendingRegistration {
   return {
     orchestratorSessionID: "orch",
-    dispatchID: "d1",
+    dispatchID: nextDispatchID(),
     producerSessionID: "child",
     producerTier: "fast",
     description: "fix the parser",
@@ -156,6 +157,13 @@ function setup(extra: Partial<PendingRegistryOptions> = {}) {
     return r.handle;
   };
   return { c, registry, evictions, add };
+}
+
+/** register is idempotent on dispatchID (phase 2.1): entries that must differ get different ids. */
+let dispatchSeq = 0;
+function nextDispatchID(): string {
+  dispatchSeq += 1;
+  return `d${dispatchSeq}`;
 }
 
 function claimed(result: ClaimResult): Extract<ClaimResult, { kind: "claimed" }> {
@@ -288,7 +296,7 @@ describe("register (R3, R5)", () => {
     expect(found.entry).toMatchObject({
       handle,
       orchestratorSessionID: "orch",
-      dispatchID: "d1",
+      dispatchID: expect.stringMatching(/^d\d+$/),
       producerSessionID: "child",
       producerTier: "fast",
       description: "fix the 'parser' now",
@@ -762,6 +770,68 @@ describe("forgetSession and dispose (R5)", () => {
 // ---------------------------------------------------------------------------------------------
 // R11 lineage
 // ---------------------------------------------------------------------------------------------
+
+describe("held entries, idempotent register and persistence (phase 2.1)", () => {
+  const options = { ttlMs: 60_000, maxVerifyingMs: 60_000 };
+
+  it("reserves a handle, registers a held entry under it and registers once per dispatchID", () => {
+    const registry = createPendingRegistry(options);
+    const handle = registry.reserveHandle("orch");
+    expect(handle).toMatch(/^vrf_[0-9a-f]{24}$/);
+    const hold = { childSessionID: "child", callID: "call-1" };
+    const first = registry.register(reg({ dispatchID: "call-1", producerSessionID: "child", handle, hold }));
+    expect(first).toMatchObject({ ok: true, handle });
+    expect(registry.register(reg({ dispatchID: "call-1", producerSessionID: "child" }))).toMatchObject({ ok: true, handle });
+    const found = registry.findByDispatch("call-1");
+    expect(found).toMatchObject({ handle, state: "held", hold });
+    expect(registry.listHeld("orch").map((e) => e.handle)).toEqual([handle]);
+    expect(registry.listPending("orch")).toEqual([]);
+    expect(registry.findByDispatch("other")).toBeUndefined();
+  });
+
+  it("fires onVerdict once on the terminal settle of a held entry, and a retryable settle returns it to held", () => {
+    const verdicts: string[] = [];
+    const registry = createPendingRegistry({ ...options, onVerdict: (entry) => verdicts.push(entry.handle) });
+    const handle = registry.reserveHandle("orch") ?? "";
+    registry.register(reg({ dispatchID: "call-2", producerSessionID: "child", handle, hold: { childSessionID: "child", callID: "call-2" } }));
+    const retry = claimed(registry.markVerifying("orch", handle));
+    retry.settle({ ...PASS, retryable: true });
+    expect(stateOf(registry, "orch", handle)).toBe("held");
+    expect(verdicts).toEqual([]);
+    claimed(registry.markVerifying("orch", handle)).settle({ ...PASS, retryable: false });
+    expect(verdicts).toEqual([handle]);
+  });
+
+  it("gives a reserved handle back and honours the caps with reservations", () => {
+    const registry = createPendingRegistry({ ...options, maxPerSession: 1 });
+    const handle = registry.reserveHandle("orch");
+    expect(handle).toBeDefined();
+    expect(registry.reserveHandle("orch")).toBeUndefined();
+    registry.releaseHandle(handle ?? "");
+    expect(registry.reserveHandle("orch")).toBeDefined();
+  });
+
+  it("persists entries and state, and restore rebuilds the held entry (held past the TTL ends unverifiable)", async () => {
+    const records: PendingRecord[] = [];
+    const persist = { append: async (record: PendingRecord) => { records.push(record); } };
+    const clock = { now: 1_000_000 };
+    const writer = createPendingRegistry({ ...options, persist, now: () => clock.now });
+    const handle = writer.reserveHandle("orch") ?? "";
+    writer.register(reg({ dispatchID: "call-3", producerSessionID: "child", handle, hold: { childSessionID: "child", callID: "call-3" } }));
+    expect(records.map((r) => r.kind)).toEqual(["entry"]);
+
+    const verdicts: string[] = [];
+    clock.now += 1_000;
+    const reader = createPendingRegistry({ ...options, now: () => clock.now, onVerdict: (entry) => verdicts.push(entry.handle) });
+    expect(reader.restore(records, { now: clock.now })).toMatchObject({ restored: 1, expiredHeld: 0 });
+    expect(reader.findByDispatch("call-3")).toMatchObject({ handle, state: "held" });
+
+    clock.now += 120_000;
+    const late = createPendingRegistry({ ...options, now: () => clock.now, onVerdict: (entry) => verdicts.push(entry.handle) });
+    expect(late.restore(records, { now: clock.now })).toMatchObject({ restored: 0, expiredHeld: 1 });
+    expect(verdicts).toEqual([handle]);
+  });
+});
 
 describe("lineage (R11)", () => {
   const base = { orchestratorSessionID: "orch", root: "/repo", label: "vrf_a", landedAt: 100, introduced: ["t1", "t2"] };

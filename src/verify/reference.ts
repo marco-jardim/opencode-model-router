@@ -825,6 +825,103 @@ export interface DispatchReference {
   readonly capturedAt: number;
 }
 
+/** JSON-safe form of a DispatchReference (pending.jsonl, phase 2.1 section 11). */
+export interface SerializedReference {
+  readonly root: string;
+  readonly head: string;
+  readonly commit: string;
+  readonly untracked: Readonly<Record<string, string>>;
+  readonly tracked: Readonly<Record<string, string>>;
+  readonly captureReasons: readonly InexactReason[];
+  readonly capturedAt: number;
+  /** Absolute node_modules links the materialized dir held (link path -> target); re-created on materialize. */
+  readonly links?: Readonly<Record<string, string>>;
+}
+
+export function serializeReference(
+  ref: DispatchReference,
+  links?: Readonly<Record<string, string>>,
+): SerializedReference {
+  return {
+    root: ref.root,
+    head: ref.head,
+    commit: ref.commit,
+    untracked: Object.fromEntries(ref.untracked),
+    tracked: Object.fromEntries(ref.tracked),
+    captureReasons: ref.captureReasons.map((r) => ({ cause: r.cause, path: r.path })),
+    capturedAt: ref.capturedAt,
+    ...(links !== undefined && Object.keys(links).length > 0 ? { links: { ...links } } : {}),
+  };
+}
+
+function digestMap(v: unknown): Map<string, string> | undefined {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return undefined;
+  const out = new Map<string, string>();
+  for (const [k, d] of Object.entries(v)) {
+    if (typeof d !== "string") return undefined;
+    out.set(k, d);
+  }
+  return out;
+}
+
+/** The links recorded by serializeReference; empty when absent or malformed. */
+export function serializedReferenceLinks(json: unknown): Readonly<Record<string, string>> {
+  const raw = typeof json === "string" ? safeParse(json) : json;
+  if (typeof raw !== "object" || raw === null) return {};
+  const links = digestMap((raw as Record<string, unknown>).links);
+  return links === undefined ? {} : Object.fromEntries(links);
+}
+
+function safeParse(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+const INEXACT_CAUSES: ReadonlySet<string> = new Set<InexactCause>([
+  "untracked-deleted",
+  "untracked-modified",
+  "untracked-not-file",
+  "untracked-unreadable",
+  "untracked-symlink",
+  "untracked-unsafe-path",
+  "dependency-drift",
+  "workspace-link-drift",
+  "index-flags",
+  "checkout-conversion",
+]);
+
+/** Inverse of serializeReference. Accepts a JSON string or the parsed object; undefined when malformed. */
+export function deserializeReference(json: unknown): DispatchReference | undefined {
+  const raw: unknown = typeof json === "string" ? safeParse(json) : json;
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const o = raw as Record<string, unknown>;
+  if (typeof o.root !== "string" || typeof o.head !== "string" || typeof o.commit !== "string") return undefined;
+  if (typeof o.capturedAt !== "number" || !Number.isFinite(o.capturedAt)) return undefined;
+  const untracked = digestMap(o.untracked);
+  const tracked = digestMap(o.tracked);
+  if (untracked === undefined || tracked === undefined) return undefined;
+  const reasons: InexactReason[] = [];
+  if (!Array.isArray(o.captureReasons)) return undefined;
+  for (const r of o.captureReasons) {
+    if (typeof r !== "object" || r === null) return undefined;
+    const rr = r as Record<string, unknown>;
+    if (typeof rr.cause !== "string" || !INEXACT_CAUSES.has(rr.cause) || typeof rr.path !== "string") return undefined;
+    reasons.push({ cause: rr.cause as InexactCause, path: rr.path });
+  }
+  return {
+    root: o.root,
+    head: o.head,
+    commit: o.commit,
+    untracked,
+    tracked,
+    captureReasons: reasons,
+    capturedAt: o.capturedAt,
+  };
+}
+
 export type InexactCause =
   | "untracked-deleted"
   | "untracked-modified"
@@ -2017,6 +2114,73 @@ function parseWorktreeList(stdout: string): WorktreeEntry[] {
   return entries;
 }
 
+/**
+ * Reference dirs reloaded from pending.jsonl by a later process (phase 2.1 section 11.3): the dir
+ * name still carries the dead owner's pid, so GC must skip them while the pending entry lives.
+ * Keyed by basename (REF_DIR_PATTERN); the value is the last known absolute dir, if given.
+ */
+const KEPT = processWideSet("omr.reference.kept");
+/** Absolute dirs of KEPT names whose path is known: refreshed by the keep heartbeat. */
+const KEPT_DIRS = new Map<string, string>();
+let keptBeat: ReturnType<typeof setInterval> | undefined;
+
+function keptName(key: string): string | undefined {
+  const name = key.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? "";
+  return REF_DIR_PATTERN.test(name) ? name : undefined;
+}
+
+/** True when `key` (a dir path or basename) was passed to keepReferences and not released. */
+export function isReferenceKept(key: string): boolean {
+  const name = keptName(key);
+  return name !== undefined && KEPT.has(name);
+}
+
+export interface KeepReferencesOptions {
+  /** Default nodeReferenceFs. */
+  fs?: Pick<ReferenceFs, "utimes">;
+  /** Default HEARTBEAT_INTERVAL_MS. */
+  heartbeatMs?: number;
+  logger?: Pick<PluginLogger, "warn">;
+}
+
+/**
+ * Marks reloaded reference dirs active: gcStaleReferences skips them, and dirs given as absolute paths
+ * are heartbeated under this process's pid (their name still carries the dead owner's). Keys are absolute
+ * dir paths or bare `omr-ref-<pid>-<16 hex>` names; anything else is ignored. The returned function
+ * releases exactly these keys.
+ */
+export function keepReferences(keys: Iterable<string>, opts: KeepReferencesOptions = {}): () => void {
+  const added: string[] = [];
+  for (const key of keys) {
+    const name = keptName(key);
+    if (name === undefined) continue;
+    KEPT.add(name);
+    if (/[\\/]/.test(key)) KEPT_DIRS.set(name, key);
+    added.push(name);
+  }
+  if (keptBeat === undefined && KEPT_DIRS.size > 0) {
+    const fs = opts.fs ?? nodeReferenceFs;
+    keptBeat = setInterval(() => {
+      const now = new Date();
+      for (const dir of KEPT_DIRS.values()) {
+        fs.utimes(dir, now, now).catch((error: unknown) =>
+          opts.logger?.warn("reference keep heartbeat failed", { dir, error: describeError(error) }));
+      }
+    }, opts.heartbeatMs ?? HEARTBEAT_INTERVAL_MS);
+    keptBeat.unref();
+  }
+  return () => {
+    for (const name of added) {
+      KEPT.delete(name);
+      KEPT_DIRS.delete(name);
+    }
+    if (KEPT_DIRS.size === 0 && keptBeat !== undefined) {
+      clearInterval(keptBeat);
+      keptBeat = undefined;
+    }
+  };
+}
+
 /** Section 11. Never throws; touches only stale omr-ref-* dirs directly under a tmp root. */
 export async function gcStaleReferences(root: string, deps: ReferenceDeps): Promise<GcReport> {
   const report = { removed: [] as string[], kept: [] as string[], failed: [] as string[] };
@@ -2082,7 +2246,7 @@ async function gcInner(
     const key = comparable(dir, platform);
     const keys = [key];
     const ownLock = entry.locked && isOwnLockReason(dir, entry.lockReason, platform);
-    if ((entry.locked && !ownLock) || ACTIVE.has(key)) {
+    if ((entry.locked && !ownLock) || ACTIVE.has(key) || isReferenceKept(dir)) {
       report.kept.push(dir);
       continue;
     }
@@ -2159,7 +2323,7 @@ async function gcInner(
         continue;
       }
       const keys = [comparable(dir, platform), comparable(realDir, platform)];
-      if (keys.some((k) => registered.has(k) || ACTIVE.has(k))) continue;
+      if (isReferenceKept(name) || keys.some((k) => registered.has(k) || ACTIVE.has(k))) continue;
       if (!stale(parsed.pid, stats, keys)) {
         report.kept.push(dir);
         continue;
