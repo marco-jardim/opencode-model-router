@@ -23,27 +23,38 @@ Worktree `D:\git\omr-cpx-p11`, branch `cpx/p11`, base tag `cpx/p11-base` = `4161
 
 QA-1.1-1 (critical) starts keyed by child id that 2.1/3.1 do not have; -2 (major) second start with a different callID kept the first; -3 (major) dedupe weaker than ingest (per-instance state, no step/prompt ids); -4 (major) sweep split live turns; -5 (major) labels only validated on read; -6 (major) 2.1 handoff not recorded; -7 no row callback / estimator seam; -8 no shared capacity classifier; -9 clock skew; -10 p90 = max for 5–9 samples; -11 quadratic stats summary; -12 stats notes ignore side logs; -13 `--json` keys untested/undocumented; -14 docs describe unwired behaviour; -15 root-session recency and turn numbering; -16 side-log rotation races; -17 (nit) missing exports.
 
+### Round 2 (heavy reviewer `ses_ed63cb01fffeMdvA6wja2M3cx2`, at `11b66b1`) — 9 findings (2 major, 4 minor, 3 nit)
+
+Round-1 status: 13 fixed, 4 partial (-2, -4, -9, -10). New: QA-1.1-18 (major) resumed / late-bound dispatches lose or get the wrong timing (single child→call link, irreversible close at start, outcome before bind dropped); -19 (major) label pattern rejected real model ids (`[1m]`) and dropped the row; -20 idle sweep flushed roots with open dispatches; -21 future rows kept in the window; -22 p90 provenance missing; -23 handoff not implementable as written; -24 (nit) silent first-wins acquire options; -25 (nit) untracked appends escaped `flush()`; -26 (nit) `isSideLogLabel` untested.
+
+### Round 3 (heavy reviewer `ses_ed6205b9affePh10w331qTON9Q`, at `30a227e`; majors only) — 1 major
+
+QA-1.1-19 fixed. QA-1.1-18 correct for the tested call orders but not under the handoff's wiring: QA-1.1-27 (major) `bindChild` closes older calls irreversibly, so it may only run on a host-confirmed child; binding at the result then dropped capacity signals for fresh foreground calls. Recorded: -28 (minor) docs stale on labels and the second start; -29 (minor) `cancelStart` on `onCallResult(callID, null)` also drops a child that ran then errored; -30 (minor) under `static` the start must not live inside `commit`; -31 (nit) `cancelStart` at the hook-chain rejection has nothing to drop.
+
 ## Fixes
 
-### Round 1 (implementer `ses_ed6601246ffeg5yIFs04MASdh5`)
-
-All 17 addressed: starts keyed by `callID` with `bindChild`/`cancelStart`/`setBackground` (-1); a different callID closes the old timing as `unknown` (-2); `acquireTimingRecorder` ref-counted per dir, step/prompt event-id dedupe, end ids consumed only when open (-3); idle-based sweep (`turnIdleMs` 30 min) + `flush()` on release (-4); write-side round-trip validation with a token label pattern (-5); handoff written above (-6); `onRow` + `durationSeamsFor` (-7); `classifyCapacity` (-8); clamped rows `unknown`, future rows ignored (-9); p90 needs ≥ 10 samples (else a coarser level or the prior; stats table keeps per-role p90 with `p90MinSamples: 1`) (-10); Set-based dedupe (-11); side-log notes and "no data" on v2 only (-12); `--json` keys tested and documented in ROUTING_ENGINE.md (USAGE text unchanged so v1 `--help` stays byte-identical) (-13); docs corrected (-14); recency on every step/prompt, `isRootSession`, `onRootStep` boolean (-15); free-name probe + per-path append serialisation + two-writer test (-16); exports (-17). Additional choice: p90 is `max(p90, p50)`. Verified in the orchestrator shell: 9 files / 734 tests green, typecheck 0, `ingest.ts` unchanged.
-
-## Fixes
+- Round 1 (implementer `ses_ed6601246ffeg5yIFs04MASdh5`, `11b66b1`): starts keyed by `callID` with `bindChild`/`cancelStart`/`setBackground` (-1); a different callID closes the old timing as `unknown` (-2); `acquireTimingRecorder` ref-counted per dir, step/prompt event-id dedupe, end ids consumed only when open (-3); idle-based sweep (`turnIdleMs` 30 min) + `flush()` on release (-4); write-side round-trip validation (-5); handoff (-6); `onRow` + `durationSeamsFor` (-7); `classifyCapacity` (-8); clamped rows `unknown`, future rows ignored (-9); p90 needs ≥ 10 samples (-10); Set-based dedupe (-11); side-log notes on v2 only (-12); `--json` keys tested and documented, USAGE unchanged so v1 `--help` stays byte-identical (-13); docs (-14); recency, `isRootSession`, `onRootStep` boolean (-15); free-name probe + per-path append serialisation (-16); exports (-17).
+- Round 2 (implementer `ses_ed628b789ffeHs4FfVhmuUahXi`, `30a227e`): per-child open-call lists, oldest closed first; outcomes for unbound children remembered (200, 10 min) and applied at bind; `cancelStart` leaves older calls alone (-18); labels `/^[!-~]{1,256}$/`, invalid non-id labels become `unknown` (-19); sweep keeps turns with open dispatches (-20); future rows dropped, shared `MAX_FUTURE_SKEW_MS` (-21); `p90Source`/`p90N` (-22); handoff rewritten (-23, below); acquire notices (-24); tracked appends (-25); label tests (-26).
+- Round 3 (implementer `ses_ed6124f8affeqPxiGmF6k5KuZD`, `a42ec2a`): capacity signals for unbound children remembered and applied at bind (-27); ROUTING_ENGINE.md label and bind text (-28).
+- Verification (orchestrator shell, `a42ec2a`): 8 files / 740 tests green (outcomes-*, persist, stats, routing-advisor, routing-ingest, docs-drift); typecheck 0; `ingest.ts` unchanged since the phase base; coverage timings.ts 94.49/90.21/89.23/95.33, persist.ts 92.56/89.74/96.29/94.1.
 
 ## Deferred findings
 
+- QA-1.1-29, -30, -31: wiring concerns, scheduled by the plan in Phase 2.1 (2.1.5.c); carried in the handoff below.
+
 ## Handoffs
 
-- **To 2.1 (task 2.1.5.c) — the calls 2.1 must make (QA-1.1-6):**
-  - Construction: on v2, whatever `routing.engine` (incl. `static`), `acquireTimingRecorder({ dir, now, logger, turnIdleMs?, onRow? })` once per plugin instance; `dir` from `resolveOutcomesDir(routing.outcomes.path, …)`; instances in one process share the recorder (ref-counted per normalised dir).
-  - `execute.before` (the router's own dispatch): `recordDispatchStart({ callID, childSessionID: null, parentSessionID, role, class, scope, tier, model, background, at })`; labels must be single tokens (`/^[A-Za-z0-9._:#/@+-]{1,256}$/`) — use `unknown` for an empty scope/class, never free text.
-  - Child known (`session.created` / the child match / the tool result carrying the child id / the launcher's `onCreated`): `bindChild(callID, childSessionID)` (re-callable, last wins).
-  - `execute.after` with the call rejected (no child ran): `cancelStart(callID)`. Background acknowledgement: `setBackground(callID, true)`.
-  - Child `session.execution.*`: `await onExecutionOutcome(childSessionID, event.id, "succeeded" | "failed" | "interrupted", at)` (event id dedupes; consumed only when a start is open).
-  - `session.retry.scheduled`, `session.hook("retry")`, `session.step.failed`: `const c = classifyCapacity({ type: error.type, status: error.status })`; if non-null `onCapacitySignal(childSessionID, c, at)`.
-  - Root detection (no parent): `markRootSession(id)`; `isRootSession(id)`. Root prompt: `await onRootPrompt(sessionID, at, event.id)`. Root step: `onRootStep(sessionID, { input, cacheRead, cacheWrite }, event.id)` (returns whether counted).
-  - Sweep: `await sweep()` on an unref'd 5–10 min interval (closes starts open > 6 h as `unknown`; writes turns idle ≥ 30 min). Dispose: `await holder.release()` (last holder of a dir `flush()`es every open turn).
-  - Estimation: observe rows via `onRow`; `createDurationModel(durationSeamsFor(createSideLogs(dir, deps), now))`, `await load()`, `observe(row)` from `onRow`. `/router stats` passes `runStatsCli` a `StatsSideLogs` (`open: dir => createSideLogs(dir, deps)`) on v2 only.
+- **To 2.1 (task 2.1.5.c) — the calls 2.1 must make (replaces the plan's `createTimingRecorder` with `acquireTimingRecorder`):**
+  - Construction: on v2, whatever `routing.engine` (incl. `static`), `acquireTimingRecorder({ dir, now, logger, turnIdleMs?, onRow? })` once per plugin instance; `dir` from `resolveOutcomesDir(...)`; instances in one process share the recorder (ref-counted per normalised dir). `/router stats` side-log wiring already exists (`src\routing\commands\stats.ts:88`): do not wire it twice.
+  - **Start:** in `v2-hooks` right after the legacy `execute.before` hook succeeds (next to the router's `commit`, ≈1635-1637), only for `subagent`: `recordDispatchStart({ callID: event.id, childSessionID: <final input sessionID for a resume, else null>, parentSessionID, role, class, scope, tier, model, background: input.background === true, at })`. Not inside `commit` (it returns early under `static`, QA-1.1-30); class/scope `unknown` without a routing decision. A hook-chain rejection (≈1633) needs no call (QA-1.1-31).
+  - **Bind / background / cancel:** only in `execute.after` (`onCallResult`, ≈1703): non-null child → `bindChild(event.id, child)`, plus `setBackground(event.id, true)` when the result status is `running`; null child → `cancelStart(event.id)` (accepts losing the row of a child that ran then errored, QA-1.1-29; the estimator only uses succeeded rows). Never bind at commit or at the `session.created` claim.
+  - **Outcome:** event loop, `session.execution.succeeded|failed|interrupted` → `await onExecutionOutcome(data.sessionID, event.id, outcome, event.created)` (optionally skip when `isRootSession`).
+  - **Capacity:** `session.retry.scheduled`, the retry hook, `session.step.failed` → `const c = classifyCapacity({ type, status })`; non-null → `onCapacitySignal(child, c, at)`.
+  - **Root turns:** the `prompt` hook (≈1347) → `markRootSession` when `ctx.session.get` shows no `parentID`, then `onRootPrompt(sessionID, at, messageID)` (not awaited); a turn runs from one user prompt to the next including C2 wakes (wakes arrive as `session.synthetic`/execution events, not the prompt hook). Root step events → `onRootStep(sessionID, { input, cacheRead, cacheWrite }, event.id)`. Add a C2 smoke assertion: no `prompt` hook call between the ack and the wake request.
+  - Sweep: `await sweep()` on an unref'd 5–10 min interval; dispose: `await holder.release()` (last holder flushes open turns).
+  - Estimation: `createDurationModel(durationSeamsFor(createSideLogs(dir, deps), now))`, `await load()`, `observe(row)` from `onRow` only when `row.kind === "dispatch-timing"`.
+- From 1.2: `docs\ROUTING_ENGINE.md` ≈122 sentence replaced (1.1.5.b).
 
 ## Verdict
+
+PASS after QA round 3 (round-3 major QA-1.1-27 fixed in `a42ec2a`; no round 4 by rule). Remaining minors are 2.1 wiring items in the handoff.
