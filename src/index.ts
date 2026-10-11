@@ -152,7 +152,7 @@ import {
   buildAcceptedSuffix,
 } from "./verify/dispatch";
 import { canonicalAuthorityPath, insideWorkRoot, requestedVerificationCwd, requestedVerificationCwdSource, verificationScope, type VerificationScope } from "./routing/roles/work-root";
-import { createRepoProbe, readSetPredicate } from "./routing/roles/read-set";
+import { createRepoProbe, displaySafe, readSetEligible, readSetPredicate } from "./routing/roles/read-set";
 import { newLadderState, recordAttempt, nextAction, advance, buildEscalatePolicy, formatLadderScorecard, startCostRatio } from "./escalate/ladder";
 import { createCatalogLookup, planFirstAttempt, planNextAttempt } from "./escalate/resume";
 import type { AttemptPlan, CatalogLookup } from "./escalate/resume";
@@ -592,9 +592,12 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     const args: Record<string, unknown> = input?.args && typeof input.args === "object" ? input.args : {};
     const named = input.tool === "read" ? [args.filePath, args.path, args.file_path] : [args.path];
     const target = named.find((value): value is string => typeof value === "string" && value !== "");
-    if (target === undefined) return undefined; // no path: the session directory, inside the work root
+    // No path (the session directory) or a relative one: the decision (v2-hooks `roleAuthorityDecision`) never lets it reach the
+    // read set (QA-1 F1) — it ran inside the work root or was refused — so there is no line. A fully qualified path canonicalises
+    // the same whatever the base, as in the decision; `.git` and below never reach R (F7).
+    if (target === undefined) return undefined;
     const canonical = canonicalAuthorityPath(target, workRoot);
-    if (canonical === undefined || insideWorkRoot(canonical, workRoot)) return undefined;
+    if (canonical === undefined || insideWorkRoot(canonical, workRoot) || !readSetEligible(target, canonical)) return undefined;
     const routing = resolveRolesRouting(cfg, "v2");
     // The orchestrator that dispatched this role: its dispatch record, else the session's parent (as the v2 adapter's readSetOf).
     let orchestrator = lookupDispatch(sid)?.parentSessionID ?? undefined;
@@ -605,7 +608,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     }
     const workingSet = orchestrator === undefined ? [] : workingSetOf(orchestrator);
     const member = readSetPredicate({ parents: routing.repoParents, depth: routing.repoDepth, exclude: routing.repoExclude }, workingSet, repoProbe)?.(canonical);
-    return member === undefined ? undefined : `[router: read from ${member.name} (${member.branch ?? "detached"}) at ${member.repository} — read-only in this dispatch]`;
+    if (member === undefined) return undefined;
+    // QA-1 F2: the name, branch and path come from the filesystem: display-safe.
+    return `[router: read from ${displaySafe(member.name)} (${displaySafe(member.branch ?? "detached")}) at ${displaySafe(member.repository)} — read-only in this dispatch]`;
   };
   /** What a routed role dispatch decided for its child's guard (QA-G-A3-3): the dispatched tier and the route line's `budget=`. */
   interface RoutedGuardInput { readonly agent: string; readonly tier: string; readonly routeBudget: number | null }

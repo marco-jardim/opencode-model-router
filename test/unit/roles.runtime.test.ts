@@ -6,7 +6,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import type { Hooks } from "@opencode-ai/plugin";
 import ModelRouterPlugin from "../../src/index";
@@ -502,7 +502,8 @@ describe("read provenance of a role read outside its work root (cross-repo P1.9)
     const work = temp("omr-p19-work-");
     writeFileSync(join(work, "in.ts"), "x");
     const parent = temp("omr-p19-parent-");
-    mkdirSync(join(parent, "lib-b", ".git"), { recursive: true });
+    // QA-1 F3: a repository's shape — `.git` with HEAD and `objects` (HEAD alone is no longer a repository of R)
+    mkdirSync(join(parent, "lib-b", ".git", "objects"), { recursive: true });
     writeFileSync(join(parent, "lib-b", ".git", "HEAD"), "ref: refs/heads/main\n");
     writeFileSync(join(parent, "lib-b", "a.ts"), "x");
     mkdirSync(join(parent, "plain"), { recursive: true });
@@ -569,6 +570,40 @@ describe("read provenance of a role read outside its work root (cross-repo P1.9)
     await bindRole(hooks, work, dir);
     expect(await after(hooks, CHILD, "explorer", "read", { filePath: join(repo, "a.ts") })).not.toContain("[router: read from");
     expect(parent).toBeDefined();
+  });
+
+  it("QA-1 F1/F7: the line follows the decision — a relative path or `.git` never gets it, whatever it resolves to", async () => {
+    const { work, parent, repo } = fixture();
+    const { dir } = home({ routing: { delegation: "roles", repoParents: [parent] } }, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    await bindRole(hooks, work, dir);
+    // The decision refuses a relative path outside W (it never reaches R): no line, even where it would resolve into R from W.
+    const fromWork = relative(work, join(repo, "a.ts"));
+    expect(isAbsolute(fromWork)).toBe(false);
+    expect(await after(hooks, CHILD, "explorer", "read", { filePath: fromWork })).not.toContain("[router: read from");
+    expect(await after(hooks, CHILD, "explorer", "grep", { pattern: "x", path: relative(work, repo) })).not.toContain("[router: read from");
+    // `.git` below a repository of R is refused by the decision: no line either
+    expect(await after(hooks, CHILD, "explorer", "read", { filePath: join(repo, ".git", "HEAD") })).not.toContain("[router: read from");
+    // the same file named absolute: the decision allows it from R, and the line names it
+    expect((await after(hooks, CHILD, "explorer", "read", { filePath: join(repo, "a.ts") })).endsWith(lineOf("lib-b", "main", repo))).toBe(true);
+  });
+
+  it("QA-1 F2: a branch that is not a git ref name reads (unknown); a repository name with unsafe characters is escaped", async () => {
+    const { work, parent, repo } = fixture();
+    writeFileSync(join(repo, ".git", "HEAD"), "ref: refs/heads/evil\u001b]0;pwned\u0007\n");
+    const odd = join(parent, "lib\u202Eb");
+    mkdirSync(join(odd, ".git", "objects"), { recursive: true });
+    writeFileSync(join(odd, ".git", "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(join(odd, "a.ts"), "x");
+    const { dir } = home({ routing: { delegation: "roles", repoParents: [parent] } }, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    await bindRole(hooks, work, dir);
+    const evil = await after(hooks, CHILD, "explorer", "read", { filePath: join(repo, "a.ts") });
+    expect(evil.endsWith(lineOf("lib-b", "(unknown)", repo))).toBe(true);
+    expect(evil).not.toMatch(/[\u001b\u0007]/);
+    const named = await after(hooks, CHILD, "explorer", "read", { filePath: join(odd, "a.ts") });
+    expect(named).not.toContain("\u202E");
+    expect(named).toContain('[router: read from "lib\\342\\200\\256b" (main) at "');
   });
 
   it("a working-set repository is in the read set without any parent", async () => {

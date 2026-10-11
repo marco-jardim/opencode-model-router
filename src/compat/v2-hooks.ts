@@ -32,7 +32,9 @@ import {
 } from "../routing/roles/binding";
 import type { DispatchGrant } from "../routing/roles/policy";
 import { forgetWorkingSet, workingSetOf } from "../routing/wire/working-set";
-import { createRepoProbe, readSetPredicate, type InReadSet } from "../routing/roles/read-set";
+import {
+  createRepoProbe, displaySafe, gitMetadataSegment, readSetEligible, readSetPredicate, type InReadSet,
+} from "../routing/roles/read-set";
 import {
   AUTHORITY_TEXT, AUTHORITY_TOOL_NAME, consumeAuthority, discardAuthority, evictAuthority, markAnnotated, previewAuthority, quoteChildText,
   requestedAuthority, type AuthorityDeps,
@@ -461,15 +463,6 @@ export function toolCallPaths(tool: string, args: unknown): string[] | undefined
 }
 
 /**
- * QA-G-A2-2: a path segment that names git's metadata entry `.git` — compared case-insensitively (win32, and stricter
- * elsewhere), with the trailing dots and spaces win32 drops and an NTFS `:stream` suffix removed (`.git.`, `.GIT`,
- * `.git::$INDEX_ALLOCATION` all name `.git` there).
- */
-function gitMetadataSegment(segment: string): boolean {
-  return segment.replace(/:.*$/s, "").replace(/[. ]+$/, "").toLowerCase() === ".git";
-}
-
-/**
  * QA-G-A2-2: an edit of `path` (canonical `target`, inside `root`) would write `.git` or anything below it — the work root's own
  * repository pointer (a file in a linked worktree) or metadata (config, hooks, `commondir`), or a nested repository's. Such an
  * edit could redirect router_git_* (and the work-root guards) to another repository or a network path. Checked on the canonical
@@ -482,11 +475,27 @@ export function editsGitMetadata(path: string, target: string, root: string): bo
   return [path, below].some((text) => text.split(/[\\/]/).some(gitMetadataSegment));
 }
 
-/** The decision for one role-session action: allowed, or refused with the reason the child sees. */
-export type RoleAuthorityDecision = { readonly allow: true } | { readonly allow: false; readonly reason: string };
+/**
+ * What allowed a path action (QA-1 F6): every path inside the work root W, some only in the read set R (P1.5), or some only as the
+ * session's own truncated output (QA-P23-2-A1) — the last one present wins (`own-output` over `read-set` over `work-root`).
+ */
+export type RoleAuthorityAllowance = "work-root" | "read-set" | "own-output";
+
+/**
+ * The decision for one role-session action: allowed (`via`: what allowed it, for an action with paths), or refused with the reason
+ * the child sees.
+ */
+export type RoleAuthorityDecision =
+  | { readonly allow: true; readonly via?: RoleAuthorityAllowance }
+  | { readonly allow: false; readonly reason: string };
 
 const ALLOW: RoleAuthorityDecision = Object.freeze({ allow: true });
 const refuse = (reason: string): RoleAuthorityDecision => ({ allow: false, reason });
+const ALLOWANCE_ORDER: readonly RoleAuthorityAllowance[] = ["work-root", "read-set", "own-output"];
+/** The allowance of a decision over several paths: the widest one any path needed. */
+const widerAllowance = (a: RoleAuthorityAllowance | undefined, b: RoleAuthorityAllowance): RoleAuthorityAllowance =>
+  a === undefined || ALLOWANCE_ORDER.indexOf(b) > ALLOWANCE_ORDER.indexOf(a) ? b : a;
+const allowedVia = (via: RoleAuthorityAllowance | undefined): RoleAuthorityDecision => (via === undefined ? ALLOW : { allow: true, via });
 
 export interface RoleAuthorityInput {
   /** The host permission action (`event.action`) or the tool name (`execute.before`). */
@@ -517,6 +526,18 @@ export interface RoleAuthorityInput {
    * the file lies.
    */
   readonly inReadSet?: (canonicalTarget: string) => { readonly repository: string; readonly name: string; readonly branch: string | null } | undefined;
+  /**
+   * QA-1 F1: the paths are the host's own resources (`evaluate`): a relative `read`/`edit` resource is the host's Location-relative
+   * form of a file the call's `execute.before` already checked as the call wrote it, so it may reach R. Without it (the call's own
+   * arguments, `execute.before`) a relative path never reaches R: it resolves against the session directory, which may itself be
+   * a repository of R, and the role would read another checkout's file silently.
+   */
+  readonly hostRelative?: boolean;
+  /**
+   * QA-1 F1: the one path is a `glob`/`grep` search root the call did not name (the session directory, or the host's `.`): it never
+   * reaches R, only W.
+   */
+  readonly implicitRoot?: boolean;
 }
 
 /**
@@ -528,7 +549,9 @@ function editElsewhereReason(
   action: string, path: string, target: string, root: string, location: DispatchGrant["location"],
   readSet: RoleAuthorityInput["inReadSet"], canonicalOf: (path: string) => string | undefined,
 ): string | undefined {
-  const branch = (name: string | null): string => name ?? "(detached)";
+  // QA-1 F2: names, branches and paths from the filesystem (and the call's own path) are echoed display-safe.
+  const branch = (name: string | null): string => displaySafe(name ?? "(detached)");
+  const shown = displaySafe(path);
   if (location !== undefined) {
     let match: { dir: string; branch: string | null } | undefined;
     for (const entry of location.worktrees) {
@@ -538,14 +561,16 @@ function editElsewhereReason(
     }
     if (match !== undefined) {
       const rel = target.slice(match.dir.replace(/[\\/]+$/, "").length).replace(/^[\\/]+/, "");
-      return `${action}: ${path} is in worktree ${match.dir} (repository ${location.name}, branch ${branch(match.branch)}); this dispatch `
-        + `edits only in ${root} (branch ${branch(location.branch)}). The same file in your work root is ${rel === "" ? root : join(root, rel)}.`;
+      return `${action}: ${shown} is in worktree ${displaySafe(match.dir)} (repository ${displaySafe(location.name)}, branch ${branch(match.branch)}); `
+        + `this dispatch edits only in ${displaySafe(root)} (branch ${branch(location.branch)}). The same file in your work root is `
+        + `${displaySafe(rel === "" ? root : join(root, rel))}.`;
     }
   }
   const repo = readSet?.(target);
   if (repo === undefined) return undefined;
-  return `${action}: ${path} is in repository ${repo.name} (branch ${branch(repo.branch)}), which this dispatch may read but not edit. `
-    + `Finish the ${location?.name ?? basename(root)} part and return NEED MORE: naming the ${repo.name} change; it needs a dispatch with repo=${repo.name}.`;
+  const name = displaySafe(repo.name);
+  return `${action}: ${shown} is in repository ${name} (branch ${branch(repo.branch)}), which this dispatch may read but not edit. `
+    + `Finish the ${displaySafe(location?.name ?? basename(root))} part and return NEED MORE: naming the ${name} change; it needs a dispatch with repo=${name}.`;
 }
 
 /** The shape of a tool-output store file: `<data>/tool-output/tool_<id>` (`MANAGED_DIRECTORY`, `tool_${Identifier.ascending()}`). */
@@ -650,17 +675,28 @@ export function roleAuthorityDecision(input: RoleAuthorityInput): RoleAuthorityD
     const outputs = grant.actions.has("read") || grant.actions.has("grep") ? input.ownOutputs : undefined;
     // P1.5: a directory of R only for a grant with a local READ action; `router_git` alone keeps W only.
     const reads = grant.actions.has("read") || grant.actions.has("glob") || grant.actions.has("grep");
+    let via: RoleAuthorityAllowance | undefined;
     for (const resource of input.paths) {
       const dir = resource.replace(/[\\/]\*$/, "");
       const target = dir === "" ? undefined : canonical(dir, input.sessionDirectory);
-      if (target !== undefined && root !== null && insideWorkRoot(target, root)) continue;
-      if (target !== undefined && ownOutputDirectory(target, outputs)) continue;
-      if (target !== undefined && reads && readSet?.(target) !== undefined) continue;
+      if (target !== undefined && root !== null && insideWorkRoot(target, root)) {
+        via = widerAllowance(via, "work-root");
+        continue;
+      }
+      if (target !== undefined && ownOutputDirectory(target, outputs)) {
+        via = widerAllowance(via, "own-output");
+        continue;
+      }
+      // QA-1 F1/F7: the host's resources are canonical absolute; never `.git` or below in R.
+      if (target !== undefined && reads && readSetEligible(dir, target) && readSet?.(target) !== undefined) {
+        via = widerAllowance(via, "read-set");
+        continue;
+      }
       return refuse(root === null
         ? "external_directory: this dispatch has no work root (root=)"
         : `external_directory: ${resource} is outside this dispatch's work root ${root}`);
     }
-    return ALLOW;
+    return allowedVia(via);
   }
   if (!grant.actions.has(cls)) return refuse(`${action} is not in this dispatch's grant (${[...grant.actions].join(", ") || "none"})`);
   if (cls === "read" || cls === "edit" || cls === "glob" || cls === "grep") {
@@ -673,22 +709,35 @@ export function roleAuthorityDecision(input: RoleAuthorityInput): RoleAuthorityD
     for (const pattern of input.patterns ?? []) {
       if (unsafeSearchPattern(pattern)) return refuse(`${action}: the pattern ${pattern} reaches outside its search root (use a relative pattern and \`path\`)`);
     }
+    // QA-1 F1: R only for a path the call wrote fully qualified (or the host's own Location-relative resource) and a search root
+    // the call named; a relative path or a search without a path that lands outside W keeps the refusal it had before P1.5.
+    const mayReachReadSet = (path: string, target: string): boolean =>
+      cls !== "edit" && input.implicitRoot !== true && readSetEligible(path, target, input.hostRelative === true);
+    let via: RoleAuthorityAllowance | undefined;
     for (const path of input.paths) {
       const target = canonical(path, input.sessionDirectory);
       if (target !== undefined && insideWorkRoot(target, root)) {
         if (cls === "edit" && editsGitMetadata(path, target, root)) {
           return refuse(`${action}: ${path} is repository metadata (\`.git\` or below it); a role never edits it`);
         }
+        via = widerAllowance(via, "work-root");
         continue;
       }
-      if (target !== undefined && (cls === "read" || cls === "grep") && ownOutput(target, input.ownOutputs)) continue; // QA-P23-2-A1
-      if (target !== undefined && cls !== "edit" && readSet?.(target) !== undefined) continue; // P1.5: read/glob/grep inside R
+      if (target !== undefined && (cls === "read" || cls === "grep") && ownOutput(target, input.ownOutputs)) { // QA-P23-2-A1
+        via = widerAllowance(via, "own-output");
+        continue;
+      }
+      if (target !== undefined && mayReachReadSet(path, target) && readSet?.(target) !== undefined) { // P1.5: read/glob/grep in R
+        via = widerAllowance(via, "read-set");
+        continue;
+      }
       const elsewhere = cls === "edit" && target !== undefined
         ? editElsewhereReason(action, path, target, root, grant.location, readSet, (named) => canonical(named, input.sessionDirectory))
         : undefined;
       if (elsewhere !== undefined) return refuse(elsewhere);
       return refuse(`${action}: ${path} is outside this dispatch's work root ${root} (use an absolute path inside it)`);
     }
+    return allowedVia(via);
   }
   return ALLOW;
 }
@@ -1045,31 +1094,41 @@ export async function registerV2Hooks(
   const roleEvaluateRefusal = async (
     event: { sessionID: unknown; action: string; resources: readonly string[]; metadata?: Record<string, unknown> | undefined },
     agent: string,
-  ): Promise<{ readonly refusal: string | undefined; readonly exact: boolean }> => {
+  ): Promise<{ readonly refusal: string | undefined; readonly exact: boolean; readonly lift: boolean }> => {
     const sessionID = String(event.sessionID);
     const authority = await roleAuthorityOf(sessionID, agent);
-    if (authority === undefined) return { refusal: "the role table is unavailable (fail closed)", exact: false };
+    if (authority === undefined) return { refusal: "the role table is unavailable (fail closed)", exact: false, lift: false };
     const exact = authority.binding.kind === "exact";
     const cls = roleActionOf(event.action);
     const metadata = event.metadata !== null && typeof event.metadata === "object" ? event.metadata : undefined;
     const search = cls === "glob" || cls === "grep";
+    // QA-1 F1: a search the call named no root for (the host's `.`) never reaches R.
+    const namedRoot = search && typeof metadata?.path === "string" && metadata.path !== "" ? metadata.path : undefined;
     const paths = cls === "read" || cls === "edit" || cls === "external_directory" ? event.resources
-      : search && metadata !== undefined ? [typeof metadata.path === "string" && metadata.path !== "" ? metadata.path : "."] : [];
+      : search && metadata !== undefined ? [namedRoot ?? "."] : [];
     const patterns = searchPatterns(cls, event.resources[0], metadata?.include);
     const info = paths.length > 0 ? await sessionInfoOf(sessionID) : undefined;
+    const readSet = info === undefined ? undefined : readSetOf(sessionID, authority.binding, info.parentID);
     const decision = roleAuthorityDecision({
       action: event.action, paths, patterns, binding: authority.binding, dynamic: authority.spec.authority.mode === "dynamic",
       sessionDirectory: info?.directory ?? ctx.location.directory, fallbackRoot: fallbackRoot(),
-      ownOutputs: ownOutputs.get(sessionID),
-      inReadSet: info === undefined ? undefined : readSetOf(sessionID, authority.binding, info.parentID),
+      ownOutputs: ownOutputs.get(sessionID), inReadSet: readSet,
+      // QA-1 F1: a relative read/edit resource is the host's Location-relative form; execute.before checked the call as written.
+      hostRelative: cls === "read" || cls === "edit",
+      implicitRoot: search && namedRoot === undefined,
     });
-    if (!decision.allow) return { refusal: decision.reason, exact };
+    if (!decision.allow) return { refusal: decision.reason, exact, lift: false };
     const grant = authority.binding.grant;
     const root = grant.workRoot;
     if (cls === "external_directory" && root !== null && !(await stillAWorktree(root, grant.location?.repository ?? ctx.location.directory))) {
-      return { refusal: `external_directory: the work root ${root} is no longer a worktree listed by \`git worktree list --porcelain\``, exact };
+      return { refusal: `external_directory: the work root ${root} is no longer a worktree listed by \`git worktree list --porcelain\``, exact, lift: false };
     }
-    return { refusal: undefined, exact };
+    // QA-1 F6 (D13, I18): the lift is for an exact binding's `external_directory` allowed by W or R only — never by the session's
+    // own output directory — and only while cross-repo is in use (`routing.repoParents`, a working set, or a grant that carries its
+    // repository's location); otherwise a host ask stays an ask (I9).
+    const crossRepo = readSet !== undefined || grant.location !== undefined;
+    const lift = exact && cls === "external_directory" && crossRepo && (decision.via === "work-root" || decision.via === "read-set");
+    return { refusal: undefined, exact, lift };
   };
   /**
    * T2.3.1 (P-12, S11): the `execute.before` side of EVERY tool call a role session makes — the tool's role action must be in the
@@ -1089,17 +1148,21 @@ export async function registerV2Hooks(
     const info = await sessionInfoOf(sessionID);
     const sessionDirectory = info.directory;
     let paths: string[] = [];
+    let implicitRoot = false;
     if (cls === "read" || cls === "edit") {
+      // The raw `path` stays among them next to `scopedArgs`' resolved `filePath`: a relative one is checked as the call wrote it.
       const named = toolCallPaths(event.tool, record);
       if (named === undefined) return `${event.tool}: no path to check (or a patch whose paths cannot be read)`;
       paths = named;
     } else if (cls === "glob" || cls === "grep") {
-      paths = [typeof record.path === "string" && record.path !== "" ? record.path : sessionDirectory];
+      const named = typeof record.path === "string" && record.path !== "" ? record.path : undefined;
+      implicitRoot = named === undefined; // QA-1 F1: the session directory by default — W only, never R
+      paths = [named ?? sessionDirectory];
     }
     const decision = roleAuthorityDecision({
       action: event.tool, paths, patterns: searchPatterns(cls, record.pattern, record.include), binding: authority.binding,
       dynamic: authority.spec.authority.mode === "dynamic", sessionDirectory, fallbackRoot: fallbackRoot(), ownOutputs: ownOutputs.get(sessionID),
-      inReadSet: paths.length > 0 ? readSetOf(sessionID, authority.binding, info.parentID) : undefined,
+      inReadSet: paths.length > 0 ? readSetOf(sessionID, authority.binding, info.parentID) : undefined, implicitRoot,
     });
     return decision.allow ? undefined : decision.reason;
   };
@@ -1341,13 +1404,14 @@ export async function registerV2Hooks(
         // #84 P2.3 (T2.3.1, P-13, I3/I9): a role session is narrowed to ITS dispatch grant and work root: an action the max
         // policy refused stays refused, a sensitive-read ask stays an ask when the grant covers it. The one widening is D13 below.
         if (role !== undefined && event.effect !== "deny") {
-          const { refusal, exact } = await roleEvaluateRefusal(event, role);
+          const { refusal, lift } = await roleEvaluateRefusal(event, role);
           if (refusal !== undefined) {
             event.effect = "deny";
             event.message = `Permission denied by role agent ${role} for this dispatch: ${refusal}`;
-          } else if (exact && event.effect === "ask" && event.action === "external_directory") {
+          } else if (lift && event.effect === "ask" && event.action === "external_directory") {
             // Cross-repo P4.5 / D13, I18 (lift only inside the grant): a host `ask` for `external_directory` becomes `allow` when the
-            // binding is exact and the router's own decision allowed every resource — inside W (still a listed worktree) or R.
+            // binding is exact and the router's own decision allowed every resource — inside W (still a listed worktree) or R —
+            // while cross-repo is in use (QA-1 F6: never for the session's own output directory, never without cross-repo: I9).
             // Never another action, never an unknown binding, never over a `deny` (host or configured: both skip this branch).
             event.effect = "allow";
           }
