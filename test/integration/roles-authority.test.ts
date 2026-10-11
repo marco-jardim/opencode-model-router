@@ -1186,7 +1186,7 @@ describe("work roots (I3, P-13): the dispatch's own worktree only", () => {
     expect(outside.text).not.toContain("verified: deterministic");
   }, 60_000);
 
-  it.skipIf(!hasGit())("QA-P33F1-1: a resume is verified in the child's bound worktree; a null root stays in the session directory; capture, preparation and deferral run there", async () => {
+  it.skipIf(!hasGit())("QA-P33F1-1 / Q9: a resume is verified in the child's bound worktree; a root= that is no worktree is refused; capture, preparation and deferral run in the worktree", async () => {
     wired.calls.length = 0;
     const base = temp("omr-p33-repo-");
     const main = join(base, "main");
@@ -1706,8 +1706,10 @@ describe("P3.3 global QA round 1 (QA-G-B-2, QA-G-A1-2)", () => {
   });
 
   // Q9 (FLIPPED ON PURPOSE): this test dispatched with a root= that is no worktree to get a child bound WITHOUT a work root, and
-  // checked that the ladder, `evaluate` and the tool call refuse its edit. That dispatch is now refused, so such a child can no
-  // longer be created through the router; the no-work-root decision itself stays pinned by the previous test.
+  // checked that the ladder, `evaluate` and the tool call refuse its edit. That dispatch is now refused. A child without a work root
+  // can still be created through the router when the session directory cannot be resolved (a dispatch that declares nothing is then
+  // not refused: no work root, write/run withheld — see roles.dispatch-path "realpath throws for the session directory"); the
+  // no-work-root decision itself stays pinned by the previous test.
   it("QA-G-B-2 / Q9: root= that is no worktree → the dispatch is refused with the note; nothing is routed", async () => {
     const { dir, cfg } = home(ROLES);
     const hooks = await plugin(dir);

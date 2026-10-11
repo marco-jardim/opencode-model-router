@@ -58,7 +58,7 @@ import { parseVerifyDirectives } from "../../verify/directives";
 import { buildDelegationDoD } from "../../verify/dispatch";
 import { requestedVerificationCwd, verificationScope } from "../roles/work-root";
 import { resolveCheckPlacements } from "../roles/check-placement";
-import { createRepoProbe, readSetPredicate } from "../roles/read-set";
+import { createRepoProbe, displaySafe, readSetPredicate } from "../roles/read-set";
 import { effectiveDetection, effectiveFactsOf, grantFor, tierBounds, type DispatchGrant, type EffectiveDetection } from "../roles/policy";
 import {
   BINDING_NOTES, LOCAL_ACTIONS, currentBinding, evictCall, newDispatchNonce, noncePromptLine, nonceTitleSuffix, registerPending, type Binding,
@@ -1658,8 +1658,8 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
 
   /**
    * The work root of a role dispatch: {@link resolveRoleWorkRoot} plus the route-flow rules of the cross-repo QA (round 1).
-   * - F3: a `repo=` / `branch=` the route line declared but the parser rejected gives NO work root and a note, never the session
-   *   directory (design §5).
+   * - F3: a `repo=` / `branch=` / `root=` the route line declared but the parser rejected (invalid value, bare key, duplicate or
+   *   conflicting key) gives NO work root and a note, never the session directory (design §5).
    * - F6: a `root=` that is the session directory, with `branch=`, is accepted when the worktree on that branch contains it (the
    *   session may have started in a subdirectory); and a worktree bound without `root=` that contains the session directory keeps
    *   the session directory as the work root (the write root does not grow to the worktree's top level).
@@ -1674,7 +1674,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     const invalid = line?.invalidCrossRepo ?? [];
     if (invalid.length > 0) {
       const note = invalid
-        .map(({ key, value }) => `${key}=${value} is not a valid ${key === "repo" ? "repository name" : "branch name"}: no work root. Fix the route line.`)
+        .map(({ key, value }) => `${key}=${value} is not a valid ${key === "repo" ? "repository name" : key === "branch" ? "branch name" : "absolute work root"}: no work root. Fix the route line.`)
         .join(" ");
       return { workRoot: null, requested: declaredRoot, note };
     }
@@ -1734,6 +1734,37 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
   };
 
   /**
+   * Q9 (QA round 3): the target the route line of an EXACT resume declares is the child's bound root — by text only, no admission
+   * and no filesystem call: a `root=` equal (normalised) to the bound work root or its worktree, a `repo=` equal to the bound
+   * repository's name, a `branch=` equal to the bound branch. An invalid declaration, or a bound grant without a work root, never is.
+   */
+  const declaresBoundRoot = (line: RouteLine | null | undefined, grant: DispatchGrant): boolean => {
+    if (line === null || line === undefined) return true;
+    if ((line.invalidCrossRepo?.length ?? 0) > 0 || grant.workRoot === null) return false;
+    const platform = workRootDeps.platform;
+    const location = grant.location;
+    if (line.root !== undefined) {
+      const declared = normalizeRootText(line.root, platform);
+      const candidates = location === undefined ? [grant.workRoot] : [grant.workRoot, location.worktree];
+      if (!candidates.some((candidate) => normalizeRootText(candidate, platform) === declared)) return false;
+    }
+    const sameName = (a: string, b: string): boolean => (platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b);
+    if (line.repo !== undefined && (location === undefined || !sameName(location.name, line.repo))) return false;
+    if (line.branch !== undefined && (location === undefined || location.branch !== line.branch)) return false;
+    return true;
+  };
+
+  /** Q9 (QA round 3): the refusal of an exact resume whose route line declares another target than the child's bound root. */
+  const boundRootRefusal = (grant: DispatchGrant): string => {
+    const where = grant.workRoot === null ? "no work root" : displaySafe(grant.workRoot);
+    const location = grant.location;
+    const detail = location === undefined
+      ? ""
+      : ` (repository ${displaySafe(location.name)}, branch ${location.branch === null ? "(detached)" : displaySafe(location.branch)})`;
+    return `this child is bound to ${where}${detail}; a resume cannot change its work root: dispatch a new child`;
+  };
+
+  /**
    * The rung a resumed child runs on: the dispatch registry's record (its `tier` is the role tier the router registered), else the
    * child session's own model; unknown → a model off every ladder, which the kernel lifts to the window ceiling (never below).
    */
@@ -1782,14 +1813,28 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     // 2. work root: `root=` from the trace only, text-compared with `git worktree list --porcelain` before any filesystem call.
     // Cross-repo (P1.4): `repo=` / `branch=`, and a `root=` the text match does not find, are bound through admission.
     const declaredLine = lined.trace.routeLine;
-    const root = await bindWorkRoot(rp.cfg, call.sessionID, sessionDirectory, declaredLine);
     const bound = resumeID === null ? undefined : currentBinding(resumeID, { maxOf: (name) => roleMaxActions(rp.roles.get(name)) });
-    // Q9: a dispatch that DECLARED a target (`repo=` / `branch=` / `root=`, or an invalid `repo=` / `branch=`) whose binding was
-    // refused is refused with the note — it never runs in the session directory instead. A dispatch that declared nothing is
-    // untouched. A resume of an exactly bound child keeps the child's bound root whatever its route line says, so it is not refused.
+    // Q9: a dispatch that DECLARED a target (`repo=` / `branch=` / `root=`, or an invalid `repo=` / `branch=` / `root=`) whose
+    // binding was refused is refused with the note — it never runs in the session directory instead. A dispatch that declared
+    // nothing is untouched.
     const declaredTarget = declaredLine !== null && declaredLine !== undefined
       && (declaredLine.repo !== undefined || declaredLine.branch !== undefined || declaredLine.root !== undefined || (declaredLine.invalidCrossRepo?.length ?? 0) > 0);
-    if (declaredTarget && root.workRoot === null && root.note !== null && bound?.kind !== "exact") throw new RoleDispatchRefusal(agent, root.note);
+    // A resume of an exactly bound child keeps the child's bound root: a target it declares runs no admission; it must name that
+    // root (text only), else the resume is refused — a resume cannot move a child.
+    const exactBound = bound?.kind === "exact" ? bound.grant : undefined;
+    if (declaredTarget && exactBound !== undefined && !declaresBoundRoot(declaredLine, exactBound)) {
+      throw new RoleDispatchRefusal(agent, boundRootRefusal(exactBound));
+    }
+    const root: WorkRootResolution = declaredTarget && exactBound !== undefined
+      ? {
+          workRoot: exactBound.workRoot,
+          requested: declaredLine?.root ?? null,
+          note: null,
+          ...(exactBound.location === undefined ? {} : { location: exactBound.location }),
+        }
+      : await bindWorkRoot(rp.cfg, call.sessionID, sessionDirectory, declaredLine);
+    // The note may echo route-line text and filesystem names: escaped before it reaches the orchestrator.
+    if (declaredTarget && root.workRoot === null && root.note !== null && bound?.kind !== "exact") throw new RoleDispatchRefusal(agent, displaySafe(root.note));
 
     // 3. classify in the dispatch's own root (QA-G-B-3 (1)): an absolute path inside it is no `external_dir`. A resume of an exactly
     // bound child is classified in its bound root (QA-P33F1-1-1); without a `root=` (the work root is the session directory) or a
@@ -2050,7 +2095,9 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
           : {}),
         ...(exactResume ? { exactResume: true } : {}),
       })}${stripDispatchHeader(outPrompt)}`
-      : outPrompt;
+      // QA round 3: a header the orchestrator copied (it names another dispatch's root and verb) is stripped even when the router
+      // adds none; a prompt without one is returned unchanged (Q8: byte-identical).
+      : stripDispatchHeader(outPrompt);
 
     decided.set(call.callID, {
       parentSessionID: call.sessionID,

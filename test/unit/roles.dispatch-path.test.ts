@@ -572,6 +572,14 @@ describe("exported helpers for the adapter (P2.1-C)", () => {
       expect("location" in resumedGrant(without, [])).toBe(false);
       const withRoot: Grant = { actions: new Set<Action>(), notes: [], workRoot: "CANON(D:\\src\\api)", location: bound };
       expect(resumedGrant(withRoot, []).location).toBe(bound);
+      // QA round 3: a child bound with a null work root (the session directory could not be resolved) keeps none on a resume: edit
+      // and router_run are removed, from the bound grant and from the widened actions alike; the rest is kept.
+      const nullRoot = { actions: new Set(["read", "glob", "edit", "router_run"] as const), notes: ["bound without a work root"], workRoot: null };
+      const resumedNull = resumedGrant(nullRoot, ["edit", "router_run", "grep"]);
+      expect(resumedNull.workRoot).toBeNull();
+      expect([...resumedNull.actions].sort()).toEqual(["glob", "grep", "read"]);
+      expect(resumedNull.notes).toEqual(["bound without a work root"]);
+      expect("location" in resumedNull).toBe(false);
     });
   });
 
@@ -722,7 +730,37 @@ describe("role dispatch header (P2g, OD6)", () => {
     expect(plain.prompt).toBe(`find x\nOMR_NONCE=${plain.role!.nonce}`);
   });
 
-  it("a header the orchestrator copied from another dispatch is replaced by the router's (QA round 1 #11)", async () => {
+  it("realpath throws for the session directory: a dispatch that declares nothing gets no work root, is not refused, holds no write/run, gets no header (QA round 3)", async () => {
+    const world = makeWorld({ delegation: "roles", engine: "static" });
+    world.realpath.mockImplementation((path: string) => {
+      if (path === world.main) throw new Error("EACCES: permission denied");
+      return realpathSync.native(path);
+    });
+    const outcome = await world.router.route(call(world, { agent: "implementer", prompt: "[route class=implement risk=low scope=single needs=edit,shell]\nchange x" }));
+    expect(outcome.role!.workRoot).toBeNull();
+    expect(outcome.role!.grant.workRoot).toBeNull();
+    expect(outcome.role!.grant.actions.has("edit")).toBe(false);
+    expect(outcome.role!.grant.actions.has("router_run")).toBe(false);
+    expect(outcome.prompt).toBe(`change x\nOMR_NONCE=${outcome.role!.nonce}`);
+    expect(outcome.prompt!.startsWith(DISPATCH_HEADER_PREFIX)).toBe(false);
+  });
+
+  it("a header the orchestrator copied from another dispatch is removed even when the router adds none (QA round 1 #11)", async () => {
+    // no repoParents, nothing declared, the work root is the session directory: no header is relevant (Q8), yet the copied one
+    // (another dispatch's root, "read or write") never reaches the delegate.
+    const world = makeWorld({ delegation: "roles", engine: "static" });
+    const copied = buildRoleDispatchHeader({ agent: "implementer", workRoot: world.outside, edits: true });
+    const outcome = await world.router.route(call(world, { agent: "explorer", prompt: `${copied}find where the config is loaded` }));
+    expect(outcome.role!.workRoot).toBe(world.main);
+    expect(outcome.prompt).toBe(`find where the config is loaded\nOMR_NONCE=${outcome.role!.nonce}`);
+    expect(outcome.prompt).not.toContain(DISPATCH_HEADER_PREFIX);
+    expect(outcome.prompt).not.toContain(world.outside);
+    // a role without read, glob or grep (no header is eligible at all): the copied header is removed too
+    const researcher = await world.router.route(call(world, { agent: "researcher", prompt: `${copied}look up x` }));
+    expect(researcher.prompt).toBe(`look up x\nOMR_NONCE=${researcher.role!.nonce}`);
+  });
+
+  it("a header the orchestrator copied from another dispatch is replaced by the router's (QA round 1 #11, repoParents)", async () => {
     const parent = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-q8-copied-")));
     cleanups.push(async () => rmSync(parent, { recursive: true, force: true }));
     const world = makeWorld({ delegation: "roles", engine: "static", repoParents: [parent] }); // Q8: a header is emitted only when relevant

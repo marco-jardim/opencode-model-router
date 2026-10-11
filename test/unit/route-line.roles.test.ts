@@ -141,6 +141,42 @@ describe("route line cross-repo keys (repo, branch)", () => {
     const byRepo = parse("[route repo=a]\n[route repo=b]", "any");
     expect(byRepo.line?.invalidCrossRepo).toEqual([{ key: "repo", value: "a" }]);
     expect(parse("[route repo=a branch=x]\n[route repo=a branch=x]", "any").line?.invalidCrossRepo).toBeUndefined();
+    // QA round 3 (Q9): a `root=` the parser rejects is an invalid declaration too, never "no root declared".
+    const invalidRoots: ReadonlyArray<readonly [string, string]> = [
+      ["[route root=../app-b]", "../app-b"],
+      ["[route root=D:\\git\\x\\..\\y]", "D:\\git\\x\\..\\y"],
+      ["[route root=\\\\host\\share\\r]", "\\\\host\\share\\r"],
+      ["[route root=D:git\\r]", "D:git\\r"],
+      ["[route root]", ""],
+      ["[route root=\"D:\\My Work]", "\"D:\\My"],
+      ["[route root=relative/dir,]", "relative/dir"],
+    ];
+    for (const [text, value] of invalidRoots) {
+      const parsed = parse(text);
+      expect(parsed.line?.root, text).toBeUndefined();
+      expect(parsed.line?.invalidCrossRepo, text).toEqual([{ key: "root", value }]);
+      // tier dispatches read `ignored` only: unchanged (an invalid root is an ignored key, as before)
+      expect(parsed.line?.ignored, text).toContain("root");
+    }
+    // a second `root=` on the same line is a duplicate declaration (quoted or not)
+    const dupRoot = parse("[route root=D:\\a root=D:\\b]");
+    expect(dupRoot.line?.root).toBe("D:\\a");
+    expect(dupRoot.line?.invalidCrossRepo).toEqual([{ key: "root", value: "D:\\b" }]);
+    expect(parse("[route root=\"D:\\a b\" root=\"D:\\c d\"]").line?.invalidCrossRepo).toEqual([{ key: "root", value: "D:\\c d" }]);
+    expect(parse("[route root]\n").line?.invalidCrossRepo).toEqual([{ key: "root", value: "" }]);
+    // conflicting `root=` across lines: no root, the first line's declaration is invalid
+    const conflictRoot = parse("[route root=D:\\a]\n[route root=D:\\b]", "any");
+    expect(conflictRoot.conflict).toBe(true);
+    expect(conflictRoot.line?.root).toBeUndefined();
+    expect(conflictRoot.line?.invalidCrossRepo).toEqual([{ key: "root", value: "D:\\a" }]);
+    // lines that differ only in an invalid `root=`: no conflict (tier behaviour unchanged), every invalid root kept
+    const sameButRoot = parse("[route class=debug root=bad1]\n[route class=debug root=bad2]", "any");
+    expect(sameButRoot.conflict).toBe(false);
+    expect(sameButRoot.line?.class).toBe("debug");
+    expect(sameButRoot.line?.invalidCrossRepo).toEqual([{ key: "root", value: "bad1" }, { key: "root", value: "bad2" }]);
+    // a valid root is no invalid declaration
+    expect(parse("[route root=\"D:\\My Work\\Repo\"]").line?.invalidCrossRepo).toBeUndefined();
+    expect(parse("[route root=/srv/app]").line?.invalidCrossRepo).toBeUndefined();
   });
 
   it("splits a branch at whitespace: the first token is the value, the rest is an unknown key", () => {

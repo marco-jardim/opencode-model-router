@@ -273,9 +273,9 @@ export type FetchLike = (
 /** Environment lookup (process.env in production, a plain object in tests). */
 export type EnvLike = Readonly<Record<string, string | undefined>>;
 
-/** A `repo=` / `branch=` declaration of a route line that was not accepted (see {@link RouteLine.invalidCrossRepo}). */
+/** A `repo=` / `branch=` / `root=` declaration of a route line that was not accepted (see {@link RouteLine.invalidCrossRepo}). */
 export interface InvalidCrossRepo {
-  readonly key: "repo" | "branch";
+  readonly key: "repo" | "branch" | "root";
   /** The value as written (empty for a bare key). */
   readonly value: string;
 }
@@ -318,8 +318,8 @@ export interface RouteLine {
    */
   readonly branch?: string;
   /**
-   * `repo=` / `branch=` the line declared but the parser could not accept (invalid value, bare key, duplicate or
-   * conflicting key), with the value as written. The route flow gives such a dispatch NO work root and a note: an
+   * `repo=` / `branch=` / `root=` the line declared but the parser could not accept (invalid value, bare key, duplicate or
+   * conflicting key), with the value as written (a quoted `root=` without its quotes). The route flow gives such a dispatch NO work root and a note: an
    * invalid declaration never falls back to the session directory. Absent when every declaration was valid.
    */
   readonly invalidCrossRepo?: readonly InvalidCrossRepo[];

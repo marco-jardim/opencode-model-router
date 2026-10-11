@@ -110,6 +110,13 @@ function parseNeeds(value: string): readonly Need[] | undefined {
   return NEEDS.filter((need) => found.has(need));
 }
 
+/** The `root=` value as written: a quoted path from `quotedRoots`, else the token's value; undefined for a bare `root`. */
+function rootCandidate(rawValue: string | null, quotedRoots: readonly string[]): string | undefined {
+  if (rawValue === null) return undefined;
+  const q = QUOTED_PLACEHOLDER_RE.exec(stripTail(rawValue.toLowerCase()));
+  return q ? quotedRoots[Number(q[1])] : stripTail(rawValue);
+}
+
 /** L2: the fields of one route line body. */
 function parseFields(body: string): RouteLine {
   let taskClass: TaskClass | undefined;
@@ -146,6 +153,7 @@ function parseFields(body: string): RouteLine {
     if (seen.has(key)) {
       ignored.push(`dup:${key}`);
       if (key === "repo" || key === "branch") invalidCrossRepo.push({ key, value: rawValue === null ? "" : stripTail(rawValue) });
+      else if (key === "root") invalidCrossRepo.push({ key, value: rootCandidate(rawValue, quotedRoots) ?? "" });
       continue;
     }
     seen.add(key);
@@ -189,10 +197,13 @@ function parseFields(body: string): RouteLine {
         break;
       }
       case "root": {
-        const q = value === null ? null : QUOTED_PLACEHOLDER_RE.exec(value);
-        const candidate = q ? quotedRoots[Number(q[1])] : rawValue === null ? undefined : stripTail(rawValue);
+        const candidate = rootCandidate(rawValue, quotedRoots);
         if (candidate !== undefined && isWorkRootPath(candidate)) root = candidate;
-        else ignored.push(key);
+        else {
+          // A declared work root that cannot be accepted is an invalid declaration, never "nothing declared".
+          ignored.push(key);
+          invalidCrossRepo.push({ key, value: candidate ?? "" });
+        }
         break;
       }
       case "repo": {
@@ -255,7 +266,25 @@ function isRecognisable(line: string, inFence: boolean): boolean {
 }
 
 function canonical(line: RouteLine): string {
-  return JSON.stringify([line.class, line.risk, line.scope, line.needs, line.detection, line.pin, line.tier, line.budget, line.root, line.repo, line.branch, line.invalidCrossRepo]);
+  // Invalid `root=` entries are not compared: a tier dispatch's conflict detection stays what it was before they were
+  // recorded (an invalid root was only an `ignored` key). They are merged into the effective line instead (mergeInvalidRoots).
+  const invalid = line.invalidCrossRepo?.filter((entry) => entry.key !== "root");
+  return JSON.stringify([line.class, line.risk, line.scope, line.needs, line.detection, line.pin, line.tier, line.budget, line.root, line.repo, line.branch, invalid !== undefined && invalid.length > 0 ? invalid : undefined]);
+}
+
+/**
+ * Several route lines that agree on every compared field: the first line, with the invalid `root=` declarations of
+ * every line (a declared-but-invalid work root on any line is never silently dropped).
+ */
+function mergeInvalidRoots(lines: readonly RouteLine[]): RouteLine {
+  const first = lines[0]!;
+  const merged: InvalidCrossRepo[] = [...(first.invalidCrossRepo ?? [])];
+  for (const l of lines.slice(1)) {
+    for (const entry of l.invalidCrossRepo ?? []) {
+      if (!merged.some((seenEntry) => seenEntry.key === entry.key && seenEntry.value === entry.value)) merged.push(entry);
+    }
+  }
+  return merged.length === (first.invalidCrossRepo?.length ?? 0) ? first : { ...first, invalidCrossRepo: merged };
 }
 
 /**
@@ -301,6 +330,7 @@ function resolveConflict(lines: readonly RouteLine[]): RouteLine {
   for (const l of lines) for (const entry of l.invalidCrossRepo ?? []) mark(entry);
   if (first.repo !== undefined && repo === undefined) mark({ key: "repo", value: first.repo });
   if (first.branch !== undefined && branch === undefined) mark({ key: "branch", value: first.branch });
+  if (first.root !== undefined && root === undefined) mark({ key: "root", value: first.root });
   return {
     ...(taskClass ? { class: taskClass } : {}),
     ...(risk ? { risk } : {}),
@@ -387,7 +417,7 @@ export function parseRouteLine(text: string, options: RouteLineOptions = {}): Ro
   const conflict = new Set(parsed.map(canonical)).size > 1;
   return {
     // QA-P12-2-2: the flag lives on the parse result only; the line's `ignored` list is the tier-mode one.
-    line: conflict ? resolveConflict(parsed) : parsed[0]!,
+    line: conflict ? resolveConflict(parsed) : mergeInvalidRoots(parsed),
     count: parsed.length,
     stripped: kept.join(""),
     conflict,
