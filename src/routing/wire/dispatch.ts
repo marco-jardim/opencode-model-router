@@ -1750,8 +1750,41 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     }
     const sameName = (a: string, b: string): boolean => (platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b);
     if (line.repo !== undefined && (location === undefined || !sameName(location.name, line.repo))) return false;
-    if (line.branch !== undefined && (location === undefined || location.branch !== line.branch)) return false;
+    if (line.branch !== undefined && (location === undefined || location.branch !== line.branch.replace(/^refs\/heads\//, ""))) return false;
     return true;
+  };
+
+  /**
+   * D17 (cross-repo QA): the target an exact resume declares is the child's bound root. The text fast path ({@link declaresBoundRoot})
+   * runs no admission and no filesystem call. When it does not match — `repo=<worktree directory>` (Q10: the location's name is the
+   * repository's), a `root=` spelled through a junction / symlink / subst drive — the declaration is resolved exactly as a fresh
+   * dispatch resolves it ({@link bindWorkRoot}) and accepted when the work root it binds is the child's bound work root or its
+   * worktree (`normalizeRootText` of the realpath on both sides). So admission may now run on a resume, but only when the fast path
+   * fails. Whatever the answer, the resume keeps the BOUND grant: the resolution is only compared, never adopted (no widening).
+   */
+  const declaresBoundTarget = async (
+    cfg: RouterConfig,
+    orchestratorSessionID: string,
+    sessionDirectory: string,
+    line: RouteLine | null | undefined,
+    grant: DispatchGrant,
+  ): Promise<boolean> => {
+    if (declaresBoundRoot(line, grant)) return true;
+    if (line === null || line === undefined || (line.invalidCrossRepo?.length ?? 0) > 0 || grant.workRoot === null) return false;
+    const platform = workRootDeps.platform;
+    const canonicalText = (path: string): string => {
+      try {
+        const real = workRootDeps.realpath(path);
+        return normalizeRootText(typeof real === "string" && real !== "" ? real : path, platform);
+      } catch {
+        return normalizeRootText(path, platform);
+      }
+    };
+    const resolved = await bindWorkRoot(cfg, orchestratorSessionID, sessionDirectory, line);
+    if (resolved.workRoot === null) return false;
+    const got = canonicalText(resolved.workRoot);
+    const bound = grant.location === undefined ? [grant.workRoot] : [grant.workRoot, grant.location.worktree];
+    return bound.some((candidate) => canonicalText(candidate) === got);
   };
 
   /** Q9 (QA round 3): the refusal of an exact resume whose route line declares another target than the child's bound root. */
@@ -1819,10 +1852,10 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     // nothing is untouched.
     const declaredTarget = declaredLine !== null && declaredLine !== undefined
       && (declaredLine.repo !== undefined || declaredLine.branch !== undefined || declaredLine.root !== undefined || (declaredLine.invalidCrossRepo?.length ?? 0) > 0);
-    // A resume of an exactly bound child keeps the child's bound root: a target it declares runs no admission; it must name that
-    // root (text only), else the resume is refused — a resume cannot move a child.
+    // A resume of an exactly bound child keeps the child's bound root: a target it declares must name that root — by text first (no
+    // admission), else by the same resolution a fresh dispatch uses (D17) — else the resume is refused: a resume cannot move a child.
     const exactBound = bound?.kind === "exact" ? bound.grant : undefined;
-    if (declaredTarget && exactBound !== undefined && !declaresBoundRoot(declaredLine, exactBound)) {
+    if (declaredTarget && exactBound !== undefined && !await declaresBoundTarget(rp.cfg, call.sessionID, sessionDirectory, declaredLine, exactBound)) {
       throw new RoleDispatchRefusal(agent, boundRootRefusal(exactBound));
     }
     const root: WorkRootResolution = declaredTarget && exactBound !== undefined

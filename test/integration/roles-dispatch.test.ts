@@ -6,7 +6,7 @@
  * (bare model, next rung, refusal), the runner mark, deferred verification and detection, and the binding rows.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import ModelRouterPlugin from "../../src/index";
@@ -623,15 +623,18 @@ describe("P3.3 global QA round 1: resumes keep the resumed dispatch's facts and 
         .toBe(`[router] role dispatch @implementer refused: ${refusal}`);
       // a resume that declares nothing is untouched
       expect(await refusalOfResume(world, "child-q9r", "continue")).toBeUndefined();
-      expect(created).not.toHaveBeenCalled();
-      expect(resolve).not.toHaveBeenCalled();
+      // D17: a repo= / branch= the text fast path cannot match is resolved like a fresh dispatch's (here: refused by admission, so the
+      // resume is refused as before); a root= is not asked to admission without routing.repoParents. Nothing is ever adopted.
+      expect(resolve).toHaveBeenCalledTimes(2); // repo=app, branch=main
       expect(admit).not.toHaveBeenCalled();
     });
 
     it("a child bound by branch= through admission: the same repo=/branch= proceeds without admission; another branch is refused", async () => {
-      const resolve = vi.fn(async (): Promise<Admission> => ({
-        ok: true, location: { repository: world.main, name: "app", worktree: world.main, branch: "main", head: "abc1234", worktrees: [] },
-      }));
+      const resolve = vi.fn(async (input: { repo?: string; branch?: string }): Promise<Admission> => (
+        input.branch === "dev" || input.repo === "other"
+          ? { ok: false, reason: "no such target" }
+          : { ok: true, location: { repository: world.main, name: "app", worktree: world.main, branch: "main", head: "abc1234", worktrees: [] } }
+      ));
       const world = makeWorld(config({ delegation: "roles", engine: "static" }), { createAdmission: () => ({ admit: vi.fn(), resolve }) });
       await freshChild(world, "child-q9b", { agent: "implementer", description: "bound", prompt: RESUME("branch=main") });
       expect(resolve).toHaveBeenCalledTimes(1);
@@ -646,7 +649,92 @@ describe("P3.3 global QA round 1: resumes keep the resumed dispatch's facts and 
       const refusal = `this child is bound to ${world.main} (repository app, branch main); a resume cannot change its work root: dispatch a new child`;
       expect((await refusalOfResume(world, "child-q9b", RESUME("branch=dev")))?.reason).toBe(refusal);
       expect((await refusalOfResume(world, "child-q9b", RESUME("repo=other")))?.reason).toBe(refusal);
-      expect(resolve).toHaveBeenCalledTimes(1);
+      expect(resolve).toHaveBeenCalledTimes(3); // D17: only the two declarations the text fast path could not match were resolved
+    });
+
+    // D17 (cross-repo QA, major): a resume that repeats the route line that bound the child is never refused, whatever the spelling.
+    describe("D17: a resume repeating its binding target", () => {
+      const locationFor = (name: string, worktree: string, branch: string): RepoLocation =>
+        ({ repository: worktree, name, worktree, branch, head: "abc1234", worktrees: [] });
+
+      it("repo=<worktree directory> (Q10: the location's name is the repository's) proceeds; another branch of it is refused", async () => {
+        const wt = temp("omr-d17-lib-wt-");
+        const other = temp("omr-d17-lib-other-");
+        const resolve = vi.fn(async (input: { branch?: string }): Promise<Admission> => ({
+          ok: true, location: locationFor("lib-main", input.branch === "dev" ? other : wt, input.branch ?? "feat"),
+        }));
+        const world = makeWorld(config({ delegation: "roles", engine: "static" }), { createAdmission: () => ({ admit: vi.fn(), resolve }) });
+        await freshChild(world, "child-d17q", { agent: "implementer", description: "bound", prompt: RESUME("repo=lib-wt") });
+        expect(resolve).toHaveBeenCalledTimes(1);
+
+        const same = await world.router.route(call(world, { agent: "implementer", sessionID: "child-d17q", prompt: RESUME("repo=lib-wt") }));
+        expect(same.role!.workRoot).toBe(wt);
+        expect(same.role!.grant.workRoot).toBe(wt); // the grant stays the bound one
+        expect(same.role!.grant.location).toMatchObject({ name: "lib-main", worktree: wt });
+        expect(resolve).toHaveBeenCalledTimes(2); // the text fast path failed: the declaration was resolved like a fresh dispatch's
+
+        const refusal = await refusalOfResume(world, "child-d17q", RESUME("repo=lib-wt branch=dev"));
+        expect(refusal?.reason).toBe(`this child is bound to ${wt} (repository lib-main, branch feat); a resume cannot change its work root: dispatch a new child`);
+        expect(resolve).toHaveBeenCalledTimes(3);
+      });
+
+      it("repo=<worktree directory> branch=<main branch> bound to the main checkout proceeds when repeated", async () => {
+        const resolve = vi.fn(async (): Promise<Admission> => ({ ok: true, location: locationFor("lib-main", world.main, "main") }));
+        const world = makeWorld(config({ delegation: "roles", engine: "static" }), { createAdmission: () => ({ admit: vi.fn(), resolve }) });
+        await freshChild(world, "child-d17m", { agent: "implementer", description: "bound", prompt: RESUME("repo=lib-wt branch=main") });
+        const same = await world.router.route(call(world, { agent: "implementer", sessionID: "child-d17m", prompt: RESUME("repo=lib-wt branch=main") }));
+        expect(same.role!.workRoot).toBe(world.main);
+        expect(same.role!.grant.workRoot).toBe(world.main);
+        expect(same.role!.grant.location).toMatchObject({ name: "lib-main", branch: "main" });
+      });
+
+      it("branch=refs/heads/<b> repeated proceeds on the text fast path: admission is not called again", async () => {
+        const resolve = vi.fn(async (): Promise<Admission> => ({ ok: true, location: locationFor("app", world.main, "main") }));
+        const world = makeWorld(config({ delegation: "roles", engine: "static" }), { createAdmission: () => ({ admit: vi.fn(), resolve }) });
+        await freshChild(world, "child-d17r", { agent: "implementer", description: "bound", prompt: RESUME("branch=refs/heads/main") });
+        expect(resolve).toHaveBeenCalledTimes(1);
+        const same = await world.router.route(call(world, { agent: "implementer", sessionID: "child-d17r", prompt: RESUME("branch=refs/heads/main") }));
+        expect(same.role!.workRoot).toBe(world.main);
+        const bare = await world.router.route(call(world, { agent: "implementer", sessionID: "child-d17r", prompt: RESUME("repo=app branch=main") }));
+        expect(bare.role!.workRoot).toBe(world.main);
+        expect(resolve).toHaveBeenCalledTimes(1);
+      });
+
+      it("a root= spelled through a junction proceeds; a root= that resolves elsewhere is refused; the grant stays the bound one", async () => {
+        const parent = temp("omr-d17-parent-");
+        const elsewhere = temp("omr-d17-elsewhere-");
+        const admit = vi.fn(async (root: string): Promise<Admission> => {
+          const real = realpathSync.native(root);
+          return { ok: true, location: locationFor("app", real, "main") };
+        });
+        const world = makeWorld(config({ delegation: "roles", engine: "static", repoParents: [parent] }), {
+          createAdmission: () => ({ admit, resolve: vi.fn() }),
+        });
+        const link = join(temp("omr-d17-link-"), "main-link");
+        symlinkSync(world.main, link, "junction");
+        await freshChild(world, "child-d17j", { agent: "implementer", description: "bound", prompt: RESUME(`root=${world.main}`) });
+        expect(admit).not.toHaveBeenCalled(); // the session directory itself binds by text
+
+        const same = await world.router.route(call(world, { agent: "implementer", sessionID: "child-d17j", prompt: RESUME(`root=${link}`) }));
+        expect(same.role!.workRoot).toBe(world.main);
+        expect(same.role!.grant.workRoot).toBe(world.main);
+        expect(admit).toHaveBeenCalledTimes(1);
+
+        const refusal = await refusalOfResume(world, "child-d17j", RESUME(`root=${elsewhere}`));
+        expect(refusal?.reason).toBe(`this child is bound to ${world.main}; a resume cannot change its work root: dispatch a new child`);
+      });
+
+      it("the text fast path runs no admission (root= equal to the bound work root)", async () => {
+        const parent = temp("omr-d17-parent-");
+        const admit = vi.fn(async (): Promise<Admission> => ({ ok: false, reason: "never" }));
+        const resolve = vi.fn(async (): Promise<Admission> => ({ ok: false, reason: "never" }));
+        const world = makeWorld(config({ delegation: "roles", engine: "static", repoParents: [parent] }), { createAdmission: () => ({ admit, resolve }) });
+        await freshChild(world, "child-d17t", { agent: "implementer", description: "bound", prompt: RESUME(`root=${world.main}`) });
+        const same = await world.router.route(call(world, { agent: "implementer", sessionID: "child-d17t", prompt: RESUME(`root=${world.main}`) }));
+        expect(same.role!.workRoot).toBe(world.main);
+        expect(admit).not.toHaveBeenCalled();
+        expect(resolve).not.toHaveBeenCalled();
+      });
     });
   });
 
