@@ -66,6 +66,7 @@ import {
   buildAcceptedSuffix,
   buildForcingNote,
   canonicalPath,
+  isUnattributedWriter,
   tierModel,
   toolLabel,
   type ChangedFile,
@@ -1401,6 +1402,9 @@ export function createVerificationWiring(deps: {
     // QA-2.1-5: the recheck's git processes (GC, materialize, dispose) run at the configured
     // priority too, like the capture and the start-up GC (QA-1.2-13).
     const referenceArgv: ArgvSeam = (file, args, opts) => argvSeam(file, args, { ...opts, lowPriority: budget.lowPriority });
+    // QA-2 nit: materialize pins a link target as this gate's dispatch admitted it (its pins' admission); without pins, none.
+    const gatePins = prepared?.reference?.kind === "captured" ? prepared.reference.reference.pins : undefined;
+    const pinNow = pinNowFor(gatePins !== undefined ? pinAdmissions.get(gatePins) : undefined);
     const openScope = createScopeOpener({
       argv: argvSeam, exec: execSeam, fs: fsSeam, budget, checkTimeoutMs: CHECK_TIMEOUT_MS,
       reference: { argv: referenceArgv, pinNow },
@@ -1482,26 +1486,75 @@ export function createVerificationWiring(deps: {
 
   /**
    * Cross-repo P2d.3 (P2.6): the dispatch-time pins of a dispatch's admitted link targets, by dispatch id then by the seed's
-   * root (`PerimeterSeed.at`). Each promise settles once and never rejects; a pin of a discarded (contaminated) snapshot is
-   * dropped at the gate (linkPinsAtGate).
+   * root (`PerimeterSeed.at`). Each `pin` settles once and never rejects. QA-2 #9c: an unattributable writer that runs while a
+   * pin (its root or a nested target) is still computed marks it `contaminatedBy`, and linkPinsAtGate drops it. QA-2 nit:
+   * freed once the dispatch's gate took them, or with a reference that was not captured (freeLinkPins); bounded otherwise.
    */
-  const linkPins = new Map<string, Map<string, Promise<LinkPin>>>();
+  interface DispatchLinkPin {
+    readonly pin: Promise<LinkPin>;
+    pending: boolean;
+    contaminatedBy?: string;
+  }
+  const linkPins = new Map<string, Map<string, DispatchLinkPin>>();
   const LINK_PINS_MAX = 256;
-  /** The link roots (perimeterKey) a dispatch's admission accepted; bounded, oldest out. */
-  const admittedLinks = new Set<string>();
-  const rememberAdmittedLink = (dir: string): void => {
-    admittedLinks.add(perimeterKey(dir));
-    while (admittedLinks.size > 1024) {
-      const oldest = admittedLinks.values().next();
+  /** QA-2 nit: per dispatch, the link roots (perimeterKey) its admission accepted; bounded, oldest out. */
+  const admittedLinks = new Map<string, Set<string>>();
+  /** The admitted link roots behind the pins a gate took (keyed by that pins array): pinNow admits as the dispatch did. */
+  const pinAdmissions = new WeakMap<readonly LinkPin[], ReadonlySet<string>>();
+  const rememberAdmittedLink = (id: string, dir: string): void => {
+    let admitted = admittedLinks.get(id);
+    if (admitted === undefined) {
+      admitted = new Set();
+      admittedLinks.set(id, admitted);
+    }
+    admitted.add(perimeterKey(dir));
+    while (admitted.size > 1024) {
+      const oldest = admitted.values().next();
       if (oldest.done === true) break;
-      admittedLinks.delete(oldest.value);
+      admitted.delete(oldest.value);
+    }
+  };
+  /** QA-2 nit: forgets a dispatch's pins and admitted roots; the pins its gate took keep that admission for pinNow. */
+  const freeLinkPins = (id: string, taken: readonly LinkPin[]): void => {
+    const admitted = admittedLinks.get(id);
+    if (admitted !== undefined && taken.length > 0) pinAdmissions.set(taken, admitted);
+    linkPins.delete(id);
+    admittedLinks.delete(id);
+  };
+  /**
+   * QA-2 #9c: an unattributable writer (any session: its directory says nothing about where it writes) discards every pin still
+   * being computed, as it discards an in-flight perimeter snapshot (dispatch.ts observeEdit).
+   */
+  const contaminateLinkPins = (tool: string): void => {
+    if (!isUnattributedWriter(tool)) return;
+    for (const forDispatch of linkPins.values()) {
+      for (const pin of forDispatch.values()) if (pin.pending) pin.contaminatedBy ??= tool;
     }
   };
   /**
-   * Cross-repo P2d.3 (P2.6): the current pin of a link target at materialize time (hardened, ignored files digested), admitted
-   * as the dispatch admitted it. Never throws (pinTarget).
+   * QA-2 #9c: the store's own writer signal (observeEdit before a call, record after it: the calls that contaminate an in-flight
+   * perimeter snapshot) also reaches the pins. Installed once per store, by the first dispatch that pins a link target.
    */
-  const pinNow = (root: string): Promise<LinkPin> =>
+  const watchedStores = new WeakSet<object>();
+  const watchWritersFor = (store: ReturnType<typeof createChangedFileStore>): void => {
+    if (watchedStores.has(store)) return;
+    watchedStores.add(store);
+    const observeEdit = store.observeEdit;
+    const record = store.record;
+    store.observeEdit = (tool, cwd) => {
+      contaminateLinkPins(tool);
+      observeEdit(tool, cwd);
+    };
+    store.record = (sessionID, tool, args) => {
+      contaminateLinkPins(tool);
+      record(sessionID, tool, args);
+    };
+  };
+  /**
+   * Cross-repo P2d.3 (P2.6): the current pin of a link target at materialize time (hardened, ignored files digested), admitted
+   * as the dispatch admitted it (QA-2 nit: the gate's own pins' admission, never another dispatch's). Never throws (pinTarget).
+   */
+  const pinNowFor = (admitted: ReadonlySet<string> | undefined) => (root: string): Promise<LinkPin> =>
     pinTarget(root, {
       snapshot: dir => {
         const controller = new AbortController();
@@ -1511,7 +1564,7 @@ export function createVerificationWiring(deps: {
           "link pin fingerprint",
         ).catch(() => undefined).finally(() => controller.abort());
       },
-      admitted: dir => admittedLinks.has(perimeterKey(dir)),
+      admitted: dir => admitted?.has(perimeterKey(dir)) === true,
       externalLinks: defaultExternalLinks,
     });
 
@@ -1547,23 +1600,23 @@ export function createVerificationWiring(deps: {
       }
     }
     const lowPriority = configuredLowPriority();
-    // Cross-repo P2d.3 (P2.6): an admitted link target's snapshot also digests its ignored files, and its pin starts with it
-    // (bounded by the capture timeout; the nested targets are snapshotted hardened, one level deep, by pinTarget).
+    // Cross-repo P2d.3 (P2.6): an admitted link target is pinned at dispatch (bounded by the capture timeout; the nested targets
+    // are snapshotted hardened, one level deep, by pinTarget). QA-2 #4: the perimeter snapshot stays the plain hardened one; the
+    // pin takes its own snapshots (ignored files digested), started once that snapshot settled, and neither dispatch start nor
+    // the perimeter entry waits for it.
     const perimeterRootSnapshot = (root: string, signal: AbortSignal): Promise<TreeSnapshot | undefined> => {
+      const plain = snapshotTree(root, signal, { lowPriority, hardened: true });
       const seed = perimeter?.roots.find(candidate => candidate.at === root);
-      if (seed === undefined || seed.origin !== "link" || seed.fixed !== undefined) {
-        return snapshotTree(root, signal, { lowPriority, hardened: true });
-      }
-      const own = snapshotTree(root, signal, { lowPriority, hardened: true, ignoredDigest: true });
+      if (seed === undefined || seed.origin !== "link" || seed.fixed !== undefined) return plain;
+      watchWritersFor(store);
       const seedAdmit = seed.admit ?? ((): boolean => false);
       // The roots the dispatch's admission accepted: the materialize-time pin (pinNow) is admitted by the same set.
       const admit = (dir: string): boolean => {
         const admitted = seedAdmit(dir);
-        if (admitted) rememberAdmittedLink(dir);
+        if (admitted) rememberAdmittedLink(id, dir);
         return admitted;
       };
-      const nestedSnapshot = async (dir: string): Promise<TreeSnapshot | undefined> => {
-        if (perimeterKey(dir) === perimeterKey(root)) return own.catch(() => undefined);
+      const pinSnapshot = async (dir: string): Promise<TreeSnapshot | undefined> => {
         const controller = new AbortController();
         try {
           return await withTimeout(
@@ -1577,24 +1630,33 @@ export function createVerificationWiring(deps: {
           controller.abort();
         }
       };
-      const pin: Promise<LinkPin> = withTimeout(
-        pinTarget(root, { snapshot: nestedSnapshot, admitted: admit, externalLinks: defaultExternalLinks }),
-        deps.timeoutMs,
-        "link pin",
-      ).catch((): LinkPin => ({ kind: "unpinnable", root, why: "not-observed" }));
+      const entry: DispatchLinkPin = {
+        pending: true,
+        pin: plain.then(() => undefined, () => undefined)
+          .then(() => withTimeout(
+            pinTarget(root, { snapshot: pinSnapshot, admitted: admit, externalLinks: defaultExternalLinks }),
+            deps.timeoutMs,
+            "link pin",
+          ))
+          .catch((): LinkPin => ({ kind: "unpinnable", root, why: "not-observed" }))
+          .finally(() => {
+            entry.pending = false;
+          }),
+      };
       let forDispatch = linkPins.get(id);
       if (forDispatch === undefined) {
         forDispatch = new Map();
         linkPins.set(id, forDispatch);
-        // Bounded: a dispatch whose gate never ran is evicted by newer ones (oldest first).
+        // Bounded: a dispatch whose gate never ran is evicted by newer ones (oldest first), with its admitted roots.
         while (linkPins.size > LINK_PINS_MAX) {
           const oldest = linkPins.keys().next();
           if (oldest.done === true) break;
           linkPins.delete(oldest.value);
+          admittedLinks.delete(oldest.value);
         }
       }
-      forDispatch.set(root, pin);
-      return own;
+      forDispatch.set(root, entry);
+      return plain;
     };
     const begun = store.beginDispatch(id, at, perimeter === undefined ? deps : {
       ...deps,
@@ -1620,13 +1682,15 @@ export function createVerificationWiring(deps: {
     const forDispatch = linkPins.get(id);
     const planned = store.perimeterOf(id);
     if (forDispatch === undefined || planned === undefined) return [];
-    const ready = await Promise.all([...forDispatch].map(async ([root, pin]): Promise<LinkPin | undefined> => {
+    const ready = await Promise.all([...forDispatch].map(async ([root, pinned]): Promise<LinkPin | undefined> => {
       const entry = planned.entries.get(root);
       if (entry === undefined || entry.seed.fixed !== undefined || entry.contaminatedBy !== undefined) return undefined;
       const ms = deadline ? deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS) : GRADE_SNAPSHOT_TIMEOUT_MS;
       if (ms <= 0 || deadline?.signal.aborted === true) return undefined;
       try {
-        return await withTimeout(pin, ms, "link pin");
+        const pin = await withTimeout(pinned.pin, ms, "link pin");
+        // QA-2 #9c: an unattributable writer ran while it (or a nested target's snapshot) was computed: dropped.
+        return pinned.contaminatedBy === undefined ? pin : undefined;
       } catch {
         return undefined;
       }
@@ -2654,6 +2718,8 @@ export function createVerificationWiring(deps: {
       const captured = await store.reference(id, deadline?.signal);
       // Cross-repo P2d.3 (P2.6): the pins of the admitted link targets travel with a captured reference (required gate only).
       const pins = captured.kind === "captured" ? await linkPinsAtGate(store, id, deadline) : [];
+      // QA-2 nit: the gate took the dispatch's pins (or its reference was discarded): free them.
+      freeLinkPins(id, pins);
       const reference: ReferenceState = pins.length > 0 && captured.kind === "captured"
         ? { kind: "captured", reference: { ...captured.reference, pins } }
         : captured;

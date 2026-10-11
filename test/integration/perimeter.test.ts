@@ -22,7 +22,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import ModelRouterPlugin from "../../src/index";
-import { invalidateConfigCache } from "../../src/router/config";
+import { invalidateConfigCache, loadConfig } from "../../src/router/config";
 import * as gateModule from "../../src/verify/gate";
 import * as dispatchModule from "../../src/routing/wire/dispatch";
 import { addToWorkingSet, forgetWorkingSet } from "../../src/routing/wire/working-set";
@@ -31,6 +31,7 @@ import { createChangedFileStore } from "../../src/verify/dispatch";
 import * as perimeterModule from "../../src/verify/perimeter";
 import * as deterministicModule from "../../src/verify/deterministic";
 import { samePin, type LinkPin } from "../../src/verify/pin";
+import type { DoD } from "../../src/verify/dod";
 import { PERIMETER_MAX, planPerimeter } from "../../src/verify/perimeter";
 
 type Tree = Awaited<ReturnType<typeof import("../../src/verify/tree").snapshotTree>>;
@@ -41,7 +42,13 @@ const seam = vi.hoisted(() => {
     const normalized = at.replace(/\\/g, "/").replace(/\/+$/, "");
     return process.platform === "win32" ? normalized.toLowerCase() : normalized;
   };
-  return { key, pins: new Map<string, unknown>(), calls: [] as string[], hardened: [] as string[] };
+  return {
+    key, pins: new Map<string, unknown>(), calls: [] as string[], hardened: [] as string[],
+    /** QA-2 #4: every snapshot call in order, with whether it asked for the ignored-files digest (a link pin). */
+    log: [] as { key: string; digest: boolean }[],
+    /** Pinned answers for the digested calls only (else `pins`). */
+    digestPins: new Map<string, unknown>(),
+  };
 });
 
 vi.mock("../../src/verify/tree", async importOriginal => {
@@ -52,6 +59,11 @@ vi.mock("../../src/verify/tree", async importOriginal => {
       const key = seam.key(args[0]);
       seam.calls.push(key);
       if (args[2]?.hardened === true) seam.hardened.push(key);
+      seam.log.push({ key, digest: args[2]?.ignoredDigest === true });
+      if (args[2]?.ignoredDigest === true) {
+        const digestPin = seam.digestPins.get(key);
+        if (digestPin !== undefined) return Promise.resolve(digestPin as Tree);
+      }
       const pin = seam.pins.get(key);
       return pin !== undefined ? Promise.resolve(pin as Tree) : actual.snapshotTree(...args);
     },
@@ -130,6 +142,8 @@ afterEach(() => {
   seam.pins.clear();
   seam.calls.length = 0;
   seam.hardened.length = 0;
+  seam.log.length = 0;
+  seam.digestPins.clear();
   forgetWorkingSet("orch");
   for (const key of ["HOME", "USERPROFILE"] as const) {
     if (saved[key] === undefined) delete process.env[key];
@@ -616,6 +630,85 @@ describe("link pins at dispatch (P2.6)", () => {
     const reference = gateReferences()[0] as { kind?: string } | undefined;
     expect(reference?.kind).toBe("captured");
     expect(pinsOf(reference)).toBeUndefined();
+  }, 90_000);
+
+  /** Every key lib-b is snapshotted under (as given, and its native realpath). */
+  const libKeys = (): Set<string> => new Set([seam.key(lib), seam.key(fs.realpathSync.native(lib))]);
+
+  it("QA-2 #4: the perimeter snapshot of a link seed is the plain one (no ignoredDigest); the pin takes its own digested snapshot after it", async () => {
+    const hooks = await linked([parent]);
+    await runTask(hooks, `Implement it.\n${TESTS_DOD}`, async () => undefined);
+    const keys = libKeys();
+    const libCalls = seam.log.filter(call => keys.has(call.key));
+    // The dispatch-time perimeter snapshot comes first and never digests the ignored files.
+    expect(libCalls[0]?.digest).toBe(false);
+    // The pin's own snapshot is the only digested one (the gate's perimeter snapshot is plain too).
+    expect(libCalls.filter(call => call.digest)).toHaveLength(1);
+    expect(libCalls.filter(call => !call.digest).length).toBeGreaterThanOrEqual(2);
+    expect(pinsOf(gateReferences()[0])?.map(pin => [pin.kind, seam.key(pin.root)])).toEqual([["pinned", seam.key(lib)]]);
+  }, 90_000);
+
+  it("QA-2 #9c: an unattributable writer while the pin is still computed drops the pin; the settled perimeter snapshot is kept", async () => {
+    const hooks = await linked([parent]);
+    const tree = seam.pins.get(seam.key(lib)) as NonNullable<Tree>;
+    let release: (value: Tree) => void = () => undefined;
+    const held = new Promise<Tree>(settle => {
+      release = settle;
+    });
+    // Only the pin's (digested) snapshot is held; the perimeter snapshot settles at once.
+    for (const key of libKeys()) seam.digestPins.set(key, held);
+    const out = await runTask(hooks, `Implement it.\n${TESTS_DOD}`, async (h, sid) => {
+      await runTool(h, sid, "bash", { command: "echo hi" }); // An unattributable writer while lib-b's pin is in flight.
+      release(tree);
+    });
+    const reference = gateReferences()[0] as { kind?: string } | undefined;
+    expect(reference?.kind).toBe("captured");
+    expect(pinsOf(reference)).toBeUndefined();
+    // lib-b itself was observed (its dispatch snapshot was not discarded): only the pin was dropped.
+    expect(out).not.toMatch(/could not be observed/);
+    expect(await gateResults()).not.toMatch(/could not be observed/);
+  }, 90_000);
+
+  it("QA-2 #9c: a writer that ran after the pin settled leaves the pin in place", async () => {
+    const hooks = await linked([parent]);
+    await runTask(hooks, `Implement it.\n${TESTS_DOD}`, async (h, sid) => {
+      // Let the pin (resolved by the seam at once) settle before the writer runs.
+      for (let i = 0; i < 20; i++) await new Promise<void>(settle => setImmediate(settle));
+      await runTool(h, sid, "bash", { command: "echo hi" });
+    });
+    expect(pinsOf(gateReferences()[0])?.map(pin => [pin.kind, seam.key(pin.root)])).toEqual([["pinned", seam.key(lib)]]);
+  }, 90_000);
+
+  it("QA-2 nit: a dispatch's pins are freed once its gate took them; materialize pins as that gate's dispatch admitted", async () => {
+    await linked([parent]);
+    const opener = vi.spyOn(deterministicModule, "createScopeOpener");
+    const { createVerificationWiring } = await import("../../src/verify/wiring");
+    const cfg = loadConfig(repo);
+    const wiring = createVerificationWiring({ client: {}, directory: repo, getConfig: () => cfg, logger: { warn: () => {} } });
+    const store = createChangedFileStore();
+    const dod: DoD = { kind: "deterministic", source: "explicit", criteria: [], deliverable: null, checks: [{ kind: "testsPass", command: "npm test" }] };
+    // The routed role dispatch's id (`task:<orchestrator>:<callID>`, routeAsRole), so its perimeter is planned (I9).
+    const id = "task:orch:call1";
+    await wiring.beginVerification(store, id, repo, dod);
+    const first = await wiring.prepareVerification(store, id, id);
+    expect(first.reference.kind).toBe("captured");
+    const taken = pinsOf(first.reference) ?? [];
+    expect(taken.map(pin => [pin.kind, seam.key(pin.root)])).toEqual([["pinned", seam.key(lib)]]);
+    // Freed: the same dispatch's next gate finds none left (its reference is still captured).
+    const second = await wiring.prepareVerification(store, id, id);
+    expect(second.reference.kind).toBe("captured");
+    expect(pinsOf(second.reference)).toBeUndefined();
+    // Materialize pins as the gate's own dispatch admitted (keyed by its pins), not by a set shared across dispatches.
+    wiring.buildGateDeps(undefined, undefined, first);
+    const withPins = opener.mock.calls.at(-1)?.[0].reference?.pinNow;
+    wiring.buildGateDeps(undefined, undefined, second);
+    const withoutPins = opener.mock.calls.at(-1)?.[0].reference?.pinNow;
+    const dispatchPin = taken[0] as LinkPin | undefined;
+    expect(withPins).toBeTypeOf("function");
+    expect(withoutPins).toBeTypeOf("function");
+    if (dispatchPin === undefined || withPins === undefined || withoutPins === undefined) return;
+    expect(samePin(dispatchPin, await withPins(dispatchPin.root))).toBe(true);
+    expect((await withoutPins(dispatchPin.root)).kind).not.toBe("pinned");
   }, 90_000);
 
   // S7 (the full recheck needs a recognised test runner in the temp repo, which this harness does not install): the dispatch pin

@@ -250,6 +250,7 @@ describe("snapshotTree — ignored-files digest (P2.6)", () => {
   let tree: TreeModule;
   let repo: string;
   let write: (rel: string, content: string) => Promise<void>;
+  let gitIn: (...args: string[]) => void = () => undefined;
   const signal = new AbortController().signal;
   let cleanup: (() => Promise<void>) | undefined;
 
@@ -278,6 +279,7 @@ describe("snapshotTree — ignored-files digest (P2.6)", () => {
       GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.com",
     };
     const git = (...args: string[]) => cp.execFileSync("git", ["-c", "core.autocrlf=false", "-c", "commit.gpgsign=false", ...args], { cwd: repo, env, stdio: "ignore" });
+    gitIn = git;
     await write(".gitignore", "dist/\nnode_modules/\n");
     await write("src/a.ts", "export const a = 1;\n");
     cleanup = () => fs.rm(repo, { recursive: true, force: true });
@@ -360,5 +362,83 @@ describe("snapshotTree — ignored-files digest (P2.6)", () => {
     expect(snapshot).toBeDefined();
     expect(snapshot && "ignored" in snapshot).toBe(false);
     expect(seen.some(a => a.includes("--ignored"))).toBe(false);
+    expect(seen.some(a => a.includes("-v"))).toBe(false); // nor for the index tags (QA-2 #9b)
+  }, 60_000);
+
+  it("(g) QA-2 #4: git never lists inside node_modules (--directory, node_modules pathspec excludes); ignored directories are walked", async () => {
+    await write("node_modules/x/y.js", "one");
+    await write("dist/sub/deep.js", "one");
+    const seen: (readonly string[])[] = [];
+    const git = async (args: readonly string[], opts: import("../../src/verify/tree").SnapshotGitOptions) => {
+      seen.push(args);
+      return tree.execGit(args, opts);
+    };
+    const before = (await tree.snapshotTree(repo, signal, { ignoredDigest: true, git }))?.ignored;
+    expect(before).toMatch(/^[0-9a-f]{64}$/);
+    const listing = seen.filter(a => a.includes("--ignored"));
+    expect(listing).toHaveLength(1);
+    const args = listing[0] ?? [];
+    expect(args).toContain("--directory");
+    // The pathspec follows `--`: everything, minus every node_modules (top-level and nested) and its contents.
+    expect(args.slice(args.indexOf("--"))).toEqual(["--", ".", ":(exclude,glob)**/node_modules", ":(exclude,glob)**/node_modules/**"]);
+    expect([...tree.IGNORED_LIST_ARGS]).toEqual(args.slice(args.indexOf("ls-files")));
+    // What git itself prints for that listing never names a path inside node_modules (git did not walk it): at most the bare
+    // ignored directory, which the digest drops. dist/ is reported whole too, and walked by the digest.
+    const raw = (await tree.execGit([...tree.IGNORED_LIST_ARGS], {
+      cwd: repo, signal, timeoutMs: tree.SNAPSHOT_GIT_TIMEOUT_MS, maxBuffer: tree.SNAPSHOT_GIT_MAX_BUFFER, lowPriority: false,
+    })).split("\0").filter(Boolean);
+    expect(raw.filter(p => p.includes("node_modules") && p !== "node_modules/")).toEqual([]);
+    expect(raw).toContain("dist/");
+    expect(raw.some(p => p.startsWith("dist/") && p !== "dist/")).toBe(false);
+    // The walk of an ignored directory sees nested files, and skips a node_modules inside it.
+    await write("dist/sub/deep.js", "two");
+    const after = await ignoredOf();
+    expect(after).toMatch(/^[0-9a-f]{64}$/);
+    expect(after).not.toBe(before);
+    await write("dist/node_modules/k.js", "one");
+    expect(await ignoredOf()).toBe(after);
+    await write("dist/node_modules/k.js", "a different and longer content");
+    expect(await ignoredOf()).toBe(after);
+  }, 60_000);
+
+  it("(h) QA-2 #9b: a skip-worktree entry makes the digest \"over-bounds\" (the fingerprint cannot see its edits)", async () => {
+    expect(await ignoredOf()).toMatch(/^[0-9a-f]{64}$/);
+    gitIn("update-index", "--skip-worktree", "src/a.ts");
+    try {
+      expect(await ignoredOf()).toBe("over-bounds");
+    } finally {
+      gitIn("update-index", "--no-skip-worktree", "src/a.ts");
+    }
+    expect(await ignoredOf()).toMatch(/^[0-9a-f]{64}$/);
+  }, 60_000);
+
+  it("(i) QA-2 #9b: an assume-unchanged entry makes the digest \"over-bounds\"", async () => {
+    gitIn("update-index", "--assume-unchanged", "src/a.ts");
+    try {
+      expect(await ignoredOf()).toBe("over-bounds");
+    } finally {
+      gitIn("update-index", "--no-assume-unchanged", "src/a.ts");
+    }
+    expect(await ignoredOf()).toMatch(/^[0-9a-f]{64}$/);
+  }, 60_000);
+
+  it("(j) QA-2 #9b: the index tags are read only when the digest is asked for, through the same runner", async () => {
+    const seen: (readonly string[])[] = [];
+    const git = async (args: readonly string[], opts: import("../../src/verify/tree").SnapshotGitOptions) => {
+      seen.push(args);
+      return tree.execGit(args, opts);
+    };
+    await tree.snapshotTree(repo, signal, { ignoredDigest: true, git });
+    expect(seen.filter(a => a.join(" ").endsWith(tree.INDEX_TAGS_ARGS.join(" ")))).toHaveLength(1);
+  }, 60_000);
+
+  it("(k) QA-2 #9b: a failing index-tags listing leaves `ignored` absent and the snapshot intact; it never throws", async () => {
+    const git = async (args: readonly string[], opts: import("../../src/verify/tree").SnapshotGitOptions) => {
+      if (args.join(" ").endsWith(tree.INDEX_TAGS_ARGS.join(" "))) throw new Error("boom");
+      return tree.execGit(args, opts);
+    };
+    const snapshot = await tree.snapshotTree(repo, signal, { ignoredDigest: true, git });
+    expect(snapshot).toBeDefined();
+    expect(snapshot && "ignored" in snapshot).toBe(false);
   }, 60_000);
 });

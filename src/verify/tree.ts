@@ -1,7 +1,7 @@
 // Impure, bounded Git fingerprint adapter. Never interpolates paths into a shell.
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstat, readFile, readlink, realpath } from "node:fs/promises";
+import { lstat, readdir, readFile, readlink, realpath } from "node:fs/promises";
 import { constants as osConstants, setPriority } from "node:os";
 import { join, resolve } from "node:path";
 import { ABSENT_DIGEST, FILE_DIGEST_PREFIX, LINK_DIGEST_PREFIX, type TreeSnapshot, type ChangedFile } from "./dispatch";
@@ -174,8 +174,9 @@ export interface SnapshotOptions {
   git?: SnapshotGit;
   /**
    * Cross-repo P2.6 (SD11): also compute `TreeSnapshot.ignored`, a bounded digest of the repository's ignored files (nothing
-   * under a `node_modules` segment), with the snapshot's own git runner (hardened when `hardened`). Default false: no extra git
-   * process, no extra read, no `ignored` field.
+   * under a `node_modules` segment), with the snapshot's own git runner (hardened when `hardened`). QA-2 #9b: "over-bounds" when
+   * the index holds a skip-worktree or assume-unchanged entry (the fingerprint cannot see edits there). Default false: no extra
+   * git process, no extra read, no `ignored` field.
    */
   ignoredDigest?: boolean;
   /** Default MAX_IGNORED_FILES. */
@@ -189,9 +190,24 @@ export const MAX_IGNORED_FILES = 5_000;
 export const MAX_IGNORED_BYTES = 64 * 1024 * 1024;
 
 /**
- * Cross-repo P2.6: a digest of the ignored files `git ls-files --others --ignored --exclude-standard -z` lists, minus any path
- * with a `node_modules` segment: sha256 over the sorted paths with their size and content (a link: its target). "over-bounds"
- * above `maxFiles` paths or `maxBytes` bytes (sizes come from lstat before anything is read); undefined on any error.
+ * Cross-repo QA-2 #4: how the ignored files are listed. `--directory` reports a wholly ignored directory (an ignored
+ * `node_modules` above all) as one `dir/` entry without walking it; the pathspec excludes keep any file under a `node_modules`
+ * (top-level or nested) out of the listing. ignoredFilesDigest drops the `node_modules/` entries and walks the other reported
+ * directories itself, bounded, never into a `node_modules`.
+ */
+export const IGNORED_LIST_ARGS: readonly string[] = [
+  "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z",
+  "--", ".", ":(exclude,glob)**/node_modules", ":(exclude,glob)**/node_modules/**",
+];
+
+/** Cross-repo QA-2 #9b: lists the index with its tags (`S` skip-worktree, lowercase assume-unchanged). */
+export const INDEX_TAGS_ARGS: readonly string[] = ["ls-files", "-v", "-z"];
+
+/**
+ * Cross-repo P2.6: a digest of the ignored files `git ls-files` lists (IGNORED_LIST_ARGS), minus any path with a
+ * `node_modules` segment: sha256 over the sorted paths with their size and content (a link: its target). "over-bounds"
+ * above `maxFiles` paths or `maxBytes` bytes (sizes come from lstat before anything is read); undefined on any error
+ * (a nested repository included).
  */
 async function ignoredFilesDigest(
   root: string,
@@ -201,10 +217,35 @@ async function ignoredFilesDigest(
   maxBytes: number,
 ): Promise<string | "over-bounds" | undefined> {
   try {
-    const paths = (await list()).split("\0").filter(Boolean)
-      .filter(path => !path.split(/[\\/]/).includes("node_modules"))
-      .sort();
-    if (paths.length > maxFiles) return "over-bounds";
+    // `--directory`: git reports a wholly ignored directory as `dir/` without walking it (so never a `node_modules` tree);
+    // the other ignored directories are walked here, bounded by `maxFiles`, and never into a `node_modules`.
+    const listed = (await list()).split("\0").filter(Boolean)
+      .filter(path => !path.split(/[\\/]/).includes("node_modules"));
+    const paths: string[] = [];
+    for (const path of listed) {
+      if (!/[\\/]$/.test(path)) {
+        paths.push(path);
+        if (paths.length > maxFiles) return "over-bounds";
+        continue;
+      }
+      const pending = [path.replace(/[\\/]+$/, "")];
+      while (pending.length > 0) {
+        if (signal.aborted) return undefined;
+        const dir = pending.pop() as string;
+        for (const entry of await readdir(resolve(root, dir), { withFileTypes: true })) {
+          if (entry.name === "node_modules") continue;
+          if (entry.name === ".git") return undefined; // A nested repository has no content identity here.
+          const child = `${dir}/${entry.name}`;
+          if (entry.isDirectory()) {
+            pending.push(child);
+            continue;
+          }
+          paths.push(child);
+          if (paths.length > maxFiles) return "over-bounds";
+        }
+      }
+    }
+    paths.sort();
     const sized: [string, "file" | "link", number][] = [];
     let bytes = 0;
     for (const path of paths) {
@@ -366,15 +407,27 @@ export async function snapshotTree(cwd: string, signal: AbortSignal, options: Sn
       options.maxDigestBytes ?? MAX_DIGEST_BYTES,
     );
     if (signal.aborted) return undefined;
-    const ignored = options.ignoredDigest === true
-      ? await ignoredFilesDigest(
-        root,
-        () => git(["ls-files", "--others", "--ignored", "--exclude-standard", "-z"]),
-        signal,
-        options.maxIgnoredFiles ?? MAX_IGNORED_FILES,
-        options.maxIgnoredBytes ?? MAX_IGNORED_BYTES,
-      )
-      : undefined;
+    let ignored: string | "over-bounds" | undefined;
+    if (options.ignoredDigest === true) {
+      // Cross-repo QA-2 #9b: a skip-worktree (`S`) or assume-unchanged (lowercase) entry hides its edits from `status` and
+      // `diff`, so the fingerprint cannot vouch for it: the digest is unusable ("over-bounds"), as reference.ts treats it for W.
+      // A failed listing leaves `ignored` absent and the snapshot intact, as a failed ignored listing does.
+      const hidden = await git([...INDEX_TAGS_ARGS]).then(
+        tags => tags.split("\0").some(record => record !== "" && (record[0] === "S" || record[0] !== record[0]?.toUpperCase())),
+        () => undefined,
+      );
+      ignored = hidden === undefined
+        ? undefined
+        : hidden
+        ? "over-bounds"
+        : await ignoredFilesDigest(
+          root,
+          () => git([...IGNORED_LIST_ARGS]),
+          signal,
+          options.maxIgnoredFiles ?? MAX_IGNORED_FILES,
+          options.maxIgnoredBytes ?? MAX_IGNORED_BYTES,
+        );
+    }
     return {
       cwd: await realpath(cwd), root: await realpath(root), head, branch, fingerprint: hash.digest("hex"), dirty: files.length > 0, files, digests,
       ...(ignored !== undefined ? { ignored } : {}),
