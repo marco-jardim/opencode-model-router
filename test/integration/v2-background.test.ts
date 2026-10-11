@@ -11,7 +11,8 @@
  * The defects found by 2.1.8 are fixed and pinned by plain tests named "Dn: ...": D2 early end processed at the ack, D3 held
  * verdict posted (the pending journal survives a removed directory), D4 resume by `task_id` of a held child refused, D5 a lost
  * child (empty history) annotated. Verdict posting through the real adapter to a busy and to an idle parent (PASS, FAIL: one
- * `synthetic` with `resume: true`) is tested in "held verdicts posted to the parent" below.
+ * `synthetic` with `resume: true`) is tested in "held verdicts posted to the parent" below. Timing rows of the static engine feeding
+ * the background decision ("static engine: timing rows…") and the route hint never carrying held output are tested here too.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { bootBgHost, restoreEnv, type BgHost, type ToolEvent } from "../helpers/v2-bg-host";
@@ -309,6 +310,17 @@ describe("held results across a restart (R20): placeholder, refusal, compaction"
     expect(tail(event)).toContain(HANDLE);
   });
 
+  it("the held output never leaks through the route hint or any other part of the tail", async () => {
+    const h = await boot("auto", { journalText: holdJournal(HANDLE, CHILD, "call-old") });
+    childSays(h, CHILD, "SECRET held output");
+    const messages = [user("[route class=implement risk=low scope=single]\nimplement it"), { id: "m-completion", role: "user", content: [{ type: "text", text: original }] }];
+    for (let i = 0; i < 2; i += 1) {
+      const event = await request(h, messages.map((m) => structuredClone(m)));
+      expect(tail(event)).not.toContain("SECRET");
+      expect(allText(event)).not.toContain("SECRET");
+    }
+  });
+
   it("a resume of a held child is refused before anything runs", async () => {
     const h = await boot("auto", { journalText: holdJournal(HANDLE, CHILD, "call-old") });
     await request(h, [user("hello")]); // the first request of the parent adopts its records
@@ -387,6 +399,39 @@ describe("held verdicts posted to the parent (memo 5, 7.3)", () => {
       });
     }
   }
+});
+
+describe("static engine: timing rows feed the background decision", () => {
+  /** A dispatch with the route marker of a fixed class, so every call lands on one duration key. */
+  const SLOW = "[route class=implement risk=low scope=single]\nImplement the feature in src/a.ts";
+  const SLOW_MS = 60_000;
+
+  async function oneSlowDispatch(h: BgHost, n: number, durationMs: number): Promise<ToolEvent> {
+    const child = `slow-${n}`;
+    h.sessions.set(child, { parentID: ORCH });
+    h.emit(created(child, ORCH));
+    const call = await h.before(dispatch({ prompt: SLOW, background: false }));
+    // The timing clock starts at execute.before (the host's wall clock); the end event carries the child's end time.
+    await h.after({ ...call, status: "completed", result: { output: { sessionID: child, status: "completed", output: "done" }, content: "done", metadata: { sessionID: child } } });
+    h.emit({ type: "session.execution.succeeded", id: `ev-slow-${n}`, created: Date.now() + durationMs, data: { sessionID: child } });
+    await h.drain();
+    return call;
+  }
+
+  it("after 5 sampled rows of one key with p50 >= 45 s the next dispatch of that key goes to the background", async () => {
+    host = await bootBgHost({
+      overrides: { routing: { engine: "static", background: { mode: "auto" }, leases: { mode: "off" } } },
+      sessions: { [ORCH]: {} },
+    });
+    const h = host;
+    h.emit({ type: "session.created", id: "ev-created-root", created: 1, data: { sessionID: ORCH } });
+    for (let n = 1; n <= 4; n += 1) await oneSlowDispatch(h, n, SLOW_MS);
+    // Control: 4 rows are below the 5-sample minimum, so the estimate is still the prior and the call stays in the foreground.
+    expect(inputOf(await h.before(dispatch({ prompt: SLOW }))).background).toBe(false);
+    await oneSlowDispatch(h, 5, SLOW_MS);
+    const next = await h.before(dispatch({ prompt: SLOW }));
+    expect(inputOf(next).background).toBe(true);
+  });
 });
 
 describe("a restart between the ack and the end (R18)", () => {

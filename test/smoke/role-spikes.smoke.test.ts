@@ -19,7 +19,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
-  OPENAI_PROVIDER, RoutingHost, agentWithoutModel, arr, effectiveEffort, obj, redact, ref, stopAllHosts, str,
+  OPENAI_PROVIDER, RoutingHost, agentWithoutModel, arr, clip, effectiveEffort, obj, redact, ref, stopAllHosts, str,
   type EventRecord, type HostOptions, type Obj, type WireRequest,
 } from "./helpers/routing-host";
 
@@ -732,6 +732,19 @@ d("role spikes on the real OpenCode v2 host (issue #84, P0.1)", () => {
     expect(off.delivery.hasNote).toBe(false);
     expect(off.delivery.snippet).toContain('state=\\"completed\\" description=\\"S6B bg\\"'); // a host-made completion notification to the parent
   }, 600_000);
+
+  // CPX 2.1 (memo §6 footnote 1, row 12): routing.background.mode "auto" with a thin outcome store selects nothing, so a dispatch that sets no
+  // `background` and is not verified reaches the host with NO background key (it used to be forced to false for every routed dispatch).
+  it("S6C auto with a thin store: a role-spike dispatch without a background argument gets no background key", async () => {
+    const host = await startSpikeHost("s6c", { [NO_MODEL]: agentWithoutModel() }, { overrides: { enforcement: { mode: "off" }, routing: { background: { mode: "auto" } } } });
+    try {
+      const root = await host.newRoot("s6c root");
+      const call = await host.call(root, "subagent", { agent: NO_MODEL, description: "S6C", prompt: "S6C child", model: `${SONNET}#low` });
+      await save("S6C-auto-thin-store", { before: clip(call.before.input, 600), hostErrors: host.errorLines() });
+      expect(Object.hasOwn(obj(call.before.input), "background")).toBe(false);
+      expect(host.errorLines()).toEqual([]);
+    } finally { await finish(host); }
+  }, 300_000);
 
   it("S8 Code Mode execute: inner tools.* calls bypass the permission evaluate hook and the per-session context filter", async () => {
     const host = await startSpikeHost("s8", { [NO_MODEL]: agentWithoutModel() }, { probe: { lifecycle: true, bySession: { keepOnlyTitle: "S8 keep", keepOnly: ["execute", "subagent"] } } });

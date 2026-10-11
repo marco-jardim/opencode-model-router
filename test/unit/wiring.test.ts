@@ -9,9 +9,29 @@ import {
 } from "../../src/verify/wiring";
 import { buildForcingNote, createChangedFileStore, type DispatchDelta } from "../../src/verify/dispatch";
 import type { DoD } from "../../src/verify/dod";
+import type { TestsPassRequest } from "../../src/verify/types";
 import { preemptBackgroundVerification } from "../../src/verify/wiring";
 import type { GateResult } from "../../src/verify/gate";
 import type { RouterConfig } from "../../src/router/config";
+
+// Phase 2.1: the reference GC test below records the order of keepReferences and gcStaleReferences; both pass through to the real
+// module except the GC scan itself (no git in this unit test).
+const refCalls = vi.hoisted(() => ({ order: [] as string[], kept: [] as string[][] }));
+vi.mock("../../src/verify/reference", async importOriginal => {
+  const real = await importOriginal<typeof import("../../src/verify/reference")>();
+  return {
+    ...real,
+    keepReferences: (keys: Iterable<string>, opts?: Parameters<typeof real.keepReferences>[1]) => {
+      refCalls.order.push("keep");
+      refCalls.kept.push([...keys]);
+      return real.keepReferences(keys, opts);
+    },
+    gcStaleReferences: async () => {
+      refCalls.order.push("gc");
+      return { removed: [], kept: [], failed: [] };
+    },
+  };
+});
 
 function cfg(over: Partial<RouterConfig> = {}): RouterConfig {
   return {
@@ -54,6 +74,87 @@ function respondToPrompt(client: ReturnType<typeof fakeClient>, response: any): 
     return response;
   };
 }
+
+describe("reference GC at start (Phase 2.1, pending.jsonl reload)", () => {
+  const refDir = "/tmp/omr-ref-4242-0123456789abcdef";
+  const refRecord = {
+    v: 1 as const,
+    kind: "ref",
+    handle: "vrf_0123456789abcdef01234567",
+    callID: "call-1",
+    reference: { root: "/d", head: "h", commit: "c", untracked: {}, tracked: {}, captureReasons: [], capturedAt: 1, links: { [`${refDir}/node_modules`]: "/d/node_modules" } },
+  };
+
+  it("keeps the reference dirs named by reloaded pending entries before the GC scans", async () => {
+    refCalls.order.length = 0;
+    refCalls.kept.length = 0;
+    const w = createVerificationWiring({ client: fakeClient(), directory: "/d", getConfig: () => cfg(), pendingRestore: Promise.resolve([refRecord]), logger: { warn: () => undefined } });
+    const cancel = w.startReferenceGc(0);
+    await vi.waitFor(() => expect(refCalls.order).toContain("gc"));
+    cancel();
+    expect(refCalls.order).toEqual(["keep", "gc"]);
+    expect(refCalls.kept).toEqual([[refDir]]);
+  });
+
+  it("scans anyway when the reload fails, and keeps nothing", async () => {
+    refCalls.order.length = 0;
+    refCalls.kept.length = 0;
+    const w = createVerificationWiring({ client: fakeClient(), directory: "/d", getConfig: () => cfg(), pendingRestore: Promise.reject(new Error("unreadable")), logger: { warn: () => undefined } });
+    const cancel = w.startReferenceGc(0);
+    await vi.waitFor(() => expect(refCalls.order).toContain("gc"));
+    cancel();
+    expect(refCalls.order).toEqual(["gc"]);
+  });
+});
+
+describe("leaseGate (Phase 2.1.5): a verification run waits for the tree's holders, then runs with the caveat", () => {
+  const request: TestsPassRequest = {
+    command: "pnpm test", cwd: process.cwd(), testScope: "affected", changedFiles: [], reference: { kind: "none", reason: "test" },
+    deadline: { budgetMs: 60_000, remaining: () => 60_000, bound: ms => Math.min(ms, 60_000), signal: new AbortController().signal },
+  };
+  const run = (w: ReturnType<typeof createVerificationWiring>, prepared: Awaited<ReturnType<ReturnType<typeof createVerificationWiring>["prepareVerification"]>>) => {
+    const hook = w.buildGateDeps("PARENT", undefined, prepared).deterministic.testsPass;
+    if (hook === undefined) throw new Error("the gate deps carry no testsPass hook");
+    return hook(request);
+  };
+
+  it("waits first, then runs the hook, and marks the dispatch with the holders that remain", async () => {
+    const order: string[] = [];
+    const waitTreeFree = vi.fn(async () => {
+      order.push("wait");
+      return { waitedMs: 5, holders: ["impl-1", "impl-2"], fileCount: 3 };
+    });
+    const w = createVerificationWiring({ client: fakeClient(), directory: process.cwd(), getConfig: () => cfg(), leaseGate: { waitTreeFree }, logger: { warn: () => undefined } });
+    const prepared = await w.prepareVerification(createChangedFileStore(), "lease-d", "child");
+    await run(w, prepared);
+    expect(waitTreeFree).toHaveBeenCalledTimes(1);
+    expect(order).toEqual(["wait"]);
+    const [tree, owner, deadlineMs] = waitTreeFree.mock.calls[0] as unknown as [string, { producer: string }, number];
+    expect(typeof tree).toBe("string");
+    expect(owner).toEqual({ producer: "PARENT" });
+    expect(deadlineMs).toBeGreaterThan(0);
+    // The caveat that applyDispatchCaveats turns into the "other delegations ran concurrently (2)" reason.
+    expect(prepared.concurrentDispatches).toBe(2);
+  });
+
+  it("adds no caveat when the tree is free", async () => {
+    const waitTreeFree = vi.fn(async () => ({ waitedMs: 0, holders: [], fileCount: 0 }));
+    const w = createVerificationWiring({ client: fakeClient(), directory: process.cwd(), getConfig: () => cfg(), leaseGate: { waitTreeFree }, logger: { warn: () => undefined } });
+    const prepared = await w.prepareVerification(createChangedFileStore(), "lease-free", "child");
+    await run(w, prepared);
+    expect(waitTreeFree).toHaveBeenCalledTimes(1);
+    expect(prepared.concurrentDispatches ?? 0).toBe(0);
+  });
+
+  it("still verifies when the wait throws", async () => {
+    const warn = vi.fn();
+    const waitTreeFree = vi.fn(async () => { throw new Error("registry gone"); });
+    const w = createVerificationWiring({ client: fakeClient(), directory: process.cwd(), getConfig: () => cfg(), leaseGate: { waitTreeFree }, logger: { warn } });
+    const prepared = await w.prepareVerification(createChangedFileStore(), "lease-err", "child");
+    expect(await run(w, prepared)).toBeDefined();
+    expect(warn).toHaveBeenCalledWith("[verify] lease wait failed; verifying anyway", expect.objectContaining({ error: expect.stringContaining("registry gone") }));
+  });
+});
 
 describe("extractAssistantText", () => {
   it("joins the text parts", () => {
