@@ -727,8 +727,23 @@ Append-only, one JSON object per line, `"v": 1`. Records:
 
 ## Findings
 
-## Fixes
+### Round 1 (heavy reviewer `ses_ed4d06f56ffeWxa2gPb7xz56cy`, at `bc0a9b4`) — 13 findings (2 critical, 7 major, 4 minor); fixes pending
 
+- QA-2.1-1 (critical): held verdict posted as PASS when the gate gave none (`index.ts:3583`; `finishDispatch` `{kind:"none"}` on read-only skip `:3318-3330` and on any exception `catch {}` `:3430-3432`). Fix: none/deferred/skipped/error → UNVERIFIABLE with reason; add `skipped`/`error` to FinishOutcome; end-to-end tests; remove the empty catch.
+- QA-2.1-2 (critical): verdict delivery has no recovery (`background.ts:696-723`, `:785-796`; R21 `posting` never read; restored verified entry dropped `pending.ts:1616` while the hold stays `:978-981`; duplicate posts if `posted` append throws; verdict before hold insertion dropped `:728-735`). Fix: persist verdict text with `posting`; re-post posting-without-posted at adoption after checking parent context `metadata.router.handle`; post even if the journal write fails; never retry synthetic for a journal failure; insert the hold before the fsync or queue verdicts.
+- QA-2.1-3 (major): ack failure leaves "held" text without a hold (`v2-hooks.ts:2355-2377`). Fix: set ack text after both writes; on failure drop `attempt.hold`, `pending.releaseHandle`, "will arrive unverified" text.
+- QA-2.1-4 (major): reserved handles leak (`releaseHandle` `pending.ts:1714` never called; failed/interrupted `background.ts:1029`, closed-unknown `:1183-1195`). Fix: release on every held attempt ending without a held register; TTL on reservations.
+- QA-2.1-5 (major): failed/interrupted children still run the gate (`index.ts:3604`). Fix: status ≠ succeeded → no `finishDispatch`.
+- QA-2.1-6 (major): restart recovery incomplete (R18–R20): `recoverInflight` `v2-hooks.ts:2285-2294` assumes succeeded; lost non-held child never wakes the parent; restored held entries never re-verified; `heldTexts` in memory only. Fix: read the child's end state; one `resume:true` wake per lost child; adopt from the event loop too; re-run the gate at adoption; persist child text with the hold.
+- QA-2.1-7 (major): `captureDelta(a.callID)` keyed wrongly (`index.ts:3509` vs `task:<parent>:<callID>` `:2323`; `dispatch.ts:493`) and narrower than the observed change set it overwrites (`wiring.ts:1716-1720`). Fix: pass the dispatch id and compute the full delta, or do not override the observed set.
+- QA-2.1-8 (major): pending journal fragile; answers the D3 question: nothing in `src` deletes `outcomes`; the default outcomes dir is in `os.tmpdir()` (`routing/outcomes/persist.ts:130`) and test `dispose` removes the home while work is in flight (`test/helpers/v2-bg-host.ts:274-278`); missing file loads as `[]` (`pending.ts:904`); never compacted; reload read twice; `reloadFailed` permanent; compaction hook not fail-closed (`v2-hooks.ts:1216-1225` vs `:1772`); held resumes not refused while reload failed (`:1324`). Fix: durable per-user journal dir; vanished journal = reload failure; compact at start; retry reload; fail closed in compaction; `dispose` waits for in-flight work; remove the mkdirSync workaround.
+- QA-2.1-9 (major): `router_verify` can claim a held entry (`pending.ts:1528-1548`, `wiring.ts:2116`). Fix: refuse held entries or join the background run.
+- QA-2.1-10 (minor): posted holds lose their placeholder after restart (`pending.ts:978-981`). Restore as inactive placeholders.
+- QA-2.1-11 (minor): lease guard: uncached `ctx.session.get` per call (`v2-hooks.ts:986-990`, `background.ts:1401`); child misclassified as root gets root wording; producer's own leases delay its own check (`wiring.ts:1476-1486`). Fix: cache dir + negative cache; child wording when kind unknown; exclude the producer's holder in `waitTreeFree`.
+- QA-2.1-12 (minor): `off` still adds the lease line (`protocol.ts`), child-parent user-backgrounded notice, undocumented `[router`→`(router` defang, v1 logs up to 4 notices (AGENTS.md: at most one). Fix docs or code; fold v1 notices into one.
+- QA-2.1-13 (minor): bookkeeping leaks (`heldTexts`, `adoptedSessions`, `warned`, claim files/PID reuse, decided-but-unacked records counted live, `PROCESS_CLAIMS` across reloads).
+
+## Fixes
 ## Deferred findings
 
 ## Handoffs
