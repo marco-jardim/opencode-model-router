@@ -705,6 +705,9 @@ import { tmpdir as osTmpdir } from "node:os";
 import { posix as pathPosix, win32 as pathWin32 } from "node:path";
 import type { ArgvSeam, ExecOptions, ExecResult } from "./types";
 import type { TreeSnapshot } from "./dispatch";
+import { gitTopOf, perimeterKey } from "./git-top";
+// Type-only: pin.ts imports perimeter.ts, which imports this module; samePin is loaded lazily in step 7.
+import type { LinkPin } from "./pin";
 import type { PluginLogger } from "../router/logger";
 
 // --- Seams --------------------------------------------------------------------
@@ -778,6 +781,11 @@ export interface ReferenceDeps extends CaptureDeps {
   randomSuffix?: () => string;
   /** Default HEARTBEAT_INTERVAL_MS: how often a materialized dir's mtime is refreshed while in use. */
   heartbeatMs?: number;
+  /**
+   * Cross-repo P2.6: the current pin of a link target's repository top, computed by the caller (pin.ts pinTarget). With
+   * DispatchReference.pins, a package link into a pinned repository unchanged since dispatch is exact instead of external-link.
+   */
+  pinNow?: (root: string) => Promise<LinkPin>;
 }
 
 // --- Data types ---------------------------------------------------------------
@@ -797,6 +805,8 @@ export interface DispatchReference {
   readonly captureReasons: readonly InexactReason[];
   /** now() when the capture resolved. */
   readonly capturedAt: number;
+  /** Cross-repo P2.6: the dispatch-time pins of linked repositories (pin.ts); see ReferenceDeps.pinNow. */
+  readonly pins?: readonly LinkPin[];
 }
 
 export type InexactCause =
@@ -1846,6 +1856,34 @@ export async function materialize(
     // Package-store layouts (pnpm `.pnpm/x@1/node_modules/x`, a global virtual store, a custom
     // virtualStoreDir) all place the package directly under a node_modules dir (or its @scope).
     const storeLike = (real: string): boolean => isStoreLikeLink(real, platform);
+    // Cross-repo P2.6 (OD3, fail closed): an outside link whose git top was pinned at dispatch (ref.pins) and has the same
+    // pin now (deps.pinNow) is exact. No pin, an unpinnable or changed pin, no pinNow, or a throw keeps external-link.
+    const pins = ref.pins ?? [];
+    const pinNow = deps.pinNow;
+    const usePins = pins.length > 0 && pinNow !== undefined;
+    const pinVerdicts = new Map<string, Promise<boolean>>();
+    const pinnedUnchanged = async (real: string): Promise<boolean> => {
+      try {
+        if (pinNow === undefined) return false;
+        const top = gitTopOf(real);
+        if (top === undefined) return false;
+        const key = perimeterKey(top);
+        const dispatchPin = pins.find((pin) => perimeterKey(pin.root) === key);
+        if (dispatchPin === undefined || dispatchPin.kind !== "pinned") return false;
+        let verdict = pinVerdicts.get(key);
+        if (verdict === undefined) {
+          verdict = (async () => {
+            // Lazy: a static import would close the cycle reference -> pin -> perimeter -> reference.
+            const { samePin } = await import("./pin");
+            return samePin(dispatchPin, await pinNow(dispatchPin.root));
+          })().catch(() => false);
+          pinVerdicts.set(key, verdict);
+        }
+        return await verdict;
+      } catch {
+        return false;
+      }
+    };
     for (const { target, label } of linkTargets) {
       for (const entry of await packageEntries(fs, target, platform)) {
         const stats = await lstatOrMissing(fs, entry);
@@ -1863,7 +1901,7 @@ export async function materialize(
           if (!p.basename(entry).startsWith(".")) {
             const entryLabel = [label, ...p.relative(target, entry).split(p.sep)].join("/");
             if (insideOrEqual(realRoot, real, platform) || insideOrEqual(root, real, platform)) rootLinks.add(entryLabel);
-            else if (!storeLike(real)) externalLinks.add(entryLabel);
+            else if (!storeLike(real) && !(usePins && (await pinnedUnchanged(real)))) externalLinks.add(entryLabel);
           }
           continue;
         }

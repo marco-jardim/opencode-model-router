@@ -17,6 +17,7 @@ import {
   type MaterializedReference,
   type ReferenceDeps,
 } from "../../src/verify/reference";
+import type { LinkPin } from "../../src/verify/pin";
 
 const isWin = process.platform === "win32";
 const linkType = isWin ? "junction" : "dir";
@@ -719,6 +720,171 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
     } finally {
       await handle.dispose();
     }
+  });
+
+  describe("materialize — pinned link targets (P2.6)", () => {
+    const pinned = (root: string, head = "h0"): LinkPin => ({ kind: "pinned", root, head, fingerprint: "f0", ignored: "i0", nested: [] });
+    // A git repository outside root; its canonical path is what the dispatch pin records as root.
+    const outsideRepo = async (name: string): Promise<string> => {
+      const outside = join(base, name);
+      await fsp.mkdir(join(outside, "packages", "x"), { recursive: true });
+      await fsp.writeFile(join(outside, "index.js"), "module.exports = 'b0';\n");
+      await git(outside, "init", "-q");
+      return fsp.realpath(outside);
+    };
+    const linkReasons = async (pins: readonly LinkPin[] | undefined, pinNow?: ReferenceDeps["pinNow"]) => {
+      const ref = await capture();
+      const handle = await mat(pins === undefined ? ref : { ...ref, pins }, pinNow === undefined ? {} : { pinNow });
+      try {
+        return { exact: handle.exact, reasons: handle.inexactReasons.filter((r) => r.cause === "external-link" || r.cause === "root-link") };
+      } finally {
+        await handle.dispose();
+      }
+    };
+
+    it("S7: link to a pinned repository unchanged since dispatch -> exact, no external-link", async () => {
+      const outside = await outsideRepo("pinned lib-b");
+      await fsp.symlink(outside, join(repo, "node_modules", "lib-b"), linkType);
+      const calls: string[] = [];
+      const { exact, reasons } = await linkReasons([pinned(outside)], async (root) => {
+        calls.push(root);
+        return pinned(root);
+      });
+      expect(reasons).toEqual([]);
+      expect(exact).toBe(true);
+      expect(calls).toEqual([outside]);
+    });
+
+    it("S7: link inside a pinned repository (below its top) unchanged since dispatch -> exact", async () => {
+      const outside = await outsideRepo("pinned lib-inner");
+      await fsp.symlink(join(outside, "packages", "x"), join(repo, "node_modules", "x"), linkType);
+      const { exact, reasons } = await linkReasons([pinned(outside)], async (root) => pinned(root));
+      expect(reasons).toEqual([]);
+      expect(exact).toBe(true);
+    });
+
+    it("S7: two links into the same pinned repository -> the current pin is computed once", async () => {
+      const outside = await outsideRepo("pinned lib-twice");
+      await fsp.symlink(outside, join(repo, "node_modules", "lib-b"), linkType);
+      await fsp.symlink(join(outside, "packages", "x"), join(repo, "node_modules", "x"), linkType);
+      const calls: string[] = [];
+      const { exact, reasons } = await linkReasons([pinned(outside)], async (root) => {
+        calls.push(root);
+        return pinned(root);
+      });
+      expect(reasons).toEqual([]);
+      expect(exact).toBe(true);
+      expect(calls).toEqual([outside]);
+    });
+
+    it("S7: pinned repository changed since dispatch -> external-link", async () => {
+      const outside = await outsideRepo("changed lib-b");
+      await fsp.symlink(outside, join(repo, "node_modules", "lib-b"), linkType);
+      const { exact, reasons } = await linkReasons([pinned(outside)], async (root) => pinned(root, "h1"));
+      expect(reasons).toEqual([{ cause: "external-link", path: "node_modules/lib-b" }]);
+      expect(exact).toBe(false);
+    });
+
+    it("S7: no dispatch pin for the link target -> external-link", async () => {
+      const outside = await outsideRepo("unpinned lib-b");
+      const other = await outsideRepo("other repo");
+      await fsp.symlink(outside, join(repo, "node_modules", "lib-b"), linkType);
+      const calls: string[] = [];
+      const { exact, reasons } = await linkReasons([pinned(other)], async (root) => {
+        calls.push(root);
+        return pinned(root);
+      });
+      expect(reasons).toEqual([{ cause: "external-link", path: "node_modules/lib-b" }]);
+      expect(exact).toBe(false);
+      expect(calls).toEqual([]);
+    });
+
+    it("S7: dispatch pin for a directory below the target's git top -> external-link", async () => {
+      const outside = await outsideRepo("subdir pin lib");
+      const inner = join(outside, "packages", "x");
+      await fsp.symlink(inner, join(repo, "node_modules", "x"), linkType);
+      const { exact, reasons } = await linkReasons([pinned(inner)], async (root) => pinned(root));
+      expect(reasons).toEqual([{ cause: "external-link", path: "node_modules/x" }]);
+      expect(exact).toBe(false);
+    });
+
+    it("S7: empty pins -> external-link", async () => {
+      const outside = await outsideRepo("empty pins lib-b");
+      await fsp.symlink(outside, join(repo, "node_modules", "lib-b"), linkType);
+      const { exact, reasons } = await linkReasons([], async (root) => pinned(root));
+      expect(reasons).toEqual([{ cause: "external-link", path: "node_modules/lib-b" }]);
+      expect(exact).toBe(false);
+    });
+
+    it("S7: unpinnable dispatch pin -> external-link", async () => {
+      const outside = await outsideRepo("unpinnable lib-b");
+      await fsp.symlink(outside, join(repo, "node_modules", "lib-b"), linkType);
+      const { exact, reasons } = await linkReasons([{ kind: "unpinnable", root: outside, why: "over-bounds" }], async (root) => pinned(root));
+      expect(reasons).toEqual([{ cause: "external-link", path: "node_modules/lib-b" }]);
+      expect(exact).toBe(false);
+    });
+
+    it("S7: current pin unpinnable -> external-link", async () => {
+      const outside = await outsideRepo("now unpinnable lib-b");
+      await fsp.symlink(outside, join(repo, "node_modules", "lib-b"), linkType);
+      const { exact, reasons } = await linkReasons([pinned(outside)], async (root) => ({ kind: "unpinnable", root, why: "not-observed" }));
+      expect(reasons).toEqual([{ cause: "external-link", path: "node_modules/lib-b" }]);
+      expect(exact).toBe(false);
+    });
+
+    it("S7: pinNow throws -> external-link", async () => {
+      const outside = await outsideRepo("throwing lib-b");
+      await fsp.symlink(outside, join(repo, "node_modules", "lib-b"), linkType);
+      const { exact, reasons } = await linkReasons([pinned(outside)], async () => {
+        throw new Error("boom");
+      });
+      expect(reasons).toEqual([{ cause: "external-link", path: "node_modules/lib-b" }]);
+      expect(exact).toBe(false);
+    });
+
+    it("S7: pins without pinNow -> external-link", async () => {
+      const outside = await outsideRepo("no pinNow lib-b");
+      await fsp.symlink(outside, join(repo, "node_modules", "lib-b"), linkType);
+      const { exact, reasons } = await linkReasons([pinned(outside)]);
+      expect(reasons).toEqual([{ cause: "external-link", path: "node_modules/lib-b" }]);
+      expect(exact).toBe(false);
+    });
+
+    it("S7: pinNow without pins -> external-link (P0.4 unchanged)", async () => {
+      const outside = await outsideRepo("no pins lib-b");
+      await fsp.symlink(outside, join(repo, "node_modules", "lib-b"), linkType);
+      const calls: string[] = [];
+      const { exact, reasons } = await linkReasons(undefined, async (root) => {
+        calls.push(root);
+        return pinned(root);
+      });
+      expect(reasons).toEqual([{ cause: "external-link", path: "node_modules/lib-b" }]);
+      expect(exact).toBe(false);
+      expect(calls).toEqual([]);
+    });
+
+    it("S7: root-link is unaffected by a pin of the repository itself", async () => {
+      const realRepo = await fsp.realpath(repo);
+      await fsp.symlink(repo, join(repo, "node_modules", "self"), linkType);
+      const { exact, reasons } = await linkReasons([pinned(realRepo)], async (root) => pinned(root));
+      expect(reasons).toEqual([{ cause: "root-link", path: "node_modules/self" }]);
+      expect(exact).toBe(false);
+    });
+
+    it("S7: store-like outside link stays exact with pins and does not consult pinNow", async () => {
+      const store = join(base, "pin store", "node_modules", "lib-c");
+      await fsp.mkdir(store, { recursive: true });
+      await fsp.writeFile(join(store, "index.js"), "module.exports = 'c0';\n");
+      await fsp.symlink(store, join(repo, "node_modules", "lib-c"), linkType);
+      const calls: string[] = [];
+      const { exact, reasons } = await linkReasons([pinned(await fsp.realpath(join(base, "pin store")))], async (root) => {
+        calls.push(root);
+        return pinned(root, "h1");
+      });
+      expect(reasons).toEqual([]);
+      expect(exact).toBe(true);
+      expect(calls).toEqual([]);
+    });
   });
 
   describe("external-link / root-link rules", () => {
