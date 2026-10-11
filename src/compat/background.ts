@@ -1341,6 +1341,8 @@ export interface LeaseGuardDeps {
 }
 
 const TREE_POLL_MS = 5000;
+/** Bound of one host lookup (session kind / directory) made from inside a tool hook. */
+const LOOKUP_TIMEOUT_MS = 5000;
 const MAX_ACTOR_CACHE = 1000;
 
 /** The task reference of a plan task (the owner of the leases of its slot); = `leaseTaskRef` (executor/types.ts:1446). */
@@ -1374,16 +1376,29 @@ export function createLeaseGuard(deps: LeaseGuardDeps): LeaseGuard {
     warnSafe(deps.logger, message, meta);
   }
 
+  /** A host lookup that never answers must not hang the tool call it guards (memo §14.1: fall back to root semantics). */
+  async function bounded<T>(lookup: Promise<T>, what: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`${what} timed out after ${LOOKUP_TIMEOUT_MS} ms`)), LOOKUP_TIMEOUT_MS);
+    });
+    try {
+      return await Promise.race([lookup, timeout]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
   async function resolveActor(sessionID: string): Promise<{ kind: "root" | "child"; tree: string; dir: string } | undefined> {
     let kind: "root" | "child" = "root";
     try {
-      kind = await deps.sessionKind(sessionID);
+      kind = await bounded(deps.sessionKind(sessionID), "session kind lookup");
     } catch (error) {
       warnOnce(`kind:${sessionID}`, "[router] lease session kind lookup failed; treating as root", { error: errorText(error) });
     }
     let dir: string;
     try {
-      dir = await deps.sessionDir(sessionID);
+      dir = await bounded(deps.sessionDir(sessionID), "session directory lookup");
     } catch (error) {
       warnOnce(`dir:${sessionID}`, "[router] lease session directory lookup failed; no lease check", { error: errorText(error) });
       return undefined;

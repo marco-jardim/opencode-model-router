@@ -308,6 +308,39 @@ describe("acquireLeaseRegistry: the process-wide registry (ref-counted)", () => 
   });
 });
 
+describe("leases: a host lookup that never answers (memo 14.1)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("a session kind lookup that hangs is bounded: the call proceeds with root semantics and the lookup is warned once", async () => {
+    vi.useFakeTimers();
+    const dir = join(tmpdir(), "omr-lease-hang");
+    const registry = createLeaseRegistry({ realpath: (path) => path, repoKeyOf: () => undefined, now: () => 1 }, { runMode: "annotate" });
+    const warn = vi.fn();
+    const guard = createLeaseGuard({
+      registry, sessionKind: () => new Promise<"root" | "child">(() => undefined), sessionDir: async () => dir, gitRootOf: () => undefined,
+      holderLabel: (id) => `session ${id}`, planTaskOf: () => undefined, events: { onRelease: () => () => undefined }, logger: { warn },
+    });
+    const pending = guard.before({ sessionID: "ses_hang", tool: "edit", args: { filePath: join(dir, "a.txt") }, callID: "call-1" });
+    await vi.advanceTimersByTimeAsync(5_100);
+    await expect(pending).resolves.toEqual({});
+    expect(warn).toHaveBeenCalledWith("[router] lease session kind lookup failed; treating as root", expect.objectContaining({ error: expect.stringContaining("timed out") }));
+  });
+
+  it("a session directory lookup that hangs is bounded: no lease check, the call is not refused", async () => {
+    vi.useFakeTimers();
+    const registry = createLeaseRegistry({ realpath: (path) => path, repoKeyOf: () => undefined, now: () => 1 }, { runMode: "annotate" });
+    const guard = createLeaseGuard({
+      registry, sessionKind: async () => "child", sessionDir: () => new Promise<string>(() => undefined), gitRootOf: () => undefined,
+      holderLabel: (id) => `session ${id}`, planTaskOf: () => undefined, events: { onRelease: () => () => undefined },
+    });
+    const pending = guard.before({ sessionID: "ses_hang2", tool: "edit", args: { filePath: "a.txt" }, callID: "call-2" });
+    await vi.advanceTimersByTimeAsync(5_100);
+    await expect(pending).resolves.toEqual({});
+  });
+});
+
 describe("leases: verification deferral (waitTreeFree, memo 14.4)", () => {
   const TREE = join(tmpdir(), "omr-lease-wait");
 

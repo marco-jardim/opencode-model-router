@@ -91,6 +91,11 @@ const lastIsToolResult = (r: CpxRequest): boolean => arr(bodyMessages(r).at(-1)?
 const BG_ROUTING = { engine: "advise", background: { mode: "auto" }, leases: { mode: "off" } } as const;
 /** What the scripted child answers. */
 const CHILD_OUTPUT = "CHILD_OK";
+/**
+ * A dispatch that is NOT held: verification defers only for `VERIFY:deferred` AND a DoD with a `testsPass` check (verify/wiring.ts `isDeferred`);
+ * the directive alone leaves a synchronous (held) verification. Deferred verification never runs the command here (no `router_verify` call).
+ */
+const DEFERRED_DOD = "VERIFY:deferred\n[acceptance]\ncheck: testsPass command=\"npm test\"\n[/acceptance]";
 /** A verified (VERIFY:required, deterministic fileExists check that passes) background dispatch; the child is held so the root runs on. */
 async function heldDispatch(host: RoutingHost): Promise<{ root: string; call: Dispatched & { childID: string } }> {
   host.provider.holdMarked(HOLD_MARKER, CHILD_HOLD_MS);
@@ -150,7 +155,7 @@ d("cpx background: dispatch, holding and leases on a real v2 host", () => {
     await scenario("background-dispatch", { routing: { engine: "advise", background: { mode: "auto" }, leases: { mode: "off" } } }, async ({ host, observed, check }) => {
       host.provider.holdMarked(HOLD_MARKER, CHILD_HOLD_MS);
       const root = await host.newRoot("cpx background root");
-      const call = await host.dispatch(root, { agent: "fast", description: "Implement feature", prompt: `${IMPLEMENT_PROMPT}\n${HOLD_MARKER}\nVERIFY:deferred`, background: true });
+      const call = await host.dispatch(root, { agent: "fast", description: "Implement feature", prompt: `${IMPLEMENT_PROMPT}\n${HOLD_MARKER}\n${DEFERRED_DOD}`, background: true });
       const rootRequests = primaryRequests(host, root);
       const endEventsAtReturn = (await host.eventsOf(call.childID)).filter(e => /^session\.execution\.(succeeded|failed|interrupted)$/.test(e.type)).map(e => e.type);
       observed.ack = clip(resultText(call), 800);
@@ -163,11 +168,19 @@ d("cpx background: dispatch, holding and leases on a real v2 host", () => {
       check("in-flight-tail", inFlight, "a root request made while the child runs must list it in flight in the tail");
 
       observed.childEnd = await childEnded(host, call.childID);
+      const requestsAtEnd = primaryRequests(host, root).length;
+      // The completion line is shown ONCE: the host wakes the idle root with the completion (its own request), and the root's execution end
+      // drops the line already shown. So look at every root request made after the end, not only at the last one.
+      const annotated = await waitFor("a root request after the end carrying the completion annotation", () => {
+        const after = primaryRequests(host, root).slice(requestsAtEnd).filter(r => tailOf(r).includes(COMPLETED_LINE) && !tailOf(r).includes("router guarantees pending"));
+        return after.length > 0 ? after : undefined;
+      }, 90_000, 500).catch(() => undefined);
       await host.settle(root);
       await host.prompt(root, "Continue with the next independent step.");
       const tail = lastTail(host, root);
+      observed.tailsAfterEnd = primaryRequests(host, root).slice(requestsAtEnd).map(tailOf).map(t => clip(t, 800));
       observed.tailAfterEnd = clip(tail, 1500);
-      check("completion-annotated", tail.includes(COMPLETED_LINE), "the tail of the root's first request after the completion must carry the completion annotation");
+      check("completion-annotated", annotated !== undefined, "a root request made after the child's end must carry the completion annotation in its tail");
       check("not-in-flight", !tail.includes(IN_FLIGHT), "a processed child must leave the in-flight list");
     });
   }, 600_000);
@@ -220,9 +233,10 @@ d("cpx background: dispatch, holding and leases on a real v2 host", () => {
         firstHeld.fired = true;
         return CHILD_HOLD_MS * 2;
       };
+      // The writers are `medium`: the `fast` tier is read-only (its edit never executes), so a fast writer would never take a lease.
       const edit = (to: string) => scriptLine([{ tool: "edit", input: { path: shared, oldString: "ORIGINAL", newString: to } }], CHILD_OUTPUT);
       const root = await host.newRoot("cpx background leases root");
-      const first = await host.dispatch(root, { agent: "fast", description: "First writer", prompt: `${IMPLEMENT_PROMPT}\n${LEASE_ONE}\n${edit("ONE")}`, background: true });
+      const first = await host.dispatch(root, { agent: "medium", description: "First writer", prompt: `${IMPLEMENT_PROMPT}\n${LEASE_ONE}\n${edit("ONE")}`, background: true });
       const editHook = (child: string, kind: "before" | "after") => async () => (await host.hooks()).find(h => h.hook === kind && h.sessionID === child && h.tool === "edit");
       // Every hook of the two writers, for the observation (a refusal thrown in `execute.before` leaves no `execute.after`).
       const trail = async (): Promise<unknown> => (await host.hooks()).filter(h => [first.childID, second?.childID].includes(h.sessionID)).map(h => ({ hook: h.hook, session: h.sessionID, tool: h.tool, error: h.error, status: h.status }));
@@ -230,17 +244,17 @@ d("cpx background: dispatch, holding and leases on a real v2 host", () => {
       try {
         await waitFor("the first writer's edit call", editHook(first.childID, "before"), 60_000, 250);
         const firstEdit = await waitFor("the first writer's edit result", editHook(first.childID, "after"), 60_000, 250);
-        second = await host.dispatch(root, { agent: "fast", description: "Second writer", prompt: `${IMPLEMENT_PROMPT}\n${LEASE_TWO}\n${edit("TWO")}`, background: true });
-        const secondBefore = await waitFor("the second writer's edit call", editHook(second.childID, "before"), 60_000, 250);
-        // The lease refusal is thrown in `execute.before`: the host emits no `execute.after` for it, the writer's next request carries the error result.
+        second = await host.dispatch(root, { agent: "medium", description: "Second writer", prompt: `${IMPLEMENT_PROMPT}\n${LEASE_TWO}\n${edit("TWO")}`, background: true });
+        // The lease refusal is thrown in `execute.before`: the probe plugin's hook records (which run after the router's) do not exist for it,
+        // and the host emits no `execute.after`; the writer's next request carries the error result.
         const secondChild = second.childID;
         const refusedRequest = await waitFor("a request of the second writer carrying the lease refusal", () => front(host).requests.find(r => hdr(r, "x-proof-session") === secondChild && /is being edited by/.test(json(r.body))), 60_000, 250);
         const secondAfter = (await editHook(secondChild, "after")());
         const refusal = secondAfter?.error !== undefined ? json(secondAfter.error) : json(refusedRequest.body).slice(Math.max(0, json(refusedRequest.body).search(/is being edited by/) - 200));
         observed.firstEdit = clip(firstEdit, 600);
-        observed.secondEdit = clip(secondAfter ?? secondBefore, 800);
+        observed.secondEdit = clip(secondAfter ?? null, 800);
         observed.secondRefusal = clip(refusal, 800);
-        check("first-writes", secondBefore.__t > firstEdit.__t && firstEdit.error === undefined, `the first writer's edit must succeed (${json(firstEdit.error)})`);
+        check("first-writes", firstEdit.error === undefined, `the first writer's edit must succeed (${json(firstEdit.error)})`);
         check("second-refused", /is being edited by/.test(refusal), `the second writer's edit must be refused by the lease registry, naming the holder (got ${refusal})`);
       } finally {
         observed.hookTrail = clip(await trail(), 1500);
@@ -259,14 +273,13 @@ d("cpx background: dispatch, holding and leases on a real v2 host", () => {
       const { root, call } = await heldDispatch(host);
       // A refusal thrown in `execute.before` never reaches `execute.after` on the host: `host.call` would wait for it in vain. The refusal
       // is the error tool_result the root's next request carries.
-      const seen = new Set((await host.hooks()).filter(h => h.hook === "before" && h.sessionID === root && h.tool === "subagent").map(h => h.callID));
+      // The probe plugin's `execute.before` record is written after the router's hook, which throws: a refused call leaves no hook record at all.
       const input = { agent: "fast", description: "Resume the held child", prompt: "Continue the work.", sessionID: call.childID, background: false };
+      const requestsBefore = primaryRequests(host, root).length;
       await host.client.session.prompt({ sessionID: root, text: `SPIKE_CALL=${json(input)}` });
-      const resumeBefore = await waitFor("the resume's subagent execute.before", async () => (await host.hooks()).find(h => h.hook === "before" && h.sessionID === root && h.tool === "subagent" && !seen.has(h.callID)), 120_000, 250);
+      const refusing = await waitFor("a root request carrying the refusal", () => primaryRequests(host, root).slice(requestsBefore).find(r => /is held for verification \(/.test(historyOf(r))), 120_000, 250);
       await host.settle(root);
-      const refusing = await waitFor("a root request carrying the refusal", () => primaryRequests(host, root).find(r => /is held for verification \(/.test(historyOf(r))), 60_000, 250);
-      const afterHooks = (await host.hooks()).filter(h => h.hook === "after" && h.callID === resumeBefore.callID);
-      observed.resumeAfterHooks = afterHooks.length;
+      observed.resumeHooks = clip((await host.hooks()).filter(h => h.sessionID === root && h.tool === "subagent").map(h => ({ hook: h.hook, callID: h.callID, error: h.error })), 800);
       const history = historyOf(refusing);
       const error = history.slice(Math.max(0, history.search(/\[router\] Refused: session/)), history.length);
       observed.refusal = clip(error, 800);
