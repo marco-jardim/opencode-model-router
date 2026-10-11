@@ -23,8 +23,8 @@
  * - P holds at most PERIMETER_MAX snapshotted roots, W included; the roots beyond are kept as "unobserved" roots, never dropped
  *   (F2), so the gate refuses a dispatch that ran unattributable writers.
  */
-import { lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
-import { lstat, readdir, realpath } from "node:fs/promises";
+import { lstatSync, readFileSync, readdirSync, readlinkSync, realpathSync } from "node:fs";
+import { lstat, readFile, readdir, readlink, realpath } from "node:fs/promises";
 import * as path from "node:path";
 import { permissionMatches } from "../router/read-only";
 import { routedRoleOf } from "../routing/wire/dispatch";
@@ -85,14 +85,37 @@ function packageEntries(w: string): string[] {
   return entries;
 }
 
+/**
+ * QA-1 #3: a link's text naming a UNC share or a device path (`\\server\share`, `\\?\…`, `//server/share`). Such a target is
+ * never resolved (no `realpath` on it, so no network access from the gate or the store): the link is skipped, as unreadable.
+ */
+export function isUncLinkText(text: string): boolean {
+  return /^[\\/]{2}/.test(text);
+}
+
+/** The link primitives `linkedTargets` uses; injectable for tests (QA-1 #3). */
+export interface LinkIO {
+  readonly lstat: (p: string) => { isSymbolicLink(): boolean };
+  readonly readlink: (p: string) => string;
+  readonly realpath: (p: string) => string;
+}
+
+const defaultLinkIO: LinkIO = {
+  lstat: (p) => lstatSync(p),
+  readlink: (p) => readlinkSync(p),
+  realpath: (p) => realpathSync.native(p),
+};
+
 /** The real paths of W's package links (symlinks, junctions) that point outside W and are not store-like, de-duplicated. */
-export function linkedTargets(w: string): string[] {
+export function linkedTargets(w: string, io: LinkIO = defaultLinkIO): string[] {
   const targets = new Map<string, string>();
   for (const entry of packageEntries(w)) {
     let real: string;
     try {
-      if (!lstatSync(entry).isSymbolicLink()) continue;
-      real = realpathSync.native(entry);
+      if (!io.lstat(entry).isSymbolicLink()) continue;
+      // QA-1 #3: the link text first; a UNC or device target is never realpath'ed (not admitted, as an unreadable link).
+      if (isUncLinkText(io.readlink(entry))) continue;
+      real = io.realpath(entry);
     } catch {
       continue; // Unreadable or dangling: it loads nothing.
     }
@@ -110,64 +133,226 @@ export interface PerimeterConsumer {
   readonly entry: string;
 }
 
-/** Cross-repo P2b.3: the bound on `node_modules` entries read by `discoverConsumers`, in total. */
+/** Cross-repo P2b.3: the bound on `node_modules` entries read by `discoverConsumers`, per root (QA-1 #2). */
 export const CONSUMER_SCAN_MAX = 2000;
 
+/** Cross-repo QA-1 #2: the bound on W's package names looked up directly (W's own, plus its workspace packages'). */
+export const CONSUMER_NAMES_MAX = 64;
+
+/** Cross-repo QA-1 #2: the bound on the workspace `package.json` files read to learn W's package names. */
+const WORKSPACE_MANIFESTS_MAX = 256;
+
+/** A `package.json` larger than this is not read for names. */
+const MANIFEST_BYTES_MAX = 1024 * 1024;
+
+/** A package name usable as a `node_modules` path: `name` or `@scope/name`, no dot-leading segment, no separators besides one "/". */
+const PACKAGE_NAME = /^(?:@[a-z0-9_~-][a-z0-9._~-]*\/)?[a-z0-9_~-][a-z0-9._~-]*$/i;
+
+/** One working-set root handed to `discoverConsumers`. */
+export interface ConsumerRoot {
+  readonly root: string;
+  readonly name?: string;
+}
+
+/** Cross-repo QA-1 #2/#13: what `discoverConsumers` found, and the roots it could not finish (budget or deadline). */
+export interface ConsumerDiscovery {
+  readonly consumers: PerimeterConsumer[];
+  readonly incomplete: ConsumerRoot[];
+}
+
+async function readManifest(dir: string): Promise<Record<string, unknown> | undefined> {
+  try {
+    const text = await readFile(path.join(dir, "package.json"), "utf8");
+    if (text.length > MANIFEST_BYTES_MAX) return undefined;
+    const parsed: unknown = JSON.parse(text);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+}
+
+function workspacePatterns(manifest: Record<string, unknown>): string[] {
+  const field = manifest.workspaces;
+  const packages = typeof field === "object" && field !== null && !Array.isArray(field)
+    ? (field as { packages?: unknown }).packages
+    : field;
+  return Array.isArray(packages) ? packages.filter((entry): entry is string => typeof entry === "string") : [];
+}
+
 /**
- * Cross-repo P2b.3 (docs/design/cross-repo.md §6, consumer discovery): the roots among `roots` whose `node_modules` entries
- * (the ones `packageEntries` reads) hold a link whose real path is inside W or W itself. Only the given roots are read; async fs,
- * no git. At most `opts.maxEntries` (default CONSUMER_SCAN_MAX) entries are read in total; past that, scanning stops. Never
- * throws. One entry per root (the first link found).
+ * The directories of one `workspaces` pattern, inside W only: literal segments, and a wildcard (`*`, `**`) in the last segment
+ * only, matched one level deep. Negations, absolute paths, `..` and inner wildcards give none. At most `limit` directories.
+ */
+async function workspaceDirs(w: string, pattern: string, limit: number): Promise<string[]> {
+  if (pattern.startsWith("!") || path.isAbsolute(pattern) || /^[\\/]/.test(pattern)) return [];
+  const segments = pattern.split(/[\\/]/).filter((segment) => segment !== "" && segment !== ".");
+  if (segments.length === 0 || segments.some((segment) => segment === "..")) return [];
+  const last = segments[segments.length - 1] ?? "";
+  const head = segments.slice(0, -1);
+  if (head.some((segment) => segment.includes("*"))) return [];
+  if (!last.includes("*")) return [path.join(w, ...segments)];
+  const escaped = last.split("*").map((piece) => piece.replace(/[.+?^${}()|[\]\\]/g, "\\$&"));
+  const match = new RegExp(`^${escaped.join("[^/\\\\]*")}$`, process.platform === "win32" ? "i" : "");
+  const base = path.join(w, ...head);
+  let children: string[];
+  try {
+    children = await readdir(base);
+  } catch {
+    return [];
+  }
+  return children
+    .filter((child) => !child.startsWith(".") && child !== "node_modules" && match.test(child))
+    .slice(0, limit)
+    .map((child) => path.join(base, child));
+}
+
+/**
+ * Cross-repo QA-1 #2: W's package names, looked up directly in each root's `node_modules`: the `name` of `<W>/package.json`
+ * and, when W is a workspace root, the `name` of each workspace package its `workspaces` lists. Bounded (CONSUMER_NAMES_MAX
+ * names, WORKSPACE_MANIFESTS_MAX manifests); `stop` ends the reading early (the deadline).
+ */
+async function packageNamesOf(w: string, stop: () => boolean): Promise<string[]> {
+  const names = new Set<string>();
+  const take = (manifest: Record<string, unknown> | undefined): void => {
+    const name = manifest?.name;
+    if (typeof name === "string" && PACKAGE_NAME.test(name) && names.size < CONSUMER_NAMES_MAX) names.add(name);
+  };
+  const manifest = await readManifest(w);
+  if (manifest === undefined) return [];
+  take(manifest);
+  let read = 0;
+  for (const pattern of workspacePatterns(manifest)) {
+    if (stop() || names.size >= CONSUMER_NAMES_MAX || read >= WORKSPACE_MANIFESTS_MAX) break;
+    for (const dir of await workspaceDirs(w, pattern, WORKSPACE_MANIFESTS_MAX - read)) {
+      if (stop() || names.size >= CONSUMER_NAMES_MAX || read >= WORKSPACE_MANIFESTS_MAX) break;
+      read += 1;
+      take(await readManifest(dir));
+    }
+  }
+  return [...names];
+}
+
+/**
+ * Cross-repo P2b.3 (docs/design/cross-repo.md §6, consumer discovery): the roots among `roots` whose `node_modules` hold a
+ * link whose real path is inside W or W itself. Only the given roots are read; async fs, no git; never throws. Per root
+ * (QA-1 #2): first a direct lookup of each of W's package names (`<root>/node_modules/<name>`, scoped names included; one
+ * lookup per name, outside the budget), then a scan of the entries `packageEntries` reads, at most `opts.maxEntries` (default
+ * CONSUMER_SCAN_MAX) of them per root. A root whose scan stops on that bound without finding a consumer is incomplete; so is
+ * every root not finished when `opts.signal` aborts (QA-1 #13, the gate deadline). A link whose text names a UNC or device
+ * path is never resolved (QA-1 #3). One entry per consumer (the first link found); both lists follow the order of `roots`.
  */
 export async function discoverConsumers(
   w: string,
-  roots: readonly { root: string; name?: string }[],
-  opts?: { maxEntries?: number },
-): Promise<PerimeterConsumer[]> {
-  const consumers: PerimeterConsumer[] = [];
-  let budget = Math.max(0, Math.floor(opts?.maxEntries ?? CONSUMER_SCAN_MAX));
-  // Link targets are real paths: W is matched as given and as its real path (a junction or 8.3 spelling of W).
-  const wReal = await realpath(w).catch(() => w);
-  const inW = (dir: string): boolean => insideOrEqual(dir, w) || insideOrEqual(dir, wReal);
-  const names = async (dir: string): Promise<string[]> => {
-    try {
-      return await readdir(dir);
-    } catch {
-      return [];
-    }
+  roots: readonly ConsumerRoot[],
+  opts?: { maxEntries?: number; signal?: AbortSignal },
+): Promise<ConsumerDiscovery> {
+  const maxEntries = Math.max(0, Math.floor(opts?.maxEntries ?? CONSUMER_SCAN_MAX));
+  const signal = opts?.signal;
+  const stopped = (): boolean => signal?.aborted === true;
+  // Per root, by index: a consumer's entry, "incomplete", "none"; unset while the root is not finished.
+  // W (or a root around it) is never scanned, so never incomplete either: settled before any fs call, by text.
+  const outcomes: (string | { readonly incomplete: true } | null | undefined)[] = roots.map(({ root }) =>
+    (insideOrEqual(root, w) || insideOrEqual(w, root) ? null : undefined));
+  const assemble = (): ConsumerDiscovery => {
+    const consumers: PerimeterConsumer[] = [];
+    const incomplete: ConsumerRoot[] = [];
+    roots.forEach(({ root, name }, index) => {
+      const outcome = outcomes[index];
+      const named = name !== undefined ? { name } : {};
+      if (typeof outcome === "string") consumers.push({ root, ...named, entry: outcome });
+      else if (outcome !== null) incomplete.push({ root, ...named });
+    });
+    return { consumers, incomplete };
   };
-  for (const { root, name } of roots) {
-    if (inW(root) || insideOrEqual(w, root) || insideOrEqual(wReal, root)) continue;
-    if (budget <= 0) break;
-    const modules = path.join(root, "node_modules");
-    let found: string | undefined;
-    const check = async (full: string, entry: string): Promise<void> => {
-      if (found !== undefined || budget <= 0) return;
-      budget -= 1;
+  const work = async (): Promise<void> => {
+    // Link targets are real paths: W is matched as given and as its real path (a junction or 8.3 spelling of W).
+    const wReal = await realpath(w).catch(() => w);
+    const inW = (dir: string): boolean => insideOrEqual(dir, w) || insideOrEqual(dir, wReal);
+    const linksIntoW = async (full: string): Promise<boolean> => {
       try {
-        if (!(await lstat(full)).isSymbolicLink()) return;
+        if (!(await lstat(full)).isSymbolicLink()) return false;
+        if (isUncLinkText(await readlink(full))) return false; // QA-1 #3: never resolved.
         const real = await realpath(full);
-        if (inW(real) && !isStoreLikeLink(real, process.platform)) found = entry;
+        return inW(real) && !isStoreLikeLink(real, process.platform);
       } catch {
-        // Unreadable or dangling: it loads nothing.
+        return false; // Unreadable or dangling: it loads nothing.
       }
     };
-    for (const top of await names(modules)) {
-      if (found !== undefined || budget <= 0) break;
-      if (top.startsWith(".")) continue;
-      if (!top.startsWith("@")) {
-        await check(path.join(modules, top), top);
+    const names = async (dir: string): Promise<string[]> => {
+      try {
+        return await readdir(dir);
+      } catch {
+        return [];
+      }
+    };
+    const wNames = await packageNamesOf(w, stopped);
+    for (const [index, { root }] of roots.entries()) {
+      if (outcomes[index] === null) continue;
+      if (inW(root) || insideOrEqual(w, root) || insideOrEqual(wReal, root)) {
+        outcomes[index] = null;
         continue;
       }
-      for (const sub of await names(path.join(modules, top))) {
-        if (found !== undefined || budget <= 0) break;
-        if (sub.startsWith(".")) continue;
-        await check(path.join(modules, top, sub), `${top}/${sub}`);
+      if (stopped()) return;
+      const modules = path.join(root, "node_modules");
+      let found: string | undefined;
+      // (a) The direct lookup: one per name, outside the budget.
+      for (const name of wNames) {
+        if (stopped()) return;
+        if (await linksIntoW(path.join(modules, ...name.split("/")))) {
+          found = name;
+          break;
+        }
       }
+      // (b) The bounded scan, its budget per root.
+      let budget = maxEntries;
+      let exhausted = false;
+      const check = async (full: string, entry: string): Promise<void> => {
+        if (found !== undefined || exhausted) return;
+        if (budget <= 0) {
+          exhausted = true;
+          return;
+        }
+        budget -= 1;
+        if (await linksIntoW(full)) found = entry;
+      };
+      if (found === undefined) {
+        for (const top of await names(modules)) {
+          if (stopped()) return;
+          if (found !== undefined || exhausted) break;
+          if (top.startsWith(".")) continue;
+          if (!top.startsWith("@")) {
+            await check(path.join(modules, top), top);
+            continue;
+          }
+          for (const sub of await names(path.join(modules, top))) {
+            if (stopped()) return;
+            if (found !== undefined || exhausted) break;
+            if (sub.startsWith(".")) continue;
+            await check(path.join(modules, top, sub), `${top}/${sub}`);
+          }
+        }
+      }
+      // (c) Stopped on the budget without a consumer: incomplete.
+      outcomes[index] = found !== undefined ? found : exhausted ? { incomplete: true } : null;
     }
-    if (found !== undefined) consumers.push({ root, ...(name !== undefined ? { name } : {}), entry: found });
+  };
+  if (signal === undefined) {
+    await work().catch(() => undefined);
+    return assemble();
   }
-  return consumers;
+  if (signal.aborted) return assemble();
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<void>((resolve) => {
+    onAbort = resolve;
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    await Promise.race([work().catch(() => undefined), aborted]);
+  } finally {
+    if (onAbort !== undefined) signal.removeEventListener("abort", onAbort);
+  }
+  return assemble();
 }
 
 /** QA-1 F11: the git common directory of the repository whose top level is `top`, read without git; undefined when unknown. */
@@ -290,7 +475,22 @@ export function planPerimeter(dispatchID: string, cwd: string, admission: () => 
       continue;
     }
     if (insideOrEqual(top, w) || insideOrEqual(w, top)) continue; // W's own repository: W's snapshot covers it.
-    if (seeds.some((seed) => seed.fixed === undefined && insideOrEqual(top, seed.at))) continue; // A working-set root covers it.
+    const covering = seeds.findIndex((seed) => seed.fixed === undefined && insideOrEqual(top, seed.at));
+    if (covering >= 0) {
+      // A root already in P covers it: one seed. QA-1 #9a: a working-set root covering it is marked as a link target too, so it
+      // is pinned at dispatch; it keeps its working-set semantics (consumer discovery, I13). Its admission still accepts any
+      // top level at, above or inside it at the gate (as without one), and admits its own links for the pin as a link's are.
+      const seed = seeds[covering];
+      if (seed !== undefined && seed.origin === "working-set" && seed.linked !== true) {
+        const at = seed.at;
+        seeds[covering] = {
+          ...seed,
+          linked: true,
+          admit: (dir: string): boolean => insideOrEqual(dir, at) || insideOrEqual(at, dir) || admitTop(dir),
+        };
+      }
+      continue;
+    }
     if (!admitTop(top)) {
       add({ at: top, name: path.basename(top), fixed: "unadmitted", origin: "link" });
       continue;

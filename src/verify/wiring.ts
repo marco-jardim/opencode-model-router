@@ -76,7 +76,7 @@ import {
 } from "./dispatch";
 import { runArgv, runShell } from "./exec";
 import { snapshotTree } from "./tree";
-import { discoverConsumers, planPerimeter } from "./perimeter";
+import { discoverConsumers, planPerimeter, type ConsumerDiscovery } from "./perimeter";
 import { defaultExternalLinks, pinTarget, type LinkPin } from "./pin";
 import { perimeterKey } from "./git-top";
 import type { DispatchPerimeter, PerimeterEntry } from "./dispatch";
@@ -1607,7 +1607,8 @@ export function createVerificationWiring(deps: {
     const perimeterRootSnapshot = (root: string, signal: AbortSignal): Promise<TreeSnapshot | undefined> => {
       const plain = snapshotTree(root, signal, { lowPriority, hardened: true });
       const seed = perimeter?.roots.find(candidate => candidate.at === root);
-      if (seed === undefined || seed.origin !== "link" || seed.fixed !== undefined) return plain;
+      // QA-1 #9a: a working-set root that is also a link target of W (`linked`) is pinned too.
+      if (seed === undefined || (seed.origin !== "link" && seed.linked !== true) || seed.fixed !== undefined) return plain;
       watchWritersFor(store);
       const seedAdmit = seed.admit ?? ((): boolean => false);
       // The roots the dispatch's admission accepted: the materialize-time pin (pinNow) is admitted by the same set.
@@ -1751,6 +1752,7 @@ export function createVerificationWiring(deps: {
     planned: { name?: string; snapshots: PerimeterSnapshots } | undefined,
     snapshot: TreeSnapshot | undefined,
     base: string,
+    deadline?: Deadline,
   ): Promise<PerimeterObservation | undefined> => {
     if (planned === undefined) return undefined;
     const key = (at: string): string => {
@@ -1788,9 +1790,26 @@ export function createVerificationWiring(deps: {
       if (previous === undefined || rank[next.status] > rank[previous.status]) roots.set(key(root), next);
     }
     if (roots.size === 0) return undefined;
-    const consumers = workingSet.size === 0
-      ? []
-      : await discoverConsumers(wRoot, [...workingSet.values()]).catch(() => []);
+    // QA-1 #13: the discovery is bounded by the gate deadline (and the grade snapshot bound); the roots it has not finished
+    // then are incomplete. QA-1 #2: so is a root whose scan stopped on its entry bound without finding a consumer.
+    const discover = async (): Promise<ConsumerDiscovery> => {
+      const candidates = [...workingSet.values()];
+      const controller = new AbortController();
+      const ms = deadline ? deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS) : GRADE_SNAPSHOT_TIMEOUT_MS;
+      const onAbort = (): void => controller.abort();
+      if (ms <= 0 || deadline?.signal.aborted === true) controller.abort();
+      deadline?.signal.addEventListener("abort", onAbort, { once: true });
+      const timer = setTimeout(onAbort, Math.max(0, ms));
+      try {
+        return await discoverConsumers(wRoot, candidates, { signal: controller.signal });
+      } catch {
+        return { consumers: [], incomplete: candidates }; // Never expected (it never throws): fail closed.
+      } finally {
+        clearTimeout(timer);
+        deadline?.signal.removeEventListener("abort", onAbort);
+      }
+    };
+    const { consumers, incomplete } = workingSet.size === 0 ? { consumers: [], incomplete: [] } : await discover();
     return {
       w: {
         root: wRoot,
@@ -1800,6 +1819,7 @@ export function createVerificationWiring(deps: {
       },
       roots: [...roots.values()],
       ...(consumers.length > 0 ? { consumers } : {}),
+      ...(incomplete.length > 0 ? { consumersIncomplete: incomplete } : {}),
     };
   };
 
@@ -1915,7 +1935,7 @@ export function createVerificationWiring(deps: {
     // B8: on a switch the commit diff is not run; "unavailable" keeps the whole change set unavailable (the gate refuses anyway).
     const committed = branchSwitch !== undefined ? "unavailable" as const : await committedSinceDispatch(before, snapshot, deadline);
     const contaminatedBy = store.snapshotContaminatedBy(id);
-    const perimeter = await perimeterAtGate(await perimeterSnapshots, snapshot, base);
+    const perimeter = await perimeterAtGate(await perimeterSnapshots, snapshot, base, deadline);
     return {
       ...store.delta(id, childID, snapshot, base, committed),
       snapshot,

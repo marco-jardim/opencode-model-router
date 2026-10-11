@@ -732,6 +732,15 @@ describe("link pins at dispatch (P2.6)", () => {
     expect(samePin(dispatchPin, await pinNow(dispatchPin.root))).toBe(false);
   }, 90_000);
 
+  it("QA-1 #9a: a working-set root that is also W's link target is pinned, and stays a working-set root", async () => {
+    addToWorkingSet("orch", location(lib, "lib-b"));
+    const hooks = await linked([parent]);
+    const planned = perimeterModule.planPerimeter("task:orch:call1", repo, () => ({ parents: [parent], depth: 1, exclude: [] }));
+    expect(planned?.roots.map(seed => [seam.key(seed.at), seed.origin, seed.linked])).toEqual([[seam.key(lib), "working-set", true]]);
+    await runTask(hooks, `Implement it.\n${TESTS_DOD}`, async () => undefined);
+    expect(pinsOf(gateReferences()[0])?.map(pin => [pin.kind, seam.key(pin.root)])).toEqual([["pinned", seam.key(lib)]]);
+  }, 90_000);
+
   it("a tier dispatch (no role, no perimeter) carries no pins", async () => {
     for (const dir of [repo, lib]) execFileSync("git", ["config", "core.autocrlf", "false"], { cwd: dir, stdio: "ignore" });
     const modules = path.join(repo, "node_modules");
@@ -767,25 +776,31 @@ describe("consumer discovery (§6)", () => {
     }
   });
 
+  const NONE = { consumers: [], incomplete: [] };
+
   it("a working-set worktree whose node_modules junction resolves into W is a consumer (plain and @scope entries)", async () => {
     fs.mkdirSync(path.join(repo, "packages", "core"), { recursive: true });
     link(repo, path.join(lib, "node_modules", "app-a"));
-    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }])).toEqual([{ root: lib, name: "lib-b", entry: "app-a" }]);
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }]))
+      .toEqual({ consumers: [{ root: lib, name: "lib-b", entry: "app-a" }], incomplete: [] });
     // A link into a directory below W counts too, and a scoped entry is named with its scope.
     const other = path.join(parent, "lib-c");
     fs.mkdirSync(other, { recursive: true });
     link(path.join(repo, "packages", "core"), path.join(other, "node_modules", "@scope", "core"));
-    expect(await perimeterModule.discoverConsumers(repo, [{ root: other }])).toEqual([{ root: other, entry: "@scope/core" }]);
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: other }]))
+      .toEqual({ consumers: [{ root: other, entry: "@scope/core" }], incomplete: [] });
   });
 
   it("a link into another worktree of W's repository is not a consumer; W itself is never scanned", async () => {
     const wt = path.join(parent, "app-a-wt");
     execFileSync("git", ["worktree", "add", "-q", "-b", "feat-c", wt], { cwd: repo, stdio: "ignore" });
     link(wt, path.join(lib, "node_modules", "app-a"));
-    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }])).toEqual([]);
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }])).toEqual(NONE);
     link(lib, path.join(repo, "node_modules", "lib-b"));
     link(repo, path.join(repo, "node_modules", "self"));
-    expect(await perimeterModule.discoverConsumers(repo, [{ root: repo, name: "app-a" }])).toEqual([]);
+    // W itself is never scanned, nor reported incomplete (even with no budget).
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: repo, name: "app-a" }])).toEqual(NONE);
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: repo, name: "app-a" }], { maxEntries: 0 })).toEqual(NONE);
   }, 60_000);
 
   it("only working-set roots are scanned: a link target of W and a repository outside the working set are not consumers", async () => {
@@ -801,12 +816,13 @@ describe("consumer discovery (§6)", () => {
     const workingSetRoots = (plan: typeof linked): { root: string; name?: string }[] => (plan?.roots ?? [])
       .filter(seed => seed.origin === "working-set")
       .map(seed => ({ root: seed.at, ...(seed.name !== undefined ? { name: seed.name } : {}) }));
-    expect(await perimeterModule.discoverConsumers(repo, workingSetRoots(linked))).toEqual([]);
+    expect(await perimeterModule.discoverConsumers(repo, workingSetRoots(linked))).toEqual(NONE);
     // In the working set, lib-b is scanned and is a consumer; lib-c, outside it, is still not.
     addToWorkingSet("orch", location(lib, "lib-b"));
     const planned = planPerimeter("task:orch:call1", repo, () => ({ parents: [parent], depth: 1, exclude: [] }));
     expect(planned?.roots.map(seed => [seam.key(seed.at), seed.origin])).toEqual([[seam.key(lib), "working-set"]]);
-    expect(await perimeterModule.discoverConsumers(repo, workingSetRoots(planned))).toEqual([{ root: lib, name: "lib-b", entry: "app-a" }]);
+    expect(await perimeterModule.discoverConsumers(repo, workingSetRoots(planned)))
+      .toEqual({ consumers: [{ root: lib, name: "lib-b", entry: "app-a" }], incomplete: [] });
   });
 
   it("store-like links and dot-entries are skipped", async () => {
@@ -815,13 +831,13 @@ describe("consumer discovery (§6)", () => {
     link(store, path.join(lib, "node_modules", "pkg"));
     link(repo, path.join(lib, "node_modules", ".cache"));
     link(repo, path.join(lib, "node_modules", "@scope", ".hidden"));
-    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }])).toEqual([]);
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }])).toEqual(NONE);
   });
 
   it("an unreadable or missing node_modules yields no consumer, and never throws", async () => {
     fs.writeFileSync(path.join(lib, "node_modules"), "not a directory\n");
     const missing = path.join(parent, "missing");
-    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }, { root: missing }])).toEqual([]);
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }, { root: missing }])).toEqual(NONE);
   });
 
   it("end to end (D6): a working-set consumer of W with no check there makes a pass UNVERIFIED; with no change it stays a pass", async () => {
@@ -848,15 +864,82 @@ describe("consumer discovery (§6)", () => {
       .toEqual([[seam.key(lib), "lib-b", "app-a"]]);
   }, 90_000);
 
-  it("past the bound, scanning stops", async () => {
+  // QA-1 #2: the scan budget is per root, a root stopped on it is incomplete (the old test, "past the bound, scanning stops", read
+  // the budget as shared by all roots: lib-c was never read; it no longer is).
+  it("QA-1 #2: the scan budget is per root; a root that stops on it without a consumer is reported incomplete", async () => {
     for (const name of ["a", "b", "c"]) fs.mkdirSync(path.join(lib, "node_modules", name), { recursive: true });
     const second = path.join(parent, "lib-c");
     link(repo, path.join(second, "node_modules", "app-a"));
     const roots = [{ root: lib, name: "lib-b" }, { root: second, name: "lib-c" }];
-    // lib-b's three entries use up the bound: lib-c is never read.
-    expect(await perimeterModule.discoverConsumers(repo, roots, { maxEntries: 3 })).toEqual([]);
-    expect(await perimeterModule.discoverConsumers(repo, roots, { maxEntries: 0 })).toEqual([]);
-    expect(await perimeterModule.discoverConsumers(repo, roots, { maxEntries: 4 })).toEqual([{ root: second, name: "lib-c", entry: "app-a" }]);
-    expect(await perimeterModule.discoverConsumers(repo, roots)).toEqual([{ root: second, name: "lib-c", entry: "app-a" }]);
+    const found = { root: second, name: "lib-c", entry: "app-a" };
+    // lib-b's three entries fit the bound exactly: complete, and lib-c is read with a budget of its own.
+    expect(await perimeterModule.discoverConsumers(repo, roots, { maxEntries: 3 })).toEqual({ consumers: [found], incomplete: [] });
+    expect(await perimeterModule.discoverConsumers(repo, roots)).toEqual({ consumers: [found], incomplete: [] });
+    // One entry too few for lib-b: incomplete, but lib-c (one entry) is still scanned.
+    expect(await perimeterModule.discoverConsumers(repo, roots, { maxEntries: 2 }))
+      .toEqual({ consumers: [found], incomplete: [{ root: lib, name: "lib-b" }] });
+    // No budget at all: a root with entries is incomplete, a root with no node_modules is not. W's own name ("app-a", W's
+    // package.json) is looked up outside the budget, so lib-c is still found.
+    expect(await perimeterModule.discoverConsumers(repo, [...roots, { root: path.join(parent, "missing") }], { maxEntries: 0 }))
+      .toEqual({ consumers: [found], incomplete: [{ root: lib, name: "lib-b" }] });
+  });
+
+  it("QA-1 #2: W's package name is looked up directly, past the scan budget", async () => {
+    fs.writeFileSync(path.join(repo, "package.json"), JSON.stringify({ name: "app-direct" }));
+    for (const name of ["a", "b", "c"]) fs.mkdirSync(path.join(lib, "node_modules", name), { recursive: true });
+    link(repo, path.join(lib, "node_modules", "app-direct"));
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }], { maxEntries: 0 }))
+      .toEqual({ consumers: [{ root: lib, name: "lib-b", entry: "app-direct" }], incomplete: [] });
+  });
+
+  it("QA-1 #2: a scoped package name is looked up directly", async () => {
+    fs.writeFileSync(path.join(repo, "package.json"), JSON.stringify({ name: "@acme/app-a" }));
+    for (const name of ["a", "b", "c"]) fs.mkdirSync(path.join(lib, "node_modules", name), { recursive: true });
+    link(repo, path.join(lib, "node_modules", "@acme", "app-a"));
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }], { maxEntries: 0 }))
+      .toEqual({ consumers: [{ root: lib, name: "lib-b", entry: "@acme/app-a" }], incomplete: [] });
+  });
+
+  it("QA-1 #2: the names of W's workspace packages are looked up directly", async () => {
+    fs.writeFileSync(path.join(repo, "package.json"), JSON.stringify({ name: "root", workspaces: ["packages/*"] }));
+    const core = path.join(repo, "packages", "core");
+    fs.mkdirSync(core, { recursive: true });
+    fs.writeFileSync(path.join(core, "package.json"), JSON.stringify({ name: "@ws/core" }));
+    for (const name of ["a", "b", "c"]) fs.mkdirSync(path.join(lib, "node_modules", name), { recursive: true });
+    link(core, path.join(lib, "node_modules", "@ws", "core"));
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }], { maxEntries: 0 }))
+      .toEqual({ consumers: [{ root: lib, name: "lib-b", entry: "@ws/core" }], incomplete: [] });
+  });
+
+  it("QA-1 #13: at the gate deadline the roots not finished are incomplete", async () => {
+    const second = path.join(parent, "lib-c");
+    link(repo, path.join(second, "node_modules", "app-a"));
+    const roots = [{ root: lib, name: "lib-b" }, { root: second, name: "lib-c" }, { root: repo, name: "app-a" }];
+    const controller = new AbortController();
+    controller.abort();
+    // W itself is never scanned, so never incomplete; the two others were not finished.
+    expect(await perimeterModule.discoverConsumers(repo, roots, { signal: controller.signal }))
+      .toEqual({ consumers: [], incomplete: [{ root: lib, name: "lib-b" }, { root: second, name: "lib-c" }] });
+  });
+
+  it("QA-1 #3: a link whose text is a UNC or device path is never realpath'ed", async () => {
+    const real = fs.realpathSync.native(lib);
+    const unc = "\\\\attacker\\share\\pkg";
+    const lstatOf = { isSymbolicLink: (): boolean => true };
+    fs.mkdirSync(path.join(repo, "node_modules", "lib-b"), { recursive: true });
+    fs.mkdirSync(path.join(repo, "node_modules", "lib-c"), { recursive: true });
+    const realpaths: string[] = [];
+    const io: perimeterModule.LinkIO = {
+      lstat: () => lstatOf,
+      readlink: (p) => (p.endsWith("lib-b") ? unc : p.endsWith("lib-c") ? "//server/share" : real),
+      realpath: (p) => {
+        realpaths.push(p);
+        return real;
+      },
+    };
+    expect(perimeterModule.linkedTargets(repo, io)).toEqual([]);
+    expect(realpaths).toEqual([]);
+    expect(perimeterModule.isUncLinkText("\\\\?\\C:\\x")).toBe(true);
+    expect(perimeterModule.isUncLinkText("C:\\x")).toBe(false);
   });
 });

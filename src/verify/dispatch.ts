@@ -105,6 +105,11 @@ export interface PerimeterSeed {
    * "link" (a package link target of W). Consumer discovery scans only the working-set roots.
    */
   readonly origin?: "w" | "working-set" | "link";
+  /**
+   * Cross-repo QA-1 #9a: a working-set root that is also a package link target of W (the link was de-duplicated into it). It
+   * keeps its working-set semantics (consumer discovery, I13) and is pinned at dispatch like a link target.
+   */
+  readonly linked?: boolean;
 }
 
 /** Cross-repo P1.8: the perimeter P of a dispatch beyond W. */
