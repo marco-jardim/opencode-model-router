@@ -13,13 +13,15 @@ import type { DoD, InferHints } from "./dod";
 import { isIncompleteReason } from "./checker";
 import { stripDispatchHeader } from "../router/dispatch-header";
 import { DEFAULT_IDLE_TTL_MS } from "../router/idle-sweep";
-import { basename, dirname, join, resolve } from "node:path";
-import { existsSync, realpathSync } from "node:fs";
+import { resolve } from "node:path";
+import { existsSync } from "node:fs";
+import { canonicalPath } from "./canonical-path";
 import type { ReferenceState, Verdict } from "./types";
 import type { DispatchReference } from "./reference";
 import { REFERENCE_NONE } from "./baseline";
 import { neutralizeDirectives } from "./pending";
 import { withTimeout } from "./timeout";
+import { applyPatchHeaderPaths } from "../router/tool-paths";
 
 export interface TreeSnapshot {
   cwd: string;
@@ -62,29 +64,8 @@ function none(reason: string): ReferenceState {
   return { kind: "none", reason };
 }
 
-/**
- * QA-2.1-8: the canonical spelling of `path`, so a Windows 8.3 short name (`C:\Users\MARQUI~1\…`),
- * a junction or symlink alias, and the long real path of one file key the same change-set entry.
- * The native realpath of the path, or of its nearest existing ancestor with the missing tail
- * appended (a deleted file keeps its directory's canonical spelling); lexical `resolve` when no
- * ancestor resolves.
- */
-export function canonicalPath(path: string): string {
-  const absolute = resolve(path);
-  let head = absolute;
-  const tail: string[] = [];
-  for (;;) {
-    try {
-      const real = realpathSync.native(head);
-      return tail.length === 0 ? real : join(real, ...tail.reverse());
-    } catch {
-      const parent = dirname(head);
-      if (parent === head) return absolute;
-      tail.push(basename(head));
-      head = parent;
-    }
-  }
-}
+// QA-2.1-8 / QA-1.3-16: canonicalPath lives in the leaf module canonical-path.ts; re-exported for every caller.
+export { canonicalPath };
 
 /** A change-set key: the canonical path with "/" separators, case-folded on win32. */
 function pathKey(path: string): string {
@@ -469,10 +450,8 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
       touch(sessionID);
       observeEdit(tool, dispatches.get(sessionID)?.cwd);
       if (tool.toLowerCase() === "apply_patch") {
-        const a = args && typeof args === "object" ? args as Record<string, unknown> : {};
-        const patch = typeof a.patchText === "string" ? a.patchText : typeof a.patch === "string" ? a.patch : "";
         const files = bySession.get(sessionID) ?? new Map<string, string>();
-        for (const match of patch.matchAll(/^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)$/gm)) files.set(match[1].trim(), "modified");
+        for (const p of applyPatchHeaderPaths(args)) files.set(p, "modified");
         bySession.set(sessionID, files);
       }
       const cf = extractChangedFile(tool, args);
