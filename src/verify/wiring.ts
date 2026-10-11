@@ -2371,6 +2371,51 @@ export function createVerificationWiring(deps: {
         if (move !== undefined) branchSwitch = treeMoveReason(nowHead.root, before, nowHead, move, "since the producer returned");
       }
     }
+    // Cross-repo P2e.3: a frozen perimeter (registered at return) is judged as it was then (I4, I8: its roots' statuses are
+    // never re-snapshotted); the consumers (D6) are discovered now over its frozen working set, bounded by the claim deadline.
+    let perimeter: PerimeterObservation | undefined;
+    let gateReference: ReferenceState = reference;
+    const frozen = entry.perimeter;
+    if (frozen !== undefined) {
+      const discoverFrozen = async (): Promise<ConsumerDiscovery> => {
+        const candidates = [...frozen.workingSet];
+        if (candidates.length === 0) return { consumers: [], incomplete: [] };
+        const controller = new AbortController();
+        const ms = deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS);
+        const onAbort = (): void => controller.abort();
+        if (ms <= 0 || deadline.signal.aborted) controller.abort();
+        deadline.signal.addEventListener("abort", onAbort, { once: true });
+        const timer = setTimeout(onAbort, Math.max(0, ms));
+        try {
+          return await discoverConsumers(frozen.observation.w.root, candidates, { signal: controller.signal });
+        } catch {
+          return { consumers: [], incomplete: candidates }; // Never expected (it never throws): fail closed.
+        } finally {
+          clearTimeout(timer);
+          deadline.signal.removeEventListener("abort", onAbort);
+        }
+      };
+      const awaitPins = async (): Promise<readonly LinkPin[]> => {
+        const bound = deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS);
+        if (bound <= 0 || deadline.signal.aborted) return [];
+        return withTimeout(frozen.pins, bound, "router_verify link pins").catch(() => []);
+      };
+      const [found, pins] = await Promise.all([discoverFrozen(), awaitPins()]);
+      perimeter = {
+        ...frozen.observation,
+        ...(found.consumers.length > 0 ? { consumers: found.consumers } : {}),
+        ...(found.incomplete.length > 0 ? { consumersIncomplete: found.incomplete } : {}),
+      };
+      if (reference.kind === "captured" && pins.length > 0) {
+        // pinNow admits exactly the frozen links' roots, keyed by this pins array (buildGateDeps).
+        const admitted = new Set<string>();
+        for (const link of frozen.links) {
+          if (link.admit === undefined || link.admit(link.root)) admitted.add(perimeterKey(link.root));
+        }
+        pinAdmissions.set(pins, admitted);
+        gateReference = { ...reference, reference: { ...reference.reference, pins } };
+      }
+    }
     return {
       prepared: {
         changedFiles: changed === "unavailable"
@@ -2378,10 +2423,11 @@ export function createVerificationWiring(deps: {
           : changed.map(c => ({ path: c.path, status: c.status ?? "", ...(c.previousPath !== undefined ? { previousPath: c.previousPath } : {}) })),
         // Section 1.5-6: an unattributed change set stays unattributed (never []).
         changeBaseline: changed === "unavailable" ? "unavailable" : "available",
-        reference,
+        reference: gateReference,
         snapshot: tree,
         ...(branchSwitch !== undefined ? { branchSwitch } : {}),
         ...(entry.unattributedWriters !== undefined ? { unattributedWriters: [...entry.unattributedWriters] } : {}),
+        ...(perimeter !== undefined ? { perimeter } : {}),
       },
       drift,
       root,
