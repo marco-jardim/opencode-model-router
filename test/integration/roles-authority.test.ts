@@ -1101,6 +1101,17 @@ describe("work roots (I3, P-13): the dispatch's own worktree only", () => {
       await expect(toolCall(v2, "x1", "explorer", "grep", { pattern: "x" })).rejects.toThrow(/outside this dispatch's work root/);
       await expect(toolCall(v2, "x1", "explorer", "glob", { pattern: "*.ts", path: "." })).rejects.toThrow(/outside this dispatch's work root/);
       await toolCall(v2, "x1", "explorer", "grep", { pattern: "x", path: main });
+      // QA-2 (v2 `read`'s main argument is `filePath`): a relative `filePath` — alone, next to `path`, or as `file_path` — resolves
+      // against the session directory (main, in R) and must not reach R either; the absolute spelling of the same file does.
+      await expect(toolCall(v2, "x1", "explorer", "read", { filePath: "a.ts" })).rejects.toThrow(/a\.ts is outside this dispatch's work root/);
+      await expect(toolCall(v2, "x1", "explorer", "read", { filePath: "a.ts", path: join(main, "a.ts") })).rejects.toThrow(/a\.ts is outside this dispatch's work root/);
+      await expect(toolCall(v2, "x1", "explorer", "read", { file_path: "a.ts" })).rejects.toThrow(/a\.ts is outside this dispatch's work root/);
+      await toolCall(v2, "x1", "explorer", "read", { filePath: join(main, "a.ts") });
+      // a relative `filePath` inside W (a child whose session directory is the work root) is unchanged
+      await dispatch(v2, sessions, "e2", "x2", "explorer", `[route class=search risk=low scope=single root=${wt1}]\nfind the parser again`, wt1, "again");
+      expect(routedRoleOf("e2")?.workRoot).toBe(wt1);
+      await toolCall(v2, "x2", "explorer", "read", { filePath: "a.ts" });
+      await toolCall(v2, "x2", "explorer", "read", { path: "a.ts" });
       const grepDefault = { sessionID: "x1", agent: "explorer", action: "grep", resources: ["x"], effect: "allow", metadata: { root: "." } };
       await v2.permissionHooks.evaluate!(grepDefault);
       expect(grepDefault.effect).toBe("deny");

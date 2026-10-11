@@ -1138,7 +1138,7 @@ export async function registerV2Hooks(
    * (`router_run`, `router_git_*`: no `evaluate`, S11) and for Code Mode `execute` (S8). A tool outside every role class —
    * `subagent` included — is refused here too (QA-P23-A7), whatever the agent's max policy or the parent's grants say.
    */
-  const roleToolRefusal = async (event: { sessionID: unknown; tool: string }, args: any, agent: string): Promise<string | undefined> => {
+  const roleToolRefusal = async (event: { sessionID: unknown; tool: string; input?: unknown }, args: any, agent: string): Promise<string | undefined> => {
     const cls = roleActionOf(event.tool);
     if (cls === undefined && event.tool !== "execute" && event.tool !== AUTHORITY_TOOL_NAME) return `${event.tool} is outside every role's authority`;
     const sessionID = String(event.sessionID);
@@ -1150,10 +1150,13 @@ export async function registerV2Hooks(
     let paths: string[] = [];
     let implicitRoot = false;
     if (cls === "read" || cls === "edit") {
-      // The raw `path` stays among them next to `scopedArgs`' resolved `filePath`: a relative one is checked as the call wrote it.
-      const named = toolCallPaths(event.tool, record);
-      if (named === undefined) return `${event.tool}: no path to check (or a patch whose paths cannot be read)`;
-      paths = named;
+      // QA-2: `scopedArgs` resolves a relative `filePath` against the session directory (and `taskArgs` maps `path` onto `filePath`),
+      // so the call's RAW arguments are read too: a path written relative stays among the checked ones as written, and is never
+      // eligible for R (`readSetEligible`) — only a path inside W passes. The resolved forms are checked next to them.
+      const scoped = toolCallPaths(event.tool, record);
+      const raw = toolCallPaths(event.tool, event.input);
+      if (scoped === undefined && raw === undefined) return `${event.tool}: no path to check (or a patch whose paths cannot be read)`;
+      paths = [...new Set([...(raw ?? []), ...(scoped ?? [])])];
     } else if (cls === "glob" || cls === "grep") {
       const named = typeof record.path === "string" && record.path !== "" ? record.path : undefined;
       implicitRoot = named === undefined; // QA-1 F1: the session directory by default — W only, never R
