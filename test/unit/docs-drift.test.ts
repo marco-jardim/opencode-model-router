@@ -35,6 +35,7 @@ import { GRADER_REASONS_MAX } from "../../src/verify/checker";
 import { oneLineReason } from "../../src/routing/roles/authority";
 import { CREDENTIAL_ENV_RE } from "../../src/router/run-tools";
 import { ROLES_RESTART_NOTICE } from "../../src/compat/v2-hooks";
+import { buildRoleDispatchHeader } from "../../src/router/dispatch-header";
 import { parseJsonc } from "../../src/router/jsonc";
 import { FINDING_IDS } from "../../src/routing/advisor/findings";
 import { runAdvisor } from "../../src/routing/advisor";
@@ -88,6 +89,35 @@ vi.mock("@opentui/solid", () => ({ createElement: () => ({}), insert: () => unde
 
 const root = process.cwd();
 const read = (p: string) => readFileSync(join(root, p), "utf-8");
+
+describe("role dispatch header docs (P2g, OD6)", () => {
+  const flat = (path: string) => read(path).replace(/\s+/g, " ");
+
+  it("ROLES.md quotes the rendered location paragraph of the role header", () => {
+    const header = buildRoleDispatchHeader({
+      agent: "implementer", workRoot: "ROOT", edits: true, location: { name: "app-a", branch: "feat/login", head: "3f2c1a9deadbeef" },
+    });
+    const paragraph = header.split("\n\n")[1]!.replace("ROOT", "<root>");
+    expect(paragraph).toBe("Working directory: <root> (repository app-a, branch feat/login at 3f2c1a9). You are already there — do not ask permission to read or write inside it.");
+    expect(flat("docs/ROLES.md")).toContain(paragraph);
+    expect(flat("docs/ROLES.md")).toContain("`[router] You are @<role>. Execute this dispatch yourself.`");
+  });
+
+  it("no doc still says the header is built for tier dispatches only", () => {
+    const roles = flat("docs/ROLES.md");
+    expect(roles).not.toContain("built for tier dispatches only");
+    expect(roles).not.toContain("learns its location from refusals");
+    const design = flat("docs/design/cross-repo.md");
+    expect(design).not.toContain("Header only for tier dispatches");
+    expect(design).not.toContain("Role dispatches get no header");
+    expect(design).not.toContain("headers are built only for tier dispatches");
+  });
+
+  it("dispatchHeader: false also turns off the role header (CONFIG_REFERENCE and ROLES)", () => {
+    expect(flat("docs/CONFIG_REFERENCE.md")).toContain("`dispatchHeader: false` also turns off the role header");
+    expect(flat("docs/ROLES.md")).toContain("or `dispatchHeader: false`");
+  });
+});
 const undocumentedKeys = (doc: string, keys: readonly string[]) =>
   keys.filter((key) => !doc.includes(`\`${key}\``));
 const nestedEnforcementKeys = [

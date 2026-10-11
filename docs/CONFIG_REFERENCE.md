@@ -73,7 +73,7 @@ falls back to its in-code default), so you only ever see them in an overrides fi
 | Key | Type | Default when absent | Notes |
 |---|---|---|---|
 | `delegateInstructions` | `"strip-global" \| "strip-all" \| "keep"` | `"strip-global"` | Instruction-file filtering for delegate sessions only; never changes the orchestrator. See below. |
-| `dispatchHeader` | `boolean` | `true` | Prepends mechanical guidance to tier-targeted `task` prompts. See below. |
+| `dispatchHeader` | `boolean` | `true` | Prepends mechanical guidance to tier-targeted `task` prompts, and a work-root header to routed role dispatches (v2). See below. |
 | `falseRefusalDetection` | `boolean` | `true` | Annotates capability-complaining hand-backs with zero recorded child tool calls. See below. |
 | `taskPromptRepair` | `boolean` | `true` | Fills a missing `task` prompt from its description, or refuses the call readably. See below. |
 | `tierPromptsGoalOriented` | `Record<string, string>` | built-in goal-oriented prompts in `src/router/prompts.ts` | Goal-oriented twin of `tierPrompts`; an entry replaces the built-in for that tier. See [Prompt styles](#prompt-styles-promptstyle). |
@@ -195,6 +195,10 @@ only when the tier belongs to the active preset. Other tools, missing or unknown
 tiers, non-string prompts, router bypass, and prompts already beginning with
 `[router] You are @` are unchanged. An absent or empty directory omits that paragraph.
 The cap follows `tierCaps[tier] ?? DEFAULT_TIER_CAPS[tier] ?? 5`.
+
+`dispatchHeader: false` also turns off the role header: on Claude Code v2 in roles mode, a routed role dispatch with a
+work root and read access gets a shorter header (role name, work root, and the repository location when the grant has
+one; no cap or budget text), see [Roles mode](./ROLES.md#repositories-below-parent-directories-cross-repo). Inert on Claude Code v1.
 
 Measured using the pure builder's string length: **1,031 characters** for `@fast`,
 cap `8`, and cwd `D:\git\opencode-model-router`, including LF paragraph separators

@@ -66,6 +66,7 @@ import {
 import { realpathSync } from "node:fs";
 import { dirname } from "node:path";
 import type { Admission, AdmissionConfig, AdmissionService, RepoLocation } from "../roles/admission";
+import { buildRoleDispatchHeader, DISPATCH_HEADER_PREFIX } from "../../router/dispatch-header";
 import { addToWorkingSet, workingSetOf } from "./working-set";
 import {
   consumeRunnerDispatch, consumeRunnerDispatchLoose, forgetDispatch, lookupDispatch, rememberDispatch, runnerDescription,
@@ -2000,6 +2001,24 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     // `branch=` / `repo=` alone binds through declare-then-check but does not grow the working set.
     if (grant.location !== undefined && grant.workRoot !== null && resolveRolesRouting(rp.cfg, "v2").repoParents.length > 0) addToWorkingSet(call.sessionID, grant.location);
     if (raised !== null && resumeID !== null) resumeRaises.delete(resumeID); // QA-P21-2-2: consumed once, by a routed resume
+    // P2g (OD6): a role delegate is told its work root. The header goes FIRST; the nonce line / carried block stay last. Only a
+    // grant with a work root and read access gets one; a resume only when its binding is exact (the bound grant is what it holds).
+    const exactResume = resumed && bound?.kind === "exact";
+    const headerWanted = rp.cfg.dispatchHeader !== false && grant.workRoot !== null
+      && (grant.actions.has("read") || grant.actions.has("glob") || grant.actions.has("grep"))
+      && (!resumed || exactResume)
+      && !outPrompt.startsWith(DISPATCH_HEADER_PREFIX); // like the tier path: a prompt that already begins with a router header is left as is
+    const finalPrompt = headerWanted && grant.workRoot !== null
+      ? `${buildRoleDispatchHeader({
+        agent,
+        workRoot: grant.workRoot,
+        edits: grant.actions.has("edit"),
+        ...(grant.location === undefined ? {} : { location: grant.location }),
+        workingSet: workingSetOf(call.sessionID),
+        readParents: resolveRolesRouting(rp.cfg, "v2").repoParents,
+        ...(exactResume ? { exactResume: true } : {}),
+      })}${outPrompt}`
+      : outPrompt;
 
     decided.set(call.callID, {
       parentSessionID: call.sessionID,
@@ -2025,7 +2044,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     trim(decided, MAX_PENDING);
     return {
       mode,
-      ...(outPrompt !== prompt ? { prompt: outPrompt } : {}),
+      ...(finalPrompt !== prompt ? { prompt: finalPrompt } : {}),
       model,
       ...(logged === null ? {} : { decisionID: logged }),
       ...(outDescription === null ? {} : { description: outDescription }),

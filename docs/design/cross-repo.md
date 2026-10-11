@@ -265,7 +265,7 @@ D:\git\app-a-login (repository app-a, branch feat/login).
 
 ### Dispatch header (only when `routing.repoParents` is configured or an approval exists)
 
-Implemented for tier dispatches only; role dispatches get no header (see the notes under section 7, Phase 1).
+Implemented for tier dispatches and, since P2g (OD6), for routed role dispatches with a work root and read access (the role header, `buildRoleDispatchHeader`; a read-only role is told `read` instead of `read or write`).
 
 ```text
 Working directory: D:\git\app-a-login (repository app-a, branch feat/login at 3f2c1a9). You are already there — do not ask permission to read or write inside it.
@@ -424,7 +424,7 @@ Each slice lands test-first: the failing test reproduces the scenario row, then 
 **Implemented (notes).** Deviations from the steps above, checked against the code at HEAD 2511f68:
 
 - **Working set at grant time.** The orchestrator session's working set (up to 16 bound roots, forgotten on session deletion) is filled when a grant is bound, not when the dispatch returns.
-- **Header only for tier dispatches.** The dispatch header is built only for tier dispatches. When cross-repo is in use it names the session's repositories and the readable parents. Role dispatches get no header; their location reaches them through refusals and the read provenance line.
+- **Role dispatch header (P2g, OD6).** A routed role dispatch with a work root and read access gets a role header (not a delegate's, not a non-exact resume, not with `dispatchHeader: false`). When cross-repo is in use it names the session's repositories and the readable parents. The nonce line (or the carried acceptance block) stays last.
 - **D13 limit.** The hook-level allow lifts an `ask` for `external_directory` inside W or R for an exactly bound session; a deny is never changed. Role agents are registered from a catch-all `*: deny`, so a directory outside the registered patterns (parents, `workRoots`, the session repository's worktrees at registration) is a static deny. A worktree outside the parents still needs a `routing.workRoots` glob or a restart (Q7).
 - **Read refusal text kept.** A read outside W and outside the read set keeps today's text (`read: <path> is outside this dispatch's work root <root> (use an absolute path inside it)`); only edit refusals carry the location.
 - **Link roots named by basename.** The perimeter names a repository reached through `node_modules` links by the basename of its root.
@@ -555,7 +555,7 @@ After QA rounds 1 and 2 (facts checked at HEAD effcdb3):
   - The fail-closed planning catch wraps the role check.
   - Ignored build output (for example `dist/`) in a linked repository is not observed, so a pass covers tracked and untracked files only (P2 pinning).
   - A repository with submodules is never observed, so with writers its dispatches are unverifiable.
-  - The dispatch-header location line is dead code (headers are built only for tier dispatches).
+  - The dispatch-header location line was dead code for roles; resolved by the role dispatch header (P2g, OD6).
   - The evaluate hook still accepts host-relative resources (`hostRelative`), and relies on `execute.before` refusing the relative form first.
 - **Consumers** are discovered only in the working set, and only through `node_modules` links. Python editable installs, Go `replace`, Cargo path dependencies, and `../` or alias imports are not discovered (Q2).
 - **A consumer check's failures** are unverifiable, never "fail". The dependency is the changed repository, so the reference can neither excuse nor prove them.

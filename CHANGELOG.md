@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Role dispatch header (OpenCode v2 roles mode; inert on v1) (#107).** A routed role dispatch with a work root and
+  read access now starts with a short header naming the role, the work root and, when known, the repository, branch and
+  head, so a role delegate is told where it works; the nonce line or carried acceptance block stays last. No header for
+  a delegate's dispatch, a non-exact resume or `dispatchHeader: false`; the role work-root rule now points to the
+  `Working directory:` line.
 - **Checks in other repositories (OpenCode v2, roles mode) (#107).** A check of the `[acceptance]` block can run in
   another repository of the read set: `check: testsPass cwd="<repo>" scope=full`. A relative `cwd=` stays inside the
   work root; an absolute one must be in the read set; one outside it, or a `scope=` that is neither `affected` nor

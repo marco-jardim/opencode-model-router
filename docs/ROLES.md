@@ -233,9 +233,15 @@ value gives no work root, see below):
 with several worktrees and no `branch=`, is refused and the candidates are listed. `root`, `repo` and `branch` must
 agree when given together. With parents set, the protocol tells the orchestrator: name another repository with
 `repo=<name>` (and `branch=<ref>` when it has several worktrees) instead of `root=`; each dispatch edits one
-repository, and a role may read the others below `routing.repoParents`. The router's dispatch header, which names the
-session's repositories and the readable parents, is built for tier dispatches only; a role dispatch learns its
-location from refusals and from read provenance.
+repository, and a role may read the others below `routing.repoParents`. A routed role dispatch that has a work root and
+read access starts with a role header (`[router] You are @<role>. Execute this dispatch yourself.`), so the delegate is
+told where it works. A fresh dispatch gets the header, the work root, and, when the grant is located, the repository,
+branch and head: `Working directory: <root> (repository app-a, branch feat/login at 3f2c1a9). You are already there —
+do not ask permission to read or write inside it.` A read-only role is told `read` instead of `read or write`. With
+parents set, a second paragraph lists the session's repositories and where the role may read. The nonce line (or the
+carried `[acceptance]` block of a resume) stays the last line of the prompt. A resume gets the header only when its
+binding is exact, and without the head clause, which may be stale. No header: no work root, no `read`/`glob`/`grep`
+(`researcher`), a delegate's dispatch, a non-exact resume, or `dispatchHeader: false`.
 
 **Admission.** On a v2 roles dispatch, when parents are set or `repo=`/`branch=` is given, the work root is bound
 through admission. It is admitted when either:
@@ -326,7 +332,8 @@ repository without writers is marked `changed during the dispatch`. Such a dispa
   form or a restart; the same holds for a worktree of the session repository created after registration. Creating
   worktrees below a parent avoids this.
 - Changing `routing.repoParents` needs a restart.
-- The dispatch header is built for tier dispatches only.
+- The role header is built only for a routed role dispatch (not for a delegate's) and names the work root and location
+  the router bound; a role still cannot read or write outside its grant.
 
 The rest of the design is in [the cross-repo design](./design/cross-repo.md).
 

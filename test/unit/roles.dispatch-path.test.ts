@@ -6,6 +6,7 @@ import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { validateConfig, type RouterConfig } from "../../src/router/config";
+import { DISPATCH_HEADER_PREFIX, DISPATCH_HEADER_SEPARATOR, stripDispatchHeader } from "../../src/router/dispatch-header";
 import { rememberDispatch, resetDispatchRegistry } from "../../src/router/sessions";
 import { buildRoleLadder } from "../../src/routing/engine/ladders";
 import { acquireOutcomes } from "../../src/routing/outcomes";
@@ -27,9 +28,11 @@ import {
   routedRoleOf,
   routedWorkRoot,
   type DispatchRouter,
+  type DispatchRouterDeps,
   type RouteOutcome,
 } from "../../src/routing/wire/dispatch";
 import { createEngineRuntime, type EngineRuntime } from "../../src/routing/wire/runtime";
+import { forgetWorkingSet } from "../../src/routing/wire/working-set";
 import type { Admission, RepoLocation } from "../../src/routing/roles/admission";
 import { resolveRoles } from "../../src/router/roles";
 import { resumedGrant } from "../../src/routing/wire/dispatch";
@@ -83,7 +86,10 @@ interface World {
 const cleanups: Array<() => Promise<void>> = [];
 let seq = 0;
 
-function makeWorld(routing: Record<string, unknown>, opts: { extra?: Record<string, unknown>; variants?: boolean; bypassed?: boolean; env?: Record<string, string> } = {}): World {
+function makeWorld(routing: Record<string, unknown>, opts: {
+  extra?: Record<string, unknown>; variants?: boolean; bypassed?: boolean; env?: Record<string, string>;
+  createAdmission?: DispatchRouterDeps["createAdmission"];
+} = {}): World {
   const main = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-p21b-main-")));
   const worktree = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-p21b-wt-")));
   const outside = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-p21b-out-")));
@@ -118,6 +124,7 @@ function makeWorld(routing: Record<string, unknown>, opts: { extra?: Record<stri
     realpath,
     isBypassed: () => opts.bypassed === true,
     env: opts.env ?? {},
+    ...(opts.createAdmission === undefined ? {} : { createAdmission: opts.createAdmission }),
   });
   cleanups.push(async () => {
     await runtime.dispose();
@@ -203,7 +210,8 @@ describe("role dispatch path", () => {
     expect(role.nonce).toMatch(/^[A-Za-z0-9_-]{16,128}$/);
     const lines = outcome.prompt!.split("\n");
     expect(lines[lines.length - 1]).toBe(`OMR_NONCE=${role.nonce}`);
-    expect(outcome.prompt!.startsWith("find where the config is loaded\nreport file:line\n")).toBe(true);
+    // P2g (OD6): the role header comes first; the prompt itself is compared without it
+    expect(stripDispatchHeader(outcome.prompt!).startsWith("find where the config is loaded\nreport file:line\n")).toBe(true);
     expect(outcome.description).toBe(`find loader [nonce ${role.nonce}]`);
     // the work root without root= is the session directory (canonical long form)
     expect(role.workRoot).toBe(world.main);
@@ -586,5 +594,138 @@ describe("exported helpers for the adapter (P2.1-C)", () => {
     });
     expect(roleEscalationHintFor(cfg, "ses_2")).toContain("raises it to medium");
     expect(roleEscalationHintFor(config({ delegation: "tiers" }), "ses_2")).toBeNull();
+  });
+});
+
+// P2g (OD6): the role dispatch header. A routed role dispatch with a work root and read access is told its work root; the nonce line
+// (fresh) or the carried acceptance block (resume) stays the LAST thing of the prompt.
+describe("role dispatch header (P2g, OD6)", () => {
+  beforeEach(() => forgetWorkingSet("root"));
+  afterEach(() => forgetWorkingSet("root"));
+
+  /** The header of an outgoing prompt, separator included ("" without one). */
+  const headerOf = (prompt: string): string => {
+    const end = prompt.indexOf(DISPATCH_HEADER_SEPARATOR);
+    return end === -1 ? "" : prompt.slice(0, end + DISPATCH_HEADER_SEPARATOR.length);
+  };
+  const bindsExact = async (world: World, child: string, outcome: RouteOutcome, agent: string) =>
+    bind(child, async () => ({ parentID: "root", agent, title: outcome.description!, firstText: outcome.prompt! }), {
+      maxOf: (name) => roleMaxActions(resolveRoles(world.cfg, "v2").get(name)),
+    });
+
+  it("fresh: canonical work root, route line gone, nonce last, child binds exact", async () => {
+    const world = makeWorld({ delegation: "roles", engine: "static" });
+    const input = { agent: "explorer", prompt: "[route class=search risk=low scope=single]\nfind where the config is loaded", description: "find loader" };
+    const c = call(world, input);
+    const outcome = await world.router.route(c);
+    const role = outcome.role!;
+    const prompt = outcome.prompt!;
+    expect(prompt.startsWith(`${DISPATCH_HEADER_PREFIX}explorer. Execute this dispatch yourself.\n\n`)).toBe(true);
+    expect(headerOf(prompt)).toContain(`Working directory: ${world.main}. You are already there — do not ask permission to read inside it.`);
+    expect(headerOf(prompt)).not.toContain("Repositories in this session");
+    expect(stripDispatchHeader(prompt)).toBe(`find where the config is loaded\nOMR_NONCE=${role.nonce}`);
+    expect(prompt).not.toContain("[route class");
+    expect(prompt.split("\n").pop()).toBe(`OMR_NONCE=${role.nonce}`);
+    world.router.commit(c.callID, applied(input, outcome));
+    expect((await bindsExact(world, "child-h1", outcome, "explorer")).kind).toBe("exact");
+  });
+
+  it("worktree implementer: read or write", async () => {
+    const world = makeWorld({ delegation: "roles", engine: "static" });
+    const outcome = await world.router.route(call(world, {
+      agent: "implementer", prompt: `[route class=implement risk=low scope=single needs=edit root=${world.worktree}]\nadd a guard`,
+    }));
+    const header = headerOf(outcome.prompt!);
+    expect(header.startsWith(`${DISPATCH_HEADER_PREFIX}implementer. Execute this dispatch yourself.\n\n`)).toBe(true);
+    expect(header).toContain(`Working directory: ${world.worktree}. You are already there — do not ask permission to read or write inside it.`);
+    expect(stripDispatchHeader(outcome.prompt!)).toBe(`add a guard\nOMR_NONCE=${outcome.role!.nonce}`);
+  });
+
+  it("located grant (stubbed admission): repository, branch, head; repositories paragraph with repoParents", async () => {
+    const parent = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-p2g-parent-")));
+    cleanups.push(async () => rmSync(parent, { recursive: true, force: true }));
+    const worlds: World[] = [];
+    const located = (): RepoLocation => ({
+      repository: worlds[0]!.main, name: "app-a", worktree: worlds[0]!.worktree, branch: "feat/login", head: "3f2c1a9deadbeef", worktrees: [],
+    });
+    const world = makeWorld({ delegation: "roles", engine: "static", repoParents: [parent] }, {
+      createAdmission: () => ({
+        admit: async (): Promise<Admission> => ({ ok: true, location: located() }),
+        resolve: async (): Promise<Admission> => ({ ok: true, location: located() }),
+      }),
+    });
+    worlds.push(world);
+    const outcome = await world.router.route(call(world, {
+      agent: "implementer", prompt: "[route class=implement risk=low scope=single needs=edit repo=app-a]\nadd a guard",
+    }));
+    expect(outcome.role!.grant.location).toBeDefined();
+    const header = headerOf(outcome.prompt!);
+    expect(header).toContain(
+      `Working directory: ${world.worktree} (repository app-a, branch feat/login at 3f2c1a9). You are already there — do not ask permission to read or write inside it.`,
+    );
+    expect(header).toContain("Repositories in this session: app-a (feat/login). You may read any repository below ");
+    expect(header).toContain("; you edit and run only in your working directory.");
+    expect(outcome.prompt!.split("\n").pop()).toBe(`OMR_NONCE=${outcome.role!.nonce}`);
+  });
+
+  it("none: null work root, researcher, delegate, non-exact resume, dispatchHeader:false", async () => {
+    const hasHeader = (prompt: string | undefined): boolean => prompt !== undefined && prompt.startsWith(DISPATCH_HEADER_PREFIX);
+    // a null work root (root= outside the session's worktrees)
+    const world = makeWorld({ delegation: "roles", engine: "static" });
+    const nowhere = await world.router.route(call(world, { agent: "implementer", prompt: `[route class=implement risk=low scope=single needs=edit root=${world.outside}]\nchange x` }));
+    expect(nowhere.role!.workRoot).toBeNull();
+    expect(hasHeader(nowhere.prompt)).toBe(false);
+    // a role without read, glob or grep
+    const researcher = await world.router.route(call(world, { agent: "researcher", prompt: "[route class=research risk=low scope=single]\nlook up x" }));
+    expect(["read", "glob", "grep"].some((action) => researcher.role!.grant.actions.has(action as never))).toBe(false);
+    expect(hasHeader(researcher.prompt)).toBe(false);
+    // a non-exact resume
+    const [model, variant] = tierRef(world.cfg, "medium").split("#") as [string, string | undefined];
+    rememberDispatch("child-n", {
+      facts: { class: "search", risk: "low", scope: "single", needs: [], confidence: 1, source: "rules" },
+      agent: "explorer", model, variant: variant ?? null, tier: "medium", parentSessionID: "root", decisionID: "d0", step: "dispatch", picked: "explorer",
+    });
+    const resumed = await world.router.route(call(world, { agent: "explorer", prompt: "find the rest", sessionID: "child-n" }));
+    expect(resumed.role!.nonce).toBeNull();
+    expect(hasHeader(resumed.prompt)).toBe(false);
+    // a delegate (a session with a parent)
+    world.session.parentID = "grand-parent";
+    const delegate = await world.router.route(call(world, { agent: "explorer", prompt: "find x" }));
+    expect(hasHeader(delegate.prompt)).toBe(false);
+    // dispatchHeader:false
+    const off = makeWorld({ delegation: "roles", engine: "static" }, { extra: { dispatchHeader: false } });
+    const plain = await off.router.route(call(off, { agent: "explorer", prompt: "[route class=search risk=low scope=single]\nfind x" }));
+    expect(plain.prompt).toBe(`find x\nOMR_NONCE=${plain.role!.nonce}`);
+  });
+
+  it("exact resume: header without head; carried block last", async () => {
+    const parent = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-p2g-parent-")));
+    cleanups.push(async () => rmSync(parent, { recursive: true, force: true }));
+    const worlds: World[] = [];
+    const located = (): RepoLocation => ({
+      repository: worlds[0]!.main, name: "app-a", worktree: worlds[0]!.worktree, branch: "feat/login", head: "3f2c1a9deadbeef", worktrees: [],
+    });
+    const world = makeWorld({ delegation: "roles", engine: "static", repoParents: [parent] }, {
+      createAdmission: () => ({
+        admit: async (): Promise<Admission> => ({ ok: true, location: located() }),
+        resolve: async (): Promise<Admission> => ({ ok: true, location: located() }),
+      }),
+    });
+    worlds.push(world);
+    const block = `[acceptance]\ncheck: fileExists path=${PACKAGE_JSON}\n[/acceptance]`;
+    const input = { agent: "implementer", prompt: `[route class=implement risk=low scope=single needs=edit repo=app-a]\nadd a guard\n${block}`, description: "guard" };
+    const c = call(world, input);
+    const fresh = await world.router.route(c);
+    world.router.commit(c.callID, applied(input, fresh));
+    world.router.onSessionCreated({ sessionID: "child-x1", parentID: "root", agent: "implementer", title: fresh.description });
+    expect((await bindsExact(world, "child-x1", fresh, "implementer")).kind).toBe("exact");
+    const resume = await world.router.route(call(world, { agent: "implementer", prompt: "continue with the guard", sessionID: "child-x1" }));
+    expect(resume.role!.nonce).toBeNull();
+    const prompt = resume.prompt!;
+    expect(prompt.startsWith(`${DISPATCH_HEADER_PREFIX}implementer. Execute this dispatch yourself.\n\n`)).toBe(true);
+    expect(headerOf(prompt)).toContain(`Working directory: ${world.worktree} (repository app-a, branch feat/login). You are already there`);
+    expect(headerOf(prompt)).not.toContain("3f2c1a9");
+    expect(stripDispatchHeader(prompt).startsWith("continue with the guard")).toBe(true);
+    expect(prompt.endsWith(block)).toBe(true);
   });
 });

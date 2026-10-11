@@ -13,6 +13,7 @@ import ModelRouterPlugin from "../../src/index";
 import type { RouterPluginInput } from "../../src/compat/child-session";
 import { invalidateConfigCache, overridePath, validateConfig, type RouterConfig } from "../../src/router/config";
 import { resolveRoles } from "../../src/router/roles";
+import { DISPATCH_HEADER_PREFIX, stripDispatchHeader } from "../../src/router/dispatch-header";
 import { lookupDispatch, markRunnerDispatch, rememberDispatch, resetDispatchRegistry, resetRunnerTokens, runnerDescription } from "../../src/router/sessions";
 import { TASK_CLASSES } from "../../src/routing/classify/types";
 import { buildRoleLadder, roleTierOrder } from "../../src/routing/engine/ladders";
@@ -525,12 +526,14 @@ describe("P3.3 global QA round 1: resumes keep the resumed dispatch's facts and 
     expect(resumed.role!.window.floor).toBe("medium"); // was heavy: write + exec without detection
     expect(resumed.role!.notes).toContain(CARRIED_ACCEPTANCE_NOTE);
     // The router's gate verifies the resume on the same acceptance: it is carried in the prompt the host runs.
-    expect(resumed.prompt).toBe(`continue and finish\nVERIFY: required\n${acceptance}`);
+    // P2g (OD6): an exactly bound resume also carries the role header, first; the carried block stays last.
+    expect(resumed.prompt!.startsWith(DISPATCH_HEADER_PREFIX)).toBe(true);
+    expect(stripDispatchHeader(resumed.prompt!)).toBe(`continue and finish\nVERIFY: required\n${acceptance}`);
     world.router.commit(rc.callID, applied(resumeInput, resumed));
     expect(lookupDispatch("child-w")?.verification).toEqual({ block: acceptance, directives: ["VERIFY: required"] }); // a 2nd resume carries it too
     // A resume naming its own acceptance keeps its own (nothing carried).
     const own = await world.router.route(call(world, { agent: "implementer", sessionID: "child-w", prompt: "fix it\n[acceptance]\ncriteria: the generator runs\n[/acceptance]" }));
-    expect(own.prompt).toBeUndefined();
+    expect(stripDispatchHeader(own.prompt!)).toBe("fix it\n[acceptance]\ncriteria: the generator runs\n[/acceptance]");
     expect(own.role!.notes).not.toContain(CARRIED_ACCEPTANCE_NOTE);
   });
 
