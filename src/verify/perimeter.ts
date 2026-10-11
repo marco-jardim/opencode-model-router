@@ -24,6 +24,7 @@
  *   (F2), so the gate refuses a dispatch that ran unattributable writers.
  */
 import { lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
+import { lstat, readdir, realpath } from "node:fs/promises";
 import * as path from "node:path";
 import { permissionMatches } from "../router/read-only";
 import { routedRoleOf } from "../routing/wire/dispatch";
@@ -101,6 +102,74 @@ export function linkedTargets(w: string): string[] {
   return [...targets.values()];
 }
 
+/** Cross-repo P2b.3: one working-set worktree whose `node_modules` links into W. */
+export interface PerimeterConsumer {
+  readonly root: string;
+  readonly name?: string;
+  /** The link, relative to `<root>/node_modules` (for example `lib` or `@scope/lib`), "/" separated. */
+  readonly entry: string;
+}
+
+/** Cross-repo P2b.3: the bound on `node_modules` entries read by `discoverConsumers`, in total. */
+export const CONSUMER_SCAN_MAX = 2000;
+
+/**
+ * Cross-repo P2b.3 (docs/design/cross-repo.md §6, consumer discovery): the roots among `roots` whose `node_modules` entries
+ * (the ones `packageEntries` reads) hold a link whose real path is inside W or W itself. Only the given roots are read; async fs,
+ * no git. At most `opts.maxEntries` (default CONSUMER_SCAN_MAX) entries are read in total; past that, scanning stops. Never
+ * throws. One entry per root (the first link found).
+ */
+export async function discoverConsumers(
+  w: string,
+  roots: readonly { root: string; name?: string }[],
+  opts?: { maxEntries?: number },
+): Promise<PerimeterConsumer[]> {
+  const consumers: PerimeterConsumer[] = [];
+  let budget = Math.max(0, Math.floor(opts?.maxEntries ?? CONSUMER_SCAN_MAX));
+  // Link targets are real paths: W is matched as given and as its real path (a junction or 8.3 spelling of W).
+  const wReal = await realpath(w).catch(() => w);
+  const inW = (dir: string): boolean => insideOrEqual(dir, w) || insideOrEqual(dir, wReal);
+  const names = async (dir: string): Promise<string[]> => {
+    try {
+      return await readdir(dir);
+    } catch {
+      return [];
+    }
+  };
+  for (const { root, name } of roots) {
+    if (inW(root) || insideOrEqual(w, root) || insideOrEqual(wReal, root)) continue;
+    if (budget <= 0) break;
+    const modules = path.join(root, "node_modules");
+    let found: string | undefined;
+    const check = async (full: string, entry: string): Promise<void> => {
+      if (found !== undefined || budget <= 0) return;
+      budget -= 1;
+      try {
+        if (!(await lstat(full)).isSymbolicLink()) return;
+        const real = await realpath(full);
+        if (inW(real) && !isStoreLikeLink(real, process.platform)) found = entry;
+      } catch {
+        // Unreadable or dangling: it loads nothing.
+      }
+    };
+    for (const top of await names(modules)) {
+      if (found !== undefined || budget <= 0) break;
+      if (top.startsWith(".")) continue;
+      if (!top.startsWith("@")) {
+        await check(path.join(modules, top), top);
+        continue;
+      }
+      for (const sub of await names(path.join(modules, top))) {
+        if (found !== undefined || budget <= 0) break;
+        if (sub.startsWith(".")) continue;
+        await check(path.join(modules, top, sub), `${top}/${sub}`);
+      }
+    }
+    if (found !== undefined) consumers.push({ root, ...(name !== undefined ? { name } : {}), entry: found });
+  }
+  return consumers;
+}
+
 /** QA-1 F11: the git common directory of the repository whose top level is `top`, read without git; undefined when unknown. */
 function commonDirOf(top: string | undefined): string | undefined {
   if (top === undefined) return undefined;
@@ -169,11 +238,17 @@ export function planPerimeter(dispatchID: string, cwd: string, admission: () => 
       at: seed.at,
       ...(seed.name !== undefined ? { name: seed.name } : {}),
       ...(seed.sameRepository === true ? { sameRepository: true } : {}),
+      ...(seed.origin !== undefined ? { origin: seed.origin } : {}),
       fixed: "unobserved",
     });
   };
   for (const entry of others) {
-    add({ at: entry.worktree, name: entry.name, ...(sameRepository(entry.worktree) ? { sameRepository: true } : {}) });
+    add({
+      at: entry.worktree,
+      name: entry.name,
+      origin: "working-set",
+      ...(sameRepository(entry.worktree) ? { sameRepository: true } : {}),
+    });
   }
 
   const depth = Math.max(1, Math.floor(config.depth));
@@ -205,22 +280,22 @@ export function planPerimeter(dispatchID: string, cwd: string, admission: () => 
     const parent = parentOf(real);
     const worktree = worktreeOf(real);
     if (parent === undefined && worktree === undefined) {
-      add({ at: real, name: path.basename(real), fixed: "unadmitted" });
+      add({ at: real, name: path.basename(real), fixed: "unadmitted", origin: "link" });
       continue;
     }
     // QA-1 F3: the repository's top level, without git; the walk stops at the parent (or above the worktree).
     const top = gitTopOf(real, worktree !== undefined ? path.dirname(worktree.worktree) : parent);
     if (top === undefined) {
-      add({ at: real, name: path.basename(real), fixed: "unadmitted" }); // Not in a git repository: nothing to observe.
+      add({ at: real, name: path.basename(real), fixed: "unadmitted", origin: "link" }); // Not in a git repository: nothing to observe.
       continue;
     }
     if (insideOrEqual(top, w) || insideOrEqual(w, top)) continue; // W's own repository: W's snapshot covers it.
     if (seeds.some((seed) => seed.fixed === undefined && insideOrEqual(top, seed.at))) continue; // A working-set root covers it.
     if (!admitTop(top)) {
-      add({ at: top, name: path.basename(top), fixed: "unadmitted" });
+      add({ at: top, name: path.basename(top), fixed: "unadmitted", origin: "link" });
       continue;
     }
-    add({ at: top, admit: admitTop, ...(sameRepository(top) ? { sameRepository: true } : {}) });
+    add({ at: top, admit: admitTop, origin: "link", ...(sameRepository(top) ? { sameRepository: true } : {}) });
   }
   if (seeds.length === 0) return undefined;
   return { ...(location !== undefined ? { name: location.name } : {}), roots: seeds };

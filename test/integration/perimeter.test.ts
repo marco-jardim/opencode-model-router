@@ -549,3 +549,119 @@ describe("the verification perimeter of a cross-repo role dispatch (P1.8)", () =
     expect(out).toMatch(/Dispatch that work with branch=feat-x, or verify it there\./);
   }, 60_000);
 });
+
+describe("consumer discovery (§6)", () => {
+  /** Every link made here; removed one by one (never a recursive delete through a junction). */
+  const links: string[] = [];
+  const link = (target: string, at: string): void => {
+    fs.mkdirSync(path.dirname(at), { recursive: true });
+    fs.symlinkSync(target, at, "junction");
+    links.push(at);
+  };
+  afterEach(() => {
+    for (const at of links.splice(0).reverse()) {
+      try {
+        fs.unlinkSync(at);
+      } catch {
+        try {
+          fs.rmdirSync(at);
+        } catch {
+          // Already gone.
+        }
+      }
+    }
+  });
+
+  it("a working-set worktree whose node_modules junction resolves into W is a consumer (plain and @scope entries)", async () => {
+    fs.mkdirSync(path.join(repo, "packages", "core"), { recursive: true });
+    link(repo, path.join(lib, "node_modules", "app-a"));
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }])).toEqual([{ root: lib, name: "lib-b", entry: "app-a" }]);
+    // A link into a directory below W counts too, and a scoped entry is named with its scope.
+    const other = path.join(parent, "lib-c");
+    fs.mkdirSync(other, { recursive: true });
+    link(path.join(repo, "packages", "core"), path.join(other, "node_modules", "@scope", "core"));
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: other }])).toEqual([{ root: other, entry: "@scope/core" }]);
+  });
+
+  it("a link into another worktree of W's repository is not a consumer; W itself is never scanned", async () => {
+    const wt = path.join(parent, "app-a-wt");
+    execFileSync("git", ["worktree", "add", "-q", "-b", "feat-c", wt], { cwd: repo, stdio: "ignore" });
+    link(wt, path.join(lib, "node_modules", "app-a"));
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }])).toEqual([]);
+    link(lib, path.join(repo, "node_modules", "lib-b"));
+    link(repo, path.join(repo, "node_modules", "self"));
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: repo, name: "app-a" }])).toEqual([]);
+  }, 60_000);
+
+  it("only working-set roots are scanned: a link target of W and a repository outside the working set are not consumers", async () => {
+    // lib-b is a link target of W (origin "link") that links back into W; lib-c is outside the working set and links into W.
+    link(lib, path.join(repo, "node_modules", "lib-b"));
+    link(repo, path.join(lib, "node_modules", "app-a"));
+    const outside = path.join(parent, "lib-c");
+    fs.mkdirSync(outside, { recursive: true });
+    link(repo, path.join(outside, "node_modules", "app-a"));
+    routeAsRole(location(repo, "app-a"));
+    const linked = planPerimeter("task:orch:call1", repo, () => ({ parents: [parent], depth: 1, exclude: [] }));
+    expect(linked?.roots.map(seed => [seam.key(seed.at), seed.origin])).toEqual([[seam.key(lib), "link"]]);
+    const workingSetRoots = (plan: typeof linked): { root: string; name?: string }[] => (plan?.roots ?? [])
+      .filter(seed => seed.origin === "working-set")
+      .map(seed => ({ root: seed.at, ...(seed.name !== undefined ? { name: seed.name } : {}) }));
+    expect(await perimeterModule.discoverConsumers(repo, workingSetRoots(linked))).toEqual([]);
+    // In the working set, lib-b is scanned and is a consumer; lib-c, outside it, is still not.
+    addToWorkingSet("orch", location(lib, "lib-b"));
+    const planned = planPerimeter("task:orch:call1", repo, () => ({ parents: [parent], depth: 1, exclude: [] }));
+    expect(planned?.roots.map(seed => [seam.key(seed.at), seed.origin])).toEqual([[seam.key(lib), "working-set"]]);
+    expect(await perimeterModule.discoverConsumers(repo, workingSetRoots(planned))).toEqual([{ root: lib, name: "lib-b", entry: "app-a" }]);
+  });
+
+  it("store-like links and dot-entries are skipped", async () => {
+    const store = path.join(repo, "node_modules", ".pnpm", "pkg@1.0.0", "node_modules", "pkg");
+    fs.mkdirSync(store, { recursive: true });
+    link(store, path.join(lib, "node_modules", "pkg"));
+    link(repo, path.join(lib, "node_modules", ".cache"));
+    link(repo, path.join(lib, "node_modules", "@scope", ".hidden"));
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }])).toEqual([]);
+  });
+
+  it("an unreadable or missing node_modules yields no consumer, and never throws", async () => {
+    fs.writeFileSync(path.join(lib, "node_modules"), "not a directory\n");
+    const missing = path.join(parent, "missing");
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }, { root: missing }])).toEqual([]);
+  });
+
+  it("end to end (D6): a working-set consumer of W with no check there makes a pass UNVERIFIED; with no change it stays a pass", async () => {
+    link(repo, path.join(lib, "node_modules", "app-a"));
+    addToWorkingSet("orch", location(lib, "lib-b"));
+    routeAsRole(location(repo, "app-a"));
+    const hooks = await makePlugin();
+    await pin(repo);
+    await pin(lib);
+    const caveat = /lib-b at (\S+) links this work root \(node_modules\/app-a\) and no check ran there; add a check such as: check: testsPass cwd="([^"]+)" scope=full/;
+    const unchanged = await runTask(hooks, `Implement it.\n${SYNC_DOD}`, async () => undefined);
+    expect(unchanged).toContain("✓ verified");
+    expect(unchanged).not.toMatch(caveat);
+    const out = await runTask(hooks, `Implement it.\n${SYNC_DOD}`, async () => {
+      fs.writeFileSync(path.join(repo, "index.ts"), "export const v = 1;\n");
+      await pin(repo);
+    });
+    expect(out).toContain("UNVERIFIED");
+    expect(out).not.toContain("✓ verified");
+    const named = caveat.exec(out);
+    expect(seam.key(named?.[1] ?? "")).toBe(seam.key(lib));
+    expect(seam.key(named?.[2] ?? "")).toBe(seam.key(lib));
+    expect(artefacts()[1]?.perimeter?.consumers?.map(consumer => [seam.key(consumer.root), consumer.name, consumer.entry]))
+      .toEqual([[seam.key(lib), "lib-b", "app-a"]]);
+  }, 90_000);
+
+  it("past the bound, scanning stops", async () => {
+    for (const name of ["a", "b", "c"]) fs.mkdirSync(path.join(lib, "node_modules", name), { recursive: true });
+    const second = path.join(parent, "lib-c");
+    link(repo, path.join(second, "node_modules", "app-a"));
+    const roots = [{ root: lib, name: "lib-b" }, { root: second, name: "lib-c" }];
+    // lib-b's three entries use up the bound: lib-c is never read.
+    expect(await perimeterModule.discoverConsumers(repo, roots, { maxEntries: 3 })).toEqual([]);
+    expect(await perimeterModule.discoverConsumers(repo, roots, { maxEntries: 0 })).toEqual([]);
+    expect(await perimeterModule.discoverConsumers(repo, roots, { maxEntries: 4 })).toEqual([{ root: second, name: "lib-c", entry: "app-a" }]);
+    expect(await perimeterModule.discoverConsumers(repo, roots)).toEqual([{ root: second, name: "lib-c", entry: "app-a" }]);
+  });
+});

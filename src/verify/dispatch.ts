@@ -100,6 +100,11 @@ export interface PerimeterSeed {
   readonly fixed?: "unobserved" | "unadmitted";
   /** QA-1 F11: a worktree of W's own repository (the same git common directory): I4 suggests `branch=`, not `repo=`. */
   readonly sameRepository?: boolean;
+  /**
+   * Cross-repo P2b.3: where the root came from, set by `planPerimeter`: "working-set" (a working-set worktree other than W),
+   * "link" (a package link target of W). Consumer discovery scans only the working-set roots.
+   */
+  readonly origin?: "w" | "working-set" | "link";
 }
 
 /** Cross-repo P1.8: the perimeter P of a dispatch beyond W. */

@@ -75,7 +75,7 @@ import {
 } from "./dispatch";
 import { runArgv, runShell } from "./exec";
 import { snapshotTree } from "./tree";
-import { planPerimeter } from "./perimeter";
+import { discoverConsumers, planPerimeter } from "./perimeter";
 import type { DispatchPerimeter, PerimeterEntry } from "./dispatch";
 import { branchSwitched, branchSwitchReason, branchUnconfirmedReason, treeMove, treeMoveReason } from "./branch";
 import { readHead, readHeadState, readReflogWindow, type HeadState, type ReflogEntry } from "./head";
@@ -1568,12 +1568,14 @@ export function createVerificationWiring(deps: {
    * the fingerprint, HEAD or top level differs, "unobserved" when either snapshot is unavailable (fail closed), a fixed root with
    * its own status. QA-1 F4: a root whose git top level is not admitted at the gate is reported unobserved, never dropped (I12).
    * Roots are de-duplicated by top level, W's own excluded. Undefined when the dispatch has no perimeter or none remains.
+   * Cross-repo P2b.3 (D6): the working-set roots (never W, never a link target) whose `node_modules` link into W are its
+   * consumers (perimeter.ts discoverConsumers: fs only, bounded, never throws).
    */
-  const perimeterAtGate = (
+  const perimeterAtGate = async (
     planned: { name?: string; snapshots: PerimeterSnapshots } | undefined,
     snapshot: TreeSnapshot | undefined,
     base: string,
-  ): PerimeterObservation | undefined => {
+  ): Promise<PerimeterObservation | undefined> => {
     if (planned === undefined) return undefined;
     const key = (at: string): string => {
       const normalized = resolve(at).replace(/\\/g, "/");
@@ -1582,6 +1584,7 @@ export function createVerificationWiring(deps: {
     const wRoot = snapshot?.root ?? base;
     const rank = { unchanged: 0, unadmitted: 1, unobserved: 2, changed: 3 } as const;
     const roots = new Map<string, PerimeterRoot>();
+    const workingSet = new Map<string, { root: string; name?: string }>();
     for (const { entry, before, now } of planned.snapshots) {
       const fixed = entry.seed.fixed;
       const known = fixed === undefined ? now?.root ?? before?.root : undefined;
@@ -1589,6 +1592,9 @@ export function createVerificationWiring(deps: {
       const root = known !== undefined && !refused ? known : entry.seed.at;
       // W's own repository is W's snapshot (a fixed placeholder may stand at W's path: it is kept).
       if (fixed === undefined && key(root) === key(wRoot)) continue;
+      if (entry.seed.origin === "working-set" && !workingSet.has(key(root))) {
+        workingSet.set(key(root), { root, ...(entry.seed.name !== undefined ? { name: entry.seed.name } : {}) });
+      }
       const status: PerimeterRoot["status"] = fixed ?? (refused || before === undefined || now === undefined
         ? "unobserved"
         : before.fingerprint !== now.fingerprint || before.head !== now.head || before.root !== now.root ? "changed" : "unchanged");
@@ -1606,6 +1612,9 @@ export function createVerificationWiring(deps: {
       if (previous === undefined || rank[next.status] > rank[previous.status]) roots.set(key(root), next);
     }
     if (roots.size === 0) return undefined;
+    const consumers = workingSet.size === 0
+      ? []
+      : await discoverConsumers(wRoot, [...workingSet.values()]).catch(() => []);
     return {
       w: {
         root: wRoot,
@@ -1614,6 +1623,7 @@ export function createVerificationWiring(deps: {
         ...(snapshot?.head ? { head: snapshot.head } : {}),
       },
       roots: [...roots.values()],
+      ...(consumers.length > 0 ? { consumers } : {}),
     };
   };
 
@@ -1729,7 +1739,7 @@ export function createVerificationWiring(deps: {
     // B8: on a switch the commit diff is not run; "unavailable" keeps the whole change set unavailable (the gate refuses anyway).
     const committed = branchSwitch !== undefined ? "unavailable" as const : await committedSinceDispatch(before, snapshot, deadline);
     const contaminatedBy = store.snapshotContaminatedBy(id);
-    const perimeter = perimeterAtGate(await perimeterSnapshots, snapshot, base);
+    const perimeter = await perimeterAtGate(await perimeterSnapshots, snapshot, base);
     return {
       ...store.delta(id, childID, snapshot, base, committed),
       snapshot,

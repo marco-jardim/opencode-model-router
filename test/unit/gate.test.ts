@@ -715,6 +715,108 @@ describe("accept() — per-check placements (P2.4)", () => {
   });
 });
 
+describe("accept() — consumer caveat (D6)", () => {
+  const W = join(tmpdir(), "d6-work-root");
+  const C = join(tmpdir(), "d6-consumer");
+  const consumer = { root: C, name: "app-c", entry: "@scope/lib-w" };
+  const runCheck: Check = { kind: "run", command: "node verify.js", expect: "OK" };
+  const testsCheck: Check = { kind: "testsPass", command: "npm test" };
+  const existsCheck: Check = { kind: "fileExists", path: "out.txt" };
+  const inConsumer = (over: Partial<CheckPlacement> = {}): CheckPlacement => ({ cwd: C, top: C, foreign: true, scope: "full", ...over });
+  const CAVEAT = `app-c at ${C} links this work root (node_modules/@scope/lib-w) and no check ran there; add a check such as: check: testsPass cwd="${C}" scope=full`;
+  const perimeter = (consumers?: readonly { root: string; name?: string; entry: string }[]): NonNullable<Artefact["perimeter"]> => ({
+    w: { root: W, name: "lib-w" },
+    roots: [{ root: C, name: "app-c", status: "unchanged" }],
+    ...(consumers !== undefined ? { consumers } : {}),
+  });
+  const wrote = (over: Partial<Artefact> = {}): Artefact =>
+    artefact({ changeRoot: W, changedFiles: [{ path: join(W, "a.ts"), status: "M" }], perimeter: perimeter([consumer]), ...over });
+  function setup(checks: Check[], code = 0) {
+    const exec = vi.fn<DeterministicDeps["exec"]>().mockResolvedValue({ code, stdout: "OK", stderr: "" });
+    const d = deps({ deterministic: { ...fakeDeterministicDeps(), cwd: W, exec } });
+    const dod = normalizeDoD({ ...detDoD(), checks });
+    return { exec, d, dod };
+  }
+
+  it("a consumer without a check turns a pass into UNVERIFIED, naming the consumer and the suggested check line", async () => {
+    const { d, dod } = setup([runCheck]);
+    const r = await accept({ dod, workRoot: W }, wrote(), d);
+    expect(r.verdict.pass).toBe(false);
+    expect(r.verdict.outcome).toBe("unverifiable");
+    expect(r.verdict.reasons).toContain(CAVEAT);
+    expect(r.verdict.caveats).toEqual([CAVEAT]);
+    // Not a pass: the I8 scope line (a pass's evidence) is not added.
+    expect(r.verdict.reasons.join("\n")).not.toContain("verified scope:");
+    // strictUnverifiable refuses it like any other unverifiable verdict.
+    expect((await accept({ dod, workRoot: W }, wrote(), { ...d, strictUnverifiable: true })).accepted).toBe(false);
+    // A consumer without a name is named by its root.
+    const unnamed = await accept({ dod, workRoot: W }, wrote({ perimeter: perimeter([{ root: C, entry: "lib-w" }]) }), d);
+    expect(unnamed.verdict.caveats).toEqual([
+      `${C} at ${C} links this work root (node_modules/lib-w) and no check ran there; add a check such as: check: testsPass cwd="${C}" scope=full`,
+    ]);
+  });
+
+  it("a testsPass (or run) placed in the consumer: no caveat", async () => {
+    for (const check of [testsCheck, runCheck]) {
+      const { exec, d, dod } = setup([runCheck, check]);
+      const delegation = { dod, workRoot: W, checkPlacements: [undefined, inConsumer()] };
+      const r = await accept(delegation, wrote(), d);
+      expect(r.verdict.caveats ?? [], check.kind).not.toContain(CAVEAT);
+      expect(r.verdict.reasons, check.kind).not.toContain(CAVEAT);
+      // The verdict is the runner's own: the same as with no consumer known (the fake testsPass output is not a test report).
+      expect(r.verdict, check.kind).toEqual((await accept(delegation, wrote({ perimeter: perimeter() }), d)).verdict);
+      if (check.kind === "run") {
+        expect(r.verdict.outcome).toBe("pass");
+        expect(exec).toHaveBeenCalledWith("node verify.js", expect.objectContaining({ cwd: C }));
+      }
+    }
+    // The placement's top is compared with the perimeterKey normalisation (separators, trailing separator, case on win32).
+    const spelled = `${process.platform === "win32" ? C.toUpperCase() : C}${sep}`;
+    const { d, dod } = setup([runCheck, runCheck]);
+    const r = await accept({ dod, workRoot: W, checkPlacements: [undefined, inConsumer({ top: spelled })] }, wrote(), d);
+    expect(r.verdict.outcome).toBe("pass");
+  });
+
+  it("a fileExists placed in the consumer does not count", async () => {
+    const { d, dod } = setup([runCheck, existsCheck]);
+    const r = await accept({ dod, workRoot: W, checkPlacements: [undefined, { cwd: C, top: C, foreign: true }] }, wrote(), d);
+    expect(r.verdict.outcome).toBe("unverifiable");
+    expect(r.verdict.caveats).toEqual([CAVEAT]);
+  });
+
+  it("an empty change set: no caveat, the pass stays a pass", async () => {
+    const { d, dod } = setup([runCheck]);
+    const r = await accept({ dod, workRoot: W }, wrote({ changedFiles: [] }), d);
+    expect(r.verdict.outcome).toBe("pass");
+    expect(r.verdict.reasons).not.toContain(CAVEAT);
+    expect(r.verdict.caveats ?? []).toEqual([]);
+  });
+
+  it("a fail stays a fail, without the consumer caveat", async () => {
+    const { d, dod } = setup([runCheck], 1);
+    const r = await accept({ dod, workRoot: W }, wrote(), d);
+    expect(r.verdict.outcome).toBe("fail");
+    expect(r.verdict.reasons).not.toContain(CAVEAT);
+    expect(r.verdict.caveats ?? []).not.toContain(CAVEAT);
+  });
+
+  it("no perimeter, or a perimeter without consumers: unchanged", async () => {
+    const { d, dod } = setup([runCheck]);
+    const none = await accept({ dod, workRoot: W }, wrote({ perimeter: undefined }), d);
+    expect(none.verdict).toEqual({
+      pass: true,
+      outcome: "pass",
+      method: "deterministic",
+      reasons: ["all 1 deterministic checks passed"],
+      evidence: "exit 0: node verify.js",
+    });
+    const without = await accept({ dod, workRoot: W }, wrote({ perimeter: perimeter() }), d);
+    const empty = await accept({ dod, workRoot: W }, wrote({ perimeter: perimeter([]) }), d);
+    expect(without.verdict.outcome).toBe("pass");
+    expect(empty.verdict).toEqual(without.verdict);
+  });
+});
+
 describe("accept() — gate policy", () => {
   it("1. require:'never' disables the gate (accepts without verifying)", async () => {
     const del: Delegation = { dod: detDoD() };

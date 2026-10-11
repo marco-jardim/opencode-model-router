@@ -28,6 +28,7 @@ import type { BudgetSnapshot } from "../guard/enforce";
 import { isAbsolute, resolve } from "node:path";
 import { isWithinDir, resolveBaseDir } from "./paths";
 import { toolLabel } from "./dispatch";
+import { perimeterKey } from "./git-top";
 
 /** How many outside paths the mixed-change-set reason names before "and N more". */
 const MAX_OUTSIDE_LISTED = 5;
@@ -58,6 +59,11 @@ export const PERIMETER_UNPLANNED = "perimeter could not be planned";
 export interface PerimeterObservation {
   readonly w: PerimeterRepo;
   readonly roots: readonly PerimeterRoot[];
+  /**
+   * Cross-repo P2b.3 (D6): working-set worktrees other than W whose `node_modules` link into W, found by `discoverConsumers`.
+   * Absent or empty: none known, no consumer caveat.
+   */
+  readonly consumers?: readonly { readonly root: string; readonly name?: string; readonly entry: string }[];
 }
 
 /** The concrete, inspectable result of a delegation (artefact contract §3.3). */
@@ -471,6 +477,12 @@ export async function accept(
     const caveat = unattributedWritersCaveat(artefact.changeRoot ?? effectiveBaseDir, writers);
     verdict = { ...verdict, pass: false, outcome: "unverifiable", reasons: [...verdict.reasons, caveat], caveats: [...(verdict.caveats ?? []), caveat] };
   }
+  // D6 (cross-repo P2b.4, OD2): a would-be pass with a change, where a working-set worktree links this work root (a consumer) and
+  // no testsPass/buildPasses/lintClean/run check is placed in it: nothing ran there, so the pass is not a verified pass.
+  const consumerCaveats = unverifiedConsumerCaveats(artefact, dod, delegation.checkPlacements);
+  if (consumerCaveats.length > 0 && (verdict.outcome ?? (verdict.pass ? "pass" : "fail")) === "pass") {
+    verdict = { ...verdict, pass: false, outcome: "unverifiable", reasons: [...verdict.reasons, ...consumerCaveats], caveats: [...(verdict.caveats ?? []), ...consumerCaveats] };
+  }
   // I8 (cross-repo P1.8): a pass names the perimeter it was scoped to. Evidence only: the outcome is unchanged. QA-1 F6: a pass
   // renders its notes, not its reasons (buildAcceptedSuffix), so the line is a note too; a note never makes the pass unverified.
   if (artefact.perimeter !== undefined && artefact.perimeter.roots.length > 0
@@ -480,6 +492,32 @@ export async function accept(
   }
 
   return gateResult(verdict, dodSource, deps.strictUnverifiable);
+}
+
+/** OD2: the check kinds that exercise a consumer; `fileExists` and `schemaMatch` do not. */
+const CONSUMER_CHECK_KINDS: ReadonlySet<string> = new Set(["testsPass", "buildPasses", "lintClean", "run"]);
+
+/**
+ * D6 (cross-repo P2b.4, OD2): one caveat per consumer of W (artefact.perimeter.consumers) that no consumer check is placed in
+ * (placement.top equals the consumer root, `perimeterKey` normalisation). [] when there is no perimeter, no consumer, or the
+ * change set is empty.
+ */
+function unverifiedConsumerCaveats(
+  artefact: Artefact,
+  dod: DoD,
+  placements: readonly (CheckPlacement | undefined)[] | undefined,
+): string[] {
+  const consumers = artefact.perimeter?.consumers;
+  if (consumers === undefined || consumers.length === 0 || artefact.changedFiles.length === 0) return [];
+  const checks = dod.kind === "deterministic" ? dod.checks ?? [] : [];
+  const covered = new Set<string>();
+  checks.forEach((check, index) => {
+    const top = placements?.[index]?.top;
+    if (top !== undefined && CONSUMER_CHECK_KINDS.has(check.kind)) covered.add(perimeterKey(top));
+  });
+  return consumers
+    .filter(consumer => !covered.has(perimeterKey(consumer.root)))
+    .map(consumer => `${consumer.name ?? consumer.root} at ${consumer.root} links this work root (node_modules/${consumer.entry}) and no check ran there; add a check such as: check: testsPass cwd="${consumer.root}" scope=full`);
 }
 
 /** I5 (P0.3): the caveat for an empty change set when the producer ran tools whose writes the router cannot observe. */
