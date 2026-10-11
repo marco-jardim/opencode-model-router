@@ -18,6 +18,17 @@ export interface ToolTargets {
   roots: string[];
   /** Tools whose effects cannot be extracted from the arguments. */
   uncovered?: "shell" | "execute";
+  /**
+   * A `router_git_*` call whose paths are relative to the repository top level, resolved against `cwd`
+   * because the caller gave no `gitRoot`: the work root may be below the top level, so they may be wrong.
+   */
+  gitRootAssumed?: true;
+}
+
+/** Optional context for `toolTargets`. */
+export interface ToolTargetsOptions {
+  /** Absolute repository top level: the base of `router_git_*` paths (git-tools.ts takes them relative to it). */
+  gitRoot?: string;
 }
 
 /** The tools that mutate the workspace; mirrors `WRITE_TOOLS` in src/verify/dispatch.ts (pinned by a test). */
@@ -26,8 +37,17 @@ export const WRITE_CLASS: ReadonlySet<string> = new Set(["write", "edit", "multi
 /** The apply_patch header lines that name a file; verbatim from the dispatch.ts change-set parser. */
 const PATCH_HEADER = /^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)$/gm;
 
-/** Path argument keys, in the order `extractChangedFile` (src/verify/dispatch.ts) reads them. */
-const PATH_KEYS = ["filePath", "path", "file"] as const;
+/**
+ * Path argument keys: the ones `extractChangedFile` (src/verify/dispatch.ts) reads plus the host's `file_path`.
+ * Every non-empty string among them is a target (the host may honour any of them, so first-wins is unsafe).
+ */
+const PATH_KEYS = ["filePath", "path", "file", "file_path"] as const;
+
+/** The apply_patch argument keys the v2 host reads, in order; the first string wins (even when empty). */
+const PATCH_KEYS = ["patchText", "patch_text", "patch", "input"] as const;
+
+/** The header prefixes of the v2 host's patch format (`patchPaths` in src/compat/v2-hooks.ts). */
+const HOST_PATCH_HEADERS = ["*** Add File:", "*** Update File:", "*** Delete File:", "*** Move to:"] as const;
 
 function record(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
@@ -38,6 +58,26 @@ export function applyPatchHeaderPaths(args: unknown): string[] {
   const a = args && typeof args === "object" ? args as Record<string, unknown> : {};
   const patch = typeof a.patchText === "string" ? a.patchText : typeof a.patch === "string" ? a.patch : "";
   return [...patch.matchAll(PATCH_HEADER)].map(m => m[1].trim());
+}
+
+/**
+ * The paths of a patch as the v2 host parses it (same semantics as `patchPaths` in src/compat/v2-hooks.ts, which this
+ * module may not import): header lines may have leading blanks. Undefined when a header names no path or no header is
+ * found, i.e. the patch is unreadable and its targets unknown.
+ */
+function hostPatchPaths(a: Record<string, unknown>): string[] | undefined {
+  const text = PATCH_KEYS.map(key => a[key]).find(value => typeof value === "string");
+  if (typeof text !== "string") return undefined;
+  const paths: string[] = [];
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trimStart();
+    const header = HOST_PATCH_HEADERS.find(prefix => line.startsWith(prefix));
+    if (header === undefined) continue;
+    const path = line.slice(header.length).trim();
+    if (path === "") return undefined;
+    paths.push(path);
+  }
+  return paths.length > 0 ? paths : undefined;
 }
 
 /** `p` resolved against `base`; undefined when it would stay relative (no absolute base, relative `p`). */
@@ -54,13 +94,14 @@ function nonEmpty(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
-/** The first non-empty string among the path keys of `a`, if any. */
-function pathArg(a: Record<string, unknown>): string | undefined {
+/** Every non-empty string among the path keys of `a`. */
+function pathArgs(a: Record<string, unknown>): string[] {
+  const out: string[] = [];
   for (const key of PATH_KEYS) {
     const value = nonEmpty(a[key]);
-    if (value !== undefined) return value;
+    if (value !== undefined) out.push(value);
   }
-  return undefined;
+  return out;
 }
 
 function resolved(values: readonly (string | undefined)[], cwd: string): string[] {
@@ -85,8 +126,19 @@ const GLOB_CHARS = /[*?[\]{}()!]/;
  * glob-free segments of an absolute pattern or one starting with `..`. Undefined otherwise.
  */
 function globPrefix(pattern: string): string | undefined {
-  const segments = pattern.split(/[\\/]/);
-  if (!isAbsolute(pattern) && segments[0] !== "..") return undefined;
+  let segments = pattern.split(/[\\/]/);
+  if (!isAbsolute(pattern)) {
+    // Normalise lexically first: `src/../../w1/**` and `./../w1/**` leave the root, `src/../x/*` does not.
+    const normal: string[] = [];
+    for (const segment of segments) {
+      if (segment === "" || segment === ".") continue;
+      if (segment !== "..") normal.push(segment);
+      else if (normal.length > 0 && normal[normal.length - 1] !== "..") normal.pop();
+      else normal.push("..");
+    }
+    if (normal[0] !== "..") return undefined;
+    segments = normal;
+  }
   const fixed: string[] = [];
   let sawGlob = false;
   for (const segment of segments) {
@@ -105,14 +157,13 @@ function none(): ToolTargets {
 }
 
 function writeTargets(tool: string, a: Record<string, unknown>, cwd: string): ToolTargets {
-  let raw: (string | undefined)[];
   if (tool === "patch" || tool === "apply_patch") {
-    raw = applyPatchHeaderPaths(a);
-  } else {
-    raw = [pathArg(a)];
-    if (tool === "multiedit" && Array.isArray(a.edits)) {
-      for (const edit of a.edits) raw.push(pathArg(record(edit)));
-    }
+    // An unreadable patch has unknown targets: a write of nothing the caller can name.
+    return { access: "write", paths: resolved(hostPatchPaths(a) ?? [], cwd), roots: [] };
+  }
+  const raw = pathArgs(a);
+  if (tool === "multiedit" && Array.isArray(a.edits)) {
+    for (const edit of a.edits) raw.push(...pathArgs(record(edit)));
   }
   return { access: "write", paths: resolved(raw, cwd), roots: [] };
 }
@@ -132,10 +183,27 @@ function gitDiffReadsWorkingTree(a: Record<string, unknown>): boolean {
   return !ref.includes("..");
 }
 
-function classify(tool: string, a: Record<string, unknown>, cwd: string): ToolTargets {
+/** A `router_git_*` result: paths are relative to the repository top level, so resolved against `gitRoot`. */
+function gitTargets(
+  result: ToolTargets,
+  a: Record<string, unknown>,
+  cwd: string,
+  opts: ToolTargetsOptions | undefined,
+): ToolTargets {
+  const gitRoot = nonEmpty(opts?.gitRoot);
+  const base = gitRoot !== undefined && isAbsolute(gitRoot) ? gitRoot : undefined;
+  const dir = nonEmpty(a.path);
+  // Without a path the tools list the work root (git-tools.ts scopes the pathspec to it), so that is the root.
+  const out: ToolTargets = result.access === "read"
+    ? { ...result, paths: dir === undefined ? [] : resolved([dir], base ?? cwd) }
+    : { ...result, roots: resolved([dir ?? cwd], dir === undefined ? cwd : base ?? cwd) };
+  return base === undefined ? { ...out, gitRootAssumed: true } : out;
+}
+
+function classify(tool: string, a: Record<string, unknown>, cwd: string, opts?: ToolTargetsOptions): ToolTargets {
   switch (tool) {
     case "read":
-      return { access: "read", paths: resolved([pathArg(a)], cwd), roots: [] };
+      return { access: "read", paths: resolved(pathArgs(a), cwd), roots: [] };
     case "write":
     case "edit":
     case "multiedit":
@@ -162,13 +230,13 @@ function classify(tool: string, a: Record<string, unknown>, cwd: string): ToolTa
     case "router_git_blame": {
       // A blame at a ref reads committed content only; without one it reads the working-tree file.
       if ((nonEmpty(a.ref)?.trim() ?? "") !== "") return none();
-      return { access: "read", paths: resolved([nonEmpty(a.path)], cwd), roots: [] };
+      return gitTargets({ access: "read", paths: [], roots: [] }, a, cwd, opts);
     }
     case "router_git_diff":
-      return gitDiffReadsWorkingTree(a) ? { access: "search", paths: [], roots: searchRoots(a, cwd) } : none();
+      return gitDiffReadsWorkingTree(a) ? gitTargets({ access: "search", paths: [], roots: [] }, a, cwd, opts) : none();
     case "router_git_status":
     case "router_git_ls_files":
-      return { access: "search", paths: [], roots: searchRoots(a, cwd) };
+      return gitTargets({ access: "search", paths: [], roots: [] }, a, cwd, opts);
     case "router_git_log":
     case "router_git_show":
       return none();
@@ -181,11 +249,15 @@ function classify(tool: string, a: Record<string, unknown>, cwd: string): ToolTa
   }
 }
 
-/** What the tool call `tool(args)` touches, with `cwd` (absolute) as the base for relative paths. Never throws. */
-export function toolTargets(tool: string, args: unknown, cwd: string): ToolTargets {
+/**
+ * What the tool call `tool(args)` touches, with `cwd` (absolute) as the base for relative paths. `router_git_*` paths
+ * are relative to the repository top level and resolve against `opts.gitRoot`; without it they fall back to `cwd` and
+ * the result carries `gitRootAssumed: true`. Never throws.
+ */
+export function toolTargets(tool: string, args: unknown, cwd: string, opts?: ToolTargetsOptions): ToolTargets {
   const name = typeof tool === "string" ? tool.toLowerCase() : "";
   try {
-    return classify(name, record(args), typeof cwd === "string" ? cwd : "");
+    return classify(name, record(args), typeof cwd === "string" ? cwd : "", opts);
   } catch {
     // Unreachable for string inputs; a write-class tool stays a write so a lease is not skipped.
     return WRITE_CLASS.has(name) ? { access: "write", paths: [], roots: [] } : none();

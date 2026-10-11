@@ -1,14 +1,16 @@
 import { execSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   createLeaseRegistry,
+  foldKeyPath,
   formatRunNote,
   keyOf,
   type Holder,
   type HolderInput,
+  type LeaseActor,
   type LeaseOptions,
   type LeaseRegistry,
   type LeaseSeams,
@@ -16,6 +18,8 @@ import {
   type PathKey,
   type Unkeyable,
 } from "../../src/router/leases";
+import { canonicalPath as canonicalPathFromDispatch } from "../../src/verify/dispatch";
+import { canonicalPath } from "../../src/verify/canonical-path";
 import { removeDirWhenReleased } from "../helpers/remove-dir";
 
 const win = process.platform === "win32";
@@ -117,7 +121,7 @@ function holdingX(opts: Partial<LeaseOptions> = {}): Rig {
   return r;
 }
 
-const holderA = { holderID: "A", tree: "/w1", isChild: true, scope: "until-complete", acquiredAt: 1_000 };
+const holderA = { holderID: "A", tree: "/w1", isChild: true, scope: "until-complete", acquiredAt: 1_000, lastSeenAt: 1_000 };
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Normalization against the real filesystem.
@@ -137,10 +141,7 @@ describe("keyOf on the real filesystem", () => {
   let link = "";
   let outsideDir = "";
   let seams: LeaseSeams;
-  const fold = (text: string): string => {
-    const slashed = text.replace(/\\/g, "/");
-    return win ? slashed.toLowerCase() : slashed;
-  };
+  const fold = (text: string): string => foldKeyPath(text);
 
   beforeAll(() => {
     root = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-leases-")));
@@ -168,14 +169,14 @@ describe("keyOf on the real filesystem", () => {
     await removeDirWhenReleased(root);
   }, 30_000);
 
-  const expectedLogical = () => `r:R${NUL}${win ? "src/a.ts" : "Src/A.ts"}`;
+  const expectedLogical = () => `r:R${NUL}${win ? "SRC/A.TS" : "Src/A.ts"}`;
 
   it("keys an existing file inside a repository by repository and relative path", () => {
     const key = asKey(keyOf(file, root, seams));
     expect(key.logical).toBe(expectedLogical());
     expect(key.repo).toBe("R");
     expect(key.tree).toBe(fold(repoDir));
-    expect(key.rel).toBe(win ? "src/a.ts" : "Src/A.ts");
+    expect(key.rel).toBe(win ? "SRC/A.TS" : "Src/A.ts");
     expect(key.physical).toBe(fold(file));
     expect(key.display).toBe(file);
   });
@@ -232,12 +233,12 @@ describe("keyOf on the real filesystem", () => {
     const viaLong = asKey(keyOf(join(longDir, "b.ts"), root, seams));
     expect(viaShort.logical).toBe(viaLong.logical);
     expect(viaShort.physical).toBe(viaLong.physical);
-    expect(viaShort.logical).toBe(`r:R${NUL}longdirectoryname/b.ts`);
+    expect(viaShort.logical).toBe(`r:R${NUL}LONGDIRECTORYNAME/B.TS`);
   });
 
   it("keys a file that does not exist yet by its existing ancestor", () => {
     const fresh = asKey(keyOf(join(srcDir, "New", "Deep.ts"), root, seams));
-    expect(fresh.logical).toBe(`r:R${NUL}${win ? "src/new/deep.ts" : "Src/New/Deep.ts"}`);
+    expect(fresh.logical).toBe(`r:R${NUL}${win ? "SRC/NEW/DEEP.TS" : "Src/New/Deep.ts"}`);
     const viaLink = asKey(keyOf(join(link, "New", "Deep.ts"), root, seams));
     expect(viaLink.logical).toBe(fresh.logical);
   });
@@ -330,11 +331,17 @@ describe("keyOf on the real filesystem", () => {
 
     it.runIf(win)("rejects drive-relative and device forms", () => {
       expect(keyOf("C:foo.ts", root, seams)).toEqual({ unkeyable: "drive-relative path" });
-      expect(keyOf("\\\\.\\C:\\x.ts", root, seams)).toEqual({ unkeyable: "device path" });
       expect(keyOf("\\\\.\\pipe\\x", root, seams)).toEqual({ unkeyable: "device path" });
       expect(keyOf("\\\\?\\Volume{1234}\\x.ts", root, seams)).toEqual({ unkeyable: "device path" });
       expect(keyOf("\\\\?\\GLOBALROOT\\Device\\HarddiskVolume1\\x", root, seams)).toEqual({ unkeyable: "device path" });
-      expect(keyOf("x.ts", "\\\\.\\C:\\", seams)).toEqual({ unkeyable: "device path" });
+      expect(keyOf("x.ts", "\\\\.\\pipe\\", seams)).toEqual({ unkeyable: "device path" });
+    });
+
+    it.runIf(win)("unwraps the device spellings of a drive path", () => {
+      const direct = asKey(keyOf(file, root, seams));
+      expect(asKey(keyOf(`\\\\.\\${file}`, root, seams)).logical).toBe(direct.logical);
+      expect(asKey(keyOf(`\\??\\${file}`, root, seams)).logical).toBe(direct.logical);
+      expect(asKey(keyOf("Src\\A.ts", `\\\\.\\${repoDir}`, seams)).logical).toBe(direct.logical);
     });
 
     it.runIf(win)("rejects a path segment that is empty once stream and trailing dots are stripped", () => {
@@ -394,20 +401,22 @@ describe("keyOf with virtual path rules", () => {
     ]) {
       expect(asKey(keyOf(raw, "C:\\", seams, "win32")).physical, raw).toBe(direct.physical);
     }
-    expect(direct.physical).toBe("c:/repo/src/a.ts");
-    expect(direct.logical).toBe("x:c:/repo/src/a.ts");
+    expect(direct.physical).toBe("C:/REPO/SRC/A.TS");
+    expect(direct.logical).toBe("x:C:/REPO/SRC/A.TS");
   });
 
   it("unwraps an extended UNC path and keeps a UNC root", () => {
     const seams = mk([]);
-    expect(asKey(keyOf("\\\\?\\UNC\\Host\\Share\\Dir\\F.ts", "C:\\", seams, "win32")).physical).toBe("//host/share/dir/f.ts");
-    expect(asKey(keyOf("\\\\Host\\Share\\Dir\\F.ts", "C:\\", seams, "win32")).physical).toBe("//host/share/dir/f.ts");
+    expect(asKey(keyOf("\\\\?\\UNC\\Host\\Share\\Dir\\F.ts", "C:\\", seams, "win32")).physical).toBe("//HOST/SHARE/DIR/F.TS");
+    expect(asKey(keyOf("\\\\Host\\Share\\Dir\\F.ts", "C:\\", seams, "win32")).physical).toBe("//HOST/SHARE/DIR/F.TS");
+    expect(asKey(keyOf("\\\\.\\UNC\\Host\\Share\\Dir\\F.ts", "C:\\", seams, "win32")).physical).toBe("//HOST/SHARE/DIR/F.TS");
+    expect(asKey(keyOf("\\??\\UNC\\Host\\Share\\Dir\\F.ts", "C:\\", seams, "win32")).physical).toBe("//HOST/SHARE/DIR/F.TS");
   });
 
   it("rejects win32 unkeyable forms on any host", () => {
     const seams = mk(["C:\\"]);
     expect(keyOf("C:foo", "C:\\", seams, "win32")).toEqual({ unkeyable: "drive-relative path" });
-    expect(keyOf("\\\\.\\C:\\x", "C:\\", seams, "win32")).toEqual({ unkeyable: "device path" });
+    expect(keyOf("\\\\.\\pipe\\x", "C:\\", seams, "win32")).toEqual({ unkeyable: "device path" });
     expect(keyOf("C:\\Missing\\PROGRA~1\\x", "C:\\", seams, "win32")).toEqual({ unkeyable: "8.3 short name in a missing path" });
     expect(keyOf("C:\\a\\...\\x", "C:\\", seams, "win32")).toEqual({ unkeyable: "empty path segment" });
     expect(keyOf("rel", "rel", seams, "win32")).toEqual({ unkeyable: "relative path without an absolute base" });
@@ -418,8 +427,8 @@ describe("keyOf with virtual path rules", () => {
     expect(asKey(keyOf("/lnk", "/", posix, "linux")).physical).toBe("/w1");
     expect(asKey(keyOf("/", "/", posix, "linux")).physical).toBe("/");
     const winSeams = mk(["C:\\"], { "C:\\drive": "C:\\", "C:\\share": "\\\\host\\share\\" });
-    expect(asKey(keyOf("C:\\drive", "C:\\", winSeams, "win32")).physical).toBe("c:/");
-    expect(asKey(keyOf("C:\\share", "C:\\", winSeams, "win32")).physical).toBe("//host/share/");
+    expect(asKey(keyOf("C:\\drive", "C:\\", winSeams, "win32")).physical).toBe("C:/");
+    expect(asKey(keyOf("C:\\share", "C:\\", winSeams, "win32")).physical).toBe("//HOST/SHARE/");
   });
 
   it("rejects a real path that turns into a device form", () => {
@@ -506,15 +515,30 @@ describe("conflict matrix (child A holds /w1/src/x.ts)", () => {
       expect(reg.acquireWrite(B, "/w1/src/y.ts")).toMatchObject({ ok: true });
     });
 
-    it("is allowed in another tree, and lists the unkeyed paths", () => {
+    it("is allowed in another repository, and lists the unkeyed paths", () => {
       const { reg } = holdingX();
-      expect(reg.acquireWrite(C, null)).toEqual({ ok: true, leased: [], reentrant: [], unkeyed: [] });
-      expect(reg.acquireWrite(C, ["", "/w2/src/z.ts"])).toEqual({
+      const s = child("S1", "/s1");
+      expect(reg.acquireWrite(s, null)).toEqual({ ok: true, leased: [], reentrant: [], unkeyed: [] });
+      expect(reg.acquireWrite(s, ["", "/s1/src/z.ts"])).toEqual({
         ok: true,
-        leased: ["/w2/src/z.ts"],
+        leased: ["/s1/src/z.ts"],
         reentrant: [],
         unkeyed: [""],
       });
+    });
+
+    it("is refused for another worktree of the repository that another owner leases in (QA-1.3-17)", () => {
+      const { reg } = holdingX();
+      expect(reg.acquireWrite(C, null)).toEqual({ ok: false, reason: "unknown-target", holders: [holderA] });
+      expect(reg.acquireWrite(C, ["", "/w2/src/z.ts"])).toMatchObject({ ok: false, reason: "unknown-target" });
+      expect(reg.acquireWrite(C, "/w2/src/z.ts")).toMatchObject({ ok: true });
+    });
+
+    it("keeps the per-tree behaviour for a holder outside every repository", () => {
+      const { reg } = rig();
+      expect(reg.acquireWrite(A, "/out/src/f.ts")).toMatchObject({ ok: true });
+      expect(reg.acquireWrite(child("O", "/out"), null)).toMatchObject({ ok: true });
+      expect(reg.acquireWrite(child("O2", "/out"), "")).toMatchObject({ ok: true });
     });
 
     it("is allowed when no other holder leases anything in the tree, and ignores the holder's own leases", () => {
@@ -699,7 +723,7 @@ describe("conflict matrix (child A holds /w1/src/x.ts)", () => {
       reg.acquireWrite(B, "/w1/src/y.ts");
       const result = reg.checkRun(actor(C), "/w1");
       expect(result).toMatchObject({ ok: false, reason: "run-refused", fileCount: 3 });
-      if (result.ok) throw new Error("expected refusal");
+      if (result.ok || result.reason !== "run-refused") throw new Error("expected refusal");
       expect(result.holders.map((holder) => holder.holderID)).toEqual(["A", "B"]);
     });
   });
@@ -901,11 +925,14 @@ describe("scopes", () => {
     expect(reg.checkRun(actor(C), "/s1")).toEqual({ ok: true });
   });
 
-  it("does not count a holder's leases outside any repository in a tree", () => {
+  it("counts a holder's leases outside any repository only under the run directory (QA-1.3-12)", () => {
     const { reg } = rig({ runMode: "refuse" });
     reg.acquireWrite(A, "/out/src/f.ts");
-    expect(reg.checkRun(actor(B), "/out")).toEqual({ ok: true });
+    expect(reg.checkRun(actor(B), "/out")).toMatchObject({ ok: false, reason: "run-refused", fileCount: 1 });
+    expect(reg.checkRun(actor(B), "/out/src")).toMatchObject({ ok: false, reason: "run-refused", fileCount: 1 });
+    expect(reg.checkRun(actor(B), "/s1")).toEqual({ ok: true });
     expect(reg.release("A")).toEqual({ released: 1, retained: 0 });
+    expect(reg.checkRun(actor(B), "/out")).toEqual({ ok: true });
   });
 });
 
@@ -1133,7 +1160,7 @@ describe("snapshot and restore", () => {
     const snap: LeaseSnapshot = {
       version: 1,
       takenAt: 1,
-      holders: [{ holderID: "A", tree: "/w1", isChild: true, scope: "until-complete", acquiredAt: 0 }],
+      holders: [{ holderID: "A", tree: "/w1", isChild: true, scope: "until-complete", acquiredAt: 0, lastSeenAt: 0 }],
       leases: [],
     };
     expect(reg.restore(snap)).toEqual({ ok: true, leases: 0 });
@@ -1165,5 +1192,708 @@ describe("formatRunNote", () => {
     expect(formatRunNote(run.contaminatedBy, run.fileCount)).toBe(
       "[router] ran while A edits 1 file(s); result may be contaminated",
     );
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Phase 1.3 QA round 1.
+// ---------------------------------------------------------------------------------------------------------------------
+
+const Y = "/w1/src/y.ts";
+
+/** A registry on win32 rules over a virtual C: drive whose repository `R` has its tree at `C:\Repo`. */
+function winRig(links: Record<string, string> = {}, opts: Partial<LeaseOptions> = {}) {
+  const fs = fakeFs(["C:\\", "C:\\Repo", "C:\\Repo\\src", "C:\\Other"], links);
+  const clock = { now: 1_000 };
+  const answer = { repo: "R", tree: "C:/Repo" };
+  const seams: LeaseSeams = {
+    realpath: (p) => fs.realpath(p),
+    repoKeyOf: (dir) => (/^c:[\\/]repo(?:[\\/]|$)/i.test(dir) ? answer : undefined),
+    now: () => clock.now,
+  };
+  const reg = createLeaseRegistry(seams, { runMode: "annotate", platform: "win32", ...opts });
+  return { reg, fs, clock, seams, answer };
+}
+
+const WA: HolderInput = { holderID: "A", tree: "C:\\Repo", isChild: true, scope: "until-complete" };
+const WB: HolderInput = { ...WA, holderID: "B" };
+const WX = "C:\\Repo\\src\\x.ts";
+
+describe("QA-1.3-2: ownership by task", () => {
+  const producer = child("P", "/w1", { scope: "until-integrated", taskRef: "T" });
+  const retry = child("P2", "/w1", { taskRef: "T" });
+  const verifier = { holderID: "V", tree: "/w1", isChild: true, taskRef: "T" };
+  const other = child("U1", "/w1", { taskRef: "U" });
+  const otherActor = { ...actor(other), taskRef: "U" };
+
+  it("lets a retry, its verifier and its QA child through, and still refuses a child of another task", () => {
+    const { reg } = rig({ runMode: "refuse" });
+    expect(reg.acquireWrite(producer, [X, Y])).toMatchObject({ ok: true, leased: [X, Y] });
+    expect(reg.acquireWrite(retry, X)).toEqual({ ok: true, leased: [], reentrant: [X], unkeyed: [] });
+    expect(reg.snapshot().leases).toHaveLength(2);
+    expect(reg.snapshot().holders.map((holder) => holder.holderID)).toEqual(["P"]);
+    expect(reg.checkRead(verifier, X)).toEqual({ ok: true });
+    expect(reg.checkRun(verifier, "/w1")).toEqual({ ok: true });
+    expect(reg.filterSearchResults(verifier, "/w1", [X, "src/y.ts"])).toEqual({
+      kept: [X, "src/y.ts"],
+      omitted: 0,
+      holders: [],
+    });
+    expect(reg.acquireWrite(other, X)).toMatchObject({ ok: false, reason: "held" });
+    expect(reg.checkRead(otherActor, X)).toMatchObject({ ok: false, reason: "underEdit", holders: [{ holderID: "P" }] });
+    expect(reg.checkRun(otherActor, "/w1")).toMatchObject({ ok: false, reason: "run-refused", fileCount: 2 });
+    expect(reg.filterSearchResults(otherActor, "/w1", [X])).toMatchObject({ omitted: 1 });
+  });
+
+  it("does not count a re-entrant write against the cap", () => {
+    const { reg } = rig({ cap: 1 });
+    expect(reg.acquireWrite(producer, X)).toMatchObject({ ok: true });
+    expect(reg.acquireWrite(retry, X)).toMatchObject({ ok: true, leased: [], reentrant: [X] });
+  });
+
+  it("leases a new file of the retry under the same owner", () => {
+    const { reg } = rig();
+    reg.acquireWrite(producer, X);
+    expect(reg.acquireWrite(retry, Y)).toMatchObject({ ok: true, leased: [Y] });
+    expect(reg.acquireWrite(producer, Y)).toMatchObject({ ok: true, reentrant: [Y] });
+    expect(reg.acquireWrite(other, Y)).toMatchObject({ ok: false, reason: "held" });
+    expect(reg.checkRun({ ...actor(retry), taskRef: "T" }, "/w1")).toEqual({ ok: true });
+  });
+
+  it("exempts the same owner from an unknown-target refusal", () => {
+    const { reg } = rig();
+    reg.acquireWrite(producer, X);
+    expect(reg.acquireWrite(retry, null)).toMatchObject({ ok: true });
+    expect(reg.acquireWrite(other, null)).toMatchObject({ ok: false, reason: "unknown-target" });
+  });
+
+  it("does not mix up a taskRef with a holderID of the same text", () => {
+    const { reg } = rig();
+    reg.acquireWrite(child("T", "/w1"), X);
+    expect(reg.acquireWrite(child("Q", "/w1", { taskRef: "T" }), X)).toMatchObject({ ok: false, reason: "held" });
+    expect(reg.checkRead({ ...actor(A), holderID: "Q", taskRef: "T" }, X)).toMatchObject({ ok: false, reason: "underEdit" });
+  });
+
+  it("keeps a holder without a taskRef its own owner", () => {
+    const { reg } = holdingX();
+    expect(reg.checkRead({ ...actor(B), taskRef: "T" }, X)).toMatchObject({ ok: false, reason: "underEdit" });
+  });
+});
+
+describe("QA-1.3-5: device spellings and fail-closed unkeyable paths", () => {
+  const GLOBAL = "\\\\?\\GLOBALROOT\\Device\\HarddiskVolume3\\Repo\\src\\x.ts";
+  const VOLUME = "\\\\?\\Volume{1234}\\Repo\\src\\x.ts";
+  const links = { [GLOBAL]: WX, [VOLUME]: `\\\\?\\${WX}` };
+
+  it("keys the DOS-device spellings of a drive path like the drive path", () => {
+    const { reg } = winRig();
+    expect(reg.acquireWrite(WA, WX)).toMatchObject({ ok: true });
+    for (const spelling of [
+      "\\\\.\\C:\\Repo\\src\\x.ts",
+      "\\\\?\\C:\\Repo\\src\\x.ts",
+      "\\??\\C:\\Repo\\src\\x.ts",
+      "//./c:/repo/src/X.ts",
+    ]) {
+      expect(reg.checkRead(actor(WB), spelling), spelling).toMatchObject({ ok: false, reason: "underEdit" });
+      expect(reg.acquireWrite(WB, spelling), spelling).toMatchObject({ ok: false, reason: "held" });
+    }
+  });
+
+  it("keys the device forms the filesystem resolves to a DOS path", () => {
+    const { reg } = winRig(links);
+    expect(reg.acquireWrite(WA, WX)).toMatchObject({ ok: true });
+    for (const spelling of [GLOBAL, VOLUME]) {
+      expect(reg.checkRead(actor(WB), spelling), spelling).toMatchObject({ ok: false, reason: "underEdit", path: WX });
+      expect(reg.acquireWrite(WB, spelling), spelling).toMatchObject({ ok: false, reason: "held" });
+    }
+    expect(asKey(keyOf(GLOBAL, "C:\\", winRig(links).seams, "win32")).physical).toBe("C:/REPO/SRC/X.TS");
+  });
+
+  it("refuses a child's read of an unresolvable device path while any other owner holds a lease", () => {
+    const { reg } = winRig();
+    const device = "\\\\?\\GLOBALROOT\\Device\\Nowhere\\x.ts";
+    expect(reg.checkRead(actor(WB), device)).toEqual({ ok: true });
+    reg.acquireWrite(WA, "C:\\Other\\f.ts");
+    const refused = reg.checkRead(actor(WB), device);
+    expect(refused).toMatchObject({ ok: false, reason: "underEdit", path: device, holders: [{ holderID: "A" }] });
+    expect(reg.checkRead({ ...actor(WA), isChild: false, holderID: "root" }, device)).toEqual({ ok: true });
+    expect(reg.checkRead(actor(WA), device)).toEqual({ ok: true });
+    expect(reg.checkRead(actor(WB), "")).toEqual({ ok: true });
+    expect(reg.filterSearchResults(actor(WB), "C:\\Repo", [device, "src\\y.ts"])).toMatchObject({
+      kept: ["src\\y.ts"],
+      omitted: 1,
+      holders: [{ holderID: "A" }],
+    });
+  });
+
+  it("refuses a child's write of an unresolvable device path while any other owner holds a lease", () => {
+    const { reg } = winRig();
+    const device = "\\\\.\\pipe\\x";
+    expect(reg.acquireWrite(WB, device)).toEqual({ ok: true, leased: [], reentrant: [], unkeyed: [device] });
+    reg.acquireWrite(WA, "C:\\Other\\f.ts");
+    expect(reg.acquireWrite(WB, device)).toMatchObject({ ok: false, reason: "unknown-target", holders: [{ holderID: "A" }] });
+    expect(reg.acquireWrite(WB, ["C:\\Repo\\src\\y.ts", "C:\\Repo\\Missing\\PROGRA~1\\z"])).toMatchObject({
+      ok: false,
+      reason: "unknown-target",
+    });
+    expect(reg.acquireWrite({ ...WB, holderID: "R", isChild: false }, device)).toMatchObject({ ok: true });
+    reg.release("A");
+    expect(reg.acquireWrite(WB, device)).toMatchObject({ ok: true });
+  });
+
+  it("exempts the same owner from the fail-closed refusal", () => {
+    const { reg } = winRig();
+    reg.acquireWrite({ ...WA, taskRef: "T" }, WX);
+    const device = "\\\\.\\pipe\\x";
+    expect(reg.checkRead({ ...actor(WB), taskRef: "T" }, device)).toEqual({ ok: true });
+    expect(reg.acquireWrite({ ...WB, taskRef: "T" }, device)).toMatchObject({ ok: true });
+  });
+
+  it("does not fail closed for empty, NUL or non-string paths", () => {
+    const { reg } = holdingX();
+    expect(reg.checkRead(actor(B), `a${NUL}b`)).toEqual({ ok: true });
+    expect(reg.checkRead(actor(B), 5 as unknown as string)).toEqual({ ok: true });
+  });
+});
+
+describe("QA-1.3-6: inputs outside the declared types", () => {
+  it("treats a path value that is not null, a string or an array as an unknown target, without throwing", () => {
+    const { reg } = holdingX();
+    const refused = { ok: false, reason: "unknown-target", holders: [holderA] };
+    for (const value of [5, undefined, {}, true, new Set<string>(), new Set([Y]), () => Y]) {
+      expect(reg.acquireWrite(B, value as unknown as string), String(value)).toEqual(refused);
+    }
+    expect(reg.acquireWrite(ROOT, 5 as unknown as string)).toEqual({ ok: true, leased: [], reentrant: [], unkeyed: [] });
+    expect(reg.acquireWrite(child("S1", "/s1"), undefined as unknown as string)).toMatchObject({ ok: true });
+  });
+
+  it("describes any array entry that is not a string without throwing", () => {
+    const { reg } = rig();
+    const hostile = { toString: () => { throw new Error("no"); } };
+    expect(reg.acquireWrite(A, [Symbol("s"), hostile, Y] as unknown as string[])).toMatchObject({ ok: true, leased: [Y] });
+  });
+
+  it("refuses an actor that is not a valid object, with invalid-holder", () => {
+    const { reg } = holdingX();
+    for (const value of [undefined, null, "B", 5, []]) {
+      const actorValue = value as unknown as LeaseActor;
+      expect(reg.checkRead(actorValue, X), String(value)).toMatchObject({ ok: false, reason: "invalid-holder" });
+      expect(reg.checkRun(actorValue, "/w1"), String(value)).toMatchObject({ ok: false, reason: "invalid-holder" });
+      expect(reg.filterSearchResults(actorValue, "/w1", [X]), String(value)).toMatchObject({
+        kept: [],
+        omitted: 1,
+        invalid: expect.any(String),
+      });
+    }
+  });
+
+  it("refuses an isChild that is not a boolean instead of treating the actor as root", () => {
+    const { reg } = holdingX();
+    for (const isChild of [undefined, "yes", 1, null]) {
+      const bad = { ...actor(B), isChild } as unknown as LeaseActor;
+      expect(reg.checkRead(bad, X)).toEqual({ ok: false, reason: "invalid-holder", message: "isChild must be a boolean" });
+      expect(reg.checkRun(bad, "/w1")).toMatchObject({ ok: false, reason: "invalid-holder" });
+    }
+  });
+
+  it("refuses a relative or missing tree and a bad holderID or taskRef of an actor", () => {
+    const { reg } = holdingX();
+    expect(reg.checkRead({ ...actor(B), tree: "w1" }, X)).toEqual({
+      ok: false,
+      reason: "invalid-holder",
+      message: "tree must be an absolute path",
+    });
+    expect(reg.checkRead({ ...actor(B), tree: undefined } as unknown as LeaseActor, X)).toMatchObject({ reason: "invalid-holder" });
+    expect(reg.checkRead({ ...actor(B), holderID: "" }, X)).toMatchObject({ reason: "invalid-holder" });
+    expect(reg.checkRead({ ...actor(B), taskRef: 3 } as unknown as LeaseActor, X)).toMatchObject({ reason: "invalid-holder" });
+  });
+
+  it("rejects a holder with a relative tree", () => {
+    const { reg } = rig();
+    expect(reg.acquireWrite({ ...A, tree: "w1" }, X)).toEqual({
+      ok: false,
+      reason: "invalid-holder",
+      message: "tree must be an absolute path",
+    });
+    expect(reg.acquireWrite({ ...A, tree: "./w1" }, X)).toMatchObject({ reason: "invalid-holder" });
+    expect(reg.snapshot().leases).toEqual([]);
+  });
+
+  it("answers a path or paths that are not strings without throwing", () => {
+    const { reg } = holdingX();
+    expect(reg.checkRead(actor(B), undefined as unknown as string)).toEqual({ ok: true });
+    expect(reg.checkRun(actor(B), undefined as unknown as string)).toEqual({ ok: true });
+    expect(reg.filterSearchResults(actor(B), undefined as unknown as string, undefined as unknown as string[])).toEqual({
+      kept: [],
+      omitted: 0,
+      holders: [],
+    });
+    expect(reg.filterSearchResults(actor(B), "/w1", [5, X] as unknown as string[])).toMatchObject({ omitted: 1 });
+  });
+});
+
+describe("QA-1.3-7: the sweep ages from lastSeenAt", () => {
+  const seen = (reg: LeaseRegistry) => pick(reg.snapshot().holders, 0).lastSeenAt;
+
+  it("refreshes lastSeenAt on every acquire (re-entrant too), read, search and run of the holder", () => {
+    const { reg, clock } = holdingX();
+    expect(seen(reg)).toBe(1_000);
+    clock.now = 2_000;
+    reg.acquireWrite(A, X);
+    expect(seen(reg)).toBe(2_000);
+    clock.now = 3_000;
+    reg.checkRead(actor(A), X);
+    expect(seen(reg)).toBe(3_000);
+    clock.now = 4_000;
+    reg.checkRun(actor(A), "/w1");
+    expect(seen(reg)).toBe(4_000);
+    clock.now = 5_000;
+    reg.filterSearchResults(actor(A), "/w1", ["src/x.ts"]);
+    expect(seen(reg)).toBe(5_000);
+    clock.now = 6_000;
+    reg.acquireWrite(A, Y);
+    expect(seen(reg)).toBe(6_000);
+    expect(pick(reg.snapshot().holders, 0).acquiredAt).toBe(1_000);
+  });
+
+  it("refreshes the holder of a lease a same-task session writes again", () => {
+    const { reg, clock } = rig();
+    reg.acquireWrite(child("P", "/w1", { taskRef: "T" }), X);
+    clock.now = 4_000;
+    reg.acquireWrite(child("P2", "/w1", { taskRef: "T" }), X);
+    expect(seen(reg)).toBe(4_000);
+  });
+
+  it("does not sweep a holder that keeps working", () => {
+    const { reg, clock } = holdingX();
+    clock.now = 1_000 + SIX_H - 1;
+    reg.acquireWrite(A, X);
+    clock.now = 1_000 + SIX_H;
+    expect(reg.sweep()).toEqual({ released: 0, holders: [] });
+    expect(reg.acquireWrite(B, X)).toMatchObject({ ok: false, reason: "held" });
+    clock.now = 1_000 + 2 * SIX_H - 1;
+    expect(reg.sweep()).toEqual({ released: 1, holders: ["A"] });
+  });
+
+  it("sweeps a stale until-complete holder on the spot when a write conflicts with it", () => {
+    const { reg, clock } = holdingX();
+    clock.now = 1_000 + SIX_H;
+    expect(reg.acquireWrite(B, X)).toEqual({ ok: true, leased: [X], reentrant: [], unkeyed: [] });
+    expect(reg.snapshot().holders.map((holder) => holder.holderID)).toEqual(["B"]);
+  });
+
+  it("re-evaluates a whole array after sweeping", () => {
+    const { reg, clock } = holdingX();
+    reg.acquireWrite(C, "/w2/src/z.ts");
+    clock.now = 1_000 + SIX_H - 1;
+    reg.acquireWrite(C, "/w2/src/z.ts");
+    clock.now = 1_000 + SIX_H;
+    expect(reg.acquireWrite(B, [Y, X, "/w2/src/z.ts"])).toMatchObject({ ok: false, reason: "held", path: "/w2/src/z.ts" });
+    expect(reg.snapshot().holders.map((holder) => holder.holderID)).toEqual(["C"]);
+  });
+
+  it("sweeps a stale holder named by a root write, a read, a run and an unknown-target write", () => {
+    for (const probe of [
+      (reg: LeaseRegistry) => reg.acquireWrite(ROOT, X),
+      (reg: LeaseRegistry) => reg.checkRead(actor(B), X),
+      (reg: LeaseRegistry) => reg.checkRun(actor(B), "/w1"),
+      (reg: LeaseRegistry) => reg.acquireWrite(B, null),
+      (reg: LeaseRegistry) => reg.filterSearchResults(actor(B), "/w1", [X]),
+    ]) {
+      const { reg, clock } = holdingX({ runMode: "refuse" });
+      clock.now = 1_000 + SIX_H;
+      const result = probe(reg);
+      expect(result).not.toMatchObject({ ok: false });
+      expect(result).not.toHaveProperty("omitted", 1);
+      expect(reg.snapshot().leases).toEqual([]);
+    }
+  });
+
+  it("never sweeps an until-integrated holder on the spot", () => {
+    const { reg, clock } = rig();
+    reg.acquireWrite(child("I", "/w1", { scope: "until-integrated", taskRef: "T" }), X);
+    clock.now = 1_000 + 10 * SIX_H;
+    expect(reg.acquireWrite(B, X)).toMatchObject({ ok: false, reason: "held" });
+  });
+
+  it("does not sweep a holder younger than the age on the spot", () => {
+    const { reg, clock } = holdingX();
+    clock.now = 1_000 + SIX_H - 1;
+    expect(reg.acquireWrite(B, X)).toMatchObject({ ok: false, reason: "held" });
+    expect(reg.checkRead(actor(B), X)).toMatchObject({ ok: false, reason: "underEdit" });
+  });
+});
+
+describe("QA-1.3-8: restore checks consistency", () => {
+  const base = (): LeaseSnapshot => {
+    const r = rig();
+    r.reg.acquireWrite(A, X);
+    r.reg.acquireWrite(child("O", "/out"), "/out/src/f.ts");
+    return r.reg.snapshot();
+  };
+  const withLease = (index: number, patch: Record<string, unknown>) => (snap: LeaseSnapshot): unknown => ({
+    ...snap,
+    leases: snap.leases.map((lease, at) => (at === index ? { ...lease, ...patch } : lease)),
+  });
+  const withHolder = (index: number, patch: Record<string, unknown>) => (snap: LeaseSnapshot): unknown => ({
+    ...snap,
+    holders: snap.holders.map((holder, at) => (at === index ? { ...holder, ...patch } : holder)),
+  });
+
+  const bad: [string, (snap: LeaseSnapshot) => unknown][] = [
+    ["an x: lease with a tree", withLease(1, { tree: "/out" })],
+    ["an r: lease without a tree", withLease(0, { tree: null })],
+    ["an r: lease whose physical lies outside its tree", withLease(0, { physical: "/w2/src/x.ts" })],
+    ["an r: lease whose physical is a sibling by prefix", withLease(0, { tree: "/w1/sr", physical: X })],
+    ["a physical path with backslashes", withLease(0, { physical: "\\w1\\src\\x.ts" })],
+    ["a physical path with a trailing slash", withLease(1, { physical: "/out/src/f.ts/", logical: "x:/out/src/f.ts/" })],
+    ["a tree with a trailing slash", withLease(0, { tree: "/w1/" })],
+    ["a logical key that does not match the physical path", withLease(0, { logical: `r:R${NUL}src/other.ts` })],
+    ["an x: key that does not match the physical path", withLease(1, { logical: "x:/out/src/g.ts" })],
+    ["a logical key without a key space", withLease(0, { logical: "R" })],
+    ["a relative holder tree", withHolder(0, { tree: "w1" })],
+    ["a non-numeric lastSeenAt", withHolder(0, { lastSeenAt: "now" })],
+    ["a non-finite lastSeenAt", withHolder(0, { lastSeenAt: Number.NaN })],
+  ];
+  for (const [name, corrupt] of bad) {
+    it(`rejects ${name} and leaves the state unchanged`, () => {
+      const { reg } = rig();
+      reg.acquireWrite(B, Y);
+      const before = reg.snapshot();
+      const result = reg.restore(corrupt(base()));
+      expect(result).toMatchObject({ ok: false, reason: "invalid-snapshot" });
+      expect(reg.snapshot()).toEqual(before);
+    });
+  }
+
+  it("clamps a stamp in the future to now()", () => {
+    const { reg, clock } = rig();
+    clock.now = 3_000;
+    const snap = withHolder(0, { acquiredAt: 9_000_000, lastSeenAt: 8_000_000 })(base());
+    expect(reg.restore(snap)).toEqual({ ok: true, leases: 2 });
+    const [first] = reg.snapshot().holders;
+    expect(first).toMatchObject({ acquiredAt: 3_000, lastSeenAt: 3_000 });
+    clock.now = 3_000 + SIX_H - 1;
+    // only the other holder, last seen at 1 000, is stale: the clamped one was last seen at now()
+    expect(reg.sweep().holders).toEqual(["O"]);
+  });
+
+  it("takes a holder without lastSeenAt as last seen when acquired", () => {
+    const { reg } = rig();
+    const snap = withHolder(0, { lastSeenAt: undefined, acquiredAt: 500 })(base());
+    expect(reg.restore(snap)).toEqual({ ok: true, leases: 2 });
+    expect(pick(reg.snapshot().holders, 0)).toMatchObject({ acquiredAt: 500, lastSeenAt: 500 });
+  });
+
+  it("drops the until-complete holders and their leases on request", () => {
+    const r = rig();
+    r.reg.acquireWrite(A, X);
+    r.reg.acquireWrite(child("I", "/w2", { scope: "until-integrated", taskRef: "T" }), "/w2/src/z.ts");
+    const snap = r.reg.snapshot();
+    const keep = rig();
+    expect(keep.reg.restore(snap, { dropCompleteHolders: true })).toEqual({ ok: true, leases: 1 });
+    expect(keep.reg.snapshot().holders.map((holder) => holder.holderID)).toEqual(["I"]);
+    expect(keep.reg.acquireWrite(B, X)).toMatchObject({ ok: true });
+    expect(rig().reg.restore(snap, { dropCompleteHolders: false })).toEqual({ ok: true, leases: 2 });
+    expect(rig().reg.restore(snap, {})).toEqual({ ok: true, leases: 2 });
+  });
+
+  it("still validates the leases of a dropped holder", () => {
+    const r = rig();
+    r.reg.acquireWrite(A, X);
+    const snap = withLease(0, { physical: "/w2/src/x.ts" })(r.reg.snapshot());
+    expect(rig().reg.restore(snap, { dropCompleteHolders: true })).toMatchObject({ ok: false, reason: "invalid-snapshot" });
+  });
+
+  it("checks a snapshot against the platform's normal form", () => {
+    const { reg } = winRig();
+    const holders = [{ ...WA, acquiredAt: 1, lastSeenAt: 1 }];
+    const lease = { logical: `r:R${NUL}SRC/X.TS`, physical: "C:/REPO/SRC/X.TS", tree: "C:/REPO", holderID: "A", display: WX };
+    const snapshot = (patch: Record<string, unknown>) => ({ version: 1, takenAt: 1, holders, leases: [{ ...lease, ...patch }] });
+    expect(reg.restore(snapshot({}))).toEqual({ ok: true, leases: 1 });
+    expect(reg.restore(snapshot({ physical: "c:/repo/src/x.ts" }))).toMatchObject({ ok: false });
+    expect(reg.restore(snapshot({ physical: "C:\\REPO\\SRC\\X.TS" }))).toMatchObject({ ok: false });
+    expect(reg.restore(snapshot({ tree: "C:/Repo" }))).toMatchObject({ ok: false });
+    expect(reg.checkRead(actor(WB), WX)).toMatchObject({ ok: false, reason: "underEdit" });
+  });
+});
+
+describe("QA-1.3-9: repoKeyOf answers are folded like physical keys", () => {
+  it("accepts a forward-slash, backslash, trailing-slash or differently cased answer alike", () => {
+    const logicals = new Set<string>();
+    for (const tree of ["C:/Repo", "C:\\Repo", "C:\\Repo\\", "c:/repo/", "C:/REPO"]) {
+      for (const repo of ["R", "r"]) {
+        const { seams, answer } = winRig();
+        answer.tree = tree;
+        answer.repo = repo;
+        const key = asKey(keyOf(WX, "C:\\", seams, "win32"));
+        expect(key.tree, tree).toBe("C:/REPO");
+        expect(key.repo).toBe("R");
+        expect(key.rel).toBe("SRC/X.TS");
+        logicals.add(key.logical);
+      }
+    }
+    expect([...logicals]).toEqual([`r:R${NUL}SRC/X.TS`]);
+  });
+
+  it("conflicts across spellings of the answer through the registry", () => {
+    const { reg, answer } = winRig();
+    expect(reg.acquireWrite(WA, WX)).toMatchObject({ ok: true });
+    answer.tree = "c:\\repo\\";
+    answer.repo = "r";
+    expect(reg.acquireWrite(WB, "c:/repo/SRC/x.ts")).toMatchObject({ ok: false, reason: "held" });
+  });
+
+  it("exports the fold function the adapter spells its answers with", () => {
+    expect(foldKeyPath("C:\\Repo\\", "win32")).toBe("C:/REPO");
+    expect(foldKeyPath("c:/repo", "win32")).toBe("C:/REPO");
+    expect(foldKeyPath("C:\\", "win32")).toBe("C:/");
+    expect(foldKeyPath("\\\\host\\share\\", "win32")).toBe("//HOST/SHARE/");
+    expect(foldKeyPath("/", "linux")).toBe("/");
+    expect(foldKeyPath("/Repo/Src//", "linux")).toBe("/Repo/Src");
+  });
+});
+
+describe("QA-1.3-10: case folding", () => {
+  it("folds each UTF-16 unit with toUpperCase on win32 only", () => {
+    expect(foldKeyPath("ΟΔΟΣ", "win32")).toBe(foldKeyPath("οδοσ", "win32"));
+    expect(foldKeyPath("ΟΔΟΣ", "win32")).toBe(foldKeyPath("οδος", "win32"));
+    expect(foldKeyPath("ſ", "win32")).toBe(foldKeyPath("s", "win32"));
+    expect(foldKeyPath("ſ", "win32")).toBe(foldKeyPath("S", "win32"));
+    expect(foldKeyPath("ΟΔΟΣ", "linux")).not.toBe(foldKeyPath("οδοσ", "linux"));
+    expect(foldKeyPath("ſ", "linux")).toBe("ſ");
+  });
+
+  it("keeps a unit whose upper case is longer than one unit, and leaves astral characters alone", () => {
+    expect(foldKeyPath("ß", "win32")).toBe("ß");
+    expect(foldKeyPath("ǰ", "win32")).toBe("ǰ");
+    expect(foldKeyPath("\u{10428}", "win32")).toBe("\u{10428}");
+    expect(foldKeyPath("é", "win32")).toBe("É");
+  });
+
+  it("conflicts two spellings that differ only by such letters", () => {
+    const { reg } = winRig();
+    expect(reg.acquireWrite(WA, "C:\\Repo\\src\\ΟΔΟΣ.ts")).toMatchObject({ ok: true });
+    expect(reg.acquireWrite(WB, "C:\\Repo\\src\\οδοσ.ts")).toMatchObject({ ok: false, reason: "held" });
+    expect(reg.acquireWrite(WA, "C:\\Repo\\src\\ſ.ts")).toMatchObject({ ok: true });
+    expect(reg.acquireWrite(WB, "C:\\Repo\\src\\S.TS")).toMatchObject({ ok: false, reason: "held" });
+  });
+});
+
+describe("QA-1.3-11: one logical key, several (physical, tree) pairs", () => {
+  const W2X = "/w2/src/x.ts";
+
+  it("records a re-entrant write in another tree and checks reads and runs in each", () => {
+    const { reg } = rig({ runMode: "refuse" });
+    expect(reg.acquireWrite(A, X)).toMatchObject({ ok: true });
+    expect(reg.checkRead(actor(C), W2X)).toEqual({ ok: true });
+    expect(reg.checkRun(actor(C), "/w2")).toEqual({ ok: true });
+    expect(reg.acquireWrite(A, W2X)).toEqual({ ok: true, leased: [], reentrant: [W2X], unkeyed: [] });
+    expect(reg.checkRead(actor(C), W2X)).toMatchObject({ ok: false, reason: "underEdit", holders: [{ holderID: "A" }] });
+    expect(reg.checkRead(actor(B), X)).toMatchObject({ ok: false, reason: "underEdit" });
+    expect(reg.checkRun(actor(C), "/w2")).toMatchObject({ ok: false, reason: "run-refused", fileCount: 1 });
+    expect(reg.checkRun(actor(C), "/w1")).toMatchObject({ ok: false, reason: "run-refused", fileCount: 1 });
+    expect(reg.filterSearchResults(actor(C), "/w2", ["src/x.ts", "src/y.ts"])).toMatchObject({ kept: ["src/y.ts"], omitted: 1 });
+    expect(reg.acquireWrite(C, W2X)).toMatchObject({ ok: false, reason: "held" });
+  });
+
+  it("counts one logical key once, and lets the same pair be recorded once", () => {
+    const { reg } = rig({ cap: 1 });
+    reg.acquireWrite(A, X);
+    expect(reg.acquireWrite(A, W2X)).toMatchObject({ ok: true, reentrant: [W2X] });
+    expect(reg.acquireWrite(A, W2X)).toMatchObject({ ok: true, reentrant: [W2X] });
+    expect(reg.snapshot().leases).toHaveLength(2);
+    expect(reg.acquireWrite(A, Y)).toMatchObject({ ok: false, reason: "cap", held: 1 });
+  });
+
+  it("adds the pair only when the whole array succeeds", () => {
+    const { reg } = holdingX();
+    reg.acquireWrite(C, "/w2/src/z.ts");
+    expect(reg.acquireWrite(A, [W2X, "/w2/src/z.ts"])).toMatchObject({ ok: false, reason: "held" });
+    expect(reg.snapshot().leases).toHaveLength(2);
+  });
+
+  it("ends every pair with the lease, and survives a snapshot round trip", () => {
+    const { reg, clock } = rig({ runMode: "refuse" });
+    reg.acquireWrite(A, X);
+    reg.acquireWrite(A, W2X);
+    const snap = JSON.parse(JSON.stringify(reg.snapshot())) as LeaseSnapshot;
+    expect(snap.leases.map((lease) => [lease.logical, lease.tree])).toEqual([
+      [REL_X_KEY, "/w1"],
+      [REL_X_KEY, "/w2"],
+    ]);
+    const second = rig({ runMode: "refuse" });
+    second.clock.now = clock.now;
+    expect(second.reg.restore(snap)).toEqual({ ok: true, leases: 1 });
+    expect(second.reg.snapshot()).toEqual(snap);
+    expect(second.reg.checkRead(actor(C), W2X)).toMatchObject({ ok: false, reason: "underEdit" });
+    expect(second.reg.release("A")).toEqual({ released: 1, retained: 0 });
+    expect(second.reg.checkRun(actor(C), "/w2")).toEqual({ ok: true });
+    expect(second.reg.checkRun(actor(C), "/w1")).toEqual({ ok: true });
+  });
+
+  it("rejects a repeated pair or the same key under two holders in a snapshot", () => {
+    const { reg } = rig();
+    reg.acquireWrite(A, X);
+    reg.acquireWrite(A, W2X);
+    const snap = reg.snapshot();
+    const [first, second] = snap.leases;
+    expect(rig().reg.restore({ ...snap, leases: [first, first] })).toMatchObject({ ok: false });
+    const other = { ...snap, holders: [...snap.holders, { ...holderA, holderID: "Z" }], leases: [first, { ...second, holderID: "Z" }] };
+    expect(rig().reg.restore(other)).toMatchObject({ ok: false, message: expect.stringMatching(/duplicate lease/) });
+  });
+});
+
+describe("QA-1.3-12: a run also counts the leases under the run directory", () => {
+  it("counts a lease of another repository (a nested tree or submodule) under the run directory", () => {
+    const { reg } = rig({ runMode: "refuse" });
+    reg.acquireWrite(child("S1", "/s1"), "/s1/src/z.ts");
+    expect(reg.checkRun(actor(B), "/w1")).toEqual({ ok: true });
+    expect(reg.checkRun(actor(B), "/")).toMatchObject({ ok: false, reason: "run-refused", fileCount: 1, holders: [{ holderID: "S1" }] });
+    expect(reg.checkRun(actor(ROOT), "/")).toMatchObject({ ok: true, contaminatedBy: [{ holderID: "S1" }], fileCount: 1 });
+    expect(reg.checkRun({ ...actor(B), taskRef: "T" }, "/s1")).toMatchObject({ ok: false });
+  });
+
+  it("counts x: keys under the directory and not the siblings of it", () => {
+    const { reg } = rig({ runMode: "refuse" });
+    reg.acquireWrite(A, ["/out/src/f.ts", X]);
+    expect(reg.checkRun(actor(B), "/out/src")).toMatchObject({ ok: false, fileCount: 1 });
+    expect(reg.checkRun(actor(B), "/out/sr")).toEqual({ ok: true });
+    expect(reg.checkRun(actor(C), "/w1")).toMatchObject({ ok: false, fileCount: 1 });
+    expect(reg.checkRun(actor(C), "/")).toMatchObject({ ok: false, fileCount: 2 });
+  });
+
+  it("counts a file once when it is under the directory and in its tree", () => {
+    const { reg } = holdingX();
+    expect(reg.checkRun(actor(B), "/w1/src")).toMatchObject({ ok: true, fileCount: 1 });
+  });
+});
+
+describe("QA-1.3-13: input size", () => {
+  const seams = (): LeaseSeams => {
+    const fs = fakeFs(["/", "/w1"]);
+    return { realpath: (p) => fs.realpath(p), repoKeyOf: () => undefined, now: () => 0 };
+  };
+
+  it("makes a path above 32 767 characters unkeyable", () => {
+    expect(keyOf(`/${"a".repeat(32_767)}`, "/", seams(), "linux")).toEqual({ unkeyable: "path too long" });
+    expect(keyOf("a".repeat(32_768), "/w1", seams(), "linux")).toEqual({ unkeyable: "path too long" });
+    expect(keyOf("a", `/${"b".repeat(32_767)}`, seams(), "linux")).toEqual({ unkeyable: "path too long" });
+    expect(keyOf(`/${"a".repeat(32_766)}`, "/", seams(), "linux")).toHaveProperty("physical");
+  });
+
+  it("makes a path above 4 096 segments unkeyable", () => {
+    expect(keyOf(`/${"a/".repeat(4_095)}`, "/", seams(), "linux")).toEqual({ unkeyable: "too many path segments" });
+    expect(keyOf(`${"a/".repeat(4_096)}`, "/w1", seams(), "linux")).toEqual({ unkeyable: "too many path segments" });
+    expect(keyOf(`/${"a/".repeat(4_094)}`, "/", seams(), "linux")).toHaveProperty("physical");
+    expect(keyOf(`C:\\${"a\\".repeat(4_095)}`, "C:\\", seams(), "win32")).toEqual({ unkeyable: "too many path segments" });
+  });
+
+  it("lists an oversize path as unkeyed and refuses it as an unknown target", () => {
+    const { reg } = holdingX();
+    const huge = "a".repeat(40_000);
+    expect(reg.acquireWrite(B, huge)).toMatchObject({ ok: false, reason: "unknown-target" });
+    expect(reg.acquireWrite(child("S1", "/s1"), huge)).toEqual({ ok: true, leased: [], reentrant: [], unkeyed: [huge] });
+    expect(reg.checkRead(actor(B), huge)).toEqual({ ok: true });
+  });
+});
+
+describe("QA-1.3-15: the NT object prefix", () => {
+  it("treats `\\??\\C:\\…` like `\\\\?\\C:\\…`", () => {
+    const { seams } = winRig();
+    const direct = asKey(keyOf(WX, "C:\\", seams, "win32"));
+    expect(asKey(keyOf(`\\??\\${WX}`, "C:\\", seams, "win32")).logical).toBe(direct.logical);
+    expect(asKey(keyOf("x.ts", "\\??\\C:\\Repo\\src", seams, "win32")).physical).toBe(direct.physical);
+    expect(asKey(keyOf("\\??\\UNC\\Host\\Share\\f.ts", "C:\\", seams, "win32")).physical).toBe("//HOST/SHARE/F.TS");
+  });
+
+  it("makes other `\\??\\` forms unkeyable", () => {
+    const { seams } = winRig();
+    expect(keyOf("\\??\\Volume{1}\\x", "C:\\", seams, "win32")).toEqual({ unkeyable: "device path" });
+    expect(keyOf("\\??\\C:x", "C:\\", seams, "win32")).toEqual({ unkeyable: "device path" });
+  });
+
+  it("does not treat the prefix as special on posix rules", () => {
+    const fs = fakeFs(["/"]);
+    const posixSeams: LeaseSeams = { realpath: (p) => fs.realpath(p), repoKeyOf: () => undefined, now: () => 0 };
+    expect(keyOf("/??/x", "/", posixSeams, "linux")).toHaveProperty("physical", "/??/x");
+  });
+});
+
+describe("QA-1.3-16: canonicalPath lives in a leaf module", () => {
+  it("is the same function from the leaf and from the verify dispatch module", () => {
+    expect(canonicalPathFromDispatch).toBe(canonicalPath);
+  });
+
+  it("falls back to the native realpath when the realpath argument is not a function", () => {
+    const cwd = process.cwd();
+    const native = canonicalPath(cwd);
+    expect(canonicalPath(cwd, "realpath" as unknown as (p: string) => string)).toBe(native);
+    expect(canonicalPath(cwd, null as unknown as (p: string) => string)).toBe(native);
+    expect(canonicalPath(cwd, undefined)).toBe(native);
+  });
+
+  it("resolves the nearest existing ancestor and keeps the missing tail", () => {
+    const seen: string[] = [];
+    const result = canonicalPath("/a/b/c", (p) => {
+      seen.push(p);
+      if (p.replace(/\\/g, "/").replace(/^[A-Za-z]:/, "") === "/a") return "/real-a";
+      throw new Error("ENOENT");
+    });
+    expect(result.replace(/\\/g, "/").replace(/^[A-Za-z]:/, "")).toBe("/real-a/b/c");
+    expect(seen.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("is imported by the lease registry from the leaf, and the leaf imports only node built-ins", () => {
+    const leaf = readFileSync(join(__dirname, "..", "..", "src", "verify", "canonical-path.ts"), "utf8");
+    const specifiers = [...leaf.matchAll(/^import .* from "([^"]+)";$/gm)].map((match) => match[1]);
+    expect(specifiers.length).toBeGreaterThan(0);
+    for (const specifier of specifiers) expect(specifier).toMatch(/^node:/);
+    const leases = readFileSync(join(__dirname, "..", "..", "src", "router", "leases.ts"), "utf8");
+    expect(leases).toContain('from "../verify/canonical-path"');
+    expect(leases).not.toContain('from "../verify/dispatch"');
+  });
+});
+
+describe("QA-1.3-17: an unknown-target write is refused per repository", () => {
+  it("is refused while another owner leases a file in any worktree of the same repository", () => {
+    const { reg } = rig();
+    reg.acquireWrite(C, "/w2/src/z.ts");
+    expect(reg.acquireWrite(B, null)).toEqual({
+      ok: false,
+      reason: "unknown-target",
+      holders: [expect.objectContaining({ holderID: "C" })],
+    });
+    expect(reg.acquireWrite(B, [""])).toMatchObject({ ok: false, reason: "unknown-target" });
+  });
+
+  it("is allowed in another repository and for the same owner", () => {
+    const { reg } = rig();
+    reg.acquireWrite(child("P", "/w2", { taskRef: "T" }), "/w2/src/z.ts");
+    expect(reg.acquireWrite(child("S1", "/s1"), null)).toMatchObject({ ok: true });
+    expect(reg.acquireWrite(child("P2", "/w1", { taskRef: "T" }), null)).toMatchObject({ ok: true });
+  });
+
+  it("is allowed again once the other owner's leases end", () => {
+    const { reg } = rig();
+    reg.acquireWrite(C, "/w2/src/z.ts");
+    reg.release("C");
+    expect(reg.acquireWrite(B, null)).toMatchObject({ ok: true });
+  });
+
+  it("is not triggered by x: leases (those keep the per-tree behaviour)", () => {
+    const { reg } = rig();
+    reg.acquireWrite(child("O", "/out"), "/out/src/f.ts");
+    expect(reg.acquireWrite(B, null)).toMatchObject({ ok: true });
+    expect(reg.acquireWrite(child("O2", "/out"), null)).toMatchObject({ ok: true });
+  });
+});
+
+describe("the registry has no await", () => {
+  it("contains no await in code", () => {
+    const source = readFileSync(join(__dirname, "..", "..", "src", "router", "leases.ts"), "utf8");
+    const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+    expect(code).not.toMatch(/\bawait\b/);
+    expect(code).not.toMatch(/\basync\b/);
   });
 });
