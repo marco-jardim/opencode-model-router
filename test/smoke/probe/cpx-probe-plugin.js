@@ -18,6 +18,8 @@
  *   CPX_PROBE_USE_RETAINED_SIGNAL  retained-launch only: "1" passes the retained context's own `signal` to the launches instead of the probe's
  *                          300 s controller (default: the probe's controller; `progress` is always replaced by a recorder).
  *                          The "retained-launch-batch" line records `signalReplaced`, `retainedSignalAbortedAtLaunch`.
+ *   CPX_PROBE_MOVE_DIR     retained-launch only, optional: absolute directory (must exist). The recording `progress` of each launched child then waits 2 s and
+ *                          moves the child session there with ctx.session.move (QA-0.1-19; lines retained-progress-called / -move / -resolved).
  *   CPX_PROBE_TOOL_URL     retained-launch only, optional: file URL of a module exporting `tool` (from @opencode-ai/plugin),
  *                          used to build the input schema of `cpx_probe_capture` when the bare specifier does not resolve.
  *
@@ -36,6 +38,9 @@
  *   cache-hint-1h          context hook: set `cache: { type: "ephemeral", ttlSeconds: 3600 }` (the plugin API's CacheHint, @opencode/ai
  *                          schema/messages.d.ts + options.d.ts; the key is created) on the LAST system part; what was set is recorded.
  *   cache-hint-1h-message  same CacheHint on the last text part of the last real message.
+ *   cache-hint-1h-all      QA-0.1-17: the same CacheHint on the FIRST and the LAST system part, the LAST tool of `e.tools` (the typed tool object has no `cache`
+ *                          field; the key is created anyway and what the host did with it is the observation) and the last text part of the last real message.
+ *                          One "cache-hint-1h-all" line records per target { did, ... }.
  *   append-tail-user+hint-last-real  append-tail-user, and BEFORE the tail a manual `cache: { type: "ephemeral" }` on the last text part of
  *                          the last real message (records "cache-hint-last-real").
  *   mutate-subagent-prompt execute.before of subagent: append " CPX_MUTATED" to the prompt.
@@ -60,7 +65,7 @@ import { appendFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 
 const MODES = new Set([
-  "rewrite-completion", "append-tail-system", "append-tail-user", "append-tail-newest", "cache-hint-1h", "cache-hint-1h-message", "append-tail-user+hint-last-real",
+  "rewrite-completion", "append-tail-system", "append-tail-user", "append-tail-newest", "cache-hint-1h", "cache-hint-1h-message", "cache-hint-1h-all", "append-tail-user+hint-last-real",
   "mutate-subagent-prompt", "filter-grep", "rewrite-compaction", "retained-launch",
   "rewrite-completion+compaction", "retry-observe", "retry-stop", "plugin-session-api",
 ]);
@@ -71,6 +76,8 @@ const PICKED_ARGS = ["path", "filePath", "pattern", "cwd", "directory", "backgro
 const PLACEHOLDER = "held \u2014 verdict pending (probe)";
 const COMPLETION = /<subagent\s+sessionID=/;
 const HIDDEN_NOTE = "[cpx: 1 hidden]";
+/** retained-launch with CPX_PROBE_MOVE_DIR: how long the recording `progress` blocks (a timer inside the probe; the experiment, not a harness sleep). */
+const PROGRESS_DELAY_MS = 2000;
 
 const outPath = process.env.CPX_PROBE_OUT;
 let logFailures = 0;
@@ -392,6 +399,48 @@ export default {
         const hinted = withLastTextCache(messages[index], hint);
         if (hinted) e.messages[index] = hinted.message;
         rec("cache-hint-1h-message", { ...base, did: Boolean(hinted), via: "text part field `cache` (created) on the last text part of the last real message", index, id: messages[index] && messages[index].id, role: messages[index] && messages[index].role, partIndex: hinted ? hinted.partIndex : null, set: hint, messageCount: messages.length });
+      } else if (mode === "cache-hint-1h-all") {
+        // QA-0.1-17: D5's all-1h layout. The provider wants longer TTLs before shorter ones in the prefix order tools -> system -> messages, while the host
+        // keeps 5-minute markers on the last tool and the first system part. So every breakpoint the plugin API can reach is set to 1 h: the FIRST and the
+        // LAST system part, the LAST tool and the last text part of the last real message. Each target records what was set, so the harness can compare
+        // it with the wire. `SessionContext.tools` is `Record<name, { description, input }>` (@opencode/plugin dist/promise/session.d.ts:31): the typed
+        // tool object has NO cache field, so the probe still tries to create one (an unknown key) and records whether it reached the wire.
+        const hint = { type: "ephemeral", ttlSeconds: 3600 };
+        const targets = {};
+        const system = Array.isArray(e.system) ? e.system : [];
+        if (system.length === 0 || !system.every((part) => part && typeof part === "object")) {
+          targets.systemFirst = { did: false, reason: "no (object) system parts" };
+          targets.systemLast = { did: false, reason: "no (object) system parts" };
+        } else {
+          const lastIndex = system.length - 1;
+          e.system = system.map((part, i) => (i === 0 || i === lastIndex ? { ...part, cache: hint } : part));
+          targets.systemFirst = { did: true, target: "system[0]", hadCacheKey: "cache" in system[0], partKeys: Object.keys(system[0]) };
+          targets.systemLast = { did: true, target: `system[${lastIndex}]`, hadCacheKey: "cache" in system[lastIndex], partKeys: Object.keys(system[lastIndex]), sameAsFirst: lastIndex === 0 };
+        }
+        const toolNames = e.tools && typeof e.tools === "object" ? Object.keys(e.tools) : [];
+        if (toolNames.length === 0) {
+          targets.toolLast = { did: false, reason: "the context event carries no tools", toolsType: typeof e.tools };
+        } else {
+          const name = toolNames[toolNames.length - 1];
+          const tool = e.tools[name];
+          let failure;
+          try {
+            e.tools = { ...e.tools, [name]: { ...tool, cache: hint } };
+          } catch (error) {
+            failure = String(error);
+          }
+          const back = e.tools && e.tools[name];
+          targets.toolLast = {
+            did: failure === undefined && Boolean(back) && typeof back === "object" && "cache" in back, tool: name, toolIndex: toolNames.length - 1, toolCount: toolNames.length,
+            toolKeys: tool && typeof tool === "object" ? Object.keys(tool) : null, hadCacheKey: Boolean(tool) && typeof tool === "object" && "cache" in tool,
+            via: "tool object field `cache` (an unknown key, created)", error: failure,
+          };
+        }
+        const index = messages.length - 1;
+        const hinted = withLastTextCache(messages[index], hint);
+        if (hinted) e.messages[index] = hinted.message;
+        targets.messageLast = { did: Boolean(hinted), index, id: messages[index] && messages[index].id, role: messages[index] && messages[index].role, partIndex: hinted ? hinted.partIndex : null };
+        rec("cache-hint-1h-all", { ...base, set: hint, targets, did: Object.values(targets).every((t) => t.did === true), messageCount: messages.length, systemParts: system.length });
       }
     }));
 
@@ -463,6 +512,7 @@ export default {
     const childAgent = process.env.CPX_PROBE_CHILD_AGENT || undefined;
     const childModel = process.env.CPX_PROBE_CHILD_MODEL || undefined;
     const useRetainedSignal = process.env.CPX_PROBE_USE_RETAINED_SIGNAL === "1";
+    const moveDir = process.env.CPX_PROBE_MOVE_DIR || undefined;
     const childPromptTemplate = process.env.CPX_PROBE_CHILD_PROMPT;
     const childPrompt = (n) => (childPromptTemplate && childPromptTemplate.length > 0 ? childPromptTemplate.split("{n}").join(String(n)) : `CPX_RETAINED_CHILD ${n}`);
 
@@ -494,19 +544,46 @@ export default {
         const timer = setTimeout(() => controller.abort(), 300000);
         timer.unref();
         let childID;
-        rec("retained-launch-attempt", { batch, n, id, label, parentID, agent: chosen.agent, description: `cpx-retained-${n}`, prompt: cut(childPrompt(n), 300) });
+        rec("retained-launch-attempt", { batch, n, id, label, parentID, agent: childAgent ?? chosen.agent, description: `cpx-retained-${n}`, prompt: cut(childPrompt(n), 300) });
         try {
           const result = await native.execute(
             { agent: childAgent ?? chosen.agent, ...(childModel ? { model: childModel } : {}), description: `cpx-retained-${n}`, prompt: childPrompt(n), background: false },
             {
               ...context,
               signal: useRetainedSignal && context.signal ? context.signal : controller.signal,
-              // The parent's call has ended, so the host would reject a progress update on its context: only record it.
+              // The parent's call has ended, so the host would reject a progress update on its context: it is not forwarded, only recorded.
+              // QA-0.1-19 (launcher A binding timing): the router's runner binds and moves the child inside its `onCreated` (src/compat/v2-client.ts), which
+              // assumes the host AWAITS `progress` before it prompts the child. With CPX_PROBE_MOVE_DIR set, the FIRST progress call that carries the child
+              // id therefore (1) records "retained-progress-called", (2) waits PROGRESS_DELAY_MS on a timer (the experiment itself: if the host does not
+              // await `progress`, the child's first context hook fires inside this window), (3) moves the child with ctx.session.move({ sessionID, directory })
+              // ("retained-progress-move": input, result or error, and the session's directory read back), (4) records "retained-progress-resolved" and
+              // returns. The harness compares resolved-time with the child's first "context" line and checks where the child's relative `read` resolved.
               async progress(metadata) {
                 const sessionID = metadata && metadata.sessionID;
                 if (typeof sessionID === "string" && sessionID !== childID) {
                   childID = sessionID;
                   rec("retained-launch-child", { batch, n, id, parentID, childSessionID: sessionID });
+                  rec("retained-progress-called", { batch, n, id, parentID, childSessionID: sessionID, moveDir: moveDir ?? null, delayMs: moveDir ? PROGRESS_DELAY_MS : 0, metadataKeys: Object.keys(metadata) });
+                  if (moveDir) {
+                    await new Promise((resolve) => setTimeout(resolve, PROGRESS_DELAY_MS));
+                    const input = { sessionID, directory: moveDir };
+                    try {
+                      const moved = await ctx.session.move(input);
+                      let directoryAfter;
+                      let getError;
+                      try {
+                        const got = await ctx.session.get({ sessionID });
+                        const session = got && typeof got === "object" && "data" in got ? got.data : got;
+                        directoryAfter = session && typeof session === "object" ? session.directory : undefined;
+                      } catch (error) {
+                        getError = String(error);
+                      }
+                      rec("retained-progress-move", { batch, n, id, childSessionID: sessionID, input, status: "ok", result: jsonCut(moved, 500), directoryAfter, getError });
+                    } catch (error) {
+                      rec("retained-progress-move", { batch, n, id, childSessionID: sessionID, input, status: "error", error: String(error) });
+                    }
+                  }
+                  rec("retained-progress-resolved", { batch, n, id, parentID, childSessionID: sessionID });
                 }
               },
             },

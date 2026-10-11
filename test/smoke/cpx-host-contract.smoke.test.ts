@@ -30,7 +30,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -56,7 +56,7 @@ const CHILD_ENDED = new Set(["session.execution.succeeded", "session.execution.f
 /** Verification off, so the router does not rewrite `background: true` into a foreground call (role-spikes S6B); engine shadow as everywhere. */
 const BASE: HostOptions = { routing: { engine: "shadow" }, overrides: { enforcement: { mode: "off" } }, hostConfig: { agents: { [CHILD]: agentWithoutModel() } } };
 
-type ProbeMode = "rewrite-completion" | "append-tail-system" | "append-tail-user" | "append-tail-newest" | "cache-hint-1h" | "cache-hint-1h-message" | "append-tail-user+hint-last-real" | "filter-grep" | "mutate-subagent-prompt" | "rewrite-compaction" | "retained-launch" | "rewrite-completion+compaction" | "retry-observe" | "retry-stop" | "plugin-session-api";
+type ProbeMode = "rewrite-completion" | "append-tail-system" | "append-tail-user" | "append-tail-newest" | "cache-hint-1h" | "cache-hint-1h-message" | "cache-hint-1h-all" | "append-tail-user+hint-last-real" | "filter-grep" | "mutate-subagent-prompt" | "rewrite-compaction" | "retained-launch" | "rewrite-completion+compaction" | "retry-observe" | "retry-stop" | "plugin-session-api";
 /** One probe JSON line: `{ t, kind, ...fields }` (see cpx-probe-plugin.js). */
 interface ProbeLine extends Obj { t: number; kind: string }
 
@@ -81,8 +81,31 @@ afterAll(async () => {
 
 /** Base directory of the observations (see the file header): `<...>/omr-cpx-probe`. */
 const obsBaseDir = (): string => path.join(process.env.OMR_CPX_PROBE_DIR || process.env.OMR_SMOKE_REAL_TMPDIR || tmpdir(), "omr-cpx-probe");
+/** QA-0.1-29: at the start of a run (first use of {@link obsDir}) only the newest KEEP_RUN_DIRS earlier run directories of OBS_DIR (by mtime) are kept. Only directories named like a run id
+ *  (8 hex characters) are candidates, so `latest` and any foreign directory are never touched. What was removed / kept / failed is written into every contract file (`prunedRunDirs`). */
+const KEEP_RUN_DIRS = 5;
+const pruneResult: { removed: string[]; kept: string[]; errors: string[] } = { removed: [], kept: [], errors: [] };
+let pruning: Promise<void> | undefined;
+function pruneOldRuns(): Promise<void> {
+  if (pruning === undefined) {
+    pruning = (async () => {
+      const base = obsBaseDir();
+      if (!existsSync(base)) return;
+      const entries = await readdir(base, { withFileTypes: true });
+      const runs = await Promise.all(entries.filter(e => e.isDirectory() && e.name !== "latest" && e.name !== RUN_ID && /^[0-9a-f]{8}$/.test(e.name))
+        .map(async e => ({ name: e.name, mtimeMs: (await stat(path.join(base, e.name))).mtimeMs })));
+      runs.sort((a, b) => b.mtimeMs - a.mtimeMs);
+      pruneResult.kept.push(...runs.slice(0, KEEP_RUN_DIRS).map(r => r.name));
+      for (const run of runs.slice(KEEP_RUN_DIRS)) {
+        try { await rm(path.join(base, run.name), { recursive: true, force: true, maxRetries: 3 }); pruneResult.removed.push(run.name); } catch (error) { pruneResult.errors.push(`${run.name}: ${String(error)}`); }
+      }
+    })();
+  }
+  return pruning;
+}
 /** Directory of THIS run's observations: `<OBS_DIR>/<runId>/`; created on first use. */
 async function obsDir(): Promise<string> {
+  await pruneOldRuns();
   const dir = path.join(obsBaseDir(), RUN_ID);
   await mkdir(dir, { recursive: true });
   return dir;
@@ -198,7 +221,7 @@ async function observeContract(id: string, body: (o: Observation) => Promise<voi
   const file = path.join(dir, `${id}.json`);
   const record = {
     contract: id, runId: RUN_ID, recordedAt: new Date().toISOString(), hostVersion: hostVersion(), obsDir: base, runDir: dir, vitestTmpdir: tmpdir(),
-    durationMs: Date.now() - startedAt, hosts: o.hosts, checks: o.checks, probeLinesRelied: clip(o.relied, 1500), observed: clip(o.observed, 3000),
+    prunedRunDirs: pruneResult, durationMs: Date.now() - startedAt, hosts: o.hosts, checks: o.checks, probeLinesRelied: clip(o.relied, 1500), observed: clip(o.observed, 3000),
   };
   const text = `${JSON.stringify(redact(record), null, 2)}\n`;
   await writeFile(file, text);
@@ -512,6 +535,36 @@ function findKeys(value: unknown, key: RegExp, at = "$", out: Obj[] = []): Obj[]
   }
   return out;
 }
+/** One `cache_control` of a provider request body, in the provider's prefix order (rank 0 tools, 1 system, 2 messages; then array indexes). `seconds`: 3600 for ttl "1h", else 300 (the default). */
+interface Breakpoint { path: string; ttl: string; seconds: number; rank: number; seq: number[] }
+/** QA-0.1-17: every `cache_control` of `body` with path and ttl, sorted along tools -> system -> messages (the order the provider checks TTLs in: longer before shorter). */
+function wireBreakpoints(body: Obj): Breakpoint[] {
+  const rankOf = (p: string): number => (p.startsWith("$.tools") ? 0 : p.startsWith("$.system") ? 1 : p.startsWith("$.messages") ? 2 : 3);
+  const order = (a: Breakpoint, b: Breakpoint): number => {
+    if (a.rank !== b.rank) return a.rank - b.rank;
+    for (let i = 0; i < Math.max(a.seq.length, b.seq.length); i += 1) { const diff = (a.seq[i] ?? -1) - (b.seq[i] ?? -1); if (diff !== 0) return diff; }
+    return 0;
+  };
+  return findKeys(body, /^cache_?control$/i).map(c => {
+    const p = String(c.path);
+    const ttl = str(obj(c.value).ttl);
+    return { path: p, ttl: ttl ?? "(default)", seconds: ttl === "1h" ? 3600 : 300, rank: rankOf(p), seq: [...p.matchAll(/\[(\d+)\]/g)].map(m => Number(m[1])) };
+  }).sort(order);
+}
+/** True when, along the sorted breakpoints, no shorter TTL precedes a longer one (a 5-minute marker never comes before a 1-hour marker). */
+const ttlOrderMonotonic = (points: readonly Breakpoint[]): boolean => points.every((b, i) => i === 0 || b.seconds <= (points[i - 1]?.seconds ?? Number.POSITIVE_INFINITY));
+/** Where the FINAL request of the "all" variant carries a 1 h marker (view = a C6 request view with `breakpoints` [{ path, ttl }] and `systemBlocks`). */
+function wireLayout(view: Obj | undefined): Obj {
+  const points = arr(view?.breakpoints).map(obj);
+  const lastSystem = Math.max(0, Number(view?.systemBlocks ?? 0) - 1);
+  const oneHour = (test: (p: string) => boolean): boolean => points.some(b => test(String(b.path)) && b.ttl === "1h");
+  const messages = points.filter(b => String(b.path).startsWith("$.messages")).map(b => String(b.path));
+  return {
+    tools: oneHour(p => p.startsWith("$.tools")), systemFirst: oneHour(p => p.startsWith("$.system[0]")), systemLast: oneHour(p => p.startsWith(`$.system[${lastSystem}]`)),
+    message: oneHour(p => p.startsWith("$.messages")), messageBreakpoints: messages.length, toolsBreakpoints: points.filter(b => String(b.path).startsWith("$.tools")).map(b => ({ path: b.path, ttl: b.ttl })),
+    systemBlocks: view?.systemBlocks, toolsBlocks: view?.toolsBlocks, all: points,
+  };
+}
 /** JSON paths of every string value matching `re`. */
 function stringPaths(value: unknown, re: RegExp, at = "$", out: string[] = []): string[] {
   if (typeof value === "string") { if (re.test(value)) out.push(at); } else if (Array.isArray(value)) value.forEach((v, i) => stringPaths(v, re, `${at}[${i}]`, out));
@@ -529,7 +582,7 @@ d("C6 one-hour cache hint set by a plugin in the context hook", () => {
     await observeContract("C6", async o => {
       const variants: Obj = {};
       o.observed.variants = variants;
-      for (const [name, mode] of [["system", "cache-hint-1h"], ["message", "cache-hint-1h-message"]] as const) {
+      for (const [name, mode] of [["system", "cache-hint-1h"], ["message", "cache-hint-1h-message"], ["all", "cache-hint-1h-all"]] as const) {
       await withHost(`C6-${name}`, mode, o, async s => {
         const { arrivals } = instrument(s.host);
         const root = await s.host.newRoot("C6 root");
@@ -543,7 +596,10 @@ d("C6 one-hour cache hint set by a plugin in the context hook", () => {
         const views = requests.map(r => {
           const body = obj(r.body);
           const occurrences = findKeys(body, /^cache_?control$/i);
+          const breakpoints = wireBreakpoints(body);
           return {
+            breakpoints: breakpoints.map(b => ({ path: b.path, ttl: b.ttl })), ttlOrderMonotonic: ttlOrderMonotonic(breakpoints),
+            toolsBlocks: arr(body.tools).length,
             index: r.index, arrivedAt: arrivals.get(r.index), anthropicBeta: hdr(r, "anthropic-beta"), topLevelKeys: Object.keys(body),
             systemType: Array.isArray(body.system) ? "array" : typeof body.system, systemBlocks: arr(body.system).length,
             cacheControl: occurrences, ttl: findKeys(body, /^ttl$/), oneHourStrings: stringPaths(body, /^1h$/),
@@ -562,9 +618,23 @@ d("C6 one-hour cache hint set by a plugin in the context hook", () => {
           oneHourOnSystem: views.some(v => v.oneHourOnSystem), oneHourOnMessage: views.some(v => v.oneHourOnMessage),
           oneHourAnywhere: views.some(v => v.cacheControl.some(c => /"ttl":"1h"/.test(json(c.value))) || v.oneHourStrings.length > 0),
           hintsApplied: hints.length > 0 && hints.every(l => l.did === true),
+          ttlOrderMonotonic: views.length > 0 && views.every(v => v.ttlOrderMonotonic),
+          ...(mode === "cache-hint-1h-all" ? { allTargets: hints.map(l => l.targets), wireLast: wireLayout(views.at(-1)) } : {}),
         };
       });
       }
+      // QA-0.1-17: D5's all-1h layout. `applied` = the probe set the hint on every target AND the final request carries a 1 h marker on the tools, the first / last system block and the last message;
+      // `notApplied` names what could not be 1 h (the reason is the observation). `monotonic` = no 5-minute marker precedes a 1-hour marker (tools -> system -> messages) in every request.
+      const layout = at(variants, "all", "wireLast");
+      const wireMissing = ["tools", "systemFirst", "systemLast", "message"].filter(k => at(layout, k) !== true);
+      const targetsMissing = [...new Set(list(at(variants, "all", "allTargets")).flatMap(t => Object.entries(obj(t)).filter(([, v]) => at(v, "did") !== true).map(([k, v]) => `${k}: ${String(at(v, "reason") ?? at(v, "error") ?? "probe could not set it")}`)))];
+      o.observed.oneHourLayout = {
+        ttlOrderMonotonic: at(variants, "all", "ttlOrderMonotonic"), probeSetEveryTarget: targetsMissing.length === 0 && list(at(variants, "all", "allTargets")).length > 0, wire: layout,
+        wireWithoutOneHour: wireMissing, probeCouldNotSet: targetsMissing, toolsBreakpointsOnWire: at(layout, "toolsBreakpoints"),
+        allHintsApplied: targetsMissing.length === 0 && wireMissing.length === 0 && list(at(variants, "all", "allTargets")).length > 0,
+        branch: wireMissing.length === 0 && targetsMissing.length === 0 ? "all breakpoints 1h in prefix order"
+          : `${wireMissing.includes("tools") ? "tools breakpoint cannot carry 1h: " : "some breakpoint cannot carry 1h: "}${[...targetsMissing, ...wireMissing.map(k => `${k} has no 1h marker on the wire`)].join("; ")}`,
+      };
       o.observed.providerCarriesOneHourOnSystem = at(variants, "system", "oneHourOnSystem");
       o.observed.providerCarriesOneHourOnMessage = at(variants, "message", "oneHourOnMessage");
       o.observed.providerCarriesOneHourAnywhere = at(variants, "system", "oneHourAnywhere") === true || at(variants, "message", "oneHourAnywhere") === true;
@@ -813,8 +883,7 @@ const FAULT_CASES: readonly FaultCase[] = [
   { name: "rate-limit-persistent-retry-stop", kind: "rate-limit", mode: "persistent", capMs: PERSISTENT_WINDOW_MS, probe: "retry-stop" },
 ];
 /** How the host classifies each usage-limit variant (the error type of step.failed, else of the first session.retry.scheduled).
- *  "reset-sentence" is the observed baseline of the earlier run. The other entries are UNCONFIRMED hypotheses (wording-driven classification) until the
- *  first run of this file: set each to the value recorded in C10.json (`cases.<name>.classification`) and keep the message; do not loosen the check. */
+ *  Confirmed in three runs (`cases.<name>.classification` of C10.json); do not loosen the check. */
 const EXPECTED_CLASSIFICATION: Record<string, string> = {
   "usage-limit-until-reset": "provider.quota", "usage-limit-header-only": "provider.quota", "usage-limit-alt-wording": "provider.quota",
   "usage-limit-retry-after-only": "provider.quota", "usage-limit-control-no-wording": "provider.rate-limit",
@@ -1158,6 +1227,10 @@ d("C13 concurrent background children, host cap, parent interrupt", () => {
 
 // ---------------------------------------------------------------------------- C14 ----
 const RETAINED_NAME = "cpx-retained.txt";
+/** Subdirectory of the project the probe moves the C14 children to (QA-0.1-19), with a same-named file of different content: the read content tells the directory it resolved in. */
+const MOVED_DIR = "cpx-moved";
+const PROJECT_MARKER = "retained child read target";
+const MOVED_MARKER = "cpx moved-directory read target";
 /** File URL of the plugin package's `tool` module: `CPX_PROBE_TOOL_URL` of every scenario whose probe mode registers a tool (retained-launch, plugin-session-api). */
 const TOOL_MODULE_URL = pathToFileURL(path.join(ROOT, "node_modules", "@opencode-ai", "plugin", "dist", "tool.js")).href;
 /** Fills every heading of the host's compaction summary template (same text as the frozen routing-spikes harness uses). */
@@ -1173,16 +1246,23 @@ const RETAINED_READS = 6;
 const retainedPrompt = (file: string): string => `C14G_{n}x ${scriptLine(Array.from({ length: RETAINED_READS }, () => ({ tool: "read", input: { path: file } })), "CHILD_OK")}`;
 /** Probe env of the C14 hosts; the child prompt names a file of the host's project, so it is resolved in `prepare` (see {@link ProbeEnv}). Children use the non-default agent
  * `cpx-child` and an explicit model, so the contract "agent and model are honoured for retained launches" is observable. */
-const retainedEnvFor = (count: number, relaunchMs: number | undefined, extra: Readonly<Record<string, string>> = {}): ProbeEnv => project => ({
+const retainedEnvFor = (count: number, relaunchMs: number | undefined, extra: Readonly<Record<string, string>> = {}, moved = false): ProbeEnv => project => ({
   CPX_PROBE_TOOL_URL: pathToFileURL(path.join(ROOT, "node_modules", "@opencode-ai", "plugin", "dist", "tool.js")).href, CPX_PROBE_RETAINED_COUNT: String(count),
   ...(relaunchMs === undefined ? {} : { CPX_PROBE_RELAUNCH_MS: String(relaunchMs) }),
-  CPX_PROBE_CHILD_PROMPT: retainedPrompt(path.join(project, RETAINED_NAME)), CPX_PROBE_CHILD_AGENT: CHILD, CPX_PROBE_CHILD_MODEL: `${SONNET}#low`, ...extra,
+  // QA-0.1-19 (`moved`): the probe's `progress` waits 2 s and moves each child to MOVED_DIR; the child then reads RETAINED_NAME by a RELATIVE path, which resolves
+  // to a different file (MOVED_MARKER) in the moved directory than in the project directory (PROJECT_MARKER), so the content says where the read was resolved.
+  ...(moved ? { CPX_PROBE_MOVE_DIR: path.join(project, MOVED_DIR) } : {}),
+  CPX_PROBE_CHILD_PROMPT: retainedPrompt(moved ? RETAINED_NAME : path.join(project, RETAINED_NAME)), CPX_PROBE_CHILD_AGENT: CHILD, CPX_PROBE_CHILD_MODEL: `${SONNET}#low`, ...extra,
 });
-const retainedEnv: ProbeEnv = retainedEnvFor(RETAINED_COUNT, 60_000);
+const retainedEnv: ProbeEnv = retainedEnvFor(RETAINED_COUNT, 60_000, {}, true);
 /** Host options of the C14 hosts: router ENFORCED (guards live), the harness probe's lifecycle log (permission evaluations), the read target in the project. */
 const retainedHostOptions = (overrides: Partial<HostOptions> = {}): HostOptions => ({
   ...BASE, overrides: { enforcement: { mode: "enforced" } }, probe: { lifecycle: true },
-  prepare: async ({ project }) => { await writeFile(path.join(project, RETAINED_NAME), "retained child read target\n"); }, ...overrides,
+  prepare: async ({ project }) => {
+    await writeFile(path.join(project, RETAINED_NAME), `${PROJECT_MARKER}\n`);
+    await mkdir(path.join(project, MOVED_DIR), { recursive: true });
+    await writeFile(path.join(project, MOVED_DIR, RETAINED_NAME), `${MOVED_MARKER}\n`);
+  }, ...overrides,
 });
 /** Per retained child: the agent / model it ACTUALLY ran with (session record, provider request headers and bodies), the tool results the model got back, and the router-only
  * observable: a router guard refusal text (`DENIED: …`) in a tool result, which only the router can produce (the control host without the router never shows one). */
@@ -1282,7 +1362,7 @@ d("C14 launch with a retained tool context outside any LLM tool call", () => {
         const harnessHooks = (await host.hooks()).filter(h => childIDs.includes(h.sessionID));
         const hostEvents = await host.events();
         const decisions = await host.decisionRows();
-        const sentInput = { path: retainedFile };
+        const sentInput = { path: RETAINED_NAME }; // relative: resolved against the directory the child was moved to (QA-0.1-19)
         // The child's prompt makes the fixture emit a `read` call (READ_ONLY_PROBE marker) in the child's own turn: those calls pass through the router's hooks
         // (loaded first), then this file's probe, then the harness probe (loaded last, so it sees what the earlier hooks left).
         const perChild = childIDs.map(id => {
@@ -1312,7 +1392,7 @@ d("C14 launch with a retained tool context outside any LLM tool call", () => {
         });
         const triggered = perChild.some(c => c.probeBefore.some(b => b.tool === "read"));
         o.observed.hooksForChildren = {
-          childPrompt: retainedPrompt(retainedFile), file: retainedFile,
+          childPrompt: retainedPrompt(RETAINED_NAME), file: retainedFile, movedFile: path.join(host.project, MOVED_DIR, RETAINED_NAME),
           childPromptCanTriggerTool: triggered, probeHookLinesForChildren: toolLines.length, harnessHookRecordsForChildren: harnessHooks.length,
           tools: [...new Set([...toolLines.map(l => l.tool), ...harnessHooks.map(h => h.tool)])],
           // NOT router evidence: the harness probe's own evaluate hook (lifecycle) also produces permission evaluations. The router-only observable is `childContract[*].routerRefusals`, measured against `control`.
@@ -1320,6 +1400,35 @@ d("C14 launch with a retained tool context outside any LLM tool call", () => {
           routerLogLines: host.routerLogLines().slice(-10).map(l => l.slice(0, 300)),
           subagentHooksOnRootAfterCapture: lines.filter(l => (l.kind === "execute.before" || l.kind === "execute.after") && l.tool === "subagent" && l.sessionID === root).length,
           perChild,
+        };
+        // QA-0.1-19 (launcher A binding timing): per batch and child, the probe's `progress` (called -> 2 s delay -> session.move -> resolved) against the child's first context hook
+        // (probe clock, one process), and where the child's relative `read` resolved (content marker of the file the model got back).
+        const ofChild = (kind: string, c: ProbeLine): ProbeLine | undefined => lines.find(l => l.kind === kind && l.batch === c.batch && l.n === c.n);
+        const progressBatch = (batch: number): Obj => ({
+          batch,
+          children: lines.filter(l => l.kind === "retained-progress-called" && l.batch === batch).map(c => {
+            const resolved = ofChild("retained-progress-resolved", c);
+            const move = ofChild("retained-progress-move", c);
+            const contextTimes = lines.filter(l => l.kind === "context" && l.sessionID === c.childSessionID).map(l => l.t);
+            const firstContextAt = contextTimes.length > 0 ? Math.min(...contextTimes) : undefined;
+            return {
+              n: c.n, childSessionID: c.childSessionID, progressCalledAt: c.t, progressResolvedAt: resolved?.t, firstContextAt,
+              progressTookMs: resolved ? resolved.t - c.t : undefined, contextMinusResolvedMs: resolved && firstContextAt !== undefined ? firstContextAt - resolved.t : undefined,
+              resolvedBeforeFirstContext: resolved && firstContextAt !== undefined ? resolved.t <= firstContextAt : undefined,
+              moveStatus: move?.status, moveInput: move?.input, moveResult: move?.result, moveDirectoryAfter: move?.directoryAfter, moveError: move?.error, moveGetError: move?.getError,
+            };
+          }),
+        });
+        const movedReads = childIDs.map(id => {
+          const texts = front(host).requests.filter(r => hdr(r, "x-proof-session") === id && hdr(r, "x-proof-kind") === "primary" && lastIsToolResult(r)).map(r => toolResultText(r));
+          return { sessionID: id, toolResults: texts.length, inMovedDir: texts.filter(t => t.includes(MOVED_MARKER)).length, inProjectDir: texts.filter(t => t.includes(PROJECT_MARKER)).length, firstResult: texts[0]?.slice(0, 200) };
+        });
+        const markerSeen = movedReads.every(r => r.inMovedDir + r.inProjectDir > 0);
+        o.observed.progressBinding = {
+          moveDir: path.join(host.project, MOVED_DIR), delayMs: 2000, readPath: RETAINED_NAME, batches: [1, 2].map(progressBatch), reads: movedReads,
+          moveReadObservable: movedReads.length === RETAINED_COUNT * 2 && markerSeen,
+          moveReadUnobservableReason: movedReads.length !== RETAINED_COUNT * 2 ? `${movedReads.length} children seen instead of ${RETAINED_COUNT * 2}` : markerSeen ? undefined : "the read tool result of at least one child carries neither the moved-directory nor the project-directory file marker (see reads[].firstResult)",
+          allReadsInMovedDir: movedReads.every(r => r.inMovedDir >= 1 && r.inProjectDir === 0),
         };
         const kids = await host.children(root);
         o.observed.parentHistory = { ...history, unchangedAcrossLaunches: json(history.afterCaptureTurn) === json(history.afterBatch1) && json(history.afterBatch1) === json(history.afterBatch2), childrenListedUnderRoot: kids.map(k => ({ id: k.id, parentID: k.parentID, agent: k.agent })), session: await sessionState(host, root) };
@@ -1675,6 +1784,16 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
     check(o, "C6/D5", at(ob, "variants", "system", "hintsApplied") === true && at(ob, "variants", "message", "hintsApplied") === true, "the probe must be able to set `cache` on the last system part and on the last text part of the last message in the context hook (no lever => D5 stays withdrawn)");
     check(o, "C6/D5", at(ob, "providerCarriesOneHourOnSystem") === true, "D5 decision: a `cache: {type: ephemeral, ttlSeconds: 3600}` hint on the last system part must reach the provider as cache_control ttl 1h on the system block; if it does not, D5 stays withdrawn (re-decide D5 from variants.system in C6.json)");
     check(o, "C6/D5", at(ob, "providerCarriesOneHourOnMessage") === true, "D5 decision: the same hint on the last text part of the last message must reach the provider as cache_control ttl 1h on that message block; if it does not, re-decide D5 from variants.message in C6.json");
+    // QA-0.1-17: the host keeps 5-minute markers on the last tool and the first system part; the provider wants longer TTLs before shorter ones (tools -> system -> messages).
+    // The "all" variant sets 1 h on the first + last system part, the last tool and the last message. When every one of them reached the wire as 1 h, the order must be monotonic;
+    // otherwise the branch (what cannot carry 1 h, and why) is recorded in observed.oneHourLayout.branch and is not a failure of this check.
+    const layout = at(ob, "oneHourLayout");
+    check(o, "C6/D5", Array.isArray(at(ob, "variants", "all", "probeTried")) && list(at(ob, "variants", "all", "probeTried")).length > 0, "the cache-hint-1h-all probe must have run in the context hook (variants.all.probeTried)");
+    if (at(layout, "allHintsApplied") === true) {
+      check(o, "C6/D5", at(layout, "ttlOrderMonotonic") === true, `C6/D5: all breakpoints 1h in prefix order: with 1 h on the first + last system part, the last tool and the last message, no 5-minute marker may precede a 1-hour marker along tools -> system -> messages (breakpoints per request: variants.all.requests[].breakpoints); if it does, D5's 1 h layout is rejected by the provider's TTL ordering and must be re-decided`);
+    } else {
+      check(o, "C6/D5", true, `C6/D5: ${String(at(layout, "branch"))} (recorded, not asserted; ttlOrderMonotonic=${String(at(layout, "ttlOrderMonotonic"))}; tools breakpoints on the wire: ${json(at(layout, "toolsBreakpointsOnWire"))})`);
+    }
   },
   C7: o => {
     const ob = o.observed;
@@ -1839,6 +1958,22 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
     check(o, "C14/D14", children.every(c => Number(at(c, "routerRefusals")) >= 1), "D14 guards: with the router ENFORCED, every retained child's repeated identical `read` calls must meet a router guard refusal (`DENIED: …` in the tool result); if not, the router's guards do not apply to children launched with a retained context and D14's six guards must be re-decided (compare control.children)");
     check(o, "C14/D14", control.length === LIGHT_COUNT && control.every(c => Number(at(c, "routerRefusals")) === 0 && Number(at(c, "toolResults")) === RETAINED_READS && at(c, "session", "agent") === CHILD), `control host WITHOUT the router: the same launch must show no refusal and all ${RETAINED_READS} reads must succeed (the refusal above is therefore the router's)`);
     check(o, "C14/D14", at(ob, "parentHistory", "unchangedAcrossLaunches") === true, "the parent's history must get no message from retained-context launches");
+    // QA-0.1-19: launcher A binds / moves the child inside `onCreated` (= the retained `progress`), assuming the host awaits `progress` before it prompts the child.
+    const binding = at(ob, "progressBinding");
+    for (const batch of [0, 1]) {
+      const b = at(binding, "batches", batch);
+      const kids = list(at(b, "children"));
+      check(o, "C14/D14", kids.length === RETAINED_COUNT, `batch ${batch + 1}: all ${RETAINED_COUNT} retained children must be seen through \`progress\` (retained-progress-called); saw ${kids.length}`);
+      check(o, "C14/D14", kids.length === RETAINED_COUNT && kids.every(k => typeof at(k, "progressResolvedAt") === "number" && typeof at(k, "firstContextAt") === "number" && at(k, "resolvedBeforeFirstContext") === true),
+        `batch ${batch + 1}: for every retained child the host must AWAIT \`progress\` (resolved after the probe's ${String(at(binding, "delayMs"))} ms delay) BEFORE the child's first context hook; if not, launcher A's bind / move inside onCreated races the child's first request (src/compat/v2-client.ts) and must bind in the context hook instead (per child: ${json(kids.map(k => ({ n: at(k, "n"), gapMs: at(k, "contextMinusResolvedMs") })))})`);
+      check(o, "C14/D14", kids.length === RETAINED_COUNT && kids.every(k => at(k, "moveStatus") === "ok"), `batch ${batch + 1}: ctx.session.move({ sessionID, directory }) on the child from inside \`progress\` must succeed for every child (moveStatus per child: ${json(kids.map(k => at(k, "moveStatus") ?? at(k, "moveError")))})`);
+    }
+    if (at(binding, "moveReadObservable") === true) {
+      check(o, "C14/D14", at(binding, "allReadsInMovedDir") === true, `launcher A moves the child before its first request: every retained child's relative \`read\` must resolve inside the moved directory (file content carries the marker "${MOVED_MARKER}", never the project one); per child: ${json(list(at(binding, "reads")))}`);
+    } else {
+      // Unobservable: recorded, not asserted (the reason is in progressBinding.moveReadUnobservableReason).
+      check(o, "C14/D14", true, `move-directory read check unobservable: ${String(at(binding, "moveReadUnobservableReason"))}`);
+    }
   },
   C14b: o => {
     const ob = o.observed;
