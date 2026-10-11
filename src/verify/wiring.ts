@@ -76,6 +76,8 @@ import {
 import { runArgv, runShell } from "./exec";
 import { snapshotTree } from "./tree";
 import { discoverConsumers, planPerimeter } from "./perimeter";
+import { defaultExternalLinks, pinTarget, type LinkPin } from "./pin";
+import { perimeterKey } from "./git-top";
 import type { DispatchPerimeter, PerimeterEntry } from "./dispatch";
 import { branchSwitched, branchSwitchReason, branchUnconfirmedReason, treeMove, treeMoveReason } from "./branch";
 import { readHead, readHeadState, readReflogWindow, type HeadState, type ReflogEntry } from "./head";
@@ -1401,7 +1403,7 @@ export function createVerificationWiring(deps: {
     const referenceArgv: ArgvSeam = (file, args, opts) => argvSeam(file, args, { ...opts, lowPriority: budget.lowPriority });
     const openScope = createScopeOpener({
       argv: argvSeam, exec: execSeam, fs: fsSeam, budget, checkTimeoutMs: CHECK_TIMEOUT_MS,
-      reference: { argv: referenceArgv },
+      reference: { argv: referenceArgv, pinNow },
     });
     const currentTree = prepared?.snapshot !== undefined ? { currentTree: prepared.snapshot } : {};
     const direct = createDirectTestsPassHook({
@@ -1478,6 +1480,41 @@ export function createVerificationWiring(deps: {
     };
   };
 
+  /**
+   * Cross-repo P2d.3 (P2.6): the dispatch-time pins of a dispatch's admitted link targets, by dispatch id then by the seed's
+   * root (`PerimeterSeed.at`). Each promise settles once and never rejects; a pin of a discarded (contaminated) snapshot is
+   * dropped at the gate (linkPinsAtGate).
+   */
+  const linkPins = new Map<string, Map<string, Promise<LinkPin>>>();
+  const LINK_PINS_MAX = 256;
+  /** The link roots (perimeterKey) a dispatch's admission accepted; bounded, oldest out. */
+  const admittedLinks = new Set<string>();
+  const rememberAdmittedLink = (dir: string): void => {
+    admittedLinks.add(perimeterKey(dir));
+    while (admittedLinks.size > 1024) {
+      const oldest = admittedLinks.values().next();
+      if (oldest.done === true) break;
+      admittedLinks.delete(oldest.value);
+    }
+  };
+  /**
+   * Cross-repo P2d.3 (P2.6): the current pin of a link target at materialize time (hardened, ignored files digested), admitted
+   * as the dispatch admitted it. Never throws (pinTarget).
+   */
+  const pinNow = (root: string): Promise<LinkPin> =>
+    pinTarget(root, {
+      snapshot: dir => {
+        const controller = new AbortController();
+        return withTimeout(
+          snapshotTree(dir, controller.signal, { lowPriority: configuredLowPriority(), hardened: true, ignoredDigest: true }),
+          GRADE_SNAPSHOT_TIMEOUT_MS,
+          "link pin fingerprint",
+        ).catch(() => undefined).finally(() => controller.abort());
+      },
+      admitted: dir => admittedLinks.has(perimeterKey(dir)),
+      externalLinks: defaultExternalLinks,
+    });
+
   const beginVerification: VerificationWiring["beginVerification"] = async (store, id, cwd, dod) => {
     let deps: DispatchCaptureDeps;
     try {
@@ -1510,16 +1547,91 @@ export function createVerificationWiring(deps: {
       }
     }
     const lowPriority = configuredLowPriority();
+    // Cross-repo P2d.3 (P2.6): an admitted link target's snapshot also digests its ignored files, and its pin starts with it
+    // (bounded by the capture timeout; the nested targets are snapshotted hardened, one level deep, by pinTarget).
+    const perimeterRootSnapshot = (root: string, signal: AbortSignal): Promise<TreeSnapshot | undefined> => {
+      const seed = perimeter?.roots.find(candidate => candidate.at === root);
+      if (seed === undefined || seed.origin !== "link" || seed.fixed !== undefined) {
+        return snapshotTree(root, signal, { lowPriority, hardened: true });
+      }
+      const own = snapshotTree(root, signal, { lowPriority, hardened: true, ignoredDigest: true });
+      const seedAdmit = seed.admit ?? ((): boolean => false);
+      // The roots the dispatch's admission accepted: the materialize-time pin (pinNow) is admitted by the same set.
+      const admit = (dir: string): boolean => {
+        const admitted = seedAdmit(dir);
+        if (admitted) rememberAdmittedLink(dir);
+        return admitted;
+      };
+      const nestedSnapshot = async (dir: string): Promise<TreeSnapshot | undefined> => {
+        if (perimeterKey(dir) === perimeterKey(root)) return own.catch(() => undefined);
+        const controller = new AbortController();
+        try {
+          return await withTimeout(
+            snapshotTree(dir, controller.signal, { lowPriority, hardened: true, ignoredDigest: true }),
+            deps.timeoutMs,
+            "link pin fingerprint",
+          );
+        } catch {
+          return undefined;
+        } finally {
+          controller.abort();
+        }
+      };
+      const pin: Promise<LinkPin> = withTimeout(
+        pinTarget(root, { snapshot: nestedSnapshot, admitted: admit, externalLinks: defaultExternalLinks }),
+        deps.timeoutMs,
+        "link pin",
+      ).catch((): LinkPin => ({ kind: "unpinnable", root, why: "not-observed" }));
+      let forDispatch = linkPins.get(id);
+      if (forDispatch === undefined) {
+        forDispatch = new Map();
+        linkPins.set(id, forDispatch);
+        // Bounded: a dispatch whose gate never ran is evicted by newer ones (oldest first).
+        while (linkPins.size > LINK_PINS_MAX) {
+          const oldest = linkPins.keys().next();
+          if (oldest.done === true) break;
+          linkPins.delete(oldest.value);
+        }
+      }
+      forDispatch.set(root, pin);
+      return own;
+    };
     const begun = store.beginDispatch(id, at, perimeter === undefined ? deps : {
       ...deps,
       perimeter,
       // QA-1 F4 (I11): git runs hardened in a repository other than W.
-      perimeterSnapshot: (root, signal) => snapshotTree(root, signal, { lowPriority, hardened: true }),
+      perimeterSnapshot: perimeterRootSnapshot,
     });
     // pending.ts R10: remember the reference's settled value (the store hands out one promise).
     const reference = store.reference(id);
     if (!settledReferences.has(reference)) void reference.then(state => settledReferences.set(reference, state));
     await begun;
+  };
+
+  /**
+   * Cross-repo P2d.3 (P2.6): the dispatch's link pins that are ready within the gate deadline. A pin whose root's dispatch
+   * snapshot was discarded (contaminated), a fixed root and a pin not ready in time are omitted. Never throws.
+   */
+  const linkPinsAtGate = async (
+    store: ReturnType<typeof createChangedFileStore>,
+    id: string,
+    deadline: Deadline | undefined,
+  ): Promise<LinkPin[]> => {
+    const forDispatch = linkPins.get(id);
+    const planned = store.perimeterOf(id);
+    if (forDispatch === undefined || planned === undefined) return [];
+    const ready = await Promise.all([...forDispatch].map(async ([root, pin]): Promise<LinkPin | undefined> => {
+      const entry = planned.entries.get(root);
+      if (entry === undefined || entry.seed.fixed !== undefined || entry.contaminatedBy !== undefined) return undefined;
+      const ms = deadline ? deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS) : GRADE_SNAPSHOT_TIMEOUT_MS;
+      if (ms <= 0 || deadline?.signal.aborted === true) return undefined;
+      try {
+        return await withTimeout(pin, ms, "link pin");
+      } catch {
+        return undefined;
+      }
+    }));
+    return ready.filter((pin): pin is LinkPin => pin !== undefined);
   };
 
   /** The two snapshots of each extra root of a perimeter (perimeterSnapshotsAtGate); `fixed` roots have neither. */
@@ -2539,7 +2651,12 @@ export function createVerificationWiring(deps: {
     },
     async prepareVerification(store, id, childID, cwd, deadline) {
       const change = await observeChange(store, id, childID, cwd, deadline);
-      const reference = await store.reference(id, deadline?.signal);
+      const captured = await store.reference(id, deadline?.signal);
+      // Cross-repo P2d.3 (P2.6): the pins of the admitted link targets travel with a captured reference (required gate only).
+      const pins = captured.kind === "captured" ? await linkPinsAtGate(store, id, deadline) : [];
+      const reference: ReferenceState = pins.length > 0 && captured.kind === "captured"
+        ? { kind: "captured", reference: { ...captured.reference, pins } }
+        : captured;
       return { ...change, reference };
     },
     graderSessions,

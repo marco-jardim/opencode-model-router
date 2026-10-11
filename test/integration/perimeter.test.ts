@@ -29,6 +29,8 @@ import { addToWorkingSet, forgetWorkingSet } from "../../src/routing/wire/workin
 import type { RepoLocation } from "../../src/routing/roles/admission";
 import { createChangedFileStore } from "../../src/verify/dispatch";
 import * as perimeterModule from "../../src/verify/perimeter";
+import * as deterministicModule from "../../src/verify/deterministic";
+import { samePin, type LinkPin } from "../../src/verify/pin";
 import { PERIMETER_MAX, planPerimeter } from "../../src/verify/perimeter";
 
 type Tree = Awaited<ReturnType<typeof import("../../src/verify/tree").snapshotTree>>;
@@ -548,6 +550,106 @@ describe("the verification perimeter of a cross-repo role dispatch (P1.8)", () =
     });
     expect(out).toMatch(/Dispatch that work with branch=feat-x, or verify it there\./);
   }, 60_000);
+});
+
+describe("link pins at dispatch (P2.6)", () => {
+  const TESTS_DOD = `[acceptance]\ncheck: testsPass command="npm test"\n[/acceptance]`;
+
+  /** Pins `dir` as the router will see it: a real snapshot that also digests the ignored files. */
+  async function pinWithIgnored(dir: string): Promise<void> {
+    const keys = [seam.key(dir), seam.key(fs.realpathSync.native(dir))];
+    for (const key of keys) seam.pins.delete(key);
+    const { snapshotTree } = await vi.importActual<typeof import("../../src/verify/tree")>("../../src/verify/tree");
+    const tree = await snapshotTree(dir, new AbortController().signal, { digestPaths: [], ignoredDigest: true });
+    if (tree === undefined) throw new Error(`the real snapshot of ${dir} failed`);
+    for (const key of keys) seam.pins.set(key, tree);
+  }
+
+  /** W (app-a) links lib-b through node_modules; `parents` is routing.repoParents as the perimeter reads it. */
+  async function linked(parents: string[]): Promise<any> {
+    for (const dir of [repo, lib]) execFileSync("git", ["config", "core.autocrlf", "false"], { cwd: dir, stdio: "ignore" });
+    routeAsRole(location(repo, "app-a"));
+    const modules = path.join(repo, "node_modules");
+    fs.mkdirSync(modules, { recursive: true });
+    fs.symlinkSync(lib, path.join(modules, "lib-b"), "junction");
+    const realPlan = perimeterModule.planPerimeter;
+    vi.spyOn(perimeterModule, "planPerimeter").mockImplementation((id, cwd) => realPlan(id, cwd, () => ({ parents, depth: 1, exclude: [] })));
+    const hooks = await makePlugin();
+    await pin(repo);
+    await pinWithIgnored(lib);
+    return hooks;
+  }
+
+  /** The reference each required gate was given (GateDeps.deterministic.reference). */
+  const gateReferences = (): unknown[] => acceptSpy.mock.calls.map(call => call[2]?.deterministic?.reference);
+  const pinsOf = (reference: unknown): readonly { kind: string; root: string }[] | undefined => {
+    const captured = reference as { kind?: string; reference?: { pins?: readonly { kind: string; root: string }[] } } | undefined;
+    return captured?.kind === "captured" ? captured.reference?.pins : undefined;
+  };
+
+  it("an admitted linked repository is pinned at dispatch and the pin travels with the reference at the gate", async () => {
+    const hooks = await linked([parent]);
+    await runTask(hooks, `Implement it.\n${TESTS_DOD}`, async () => undefined);
+    const pins = pinsOf(gateReferences()[0]);
+    expect(pins?.map(pin => [pin.kind, seam.key(pin.root)])).toEqual([["pinned", seam.key(lib)]]);
+  }, 90_000);
+
+  it("an unadmitted link target gets no pin", async () => {
+    const hooks = await linked([path.join(parent, "elsewhere")]);
+    await runTask(hooks, `Implement it.\n${TESTS_DOD}`, async () => undefined);
+    expect(pinsOf(gateReferences()[0])).toBeUndefined();
+    expect(seam.calls).not.toContain(seam.key(lib));
+  }, 90_000);
+
+  it("a pin whose dispatch snapshot was discarded (contaminated) is dropped", async () => {
+    const hooks = await linked([parent]);
+    const tree = seam.pins.get(seam.key(lib)) as NonNullable<Tree>;
+    let release: (value: Tree) => void = () => undefined;
+    seam.pins.set(seam.key(lib), new Promise<Tree>(settle => {
+      release = settle;
+    }));
+    seam.pins.set(seam.key(fs.realpathSync.native(lib)), seam.pins.get(seam.key(lib)));
+    await runTask(hooks, `Implement it.\n${TESTS_DOD}`, async (h, sid) => {
+      await runTool(h, sid, "bash", { command: "echo hi" }); // An unattributable writer while lib-b's snapshot is in flight.
+      release(tree);
+    });
+    const reference = gateReferences()[0] as { kind?: string } | undefined;
+    expect(reference?.kind).toBe("captured");
+    expect(pinsOf(reference)).toBeUndefined();
+  }, 90_000);
+
+  // S7 (the full recheck needs a recognised test runner in the temp repo, which this harness does not install): the dispatch pin
+  // and the materialize-time pin are compared as reference.ts step 7 does. `pinNow` is what createScopeOpener hands materialize.
+  it("S7: materialize is given a pinNow; it matches the dispatch pin while the linked repository is unchanged, not once it changed", async () => {
+    const opener = vi.spyOn(deterministicModule, "createScopeOpener");
+    const hooks = await linked([parent]);
+    await runTask(hooks, `Implement it.\n${TESTS_DOD}`, async () => undefined);
+    const dispatchPin = (pinsOf(gateReferences()[0]) ?? [])[0] as LinkPin | undefined;
+    expect(dispatchPin?.kind).toBe("pinned");
+    const pinNow = opener.mock.calls.at(-1)?.[0].reference?.pinNow;
+    expect(pinNow).toBeTypeOf("function");
+    if (dispatchPin === undefined || pinNow === undefined) return;
+
+    // Unchanged: the same pin, so the reference stays exact (no external-link cause).
+    expect(samePin(dispatchPin, await pinNow(dispatchPin.root))).toBe(true);
+
+    // Changed during the dispatch (a tracked file, then an ignored one): not the same pin, so external-link / approximate.
+    fs.writeFileSync(path.join(lib, "index.ts"), "export const b = 1;\n");
+    await pinWithIgnored(lib);
+    expect(samePin(dispatchPin, await pinNow(dispatchPin.root))).toBe(false);
+  }, 90_000);
+
+  it("a tier dispatch (no role, no perimeter) carries no pins", async () => {
+    for (const dir of [repo, lib]) execFileSync("git", ["config", "core.autocrlf", "false"], { cwd: dir, stdio: "ignore" });
+    const modules = path.join(repo, "node_modules");
+    fs.mkdirSync(modules, { recursive: true });
+    fs.symlinkSync(lib, path.join(modules, "lib-b"), "junction");
+    const hooks = await makePlugin();
+    await pin(repo);
+    await runTask(hooks, `Implement it.\n${TESTS_DOD}`, async () => undefined);
+    expect(pinsOf(gateReferences()[0])).toBeUndefined();
+    expect(seam.calls).not.toContain(seam.key(lib));
+  }, 90_000);
 });
 
 describe("consumer discovery (§6)", () => {
