@@ -547,8 +547,10 @@ Priority is the bottom level (the longest remaining path by estimated duration).
 - **Capacity signals (QA-0.1-27).** The router's own retry-hook stop and its quota retry-hook calls are capacity
   signals, like the event fields in the table above.
 - **Attempt counting (QA-0.1-20).** An execution failure with error type `provider.quota` (usage limit), or a
-  `provider.rate-limit` / `provider.internal` failure ended by the host (for example after the router's retry hook
-  stopped retries), closes the attempt with outcome `capacity`. It is not counted toward `maxAttempts` and is
+  `provider.rate-limit` failure or a `provider.internal` failure with status 529 (overload) ended by the host (for
+  example after the router's retry hook stopped retries), closes the attempt with outcome `capacity`. A
+  `provider.internal` failure with any other status is not capacity: the attempt is `failed` and counted
+  (QA-0.1-30). A capacity attempt is not counted toward `maxAttempts` and is
   excluded from the circuit breaker. A lost child closes its in-flight attempt as `lost`, also uncounted. Rate-limit,
   overload and usage-limit outcomes never count as failed attempts.
 - **Asserted facts (QA-0.1-23, -24).** The smoke asserts, for C10: persistent 429 and 529 produce no
@@ -932,7 +934,7 @@ O11(b), recorded against the real provider).
 - **2026-10-11** — QA round 2 of Phase 0.1 and the Phase 1.2–1.4 memos. Changes, applied to the plan by amendments
   A-0.1-3, A-1.2-1, A-1.3-1, A-1.4-1 and A-1.1-1:
   - D5 is withdrawn on OpenCode v2.0.26; O11(a) is not applicable (QA-0.1-17, -18).
-  - `provider.quota`, and host-ended `provider.rate-limit` / `provider.internal`, close an attempt as `capacity`; a lost
+  - `provider.quota`, and host-ended `provider.rate-limit` / `provider.internal` with status 529, close an attempt as `capacity`; a lost
     child's in-flight attempt closes as `lost`; neither counts toward `maxAttempts` (QA-0.1-20).
   - Launcher-A prompt order is PLAN CONTEXT → launch header → TASK (QA-0.1-21); launcher B leftovers are removed
     (QA-0.1-22); launches never use the retained `signal` or `progress` (QA-0.1-25).

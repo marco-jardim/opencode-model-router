@@ -74,6 +74,7 @@ import {
   ledgerSchemaOf,
   parseLaunchHeader,
 } from "../../src/executor/types";
+import { classifyCapacity } from "../../src/routing/outcomes";
 import type {
   Attempt,
   AttemptOutcome,
@@ -776,9 +777,10 @@ describe("provider error classification (R3)", () => {
     { type: "provider.rate-limit", status: 429, klass: "rate-limit" },
     { type: "provider.rate-limit", status: 500, klass: "rate-limit" },
     { type: "provider.rate-limit", status: 529, klass: "rate-limit" },
-    { type: "provider.internal", status: null, klass: "overload" },
-    { type: "provider.internal", status: 500, klass: "overload" },
-    { type: "provider.internal", status: 429, klass: "overload" },
+    { type: "provider.internal", status: 529, klass: "overload" },
+    { type: "provider.internal", status: null, klass: null },
+    { type: "provider.internal", status: 500, klass: null },
+    { type: "provider.internal", status: 429, klass: "rate-limit" },
     { type: "provider.quota", status: null, klass: "quota" },
     { type: "provider.quota", status: 429, klass: "quota" },
     { type: "provider.quota", status: 402, klass: "quota" },
@@ -805,6 +807,21 @@ describe("provider error classification (R3)", () => {
 
   it("ignores the message", () => {
     expect(executionFailureOutcome({ type: "unknown", status: null, message: "429 rate limit exceeded" })).toBe("failed");
+  });
+
+  it("provider.internal is overload only with status 529; other statuses are a counted failure (QA-0.1-30)", () => {
+    expect(classifyProviderError({ type: "provider.internal", status: 529 })).toBe("overload");
+    expect(executionFailureOutcome({ type: "provider.internal", status: 529, message: "x" })).toBe("capacity");
+    expect(executionFailureOutcome({ type: "provider.internal", status: 500, message: "x" })).toBe("failed");
+    expect(executionFailureOutcome({ type: "provider.internal", status: null, message: "x" })).toBe("failed");
+  });
+
+  it("agrees with the Phase 1.1 timing classifier (classifyCapacity) on a shared {type, status} table (QA-0.1-30)", () => {
+    const toTiming = { "rate-limit": "rate-limit", overload: "overload", quota: "usage-limit" } as const;
+    for (const { type, status } of cases) {
+      const executor = classifyProviderError({ type, status });
+      expect(classifyCapacity({ type, status })).toBe(executor === null ? null : toTiming[executor]);
+    }
   });
 });
 

@@ -1252,8 +1252,8 @@ per C5, unread late notices persist until read, and v1 is unchanged.
   - `D:\git\omr-cpx-main\src\routing\wire\hint.ts` ≈64 and ≈204-215;
   - the context hook in `D:\git\omr-cpx-main\src\compat\v2-hooks.ts` ≈1363-1480 (≈1422-1443 system part
     identity; ≈1445-1472 message shape);
-  - `ROUTING_DEFAULTS` and `resolveRouting` in `D:\git\omr-cpx-main\src\router\config.ts` ≈3024-3042 and ≈3120.
-- [ ] Read the ADR 0007 decisions for C5 (placement) and C6 (TTL).
+  - *Not applicable (A-0.1-3, QA-0.1-31):* `ROUTING_DEFAULTS` and `resolveRouting` in `D:\git\omr-cpx-main\src\router\config.ts` (no TTL key is added).
+- [ ] Read the ADR 0007 decisions for C5 (placement) and C6 (D5 is withdrawn by A-0.1-3: no TTL).
 - [ ] List the golden snapshots that contain the pending or late blocks or the hint. They must stay unchanged; new v2
       snapshots are added.
 
@@ -1294,19 +1294,7 @@ per C5, unread late notices persist until read, and v1 is unchanged.
   check: testsPass
   criteria: output is deterministic for equal provider outputs; the 6000-character bound holds
   [/acceptance]
-- **1.2.3** [tier:medium] VERIFY:required **Not applicable (A-0.1-3, QA-0.1-17): ADR 0007 D5 is withdrawn on OpenCode v2.0.26. No `routing.promptCache.ttl` key is added, with no config row and no drift pin; no TTL hint is emitted; O11 does not apply.** Superseded text, kept as history: Config `routing.promptCache.ttl` (`"auto" | "5m" | "1h"`, default `"auto"`, which
-  means `1h` while `hasActivity`, otherwise the host default). *Amended by A-0.1-2:* ADR 0007 decided C6 = available (D5). The resolved TTL emits no hint until the O11 real-provider check (a keyed
-  request with the host's markers plus the 1 h hint, or the first DF session) is recorded in the Phase 1.2 report;
-  until then `auto` and `1h` behave as `5m`.
-  [route class=implement risk=low scope=multi needs=edit,shell d=deterministic root=D:\git\omr-cpx-p12 tier=medium pin]
-  Writes: `D:\git\omr-cpx-main\src\router\config.ts`, `D:\git\omr-cpx-main\docs\CONFIG_REFERENCE.md`.
-  Reads: `D:\git\omr-cpx-main\test\unit\docs-drift.test.ts`.
-  [acceptance]
-  cwd: D:\git\omr-cpx-p12
-  check: buildPasses
-  check: testsPass
-  criteria: the key resolves through ROUTING_DEFAULTS/resolveRouting with validation, and the routing table row exists
-  [/acceptance]
+- **1.2.3** *Not applicable: superseded by A-0.1-3 (QA-0.1-17, QA-0.1-31).* ADR 0007 D5 is withdrawn on OpenCode v2.0.26: no `routing.promptCache.ttl` key, no config row, no drift pin, no TTL hint, no O11. The task has no route line and no acceptance block.
 - **1.2.4** [tier:medium] VERIFY:required Turn-state providers, v2 only. The v1 path stays byte-identical.
   [route class=implement risk=high scope=multi needs=edit,shell d=deterministic root=D:\git\omr-cpx-p12 tier=medium pin]
   Writes: `D:\git\omr-cpx-main\src\index.ts`, `D:\git\omr-cpx-main\src\routing\wire\hint.ts`.
@@ -1323,7 +1311,7 @@ per C5, unread late notices persist until read, and v1 is unchanged.
   [/acceptance]
 - **1.2.5** [tier:medium] VERIFY:required Context hook.
   [route class=implement risk=high scope=single needs=edit,shell d=deterministic root=D:\git\omr-cpx-p12 tier=medium pin]
-  Writes: `D:\git\omr-cpx-main\src\compat\v2-hooks.ts`. Reads: `D:\git\omr-cpx-main\src\compat\turn-state.ts`, `D:\git\omr-cpx-main\src\router\config.ts`.
+  Writes: `D:\git\omr-cpx-main\src\compat\v2-hooks.ts`. Reads: `D:\git\omr-cpx-main\src\compat\turn-state.ts`. *Amended by A-0.1-3 (QA-0.1-31):* `src\router\config.ts` is no longer read; the TTL key is not added.
   - 1.2.5.a *Amended by A-0.1-2 and A-1.2-1:* On every request of a root session with non-empty state, append the tail as a new last `user` message (C5), and set
     `cache: {type: "ephemeral"}` (no TTL) on a copy of the last non-blank `text` part of the last real message; if that
     message has none, on its last `tool-result` or `media` part; if it has neither, no hint (never an earlier message;
@@ -1335,7 +1323,7 @@ per C5, unread late notices persist until read, and v1 is unchanged.
   cwd: D:\git\omr-cpx-p12
   check: buildPasses
   check: testsPass
-  criteria: consecutive context builds keep event.system deep-equal and host parts identical by reference while the state changes and the TTL resolution does not; when it resolves to `1h` only the last system part's `cache` differs
+  criteria: consecutive context builds keep event.system deep-equal and host parts identical by reference while the state changes. *Amended by A-0.1-3 (QA-0.1-31):* no TTL is resolved or set, and no system part's `cache` differs
   [/acceptance]
 - **1.2.6** [tier:medium] VERIFY:required Docs, drift pins and goldens.
   [route class=implement risk=low scope=multi needs=edit,shell d=deterministic root=D:\git\omr-cpx-p12 tier=medium pin]
@@ -1418,7 +1406,7 @@ per C5, unread late notices persist until read, and v1 is unchanged.
 - All dynamic state is in the tail.
 - Notices persist until read.
 - v1 output is unchanged.
-- The TTL behaves per ADR 0007.
+- *Amended by A-0.1-3 (QA-0.1-31):* No TTL is set (D5 is withdrawn); the only breakpoint is the D4 ephemeral hint on the last real message.
 
 **Definition of Done:**
 - §0.9 met.
@@ -4205,7 +4193,7 @@ Edge cases are those listed in 6.1.2.
 | G1 | **Background-first.** On v2 with the default config, a dispatch returns a running acknowledgement at once when it has a sampled estimate ≥ 45 s, `testsPass`/`buildPasses`, or is a plan task, and the orchestrator's next step runs before the child ends. A dispatch with only the prior adds no background key. `off` reproduces today's `nativeArgs` exactly. | 2.1, 6.1 |
 | G2 | **Guarantees at completion.** Annotations, deferred registration, change-set capture, verification enqueue and timing happen exactly once per child attempt, for foreground, background and user-backgrounded dispatches. | 2.1, 6.1 |
 | G3 | **Held results.** When C4 and C15 hold, a background child's output under required verification is never visible to the orchestrator before its verdict, including after compaction. PASS posts output and verdict, FAIL posts findings, and the parent is woken once. When C4 or C15 do not hold, such dispatches stay in the foreground. | 2.1, 6.1 |
-| G4 | **Cache stability.** On v2, consecutive orchestrator requests are byte-identical through the previous request's messages, including across held → released. Dynamic state appears only in the tail. With C6, the 1-hour TTL is set exactly while there is activity. If C5 made this unattainable, ADR 0007 records it. | 1.2, 2.1, 6.1 |
+| G4 | **Cache stability.** On v2, consecutive orchestrator requests are byte-identical through the previous request's messages, including across held → released. Dynamic state appears only in the tail. *Amended by A-0.1-3 (QA-0.1-31):* D5 is withdrawn, so no TTL is set: each request carries one ephemeral breakpoint (no TTL) on the last real message, and the system array never changes. If C5 made this unattainable, ADR 0007 records it. | 1.2, 2.1, 6.1 |
 | G5 | **Compilation.** The frozen copies of the three largest plans and of this plan compile with every task id recognized, ≥ 80% write-footprint coverage for editing tasks, zero cycles, and their explicit dependencies present. Unannotated plans compile through the classifier. | 2.3 |
 | G6 | **File safety.** No file is written by two agents at once. In a shared tree, no file is read through an agent's file or search tools while a child agent holds its write lease; a `router_run` there is annotated as possibly contaminated (refused under `routing.leases.run: "refuse"`); plugin verification runs are deferred. Enforced in code and proven by tests, for ad hoc and plan dispatches; observed in real use under DF-1 and DF-2. | 1.3, 2.1, 3.1, 6.1 |
 | G7 | **Integration.** The plan integration branch never points at a commit whose integration checks failed, reverts included. Phase-suite failures are bisected, and the culprit is reverted through a checked slot and reopened automatically. | 3.2, 6.1 |
@@ -4536,7 +4524,7 @@ at the owner's request: 6.1 metrics reach ADR 0007 through 6.2.0; the DF-1 lease
 Node ≥ 22.18; DF-2 switch procedure and the 24 h pending TTL from DF-1; QA tasks return JSON only.
 
 **Amendment log** (inline markers read *Amended by A-…*; A-0.1-1 and A-0.1-2 are listed in the handover file's "Amendments"):
-- **A-0.1-3** (QA-0.1-17, -18, -20, -21, -22, -25, -26, -27) — applies ADR 0007's QA revision of 2026-10-11 to Phase 0.1: D5 is withdrawn on OpenCode v2.0.26 (no `routing.promptCache.ttl`, no TTL hint, the system array is never changed; 1.2.3 and 1.2.5.b/c do not apply; O11 does not apply); `provider.quota` and host-ended `provider.rate-limit` / `provider.internal` close an attempt as `capacity` (uncounted, outside the circuit breaker); the retry-hook stop and quota retry-hook calls are capacity signals; launcher-A prompt order is PLAN CONTEXT, launch header, TASK; launcher B leftovers removed; launches never use the retained `signal` and never forward `progress`; D7 lists the `router_git_*` tools, and `shell`/`execute` are not covered by leases. Items marked A-0.1-3 in the text: D5 row, C6 decided branch, 1.2.1 memo, 1.2.3, 1.2.5.b/c, the 1.2 QA focus and smoke bullets, 3.1.4.a, Appendix C `routing.promptCache.ttl`.
+- **A-0.1-3** (QA-0.1-17, -18, -20, -21, -22, -25, -26, -27) — applies ADR 0007's QA revision of 2026-10-11 to Phase 0.1: D5 is withdrawn on OpenCode v2.0.26 (no `routing.promptCache.ttl`, no TTL hint, the system array is never changed; 1.2.3 and 1.2.5.b/c do not apply; O11 does not apply); `provider.quota`, host-ended `provider.rate-limit` and host-ended `provider.internal` with status 529 close an attempt as `capacity` (uncounted, outside the circuit breaker; a `provider.internal` with any other status is not capacity: the attempt is `failed` and counted, QA-0.1-30); the retry-hook stop and quota retry-hook calls are capacity signals; launcher-A prompt order is PLAN CONTEXT, launch header, TASK; launcher B leftovers removed; launches never use the retained `signal` and never forward `progress`; D7 lists the `router_git_*` tools, and `shell`/`execute` are not covered by leases. Items marked A-0.1-3 in the text: D5 row, C6 decided branch, 1.2.1 memo, 1.2.3, 1.2.5.b/c, the 1.2 QA focus and smoke bullets, 3.1.4.a, Appendix C `routing.promptCache.ttl`. Added by QA-0.1-30 and QA-0.1-31: `provider.internal` is overload only with status 529 (`classifyProviderError` agrees with the Phase 1.1 `classifyCapacity`); 1.2.3 is reduced to a superseded note (route line and acceptance block removed); 1.2.5 no longer reads `src\router\config.ts`, and its acceptance no longer mentions a TTL resolution; global acceptance G4 and the 1.2 exit bullet state that no TTL is set.
 - **A-1.1-1** (Phase 1.1) — 2.1.5.c acquires the timing recorder with `acquireTimingRecorder` and makes the calls listed under "Handoffs" in `docs\qa\critical-path-execution\phase-1.1.md`.
 - **A-1.2-1** (QA-1.2-12, -16) — the D4 hint goes on the last non-blank text part of the last real message, else on its last `tool-result` or `media` part, else no hint, never an earlier message. Observed on v2.0.26: the `tool_result` block carries the marker. "Never on the tail" holds only while the host's four-marker budget is used. Changed in the D4 row, 1.2.1 memo, 1.2.5.a and the 1.2 test bullets.
 - **A-1.3-1** (Phase 1.3, ADR 0007 D7) — 1.3.3.b/c: read, search and run restrictions apply to another child session (root sessions are never refused); lease ownership is the task (`taskRef`); read/run conflicts are decided per owner; a run also conflicts with leases under the run directory; unkeyable spellings fail closed; `checkRun` costs the leases of the run tree plus those under the run directory, not O(1).

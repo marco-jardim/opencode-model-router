@@ -1242,15 +1242,16 @@ export interface HostError {
 }
 
 /**
- * Capacity class of a provider error (R3): the `type` decides (`provider.rate-limit`, `provider.internal` -> overload,
- * `provider.quota`); any other type falls back to its status (429 -> rate-limit, 529 -> overload); else null.
+ * Capacity class of a provider error (R3): the `type` decides (`provider.rate-limit` -> rate-limit, `provider.quota`
+ * -> quota, `provider.internal` -> overload only with status 529; any other `provider.internal` is not capacity, QA-0.1-30);
+ * any other type falls back to its status (429 -> rate-limit, 529 -> overload); else null.
  */
 export function classifyProviderError(e: Pick<HostError, "type" | "status">): "rate-limit" | "overload" | "quota" | null {
   switch (e.type) {
     case "provider.rate-limit": return "rate-limit";
-    case "provider.internal": return "overload";
     case "provider.quota": return "quota";
     default:
+      // `provider.internal` is overload only with status 529; with another status it falls back to the status like any type.
       if (e.status === 429) return "rate-limit";
       if (e.status === 529) return "overload";
       return null;
