@@ -267,11 +267,11 @@ async function storedView(host: RoutingHost, session: string): Promise<{ message
 // ------------------------------------------------------------------ background driver ----
 interface Bg { root: string; call: Dispatched; childID?: string; ack: Obj; ackMs: number; parentCountAtIdle: number; idleAt: number }
 /** One root turn whose scripted model calls `subagent` with `background: true` (child held `holdMs` on its first request); returns once the root is idle. */
-async function launchBackground(s: Scenario, marker: string, holdMs: number, onRoot?: (root: string) => void): Promise<Bg> {
+async function launchBackground(s: Scenario, marker: string, holdMs: number, onRoot?: (root: string) => void | Promise<void>): Promise<Bg> {
   const { host } = s;
   host.provider.holdMarked(marker, holdMs);
   const root = await host.newRoot(`${s.tag} root`);
-  onRoot?.(root);
+  await onRoot?.(root);
   const call = await host.call(root, "subagent", { agent: CHILD, description: `${s.tag} background`, prompt: `${marker} background child`, model: `${SONNET}#low`, background: true });
   return { root, call, childID: call.childID, ack: obj(call.after.result), ackMs: call.after.__t - call.before.__t, parentCountAtIdle: parentRequests(host, root).length, idleAt: Date.now() };
 }
@@ -1158,6 +1158,8 @@ d("C13 concurrent background children, host cap, parent interrupt", () => {
 
 // ---------------------------------------------------------------------------- C14 ----
 const RETAINED_NAME = "cpx-retained.txt";
+/** File URL of the plugin package's `tool` module: `CPX_PROBE_TOOL_URL` of every scenario whose probe mode registers a tool (retained-launch, plugin-session-api). */
+const TOOL_MODULE_URL = pathToFileURL(path.join(ROOT, "node_modules", "@opencode-ai", "plugin", "dist", "tool.js")).href;
 /** Fills every heading of the host's compaction summary template (same text as the frozen routing-spikes harness uses). */
 const COMPACTION_SUMMARY = ["## Objective", "cpx", "## Requirements", "none", "## Decisions", "none", "## Work State", "### Completed", "none", "### Active", "none", "### Blocked", "none", "## Next Move", "reply", "## Relevant Files", "none", "## Important Context", "none"].join("\n");
 /** Children per retained-launch batch (O3: ADR 0007 proved 3; D13/D14 clamp `maxParallel` to 8, so 8 must run concurrently). */
@@ -1331,6 +1333,20 @@ d("C14 launch with a retained tool context outside any LLM tool call", () => {
 });
 
 // ---------------------------------------------------------------------------- C15 ----
+/** The compaction window: the messages the compaction hook received (ids / roles / first text) against the session's stored history snapshot taken just before `compact()`. */
+function compactionWindow(hook: ProbeLine | undefined, before: readonly Obj[]): Obj {
+  const sent = arr(hook?.messages).map(obj);
+  const sentIds = sent.map(m => str(m.id));
+  return {
+    hookFired: hook !== undefined, hookMessageCount: sent.length,
+    hookMessages: sent.map(m => ({ id: str(m.id), role: str(m.role), partCount: m.partCount, text: str(arr(m.texts)[0])?.slice(0, 120), otherPartTypes: arr(m.other).map(x => str(obj(x).type)) })),
+    storedBeforeCount: before.length,
+    storedBefore: before.map(m => ({ id: str(m.id), type: str(m.type), role: str(m.role), snippet: json(m).slice(0, 120) })),
+    storedIdsInHook: before.filter(m => str(m.id) !== undefined && sentIds.includes(str(m.id))).map(m => str(m.id)),
+    storedIdsNotInHook: before.filter(m => str(m.id) !== undefined && !sentIds.includes(str(m.id))).map(m => ({ id: str(m.id), type: str(m.type), role: str(m.role) })),
+    hookIdsNotInStored: sentIds.filter(id => id !== undefined && !before.some(m => str(m.id) === id)),
+  };
+}
 d("C15 compaction hook: can a plugin rewrite the compaction request", () => {
   it("puts CPX_HELD_ORIGINAL in the history, compacts, and records the hook, the provider request and the stored summary", async () => {
     await observeContract("C15", async o => {
@@ -1379,6 +1395,7 @@ d("C15 compaction hook: can a plugin rewrite the compaction request", () => {
           summaryHasOriginal: json(compactionRecords).includes("CPX_HELD_ORIGINAL"),
           summaryTexts: compactionRecords.map(m => textsOf(m).map(t => t.slice(0, 200))),
         };
+        o.observed.compactionWindow = compactionWindow(hook, preContext); // which turns the host put into the compaction request
         o.observed.api = { compactOnClient: compact !== undefined, via: "host.client.session.compact({ sessionID })", result: clip(compactResult, 600), error: compactError };
         o.observed.hook = {
           available: lines.find(l => l.kind === "compaction-hook-available")?.["compaction-hook-available"], fired: hook !== undefined,
@@ -1418,11 +1435,18 @@ d("C15 compaction hook: can a plugin rewrite the compaction request", () => {
       // QA-0.1-11 variant: the compacted session holds a REAL background `<subagent …>` completion; both rewrite modes are active in one probe.
       await withHost("C15-real", "rewrite-completion+compaction", o, async s => {
         const { host } = s;
-        const bg = await launchBackground(s, "C15R_HOLD", 1_500);
+        // RoutingProvider answers the `final` of the LAST `CHILD_SCRIPT64` user text in the request's history (SPIKE_CALL texts never count), and the host sends only the
+        // older part of the history to the compaction model (the latest turn is retained), so the script note is the root's FIRST turn: every later reply of the session,
+        // the compaction reply included, is the template-conforming COMPACTION_SUMMARY (as in the main variant, whose first prompt carries the script).
+        const bg = await launchBackground(s, "C15R_HOLD", 1_500, async root => { await host.prompt(root, `C15R note ${scriptLine([], COMPACTION_SUMMARY)}`); });
         const childEnd = await awaitChildEnd(s, bg.childID, o);
         const wake = await observeWake(s, bg, 30_000);
         const stored = await tryWait("the real completion envelope in the parent's stored history", async () => { const v = await storedView(host, bg.root); return v.envelopes.length > 0 ? v : undefined; }, 30_000);
-        await host.prompt(bg.root, `C15R note ${scriptLine([], COMPACTION_SUMMARY)}`); // the template-conforming compaction reply, as in the main variant
+        // The host compacts everything except the LATEST turn (observed: with the completion as the latest turn the compaction request held only the first note and its reply),
+        // so one more plain turn (its reply is the session script's COMPACTION_SUMMARY) makes the completion part of the compacted window.
+        await host.prompt(bg.root, "C15R closing turn");
+        const closingIdle = await waitIdle(host, bg.root, 60_000);
+        const preContext = await host.client.session.context({ sessionID: bg.root });
         const compact = sessionMethod(host, "compact");
         const requestsBefore = front(host).requests.length;
         const calledAt = Date.now();
@@ -1442,6 +1466,7 @@ d("C15 compaction hook: can a plugin rewrite the compaction request", () => {
         if (hook) o.relied.push(hook);
         if (rewrite) o.relied.push(rewrite);
         o.observed.realCompletion = {
+          compactionWindow: compactionWindow(hook, preContext), closingTurnIdle: closingIdle === true,
           childEnd, parentWoke: wake !== undefined, storedEnvelopeBeforeCompact: stored !== undefined, storedEnvelopeStates: stored ? envelopeStates(stored.envelopes) : [],
           compactApi: compact !== undefined, compactError,
           hookFired: hook !== undefined, hookSawEnvelope: hook ? ENVELOPE.test(json(hook.messages)) : false, hookMessages: clip(hook?.messages, 800),
@@ -1578,7 +1603,7 @@ d("O6b plugin-side session API: synthetic with resume, context, interrupt", () =
           storedHasText: json(await host.client.session.context({ sessionID: bg.root })).includes(SYNTHETIC_TEXT),
           storedTypes: stored.messages.map(m => str(m.type)),
         };
-      });
+      }, BASE, { CPX_PROBE_TOOL_URL: TOOL_MODULE_URL }); // the probe builds the tool's input schema from this module (the bare specifier does not resolve from the wrapper dir)
     });
   }, 300_000);
 });
