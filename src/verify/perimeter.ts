@@ -8,11 +8,12 @@
  * (dispatch.ts beginDispatch), and the wiring snapshots it again at the gate (wiring.ts observeChange).
  *
  * Inert by default (I9): only a routed role dispatch whose grant has a location (cross-repo admission bound it), or whose
- * orchestrator session's working set holds a root other than W, can have a perimeter; every other dispatch plans none, so nothing
- * else is snapshotted and no reason changes.
+ * orchestrator session's working set holds a root other than W, or (I13, QA round 2) with `routing.repoParents` set, can have a
+ * perimeter; every other dispatch plans none, so nothing else is snapshotted and no reason changes.
  *
  * Link targets (QA round 1, I11, I12), all without running git:
- * - a link whose real path is neither below a `routing.repoParents` entry nor inside a working-set worktree is not in P;
+ * - a link whose real path is neither below a `routing.repoParents` entry nor inside a working-set worktree is not in P, but is
+ *   kept as an "unadmitted" root named by its basename (I8, I12; QA round 2), never dropped;
  * - otherwise its repository's top level is found by walking up to the nearest `.git` entry (F3), and links are de-duplicated
  *   by top level, so several links into one monorepo are one root and one snapshot;
  * - a top level is admitted when it lies 1..`routing.repoDepth` segments below a parent and no `routing.repoExclude` glob
@@ -168,7 +169,10 @@ export function planPerimeter(dispatchID: string, cwd: string, admission: () => 
   const w = location?.worktree ?? cwd;
   const workingSet = workingSetOf(orchestrator);
   const others = workingSet.filter((entry) => !insideOrEqual(w, entry.worktree) && !insideOrEqual(entry.worktree, w));
-  if (location === undefined && others.length === 0) return undefined;
+  // I13 (S1/S2): with cross-repo configured (`routing.repoParents`), W's admitted link targets are in P even when the dispatch has
+  // no location and no working set. Without parents, such a dispatch has none (I9).
+  const config = admission();
+  if (location === undefined && others.length === 0 && config.parents.length === 0) return undefined;
 
   // QA-1 F11: W's git common directory, to tell another worktree of W's own repository from another repository.
   const wCommon = commonDirOf(gitTopOf(w));
@@ -202,7 +206,6 @@ export function planPerimeter(dispatchID: string, cwd: string, admission: () => 
     add({ at: entry.worktree, name: entry.name, ...(sameRepository(entry.worktree) ? { sameRepository: true } : {}) });
   }
 
-  const config = admission();
   const depth = Math.max(1, Math.floor(config.depth));
   const exclude = config.exclude ?? [];
   // Both spellings of each parent: as configured, and canonical (link targets are real paths).
@@ -227,10 +230,14 @@ export function planPerimeter(dispatchID: string, cwd: string, admission: () => 
     });
 
   for (const real of linkedTargets(w)) {
-    // Admission by text first: a link outside every parent and every working-set worktree is not in P.
+    // Admission by text first: a link outside every parent and every working-set worktree is not in P, but it is not dropped
+    // either (I8, I12): kept as an unadmitted root named by its basename, without running git or touching the filesystem.
     const parent = parentOf(real);
     const worktree = worktreeOf(real);
-    if (parent === undefined && worktree === undefined) continue;
+    if (parent === undefined && worktree === undefined) {
+      add({ at: real, name: path.basename(real), fixed: "unadmitted" });
+      continue;
+    }
     // QA-1 F3: the repository's top level, without git; the walk stops at the parent (or above the worktree).
     const top = gitTopOf(real, worktree !== undefined ? path.dirname(worktree.worktree) : parent);
     if (top === undefined) {

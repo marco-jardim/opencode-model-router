@@ -166,7 +166,7 @@ export interface SnapshotOptions {
   /**
    * Cross-repo QA-1 F4 (I11): run every git process of the snapshot hardened, as the router's other git calls in a repository
    * it does not own (git-tools.ts): `hardeningArgs()` (no fsmonitor, no hooks, no pager, no external diff, no optional locks),
-   * the user's `safe.directory` values, `gitEnvironment()` (no inherited GIT_*, no system or global config) and git by absolute
+   * the user's `safe.directory` values and inherited line-ending settings (`core.autocrlf` …), `gitEnvironment()` (no inherited GIT_*, no system or global config) and git by absolute
    * path outside the snapshotted tree. The perimeter's extra roots use it. Default false: the snapshot of W is unchanged.
    */
   hardened?: boolean;
@@ -180,7 +180,11 @@ async function hardenedGit(cwd: string): Promise<{ prefix: string[]; env: NodeJS
   const tools = await import("../router/git-tools");
   const executable = tools.gitExecutable(tools.workRootGuards(cwd));
   const trusted = await tools.inheritedSafeDirectoryArgs(executable);
-  return { prefix: [...tools.hardeningArgs(), ...trusted], env: tools.gitEnvironment(), executable };
+  const base = [...tools.hardeningArgs(), ...trusted];
+  // The inherited line-ending settings (inspectGit's allowlist): a CRLF checkout must not read as modified because the
+  // environment hides the user's `core.autocrlf`.
+  const inherited = await tools.inheritedConfigArgs(executable, cwd, base);
+  return { prefix: [...base, ...inherited], env: tools.gitEnvironment(), executable };
 }
 
 function errorCode(err: unknown): unknown {

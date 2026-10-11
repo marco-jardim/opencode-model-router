@@ -800,6 +800,31 @@ export async function inheritedSafeDirectoryArgs(executable: string, timeoutMs: 
 }
 
 /**
+ * Cross-repo QA round 2: the user's inherited non-executing settings (`core.autocrlf`, `core.eol`, `core.safecrlf`,
+ * `core.longpaths`, `core.quotepath`; not `safe.directory`, see {@link inheritedSafeDirectoryArgs}) as `-c key=value` pairs for a
+ * hardened git run in `root`, whose environment hides the system and global config (`gitEnvironment()`). Without them a CRLF
+ * checkout made under `core.autocrlf=true` reads as modified. Exactly what `inspectGit` passes: a key the repository's own
+ * configuration sets is left out (a `-c` value would override it). `base` is the hardening (and trusted `safe.directory`)
+ * prefix the repository query runs with. Any failure yields no pairs (the previous behaviour, never a wider setting).
+ */
+export async function inheritedConfigArgs(executable: string, root: string, base: readonly string[], timeoutMs: number = DEADLINE_MS): Promise<string[]> {
+  const deadline = performance.now() + timeoutMs;
+  const budget: Budget = { timeoutMs: () => {
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) throw new Error("Git configuration query timed out");
+    return remaining;
+  } };
+  try {
+    const pairs = (await inheritedConfig(executable, budget)).filter(pair => !pair.startsWith("safe.directory="));
+    if (pairs.length === 0) return [];
+    const repository = await repositoryConfig(executable, root, gitEnvironment(), [...base], budget);
+    return pairs.filter(pair => !repository.overridden.has(pair.slice(0, pair.indexOf("=")))).flatMap(pair => ["-c", pair]);
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Repository-level (local, worktree, included) driver programs and line-ending
  * settings. Every configured filter/diff program is blanked with `-c key=` (G1);
  * filters also become optional so a blank one is not a hard failure.

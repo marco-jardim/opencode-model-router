@@ -302,9 +302,100 @@ describe("the verification perimeter of a cross-repo role dispatch (P1.8)", () =
     const seed = plan?.roots.find(candidate => seam.key(candidate.at) === seam.key(lib));
     expect(seed?.admit?.(lib)).toBe(true);
     expect(seed?.admit?.(parent)).toBe(false);
-    // Not below a parent and not in the working set: not admitted, so P is W alone.
-    expect(planPerimeter("task:orch:call1", repo, () => ({ parents: [], depth: 1 }))).toBeUndefined();
+    // Cross-repo QA round 2 (I8, I12): not below a parent and not in the working set, the target is not dropped: it is kept as an
+    // unadmitted root, named by its basename only, and git never runs there. The store-like link stays out.
+    const outside = planPerimeter("task:orch:call1", repo, () => ({ parents: [], depth: 1 }));
+    expect(outside?.roots.map(seed => [seam.key(seed.at), seed.name, seed.fixed])).toEqual([[seam.key(lib), "lib-b", "unadmitted"]]);
+    expect(outside?.roots[0]?.admit).toBeUndefined();
   });
+
+  it("QA round 2 (I8): a link target outside every parent is reported, not silently dropped: '(not admitted)', git never runs there", async () => {
+    routeAsRole(location(repo, "app-a"));
+    const modules = path.join(repo, "node_modules");
+    fs.mkdirSync(modules, { recursive: true });
+    fs.symlinkSync(lib, path.join(modules, "lib-b"), "junction");
+    const realPlan = perimeterModule.planPerimeter;
+    // routing.repoParents names a directory that holds neither W nor lib-b.
+    vi.spyOn(perimeterModule, "planPerimeter").mockImplementation((id, cwd) => realPlan(id, cwd, () => ({ parents: [path.join(parent, "elsewhere")], depth: 1, exclude: [] })));
+    const hooks = await makePlugin();
+    await pin(repo);
+    await pin(lib);
+    const out = await runTask(hooks, `Implement it.\n${SYNC_DOD}`, async () => undefined);
+    expect(seam.calls).not.toContain(seam.key(lib));
+    expect(out).toContain("✓ verified");
+    expect(out).toMatch(/also observed: lib-b \(not admitted\)/);
+    expect(out).not.toMatch(/lib-b \(not observed\)/);
+    expect(artefacts()[0]?.perimeter?.roots.map(root => [root.name, root.status])).toEqual([["lib-b", "unadmitted"]]);
+  }, 60_000);
+
+  it("QA round 2 (I13, S1/S2): a role dispatch with no repo= still gets a perimeter when repoParents is set and W links a sibling; without repoParents it is inert (I9)", async () => {
+    routeAsRole(); // No grant location, and no working set.
+    const modules = path.join(repo, "node_modules");
+    fs.mkdirSync(modules, { recursive: true });
+    fs.symlinkSync(lib, path.join(modules, "lib-b"), "junction");
+    const plan = planPerimeter("task:orch:call1", repo, () => ({ parents: [parent], depth: 1 }));
+    expect(plan?.name).toBeUndefined();
+    expect(plan?.roots.map(seed => [seam.key(seed.at), seed.fixed])).toEqual([[seam.key(lib), undefined]]);
+    // I9: no repoParents, no location, no working set: no perimeter, and admission is read only to find that out.
+    expect(planPerimeter("task:orch:call1", repo, () => ({ parents: [], depth: 1 }))).toBeUndefined();
+    // Inert when nothing extra is found: parents set, no links.
+    fs.rmSync(path.join(modules, "lib-b"), { recursive: true, force: true });
+    expect(planPerimeter("task:orch:call1", repo, () => ({ parents: [parent], depth: 1 }))).toBeUndefined();
+
+    // End to end: a bash write in lib-b during the dispatch is unverifiable.
+    fs.symlinkSync(lib, path.join(modules, "lib-b"), "junction");
+    const realPlan = perimeterModule.planPerimeter;
+    vi.spyOn(perimeterModule, "planPerimeter").mockImplementation((id, cwd) => realPlan(id, cwd, () => ({ parents: [parent], depth: 1, exclude: [] })));
+    const hooks = await makePlugin();
+    await pin(repo);
+    await pin(lib);
+    const out = await runTask(hooks, `Implement it.\n${SYNC_DOD}`, async (h, sid) => {
+      await runTool(h, sid, "bash", { command: "echo hi" });
+      await changeLib();
+    });
+    expect(out).toMatch(I4_REASON("bash"));
+    expect(out).toContain("UNVERIFIED");
+    expect(artefacts()[0]?.perimeter?.roots.map(root => [root.name, root.status])).toEqual([["lib-b", "changed"]]);
+  }, 60_000);
+
+  it("QA round 2 (I11): a hardened snapshot keeps the user's core.autocrlf, so a CRLF checkout is not 'modified'; a repo-local value still wins", async () => {
+    const { snapshotTree } = await vi.importActual<typeof import("../../src/verify/tree")>("../../src/verify/tree");
+    const globalConfig = path.join(home, "global.gitconfig");
+    fs.writeFileSync(globalConfig, "[core]\n\tautocrlf = true\n");
+    const savedEnv = { GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL, GIT_CONFIG_NOSYSTEM: process.env.GIT_CONFIG_NOSYSTEM };
+    process.env.GIT_CONFIG_GLOBAL = globalConfig;
+    process.env.GIT_CONFIG_NOSYSTEM = "1";
+    try {
+      // A CRLF checkout committed under core.autocrlf=true: the blob is LF, the working file is CRLF.
+      const file = path.join(lib, "index.ts");
+      fs.writeFileSync(file, "export const b = 0;\r\nexport const c = 1;\r\n");
+      const env = { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.com" };
+      for (const args of [["add", "-A"], ["commit", "-q", "--amend", "-m", "crlf"]]) {
+        execFileSync("git", ["-c", "core.autocrlf=true", ...args], { cwd: lib, stdio: "ignore", env });
+      }
+      const signal = new AbortController().signal;
+      const touch = (seconds: number): void => {
+        const when = new Date(Date.now() + seconds * 1000);
+        fs.utimesSync(file, when, when); // mtime changes, content does not
+      };
+      touch(60);
+      const first = await snapshotTree(lib, signal, { hardened: true, digestPaths: [] });
+      touch(120);
+      const second = await snapshotTree(lib, signal, { hardened: true, digestPaths: [] });
+      expect(first?.dirty).toBe(false);
+      expect(second?.dirty).toBe(false);
+      expect(second?.fingerprint).toBe(first?.fingerprint);
+      // A value the repository sets itself is not overridden by the inherited one.
+      execFileSync("git", ["config", "core.autocrlf", "false"], { cwd: lib, stdio: "ignore" });
+      const local = await snapshotTree(lib, signal, { hardened: true, digestPaths: [] });
+      expect(local?.dirty).toBe(true);
+    } finally {
+      for (const [key, value] of Object.entries(savedEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  }, 60_000);
 
   it("contamination: a write while an extra root's dispatch snapshot is in flight discards it", async () => {
     const tree = { cwd: lib, root: lib, head: "a".repeat(40), fingerprint: "f", dirty: false, files: [] } as unknown as NonNullable<Tree>;
@@ -422,8 +513,8 @@ describe("the verification perimeter of a cross-repo role dispatch (P1.8)", () =
     expect(seam.calls).not.toContain(seam.key(deep));
     expect(seam.calls).not.toContain(seam.key(plain));
     expect(out).toContain("✓ verified");
-    expect(out).toMatch(/also observed: .*deep \(not observed\)/);
-    expect(out).toMatch(/also observed: .*plain \(not observed\)/);
+    expect(out).toMatch(/also observed: .*deep \(not admitted\)/);
+    expect(out).toMatch(/also observed: .*plain \(not admitted\)/);
   }, 60_000);
 
   it("QA-1 F10: a perimeter that cannot be planned fails closed: with bash, unverifiable", async () => {

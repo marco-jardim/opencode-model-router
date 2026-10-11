@@ -55,6 +55,9 @@ vi.mock("node:fs/promises", () => ({
 const HARDENED = vi.hoisted(() => ({
   prefix: ["--no-optional-locks", "--no-pager", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=NUL"],
   trusted: ["-c", "safe.directory=D:/trusted"],
+  /** Cross-repo QA round 2: the inherited line-ending settings (git-tools.ts inheritedConfigArgs), passed after `trusted`. */
+  inherited: ["-c", "core.autocrlf=true", "-c", "core.eol=crlf"],
+  inheritedCalls: [] as { executable: string; root: string; base: string[] }[],
   env: { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "NUL" },
   executable: "C:/Program Files/Git/cmd/git.exe",
 }));
@@ -62,6 +65,10 @@ vi.mock("../../src/router/git-tools", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/router/git-tools")>()),
   hardeningArgs: () => [...HARDENED.prefix],
   inheritedSafeDirectoryArgs: async () => [...HARDENED.trusted],
+  inheritedConfigArgs: async (executable: string, root: string, base: readonly string[]) => {
+    HARDENED.inheritedCalls.push({ executable, root, base: [...base] });
+    return [...HARDENED.inherited];
+  },
   gitEnvironment: () => ({ ...HARDENED.env }),
   gitExecutable: () => HARDENED.executable,
   workRootGuards: (root: string) => [root],
@@ -119,7 +126,8 @@ describe("Git tree fingerprint adapter", () => {
     expect(seen.map(o => o.lowPriority)).toEqual(Array(7).fill(false));
   });
   it("QA-1 F4: hardened (opt-in) runs every git process hardened, by path, in the hardened environment; the default is unchanged", async () => {
-    const prefix = [...HARDENED.prefix, ...HARDENED.trusted];
+    const prefix = [...HARDENED.prefix, ...HARDENED.trusted, ...HARDENED.inherited];
+    HARDENED.inheritedCalls.length = 0;
     const seen: { args: readonly string[]; opts: SnapshotGitOptions }[] = [];
     // The child_process mock answers by the arguments after `--no-pager`: hand it the command without the hardening.
     const git = async (args: readonly string[], opts: SnapshotGitOptions) => {
@@ -136,6 +144,11 @@ describe("Git tree fingerprint adapter", () => {
       expect(opts.executable).toBe(HARDENED.executable);
     }
     expect(state.binaries).toEqual(Array(7).fill(HARDENED.executable));
+    // Cross-repo QA round 2: the inherited settings are read once per snapshot, for the snapshotted directory, with the
+    // hardening and the trusted safe.directory values as the query's base; the default snapshot never reads them.
+    expect(HARDENED.inheritedCalls).toEqual([{
+      executable: HARDENED.executable, root: process.cwd(), base: [...HARDENED.prefix, ...HARDENED.trusted],
+    }]);
     // Default (W's snapshot): `--no-pager` first, the process's own environment, git by name, as before.
     seen.length = 0;
     state.binaries = [];
@@ -147,6 +160,7 @@ describe("Git tree fingerprint adapter", () => {
       expect("env" in opts || "executable" in opts).toBe(false);
     }
     expect(state.binaries).toEqual(Array(7).fill("git"));
+    expect(HARDENED.inheritedCalls).toHaveLength(1);
   });
   it("QA-3.1-8: the default git seam lowers the process's priority as exec.ts does", async () => {
     // Generous timeout: this test is about priority, and a 5 ms timer could fire on a slow

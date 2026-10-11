@@ -453,7 +453,8 @@ export function verifiedScopeLine(perimeter: PerimeterObservation): string {
     `${repo.name} (${repo.branch ?? "detached"} @ ${repo.head !== undefined && repo.head !== "" ? repo.head.slice(0, 7) : "unknown"}${suffix})`;
   const others = perimeter.roots.map(root => {
     if (root.name === PERIMETER_UNPLANNED) return PERIMETER_UNPLANNED;
-    if (root.status === "unobserved" || root.status === "unadmitted") return `${root.name} (not observed)`;
+    if (root.status === "unadmitted") return `${root.name} (not admitted)`;
+    if (root.status === "unobserved") return `${root.name} (not observed)`;
     return root.status === "changed" ? show(root, ", changed during the dispatch") : show(root);
   });
   return `verified scope: ${show(perimeter.w)}; also observed: ${others.join(", ")}`;
