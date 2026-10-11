@@ -187,6 +187,16 @@ function describeError(error: unknown): string {
 }
 
 /**
+ * Cross-repo P2b.7 (OD1=B, v2 only): a tier dispatch honours no per-check `cwd=`. The first check of the DoD that sets one (0-based
+ * index) is the refusal the gate reports (`why: "tier"`, nothing runs); undefined when none does. `scope=` alone is ignored.
+ */
+function tierCheckCwdRefusal(dod: Parameters<typeof resolveCheckPlacements>[0]): NonNullable<Parameters<typeof accept>[0]["refusedCheck"]> | undefined {
+  const index = dod.checks.findIndex((check) => check.cwd !== undefined);
+  const check = index < 0 ? undefined : dod.checks[index];
+  return check?.cwd === undefined ? undefined : { index, kind: check.kind, text: check.cwd, why: "tier" };
+}
+
+/**
  * #84 P2.2 (advisor `tierDispatches`): dispatch rows WITHOUT a role at or after `since` — non-annotation `dispatch` decision rows,
  * the first row per decision id (as `summarizeRoles` keeps them), whose row names no role and whose chosen key is not a role's.
  */
@@ -1449,6 +1459,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               acceptance: args.acceptance,
             });
             const effectiveCwd = typeof args.cwd === "string" && args.cwd.trim() ? args.cwd : dod.cwd;
+            // Cross-repo P2b.7 (OD1=B, v2 only): `delegate` is a tier dispatch; a per-check `cwd=` is unverifiable there. On v1 nothing changes.
+            const tierRefusal = ctx.routerHost === "v2" ? tierCheckCwdRefusal(dod) : undefined;
 
             // Phase 2.3 (D10/D11): on v2 with `variantSteps: auto` (A15: only with a `routing` block) and a catalog,
             // the ladder is session-aware: variant steps on the same model first, resume of the child session
@@ -1668,7 +1680,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               // 2.4.2c, section 1.5-16: a deferred delegation runs no gate and no ladder. A producer
               // that failed outright produced nothing to verify later; it keeps today's
               // failed-attempt path, which runs no verification process either.
-              const finish = dispatchStart !== undefined && producerError === null && isDeferred(dod, dispatchStart.directives) &&
+              const finish = dispatchStart !== undefined && producerError === null && tierRefusal === undefined && isDeferred(dod, dispatchStart.directives) &&
                 await isProvenRootCaller(toolCtx?.sessionID)
                 ? await finishDeferred(changedFileStore, {
                     dispatchID: baselineID,
@@ -1764,6 +1776,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                           trivial: false,
                           mode: "modeA",
                           ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
+                          ...(tierRefusal !== undefined ? { refusedCheck: tierRefusal } : {}),
                         },
                         artefact,
                         gateDeps,
@@ -2510,7 +2523,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             // P2.7 interim: a DoD with any per-check `cwd=`/`scope=` is verified at once, never deferred (a later handle would not
             // run the checks where they were placed). Tier dispatches resolve nothing and defer as before.
             const placement = routedRole === undefined ? undefined : resolveCheckPlacements(dod, scope, { inReadSet: roleReadSetFor(routedRole) });
-            const perCheckPlacement = placement !== undefined && dod.checks.some((check) => check.cwd !== undefined || check.scope !== undefined);
+            // P2b.7 (OD1=B, v2 only): a tier dispatch with a per-check `cwd=` is unverifiable (the gate refuses it); it is never deferred.
+            const tierRefusal = routedRole === undefined && ctx.routerHost === "v2" ? tierCheckCwdRefusal(dod) : undefined;
+            const perCheckPlacement = tierRefusal !== undefined
+              || (placement !== undefined && dod.checks.some((check) => check.cwd !== undefined || check.scope !== undefined));
             const orchestratorSessionID = typeof input.sessionID === "string" ? input.sessionID : "";
             const taskPrompt = typeof input?.args?.prompt === "string" ? input.args.prompt : undefined;
             const taskDescription = typeof input?.args?.description === "string" ? input.args.description : undefined;
@@ -2632,6 +2648,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                     ...(scope.refused !== undefined ? { refusedCwd: scope.refused } : {}),
                     // Fix-1 review nit: a refusal names where the cwd came from (the call's `cwd`, else the block's `cwd:`).
                     ...(scope.workRoot !== undefined && cwdSource !== undefined ? { cwdSource } : {}),
+                    // Cross-repo P2b.5 (v2 only): where each check of a routed role dispatch runs, or the check the router refused.
+                    ...(placement?.placements !== undefined ? { checkPlacements: placement.placements } : {}),
+                    ...(placement?.refused !== undefined ? { refusedCheck: placement.refused } : tierRefusal !== undefined ? { refusedCheck: tierRefusal } : {}),
                   },
                   artefact,
                   gateDeps,

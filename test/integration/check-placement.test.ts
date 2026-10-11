@@ -2,13 +2,14 @@
  * test/integration/check-placement.test.ts
  *
  * Cross-repo Phase 2 (docs/design/cross-repo-phase2-plan.md P2a.3, P2.7 interim): a routed role dispatch whose DoD has any per-check
- * `cwd=` or `scope=` is never deferred; it is verified at once. The gate does not receive placements yet. A tier dispatch, and a
- * role dispatch without per-check keys, defer as before.
+ * `cwd=` or `scope=` is never deferred; it is verified at once, and the gate receives its placements or refusal (P2b.5). A tier
+ * dispatch, and a role dispatch without per-check keys, defer as before; on a v2 host a tier dispatch with a per-check `cwd=` is
+ * unverifiable (P2b.7, OD1=B).
  *
  * The harness is test/integration/perimeter.test.ts's: a real temporary git repository, the real plugin and gate, `routedRoleOf`
  * spied to make the dispatch a routed role dispatch, tree snapshots pinned through the `src/verify/tree` mock seam.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -16,6 +17,8 @@ import * as path from "node:path";
 import ModelRouterPlugin from "../../src/index";
 import { invalidateConfigCache } from "../../src/router/config";
 import * as dispatchModule from "../../src/routing/wire/dispatch";
+import * as gateModule from "../../src/verify/gate";
+import { addToWorkingSet, forgetWorkingSet } from "../../src/routing/wire/working-set";
 
 type Tree = Awaited<ReturnType<typeof import("../../src/verify/tree").snapshotTree>>;
 
@@ -76,6 +79,7 @@ const HANDLE = /vrf_[0-9a-f]{24}/;
 let home = "";
 let parent = "";
 let repo = "";
+let acceptSpy: MockInstance<typeof gateModule.accept>;
 const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
 
 function initRepo(dir: string, files: Record<string, string>): void {
@@ -124,10 +128,12 @@ beforeEach(() => {
   process.env.MODEL_ROUTER_ENFORCE = "1";
   process.env.MODEL_ROUTER_VERIFIED_DELEGATE = "1";
   invalidateConfigCache();
+  acceptSpy = vi.spyOn(gateModule, "accept");
 }, 60_000);
 
 afterEach(() => {
   vi.restoreAllMocks();
+  forgetWorkingSet("orch");
   seam.pins.clear();
   wired.calls.length = 0;
   for (const key of ["HOME", "USERPROFILE"] as const) {
@@ -142,9 +148,10 @@ afterEach(() => {
 });
 
 /** A plugin whose directory is the repository. */
-async function makePlugin(): Promise<any> {
+async function makePlugin(host?: "v2"): Promise<any> {
   const created: string[] = [];
   const ctx = {
+    ...(host === "v2" ? { routerHost: "v2" as const } : {}),
     directory: repo,
     worktree: repo,
     project: {},
@@ -168,11 +175,12 @@ async function makePlugin(): Promise<any> {
 }
 
 /** Runs one native `task` dispatch whose child does nothing, and returns the output the orchestrator sees. */
-async function runTask(hooks: any, prompt: string): Promise<string> {
+async function runTask(hooks: any, prompt: string, work?: () => Promise<void>): Promise<string> {
   const input: any = { tool: "task", sessionID: "orch", callID: "call1", args: { subagent_type: "fast", prompt, description: "the work" } };
   const before = { args: { ...input.args } };
   await hooks["tool.execute.before"](input, before);
   input.args = before.args;
+  await work?.();
   const output = { output: "<task_result>\nDONE: implemented.\n</task_result>", metadata: { sessionId: "child1" } };
   await hooks["tool.execute.after"](input, output);
   return output.output;
@@ -209,6 +217,123 @@ describe("interim deferral (P2.7 interim)", () => {
     await pin(repo);
     const out = await runTask(hooks, `Implement it.\n${dod(['testsPass command="npm test" scope=full', "fileExists path=inner.ts cwd=sub"])}`);
     expect(HANDLE.exec(out)?.[0], out).toBeDefined();
+  }, 90_000);
+});
+
+const required = (checks: string[]): string => `VERIFY:required\n[acceptance]\n${checks.map(check => `check: ${check}`).join("\n")}\n[/acceptance]`;
+const slashed = (p: string): string => p.replace(/\\/g, "/");
+const lastDelegation = (): Parameters<typeof gateModule.accept>[0] | undefined => acceptSpy.mock.calls.at(-1)?.[0];
+
+describe("placements reach the gate (P2b.5)", () => {
+  it("(a) cwd=sub inside W: the check runs in sub (sub/marker.txt exists) and the gate got the placement", async () => {
+    fs.writeFileSync(path.join(repo, "sub", "marker.txt"), "x\n");
+    routeAsRole();
+    const hooks = await makePlugin();
+    await pin(repo);
+    const out = await runTask(hooks, `Implement it.\n${required(["fileExists path=marker.txt cwd=sub"])}`);
+    expect(out).toContain("✓ verified");
+    expect(out).not.toContain("UNVERIFIED");
+    const placements = lastDelegation()?.checkPlacements;
+    expect(same(placements?.[0]?.cwd, path.join(repo, "sub")), `placement: ${placements?.[0]?.cwd}`).toBe(true);
+    expect(lastDelegation()?.refusedCheck).toBeUndefined();
+  }, 90_000);
+
+  it("(b) cwd= outside W and R: unverifiable, the reason names the check, nothing ran", async () => {
+    routeAsRole();
+    const hooks = await makePlugin();
+    await pin(repo);
+    const elsewhere = slashed(path.join(parent, "elsewhere"));
+    const out = await runTask(hooks, `Implement it.\n${required([`fileExists path=index.ts cwd=${elsewhere}`])}`);
+    expect(out).toContain("UNVERIFIED");
+    expect(out).not.toContain("✓ verified");
+    expect(out).toContain("check 1 (fileExists) cwd=");
+    expect(out).toContain("is outside the work root");
+    expect(out).toContain("nothing ran");
+    expect(lastDelegation()?.refusedCheck).toMatchObject({ index: 0, kind: "fileExists", why: "outside" });
+    expect(lastDelegation()?.checkPlacements).toBeUndefined();
+  }, 90_000);
+
+  it("(c) scope=bogus: unverifiable scope refusal", async () => {
+    routeAsRole();
+    const hooks = await makePlugin();
+    await pin(repo);
+    const out = await runTask(hooks, `Implement it.\n${required(["fileExists path=index.ts scope=bogus"])}`);
+    expect(out).toContain("UNVERIFIED");
+    expect(out).toContain("check 1 (fileExists) scope=bogus is not affected or full; nothing ran");
+    expect(lastDelegation()?.refusedCheck).toMatchObject({ index: 0, kind: "fileExists", text: "bogus", why: "scope" });
+  }, 90_000);
+
+  it("(d) the only check runs in another repository of R while W changed: the I3 refusal", async () => {
+    const lib = path.join(parent, "lib-b");
+    initRepo(lib, { "index.ts": "export const b = 0;\n" });
+    addToWorkingSet("orch", { repository: lib, name: "lib-b", worktree: lib, branch: null, head: null, worktrees: [] });
+    routeAsRole();
+    const hooks = await makePlugin("v2");
+    await pin(repo);
+    await pin(lib);
+    const out = await runTask(hooks, `Implement it.\n${required([`fileExists path=index.ts cwd=${slashed(lib)}`])}`, async () => {
+      fs.writeFileSync(path.join(repo, "index.ts"), "export const v = 1;\n");
+      await pin(repo);
+    });
+    expect(out).toContain("UNVERIFIED");
+    expect(out).toContain("is not covered by any check root");
+    expect(out).not.toContain("✓ verified");
+    const placement = lastDelegation()?.checkPlacements?.[0];
+    expect(same(placement?.cwd, lib), `placement: ${placement?.cwd}`).toBe(true);
+    expect(placement?.foreign).toBe(true);
+  }, 90_000);
+});
+
+describe("tier per-check cwd (OD1)", () => {
+  const ROLES_ONLY = "check 1 (fileExists) cwd=sub: a per-check cwd= is honoured only in roles mode; nothing ran";
+
+  it("(a) a v2 tier task dispatch with cwd= is unverifiable with the roles-only reason", async () => {
+    // No routeAsRole(): routedRoleOf("call1") is undefined.
+    const hooks = await makePlugin("v2");
+    await pin(repo);
+    const out = await runTask(hooks, `Implement it.\n${required(["fileExists path=inner.ts cwd=sub"])}`);
+    expect(out).toContain("UNVERIFIED");
+    expect(out).toContain(ROLES_ONLY);
+    expect(out).not.toContain("✓ verified");
+    expect(lastDelegation()?.refusedCheck).toEqual({ index: 0, kind: "fileExists", text: "sub", why: "tier" });
+  }, 90_000);
+
+  it("(b) the same, deferred: verified at once (no handle) and refused", async () => {
+    const hooks = await makePlugin("v2");
+    await pin(repo);
+    const out = await runTask(hooks, `Implement it.\n${dod(['testsPass command="npm test"', "fileExists path=inner.ts cwd=sub"])}`);
+    expect(HANDLE.exec(out)?.[0], out).toBeUndefined();
+    expect(out).toContain(`check 2 (fileExists) cwd=sub: a per-check cwd= is honoured only in roles mode; nothing ran`);
+  }, 90_000);
+
+  it("(c) the refusal names the first check with a cwd, 0-based index", async () => {
+    const hooks = await makePlugin("v2");
+    await pin(repo);
+    await runTask(hooks, `Implement it.\n${required(["fileExists path=index.ts", "fileExists path=inner.ts cwd=sub", "fileExists path=x cwd=other"])}`);
+    expect(lastDelegation()?.refusedCheck).toEqual({ index: 1, kind: "fileExists", text: "sub", why: "tier" });
+  }, 90_000);
+
+  it("(d) a v2 tier dispatch with only scope=full is as today: deferred, with a handle, no refusal", async () => {
+    const hooks = await makePlugin("v2");
+    await pin(repo);
+    const out = await runTask(hooks, `Implement it.\n${dod(['testsPass command="npm test" scope=full', "fileExists path=index.ts"])}`);
+    expect(HANDLE.exec(out)?.[0], out).toBeDefined();
+    expect(out).not.toContain("roles mode");
+  }, 90_000);
+
+  it("(e) a v1 tier dispatch with cwd= is unchanged: deferred, no refusal", async () => {
+    const hooks = await makePlugin();
+    await pin(repo);
+    const out = await runTask(hooks, `Implement it.\n${dod(['testsPass command="npm test"', "fileExists path=inner.ts cwd=sub"])}`);
+    expect(HANDLE.exec(out)?.[0], out).toBeDefined();
+    expect(out).not.toContain("roles mode");
+  }, 90_000);
+
+  it("(f) a v1 tier dispatch with cwd=, required: no tier refusal reaches the gate", async () => {
+    const hooks = await makePlugin();
+    await pin(repo);
+    await runTask(hooks, `Implement it.\n${required(["fileExists path=inner.ts cwd=sub"])}`);
+    expect(lastDelegation()?.refusedCheck).toBeUndefined();
   }, 90_000);
 });
 

@@ -619,6 +619,15 @@ describe("accept() — per-check placements (P2.4)", () => {
     expect(exec).not.toHaveBeenCalled();
   });
 
+  it("a tier dispatch's per-check cwd= is refused with the roles-only reason; nothing runs (OD1=B)", async () => {
+    const { exec, d, dod } = setup([runCheck, runCheck]);
+    const refusedCheck = { index: 1, kind: "run", text: "sub", why: "tier" as const };
+    const r = await accept({ dod, refusedCheck }, wrote("a.ts"), d);
+    const reason = "check 2 (run) cwd=sub: a per-check cwd= is honoured only in roles mode; nothing ran";
+    expect(r.verdict).toEqual({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] });
+    expect(exec).not.toHaveBeenCalled();
+  });
+
   it("without placements the verdict is the same and the runner receives none", async () => {
     const { exec, d, dod } = setup();
     const plain = await accept({ dod, workRoot: W }, wrote("a.ts"), d);

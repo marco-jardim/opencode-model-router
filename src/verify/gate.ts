@@ -142,7 +142,7 @@ export interface Delegation {
    * Cross-repo P2.4 (SD4): the first check whose `cwd=` is outside the work root and its read set (`why: "outside"`) or whose
    * `scope=` is not affected/full (`why: "scope"`); `index` is 0-based. With it the gate refuses (unverifiable, nothing runs).
    */
-  refusedCheck?: { readonly index: number; readonly kind: string; readonly text: string; readonly why: "outside" | "scope" };
+  refusedCheck?: { readonly index: number; readonly kind: string; readonly text: string; readonly why: "outside" | "scope" | "tier" };
 }
 
 export interface GateDeps {
@@ -311,9 +311,12 @@ export async function accept(
   // full: nothing runs, whichever verifier the DoD names.
   if (delegation.refusedCheck !== undefined) {
     const { index, kind, text, why } = delegation.refusedCheck;
+    // OD1=B: a tier dispatch (no routed role) honours no per-check `cwd=`; `text` is the cwd as written.
     const reason = why === "outside"
       ? `check ${index + 1} (${kind}) cwd=${text} is outside the work root ${workRoot ?? deps.deterministic.cwd} and its read set; nothing ran`
-      : `check ${index + 1} (${kind}) scope=${text} is not affected or full; nothing ran`;
+      : why === "tier"
+        ? `check ${index + 1} (${kind}) cwd=${text}: a per-check cwd= is honoured only in roles mode; nothing ran`
+        : `check ${index + 1} (${kind}) scope=${text} is not affected or full; nothing ran`;
     return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] }, dodSource, deps.strictUnverifiable);
   }
   const effectiveBaseDir = resolveBaseDir(
