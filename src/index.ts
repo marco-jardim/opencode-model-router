@@ -152,6 +152,7 @@ import {
   buildAcceptedSuffix,
 } from "./verify/dispatch";
 import { canonicalAuthorityPath, insideWorkRoot, requestedVerificationCwd, requestedVerificationCwdSource, verificationScope, type VerificationScope } from "./routing/roles/work-root";
+import { resolveCheckPlacements } from "./routing/roles/check-placement";
 import { createRepoProbe, displaySafe, readSetEligible, readSetPredicate } from "./routing/roles/read-set";
 import { newLadderState, recordAttempt, nextAction, advance, buildEscalatePolicy, formatLadderScorecard, startCostRatio } from "./escalate/ladder";
 import { createCatalogLookup, planFirstAttempt, planNextAttempt } from "./escalate/resume";
@@ -582,6 +583,21 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
    * the work root, a target outside the read set, and whenever cross-repo is not in use (no parents and no working set: I9).
    */
   const repoProbe = createRepoProbe();
+  /** The read set R (P1.5) of the role dispatches of `orchestrator`: its working set plus `routing.repoParents`. Undefined when R adds nothing. */
+  const readSetMemberOf = (orchestrator: string | undefined): ReturnType<typeof readSetPredicate> => {
+    const routing = resolveRolesRouting(cfg, "v2");
+    const workingSet = orchestrator === undefined ? [] : workingSetOf(orchestrator);
+    return readSetPredicate({ parents: routing.repoParents, depth: routing.repoDepth, exclude: routing.repoExclude }, workingSet, repoProbe);
+  };
+  /**
+   * Cross-repo P2a.3 (v2 only): R as a yes/no test on a canonical absolute path, for the role dispatch `routed` (its orchestrator's
+   * working set). Undefined when no R applies.
+   */
+  const roleReadSetFor = (routed: { readonly parentSessionID: string }): ((absPath: string) => boolean) | undefined => {
+    if (ctx.routerHost !== "v2") return undefined;
+    const member = readSetMemberOf(routed.parentSessionID === "" ? undefined : routed.parentSessionID);
+    return member === undefined ? undefined : (absPath) => member(absPath) !== undefined;
+  };
   const readProvenanceLine = async (input: any): Promise<string | undefined> => {
     const sid: unknown = input?.sessionID;
     if (ctx.routerHost !== "v2" || typeof sid !== "string" || !["read", "glob", "grep"].includes(input?.tool)) return undefined;
@@ -598,7 +614,6 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     if (target === undefined) return undefined;
     const canonical = canonicalAuthorityPath(target, workRoot);
     if (canonical === undefined || insideWorkRoot(canonical, workRoot) || !readSetEligible(target, canonical)) return undefined;
-    const routing = resolveRolesRouting(cfg, "v2");
     // The orchestrator that dispatched this role: its dispatch record, else the session's parent (as the v2 adapter's readSetOf).
     let orchestrator = lookupDispatch(sid)?.parentSessionID ?? undefined;
     if (orchestrator === undefined || orchestrator === "") {
@@ -606,8 +621,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       const parentID = res?.data?.parentID;
       orchestrator = typeof parentID === "string" && parentID !== "" ? parentID : undefined;
     }
-    const workingSet = orchestrator === undefined ? [] : workingSetOf(orchestrator);
-    const member = readSetPredicate({ parents: routing.repoParents, depth: routing.repoDepth, exclude: routing.repoExclude }, workingSet, repoProbe)?.(canonical);
+    const member = readSetMemberOf(orchestrator)?.(canonical);
     if (member === undefined) return undefined;
     // QA-1 F2: the name, branch and path come from the filesystem: display-safe.
     return `[router: read from ${displaySafe(member.name)} (${displaySafe(member.branch ?? "detached")}) at ${displaySafe(member.repository)} — read-only in this dispatch]`;
@@ -2491,6 +2505,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             // earlier attempt is gated at once (never deferred) on the child's cumulative change set (roleAttemptVerification).
             const routedRole = typeof input.callID === "string" ? routedRoleOf(input.callID) : undefined;
             const carriedRole = routedRole?.carried === true && childSessionID !== null && routedRole.resumeID === childSessionID;
+            // Cross-repo P2a.3 (v2 only): where each check of a routed role dispatch runs. The gate does not receive the placements yet.
+            // P2.7 interim: a DoD with any per-check `cwd=`/`scope=` is verified at once, never deferred (a later handle would not
+            // run the checks where they were placed). Tier dispatches resolve nothing and defer as before.
+            const placement = routedRole === undefined ? undefined : resolveCheckPlacements(dod, scope, { inReadSet: roleReadSetFor(routedRole) });
+            const perCheckPlacement = placement !== undefined && dod.checks.some((check) => check.cwd !== undefined || check.scope !== undefined);
             const orchestratorSessionID = typeof input.sessionID === "string" ? input.sessionID : "";
             const taskPrompt = typeof input?.args?.prompt === "string" ? input.args.prompt : undefined;
             const taskDescription = typeof input?.args?.description === "string" ? input.args.description : undefined;
@@ -2503,7 +2522,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             // deferred (isDeferred). QA-2.4-2: only a proven root orchestrator defers.
             // B2: the reason a deferred finish refused for a branch switch, carried into the artefact below.
             let deferredSwitch: string | undefined;
-            if (!scope.outside && !carriedRole && isDeferred(dod, start.directives, trivial) && await isProvenRootCaller(orchestratorSessionID)) {
+            if (!scope.outside && !carriedRole && !perCheckPlacement && isDeferred(dod, start.directives, trivial) && await isProvenRootCaller(orchestratorSessionID)) {
               // Section 1.5-16: no gate, no test process; the result goes back now with the
               // footer, which is appended last and never says accepted or verified.
               const finish = await finishDeferred(changedFileStore, {
