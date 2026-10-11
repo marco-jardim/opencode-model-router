@@ -80,12 +80,38 @@ Assign a new array (never push in place). `tailMessage(text)` = `{ role: "user",
 
 **Unconfirmed inputs (implementers check):** Appendix B layout (if it defines extra headers it wins; bound and overflow stay); C5 probe tail shape and consecutive `user` messages accepted; host markers + router hint ≤ 4 breakpoints (C6 showed 4 host markers incl. the message one — the router hint replaces the host's message marker, observed in C5 `userHint`); whether `pending.ts` prints ages; whether the verify report exposes handles.
 
+- 1.2.2 (`ses_ed689ff73ffekESjx6mvOPyrFs`) `2970839`; 1.2.4 (`ses_ed675cbeaffejaeieps18ZDTgb`) v1 characterisation golden `a4c6b21` recorded before the change, providers `03f6a58`; 1.2.5 (`ses_ed62dab9effeAvU64BvSfEMMjs`) `f0173e9` — deviation: the legacy ctx is built in `src\v2.ts` (not owned), so the registry reaches the legacy plugin through a non-enumerable `ROUTER_TURN_STATE_ATTACH` symbol on the returned hooks object (now exported from `turn-state.ts`, QA-1.2-1); `applyChildSystem` only appends to child sessions with a stored child system (no-op for roots); 1.2.6 (`ses_ed6282dfdffeX9C9CjPPD0vu7u`) `6e5b792`; 1.2.7 (`ses_ed61ff96cffe51HmQFMxZ2FRr0`) `0d5a52a`. 1.2.3 and 1.2.5.b/c not applicable (D5 withdrawn).
+
 ## Findings
+
+### Round 1 (heavy reviewer `ses_ed60f5d18ffeBJqbtGpLyJZiA4`, at `0d5a52a`) — 13 findings (2 blocking, 4 major, 5 minor, 2 nit)
+
+QA-1.2-1 (blocking) the attach symbol was a runtime export of `main`, breaking v1 loaders; -2 (blocking) the augmenter got the registry without a successful attach, losing the hint (routing-dispatch red); -3 (major) `smoke:routing` still read the hint from the system; -4 (major) the cache-prefix smoke compared prefixes one-sided; -5 (major) the O12 fallback walked back to an earlier text part, pinning the breakpoint during tool loops; -6 (major) no real route-hint / frozen `R:` line tests; -7 docs promised regeneration on agent-catalog change; -8 stale ROUTING_ENGINE.md:122 (owned by 1.1; fixed there) and missing handoff; -9 whitespace-only text hinted; -10 quadratic overflow trim; -11 dead `ctx.routerTurnState` channel; -12 (nit) "never on the tail" depends on the host's marker budget; -13 (nit) late-buffer housekeeping.
+
+### Round 2 (heavy reviewer `ses_ed5f2b6d4ffeUS0fegzJW3SoeL`, at `0947fac`) — 6 findings (1 major, 3 minor, 2 nit)
+
+Round-1 status: -1, -2, -6, -7, -10, -11, -13 fixed; -3, -4, -9 partial; -5 fixed in code. New: QA-1.2-14 (major) the scripted smoke provider read its commands from the `<router-state>` tail, so a root with state never dispatched; -15 the fallback could hint a part the host never sends; -16 ADR/plan and smoke header describe the old fallback; -17 trailing native system messages could break the prefix (unobserved); -18 (nit) attach reported success after a failed registration; -19 (nit) stale comment and permission-rule wording.
+
+### Round 3 (heavy reviewer `ses_ed5daafeaffe2BKNNv2MYVtZg7`, at `2cc4353`; majors only) — clean
+
+QA-1.2-14 fixed. Recorded: docs/pin still described the "last part whatever its type" fallback (fixed anyway, `docs(cache)` commit after `2cc4353`); with no router hint the host's automatic caching may mark the tail; a provider-executed `tool-result` in an assistant message still gets the hint; the tail skip in the smoke provider is pinned only by real-host smokes.
 
 ## Fixes
 
+- Round 1 (implementers `ses_ed5f9d1d1ffedOeKls1RqatXg1`, `ses_ed5f99c2effeNbVdI2fovbj2ul`; `0947fac`): symbol moved to `turn-state.ts`, `test\unit\main-exports.test.ts` pins `main` = `default` only (-1); attach returns `true` and only then does the augmenter get the registry; real advise hint asserted in the tail (`routing-dispatch.test.ts`) (-2); routing-engine smoke reads the hint from the last router-state message and asserts it absent from the system (-3); marker-free prefix comparison plus separate placement checks (-4); hint on the last visible text part of the last real message, else its last part, never an earlier message; tool-result golden rewritten (-5); real `route-hint`, early-return clearing, frozen `R:` line across outcomes + clock, recomputation on config/model/agent (-6); docs state the freeze key (-7); `trim()` (-9); one-pass trim (-10); channel removed (-11); `session.deleted` drops the buffer, LRU refresh on render, singular overflow line (-13).
+- Round 2 (implementer `ses_ed5e6d9b9ffeMmLukTWuqtTOEv`, `2cc4353`): the smoke provider reads `last`/`lastText`/`toolResult`/markers from the last message that is not a router-state tail (-14); fallback only to a `tool-result` or `media` part, else no hint (-15); smoke header (-16, code part); `observed.systemFold` (-17); attach rollback returns `false` (-18); comment and wording (-19).
+- Verification (orchestrator shell): 16 files / 351 tests green (turn-state, v2-turn-state, goldens incl. the unchanged v1 characterisation, docs-drift, routing-dispatch, main-exports, routing-wire.hint) plus v2-hooks, roles-protocol, router-verify-tool, deferred-verification, pending-list-transform (600 at `0947fac`); routing-host helper tests 8/8; typecheck 0; turn-state.ts coverage 99.18/96.05/100/100. Real v2.0.26 host at `2cc4353`: `cpx-cache-prefix` smoke passed (O12 observed: the tool_result block of request 4 carries the router's marker; no native system messages, no prefix differences); routing-engine smoke 2-advise and 4-ladder passed; 5-advisor fails also at the phase base (PF-4, pre-existing).
+
 ## Deferred findings
+
+- QA-1.2-12, QA-1.2-16 (ADR 0007 D4/O12 text, plan 1.2 lines ≈1329/1409/1416): orchestrator amendment in `cpx/main` (A-1.2-1), applied at merge.
+- Round-3 recorded minors: tail marked by the host when no router hint qualifies; provider-executed tool results. Observable only on real hosts; carried to the DF-1 dogfood pre-flight.
 
 ## Handoffs
 
+- To 1.1 (applied there, 1.1.5.b): `docs\ROUTING_ENGINE.md` ≈122 — on v2 the route hint is delivered in the per-turn router state, not the last system part.
+- To later phases that add turn-state providers (2.1 background notices, 3.1 plan status): register through the registry handed to the legacy plugin by `ROUTER_TURN_STATE_ATTACH`; the provider name `plan` and orders 0–9 are reserved for the plan provider; `render` must be synchronous and side-effect free apart from buffered state.
+
 ## Verdict
+
+PASS after QA round 3 (clean). v1 output byte-identical (characterisation golden recorded before the change).
