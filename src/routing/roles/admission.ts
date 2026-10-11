@@ -527,6 +527,8 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
     const refused: string[] = [];
     const searched: string[] = [];
     const seen = new Set<string>();
+    /** Locations matched by their worktree's directory name only (Q10), not by the repository's name. */
+    const viaDirectory = new Set<RepoLocation>();
     let visited = 0;
     let capped = false;
     for (const parent of parents) {
@@ -547,18 +549,24 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
             refused.push(result.reason);
             continue;
           }
-          if (!sameName(result.location.name, name)) continue;
-          const key = text(result.location.repository);
+          // Q10: the repository is named X, or the directory of this (linked) worktree is.
+          const byName = sameName(result.location.name, name);
+          if (!byName && !sameName(paths.basename(result.location.worktree), name)) continue;
+          // A repository counts once; a worktree directory counts once per worktree (two of them are ambiguous).
+          const key = byName ? text(result.location.repository) : `worktree:${text(result.location.worktree)}`;
           if (seen.has(key)) continue;
           seen.add(key);
           found.push(result.location);
+          if (!byName) viaDirectory.add(result.location);
         }
         if (capped || level === depth) break;
         frontier = frontier.flatMap(scanned);
       }
       if (capped) break;
     }
-    return { found, refused, searched, capped };
+    // A worktree directory X of a repository that is itself named X, found below the parents, is that repository: not a second match.
+    const named = new Set(found.filter((location) => !viaDirectory.has(location)).map((location) => text(location.repository)));
+    return { found: found.filter((location) => !viaDirectory.has(location) || !named.has(text(location.repository))), refused, searched, capped };
   };
 
   /** The worktree of a repository (`worktrees`, git's order) for `branch`, or the only one; admitted (and gated) by `admit`. */
@@ -631,10 +639,18 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
         return refuse(`repo=${repo} matches no repository below routing.repoParents (searched ${searched.length === 0 ? "nothing: none configured" : searched.join(", ")}): no work root.${notes}${stopped}`);
       }
       if (found.length > 1) {
+        // Q10: a match by a worktree's directory name is a work root, not a repository: list each as path, repository and branch.
+        if (found.some((location) => !sameName(location.name, repo))) {
+          const roots = found.map((location) => `${location.worktree} (repository ${location.name}, branch ${location.branch ?? `detached at ${short(location.head)}`})`);
+          return refuse(`repo=${repo} matches ${String(found.length)} work roots: ${joinAnd(roots)}: no work root. Name one with root="<path>".`);
+        }
         return refuse(`repo=${repo} matches ${String(found.length)} repositories: ${joinAnd(found.map((location) => location.repository))}: no work root. Name one with root="<path>".`);
       }
       const [location] = found;
       if (location === undefined) return refuse(`repo=${repo}: no work root.`);
+      // Q10: repo=X matched the directory of a linked worktree, not a repository name. Without branch= that worktree is the work root;
+      // with branch= the repository it belongs to decides (`pick`): the worktree on that branch, whatever its directory is called.
+      if (branch === undefined && !sameName(location.name, repo)) return admit(location.worktree, unique([...known, location.repository]));
       return pick(`repo=${repo}`, location, branch, known);
     }
 

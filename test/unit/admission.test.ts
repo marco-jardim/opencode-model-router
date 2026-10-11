@@ -332,6 +332,98 @@ describe("admission with real git", { timeout: 60_000 }, () => {
   });
 });
 
+describe("Q10 (real git): repo= also matches the directory name of a linked worktree", { timeout: 60_000 }, () => {
+  let base = "";
+  let parent = "";
+  let outside = "";
+  const env: NodeJS.ProcessEnv = {};
+
+  const git = (cwd: string, ...args: string[]): string =>
+    execFileSync("git", args, { cwd, env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+
+  const repo = (dir: string): void => {
+    mkdirSync(dir, { recursive: true });
+    git(dir, "init", "-q", "-b", "main");
+    git(dir, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "init");
+  };
+
+  const config = () => ({ parents: [parent], depth: 2, exclude: [] as string[] });
+  const session = () => ({ sessionRepository: join(parent, "lib-main") });
+
+  beforeAll(() => {
+    base = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-admission-q10-")));
+    for (const [key, value] of Object.entries(process.env)) if (!key.toUpperCase().startsWith("GIT_")) env[key] = value;
+    writeFileSync(join(base, "gitconfig"), "");
+    env.GIT_CONFIG_GLOBAL = join(base, "gitconfig");
+    env.GIT_CONFIG_NOSYSTEM = "1";
+    parent = join(base, "parent");
+    outside = join(base, "outside");
+    // lib-main: worktrees lib-wt (below the parent, branch wt-branch) and lib-other (outside, branch feat/other).
+    repo(join(parent, "lib-main"));
+    git(join(parent, "lib-main"), "worktree", "add", "-q", "-b", "wt-branch", join(parent, "lib-wt"));
+    git(join(parent, "lib-main"), "worktree", "add", "-q", "-b", "feat/other", join(outside, "lib-other"));
+    // A repository named shared, and a worktree directory shared of another repository.
+    repo(join(parent, "shared"));
+    repo(join(parent, "other"));
+    git(join(parent, "other"), "worktree", "add", "-q", "-b", "b-shared", join(parent, "org", "shared"));
+    // Two worktree directories named twin, of different repositories.
+    repo(join(parent, "a1"));
+    git(join(parent, "a1"), "worktree", "add", "-q", "-b", "a-twin", join(parent, "twin"));
+    repo(join(parent, "b1"));
+    git(join(parent, "b1"), "worktree", "add", "-q", "-b", "b-twin", join(parent, "org", "twin"));
+  }, 120_000);
+
+  afterAll(() => {
+    if (base !== "") rmSync(base, { recursive: true, force: true });
+  });
+
+  it("binds the linked worktree whose directory is named X", async () => {
+    const result = await createAdmission(config(), defaultAdmissionDeps()).resolve({ repo: "lib-wt" }, session());
+    expect(result).toMatchObject({ ok: true, location: { repository: join(parent, "lib-main"), name: "lib-main", worktree: join(parent, "lib-wt"), branch: "wt-branch" } });
+  });
+
+  it("binds the same worktree for the directory name + the branch of that worktree", async () => {
+    const result = await createAdmission(config(), defaultAdmissionDeps()).resolve({ repo: "lib-wt", branch: "wt-branch" }, session());
+    expect(result).toMatchObject({ ok: true, location: { repository: join(parent, "lib-main"), worktree: join(parent, "lib-wt"), branch: "wt-branch" } });
+  });
+
+  it("binds the worktree of the repository on another branch (pick), whatever its directory is called", async () => {
+    const admission = createAdmission(config(), defaultAdmissionDeps());
+    expect(await admission.resolve({ repo: "lib-wt", branch: "feat/other" }, session())).toMatchObject({
+      ok: true,
+      location: { repository: join(parent, "lib-main"), worktree: join(outside, "lib-other"), branch: "feat/other" },
+    });
+    expect(await admission.resolve({ repo: "lib-wt", branch: "main" }, session())).toMatchObject({ ok: true, location: { worktree: join(parent, "lib-main"), branch: "main" } });
+    expect(await admission.resolve({ repo: "lib-wt", branch: "nope" }, session())).toEqual({ ok: false, reason: expect.stringContaining("no worktree of lib-main is on nope") });
+  });
+
+  it("refuses a repository named X and a worktree directory X of another repository as ambiguous, listing both", async () => {
+    const admission = createAdmission(config(), defaultAdmissionDeps());
+    const reason = `repo=shared matches 2 work roots: ${join(parent, "shared")} (repository shared, branch main) and ${join(parent, "org", "shared")} (repository other, branch b-shared): no work root. Name one with root="<path>".`;
+    expect(await admission.resolve({ repo: "shared" }, session())).toEqual({ ok: false, reason });
+    expect(await admission.resolve({ repo: "shared", branch: "main" }, session())).toEqual({ ok: false, reason });
+  });
+
+  it("refuses two worktree directories named X of different repositories as ambiguous, listing both", async () => {
+    const result = await createAdmission(config(), defaultAdmissionDeps()).resolve({ repo: "twin" }, session());
+    expect(result).toEqual({
+      ok: false,
+      reason: `repo=twin matches 2 work roots: ${join(parent, "twin")} (repository a1, branch a-twin) and ${join(parent, "org", "twin")} (repository b1, branch b-twin): no work root. Name one with root="<path>".`,
+    });
+  });
+
+  it("leaves repository-name lookups unchanged", async () => {
+    const admission = createAdmission(config(), defaultAdmissionDeps());
+    expect(await admission.resolve({ repo: "a1" }, session())).toEqual({
+      ok: false,
+      reason: `repo=a1 has 2 worktrees: ${join(parent, "a1")} → main; ${join(parent, "twin")} → a-twin: no work root. Add branch=<name>, or name one with root="<path>".`,
+    });
+    expect(await admission.resolve({ repo: "a1", branch: "a-twin" }, session())).toMatchObject({ ok: true, location: { worktree: join(parent, "twin"), name: "a1" } });
+    expect(await admission.resolve({ repo: "lib-main", branch: "wt-branch" }, session())).toMatchObject({ ok: true, location: { worktree: join(parent, "lib-wt") } });
+    expect(await admission.resolve({ repo: "nowhere" }, session())).toEqual({ ok: false, reason: expect.stringContaining("repo=nowhere matches no repository below routing.repoParents") });
+  });
+});
+
 describe("QA round 1 (real git): every admission passes the final gates", { timeout: 60_000 }, () => {
   let base = "";
   let parent = "";
