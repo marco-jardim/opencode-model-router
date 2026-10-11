@@ -210,12 +210,89 @@ named on the route line with `root=<absolute path>` (and repeated in ENVIRONMENT
 
 ### Repositories below parent directories (cross-repo)
 
-`routing.repoParents`, `routing.repoDepth` and `routing.repoExclude` (global only, OpenCode v2 roles mode, inert on v1)
-name the directories whose repositories role dispatches may work in besides the session repository, without a
-per-repository list: a git top level 1 to `routing.repoDepth` levels below a parent (default 2) is admissible, and so
-are its worktrees. A dispatch still has one work root; the route line names it with `root=`, or by `repo=<name>` and
-`branch=<ref>`, which the router checks against git. The admission rules, the read set and the verification perimeter
-are specified in [the cross-repo design](./design/cross-repo.md).
+`routing.repoParents`, `routing.repoDepth` (1–4, default 2) and `routing.repoExclude` are global-only keys (OpenCode v2
+roles mode, inert on v1). They name the directories whose repositories role dispatches may work in besides the session
+repository, without a per-repository list:
+
+```jsonc
+{ "routing": { "delegation": "roles", "repoParents": ["D:/git"] } }
+```
+
+Registration adds a `<parent>/*` `external_directory` allow pattern to the local roles, so a repository cloned later
+needs no restart. Changing `repoParents` does need one, and a parent must exist when the agents are registered.
+
+**Naming the work root.** A dispatch still has one work root and edits only there. The route line names it with
+`root=`, or by repository name and branch, which the router checks against git (values keep their case; an invalid
+value is ignored):
+
+```text
+[route class=implement needs=edit repo=app-a branch=feat/login]
+```
+
+`repo=` looks up `<parent>\<name>`, then `<parent>\*\<name>`. A name that matches several repositories, or a repository
+with several worktrees and no `branch=`, is refused and the candidates are listed. `root`, `repo` and `branch` must
+agree when given together. With parents set, the protocol tells the orchestrator: name another repository with
+`repo=<name>` (and `branch=<ref>` when it has several worktrees) instead of `root=`; each dispatch edits one
+repository, and a role may read the others below `routing.repoParents`. The router's dispatch header, which names the
+session's repositories and the readable parents, is built for tier dispatches only; a role dispatch learns its
+location from refusals and from read provenance.
+
+**Admission.** On a v2 roles dispatch, when parents are set or `repo=`/`branch=` is given, the work root is bound
+through admission. It is admitted when either:
+
+1. it is a git top level 1 to `repoDepth` levels below a parent (never the parent itself), its canonical path stays
+   below that parent, and it is not excluded by `repoExclude`; or
+2. it is a worktree that a known repository lists: the session repository, or a repository in the session's working
+   set.
+
+Text checks come before any git call: UNC, device, 8.3 and `..` paths are refused. The grant carries the repository,
+branch and worktree. The orchestrator session keeps a working set of up to 16 bound roots, forgotten when the session
+is deleted.
+
+**Read set.** A role may read, `glob` and `grep` in the work root, in the worktrees of the working set, and in
+directories inside an admissible repository below the parents (checked with a synchronous `.git` probe, cached for 5
+seconds). `external_directory` access to those directories is allowed in addition when the action is a read. A read
+outside the work root but inside the read set is annotated:
+
+```text
+[router: read from lib-b (main) at D:\git\lib-b — read-only in this dispatch]
+```
+
+**Edit refusals.** Edits stay in the work root. An edit elsewhere in the read set is refused with a message that says
+where the path lives and what to do:
+
+- same repository, other worktree: `edit: <path> is in worktree <wt> (repository <name>, branch <b>); this dispatch
+  edits only in <W> (branch <wb>). The same file in your work root is <W>\<rel>.`
+- another admitted repository: `edit: <path> is in repository <name> (branch <b>), which this dispatch may read but
+  not edit. Finish the <W name> part and return NEED MORE: naming the <name> change; it needs a dispatch with
+  repo=<name>.`
+
+Any other path outside the read set keeps the earlier text (`read: <path> is outside this dispatch's work root <root>
+(use an absolute path inside it)`). The worktree re-checks and `router_git_*` check against the binding's repository.
+A host `ask` for `external_directory` inside the work root or the read set is lifted to `allow` for an exactly bound
+session; a deny is never changed.
+
+**Verification perimeter.** For a role dispatch with a cross-repo location, or whose session working set holds other
+repositories, the perimeter is the work root's repository, the working-set worktrees, and the admitted repositories
+the work root links to through `node_modules` (store links excluded), at most 16, snapshotted at dispatch and at the
+gate. When a root in the perimeter changed, or could not be observed, while the producer ran a tool that can write
+anywhere, the result is unverifiable: `the repository <name> at <root> also changed during the dispatch, and the
+producer ran <tools>; a write there cannot be attributed, so the checks in <W> do not cover it. Dispatch that work with
+repo=<name>, or verify it there.` (`could not be observed during the dispatch` for a missing snapshot). A pass with
+more than one root carries the evidence line `verified scope: <W> (<branch> @ <head7>); also observed: …` in the
+verdict reasons; accepted results do not display pass reasons today. Such a dispatch is not deferred (reason
+`cross-repo`).
+
+**Limits.**
+
+- A worktree outside the parents (for example under `%TEMP%`) is admitted by rule 2, but the registered policy ends in
+  a catch-all `deny` that the hook-level allow cannot override, so it still needs a `routing.workRoots` glob in long
+  form or a restart; the same holds for a worktree of the session repository created after registration. Creating
+  worktrees below a parent avoids this.
+- Changing `routing.repoParents` needs a restart.
+- The dispatch header is built for tier dispatches only.
+
+The rest of the design is in [the cross-repo design](./design/cross-repo.md).
 
 ## Tier floor
 

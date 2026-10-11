@@ -1,6 +1,6 @@
 # Cross-repo work in roles mode
 
-**Status:** Accepted 2026-10-10 (owner). Phase 0 implemented (P0.1–P0.4); QA round 1 fixes applied; QA round 2 pending.
+**Status:** Accepted 2026-10-10 (owner). Phase 0 implemented and QA'd; Phase 1 implemented (P1.1–P1.10); Phase 1 QA pending.
 **Scope:** roles mode on OpenCode v2 (`routing.delegation: "roles"`). Phase 0 changes the shared verification engine and applies to both hosts.
 **Configuration keys** marked *proposed (not implemented)* do not exist yet.
 **File references** are `path:line` as of 2026-10-10. Line numbers drift; the function names are the stable reference.
@@ -97,7 +97,7 @@ A directory D is **admitted** when any rule holds:
 - Each parent is passed to the existing glob machinery as `<parent>/*`. `workRootPattern("D:/git/*")` (`src/router/role-agents.ts:215-236`) takes the static directory `D:/git/`, resolves it with `realpathSync.native`, and builds `D:\git\*`. That pattern passes `workRootProblem`. `externalDirectoryPatterns` (`role-agents.ts:242-263`) adds it like any `routing.workRoots` entry, and `registerRoleAgents` writes it into every local role (`role-agents.ts:347-354`).
 - The host's `*` crosses separators (`docs/ROLES.md:194-197`; the v2 permissions docs say "`*` Zero or more characters, including /", with backslashes normalised and case-insensitive matching on Windows), so the one pattern covers every depth and every clone made later. **New clones under a parent need no restart.** Depth, exclusion and the git top-level test are enforced by the router's permission hook, not by the host pattern. The host pattern is wider than admission, as with `routing.workRoots` today.
 - **The parent must exist when the agents are registered.** Otherwise it gets no pattern and a warning (`role-agents.ts:229-231`, `:348`).
-- **Worktrees outside every parent are not covered by the parent pattern.** Registration lists only the session repository's worktrees (`role-agents.ts:339-347`). Until the hook-level allow lands (P4.5, D13):
+- **Worktrees outside every parent are not covered by the parent pattern.** Registration lists only the session repository's worktrees (`role-agents.ts:339-347`). The hook-level allow (P4.5, D13) does not close this gap: role agents are registered from a catch-all `*: deny` policy, so a directory outside the registered patterns gets a static deny, which the lift never overrides (see Q7). Therefore:
   - A worktree of another repository outside the parents (for example under `%TEMP%`) is admitted by the router, but the host has no allow rule for its directory. It needs a `routing.workRoots` glob that covers it, written in long form. The usual 8.3 spelling of `%TEMP%` is refused (`roles-config.ts:218`).
   - A worktree of the session repository is covered if it existed at registration. One created later needs a glob or a restart (`docs/ROLES.md:188-191`).
   - Recommendation: create worktrees under a parent (for example `D:\git\app-a-login`).
@@ -162,7 +162,7 @@ Allow once = this dispatch only. Allow always = until it expires. Reject = no wo
 
 **Host permission for approved repositories.** An approved repository outside the parents has no registered `external_directory` allow pattern. Two ways to grant it; the second is chosen (D13):
 - Re-register the role agents (a restart, or a verified hot reload). This breaks "no restart".
-- **Hook-level allow (approved, D13).** In a role session with an exact binding, the router lifts the host's `ask` to `allow` for `external_directory` resources inside the grant's W or R. A configured `deny` stays final. This changes the current rule that the router only ever narrows a role's decision (`v2-hooks.ts:1257`). It also removes the restart and the `%TEMP%` gap for worktrees outside the parents (above).
+- **Hook-level allow (approved, D13).** In a role session with an exact binding, the router lifts the host's `ask` to `allow` for `external_directory` resources inside the grant's W or R. A configured `deny` stays final. This changes the current rule that the router only ever narrows a role's decision (`v2-hooks.ts:1257`). It does not remove the restart or the `%TEMP%` gap for worktrees outside the parents (above): the registered catch-all is `*: deny`, a static deny, which the lift never overrides. Only an `ask` is lifted, so a directory the registered patterns do not cover still needs a `routing.workRoots` glob or a restart (Q7).
 
 **Revocation and listing.** Delete the entry or the file. A listing command (proposed: `/router repos`) shows approvals, last use and expiry.
 
@@ -254,8 +254,7 @@ in D:\git\app-a-login (branch feat/login). The same file in your work root is D:
 edit: D:\git\lib-b\src\index.ts is in repository lib-b (branch main), which this dispatch may read but not edit.
 Finish the app-a part and return NEED MORE: naming the lib-b change; it needs a dispatch with repo=lib-b.
 
-read: C:\Users\x\notes\a.md is outside this dispatch's work root D:\git\app-a-login and outside every repository
-below routing.repoParents (D:\git).
+read: C:\Users\x\notes\a.md is outside this dispatch's work root D:\git\app-a-login (use an absolute path inside it)
 
 router_run: cwd D:\git\lib-b is repository lib-b (branch main); this dispatch runs only in its work root
 D:\git\app-a-login (repository app-a, branch feat/login).
@@ -265,6 +264,8 @@ D:\git\app-a-login (repository app-a, branch feat/login).
 - A host denial for a worktree outside the parents (section 3) is the host's own message, which the router cannot change.
 
 ### Dispatch header (only when `routing.repoParents` is configured or an approval exists)
+
+Implemented for tier dispatches only; role dispatches get no header (see the notes under section 7, Phase 1).
 
 ```text
 Working directory: D:\git\app-a-login (repository app-a, branch feat/login at 3f2c1a9). You are already there — do not ask permission to read or write inside it.
@@ -420,6 +421,15 @@ Each slice lands test-first: the failing test reproduces the scenario row, then 
 | P1.9 | `src/index.ts` `tool.execute.after` (near `:2347`) | Add the read-provenance line to role reads outside W, only when configured. |
 | P1.10 | `docs/ROLES.md` "Work roots" (`:171-209`), `docs/CONFIG_REFERENCE.md`, `test/unit/docs-drift.test.ts:1126-1127` | Document the keys and add them to the docs-drift key list. Keep the pinned sentences at `docs/ROLES.md:207-208` (`docs-drift.test.ts:1078-1079`). |
 
+**Implemented (notes).** Deviations from the steps above, checked against the code at HEAD 2511f68:
+
+- **Working set at grant time.** The orchestrator session's working set (up to 16 bound roots, forgotten on session deletion) is filled when a grant is bound, not when the dispatch returns.
+- **Header only for tier dispatches.** The dispatch header is built only for tier dispatches. When cross-repo is in use it names the session's repositories and the readable parents. Role dispatches get no header; their location reaches them through refusals and the read provenance line.
+- **D13 limit.** The hook-level allow lifts an `ask` for `external_directory` inside W or R for an exactly bound session; a deny is never changed. Role agents are registered from a catch-all `*: deny`, so a directory outside the registered patterns (parents, `workRoots`, the session repository's worktrees at registration) is a static deny. A worktree outside the parents still needs a `routing.workRoots` glob or a restart (Q7).
+- **Read refusal text kept.** A read outside W and outside the read set keeps today's text (`read: <path> is outside this dispatch's work root <root> (use an absolute path inside it)`); only edit refusals carry the location.
+- **Link roots named by basename.** The perimeter names a repository reached through `node_modules` links by the basename of its root.
+- **The perimeter does not defer.** A role dispatch with a cross-repo location, or whose session working set holds other repositories, is not deferred (reason `cross-repo`).
+
 ### Phase 2 — consumer checks, pinning, deferred P
 
 | Step | File:function | Change |
@@ -447,7 +457,7 @@ Each slice lands test-first: the failing test reproduces the scenario row, then 
 | P4.2 | new `src/routing/roles/approvals.ts` | The approval store: read, write through a tmp file and rename (as `writeState`, `config.ts:2862-2868`), identity check (path and root-commit set), sliding expiry with the 90-day cap, protected locations. |
 | P4.3 | `src/routing/roles/admission.ts` (P1.2); `dispatch.ts` `resolveRoleWorkRoot` | Admission rule 3. An unapproved candidate gives no work root and a note that carries the approval request. |
 | P4.4 | `src/compat/v2-hooks.ts` evaluate hook (`:1228-1264`) | Either set `effect = "ask"` on the orchestrator's `subagent` evaluation for an unapproved candidate (T1), and record the reply from `permission.replied` (T3); or accept the router-issued challenge in `tool.execute.after` for `question` (`src/index.ts`, T5). |
-| P4.5 | `src/compat/v2-hooks.ts` role branch of the evaluate hook (`:1257-1264`) | Lift `ask` to `allow` for `external_directory` resources inside the bound grant's W or R (D13, I18). A configured `deny` stays final. It does not depend on approvals and can land with Phase 1: it also removes the restart and the `%TEMP%` gap for worktrees outside the parents. |
+| P4.5 | `src/compat/v2-hooks.ts` role branch of the evaluate hook (`:1257-1264`) | Lift `ask` to `allow` for `external_directory` resources inside the bound grant's W or R (D13, I18). A configured `deny` stays final. It does not depend on approvals and can land with Phase 1. It does not remove the restart or the `%TEMP%` gap for worktrees outside the parents: the registered catch-all is a static `*: deny` that the lift never overrides (Q7). |
 | P4.6 | command registration (where the plugin registers its commands) | `/router repos`: list approvals, last use and expiry. |
 | P4.7 | `docs/ROLES.md`, `docs/CONFIG_REFERENCE.md`, docs-drift key list | Document the approval flow, the store, expiry and revocation. |
 
@@ -480,7 +490,7 @@ Each slice lands test-first: the failing test reproduces the scenario row, then 
 - **Pass is scoped to P.** A script write outside P is not observed, and a pass names P (I8).
 - **Fail-closed scope of P0.1.** Any absolute path outside the repository that a write tool touched (for example a scratch file in the temp directory), mixed with repository edits, makes the result unverifiable. This is deliberate; there is no temp-directory exemption.
 - **Parallel cross-repo dispatches.** When dispatches that run `router_run` work in parallel in repositories that are in each other's P, each sees the other's changes, and both become unverifiable (I4) until Q3 is decided.
-- **Worktrees outside the parents** need a `routing.workRoots` glob in long form, or a restart for the session repository's worktrees, until the hook-level allow lands (P4.5, D13). `%TEMP%` is often spelled in 8.3 form, which is refused.
+- **Worktrees outside the parents** need a `routing.workRoots` glob in long form, or a restart for the session repository's worktrees; the hook-level allow (D13) does not change this, because the registered catch-all is a static deny (Q7). `%TEMP%` is often spelled in 8.3 form, which is refused.
 - **Changing `routing.repoParents`** needs a restart for the host patterns.
 - **The host pattern `<parent>\*` is wider than admission.** The router's hook narrows it, and an unknown binding gets no `external_directory` at all (`v2-hooks.ts:599`).
 - **R is wide.** Every repository below the parents is readable by every local role, including files such as `.env`. Roles hold no egress together with local actions (`policy.ts:171-174`), but results flow through the orchestrator (`docs/ROLES.md:163-164`).
@@ -517,6 +527,7 @@ Each slice lands test-first: the failing test reproduces the scenario row, then 
 - **Q4.** Decided 2026-10-10: hook-level allow approved (D13, I18).
 - **Q5.** Approval defaults: 14 days after last use and a 90-day cap. Should an approval offer a read-only variant (R only, never W)?
 - **Q6.** Same-branch history rewrite across a roles lineage: carried attempts compare names and heads only.
+- **Q7.** Make the router's generated external_directory catch-all `ask` instead of `deny`, so the router decides (owner call; a background child could wait on a prompt if the hook does not run).
 
 **To verify during implementation**
 - That the host's `*` matches across separators on the installed version.

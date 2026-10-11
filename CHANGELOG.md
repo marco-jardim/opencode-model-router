@@ -10,10 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - README: 90-second demo video below the title.
-- **Cross-repo work in roles mode (OpenCode v2; inert on v1), in progress (#107).** New global-only keys
-  `routing.repoParents`, `routing.repoDepth` (1–4, default 2) and `routing.repoExclude` name the directories whose
-  repositories role dispatches may work in; the route line accepts `repo=<name>` and `branch=<ref>` (case kept). The
-  binding that uses them follows; until then they are validated and have no effect.
+- **Cross-repo work in roles mode (OpenCode v2; inert on v1) (#107).** New global-only keys `routing.repoParents`,
+  `routing.repoDepth` (1–4, default 2) and `routing.repoExclude` name the directories whose repositories role
+  dispatches may work in; registration adds `<parent>/*` `external_directory` allow patterns, so new clones need no
+  restart. The route line accepts `repo=<name>` and `branch=<ref>` (case kept), and the work root is bound through
+  admission (a git top level below a parent, or a worktree of a known repository). A role may read, glob and grep the
+  work root, the session's working set and the admissible repositories below the parents (reads outside the work root
+  are annotated `[router: read from <name> (<branch>) …]`) but edits only in its work root; edit refusals name the
+  other worktree or repository and the `repo=` dispatch needed. The verification perimeter snapshots the repository,
+  the working set and `node_modules`-linked repositories; an unattributable write there makes the result
+  unverifiable. The protocol and the tier dispatch header gain a cross-repo sentence. Limit: a worktree outside the
+  parents still needs a `routing.workRoots` glob or a restart.
 
 ### Removed
 
