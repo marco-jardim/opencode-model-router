@@ -1100,12 +1100,55 @@ Gate table cell by cell (12 legal pairs, each with trigger and owner; `awaiting-
 
 2.3 `validate` codes `qa-multiple`, `shared-context-header`; 3.1.4 renders through `formatLaunchPrompt`; 3.1.5 adds `bootID` and the context pin in v2-client; 4.2.2 routes `qa-cap` answers; the 3.2 test "a revert that conflicts: the culprit is parked" reads as R11 ("the phase is paused").
 
+### 1.4.1-A2 Contract addendum (binding; QA-1.4 round 2 at `2c15732`; implementer `ses_ed62869d2ffe0QW14CTDMv12W8`)
+
+**Precedence:** A2 amends A1; A3 amends A2-2.
+
+- **A2-1 (QA-1.4-21) suite batches.** The gate change into `suite-running` and the suite's ISS are one Q batch; the suite's closing ISE and the gate change out of `suite-running` (`suite-passed` / `suite-culprit-found`) are one batch; the same holds for `suite-rerun`. `checkPhase` on gate `suite-running` with no open phase-suite entry **with `phaseId` = this phase** means "start the suite, no gate event" (journals the ISS only); this covers every rollback by `resume()`, running or paused. Recovery row: gate `suite-running`, no open entry → `checkPhase`. The runtime calls `checkPhase` when a paused plan resumes (`status-changed paused→running`).
+- **A2-2 (QA-1.4-22) lease seam.** Superseded by A3.
+- **A2-3 (QA-1.4-24) row 4b for a qa task.** The batch writes G1 (`awaiting-qa→qa-running`, `qa-dispatched`, Rt) then G2 (`qa-running→awaiting-qa`, `qa-requeued`, Rt); each `from` equals the gate at that point; the gate ends where it started.
+- **A2-4 (QA-1.4-25) load rules.** Batch-framing rules (2) and (3) apply to the main journal only; history is checked for strictly increasing `seq` and a torn last line only; `read()` and `open()` both drop a trailing incomplete batch.
+- **A2-5 (QA-1.4-26) `resume()` step 0.** Writes `status-changed running→paused` only when the plan is `running`; always raises the inbox item.
+- **A2-6 (QA-1.4-27) attempt end time.** The runtime journals `attempt-ended.endedAt = max(end.endedAt, attempt.startedAt)`; `startedAt` is never rewritten.
+- **A2-7.** `LedgerWriter.wakeKeys()` is built from history at open and updated on every append (A1-6 rules copied into the `Waker` doc); `GATE_TRIGGER_OWNERS` refines the pair owners (`qa-requeued` → Rt, P, Q; `qa-cap` → QL); `RESERVED_TASK_IDS` (`constructor`, `toString`, `__proto__`, `hasOwnProperty`, `valueOf`, `prototype`) are rejected; maps keyed by task id use own-property lookups.
+
+### 1.4.1-A3 Lease seam (binding; QA-1.4 round 3 at `4a79bfa`; replaces A2-2)
+
+- **Identity (QA-1.4-32).** `leaseTaskRef(planId, taskId)` = `${planId}:${taskId}` (unique per process; neither grammar allows `:`); `leaseHolderID(planId, taskId)` = `plan:${planId}:${taskId}`. Every task lease is held by `{holderID: leaseHolderID, tree: slot path, isChild: true, taskRef: leaseTaskRef, scope: "until-integrated"}`; a plan child joins through the 2.1 guard with its own holderID, the same taskRef and scope, and tree = slot path (re-entrant, same owner).
+- **Seam (QA-1.4-33).** `LeaseService` is per plan over the ONE process-wide Phase 1.3 registry and never calls `registry.restore`. `acquireTask({taskId, tree, writes})`: `[]` → ok with no registry call; else one atomic `acquireWrite(holder, writes)`; `held | unknown-target` → `held` with the holders the registry names (at least one). `rebuild(tasks)` at open/takeover after slots are resolved: `releaseTask` every task of the plan, then re-acquire for every task with `slot !== null` and writes; touches no holder outside the plan; returns the tasks it could not re-take (the runtime raises one inbox item each). `LeaseView.holder(path)` returns `LeaseHolderInfo {planId|null, taskId|null, holderID}`; a holder of another plan or none is "not a plan task" under R6 (`lease-unresolvable`).
+- **Release callers (QA-1.4-34).** `releaseTask` runs after the fsync of every batch that writes `TS(null)` for the task, by the module that wrote it (A1-2.4 release column): Rt rows 6, 9, 14, 15qa, 18b, 20, 22, 24, 27, 29, 39 (abort included); Q rows 5, 13, 19, 30, 33; P rows 17, 36; for a live child being cancelled, after its completion settles. **Rt acquires** the leases before the row-4 batch and releases them if `append` fails or the builder returns `[]`.
+
 ## Findings
+
+### Round 1 (heavy reviewer `ses_ed6996549ffefS1pVZWovl66Uf`, at `168a25c`) — 20 findings (1 critical, 8 major, 9 minor, 2 nit)
+
+QA-1.4-1 (critical) a QA task retried or answered could never be relaunched (gate stuck in `qa-running`); -2 (major) "atomic batch" undeliverable without framing; -3 (major) only `integrating` tasks resumed after rotation; -4 (major) child run not pinned to the gated context; -5 (major) contradictory launch-failure rules; -6 (major) wake keys collide across restarts; -7 (major) QA round cap had no exit; -8 (major) guards missed invariants; -9 (major) the `src/executor/**` coverage gate not enforced in CI; -10 header parse position; -11 vacuous fuzz; -12 memo lookahead wrong; -13 slot/lease/token per row; -14 R12 counting; -15 mutable defaults; -16 `sessionID` on read-only calls; -17 verdict ref and learned footprints; -18 `exportPlan` history; -19 (nit) draft `seq`; -20 (nit) queue gating and abort order.
+
+### Round 2 (heavy reviewer `ses_ed63c87ceffenj8X7FV7VMe6oM`, at `2c15732`) — 11 findings (2 major, 5 minor, 4 nit)
+
+`types.ts` matches A1. New: QA-1.4-21 (major) a phase could stay in `suite-running` forever; -22 (major) no lease seam; -23 wake-key dedupe source; -24 row 4b gate sequence for qa tasks; -25 load rules for history; -26 `resume()` halt in a paused plan; -27 attempt end before start; -28 (nit) oracle git ids; -29 (nit) per-trigger gate owners; -30 (nit) coverage script function drift; -31 (nit) reserved task ids.
+
+### Round 3 (heavy reviewer `ses_ed620333fffehkY719rxxYFjHT`, at `4a79bfa`; majors only) — 3 major
+
+QA-1.4-21 fixed; QA-1.4-22 partial: QA-1.4-32 (major) task refs not unique across plans; -33 (major) `rebuild` as `restore` would wipe other plans' leases, and the seam lacked tree and holder identity; -34 (major) release callers contradicted A1-2.4. Recorded minors: "every holder listed" vs the registry's single named holder and non-atomic per-path calls (settled by A3); A2-2 "the launcher acquires" (settled by A3: Rt); null `sessionID` vs `string` holders (settled by `LeaseHolderInfo`); A2-1 rollback wording and per-phase entry (settled in A2-1 above); (nit) un-pausing a single phase is not a `checkPhase` trigger (unreachable today; handoff to 3.2).
 
 ## Fixes
 
+- Round 1: contract addendum A1 (architect `ses_ed689bce6ffeVMf77avXeJC2cu`) implemented in `types.ts` with oracle-based fuzzing (implementer `ses_ed660b574ffevqpAdgIXaKssb8`, `2c15732`); coverage gate: `scripts\coverage-gate.ts` + prefix entries with function thresholds in `scripts\coverage-merge.mjs`, `src/executor/` gated 90/90/90 in the CI `coverage-merge` job (implementer `ses_ed6608221ffeua0J1HDSAmtpRA`, `ed9cb6e`).
+- Round 2: A2 (implementer `ses_ed62869d2ffe0QW14CTDMv12W8`, `4a79bfa`).
+- Round 3: A3 (implementer `ses_ed60f86b6ffeO9x7NbgT755Iqx`, `6071f54`).
+- Verification (orchestrator shell, `6071f54`): executor-types 214 + coverage-merge 20 tests green; typecheck 0; types.ts coverage 99.31/99.63/100/100 (at `4a79bfa`).
+
 ## Deferred findings
+
+- None open in this phase. Consumer follow-ups below.
 
 ## Handoffs
 
+- A1-12: 2.3 `validate` codes `qa-multiple`, `shared-context-header`; 3.1.4 renders through `formatLaunchPrompt`; 3.1.5 adds `bootID` and the context pin in v2-client; 4.2.2 routes `qa-cap` answers; the 3.2 test "a revert that conflicts: the culprit is parked" reads as R11.
+- A3: 2.1 binds plan children with `taskRef = leaseTaskRef(planId, taskId)`, `scope: "until-integrated"`, tree = slot path; 3.1 implements `LeaseService` over the Phase 1.3 registry and raises one inbox item per `rebuild` failure; 3.2 considers un-pausing a single phase as a `checkPhase` trigger.
+- `engines` allows Node 22.0–22.17, where the coverage-merge `.ts` imports need type stripping (≥ 22.18): pre-existing, outside this phase.
+
 ## Verdict
+
+PASS after QA round 3 (majors QA-1.4-32/33/34 fixed in `6071f54`; no round 4 by rule).
