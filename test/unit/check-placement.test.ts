@@ -8,8 +8,8 @@ import type { Check, DoD } from "../../src/verify/dod";
 
 const dodOf = (checks: Check[]): DoD => ({ kind: "deterministic", checks, criteria: [], deliverable: null, source: "explicit" });
 
-// base/w (a repository, the work root W) with w/pkg; base/other (another repository in R) with other/sub; base/lib (a
-// repository next to W); base/outside (no repository of its own).
+// base/w (a repository, the work root W) with w/pkg, w/my-library~2 and w/vendor (a nested repository inside W); base/other
+// (another repository in R) with other/sub; base/lib (a repository next to W); base/outside (no repository of its own).
 let base = "";
 let w = "";
 let other = "";
@@ -22,7 +22,8 @@ beforeAll(() => {
   other = join(base, "other");
   lib = join(base, "lib");
   outside = join(base, "outside");
-  for (const dir of [join(w, ".git"), join(w, "pkg"), join(other, ".git"), join(other, "sub"), join(lib, ".git"), outside]) {
+  const dirs = [join(w, ".git"), join(w, "pkg"), join(w, "my-library~2"), join(w, "vendor", ".git")];
+  for (const dir of [...dirs, join(other, ".git"), join(other, "sub"), join(lib, ".git"), outside]) {
     mkdirSync(dir, { recursive: true });
   }
 });
@@ -76,11 +77,13 @@ describe("resolveCheckPlacements (cross-repo P2.2)", () => {
     expect(inReadSet).toHaveBeenCalledWith(outside);
   });
 
-  it("refuses UNC, 8.3 and `.git` paths before any filesystem probe, read-set or top lookup", () => {
+  // QA round 1 #7: the 8.3 case `D:\PROGRA~1\x` moved out of this cross-platform list on purpose; it is a win32-only refusal now
+  // (see the two short-name tests below).
+  it("refuses UNC and `.git` paths before any filesystem probe, read-set or top lookup", () => {
     const inReadSet = vi.fn(() => true);
     const topOf = vi.fn(() => w);
     const canonical = vi.fn(canonicalAuthorityPath);
-    for (const cwd of ["\\\\server\\share\\x", "//server/share/x", "D:\\PROGRA~1\\x", join(other, ".git", "hooks"), join(w, ".git"), join(w, ".GIT")]) {
+    for (const cwd of ["\\\\server\\share\\x", "//server/share/x", join(other, ".git", "hooks"), join(w, ".git"), join(w, ".GIT")]) {
       const result = resolveCheckPlacements(dodOf([{ kind: "run", command: "npm test", cwd }]), verificationScope(undefined, w), {
         inReadSet,
         topOf,
@@ -91,6 +94,87 @@ describe("resolveCheckPlacements (cross-repo P2.2)", () => {
     expect(inReadSet).not.toHaveBeenCalled();
     expect(topOf).not.toHaveBeenCalled();
     expect(canonical).not.toHaveBeenCalled();
+  });
+
+  it("refuses trailing-dot/space `.git` variants (`.git.`, `.git `) before any filesystem probe (QA round 1 #6)", () => {
+    const inReadSet = vi.fn(() => true);
+    const topOf = vi.fn(() => w);
+    const canonical = vi.fn(canonicalAuthorityPath);
+    const cwds = [".git.", ".git ", ".GIT..", ".git. ", "pkg/.git./x", join(w, ".git."), join(w, ".git ", "hooks"), join(other, ".Git.", "hooks")];
+    for (const cwd of cwds) {
+      const result = resolveCheckPlacements(dodOf([{ kind: "run", command: "npm test", cwd }]), verificationScope(undefined, w), {
+        inReadSet,
+        topOf,
+        canonical,
+      });
+      expect(result).toEqual({ refused: { index: 0, kind: "run", text: cwd, why: "outside" } });
+    }
+    expect(inReadSet).not.toHaveBeenCalled();
+    expect(topOf).not.toHaveBeenCalled();
+    expect(canonical).not.toHaveBeenCalled();
+  });
+
+  it("refuses a cwd whose CANONICAL path has a `.git` segment, before the read set or any top lookup (QA round 1 #6)", () => {
+    const inReadSet = vi.fn(() => true);
+    const topOf = vi.fn(() => w);
+    const cases: [string, string][] = [
+      ["pkg", join(w, ".git")],
+      ["pkg", join(w, ".GIT", "hooks")],
+      [join(other, "sub"), join(other, ".git")],
+    ];
+    for (const [cwd, canonicalPath] of cases) {
+      const canonical = vi.fn(() => canonicalPath);
+      const result = resolveCheckPlacements(dodOf([{ kind: "run", command: "npm test", cwd }]), verificationScope(undefined, w), {
+        inReadSet,
+        topOf,
+        canonical,
+      });
+      expect(result).toEqual({ refused: { index: 0, kind: "run", text: cwd, why: "outside" } });
+      expect(canonical).toHaveBeenCalledTimes(1);
+    }
+    expect(inReadSet).not.toHaveBeenCalled();
+    expect(topOf).not.toHaveBeenCalled();
+  });
+
+  it("accepts `~<digit>` in a long segment (`my-library~2`) inside W on every platform (QA round 1 #7)", () => {
+    const lib2 = join(w, "my-library~2");
+    const scope = verificationScope(undefined, w);
+    expect(resolveCheckPlacements(dodOf([{ kind: "testsPass", cwd: "my-library~2" }]), scope)).toEqual({
+      placements: [{ cwd: lib2, top: w, foreign: false }],
+    });
+    expect(resolveCheckPlacements(dodOf([{ kind: "testsPass", cwd: lib2 }]), scope)).toEqual({
+      placements: [{ cwd: lib2, top: w, foreign: false }],
+    });
+  });
+
+  it.runIf(process.platform === "win32")("refuses an 8.3 short-name segment on win32 before any filesystem probe (QA round 1 #7)", () => {
+    const inReadSet = vi.fn(() => true);
+    const topOf = vi.fn(() => w);
+    const canonical = vi.fn(canonicalAuthorityPath);
+    for (const cwd of ["D:\\PROGRA~1\\x", "PROGRA~1", "backup~1", "pkg\\MARQUI~1.TXT", join(w, "BACKUP~1", "x")]) {
+      const result = resolveCheckPlacements(dodOf([{ kind: "run", command: "npm test", cwd }]), verificationScope(undefined, w), {
+        inReadSet,
+        topOf,
+        canonical,
+      });
+      expect(result).toEqual({ refused: { index: 0, kind: "run", text: cwd, why: "outside" } });
+    }
+    expect(inReadSet).not.toHaveBeenCalled();
+    expect(topOf).not.toHaveBeenCalled();
+    expect(canonical).not.toHaveBeenCalled();
+  });
+
+  it.skipIf(process.platform === "win32")("does not refuse a `~<digit>` segment lexically off win32 (QA round 1 #7)", () => {
+    const topOf = vi.fn(() => w);
+    for (const cwd of ["D:\\PROGRA~1\\x", "backup~1"]) {
+      const canonical = vi.fn(canonicalAuthorityPath);
+      const result = resolveCheckPlacements(dodOf([{ kind: "run", command: "npm test", cwd }]), verificationScope(undefined, w), {
+        topOf,
+        canonical,
+      });
+      expect(canonical).toHaveBeenCalledWith(cwd, w);
+      expect(result).toEqual({ placements: [{ cwd: join(w, cwd), top: w, foreign: false }] });
+    }
   });
 
   it("normalizes `scope=` case-insensitively", () => {
@@ -168,10 +252,34 @@ describe("resolveCheckPlacements (cross-repo P2.2)", () => {
     expect(result).toEqual({ placements: [{ cwd: outside, top: undefined, foreign: true }] });
   });
 
+  it("never makes a cwd inside W foreign, even below a nested `.git`; its own top is still reported (QA round 1 #8)", () => {
+    const pkg = join(w, "pkg");
+    const scope = verificationScope(undefined, w);
+    const nested = vi.fn((dir: string) => (dir === pkg ? pkg : w));
+    expect(resolveCheckPlacements(dodOf([{ kind: "testsPass", cwd: "pkg" }]), scope, { topOf: nested })).toEqual({
+      placements: [{ cwd: pkg, top: pkg, foreign: false }],
+    });
+    const unknown = vi.fn((dir: string) => (dir === w ? w : undefined));
+    expect(resolveCheckPlacements(dodOf([{ kind: "testsPass", cwd: "pkg" }]), scope, { topOf: unknown })).toEqual({
+      placements: [{ cwd: pkg, top: undefined, foreign: false }],
+    });
+    // On disk: w/vendor holds its own `.git` (a vendored repository).
+    const vendor = join(w, "vendor");
+    expect(resolveCheckPlacements(dodOf([{ kind: "run", command: "npm test", cwd: "vendor", scope: "full" }]), scope)).toEqual({
+      placements: [{ cwd: vendor, top: vendor, foreign: false, scope: "full" }],
+    });
+  });
+
+  // QA round 1 #8 changed this case on purpose: a cwd inside W is never foreign now, so the comparison is exercised on a
+  // placement outside W (in the read set) instead of `pkg`.
   it.runIf(process.platform === "win32")("compares tops case-insensitively with normalized separators on win32", () => {
-    const topOf = (dir: string): string => (dir === w ? w : w.toUpperCase().replace(/\\/g, "/"));
-    const result = resolveCheckPlacements(dodOf([{ kind: "testsPass", cwd: "pkg" }]), verificationScope(undefined, w), { topOf });
-    expect(result.placements?.[0]).toMatchObject({ cwd: join(w, "pkg"), foreign: false });
+    const sub = join(other, "sub");
+    const topOf = (dir: string): string => (dir === w ? w : `${w.toUpperCase().replace(/\\/g, "/")}/`);
+    const result = resolveCheckPlacements(dodOf([{ kind: "testsPass", cwd: sub }]), verificationScope(undefined, w), {
+      topOf,
+      inReadSet: insideOther,
+    });
+    expect(result.placements?.[0]).toMatchObject({ cwd: sub, foreign: false });
   });
 });
 

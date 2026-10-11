@@ -9,7 +9,7 @@ import { join, posix, win32 } from "node:path";
 import { permissionMatches } from "../../router/read-only";
 
 /** A win32 8.3 short-name segment (`PROGRA~1`, `MARQUI~1.TXT`): refused, never expanded (S11, P-11: fail closed). */
-const SHORT_NAME_SEGMENT = /(?:^|[\\/])[^\\/~]{1,8}~\d+(?:\.[^\\/.]{0,3})?(?=[\\/]|$)/;
+export const SHORT_NAME_SEGMENT = /(?:^|[\\/])[^\\/~]{1,8}~\d+(?:\.[^\\/.]{0,3})?(?=[\\/]|$)/;
 
 /**
  * The canonical long form of a path a role session names (T2.3.1). The RAW path (a relative one joined to `base` as text) goes to
