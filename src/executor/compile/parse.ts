@@ -137,15 +137,24 @@ const PHASE_P_HEADING_RE = /^ {0,3}#{2,4}[ \t]+(P\d+(?:\.\d+)+)\b(.*)$/;
 const DOGFOOD_HEADING_RE = /^ {0,3}#{2,4}[ \t]+Dogfood switch DF-(\d+)\b(.*)$/;
 const GENERIC_HEADING_RE = new RegExp(`^ {0,3}#{2,4}[ \\t]+(?:\\*\\*)?(${PID})(?:\\*\\*)?(?=[\\s:.)]|$)(.*)$`);
 const ANY_HEADING_RE = /^ {0,3}#{1,6}[ \t]+(.*)$/;
+/** `Task`/`Steps` (singular or looser wording) label a task list only when marked (heading or bold), never as plain prose. */
 const BLOCK_LABEL_RE =
-  /^ {0,3}(?:#{1,6}[ \t]+|\*\*|__)?(Pre-flight|Tasks|New tests|Acceptance criteria|Definition of Done|QA review|Order)\b/;
+  /^ {0,3}(?:(?:#{1,6}[ \t]+|\*\*|__)(Task|Steps)(?=(?:\*\*|__)?[ \t]*:?(?:\*\*|__)?[ \t]*$)|(?:#{1,6}[ \t]+|\*\*|__)?(Pre-flight|Tasks|New tests|Acceptance criteria|Definition of Done|QA review|Order)\b)/;
+
+/**
+ * Any other bold label at the start of a line (`**Fallback:** …`, `**Goal:** …`) ends a Tasks block: the list under it is
+ * not a task list (cpx:3904, the DF-2 fallback steps). `Writes:`/`Reads:` belong to the task above and do not end it.
+ */
+const OTHER_LABEL_RE = /^ {0,3}(?:\*\*|__)(?!Writes\b|Reads\b)[A-Z][^*_\n]{0,60}?(?::(?:\*\*|__)|(?:\*\*|__):)/;
 
 type BlockName = "pre-flight" | "tasks" | "new-tests" | "acceptance" | "dod" | "qa-review" | "order";
 
 function blockNameOf(label: string): BlockName {
   switch (label) {
     case "Pre-flight": return "pre-flight";
-    case "Tasks": return "tasks";
+    case "Tasks":
+    case "Task":
+    case "Steps": return "tasks";
     case "New tests": return "new-tests";
     case "Acceptance criteria": return "acceptance";
     case "Definition of Done": return "dod";
@@ -179,6 +188,22 @@ function headingLevelOf(line: string): number {
   return n;
 }
 
+/**
+ * `## 3. Waves, phases, tasks`: a bare number with a trailing period labels a document section, not a phase, unless the section holds
+ * list items with a task id of its own (`<n>.…`) before the next heading of any level.
+ */
+function isNumberedSectionHeading(lines: readonly string[], mask: readonly boolean[], idx: number, id: string, rest: string): boolean {
+  if (!/^\d+$/.test(id) || !rest.startsWith(".")) return false;
+  const own = new RegExp(`^ {0,3}(?:[-*+]|\\d{1,9}[.)])[ \\t]+(?:\\[[ xX]\\][ \\t]+)?(?:\\*\\*|__)?T?${id}\\.`);
+  for (let j = idx + 1; j < lines.length; j += 1) {
+    if (mask[j] === true) continue;
+    const l = lines[j] as string;
+    if (ANY_HEADING_RE.test(l)) break;
+    if (own.test(l)) return false;
+  }
+  return true;
+}
+
 /** Headings on unmasked lines, classified (memo §2 step 2). */
 function scanHeadings(lines: readonly string[], mask: readonly boolean[]): HeadingInfo[] {
   const out: HeadingInfo[] = [];
@@ -206,7 +231,7 @@ function scanHeadings(lines: readonly string[], mask: readonly boolean[]): Headi
       continue;
     }
     const gen = level >= 2 && level <= 4 ? GENERIC_HEADING_RE.exec(line) : null;
-    if (gen !== null) {
+    if (gen !== null && !isNumberedSectionHeading(lines, mask, i, gen[1] as string, gen[2] ?? "")) {
       out.push({ ...base, kind: "generic", id: gen[1] as string, rest: gen[2] ?? "" });
       continue;
     }
@@ -257,7 +282,7 @@ function unclosedAcceptanceLine(lines: readonly string[], mask: readonly boolean
 
 const ITEM_RE = /^( {0,3})([-*+]|\d{1,9}[.)])([ \t]+)\S/;
 const ITEM_LEAD_RE = /^[ \t]*(?:[-*+]|\d{1,9}[.)])[ \t]+/;
-const DOGFOOD_ID_RE = /^(?:\*\*)?DF-?(\d+)\.(\d+|QA)(?:\*\*)?(?=\s|:|$)/i;
+const DOGFOOD_ID_RE = /^(?:\*\*)?DF-?(\d+)\.(\d+|QA|FIX)(?:\*\*)?(?=\s|:|$)/i;
 const TIER_RE = /\[tier:(fast|medium|heavy)\]/i;
 const VERIFY_RE = /\bVERIFY:([A-Za-z]+)\b/;
 const CAP_RE = /\bCAP:(\d+|none)\b/;
@@ -436,6 +461,7 @@ const ORDER_LABEL_RE = /Order(?:\*\*|__)?:(?:\*\*|__)?/;
 const ORDER_ID_Y = /(?:\*\*)?((?:T|P)?\d+(?:\.(?:\d+|[A-Z]{1,4}))+[a-z]?)(?:\*\*)?(?=[\s,;:.)∥|→-]|$)/y;
 const ORDER_QA_Y = /QA(?![A-Za-z0-9_-])/y;
 const ORDER_FIX_Y = /FIX(?:[ \t]*\([ \t]*[A-Za-z-]+[ \t]*\))?(?![A-Za-z0-9_])/y;
+const ORDER_WORD_PAREN_Y = /[ \t]*\([ \t]*[A-Za-z-]+[ \t]*\)/y;
 const ORDER_ARROW_Y = /[ \t]*(?:→|-->|->)[ \t]*/y;
 const ORDER_SEP_Y = /[ \t]*(?:∥|\|\||,)[ \t]*/y;
 const ORDER_OPEN_Y = /[ \t]*\([ \t]*/y;
@@ -452,7 +478,12 @@ function parseOrderChain(s: string, phaseId: string): string[][] {
   let i = 0;
   const item = (at: number): { id: string; end: number } | null => {
     const id = stickyAt(ORDER_ID_Y, s, at);
-    if (id !== null) return { id: id[1] as string, end: at + id[0].length };
+    if (id !== null) {
+      const end = at + id[0].length;
+      // `6.2.FIX (loop)`: the FIX template spelled as an id keeps its optional parenthetical word.
+      const tail = (id[1] as string).endsWith(".FIX") ? stickyAt(ORDER_WORD_PAREN_Y, s, end) : null;
+      return { id: id[1] as string, end: tail === null ? end : end + tail[0].length };
+    }
     const qa = stickyAt(ORDER_QA_Y, s, at);
     if (qa !== null) return { id: `${phaseId}.QA`, end: at + qa[0].length };
     const fix = stickyAt(ORDER_FIX_Y, s, at);
@@ -494,17 +525,26 @@ function parseOrderChain(s: string, phaseId: string): string[][] {
   return groups;
 }
 
-const DEPENDS_LABEL_RE = /Depends on(?:\*\*|__)?:?(?:\*\*|__)?/i;
+/**
+ * The `Depends on:` label: at the start of a line (after an optional list marker and bold), or bold anywhere
+ * (`**Worktree:** … · **Depends on:** 0.P`). The colon is required, so prose "depends on X" is not a label (D8).
+ */
+const DEPENDS_LABEL_RE =
+  /(?:^[ \t>]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)?(?:\*\*|__)?|\*\*|__)Depends on(?:\*\*|__)?:(?:\*\*|__)?/i;
 const DF_TOKEN_RE = /\bDF-(\d+)\b/g;
 const PID_TOKEN_RE = /(?<![A-Za-z0-9.])[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*(?![A-Za-z0-9])/g;
 const DOTTED_ID_RE = /^[A-Za-z]?\d+(?:\.[A-Za-z0-9]+)+$/;
 
-/** The part of a `Depends on:` line that names dependencies (cut at the next bold label or a middle dot). */
+/** End of the dependency clause: the next bold label, a middle dot, a sentence end (`. ` / `;`) or a "parallel with"-style phrase. */
+const DEPENDS_CLAUSE_END_RE =
+  /\*\*[A-Za-z][^*\n]*:\*\*|·|;|\.(?=\s|$)|\b(?:in parallel|parallel with|parallel to|alongside|independent of)\b/i;
+
+/** The part of a `Depends on:` line that names dependencies (cut at the clause end, see DEPENDS_CLAUSE_END_RE). */
 function dependsText(line: string): string | null {
   const m = DEPENDS_LABEL_RE.exec(line);
   if (m === null) return null;
   const rest = line.slice(m.index + m[0].length);
-  const cut = rest.search(/\*\*[A-Za-z][^*\n]*:\*\*|·/);
+  const cut = rest.search(DEPENDS_CLAUSE_END_RE);
   return cut >= 0 ? rest.slice(0, cut) : rest;
 }
 
@@ -524,7 +564,8 @@ function resolveDepends(
   };
   const cleaned = text.replace(/§\S+/g, " ").replace(/`/g, " ");
   const dfRemoved = cleaned.replace(DF_TOKEN_RE, (_all, n: string) => {
-    add(`DF${n}`, true);
+    // `DF-<n>` is external unless the plan has the `Dogfood switch DF-<n>` section; then it is a phase gate like any other.
+    add(`DF${n}`, !known.has(`DF${n}`));
     return " ";
   });
   for (const m of dfRemoved.matchAll(PID_TOKEN_RE)) {
@@ -697,6 +738,13 @@ function scanTables(
     const hasSep = end > i && TABLE_SEP_RE.test(lines[i + 1] as string);
     const first = (header[0] ?? "").replace(/[`*_]/g, "").trim();
     const fileMajor = /^(?:File|Path)s?$/i.test(first);
+    // An ownership table with named columns (`| Wave | Phase | Owns (writes) |`): the phase and the owned-paths column by header.
+    const names = header.map((h) => h.replace(/[`*_]/g, "").trim());
+    const namedPhase = names.findIndex((h) => /^Phases?$/i.test(h));
+    const namedOwns = names.findIndex((h, c) => c !== namedPhase && /^(?:Owns|Writes)\b/i.test(h));
+    const named = !fileMajor && namedPhase >= 0 && namedOwns >= 0;
+    const phaseCol = named ? namedPhase : 0;
+    const ownsCol = named ? namedOwns : -1;
     for (let r = hasSep ? i + 2 : i + 1; r <= end; r += 1) {
       const cells = splitCells(lines[r] as string);
       const c1 = cells[0] ?? "";
@@ -714,14 +762,15 @@ function scanTables(
         rows.push({ path, owners, format: "file-major", line: r + 1 });
         continue;
       }
-      const owner = phaseTokens(c1, known)[0];
+      const owner = phaseTokens(cells[phaseCol] ?? "", known)[0];
       if (owner === undefined || cells.length < 2) continue;
-      const c2 = cells[1] as string;
+      const own = cells.slice(phaseCol + 1);
+      const c2 = (ownsCol >= 0 ? cells[ownsCol] : own[0]) ?? "";
       for (const m of c2.matchAll(BACKTICK_SPAN_RE)) {
         const p = (m[1] as string).trim();
         if (pathLike(p)) rows.push({ path: p, owners: [owner], format: "phase-major", line: r + 1 });
       }
-      scanPhrases(cells.slice(1).join(" | "), r + 1, { kind: "phase", id: owner }, phrases);
+      scanPhrases(own.join(" | "), r + 1, { kind: "phase", id: owner }, phrases);
     }
     i = end + 1;
   }
@@ -930,6 +979,7 @@ export function parsePlan(text: string): ParsedPlan {
   });
 
   let curWave: { w: ParsedWave; level: number } | null = null;
+  const syntheticWaves = new Set<ParsedWave>();
   let curDraft: PhaseDraft | null = null;
   const closePhase = (idx: number): void => {
     if (curDraft !== null) curDraft.end = idx;
@@ -938,6 +988,16 @@ export function parsePlan(text: string): ParsedPlan {
   for (const h of headings) {
     if (h.kind === "wave") {
       closePhase(h.idx);
+      const clash = waveById.get(h.id);
+      if (clash !== undefined && syntheticWaves.has(clash)) {
+        // A synthetic wave never stands for a real `Wave N` heading: move it aside (it keeps its place in plan order).
+        let moved = `${h.id}.w`;
+        while (waveById.has(moved)) moved += "w";
+        waveById.delete(h.id);
+        for (const p of allPhases) if (p.wave === clash.id) p.wave = moved;
+        clash.id = moved;
+        waveById.set(moved, clash);
+      }
       const existing = waveById.get(h.id);
       if (existing !== undefined) warn(warnings, "wave-duplicate", h.idx + 1, `duplicate wave ${h.id}`);
       const w = existing ?? addWave(h.id, h.text, h.idx + 1);
@@ -962,8 +1022,8 @@ export function parsePlan(text: string): ParsedPlan {
       } else {
         curWave = null;
         waveId = h.id;
-        if (waveById.has(waveId)) waveId = `${h.id}.w`;
-        addWave(waveId, h.text, h.idx + 1);
+        while (waveById.has(waveId)) waveId = `${waveId}.w`;
+        syntheticWaves.add(addWave(waveId, h.text, h.idx + 1));
       }
       const phase = newPhase(h.id, h.text, waveId, h.idx + 1, h.idx + 1, h.kind === "dogfood", false);
       addPhase(phase);
@@ -1009,10 +1069,12 @@ export function parsePlan(text: string): ParsedPlan {
         const m = BLOCK_LABEL_RE.exec(l);
         if (m !== null) {
           close(i);
-          const name = blockNameOf(m[1] as string);
+          const name = blockNameOf((m[1] ?? m[2]) as string);
           cur = { draft: d, name, start: i, end: i + 1 };
           d.hasLabels = true;
           if (name === "tasks") d.hasTasksBlock = true;
+        } else if (cur !== null && (cur as BlockSpan).name === "tasks" && OTHER_LABEL_RE.test(l)) {
+          close(i);
         }
       }
       blockAt[i] = cur === null ? null : (cur as BlockSpan).name;
@@ -1116,7 +1178,10 @@ export function parsePlan(text: string): ParsedPlan {
       continue;
     }
 
-    if (d !== undefined && d.phase.dogfood) {
+    // A DF section's items outside the Tasks block (Worktrees, Acceptance, DoD lists) are not tasks unless they carry a DF id.
+    if (d !== undefined && d.phase.dogfood && (block === "acceptance" || block === "dod" || (block === null && d.hasLabels && info.df === null))) continue;
+
+    if (d !== undefined && d.phase.dogfood && block !== "pre-flight") {
       d.dfOrdinal += 1;
       const n = d.phase.id.slice(2);
       let id: string;
@@ -1148,6 +1213,10 @@ export function parsePlan(text: string): ParsedPlan {
       if (d !== undefined) {
         owner = d.phase;
         if (bareId(d.phase.id) !== prefix) warn(warnings, "id-phase-mismatch", step.line, `id ${id} sits in phase ${d.phase.id}`);
+      } else if (phaseById.has(id)) {
+        // `- **0.P** …` outside every phase names a phase (a summary list), not a task of an implicit phase `0`.
+        warn(warnings, "item-outside-phase", step.line, `list item ${id} outside any phase names a phase; not a task`);
+        continue;
       } else {
         owner = ensureImplicit(prefix, step.line);
       }

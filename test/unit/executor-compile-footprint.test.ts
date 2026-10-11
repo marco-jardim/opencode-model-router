@@ -323,12 +323,14 @@ describe("executor compile: footprint (2.3.3)", () => {
         const r = await harness.compiler.compile(planPathOf(name), compileOpts(harness));
         let e = 0;
         let w = 0;
+        const missing: string[] = [];
         for (const t of Object.values(r.draft.tasks)) {
           if (t.kind === "manual" || t.kind === "preflight" || t.kind === "qa") continue;
           e += 1;
           if (t.footprint.writes.length > 0) w += 1;
+          else missing.push(t.id);
         }
-        per[name] = `${w}/${e}`;
+        per[name] = `${w}/${e} without writes: ${missing.join(" ")}`;
         editing += e;
         withWrites += w;
       }
@@ -347,24 +349,18 @@ describe("executor compile: footprint (2.3.3)", () => {
       expect(r.summary.warnings.some((w) => w.startsWith("foreign-root"))).toBe(true);
     });
 
-    // D9 (source defect vs the plan's 2.3.3 criterion "≥80% of editing tasks have writes"; src/executor/compile/
-    // footprint.ts write-verb rule, memo section 4 table): with the frozen repo view the paths resolve (see the test
-    // above) but rta and vrb phrase their writes as "Extend `X`", "write `X`", "Keys in `X`", "`X` rows for …",
-    // "First commit: … in `X`", none of which is a write verb, and rta's ownership map (rta:460-461,
-    // `| Wave | Phase | Owns (writes) |`, phase id in cell 2) is neither the file-major nor the phase-major format of
-    // memo section 2 step 4, so it is not applied (src/executor/compile/parse.ts scanTables). Measured:
-    // rta 9/66, vrb 34/52 (36%). Expected ≥ 80%. Those tasks stay `unknown` (⊤) and go to the residue, so the draft
-    // is safe but over-serialized.
-    it.fails("D9: gives at least 80% of the editing tasks a write (the plans that compile today: rta, vrb)", async () => {
-      const s = await writeShare(["role-tier-assurance-delegation-plan.md", "verification-resource-budget-plan.md"]);
-      expect(s.editing).toBeGreaterThan(0);
-      expect(s.withWrites / s.editing, JSON.stringify(s.per)).toBeGreaterThanOrEqual(0.8);
-    });
-
-    // D4 (cpx, E_COMPILE id-duplicate at cpx:2059) and D5 (dd, E_CYCLE 3.1 <-> 3.2): see executor-compile-real-plans.
-    it.fails("D4/D5: gives at least 80% of the editing tasks a write over all four plans", async () => {
-      const s = await writeShare(names);
-      expect(s.withWrites / s.editing, JSON.stringify(s.per)).toBeGreaterThanOrEqual(0.8);
-    });
+    // D9 (fixed): the plan's 2.3.3 criterion "≥80% of editing tasks have writes". footprint.ts knows the write verbs
+    // "extend", "write", "edit", "keys in" and "wire/document/record … in", and parse.ts scanTables reads ownership tables
+    // whose header names a `Phase` column and an `Owns`/`Writes` column (rta:460-461, `| Wave | Phase | Owns (writes) |`).
+    // An editing task with no evidence of its own writes its phase's owned set (low confidence, not ⊤), and a new file
+    // under another worktree root maps to the longest suffix whose parent exists. The dd tasks still without writes name
+    // no file in this repository, e.g. 0.P.3/0.P.4 (read-only spikes) and 3.3.2 (fixes anywhere).
+    for (const name of names) {
+      it(`D9: gives at least 80% of the editing tasks of ${name} a write`, async () => {
+        const s = await writeShare([name]);
+        expect(s.editing).toBeGreaterThan(0);
+        expect(s.withWrites / s.editing, JSON.stringify(s.per)).toBeGreaterThanOrEqual(0.8);
+      });
+    }
   });
 });

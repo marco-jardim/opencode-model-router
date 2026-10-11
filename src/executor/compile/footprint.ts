@@ -301,6 +301,20 @@ function resolveAbsolute(
       return good(hit.path, "suffix", hit.dir, root);
     }
   }
+  // Rules 6 + 9: a new file under another root (`D:\git\other-wt\test\smoke\new.test.ts`, created by the task) maps to the
+  // longest suffix of at least two segments whose parent directory exists or is created earlier.
+  if (o.allowNew) {
+    for (let drop = win ? 1 : 0; drop + 2 <= segs.length; drop++) {
+      const rel = segs.slice(drop);
+      if (rel.some(badSegment)) continue;
+      const parent = rel.slice(0, -1).join("/");
+      if (lookup(repo, parent)?.dir === true || createdHas(o.createdEarlier, parent, ci)) {
+        const dropped = segs.slice(0, drop);
+        const root = win ? dropped.join("\\") : `/${dropped.join("/")}`;
+        return good(rel.join("/"), "suffix", trailing, root);
+      }
+    }
+  }
   if (win) {
     const drive = (segs[0] ?? "").toLowerCase();
     const known = [repo.toplevel, ...repo.worktrees].some((r) => splitSegs(mod.normalize(r))[0]?.toLowerCase() === drive);
@@ -478,7 +492,9 @@ function scanText(text: string, firstLine: number): Cand[] {
 // ---------------------------------------------------------------------------------------------------------------
 
 const WRITE_VERB =
-  /\b(?:implement(?:s|ed|ing)?|creat(?:e|es|ed|ing)|add(?:s|ed|ing)?|modif(?:y|ies|ied|ying)|updat(?:e|es|ed|ing)|replac(?:e|es|ed|ing)|mov(?:e|es|ed|ing)|delet(?:e|es|ed|ing))\b/i;
+  /\b(?:implement(?:s|ed|ing)?|creat(?:e|es|ed|ing)|add(?:s|ed|ing)?|modif(?:y|ies|ied|ying)|updat(?:e|es|ed|ing)|replac(?:e|es|ed|ing)|mov(?:e|es|ed|ing)|delet(?:e|es|ed|ing)|extend(?:s|ed|ing)?|writ(?:e|es|ing)|wrote|edit(?:s|ed|ing)?|keys?\s+in)\b/i;
+/** "wire … in `X`", "document … in `X`", "record … in `X`": the verb, up to four tokens, then `in` right before the path. */
+const WRITE_VERB_IN = /\b(?:wir(?:e|es|ed|ing)|document(?:s|ed|ing)?|record(?:s|ed|ing)?)\b(?:\s+\S+){0,4}?\s+in\s*$/i;
 const CREATE_VERB = /^(?:implement|creat|add)/i;
 const TESTS_IN = /\btests?\s+in\s*$/i;
 const NEW_MARKER = /^[\s*_]*\(new\)/i;
@@ -492,7 +508,10 @@ function verbBefore(c: Cand): { rule: string; create: boolean } | null {
   const tail = clause.trim().split(/\s+/).slice(-6).join(" ");
   if (TESTS_IN.test(tail)) return { rule: "verb:tests-in", create: false };
   const m = WRITE_VERB.exec(tail);
-  if (m === null) return null;
+  if (m === null) {
+    const w = WRITE_VERB_IN.exec(tail);
+    return w === null ? null : { rule: `verb:${(/^\S+/.exec(w[0]) ?? [w[0]])[0].toLowerCase()}-in`, create: false };
+  }
   return { rule: `verb:${m[0].toLowerCase()}`, create: CREATE_VERB.test(m[0]) };
 }
 
@@ -655,10 +674,24 @@ export function extractFootprint(
     }
   }
 
-  const finalReads = reads.filter((r) => !writeKeys.has(touchKey(r, ci)));
-  const hasWriteEvidence = writes.length > 0 || unbounded;
   const cls = t.route?.fields?.class;
   const needs = t.route?.fields?.needs;
+  // D9: an editing task with no write evidence of its own writes what its phase owns. The ownership table declares the
+  // phase's write set ("Owns (writes)"), so this is a bounded over-approximation (low confidence) instead of ⊤.
+  const editsByDefault = !t.manual && !NEVER_EDITING_KINDS.has(t.kind)
+    && (needs !== undefined ? needs.includes("edit") : cls === undefined || !NON_EDITING_CLASSES.has(cls));
+  if (wantOwnership && editsByDefault && writes.length === 0 && !unbounded && !explicit) {
+    for (const row of phaseOwnership) {
+      const rp = resolve(row.path, row.line, true, false);
+      if (rp === null || rp.path === "") continue;
+      owned = true;
+      weak = true;
+      addWrite(rp, row.path, "ownership", row.line, "ownership-phase");
+    }
+  }
+
+  const finalReads = reads.filter((r) => !writeKeys.has(touchKey(r, ci)));
+  const hasWriteEvidence = writes.length > 0 || unbounded;
   let editing: boolean;
   if (t.manual || NEVER_EDITING_KINDS.has(t.kind)) editing = false;
   else if (needs !== undefined) editing = needs.includes("edit") || hasWriteEvidence;

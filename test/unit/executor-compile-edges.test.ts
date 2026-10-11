@@ -218,11 +218,9 @@ describe("executor compile: edges (2.3.4)", () => {
       expect(warnings.some((w) => w.startsWith("explicit-edge-cycle-dropped"))).toBe(true);
     });
 
-    // D8 (source defect, src/executor/compile/parse.ts:497 + 1276): DEPENDS_LABEL_RE is unanchored, case-insensitive
-    // and its colon optional, so any task-body line containing prose "depends on" is skipped by the phrase scan
-    // (1276 `continue`). Input: "Step one; depends on 9.9 landing first." Expected: one `explicit-ref-unknown` for 9.9
-    // (and, for a known id, an explicit edge). Actual: no phrase, no warning, no edge.
-    it.fails("D8: `depends on` in task prose is an explicit phrase; an unknown id there is reported", async () => {
+    // D8 (fixed): DEPENDS_LABEL_RE is anchored and needs the colon, so a task-body line with prose "depends on" is no
+    // longer skipped by the phrase scan. Input: "Step one; depends on 9.9 landing first." -> one `explicit-ref-unknown`.
+    it("D8: `depends on` in task prose is an explicit phrase; an unknown id there is reported", async () => {
       const { warnings } = await compileInline(unknownRef("depends on"));
       expect(warnings.filter((w) => w.includes("9.9"))).toEqual([expect.stringMatching(/^explicit-ref-unknown/)]);
     });

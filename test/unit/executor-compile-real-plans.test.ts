@@ -365,57 +365,30 @@ describe.skipIf(!FROZEN)("executor compile: frozen real plans", () => {
   });
 
   // D3 (fixed in parse.ts): an id-shaped heading is a phase only when a task id of its own section has that prefix.
-  // D4 (open, src/executor/compile/parse.ts:1119-1135): Pre-flight items of a `Dogfood switch DF-<n>` section get
-  // ordinal DF ids and collide with the authored ones, so the cpx plan fails with E_COMPILE id-duplicate (cpx:2059).
-  // D5 (open, src/executor/compile/parse.ts:503-508 cuts the `Depends on:` text only at a bold label or `·`, and
-  // 530-534 take every known phase id in it): every known phase id on the line counts,
-  // so `**Depends on:** 2.3 merged. Parallel with 3.2.` (dd:1385) and `... Parallel with 3.1.` (dd:1426) make 3.1 and
-  // 3.2 depend on each other -> E_CYCLE `3.1.PF1 -> gate:3.1 -> 3.2.PF1 -> gate:3.2`. Expected: 3.1 and 3.2 depend
-  // on 2.3 only (the line's first sentence; "Parallel with X" states the absence of an edge).
-  // D6 (open, src/executor/compile/parse.ts:903 + 942-943 + 966): the numbered section heading `## 3. Waves, phases,
-  // tasks` (vrb:468) is confirmed as phase `3` (its section holds every 3.x.y id), gets a synthetic wave `3` that is
-  // created first and then reused by `### Wave 3` (vrb:1359, `wave-duplicate`). Compiler: 15 phases, wave order
-  // [3, 0.P, 1, 2], so the wave gates put 0.P after Wave 3 and Wave 3 has no predecessor. Hand count: 14 phases, wave
-  // order [0.P, 1, 2, 3].
-  // D7 (open, src/executor/compile/parse.ts:1130-1134 runs before the explicit-id branch at 1144): vrb Phase 3.2 labels
-  // its list `**Task**` (vrb:1469, singular, not in the block-label regex), so the Pre-flight block runs on and the
-  // explicit tasks 3.2.1 (heavy global review, vrb:1470) and 3.2.2 (vrb:1485) become manual `3.2.PF3`/`3.2.PF4`.
-  // Compiler: preflight 26, manual 26; hand count: preflight 24, manual 24 (3.2.1 and 3.2.2 are tasks).
-  const BLOCKED: Record<string, string> = {
-    "critical-path-execution-plan.md": "D4: ",
-    "delegation-depth-and-effort-bump-plan.md": "D5: ",
-    "verification-resource-budget-plan.md": "D6/D7: ",
-  };
-  const caseFor = (name: string): ((title: string, fn: () => Promise<void>) => void) =>
-    BLOCKED[name] !== undefined ? (title, fn) => it.fails(title, fn) : (title, fn) => it(title, fn);
-  const labelFor = (name: string): string => BLOCKED[name] ?? "";
-
+  // D4 (fixed): Pre-flight items of a `Dogfood switch DF-<n>` section are `DF<n>.PF<k>`; Worktrees/Acceptance/DoD lists
+  // of a DF section are not tasks (cpx:2041, 2156).
+  // D5 (fixed): only the dependency clause of a `Depends on:` line counts (up to `. `, `;` or "parallel with"), so
+  // `**Depends on:** 2.3 merged. Parallel with 3.2.` (dd:1385, dd:1426) no longer closes a 3.1/3.2 cycle.
+  // D6 (fixed): the numbered section heading `## 3. Waves, phases, tasks` (vrb:468) is not a phase, and a synthetic
+  // wave never shares an id with a real `Wave N` heading.
+  // D7 (fixed): `**Task**` (vrb:1469) is a Tasks label, so 3.2.1 and 3.2.2 are tasks.
+  // cpx: `DF<n>.FIX` is the dogfood FIX template, a `**Fallback:**` list ends the Tasks block (cpx:3904), and
+  // `**Depends on:** DF-2 (and 5.1)` (cpx:3933) gates 6.1 on the plan's own DF2 section.
+  // dd: counts.json corrected (1.3.2b at dd:1047 is a task; see its `correction` note).
+  // D4-D7 are fixed in parse.ts (Pre-flight items of a DF section, `Depends on:` clause end, numbered section headings,
+  // `**Task**` list labels and explicit ids inside a Pre-flight block), so every plan compiles to its hand counts.
   for (const name of PLAN_NAMES) {
-    caseFor(name)(`${labelFor(name)}${name} compiles to a valid draft whose counts equal the hand counts`, async () => {
+    it(`${name} compiles to a valid draft whose counts equal the hand counts`, async () => {
       await handCountCheck(name);
     });
   }
 
-  // Pins of the open defects' symptoms, so each `it.fails` above is known to fail for its stated reason. Delete a pin
-  // when its defect is fixed and the matching `it.fails` is flipped.
-  it("D4 pin: cpx fails with E_COMPILE id-duplicate DF1.1 at line 2059", async () => {
-    const h = makeHarness();
-    await expect(h.compiler.compile(planPathOf("critical-path-execution-plan.md"), compileOpts(h))).rejects.toThrow(/id-duplicate \(line 2059\).*DF1\.1/);
-  });
-
-  it("D5 pin: dd fails with E_CYCLE between 3.1 and 3.2", async () => {
-    const h = makeHarness();
-    await expect(h.compiler.compile(planPathOf("delegation-depth-and-effort-bump-plan.md"), compileOpts(h))).rejects.toThrow(
-      /dependency cycle: .*gate:3\.1.*gate:3\.2/,
-    );
-  });
-
-  it("D6/D7 pins: vrb has a spurious phase `3` ordered first and 3.2.1/3.2.2 compiled as pre-flight", async () => {
+  it("vrb has no phase for the `## 3.` section heading and 3.2.1/3.2.2 are tasks", async () => {
     const { draft } = await compileName("verification-resource-budget-plan.md");
-    expect(draft.phases.map((p) => p.id)[0]).toBe("3");
-    expect(draft.waves.map((w) => w.id)).toEqual(["3", "0.P", "1", "2"]);
-    expect(Object.keys(draft.tasks)).not.toContain("3.2.1");
-    expect(draft.tasks["3.2.PF3"]?.kind).toBe("preflight");
+    expect(draft.phases.map((p) => p.id)).not.toContain("3");
+    expect(draft.waves.map((w) => w.id)).toEqual(["0.P", "1", "2", "3"]);
+    expect(Object.keys(draft.tasks)).toContain("3.2.1");
+    expect(Object.keys(draft.tasks)).toContain("3.2.2");
   });
 
   async function handCountCheck(name: string): Promise<void> {
@@ -447,12 +420,16 @@ describe.skipIf(!FROZEN)("executor compile: frozen real plans", () => {
       waves: c.waves,
       perPhase: c.perPhase,
     };
-    expect(actual, name).toEqual(expected);
+    // On a mismatch, name the task ids of every phase whose count differs from the hand count.
+    const off = Object.keys({ ...perPhase, ...c.perPhase })
+      .filter((p) => perPhase[p] !== c.perPhase[p])
+      .map((p) => `${p}: ${tasks.filter((t) => t.phase === p).map((t) => t.id).join(" ")}`);
+    expect(actual, `${name} ${off.join(" | ")}`).toEqual(expected);
     expect(tasks.some((t) => t.id.endsWith(".FIX"))).toBe(false);
   }
 
   for (const name of PLAN_NAMES) {
-    caseFor(name)(`${labelFor(name)}${name}: hand-listed Order edges and Depends-on gates are present`, async () => {
+    it(`${name}: hand-listed Order edges and Depends-on gates are present`, async () => {
       await orderCheck(name);
     });
   }
@@ -469,7 +446,7 @@ describe.skipIf(!FROZEN)("executor compile: frozen real plans", () => {
     }
   }
 
-  it.fails("D4: compiles phase 6.1 of the cpx plan with everything earlier done", async () => {
+  it("D4: compiles phase 6.1 of the cpx plan with everything earlier done", async () => {
     const { draft } = await compileName("critical-path-execution-plan.md", { phases: ["6.1"], doneBefore: "6.1" });
     const ids = Object.keys(draft.tasks);
     for (const id of ["6.1.1", "6.1.2", "6.1.3", "6.1.4", "6.1.5", "6.1.QA"]) expect(ids).toContain(id);

@@ -118,16 +118,12 @@ describe("executor compile: parse (2.3.2)", () => {
       "- **DF1.1** Orchestrator: tag the build.",
       "- **DF1.2** Planned human action: restart.",
       "- **DF1.QA** [tier:heavy] Senior QA of the switch.",
+      "- **DF1.FIX** Every finding is fixed.",
       "",
       "**Acceptance criteria**",
       "- DF1.QA has zero open findings.",
       "",
     ].join("\n");
-
-    // Pins the D4 symptom (delete this pin when D4 is fixed and the `it.fails` below is flipped).
-    it("D4 pin: today a DF Pre-flight block makes the authored DF1.1 a duplicate", () => {
-      expect(() => parsePlan(df)).toThrow(/id-duplicate.*DF1\.1/);
-    });
 
     it("numbers items of a DF section without a Pre-flight block by ordinal and marks them manual", () => {
       const p = parsePlan(readFixture("synthetic/df-switch.md"));
@@ -137,12 +133,10 @@ describe("executor compile: parse (2.3.2)", () => {
       expect(p.phases.find((ph) => ph.id === "DF1")?.dogfood).toBe(true);
     });
 
-    // D4 (source defect, src/executor/compile/parse.ts:1119-1128): the dogfood branch runs before the Pre-flight
-    // (1130-1134) and metadata-block (1135) branches, so Pre-flight items of a DF section get ordinal ids DF1.1, DF1.2
-    // and collide with the authored DF1.1 (cpx:2051-2059 -> E_COMPILE id-duplicate at line 2059), and Acceptance/DoD
-    // items such as `- DF1.QA has zero open findings.` (cpx:2156) would become tasks. Expected (memo section 2 step 6):
-    // Pre-flight items are `DF1.PF<k>` (kind preflight) and Acceptance/DoD/New tests/QA review items are metadata.
-    it.fails("D4: Pre-flight items of a DF section are DF<n>.PF<k> and metadata blocks are not tasks", () => {
+    // D4 (fixed): Pre-flight items of a DF section used to get ordinal ids DF1.1, DF1.2 and collide with the authored DF1.1
+    // (cpx:2051-2059), and Acceptance/DoD items such as `- DF1.QA has zero open findings.` (cpx:2156) became tasks.
+    // Memo section 2 step 6: Pre-flight items are `DF1.PF<k>` (kind preflight); Acceptance/DoD items are metadata.
+    it("D4: Pre-flight items of a DF section are DF<n>.PF<k> and metadata blocks are not tasks", () => {
       const p = parsePlan(df);
       const ids = p.tasks.filter((t) => t.phase === "DF1").map((t) => t.id);
       expect(ids).toEqual(["DF1.PF1", "DF1.PF2", "DF1.1", "DF1.2", "DF1.QA"]);
