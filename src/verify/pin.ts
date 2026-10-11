@@ -50,6 +50,16 @@ export function pinOf(root: string, snapshot: TreeSnapshot | undefined, admitted
   return { kind: "pinned", root, head: snapshot.head, fingerprint: snapshot.fingerprint, ignored: snapshot.ignored, nested: [] };
 }
 
+/** UNC and device paths (`\\host\share`, `//host/share`, `\\?\`, `\\.\`): never touched, decided by text alone. */
+function isUncOrDevice(dir: string): boolean {
+  return /^[\\/]{2}/.test(dir);
+}
+
+/** True only for a non-UNC directory that is admitted; checked before any snapshot or link discovery on it. */
+function mayTouch(dir: string, deps: PinDeps): boolean {
+  return !isUncOrDevice(dir) && deps.admitted(dir);
+}
+
 /** True only when both pins are pinned and identical, nested pins included (order-independent by root key). */
 export function samePin(a: LinkPin, b: LinkPin): boolean {
   if (a.kind !== "pinned" || b.kind !== "pinned") return false;
@@ -74,16 +84,21 @@ export function samePin(a: LinkPin, b: LinkPin): boolean {
 
 /**
  * Pins `root` and, one level deep, the targets of its own external links. A target that itself has external links makes the
- * whole root unpinnable (`deep-link`, OD3); an unpinnable nested pin makes the root unpinnable with its reason. Never throws.
+ * whole root unpinnable (`deep-link`, OD3); an unpinnable nested pin makes the root unpinnable with its reason. A UNC or
+ * device path, or a directory that is not admitted, is `not-admitted` before any snapshot or link discovery on it (I11/I12).
+ * Never throws.
  */
 export async function pinTarget(root: string, deps: PinDeps): Promise<LinkPin> {
   try {
-    const own = pinOf(root, await deps.snapshot(root), deps.admitted(root));
+    // I11/I12: refuse UNC/device paths by text and non-admitted directories before any fs or git call on them.
+    if (!mayTouch(root, deps)) return unpinnable(root, "not-admitted");
+    const own = pinOf(root, await deps.snapshot(root), true);
     if (own.kind !== "pinned") return own;
     const nested: LinkPin[] = [];
     for (const target of deps.externalLinks(root)) {
+      if (!mayTouch(target, deps)) return unpinnable(root, "not-admitted");
       if (deps.externalLinks(target).length > 0) return unpinnable(root, "deep-link");
-      const pin = pinOf(target, await deps.snapshot(target), deps.admitted(target));
+      const pin = pinOf(target, await deps.snapshot(target), true);
       if (pin.kind !== "pinned") return unpinnable(root, pin.why);
       nested.push(pin);
     }

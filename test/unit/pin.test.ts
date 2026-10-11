@@ -141,6 +141,65 @@ describe("pinTarget", () => {
     });
   });
 
+  const spied = (links: Record<string, string[]>, admittedFn: (dir: string) => boolean) => {
+    const calls: string[] = [];
+    const deps = {
+      snapshot: async (dir: string): Promise<TreeSnapshot | undefined> => {
+        calls.push(`snapshot:${dir}`);
+        return snap(dir);
+      },
+      admitted: (dir: string): boolean => {
+        calls.push(`admitted:${dir}`);
+        return admittedFn(dir);
+      },
+      externalLinks: (dir: string): string[] => {
+        calls.push(`links:${dir}`);
+        return links[dir] ?? [];
+      },
+    };
+    return { deps, calls };
+  };
+
+  it("never snapshots nor reads links of a nested target that is not admitted", async () => {
+    const { deps, calls } = spied({ "/r/a": ["/r/b"] }, (dir) => dir !== "/r/b");
+    expect(await pinTarget("/r/a", deps)).toEqual({ kind: "unpinnable", root: "/r/a", why: "not-admitted" });
+    expect(calls).toEqual(["admitted:/r/a", "snapshot:/r/a", "links:/r/a", "admitted:/r/b"]);
+  });
+
+  it("never touches a UNC nested target", async () => {
+    const unc = "\\\\host\\share\\lib";
+    const { deps, calls } = spied({ "/r/a": [unc] }, () => true);
+    expect(await pinTarget("/r/a", deps)).toEqual({ kind: "unpinnable", root: "/r/a", why: "not-admitted" });
+    expect(calls.filter((c) => c.includes("host"))).toEqual([]);
+  });
+
+  it("never touches device-path nested targets", async () => {
+    for (const bad of ["\\\\?\\C:\\lib", "\\\\.\\pipe\\x", "//host/share/lib", "//?/C:/lib"]) {
+      const { deps, calls } = spied({ "/r/a": [bad] }, () => true);
+      expect(await pinTarget("/r/a", deps)).toEqual({ kind: "unpinnable", root: "/r/a", why: "not-admitted" });
+      expect(calls.filter((c) => c.endsWith(`:${bad}`))).toEqual([]);
+    }
+  });
+
+  it("makes no deps call at all for a UNC root", async () => {
+    const root = "\\\\host\\share\\repo";
+    const { deps, calls } = spied({}, () => true);
+    expect(await pinTarget(root, deps)).toEqual({ kind: "unpinnable", root, why: "not-admitted" });
+    expect(calls).toEqual([]);
+  });
+
+  it("makes no snapshot nor links call for a root that is not admitted", async () => {
+    const { deps, calls } = spied({}, () => false);
+    expect(await pinTarget("/r/a", deps)).toEqual({ kind: "unpinnable", root: "/r/a", why: "not-admitted" });
+    expect(calls).toEqual(["admitted:/r/a"]);
+  });
+
+  it("checks admission of a nested target before reading its links (deep-link)", async () => {
+    const { deps, calls } = spied({ "/r/a": ["/r/b"], "/r/b": ["/r/c"] }, (dir) => dir !== "/r/b");
+    expect(await pinTarget("/r/a", deps)).toEqual({ kind: "unpinnable", root: "/r/a", why: "not-admitted" });
+    expect(calls).not.toContain("links:/r/b");
+  });
+
   it("reports not-observed when link discovery throws", async () => {
     const deps = {
       ...make({}),
