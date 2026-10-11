@@ -21,6 +21,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/
 import { homedir, tmpdir, userInfo } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { CpxFront, type CpxProviderOptions } from "./cpx-scripted-provider";
 import { listenOnFetchSafePort, pickFetchSafePort } from "./fetch-safe-port";
 import { DEFAULT_OUTCOME_TUNING, acquireOutcomes, type OutcomeKey } from "../../../src/routing/outcomes";
 import type { DecisionRow, LogRow, OutcomeEntrySnapshot } from "../../../src/routing/outcomes/types";
@@ -28,6 +29,13 @@ import type { DecisionRow, LogRow, OutcomeEntrySnapshot } from "../../../src/rou
 export const ROOT = path.resolve(__dirname, "../../..");
 export const RUN_ID = randomUUID();
 export const EVIDENCE_DIR = path.join(ROOT, "docs", "qa", "cost-aware-routing", "evidence-3.2");
+/** Where `runScenario` writes its evidence: `OMR_SMOKE_EVIDENCE_DIR` (absolute; read at CALL time so a test may set it) or {@link EVIDENCE_DIR}. */
+export const evidenceDir = (): string => {
+  const override = process.env.OMR_SMOKE_EVIDENCE_DIR;
+  if (override === undefined || override === "") return EVIDENCE_DIR;
+  if (!path.isAbsolute(override)) throw new Error(`OMR_SMOKE_EVIDENCE_DIR must be an absolute path: ${override}`);
+  return override;
+};
 export const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
 // -------------------------------------------------------------------- types ----
@@ -670,6 +678,10 @@ export interface HostOptions {
   readonly rootModel?: ModelRef;
   /** Skip the router plugin (control host). */
   readonly withoutRouter?: boolean;
+  /** CPX 0.1.0: ABSOLUTE paths of extra plugin directories/files, appended to opencode.json `plugins` AFTER the router and BEFORE the probe (the probe stays last). A relative path throws. */
+  readonly extraPlugins?: readonly string[];
+  /** CPX 0.1.0: puts a {@link CpxFront} between the host and the scripted provider (per-request delay, cache usage fields, queued 429/529/usage-limit faults, request capture, all on `host.front`). Unset: the host talks to the scripted provider directly, as before. */
+  readonly provider?: CpxProviderOptions;
   /** Merged over the generated opencode.json (the host's own config: agents, providers…). */
   readonly hostConfig?: Obj | ((root: string) => Obj);
   /** Seeds written to the outcomes store BEFORE the host starts (through the repo's own store + persister, on the temp dir). */
@@ -707,6 +719,8 @@ export const seenProjectDirs = new Set<string>();
 
 export class RoutingHost {
   readonly provider = new RoutingProvider();
+  /** The CPX front in front of {@link provider} (only when `HostOptions.provider` is set): queue faults and read captures here. It survives `restart()`. */
+  readonly front?: CpxFront;
   client!: HostClient;
   baseUrl = "";
   authorization = "";
@@ -719,14 +733,18 @@ export class RoutingHost {
   private child?: ChildProcess;
   private output = "";
   private teardown?: Promise<Teardown>;
+  /** What `launch()` needs again on `restart()`: fixed at the first boot (config files, env dirs, probe/pre-probe locations). */
+  private plan?: { executable: string; env: Record<string, string | undefined>; probeConfig: string; preProbe?: string; preProbeConfig: string };
 
   private constructor(readonly root: string, readonly options: HostOptions) {
+    if (options.provider) this.front = new CpxFront(options.provider);
     this.outcomes = path.join(root, "outcomes");
     this.logs = { hooks: path.join(root, "hooks.jsonl"), events: path.join(root, "events.jsonl"), dump: path.join(root, "dump.json") };
     this.configHome = path.join(root, "home", ".config", "opencode");
   }
 
   static async start(name: string, options: HostOptions = {}): Promise<RoutingHost> {
+    for (const extra of options.extraPlugins ?? []) if (!path.isAbsolute(extra)) throw new Error(`HostOptions.extraPlugins entries must be absolute paths: ${extra}`);
     const made = await mkdtemp(path.join(tmpdir(), `omr-p32-${name}-`));
     const root = options.longPaths ? realpathSync.native(made) : made;
     const host = new RoutingHost(root, options);
@@ -789,17 +807,26 @@ export class RoutingHost {
     }
     if (this.options.seed && this.options.seed.length > 0) await seedOutcomes(this.outcomes, this.options.seed);
     await this.writeOverrides();
-    const baseURL = await this.provider.start();
+    const innerURL = await this.provider.start();
+    const baseURL = this.front ? await this.front.start(innerURL) : innerURL;
     const root = this.options.rootModel ?? ROOT_MODEL;
     const configDir = path.join(env.XDG_CONFIG_HOME!, "opencode");
     await mkdir(configDir, { recursive: true });
     await writeFile(path.join(configDir, "opencode.json"), JSON.stringify({
       $schema: "https://opencode.ai/config.json",
       model: ref(root),
-      plugins: [...(preProbe ? [preProbe] : []), ...(this.options.withoutRouter ? [] : [ROOT]), probe],
+      plugins: [...(preProbe ? [preProbe] : []), ...(this.options.withoutRouter ? [] : [ROOT]), ...(this.options.extraPlugins ?? []), probe],
       providers: { anthropic: { settings: { baseURL, apiKey: "keyless-smoke-fake" } }, ...this.resolveProviders(baseURL) },
       ...obj(typeof this.options.hostConfig === "function" ? this.options.hostConfig(this.root) : this.options.hostConfig),
     }));
+    this.plan = { executable, env, probeConfig, preProbe, preProbeConfig };
+    await this.launch();
+    return this;
+  }
+
+  /** Spawns the host process with the fixed {@link plan} and waits until it listens and its plugins are active: a NEW password, port, client and authorization each time. Writes no config file and truncates no log. */
+  private async launch(): Promise<void> {
+    const { executable, env, probeConfig, preProbe, preProbeConfig } = this.plan!;
     const password = randomBytes(24).toString("base64url");
     Object.assign(env, {
       OPENCODE_PASSWORD: password, OPENCODE_TEST_HOME: env.HOME, PWD: this.project,
@@ -813,12 +840,14 @@ export class RoutingHost {
     const leaked = this.envKeys.filter(name => CREDENTIAL_NAME.test(name) && name !== "OPENCODE_PASSWORD");
     if (leaked.length > 0) throw new Error(`credential-shaped variable(s) would reach the host: ${leaked.join(",")}`);
     this.port = await pickFetchSafePort();
-    this.child = spawn(executable, ["serve", "--hostname", "127.0.0.1", "--port", String(this.port), "--print-logs"], { cwd: this.project, env, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
-    this.child.stdout!.on("data", chunk => { this.output += chunk; });
-    this.child.stderr!.on("data", chunk => { this.output += chunk; });
+    const outputFrom = this.output.length; // `output` accumulates across children: only this child's lines can announce its address
+    const child = spawn(executable, ["serve", "--hostname", "127.0.0.1", "--port", String(this.port), "--print-logs"], { cwd: this.project, env, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    this.child = child;
+    child.stdout!.on("data", chunk => { this.output += chunk; });
+    child.stderr!.on("data", chunk => { this.output += chunk; });
     this.baseUrl = await waitFor("host to listen", () => {
-      if (this.child!.exitCode !== null) throw new Error(`OpenCode 2 exited early:\n${this.output}`);
-      return /server listening on (http:\/\/127\.0\.0\.1:\d+)/.exec(this.output)?.[1];
+      if (child.exitCode !== null) throw new Error(`OpenCode 2 exited early:\n${this.output}`);
+      return /server listening on (http:\/\/127\.0\.0\.1:\d+)/.exec(this.output.slice(outputFrom))?.[1];
     }, 40_000);
     this.authorization = basic("opencode", password);
     this.client = await loadClient(this.baseUrl, this.authorization);
@@ -831,7 +860,39 @@ export class RoutingHost {
       }, 40_000);
       if (state.status !== "active") throw new Error(`${id} plugin is ${state.status}: ${state.error ?? ""}\n${this.output}`);
     }
-    return this;
+  }
+
+  /**
+   * CPX 0.1.0: stops ONLY the host process (same kill as `stop()`), waits for its port to close, then boots it again with the SAME
+   * root, project, HOME/XDG dirs, config files, outcome store and provider (and front). Nothing one-time is redone: no seed, no
+   * override/probe/opencode.json rewrite, no log truncation (hooks/events observed before the restart survive). New password,
+   * port, client and authorization. `stop()` still works afterwards.
+   */
+  async restart(): Promise<void> {
+    if (this.teardown) throw new Error("RoutingHost.restart(): the host is already stopped");
+    if (!this.plan) throw new Error("RoutingHost.restart(): the host never booted");
+    const oldPort = this.port;
+    await this.killChild();
+    await waitFor("old host port to close", async () => (await portOpen(oldPort)) ? undefined : true, 10_000, 200);
+    await this.launch();
+  }
+
+  /** Kills the current host process tree (taskkill on win32, SIGTERM elsewhere) and waits (bounded) for it to close. */
+  private async killChild(): Promise<{ method: string; taskkill?: Obj }> {
+    const child = this.child;
+    const pid = child?.pid;
+    let method = "none (never started or already exited)";
+    let taskkill: Obj | undefined;
+    if (child && child.exitCode === null && child.signalCode === null) {
+      const closed = new Promise<void>(resolve => child.once("close", () => resolve()));
+      if (process.platform === "win32" && pid !== undefined) {
+        const result = spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { encoding: "utf8", windowsHide: true });
+        method = "taskkill /PID <pid> /T /F";
+        taskkill = { status: result.status, killedPids: [...new Set([...(result.stdout ?? "").matchAll(/PID\D*(\d+)/g)].map(m => Number(m[1])))], stderr: result.stderr?.trim() };
+      } else { child.kill(); method = "SIGTERM"; }
+      await Promise.race([closed, delay(10_000)]);
+    }
+    return { method, taskkill };
   }
 
   /** Extra providers: values may contain the placeholder `$BASE_URL`, replaced by the scripted provider's base URL. */
@@ -853,18 +914,9 @@ export class RoutingHost {
     seenProjectDirs.add(this.project);
     seenProjectDirs.add(path.join(this.root, "config", "opencode"));
     if (child && child.exitCode === null) { try { for (const s of await this.everySession()) seenSessionIDs.add(s.id); } catch { /* the host is already gone */ } }
-    let method = "none (never started or already exited)";
-    let taskkill: Obj | undefined;
-    if (child && child.exitCode === null && child.signalCode === null) {
-      const closed = new Promise<void>(resolve => child.once("close", () => resolve()));
-      if (process.platform === "win32" && pid !== undefined) {
-        const result = spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { encoding: "utf8", windowsHide: true });
-        method = "taskkill /PID <pid> /T /F";
-        taskkill = { status: result.status, killedPids: [...new Set([...(result.stdout ?? "").matchAll(/PID\D*(\d+)/g)].map(m => Number(m[1])))], stderr: result.stderr?.trim() };
-      } else { child.kill(); method = "SIGTERM"; }
-      await Promise.race([closed, delay(10_000)]);
-    }
-    const providerStopped = await this.provider.stop().then(() => true, () => false);
+    const { method, taskkill } = await this.killChild();
+    const frontStopped = this.front ? await this.front.stop().then(() => true, () => false) : true;
+    const providerStopped = (await this.provider.stop().then(() => true, () => false)) && frontStopped;
     const hostPortClosed = this.port === 0 ? true : await waitFor("host port to close", async () => (await portOpen(this.port)) ? undefined : true, 10_000, 200).catch(() => false);
     liveHosts.delete(this);
     const rootRemoved = await rm(this.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }).then(() => !existsSync(this.root), () => false);
@@ -1067,9 +1119,10 @@ export async function runScenario(id: string, expectation: string, body: (s: Sce
   const state: Scenario = { observed: {}, notes: [], verdict: (pass, detail) => { verdict = { pass, detail }; } };
   try { await body(state); } catch (error) { failure = error; }
   const result = failure !== undefined ? `ERROR: ${failure instanceof Error ? failure.message : String(failure)}` : verdict ? `${verdict.pass ? "PASS" : "FAIL"}: ${verdict.detail}` : "NO VERDICT";
-  await mkdir(EVIDENCE_DIR, { recursive: true });
+  const dir = evidenceDir();
+  await mkdir(dir, { recursive: true });
   const record = { scenario: id, host: "opencode v2.0.22 (native v2 plugin API), this checkout loaded as the router plugin", runId: RUN_ID, recordedAt: new Date().toISOString(), harness: harnessGitIds(), expectation, observed: clip(state.observed), assertionResult: result, notes: state.notes };
-  await writeFile(path.join(EVIDENCE_DIR, `${id}.json`), `${JSON.stringify(redact(record), null, 2)}\n`);
+  await writeFile(path.join(dir, `${id}.json`), `${JSON.stringify(redact(record), null, 2)}\n`);
   if (failure !== undefined) throw failure;
   if (!verdict) throw new Error(`${id} produced no verdict`);
   if (!verdict.pass) throw new Error(`${id} expectation disproven: ${verdict.detail}`);
