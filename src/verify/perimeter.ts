@@ -85,7 +85,7 @@ function packageEntries(w: string): string[] {
 }
 
 /** The real paths of W's package links (symlinks, junctions) that point outside W and are not store-like, de-duplicated. */
-function linkedTargets(w: string): string[] {
+export function linkedTargets(w: string): string[] {
   const targets = new Map<string, string>();
   for (const entry of packageEntries(w)) {
     let real: string;
