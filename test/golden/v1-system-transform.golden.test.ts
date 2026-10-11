@@ -6,7 +6,7 @@
  * from the code before the turn-state providers existed and must stay byte-identical afterwards: on v1 nothing
  * moves out of the system array.
  *
- * The plugin is driven without `routerHost: "v2"` and without `routerTurnState` (a v1 host). Pending entries are
+ * The plugin is driven without `routerHost: "v2"` and without a turn-state registry attached through `ROUTER_TURN_STATE_ATTACH` (a v1 host). Pending entries are
  * registered in the plugin's own registry; the late notice comes from the background queue's `takeNotices`.
  * Handles are random, so they are replaced by `<handle-N>` in order of first appearance before the comparison.
  */

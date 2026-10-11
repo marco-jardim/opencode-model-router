@@ -1638,7 +1638,7 @@ describe("docs drift: the per-turn router state on OpenCode v2 (Phase 1.2.6)", (
     expect(flatState).toMatch(/OpenCode v2\.0\.26 cannot set the TTL of the tools breakpoint/);
     expect(flatState).toMatch(/ADR 0007, decision D5, withdrawn/);
     expect(flatState).toMatch(/frozen per session/);
-    expect(flatState).toMatch(/agent name, the orchestrator's model, the agent's permission rules and the configuration are unchanged/);
+    expect(flatState).toMatch(/agent name, the orchestrator's model, the agent's and the session's permission rules and the configuration are unchanged/);
     expect(flatState).toMatch(/A change of the agent catalog alone does not regenerate it/);
     expect(flatState).not.toMatch(/the agent catalog and the orchestrator's model are unchanged/);
     expect(flatState).toMatch(/OpenCode v1 keeps the old delivery, unchanged/);

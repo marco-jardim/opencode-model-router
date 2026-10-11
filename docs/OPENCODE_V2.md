@@ -115,7 +115,7 @@ withdrawn); the router has no setting for the cache hint's lifetime.
 **The `R:` line.** In `advise` and `enforce` mode the `R:` line of the protocol is
 generated from recorded outcomes. With the state in place it is frozen per session: the
 first request of a session fixes it, and it is reused while the agent name, the
-orchestrator's model, the agent's permission rules and the configuration are unchanged. A
+orchestrator's model, the agent's and the session's permission rules and the configuration are unchanged. A
 change to any of these, or a new session, regenerates it, and that request misses the
 cache. A change of the agent catalog alone does not regenerate it: an agent removed from
 the host can stay named in the line until one of those changes. Fresh routing evidence still

@@ -396,7 +396,7 @@ describe("placeTurnState", () => {
     expect(placed[0]).toBe(messages[0]);
   });
 
-  it("treats whitespace-only text as no text (the host drops it) and hints the last part instead", () => {
+  it("treats whitespace-only text as no text (the host drops it) and hints a text part that is visible", () => {
     const messages = deepFreeze<Msg[]>([
       user("real"),
       { role: "user", content: [{ type: "text", text: "kept" }, { type: "image" }, { type: "text", text: " \n\t " }] },
@@ -404,7 +404,33 @@ describe("placeTurnState", () => {
     const placed = placeTurnState(messages, "T", makeTail)!;
     expect(hints(placed)).toEqual([{ message: 1, part: 0 }]);
     const onlyBlank = deepFreeze<Msg[]>([user("real"), { role: "user", content: [{ type: "text", text: "   " }] }]);
-    expect(hints(placeTurnState(onlyBlank, "T", makeTail)!)).toEqual([{ message: 1, part: 0 }]);
+    const placedBlank = placeTurnState(onlyBlank, "T", makeTail)!;
+    expect(placedBlank).toHaveLength(3);
+    expect(hints(placedBlank)).toEqual([]);
+  });
+
+  it("places no hint on a last message whose only parts are tool calls, signed reasoning or effort (the host never marks them)", () => {
+    const messages = deepFreeze<Msg[]>([
+      user("real"),
+      { role: "assistant", content: [{ type: "reasoning", id: "r1" }, { type: "tool-call", id: "t1" }] },
+    ]);
+    const placed = placeTurnState(messages, "T", makeTail)!;
+    expect(placed).toHaveLength(3);
+    expect(hints(placed)).toEqual([]);
+    expect(placed[1]).toBe(messages[1]);
+    expect(placed[2]).toEqual(makeTail("T"));
+  });
+
+  it("hints the tool-result part of a message with blank text and a tool result, and a media part likewise", () => {
+    const withResult = deepFreeze<Msg[]>([
+      user("real"),
+      { role: "tool", content: [{ type: "tool-result", id: "t1" }, { type: "text", text: "  " }, { type: "tool-call", id: "t2" }] },
+    ]);
+    const placed = placeTurnState(withResult, "T", makeTail)!;
+    expect(hints(placed)).toEqual([{ message: 1, part: 0 }]);
+    expect(placed[1]!.content[0]).toEqual({ type: "tool-result", id: "t1", cache: { type: "ephemeral" } });
+    const withMedia = deepFreeze<Msg[]>([user("real"), { role: "user", content: [{ type: "media" }, { type: "text", text: "" }] }]);
+    expect(hints(placeTurnState(withMedia, "T", makeTail)!)).toEqual([{ message: 1, part: 0 }]);
   });
 
   it("adds the tail with no hint when no message has any text", () => {

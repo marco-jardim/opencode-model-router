@@ -866,6 +866,16 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       }));
     } catch (error) {
       logger.warn("[router] turn state: late/pending providers not registered", { error: scrubText(String(error)) });
+      // Nothing stays half registered: the system transform keeps delivering through the system array.
+      for (const unregister of unregisterTurnStateProviders.splice(0)) {
+        try {
+          unregister();
+        } catch (unregisterError) {
+          logger.warn("[router] turn state: unregistering a provider failed", { error: scrubText(String(unregisterError)) });
+        }
+      }
+      turnState = undefined;
+      return false;
     }
     return true;
   };

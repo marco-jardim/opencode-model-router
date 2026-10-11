@@ -252,6 +252,48 @@ describe("v2 turn state (Phase 1.2, integration)", () => {
 
   const lateNotice = (handle = LATE_HANDLE): LateNotice => ({ handle, description: "late work", introduced: ["a.test.ts > t2"], outcome: "fail" });
 
+  it("QA-1.2-18: a registry whose registration throws is refused (false), nothing stays registered and the system array still carries the pending list", async () => {
+    const overrides = join(home, ".config/opencode/opencode-model-router.overrides.jsonc");
+    mkdirSync(dirname(overrides), { recursive: true });
+    writeFileSync(overrides, JSON.stringify({ enforcement: { verify: { background: true } } }), "utf-8");
+    invalidateConfigCache();
+    const hooks = await ModelRouterPlugin({
+      directory: root,
+      worktree: root,
+      project: {},
+      serverUrl: new URL("http://localhost"),
+      $: () => undefined,
+      routerHost: "v2",
+      client: { session: { get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id } }) } },
+    } as unknown as Parameters<typeof ModelRouterPlugin>[0]);
+    const attach = (hooks as unknown as Record<PropertyKey, unknown>)[ROUTER_TURN_STATE_ATTACH];
+    if (typeof attach !== "function") throw new Error("the plugin exposes no turn-state attach hook");
+    const registered: string[] = [];
+    const unregistered: string[] = [];
+    const failing: TurnStateRegistry = {
+      registerTurnStateProvider(provider) {
+        if (provider.name === "pending") throw new Error("registration refused");
+        registered.push(provider.name);
+        return () => { unregistered.push(provider.name); };
+      },
+      buildTurnState: () => undefined,
+      hasActivity: () => false,
+    };
+    expect((attach as (r: TurnStateRegistry) => unknown)(failing)).toBe(false);
+    expect(registered).toEqual(["late"]);
+    expect(unregistered).toEqual(["late"]);
+
+    register(1);
+    const transform = hooks["experimental.chat.system.transform"];
+    if (transform === undefined) throw new Error("the plugin has no system transform");
+    const output: { system: string[] } = { system: [] };
+    await transform({ sessionID: SESSION, model: { providerID: "anthropic", modelID: "claude-sonnet-5-5" } } as unknown as Parameters<typeof transform>[0], output);
+    expect(output.system.join("\n")).toContain("work 1");
+    // The refused attach left the slot free: a registry that works is accepted afterwards.
+    const working: TurnStateRegistry = { registerTurnStateProvider: () => () => undefined, buildTurnState: () => undefined, hasActivity: () => false };
+    expect((attach as (r: TurnStateRegistry) => unknown)(working)).toBe(true);
+  });
+
   it("empty state: event.messages stays the very same (frozen) array and no part is touched", async () => {
     const { hook } = await boot();
     const messages = deepFreeze([user("Hello")]);

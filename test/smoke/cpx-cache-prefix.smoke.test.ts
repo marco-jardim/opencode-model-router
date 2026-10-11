@@ -17,8 +17,10 @@
  *   - N+1 equals N byte for byte through N's last real message, with `cache_control` stripped on both sides (the marker moves);
  *   - N+1 carries no `cache_control` inside that shared part except on its own last real message;
  *   - `system` (the host's own markers included) is byte-identical.
- * Recorded (not asserted): whether the tool_result block carries the marker (O12) and whether the host took the reassigned `event.messages`
- * (the tail present in the wire request proves it).
+ *   - a request ending in a tool result carries the marker on its tool_result block (O12, check `o12-breakpoint`).
+ * Recorded (not asserted): whether the host took the reassigned `event.messages` (the tail present in the wire request proves it), and
+ * `systemFold`: whether any request carries a trailing native system message or a system update folded into a user message (the first
+ * differing path between request N and N+1 before N's last real message, if any).
  *
  * Output: the observation `<OBS_DIR>/<runId>/cache-prefix.json` (+ `<OBS_DIR>/latest/cache-prefix.json`) is written BEFORE any assertion, with
  * OBS_DIR as in cpx-host-contract (`<OMR_CPX_PROBE_DIR | OMR_SMOKE_REAL_TMPDIR | os.tmpdir()>/omr-cpx-probe`).
@@ -92,6 +94,25 @@ function withoutCacheControl(value: unknown): unknown {
   }
   return value;
 }
+/** The JSON path of the first place where two values differ (depth first, keys in `a`'s order), undefined when equal. */
+function firstPathDiff(a: unknown, b: unknown, at: string): string | undefined {
+  if (json(a) === json(b)) return undefined;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    for (let i = 0; i < Math.max(a.length, b.length); i += 1) {
+      const found = firstPathDiff(a[i], b[i], `${at}[${i}]`);
+      if (found !== undefined) return found;
+    }
+    return at;
+  }
+  if (a !== null && b !== null && typeof a === "object" && typeof b === "object" && !Array.isArray(a) && !Array.isArray(b)) {
+    const keys = [...Object.keys(a), ...Object.keys(b).filter(k => !(k in a))];
+    for (const k of keys) {
+      const found = firstPathDiff((a as Obj)[k], (b as Obj)[k], `${at}.${k}`);
+      if (found !== undefined) return found;
+    }
+  }
+  return at;
+}
 const messageIndexOf = (p: string): number | undefined => {
   const m = /^\$\.messages\[(\d+)\]/.exec(p);
   return m ? Number(m[1]) : undefined;
@@ -118,6 +139,8 @@ interface RequestView {
   lastRealLastPartMarked: boolean;
   /** Whether a `tool_result` block of the last real message carries a `cache_control` (O12). */
   lastRealToolResultMarked: boolean;
+  /** Indexes of messages whose role is `system` (a native system message inside `messages`, QA-1.2-17). */
+  systemRoleMessages: number[];
   systemBreakpoints: number;
   totalMarkers: number;
   ttlPaths: string[];
@@ -145,6 +168,7 @@ function view(r: CpxRequest): RequestView {
     lastReal: tail > 0 ? tail - 1 : -1,
     lastRealIsToolResult: tail > 0 && hasToolResult(messages[tail - 1]),
     messageBreakpoints: paths.flatMap(p => { const i = messageIndexOf(p); return i === undefined ? [] : [i]; }),
+    systemRoleMessages: messages.flatMap((m, i) => (m.role === "system" ? [i] : [])),
     systemBreakpoints: paths.filter(p => p.startsWith("$.system")).length,
     totalMarkers: markers.length,
     ttlPaths: [...findKeys(obj(r.body), /^ttl/i).map(k => String(k.path))],
@@ -165,6 +189,8 @@ function comparePair(a: CpxRequest, b: CpxRequest, va: RequestView, vb: RequestV
   const earlier = json(withoutCacheControl(am.slice(0, through)));
   const later = json(withoutCacheControl(bm.slice(0, through)));
   let firstDiff: Obj | undefined;
+  // QA-1.2-17: the JSON path of the first difference in the shared part (a system update folded into a user message shows up here).
+  const firstDiffPath = earlier === later ? undefined : firstPathDiff(withoutCacheControl(am.slice(0, through)), withoutCacheControl(bm.slice(0, through)), "$.messages");
   if (earlier !== later) {
     let at = 0;
     while (at < earlier.length && earlier[at] === later[at]) at += 1;
@@ -178,6 +204,7 @@ function comparePair(a: CpxRequest, b: CpxRequest, va: RequestView, vb: RequestV
     comparedMessages: through,
     prefixIdentical: earlier === later,
     firstDiff,
+    firstDiffPath,
     laterPrefixOtherMarkers: bPrefixOtherMarkers,
     systemIdentical: json(obj(a.body).system) === json(obj(b.body).system),
     otherFieldsIdentical: json(Object.fromEntries(Object.entries(obj(a.body)).filter(([k]) => k !== "messages"))) === json(Object.fromEntries(Object.entries(obj(b.body)).filter(([k]) => k !== "messages"))),
@@ -225,6 +252,15 @@ d("cpx cache prefix: the turn-state tail never touches the cached prefix", () =>
       // (the router-state tail present in the wire request proves it)?
       observed.o12ToolResultBlockCarriesCacheControl = views.filter(v => v.lastRealIsToolResult).map(v => ({ request: v.index, toolResultMarked: v.lastRealToolResultMarked, markedTypes: v.lastRealMarkedTypes }));
       observed.eventMessagesReassigned = { tailInEveryWireRequest: views.every(v => v.tailAt.length === 1), perRequest: views.map(v => ({ request: v.index, tailAt: v.tailAt })) };
+      // QA-1.2-17 (observation, not asserted): does any wire request carry a native system message inside `messages` (trailing or not), or a
+      // system update folded into a user message (a difference between N and N+1 before N's last real message)? Either would break the prefix.
+      observed.systemFold = {
+        nativeSystemMessages: views.filter(v => v.systemRoleMessages.length > 0).map(v => ({ request: v.index, at: v.systemRoleMessages, trailing: v.systemRoleMessages.includes(v.messageCount - 1) })),
+        anyNativeSystemMessage: views.some(v => v.systemRoleMessages.length > 0),
+        anyTrailingNativeSystemMessage: views.some(v => v.systemRoleMessages.includes(v.messageCount - 1)),
+        prefixDifferences: (observed.pairs as Obj[]).filter(p => p.prefixIdentical !== true).map(p => ({ from: p.from, to: p.to, firstDiffPath: p.firstDiffPath })),
+        anySystemUpdateFoldedIntoUserMessage: (observed.pairs as Obj[]).some(p => p.prefixIdentical !== true),
+      };
       observed.lastMessages = requests.map(r => clip(bodyMessages(r).at(-1), 700));
       observed.systems = requests.map(r => clip(obj(r.body).system, 1500));
       observed.hostErrors = clip(host.errorLines(), 400);

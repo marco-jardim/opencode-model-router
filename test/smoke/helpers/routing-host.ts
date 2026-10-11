@@ -237,7 +237,11 @@ export class RoutingProvider {
       const responses = /\/responses(\?|$)/.test(url);
       const system = responses ? String(body.instructions ?? "") : this.systemText(body.system);
       const messages = (responses ? arr(body.input) : arr(body.messages)).map(obj);
-      const last = messages.at(-1);
+      // The router's turn-state tail (a trailing user message starting `<router-state>`) is never the caller's turn: take the last message that is not one.
+      const isStateTail = (m: Obj): boolean => m.role === "user" && this.blocks(m.content).map(b => String(b.text ?? "")).join("\n").trimStart().startsWith("<router-state>");
+      let lastIndex = messages.length - 1;
+      while (lastIndex >= 0 && isStateTail(messages[lastIndex]!)) lastIndex -= 1;
+      const last = lastIndex >= 0 ? messages[lastIndex] : undefined;
       const lastBlocks = this.blocks(last?.content);
       const toolResult = responses ? messages.some(m => m.type === "function_call_output") && last?.type === "function_call_output" : lastBlocks.some(b => b.type === "tool_result");
       const lastText = responses

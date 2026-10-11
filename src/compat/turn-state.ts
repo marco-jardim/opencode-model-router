@@ -166,7 +166,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 /**
  * The part that carries the cache hint: the last text part with visible text (the host drops whitespace-only text),
- * else the last part of the message whatever its type (a tool-result-only message). None for a message without parts.
+ * else the last `tool-result` or `media` part (the only other parts the host marks). None otherwise.
  */
 function hintTarget(message: unknown): { content: unknown[]; index: number; part: Record<string, unknown> } | undefined {
   if (!isRecord(message) || !Array.isArray(message.content)) return undefined;
@@ -175,14 +175,18 @@ function hintTarget(message: unknown): { content: unknown[]; index: number; part
     const part = content[index];
     if (isRecord(part) && part.type === "text" && typeof part.text === "string" && part.text.trim() !== "") return { content, index, part };
   }
-  const index = content.length - 1;
-  const last = content[index];
-  return isRecord(last) ? { content, index, part: last } : undefined;
+  // No visible text: the host marks only a tool result or media part, so only such a part carries the hint. It never
+  // marks a tool call, signed reasoning, effort or blank text, so those get no hint (a hint there would be lost).
+  for (let index = content.length - 1; index >= 0; index--) {
+    const part = content[index];
+    if (isRecord(part) && (part.type === "tool-result" || part.type === "media")) return { content, index, part };
+  }
+  return undefined;
 }
 
 /**
  * Appends the tail as a new last message and puts the one router cache hint on the last real message only: on its
- * last non-blank text part, else on its last part (never on an earlier message, so a tool loop does not pin the
+ * last non-blank text part, else on its last tool-result or media part, else nowhere (never on an earlier message, so a tool loop does not pin the
  * breakpoint). Pure: host messages, content arrays and parts are never mutated; the changed message is a
  * prototype-preserving copy. `undefined` tail → `undefined` (the caller leaves the messages alone).
  */
