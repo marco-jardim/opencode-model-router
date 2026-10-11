@@ -23,7 +23,7 @@ Read this first in a new session. The design is `docs/design/cross-repo.md`, and
 | Phase | State |
 |---|---|
 | P0: integrity fixes in the shared verification engine (both hosts) | Done. QA'd twice. Live check: the unobservable-writers caveat appeared on a real dispatch. |
-| P1: v2 roles cross-repo (P1.1–P1.10) | Done. QA'd twice. Docs updated. **Live dogfood pending.** |
+| P1: v2 roles cross-repo (P1.1–P1.10) | Done. QA'd twice. Docs updated. Live dogfood done (see "Phase 1 live dogfood"). |
 | P2 / P3 / P4 | Not started |
 
 Last checks (HEAD `be7c0b3`):
@@ -33,13 +33,28 @@ Last checks (HEAD `be7c0b3`):
 
 ## Next steps
 
-1. **Dogfood P1 live** (needs the restart above, with `repoParents` already set):
-   - dispatch a role with `[route class=recon repo=<some repo under D:\git>]` and confirm the work root, the read-provenance line, and a cross-repo read;
-   - dispatch an edit into the wrong repository and confirm the located refusal;
-   - check the perimeter scope note on a pass, and the I4 refusal when a linked repository changes while `bash` runs.
+1. ~~Dogfood P1 live~~: done, see "Phase 1 live dogfood".
 2. **Open owner decision Q7:** role agents are registered from a catch-all `*: deny`, so D13 cannot open worktrees outside the parents. The fix would turn the generated catch-all into `ask`; the risk is a background child waiting on a prompt. Do not change this without the owner.
 3. **Phase 2** (design §7): per-check `cwd=` / `scope=`, consumer checks, pinning of linked repositories (including ignored `dist/`), and deferred verification across the perimeter.
 4. **Accepted minors** from the P0 and P1 QA rounds are listed in design §9 ("Known follow-ups"). Revisit them only if they become relevant.
+
+## Phase 1 live dogfood (2026-10-10)
+
+Run in the dogfood instance at HEAD `7ecbfda`, with `repoParents: ["D:/git"]`.
+
+| Check | Dispatch | Result |
+|---|---|---|
+| Work root and cross-repo read | `explorer`, `[route class=recon repo=mcp-reader]` | Pass. The work root resolved to `D:\git\mcp-reader` (`router_git_log` ran there). Reading this worktree returned `[router: read from opencode-model-router-cross-repo (feat/cross-repo) at D:\git\opencode-model-router-cross-repo — read-only in this dispatch]`. |
+| Located refusal | `implementer`, `repo=mcp-reader needs=edit`, writes a new file in this worktree | Pass. `[router] Refused for role agent implementer in this dispatch: write: …\.dogfood-wrong-repo-probe.txt is in repository opencode-model-router-cross-repo (branch feat/cross-repo), which this dispatch may read but not edit. Finish the mcp-reader part and return NEED MORE: naming the opencode-model-router-cross-repo change; it needs a dispatch with repo=opencode-model-router-cross-repo.` |
+| Scope note on a pass | `implementer` in this worktree, `VERIFY:required`, `fileExists` | Pass. `verified scope: opencode-model-router-cross-repo (feat/cross-repo @ 7ecbfda); also observed: mcp-reader (main @ fe7d775)`. mcp-reader comes from the working set (the parallel `repo=` dispatch). |
+| I4, tier with `bash` | `medium`, writes through `node_modules\omr-xr-dogfood-lib` (a junction to the scratch repository `D:\git\omr-xr-dogfood-lib`) | `✓ verified` with no note. As designed: tier dispatches plan no perimeter (`perimeter.ts:167`; design S3, Q1). |
+| I4, role with `router_run` | `implementer`, `router_run test-files` running a scratch test that writes through the same junction | Pass. UNVERIFIED: `the repository omr-xr-dogfood-lib at D:\git\omr-xr-dogfood-lib also changed during the dispatch, and the producer ran router_run; a write there cannot be attributed, so the checks in D:\git\opencode-model-router-cross-repo do not cover it. Dispatch that work with repo=omr-xr-dogfood-lib, or verify it there.` |
+
+Observations:
+- Role delegates are never told their work root: role dispatches get no header (the known "location line is dead code" follow-up). With `repo=`, every role delegate had to infer its work root from the prompt's ENVIRONMENT text.
+- In this instance the host's `<env>` block names `D:\git\Claude-model-router-cross-repo`, which does not exist. The AGENTS.md path in the system prompt is rewritten the same way (`omr-cross-repo\Claude-config`), so this is a text substitution in the prompt pipeline, not the router. It still misleads delegates.
+- `fast` has no write or shell tool in this config; a write dispatched to it escalates to `medium`.
+- The scratch repository `D:\git\omr-xr-dogfood-lib` (one commit, branch `main`) is kept for the Phase 2 dogfood. The junction and the scratch test were removed.
 
 ## Owner's working rules (from the session)
 
