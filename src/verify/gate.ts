@@ -64,6 +64,11 @@ export interface PerimeterObservation {
    * Absent or empty: none known, no consumer caveat.
    */
   readonly consumers?: readonly { readonly root: string; readonly name?: string; readonly entry: string }[];
+  /**
+   * Cross-repo QA-2 #2: working-set worktrees whose consumer discovery stopped on its entry budget before it finished. A
+   * repository there may link W unchecked, so a would-be pass with a change carries a caveat per entry.
+   */
+  readonly consumersIncomplete?: readonly { readonly root: string; readonly name?: string }[];
 }
 
 /** The concrete, inspectable result of a delegation (artefact contract §3.3). */
@@ -394,14 +399,24 @@ export async function accept(
   const refuseUncoveredByCheckRoots = (): GateResult | undefined => {
     const placements = delegation.checkPlacements;
     if (placements === undefined || !placements.some(placement => placement !== undefined)) return undefined;
-    if (artefact.changedFiles.length === 0) return undefined;
+    // QA-3 #1: an unavailable change baseline leaves the change list unknown (often []), not empty.
+    const baselineUnavailable = artefact.changeBaseline === "unavailable";
+    if (artefact.changedFiles.length === 0 && !baselineUnavailable) return undefined;
     const changeRoot = artefact.changeRoot ?? effectiveBaseDir;
     const tops: string[] = [];
+    let coversChangeRoot = false;
     for (let index = 0; index < (dod.checks ?? []).length; index++) {
       const placement = placements[index];
-      const top = placement === undefined ? changeRoot : placement.top;
+      // QA-3 #5: an unplaced check, or a non-foreign placement without a top, runs in (covers) the change root.
+      if (placement === undefined || placement.foreign !== true) coversChangeRoot = true;
+      const top = placement === undefined || (placement.foreign !== true && placement.top === undefined) ? changeRoot : placement.top;
       if (top !== undefined && !tops.includes(top)) tops.push(top);
     }
+    if (baselineUnavailable && !coversChangeRoot) {
+      const reason = `the change in the work root could not be observed and no check runs there (${tops.join(", ")}); nothing ran`;
+      return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] }, dodSource, deps.strictUnverifiable);
+    }
+    if (artefact.changedFiles.length === 0) return undefined;
     const canonicalTops = tops.map(top => canonical(top));
     const uncovered = artefact.changedFiles
       .map(({ path }) => path)
@@ -507,17 +522,22 @@ function unverifiedConsumerCaveats(
   dod: DoD,
   placements: readonly (CheckPlacement | undefined)[] | undefined,
 ): string[] {
-  const consumers = artefact.perimeter?.consumers;
-  if (consumers === undefined || consumers.length === 0 || artefact.changedFiles.length === 0) return [];
+  // QA-3 #1: an unavailable change baseline counts as a non-empty change set (the change is unknown, not absent).
+  if (artefact.changedFiles.length === 0 && artefact.changeBaseline !== "unavailable") return [];
+  const consumers = artefact.perimeter?.consumers ?? [];
   const checks = dod.kind === "deterministic" ? dod.checks ?? [] : [];
   const covered = new Set<string>();
   checks.forEach((check, index) => {
     const top = placements?.[index]?.top;
     if (top !== undefined && CONSUMER_CHECK_KINDS.has(check.kind)) covered.add(perimeterKey(top));
   });
-  return consumers
+  const unchecked = consumers
     .filter(consumer => !covered.has(perimeterKey(consumer.root)))
     .map(consumer => `${consumer.name ?? consumer.root} at ${consumer.root} links this work root (node_modules/${consumer.entry}) and no check ran there; add a check such as: check: testsPass cwd="${consumer.root}" scope=full`);
+  // QA-2 #2: discovery stopped on its budget; a repository there may link this work root unchecked.
+  const incomplete = (artefact.perimeter?.consumersIncomplete ?? [])
+    .map(entry => `consumer discovery stopped before finishing ${entry.name ?? entry.root} at ${entry.root}; a repository there may link this work root unchecked`);
+  return [...unchecked, ...incomplete];
 }
 
 /** I5 (P0.3): the caveat for an empty change set when the producer ran tools whose writes the router cannot observe. */

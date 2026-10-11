@@ -713,6 +713,42 @@ describe("accept() — per-check placements (P2.4)", () => {
     expect(r.verdict.outcome).toBe("pass");
     expect(lastRunArgs().changedFiles).toBe(changedFiles);
   });
+
+  it("F17: an unavailable change baseline with only a foreign check is unverifiable, and nothing runs", async () => {
+    const { exec, d, dod } = setup();
+    const unobserved = artefact({ changeRoot: W, changedFiles: [], changeBaseline: "unavailable" });
+    const r = await accept({ dod, workRoot: W, checkPlacements: [foreign] }, unobserved, d);
+    const reason = `the change in the work root could not be observed and no check runs there (${C}); nothing ran`;
+    expect(r.verdict).toEqual({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] });
+    expect(exec).not.toHaveBeenCalled();
+    // An available, empty change set leaves nothing uncovered: the foreign check runs.
+    const observed = await accept({ dod, workRoot: W, checkPlacements: [foreign] }, { ...unobserved, changeBaseline: "available" }, d);
+    expect(observed.verdict.outcome).toBe("pass");
+    expect(exec).toHaveBeenCalledTimes(1);
+  });
+
+  it("F17: an unavailable change baseline with a check in W plus a foreign check runs both", async () => {
+    const { exec, d, dod } = setup([runCheck, runCheck]);
+    const unobserved = artefact({ changeRoot: W, changedFiles: [], changeBaseline: "unavailable" });
+    for (const inW of [undefined, local]) {
+      const r = await accept({ dod, workRoot: W, checkPlacements: [inW, foreign] }, unobserved, d);
+      expect(r.verdict.outcome).toBe("pass");
+      expect(lastRunArgs().placements).toEqual([inW, foreign]);
+    }
+    expect(exec).toHaveBeenCalledTimes(4);
+  });
+
+  it("QA-2 #5: a non-foreign check with an unknown top (W not a git repository) covers the change root", async () => {
+    const { exec, d, dod } = setup();
+    const unknownTop: CheckPlacement = { cwd: W, top: undefined, foreign: false };
+    const r = await accept({ dod, workRoot: W, checkPlacements: [unknownTop] }, wrote("a.ts"), d);
+    expect(r.verdict.outcome).toBe("pass");
+    expect(r.verdict.reasons.join("\n")).not.toContain("is not covered by any check root");
+    const unobserved = artefact({ changeRoot: W, changedFiles: [], changeBaseline: "unavailable" });
+    const r2 = await accept({ dod, workRoot: W, checkPlacements: [unknownTop] }, unobserved, d);
+    expect(r2.verdict.outcome).toBe("pass");
+    expect(exec).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("accept() — consumer caveat (D6)", () => {
@@ -790,6 +826,35 @@ describe("accept() — consumer caveat (D6)", () => {
     expect(r.verdict.outcome).toBe("pass");
     expect(r.verdict.reasons).not.toContain(CAVEAT);
     expect(r.verdict.caveats ?? []).toEqual([]);
+  });
+
+  it("F17: an unavailable change baseline counts as a change: a consumer without a check carries the caveat", async () => {
+    const { d, dod } = setup([runCheck]);
+    const r = await accept({ dod, workRoot: W }, wrote({ changedFiles: [], changeBaseline: "unavailable" }), d);
+    expect(r.verdict.outcome).toBe("unverifiable");
+    expect(r.verdict.caveats).toEqual([CAVEAT]);
+  });
+
+  it("QA-2 #2: consumer discovery that stopped early carries a caveat per entry on a pass with a change", async () => {
+    const { d, dod } = setup([runCheck]);
+    const incomplete = [{ root: C, name: "app-c" }, { root: join(tmpdir(), "d6-other") }];
+    const art = (over: Partial<Artefact> = {}): Artefact =>
+      wrote({ perimeter: { ...perimeter(), consumersIncomplete: incomplete }, ...over });
+    const caveats = [
+      `consumer discovery stopped before finishing app-c at ${C}; a repository there may link this work root unchecked`,
+      `consumer discovery stopped before finishing ${incomplete[1].root} at ${incomplete[1].root}; a repository there may link this work root unchecked`,
+    ];
+    const r = await accept({ dod, workRoot: W }, art(), d);
+    expect(r.verdict.pass).toBe(false);
+    expect(r.verdict.outcome).toBe("unverifiable");
+    expect(r.verdict.caveats).toEqual(caveats);
+    // An unavailable baseline counts as a change too.
+    const unobserved = await accept({ dod, workRoot: W }, art({ changedFiles: [], changeBaseline: "unavailable" }), d);
+    expect(unobserved.verdict.caveats).toEqual(caveats);
+    // An empty, available change set: no caveat, the pass stays a pass.
+    const empty = await accept({ dod, workRoot: W }, art({ changedFiles: [], changeBaseline: "available" }), d);
+    expect(empty.verdict.outcome).toBe("pass");
+    expect(empty.verdict.caveats ?? []).toEqual([]);
   });
 
   it("a fail stays a fail, without the consumer caveat", async () => {
