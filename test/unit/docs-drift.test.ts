@@ -6,6 +6,8 @@ import {
   ROUTING_DEFAULTS,
   ROUTING_ENGINES,
   ROUTING_TASK_CLASSES,
+  configuredV2OnlyKeys,
+  resetRoutingWarnings,
   resolveRolesRouting,
   resolveRouting,
   validateConfig,
@@ -557,6 +559,10 @@ describe("docs drift: defaults, ranges, ids and severities (QA-3.1-18)", () => {
       "advisor.enabled": defaults.advisor.enabled,
       "advisor.noticeIntervalHours": defaults.advisor.noticeIntervalHours,
       "advisor.notify": defaults.advisor.notify,
+      "background.mode": defaults.background.mode,
+      "background.minPredictedMs": defaults.background.minPredictedMs,
+      "leases.mode": defaults.leases.mode,
+      "leases.run": defaults.leases.run,
     };
     const wrong: string[] = [];
     for (const [key, value] of Object.entries(expected)) {
@@ -609,6 +615,35 @@ describe("docs drift: defaults, ranges, ids and severities (QA-3.1-18)", () => {
     const half = lo + 0.5;
     expect(accepts(withValue(block, field, half)), `${key} = ${half}`).toBe(!integer);
     expect(cells![1], `${key} type`).toBe(integer ? "`integer`" : "`number`");
+  });
+
+  it("background.* and leases.* are documented as OpenCode v2 only, with the enum values and the range the code accepts (Phase 2.1)", () => {
+    const doc = read("docs/CONFIG_REFERENCE.md");
+    const rows = {
+      "background.mode": ["auto", "model", "off"],
+      "leases.mode": ["enforce", "off"],
+      "leases.run": ["annotate", "refuse"],
+    } as const;
+    for (const [key, values] of Object.entries(rows)) {
+      const cells = keyRow(doc, key);
+      expect(cells, `row ${key}`).toBeDefined();
+      expect(cells![3]!.replace(/[\\`]/g, "").split("|").map((v) => v.trim())).toEqual([...values]);
+      expect(cells![4], `${key} v2 only`).toContain("OpenCode v2 only");
+      expect(cells![4], `${key} v1`).toContain("v1 logs one notice per configured key and ignores it");
+    }
+    const ms = keyRow(doc, "background.minPredictedMs");
+    expect(ms?.[1]).toBe("`integer`");
+    expect(parseRange(ms![3]!)).toEqual({ lo: 0, hi: 3_600_000, loExcluded: false });
+    expect(ms![4]).toContain("OpenCode v2 only");
+    expect(ms![4]).toContain("v1 logs one notice per configured key and ignores it");
+    // the code takes the documented bounds and falls back to the default outside them
+    const minMs = (v: unknown) => resolveRouting(validateConfig({ ...bundled, routing: { background: { minPredictedMs: v } } }), "v2", { warn: () => {} }).background.minPredictedMs;
+    resetRoutingWarnings();
+    expect([minMs(0), minMs(3_600_000), minMs(3_600_001), minMs(-1), minMs(1.5)]).toEqual([0, 3_600_000, 45_000, 45_000, 45_000]);
+    expect(configuredV2OnlyKeys({ routing: { background: { mode: "off" }, leases: { run: "refuse" } } })).toEqual([
+      "routing.background.mode",
+      "routing.leases.run",
+    ]);
   });
 
   it("the three detection probabilities share the documented [0, 1] range and must not increase with a weaker check", () => {

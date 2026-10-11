@@ -850,6 +850,10 @@ Every key is optional. Types and ranges are enforced by `validateConfig`; defaul
 | `advisor.enabled` | `boolean` | `true` | | The cost doctor's findings (the `/router` section) and its notice. Inert without a `routing` block. See [The cost doctor](./ROUTING_ENGINE.md#the-cost-doctor). |
 | `advisor.noticeIntervalHours` | `number` | `24` | `[1, 720]` | Hours between cost-doctor checks (never more often than hourly). A notice goes out only when a notice-worthy finding the user was not told about appears, or as a reminder after 7 days; a set that only shrank is not news. |
 | `advisor.notify` | `boolean` | `true` | | `false` = never notify; the `/router` section stays. Findings on unmodified tiers of a bundled preset are never notified either way. |
+| `background.mode` | `string` | `"auto"` | `auto \| model \| off` | Background dispatch of a subagent whose predicted duration is long. `auto`: the router decides from the predicted duration; `model`: the orchestrating model decides; `off`: every dispatch stays foreground, byte-identical to the previous release. **OpenCode v2 only**: v1 logs one notice per configured key and ignores it. An invalid value logs one warning and the default applies. |
+| `background.minPredictedMs` | `integer` | `45000` | `[0, 3600000]` | With `background.mode: "auto"`, the predicted duration (milliseconds) from which a dispatch runs in the background. **OpenCode v2 only**: v1 logs one notice per configured key and ignores it. A value outside the range or not an integer logs one warning and the default applies. |
+| `leases.mode` | `string` | `"enforce"` | `enforce \| off` | Work leases: one holder per repository area at a time. `off` takes no lease and refuses nothing. **OpenCode v2 only**: v1 logs one notice per configured key and ignores it. An invalid value logs one warning and the default applies. |
+| `leases.run` | `string` | `"annotate"` | `annotate \| refuse` | What `router_run` does when its target is leased by another holder: `annotate` runs it and notes the lease in the result; `refuse` refuses the run. **OpenCode v2 only**: v1 logs one notice per configured key and ignores it. An invalid value logs one warning and the default applies. |
 
 Fully resolved defaults on **OpenCode v2** (this block is parsed by a test and compared with `resolveRouting`, so it cannot drift from the code; on v1 only `roles` differs: `{}`):
 
@@ -874,7 +878,9 @@ Fully resolved defaults on **OpenCode v2** (this block is parsed by a test and c
   "roles": { "search": ["explore"], "implement": ["general"], "debug": ["general"], "review": ["general"] },
   "outcomes": { "path": null, "halfLifeDays": 14, "maxEffectiveSamples": 50 },
   "sessionReuse": { "maxContextFraction": 0.6 },
-  "advisor": { "enabled": true, "noticeIntervalHours": 24, "notify": true }
+  "advisor": { "enabled": true, "noticeIntervalHours": 24, "notify": true },
+  "background": { "mode": "auto", "minPredictedMs": 45000 },
+  "leases": { "mode": "enforce", "run": "annotate" }
 }
 ```
 
