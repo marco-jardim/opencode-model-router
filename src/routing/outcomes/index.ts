@@ -60,13 +60,45 @@ export {
   compactStamp,
   createFlusher,
   createPersister,
+  createSideLogs,
   nodePersistDeps,
   nodePersistFs,
   nodeScheduler,
   parseLogLine,
+  parseTimingLine,
+  parseTurnLine,
   renameWithRetry,
   resolveOutcomesDir,
 } from "./persist";
+export {
+  MAX_OPEN_STARTS,
+  MAX_ROOT_SESSIONS,
+  MAX_SEEN_EVENT_IDS,
+  OPEN_START_TTL_MS,
+  createTimingRecorder,
+} from "./timings";
+export type {
+  DispatchStartInput,
+  RootStepTokens,
+  TimingLogger,
+  TimingRecorder,
+  TimingRecorderOptions,
+} from "./timings";
+export {
+  DURATION_MAX_AGE_DAYS,
+  DURATION_MIN_SAMPLES,
+  DURATION_PRIOR_MS,
+  DURATION_WINDOW,
+  createDurationModel,
+} from "./durations";
+export type {
+  DurationEstimate,
+  DurationModel,
+  DurationOptions,
+  DurationQuery,
+  DurationSeams,
+  DurationSource,
+} from "./durations";
 
 export { USAGE, hasRoleRows, parseStatsArgs, renderMarkdown, renderRoleMarkdown, runStatsCli, summarize, summarizeRoles } from "./stats";
 export type { ParseStatsResult, StatsArgs } from "./stats";
