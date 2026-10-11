@@ -61,6 +61,8 @@ export {
   createFlusher,
   createPersister,
   createSideLogs,
+  durationSeamsFor,
+  isSideLogLabel,
   nodePersistDeps,
   nodePersistFs,
   nodeScheduler,
@@ -70,23 +72,31 @@ export {
   renameWithRetry,
   resolveOutcomesDir,
 } from "./persist";
+export type { SideLogOptions } from "./persist";
 export {
+  DEFAULT_TURN_IDLE_MS,
+  MAX_FUTURE_SKEW_MS,
   MAX_OPEN_STARTS,
   MAX_ROOT_SESSIONS,
   MAX_SEEN_EVENT_IDS,
   OPEN_START_TTL_MS,
+  acquireTimingRecorder,
+  classifyCapacity,
   createTimingRecorder,
 } from "./timings";
 export type {
+  AcquireTimingRecorderOptions,
   DispatchStartInput,
   RootStepTokens,
   TimingLogger,
   TimingRecorder,
+  TimingRecorderHolder,
   TimingRecorderOptions,
 } from "./timings";
 export {
   DURATION_MAX_AGE_DAYS,
   DURATION_MIN_SAMPLES,
+  DURATION_P90_MIN_SAMPLES,
   DURATION_PRIOR_MS,
   DURATION_WINDOW,
   createDurationModel,
@@ -100,8 +110,21 @@ export type {
   DurationSource,
 } from "./durations";
 
-export { USAGE, hasRoleRows, parseStatsArgs, renderMarkdown, renderRoleMarkdown, runStatsCli, summarize, summarizeRoles } from "./stats";
-export type { ParseStatsResult, StatsArgs } from "./stats";
+export {
+  USAGE,
+  hasRoleRows,
+  parseStatsArgs,
+  renderCacheShareMarkdown,
+  renderDurationsMarkdown,
+  renderMarkdown,
+  renderRoleMarkdown,
+  runStatsCli,
+  summarize,
+  summarizeCacheShare,
+  summarizeDurations,
+  summarizeRoles,
+} from "./stats";
+export type { CacheShareStats, DurationStatsRow, ParseStatsResult, StatsArgs, StatsSideLogs } from "./stats";
 export {
   REDISPATCH_MAX_EARLIER,
   REDISPATCH_MIN_TOKENS,

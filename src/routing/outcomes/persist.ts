@@ -10,6 +10,7 @@
 
 import { appendFile, mkdir, open, readFile, readdir, rename, stat, unlink } from "node:fs/promises";
 import { isAbsolute, join, normalize, resolve } from "node:path";
+import type { DurationSeams } from "./durations";
 import type {
   DecisionRow,
   DecisionTrace,
@@ -862,11 +863,42 @@ export function createPersister(dir: string, deps: PersistDeps, options: Persist
 
 const TIMING_OUTCOMES: readonly string[] = ["succeeded", "failed", "interrupted", "unknown"];
 const CAPACITIES: readonly string[] = ["rate-limit", "overload", "usage-limit"];
-/** A label longer than this is not a label: the row is refused rather than risk storing free text. */
-const MAX_LABEL_LENGTH = 256;
+/**
+ * A label (role, class, scope, tier, model, ids) is one token of at most 256 characters, no whitespace: anything longer or
+ * with spaces could be free text, so the row is refused rather than stored (QA-1.1-5). Model ids such as
+ * `anthropic/claude-sonnet-5-5#low` match.
+ */
+const LABEL_RE = /^[A-Za-z0-9._:#/@+-]{1,256}$/;
 
 function isLabel(x: unknown): x is string {
-  return typeof x === "string" && x.length <= MAX_LABEL_LENGTH;
+  return typeof x === "string" && LABEL_RE.test(x);
+}
+
+/** True when `label` would be stored as it is (the rule of the side-log rows). */
+export function isSideLogLabel(label: string): boolean {
+  return LABEL_RE.test(label);
+}
+
+/** Appends to one file are serialized per path within the process, whichever side-log instance issues them (QA-1.1-16). */
+const appendChains = new Map<string, Promise<void>>();
+
+async function serialized<T>(key: string, task: () => Promise<T>): Promise<T> {
+  const previous = appendChains.get(key) ?? Promise.resolve();
+  const run = previous.then(task); // `previous` is a tail that never rejects
+  const tail: Promise<void> = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  appendChains.set(key, tail);
+  void tail.then(() => {
+    if (appendChains.get(key) === tail) appendChains.delete(key);
+  });
+  return run;
+}
+
+function chainKey(path: string): string {
+  const abs = resolve(path);
+  return process.platform === "win32" ? abs.toLowerCase() : abs;
 }
 
 function isCount(x: unknown): x is number {
@@ -971,6 +1003,20 @@ function serializeTurn(row: OrchestratorTurnRow): string {
   });
 }
 
+/** Options of {@link createSideLogs}: the rotation knobs of the decision log, plus an observer. */
+export interface SideLogOptions extends PersisterOptions {
+  /** Called once per row after it was appended (not for refused rows or failed writes). Must not throw; if it does it is logged. */
+  readonly onRow?: (row: DispatchTimingRow | OrchestratorTurnRow) => void;
+}
+
+/** Adapts the timing side log to the duration estimator's seam (`createDurationModel`). */
+export function durationSeamsFor(sideLogs: Pick<SideLogs, "readTimings">, now: () => number): DurationSeams {
+  return {
+    readTimings: async () => (await sideLogs.readTimings()).rows,
+    now,
+  };
+}
+
 interface SideSpec<Row> {
   readonly file: string;
   /** Rotated names are `<prefix>.<stamp>-<pid>.jsonl`. */
@@ -1002,20 +1048,22 @@ const TURNS_SPEC: SideSpec<OrchestratorTurnRow> = {
  * (the decision-log code itself is untouched). Readers skip a torn last line with one warning per read and rows of a
  * newer schema without one.
  */
-export function createSideLogs(dir: string, deps: PersistDeps, options: PersisterOptions = {}): SideLogs {
+export function createSideLogs(dir: string, deps: PersistDeps, options: SideLogOptions = {}): SideLogs {
   const { fs, sleep, logger, pid } = deps;
   const now = (): number => safeNow(deps.now);
   const maxBytes = options.maxBytes ?? DECISIONS_MAX_BYTES;
   const maxGenerations = Math.max(0, Math.floor(options.maxGenerations ?? DECISIONS_MAX_GENERATIONS));
   const delays = options.renameRetryDelaysMs ?? RENAME_RETRY_DELAYS_MS;
 
-  function createFile<Row>(spec: SideSpec<Row>): {
+  function createFile<Row extends DispatchTimingRow | OrchestratorTurnRow>(spec: SideSpec<Row>): {
     readonly path: string;
     append(rows: readonly Row[]): Promise<WriteResult>;
     read(): Promise<ReadSideRowsResult<Row>>;
   } {
     const path = join(dir, spec.file);
+    const key = chainKey(path);
     let knownEnd: number | null = null;
+    let warnedRefusal = false;
     const rotated = (names: readonly string[]): string[] => names.filter((name) => spec.rotatedRe.test(name)).sort();
 
     async function sizeOrNull(target: string): Promise<number | null> {
@@ -1034,11 +1082,18 @@ export function createSideLogs(dir: string, deps: PersistDeps, options: Persiste
         const match = newest === undefined ? null : spec.rotatedRe.exec(newest);
         const newestMs = match === null ? null : stampToMs(match[1] as string);
         if (newestMs !== null && ms <= newestMs) ms = newestMs + 1; // names stay unique and chronological
-        const target = join(dir, `${spec.prefix}.${compactStamp(ms)}-${pid}.jsonl`);
         try {
           // Another process may have rotated while we listed generations. Do not rotate its small new file.
           const current = await fs.stat(path);
           if (current === null || current.size < maxBytes) return;
+          // QA-1.1-16: never rename over an existing generation (a second writer of the same stamp and pid): probe a free name.
+          let target = "";
+          for (let attempt = 0; attempt < 20 && target === ""; attempt++) {
+            const candidate = join(dir, `${spec.prefix}.${compactStamp(ms)}-${pid}.jsonl`);
+            if ((await fs.stat(candidate)) === null) target = candidate;
+            else ms += 1;
+          }
+          if (target === "") throw new Error("no free rotated side log name");
           await renameWithRetry(fs, path, target, sleep, delays);
         } catch (error) {
           if (errorCode(error) !== "ENOENT") throw error; // ENOENT: another process rotated first
@@ -1060,31 +1115,68 @@ export function createSideLogs(dir: string, deps: PersistDeps, options: Persiste
       path,
       async append(rows: readonly Row[]): Promise<WriteResult> {
         if (rows.length === 0) return { ok: true };
-        try {
-          await fs.mkdirp(dir);
-          const body = rows.map((row) => spec.serialize(row)).join("\n") + "\n";
-          let size = (await sizeOrNull(path)) ?? 0;
-          if (size > 0 && size + Buffer.byteLength(body, "utf8") + 1 > maxBytes) {
-            await rotate();
-            size = (await sizeOrNull(path)) ?? 0;
+        // QA-1.1-5: only a row the reader would accept again is written (labels without whitespace, finite non-negative times).
+        const accepted: Row[] = [];
+        const lines: string[] = [];
+        let refused = 0;
+        for (const row of rows) {
+          let line: string | null = null;
+          try {
+            const text = spec.serialize(row);
+            const back = spec.parse(text);
+            if (back !== null && back !== "newer") line = text;
+          } catch {
+            line = null; // a row that cannot even be serialized is refused like any other invalid row
           }
-          // A crash can leave a torn last line without its newline: the batch that follows starts on a fresh line.
-          let lead = "";
-          if (size > 0 && size !== knownEnd) {
+          if (line === null) {
+            refused += 1;
+          } else {
+            accepted.push(row);
+            lines.push(line);
+          }
+        }
+        if (refused > 0 && !warnedRefusal) {
+          warnedRefusal = true;
+          logger.warn("[router] side log rows that do not validate were refused (labels are single tokens of at most 256 characters)", {
+            file: spec.file,
+            refused,
+          });
+        }
+        if (lines.length === 0) return { ok: true };
+        return serialized(key, async (): Promise<WriteResult> => {
+          try {
+            await fs.mkdirp(dir);
+            const body = lines.join("\n") + "\n";
+            let size = (await sizeOrNull(path)) ?? 0;
+            if (size > 0 && size + Buffer.byteLength(body, "utf8") + 1 > maxBytes) {
+              await rotate();
+              size = (await sizeOrNull(path)) ?? 0;
+            }
+            // A crash can leave a torn last line without its newline: the batch that follows starts on a fresh line.
+            let lead = "";
+            if (size > 0 && size !== knownEnd) {
+              try {
+                const existing = await fs.readText(path);
+                if (existing !== null && !existing.endsWith("\n")) lead = "\n";
+              } catch (readError) {
+                lead = "\n"; // cannot tell: a blank line is harmless, a glued row is not
+                logger.info?.("[router] side log end not checked", { file: spec.file, error: describeError(readError) });
+              }
+            }
+            await fs.appendText(path, lead + body);
+            knownEnd = size + Buffer.byteLength(lead + body, "utf8");
+          } catch (error) {
+            return failure(error);
+          }
+          for (const row of accepted) {
             try {
-              const existing = await fs.readText(path);
-              if (existing !== null && !existing.endsWith("\n")) lead = "\n";
-            } catch (readError) {
-              lead = "\n"; // cannot tell: a blank line is harmless, a glued row is not
-              logger.info?.("[router] side log end not checked", { file: spec.file, error: describeError(readError) });
+              options.onRow?.(row);
+            } catch (hookError) {
+              logger.warn("[router] side log onRow observer failed", { file: spec.file, error: describeError(hookError) });
             }
           }
-          await fs.appendText(path, lead + body);
-          knownEnd = size + Buffer.byteLength(lead + body, "utf8");
           return { ok: true };
-        } catch (error) {
-          return failure(error);
-        }
+        });
       },
       async read(): Promise<ReadSideRowsResult<Row>> {
         const rows: Row[] = [];

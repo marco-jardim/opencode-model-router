@@ -731,7 +731,9 @@ function rowInWindow(ts: string, window: StatsWindow): boolean {
 export function summarizeDurations(rows: readonly DispatchTimingRow[], window: StatsWindow): DurationStatsRow[] {
   const model = createDurationModel(
     { readTimings: () => [], now: () => Date.now() },
-    { window: Number.MAX_SAFE_INTEGER, maxAgeDays: 1e9, minSamples: 1 },
+    // p90MinSamples 1: the report shows each role's own percentiles however few the samples (the estimator's own p90 rule,
+    // QA-1.1-10, hands thin levels to the prior, which would misreport a role here).
+    { window: Number.MAX_SAFE_INTEGER, maxAgeDays: 1e9, minSamples: 1, p90MinSamples: 1 },
   );
   const roles = new Set<string>();
   for (const row of rows) {
@@ -939,11 +941,22 @@ export async function runStatsCli(argv: readonly string[], io: StatsCliIO, side?
     const store = createOutcomeStore();
     if (loaded.status === "ok") store.fromSnapshot(loaded.snapshot);
     const read = await source.readRows();
-    if (loaded.status === "missing" && read.files.length === 0) {
+    // 1.1.4 (QA-1.1-12): where side logs are supplied (v2), they take part in the "no outcome data" decision and report their
+    // own skipped / newer-schema notes like the decision log does; without them (v1) nothing below changes.
+    const sideLogs = side === undefined ? null : side.open(source.dir);
+    const sideTimings = sideLogs === null ? null : await sideLogs.readTimings();
+    const sideTurns = sideLogs === null ? null : await sideLogs.readTurns();
+    const sideFiles = (sideTimings?.files.length ?? 0) + (sideTurns?.files.length ?? 0);
+    if (loaded.status === "missing" && read.files.length === 0 && sideFiles === 0) {
       // Not an error (a fresh install has nothing yet), but a typo in --dir looks exactly like this (QA-1.3-5).
       io.stderr(`routing-stats: no outcome data in ${source.dir}\n`);
     }
     if (read.skipped > 0) io.stderr(`routing-stats: skipped ${read.skipped} unreadable decision-log line(s)\n`);
+    for (const [label, result] of [["timing-log", sideTimings], ["turn-log", sideTurns]] as const) {
+      if (result === null) continue;
+      if (result.skipped > 0) io.stderr(`routing-stats: skipped ${result.skipped} unreadable ${label} line(s)\n`);
+      if (result.newer > 0) io.stderr(`routing-stats: skipped ${result.newer} ${label} row(s) written by a newer version\n`);
+    }
     if (
       read.generations >= DECISIONS_MAX_GENERATIONS &&
       read.oldestTs !== null &&
@@ -966,11 +979,10 @@ export async function runStatsCli(argv: readonly string[], io: StatsCliIO, side?
     // and only when the window holds rows; without them the output is exactly what it was before.
     let durations: DurationStatsRow[] = [];
     let cacheShare: CacheShareStats | null = null;
-    if (side !== undefined) {
-      const sideLogs = side.open(source.dir);
+    if (sideTimings !== null && sideTurns !== null) {
       const window = { since: args.since, until: args.until };
-      durations = summarizeDurations((await sideLogs.readTimings()).rows, window);
-      cacheShare = summarizeCacheShare((await sideLogs.readTurns()).rows, window);
+      durations = summarizeDurations(sideTimings.rows, window);
+      cacheShare = summarizeCacheShare(sideTurns.rows, window);
     }
 
     if (args.json) {

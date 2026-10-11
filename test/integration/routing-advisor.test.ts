@@ -737,6 +737,84 @@ describe("D18 /router stats and the checkpoint line", { timeout: 60_000 }, () =>
     expect(`${v1Text}\n`).toBe(without);
   });
 
+  // QA-1.1-12, QA-1.1-13: the --json keys, a window, and the notes of the side logs.
+  it.skipIf(!supportsPlainNodeTypeScript())("--json: durations (ms) and cacheShare (0-1) appear only with rows and follow --until; side logs count as outcome data and report skipped lines", async () => {
+    seed(ROWS[1]!);
+    const bare = JSON.parse(script("--dir", store, "--json").stdout) as Record<string, unknown>;
+    expect("durations" in bare).toBe(false);
+    expect("cacheShare" in bare).toBe(false);
+
+    const hooks = await plugin({ engine: "shadow", outcomes: { path: store } });
+    const logs = createSideLogs(store, nodePersistDeps({ warn: () => undefined }));
+    const t = (day: string): number => Date.parse(`2026-10-${day}T12:00:00.000Z`);
+    const timing = (n: number, day: string, durationMs: number): DispatchTimingRow => ({
+      kind: "dispatch-timing",
+      v: 1,
+      ts: new Date(t(day)).toISOString(),
+      parentSessionID: "s1",
+      childSessionID: `c${n}`,
+      callID: `call${n}`,
+      role: "builder",
+      class: "implement",
+      scope: "single",
+      tier: "medium",
+      model: "anthropic/claude-sonnet-5-5",
+      background: false,
+      startedAt: t(day),
+      endedAt: t(day) + durationMs,
+      durationMs,
+      outcome: "succeeded",
+      capacity: null,
+    });
+    const turn = (n: number, day: string, input: number, cacheRead: number): OrchestratorTurnRow => ({
+      kind: "orchestrator-turn",
+      v: 1,
+      ts: new Date(t(day)).toISOString(),
+      sessionID: "s1",
+      turn: n,
+      steps: 1,
+      input,
+      cacheRead,
+      cacheWrite: 0,
+    });
+    await logs.appendTimings([timing(1, "06", 10_000), timing(2, "06", 30_000), timing(3, "08", 50_000)]);
+    await logs.appendTurns([turn(1, "06", 100, 900), turn(2, "06", 500, 500), turn(3, "08", 0, 100)]);
+
+    const all = JSON.parse(script("--dir", store, "--json").stdout) as { durations?: unknown; cacheShare?: unknown };
+    expect(all.durations).toEqual([{ role: "builder", p50: 30_000, p90: 50_000, n: 3 }]); // milliseconds
+    expect(all.cacheShare).toEqual({ p50: 0.9, p10: 0.5, turns: 3 }); // shares, 0..1
+
+    const until = "2026-10-07T00:00:00Z";
+    const early = JSON.parse(script("--dir", store, "--until", until, "--json").stdout) as { durations?: unknown; cacheShare?: unknown };
+    expect(early.durations).toEqual([{ role: "builder", p50: 10_000, p90: 30_000, n: 2 }]);
+    expect(early.cacheShare).toEqual({ p50: 0.5, p10: 0.5, turns: 2 });
+    expect(JSON.parse(await ask(hooks, `stats --until ${until} --json`))).toEqual(early);
+
+    // a window without rows drops the keys again
+    const none = JSON.parse(script("--dir", store, "--until", "2026-10-01", "--json").stdout) as Record<string, unknown>;
+    expect("durations" in none).toBe(false);
+    expect("cacheShare" in none).toBe(false);
+
+    // side-log notes, like the decision log's
+    const fsMod = await import("node:fs");
+    fsMod.appendFileSync(join(store, "timings.jsonl"), 'not json\n{"kind":"dispatch-timing","v":2}\n');
+    fsMod.appendFileSync(join(store, "turns.jsonl"), "also not json\n");
+    const noted = script("--dir", store);
+    expect(noted.stderr).toContain("routing-stats: skipped 1 unreadable timing-log line(s)");
+    expect(noted.stderr).toContain("routing-stats: skipped 1 timing-log row(s) written by a newer version");
+    expect(noted.stderr).toContain("routing-stats: skipped 1 unreadable turn-log line(s)");
+
+    // a directory that holds only side logs is not "no outcome data"
+    const sideOnly = join(home, "side-only");
+    const onlyLogs = createSideLogs(sideOnly, nodePersistDeps({ warn: () => undefined }));
+    await onlyLogs.appendTimings([timing(9, "06", 5_000)]);
+    const only = script("--dir", sideOnly);
+    expect(only.stderr).not.toContain("no outcome data");
+    expect(only.stdout).toContain("### Dispatch durations");
+    const nothing = script("--dir", join(home, "nothing-here"));
+    expect(nothing.stderr).toContain("no outcome data");
+  });
+
   it("flushes the rows still queued in memory first, so the table is current", async () => {
     seed(ROWS[1]!);
     const hooks = await plugin({ engine: "shadow", outcomes: { path: store } });

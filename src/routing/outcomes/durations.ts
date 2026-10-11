@@ -7,8 +7,10 @@
 // type stripping: `import type` only, no enum, namespace or parameter property.
 //
 // Rules:
-//   - fallback: exact (role, class, scope) -> (role, class) -> role -> prior. A level answers only with at least
-//     `minSamples` samples; otherwise the next, coarser level is tried;
+//   - fallback: exact (role, class, scope) -> (role, class) -> role -> prior. A level answers p50 only with at least
+//     `minSamples` samples; otherwise the next, coarser level is tried. p90 needs at least `p90MinSamples` (10): it
+//     comes from the finest level, from the p50 level on, that has them, else from the prior (never below p50);
+//   - rows that ended more than a day after `now()` are ignored (a clock jump wrote them);
 //   - only rows with `outcome: "succeeded"` count, and rows whose `capacity` is not null are excluded (ADR 0007 D6:
 //     a provider capacity condition says nothing about how long the work takes);
 //   - p50 / p90 are nearest-rank percentiles (rank = ceil(p * n), 1-based) over the newest `window` rows of the key
@@ -27,8 +29,12 @@ export const DURATION_WINDOW = 50;
 export const DURATION_MAX_AGE_DAYS = 30;
 export const DURATION_PRIOR_MS = 480_000;
 export const DURATION_MIN_SAMPLES = 5;
+/** Samples a level needs before its p90 is reported (QA-1.1-10). */
+export const DURATION_P90_MIN_SAMPLES = 10;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+/** A row that ended later than `now` by more than this is ignored (QA-1.1-9: the clock that wrote it jumped forward). */
+const MAX_FUTURE_ENDED_MS = DAY_MS;
 const SEP = "\u0000";
 
 export type DurationSource = "exact" | "role-class" | "role" | "prior";
@@ -61,8 +67,10 @@ export interface DurationOptions {
   readonly maxAgeDays?: number;
   /** p50 = p90 of the prior, in milliseconds (default 480000). */
   readonly priorMs?: number;
-  /** Samples a level needs to answer (default 5). */
+  /** Samples a level needs to answer p50 (default 5). */
   readonly minSamples?: number;
+  /** Samples a level needs to answer p90 (default 10); a thinner level hands p90 to a coarser one, else to the prior. */
+  readonly p90MinSamples?: number;
 }
 
 export interface DurationModel {
@@ -78,6 +86,13 @@ interface Sample {
   readonly endedAt: number;
   readonly durationMs: number;
   readonly id: string;
+}
+
+interface Bucket {
+  /** Ascending by endedAt, at most `window` long. */
+  readonly list: Sample[];
+  /** Ids of `list`. */
+  readonly ids: Set<string>;
 }
 
 function positiveInt(value: number | undefined, fallback: number): number {
@@ -100,23 +115,30 @@ export function createDurationModel(seams: DurationSeams, opts: DurationOptions 
   const priorMs = opts.priorMs !== undefined && Number.isFinite(opts.priorMs) && opts.priorMs >= 0 ? opts.priorMs : DURATION_PRIOR_MS;
   const minSamples = positiveInt(opts.minSamples, DURATION_MIN_SAMPLES);
 
-  // One map per level; each list holds the newest `window` samples of its key, ascending by endedAt.
-  const exact = new Map<string, Sample[]>();
-  const roleClass = new Map<string, Sample[]>();
-  const role = new Map<string, Sample[]>();
+  const p90MinSamples = positiveInt(opts.p90MinSamples, DURATION_P90_MIN_SAMPLES);
+
+  // One map per level; each bucket holds the newest `window` samples of its key, ascending by endedAt, and the set of
+  // their row ids (QA-1.1-11: the dedupe is a set lookup, not a scan of the list).
+  const exact = new Map<string, Bucket>();
+  const roleClass = new Map<string, Bucket>();
+  const role = new Map<string, Bucket>();
   let loading: Promise<void> | null = null;
 
-  function insert(level: Map<string, Sample[]>, key: string, sample: Sample): void {
-    let list = level.get(key);
-    if (list === undefined) {
-      list = [];
-      level.set(key, list);
+  function insert(level: Map<string, Bucket>, key: string, sample: Sample): void {
+    let bucket = level.get(key);
+    if (bucket === undefined) {
+      bucket = { list: [], ids: new Set() };
+      level.set(key, bucket);
     }
-    for (const existing of list) if (existing.id === sample.id) return;
+    if (bucket.ids.has(sample.id)) return;
+    const { list } = bucket;
     let at = list.length;
     while (at > 0 && (list[at - 1] as Sample).endedAt > sample.endedAt) at -= 1;
     list.splice(at, 0, sample);
-    if (list.length > window) list.splice(0, list.length - window);
+    bucket.ids.add(sample.id);
+    if (list.length > window) {
+      for (const dropped of list.splice(0, list.length - window)) bucket.ids.delete(dropped.id);
+    }
   }
 
   function observe(row: DispatchTimingRow): void {
@@ -132,30 +154,40 @@ export function createDurationModel(seams: DurationSeams, opts: DurationOptions 
     insert(role, row.role, sample);
   }
 
-  /** Durations (ascending) of the key's samples within the age limit, or null below `minSamples`. */
-  function usable(level: Map<string, Sample[]>, key: string, cutoff: number): number[] | null {
-    const list = level.get(key);
-    if (list === undefined) return null;
+  /**
+   * Durations (ascending) of the key's samples within the age limit and not from the future (QA-1.1-9: a row that ended more
+   * than a day after `now` carries a bad clock). Empty when there are none.
+   */
+  function durationsOf(level: Map<string, Bucket>, key: string, cutoff: number, ceiling: number): number[] {
+    const bucket = level.get(key);
+    if (bucket === undefined) return [];
     const durations: number[] = [];
-    for (const sample of list) if (sample.endedAt >= cutoff) durations.push(sample.durationMs);
-    if (durations.length < minSamples) return null;
+    for (const sample of bucket.list) if (sample.endedAt >= cutoff && sample.endedAt <= ceiling) durations.push(sample.durationMs);
     return durations.sort((a, b) => a - b);
   }
 
-  function answer(durations: readonly number[], source: DurationSource): DurationEstimate {
-    return { p50: nearestRank(durations, 0.5), p90: nearestRank(durations, 0.9), n: durations.length, source };
-  }
-
+  /**
+   * p50 comes from the finest level with at least `minSamples` samples. p90 (QA-1.1-10) comes from the finest level, starting
+   * at that one, with at least `p90MinSamples` (10) samples, else from the prior: a tail estimate needs a tail. p90 is never
+   * reported below p50.
+   */
   function estimate(query: DurationQuery): DurationEstimate {
     const t = seams.now();
-    const cutoff = (Number.isFinite(t) ? t : Date.now()) - maxAgeMs;
-    const fromExact = usable(exact, `${query.role}${SEP}${query.class}${SEP}${query.scope}`, cutoff);
-    if (fromExact !== null) return answer(fromExact, "exact");
-    const fromRoleClass = usable(roleClass, `${query.role}${SEP}${query.class}`, cutoff);
-    if (fromRoleClass !== null) return answer(fromRoleClass, "role-class");
-    const fromRole = usable(role, query.role, cutoff);
-    if (fromRole !== null) return answer(fromRole, "role");
-    return { p50: priorMs, p90: priorMs, n: 0, source: "prior" };
+    const now = Number.isFinite(t) ? t : Date.now();
+    const cutoff = now - maxAgeMs;
+    const ceiling = now + MAX_FUTURE_ENDED_MS;
+    const levels: Array<{ readonly source: DurationSource; readonly durations: number[] }> = [
+      { source: "exact", durations: durationsOf(exact, `${query.role}${SEP}${query.class}${SEP}${query.scope}`, cutoff, ceiling) },
+      { source: "role-class", durations: durationsOf(roleClass, `${query.role}${SEP}${query.class}`, cutoff, ceiling) },
+      { source: "role", durations: durationsOf(role, query.role, cutoff, ceiling) },
+    ];
+    const start = levels.findIndex((level) => level.durations.length >= minSamples);
+    if (start < 0) return { p50: priorMs, p90: priorMs, n: 0, source: "prior" };
+    const chosen = levels[start] as (typeof levels)[number];
+    const p50 = nearestRank(chosen.durations, 0.5);
+    const tail = levels.slice(start).find((level) => level.durations.length >= p90MinSamples);
+    const p90 = tail === undefined ? priorMs : nearestRank(tail.durations, 0.9);
+    return { p50, p90: Math.max(p90, p50), n: chosen.durations.length, source: chosen.source };
   }
 
   function load(): Promise<void> {

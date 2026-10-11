@@ -282,7 +282,7 @@ describe("orchestrator turns: root sessions only", () => {
     for (let i = 0; i <= MAX_ROOT_SESSIONS; i++) rec.markRootSession(`r-${i}`);
     rec.onRootStep("r-0", tokens(1, 0, 0)); // evicted: ignored
     rec.onRootStep("r-1", tokens(2, 0, 0));
-    await rec.sweep(NOW);
+    await rec.flush();
     expect(turnRows().map(r => [r.sessionID, r.input])).toEqual([["r-1", 2]]);
   });
 
@@ -293,12 +293,41 @@ describe("orchestrator turns: root sessions only", () => {
     rec.markRootSession("extra"); // evicts r-1
     rec.onRootStep("r-0", tokens(1, 0, 0));
     rec.onRootStep("r-1", tokens(2, 0, 0));
-    await rec.sweep(NOW);
+    await rec.flush();
     expect(turnRows().map(r => r.sessionID)).toEqual(["r-0"]);
   });
 });
 
-describe("orchestrator turns: sweep", () => {
+describe("orchestrator turns: flush and sweep", () => {
+  it("sweep flushes only turns idle for the idle time (QA-1.1-4)", async () => {
+    const rec = createTimingRecorder({ dir, now, logger, turnIdleMs: 60_000 });
+    rec.markRootSession("busy");
+    rec.markRootSession("idle");
+    rec.onRootStep("idle", tokens(1, 2, 3));
+    clockNow = NOW + 50_000;
+    rec.onRootStep("busy", tokens(4, 5, 6));
+    clockNow = NOW + 70_000;
+    await rec.sweep();
+    expect(turnRows().map(r => r.sessionID)).toEqual(["idle"]);
+    clockNow = NOW + 110_000;
+    await rec.sweep();
+    expect(turnRows().map(r => r.sessionID)).toEqual(["idle", "busy"]);
+  });
+
+  it("a sweep in the middle of a turn, more steps, then a prompt give one row", async () => {
+    const rec = recorder();
+    rec.markRootSession("root");
+    rec.onRootStep("root", tokens(1, 1, 1));
+    clockNow = NOW + 5_000;
+    await rec.sweep();
+    rec.onRootStep("root", tokens(1, 1, 1));
+    clockNow = NOW + 10_000;
+    await rec.sweep();
+    rec.onRootStep("root", tokens(1, 1, 1));
+    await rec.onRootPrompt("root", clockNow);
+    expect(turnRows().map(r => [r.turn, r.steps])).toEqual([[1, 3]]);
+  });
+
   it("flushes every open turn, in one call, and numbers the next turn after it", async () => {
     const rec = recorder();
     rec.markRootSession("a");
@@ -307,13 +336,13 @@ describe("orchestrator turns: sweep", () => {
     rec.onRootStep("a", tokens(1, 2, 3));
     rec.onRootStep("b", tokens(4, 5, 6));
     rec.onRootStep("b", tokens(4, 5, 6));
-    await rec.sweep(NOW);
+    await rec.flush();
     expect(turnRows().map(r => [r.sessionID, r.turn, r.steps, r.input, r.cacheRead, r.cacheWrite])).toEqual([
       ["a", 1, 1, 1, 2, 3],
       ["b", 1, 2, 8, 10, 12],
     ]);
 
-    await rec.sweep(NOW + 1); // nothing open any more
+    await rec.flush(); // nothing open any more
     expect(turnRows()).toHaveLength(2);
 
     rec.onRootStep("a", tokens(9, 9, 9));
@@ -326,7 +355,7 @@ describe("orchestrator turns: sweep", () => {
     rec.markRootSession("a");
     rec.onRootStep("a", tokens(1, 0, 0));
     clockNow = NOW + 5_000;
-    await rec.sweep();
+    await rec.flush();
     expect(turnRows()[0]?.ts).toBe(new Date(NOW + 5_000).toISOString());
   });
 });

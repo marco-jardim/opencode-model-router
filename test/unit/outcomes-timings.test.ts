@@ -5,7 +5,16 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createDurationModel } from "../../src/routing/outcomes/durations";
 import { createSideLogs, nodePersistDeps, nodePersistFs } from "../../src/routing/outcomes/persist";
-import { MAX_OPEN_STARTS, MAX_SEEN_EVENT_IDS, OPEN_START_TTL_MS, createTimingRecorder } from "../../src/routing/outcomes/timings";
+import {
+  DEFAULT_TURN_IDLE_MS,
+  MAX_OPEN_STARTS,
+  MAX_ROOT_SESSIONS,
+  MAX_SEEN_EVENT_IDS,
+  OPEN_START_TTL_MS,
+  acquireTimingRecorder,
+  classifyCapacity,
+  createTimingRecorder,
+} from "../../src/routing/outcomes/timings";
 import type { DispatchStartInput, TimingLogger, TimingRecorder } from "../../src/routing/outcomes/timings";
 import type { DispatchTimingRow, OrchestratorTurnRow, SideLogs } from "../../src/routing/outcomes/types";
 import { removeDirWhenReleased } from "../helpers/remove-dir";
@@ -38,10 +47,12 @@ function capturingLogger(): CapturingLogger {
 }
 
 function startInput(overrides: Partial<DispatchStartInput> = {}): DispatchStartInput {
+  // Open starts are keyed by callID: a test that names only the child gets a call of its own.
+  const callID = overrides.callID ?? (overrides.childSessionID === undefined || overrides.childSessionID === null ? "call-1" : `call-${overrides.childSessionID}`);
   return {
     childSessionID: "child-1",
     parentSessionID: "root-1",
-    callID: "call-1",
+    callID,
     role: "implementer",
     class: "implement",
     scope: "file",
@@ -251,12 +262,14 @@ describe("timing recorder: duplicates and double outcomes", () => {
     expect(timingRows().map(r => r.childSessionID)).toEqual(["a", "b"]);
   });
 
-  it("an event id consumed by an outcome without a start stays consumed", async () => {
+  it("an end event id for an unknown child is not consumed (QA-1.1-3)", async () => {
     const rec = recorder();
     await rec.onExecutionOutcome("late", "evt-1", "succeeded", NOW);
     rec.recordDispatchStart(startInput({ childSessionID: "late" }));
     await rec.onExecutionOutcome("late", "evt-1", "succeeded", NOW + 5);
-    expect(timingRows()).toEqual([]);
+    expect(timingRows().map(r => r.childSessionID)).toEqual(["late"]);
+    await rec.onExecutionOutcome("late", "evt-1", "succeeded", NOW + 9); // now it is consumed
+    expect(timingRows()).toHaveLength(1);
   });
 
   it("an empty event id is never deduped", async () => {
@@ -268,15 +281,38 @@ describe("timing recorder: duplicates and double outcomes", () => {
     expect(timingRows()).toHaveLength(2);
   });
 
-  it("a second start for an open child keeps the first start", async () => {
+  it("a second start for an open child under ANOTHER callID closes the first as unknown at the new start (QA-1.1-2)", async () => {
     const rec = recorder();
     rec.recordDispatchStart(startInput({ at: NOW, callID: "first" }));
     rec.recordDispatchStart(startInput({ at: NOW + 1_000, callID: "second" }));
-    await rec.onExecutionOutcome("child-1", "evt-1", "succeeded", NOW + 2_000);
-    const [only] = timingRows();
+    await rec.flush(); // the older row is written in the background
     expect(timingRows()).toHaveLength(1);
-    expect(only?.callID).toBe("first");
-    expect(only?.durationMs).toBe(2_000);
+    expect(timingRows()[0]).toMatchObject({ callID: "first", outcome: "unknown", startedAt: NOW, endedAt: NOW + 1_000, durationMs: 1_000 });
+    await rec.onExecutionOutcome("child-1", "evt-1", "succeeded", NOW + 2_000);
+    expect(timingRows()).toHaveLength(2);
+    expect(timingRows()[1]).toMatchObject({ callID: "second", outcome: "succeeded", startedAt: NOW + 1_000, durationMs: 1_000 });
+  });
+
+  it("the unknown row of a replaced start is excluded from estimates", async () => {
+    const rec = recorder();
+    rec.recordDispatchStart(startInput({ at: NOW, callID: "first" }));
+    rec.recordDispatchStart(startInput({ at: NOW + 1_000, callID: "second" }));
+    await rec.flush();
+    const rows = timingRows();
+    const model = createDurationModel({ readTimings: () => Array.from({ length: 6 }, () => rows[0] as DispatchTimingRow), now }, { minSamples: 1 });
+    await model.load();
+    expect(model.estimate({ role: "implementer", class: "implement", scope: "file" }).source).toBe("prior");
+  });
+
+  it("a second start with the SAME callID is a no-op", async () => {
+    const rec = recorder();
+    rec.recordDispatchStart(startInput({ at: NOW, callID: "same" }));
+    rec.recordDispatchStart(startInput({ at: NOW + 1_000, callID: "same" }));
+    await rec.flush();
+    expect(timingRows()).toEqual([]);
+    await rec.onExecutionOutcome("child-1", "evt-1", "succeeded", NOW + 2_000);
+    expect(timingRows()).toHaveLength(1);
+    expect(timingRows()[0]).toMatchObject({ callID: "same", startedAt: NOW, durationMs: 2_000 });
   });
 
   it("the same child can start again once its timing is closed", async () => {
@@ -289,14 +325,27 @@ describe("timing recorder: duplicates and double outcomes", () => {
   });
 
   it("remembers at most MAX_SEEN_EVENT_IDS event ids (the oldest is forgotten)", async () => {
-    const rec = recorder();
+    const written: string[] = [];
+    const sideLogs = fakeSideLogs({
+      appendTimings: async rows => {
+        for (const row of rows) written.push(row.childSessionID);
+        return { ok: true };
+      },
+    });
+    const rec = recorder({ sideLogs });
     rec.recordDispatchStart(startInput({ childSessionID: "first" }));
     await rec.onExecutionOutcome("first", "evt-first", "succeeded", NOW + 1);
-    for (let i = 0; i < MAX_SEEN_EVENT_IDS; i++) await rec.onExecutionOutcome(`ghost-${i}`, `evt-${i}`, "succeeded", NOW);
+    // Ids are consumed by deliveries that found a start: close MAX_SEEN_EVENT_IDS other dispatches.
+    for (let i = 0; i < MAX_SEEN_EVENT_IDS; i++) {
+      rec.recordDispatchStart(startInput({ childSessionID: `c-${i}` }));
+      await rec.onExecutionOutcome(`c-${i}`, `evt-${i}`, "succeeded", NOW);
+    }
     // "evt-first" has been pushed out: a new open start is closed by that id again.
     rec.recordDispatchStart(startInput({ childSessionID: "second", at: NOW }));
     await rec.onExecutionOutcome("second", "evt-first", "succeeded", NOW + 2);
-    expect(timingRows().map(r => r.childSessionID)).toEqual(["first", "second"]);
+    expect(written).toHaveLength(MAX_SEEN_EVENT_IDS + 2);
+    expect(written[0]).toBe("first");
+    expect(written.at(-1)).toBe("second");
   });
 });
 
@@ -574,6 +623,379 @@ describe("timing recorder: never throws", () => {
   });
 });
 
+describe("timing recorder: keyed by callID (QA-1.1-1)", () => {
+  it("a start known only by its call id is closed through bindChild", async () => {
+    const rec = recorder();
+    rec.recordDispatchStart(startInput({ callID: "call-x", childSessionID: null }));
+    rec.bindChild("call-x", "child-x");
+    await rec.onExecutionOutcome("child-x", "evt-1", "succeeded", NOW + 800);
+    expect(timingRows()).toHaveLength(1);
+    expect(timingRows()[0]).toMatchObject({ callID: "call-x", childSessionID: "child-x", durationMs: 800 });
+  });
+
+  it("an outcome before the child is bound finds nothing and consumes nothing", async () => {
+    const rec = recorder();
+    rec.recordDispatchStart(startInput({ callID: "call-x", childSessionID: null }));
+    await rec.onExecutionOutcome("child-x", "evt-1", "succeeded", NOW + 1);
+    expect(timingRows()).toEqual([]);
+    rec.bindChild("call-x", "child-x");
+    await rec.onExecutionOutcome("child-x", "evt-1", "succeeded", NOW + 2);
+    expect(timingRows()).toHaveLength(1);
+  });
+
+  it("bindChild is re-callable: the last child wins and the earlier one no longer finds the call", async () => {
+    const rec = recorder();
+    rec.recordDispatchStart(startInput({ callID: "call-x", childSessionID: null }));
+    rec.bindChild("call-x", "child-old");
+    rec.bindChild("call-x", "child-new");
+    await rec.onExecutionOutcome("child-old", "evt-1", "succeeded", NOW + 1);
+    expect(timingRows()).toEqual([]);
+    await rec.onExecutionOutcome("child-new", "evt-2", "succeeded", NOW + 2);
+    expect(timingRows().map(r => r.childSessionID)).toEqual(["child-new"]);
+  });
+
+  it("bindChild for an unknown or closed call is ignored", async () => {
+    const rec = recorder();
+    rec.bindChild("nobody", "child-x");
+    rec.recordDispatchStart(startInput({ callID: "call-x", childSessionID: "child-x" }));
+    await rec.onExecutionOutcome("child-x", "evt-1", "succeeded", NOW + 1);
+    rec.bindChild("call-x", "child-y");
+    await rec.onExecutionOutcome("child-y", "evt-2", "succeeded", NOW + 2);
+    expect(timingRows()).toHaveLength(1);
+    expect(logger.warns).toEqual([]);
+  });
+
+  it("cancelStart drops a rejected call without a row", async () => {
+    const rec = recorder();
+    rec.recordDispatchStart(startInput({ callID: "call-x", childSessionID: null }));
+    rec.cancelStart("call-x");
+    rec.bindChild("call-x", "child-x");
+    await rec.onExecutionOutcome("child-x", "evt-1", "succeeded", NOW + 1);
+    await rec.sweep(NOW + OPEN_START_TTL_MS * 2);
+    expect(existsSync(join(dir, "timings.jsonl"))).toBe(false);
+    rec.cancelStart("call-x"); // a second cancel, and one for an unknown call, are fine
+    rec.cancelStart("never");
+    expect(logger.warns).toEqual([]);
+  });
+
+  it("cancelStart of a bound call frees its child", async () => {
+    const rec = recorder();
+    rec.recordDispatchStart(startInput({ callID: "call-x", childSessionID: "child-x" }));
+    rec.cancelStart("call-x");
+    await rec.onExecutionOutcome("child-x", "evt-1", "succeeded", NOW + 1);
+    expect(existsSync(join(dir, "timings.jsonl"))).toBe(false);
+  });
+
+  it("setBackground changes the flag of the open call before the row is written", async () => {
+    const rec = recorder();
+    rec.recordDispatchStart(startInput({ callID: "call-x", childSessionID: "child-x", background: false }));
+    rec.setBackground("call-x", true);
+    rec.setBackground("ghost", true);
+    await rec.onExecutionOutcome("child-x", "evt-1", "succeeded", NOW + 1);
+    expect(timingRows()[0]?.background).toBe(true);
+  });
+
+  it("a capacity signal reaches the call through its bound child", async () => {
+    const rec = recorder();
+    rec.recordDispatchStart(startInput({ callID: "call-x", childSessionID: null }));
+    rec.onCapacitySignal("child-x", "rate-limit", NOW); // not bound yet: ignored
+    rec.bindChild("call-x", "child-x");
+    rec.onCapacitySignal("child-x", "overload", NOW + 1);
+    await rec.onExecutionOutcome("child-x", "evt-1", "failed", NOW + 2);
+    expect(timingRows()[0]?.capacity).toBe("overload");
+  });
+
+  it("a start that never got a child writes no row when swept", async () => {
+    const rec = recorder();
+    rec.recordDispatchStart(startInput({ callID: "call-x", childSessionID: null }));
+    await rec.sweep(NOW + OPEN_START_TTL_MS + 1);
+    expect(existsSync(join(dir, "timings.jsonl"))).toBe(false);
+    rec.bindChild("call-x", "child-x"); // it is gone
+    await rec.onExecutionOutcome("child-x", "evt-1", "succeeded", NOW + OPEN_START_TTL_MS + 2);
+    expect(existsSync(join(dir, "timings.jsonl"))).toBe(false);
+  });
+
+  it("evicting a bound start also forgets its child", async () => {
+    const rec = recorder();
+    for (let i = 0; i <= MAX_OPEN_STARTS; i++) rec.recordDispatchStart(startInput({ childSessionID: `c-${i}` }));
+    rec.onCapacitySignal("c-0", "overload", NOW);
+    await rec.onExecutionOutcome("c-0", "evt-0", "succeeded", NOW + 1);
+    expect(existsSync(join(dir, "timings.jsonl"))).toBe(false);
+  });
+});
+
+describe("timing recorder: clamped rows (QA-1.1-9)", () => {
+  it("an end before the start is written as unknown with duration 0", async () => {
+    const rec = recorder();
+    rec.recordDispatchStart(startInput({ at: NOW }));
+    await rec.onExecutionOutcome("child-1", "evt-1", "succeeded", NOW - 9_000);
+    expect(timingRows()[0]).toMatchObject({ outcome: "unknown", durationMs: 0, startedAt: NOW, endedAt: NOW });
+  });
+
+  it("a negative timestamp falls back to the clock like a non-finite one", async () => {
+    clockNow = NOW + 50;
+    const rec = recorder();
+    rec.recordDispatchStart(startInput({ at: -5 }));
+    expect(await rec.flush()).toBeUndefined();
+    await rec.onExecutionOutcome("child-1", "evt-1", "succeeded", NOW + 60);
+    expect(timingRows()[0]?.startedAt).toBe(NOW + 50);
+  });
+
+  it("a forward clock jump of more than 6 h (a suspended machine) closes running dispatches as unknown", async () => {
+    const rec = recorder();
+    rec.recordDispatchStart(startInput({ at: NOW }));
+    clockNow = NOW + OPEN_START_TTL_MS + 60_000;
+    await rec.sweep();
+    expect(timingRows().map(r => r.outcome)).toEqual(["unknown"]);
+  });
+});
+
+describe("timing recorder: label validation reaches the recorder (QA-1.1-5)", () => {
+  it("a role with spaces is refused by the side log: no row, one warning", async () => {
+    const rec = recorder();
+    rec.recordDispatchStart(startInput({ role: "some free text" }));
+    await rec.onExecutionOutcome("child-1", "evt-1", "succeeded", NOW + 1);
+    expect(existsSync(join(dir, "timings.jsonl"))).toBe(false);
+    expect(logger.warns).toHaveLength(1);
+  });
+});
+
+describe("timing recorder: turns (QA-1.1-4, QA-1.1-15)", () => {
+  const step = { input: 10, cacheRead: 20, cacheWrite: 30 };
+
+  it("sweep leaves a turn that still receives steps open; the prompt then writes one row", async () => {
+    const rec = recorder();
+    rec.markRootSession("root-1");
+    expect(rec.onRootStep("root-1", step)).toBe(true);
+    clockNow = NOW + 60_000;
+    await rec.sweep();
+    expect(turnRows()).toEqual([]);
+    clockNow = NOW + 120_000;
+    expect(rec.onRootStep("root-1", step)).toBe(true);
+    expect(rec.onRootStep("root-1", step)).toBe(true);
+    await rec.sweep();
+    expect(turnRows()).toEqual([]);
+    await rec.onRootPrompt("root-1", clockNow);
+    expect(turnRows()).toHaveLength(1);
+    expect(turnRows()[0]).toMatchObject({ sessionID: "root-1", turn: 1, steps: 3, input: 30, cacheRead: 60, cacheWrite: 90 });
+  });
+
+  it("sweep flushes a turn idle for at least turnIdleMs", async () => {
+    const rec = recorder();
+    rec.markRootSession("root-1");
+    rec.onRootStep("root-1", step);
+    clockNow = NOW + DEFAULT_TURN_IDLE_MS - 1;
+    await rec.sweep();
+    expect(turnRows()).toEqual([]);
+    clockNow = NOW + DEFAULT_TURN_IDLE_MS;
+    await rec.sweep();
+    expect(turnRows()).toHaveLength(1);
+    await rec.sweep();
+    expect(turnRows()).toHaveLength(1); // nothing left to flush
+  });
+
+  it("turnIdleMs is configurable", async () => {
+    const rec = createTimingRecorder({ dir, now, logger, turnIdleMs: 1_000 });
+    rec.markRootSession("root-1");
+    rec.onRootStep("root-1", step);
+    clockNow = NOW + 1_000;
+    await rec.sweep();
+    expect(turnRows()).toHaveLength(1);
+  });
+
+  it("flush and dispose write every open turn whatever its idle time", async () => {
+    const rec = recorder();
+    rec.markRootSession("a");
+    rec.markRootSession("b");
+    rec.onRootStep("a", step);
+    rec.onRootStep("b", step);
+    await rec.flush();
+    expect(turnRows().map(r => r.sessionID).sort()).toEqual(["a", "b"]);
+    rec.onRootStep("a", step);
+    await rec.dispose();
+    expect(turnRows().map(r => `${r.sessionID}:${r.turn}`).sort()).toEqual(["a:1", "a:2", "b:1"]);
+  });
+
+  it("onRootStep says whether the step was counted; isRootSession tells the tracked roots", () => {
+    const rec = recorder();
+    expect(rec.isRootSession("root-1")).toBe(false);
+    expect(rec.onRootStep("root-1", step)).toBe(false);
+    rec.markRootSession("root-1");
+    expect(rec.isRootSession("root-1")).toBe(true);
+    expect(rec.onRootStep("root-1", step, "evt-1")).toBe(true);
+    expect(rec.onRootStep("root-1", step, "evt-1")).toBe(false);
+  });
+
+  it("a duplicate step event counts once", async () => {
+    const rec = recorder();
+    rec.markRootSession("root-1");
+    rec.onRootStep("root-1", step, "step-1");
+    rec.onRootStep("root-1", step, "step-1");
+    rec.onRootStep("root-1", step, "step-2");
+    await rec.onRootPrompt("root-1", NOW);
+    expect(turnRows()).toHaveLength(1);
+    expect(turnRows()[0]?.steps).toBe(2);
+  });
+
+  it("a step event id for a session that is not a root is not consumed", async () => {
+    const rec = recorder();
+    expect(rec.onRootStep("root-1", step, "step-1")).toBe(false);
+    rec.markRootSession("root-1");
+    expect(rec.onRootStep("root-1", step, "step-1")).toBe(true);
+  });
+
+  it("a duplicate prompt event closes the turn once", async () => {
+    const rec = recorder();
+    rec.markRootSession("root-1");
+    rec.onRootStep("root-1", step);
+    await rec.onRootPrompt("root-1", NOW, "prompt-1");
+    rec.onRootStep("root-1", step);
+    await rec.onRootPrompt("root-1", NOW, "prompt-1"); // the same event again: ignored, the new step stays in the open turn
+    expect(turnRows()).toHaveLength(1);
+    await rec.onRootPrompt("root-1", NOW, "prompt-2");
+    expect(turnRows().map(r => r.turn)).toEqual([1, 2]);
+  });
+
+  it("every step refreshes the recency of its root: the least recently used root is the one evicted", () => {
+    const rec = recorder();
+    for (let i = 0; i < MAX_ROOT_SESSIONS; i++) rec.markRootSession(`root-${i}`);
+    rec.onRootStep("root-0", step); // root-0 is now the most recent
+    rec.markRootSession("extra"); // evicts root-1
+    expect(rec.isRootSession("root-0")).toBe(true);
+    expect(rec.isRootSession("root-1")).toBe(false);
+    expect(rec.isRootSession("extra")).toBe(true);
+  });
+
+  it("a root evicted with a turn in progress still writes that turn", async () => {
+    const rec = recorder();
+    rec.markRootSession("root-0");
+    rec.onRootStep("root-0", step);
+    for (let i = 1; i <= MAX_ROOT_SESSIONS; i++) rec.markRootSession(`root-${i}`);
+    await rec.flush();
+    expect(turnRows().map(r => r.sessionID)).toEqual(["root-0"]);
+  });
+});
+
+describe("timing recorder: shared per directory (QA-1.1-3)", () => {
+  const step = { input: 10, cacheRead: 20, cacheWrite: 30 };
+  const holders: Array<{ release(): Promise<void> }> = [];
+  afterEach(async () => {
+    for (const holder of holders.splice(0)) await holder.release();
+  });
+  const acquire = (extra: { dir?: string; onRow?: (row: DispatchTimingRow | OrchestratorTurnRow) => void } = {}) => {
+    const holder = acquireTimingRecorder({ dir: extra.dir ?? dir, now, logger, ...(extra.onRow === undefined ? {} : { onRow: extra.onRow }) });
+    holders.push(holder);
+    return holder;
+  };
+
+  it("two acquirers of one directory share state: one turn row, whoever closes the turn", async () => {
+    const a = acquire();
+    const b = acquire();
+    a.markRootSession("root-1");
+    expect(b.isRootSession("root-1")).toBe(true);
+    b.markRootSession("root-1");
+    a.onRootStep("root-1", step, "step-1");
+    b.onRootStep("root-1", step, "step-1"); // the same host event, delivered to both plugin instances
+    await a.onRootPrompt("root-1", NOW, "prompt-1");
+    await b.onRootPrompt("root-1", NOW, "prompt-1");
+    expect(turnRows()).toHaveLength(1);
+    expect(turnRows()[0]).toMatchObject({ steps: 1, turn: 1 });
+  });
+
+  it("a dispatch started through one acquirer is closed once through the other", async () => {
+    const a = acquire();
+    const b = acquire();
+    a.recordDispatchStart(startInput({ callID: "call-x", childSessionID: null }));
+    b.bindChild("call-x", "child-x");
+    await Promise.all([a.onExecutionOutcome("child-x", "evt-1", "succeeded", NOW + 5), b.onExecutionOutcome("child-x", "evt-1", "succeeded", NOW + 5)]);
+    expect(timingRows()).toHaveLength(1);
+  });
+
+  it("different directories (and the same directory spelled differently) are told apart correctly", async () => {
+    const other = mkdtempSync(join(tmpdir(), "omr-timings-other-"));
+    try {
+      const a = acquire();
+      const b = acquire({ dir: other });
+      const c = acquire({ dir: join(dir, "..", dir.split(/[\\/]/).pop() ?? "") });
+      a.markRootSession("root-1");
+      expect(b.isRootSession("root-1")).toBe(false);
+      expect(c.isRootSession("root-1")).toBe(true);
+      await b.release();
+    } finally {
+      await removeDirWhenReleased(other);
+    }
+  });
+
+  it("release: only the last holder flushes; the recorder is then gone from the registry", async () => {
+    const a = acquire();
+    const b = acquire();
+    a.markRootSession("root-1");
+    a.onRootStep("root-1", step);
+    await a.release();
+    await a.release(); // idempotent
+    expect(turnRows()).toEqual([]);
+    await b.release();
+    expect(turnRows()).toHaveLength(1);
+    const again = acquire();
+    expect(again.isRootSession("root-1")).toBe(false); // a fresh recorder
+  });
+
+  it("onRow observes the rows of the shared recorder until its holder releases", async () => {
+    const seen: string[] = [];
+    const a = acquire({ onRow: row => seen.push(row.kind) });
+    const b = acquire();
+    b.recordDispatchStart(startInput());
+    await b.onExecutionOutcome("child-1", "evt-1", "succeeded", NOW + 1);
+    expect(seen).toEqual(["dispatch-timing"]);
+    await a.release();
+    b.recordDispatchStart(startInput({ at: NOW + 5 }));
+    await b.onExecutionOutcome("child-1", "evt-2", "succeeded", NOW + 6);
+    expect(seen).toEqual(["dispatch-timing"]);
+  });
+
+  it("a throwing observer does not stop the write or the other observers", async () => {
+    const seen: string[] = [];
+    acquire({
+      onRow: () => {
+        throw new Error("observer broke");
+      },
+    });
+    acquire({ onRow: row => seen.push(row.kind) });
+    const rec = acquire();
+    rec.recordDispatchStart(startInput());
+    await rec.onExecutionOutcome("child-1", "evt-1", "succeeded", NOW + 1);
+    expect(timingRows()).toHaveLength(1);
+    expect(seen).toEqual(["dispatch-timing"]);
+  });
+});
+
+describe("classifyCapacity (QA-1.1-8; ADR 0007 D6 and D13)", () => {
+  it.each([
+    [{ type: "provider.rate-limit", status: 429 }, "rate-limit"],
+    [{ type: "provider.rate-limit" }, "rate-limit"],
+    [{ type: "provider.internal", status: 529 }, "overload"],
+    [{ type: "provider.internal", status: 500 }, null],
+    [{ type: "provider.internal" }, null],
+    [{ type: "provider.quota", status: 429 }, "usage-limit"],
+    [{ type: "provider.quota" }, "usage-limit"],
+    [{ type: "provider.something-new", status: 429 }, "rate-limit"],
+    [{ type: "provider.something-new", status: 529 }, "overload"],
+    [{ type: "provider.something-new", status: 500 }, null],
+    [{ type: "provider.something-new" }, null],
+    [{ status: 429 }, "rate-limit"],
+    [{ status: 529 }, "overload"],
+    [{ type: null, status: null }, null],
+    [{}, null],
+  ] as const)("%j → %s", (error, expected) => {
+    expect(classifyCapacity(error)).toBe(expected);
+  });
+
+  it("the type decides over the status", () => {
+    expect(classifyCapacity({ type: "provider.quota", status: 529 })).toBe("usage-limit");
+    expect(classifyCapacity({ type: "provider.rate-limit", status: 529 })).toBe("rate-limit");
+  });
+});
+
 describe("timing recorder: independent of routing.engine", () => {
   it("takes no engine input and creates no store, decision log or snapshot", async () => {
     // The way phase 2.1 constructs it: from a directory and a clock. A config whose engine is `static` has nothing to give it.
@@ -581,7 +1003,21 @@ describe("timing recorder: independent of routing.engine", () => {
     expect(config.routing.engine).toBe("static");
     const rec = createTimingRecorder({ dir, now });
     expect(Object.keys(rec).sort()).toEqual(
-      ["markRootSession", "onCapacitySignal", "onExecutionOutcome", "onRootPrompt", "onRootStep", "recordDispatchStart", "sweep"].sort(),
+      [
+        "bindChild",
+        "cancelStart",
+        "dispose",
+        "flush",
+        "isRootSession",
+        "markRootSession",
+        "onCapacitySignal",
+        "onExecutionOutcome",
+        "onRootPrompt",
+        "onRootStep",
+        "recordDispatchStart",
+        "setBackground",
+        "sweep",
+      ].sort(),
     );
 
     rec.recordDispatchStart(startInput());
@@ -598,7 +1034,7 @@ describe("timing recorder: independent of routing.engine", () => {
   it("the module imports nothing but the side-log persistence and the shared types", () => {
     const source = readFileSync(fileURLToPath(new URL("../../src/routing/outcomes/timings.ts", import.meta.url)), "utf8");
     const specifiers = [...source.matchAll(/^import[^;]*?from\s+"([^"]+)";/gm)].map(m => m[1]).sort();
-    expect(specifiers).toEqual(["./persist", "./types", "./types"]);
+    expect(specifiers).toEqual(["./persist", "./types", "./types", "node:path"]);
     const code = source.split("\n").filter(l => !/^\s*(\/\/|\/\*|\*)/.test(l)).join("\n");
     expect(code).not.toMatch(/engine/i);
   });

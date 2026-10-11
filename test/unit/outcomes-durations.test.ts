@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   DURATION_MAX_AGE_DAYS,
   DURATION_MIN_SAMPLES,
+  DURATION_P90_MIN_SAMPLES,
   DURATION_PRIOR_MS,
   DURATION_WINDOW,
   createDurationModel,
@@ -86,8 +87,8 @@ describe("duration estimator: samples per level", () => {
 
   it("5 samples answer: exact, nearest-rank percentiles", async () => {
     const model = await loaded(ladder(5)); // 1..5
-    // rank(p50) = ceil(2.5) = 3, rank(p90) = ceil(4.5) = 5
-    expect(model.estimate(Q)).toEqual({ p50: 3, p90: 5, n: 5, source: "exact" });
+    // rank(p50) = ceil(2.5) = 3; p90 needs 10 samples (QA-1.1-10), so it is the prior's
+    expect(model.estimate(Q)).toEqual({ p50: 3, p90: 480_000, n: 5, source: "exact" });
   });
 
   it("60 samples: only the newest 50 are kept (window)", async () => {
@@ -98,7 +99,7 @@ describe("duration estimator: samples per level", () => {
   });
 
   it("a single sample with minSamples 1 answers with p50 = p90", async () => {
-    const model = await loaded([row({ durationMs: 77 })], { minSamples: 1 });
+    const model = await loaded([row({ durationMs: 77 })], { minSamples: 1, p90MinSamples: 1 });
     expect(model.estimate(Q)).toEqual({ p50: 77, p90: 77, n: 1, source: "exact" });
   });
 });
@@ -180,7 +181,7 @@ describe("duration estimator: which rows count", () => {
 
   it("a zero duration counts", async () => {
     const model = await loaded(ladder(5).map(r => ({ ...r, durationMs: 0 })));
-    expect(model.estimate(Q)).toMatchObject({ p50: 0, p90: 0, n: 5 });
+    expect(model.estimate(Q)).toMatchObject({ p50: 0, n: 5 });
   });
 });
 
@@ -192,7 +193,7 @@ describe("duration estimator: window and age", () => {
   });
 
   it("honours a custom window", async () => {
-    const model = await loaded(ladder(10), { window: 5, minSamples: 1 }); // keeps 6..10
+    const model = await loaded(ladder(10), { window: 5, minSamples: 1, p90MinSamples: 1 }); // keeps 6..10
     expect(model.estimate(Q)).toEqual({ p50: 8, p90: 10, n: 5, source: "exact" });
   });
 
@@ -256,9 +257,9 @@ describe("duration estimator: percentiles and outliers", () => {
     expect(model.estimate(Q)).toEqual({ p50: 100, p90: 100, n: 10, source: "exact" });
   });
 
-  it("the same outlier among 5 samples is p90 (nearest rank: rank 5 of 5)", async () => {
+  it("the same outlier among 5 samples is p90 (nearest rank: rank 5 of 5) when the level may answer p90", async () => {
     const rows = [...Array.from({ length: 4 }, () => row({ durationMs: 100 })), row({ durationMs: 1000 })];
-    const model = await loaded(rows);
+    const model = await loaded(rows, { p90MinSamples: 5 });
     expect(model.estimate(Q)).toEqual({ p50: 100, p90: 1000, n: 5, source: "exact" });
   });
 
@@ -268,6 +269,84 @@ describe("duration estimator: percentiles and outliers", () => {
     durations.forEach((d, i) => model.observe(row({ durationMs: d, endedAt: NOW - 1000 - i })));
     // sorted: 5 10 20 30 40 50 60 70 80 90 -> rank 5 = 40, rank 9 = 80
     expect(model.estimate(Q)).toEqual({ p50: 40, p90: 80, n: 10, source: "exact" });
+  });
+});
+
+describe("duration estimator: p90 needs a tail (QA-1.1-10)", () => {
+  it("documents the default", () => {
+    expect(DURATION_P90_MIN_SAMPLES).toBe(10);
+  });
+
+  it("9 samples: p50 from the level, p90 from the prior", async () => {
+    const model = await loaded(ladder(9));
+    expect(model.estimate(Q)).toEqual({ p50: 5, p90: 480_000, n: 9, source: "exact" });
+  });
+
+  it("10 samples: p90 from the level", async () => {
+    const model = await loaded(ladder(10));
+    expect(model.estimate(Q)).toEqual({ p50: 5, p90: 9, n: 10, source: "exact" });
+  });
+
+  it("a thin exact level takes p90 from the first coarser level with 10 samples", async () => {
+    const rows = [
+      ...ladder(5, { scope: "s" }), // exact: 1..5 (p50 = 3)
+      ...ladder(10, { scope: "t" }), // role-class holds 15 rows: 1..5 and 1..10
+    ];
+    const model = await loaded(rows);
+    // role-class durations sorted: 1,1,2,2,3,3,4,4,5,5,6,7,8,9,10 -> rank ceil(13.5) = 14 -> 9
+    expect(model.estimate({ ...Q, scope: "s" })).toEqual({ p50: 3, p90: 9, n: 5, source: "exact" });
+  });
+
+  it("p90 never falls below p50 when the prior is smaller", async () => {
+    const rows = ladder(5).map(r => ({ ...r, durationMs: r.durationMs + 1_000_000 }));
+    const est = (await loaded(rows)).estimate(Q);
+    expect(est.p50).toBe(1_000_003);
+    expect(est.p90).toBeGreaterThanOrEqual(est.p50);
+  });
+
+  it("p90MinSamples is an option; invalid values fall back to 10", async () => {
+    for (const p90MinSamples of [0, -1, Number.NaN]) {
+      expect((await loaded(ladder(9), { p90MinSamples })).estimate(Q).p90).toBe(480_000);
+    }
+    expect((await loaded(ladder(3), { minSamples: 1, p90MinSamples: 3 })).estimate(Q).p90).toBe(3);
+  });
+});
+
+describe("duration estimator: rows from the future (QA-1.1-9)", () => {
+  it("ignores rows that ended more than a day after now; keeps the boundary", async () => {
+    const future = ladder(5).map(r => ({ ...r, endedAt: NOW + DAY + 1 }));
+    expect((await loaded(future)).estimate(Q).source).toBe("prior");
+    const edge = ladder(5).map(r => ({ ...r, endedAt: NOW + DAY }));
+    expect((await loaded(edge)).estimate(Q)).toMatchObject({ source: "exact", n: 5 });
+  });
+
+  it("judges the future at estimate time against the injected clock", async () => {
+    let t = NOW;
+    const rows = ladder(5).map(r => ({ ...r, endedAt: NOW + 2 * DAY }));
+    const model = await loaded(rows, undefined, () => t);
+    expect(model.estimate(Q).source).toBe("prior");
+    t = NOW + 2 * DAY;
+    expect(model.estimate(Q).source).toBe("exact");
+  });
+});
+
+describe("duration estimator: dedupe is a set lookup (QA-1.1-11)", () => {
+  it("20000 rows in a huge window dedupe correctly and quickly", async () => {
+    const model = createDurationModel({ readTimings: () => [], now: () => NOW }, { window: 100_000, minSamples: 1 });
+    const rows: DispatchTimingRow[] = [];
+    for (let i = 0; i < 20_000; i++) rows.push(row({ durationMs: i, endedAt: NOW - 100_000 + i }));
+    for (const r of rows) model.observe(r);
+    for (const r of rows) model.observe(r);
+    expect(model.estimate(Q).n).toBe(20_000);
+  });
+
+  it("a row pushed out of the window can be observed again", async () => {
+    const model = createDurationModel({ readTimings: () => [], now: () => NOW }, { window: 2, minSamples: 1 });
+    const rows = ladder(3);
+    for (const r of rows) model.observe(r); // rows[0] falls out of the window
+    model.observe(rows[0] as DispatchTimingRow); // it is the oldest: inserted, then dropped again
+    expect(model.estimate(Q).n).toBe(2);
+    expect(model.estimate(Q).p50).toBe(2);
   });
 });
 

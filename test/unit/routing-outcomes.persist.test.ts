@@ -7,12 +7,14 @@ import {
   createFlusher,
   createPersister,
   createSideLogs,
+  durationSeamsFor,
   nodePersistFs,
   nodeScheduler,
   parseLogLine,
   renameWithRetry,
   resolveOutcomesDir,
 } from "../../src/routing/outcomes/persist";
+import { createDurationModel } from "../../src/routing/outcomes/durations";
 import { acquireOutcomes } from "../../src/routing/outcomes/index";
 import { emptyTokenSample } from "../../src/routing/outcomes/cost";
 import { createOutcomeStore } from "../../src/routing/outcomes/store";
@@ -1222,6 +1224,208 @@ describe("side logs: timings.jsonl and turns.jsonl", () => {
     };
     expect(await side.readTurns()).toEqual({ rows: [], skipped: 0, newer: 0, files: [] });
     expect(logger.warn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("side logs: validation, observer, serialized appends (QA-1.1-5, -7, -16)", () => {
+  const T = Date.UTC(2026, 9, 11, 12, 0, 0);
+  const OUT = join(tmpdir(), "omr-side-validation");
+
+  function timing(overrides: Record<string, unknown> = {}): DispatchTimingRow {
+    return {
+      kind: "dispatch-timing",
+      v: 1,
+      ts: new Date(T).toISOString(),
+      parentSessionID: "root-1",
+      childSessionID: "child-1",
+      callID: "call-1",
+      role: "implementer",
+      class: "implement",
+      scope: "file",
+      tier: "medium",
+      model: "anthropic/claude-sonnet-5-5#low",
+      background: false,
+      startedAt: T,
+      endedAt: T + 1000,
+      durationMs: 1000,
+      outcome: "succeeded",
+      capacity: null,
+      ...overrides,
+    } as DispatchTimingRow;
+  }
+
+  function turn(overrides: Record<string, unknown> = {}): OrchestratorTurnRow {
+    return {
+      kind: "orchestrator-turn",
+      v: 1,
+      ts: new Date(T).toISOString(),
+      sessionID: "root-1",
+      turn: 1,
+      steps: 1,
+      input: 1,
+      cacheRead: 2,
+      cacheWrite: 3,
+      ...overrides,
+    } as OrchestratorTurnRow;
+  }
+
+  function memDeps(warns: string[] = []) {
+    const mem = createMemFs(() => T);
+    return {
+      mem,
+      deps: {
+        fs: mem.fs,
+        now: () => T,
+        sleep: async () => undefined,
+        logger: { warn: (message: string) => void warns.push(message) },
+        pid: 1,
+      },
+    };
+  }
+
+  it("writes nothing for a 300-character label or a label with spaces, with one warning per kind", async () => {
+    const warns: string[] = [];
+    const { deps } = memDeps(warns);
+    const side = createSideLogs(OUT, deps);
+    expect(await side.appendTimings([timing({ role: "x".repeat(300) }), timing({ scope: "free text here" })])).toEqual({ ok: true });
+    expect(await side.appendTimings([timing({ model: "has space" })])).toEqual({ ok: true });
+    expect(await side.appendTurns([turn({ sessionID: "a b" })])).toEqual({ ok: true });
+    expect((await side.readTimings()).rows).toEqual([]);
+    expect((await side.readTurns()).rows).toEqual([]);
+    expect((await side.readTimings()).files).toEqual([]);
+    expect(warns.filter(w => w.includes("were refused"))).toHaveLength(2); // timings once, turns once
+  });
+
+  it("a refused row does not keep its valid neighbours from being written", async () => {
+    const { deps } = memDeps();
+    const side = createSideLogs(OUT, deps);
+    await side.appendTimings([timing({ callID: "ok-1" }), timing({ callID: "bad call" }), timing({ callID: "ok-2" })]);
+    expect((await side.readTimings()).rows.map(r => r.callID)).toEqual(["ok-1", "ok-2"]);
+  });
+
+  it("model ids such as anthropic/claude-sonnet-5-5#low and the other usual labels are accepted", async () => {
+    const { deps } = memDeps();
+    const side = createSideLogs(OUT, deps);
+    const row = timing({ model: "anthropic/claude-sonnet-5-5#low", callID: "toolu_01:A.b@c+d-e", scope: "src/a.ts", role: "plan-reviewer" });
+    await side.appendTimings([row]);
+    expect((await side.readTimings()).rows).toEqual([row]);
+  });
+
+  it("an empty label is refused", async () => {
+    const { deps } = memDeps();
+    const side = createSideLogs(OUT, deps);
+    await side.appendTimings([timing({ scope: "" })]);
+    expect((await side.readTimings()).rows).toEqual([]);
+  });
+
+  it("refuses negative and non-finite times", async () => {
+    const { deps } = memDeps();
+    const side = createSideLogs(OUT, deps);
+    await side.appendTimings([
+      timing({ startedAt: -1 }),
+      timing({ endedAt: Number.NaN }),
+      timing({ durationMs: Number.POSITIVE_INFINITY }),
+      timing({ durationMs: -5 }),
+      timing({ ts: "not a date" }),
+    ]);
+    await side.appendTurns([turn({ input: -1 }), turn({ cacheRead: Number.NaN })]);
+    expect((await side.readTimings()).rows).toEqual([]);
+    expect((await side.readTurns()).rows).toEqual([]);
+  });
+
+  it("onRow is called after each appended row, in order, and never for a refused row or a failed write", async () => {
+    const seen: string[] = [];
+    const { deps, mem } = memDeps();
+    const side = createSideLogs(OUT, deps, { onRow: row => void seen.push(row.kind === "dispatch-timing" ? row.callID : `turn-${row.turn}`) });
+    await side.appendTimings([timing({ callID: "a" }), timing({ callID: "bad id" }), timing({ callID: "b" })]);
+    await side.appendTurns([turn({ turn: 7 })]);
+    expect(seen).toEqual(["a", "b", "turn-7"]);
+
+    const failing = createSideLogs(OUT, { ...deps, fs: { ...mem.fs, appendText: () => Promise.reject(new Error("EIO")) } }, { onRow: () => void seen.push("never") });
+    expect((await failing.appendTimings([timing({ callID: "c" })])).ok).toBe(false);
+    expect(seen).not.toContain("never");
+  });
+
+  it("a throwing onRow is logged and does not fail the append", async () => {
+    const warns: string[] = [];
+    const { deps } = memDeps(warns);
+    const side = createSideLogs(OUT, deps, {
+      onRow: () => {
+        throw new Error("observer broke");
+      },
+    });
+    expect(await side.appendTimings([timing()])).toEqual({ ok: true });
+    expect((await side.readTimings()).rows).toHaveLength(1);
+    expect(warns.some(w => w.includes("onRow"))).toBe(true);
+  });
+
+  it("durationSeamsFor feeds the estimator from the timing side log", async () => {
+    const { deps } = memDeps();
+    const side = createSideLogs(OUT, deps);
+    await side.appendTimings([1, 2, 3, 4, 5].map(i => timing({ callID: `c${i}`, childSessionID: `s${i}`, durationMs: i * 100, endedAt: T + i })));
+    const seams = durationSeamsFor(side, () => T + 10);
+    expect(await seams.readTimings()).toHaveLength(5);
+    const model = createDurationModel(seams);
+    await model.load();
+    expect(model.estimate({ role: "implementer", class: "implement", scope: "file" })).toMatchObject({ p50: 300, n: 5, source: "exact" });
+  });
+
+  it("two side-log instances on one directory with a tiny maxBytes lose no row and never overwrite a generation", async () => {
+    const { deps } = memDeps();
+    const options = { maxBytes: 700, maxGenerations: 100 };
+    const a = createSideLogs(join(OUT, "shared"), deps, options);
+    const b = createSideLogs(join(OUT, "shared"), deps, options);
+    const writes: Array<Promise<unknown>> = [];
+    for (let i = 0; i < 30; i++) writes.push((i % 2 === 0 ? a : b).appendTimings([timing({ callID: `call-${i}`, childSessionID: `child-${i}` })]));
+    await Promise.all(writes);
+    const read = await a.readTimings();
+    expect(read.skipped).toBe(0);
+    expect(read.rows.map(r => r.callID).sort()).toEqual(Array.from({ length: 30 }, (_, i) => `call-${i}`).sort());
+    expect(read.files.length).toBeGreaterThan(3); // it did rotate
+    expect(new Set(read.files).size).toBe(read.files.length);
+  });
+
+  it("appends to one file are serialized: a slow first append does not interleave with the second", async () => {
+    const { deps, mem } = memDeps();
+    const order: string[] = [];
+    let releaseFirst: () => void = () => undefined;
+    const gate = new Promise<void>(resolve => {
+      releaseFirst = resolve;
+    });
+    let calls = 0;
+    const slow = {
+      ...mem.fs,
+      appendText: async (path: string, data: string) => {
+        calls += 1;
+        const mine = calls;
+        order.push(`start-${mine}`);
+        if (mine === 1) await gate;
+        await mem.fs.appendText(path, data);
+        order.push(`end-${mine}`);
+      },
+    };
+    const a = createSideLogs(join(OUT, "ser"), { ...deps, fs: slow });
+    const b = createSideLogs(join(OUT, "ser"), { ...deps, fs: slow });
+    const first = a.appendTimings([timing({ callID: "one" })]);
+    const second = b.appendTimings([timing({ callID: "two" })]);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(order).toEqual(["start-1"]);
+    releaseFirst();
+    await Promise.all([first, second]);
+    expect(order).toEqual(["start-1", "end-1", "start-2", "end-2"]);
+    expect((await a.readTimings()).rows.map(r => r.callID)).toEqual(["one", "two"]);
+  });
+
+  it("rotation probes for a free name instead of renaming over an existing generation", async () => {
+    const { deps, mem } = memDeps();
+    const options = { maxBytes: 400, maxGenerations: 100 };
+    const side = createSideLogs(join(OUT, "probe"), deps, options);
+    await side.appendTimings([timing({ callID: "r1" })]);
+    await side.appendTimings([timing({ callID: "r2" })]); // rotates r1 away (clock frozen, same pid)
+    await side.appendTimings([timing({ callID: "r3" })]); // rotates r2 away under a different name
+    const names = (await mem.fs.readdir(join(OUT, "probe"))).filter(n => n.startsWith("timings.") && n !== "timings.jsonl");
+    expect(new Set(names).size).toBe(names.length);
+    expect((await side.readTimings()).rows.map(r => r.callID)).toEqual(["r1", "r2", "r3"]);
   });
 });
 
