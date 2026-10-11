@@ -63,7 +63,51 @@ Pre-flight finding, fixed by amendment:
 
 ## Findings
 
+### Round 1 (heavy reviewer `ses_ed735b776ffeBl88hVndizsRn5`, at `97b210e`) — 16 findings (2 critical, 6 major, 7 minor, 1 nit)
+
+| Id | Sev. | Finding (short) |
+|---|---|---|
+| QA-0.1-1 | critical | C6/O8 decided without the plugin API's own `CacheHint` (`part.cache = {type, ttlSeconds}` → `cache_control ttl "1h"`); D5 likely withdrawn wrongly; under D4 the auto tail breakpoint lands on the volatile tail |
+| QA-0.1-2 | critical | C14 never observed the router on retained children (enforcement off; "router" evidence was the harness probe's own evaluate hook); agent/model binding not shown |
+| QA-0.1-3 | major | ADR evidence/decision tables contradict the O-items and the current smoke (stale keys, 3+3 vs 8 children, C15 failed vs succeeded); runs not identified |
+| QA-0.1-4 | major | "Resolved" O-items and ADR facts not pinned (O4a/O4b fate, O5 full log vacuous, O6 resume:false, D13 providerID source, D14 decision rows / first-context order) |
+| QA-0.1-5 | major | O3 8-way proof relies on a fixed 3 s hold |
+| QA-0.1-6 | major | C12 "woke after restart" not measured; child A's end races the kill |
+| QA-0.1-7 | major | C10 usage-limit evidence is the test's own invented body; reset pattern fitted to it; `session.hook("retry")` not evaluated; "never" unscoped |
+| QA-0.1-8 | major | ADR departs from the plan with no recorded amendment (D5, C10 branch, D6 classes and age, D13 range, launcher A vs plan 1.4/3.1/D15) |
+| QA-0.1-9 | minor | C9 keys of unadvertised `list`/`router_run` are the test's own input |
+| QA-0.1-10 | minor | C9 model-side evidence taken from the latest tool-result request, whichever call |
+| QA-0.1-11 | minor | C15 summary check vacuous; held text not a real completion; `succeeded` accepted any non-failed status |
+| QA-0.1-12 | minor | O4b depends on the probe replacing the retained `signal`/`progress` |
+| QA-0.1-13 | minor | O6/interrupt/context proven only through the HTTP client, not the plugin session API |
+| QA-0.1-14 | minor | Observation files collide across runs; teardown leaks silent; `afterAll` stops at the first error |
+| QA-0.1-15 | minor | 0.1.0 harness additions (`restart`, plugin order, front wiring, listen slicing) had no unit tests |
+| QA-0.1-16 | nit | Missing `DECISIONS` entry passes silently; empty `smoke:cpx:*` scripts; `hostVersion` throws pre-observation; preamble bypasses the credential check; O2 pin landed after the cited commit |
+
 ## Fixes
+
+### Round 1
+
+| Id | Fix | Commit |
+|---|---|---|
+| QA-0.1-1 | Probe sets `cache: {type:"ephemeral", ttlSeconds:3600}` on the last system part (`cache-hint-1h`) and on the last real message (`cache-hint-1h-message`); C6 asserts the observed branch: **1 h ttl reaches the wire on both** → C6 holds, D5 to be reinstated in the ADR. C5 adds `append-tail-user+hint-last-real`: with a manual hint on the last real message the wire breakpoint moves to that message and off the tail (asserted, both requests); plain user tail → breakpoint on the tail. | `672c727`, `4f63434` |
+| QA-0.1-2 | C14 runs the router **enforced**; children launched as `cpx-child` with an explicit `model`; each child repeats a `read` so the router's guards refuse (`DENIED:`); per-child checks for agent, wire model, read hook and a router refusal; a `withoutRouter` control host shows no refusal. | `672c727` |
+| QA-0.1-3 | ADR regenerated from the round-1 runs (pending: heavy architect after the 3× green runs). | — |
+| QA-0.1-4 | O4a/O4b fates, O5 full log (`anyApiReturnsPreCompaction`), O6 `resume:false` no wake, D13 `session.step.started` `model.providerID`, D14 `routerDecisionRows === 0` and first-context-before-first-tool are asserted. | `4f63434` |
+| QA-0.1-5 | C14 batch 1 parked with `Gates` until all 8 wait at once (`peakWaiting === 8`). | `672c727` |
+| QA-0.1-6 | C12 waits for A's terminal line and stored completion before `restart()`, classifies the wake against the restart window, and asserts exactly one stored completion and one wire delivery for A. | `4f63434` |
+| QA-0.1-7 | CpxFront usage-limit variants; host classification observed and asserted: "usage limit" wording → `provider.quota` (with or without reset sentence or headers), the control 429 → `provider.rate-limit`; only the message text carries the reset time (headers are not surfaced); persistent-fault claims scoped to the 75 s window; `session.hook("retry")` observed, and setting `decision = {retry:false}` makes the host fail the step (`retry-stop` branch "stops"). | `b95f74a` |
+| QA-0.1-8 | Plan amendment A-0.1-2 in `cpx/main` (pending, after the ADR revision). | — |
+| QA-0.1-9 | Unadvertised `list`/`router_run`: only `advertised === false` asserted; keys recorded as unobserved. | `b95f74a` |
+| QA-0.1-10 | C9 model-side request selected by `tool_use_id`; `promptError` asserted undefined. | `b95f74a` |
+| QA-0.1-11 | `status === "completed"` required; summary claim dropped; C15-real compacts a session holding a real `<subagent>` completion with completion+compaction rewrites; asserted placeholder on the wire, no raw envelope. Observed: the host compacts the history except the latest turn when the session has more than one turn. | `b95f74a`, `7b11504` |
+| QA-0.1-12 | The probe records whether the retained `signal`/`progress` were replaced; a host launches with the retained signal (recorded). | `672c727` |
+| QA-0.1-13 | O6b drives `ctx.session.context` / `interrupt` / `synthetic({resume:true})` from the plugin; asserted. | `b95f74a`, `7b11504` |
+| QA-0.1-14 | Per-run observation dirs + `latest`; teardown result asserted; `afterAll` collects errors. | `4f63434` |
+| QA-0.1-15 | `test\smoke\helpers\routing-host.test.ts` (stub host via mocked spawn): plugin order, front wiring, `restart()`, listen slicing, `evidenceDir`; run by `smoke:cpx`. | `1332166` |
+| QA-0.1-16 | Missing `DECISIONS` entry throws; `hostVersion` never throws; credential-shaped preamble keys refused; `smoke:cpx` includes the harness tests. `smoke:cpx:provision`/`:e2e` stay as specified by the plan (their files arrive in 2.4 and 6.1) — recorded. | `4f63434` |
+
+Post-phase smoke checks (orchestrator shell, 2026-10-10/11): `npm run smoke:keyless` 5 files, 27 passed, 11 skipped (= baseline); `routing-engine.smoke.test.ts` scenario `6-v1-untouched` passed; full `routing-engine` smoke 12/13 — scenario `5-advisor` fails **also at the phase base** (`cpx/p01-base`, scratch worktree, same message), so it is pre-existing on OpenCode 2.0.26 (PF-4, recorded in the handover), not caused by this phase.
 
 ## Deferred findings
 
