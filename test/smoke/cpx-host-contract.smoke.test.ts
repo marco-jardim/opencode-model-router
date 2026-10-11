@@ -1387,7 +1387,7 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
       if (type) check(o, "C10/D13", at(c, "retryScheduled", 0, "error", "type") === type, `${name}: data.error.type must be ${type}`);
     }
     const overloadType = at(kase("overloaded-once"), "retryScheduled", 0, "error", "type");
-    check(o, "C10/O2", typeof overloadType === "string" && overloadType.length > 0, "O2: session.retry.scheduled for a 529 must carry a data.error.type (recorded in cases.overloaded-once.retryScheduled[0].error.type)");
+    check(o, "C10/D13", overloadType === "provider.internal", "529 retry error.type changed — update D13's signal table");
     ob.o2OverloadErrorType = overloadType;
     for (const [name, status] of [["rate-limit-persistent", 429], ["overloaded-persistent", 529]] as const) {
       const c = kase(name);

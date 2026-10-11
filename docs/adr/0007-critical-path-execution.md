@@ -61,10 +61,10 @@ always vary and are not listed. Observation keys are cited as `C<n> key=value`.
 | C7 | Each child produced its own terminal event: `session.execution.succeeded`, `session.execution.failed` or `session.execution.interrupted`. `context({sessionID: child})` returned 3 messages (`user, assistant, idle`); the last is `{type: "idle", outcome}`. The OK child's text is in that context (`containsChildOk=true`), but the probe's final-text extraction found nothing (`finalTexts.length=0`). `client.session.interrupt({sessionID})` returned `{interrupted: true}`. The parent stored three completions with states `error, cancelled, completed`. The host did not retry the invalid request (`failure.retriedByHost=false`). | index of the failing child's host attempt: 4 \| 3 \| 4 | scenario C7 |
 | C8 | `client.session.background({sessionID: parent})` moved a running foreground `subagent` call to the background. Its `execute.after` reported `resultStatus="running"` before the child ended. The acknowledgement has the same shape as C1 apart from ids (`comparisonWithC1Ack.sameShapeModuloIds=true`). | `background.executeAfter.afterMs` 13 \| 13 \| 26 | scenario C8 |
 | C9 | `execute.before` received these arguments: `read {path}`, `write {path, content}`, `edit {path, oldString, newString}`, `glob {path, pattern}`, `grep {path, pattern}`, `list {filePath}` and `router_run {script, cwd}`. `list` is not a v2.0.26 tool and `router_run` was not registered in the fixture, so neither got an `execute.after`. The `glob` and `grep` results could be rewritten in `execute.after` (`filter.mutable=true`, `filter.removedLines=1`), and the model saw the rewritten text. For `grep` the line with the leased text was removed (`perTool.grep.modelSaw.containsLeased=false`). v2.0.26 does not advertise `multiedit`, `patch` or `apply_patch`. It does advertise `shell {command, workdir, timeout, background}` and `execute {code}`. | none | scenario C9 |
-| C10 | A single 429 or 529 produced one `session.retry.scheduled`, then success, with no `session.step.failed`. A persistent 429 or 529 kept producing `session.retry.scheduled` (`attempt` 2…10 in run 1; first retry `at` = event time + 2000 ms) and no terminal event until the harness interrupted the root. The retry event's data is `{sessionID, assistantMessageID, attempt, at, error: {type: "provider.rate-limit", message, status: 429, response: {body}}}`; for overload, `status: 529`. A usage limit got no retry: `session.step.failed`, then `session.execution.failed`, with `error = {type: "provider.quota", message: "Usage limit reached. Your limit will reset at <ISO-8601>.", status: 429}`. | persistent 429: `requestCount` 9 \| 9 \| 10 (bounded by the harness's observation window) | scenario C10 |
+| C10 | A single 429 or 529 produced one `session.retry.scheduled`, then success, with no `session.step.failed`. A persistent 429 or 529 kept producing `session.retry.scheduled` (`attempt` 2…10 in run 1; first retry `at` = event time + 2000 ms) and no terminal event until the harness interrupted the root. The retry event's data is `{sessionID, assistantMessageID, attempt, at, error: {type: "provider.rate-limit", message, status: 429, response: {body}}}`; for overload, `type: "provider.internal"` and `status: 529`. A usage limit got no retry: `session.step.failed`, then `session.execution.failed`, with `error = {type: "provider.quota", message: "Usage limit reached. Your limit will reset at <ISO-8601>.", status: 429}`. | persistent 429: `requestCount` 9 \| 9 \| 10 (bounded by the harness's observation window) | scenario C10 |
 | C11 | The model wrote `prompt: "C11 original prompt"`. `execute.before` changed it to `"C11 original prompt CPX_MUTATED"`, and the child received the changed prompt (`child.receivedMutated=true`). The parent's provider bodies kept the original arguments (`parentWire[1].toolUses[0].mutated=false`, `parentWire[2].toolUses[0].mutated=false`). | none | scenario C11 |
 | C12 | The restart kills and relaunches in one call, so the downtime itself was never hit. Child A finished before the restart; after the restart the parent woke with A's `completed` completion (`parent.wokeAfterRestart=true`, `parent.envelopeStates=[completed]`). Child B was in flight at the restart. Afterwards it had no terminal event and was inactive (`perChild.C12_B.terminal=null`, `perChild.C12_B.active=false`); its context held only the `user` message, and the parent got no completion for it. | `timing.restartMs` 3119 \| 3887 \| 3171; held index of A 2 \| 1 \| 1 | scenario C12 |
-| C13 | 6, then 8, background children were all acknowledged `running` and were all waiting at the provider at once (`concurrency.n6.peakWaiting=6`, `concurrency.n8.peakWaiting=8`); all succeeded. Parent interrupt while the root was idle: `interrupted=false`, and the 3 background children kept running and succeeded. Parent interrupt while the root was active, with 3 foreground children: `interrupted=true`; all 3 children ended `session.execution.interrupted`; the root logged `session.step.failed {type: "aborted"}`. | in run 2 the root started a new execution after the idle-root interrupt (`rootLinesAfterInterrupt.length` 0 \| 2 \| 0) | scenario C13 |
+| C13 | 6, then 8, background children were all acknowledged `running` and were all waiting at the provider at once (`concurrency.n6.peakWaiting=6`, `concurrency.n8.peakWaiting=8`); all succeeded. Parent interrupt while the root was idle: `interrupted=false`, and the 3 background children kept running and succeeded. Parent interrupt while the root was active, with 3 foreground children: `interrupted=true`; all 3 children ended `session.execution.interrupted`; the root logged `session.step.failed {type: "aborted"}`. Parent interrupt while the root was active with 3 background children (O4a): `interrupted=true`, the children stayed active and ended `session.execution.succeeded`. | in run 2 the root started a new execution after the idle-root interrupt (`rootLinesAfterInterrupt.length` 0 \| 2 \| 0) | scenario C13 |
 | C14 | A plugin tool's execute context (`sessionID, agent, messageID, id, progress, signal`) was kept after the turn. Three children were launched through the native `subagent` tool right after the turn, and three more 60 s later (`CPX_PROBE_RELAUNCH_MS=60000`). All six completed (`results[*].ok=true`, `status="completed"`, `errors.length=0`). Each child's `read` call fired the router's hooks (`harnessHookRecordsForChildren=12`, `routerGuardsOrGrantsRan=true`; permission evaluations ran). Peak concurrency was 3 (`peakOverlapBatch1=3`). The parent's history was unchanged (`parentHistory.unchangedAcrossLaunches=true`) and the children were listed under the root. No `subagent` hook fired on the root (`subagentHooksOnRootAfterCapture=0`) and the router wrote no decision row (`routerDecisionRows=0`). | order in which the children started | scenario C14 |
 | C15 | `client.session.compact({sessionID})` returned `{type: "compaction", delivery: "steer"}`. The compaction hook fired (`hook.fired=true`: 2 messages, system present) and the rewrite applied (`hook.rewriteLines[0].did=true`, `replacements=1`). A provider request followed (`provider.requestSentAfterCompact=true`). Stored history kept the original (`stored.hasOriginal=true`, `stored.hasPlaceholder=false`). In every run the compaction record ended `status="failed"`, `compaction.failed` "Compaction summary did not match the required template". | none | scenario C15 |
 
@@ -80,13 +80,13 @@ always vary and are not listed. Observation keys are cited as `C<n> key=value`.
 | C4 | holds | D3 held placeholder. | `C4 rawEnvelopeInAnyProviderBody=false`, `placeholderInProviderBodies=[3,4]`, `stored.originalKept=true`, `stored.placeholderPersisted=false` |
 | C5 | holds | The tail is the last message, role `user`. | `C5 variants.user.wire.firstMarkerPaths=["$.messages[1].content[0].text"]`, `secondMarkerPaths=["$.messages[3].content[0].text"]`, `firstMarkerStillInSecond=false`, `storedHasMarker=false`, `prefix.systemIdentical=true`, `prefix.otherFieldsIdentical=true` |
 | C6 | does not hold | Fallback: `routing.promptCache.ttl` is not added; D5 is withdrawn. | `C6 providerCarriesOneHourAnywhere=false`, `contextShape.optionKeys=["maxTokens"]` |
-| C7 | holds | The processor and recovery read results from the child's context. Per child, recovery re-queues when the result cannot be read (the text path is QA item O1). | `C7 perChild.C7_OK.terminal.kind="session.execution.succeeded"`, `context.finalMessage.outcome="succeeded"`, `containsChildOk=true`, `finalTexts.length=0` |
+| C7 | holds | The processor and recovery read results from the child's context. Per child, recovery re-queues when the result cannot be read (the text path is the last `assistant` message; QA item O1). | `C7 perChild.C7_OK.terminal.kind="session.execution.succeeded"`, `context.finalMessage.outcome="succeeded"`, `containsChildOk=true`, `finalTexts` contains `CHILD_OK` |
 | C8 | holds | Covered through C1. | `C8 background.executeAfter.resultStatus="running"`, `comparisonWithC1Ack.sameShapeModuloIds=true` |
 | C9 | holds | Leases are enforced in the tool hooks; search filtering is available. | `C9 perTool.*.executeBefore.args`, `perTool.grep.filter.mutable=true`, `perTool.grep.probeSawLeasedBeforeFilter=true`, `perTool.grep.modelSaw.containsLeased=false` |
 | C10 | holds, on a different event for 429 and 529 | D13 capacity signals come from event fields. A text pattern is used only to read the usage-limit reset time. | `C10 cases.rate-limit-persistent.stepFailed.length=0`; `session.retry.scheduled` `data.error.status=429`; `cases.usage-limit-until-reset.stepFailed[0].error` has `"type":"provider.quota"` |
 | C11 | holds | Launcher B would expand in `execute.before`. B is not built (C14 chose A); C11 stays pinned because of today's `execute.before` changes to `subagent` arguments. | `C11 child.receivedMutated=true`, `parentWire[2].toolUses[0].mutated=false` |
 | C12 | does not hold for a child that is in flight | Fallback: recovery reads child state and result through C7, and re-queues the task when neither is available. | `C12 perChild.C12_B.terminal=null`, `perChild.C12_B.active=false`, `perChild.C12_B.context.roles=["user"]` |
-| C13 | holds (for an interrupt while the root is idle) | `maxParallel` is clamped to 8. | `C13 concurrency.n8.peakWaiting=8`, `parentInterrupt.background.interrupt.result.interrupted=false`, `parentInterrupt.background.afterInterrupt.activeChildren=3` |
+| C13 | holds (for an interrupt while the root is idle; an interrupt of an active root also leaves background and retained-context children running, O4) | `maxParallel` is clamped to 8. | `C13 concurrency.n8.peakWaiting=8`, `parentInterrupt.background.interrupt.result.interrupted=false`, `parentInterrupt.background.afterInterrupt.activeChildren=3` |
 | C14 | holds (validity proven for 60 s) | **Launcher A**. | `C14 launches[1].results[*].ok=true` (60 s after the turn), `hooksForChildren.routerGuardsOrGrantsRan=true`, `concurrency.peakOverlapBatch1=3`, `parentHistory.unchangedAcrossLaunches=true` |
 | C15 | holds (the rewrite; a successful compaction was not observed) | The held placeholder is also applied in compaction (D3). | `C15 hook.fired=true`, `hook.rewriteLines[0].did=true`, `stored.hasOriginal=true`, `stored.hasPlaceholder=false` |
 
@@ -181,10 +181,12 @@ placeholder, `held — verdict pending (vrf_…)`, for the life of the session.
 **What the contracts change.**
 
 - Held results are possible, so D1 may background required verification.
-- The parent wake from `client.session.synthetic` with `resume: true` was not exercised in Phase 0.1. The method exists
-  (`C8 api.sessionMethods` lists `synthetic`), but whether it wakes the parent is QA item O6. Phase 2.1's smoke must
-  assert the wake.
-- A *successful* compaction with a held placeholder was not observed (QA item O5).
+- The parent wake from `client.session.synthetic` with `resume: true` is proven (QA item O6): the call
+  `{sessionID, text, description, metadata, resume: true}` on an idle parent produces a new provider request that carries
+  the text, while `resume: false` does not wake it.
+- A successful compaction with a held placeholder is observed (QA item O5): the compaction record ends
+  `status="completed"`, the compaction request carries the placeholder (and not the original), and the summary has no
+  original.
 
 **Rationale.** Required verification can run in parallel without the model reading output that is not yet verified.
 
@@ -416,7 +418,7 @@ Priority is the bottom level (the longest remaining path by estimated duration).
 | Signal | Event | Identifying fields |
 |---|---|---|
 | Rate limit | `session.retry.scheduled` | `data.error.type = "provider.rate-limit"`, `data.error.status = 429`, plus `data.attempt` and `data.at` |
-| Overload | `session.retry.scheduled` | `data.error.status = 529`; the `error.type` value is QA item O2 |
+| Overload | `session.retry.scheduled` | `data.error.type = "provider.internal"`, `data.error.status = 529` (QA item O2) |
 | Usage limit | `session.step.failed`, then `session.execution.failed` | `error.type = "provider.quota"`, `error.status = 429` |
 
 - The decrease is applied on the **first retry event**, because the host retries 429 and 529 by itself and a persistent
@@ -502,13 +504,14 @@ in-flight registration for D2.
    which a launch succeeded under DF-2. The ADR claims no validity beyond the recorded age.
 5. **Unexpected interrupts.** A plan child that ends `session.execution.interrupted` without an executor cancel is
    treated as lost and re-queued, not as a failed attempt. Retained launches are awaited; C13 shows that an interrupt of
-   an active root kills foreground children, and the effect on retained-context children is unobserved (QA item O4).
+   an active root kills foreground children but not background children (they stay active and end
+   `session.execution.succeeded`; QA item O4a), and it does not kill retained-context children either: they stay active
+   and all their launches return `completed` (QA item O4b).
 6. **After a host restart (D16),** nothing launches until the orchestrator's first router tool call in the adopted
    session.
 
-**Concurrency.** C14 proved 3 concurrent retained launches. The `maxParallel` clamp of 8 assumes that retained launches
-share the host's subagent concurrency that C13 proved. QA item O3 extends C14 to 8; if that fails, the launcher A clamp
-becomes the largest count C14 proves.
+**Concurrency.** C14 proved 8 concurrent retained launches in one batch (`C14 concurrency.peakOverlapBatch1=8`; QA item
+O3), so the launcher A clamp equals the `maxParallel` clamp of 8.
 
 **Alternatives rejected.**
 
@@ -536,8 +539,8 @@ becomes the largest count C14 proves.
 - a `manual` task entering `ready` (once);
 - a stale launch context (D14, guard 3).
 
-The plan's "(launcher B) ready work" wake does not exist. The wake channel (`client.session.synthetic` with `resume`)
-is QA item O6.
+The plan's "(launcher B) ready work" wake does not exist. The wake channel `client.session.synthetic` with
+`resume: true` is proven (QA item O6); `resume: false` does not wake an idle parent.
 
 **Alternatives rejected.**
 
@@ -553,7 +556,7 @@ and its active state:
 
 | Child state | Classification | Action |
 |---|---|---|
-| Last message `{type: "idle", outcome}` | finished | Processed once. Result text from the child's assistant message (QA item O1), or else the body of the parent's completion for that child. |
+| Last message `{type: "idle", outcome}` | finished | Processed once. Result text from the last `assistant` message of the child's context (roles `user, assistant, idle`; QA item O1), or else the body of the parent's completion for that child. |
 | Active | alive | Adopted, never re-dispatched. |
 | Neither finished nor active | lost | Re-queued without counting an attempt. |
 
@@ -624,10 +627,10 @@ Each phase implements only the branch named here (plan §0.2).
 | C11: launcher B expansion point | none | `execute.before` would be the expansion point, but B is not built. C11 stays pinned because the router's `execute.before` changes to `subagent` arguments must not enter the parent's history (cache stability). |
 | C14: launcher | 3.1 (with 1.4 types) | Launcher A only: awaited native `subagent` launches from the retained router-tool context, explicit role, model, grant and work-root binding resolved in the child's first context hook, and the six guards of D14. `src/executor/types.ts` defines no launcher B types. |
 | C15: holding in compaction | 2.1 | The held placeholder is applied in the compaction hook as well as the context hook. |
-| C13: `maxParallel` clamp | 1.4, 3.1, 4.1 | Clamped to 8, validated to 1–8, default 4. Launcher A is held to C14's proven count until QA item O3 is closed. |
-| C4/C15 and D3: held results | 2.1 | Held results are possible and built. D1 may background required verification. Phase 2.1's smoke asserts the verdict delivery wake (QA item O6). |
-| C10: capacity signals | 1.1, 3.1 | Event fields: `session.retry.scheduled` `data.error.status` 429/529 and `data.error.type` (`provider.rate-limit` for 429); usage limit = `session.step.failed`/`session.execution.failed` with `error.type = "provider.quota"`. The only text pattern is `/reset at (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)/` on `error.message`. The provider comes from the preceding `session.step.started` `model.providerID`. |
-| C12/C7: recovery reads | 2.1, 4.2 | `client.session.context({sessionID: child})`: last message `{type: "idle", outcome}` means finished; the result comes from the child's assistant text, else from the parent's completion body. A child that is neither finished nor active is re-queued. Pending verifications are persisted (P5). Cancellation uses `client.session.interrupt({sessionID})`. |
+| C13: `maxParallel` clamp | 1.4, 3.1, 4.1 | Clamped to 8, validated to 1–8, default 4. Launcher A uses the same clamp: C14 proved 8 concurrent retained launches (QA item O3). |
+| C4/C15 and D3: held results | 2.1 | Held results are possible and built. D1 may background required verification. Phase 2.1's smoke asserts the verdict delivery wake; `client.session.synthetic` with `resume: true` is proven to wake an idle parent and a successful compaction with the placeholder is observed (QA items O5, O6). |
+| C10: capacity signals | 1.1, 3.1 | Event fields: `session.retry.scheduled` `data.error.status` 429/529 and `data.error.type` (`provider.rate-limit` for 429); usage limit = `session.step.failed`/`session.execution.failed` with `error.type = "provider.quota"`. The only text pattern is `/reset at (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)/` on `error.message`. The provider comes from the preceding `session.step.started` `model.providerID`. For 529 `data.error.type = "provider.internal"` (QA item O2). |
+| C12/C7: recovery reads | 2.1, 4.2 | `client.session.context({sessionID: child})`: last message `{type: "idle", outcome}` means finished; the result comes from the last `assistant` message of that context (QA item O1), else from the parent's completion body. A child that is neither finished nor active is re-queued. Pending verifications are persisted (P5). Cancellation uses `client.session.interrupt({sessionID})`. |
 | C2/C3: completion trigger and re-post | 2.1 | Triggered by the host's completion in the parent's context hook or by the child's `session.execution.*` event, whichever comes first. No re-post, no undelivered set. |
 | C8: user-backgrounded calls | 2.1 | Covered through C1: classified by result `metadata.status === "running"`, processed by D2. |
 | C1: registration | 2.1 | Register the dispatch as in flight in `execute.after`, keyed by the child session id from the acknowledgement. |
@@ -638,20 +641,26 @@ retained-context age proven under DF-2.
 
 ## Open observations (flagged for Phase 0.1 QA)
 
-Each item keeps the conservative branch chosen above until its assertion is pinned in `smoke:cpx`.
+Each item keeps the conservative branch chosen above until its assertion is pinned in `smoke:cpx`. O1–O6 are resolved
+(commit 7e5eda4: `smoke:cpx` 41/41 in three consecutive runs); O7–O10 stay open.
 
-- **O1 — C7 child final text.** `containsChildOk=true` but `finalTexts.length=0`. Pin the assistant text path. Until
-  then, recovery falls back to the parent's completion body and, failing that, re-queues.
-- **O2 — C10 overload type.** The value of `error.type` for 529 is not pinned. The host's retry limit is unobserved;
-  persistent faults were still retrying when the harness stopped.
-- **O3 — C14 concurrency.** Retained launches are proven up to 3. Extend C14 to 8 concurrent launches.
-- **O4 — Interrupting an active root.** Unobserved both for C13's background children and for C14's retained-context
-  children.
-- **O5 — C15 successful compaction.** Unobserved: every run failed on the summary template. Make the scripted summary
-  match the template. Also add the placeholder in the compaction request body as an asserted leaf (today it is only in
-  the raw `placeholderPaths`).
-- **O6 — Synthetic wake.** Whether `client.session.synthetic` with `resume: true` wakes an idle parent is unobserved. D3
-  delivery and the D15 wake channel depend on it.
+- **O1 — C7 child final text. Resolved.** The child's final text is in the last `assistant` message of
+  `context({sessionID: child})` (roles `user, assistant, idle`; `finalTexts` contains `CHILD_OK`). Recovery reads it
+  there; the parent's completion body remains the fallback and re-queue the last resort.
+- **O2 — C10 overload type. Resolved.** The 529 `session.retry.scheduled` has `data.error.type = "provider.internal"`
+  (all three runs), pinned in `smoke:cpx` C10. The host's retry limit is still unobserved (persistent faults were still
+  retrying when the harness stopped).
+- **O3 — C14 concurrency. Resolved.** One batch of 8 retained-context launches ran concurrently
+  (`peakOverlapBatch1=8`) and all completed.
+- **O4 — Interrupting an active root. Resolved.** Interrupting an active root returns `{interrupted: true}` and does not
+  kill background children (O4a: they stay active and end `session.execution.succeeded`) or retained-context children
+  (O4b: they stay active and all three launches return `completed`).
+- **O5 — C15 successful compaction. Resolved.** A compaction succeeds (record `status="completed"`). The compaction
+  request carries the placeholder at `$.messages[0].content[0].text` and not the original, and the summary has no
+  original. After compaction `session.context` shows only the compacted view; the full message log still holds the
+  original and no placeholder (`fullLog.anyApiReturnsPreCompaction=true`).
+- **O6 — Synthetic wake. Resolved.** `client.session.synthetic({sessionID, text, description, metadata, resume})` does
+  not wake an idle parent with `resume: false`; with `resume: true` it does (a new provider request carries the text).
 - **O7 — Retained-context lifetime.** Proven 60 s; hours are an assumption bounded by D14's guards and recorded age.
 - **O8 — Second cache breakpoint.** Whether the host also places a breakpoint on the second-to-last message is
   unobserved.
