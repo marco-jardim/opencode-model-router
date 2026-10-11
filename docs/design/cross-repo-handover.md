@@ -33,6 +33,39 @@ Last checks (HEAD after the round 2 fixes):
 - Goldens: all `test/golden/` pass; only the configured roles-protocol golden changed (OD5) and the new `dispatch-header.golden.test.ts` was added.
 - Full `npx vitest run`: 50 failures in 15 files, every time it ran next to a reviewer's own test runs. Every failing file passes when run alone or in small groups, except the known `test/unit/exec.test.ts` timing tests. New in the load-sensitive list: `test/integration/unattributed-writers.test.ts`, `test/integration/branch-switch.test.ts`, `test/integration/branch-switch-deferred.test.ts`, `test/unit/tree-kill.test.ts`, `test/integration/perimeter.test.ts`, `test/integration/roles-authority.test.ts`, `test/integration/failover-compose.test.ts`, `test/integration/layer2-wiring.test.ts`, `test/integration/modeB-e2e.test.ts` (possibly related to round 2 m8, the extra pin snapshots). A clean full run with nothing else running has not been done yet.
 
+## Resume here (2026-10-11, session paused by the owner)
+
+HEAD is a **WIP commit** (`fix(verify): [WIP] P2e QA round 1 fixes …`): the P2e QA round 1 fixes are half done. `src/` loads and typechecks; the tests do not all pass yet. Finish it, then squash or follow it with a fixing commit (local branch, nothing pushed).
+
+State of the WIP (verified at save time):
+- `npm run typecheck`: one error, in a test file only: `test/integration/deferred-verification.test.ts(72,31)`: `FullScopePlan | StaticScoping` is not assignable to `StaticScoping` (a test mock of `planStaticScoping` must accept the new full-scope plan type).
+- `test/integration/deferred-perimeter.test.ts` 23/23 and `test/integration/deferred-verification.test.ts` 72/72 pass.
+- Failing: `test/integration/perimeter.test.ts` › "deferred P (P2e) › P2e QA-1 #1: a working-set consumer past the cap is still discovered at router_verify (D6)"; `test/unit/risk.test.ts` › "assessRisk › reasons are stable strings" (a new risk reason was added for full scope; the stable-strings list must be updated on purpose).
+- No junction or probe file is left (`node_modules\omr-xr-dogfood-lib` absent; the scratch repository is clean).
+
+P2e QA round 1 findings (reviewer, `src/verify/wiring.ts` unless noted). Fix all; it is round 1:
+1. MAJOR: past `PERIMETER_MAX`, `perimeterAtReturn` skips fixed seeds before collecting working-set roots and links, so a capped consumer is never discovered at router_verify and a capped link target neither sets `linkUnobserved` nor enters `frozen.links`. Fix: mirror `perimeterAtGate` (collect working-set roots before the fixed skip; a fixed "unobserved" link seed sets `linkUnobserved`). *(WIP: code started; its test fails.)*
+2. minor: S11 does not notice a link in W retargeted after return; re-run `linkedTargets(W)` (fs only) at router_verify; a changed real path or a new outside link → S11 "changed".
+3. minor: `prepareClaim` replaces the dispatch's pin admission set (with nested targets) by the frozen links only → nested pins unusable; set it only when `!pinAdmissions.has(pins)`.
+4. minor (I12): `observeLink` runs git before re-checking `realpath(link.at)` against the frozen root and `admit`; check first, else "unobserved" without git.
+5. minor: an "unobserved" link drift and a non-ENOENT `realpath` error in `placementDriftOf` give a final UNVERIFIED; make them retryable.
+6. minor (docs): F13 is described wrongly (`CHANGELOG.md` ~:96, `VERIFICATION.md` ~:480, `CONFIG_REFERENCE.md` ~:554-557, ~:586-588): before, a no-change dispatch with `testScope:"full"` ran the full suite synchronously; now on v2 it defers; config `testScope` does not affect `lintClean`.
+7. nit: all-full-scope DoDs got "scoping impossible (S6)"; a neutral full-scope reason (WIP: added in `src/verify/risk.ts`).
+8. nit (docs): the `cross-repo` reason/details are never shown to anyone (only `branch-switched` is read, `index.ts` ~:2585); a refused placement or v2 tier `cwd=` never reaches `finishDeferred`. Reword the docs (VERIFICATION ~:468-471, CONFIG_REFERENCE ~:560-564, ROLES, design ~:500) or surface the reason.
+9. nit: a placement whose directory did not exist at return says "since the producer returned"; document.
+10. nit: discovery not shared across claimed entries; link snapshots digest every dirty file; a certain I3 refusal still defers; `branch-switched` early return leaves perimeter snapshots running. Record in design §9.
+
+Fan-out to resume (disjoint files; dispatch A first, then B and C in parallel, then D):
+- **A, implementer (sessionID `ses_ed50bd3fcffer1kfpPvJZ14k64` if it still exists, else fresh):** finish findings 1–5 and 7 in `src/verify/wiring.ts`, `src/verify/risk.ts`, `test/integration/{perimeter,deferred-perimeter,deferred-verification}.test.ts`, `test/unit/risk.test.ts`; fix the typecheck error and the two failing tests; then commit (follow-up to the WIP, `Refs #107`). Tell it: at most 3 reads in a row before an edit; every edit must leave `src/` loadable; router_run one call at a time.
+- **B, implementer:** docs for findings 6, 8, 9, plus the limits of finding 2 (nested links, ignored files, skip-worktree not covered by S11) in `docs/VERIFICATION.md`, `docs/CONFIG_REFERENCE.md`, `docs/ROLES.md`, `CHANGELOG.md`, `test/unit/docs-drift.test.ts`. Work file by file (read one, edit it).
+- **C, implementer:** design `docs/design/cross-repo.md` §9 "Known follow-ups (P2e QA round 1)" for findings 9 and 10; fix the design's §7 notes if A changes behaviour.
+- **D, reviewer (heavy):** P2e QA round 2 on the fix commits (after round 2 fix only blocking/critical/major). Do not run the full suite next to it.
+- Then: full `npx vitest run` with nothing else running; run each failing file alone; `test/golden`.
+- Then: live P2e dogfood (script in `docs/design/cross-repo-phase2-plan.md` pre-flight section; the junction is created with `New-Item -ItemType Junction`, removed with `cmd /c rmdir`). `src/` changes apply live, no restart needed.
+- Then: update this handover, and the P2 status comment on #107.
+
+Owner decisions taken this session: OD1–OD6 (Phase 2 plan), Q8 (D14), Q9 (D15), Q10 (D16), D17 (QA of D15), OD-P2e-1 (D18), OD-P2e-2 (D19). Still open: Q7.
+
 ## Next steps
 
 1. ~~Phase 2 live dogfood~~: done (see "Phase 2 live dogfood").
