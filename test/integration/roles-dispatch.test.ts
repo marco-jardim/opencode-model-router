@@ -373,17 +373,25 @@ describe("detection with per-check check roots (P2.5)", () => {
     expect(await detectionOf(world, "check: testsPass scope=everything")).not.toBe("deterministic");
   });
 
-  it("VERIFY:deferred (the default) with per-check keys is not deferred; without keys it is unchanged", async () => {
+  it("VERIFY:deferred (the default) with per-check keys → deferred, detection not deterministic", async () => {
     const cfg = config({ delegation: "roles", engine: "static" });
     const world = makeWorld(cfg);
     mkdirSync(join(world.main, "pkg"), { recursive: true });
     const keyed = "[acceptance]\ncheck: testsPass cwd=pkg\n[/acceptance]";
     const plain = "[acceptance]\ncheck: testsPass\n[/acceptance]";
-    expect(roleGateDeferred(cfg, `change x\n${keyed}`, "")).toBe(false);
-    expect(roleGateDeferred(cfg, `change x\n[acceptance]\ncheck: testsPass scope=full\n[/acceptance]`, "")).toBe(false);
+    expect(roleGateDeferred(cfg, `change x\n${keyed}`, "")).toBe(true);
+    expect(roleGateDeferred(cfg, `change x\n[acceptance]\ncheck: testsPass scope=full\n[/acceptance]`, "")).toBe(true);
     expect(roleGateDeferred(cfg, `change x\n${plain}`, "")).toBe(true);
-    expect(await detectionOf(world, "check: testsPass cwd=pkg", { verify: false })).toBe("deterministic");
+    expect(await detectionOf(world, "check: testsPass cwd=pkg", { verify: false })).not.toBe("deterministic");
     expect(await detectionOf(world, "check: testsPass", { verify: false })).not.toBe("deterministic");
+  });
+
+  it("a refused cwd= is still not deterministic", async () => {
+    const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+    const outside = temp("omr-p25-refused-");
+    expect(roleGateOutsideWorkRoot(world.main, `change x\n[acceptance]\ncheck: testsPass cwd=${outside}\n[/acceptance]`, "")).toBe(true);
+    expect(await detectionOf(world, `check: testsPass cwd=${outside}`)).not.toBe("deterministic");
+    expect(await detectionOf(world, `check: testsPass cwd=${outside}`, { verify: false })).not.toBe("deterministic");
   });
 
   it("roleGateOutsideWorkRoot accepts a check root in the read set and refuses it without one", () => {

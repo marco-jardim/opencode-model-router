@@ -708,7 +708,8 @@ export function roleVerificationRuns(input: {
 /**
  * QA-P21-1-2: the dispatch's verification would be deferred, exactly as the native path decides it (index.ts `isDeferred` →
  * verify/wiring.ts `isDeferred`): its `VERIFY:` directives resolve to `deferred` (the configured `defaultVerify` when the text has
- * none; the text is `dispatchDirectiveText(prompt, description)`) AND its DoD carries a `testsPass` check. A deferred dispatch
+ * none; the text is `dispatchDirectiveText(prompt, description)`) AND its DoD carries a `testsPass` check (with or without
+ * per-check `cwd=`/`scope=` keys: the classification does not depend on where a check runs). A deferred dispatch
  * returns without the gate (`router_verify` runs it later), so the router's gate cannot back a `deterministic` detection.
  * Fails toward "deferred" on any error (a weaker detection, never a stronger one). QA-P21-2 nit 3: nothing is deferred when
  * `router_verify` is not registered (`verifyEnabled: false`, index.ts `routerVerifyEnabled`): the gate then runs at the return.
@@ -722,10 +723,7 @@ export function roleGateDeferred(cfg: RouterConfig, prompt: string, description:
       defaultVerify: budget.defaultVerify, captureWaitMs: budget.captureWaitMs, baselineTimeoutMs: budget.baselineTimeoutMs,
     });
     if (directives.mode !== "deferred") return false;
-    const checks = buildDelegationDoD({ prompt, description }).checks;
-    // P2.5 (SD8, interim): a DoD with per-check keys (`cwd=`/`scope=`) is never classified as deferred.
-    if (checks.some((check) => check.cwd !== undefined || check.scope !== undefined)) return false;
-    return checks.some((check) => check.kind === "testsPass");
+    return buildDelegationDoD({ prompt, description }).checks.some((check) => check.kind === "testsPass");
   } catch {
     return true;
   }
