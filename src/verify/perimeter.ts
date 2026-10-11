@@ -29,6 +29,7 @@ import { permissionMatches } from "../router/read-only";
 import { routedRoleOf } from "../routing/wire/dispatch";
 import { workingSetOf } from "../routing/wire/working-set";
 import type { DispatchPerimeter, PerimeterSeed } from "./dispatch";
+import { depthBelow, gitTopOf, perimeterKey } from "./git-top";
 import { isStoreLikeLink } from "./reference";
 
 /** P holds at most this many snapshotted roots, W included. */
@@ -42,24 +43,13 @@ export interface PerimeterAdmission {
   readonly exclude?: readonly string[];
 }
 
-/** A comparison key: absolute, "/" separators, no trailing separator, case-folded on win32. */
-export function perimeterKey(at: string): string {
-  const normalized = path.resolve(at).replace(/\\/g, "/").replace(/\/+$/, "");
-  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
-}
+/** A comparison key (moved to `git-top.ts` with `gitTopOf`; re-exported for existing importers). */
+export { perimeterKey };
 
 function insideOrEqual(child: string, parent: string): boolean {
   const c = perimeterKey(child);
   const p = perimeterKey(parent);
   return c === p || c.startsWith(`${p}/`);
-}
-
-/** How many segments `child` lies below `parent`: 0 when equal, -1 when not inside. */
-function depthBelow(child: string, parent: string): number {
-  const c = perimeterKey(child);
-  const p = perimeterKey(parent);
-  if (c === p) return 0;
-  return c.startsWith(`${p}/`) ? c.slice(p.length + 1).split("/").length : -1;
 }
 
 function readNames(dir: string): string[] {
@@ -109,26 +99,6 @@ function linkedTargets(w: string): string[] {
     if (!targets.has(perimeterKey(real))) targets.set(perimeterKey(real), real);
   }
   return [...targets.values()];
-}
-
-/**
- * QA-1 F3: the git top level of `dir` found without git: the nearest directory at or above it holding a `.git` entry (a
- * directory, or a worktree's or submodule's `.git` file), strictly below `ceiling` when given. Undefined when there is none.
- */
-function gitTopOf(dir: string, ceiling?: string): string | undefined {
-  let current = path.resolve(dir);
-  for (;;) {
-    if (ceiling !== undefined && !(depthBelow(current, ceiling) >= 1)) return undefined;
-    try {
-      lstatSync(path.join(current, ".git"));
-      return current;
-    } catch {
-      // No `.git` here: keep walking up.
-    }
-    const up = path.dirname(current);
-    if (up === current) return undefined;
-    current = up;
-  }
 }
 
 /** QA-1 F11: the git common directory of the repository whose top level is `top`, read without git; undefined when unknown. */

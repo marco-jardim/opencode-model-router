@@ -112,6 +112,14 @@ export interface VerificationScope {
 }
 
 /**
+ * Cross-repo P2.2 (SD2): the root the change capture of a dispatch observes — a role dispatch's work root W (even when the
+ * block's `cwd:` names a subdirectory of it, or was refused), else (a tier dispatch) the verification cwd, as before.
+ */
+export function captureRootOf(scope: VerificationScope): string | undefined {
+  return scope.workRoot ?? scope.cwd;
+}
+
+/**
  * #84 P3.3 DF2-F1: where a dispatch is verified. No root (a tier dispatch): the explicit `cwd`, exactly as before (I1). A role
  * dispatch's verification root (its bound work root, else its canonical session directory: QA-P33F1-1-1, 1-3): no `cwd` → the root;
  * a `cwd` (relative ones joined to the root) is canonicalised and contained by P2.3's rule ({@link canonicalAuthorityPath},

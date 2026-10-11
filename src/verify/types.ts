@@ -8,6 +8,27 @@ import type { DispatchReference, InexactReason } from "./reference";
 
 export type VerifyMethod = "deterministic" | "checker" | "none";
 
+/**
+ * Cross-repo P2.2: where one check of a role dispatch runs. `cwd` is canonical; `top` is the git top level of `cwd` (undefined
+ * when unknown); `foreign` is set when that top differs from the top of the dispatch's work root; `scope` is the check's
+ * normalized `scope=` key.
+ */
+export interface CheckPlacement {
+  readonly cwd: string;
+  readonly top: string | undefined;
+  readonly foreign: boolean;
+  readonly scope?: "affected" | "full";
+}
+
+/**
+ * The placements of a DoD's checks, index-aligned with `dod.checks` (undefined for a check with neither `cwd=` nor `scope=`);
+ * absent when no check has a key. `refused` names the first check whose key is not accepted.
+ */
+export interface PlacementResolution {
+  readonly placements?: readonly (CheckPlacement | undefined)[];
+  readonly refused?: { readonly index: number; readonly kind: string; readonly text: string; readonly why: "outside" | "scope" };
+}
+
 export interface Verdict {
   pass: boolean;
   /** Absent on legacy verdicts: derive from pass. Unverifiable is not failure. */
