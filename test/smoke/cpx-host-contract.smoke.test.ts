@@ -635,8 +635,14 @@ d("C6 one-hour cache hint set by a plugin in the context hook", () => {
         branch: wireMissing.length === 0 && targetsMissing.length === 0 ? "all breakpoints 1h in prefix order"
           : `${wireMissing.includes("tools") ? "tools breakpoint cannot carry 1h: " : "some breakpoint cannot carry 1h: "}${[...targetsMissing, ...wireMissing.map(k => `${k} has no 1h marker on the wire`)].join("; ")}`,
       };
-      o.observed.providerCarriesOneHourOnSystem = at(variants, "system", "oneHourOnSystem");
-      o.observed.providerCarriesOneHourOnMessage = at(variants, "message", "oneHourOnMessage");
+      // QA-0.1-23a: "in both requests" is computed PER REQUEST (every one of the >= 2 parent requests carries the 1 h marker), not "in some request" (`variants.<v>.oneHourOnSystem` stays the some-request record).
+      const inEveryRequest = (variant: string, key: string): boolean => { const rs = list(at(variants, variant, "requests")); return rs.length >= 2 && rs.every(r => at(r, key) === true); };
+      o.observed.providerCarriesOneHourOnSystem = inEveryRequest("system", "oneHourOnSystem");
+      o.observed.providerCarriesOneHourOnMessage = inEveryRequest("message", "oneHourOnMessage");
+      o.observed.oneHourPerRequest = {
+        system: list(at(variants, "system", "requests")).map(r => ({ index: at(r, "index"), oneHourOnSystem: at(r, "oneHourOnSystem") })),
+        message: list(at(variants, "message", "requests")).map(r => ({ index: at(r, "index"), oneHourOnMessage: at(r, "oneHourOnMessage") })),
+      };
       o.observed.providerCarriesOneHourAnywhere = at(variants, "system", "oneHourAnywhere") === true || at(variants, "message", "oneHourAnywhere") === true;
     });
   }, 600_000);
@@ -844,7 +850,7 @@ d("C9 tool hooks: execute.before paths, execute.after result rewriting", () => {
           const modelText = seen ? toolResultText(seen) : undefined;
           const advertised = defs.has(tool);
           perTool[tool] = {
-            advertised, inputSent: input, promptError, callID, selectedBy, toolResultIdsInSelected: seen ? toolResultIds(seen) : [],
+            advertised, inputSent: input, promptError, callID, selectedBy, selectedByToolUseId: selectedBy === "tool_use_id", toolResultIdsInSelected: seen ? toolResultIds(seen) : [],
             // QA-0.1-9: for a tool the host does not advertise the input keys are the test's own input, not an observation: recorded as unobserved.
             executeBefore: before
               ? (advertised ? { argKeys: before.argKeys, args: before.args, agent: before.agent } : { argKeys: null, args: null, agent: before.agent, inputKeysUnobserved: true, reason: "the host does not advertise this tool in this fixture, so the arguments are the test's own input" })
@@ -952,7 +958,9 @@ d("C10 provider errors: 429, 529 and usage limit", () => {
             },
             stepStartedCount: events.filter(e => e.type === "session.step.started").length, stepStartedBeforeRetry,
             kind: c.kind, mode: c.mode, capMs: c.capMs, promptedAt, resetAt: c.kind === "usage-limit" ? new Date(resetAtMs).toISOString() : undefined,
-            outcome: stillRetrying ? "still retrying at the cap (faults cleared, root interrupted)" : terminal?.kind, rootIdleAfter: idle === true,
+            outcome: stillRetrying ? "still retrying at the cap (faults cleared, root interrupted)" : terminal?.kind, stillRetryingAtCap: stillRetrying, rootIdleAfter: idle === true,
+            // QA-0.1-23i: recorded only, never asserted: the gaps between the root's provider requests (the host's retry delays) against the provider's `retry-after: 2`.
+            providerRetryAfterSeconds: 2, retryDelaysMs: requests.slice(1).map((r, i) => { const x = arrivals.get(r.index); const p = arrivals.get(requests[i]!.index); return x !== undefined && p !== undefined ? x - p : null; }),
             turnCompleted: json(stored).includes("CHILD_OK"), terminal: terminal ? lineBrief(terminal) : null,
             providerRequests: requests.map((r, i) => {
               const at = arrivals.get(r.index);
@@ -1084,6 +1092,9 @@ d("C11 stored parent history keeps the subagent arguments the model wrote", () =
 });
 
 // ---------------------------------------------------------------------------- C12 ----
+/** QA-0.1-24c: how long C12 waits for an event that is expected NOT to happen (B's terminal event, a parent wake / B's envelope after the restart). Each such wait is a guaranteed timeout, so it is the
+ *  minimum that still proves the absence on a relaunched, released host: 10 s is far above the milliseconds a child needs to finish here (A ends in < 1 s once released), and the previous 45 s / 30 s bought nothing. */
+const B_ABSENCE_WAIT_MS = 10_000;
 d("C12 background children in flight across a host restart", () => {
   it("releases child A right before restart() and child B after the relaunch and records what each delivers", async () => {
     await observeContract("C12", async o => {
@@ -1108,9 +1119,16 @@ d("C12 background children in flight across a host restart", () => {
         const aTerminalBefore = aID ? await tryWait("child A's terminal probe line before the restart", async () => terminalOf(await probeLines(s.probeFile), aID), 45_000) : undefined;
         if (aTerminalBefore) o.relied.push(aTerminalBefore);
         const aEnvelopeBefore = aID ? await tryWait("child A's completion envelope stored in the parent before the restart", async () => { const v = await storedView(host, root); return envelopeStates(v.envelopes).some(e => e.sessionID === aID) ? v : undefined; }, 45_000) : undefined;
+        // QA-0.1-24b: the probe's first `loaded` line (before the restart) and the pid it records; after `restart()` a SECOND `loaded` line with a different pid proves the relaunched host runs a new process
+        // (and its plugin instance loaded) before anything is asserted about B.
+        const loadedBefore = (await probeLines(s.probeFile)).filter(l => l.kind === "loaded");
+        const pidBefore = loadedBefore[0]?.pid;
         const restartStartedAt = Date.now();
         await host.restart();
         const restartEndedAt = Date.now();
+        const loadedAfter = await tryWait("a second probe `loaded` line with a new pid after the restart", async () => (await probeLines(s.probeFile)).filter(l => l.kind === "loaded").find(l => l.t >= restartStartedAt && l.pid !== undefined && l.pid !== pidBefore), 30_000);
+        if (loadedAfter) o.relied.push(loadedAfter);
+        o.observed.restartProcess = { pidBefore, pidAfter: loadedAfter?.pid, loadedLinesBefore: loadedBefore.length, secondLoadedSeen: loadedAfter !== undefined, newProcess: pidBefore !== undefined && loadedAfter !== undefined && loadedAfter.pid !== pidBefore };
         gates.release("C12_B");
         const bReleasedAt = Date.now();
         o.observed.timing = {
@@ -1122,7 +1140,9 @@ d("C12 background children in flight across a host restart", () => {
         for (const t of gates.tokens) {
           const id = ids[t];
           if (!id) { perChild[t] = { error: "no sessionID" }; continue; }
-          const end = await tryWait(`terminal event of ${t} after the restart`, async () => terminalOf(await probeLines(s.probeFile), id), 45_000);
+          // QA-0.1-24c: child A's terminal line already exists (awaited above), so this returns at once for A; B's wait is a guaranteed timeout (the restart killed its session),
+          // so it is the minimum that still shows "no terminal event for B" on a released, relaunched host: B_ABSENCE_WAIT_MS (10 s), not the 45 s of a normal wait.
+          const end = await tryWait(`terminal event of ${t} after the restart`, async () => terminalOf(await probeLines(s.probeFile), id), B_ABSENCE_WAIT_MS);
           if (end) o.relied.push(end);
           const context = await host.client.session.context({ sessionID: id }).then(c => c, error => ({ error: String(error) }));
           perChild[t] = {
@@ -1133,8 +1153,8 @@ d("C12 background children in flight across a host restart", () => {
           };
         }
         o.observed.perChild = perChild;
-        const woke = await tryWait("a parent request after the restart", () => parentRequests(host, root)[parentRequestsBefore], 30_000);
-        const stored = await tryWait("completion envelopes of both children", async () => { const v = await storedView(host, root); return envelopeStates(v.envelopes).length >= 2 ? v : undefined; }, 30_000);
+        const woke = await tryWait("a parent request after the restart", () => parentRequests(host, root)[parentRequestsBefore], B_ABSENCE_WAIT_MS);
+        const stored = await tryWait("completion envelopes of both children", async () => { const v = await storedView(host, root); return envelopeStates(v.envelopes).length >= 2 ? v : undefined; }, B_ABSENCE_WAIT_MS);
         const after = stored ?? await storedView(host, root);
         // The wake request (first parent request after the pre-release snapshot) against the restart window; arrival stamps come from `Gates` (front delayMs, same clock).
         const wakeAt = woke ? gates.stamps.get(woke.index) : undefined;
@@ -1142,6 +1162,12 @@ d("C12 background children in flight across a host restart", () => {
         const carriesA = (r: CpxRequest): boolean => envelopeStates(bodyMessages(r)).some(e => e.sessionID === aID);
         // Wire deliveries of A's completion = parent requests that carry A's envelope although the previous parent request did not (a re-sent history is not a new delivery).
         const aWireDeliveries = allParentRequests.filter((r, i) => carriesA(r) && (i === 0 || !carriesA(allParentRequests[i - 1]!))).length;
+        // QA-0.1-24a: "delivered once" is measured on the LAST parent provider request (the history the model finally sees): A's completion must occur in it exactly once.
+        // A parent wake FOR A after the restart = a parent request that arrived at/after the restart start AND newly carries A's envelope (its predecessor did not).
+        const lastParent = allParentRequests.at(-1);
+        const aOccurrencesInLastParentRequest = lastParent ? envelopeStates(bodyMessages(lastParent)).filter(e => e.sessionID === aID).length : 0;
+        const aWakesAfterRestart = allParentRequests.filter((r, i) => (gates.stamps.get(r.index) ?? 0) >= restartStartedAt && carriesA(r) && (i === 0 || !carriesA(allParentRequests[i - 1]!))).map(r => r.index);
+        o.observed.parentAfterRestart = { lastParentRequestIndex: lastParent?.index, aOccurrencesInLastParentRequest, aWakesAfterRestart, parentRequestsArrivedAfterRestart: allParentRequests.filter(r => (gates.stamps.get(r.index) ?? 0) >= restartStartedAt).map(r => r.index) };
         o.observed.parent = {
           wokeBeforeRestart: wakeAt !== undefined && wakeAt < restartStartedAt, wokeAfterRestart: wakeAt !== undefined && wakeAt >= restartStartedAt, wakeArrivedAt: wakeAt, wakeRequestIndex: woke?.index,
           aEnvelopesStored: envelopeStates(after.envelopes).filter(e => e.sessionID === aID).length, aWireDeliveries, aWireRequestsCarrying: allParentRequests.filter(carriesA).map(r => r.index),
@@ -1264,6 +1290,8 @@ const retainedHostOptions = (overrides: Partial<HostOptions> = {}): HostOptions 
     await writeFile(path.join(project, MOVED_DIR, RETAINED_NAME), `${MOVED_MARKER}\n`);
   }, ...overrides,
 });
+/** Text of the router's duplicate-read guard refusal (ADR 0007 C14). */
+const DUPLICATE_READ_REFUSAL = /DENIED: you already ran this exact read/;
 /** Per retained child: the agent / model it ACTUALLY ran with (session record, provider request headers and bodies), the tool results the model got back, and the router-only
  * observable: a router guard refusal text (`DENIED: …`) in a tool result, which only the router can produce (the control host without the router never shows one). */
 async function childContracts(host: RoutingHost, ids: readonly string[]): Promise<Obj[]> {
@@ -1272,11 +1300,13 @@ async function childContracts(host: RoutingHost, ids: readonly string[]): Promis
     const mine = front(host).requests.filter(r => hdr(r, "x-proof-session") === id && hdr(r, "x-proof-kind") === "primary");
     const results = mine.filter(r => lastIsToolResult(r)).map(r => toolResultText(r));
     const refusals = results.filter(t => /DENIED:|Refused/.test(t));
+    // QA-0.1-23f: the duplicate-read guard's own text (ADR 0007 C14: `DENIED: you already ran this exact read …`), counted separately from any other refusal.
+    const duplicateReadRefusals = results.filter(t => DUPLICATE_READ_REFUSAL.test(t));
     const session = await host.client.session.get({ sessionID: id }).then(g => ({ agent: g.agent, parentID: g.parentID, model: g.model ? ref(g.model) : undefined }), error => ({ error: String(error) }));
     return {
       sessionID: id, session, wireModels: [...new Set(mine.map(r => str(obj(r.body).model)))], catalogModels: [...new Set(mine.map(r => hdr(r, "x-proof-model")))],
       providerRequests: mine.length, toolResults: results.length, toolResultSamples: results.slice(0, 3).map(t => t.slice(0, 160)),
-      routerRefusals: refusals.length, firstRefusal: refusals[0]?.slice(0, 300),
+      routerRefusals: refusals.length, duplicateReadRefusals: duplicateReadRefusals.length, firstRefusal: refusals[0]?.slice(0, 300),
       readHooksBefore: hooks.filter(h => h.sessionID === id && h.hook === "before" && h.tool === "read").length,
       readHooksAfterOk: hooks.filter(h => h.sessionID === id && h.hook === "after" && h.tool === "read" && h.status === "completed").length,
     };
@@ -1432,6 +1462,14 @@ d("C14 launch with a retained tool context outside any LLM tool call", () => {
         };
         const kids = await host.children(root);
         o.observed.parentHistory = { ...history, unchangedAcrossLaunches: json(history.afterCaptureTurn) === json(history.afterBatch1) && json(history.afterBatch1) === json(history.afterBatch2), childrenListedUnderRoot: kids.map(k => ({ id: k.id, parentID: k.parentID, agent: k.agent })), session: await sessionState(host, root) };
+        // QA-0.1-23g positive control (last step, so it changes neither the parent history nor the children list recorded above): this very host (same router, same decision log) writes
+        // decision rows for an ORDINARY subagent call made by the root; only then does `routerDecisionRows === 0` for the retained children mean "the retained launch is invisible to the
+        // router" and not "this host writes no decision rows at all".
+        const rowsBeforeControl = (await host.decisionRows()).length;
+        const controlCall = await host.call(root, "subagent", childInput("C14POS", false));
+        const rowsAfterControl = await host.decisionRows();
+        const controlRows = rowsAfterControl.filter(row => (controlCall.childID !== undefined && json(row).includes(controlCall.childID)) || json(row).includes(controlCall.callID));
+        o.observed.decisionRowControl = { childID: controlCall.childID, callID: controlCall.callID, rowsTotalBefore: rowsBeforeControl, rowsTotalAfter: rowsAfterControl.length, rowsForOrdinaryCall: controlRows.length, sample: clip(controlRows[0], 500) };
       }, retainedHostOptions(), retainedEnv);
       // QA-2a CONTROL: the same launch on a host WITHOUT the router. Anything the router adds to a retained child (guard refusals) is absent here.
       o.observed.control = await lightRetained(o, "C14-control", retainedHostOptions({ withoutRouter: true }), {}, 60_000);
@@ -1759,6 +1797,18 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
       const v = at(variants, name);
       check(o, "C5/D4", at(v, "wire", "firstMarkerSent") === true && at(v, "wire", "secondMarkerSent") === true && at(v, "storedHasMarker") === false && at(v, "wire", "firstMarkerStillInSecond") === false, `C5 ${name} tail: a context-hook tail must be sent to the provider, must not be stored and must be absent from the next request; the turn-state tail design (D4) rests on it`);
     }
+    // QA-0.1-23b: per request, at most 4 marker occurrences in total, and for the message-tail variants (user / newest / userHint) exactly ONE message carries a marker.
+    // The system variant puts its marker in the system field: its message-marker count is recorded in the message, not asserted.
+    for (const name of ["system", "user", "newest", "userHint"]) {
+      for (const which of ["firstMarkerPaths", "secondMarkerPaths"]) {
+        const paths = list(at(variants, name, "wire", which)).map(String);
+        const messageIndexes = new Set(paths.map(p => /^\$\.messages\[(\d+)\]/.exec(p)?.[1]).filter((x): x is string => x !== undefined));
+        const where = `${name}.${which === "firstMarkerPaths" ? "request 1" : "request 2"}: ${paths.length} marker(s) at ${json(paths)}`;
+        check(o, "C5/D4", paths.length >= 1 && paths.length <= 4, `${where}; a request must carry between 1 and 4 tail markers (the probe appends one tail; the host may mirror it, but never more than four)`);
+        if (name === "system") check(o, "C5/D4", true, `${where}; messages with a marker: ${messageIndexes.size} (recorded only: the system variant's tail is in the system field, not on a message)`);
+        else check(o, "C5/D4", messageIndexes.size === 1, `${where}; exactly one message must carry the marker (found ${messageIndexes.size})`);
+      }
+    }
     const user = at(variants, "user");
     const first = at(user, "parentRequests", 0);
     const markerIndex = Number(list(at(first, "markerAt"))[0]);
@@ -1782,8 +1832,8 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
     // The plugin API's own lever is the part field `cache: {type, ttlSeconds}` (SystemPart / TextPart, @opencode/ai schema/messages.d.ts + options.d.ts);
     // the Anthropic protocol maps ttlSeconds >= 3600 to `cache_control {type: "ephemeral", ttl: "1h"}` (protocols/anthropic-messages.js).
     check(o, "C6/D5", at(ob, "variants", "system", "hintsApplied") === true && at(ob, "variants", "message", "hintsApplied") === true, "the probe must be able to set `cache` on the last system part and on the last text part of the last message in the context hook (no lever => D5 stays withdrawn)");
-    check(o, "C6/D5", at(ob, "providerCarriesOneHourOnSystem") === true, "D5 decision: a `cache: {type: ephemeral, ttlSeconds: 3600}` hint on the last system part must reach the provider as cache_control ttl 1h on the system block; if it does not, D5 stays withdrawn (re-decide D5 from variants.system in C6.json)");
-    check(o, "C6/D5", at(ob, "providerCarriesOneHourOnMessage") === true, "D5 decision: the same hint on the last text part of the last message must reach the provider as cache_control ttl 1h on that message block; if it does not, re-decide D5 from variants.message in C6.json");
+    check(o, "C6/D5", at(ob, "providerCarriesOneHourOnSystem") === true, "D5 decision: a `cache: {type: ephemeral, ttlSeconds: 3600}` hint on the last system part must reach the provider as cache_control ttl 1h on the system block in EVERY one of the (>= 2) parent requests (oneHourPerRequest.system); if it does not, D5 stays withdrawn (re-decide D5 from variants.system in C6.json)");
+    check(o, "C6/D5", at(ob, "providerCarriesOneHourOnMessage") === true, "D5 decision: the same hint on the last text part of the last message must reach the provider as cache_control ttl 1h on that message block in EVERY one of the (>= 2) parent requests (oneHourPerRequest.message); if it does not, re-decide D5 from variants.message in C6.json");
     // QA-0.1-17: the host keeps 5-minute markers on the last tool and the first system part; the provider wants longer TTLs before shorter ones (tools -> system -> messages).
     // The "all" variant sets 1 h on the first + last system part, the last tool and the last message. When every one of them reached the wire as 1 h, the order must be monotonic;
     // otherwise the branch (what cannot carry 1 h, and why) is recorded in observed.oneHourLayout.branch and is not a failure of this check.
@@ -1833,8 +1883,10 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
     for (const tool of Object.keys(obj(at(ob, "perTool")))) {
       check(o, "C9/D7", at(ob, "perTool", tool, "promptError") === undefined, `${tool}: the scripted tool call's prompt must complete without error (promptError: ${String(at(ob, "perTool", tool, "promptError")).slice(0, 200)})`);
     }
+    // QA-0.1-10: no fallback. The request that carried the call's result must be the one whose tool_result.tool_use_id is the call id; the "first-after-start" guess stays recorded
+    // in perTool.<tool>.selectedBy but FAILS this check, so "what the model saw" is never read from a request that merely arrived later.
     for (const tool of ["glob", "grep"]) {
-      check(o, "C9/D7", at(ob, "perTool", tool, "selectedBy") !== null && at(ob, "perTool", tool, "selectedBy") !== undefined, `${tool}: the provider request that carried the call's result must be identified (by tool_use_id, else first after the call started); "what the model saw" is read from it`);
+      check(o, "C9/D7", at(ob, "perTool", tool, "selectedBy") === "tool_use_id" && at(ob, "perTool", tool, "selectedByToolUseId") === true, `${tool}: the provider request that carried the call's result must be identified by tool_use_id === the call id (selectedBy ${String(at(ob, "perTool", tool, "selectedBy"))}; "first-after-start" is recorded but not accepted); "what the model saw" is read from that request`);
     }
     for (const tool of ["glob", "grep"]) {
       check(o, "C9/D7", at(ob, "perTool", tool, "filter", "mutable") === true && Number(at(ob, "perTool", tool, "filter", "removedLines")) >= 1 && at(ob, "perTool", tool, "filter", "sawLeasedFull") === true, `${tool}: execute.after must be able to rewrite the result (search filtering): the full pre-filter text held the leased line and the probe removed it`);
@@ -1863,9 +1915,12 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
       check(o, "C10/D13", list(at(c, "retryScheduled")).length >= 2 && at(c, "retryScheduled", 0, "error", "status") === status, `${name}: a persistent fault must keep producing session.retry.scheduled (status ${status})`);
     }
     // QA-0.1-7b: the claim is scoped to the observation window; the host may still fail the step later.
-    for (const name of ["rate-limit-persistent"]) {
+    // QA-0.1-23c: the same window claim for BOTH persistent faults (429 and 529): neither a step.failed nor any terminal execution event within the window.
+    // QA-0.1-23i: the retry delays are only RECORDED (cases.<name>.retryDelaysMs; observed 2.4 s .. 12 s with the provider's retry-after 2): the host's backoff does not follow the provider's answer and nothing here asserts it does.
+    for (const name of ["rate-limit-persistent", "overloaded-persistent"]) {
       const windowMs = Number(at(kase(name), "observationWindowMs"));
       check(o, "C10/D13", windowMs === PERSISTENT_WINDOW_MS && list(at(kase(name), "stepFailed")).length === 0, `${name}: a persistent fault must not produce session.step.failed — no step.failed within ${PERSISTENT_WINDOW_MS} ms (the observation window; nothing is claimed beyond it, so D13 must not rely on the host giving up on its own)`);
+      check(o, "C10/D13", windowMs === PERSISTENT_WINDOW_MS && at(kase(name), "terminal") === null && at(kase(name), "stillRetryingAtCap") === true, `${name}: a persistent fault must produce no terminal execution event (succeeded / failed / interrupted) within ${PERSISTENT_WINDOW_MS} ms — the turn is still retrying at the cap (observed: ${String(at(kase(name), "outcome"))}); nothing is claimed beyond the window`);
     }
     const quota = kase("usage-limit-until-reset");
     const parsed = at(quota, "stepFailedParsed", 0);
@@ -1888,6 +1943,12 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
     check(o, "C10/D13", at(observed, "retryHook", "available") === true && list(at(observed, "retryHook", "calls")).length >= 1 && at(firstCall, "errorStatus") === 429 && list(at(firstCall, "decisionKeys")).includes("retry") && at(observed, "outcome") === TERMINAL.ok, "session.hook(\"retry\") must be registrable and be called for a retryable 429 with error.status 429 and a `decision` carrying `retry` (observe only: the turn still completes)");
     const quotaObserved = kase("usage-limit-retry-observe");
     check(o, "C10/D13", at(quotaObserved, "classification") === "provider.quota" && at(quotaObserved, "retryHook", "available") === true, `usage limit with the retry hook registered: still classified provider.quota (the hook was called ${list(at(quotaObserved, "retryHook", "calls")).length} time(s) for it; see retryHook.calls)`);
+    // QA-0.1-23d: on a usage limit the hook receives the host's own decision already set to {retry: false}; and the provider's response headers never reach the surfaced error (every usage-limit case).
+    check(o, "C10/D13", list(at(quotaObserved, "retryHook", "calls")).length >= 1 && list(at(quotaObserved, "retryHook", "calls")).every(x => at(x, "decisionReceived", "retry") === false), `usage limit with the retry hook registered: the hook must be called and receive the decision {retry: false} (calls ${list(at(quotaObserved, "retryHook", "calls")).length}, decisions received ${json(list(at(quotaObserved, "retryHook", "calls")).map(x => at(x, "decisionReceived")))}); if it receives retry:true the host would retry a quota error and D13 must stop it itself`);
+    for (const name of Object.keys(EXPECTED_CLASSIFICATION)) {
+      const headerFields = list(at(kase(name), "resetRecoverable", "responseFields")).filter(f => /\.(headers|response|responseHeaders)$/i.test(String(at(f, "path"))));
+      check(o, "C10/D13", headerFields.length === 0, `${name}: the provider's response headers must NOT reach the surfaced error (step.failed / session.retry.scheduled error carry no headers / response field; found ${json(headerFields)}); D13 therefore reads the reset time from the message text only — if headers appear, re-decide where the reset time is read`);
+    }
     const stopCase = kase("rate-limit-persistent-retry-stop");
     const stopCalls = list(at(stopCase, "retryHook", "calls"));
     const stopFailed = list(at(stopCase, "stepFailedParsed"));
@@ -1914,17 +1975,24 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
     check(o, "C12/D2", (at(ob, "parent", "wokeBeforeRestart") === true) !== (at(ob, "parent", "wokeAfterRestart") === true), "the parent must be woken for A's completion exactly once, classified as wokeBeforeRestart xor wokeAfterRestart (see parent.wakeArrivedAt vs timing.restartStartedAt)");
     check(o, "C12/D2", envelopes.some(e => at(e, "sessionID") === a && at(e, "state") === "completed") && at(ob, "parent", "aEnvelopesStored") === 1, "A's completion must be stored exactly once as `completed` across the restart (D2 dedupes against the persisted store)");
     check(o, "C12/D2", at(ob, "parent", "aWireDeliveries") === 1, "A's completion must reach the model (a provider request newly carrying A's envelope) exactly once across the restart; a second delivery means the host re-processes a stored completion after a restart and D2 must dedupe");
+    // QA-0.1-24a: "delivered once" measured on the LAST parent provider request (the history the model finally sees), and no parent wake for A after the restart.
+    check(o, "C12/D2", at(ob, "parentAfterRestart", "aOccurrencesInLastParentRequest") === 1, `A's completion must occur exactly once in the LAST parent provider request (request ${String(at(ob, "parentAfterRestart", "lastParentRequestIndex"))}; occurrences ${String(at(ob, "parentAfterRestart", "aOccurrencesInLastParentRequest"))}); 0 = never delivered, 2+ = duplicated history`);
+    check(o, "C12/D2", Array.isArray(at(ob, "parentAfterRestart", "aWakesAfterRestart")) && list(at(ob, "parentAfterRestart", "aWakesAfterRestart")).length === 0, `no parent provider request that newly carries A's completion may arrive after the restart started (found: ${json(at(ob, "parentAfterRestart", "aWakesAfterRestart"))}); a post-restart wake for A means the host re-delivers a stored completion and D2 must dedupe`);
+    // QA-0.1-24b: B is only judged once the relaunched host is a NEW process whose probe plugin loaded (a second `loaded` line with a different pid).
+    check(o, "C12/D16", at(ob, "restartProcess", "newProcess") === true, `after restart() the probe must log a second \`loaded\` line from a different process (pid before ${String(at(ob, "restartProcess", "pidBefore"))}, after ${String(at(ob, "restartProcess", "pidAfter"))}); otherwise the assertions about B describe a host that never restarted`);
   },
   C13: o => {
     const ob = o.observed;
     for (const n of [6, 8]) {
       const c = at(ob, "concurrency", `n${n}`);
       check(o, "C13/D13", at(c, "allArrived") === true && at(c, "peakWaiting") === n && list(at(c, "ackStatuses")).every(s => s === "running"), `n=${n}: all ${n} background children must be acknowledged running and be waiting at the provider at once (peakWaiting ${n}); D13 clamps maxParallel to 8`);
-      check(o, "C13/D13", at(c, "allEnded") === true && list(at(c, "terminalKinds")).every(k => k === TERMINAL.ok), `n=${n}: all children must finish succeeded`);
+      // QA-0.1-23h: `every` over an empty list is true, so the children list must be non-empty (exactly the n children that were held) before "all finished succeeded" means anything.
+      check(o, "C13/D13", at(c, "childSessions") === n && list(at(c, "terminalKinds")).length === n, `n=${n}: the host's children list for the root must contain the ${n} children (childSessions ${String(at(c, "childSessions"))}, terminalKinds ${list(at(c, "terminalKinds")).length}); an empty list would make "all finished succeeded" vacuous`);
+      check(o, "C13/D13", at(c, "allEnded") === true && list(at(c, "terminalKinds")).length > 0 && list(at(c, "terminalKinds")).every(k => k === TERMINAL.ok), `n=${n}: all children must finish succeeded`);
     }
     const bg = at(ob, "parentInterrupt", "background");
     check(o, "C13/D14", at(bg, "interrupt", "result", "interrupted") === false && at(bg, "afterInterrupt", "activeChildren") === 3, "interrupting an IDLE parent must report interrupted=false and leave its 3 background children running");
-    check(o, "C13/D14", at(bg, "allEndedAfterRelease") === true && list(at(bg, "perChild")).every(c => at(c, "terminal", "kind") === TERMINAL.ok), "after an idle-root interrupt the background children must still finish succeeded");
+    check(o, "C13/D14", at(bg, "allEndedAfterRelease") === true && list(at(bg, "perChild")).length === 3 && list(at(bg, "perChild")).every(c => at(c, "terminal", "kind") === TERMINAL.ok), "after an idle-root interrupt the background children must still finish succeeded");
     const fg = at(ob, "parentInterrupt", "foreground");
     check(o, "C13/D14", at(fg, "interrupt", "result", "interrupted") === true && list(at(fg, "perChild")).length === 3 && list(at(fg, "perChild")).every(c => at(c, "terminal", "kind") === TERMINAL.interrupted), "interrupting an ACTIVE root with foreground children must interrupt all 3 children");
     const act = at(ob, "parentInterrupt", "background-active");
@@ -1945,6 +2013,10 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
     check(o, "C14/D14", at(hooks, "childPromptCanTriggerTool") === true && Number(at(hooks, "harnessHookRecordsForChildren")) > 0 && list(at(hooks, "perChild")).length === RETAINED_COUNT * 2 && list(at(hooks, "perChild")).every(c => list(at(c, "probeBefore")).some(b => at(b, "tool") === "read")), "the retained-context children's own tool calls must fire the tool hooks (the probe's execute.before, the harness probe's records) for every child; the router-only part is asserted separately through the guard refusals");
     check(o, "C14/D14", at(hooks, "subagentHooksOnRootAfterCapture") === 0, "a retained-context launch must fire no subagent hook on the root");
     const perChildHooks = list(at(hooks, "perChild"));
+    // QA-0.1-23g positive control: the same host writes decision rows for an ordinary subagent call, so "0 rows for the retained children" below is a real absence.
+    check(o, "C14/D14", Number(at(ob, "decisionRowControl", "rowsForOrdinaryCall")) >= 1, `positive control: an ordinary subagent call made by the root in this same host must produce at least one router decision row (rows for it: ${String(at(ob, "decisionRowControl", "rowsForOrdinaryCall"))}); if this host writes none, routerDecisionRows === 0 for the retained children proves nothing`);
+    // QA-0.1-23e: every pinned C14 check ran with the probe's OWN signal and a recording progress (not the retained ones); the retained-signal host below is recorded, not pinned.
+    check(o, "C14/D14", at(ob, "launchContext", "signalReplaced") === true && at(ob, "launchContext", "progressReplaced") === true, `the pinned C14 launches must use the probe's own signal and a recording progress (launchContext.signalReplaced ${String(at(ob, "launchContext", "signalReplaced"))}, progressReplaced ${String(at(ob, "launchContext", "progressReplaced"))}); otherwise the other C14 checks describe a different launch than the one D14 assumes`);
     check(o, "C14/D14", perChildHooks.length === RETAINED_COUNT * 2 && perChildHooks.every(c => at(c, "routerDecisionRows") === 0), "retained-context launches must leave no router decision row for any child (routerDecisionRows === 0): the router records decisions in subagent tool hooks, which a retained launch never fires");
     check(o, "C14/D14", perChildHooks.length === RETAINED_COUNT * 2 && perChildHooks.every(c => at(c, "firstContextBeforeFirstTool") === true), "for every retained child the first context hook must run before its first tool call (firstContextAt < firstToolAt); D14 binds role / agent / model in the context hook");
     check(o, "C14/O3", at(ob, "concurrency", "allParked") === true && at(ob, "concurrency", "peakWaiting") === RETAINED_COUNT && at(ob, "concurrency", "parkedSessions") === RETAINED_COUNT, `O3: all ${RETAINED_COUNT} retained children's first provider requests must be waiting at once (peakWaiting ${RETAINED_COUNT}, held by Gates until all arrived); if the host caps lower, clamp D13/D14 maxParallel to the observed peak (${String(at(ob, "concurrency", "peakWaiting"))})`);
@@ -1955,7 +2027,8 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
     check(o, "C14/D14", children.length === RETAINED_COUNT * 2 && children.every(c => at(c, "session", "agent") === CHILD), `every retained child (${RETAINED_COUNT * 2}) must run with the requested non-default agent ${CHILD} (session.get agent); D14 binds role/agent at launch`);
     check(o, "C14/D14", children.every(c => same(at(c, "wireModels"), [wire]) && same(at(c, "catalogModels"), [`${SONNET}#low`])), `every retained child must run on the requested model (${SONNET}#low): the provider request body model and the host's catalog model header must match; D14 binds the model at launch`);
     check(o, "C14/D14", children.every(c => Number(at(c, "readHooksBefore")) >= 1), "every retained child's own `read` call must pass the tool hooks (execute.before)");
-    check(o, "C14/D14", children.every(c => Number(at(c, "routerRefusals")) >= 1), "D14 guards: with the router ENFORCED, every retained child's repeated identical `read` calls must meet a router guard refusal (`DENIED: …` in the tool result); if not, the router's guards do not apply to children launched with a retained context and D14's six guards must be re-decided (compare control.children)");
+    // QA-0.1-23f: not "any DENIED/Refused once": ADR 0007 C14 states the duplicate-read guard text (`DENIED: you already ran this exact read …`) and 5 refusals of the 6 identical reads, per child.
+    check(o, "C14/D14", children.length === RETAINED_COUNT * 2 && children.every(c => Number(at(c, "duplicateReadRefusals")) === RETAINED_READS - 1 && Number(at(c, "routerRefusals")) === Number(at(c, "duplicateReadRefusals"))), `D14 guards: with the router ENFORCED, every retained child's ${RETAINED_READS} identical \`read\` calls must meet exactly ${RETAINED_READS - 1} refusals with the duplicate-read guard text (\`DENIED: you already ran this exact read …\`) and no other refusal (per child duplicateReadRefusals/routerRefusals: ${json(children.map(c => [at(c, "duplicateReadRefusals"), at(c, "routerRefusals")]))}); if not, the router's guards do not apply to children launched with a retained context as ADR 0007 C14 states and D14's six guards must be re-decided (compare control.children)`);
     check(o, "C14/D14", control.length === LIGHT_COUNT && control.every(c => Number(at(c, "routerRefusals")) === 0 && Number(at(c, "toolResults")) === RETAINED_READS && at(c, "session", "agent") === CHILD), `control host WITHOUT the router: the same launch must show no refusal and all ${RETAINED_READS} reads must succeed (the refusal above is therefore the router's)`);
     check(o, "C14/D14", at(ob, "parentHistory", "unchangedAcrossLaunches") === true, "the parent's history must get no message from retained-context launches");
     // QA-0.1-19: launcher A binds / moves the child inside `onCreated` (= the retained `progress`), assuming the host awaits `progress` before it prompts the child.
