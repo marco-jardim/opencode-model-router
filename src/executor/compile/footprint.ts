@@ -488,7 +488,7 @@ function verbBefore(c: Cand): { rule: string; create: boolean } | null {
   const masked = c.text.slice(0, c.start).replace(/`[^`]*`/g, "§");
   const clause = masked.split(/(?<=[.;!?])\s+/).pop() ?? "";
   const lead = clause.replace(/^[\s>*+-]+/, "").replace(/^\d+[.)]\s+/, "").trim();
-  if (/^in$/i.test(lead) && /^\s*:/.test(c.text.slice(c.end))) return { rule: "verb:in", create: false };
+  if (/(?:^|\s)in$/i.test(lead) && /^\s*:/.test(c.text.slice(c.end))) return { rule: "verb:in", create: false };
   const tail = clause.trim().split(/\s+/).slice(-6).join(" ");
   if (TESTS_IN.test(tail)) return { rule: "verb:tests-in", create: false };
   const m = WRITE_VERB.exec(tail);

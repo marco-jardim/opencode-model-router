@@ -597,11 +597,54 @@ const PHRASE_RES: ReadonlyArray<{ verb: string; re: RegExp }> = [
   { verb: "before", re: new RegExp(`\\bbefore\\s+(?:Phase\\s+)?(${PID})\\b`, "gi") },
   { verb: "merged-first", re: new RegExp(`\\b(?:Phase\\s+)?(${PID})\\s+(?:(?:is|are|must|be)\\s+)*merged\\s+first\\b`, "gi") },
 ];
+/** Further explicit-dependency phrases (memo §5 pass 3); all carry the `after` semantics (the reference precedes the subject). */
+/** Id-shaped token: a dotted id (`2.3.4`, `P2.1`) or a `T`/`P`/`W` letter plus number; bare words and `QA`/`FIX` never match. */
+const FULL_ID = "(?:[A-Za-z]{0,2}\\d+(?:\\.[A-Za-z0-9]+)+|[TPWtpw]\\d+)";
+const ID_SHAPED_RE = new RegExp(`^${FULL_ID}$`);
+const AFTER_LIKE_RES: readonly RegExp[] = [
+  new RegExp(`\\bstarts?\\s+after\\s+(?:Phase\\s+)?(${FULL_ID})(?![A-Za-z0-9.]*[A-Za-z0-9])`, "gi"),
+  new RegExp(`\\bdepend(?:s|ing)?\\s+on\\s+(?:Phase\\s+)?(${FULL_ID})(?![A-Za-z0-9.]*[A-Za-z0-9])`, "gi"),
+  new RegExp(`\\brequires?\\s+(?:Phase\\s+)?(${FULL_ID})(?![A-Za-z0-9.]*[A-Za-z0-9])`, "gi"),
+  new RegExp(`\\bblocked\\s+by\\s+(?:Phase\\s+)?(${FULL_ID})(?![A-Za-z0-9.]*[A-Za-z0-9])`, "gi"),
+  new RegExp(`\\bonce\\s+(?:Phase\\s+)?(${FULL_ID})\\s+(?:is\\s+|are\\s+|has\\s+been\\s+)?(?:merged|merges|lands|done|passed)\\b`, "gi"),
+  new RegExp(`(?<![A-Za-z0-9.])(?:Phase\\s+)?(${FULL_ID})\\s+merges\\b`, "gi"),
+  new RegExp(`\\bbuilds?\\s+on\\s+(?:Phase\\s+)?(${FULL_ID})(?![A-Za-z0-9.]*[A-Za-z0-9])`, "gi"),
+  new RegExp(`\\bcodes?\\s+against\\s+(?:Phase\\s+)?(${FULL_ID})(?![A-Za-z0-9.]*[A-Za-z0-9])`, "gi"),
+  new RegExp(`\\buses?\\s+the\\s+API\\s+from\\s+(?:Phase\\s+)?(${FULL_ID})(?![A-Za-z0-9.]*[A-Za-z0-9])`, "gi"),
+];
 const MERGED_FIRST_BARE_RE = /\bmerged\s+first\b/i;
+
+const QUOTED_RE = /"[^"\n]*"|“[^”\n]*”/g;
+const CLAUSE_SPLIT_RE = /;|\.(?=\s|$)/;
+const CLAUSE_MAX = 160;
+
+/** Clauses of one line, bounded by `;`, `. ` and 160 characters; quoted spans are blanked first. */
+function clausesOf(text: string): string[] {
+  const out: string[] = [];
+  for (const part of text.replace(QUOTED_RE, (q) => " ".repeat(q.length)).split(CLAUSE_SPLIT_RE)) {
+    for (let i = 0; i < part.length; i += CLAUSE_MAX) out.push(part.slice(i, i + CLAUSE_MAX));
+  }
+  return out;
+}
+
+function scanAfterLike(text: string, line: number, subject: ExplicitPhrase["subject"], out: ExplicitPhrase[]): boolean {
+  let any = false;
+  for (const clause of clausesOf(text)) {
+    for (const re of AFTER_LIKE_RES) {
+      for (const m of clause.matchAll(re)) {
+        any = true;
+        const ref = m[1] as string;
+        if (out.some((p) => p.line === line && p.subject.id === subject.id && p.verb === "after" && p.refs[0] === ref)) continue;
+        out.push({ subject, verb: "after", refs: [m[1] as string], line, excerpt: m[0].slice(0, 160) });
+      }
+    }
+  }
+  return any;
+}
 
 function scanPhrases(raw: string, line: number, subject: ExplicitPhrase["subject"], out: ExplicitPhrase[]): void {
   const text = withoutInlineCode(raw);
-  let any = false;
+  let any = scanAfterLike(text, line, subject, out);
   for (const { verb, re } of PHRASE_RES) {
     for (const m of text.matchAll(re)) {
       any = true;
@@ -835,17 +878,29 @@ export function parsePlan(text: string): ParsedPlan {
     const lead = leadOf(lines[step.line - 1] ?? "");
     return { step, endIdx, lead, ex: EXPLICIT_ID_RE.exec(lead), df: DOGFOOD_ID_RE.exec(lead) };
   });
-  const prefixes = new Set<string>();
+  const explicitTasks: Array<{ idx: number; id: string }> = [];
   for (const info of infos) {
-    if (info.ex === null) continue;
-    const parts = bareId(info.ex[1] as string).split(".");
-    for (let k = 1; k < parts.length; k += 1) prefixes.add(parts.slice(0, k).join("."));
+    if (info.ex !== null) explicitTasks.push({ idx: info.step.line - 1, id: bareId(info.ex[1] as string) });
   }
 
   // --- headings, waves, phases (step 2) ----------------------------------------------------------------------
-  const headings = scanHeadings(lines, mask).map((h): HeadingInfo => {
+  const scanned = scanHeadings(lines, mask);
+  /** An id-shaped heading is confirmed only by explicit task ids inside its own section. */
+  const confirmedByChildren = (hi: number): boolean => {
+    const h = scanned[hi] as HeadingInfo;
+    let end = lines.length;
+    for (let j = hi + 1; j < scanned.length; j += 1) {
+      if ((scanned[j] as HeadingInfo).level <= h.level) {
+        end = (scanned[j] as HeadingInfo).idx;
+        break;
+      }
+    }
+    const prefix = `${bareId(h.id)}.`;
+    return explicitTasks.some((t) => t.idx > h.idx && t.idx < end && t.id.startsWith(prefix));
+  };
+  const headings = scanned.map((h, hi): HeadingInfo => {
     if (headingRun) return { ...h, kind: "other" };
-    if (h.kind === "generic" && !prefixes.has(bareId(h.id))) return { ...h, kind: "other" };
+    if (h.kind === "generic" && !confirmedByChildren(hi)) return { ...h, kind: "other" };
     return h;
   });
 
@@ -1223,6 +1278,14 @@ export function parsePlan(text: string): ParsedPlan {
     }
   }
   const knownRefs = new Set<string>([...knownNodes]);
+  const warnedRefs = new Set<string>();
+  for (const p of phrases) {
+    for (const r of p.refs) {
+      if (knownRefs.has(r) || !ID_SHAPED_RE.test(r) || warnedRefs.has(`${p.line}:${r}`)) continue;
+      warnedRefs.add(`${p.line}:${r}`);
+      warn(warnings, "explicit-ref-unknown", p.line, `unknown reference ${r}: ${p.excerpt.slice(0, 80)}`);
+    }
+  }
   const keptPhrases = phrases
     .map((p) => ({ ...p, refs: p.refs.filter((r) => knownRefs.has(r) && r !== p.subject.id) }))
     .filter((p) => p.refs.length > 0 || (p.verb === "merged-first" && p.subject.kind === "wave"))

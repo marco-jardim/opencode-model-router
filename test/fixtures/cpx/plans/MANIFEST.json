@@ -1,0 +1,30 @@
+[
+  {
+    "name": "critical-path-execution-plan.md",
+    "source": "docs/plans/critical-path-execution-plan.md",
+    "commit": "c4cbf579a8622df96a78da639546941dc6ec9618",
+    "sha256": "36c10a7297eff614fdcbe7460f331df37321d40e3c69a7fbaf72983188688636",
+    "bytes": 329159
+  },
+  {
+    "name": "delegation-depth-and-effort-bump-plan.md",
+    "source": "docs/plans/delegation-depth-and-effort-bump-plan.md",
+    "commit": "c4cbf579a8622df96a78da639546941dc6ec9618",
+    "sha256": "829d448876abdcd3b3e3e9135d0cc58a610558c88a84c15b6d01a9eeac29c0a6",
+    "bytes": 122430
+  },
+  {
+    "name": "role-tier-assurance-delegation-plan.md",
+    "source": "docs/plans/role-tier-assurance-delegation-plan.md",
+    "commit": "c4cbf579a8622df96a78da639546941dc6ec9618",
+    "sha256": "14cc416f0c99e9b42618c5cfea9b0f8ac3328aefc7d9ee06e7548b765cd21374",
+    "bytes": 113482
+  },
+  {
+    "name": "verification-resource-budget-plan.md",
+    "source": "docs/plans/verification-resource-budget-plan.md",
+    "commit": "c4cbf579a8622df96a78da639546941dc6ec9618",
+    "sha256": "382b3806dd0378ac876935cbcbd181eb454cb6d02c2c828a70a1ba0020f33db1",
+    "bytes": 120375
+  }
+]
