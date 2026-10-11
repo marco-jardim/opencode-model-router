@@ -172,6 +172,60 @@ export interface SnapshotOptions {
   hardened?: boolean;
   /** The git process seam (tests). Default execGit. */
   git?: SnapshotGit;
+  /**
+   * Cross-repo P2.6 (SD11): also compute `TreeSnapshot.ignored`, a bounded digest of the repository's ignored files (nothing
+   * under a `node_modules` segment), with the snapshot's own git runner (hardened when `hardened`). Default false: no extra git
+   * process, no extra read, no `ignored` field.
+   */
+  ignoredDigest?: boolean;
+  /** Default MAX_IGNORED_FILES. */
+  maxIgnoredFiles?: number;
+  /** Default MAX_IGNORED_BYTES. */
+  maxIgnoredBytes?: number;
+}
+
+/** Cross-repo P2.6: mirrors reference.ts MAX_UNTRACKED_FILES / MAX_UNTRACKED_BYTES (not imported: tree.ts stays free of reference.ts). */
+export const MAX_IGNORED_FILES = 5_000;
+export const MAX_IGNORED_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Cross-repo P2.6: a digest of the ignored files `git ls-files --others --ignored --exclude-standard -z` lists, minus any path
+ * with a `node_modules` segment: sha256 over the sorted paths with their size and content (a link: its target). "over-bounds"
+ * above `maxFiles` paths or `maxBytes` bytes (sizes come from lstat before anything is read); undefined on any error.
+ */
+async function ignoredFilesDigest(
+  root: string,
+  list: () => Promise<string>,
+  signal: AbortSignal,
+  maxFiles: number,
+  maxBytes: number,
+): Promise<string | "over-bounds" | undefined> {
+  try {
+    const paths = (await list()).split("\0").filter(Boolean)
+      .filter(path => !path.split(/[\\/]/).includes("node_modules"))
+      .sort();
+    if (paths.length > maxFiles) return "over-bounds";
+    const sized: [string, "file" | "link", number][] = [];
+    let bytes = 0;
+    for (const path of paths) {
+      const stat = await lstat(resolve(root, path));
+      if (stat.isSymbolicLink()) sized.push([path, "link", stat.size]);
+      else if (stat.isFile()) {
+        bytes += stat.size;
+        if (bytes > maxBytes) return "over-bounds";
+        sized.push([path, "file", stat.size]);
+      } else return undefined; // A directory (nested repository) has no content identity here.
+    }
+    const hash = createHash("sha256");
+    for (const [path, kind, size] of sized) {
+      if (signal.aborted) return undefined;
+      hash.update(JSON.stringify([path, kind, size]));
+      hash.update(kind === "link" ? await readlink(resolve(root, path)) : await readFile(resolve(root, path), { signal }));
+    }
+    return hash.digest("hex");
+  } catch {
+    return undefined; // Unlisted, vanished or unreadable: no digest, never a throw.
+  }
 }
 
 /** QA-1 F4: the argument prefix and process options of a hardened snapshot of `cwd` (SnapshotOptions.hardened). */
@@ -312,7 +366,19 @@ export async function snapshotTree(cwd: string, signal: AbortSignal, options: Sn
       options.maxDigestBytes ?? MAX_DIGEST_BYTES,
     );
     if (signal.aborted) return undefined;
-    return { cwd: await realpath(cwd), root: await realpath(root), head, branch, fingerprint: hash.digest("hex"), dirty: files.length > 0, files, digests };
+    const ignored = options.ignoredDigest === true
+      ? await ignoredFilesDigest(
+        root,
+        () => git(["ls-files", "--others", "--ignored", "--exclude-standard", "-z"]),
+        signal,
+        options.maxIgnoredFiles ?? MAX_IGNORED_FILES,
+        options.maxIgnoredBytes ?? MAX_IGNORED_BYTES,
+      )
+      : undefined;
+    return {
+      cwd: await realpath(cwd), root: await realpath(root), head, branch, fingerprint: hash.digest("hex"), dirty: files.length > 0, files, digests,
+      ...(ignored !== undefined ? { ignored } : {}),
+    };
   } catch {
     // Not a Git checkout, unreadable file, timeout or concurrent deletion: no baseline.
     return undefined;

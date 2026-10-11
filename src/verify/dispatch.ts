@@ -42,6 +42,12 @@ export interface TreeSnapshot {
    * "unavailable" (over the digest bounds, or unreadable) and absent both mean no per-file proof.
    */
   digests?: ReadonlyMap<string, string> | "unavailable";
+  /**
+   * Cross-repo P2.6 (SD11): a content digest of the repository's ignored files (path, size and content; nothing under a
+   * `node_modules` segment), so a linked package's ignored `dist/` can be pinned. "over-bounds": more files or bytes than the
+   * bounds allow. Absent: not requested (SnapshotOptions.ignoredDigest) or unavailable (any error).
+   */
+  ignored?: string | "over-bounds";
 }
 
 /** QA-2.1-2: the digest of a path that does not exist. */

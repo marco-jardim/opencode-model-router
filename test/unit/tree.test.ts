@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolve } from "node:path";
 import { constants as osConstants } from "node:os";
 import { execGit, GitExitError, gitExitCode, snapshotTree, SNAPSHOT_GIT_MAX_BUFFER, SNAPSHOT_GIT_TIMEOUT_MS, type SnapshotGitOptions } from "../../src/verify/tree";
@@ -241,4 +241,124 @@ describe("Git tree fingerprint adapter", () => {
       expect(gitExitCode(new Error("git exited with code 1"))).toBeUndefined();
     });
   });
+});
+
+// Cross-repo P2.6 (SD11, F8). Real git in a real temp repository: the file-wide mocks above (child_process, fs/promises and
+// git-tools) are lifted for this block, which is last in the file, and tree.ts is loaded afresh without them.
+describe("snapshotTree — ignored-files digest (P2.6)", () => {
+  type TreeModule = typeof import("../../src/verify/tree");
+  let tree: TreeModule;
+  let repo: string;
+  let write: (rel: string, content: string) => Promise<void>;
+  const signal = new AbortController().signal;
+  let cleanup: (() => Promise<void>) | undefined;
+
+  afterAll(async () => {
+    await cleanup?.();
+  });
+
+  beforeAll(async () => {
+    vi.doUnmock("node:fs/promises");
+    vi.doUnmock("node:child_process");
+    vi.doUnmock("../../src/router/git-tools");
+    vi.resetModules();
+    tree = await import("../../src/verify/tree");
+    const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    const cp = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+    const os = await vi.importActual<typeof import("node:os")>("node:os");
+    const path = await vi.importActual<typeof import("node:path")>("node:path");
+    repo = await fs.mkdtemp(path.join(os.tmpdir(), "omr-ignored-"));
+    write = async (rel, content) => {
+      const file = path.join(repo, rel);
+      await fs.mkdir(path.dirname(file), { recursive: true });
+      await fs.writeFile(file, content);
+    };
+    const env = {
+      ...process.env,
+      GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.com",
+    };
+    const git = (...args: string[]) => cp.execFileSync("git", ["-c", "core.autocrlf=false", "-c", "commit.gpgsign=false", ...args], { cwd: repo, env, stdio: "ignore" });
+    await write(".gitignore", "dist/\nnode_modules/\n");
+    await write("src/a.ts", "export const a = 1;\n");
+    cleanup = () => fs.rm(repo, { recursive: true, force: true });
+    git("init", "-q");
+    git("add", ".");
+    git("commit", "-q", "-m", "init");
+  }, 60_000);
+
+  const ignoredOf = async (options: import("../../src/verify/tree").SnapshotOptions = {}) =>
+    (await tree.snapshotTree(repo, signal, { ignoredDigest: true, ...options }))?.ignored;
+
+  it("(a) editing an ignored dist file changes the digest", async () => {
+    await write("dist/index.js", "one");
+    const before = await ignoredOf();
+    expect(before).toMatch(/^[0-9a-f]{64}$/);
+    expect(await ignoredOf()).toBe(before); // stable while nothing changes
+    await write("dist/index.js", "two");
+    const after = await ignoredOf();
+    expect(after).toMatch(/^[0-9a-f]{64}$/);
+    expect(after).not.toBe(before);
+  }, 60_000);
+
+  it("(b) editing a file under node_modules does not change the digest", async () => {
+    await write("node_modules/x/y.js", "one");
+    const before = await ignoredOf();
+    await write("node_modules/x/y.js", "a different and longer content");
+    await write("node_modules/x/z.js", "new");
+    expect(await ignoredOf()).toBe(before);
+  }, 60_000);
+
+  it("(c) editing a tracked file does not change `ignored`", async () => {
+    const before = await ignoredOf();
+    await write("src/a.ts", "export const a = 2;\n");
+    expect(await ignoredOf()).toBe(before);
+  }, 60_000);
+
+  it("(d) more ignored files or bytes than a bound is \"over-bounds\" (node_modules not counted)", async () => {
+    await write("dist/index.js", "12345");
+    await write("dist/other.js", "67890");
+    for (let i = 0; i < 5; i++) await write(`node_modules/n/${i}.js`, "x".repeat(100));
+    expect(await ignoredOf({ maxIgnoredFiles: 2, maxIgnoredBytes: 10 })).toMatch(/^[0-9a-f]{64}$/); // exactly at the bounds
+    expect(await ignoredOf({ maxIgnoredFiles: 1 })).toBe("over-bounds");
+    expect(await ignoredOf({ maxIgnoredBytes: 9 })).toBe("over-bounds");
+  }, 60_000);
+
+  it("(e) the ignored listing goes through the hardened runner when hardened", async () => {
+    const seen: { args: readonly string[]; opts: import("../../src/verify/tree").SnapshotGitOptions }[] = [];
+    const git = async (args: readonly string[], opts: import("../../src/verify/tree").SnapshotGitOptions) => {
+      seen.push({ args, opts });
+      return tree.execGit(args, opts);
+    };
+    const snapshot = await tree.snapshotTree(repo, signal, { hardened: true, ignoredDigest: true, git });
+    expect(snapshot?.ignored).toMatch(/^[0-9a-f]{64}$/);
+    const listing = seen.filter(c => c.args.includes("--ignored"));
+    expect(listing).toHaveLength(1);
+    expect(listing[0]?.args).toEqual(expect.arrayContaining(["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "core.fsmonitor=false"]));
+    expect(listing[0]?.opts.env).toBeDefined();
+    expect(listing[0]?.opts.executable).toBeDefined();
+    // Every process of the snapshot carried the hardening, the listing included.
+    for (const c of seen) expect(c.args).toContain("core.fsmonitor=false");
+  }, 60_000);
+
+  it("a failing listing leaves `ignored` absent and the snapshot intact; it never throws", async () => {
+    const git = async (args: readonly string[], opts: import("../../src/verify/tree").SnapshotGitOptions) => {
+      if (args.includes("--ignored")) throw new Error("boom");
+      return tree.execGit(args, opts);
+    };
+    const snapshot = await tree.snapshotTree(repo, signal, { ignoredDigest: true, git });
+    expect(snapshot).toBeDefined();
+    expect(snapshot && "ignored" in snapshot).toBe(false);
+  }, 60_000);
+
+  it("(f) without the option `ignored` is absent and git is not asked for the ignored files", async () => {
+    const seen: (readonly string[])[] = [];
+    const git = async (args: readonly string[], opts: import("../../src/verify/tree").SnapshotGitOptions) => {
+      seen.push(args);
+      return tree.execGit(args, opts);
+    };
+    const snapshot = await tree.snapshotTree(repo, signal, { git });
+    expect(snapshot).toBeDefined();
+    expect(snapshot && "ignored" in snapshot).toBe(false);
+    expect(seen.some(a => a.includes("--ignored"))).toBe(false);
+  }, 60_000);
 });
