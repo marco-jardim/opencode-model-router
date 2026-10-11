@@ -40,10 +40,19 @@ export interface PerimeterRepo {
   readonly head?: string;
 }
 
-/** Cross-repo P1.8: an extra root of P and its change since the dispatch ("unobserved": no snapshot at either end). */
+/**
+ * Cross-repo P1.8: an extra root of P and its change since the dispatch. "unobserved": no snapshot at either end, past the cap,
+ * or a perimeter that could not be planned (I4 refuses it when writers ran). "unadmitted" (QA-1 F4): a linked directory whose
+ * repository is not admitted, or that is not a git repository; never snapshotted, and only named in I8.
+ */
 export interface PerimeterRoot extends PerimeterRepo {
-  readonly status: "changed" | "unchanged" | "unobserved";
+  readonly status: "changed" | "unchanged" | "unobserved" | "unadmitted";
+  /** QA-1 F11: a worktree of W's own repository; I4 suggests `branch=<branch>` rather than `repo=<name>`. */
+  readonly sameRepository?: boolean;
 }
+
+/** QA-1 F10: the name of the placeholder root a perimeter that could not be planned holds (fail closed). */
+export const PERIMETER_UNPLANNED = "perimeter could not be planned";
 
 /** Cross-repo P1.8 (I8): the perimeter P of a dispatch: W, then its other roots (at least one). */
 export interface PerimeterObservation {
@@ -393,10 +402,12 @@ export async function accept(
     const caveat = unattributedWritersCaveat(artefact.changeRoot ?? effectiveBaseDir, writers);
     verdict = { ...verdict, pass: false, outcome: "unverifiable", reasons: [...verdict.reasons, caveat], caveats: [...(verdict.caveats ?? []), caveat] };
   }
-  // I8 (cross-repo P1.8): a pass names the perimeter it was scoped to. Evidence only: the outcome is unchanged.
+  // I8 (cross-repo P1.8): a pass names the perimeter it was scoped to. Evidence only: the outcome is unchanged. QA-1 F6: a pass
+  // renders its notes, not its reasons (buildAcceptedSuffix), so the line is a note too; a note never makes the pass unverified.
   if (artefact.perimeter !== undefined && artefact.perimeter.roots.length > 0
     && (verdict.outcome ?? (verdict.pass ? "pass" : "fail")) === "pass") {
-    verdict = { ...verdict, reasons: [...verdict.reasons, verifiedScopeLine(artefact.perimeter)] };
+    const scope = verifiedScopeLine(artefact.perimeter);
+    verdict = { ...verdict, reasons: [...verdict.reasons, scope], notes: [...(verdict.notes ?? []), scope] };
   }
 
   return gateResult(verdict, dodSource, deps.strictUnverifiable);
@@ -422,16 +433,28 @@ export function perimeterChangeReasons(artefact: Pick<Artefact, "perimeter" | "u
   const writers = artefact.unattributedWriters ?? [];
   if (artefact.perimeter === undefined || writers.length === 0) return [];
   const tools = listedTools(writers);
-  return artefact.perimeter.roots.filter(root => root.status !== "unchanged").map(root => {
+  return artefact.perimeter.roots.filter(root => root.status === "changed" || root.status === "unobserved").map(root => {
+    if (root.name === PERIMETER_UNPLANNED) {
+      return `the verification ${PERIMETER_UNPLANNED} when the dispatch started, and the producer ran ${tools}; a write in another repository cannot be ruled out, so the checks in ${w} do not cover it. Re-dispatch, or verify it there.`;
+    }
     const what = root.status === "changed" ? "also changed during the dispatch" : "could not be observed during the dispatch";
-    return `the repository ${root.name} at ${root.root} ${what}, and the producer ran ${tools}; a write there cannot be attributed, so the checks in ${w} do not cover it. Dispatch that work with repo=${root.name}, or verify it there.`;
+    // QA-1 F11: another worktree of W's own repository is reached by its branch, not by the repository's name.
+    const target = root.sameRepository === true && root.branch !== undefined ? `branch=${root.branch}` : `repo=${root.name}`;
+    return `the repository ${root.name} at ${root.root} ${what}, and the producer ran ${tools}; a write there cannot be attributed, so the checks in ${w} do not cover it. Dispatch that work with ${target}, or verify it there.`;
   });
 }
 
-/** I8 (cross-repo P1.8): the evidence line of a pass whose perimeter holds more than W. */
+/**
+ * I8 (cross-repo P1.8): the evidence line of a pass whose perimeter holds more than W. QA-1 F6 (I4 "otherwise → a note"): a root
+ * that changed without an unattributable writer is shown as changed.
+ */
 export function verifiedScopeLine(perimeter: PerimeterObservation): string {
-  const show = (repo: PerimeterRepo): string =>
-    `${repo.name} (${repo.branch ?? "detached"} @ ${repo.head !== undefined && repo.head !== "" ? repo.head.slice(0, 7) : "unknown"})`;
-  const others = perimeter.roots.map(root => (root.status === "unobserved" ? `${root.name} (not observed)` : show(root)));
+  const show = (repo: PerimeterRepo, suffix = ""): string =>
+    `${repo.name} (${repo.branch ?? "detached"} @ ${repo.head !== undefined && repo.head !== "" ? repo.head.slice(0, 7) : "unknown"}${suffix})`;
+  const others = perimeter.roots.map(root => {
+    if (root.name === PERIMETER_UNPLANNED) return PERIMETER_UNPLANNED;
+    if (root.status === "unobserved" || root.status === "unadmitted") return `${root.name} (not observed)`;
+    return root.status === "changed" ? show(root, ", changed during the dispatch") : show(root);
+  });
   return `verified scope: ${show(perimeter.w)}; also observed: ${others.join(", ")}`;
 }

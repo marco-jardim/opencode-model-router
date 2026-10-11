@@ -76,7 +76,7 @@ import {
 import { runArgv, runShell } from "./exec";
 import { snapshotTree } from "./tree";
 import { planPerimeter } from "./perimeter";
-import type { DispatchPerimeter } from "./dispatch";
+import type { DispatchPerimeter, PerimeterEntry } from "./dispatch";
 import { branchSwitched, branchSwitchReason, branchUnconfirmedReason, treeMove, treeMoveReason } from "./branch";
 import { readHead, readHeadState, readReflogWindow, type HeadState, type ReflogEntry } from "./head";
 import { captureReference, DEFAULT_CAPTURE_TIMEOUT_MS, gcStaleReferences, nodeReferenceFs, type DispatchReference } from "./reference";
@@ -93,7 +93,7 @@ import {
   withTimeout,
 } from "./timeout";
 import { resolveRolesRouting, resolveVerifyBudget, type RouterConfig, type VerifyBudget } from "../router/config";
-import { accept, gateResult, unverifiableGateResult, type GateDeps, type GateResult, type PerimeterObservation, type PerimeterRoot } from "./gate";
+import { accept, gateResult, PERIMETER_UNPLANNED, unverifiableGateResult, type GateDeps, type GateResult, type PerimeterObservation, type PerimeterRoot } from "./gate";
 // The grader request shape is owned by checker.ts, which builds it. Re-exported
 // here because this module is where it is consumed, and because keeping a
 // second local copy is exactly how `cwd` got dropped: the checker set it, the
@@ -1488,81 +1488,114 @@ export function createVerificationWiring(deps: {
       };
     }
     const at = resolve(directory, cwd || ".");
-    // Cross-repo P1.8 (I13): a role dispatch's perimeter is fixed now; every other dispatch plans none (I9).
+    // Cross-repo P1.8 (I13): a role dispatch's perimeter is fixed now; every other dispatch plans none (I9). QA-1 F9: a ladder
+    // retry keeps the dispatch's perimeter (beginDispatch keeps the original), so it is not planned again.
     let perimeter: DispatchPerimeter | undefined;
-    try {
-      perimeter = planPerimeter(id, at, () => {
-        const routing = resolveRolesRouting(getConfig(), "v2");
-        return { parents: routing.repoParents, depth: routing.repoDepth };
-      });
-    } catch (err) {
-      logger.warn("[verify] dispatch perimeter could not be planned", { id, error: errorText(err) });
+    if (store.perimeterOf(id) === undefined) {
+      try {
+        perimeter = planPerimeter(id, at, () => {
+          const routing = resolveRolesRouting(getConfig(), "v2");
+          return { parents: routing.repoParents, depth: routing.repoDepth, exclude: routing.repoExclude };
+        });
+      } catch (err) {
+        logger.warn("[verify] dispatch perimeter could not be planned", { id, error: errorText(err) });
+        // QA-1 F10: fail closed. A placeholder root that is never observed: a dispatch whose producer ran an unattributable
+        // writer is unverifiable (I4), since a write in another repository cannot be ruled out.
+        perimeter = { roots: [{ at, name: PERIMETER_UNPLANNED, fixed: "unobserved" }] };
+      }
     }
-    const begun = store.beginDispatch(id, at, perimeter === undefined ? deps : { ...deps, perimeter });
+    const lowPriority = configuredLowPriority();
+    const begun = store.beginDispatch(id, at, perimeter === undefined ? deps : {
+      ...deps,
+      perimeter,
+      // QA-1 F4 (I11): git runs hardened in a repository other than W.
+      perimeterSnapshot: (root, signal) => snapshotTree(root, signal, { lowPriority, hardened: true }),
+    });
     // pending.ts R10: remember the reference's settled value (the store hands out one promise).
     const reference = store.reference(id);
     if (!settledReferences.has(reference)) void reference.then(state => settledReferences.set(reference, state));
     await begun;
   };
 
+  /** The two snapshots of each extra root of a perimeter (perimeterSnapshotsAtGate); `fixed` roots have neither. */
+  type PerimeterSnapshots = readonly { entry: PerimeterEntry; before: TreeSnapshot | undefined; now: TreeSnapshot | undefined }[];
+
   /**
-   * Cross-repo P1.8 (I4, I8): each extra root of the dispatch's perimeter, snapshotted again (bounded by `deadline`) and
-   * compared with its dispatch snapshot: "changed" when the fingerprint, HEAD or top level differs, "unobserved" when either
-   * snapshot is unavailable (fail closed). A link target whose git top level is not admitted is dropped (I12); roots are
-   * de-duplicated by top level, W's own excluded. Undefined when the dispatch has no perimeter or none of its roots remains.
+   * Cross-repo P1.8 (I4, I13): each extra root of the dispatch's perimeter snapshotted again, hardened (QA-1 F4) and bounded by
+   * `deadline`, next to its dispatch snapshot. QA-1 F9: the roots are snapshotted concurrently with each other, and the caller
+   * starts this before W's own gate snapshot so both run at once. A fixed root (never observed) is not snapshotted. Undefined
+   * when the dispatch has no perimeter.
    */
-  const perimeterAtGate = async (
+  const perimeterSnapshotsAtGate = async (
     store: ReturnType<typeof createChangedFileStore>,
     id: string,
-    snapshot: TreeSnapshot | undefined,
-    base: string,
     deadline: Deadline | undefined,
-  ): Promise<PerimeterObservation | undefined> => {
+  ): Promise<{ name?: string; snapshots: PerimeterSnapshots } | undefined> => {
     const planned = store.perimeterOf(id);
     if (planned === undefined || planned.entries.size === 0) return undefined;
     const bound = (): number => (deadline ? deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS) : GRADE_SNAPSHOT_TIMEOUT_MS);
     const lowPriority = configuredLowPriority();
-    const observed = await Promise.all([...planned.entries.values()].map(async entry => {
-      const before = await withTimeout(entry.snapshot, Math.max(1, bound()), "perimeter fingerprint").catch(() => undefined);
-      let now: TreeSnapshot | undefined;
-      const ms = bound();
-      if (ms > 0 && deadline?.signal.aborted !== true) {
+    const snapshots = await Promise.all([...planned.entries.values()].map(async entry => {
+      if (entry.seed.fixed !== undefined) return { entry, before: undefined, now: undefined };
+      const before = withTimeout(entry.snapshot, Math.max(1, bound()), "perimeter fingerprint").catch(() => undefined);
+      const now = (async (): Promise<TreeSnapshot | undefined> => {
+        const ms = bound();
+        if (ms <= 0 || deadline?.signal.aborted === true) return undefined;
         const controller = new AbortController();
         const onAbort = (): void => controller.abort();
         deadline?.signal.addEventListener("abort", onAbort, { once: true });
         try {
-          now = await withTimeout(snapshotTree(entry.seed.at, controller.signal, { lowPriority }), ms, "perimeter fingerprint");
+          return await withTimeout(snapshotTree(entry.seed.at, controller.signal, { lowPriority, hardened: true }), ms, "perimeter fingerprint");
         } catch {
-          now = undefined;
+          return undefined;
         } finally {
           deadline?.signal.removeEventListener("abort", onAbort);
           controller.abort();
         }
-      }
-      return { entry, before, now };
+      })();
+      return { entry, before: await before, now: await now };
     }));
+    return { ...(planned.name !== undefined ? { name: planned.name } : {}), snapshots };
+  };
+
+  /**
+   * Cross-repo P1.8 (I4, I8): each extra root of the dispatch's perimeter compared with its dispatch snapshot: "changed" when
+   * the fingerprint, HEAD or top level differs, "unobserved" when either snapshot is unavailable (fail closed), a fixed root with
+   * its own status. QA-1 F4: a root whose git top level is not admitted at the gate is reported unobserved, never dropped (I12).
+   * Roots are de-duplicated by top level, W's own excluded. Undefined when the dispatch has no perimeter or none remains.
+   */
+  const perimeterAtGate = (
+    planned: { name?: string; snapshots: PerimeterSnapshots } | undefined,
+    snapshot: TreeSnapshot | undefined,
+    base: string,
+  ): PerimeterObservation | undefined => {
+    if (planned === undefined) return undefined;
     const key = (at: string): string => {
       const normalized = resolve(at).replace(/\\/g, "/");
       return process.platform === "win32" ? normalized.toLowerCase() : normalized;
     };
     const wRoot = snapshot?.root ?? base;
-    const rank = { unchanged: 0, unobserved: 1, changed: 2 } as const;
+    const rank = { unchanged: 0, unadmitted: 1, unobserved: 2, changed: 3 } as const;
     const roots = new Map<string, PerimeterRoot>();
-    for (const { entry, before, now } of observed) {
-      const known = now?.root ?? before?.root;
-      if (known !== undefined && entry.seed.admit !== undefined && !entry.seed.admit(known)) continue;
-      const root = known ?? entry.seed.at;
-      if (key(root) === key(wRoot)) continue;
-      const status: PerimeterRoot["status"] = before === undefined || now === undefined
+    for (const { entry, before, now } of planned.snapshots) {
+      const fixed = entry.seed.fixed;
+      const known = fixed === undefined ? now?.root ?? before?.root : undefined;
+      const refused = known !== undefined && entry.seed.admit !== undefined && !entry.seed.admit(known);
+      const root = known !== undefined && !refused ? known : entry.seed.at;
+      // W's own repository is W's snapshot (a fixed placeholder may stand at W's path: it is kept).
+      if (fixed === undefined && key(root) === key(wRoot)) continue;
+      const status: PerimeterRoot["status"] = fixed ?? (refused || before === undefined || now === undefined
         ? "unobserved"
-        : before.fingerprint !== now.fingerprint || before.head !== now.head || before.root !== now.root ? "changed" : "unchanged";
-      const shown = now ?? before;
+        : before.fingerprint !== now.fingerprint || before.head !== now.head || before.root !== now.root ? "changed" : "unchanged");
+      // Only an admitted, observed root is described by its git state.
+      const shown = fixed !== undefined || refused ? undefined : now ?? before;
       const next: PerimeterRoot = {
         root,
         name: entry.seed.name ?? basename(root),
         status,
         ...(typeof shown?.branch === "string" ? { branch: shown.branch } : {}),
         ...(shown?.head ? { head: shown.head } : {}),
+        ...(entry.seed.sameRepository === true ? { sameRepository: true } : {}),
       };
       const previous = roots.get(key(root));
       if (previous === undefined || rank[next.status] > rank[previous.status]) roots.set(key(root), next);
@@ -1593,6 +1626,10 @@ export function createVerificationWiring(deps: {
     observePerimeter = true,
   ): Promise<Omit<PreparedVerification, "reference">> => {
     const base = resolve(directory, cwd || ".");
+    // QA-1 F9: the perimeter's gate snapshots start now, concurrently with W's own (never rejects).
+    const perimeterSnapshots = observePerimeter
+      ? perimeterSnapshotsAtGate(store, id, deadline).catch(() => undefined)
+      : Promise.resolve(undefined);
     const controller = new AbortController();
     const onAbort = (): void => controller.abort();
     deadline?.signal.addEventListener("abort", onAbort, { once: true });
@@ -1687,7 +1724,7 @@ export function createVerificationWiring(deps: {
     // B8: on a switch the commit diff is not run; "unavailable" keeps the whole change set unavailable (the gate refuses anyway).
     const committed = branchSwitch !== undefined ? "unavailable" as const : await committedSinceDispatch(before, snapshot, deadline);
     const contaminatedBy = store.snapshotContaminatedBy(id);
-    const perimeter = observePerimeter ? await perimeterAtGate(store, id, snapshot, base, deadline) : undefined;
+    const perimeter = perimeterAtGate(await perimeterSnapshots, snapshot, base);
     return {
       ...store.delta(id, childID, snapshot, base, committed),
       snapshot,

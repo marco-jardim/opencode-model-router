@@ -19,6 +19,10 @@ export interface SnapshotGitOptions {
   readonly maxBuffer: number;
   /** QA-3.1-8: below-normal OS priority (VerifyBudget.lowPriority), like every other verification process. */
   readonly lowPriority: boolean;
+  /** Cross-repo QA-1 F4 (SnapshotOptions.hardened): the environment git runs with. Absent: the process's own (unchanged). */
+  readonly env?: NodeJS.ProcessEnv;
+  /** Cross-repo QA-1 F4: the git executable, by absolute path. Absent: `git`, looked up as before. */
+  readonly executable?: string;
 }
 
 /**
@@ -92,10 +96,12 @@ export const execGit: SnapshotGit = (args, opts) => new Promise<string>((ok, fai
     return;
   }
   const nice = opts.lowPriority && !isWin;
+  const git = opts.executable ?? "git";
   let child: ChildProcess;
   try {
-    child = spawn(nice ? "nice" : "git", nice ? ["-n", "10", "--", "git", ...args] : [...args], {
+    child = spawn(nice ? "nice" : git, nice ? ["-n", "10", "--", git, ...args] : [...args], {
       cwd: opts.cwd, windowsHide: true, detached: !isWin, stdio: ["ignore", "pipe", "ignore"],
+      ...(opts.env !== undefined ? { env: opts.env } : {}),
     });
   } catch (e) {
     fail(e);
@@ -157,8 +163,24 @@ export interface SnapshotOptions {
    * VerifyBudget.lowPriority (default true). Default false.
    */
   lowPriority?: boolean;
+  /**
+   * Cross-repo QA-1 F4 (I11): run every git process of the snapshot hardened, as the router's other git calls in a repository
+   * it does not own (git-tools.ts): `hardeningArgs()` (no fsmonitor, no hooks, no pager, no external diff, no optional locks),
+   * the user's `safe.directory` values, `gitEnvironment()` (no inherited GIT_*, no system or global config) and git by absolute
+   * path outside the snapshotted tree. The perimeter's extra roots use it. Default false: the snapshot of W is unchanged.
+   */
+  hardened?: boolean;
   /** The git process seam (tests). Default execGit. */
   git?: SnapshotGit;
+}
+
+/** QA-1 F4: the argument prefix and process options of a hardened snapshot of `cwd` (SnapshotOptions.hardened). */
+async function hardenedGit(cwd: string): Promise<{ prefix: string[]; env: NodeJS.ProcessEnv; executable: string }> {
+  // Loaded only when asked for, so a plain snapshot's module graph and processes stay as they were.
+  const tools = await import("../router/git-tools");
+  const executable = tools.gitExecutable(tools.workRootGuards(cwd));
+  const trusted = await tools.inheritedSafeDirectoryArgs(executable);
+  return { prefix: [...tools.hardeningArgs(), ...trusted], env: tools.gitEnvironment(), executable };
 }
 
 function errorCode(err: unknown): unknown {
@@ -230,10 +252,17 @@ export async function snapshotTree(cwd: string, signal: AbortSignal, options: Sn
   let gitCwd = cwd;
   const run = options.git ?? execGit;
   const lowPriority = options.lowPriority === true;
-  const git = (args: string[]) => run(["--no-pager", ...args], {
-    cwd: gitCwd, signal, timeoutMs: SNAPSHOT_GIT_TIMEOUT_MS, maxBuffer: SNAPSHOT_GIT_MAX_BUFFER, lowPriority,
+  let prefix: readonly string[] = ["--no-pager"];
+  let hardening: Pick<SnapshotGitOptions, "env" | "executable"> = {};
+  const git = (args: string[]) => run([...prefix, ...args], {
+    cwd: gitCwd, signal, timeoutMs: SNAPSHOT_GIT_TIMEOUT_MS, maxBuffer: SNAPSHOT_GIT_MAX_BUFFER, lowPriority, ...hardening,
   });
   try {
+    if (options.hardened === true) {
+      const hardened = await hardenedGit(cwd);
+      prefix = hardened.prefix;
+      hardening = { env: hardened.env, executable: hardened.executable };
+    }
     const root = (await git(["rev-parse", "--show-toplevel"])).trim();
     // ls-files otherwise scopes untracked contents to a subdirectory cwd,
     // missing same-path edits in sibling packages that tests may import.

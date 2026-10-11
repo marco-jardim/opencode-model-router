@@ -28,7 +28,8 @@ import * as dispatchModule from "../../src/routing/wire/dispatch";
 import { addToWorkingSet, forgetWorkingSet } from "../../src/routing/wire/working-set";
 import type { RepoLocation } from "../../src/routing/roles/admission";
 import { createChangedFileStore } from "../../src/verify/dispatch";
-import { planPerimeter } from "../../src/verify/perimeter";
+import * as perimeterModule from "../../src/verify/perimeter";
+import { PERIMETER_MAX, planPerimeter } from "../../src/verify/perimeter";
 
 type Tree = Awaited<ReturnType<typeof import("../../src/verify/tree").snapshotTree>>;
 
@@ -38,7 +39,7 @@ const seam = vi.hoisted(() => {
     const normalized = at.replace(/\\/g, "/").replace(/\/+$/, "");
     return process.platform === "win32" ? normalized.toLowerCase() : normalized;
   };
-  return { key, pins: new Map<string, unknown>(), calls: [] as string[] };
+  return { key, pins: new Map<string, unknown>(), calls: [] as string[], hardened: [] as string[] };
 });
 
 vi.mock("../../src/verify/tree", async importOriginal => {
@@ -48,6 +49,7 @@ vi.mock("../../src/verify/tree", async importOriginal => {
     snapshotTree: (...args: Parameters<typeof actual.snapshotTree>) => {
       const key = seam.key(args[0]);
       seam.calls.push(key);
+      if (args[2]?.hardened === true) seam.hardened.push(key);
       const pin = seam.pins.get(key);
       return pin !== undefined ? Promise.resolve(pin as Tree) : actual.snapshotTree(...args);
     },
@@ -125,6 +127,7 @@ afterEach(() => {
   vi.restoreAllMocks();
   seam.pins.clear();
   seam.calls.length = 0;
+  seam.hardened.length = 0;
   forgetWorkingSet("orch");
   for (const key of ["HOME", "USERPROFILE"] as const) {
     if (saved[key] === undefined) delete process.env[key];
@@ -212,6 +215,9 @@ describe("the verification perimeter of a cross-repo role dispatch (P1.8)", () =
     expect(out).toContain("UNVERIFIED");
     expect(out).not.toContain("✓ verified");
     expect(artefacts()[0]?.perimeter?.roots.map(root => [root.name, root.status])).toEqual([["lib-b", "changed"]]);
+    // QA-1 F4 (I11): git runs hardened in an extra root, at dispatch and at the gate; W's own snapshot is unchanged.
+    expect(seam.hardened.filter(key => key === seam.key(lib))).toHaveLength(2);
+    expect(seam.hardened).not.toContain(seam.key(repo));
   }, 60_000);
 
   it("I4-writers: lib-b changed but the producer ran no unattributable writer: not refused by I4", async () => {
@@ -223,6 +229,8 @@ describe("the verification perimeter of a cross-repo role dispatch (P1.8)", () =
     expect(out).not.toMatch(ANY_I4);
     expect(out).toContain("✓ verified");
     expect(artefacts()[0]?.perimeter?.roots[0]?.status).toBe("changed");
+    // QA-1 F6 (I4 "otherwise → a note"): the rendered scope line says lib-b changed.
+    expect(out).toMatch(/also observed: lib-b \([^ ()]+ @ [0-9a-f]{7}, changed during the dispatch\)/);
   }, 60_000);
 
   it("I4-unchanged: lib-b unchanged and the producer ran bash: only the empty-change caveat (I5), no I4", async () => {
@@ -258,6 +266,8 @@ describe("the verification perimeter of a cross-repo role dispatch (P1.8)", () =
     const out = await runTask(hooks, `Implement it.\n${SYNC_DOD}`, async () => undefined);
     expect(out).toContain("✓ verified");
     expect(await gateResults()).toMatch(SCOPE_LINE);
+    // QA-1 F6: the line is rendered on the pass (a verification note), not only kept in the gate result.
+    expect(out).toMatch(SCOPE_LINE);
   }, 60_000);
 
   it("defer-cross-repo: a deferred DoD with a perimeter is verified at once, without a handle", async () => {
@@ -298,7 +308,7 @@ describe("the verification perimeter of a cross-repo role dispatch (P1.8)", () =
 
   it("contamination: a write while an extra root's dispatch snapshot is in flight discards it", async () => {
     const tree = { cwd: lib, root: lib, head: "a".repeat(40), fingerprint: "f", dirty: false, files: [] } as unknown as NonNullable<Tree>;
-    const run = async (write: boolean): Promise<Tree> => {
+    const run = async (write?: (store: ReturnType<typeof createChangedFileStore>) => void): Promise<Tree> => {
       const store = createChangedFileStore();
       let release: (value: Tree) => void = () => undefined;
       const held = new Promise<Tree>(settle => {
@@ -309,12 +319,142 @@ describe("the verification perimeter of a cross-repo role dispatch (P1.8)", () =
         timeoutMs: 10_000,
         perimeter: { roots: [{ at: lib }] },
       });
-      if (write) store.observeEdit("bash", path.join(lib, "src"));
+      write?.(store);
       release(tree);
       await begun;
       return store.perimeterOf("d")?.entries.get(lib)?.snapshot;
     };
-    expect(await run(false)).toBe(tree);
-    expect(await run(true)).toBeUndefined();
+    expect(await run()).toBe(tree);
+    expect(await run(store => store.observeEdit("bash", path.join(lib, "src")))).toBeUndefined();
+    // QA-1 F1: router_run's cwd is always W, so the call's directory never names lib-b; an unattributable writer discards it.
+    expect(await run(store => store.observeEdit("router_run", repo))).toBeUndefined();
+    expect(await run(store => store.observeEdit("bash", repo))).toBeUndefined();
+    // A tool that never writes leaves it alone.
+    expect(await run(store => store.observeEdit("read", repo))).toBe(tree);
   });
+
+  it("QA-1 F1: router_run (cwd W) while lib-b's dispatch snapshot is in flight: lib-b was not observed, so unverifiable", async () => {
+    const hooks = await crossRepo();
+    let release: (value: Tree) => void = () => undefined;
+    seam.pins.set(seam.key(lib), new Promise<Tree>(settle => {
+      release = settle;
+    }));
+    const out = await runTask(hooks, `VERIFY_WAIT:0s\nImplement it.\n${SYNC_DOD}`, async (h, sid) => {
+      const args = { script: "build", cwd: repo };
+      await h["tool.execute.before"]({ tool: "router_run", sessionID: sid, callID: "c-run" }, { args: { ...args } });
+      // While the run runs it writes lib-b, and lib-b's in-flight dispatch snapshot settles holding that write; the run's
+      // after hook comes later, too late to discard it.
+      await changeLib();
+      release(seam.pins.get(seam.key(lib)) as Tree);
+      await new Promise(settle => setTimeout(settle, 20));
+      fs.writeFileSync(path.join(repo, "index.ts"), "export const v = 1;\n");
+      await pin(repo);
+      await h["tool.execute.after"]({ tool: "router_run", sessionID: sid, callID: "c-run", args }, { title: "", output: "", metadata: {} });
+    });
+    expect(out).toMatch(/the repository lib-b at \S+ could not be observed during the dispatch, and the producer ran router_run/);
+    expect(out).toContain("UNVERIFIED");
+    expect(out).not.toContain("✓ verified");
+    expect(artefacts()[0]?.perimeter?.roots.map(root => [root.name, root.status])).toEqual([["lib-b", "unobserved"]]);
+  }, 60_000);
+
+  /** A pinned stand-in tree for a working-set root that is not a real repository. */
+  const fakeTree = (dir: string): Tree => ({
+    cwd: dir, root: dir, head: "b".repeat(40), branch: "main", fingerprint: `fake:${dir}`, dirty: false, files: [],
+  } as unknown as NonNullable<Tree>);
+
+  it("QA-1 F2: a root past the cap is kept, never snapshotted, and reported unobserved; with bash, I4 names it", async () => {
+    addToWorkingSet("orch", location(lib, "lib-b"));
+    const extras = Array.from({ length: PERIMETER_MAX - 1 }, (_, i) => path.join(parent, `extra-${i + 1}`));
+    for (const dir of extras) {
+      addToWorkingSet("orch", location(dir, path.basename(dir)));
+      seam.pins.set(seam.key(dir), fakeTree(dir));
+    }
+    routeAsRole(location(repo, "app-a"));
+    const hooks = await makePlugin();
+    await pin(repo);
+    await pin(lib);
+    const last = extras[extras.length - 1] ?? "";
+    const out = await runTask(hooks, `Implement it.\n${SYNC_DOD}`, async (h, sid) => {
+      await runTool(h, sid, "bash", { command: "echo hi" });
+    });
+    expect(seam.calls).not.toContain(seam.key(last));
+    expect(out).toMatch(new RegExp(`the repository ${path.basename(last)} at \\S+ could not be observed during the dispatch`));
+    const roots = artefacts()[0]?.perimeter?.roots ?? [];
+    expect(roots).toHaveLength(PERIMETER_MAX);
+    expect(roots.filter(root => root.status === "unobserved").map(root => root.name)).toEqual([path.basename(last)]);
+  }, 60_000);
+
+  it("QA-1 F3: two links into one repository are one root, at its top level", () => {
+    routeAsRole(location(repo, "app-a"));
+    const modules = path.join(repo, "node_modules");
+    fs.mkdirSync(modules, { recursive: true });
+    for (const name of ["x", "y"]) {
+      fs.mkdirSync(path.join(lib, "packages", name), { recursive: true });
+      fs.symlinkSync(path.join(lib, "packages", name), path.join(modules, `pkg-${name}`), "junction");
+    }
+    const plan = planPerimeter("task:orch:call1", repo, () => ({ parents: [parent], depth: 1, exclude: [] }));
+    expect((plan?.roots ?? []).map(seed => [seam.key(seed.at), seed.fixed])).toEqual([[seam.key(lib), undefined]]);
+  });
+
+  it("QA-1 F4: a linked repository past repoDepth, excluded, or not a git repository is unadmitted and never snapshotted", async () => {
+    routeAsRole(location(repo, "app-a"));
+    const deep = path.join(parent, "group", "deep");
+    initRepo(deep, { "a.txt": "a\n" });
+    const plain = path.join(parent, "plain");
+    fs.mkdirSync(plain, { recursive: true });
+    const modules = path.join(repo, "node_modules");
+    fs.mkdirSync(modules, { recursive: true });
+    for (const target of [deep, plain, lib]) fs.symlinkSync(target, path.join(modules, path.basename(target)), "junction");
+    const statuses = (exclude: string[]): Record<string, string> => Object.fromEntries(
+      (planPerimeter("task:orch:call1", repo, () => ({ parents: [parent], depth: 1, exclude }))?.roots ?? [])
+        .map(seed => [path.basename(seed.at), seed.fixed ?? "observed"]),
+    );
+    expect(statuses([])).toEqual({ "lib-b": "observed", deep: "unadmitted", plain: "unadmitted" });
+    expect(statuses([`${parent.replace(/\\/g, "/")}/lib-*`])).toEqual({ "lib-b": "unadmitted", deep: "unadmitted", plain: "unadmitted" });
+    // Through a dispatch (repoParents = the temporary parent): the unadmitted roots are named in I8 as not observed, and git
+    // never runs there.
+    const realPlan = perimeterModule.planPerimeter;
+    vi.spyOn(perimeterModule, "planPerimeter").mockImplementation((id, cwd) => realPlan(id, cwd, () => ({ parents: [parent], depth: 1, exclude: [] })));
+    const hooks = await makePlugin();
+    await pin(repo);
+    await pin(lib);
+    const out = await runTask(hooks, `Implement it.\n${SYNC_DOD}`, async () => undefined);
+    expect(seam.calls).not.toContain(seam.key(deep));
+    expect(seam.calls).not.toContain(seam.key(plain));
+    expect(out).toContain("✓ verified");
+    expect(out).toMatch(/also observed: .*deep \(not observed\)/);
+    expect(out).toMatch(/also observed: .*plain \(not observed\)/);
+  }, 60_000);
+
+  it("QA-1 F10: a perimeter that cannot be planned fails closed: with bash, unverifiable", async () => {
+    routeAsRole(location(repo, "app-a"));
+    vi.spyOn(perimeterModule, "planPerimeter").mockImplementation(() => {
+      throw new Error("boom");
+    });
+    const hooks = await makePlugin();
+    await pin(repo);
+    const out = await runTask(hooks, `Implement it.\n${SYNC_DOD}`, async (h, sid) => {
+      await runTool(h, sid, "bash", { command: "echo hi" });
+      fs.writeFileSync(path.join(repo, "index.ts"), "export const v = 1;\n");
+      await pin(repo);
+    });
+    expect(out).toMatch(/the verification perimeter could not be planned/);
+    expect(out).toContain("UNVERIFIED");
+  }, 60_000);
+
+  it("QA-1 F11: another worktree of W's own repository changed with bash: I4 suggests branch=<b>", async () => {
+    const wt = path.join(parent, "app-a-wt");
+    execFileSync("git", ["worktree", "add", "-q", "-b", "feat-x", wt], { cwd: repo, stdio: "ignore" });
+    addToWorkingSet("orch", location(wt, "app-a"));
+    routeAsRole(location(repo, "app-a"));
+    const hooks = await makePlugin();
+    await pin(repo);
+    await pin(wt);
+    const out = await runTask(hooks, `Implement it.\n${SYNC_DOD}`, async (h, sid) => {
+      await runTool(h, sid, "bash", { command: "echo hi" });
+      fs.writeFileSync(path.join(wt, "index.ts"), "export const v = 2;\n");
+      await pin(wt);
+    });
+    expect(out).toMatch(/Dispatch that work with branch=feat-x, or verify it there\./);
+  }, 60_000);
 });

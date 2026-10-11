@@ -9,23 +9,36 @@
  *
  * Inert by default (I9): only a routed role dispatch whose grant has a location (cross-repo admission bound it), or whose
  * orchestrator session's working set holds a root other than W, can have a perimeter; every other dispatch plans none, so nothing
- * else is snapshotted and no reason changes. A link target is snapshotted only when its real path is admitted by text first
- * (below a `routing.repoParents` entry, or inside a working-set worktree; I11, I12); its git top level is checked again at the gate.
+ * else is snapshotted and no reason changes.
+ *
+ * Link targets (QA round 1, I11, I12), all without running git:
+ * - a link whose real path is neither below a `routing.repoParents` entry nor inside a working-set worktree is not in P;
+ * - otherwise its repository's top level is found by walking up to the nearest `.git` entry (F3), and links are de-duplicated
+ *   by top level, so several links into one monorepo are one root and one snapshot;
+ * - a top level is admitted when it lies 1..`routing.repoDepth` segments below a parent and no `routing.repoExclude` glob
+ *   matches it or a directory between the parent and it, or when it is a working-set worktree (F4). A top level that is not
+ *   admitted, or a link target that is not in a git repository, is kept as an "unadmitted" root: never snapshotted, and named in
+ *   I8 as not observed;
+ * - P holds at most PERIMETER_MAX snapshotted roots, W included; the roots beyond are kept as "unobserved" roots, never dropped
+ *   (F2), so the gate refuses a dispatch that ran unattributable writers.
  */
-import { lstatSync, readdirSync, realpathSync } from "node:fs";
+import { lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import * as path from "node:path";
+import { permissionMatches } from "../router/read-only";
 import { routedRoleOf } from "../routing/wire/dispatch";
 import { workingSetOf } from "../routing/wire/working-set";
 import type { DispatchPerimeter, PerimeterSeed } from "./dispatch";
 import { isStoreLikeLink } from "./reference";
 
-/** P holds at most this many roots, W included. */
+/** P holds at most this many snapshotted roots, W included. */
 export const PERIMETER_MAX = 16;
 
-/** What link admission needs: `routing.repoParents` and `routing.repoDepth`. */
+/** What link admission needs: `routing.repoParents`, `routing.repoDepth` and `routing.repoExclude`. */
 export interface PerimeterAdmission {
   readonly parents: readonly string[];
   readonly depth: number;
+  /** `routing.repoExclude`: absolute globs (the max policy's matcher, `permissionMatches`). Absent: none. */
+  readonly exclude?: readonly string[];
 }
 
 /** A comparison key: absolute, "/" separators, no trailing separator, case-folded on win32. */
@@ -56,6 +69,14 @@ function readNames(dir: string): string[] {
   }
 }
 
+function canonical(dir: string): string {
+  try {
+    return realpathSync.native(dir);
+  } catch {
+    return path.resolve(dir);
+  }
+}
+
 /** The package entries of `<w>/node_modules`: the top level, and one level under `@scope`. Dot-entries are tool state. */
 function packageEntries(w: string): string[] {
   const modules = path.join(w, "node_modules");
@@ -72,8 +93,8 @@ function packageEntries(w: string): string[] {
   return entries;
 }
 
-/** The real paths of W's package links (symlinks, junctions) that point outside W, are not store-like and pass `admitted`. */
-function linkedTargets(w: string, admitted: (real: string) => boolean): string[] {
+/** The real paths of W's package links (symlinks, junctions) that point outside W and are not store-like, de-duplicated. */
+function linkedTargets(w: string): string[] {
   const targets = new Map<string, string>();
   for (const entry of packageEntries(w)) {
     let real: string;
@@ -83,10 +104,51 @@ function linkedTargets(w: string, admitted: (real: string) => boolean): string[]
     } catch {
       continue; // Unreadable or dangling: it loads nothing.
     }
-    if (insideOrEqual(real, w) || insideOrEqual(w, real) || isStoreLikeLink(real, process.platform) || !admitted(real)) continue;
+    if (insideOrEqual(real, w) || insideOrEqual(w, real) || isStoreLikeLink(real, process.platform)) continue;
     if (!targets.has(perimeterKey(real))) targets.set(perimeterKey(real), real);
   }
   return [...targets.values()];
+}
+
+/**
+ * QA-1 F3: the git top level of `dir` found without git: the nearest directory at or above it holding a `.git` entry (a
+ * directory, or a worktree's or submodule's `.git` file), strictly below `ceiling` when given. Undefined when there is none.
+ */
+function gitTopOf(dir: string, ceiling?: string): string | undefined {
+  let current = path.resolve(dir);
+  for (;;) {
+    if (ceiling !== undefined && !(depthBelow(current, ceiling) >= 1)) return undefined;
+    try {
+      lstatSync(path.join(current, ".git"));
+      return current;
+    } catch {
+      // No `.git` here: keep walking up.
+    }
+    const up = path.dirname(current);
+    if (up === current) return undefined;
+    current = up;
+  }
+}
+
+/** QA-1 F11: the git common directory of the repository whose top level is `top`, read without git; undefined when unknown. */
+function commonDirOf(top: string | undefined): string | undefined {
+  if (top === undefined) return undefined;
+  const dotGit = path.join(top, ".git");
+  try {
+    if (lstatSync(dotGit).isDirectory()) return perimeterKey(canonical(dotGit));
+    const named = /^gitdir:\s*(.+?)\s*$/m.exec(readFileSync(dotGit, "utf8").slice(0, 4096))?.[1];
+    if (named === undefined) return undefined;
+    const gitDir = path.resolve(top, named);
+    let common = gitDir;
+    try {
+      common = path.resolve(gitDir, readFileSync(path.join(gitDir, "commondir"), "utf8").trim());
+    } catch {
+      // No `commondir`: a submodule's (or a relocated) git directory is its own common directory.
+    }
+    return perimeterKey(canonical(common));
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -108,28 +170,80 @@ export function planPerimeter(dispatchID: string, cwd: string, admission: () => 
   const others = workingSet.filter((entry) => !insideOrEqual(w, entry.worktree) && !insideOrEqual(entry.worktree, w));
   if (location === undefined && others.length === 0) return undefined;
 
+  // QA-1 F11: W's git common directory, to tell another worktree of W's own repository from another repository.
+  const wCommon = commonDirOf(gitTopOf(w));
+  const sameRepository = (top: string): boolean => wCommon !== undefined && commonDirOf(top) === wCommon;
+
   const seeds: PerimeterSeed[] = [];
   const seen = new Set<string>([perimeterKey(w)]);
+  let observed = 0;
+  // QA-1 F2: past the cap a root is kept, unobserved (the gate refuses it with writers), never dropped.
   const add = (seed: PerimeterSeed): void => {
     const key = perimeterKey(seed.at);
-    if (seen.has(key) || seeds.length >= PERIMETER_MAX - 1) return;
+    if (seen.has(key)) return;
     seen.add(key);
-    seeds.push(seed);
+    if (seed.fixed !== undefined) {
+      seeds.push(seed);
+      return;
+    }
+    observed += 1;
+    if (observed <= PERIMETER_MAX - 1) {
+      seeds.push(seed);
+      return;
+    }
+    seeds.push({
+      at: seed.at,
+      ...(seed.name !== undefined ? { name: seed.name } : {}),
+      ...(seed.sameRepository === true ? { sameRepository: true } : {}),
+      fixed: "unobserved",
+    });
   };
-  for (const entry of others) add({ at: entry.worktree, name: entry.name });
+  for (const entry of others) {
+    add({ at: entry.worktree, name: entry.name, ...(sameRepository(entry.worktree) ? { sameRepository: true } : {}) });
+  }
 
   const config = admission();
-  const belowParent = (dir: string, maxDepth: number): boolean => config.parents.some((parent) => {
-    const depth = depthBelow(dir, parent);
-    return depth >= 1 && depth <= maxDepth;
-  });
-  const inWorkingSet = (dir: string): boolean => workingSet.some((entry) => insideOrEqual(dir, entry.worktree));
-  // Admission by text before any git call (I11, I12); the snapshot's top level is admitted again at the gate (`admit`).
-  const admitRoot = (root: string): boolean =>
-    belowParent(root, Math.max(1, config.depth)) || workingSet.some((entry) => perimeterKey(entry.worktree) === perimeterKey(root));
-  for (const real of linkedTargets(w, (dir) => belowParent(dir, Number.POSITIVE_INFINITY) || inWorkingSet(dir))) {
-    if (seeds.some((seed) => insideOrEqual(real, seed.at))) continue;
-    add({ at: real, admit: admitRoot });
+  const depth = Math.max(1, Math.floor(config.depth));
+  const exclude = config.exclude ?? [];
+  // Both spellings of each parent: as configured, and canonical (link targets are real paths).
+  const parents = [...new Map(config.parents.flatMap((parent) => [parent, canonical(parent)]).map((p) => [perimeterKey(p), p])).values()];
+  const excluded = (parent: string, top: string): boolean => {
+    if (exclude.length === 0) return false;
+    const segments = path.relative(parent, top).split(/[\\/]/).filter((segment) => segment !== "");
+    for (let level = 1; level <= segments.length; level++) {
+      const dir = path.join(parent, ...segments.slice(0, level));
+      if (exclude.some((glob) => permissionMatches(dir, glob))) return true;
+    }
+    return false;
+  };
+  const parentOf = (dir: string): string | undefined => parents.find((parent) => depthBelow(dir, parent) >= 1);
+  const worktreeOf = (dir: string) => workingSet.find((entry) => insideOrEqual(dir, entry.worktree));
+  // QA-1 F4 (I11, I12): admission by top level, before any git call; the snapshot's top level is checked again at the gate.
+  const admitTop = (top: string): boolean =>
+    workingSet.some((entry) => perimeterKey(entry.worktree) === perimeterKey(top))
+    || parents.some((parent) => {
+      const below = depthBelow(top, parent);
+      return below >= 1 && below <= depth && !excluded(parent, top);
+    });
+
+  for (const real of linkedTargets(w)) {
+    // Admission by text first: a link outside every parent and every working-set worktree is not in P.
+    const parent = parentOf(real);
+    const worktree = worktreeOf(real);
+    if (parent === undefined && worktree === undefined) continue;
+    // QA-1 F3: the repository's top level, without git; the walk stops at the parent (or above the worktree).
+    const top = gitTopOf(real, worktree !== undefined ? path.dirname(worktree.worktree) : parent);
+    if (top === undefined) {
+      add({ at: real, name: path.basename(real), fixed: "unadmitted" }); // Not in a git repository: nothing to observe.
+      continue;
+    }
+    if (insideOrEqual(top, w) || insideOrEqual(w, top)) continue; // W's own repository: W's snapshot covers it.
+    if (seeds.some((seed) => seed.fixed === undefined && insideOrEqual(top, seed.at))) continue; // A working-set root covers it.
+    if (!admitTop(top)) {
+      add({ at: top, name: path.basename(top), fixed: "unadmitted" });
+      continue;
+    }
+    add({ at: top, admit: admitTop, ...(sameRepository(top) ? { sameRepository: true } : {}) });
   }
   if (seeds.length === 0) return undefined;
   return { ...(location !== undefined ? { name: location.name } : {}), roots: seeds };

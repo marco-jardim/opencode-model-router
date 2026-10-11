@@ -71,6 +71,8 @@ export interface DispatchCaptureDeps {
    * baseline and bounded by `timeoutMs`. Absent: no perimeter, and nothing else is snapshotted (I9).
    */
   perimeter?: DispatchPerimeter;
+  /** Cross-repo QA-1 F4 (I11): how an extra root of the perimeter is snapshotted (hardened git). Absent: `snapshot`. */
+  perimeterSnapshot?: (cwd: string, signal: AbortSignal) => Promise<TreeSnapshot | undefined>;
   /** Bounds the snapshot, the head read and the capture, each (baselineTimeoutMs). */
   timeoutMs: number;
 }
@@ -83,6 +85,15 @@ export interface PerimeterSeed {
   readonly name?: string;
   /** Link targets only: whether the git top level the snapshot names is admitted (checked at the gate). */
   readonly admit?: (root: string) => boolean;
+  /**
+   * Cross-repo QA-1: a root that is never snapshotted, and the status the gate reports for it. "unobserved": past PERIMETER_MAX
+   * (F2), or the placeholder of a perimeter that could not be planned (F10); I4 refuses it when writers ran. "unadmitted" (F4):
+   * a linked directory whose repository is not admitted (`routing.repoParents` / `repoDepth` / `repoExclude`) or that is not a
+   * git repository; git never runs there (I11, I12), and I8 names it as not observed.
+   */
+  readonly fixed?: "unobserved" | "unadmitted";
+  /** QA-1 F11: a worktree of W's own repository (the same git common directory): I4 suggests `branch=`, not `repo=`. */
+  readonly sameRepository?: boolean;
 }
 
 /** Cross-repo P1.8: the perimeter P of a dispatch beyond W. */
@@ -319,8 +330,10 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
       || pathKey(cwd).startsWith(pathKey(other) + "/") || pathKey(other).startsWith(pathKey(cwd) + "/");
     for (const d of dispatches.values()) {
       // Cross-repo P1.8: a write that may land in an extra root of the perimeter discards that root's in-flight snapshot.
+      // QA-1 F1: an unattributable writer's directory says nothing about where it writes (router_run's cwd is always W), so it
+      // discards every in-flight perimeter snapshot, whatever its cwd.
       for (const entry of d.perimeter?.entries.values() ?? []) {
-        if (entry.pending && overlaps(entry.seed.at)) entry.contaminatedBy ??= tool;
+        if (entry.pending && (isUnattributedWriter(tool) || overlaps(entry.seed.at))) entry.contaminatedBy ??= tool;
       }
       if (!overlaps(d.cwd)) continue;
       if (d.snapshotPending) {
@@ -437,13 +450,19 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
       // Cross-repo P1.8 (I13): P is fixed now; each extra root is snapshotted like the change baseline, with the same bound.
       if (deps.perimeter !== undefined && deps.perimeter.roots.length > 0) {
         const entries = new Map<string, PerimeterEntry>();
+        const snapshotRoot = deps.perimeterSnapshot ?? deps.snapshot;
         for (const seed of deps.perimeter.roots) {
+          // QA-1 F2, F4, F10: a fixed root is kept (the gate reports it) but never snapshotted.
+          if (seed.fixed !== undefined) {
+            entries.set(seed.at, { seed, pending: false, snapshot: Promise.resolve(undefined) });
+            continue;
+          }
           const entry: PerimeterEntry = { seed, pending: true, snapshot: Promise.resolve(undefined) };
           entry.snapshot = (async (): Promise<TreeSnapshot | undefined> => {
             const controller = new AbortController();
             let snapshot: TreeSnapshot | undefined;
             try {
-              snapshot = await withTimeout(deps.snapshot(seed.at, controller.signal), deps.timeoutMs, "perimeter fingerprint");
+              snapshot = await withTimeout(snapshotRoot(seed.at, controller.signal), deps.timeoutMs, "perimeter fingerprint");
             } catch {
               snapshot = undefined; // Unavailable: the gate reports the root as not observed.
             } finally {

@@ -51,6 +51,21 @@ vi.mock("node:fs/promises", () => ({
   readFile: async () => state.content,
   readlink: async () => "target",
 }));
+/** QA-1 F4: the hardening a `hardened` snapshot takes from git-tools.ts (loaded only then), pinned here. */
+const HARDENED = vi.hoisted(() => ({
+  prefix: ["--no-optional-locks", "--no-pager", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=NUL"],
+  trusted: ["-c", "safe.directory=D:/trusted"],
+  env: { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "NUL" },
+  executable: "C:/Program Files/Git/cmd/git.exe",
+}));
+vi.mock("../../src/router/git-tools", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../src/router/git-tools")>()),
+  hardeningArgs: () => [...HARDENED.prefix],
+  inheritedSafeDirectoryArgs: async () => [...HARDENED.trusted],
+  gitEnvironment: () => ({ ...HARDENED.env }),
+  gitExecutable: () => HARDENED.executable,
+  workRootGuards: (root: string) => [root],
+}));
 beforeEach(() => Object.assign(state, {
   head: "head1", status: "", diff: "", index: "", untracked: "", content: "", stage: "", error: false,
   branchRef: "refs/heads/main",
@@ -102,6 +117,36 @@ describe("Git tree fingerprint adapter", () => {
     seen.length = 0;
     expect(await snapshotTree(process.cwd(), signal, { git })).toBeDefined();
     expect(seen.map(o => o.lowPriority)).toEqual(Array(7).fill(false));
+  });
+  it("QA-1 F4: hardened (opt-in) runs every git process hardened, by path, in the hardened environment; the default is unchanged", async () => {
+    const prefix = [...HARDENED.prefix, ...HARDENED.trusted];
+    const seen: { args: readonly string[]; opts: SnapshotGitOptions }[] = [];
+    // The child_process mock answers by the arguments after `--no-pager`: hand it the command without the hardening.
+    const git = async (args: readonly string[], opts: SnapshotGitOptions) => {
+      seen.push({ args, opts });
+      const hardened = args.slice(0, prefix.length).join("\0") === prefix.join("\0");
+      return execGit(["--no-pager", ...args.slice(hardened ? prefix.length : 1)], opts);
+    };
+    const signal = new AbortController().signal;
+    expect(await snapshotTree(process.cwd(), signal, { hardened: true, git })).toBeDefined();
+    expect(seen).toHaveLength(7);
+    for (const { args, opts } of seen) {
+      expect(args.slice(0, prefix.length)).toEqual(prefix);
+      expect(opts.env).toEqual(HARDENED.env);
+      expect(opts.executable).toBe(HARDENED.executable);
+    }
+    expect(state.binaries).toEqual(Array(7).fill(HARDENED.executable));
+    // Default (W's snapshot): `--no-pager` first, the process's own environment, git by name, as before.
+    seen.length = 0;
+    state.binaries = [];
+    expect(await snapshotTree(process.cwd(), signal, { git })).toBeDefined();
+    expect(seen).toHaveLength(7);
+    for (const { args, opts } of seen) {
+      expect(args[0]).toBe("--no-pager");
+      expect(args).not.toContain("core.fsmonitor=false");
+      expect("env" in opts || "executable" in opts).toBe(false);
+    }
+    expect(state.binaries).toEqual(Array(7).fill("git"));
   });
   it("QA-3.1-8: the default git seam lowers the process's priority as exec.ts does", async () => {
     // Generous timeout: this test is about priority, and a 5 ms timer could fire on a slow
