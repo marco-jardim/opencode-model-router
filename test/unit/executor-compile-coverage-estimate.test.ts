@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+// Branch coverage for planEstimate: costed tasks, finished tasks, gates, cycles.
 import { INTEGRATION_ESTIMATE_MS, formatSummary, planEstimate, taskEstimate } from "../../src/executor/compile/estimate";
 import type { DurationEstimate, DurationModel, DurationQuery } from "../../src/routing/outcomes/durations";
 import type { CompileSummary, Edge, PhaseRecord, TaskKind, TaskNode, TaskState } from "../../src/executor/types";
@@ -119,6 +120,52 @@ describe("planEstimate coverage", () => {
     expect(r.workMs).toBe(3 * H);
     expect(r.criticalPathMs).toBe(H);
     expect(Number.isFinite(r.expectedMakespanMs)).toBe(true);
+  });
+
+  it("keeps the later start when a shorter predecessor is relaxed after a longer one", () => {
+    const r = planEstimate(
+      plan(
+        [node("A", 2 * H), node("B", H), node("C", H)],
+        [edge("A", "C"), edge("B", "C")],
+      ),
+      4,
+    );
+    expect(r.criticalPathMs).toBe(3 * H);
+    expect(r.workMs).toBe(4 * H);
+    expect(r.width).toBe(2);
+    expect(r.expectedMakespanMs).toBe(3 * H);
+  });
+
+  it("raises the start when a longer predecessor is relaxed after a shorter one", () => {
+    const r = planEstimate(
+      plan(
+        [node("B", H), node("A", 2 * H), node("C", H)],
+        [edge("B", "C"), edge("A", "C")],
+      ),
+      4,
+    );
+    expect(r.criticalPathMs).toBe(3 * H);
+    expect(r.width).toBe(2);
+  });
+
+  it("does not add events for zero-cost launchable tasks alongside costed ones", () => {
+    const r = planEstimate(plan([node("Z", 0), node("A", H)]), 4);
+    expect(r.width).toBe(1);
+    expect(r.workMs).toBe(H);
+    expect(r.expectedMakespanMs).toBe(H);
+  });
+
+  it("orders a finishing interval before a starting one at the same instant across phases", () => {
+    const r = planEstimate(
+      plan(
+        [node("A", H, { phase: "p1" }), node("B", H, { phase: "p2" }), node("C", H)],
+        [edge("gate:p1", "gate:p2"), edge("A", "C")],
+        [phase("p1"), phase("p2")],
+      ),
+      4,
+    );
+    expect(r.width).toBe(2);
+    expect(r.criticalPathMs).toBe(2 * H);
   });
 
   it("rounds fractional milliseconds", () => {

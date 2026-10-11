@@ -203,6 +203,45 @@ describe("addTasks", () => {
     expect(h.compiler.validate(ledger)).toEqual([]);
   });
 
+  it("rejects a new task that an already finished task would have to wait for", async () => {
+    const { h, ledger } = await setup();
+    const finished = { ...ledger, tasks: { ...ledger.tasks, "1.2.1": { ...(ledger.tasks["1.2.1"] as TaskNode), state: "done" as const } } };
+    let caught: unknown;
+    try {
+      h.compiler.addTasks(finished, frag("- **1.2.2** Too late", "  Writes: `src/d.ts`", "  This must run before 1.2.1."));
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ExecutorError);
+    expect((caught as ExecutorError).code).toBe("E_INVALID_INPUT");
+    expect((caught as ExecutorError).message).toContain("cannot wait for a new task");
+  });
+
+  it("rejects added tasks that leave the extended ledger invalid and lists the violations", async () => {
+    const { h, ledger } = await setup();
+    const withQa = { ...ledger, tasks: { ...ledger.tasks, "1.2.1": { ...(ledger.tasks["1.2.1"] as TaskNode), kind: "qa" as const } } };
+    let caught: unknown;
+    try {
+      h.compiler.addTasks(withQa, frag("- **1.2.QA** Second review", "  Writes: `src/review.ts`"));
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ExecutorError);
+    const err = caught as ExecutorError;
+    expect(err.code).toBe("E_INVALID_INPUT");
+    expect(err.message).toContain("added tasks are invalid");
+    const violations = (err.detail as { violations: Array<{ code: string; taskIds: string[] }> }).violations;
+    expect(violations.map((v) => v.code)).toContain("qa-multiple");
+    expect(violations.find((v) => v.code === "qa-multiple")?.taskIds).toContain("1.2.QA");
+  });
+
+  it("leaves a pending task alone while reopening only ready ones", async () => {
+    const { h, ledger } = await setup();
+    const r = h.compiler.addTasks(ledger, frag("- **1.2.2** First", "  Writes: `src/d.ts`", "  This must run before 1.2.1."));
+    expect(r.edges.some((e) => e.from === "1.2.2" && e.to === "1.2.1")).toBe(true);
+    expect(r.reopened).toEqual([]);
+  });
+
   it("reopens a ready task that must now wait for a new one", async () => {
     const { h, ledger } = await setup();
     const ready = { ...ledger, tasks: { ...ledger.tasks, "1.2.1": { ...(ledger.tasks["1.2.1"] as TaskNode), state: "ready" as const } } };

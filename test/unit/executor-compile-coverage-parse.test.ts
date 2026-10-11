@@ -12,6 +12,7 @@ import type { AnnotatedPlan, PlanStep } from "../../src/routing/engine";
 import { ExecutorError } from "../../src/executor/types";
 import { FIXTURES_DIR, readFixture } from "../fixtures/cpx/plans/loader";
 
+// Extra cases at the end of the file cover QA block merging and Depends-on continuation lines.
 const doc = (...lines: string[]): string => `${lines.join("\n")}\n`;
 
 function failure(text: string): ExecutorError {
@@ -189,6 +190,69 @@ describe("parsePlan structure", () => {
   it("collects nested bullets of hash tasks as subtasks", () => {
     const p = parsePlan(doc("- do the thing", "  - part one", "  - part two"));
     expect(p.tasks[0]?.subtasks).toEqual(["part one", "part two"]);
+  });
+
+  it("merges a QA review block into an explicit QA task of the same phase", () => {
+    const p = parsePlan(
+      doc(
+        "### Phase 1.1: A",
+        "",
+        "**Tasks**",
+        "- **1.1.1** Build it",
+        "- **1.1.QA** Review the build",
+        "",
+        "**QA review**",
+        "- also check the edge cases",
+        "  Writes: `src/review.ts`",
+      ),
+    );
+    expect(idsOf(p).filter((id) => id === "1.1.QA")).toHaveLength(1);
+    const qa = task(p, "1.1.QA");
+    expect(qa.kind).toBe("qa");
+    expect(qa.text).toContain("Review the build");
+    expect(qa.text).toContain("also check the edge cases");
+    expect(qa.body).toContain("also check the edge cases");
+    expect(qa.span.endLine).toBeGreaterThan(qa.span.line + 1);
+    expect(qa.writesLine?.text).toBe("`src/review.ts`");
+  });
+
+  it("keeps what the explicit QA task already declares when the block repeats it", () => {
+    const p = parsePlan(
+      doc(
+        "### Phase 1.1: A",
+        "",
+        "**Tasks**",
+        "- **1.1.QA** Review the build [tier:heavy] VERIFY:required CAP:2",
+        "  Writes: `src/own.ts`",
+        "",
+        "**QA review**",
+        "- second look [tier:fast] VERIFY:none CAP:5",
+        "  Writes: `src/other.ts`",
+      ),
+    );
+    const qa = task(p, "1.1.QA");
+    expect(qa.tierTag).toBe("heavy");
+    expect(qa.verify).toBe("required");
+    expect(qa.cap).toBe(2);
+    expect(qa.writesLine?.text).toBe("`src/own.ts`");
+  });
+
+  it("joins the continuation lines of a task-level Depends on clause", () => {
+    const p = parsePlan(
+      doc(
+        "### Phase 1.1: A",
+        "",
+        "**Tasks**",
+        "- **1.1.1** First",
+        "- **1.1.2** Second",
+        "- **1.1.3** Third",
+        "  Depends on: 1.1.1",
+        "  and also 1.1.2",
+        "  Writes: `src/third.ts`",
+      ),
+    );
+    const after = p.phrases.find((x) => x.subject.id === "1.1.3" && x.verb === "after");
+    expect(after?.refs).toEqual(["1.1.1", "1.1.2"]);
   });
 });
 
