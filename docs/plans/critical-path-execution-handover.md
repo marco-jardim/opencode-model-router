@@ -333,8 +333,7 @@ Everything else is work: resolve it, record it, continue.
 
 ## 7. Live state (§0.11 — keep current)
 
-**Next action:** Phase 0.1 — 0.1.3 (three `smoke:cpx` runs, running in the orchestrator shell since 21:20; observations
-copied to `$env:TEMP\omr-cpx-runs\run<n>`), then 0.1.4 heavy ADR text.
+**Next action:** Phase 0.1 QA round 2 (heavy) at the p01 head after merging `cpx/main` (A-0.1-2) into `cpx/p01`.
 
 **Orchestrator session:** `ses_ed82f88a7ffej5iKaRHuwIa6fd` (directory `D:\git\omr-cpx-main`).
 
@@ -346,7 +345,7 @@ implementation's worktree `D:\git\opencode-model-router-cross-repo` (branch `fea
 | Phase | State | QA round | Notes |
 |---|---|---|---|
 | 0.P | **done** 2026-10-10 ≈20:45 | 3 (r1: 14, r2: 9, r3: 1 — all fixed or dispositioned; 7 minor/nit deferred to the DF-1 pre-flight) | started 18:55; `preflight.md` verdict: done |
-| 0.1 | running (0.1.3) | — | started 20:37; worktree `D:\git\omr-cpx-p01`, base tag `cpx/p01-base` = `584e0cf`; pre-flight `d65c3f2`; 0.1.0 `06e9840`; 0.1.1 `b996991`; 0.1.2 `aef7992`, `a138c8c`, `4b1af17`, `8592eb3` |
+| 0.1 | QA round 2 pending | 1 done (16 findings: 2 critical, 6 major, 7 minor, 1 nit — all fixed) | started 20:37; tasks 0.1.0–0.1.6 done; smoke:cpx 3× green after the round-1 fixes (51/51, 2026-10-11 00:20–00:47); ADR 0007 regenerated `25d2ec4`; A-0.1-2 applied in `cpx/main` |
 | 1.1 · 1.2 · 1.3 · 1.4 | waiting | — | |
 | 2.1 | waiting | — | |
 | DF-1 | waiting | — | |
@@ -455,7 +454,8 @@ pre-flight, listed in `preflight.md` "Deferred findings").
    test (new) instead of the v1-frozen `scripted-provider.ts` / `scripted-provider.test.ts` (pinned to `V1_BASE_COMMIT`
    `bd1ecd1` by scenario `6-v1-untouched`); `smoke:cpx` also runs the new unit tests. The same pin made `46dac26` a v1
    regression; reverted in `9943abe`.
-6. Recorded deviations (QA-0.P-5): (a) `7e6903f` and `46dac26` wrote test files outside 0.P's write set — pre-flight
+6. A-0.1-2 (QA-0.1-8) — applies ADR 0007 revision 2026-10-11 to the plan (56 edits: D4 hint, D5 reinstated behind a real-provider gate, C10 branch, D6 `capacity`, D13 range 1–8, launcher A only, D14 guards, D15 wakes, D16 attempt counting, Appendices A–D). Amendment text: the ADR architect dispatch `ses_ed6ed6d71ffe03JQRRB4s1CT2F`; applied by implementer `ses_ed6d74d7effe09Cn074msuezGc`.
+7. Recorded deviations (QA-0.P-5): (a) `7e6903f` and `46dac26` wrote test files outside 0.P's write set — pre-flight
    fixes under §0.7 ("fix everything it finds"), done in `cpx/main` while no phase was in flight; `v2-hooks.test.ts`'s
    owning phases (1.2, 2.1, 3.1) inherit the first; `deferred-catalog.smoke.test.ts` is owned by no phase. (b) 0.P.2,
    0.P.4 and the first implementer dispatch ran before the 0.P.6 restart (order 0.P.1 → 0.P.3 → 0.P.6 → 0.P.2 →
@@ -478,4 +478,4 @@ were last registered (at plugin start, or at a refresh after a config change) is
 host typings) — reported to the owner, out of plan scope. PF-2 ROLES.md registration wording (handoff above). PF-3
 `D:\git\omr-cpx-main\test\smoke\deferred-catalog.smoke.test.ts` leaked `OPENCODE_*` into its host — fixed in `46dac26`
 (QA-0.P-17), then reverted in `9943abe` (v1-frozen file); the leak stays mitigated per shell. `test\setup\smoke-tmp-guard.ts` `keyedSmokeEnv` also passes the environment through (keyed smokes use the
-real config on purpose); covered by the per-shell `OPENCODE_CONFIG_DIR` removal.
+real config on purpose); covered by the per-shell `OPENCODE_CONFIG_DIR` removal. PF-4 `test\smoke\routing-engine.smoke.test.ts` scenario `5-advisor` fails on OpenCode 2.0.26 also at `cpx/p01-base` (checked in a scratch worktree, removed afterwards) — host catalog drift, not caused by this plan; to be fixed by the phase that next owns that smoke, or recorded for the owner.
