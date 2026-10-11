@@ -77,7 +77,7 @@ import {
   CARRIED_NO_PROCESS_REASON, roleAttemptVerification, roleEscalationAfterFail, roleMaxActions, routedRoleOf, strippedRouteRoot,
 } from "./routing/wire/dispatch";
 import { roleTierOrder } from "./routing/engine/ladders";
-import { detectRedispatch, returnSignal, runSignal, parseReturnPrefix, type DispatchText } from "./routing/outcomes/signals";
+import { acceptanceScriptsOf, detectRedispatch, returnSignal, runSignal, parseReturnPrefix, type DispatchText } from "./routing/outcomes/signals";
 import type { IngestSettings } from "./routing/outcomes/ingest";
 import { captureBudget } from "./guard/enforce";
 import { budgetClaimObserved, isIncompleteVerdict } from "./verify/checker";
@@ -1158,20 +1158,14 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     },
     bindingOf: (child: string) => currentBinding(child, { maxOf: roleMaxOf }),
   };
-  /** Exact npm forms of a deterministic check's command → the `routing.run` script it names (`npm test`, `npm run <name>`). */
-  const NPM_SCRIPT_RE = /^npm(?:\.cmd)?\s+(?:(test|t)|run(?:-script)?\s+([A-Za-z0-9_][A-Za-z0-9_.:@+-]*))$/;
-  /** The acceptance commands of a role dispatch as `routing.run` names (handoff 13): only exact npm script forms count. */
-  const acceptanceScripts = (prompt: unknown, description: unknown): string[] => {
-    const dod = buildDelegationDoD({
-      prompt: typeof prompt === "string" ? prompt : undefined,
-      description: typeof description === "string" ? description : undefined,
-    });
-    if (dod.kind !== "deterministic") return [];
-    return dod.checks.flatMap((check) => {
-      const match = typeof check.command === "string" ? NPM_SCRIPT_RE.exec(check.command.trim()) : null;
-      return match === null ? [] : [match[1] !== undefined ? "test" : (match[2] as string)];
-    });
-  };
+  /** The acceptance commands of a role dispatch as `routing.run` names (handoff 13); see `acceptanceScriptsOf`. */
+  const acceptanceScripts = (prompt: unknown, description: unknown): string[] =>
+    acceptanceScriptsOf(
+      buildDelegationDoD({
+        prompt: typeof prompt === "string" ? prompt : undefined,
+        description: typeof description === "string" ? description : undefined,
+      }),
+    );
   /**
    * QA-P21-2-3: the read-only cap a role dispatch asks for itself — `CAP:N`, or `CAP:none` with a `reason:` line (an unjustified
    * `CAP:none` is no cap, as for tier dispatches); `null` when it names none (then the child gets no read-only cap).
