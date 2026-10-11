@@ -669,6 +669,21 @@ describe("link pins at dispatch (P2.6)", () => {
     expect(await gateResults()).not.toMatch(/could not be observed/);
   }, 90_000);
 
+  it("M3: a delegating tool (task) while the pin is still computed keeps the pin", async () => {
+    const hooks = await linked([parent]);
+    const tree = seam.pins.get(seam.key(lib)) as NonNullable<Tree>;
+    let release: (value: Tree) => void = () => undefined;
+    const held = new Promise<Tree>(settle => {
+      release = settle;
+    });
+    for (const key of libKeys()) seam.digestPins.set(key, held);
+    await runTask(hooks, `Implement it.\n${TESTS_DOD}`, async (h, sid) => {
+      await runTool(h, sid, "task", { subagent_type: "fast", prompt: "look around", description: "nested" }); // Delegates; writes nothing itself.
+      release(tree);
+    });
+    expect(pinsOf(gateReferences()[0])?.map(pin => [pin.kind, seam.key(pin.root)])).toEqual([["pinned", seam.key(lib)]]);
+  }, 90_000);
+
   it("QA-2 #9c: a writer that ran after the pin settled leaves the pin in place", async () => {
     const hooks = await linked([parent]);
     await runTask(hooks, `Implement it.\n${TESTS_DOD}`, async (h, sid) => {
@@ -867,7 +882,10 @@ describe("consumer discovery (§6)", () => {
   // QA-1 #2: the scan budget is per root, a root stopped on it is incomplete (the old test, "past the bound, scanning stops", read
   // the budget as shared by all roots: lib-c was never read; it no longer is).
   it("QA-1 #2: the scan budget is per root; a root that stops on it without a consumer is reported incomplete", async () => {
-    for (const name of ["a", "b", "c"]) fs.mkdirSync(path.join(lib, "node_modules", name), { recursive: true });
+    // M2: only link entries spend the budget, so lib-b's three entries are links to a directory outside W.
+    const elsewhere = path.join(parent, "elsewhere");
+    fs.mkdirSync(elsewhere, { recursive: true });
+    for (const name of ["a", "b", "c"]) link(elsewhere, path.join(lib, "node_modules", name));
     const second = path.join(parent, "lib-c");
     link(repo, path.join(second, "node_modules", "app-a"));
     const roots = [{ root: lib, name: "lib-b" }, { root: second, name: "lib-c" }];
@@ -882,6 +900,38 @@ describe("consumer discovery (§6)", () => {
     // package.json) is looked up outside the budget, so lib-c is still found.
     expect(await perimeterModule.discoverConsumers(repo, [...roots, { root: path.join(parent, "missing") }], { maxEntries: 0 }))
       .toEqual({ consumers: [found], incomplete: [{ root: lib, name: "lib-b" }] });
+  });
+
+  it("M2: plain package directories do not spend the scan budget; a consumer link past them is found", async () => {
+    const modules = path.join(lib, "node_modules");
+    for (let i = 0; i < 3000; i++) fs.mkdirSync(path.join(modules, `plain-${String(i).padStart(4, "0")}`), { recursive: true });
+    link(repo, path.join(modules, "zz-consumer"));
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }], { maxEntries: 2000 }))
+      .toEqual({ consumers: [{ root: lib, name: "lib-b", entry: "zz-consumer" }], incomplete: [] });
+    // No consumer at all: plain directories alone never make the root incomplete.
+    fs.unlinkSync(path.join(modules, "zz-consumer"));
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }], { maxEntries: 2000 })).toEqual(NONE);
+  }, 60_000);
+
+  it("M2: more link entries than the budget with the consumer link past it is incomplete", async () => {
+    const elsewhere = path.join(parent, "elsewhere");
+    fs.mkdirSync(elsewhere, { recursive: true });
+    const modules = path.join(lib, "node_modules");
+    for (const name of ["l1", "l2", "l3"]) link(elsewhere, path.join(modules, name));
+    link(repo, path.join(modules, "zz-consumer"));
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }], { maxEntries: 3 }))
+      .toEqual({ consumers: [], incomplete: [{ root: lib, name: "lib-b" }] });
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }], { maxEntries: 4 }))
+      .toEqual({ consumers: [{ root: lib, name: "lib-b", entry: "zz-consumer" }], incomplete: [] });
+  });
+
+  it("M2: the hard cap on all entries read per root reports the root incomplete", async () => {
+    const modules = path.join(lib, "node_modules");
+    for (let i = 0; i < 6; i++) fs.mkdirSync(path.join(modules, `plain-${i}`), { recursive: true });
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }], { maxRead: 6 })).toEqual(NONE);
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }], { maxRead: 5 }))
+      .toEqual({ consumers: [], incomplete: [{ root: lib, name: "lib-b" }] });
+    expect(perimeterModule.CONSUMER_READ_MAX).toBe(20000);
   });
 
   it("QA-1 #2: W's package name is looked up directly, past the scan budget", async () => {

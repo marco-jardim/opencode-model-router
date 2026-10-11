@@ -228,6 +228,16 @@ export function isUnattributedWriter(tool: string): boolean {
 /** F2: tools that start a child session whose writes are not in the caller's lineage. */
 const DELEGATING_TOOLS = new Set(["task", "delegate", "subagent"]);
 
+/**
+ * Whether a call to `tool` may write the workspace behind the router's back, so that it discards every in-flight snapshot,
+ * capture and link pin. The one rule for both contaminateCaptures and the onUnattributedWriter signal (M3: they must not drift).
+ * A delegating tool never does: its child session is observed on its own, and it writes nothing itself (it is only an
+ * unattributed writer for the producer's empty-change-set caveat, isUnattributedWriter).
+ */
+function mayContaminate(tool: string): boolean {
+  return !isNonWritingTool(tool) && !DELEGATING_TOOLS.has(tool.toLowerCase());
+}
+
 export interface ChangedFile {
   path: string;
   status: string;
@@ -347,7 +357,8 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
     };
   }
   function notifyUnattributedWriter(tool: string, sessionID?: string): void {
-    if (!isUnattributedWriter(tool)) return;
+    // M3: the same rule as contaminateCaptures; a delegating tool counts as a writer for the tally, not for in-flight pins.
+    if (!isUnattributedWriter(tool) || !mayContaminate(tool)) return;
     for (const listener of [...unattributedWriterListeners]) {
       try {
         listener(tool, sessionID);
@@ -364,7 +375,7 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
 
   function contaminateCaptures(tool: string, cwd?: string): void {
     // E2E-3: fail closed. Only a tool known not to write leaves an in-flight snapshot or capture alone.
-    if (isNonWritingTool(tool)) return;
+    if (!mayContaminate(tool)) return;
     // Unknown directory is conservatively treated as overlapping every capture.
     const overlaps = (other: string) => !cwd || pathKey(cwd) === pathKey(other)
       || pathKey(cwd).startsWith(pathKey(other) + "/") || pathKey(other).startsWith(pathKey(cwd) + "/");

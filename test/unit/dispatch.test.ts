@@ -117,6 +117,19 @@ describe("createChangedFileStore", () => {
       s.observeEdit("grep", "/w");
       expect(calls).toEqual([]);
     });
+    it("is not called for a delegating tool (task, delegate, subagent), by observeEdit or by record", () => {
+      const s = createChangedFileStore();
+      const calls: string[] = [];
+      s.onUnattributedWriter(tool => calls.push(tool));
+      for (const tool of ["task", "delegate", "subagent", "TASK"]) {
+        s.observeEdit(tool, "/w");
+        s.record("S1", tool, {});
+      }
+      expect(calls).toEqual([]);
+      s.observeEdit("bash", "/w");
+      s.record("S1", "router_run", {});
+      expect(calls).toEqual(["bash", "router_run"]);
+    });
     it("stops after unsubscribe, and a throwing listener does not break the store or the others", () => {
       const s = createChangedFileStore();
       const calls: string[] = [];

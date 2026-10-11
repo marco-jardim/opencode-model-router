@@ -23,7 +23,7 @@
  * - P holds at most PERIMETER_MAX snapshotted roots, W included; the roots beyond are kept as "unobserved" roots, never dropped
  *   (F2), so the gate refuses a dispatch that ran unattributable writers.
  */
-import { lstatSync, readFileSync, readdirSync, readlinkSync, realpathSync } from "node:fs";
+import { type Dirent, lstatSync, readFileSync, readdirSync, readlinkSync, realpathSync } from "node:fs";
 import { lstat, readFile, readdir, readlink, realpath } from "node:fs/promises";
 import * as path from "node:path";
 import { permissionMatches } from "../router/read-only";
@@ -133,8 +133,11 @@ export interface PerimeterConsumer {
   readonly entry: string;
 }
 
-/** Cross-repo P2b.3: the bound on `node_modules` entries read by `discoverConsumers`, per root (QA-1 #2). */
+/** Cross-repo P2b.3: the bound on `node_modules` LINK entries checked by `discoverConsumers`, per root (QA-1 #2, M2: plain entries are free). */
 export const CONSUMER_SCAN_MAX = 2000;
+
+/** Cross-repo M2: the hard bound on all `node_modules` entries (links or not) read per root; past it the root is incomplete. */
+export const CONSUMER_READ_MAX = 20000;
 
 /** Cross-repo QA-1 #2: the bound on W's package names looked up directly (W's own, plus its workspace packages'). */
 export const CONSUMER_NAMES_MAX = 64;
@@ -237,17 +240,19 @@ async function packageNamesOf(w: string, stop: () => boolean): Promise<string[]>
  * Cross-repo P2b.3 (docs/design/cross-repo.md §6, consumer discovery): the roots among `roots` whose `node_modules` hold a
  * link whose real path is inside W or W itself. Only the given roots are read; async fs, no git; never throws. Per root
  * (QA-1 #2): first a direct lookup of each of W's package names (`<root>/node_modules/<name>`, scoped names included; one
- * lookup per name, outside the budget), then a scan of the entries `packageEntries` reads, at most `opts.maxEntries` (default
- * CONSUMER_SCAN_MAX) of them per root. A root whose scan stops on that bound without finding a consumer is incomplete; so is
+ * lookup per name, outside the budget), then a scan of the entries `packageEntries` reads, spending at most `opts.maxEntries`
+ * (default CONSUMER_SCAN_MAX) on link entries and reading at most `opts.maxRead` (default CONSUMER_READ_MAX) entries per root
+ * (QA-2 M2). A root whose scan stops on either bound without finding a consumer is incomplete; so is
  * every root not finished when `opts.signal` aborts (QA-1 #13, the gate deadline). A link whose text names a UNC or device
  * path is never resolved (QA-1 #3). One entry per consumer (the first link found); both lists follow the order of `roots`.
  */
 export async function discoverConsumers(
   w: string,
   roots: readonly ConsumerRoot[],
-  opts?: { maxEntries?: number; signal?: AbortSignal },
+  opts?: { maxEntries?: number; maxRead?: number; signal?: AbortSignal },
 ): Promise<ConsumerDiscovery> {
   const maxEntries = Math.max(0, Math.floor(opts?.maxEntries ?? CONSUMER_SCAN_MAX));
+  const readMax = Math.max(0, Math.floor(opts?.maxRead ?? CONSUMER_READ_MAX));
   const signal = opts?.signal;
   const stopped = (): boolean => signal?.aborted === true;
   // Per root, by index: a consumer's entry, "incomplete", "none"; unset while the root is not finished.
@@ -279,9 +284,9 @@ export async function discoverConsumers(
         return false; // Unreadable or dangling: it loads nothing.
       }
     };
-    const names = async (dir: string): Promise<string[]> => {
+    const entries = async (dir: string): Promise<Dirent[]> => {
       try {
-        return await readdir(dir);
+        return await readdir(dir, { withFileTypes: true });
       } catch {
         return [];
       }
@@ -305,10 +310,19 @@ export async function discoverConsumers(
         }
       }
       // (b) The bounded scan, its budget per root.
+      // Only link entries spend `budget` (M2); every entry read counts toward the hard `readMax` cap.
       let budget = maxEntries;
+      let read = 0;
       let exhausted = false;
-      const check = async (full: string, entry: string): Promise<void> => {
+      const check = async (full: string, entry: string, dirent: Dirent): Promise<void> => {
         if (found !== undefined || exhausted) return;
+        read += 1;
+        if (read > readMax) {
+          exhausted = true;
+          return;
+        }
+        // A plain directory or file is no link: free. A type the fs did not report is checked by lstat, like a link.
+        if (!dirent.isSymbolicLink() && (dirent.isDirectory() || dirent.isFile())) return;
         if (budget <= 0) {
           exhausted = true;
           return;
@@ -317,19 +331,24 @@ export async function discoverConsumers(
         if (await linksIntoW(full)) found = entry;
       };
       if (found === undefined) {
-        for (const top of await names(modules)) {
+        for (const top of await entries(modules)) {
           if (stopped()) return;
           if (found !== undefined || exhausted) break;
-          if (top.startsWith(".")) continue;
-          if (!top.startsWith("@")) {
-            await check(path.join(modules, top), top);
+          if (top.name.startsWith(".")) continue;
+          if (!top.name.startsWith("@")) {
+            await check(path.join(modules, top.name), top.name, top);
             continue;
           }
-          for (const sub of await names(path.join(modules, top))) {
+          read += 1;
+          if (read > readMax) {
+            exhausted = true;
+            break;
+          }
+          for (const sub of await entries(path.join(modules, top.name))) {
             if (stopped()) return;
             if (found !== undefined || exhausted) break;
-            if (sub.startsWith(".")) continue;
-            await check(path.join(modules, top, sub), `${top}/${sub}`);
+            if (sub.name.startsWith(".")) continue;
+            await check(path.join(modules, top.name, sub.name), `${top.name}/${sub.name}`, sub);
           }
         }
       }

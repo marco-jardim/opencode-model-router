@@ -1523,7 +1523,9 @@ export function createVerificationWiring(deps: {
   };
   /**
    * QA-2 #9c: an unattributable writer (any session: its directory says nothing about where it writes) discards every pin still
-   * being computed, as it discards an in-flight perimeter snapshot (dispatch.ts observeEdit).
+   * being computed, as it discards an in-flight perimeter snapshot (dispatch.ts contaminateCaptures). M3: the store only signals
+   * the writers that contaminate captures by the same predicate, so a delegating tool (task, delegate, subagent), which keeps
+   * the perimeter snapshot, keeps the pins too; parallel role dispatches no longer drop each other's pins.
    */
   const contaminateLinkPins = (tool: string): void => {
     if (!isUnattributedWriter(tool)) return;
