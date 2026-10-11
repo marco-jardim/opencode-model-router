@@ -14,7 +14,7 @@ Read this first in a new session. The design is `docs/design/cross-repo.md`, and
   ```powershell
   $env:OPENCODE_CONFIG_DIR = "$env:LOCALAPPDATA\omr-cross-repo\opencode-config"; opencode --standalone -s <session> D:\git\opencode-model-router-cross-repo
   ```
-  A change in `src/` takes effect only after restarting that instance. Ask the owner, then stop.
+  The plugin entry is `src/index.ts`, and on 2026-10-11 changes to `src/` took effect in the running instance without a restart (Q9 and Q10 worked live right after their commit). A half-applied edit therefore breaks live dispatches. Ask the owner for a restart only when a change is not picked up.
 - **Router overrides:** `~\.config\opencode\opencode-model-router.overrides.jsonc` is read from a fixed path, shared by every instance. It now has `"repoParents": ["D:/git"]` (added for the Phase 1 dogfood) and the owner's existing `workRoots`.
 - **Platform:** win32, pwsh 7, git 2.51.0.windows.1, OpenCode v2.0.26. No OpenCode 1.x is on PATH, so `smoke:v1` cannot run.
 
@@ -35,8 +35,8 @@ Last checks (HEAD after the round 2 fixes):
 
 ## Next steps
 
-1. ~~Phase 2 live dogfood~~: done (see "Phase 2 live dogfood"). Owner decisions Q9 (F-D1) and Q10 (F-D2) are open.
-2. **Owner decision Q8** (design §10): the role dispatch header is emitted for every roles-mode dispatch with a work root. I9 says routing output is unchanged when cross-repo is not configured. Keep it always on, or only when `repoParents`, `repo=`/`branch=`/`root=` is used, or W differs from the session directory?
+1. ~~Phase 2 live dogfood~~: done (see "Phase 2 live dogfood").
+2. ~~Owner decisions Q8, Q9, Q10~~: decided 2026-10-11 (design D14–D16) and implemented in `a594039` and `7c0301b`: the role header only when relevant; a refused declared target refuses the dispatch; `repo=` also matches a worktree directory name. Both Q9 and Q10 were confirmed live (`[router] role dispatch @explorer refused: repo=no-such-repo-xyz matches no repository below routing.repoParents (…): no work root.`).
 3. **Open owner decision Q7:** role agents are registered from a catch-all `*: deny`, so D13 cannot open worktrees outside the parents. The fix would turn the generated catch-all into `ask`; the risk is a background child waiting on a prompt. Do not change this without the owner.
 4. **Phase 2 lot 2 (P2e)**, plan `docs/design/cross-repo-phase2-plan.md`: store P and placements in the pending registration, observe P in the deferred finish, `prepareClaim` sets `prepared.perimeter`, S11 drift caveat, lift the interim rule; fix `noChangeGateSpawnsNothing` with `testScope:"full"` (F13). Own heavy QA after it.
 5. **Accepted minors** from the P0, P1 and P2 QA rounds are listed in design §9 ("Known follow-ups"). Revisit them only if they become relevant.
