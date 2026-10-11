@@ -759,6 +759,347 @@ export interface ChildRunner {
 - **Findings:** `FINDINGS_FORMAT` and `isFindingsReport`.
 - **Test doubles:** one typed double for each interface in §8 and each seam in §9, each used once.
 
+
+### 1.4.1-A1 Contract addendum (binding; resolves QA-1.4 round 1 at `168a25c`; architect, heavy pin, `ses_ed689bce6ffeVMf77avXeJC2cu`)
+
+**Precedence:** A1 amends memo 1.4.1; where they conflict, A1 wins. It adds no `TaskState`, no task transition and no field to Appendix A's data; it adds one gate edge, event fields, events and interface members.
+
+Event abbreviations: AS `attempt-started`, AC `attempt-child`, AA `attempt-adopted`, AE(o) `attempt-ended`, AV `attempt-verdict`, AX `attempt-context`, TT `task-transition`, TS(s,b) `task-slot` (TS(null) releases the slot, keeps the branch), TF `task-footprint` (new), TI `task-integrated`, IH `integration-head`, ISS/ISE `integration-step` start/end, G `gate-changed`, PP `phase-paused`, IA `inbox-added`, IAn `inbox-answered`.
+
+#### A1-0 Summary
+
+| Finding | Decision |
+|---|---|
+| QA-1.4-1 (critical) | The gate follows the qa task: G1 on dispatch/adopt, G2 whenever the qa task leaves flight without a parsed result. Snapshot invariant `qa-gate`. Recovery resumes a pending QA result from the stored report. |
+| QA-1.4-2 | Every event carries `batch` and `last`; the loader drops a trailing incomplete batch; per-event preconditions in order, whole-ledger invariants only at batch end; in-batch order fixed (A1-2.4). |
+| QA-1.4-3 | Open integration entries rebuilt from a never-rotated history journal; `resume()` reconciles the branch tip first, then each entry kind. |
+| QA-1.4-4 | `ContextRef {bootID, epoch, callID}` on `ChildRunRequest`, `LaunchRequest`, `LaunchHandle`; mismatch throws `ContextSupersededError` before any host call; `launch-lost`, not stale. |
+| QA-1.4-5 | One launch-failure table (A1-5); `taskError` → `reason` enum; `E_LAUNCH_TASK` has producers; `onChildCreated` the single journaling point; `onLateChild` only decides. |
+| QA-1.4-6 | Keys carry a per-process `bootID`; every non-ok gate reason except `disposed` has a wake; dedupe source = the plan's `wake` events (history + this writer). |
+| QA-1.4-7 | Cap item offers `accept`/`fix`; new gate edge `awaiting-qa → pending` (`cap-fix`, QaLoop); `awaiting-qa → passed` blocked while a cap item is open. |
+| QA-1.4-8 | Enumerated invariants with codes via `ledgerViolations()`; new patterns for phase ids, inbox ids, git ids, absolute paths. |
+| QA-1.4-10 | Strict position-based `parseLaunchHeader(prompt, sharedContext)`; `sharedContext` may not contain a header-shaped line; loose `looksLikePlanPrompt` only for the fail-closed check. |
+| QA-1.4-13 | Slot+leases and token columns on every row (A1-2.4); leases held exactly while `slot !== null`. |
+| QA-1.4-14 | `qaUnparsableCount(t)` from the context prefix; the R12 retry never bypasses `maxAttempts`. |
+| QA-1.4-16 | Read-only exemption; no signature change. |
+| QA-1.4-17 | `ref` journal-only, kept in history; learned footprints get a `task-footprint` event. |
+| QA-1.4-18 | History journal + a binding `exportPlan` merge rule. |
+| QA-1.4-19 | A draft carries `seq: 1`; `create` enforces it; `draft-replaced` sets `seq` through its own event. |
+| QA-1.4-20 | Dequeue only while the plan is running and the task's phase is not paused; abort order: latch, `queue.abort()`, one Rt batch, cancel children. |
+
+#### A1-1 QA gate, rounds, cap and unparsable output (QA-1.4-1, -7, -14)
+
+Rules (replace R12, R16 and memo §3.3 rows):
+- **QA1 rounds.** `PhaseRecord.qaRound` is the 1-based current round (compile sets 1); only `qa-next-round` and `cap-fix` change it (+1 each); `gate-changed.qaRound` is the value after the change. Round 1's qa task is the plan's qa task of the phase; round r ≥ 2's is `reviewTaskId(phaseId, r)` = `${phaseId}.QA${r}`; fix tasks from round r findings are `fixTaskId(phaseId, r, k)` = `${phaseId}.FIX${r}-${k}`.
+- **QA2** at most one `qa` task outside {done, cancelled} per phase (compile `validate`: `qa-multiple`).
+- **QA3 G1 (`qa-dispatched`):** `gate-changed awaiting-qa→qa-running` in the same batch as a qa task's `ready→dispatched` (launch) or `ready→running` (adopt, incl. recovery).
+- **QA4 G2 (`qa-requeued`):** `gate-changed qa-running→awaiting-qa` in the same batch as a qa task leaving {dispatched, running} for anything but `completed`: `launch-lost`/`launch-task-error`; `running→failed|parked|ready` (any trigger); `→blocked`. `→cancelled` writes no G2.
+- **QA5 parsed result:** Rt writes one batch AE(succeeded), AX(`canonicalFindingsJson(report)`), TT `running→completed` (`child-ended`), TT `completed→done` (`no-changes`), TS(null); gate stays `qa-running`; a qa task never commits; then `QaLoop.onQaResult` writes one batch (A1-1.3). "Result pending" = gate `qa-running` and no qa task of the phase in flight.
+- **QA6 R12 restated:** c = `qaUnparsableCount(task)` before this attempt's context. c = 0 → row 16: AE(failed), AX(`QA_UNPARSABLE_CONTEXT_PREFIX + error`), TT `running→failed` (`qa-unparsable`), G2, then the ordinary decision (`failed→ready` iff `hasAttemptsLeft`, else P `failed→parked`). **R12 never bypasses `maxAttempts`.** c ≥ 1 → row 17 by P: AE(**failed**), AX(prefix+error), TT `running→parked` (`qa-unparsable`), TS(null), G2, IA(failure). An answer replaces the latest context (R13), so after an answer the count drops by one and the next unparsable output parks again immediately (intended).
+- **QA7 R16:** `readySet` returns a qa task only while its phase gate is `awaiting-qa`; `promotable` may still move it `pending→ready`.
+- **QA8 cap:** at the result of round r with any blocking/critical/major finding left: r < `qaMaxRounds` → `qa-next-round`; else `qa-cap`: G `qa-running→awaiting-qa`, PP(true, `"qa-cap"`), IA `{kind:"qa-cap", severity:"critical", taskId:<round-r qa task>, options: r < QA_ROUND_LIMIT ? ["accept","fix"] : ["accept"]}`; while open, `onAwaitingQa` is a no-op.
+- **QA9 cap answers** via `UnattendedPolicy.answer` → `QaLoop.onCapAnswer`; trimmed lowercased answer must equal an option else `E_INVALID_INPUT`. `accept`: IAn, one IA per remaining finding `{kind:"qa-cap", severity:"info", answer:"deferred"}`, G `awaiting-qa→passed` (`cap-accepted`), PP(false). `fix`: IAn, G `awaiting-qa→pending` (`cap-fix`, qaRound+1), `task-created` for fix tasks (blocking/critical/major only) and the re-review task, `edge-added`, PP(false); findings from `QaLoop.parse(<round-r qa task>.attempts.at(-1).context)`.
+
+Gate table (replaces memo §3.3; 12 pairs):
+
+| From | To | Trigger(s) | Owner |
+|---|---|---|---|
+| pending | suite-running | `phase-integrated` | Q |
+| pending | awaiting-qa | `phase-integrated` (`phaseSuite = off`) | Q |
+| suite-running | awaiting-qa | `suite-passed` | Q |
+| suite-running | suite-failed | `suite-culprit-found` | Q |
+| suite-failed | pending | `culprit-reverted` | Q |
+| suite-failed | suite-running | `suite-rerun` | Q |
+| awaiting-qa | qa-running | `qa-dispatched` | Rt, Rc |
+| awaiting-qa | passed | `no-open-qa` (no qa task outside {done, cancelled} and no open critical `qa-cap` item naming one of the phase's qa tasks); `cap-accepted` | QL |
+| awaiting-qa | pending | `cap-fix` (new) | QL |
+| qa-running | awaiting-qa | `qa-requeued`; `qa-cap` | Rt, P, Q (requeued); QL (cap) |
+| qa-running | pending | `qa-next-round` | QL |
+| qa-running | passed | `qa-clean` (no in-scope findings; at round ≥ 3 only minor/nit, deferred) | QL |
+
+QaLoop batches (order binding): `qa-clean`: IA(deferred)…, G. `qa-next-round`: G (qaRound+1), task-created (fix… then re-review), edge-added…, IA(deferred)…. `qa-cap`: G, PP(true), IA(critical). `cap-accepted`/`cap-fix`: as QA9. `onQaResult` is idempotent: if the gate is no longer `qa-running`, it writes nothing and returns the outcome derived from the ledger.
+
+Recovery additions: gate `qa-running` with no qa task in flight (result pending) → `QaLoop.onQaResult(t, parse(t.attempts.at(-1).context).report)` (t = latest done qa task); gate `awaiting-qa` → `QaLoop.onAwaitingQa(phaseId)`; a lost dispatched/running qa task → the usual row (Rt `onChildEnd(lost "restart")`) plus G2.
+
+```ts
+export const GATE_TRANSITIONS: Readonly<Record<GateState, readonly GateState[]>> = {
+  pending: ["suite-running", "awaiting-qa"],
+  "suite-running": ["awaiting-qa", "suite-failed"],
+  "suite-failed": ["pending", "suite-running"],
+  "awaiting-qa": ["qa-running", "passed", "pending"],
+  "qa-running": ["awaiting-qa", "pending", "passed"],
+  passed: [],
+};
+export type GateTrigger =
+  | "phase-integrated" | "suite-passed" | "suite-culprit-found" | "culprit-reverted" | "suite-rerun"
+  | "qa-dispatched" | "qa-requeued" | "qa-cap" | "qa-next-round" | "qa-clean" | "no-open-qa" | "cap-accepted" | "cap-fix";
+export type GateTransitionKey = `${GateState}>${GateState}`;
+export const GATE_TRANSITION_TRIGGERS: Readonly<Partial<Record<GateTransitionKey, readonly GateTrigger[]>>>;  // exactly 12 keys
+export type GateOwner = TransitionOwner | "QL";
+export const GATE_TRANSITION_OWNERS: Readonly<Partial<Record<GateTransitionKey, readonly GateOwner[]>>>;
+export const QA_ROUND_LIMIT = 999;
+export const FIX_TASKS_PER_ROUND_LIMIT = 999;
+export function fixTaskId(phaseId: PhaseId, round: number, k: number): TaskId;   // E_INVALID_INPUT unless PHASE_ID_PATTERN, 1≤round≤QA_ROUND_LIMIT, 1≤k≤FIX_TASKS_PER_ROUND_LIMIT
+export function reviewTaskId(phaseId: PhaseId, round: number): TaskId;            // 2 ≤ round ≤ QA_ROUND_LIMIT
+export const QA_UNPARSABLE_CONTEXT_PREFIX = "QA OUTPUT UNPARSABLE: ";
+export function qaUnparsableCount(t: TaskNode): number;
+export function canonicalFindingsJson(r: FindingsReport): string;  // JSON.stringify({findings: r.findings.map(f => ({id, severity, files, problem, fix}))})
+export const QA_CAP_OPTIONS = ["accept", "fix"] as const;
+export type QaCapChoice = (typeof QA_CAP_OPTIONS)[number];
+export interface QaLoop {
+  parse(text: string): { ok: true; report: FindingsReport } | { ok: false; error: string };
+  onQaResult(taskId: TaskId, report: FindingsReport): Promise<"passed" | "next-round" | "cap-reached">;
+  onAwaitingQa(phaseId: PhaseId): Promise<void>;
+  onCapAnswer(inboxId: string, choice: QaCapChoice): Promise<"passed" | "next-round">;
+}
+```
+`gate-changed` gains `trigger: GateTrigger`; per-event check: `from === phase.gate`, `canGateTransition`, trigger listed for the pair, `qaRound === phase.qaRound + (trigger ∈ {qa-next-round, cap-fix} ? 1 : 0)`. `isPhaseRecord`: `1 ≤ qaRound ≤ QA_ROUND_LIMIT`.
+
+#### A1-2 Batch framing, order and resources (QA-1.4-2, -13, -19)
+
+```ts
+type E<T extends string, P> = { seq: number; at: IsoTime; batch: number /* seq of the batch's first event */; last: boolean; type: T } & P;
+export type ExecutorEventInput = DistributiveOmit<ExecutorEvent, "seq" | "at" | "batch" | "last">;
+export type BatchBuilder = (ledger: Readonly<LedgerV1>) => readonly ExecutorEventInput[];
+// gate-changed: { phaseId; from; to; trigger: GateTrigger; qaRound }
+// integration-step: { edge; entry; step; result; detail; failingIds; closes: boolean }
+// + task-footprint: { taskId: TaskId; footprint: Footprint }   (durable)
+export interface LedgerWriter {
+  readonly planId: PlanId; readonly ledger: Readonly<LedgerV1>;
+  /** One batch. A builder runs synchronously inside the writer's serialization against the ledger the batch applies to; must be pure;
+   *  [] appends nothing and resolves with the current ledger. Validation per A1-2.2; all lines in one appendText; fsync iff any
+   *  isDurableEvent; then the history copy (A1-3). err E_ILLEGAL_TRANSITION (nothing written; detail = {batchIndex, eventIndex|null, codes}),
+   *  E_LOCK_LOST, I/O */
+  append(batch: readonly ExecutorEventInput[] | BatchBuilder): Promise<Readonly<LedgerV1>>;
+  openIntegration(): readonly OpenIntegrationEntry[];
+  snapshot(): Promise<void>; close(): Promise<void>;
+}
+```
+All events of a batch share one `at`. The builder form allocates inbox ids (`formatInboxId(kind, nextInboxNumber(ledger))`), entry ids (`i-${ledger.seq + k}`, k = 1-based position of the entry's first ISS) and latest-attempt checks without races.
+
+Load/append rules: (1) torn last line dropped with one warning; (2) framing: `seq` +1; first event of a file and any event after `last: true` has `batch === seq`; others share the previous `batch`; violation → `E_SEQ_GAP`; (3) a final complete line with `last: false` → the whole trailing batch dropped with one warning (`incomplete-batch`); (4) replay event by event with the per-event preconditions; at batch end `ledgerViolations(ledger)` must be `[]` else `E_ILLEGAL_TRANSITION`; whole-ledger invariants never mid-batch; (5) snapshots/rotation only at batch boundaries.
+
+Per-event preconditions:
+
+| Event | Precondition |
+|---|---|
+| `ledger-init` | `seq === 1`, alone in its batch, `ledger.seq === 1` |
+| `draft-replaced` | status ∈ {compiling, awaiting-residue, awaiting-approval} |
+| `status-changed` | `from === status`; `canStatusTransition` |
+| `plan-approved` | status `awaiting-approval`; `config.slotsDir !== null`; followed in the same batch by `status-changed →running` |
+| `task-created` | id absent; state `pending` or `done`; `attempts: []`; `slot === null` |
+| `edge-added` | both endpoints exist |
+| `task-transition` | `from === state`; `canTransition`; trigger ∈ `TRANSITION_TRIGGERS[key]` |
+| `attempt-started` | state `ready`; no open attempt; `n === attempts.length + 1`; open shape; nonce unused by the task |
+| `attempt-child` | state `dispatched`; n latest, open, `childSessionID === null` |
+| `attempt-adopted` | state `ready`; n latest; its outcome `lost` |
+| `attempt-ended` | state ∈ {dispatched, running}; n latest and open |
+| `attempt-verdict` | state `verifying`; n latest; outcome `succeeded`; verdict null |
+| `attempt-context` | `n === attempts.length ≥ 1` |
+| `task-footprint` | new ⊇ old (writes, reads, sources) |
+| `task-integrated` | state `integrating` |
+| `gate-changed` | A1-1 |
+| `phase-paused` | `paused` ≠ current |
+| `inbox-added` | id per `INBOX_ID_PATTERN`, prefix = `INBOX_ID_PREFIX[kind]`, n > every existing n |
+| `inbox-answered` | item open; critical `qa-cap`: answer ∈ options |
+
+In-batch order and resources (binding). Default order: acquiring TS, TF, `edge-added`; attempt events; subject TT(s); releasing TS; dependents' rows; G; PP; IA/IAn. [G1]/[G2] only for `kind: "qa"`. Leases are held exactly while `task.slot !== null` (acquired with the slot, released with it, rebuilt by recovery from it). "acquire" = `SlotPool.acquire` + leases before the batch (release them if `append` fails); "release" = pool + lease release after the fsync (for a live child being cancelled: after its `completion` settles). Token: "acquire" before the batch, "release(r)" after the fsync, "force" = `acquire(…, {force: true})`.
+
+| # | Row (trigger) | Batch, in order | Slot+leases | Token |
+|---|---|---|---|---|
+| 1 | pending→ready | TT | — | — |
+| 2 | pending→blocked | TT (inside P's park/exhausted batch, or a spread batch) | — | — |
+| 3 | pending→cancelled | TT | — | — |
+| 4 | ready→dispatched (launch) | [TS(slot)] if changed, AS, TT, [G1] | acquire (or keep) | acquire |
+| 4b | launch with task-class prep error (L1) | [TS], AS, TT ready→dispatched, AE(failed), AX(error), TT dispatched→failed (`launch-task-error`) | keep | release(other) |
+| 5 | ready→blocked (`dep-reverted`, **Q**) | TT, TS(null) | release | — |
+| 6 | ready→cancelled | TT, [TS(null)] | release | — |
+| 7 | ready→running (adopt) | AA, TT, [G1] | keep (slot must be non-null, else refuse) | force |
+| 8 | ready→done | TT | — | — |
+| 9 | ready→pending (`dep-added`) | (task-created…, edge-added… of the same batch), TT, [TS(null)] | release | — |
+| 10 | dispatched→running | AC, TT | keep | keep |
+| 11 | dispatched→ready (`launch-lost`) | AE(lost), TT, [G2] | keep (R4) | release(other); a late adopt forces |
+| 12 | dispatched→failed | AE(failed), AX, TT, [G2] | keep | release(other) |
+| 13 | dispatched→blocked (**Q**) | AE(interrupted), TT, TS(null), [G2] | release after settle | release after settle |
+| 14 | dispatched→cancelled | AE(interrupted), TT, TS(null) | release after settle | release after settle |
+| 15 | running→completed | AE(succeeded), TT. qa: AE, AX(report), TT, TT completed→done (`no-changes`), TS(null) | keep; qa: release | release(success) |
+| 16 | running→failed (`child-failed`, `lease-unresolvable`, `qa-unparsable` 1st) | AE(failed), AX, TT, [G2] | keep | release(other) |
+| 17 | running→parked (P): escalate/ambiguity AE(interrupted); qa-unparsable 2nd AE(failed) | AE, AX, TT, TS(null), [G2], IA, then TT pending→blocked for each transitive pending dependent | release | release(other) |
+| 18 | running→ready (`child-lost`: AE(lost); `capacity-stop`: AE(capacity)) | AE, [AX], TT, [G2] | keep | release(other) |
+| 18b | running→ready (`lease-needed`) | AE(interrupted), AX, TT running→ready, TF, edge-added(learned), TT ready→pending (`dep-added`), TS(null), [G2] | release | release(other) |
+| 19 | running→blocked (**Q**) | AE(interrupted), TT, TS(null), [G2] | release after settle | release after settle |
+| 20 | running→cancelled | AE(interrupted), TT, TS(null) | release after settle | release after settle |
+| 21 | completed→verifying | TS(slot, branch), TT | keep | — |
+| 22 | completed→done | TT, TS(null) | release | — |
+| 23 | completed→failed | AX, TT | keep | — |
+| 24 | completed→cancelled | TT, TS(null) | release | — |
+| 25 | verifying→verified | AV(pass), TT | keep | — |
+| 26 | verifying→failed | AV(fail \| unverifiable), AX, TT | keep | — |
+| 27 | verifying→cancelled | TT, TS(null) | release after verification stops | — |
+| 28 | verified→integrating (Q) | TT for each task of the entry, ISS(first step) | keep | — |
+| 29 | verified→cancelled | TT, TS(null) | release | — |
+| 30 | integrating→integrated (Q) | ISE(fast-forward ok, closes), IH, then per task in entry order: TI, TT, TS(null) | release | — |
+| 31 | integrating→conflict (Q) | ISE(rebase conflict), AX, TT | keep | — |
+| 32 | integrating→failed (Q) | ISE(checks \| batch-checks \| bisect failed), AX, TT | keep | — |
+| 33 | integrating→cancelled (Q) | ISE(rollback rolled-back, closes), TT, TS(null) | release | — |
+| 34 | integrated→reverted (Q) | ISE(revert-fast-forward ok, closes), IH, AX, TT, then R9 dependents as rows 5/13/19 | — | dependents per 13/19 |
+| 35 | conflict\|failed→ready (retry) | TT | keep | — |
+| 35b | reverted→ready (retry) | TT | — | — |
+| 36 | conflict\|failed\|reverted→parked (P) | TT, [TS(null)], IA, pending dependents→blocked | release | — |
+| 37 | parked→ready (P) | IAn, AX(answer), TT | — | — |
+| 38 | blocked→ready (P) | TT | — | — |
+| 39 | completed\|failed\|conflict\|reverted\|parked\|blocked→cancelled | TT, [TS(null)] | release | — |
+
+ISE `closes: true` when no task of the entry remains `integrating` and the entry has no further step. **Owner changes:** `TRANSITION_OWNERS["ready>blocked" | "dispatched>blocked" | "running>blocked"] = ["Q"]` (a revert and its dependents are one Q batch; Rt cancels the children from `IntegrationListener.onReverted` after the fsync). Retry/exhausted decisions (rows 35-36) are a separate batch right after rows 12, 16, 23, 26, 31, 32, 34; recovery adds: `failed`, `conflict`, `reverted` → apply the retry/exhausted decision (idempotent).
+
+Draft `seq` (QA-1.4-19): `PlanCompiler.compile` returns a draft with `seq: 1`; `LedgerStore.create` rejects any other value (`E_SCHEMA_INVALID`); `ledger-init` = `{seq: 1, batch: 1, last: true, ledger: draft}`. `mergeResidue`'s draft `seq` is ignored: the runtime journals `draft-replaced` (payload excludes `seq`) and `ledger.seq` becomes that event's `seq`.
+
+#### A1-3 Integration resume and the history journal (QA-1.4-3, -18, part of -17)
+
+- `history.jsonl` in the plan dir: append-only, never rotated; byte-identical copies of every main-journal line with `isHistoryEvent` true (`metric`, `integration-step`, `attempt-verdict`, `wake`). The main journal is the authority; a copy is written after it and never for an incomplete batch; at open, history is repaired from the main journal (append every history-class event with `seq` > history's last); rotation requires history synced through the snapshot's `seq`. The store derives `openIntegration()` from history at open and updates it on every append.
+- Entry rules (checked at open over history): an entry starts with ISS whose `entry.id === "i-" + seq`; a step's start requires the previous step's end; an end matches the open step; exactly one event per entry has `closes: true` (an end), nothing after it; `kind`, `phaseId`, `baseHead` fixed; `taskIds`, `candidate` may change (latest wins); ISS of `fast-forward`, `revert-fast-forward`, `tag`, `land` carries the target commit in `entry.candidate`.
+
+```ts
+export type HistoryEventType = "metric" | "integration-step" | "attempt-verdict" | "wake";
+export function isHistoryEvent(e: { type: string }): boolean;
+export interface IntegrationEntry { id: string; kind: "task" | "batch" | "revert" | "phase-suite" | "tag" | "land";
+  phaseId: PhaseId | null; taskIds: TaskId[]; slot: string | null; baseHead: string; candidate: string | null }
+export interface OpenIntegrationEntry { entry: IntegrationEntry; startSeq: number; step: IntegrationStep;
+  edge: "start" | "end"; result: IntegrationStepResult | null }
+export interface ResumeReport { completed: TaskId[]; rolledBack: TaskId[]; halted: boolean;
+  entries: Array<{ id: string; kind: IntegrationEntry["kind"]; action: "completed" | "rolled-back" | "rerun" | "tagged" | "none" }> }
+// IntegrationQueue.resume(): Promise<ResumeReport>
+```
+
+`resume()` runs once per plan before the first dequeue, whatever the task states (replaces the recovery row "`integrating` → `queue.resume()`"). Step 0 head reconciliation: tip = `rev-parse refs/heads/<integration.branch>`; tip = head → continue; tip ≠ head, head ancestor of tip, and an open entry's open/last step is `fast-forward`/`revert-fast-forward` with `candidate === tip` → complete it (journal the row 30 / 34 batch); otherwise no git action, journal [`status-changed →paused` (`"integration-branch-moved"`), IA(failure, critical)], return `halted: true`. Step 1 open entries oldest first: task/batch with an open rebase/checks/batch-checks/bisect/fast-forward (not landed) → reset the entry's slot, ISE(rollback, rolled-back, closes), tasks still `integrating` to the queue front in entry order (tasks a partial batch already integrated stay integrated); revert → discard the revert slot, ISE(rollback, rolled-back, closes), rerun the revert (gate still `suite-failed`); phase-suite → ISE(rollback, rolled-back, closes), `checkPhase` reruns; tag → ref `omr/<planId>/phase-<id>` at `candidate` → [ISE ok closes, `phase-tagged`], else create it then the same; land → base tip = `candidate` → ISE(land ok, closes), else ISE(land rolled-back, closes) and `land()` again iff status `completed` and `land = ff-when-clean`; any with open rollback → redo it (idempotent), then as above. Recovery: gate `pending` → `queue.checkPhase`; an `integrating` task with no open entry → load error `E_ILLEGAL_TRANSITION` (`integrating-without-entry`).
+
+`exportPlan` (binding): `snapshot` = current ledger; `events` = every history event since seq 1 merged with every event of the current main journal, deduplicated by `seq`, ascending; no lock; torn last lines dropped. Only history-class events are guaranteed back to seq 1.
+
+#### A1-4 Child run pinned to the gated context (QA-1.4-4)
+
+```ts
+export interface ContextRef { bootID: string /* 16 lowercase hex, random once per process, owned by ChildRunner */; epoch: number; callID: string }
+export interface RetainedContextInfo { sessionID: string; callID: string; messageID: string; agent: string; capturedAt: IsoTime;
+  bootID: string; epoch: number }
+export interface ChildRunRequest { /* … */ context: ContextRef }   // new, required
+export interface ChildRunner { readonly bootID: string; /* … */ }
+export class ContextSupersededError extends Error {
+  readonly requested: ContextRef; readonly current: ContextRef | null;
+  constructor(requested: ContextRef, current: ContextRef | null) { super("retained context superseded"); this.name = "ContextSupersededError";
+    this.requested = requested; this.current = current; }
+}
+export function isContextSupersededError(e: unknown): e is ContextSupersededError;  // by name; survives realm boundaries
+// LaunchRequest and LaunchHandle: replace `contextEpoch: number` with `context: ContextRef`.
+```
+Runner rule (3.1.5): `run()` uses exactly the capture identified by `r.context`; if `retainedContext(parentSessionID)` is null or its (bootID, epoch, callID) differs → reject with `ContextSupersededError` before any host call. Launcher: `launch()` throws `E_NO_CONTEXT` synchronously when `req.context` is not the current capture of `orchestratorSessionID`. `attempt-started.attempt.callID === req.context.callID`. Both outcomes are rows L3/L5: `launch-lost`, `lost`, **not** stale.
+
+#### A1-5 Launch failure table (QA-1.4-5; replaces R1, LaunchHooks, the `launch` doc)
+
+```ts
+export type LaunchConfirmation =
+  | { kind: "confirmed"; childSessionID: string; latencyMs: number }
+  | { kind: "unconfirmed"; reason: "timeout" | "threw" | "superseded" | "task-error" | "hook-failed"; error: string | null };
+// ChildEnd "lost".reason: "unconfirmed" | "unrequested-interrupt" | "runner-error" | "restart" | "context-superseded" | "refused"
+// MetricPayload "context-age": { …; bootID: string; epoch: number; callID; capturedAt; ageMs;
+//   result: "confirmed" | "timeout" | "threw" | "superseded" | "task-error" | "hook-failed" }
+export interface LaunchHooks {
+  /** Late child. Pure decision, journals nothing: "adopt" iff this attempt is the latest, its outcome lost, task ready, plan not aborted. */
+  onLateChild(childSessionID: string): Promise<"adopt" | "refuse">;
+  /** The single journaling point for a created child (in time or adopted late), inside onCreated after RoleBindings.bind and before the
+   *  child is prompted. Rt appends with a builder: dispatched with this attempt open → [AC, TT child-created]; ready with this attempt
+   *  latest and lost → [AA, TT adopt, G1] + forced token; anything else → throw (refuse). A throw makes the runner interrupt the child. */
+  onChildCreated(childSessionID: string): Promise<void>;
+}
+// TaskLauncher.launch err (synchronous, before any host call): E_NO_CONTEXT, E_LAUNCH_TASK, E_DISPOSED. markStale only for "timeout" and "threw".
+// formatLaunchHeader and formatLaunchPrompt throw E_LAUNCH_TASK (replacing E_INVALID_INPUT).
+// CapacityController.acquire(provider, heavy, taskId, attempt, opts?: { force: true }) — force never throws E_CAPACITY (adopt only).
+```
+Rt launch step (3.1.6; Rt journals every row, the launcher never journals): choose from `readySet` with `gate()` ok; acquire token, slot, leases; prepare route, nonce, n, prompt; append row 4 with a builder (returns [] if the task is no longer `ready`, n changed, or a qa gate is not `awaiting-qa` — then release what was acquired); if an older launch of the task has not settled (R4) `cancel(old, "superseded")`; `launch()`. `completion` always goes to `onChildEnd`, which processes only the latest open attempt (incl. adopted).
+
+| # | Failure point | Confirmation | `completion` | Batch (row) | Outcome | Stale | Journaled by |
+|---|---|---|---|---|---|---|---|
+| L1 | prep throws `E_LAUNCH_TASK` (route/agent/model, prompt/header render) | — | — | 4b | failed (counts) | no | Rt launch step |
+| L2 | `launch()` throws `E_LAUNCH_TASK` (header/prompt mismatch, unknown agent, bad workRoot) | — | — | 12 | failed (counts) | no | Rt launch step |
+| L3 | `launch()` throws `E_NO_CONTEXT` | — | — | 11 | lost | no | Rt launch step |
+| L4 | `launch()` throws `E_DISPOSED` | — | — | none; recovery `lost("restart")` | lost | no | Rc via Rt |
+| L5 | runner rejects `ContextSupersededError` | unconfirmed/superseded | lost/context-superseded | 11 | lost | no | Rt |
+| L6 | runner rejects before `onCreated` | unconfirmed/threw | lost/runner-error | 11 | lost | **yes** | Rt |
+| L7 | no `onCreated` within 30 s | unconfirmed/timeout | later: interrupted/superseded, lost/unconfirmed, or the adopted child's end | 11 | lost | **yes** | Rt |
+| L8 | in time; `RoleBindings.bind` throws | unconfirmed/task-error | lost/refused | 12 | failed (counts) | no | Rt |
+| L9 | in time; `onChildCreated` throws | unconfirmed/hook-failed | lost/refused | 11 (on `E_LOCK_LOST` nothing; runtime disposes) | lost | no | Rt |
+| L10 | in time; ok | confirmed | the child's end | 10 inside `onChildCreated` | — | — | Rt (hook) |
+| L11 | late; refused or bind/`onChildCreated` throws | — | lost/refused, ignored | none | stays lost | — | — |
+| L12 | late; adopted | — | the child's end for the reopened attempt | 7 inside `onChildCreated` | — | — | Rt (hook) |
+| L13 | confirmed; runner throws, no terminal event within `CHILD_END_GRACE_MS` | — | lost/runner-error | 18 (`child-lost`) | lost | no | `Rt.onChildEnd` |
+| L14 | confirmed; `execution.interrupted` without `cancel` (R7) | — | lost/unrequested-interrupt | 18 (`child-lost`) | lost | no | `Rt.onChildEnd` |
+| L15 | confirmed; `execution.failed` | — | failed or capacity (R3) | 16 or 18 (`capacity-stop`) | failed / capacity | no | `Rt.onChildEnd` |
+| L16 | `cancel()` (abort, blocked, superseded) | — | interrupted/<reason>, ignored | none (journaled before `cancel`) | — | — | — |
+| L17 | `dispose` | — | interrupted/dispose, ignored | none; recovery `lost("restart")` | lost | no | Rc via Rt |
+
+R1 restated: task-class errors are exactly L1, L2, L8 (`failed`, counts); every other pre-confirmation failure is `lost`; only L6 and L7 mark the context stale.
+
+#### A1-6 Wake keys and dedupe (QA-1.4-6)
+
+```ts
+export type LaunchGate =
+  | { ok: true; context: RetainedContextInfo; ageMs: number }
+  | { ok: false; reason: "disposed"; wake: null }
+  | { ok: false; reason: "no-context" | "awaiting-first-router-call" | "context-stale"; wake: { reason: "stale-context"; stateKey: string } };
+```
+Keys: `context-stale` → `stale-context:<bootID>:<epoch>`; `no-context` (a capture existed in this process and is gone) → `no-context:<bootID>:<orchestratorSessionID>:<lastEpoch>`; `awaiting-first-router-call` (no capture of the bound session in this process yet) → `await-router-call:<bootID>:<orchestratorSessionID>`. Rt calls `Waker.wake(g.wake.reason, g.wake.stateKey)` iff `g.ok === false`, `g.wake !== null` and the ready set computed as if the gate were ok is non-empty. Dedupe source: the `stateKey` of every `wake` event of the plan (history loaded at open + this writer since). A key is burned when its `wake` event is journaled (before `synthetic`, D8). `debounced` journals nothing. `failed` burns the key; Rt may retry the same situation at most twice, ≥ `wakeDebounceMs` apart, with keys `<key>#2`, `<key>#3`. `inbox:<id>` keys are plan-unique already.
+
+#### A1-7 Guards and invariants (QA-1.4-8, -10)
+
+```ts
+export const PHASE_ID_PATTERN = /^(?!.*\.\.)(?!.*\.$)(?!.*\.lock$)[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/;
+export const WAVE_ID_PATTERN = PHASE_ID_PATTERN;
+export const GIT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+export const ABSOLUTE_PATH_PATTERN = /^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+|\/)/;
+export const INBOX_ID_PREFIX: Readonly<Record<InboxKind, string>> =
+  { question: "Q", failure: "F", "usage-limit": "U", landing: "L", flaky: "K", "qa-cap": "R", breaker: "B" };
+export const INBOX_ID_PATTERN = /^([QFULKRB])-([1-9][0-9]{0,8})$/;
+export function formatInboxId(kind: InboxKind, n: number): string;
+export function nextInboxNumber(l: Pick<LedgerV1, "inbox">): number;   // 1 + max n across all prefixes
+export interface LedgerViolation { code: string; at: string /* JSON path */ }
+export function ledgerViolations(v: unknown): LedgerViolation[];      // isLedgerV1(v) === (ledgerViolations(v).length === 0)
+```
+Existing invariant codes: `shape`, `schema`, `config-limits`, `task-key`, `task-phase`, `phase-wave`, `edge-endpoint`, `seq`, `attempt-n`, `open-attempt`, `slot-required`, `branch-required`, `integrated-missing`, `manual-attempts`, `shared-context-length`, `shared-context-slot-path`.
+New in `isTaskNode`: `attempt-ended-pair` (`(outcome === null) === (endedAt === null)`, `endedAt ≥ startedAt`); `verdict-unsucceeded` (verdict ≠ null ⇒ outcome `succeeded`); `nonce-duplicate`; `running-without-child` (state `running` ⇒ latest attempt `childSessionID !== null`); `slot-forbidden` (`slot === null` in pending, blocked, parked, done, cancelled, integrated, reverted); `git-id` (`integrated.from/to`); `qa-without-phase` (`kind "qa"` ⇒ `phase !== null`).
+New in `isLedgerV1`: `path-not-absolute` (`planPath`, `repo.toplevel`, `integration.worktree`, non-null `config.slotsDir`); `git-id` (`repo.baseCommit`, `integration.head`); `phase-id`/`phase-duplicate`; `wave-id`/`wave-duplicate`; `wave-membership` (every `wave.phases[i]` exists with `phase.wave === wave.id`; every phase listed in exactly one wave, its own); `phase-depends` (entries exist, not self); `slots-dir-unresolved` (status ∈ {running, paused, completed} ⇒ `config.slotsDir !== null`); `inbox-id`/`inbox-duplicate` (pattern, prefix per kind, ids and numeric parts unique); `inbox-task` (non-null `taskId` exists); `shared-context-header` (no line of `sharedContext` matches `LAUNCH_HEADER_PATTERN`); `qa-multiple-open` (QA2); `qa-round` (1 ≤ qaRound ≤ QA_ROUND_LIMIT); `qa-gate` (status ≠ aborted, for each phase P: (a) a qa task of P in {dispatched, running} ⇒ `P.gate === "qa-running"`; (b) `P.gate === "qa-running"` ⇒ exactly one qa task of P in flight, or every qa task of P ∈ {done, cancelled} with at least one `done`).
+
+```ts
+/** Strict, at the fixed position: prompt starts with "PLAN CONTEXT\n" + sharedContext + "\n\n", the next line matches
+ *  LAUNCH_HEADER_PATTERN in full and is followed by "\n\n". Recovery (C7) uses this with ledger.sharedContext. */
+export function parseLaunchHeader(prompt: string, sharedContext: string): LaunchHeaderFields | null;
+/** Loose: any line matches. Only for the 3.1.7.a fail-closed check (over-matching fails closed). */
+export function looksLikePlanPrompt(prompt: string): boolean;
+/** §7 grammar. E_LAUNCH_TASK if sharedContext has a header-shaped line or taskBlock does not start with "TASK". */
+export function formatLaunchPrompt(sharedContext: string, header: LaunchHeaderFields, taskBlock: string): string;
+```
+Memo §7 regex fix: the task-id lookahead is `(?!\d+#)` (as in types.ts since `168a25c`); consumers import the exported pattern.
+
+#### A1-8 Minor findings
+
+- **QA-1.4-16:** `ExecutorRuntime.status`, `ready`, `exportPlan`, `planLine` are read-only: never `E_NOT_OWNER`, any status incl. completed/aborted, signatures unchanged; `status` uses its `sessionID` only to pick the plan when `planId` is null.
+- **QA-1.4-17:** `attempt-verdict.ref` stays journal-only (no `Attempt` field; survives rotation through history). New durable event `task-footprint {taskId, footprint}` (owner Rt, only in row 18b), monotone (writes, reads, sources only grow; the learned path added to `writes`, `"learned"` to `sources`; `confidence` unchanged).
+- **QA-1.4-20 queue gating:** dequeue only while `status === "running"` and the task's phase is null or not paused (a queued task of a paused phase is skipped but keeps its position; a batch takes only dequeueable tasks; `checkPhase` starts a suite only under the same condition; `resume()` runs in running and paused, starting no new step except A1-3's reruns). **Abort order:** (1) in-memory latch (no launch, enqueue or promotion); (2) `await queue.abort()` (stop dequeuing, roll back the step in progress, journal one batch with row 33 events; other open entries closed `rolled-back`; on throw log and continue); (3) one Rt builder batch: rows 3, 6, 14, 20, 24, 27, 29, 39 for every task not in {done, cancelled, integrated, integrating}, then `status-changed →aborted` last; (4) after the fsync `launcher.cancel(t, n, "abort")` for every launch in flight incl. unsettled lost ones; resources released as each completion settles. Gates and inbox untouched.
+
+#### A1-9 `UnattendedPolicy` doc changes
+
+`answer`: a critical `qa-cap` item goes to `QaLoop.onCapAnswer` (answer must be an option). `park`: blocks only **pending** transitive dependents (a dependent of an un-integrated task cannot be ready or in flight, R9/R10); drop "their in-flight children cancelled".
+
+#### A1-10 Memo edits (applied by reference)
+
+§1 D-d → "rebuild from the snapshot, the history journal's open integration entries, and git (A1-3)"; R1 → A1-5; R4 → adoption journaled only in `onChildCreated` (L12); R12 → QA6; R16 → QA7; §3.1 → add the A1-2.4 table, `dep-reverted` owners → Q; §3.3 → A1-1 gate table; §5 → new constants, `qaRound` 1-based; §6 → framing, changed events, `task-footprint`, `isHistoryEvent`, replay rules A1-2; §7 → A1-7; §8 → `LedgerWriter`, `IntegrationQueue.resume`, `CapacityController.acquire`, `QaLoop`, `LaunchHooks`, `LaunchConfirmation`, `ChildEnd`, `LaunchGate`, `LaunchRequest`/`LaunchHandle`; recovery matrix → A1-1, A1-2 corollary, A1-3; §9 → `ChildRunRequest.context`, `ChildRunner.bootID`, `ContextSupersededError`; §11.3 resolved by A1-3.
+
+#### A1-11 Tests 1.4.4 must add
+
+Gate table cell by cell (12 legal pairs, each with trigger and owner; `awaiting-qa>pending` legal; `passed` no exits). `ledgerViolations`: one fuzz case per new code asserting that code; `isLedgerV1 ⇔ []`; extra fields survive. `fixTaskId`/`reviewTaskId` match `TASK_ID_PATTERN` for sampled phase ids at the limits; `fixTaskId` throws beyond them. `formatInboxId`/`nextInboxNumber` per kind. `qaUnparsableCount`; `canonicalFindingsJson` round trip through `parse`. Strict `parseLaunchHeader` rejects a header-shaped line inside the shared context and accepts the fixed position; `looksLikePlanPrompt` loose; `formatLaunchPrompt` round trip; `formatLaunchHeader` throws `E_LAUNCH_TASK` (update the existing test). `isContextSupersededError` on a plain object with that `name`. `isDurableEvent(task-footprint) === true`; `isHistoryEvent` for the four types. Typed doubles for the changed interfaces, incl. `BatchBuilder` use in the `LedgerWriter` double.
+
+#### A1-12 Consumer follow-ups (handoffs)
+
+2.3 `validate` codes `qa-multiple`, `shared-context-header`; 3.1.4 renders through `formatLaunchPrompt`; 3.1.5 adds `bootID` and the context pin in v2-client; 4.2.2 routes `qa-cap` answers; the 3.2 test "a revert that conflicts: the culprit is parked" reads as R11 ("the phase is paused").
+
 ## Findings
 
 ## Fixes
