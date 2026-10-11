@@ -139,7 +139,7 @@ describe("ledger store: crash points (child process killed)", () => {
   it("after a journal write, before the snapshot: the load yields the last fsynced state", async () => {
     const { home, parked } = await crashAt("after-journal-before-snapshot");
     expect(parked.seq).toBe(4);
-    const snapshot = JSON.parse(await readFile(join(home, PLAN_ID, "ledger.json"), "utf8")) as LedgerV1;
+    const snapshot = JSON.parse(await readFile(join(home, PLAN_ID, "ledger.1.json"), "utf8")) as LedgerV1;
     expect(snapshot.seq).toBe(1); // the snapshot never got written: the journal carries seq 2..4
     const files = await planFiles(home);
     expect(files.filter((f) => f.includes(".tmp-"))).toEqual([]);
@@ -150,11 +150,11 @@ describe("ledger store: crash points (child process killed)", () => {
   it("during the temp write: a torn temp file is ignored and cleaned; the load yields the last fsynced state", async () => {
     const { home, parked } = await crashAt("during-temp-write");
     expect(parked.seq).toBe(4);
-    const tmps = (await planFiles(home)).filter((f) => f.startsWith("ledger.json.tmp-"));
+    const tmps = (await planFiles(home)).filter((f) => f.startsWith("ledger.1.json.tmp-"));
     expect(tmps).toHaveLength(1);
     const torn = await readFile(join(home, PLAN_ID, tmps[0] as string), "utf8");
     expect(() => JSON.parse(torn)).toThrow(); // half a snapshot
-    const snapshot = JSON.parse(await readFile(join(home, PLAN_ID, "ledger.json"), "utf8")) as LedgerV1;
+    const snapshot = JSON.parse(await readFile(join(home, PLAN_ID, "ledger.1.json"), "utf8")) as LedgerV1;
     expect(snapshot.seq).toBe(1);
     const ledger = await reloadBoth(home, 4);
     expect(Object.keys(ledger.tasks)).toEqual(["T1", "T2", "T3", "T4", "T5"]);
@@ -163,11 +163,11 @@ describe("ledger store: crash points (child process killed)", () => {
   it("after the temp write, before the rename: the complete temp file is not trusted; the journal wins", async () => {
     const { home, parked } = await crashAt("after-temp-write-before-rename");
     expect(parked.seq).toBe(4);
-    const tmps = (await planFiles(home)).filter((f) => f.startsWith("ledger.json.tmp-"));
+    const tmps = (await planFiles(home)).filter((f) => f.startsWith("ledger.1.json.tmp-"));
     expect(tmps).toHaveLength(1);
     const full = JSON.parse(await readFile(join(home, PLAN_ID, tmps[0] as string), "utf8")) as LedgerV1;
     expect(full.seq).toBe(4);
-    const snapshot = JSON.parse(await readFile(join(home, PLAN_ID, "ledger.json"), "utf8")) as LedgerV1;
+    const snapshot = JSON.parse(await readFile(join(home, PLAN_ID, "ledger.1.json"), "utf8")) as LedgerV1;
     expect(snapshot.seq).toBe(1);
     const ledger = await reloadBoth(home, 4);
     expect(Object.keys(ledger.tasks)).toEqual(["T1", "T2", "T3", "T4", "T5"]);

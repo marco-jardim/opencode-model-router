@@ -30,6 +30,17 @@ const fakeGit: GitRunner = async (args, cwd) => {
 };
 const identity = async (p: string): Promise<string> => p;
 
+describe("isPlanId: Windows device names (QA-2.2-22)", () => {
+  it.each(["con", "prn", "aux", "nul", "com1", "com9", "lpt1", "lpt9", "CON", "Nul", "Com3", "LPT7"])("%s is not a plan id", (id) => {
+    expect(isPlanId(id)).toBe(false);
+    expect(() => assertPlanId(id)).toThrow(/Invalid plan id/);
+  });
+
+  it("names that merely contain or extend a device name stay valid", () => {
+    for (const id of ["console", "com10", "com0", "lpt0", "p-20261011-aaaaaa", "nul-1", "my-con"]) expect(isPlanId(id)).toBe(true);
+  });
+});
+
 describe("resolveExecutorHome (seams)", () => {
   it("main checkout and linked worktree resolve to the same home", async () => {
     const a = await resolveExecutorHome(MAIN, { git: fakeGit, realpath: identity });

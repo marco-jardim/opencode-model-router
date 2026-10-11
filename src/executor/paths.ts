@@ -105,8 +105,16 @@ export async function resolveExecutorHome(dir: string, deps: ExecutorPathsDeps =
  * case-insensitively because the home lives on a case-insensitive filesystem on Windows: a plan of that name would collide with it.
  */
 export function isPlanId(id: unknown): id is PlanId {
-  return typeof id === "string" && PLAN_ID_PATTERN.test(id) && id.toLowerCase() !== SLOT_MARKERS_DIRNAME;
+  return (
+    typeof id === "string" &&
+    PLAN_ID_PATTERN.test(id) &&
+    id.toLowerCase() !== SLOT_MARKERS_DIRNAME &&
+    !WINDOWS_DEVICE_NAME.test(id)
+  );
 }
+
+/** Windows reserved device names (any case): a directory of that name cannot be created or addressed reliably on Windows. */
+const WINDOWS_DEVICE_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
 
 /** Returns `id` or throws unless it matches `PLAN_ID_PATTERN`: the id becomes a path segment, so it is never trusted unchecked. */
 export function assertPlanId(id: string): PlanId {

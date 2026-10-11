@@ -38,7 +38,7 @@ function park(): Promise<void> {
   return new Promise<void>(() => undefined);
 }
 
-const isSnapshotTmp = (p: string): boolean => /ledger\.json\.tmp-/.test(p);
+const isSnapshotTmp = (p: string): boolean => /ledger\.\d+\.json\.tmp-/.test(p);
 
 const fs = interceptFs(
   createNodeFileSystem(),
