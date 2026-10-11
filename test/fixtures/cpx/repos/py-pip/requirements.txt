@@ -1,0 +1,1 @@
+# No third-party dependencies: provisioning creates .venv offline; pytest comes from the smoke's own environment.

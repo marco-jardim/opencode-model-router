@@ -538,11 +538,23 @@ export function createProvisioner(deps: {
     if (signal?.aborted) throw fail(`provisioning of ${slot} was aborted`, { slot });
   };
 
+  /** Creates `path` and every missing parent (the FileSystem port's mkdir is not recursive). */
   async function ensureDir(path: string): Promise<void> {
-    try {
-      await fs.mkdir(path);
-    } catch (error) {
-      if (errorCode(error) !== "EEXIST") throw error;
+    const missing: string[] = [];
+    let cur = path;
+    for (;;) {
+      if (await fs.lstat(cur) !== null) break;
+      missing.push(cur);
+      const up = p.dirname(cur);
+      if (up === cur) break;
+      cur = up;
+    }
+    for (const dir of missing.reverse()) {
+      try {
+        await fs.mkdir(dir);
+      } catch (error) {
+        if (errorCode(error) !== "EEXIST") throw error;
+      }
     }
   }
 
@@ -575,9 +587,14 @@ export function createProvisioner(deps: {
     }
   }
 
-  async function writeLock(path: string, body: LockBody): Promise<void> {
+  /** Heartbeat write: tmp + rename, but only while `held()` is true, so a release can never be undone by a late beat. */
+  async function writeLock(path: string, body: LockBody, held: () => boolean = () => true): Promise<void> {
     const tmp = `${path}.${clock.randomHex(8)}.tmp`;
     await fs.writeText(tmp, JSON.stringify(body), { fsync: true });
+    if (!held()) {
+      await removeRetrying(tmp, false);
+      return;
+    }
     await fs.rename(tmp, path);
   }
 
@@ -596,12 +613,15 @@ export function createProvisioner(deps: {
       const body = await acquireFileLock(manager, slot, lockPath, deadline, signal);
       let beat: { readonly id: number } | undefined;
       let stopped = false;
+      let inFlight: Promise<void> | undefined;
       const schedule = (): void => {
         if (stopped) return;
         beat = clock.setTimer(LOCK_HEARTBEAT_MS, () => {
+          if (stopped) return;
           body.heartbeatAt = clock.now();
           // A failed beat is retried on the next one; the lock only goes stale after LOCK_STALE_MS.
-          void writeLock(lockPath, body).then(schedule, schedule);
+          const write = writeLock(lockPath, body, () => !stopped).then(schedule, schedule);
+          inFlight = write;
         });
       };
       schedule();
@@ -613,6 +633,8 @@ export function createProvisioner(deps: {
       }
       stopped = true;
       if (beat !== undefined) clock.clearTimer(beat);
+      // A beat still writing must finish (and see `stopped`) before the lock is removed, or its rename would recreate it.
+      if (inFlight !== undefined) await inFlight;
       let releaseError: unknown;
       try {
         await removeRetrying(lockPath, false);

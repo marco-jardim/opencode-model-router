@@ -452,10 +452,12 @@ async function retireSlot(x: RetireCtx, rec: SlotRecord, deadline: number): Prom
 export async function gcSlots(
   d: GcDeps,
   isFinished: (planId: PlanId) => Promise<boolean | null>,
-  opts: { deadline?: number } = {},
+  opts: { deadline?: number; trustedSlotsDirs?: readonly string[] } = {},
 ): Promise<{ removed: string[]; reported: string[] }> {
   const platform = d.platform ?? process.platform;
   const api = pathApi(platform);
+  /** A marker's path is a candidate only when its parent is one of these (d.slotsDir plus the executor's known per-plan dirs). */
+  const trusted: readonly string[] = [d.slotsDir, ...(opts.trustedSlotsDirs ?? [])];
   const x: RetireCtx = {
     fs: d.fs, clock: d.clock, markersDir: d.markersDir, platform, git: d.git, toplevel: d.toplevel,
     ...(d.logger === undefined ? {} : { logger: d.logger }),
@@ -468,10 +470,20 @@ export async function gcSlots(
   for (const planId of await listPlanDirs(x)) {
     const plan = await readPlanMarkers(x, planId);
     for (const bad of plan.invalid) reported.push(`${bad.file}: ${bad.reason}`);
+    const planTrusted: string[] = [...trusted];
+    try {
+      planTrusted.push(defaultSlotsDir(d.toplevel, planId));
+    } catch {
+      // no drive-letter default for this repository: only the explicitly trusted directories apply
+      planTrusted.length = trusted.length;
+    }
     for (const { file, rec } of plan.records) {
       if (rec.repoKey !== d.repoKey) continue;
       try {
-        assertSafeSlotDir(rec.path, rec.slot, api.dirname(rec.path), platform);
+        const parent = api.dirname(rec.path);
+        const trustedParent = planTrusted.find((dir) => comparable(dir, platform) === comparable(parent, platform));
+        if (trustedParent === undefined) throw new Error("parent is not a known slots directory");
+        assertSafeSlotDir(rec.path, rec.slot, trustedParent, platform);
         if (isInsideOrEqual(rec.path, d.toplevel, platform)) throw new Error("slot is inside the repository");
       } catch (error) {
         reported.push(`${file}: ${messageOf(error)}`);
@@ -1014,6 +1026,7 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
         const read = await readMarkerFile(fileCtx, markerPath(d.markersDir, rec.planId, rec.slot));
         if (read.ok) {
           records.set(rec.slot, read.rec);
+          if (read.rec.state === "retired" || read.rec.state === "broken") unregisterSlot(read.rec.path);
         } else if (read.missing) {
           records.delete(rec.slot);
           unregisterSlot(rec.path);
