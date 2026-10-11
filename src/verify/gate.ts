@@ -18,7 +18,7 @@
  *    deps; this module imports no fs/network/SDK.
  */
 import type { Verdict } from "./types";
-import type { DeterministicDeps } from "./types";
+import type { CheckPlacement, DeterministicDeps } from "./types";
 import type { DoD } from "./dod";
 import { isCheckable } from "./dod";
 import { runDeterministic } from "./deterministic";
@@ -133,6 +133,16 @@ export interface Delegation {
    * the refusal names neither.
    */
   cwdSource?: "argument" | "acceptance";
+  /**
+   * Cross-repo P2.4: where each check of `dod.checks` runs, index-aligned (undefined: no `cwd=`/`scope=` key). Absent: every
+   * check runs in the base directory, and nothing below changes.
+   */
+  checkPlacements?: readonly (CheckPlacement | undefined)[];
+  /**
+   * Cross-repo P2.4 (SD4): the first check whose `cwd=` is outside the work root and its read set (`why: "outside"`) or whose
+   * `scope=` is not affected/full (`why: "scope"`); `index` is 0-based. With it the gate refuses (unverifiable, nothing runs).
+   */
+  refusedCheck?: { readonly index: number; readonly kind: string; readonly text: string; readonly why: "outside" | "scope" };
 }
 
 export interface GateDeps {
@@ -297,6 +307,15 @@ export async function accept(
   // QA-P33F1-1-2: the caller decided containment with P2.3's rule (routing/roles/work-root.ts verificationScope); a refused cwd
   // is never resolved here (a UNC/device path reaches no filesystem call).
   if (workRoot !== undefined && delegation.refusedCwd !== undefined) return refuseCwd(delegation.refusedCwd);
+  // Cross-repo P2.4 (SD4): a check's `cwd=` outside the work root and its read set, or a `scope=` that is neither affected nor
+  // full: nothing runs, whichever verifier the DoD names.
+  if (delegation.refusedCheck !== undefined) {
+    const { index, kind, text, why } = delegation.refusedCheck;
+    const reason = why === "outside"
+      ? `check ${index + 1} (${kind}) cwd=${text} is outside the work root ${workRoot ?? deps.deterministic.cwd} and its read set; nothing ran`
+      : `check ${index + 1} (${kind}) scope=${text} is not affected or full; nothing ran`;
+    return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] }, dodSource, deps.strictUnverifiable);
+  }
   const effectiveBaseDir = resolveBaseDir(
     delegation.cwd,
     workRoot ?? deps.deterministic.cwd,
@@ -361,15 +380,62 @@ export async function accept(
     return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] }, dodSource, deps.strictUnverifiable);
   };
 
+  // Cross-repo P2.4 (I3, SD7): with placed checks, every changed path must lie inside some check root: the top of a placed check,
+  // or the change root for an unplaced one (an undefined top covers nothing). Otherwise part of the change is seen by no check.
+  const refuseUncoveredByCheckRoots = (): GateResult | undefined => {
+    const placements = delegation.checkPlacements;
+    if (placements === undefined || !placements.some(placement => placement !== undefined)) return undefined;
+    if (artefact.changedFiles.length === 0) return undefined;
+    const changeRoot = artefact.changeRoot ?? effectiveBaseDir;
+    const tops: string[] = [];
+    for (let index = 0; index < (dod.checks ?? []).length; index++) {
+      const placement = placements[index];
+      const top = placement === undefined ? changeRoot : placement.top;
+      if (top !== undefined && !tops.includes(top)) tops.push(top);
+    }
+    const canonicalTops = tops.map(top => canonical(top));
+    const uncovered = artefact.changedFiles
+      .map(({ path }) => path)
+      .filter(path => {
+        const absolute = canonical(isAbsolute(path) ? path : resolve(changeRoot, path));
+        return !canonicalTops.some(top => isWithinDir(absolute, top));
+      });
+    if (uncovered.length === 0) return undefined;
+    const listed = uncovered.slice(0, MAX_OUTSIDE_LISTED).join(", ")
+      + (uncovered.length > MAX_OUTSIDE_LISTED ? ` and ${uncovered.length - MAX_OUTSIDE_LISTED} more` : "");
+    const reason = `the change in ${listed} is not covered by any check root (${tops.join(", ")}); nothing ran`;
+    return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] }, dodSource, deps.strictUnverifiable);
+  };
+
   let verdict: Verdict;
   if (dod.kind === "deterministic") {
     const allOutside = refuseAllOutside();
     if (allOutside) return allOutside;
     const mixed = refuseMixedOutside();
     if (mixed) return mixed;
+    const uncovered = refuseUncoveredByCheckRoots();
+    if (uncovered) return uncovered;
+    const placements = delegation.checkPlacements;
+    // F7: a check placed in another repository resolves relative changed paths against its own cwd, which is not where they were
+    // observed: with such a check, hand the runner absolute paths (against the change root).
+    const changed = deps.deterministic.changedFiles;
+    const hasForeign = placements?.some(placement => placement?.foreign === true) === true;
+    const changeRoot = artefact.changeRoot ?? effectiveBaseDir;
     verdict = await runDeterministic(dod, {
       ...deps.deterministic,
       cwd: effectiveBaseDir,
+      ...(hasForeign && changed !== undefined && changed !== "unavailable"
+        ? {
+          changedFiles: changed.map(file => ({
+            ...file,
+            path: isAbsolute(file.path) ? file.path : resolve(changeRoot, file.path),
+            ...(file.previousPath !== undefined
+              ? { previousPath: isAbsolute(file.previousPath) ? file.previousPath : resolve(changeRoot, file.previousPath) }
+              : {}),
+          })),
+        }
+        : {}),
+      ...(placements !== undefined ? { placements } : {}),
     });
   } else {
     // "checker" is the only remaining checkable kind.

@@ -6,7 +6,14 @@ import { canonicalPath } from "../../src/verify/dispatch";
 import { accept } from "../../src/verify/gate";
 import type { Artefact, Delegation, GateDeps } from "../../src/verify/gate";
 import type { DeterministicDeps } from "../../src/verify/types";
-import { createMutexRegistry } from "../../src/verify/deterministic";
+import { createMutexRegistry, runDeterministic } from "../../src/verify/deterministic";
+import type { CheckPlacement } from "../../src/verify/types";
+
+// P2.4: a pass-through spy, so a test can read what the gate hands to runDeterministic (placements, change set).
+vi.mock("../../src/verify/deterministic", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../src/verify/deterministic")>();
+  return { ...actual, runDeterministic: vi.fn(actual.runDeterministic) };
+});
 import type { CheckerDeps } from "../../src/verify/checker";
 import { normalizeDoD } from "../../src/verify/dod";
 import type { Check } from "../../src/verify/dod";
@@ -569,6 +576,133 @@ describe("accept() — a role dispatch is verified in its work root (DF2-F1)", (
     expect(r.verdict.outcome).toBe("unverifiable");
     expect(r.verdict.reasons[0]).toBe(`the producer changed files only outside ${session} (e.g. ${probe}); checks run there cannot see them. Add "cwd: <dir>" to the [acceptance] block to verify where the work landed.`);
     expect(exec).not.toHaveBeenCalled();
+  });
+});
+
+describe("accept() — per-check placements (P2.4)", () => {
+  const W = join(tmpdir(), "p24-work-root");
+  const C = join(tmpdir(), "p24-consumer");
+  const runCheck: Check = { kind: "run", command: "node verify.js", expect: "OK" };
+  const foreign: CheckPlacement = { cwd: join(C, "pkg"), top: C, foreign: true };
+  const local: CheckPlacement = { cwd: W, top: W, foreign: false };
+  const wrote = (...names: string[]) =>
+    artefact({ changeRoot: W, changedFiles: names.map(name => ({ path: join(W, name), status: "M" })) });
+  function setup(checks: Check[] = [runCheck], det: Partial<DeterministicDeps> = {}) {
+    const exec = vi.fn<DeterministicDeps["exec"]>().mockResolvedValue({ code: 0, stdout: "OK", stderr: "" });
+    const d = deps({ deterministic: { ...fakeDeterministicDeps(), cwd: W, exec, ...det } });
+    const dod = normalizeDoD({ ...detDoD(), checks });
+    return { exec, d, dod };
+  }
+  const lastRunArgs = () => {
+    const calls = vi.mocked(runDeterministic).mock.calls;
+    return calls[calls.length - 1][1];
+  };
+
+  it.each([false, true])("a refused check root is unverifiable and nothing runs, naming the check (strict=%s)", async (strictUnverifiable) => {
+    const { exec, d, dod } = setup([runCheck, runCheck]);
+    const refusedCheck = { index: 1, kind: "run", text: "/elsewhere", why: "outside" as const };
+    const r = await accept({ dod, workRoot: W, refusedCheck }, wrote("a.ts"), { ...d, strictUnverifiable });
+    const reason = `check 2 (run) cwd=/elsewhere is outside the work root ${W} and its read set; nothing ran`;
+    expect(r.verdict).toEqual({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] });
+    expect(r.accepted).toBe(!strictUnverifiable);
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("an invalid scope= is refused with its own text; nothing runs", async () => {
+    const { exec, d, dod } = setup();
+    const refusedCheck = { index: 0, kind: "testsPass", text: "everything", why: "scope" as const };
+    const r = await accept({ dod, workRoot: W, refusedCheck }, wrote("a.ts"), d);
+    const reason = "check 1 (testsPass) scope=everything is not affected or full; nothing ran";
+    expect(r.verdict.outcome).toBe("unverifiable");
+    expect(r.verdict.method).toBe("none");
+    expect(r.verdict.reasons).toEqual([reason]);
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("without placements the verdict is the same and the runner receives none", async () => {
+    const { exec, d, dod } = setup();
+    const plain = await accept({ dod, workRoot: W }, wrote("a.ts"), d);
+    expect(plain.verdict).toEqual({
+      pass: true,
+      outcome: "pass",
+      method: "deterministic",
+      reasons: ["all 1 deterministic checks passed"],
+      evidence: "exit 0: node verify.js",
+    });
+    expect(lastRunArgs()).not.toHaveProperty("placements");
+    const explicit = await accept({ dod, workRoot: W, checkPlacements: undefined, refusedCheck: undefined }, wrote("a.ts"), d);
+    expect(explicit).toEqual(plain);
+    // Placements without a single defined entry add no I3 refusal.
+    const empty = await accept({ dod, workRoot: W, checkPlacements: [undefined] }, wrote("a.ts"), d);
+    expect(empty).toEqual(plain);
+    expect(exec).toHaveBeenCalledTimes(3);
+  });
+
+  it("a grader DoD is unaffected by placements", async () => {
+    const dispatchGrader = vi.fn<CheckerDeps["dispatchGrader"]>().mockResolvedValue({ sessionID: "grader", text: '{"pass":true,"reasons":[]}' });
+    const { d } = setup();
+    const r = await accept({ dod: checkerDoD(), workRoot: W, checkPlacements: [foreign] }, wrote("a.ts"), { ...d, checker: { ...d.checker, dispatchGrader } });
+    expect(r.verdict.outcome).toBe("pass");
+    expect(dispatchGrader).toHaveBeenCalled();
+  });
+
+  it("I3: a change in W with every check in another repository is unverifiable, and nothing runs", async () => {
+    const { exec, d, dod } = setup();
+    const r = await accept({ dod, workRoot: W, checkPlacements: [foreign] }, wrote("a.ts"), d);
+    const reason = `the change in ${join(W, "a.ts")} is not covered by any check root (${C}); nothing ran`;
+    expect(r.verdict.outcome).toBe("unverifiable");
+    expect(r.verdict.method).toBe("none");
+    expect(r.verdict.reasons).toEqual([reason]);
+    expect(r.verdict.caveats).toEqual([reason]);
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("I3: a check with an unknown top covers nothing", async () => {
+    const { exec, d, dod } = setup();
+    const r = await accept({ dod, workRoot: W, checkPlacements: [{ cwd: join(C, "pkg"), top: undefined, foreign: true }] }, wrote("a.ts"), d);
+    expect(r.verdict.outcome).toBe("unverifiable");
+    expect(r.verdict.reasons[0]).toContain("is not covered by any check root ()");
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("I3: a check in W plus a check in a consumer repository runs both", async () => {
+    const { exec, d, dod } = setup([runCheck, runCheck]);
+    const r = await accept({ dod, workRoot: W, checkPlacements: [undefined, foreign] }, wrote("a.ts"), d);
+    expect(r.verdict.outcome).toBe("pass");
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(exec).toHaveBeenLastCalledWith("node verify.js", expect.objectContaining({ cwd: foreign.cwd }));
+    expect(lastRunArgs().placements).toEqual([undefined, foreign]);
+  });
+
+  it("I3: more than five uncovered paths list five, then 'and N more'", async () => {
+    const { exec, d, dod } = setup();
+    const names = ["a", "b", "c", "d", "e", "f", "g"].map(name => `${name}.ts`);
+    const r = await accept({ dod, workRoot: W, checkPlacements: [foreign] }, wrote(...names), d);
+    const listed = names.slice(0, 5).map(name => join(W, name)).join(", ");
+    expect(r.verdict.reasons).toEqual([`the change in ${listed} and 2 more is not covered by any check root (${C}); nothing ran`]);
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("F7: with a foreign check, relative changed paths reach the runner absolute, against the change root", async () => {
+    const changedFiles = [{ path: "a.ts", status: "M" }, { path: "b.ts", status: "R", previousPath: "old.ts" }, { path: join(W, "c.ts") }];
+    const { d, dod } = setup([runCheck, runCheck], { changedFiles });
+    const art = artefact({ changeRoot: W, changedFiles: [{ path: "a.ts", status: "M" }] });
+    const r = await accept({ dod, workRoot: W, checkPlacements: [undefined, foreign] }, art, d);
+    expect(r.verdict.outcome).toBe("pass");
+    expect(lastRunArgs().changedFiles).toEqual([
+      { path: join(W, "a.ts"), status: "M" },
+      { path: join(W, "b.ts"), status: "R", previousPath: join(W, "old.ts") },
+      { path: join(W, "c.ts") },
+    ]);
+  });
+
+  it("F7: without a foreign check the change set is handed over unchanged", async () => {
+    const changedFiles = [{ path: "a.ts", status: "M" }];
+    const { d, dod } = setup([runCheck, runCheck], { changedFiles });
+    const art = artefact({ changeRoot: W, changedFiles: [{ path: "a.ts", status: "M" }] });
+    const r = await accept({ dod, workRoot: W, checkPlacements: [undefined, local] }, art, d);
+    expect(r.verdict.outcome).toBe("pass");
+    expect(lastRunArgs().changedFiles).toBe(changedFiles);
   });
 });
 
