@@ -79,7 +79,7 @@ Run in the dogfood instance at HEAD `7ecbfda`, with `repoParents: ["D:/git"]`.
 | I4, role with `router_run` | `implementer`, `router_run test-files` running a scratch test that writes through the same junction | Pass. UNVERIFIED: `the repository omr-xr-dogfood-lib at D:\git\omr-xr-dogfood-lib also changed during the dispatch, and the producer ran router_run; a write there cannot be attributed, so the checks in D:\git\opencode-model-router-cross-repo do not cover it. Dispatch that work with repo=omr-xr-dogfood-lib, or verify it there.` |
 
 Observations:
-- Role delegates are never told their work root: role dispatches get no header (the known "location line is dead code" follow-up). With `repo=`, every role delegate had to infer its work root from the prompt's ENVIRONMENT text.
+- Role delegates are never told their work root: role dispatches get no header (the known "location line is dead code" follow-up). With `repo=`, every role delegate had to infer its work root from the prompt's ENVIRONMENT text. Fixed in Phase 2 (P2g, role dispatch header).
 - In this instance the host's `<env>` block names `D:\git\Claude-model-router-cross-repo`, which does not exist. The AGENTS.md path in the system prompt is rewritten the same way (`omr-cross-repo\Claude-config`), so this is a text substitution in the prompt pipeline, not the router. It still misleads delegates.
 - `fast` has no write or shell tool in this config; a write dispatched to it escalates to `medium`.
 - The scratch repository `D:\git\omr-xr-dogfood-lib` (one commit, branch `main`) is kept for the Phase 2 dogfood. The junction and the scratch test were removed.
