@@ -7,7 +7,14 @@
  * Ownership is per OWNER, not per session: the owner of a lease is its holder's `taskRef` when there is one, else its
  * holderID. Sessions of one plan task (the producer, a retry, its verifier or QA child) therefore never conflict with
  * one another: a re-entrant write is not counted, and a read, search or run by an actor naming the same `taskRef` is
- * exempt. Actors without a `taskRef` are their own owner.
+ * exempt. Actors without a `taskRef` are their own owner. An actor whose holderID is recorded IS that holder: its owner
+ * comes from the record (it may omit `taskRef`; a different `taskRef`, `tree` or `isChild` is `invalid-holder`), and it
+ * is never refused a lease it holds itself.
+ *
+ * A lease has a SET of holders (all of one owner, first writer first): every session of the owner that writes the file
+ * joins it, and the lease ends only with the last of them (the strongest scope among them decides how long it lives,
+ * `until-integrated` over `until-complete`). The sessions of one taskRef must not write concurrently: two writers of
+ * one owner never conflict, so 3.1 must serialise the producer and its retry.
  *
  * Two keys per file: the LOGICAL key (repository + repo-relative path) decides write conflicts, so one file edited in
  * two worktrees of one repository collides; the PHYSICAL key (the canonical, case-folded absolute path) decides read
@@ -17,7 +24,15 @@
  * A path no key can be derived for is unkeyable. A spelling that may name any file (a device form, a drive-relative
  * path, an 8.3 name) fails CLOSED: a child's read or write of it is refused while any other owner holds any lease.
  * Other unkeyable input (empty, NUL, not a string, oversize) is an unknown target: a child write is refused while
- * another owner holds a lease in the same repository, and a read is allowed.
+ * another owner holds a lease in the same repository, and a read is allowed. A run directory that is unkeyable fails
+ * closed for a child runner while any other owner holds a lease. A drive-less rooted win32 path (`\x`) is aliasing: it
+ * is on the drive of the process, which the registry cannot know. Device forms other than `X:` and `Volume{guid}`
+ * (`\\.\pipe\…`, `\\?\GLOBALROOT\…`) are unkeyable without any filesystem call.
+ *
+ * Handoffs for 2.1: run the authority checks before the lease checks; back `repoKeyOf` with the git pointers; treat a
+ * `toolTargets` result with `gitRootRequired` (no concrete target) as an unknown target; hand git the `relOnDisk` of a
+ * key, not `rel`/`physical` (folded); serialise sessions of one taskRef; drop `until-complete` holders on restart
+ * (`restore(…, { dropCompleteHolders: true })`).
  *
  * Time is epoch milliseconds (`seams.now()`). A holder's `lastSeenAt` is refreshed by each acquire, read, search and
  * run it makes; an `until-complete` holder not seen for `sweepAgeMs` is swept by {@link LeaseRegistry.sweep} or on the
@@ -96,8 +111,13 @@ export interface PathKey {
   tree: string | null;
   /** The repository (folded), or null outside any. */
   repo: string | null;
-  /** Path relative to the tree (`""` for the tree itself), or null outside any repository. */
+  /** Path relative to the tree (`""` for the tree itself), or null outside any repository. FOLDED (upper-cased on win32). */
   rel: string | null;
+  /**
+   * `rel` in the case the filesystem reports, `/`-separated: the spelling for a git pathspec. `physical`, `tree`,
+   * `repo`, `rel` and `logical` are key spellings (folded on win32) and must not be handed to git.
+   */
+  relOnDisk: string | null;
   /** The absolute path as given (lexically resolved), for messages. */
   display: string;
 }
@@ -155,7 +175,7 @@ export interface HoldersReleased {
   holders: string[];
 }
 
-/** One lease in a {@link LeaseSnapshot}: one line per recorded (physical, tree) pair of a logical key. */
+/** One lease in a {@link LeaseSnapshot}: one line per holder and recorded (physical, tree) pair of a logical key. */
 export interface SnapshotLease {
   logical: string;
   physical: string;
@@ -230,6 +250,7 @@ const DEVICE_PREFIX = /^(?:[\\/]{2}[.?]|[\\/]\?\?)[\\/]/;
 const ALIASING_REASONS: ReadonlySet<string> = new Set([
   "device path",
   "drive-relative path",
+  "rooted path without a drive",
   "8.3 short name in a missing path",
 ]);
 
@@ -249,13 +270,22 @@ function isRoot(path: string): boolean {
   return path === "/" || /^[a-z]:\/$/i.test(path) || /^\/\/[^/]+\/[^/]+\/?$/.test(path);
 }
 
-/** Each UTF-16 unit upper-cased when that stays one unit (`ß` stays, `ſ` becomes `S`): an approximation of NTFS's table. */
+/**
+ * Each UTF-16 unit upper-cased when that stays one unit (`ß` stays, `ſ` becomes `S`): an approximation of NTFS's table.
+ * A unit whose upper case is longer (`ᾳ` → `ΑΙ`) falls back to its LOWER case, so that `ᾳ` and `ᾼ` (its title case,
+ * whose lower case is `ᾳ`) fold to one spelling.
+ */
 function upcaseUnits(text: string): string {
   let out = "";
   for (let index = 0; index < text.length; index++) {
     const unit = text.charAt(index);
     const upper = unit.toUpperCase();
-    out += upper.length === 1 ? upper : unit;
+    if (upper.length === 1) {
+      out += upper;
+      continue;
+    }
+    const lower = unit.toLowerCase();
+    out += lower.length === 1 ? lower : unit;
   }
   return out;
 }
@@ -283,10 +313,18 @@ function unwrapDevicePath(text: string): { path: string } | Unkeyable {
   return { unkeyable: "device path" };
 }
 
-/** {@link unwrapDevicePath}, and for the other device forms the DOS path the filesystem answers with, if it does. */
+/** The one non-drive device form that names a volume the filesystem can resolve: `\\?\Volume{guid}\…`. */
+const VOLUME_DEVICE = /^(?:[\\/]{2}[.?]|[\\/]\?\?)[\\/]Volume\{[0-9a-f-]+\}(?:[\\/]|$)/i;
+
+/**
+ * {@link unwrapDevicePath}, and for a `Volume{guid}` form the DOS path the filesystem answers with, if it does. Every
+ * other device form (`\\.\pipe\…`, `\\?\GLOBALROOT\…`, `\\.\PhysicalDrive0`, …) is unkeyable without any filesystem
+ * call: resolving it could open a pipe or a device.
+ */
 function normalizeDevice(text: string, realpath: (p: string) => string): { path: string } | Unkeyable {
   const first = unwrapDevicePath(text);
   if (!("unkeyable" in first)) return first;
+  if (!VOLUME_DEVICE.test(text)) return first;
   let real: unknown;
   try {
     real = realpath(text);
@@ -298,9 +336,13 @@ function normalizeDevice(text: string, realpath: (p: string) => string): { path:
   return "unkeyable" in again ? first : again;
 }
 
-/** Why `text` is too big to key (more than 32 767 units or 4 096 segments), or undefined. */
-function oversized(text: string, win: boolean): string | undefined {
+/**
+ * Why `text` is too big to key (more than 32 767 units, or with `countSegments` more than 4 096 segments), or
+ * undefined. The segments are counted on the resolved path, after `..` collapse.
+ */
+function oversized(text: string, win: boolean, countSegments: boolean): string | undefined {
   if (text.length > MAX_PATH_CHARS) return "path too long";
+  if (!countSegments) return undefined;
   let segments = 1;
   for (let index = 0; index < text.length; index++) {
     const code = text.charCodeAt(index);
@@ -365,7 +407,7 @@ function keyOfIn(
   const api = win ? win32 : posix;
   let text = raw;
   let root = typeof base === "string" ? base : "";
-  const tooBig = oversized(text, win) ?? oversized(root, win);
+  const tooBig = oversized(text, win, false) ?? oversized(root, win, false);
   if (tooBig !== undefined) return { unkeyable: tooBig };
   // 2. win32: unwrap device forms; refuse unresolvable device forms and drive-relative paths
   if (win) {
@@ -373,6 +415,8 @@ function keyOfIn(
     if ("unkeyable" in unwrapped) return unwrapped;
     text = unwrapped.path;
     if (/^[A-Za-z]:(?![\\/])/.test(text)) return { unkeyable: "drive-relative path" };
+    // `\x` is on the drive of the process, which is not necessarily the one of the base.
+    if (/^[\\/](?![\\/])/.test(text)) return { unkeyable: "rooted path without a drive" };
     const unwrappedBase = normalizeDevice(root, (p) => seams.realpath(p));
     if ("unkeyable" in unwrappedBase) return unwrappedBase;
     root = unwrappedBase.path;
@@ -380,6 +424,8 @@ function keyOfIn(
   if (!api.isAbsolute(text) && !api.isAbsolute(root)) return { unkeyable: "relative path without an absolute base" };
   // 3. lexical resolution
   const display = api.resolve(root, text);
+  const collapsed = oversized(display, win, true);
+  if (collapsed !== undefined) return { unkeyable: collapsed };
   // 4. win32: per segment, strip a stream suffix, then trailing dots and spaces
   const volume = api.parse(display).root;
   let absolute = display;
@@ -422,10 +468,13 @@ function keyOfIn(
     if (physical === id.tree || `${physical}/` === prefix) rel = "";
     else if (physical.startsWith(prefix)) rel = physical.slice(prefix.length);
     if (rel !== undefined) {
-      return { physical, logical: `r:${id.repo}\0${rel}`, tree: id.tree, repo: id.repo, rel, display };
+      // Folding keeps the length of every unit, so the tail of the unfolded path is the on-disk spelling of `rel`.
+      const disk = foldKeyPath(canonical, "linux");
+      const relOnDisk = rel === "" ? "" : disk.slice(disk.length - rel.length);
+      return { physical, logical: `r:${id.repo}\0${rel}`, tree: id.tree, repo: id.repo, rel, relOnDisk, display };
     }
   }
-  return { physical, logical: `x:${physical}`, tree: null, repo: null, rel: null, display };
+  return { physical, logical: `x:${physical}`, tree: null, repo: null, rel: null, relOnDisk: null, display };
 }
 
 /**
@@ -457,7 +506,10 @@ interface Pair {
 }
 
 interface LeaseEntry {
-  holderID: string;
+  /** The sessions holding the lease, first writer first. All of them have one owner; the lease ends with the last. */
+  holders: Set<string>;
+  /** The owner of every holder (`t:<taskRef>` or `h:<holderID>`). */
+  owner: string;
   display: string;
   /** The repository of an `r:` key, else null. */
   repo: string | null;
@@ -480,10 +532,66 @@ interface State {
   tasks: Map<string, Set<string>>;
   /** owner → number of recorded holders. */
   owners: Map<string, number>;
+  /** tree (folded; "" for no tree) → the logical keys with a pair in it. Bounds a run check to its tree. */
+  byTree: Map<string, Set<string>>;
+  /** Every directory (folded) that is an ancestor-or-self of a leased physical path → the logical keys below it. */
+  byDir: Map<string, Set<string>>;
 }
 
 function emptyState(): State {
-  return { leases: new Map(), holders: new Map(), repoHolders: new Map(), tasks: new Map(), owners: new Map() };
+  return {
+    leases: new Map(),
+    holders: new Map(),
+    repoHolders: new Map(),
+    tasks: new Map(),
+    owners: new Map(),
+    byTree: new Map(),
+    byDir: new Map(),
+  };
+}
+
+/**
+ * The directories a folded physical path lies under, itself included (`/a/b` → `/`, `/a`, `/a/b`; `C:/a` → `C:/`,
+ * `C:/a`); a root is listed with and without its trailing `/`. These are the keys of {@link State.byDir}.
+ */
+function dirPrefixes(physical: string): string[] {
+  const out = new Set<string>([physical]);
+  for (let index = physical.indexOf("/"); index >= 0; index = physical.indexOf("/", index + 1)) {
+    const withSlash = physical.slice(0, index + 1);
+    if (isRoot(withSlash)) {
+      out.add(withSlash);
+      if (withSlash.length > 1) out.add(withSlash.slice(0, -1));
+    } else if (index > 0) {
+      out.add(physical.slice(0, index));
+    }
+  }
+  return [...out];
+}
+
+function addToIndex(index: Map<string, Set<string>>, key: string, logical: string): void {
+  const set = index.get(key) ?? new Set<string>();
+  set.add(logical);
+  index.set(key, set);
+}
+
+function removeFromIndex(index: Map<string, Set<string>>, key: string, logical: string): void {
+  const set = index.get(key);
+  if (set === undefined) return;
+  set.delete(logical);
+  if (set.size === 0) index.delete(key);
+}
+
+/** Records a (physical, tree) pair of a lease in the run-check indexes. */
+function indexPair(state: State, logical: string, pair: Pair): void {
+  for (const dir of dirPrefixes(pair.physical)) addToIndex(state.byDir, dir, logical);
+  if (pair.tree !== null) addToIndex(state.byTree, pair.tree, logical);
+}
+
+function unindexLease(state: State, logical: string, entry: LeaseEntry): void {
+  for (const pair of entry.pairs.values()) {
+    for (const dir of dirPrefixes(pair.physical)) removeFromIndex(state.byDir, dir, logical);
+    if (pair.tree !== null) removeFromIndex(state.byTree, pair.tree, logical);
+  }
 }
 
 function ownerOf(holderID: string, taskRef: string | undefined): string {
@@ -506,16 +614,29 @@ function recordHolder(state: State, holder: Holder): HolderRecord {
   return record;
 }
 
+/** Adds a new lease, held by `record`. */
 function link(state: State, record: HolderRecord, logical: string, entry: LeaseEntry): void {
   state.leases.set(logical, entry);
+  for (const pair of entry.pairs.values()) indexPair(state, logical, pair);
+  join(state, record, logical, entry);
+}
+
+/** Adds `record` to the holders of an existing lease (its owner is the lease's). */
+function join(state: State, record: HolderRecord, logical: string, entry: LeaseEntry): void {
+  const holderID = record.holder.holderID;
+  if (entry.holders.has(holderID)) return;
+  entry.holders.add(holderID);
   record.keys.add(logical);
   if (entry.repo === null) return;
   const counts = state.repoHolders.get(entry.repo) ?? new Map<string, number>();
-  counts.set(entry.holderID, (counts.get(entry.holderID) ?? 0) + 1);
+  counts.set(holderID, (counts.get(holderID) ?? 0) + 1);
   state.repoHolders.set(entry.repo, counts);
 }
 
-/** Ends every lease of one holder and forgets it; returns how many leases ended. */
+/**
+ * Ends the part of every lease one holder has and forgets the holder; a lease ends only with its last holder (the
+ * strongest scope among them decides how long it lives). Returns how many leases ended.
+ */
 function dropHolder(state: State, holderID: string): number {
   const record = state.holders.get(holderID);
   if (record === undefined) return 0;
@@ -523,8 +644,12 @@ function dropHolder(state: State, holderID: string): number {
   for (const logical of record.keys) {
     const entry = state.leases.get(logical);
     if (entry === undefined) continue;
-    state.leases.delete(logical);
-    ended++;
+    entry.holders.delete(holderID);
+    if (entry.holders.size === 0) {
+      state.leases.delete(logical);
+      unindexLease(state, logical, entry);
+      ended++;
+    }
     if (entry.repo === null) continue;
     const counts = state.repoHolders.get(entry.repo);
     if (counts === undefined) continue;
@@ -571,6 +696,19 @@ function parseHolderInput(value: unknown, platform: NodeJS.Platform): HolderInpu
   if (scope === "until-integrated" && actor.taskRef === undefined) return "an until-integrated lease requires a taskRef";
   return { ...actor, scope };
 }
+
+/** The paths of a write as a list: a string is one path; an array (read once, so a hostile one cannot change) is its items. */
+function readPaths(path: unknown): readonly unknown[] {
+  try {
+    if (Array.isArray(path)) return Array.from(path as readonly unknown[]);
+    return typeof path === "string" ? [path] : [];
+  } catch {
+    return [];
+  }
+}
+
+/** A {@link LeaseActor} with the owner its leases belong to. */
+type BoundActor = LeaseActor & { owner: string };
 
 function sameHolder(a: HolderInput, b: HolderInput): boolean {
   return a.tree === b.tree && a.scope === b.scope && a.taskRef === b.taskRef && a.isChild === b.isChild;
@@ -619,8 +757,11 @@ function isUnder(physical: string, dir: string): boolean {
  * A lease registry over `seams`. Throws a TypeError only for an invalid `runMode` or `cap`; every other input, however
  * malformed, gets a result.
  * Indexes: `leases` by logical key, `holders` by id, `repoHolders` by repository, `tasks` by taskRef, `owners` by owner.
- * A write check is O(1) in the registry (plus the O(depth) realpath calls of the key derivation); a run check scans
- * the leases (at most `cap`).
+ * A write check is O(1) in the registry (plus the O(depth) realpath calls of the key derivation); a run check reads
+ * the leases of the run tree (`byTree`) and of the directories under the run directory (`byDir`, every ancestor of a
+ * leased physical path), not all of them; only an unkeyable run directory of a child scans all leases (at most `cap`).
+ * Every public method that takes caller input answers a hostile input (throwing getter, revoked Proxy) with
+ * `invalid-holder` / an unknown target instead of throwing.
  */
 export function createLeaseRegistry(seams: LeaseSeams, opts: LeaseOptions): LeaseRegistry {
   if (!isRecord(opts) || (opts.runMode !== "annotate" && opts.runMode !== "refuse")) {
@@ -632,7 +773,7 @@ export function createLeaseRegistry(seams: LeaseSeams, opts: LeaseOptions): Leas
     throw new TypeError("cap must be a positive integer");
   }
   const sweepAgeMs =
-    typeof opts.sweepAgeMs === "number" && Number.isFinite(opts.sweepAgeMs) && opts.sweepAgeMs >= 0
+    typeof opts.sweepAgeMs === "number" && Number.isFinite(opts.sweepAgeMs) && opts.sweepAgeMs > 0
       ? opts.sweepAgeMs
       : DEFAULT_SWEEP_AGE_MS;
   const platform = opts.platform ?? process.platform;
@@ -655,10 +796,41 @@ export function createLeaseRegistry(seams: LeaseSeams, opts: LeaseOptions): Leas
     return record;
   };
 
+  /** The first live holder of a lease, sweeping its stale holders on the spot; undefined when none is left. */
+  const liveHolderOf = (entry: LeaseEntry): HolderRecord | undefined => {
+    for (const id of [...entry.holders]) {
+      const record = liveRecord(id);
+      if (record !== undefined) return record;
+    }
+    return undefined;
+  };
+
   /** Marks a recorded holder as alive. */
   const touch = (holderID: string): void => {
     const record = state.holders.get(holderID);
     if (record !== undefined) record.holder.lastSeenAt = seams.now();
+  };
+
+  /**
+   * The actor of a read, search or run with its owner. An actor whose holderID is recorded IS that holder: its owner
+   * comes from the record (a missing `taskRef` is inherited), and a `taskRef`, `isChild` or `tree` that differs from
+   * the record is an invalid holder. Any other actor is its own owner, or the owner its `taskRef` names.
+   */
+  const bindActor = (value: unknown): BoundActor | string => {
+    const parsed = parseActor(value, platform);
+    if (typeof parsed === "string") return parsed;
+    const record = state.holders.get(parsed.holderID);
+    if (record === undefined) return { ...parsed, owner: ownerOf(parsed.holderID, parsed.taskRef) };
+    const recorded = record.holder;
+    if (parsed.isChild !== recorded.isChild || parsed.tree !== recorded.tree) {
+      return `holder ${parsed.holderID} is recorded with a different tree or isChild`;
+    }
+    if (parsed.taskRef !== undefined && parsed.taskRef !== recorded.taskRef) {
+      return `holder ${parsed.holderID} is recorded with a different taskRef`;
+    }
+    return recorded.taskRef === undefined
+      ? { holderID: parsed.holderID, tree: recorded.tree, isChild: recorded.isChild, owner: record.owner }
+      : { holderID: parsed.holderID, tree: recorded.tree, isChild: recorded.isChild, taskRef: recorded.taskRef, owner: record.owner };
   };
 
   /** The live holders of any owner but `selfOwner` that hold at least one lease. */
@@ -693,24 +865,23 @@ export function createLeaseRegistry(seams: LeaseSeams, opts: LeaseOptions): Leas
 
   /** The holders that make `reader` refuse `raw`, with the file's display path. */
   const readConflict = (
-    reader: LeaseActor,
-    raw: string,
+    reader: BoundActor,
+    raw: unknown,
     base: string,
     sm: LeaseSeams,
   ): { holders: Holder[]; path: string } | undefined => {
     if (!reader.isChild) return undefined;
-    const readerOwner = ownerOf(reader.holderID, reader.taskRef);
     const key = keyOfIn(raw, base, sm, platform, false);
     if ("unkeyable" in key) {
       if (!ALIASING_REASONS.has(key.unkeyable)) return undefined;
-      const holders = holdersOtherThan(readerOwner);
+      const holders = holdersOtherThan(reader.owner);
       return holders.length === 0 ? undefined : { holders, path: typeof raw === "string" ? raw : describeValue(raw) };
     }
     const lease = state.leases.get(key.logical);
-    if (lease === undefined) return undefined;
-    const record = liveRecord(lease.holderID);
-    if (record === undefined || record.owner === readerOwner) return undefined;
+    if (lease === undefined || lease.owner === reader.owner || lease.holders.has(reader.holderID)) return undefined;
     if (![...lease.pairs.values()].some((pair) => pair.physical === key.physical)) return undefined;
+    const record = liveHolderOf(lease);
+    if (record === undefined) return undefined;
     return { holders: [copyHolder(record.holder)], path: key.display };
   };
 
@@ -740,9 +911,10 @@ export function createLeaseRegistry(seams: LeaseSeams, opts: LeaseOptions): Leas
     touch(holder.holderID);
     const owner = ownerOf(holder.holderID, holder.taskRef);
 
-    const raws: readonly unknown[] = Array.isArray(path) ? path : typeof path === "string" ? [path] : [];
+    const raws = readPaths(path);
     const unknownTarget = raws.length === 0;
     const keys = new Map<string, PathKey>();
+    const extras = new Map<string, Pair[]>();
     const unkeyed: string[] = [];
     let aliasing = false;
     for (const raw of raws) {
@@ -750,16 +922,25 @@ export function createLeaseRegistry(seams: LeaseSeams, opts: LeaseOptions): Leas
       if ("unkeyable" in key) {
         unkeyed.push(typeof raw === "string" ? raw : describeValue(raw));
         if (ALIASING_REASONS.has(key.unkeyable)) aliasing = true;
-      } else if (!keys.has(key.logical)) {
-        keys.set(key.logical, key);
+      } else {
+        const first = keys.get(key.logical);
+        if (first === undefined) {
+          keys.set(key.logical, key);
+        } else if (first.physical !== key.physical || first.tree !== key.tree) {
+          // The same repo-relative file in another worktree: one more (physical, tree) pair of the same lease.
+          const more = extras.get(key.logical) ?? [];
+          more.push({ physical: key.physical, tree: key.tree });
+          extras.set(key.logical, more);
+        }
       }
     }
+    const pairsOf = (key: PathKey): Pair[] => [{ physical: key.physical, tree: key.tree }, ...(extras.get(key.logical) ?? [])];
 
     if (!holder.isChild) {
       for (const [logical, key] of keys) {
         const lease = state.leases.get(logical);
         if (lease === undefined) continue;
-        const record = liveRecord(lease.holderID);
+        const record = liveHolderOf(lease);
         if (record !== undefined) {
           return { ok: false, reason: "held", holders: [copyHolder(record.holder)], path: key.display, key: logical };
         }
@@ -771,20 +952,21 @@ export function createLeaseRegistry(seams: LeaseSeams, opts: LeaseOptions): Leas
     search: for (;;) {
       const fresh: PathKey[] = [];
       const reentrant: string[] = [];
-      const additions: { entry: LeaseEntry; pair: Pair }[] = [];
-      const now = seams.now();
+      const joined: { logical: string; entry: LeaseEntry; pairs: Pair[] }[] = [];
       for (const [logical, key] of keys) {
         const lease = state.leases.get(logical);
-        const record = lease === undefined ? undefined : state.holders.get(lease.holderID);
-        if (lease === undefined || record === undefined) {
+        if (lease === undefined) {
+          fresh.push(key);
+          continue;
+        }
+        const before = state.holders.size;
+        const record = liveHolderOf(lease);
+        if (state.holders.size !== before) continue search; // a stale holder was swept: look again
+        if (record === undefined) {
           fresh.push(key);
         } else if (record.owner === owner) {
           reentrant.push(key.display);
-          const pair: Pair = { physical: key.physical, tree: key.tree };
-          if (!lease.pairs.has(pairKey(pair))) additions.push({ entry: lease, pair });
-        } else if (isStale(record, now)) {
-          dropHolder(state, lease.holderID);
-          continue search;
+          joined.push({ logical, entry: lease, pairs: pairsOf(key) });
         } else {
           return { ok: false, reason: "held", holders: [copyHolder(record.holder)], path: key.display, key: logical };
         }
@@ -809,32 +991,43 @@ export function createLeaseRegistry(seams: LeaseSeams, opts: LeaseOptions): Leas
       }
       const stamp = seams.now();
       let record = state.holders.get(holder.holderID);
-      if (record === undefined && fresh.length > 0) {
+      if (record === undefined && (fresh.length > 0 || joined.length > 0)) {
         record = recordHolder(state, { ...holder, acquiredAt: stamp, lastSeenAt: stamp });
       }
-      if (record !== undefined) record.holder.lastSeenAt = stamp;
-      for (const key of fresh) {
-        if (record === undefined) break;
-        const pair: Pair = { physical: key.physical, tree: key.tree };
-        link(state, record, key.logical, {
-          holderID: holder.holderID,
-          display: key.display,
-          repo: key.repo,
-          pairs: new Map([[pairKey(pair), pair]]),
-        });
+      if (record !== undefined) {
+        record.holder.lastSeenAt = stamp;
+        for (const key of fresh) {
+          link(state, record, key.logical, {
+            holders: new Set(),
+            owner,
+            display: key.display,
+            repo: key.repo,
+            pairs: new Map(pairsOf(key).map((pair): [string, Pair] => [pairKey(pair), pair])),
+          });
+        }
+        for (const { logical, entry, pairs } of joined) {
+          join(state, record, logical, entry);
+          for (const pair of pairs) {
+            if (entry.pairs.has(pairKey(pair))) continue;
+            entry.pairs.set(pairKey(pair), pair);
+            indexPair(state, logical, pair);
+          }
+        }
       }
-      for (const { entry, pair } of additions) entry.pairs.set(pairKey(pair), pair);
       for (const key of keys.values()) {
         const entry = state.leases.get(key.logical);
-        const owning = entry === undefined ? undefined : state.holders.get(entry.holderID);
-        if (owning !== undefined && owning.owner === owner) owning.holder.lastSeenAt = stamp;
+        if (entry === undefined || entry.owner !== owner) continue;
+        for (const id of entry.holders) {
+          const sibling = state.holders.get(id);
+          if (sibling !== undefined) sibling.holder.lastSeenAt = stamp;
+        }
       }
       return { ok: true, leased: fresh.map((key) => key.display), reentrant, unkeyed };
     }
   };
 
   const checkRead = (readerInput: LeaseActor, path: string): ReadCheck => {
-    const reader = parseActor(readerInput, platform);
+    const reader = bindActor(readerInput);
     if (typeof reader === "string") return { ok: false, reason: "invalid-holder", message: reader };
     touch(reader.holderID);
     const conflict = readConflict(reader, path, reader.tree, seams);
@@ -844,33 +1037,52 @@ export function createLeaseRegistry(seams: LeaseSeams, opts: LeaseOptions): Leas
   };
 
   const checkRun = (runnerInput: LeaseActor, tree: string): RunCheck => {
-    const runner = parseActor(runnerInput, platform);
+    const runner = bindActor(runnerInput);
     if (typeof runner === "string") return { ok: false, reason: "invalid-holder", message: runner };
     touch(runner.holderID);
     const key = keyOfIn(tree, runner.tree, seams, platform, true);
-    if ("unkeyable" in key) return { ok: true };
-    const runnerOwner = ownerOf(runner.holderID, runner.taskRef);
+    const unkeyed = "unkeyable" in key;
+    // A run directory no key exists for may be any directory: a root run is only annotated, a child run fails closed.
+    if (unkeyed && !runner.isChild) return { ok: true };
     const now = seams.now();
     const holders = new Map<string, Holder>();
     const stale = new Set<string>();
     let fileCount = 0;
-    for (const entry of state.leases.values()) {
-      const record = state.holders.get(entry.holderID);
-      if (record === undefined || record.owner === runnerOwner) continue;
-      let hit = false;
-      for (const pair of entry.pairs.values()) {
-        if ((key.tree !== null && pair.tree === key.tree) || isUnder(pair.physical, key.physical)) {
-          hit = true;
-          break;
+    // Candidates come from the indexes (the run tree, the directories under the run directory), not from every lease.
+    const candidates = new Set<string>();
+    if (unkeyed) {
+      for (const logical of state.leases.keys()) candidates.add(logical);
+    } else {
+      for (const logical of key.tree === null ? [] : state.byTree.get(key.tree) ?? []) candidates.add(logical);
+      const dir = key.physical;
+      const variants = dir.endsWith("/") ? [dir, dir.slice(0, -1)] : [dir, `${dir}/`];
+      for (const variant of variants) {
+        for (const logical of state.byDir.get(variant) ?? []) candidates.add(logical);
+      }
+    }
+    for (const logical of candidates) {
+      const entry = state.leases.get(logical);
+      if (entry === undefined || entry.owner === runner.owner || entry.holders.has(runner.holderID)) continue;
+      if (!unkeyed) {
+        let hit = false;
+        for (const pair of entry.pairs.values()) {
+          if ((key.tree !== null && pair.tree === key.tree) || isUnder(pair.physical, key.physical)) {
+            hit = true;
+            break;
+          }
         }
+        if (!hit) continue;
       }
-      if (!hit) continue;
-      if (isStale(record, now)) {
-        stale.add(entry.holderID);
-        continue;
+      let first: HolderRecord | undefined;
+      for (const id of entry.holders) {
+        const record = state.holders.get(id);
+        if (record === undefined) continue;
+        if (isStale(record, now)) stale.add(id);
+        else if (first === undefined) first = record;
       }
+      if (first === undefined) continue;
       fileCount++;
-      if (!holders.has(entry.holderID)) holders.set(entry.holderID, copyHolder(record.holder));
+      if (!holders.has(first.holder.holderID)) holders.set(first.holder.holderID, copyHolder(first.holder));
     }
     for (const id of stale) dropHolder(state, id);
     if (holders.size === 0) return { ok: true };
@@ -880,17 +1092,19 @@ export function createLeaseRegistry(seams: LeaseSeams, opts: LeaseOptions): Leas
 
   const filterSearchResults = (readerInput: LeaseActor, tree: string, paths: readonly string[]): FilterResult => {
     const list: readonly string[] = Array.isArray(paths) ? paths : [];
-    const reader = parseActor(readerInput, platform);
+    const reader = bindActor(readerInput);
     if (typeof reader === "string") return { kept: [], omitted: list.length, holders: [], invalid: reader };
     touch(reader.holderID);
-    const foreign = state.holders.size > (state.owners.get(ownerOf(reader.holderID, reader.taskRef)) ?? 0);
+    const foreign = state.holders.size > (state.owners.get(reader.owner) ?? 0);
     if (!reader.isChild || !foreign) return { kept: [...list], omitted: 0, holders: [] };
+    // Relative entries are the reader's: against the search tree, or against the reader's own tree when there is none.
+    const base = typeof tree === "string" && (platform === "win32" ? win32 : posix).isAbsolute(tree) ? tree : reader.tree;
     const sm = memoize(seams);
     const kept: string[] = [];
     const holders = new Map<string, Holder>();
     let omitted = 0;
     for (const entry of list) {
-      const conflict = readConflict(reader, entry, tree, sm);
+      const conflict = readConflict(reader, entry, base, sm);
       if (conflict === undefined) {
         kept.push(entry);
         continue;
@@ -920,14 +1134,10 @@ export function createLeaseRegistry(seams: LeaseSeams, opts: LeaseOptions): Leas
   const snapshot = (): LeaseSnapshot => {
     const leases: SnapshotLease[] = [];
     for (const [logical, entry] of state.leases) {
-      for (const pair of entry.pairs.values()) {
-        leases.push({
-          logical,
-          physical: pair.physical,
-          tree: pair.tree,
-          holderID: entry.holderID,
-          display: entry.display,
-        });
+      for (const holderID of entry.holders) {
+        for (const pair of entry.pairs.values()) {
+          leases.push({ logical, physical: pair.physical, tree: pair.tree, holderID, display: entry.display });
+        }
       }
     }
     return {
@@ -951,6 +1161,11 @@ export function createLeaseRegistry(seams: LeaseSeams, opts: LeaseOptions): Leas
     const next = emptyState();
     /** Every holder of the snapshot, and whether it is kept. */
     const listed = new Map<string, boolean>();
+    /** holderID → owner, for every holder of the snapshot. */
+    const owners = new Map<string, string>();
+    /** logical key → the owner its lines name; the holders of one lease share an owner. */
+    const leaseOwners = new Map<string, string>();
+    const lines = new Set<string>();
     for (const value of holders) {
       const parsed = parseHolderInput(value, platform);
       if (typeof parsed === "string") return bad(`invalid holder: ${parsed}`);
@@ -965,6 +1180,7 @@ export function createLeaseRegistry(seams: LeaseSeams, opts: LeaseOptions): Leas
       if (listed.has(parsed.holderID)) return bad(`duplicate holder ${parsed.holderID}`);
       const keep = !(dropComplete && parsed.scope === "until-complete");
       listed.set(parsed.holderID, keep);
+      owners.set(parsed.holderID, ownerOf(parsed.holderID, parsed.taskRef));
       if (keep) {
         recordHolder(next, { ...parsed, acquiredAt: Math.min(acquiredAt, now), lastSeenAt: Math.min(seen, now) });
       }
@@ -983,6 +1199,7 @@ export function createLeaseRegistry(seams: LeaseSeams, opts: LeaseOptions): Leas
       if (logical.startsWith("x:")) {
         if (tree !== null) return bad(`lease ${logical} is outside any repository but has a tree`);
         if (logical !== `x:${physical}`) return bad(`lease ${logical} does not match its physical path`);
+        if (!api.isAbsolute(physical)) return bad(`lease ${logical} has a physical path that is not absolute`);
       } else if (logical.startsWith("r:")) {
         if (typeof tree !== "string") return bad(`lease ${logical} is in a repository but has no tree`);
         if (tree !== foldKeyPath(tree, platform) || !api.isAbsolute(tree)) return bad(`lease ${logical} has a tree that is not normalised`);
@@ -992,35 +1209,64 @@ export function createLeaseRegistry(seams: LeaseSeams, opts: LeaseOptions): Leas
         const sep = logical.indexOf("\0");
         if (sep < 0 || logical.slice(sep + 1) !== rel) return bad(`lease ${logical} does not match its physical path`);
         repo = logical.slice(2, sep);
+        if (repo !== foldKeyPath(repo, platform)) return bad(`lease ${logical} has a repository that is not normalised`);
       } else {
         return bad(`lease ${logical} has an unknown key space`);
       }
       const pair: Pair = { physical, tree };
-      const existing = next.leases.get(logical);
-      if (existing !== undefined) {
-        if (existing.holderID !== holderID || existing.pairs.has(pairKey(pair))) return bad(`duplicate lease ${logical}`);
-        existing.pairs.set(pairKey(pair), pair);
-        continue;
-      }
+      // Duplicates are found in any order of the lines and whether or not the holder is kept.
+      const line = JSON.stringify([logical, holderID, tree, physical]);
+      if (lines.has(line)) return bad(`duplicate lease ${logical}`);
+      lines.add(line);
+      const owner = owners.get(holderID) ?? "";
+      const seenOwner = leaseOwners.get(logical);
+      if (seenOwner !== undefined && seenOwner !== owner) return bad(`duplicate lease ${logical}: held by holders of different owners`);
+      leaseOwners.set(logical, owner);
       if (!keep) continue;
       const record = next.holders.get(holderID);
       if (record === undefined) return bad(`lease ${logical} names an unknown holder ${holderID}`);
-      link(next, record, logical, { holderID, display, repo, pairs: new Map([[pairKey(pair), pair]]) });
+      const existing = next.leases.get(logical);
+      if (existing === undefined) {
+        link(next, record, logical, { holders: new Set(), owner, display, repo, pairs: new Map([[pairKey(pair), pair]]) });
+        continue;
+      }
+      join(next, record, logical, existing);
+      if (!existing.pairs.has(pairKey(pair))) {
+        existing.pairs.set(pairKey(pair), pair);
+        indexPair(next, logical, pair);
+      }
     }
     if (next.leases.size > cap) return bad(`${next.leases.size} leases exceed the cap of ${cap}`);
     state = next;
     return { ok: true, leases: next.leases.size };
   };
 
+  /** Never lets a throwing getter or revoked Proxy in the caller's input escape: `fallback` answers instead. */
+  const safe = <Args extends unknown[], Result>(
+    fn: (...args: Args) => Result,
+    fallback: (message: string) => Result,
+  ): ((...args: Args) => Result) => {
+    return (...args: Args): Result => {
+      try {
+        return fn(...args);
+      } catch (error) {
+        return fallback(`the input could not be read: ${describeValue(error)}`);
+      }
+    };
+  };
+
   return {
-    acquireWrite,
-    checkRead,
-    checkRun,
-    filterSearchResults,
-    release,
-    releaseTask,
+    acquireWrite: safe(acquireWrite, (message): AcquireResult => ({ ok: false, reason: "invalid-holder", message })),
+    checkRead: safe(checkRead, (message): ReadCheck => ({ ok: false, reason: "invalid-holder", message })),
+    checkRun: safe(checkRun, (message): RunCheck => ({ ok: false, reason: "invalid-holder", message })),
+    filterSearchResults: safe(
+      filterSearchResults,
+      (message): FilterResult => ({ kept: [], omitted: 0, holders: [], invalid: message }),
+    ),
+    release: safe(release, (): ReleaseResult => ({ released: 0, retained: 0 })),
+    releaseTask: safe(releaseTask, (): HoldersReleased => ({ released: 0, holders: [] })),
     sweep,
     snapshot,
-    restore,
+    restore: safe(restore, (message): RestoreResult => ({ ok: false, reason: "invalid-snapshot", message })),
   };
 }

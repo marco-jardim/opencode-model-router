@@ -19,10 +19,11 @@ export interface ToolTargets {
   /** Tools whose effects cannot be extracted from the arguments. */
   uncovered?: "shell" | "execute";
   /**
-   * A `router_git_*` call whose paths are relative to the repository top level, resolved against `cwd`
-   * because the caller gave no `gitRoot`: the work root may be below the top level, so they may be wrong.
+   * A `router_git_*` call whose paths are relative to the repository top level but the caller gave no absolute
+   * `gitRoot`: `access` stays as classified while `paths` and `roots` are empty, so the call has no concrete target
+   * and the caller treats it as an unknown target.
    */
-  gitRootAssumed?: true;
+  gitRootRequired?: true;
 }
 
 /** Optional context for `toolTargets`. */
@@ -42,6 +43,9 @@ const PATCH_HEADER = /^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)
  * Every non-empty string among them is a target (the host may honour any of them, so first-wins is unsafe).
  */
 const PATH_KEYS = ["filePath", "path", "file", "file_path"] as const;
+
+/** The path arguments the v2 host reads from a `patch` / `apply_patch` call besides its headers. */
+const HOST_PATCH_PATH_KEYS = ["filePath", "path", "file_path"] as const;
 
 /** The apply_patch argument keys the v2 host reads, in order; the first string wins (even when empty). */
 const PATCH_KEYS = ["patchText", "patch_text", "patch", "input"] as const;
@@ -80,8 +84,19 @@ function hostPatchPaths(a: Record<string, unknown>): string[] | undefined {
   return paths.length > 0 ? paths : undefined;
 }
 
-/** `p` resolved against `base`; undefined when it would stay relative (no absolute base, relative `p`). */
+/** win32 spellings `path.resolve` would rewrite wrongly: the device prefixes `\\?\`, `\\.\`, `\??\`. */
+const WIN_DEVICE = /^(?:[\\/]{2}[.?]|[\\/]\?\?)[\\/]/;
+/** A win32 path rooted without a drive (`\x`): its drive is the process's, not the session's. */
+const WIN_ROOTED_NO_DRIVE = /^[\\/](?![\\/])/;
+
+/**
+ * `p` resolved against `base`; undefined when it would stay relative (no absolute base, relative `p`). On win32 a
+ * device-prefixed path (`\\?\C:\x`, `\??\C:\x`) and a path rooted without a drive (`\x`) are returned unchanged:
+ * `path.resolve` would turn them into `C:\??\C:\x` and `<baseDrive>:\x`, defeating the lease registry, whose `keyOf`
+ * understands the first and fails closed on the second.
+ */
 function absolute(p: string, base: string): string | undefined {
+  if (process.platform === "win32" && (WIN_DEVICE.test(p) || WIN_ROOTED_NO_DRIVE.test(p))) return p;
   if (isAbsolute(base)) return resolve(base, p);
   return isAbsolute(p) ? resolve(p) : undefined;
 }
@@ -121,23 +136,52 @@ function searchRoots(a: Record<string, unknown>, cwd: string): string[] {
 
 const GLOB_CHARS = /[*?[\]{}()!]/;
 
+/** The directory spelling of the glob-free `fixed` segments; undefined when there is none to anchor at. */
+function joinPrefix(fixed: readonly string[], first: string | undefined): string | undefined {
+  if (fixed.length === 0) return first === "" ? "/" : undefined;
+  const joined = fixed.join("/");
+  if (joined === "") return "/";
+  return /^[A-Za-z]:$/.test(joined) ? `${joined}/` : joined;
+}
+
 /**
- * The directory a glob pattern is anchored at when it leaves the search root: the leading
- * glob-free segments of an absolute pattern or one starting with `..`. Undefined otherwise.
+ * The static prefix of a relative pattern that leaves the search root (`..` first once lexically normalised), or
+ * undefined. A wildcard segment may match nothing (`**`) or one directory (`*`), so a `..` after it may cancel it or
+ * climb one level further: with `dropWildcards` the wildcards that precede the last `..` are dropped before the `..`
+ * are resolved (the widest reading), without it they count as one ordinary segment each. The first wildcard that is
+ * left ends the prefix.
  */
-function globPrefix(pattern: string): string | undefined {
-  let segments = pattern.split(/[\\/]/);
-  if (!isAbsolute(pattern)) {
-    // Normalise lexically first: `src/../../w1/**` and `./../w1/**` leave the root, `src/../x/*` does not.
-    const normal: string[] = [];
-    for (const segment of segments) {
-      if (segment === "" || segment === ".") continue;
-      if (segment !== "..") normal.push(segment);
-      else if (normal.length > 0 && normal[normal.length - 1] !== "..") normal.pop();
+function relativePrefix(raw: readonly string[], dropWildcards: boolean): string | undefined {
+  const lastUp = raw.lastIndexOf("..");
+  const normal: string[] = [];
+  for (let index = 0; index < raw.length; index++) {
+    const segment = raw[index] ?? "";
+    if (segment === "..") {
+      if (normal.length > 0 && normal[normal.length - 1] !== "..") normal.pop();
       else normal.push("..");
+    } else if (dropWildcards && index < lastUp && GLOB_CHARS.test(segment)) {
+      continue;
+    } else {
+      normal.push(segment);
     }
-    if (normal[0] !== "..") return undefined;
-    segments = normal;
+  }
+  if (normal[0] !== "..") return undefined;
+  const cut = normal.findIndex(segment => GLOB_CHARS.test(segment));
+  const fixed = cut < 0 ? normal.slice(0, -1) : normal.slice(0, cut); // no wildcard: the pattern names one entry
+  return joinPrefix(fixed, "..");
+}
+
+/**
+ * The directories a glob pattern is anchored at when it leaves the search root: the leading glob-free segments of an
+ * absolute pattern or of a relative one that starts with `..` once normalised. A relative pattern with a wildcard
+ * ahead of a `..` (`**` + `/../../w1/**`) has two readings, wildcard dropped and wildcard as one segment; both
+ * prefixes are returned. Empty when the pattern stays inside the search root.
+ */
+function globPrefixes(pattern: string): string[] {
+  const segments = pattern.split(/[\\/]/);
+  if (!isAbsolute(pattern)) {
+    const raw = segments.filter(segment => segment !== "" && segment !== ".");
+    return dedupe([relativePrefix(raw, true), relativePrefix(raw, false)].filter((p): p is string => p !== undefined));
   }
   const fixed: string[] = [];
   let sawGlob = false;
@@ -146,10 +190,8 @@ function globPrefix(pattern: string): string | undefined {
     fixed.push(segment);
   }
   if (!sawGlob) fixed.pop(); // no wildcard: the pattern names one entry, search its directory
-  if (fixed.length === 0) return segments[0] === "" ? "/" : undefined;
-  const joined = fixed.join("/");
-  if (joined === "") return "/";
-  return /^[A-Za-z]:$/.test(joined) ? `${joined}/` : joined;
+  const prefix = joinPrefix(fixed, segments[0]);
+  return prefix === undefined ? [] : [prefix];
 }
 
 function none(): ToolTargets {
@@ -158,8 +200,10 @@ function none(): ToolTargets {
 
 function writeTargets(tool: string, a: Record<string, unknown>, cwd: string): ToolTargets {
   if (tool === "patch" || tool === "apply_patch") {
-    // An unreadable patch has unknown targets: a write of nothing the caller can name.
-    return { access: "write", paths: resolved(hostPatchPaths(a) ?? [], cwd), roots: [] };
+    // An unreadable patch has unknown targets: a write of nothing the caller can name. The host also honours the
+    // path arguments `filePath`, `path` and `file_path` of a patch call (`toolCallPaths` in src/compat/v2-hooks.ts).
+    const keyed = HOST_PATCH_PATH_KEYS.map(key => nonEmpty(a[key]));
+    return { access: "write", paths: resolved([...(hostPatchPaths(a) ?? []), ...keyed], cwd), roots: [] };
   }
   const raw = pathArgs(a);
   if (tool === "multiedit" && Array.isArray(a.edits)) {
@@ -183,21 +227,18 @@ function gitDiffReadsWorkingTree(a: Record<string, unknown>): boolean {
   return !ref.includes("..");
 }
 
-/** A `router_git_*` result: paths are relative to the repository top level, so resolved against `gitRoot`. */
-function gitTargets(
-  result: ToolTargets,
-  a: Record<string, unknown>,
-  cwd: string,
-  opts: ToolTargetsOptions | undefined,
-): ToolTargets {
+/**
+ * A `router_git_*` result: paths are relative to the repository top level, so resolved against `gitRoot`; without an
+ * absolute `gitRoot` there is no concrete target (`paths` and `roots` stay empty, `gitRootRequired` is set). A
+ * path-less call covers the top level.
+ */
+function gitTargets(result: ToolTargets, a: Record<string, unknown>, opts: ToolTargetsOptions | undefined): ToolTargets {
   const gitRoot = nonEmpty(opts?.gitRoot);
-  const base = gitRoot !== undefined && isAbsolute(gitRoot) ? gitRoot : undefined;
+  if (gitRoot === undefined || !isAbsolute(gitRoot)) return { ...result, paths: [], roots: [], gitRootRequired: true };
   const dir = nonEmpty(a.path);
-  // Without a path the tools list the work root (git-tools.ts scopes the pathspec to it), so that is the root.
-  const out: ToolTargets = result.access === "read"
-    ? { ...result, paths: dir === undefined ? [] : resolved([dir], base ?? cwd) }
-    : { ...result, roots: resolved([dir ?? cwd], dir === undefined ? cwd : base ?? cwd) };
-  return base === undefined ? { ...out, gitRootAssumed: true } : out;
+  return result.access === "read"
+    ? { ...result, paths: dir === undefined ? [] : resolved([dir], gitRoot) }
+    : { ...result, roots: resolved([dir ?? gitRoot], gitRoot) };
 }
 
 function classify(tool: string, a: Record<string, unknown>, cwd: string, opts?: ToolTargetsOptions): ToolTargets {
@@ -216,10 +257,10 @@ function classify(tool: string, a: Record<string, unknown>, cwd: string, opts?: 
     case "glob": {
       const roots = searchRoots(a, cwd);
       const pattern = nonEmpty(a.pattern);
-      const prefix = pattern === undefined ? undefined : globPrefix(pattern);
-      if (prefix !== undefined) {
+      const prefixes = pattern === undefined ? [] : globPrefixes(pattern);
+      if (prefixes.length > 0) {
         const base = roots[0] ?? cwd;
-        roots.push(...resolved([prefix], base));
+        roots.push(...resolved(prefixes, base));
       }
       return { access: "search", paths: [], roots: dedupe(roots) };
     }
@@ -230,13 +271,13 @@ function classify(tool: string, a: Record<string, unknown>, cwd: string, opts?: 
     case "router_git_blame": {
       // A blame at a ref reads committed content only; without one it reads the working-tree file.
       if ((nonEmpty(a.ref)?.trim() ?? "") !== "") return none();
-      return gitTargets({ access: "read", paths: [], roots: [] }, a, cwd, opts);
+      return gitTargets({ access: "read", paths: [], roots: [] }, a, opts);
     }
     case "router_git_diff":
-      return gitDiffReadsWorkingTree(a) ? gitTargets({ access: "search", paths: [], roots: [] }, a, cwd, opts) : none();
+      return gitDiffReadsWorkingTree(a) ? gitTargets({ access: "search", paths: [], roots: [] }, a, opts) : none();
     case "router_git_status":
     case "router_git_ls_files":
-      return gitTargets({ access: "search", paths: [], roots: [] }, a, cwd, opts);
+      return gitTargets({ access: "search", paths: [], roots: [] }, a, opts);
     case "router_git_log":
     case "router_git_show":
       return none();
@@ -251,8 +292,10 @@ function classify(tool: string, a: Record<string, unknown>, cwd: string, opts?: 
 
 /**
  * What the tool call `tool(args)` touches, with `cwd` (absolute) as the base for relative paths. `router_git_*` paths
- * are relative to the repository top level and resolve against `opts.gitRoot`; without it they fall back to `cwd` and
- * the result carries `gitRootAssumed: true`. Never throws.
+ * are relative to the repository top level and resolve against `opts.gitRoot` (a path-less search covers the top
+ * level); without an absolute one the result has no `paths` or `roots` and carries `gitRootRequired: true`. A
+ * device-prefixed (`\\?\`, `\\.\`, `\??\`) or drive-less rooted (`\x`) path is returned unchanged on win32 (the
+ * registry's `keyOf` decides). Never throws.
  */
 export function toolTargets(tool: string, args: unknown, cwd: string, opts?: ToolTargetsOptions): ToolTargets {
   const name = typeof tool === "string" ? tool.toLowerCase() : "";

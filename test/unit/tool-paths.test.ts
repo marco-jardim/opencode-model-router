@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { createLeaseRegistry, type HolderInput } from "../../src/router/leases";
 import { applyPatchHeaderPaths, toolTargets, WRITE_CLASS } from "../../src/router/tool-paths";
 
 const win = process.platform === "win32";
@@ -9,6 +10,8 @@ const CWD = resolve("/work/proj");
 const p = (...segments: string[]): string => resolve(CWD, ...segments);
 const ABS = resolve("/elsewhere/abs.ts");
 const NONE = { access: "none", paths: [], roots: [] };
+/** A drive-less rooted path: win32 returns it unchanged (the registry decides), POSIX resolves it. */
+const rooted = (text: string): string => (win ? text : resolve(text));
 
 describe("toolTargets: read and write tools", () => {
   it("read: the path key, resolved lexically against cwd", () => {
@@ -172,8 +175,18 @@ describe("toolTargets: read and write tools", () => {
       expect(toolTargets("apply_patch", { patchText: null, patch: ["x"] }, CWD).paths).toEqual([]);
     });
 
-    it("does not use the path keys for a patch", () => {
-      expect(toolTargets("apply_patch", { path: "a.ts" }, CWD)).toEqual({ access: "write", paths: [], roots: [] });
+    it("also takes filePath, path and file_path like the host, after the header paths (QA-1.3-32)", () => {
+      for (const tool of ["apply_patch", "patch"]) {
+        expect(toolTargets(tool, { path: "a.ts" }, CWD), tool).toEqual({ access: "write", paths: [p("a.ts")], roots: [] });
+        expect(toolTargets(tool, { filePath: "f", path: "g", file_path: "h" }, CWD).paths, tool).toEqual([p("f"), p("g"), p("h")]);
+        expect(
+          toolTargets(tool, { patchText: "*** Add File: x.ts", filePath: "f", path: "x.ts" }, CWD).paths,
+          tool,
+        ).toEqual([p("x.ts"), p("f")]);
+        // `file` is not a host patch key.
+        expect(toolTargets(tool, { file: "c.ts" }, CWD).paths, tool).toEqual([]);
+        expect(toolTargets(tool, { path: "" }, CWD).paths, tool).toEqual([]);
+      }
     });
 
     it("applyPatchHeaderPaths on non-object arguments is empty and does not throw", () => {
@@ -211,15 +224,15 @@ describe("toolTargets: search tools", () => {
     });
 
     it("adds the static prefix of an absolute pattern", () => {
-      const other = resolve("/other/dir");
+      const other = rooted("/other/dir");
       expect(toolTargets("glob", { pattern: "/other/dir/**/*.ts" }, CWD).roots).toEqual([CWD, other]);
       expect(toolTargets("glob", { pattern: "/other/dir/file.ts" }, CWD).roots).toEqual([CWD, other]);
-      expect(toolTargets("glob", { pattern: "/other/dir/sub/*/x.ts" }, CWD).roots).toEqual([CWD, resolve("/other/dir/sub")]);
-      expect(toolTargets("glob", { pattern: "/other/d{a,b}/x" }, CWD).roots).toEqual([CWD, resolve("/other")]);
+      expect(toolTargets("glob", { pattern: "/other/dir/sub/*/x.ts" }, CWD).roots).toEqual([CWD, rooted("/other/dir/sub")]);
+      expect(toolTargets("glob", { pattern: "/other/d{a,b}/x" }, CWD).roots).toEqual([CWD, rooted("/other")]);
     });
 
     it("anchors an absolute pattern with no static directory at the filesystem root", () => {
-      const fsRoot = resolve("/");
+      const fsRoot = rooted("/");
       expect(toolTargets("glob", { pattern: "/**" }, CWD).roots).toEqual([CWD, fsRoot]);
       expect(toolTargets("glob", { pattern: "/file.ts" }, CWD).roots).toEqual([CWD, fsRoot]);
       expect(toolTargets("glob", { pattern: "/" }, CWD).roots).toEqual([CWD, fsRoot]);
@@ -257,6 +270,19 @@ describe("toolTargets: search tools", () => {
       expect(toolTargets("glob", { pattern: "src/../../*.ts" }, CWD).roots).toEqual([CWD, p("..")]);
       expect(toolTargets("glob", { pattern: "src/../../w1/**", path: "sub" }, CWD).roots).toEqual([p("sub"), p("w1")]);
     });
+
+    it("drops wildcard segments before resolving .., so the root covers the widest reading (QA-1.3-24)", () => {
+      // `**` may match nothing (../../w1) or one directory (../w1): both readings are roots.
+      expect(toolTargets("glob", { pattern: "**/../../w1/**" }, CWD).roots).toEqual([CWD, p("../../w1"), p("../w1")]);
+      expect(toolTargets("glob", { pattern: "*/../../w1/x.ts" }, CWD).roots).toEqual([CWD, p("../../w1"), p("../w1")]);
+      expect(toolTargets("glob", { pattern: "{a,b}/../../w1/**" }, CWD).roots).toEqual([CWD, p("../../w1"), p("../w1")]);
+      expect(toolTargets("glob", { pattern: "src/*/../../w1/*.ts" }, CWD).roots).toEqual([CWD, p("../w1")]);
+      expect(toolTargets("glob", { pattern: "**/../x/**" }, CWD).roots).toEqual([CWD, p("../x")]);
+      // A wildcard after the last .. still ends the static prefix.
+      expect(toolTargets("glob", { pattern: "../a/*/b/x" }, CWD).roots).toEqual([CWD, p("../a")]);
+      // A pattern that stays inside the root is not anchored, wildcards or not.
+      expect(toolTargets("glob", { pattern: "a/**/b/../c/*.ts" }, CWD).roots).toEqual([CWD]);
+    });
   });
 });
 
@@ -287,6 +313,9 @@ describe("toolTargets: run and shell tools", () => {
   });
 });
 
+/** The repository top level is the session directory. */
+const GIT = { gitRoot: CWD };
+
 describe("toolTargets: router_git_* tools", () => {
   describe("paths are relative to the repository top level (QA-1.3-1)", () => {
     const TOP = resolve("/work/repo");
@@ -309,10 +338,11 @@ describe("toolTargets: router_git_* tools", () => {
       expect(toolTargets("router_git_ls_files", { path: "other/x" }, WORK, opts).roots).toEqual([top("other/x")]);
     });
 
-    it("without a path the tools list the work root", () => {
+    it("without a path the search tools cover the top level, not the work root (QA-1.3-23)", () => {
       const opts = { gitRoot: TOP };
-      expect(toolTargets("router_git_status", {}, WORK, opts).roots).toEqual([WORK]);
-      expect(toolTargets("router_git_diff", { path: "" }, WORK, opts).roots).toEqual([WORK]);
+      expect(toolTargets("router_git_status", {}, WORK, opts)).toEqual({ access: "search", paths: [], roots: [TOP] });
+      expect(toolTargets("router_git_ls_files", { path: 3 }, WORK, opts).roots).toEqual([TOP]);
+      expect(toolTargets("router_git_diff", { path: "" }, WORK, opts).roots).toEqual([TOP]);
       expect(toolTargets("router_git_blame", {}, WORK, opts)).toEqual({ access: "read", paths: [], roots: [] });
     });
 
@@ -320,42 +350,48 @@ describe("toolTargets: router_git_* tools", () => {
       expect(toolTargets("router_git_blame", { path: ABS }, WORK, { gitRoot: TOP }).paths).toEqual([ABS]);
     });
 
-    it("sets no gitRootAssumed flag when gitRoot is given, and none for history-only tools", () => {
-      expect(toolTargets("router_git_blame", { path: "a" }, WORK, { gitRoot: TOP })).not.toHaveProperty("gitRootAssumed");
+    it("sets no gitRootRequired flag when gitRoot is given, and none for history-only tools", () => {
+      expect(toolTargets("router_git_blame", { path: "a" }, WORK, { gitRoot: TOP })).not.toHaveProperty("gitRootRequired");
       expect(toolTargets("router_git_log", { path: "a" }, WORK)).toEqual(NONE);
       expect(toolTargets("router_git_diff", { ref: "a..b" }, WORK)).toEqual(NONE);
     });
 
-    it("falls back to cwd and flags gitRootAssumed when gitRoot is absent or not absolute", () => {
-      for (const opts of [undefined, {}, { gitRoot: "" }, { gitRoot: "rel/top" }]) {
+    it("has no concrete target and flags gitRootRequired when gitRoot is absent or not absolute (QA-1.3-23)", () => {
+      for (const opts of [undefined, {}, { gitRoot: "" }, { gitRoot: "rel/top" }, { gitRoot: 5 as unknown as string }]) {
         expect(toolTargets("router_git_blame", { path: "a.ts" }, WORK, opts)).toEqual({
           access: "read",
-          paths: [resolve(WORK, "a.ts")],
+          paths: [],
           roots: [],
-          gitRootAssumed: true,
+          gitRootRequired: true,
         });
         expect(toolTargets("router_git_status", { path: "d" }, WORK, opts)).toEqual({
           access: "search",
           paths: [],
-          roots: [resolve(WORK, "d")],
-          gitRootAssumed: true,
+          roots: [],
+          gitRootRequired: true,
+        });
+        expect(toolTargets("router_git_diff", {}, WORK, opts)).toEqual({
+          access: "search",
+          paths: [],
+          roots: [],
+          gitRootRequired: true,
         });
       }
     });
 
     it("other tools resolve against cwd and never carry the flag", () => {
       expect(toolTargets("read", { path: "a.ts" }, WORK, { gitRoot: TOP }).paths).toEqual([resolve(WORK, "a.ts")]);
-      expect(toolTargets("grep", { path: "src" }, WORK)).not.toHaveProperty("gitRootAssumed");
+      expect(toolTargets("grep", { path: "src" }, WORK)).not.toHaveProperty("gitRootRequired");
     });
   });
 
   describe("router_git_blame", () => {
     it("a blame without a ref reads the working-tree file", () => {
-      expect(toolTargets("router_git_blame", { path: "a.ts" }, CWD)).toEqual({ access: "read", paths: [p("a.ts")], roots: [], gitRootAssumed: true });
-      expect(toolTargets("router_git_blame", { path: "a.ts", ref: "" }, CWD).access).toBe("read");
-      expect(toolTargets("router_git_blame", { path: "a.ts", ref: "   " }, CWD).access).toBe("read");
-      expect(toolTargets("router_git_blame", { path: "a.ts", ref: 5 }, CWD).access).toBe("read");
-      expect(toolTargets("router_git_blame", { path: "a.ts", ref: null }, CWD).access).toBe("read");
+      expect(toolTargets("router_git_blame", { path: "a.ts" }, CWD, GIT)).toEqual({ access: "read", paths: [p("a.ts")], roots: [] });
+      expect(toolTargets("router_git_blame", { path: "a.ts", ref: "" }, CWD, GIT).access).toBe("read");
+      expect(toolTargets("router_git_blame", { path: "a.ts", ref: "   " }, CWD, GIT).access).toBe("read");
+      expect(toolTargets("router_git_blame", { path: "a.ts", ref: 5 }, CWD, GIT).access).toBe("read");
+      expect(toolTargets("router_git_blame", { path: "a.ts", ref: null }, CWD, GIT).access).toBe("read");
     });
 
     it("a blame at a ref reads committed content only", () => {
@@ -364,24 +400,24 @@ describe("toolTargets: router_git_* tools", () => {
     });
 
     it("uses only the path key; no path is a read of nothing", () => {
-      expect(toolTargets("router_git_blame", {}, CWD)).toEqual({ access: "read", paths: [], roots: [], gitRootAssumed: true });
-      expect(toolTargets("router_git_blame", { filePath: "a.ts" }, CWD).paths).toEqual([]);
-      expect(toolTargets("router_git_blame", { path: "" }, CWD).paths).toEqual([]);
+      expect(toolTargets("router_git_blame", {}, CWD, GIT)).toEqual({ access: "read", paths: [], roots: [] });
+      expect(toolTargets("router_git_blame", { filePath: "a.ts" }, CWD, GIT).paths).toEqual([]);
+      expect(toolTargets("router_git_blame", { path: "" }, CWD, GIT).paths).toEqual([]);
     });
   });
 
   describe("router_git_diff (a diff against the working tree reads it; commit-to-commit and --cached do not)", () => {
     it("no ref: working tree against the index, a search of path ?? cwd", () => {
-      expect(toolTargets("router_git_diff", {}, CWD)).toEqual({ access: "search", paths: [], roots: [CWD], gitRootAssumed: true });
-      expect(toolTargets("router_git_diff", { path: "src" }, CWD).roots).toEqual([p("src")]);
-      expect(toolTargets("router_git_diff", { mode: "stat" }, CWD).access).toBe("search");
-      expect(toolTargets("router_git_diff", { mode: "name-only" }, CWD).access).toBe("search");
+      expect(toolTargets("router_git_diff", {}, CWD, GIT)).toEqual({ access: "search", paths: [], roots: [CWD] });
+      expect(toolTargets("router_git_diff", { path: "src" }, CWD, GIT).roots).toEqual([p("src")]);
+      expect(toolTargets("router_git_diff", { mode: "stat" }, CWD, GIT).access).toBe("search");
+      expect(toolTargets("router_git_diff", { mode: "name-only" }, CWD, GIT).access).toBe("search");
     });
 
     it("a single ref compares a commit with the working tree: a search", () => {
-      expect(toolTargets("router_git_diff", { ref: "main" }, CWD)).toEqual({ access: "search", paths: [], roots: [CWD], gitRootAssumed: true });
-      expect(toolTargets("router_git_diff", { ref: " HEAD " }, CWD).access).toBe("search");
-      expect(toolTargets("router_git_diff", { ref: "HEAD~2", path: "pkg" }, CWD).roots).toEqual([p("pkg")]);
+      expect(toolTargets("router_git_diff", { ref: "main" }, CWD, GIT)).toEqual({ access: "search", paths: [], roots: [CWD] });
+      expect(toolTargets("router_git_diff", { ref: " HEAD " }, CWD, GIT).access).toBe("search");
+      expect(toolTargets("router_git_diff", { ref: "HEAD~2", path: "pkg" }, CWD, GIT).roots).toEqual([p("pkg")]);
     });
 
     it("an empty, blank or non-string ref counts as absent", () => {
@@ -407,8 +443,8 @@ describe("toolTargets: router_git_* tools", () => {
 
   for (const tool of ["router_git_status", "router_git_ls_files"]) {
     it(`${tool}: a search of path ?? cwd`, () => {
-      expect(toolTargets(tool, {}, CWD)).toEqual({ access: "search", paths: [], roots: [CWD], gitRootAssumed: true });
-      expect(toolTargets(tool, { path: "pkg" }, CWD).roots).toEqual([p("pkg")]);
+      expect(toolTargets(tool, {}, CWD, GIT)).toEqual({ access: "search", paths: [], roots: [CWD] });
+      expect(toolTargets(tool, { path: "pkg" }, CWD, GIT).roots).toEqual([p("pkg")]);
     });
   }
 
@@ -456,14 +492,15 @@ describe("toolTargets: arguments and cwd that are not what they should be", () =
       expect(toolTargets("router_run", {}, cwd).roots).toEqual([]);
       expect(toolTargets("router_run", { cwd: ABS }, cwd).roots).toEqual([ABS]);
       expect(toolTargets("shell", {}, cwd)).toEqual({ access: "none", paths: [], roots: [], uncovered: "shell" });
-      expect(toolTargets("router_git_blame", { path: "a.ts" }, cwd)).toEqual({ access: "read", paths: [], roots: [], gitRootAssumed: true });
+      expect(toolTargets("router_git_blame", { path: "a.ts" }, cwd)).toEqual({ access: "read", paths: [], roots: [], gitRootRequired: true });
+      expect(toolTargets("router_git_blame", { path: "a.ts" }, cwd, { gitRoot: ABS }).paths).toEqual([resolve(ABS, "a.ts")]);
     }
   });
 
   it("drops a relative glob prefix when there is no absolute base", () => {
     const result = toolTargets("glob", { pattern: "../x/*.ts" }, "relative");
     expect(result).toEqual({ access: "search", paths: [], roots: [] });
-    expect(toolTargets("glob", { pattern: "/other/*.ts" }, "relative").roots).toEqual([resolve("/other")]);
+    expect(toolTargets("glob", { pattern: "/other/*.ts" }, "relative").roots).toEqual([rooted("/other")]);
   });
 
   it("treats a cwd that is not a string as empty", () => {
@@ -508,6 +545,10 @@ describe("toolTargets never throws", () => {
     for (const tool of TOOLS) {
       const result = toolTargets(tool, hostile(), CWD);
       if (WRITE_CLASS.has(tool)) expect(result, tool).toEqual({ access: "write", paths: [], roots: [] });
+      else if (tool === "router_git_status" || tool === "router_git_ls_files") {
+        // No gitRoot: no concrete target, flagged, before any argument is read.
+        expect(result, tool).toEqual({ access: "search", paths: [], roots: [], gitRootRequired: true });
+      }
       else if (tool === "execute" || tool === "router_git_log" || tool === "router_git_show" || tool === "other") {
         expect(result.paths, tool).toEqual([]);
       } else expect(result, tool).toEqual(NONE);
@@ -530,6 +571,46 @@ describe("toolTargets never throws", () => {
   it("survives a path value whose toString would throw (it is ignored as a non-string)", () => {
     const evil = { toString: boom };
     expect(toolTargets("read", { path: evil }, CWD)).toEqual({ access: "read", paths: [], roots: [] });
+  });
+});
+
+describe.runIf(win)("QA-1.3-19: device-prefixed and drive-less rooted paths reach the registry unchanged", () => {
+  const registry = () => {
+    const dirs = new Set(["C:\\", "C:\\r", "C:\\Other"]);
+    return createLeaseRegistry(
+      {
+        realpath: (path: string): string => {
+          if (dirs.has(path)) return path;
+          throw new Error(`ENOENT: ${path}`);
+        },
+        repoKeyOf: (dir: string) => (/^c:[\\/]r(?:[\\/]|$)/i.test(dir) ? { repo: "R", tree: "C:/r" } : undefined),
+        now: () => 1_000,
+      },
+      { runMode: "annotate", platform: "win32" },
+    );
+  };
+  const owner: HolderInput = { holderID: "A", tree: "C:\\r", isChild: true, scope: "until-complete" };
+  const other: HolderInput = { ...owner, holderID: "B" };
+
+  it("returns the spellings unchanged", () => {
+    expect(toolTargets("write", { path: "\\??\\C:\\r\\x.ts" }, "C:\\r").paths).toEqual(["\\??\\C:\\r\\x.ts"]);
+    expect(toolTargets("write", { path: "\\\\?\\C:\\r\\x.ts" }, "C:\\r").paths).toEqual(["\\\\?\\C:\\r\\x.ts"]);
+    expect(toolTargets("write", { path: "\\\\.\\C:\\r\\x.ts" }, "C:\\r").paths).toEqual(["\\\\.\\C:\\r\\x.ts"]);
+    expect(toolTargets("write", { path: "\\r\\x.ts" }, "C:\\r").paths).toEqual(["\\r\\x.ts"]);
+    expect(toolTargets("write", { path: "\\r\\x.ts" }, "relative").paths).toEqual(["\\r\\x.ts"]);
+    expect(toolTargets("write", { path: "x.ts" }, "C:\\r").paths).toEqual(["C:\\r\\x.ts"]);
+  });
+
+  it("a write through either spelling is refused while a foreign child holds the file", () => {
+    const reg = registry();
+    expect(reg.acquireWrite(owner, "C:\\r\\x.ts")).toMatchObject({ ok: true, leased: ["C:\\r\\x.ts"] });
+    for (const spelling of ["\\??\\C:\\r\\x.ts", "\\\\?\\C:\\r\\x.ts", "\\\\.\\C:\\r\\x.ts"]) {
+      const targets = toolTargets("write", { path: spelling }, "C:\\r");
+      expect(reg.acquireWrite(other, targets.paths), spelling).toMatchObject({ ok: false, reason: "held" });
+    }
+    const rooted = toolTargets("write", { path: "\\r\\x.ts" }, "C:\\r");
+    expect(reg.acquireWrite(other, rooted.paths)).toMatchObject({ ok: false, reason: "unknown-target" });
+    expect(reg.acquireWrite(other, toolTargets("write", { path: "y.ts" }, "C:\\r").paths)).toMatchObject({ ok: true });
   });
 });
 
