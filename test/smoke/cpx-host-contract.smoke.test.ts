@@ -27,6 +27,7 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { removeDirWhenReleased } from "../helpers/remove-dir";
 import type { CpxFront, CpxRequest, FaultKind } from "./helpers/cpx-scripted-provider";
 import {
@@ -49,7 +50,7 @@ const CHILD_ENDED = new Set(["session.execution.succeeded", "session.execution.f
 /** Verification off, so the router does not rewrite `background: true` into a foreground call (role-spikes S6B); engine shadow as everywhere. */
 const BASE: HostOptions = { routing: { engine: "shadow" }, overrides: { enforcement: { mode: "off" } }, hostConfig: { agents: { [CHILD]: agentWithoutModel() } } };
 
-type ProbeMode = "rewrite-completion" | "append-tail-system" | "append-tail-user" | "append-tail-newest" | "cache-hint-1h" | "filter-grep";
+type ProbeMode = "rewrite-completion" | "append-tail-system" | "append-tail-user" | "append-tail-newest" | "cache-hint-1h" | "filter-grep" | "mutate-subagent-prompt" | "rewrite-compaction" | "retained-launch";
 /** One probe JSON line: `{ t, kind, ...fields }` (see cpx-probe-plugin.js). */
 interface ProbeLine extends Obj { t: number; kind: string }
 
@@ -80,13 +81,13 @@ function hostVersion(): string {
 }
 
 /** The probe wrapped for loading by path: `<tmp>/cpx-probe/{package.json,server.mjs}`; server.mjs = `process.env` assignments + the probe source. */
-async function writeProbePlugin(out: string, mode: ProbeMode | undefined): Promise<string> {
+async function writeProbePlugin(out: string, mode: ProbeMode | undefined, extraEnv: Readonly<Record<string, string>> = {}): Promise<string> {
   const dir = await mkdtemp(path.join(tmpdir(), "omr-cpx-probe-plugin-"));
   scratch.push(dir);
   const plugin = path.join(dir, "cpx-probe");
   await mkdir(plugin, { recursive: true });
   await writeFile(path.join(plugin, "package.json"), JSON.stringify({ name: "cpx-probe", type: "module", exports: { ".": "./server.mjs", "./server": "./server.mjs" } }));
-  const env: Record<string, string> = { CPX_PROBE_OUT: out, ...(mode ? { CPX_PROBE_MODE: mode } : {}) };
+  const env: Record<string, string> = { CPX_PROBE_OUT: out, ...(mode ? { CPX_PROBE_MODE: mode } : {}), ...extraEnv };
   const header = Object.entries(env).map(([name, value]) => `process.env.${name} = ${JSON.stringify(value)};`).join("\n");
   await writeFile(path.join(plugin, "server.mjs"), `${header}\n${await readFile(PROBE_SOURCE, "utf8")}`);
   return plugin;
@@ -120,10 +121,10 @@ interface Observation { observed: Obj; relied: ProbeLine[]; hosts: Obj[] }
 interface Scenario { host: RoutingHost; probeFile: string; tag: string }
 
 /** Starts one host (probe + CpxFront), runs `body`, records the probe summary of the host, ALWAYS stops the host. */
-async function withHost(tag: string, mode: ProbeMode | undefined, o: Observation, body: (s: Scenario) => Promise<void>, options: HostOptions = BASE): Promise<void> {
+async function withHost(tag: string, mode: ProbeMode | undefined, o: Observation, body: (s: Scenario) => Promise<void>, options: HostOptions = BASE, probeEnv: Readonly<Record<string, string>> = {}): Promise<void> {
   const probeFile = path.join(await obsDir(), `${tag}-${RUN_ID}.probe.jsonl`);
   await writeFile(probeFile, "");
-  const plugin = await writeProbePlugin(probeFile, mode);
+  const plugin = await writeProbePlugin(probeFile, mode, probeEnv);
   const host = await RoutingHost.start(`cpx-${tag.toLowerCase()}`, { ...options, extraPlugins: [...(options.extraPlugins ?? []), plugin], provider: options.provider ?? {} });
   try {
     await waitForProbe(probeFile, `the cpx-probe plugin to load (${tag})`, lines => lines.find(l => l.kind === "loaded"), 30_000);
@@ -132,7 +133,7 @@ async function withHost(tag: string, mode: ProbeMode | undefined, o: Observation
     const lines = await probeLines(probeFile);
     const kinds: Record<string, number> = {};
     for (const line of lines) kinds[line.kind] = (kinds[line.kind] ?? 0) + 1;
-    o.hosts.push({ tag, mode: mode ?? null, probeFile, probeLoaded: kinds.loaded === 1, probeKinds: kinds, probeErrors: clip(lines.filter(l => l.kind === "probe-error"), 800), hostErrors: clip(host.errorLines(), 400) });
+    o.hosts.push({ tag, mode: mode ?? null, probeFile, probeLoaded: (kinds.loaded ?? 0) >= 1, probeKinds: kinds, probeErrors: clip(lines.filter(l => l.kind === "probe-error"), 800), hostErrors: clip(host.errorLines(), 400) });
     await host.stop();
   }
 }
@@ -741,4 +742,322 @@ d("C10 provider errors: 429, 529 and usage limit", () => {
       }
     });
   }, 1_500_000);
+});
+
+// ------------------------------------------------------------------ batch 3 helpers ----
+/** `host.client.session.<name>` looked up at run time (the harness's HostClient type lists only some methods). `undefined` when the client has no such method. */
+function sessionMethod(host: RoutingHost, name: string): ((input: Obj) => Promise<unknown>) | undefined {
+  const session: object = host.client.session;
+  const method: unknown = Reflect.get(session, name);
+  return typeof method === "function" ? async input => Reflect.apply(method, session, [input]) : undefined;
+}
+/** The whole `session.get` answer (clipped), or its error. Reads `host.client` at call time, so it works across `restart()`. */
+const sessionState = (host: RoutingHost, id: string): Promise<unknown> => host.client.session.get({ sessionID: id }).then(g => clip(g, 1200), error => ({ error: String(error) }));
+const isActive = (host: RoutingHost, id: string): Promise<boolean | string> => host.client.session.active().then(active => Object.hasOwn(active, id), error => String(error));
+const toolUses = (r: CpxRequest): Obj[] => bodyMessages(r).flatMap(m => arr(m.content).map(obj)).filter(b => b.type === "tool_use");
+
+const GATE_BASE = 7_000_000;
+interface GateArrival { token: string; index: number; session?: string; at: number; releasedAt?: number }
+/** Holds the first provider request of each non-root session whose messages carry an un-released token, until `release(token)`. Works through
+ * the front's `delayMs` (returns a code >= GATE_BASE) and `sleep` (parks on that code), so each child is released individually and from the
+ * test process: it survives `RoutingHost.restart()` (the front does). Also stamps every arrival in `stamps` (what `instrument` does). */
+class Gates {
+  readonly stamps = new Map<number, number>();
+  readonly arrivals: GateArrival[] = [];
+  waiting = 0;
+  peakWaiting = 0;
+  private readonly released = new Set<string>();
+  private readonly parked = new Map<number, (() => void)[]>();
+  constructor(host: RoutingHost, private readonly root: string, readonly tokens: readonly string[]) {
+    const options = front(host).options;
+    options.delayMs = request => {
+      this.stamps.set(request.index, Date.now());
+      const session = hdr(request, "x-proof-session");
+      if (session === undefined || session === this.root || hdr(request, "x-proof-kind") !== "primary") return 0;
+      const text = json(bodyMessages(request));
+      const code = this.tokens.findIndex(t => !this.released.has(t) && text.includes(t));
+      if (code < 0) return 0;
+      this.arrivals.push({ token: this.tokens[code]!, index: request.index, session, at: Date.now() });
+      this.waiting += 1;
+      this.peakWaiting = Math.max(this.peakWaiting, this.waiting);
+      return GATE_BASE + code;
+    };
+    options.sleep = ms => new Promise<void>(resolve => {
+      if (ms < GATE_BASE || ms >= GATE_BASE + this.tokens.length) { setTimeout(resolve, ms); return; }
+      this.parked.set(ms, [...(this.parked.get(ms) ?? []), resolve]);
+    });
+  }
+  /** Releases one token (and every later arrival of it). */
+  release(token: string): void {
+    this.released.add(token);
+    const code = GATE_BASE + this.tokens.indexOf(token);
+    const waiters = this.parked.get(code) ?? [];
+    this.parked.delete(code);
+    this.waiting -= waiters.length;
+    for (const a of this.arrivals) if (a.token === token && a.releasedAt === undefined) a.releasedAt = Date.now();
+    for (const resolve of waiters) resolve();
+  }
+  releaseAll(): void { for (const t of this.tokens) this.release(t); }
+  /** The session id behind a token (from the held request's header), once it has arrived. */
+  sessionOf(token: string): string | undefined { return this.arrivals.find(a => a.token === token)?.session; }
+  arrived(token: string): boolean { return this.arrivals.some(a => a.token === token); }
+}
+const childInput = (token: string, background: boolean): Obj => ({ agent: CHILD, description: token, prompt: `${token} child`, model: `${SONNET}#low`, background });
+
+// ---------------------------------------------------------------------------- C11 ----
+d("C11 stored parent history keeps the subagent arguments the model wrote", () => {
+  it("mutates the subagent prompt in execute.before and records stored history, the child's prompt and the next parent request", async () => {
+    await observeContract("C11", async o => {
+      await withHost("C11", "mutate-subagent-prompt", o, async s => {
+        const { host } = s;
+        const { arrivals } = instrument(host);
+        const root = await host.newRoot("C11 root");
+        const written = "C11 original prompt";
+        const call = await host.call(root, "subagent", { agent: CHILD, description: "C11 child", prompt: written, model: `${SONNET}#low`, background: false });
+        await host.prompt(root, "C11 follow-up"); // a later parent request re-reads the stored history
+        const lines = await probeLines(s.probeFile);
+        const mutations = lines.filter(l => l.kind === "mutate-subagent-prompt");
+        o.relied.push(...mutations.slice(0, 2));
+        const stored = await host.client.session.context({ sessionID: root });
+        const toolMessages = stored.filter(m => /subagent/.test(json(m)) && json(m).includes("C11"));
+        const childRequest = call.childID ? front(host).requests.find(r => hdr(r, "x-proof-session") === call.childID && hdr(r, "x-proof-kind") === "primary") : undefined;
+        const childMessages = childRequest ? bodyMessages(childRequest) : [];
+        const requests = parentRequests(host, root);
+        o.observed.hook = { modelWrote: written, probeLines: mutations.map(l => ({ original: l.original, mutated: l.mutated })), harnessBeforeInput: clip(call.before.input, 600), harnessAfterInput: clip(call.after.input, 600) };
+        o.observed.storedHistory = {
+          messageCount: stored.length, subagentMessages: clip(toolMessages, 1800), inputKeyPaths: findKeys(toolMessages, /^(input|args|arguments)$/).map(k => ({ path: k.path, value: clip(k.value, 400) })),
+          originalPaths: stringPaths(stored, /C11 original prompt/), mutatedPaths: stringPaths(stored, /CPX_MUTATED/),
+          hasOriginal: json(stored).includes(written), hasMutated: json(stored).includes("CPX_MUTATED"),
+        };
+        o.observed.child = {
+          sessionID: call.childID, firstRequestIndex: childRequest?.index, lastMessage: clip(childMessages.at(-1), 600),
+          receivedMutated: json(childMessages).includes("CPX_MUTATED"), receivedOriginalOnly: json(childMessages).includes(written) && !json(childMessages).includes("CPX_MUTATED"),
+        };
+        o.observed.parentWire = requests.map(r => ({ ...requestView(r, arrivals), toolUses: toolUses(r).map(b => ({ id: b.id, name: b.name, input: clip(b.input, 400), mutated: json(b.input).includes("CPX_MUTATED") })) }));
+      });
+    });
+  }, 300_000);
+});
+
+// ---------------------------------------------------------------------------- C12 ----
+d("C12 background children in flight across a host restart", () => {
+  it("releases child A right before restart() and child B after the relaunch and records what each delivers", async () => {
+    await observeContract("C12", async o => {
+      await withHost("C12", undefined, o, async s => {
+        const { host } = s;
+        const root = await host.newRoot("C12 root");
+        const gates = new Gates(host, root, ["C12_A", "C12_B"]);
+        const calls = await host.callMany(root, gates.tokens.map(t => childInput(t, true)));
+        const ids = Object.fromEntries(gates.tokens.map(t => [t, calls.find(c => str(obj(c.before.input).prompt)?.includes(t))?.childID]));
+        await tryWait("both children's held requests", () => (gates.tokens.every(t => gates.arrived(t)) ? true : undefined), 30_000);
+        const parentRequestsBefore = parentRequests(host, root).length;
+        const storedBefore = await storedView(host, root);
+        o.observed.before = { children: ids, heldAt: gates.arrivals.map(a => ({ token: a.token, index: a.index, at: a.at })), parentRequests: parentRequestsBefore, parentMessages: storedBefore.messages.length, active: await Promise.all(Object.entries(ids).map(async ([t, id]) => [t, id ? await isActive(host, id) : null])) };
+        // A: released, then the restart starts as soon as the front has forwarded A's request (the fixture answers it; the host may or may not process the answer before the kill).
+        const releasedAt = Date.now();
+        gates.release("C12_A");
+        const aArrival = gates.arrivals.find(a => a.token === "C12_A");
+        const aRequest = aArrival ? front(host).requests.find(r => r.index === aArrival.index) : undefined;
+        const forwarded = await tryWait("A's request to be forwarded to the fixture", () => (aRequest?.served === "forwarded" ? true : undefined), 15_000);
+        const restartStartedAt = Date.now();
+        await host.restart();
+        const restartEndedAt = Date.now();
+        gates.release("C12_B");
+        const bReleasedAt = Date.now();
+        o.observed.timing = { aReleasedAt: releasedAt, aForwarded: forwarded === true, restartStartedAt, restartEndedAt, bReleasedAt, restartMs: restartEndedAt - restartStartedAt, note: "A's request was released and forwarded before restart() was called; restart() kills and relaunches in one call, so the downtime itself cannot be hit" };
+        const perChild: Obj = {};
+        for (const t of gates.tokens) {
+          const id = ids[t];
+          if (!id) { perChild[t] = { error: "no sessionID" }; continue; }
+          const end = await tryWait(`terminal event of ${t} after the restart`, async () => terminalOf(await probeLines(s.probeFile), id), 45_000);
+          if (end) o.relied.push(end);
+          const context = await host.client.session.context({ sessionID: id }).then(c => c, error => ({ error: String(error) }));
+          perChild[t] = {
+            sessionID: id, terminal: end ? { ...lineBrief(end), afterRestartStart: end.t >= restartStartedAt, afterRestartEnd: end.t >= restartEndedAt } : null,
+            probeLines: linesOf(await probeLines(s.probeFile), id).map(lineBrief), session: await sessionState(host, id), active: await isActive(host, id),
+            providerRequests: front(host).requests.filter(r => hdr(r, "x-proof-session") === id).map(r => ({ index: r.index, arrivedAt: gates.stamps.get(r.index), served: r.served })),
+            context: Array.isArray(context) ? { messageCount: context.length, roles: context.map(m => str(m.role) ?? str(m.type)), containsChildOk: json(context).includes("CHILD_OK"), last: clip(context.at(-1), 600) } : context,
+          };
+        }
+        o.observed.perChild = perChild;
+        const woke = await tryWait("a parent request after the restart", () => parentRequests(host, root)[parentRequestsBefore], 30_000);
+        const stored = await tryWait("completion envelopes of both children", async () => { const v = await storedView(host, root); return envelopeStates(v.envelopes).length >= 2 ? v : undefined; }, 30_000);
+        const after = stored ?? await storedView(host, root);
+        o.observed.parent = {
+          wokeAfterRestart: woke !== undefined, parentRequestsAfter: parentRequests(host, root).length, parentRequestsBefore,
+          envelopeStates: envelopeStates(after.envelopes), envelopes: after.envelopes, messageCountAfter: after.messages.length, session: await sessionState(host, root), active: await isActive(host, root),
+        };
+        o.observed.rootLinesAfterRestart = linesOf(await probeLines(s.probeFile), root).filter(l => l.t >= restartStartedAt).map(lineBrief);
+        o.observed.hostErrors = host.errorLines().slice(-10).map(l => l.slice(0, 300));
+      });
+    });
+  }, 600_000);
+});
+
+// ---------------------------------------------------------------------------- C13 ----
+const tokensOf = (label: string, n: number): string[] => Array.from({ length: n }, (_, i) => `${label}_${i + 1}x`);
+const activeCount = async (host: RoutingHost, ids: readonly string[]): Promise<number> => { const active = await host.client.session.active(); return ids.filter(id => Object.hasOwn(active, id)).length; };
+
+d("C13 concurrent background children, host cap, parent interrupt", () => {
+  it("holds 6 then 8 background children, then interrupts a parent with 3 children held (background and foreground)", async () => {
+    await observeContract("C13", async o => {
+      await withHost("C13", undefined, o, async s => {
+        const { host } = s;
+        // (1) + (2): N children at once, all held at the provider. peakWaiting = most provider requests parked at the same moment.
+        const concurrency: Obj = {};
+        o.observed.concurrency = concurrency;
+        for (const n of [6, 8]) {
+          const root = await host.newRoot(`C13 n=${n} root`);
+          const gates = new Gates(host, root, tokensOf(`C13n${n}`, n));
+          const calls = await host.callMany(root, gates.tokens.map(t => childInput(t, true)), 180_000);
+          const allArrived = await tryWait(`${n} held child requests`, () => (gates.arrivals.length >= n ? true : undefined), 25_000);
+          const kids = await host.children(root);
+          const ids = kids.map(k => k.id);
+          const atPeak = { requested: n, acks: calls.length, ackStatuses: calls.map(c => obj(obj(c.after.result).output).status), allArrived: allArrived === true, arrivedAtProvider: gates.arrivals.length, peakWaiting: gates.peakWaiting, childSessions: ids.length, activeChildren: await activeCount(host, ids) };
+          gates.releaseAll();
+          const ended = await tryWait(`all ${n} children to end`, async () => { const ls = await probeLines(s.probeFile); return ids.every(id => terminalOf(ls, id)) ? ls : undefined; }, 120_000);
+          const lines = ended ?? await probeLines(s.probeFile);
+          concurrency[`n${n}`] = { ...atPeak, arrivalTimes: gates.arrivals.map(a => ({ token: a.token, at: a.at })), terminalKinds: ids.map(id => terminalOf(lines, id)?.kind ?? null), allEnded: ended !== undefined };
+        }
+        // (3): interrupt the parent while 3 children are held. Background: the parent is idle (turn ended after the acks). Foreground: the parent is inside the subagent tool calls.
+        const interrupts: Obj = {};
+        o.observed.parentInterrupt = interrupts;
+        for (const variant of ["background", "foreground"] as const) {
+          const root = await host.newRoot(`C13 interrupt ${variant} root`);
+          const gates = new Gates(host, root, tokensOf(`C13i${variant === "background" ? "b" : "f"}`, 3));
+          const inputs = gates.tokens.map(t => childInput(t, variant === "background"));
+          if (variant === "background") await host.callMany(root, inputs);
+          else await host.client.session.prompt({ sessionID: root, text: `SPIKE_CALLS=${JSON.stringify(inputs)}` });
+          await tryWait("3 held child requests", () => (gates.arrivals.length >= 3 ? true : undefined), 30_000);
+          const ids = [...new Set(gates.arrivals.map(a => a.session).filter((x): x is string => x !== undefined))];
+          const rootActiveBefore = await isActive(host, root);
+          const activeBefore = await activeCount(host, ids);
+          const interruptAt = Date.now();
+          let interruptResult: unknown;
+          let interruptError: string | undefined;
+          try { interruptResult = await host.client.session.interrupt({ sessionID: root }); } catch (error) { interruptError = String(error); }
+          const endedEarly = await tryWait("a child to end before release (killed by the parent interrupt)", async () => { const ls = await probeLines(s.probeFile); return ids.map(id => terminalOf(ls, id, interruptAt)).find(l => l !== undefined); }, 10_000);
+          const afterInterrupt = { activeChildren: await activeCount(host, ids), rootActive: await isActive(host, root), childEndedBeforeRelease: endedEarly ? lineBrief(endedEarly) : null };
+          gates.releaseAll();
+          const ended = await tryWait("all children to end after release", async () => { const ls = await probeLines(s.probeFile); return ids.every(id => terminalOf(ls, id)) ? ls : undefined; }, 60_000);
+          const lines = await probeLines(s.probeFile);
+          interrupts[variant] = {
+            children: ids, rootActiveBefore, activeChildrenBefore: activeBefore, interrupt: { api: "host.client.session.interrupt({ sessionID: parent })", at: interruptAt, result: clip(interruptResult, 400), error: interruptError },
+            afterInterrupt, allEndedAfterRelease: ended !== undefined,
+            perChild: await Promise.all(ids.map(async id => ({
+              sessionID: id, terminal: terminalOf(lines, id) ? lineBrief(terminalOf(lines, id)!) : null, session: await sessionState(host, id),
+              providerRequests: front(host).requests.filter(r => hdr(r, "x-proof-session") === id).map(r => ({ index: r.index, served: r.served })),
+              heldRequestReleasedAndForwarded: front(host).requests.some(r => hdr(r, "x-proof-session") === id && r.served === "forwarded"),
+            }))),
+            rootLinesAfterInterrupt: linesOf(lines, root).filter(l => l.t >= interruptAt).map(lineBrief),
+          };
+          await waitIdle(host, root, 30_000);
+        }
+      });
+    });
+  }, 1_200_000);
+});
+
+// ---------------------------------------------------------------------------- C14 ----
+interface Span { from: number; to: number }
+const peakOverlap = (spans: readonly Span[]): number => Math.max(0, ...spans.map(a => spans.filter(b => b.from <= a.from && a.from < b.to).length));
+const RETAINED_ENV = { CPX_PROBE_TOOL_URL: pathToFileURL(path.join(ROOT, "node_modules", "@opencode-ai", "plugin", "dist", "tool.js")).href, CPX_PROBE_RELAUNCH_MS: "60000" };
+
+d("C14 launch with a retained tool context outside any LLM tool call", () => {
+  it("captures the context in cpx_probe_capture, ends the turn, and records the probe's launches (now and 60 s later)", async () => {
+    await observeContract("C14", async o => {
+      await withHost("C14", "retained-launch", o, async s => {
+        const { host } = s;
+        const { arrivals } = instrument(host);
+        host.provider.holdMarked("CPX_RETAINED_CHILD", 3_000);
+        const root = await host.newRoot("C14 root");
+        const ids = async () => (await host.client.session.context({ sessionID: root })).map(m => str(m.id) ?? str(m.type));
+        await host.prompt(root, `READ_ONLY_PROBE=${JSON.stringify({ tool: "cpx_probe_capture", input: {} })}`);
+        const history: Obj = { afterCaptureTurn: await ids() };
+        const batchDone = (batch: number) => async () => { const ls = (await probeLines(s.probeFile)).filter(l => l.kind === "retained-launch-result" && l.batch === batch); return ls.length >= 3 ? ls : undefined; };
+        const first = await tryWait("batch 1 results", batchDone(1), 120_000);
+        history.afterBatch1 = await ids();
+        const second = await tryWait("batch 2 (relaunch after 60 s) results", batchDone(2), 180_000);
+        history.afterBatch2 = await ids();
+        const lines = await probeLines(s.probeFile);
+        const retained = lines.filter(l => l.kind.startsWith("retained-") || l.kind === "probe-error");
+        o.relied.push(...retained.slice(0, 12));
+        const childIDs = [...new Set(retained.map(l => str(l.childSessionID) ?? str(l.seenInProgress)).filter((x): x is string => x !== undefined))];
+        const holds = host.provider.holds.filter(h => h.session !== undefined && childIDs.includes(h.session));
+        const byBatch = (batch: number) => retained.filter(l => l.batch === batch);
+        o.observed.registration = { toolRegistered: clip(lines.find(l => l.kind === "retained-tool-registered"), 400), capture: clip(lines.find(l => l.kind === "retained-capture"), 600), probeErrors: clip(lines.filter(l => l.kind === "probe-error"), 600) };
+        o.observed.launches = [1, 2].map(batch => ({
+          batch, batchLine: clip(byBatch(batch).find(l => l.kind === "retained-launch-batch"), 600),
+          attempts: byBatch(batch).filter(l => l.kind === "retained-launch-attempt").map(l => ({ n: l.n, t: l.t })),
+          childrenSeen: byBatch(batch).filter(l => l.kind === "retained-launch-child").map(l => ({ n: l.n, t: l.t, childSessionID: l.childSessionID })),
+          results: byBatch(batch).filter(l => l.kind === "retained-launch-result").map(l => ({ n: l.n, t: l.t, ok: l.ok, childSessionID: l.childSessionID, status: l.status, output: l.output, error: l.error, name: l.name })),
+          errors: byBatch(batch).filter(l => l.kind === "retained-launch-error").map(l => clip(l, 400)),
+          delivered: batch === 1 ? first !== undefined : second !== undefined,
+        }));
+        o.observed.childrenRan = Object.fromEntries(childIDs.map(id => [id, front(host).requests.filter(r => hdr(r, "x-proof-session") === id).map(r => ({ index: r.index, arrivedAt: arrivals.get(r.index), served: r.served }))]));
+        o.observed.concurrency = {
+          holdSpans: holds.map(h => ({ session: h.session, arrivedAt: h.arrivedAt, releasedAt: h.releasedAt })),
+          peakOverlapAllChildren: peakOverlap(holds.map(h => ({ from: h.arrivedAt, to: h.releasedAt ?? Number.POSITIVE_INFINITY }))),
+          peakOverlapBatch1: peakOverlap(holds.filter(h => h.arrivedAt < (byBatch(2).find(l => l.kind === "retained-launch-batch")?.t ?? Number.POSITIVE_INFINITY)).map(h => ({ from: h.arrivedAt, to: h.releasedAt ?? Number.POSITIVE_INFINITY }))),
+        };
+        const childHooks = lines.filter(l => (l.kind === "execute.before" || l.kind === "execute.after") && typeof l.sessionID === "string" && childIDs.includes(l.sessionID));
+        const harnessHooks = (await host.hooks()).filter(h => childIDs.includes(h.sessionID));
+        o.observed.hooksForChildren = {
+          childPromptCanTriggerTool: false, why: "the probe's child prompt is the fixed text `CPX_RETAINED_CHILD <n>`; RoutingProvider only scripts tool calls from READ_ONLY_PROBE / SPIKE_* / CHILD_SCRIPT64 markers in a user text, so the children answer plain text",
+          probeHookLinesForChildren: childHooks.length, harnessHookRecordsForChildren: harnessHooks.length, tools: [...new Set([...childHooks.map(l => l.tool), ...harnessHooks.map(h => h.tool)])],
+          subagentHooksOnRootAfterCapture: lines.filter(l => (l.kind === "execute.before" || l.kind === "execute.after") && l.tool === "subagent" && l.sessionID === root).length,
+        };
+        const kids = await host.children(root);
+        o.observed.parentHistory = { ...history, unchangedAcrossLaunches: json(history.afterCaptureTurn) === json(history.afterBatch1) && json(history.afterBatch1) === json(history.afterBatch2), childrenListedUnderRoot: kids.map(k => ({ id: k.id, parentID: k.parentID, agent: k.agent })), session: await sessionState(host, root) };
+      }, BASE, RETAINED_ENV);
+    });
+  }, 900_000);
+});
+
+// ---------------------------------------------------------------------------- C15 ----
+d("C15 compaction hook: can a plugin rewrite the compaction request", () => {
+  it("puts CPX_HELD_ORIGINAL in the history, compacts, and records the hook, the provider request and the stored summary", async () => {
+    await observeContract("C15", async o => {
+      await withHost("C15", "rewrite-compaction", o, async s => {
+        const { host } = s;
+        const { arrivals } = instrument(host);
+        const root = await host.newRoot("C15 root");
+        await host.prompt(root, "C15 first note CPX_HELD_ORIGINAL");
+        await host.prompt(root, "C15 second note");
+        const compact = sessionMethod(host, "compact");
+        const requestsBefore = front(host).requests.length;
+        let compactResult: unknown;
+        let compactError: string | undefined;
+        const calledAt = Date.now();
+        if (compact) { try { compactResult = await compact({ sessionID: root }); } catch (error) { compactError = String(error); } }
+        const hook = await tryWait("the probe's compaction hook line", async () => (await probeLines(s.probeFile)).find(l => l.kind === "compaction" && l.t >= calledAt), 60_000);
+        const sent = await tryWait("a provider request after compact()", () => (front(host).requests.length > requestsBefore ? true : undefined), 60_000);
+        const idle = await waitIdle(host, root, 90_000);
+        const lines = await probeLines(s.probeFile);
+        const hooks = lines.filter(l => l.kind === "compaction" || l.kind === "rewrite-compaction" || l.kind === "compaction-hook-available");
+        o.relied.push(...hooks);
+        const requests = front(host).requests.slice(requestsBefore);
+        const stored = await host.client.session.context({ sessionID: root });
+        o.observed.api = { compactOnClient: compact !== undefined, via: "host.client.session.compact({ sessionID })", result: clip(compactResult, 600), error: compactError };
+        o.observed.hook = {
+          available: lines.find(l => l.kind === "compaction-hook-available")?.["compaction-hook-available"], fired: hook !== undefined,
+          compactionLines: lines.filter(l => l.kind === "compaction").map(l => ({ t: l.t, sessionID: l.sessionID, agent: l.agent, messageCount: l.messageCount, hasResult: l.hasResult, messages: clip(l.messages, 500), hasSystem: l.hasSystem })),
+          rewriteLines: lines.filter(l => l.kind === "rewrite-compaction").map(l => ({ t: l.t, did: l.did, replacements: l.replacements })),
+        };
+        o.observed.provider = {
+          requestSentAfterCompact: sent === true, rootIdleAfter: idle === true,
+          requests: requests.map(r => ({
+            index: r.index, session: hdr(r, "x-proof-session"), kind: hdr(r, "x-proof-kind"), arrivedAt: arrivals.get(r.index), served: r.served, messageCount: bodyMessages(r).length,
+            hasOriginal: json(r.body).includes("CPX_HELD_ORIGINAL"), hasPlaceholder: json(r.body).includes("CPX_HELD_PLACEHOLDER"),
+            originalPaths: stringPaths(r.body, /CPX_HELD_ORIGINAL/), placeholderPaths: stringPaths(r.body, /CPX_HELD_PLACEHOLDER/), lastMessage: clip(bodyMessages(r).at(-1), 500),
+          })),
+        };
+        o.observed.stored = {
+          messageCount: stored.length, hasOriginal: json(stored).includes("CPX_HELD_ORIGINAL"), hasPlaceholder: json(stored).includes("CPX_HELD_PLACEHOLDER"),
+          messages: stored.map((m, i) => ({ i, type: str(m.type), role: str(m.role), hasOriginal: json(m).includes("CPX_HELD_ORIGINAL"), hasPlaceholder: json(m).includes("CPX_HELD_PLACEHOLDER"), snippet: json(m).slice(0, 300) })),
+          summaryLike: clip(stored.filter(m => /compact|summary/i.test(json(m).slice(0, 300))), 1200),
+        };
+      });
+    });
+  }, 600_000);
 });
