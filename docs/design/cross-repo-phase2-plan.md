@@ -73,11 +73,22 @@ Each task is test-first, one commit (`type(scope): … ` + `Refs #107`), `npm ru
 - Short design pass first (prompt surface, I9 goldens, the dead location line in `src/router/dispatch-header.ts`), then implement with goldens changed on purpose.
 
 ### P2e — deferred P (lot 2, own QA)
-- **P2e.1** `pending.ts` R3/`PendingRegistration` store P at return, link-root fingerprints, consumers and placements.
-- **P2e.2** `finishDeferred` observes P (`observeChange(..., true)`), removes the `:1855-1859` fallback, `staticScoping` per placement, fix F13.
-- **P2e.3** `prepareClaim` sets `prepared.perimeter`; S11 link-target drift caveat in `judgeVerdict`; `runClaimGate` re-validates placements.
-- **P2e.4** Lift the interim rule (`index.ts:2512`, `roleGateDeferred`).
-- **P2e.5** Docs and changelog.
+
+Pre-flight at HEAD `9dcdfc4` (2026-10-11) replaced the first sketch. Owner decisions:
+- **OD-P2e-1 = (a).** S11: a linked repository that changed after the producer returned makes a deferred pass UNVERIFIED with "<lib> changed since the producer returned"; a fail stays a fail with the caveat; a link target that cannot be observed again is never a pass.
+- **OD-P2e-2 = (a).** F13 with config `testScope:"full"` is fixed on OpenCode v2 only; per-check `scope=full` is v2-only by construction; v1 unchanged and documented.
+
+Decided under existing decisions: P is frozen at return (the I4 window ends at return; the perimeter statuses, writers, working-set roots, observed link targets with fingerprint/HEAD/top/admission, placements and the pins promise are stored with the pending entry) (SD-P2e-1, SD-P2e-4, SD-P2e-5); no deferral when the result is certain at return — I4 refuses, a non-fixed link root is unobserved, or a placement/tier key was refused (SD-P2e-2, reason `cross-repo` kept with that meaning); consumers are discovered at router_verify over the frozen working-set roots (SD-P2e-3); S11 is detected with the hardened fingerprint, HEAD and top, ignored files are not covered (SD-P2e-6).
+
+Findings: X1 (blocking) router_verify ignores P today (`prepareClaim` never sets `prepared.perimeter`, `wiring.ts:2340-2353`, read at `:2388`) — the verify side must land before the finish side; X2 (blocking) placements never reach router_verify (`runClaimGate` `accept` at `:2403`); X3 (blocking) pins are lost on the deferred path (registration stores the unpinned reference, `:2049`, `:2119`; `pinNow` admission keyed by the pins array identity, `:1406-1407`) — the entry owns the same pins array; X4 I4 cannot be re-decided later (`store.clear` at `:2168`); X5 consumer discovery must not run in the 2 s finish; X6 lift `roleGateDeferred` before or with `index.ts`; X7 no-deferral fallbacks; X8 F13 now at `wiring.ts:514-516`; X9 `staticScoping` per placement; X10 memory/release; X12 with `repoParents` set, role dispatches become deferred by default after P2e (doc it); X13 docs-drift pins `:1271`, `:1283` change.
+
+Order (commit order is a safety property — every intermediate commit must be no weaker than the synchronous gate):
+- **Group 1 (parallel):** **P2e.1** `pending.ts` fields (`PendingRegistration.perimeter?: DeferredPerimeter`, `placements?`; entry, record, snapshot, release, weight). **P2e.2** F13 (`noChangeGateSpawnsNothing(dod, {placements?, fullScope?})`) and `staticScoping` per placement; `DeferredFinishInput.placements?/fullScope?`. **P2e.2b** delete the per-check-key clause of `roleGateDeferred` (`src/routing/wire/dispatch.ts:726-727`), flip `roles-dispatch.test.ts:376-387`.
+- **Group 2 (sequential, `wiring.ts`):** **P2e.3** `prepareClaim` builds `prepared.perimeter` from the frozen observation plus consumer discovery and attaches the pins. **P2e.4a** S11 re-observation of the frozen link targets, `linkDrift`, rule in `judgeVerdict` after the producer-path drift. **P2e.4b** placement identity check and `checkPlacements` at `runClaimGate`.
+- **Group 3:** **P2e.5** finish side: perimeter snapshots concurrently with W's `observeChange`, return-mode `perimeterAtGate` (no discovery), X7 fallbacks replace `:2060-2064`, register perimeter and placements, pins started only after `reg.ok`.
+- **Group 4:** **P2e.6** lift in `index.ts` (`:2528-2529`, `:2542`): only refusals block deferral; pass placements and `fullScope` (v2) to `finishDeferred`.
+- **Group 5 (parallel):** **P2e.7** user docs (VERIFICATION, ROLES incl. X12, CONFIG_REFERENCE "Which delegations defer", CHANGELOG, docs-drift). **P2e.8** design docs (§7 refs, S11 row, I4/I7/I13/D7 notes, §5 re-checks, §9), handover.
+- Then: full suite alone, goldens, heavy QA, live dogfood (S11 control, S11, deferred consumer check, I4 at return, refused placement).
 
 ### P2f — close-out
 - Fix stale references in design §7, add "Phase 2 implemented (notes)", update the handover, run the Phase 2 live dogfood (script in the pre-flight report: recreate the junction with `New-Item -ItemType Junction`, remove it with `cmd /c rmdir`, never `Remove-Item -Recurse`).
