@@ -424,7 +424,7 @@ Each slice lands test-first: the failing test reproduces the scenario row, then 
 **Implemented (notes).** Deviations from the steps above, checked against the code at HEAD 2511f68:
 
 - **Working set at grant time.** The orchestrator session's working set (up to 16 bound roots, forgotten on session deletion) is filled when a grant is bound, not when the dispatch returns.
-- **Role dispatch header (P2g, OD6).** A routed role dispatch with a work root and read access gets a role header (not a delegate's, not a non-exact resume, not with `dispatchHeader: false`). When cross-repo is in use it names the session's repositories and the readable parents. The nonce line (or the carried acceptance block) stays last.
+- **Role dispatch header (P2g, OD6).** A routed role dispatch with a work root and read access gets a role header (not a delegate's, not a non-exact resume). A header the orchestrator copied from another dispatch is stripped and replaced by the router's own. With `dispatchHeader: false` the header is off, except that a work root other than the session directory is still told: a minimal header (the identity paragraph and the `Working directory:` paragraph, no repositories paragraph). When cross-repo is in use it names the session's repositories and the readable parents. The nonce line (or the carried acceptance block) stays last.
 - **D13 limit.** The hook-level allow lifts an `ask` for `external_directory` inside W or R for an exactly bound session; a deny is never changed. Role agents are registered from a catch-all `*: deny`, so a directory outside the registered patterns (parents, `workRoots`, the session repository's worktrees at registration) is a static deny. A worktree outside the parents still needs a `routing.workRoots` glob or a restart (Q7).
 - **Read refusal text kept.** A read outside W and outside the read set keeps today's text (`read: <path> is outside this dispatch's work root <root> (use an absolute path inside it)`); only edit refusals carry the location.
 - **Link roots named by basename.** The perimeter names a repository reached through `node_modules` links by the basename of its root.
@@ -557,6 +557,11 @@ After QA rounds 1 and 2 (facts checked at HEAD effcdb3):
   - A repository with submodules is never observed, so with writers its dispatches are unverifiable.
   - The dispatch-header location line was dead code for roles; resolved by the role dispatch header (P2g, OD6).
   - The evaluate hook still accepts host-relative resources (`hostRelative`), and relies on `execute.before` refusing the relative form first.
+- **Known follow-ups (Phase 2 QA round 1), accepted for now:**
+  - Placements are resolved with the read set at return, while dispatch-time detection uses the read set at dispatch, so a working set that changes in between can make them disagree (the gate is authoritative).
+  - Pins are freed after the first gate, so a retry gate of the same dispatch treats links as approximate (fails safe).
+  - A gate deadline that fires mid-scan is only tested with a pre-aborted signal.
+  - The role header is emitted for every roles user with a work root, pending the owner's reading of I9 (see Q8).
 - **Consumers** are discovered only in the working set, and only through `node_modules` links. Python editable installs, Go `replace`, Cargo path dependencies, and `../` or alias imports are not discovered (Q2).
 - **A consumer check's failures** are unverifiable, never "fail". The dependency is the changed repository, so the reference can neither excuse nor prove them.
 - **`router_run` scripts** remain trusted repository content (`run-tools.ts:11-13`).
@@ -573,6 +578,7 @@ After QA rounds 1 and 2 (facts checked at HEAD effcdb3):
 - **Q5.** Approval defaults: 14 days after last use and a 90-day cap. Should an approval offer a read-only variant (R only, never W)?
 - **Q6.** Same-branch history rewrite across a roles lineage: carried attempts compare names and heads only.
 - **Q7.** Make the router's generated external_directory catch-all `ask` instead of `deny`, so the router decides (owner call; a background child could wait on a prompt if the hook does not run).
+- **Q8.** I9 says routing output is unchanged when cross-repo is not configured; the role dispatch header (OD6) is emitted for every roles-mode dispatch with a work root. Keep it always on, or only when `routing.repoParents` is set, `repo=`/`branch=`/`root=` is used, or the work root differs from the session directory?
 
 **To verify during implementation**
 - That the host's `*` matches across separators on the installed version.

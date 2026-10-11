@@ -281,7 +281,15 @@ Delegations that run at the same time in one working tree share that tree. Their
 
 ### Package links to outside code
 
-A package inside a linked `node_modules` (npm `file:` dependencies and `npm link`, yarn/pnpm `link:`/`portal:`, workspace links) can resolve to a directory outside the repository. The reference cannot pin that code, so the reference is approximate:
+A package inside a linked `node_modules` (npm `file:` dependencies and `npm link`, yarn/pnpm `link:`/`portal:`, workspace links) can resolve to a directory outside the repository. An admitted link target is pinned at dispatch: its snapshot identity plus a bounded digest of its ignored files (`node_modules` excluded). The reference stays exact when the pin is unchanged at materialize. It becomes approximate when the pin cannot vouch for that code, and the cause is `external-link` when:
+
+- the target changed since dispatch, is not admitted, or is not a git repository;
+- its ignored-files digest is over the bounds, or it has skip-worktree or assume-unchanged entries;
+- a deeper external link exists (a target's own external links are followed one level);
+- an unattributable writer ran while the pin was computed;
+- the dispatch is deferred, or the gate is a retry gate (pins are used by the first required gate only).
+
+Link pins apply to roles mode on OpenCode v2. Otherwise a link is approximate as follows:
 
 - `external-link`: the link's real path is outside the repository.
 - `root-link`: the link points to the repository root or an ancestor of it.
@@ -437,7 +445,7 @@ check: testsPass cwd="D:\git\app-a" scope=full
 ```
 
 - **Syntax.** `cwd=<dir>` is where the check runs; `scope=affected|full` (case-insensitive) says whether `testsPass` and `lintClean` run on the affected files or in full. Roles mode on OpenCode v2 only.
-- **Where `cwd=` may point.** A relative `cwd=` stays inside `W`; one that leaves `W` is refused even when it lands in the read set. An absolute `cwd=` must be inside `W` or in the read set (see [Read set](./ROLES.md#repositories-below-parent-directories-cross-repo)). A check with only `scope=` runs where the block runs.
+- **Where `cwd=` may point.** A relative `cwd=` stays inside `W`; one that leaves `W` is refused even when it lands in the read set. An absolute `cwd=` must be inside `W` or in the read set (see [Read set](./ROLES.md#repositories-below-parent-directories-cross-repo)). A check with only `scope=` runs where the block runs. A `cwd=` is refused as text, before any filesystem probe, when it is a UNC or device path (`\\…`, `//…`), has a `.git` segment (case-insensitive, with any trailing dots or spaces: `.git.` and `.git ` name `.git` on Windows), or, on Windows only, has an 8.3 short-name segment (`PROGRA~1`; `my-library~2` and a POSIX `backup~1` are ordinary names). A `cwd=` whose resolved path has a `.git` segment (a link or junction into `.git`) is refused too. These are refused with the same `is outside the work root <W> and its read set` reason as any other `cwd=` outside. A placement inside `W` is never treated as another repository: a nested `.git` in `W` (a vendored repository, a fixture) does not make it one.
 - **Refusals.** The first offending check refuses the whole block: the verdict is **unverifiable** and nothing runs, whichever verifier the DoD names.
   - `check <n> (<kind>) cwd=<text> is outside the work root <W> and its read set; nothing ran`
   - `check <n> (<kind>) scope=<text> is not affected or full; nothing ran`
@@ -446,7 +454,7 @@ check: testsPass cwd="D:\git\app-a" scope=full
 - **A check in another repository.** `testsPass` and `lintClean` must use `scope=full`, because affected tests cannot be attributed to a change in `W`. Without it the check is unverifiable and does not run: `check <n> (<kind>) runs in another repository (<cwd>) and must use scope=full: affected tests cannot be attributed to a change in the work root`. A failure of any check in another repository is **unverifiable, never a fail**: `a check in another repository (<cwd>) failed; the change under verification is in the work root, so this failure can be neither excused nor attributed: <reason>`. Such a check gets no reference: `the check runs in another repository; the dispatch reference covers the work root only`.
 - **Consumers.** A working-set worktree whose `node_modules` links into `W` is a consumer of `W`. A pass with a change and no `testsPass`, `buildPasses`, `lintClean` or `run` check placed in the consumer is **UNVERIFIED**, with the check to add: `<name> at <root> links this work root (node_modules/<entry>) and no check ran there; add a check such as: check: testsPass cwd="<root>" scope=full`. A `fileExists` or `schemaMatch` check in the consumer does not count. An unavailable change baseline counts as a change. When consumer discovery stopped on its budget before finishing a worktree, a pass with a change (or an unavailable baseline) is likewise **UNVERIFIED**, once per worktree: `consumer discovery stopped before finishing <name> at <root>; a repository there may link this work root unchecked`. An empty, available change set and a fail carry no such caveat.
 - **Synchronous verification.** A dispatch with per-check keys is verified at once, never deferred. This is interim until deferred verification supports the perimeter.
-- **No run signal.** A check with its own `cwd=` gives no run signal to the [outcome signals](./ROLES.md#outcome-signals).
+- **No run signal.** A dispatch where any check has its own `cwd=` (even a relative one inside `W`) gives no run signal at all to the [outcome signals](./ROLES.md#outcome-signals).
 
 A link into a repository that was pinned at dispatch and has not changed since keeps the reference exact (link pins): it is not an `external-link`, see [Package links to outside code](#package-links-to-outside-code).
 

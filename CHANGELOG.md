@@ -11,9 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Role dispatch header (OpenCode v2 roles mode; inert on v1) (#107).** A routed role dispatch with a work root and
   read access now starts with a short header naming the role, the work root and, when known, the repository, branch and
-  head, so a role delegate is told where it works; the nonce line or carried acceptance block stays last. No header for
-  a delegate's dispatch, a non-exact resume or `dispatchHeader: false`; the role work-root rule now points to the
-  `Working directory:` line.
+  head, so a role delegate is told where it works; the nonce line or carried acceptance block stays last. A header the
+  orchestrator copied from another dispatch is stripped and replaced by the router's own. No header for a delegate's
+  dispatch or a non-exact resume; with `dispatchHeader: false` there is no header either, except that a work root other
+  than the session directory still gets a minimal header (the identity and `Working directory:` paragraphs). The role
+  work-root rule now points to the `Working directory:` line.
 - **Checks in other repositories (OpenCode v2, roles mode) (#107).** A check of the `[acceptance]` block can run in
   another repository of the read set: `check: testsPass cwd="<repo>" scope=full`. A relative `cwd=` stays inside the
   work root; an absolute one must be in the read set; one outside it, or a `scope=` that is neither `affected` nor
@@ -21,7 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   covers is unverifiable (`is not covered by any check root`). A `testsPass` or `lintClean` check in another repository
   must use `scope=full`; its failure there is unverifiable, never a fail, and it gets no reference. A working-set
   worktree whose `node_modules` links into the work root is a consumer: a pass with a change and no tests, build, lint
-  or run check placed in it is UNVERIFIED, with the suggested check line. A link target pinned at dispatch and
+  or run check placed in it is UNVERIFIED, with the suggested check line. Consumers are discovered by package name
+  (a `node_modules` link into the work root) in the working set only; when discovery stops on its budget before
+  finishing a worktree, a pass with a change is UNVERIFIED (`consumer discovery stopped before finishing …`), so a
+  consumer may remain undiscovered. A link target pinned at dispatch and
   unchanged since keeps the reference exact (link pins). A tier dispatch on v2 refuses a per-check `cwd=`
   (`a per-check cwd= is honoured only in roles mode`); `scope=` alone is ignored; v1 ignores both keys. A dispatch with
   per-check keys is verified synchronously, never deferred. The configured roles protocol (`routing.repoParents`)

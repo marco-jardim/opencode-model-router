@@ -1110,8 +1110,8 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     expect(runSignal({ childSessionID: "c", runs: [], edits: [], editsObserved: true, acceptance: [] } as unknown as Parameters<typeof runSignal>[0])).toBeNull();
     expect(flat).toContain("**The `run` signal matches npm-script-form checks only.**");
     expect(flat).toContain("A dispatch with no check of that form gets no `run` signal.");
-    // P2c.2: a check with its own cwd= does not run in the work root
-    expect(flat).toContain("An acceptance check with its own `cwd=` gives no run signal: it does not run in the work root.");
+    // P2c.2: any check with its own cwd= drops the run signal for the whole dispatch (acceptanceScriptsOf)
+    expect(flat).toContain("A dispatch where any acceptance check has its own `cwd=` (even a relative one inside the work root) gets no run signal at all: such a check may not run in the work root, so no check of that dispatch is credited.");
     // acceptance checks in the work root (DF2-F1 fixed)
     expect(flat).toContain("**Acceptance checks run in the work root.**");
     expect(flat).toContain("a `cwd:` outside that root is refused");

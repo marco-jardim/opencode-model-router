@@ -462,8 +462,9 @@ further arguments. It is matched by **`router_run` entry name**: the check `npm 
 entry of the same name (a command named `test` counts for `npm test`; one named `test-files` never does). A dispatch
 with no check of that form gets no `run` signal. A check of any other form (a file check, another command) is never
 matched to a run, so a `run` signal never shows that such a check passed: that is the deterministic gate's `verdict`.
-The child's edits must also have been observed. An acceptance check with its own `cwd=` gives no run signal: it does not
-run in the work root.
+The child's edits must also have been observed. A dispatch where any acceptance check has its own `cwd=` (even a relative
+one inside the work root) gets no run signal at all: such a check may not run in the work root, so no check of that
+dispatch is credited.
 
 **Graders weigh half, and only when independent.** When an LLM grader (not the deterministic checks) judges a role
 dispatch, there is never a weight-1 `verdict` signal. An independent grader's pass or fail writes a verdict row that
