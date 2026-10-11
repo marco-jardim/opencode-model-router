@@ -32,6 +32,25 @@ import { toolLabel } from "./dispatch";
 /** How many outside paths the mixed-change-set reason names before "and N more". */
 const MAX_OUTSIDE_LISTED = 5;
 
+/** Cross-repo P1.8: one repository of a perimeter, as the gate names it. */
+export interface PerimeterRepo {
+  readonly root: string;
+  readonly name: string;
+  readonly branch?: string;
+  readonly head?: string;
+}
+
+/** Cross-repo P1.8: an extra root of P and its change since the dispatch ("unobserved": no snapshot at either end). */
+export interface PerimeterRoot extends PerimeterRepo {
+  readonly status: "changed" | "unchanged" | "unobserved";
+}
+
+/** Cross-repo P1.8 (I8): the perimeter P of a dispatch: W, then its other roots (at least one). */
+export interface PerimeterObservation {
+  readonly w: PerimeterRepo;
+  readonly roots: readonly PerimeterRoot[];
+}
+
 /** The concrete, inspectable result of a delegation (artefact contract §3.3). */
 export interface Artefact {
   changeBaseline?: "available" | "unavailable";
@@ -52,6 +71,11 @@ export interface Artefact {
    * isUnattributedWriter), sorted. With an empty, available change set, a pass carries a caveat and is never a verified pass.
    */
   unattributedWriters?: string[];
+  /**
+   * Cross-repo P1.8 (I4, I8): the perimeter P the wiring observed (wiring.ts observeChange): W, then each extra root with its
+   * change status since the dispatch. Absent: the dispatch has no perimeter (one repository), and nothing below changes.
+   */
+  perimeter?: PerimeterObservation;
   changedFiles: { path: string; status: string }[];
   finalReturnText: string;
   declaredOutputs: string[];
@@ -276,6 +300,12 @@ export async function accept(
     const reason = artefact.branchSwitch;
     return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] }, dodSource, deps.strictUnverifiable);
   }
+  // I4 (cross-repo P1.8): another repository of the perimeter changed during the dispatch (or could not be observed: fail
+  // closed), and the producer ran a tool whose writes cannot be attributed. The checks here cannot cover a write there.
+  const perimeterRefusal = perimeterChangeReasons(artefact, artefact.perimeter?.w.root ?? artefact.changeRoot ?? effectiveBaseDir);
+  if (perimeterRefusal.length > 0) {
+    return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: perimeterRefusal, caveats: perimeterRefusal }, dodSource, deps.strictUnverifiable);
+  }
   const canonical = deps.canonicalPath ?? ((path: string) => path);
   // S4/F3: some changes inside the change root and some absolute ones outside it. Neither verifier can see the outside ones
   // (the runner drops them with a note; the grader checks against, and runs in, the working directory), so the change set
@@ -363,13 +393,45 @@ export async function accept(
     const caveat = unattributedWritersCaveat(artefact.changeRoot ?? effectiveBaseDir, writers);
     verdict = { ...verdict, pass: false, outcome: "unverifiable", reasons: [...verdict.reasons, caveat], caveats: [...(verdict.caveats ?? []), caveat] };
   }
+  // I8 (cross-repo P1.8): a pass names the perimeter it was scoped to. Evidence only: the outcome is unchanged.
+  if (artefact.perimeter !== undefined && artefact.perimeter.roots.length > 0
+    && (verdict.outcome ?? (verdict.pass ? "pass" : "fail")) === "pass") {
+    verdict = { ...verdict, reasons: [...verdict.reasons, verifiedScopeLine(artefact.perimeter)] };
+  }
 
   return gateResult(verdict, dodSource, deps.strictUnverifiable);
 }
 
 /** I5 (P0.3): the caveat for an empty change set when the producer ran tools whose writes the router cannot observe. */
 export function unattributedWritersCaveat(root: string, writers: readonly string[]): string {
-  const listed = writers.slice(0, MAX_OUTSIDE_LISTED).map(toolLabel).join(", ")
+  return `no change was observed in ${root} but the producer ran ${listedTools(writers)}; a write those tools made cannot be seen, so this is not a verified pass`;
+}
+
+/** At most MAX_OUTSIDE_LISTED tool names, sanitised (toolLabel), then "and N more". */
+function listedTools(writers: readonly string[]): string {
+  return writers.slice(0, MAX_OUTSIDE_LISTED).map(toolLabel).join(", ")
     + (writers.length > MAX_OUTSIDE_LISTED ? ` and ${writers.length - MAX_OUTSIDE_LISTED} more` : "");
-  return `no change was observed in ${root} but the producer ran ${listed}; a write those tools made cannot be seen, so this is not a verified pass`;
+}
+
+/**
+ * I4 (cross-repo P1.8): one unverifiable reason per extra root of the perimeter that changed during the dispatch, or whose
+ * snapshot was unavailable at either end (fail closed), when the producer lineage ran an unattributable writer; [] otherwise.
+ * `w` names where the checks run.
+ */
+export function perimeterChangeReasons(artefact: Pick<Artefact, "perimeter" | "unattributedWriters">, w: string): string[] {
+  const writers = artefact.unattributedWriters ?? [];
+  if (artefact.perimeter === undefined || writers.length === 0) return [];
+  const tools = listedTools(writers);
+  return artefact.perimeter.roots.filter(root => root.status !== "unchanged").map(root => {
+    const what = root.status === "changed" ? "also changed during the dispatch" : "could not be observed during the dispatch";
+    return `the repository ${root.name} at ${root.root} ${what}, and the producer ran ${tools}; a write there cannot be attributed, so the checks in ${w} do not cover it. Dispatch that work with repo=${root.name}, or verify it there.`;
+  });
+}
+
+/** I8 (cross-repo P1.8): the evidence line of a pass whose perimeter holds more than W. */
+export function verifiedScopeLine(perimeter: PerimeterObservation): string {
+  const show = (repo: PerimeterRepo): string =>
+    `${repo.name} (${repo.branch ?? "detached"} @ ${repo.head !== undefined && repo.head !== "" ? repo.head.slice(0, 7) : "unknown"})`;
+  const others = perimeter.roots.map(root => (root.status === "unobserved" ? `${root.name} (not observed)` : show(root)));
+  return `verified scope: ${show(perimeter.w)}; also observed: ${others.join(", ")}`;
 }

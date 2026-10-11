@@ -45,6 +45,57 @@ describe("buildDispatchHeader", () => {
   });
 });
 
+describe("buildDispatchHeader cross-repo lines (P1.7)", () => {
+  const cwdLine = "Working directory: D:\\git\\opencode-model-router. You are already there — do not ask permission to read or write inside it.";
+  const location = { name: "app-a", branch: "feat/login", head: "3f2c1a9d5e7b0000000000000000000000000000" };
+
+  it("is byte-identical with empty or absent cross-repo inputs", () => {
+    expect(buildDispatchHeader({ ...input, location: undefined, workingSet: [], readParents: [] })).toBe(expected);
+    expect(buildDispatchHeader({ ...input, workingSet: undefined, readParents: undefined })).toBe(expected);
+  });
+
+  it("names the repository, branch and 7-character head in the working-directory paragraph", () => {
+    expect(buildDispatchHeader({ ...input, location })).toBe(expected.replace(
+      cwdLine,
+      "Working directory: D:\\git\\opencode-model-router (repository app-a, branch feat/login at 3f2c1a9). You are already there — do not ask permission to read or write inside it.",
+    ));
+  });
+
+  it("says detached for a null branch and drops the head clause for a null head", () => {
+    expect(buildDispatchHeader({ ...input, location: { ...location, branch: null } })).toContain("(repository app-a, branch detached at 3f2c1a9). You are");
+    expect(buildDispatchHeader({ ...input, location: { ...location, head: null } })).toContain("(repository app-a, branch feat/login). You are");
+  });
+
+  it("adds the repositories paragraph right after the working directory for a working set and parents", () => {
+    const header = buildDispatchHeader({
+      ...input,
+      location,
+      workingSet: [{ name: "app-a", branch: "feat/login" }, { name: "lib-b", branch: "main" }, { name: "lib-c", branch: null }],
+      readParents: ["D:\\git", "D:\\work"],
+    });
+    const paragraphs = header.split("\n\n");
+    expect(paragraphs[1]).toMatch(/^Working directory: .*\(repository app-a/);
+    expect(paragraphs[2]).toBe(
+      "Repositories in this session: app-a (feat/login), lib-b (main), lib-c (detached). You may read any repository below D:\\git, D:\\work; you edit and run only in your working directory.",
+    );
+    expect(paragraphs).toHaveLength(expected.split("\n\n").length + 1);
+  });
+
+  it("leaves out the first sentence for parents only", () => {
+    expect(buildDispatchHeader({ ...input, readParents: ["D:\\git"] })).toBe(expected.replace(
+      cwdLine,
+      `${cwdLine}\n\nYou may read any repository below D:\\git; you edit and run only in your working directory.`,
+    ));
+  });
+
+  it("leaves out the 'below' clause for a working set only", () => {
+    expect(buildDispatchHeader({ ...input, workingSet: [{ name: "lib-b", branch: "main" }] })).toBe(expected.replace(
+      cwdLine,
+      `${cwdLine}\n\nRepositories in this session: lib-b (main). You edit and run only in your working directory.`,
+    ));
+  });
+});
+
 describe("dispatchHeader config validation", () => {
   const base = { activePreset: "test", presets: { test: { fast: { model: "test/model" } } }, rules: [], defaultTier: "fast" };
   it.each([undefined, true, false])("accepts %s", (dispatchHeader) => {

@@ -879,6 +879,20 @@ const ADD_LOCK_UNSUPPORTED = /unknown option\W+(?:reason|lock)\b/;
 export const STALE_REFERENCE_AGE_MS = 60 * 60 * 1000;
 /** A live reference dir's mtime is refreshed this often, far below STALE_REFERENCE_AGE_MS (QA-1.5-4). */
 export const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
+/**
+ * Package-store layouts (pnpm `.pnpm/x@1/node_modules/x`, a global virtual store, a custom virtualStoreDir) all place the
+ * package directly under a node_modules dir (or its @scope): a package link whose real path is such a directory is store-like
+ * (P0.4, step 7 below; cross-repo P1.8 link discovery, perimeter.ts).
+ */
+export function isStoreLikeLink(real: string, platform: string): boolean {
+  const p = platform === "win32" ? pathWin32 : pathPosix;
+  const fold = (s: string): string => (platform === "win32" ? s.toLowerCase() : s);
+  const parent = p.dirname(real);
+  const parentName = fold(p.basename(parent));
+  if (parentName === "node_modules") return true;
+  return parentName.startsWith("@") && fold(p.basename(p.dirname(parent))) === "node_modules";
+}
+
 /** Equals the baselineTimeoutMs default (§1.4); callers pass the configured value. */
 export const DEFAULT_CAPTURE_TIMEOUT_MS = 15_000;
 export const DEFAULT_MATERIALIZE_TIMEOUT_MS = 30_000;
@@ -1831,12 +1845,7 @@ export async function materialize(
     const rootLinks = new Set<string>();
     // Package-store layouts (pnpm `.pnpm/x@1/node_modules/x`, a global virtual store, a custom
     // virtualStoreDir) all place the package directly under a node_modules dir (or its @scope).
-    const storeLike = (real: string): boolean => {
-      const parent = p.dirname(real);
-      const parentName = fold(p.basename(parent));
-      if (parentName === "node_modules") return true;
-      return parentName.startsWith("@") && fold(p.basename(p.dirname(parent))) === "node_modules";
-    };
+    const storeLike = (real: string): boolean => isStoreLikeLink(real, platform);
     for (const { target, label } of linkTargets) {
       for (const entry of await packageEntries(fs, target, platform)) {
         const stats = await lstatOrMissing(fs, entry);

@@ -96,7 +96,7 @@ import { applyV1Roles, hasExplicitV1Roles, v1AgentInfos } from "./routing/comman
 import type { HostAgentInfo } from "./routing/engine/types";
 import { createEngineRuntime } from "./routing/wire/runtime";
 import type { EngineRuntime } from "./routing/wire/runtime";
-import { forgetWorkingSet } from "./routing/wire/working-set";
+import { forgetWorkingSet, workingSetOf } from "./routing/wire/working-set";
 import {
   advisorSettings,
   catalogFromProviders,
@@ -1687,6 +1687,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 ...((verification.branchSwitch ?? deferredSwitch) !== undefined ? { branchSwitch: verification.branchSwitch ?? deferredSwitch } : {}),
                 ...(verification.unattributedWriters !== undefined && verification.unattributedWriters.length > 0
                   ? { unattributedWriters: verification.unattributedWriters } : {}),
+                ...(verification.perimeter !== undefined ? { perimeter: verification.perimeter } : {}),
                 finalReturnText: producerText,
                 declaredOutputs: dod.deliverable ? [dod.deliverable] : [],
                 producerSessionID: producerSid,
@@ -2235,8 +2236,17 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               // Handoff 30, R7 (I1/I8 exemption: T1.5.3a, the header names `root=`): on v2 shadow/advise/enforce the engine stripped the
               // route line already; its `root=` comes from the router. No root → the header is byte-identical to before.
               const root = routeLineRoot(args.prompt) ?? (typeof input.callID === "string" ? strippedRouteRoot(input.callID) : undefined);
-              const prompt = buildDispatchHeader({ tier, cap, projectDirectory: ctx.directory, root }) +
-                DISPATCH_HEADER_SEPARATOR + args.prompt;
+              // Cross-repo (P1.7, v2 only): the location of a routed role dispatch, the orchestrator's working set and the read
+              // parents. All empty unless cross-repo is in use, so the header is then byte-identical to before.
+              const location = typeof input.callID === "string" ? routedRoleOf(input.callID)?.grant.location : undefined;
+              const crossRepo = ctx.routerHost === "v2" ? resolveRolesRouting(cfg, "v2") : undefined;
+              const workingSet = ctx.routerHost === "v2" && typeof input.sessionID === "string" ? workingSetOf(input.sessionID) : [];
+              const prompt = buildDispatchHeader({
+                tier, cap, projectDirectory: ctx.directory, root,
+                ...(location === undefined ? {} : { location }),
+                ...(workingSet.length === 0 ? {} : { workingSet }),
+                ...(crossRepo === undefined || crossRepo.repoParents.length === 0 ? {} : { readParents: crossRepo.repoParents }),
+              }) + DISPATCH_HEADER_SEPARATOR + args.prompt;
               args.prompt = prompt;
               if (process.env.MODEL_ROUTER_DISPATCH_DEBUG === "1" && !dispatchDebugLogged) {
                 dispatchDebugLogged = true;
@@ -2508,6 +2518,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               ...((verification.branchSwitch ?? deferredSwitch) !== undefined ? { branchSwitch: verification.branchSwitch ?? deferredSwitch } : {}),
               ...(verification.unattributedWriters !== undefined && verification.unattributedWriters.length > 0
                 ? { unattributedWriters: verification.unattributedWriters } : {}),
+              ...(verification.perimeter !== undefined ? { perimeter: verification.perimeter } : {}),
               finalReturnText,
               declaredOutputs: dod.deliverable ? [dod.deliverable] : [],
               producerSessionID: childSessionID ?? "",

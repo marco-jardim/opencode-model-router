@@ -25,19 +25,40 @@ const FALSE_REFUSAL_PARAGRAPH = "A hand-back with zero tool calls is recorded as
  * `root` (plan §2.2, T1.5.3a): the dispatch's work root — the route line's `root=`
  * (`routeLineRoot`) — named by the working-directory paragraph instead of the
  * project directory. Absent or empty: the header is byte-identical to before.
+ *
+ * Cross-repo (`docs/design/cross-repo.md` §5, P1.7), all optional and inert when absent or empty:
+ * `location` names the working directory's repository, branch and head; `workingSet` and `readParents` add one paragraph
+ * listing the session's repositories and where a role may read.
  */
 export function buildDispatchHeader(input: {
   tier: string;
   cap: number | "none";
   projectDirectory: string | undefined;
   root?: string | null;
+  location?: { readonly name: string; readonly branch: string | null; readonly head: string | null };
+  workingSet?: readonly { readonly name: string; readonly branch: string | null }[];
+  readParents?: readonly string[];
 }): string {
   const paragraphs = [
     `${DISPATCH_HEADER_PREFIX}${input.tier}. Execute this dispatch yourself; do not route it to another tier, and do not ask to be re-dispatched.`,
   ];
   const directory = input.root || input.projectDirectory;
   if (directory) {
-    paragraphs.push(`Working directory: ${directory}. You are already there — do not ask permission to read or write inside it.`);
+    const where = input.location === undefined
+      ? ""
+      : ` (repository ${input.location.name}, branch ${input.location.branch ?? "detached"}${input.location.head ? ` at ${input.location.head.slice(0, 7)}` : ""})`;
+    paragraphs.push(`Working directory: ${directory}${where}. You are already there — do not ask permission to read or write inside it.`);
+    const set = input.workingSet ?? [];
+    const parents = input.readParents ?? [];
+    if (set.length > 0 || parents.length > 0) {
+      const listed = set.length > 0
+        ? `Repositories in this session: ${set.map((entry) => `${entry.name} (${entry.branch ?? "detached"})`).join(", ")}. `
+        : "";
+      const rest = parents.length > 0
+        ? `You may read any repository below ${parents.join(", ")}; you edit and run only in your working directory.`
+        : "You edit and run only in your working directory.";
+      paragraphs.push(`${listed}${rest}`);
+    }
   }
   paragraphs.push(
     'Tool names mentioned in this dispatch are descriptive and vary by provider; your own tool schema is the authority on what you can do. Never refuse or hand back work because a named tool looks unfamiliar or missing — attempt it, and if you cannot finish, name the specific step that failed.',

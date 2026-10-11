@@ -16,7 +16,7 @@
 import { createHash } from "node:crypto";
 import type { ChildSessionRunner } from "../compat/child-session";
 import { access, readdir, readFile as fsReadFile, realpath, stat, unlink } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { createBatchCoordinator, type BatchCoordinatorOptions, type BatchPlanner } from "./batch";
 import {
   createDeadline,
@@ -75,6 +75,8 @@ import {
 } from "./dispatch";
 import { runArgv, runShell } from "./exec";
 import { snapshotTree } from "./tree";
+import { planPerimeter } from "./perimeter";
+import type { DispatchPerimeter } from "./dispatch";
 import { branchSwitched, branchSwitchReason, branchUnconfirmedReason, treeMove, treeMoveReason } from "./branch";
 import { readHead, readHeadState, readReflogWindow, type HeadState, type ReflogEntry } from "./head";
 import { captureReference, DEFAULT_CAPTURE_TIMEOUT_MS, gcStaleReferences, nodeReferenceFs, type DispatchReference } from "./reference";
@@ -90,8 +92,8 @@ import {
   RouterTimeoutError,
   withTimeout,
 } from "./timeout";
-import { resolveVerifyBudget, type RouterConfig, type VerifyBudget } from "../router/config";
-import { accept, gateResult, unverifiableGateResult, type GateDeps, type GateResult } from "./gate";
+import { resolveRolesRouting, resolveVerifyBudget, type RouterConfig, type VerifyBudget } from "../router/config";
+import { accept, gateResult, unverifiableGateResult, type GateDeps, type GateResult, type PerimeterObservation, type PerimeterRoot } from "./gate";
 // The grader request shape is owned by checker.ts, which builds it. Re-exported
 // here because this module is where it is consumed, and because keeping a
 // second local copy is exactly how `cwd` got dropped: the checker set it, the
@@ -188,6 +190,11 @@ export interface PreparedVerification {
    * builders hand them to the gate (Artefact.unattributedWriters). Absent or empty: none.
    */
   unattributedWriters?: string[];
+  /**
+   * Cross-repo P1.8 (I4, I8): the perimeter P observed at the gate (observeChange); the artefact builders hand it to the gate
+   * (Artefact.perimeter). Absent: the dispatch has no perimeter.
+   */
+  perimeter?: PerimeterObservation;
 }
 
 /**
@@ -450,9 +457,11 @@ export type DeferredFinish =
        * the required gate passes with no process (section 1.5-6; QA-G-1: any other DoD is deferred
        * with the empty set instead, noChangeGateSpawnsNothing); "error": the finish itself failed;
        * "branch-switched" (I7, P0.2): the working tree switched branch during the dispatch, so no handle is issued that could
-       * verify the other branch later; the required gate refuses it at once (its observeChange sees the same switch).
+       * verify the other branch later; the required gate refuses it at once (its observeChange sees the same switch);
+       * "cross-repo" (P1.8): the dispatch's perimeter spans several repositories, which a later handle would not observe as
+       * they were when the producer returned; the required gate verifies it at once.
        */
-      readonly reason: "unregistered" | "no-change" | "error" | "branch-switched";
+      readonly reason: "unregistered" | "no-change" | "error" | "branch-switched" | "cross-repo";
       readonly detail: string;
     };
 
@@ -1478,11 +1487,96 @@ export function createVerificationWiring(deps: {
         uncaptured: { kind: "none", reason: `${REFERENCE_NONE.failed} (${errorText(err)})` },
       };
     }
-    const begun = store.beginDispatch(id, resolve(directory, cwd || "."), deps);
+    const at = resolve(directory, cwd || ".");
+    // Cross-repo P1.8 (I13): a role dispatch's perimeter is fixed now; every other dispatch plans none (I9).
+    let perimeter: DispatchPerimeter | undefined;
+    try {
+      perimeter = planPerimeter(id, at, () => {
+        const routing = resolveRolesRouting(getConfig(), "v2");
+        return { parents: routing.repoParents, depth: routing.repoDepth };
+      });
+    } catch (err) {
+      logger.warn("[verify] dispatch perimeter could not be planned", { id, error: errorText(err) });
+    }
+    const begun = store.beginDispatch(id, at, perimeter === undefined ? deps : { ...deps, perimeter });
     // pending.ts R10: remember the reference's settled value (the store hands out one promise).
     const reference = store.reference(id);
     if (!settledReferences.has(reference)) void reference.then(state => settledReferences.set(reference, state));
     await begun;
+  };
+
+  /**
+   * Cross-repo P1.8 (I4, I8): each extra root of the dispatch's perimeter, snapshotted again (bounded by `deadline`) and
+   * compared with its dispatch snapshot: "changed" when the fingerprint, HEAD or top level differs, "unobserved" when either
+   * snapshot is unavailable (fail closed). A link target whose git top level is not admitted is dropped (I12); roots are
+   * de-duplicated by top level, W's own excluded. Undefined when the dispatch has no perimeter or none of its roots remains.
+   */
+  const perimeterAtGate = async (
+    store: ReturnType<typeof createChangedFileStore>,
+    id: string,
+    snapshot: TreeSnapshot | undefined,
+    base: string,
+    deadline: Deadline | undefined,
+  ): Promise<PerimeterObservation | undefined> => {
+    const planned = store.perimeterOf(id);
+    if (planned === undefined || planned.entries.size === 0) return undefined;
+    const bound = (): number => (deadline ? deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS) : GRADE_SNAPSHOT_TIMEOUT_MS);
+    const lowPriority = configuredLowPriority();
+    const observed = await Promise.all([...planned.entries.values()].map(async entry => {
+      const before = await withTimeout(entry.snapshot, Math.max(1, bound()), "perimeter fingerprint").catch(() => undefined);
+      let now: TreeSnapshot | undefined;
+      const ms = bound();
+      if (ms > 0 && deadline?.signal.aborted !== true) {
+        const controller = new AbortController();
+        const onAbort = (): void => controller.abort();
+        deadline?.signal.addEventListener("abort", onAbort, { once: true });
+        try {
+          now = await withTimeout(snapshotTree(entry.seed.at, controller.signal, { lowPriority }), ms, "perimeter fingerprint");
+        } catch {
+          now = undefined;
+        } finally {
+          deadline?.signal.removeEventListener("abort", onAbort);
+          controller.abort();
+        }
+      }
+      return { entry, before, now };
+    }));
+    const key = (at: string): string => {
+      const normalized = resolve(at).replace(/\\/g, "/");
+      return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+    };
+    const wRoot = snapshot?.root ?? base;
+    const rank = { unchanged: 0, unobserved: 1, changed: 2 } as const;
+    const roots = new Map<string, PerimeterRoot>();
+    for (const { entry, before, now } of observed) {
+      const known = now?.root ?? before?.root;
+      if (known !== undefined && entry.seed.admit !== undefined && !entry.seed.admit(known)) continue;
+      const root = known ?? entry.seed.at;
+      if (key(root) === key(wRoot)) continue;
+      const status: PerimeterRoot["status"] = before === undefined || now === undefined
+        ? "unobserved"
+        : before.fingerprint !== now.fingerprint || before.head !== now.head || before.root !== now.root ? "changed" : "unchanged";
+      const shown = now ?? before;
+      const next: PerimeterRoot = {
+        root,
+        name: entry.seed.name ?? basename(root),
+        status,
+        ...(typeof shown?.branch === "string" ? { branch: shown.branch } : {}),
+        ...(shown?.head ? { head: shown.head } : {}),
+      };
+      const previous = roots.get(key(root));
+      if (previous === undefined || rank[next.status] > rank[previous.status]) roots.set(key(root), next);
+    }
+    if (roots.size === 0) return undefined;
+    return {
+      w: {
+        root: wRoot,
+        name: planned.name ?? basename(wRoot),
+        ...(typeof snapshot?.branch === "string" ? { branch: snapshot.branch } : {}),
+        ...(snapshot?.head ? { head: snapshot.head } : {}),
+      },
+      roots: [...roots.values()],
+    };
   };
 
   /**
@@ -1496,6 +1590,7 @@ export function createVerificationWiring(deps: {
     childID: string,
     cwd: string | undefined,
     deadline: Deadline | undefined,
+    observePerimeter = true,
   ): Promise<Omit<PreparedVerification, "reference">> => {
     const base = resolve(directory, cwd || ".");
     const controller = new AbortController();
@@ -1592,6 +1687,7 @@ export function createVerificationWiring(deps: {
     // B8: on a switch the commit diff is not run; "unavailable" keeps the whole change set unavailable (the gate refuses anyway).
     const committed = branchSwitch !== undefined ? "unavailable" as const : await committedSinceDispatch(before, snapshot, deadline);
     const contaminatedBy = store.snapshotContaminatedBy(id);
+    const perimeter = observePerimeter ? await perimeterAtGate(store, id, snapshot, base, deadline) : undefined;
     return {
       ...store.delta(id, childID, snapshot, base, committed),
       snapshot,
@@ -1599,6 +1695,7 @@ export function createVerificationWiring(deps: {
       ...(contaminatedBy !== undefined ? { contaminatedBy } : {}),
       ...(branchSwitch !== undefined ? { branchSwitch } : {}),
       ...(gateHead !== undefined ? { head: gateHead } : {}),
+      ...(perimeter !== undefined ? { perimeter } : {}),
     };
   };
 
@@ -1713,10 +1810,16 @@ export function createVerificationWiring(deps: {
     let risk: RiskAssessment = unattributedRisk();
     let deferred = false;
     try {
-      const change = await observeChange(store, input.dispatchID, input.producerSessionID, input.cwd, deadline);
+      // Cross-repo P1.8: the perimeter is observed by the required gate only (a dispatch with one is never deferred, below).
+      const change = await observeChange(store, input.dispatchID, input.producerSessionID, input.cwd, deadline, false);
       // I7 (P0.2): a branch switch during the dispatch is never deferred: a handle could verify the other branch later. The
       // caller's required gate refuses it now (its own observeChange sees the switch). Before the no-change shortcut below.
       if (change.branchSwitch !== undefined) return { deferred: false, reason: "branch-switched", detail: change.branchSwitch };
+      // Cross-repo P1.8 (I4, I13): a handle verified later would not see the perimeter's other repositories as they were when the
+      // producer returned; the caller's required gate verifies the dispatch now. Before the no-change shortcut below.
+      if (store.perimeterOf(input.dispatchID) !== undefined) {
+        return { deferred: false, reason: "cross-repo", detail: "the perimeter spans several repositories; verified synchronously" };
+      }
       // QA-2.4-10: an attributed empty change set is passed by the required gate with no process
       // (section 1.5-6): nothing to defer. The caller runs that gate, with the same outcome.
       // QA-G-1: only for a testsPass-only DoD. Any other check (build, lint, run, fileExists,
@@ -2040,6 +2143,7 @@ export function createVerificationWiring(deps: {
       ...(prep.prepared.branchSwitch !== undefined ? { branchSwitch: prep.prepared.branchSwitch } : {}),
       ...(prep.prepared.unattributedWriters !== undefined && prep.prepared.unattributedWriters.length > 0
         ? { unattributedWriters: prep.prepared.unattributedWriters } : {}),
+      ...(prep.prepared.perimeter !== undefined ? { perimeter: prep.prepared.perimeter } : {}),
       // Not stored (R3): a testsPass DoD is deterministic, and no deterministic check reads it.
       finalReturnText: "",
       declaredOutputs: dod.deliverable ? [dod.deliverable] : [],

@@ -66,8 +66,41 @@ export interface DispatchCaptureDeps {
    * the snapshot: a snapshot that failed, timed out or was discarded does not lose it. Absent: no head baseline.
    */
   headState?: (cwd: string, signal: AbortSignal) => Promise<HeadRead>;
+  /**
+   * Cross-repo P1.8 (I13): the extra roots of the dispatch's perimeter P, each snapshotted with `snapshot` next to the change
+   * baseline and bounded by `timeoutMs`. Absent: no perimeter, and nothing else is snapshotted (I9).
+   */
+  perimeter?: DispatchPerimeter;
   /** Bounds the snapshot, the head read and the capture, each (baselineTimeoutMs). */
   timeoutMs: number;
+}
+
+/** Cross-repo P1.8: one extra root of a perimeter, as planned at dispatch (perimeter.ts planPerimeter). */
+export interface PerimeterSeed {
+  /** Where it is snapshotted: a working-set worktree, or the real path of a package link of W. */
+  readonly at: string;
+  /** The repository's name when known (the working-set location's); else the basename of its git top level. */
+  readonly name?: string;
+  /** Link targets only: whether the git top level the snapshot names is admitted (checked at the gate). */
+  readonly admit?: (root: string) => boolean;
+}
+
+/** Cross-repo P1.8: the perimeter P of a dispatch beyond W. */
+export interface DispatchPerimeter {
+  /** W's repository name when the grant's location names it. */
+  readonly name?: string;
+  readonly roots: readonly PerimeterSeed[];
+}
+
+/** Cross-repo P1.8: the dispatch-time state of one extra root of the perimeter. */
+export interface PerimeterEntry {
+  readonly seed: PerimeterSeed;
+  /** Its dispatch snapshot is in flight. */
+  pending: boolean;
+  /** The first tool whose call may have written into this root while its snapshot was in flight: the snapshot is discarded. */
+  contaminatedBy?: string;
+  /** Settles once, never rejects; undefined when unavailable, timed out or discarded. */
+  snapshot: Promise<TreeSnapshot | undefined>;
 }
 
 function none(reason: string): ReferenceState {
@@ -261,6 +294,8 @@ interface DispatchRecord {
   observed: Map<string, ChangedFile>;
   /** P0.3: the unattributable writers (isUnattributedWriter) of every session in `producers`. */
   writers: Set<string>;
+  /** Cross-repo P1.8 (I13): the extra roots of the dispatch's perimeter, by snapshot directory; absent: no perimeter. */
+  perimeter?: { readonly name?: string; readonly entries: Map<string, PerimeterEntry> };
 }
 
 /**
@@ -283,6 +318,10 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
     const overlaps = (other: string) => !cwd || pathKey(cwd) === pathKey(other)
       || pathKey(cwd).startsWith(pathKey(other) + "/") || pathKey(other).startsWith(pathKey(cwd) + "/");
     for (const d of dispatches.values()) {
+      // Cross-repo P1.8: a write that may land in an extra root of the perimeter discards that root's in-flight snapshot.
+      for (const entry of d.perimeter?.entries.values() ?? []) {
+        if (entry.pending && overlaps(entry.seed.at)) entry.contaminatedBy ??= tool;
+      }
       if (!overlaps(d.cwd)) continue;
       if (d.snapshotPending) {
         d.snapshotContaminated = true;
@@ -395,6 +434,28 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
         if (snapshot?.root !== undefined) window.root = snapshot.root;
         if (snapshot && !d.snapshotContaminated && dispatches.get(id) === d) d.snapshot = snapshot;
       })();
+      // Cross-repo P1.8 (I13): P is fixed now; each extra root is snapshotted like the change baseline, with the same bound.
+      if (deps.perimeter !== undefined && deps.perimeter.roots.length > 0) {
+        const entries = new Map<string, PerimeterEntry>();
+        for (const seed of deps.perimeter.roots) {
+          const entry: PerimeterEntry = { seed, pending: true, snapshot: Promise.resolve(undefined) };
+          entry.snapshot = (async (): Promise<TreeSnapshot | undefined> => {
+            const controller = new AbortController();
+            let snapshot: TreeSnapshot | undefined;
+            try {
+              snapshot = await withTimeout(deps.snapshot(seed.at, controller.signal), deps.timeoutMs, "perimeter fingerprint");
+            } catch {
+              snapshot = undefined; // Unavailable: the gate reports the root as not observed.
+            } finally {
+              entry.pending = false;
+              controller.abort();
+            }
+            return entry.contaminatedBy === undefined ? snapshot : undefined;
+          })();
+          entries.set(seed.at, entry);
+        }
+        d.perimeter = { ...(deps.perimeter.name !== undefined ? { name: deps.perimeter.name } : {}), entries };
+      }
       const readHead = deps.headState;
       if (readHead !== undefined) {
         d.head = (async (): Promise<HeadRead> => {
@@ -426,7 +487,8 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
           return captured ? { kind: "captured", reference: captured } : none(REFERENCE_NONE.failed);
         })();
       }
-      d.settled = Promise.all([d.ready, d.reference, d.head]).then(() => undefined);
+      const perimeterSnapshots = [...(d.perimeter?.entries.values() ?? [])].map(entry => entry.snapshot);
+      d.settled = Promise.all([d.ready, d.reference, d.head, ...perimeterSnapshots]).then(() => undefined);
       return d.settled;
     },
     observeEdit,
@@ -561,6 +623,10 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
     /** QA-3.1-3: the tool whose call discarded this dispatch's snapshot (the change baseline), if one did. */
     snapshotContaminatedBy(id: string): string | undefined {
       return dispatches.get(id)?.snapshotContaminatedBy;
+    },
+    /** Cross-repo P1.8: the dispatch's perimeter beyond W, planned at dispatch; undefined when it has none or is untracked. */
+    perimeterOf(id: string): { readonly name?: string; readonly entries: ReadonlyMap<string, PerimeterEntry> } | undefined {
+      return dispatches.get(id)?.perimeter;
     },
     record(sessionID: string, tool: string, args: unknown): void {
       touch(sessionID);

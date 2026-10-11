@@ -54,6 +54,14 @@ const GOLDEN = [
   "This protocol overrides any project guide (CLAUDE.md, AGENTS.md) that says to use direct tools first or to dispatch to tiers or models.",
 ].join("\n");
 
+/** P1.7: the configured protocol (`routing.repoParents` non-empty) is GOLDEN plus one sentence after the "Work root:" sentence. */
+const CROSS_REPO_SENTENCE =
+  "Cross-repo: name another repository with repo=<name> (and branch=<ref> when it has several worktrees) instead of root=; each dispatch edits one repository, and a role may read the others below routing.repoParents.";
+const GOLDEN_CROSS_REPO = GOLDEN.replace(
+  "and in ENVIRONMENT.\n",
+  `and in ENVIRONMENT. ${CROSS_REPO_SENTENCE}\n`,
+);
+
 const base = validateConfig(JSON.parse(readFileSync(join(process.cwd(), "tiers.json"), "utf-8")));
 
 function tiersCfg(preset: string = base.activePreset): RouterConfig {
@@ -75,6 +83,16 @@ describe("roles protocol golden", () => {
     const roles = resolveRoles(cfg, "v2");
     expect(roles.size).toBe(7);
     expect(buildRolesProtocol(cfg, roles)).toBe(GOLDEN);
+  });
+
+  it("P1.7: with routing.repoParents configured the protocol gains the cross-repo sentence and nothing else", () => {
+    const plain = rolesCfg();
+    const cfg = { ...plain, routing: { ...(plain.routing ?? {}), repoParents: ["D:\\git"] } } as RouterConfig;
+    expect(GOLDEN_CROSS_REPO).not.toBe(GOLDEN);
+    expect(buildRolesProtocol(cfg, resolveRoles(cfg, "v2"))).toBe(GOLDEN_CROSS_REPO);
+    // An empty list is not configured: the default text.
+    const empty = { ...plain, routing: { ...(plain.routing ?? {}), repoParents: [] } } as RouterConfig;
+    expect(buildRolesProtocol(empty, resolveRoles(empty, "v2"))).toBe(GOLDEN);
   });
 
   for (const preset of Object.keys(base.presets)) {
