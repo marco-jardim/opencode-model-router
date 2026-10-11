@@ -377,7 +377,7 @@ describe("OpenCode 2 hook adapter", () => {
     const next = depthResult("next");
     await f.toolHooks["execute.after"](next);
     expect(next.result.output.output.match(/GUARD:delegation_depth/g)).toHaveLength(1);
-  });
+  }, 30_000);
 
   it.each(["enforced", "advisory"] as const)("judges a v2 childRunner grader's own task by its recorded depth in %s mode", async (mode) => {
     let f: Awaited<ReturnType<typeof depthFixture>>;

@@ -91,6 +91,12 @@ import { createPersister, nodePersistDeps, summarizeRoles } from "./routing/outc
 import { roleAgentSteps } from "./router/role-agents";
 import type { HostBudgetObservation } from "./compat/v2-hooks";
 import { TURN_STATE_ROOT, type TurnStateRegistry } from "./compat/turn-state";
+
+/**
+ * Phase 1.2 (v2 only): the v2 adapter owns the turn-state registry and hands it to this plugin by calling the function
+ * stored under this key on the returned hooks object (non-enumerable; absent on v1).
+ */
+export const ROUTER_TURN_STATE_ATTACH: unique symbol = Symbol.for("router.turnState.attach");
 import { checkpointLine, formatStatsReply, runStatsCommand } from "./routing/commands/stats";
 import { buildAnnotateDirectives } from "./routing/commands/annotate-plan";
 import { applyV1Roles, hasExplicitV1Roles, v1AgentInfos } from "./routing/commands/v1-roles";
@@ -808,12 +814,21 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
   // Phase 1.2 (v2 only): the turn-state registry the adapter injects. Without it (v1, or a v2 host that injects none) nothing
   // below is registered or buffered, and the system transform keeps pushing the pending list and the late notices.
-  const turnState: TurnStateRegistry | undefined = isV2Host
-    ? (ctx as RouterPluginInput & { routerTurnState?: TurnStateRegistry }).routerTurnState
-    : undefined;
-  const lateBuffer: LateBuffer | undefined = turnState !== undefined ? createLateBuffer() : undefined;
+  // The registry arrives either on the legacy ctx (tests) or through the ROUTER_TURN_STATE_ATTACH hook the v2 adapter calls.
+  let turnState: TurnStateRegistry | undefined;
+  const lateBuffer: LateBuffer | undefined = isV2Host ? createLateBuffer() : undefined;
   const unregisterTurnStateProviders: Array<() => void> = [];
-  if (turnState !== undefined && lateBuffer !== undefined) {
+  let warnedSecondRegistry = false;
+  const attachTurnState = (registry: TurnStateRegistry): void => {
+    if (turnState !== undefined) {
+      if (turnState !== registry && !warnedSecondRegistry) {
+        warnedSecondRegistry = true;
+        logger.warn("[router] turn state: a second registry was ignored");
+      }
+      return;
+    }
+    turnState = registry;
+    if (lateBuffer === undefined) return;
     try {
       // Late notices of background runs that did not pass: buffered before the block is built (a builder throw loses
       // nothing) and kept until router_verify answers their handle.
@@ -843,6 +858,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     } catch (error) {
       logger.warn("[router] turn state: late/pending providers not registered", { error: scrubText(String(error)) });
     }
+  };
+  if (isV2Host) {
+    const injected = (ctx as RouterPluginInput & { routerTurnState?: TurnStateRegistry }).routerTurnState;
+    if (injected !== undefined) attachTurnState(injected);
   }
 
   // Best-effort, secret-free delegate scorecard dump (counts only).
@@ -1375,7 +1394,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     roleBudgetPeaks.delete(sessionID);
     for (const [callID, sent] of roleDispatchTexts) if (sent.parentSessionID === sessionID) roleDispatchTexts.delete(callID);
   };
-  return {
+  const routerHooks: Awaited<ReturnType<Plugin>> = {
     // Warnings post to /log fire-and-forget, which loses the message when the
     // process is about to exit — `opencode run` and `opencode debug` are short
     // enough for that to be the normal case. Verified against opencode 1.18.16
@@ -3337,6 +3356,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       }
     },
   };
+  if (isV2Host) {
+    // Phase 1.2 (v2 only): non-enumerable, so spreading or enumerating the hooks never sees it.
+    Object.defineProperty(routerHooks, ROUTER_TURN_STATE_ATTACH, { value: attachTurnState, enumerable: false });
+  }
+  return routerHooks;
 };
 
 export default ModelRouterPlugin;

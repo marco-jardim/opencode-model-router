@@ -40,6 +40,8 @@ import { ROUTER_BUDGET_NOTE_PREFIX } from "../router/prompts";
 import { parseReturnPrefix } from "../routing/outcomes/signals";
 import { lookupDispatch } from "../router/sessions";
 import { createSystemAugmenter } from "../routing/wire/hint";
+import { ROUTER_TURN_STATE_ATTACH } from "../index";
+import { createTurnStateRegistry, placeTurnState, TURN_STATE_ROOT, type TurnStateRegistry } from "./turn-state";
 import { CONTEXT7_DOC_TOOLS, evaluatePermission, permissionMatches, permissionRules, publishReadOnlyPermissions } from "../router/read-only";
 import { filterSensitiveGrep, isSensitivePath } from "../router/sensitive-paths";
 import { canonicalAuthorityPath, insideWorkRoot } from "../routing/roles/work-root";
@@ -741,6 +743,25 @@ export async function registerV2Hooks(
   // M6 (2.1.3): child-session outcomes and costs reach the outcome store through the plugin instance's ingest, which
   // does nothing unless routing.engine != static (its settings are null otherwise: no bundle, no files).
   const ingestLogger = createPluginLogger();
+  // Phase 1.2: the turn-state registry of this adapter instance. The legacy plugin registers its late/pending providers on it
+  // through the attach hook; the system augmenter registers the route hint; `buildContext` places the tail (root sessions only).
+  const turnState = createTurnStateRegistry({ logger: ingestLogger, translate: v2Instructions });
+  const attachTurnState = (hooks as unknown as Record<PropertyKey, unknown>)[ROUTER_TURN_STATE_ATTACH];
+  if (typeof attachTurnState === "function") {
+    try {
+      (attachTurnState as (registry: TurnStateRegistry) => void)(turnState);
+    } catch (error) {
+      ingestLogger.warn("[router] turn state: the plugin could not attach the registry", { error: String(error) });
+    }
+  }
+  let turnStateWarned = false;
+  const warnTurnStateOnce = (error: unknown): void => {
+    if (turnStateWarned) return;
+    turnStateWarned = true;
+    ingestLogger.warn("[router] turn state: the tail was not placed; the request goes on without it", { error: String(error) });
+  };
+  type ContextMessage = NonNullable<SessionContext["messages"]>[number];
+  const tailMessage = (text: string): ContextMessage => ({ role: "user", content: [{ type: "text", text }] });
   const ingest: Ingest = options.ingest ?? NOOP_INGEST;
   // An ingestion error is logged and the loop carries on: it must never cost the router an event.
   const ingesting = async (what: string, run: () => void | Promise<void>): Promise<void> => {
@@ -1021,7 +1042,7 @@ export async function registerV2Hooks(
   };
   /** P-3: role children whose catalog failure is already annotated for the parent's current call (cleared when it ends). */
   const catalogFailures = new Set<string>();
-  const systemAugmenter = createSystemAugmenter({ runtime: engine, getSession: sessionOf, logger: ingestLogger });
+  const systemAugmenter = createSystemAugmenter({ runtime: engine, getSession: sessionOf, logger: ingestLogger, turnState });
   let eventTask: Promise<void> | undefined;
   let disposed = false;
   const within = <T>(context: ToolContext, operation: () => Promise<T>): Promise<T> =>
@@ -1425,7 +1446,7 @@ export async function registerV2Hooks(
         copies.push(part);
         original.set(part.text, copies);
       }
-      const output = { system: event.system.map((part) => part.text) };
+      const output: { system: string[]; [TURN_STATE_ROOT]?: boolean } = { system: event.system.map((part) => part.text) };
       // The router pushes its own instructions, but may splice edited user text.
       // Only pushed text belongs to the router and may have its vocabulary translated.
       const added = new Set<string>();
@@ -1468,6 +1489,16 @@ export async function registerV2Hooks(
             if (content.length) event.messages[index] = Object.assign(Object.create(Object.getPrototypeOf(message)), message, { content });
             else event.messages.splice(index, 1);
           }
+        }
+      }
+      // Phase 1.2: a root session's turn state (pending list, late notices, route hint) rides in a trailing user message; the
+      // system parts above are never changed for it. A failure here only loses the tail, never the request.
+      if (output[TURN_STATE_ROOT] === true && event.messages !== undefined) {
+        try {
+          const placed = placeTurnState(event.messages, turnState.buildTurnState(String(event.sessionID)), tailMessage);
+          if (placed !== undefined) event.messages = placed;
+        } catch (error) {
+          warnTurnStateOnce(error);
         }
       }
     }
