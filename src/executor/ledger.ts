@@ -788,11 +788,14 @@ async function loadMain(fs: FileSystem, dir: string, mode: "reader" | "writer"):
         warnings.push(`${f.name}: incomplete trailing batch dropped (${framed.droppedIncomplete} events, incomplete-batch)`);
       }
     }
+    let fileStart = true;
     for (const l of framed.lines) {
       const prev = events[events.length - 1];
-      if (prev !== undefined && (l.event.seq !== prev.event.seq + 1 || !prev.event.last)) {
+      // Only the first line of a file is checked against the previous file's tail; inside a file `frameJournal` decides.
+      if (fileStart && prev !== undefined && (l.event.seq !== prev.event.seq + 1 || !prev.event.last)) {
         throw new ExecutorError("E_SEQ_GAP", `seq ${l.event.seq} follows ${prev.event.seq} across journal files`, { file: f.name });
       }
+      fileStart = false;
       events.push(l);
     }
   }
@@ -1496,6 +1499,11 @@ export function createLedgerStore(deps: LedgerStoreDeps): LedgerStore {
       } catch (e) {
         if (e instanceof ExecutorError && e.code === "E_LOCK_HELD") {
           throw new ExecutorError("E_EXISTS", `plan ${planId} is being created elsewhere`, { planId });
+        }
+        try {
+          await rmQuiet(fs, dir); // non-recursive: removes the directory this call created only while it is empty
+        } catch (cleanup) {
+          warn(`could not remove the empty plan directory ${dir}: ${errMessage(cleanup)}`);
         }
         throw e;
       }
