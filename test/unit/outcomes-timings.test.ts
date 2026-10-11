@@ -291,7 +291,7 @@ describe("timing recorder: duplicates and double outcomes", () => {
     rec.recordDispatchStart(startInput({ at: NOW + 1_000, callID: "second" }));
     await rec.flush();
     expect(timingRows()).toEqual([]); // not confirmed yet: the older call is still open
-    rec.bindChild("second", "child-1"); // the router's commit
+    rec.bindChild("second", "child-1"); // the host's result named the child
     await rec.flush(); // the older row is written in the background
     expect(timingRows()).toHaveLength(1);
     expect(timingRows()[0]).toMatchObject({ callID: "first", outcome: "unknown", startedAt: NOW, endedAt: NOW + 1_000, durationMs: 1_000 });
@@ -688,7 +688,7 @@ describe("timing recorder: keyed by callID (QA-1.1-1)", () => {
     rec.recordDispatchStart(startInput({ callID: "call-1", childSessionID: "child-r", at: NOW }));
     await rec.onExecutionOutcome("child-r", "evt-1", "succeeded", NOW + 1_000);
     expect(timingRows()).toHaveLength(1);
-    // Resume of the same child: the router knows its id only at commit.
+    // Resume of the same child: the router binds only at the result.
     clockNow = NOW + 5_000;
     rec.recordDispatchStart(startInput({ callID: "call-2", childSessionID: null, at: NOW + 5_000 }));
     await rec.onExecutionOutcome("child-r", "evt-2", "succeeded", NOW + 7_000); // ends before the result
@@ -704,7 +704,7 @@ describe("timing recorder: keyed by callID (QA-1.1-1)", () => {
     const rec = recorder();
     rec.recordDispatchStart(startInput({ callID: "call-1", childSessionID: "child-r", at: NOW }));
     rec.recordDispatchStart(startInput({ callID: "call-2", childSessionID: "child-r", at: NOW + 100 })); // the resume
-    rec.cancelStart("call-2"); // the hook chain rejected it
+    rec.cancelStart("call-2"); // the host rejected it (execute.after without a child)
     await rec.flush();
     expect(timingRows()).toEqual([]); // the live call was not closed
     await rec.onExecutionOutcome("child-r", "evt-1", "succeeded", NOW + 900);
@@ -718,7 +718,7 @@ describe("timing recorder: keyed by callID (QA-1.1-1)", () => {
     await rec.onExecutionOutcome("child-r", "evt-1", "succeeded", NOW + 300); // two open: the oldest closes
     expect(timingRows().map(r => r.callID)).toEqual(["call-1"]);
     rec.recordDispatchStart(startInput({ callID: "call-3", childSessionID: "child-r", at: NOW + 400 }));
-    rec.bindChild("call-3", "child-r"); // commit: call-2 ended without an outcome of its own
+    rec.bindChild("call-3", "child-r"); // result: call-2 ended without an outcome of its own
     await rec.flush();
     expect(timingRows().map(r => [r.callID, r.outcome, r.durationMs])).toEqual([
       ["call-1", "succeeded", 300],
@@ -796,11 +796,59 @@ describe("timing recorder: keyed by callID (QA-1.1-1)", () => {
   it("a capacity signal reaches the call through its bound child", async () => {
     const rec = recorder();
     rec.recordDispatchStart(startInput({ callID: "call-x", childSessionID: null }));
-    rec.onCapacitySignal("child-x", "rate-limit", NOW); // not bound yet: ignored
+    rec.onCapacitySignal("child-x", "rate-limit", NOW); // not bound yet: remembered, applied at the bind
     rec.bindChild("call-x", "child-x");
     rec.onCapacitySignal("child-x", "overload", NOW + 1);
     await rec.onExecutionOutcome("child-x", "evt-1", "failed", NOW + 2);
     expect(timingRows()[0]?.capacity).toBe("overload");
+  });
+
+  it("a fresh foreground dispatch keeps the capacity seen before its result binds the child (QA-1.1-27)", async () => {
+    const rec = recorder();
+    rec.recordDispatchStart(startInput({ callID: "call-x", childSessionID: null, at: NOW }));
+    rec.onCapacitySignal("child-c", "rate-limit", NOW + 100);
+    await rec.onExecutionOutcome("child-c", "evt-1", "failed", NOW + 200);
+    expect(timingRows()).toEqual([]);
+    rec.bindChild("call-x", "child-c");
+    await rec.flush();
+    expect(timingRows()).toMatchObject([{ callID: "call-x", childSessionID: "child-c", outcome: "failed", capacity: "rate-limit", durationMs: 200 }]);
+  });
+
+  it("background fan-out: capacity and outcomes follow the child even when the binds come in swapped order (QA-1.1-27)", async () => {
+    const rec = recorder();
+    rec.recordDispatchStart(startInput({ callID: "call-a", childSessionID: null, at: NOW, background: true }));
+    rec.recordDispatchStart(startInput({ callID: "call-b", childSessionID: null, at: NOW + 1, background: true }));
+    rec.onCapacitySignal("child-a", "overload", NOW + 50);
+    rec.onCapacitySignal("child-b", "usage-limit", NOW + 60);
+    await rec.onExecutionOutcome("child-b", "evt-b", "failed", NOW + 300);
+    await rec.onExecutionOutcome("child-a", "evt-a", "failed", NOW + 400);
+    rec.bindChild("call-b", "child-b");
+    rec.bindChild("call-a", "child-a");
+    await rec.flush();
+    const rows = timingRows().map(r => [r.callID, r.childSessionID, r.capacity, r.durationMs]);
+    expect(rows).toHaveLength(2);
+    expect(rows).toContainEqual(["call-a", "child-a", "overload", 400]);
+    expect(rows).toContainEqual(["call-b", "child-b", "usage-limit", 299]);
+  });
+
+  it("a capacity signal older than the start is not applied to it (QA-1.1-27)", async () => {
+    const rec = recorder();
+    rec.onCapacitySignal("child-c", "overload", NOW - 5_000); // belongs to an earlier dispatch
+    rec.recordDispatchStart(startInput({ callID: "call-x", childSessionID: null, at: NOW }));
+    rec.bindChild("call-x", "child-c");
+    await rec.onExecutionOutcome("child-c", "evt-1", "succeeded", NOW + 10);
+    expect(timingRows()[0]?.capacity).toBeNull();
+  });
+
+  it("resume of a finished child linked at start: the row is written at the outcome and a later bind is ignored (QA-1.1-27)", async () => {
+    const rec = recorder();
+    rec.recordDispatchStart(startInput({ callID: "call-y", childSessionID: "child-c", at: NOW }));
+    await rec.onExecutionOutcome("child-c", "evt-1", "succeeded", NOW + 500);
+    expect(timingRows()).toMatchObject([{ callID: "call-y", childSessionID: "child-c", durationMs: 500 }]);
+    rec.bindChild("call-y", "child-c"); // the call is closed: ignored
+    await rec.flush();
+    expect(timingRows()).toHaveLength(1);
+    expect(logger.warns).toEqual([]);
   });
 
   it("a start that never got a child writes no row when swept", async () => {

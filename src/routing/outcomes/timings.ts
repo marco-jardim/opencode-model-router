@@ -98,7 +98,7 @@ export interface TimingRecorder {
    */
   recordDispatchStart(input: DispatchStartInput): void;
   /**
-   * Confirms which child session runs the open `callID` (the router's commit point). Re-callable (the last child wins).
+   * Confirms which child session runs the open `callID` (the host's result named the child). Re-callable (the last child wins).
    * Every OLDER open call of that child is closed as `unknown` at this call's start. An outcome that arrived for the child
    * before it was bound (remembered, see {@link MAX_UNBOUND_OUTCOMES}) is applied when its time is not before the start.
    * Unknown `callID`: ignored.
@@ -115,7 +115,9 @@ export interface TimingRecorder {
    * was closed, and a seen id is ignored.
    */
   onExecutionOutcome(childSessionID: string, eventId: string, outcome: DispatchTimingOutcome, at: number): Promise<void>;
-  /** Records the latest provider capacity class on the OPEN timing of `childSessionID`; the row carries it. Ignored once closed. */
+  /** Records the latest provider capacity class on the OPEN timing of `childSessionID`; the row carries it. Ignored once closed. A child with no open linked call: the latest signal is
+   * remembered (same bound and TTL as remembered outcomes) and applied by {@link bindChild} when its time is not before the start.
+   */
   onCapacitySignal(childSessionID: string, capacity: DispatchCapacity, at: number): void;
   /** Declares `sessionID` a root (orchestrator) session: its steps are aggregated into turns. Idempotent; refreshes its recency. */
   markRootSession(sessionID: string): void;
@@ -158,6 +160,16 @@ interface UnboundOutcome {
   readonly eventId: string;
   readonly outcome: DispatchTimingOutcome;
   /** The outcome's own time (epoch ms). */
+  readonly at: number;
+  /** When it was remembered (epoch ms of the recorder's clock), for the TTL. */
+  readonly storedAt: number;
+}
+
+/** A capacity signal delivered for a child that had no open linked call. */
+interface UnboundCapacity {
+  readonly child: string;
+  readonly capacity: DispatchCapacity;
+  /** The signal's own time (epoch ms). */
   readonly at: number;
   /** When it was remembered (epoch ms of the recorder's clock), for the TTL. */
   readonly storedAt: number;
@@ -239,6 +251,8 @@ export function createTimingRecorder(options: TimingRecorderOptions): TimingReco
   const childCalls = new Map<string, string[]>();
   /** Outcomes of children that had no open start (insertion order = age), kept for a later `bindChild`. */
   const unbound: UnboundOutcome[] = [];
+  /** Latest capacity signal per child that had no open linked call (insertion order = age), kept for a later `bindChild`. */
+  const unboundCapacity: UnboundCapacity[] = [];
   const seenEvents = new Set<string>();
   const roots = new Map<string, RootTurn>();
   const warned = new Set<string>();
@@ -305,6 +319,15 @@ export function createTimingRecorder(options: TimingRecorderOptions): TimingReco
       if (oldest === undefined) return;
       if (unbound.length <= MAX_UNBOUND_OUTCOMES && t - oldest.storedAt <= UNBOUND_OUTCOME_TTL_MS) return;
       unbound.shift();
+    }
+  }
+
+  function pruneUnboundCapacity(t: number): void {
+    for (;;) {
+      const oldest = unboundCapacity[0];
+      if (oldest === undefined) return;
+      if (unboundCapacity.length <= MAX_UNBOUND_OUTCOMES && t - oldest.storedAt <= UNBOUND_OUTCOME_TTL_MS) return;
+      unboundCapacity.shift();
     }
   }
 
@@ -467,6 +490,13 @@ export function createTimingRecorder(options: TimingRecorderOptions): TimingReco
           if (row !== null) olderRows.push(row);
         }
         if (olderRows.length > 0) void appendTimingRows(olderRows);
+        // A capacity signal that arrived before the bind (a fresh foreground dispatch) belongs to this call, if not older than it.
+        pruneUnboundCapacity(t);
+        const capIndex = unboundCapacity.findIndex((item) => item.child === childSessionID && item.at >= entry.startedAt);
+        if (capIndex >= 0) {
+          const [signal] = unboundCapacity.splice(capIndex, 1);
+          if (signal !== undefined) entry.capacity = signal.capacity;
+        }
         // An outcome that arrived before the bind (a foreground resume ending before its result) closes this call now.
         pruneUnbound(t);
         const index = unbound.findIndex((item) => item.child === childSessionID && item.at >= entry.startedAt);
@@ -531,10 +561,20 @@ export function createTimingRecorder(options: TimingRecorderOptions): TimingReco
       }
     },
 
-    onCapacitySignal(childSessionID: string, capacity: DispatchCapacity, _at: number): void {
+    onCapacitySignal(childSessionID: string, capacity: DispatchCapacity, at: number): void {
       try {
         const found = oldestOpen(childSessionID);
-        if (found !== undefined) found.entry.capacity = capacity;
+        if (found !== undefined) {
+          found.entry.capacity = capacity;
+          return;
+        }
+        // QA-1.1-27: a child without an open linked call (a fresh foreground dispatch, bound only at its result) is remembered.
+        if (typeof childSessionID !== "string" || childSessionID === "") return;
+        const t = clock();
+        const previous = unboundCapacity.findIndex((item) => item.child === childSessionID);
+        if (previous >= 0) unboundCapacity.splice(previous, 1); // the latest signal per child wins
+        unboundCapacity.push({ child: childSessionID, capacity, at: stamp(at), storedAt: t });
+        pruneUnboundCapacity(t);
       } catch (error) {
         warnOnce("internal", "[router] timing recorder failed to record a capacity signal", error);
       }
