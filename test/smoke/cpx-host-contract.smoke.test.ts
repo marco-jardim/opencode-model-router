@@ -1,4 +1,4 @@
-/** CPX Phase 0.1 (task 0.1.2): OpenCode v2 host-contract OBSERVATION smoke. Part 1: scaffolding + contracts C1-C5.
+/** CPX Phase 0.1 (task 0.1.2): OpenCode v2 host-contract OBSERVATION smoke. Parts 1-2: scaffolding + contracts C1-C10.
  *
  *   RUN_OC_SMOKE_CPX=1 OPENCODE_V2_BIN=<abs path to opencode 2> npm run smoke:cpx
  *
@@ -28,7 +28,7 @@ import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { removeDirWhenReleased } from "../helpers/remove-dir";
-import type { CpxFront, CpxRequest } from "./helpers/cpx-scripted-provider";
+import type { CpxFront, CpxRequest, FaultKind } from "./helpers/cpx-scripted-provider";
 import {
   RoutingHost, ROOT, agentWithoutModel, arr, clip, obj, redact, stopAllHosts, str, waitFor, type Dispatched, type HostOptions, type Obj,
 } from "./helpers/routing-host";
@@ -49,7 +49,7 @@ const CHILD_ENDED = new Set(["session.execution.succeeded", "session.execution.f
 /** Verification off, so the router does not rewrite `background: true` into a foreground call (role-spikes S6B); engine shadow as everywhere. */
 const BASE: HostOptions = { routing: { engine: "shadow" }, overrides: { enforcement: { mode: "off" } }, hostConfig: { agents: { [CHILD]: agentWithoutModel() } } };
 
-type ProbeMode = "rewrite-completion" | "append-tail-system" | "append-tail-user" | "append-tail-newest";
+type ProbeMode = "rewrite-completion" | "append-tail-system" | "append-tail-user" | "append-tail-newest" | "cache-hint-1h" | "filter-grep";
 /** One probe JSON line: `{ t, kind, ...fields }` (see cpx-probe-plugin.js). */
 interface ProbeLine extends Obj { t: number; kind: string }
 
@@ -236,6 +236,11 @@ async function observeWake(s: Scenario, bg: Bg, ms: number): Promise<CpxRequest 
   if (woke) await s.host.settle(bg.root);
   return woke;
 }
+
+/** Probe lines of the given kinds about one session (`sessionID` field). */
+const linesOf = (lines: readonly ProbeLine[], session: string | undefined, ...kinds: string[]): ProbeLine[] => lines.filter(l => l.sessionID === session && (kinds.length === 0 || kinds.includes(l.kind)));
+/** A probe line reduced to what identifies it (kind, time, ids, the event's scalar data and error). */
+const lineBrief = (l: ProbeLine): Obj => ({ kind: l.kind, t: l.t, eventID: l.eventID, sessionID: l.sessionID, parentID: l.parentID, agent: l.agent, data: l.data, error: l.error });
 
 const executeAfterOf = (lines: readonly ProbeLine[], callID: string): ProbeLine[] => lines.filter(l => l.kind === "execute.after" && l.tool === "subagent" && l.callID === callID);
 
@@ -427,4 +432,313 @@ d("C5 context-hook tail: sent to the provider, not persisted, earlier prefix byt
       }
     });
   }, 600_000);
+});
+
+// ------------------------------------------------------------------ batch 2 helpers ----
+/** Every object key matching `key` anywhere in `value`, with its JSON path and value. */
+function findKeys(value: unknown, key: RegExp, at = "$", out: Obj[] = []): Obj[] {
+  if (Array.isArray(value)) value.forEach((v, i) => findKeys(v, key, `${at}[${i}]`, out));
+  else if (value !== null && typeof value === "object") {
+    for (const [k, v] of Object.entries(value)) {
+      if (key.test(k)) out.push({ path: `${at}.${k}`, value: v });
+      findKeys(v, key, `${at}.${k}`, out);
+    }
+  }
+  return out;
+}
+/** JSON paths of every string value matching `re`. */
+function stringPaths(value: unknown, re: RegExp, at = "$", out: string[] = []): string[] {
+  if (typeof value === "string") { if (re.test(value)) out.push(at); } else if (Array.isArray(value)) value.forEach((v, i) => stringPaths(v, re, `${at}[${i}]`, out));
+  else if (value !== null && typeof value === "object") for (const [k, v] of Object.entries(value)) stringPaths(v, re, `${at}.${k}`, out);
+  return out;
+}
+/** Waits (bounded) until the session has left the host's active set; `undefined` when it is still active. */
+const waitIdle = (host: RoutingHost, session: string, ms: number): Promise<true | undefined> => tryWait(`${session} to leave the active set`, async () => (Object.hasOwn(await host.client.session.active(), session) ? undefined : true), ms);
+/** First probe line of a terminal execution event for `session` (optionally only lines after `since`). */
+const terminalOf = (lines: readonly ProbeLine[], session: string, since = 0): ProbeLine | undefined => lines.find(l => CHILD_ENDED.has(l.kind) && l.sessionID === session && l.t >= since);
+
+// ---------------------------------------------------------------------------- C6 ----
+d("C6 one-hour cache hint set by a plugin in the context hook", () => {
+  it("records what the probe tried and every cache_control the provider request carries", async () => {
+    await observeContract("C6", async o => {
+      await withHost("C6", "cache-hint-1h", o, async s => {
+        const { arrivals } = instrument(s.host);
+        const root = await s.host.newRoot("C6 root");
+        await s.host.prompt(root, "C6 first turn");
+        await s.host.prompt(root, "C6 second turn");
+        const lines = await probeLines(s.probeFile);
+        const hints = lines.filter(l => l.kind === "cache-hint-1h");
+        const shape = lines.find(l => l.kind === "context-shape");
+        o.relied.push(...hints.slice(0, 2), ...(shape ? [shape] : []));
+        const requests = parentRequests(s.host, root);
+        const views = requests.map(r => {
+          const body = obj(r.body);
+          const occurrences = findKeys(body, /^cache_?control$/i);
+          return {
+            index: r.index, arrivedAt: arrivals.get(r.index), anthropicBeta: hdr(r, "anthropic-beta"), topLevelKeys: Object.keys(body),
+            systemType: Array.isArray(body.system) ? "array" : typeof body.system, systemBlocks: arr(body.system).length,
+            cacheControl: occurrences, ttl: findKeys(body, /^ttl$/), oneHourStrings: stringPaths(body, /^1h$/),
+            systemCacheControl: occurrences.filter(c => String(c.path).startsWith("$.system")),
+            oneHourOnSystem: occurrences.some(c => String(c.path).startsWith("$.system") && /"ttl":"1h"/.test(json(c.value))),
+          };
+        });
+        o.observed.probeTried = hints.map(l => ({ requestNo: l.requestNo, did: l.did, via: l.via, set: l.set, partKeys: l.partKeys, reason: l.reason }));
+        o.observed.contextShape = shape ? { eventKeys: shape.eventKeys, systemPartKeys: shape.systemPartKeys, messageKeys: shape.messageKeys, partKeys: shape.partKeys, optionKeys: shape.optionKeys } : null;
+        o.observed.requests = views;
+        o.observed.providerCarriesOneHourOnSystem = views.some(v => v.oneHourOnSystem);
+        o.observed.providerCarriesOneHourAnywhere = views.some(v => v.cacheControl.some(c => /"ttl":"1h"/.test(json(c.value))) || v.oneHourStrings.length > 0);
+      });
+    });
+  }, 300_000);
+});
+
+// ---------------------------------------------------------------------------- C7 ----
+/** `<subagent sessionID="…" state="…">` pairs found in the JSON text of stored messages (quotes may be JSON-escaped). */
+const envelopeStates = (value: unknown): Obj[] => [...json(value).matchAll(/<subagent\s+sessionID=\\?"([^"\\]+)\\?"\s+state=\\?"([^"\\]+)\\?"/g)].map(m => ({ sessionID: m[1], state: m[2] }));
+const textsOf = (m: Obj): string[] => findKeys(m, /^(text|content|output)$/).map(k => k.value).filter((v): v is string => typeof v === "string");
+
+d("C7 child terminal events carry the child id; the context reads back the final text", () => {
+  it("records succeeded / failed / interrupted children: events, retries, context text", async () => {
+    await observeContract("C7", async o => {
+      await withHost("C7", undefined, o, async s => {
+        const { host } = s;
+        const { arrivals } = instrument(host);
+        host.provider.holdMarked("C7_HOLD", 8_000);
+        const root = await host.newRoot("C7 root");
+        // Failure mechanism: the fixture answers HTTP 400 `invalid_request_error` (non-retryable) when a request asks for a tool the child does not advertise:
+        // `SPIKE_DELEGATE=` in the child's prompt makes it request `delegate` (RoutingProvider.handle). Whether the child advertises `delegate` is recorded.
+        const child = (token: string, extra = ""): Obj => ({ agent: CHILD, description: `C7 ${token}`, prompt: `C7_HOLD ${token}${extra}`, model: `${SONNET}#low`, background: true });
+        const calls = await host.callMany(root, [child("C7_OK"), child("C7_FAIL", " SPIKE_DELEGATE={\"x\":1}"), child("C7_INT")]);
+        const ids = Object.fromEntries(["C7_OK", "C7_FAIL", "C7_INT"].map(token => [token, calls.find(c => str(obj(c.before.input).prompt)?.includes(token))?.childID]));
+        o.observed.children = ids;
+        const intID = ids.C7_INT;
+        if (!intID) throw new Error("no child sessionID for C7_INT in the acknowledgement");
+        const held = await tryWait("the interrupt child's held provider request", () => host.provider.holds.find(h => h.session === intID && h.releasedAt === undefined), 30_000);
+        const interruptAt = Date.now();
+        let interruptResult: unknown;
+        let interruptError: string | undefined;
+        try { interruptResult = await host.client.session.interrupt({ sessionID: intID }); } catch (error) { interruptError = String(error); }
+        o.observed.interrupt = { api: "host.client.session.interrupt({ sessionID })", heldWhenCalled: held !== undefined, calledAt: interruptAt, result: clip(interruptResult, 500), error: interruptError };
+        const perChild: Obj = {};
+        for (const [token, id] of Object.entries(ids)) {
+          if (!id) { perChild[token] = { error: "no sessionID" }; continue; }
+          const end = await tryWait(`terminal execution event of ${token}`, async () => terminalOf(await probeLines(s.probeFile), id), 90_000);
+          if (end) o.relied.push(end);
+          const lines = linesOf(await probeLines(s.probeFile), id);
+          const context = await host.client.session.context({ sessionID: id });
+          const finalMessage = context.at(-1);
+          const info = await host.client.session.get({ sessionID: id }).then(g => ({ outcome: g.outcome, cost: g.cost, tokens: g.tokens, agent: g.agent, parentID: g.parentID }), error => ({ error: String(error) }));
+          const requests = front(host).requests.filter(r => hdr(r, "x-proof-session") === id);
+          perChild[token] = {
+            sessionID: id, terminal: end ? { kind: end.kind, t: end.t, eventID: end.eventID, sessionID: end.sessionID, parentID: end.parentID, agent: end.agent, data: end.data, error: end.error } : null,
+            allProbeLines: lines.map(lineBrief), eventTypes: (await host.eventsOf(id)).map(e => e.type), session: info,
+            context: { messageCount: context.length, finalMessage: clip(finalMessage, 800), finalTexts: finalMessage ? textsOf(finalMessage).map(t => t.slice(0, 300)) : [], containsChildOk: json(context).includes("CHILD_OK"), roles: context.map(m => str(m.role) ?? str(m.type)) },
+            providerRequests: requests.map(r => ({ index: r.index, arrivedAt: arrivals.get(r.index), served: r.served, toolNames: arr(obj(r.body).tools).map(t => str(obj(t).name)) })),
+          };
+        }
+        o.observed.perChild = perChild;
+        o.observed.fixtureErrors = host.provider.errors.map(e => e.slice(0, 300));
+        // The parent: which completion envelopes (and states) did it get?
+        const stored = await tryWait("three completion envelopes in the parent", async () => { const v = await storedView(host, root); return envelopeStates(v.envelopes).length >= 3 ? v : undefined; }, 30_000);
+        const view = stored ?? await storedView(host, root);
+        o.observed.parentCompletions = { allThreeStored: stored !== undefined, states: envelopeStates(view.envelopes), envelopes: view.envelopes };
+        o.observed.rootIdle = (await waitIdle(host, root, 30_000)) === true;
+      });
+    });
+  }, 600_000);
+});
+
+// ---------------------------------------------------------------------------- C8 ----
+interface BackgroundApi { background(input: { sessionID: string }): Promise<void> }
+/** `host.client.session.background` (@opencode/client SessionBackgroundInput = { sessionID }); absent from the harness's HostClient type, so it is looked up at run time. */
+function backgroundApi(host: RoutingHost): BackgroundApi | undefined {
+  const session: object = host.client.session;
+  const method: unknown = Reflect.get(session, "background");
+  if (typeof method !== "function") return undefined;
+  return { background: async input => { await Reflect.apply(method, session, [input]); } };
+}
+const sansIDs = (value: unknown): string => json(value).replace(/ses_[A-Za-z0-9]+/g, "<id>");
+
+d("C8 a user-backgrounded running subagent gets the same running acknowledgement", () => {
+  it("moves a held foreground subagent to the background through the client and records its execute.after", async () => {
+    await observeContract("C8", async o => {
+      await withHost("C8", undefined, o, async s => {
+        const { host } = s;
+        host.provider.holdMarked("C8_HOLD", 6_000);
+        const root = await host.newRoot("C8 root");
+        const api = backgroundApi(host);
+        o.observed.api = { found: api !== undefined, via: "host.client.session.background({ sessionID })", sessionMethods: Object.keys(host.client.session), looked: ["host.client.session (runtime)", "@opencode/client dist/promise/generated/client.d.ts:79 SessionBackgroundInput", "no HTTP post helper on RoutingHost (getJson is GET only)"] };
+        const input = { agent: CHILD, description: "C8 foreground", prompt: "C8_HOLD foreground child", model: `${SONNET}#low`, background: false };
+        await host.client.session.prompt({ sessionID: root, text: `SPIKE_CALL=${JSON.stringify(input)}` });
+        const before = await waitForProbe(s.probeFile, "execute.before of the foreground subagent", ls => ls.find(l => l.kind === "execute.before" && l.tool === "subagent" && l.sessionID === root), 30_000);
+        const held = await tryWait("the foreground child's held provider request", () => host.provider.holds.find(h => h.session !== undefined && h.session !== root && h.releasedAt === undefined), 30_000);
+        const childID = held?.session;
+        const callID = str(before.callID) ?? "";
+        const calledAt = Date.now();
+        const attempts: Obj[] = [];
+        if (api) {
+          for (const [target, id] of [["parent", root], ["child", childID]] as const) {
+            if (!id) continue;
+            try { await api.background({ sessionID: id }); attempts.push({ target, sessionID: id, ok: true }); break; } catch (error) { attempts.push({ target, sessionID: id, ok: false, error: String(error) }); }
+          }
+        }
+        const after = await tryWait("execute.after of the foreground subagent call", async () => executeAfterOf(await probeLines(s.probeFile), callID)[0], 60_000);
+        const childEnd = childID ? await tryWait(`terminal execution event of ${childID}`, async () => terminalOf(await probeLines(s.probeFile), childID), 60_000) : undefined;
+        if (after) o.relied.push(after);
+        const harnessAfter = (await host.hooks()).filter(h => h.hook === "after" && h.callID === callID);
+        o.observed.background = {
+          callID, childID, heldWhenMoved: held !== undefined, calledAt, attempts, apiAbsent: api === undefined,
+          executeAfter: after ? { ...lineBrief(after), status: after.status, resultStatus: after.resultStatus, resultSessionID: after.resultSessionID, resultKeys: after.resultKeys, contentText: after.contentText, outputText: after.outputText, afterMs: after.t - calledAt } : null,
+          harnessAfterCount: harnessAfter.length, harnessResult: clip(harnessAfter[0]?.result, 1200), childEndAt: childEnd?.t,
+          afterBeforeChildEnd: after && childEnd ? after.t < childEnd.t : undefined,
+        };
+        await waitIdle(host, root, 60_000);
+        // Control: the C1 style background:true call with the same fixtures; is its acknowledgement the same?
+        const root2 = await host.newRoot("C8 control root");
+        const control = await host.call(root2, "subagent", { ...input, description: "C8 control", prompt: "C8_HOLD control child", background: true });
+        const controlOutput = obj(control.after.result?.output);
+        const movedOutput = obj(harnessAfter[0]?.result?.output);
+        o.observed.comparisonWithC1Ack = {
+          controlResult: clip(control.after.result, 1000), controlStatus: controlOutput.status, movedStatus: movedOutput.status,
+          sameStatus: controlOutput.status === movedOutput.status, sameShapeModuloIds: sansIDs(control.after.result) === sansIDs(harnessAfter[0]?.result),
+        };
+        await awaitChildEnd(s, control.childID, o);
+        await waitIdle(host, root2, 60_000);
+      });
+    });
+  }, 600_000);
+});
+
+// ---------------------------------------------------------------------------- C9 ----
+const PATH_TOOLS = new Set(["glob", "grep", "list"]);
+/** The tool input for the scripted call: keys are taken from the advertised schema (`props`) when the host lists the tool, else the common names. */
+function toolInput(tool: string, props: readonly string[], project: string): Obj {
+  const pick = (...names: string[]): string => names.find(n => props.includes(n)) ?? names[0]!;
+  const input: Obj = {};
+  const file = path.join(project, tool === "write" ? "written.txt" : tool === "edit" || tool === "multiedit" ? "edit-me.txt" : "visible.txt");
+  if (tool === "router_run") return { script: "typecheck", cwd: project };
+  input[pick("filePath", "file_path", "path")] = PATH_TOOLS.has(tool) ? project : file;
+  if (tool === "glob") input[pick("pattern")] = "*.txt";
+  if (tool === "grep") input[pick("pattern")] = "row";
+  if (tool === "write") input[pick("content")] = "written by C9\n";
+  if (tool === "edit") { input[pick("oldString", "old_string")] = "alpha"; input[pick("newString", "new_string")] = "beta"; }
+  if (tool === "multiedit") input[pick("edits")] = [{ oldString: "alpha", newString: "beta" }];
+  if (tool === "patch" || tool === "apply_patch") return { [pick("patchText", "patch", "input")]: "*** Begin Patch\n*** End Patch" };
+  return input;
+}
+/** Text of the tool_result blocks in the LAST message of a provider request: what the model was handed back. */
+function toolResultText(r: CpxRequest): string {
+  const last = bodyMessages(r).at(-1);
+  return arr(last?.content).map(obj).filter(b => b.type === "tool_result").map(b => (typeof b.content === "string" ? b.content : arr(b.content).map(c => str(obj(c).text) ?? "").join("\n"))).join("\n");
+}
+
+d("C9 tool hooks: execute.before paths, execute.after result rewriting", () => {
+  it("drives read/write/edit/glob/grep/list/router_run (and multiedit/patch/apply_patch if advertised) and records the args and the filtered results", async () => {
+    await observeContract("C9", async o => {
+      await withHost("C9", "filter-grep", o, async s => {
+        const { host } = s;
+        const project = host.project;
+        await writeFile(path.join(project, "CPX_LEASED-a.txt"), "other content\n");
+        await writeFile(path.join(project, "visible.txt"), "CPX_LEASED row\nkept row\n");
+        await writeFile(path.join(project, "edit-me.txt"), "alpha\n");
+        await mkdir(path.join(project, "sub"), { recursive: true });
+        await writeFile(path.join(project, "sub", "inner.txt"), "inner row\n");
+        const root = await host.newRoot("C9 root");
+        await host.prompt(root, "C9 warmup"); // the first request lists the tools the host advertises
+        const defs = new Map(arr(obj(parentRequests(host, root)[0]?.body).tools).map(obj).map(t => [str(t.name) ?? "", Object.keys(obj(obj(t.input_schema).properties))] as const));
+        o.observed.advertisedTools = Object.fromEntries(defs);
+        const wanted = ["read", "write", "edit", "glob", "grep", "list", "router_run", ...["multiedit", "patch", "apply_patch"].filter(t => defs.has(t))];
+        const perTool: Obj = {};
+        o.observed.perTool = perTool;
+        for (const tool of wanted) {
+          const input = toolInput(tool, defs.get(tool) ?? [], project);
+          const startedAt = Date.now();
+          let promptError: string | undefined;
+          try { await host.prompt(root, `READ_ONLY_PROBE=${JSON.stringify({ tool, input })}`); } catch (error) { promptError = String(error); }
+          const lines = (await probeLines(s.probeFile)).filter(l => l.tool === tool && l.sessionID === root && l.t >= startedAt);
+          const before = lines.find(l => l.kind === "execute.before");
+          const after = lines.find(l => l.kind === "execute.after");
+          const filter = after ? (await probeLines(s.probeFile)).find(l => l.kind === "filter-grep" && l.callID === after.callID) : undefined;
+          o.relied.push(...[before, after, filter].filter((l): l is ProbeLine => l !== undefined));
+          const seen = parentRequests(host, root).filter(r => lastIsToolResult(r)).at(-1);
+          const modelText = seen ? toolResultText(seen) : undefined;
+          perTool[tool] = {
+            advertised: defs.has(tool), inputSent: input, promptError,
+            executeBefore: before ? { argKeys: before.argKeys, args: before.args, agent: before.agent } : null,
+            executeAfter: after ? { status: after.status, resultKeys: after.resultKeys, contentText: after.contentText, outputText: after.outputText, error: after.error } : null,
+            filter: filter ? { mutable: filter.mutable, removedLines: filter.removedLines, error: filter.error, note: filter.note } : null,
+            modelSaw: modelText === undefined ? null : { text: modelText.slice(0, 500), containsLeased: modelText.includes("CPX_LEASED"), containsHiddenNote: modelText.includes("[cpx: 1 hidden]"), requestIndex: seen?.index },
+            probeSawLeasedBeforeFilter: after ? json([after.contentText, after.outputText]).includes("CPX_LEASED") : undefined,
+          };
+        }
+        o.observed.fixtureErrors = host.provider.errors.map(e => e.slice(0, 300));
+      });
+    });
+  }, 900_000);
+});
+
+// --------------------------------------------------------------------------- C10 ----
+interface FaultCase { name: string; kind: FaultKind; mode: "once" | "persistent" | "until-reset"; capMs: number }
+const FAULT_CASES: readonly FaultCase[] = [
+  { name: "rate-limit-once", kind: "rate-limit", mode: "once", capMs: 90_000 },
+  { name: "overloaded-once", kind: "overloaded", mode: "once", capMs: 90_000 },
+  { name: "rate-limit-persistent", kind: "rate-limit", mode: "persistent", capMs: 75_000 },
+  { name: "overloaded-persistent", kind: "overloaded", mode: "persistent", capMs: 75_000 },
+  { name: "usage-limit-until-reset", kind: "usage-limit", mode: "until-reset", capMs: 120_000 },
+];
+const RESET_AHEAD_MS = 10_000;
+
+d("C10 provider errors: 429, 529 and usage limit", () => {
+  it("queues faults on the root's requests and records retries, backoff, events and whether the turn completes", async () => {
+    await observeContract("C10", async o => {
+      const cases: Obj = {};
+      o.observed.cases = cases;
+      for (const c of FAULT_CASES) {
+        await withHost(`C10-${c.name}`, undefined, o, async s => {
+          const { host } = s;
+          const { arrivals } = instrument(host);
+          const root = await host.newRoot(`C10 ${c.name} root`);
+          const resetAtMs = Date.now() + RESET_AHEAD_MS;
+          const mine = (r: CpxRequest): boolean => hdr(r, "x-proof-session") === root && hdr(r, "x-proof-kind") === "primary";
+          // once: one failure; persistent: every root request fails until the cap; until-reset: every root request fails until resetAt has passed.
+          front(host).failWhen(r => mine(r) && (c.mode !== "until-reset" || Date.now() < resetAtMs), c.kind, {
+            times: c.mode === "once" ? 1 : Infinity, retryAfterSeconds: 2, ...(c.kind === "usage-limit" ? { resetAt: new Date(resetAtMs) } : {}),
+          });
+          const promptedAt = Date.now();
+          await host.client.session.prompt({ sessionID: root, text: "C10 turn" });
+          const outcome = (lines: readonly ProbeLine[]) => lines.find(l => l.sessionID === root && l.t >= promptedAt && CHILD_ENDED.has(l.kind));
+          const terminal = await tryWait(`terminal execution event of the ${c.name} root`, async () => outcome(await probeLines(s.probeFile)), c.capMs);
+          let stillRetrying = false;
+          if (!terminal) {
+            stillRetrying = true;
+            front(host).clearFaults();
+            await host.client.session.interrupt({ sessionID: root });
+          }
+          const idle = await waitIdle(host, root, 60_000);
+          const lines = (await probeLines(s.probeFile)).filter(l => l.sessionID === root && l.t >= promptedAt && l.kind.startsWith("session."));
+          o.relied.push(...lines.filter(l => l.kind === "session.step.failed" || CHILD_ENDED.has(l.kind)));
+          const requests = front(host).requests.filter(mine);
+          const stored = await host.client.session.context({ sessionID: root });
+          const events = (await host.events()).filter(e => obj(e.data).sessionID === root && !/(delta|streamed)/.test(e.type));
+          cases[c.name] = {
+            kind: c.kind, mode: c.mode, capMs: c.capMs, promptedAt, resetAt: c.kind === "usage-limit" ? new Date(resetAtMs).toISOString() : undefined,
+            outcome: stillRetrying ? "still retrying at the cap (faults cleared, root interrupted)" : terminal?.kind, rootIdleAfter: idle === true,
+            turnCompleted: json(stored).includes("CHILD_OK"), terminal: terminal ? lineBrief(terminal) : null,
+            providerRequests: requests.map((r, i) => {
+              const at = arrivals.get(r.index);
+              const prev = i > 0 ? arrivals.get(requests[i - 1]!.index) : promptedAt;
+              return { index: r.index, arrivedAt: at, sincePreviousMs: at !== undefined && prev !== undefined ? at - prev : undefined, served: r.served };
+            }),
+            requestCount: requests.length, faultsServed: requests.filter(r => r.served !== "forwarded" && r.served !== undefined).length,
+            succeededAfterReset: c.kind === "usage-limit" ? requests.some(r => r.served === "forwarded" && (arrivals.get(r.index) ?? 0) >= resetAtMs) : undefined,
+            stepFailed: lines.filter(l => l.kind === "session.step.failed").map(lineBrief),
+            probeSessionLines: lines.map(l => ({ kind: l.kind, t: l.t, error: l.error })),
+            hostEvents: events.slice(0, 60).map(e => ({ type: e.type, created: e.created, data: clip(e.data, 400) })),
+            hostLogLines: host.tail(150_000).split(/\r?\n/).filter(line => /retr|429|529|overload|rate.?limit|usage/i.test(line)).slice(-30).map(line => line.slice(0, 300)),
+            frontErrors: front(host).frontErrors,
+          };
+        });
+      }
+    });
+  }, 1_500_000);
 });
