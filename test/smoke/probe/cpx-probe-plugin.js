@@ -9,9 +9,10 @@
  *                          Unset: nothing is recorded and no mode mutates anything.
  *   CPX_PROBE_MODE         at most one mutation mode (unset / empty: observe only). An unknown value records a "probe-error"
  *                          line and the probe observes only.
- *   CPX_PROBE_RELAUNCH_MS  retained-launch only: launch a second batch of three children this many ms after the first.
+ *   CPX_PROBE_RELAUNCH_MS  retained-launch only: launch a second batch of children (same count) this many ms after the first.
+ *   CPX_PROBE_RETAINED_COUNT retained-launch only, optional: children per batch, an integer 1..32 (default 3, anything else: 3).
  *   CPX_PROBE_CHILD_PROMPT retained-launch only, optional: prompt of the launched children, `{n}` replaced by the child number
- *                          (1..3). Unset: "CPX_RETAINED_CHILD <n>". Lets a harness script a tool call in the children's own turn.
+ *                          (1..CPX_PROBE_RETAINED_COUNT). Unset: "CPX_RETAINED_CHILD <n>". Lets a harness script a tool call in the children's own turn.
  *   CPX_PROBE_TOOL_URL     retained-launch only, optional: file URL of a module exporting `tool` (from @opencode-ai/plugin),
  *                          used to build the input schema of `cpx_probe_capture` when the bare specifier does not resolve.
  *
@@ -33,7 +34,7 @@
  *   filter-grep            execute.after of grep / glob: drop result lines containing CPX_LEASED, append "[cpx: 1 hidden]".
  *   rewrite-compaction     compaction hook: CPX_HELD_ORIGINAL -> CPX_HELD_PLACEHOLDER in the messages / system parts.
  *   retained-launch        registers tool cpx_probe_capture (no args, returns "captured") that retains its tool context; when the
- *                          turn that called it ends, starts THREE concurrent native `subagent` children with that retained context
+ *                          turn that called it ends, starts CPX_PROBE_RETAINED_COUNT (default THREE) concurrent native `subagent` children with that retained context
  *                          (the way src/compat/v2-client.ts does), and again after CPX_PROBE_RELAUNCH_MS if set.
  */
 import { appendFileSync } from "node:fs";
@@ -404,6 +405,8 @@ export default {
       }
     };
 
+    const requestedCount = Number(process.env.CPX_PROBE_RETAINED_COUNT);
+    const retainedCount = Number.isInteger(requestedCount) && requestedCount >= 1 && requestedCount <= 32 ? requestedCount : 3;
     const childPromptTemplate = process.env.CPX_PROBE_CHILD_PROMPT;
     const childPrompt = (n) => (childPromptTemplate && childPromptTemplate.length > 0 ? childPromptTemplate.split("{n}").join(String(n)) : `CPX_RETAINED_CHILD ${n}`);
 
@@ -423,7 +426,7 @@ export default {
         return;
       }
       rec("retained-launch-batch", { batch, label, parentID, agent: chosen.agent, agents: chosen.available, agentError: chosen.error, contextKeys: Object.keys(context) });
-      await Promise.allSettled([1, 2, 3].map(async (n) => {
+      await Promise.allSettled(Array.from({ length: retainedCount }, (_, i) => i + 1).map(async (n) => {
         const id = `${batch}.${n}`;
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 300000);
