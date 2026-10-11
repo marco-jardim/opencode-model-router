@@ -333,13 +333,22 @@ Everything else is work: resolve it, record it, continue.
 
 ## 7. Live state (§0.11 — keep current)
 
-**Next action:** Wave 2 — pre-flight and design for 2.1, 2.2, 2.3, 2.4 in `D:\git\omr-cpx-p21`…`p24` (branches `cpx/p21`…`cpx/p24`, base tags `cpx/p2x-base` = `558e5b8`). Then DF-1 after 2.1.
+**Next action (paused 2026-10-11 ≈11:30 for an owner shutdown; resume with the fan-out below):** Wave 2 in flight. All four phase branches are pushed and clean: `cpx/p21` @ `bc0a9b4`, `cpx/p22` @ `073e5bf`, `cpx/p23` @ `6d1c994`, `cpx/p24` @ `0b73acc`. `cpx/main` @ this commit.
+
+**Resume fan-out (dispatch in parallel, one message; every dispatch says "alternate one read, one edit"):**
+1. **2.1 — QA round 1 (heavy reviewer), re-run from scratch** at `bc0a9b4` (the running one, `ses_ed4d06f56ffeWxa2gPb7xz56cy`, died with the shutdown). Scope `cpx/p21-base..bc0a9b4`; focus: plan 2.1 QA list; the D3 workaround (`sharedJournal.append` recreates the pending dir — find what deletes `outcomes`); 5 s-bounded lease-guard lookups; v1 inertness; default `background.mode auto` + `leases enforce`. Then fix rounds per the rules.
+2. **2.2 — close the phase:** QA rounds 1–3 done (r1 14, r2 9, r3 1 major QA-2.2-24 fixed in `073e5bf`). Orchestrator: write `phase-2.2.md` Findings/Fixes/Deferred/Handoffs/Verdict (A1-3a rolled-back exemption + 3.2 `resume()` handoff; E_LOCK_LOST = unknown outcome; per-epoch snapshot names `ledger.<epoch>.json`, `events.<first>.<epoch>.jsonl`, beat files; plan 2.2.2.b text amendment A-2.2-1), measure coverage (ledger.ts ≥ 90 branches), merge into `cpx/main`.
+3. **2.3 — close the phase:** QA rounds 1–3 done (r1 17, r2 15, r3 1 major QA-2.3-33 fixed in `6d1c994`). Orchestrator: re-measure coverage of `src/executor/compile/*.ts` (last: estimate branches 81, index 86, parse 88 — top-up tests were added after; if any file < 90, one more tests-only push), write `phase-2.3.md` (approved extensions: ownership fallback as `inferred` + `ownership-assumed`, other-worktree new files, synchronous addTasks; handoffs: 3.1.4 path rewrite, 4.2 fixTemplate, 3.2 `.post` phases), merge.
+4. **2.4 — close the phase:** QA rounds 1–3 done (r1 21, r2 9, r3 1 major QA-2.4-31 fixed in `0b73acc`). Remaining: coverage of `provision.ts` (89.95 branches) and `pool.ts` (re-measure) ≥ 90 — tests-only push; `## Measurements` M1–M10 in `phase-2.4.md` (M4 recorded: git clean did not follow a junction here); write the report (handoffs: 3.1 passes `trustedSlotsDirs`, LeaseService after `acquire`, `pool.close()`; 3.2 detached slots, `branchForce` with CAS); `npm run smoke:cpx:provision` (needs `py -3` with pytest — installed `--user`) then merge.
+5. **After the merges:** ADR/plan amendments for Wave 2 in `cpx/main` (A-2.1-1 memo §15 decisions, A-2.2-1, A-2.3-1, A-2.4-1), CHANGELOG `[Unreleased]` for 2.1 (v2 background dispatch, held results, leases, `routing.background.*`, `routing.leases.*`), full `smoke:cpx` + `smoke:keyless` + `smoke:v1` (v1 smokes with OpenCode 1.18.35 first on PATH), then **DF-1** (dogfood switch; owner restart) and Wave 3.
+
+**Session ids worth resuming (if the host kept them):** 2.1 fixers `ses_ed4e80b99ffeXBvANNxkTAYv3E` (smoke debug), `ses_ed52eedd8ffeqZGXqHcrcKhiY6` (D1–D6); 2.3 coverage `ses_ed5073436ffeO0sghh9IZsv43C`; 2.4 coverage `ses_ed4d09b82ffeev34Qgn4lmBrLM`. Memos are recorded in each `phase-2.x.md`; subagent outputs can also be recovered from `%USERPROFILE%\.local\share\opencode\opencode.db` (`session_message`/`part` by `session_id`).
 
 **Orchestrator session:** `ses_ed82f88a7ffej5iKaRHuwIa6fd` (directory `D:\git\omr-cpx-main`).
 
 **Worktrees:** working (plan home) `D:\git\omr-cpx-main` (branch `cpx/main`, upstream `origin/cpx/main`); dogfood
 `D:\git\omr-cpx-dogfood-df0` (detached at `cpx/df0` = `b716ee9`, loaded by the plan's host); phase worktrees in
-flight: `D:\git\omr-cpx-p21`, `p22`, `p23`, `p24` (Wave 2). Done and merged: `p01`, `p11`, `p12`, `p13`, `p14` (kept until the end; never edit). Base repository directory `D:\git\opencode-model-router` is off-limits (§0.13); so is the other
+flight: `D:\git\omr-cpx-p21`, `p22`, `p23`, `p24` (Wave 2; all pushed and clean at the pause). Done and merged: `p01`, `p11`, `p12`, `p13`, `p14` (kept until the end; never edit). Base repository directory `D:\git\opencode-model-router` is off-limits (§0.13); so is the other
 implementation's worktree `D:\git\opencode-model-router-cross-repo` (branch `feat/cross-repo`).
 
 | Phase | State | QA round | Notes |
