@@ -81,6 +81,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   semantics, no branch). The output starts with the read-provenance line; git stays read-only. The argument exists only
   when `routing.repoParents` is non-empty at start (restart after adding parents); tier agents and the orchestrator are
   refused, and every refusal runs nothing (see `docs/ROLES.md`).
+- **A consumer `testsPass` with `scope=affected` runs `vitest related` across a link (OpenCode v2, roles mode; inert on
+  v1) (#107).** An explicit `scope=affected` on a `testsPass` in another repository runs the consumer's tests related
+  to the change in the work root (vitest 5 only; jest, pytest and other vitest majors are unverifiable). A run that
+  selects no test, or misses a consumer test file that imports a package of the work root, is unverifiable; so is a
+  failure. A `testsPass` without `scope=` and a `lintClean` there still must use `scope=full` (see `docs/VERIFICATION.md`).
 
 ### Changed
 

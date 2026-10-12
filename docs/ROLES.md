@@ -407,7 +407,10 @@ and when a placement or a v2 tier per-check `cwd=` is refused (a refusal never r
 
 - **Checks in other repositories.** A check may run in another repository of the read set with `cwd=` and `scope=full`
   (`check: testsPass cwd="D:\git\app-a" scope=full`); the change is still captured in the work root. Syntax, refusals
-  and the consumer caveat are in [Checks in other repositories](./VERIFICATION.md#checks-in-other-repositories).
+  and the consumer caveat are in [Checks in other repositories](./VERIFICATION.md#checks-in-other-repositories). A
+  `testsPass` in a consumer of the work root may use `scope=affected` instead: it runs `vitest related` (vitest 5 only)
+  across the link, and any doubt is unverifiable; see
+  [A consumer check with scope=affected](./VERIFICATION.md#a-consumer-check-with-scopeaffected).
 
 **Limits.**
 

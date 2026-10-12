@@ -1296,6 +1296,44 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     expect(unreleased).not.toContain("verified synchronously, never deferred");
   });
 
+  it("P3a: consumer testsPass scope=affected across a link — the cross-link reasons of runner.ts/deterministic.ts are in VERIFICATION.md", () => {
+    const runner = read("src/verify/runner.ts");
+    const deterministic = read("src/verify/deterministic.ts");
+    const verificationFlat = read("docs/VERIFICATION.md").replace(/\s+/g, " ");
+    // code-to-doc: the static parts of each S6 reason (a template's parts between its ${…}) are in the source AND in the guide
+    const reasons: ReadonlyArray<readonly [code: string, source: string, parts: readonly string[]]> = [
+      ["cross-link-unsupported", runner, ["a change in a linked repository needs vitest ", " to scope: this check runs ", " to scope: the resolved vitest is "]],
+      ["cross-link-gone", runner, ["changed file gone in the linked repository (deleted or renamed away): "]],
+      ["cross-link-unreachable", runner, ["the path of ", " in the linked repository contains node_modules, which vitest never follows"]],
+      ["cross-link-unchecked", runner, ["the consumer's vitest projects are not read; use scope=full",
+        "cannot check which consumer tests import the linked repository ", "; use scope=full"]],
+      ["cross-link-ignored-over-bounds", runner, ["too many ignored modules in the linked repository to pass as inputs: "]],
+      ["cross-link-ignored-unavailable", runner, ["the ignored modules of the linked repository could not be listed: "]],
+      ["cross-link-build-stale", deterministic, ["the build output in ", " is older than ", " changed in the linked repository; ",
+        "rebuild it (e.g. a buildPasses check in the linked repository before this one) or use scope=full"]],
+    ];
+    for (const [code, source, parts] of reasons) {
+      expect(source, code).toContain(`"${code}"`);
+      expect(verificationFlat, code).toContain(`\`${code}\``);
+      for (const part of parts) {
+        expect(source, `${code}: ${part}`).toContain(part);
+        expect(verificationFlat, `${code}: ${part}`).toContain(part);
+      }
+    }
+    // the zero-selection note (Y2) and the completeness note (QA-1 M2), static parts
+    for (const part of ["vitest selected no test in ", " for the change in ", "; the link may not be followed ",
+      "(resolve.preserveSymlinks, a built entry, or no test imports the changed files): use scope=full", "vitest did not run ", " consumer test file(s) that import the linked repository (", "); the link may not be followed: use scope=full"]) {
+      expect(runner, part).toContain(part);
+      expect(verificationFlat, part).toContain(part);
+    }
+    // the guide's statements: the section, its limits, and the refusal that still applies
+    for (const text of ["### A consumer check with scope=affected", "only static imports"]) expect(verificationFlat, text).toContain(text);
+    expect(read("docs/ROLES.md").replace(/\s+/g, " ")).toContain("(./VERIFICATION.md#a-consumer-check-with-scopeaffected)");
+    // the changelog entry
+    const unreleased = /## \[Unreleased\]([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
+    expect(unreleased).toContain("**A consumer `testsPass` with `scope=affected` runs `vitest related` across a link (OpenCode v2, roles mode; inert on v1) (#107).**");
+  });
+
   it("P3b: router_git root — the texts of git-root.ts are in ROLES.md, the other docs and the [Unreleased] entries", () => {
     const source = read("src/routing/roles/git-root.ts");
     const roles = read("docs/ROLES.md").replace(/\s+/g, " ");
