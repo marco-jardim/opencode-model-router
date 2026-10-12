@@ -12,6 +12,8 @@
  *   frozen at return (I4/I8 as at return, S11 link drift, the frozen pins). I4 at return, or a link not observed then, is not
  *   deferred: the required gate decides.
  * - Link discovery: a junction to an admitted repository is in P; a store-like link is not.
+ * - P3c.3: a declared dependency edge of W outside node_modules (`file:`, tsconfig `references`) puts its repository in P as an
+ *   "edge" seed (observed for I4/I8, never pinned); a link and an edge into one repository are one pinned "link" seed.
  * - A write while an extra root's dispatch snapshot is in flight discards that snapshot ("could not be observed").
  *
  * The harness is test/integration/unattributed-writers.test.ts's: real temporary git repositories, the real plugin and gate, real
@@ -798,6 +800,154 @@ describe("link pins at dispatch (P2.6)", () => {
     expect(pinsOf(gateReferences()[0])).toBeUndefined();
     expect(seam.calls).not.toContain(seam.key(lib));
   }, 90_000);
+});
+
+describe("declared dependency edges in P (P3c)", () => {
+  const TESTS_DOD = `[acceptance]\ncheck: testsPass command="npm test"\n[/acceptance]`;
+  /** W's package.json with `dependencies` (the manifest is written before W is pinned, so it is part of W's baseline). */
+  const declare = (dependencies: Record<string, string>): void => {
+    fs.writeFileSync(path.join(repo, "package.json"), `${JSON.stringify({ name: "app-a", private: true, scripts: { test: "node --version" }, dependencies })}\n`);
+  };
+  const junction = (): void => {
+    const modules = path.join(repo, "node_modules");
+    fs.mkdirSync(modules, { recursive: true });
+    fs.symlinkSync(lib, path.join(modules, "lib-b"), "junction");
+  };
+  const plan = (parents: string[]): ReturnType<typeof planPerimeter> =>
+    planPerimeter("task:orch:call1", repo, () => ({ parents, depth: 1, exclude: [] }));
+  const shape = (planned: ReturnType<typeof planPerimeter>): unknown[] =>
+    (planned?.roots ?? []).map(seed => [seam.key(seed.at), seed.origin, seed.fixed, seed.linked, seed.edged]);
+  /**
+   * The plugin with `routing.repoParents` = [parent] as the perimeter reads it; W pinned, lib-b pinned with its ignored files
+   * digested (as "link pins at dispatch (P2.6)" does: a link seed's pin and its perimeter snapshot then read one tree).
+   */
+  async function edgedPlugin(): Promise<any> {
+    for (const dir of [repo, lib]) execFileSync("git", ["config", "core.autocrlf", "false"], { cwd: dir, stdio: "ignore" });
+    const realPlan = perimeterModule.planPerimeter;
+    vi.spyOn(perimeterModule, "planPerimeter").mockImplementation((id, cwd) => realPlan(id, cwd, () => ({ parents: [parent], depth: 1, exclude: [] })));
+    const hooks = await makePlugin();
+    await pin(repo);
+    const keys = [seam.key(lib), seam.key(fs.realpathSync.native(lib))];
+    const { snapshotTree } = await vi.importActual<typeof import("../../src/verify/tree")>("../../src/verify/tree");
+    const tree = await snapshotTree(lib, new AbortController().signal, { digestPaths: [], ignoredDigest: true });
+    if (tree === undefined) throw new Error(`the real snapshot of ${lib} failed`);
+    for (const key of keys) seam.pins.set(key, tree);
+    return hooks;
+  }
+  const gateReferences = (): unknown[] => acceptSpy.mock.calls.map(call => call[2]?.deterministic?.reference);
+  const pinsOf = (reference: unknown): readonly { kind: string; root: string }[] | undefined => {
+    const captured = reference as { kind?: string; reference?: { pins?: readonly { kind: string; root: string }[] } } | undefined;
+    return captured?.kind === "captured" ? captured.reference?.pins : undefined;
+  };
+  const digested = (): string[] => seam.log.filter(entry => entry.digest).map(entry => entry.key);
+
+  it("a `file:../lib-b` dependency with no node_modules is an `edge` seed for lib-b, admitted like a link target", () => {
+    routeAsRole(location(repo, "app-a"));
+    declare({ "lib-b": "file:../lib-b" });
+    const planned = plan([parent]);
+    expect(planned?.name).toBe("app-a");
+    expect(shape(planned)).toEqual([[seam.key(lib), "edge", undefined, undefined, undefined]]);
+    const seed = planned?.roots[0];
+    expect(seed?.admit?.(lib)).toBe(true);
+    expect(seed?.admit?.(parent)).toBe(false);
+  });
+
+  it("a tsconfig `references` entry into lib-b is an `edge` seed for lib-b, admitted like a link target", () => {
+    routeAsRole(location(repo, "app-a"));
+    fs.writeFileSync(path.join(repo, "tsconfig.json"), `{\n  // the library\n  "references": [{ "path": "../lib-b" }],\n}\n`);
+    const planned = plan([parent]);
+    expect(shape(planned)).toEqual([[seam.key(lib), "edge", undefined, undefined, undefined]]);
+    expect(planned?.roots[0]?.admit?.(lib)).toBe(true);
+  });
+
+  it("a node_modules link and an edge into one repository are one `link` seed, pinned as before", async () => {
+    routeAsRole(location(repo, "app-a"));
+    junction();
+    declare({ "lib-b": "file:../lib-b" });
+    expect(shape(plan([parent]))).toEqual([[seam.key(lib), "link", undefined, undefined, undefined]]);
+    const hooks = await edgedPlugin();
+    await runTask(hooks, `Implement it.\n${TESTS_DOD}`, async () => undefined);
+    expect(pinsOf(gateReferences()[0])?.map(pin => [pin.kind, seam.key(pin.root)])).toEqual([["pinned", seam.key(lib)]]);
+  }, 90_000);
+
+  it("an edge into a working-set root marks it `edged` (not `linked`); it stays one working-set seed", () => {
+    addToWorkingSet("orch", location(lib, "lib-b"));
+    routeAsRole(location(repo, "app-a"));
+    declare({ "lib-b": "file:../lib-b" });
+    const planned = plan([parent]);
+    expect(shape(planned)).toEqual([[seam.key(lib), "working-set", undefined, undefined, true]]);
+    expect(planned?.roots[0]?.name).toBe("lib-b");
+  });
+
+  it("an edge-only seed is never pinned: no pin at the gate, no digested snapshot of lib-b", async () => {
+    routeAsRole(location(repo, "app-a"));
+    declare({ "lib-b": "file:../lib-b" });
+    const hooks = await edgedPlugin();
+    await runTask(hooks, `Implement it.\n${TESTS_DOD}`, async () => undefined);
+    expect(artefacts()[0]?.perimeter?.roots.map(root => [root.name, root.status])).toEqual([["lib-b", "unchanged"]]);
+    expect(pinsOf(gateReferences()[0])).toBeUndefined();
+    expect(digested()).not.toContain(seam.key(lib));
+    expect(seam.hardened).toContain(seam.key(lib));
+  }, 90_000);
+
+  it("unadmitted edge targets: at most 8 are named, each `(not admitted)` in the scope line, never snapshotted", async () => {
+    routeAsRole(location(repo, "app-a"));
+    const names = Array.from({ length: 10 }, (_, index) => `omr-outside-${index}`);
+    declare(Object.fromEntries(names.map(name => [name, `file:../../${name}`])));
+    const planned = plan([parent]);
+    expect(planned?.roots.map(seed => [seed.name, seed.origin, seed.fixed])).toEqual(names.slice(0, 8).map(name => [name, "edge", "unadmitted"]));
+    expect(planned?.roots.every(seed => seed.admit === undefined)).toBe(true);
+    const hooks = await edgedPlugin();
+    const out = await runTask(hooks, `Implement it.\n${SYNC_DOD}`, async () => undefined);
+    expect(out).toContain("✓ verified");
+    for (const name of names.slice(0, 8)) expect(out).toContain(`${name} (not admitted)`);
+    for (const name of names.slice(8)) expect(out).not.toContain(name);
+    expect(seam.calls.some(key => key.includes("omr-outside-"))).toBe(false);
+  }, 60_000);
+
+  it("I9: no parents, no location and no working set: no perimeter, and no edge file is read", () => {
+    routeAsRole(); // No grant location, and no working set.
+    declare({ "lib-b": "file:../lib-b" });
+    fs.writeFileSync(path.join(repo, "tsconfig.json"), `{ "references": [{ "path": "../lib-b" }] }\n`);
+    const touched: string[] = [];
+    const io = new Proxy({}, {
+      get: (_target, key) => (): never => {
+        touched.push(String(key));
+        throw new Error("no IO expected");
+      },
+    }) as Parameters<typeof planPerimeter>[3];
+    expect(planPerimeter("task:orch:call1", repo, () => ({ parents: [], depth: 1 }), io)).toBeUndefined();
+    expect(touched).toEqual([]);
+    // Control: with parents set, the same IO is what the edges are read with.
+    expect(() => planPerimeter("task:orch:call1", repo, () => ({ parents: [parent], depth: 1 }), io)).not.toThrow();
+    expect(touched.length).toBeGreaterThan(0);
+  });
+
+  it("end to end: a bash write into an edge-only lib-b during the dispatch is unverifiable, with the I4 reason", async () => {
+    routeAsRole(location(repo, "app-a"));
+    declare({ "lib-b": "file:../lib-b" });
+    const hooks = await edgedPlugin();
+    const out = await runTask(hooks, `Implement it.\n${SYNC_DOD}`, async (h, sid) => {
+      await runTool(h, sid, "bash", { command: "echo hi" });
+      fs.writeFileSync(path.join(lib, "index.ts"), "export const b = 1;\n");
+      await pin(lib);
+    });
+    expect(out).toMatch(I4_REASON("bash"));
+    expect(out).toContain("UNVERIFIED");
+    expect(out).not.toContain("✓ verified");
+    expect(artefacts()[0]?.perimeter?.roots.map(root => [root.name, root.status])).toEqual([["lib-b", "changed"]]);
+  }, 60_000);
+
+  it("end to end: with no write, the pass's scope line names the edge-only lib-b as also observed (branch @ short HEAD)", async () => {
+    routeAsRole(location(repo, "app-a"));
+    declare({ "lib-b": "file:../lib-b" });
+    const hooks = await edgedPlugin();
+    const out = await runTask(hooks, `Implement it.\n${SYNC_DOD}`, async () => undefined);
+    expect(out).toContain("✓ verified");
+    expect(out).not.toMatch(ANY_I4);
+    expect(out).toMatch(SCOPE_LINE);
+    expect(artefacts()[0]?.perimeter?.roots.map(root => [root.name, root.status])).toEqual([["lib-b", "unchanged"]]);
+  }, 60_000);
 });
 
 describe("deferred P (P2e)", () => {

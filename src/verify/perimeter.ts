@@ -25,7 +25,9 @@
  *
  * Declared dependency edges (cross-repo P3c, docs/design/cross-repo-phase3-plan.md SD-P3c-1, SD-P3c-3): `dependencyTargets`
  * is the union of W's package links and its declared edges (edges.ts), each edge admitted by its text first
- * (`resolveEdgeTarget`) with the same admission as a link (`admissionContext`). Not wired yet (P3c.3).
+ * (`resolveEdgeTarget`) with the same admission as a link (`admissionContext`). `planPerimeter` adds them to P as seed origin
+ * "edge" (a working-set root an edge covers gets `edged`; a link and an edge into one repository stay one "link" seed);
+ * edge-only seeds are never pinned (SD-P3c-2, F3) and not frozen for S11 yet (P3c.4).
  */
 import { type Dirent, lstatSync, readFileSync, readdirSync, readlinkSync, realpathSync } from "node:fs";
 import { lstat, readFile, readdir, readlink, realpath } from "node:fs/promises";
@@ -257,8 +259,8 @@ export interface DependencyTargets {
 
 /**
  * Cross-repo P3c.2b (SD-P3c-1): the targets W depends on, the union of its package links and its declared edges (`declaredEdges`,
- * admitted by text first, `resolveEdgeTarget`). `ctx.sameRepository` defaults to "shares W's git common directory". Nothing
- * calls it yet (P3c.3 wires it into the perimeter).
+ * admitted by text first, `resolveEdgeTarget`). `ctx.sameRepository` defaults to "shares W's git common directory".
+ * `planPerimeter` reads W's links and edges through it (P3c.3).
  */
 export function dependencyTargets(
   w: string,
@@ -731,9 +733,15 @@ export function admissionContext(config: PerimeterAdmission, workingSet: readonl
 /**
  * The perimeter beyond W of the dispatch `dispatchID` (a native `task` dispatch, `task:<orchestrator>:<callID>`) verified at
  * `cwd`, or undefined when it has none (I9): not a routed role dispatch, or neither a grant location nor another working-set
- * root, or no extra root at all. W is the grant location's worktree, else `cwd`. `admission` is read for W's package links only.
+ * root, or no extra root at all. W is the grant location's worktree, else `cwd`. `admission` is read for W's package links and
+ * declared dependency edges only (P3c.3); `io` (tests) is what `dependencyTargets` reads them with.
  */
-export function planPerimeter(dispatchID: string, cwd: string, admission: () => PerimeterAdmission): DispatchPerimeter | undefined {
+export function planPerimeter(
+  dispatchID: string,
+  cwd: string,
+  admission: () => PerimeterAdmission,
+  io: DependencyIO = defaultDependencyIO,
+): DispatchPerimeter | undefined {
   if (!dispatchID.startsWith("task:")) return undefined;
   const rest = dispatchID.slice("task:".length);
   const separator = rest.indexOf(":");
@@ -789,9 +797,14 @@ export function planPerimeter(dispatchID: string, cwd: string, admission: () => 
   }
 
   // P3c.2a: link admission (parents in both spellings, depth, excludes, working set), factored into `admissionContext`.
-  const { parentOf, worktreeOf, admitTop } = admissionContext(config, workingSet);
+  const linkAdmission = admissionContext(config, workingSet);
+  const { parentOf, worktreeOf, admitTop } = linkAdmission;
+  // P3c.3 (SD-P3c-1): W's package links first (`linkedTargets`, unchanged), then its declared edges, read once.
+  const dependencies = dependencyTargets(w, { ...linkAdmission, sameRepository }, io);
 
-  for (const real of linkedTargets(w)) {
+  for (const dependency of dependencies.targets) {
+    if (dependency.origin !== "link") continue;
+    const real = dependency.at;
     // Admission by text first: a link outside every parent and every working-set worktree is not in P, but it is not dropped
     // either (I8, I12): kept as an unadmitted root named by its basename, without running git or touching the filesystem.
     const parent = parentOf(real);
@@ -828,6 +841,30 @@ export function planPerimeter(dispatchID: string, cwd: string, admission: () => 
       continue;
     }
     add({ at: top, admit: admitTop, origin: "link", ...(sameRepository(top) ? { sameRepository: true } : {}) });
+  }
+
+  // P3c.3 (SD-P3c-2): W's declared dependency edges outside `node_modules`, after the links, so that a link and an edge into one
+  // repository are one "link" seed (pinned as before). An admitted edge is a seed of origin "edge", observed like a link target
+  // (I4, I8) and counted toward PERIMETER_MAX, but never pinned (F3) and not frozen for S11 yet (P3c.4). An unadmitted one is
+  // named (`name (not admitted)`, at most EDGE_UNADMITTED_NAMES_MAX, `dependencyTargets`), never snapshotted (I11, I12).
+  for (const dependency of dependencies.targets) {
+    if (dependency.origin !== "edge") continue;
+    if ("fixed" in dependency) {
+      add({ at: dependency.at, name: dependency.name, fixed: "unadmitted", origin: "edge" });
+      continue;
+    }
+    const top = dependency.at;
+    const covering = seeds.findIndex((seed) => seed.fixed === undefined && insideOrEqual(top, seed.at));
+    if (covering >= 0) {
+      // A root already in P covers it: one seed. A working-set root keeps its semantics and is marked `edged`; unlike a `linked`
+      // one it is not pinned (F3). A link seed, or a working-set root already `linked`, stays as it is.
+      const seed = seeds[covering];
+      if (seed !== undefined && seed.origin === "working-set" && seed.linked !== true && seed.edged !== true) {
+        seeds[covering] = { ...seed, edged: true };
+      }
+      continue;
+    }
+    add({ at: top, admit: admitTop, origin: "edge" });
   }
   if (seeds.length === 0) return undefined;
   return { ...(location !== undefined ? { name: location.name } : {}), roots: seeds };

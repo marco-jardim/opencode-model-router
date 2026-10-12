@@ -102,14 +102,21 @@ export interface PerimeterSeed {
   readonly sameRepository?: boolean;
   /**
    * Cross-repo P2b.3: where the root came from, set by `planPerimeter`: "working-set" (a working-set worktree other than W),
-   * "link" (a package link target of W). Consumer discovery scans only the working-set roots.
+   * "link" (a package link target of W), "edge" (cross-repo P3c.3, SD-P3c-2: the repository of a declared dependency edge of W
+   * outside `node_modules`, edges.ts; a link and an edge into one repository are one "link" seed). Consumer discovery scans only
+   * the working-set roots. An "edge" seed is observed like a link target (I4, I8) but never pinned (F3).
    */
-  readonly origin?: "w" | "working-set" | "link";
+  readonly origin?: "w" | "working-set" | "link" | "edge";
   /**
    * Cross-repo QA-1 #9a: a working-set root that is also a package link target of W (the link was de-duplicated into it). It
    * keeps its working-set semantics (consumer discovery, I13) and is pinned at dispatch like a link target.
    */
   readonly linked?: boolean;
+  /**
+   * Cross-repo P3c.3 (SD-P3c-2): a working-set root that a declared dependency edge of W leads into (the edge was de-duplicated
+   * into it). It keeps its working-set semantics; unlike `linked`, it is not pinned (F3).
+   */
+  readonly edged?: true;
 }
 
 /** Cross-repo P1.8: the perimeter P of a dispatch beyond W. */

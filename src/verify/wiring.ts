@@ -1652,7 +1652,8 @@ export function createVerificationWiring(deps: {
     const perimeterRootSnapshot = (root: string, signal: AbortSignal): Promise<TreeSnapshot | undefined> => {
       const plain = snapshotTree(root, signal, { lowPriority, hardened: true });
       const seed = perimeter?.roots.find(candidate => candidate.at === root);
-      // QA-1 #9a: a working-set root that is also a link target of W (`linked`) is pinned too.
+      // QA-1 #9a: a working-set root that is also a link target of W (`linked`) is pinned too. Cross-repo P3c.3 (F3): a declared
+      // dependency edge's root (origin "edge", or a working-set root marked `edged`) is observed but never pinned.
       if (seed === undefined || (seed.origin !== "link" && seed.linked !== true) || seed.fixed !== undefined) return plain;
       watchWritersFor(store);
       const seedAdmit = seed.admit ?? ((): boolean => false);
