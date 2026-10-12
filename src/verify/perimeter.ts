@@ -22,6 +22,10 @@
  *   I8 as not observed;
  * - P holds at most PERIMETER_MAX snapshotted roots, W included; the roots beyond are kept as "unobserved" roots, never dropped
  *   (F2), so the gate refuses a dispatch that ran unattributable writers.
+ *
+ * Declared dependency edges (cross-repo P3c, docs/design/cross-repo-phase3-plan.md SD-P3c-1, SD-P3c-3): `dependencyTargets`
+ * is the union of W's package links and its declared edges (edges.ts), each edge admitted by its text first
+ * (`resolveEdgeTarget`) with the same admission as a link (`admissionContext`). Not wired yet (P3c.3).
  */
 import { type Dirent, lstatSync, readFileSync, readdirSync, readlinkSync, realpathSync } from "node:fs";
 import { lstat, readFile, readdir, readlink, realpath } from "node:fs/promises";
@@ -31,12 +35,15 @@ import type { RepoLocation } from "../routing/roles/admission";
 import { routedRoleOf } from "../routing/wire/dispatch";
 import { workingSetOf } from "../routing/wire/working-set";
 import type { DispatchPerimeter, PerimeterSeed } from "./dispatch";
-import { workspacePatterns } from "./edges";
+import { type DeclaredEdge, type EdgeIO, type EdgeVia, declaredEdges, defaultEdgeIO, isUncSpec, workspacePatterns } from "./edges";
 import { depthBelow, gitTopOf, perimeterKey } from "./git-top";
 import { isStoreLikeLink } from "./reference";
 
 /** P holds at most this many snapshotted roots, W included. */
 export const PERIMETER_MAX = 16;
+
+/** Cross-repo P3c (SD-P3c-4): at most this many unadmitted declared-edge targets are named; the others are counted only. */
+export const EDGE_UNADMITTED_NAMES_MAX = 8;
 
 /** What link admission needs: `routing.repoParents`, `routing.repoDepth` and `routing.repoExclude`. */
 export interface PerimeterAdmission {
@@ -125,6 +132,169 @@ export function linkedTargets(w: string, io: LinkIO = defaultLinkIO): string[] {
     if (!targets.has(perimeterKey(real))) targets.set(perimeterKey(real), real);
   }
   return [...targets.values()];
+}
+
+/** Cross-repo P3c (SD-P3c-3): the primitives `resolveEdgeTarget` uses once a target passed the text gates; injectable for tests. */
+export interface EdgeTargetIO {
+  /** The canonical path of an existing `p` (follows links and junctions); throws when absent. */
+  readonly realpath: (p: string) => string;
+  /** The git top level of `dir`, strictly below `ceiling` when given (`gitTopOf`, no git run). */
+  readonly gitTop: (dir: string, ceiling?: string) => string | undefined;
+}
+
+/** Cross-repo P3c: every primitive `dependencyTargets` uses (`linkedTargets`, `declaredEdges`, `resolveEdgeTarget`). */
+export interface DependencyIO extends LinkIO, EdgeIO, EdgeTargetIO {}
+
+const defaultDependencyIO: DependencyIO = { ...defaultLinkIO, ...defaultEdgeIO, gitTop: (dir, ceiling) => gitTopOf(dir, ceiling) };
+
+/** What `resolveEdgeTarget` needs beyond link admission. */
+export interface EdgeContext extends AdmissionContext {
+  /** The root whose files declare the edges (W): an edge's spec resolves against `path.dirname(path.join(root, edge.from))`. */
+  readonly root: string;
+  /** Whether a top level is another worktree of W's repository (the same git common directory, QA-1 F11). */
+  readonly sameRepository: (top: string) => boolean;
+}
+
+/**
+ * Where one declared edge leads (SD-P3c-3):
+ * - `admitted`: the repository top level `top`, admitted as a link's would be (`admitTop`);
+ * - `unadmitted`: not in P, named (I8, I12): `at` is the target as text (the spec itself for a UNC or device spec) or, past the
+ *   filesystem gates, its top level; `name` is the last segment of that text, never the canonical path;
+ * - `skipped`: not a perimeter root at all: a `node_modules` segment (links cover them), W's own repository (at, inside or above
+ *   W's top, or another worktree of it), or a Python path line outside every parent (dropped silently).
+ */
+export type EdgeResolution =
+  | { readonly status: "admitted"; readonly top: string }
+  | { readonly status: "unadmitted"; readonly at: string; readonly name: string }
+  | { readonly status: "skipped"; readonly reason: "nodeModules" | "insideW" | "sameRepository" | "pythonOutside" };
+
+/** The last non-empty segment of a path as text, either separator (a UNC spec is never resolved, even on posix). */
+function textName(at: string): string {
+  const segments = at.split(/[\\/]/).filter((segment) => segment !== "");
+  return segments[segments.length - 1] ?? at;
+}
+
+function hasNodeModulesSegment(at: string): boolean {
+  return at.split(/[\\/]/).some((segment) => segment.toLowerCase() === "node_modules");
+}
+
+/**
+ * Cross-repo P3c.2b (SD-P3c-3, I11): admit one declared edge of `ctx.root` by its text first. The spec is repository text: it
+ * is resolved against the declaring file's directory as text, and gated as text before any filesystem call: a UNC or device
+ * spec, or a target outside every parent (either spelling) and every working-set worktree, is unadmitted; a `node_modules`
+ * segment or a target at, inside or above `wTop` (W's top level) is skipped. Only then is the nearest existing ancestor of the
+ * target below the parent (or inside the worktree) realpath'ed (an unbuilt `dist/` resolves to its repository); its canonical
+ * path must still be below a parent or inside a working-set worktree (a junction leading out is unadmitted); then its top level
+ * (`gitTop`, the walk stopping at the parent) must be admitted by `admitTop`, as a link target's is.
+ */
+export function resolveEdgeTarget(
+  edge: DeclaredEdge,
+  ctx: EdgeContext,
+  wTop: string,
+  io: EdgeTargetIO = defaultDependencyIO,
+): EdgeResolution {
+  const python = edge.kind === "python";
+  // A UNC share or a device path: never resolved (QA-1 #3), so no network access.
+  if (edge.unc === true || isUncSpec(edge.spec)) {
+    return python ? { status: "skipped", reason: "pythonOutside" } : { status: "unadmitted", at: edge.spec, name: textName(edge.spec) };
+  }
+  const target = path.resolve(path.dirname(path.join(ctx.root, edge.from)), edge.spec);
+  const unadmittedText: EdgeResolution = { status: "unadmitted", at: target, name: textName(target) };
+  if (isUncSpec(target)) return python ? { status: "skipped", reason: "pythonOutside" } : unadmittedText;
+  if (hasNodeModulesSegment(target)) return { status: "skipped", reason: "nodeModules" };
+  if (insideOrEqual(target, wTop) || insideOrEqual(wTop, target)) return { status: "skipped", reason: "insideW" };
+  const parent = ctx.parentOf(target);
+  const worktree = ctx.worktreeOf(target);
+  if (parent === undefined && worktree === undefined) return python ? { status: "skipped", reason: "pythonOutside" } : unadmittedText;
+
+  // The nearest existing ancestor, never at or above the parent (nor above the worktree).
+  const within = (dir: string): boolean =>
+    (parent !== undefined && depthBelow(dir, parent) >= 1) || (worktree !== undefined && insideOrEqual(dir, worktree.worktree));
+  let real: string | undefined;
+  for (let dir = target; real === undefined && within(dir); dir = path.dirname(dir)) {
+    try {
+      real = io.realpath(dir);
+    } catch {
+      if (path.dirname(dir) === dir) break; // Missing: try its parent directory.
+    }
+  }
+  if (real === undefined) return unadmittedText; // Nothing exists there: nothing to observe.
+  // The canonical path stays below a parent or inside a working-set worktree: a junction leading out is not admitted.
+  const realParent = ctx.parentOf(real);
+  const realWorktree = ctx.worktreeOf(real);
+  if (realParent === undefined && realWorktree === undefined) return unadmittedText;
+  if (insideOrEqual(real, wTop) || insideOrEqual(wTop, real)) return { status: "skipped", reason: "insideW" };
+
+  const top = io.gitTop(real, realWorktree !== undefined ? path.dirname(realWorktree.worktree) : realParent);
+  if (top === undefined) return unadmittedText; // Not in a git repository: nothing to observe.
+  if (insideOrEqual(top, wTop) || insideOrEqual(wTop, top)) return { status: "skipped", reason: "insideW" };
+  if (ctx.sameRepository(top)) return { status: "skipped", reason: "sameRepository" };
+  if (!ctx.admitTop(top)) return { status: "unadmitted", at: top, name: path.basename(top) };
+  return { status: "admitted", top };
+}
+
+/**
+ * One target W depends on: a package link's real path (`linkedTargets`, admitted by the caller as before), an admitted edge's
+ * repository top level, or an unadmitted edge target (named, never snapshotted).
+ */
+export type DependencyTarget =
+  | { readonly origin: "link"; readonly at: string }
+  | { readonly origin: "edge"; readonly at: string; readonly via: EdgeVia; readonly from: string }
+  | { readonly origin: "edge"; readonly at: string; readonly via: EdgeVia; readonly from: string; readonly name: string; readonly fixed: "unadmitted" };
+
+/** The result of `dependencyTargets`. */
+export interface DependencyTargets {
+  /**
+   * Link targets first (`linkedTargets`, unchanged), then edge targets: each once (by top level, or by text when unadmitted),
+   * none repeating a link target.
+   */
+  readonly targets: DependencyTarget[];
+  /** Unadmitted edge targets past EDGE_UNADMITTED_NAMES_MAX: counted, not named (SD-P3c-4). */
+  readonly unadmittedMore: number;
+  /** A `declaredEdges` bound cut the reading (SD-P3c-4). */
+  readonly incomplete: boolean;
+}
+
+/**
+ * Cross-repo P3c.2b (SD-P3c-1): the targets W depends on, the union of its package links and its declared edges (`declaredEdges`,
+ * admitted by text first, `resolveEdgeTarget`). `ctx.sameRepository` defaults to "shares W's git common directory". Nothing
+ * calls it yet (P3c.3 wires it into the perimeter).
+ */
+export function dependencyTargets(
+  w: string,
+  ctx: AdmissionContext & { readonly sameRepository?: (top: string) => boolean },
+  io: DependencyIO = defaultDependencyIO,
+): DependencyTargets {
+  const targets: DependencyTarget[] = linkedTargets(w, io).map((at) => ({ origin: "link", at }));
+  const declared = declaredEdges(w, io);
+  if (declared.edges.length === 0) return { targets, unadmittedMore: 0, incomplete: declared.incomplete };
+  const wTop = io.gitTop(w) ?? w;
+  let sameRepository = ctx.sameRepository;
+  if (sameRepository === undefined) {
+    const wCommon = commonDirOf(wTop);
+    sameRepository = (top: string): boolean => wCommon !== undefined && commonDirOf(top) === wCommon;
+  }
+  const edgeContext: EdgeContext = { ...ctx, root: w, sameRepository };
+  // An edge whose top level is already a link target is that link (SD-P3c-2: links first, one target).
+  const seen = new Set<string>(targets.map((target) => perimeterKey(target.at)));
+  let named = 0;
+  let unadmittedMore = 0;
+  for (const edge of declared.edges) {
+    const resolved = resolveEdgeTarget(edge, edgeContext, wTop, io);
+    if (resolved.status === "skipped") continue;
+    const at = resolved.status === "admitted" ? resolved.top : resolved.at;
+    if (seen.has(perimeterKey(at))) continue;
+    seen.add(perimeterKey(at));
+    if (resolved.status === "admitted") {
+      targets.push({ origin: "edge", at, via: edge.via, from: edge.from });
+    } else if (named < EDGE_UNADMITTED_NAMES_MAX) {
+      named += 1;
+      targets.push({ origin: "edge", at, via: edge.via, from: edge.from, name: resolved.name, fixed: "unadmitted" });
+    } else {
+      unadmittedMore += 1;
+    }
+  }
+  return { targets, unadmittedMore, incomplete: declared.incomplete };
 }
 
 /** Cross-repo P3a: the link primitives `crossLinkAliases` uses; injectable for tests. */

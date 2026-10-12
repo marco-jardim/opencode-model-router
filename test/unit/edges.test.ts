@@ -22,6 +22,7 @@ import {
   EDGE_VIAS,
   EDGE_WORKSPACES_MAX,
   EDGES_MAX,
+  type DeclaredEdge,
   type DeclaredEdges,
   type EdgeIO,
   parseJsonc,
@@ -30,7 +31,17 @@ import {
   workspaceDirsSync,
   workspacePatterns,
 } from "../../src/verify/edges";
-import { workspaceDirs } from "../../src/verify/perimeter";
+import {
+  admissionContext,
+  dependencyTargets,
+  EDGE_UNADMITTED_NAMES_MAX,
+  type DependencyIO,
+  type EdgeContext,
+  resolveEdgeTarget,
+  workspaceDirs,
+} from "../../src/verify/perimeter";
+import { gitTopOf } from "../../src/verify/git-top";
+import type { RepoLocation } from "../../src/routing/roles/admission";
 
 let tmp: string;
 let parent: string;
@@ -708,5 +719,219 @@ describe("via vocabulary (SD-P3c-5)", () => {
       expect(fs.existsSync(path.join(app, ...edge.from.split("/")))).toBe(true);
     }
     expect(result.edges.map((edge) => edge.from)).toContain("packages/p/package.json");
+  });
+});
+
+describe("edge admission (P3c.2b)", () => {
+  // Canonical spellings (os.tmpdir() may hold a short or linked component): real paths are compared as text.
+  let root: string;
+  let rParent: string;
+  let rApp: string;
+  let lib: string;
+  let outsideLib: string;
+  /** Every link made here, removed itself (never recursed through) before the temporary tree. */
+  const links: string[] = [];
+
+  const via = (kind: DeclaredEdge["kind"]) => (kind === "python" ? "python editable install" : "package.json dependencies (file:)");
+
+  /** A declared edge of `rApp` (or of `ctx.root`), declared in `from`. */
+  function edge(spec: string, kind: DeclaredEdge["kind"] = "package", from = "package.json"): DeclaredEdge {
+    return { kind, spec, via: via(kind), from };
+  }
+
+  /** A git repository found without git: a `.git` directory. */
+  function gitRepo(dir: string): string {
+    fs.mkdirSync(path.join(dir, ".git"), { recursive: true });
+    return dir;
+  }
+
+  /** A directory link: a junction on win32, a dir symlink on posix. */
+  function link(target: string, at: string): void {
+    fs.mkdirSync(path.dirname(at), { recursive: true });
+    fs.symlinkSync(target, at, process.platform === "win32" ? "junction" : "dir");
+    links.push(at);
+  }
+
+  function location(worktree: string): RepoLocation {
+    return { repository: worktree, name: path.basename(worktree), worktree, branch: "main", head: null, worktrees: [] };
+  }
+
+  /** The edge admission of `rApp`: parent `rParent`, depth 1, no exclude; nothing is another worktree of W unless said. */
+  function context(opts: { root?: string; workingSet?: RepoLocation[]; sameRepository?: (top: string) => boolean } = {}): EdgeContext {
+    return {
+      ...admissionContext({ parents: [rParent], depth: 1, exclude: [] }, opts.workingSet ?? []),
+      root: opts.root ?? rApp,
+      sameRepository: opts.sameRepository ?? (() => false),
+    };
+  }
+
+  type DepCall = { op: string; p: string };
+
+  /** The default dependency primitives, every call recorded in order (the IO spy). */
+  function spyDependencyIO(): { io: DependencyIO; calls: DepCall[] } {
+    const calls: DepCall[] = [];
+    const record = <T>(op: string, p: string, run: () => T): T => {
+      calls.push({ op, p });
+      return run();
+    };
+    const io: DependencyIO = {
+      lstat: (p) => record("lstat", p, () => fs.lstatSync(p)),
+      readlink: (p) => record("readlink", p, () => fs.readlinkSync(p)),
+      realpath: (p) => record("realpath", p, () => fs.realpathSync.native(p)),
+      gitTop: (dir, ceiling) => record("gitTop", dir, () => gitTopOf(dir, ceiling)),
+      stat: (p) => record("stat", p, () => defaultEdgeIO.stat(p)),
+      readFile: (p) => record("readFile", p, () => defaultEdgeIO.readFile(p)),
+      readdir: (dir, max) => record("readdir", dir, () => defaultEdgeIO.readdir(dir, max)),
+    };
+    return { io, calls };
+  }
+
+  /** Whether a call touched `at` or anything inside it (compared as text). */
+  const touched = (calls: DepCall[], at: string): boolean => {
+    const key = path.resolve(at).toLowerCase();
+    return calls.some((call) => {
+      const p = path.resolve(call.p).toLowerCase();
+      return p === key || p.startsWith(`${key}${path.sep}`);
+    });
+  };
+
+  beforeEach(() => {
+    root = fs.realpathSync.native(tmp);
+    rParent = path.join(root, "parent");
+    rApp = gitRepo(path.join(rParent, "app"));
+    lib = gitRepo(path.join(rParent, "lib-b"));
+    fs.mkdirSync(path.join(lib, "src"), { recursive: true });
+    outsideLib = gitRepo(path.join(root, "outside", "lib-x"));
+  });
+
+  afterEach(() => {
+    for (const at of links.splice(0)) if (fs.existsSync(at)) fs.rmSync(at, { recursive: false, force: true });
+  });
+
+  it("a target below a parent resolves to its git top level and is admitted", () => {
+    const { io } = spyDependencyIO();
+    const ctx = context();
+    expect(resolveEdgeTarget(edge("../lib-b"), ctx, rApp, io)).toEqual({ status: "admitted", top: lib });
+    expect(resolveEdgeTarget(edge("../lib-b/src"), ctx, rApp, io)).toEqual({ status: "admitted", top: lib });
+    // The spec resolves against the declaring file's directory.
+    expect(resolveEdgeTarget(edge("../../../lib-b", "package", "packages/p/package.json"), ctx, rApp, io)).toEqual({ status: "admitted", top: lib });
+    // A working-set worktree outside every parent is admitted as well (F4).
+    const withWorkingSet = context({ workingSet: [location(outsideLib)] });
+    expect(resolveEdgeTarget(edge("../../outside/lib-x"), withWorkingSet, rApp, io)).toEqual({ status: "admitted", top: outsideLib });
+  });
+
+  it("a target outside every parent and every working-set worktree, or a UNC spec, is unadmitted, named from the text, with no filesystem call", () => {
+    const { io, calls } = spyDependencyIO();
+    const ctx = context();
+    expect(resolveEdgeTarget(edge("../../outside/lib-x"), ctx, rApp, io)).toEqual({ status: "unadmitted", at: outsideLib, name: "lib-x" });
+    expect(resolveEdgeTarget({ ...edge("\\\\server\\share\\lib-u"), unc: true }, ctx, rApp, io))
+      .toEqual({ status: "unadmitted", at: "\\\\server\\share\\lib-u", name: "lib-u" });
+    expect(resolveEdgeTarget(edge("//server/share/lib-v"), ctx, rApp, io)).toEqual({ status: "unadmitted", at: "//server/share/lib-v", name: "lib-v" });
+    expect(calls).toEqual([]);
+  });
+
+  it("a junction below a parent that leads out of the parents is unadmitted, its top level never looked up", () => {
+    const escape = path.join(rParent, "escape");
+    link(outsideLib, escape);
+    const { io, calls } = spyDependencyIO();
+    expect(resolveEdgeTarget(edge("../escape"), context(), rApp, io)).toEqual({ status: "unadmitted", at: escape, name: "escape" });
+    expect(calls).toEqual([{ op: "realpath", p: escape }]);
+  });
+
+  it("a missing dist below an admitted repository resolves through the nearest existing ancestor below the parent", () => {
+    const { io, calls } = spyDependencyIO();
+    expect(resolveEdgeTarget(edge("../lib-b/dist/index.js"), context(), rApp, io)).toEqual({ status: "admitted", top: lib });
+    expect(calls.filter((call) => call.op === "realpath").map((call) => call.p))
+      .toEqual([path.join(lib, "dist", "index.js"), path.join(lib, "dist"), lib]);
+    // Nothing exists below the parent: unadmitted, and the parent itself is never realpath'ed.
+    const missing = spyDependencyIO();
+    const notCloned = path.join(rParent, "not-cloned");
+    expect(resolveEdgeTarget(edge("../not-cloned"), context(), rApp, missing.io)).toEqual({ status: "unadmitted", at: notCloned, name: "not-cloned" });
+    expect(missing.calls).toEqual([{ op: "realpath", p: notCloned }]);
+  });
+
+  it("a target at, inside or above W's top level is skipped with no filesystem call", () => {
+    const { io, calls } = spyDependencyIO();
+    const ctx = context();
+    for (const spec of [".", "./packages/p", "../app/src", ".."]) {
+      expect(resolveEdgeTarget(edge(spec), ctx, rApp, io)).toEqual({ status: "skipped", reason: "insideW" });
+    }
+    // W below its top level: a sibling package of W is still W's repository.
+    const nested = context({ root: path.join(rApp, "packages", "p") });
+    expect(resolveEdgeTarget(edge("../q"), nested, rApp, io)).toEqual({ status: "skipped", reason: "insideW" });
+    expect(calls).toEqual([]);
+  });
+
+  it("another worktree of W's repository is skipped as sameRepository", () => {
+    // `<parent>/app-wt` is a linked worktree of `<parent>/app`: its `.git` file names a git directory whose common dir is app's.
+    const gitDir = path.join(rApp, ".git", "worktrees", "app-wt");
+    fs.mkdirSync(gitDir, { recursive: true });
+    fs.writeFileSync(path.join(gitDir, "commondir"), "../..\n");
+    const appWt = path.join(rParent, "app-wt");
+    fs.mkdirSync(appWt, { recursive: true });
+    fs.writeFileSync(path.join(appWt, ".git"), `gitdir: ${gitDir}\n`);
+
+    const { io } = spyDependencyIO();
+    const ctx = context({ sameRepository: (top) => top === appWt });
+    expect(resolveEdgeTarget(edge("../app-wt"), ctx, rApp, io)).toEqual({ status: "skipped", reason: "sameRepository" });
+
+    // Through dependencyTargets, "same repository" is read from the git common directories (QA-1 F11).
+    fs.writeFileSync(path.join(rApp, "package.json"), JSON.stringify({ dependencies: { wt: "file:../app-wt", b: "file:../lib-b" } }));
+    const result = dependencyTargets(rApp, admissionContext({ parents: [rParent], depth: 1, exclude: [] }, []), io);
+    expect(result.targets).toEqual([{ origin: "edge", at: lib, via: "package.json dependencies (file:)", from: "package.json" }]);
+  });
+
+  it("a path with a node_modules segment is skipped with no filesystem call", () => {
+    const { io, calls } = spyDependencyIO();
+    const ctx = context();
+    expect(resolveEdgeTarget(edge("../lib-b/node_modules/x"), ctx, rApp, io)).toEqual({ status: "skipped", reason: "nodeModules" });
+    expect(resolveEdgeTarget(edge("../lib-b/Node_Modules/x"), ctx, rApp, io)).toEqual({ status: "skipped", reason: "nodeModules" });
+    expect(calls).toEqual([]);
+  });
+
+  it("a Python path line outside every parent is dropped silently; below a parent it is admitted", () => {
+    const { io, calls } = spyDependencyIO();
+    const ctx = context();
+    const pth = ".venv/Lib/site-packages/x.pth";
+    expect(resolveEdgeTarget(edge(outsideLib, "python", pth), ctx, rApp, io)).toEqual({ status: "skipped", reason: "pythonOutside" });
+    expect(resolveEdgeTarget({ ...edge("\\\\server\\share\\py", "python", pth), unc: true }, ctx, rApp, io))
+      .toEqual({ status: "skipped", reason: "pythonOutside" });
+    expect(calls).toEqual([]);
+    expect(resolveEdgeTarget(edge(lib, "python", pth), ctx, rApp, io)).toEqual({ status: "admitted", top: lib });
+  });
+
+  it("dependencyTargets: link targets first, then edge targets once per top, at most EDGE_UNADMITTED_NAMES_MAX unadmitted names", () => {
+    const libC = gitRepo(path.join(rParent, "lib-c"));
+    link(libC, path.join(rApp, "node_modules", "lib-c"));
+    const outside = Array.from({ length: EDGE_UNADMITTED_NAMES_MAX + 2 }, (_, i) => `o${i}`);
+    fs.writeFileSync(path.join(rApp, "package.json"), JSON.stringify({
+      dependencies: {
+        b: "file:../lib-b",
+        "b-src": "file:../lib-b/src", // Same top as b: one target.
+        c: "file:../lib-c", // Already a link target: one target.
+        self: "file:./packages/p", // Inside W: skipped.
+        ...Object.fromEntries(outside.map((name) => [name, `file:../../outside/${name}`])),
+      },
+    }));
+    const { io, calls } = spyDependencyIO();
+    const result = dependencyTargets(rApp, admissionContext({ parents: [rParent], depth: 1, exclude: [] }, []), io);
+
+    expect(result.targets[0]).toEqual({ origin: "link", at: libC });
+    expect(result.targets.slice(1).every((target) => target.origin === "edge")).toBe(true);
+    const edges = result.targets.slice(1);
+    expect(edges.filter((target) => !("fixed" in target))).toEqual([
+      { origin: "edge", at: lib, via: "package.json dependencies (file:)", from: "package.json" },
+    ]);
+    const unadmitted = edges.filter((target) => "fixed" in target);
+    expect(unadmitted).toHaveLength(EDGE_UNADMITTED_NAMES_MAX);
+    for (const target of unadmitted) {
+      expect(target).toMatchObject({ fixed: "unadmitted", via: "package.json dependencies (file:)", from: "package.json" });
+      expect(outside).toContain("name" in target ? target.name : undefined);
+      expect(target.at).toBe(path.join(root, "outside", "name" in target ? target.name : ""));
+    }
+    expect(result.unadmittedMore).toBe(2);
+    expect(result.incomplete).toBe(false);
+    // Text first: nothing outside the parents was touched.
+    expect(touched(calls, path.join(root, "outside"))).toBe(false);
   });
 });
