@@ -16,6 +16,7 @@ import {
   type ChildRunner,
   type Clock,
   type DispatchBookkeeping,
+  type HostError,
   type HostSessionContext,
   type HostSessionEvent,
   type HostSessions,
@@ -647,5 +648,374 @@ describe("dispose", () => {
     expect(seen?.signal.aborted).toBe(true);
     expect(r.onChildCreated).toHaveBeenCalledTimes(1);
     await r.launcher.dispose(); // idempotent
+  });
+});
+
+type Done = { sessionID: string; text: string };
+const noopBookkeeping: DispatchBookkeeping = {
+  decisionRow() {}, recordDispatchStart() {}, registerInFlight() {}, unregisterInFlight() {},
+};
+const promptFor = (taskId: string, attempt: number): string =>
+  `PLAN CONTEXT\nshared\n\n[plan plan-one:${taskId}#${attempt}] nonce=${NONCE}\n\nTASK`;
+
+describe("edge paths: errors, races and leftovers", () => {
+  it("a runner that rejects with a non-Error value reports its string form", async () => {
+    const r = rig();
+    r.fr.state.script = () => Promise.reject("plain failure");
+    const handle = r.launcher.launch(r.req(), r.hooks);
+    expect(await handle.confirmation).toEqual({ kind: "unconfirmed", reason: "threw", error: "plain failure" });
+    expect(await handle.completion).toMatchObject({ kind: "lost", reason: "runner-error" });
+  });
+
+  it("a launcher built after the capture still reports no-context with that epoch once the capture is gone", () => {
+    const clock = fakeClock();
+    const fr = fakeRunner(() => clock.clock.now());
+    fr.capture();
+    const launcher = createTaskLauncher({
+      runner: fr.runner, hosts: fakeHosts().hosts, bindings: { bind() {}, evict() {} }, bookkeeping: noopBookkeeping,
+      clock: clock.clock, lifetime: new AbortController().signal, knownAgent: () => true, onMetric() {},
+    });
+    expect(launcher.gate(ORCH)).toMatchObject({ ok: true, ageMs: 0 });
+    fr.forget();
+    expect(launcher.gate(ORCH)).toEqual({
+      ok: false, reason: "no-context",
+      wake: { reason: "stale-context", stateKey: noContextKey("aaaaaaaaaaaaaaaa", ORCH, 1) },
+    });
+  });
+
+  it("a superseded error after the confirmation already failed keeps the first confirmation and reports one metric", async () => {
+    const r = rig();
+    r.bindings.bind = () => { throw new Error("bind refused"); };
+    const ref = r.req().context;
+    r.fr.state.script = async (req) => {
+      try { await req.onCreated("child-1"); } catch { throw new ContextSupersededError(ref, null); }
+      return { sessionID: "child-1", text: "" };
+    };
+    const handle = r.launcher.launch(r.req(), r.hooks);
+    expect(await handle.confirmation).toEqual({ kind: "unconfirmed", reason: "task-error", error: "bind refused" });
+    expect(await handle.completion).toMatchObject({ kind: "lost", reason: "context-superseded", childSessionID: null });
+    expect(r.metrics.map((m) => m.result)).toEqual(["task-error"]);
+  });
+
+  it("a runner that returns normally after a failed hook is lost/runner-error and keeps the hook-failed confirmation", async () => {
+    const r = rig();
+    r.onChildCreated.mockRejectedValue(new Error("fsync failed"));
+    r.fr.state.script = async (req) => {
+      try { await req.onCreated("child-1"); } catch { /* the runner swallows the hook error */ }
+      return { sessionID: "child-1", text: "ignored" };
+    };
+    const handle = r.launcher.launch(r.req(), r.hooks);
+    expect(await handle.confirmation).toMatchObject({ kind: "unconfirmed", reason: "hook-failed" });
+    expect(await handle.completion).toMatchObject({ kind: "lost", reason: "runner-error", childSessionID: "child-1" });
+    expect(r.metrics.map((m) => m.result)).toEqual(["hook-failed"]);
+    expect(r.evicted).toEqual(["child-1"]);
+    expect(r.launcher.inFlight()).toEqual([]);
+  });
+
+  it("a runner that returns without ever creating a child is unconfirmed/threw, lost/runner-error and stale", async () => {
+    const r = rig();
+    r.fr.state.script = async () => ({ sessionID: "x", text: "" });
+    const handle = r.launcher.launch(r.req(), r.hooks);
+    expect(await handle.confirmation).toEqual({
+      kind: "unconfirmed", reason: "threw", error: "the runner returned without creating a confirmed child",
+    });
+    expect(await handle.completion).toMatchObject({ kind: "lost", reason: "runner-error", childSessionID: null });
+    expect(r.launcher.gate(ORCH)).toMatchObject({ ok: false, reason: "context-stale" });
+    expect(r.launcher.inFlight()).toEqual([]);
+  });
+
+  it("a terminal event that arrives while the hook is still pending is ignored; the runner's result decides", async () => {
+    const r = rig();
+    const hook = deferred<void>();
+    r.onChildCreated.mockImplementation(() => hook.promise);
+    const done = deferred<Done>();
+    r.fr.state.script = creating(r, "child-1", done.promise);
+    const handle = r.launcher.launch(r.req(), r.hooks);
+    await flush();
+    r.fh.emit({ type: "execution.interrupted", sessionID: "child-1", at: r.clock.clock.iso() });
+    hook.resolve();
+    expect(await handle.confirmation).toMatchObject({ kind: "confirmed" });
+    done.resolve({ sessionID: "child-1", text: "fine" });
+    expect(await handle.completion).toMatchObject({ kind: "completed", text: "fine" });
+  });
+
+  it("a child adopted after the timeout ignores terminal events once the completion has settled", async () => {
+    const r = rig();
+    r.onLateChild.mockResolvedValue("adopt");
+    const start = deferred<void>();
+    const done = deferred<Done>();
+    r.fr.state.script = async (req) => { await start.promise; await req.onCreated("late-child"); return done.promise; };
+    const handle = r.launcher.launch(r.req(), r.hooks);
+    await r.clock.advance(30_000);
+    expect(await handle.completion).toMatchObject({ kind: "lost", reason: "unconfirmed" });
+    start.resolve();
+    await flush();
+    r.fh.emit({ type: "execution.completed", sessionID: "late-child", at: r.clock.clock.iso() });
+    await r.clock.advance(10_000);
+    expect(r.fh.hosts.context).not.toHaveBeenCalled();
+    done.resolve({ sessionID: "late-child", text: "x" });
+    await flush();
+    expect(r.evicted).toEqual(["late-child"]);
+    expect(r.launcher.inFlight()).toEqual([]);
+  });
+
+  it("a late child whose onLateChild decision throws is refused", async () => {
+    const r = rig();
+    r.onLateChild.mockRejectedValue(new Error("rt unavailable"));
+    const start = deferred<void>();
+    let outcome: unknown = "pending";
+    r.fr.state.script = async (req) => {
+      await start.promise;
+      try { await req.onCreated("late-child"); outcome = "accepted"; } catch (e) { outcome = e; }
+      return new Promise<Done>(() => undefined);
+    };
+    r.launcher.launch(r.req(), r.hooks);
+    await r.clock.advance(30_000);
+    start.resolve();
+    await flush();
+    expect(outcome).toBeInstanceOf(Error);
+    expect((outcome as Error).message).toContain("late child refused");
+    expect(r.binds).toEqual([]);
+    expect(r.onChildCreated).not.toHaveBeenCalled();
+  });
+
+  it("a runner that rejects after the timeout only releases leftovers", async () => {
+    const r = rig();
+    const gone = deferred<Done>();
+    r.fr.state.script = () => gone.promise;
+    const handle = r.launcher.launch(r.req(), r.hooks);
+    await r.clock.advance(30_000);
+    expect(await handle.completion).toMatchObject({ kind: "lost", reason: "unconfirmed" });
+    expect(r.launcher.inFlight()).toHaveLength(1); // the runner has not settled yet
+    gone.reject(new Error("late failure"));
+    await flush();
+    expect(r.launcher.inFlight()).toEqual([]);
+    expect(r.metrics.map((m) => m.result)).toEqual(["timeout"]);
+  });
+
+  it("execution.completed first, then the runner throws -> completed from the history at once", async () => {
+    const r = rig();
+    r.fh.messages.push({ role: "assistant", text: "history text", outcome: null });
+    const done = deferred<Done>();
+    r.fr.state.script = creating(r, "child-1", done.promise);
+    const handle = r.launcher.launch(r.req(), r.hooks);
+    await handle.confirmation;
+    r.fh.emit({ type: "execution.completed", sessionID: "child-1", at: r.clock.clock.iso() });
+    done.reject(new Error("stream dropped"));
+    expect(await handle.completion).toMatchObject({ kind: "completed", text: "history text", childSessionID: "child-1" });
+  });
+
+  it("a cancelled launch whose runner throws without a terminal event is interrupted/<reason> after the grace", async () => {
+    const r = rig();
+    const done = deferred<Done>();
+    r.fr.state.script = creating(r, "child-1", done.promise);
+    const handle = r.launcher.launch(r.req(), r.hooks);
+    await handle.confirmation;
+    await r.launcher.cancel("T1", 1, "blocked");
+    done.reject(new Error("aborted"));
+    await flush();
+    let end: ChildEnd | null = null;
+    void handle.completion.then((e) => { end = e; });
+    await r.clock.advance(4_999);
+    expect(end).toBeNull();
+    await r.clock.advance(1);
+    expect(end).toMatchObject({ kind: "interrupted", reason: "blocked", childSessionID: "child-1" });
+  });
+
+  it("onCreated after a cancel is refused and the child is never bound", async () => {
+    const r = rig();
+    const start = deferred<void>();
+    let outcome: unknown = "pending";
+    r.fr.state.script = async (req) => {
+      await start.promise;
+      try { await req.onCreated("child-1"); outcome = "accepted"; } catch (e) { outcome = e; }
+      throw new Error("aborted");
+    };
+    const handle = r.launcher.launch(r.req(), r.hooks);
+    await r.launcher.cancel("T1", 1, "abort");
+    start.resolve();
+    await flush();
+    expect(outcome).toBeInstanceOf(Error);
+    expect((outcome as Error).message).toContain("cancelled before the child was prompted");
+    expect(r.binds).toEqual([]);
+    expect(await handle.completion).toMatchObject({ kind: "interrupted", childSessionID: null, reason: "abort" });
+  });
+
+  it("a confirmation timer that fires after the hook was entered does not time the launch out", async () => {
+    const fc = fakeClock();
+    const stubborn: Clock = { ...fc.clock, clearTimer() { /* the timer is already queued */ } };
+    const r = rig({ clock: stubborn });
+    const hook = deferred<void>();
+    r.onChildCreated.mockImplementation(() => hook.promise);
+    const done = deferred<Done>();
+    r.fr.state.script = creating(r, "child-1", done.promise);
+    const handle = r.launcher.launch(r.req(), r.hooks);
+    let settled: LaunchConfirmation | null = null;
+    void handle.confirmation.then((c) => { settled = c; });
+    await fc.advance(31_000);
+    expect(settled).toBeNull();
+    expect(r.metrics).toEqual([]);
+    hook.resolve();
+    await flush();
+    expect(settled).toMatchObject({ kind: "confirmed" });
+    done.resolve({ sessionID: "child-1", text: "x" });
+    expect(await handle.completion).toMatchObject({ kind: "completed" });
+  });
+
+  it("a confirmation timer that fires after the confirmation settled does not overwrite it", async () => {
+    const fc = fakeClock();
+    const stubborn: Clock = { ...fc.clock, clearTimer() { /* the timer is already queued */ } };
+    const r = rig({ clock: stubborn });
+    r.fr.state.script = () => Promise.reject(new Error("host unavailable"));
+    const handle = r.launcher.launch(r.req(), r.hooks);
+    expect(await handle.confirmation).toMatchObject({ kind: "unconfirmed", reason: "threw" });
+    await fc.advance(31_000);
+    expect(await handle.completion).toMatchObject({ kind: "lost", reason: "runner-error" });
+    expect(r.metrics.map((m) => m.result)).toEqual(["threw"]);
+  });
+
+  it("different tasks run side by side; a retry may start once the previous attempt's completion settled", async () => {
+    const r = rig();
+    r.fr.state.script = () => new Promise<Done>(() => undefined);
+    r.launcher.launch(r.req(), r.hooks);
+    r.launcher.launch(r.req({ taskId: "T2", prompt: promptFor("T2", 1) }), r.hooks);
+    expect(r.launcher.inFlight().map((f) => f.taskId).sort()).toEqual(["T1", "T2"]);
+    await r.clock.advance(30_000); // both time out, their runners stay pending
+    r.fr.capture();
+    const retry = r.launcher.launch(r.req({ attempt: 2, prompt: promptFor("T1", 2) }), r.hooks);
+    expect(retry.attempt).toBe(2);
+    expect(r.fr.runner.run).toHaveBeenCalledTimes(3);
+  });
+
+  it("onCreated after dispose is refused and the child is never bound", async () => {
+    const r = rig();
+    const start = deferred<void>();
+    let outcome: unknown = "pending";
+    r.fr.state.script = async (req) => {
+      await start.promise;
+      try { await req.onCreated("child-1"); outcome = "accepted"; } catch (e) { outcome = e; }
+      throw new Error("aborted");
+    };
+    const handle = r.launcher.launch(r.req(), r.hooks);
+    await r.launcher.dispose();
+    start.resolve();
+    await flush();
+    expect(outcome).toBeInstanceOf(Error);
+    expect(r.binds).toEqual([]);
+    expect(await handle.completion).toMatchObject({ kind: "interrupted", childSessionID: null, reason: "dispose" });
+  });
+
+  it("cancel of an unknown launch is a no-op", async () => {
+    const r = rig();
+    await r.launcher.cancel("nope", 1, "abort");
+    expect(r.fh.hosts.interrupt).not.toHaveBeenCalled();
+  });
+
+  it("dispose keeps an earlier cancel reason and otherwise records 'dispose'", async () => {
+    const cancelled = rig();
+    const d1 = deferred<Done>();
+    cancelled.fr.state.script = creating(cancelled, "child-1", d1.promise);
+    const h1 = cancelled.launcher.launch(cancelled.req(), cancelled.hooks);
+    await h1.confirmation;
+    await cancelled.launcher.cancel("T1", 1, "blocked");
+    await cancelled.launcher.dispose();
+    d1.reject(new Error("aborted"));
+    await flush();
+    await cancelled.clock.advance(5_000);
+    expect(await h1.completion).toMatchObject({ kind: "interrupted", reason: "blocked" });
+
+    const plain = rig();
+    const d2 = deferred<Done>();
+    plain.fr.state.script = creating(plain, "child-1", d2.promise);
+    const h2 = plain.launcher.launch(plain.req(), plain.hooks);
+    await h2.confirmation;
+    await plain.launcher.dispose();
+    d2.reject(new Error("aborted"));
+    await flush();
+    await plain.clock.advance(5_000);
+    expect(await h2.completion).toMatchObject({ kind: "interrupted", reason: "dispose" });
+  });
+
+  it("falls back to the last assistant text that is not null, or to an empty text", async () => {
+    const cases: Array<[string, HostSessionContext["messages"], string]> = [
+      ["skips null texts", [
+        { role: "assistant", text: "kept", outcome: null },
+        { role: "assistant", text: null, outcome: null },
+      ], "kept"],
+      ["no assistant message", [{ role: "idle", text: null, outcome: null }], ""],
+    ];
+    for (const [, messages, expected] of cases) {
+      const r = rig();
+      r.fh.messages.push(...messages);
+      const done = deferred<Done>();
+      r.fr.state.script = creating(r, "child-1", done.promise);
+      const handle = r.launcher.launch(r.req(), r.hooks);
+      await handle.confirmation;
+      done.reject(new Error("dropped"));
+      await flush();
+      r.fh.emit({ type: "execution.completed", sessionID: "child-1", at: r.clock.clock.iso() });
+      expect(await handle.completion).toMatchObject({ kind: "completed", text: expected });
+    }
+
+    const r = rig();
+    vi.mocked(r.fh.hosts.context).mockRejectedValue(new Error("history unreadable"));
+    const done = deferred<Done>();
+    r.fr.state.script = creating(r, "child-1", done.promise);
+    const handle = r.launcher.launch(r.req(), r.hooks);
+    await handle.confirmation;
+    done.reject(new Error("dropped"));
+    await flush();
+    r.fh.emit({ type: "execution.completed", sessionID: "child-1", at: r.clock.clock.iso() });
+    expect(await handle.completion).toMatchObject({ kind: "completed", text: "" });
+  });
+
+  it("bookkeeping, binding and metric failures never fail a launch", async () => {
+    const r = rig({
+      onMetric: () => { throw new Error("sink down"); },
+      bindings: { bind() {}, evict() { throw new Error("evict failed"); } },
+      bookkeeping: { ...noopBookkeeping, unregisterInFlight() { throw new Error("unregister failed"); } },
+    });
+    r.fr.state.script = creating(r, "child-1", Promise.resolve({ sessionID: "child-1", text: "done" }));
+    const handle = r.launcher.launch(r.req(), r.hooks);
+    expect(await handle.confirmation).toMatchObject({ kind: "confirmed" });
+    expect(await handle.completion).toMatchObject({ kind: "completed", text: "done" });
+    expect(r.launcher.inFlight()).toEqual([]);
+  });
+
+  it("execution.failed classifies by the provider error: capacity for a rate limit, failed otherwise", async () => {
+    const cases: Array<[HostError, "capacity" | "failed"]> = [
+      [{ type: "provider.rate-limit", status: 429, message: "slow down" }, "capacity"],
+      [{ type: "unknown", status: 500, message: "boom" }, "failed"],
+    ];
+    for (const [error, kind] of cases) {
+      const r = rig();
+      const done = deferred<Done>();
+      r.fr.state.script = creating(r, "child-1", done.promise);
+      const handle = r.launcher.launch(r.req(), r.hooks);
+      await handle.confirmation;
+      const seen = vi.mocked(r.fr.runner.run).mock.calls[0]?.[0];
+      r.fh.emit({ type: "execution.failed", sessionID: "child-1", error, at: r.clock.clock.iso() });
+      expect(await handle.completion).toMatchObject({ kind, childSessionID: "child-1", error });
+      expect(seen?.signal.aborted).toBe(true);
+      expect(r.evicted).toEqual(["child-1"]);
+    }
+  });
+
+  it("events that are not terminal never settle a launch", async () => {
+    const r = rig();
+    const done = deferred<Done>();
+    r.fr.state.script = creating(r, "child-1", done.promise);
+    const handle = r.launcher.launch(r.req(), r.hooks);
+    await handle.confirmation;
+    r.fh.emit({
+      type: "retry", sessionID: "child-1", stepKey: "s1", source: "hook",
+      error: { type: "provider.rate-limit", status: 429, message: "retry" }, at: r.clock.clock.iso(),
+    });
+    let end: ChildEnd | null = null;
+    void handle.completion.then((e) => { end = e; });
+    await r.clock.advance(10_000);
+    expect(end).toBeNull();
+    done.resolve({ sessionID: "child-1", text: "ok" });
+    expect(await handle.completion).toMatchObject({ kind: "completed", text: "ok" });
   });
 });

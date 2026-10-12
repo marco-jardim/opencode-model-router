@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   expandTask,
   loadExpansionEnv,
+  normalizePrefix,
   renderRouteLine,
   renderTaskBlock,
   rewriteAbsolutePaths,
@@ -22,6 +23,7 @@ import {
   type SlotLease,
   type TaskNode,
 } from "../../src/executor/types.js";
+import { registerSlot, unregisterSlot } from "../../src/executor/slots/env.js";
 import { parseRouteLine } from "../../src/routing/classify/route-line.js";
 import { PLAN_ID, buildDraft, clone, nonceFor, openAttempt, taskNode as baseTaskNode } from "../fixtures/cpx/ledger/builders.js";
 
@@ -407,5 +409,179 @@ describe("renderRouteLine: whitelist re-serialization", () => {
     expect(x.routeLine).not.toMatch(/[\r\n]/);
     expect(x.routeLine).not.toContain("evil");
     expect(clone(x).routeLine).toBe(x.routeLine);
+  });
+});
+
+describe("normalizePrefix", () => {
+  it("returns null for an empty, blank or relative path", () => {
+    expect(normalizePrefix("")).toBeNull();
+    expect(normalizePrefix("   ")).toBeNull();
+    expect(normalizePrefix("relative/dir")).toBeNull();
+    expect(normalizePrefix("src\\a.ts")).toBeNull();
+  });
+
+  it("normalizes drive and POSIX prefixes and trims trailing separators except at a root", () => {
+    expect(normalizePrefix("  D:/git/x/ ")).toBe("D:\\git\\x");
+    expect(normalizePrefix("C:\\")).toBe("C:\\");
+    expect(normalizePrefix("/")).toBe("/");
+    expect(normalizePrefix("/home/u//repo/")).toBe("/home/u/repo");
+    expect(normalizePrefix("/a/../b")).toBe("/b");
+  });
+});
+
+describe("rewriteAbsolutePaths: prefix sets and boundaries", () => {
+  const map: PathMap = { mappable: [MAIN], inRepo: [MAIN], slot: SLOT, longPaths: false };
+
+  it("ignores relative prefixes and folds drive prefixes that differ only in case", () => {
+    const m: PathMap = { mappable: ["relative/dir", MAIN, MAIN.toUpperCase()], inRepo: [], slot: SLOT, longPaths: false };
+    expect(rewriteAbsolutePaths(`${MAIN}\\a and relative/dir/x`, m)).toBe(`${SLOT}\\a and relative/dir/x`);
+  });
+
+  it("orders equally long prefixes by code unit, whatever the input order", () => {
+    for (const mappable of [["/b/xx", "/a/xx", "/c/xx"], ["/c/xx", "/a/xx", "/b/xx"], ["/a/xx", "/b/xx", "/c/xx"]]) {
+      const m: PathMap = { mappable, inRepo: [], slot: "/slots/s1", longPaths: false };
+      expect(rewriteAbsolutePaths("/a/xx/f and /b/xx/g and /c/xx/h", m)).toBe("/slots/s1/f and /slots/s1/g and /slots/s1/h");
+    }
+  });
+
+  it("maps a root prefix and keeps its separator", () => {
+    const posix: PathMap = { mappable: ["/"], inRepo: ["/"], slot: "/slots/s1", longPaths: false };
+    expect(rewriteAbsolutePaths("open /etc/x now", posix)).toBe("open /slots/s1/etc/x now");
+    const drive: PathMap = { mappable: ["C:\\"], inRepo: ["C:\\"], slot: SLOT, longPaths: false };
+    expect(rewriteAbsolutePaths("see C:\\Users\\a.txt", drive)).toBe(`see ${SLOT}\\Users\\a.txt`);
+    expect(rewriteAbsolutePaths("see C:/Users/a.txt", drive)).toBe(`see ${SLOT}/Users/a.txt`);
+  });
+
+  it("stops a prefix at a terminator, but not at a dot that continues the name", () => {
+    expect(rewriteAbsolutePaths(`see ${MAIN}, then`, map)).toBe(`see ${SLOT}, then`);
+    const dotted = `${MAIN}.old\\x`;
+    expect(rewriteAbsolutePaths(dotted, map)).toBe(dotted);
+  });
+
+  it("does not start a path inside a word", () => {
+    const glued = `x${MAIN}\\a`;
+    expect(rewriteAbsolutePaths(glued, map)).toBe(glued);
+  });
+
+  it("does not apply MAX_PATH to a POSIX slot", () => {
+    const posix: PathMap = { mappable: ["/home/u/Repo"], inRepo: ["/home/u/Repo"], slot: "/slots/s1", longPaths: false };
+    const tail = "a".repeat(300);
+    expect(rewriteAbsolutePaths(`/home/u/Repo/${tail}`, posix)).toBe(`/slots/s1/${tail}`);
+  });
+});
+
+describe("loadExpansionEnv: failure details and odd worktree lines", () => {
+  it("reports a failure without stderr by its exit code", async () => {
+    const noStderr = gitDouble({ list: result(128), config: result(1) });
+    await expect(loadExpansionEnv(noStderr.git, { toplevel: MAIN, slotPath: SLOT, timeoutMs: 1 })).rejects.toMatchObject({ code: "E_GIT" });
+    const killed = gitDouble({ list: result(null), config: result(1) });
+    await expect(loadExpansionEnv(killed.git, { toplevel: MAIN, slotPath: SLOT, timeoutMs: 1 })).rejects.toMatchObject({ code: "E_GIT" });
+    const badConfig = gitDouble({ list: result(0, PORCELAIN), config: result(2) });
+    await expect(loadExpansionEnv(badConfig.git, { toplevel: MAIN, slotPath: SLOT, timeoutMs: 1 })).rejects.toMatchObject({ code: "E_GIT" });
+  });
+
+  it("skips relative worktree paths and tolerates CRLF line ends", async () => {
+    const porcelain = "worktree relative/path\r\nHEAD aaaa\r\n\r\nworktree D:/git/omr-cpx-main\r\nbranch refs/heads/main\r\n";
+    const { git } = gitDouble({ list: result(0, porcelain), config: result(1) });
+    expect(await loadExpansionEnv(git, { toplevel: MAIN, slotPath: SLOT, timeoutMs: 1 })).toEqual({ worktrees: [MAIN], longPaths: false });
+  });
+});
+
+describe("renderRouteLine: remaining token paths", () => {
+  const routeOf = (line: string, over: Partial<TaskNode["route"]> = {}): TaskNode =>
+    taskNode("T1", { route: { line, role: "implementer", tier: null, pin: false, ...over } });
+
+  it("renders a bare [route] with only the root", () => {
+    expect(renderRouteLine(routeOf("[route]"), SLOT)).toBe(`[route root=${SLOT}]`);
+  });
+
+  it("reads pin values: true, yes and 1 set it, false, no and 0 clear it", () => {
+    for (const v of ["pin=true", "pin=yes", "pin=1", "pin=TRUE", "pin"]) {
+      expect(renderRouteLine(routeOf(`[route ${v}]`), SLOT), v).toBe(`[route root=${SLOT} pin]`);
+    }
+    for (const v of ["pin=false", "pin=no", "pin=0"]) {
+      expect(renderRouteLine(routeOf(`[route ${v}]`), SLOT), v).toBe(`[route root=${SLOT}]`);
+    }
+  });
+
+  it("rejects an unknown scope and a tier that is not one of the three", () => {
+    expect(codeOf(() => renderRouteLine(routeOf("[route scope=galaxy]"), SLOT))).toBe("E_LAUNCH_TASK");
+    const bad = routeOf("[route class=debug]", { tier: "ultra" as unknown as TaskNode["route"]["tier"] });
+    expect(codeOf(() => renderRouteLine(bad, SLOT))).toBe("E_LAUNCH_TASK");
+  });
+
+  it("lists a repeated need once", () => {
+    expect(renderRouteLine(routeOf("[route class=debug needs=edit,edit]"), SLOT)).toBe(`[route class=debug needs=edit root=${SLOT}]`);
+  });
+});
+
+describe("expandTask: declared roots and sections", () => {
+  it("maps a quoted root= that holds a space", () => {
+    const t = taskNode("T1", {
+      text: "see D:\\my dir\\x\\a.ts today",
+      route: { line: "[route class=debug root=\"D:\\my dir\\x\"]", role: "implementer", tier: null, pin: false },
+    });
+    const x = expandTask(input(ledgerOf([t]), "T1"));
+    expect(x.prompt).toContain(`see ${SLOT}\\a.ts today`);
+    expect(x.prompt).not.toContain("my dir");
+    expect(x.routeLine).toBe(`[route class=debug root=${SLOT}]`);
+  });
+
+  it("maps a bare root= followed by a comma", () => {
+    const t = taskNode("T1", {
+      text: "open D:\\git\\omr-cpx-p62\\x.ts",
+      route: { line: "[route class=debug root=D:\\git\\omr-cpx-p62, tier=fast]", role: "implementer", tier: null, pin: false },
+    });
+    const x = expandTask(input(ledgerOf([t]), "T1"));
+    expect(x.prompt).toContain(`open ${SLOT}\\x.ts`);
+    expect(x.prompt).not.toMatch(/omr-cpx-p62/i);
+  });
+
+  it("rejects ids that are only inherited object properties", () => {
+    const l = ledgerOf([taskNode("T1")]);
+    for (const id of ["constructor", "__proto__", "toString"]) {
+      expect(codeOf(() => expandTask(input(l, id))), id).toBe("E_LAUNCH_TASK");
+    }
+  });
+
+  it("omits ACCEPTANCE when the block has no criteria line", () => {
+    const t = taskNode("T1", { acceptance: `[acceptance]\ncwd: ${MAIN}\ncheck: buildPasses\n[/acceptance]` });
+    expect(expandTask(input(ledgerOf([t]), "T1")).prompt).not.toContain("\nACCEPTANCE\n");
+  });
+
+  it("omits the task text when blank, and ATTEMPT CONTEXT without attempts or with a blank context", () => {
+    const blank = taskNode("T1", { text: "   ", attempts: [] });
+    const p = expandTask(input(ledgerOf([blank]), "T1")).prompt;
+    expect(p).toMatch(/^TASK T1: [^\n]*\n\n(SUBTASKS|Writes: )/m);
+    expect(p).not.toContain("ATTEMPT CONTEXT");
+    const spaces = taskNode("T1", { attempts: [{ ...openAttempt(1), context: "  \n " }] });
+    expect(expandTask(input(ledgerOf([spaces]), "T1")).prompt).not.toContain("ATTEMPT CONTEXT");
+  });
+
+  it("lists footprint paths, or (none) when empty", () => {
+    const base = taskNode("T1").footprint;
+    const empty = taskNode("T1", { footprint: { ...base, writes: [], reads: [] } });
+    expect(expandTask(input(ledgerOf([empty]), "T1")).prompt).toContain("Writes: (none)\nReads: (none)");
+    const some = taskNode("T1", { footprint: { ...base, writes: ["src/a.ts", "src/b.ts"], reads: ["docs/c.md"] } });
+    expect(expandTask(input(ledgerOf([some]), "T1")).prompt).toContain("Writes: src/a.ts, src/b.ts\nReads: docs/c.md");
+  });
+
+  it("states the environment of a registered slot: variables, PATH prefix and unset names", () => {
+    try {
+      registerSlot({ root: SLOT, managers: ["pip", "npm"] });
+      const python = expandTask(input(ledgerOf([taskNode("T1")]), "T1")).prompt;
+      expect(python).toContain("VIRTUAL_ENV=");
+      expect(python).toContain("PATH prepend: ");
+      expect(python).toContain("unset: PYTHONPATH");
+      expect(python).not.toContain("unset: VIRTUAL_ENV");
+      registerSlot({ root: SLOT, managers: ["npm"] });
+      const node = expandTask(input(ledgerOf([taskNode("T1")]), "T1")).prompt;
+      expect(node).not.toContain("VIRTUAL_ENV=");
+      expect(node).toContain("PATH prepend: ");
+      expect(node).toContain("unset: VIRTUAL_ENV");
+    } finally {
+      unregisterSlot(SLOT);
+    }
+    expect(expandTask(input(ledgerOf([taskNode("T1")]), "T1")).prompt).not.toContain("unset: ");
   });
 });
