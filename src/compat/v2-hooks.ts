@@ -48,7 +48,7 @@ import { appliedEffort, appliedThinkingBudget, createEffortStore, registerEffort
 import {
   acquireLeaseRegistry, attemptLabel, COMPLETION_SETTLE_MS, createCompletionProcessor, createHeldResults, createInFlightRegistry,
   createLeaseGuard, decideBackground, PENDING_GUARANTEES_TEXT, PROVIDER_ORDER, renderCompleted, renderHeld, renderInFlight,
-  ROUTER_FINISH_ATTACH,
+  restoredDispatchOf, ROUTER_FINISH_ATTACH,
 } from "./background";
 import { acquireTimingRecorder, classifyCapacity } from "../routing/outcomes/timings";
 import type { TimingRecorderHolder } from "../routing/outcomes/timings";
@@ -65,7 +65,7 @@ import { createDurationModel, DURATION_MIN_SAMPLES } from "../routing/outcomes/d
 import type { DurationModel } from "../routing/outcomes/durations";
 import type {
   Attempt, CompletionProcessor, FinishApi, FinishAttach, HeldResults, InFlightRegistry, InflightJournal, LeaseGuard, PersistedRecord,
-  RestoredHold, RestoredHolds,
+  RestoredDispatch, RestoredHold, RestoredHolds,
 } from "./background";
 import { PENDING_JOURNAL_VANISHED } from "../verify/pending";
 
@@ -706,7 +706,9 @@ const COMPLETION_ELEMENT = /<subagent sessionID="([^"]+)" state="([^"]+)"[^>]*>(
 
 /** QA-2.1-8: the refusal of a resume while the pending journal is not reloaded (the session may be held). */
 export function reloadFailedResumeText(child: string): string {
-  return `[router] Refused: the router could not reload its pending journal, so session ${child} may be held for verification. Resume it after the router recovers (it retries on its own).`;
+  // QA-2.1-16: the retry is real: each refused call (and each later hook or event) starts another reload, or rebuilds a
+  // vanished journal, at most every PENDING_RELOAD_RETRY_MS.
+  return `[router] Refused: the router could not reload its pending journal, so session ${child} may be held for verification. Try the resume again shortly: each attempt makes the router retry the reload (at most every ${PENDING_RELOAD_RETRY_MS / 1000} s).`;
 }
 
 /** QA-2.1-20: a `sessionID` / `task_id` key given a string literal in Code Mode code (`sessionID: "x"`, `"task_id": 'x'`, `task_id = "x"`). */
@@ -1329,13 +1331,12 @@ export async function registerV2Hooks(
       try {
         await shared.append(...args);
       } catch (error) {
-        // QA-2.1-8: a journal that vanished under this process fails closed exactly like a failed reload.
-        if (error instanceof Error && error.message === PENDING_JOURNAL_VANISHED && !reloadFailed) {
-          reloadFailed = true;
-          lastReloadAt = nowMs();
-          ingestLogger.warn("[router] background: the pending journal vanished; holding is off and unprocessed results are redacted");
-        }
-        throw error;
+        if (!(error instanceof Error && error.message === PENDING_JOURNAL_VANISHED)) throw error;
+        // QA-2.1-8: a journal that vanished under this process fails closed exactly like a failed reload, until QA-2.1-16
+        // rewrites it from the in-memory state; then this append is tried once more.
+        noteVanished();
+        if (!(await recreateJournal())) throw error;
+        await shared.append(...args);
       }
     },
     hasProcessed: (key) => processedKeys.has(key) || finishApi?.journal?.hasProcessed(key) === true,
@@ -1399,7 +1400,9 @@ export async function registerV2Hooks(
   /**
    * Memo §12: the journal reload failed or timed out, or the journal vanished under this process (QA-2.1-8). Holding is off,
    * every unprocessed `<subagent>` element is redacted (context and compaction hooks) and a resume of a session this process
-   * does not know is refused (it may be held). Not permanent: `retryReload` tries again every PENDING_RELOAD_RETRY_MS.
+   * does not know is refused (it may be held). A failed reload is retried by `retryReload` (at most every
+   * PENDING_RELOAD_RETRY_MS); a vanished journal is recreated from this process's in-memory state by `recreateJournal`
+   * (QA-2.1-16), and a successful reload or recreation ends the state.
    */
   let reloadFailed = false;
   let lastReloadAt = 0;
@@ -1415,7 +1418,19 @@ export async function registerV2Hooks(
   };
   /** V2_BACKGROUND_SETTLED: waits until the in-flight set is empty (work a settled task started is waited for too). Never rejects. */
   const settleBackground = async (): Promise<void> => {
-    while (inFlightWork.size > 0) await Promise.allSettled([...inFlightWork]);
+    for (;;) {
+      while (inFlightWork.size > 0) await Promise.allSettled([...inFlightWork]);
+      // QA-2.1-21: the held gates the plugin runs behind `finish` (and the verdict posts they start here) count too.
+      const api = finishApi;
+      if (api === undefined) return;
+      try {
+        await api.idle();
+      } catch (error) {
+        ingestLogger.warn("[router] background: the plugin's held gates could not be awaited", { error: String(error) });
+        return;
+      }
+      if (inFlightWork.size === 0) return;
+    }
   };
   /** QA-2.1-8: one bounded reload of the pending journal (concurrent callers share it); success ends the fail-closed state. */
   const reloadJournal = (): Promise<boolean> => {
@@ -1434,6 +1449,12 @@ export async function registerV2Hooks(
         reloadFailed = false;
         return true;
       } catch (error) {
+        if (timer !== undefined) clearTimeout(timer);
+        // QA-2.1-16: a vanished journal is never found again by a reload: it is rewritten from the in-memory state.
+        if (error instanceof Error && error.message === PENDING_JOURNAL_VANISHED) {
+          noteVanished();
+          return await recreateJournal();
+        }
         reloadFailed = true;
         ingestLogger.warn("[router] background: the pending journal could not be reloaded; holding is off and unprocessed results are redacted", { error: String(error) });
         return false;
@@ -1444,6 +1465,67 @@ export async function registerV2Hooks(
     })();
     return reloading;
   };
+  /** QA-2.1-16: told once per vanishing (until a recreation succeeds). */
+  let vanishedWarned = false;
+  /** QA-2.1-8: a journal that vanished under this process fails closed exactly like a failed reload (until it is recreated). */
+  const noteVanished = (): void => {
+    reloadFailed = true;
+    lastReloadAt = nowMs();
+    if (vanishedWarned) return;
+    vanishedWarned = true;
+    ingestLogger.warn("[router] background: the pending journal vanished; it is recreated from memory, and until then holding is off and unprocessed results are redacted");
+  };
+  /**
+   * QA-2.1-16: the records of this adapter's in-memory state a later restore needs: the live attempts not processed yet
+   * (`inflight`, with their dispatch data), every hold (`hold`, `hold-text`, `posting`, `posted`) and the dormant
+   * `inflight` records of sessions not seen yet. The plugin adds its pending entries and dormant records.
+   */
+  const adapterRecords = (): PersistedRecord[] => {
+    const out: PersistedRecord[] = [];
+    for (const attempt of inflight.list()) {
+      if (attempt.state !== "acknowledged" && attempt.state !== "child-ended" && attempt.state !== "processing") continue;
+      if (journal.hasProcessed(attempt.key)) continue;
+      const dispatch = restoredDispatches.get(attempt.callID) ?? finishApi?.dispatchOf(attempt.callID);
+      out.push({
+        v: 1, kind: "inflight", key: attempt.key, callID: attempt.callID, parentSessionID: attempt.parentSessionID,
+        childSessionID: attempt.childSessionID, label: attemptLabel(attempt), at: attempt.ackAt ?? attempt.at,
+        agent: attempt.agent, description: attempt.description, verifying: attempt.verifying, verificationMode: attempt.verificationMode,
+        ...(attempt.role === undefined ? {} : { role: attempt.role }),
+        ...(attempt.hold === undefined ? {} : { handle: attempt.hold.handle }), hold: attempt.hold?.handle ?? null,
+        ...(dispatch === undefined ? {} : { dispatch }),
+      });
+    }
+    out.push(...held.persisted());
+    for (const records of dormantInflight.values()) out.push(...records);
+    return out;
+  };
+  let recreating: Promise<boolean> | undefined;
+  /**
+   * QA-2.1-16: rewrites a vanished journal from the in-memory state (`FinishApi.recreateJournal`); concurrent callers share
+   * one rewrite. Success ends the fail-closed state; a failure keeps it, and the next append or `retryReload` tries again.
+   */
+  const recreateJournal = (): Promise<boolean> => {
+    if (recreating !== undefined) return recreating;
+    const api = finishApi;
+    if (api === undefined) return Promise.resolve(false);
+    lastReloadAt = nowMs();
+    recreating = (async () => {
+      try {
+        await api.recreateJournal(adapterRecords());
+        if (reloadFailed) ingestLogger.warn("[router] background: the pending journal was recreated from memory; holding is available again");
+        reloadFailed = false;
+        vanishedWarned = false;
+        return true;
+      } catch (error) {
+        reloadFailed = true;
+        ingestLogger.warn("[router] background: the pending journal could not be recreated; holding stays off and it is tried again", { error: String(error) });
+        return false;
+      } finally {
+        recreating = undefined;
+      }
+    })();
+    return recreating;
+  };
   /** QA-2.1-8: while the reload is failed, a hook or event starts another try (never awaited, at most every PENDING_RELOAD_RETRY_MS). */
   const retryReload = (): void => {
     if (!reloadFailed || reloading !== undefined || finishApi === undefined || nowMs() - lastReloadAt < PENDING_RELOAD_RETRY_MS) return;
@@ -1451,8 +1533,15 @@ export async function registerV2Hooks(
   };
   /** Reloaded in-flight records (memo §11.3): dormant until this process sees the parent session. */
   const dormantInflight = new Map<string, PersistedRecord[]>();
-  /** Set once the completion processor exists: recovers the adopted `inflight` records of a session. */
-  let recoverInflight: ((sessionID: string) => void) | undefined;
+  /**
+   * Set once the completion processor exists: recovers the adopted `inflight` records of a session. Returns the call ids
+   * of the attempts acknowledged for recovery (QA-2.1-29: their holds get their verdict from that recovery).
+   */
+  let recoverInflight: ((sessionID: string) => Set<string>) | undefined;
+  /** QA-2.1-17: the dispatch data journaled with the `inflight` records being recovered, by call id (bounded). */
+  const restoredDispatches = new Map<string, RestoredDispatch>();
+  /** QA-2.1-29: restored holds of sessions adopted before the processor existed, waiting for the start-up recovery. */
+  const deferredRestores = new Map<string, RestoredHolds>();
   /** Background guarantees apply: mode ≠ off AND the finish API attached. Otherwise every code path below behaves as `off`. */
   const bgActive = (): boolean => bgMode !== "off" && finishApi !== undefined;
   /** `router_run` contamination notes from `execute.before`, appended in `execute.after` (bounded). */
@@ -1541,11 +1630,18 @@ export async function registerV2Hooks(
       const adopted = finishApi.adopt(sessionID);
       if (adopted === undefined) return;
       const restored = adopted.holds.length > 0 ? held.restore(adopted.holds) : { reposts: [], unverified: [] };
-      const recovering = new Set<string>();
-      for (const rec of adopted.inflight) if (typeof rec.callID === "string") recovering.add(rec.callID);
+      let recovering = new Set<string>();
       if (adopted.inflight.length > 0) {
         dormantInflight.set(sessionID, [...adopted.inflight]);
-        recoverInflight?.(sessionID);
+        if (recoverInflight === undefined) {
+          // Recovered once the processor exists (the start-up loop): their holds wait for that recovery.
+          for (const rec of adopted.inflight) if (typeof rec.callID === "string") recovering.add(rec.callID);
+          deferredRestores.set(sessionID, { reposts: [], unverified: restored.unverified.filter((h) => recovering.has(h.callID)) });
+        } else {
+          // QA-2.1-29: only the attempts actually acknowledged for recovery settle their holds; a record whose recovery is
+          // skipped (`decide` refused, `acknowledge` undefined) leaves its hold to `settleRestoredHolds` below.
+          recovering = recoverInflight(sessionID);
+        }
       }
       // R20/R21 (QA-2.1-2, QA-2.1-6): the restored holds still owe their verdict; a hold whose child is recovered above gets it there.
       if (restored.reposts.length > 0 || restored.unverified.some((h) => !recovering.has(h.callID))) {
@@ -1600,11 +1696,24 @@ export async function registerV2Hooks(
       // A duplicate verdict is visible and harmless; a missing one keeps the child held for good.
       ingestLogger.warn("[router] background: the parent's history could not be read; restored verdicts are posted again", { parent, error: String(error) });
     }
-    for (const r of restored.reposts) await held.settleRestored(r.handle, posted.has(r.handle));
+    // QA-2.1-31: a verdict posted here (or found posted) bypasses the plugin's gate: its restored pending entry is settled
+    // with it, so `router_verify` stops saying that the verdict follows.
+    const settleEntry = (handle: string, verdict: "PASS" | "FAIL" | "UNVERIFIABLE", reason?: string): void => {
+      try {
+        finishApi?.settleHeldDirect(parent, handle, { verdict, ...(reason === undefined ? {} : { reason }) });
+      } catch (error) {
+        ingestLogger.warn("[router] background: the pending entry of a restored hold could not be settled", { handle, error: String(error) });
+      }
+    };
+    for (const r of restored.reposts) {
+      await held.settleRestored(r.handle, posted.has(r.handle));
+      settleEntry(r.handle, verdictOfText(r.text));
+    }
     for (const h of restored.unverified) {
       if (recovering.has(h.callID)) continue;
       if (posted.has(h.handle)) {
         await held.settleRestored(h.handle, true);
+        settleEntry(h.handle, "UNVERIFIABLE", "verdict posted before the restart");
         continue;
       }
       if (reverifyRestored !== undefined) {
@@ -1612,8 +1721,14 @@ export async function registerV2Hooks(
         continue;
       }
       await held.verdict(h.handle, { verdict: "UNVERIFIABLE", text: "[router] not verified: lost in restart", reason: "lost in restart" });
-      finishApi?.releaseHeld?.(h.handle);
+      settleEntry(h.handle, "UNVERIFIABLE", "lost in restart");
+      finishApi?.releaseHeld(h.handle);
     }
+  };
+  /** QA-2.1-31: the verdict a journaled verdict text names (UNVERIFIABLE when it names none). */
+  const verdictOfText = (text: string): "PASS" | "FAIL" | "UNVERIFIABLE" => {
+    const match = /\b(PASS|FAIL|UNVERIFIABLE)\b/.exec(text);
+    return match === null ? "UNVERIFIABLE" : (match[1] as "PASS" | "FAIL" | "UNVERIFIABLE");
   };
   // Sweeps on an unref'd 5-minute interval (memo §4.1): the timing recorder, the in-flight registry and the leases.
   const sweepTimer = setInterval(() => {
@@ -2289,6 +2404,8 @@ export async function registerV2Hooks(
         // attempt for may be a resume of a held child: refused (fail closed) until a reload succeeds.
         // QA-2.1-20: Code Mode `execute` code is inspected too, as `held.refusal` does: a session it resumes by name is refused alike.
         if (reloadFailed) {
+          // QA-2.1-16: the refusal promises a retry; each refused attempt starts one (bounded by PENDING_RELOAD_RETRY_MS).
+          retryReload();
           for (const target of resumeTargetsOf(event.tool, heldArgs, String(event.sessionID))) {
             if (inflight.byChild(target) === undefined) throw refused(reloadFailedResumeText(target), callerRole);
           }
@@ -2581,27 +2698,44 @@ export async function registerV2Hooks(
       const captureDeltaOf = api.captureDelta?.bind(api);
       // R20 (QA-2.1-6): a restored hold with its child text runs the gate again; without one it ends UNVERIFIABLE.
       reverifyRestored = async (hold) => {
+        // QA-2.1-31: every verdict posted here bypasses the plugin's gate; the restored pending entry is settled with it.
+        const settleEntry = (verdict: "PASS" | "FAIL" | "UNVERIFIABLE", reason?: string): void => {
+          try {
+            api.settleHeldDirect(hold.parentSessionID, hold.handle, { verdict, ...(reason === undefined ? {} : { reason }) });
+          } catch (error) {
+            ingestLogger.warn("[router] background: the pending entry of a restored hold could not be settled", { handle: hold.handle, error: String(error) });
+          }
+        };
         const unverifiable = async (reason: string): Promise<void> => {
           await held.verdict(hold.handle, { verdict: "UNVERIFIABLE", text: `${hold.childText === undefined ? "" : `${hold.childText}\n`}[router] not verified: ${reason}`, reason });
-          api.releaseHeld?.(hold.handle);
+          settleEntry("UNVERIFIABLE", reason);
+          api.releaseHeld(hold.handle);
         };
+        // QA-2.1-17: `hold-text` is journaled for a succeeded child only, so a missing text is a child that did not
+        // succeed, or one the restart cut before its text was kept.
         const childText = hold.childText;
         if (childText === undefined) {
           await unverifiable("lost in restart");
           return;
         }
         try {
+          // QA-2.1-17: the plugin rebuilds the gate inputs from the journaled dispatch and the restored pending entry, and
+          // re-posts a verdict the entry already reached.
           const result = await within(hookContext({ sessionID: hold.parentSessionID, agent: undefined, messageID: "", id: hold.callID }), () => api.finish({
             callID: hold.callID, parentSessionID: hold.parentSessionID, childSessionID: hold.childSessionID, outputText: childText,
-            status: "succeeded", mode: "background", heldHandle: hold.handle, endedAt: nowMs(),
+            status: "succeeded", mode: "background", heldHandle: hold.handle, endedAt: nowMs(), restored: hold.dispatch,
           }));
           // The gate runs behind `finish`; it posts the verdict through the HeldSink when it settles.
           if (result.verification.kind === "held") return;
-          api.releaseHeld?.(hold.handle);
+          api.releaseHeld(hold.handle);
           const v = result.verification;
-          await held.verdict(hold.handle, v.kind === "required"
-            ? { verdict: v.verdict, text: result.outputText }
-            : { verdict: "UNVERIFIABLE", text: `${result.outputText}\n[router] not verified: no verification ran`, reason: "no verification ran" });
+          if (v.kind === "required") {
+            await held.verdict(hold.handle, { verdict: v.verdict, text: result.outputText });
+            settleEntry(v.verdict, v.verdict === "UNVERIFIABLE" ? "verification data lost in restart" : undefined);
+            return;
+          }
+          await held.verdict(hold.handle, { verdict: "UNVERIFIABLE", text: `${result.outputText}\n[router] not verified: no verification ran`, reason: "no verification ran" });
+          settleEntry("UNVERIFIABLE", "no verification ran");
         } catch (error) {
           await unverifiable(`verification after a restart failed: ${String(error)}`);
         }
@@ -2626,7 +2760,13 @@ export async function registerV2Hooks(
         // 2.1.4.b: the change set at child end, so a background completion verifies what the child changed.
         ...(captureDeltaOf === undefined ? {} : { captureDelta: captureDeltaOf }),
         // QA-2.1-4: a held attempt that ends without a held register gives its reserved handle back.
-        releaseHeld: (handle) => api.releaseHeld?.(handle),
+        releaseHeld: (handle) => api.releaseHeld(handle),
+        // QA-2.1-17: a recovery finishes with the dispatch data its `inflight` record journaled.
+        restoredDispatch: (attempt) => {
+          const dispatch = restoredDispatches.get(attempt.callID);
+          restoredDispatches.delete(attempt.callID);
+          return dispatch;
+        },
       });
       const closing = processor;
       closeAttempt = (attempt, cause) => closing.closeUnknown(attempt, cause);
@@ -2635,6 +2775,7 @@ export async function registerV2Hooks(
       recoverInflight = (sessionID) => {
         const records = dormantInflight.get(sessionID);
         dormantInflight.delete(sessionID);
+        const recovering = new Set<string>();
         for (const rec of records ?? []) {
           const callID = typeof rec.callID === "string" ? rec.callID : undefined;
           const child = typeof rec.childSessionID === "string" ? rec.childSessionID : typeof rec.child === "string" ? rec.child : undefined;
@@ -2654,6 +2795,10 @@ export async function registerV2Hooks(
             ? inflight.acknowledge(callID, child, { userBackgrounded: true, ...(holdHandle === undefined ? {} : { hold: { handle: holdHandle } }) })
             : undefined;
           if (attempt === undefined) continue;
+          recovering.add(callID);
+          restoredDispatches.delete(callID);
+          restoredDispatches.set(callID, restoredDispatchOf(rec.dispatch));
+          while (restoredDispatches.size > MAX_ADOPTED_SESSIONS) restoredDispatches.delete(restoredDispatches.keys().next().value!);
           trackBackground((async () => {
             // QA-2.1-6: the child's END STATE decides (succeeded / failed / interrupted / never finished), not just "some text exists".
             let end: ChildEndState = { outcome: "lost" };
@@ -2670,8 +2815,17 @@ export async function registerV2Hooks(
             if (end.outcome === "lost" && holdHandle === undefined) await wakeParentLost(attempt);
           })());
         }
+        return recovering;
       };
-      for (const sessionID of [...dormantInflight.keys()]) recoverInflight(sessionID);
+      for (const sessionID of [...dormantInflight.keys()]) {
+        const recovered = recoverInflight(sessionID);
+        // QA-2.1-29: a hold adopted before the processor existed waited for this recovery; a skipped one is settled now.
+        const waiting = deferredRestores.get(sessionID);
+        deferredRestores.delete(sessionID);
+        if (waiting !== undefined && waiting.unverified.some((h) => !recovered.has(h.callID))) {
+          trackBackground(settleRestoredHolds(sessionID, waiting, recovered));
+        }
+      }
     }
     // Phase 2.1 (memo §13): the three turn-state providers. They render nothing (and are not registered) under `off`.
     if (bgActive() && processor !== undefined) {
@@ -2735,12 +2889,20 @@ export async function registerV2Hooks(
                 ? `${notRunning} Its result will arrive unverified; the verdict follows in the router state.`
                 : `${notRunning} Router guarantees apply when it completes.`;
               let journaled = true;
+              // QA-2.1-17: the prompt, cwd and work root go with the records, so a gate after a restart has its inputs.
+              let dispatch: RestoredDispatch | undefined;
+              try {
+                dispatch = finishApi?.dispatchOf(event.id);
+              } catch (error) {
+                ingestLogger.warn("[router] background: the dispatch data could not be read; a restart cannot verify it", { error: String(error) });
+              }
               try {
                 await journal.append({
                   v: 1, kind: "inflight", key: attempt.key, callID: event.id, parentSessionID: parent, childSessionID: resultChild,
                   label: attemptLabel(attempt), ...(handle === undefined ? {} : { handle }), at: nowMs(),
                   agent: rec.agent, description: rec.description, verifying: rec.verifying, verificationMode: rec.verificationMode,
                   ...(rec.role === undefined ? {} : { role: rec.role }), hold: handle ?? null,
+                  ...(dispatch === undefined ? {} : { dispatch }),
                 }, { fsync: true });
               } catch (error) {
                 journaled = false;
@@ -2749,7 +2911,10 @@ export async function registerV2Hooks(
               let holding = false;
               if (handle !== undefined && journaled) {
                 try {
-                  await held.hold({ handle, parentSessionID: parent, childSessionID: resultChild, callID: event.id, label: attemptLabel(attempt) });
+                  await held.hold({
+                    handle, parentSessionID: parent, childSessionID: resultChild, callID: event.id, label: attemptLabel(attempt),
+                    ...(dispatch === undefined ? {} : { dispatch }),
+                  });
                   holding = true;
                 } catch (error) {
                   ingestLogger.warn("[router] background: the result could not be held; it arrives unverified", { error: String(error) });
@@ -2970,10 +3135,17 @@ export async function registerV2Hooks(
               // QA-2.1-6: an end event adopts the parent's records: the root itself, or (for a child this process has no attempt for)
               // its parent, looked up once (`sessionOf`) and never awaited here.
               if (sessionKinds.get(sid) === "root") adoptSession(sid);
-              else if (bgActive() && inflight.byChild(sid) === undefined) {
+              else if (bgActive() && inflight.byChild(sid) === undefined && !sessionKinds.has(sid)) {
+                // QA-2.1-30: only a session of unknown kind is looked up: a child seen at `session.created` had its parent
+                // adopted there, and a looked-up child is remembered, so later ends never call `sessionOf` again.
                 trackBackground(sessionOf(sid).then((session) => {
                   const parentID: unknown = session !== null && typeof session === "object" ? Reflect.get(session, "parentID") : undefined;
-                  adoptSession(typeof parentID === "string" && parentID !== "" ? parentID : sid);
+                  if (typeof parentID === "string" && parentID !== "") {
+                    noteSessionKind(sid, "child");
+                    adoptSession(parentID);
+                  } else {
+                    adoptSession(sid);
+                  }
                 }));
               }
               if (bgActive() && processor !== undefined) {

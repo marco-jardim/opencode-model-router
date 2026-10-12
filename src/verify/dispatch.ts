@@ -503,6 +503,20 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
         capturedAt: now(),
       };
     },
+    /**
+     * QA-2.1-17 (v2 only): a gate re-run after a restart has no observed tool calls for the child; the change set the
+     * restored pending entry persisted at child end is put back under the child's session, so the gate verifies what
+     * the child changed instead of a read-only delegation. Merges with anything recorded since.
+     */
+    seed(sessionID: string, files: readonly ChangedFile[]): void {
+      touch(sessionID);
+      let m = bySession.get(sessionID);
+      if (!m) {
+        m = new Map();
+        bySession.set(sessionID, m);
+      }
+      for (const file of files) if (!m.has(file.path)) m.set(file.path, file.status);
+    },
     clear(sessionID: string): void {
       evict(sessionID);
     },

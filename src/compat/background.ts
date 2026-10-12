@@ -172,6 +172,43 @@ export interface FinishInput {
   endedAt: number;
   /** The change set computed at child end (verify/dispatch.ts, 2.1.4.b); opaque here. */
   delta?: unknown;
+  /**
+   * QA-2.1-17: set on a finish after a restart (an adopted `inflight` record, a restored hold): the dispatch as journaled
+   * with its record. A restart lost the in-memory call arguments and change set, so the plugin rebuilds the gate inputs from
+   * this and from the restored pending entry (its DoD and changed files), re-posts a verdict reached before the restart, and
+   * ends UNVERIFIABLE ("verification data lost in restart") when the data is missing. Absent on a live finish.
+   */
+  restored?: RestoredDispatch;
+}
+
+/**
+ * QA-2.1-17: the dispatch data journaled with an `inflight` and a `hold` record (field `dispatch`), from `FinishApi.dispatchOf`.
+ * Any field may be missing (an older record, or a dispatch the plugin did not see).
+ */
+export interface RestoredDispatch {
+  prompt?: string;
+  description?: string;
+  subagentType?: string;
+  /** The directory the dispatch ran in (`args.cwd`, else the plugin's project directory). */
+  cwd?: string;
+  /** The work root the dispatch named (`root=`), when there was one. */
+  workRoot?: string;
+}
+
+/** QA-2.1-17: the `dispatch` field of a journaled record, keeping only string fields. Pure; never throws. */
+export function restoredDispatchOf(value: unknown): RestoredDispatch {
+  if (value === null || typeof value !== "object") return {};
+  const out: RestoredDispatch = {};
+  const read = (key: keyof RestoredDispatch): void => {
+    const field: unknown = Reflect.get(value, key);
+    if (typeof field === "string") out[key] = field;
+  };
+  read("prompt");
+  read("description");
+  read("subagentType");
+  read("cwd");
+  read("workRoot");
+  return out;
 }
 
 export type FinishResult = {
@@ -199,6 +236,17 @@ export interface FinishApi {
    * compatibility: absent, the reservation expires after `HELD_RESERVATION_TTL_MS` (verify/pending.ts).
    */
   releaseHeld(handle: string): void;
+  /**
+   * QA-2.1-31: a restored hold's verdict was posted (or found posted) by the adapter directly, not through the plugin's
+   * gate: the restored pending entry of `handle` is settled with it, without a second post, so `router_verify` stops
+   * saying the verdict follows. Unknown or already settled handles are ignored.
+   */
+  settleHeldDirect(parentSessionID: string, handle: string, verdict: { verdict: "PASS" | "FAIL" | "UNVERIFIABLE"; reason?: string }): void;
+  /**
+   * QA-2.1-17: the journal-able dispatch data of a live `task` call (prompt, description, subagent type, cwd, work root),
+   * written with its `inflight` and `hold` records; undefined when the plugin does not know the call.
+   */
+  dispatchOf(callID: string): RestoredDispatch | undefined;
   finish(input: FinishInput): Promise<FinishResult>;
   /**
    * The ONE journal (memo §11): `pending.jsonl`, shared by the pending store, the in-flight registry and the held results.
@@ -215,6 +263,19 @@ export interface FinishApi {
    * records dormant. Rejects when the file cannot be read (the caller then fails closed, §12).
    */
   reload(): Promise<void>;
+  /**
+   * QA-2.1-16: rewrites a vanished `pending.jsonl` from in-memory state: the plugin's live pending entries (and their
+   * verdicts), its dormant records, and `records` (the caller's live `inflight` attempts, holds with their `hold-text` and
+   * `posting` lines, and its own dormant records). Afterwards appends and reloads succeed again. Rejects when the rewrite
+   * fails (the caller stays fail closed and may retry).
+   */
+  recreateJournal(records: readonly PersistedRecord[]): Promise<void>;
+  /**
+   * QA-2.1-21: resolves once the held gates the plugin started (`finish` with a held handle runs its gate without awaiting
+   * it) and their verdict posts have ended, including gates started meanwhile. The adapter's settled seam and `dispose`
+   * wait for it. Never rejects.
+   */
+  idle(): Promise<void>;
   /**
    * Memo §11.3: this process saw `sessionID`. Takes the exclusive claim file `pending.claims\<id>` and hands over the dormant
    * records of that session; `undefined` when there are none or another live process holds the claim. Synchronous, once per session.
@@ -293,6 +354,8 @@ export interface InFlightRegistry {
   noteEarlyEnd(child: string, end: EndFact): void;
   takeEarlyEnd(child: string): EndFact | undefined;
   listForParent(parent: string): readonly Attempt[];
+  /** QA-2.1-16: every attempt this registry knows (any parent, any state). */
+  list(): readonly Attempt[];
   liveCount(): number;
   forgetSession(sessionID: string): void;
   /** Open for longer than `ATTEMPT_SWEEP_AGE_MS` becomes `closed-unknown`; the closed attempts are returned. */
@@ -486,6 +549,10 @@ export function createInFlightRegistry(deps: {
       return out;
     },
 
+    list() {
+      return [...attempts.values()];
+    },
+
     liveCount() {
       let n = 0;
       const at = deps.now();
@@ -556,6 +623,8 @@ export interface HeldRecord {
   body?: string;
   /** The child's final text, persisted with the hold so a restart can re-run the gate (QA-2.1-6). */
   childText?: string;
+  /** QA-2.1-17: the dispatch data (`FinishApi.dispatchOf`), persisted with the hold so a restart can rebuild the gate inputs. */
+  dispatch?: RestoredDispatch;
 }
 
 /** A restored hold whose verdict was being posted (`posting` without `posted`): re-post after a parent check (R21). */
@@ -572,7 +641,10 @@ export interface RestoredHold {
   parentSessionID: string;
   childSessionID: string;
   callID: string;
+  /** Present only when the child succeeded: `hold-text` is journaled for succeeded children only (QA-2.1-17). */
   childText?: string;
+  /** QA-2.1-17: the dispatch data journaled with the hold (empty fields when an older record had none). */
+  dispatch: RestoredDispatch;
 }
 
 /** What `HeldResults.restore` hands back to the adopter. */
@@ -620,6 +692,11 @@ export interface HeldResults extends HeldSink {
    * `metadata.router.handle`) records `posted`; otherwise the journaled verdict text is posted again.
    */
   settleRestored(handle: string, alreadyPosted: boolean): Promise<void>;
+  /**
+   * QA-2.1-16: the journal records of every live hold (its `hold` record with the dispatch data, its `hold-text` and an
+   * unposted `posting`), and of every posted placeholder (`hold` and `posted`), for rewriting a vanished journal.
+   */
+  persisted(): PersistedRecord[];
 }
 
 const SUBAGENT_CLOSE = "</subagent>";
@@ -918,6 +995,7 @@ export function createHeldResults(deps: {
             callID: rec.callID,
             ...(rec.label === undefined ? {} : { label: rec.label }),
             ...(rec.childText === undefined ? {} : { text: rec.childText }),
+            ...(rec.dispatch === undefined ? {} : { dispatch: rec.dispatch }),
             at: now(),
           },
           { fsync: true },
@@ -1021,7 +1099,8 @@ export function createHeldResults(deps: {
       entry.childText = text;
       entry.body ??= text;
       try {
-        await deps.journal.append({ v: 1, kind: "hold-text", handle, text, at: now() }, { fsync: true });
+        // QA-2.1-17: written for a succeeded child only (the processor checks the status first); the status is journaled with it.
+        await deps.journal.append({ v: 1, kind: "hold-text", handle, text, status: "succeeded", at: now() }, { fsync: true });
       } catch (error) {
         warnSafe(deps.logger, "[router] held child text not journaled", { handle, error: errorText(error) });
       }
@@ -1053,13 +1132,16 @@ export function createHeldResults(deps: {
             callID: typeof r.callID === "string" ? r.callID : "",
             ...(typeof r.label === "string" ? { label: r.label } : {}),
             ...(typeof r.text === "string" ? { childText: r.text, body: r.text } : {}),
+            ...(r.dispatch === undefined ? {} : { dispatch: restoredDispatchOf(r.dispatch) }),
             active: true,
             posting: false,
             status: "verifying",
           };
           insert(entry);
           restored.push(entry);
-        } else if (r.kind === "hold-text" && typeof r.handle === "string" && typeof r.text === "string") {
+        } else if (r.kind === "hold-text" && typeof r.handle === "string" && typeof r.text === "string"
+          // QA-2.1-17: only a succeeded child's text is gated after a restart (a line without `status` predates the field).
+          && (r.status === undefined || r.status === "succeeded")) {
           const e = byHandle.get(r.handle);
           if (e !== undefined && restored.includes(e)) {
             e.childText = r.text;
@@ -1097,6 +1179,7 @@ export function createHeldResults(deps: {
             childSessionID: e.childSessionID,
             callID: e.callID,
             ...(e.childText === undefined ? {} : { childText: e.childText }),
+            dispatch: e.dispatch ?? {},
           });
         }
       }
@@ -1128,6 +1211,28 @@ export function createHeldResults(deps: {
       } finally {
         entry.posting = false;
       }
+    },
+
+    persisted() {
+      const at = now();
+      const out: PersistedRecord[] = [];
+      for (const e of byHandle.values()) {
+        // A hold whose first append is still in flight (or failed) is not journaled yet: its own append writes it.
+        if (e.ready !== undefined) continue;
+        out.push({
+          v: 1, kind: "hold", handle: e.handle, parent: e.parentSessionID, child: e.childSessionID, callID: e.callID,
+          ...(e.label === undefined ? {} : { label: e.label }),
+          ...(e.dispatch === undefined ? {} : { dispatch: e.dispatch }),
+          at,
+        });
+        if (!e.active) {
+          out.push({ v: 1, kind: "posted", handle: e.handle, at });
+          continue;
+        }
+        if (e.childText !== undefined) out.push({ v: 1, kind: "hold-text", handle: e.handle, text: e.childText, status: "succeeded", at });
+        if (e.verdictText !== undefined) out.push({ v: 1, kind: "posting", handle: e.handle, text: e.verdictText, at });
+      }
+      return out;
     },
   };
 }
@@ -1161,6 +1266,12 @@ export interface CompletionDeps {
    * (failed, interrupted, lost, closed unknown, or a gate that answered at once). Idempotent; a registered entry is kept.
    */
   releaseHeld?(handle: string): void;
+  /**
+   * QA-2.1-17: the dispatch data journaled with a recovered attempt's `inflight` record (`FinishApi.dispatchOf` at
+   * acknowledgement); passed to `finish` as `restored` on a recovery. Absent: an empty record (the plugin then ends
+   * UNVERIFIABLE when it has nothing to verify with).
+   */
+  restoredDispatch?(a: Attempt): RestoredDispatch | undefined;
 }
 
 export interface CompletedLine {
@@ -1287,6 +1398,16 @@ export function createCompletionProcessor(reg: InFlightRegistry, deps: Completio
     }
   }
 
+  /** QA-2.1-17: the dispatch data journaled with a recovered attempt's `inflight` record; empty when none. Never throws. */
+  function restoredDispatchSafe(a: Attempt): RestoredDispatch {
+    try {
+      return deps.restoredDispatch?.(a) ?? {};
+    } catch (error) {
+      warnSafe(deps.logger, "[router] restored dispatch data unreadable", { callID: a.callID, error: errorText(error) });
+      return {};
+    }
+  }
+
   async function noteTextSafe(handle: string, text: string): Promise<void> {
     try {
       await deps.held.noteText(handle, text);
@@ -1346,9 +1467,10 @@ export function createCompletionProcessor(reg: InFlightRegistry, deps: Completio
     }
 
     ctx.text = text;
-    // QA-2.1-6: the child text lives in the journal with the hold, so a restart can re-run the gate.
-    if (handle !== undefined) await noteTextSafe(handle, text);
     const status = end.status ?? "unknown";
+    // QA-2.1-6: the child text lives in the journal with the hold, so a restart can re-run the gate. QA-2.1-17: only a
+    // succeeded child's text, so a restart never gates a failed or interrupted child.
+    if (handle !== undefined && status === "succeeded") await noteTextSafe(handle, text);
     let delta: unknown;
     if (deps.captureDelta !== undefined) {
       try {
@@ -1370,6 +1492,8 @@ export function createCompletionProcessor(reg: InFlightRegistry, deps: Completio
       ...(holdForGate === undefined ? {} : { heldHandle: holdForGate }),
       endedAt: end.at,
       ...(delta === undefined ? {} : { delta }),
+      // QA-2.1-17: a recovery runs after a restart: the plugin rebuilds the gate inputs from the journaled dispatch.
+      ...(trigger.kind === "recovery" ? { restored: restoredDispatchSafe(a) } : {}),
     });
     releaseLeasesSafe(a.childSessionID);
     await markProcessed(a);

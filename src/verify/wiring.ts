@@ -379,6 +379,20 @@ export const DRIFT_DIGEST_MAX_BYTES = 64 * 1024 * 1024;
 export const STATIC_SCOPING_UNFINISHED_REASON = "static scoping did not finish within the deferred-finish bound";
 /** Section 1.4 pendingTtlMs default, used when the config cannot be read at plugin start. */
 export const DEFAULT_PENDING_TTL_MS = 3_600_000;
+
+/**
+ * QA-2.1-27: the resolved `enforcement.verify.pendingTtlMs` at plugin start, as the pending registry reads it
+ * (`createVerificationWiring`); the section 1.4 default when the config cannot be read. The v2 pending journal
+ * compacts and reloads with it. Never throws.
+ */
+export function resolvePendingTtlMs(config: RouterConfig): number {
+  try {
+    return resolveVerifyBudget(config).pendingTtlMs;
+  } catch (err) {
+    void err; // plugin start never fails on config: the default bound, as the pending registry falls back
+    return DEFAULT_PENDING_TTL_MS;
+  }
+}
 /**
  * QA-2.4-9: the capture wait when the config cannot be read: section 1.4's captureWaitMs default
  * (5000 ms), clamped to the default baselineTimeoutMs (DEFAULT_CAPTURE_TIMEOUT_MS), as config.ts does.

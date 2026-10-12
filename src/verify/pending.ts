@@ -705,6 +705,8 @@ export interface PendingRegistry {
   recordRejection(record: RejectionRecord): void;
   findLineage(query: LineageQuery): LineageMatch | undefined;
   stats(): PendingRegistryStats;
+  /** QA-2.1-16 (v2 only): the `entry` and `state` records of every live entry (a vanished journal is rewritten from them). */
+  persistedRecords(): PendingRecord[];
   dispose(): void;
 }
 
@@ -1604,8 +1606,24 @@ export function claimPendingSession(
   // makes another live pid's claim ours: two processes of one test share the module token.
   const fresh = owner?.at !== undefined && seams.now - owner.at <= (seams.staleMs ?? CLAIM_STALE_MS);
   if (owner?.pid !== undefined && owner.pid !== seams.pid && fresh && seams.isAlive(owner.pid)) return false;
+  // QA-2.1-19: a claim of this pid under the token of ANOTHER live plugin instance of this process is that instance's.
+  if (owner?.pid === seams.pid && owner.token !== undefined && owner.token !== token && LIVE_INSTANCE_TOKENS.has(owner.token)) return false;
   writeFileSync(file, body);
   return true;
+}
+
+/** QA-2.1-19: the claim tokens of the live plugin instances of this process (`createInstanceClaimToken`). */
+const LIVE_INSTANCE_TOKENS = new Set<string>();
+
+/**
+ * QA-2.1-19: a claim token for one plugin instance. While it is not released, a claim this process wrote under it is
+ * refused to every other instance of the process (`claimPendingSession`); once released (dispose), the claim is stale for
+ * them and is taken over. Idempotent release.
+ */
+export function createInstanceClaimToken(): { readonly token: string; release(): void } {
+  const token = `${PROCESS_CLAIM_TOKEN}.${toHex(randomBytes(4))}`;
+  LIVE_INSTANCE_TOKENS.add(token);
+  return { token, release: () => { LIVE_INSTANCE_TOKENS.delete(token); } };
 }
 
 /** A claim older than this no longer protects a live pid (QA-2.1-13); live owners refresh well within it. */
@@ -1730,8 +1748,11 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
 
   function persistEntry(rec: EntryRecord): void {
     if (persist === undefined) return;
-    journal(
-      {
+    journal(entryRecord(rec), { fsync: rec.hold !== undefined });
+  }
+
+  function entryRecord(rec: EntryRecord): PendingRecord {
+    return {
         v: 1,
         kind: "entry",
         handle: rec.handle,
@@ -1753,9 +1774,7 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
         dispatchedAt: rec.dispatchedAt,
         ...(rec.concurrentDispatches !== undefined ? { concurrentDispatches: rec.concurrentDispatches } : {}),
         ...(rec.contaminatedBy !== undefined ? { contaminatedBy: rec.contaminatedBy } : {}),
-      },
-      { fsync: rec.hold !== undefined },
-    );
+    };
   }
 
   function persistReference(rec: EntryRecord, reference: DispatchReference): void {
@@ -1765,14 +1784,29 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
 
   function persistState(rec: EntryRecord, at: number): void {
     if (persist === undefined) return;
-    journal({
+    journal(stateRecord(rec, at));
+  }
+
+  function stateRecord(rec: EntryRecord, at: number): PendingRecord {
+    return {
       v: 1,
       kind: "state",
       handle: rec.handle,
       state: rec.state,
       at,
       ...(rec.state === "verified" && rec.result !== undefined ? { verdict: rec.result.verdict } : {}),
-    });
+    };
+  }
+
+  /** QA-2.1-16: the `entry` and `state` records of every live entry, for rewriting a vanished journal. */
+  function persistedRecords(): PendingRecord[] {
+    const at = now();
+    const out: PendingRecord[] = [];
+    for (const rec of byHandle.values()) {
+      if (!rec.live) continue;
+      out.push(entryRecord(rec), stateRecord(rec, at));
+    }
+    return out;
   }
 
   function hasSlot(sessionID: string): boolean {
@@ -2361,6 +2395,7 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       }
     },
     markVerifying,
+    persistedRecords,
     sweep(nowMs) {
       return maintain(nowMs ?? now());
     },
