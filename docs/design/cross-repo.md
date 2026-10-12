@@ -2,7 +2,7 @@
 
 **Status:** Accepted 2026-10-10 (owner). Phase 0 and Phase 1 implemented, two QA rounds each; dogfooding pending.
 **Scope:** roles mode on OpenCode v2 (`routing.delegation: "roles"`). Phase 0 changes the shared verification engine and applies to both hosts.
-**Configuration keys** marked *proposed (not implemented)* do not exist yet.
+**Configuration keys** marked *proposed (not implemented)* do not exist yet (as of 2026-10-12 only `routing.repoApprovalDays`, Phase 4; `repoParents`, `repoDepth` and `repoExclude` are implemented).
 **File references** are `path:line` as of 2026-10-10. Line numbers drift; the function names are the stable reference.
 
 ## 1. Context
@@ -46,12 +46,12 @@
 
 | Key | Layer | Default | Status |
 |---|---|---|---|
-| `routing.repoParents` | global only | `[]` | proposed (not implemented) |
-| `routing.repoDepth` | global only | `2` (allowed `1`–`4`) | proposed (not implemented) |
-| `routing.repoExclude` | global only | `[]` | proposed (not implemented) |
+| `routing.repoParents` | global only | `[]` | implemented (Phase 1; `sanitizeRepoParents`, `src/router/roles-config.ts`) |
+| `routing.repoDepth` | global only | `2` (allowed `1`–`4`) | implemented (Phase 1; `sanitizeRepoDepth`, `src/router/roles-config.ts`) |
+| `routing.repoExclude` | global only | `[]` | implemented (Phase 1; `sanitizeRepoExclude`, `src/router/roles-config.ts`) |
 | `routing.repoApprovalDays` | global only | `14` (allowed `1`–`90`) | proposed (not implemented), Phase 4 |
 
-Example (proposed):
+Example:
 
 ```json
 { "routing": { "delegation": "roles", "repoParents": ["D:/git"] } }

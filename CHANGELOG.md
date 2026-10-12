@@ -62,8 +62,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused (the refusal reaches the verification, never the deferred finish). At
   `router_verify` the I4 window is the dispatch (never decided again), consumers are discovered over the frozen
   working-set roots, and link targets are observed again: one that changed since the producer returned, or cannot be
-  observed again, turns a pass UNVERIFIED with a caveat (a fail keeps it); a placement whose path or git top changed
-  since return runs nothing; link pins kept for the deferred entry keep the reference exact. With `routing.repoParents`
+  observed again, turns a pass UNVERIFIED with a caveat (a fail keeps it). Correction since P2e QA round 1: a pass held
+  back only by links that cannot be observed again is retryable instead: the handle is reported as not judged and stays
+  open, so call `router_verify` again (see `docs/VERIFICATION.md`, "Deferred verification across repositories"). A
+  placement whose path or git top changed since return runs nothing; one that cannot be checked now (an error other
+  than a missing directory) runs nothing and also stays open. Link pins kept for the deferred entry keep the reference
+  exact. With `routing.repoParents`
   set, role dispatches are now deferred by default where they used to be synchronous; a "continue and finish" resume of
   a deferred attempt cannot back a `deterministic` detection (see `docs/ROLES.md`).
 - README: 90-second demo video below the title.
