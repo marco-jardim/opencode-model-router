@@ -76,7 +76,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **OpenCode v2: `router_verify` on a held background handle reports the verdict its gate reached** (method, outcome,
   reasons, caveats and notes). It used to settle every held gate verdict as a deterministic result with no caveats, so
   a checker that could not verify showed "UNVERIFIED: deterministic" without the grader's reason and a pass with
-  caveats showed "✓ verified". The posted verdict is unchanged. OpenCode v1 is unchanged.
+  caveats showed "✓ verified". The stored pass/outcome always match the posted tag (a trivial dispatch the gate accepts
+  unverified reads pass, a pass that `strictUnverifiable` rejects reads fail, also when re-posted after a restart). The
+  posted verdict is unchanged. OpenCode v1 is unchanged.
 - **OpenCode v2: plugin copies loaded per booted location share the pending journal safely.** A fresh writer mark of
   the same process under another module token counts as a live writer (start-up compaction is skipped), each copy
   compacts through its own temp file, and a recreate merges the records of every copy. Beat files in

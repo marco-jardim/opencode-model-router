@@ -3319,7 +3319,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   type FinishOutcome =
     | { kind: "none" }
     | { kind: "deferred"; handle: string }
-    // QA-DF1-16: `gate` is the gate's own verdict (method, outcome, reasons, caveats, notes); a held entry settles with it.
+    // QA-DF1-16: `gate` is the gate's own verdict (method, outcome, reasons, caveats, notes); a held entry settles with it,
+    // QA-DF1-29: with its pass/outcome set from `verdict` (the tag the gate's decision gives; see heldSettlementOf).
     | { kind: "required"; verdict: "PASS" | "FAIL" | "UNVERIFIABLE"; detail: string; gate: HeldSettlement }
     // QA-2.1-1: the gate was not run on purpose (a read-only delegation) or failed; neither is a verdict.
     | { kind: "skipped"; reason: string }
@@ -3723,9 +3724,21 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   type HeldClaim = Extract<ReturnType<typeof pending.markVerifying>, { kind: "claimed" }>;
   type HeldSettlement = Parameters<HeldClaim["settle"]>[0];
   type HeldScratch = { output: string; title: string; metadata: Record<string, unknown> };
-  /** QA-DF1-16: what a held entry settles with: a gate verdict as the gate reached it, anything else as `heldVerification`. */
+  /**
+   * QA-DF1-16: what a held entry settles with: a gate verdict as the gate reached it (method, reasons, caveats, notes), anything
+   * else as `heldVerification`. QA-DF1-29: its `pass`/`outcome` are those of the posted tag (the gate's decision, `accepted`, which
+   * a trivial skip or `strictUnverifiable` sets apart from the raw verdict), so every reader that re-derives a tag from them
+   * (router_verify through `gateResult`, the restart re-post and the onVerdict fallback through `heldVerdictKind`) reads the
+   * posted one. Done here, once, not by each reader: a reader cannot re-derive a trivial skip's acceptance (gate.ts accepts it
+   * outside `gateResult`), and `strictUnverifiable` read after a restart need not be the value the gate decided under.
+   */
   function heldSettlementOf(outcome: FinishOutcome, held: { verdict: "PASS" | "FAIL" | "UNVERIFIABLE"; reasons: string[] }): HeldSettlement {
-    return outcome.kind === "required" ? outcome.gate : heldVerification(held.verdict, held.reasons);
+    if (outcome.kind !== "required") return heldVerification(held.verdict, held.reasons);
+    const tag = outcome.verdict;
+    return {
+      ...outcome.gate,
+      verdict: { ...outcome.gate.verdict, pass: tag === "PASS", outcome: tag === "PASS" ? "pass" : tag === "FAIL" ? "fail" : "unverifiable" },
+    };
   }
   /**
    * A deterministic, non-retryable result for a held entry whose outcome is not a gate verdict (QA-DF1-16): the held gate's
