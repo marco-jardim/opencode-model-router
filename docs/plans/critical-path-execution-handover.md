@@ -435,6 +435,13 @@ implementations, so the plan now runs on its own data/state dirs (owner decision
   DF-1.1-1 e2e tests `ses_ecdfe09a6ffeMGnvsNK1wSzy70` (W `test\helpers\v2-bg-host.ts`, the two v2-background tests),
   3.2.3 `ses_ecdf84ce9ffeiY9wIfIxfw89cK` (W `integrate\queue.ts`), 3.1.5 `ses_ecdf80bd8ffeyBecf1KQWEe3AT` (W `launch.ts`,
   `v2-client.ts`, `binding.ts`, their tests).
+- **Progress (18:50):** pdf1-2 e2e tests `c8a2782` (85 green). 3.1.5 `899559d` (130 green; one ordering test awaited
+  "prompted"). 3.2.3 `c6e6b93` (tsc clean; tests in 3.2.6). pdf1-2 QA round 1 (heavy reviewer
+  `ses_ecdf2665affeWpa09Pka5hipSy`): 9 findings (1 major QA-PDF12-1 old-entry fallback; minors -2..-6; nits -7..-9), all
+  being fixed: A `ses_ecde49833ffeB6QJ3P9dWdhhr5` [tier:heavy] (W `src\compat\{v2-hooks,background,v2-client}.ts`, v2
+  background tests, helper) for -1/-2/-5/-6/-7/-9; B `ses_ecde4683affevrB19VMMzc8n6t` (W `timings.ts`, its test,
+  `CHANGELOG.md`) for -3/-4/-8. In flight Wave 3: 3.1.6 `ses_ecded6271ffe2CdyUJ3Qx8P3CD` (W `runtime.ts`), 3.2.4
+  `ses_ecde5881bffeulfqr317KFYVDP` (W `phase-suite.ts`, `bisect.ts`), 3.2.5 `ses_ecde55d3affeYnsX1ugioHtVgp` (W `land.ts`).
 
 *(superseded)* **NEXT ACTION (2026-10-12 ≈16:30): DF-1.1 re-switch — waiting for the owner restart; then the DF-1.1 self-check and
 re-probes (DF1.4.a with `df1.1`, c runner criterion, d, e), then Wave 3.** `cpx/pdf1-1` merged into `cpx/main` as
