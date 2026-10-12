@@ -8,6 +8,7 @@ import {
   defaultAdmissionDeps,
   parseWorktreeEntries,
   type AdmissionDeps,
+  type AdmissionLookup,
 } from "../../src/routing/roles/admission";
 import { gitWorktreeList, resolveRoleWorkRoot } from "../../src/routing/wire/dispatch";
 
@@ -181,6 +182,51 @@ describe("admission without git (fake deps)", () => {
     expect(capped.ok ? "" : capped.reason).toContain("stopped after 2000 directories");
     expect(new Set(wide.calls.filter((call) => call.startsWith("isDirectory "))).size).toBe(2000);
     expect(wide.calls.filter((call) => call.startsWith("showToplevel "))).toEqual([]);
+  });
+
+  it("find(name) returns the candidates resolve() uses", async () => {
+    // D:\git\app is a repository on main with a linked worktree D:\git\org\app-wt on feat; D:\git\x has a .git entry but is no top level.
+    const porcelain = `worktree D:/git/app\nHEAD ${SHA}\nbranch refs/heads/main\n\nworktree D:/git/org/app-wt\nHEAD ${SHA}\nbranch refs/heads/feat\n\n`;
+    const admission = createAdmission({ parents: ["D:\\git"], depth: 2, exclude: [] }, {
+      ...fakeWin({ t: 0 }),
+      listWorktrees: async () => porcelain,
+      showToplevel: async (cwd) => (/^d:\\git\\(app|org\\app-wt)$/i.test(cwd) ? cwd : undefined),
+      commonDir: async () => "D:\\git\\app\\.git",
+      gitEntry: (dir) => /^d:\\git\\(app|org\\app-wt|x)$/i.test(dir),
+      realpath: (path) => path.replace(/\//g, "\\"),
+      isDirectory: (path) => /^d:\\git\\(app|org|x|org\\app-wt)$/i.test(path),
+      readdir: (path) => (/^d:\\git$/i.test(path) ? ["app", "org", "x"] : []),
+    });
+    const ctx = { sessionRepository: "D:\\git\\app" };
+
+    // A repository-name match: the repository resolve() binds (on its branch).
+    const byName: AdmissionLookup = await admission.find("app");
+    expect(byName).toMatchObject({ refused: [], searched: ["D:\\git\\app", "D:\\git\\*\\app"], capped: false });
+    expect(byName.found.map((location) => [location.name, location.repository, location.worktree])).toEqual([["app", "D:\\git\\app", "D:\\git\\app"]]);
+    expect(await admission.resolve({ repo: "app", branch: "main" }, ctx)).toEqual({ ok: true, location: byName.found[0] });
+
+    // A worktree-directory match: the linked worktree resolve() binds without branch=.
+    const byDir = await admission.find("app-wt");
+    expect(byDir.found.map((location) => [location.name, location.repository, location.worktree, location.branch])).toEqual([["app", "D:\\git\\app", "D:\\git\\org\\app-wt", "feat"]]);
+    expect(await admission.resolve({ repo: "app-wt" }, ctx)).toEqual({ ok: true, location: byDir.found[0] });
+
+    // Refused notes: resolve() quotes them, with the places find() searched.
+    const none = await admission.find("x");
+    expect(none).toMatchObject({ found: [], refused: [expect.stringContaining("is not the top level of a git repository")], capped: false });
+    const refusedX = await admission.resolve({ repo: "x" }, ctx);
+    expect(refusedX.ok ? "" : refusedX.reason).toContain(`(searched ${none.searched.join(", ")}): no work root. ${none.refused[0] ?? "?"}`);
+
+    // The cap: find() stops after LOOKUP_MAX_DIRS directories, and resolve() says so.
+    const wide = createAdmission({ parents: ["D:\\git"], depth: 2, exclude: [] }, {
+      ...fakeWin({ t: 0 }),
+      gitEntry: () => false,
+      readdir: (path) => (/^d:\\git$/i.test(path) ? Array.from({ length: 3000 }, (_, i) => `d${String(i)}`) : []),
+    });
+    const capped = await wide.find("x");
+    expect(capped).toMatchObject({ found: [], capped: true });
+    expect(capped.refused.length).toBe(2000);
+    const stopped = await wide.resolve({ repo: "x" }, ctx);
+    expect(stopped.ok ? "" : stopped.reason).toContain(`… and ${String(capped.refused.length - 10)} more. The search stopped after 2000 directories.`);
   });
 
   it("refuses when no root, repo or branch is declared", async () => {
@@ -470,6 +516,19 @@ describe("Q10 (real git): repo= also matches the directory name of a linked work
     expect(await admission.resolve({ repo: "a1", branch: "a-twin" }, session())).toMatchObject({ ok: true, location: { worktree: join(parent, "twin"), name: "a1" } });
     expect(await admission.resolve({ repo: "lib-main", branch: "wt-branch" }, session())).toMatchObject({ ok: true, location: { worktree: join(parent, "lib-wt") } });
     expect(await admission.resolve({ repo: "nowhere" }, session())).toEqual({ ok: false, reason: expect.stringContaining("repo=nowhere matches no repository below routing.repoParents") });
+  });
+
+  it("find() keeps a repository and a same-named worktree directory apart", async () => {
+    const admission = createAdmission(config(), defaultAdmissionDeps());
+    const shared = await admission.find("shared");
+    expect(shared.capped).toBe(false);
+    expect(shared.found.map((location) => [location.name, location.repository, location.worktree])).toEqual([
+      ["shared", join(parent, "shared"), join(parent, "shared")],
+      ["other", join(parent, "other"), join(parent, "org", "shared")],
+    ]);
+    const wt = await admission.find("lib-wt");
+    expect(wt.found.map((location) => [location.name, location.worktree, location.branch])).toEqual([["lib-main", join(parent, "lib-wt"), "wt-branch"]]);
+    expect((await admission.find("nowhere")).found).toEqual([]);
   });
 });
 

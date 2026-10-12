@@ -90,6 +90,23 @@ export interface AdmissionService {
   admit(root: string, known?: readonly string[]): Promise<Admission>;
   /** Resolve `root=` / `repo=` / `branch=`; every declaration must agree. */
   resolve(decl: Declaration, ctx: DeclarationContext): Promise<Admission>;
+  /**
+   * The `repo=` lookup `resolve` uses for a bare name (a repository name, or the directory name of a linked worktree below the
+   * parents), read-only. The name is not checked here: refuse a non-bare name with {@link repoNameProblem} first.
+   */
+  find(name: string): Promise<AdmissionLookup>;
+}
+
+/** What a `repo=X` lookup saw: the matches, the refusal notes, the places searched, and whether the scan was capped. */
+export interface AdmissionLookup {
+  /** One location per repository named X and per linked worktree whose directory is named X, in scan order. */
+  readonly found: RepoLocation[];
+  /** Why each candidate directory named X was not admitted. */
+  readonly refused: string[];
+  /** The patterns searched, `<parent>\X` then `<parent>\*\X` while the depth allows. */
+  readonly searched: string[];
+  /** The scan stopped after {@link LOOKUP_MAX_DIRS} directories. */
+  readonly capped: boolean;
 }
 
 /** How long a `show-toplevel`, common-dir or worktree-list result is reused, per normalised path. */
@@ -232,7 +249,8 @@ export function rootTextProblem(path: string, platform: NodeJS.Platform = proces
   return undefined;
 }
 
-function repoNameProblem(name: string): string | undefined {
+/** Why `name` is not a bare repository name for `repo=` (empty, a separator, a drive, . / .., a wildcard, an 8.3 short name); undefined when it is. */
+export function repoNameProblem(name: string): string | undefined {
   if (name === "") return "is empty";
   if (/[\u0000-\u001f]/.test(name)) return "contains a control character";
   if (/[\\/:]/.test(name) || name === "." || name === "..") return "is not a bare repository name (no separator, drive or . / ..)";
@@ -522,7 +540,7 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
    * `repo=X`: `<parent>\X`, then `<parent>\*\X` while the depth allows (one listing per level); admitted by rule 1, named X.
    * At most {@link LOOKUP_MAX_DIRS} directories are visited (`capped`).
    */
-  const lookup = async (name: string): Promise<{ found: RepoLocation[]; refused: string[]; searched: string[]; capped: boolean }> => {
+  const lookup = async (name: string): Promise<AdmissionLookup> => {
     const found: RepoLocation[] = [];
     const refused: string[] = [];
     const searched: string[] = [];
@@ -668,5 +686,5 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
     return pick(`repo=${view.name}`, view, branch, known);
   };
 
-  return { admit, resolve };
+  return { admit, resolve, find: lookup };
 }
