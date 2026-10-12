@@ -1,6 +1,29 @@
-import { describe, expect, it } from "vitest";
-import { BackgroundRuns, isPlaceholderTestScript, selectFromFiles } from "../../src/executor/integrate/checks";
-import { classifyReruns, revertMessage } from "../../src/executor/integrate/phase-suite";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import {
+  BackgroundRuns, CheckPrepareError, createIntegrateGit, createIntegrationChecks, createWriteGuard, isPlaceholderTestScript, selectFromFiles,
+  type CommandOutput,
+} from "../../src/executor/integrate/checks";
+import type { SlotHandle, SlotOptions, SlotResult } from "../../src/verify/slot";
+import type {
+  DetectedRunner, NoAffected, PlanScopedRunInput, RunResult as VerifyResult, ScopedSpec, Unverifiable,
+} from "../../src/verify/runner";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import * as nodePath from "node:path";
+import { createLander, phaseTagName, samePath } from "../../src/executor/integrate/land";
+import type { GitOps } from "../../src/executor/git";
+import { ExecutorError } from "../../src/executor/types";
+import type {
+  Clock, ExecutorConfig, GitRunner, IntegrationStep, LedgerV1, RunCommandRef, SlotLease, SlotPool, SlotRecord,
+} from "../../src/executor/types";
+import type {
+  CheckErrorReason, CheckRequest, CheckResult, CheckSelection, CommandRunRequest, CommandRunResult, IntegrateGit,
+  IntegrationChecks, NameStatus, ResolvedCommand, RunResolver, WriteGuard,
+} from "../../src/executor/integrate/checks";
+import type {
+  LandRequest, RevertRequest, StepDetail, StepJournal, SuiteRunRequest,
+} from "../../src/executor/integrate/queue";
+import { classifyReruns, createPhaseSuiteRunner, revertMessage } from "../../src/executor/integrate/phase-suite";
 import { PREEMPT_LIMIT } from "../../src/executor/integrate/queue";
 import {
   bisectRanges,
@@ -9,6 +32,32 @@ import {
   type ProbeVerdict,
   type TaskRange,
 } from "../../src/executor/integrate/bisect";
+
+// The verify runner is a seam of checks.ts: its planners and result reader are replaced by scripted doubles (default:
+// the real functions), so no real runner, git or test process is involved.
+type RunnerModule = typeof import("../../src/verify/runner");
+const runnerHooks = vi.hoisted(() => ({
+  planScopedRun: null as RunnerModule["planScopedRun"] | null,
+  detectRunner: null as RunnerModule["detectRunner"] | null,
+  planRerun: null as RunnerModule["planRerun"] | null,
+  readResult: null as RunnerModule["readResult"] | null,
+}));
+vi.mock("../../src/verify/runner", async importOriginal => {
+  const actual = await importOriginal<RunnerModule>();
+  return {
+    ...actual,
+    planScopedRun: (...a: Parameters<RunnerModule["planScopedRun"]>) => (runnerHooks.planScopedRun ?? actual.planScopedRun)(...a),
+    detectRunner: (...a: Parameters<RunnerModule["detectRunner"]>) => (runnerHooks.detectRunner ?? actual.detectRunner)(...a),
+    planRerun: (...a: Parameters<RunnerModule["planRerun"]>) => (runnerHooks.planRerun ?? actual.planRerun)(...a),
+    readResult: (...a: Parameters<RunnerModule["readResult"]>) => (runnerHooks.readResult ?? actual.readResult)(...a),
+  };
+});
+afterEach(() => {
+  runnerHooks.planScopedRun = null;
+  runnerHooks.detectRunner = null;
+  runnerHooks.planRerun = null;
+  runnerHooks.readResult = null;
+});
 
 /** Chain c0..cn; task i spans c{i} -> c{i+1}. */
 function chainOf(n: number): string[] {
@@ -269,6 +318,1432 @@ describe("check selection (M9, M10)", () => {
     expect(out.extras[0]).not.toBe(extras[0]);
     expect(out.extras[0]?.args).not.toBe(extras[0]?.args);
     expect(selectFromFiles(none, []).extras).toEqual([]);
+  });
+});
+
+describe("land path helpers", () => {
+  it("samePath folds separators and trailing separators, and case only on win32", () => {
+    expect(samePath("C:\\Repo\\", "c:/repo", "win32")).toBe(true);
+    expect(samePath("C:\\Repo", "c:/repo", "linux")).toBe(false);
+    expect(samePath("/a/b//", "/a/b", "linux")).toBe(true);
+    expect(samePath("C:\\", "C:/", "win32")).toBe(true);
+    expect(samePath("/", "/", "linux")).toBe(true);
+    expect(samePath("/a", "/b", "linux")).toBe(false);
+  });
+
+  it("phaseTagName is omr/<plan>/phase-<phase>", () => {
+    expect(phaseTagName("plan1", "p2")).toBe("omr/plan1/phase-p2");
+  });
+});
+
+/** A typed partial double: unset members are absent (calling one is a test bug and throws a TypeError). */
+function stub<T extends object>(partial: Partial<T>): T {
+  return partial as T;
+}
+
+type RunResult = Awaited<ReturnType<GitRunner["run"]>>;
+function runResult(code: number | null, stdout = "", stderr = ""): RunResult {
+  return { code, signal: null, stdout, stderr, truncated: false, durationMs: 0 };
+}
+
+describe("createLander", () => {
+  const req: LandRequest = { toplevel: "/repo", baseBranch: "main", candidate: "cand", integrationBranch: "omr/int" };
+
+  interface World {
+    probes: Record<string, RunResult>;
+    seen: string[][];
+    baseTip: string | null;
+    ancestor: boolean;
+    changed: NameStatus[];
+    ignored: string[];
+    merge: Awaited<ReturnType<GitOps["mergeFfOnly"]>>;
+    guardError: unknown;
+    realpath: (p: string) => Promise<string>;
+    createRef: IntegrateGit["createRef"];
+    ignoredCalls: string[][];
+  }
+  function world(over: Partial<World> = {}): { w: World; lander: ReturnType<typeof createLander> } {
+    const w: World = {
+      probes: {
+        "rev-parse --show-toplevel": runResult(0, "/repo\n"),
+        "symbolic-ref -q HEAD": runResult(0, "refs/heads/main\n"),
+        status: runResult(0, ""),
+      },
+      seen: [], baseTip: "base", ancestor: true, changed: [], ignored: [],
+      merge: { ok: true, head: "cand" },
+      guardError: null, realpath: async p => p, createRef: async () => "created", ignoredCalls: [],
+      ...over,
+    };
+    w.probes = {
+      "rev-parse --show-toplevel": runResult(0, "/repo\n"),
+      "symbolic-ref -q HEAD": runResult(0, "refs/heads/main\n"),
+      status: runResult(0, ""),
+      ...over.probes,
+    };
+    const run = stub<GitRunner>({
+      run: async args => {
+        w.seen.push([...args]);
+        const key = args[2] === "status" ? "status" : args.slice(2).join(" ");
+        return w.probes[key] ?? runResult(1);
+      },
+    });
+    const igit = stub<IntegrateGit>({
+      readRef: async () => w.baseTip,
+      isAncestor: async () => w.ancestor,
+      diffNameStatus: async () => w.changed,
+      ignoredAt: async (_cwd, paths) => { w.ignoredCalls.push([...paths]); return w.ignored; },
+      createRef: (cwd, ref, commit) => w.createRef(cwd, ref, commit),
+    });
+    const git = stub<GitOps>({ mergeFfOnly: async () => w.merge });
+    const guard: WriteGuard = {
+      assertWriteCwd: async () => { if (w.guardError !== null) throw w.guardError; },
+    };
+    const lander = createLander({ git, igit, guard, run, realpath: p => w.realpath(p), platform: "linux" });
+    return { w, lander };
+  }
+
+  it("refuses with toplevel-mismatch when rev-parse fails or reports another directory", async () => {
+    const failing = world({ probes: { "rev-parse --show-toplevel": runResult(128) } });
+    expect(await failing.lander.inspect(req)).toEqual({ ok: false, refusal: { reason: "toplevel-mismatch", actual: "" }, baseTip: null });
+    const other = world({ probes: { "rev-parse --show-toplevel": runResult(0, "/elsewhere\n") } });
+    expect(await other.lander.inspect(req)).toEqual({ ok: false, refusal: { reason: "toplevel-mismatch", actual: "/elsewhere" }, baseTip: null });
+  });
+
+  it("probes with -C <toplevel> and falls back to the raw paths when realpath fails", async () => {
+    const { w, lander } = world({ realpath: async () => { throw new Error("ENOENT"); }, baseTip: null });
+    expect(await lander.inspect(req)).toEqual({ ok: false, refusal: { reason: "base-missing" }, baseTip: null });
+    expect(w.seen[0]).toEqual(["-C", "/repo", "rev-parse", "--show-toplevel"]);
+  });
+
+  it("compares the realpaths of the reported and the recorded toplevel", async () => {
+    const { lander } = world({
+      realpath: async p => (p === "/link" ? "/repo" : p),
+      probes: { "rev-parse --show-toplevel": runResult(0, "/repo/\n") },
+    });
+    expect(await lander.inspect({ ...req, toplevel: "/link" })).toMatchObject({ ok: true, noop: false });
+  });
+
+  it("refuses with not-checked-out and names the current head (null when detached or empty)", async () => {
+    const detached = world({ probes: { "rev-parse --show-toplevel": runResult(0, "/repo"), "symbolic-ref -q HEAD": runResult(1) } });
+    expect(await detached.lander.inspect(req)).toEqual({ ok: false, refusal: { reason: "not-checked-out", head: null }, baseTip: "base" });
+    const empty = world({ probes: { "rev-parse --show-toplevel": runResult(0, "/repo"), "symbolic-ref -q HEAD": runResult(0, "\n") } });
+    expect(await empty.lander.inspect(req)).toMatchObject({ refusal: { reason: "not-checked-out", head: null } });
+    const other = world({ probes: { "rev-parse --show-toplevel": runResult(0, "/repo"), "symbolic-ref -q HEAD": runResult(0, "refs/heads/dev\n") } });
+    expect(await other.lander.inspect(req)).toMatchObject({ refusal: { reason: "not-checked-out", head: "refs/heads/dev" } });
+  });
+
+  it("throws when git status fails in the owner checkout, and fastForward reports it as an error", async () => {
+    const { lander } = world({ probes: {
+      "rev-parse --show-toplevel": runResult(0, "/repo"), "symbolic-ref -q HEAD": runResult(0, "refs/heads/main"), status: runResult(null),
+    } });
+    await expect(lander.inspect(req)).rejects.toThrow(/exit unknown/);
+    expect(await lander.fastForward(req)).toEqual({ kind: "error", message: expect.stringContaining("git status failed") });
+  });
+
+  it("lists dirty paths, skipping short fields and the origin of renames and copies", async () => {
+    const status = ["R  new.txt", "old.txt", " M mod.txt", "??", "C  copy.txt", "src.txt", "?? untracked.txt", ""].join("\0");
+    const { lander } = world({ probes: {
+      "rev-parse --show-toplevel": runResult(0, "/repo"), "symbolic-ref -q HEAD": runResult(0, "refs/heads/main"), status: runResult(0, status),
+    } });
+    expect(await lander.inspect(req)).toEqual({
+      ok: false, refusal: { reason: "dirty", paths: ["new.txt", "mod.txt", "copy.txt", "untracked.txt"] }, baseTip: "base",
+    });
+  });
+
+  it("refuses diverged when the base tip is not an ancestor of the candidate", async () => {
+    const { lander } = world({ ancestor: false });
+    expect(await lander.inspect(req)).toEqual({ ok: false, refusal: { reason: "diverged", baseTip: "base" }, baseTip: "base" });
+  });
+
+  it("is a noop when the base tip already is the candidate", async () => {
+    const { lander, w } = world({ baseTip: "cand" });
+    expect(await lander.inspect(req)).toEqual({ ok: true, baseTip: "cand", noop: true });
+    expect(w.ignoredCalls).toEqual([]);
+  });
+
+  it("refuses ignored-overwrite for added or changed paths only; deletions are not probed", async () => {
+    const blocked = world({ changed: [{ status: "A", path: "a.txt" }, { status: "D", path: "gone.txt" }], ignored: ["a.txt"] });
+    expect(await blocked.lander.inspect(req)).toEqual({ ok: false, refusal: { reason: "ignored-overwrite", paths: ["a.txt"] }, baseTip: "base" });
+    expect(blocked.w.ignoredCalls).toEqual([["a.txt"]]);
+    const clear = world({ changed: [{ status: "M", path: "m.txt" }] });
+    expect(await clear.lander.inspect(req)).toEqual({ ok: true, baseTip: "base", noop: false });
+    const onlyDeletes = world({ changed: [{ status: "D", path: "gone.txt" }] });
+    expect(await onlyDeletes.lander.inspect(req)).toEqual({ ok: true, baseTip: "base", noop: false });
+    expect(onlyDeletes.w.ignoredCalls).toEqual([]);
+  });
+
+  it("fastForward: refusal, noop, diverged merge, unexpected head, success and thrown errors", async () => {
+    expect(await world({ ancestor: false }).lander.fastForward(req)).toMatchObject({ kind: "refused", refusal: { reason: "diverged" } });
+    expect(await world({ baseTip: "cand" }).lander.fastForward(req)).toEqual({ kind: "landed", from: "cand", to: "cand" });
+    expect(await world({ merge: { ok: false, head: "moved" } }).lander.fastForward(req))
+      .toEqual({ kind: "refused", refusal: { reason: "diverged", baseTip: "moved" } });
+    expect(await world({ merge: { ok: true, head: "other" } }).lander.fastForward(req))
+      .toEqual({ kind: "error", message: "fast-forward left HEAD at other, expected cand" });
+    expect(await world().lander.fastForward(req)).toEqual({ kind: "landed", from: "base", to: "cand" });
+    expect(await world({ guardError: new Error("not the toplevel") }).lander.fastForward(req)).toEqual({ kind: "error", message: "not the toplevel" });
+    expect(await world({ guardError: "plain" }).lander.fastForward(req)).toEqual({ kind: "error", message: "plain" });
+  });
+
+  it("tag creates refs/tags/<name> and reports a thrown error as an outcome", async () => {
+    const refs: string[] = [];
+    const ok = world({ createRef: async (_cwd, ref, commit) => { refs.push(`${ref}@${commit}`); return "exists-same"; } });
+    expect(await ok.lander.tag({ cwd: "/slot", name: "omr/p/phase-1", commit: "abc" })).toBe("exists-same");
+    expect(refs).toEqual(["refs/tags/omr/p/phase-1@abc"]);
+    const bad = world({ createRef: async () => { throw new Error("boom"); } });
+    expect(await bad.lander.tag({ cwd: "/slot", name: "n", commit: "abc" })).toEqual({ kind: "error", message: "boom" });
+    expect(ok.lander.tagName("p", "1")).toBe("omr/p/phase-1");
+  });
+
+  it("commands: one hint list per refusal, none when nothing can be done", () => {
+    const { lander } = world();
+    const merge = 'git -C "/repo" merge --ff-only cand';
+    expect(lander.commands(req, { reason: "dirty", paths: ["a"] })).toEqual([
+      'git -C "/repo" status --porcelain=v1 --untracked-files=all', "# commit or stash the changes above, then:", merge,
+    ]);
+    expect(lander.commands(req, { reason: "not-checked-out", head: null })).toEqual(['git -C "/repo" switch main', merge]);
+    expect(lander.commands(req, { reason: "diverged", baseTip: "b" })).toEqual([
+      'git -C "/repo" log --oneline cand..main', "# the owner chooses; the executor never runs this:", 'git -C "/repo" merge refs/heads/omr/int',
+    ]);
+    expect(lander.commands(req, { reason: "ignored-overwrite", paths: ["x", "y"] })).toEqual([
+      "# ignored file would be overwritten: x", "# ignored file would be overwritten: y", "# move them, then:", merge,
+    ]);
+    expect(lander.commands(req, { reason: "toplevel-mismatch", actual: "/z" })).toEqual([]);
+    expect(lander.commands(req, { reason: "base-missing" })).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Write guard and IntegrateGit
+// ---------------------------------------------------------------------------------------------------------------
+
+describe("createWriteGuard (M30)", () => {
+  const ledger = stub<LedgerV1>({
+    planId: "plan",
+    repo: stub<LedgerV1["repo"]>({ toplevel: "/repo" }),
+    integration: stub<LedgerV1["integration"]>({ worktree: "/wt" }),
+  });
+  const slotRecord = (path: string): SlotRecord => stub<SlotRecord>({ path });
+  function guardOf(platform: NodeJS.Platform, o: { ledger?: LedgerV1; slots?: string[]; realpath?: (p: string) => Promise<string> } = {}) {
+    const listed: Array<string | undefined> = [];
+    const pool = stub<SlotPool>({ list: async planId => { listed.push(planId); return (o.slots ?? []).map(slotRecord); } });
+    return { guard: createWriteGuard({ ledger: () => o.ledger ?? ledger, pool, realpath: o.realpath ?? (async p => p), platform }), listed };
+  }
+
+  it("allows the integration worktree and the slots of the plan, whatever the trailing separator", async () => {
+    const { guard, listed } = guardOf("linux", { slots: ["/slots/s1"] });
+    await expect(guard.assertWriteCwd("/wt/", "integration")).resolves.toBeUndefined();
+    await expect(guard.assertWriteCwd("/slots/s1", "slot")).resolves.toBeUndefined();
+    expect(listed).toEqual(["plan", "plan"]);
+  });
+
+  it("refuses any other directory", async () => {
+    const { guard } = guardOf("linux", { slots: ["/slots/s1"] });
+    await expect(guard.assertWriteCwd("/elsewhere", "tag")).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
+    await expect(guard.assertWriteCwd("/elsewhere", "tag")).rejects.toThrow(/outside the slots/);
+  });
+
+  it("a slot path that does not resolve cannot be the cwd, but does not hide the others", async () => {
+    const realpath = async (p: string): Promise<string> => {
+      if (p === "/gone") throw new Error("ENOENT");
+      return p;
+    };
+    const { guard } = guardOf("linux", { slots: ["/gone", "/slots/s2"], realpath });
+    await expect(guard.assertWriteCwd("/slots/s2", "slot")).resolves.toBeUndefined();
+    await expect(guard.assertWriteCwd("/slots/s3", "slot")).rejects.toThrow(/outside the slots/);
+  });
+
+  it("a landing write is allowed only in the repository toplevel", async () => {
+    const { guard } = guardOf("linux");
+    await expect(guard.assertWriteCwd("/repo", "land")).resolves.toBeUndefined();
+    await expect(guard.assertWriteCwd("/wt", "land")).rejects.toThrow(/repository toplevel/);
+  });
+
+  it("folds case and separators on win32 only, and keeps a drive root", async () => {
+    const winLedger = stub<LedgerV1>({
+      planId: "plan", repo: stub<LedgerV1["repo"]>({ toplevel: "C:\\" }), integration: stub<LedgerV1["integration"]>({ worktree: "c:/Repo/WT" }),
+    });
+    const w = guardOf("win32", { ledger: winLedger });
+    await expect(w.guard.assertWriteCwd("C:\\REPO\\wt\\", "integration")).resolves.toBeUndefined();
+    await expect(w.guard.assertWriteCwd("c:/", "land")).resolves.toBeUndefined();
+    const posix = guardOf("linux", { ledger: winLedger });
+    await expect(posix.guard.assertWriteCwd("/wt", "land")).rejects.toThrow();
+    const root = stub<LedgerV1>({ planId: "plan", repo: stub<LedgerV1["repo"]>({ toplevel: "/" }), integration: stub<LedgerV1["integration"]>({ worktree: "/wt" }) });
+    await expect(guardOf("linux", { ledger: root }).guard.assertWriteCwd("/", "land")).resolves.toBeUndefined();
+  });
+});
+
+describe("createIntegrateGit", () => {
+  type Reply = RunResult | ((args: readonly string[]) => RunResult);
+  function gitEnv(replies: Reply[] = []) {
+    const calls: Array<{ args: readonly string[]; cwd: string }> = [];
+    const writes: string[] = [];
+    let n = 0;
+    const run = stub<GitRunner>({
+      run: async (args, o) => {
+        calls.push({ args, cwd: o.cwd });
+        const reply = replies[n++] ?? runResult(0);
+        return typeof reply === "function" ? reply(args) : reply;
+      },
+    });
+    const guard: WriteGuard = { assertWriteCwd: async (cwd, purpose) => { writes.push(`${purpose}:${cwd}`); } };
+    return { igit: createIntegrateGit(run, guard), calls, writes };
+  }
+  /** The git arguments after the shared prefix (--no-optional-locks plus the hardening flags). */
+  const rest = (args: readonly string[], first: string): string[] => args.slice(args.indexOf(first));
+
+  it("diffNameStatus parses the -z name-status pairs; an unknown status counts as modified", async () => {
+    const { igit, calls } = gitEnv([runResult(0, "M\0a.ts\0A\0b.ts\0D\0c.ts\0T\0d.ts\0X\0e.ts\0Z\0")]);
+    expect(await igit.diffNameStatus("/wt", "from", "to")).toEqual([
+      { status: "M", path: "a.ts" }, { status: "A", path: "b.ts" }, { status: "D", path: "c.ts" }, { status: "T", path: "d.ts" }, { status: "M", path: "e.ts" },
+    ]);
+    expect(rest(calls[0]?.args ?? [], "diff")).toEqual(["diff", "--name-status", "-z", "--no-renames", "--no-ext-diff", "from", "to", "--"]);
+    expect(calls[0]?.args[0]).toBe("--no-optional-locks");
+    expect(calls[0]?.cwd).toBe("/wt");
+  });
+
+  it("a failing read is an E_GIT error naming the exit code, the signal or unknown", async () => {
+    const long = "e".repeat(5000);
+    const a = gitEnv([runResult(128, "", long)]);
+    const err = await a.igit.revList("/wt", "a", "b").catch((e: unknown) => e);
+    expect(err).toMatchObject({ code: "E_GIT", message: "git rev-list failed (exit 128)" });
+    expect(err).toBeInstanceOf(ExecutorError);
+    const detail = JSON.stringify(err instanceof ExecutorError ? err.detail : null);
+    expect(detail).toContain('"op":"rev-list"');
+    expect(detail).toContain("e".repeat(2048));
+    expect(detail).not.toContain("e".repeat(2049));
+    const sig = gitEnv([{ ...runResult(null), signal: "SIGTERM" }]);
+    await expect(sig.igit.mergeBase("/wt", "a", "b")).rejects.toThrow("git merge-base failed (exit SIGTERM)");
+    const none = gitEnv([runResult(null)]);
+    await expect(none.igit.subject("/wt", "a")).rejects.toThrow("(exit unknown)");
+  });
+
+  it("logPaths pairs sha and subject, skips blank shas and passes a literal pathspec", async () => {
+    const { igit, calls } = gitEnv([runResult(0, "sha1\0first\0\0skipped\0\nsha2\0second\0")]);
+    expect(await igit.logPaths("/wt", "a", "b", "dir/f.ts", 5)).toEqual([{ sha: "sha1", subject: "first" }, { sha: "sha2", subject: "second" }]);
+    expect(rest(calls[0]?.args ?? [], "log")).toEqual(["log", "-z", "--format=%H%x00%s", "-n", "5", "a..b", "--", ":(literal)dir/f.ts"]);
+  });
+
+  it("revList returns the trimmed non-empty lines, oldest first", async () => {
+    const { igit, calls } = gitEnv([runResult(0, "a\n b \n\nc\n")]);
+    expect(await igit.revList("/wt", "x", "y")).toEqual(["a", "b", "c"]);
+    expect(rest(calls[0]?.args ?? [], "rev-list")).toEqual(["rev-list", "--reverse", "--topo-order", "x..y"]);
+  });
+
+  it("createRef creates against the zero id after asserting the tag write cwd", async () => {
+    const { igit, calls, writes } = gitEnv([runResult(0)]);
+    expect(await igit.createRef("/wt", "refs/tags/t", "abcd")).toBe("created");
+    expect(writes).toEqual(["tag:/wt"]);
+    expect(rest(calls[0]?.args ?? [], "update-ref")).toEqual(["update-ref", "refs/tags/t", "abcd", "0000"]);
+  });
+
+  it("createRef reports an existing ref: same commit, another commit, or fails when it is not there", async () => {
+    const same = gitEnv([runResult(1), runResult(0, "abcd\n")]);
+    expect(await same.igit.createRef("/wt", "refs/tags/t", "abcd")).toBe("exists-same");
+    const other = gitEnv([runResult(1), runResult(0, "ffff\n")]);
+    expect(await other.igit.createRef("/wt", "refs/tags/t", "abcd")).toEqual({ kind: "exists-other", at: "ffff" });
+    const missing = gitEnv([runResult(128, "", "locked"), runResult(1)]);
+    await expect(missing.igit.createRef("/wt", "refs/tags/t", "abcd")).rejects.toThrow("git update-ref failed");
+  });
+
+  it("readRef: a commit, null for an unknown ref, an error otherwise", async () => {
+    const { igit, calls } = gitEnv([runResult(0, "abc\n"), runResult(1), runResult(129, "", "bad")]);
+    expect(await igit.readRef("/wt", "refs/heads/m")).toBe("abc");
+    expect(rest(calls[0]?.args ?? [], "rev-parse")).toEqual(["rev-parse", "--verify", "-q", "--end-of-options", "refs/heads/m^{commit}"]);
+    expect(await igit.readRef("/wt", "refs/heads/none")).toBeNull();
+    await expect(igit.readRef("/wt", "refs/heads/bad")).rejects.toThrow("git rev-parse failed");
+  });
+
+  it("mergeBase trims, isAncestor maps exit 0/1 and fails on anything else", async () => {
+    const { igit } = gitEnv([runResult(0, "base\n"), runResult(0), runResult(1), runResult(128)]);
+    expect(await igit.mergeBase("/wt", "a", "b")).toBe("base");
+    expect(await igit.isAncestor("/wt", "a", "b")).toBe(true);
+    expect(await igit.isAncestor("/wt", "a", "b")).toBe(false);
+    await expect(igit.isAncestor("/wt", "a", "b")).rejects.toThrow("git merge-base failed");
+  });
+
+  it("showFile returns the content, or null when the path is not in the commit", async () => {
+    const { igit, calls } = gitEnv([runResult(0, "content"), runResult(128)]);
+    expect(await igit.showFile("/wt", "c1", "package.json")).toBe("content");
+    expect(rest(calls[0]?.args ?? [], "show")).toEqual(["show", "c1:package.json"]);
+    expect(await igit.showFile("/wt", "c1", "missing")).toBeNull();
+  });
+
+  it("subject drops the trailing newline only", async () => {
+    const { igit } = gitEnv([runResult(0, "feat: x\r\n"), runResult(0, "a\nb\n")]);
+    expect(await igit.subject("/wt", "c1")).toBe("feat: x");
+    expect(await igit.subject("/wt", "c1")).toBe("a\nb");
+  });
+
+  it("ignoredAt asks about each path and its parent directories once, and skips the call for no paths", async () => {
+    const none = gitEnv();
+    expect(await none.igit.ignoredAt("/wt", [])).toEqual([]);
+    expect(none.calls).toEqual([]);
+    const { igit, calls } = gitEnv([runResult(0, "a/b\0x\0")]);
+    expect(await igit.ignoredAt("/wt", ["a/b/c.txt", "a/d.txt", "x", "/abs/y"])).toEqual(["a/b", "x"]);
+    const specs = (calls[0]?.args ?? []).slice((calls[0]?.args ?? []).lastIndexOf("--") + 1);
+    expect(specs).toEqual([
+      ":(literal)a/b/c.txt", ":(literal)a/b", ":(literal)a", ":(literal)a/d.txt", ":(literal)x", ":(literal)/abs/y", ":(literal)/abs",
+    ]);
+  });
+
+  it("revertAbort does nothing without REVERT_HEAD and aborts otherwise, asserting the slot write cwd", async () => {
+    const idle = gitEnv([runResult(1)]);
+    await idle.igit.revertAbort("/slot");
+    expect(idle.writes).toEqual(["slot:/slot"]);
+    expect(idle.calls).toHaveLength(1);
+    const active = gitEnv([runResult(0, "sha"), runResult(0)]);
+    await active.igit.revertAbort("/slot");
+    expect(rest(active.calls[1]?.args ?? [], "revert")).toEqual(["revert", "--abort"]);
+    const failing = gitEnv([runResult(0, "sha"), runResult(1, "", "no")]);
+    await expect(failing.igit.revertAbort("/slot")).rejects.toThrow("git revert --abort failed");
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Integration checks doubles
+// ---------------------------------------------------------------------------------------------------------------
+
+const noneOut = (exitCode: number | null = 0, o: Partial<CommandOutput> = {}): CommandOutput => ({
+  exitCode, timedOut: false, stdout: "", stderr: "", durationMs: 5, ...o,
+});
+const okHandle = (released: string[], tag = "h"): SlotHandle => ({ lost: false, release: async () => { released.push(tag); } });
+const scoped = (o: Partial<ScopedSpec> = {}): ScopedSpec => ({
+  runner: "vitest", mode: "related", file: "node", args: ["vitest", "run"], cwd: "/slot/pkg", env: { A: "1" }, reportPath: "/tmp/r.json",
+  gitRoot: "/slot", entry: "/slot/node_modules/vitest/vitest.mjs", inputs: ["/slot/a.test.ts"], inputsAreTests: true, workers: 2, notes: [], ...o,
+});
+const report = (o: Partial<VerifyResult> = {}): VerifyResult => ({
+  failingIds: [], failingFiles: [], collectionError: false, total: 1, complete: true, source: "report", ...o,
+});
+const noAffected: NoAffected = { noAffected: true, note: "none" };
+const unverifiable: Unverifiable = { unverifiable: true, reason: "no runner", code: "no-git-root" };
+const detected = stub<DetectedRunner>({ kind: "vitest", launcher: "direct" });
+
+interface ChecksOpts {
+  files?: Record<string, string | null>;
+  diff?: NameStatus[];
+  diffError?: Error;
+  head?: string;
+  resetError?: unknown;
+  spawn?: (c: ResolvedCommand, o: { cwd: string; signal: AbortSignal; lowPriority: boolean }, n: number) => CommandOutput | Promise<CommandOutput>;
+  acquire?: (o: SlotOptions, n: number) => SlotResult | Promise<SlotResult>;
+  /** null: leave the dependency unset, so the default (wiring.preemptBackgroundVerification) runs. */
+  preemptForeground?: (() => Promise<void>) | null;
+  resolve?: (ref: RunCommandRef) => { ok: true; command: ResolvedCommand } | { ok: false; reason: string };
+  config?: Partial<LedgerV1["config"]>;
+  allowCommand?: (command: string) => boolean;
+  slotMax?: number;
+  background?: BackgroundRuns;
+}
+const PKG_BOTH = JSON.stringify({ scripts: { typecheck: "tsc", test: "vitest run" } });
+
+function checksEnv(o: ChecksOpts = {}) {
+  const spawned: Array<{ c: ResolvedCommand; cwd: string; low: boolean }> = [];
+  const released: string[] = [];
+  const acquired: SlotOptions[] = [];
+  const preempts: string[] = [];
+  const resets: string[] = [];
+  let tick = 0;
+  const background = o.background ?? new BackgroundRuns();
+  const pool = stub<SlotPool>({
+    reset: async (s, commit) => { resets.push(`reset:${s}@${commit}`); if (o.resetError !== undefined) throw o.resetError; },
+    cleanForChecks: async s => { resets.push(`clean:${s}`); },
+  });
+  const git = stub<GitOps>({ revParse: async () => o.head ?? "cand" });
+  const igit = stub<IntegrateGit>({
+    showFile: async (_cwd, _commit, path) => (o.files ?? { "package.json": null })[path] ?? null,
+    diffNameStatus: async () => { if (o.diffError !== undefined) throw o.diffError; return o.diff ?? []; },
+  });
+  const resolver: RunResolver = {
+    resolve: async ref => (o.resolve ?? ((r: RunCommandRef) => ({
+      ok: true as const, command: { label: r.script, file: "npm", args: ["run", r.script, ...r.args], source: "package-script" as const, ref: r },
+    })))(ref),
+  };
+  const checks = createIntegrationChecks({
+    ledger: () => stub<LedgerV1>({ config: stub<LedgerV1["config"]>({ integrationChecks: "auto", python: "auto", ...o.config }) }),
+    pool, git, igit, resolver,
+    spawn: async (c, opts) => {
+      spawned.push({ c, cwd: opts.cwd, low: opts.lowPriority });
+      return (o.spawn ?? (() => noneOut()))(c, opts, spawned.length);
+    },
+    guard: { assertWriteCwd: async () => undefined },
+    background, clock: stub<Clock>({ now: () => (tick += 10) }), logger: { warn: () => undefined },
+    ...(o.preemptForeground === null ? {} : { preemptForeground: o.preemptForeground ?? (async () => { preempts.push("fg"); }) }),
+    acquire: async (opts) => {
+      acquired.push(opts);
+      return (o.acquire ?? (() => okHandle(released)))(opts, acquired.length);
+    },
+    ...(o.slotMax === undefined ? {} : { slotMax: o.slotMax }),
+    ...(o.allowCommand === undefined ? {} : { allowCommand: o.allowCommand }),
+  });
+  return { checks, spawned, released, acquired, preempts, resets, background };
+}
+
+function checkReq(o: Partial<CheckRequest> = {}): CheckRequest {
+  return { slot, base: "base", candidate: "cand", priority: "foreground", signal: new AbortController().signal, ...o };
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Phase suite runner doubles
+// ---------------------------------------------------------------------------------------------------------------
+
+const slot: SlotLease = { slot: "s1", path: "/slot", planId: "plan", owner: "integration", commit: "c3" };
+const cmd: ResolvedCommand = { label: "npm test", file: "npm", args: ["test"], source: "package-script", ref: { script: "test", args: [] } };
+
+function runRes(verdict: CommandRunResult["verdict"], o: Partial<CommandRunResult> = {}): CommandRunResult {
+  return { verdict, ids: [], files: [], idsUnparsed: false, output: "", durationMs: 1, error: null, ...o };
+}
+function failRes(ids: string[], o: Partial<CommandRunResult> = {}): CommandRunResult {
+  return runRes("fail", { ids, files: ["f.test.ts"], output: "out", ...o });
+}
+function errRes(reason: CheckErrorReason, message = "m"): CommandRunResult {
+  return runRes("error", { error: { reason, message } });
+}
+function byCommit(m: Record<string, CommandRunResult>): (req: CommandRunRequest) => CommandRunResult {
+  return req => m[req.commit] ?? runRes("pass");
+}
+
+function journalOf(signal: AbortSignal = new AbortController().signal) {
+  const log = {
+    order: [] as string[],
+    starts: [] as Array<{ step: IntegrationStep; detail: StepDetail; patch: unknown }>,
+    ends: [] as Array<{ result: string; detail: StepDetail; ids: readonly string[] | undefined }>,
+    counters: [] as Array<{ key: string; value: number; labels: Record<string, string> }>,
+    cwds: [] as string[],
+  };
+  const j: StepJournal = {
+    entry: { id: "i-1", kind: "phase-suite", phaseId: "p1", taskIds: [], slot: "s1", baseHead: "c0", candidate: null },
+    signal,
+    start: async (step, detail, patch) => { log.order.push(`start:${step}`); log.starts.push({ step, detail, patch }); },
+    end: async (result, detail, ids) => { log.order.push(`end:${result}`); log.ends.push({ result, detail, ids }); },
+    assertWriteCwd: async (cwd, purpose) => { log.cwds.push(`${purpose}:${cwd}`); },
+    counter: (key, value, labels) => { log.counters.push({ key, value, labels }); },
+  };
+  return { j, log };
+}
+
+function suiteEnv(over: {
+  runCommands?: (req: CommandRunRequest, n: number) => CommandRunResult;
+  checks?: Partial<IntegrationChecks>; igit?: Partial<IntegrateGit>; git?: Partial<GitOps>; resolver?: Partial<RunResolver>;
+} = {}) {
+  const requests: CommandRunRequest[] = [];
+  const background = new BackgroundRuns();
+  const checks = stub<IntegrationChecks>({
+    runCommands: async req => { requests.push(req); return (over.runCommands ?? (() => runRes("pass")))(req, requests.length); },
+    ...over.checks,
+  });
+  const runner = createPhaseSuiteRunner({
+    checks, igit: stub<IntegrateGit>({ ...over.igit }), git: stub<GitOps>({ ...over.git }), pool: stub<SlotPool>({}),
+    resolver: stub<RunResolver>({ ...over.resolver }), background, clock: stub<Clock>({}), logger: { warn: () => undefined },
+  });
+  return { runner, requests, background };
+}
+
+function suiteReq(o: Partial<SuiteRunRequest> = {}): SuiteRunRequest {
+  return { planId: "plan", phaseId: "p1", commit: "c3", base: "c0", ranges: rangesOf(3), commands: [cmd], slot, ...o };
+}
+
+const lintCfg: Partial<LedgerV1["config"]> = { integrationChecks: [{ script: "lint", args: [] }] };
+
+describe("integration checks: prepare and select", () => {
+  it("prepare resets, cleans and verifies the head of the slot", async () => {
+    const { checks, resets } = checksEnv();
+    await checks.prepare(slot, "cand");
+    expect(resets).toEqual(["reset:s1@cand", "clean:s1"]);
+  });
+
+  it("prepare wraps a failing slot operation (Error and non-Error) in a CheckPrepareError", async () => {
+    const a = checksEnv({ resetError: new Error("boom") });
+    const err = await a.checks.prepare(slot, "cand").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CheckPrepareError);
+    expect(err).toMatchObject({ name: "CheckPrepareError", message: "could not prepare slot s1: boom" });
+    const b = checksEnv({ resetError: "plain" });
+    await expect(b.checks.prepare(slot, "cand")).rejects.toThrow("could not prepare slot s1: plain");
+  });
+
+  it("prepare refuses a slot that is not at the requested commit, naming both (12 characters)", async () => {
+    const { checks } = checksEnv({ head: "1234567890abcdef" });
+    const err = await checks.prepare(slot, "fedcba0987654321").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CheckPrepareError);
+    expect(err).toMatchObject({ message: "slot s1 is at 1234567890ab, not fedcba098765" });
+  });
+
+  it("select resolves typecheck and the node tests from package.json", async () => {
+    const { checks } = checksEnv({ files: { "package.json": PKG_BOTH } });
+    const sel = await checks.select("/slot", "cand");
+    expect(sel.typecheck).toMatchObject({ label: "typecheck", args: ["run", "typecheck"] });
+    expect(sel.tests).toHaveLength(1);
+    expect(sel.tests[0]).toMatchObject({ framework: "node", full: { label: "test" } });
+    expect(sel.extras).toEqual([]);
+  });
+
+  it("select adds pytest with the configured python, unless the command is not allowed", async () => {
+    const labels: string[] = [];
+    const auto = checksEnv({ files: { "pytest.ini": "" }, allowCommand: l => { labels.push(l); return true; } });
+    const sel = await auto.checks.select("/slot", "cand");
+    expect(sel.tests).toEqual([{ framework: "pytest", full: { label: "python -m pytest", file: "python", args: ["-m", "pytest"], source: "pytest", ref: null } }]);
+    expect(labels).toEqual(["python -m pytest"]);
+    const custom = checksEnv({ files: { "conftest.py": "" }, config: { python: "py3" } });
+    expect((await custom.checks.select("/slot", "cand")).tests[0]?.full).toMatchObject({ label: "py3 -m pytest", file: "py3" });
+    const denied = checksEnv({ files: { "pytest.ini": "" }, allowCommand: () => false });
+    expect((await denied.checks.select("/slot", "cand")).tests).toEqual([]);
+  });
+
+  it("select resolves the configured extra checks", async () => {
+    const { checks } = checksEnv({ config: { integrationChecks: [{ script: "lint", args: ["-q"] }, { script: "audit", args: [] }] } });
+    const sel = await checks.select("/slot", "cand");
+    expect(sel.extras.map(e => e.args)).toEqual([["run", "lint", "-q"], ["run", "audit"]]);
+  });
+
+  it("select rejects with the resolver's reason for a typecheck, a test or an extra it refuses", async () => {
+    const refuse = (script: string) => (r: RunCommandRef) => (r.script === script
+      ? { ok: false as const, reason: "not allowed" }
+      : { ok: true as const, command: { label: r.script, file: "npm", args: [], source: "package-script" as const, ref: r } });
+    const a = checksEnv({ files: { "package.json": PKG_BOTH }, resolve: refuse("typecheck") });
+    await expect(a.checks.select("/slot", "cand")).rejects.toThrow("typecheck: not allowed");
+    const b = checksEnv({ files: { "package.json": PKG_BOTH }, resolve: refuse("test") });
+    await expect(b.checks.select("/slot", "cand")).rejects.toThrow("test: not allowed");
+    const c = checksEnv({ config: lintCfg, resolve: refuse("lint") });
+    await expect(c.checks.select("/slot", "cand")).rejects.toThrow("lint: not allowed");
+  });
+});
+
+describe("integration checks: run", () => {
+  it("reports a prepare error with no component", async () => {
+    const { checks, acquired } = checksEnv({ resetError: new Error("boom") });
+    const r = await checks.run(checkReq());
+    expect(r).toMatchObject({ verdict: "error", reason: "prepare", message: "could not prepare slot s1: boom", components: [] });
+    expect(acquired).toHaveLength(0);
+  });
+
+  it("reports a refused command as a resolve error and a failing diff as a prepare error", async () => {
+    const a = checksEnv({ files: { "package.json": PKG_BOTH }, resolve: r => ({ ok: false, reason: `no ${r.script}` }) });
+    expect(await a.checks.run(checkReq())).toMatchObject({ verdict: "error", reason: "resolve", message: "typecheck: no typecheck" });
+    const b = checksEnv({ diffError: new Error("diff failed") });
+    expect(await b.checks.run(checkReq())).toMatchObject({ verdict: "error", reason: "prepare", message: "diff failed" });
+  });
+
+  it("passes with the no-checks note when nothing is selected, and takes no slot", async () => {
+    const { checks, acquired, spawned } = checksEnv();
+    const r = await checks.run(checkReq());
+    expect(r).toMatchObject({ verdict: "pass", components: [], flakyIds: [], note: "no-checks" });
+    expect(r.durationMs).toBeGreaterThan(0);
+    expect(acquired).toHaveLength(0);
+    expect(spawned).toHaveLength(0);
+  });
+
+  it("a regression command alone is a check", async () => {
+    const regress: ResolvedCommand = { label: "regress", file: "npm", args: ["run", "regress"], source: "run-command", ref: null };
+    const { checks, spawned } = checksEnv();
+    const r = await checks.run(checkReq({ extra: { ids: [], files: [], commands: [regress] } }));
+    expect(r).toMatchObject({ verdict: "pass", note: null, components: [{ name: "regression", label: "regress", exitCode: 0, scope: "full" }] });
+    expect(spawned.map(s => s.c.label)).toEqual(["regress"]);
+  });
+
+  it("runs typecheck, scoped tests, extras and regression in order under the slot and passes", async () => {
+    const regress: ResolvedCommand = { label: "regress", file: "npm", args: ["run", "regress"], source: "run-command", ref: null };
+    const captured: { input: PlanScopedRunInput | null } = { input: null };
+    runnerHooks.planScopedRun = async input => { captured.input = input; return noAffected; };
+    const { checks, spawned, released, acquired } = checksEnv({
+      files: { "package.json": PKG_BOTH }, config: lintCfg, diff: [{ status: "M", path: "src/a.ts" }],
+    });
+    const r = await checks.run(checkReq({ extra: { ids: ["x"], files: ["extra.test.ts"], commands: [regress] } }));
+    expect(r).toMatchObject({ verdict: "pass", flakyIds: [], note: null });
+    if (r.verdict !== "pass") throw new Error("expected pass");
+    expect(r.components.map(c => `${c.name}:${c.label}:${c.scope}`)).toEqual([
+      "typecheck:typecheck:full", "tests:no affected tests:no-affected", "extra:lint:full", "regression:regress:full",
+    ]);
+    expect(spawned.map(s => s.c.label)).toEqual(["typecheck", "lint", "regress"]);
+    expect(spawned.every(s => s.cwd === "/slot" && !s.low)).toBe(true);
+    expect(released).toEqual(["h"]);
+    expect(acquired[0]).toMatchObject({ max: 2, waitMs: 2000, meta: { cwd: "/slot", command: "integration checks" } });
+    const input = captured.input;
+    expect(input).toMatchObject({ command: "npm test", cwd: "/slot", budget: { maxWorkers: 2 } });
+    expect(input?.changedFiles).toEqual([{ path: nodePath.join("/slot", "src/a.ts"), status: "M" }, { path: nodePath.join("/slot", "extra.test.ts") }]);
+  });
+
+  it("a pytest component is planned under its own label", async () => {
+    let command = "";
+    runnerHooks.planScopedRun = async input => { command = input.command; return noAffected; };
+    const { checks } = checksEnv({ files: { "pytest.ini": "" } });
+    expect(await checks.run(checkReq())).toMatchObject({ verdict: "pass" });
+    expect(command).toBe("python -m pytest");
+  });
+
+  it("a failing typecheck fails fast with the output tail and runs nothing else", async () => {
+    runnerHooks.planScopedRun = async () => { throw new Error("tests must not be planned"); };
+    const { checks, spawned } = checksEnv({
+      files: { "package.json": PKG_BOTH }, spawn: () => noneOut(1, { stdout: "o".repeat(3000), stderr: "e".repeat(3000) }),
+    });
+    const r = await checks.run(checkReq({ priority: "background" }));
+    expect(r).toMatchObject({ verdict: "fail", failingIds: [], failingFiles: [], flakyIds: [] });
+    if (r.verdict !== "fail") throw new Error("expected fail");
+    expect(Buffer.byteLength(r.output)).toBe(4096);
+    expect(r.output.endsWith("e".repeat(3000))).toBe(true);
+    expect(r.components).toHaveLength(1);
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]?.low).toBe(true);
+  });
+
+  it("a timed out extra or regression command fails", async () => {
+    const a = checksEnv({ config: lintCfg, spawn: () => noneOut(null, { timedOut: true, stdout: "slow" }) });
+    expect(await a.checks.run(checkReq())).toMatchObject({ verdict: "fail", output: "slow", components: [{ name: "extra", timedOut: true, exitCode: null }] });
+    const regress: ResolvedCommand = { label: "regress", file: "npm", args: [], source: "run-command", ref: null };
+    const b = checksEnv({ config: lintCfg, spawn: c => (c.label === "regress" ? noneOut(2) : noneOut()) });
+    const r = await b.checks.run(checkReq({ extra: { ids: [], files: [], commands: [regress] } }));
+    expect(r).toMatchObject({ verdict: "fail" });
+    if (r.verdict !== "fail") return;
+    expect(r.components.map(c => c.name)).toEqual(["extra", "regression"]);
+  });
+});
+
+describe("integration checks: tests component", () => {
+  const PKG_TEST = { "package.json": JSON.stringify({ scripts: { test: "vitest run" } }) };
+  const f1 = "a.test.ts > s > one", f2 = "b.py::C::two";
+
+  it("an unverifiable plan never counts as verified: the full command runs", async () => {
+    runnerHooks.planScopedRun = async () => unverifiable;
+    const ok = checksEnv({ files: PKG_TEST });
+    const r = await ok.checks.run(checkReq());
+    expect(r).toMatchObject({ verdict: "pass", components: [{ name: "tests", label: "test", scope: "full", exitCode: 0 }] });
+    expect(ok.spawned[0]?.c.label).toBe("test");
+
+    const bad = checksEnv({ files: PKG_TEST, spawn: () => noneOut(1, { stdout: "out-", stderr: "err" }) });
+    expect(await bad.checks.run(checkReq())).toMatchObject({ verdict: "fail", failingIds: [], failingFiles: [], output: "out-err" });
+    const timed = checksEnv({ files: PKG_TEST, spawn: () => noneOut(0, { timedOut: true }) });
+    expect(await timed.checks.run(checkReq())).toMatchObject({ verdict: "fail" });
+  });
+
+  it("a complete clean scoped run passes under the spec command, in the spec's directory and environment", async () => {
+    runnerHooks.planScopedRun = async () => scoped();
+    runnerHooks.readResult = async () => report();
+    const { checks, spawned } = checksEnv({ files: PKG_TEST });
+    const r = await checks.run(checkReq());
+    expect(r).toMatchObject({ verdict: "pass", components: [{ name: "tests", label: "test", scope: "spec" }] });
+    expect(spawned[0]).toMatchObject({ cwd: "/slot/pkg", c: { file: "node", args: ["vitest", "run"], env: { A: "1" }, cwd: "/slot/pkg" } });
+  });
+
+  it("an incomplete, timed out, colliding or id-less failure fails without a confirmation rerun", async () => {
+    let reruns = 0;
+    runnerHooks.planScopedRun = async () => scoped();
+    runnerHooks.detectRunner = async () => { reruns++; return detected; };
+    const cases: Array<{ out: CommandOutput; res: VerifyResult; ids: string[]; files: string[] }> = [
+      { out: noneOut(0), res: report({ complete: false }), ids: [], files: [] },
+      { out: noneOut(null, { timedOut: true }), res: report({ failingIds: ["a"], failingFiles: ["/slot/a"] }), ids: ["a"], files: ["/slot/a"] },
+      { out: noneOut(1), res: report({ failingIds: ["a"], failingFiles: ["/slot/a"], collectionError: true }), ids: ["a"], files: ["/slot/a"] },
+      { out: noneOut(1), res: report(), ids: [], files: [] },
+      { out: noneOut(1), res: report({ failingIds: ["a"] }), ids: ["a"], files: [] },
+    ];
+    for (const c of cases) {
+      runnerHooks.readResult = async () => c.res;
+      const { checks } = checksEnv({ files: PKG_TEST, spawn: () => ({ ...c.out, stdout: "so", stderr: "se" }) });
+      const r = await checks.run(checkReq());
+      expect(r).toMatchObject({ verdict: "fail", failingIds: c.ids, failingFiles: c.files, flakyIds: [], output: "sose" });
+    }
+    expect(reruns).toBe(0);
+  });
+
+  /** First run fails ids [f1, f2]; the rerun is scripted. */
+  function rerunEnv(second: { out: CommandOutput; res: VerifyResult }, o: { runner?: DetectedRunner | Unverifiable; rerun?: ScopedSpec | NoAffected | Unverifiable } = {}) {
+    const results = [report({ failingIds: [f1, f2], failingFiles: ["/slot/a.test.ts", "/slot/b.py"] }), second.res];
+    let n = 0;
+    const planned: Array<{ files: readonly string[]; command: string }> = [];
+    runnerHooks.planScopedRun = async () => scoped();
+    runnerHooks.readResult = async () => results[n++] ?? report();
+    runnerHooks.detectRunner = async command => { planned.push({ files: [], command }); return o.runner ?? detected; };
+    runnerHooks.planRerun = async (_runner, files) => { planned.push({ files, command: "rerun" }); return o.rerun ?? scoped({ mode: "rerun", args: ["rerun"], env: { B: "2" }, cwd: "/slot/rr" }); };
+    const env = checksEnv({
+      files: PKG_TEST, spawn: (_c, _o, k) => (k === 1 ? noneOut(1, { stdout: "first" }) : { ...second.out, stdout: "second" }),
+    });
+    return { ...env, planned };
+  }
+
+  it("a failure that passes on the rerun is flaky: the check passes and names the flaky ids", async () => {
+    const { checks, spawned, planned } = rerunEnv({ out: noneOut(0), res: report() });
+    const r = await checks.run(checkReq());
+    expect(r).toMatchObject({ verdict: "pass", flakyIds: [f1, f2], note: null });
+    if (r.verdict !== "pass") return;
+    expect(r.components).toMatchObject([{ name: "tests", scope: "rerun", flakyIds: [f1, f2] }]);
+    expect(spawned[1]).toMatchObject({ cwd: "/slot/rr", c: { args: ["rerun"], env: { B: "2" } } });
+    expect(planned).toEqual([{ files: [], command: "npm test" }, { files: ["/slot/a.test.ts", "/slot/b.py"], command: "rerun" }]);
+  });
+
+  it("only the ids that fail again are failing; the others are flaky", async () => {
+    const { checks } = rerunEnv({ out: noneOut(1), res: report({ failingIds: [f1], failingFiles: ["/slot/a.test.ts"] }) });
+    const r = await checks.run(checkReq());
+    expect(r).toMatchObject({ verdict: "fail", failingIds: [f1], failingFiles: ["/slot/a.test.ts"], flakyIds: [f2], output: "second" });
+    if (r.verdict !== "fail") return;
+    expect(r.components).toMatchObject([{ scope: "rerun", flakyIds: [f2] }]);
+  });
+
+  it("a rerun that fails without naming ids keeps every original id failing", async () => {
+    const { checks } = rerunEnv({ out: noneOut(1), res: report() });
+    const r = await checks.run(checkReq());
+    expect(r).toMatchObject({ verdict: "fail", failingIds: [f1, f2], failingFiles: [], flakyIds: [] });
+  });
+
+  it("a rerun with a collection error is not a confirmation of a pass", async () => {
+    const { checks } = rerunEnv({ out: noneOut(0), res: report({ failingIds: [f2], failingFiles: ["/slot/b.py"], collectionError: true }) });
+    const r = await checks.run(checkReq());
+    expect(r).toMatchObject({ verdict: "fail", failingIds: [f2], failingFiles: ["/slot/b.py"], flakyIds: [f1] });
+  });
+
+  it("without a rerunnable runner the first failure stands", async () => {
+    for (const o of [{ runner: unverifiable }, { rerun: noAffected }, { rerun: unverifiable }]) {
+      const { checks, spawned } = rerunEnv({ out: noneOut(0), res: report() }, o);
+      const r = await checks.run(checkReq());
+      expect(r).toMatchObject({ verdict: "fail", failingIds: [f1, f2], failingFiles: ["/slot/a.test.ts", "/slot/b.py"], flakyIds: [], output: "first" });
+      expect(spawned).toHaveLength(1);
+    }
+  });
+
+  it("ids of every shape name their test file (the rerun fails with a mix of ids)", async () => {
+    const ids = ["a.test.ts > s", "b.py::C::t", "bare.test.ts", "c.py::T > odd"];
+    runnerHooks.planScopedRun = async () => scoped();
+    runnerHooks.detectRunner = async () => detected;
+    runnerHooks.planRerun = async () => scoped({ mode: "rerun" });
+    let n = 0;
+    runnerHooks.readResult = async () => (n++ === 0 ? report({ failingIds: ids, failingFiles: ["/slot/x"] }) : report({ failingIds: ids, failingFiles: ["/slot/y"] }));
+    const { checks } = checksEnv({ files: PKG_TEST, spawn: () => noneOut(1) });
+    const r = await checks.run(checkReq());
+    expect(r).toMatchObject({ verdict: "fail", failingIds: ids, failingFiles: ["/slot/y"], flakyIds: [] });
+  });
+});
+
+describe("integration checks: verification slot (M12)", () => {
+  const busy: SlotResult = { busy: true };
+
+  it("a foreground check preempts background verification first, then preempts one background run per busy answer", async () => {
+    const bg = new BackgroundRuns();
+    const victim = new AbortController();
+    bg.register(victim, 1);
+    const mine: string[] = [];
+    const { checks, acquired, preempts } = checksEnv({
+      config: lintCfg, background: bg, slotMax: 5, acquire: (_o, n) => (n < 3 ? busy : okHandle(mine)),
+    });
+    expect(await checks.run(checkReq())).toMatchObject({ verdict: "pass" });
+    expect(preempts).toEqual(["fg"]);
+    expect(acquired).toHaveLength(3);
+    expect(acquired[0]).toMatchObject({ max: 5 });
+    expect(victim.signal.aborted).toBe(true);
+    expect(mine).toEqual(["h"]);
+  });
+
+  it("a background check registers for preemption, never preempts others and runs at low priority", async () => {
+    const bg = new BackgroundRuns();
+    const other = new AbortController();
+    bg.register(other, 1);
+    const during: number[] = [];
+    const { checks, spawned, preempts, acquired } = checksEnv({
+      config: lintCfg, background: bg, acquire: (_o, n) => (n < 2 ? busy : okHandle([])),
+      spawn: () => { during.push(bg.active); return noneOut(); },
+    });
+    expect(await checks.run(checkReq({ priority: "background" }))).toMatchObject({ verdict: "pass" });
+    expect(during).toEqual([2]);
+    expect(bg.active).toBe(1);
+    expect(other.signal.aborted).toBe(false);
+    expect(preempts).toEqual([]);
+    expect(acquired).toHaveLength(2);
+    expect(spawned[0]?.low).toBe(true);
+  });
+
+  it("the default preemption (wiring) works when none is injected", async () => {
+    const { checks } = checksEnv({ config: lintCfg, preemptForeground: null });
+    expect(await checks.run(checkReq())).toMatchObject({ verdict: "pass" });
+  });
+
+  it("an aborted request never takes a slot", async () => {
+    const ac = new AbortController();
+    ac.abort();
+    const { checks, acquired, spawned } = checksEnv({ config: lintCfg });
+    expect(await checks.run(checkReq({ signal: ac.signal }))).toMatchObject({
+      verdict: "error", reason: "interrupted", message: "aborted while waiting for a verification slot",
+    });
+    expect(acquired).toHaveLength(0);
+    expect(spawned).toHaveLength(0);
+  });
+
+  it("an abort while waiting for the slot ends the wait", async () => {
+    const ac = new AbortController();
+    const { checks, acquired } = checksEnv({ config: lintCfg, acquire: () => { ac.abort(); return busy; } });
+    expect(await checks.run(checkReq({ signal: ac.signal }))).toMatchObject({
+      verdict: "error", reason: "interrupted", message: "aborted while waiting for a verification slot",
+    });
+    expect(acquired).toHaveLength(1);
+  });
+
+  it("a slot reclaimed while held is a slot-lost error and the handle is still released", async () => {
+    let onLost: (() => void) | undefined;
+    const rel: string[] = [];
+    const { checks } = checksEnv({
+      config: lintCfg, acquire: o => { onLost = o.onLost; return okHandle(rel); }, spawn: () => { onLost?.(); return noneOut(); },
+    });
+    expect(await checks.run(checkReq())).toMatchObject({
+      verdict: "error", reason: "slot-lost", message: "the verification slot was reclaimed while held",
+    });
+    expect(rel).toEqual(["h"]);
+  });
+
+  it("a handle that reports itself lost without the callback is an interrupted run", async () => {
+    const rel: string[] = [];
+    const lost: SlotHandle = { lost: true, release: async () => { rel.push("l"); } };
+    const { checks } = checksEnv({ config: lintCfg, acquire: () => lost });
+    expect(await checks.run(checkReq())).toMatchObject({ verdict: "error", reason: "interrupted", message: "the run was aborted" });
+    expect(rel).toEqual(["l"]);
+  });
+
+  it("a background run preempted by a foreground check reports preempted", async () => {
+    const bg = new BackgroundRuns();
+    const { checks } = checksEnv({ config: lintCfg, background: bg, spawn: () => { bg.preemptOne(); return noneOut(); } });
+    expect(await checks.run(checkReq({ priority: "background" }))).toMatchObject({
+      verdict: "error", reason: "preempted", message: "a foreground check preempted this background run",
+    });
+    expect(bg.active).toBe(0);
+  });
+
+  it("a spawner failure is a spawn error (Error and non-Error) and releases the slot", async () => {
+    const rel: string[] = [];
+    const a = checksEnv({ config: lintCfg, acquire: () => okHandle(rel), spawn: () => { throw new Error("no such file"); } });
+    expect(await a.checks.run(checkReq())).toMatchObject({ verdict: "error", reason: "spawn", message: "no such file" });
+    expect(rel).toEqual(["h"]);
+    const b = checksEnv({ config: lintCfg, spawn: () => Promise.reject("plain") });
+    expect(await b.checks.run(checkReq())).toMatchObject({ verdict: "error", reason: "spawn", message: "plain" });
+  });
+});
+
+describe("integration checks: test search and filesystem seams", () => {
+  const PKG_TEST = { "package.json": JSON.stringify({ scripts: { test: "vitest run" } }) };
+  const dirs: { root: string } = { root: "" };
+  beforeAll(async () => { dirs.root = await mkdtemp(nodePath.join(tmpdir(), "omr-bisect-")); });
+  afterAll(async () => { await rm(dirs.root, { recursive: true, force: true }); });
+
+  it("the search runs git through the spawner and maps exit codes, time-outs and failures to undefined", async () => {
+    const replies: Array<CommandOutput | Error> = [];
+    const got: Record<string, readonly string[] | undefined> = {};
+    runnerHooks.planScopedRun = async input => {
+      const s = input.search;
+      replies.push(noneOut(0, { stdout: "a/x.test.ts\0y.ts\0" }));
+      got["name"] = await s.findByName("/root", ["a*b.ts"]);
+      replies.push(noneOut(0));
+      got["escaped"] = await s.findByName("/root", ["a?b", "c[d]", "e\\f"]);
+      replies.push(noneOut(1));
+      got["nameExit1"] = await s.findByName("/root", ["x"]);
+      replies.push(noneOut(0, { timedOut: true }));
+      got["nameTimeout"] = await s.findByName("/root", ["x"]);
+      replies.push(new Error("spawn failed"));
+      got["nameThrow"] = await s.findByName("/root", ["x"]);
+      replies.push(noneOut(1));
+      got["none"] = await s.findByContent("/root", "needle", ["*.ts"]);
+      replies.push(noneOut(0, { stdout: "z.ts\0" }));
+      got["hit"] = await s.findByContent("/root", "needle", ["*.ts"], { word: true });
+      replies.push(noneOut(0, { stdout: "q.ts\0" }));
+      got["plainHit"] = await s.findByContent("/root", "needle", ["*.ts"], { word: false });
+      replies.push(noneOut(2));
+      got["contentError"] = await s.findByContent("/root", "needle", ["*.ts"]);
+      replies.push(noneOut(1, { timedOut: true }));
+      got["contentTimeout"] = await s.findByContent("/root", "needle", ["*.ts"]);
+      replies.push(new Error("spawn failed"));
+      got["contentThrow"] = await s.findByContent("/root", "needle", ["*.ts"]);
+      return noAffected;
+    };
+    const { checks, spawned } = checksEnv({
+      files: PKG_TEST, spawn: () => { const r = replies.shift(); if (r instanceof Error) throw r; return r ?? noneOut(); },
+    });
+    expect(await checks.run(checkReq())).toMatchObject({ verdict: "pass" });
+    expect(got["name"]).toEqual([nodePath.resolve("/root", "a/x.test.ts"), nodePath.resolve("/root", "y.ts")]);
+    expect(got["escaped"]).toEqual([]);
+    expect(got["nameExit1"]).toBeUndefined();
+    expect(got["nameTimeout"]).toBeUndefined();
+    expect(got["nameThrow"]).toBeUndefined();
+    expect(got["none"]).toEqual([]);
+    expect(got["hit"]).toEqual([nodePath.resolve("/root", "z.ts")]);
+    expect(got["plainHit"]).toEqual([nodePath.resolve("/root", "q.ts")]);
+    expect(got["contentError"]).toBeUndefined();
+    expect(got["contentTimeout"]).toBeUndefined();
+    expect(got["contentThrow"]).toBeUndefined();
+
+    const calls = spawned.filter(s => s.c.file === "git");
+    expect(calls).toHaveLength(11);
+    expect(calls[0]).toMatchObject({ cwd: "/slot", low: true, c: { label: "git", source: "run-command", ref: null, cwd: "/slot" } });
+    expect(calls[0]?.c.args).toEqual([
+      "--no-optional-locks", "-C", "/root", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", ":(glob)**/a[*]b.ts",
+    ]);
+    expect(calls[1]?.c.args.slice(-3)).toEqual([":(glob)**/a[?]b", ":(glob)**/c[[]d[]]", ":(glob)**/e[\\\\]f"]);
+    expect(calls[6]?.c.args).toEqual([
+      "--no-optional-locks", "-C", "/root", "grep", "-l", "-z", "-F", "-w", "--untracked", "-e", "needle", "--", "*.ts",
+    ]);
+    expect(calls[7]?.c.args).not.toContain("-w");
+  });
+
+  it("the filesystem seam reads real files, reports a missing file and tolerates an already deleted one", async () => {
+    const file = nodePath.join(dirs.root, "f.txt");
+    await writeFile(file, "hi");
+    await mkdir(nodePath.join(dirs.root, "sub"));
+    const expectedReal = await realpath(file);
+    const got: {
+      exists: boolean[]; text: string; real: string | undefined; stat: unknown; dir: readonly string[] | undefined;
+      gone: boolean; dirError: unknown;
+    } = { exists: [], text: "", real: undefined, stat: null, dir: undefined, gone: false, dirError: null };
+    runnerHooks.planScopedRun = async input => {
+      const fs = input.fs;
+      got.exists = [await fs.fileExists(file), await fs.fileExists(nodePath.join(dirs.root, "nope"))];
+      got.text = await fs.readFile(file);
+      got.real = await fs.realpath?.(file);
+      got.stat = await fs.stat?.(file);
+      got.dir = await fs.readdir?.(dirs.root);
+      return scoped();
+    };
+    runnerHooks.readResult = async (_spec, _exec, fs) => {
+      await fs.unlink(file);
+      got.gone = !(await fs.fileExists(file));
+      await fs.unlink(file);
+      got.dirError = await fs.unlink(nodePath.join(dirs.root, "sub")).then(() => null, (e: unknown) => e);
+      return report();
+    };
+    const { checks } = checksEnv({ files: PKG_TEST });
+    expect(await checks.run(checkReq())).toMatchObject({ verdict: "pass" });
+    expect(got.exists).toEqual([true, false]);
+    expect(got.text).toBe("hi");
+    expect(got.real).toBe(expectedReal);
+    expect(got.stat).toMatchObject({ isFile: true, size: 2n });
+    expect([...(got.dir ?? [])].sort()).toEqual(["f.txt", "sub"]);
+    expect(got.gone).toBe(true);
+    expect(got.dirError).toBeInstanceOf(Error);
+  });
+});
+
+describe("integration checks: runCommands", () => {
+  const testCmd: ResolvedCommand = { label: "npm test", file: "npm", args: ["test"], source: "package-script", ref: { script: "test", args: [] } };
+  const lintCmd: ResolvedCommand = { label: "lint", file: "npm", args: ["run", "lint"], source: "package-script", ref: { script: "lint", args: [] } };
+  const pyCmd: ResolvedCommand = { label: "python -m pytest", file: "python", args: ["-m", "pytest"], source: "pytest", ref: null };
+  function cmdReq(o: Partial<CommandRunRequest> = {}): CommandRunRequest {
+    return { slot, commit: "cand", commands: [testCmd], mode: "full", priority: "foreground", signal: new AbortController().signal, prepare: true, ...o };
+  }
+
+  it("a prepare failure is an error result and takes no slot; prepare=false skips the preparation", async () => {
+    const a = checksEnv({ resetError: new Error("boom") });
+    const r = await a.checks.runCommands(cmdReq());
+    expect(r).toMatchObject({ verdict: "error", ids: [], files: [], idsUnparsed: false, output: "", error: { reason: "prepare", message: "could not prepare slot s1: boom" } });
+    expect(r.durationMs).toBeGreaterThan(0);
+    expect(a.acquired).toHaveLength(0);
+    const b = checksEnv();
+    expect(await b.checks.runCommands(cmdReq({ prepare: false }))).toMatchObject({ verdict: "pass", error: null });
+    expect(b.resets).toEqual([]);
+  });
+
+  it("the full mode runs every command and passes", async () => {
+    const { checks, spawned } = checksEnv();
+    const r = await checks.runCommands(cmdReq({ commands: [lintCmd, testCmd, pyCmd] }));
+    expect(r).toMatchObject({ verdict: "pass", ids: [], files: [], idsUnparsed: false, error: null });
+    expect(spawned.map(s => s.c.label)).toEqual(["lint", "npm test", "python -m pytest"]);
+  });
+
+  it("the first failing command stops the run: unparsed, with its output tail", async () => {
+    const { checks, spawned } = checksEnv({ spawn: c => (c.label === "lint" ? noneOut(1, { stdout: "lint-out", stderr: "-err" }) : noneOut()) });
+    const r = await checks.runCommands(cmdReq({ commands: [lintCmd, testCmd], priority: "background" }));
+    expect(r).toMatchObject({ verdict: "fail", ids: [], files: [], idsUnparsed: true, output: "lint-out-err" });
+    expect(spawned.map(s => s.c.label)).toEqual(["lint"]);
+    expect(spawned[0]?.low).toBe(true);
+    const t = checksEnv({ spawn: () => noneOut(0, { timedOut: true }) });
+    expect(await t.checks.runCommands(cmdReq())).toMatchObject({ verdict: "fail", idsUnparsed: true });
+  });
+
+  it("a rerun narrows a test command to the failing files and collects sorted ids and files", async () => {
+    const planned: Array<{ command: string; files: readonly string[] }> = [];
+    runnerHooks.detectRunner = async () => detected;
+    runnerHooks.planRerun = async (_r, files) => { planned.push({ command: "rerun", files }); return scoped({ mode: "rerun", args: ["rr"], env: { R: "1" }, cwd: "/slot/rr" }); };
+    runnerHooks.readResult = async () => report({ failingIds: ["b > y", "a > x"], failingFiles: ["/slot/b", "/slot/a"] });
+    const { checks, spawned } = checksEnv({ spawn: () => noneOut(1, { stdout: "boom" }) });
+    const r = await checks.runCommands(cmdReq({ mode: { rerun: ["a.test.ts > x", "b.py::T::t", "a.test.ts"] } }));
+    expect(r).toMatchObject({ verdict: "fail", ids: ["a > x", "b > y"], files: ["/slot/a", "/slot/b"], idsUnparsed: false, output: "boom" });
+    expect(planned).toEqual([{ command: "rerun", files: [nodePath.resolve("/slot", "a.test.ts"), nodePath.resolve("/slot", "b.py")] }]);
+    expect(spawned[0]).toMatchObject({ cwd: "/slot/rr", c: { args: ["rr"], env: { R: "1" }, label: "npm test" } });
+  });
+
+  it("a pytest command is detected under its own label; other commands run unchanged in a rerun", async () => {
+    const detectedFor: string[] = [];
+    runnerHooks.detectRunner = async command => { detectedFor.push(command); return detected; };
+    runnerHooks.planRerun = async () => scoped({ mode: "rerun" });
+    runnerHooks.readResult = async () => report();
+    const { checks, spawned } = checksEnv();
+    const r = await checks.runCommands(cmdReq({ commands: [pyCmd, lintCmd], mode: { rerun: ["t.py::T::t"] } }));
+    expect(r).toMatchObject({ verdict: "pass", ids: [], files: [], idsUnparsed: false });
+    expect(detectedFor).toEqual(["python -m pytest"]);
+    expect(spawned.map(s => s.c.label)).toEqual(["python -m pytest", "lint"]);
+  });
+
+  it("an unparsed or timed out scoped failure marks the ids unparsed; a rerun with nothing affected is skipped", async () => {
+    runnerHooks.detectRunner = async () => detected;
+    runnerHooks.planRerun = async () => scoped({ mode: "rerun" });
+    runnerHooks.readResult = async () => report({ complete: false });
+    const a = checksEnv({ spawn: () => noneOut(1) });
+    expect(await a.checks.runCommands(cmdReq({ mode: { rerun: ["t"] } }))).toMatchObject({ verdict: "fail", ids: [], idsUnparsed: true });
+    runnerHooks.readResult = async () => report({ failingIds: ["a"], failingFiles: ["/slot/a"] });
+    const b = checksEnv({ spawn: () => noneOut(0, { timedOut: true }) });
+    expect(await b.checks.runCommands(cmdReq({ mode: { rerun: ["t"] } }))).toMatchObject({ verdict: "fail", ids: ["a"], idsUnparsed: false });
+    runnerHooks.planRerun = async () => noAffected;
+    const c = checksEnv();
+    expect(await c.checks.runCommands(cmdReq({ mode: { rerun: ["t"] } }))).toMatchObject({ verdict: "pass" });
+    expect(c.spawned).toHaveLength(0);
+  });
+
+  it("an unverifiable runner falls back to running the command as it is", async () => {
+    runnerHooks.detectRunner = async () => unverifiable;
+    const { checks, spawned } = checksEnv({ spawn: () => noneOut(3, { stdout: "plain" }) });
+    const r = await checks.runCommands(cmdReq({ mode: { rerun: ["t"] } }));
+    expect(r).toMatchObject({ verdict: "fail", idsUnparsed: true, output: "plain" });
+    expect(spawned.map(s => s.c)).toEqual([testCmd]);
+  });
+
+  it("a slot that cannot be taken or a failing spawner is an error result", async () => {
+    const ac = new AbortController();
+    ac.abort();
+    const a = checksEnv();
+    expect(await a.checks.runCommands(cmdReq({ signal: ac.signal }))).toMatchObject({
+      verdict: "error", error: { reason: "interrupted", message: "aborted while waiting for a verification slot" },
+    });
+    const b = checksEnv({ spawn: () => { throw new Error("spawn died"); } });
+    expect(await b.checks.runCommands(cmdReq())).toMatchObject({ verdict: "error", error: { reason: "spawn", message: "spawn died" } });
+  });
+});
+
+describe("phase suite runner: run", () => {
+  it("a passing full run is passed and journals nothing itself", async () => {
+    const { runner, requests } = suiteEnv();
+    const { j, log } = journalOf();
+    expect(await runner.run(suiteReq(), j)).toEqual({ kind: "passed" });
+    expect(log.order).toEqual([]);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({ commit: "c3", mode: "full", priority: "background", prepare: true, signal: j.signal });
+    expect(log.cwds).toEqual(["slot:/slot"]);
+  });
+
+  it("an unattributable failure reruns the full commands; two passing reruns are flaky with no ids", async () => {
+    const { runner, requests } = suiteEnv({ runCommands: (_r, n) => (n === 1 ? runRes("fail", { idsUnparsed: true, output: "boom" }) : runRes("pass")) });
+    const { j, log } = journalOf();
+    expect(await runner.run(suiteReq(), j)).toEqual({ kind: "flaky", ids: [] });
+    expect(requests.map(r => r.mode)).toEqual(["full", "full", "full"]);
+    expect(log.order).toEqual(["end:failed", "start:suite-rerun", "end:ok", "start:suite-rerun"]);
+  });
+
+  it("an attributable failure reruns only the failing files; reruns without the ids make them flaky", async () => {
+    const { runner, requests } = suiteEnv({ runCommands: (_r, n) => (n === 1 ? failRes(["a", "b"]) : runRes("pass")) });
+    const { j, log } = journalOf();
+    expect(await runner.run(suiteReq(), j)).toEqual({ kind: "flaky", ids: ["a", "b"] });
+    expect(requests.slice(1).map(r => r.mode)).toEqual([{ rerun: ["f.test.ts"] }, { rerun: ["f.test.ts"] }]);
+    expect(log.ends[0]).toMatchObject({ result: "failed", ids: ["a", "b"] });
+    expect(log.ends[1]).toMatchObject({ result: "ok", ids: [] });
+  });
+
+  it("a rerun that fails without parsed ids counts as every original id", async () => {
+    const { runner } = suiteEnv({ runCommands: (_r, n) => (n === 1 ? failRes(["a", "b"]) : n === 2 ? runRes("fail", { idsUnparsed: true }) : runRes("pass")) });
+    const { j } = journalOf();
+    const verdict = await runner.run(suiteReq({ base: null }), j);
+    expect(verdict).toEqual({ kind: "unattributed", ids: ["a", "b"], reason: "no-base" });
+  });
+
+  it("without a base the failure is unattributed and a memo bisect step is journaled", async () => {
+    const { runner } = suiteEnv({ runCommands: () => failRes(["x"]) });
+    const { j, log } = journalOf();
+    expect(await runner.run(suiteReq({ base: null }), j)).toEqual({ kind: "unattributed", ids: ["x"], reason: "no-base" });
+    expect(log.order.slice(-1)).toEqual(["start:bisect"]);
+    expect(log.starts.at(-1)?.detail).toEqual({ v: 1, base: "c3", candidate: "c3", tasks: ["T1", "T2", "T3"], probe: "memo" });
+    expect(log.ends.at(-1)).toMatchObject({ result: "failed", ids: ["x"] });
+  });
+
+  it("failures that also fail at the base are pre-existing and the base step stays open", async () => {
+    const { runner, requests } = suiteEnv({ runCommands: byCommit({ c3: failRes(["x", "y"]), c0: failRes(["x", "y"]) }) });
+    const { j, log } = journalOf();
+    expect(await runner.run(suiteReq(), j)).toEqual({ kind: "pre-existing", ids: ["x", "y"] });
+    expect(requests.at(-1)?.commit).toBe("c0");
+    expect(log.order.at(-1)).toBe("start:suite-rerun");
+  });
+
+  it("an unparsed failure at the base is unattributed (no-base) with a memo step", async () => {
+    const { runner } = suiteEnv({ runCommands: byCommit({ c3: failRes(["x"]), c0: runRes("fail", { idsUnparsed: true, output: "o" }) }) });
+    const { j, log } = journalOf();
+    expect(await runner.run(suiteReq(), j)).toEqual({ kind: "unattributed", ids: ["x"], reason: "no-base" });
+    expect(log.ends.at(-1)).toMatchObject({ result: "failed", ids: ["x"] });
+    expect(log.order.at(-1)).toBe("start:bisect");
+  });
+
+  it("an unattributable failure that also fails at the base is pre-existing with no ids", async () => {
+    const { runner } = suiteEnv({ runCommands: () => runRes("fail", { idsUnparsed: true }) });
+    const { j } = journalOf();
+    expect(await runner.run(suiteReq(), j)).toEqual({ kind: "pre-existing", ids: [] });
+  });
+
+  it("bisects to the culprit range, probing only the regression ids and never the known base", async () => {
+    const { runner, requests } = suiteEnv({
+      runCommands: byCommit({ c3: failRes(["x"]), c2: failRes(["x", "other"]), c1: failRes(["other"]) }),
+      igit: { revList: async () => ["c1", "c2", "c3"] },
+    });
+    const { j, log } = journalOf();
+    const verdict = await runner.run(suiteReq(), j);
+    expect(verdict).toEqual({ kind: "culprit", range: { taskId: "T2", from: "c1", to: "c2" }, ids: ["x"], files: ["f.test.ts"] });
+    const probed = requests.slice(4).map(r => r.commit);
+    expect(probed).not.toContain("c0");
+    expect(probed).not.toContain("c3");
+    expect(probed.length).toBeGreaterThan(0);
+    expect(probed.every(c => c === "c1" || c === "c2")).toBe(true);
+    expect(log.counters).toEqual([{ key: "integration.bisect.probes", value: probed.length, labels: { kind: "suite" } }]);
+    expect(log.ends.some(e => e.result === "ok" && e.ids?.length === 0)).toBe(true);
+    expect(log.starts.at(-1)?.detail).toMatchObject({ probe: "memo", tasks: ["T1", "T2", "T3"] });
+  });
+
+  it("bisects an unattributable failure by the verdict alone", async () => {
+    const unparsed = runRes("fail", { idsUnparsed: true });
+    const { runner, requests } = suiteEnv({
+      runCommands: byCommit({ c3: unparsed, c2: unparsed }),
+      igit: { revList: async () => ["c1", "c2", "c3"] },
+    });
+    expect(await runner.run(suiteReq(), journalOf().j)).toEqual({ kind: "culprit", range: { taskId: "T2", from: "c1", to: "c2" }, ids: [], files: [] });
+    expect(requests.slice(0, 3).map(r => r.mode)).toEqual(["full", "full", "full"]);
+  });
+
+  it("reports outside when even the first range's from fails", async () => {
+    const ranges: TaskRange[] = [{ taskId: "T1", from: "cx", to: "c1" }, { taskId: "T2", from: "c1", to: "c2" }, { taskId: "T3", from: "c2", to: "c3" }];
+    const { runner } = suiteEnv({
+      runCommands: byCommit({ c3: failRes(["x"]), c2: failRes(["x"]), c1: failRes(["x"]), cx: failRes(["x"]) }),
+      igit: { revList: async () => ["c1", "c2", "c3"] },
+    });
+    const { j } = journalOf();
+    expect(await runner.run(suiteReq({ ranges }), j)).toEqual({ kind: "unattributed", ids: ["x"], reason: "outside" });
+  });
+
+  it("a range whose `to` is not in the phase chain is unattributed (outside) with a memo step", async () => {
+    const { runner } = suiteEnv({ runCommands: byCommit({ c3: failRes(["x"]) }), igit: { revList: async () => [] } });
+    const { j, log } = journalOf();
+    expect(await runner.run(suiteReq(), j)).toEqual({ kind: "unattributed", ids: ["x"], reason: "outside" });
+    expect(log.order.at(-1)).toBe("start:bisect");
+  });
+
+  it("a git failure while listing the chain is a prepare error (Error and non-Error)", async () => {
+    const run = byCommit({ c3: failRes(["x"]) });
+    const a = suiteEnv({ runCommands: run, igit: { revList: async () => { throw new Error("rev-list failed"); } } });
+    expect(await a.runner.run(suiteReq(), journalOf().j)).toEqual({ kind: "error", reason: "prepare", message: "rev-list failed" });
+    const b = suiteEnv({ runCommands: run, igit: { revList: () => Promise.reject("plain") } });
+    expect(await b.runner.run(suiteReq(), journalOf().j)).toEqual({ kind: "error", reason: "prepare", message: "plain" });
+  });
+
+  it("a probe that cannot run stops the bisect with its outcome", async () => {
+    const { runner } = suiteEnv({
+      runCommands: (req) => (req.commit === "c3" ? failRes(["x"]) : req.commit === "c0" ? runRes("pass") : errRes("spawn", "no probe")),
+      igit: { revList: async () => ["c1", "c2", "c3"] },
+    });
+    const { j, log } = journalOf();
+    expect(await runner.run(suiteReq(), j)).toEqual({ kind: "error", reason: "spawn", message: "no probe" });
+    expect(log.counters).toEqual([]);
+  });
+
+  it("a failed run without an error object is a spawn error; three tries then give up with a clipped message", async () => {
+    const { runner, requests } = suiteEnv({ runCommands: () => ({ ...runRes("error"), error: null }) });
+    const { j, log } = journalOf();
+    expect(await runner.run(suiteReq(), j)).toEqual({ kind: "error", reason: "spawn", message: "the run failed without a reason" });
+    expect(requests).toHaveLength(3);
+    expect(log.order).toEqual(["end:refused", "start:phase-suite", "end:refused", "start:phase-suite", "end:refused"]);
+
+    const long = suiteEnv({ runCommands: () => errRes("prepare", "z".repeat(1500)) });
+    const l = journalOf();
+    const verdict = await long.runner.run(suiteReq(), l.j);
+    expect(verdict).toMatchObject({ kind: "error", reason: "prepare" });
+    const detail = l.log.ends[0]?.detail;
+    const message = detail !== undefined && "message" in detail ? detail.message : undefined;
+    expect(message).toHaveLength(1000);
+    expect(message?.endsWith("\u2026")).toBe(true);
+  });
+
+  it("a preempted attempt reopens the step with the same detail and does not use the try budget", async () => {
+    const { runner, requests } = suiteEnv({ runCommands: (_r, n) => (n <= 5 ? errRes("preempted") : runRes("pass")) });
+    const { j, log } = journalOf();
+    expect(await runner.run(suiteReq(), j)).toEqual({ kind: "passed" });
+    expect(requests).toHaveLength(6);
+    expect(log.ends[0]).toMatchObject({ result: "refused", detail: { reason: "preempted", n: 1 } });
+    expect(log.ends[4]).toMatchObject({ detail: { reason: "preempted", n: 5 } });
+    expect(log.starts.every(s => s.step === "phase-suite")).toBe(true);
+  });
+
+  it("an aborted journal signal interrupts before and after an attempt (abort and dispose)", async () => {
+    const pre = new AbortController();
+    pre.abort();
+    const a = suiteEnv();
+    expect(await a.runner.run(suiteReq(), journalOf(pre.signal).j)).toEqual({ kind: "interrupted", by: "abort" });
+    expect(a.requests).toHaveLength(0);
+
+    const during = new AbortController();
+    const b = suiteEnv({ runCommands: () => { during.abort("dispose"); return errRes("spawn"); } });
+    expect(await b.runner.run(suiteReq(), journalOf(during.signal).j)).toEqual({ kind: "interrupted", by: "dispose" });
+
+    const c = suiteEnv({ runCommands: () => errRes("interrupted") });
+    expect(await c.runner.run(suiteReq(), journalOf().j)).toEqual({ kind: "interrupted", by: "abort" });
+  });
+
+  it("an error in the first rerun is returned as is", async () => {
+    const { runner } = suiteEnv({ runCommands: (_r, n) => (n === 1 ? failRes(["x"]) : errRes("slot-lost", "lost")) });
+    expect(await runner.run(suiteReq(), journalOf().j)).toEqual({ kind: "error", reason: "slot-lost", message: "lost" });
+  });
+
+  it("an error at the base is returned as is", async () => {
+    const { runner } = suiteEnv({ runCommands: (r) => (r.commit === "c0" ? errRes("slot-lost", "lost") : failRes(["x"])) });
+    expect(await runner.run(suiteReq(), journalOf().j)).toEqual({ kind: "error", reason: "slot-lost", message: "lost" });
+  });
+
+  it("preemptBackground delegates to the background runs", () => {
+    const { runner, background } = suiteEnv();
+    const c = new AbortController();
+    background.register(c, 1);
+    expect(runner.preemptBackground()).toBe(true);
+    expect(c.signal.aborted).toBe(true);
+    expect(runner.preemptBackground()).toBe(false);
+  });
+});
+
+describe("phase suite runner: revert", () => {
+  const revertReq: RevertRequest = {
+    planId: "plan", phaseId: "p1", culprit: { taskId: "T2", from: "c1", to: "c2" }, suiteCommit: "c3", head: "h0",
+    regression: { ids: ["x"], files: ["f.test.ts"], commands: [cmd] }, slot,
+  };
+  const pass: CheckResult = { verdict: "pass", components: [], flakyIds: [], note: null, durationMs: 1 };
+
+  function revertEnv(over: { checks?: Partial<IntegrationChecks>; igit?: Partial<IntegrateGit>; git?: Partial<GitOps> } = {}) {
+    const reverted: Array<{ sha: string; message: string }> = [];
+    const runs: CheckRequest[] = [];
+    const env = suiteEnv({
+      checks: {
+        prepare: async () => undefined,
+        run: async req => { runs.push(req); return pass; },
+        ...over.checks,
+      },
+      igit: { revList: async () => ["s1", "s2"], subject: async sha => `change ${sha} [plan:T2]`, ...over.igit },
+      git: {
+        revert: async (_cwd, sha, message) => { reverted.push({ sha, message }); return { ok: true, head: sha }; },
+        revParse: async () => "rh",
+        ...over.git,
+      },
+    });
+    return { ...env, reverted, runs };
+  }
+
+  it("reverts newest first, then runs the integration checks with the regression as extra", async () => {
+    const { runner, reverted, runs } = revertEnv();
+    const { j, log } = journalOf();
+    expect(await runner.revert(revertReq, j)).toEqual({ kind: "ok", revertHead: "rh", reverted: ["s2", "s1"] });
+    expect(reverted.map(r => r.sha)).toEqual(["s2", "s1"]);
+    expect(reverted[0]?.message).toMatch(/^revert\(p1\)/);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({
+      base: "h0", candidate: "rh", priority: "foreground", extra: { ids: ["x"], files: ["f.test.ts"], commands: [cmd] },
+    });
+    expect(log.cwds).toEqual(["integration:/slot"]);
+    expect(log.order).toEqual(["end:ok", "start:revert-checks"]);
+    expect(log.starts[0]?.patch).toEqual({ candidate: "rh" });
+  });
+
+  it("a revert conflict reports the commit and the paths", async () => {
+    const { runner } = revertEnv({ git: { revert: async () => ({ ok: false, conflicts: ["a.ts", "b.ts"], head: "h" }) } });
+    expect(await runner.revert(revertReq, journalOf().j)).toEqual({ kind: "conflict", at: "s2", paths: ["a.ts", "b.ts"] });
+  });
+
+  it("failing integration checks are reported with their ids, files and output", async () => {
+    const failing: CheckResult = { verdict: "fail", components: [], failingIds: ["x"], failingFiles: ["f"], flakyIds: [], output: "o", durationMs: 1 };
+    const { runner } = revertEnv({ checks: { run: async () => failing } });
+    expect(await runner.revert(revertReq, journalOf().j)).toEqual({ kind: "failed", ids: ["x"], files: ["f"], output: "o" });
+  });
+
+  it("an erroring check run is retried three times, a preempted one without limit", async () => {
+    let calls = 0;
+    const erroring = revertEnv({ checks: { run: async () => { calls++; return { verdict: "error", reason: "slot-lost", message: "lost", components: [], durationMs: 1 }; } } });
+    expect(await erroring.runner.revert(revertReq, journalOf().j)).toEqual({ kind: "error", reason: "slot-lost", message: "lost" });
+    expect(calls).toBe(3);
+
+    let n = 0;
+    const preempted = revertEnv({ checks: { run: async () => {
+      n++;
+      return n < 5 ? { verdict: "error", reason: "preempted", message: "p", components: [], durationMs: 1 } : pass;
+    } } });
+    expect(await preempted.runner.revert(revertReq, journalOf().j)).toMatchObject({ kind: "ok" });
+    expect(n).toBe(5);
+  });
+
+  it("a slot that cannot be prepared is a prepare error after three tries (Error and non-Error)", async () => {
+    let calls = 0;
+    const a = revertEnv({ checks: { prepare: async () => { calls++; throw new Error("dirty slot"); } } });
+    expect(await a.runner.revert(revertReq, journalOf().j)).toEqual({ kind: "error", reason: "prepare", message: "dirty slot" });
+    expect(calls).toBe(3);
+    const b = revertEnv({ checks: { prepare: () => Promise.reject("nope") } });
+    expect(await b.runner.revert(revertReq, journalOf().j)).toEqual({ kind: "error", reason: "prepare", message: "nope" });
+  });
+
+  it("an empty culprit range holds nothing to revert", async () => {
+    const { runner } = revertEnv({ igit: { revList: async () => [] } });
+    expect(await runner.revert(revertReq, journalOf().j)).toEqual({
+      kind: "error", reason: "prepare", message: "range c1..c2 holds no commit to revert",
+    });
+  });
+
+  it("a git failure while building the revert is a spawn error (Error and non-Error)", async () => {
+    const a = revertEnv({ git: { revert: async () => { throw new Error("git died"); } } });
+    expect(await a.runner.revert(revertReq, journalOf().j)).toEqual({ kind: "error", reason: "spawn", message: "git died" });
+    const b = revertEnv({ igit: { revList: () => Promise.reject("plain") } });
+    expect(await b.runner.revert(revertReq, journalOf().j)).toEqual({ kind: "error", reason: "spawn", message: "plain" });
+  });
+
+  it("an aborted journal interrupts the build and the checks", async () => {
+    const ac = new AbortController();
+    ac.abort();
+    expect(await revertEnv().runner.revert(revertReq, journalOf(ac.signal).j)).toEqual({ kind: "interrupted", by: "abort" });
+
+    const late = new AbortController();
+    const env = revertEnv({ checks: { run: async () => { late.abort("dispose"); return { verdict: "error", reason: "spawn", message: "x", components: [], durationMs: 1 }; } } });
+    expect(await env.runner.revert(revertReq, journalOf(late.signal).j)).toEqual({ kind: "interrupted", by: "dispose" });
+  });
+});
+
+describe("phase suite runner: resolve", () => {
+  const ref: RunCommandRef = { script: "lint", args: ["--quiet"] };
+  function ledgerOf(phaseSuite: ExecutorConfig["phaseSuite"]): LedgerV1 {
+    return stub<LedgerV1>({
+      config: stub<LedgerV1["config"]>({ phaseSuite }),
+      integration: stub<LedgerV1["integration"]>({ worktree: "/wt" }),
+    });
+  }
+
+  it("off and an empty list select nothing", async () => {
+    const { runner } = suiteEnv();
+    expect(await runner.resolve(ledgerOf("off"), "p1", "c3")).toEqual({ kind: "off" });
+    expect(await runner.resolve(ledgerOf([]), "p1", "c3")).toEqual({ kind: "none" });
+  });
+
+  it("auto runs the full command of every selected test component", async () => {
+    const selection: CheckSelection = { typecheck: null, tests: [{ framework: "node", full: cmd }], extras: [] };
+    const seen: string[] = [];
+    const { runner } = suiteEnv({ checks: { select: async (cwd, commit) => { seen.push(`${cwd}@${commit}`); return selection; } } });
+    expect(await runner.resolve(ledgerOf("auto"), "p1", "c3")).toEqual({ kind: "runs", commands: [cmd] });
+    expect(seen).toEqual(["/wt@c3"]);
+    const none = suiteEnv({ checks: { select: async () => ({ typecheck: null, tests: [], extras: [] }) } });
+    expect(await none.runner.resolve(ledgerOf("auto"), "p1", "c3")).toEqual({ kind: "none" });
+  });
+
+  it("auto refuses when the selection throws", async () => {
+    const a = suiteEnv({ checks: { select: async () => { throw new Error("no package.json"); } } });
+    expect(await a.runner.resolve(ledgerOf("auto"), "p1", "c3")).toEqual({ kind: "refused", reason: "phase p1 suite selection failed: no package.json", ref: null });
+    const b = suiteEnv({ checks: { select: () => Promise.reject("plain") } });
+    expect(await b.runner.resolve(ledgerOf("auto"), "p1", "c3")).toMatchObject({ kind: "refused", reason: "phase p1 suite selection failed: plain" });
+  });
+
+  it("an explicit list resolves every ref in the integration worktree", async () => {
+    const { runner } = suiteEnv({ resolver: { resolve: async (r, cwd) => ({ ok: true, command: { ...cmd, label: `${r.script}@${cwd}` } }) } });
+    expect(await runner.resolve(ledgerOf([ref, { script: "test", args: [] }]), "p1", "c3")).toEqual({
+      kind: "runs", commands: [{ ...cmd, label: "lint@/wt" }, { ...cmd, label: "test@/wt" }],
+    });
+  });
+
+  it("an explicit list refuses with the resolver's reason or error and names the ref", async () => {
+    const denied = suiteEnv({ resolver: { resolve: async () => ({ ok: false, reason: "not allowed" }) } });
+    expect(await denied.runner.resolve(ledgerOf([ref]), "p1", "c3")).toEqual({ kind: "refused", reason: "not allowed", ref });
+    const throwing = suiteEnv({ resolver: { resolve: async () => { throw new Error("resolver down"); } } });
+    expect(await throwing.runner.resolve(ledgerOf([ref]), "p1", "c3")).toEqual({ kind: "refused", reason: "resolver down", ref });
+    const plain = suiteEnv({ resolver: { resolve: () => Promise.reject("plain") } });
+    expect(await plain.runner.resolve(ledgerOf([ref]), "p1", "c3")).toEqual({ kind: "refused", reason: "plain", ref });
   });
 });
 
