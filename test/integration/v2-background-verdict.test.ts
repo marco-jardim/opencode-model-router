@@ -8,6 +8,7 @@
  * - QA-2.1-9 / QA-2.1-11 (the pieces router_verify and the gate use): a held entry's report line; the producer-aware lease wait.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -59,7 +60,7 @@ afterEach(async () => {
 
 type Posted = { handle: string; verdict: string; text: string; reason?: string };
 
-async function attach(): Promise<{ api: FinishApi; posted: Posted[] }> {
+async function attach(runner?: { run(request: { parentSessionID?: string }): Promise<{ sessionID: string; text: string }>; dispose(sessionID: string): Promise<void> }): Promise<{ api: FinishApi; posted: Posted[]; hooks: Hooks }> {
   const hooks: Hooks = await ModelRouterPlugin({
     directory: home,
     worktree: home,
@@ -68,6 +69,8 @@ async function attach(): Promise<{ api: FinishApi; posted: Posted[] }> {
     $: () => undefined,
     routerHost: "v2",
     client: { session: { get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id } }) } },
+    // DF-1-3: the v2 child runner the graders launch through (the adapter's `ctx.routerChildRunner`).
+    ...(runner === undefined ? {} : { routerChildRunner: runner }),
   } as unknown as Parameters<typeof ModelRouterPlugin>[0]);
   const channel: unknown = Reflect.get(hooks, ROUTER_FINISH_ATTACH);
   if (typeof channel !== "function") throw new Error("the plugin exposes no finish attach channel");
@@ -79,7 +82,7 @@ async function attach(): Promise<{ api: FinishApi; posted: Posted[] }> {
   };
   const api = channel({ host: "v2", held }) as FinishApi | undefined;
   if (api === undefined) throw new Error("v2 attach returned no finish API");
-  return { api, posted };
+  return { api, posted, hooks };
 }
 
 async function finishHeld(api: FinishApi, callID: string): Promise<string> {
@@ -121,6 +124,42 @@ describe("held background verdicts (QA-2.1-1)", () => {
     expect(posted[0].verdict).not.toBe("PASS");
     expect(posted[0].reason).toMatch(/^(not verified: |verification unavailable: )/);
     expect(posted[0].text).toMatch(/\[router\] UNVERIFIABLE — (not verified: |verification unavailable: )/);
+  }, 30_000);
+});
+
+describe("DF-1-3 a background completion without a deterministic check", () => {
+  it("DF-1-3 the grader launches from the orchestrator (never the current context); an unverifiable result is tagged UNVERIFIABLE, never PASS", async () => {
+    process.env.MODEL_ROUTER_ENFORCE = "1";
+    execFileSync("git", ["init", "-q"], { cwd: home }); // a work tree the gate can prepare its verification in
+    const launched: Array<{ parentSessionID?: string }> = [];
+    const runner = {
+      run: async (request: { parentSessionID?: string }) => {
+        launched.push(request);
+        throw new Error("Tool.Error: Subagent denied: model-router-grader");
+      },
+      dispose: async () => undefined,
+    };
+    const { api, hooks } = await attach(runner);
+    // The call's arguments as the before hook keeps them (an explicit acceptance with a criterion only: a grader check).
+    const prompt = ["Explain the parser.", "", "[acceptance]", "criteria: the explanation names the parser's entry point", "[/acceptance]"].join("\n");
+    const before = hooks["tool.execute.before"] as unknown as ((input: unknown, output: unknown) => Promise<void>) | undefined;
+    await before?.({ tool: "task", sessionID: "ses_parent", callID: "call-df13" }, { args: { subagent_type: "fast", description: "explain the parser", prompt } })
+      .catch(() => undefined);
+    const result = await api.finish({
+      callID: "call-df13",
+      parentSessionID: "ses_parent",
+      childSessionID: "ses_child_df13",
+      outputText: "The parser starts in parse().",
+      status: "succeeded",
+      mode: "background",
+      endedAt: Date.now(),
+    });
+    expect(launched.length).toBeGreaterThan(0);
+    for (const request of launched) expect(request.parentSessionID).toBe("ses_parent");
+    expect(result.verification).toEqual({ kind: "required", verdict: "UNVERIFIABLE" });
+    // Acceptance is unchanged: an unverifiable result is accepted (not strictUnverifiable), so no forcing note.
+    expect(result.outputText.startsWith("The parser starts in parse().")).toBe(true);
+    expect(result.outputText).not.toContain("NEXT: address the above");
   }, 30_000);
 });
 

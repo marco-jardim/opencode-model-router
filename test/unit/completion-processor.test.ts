@@ -125,6 +125,46 @@ function rig(opts: { withCapture?: boolean } = {}): Rig {
   return { clock, reg, proc, held, finishCalls, released, records, processedKeys, posts, warns, closed, claims, releasedHandles, behavior };
 }
 
+describe("DF-1-4 resumed background dispatch (registry)", () => {
+  it("DF-1-4 an end parked before the resume was decided is never replayed to the resumed attempt", () => {
+    const r = rig();
+    // Turn 1's end of the child, parked while no attempt of this process knew the child.
+    r.reg.noteEarlyEnd("ses_c1", { outcome: "succeeded", eventID: "e_turn1", at: r.clock.t });
+    r.clock.t += 1_000;
+    // The resume: same child, new call, decided after the end was parked.
+    expect(r.reg.decide(callRecord("c2", { at: r.clock.t, resumeOf: "ses_c1" }))).toBe(true);
+    expect(r.reg.acknowledge("c2", "ses_c1", { userBackgrounded: false })).toBeDefined();
+    expect(r.reg.takeEarlyEnd("ses_c1")).toBeUndefined();
+  });
+
+  it("DF-1-4 an end parked after the resume was decided is still replayed at its acknowledgement", () => {
+    const r = rig();
+    expect(r.reg.decide(callRecord("c3", { at: r.clock.t, resumeOf: "ses_c3" }))).toBe(true);
+    r.clock.t += 10;
+    r.reg.noteEarlyEnd("ses_c3", { outcome: "succeeded", eventID: "e_own", at: r.clock.t });
+    expect(r.reg.acknowledge("c3", "ses_c3", { userBackgrounded: false })).toBeDefined();
+    expect(r.reg.takeEarlyEnd("ses_c3")?.eventID).toBe("e_own");
+  });
+
+  it("DF-1-4 an end met before the turn has an answer waits; the turn's own end delivers exactly one verdict with its answer", async () => {
+    const r = rig();
+    await launch(r, "c2", "ses_c2", { handle: "vrf_2" });
+    const reads: Array<{ text?: string } | undefined> = [undefined, { text: "turn 2 answer" }];
+    r.behavior.read = async () => reads.shift();
+    r.behavior.finish = async (input) => finishResult({ outputText: input.outputText, suffix: "", verification: { kind: "required", verdict: "PASS" } });
+    await r.proc.process("ses_c2", endEvent());
+    expect(r.reg.byChild("ses_c2")?.state).toBe("child-ended");
+    expect(r.finishCalls).toHaveLength(0);
+    await r.proc.process("ses_c2", { kind: "end-event", outcome: "succeeded", eventID: "ev2", at: 1_000_700 });
+    await r.proc.process("ses_c2", { kind: "end-event", outcome: "succeeded", eventID: "ev3", at: 1_000_800 });
+    await flushAll();
+    expect(r.finishCalls.map((f) => f.outputText)).toEqual(["turn 2 answer"]);
+    const verdicts = r.posts.filter((p) => JSON.stringify(p).includes("vrf_2"));
+    expect(verdicts).toHaveLength(1);
+    expect(JSON.stringify(verdicts[0])).toContain("turn 2 answer");
+  });
+});
+
 function callRecord(callID: string, over: Partial<CallRecord> = {}): CallRecord {
   return {
     callID,

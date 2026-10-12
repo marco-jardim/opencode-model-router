@@ -39,6 +39,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   conversation, so the system prompt stays byte-stable across turns. Late notices are repeated every turn until
   `router_verify` reads them. OpenCode v1 is unchanged.
 
+### Fixed
+
+- **OpenCode v2: a resumed background dispatch delivers its own answer.** It no longer delivers the previous turn's
+  answer (from the parent's earlier completion message or from the child's earlier turn), and its handle gets exactly
+  one verdict, carrying the resumed turn's answer.
+- **OpenCode v2: background dispatches without a deterministic check are graded.** Their grader launches from the
+  orchestrator's context, never from a role child's (which denies `subagent`), and a result that could not be verified
+  is tagged `UNVERIFIABLE` instead of `PASS`. Acceptance is unchanged. OpenCode v1 is unchanged.
+
 ## [2.7.0] - 2026-10-10
 
 ### Added

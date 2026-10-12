@@ -781,6 +781,9 @@ export const SESSION_KIND_NEGATIVE_TTL_MS = 2_000;
 const MAX_SESSION_DIRS = 1000;
 /** QA-2.1-13: parent sessions remembered as adopted (oldest first out). */
 const MAX_ADOPTED_SESSIONS = 5000;
+/** DF-1-4: the children whose completion elements are remembered, and the elements kept per child. */
+const MAX_SEEN_COMPLETION_CHILDREN = 1000;
+const MAX_SEEN_COMPLETION_ELEMENTS = 64;
 /** QA-2.1-8: a failed pending-journal reload is tried again at most this often (fail closed meanwhile). */
 export const PENDING_RELOAD_RETRY_MS = 30_000;
 /** QA-2.1-8: `dispose` waits at most this long for the background work in flight (verdict posts, recoveries). */
@@ -2178,6 +2181,27 @@ export async function registerV2Hooks(
       });
       return changed ? next : undefined;
     };
+    /** DF-1-4: per child, the completion elements (state and body) already seen in its parent's context; bounded. */
+    const seenCompletionElements = new Map<string, Set<string>>();
+    /** Records a completion element of `child`; true only the first time it is seen. */
+    const noteCompletionElement = (child: string, signature: string): boolean => {
+      let seen = seenCompletionElements.get(child);
+      if (seen?.has(signature)) return false;
+      if (seen === undefined) {
+        seen = new Set<string>();
+        seenCompletionElements.set(child, seen);
+        for (const old of seenCompletionElements.keys()) {
+          if (seenCompletionElements.size <= MAX_SEEN_COMPLETION_CHILDREN) break;
+          seenCompletionElements.delete(old);
+        }
+      }
+      seen.add(signature);
+      for (const old of seen) {
+        if (seen.size <= MAX_SEEN_COMPLETION_ELEMENTS) break;
+        seen.delete(old);
+      }
+      return true;
+    };
     /**
      * A root session's request: every completion element of an acknowledged attempt starts its processing (not awaited), and the
      * first request that sees an attempt waits for it at most COMPLETION_SETTLE_MS (one shared budget, never again for that attempt).
@@ -2197,7 +2221,14 @@ export async function registerV2Hooks(
               });
               continue;
             }
-            if (attempt.state === "acknowledged" || attempt.state === "child-ended") {
+            // DF-1-4: the parent's history keeps the completion element of every earlier turn of a resumed child. An element is
+            // remembered once an attempt took it or had finished when it was seen; a remembered one never starts a later attempt
+            // (the resume's own element, or its end event, follows). Seen during a processing, it is left for the next request.
+            const signature = `${element.state}\0${element.body}`;
+            const open = attempt.state === "acknowledged" || attempt.state === "child-ended";
+            if (open && !noteCompletionElement(element.child, signature)) continue;
+            if (!open && attempt.state !== "processing") noteCompletionElement(element.child, signature);
+            if (open) {
               trackBackground(processor.process(element.child, { kind: "completion", state: element.state, body: element.body, at: nowMs() }));
             }
             if (!attempt.waitedOnce && !waits.includes(element.child)) {
@@ -2675,7 +2706,10 @@ export async function registerV2Hooks(
     };
     // Phase 2.1 (memo §4.7): the completion processor. Only when the plugin attached its finish API; otherwise nothing is processed.
     let processor: CompletionProcessor | undefined;
-    /** The child's last assistant message (`ctx.session.context`, C7/O1); also the recovery read of a persisted dispatch. */
+    /**
+     * The child's last assistant message of its current turn (after its newest user prompt, DF-1-4) (`ctx.session.context`,
+     * C7/O1); also the recovery read of a persisted dispatch.
+     */
     const lastAssistantText = async (child: string): Promise<{ text: string } | undefined> => {
       const history = await ctx.session.context({ sessionID: child } as Parameters<typeof ctx.session.context>[0]);
       const messages: readonly unknown[] = Array.isArray(history) ? history : [];
@@ -2687,6 +2721,8 @@ export async function registerV2Hooks(
           const text = messageText(message);
           if (text !== undefined) return { text };
         }
+        // DF-1-4: the newest user prompt opens the current turn; an answer before it belongs to an earlier turn (a resume).
+        if (message?.type === "user" || message?.role === "user") break;
       }
       ingestLogger.warn("[router] background: the child's context holds no assistant message", {
         child,
@@ -3238,7 +3274,8 @@ export async function registerV2Hooks(
                 const attempt = inflight.byChild(sid);
                 if (attempt !== undefined) {
                   // QA-2.1-21: tracked, so `dispose` and the settled seam wait for the completion it starts.
-                  if (attempt.state === "acknowledged") trackBackground(processor.process(sid, { kind: "end-event", outcome, eventID: event.id, at }));
+                  // DF-1-4: a `child-ended` attempt met an end before its turn had an answer to read: this end delivers it.
+                  if (attempt.state === "acknowledged" || attempt.state === "child-ended") trackBackground(processor.process(sid, { kind: "end-event", outcome, eventID: event.id, at }));
                   else ingestLogger.warn("[router] background: an end event met an attempt that is not awaiting one", { child: sid, state: attempt.state, outcome });
                 } else if (sessionKinds.get(sid) !== "root") {
                   // A session whose kind is not yet known may be a child whose acknowledgement is still to come (bounded, TTL).
@@ -3269,6 +3306,7 @@ export async function registerV2Hooks(
               effortStore.forget(data.sessionID); // #90 P1.2: a deleted session is no longer answered
               // Phase 2.1 (memo §4.6): the session's attempts, holds, leases and cached kind go with it.
               inflight.forgetSession(data.sessionID);
+              seenCompletionElements.delete(data.sessionID);
               processor?.forgetSession(data.sessionID);
               held.forgetSession(data.sessionID);
               leaseGuard?.releaseChild(data.sessionID);

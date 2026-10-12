@@ -350,6 +350,51 @@ describe("background dispatch: acknowledgement, in-flight list, completion annot
   });
 });
 
+describe("DF-1-4 a resumed background dispatch", () => {
+  const verdicts = (h: BgHost): string[] => h.synthetic.filter((s) => s.text.startsWith("<router-verdict ")).map((s) => s.text);
+  const say = (text: string) => ({ type: "assistant", content: [{ type: "text", text }], finish: "stop", time: { created: 1, completed: 2 } });
+  const ask = (text: string) => ({ type: "user", content: [{ type: "text", text }] });
+
+  it("DF-1-4 the resume never takes the previous turn's completion element or answer; its own end delivers one verdict with its answer", async () => {
+    const h = await boot("auto");
+    h.emit(created(CHILD, ORCH));
+    // Turn 1: dispatched in the background, ended, verdict posted, completion element in the parent's history.
+    const first = await h.before(dispatch({ background: true }));
+    await h.after({ ...first, status: "completed", result: structuredClone(RUNNING) });
+    await request(h, [user("start")]); // the root request that teaches the adapter the parent is a root
+    h.childContext.set(CHILD, [ask("do the work"), say("NEED MORE: turn one")]);
+    h.emit({ type: "session.execution.succeeded", id: "ev-end-df14-turn-1", created: 2, data: { sessionID: CHILD } });
+    await h.settled();
+    await vi.waitFor(() => expect(verdicts(h)).toHaveLength(1), { timeout: 20_000 });
+    const turnOne = completion(CHILD, "NEED MORE: turn one");
+    await request(h, [user("start"), turnOne]);
+    await h.settled();
+
+    // Turn 2: the resume of the same child, in the background, with a new prompt.
+    const second = await h.before(dispatch({ background: true, sessionID: CHILD, prompt: "resume prompt" }));
+    await h.after({ ...second, status: "completed", result: structuredClone(RUNNING) });
+    // The parent's next request still carries turn 1's completion element: it is not the resume's.
+    await request(h, [user("start"), turnOne, user("resumed")]);
+    await h.settled();
+    // An end met while the resumed turn has no answer yet: turn 1's answer is never read for it.
+    h.childContext.set(CHILD, [ask("do the work"), say("NEED MORE: turn one"), ask("resume prompt")]);
+    h.emit({ type: "session.execution.succeeded", id: "ev-end-df14-early", created: 3, data: { sessionID: CHILD } });
+    await h.settled();
+    expect(verdicts(h)).toHaveLength(1);
+
+    // The resumed turn's own end delivers exactly one verdict, with its answer.
+    h.childContext.set(CHILD, [ask("do the work"), say("NEED MORE: turn one"), ask("resume prompt"), say("DONE: turn two")]);
+    h.emit({ type: "session.execution.succeeded", id: "ev-end-df14-turn-2", created: 4, data: { sessionID: CHILD } });
+    await h.settled();
+    await vi.waitFor(() => expect(verdicts(h)).toHaveLength(2), { timeout: 20_000 });
+    expect(verdicts(h)[1]).toContain("DONE: turn two");
+    expect(verdicts(h)[1]).not.toContain("turn one");
+    await request(h, [user("start"), turnOne, user("resumed"), completion(CHILD, "DONE: turn two")]);
+    await h.settled();
+    expect(verdicts(h)).toHaveLength(2);
+  }, 60_000);
+});
+
 describe("held results across a restart (R20): placeholder, refusal, compaction", () => {
   const original = `<subagent sessionID="${CHILD}" state="completed">SECRET held output</subagent>`;
 

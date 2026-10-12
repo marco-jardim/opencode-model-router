@@ -3318,7 +3318,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     input: any,
     output: any,
     unbannered: { output: unknown } | undefined,
-    extra?: { delta?: DispatchDelta; dod?: ReturnType<typeof buildDelegationDoD> },
+    extra?: { delta?: DispatchDelta; dod?: ReturnType<typeof buildDelegationDoD>; graderParentSessionID?: string },
   ): Promise<FinishOutcome> {
     let outcome: FinishOutcome = { kind: "none" };
     if (typeof input?.tool === "string") {
@@ -3444,8 +3444,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
           const gateGraderSessions = new Set<string>();
           const completedFailures: string[] = [];
-          // Keep the native grader unparented on the backend; only depth tracking uses its caller.
-          const gateDeps = buildGateDeps(undefined, gateGraderSessions, verification, gateDeadline, false, orchestratorSessionID || null);
+          // Keep the native grader unparented on the backend; only depth tracking uses its caller. DF-1-3 (v2 finish API only,
+          // absent on the v1 after-hook): a background completion names the parent whose retained context launches the grader.
+          const gateDeps = buildGateDeps(extra?.graderParentSessionID, gateGraderSessions, verification, gateDeadline, false, orchestratorSessionID || null);
           gateDeps.deterministic.onFailure = reason => completedFailures.push(reason);
           // #84 QA-G-B-2-1: a carried acceptance never passes on a testsPass/lintClean that ran no process.
           if (carriedRole) gateDeps.deterministic.noAffectedUnverifiable = CARRIED_NO_PROCESS_REASON;
@@ -3538,7 +3539,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           changedFileStore.clear(dispatchID);
           outcome = {
             kind: "required",
-            verdict: res.accepted ? "PASS" : res.verdict.outcome === "unverifiable" ? "UNVERIFIABLE" : "FAIL",
+            // DF-1-3: the tag follows the outcome; an accepted unverifiable result (gate.ts, not strictUnverifiable) is UNVERIFIABLE.
+            verdict: res.verdict.outcome === "unverifiable" ? "UNVERIFIABLE" : res.accepted ? "PASS" : "FAIL",
             detail: res.verdict.reasons.join("; "),
           };
         } catch (error) {
@@ -3767,7 +3769,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       // onVerdict posts only for an entry that carries its hold.
       return claim.entry.hold === undefined ? postHeldDirect(handle, held.verdict, text, reason) : undefined;
     };
-    trackHeldGate(finishDispatch(callInput, scratch, undefined, extra).then(settleHeld, (error: unknown) => {
+    // DF-1-3: the held gate's grader launches from the orchestrator's retained context too (C14 launcher A).
+    trackHeldGate(finishDispatch(callInput, scratch, undefined, { ...extra, graderParentSessionID: fin.parentSessionID }).then(settleHeld, (error: unknown) => {
       logger.warn("[router] held verification failed", { handle, error: describeError(error) });
       return settleHeld({ kind: "error", reason: `verification unavailable: ${scrubText(String(error))}` });
     }));
@@ -3963,7 +3966,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         runHeldGate(fin, handle, callInput, scratch, delta === undefined ? undefined : { delta }, undefined);
         return { outputText: fin.outputText, suffix: "", verification: { kind: "held", handle }, metadata: {} };
       }
-      const outcome = await finishDispatch(callInput, scratch, undefined, delta === undefined ? undefined : { delta });
+      // DF-1-3: a background completion has no tool context of the orchestrator; its grader launches from the retained context of
+      // the parent (C14 launcher A), never from whatever context is current (a role child's denies `subagent`).
+      const outcome = await finishDispatch(callInput, scratch, undefined, { ...(delta === undefined ? {} : { delta }), graderParentSessionID: fin.parentSessionID });
       const suffix = suffixOf();
       const verification: FinishResult["verification"] =
         outcome.kind === "deferred" ? { kind: "deferred", handle: outcome.handle }
