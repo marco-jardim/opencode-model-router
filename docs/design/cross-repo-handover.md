@@ -33,9 +33,16 @@ Last checks (HEAD after the round 2 fixes):
 - Goldens: all `test/golden/` pass; only the configured roles-protocol golden changed (OD5) and the new `dispatch-header.golden.test.ts` was added.
 - Full `npx vitest run`: 50 failures in 15 files, every time it ran next to a reviewer's own test runs. Every failing file passes when run alone or in small groups, except the known `test/unit/exec.test.ts` timing tests. New in the load-sensitive list: `test/integration/unattributed-writers.test.ts`, `test/integration/branch-switch.test.ts`, `test/integration/branch-switch-deferred.test.ts`, `test/unit/tree-kill.test.ts`, `test/integration/perimeter.test.ts`, `test/integration/roles-authority.test.ts`, `test/integration/failover-compose.test.ts`, `test/integration/layer2-wiring.test.ts`, `test/integration/modeB-e2e.test.ts` (possibly related to round 2 m8, the extra pin snapshots). A clean full run with nothing else running has not been done yet.
 
-## Resume here (2026-10-11, session paused by the owner)
+## Progress after resuming (2026-10-12)
 
-HEAD is a **WIP commit** (`fix(verify): [WIP] P2e QA round 1 fixes …`): the P2e QA round 1 fixes are half done. `src/` loads and typechecks; the tests do not all pass yet. Finish it, then squash or follow it with a fixing commit (local branch, nothing pushed).
+- Fan-out A, B, C, D done: the WIP was completed (`29abefc`), user docs corrected (`d8bd374`), design follow-ups recorded (`1c44f2f`), P2e QA round 2 run. Its one major (the deferred link re-check read the git top level instead of the W the dispatch read; W in a repository subfolder reported every link as changed) is fixed in `7dbb317`; its minors are recorded in design §9 (`99b31a1`).
+- Checks at `7dbb317`: typecheck clean; `deferred-perimeter` 26/26, `perimeter` 54/54, `deferred-verification` 72/72, `pending` 90/90, `docs-drift` 90/90.
+- Remaining: full `npx vitest run` with nothing else running (then each failing file alone), `test/golden`, the live P2e dogfood, then the handover status table and the P2 status comment on #107. Still open: Q7.
+- The OpenCode server restarted several times during this session; a dispatch interrupted by a restart leaves its edits in the tree. Check `git status` and `git diff --stat` before re-dispatching.
+
+## Resume here (2026-10-11, session paused by the owner) — superseded by the section above
+
+HEAD was a **WIP commit** (`fix(verify): [WIP] P2e QA round 1 fixes …`): the P2e QA round 1 fixes are half done. `src/` loads and typechecks; the tests do not all pass yet. Finish it, then squash or follow it with a fixing commit (local branch, nothing pushed).
 
 State of the WIP (verified at save time):
 - `npm run typecheck`: one error, in a test file only: `test/integration/deferred-verification.test.ts(72,31)`: `FullScopePlan | StaticScoping` is not assignable to `StaticScoping` (a test mock of `planStaticScoping` must accept the new full-scope plan type).
