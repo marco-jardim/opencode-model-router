@@ -164,7 +164,7 @@ Conclusions:
 
 - **SD-P3a-1.** Only an explicit `scope=affected` (normalized `CheckPlacement.scope`, `types.ts:16-21`, `check-placement.ts:87-98`) turns a foreign `testsPass` into a cross-link run (if OD-P3a-1 = a). No `scope=` and foreign `lintClean` keep today's refusal byte-identical (`deterministic.ts:1685-1691`).
 - **SD-P3a-2 (amended by the spike).** The union of spellings above; never the junction spelling (ids under `node_modules` are skipped by vitest).
-- **SD-P3a-3.** A cross-link run that selects 0 tests is incomplete → unverifiable, never "no affected tests ran" (D7/D12).
+- **SD-P3a-3.** A cross-link run that selects 0 tests is incomplete → unverifiable, never "no affected tests ran" (D7/D12). Since QA-1 M2 it also has a post-run completeness check (D27, owner decision): every consumer test file that names a W package in an import/require specifier must have run, else the run is incomplete.
 - **SD-P3a-4.** vitest only, the major the integration test covers (5, `ResolvedEntry.version`, `runner.ts:1427-1428`); jest, pytest, other majors → S6 `cross-link-unsupported` (design `:322`).
 - **SD-P3a-5.** The cross-link root is W's git top: `artefact.changeRoot`, else `effectiveBaseDir` (`gate.ts:449`). Only changed paths inside it become inputs.
 - **SD-P3a-6.** No link requirement: vitest's own graph does discovery (`../` and alias edges count, R4); the zero guard is the backstop.
@@ -174,6 +174,7 @@ Conclusions:
 - **SD-P3a-10.** v2 roles only by construction (placements exist only there; tier `cwd=` refused, OD1). A test pins that tiers and v1 never set the cross-link root.
 - **SD-P3a-11.** Static scoping plans the check with the same option (risk input only).
 - **SD-P3a-12.** No protocol change (see Owner decisions).
+- **D23 amended (QA-1 C1, QA-2 M-A).** Only W's ignored modules modified since the dispatch start are added as inputs; a build older than a W source changed after it is S6 `cross-link-build-stale`.
 
 ## Pre-flight findings
 
@@ -209,6 +210,7 @@ Conclusions:
 - **Y6** `feat(verify): static scoping plans a cross-link check`.
   - Tests: `wiring.test.ts`, `deferred-verification.test.ts` next to `:741`: a scopable plan gives no "unverifiable" risk reason; jest → S6.
   - Code: `wiring.ts` `staticScoping` (`:2133-2145`, root from `change.snapshot?.root`, `:2239`).
+- **Y7** skipped: the roles protocol is not taught `scope=affected` (SD-P3a-12).
 - **Y8** `docs(verify): affected consumer checks across a link`.
   - `docs/VERIFICATION.md:441-457` (new bullet: spellings, zero → unverifiable, `preserveSymlinks`, built output per OD-P3a-2, I3 still needs a check in W) and a note at `:183`; `docs/ROLES.md:363-365`; `CHANGELOG.md` `[Unreleased]` Added; docs-drift pins for the new reasons (`docs-drift.test.ts:1240-1293`).
   - Design: §6 `:316-322` (the spike table), S8 row `:305` (X11), §7 `:480` implemented note, §11 D22/D23.

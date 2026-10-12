@@ -302,7 +302,7 @@ The first sentence of the working-directory paragraph is today's text (`src/rout
 | S5 | Tier edits only lib-b with write tools; DoD cwd app-a | unverifiable (`gate.ts:257-269`) | unchanged |
 | S6 | W=app-a; `node_modules\lib-b` → `D:\git\lib-b`. lib-b changes during the dispatch, an app-a test fails, and the reference rerun loads live lib-b and fails too. | **pass, "no worse than before"** (`baseline.ts:186-190`); the link is skipped (`reference.ts:1833-1834`) | P0.4: reference approximate (`external-link`) → **unverifiable** |
 | S7 | Same as S6, but lib-b untouched; the failure really is pre-existing | pass, "no worse than before" | P0.4: unverifiable (the cost of failing closed). P2: link pinned → pass "no worse than before" again. |
-| S8 | W=lib-b; app-a consumes lib-b; the change breaks app-a | Roles: cannot be expressed (lib-b cannot be W; `gate.ts:245`). Tier with cwd app-a: unverifiable (`gate.ts:257`). | P1: lib-b's checks decide, with the note "app-a links lib-b; not verified" when app-a is in the working set. P2: a working-set consumer without a check → caveat (UNVERIFIED). A consumer check with `scope=full`: fails → unverifiable, passes → pass. A scoped consumer check → S6 `attribution-unavailable`, unverifiable (`runner.ts:4306`). Consumers outside the working set are not discovered. |
+| S8 | W=lib-b; app-a consumes lib-b; the change breaks app-a | Roles: cannot be expressed (lib-b cannot be W; `gate.ts:245`). Tier with cwd app-a: unverifiable (`gate.ts:257`). | P1: lib-b's checks decide, with the note "app-a links lib-b; not verified" when app-a is in the working set. P2: a working-set consumer without a check → caveat (UNVERIFIED). A consumer check with `scope=full`: fails → unverifiable, passes → pass. A scoped consumer check is refused before it runs, unverifiable ("must use scope=full", `src/verify/deterministic.ts:1872-1876` since P2). P3 (a): a consumer `testsPass` with an explicit `scope=affected` runs across the link into W instead (X11, D22); a `lintClean`, or a `testsPass` without an explicit scope, keeps the refusal. Consumers outside the working set are not discovered. |
 | S9 | A script runs `git checkout main` in W; tests pass on main | **pass**: the commit diff becomes the change set (`wiring.ts:1118-1136`) | P0.2: **unverifiable** (I7) |
 | S10 | Grader DoD; the producer wrote only through a script | grader **pass**; the prompt says an empty delta is valid (`src/verify/checker.ts:333`) | P0.3: caveat (I5) |
 | S11 | Deferred; lib-b (linked by app-a) changes after return; app-a's tests pass against the new lib-b | Phase 2 implemented: the frozen link targets are observed again at `router_verify`; a changed target, or one that cannot be observed again, turns a pass **UNVERIFIED** with the caveat `the linked repository <name> at <root> changed since the producer returned; the checks ran against its new state` (or `… could not be observed again since the producer returned`); a fail stays a fail and carries it (`LINK_DRIFT_CAVEAT`, `wiring.ts`; D18). Before Phase 2 this was a pass (`checkDrift` checked stored paths only). | P2: unchanged by Phase 3. Under the contract this is staleness, not a false pass. |
@@ -318,8 +318,28 @@ The first sentence of the working-directory paragraph is today's text (`src/rout
 **Affected tests in A when only B changed.**
 - The planner drops every path outside A's git root (`runner.ts:4411-4416`). When nothing is left, the result is S6 `attribution-unavailable` (`runner.ts:4306`, `:4368`).
 - `vitest related` and `jest --findRelatedTests` follow static imports only, and a cross-package effect is not run (`docs/VERIFICATION.md:183`).
-- **Rule:** a check in a consumer repository runs with `scope=full` (Phase 2); a scoped one stays unverifiable.
-- **Phase 3 spike:** test whether `vitest related <real path in B>` run in A finds A's importers through symlinked packages. Jest stays S6.
+- **Rule:** a check in a consumer repository runs with `scope=full` (Phase 2); a scoped one stays unverifiable, except a consumer `testsPass` with an explicit `scope=affected`, which runs across the link (Phase 3 (a), D22, below).
+
+**Phase 3 (a) spike result (2026-10-12): yes, with a path-spelling amendment.** vitest 5.0.3, vite 8.3.1, node v24.21.0, pwsh. Each run is `vitest related <paths> --run --passWithNoTests` in a scratch consumer with a junction `node_modules\p3a-lib` → `lib`, whose stored target text differs in case from the disk (`Temp\Claude` against `Temp\claude`). Jest stays S6 (`cross-link-unsupported`).
+
+| Run | Path passed | Selected |
+|---|---|---|
+| R1, R2, R5 | native real path (`realpathSync.native`) of an imported lib file, also with `/` | **none** |
+| R3, B2 | junction spelling (`app\node_modules\p3a-lib\…`) | none (ids with `node_modules` are skipped) |
+| R6 | upper-cased path | none |
+| R7a/b | any spelling, with `resolve.preserveSymlinks: true` | none |
+| C1, C3, C4 | real path as the junction stores it, or JS `fs.realpathSync` of the link path | the importing test |
+| R4 | native real path of a lib file imported with `../../lib/other.js` | the importing test |
+| R8a, C6 / C5 | consumer loads `dist/`: a `src/` file / the built `dist/` file | none / the importing test |
+| B1 | this repository's config, junction case matching the disk, native real path | only the importing test, 6.2 s |
+
+Conclusions:
+- vite resolves the link with JS `fs.realpathSync`, which keeps the junction's stored target text (its case), and vitest matches the related set by exact string. Every changed W file is passed in the union of spellings: its native real path; W's top as the gate knows it + the relative path; for every consumer link into W, `fs.realpathSync(<link>)` + the relative path. Never the junction spelling.
+- `resolve.preserveSymlinks: true`, a consumer that loads a build not in the change set, or no importing test all select 0 tests. A cross-link run that selects 0 tests is incomplete → unverifiable (the zero guard); a consumer test file that names a W package and did not run makes it incomplete too (D27).
+- A consumer that loads `dist/` is selected only through the built file: W's ignored modules modified since the dispatch start are added (D23).
+- A relative `../` import outside the consumer root is followed (R4).
+- Cost: about 6 s for a related run over this repository's whole test graph, against minutes for `scope=full`.
+- Details: `docs/design/cross-repo-phase3-plan.md`, "Item (a)".
 
 **Reference contamination.**
 - Materialize links the live `node_modules` (`reference.ts:1764-1798`). Workspace-link drift checks only targets inside the repository (`reference.ts:1820-1845`); a link to `D:\git\lib-b` was skipped there before P0.4.
@@ -477,7 +497,7 @@ After QA rounds 1 and 2 (facts checked at HEAD effcdb3):
 
 ### Phase 3
 
-- The `vitest related` cross-link spike.
+- (a) A consumer `testsPass` with an explicit `scope=affected` runs `vitest related` across the link into W (the spike result is in section 6, "Dependency effects"). **Implemented** (`830d5db..9ccabd0`; plan and QA in [cross-repo-phase3-plan.md](cross-repo-phase3-plan.md), "Item (a)", decisions D22, D23 and D27; limits in section 9, "Known follow-ups (P3a QA)").
 - A read-only `root` argument for `router_git_*` that names an admitted repository. **Implemented** (`3b6aec8..219e5c5`; plan and QA in [cross-repo-phase3-plan.md](cross-repo-phase3-plan.md), decisions D20 and D21; limits in section 9, "Known follow-ups (P3b QA)").
 - Discovery of dependency edges that do not go through `node_modules` (no per-repository configuration).
 
@@ -634,6 +654,17 @@ After QA rounds 1 and 2 (facts checked at HEAD effcdb3):
   - m3: F3 matches exact paths. An exclude glob on an ancestor of the repository, or one written in a link parent's spelling, does not refuse its linked worktree at admission. The read set checks ancestors since `219e5c5`.
   - m4: F6 redaction is regex-based: paths with spaces or `,;()'"<>|` leak or are mis-redacted. Structured paths from admission would fix it.
   - Nits: n1 the orchestrator lookup runs before the step-2 text checks, and the `readProvenanceLine` lookup is unbounded; n3 `objects/info/alternates` lets `show <sha>` read another object store, and a directory can be swapped between the last check and the spawn; n4 the step-5 refusal prints a junction's real target outside R; n5 `isDirectory` runs before `eligible` in `find()`; n7 a single capped match is kept, as for `repo=`; n8 each parent is resolved with a synchronous realpath on a refusal.
+- **Known follow-ups (P3a QA), accepted for now** (the cross-link run of a consumer `testsPass` with `scope=affected`; D22, D23, D27; plan in [cross-repo-phase3-plan.md](cross-repo-phase3-plan.md), "Item (a)"):
+  - Round 1, m1: a deleted build module is caught by the completeness check (D27) only when the test names a W package.
+  - Round 1, m2: the hardened ignored listing ignores the user's global `core.excludesFile`; the change set honours it.
+  - Round 1, m3: static scoping lacks D23's ignored modules; with `fullScope` it skips the check as full, while the gate runs it as cross-link.
+  - Round 1, nits: the alias provider does synchronous fs work inside `withTimeout` and before the allowlist check; one note per compiled W test file; a W test-only change is NoAffected, and `__tests__` helpers are dropped.
+  - Round 2, completeness-list gaps (D27): tests that reach W through consumer source, helper or setup modules; a non-default consumer `include`; a link name different from W's package name; one test file run by two projects is merged; vite aliases; a consumer config that imports a W preset.
+  - Round 2: a declaration-only W change is "no affected tests" (type tests run only with `--typecheck`).
+  - Round 2, clock and mtime precision: SMB/NFS, WSL2 `/mnt`, Docker bind mounts, FAT (2 s).
+  - Round 2, unscanned link spellings: the own `node_modules` of W's workspace packages, and links above the consumer's git top. They are caught at file level by the zero guard and the completeness check.
+  - Round 2, nits: the no-per-file-results branch is unreachable from the text fallback; up to 64 greps run outside `SEARCH_LIMIT`; a large fresh `dist` on win32 hits `argv-too-long`.
+  - Round 2, fix choices that fail closed: any changed non-test W file edited after the build (docs too) makes the run `cross-link-build-stale`; any consumer vitest `projects`/workspace is S6 `cross-link-unchecked`; the `SETUP_REF_LIMIT` path is untested.
 - **Consumers** are discovered only in the working set, and only through `node_modules` links. Python editable installs, Go `replace`, Cargo path dependencies, and `../` or alias imports are not discovered (Q2).
 - **A consumer check's failures** are unverifiable, never "fail". The dependency is the changed repository, so the reference can neither excuse nor prove them.
 - **`router_run` scripts** remain trusted repository content (`run-tools.ts:11-13`).
@@ -687,11 +718,12 @@ After QA rounds 1 and 2 (facts checked at HEAD effcdb3):
 | D19 | 2026-10-11 | OD-P2e-2 (F13): a full-scope `testsPass`/`lintClean` is never the cheap no-change shortcut. It applies to per-check `scope=full`, and to config `testScope: "full"` on OpenCode v2 only; v1 is unchanged (feature freeze). |
 | D20 | 2026-10-12 | OD-P3b-1 = (b): the `root` argument of `router_git_*` is an absolute top-level path, or a bare name with the route-line `repo=` semantics (D16). There is no `branch` argument. Implemented (Phase 3 (b), `3b6aec8..219e5c5`). |
 | D21 | 2026-10-12 | OD-P3b-2 = (a): only role agents may pass `root`, with an exact binding and `read`/`glob`/`grep` in the grant. Tiers and the orchestrator may not. Implemented (Phase 3 (b), `3b6aec8..219e5c5`). |
-| D22 | 2026-10-12 | OD-P3a-1 = (a): a consumer `testsPass` opts in to the cross-link run only with an explicit `scope=affected`. Decided, not yet implemented. |
-| D23 | 2026-10-12 | OD-P3a-2 = (b): ignored build output in W (`dist/`): a bounded gate-time list of W's ignored JS/TS/JSON files is added to the related inputs. Decided, not yet implemented. |
+| D22 | 2026-10-12 | OD-P3a-1 = (a): a consumer `testsPass` opts in to the cross-link run only with an explicit `scope=affected`. Implemented (Phase 3 (a), `830d5db..9ccabd0`). |
+| D23 | 2026-10-12 | OD-P3a-2 = (b): ignored build output in W (`dist/`): a bounded gate-time list of W's ignored JS/TS/JSON files is added to the related inputs; amended 2026-10-12 after QA-1 C1: only W's ignored modules modified since the dispatch start are added; a build older than a W source changed after it is S6 `cross-link-build-stale` (QA-2 M-A). Implemented (Phase 3 (a), `830d5db..9ccabd0`). |
 | D24 | 2026-10-12 | OD-P3c-1 = (a): the dependency edge kinds that ship are Tier A: `package.json` path specs, tsconfig, Python editable installs in an in-repo venv, Go `replace`/`go.work`. Decided, not yet implemented. |
 | D25 | 2026-10-12 | OD-P3c-2 = (a): Q2 (approximate reference for edges leaving the repository) is closed as a documented, narrower limit; failing closed is recorded as a follow-up. Decided, not yet implemented. |
 | D26 | 2026-10-12 | OD-P3c-3 = (b): W's dependency targets are read again at return, and the new admitted ones are frozen, so a dependency added during the dispatch is not "changed" at `router_verify`. Decided, not yet implemented. |
+| D27 | 2026-10-12 | QA-1 M2, owner decision: a post-run completeness check for the cross-link run: every consumer test file that names a W package in an import/require specifier must have run, else the result is incomplete. Implemented (Phase 3 (a), `830d5db..9ccabd0`). |
 
 ## 12. Alternatives considered
 
