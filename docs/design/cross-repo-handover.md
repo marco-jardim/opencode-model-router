@@ -28,7 +28,7 @@ Read this first in a new session. The design is `docs/design/cross-repo.md`, and
 | P2 lot 2: P2e (deferred P), owner decision OD4 | Implemented (`3037ab8`..`722c5db`, docs after): a role dispatch with a perimeter or per-check keys defers; P frozen at return; S11 caveat (OD-P2e-1 = UNVERIFIED); F13 v2-only (OD-P2e-2). QA'd twice (round 1: 1 major + 5 minor fixed; round 2: 1 major fixed, minors in design §9). Live dogfood done (see "Progress after resuming"). |
 | P3 lot 1: item (b), `router_git_*` `root` (plan `docs/design/cross-repo-phase3-plan.md`) | Done (`3b6aec8`..`bc9930c`). QA'd twice (round 1: 1 major + 5 minor + nits fixed; round 2: 1 major (M1, read set vs repoExclude) fixed in `219e5c5`, minors in design §9). Docs and CHANGELOG updated. Live dogfood done (see "Phase 3 lot 1 live dogfood"). |
 | P3 lot 2: item (a), `vitest related` across a link | Done (`830d5db`..`702c858`). QA'd twice (round 1: 1 blocking + 1 critical + 4 major fixed, owner decisions D23 amended and D27; round 2: 2 major fixed, minors in design §9). Docs and CHANGELOG updated. Live dogfood done (see "Phase 3 lot 2 live dogfood"). |
-| P3 lot 3: item (c), edges outside `node_modules` | Code done (P3c.1–P3c.6, `234c5e2`..`9e59f8e`). QA round 1 done (1 critical ReDoS + 5 major + minors) and fixed (`d151fbd`, `18a15a0`, plus the m4/m5 wiring commit). **Next:** QA round 2 (heavy), then P3c.7 docs/CHANGELOG + P3c.8 design (§9 minors of round 1 not fixed: m1 edges into another worktree of W's repo skipped, m3 P3c.6 fail-open gaps, m6 I11 residual symlinks inside the root, nits), then the lot 3 live dogfood (plan "Live dogfood (lot 3)"), the full suite alone, the handover and the #107 comment (ask the owner first). |
+| P3 lot 3: item (c), edges outside `node_modules` | Done (`234c5e2`..`987529e`). QA'd twice (round 1: 1 critical ReDoS + 5 major + minors fixed in `d151fbd`, `18a15a0`, `76dd864`; round 2: 3 major fixed in `3de411e`, `06c1502`, minors and nits in design §9). Docs and CHANGELOG (`340265c`), design (`987529e`). Live dogfood done (see "Phase 3 lot 3 live dogfood"). **Next:** the #107 status comment (ask the owner first), then Phase 4. |
 | P4 | Not started |
 
 Last checks (HEAD after the round 2 fixes):
@@ -45,6 +45,28 @@ Phase 2 is closed: code, docs, two QA rounds per lot, live dogfood, clean full-s
 **Next: Phase 3** (design §7 "Phase 3", `docs/design/cross-repo.md` ~:478): (a) the `vitest related` cross-link spike; (b) a read-only `root` argument for `router_git_*` that names an admitted repository; (c) discovery of dependency edges that do not go through `node_modules`, with no per-repository configuration. The design gives no file-level plan for it: start with a pre-flight (architect) that writes a plan like `docs/design/cross-repo-phase2-plan.md`, ask the owner the real decisions, then implement test-first, QA twice, dogfood live.
 
 **Working rules that bit this session:** delegates hit a read guard after 3 consecutive reads (tell them to alternate read and edit, and paste file:line ranges); "Agent not found" on parallel implementer dispatches usually means the child still runs — check `git status`/`git diff --stat` and resume the same session; every edit must leave `src/` loadable (the live router loads it); run `router_run` calls one at a time; a full suite run only with nothing else running; the gate's `testsPass` cannot scope this repo ("attribution-unavailable"), so verify every change in the shell (typecheck plus the touched test files).
+
+## Phase 3 lot 3 live dogfood (2026-10-12)
+
+Run live at HEAD `987529e`, no restart. Scratch app `D:\git\omr-xr-dogfood-app` (plan "Live dogfood (lot 3)" setup; no `node_modules`), plus a scratch repository `D:\git\omr-xr-dogfood-d7` for D7b. Both removed afterwards; the lib and this worktree are clean. `D:\git\mcp-reader` was only observed (its 8 dirty files unchanged).
+
+| # | Dispatch | Result |
+|---|---|---|
+| D1 | `implementer repo=omr-xr-dogfood-app`, notes.txt, `fileExists`, `VERIFY:required` | Pass. `✓ verified`, `also observed: omr-xr-dogfood-lib (main @ 2d133c4)` through the `file:`/`references` edges (no link). Timing vs control (F9) not measured. |
+| D2 | Same repo, `router_run test` (the plan's `touch-lib` is not on the run allowlist; renamed `test`), writes `touched.txt` into the lib | Pass. UNVERIFIED with the I4 reason naming the lib. |
+| D3 | `repo=omr-xr-dogfood-lib`, lib.txt, `fileExists` | Pass. `omr-xr-dogfood-app at D:\git\omr-xr-dogfood-app links this work root (package.json dependencies (file:)) and no check ran there; …`. |
+| D3b | Same + `check: run command="node --version" expect=v cwd="<app>"` | Pass. `✓ verified`, `also observed: omr-xr-dogfood-app (main @ b6a5b09)`. |
+| D4a | This worktree, untracked `tsconfig.dogfood.json` → the lib, deferred, `testsPass … scope=full` | Pass. Handle; `router_verify` → `✓ verified`, lib observed, no S11. |
+| D4b | Same, `s11.txt` added to the lib before `router_verify` | Pass. UNVERIFIED: `the linked repository omr-xr-dogfood-lib … changed since the producer returned`. |
+| D4c | tsconfig deleted, deferred dispatch, recreated after return | `✓ verified` (the plan's alternative): the lib was already a working-set root of P (D3 bound it) and unchanged, so the re-added edge is covered by its observation. |
+| D5 | App: edges dropped; `.venv\pyvenv.cfg` + `.venv\Lib\site-packages\_omr_xr_lib.pth` → `D:\git\mcp-reader` (outside the working set, so it discriminates) | Pass. `also observed: …, mcp-reader (main @ fe7d775)` through the Python edge; `.venv` removed and repeated: no mcp-reader. |
+| D6 | App tsconfig `references` → `C:/omr-xr-not-admitted` | Pass. `also observed: …, omr-xr-not-admitted (not admitted)`. |
+| D7 | Deferred dispatch whose producer creates `tsconfig.dogfood.json` → `../mcp-reader` | Pass. `✓ verified`, no S11 (P3c.6, D26: frozen at return). |
+| D7b | Control: same → `../omr-xr-dogfood-d7` (new scratch repository), `drift.txt` added there before `router_verify` | Pass. UNVERIFIED S11 `the linked repository omr-xr-dogfood-d7 … changed since the producer returned`: frozen at return, then observed again. |
+
+Observation: a dependency frozen at return (D7, D7b) is not listed in the verified-scope line; the line shows the dispatch-time observation only.
+
+Full `npx vitest run` with nothing else running (HEAD `987529e`): 10 failures in 5 files (`depth-guard-wiring`, `modeA-e2e`, `modeB-e2e`, `routing-ladder-resume`, `exec`); each passes alone except the 2 known `exec.test.ts` timing tests. `test/golden` 95/95.
 
 ## Phase 3 lot 2 live dogfood (2026-10-12)
 
