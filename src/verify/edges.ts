@@ -25,6 +25,11 @@ export const EDGE_FILE_BYTES_MAX = 1024 * 1024;
 export const EDGE_FILES_MAX = 128;
 /** SD-P3c-4: at most this many distinct targets per root. */
 export const EDGES_MAX = 64;
+/**
+ * QA-1 M1: a spec longer than this is never walked, and is unadmitted (perimeter.ts `resolveEdgeTarget`, which re-exports it).
+ * QA-2 F-2: such a spec never takes its target's place either: a later spelling of the same target is still kept.
+ */
+export const EDGE_SPEC_MAX = 4096;
 /** SD-P3c-4: at most this many workspace packages are read per root. */
 export const EDGE_WORKSPACES_MAX = 64;
 /** SD-P3c-4: a tsconfig `extends` chain is followed at most this deep, and only inside the declaring root. */
@@ -256,42 +261,83 @@ function foldUnit(unit: string): string {
   return upper.length === 1 && !(unit.charCodeAt(0) >= 128 && upper.charCodeAt(0) < 128) ? upper : unit;
 }
 
+/** `text` with every code unit folded by `foldUnit` (one unit each, so the length and every `*` position are kept). */
+function foldUnits(text: string): string {
+  let out = "";
+  for (let i = 0; i < text.length; i++) out += foldUnit(text.charAt(i));
+  return out;
+}
+
+/**
+ * Cross-repo P3c QA-2 F-1: a directory entry name is at most 255 code units (posix NAME_MAX, NTFS's 255 UTF-16 units), so a
+ * `workspaces` segment with more literal (non-`*`) characters matches no entry, and its directory is never listed.
+ */
+export const WORKSPACE_SEGMENT_LITERALS_MAX = 255;
+
+/** A one-segment `workspaces` pattern prepared once (QA-2 F-1): whether one directory entry name matches it. */
+export type WorkspaceSegmentMatcher = (name: string) => boolean;
+
+/**
+ * The matcher of `pattern`, the pattern scanned once (separator check, literal count, case folding); `undefined` when it holds
+ * a separator or more than `maxLiterals` literal characters (it matches nothing). Each name is folded once per call.
+ */
+function compileSegment(pattern: string, ignoreCase: boolean, maxLiterals: number): WorkspaceSegmentMatcher | undefined {
+  if (/[\\/]/.test(pattern)) return undefined;
+  let literals = 0;
+  for (let i = 0; i < pattern.length; i++) if (pattern.charCodeAt(i) !== 42) literals += 1;
+  if (literals > maxLiterals) return undefined;
+  const folded = ignoreCase ? foldUnits(pattern) : pattern;
+  return (name: string): boolean => {
+    if (literals > name.length || /[\\/]/.test(name)) return false;
+    const subject = ignoreCase ? foldUnits(name) : name;
+    let p = 0;
+    let n = 0;
+    let star = -1;
+    let mark = 0;
+    while (n < subject.length) {
+      if (p < folded.length && folded.charCodeAt(p) === 42) {
+        star = p;
+        p += 1;
+        mark = n;
+      } else if (p < folded.length && folded.charCodeAt(p) === subject.charCodeAt(n)) {
+        p += 1;
+        n += 1;
+      } else if (star >= 0) {
+        // The last `*` takes one more character (never a separator: `name` holds none), and the rest is matched again.
+        p = star + 1;
+        mark += 1;
+        n = mark;
+      } else {
+        return false;
+      }
+    }
+    while (p < folded.length && folded.charCodeAt(p) === 42) p += 1;
+    return p === folded.length;
+  };
+}
+
+/**
+ * Cross-repo P3c QA-2 F-1: the matcher of the one-segment `workspaces` pattern `pattern` (`workspaceSegmentMatches` rules),
+ * prepared once for a whole directory listing; `undefined` when no directory entry can match it (a separator, or more than
+ * `WORKSPACE_SEGMENT_LITERALS_MAX` literal characters), so the caller lists nothing.
+ */
+export function prepareWorkspaceSegment(
+  pattern: string,
+  ignoreCase: boolean = process.platform === "win32",
+): WorkspaceSegmentMatcher | undefined {
+  return compileSegment(pattern, ignoreCase, WORKSPACE_SEGMENT_LITERALS_MAX);
+}
+
 /**
  * Cross-repo P3c QA-1 C1: whether the directory entry `name` matches the one-segment `workspaces` pattern `pattern`, whose only
  * wildcard is `*` (`**` is one), a run of any characters but a separator; case-insensitive on win32 (`ignoreCase`), as the
  * regular expression it replaces. No regular expression is built from repository text: two pointers, the last `*` the only
  * backtracking point, so the time is at most quadratic in `name` (a directory entry) and linear in `pattern`. A pattern holding
- * a separator matches nothing (a segment never holds one).
+ * a separator matches nothing (a segment never holds one). One-shot: a listing prepares the pattern once
+ * (`prepareWorkspaceSegment`, QA-2 F-1).
  */
 export function workspaceSegmentMatches(pattern: string, name: string, ignoreCase: boolean = process.platform === "win32"): boolean {
-  if (/[\\/]/.test(pattern) || /[\\/]/.test(name)) return false;
-  let literals = 0;
-  for (let i = 0; i < pattern.length; i++) if (pattern[i] !== "*") literals += 1;
-  if (literals > name.length) return false;
-  const same = ignoreCase ? (a: string, b: string): boolean => a === b || foldUnit(a) === foldUnit(b) : (a: string, b: string): boolean => a === b;
-  let p = 0;
-  let n = 0;
-  let star = -1;
-  let mark = 0;
-  while (n < name.length) {
-    if (p < pattern.length && pattern[p] === "*") {
-      star = p;
-      p += 1;
-      mark = n;
-    } else if (p < pattern.length && same(pattern[p]!, name[n]!)) {
-      p += 1;
-      n += 1;
-    } else if (star >= 0) {
-      // The last `*` takes one more character (never a separator: `name` holds none), and the rest is matched again.
-      p = star + 1;
-      mark += 1;
-      n = mark;
-    } else {
-      return false;
-    }
-  }
-  while (p < pattern.length && pattern[p] === "*") p += 1;
-  return p === pattern.length;
+  return compileSegment(pattern, ignoreCase, Number.POSITIVE_INFINITY)?.(name) ?? false;
 }
 
 /** The directories of one `workspaces` pattern, whether the listing was cut at `entries` names, and how many names it read. */
@@ -309,6 +355,9 @@ function matchWorkspace(
   const head = segments.slice(0, -1);
   if (head.some((segment) => segment.includes("*"))) return { dirs: [], cut: false, listed: 0 };
   if (!last.includes("*")) return { dirs: [path.join(w, ...segments)], cut: false, listed: 0 };
+  // QA-2 F-1: the segment is prepared once, before the listing; one no entry name can match is not listed at all.
+  const matches = prepareWorkspaceSegment(last);
+  if (matches === undefined) return { dirs: [], cut: false, listed: 0 };
   const base = path.join(w, ...head);
   let children: string[];
   try {
@@ -320,7 +369,7 @@ function matchWorkspace(
   const dirs = children
     .slice(0, entries)
     .sort(byCodeUnit)
-    .filter((child) => !child.startsWith(".") && child !== "node_modules" && workspaceSegmentMatches(last, child))
+    .filter((child) => !child.startsWith(".") && child !== "node_modules" && matches(child))
     .slice(0, limit)
     .map((child) => path.join(base, child));
   return { dirs, cut: children.length > entries, listed: Math.min(children.length, entries + 1) };
@@ -569,7 +618,8 @@ export function declaredEdges(root: string, io: EdgeIO = defaultEdgeIO, limits: 
     } else {
       const target = path.resolve(path.dirname(file), spec);
       if (insideOrEqual(target, base)) return;
-      key = perimeterKey(target);
+      // QA-2 F-2: an overlong spec (never walked, so unadmitted) keys apart: it never drops a later spelling of its target.
+      key = spec.length > EDGE_SPEC_MAX ? `overlong:${perimeterKey(target)}` : perimeterKey(target);
     }
     if (targets.has(key)) return;
     if (targets.size >= limits.edges) {

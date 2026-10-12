@@ -36,7 +36,7 @@
  * line shows any other edge text (M5); `planPerimeter` returns how the forward bounds cut W's edges, for its caller to log (m4).
  */
 import { type Dirent, lstatSync, readFileSync, readdirSync, readlinkSync, realpathSync } from "node:fs";
-import { lstat, readFile, readdir, readlink, realpath } from "node:fs/promises";
+import { lstat, opendir, readFile, readdir, readlink, realpath } from "node:fs/promises";
 import * as path from "node:path";
 import { permissionMatches } from "../router/read-only";
 import type { RepoLocation } from "../routing/roles/admission";
@@ -50,12 +50,15 @@ import {
   type EdgeLimits,
   type EdgeVia,
   EDGE_LIMITS,
+  EDGE_SPEC_MAX,
+  EDGE_WORKSPACE_ENTRIES_MAX,
   EDGE_WORKSPACE_PATTERNS_MAX,
+  SITE_PACKAGES_ENTRIES_MAX,
   declaredEdges,
   defaultEdgeIO,
   isUncSpec,
+  prepareWorkspaceSegment,
   workspacePatterns,
-  workspaceSegmentMatches,
 } from "./edges";
 import { depthBelow, gitTopOf, perimeterKey } from "./git-top";
 import { isStoreLikeLink } from "./reference";
@@ -67,10 +70,11 @@ export const PERIMETER_MAX = 16;
 export const EDGE_UNADMITTED_NAMES_MAX = 8;
 
 /**
- * Cross-repo P3c QA-1 M1: a declared edge's spec longer than this many characters is never walked: its target is unadmitted,
- * named from its text, with no filesystem call.
+ * Cross-repo P3c QA-1 M1: a declared edge's spec longer than EDGE_SPEC_MAX characters is never walked: its target is
+ * unadmitted, named from its text, with no filesystem call. Defined in edges.ts (QA-2 F-2: `declaredEdges` keys such a spec
+ * apart), re-exported here.
  */
-export const EDGE_SPEC_MAX = 4096;
+export { EDGE_SPEC_MAX };
 
 /**
  * Cross-repo P3c QA-1 M1: `resolveEdgeTarget` walks at most this many segments up from a target looking for its nearest
@@ -363,23 +367,39 @@ export function dependencyTargets(
     sameRepository = (top: string): boolean => wCommon !== undefined && commonDirOf(top) === wCommon;
   }
   const edgeContext: EdgeContext = { ...ctx, root: w, sameRepository };
-  // An edge whose top level is already a link target is that link (SD-P3c-2: links first, one target).
-  const seen = new Set<string>(targets.map((target) => perimeterKey(target.at)));
+  // An edge whose top level is already a link target is that link (SD-P3c-2: links first, one target). QA-2 F-2: by kind, so an
+  // unadmitted spelling of a path (an overlong spec, say) never shadows an admitted top level at that path: the admitted target
+  // takes the unadmitted one's place (its name, or its count). An unadmitted spelling of an admitted path adds nothing.
+  const seen = new Map<string, "admitted" | "named" | "counted">(targets.map((target) => [perimeterKey(target.at), "admitted"]));
   let named = 0;
   let unadmittedMore = 0;
   for (const edge of declared.edges) {
     const resolved = resolveEdgeTarget(edge, edgeContext, wTop, io);
     if (resolved.status === "skipped") continue;
     const at = resolved.status === "admitted" ? resolved.top : resolved.at;
-    if (seen.has(perimeterKey(at))) continue;
-    seen.add(perimeterKey(at));
+    const key = perimeterKey(at);
+    const before = seen.get(key);
+    if (before === "admitted" || (before !== undefined && resolved.status !== "admitted")) continue;
     if (resolved.status === "admitted") {
-      targets.push({ origin: "edge", at, via: edge.via, from: edge.from });
+      const admitted: DependencyTarget = { origin: "edge", at, via: edge.via, from: edge.from };
+      const index = before === "named"
+        ? targets.findIndex((target) => "fixed" in target && perimeterKey(target.at) === key)
+        : -1;
+      if (index >= 0) {
+        named -= 1;
+        targets[index] = admitted;
+      } else {
+        if (before === "counted") unadmittedMore -= 1;
+        targets.push(admitted);
+      }
+      seen.set(key, "admitted");
     } else if (named < EDGE_UNADMITTED_NAMES_MAX) {
       named += 1;
       targets.push({ origin: "edge", at, via: edge.via, from: edge.from, name: resolved.name, fixed: "unadmitted" });
+      seen.set(key, "named");
     } else {
       unadmittedMore += 1;
+      seen.set(key, "counted");
     }
   }
   return { targets, unadmittedMore, incomplete: declared.incomplete };
@@ -585,31 +605,69 @@ async function readManifest(dir: string): Promise<Record<string, unknown> | unde
   }
 }
 
+/** QA-2 F-1: the names in `dir`, in directory order, at most `max + 1` of them (so a caller sees a cut); rejects when unreadable. */
+async function boundedListing(dir: string, max: number): Promise<string[]> {
+  const handle = await opendir(dir);
+  try {
+    const names: string[] = [];
+    for (let entry = await handle.read(); entry !== null && names.length <= max; entry = await handle.read()) names.push(entry.name);
+    return names;
+  } finally {
+    await handle.close();
+  }
+}
+
 /**
- * The directories of one `workspaces` pattern, inside W only: literal segments, and a wildcard (`*`, `**`) in the last segment
- * only, matched one level deep. Negations, absolute paths, `..` and inner wildcards give none. At most `limit` directories.
- * Exported for the agreement test with its synchronous twin, edges.ts `workspaceDirsSync` (P3c.1).
+ * The directories of one `workspaces` pattern (`workspaceDirs` rules), whether the listing was cut at `entries` names, and how
+ * many names it read: the async twin of edges.ts `matchWorkspace`. QA-2 F-1: the segment is prepared once, before the listing
+ * (one no entry name can match lists nothing), and the listing reads at most `entries + 1` names, so one synchronous filter
+ * never runs over an uncapped listing.
  */
-export async function workspaceDirs(w: string, pattern: string, limit: number): Promise<string[]> {
-  if (pattern.startsWith("!") || path.isAbsolute(pattern) || /^[\\/]/.test(pattern)) return [];
+export async function workspaceListing(
+  w: string,
+  pattern: string,
+  limit: number,
+  entries: number,
+): Promise<{ dirs: string[]; cut: boolean; listed: number }> {
+  if (pattern.startsWith("!") || path.isAbsolute(pattern) || /^[\\/]/.test(pattern)) return { dirs: [], cut: false, listed: 0 };
   const segments = pattern.split(/[\\/]/).filter((segment) => segment !== "" && segment !== ".");
-  if (segments.length === 0 || segments.some((segment) => segment === "..")) return [];
+  if (segments.length === 0 || segments.some((segment) => segment === "..")) return { dirs: [], cut: false, listed: 0 };
   const last = segments[segments.length - 1] ?? "";
   const head = segments.slice(0, -1);
-  if (head.some((segment) => segment.includes("*"))) return [];
-  if (!last.includes("*")) return [path.join(w, ...segments)];
+  if (head.some((segment) => segment.includes("*"))) return { dirs: [], cut: false, listed: 0 };
+  if (!last.includes("*")) return { dirs: [path.join(w, ...segments)], cut: false, listed: 0 };
+  const matches = prepareWorkspaceSegment(last);
+  if (matches === undefined) return { dirs: [], cut: false, listed: 0 };
   const base = path.join(w, ...head);
   let children: string[];
   try {
-    children = await readdir(base);
+    children = await boundedListing(base, entries);
   } catch {
-    return [];
+    return { dirs: [], cut: false, listed: 0 };
   }
-  // QA-1 C1: the linear matcher of edges.ts, never a regular expression built from the pattern.
-  return children
-    .filter((child) => !child.startsWith(".") && child !== "node_modules" && workspaceSegmentMatches(last, child))
+  // QA-1 C1: the linear matcher of edges.ts, never a regular expression built from the pattern; code-unit order, as edges.ts.
+  const dirs = children
+    .slice(0, entries)
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+    .filter((child) => !child.startsWith(".") && child !== "node_modules" && matches(child))
     .slice(0, limit)
     .map((child) => path.join(base, child));
+  return { dirs, cut: children.length > entries, listed: Math.min(children.length, entries + 1) };
+}
+
+/**
+ * The directories of one `workspaces` pattern, inside W only: literal segments, and a wildcard (`*`, `**`) in the last segment
+ * only, matched one level deep. Negations, absolute paths, `..` and inner wildcards give none. At most `limit` directories, from
+ * a listing of at most `entries` names (QA-2 F-1). Exported for the agreement test with its synchronous twin, edges.ts
+ * `workspaceDirsSync` (P3c.1).
+ */
+export async function workspaceDirs(
+  w: string,
+  pattern: string,
+  limit: number,
+  entries: number = SITE_PACKAGES_ENTRIES_MAX,
+): Promise<string[]> {
+  return (await workspaceListing(w, pattern, limit, entries)).dirs;
 }
 
 /**
@@ -617,7 +675,7 @@ export async function workspaceDirs(w: string, pattern: string, limit: number): 
  * and, when W is a workspace root, the `name` of each workspace package its `workspaces` lists. Bounded (CONSUMER_NAMES_MAX
  * names, WORKSPACE_MANIFESTS_MAX manifests); `stop` ends the reading early (the deadline).
  */
-async function packageNamesOf(w: string, stop: () => boolean): Promise<string[]> {
+async function packageNamesOf(w: string, stop: () => boolean, onCut: () => void = () => undefined): Promise<string[]> {
   const names = new Set<string>();
   const take = (manifest: Record<string, unknown> | undefined): void => {
     const name = manifest?.name;
@@ -627,10 +685,23 @@ async function packageNamesOf(w: string, stop: () => boolean): Promise<string[]>
   if (manifest === undefined) return [];
   take(manifest);
   let read = 0;
-  // QA-1 M2: at most EDGE_WORKSPACE_PATTERNS_MAX patterns (each wildcard one is a directory listing), as edges.ts reads them.
-  for (const pattern of workspacePatterns(manifest).slice(0, EDGE_WORKSPACE_PATTERNS_MAX)) {
+  let listed = 0;
+  // QA-1 M2: at most EDGE_WORKSPACE_PATTERNS_MAX patterns (each wildcard one is a directory listing), as edges.ts reads them;
+  // QA-2 F-1: their listings read at most EDGE_WORKSPACE_ENTRIES_MAX names in total, each at most SITE_PACKAGES_ENTRIES_MAX, as
+  // edges.ts. Fail-closed, as edges.ts marks its result incomplete: each of those cuts calls `onCut` (W's names may be short).
+  const patterns = workspacePatterns(manifest);
+  if (patterns.length > EDGE_WORKSPACE_PATTERNS_MAX) onCut();
+  for (const pattern of patterns.slice(0, EDGE_WORKSPACE_PATTERNS_MAX)) {
     if (stop() || names.size >= CONSUMER_NAMES_MAX || read >= WORKSPACE_MANIFESTS_MAX) break;
-    for (const dir of await workspaceDirs(w, pattern, WORKSPACE_MANIFESTS_MAX - read)) {
+    const budget = Math.max(0, Math.min(SITE_PACKAGES_ENTRIES_MAX, EDGE_WORKSPACE_ENTRIES_MAX - listed));
+    if (budget === 0 && pattern.includes("*")) {
+      onCut(); // A wildcard needs a listing, and the total is spent.
+      continue;
+    }
+    const listing = await workspaceListing(w, pattern, WORKSPACE_MANIFESTS_MAX - read, budget);
+    listed += listing.listed;
+    if (listing.cut) onCut();
+    for (const dir of listing.dirs) {
       if (stop() || names.size >= CONSUMER_NAMES_MAX || read >= WORKSPACE_MANIFESTS_MAX) break;
       read += 1;
       take(await readManifest(dir));
@@ -747,7 +818,11 @@ export async function discoverConsumers(
         return [];
       }
     };
-    const wNames = await packageNamesOf(w, stopped);
+    // QA-2 F-1 (fail-closed): a bound cut W's workspace listing, so its names may be short; a root with no consumer is incomplete.
+    let namesCut = false;
+    const wNames = await packageNamesOf(w, stopped, () => {
+      namesCut = true;
+    });
     for (const [index, { root }] of roots.entries()) {
       if (outcomes[index] === null) continue;
       if (inW(root) || insideOrEqual(w, root) || insideOrEqual(wReal, root)) {
@@ -819,7 +894,7 @@ export async function discoverConsumers(
         else edgesCut = declared.incomplete;
       }
       // Stopped on a budget or a bound without a consumer: incomplete.
-      outcomes[index] = found !== undefined ? found : via !== undefined ? { via } : exhausted || edgesCut ? { incomplete: true } : null;
+      outcomes[index] = found !== undefined ? found : via !== undefined ? { via } : exhausted || edgesCut || namesCut ? { incomplete: true } : null;
     }
   };
   if (signal === undefined) {

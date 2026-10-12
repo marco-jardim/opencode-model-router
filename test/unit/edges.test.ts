@@ -31,8 +31,10 @@ import {
   finderMappingBody,
   finderMappingValues,
   parseJsonc,
+  prepareWorkspaceSegment,
   SITE_PACKAGES_ENTRIES_MAX,
   SITE_PACKAGES_FILES_MAX,
+  WORKSPACE_SEGMENT_LITERALS_MAX,
   workspaceDirsSync,
   workspacePatterns,
   workspaceSegmentMatches,
@@ -52,6 +54,7 @@ import {
   planPerimeter,
   resolveEdgeTarget,
   workspaceDirs,
+  workspaceListing,
 } from "../../src/verify/perimeter";
 import { displaySafe } from "../../src/routing/roles/read-set";
 import * as dispatchModule from "../../src/routing/wire/dispatch";
@@ -711,6 +714,107 @@ describe("QA-1 C1: linear workspace wildcard matching", () => {
   });
 });
 
+describe("QA-2 F-1: a workspaces segment is prepared once, and an impossible one lists nothing", () => {
+  it("a segment of 500 000 literal characters returns no directory at once and never lists its directory, sync and async", async () => {
+    const entries = 2000;
+    fs.mkdirSync(path.join(app, "p"), { recursive: true });
+    for (let n = 0; n < entries; n++) fs.writeFileSync(path.join(app, "p", `a${n}`), "");
+    const segment = `*${"a".repeat(500_000)}`;
+    const pattern = `p/${segment}`;
+    writeJson("package.json", { workspaces: [pattern] });
+    const started = performance.now();
+    expect(prepareWorkspaceSegment(segment, false)).toBeUndefined();
+    expect(prepareWorkspaceSegment(segment, true)).toBeUndefined();
+    const sync = spyIO();
+    expect(workspaceDirsSync(app, pattern, 64, sync.io)).toEqual([]);
+    expect(declaredEdges(app, sync.io)).toEqual({ edges: [], incomplete: false });
+    expect(sync.calls.filter((call) => call.op === "readdir" && call.p === path.join(app, "p"))).toEqual([]);
+    // Nothing listed (`listed: 0`), though the directory holds `entries` names; a possible segment lists them.
+    expect(await workspaceListing(app, pattern, 64, SITE_PACKAGES_ENTRIES_MAX)).toEqual({ dirs: [], cut: false, listed: 0 });
+    expect(await workspaceDirs(app, pattern, 64)).toEqual([]);
+    expect(performance.now() - started).toBeLessThan(500);
+    expect((await workspaceListing(app, "p/a*", 64, SITE_PACKAGES_ENTRIES_MAX)).listed).toBe(entries);
+  });
+
+  it("prepares a segment of at most WORKSPACE_SEGMENT_LITERALS_MAX literals; the one-shot matcher keeps its semantics", () => {
+    expect(WORKSPACE_SEGMENT_LITERALS_MAX).toBe(255);
+    const most = `${"a".repeat(WORKSPACE_SEGMENT_LITERALS_MAX - 1)}*z`;
+    expect(prepareWorkspaceSegment(most, false)?.(`${"a".repeat(WORKSPACE_SEGMENT_LITERALS_MAX - 1)}z`)).toBe(true);
+    expect(prepareWorkspaceSegment(`a${most}`, false)).toBeUndefined();
+    expect(prepareWorkspaceSegment("a/*", false)).toBeUndefined();
+    expect(workspaceSegmentMatches("a".repeat(300), "a".repeat(300), false)).toBe(true);
+  });
+
+  it("the prepared matcher agrees with the regular expression it replaces on every short pattern and name", () => {
+    const escape = (piece: string): string => piece.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
+    const words = (alphabet: string[], max: number): string[] => {
+      const out = [""];
+      for (let start = 0; start < out.length; start++) {
+        const word = out[start]!;
+        if (word.length < max) for (const c of alphabet) out.push(word + c);
+      }
+      return out;
+    };
+    const names = [...words(["a", "b", "A", "."], 4), "\u00e9", "\u00c9", "\u0131", "I", "\u017f", "S", "\u212a", "k"];
+    const disagreements: string[] = [];
+    for (const pattern of [...words(["a", "b", "A", ".", "*"], 4), "\u00c9*", "*i", "\u0131", "s*", "*K"]) {
+      for (const ignoreCase of [false, true]) {
+        const old = new RegExp(`^${pattern.split("*").map(escape).join("[^/\\\\]*")}$`, ignoreCase ? "i" : "");
+        const matches = prepareWorkspaceSegment(pattern, ignoreCase);
+        for (const name of names) {
+          if ((matches?.(name) ?? false) !== old.test(name)) disagreements.push(`${pattern} ~ ${name} (${ignoreCase})`);
+        }
+      }
+    }
+    expect(disagreements).toEqual([]);
+  });
+
+  it("folds each name once per call, never once per comparison", () => {
+    const matches = prepareWorkspaceSegment(`${"a*".repeat(24)}z`, true);
+    expect(matches).toBeDefined();
+    const upper = vi.spyOn(String.prototype, "toUpperCase");
+    try {
+      upper.mockClear();
+      expect(matches?.("A".repeat(200))).toBe(false);
+      expect(upper.mock.calls.length).toBeLessThanOrEqual(200);
+    } finally {
+      upper.mockRestore();
+    }
+  });
+
+  it("the async listing reads at most `entries` names and says when it was cut, as the sync twin", async () => {
+    for (let n = 0; n < 10; n++) fs.mkdirSync(path.join(app, "packages", `p${n}`), { recursive: true });
+    const cut = await workspaceListing(app, "packages/*", 64, 3);
+    expect(cut.cut).toBe(true);
+    expect(cut.listed).toBe(4);
+    expect(cut.dirs.length).toBe(3);
+    const whole = await workspaceListing(app, "packages/*", 64, 20);
+    expect(whole).toEqual({
+      dirs: Array.from({ length: 10 }, (_, n) => path.join(app, "packages", `p${n}`)).sort(),
+      cut: false,
+      listed: 10,
+    });
+    expect(await workspaceDirs(app, "packages/*", 64, 3)).toEqual(cut.dirs);
+    expect(await workspaceDirs(app, "packages/*", 64)).toEqual(workspaceDirsSync(app, "packages/*", 64));
+  });
+
+  it("fail-closed: a root with no consumer is incomplete when a bound cut W's workspace listing (discoverConsumers)", async () => {
+    const consumer = path.join(parent, "consumer");
+    fs.mkdirSync(consumer, { recursive: true });
+    fs.mkdirSync(path.join(app, "packages", "p0"), { recursive: true });
+    writeJson("package.json", { name: "app", workspaces: ["packages/*"] });
+    expect(await discoverConsumers(app, [{ root: consumer }])).toEqual({ consumers: [], incomplete: [] });
+    // The listing cut at SITE_PACKAGES_ENTRIES_MAX names.
+    for (let n = 0; n < SITE_PACKAGES_ENTRIES_MAX; n++) fs.writeFileSync(path.join(app, "packages", `f${n}`), "");
+    expect((await workspaceListing(app, "packages/*", 64, SITE_PACKAGES_ENTRIES_MAX)).cut).toBe(true);
+    expect(await discoverConsumers(app, [{ root: consumer }])).toEqual({ consumers: [], incomplete: [{ root: consumer }] });
+    // More workspaces patterns than EDGE_WORKSPACE_PATTERNS_MAX: cut as well, as edges.ts says.
+    fs.rmSync(path.join(app, "packages"), { recursive: true, force: true });
+    writeJson("package.json", { name: "app", workspaces: Array.from({ length: EDGE_WORKSPACE_PATTERNS_MAX + 1 }, (_, n) => `w${n}`) });
+    expect(await discoverConsumers(app, [{ root: consumer }])).toEqual({ consumers: [], incomplete: [{ root: consumer }] });
+  }, 60_000);
+});
+
 describe("QA-1 M2: bounds the reading cannot bypass", () => {
   it("reads at most EDGE_WORKSPACE_PATTERNS_MAX workspaces patterns, and says so", () => {
     const wildcard = (count: number): string[] => Array.from({ length: count }, (_, n) => `w${n}/*`);
@@ -1225,5 +1329,31 @@ describe("edge admission (P3c.2b)", () => {
     expect(result.incomplete).toBe(false);
     // Text first: nothing outside the parents was touched.
     expect(touched(calls, path.join(root, "outside"))).toBe(false);
+  });
+
+  it("QA-2 F-2: an unadmitted spelling of a path (an overlong spec) never shadows the admitted top level there, listed first or not", () => {
+    const overlong = `../${"x/../".repeat(1000)}lib-b`;
+    expect(overlong.length).toBeGreaterThan(EDGE_SPEC_MAX);
+    expect(path.resolve(rApp, overlong)).toBe(lib);
+    // declaredEdges keys the overlong spelling apart: a normal spelling of its target after it is still declared.
+    fs.writeFileSync(path.join(rApp, "package.json"), JSON.stringify({ dependencies: { long: `file:${overlong}`, b: "file:../lib-b" } }));
+    expect(declaredEdges(rApp).edges.map((edge) => edge.spec)).toEqual([overlong, "../lib-b"]);
+    const admitted = { origin: "edge", at: lib, via: "package.json dependencies (file:)", from: "package.json" };
+    const targets = (dependencies: Record<string, string>): ReturnType<typeof dependencyTargets> => {
+      fs.writeFileSync(path.join(rApp, "package.json"), JSON.stringify({ dependencies }));
+      return dependencyTargets(rApp, admissionContext({ parents: [rParent], depth: 1, exclude: [] }, []), spyDependencyIO().io);
+    };
+    // The overlong spelling first (named), then the normal one: the admitted target takes its place.
+    expect(targets({ long: `file:${overlong}`, b: "file:../lib-b" })).toEqual({ targets: [admitted], unadmittedMore: 0, incomplete: false });
+    // The normal one first: the overlong spelling adds nothing.
+    expect(targets({ b: "file:../lib-b", long: `file:${overlong}` })).toEqual({ targets: [admitted], unadmittedMore: 0, incomplete: false });
+    // The overlong spelling past the named unadmitted targets (counted): the admitted target takes its count back.
+    const outside = Object.fromEntries(
+      Array.from({ length: EDGE_UNADMITTED_NAMES_MAX }, (_, i) => [`o${i}`, `file:../../outside/o${i}`]),
+    );
+    const counted = targets({ ...outside, long: `file:${overlong}`, b: "file:../lib-b" });
+    expect(counted.targets.filter((target) => !("fixed" in target))).toEqual([admitted]);
+    expect(counted.targets.filter((target) => "fixed" in target)).toHaveLength(EDGE_UNADMITTED_NAMES_MAX);
+    expect(counted.unadmittedMore).toBe(0);
   });
 });
