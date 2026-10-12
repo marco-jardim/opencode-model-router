@@ -49,8 +49,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already taken lives in memory, so a resume right after a plugin restart can still mis-attribute.
 - **OpenCode v2: background dispatches without a deterministic check are graded.** Their grader launches as the
   orchestrator agent that made the call, also after a restart, never from a role child's context (which denies
-  `subagent`); an entry journaled by an older build falls back to the parent session's current agent, and a result that could not be verified is tagged `UNVERIFIABLE` instead of `PASS`. Acceptance is
-  unchanged. OpenCode v1 is unchanged.
+  `subagent`); an entry journaled by an older build falls back to the parent session's current agent and its latest
+  assistant message (looked up for at most 2 s, and not for a completion that did not succeed), and a result that
+  could not be verified is tagged `UNVERIFIABLE` instead of `PASS`. Acceptance is unchanged. OpenCode v1 is unchanged.
+- **OpenCode v2: one plugin copy per process decides each background call.** Call claims are process-wide across the
+  plugin copies a host loads per location (bounded to 8000 claims in all, the oldest of any copy evicted first): a
+  call that reaches several copies is completed once, and the claiming copy's background decision stands. A copy that
+  lost the claim leaves the call's `background` flag as it found it and does not tell the orchestrator the result is
+  unverified. OpenCode v1 is unchanged.
 - **OpenCode v2: an unrecorded child session never backgrounds a dispatch.** A child the plugin never recorded (after a
   reload, or past the 1000-entry bound) no longer counts as a root parent in the background decision (root parents
   only): its kind comes from the role decision's session read or from the host, and a failed lookup keeps the
@@ -91,8 +97,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **OpenCode v2: plugin copies loaded per host location share one timing recorder.** When one host process loads the
   plugin once per location, `turns.jsonl` no longer gets repeated rows and its turn numbers no longer restart, and the
   `/router stats` orchestrator cache-read share is no longer over-counted. The recorder is shared per directory across
-  the copies; a recorder registered by a build with another registry version is left alone and the copy records on its
-  own. OpenCode v1 is unchanged.
+  the copies of one build; a recorder registered by a build with another registry version is left alone. OpenCode v1 is
+  unchanged.
 
 ## [2.7.0] - 2026-10-10
 

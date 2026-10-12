@@ -420,7 +420,9 @@ const OPEN_STATES: ReadonlySet<AttemptState> = new Set<AttemptState>(["acknowled
 const TERMINAL_STATES: ReadonlySet<AttemptState> = new Set<AttemptState>(["released", "foreground", "cancelled", "closed-unknown"]);
 
 /** Process-wide call claims (`bg:<callID>`), shared by every plugin instance of the process; bounded. */
-const MAX_CLAIMS = 1000;
+export const MAX_CLAIMS = 1000;
+/** QA-PDF12-13: the bound of the whole shared set, whichever instances own its claims. */
+export const MAX_PROCESS_CLAIMS = 8 * MAX_CLAIMS;
 
 /**
  * DF-1.1-1: the plugin can be loaded as several module copies in one process (one per booted host location), and a
@@ -533,6 +535,13 @@ export function createInFlightRegistry(deps: {
         if (own.size <= MAX_CLAIMS) break;
         own.delete(old);
         claims.delete(old);
+      }
+      // QA-PDF12-13: a process-wide backstop past the per-owner cap: the oldest claims of ANY owner go once the shared set
+      // outgrows MAX_PROCESS_CLAIMS (leaked claims of instances that never disposed cannot grow it without bound).
+      for (const old of claims) {
+        if (claims.size <= MAX_PROCESS_CLAIMS) break;
+        claims.delete(old);
+        own.delete(old);
       }
       calls.set(rec.callID, rec);
       enforceBounds();

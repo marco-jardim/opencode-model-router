@@ -1247,7 +1247,7 @@ describe("timing recorder: shared per directory (QA-1.1-3)", () => {
 describe("timing recorder: shared across module copies (DF-1.1-2)", () => {
   type TimingsModule = typeof import("../../src/routing/outcomes/timings");
   const step = { input: 10, cacheRead: 20, cacheWrite: 30 };
-  const REGISTRY_KEY = Symbol.for("opencode-model-router.timings.registry.v1");
+  const REGISTRY_KEY = Symbol.for("opencode-model-router.timings.registry.v2"); // the current TIMING_REGISTRY_VERSION (asserted below)
   const holders: Array<{ release(): Promise<void> }> = [];
 
   // The host loads the plugin once per booted location: each load is a distinct module instance in one process.
@@ -1328,23 +1328,28 @@ describe("timing recorder: shared across module copies (DF-1.1-2)", () => {
 
     it("exports the version the entries are stamped with", async () => {
       const copy = await loadCopy();
-      expect(copy.TIMING_REGISTRY_VERSION).toBe(1);
+      expect(copy.TIMING_REGISTRY_VERSION).toBe(2);
+      expect(Symbol.keyFor(REGISTRY_KEY)).toBe(`opencode-model-router.timings.registry.v${copy.TIMING_REGISTRY_VERSION}`);
     });
 
-    it.each([[999], ["1"], [undefined]])("an entry of version %s is not reused and not touched; the copy records on its own", async version => {
+    it.each([[999], ["1"], [undefined]])("an entry of version %s is not reused and not touched; two same-version copies still share one recorder (QA-PDF12-11)", async version => {
       const { entry, registry } = plantForeignEntry(version);
       const snapshot = { ...entry };
-      const copy = await loadCopy();
-      const holder = copy.acquireTimingRecorder({ dir, now, logger });
-      holders.push(holder);
-      holder.markRootSession("root-1");
-      expect(holder.isRootSession("root-1")).toBe(true); // its own recorder, not the foreign `{ foreign: true }`
-      expect(registry.size).toBe(1);
-      expect(registry.get([...registry.keys()][0] as string)).toBe(entry);
+      const copyA = await loadCopy();
+      const copyB = await loadCopy();
+      const a = copyA.acquireTimingRecorder({ dir, now, logger });
+      const b = copyB.acquireTimingRecorder({ dir, now, logger });
+      holders.push(a, b);
+      a.markRootSession("root-1");
+      expect(a.isRootSession("root-1")).toBe(true); // its own recorder, not the foreign `{ foreign: true }`
+      expect(b.isRootSession("root-1")).toBe(true); // one recorder for both copies, never a private one each
+      expect(registry.size).toBe(2); // the foreign entry and the one both copies share
+      expect([...registry.values()]).toContain(entry);
       expect(entry).toEqual(snapshot);
       expect(entry.refs).toBe(1);
-      await holder.release();
-      expect(registry.size).toBe(1); // releasing its own entry leaves the foreign one in place
+      await a.release();
+      await b.release();
+      expect(registry.size).toBe(1); // releasing the shared entry leaves the foreign one in place
       expect(entry).toEqual(snapshot);
     });
 

@@ -707,7 +707,7 @@ export interface TimingRecorderHolder extends TimingRecorder {
  * Layout/behaviour version of a registry entry; bump it whenever `RegistryEntry` or the recorder it holds changes shape.
  * An entry of another version in the process-wide map is foreign: it is neither reused nor touched (QA-PDF12-4).
  */
-export const TIMING_REGISTRY_VERSION = 1;
+export const TIMING_REGISTRY_VERSION = 2;
 
 interface RegistryEntry {
   readonly version: number;
@@ -722,7 +722,7 @@ interface RegistryEntry {
  * `globalThis` under a registered symbol, as in `verify/pending.ts`; a value that is not a map is replaced. A recorder made by
  * one copy is used by another: all copies are the same build, so the recorder's shape is identical.
  */
-const PROCESS_REGISTRY_KEY = Symbol.for("opencode-model-router.timings.registry.v1");
+const PROCESS_REGISTRY_KEY = Symbol.for(`opencode-model-router.timings.registry.v${TIMING_REGISTRY_VERSION}`);
 
 function processRegistry(): Map<string, RegistryEntry> {
   const holder = globalThis as unknown as Record<symbol, unknown>;
@@ -734,21 +734,17 @@ function processRegistry(): Map<string, RegistryEntry> {
   return all as Map<string, RegistryEntry>;
 }
 
-/** Entries this copy keeps for itself where the process-wide map holds a foreign (other-version) entry of the same directory. */
-const privateRegistry = new Map<string, RegistryEntry>();
-
-/** The map that holds (or may hold) this copy's entry of `id`: the shared one, or the private one beside a foreign entry. */
-function registryFor(id: string): Map<string, RegistryEntry> {
-  const shared = processRegistry();
-  const existing: unknown = shared.get(id);
-  if (existing === undefined) return shared;
-  const version = typeof existing === "object" && existing !== null ? (existing as Partial<RegistryEntry>).version : undefined;
-  return version === TIMING_REGISTRY_VERSION ? shared : privateRegistry;
+/** The entry of `id` in `registry` when it is of this build's version; a foreign entry (another layout) is not used (QA-PDF12-11). */
+function currentEntry(registry: Map<string, RegistryEntry>, id: string): RegistryEntry | undefined {
+  const existing: unknown = registry.get(id);
+  if (typeof existing !== "object" || existing === null) return undefined;
+  return (existing as Partial<RegistryEntry>).version === TIMING_REGISTRY_VERSION ? (existing as RegistryEntry) : undefined;
 }
 
+/** The directory's key in the shared map: versioned too, so an entry another layout left at the bare path is never seen. */
 function registryId(dir: string): string {
   const abs = resolve(dir);
-  return process.platform === "win32" ? abs.toLowerCase() : abs;
+  return `${process.platform === "win32" ? abs.toLowerCase() : abs}\u0000v${TIMING_REGISTRY_VERSION}`;
 }
 
 /**
@@ -758,8 +754,10 @@ function registryId(dir: string): string {
  */
 export function acquireTimingRecorder(options: AcquireTimingRecorderOptions): TimingRecorderHolder {
   const id = registryId(options.dir);
-  const registry = registryFor(id);
-  let entry = registry.get(id);
+  // The version is in the slot's key and in each entry's key, so every copy of this version shares one map and one entry per
+  // directory; a foreign entry is ignored (never reused, never touched), without a private fallback map (QA-PDF12-11).
+  const registry = processRegistry();
+  let entry = currentEntry(registry, id);
   if (entry === undefined) {
     const observers = new Set<(row: DispatchTimingRow | OrchestratorTurnRow) => void>();
     const logger = options.logger ?? NOOP_LOGGER;

@@ -414,7 +414,7 @@ describe("QA-PDF12-1/-2: after a restart, the grader launches as the caller on e
    * (the completion processor's finish); otherwise through the restored hold. `oldEntry`: the records lose their caller fields
    * (a journal written before they existed). Returns B's grader launches and B's journal.
    */
-  const restart = async (callID: string, opts: { keepInflight: boolean; oldEntry: boolean }) => {
+  const restart = async (callID: string, opts: { keepInflight: boolean; oldEntry: boolean; parentAssistantID?: string }) => {
     process.env.MODEL_ROUTER_ENFORCE = "1";
     let released = false;
     const waiting: Array<(error: Error) => void> = [];
@@ -475,6 +475,13 @@ describe("QA-PDF12-1/-2: after a restart, the grader launches as the caller on e
     host = b;
     execFileSync("git", ["init", "-q"], { cwd: b.project });
     b.childContext.set(CHILD, childDone); // the child's finished history, which an `inflight` recovery reads
+    // The parent's own history, whose latest assistant message an old entry (no journaled message id) falls back to.
+    if (opts.parentAssistantID !== undefined) {
+      b.childContext.set(ORCH, [
+        { id: "m-parent-user", role: "user", content: [{ type: "text", text: "go" }] },
+        { id: opts.parentAssistantID, role: "assistant", content: [{ type: "text", text: "dispatching" }] },
+      ]);
+    }
     adoptOrchestrator(b);
     await b.settled();
     await vi.waitFor(() => expect(secondStub.calls.length).toBeGreaterThan(0), { timeout: 25_000 });
@@ -508,6 +515,27 @@ describe("QA-PDF12-1/-2: after a restart, the grader launches as the caller on e
     const { calls, journal } = await restart(callID, { keepInflight: false, oldEntry: true });
     expect(processedHere(journal, callID)).toBe(false);
     for (const launched of calls) expect(launched.agent).toBe("plan");
+  }, 60_000);
+
+  it("QA-PDF12-12 an old `inflight` entry without its message id: the grader's context carries the parent's latest assistant message id", async () => {
+    const callID = "call-pdf1212-inflight";
+    const { calls } = await restart(callID, { keepInflight: true, oldEntry: true, parentAssistantID: "m-parent-latest" });
+    expect(calls.length).toBeGreaterThan(0);
+    for (const launched of calls) expect(launched.messageID).toBe("m-parent-latest");
+  }, 60_000);
+
+  it("QA-PDF12-12 an old hold without its message id (no `inflight`): the re-run grader's context carries the parent's latest assistant message id", async () => {
+    const callID = "call-pdf1212-hold";
+    const { calls } = await restart(callID, { keepInflight: false, oldEntry: true, parentAssistantID: "m-parent-latest" });
+    expect(calls.length).toBeGreaterThan(0);
+    for (const launched of calls) expect(launched.messageID).toBe("m-parent-latest");
+  }, 60_000);
+
+  it("QA-PDF12-12 an old entry whose parent history cannot be read keeps the empty message id", async () => {
+    const callID = "call-pdf1212-none";
+    const { calls } = await restart(callID, { keepInflight: false, oldEntry: true });
+    expect(calls.length).toBeGreaterThan(0);
+    for (const launched of calls) expect(launched.messageID).toBe("");
   }, 60_000);
 });
 
@@ -569,8 +597,12 @@ describe("QA-PDF12-6: two plugin instances of one process receive the same call"
       await second.before(event);
       expect((event.input as Record<string, unknown>).background).toBe(true);
       const running = { output: { sessionID: CHILD, status: "running", output: "Working in the background" }, content: "Working in the background", metadata: { sessionID: CHILD } };
-      await owner.after({ ...event, status: "completed", result: structuredClone(running) });
-      await second.after({ ...event, status: "completed", result: structuredClone(running) });
+      const ownerDone = await owner.after({ ...event, status: "completed", result: structuredClone(running) });
+      const secondDone = await second.after({ ...event, status: "completed", result: structuredClone(running) });
+      // QA-PDF12-10: the copy that lost the claim does not treat the call as verifying, so it never says acceptance needs a
+      // foreground return; the owner's notice (the result is held) is the one the call carries.
+      expect(JSON.stringify(secondDone.result)).not.toContain("automatic acceptance requires");
+      expect(JSON.stringify(ownerDone.result)).toContain("held until verification finishes");
       await owner.settled();
       await second.settled();
       // Only the owner acknowledged and journaled the dispatch.
@@ -629,6 +661,91 @@ describe("QA-DF1-21: an adopted dispatch of this very process whose child is sti
     await vi.waitFor(() => expect(h.synthetic.map((s) => `${s.sessionID}|${s.text.slice(0, 160)}`).join("\n")).toMatch(/lost in/), { timeout: 3_000 });
     expect(lostNotices(h)).toHaveLength(1);
   });
+});
+
+describe("QA-PDF12-14: the caller lookups of a rebuilt context", () => {
+  const parentReads = (h: BgHost): { count(): number } => {
+    const original = h.childContext.get.bind(h.childContext);
+    let reads = 0;
+    vi.spyOn(h.childContext, "get").mockImplementation((key: string) => {
+      if (key === ORCH) reads += 1;
+      return original(key);
+    });
+    return { count: () => reads };
+  };
+
+  it("QA-PDF12-14 restored holds of one parent share one lookup of the parent's history, however many they are", async () => {
+    const readsFor = async (holds: number): Promise<number> => {
+      const children = Array.from({ length: holds }, (_, i) => `child-hold-${i}`);
+      const records = children.flatMap((child, i): Array<Record<string, unknown>> => {
+        const handle = `vrf_${String(i).repeat(24)}`;
+        return [
+          { v: 1, kind: "hold", handle, parent: ORCH, child, callID: `call-pdf1214-${holds}-${i}`, dispatch: { prompt: "old work" }, at: Date.now() },
+          { v: 1, kind: "hold-text", handle, text: "old output", status: "succeeded", at: Date.now() },
+        ];
+      });
+      const h = await boot(records, Object.fromEntries(children.map((child) => [child, { parentID: ORCH }])));
+      const reads = parentReads(h);
+      adoptOrchestrator(h);
+      await h.settled();
+      expect(verdictPosts(h)).toHaveLength(holds);
+      const count = reads.count();
+      await h.dispose();
+      host = undefined;
+      vi.restoreAllMocks();
+      return count;
+    };
+    const one = await readsFor(1);
+    expect(one).toBeGreaterThan(0);
+    expect(await readsFor(4)).toBe(one);
+  }, 30_000);
+
+  /** The completion processor journals `processed` right after its `finish` returned: proof the finish (and its lookups) ran. */
+  const processedHere = (h: BgHost, callID: string): boolean =>
+    readFileSync(h.journalPath, "utf8").split("\n").filter((line) => line.trim() !== "")
+      .some((line) => {
+        const r = JSON.parse(line) as Record<string, unknown>;
+        return r.kind === "processed" && r.callID === callID;
+      });
+  /**
+   * A live background dispatch whose call carries no message id (so its caller's message is NOT journaled and a finish that
+   * needs it must look it up in the parent's history), whose child then ends with `ending`. Returns the parent-history reads
+   * made from the child's end until the processor journaled `processed` for the call.
+   */
+  const completeWith = async (callID: string, ending: "succeeded" | "failed"): Promise<number> => {
+    const h = await boot([]);
+    h.emit({ type: "session.created", id: `ev-created-${CHILD}`, created: 1, data: { sessionID: CHILD, parentID: ORCH } });
+    await h.drain();
+    const call = await h.before({
+      sessionID: ORCH, agent: "build", messageID: "", id: callID, tool: "subagent",
+      input: { agent: "fast", description: "background work", prompt: "do the work", background: true },
+    });
+    const running = { output: { sessionID: CHILD, status: "running", output: "Working in the background" }, content: "Working in the background", metadata: { sessionID: CHILD } };
+    await h.after({ ...call, status: "completed", result: running });
+    await h.settled();
+    // The dispatch runs in the background and its record carries no caller message: a lookup is needed at its finish.
+    const inflight = readFileSync(h.journalPath, "utf8").split("\n").filter((line) => line.trim() !== "")
+      .map((line) => JSON.parse(line) as Record<string, unknown>).filter((r) => r.kind === "inflight" && r.callID === callID);
+    expect(inflight.length).toBeGreaterThan(0);
+    for (const record of inflight) expect(record.callerMessageID).toBeUndefined();
+    const reads = parentReads(h);
+    h.childContext.set(CHILD, [{ role: "assistant", content: [{ type: "text", text: "partial" }], finish: "stop", time: { created: 1, completed: 2 } }]);
+    h.emit({ type: `session.execution.${ending}`, id: `ev-end-${callID}-${ending}`, created: 3, data: { sessionID: CHILD } });
+    await h.drain();
+    // The processor journals (file I/O) around its finish, which microtask turns alone do not cover.
+    await vi.waitFor(() => expect(processedHere(h, callID)).toBe(true), { timeout: 10_000 });
+    const count = reads.count();
+    await h.settled();
+    return count;
+  };
+
+  it("QA-PDF12-14 a completion that succeeded looks the caller's message up when its record has none (control)", async () => {
+    expect(await completeWith("call-pdf1214-ok", "succeeded")).toBeGreaterThan(0);
+  }, 30_000);
+
+  it("QA-PDF12-14 a completion that did not succeed skips the caller lookup, although its record has no caller message", async () => {
+    expect(await completeWith("call-pdf1214-failed", "failed")).toBe(0);
+  }, 30_000);
 });
 
 describe("a restored hold whose recovery is skipped (QA-2.1-29)", () => {

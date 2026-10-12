@@ -11,6 +11,8 @@ import {
   createHeldResults,
   createInFlightRegistry,
   heldPlaceholder,
+  MAX_CLAIMS,
+  MAX_PROCESS_CLAIMS,
   renderCompleted,
   renderHeld,
   renderInFlight,
@@ -1607,6 +1609,23 @@ describe("bookkeeping bounds (QA-2.1-13)", () => {
     // A reloaded instance can decide the same calls again.
     const next = createInFlightRegistry({ now: () => 1, logger, claims });
     expect(next.decide(callRecord("c1"))).toBe(true);
+  });
+
+  it("QA-PDF12-13 the shared claim set stays bounded: past MAX_PROCESS_CLAIMS the oldest claims of ANY owner go", () => {
+    expect(MAX_PROCESS_CLAIMS).toBe(8 * MAX_CLAIMS);
+    const logger = { warn: () => undefined };
+    const claims = new Set<string>();
+    // Claims of instances that never disposed (no longer owned by anyone alive) fill the shared set to its bound.
+    for (let i = 0; i < MAX_PROCESS_CLAIMS; i += 1) claims.add(`bg:leaked-${i}`);
+    const reg = createInFlightRegistry({ now: () => 1, logger, claims });
+    expect(reg.decide(callRecord("fresh-1"))).toBe(true);
+    expect(claims.size).toBe(MAX_PROCESS_CLAIMS);
+    expect(claims.has("bg:leaked-0")).toBe(false); // the oldest claim, owned by nobody here, was evicted
+    expect(claims.has("bg:leaked-1")).toBe(true);
+    expect(claims.has("bg:fresh-1")).toBe(true);
+    for (let i = 0; i < 50; i += 1) reg.decide(callRecord(`more-${i}`));
+    expect(claims.size).toBe(MAX_PROCESS_CLAIMS);
+    expect(claims.has("bg:more-49")).toBe(true);
   });
 
   it("forgetSession gives the session's claims back", () => {

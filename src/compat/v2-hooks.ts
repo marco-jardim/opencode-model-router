@@ -1283,17 +1283,11 @@ export async function registerV2Hooks(
    * QA-PDF12-1: the caller agent of a rebuilt context: the journaled one, else (a record journaled before DF-1.1-1) the parent
    * session's current agent, looked up within CALLER_AGENT_LOOKUP_MS; undefined when neither is known. Never throws.
    */
-  const callerAgentOf = async (parentSessionID: string, journaled: string | undefined): Promise<string | undefined> => {
-    if (journaled !== undefined && journaled !== "") return journaled;
+  /** Runs `work` (a host lookup) for at most CALLER_AGENT_LOOKUP_MS; undefined when it fails or is too slow. Never throws. */
+  const boundedLookup = async (work: () => Promise<string | undefined>): Promise<string | undefined> => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const lookup = Promise.resolve(ctx.session.get({ sessionID: parentSessionID } as Parameters<typeof ctx.session.get>[0])).then(
-        (session: unknown) => {
-          const agent = (session as { agent?: unknown } | null | undefined)?.agent;
-          return typeof agent === "string" && agent !== "" ? agent : undefined;
-        },
-        () => undefined,
-      );
+      const lookup = work().then((value) => value, () => undefined);
       const timeout = new Promise<undefined>((resolveTimeout) => {
         timer = setTimeout(() => resolveTimeout(undefined), CALLER_AGENT_LOOKUP_MS);
         if (typeof timer === "object" && typeof timer.unref === "function") timer.unref();
@@ -1306,6 +1300,58 @@ export async function registerV2Hooks(
     }
   };
   /**
+   * QA-PDF12-14: the parent lookups made while at least one restore pass runs are shared per parent, so N restored holds of one
+   * parent cost one lookup each, not N. Dropped when the last running pass ends (a later pass looks again).
+   */
+  let restorePass: { passes: number; agents: Map<string, Promise<string | undefined>>; messages: Map<string, Promise<string | undefined>> } | undefined;
+  const sharedPerParent = (kind: "agents" | "messages", parent: string, work: () => Promise<string | undefined>): Promise<string | undefined> => {
+    const cache = restorePass?.[kind];
+    if (cache === undefined) return boundedLookup(work);
+    let pending = cache.get(parent);
+    if (pending === undefined) {
+      pending = boundedLookup(work);
+      cache.set(parent, pending);
+    }
+    return pending;
+  };
+  const duringRestorePass = async <T>(pass: () => Promise<T>): Promise<T> => {
+    restorePass ??= { passes: 0, agents: new Map(), messages: new Map() };
+    restorePass.passes += 1;
+    try {
+      return await pass();
+    } finally {
+      if (restorePass !== undefined && (restorePass.passes -= 1) <= 0) restorePass = undefined;
+    }
+  };
+  const callerAgentOf = (parentSessionID: string, journaled: string | undefined): Promise<string | undefined> => {
+    if (journaled !== undefined && journaled !== "") return Promise.resolve(journaled);
+    return sharedPerParent("agents", parentSessionID, async () => {
+      const session: unknown = await ctx.session.get({ sessionID: parentSessionID } as Parameters<typeof ctx.session.get>[0]);
+      const agent = (session as { agent?: unknown } | null | undefined)?.agent;
+      return typeof agent === "string" && agent !== "" ? agent : undefined;
+    });
+  };
+  /**
+   * QA-PDF12-12: the message id of a rebuilt context: the journaled one, else (a record journaled before QA-PDF12-5) the id of
+   * the parent's latest assistant message, read from its context within the same bound; undefined when that fails.
+   */
+  const callerMessageIDOf = (parentSessionID: string, journaled: string | undefined): Promise<string | undefined> => {
+    if (journaled !== undefined && journaled !== "") return Promise.resolve(journaled);
+    return sharedPerParent("messages", parentSessionID, async () => {
+      const history: unknown = await ctx.session.context({ sessionID: parentSessionID } as Parameters<typeof ctx.session.context>[0]);
+      const list: unknown = Array.isArray(history) ? history : Reflect.get(Object(history), "messages");
+      if (!Array.isArray(list)) return undefined;
+      for (let i = list.length - 1; i >= 0; i -= 1) {
+        const message: unknown = list[i];
+        if (message === null || typeof message !== "object") continue;
+        const role: unknown = Reflect.get(message, "role") ?? Reflect.get(message, "type");
+        const id: unknown = Reflect.get(message, "id");
+        if (role === "assistant" && typeof id === "string" && id !== "") return id;
+      }
+      return undefined;
+    });
+  };
+  /**
    * QA-PDF12-1/-5/-7/-9: runs `operation` (a background finish, a restored hold's gate) in the context of the dispatch's caller,
    * rebuilt from the data the dispatch journaled: its call, the message that made it and the caller agent (else the parent's
    * current one). The context is never retained as the parent's context.
@@ -1313,9 +1359,14 @@ export async function registerV2Hooks(
   const withinCaller = async <T>(
     caller: { parentSessionID: string; callID: string; callerAgent?: string; callerMessageID?: string },
     operation: () => Promise<T>,
+    /** QA-PDF12-14: false when nothing in `operation` launches as the caller (a completion that did not succeed runs no grader). */
+    lookup = true,
   ): Promise<T> => {
-    const agent = await callerAgentOf(caller.parentSessionID, caller.callerAgent);
-    return withinRebuilt(hookContext({ sessionID: caller.parentSessionID, agent, messageID: caller.callerMessageID ?? "", id: caller.callID }), operation);
+    const [agent, messageID] = lookup ? await Promise.all([
+      callerAgentOf(caller.parentSessionID, caller.callerAgent),
+      callerMessageIDOf(caller.parentSessionID, caller.callerMessageID),
+    ]) : [caller.callerAgent, caller.callerMessageID];
+    return withinRebuilt(hookContext({ sessionID: caller.parentSessionID, agent, messageID: messageID ?? "", id: caller.callID }), operation);
   };
   // ---------------------------------------------------------------------------------------------------------------------
   // Phase 2.1 startup (memo §4.1). Everything below is v2-only (this module is loaded by server.ts alone) and inert under
@@ -1784,7 +1835,8 @@ export async function registerV2Hooks(
       }
       // R20/R21 (QA-2.1-2, QA-2.1-6): the restored holds still owe their verdict; a hold whose child is recovered above gets it there.
       if (restored.reposts.length > 0 || restored.unverified.some((h) => !recovering.has(h.callID))) {
-        const pendingRestore = settleRestoredHolds(sessionID, restored, recovering);
+        // QA-PDF12-14: the holds of one pass share their parent lookups.
+        const pendingRestore = duringRestorePass(() => settleRestoredHolds(sessionID, restored, recovering));
         trackBackground(pendingRestore);
       }
     } catch (error) {
@@ -2783,7 +2835,11 @@ export async function registerV2Hooks(
           });
           // QA-PDF12-6: a copy that lost the call's claim to another copy leaves the call's background flag as it found it.
           if (claimed) background = decision.background;
-          else lostClaim = true;
+          else {
+            // QA-PDF12-10: the owner copy holds the verification and the result; this copy must not treat the call as verifying.
+            lostClaim = true;
+            verifyingCalls.delete(event.id);
+          }
         }
         // QA-PDF12-6: without the claim, `undefined` keeps the `background` key the input already has (set by the copy that claimed).
         event.input = nativeArgs(event.tool, output.args, original, lostClaim ? undefined : background);
@@ -3004,7 +3060,8 @@ export async function registerV2Hooks(
       };
       processor = createCompletionProcessor(inflight, {
         // QA-PDF12-9: the caller is the one the processor's attempt carries (journaled at decide), not a capped call-id lookup.
-        finish: (input, caller) => withinCaller({ parentSessionID: input.parentSessionID, callID: input.callID, ...caller }, () => api.finish(input)),
+        // QA-PDF12-14: only a succeeded completion can launch a grader as the caller, so only it waits for the caller lookups.
+        finish: (input, caller) => withinCaller({ parentSessionID: input.parentSessionID, callID: input.callID, ...caller }, () => api.finish(input), input.status === "succeeded"),
         readChildResult: lastAssistantText,
         // The `!running` half of `roleAfterCall`: budget and authority notices, plus its evictions (run through its own `finish`).
         roleCompletion: async (attempt, text) => {
