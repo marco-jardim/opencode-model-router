@@ -12,6 +12,7 @@ import {
 } from "../../src/verify/deterministic";
 import {
   createDeadline,
+  createDirectTestsPassHook,
   NO_TESTS_PASS_HOOK,
   SLOT_DEADLINE_REASON,
   type CommandOutcome,
@@ -19,7 +20,7 @@ import {
 } from "../../src/verify/deterministic";
 import { resolveVerifyBudget } from "../../src/router/config";
 import type { DoD, Check } from "../../src/verify/dod";
-import type { LintSpec } from "../../src/verify/runner";
+import type { LintSpec, PlannerFs, PlanScopedRunInput, ScopingPlan, TestSearchSeam } from "../../src/verify/runner";
 import type { Deadline, DeterministicDeps, ExecResult, TestsPassHook, TestsPassRequest, TestsPassRun } from "../../src/verify/types";
 
 // ---------------------------------------------------------------------------
@@ -1215,5 +1216,58 @@ describe("runDeterministic — per-check placements (P2.4)", () => {
     expect(verdict.outcome).toBe("fail");
     expect(verdict.reasons).toEqual(["command exited 4: node check.js"]);
     expect(failures).toEqual(["command exited 4: node check.js"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// createDirectTestsPassHook — cross-link root plumbing (cross-repo P3a, Y3)
+// ---------------------------------------------------------------------------
+
+describe("createDirectTestsPassHook — cross-link root (cross-repo P3a)", () => {
+  const CWD = "/fake/consumer";
+  const W = "/fake/lib";
+  const CHANGED = [{ path: `${W}/src/a.ts`, status: "modified" as const }];
+
+  function setup() {
+    const inputs: PlanScopedRunInput[] = [];
+    const plan = async (input: PlanScopedRunInput): Promise<ScopingPlan> => {
+      inputs.push(input);
+      return { noAffected: true, note: "no affected tests" };
+    };
+    const openScope: OpenCheckScope = () => { throw new Error("planning outcomes open no scope"); };
+    const plannerFs: PlannerFs = { fileExists: async () => true, readFile: async () => "{}" };
+    const search: TestSearchSeam = { findByName: async () => [], findByContent: async () => [] };
+    const host = { platform: "linux" as const };
+    const hook = createDirectTestsPassHook({ openScope, plannerFs, search, plan, host, budget: { maxWorkers: 2, failureRecheck: true } });
+    const today = { command: "npx vitest run", cwd: CWD, changedFiles: CHANGED, budget: { maxWorkers: 2 }, fs: plannerFs, search, host };
+    return { hook, inputs, today };
+  }
+
+  function request(over: Partial<TestsPassRequest> = {}): TestsPassRequest {
+    const deadline: Deadline = { budgetMs: 60_000, remaining: () => 60_000, bound: ms => ms, signal: new AbortController().signal };
+    return { command: "npx vitest run", cwd: CWD, testScope: "affected", changedFiles: CHANGED, reference: { kind: "disabled" }, deadline, ...over };
+  }
+
+  it("without crossLinkRoot the plan input is the pre-P3a one, with no extra undefined keys", async () => {
+    const s = setup();
+    expect(await s.hook(request())).toEqual({ scoped: { kind: "no-affected", note: "no affected tests" }, recheck: undefined });
+    expect(s.inputs).toHaveLength(1);
+    expect(s.inputs[0]).toStrictEqual(s.today);
+    expect(Object.keys(s.inputs[0]!).sort()).toEqual(Object.keys(s.today).sort());
+  });
+
+  it("forwards crossLinkRoot and crossLinkAliases to the plan", async () => {
+    const s = setup();
+    const aliases = ["/fake/consumer/node_modules/lib", "/fake/LIB"];
+    await s.hook(request({ crossLinkRoot: W, crossLinkAliases: aliases }));
+    expect(s.inputs).toHaveLength(1);
+    expect(s.inputs[0]).toStrictEqual({ ...s.today, crossLinkRoot: W, crossLinkAliases: aliases });
+  });
+
+  it("forwards crossLinkRoot alone without adding a crossLinkAliases key", async () => {
+    const s = setup();
+    await s.hook(request({ crossLinkRoot: W }));
+    expect(s.inputs[0]).toStrictEqual({ ...s.today, crossLinkRoot: W });
+    expect("crossLinkAliases" in s.inputs[0]!).toBe(false);
   });
 });

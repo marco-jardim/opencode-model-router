@@ -1317,6 +1317,9 @@ export function createDirectTestsPassHook(deps: DirectTestsPassHookDeps): TestsP
           fs: deps.plannerFs,
           search: deps.search,
           ...(deps.host !== undefined ? { host: deps.host } : {}),
+          // Cross-repo P3a (runner.ts G.4b): only when set, so a request without them plans as before.
+          ...(req.crossLinkRoot !== undefined ? { crossLinkRoot: req.crossLinkRoot } : {}),
+          ...(req.crossLinkAliases !== undefined ? { crossLinkAliases: req.crossLinkAliases } : {}),
         });
         if (isNoAffected(planned)) return { scoped: { kind: "no-affected", note: planned.note }, recheck: undefined };
         if (isUnverifiable(planned)) {

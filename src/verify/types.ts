@@ -371,6 +371,14 @@ export interface TestsPassRequest {
   readonly changedFiles: readonly ChangedPath[] | "unavailable";
   readonly reference: ReferenceState;
   readonly deadline: Deadline;
+  /**
+   * Cross-repo P3a (runner.ts G.4b): the git top of the repository the change lies in when it is
+   * not cwd's (W, SD-P3a-5). Forwarded to planScopedRun only when set; a request with it is never
+   * batched (batch.ts submit).
+   */
+  readonly crossLinkRoot?: string;
+  /** Other spellings of crossLinkRoot's directory (runner.ts PlanScopedRunInput); used only with crossLinkRoot. */
+  readonly crossLinkAliases?: readonly string[];
 }
 
 /** What the S5 hook returns for one request; judgeScoped turns it into the check result. */
