@@ -2797,23 +2797,7 @@ export async function registerV2Hooks(
       }
     }));
 
-    // 3.1.7 W4 (3.1.7.c, ADR 0007 D13): the host's retry decision feeds the capacity signals; the executor stops the retry of a
-    // plan child only. Without an executor, or on any error, the decision stays unchanged. Registered only with an executor.
-    if (options.executor !== undefined) {
-      registrations.push(await ctx.session.hook("retry", async (event) => {
-        const current = executor;
-        if (current === null) return;
-        try {
-          const sessionID = String(event.sessionID);
-          const { stop } = current.runtime.onRetryHook({ sessionID, stepKey: executorStepKey(sessionID), error: toHostError(event.error) });
-          // The memo's `decision.retry = false`: this host's `SessionRetry` has no writable decision field, so the stop is only
-          // recorded by the runtime (`capacityStopped`) and the host retries (open for 3.1.8).
-          if (stop) ingestLogger.warn("[router] executor: a plan child's retry should stop; this host offers no retry decision", { sessionID });
-        } catch (error) {
-          ingestLogger.warn("[router] executor: the retry signal could not be fed", { error: String(error) });
-        }
-      }));
-    }
+    // 3.1.7 W4: the host's retry hook is registered with the executor below (W1), only when the factory built one (M3).
     registrations.push(await ctx.tool.hook("execute.before", async (event) => {
       // 3.1.7 M41 (always on): a plan child without its plan binding is refused every tool call (fail closed). The context hook
       // checks a session's first user message; a first tool call that comes before that hook performs the same check here.
@@ -3449,6 +3433,19 @@ export async function registerV2Hooks(
           active: (sid) => built.runtime.planLine(sid) !== null || built.runtime.manualReady(sid).length > 0,
         });
         registrations.push({ dispose: async () => { unsubscribe(); unregisterPlan(); } });
+        // W4 (3.1.7.c, ADR 0007 D13): the host's retry decision feeds the capacity signals; the executor stops the retry of a plan
+        // child only. Registered only when an executor exists (M3); on any error the decision stays unchanged.
+        registrations.push(await ctx.session.hook("retry", async (event) => {
+          try {
+            const sessionID = String(event.sessionID);
+            const { stop } = built.runtime.onRetryHook({ sessionID, stepKey: executorStepKey(sessionID), error: toHostError(event.error) });
+            // The memo's `decision.retry = false`: this host's `SessionRetry` has no writable decision field, so the stop is only
+            // recorded by the runtime (`capacityStopped`) and the host retries (open for 3.1.8).
+            if (stop) ingestLogger.warn("[router] executor: a plan child's retry should stop; this host offers no retry decision", { sessionID });
+          } catch (error) {
+            ingestLogger.warn("[router] executor: the retry signal could not be fed", { error: String(error) });
+          }
+        }));
         trackBackground(built.runtime.start().catch((error: unknown) => {
           ingestLogger.warn("[router] executor: it could not start", { error: String(error) });
         }));

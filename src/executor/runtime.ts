@@ -464,6 +464,17 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     return pr;
   }
 
+  /** Waits for a live child's end (settles only when the child ends); tracked, but `dispose` never waits for it. */
+  const childWaits = new Set<Promise<unknown>>();
+  function trackChild<T>(pr: Promise<T>): Promise<T> {
+    childWaits.add(pr);
+    const done = (): void => {
+      childWaits.delete(pr);
+    };
+    pr.then(done, done);
+    return track(pr);
+  }
+
   function bg(label: string, fn: () => Promise<void>): void {
     void track(
       fn().catch((e: unknown) => {
@@ -865,10 +876,11 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       }
       const ref: HandleRef = { n, settled: false, completion: handle.completion };
       p.handles.set(taskId, ref);
-      void track(
+      // The wait for the child is a child wait (dispose never waits for it); processing its end, once it came, is ordinary work.
+      void trackChild(
         handle.completion.then((end) => {
           ref.settled = true;
-          return processEnd(p, taskId, n, end);
+          return track(processEnd(p, taskId, n, end));
         }),
       );
       void track(
@@ -2054,7 +2066,19 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         for (const h of p.timers) d.clock.clearTimer(h);
         p.timers.clear();
       }
-      await handle.settled();
+      // A live child's completion settles only when the child ends, so dispose never waits for it: the launcher aborts every
+      // owned child first (journals nothing; recovery closes those attempts as lost), then only the work already running is
+      // awaited (ticks, appends, the processing of ends that came), never a child wait.
+      try {
+        await d.launcher.dispose();
+      } catch (e) {
+        d.log("warn", "launcher dispose failed", errorText(e));
+      }
+      for (;;) {
+        const work = [...pending].filter((pr) => !childWaits.has(pr));
+        if (work.length === 0) break;
+        await Promise.allSettled(work);
+      }
       for (const p of [...plans.values()]) {
         try {
           await closePlan(p);
@@ -2062,7 +2086,6 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
           d.log("warn", "plan close failed", errorText(e));
         }
       }
-      await d.launcher.dispose();
     },
 
     async settled() {

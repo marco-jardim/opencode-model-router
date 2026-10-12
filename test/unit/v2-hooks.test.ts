@@ -3,7 +3,13 @@ import type { Context } from "@opencode/plugin/promise/plugin";
 import { Agent } from "@opencode/plugin";
 import type { Hooks } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
-import { registerV2Hooks, resumeTargetsOf, v2Instructions } from "../../src/compat/v2-hooks";
+import {
+  registerV2Hooks, resumeTargetsOf, v2Instructions, V2_BACKGROUND_SETTLED,
+  type V2Executor, type V2ExecutorFactory, type V2ExecutorHost,
+} from "../../src/compat/v2-hooks";
+import { PLAN_PROVIDER_NAME, ROUTER_TURN_STATE_ATTACH } from "../../src/compat/turn-state";
+import { bindPlanChild, evict as evictBinding } from "../../src/routing/roles/binding";
+import type { HostSessionEvent } from "../../src/executor/types";
 import ModelRouterPlugin from "../../src/index";
 import { invalidateConfigCache, loadConfig, overridePath } from "../../src/router/config";
 import { getActiveTiers } from "../../src/router/protocol";
@@ -1169,6 +1175,245 @@ describe("OpenCode 2 hook adapter", () => {
       process.chdir(savedCwd);
       rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
     }
+  });
+});
+
+describe("plan executor wiring in the v2 adapter (3.1.7: W2, W4, W5, W6, M41)", () => {
+  const NONCE = "a".repeat(32);
+  const planPrompt = (planId: string, taskId: string, attempt = 1): string =>
+    `PLAN CONTEXT\nshared\n\n[plan ${planId}:${taskId}#${attempt}] nonce=${NONCE}\n\nTASK do it`;
+  const userMessage = (text: string) => [{ role: "user", content: [{ type: "text", text }] }];
+  const PLAN_CHILD = "plan-child";
+  const ABS_ROOT = process.platform === "win32" ? "C:/slots/slot-1" : "/slots/slot-1";
+
+  /** A fake runtime handle: the adapter is asked, the answers are scripted. */
+  function fakeExecutor() {
+    const runtime = {
+      onRouterToolCall: vi.fn(),
+      onRetryHook: vi.fn((i: { sessionID: string }) => ({ stop: i.sessionID === PLAN_CHILD })),
+      onHostEvent: vi.fn(),
+      planLine: vi.fn((): string | null => null),
+      manualReady: vi.fn((): Array<{ taskId: string; kind: string }> => []),
+      start: vi.fn(async () => undefined),
+      recordMetric: vi.fn(),
+      dispose: vi.fn(async () => undefined),
+      isPlanChild: vi.fn((sessionID: string) => sessionID === PLAN_CHILD),
+    };
+    const launcher = { dispose: vi.fn(async () => undefined) };
+    const emitted: HostSessionEvent[] = [];
+    const state: { host?: V2ExecutorHost } = {};
+    const factory: V2ExecutorFactory = (host) => {
+      state.host = host;
+      host.hosts.onEvent((e) => { emitted.push(e); });
+      return { runtime: runtime as unknown as V2Executor["runtime"], launcher };
+    };
+    return { runtime, launcher, emitted, state, factory };
+  }
+
+  async function startWired(options: { executor?: V2ExecutorFactory; hooks?: Record<PropertyKey, unknown> } = {}) {
+    const f = fixture();
+    const messagesBySession = new Map<string, unknown[]>();
+    Object.assign(f.ctx.session, {
+      get: vi.fn(async ({ sessionID }: { sessionID: string }) => (sessionID.startsWith("root") ? { id: sessionID } : { id: sessionID, parentID: "root", agent: "fast" })),
+      context: vi.fn(async ({ sessionID }: { sessionID: string }) => messagesBySession.get(sessionID) ?? []),
+    });
+    const listeners = new Set<(info: { sessionID: string }) => void>();
+    const childRunner = {
+      bootID: "0123456789abcdef", retainedContext: () => null,
+      onContextCaptured: (listener: (info: { sessionID: string }) => void) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
+      run: async () => ({ sessionID: "unused", text: "" }), pin: vi.fn(() => vi.fn()),
+    };
+    const v2 = { withToolContext: async <T>(_context: unknown, operation: () => Promise<T>) => operation(), applyChildSystem: () => undefined, childRunner };
+    const providers: string[] = [];
+    const attach = (registry: { registerTurnStateProvider: (p: { name: string }) => () => void }): boolean => {
+      const original = registry.registerTurnStateProvider.bind(registry);
+      registry.registerTurnStateProvider = (p) => { providers.push(p.name); return original(p); };
+      return true;
+    };
+    const hooks = { [ROUTER_TURN_STATE_ATTACH]: attach, ...(options.hooks ?? {}) } as unknown as Hooks;
+    const cleanup = await registerV2Hooks(
+      f.ctx as unknown as Context, hooks, v2 as unknown as Parameters<typeof registerV2Hooks>[2],
+      options.executor === undefined ? {} : { executor: options.executor },
+    );
+    cleanups.push(cleanup);
+    const toolEvent = (sessionID: string, tool = "read") => ({ sessionID, agent: "fast", messageID: "m", id: `call-${sessionID}`, tool, input: {} });
+    const contextEvent = (sessionID: string, text: string) => ({
+      sessionID, agent: "fast", model: { providerID: "p", id: "m" }, options: {}, system: [], messages: userMessage(text), tools: {},
+    });
+    const tick = async (): Promise<void> => { for (let i = 0; i < 20; i += 1) await new Promise<void>((resolve) => setImmediate(resolve)); };
+    return { f, listeners, providers, cleanup, messagesBySession, toolEvent, contextEvent, tick };
+  }
+
+  it("a captured router tool call of the orchestrator feeds the executor (W2); disposing unsubscribes", async () => {
+    const x = fakeExecutor();
+    const w = await startWired({ executor: x.factory });
+    expect(w.listeners.size).toBe(1);
+    expect(x.runtime.start).toHaveBeenCalledTimes(1);
+    for (const listener of w.listeners) listener({ sessionID: "root" });
+    expect(x.runtime.onRouterToolCall).toHaveBeenCalledWith("root");
+    x.runtime.onRouterToolCall.mockImplementationOnce(() => { throw new Error("feed failed"); });
+    for (const listener of w.listeners) expect(() => listener({ sessionID: "root" })).not.toThrow();
+    await w.cleanup();
+    expect(w.listeners.size).toBe(0);
+    expect(x.runtime.dispose).toHaveBeenCalled();
+    expect(x.launcher.dispose).toHaveBeenCalled();
+  });
+
+  it("session.step.started carries the provider to the emitter; retry and step-failure share one stepKey per step (W4)", async () => {
+    const x = fakeExecutor();
+    const w = await startWired({ executor: x.factory });
+    const rate = { type: "APIError", message: "rate limited", status: 429 };
+    w.f.emit({ id: "e1", type: "session.step.started", data: { sessionID: PLAN_CHILD, model: { providerID: "anthropic", id: "claude-x" } } });
+    w.f.emit({ id: "e2", type: "session.retry.scheduled", data: { sessionID: PLAN_CHILD, error: rate } });
+    w.f.emit({ id: "e3", type: "session.step.failed", data: { sessionID: PLAN_CHILD, error: rate } });
+    w.f.emit({ id: "e4", type: "session.step.started", data: { sessionID: PLAN_CHILD, model: { providerID: "openai", id: "gpt-x" } } });
+    w.f.emit({ id: "e5", type: "session.retry.scheduled", data: { sessionID: PLAN_CHILD, error: rate } });
+    await vi.waitFor(() => expect(x.emitted.filter((e) => e.type === "retry")).toHaveLength(2));
+    const started = x.emitted.filter((e) => e.type === "step.started");
+    expect(started).toMatchObject([
+      { sessionID: PLAN_CHILD, providerID: "anthropic", modelID: "claude-x" },
+      { sessionID: PLAN_CHILD, providerID: "openai", modelID: "gpt-x" },
+    ]);
+    expect(x.emitted.filter((e) => e.type === "retry")).toMatchObject([
+      { sessionID: PLAN_CHILD, stepKey: `${PLAN_CHILD}:1`, source: "scheduled", error: { type: "APIError", status: 429, message: "rate limited" } },
+      { sessionID: PLAN_CHILD, stepKey: `${PLAN_CHILD}:2`, source: "scheduled" },
+    ]);
+    expect(x.emitted.find((e) => e.type === "step.failed")).toMatchObject({ sessionID: PLAN_CHILD, error: { type: "APIError", status: 429 } });
+    // M46: the adapter only emits; it never calls the runtime's host-event entry itself
+    expect(x.runtime.onHostEvent).not.toHaveBeenCalled();
+  });
+
+  it("the retry hook asks the runtime with the step's key; a stop is requested only for a plan child; errors leave the decision alone (W4)", async () => {
+    const x = fakeExecutor();
+    const w = await startWired({ executor: x.factory });
+    w.f.emit({ id: "e1", type: "session.step.started", data: { sessionID: PLAN_CHILD, model: { providerID: "anthropic", id: "claude-x" } } });
+    await vi.waitFor(() => expect(x.emitted.some((e) => e.type === "step.started")).toBe(true));
+    const error = { type: "APIError", message: "overloaded", status: 529 };
+    const planDecision = { sessionID: PLAN_CHILD, error };
+    const otherDecision = { sessionID: "ordinary-session", error };
+    await expect(w.f.sessionHooks.retry(planDecision)).resolves.toBeUndefined();
+    await expect(w.f.sessionHooks.retry(otherDecision)).resolves.toBeUndefined();
+    expect(x.runtime.onRetryHook).toHaveBeenNthCalledWith(1, { sessionID: PLAN_CHILD, stepKey: `${PLAN_CHILD}:1`, error: { type: "APIError", status: 529, message: "overloaded" } });
+    expect(x.runtime.onRetryHook).toHaveBeenNthCalledWith(2, expect.objectContaining({ sessionID: "ordinary-session" }));
+    expect(x.runtime.onRetryHook.mock.results.map((r) => r.value)).toEqual([{ stop: true }, { stop: false }]);
+    // the host event has no writable retry field: the decision objects are left untouched
+    expect(planDecision).toEqual({ sessionID: PLAN_CHILD, error });
+    expect(otherDecision).toEqual({ sessionID: "ordinary-session", error });
+    x.runtime.onRetryHook.mockImplementationOnce(() => { throw new Error("runtime failed"); });
+    await expect(w.f.sessionHooks.retry(planDecision)).resolves.toBeUndefined();
+  });
+
+  it("the orchestrator's own idle events reach the emitter (W6, M34)", async () => {
+    const x = fakeExecutor();
+    const w = await startWired({ executor: x.factory });
+    w.f.emit({ id: "r1", type: "session.execution.succeeded", data: { sessionID: "root" } });
+    w.f.emit({ id: "r2", type: "session.execution.interrupted", data: { sessionID: "root" } });
+    await vi.waitFor(() => expect(x.emitted).toHaveLength(2));
+    expect(x.emitted).toMatchObject([{ type: "execution.completed", sessionID: "root" }, { type: "execution.interrupted", sessionID: "root" }]);
+  });
+
+  it("registers the plan turn-state provider with an executor (W6)", async () => {
+    const x = fakeExecutor();
+    const w = await startWired({ executor: x.factory });
+    expect(w.providers).toContain(PLAN_PROVIDER_NAME);
+  });
+
+  it("with no factory, or a factory answering null, nothing changes: no retry hook, no plan provider, no emission (M3)", async () => {
+    const none = await startWired();
+    expect(none.f.sessionHooks.retry).toBeUndefined();
+    expect(none.providers).not.toContain(PLAN_PROVIDER_NAME);
+    expect(none.listeners.size).toBe(0);
+
+    const factory = vi.fn((): null => null);
+    const nulled = await startWired({ executor: factory });
+    expect(factory).toHaveBeenCalledTimes(1);
+    expect(nulled.providers).not.toContain(PLAN_PROVIDER_NAME);
+    expect(nulled.listeners.size).toBe(0);
+    expect(nulled.f.sessionHooks.retry).toBeUndefined();
+  });
+
+  describe("M41: an unbound plan child is refused every tool call (always on)", () => {
+    const bound: string[] = [];
+    afterEach(() => { for (const id of bound.splice(0)) evictBinding(id); });
+    const bind = (child: string, planId: string, taskId: string): void => {
+      bindPlanChild({ childSessionID: child, role: "implementer", agent: "fast", workRoot: ABS_ROOT, grant: ["read"], planId, taskId, attempt: 1 });
+      bound.push(child);
+    };
+    /** The refusal text of one tool call of the session; "" when the call was allowed. */
+    const refusal = async (w: Awaited<ReturnType<typeof startWired>>, sessionID: string): Promise<string> => {
+      try {
+        await w.f.toolHooks["execute.before"](w.toolEvent(sessionID));
+        return "";
+      } catch (error) {
+        return String(error instanceof Error ? error.message : error);
+      }
+    };
+
+    it("context-hook path: an unbound child whose first message carries a plan header is refused, and stays refused", async () => {
+      const w = await startWired(); // no executor: the check is on either way
+      await w.f.sessionHooks.context(w.contextEvent("m41-unbound", planPrompt("plan-one", "T1")));
+      expect(await refusal(w, "m41-unbound")).toMatch(/no matching plan binding/);
+      expect(await refusal(w, "m41-unbound")).toMatch(/no matching plan binding/);
+    });
+
+    it("a header naming another plan or task than the binding is refused; a matching header is not", async () => {
+      const w = await startWired();
+      bind("m41-wrong-task", "plan-one", "T1");
+      bind("m41-wrong-plan", "plan-one", "T1");
+      bind("m41-match", "plan-one", "T1");
+      await w.f.sessionHooks.context(w.contextEvent("m41-wrong-task", planPrompt("plan-one", "T2")));
+      await w.f.sessionHooks.context(w.contextEvent("m41-wrong-plan", planPrompt("plan-two", "T1")));
+      await w.f.sessionHooks.context(w.contextEvent("m41-match", planPrompt("plan-one", "T1")));
+      expect(await refusal(w, "m41-wrong-task")).toMatch(/no matching plan binding/);
+      expect(await refusal(w, "m41-wrong-plan")).toMatch(/no matching plan binding/);
+      expect(await refusal(w, "m41-match")).not.toMatch(/no matching plan binding/);
+    });
+
+    it("execute.before fallback: a first tool call before the context hook ran performs the same check", async () => {
+      const w = await startWired();
+      w.messagesBySession.set("m41-fallback", userMessage(planPrompt("plan-one", "T1")));
+      expect(await refusal(w, "m41-fallback")).toMatch(/no matching plan binding/);
+      bind("m41-fallback-bound", "plan-one", "T1");
+      w.messagesBySession.set("m41-fallback-bound", userMessage(planPrompt("plan-one", "T1")));
+      expect(await refusal(w, "m41-fallback-bound")).not.toMatch(/no matching plan binding/);
+    });
+
+    it("root sessions are not checked, and a prompt without a header never refuses", async () => {
+      const w = await startWired();
+      await w.f.sessionHooks.context(w.contextEvent("root-m41", planPrompt("plan-one", "T1")));
+      expect(await refusal(w, "root-m41")).not.toMatch(/no matching plan binding/);
+      await w.f.sessionHooks.context(w.contextEvent("m41-ordinary", "Please read the file and report."));
+      expect(await refusal(w, "m41-ordinary")).not.toMatch(/no matching plan binding/);
+    });
+  });
+
+  it("an executor-owned completion is not processed a second time: the runner trigger settles it, execution.* is a duplicate (W5)", async () => {
+    const x = fakeExecutor();
+    const w = await startWired({ executor: x.factory });
+    const host = x.state.host;
+    if (host === undefined) throw new Error("the factory was not called");
+    const req = {
+      planId: "plan-one", taskId: "T1", attempt: 1, nonce: NONCE, orchestratorSessionID: "root", role: "implementer", grant: ["read"],
+      workRoot: ABS_ROOT, prompt: planPrompt("plan-one", "T1"), context: { bootID: "0123456789abcdef", epoch: 1, callID: "c1" },
+      route: { agent: "fast", model: { providerID: "p", modelID: "m", variant: null }, provider: "p", heavy: false },
+    } as unknown as Parameters<typeof host.bookkeeping.decisionRow>[0];
+    host.bookkeeping.decisionRow(req);
+    host.bookkeeping.recordDispatchStart(req, new Date().toISOString());
+    host.bookkeeping.registerInFlight("T1", 1, null);
+    host.bookkeeping.registerInFlight("T1", 1, PLAN_CHILD);
+    w.f.emit({ id: "s1", type: "session.created", data: { sessionID: PLAN_CHILD, parentID: "root" } });
+    host.bookkeeping.unregisterInFlight("T1", 1); // the launcher's settle point: the runner trigger
+    w.f.emit({ id: "s2", type: "session.execution.succeeded", data: { sessionID: PLAN_CHILD } }); // a later execution.* trigger
+    host.bookkeeping.unregisterInFlight("T1", 1); // idempotent
+    await w.tick();
+    const settle: unknown = Reflect.get(w.cleanup, V2_BACKGROUND_SETTLED);
+    if (typeof settle === "function") await (settle as () => Promise<void>)();
+    await w.tick();
+    // the ordinary path would hold or deliver a completion entry to the parent; an executor-owned attempt does neither
+    expect(w.f.ctx.session.synthetic).not.toHaveBeenCalled();
+    // the executor still sees the child's end through its one event path
+    expect(x.emitted.some((e) => e.type === "execution.completed" && e.sessionID === PLAN_CHILD)).toBe(true);
+    expect(x.runtime.onHostEvent).not.toHaveBeenCalled();
   });
 });
 

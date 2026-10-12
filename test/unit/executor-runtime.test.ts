@@ -1392,6 +1392,29 @@ describe("learned edge and lease needs (M13: rows 18b, 18b', R6)", () => {
   });
 });
 
+describe("dispose with a live child (3.1.8 regression)", () => {
+  it("dispose returns while a confirmed child still runs: the launcher is disposed first and the child's end is never awaited", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-live");
+    // `settled()` is not awaited here: it includes the wait for this live child, which ends only with the child
+    await until(() => h.state("T1") === "running", "T1 running");
+    expect(run.settled).toBe(false);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const hung = new Promise<"hung">((resolve) => {
+      timer = setTimeout(() => resolve("hung"), 5_000);
+    });
+    try {
+      const outcome = await Promise.race([h.runtime.dispose().then(() => "disposed" as const), hung]);
+      expect(outcome).toBe("disposed");
+    } finally {
+      clearTimeout(timer);
+    }
+    expect(h.launcher.disposed).toBe(1);
+    expect(run.settled).toBe(false); // the runtime ended nothing itself: the launcher's dispose aborts the child
+  });
+});
+
 describe("capacity, lost streak and abort", () => {
   it("a capacity stop is uncounted (outcome capacity, no recordAttempt); a non-plan session's retry is untouched", async () => {
     const h = await mk(planOf([task("T1")]));
