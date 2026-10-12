@@ -13,8 +13,8 @@ import {
 import type {
   PhaseSuiteRunner, RevertRequest, RevertVerdict, StepDetail, StepJournal, SuiteResolution, SuiteRunRequest, SuiteVerdict,
 } from "./queue";
-import type { GitOps } from "../git";
-import type { Clock, IntegrationStep, LedgerV1, PhaseId, SlotPool, TaskId } from "../types";
+import { COMMIT_SUBJECT_PATTERN, formatCommitMessage, type GitOps } from "../git";
+import { ExecutorError, type Clock, type IntegrationStep, type LedgerV1, type PhaseId, type PlanId, type SlotPool, type TaskId } from "../types";
 
 export interface PhaseSuiteDeps {
   checks: IntegrationChecks; igit: IntegrateGit; git: GitOps; pool: SlotPool;
@@ -236,7 +236,7 @@ async function runRevert(d: PhaseSuiteDeps, req: RevertRequest, j: StepJournal):
       const newestFirst = (await d.igit.revList(cwd, culprit.from, culprit.to)).reverse();
       if (newestFirst.length === 0) return { error: { reason: "prepare", message: `range ${culprit.from}..${culprit.to} holds no commit to revert` } };
       for (const sha of newestFirst) {
-        const message = revertMessage(await d.igit.subject(cwd, sha), culprit.taskId, culprit.from, culprit.to, req.phaseId);
+        const message = revertMessage(await d.igit.subject(cwd, sha), culprit.taskId, culprit.from, culprit.to, req.phaseId, req.planId);
         const r = await d.git.revert(cwd, sha, message);
         if (!r.ok) return { error: null, value: { kind: "conflict", at: sha, paths: [...r.conflicts] } };
       }
@@ -304,7 +304,17 @@ export function createPhaseSuiteRunner(d: PhaseSuiteDeps): PhaseSuiteRunner {
   };
 }
 
-/** Revert commit message (M26). */
-export function revertMessage(subject: string, taskId: TaskId, from: string, to: string, phaseId: PhaseId): string {
-  return `Revert "${subject}"\n\nomr: revert ${taskId} ${from}..${to} (phase ${phaseId} suite failure)`;
+/**
+ * Revert commit message (M26). `GitOps.revert` accepts only a one-line `COMMIT_SUBJECT_PATTERN` subject (no body), so the
+ * message is `revert(<phase>): <taskId> <from>..<to> "<subject>" [<planId>:<taskId>]` via `formatCommitMessage` (the
+ * title is cut at 72 characters). `planId` defaults to the `[plan:task]` suffix of the reverted subject.
+ */
+export function revertMessage(subject: string, taskId: TaskId, from: string, to: string, phaseId: PhaseId, planId?: PlanId): string {
+  const plan = planId ?? COMMIT_SUBJECT_PATTERN.exec(subject)?.[4];
+  if (plan === undefined) {
+    throw new ExecutorError("E_INVALID_INPUT", "revert message needs the plan id", { subject: subject.slice(0, 200) });
+  }
+  const scope = /^[\w.-]+$/.test(phaseId) ? phaseId : "phase";
+  const title = `${taskId} ${from.slice(0, 7)}..${to.slice(0, 7)} "${subject.replace(/ \[[^\]]*\]$/, "")}"`;
+  return formatCommitMessage({ type: "revert", scope, title, planId: plan, taskId });
 }
