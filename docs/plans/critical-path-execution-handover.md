@@ -426,6 +426,15 @@ implementations, so the plan now runs on its own data/state dirs (owner decision
   `ses_ecdffab07ffeTDH3rknizw7W4E` (W `capacity.ts` + test), 3.1.4 `ses_ecdff6ed1ffeBXU36iCqBmtU3b` (W `expand.ts` + test);
   p32 implementer 3.2.2 + V2-V8 `ses_ecdff07afffeZ3PYj1J2dNUrcQ` (W `integrate\checks.ts`, exports in `verify\runner.ts`,
   `verify\slot.ts`).
+- **Progress (18:40):** p31: 3.1.2 `1ed3bac` (43 tests), 3.1.3 `7ebcff7` (47; test fixed by the orchestrator: a "future"
+  instant equal to now), 3.1.4 `8129e1f` (30; expected needs order fixed to the canonical `shell,edit`). Router verdicts
+  for these were FAIL/UNVERIFIABLE only from cross-writer contamination in the shared worktree; verified independently
+  (scoped vitest + `tsc --noEmit`). p32: 3.2.2 `d22c9ba` (V1-V8 true; memo name mismatches: `diffNames` not
+  `diffNameStatus`, no `Logger` in types — local structural one). pdf1-2: DF-1.1-2 `7026208` (326 tests), DF-1.1-1
+  `3add1e5` (`callerAgent` on CallRecord/holds/journal; process-wide claims registry; 9 files 536 green). In flight:
+  DF-1.1-1 e2e tests `ses_ecdfe09a6ffeMGnvsNK1wSzy70` (W `test\helpers\v2-bg-host.ts`, the two v2-background tests),
+  3.2.3 `ses_ecdf84ce9ffeiY9wIfIxfw89cK` (W `integrate\queue.ts`), 3.1.5 `ses_ecdf80bd8ffeyBecf1KQWEe3AT` (W `launch.ts`,
+  `v2-client.ts`, `binding.ts`, their tests).
 
 *(superseded)* **NEXT ACTION (2026-10-12 ≈16:30): DF-1.1 re-switch — waiting for the owner restart; then the DF-1.1 self-check and
 re-probes (DF1.4.a with `df1.1`, c runner criterion, d, e), then Wave 3.** `cpx/pdf1-1` merged into `cpx/main` as
