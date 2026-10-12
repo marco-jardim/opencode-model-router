@@ -266,3 +266,63 @@ describe("formatSummary coverage", () => {
     expect(formatSummary({ ...s, width: 0 })).toContain("(p=1)");
   });
 });
+
+// Runs `run` with `target[key]` replaced by `value`, restoring the original descriptor afterwards.
+function withPatched<T>(target: object, key: PropertyKey, value: unknown, run: () => T): T {
+  const original = Object.getOwnPropertyDescriptor(target, key);
+  Object.defineProperty(target, key, { value, configurable: true, writable: true });
+  try {
+    return run();
+  } finally {
+    if (original !== undefined) Object.defineProperty(target, key, original);
+  }
+}
+
+// `fill` that leaves every slot a hole, so the `?? 0` fallbacks stand in for the fill value.
+function holeyFill(this: unknown[]): unknown[] {
+  return this;
+}
+
+const realFrom = Array.from;
+// `Array.from` that leaves the last slot a hole (the last node is a sink in the plans below).
+function fromWithLastHole(src: ArrayLike<unknown>, fn?: (v: unknown, k: number) => unknown): unknown[] {
+  const r: unknown[] = fn === undefined ? realFrom(src) : realFrom(src, fn);
+  Reflect.deleteProperty(r, r.length - 1);
+  return r;
+}
+
+describe("planEstimate fallbacks for missing values", () => {
+  it("costs a launchable task whose estimate has no p50 as zero", () => {
+    const a = node("A", H);
+    const b = node("B", H);
+    Reflect.deleteProperty(b.estimate, "p50");
+    const r = planEstimate(plan([a, b], [edge("A", "B")]), 4);
+    expect(r).toEqual({ workMs: H, criticalPathMs: H, width: 1, expectedMakespanMs: H });
+  });
+
+  it("gives the same estimate when the per-node arrays are sparse", () => {
+    const chain = plan([node("A", H, { phase: "p1" }), node("B", 2 * H), node("C", H)], [edge("A", "B"), edge("gate:p1", "C")], [phase("p1")]);
+    const baseline = planEstimate(chain, 4);
+    expect(baseline).toEqual({ workMs: 4 * H, criticalPathMs: 3 * H, width: 2, expectedMakespanMs: 3 * H });
+    expect(withPatched(Array.prototype, "fill", holeyFill, () => planEstimate(chain, 4))).toEqual(baseline);
+    // the patch is undone, so later tests see the real `fill`
+    expect(new Array<number>(2).fill(7)).toEqual([7, 7]);
+  });
+
+  it("gives the same estimate on a cycle entered from an acyclic node when the arrays are sparse", () => {
+    // A -> B <-> C: only A is ordered, and its successor B has no backward length yet.
+    const entered = plan([node("A", H), node("B", H), node("C", H)], [edge("A", "B"), edge("B", "C"), edge("C", "B")]);
+    const baseline = planEstimate(entered, 4);
+    expect(baseline.criticalPathMs).toBe(H);
+    expect(baseline.workMs).toBe(3 * H);
+    expect(baseline.width).toBe(2);
+    expect(withPatched(Array.prototype, "fill", holeyFill, () => planEstimate(entered, 4))).toEqual(baseline);
+  });
+
+  it("gives the same estimate when a sink has no successor list", () => {
+    const chain = plan([node("A", H), node("B", 2 * H)], [edge("A", "B")]);
+    const baseline = planEstimate(chain, 4);
+    expect(baseline).toEqual({ workMs: 3 * H, criticalPathMs: 3 * H, width: 1, expectedMakespanMs: 3 * H });
+    expect(withPatched(Array, "from", fromWithLastHole, () => planEstimate(chain, 4))).toEqual(baseline);
+  });
+});

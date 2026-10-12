@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { createPlanCompiler, planIdOf } from "../../src/executor/compile/index";
+import { createPlanCompiler, planIdOf, type CompilerDeps } from "../../src/executor/compile/index";
 import { residueDigestOf } from "../../src/executor/compile/residue";
 import { ExecutorError, PLAN_ID_PATTERN, executorDefaults, type ExecutorConfig, type TaskNode } from "../../src/executor/types";
-import { NOW, compileOpts, makeHarness, planPathOf } from "../fixtures/cpx/plans/harness";
+import { NOW, ROUTE_LINE, compileOpts, makeHarness, planPathOf, stubAnnotate } from "../fixtures/cpx/plans/harness";
 
 async function rejection(p: Promise<unknown>): Promise<ExecutorError> {
   try {
@@ -242,6 +242,140 @@ describe("addTasks", () => {
     expect(r.reopened).toEqual([]);
   });
 
+  it("adds to a ledger without any task id that could be referenced", async () => {
+    const { h, ledger } = await setup();
+    const empty = { ...ledger, tasks: {}, edges: [] };
+    const r = h.compiler.addTasks(empty, frag("- **1.2.2** Extra work", "  Writes: `src/d.ts`"));
+    expect(r.tasks.map((t) => t.id)).toEqual(["1.2.2"]);
+    expect(r.edges.map((e) => `${e.from}>${e.to}`)).toContain("gate:1.1>1.2.2");
+    expect(r.reopened).toEqual([]);
+  });
+
+  it("rejects an id that a ledger task already uses in another case", async () => {
+    const { h, ledger } = await setup();
+    const lower = { ...(ledger.tasks["1.2.1"] as TaskNode), id: "1.2.qa" };
+    const withLower = { ...ledger, tasks: { ...ledger.tasks, "1.2.qa": lower } };
+    let caught: unknown;
+    try {
+      h.compiler.addTasks(withLower, frag("- **1.2.QA** Review", "  Writes: `src/review.ts`"));
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ExecutorError);
+    expect((caught as ExecutorError).code).toBe("E_INVALID_INPUT");
+    expect((caught as ExecutorError).message).toBe("task id 1.2.QA already exists in the ledger");
+    expect((caught as ExecutorError).detail).toEqual({ taskId: "1.2.QA" });
+  });
+
+  it("treats a new task without write evidence as writing everything", async () => {
+    const { h, ledger } = await setup();
+    const r = h.compiler.addTasks(ledger, frag("- **1.2.2** Do other things in the repo", `  ${ROUTE_LINE}`));
+    expect(r.tasks[0]?.footprint.confidence).toBe("unknown");
+    expect(r.edges.some((e) => e.kind === "conflict" && e.from === "1.2.1" && e.to === "1.2.2")).toBe(true);
+  });
+
+  it("keeps a single conflict edge between two new tasks writing the same file", async () => {
+    const { h, ledger } = await setup();
+    const r = h.compiler.addTasks(ledger, frag("- **1.2.2** First", "  Writes: `src/shared.ts`", "- **1.2.3** Second", "  Writes: `src/shared.ts`"));
+    const between = r.edges.filter((e) => e.from === "1.2.2" && e.to === "1.2.3");
+    expect(between).toHaveLength(1);
+    expect(between[0]?.kind).toBe("conflict");
+    expect(new Set(r.edges.map((e) => `${e.from}>${e.to}`)).size).toBe(r.edges.length);
+  });
+
+  it("rejects an item without an id, whose hash id names no phase", async () => {
+    const { h, ledger } = await setup();
+    let caught: unknown;
+    try {
+      h.compiler.addTasks(ledger, frag("- Tidy up the widget", "  Writes: `src/d.ts`"));
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ExecutorError);
+    const err = caught as ExecutorError;
+    expect(err.code).toBe("E_INVALID_INPUT");
+    expect(err.message).toMatch(/^task S[0-9a-f]{8}-1 belongs to no phase of the ledger$/);
+    expect(err.detail).toMatchObject({ phase: "main" });
+  });
+
+  it("files a task under the phase of its id prefix when it sits under a heading the ledger does not know", async () => {
+    const { h, ledger } = await setup();
+    const text = ["### Phase 9.9: Elsewhere", "", "**Tasks**", "- **1.2.2** Extra work", "  Writes: `src/d.ts`", ""].join("\n");
+    const r = h.compiler.addTasks(ledger, text);
+    expect(r.tasks.map((t) => [t.id, t.phase])).toEqual([["1.2.2", "1.2"]]);
+    expect(r.edges.map((e) => `${e.from}>${e.to}`)).toContain("gate:1.1>1.2.2");
+    expect(r.edges.some((e) => e.from === "gate:9.9")).toBe(false);
+  });
+
+  it("merges a fragment's phase dependencies with the ledger's without repeating them", async () => {
+    const { h, ledger } = await setup();
+    const text = ["### Phase 1.1: First", "", "### Phase 1.2: Second", "Depends on: 1.1", "", "**Tasks**", "- **1.2.2** Extra work", "  Writes: `src/d.ts`", ""].join("\n");
+    const r = h.compiler.addTasks(ledger, text);
+    expect(r.tasks.map((t) => [t.id, t.phase])).toEqual([["1.2.2", "1.2"]]);
+    expect(r.edges.filter((e) => e.from === "gate:1.1" && e.to === "1.2.2")).toHaveLength(1);
+  });
+
+  it("gives a new task the gate edge of a dependency only the fragment declares", async () => {
+    const { h, ledger } = await setup();
+    const detached = { ...ledger, phases: ledger.phases.map((p) => ({ ...p, dependsOn: [] })) };
+    const text = ["### Phase 1.1: First", "", "### Phase 1.2: Second", "Depends on: 1.1", "", "**Tasks**", "- **1.2.2** Extra work", "  Writes: `src/d.ts`", ""].join("\n");
+    const r = h.compiler.addTasks(detached, text);
+    expect(r.edges.filter((e) => e.from === "gate:1.1" && e.to === "1.2.2")).toHaveLength(1);
+    const plain = h.compiler.addTasks(detached, frag("- **1.2.2** Extra work", "  Writes: `src/d.ts`"));
+    expect(plain.edges.some((e) => e.from === "gate:1.1" && e.to === "1.2.2")).toBe(false);
+  });
+
+  it("links a new task past a finished tests stage to the successors that can still wait", async () => {
+    const { h, ledger } = await setup();
+    const base = ledger.tasks["1.2.1"] as TaskNode;
+    const empty = { ...base.footprint, writes: [], reads: [] };
+    const stage = (from: string, to: string) => ({ from, to, kind: "structural" as const, confidence: "high" as const, evidence: "stage" });
+    const staged = {
+      ...ledger,
+      tasks: {
+        ...ledger.tasks,
+        "1.2.3": { ...base, id: "1.2.3", footprint: empty, state: "done" as const },
+        "1.2.TESTS": { ...base, id: "1.2.TESTS", kind: "tests" as const, footprint: empty, state: "done" as const },
+        "1.2.QA": { ...base, id: "1.2.QA", kind: "qa" as const, footprint: empty, state: "pending" as const },
+      },
+      // 1.2.9 is a stale edge target that is no longer a task of the ledger
+      edges: [...ledger.edges, stage("1.2.1", "1.2.TESTS"), stage("1.2.TESTS", "1.2.3"), stage("1.2.TESTS", "1.2.9"), stage("1.2.TESTS", "1.2.QA"), stage("1.2.3", "1.2.QA")],
+    };
+    const r = h.compiler.addTasks(staged, frag("- **1.2.2** Extra work", "  Writes: `src/d.ts`"));
+    const keys = r.edges.map((e) => `${e.from}>${e.to}`);
+    expect(keys).toContain("1.2.2>1.2.QA");
+    expect(r.edges.find((e) => e.from === "1.2.2" && e.to === "1.2.QA")?.kind).toBe("structural");
+    expect(keys).not.toContain("1.2.2>1.2.TESTS");
+    expect(keys).not.toContain("1.2.2>1.2.3");
+    expect(keys).not.toContain("1.2.2>1.2.9");
+    expect(r.reopened).toEqual([]);
+  });
+
+  it("rejects a gate edge from a phase only the fragment knows", async () => {
+    const { h, ledger } = await setup();
+    const text = ["### Phase 9.8: Elsewhere", "", "### Phase 1.2: Second", "Depends on: 9.8", "", "**Tasks**", "- **1.2.2** Extra work", "  Writes: `src/d.ts`", ""].join("\n");
+    let caught: unknown;
+    try {
+      h.compiler.addTasks(ledger, text);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ExecutorError);
+    const err = caught as ExecutorError;
+    expect(err.code).toBe("E_INVALID_INPUT");
+    // the gate reaches every source of phase 1.2; the first one met is refused
+    expect(err.message).toMatch(/^edge gate:9\.8 -> 1\.2\.[12] names a phase that is not in the ledger$/);
+    expect(err.detail).toMatchObject({ from: "gate:9.8" });
+  });
+
+  it("adds next to a ledger task that has no phase", async () => {
+    const { h, ledger } = await setup();
+    const loose = { ...ledger, tasks: { ...ledger.tasks, "1.1.1": { ...(ledger.tasks["1.1.1"] as TaskNode), phase: null } } };
+    const r = h.compiler.addTasks(loose, frag("- **1.2.2** Extra work", "  Writes: `src/d.ts`"));
+    expect(r.tasks.map((t) => [t.id, t.phase])).toEqual([["1.2.2", "1.2"]]);
+    expect(r.edges.some((e) => e.from === "1.1.1" || e.to === "1.1.1")).toBe(false);
+  });
+
   it("reopens a ready task that must now wait for a new one", async () => {
     const { h, ledger } = await setup();
     const ready = { ...ledger, tasks: { ...ledger.tasks, "1.2.1": { ...(ledger.tasks["1.2.1"] as TaskNode), state: "ready" as const } } };
@@ -305,6 +439,33 @@ describe("mergeResidue", () => {
     expect(h.compiler.validate(m.draft)).toEqual([]);
     expect(m.draft.edges.some((e) => e.kind === "conflict")).toBe(true);
   });
+
+  it("refuses a merge whose result breaks the ledger and lists both kinds of violation", async () => {
+    const h = makeHarness({ inline: { "resid.md": PLAN } });
+    const r = await h.compiler.compile(planPathOf("resid.md"), compileOpts(h));
+    const digest = residueDigestOf(r.draft.planDigest, r.residueRequest?.taskIds ?? []);
+    const answer = JSON.stringify({
+      requestDigest: digest,
+      footprints: [{ taskId: "1.1.1", writes: ["src/x.ts"], reads: [], evidence: "found" }],
+      edges: [],
+      noChange: ["1.1.2"],
+    });
+    const broken = { ...r.draft, repo: { ...r.draft.repo, baseCommit: "not-a-commit" } };
+    let caught: unknown;
+    try {
+      h.compiler.mergeResidue(broken, answer);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ExecutorError);
+    const err = caught as ExecutorError;
+    expect(err.code).toBe("E_RESIDUE");
+    expect(err.message).toBe("the merged residue leaves an invalid plan");
+    const detail = err.detail as { code: string; violations: Array<{ code: string; taskIds: string[] }>; ledger: string[] };
+    expect(detail.code).toBe("residue-invalid");
+    expect(detail.violations.map((v) => v.code)).toContain("ledger:git-id");
+    expect(detail.ledger).toContain("git-id at $.repo.baseCommit");
+  });
 });
 
 describe("shared context", () => {
@@ -337,6 +498,80 @@ describe("shared context", () => {
     const cut = await h.compiler.compile(planPathOf("ctx.md"), compileOpts(h, { config: cap }));
     expect(cut.draft.sharedContext.length).toBeLessThanOrEqual(40);
     expect(cut.summary.warnings.some((w) => w.startsWith("shared-context-truncated"))).toBe(true);
+  });
+});
+
+describe("compile routing fields", () => {
+  it("takes the tier from the engine route line when the annotation carries no valid tier", async () => {
+    const h = makeHarness({ inline: { "simple.md": SIMPLE_PLAN } });
+    const base = stubAnnotate();
+    const annotate: CompilerDeps["annotate"] = async (steps) => {
+      const plan = await base(steps);
+      for (const s of plan) {
+        Reflect.set(s, "tier", "auto");
+        Reflect.set(s, "routeLine", "[route class=implement risk=low scope=single d=none tier=heavy]");
+      }
+      return plan;
+    };
+    const c = createPlanCompiler({ ...h.deps, annotate });
+    const r = await c.compile(planPathOf("simple.md"), compileOpts(h));
+    const t = r.draft.tasks["1.1.1"];
+    expect(t?.route.tier).toBe("heavy");
+    expect(t?.route.role).toBe("role-heavy");
+    expect(t?.route.line).toContain("tier=heavy");
+  });
+});
+
+describe("compile self-check", () => {
+  it("refuses a draft that breaks the ledger schema and names the ledger violation", async () => {
+    const h = makeHarness({ inline: { "twophase.md": TWO_PHASES } });
+    const git = { run: async (args: readonly string[], cwd: string): Promise<{ code: number; stdout: string }> => (args.join(" ") === "rev-parse HEAD" ? { code: 0, stdout: "not-a-commit\n" } : h.deps.git.run(args, cwd)) };
+    const c = createPlanCompiler({ ...h.deps, git });
+    const e = await rejection(c.compile(planPathOf("twophase.md"), compileOpts(h)));
+    expect(e.code).toBe("E_COMPILE");
+    expect(e.message).toMatch(/^compiled draft is invalid: /);
+    const detail = e.detail as { code: string; line: number; violations: Array<{ code: string; message: string; taskIds: string[] }>; ledger: string[] };
+    expect(detail.code).toBe("draft-invalid");
+    expect(detail.line).toBe(0);
+    expect(detail.violations.map((v) => v.code)).toContain("ledger:git-id");
+    expect(detail.ledger).toContain("git-id at $.repo.baseCommit");
+    const first = detail.violations[0];
+    expect(e.message).toBe(`compiled draft is invalid: ${first?.code}: ${first?.message}`);
+  });
+});
+
+describe("shared context roots", () => {
+  const ctxPlan = (...context: string[]): string =>
+    ["# Plan", "", "<!-- plan-context -->", ...context, "<!-- /plan-context -->", "", "### Phase 1.1: First", "", "**Tasks**", "- **1.1.1** Do it", "  Writes: `src/a.ts`", ""].join("\n");
+
+  it("replaces a root that is not followed by a separator with a bare placeholder", async () => {
+    const h = makeHarness({ inline: { "ctx.md": ctxPlan("Repo lives at D:\\fake\\repo today.") }, view: { toplevel: "D:\\fake\\repo", worktrees: ["D:\\fake\\repo"] } });
+    const r = await h.compiler.compile(planPathOf("ctx.md"), compileOpts(h));
+    expect(r.draft.sharedContext).toContain("Repo lives at <worktree> today.");
+  });
+
+  it("replaces UNC and posix worktree roots and keeps their separator style", async () => {
+    const h = makeHarness({
+      inline: { "ctx.md": ctxPlan("UNC \\\\host\\share\\wt\\x.ts and posix /srv/wt/y.ts end") },
+      view: { toplevel: "D:\\fake\\repo", worktrees: ["D:\\fake\\repo", "\\\\host\\share\\wt", "/srv/wt"] },
+    });
+    const r = await h.compiler.compile(planPathOf("ctx.md"), compileOpts(h));
+    expect(r.draft.sharedContext).toContain("UNC <worktree>\\x.ts and posix <worktree>/y.ts end");
+  });
+
+  it("does not split a surrogate pair when the cap falls inside it on a single line", async () => {
+    const h = makeHarness({ inline: { "ctx.md": ctxPlan(`${"x".repeat(39)}\u{1F600}tail`) } });
+    const cap = { ...h.config, sharedContextChars: 40 };
+    const r = await h.compiler.compile(planPathOf("ctx.md"), compileOpts(h, { config: cap }));
+    expect(r.draft.sharedContext).toBe("x".repeat(39));
+    expect(r.summary.warnings).toContain("shared-context-truncated: shared context cut to 39 of 45 chars");
+  });
+
+  it("ignores a worktree root that has no path segment", async () => {
+    const h = makeHarness({ inline: { "ctx.md": ctxPlan("keep a/b and \\c\\d as they are") }, view: { toplevel: "D:\\fake\\repo", worktrees: ["D:\\fake\\repo", "/", "\\"] } });
+    const r = await h.compiler.compile(planPathOf("ctx.md"), compileOpts(h));
+    expect(r.draft.sharedContext).toContain("keep a/b and \\c\\d as they are");
+    expect(r.draft.sharedContext).not.toContain("<worktree>");
   });
 });
 
