@@ -380,7 +380,22 @@ Everything else is work: resolve it, record it, continue.
 
 ## 7. Live state (§0.11 — keep current)
 
-**NEXT ACTION (2026-10-12 ≈12:45): fix phase `pdf1-1` → re-switch `cpx/df1.1`, then Wave 3.** DF-1 ran on `cpx/df1`
+**NEXT ACTION (2026-10-12 ≈16:30): DF-1.1 re-switch — waiting for the owner restart; then the DF-1.1 self-check and
+re-probes (DF1.4.a with `df1.1`, c runner criterion, d, e), then Wave 3.** `cpx/pdf1-1` merged into `cpx/main` as
+`9fa7607` (DF1.QA rounds 1-3 closed; record in `dogfood.md`). Tag `cpx/df1.1` = `9fa7607`, pushed. Worktree
+`D:\git\omr-cpx-dogfood-df1.1` (detached at `cpx/df1.1`, `npm ci` done, clean). Switch: the copy
+`$env:LOCALAPPDATA\omr-cpx\opencode-config\opencode.json` regenerated from the current global `opencode.json`, only the
+router entry changed to `D:\\git\\omr-cpx-dogfood-df1.1`; directory entries match the global ones except the 0.P.3.f
+exclusions (`.git`, backups `*.bak*`, `opencode - Copia pre v2.json`, `rich-footer-backup-*`, lock/`nul` files);
+hard-linked files equal their originals. Override `pendingTtlMs` unchanged. Launch: the command below with
+`-s ses_ecf5bd114ffe5QT3S5xVTAQcF4`. Revert: drain holds (`router_verify pending:true`), set the copy's router entry back
+to `D:\\git\\omr-cpx-dogfood-df1`, relaunch. Wave 3 is prepared: design memos 3.1.1 and 3.2.1 in
+`$env:TEMP\omr-evidence\memo-3.1.md` / `memo-3.2.md` (to paste into `phase-3.1.md` / `phase-3.2.md`); worktrees
+`p31`/`p32` are created from `cpx/main` @ `9fa7607` after the restart. Unjudged handles `vrf_e7dbd395…`,
+`vrf_8bd03f89…`, `vrf_ef89f090…` (pdf1-1 fixes): the router never judged them (gate timeout / slot busy); verified
+independently by the orchestrator (`dogfood.md`); they expire with the restart.
+
+*(superseded)* **NEXT ACTION (2026-10-12 ≈12:45): fix phase `pdf1-1` → re-switch `cpx/df1.1`, then Wave 3.** DF-1 ran on `cpx/df1`
 (server run `27717102`, orchestrator session `ses_ecf5bd114ffe5QT3S5xVTAQcF4`): DF1.4.a/b/f/h pass, c (runner
 criterion)/d/e re-probe on `cpx/df1.1`; faults DF-1-1..DF-1-11 and DF1.QA round 1 (15 findings, all dispositioned) in
 `docs\qa\critical-path-execution\dogfood.md`. The plan continues on df1 under the **binding workaround** recorded
