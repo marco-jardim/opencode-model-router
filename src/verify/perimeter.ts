@@ -30,6 +30,7 @@ import { permissionMatches } from "../router/read-only";
 import { routedRoleOf } from "../routing/wire/dispatch";
 import { workingSetOf } from "../routing/wire/working-set";
 import type { DispatchPerimeter, PerimeterSeed } from "./dispatch";
+import { workspacePatterns } from "./edges";
 import { depthBelow, gitTopOf, perimeterKey } from "./git-top";
 import { isStoreLikeLink } from "./reference";
 
@@ -298,19 +299,12 @@ async function readManifest(dir: string): Promise<Record<string, unknown> | unde
   }
 }
 
-function workspacePatterns(manifest: Record<string, unknown>): string[] {
-  const field = manifest.workspaces;
-  const packages = typeof field === "object" && field !== null && !Array.isArray(field)
-    ? (field as { packages?: unknown }).packages
-    : field;
-  return Array.isArray(packages) ? packages.filter((entry): entry is string => typeof entry === "string") : [];
-}
-
 /**
  * The directories of one `workspaces` pattern, inside W only: literal segments, and a wildcard (`*`, `**`) in the last segment
  * only, matched one level deep. Negations, absolute paths, `..` and inner wildcards give none. At most `limit` directories.
+ * Exported for the agreement test with its synchronous twin, edges.ts `workspaceDirsSync` (P3c.1).
  */
-async function workspaceDirs(w: string, pattern: string, limit: number): Promise<string[]> {
+export async function workspaceDirs(w: string, pattern: string, limit: number): Promise<string[]> {
   if (pattern.startsWith("!") || path.isAbsolute(pattern) || /^[\\/]/.test(pattern)) return [];
   const segments = pattern.split(/[\\/]/).filter((segment) => segment !== "" && segment !== ".");
   if (segments.length === 0 || segments.some((segment) => segment === "..")) return [];
