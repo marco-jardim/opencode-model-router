@@ -60,8 +60,8 @@ const state = vi.hoisted(() => ({
   queues: 0,
   /** P2e: the cwd of every planStaticScoping call (the deferred finish's static scoping). */
   scopingCwds: [] as string[],
-  /** P2e: the scopingPlan every assessRisk call received. */
-  scopingPlans: [] as import("../../src/verify/runner").StaticScoping[],
+  /** P2e: the scopingPlan every assessRisk call received (a scoped plan, S6, or the neutral full-scope plan). */
+  scopingPlans: [] as (import("../../src/verify/runner").StaticScoping | import("../../src/verify/risk").FullScopePlan)[],
 }));
 
 vi.mock("../../src/verify/risk", async importOriginal => {

@@ -956,7 +956,7 @@ describe("deferred P (P2e)", () => {
   it("P2e QA-1 #1: a working-set consumer past the cap is still discovered at router_verify (D6)", async () => {
     watchPlugin();
     extraRoots(PERIMETER_MAX);
-    // The consumer is the (PERIMETER_MAX + 1)th working-set root: past the cap, a fixed "unobserved" root.
+    // The consumer is the (PERIMETER_MAX + 1)th working-set root: past the cap, a fixed "unobserved" root (the planner keeps it).
     const consumer = path.join(parent, "consumer-c");
     const consumerLink = path.join(consumer, "node_modules", "app-a");
     fs.mkdirSync(path.dirname(consumerLink), { recursive: true });
@@ -966,7 +966,9 @@ describe("deferred P (P2e)", () => {
       routeAsRole(location(repo, "app-a"));
       const hooks = await makePlugin();
       await pin(repo);
-      const handle = handleIn(await runTask(hooks, `Implement it.\n${DEFERRED_DOD}`, async () => {
+      // scope=full: the producer changed index.ts, and scoping this fixture's `node --version` test script is unsupported (S6).
+      const dod = DEFERRED_DOD.replace('command="npm test"', 'command="npm test" scope=full');
+      const handle = handleIn(await runTask(hooks, `Implement it.\n${dod}`, async () => {
         fs.writeFileSync(path.join(repo, "index.ts"), "export const v = 1;\n");
         await pin(repo);
       }));
