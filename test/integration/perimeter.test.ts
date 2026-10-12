@@ -263,6 +263,32 @@ describe("the verification perimeter of a cross-repo role dispatch (P1.8)", () =
     expect(artefacts()[0]?.perimeter?.roots[0]?.status).toBe("unchanged");
   }, 60_000);
 
+  // Cross-repo 3b.5: router_git_* are non-writing by exact name (src/verify/dispatch.ts READ_ONLY_ROUTER_TOOLS), with `root` too.
+  const GIT_TOOLS = ["router_git_status", "router_git_log", "router_git_diff", "router_git_show", "router_git_blame", "router_git_ls_files"];
+
+  it("3b.5: router_git_* with root into lib-b (in P) is no unattributable writer: lib-b changed adds no I4 and no I5 caveat", async () => {
+    const hooks = await crossRepo();
+    const out = await runTask(hooks, `Implement it.\n${SYNC_DOD}`, async (h, sid) => {
+      for (const tool of GIT_TOOLS) await runTool(h, sid, tool, { root: lib });
+      await changeLib();
+    });
+    expect(out).not.toMatch(ANY_I4);
+    expect(out).not.toMatch(I5_CAVEAT);
+    expect(out).toContain("✓ verified");
+    expect(artefacts()[0]?.perimeter?.roots.map(root => [root.name, root.status])).toEqual([["lib-b", "changed"]]);
+  }, 60_000);
+
+  it("3b.5: router_git_* with root into lib-b (in P), nothing changed: no I5 caveat, no I4", async () => {
+    const hooks = await crossRepo();
+    const out = await runTask(hooks, `Implement it.\n${SYNC_DOD}`, async (h, sid) => {
+      for (const tool of GIT_TOOLS) await runTool(h, sid, tool, { root: lib });
+    });
+    expect(out).not.toMatch(I5_CAVEAT);
+    expect(out).not.toMatch(ANY_I4);
+    expect(out).toContain("✓ verified");
+    expect(artefacts()[0]?.perimeter?.roots[0]?.status).toBe("unchanged");
+  }, 60_000);
+
   it("I9-inert: a role dispatch with no location and no working set takes no extra snapshot; its output is a plain dispatch's", async () => {
     const plainHooks = await makePlugin();
     await pin(repo);
