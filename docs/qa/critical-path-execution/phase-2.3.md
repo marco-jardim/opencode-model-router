@@ -671,10 +671,62 @@ These files also cover `validate`, `estimate` and `index`, so the `src/executor`
 
 ## Findings
 
+| Round | Findings | Status |
+|---|---|---|
+| 1 | 17 (QA-2.3-1 to -17) | Fixed in `fa8da92` (the commit lists the fixes by topic, not by id). |
+| 2 | 15 (QA-2.3-18 to -32) | Fixed in `6ee2f6a` (names -18 to -27 and -29 to -32; -28 is not named in the commit message); coverage follow-up `3872d0a`. |
+| 3 | 1 (major) | QA-2.3-33: fixed in commit `6d1c994`. |
+
+Round 3 closed with no open finding.
+
 ## Fixes
+
+- QA-2.3-33 (round 3, major): fixed in commit `6d1c994`.
+- Round 1, `fa8da92`: unresolved writes kept or made top, addTasks resolves ledger references and rejects out-of-repo writes and passed gates, corrected ownership fallback, residue limited to asked tasks, exact real-plan assertions, linear top conflicts, dependency clauses, metadata-block ids, inline-code labels, commented graphs, case flag per repository, more write verbs, normalized residue comparison, directory keys, input validation and plan ids.
+- Round 2, `6ee2f6a`: writes only from real write evidence (-18), added tasks inherit their phase's prerequisites (-19), reads of untracked files (-20), run-scoped references (-21/-25/-26), addTasks fails closed on unresolved references (-22), URLs never written (-23), exact Order edges (-24), clause ends and labels (-27/-31), case flag in merged-first (-29), ownership rows for new dirs (-30), contract detection on files only (-32); `3872d0a` covers the remaining branches.
+- Coverage top-up, commit `ca5cb81` (tests only): `estimate.ts` branches were 81.25 and `index.ts` branches 87.3 before it; both now pass the gate (see Coverage).
+
+## Coverage
+
+Orchestrator, 2026-10-12: `npx vitest run --coverage` on `test/unit/executor-compile*`; 570 tests passed. CI gate per file: 90/90/90 on `src/executor/`.
+
+| File | Statements | Branches | Functions | Lines |
+|---|---|---|---|---|
+| `edges.ts` | 99.16 | 93 | 100 | 100 |
+| `estimate.ts` | 100 | 97.5 | 100 | 100 |
+| `footprint.ts` | 97.3 | 93.51 | 100 | 98.86 |
+| `index.ts` | 97.69 | 92.46 | 97.97 | 99.58 |
+| `parse.ts` | 96.45 | 90.09 | 100 | 98.32 |
+| `residue.ts` | 99.77 | 98.93 | 100 | 100 |
+| `validate.ts` | 96.85 | 90.44 | 100 | 97.93 |
+
+- Every file is above the gate.
+- Thin margins over the 90 gate: `parse.ts` branches at 90.09 and `validate.ts` branches at 90.44. A small change in either file can drop it below the gate.
+- The top-up commit `ca5cb81` (tests only) raised `estimate.ts` branches from 81.25 and `index.ts` branches from 87.3.
+
+## Approved extensions
+
+- Ownership fallback is reported as `inferred` plus an `ownership-assumed` diagnostic.
+- New files in another worktree.
+- Synchronous `addTasks`.
+
+All three are covered by plan amendment A-2.3-1.
 
 ## Deferred findings
 
+- No finding is deferred to a later phase. Items for later phases are listed under Handoffs.
+
 ## Handoffs
 
+- 3.1.4: rewrite worktree-root paths in `task.text` to the slot when rendering through `formatLaunchPrompt`; path rewrite.
+- 4.2: read `fixTemplate` via `parsePlan`.
+- 3.2: `.post` phases (the synthetic `.post` phase for post-QA tasks, design memo §11).
+- 3.1 and 4.1: edges depend on `crossPhase`. If approval changes it, recompile and journal `draft-replaced`.
+
+## Plan amendments
+
+- **A-2.3-1** covers the approved extensions: the `inferred` ownership fallback with the `ownership-assumed` diagnostic, new files in another worktree, and synchronous `addTasks`. The orchestrator applies it in `cpx/main`.
+
 ## Verdict
+
+Done, pending merge into `cpx/main`.
