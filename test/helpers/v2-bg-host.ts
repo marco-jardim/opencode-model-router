@@ -114,6 +114,9 @@ export interface NativeSubagentCall {
   args: Record<string, unknown>;
   agent: unknown;
   sessionID: unknown;
+  /** QA-PDF12-5: the message and call ids of the tool context (what a host attaches a permission prompt to). */
+  messageID: unknown;
+  callID: unknown;
 }
 
 export interface NativeSubagentStub {
@@ -212,8 +215,10 @@ export async function bootBgHost(options: BootOptions = {}): Promise<BgHost> {
   const nativeTools = stub === undefined ? {} : {
     list: async () => [{
       id: "subagent",
-      execute: async (args: Record<string, unknown>, toolContext: { agent?: unknown; sessionID?: unknown }) => {
-        const call: NativeSubagentCall = { args, agent: toolContext.agent, sessionID: toolContext.sessionID };
+      execute: async (args: Record<string, unknown>, toolContext: { agent?: unknown; sessionID?: unknown; messageID?: unknown; id?: unknown }) => {
+        const call: NativeSubagentCall = {
+          args, agent: toolContext.agent, sessionID: toolContext.sessionID, messageID: toolContext.messageID, callID: toolContext.id,
+        };
         stub.calls.push(call);
         if (stub.respond !== undefined) return stub.respond(call);
         throw new Error(`Tool.Error: Subagent denied: ${String(args.agent)}`);

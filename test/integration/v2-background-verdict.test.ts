@@ -252,6 +252,46 @@ describe("DF-1.1-1 a background completion's grader launches as the caller agent
       expect(launched.sessionID).toBe(ORCH);
     }
   }, 30_000);
+
+  it("QA-PDF12-5/-9 under a caller `subagent: ask` rule, every prompt a grader launch raises carries the dispatch's real message and call ids, as the attempt's caller (not the parent's current agent)", async () => {
+    process.env.MODEL_ROUTER_ENFORCE = "1";
+    // The host asks before every `subagent` call of the caller (an `ask` rule): it records the prompt it raises, then the user rejects it.
+    const prompts: Array<{ messageID: unknown; callID: unknown; agent: unknown }> = [];
+    const stub: NativeSubagentStub = {
+      calls: [],
+      respond: async (launched) => {
+        prompts.push({ messageID: launched.messageID, callID: launched.callID, agent: launched.agent });
+        throw new Error("Tool.Error: Subagent denied: the user rejected the permission prompt");
+      },
+    };
+    const h = await bootBgHost({
+      overrides: { routing: { background: { mode: "auto" }, leases: { mode: "off" } } },
+      // The parent runs another agent by the time the child ends: only the attempt's own caller yields `build`.
+      sessions: { [ORCH]: { agent: "plan" }, [CHILD]: { parentID: ORCH } },
+      nativeSubagent: stub,
+    });
+    bg = h;
+    execFileSync("git", ["init", "-q"], { cwd: h.project });
+    h.emit({ type: "session.created", id: `ev-created-${CHILD}`, created: 1, data: { sessionID: CHILD, parentID: ORCH } });
+    await h.drain();
+    const call = await h.before({
+      sessionID: ORCH, agent: "build", messageID: "m-pdf125", id: "call-pdf125-bg", tool: "subagent",
+      input: { agent: "fast", description: "explain the parser", prompt: criteriaPrompt, background: true },
+    });
+    const running = { output: { sessionID: CHILD, status: "running", output: "Working in the background" }, content: "Working in the background", metadata: { sessionID: CHILD } };
+    await h.after({ ...call, status: "completed", result: running });
+    await h.settled();
+    h.childContext.set(CHILD, [{ role: "assistant", content: [{ type: "text", text: "The parser starts in parse()." }], finish: "stop", time: { created: 1, completed: 2 } }]);
+    h.emit({ type: "session.execution.succeeded", id: `ev-end-${CHILD}-succeeded`, created: 2, data: { sessionID: CHILD } });
+    await h.drain();
+    await vi.waitFor(() => expect(prompts.length).toBeGreaterThan(0), { timeout: 25_000 });
+    await h.settled();
+    for (const prompt of prompts) {
+      expect(prompt.messageID).toBe("m-pdf125");
+      expect(prompt.callID).toBe("call-pdf125-bg");
+      expect(prompt.agent).toBe("build");
+    }
+  }, 30_000);
 });
 
 type Launched = { parentSessionID?: string };

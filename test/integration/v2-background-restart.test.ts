@@ -288,7 +288,10 @@ describe("DF-1.1-1: the caller (orchestrator) agent survives the journal, so a c
       expect(record.callerAgent).toBe("build");
       expect(record.agent).toBe("fast");
     }
-    for (const record of journalRecords(h).filter((r) => r.kind === "hold" && r.callID === "call-df111-live")) expect(record.callerAgent).toBe("build");
+    // QA-PDF12-2: the dispatch is held (verification required), and its hold journals the caller next to the dispatched agent.
+    const holds = journalRecords(h).filter((r) => r.kind === "hold" && r.callID === "call-df111-live");
+    expect(holds.length).toBeGreaterThan(0);
+    for (const record of holds) expect(record.callerAgent).toBe("build");
   });
 
   it("an old journal entry without the field (inflight and hold) still loads and settles once", async () => {
@@ -381,7 +384,8 @@ describe("DF-1.1-1: a restored held completion's grader launches as the journale
     const moved = (line: string): string => homesA.reduce((text, homeA) => text.split(escaped(homeA)).join(escaped(homeB)), line);
     const journalText = kept.map((record) => `${moved(JSON.stringify(record))}\n`).join("");
     const secondStub: NativeSubagentStub = { calls: [] }; // answers with the host's denial
-    const b = await bootBgHost({ home: homeB, overrides, sessions, journalText, nativeSubagent: secondStub });
+    // QA-PDF12-1: B's parent runs another agent now (`plan`), so only the journaled caller can yield `build`.
+    const b = await bootBgHost({ home: homeB, overrides, sessions: { ...sessions, [ORCH]: { agent: "plan" } }, journalText, nativeSubagent: secondStub });
     host = b;
     execFileSync("git", ["init", "-q"], { cwd: b.project });
     adoptOrchestrator(b);
@@ -392,6 +396,118 @@ describe("DF-1.1-1: a restored held completion's grader launches as the journale
       expect(launched.agent).toBe("build");
       expect(launched.sessionID).toBe(ORCH);
     }
+  }, 60_000);
+});
+
+describe("QA-PDF12-1/-2: after a restart, the grader launches as the caller on either recovery path, even for an old entry", () => {
+  const criteriaPrompt = ["Explain the parser.", "", "[acceptance]", "criteria: the explanation names the parser's entry point", "[/acceptance]"].join("\n");
+  const overrides = { routing: { background: { mode: "auto" }, leases: { mode: "off" } } };
+  const sessionsA = { [ORCH]: { agent: "build" }, [CHILD]: { parentID: ORCH }, [EVENT_CHILD]: { parentID: ORCH } };
+  const childDone = [{ role: "assistant", content: [{ type: "text", text: "The parser starts in parse()." }], finish: "stop", time: { created: 1, completed: 2 } }];
+  const readJournal = (path: string): Array<Record<string, unknown>> =>
+    readFileSync(path, "utf8").split("\n").filter((line) => line.trim() !== "").map((line) => JSON.parse(line) as Record<string, unknown>);
+  const denied = (): Error => new Error("Tool.Error: Subagent denied: model-router-grader");
+
+  /**
+   * Process A: a held background `fast` dispatch from `build` whose grader never answers, so A dies with the gate cut. Process
+   * B, whose parent session runs `plan` by now, adopts A's journal. `keepInflight`: B recovers through the `inflight` record
+   * (the completion processor's finish); otherwise through the restored hold. `oldEntry`: the records lose their caller fields
+   * (a journal written before they existed). Returns B's grader launches and B's journal.
+   */
+  const restart = async (callID: string, opts: { keepInflight: boolean; oldEntry: boolean }) => {
+    process.env.MODEL_ROUTER_ENFORCE = "1";
+    let released = false;
+    const waiting: Array<(error: Error) => void> = [];
+    const firstStub: NativeSubagentStub = {
+      calls: [],
+      respond: () => (released ? Promise.reject(denied()) : new Promise((_resolve, reject) => { waiting.push(reject); })),
+    };
+    const a = await bootBgHost({ overrides, sessions: sessionsA, nativeSubagent: firstStub });
+    host = a;
+    execFileSync("git", ["init", "-q"], { cwd: a.project });
+    a.emit({ type: "session.created", id: `ev-created-${CHILD}`, created: 1, data: { sessionID: CHILD, parentID: ORCH } });
+    await a.drain();
+    const call = await a.before({
+      sessionID: ORCH, agent: "build", messageID: `m-${callID}`, id: callID, tool: "subagent",
+      input: { agent: "fast", description: "explain the parser", prompt: criteriaPrompt, background: true },
+    });
+    const running = { output: { sessionID: CHILD, status: "running", output: "Working in the background" }, content: "Working in the background", metadata: { sessionID: CHILD } };
+    await a.after({ ...call, status: "completed", result: running });
+    await a.settled();
+    a.childContext.set(CHILD, childDone);
+    a.emit({ type: "session.execution.succeeded", id: `ev-end-${CHILD}-succeeded`, created: 2, data: { sessionID: CHILD } });
+    await a.drain();
+    let snapshot: Array<Record<string, unknown>> = [];
+    await vi.waitFor(() => {
+      expect(firstStub.calls.length).toBeGreaterThan(0);
+      snapshot = readJournal(a.journalPath);
+      const hold = snapshot.find((r) => r.kind === "hold" && r.callID === callID);
+      expect(hold).toBeDefined();
+      expect(snapshot.some((r) => r.kind === "inflight" && r.callID === callID)).toBe(true);
+      expect(snapshot.some((r) => r.kind === "hold-text" && r.handle === hold?.handle)).toBe(true);
+      expect(snapshot.some((r) => r.kind === "entry" && r.callID === callID)).toBe(true);
+    }, { timeout: 25_000 });
+    // Both records carry the caller (agent and message) as A journaled them.
+    for (const record of snapshot.filter((r) => (r.kind === "inflight" || r.kind === "hold") && r.callID === callID)) {
+      expect(record.callerAgent).toBe("build");
+      expect(record.callerMessageID).toBe(`m-${callID}`);
+    }
+    // A dies before it journals `processed`; what it journaled until now is what B gets.
+    const withoutCaller = (record: Record<string, unknown>): Record<string, unknown> => {
+      if (!opts.oldEntry) return record;
+      return Object.fromEntries(Object.entries(record).filter(([key]) => key !== "callerAgent" && key !== "callerMessageID"));
+    };
+    const kept = snapshot.filter((r) => r.kind !== "processed" && (opts.keepInflight || r.kind !== "inflight")).map(withoutCaller);
+    released = true;
+    for (const reject of waiting.splice(0)) reject(denied());
+    await a.settled();
+    const homesA = [...new Set([a.home, realpathSync(a.home), realpathSync.native(a.home)].flatMap((p) => [p, p.replace(/\\/g, "/")]))]
+      .sort((x, y) => y.length - x.length);
+    await a.dispose();
+    host = undefined;
+    const homeB = mkdtempSync(join(tmpdir(), "omr-pdf12-restart-"));
+    const escaped = (path: string): string => JSON.stringify(path).slice(1, -1);
+    const moved = (line: string): string => homesA.reduce((text, homeA) => text.split(escaped(homeA)).join(escaped(homeB)), line);
+    const journalText = kept.map((record) => `${moved(JSON.stringify(record))}\n`).join("");
+    const secondStub: NativeSubagentStub = { calls: [] }; // answers with the host's denial
+    // B's parent runs another agent now (`plan`): only the journaled caller yields `build`.
+    const b = await bootBgHost({ home: homeB, overrides, sessions: { ...sessionsA, [ORCH]: { agent: "plan" } }, journalText, nativeSubagent: secondStub });
+    host = b;
+    execFileSync("git", ["init", "-q"], { cwd: b.project });
+    b.childContext.set(CHILD, childDone); // the child's finished history, which an `inflight` recovery reads
+    adoptOrchestrator(b);
+    await b.settled();
+    await vi.waitFor(() => expect(secondStub.calls.length).toBeGreaterThan(0), { timeout: 25_000 });
+    await b.settled();
+    return { calls: secondStub.calls, journal: readJournal(b.journalPath) };
+  };
+  /** The completion processor journals `processed` for what it finished: present only when the `inflight` path recovered it. */
+  const processedHere = (journal: ReadonlyArray<Record<string, unknown>>, callID: string): boolean =>
+    journal.some((r) => r.kind === "processed" && r.callID === callID && r.child === CHILD);
+
+  it("QA-PDF12-2 a kept `inflight` record recovers through the completion processor: its grader launches as the journaled caller, with the journaled message", async () => {
+    const callID = "call-pdf122-inflight";
+    const { calls, journal } = await restart(callID, { keepInflight: true, oldEntry: false });
+    expect(processedHere(journal, callID)).toBe(true);
+    for (const launched of calls) {
+      expect(launched.agent).toBe("build");
+      expect(launched.messageID).toBe(`m-${callID}`);
+      expect(launched.callID).toBe(callID);
+    }
+  }, 60_000);
+
+  it("QA-PDF12-1 an old `inflight` entry without its caller: the grader launches as the parent's current agent (`plan`), never undefined", async () => {
+    const callID = "call-pdf121-inflight";
+    const { calls, journal } = await restart(callID, { keepInflight: true, oldEntry: true });
+    expect(processedHere(journal, callID)).toBe(true);
+    for (const launched of calls) expect(launched.agent).toBe("plan");
+  }, 60_000);
+
+  it("QA-PDF12-1 an old hold without its caller (no `inflight`): the re-run grader launches as the parent's current agent (`plan`), never undefined", async () => {
+    const callID = "call-pdf121-hold";
+    const { calls, journal } = await restart(callID, { keepInflight: false, oldEntry: true });
+    expect(processedHere(journal, callID)).toBe(false);
+    for (const launched of calls) expect(launched.agent).toBe("plan");
   }, 60_000);
 });
 
@@ -418,6 +534,52 @@ describe("DF-1.1-1: the call claims are process-wide across module copies", () =
       b.dispose();
     }
   });
+});
+
+describe("QA-PDF12-6: two plugin instances of one process receive the same call", () => {
+  it("QA-PDF12-6 exactly one instance claims the call, and only its background decision reaches the input", async () => {
+    process.env.MODEL_ROUTER_ENFORCE = "1";
+    const overrides = { routing: { background: { mode: "auto" }, leases: { mode: "off" } } };
+    const criteriaPrompt = ["Explain the parser.", "", "[acceptance]", "criteria: the explanation names the parser's entry point", "[/acceptance]"].join("\n");
+    const records = (path: string): Array<Record<string, unknown>> => {
+      try {
+        return readFileSync(path, "utf8").split("\n").filter((line) => line.trim() !== "").map((line) => JSON.parse(line) as Record<string, unknown>);
+      } catch {
+        return [];
+      }
+    };
+    const owner = await bootBgHost({ overrides, sessions: { [ORCH]: { agent: "build" }, [CHILD]: { parentID: ORCH } } });
+    host = owner;
+    owner.emit({ type: "session.created", id: `ev-created-${CHILD}`, created: 1, data: { sessionID: CHILD, parentID: ORCH } });
+    await owner.drain();
+    // A second instance from another module copy (its own home): it sees ORCH as a child session, so on its own it keeps a
+    // verifying call in the foreground.
+    vi.resetModules();
+    const copy = await import("../helpers/v2-bg-host");
+    const second = await copy.bootBgHost({ overrides, sessions: { [ORCH]: { parentID: "ses_root_pdf126", agent: "build" }, [CHILD]: { parentID: ORCH } } });
+    try {
+      const input = { agent: "fast", description: "explain the parser", prompt: criteriaPrompt, background: true };
+      const alone = await second.before({ sessionID: ORCH, agent: "build", messageID: "m-pdf126-alone", id: "call-pdf126-alone", tool: "subagent", input: { ...input } });
+      expect((alone.input as Record<string, unknown>).background).toBe(false);
+      // The same call reaches both: the owner claims it first and sends it to the background.
+      const event = { sessionID: ORCH, agent: "build", messageID: "m-pdf126", id: "call-pdf126", tool: "subagent", input: { ...input } as unknown };
+      await owner.before(event);
+      expect((event.input as Record<string, unknown>).background).toBe(true);
+      // The second instance lost the claim: it leaves the owner's background flag as it found it.
+      await second.before(event);
+      expect((event.input as Record<string, unknown>).background).toBe(true);
+      const running = { output: { sessionID: CHILD, status: "running", output: "Working in the background" }, content: "Working in the background", metadata: { sessionID: CHILD } };
+      await owner.after({ ...event, status: "completed", result: structuredClone(running) });
+      await second.after({ ...event, status: "completed", result: structuredClone(running) });
+      await owner.settled();
+      await second.settled();
+      // Only the owner acknowledged and journaled the dispatch.
+      expect(records(owner.journalPath).filter((r) => r.kind === "inflight" && r.callID === "call-pdf126")).toHaveLength(1);
+      expect(records(second.journalPath).some((r) => r.kind === "inflight" && r.callID === "call-pdf126")).toBe(false);
+    } finally {
+      await second.dispose();
+    }
+  }, 30_000);
 });
 
 describe("QA-DF1-21: an adopted dispatch of this very process whose child is still running", () => {

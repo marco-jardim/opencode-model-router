@@ -182,6 +182,15 @@ export interface FinishInput {
 }
 
 /**
+ * QA-PDF12-9: the caller of the dispatch a completion finishes, from the attempt the completion processor holds (never a
+ * capped lookup by call id), so the finish seam runs the graders as that caller.
+ */
+export interface FinishCaller {
+  callerAgent?: string;
+  callerMessageID?: string;
+}
+
+/**
  * QA-2.1-17: the dispatch data journaled with an `inflight` and a `hold` record (field `dispatch`), from `FinishApi.dispatchOf`.
  * Any field may be missing (an older record, or a dispatch the plugin did not see).
  */
@@ -340,6 +349,11 @@ export interface CallRecord {
    * Absent for a record journaled before this field existed.
    */
   callerAgent?: string;
+  /**
+   * QA-PDF12-5: the id of the caller's message that made the `subagent` call, so the completion finish runs in a context with
+   * the call's real ids (never an empty message id). Absent for a record journaled before this field existed.
+   */
+  callerMessageID?: string;
   role?: string;
   description: string;
   verifying: boolean;
@@ -512,12 +526,13 @@ export function createInFlightRegistry(deps: {
       const claim = `bg:${rec.callID}`;
       if (claims.has(claim)) return false;
       claims.add(claim);
-      addBounded(own, claim, MAX_CLAIMS);
-      if (claims.size > MAX_CLAIMS) {
-        for (const old of claims) {
-          if (claims.size <= MAX_CLAIMS) break;
-          claims.delete(old);
-        }
+      own.add(claim);
+      // QA-PDF12-6: the cap is per owner. An instance evicts only its own oldest claims, never a live claim of another copy
+      // sharing the process-wide set (which is then bounded by MAX_CLAIMS per live instance).
+      for (const old of own) {
+        if (own.size <= MAX_CLAIMS) break;
+        own.delete(old);
+        claims.delete(old);
       }
       calls.set(rec.callID, rec);
       enforceBounds();
@@ -678,6 +693,8 @@ export interface HeldRecord {
   dispatch?: RestoredDispatch;
   /** DF-1.1-1: the CALLER agent of the dispatch, persisted so a restored hold launches its grader as the caller. Absent in an old entry. */
   callerAgent?: string;
+  /** QA-PDF12-5: the caller's message that made the dispatch, persisted with the hold. Absent in an old entry. */
+  callerMessageID?: string;
 }
 
 /** A restored hold whose verdict was being posted (`posting` without `posted`): re-post after a parent check (R21). */
@@ -700,6 +717,8 @@ export interface RestoredHold {
   dispatch: RestoredDispatch;
   /** DF-1.1-1: the caller agent journaled with the hold; absent for an older record. */
   callerAgent?: string;
+  /** QA-PDF12-5: the caller's message id journaled with the hold; absent for an older record. */
+  callerMessageID?: string;
   /** QA-2.1-17: a verdict the gate reached before the restart but never started posting: posted, never recomputed. */
   verdict?: StoredVerdict;
 }
@@ -1072,6 +1091,7 @@ export function createHeldResults(deps: {
             ...(rec.childText === undefined ? {} : { text: rec.childText }),
             ...(rec.dispatch === undefined ? {} : { dispatch: rec.dispatch }),
             ...(rec.callerAgent === undefined ? {} : { callerAgent: rec.callerAgent }),
+            ...(rec.callerMessageID === undefined ? {} : { callerMessageID: rec.callerMessageID }),
             at: now(),
           },
           { fsync: true },
@@ -1217,6 +1237,7 @@ export function createHeldResults(deps: {
             ...(typeof r.text === "string" ? { childText: r.text, body: r.text } : {}),
             ...(r.dispatch === undefined ? {} : { dispatch: restoredDispatchOf(r.dispatch) }),
             ...(typeof r.callerAgent === "string" && r.callerAgent !== "" ? { callerAgent: r.callerAgent } : {}),
+            ...(typeof r.callerMessageID === "string" && r.callerMessageID !== "" ? { callerMessageID: r.callerMessageID } : {}),
             active: true,
             posting: false,
             status: "verifying",
@@ -1265,6 +1286,7 @@ export function createHeldResults(deps: {
             ...(e.childText === undefined ? {} : { childText: e.childText }),
             dispatch: e.dispatch ?? {},
             ...(e.callerAgent === undefined ? {} : { callerAgent: e.callerAgent }),
+            ...(e.callerMessageID === undefined ? {} : { callerMessageID: e.callerMessageID }),
             ...(stored.has(e.handle) ? { verdict: stored.get(e.handle) } : {}),
           });
         }
@@ -1310,6 +1332,7 @@ export function createHeldResults(deps: {
           ...(e.label === undefined ? {} : { label: e.label }),
           ...(e.dispatch === undefined ? {} : { dispatch: e.dispatch }),
           ...(e.callerAgent === undefined ? {} : { callerAgent: e.callerAgent }),
+          ...(e.callerMessageID === undefined ? {} : { callerMessageID: e.callerMessageID }),
           at,
         });
         if (!e.active) {
@@ -1335,7 +1358,8 @@ export type Trigger =
   | { kind: "runner"; status: EndFact["outcome"]; text: string; at: number };
 
 export interface CompletionDeps {
-  finish: FinishApi["finish"];
+  /** `caller` (QA-PDF12-9): the caller journaled on the attempt being finished, for the context the finish runs in. */
+  finish(input: FinishInput, caller: FinishCaller): Promise<FinishResult>;
   /** The child's last assistant message (`ctx.session.context`, C7/O1). */
   readChildResult(child: string): Promise<{ outcome?: EndFact["outcome"]; text?: string } | undefined>;
   /** The `!running` half of `roleAfterCall` (§4.2): budget and authority notices, plus its evictions. */
@@ -1581,6 +1605,10 @@ export function createCompletionProcessor(reg: InFlightRegistry, deps: Completio
       ...(delta === undefined ? {} : { delta }),
       // QA-2.1-17: a recovery runs after a restart: the plugin rebuilds the gate inputs from the journaled dispatch.
       ...(trigger.kind === "recovery" ? { restored: restoredDispatchSafe(a) } : {}),
+    }, {
+      // QA-PDF12-9: the caller comes from the attempt itself, never from a capped call-id lookup a `forgetSession` may clear.
+      ...(a.callerAgent === undefined ? {} : { callerAgent: a.callerAgent }),
+      ...(a.callerMessageID === undefined ? {} : { callerMessageID: a.callerMessageID }),
     });
     releaseLeasesSafe(a.childSessionID);
     await markProcessed(a);
