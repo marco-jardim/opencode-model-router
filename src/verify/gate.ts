@@ -29,6 +29,7 @@ import { isAbsolute, resolve } from "node:path";
 import { isWithinDir, resolveBaseDir } from "./paths";
 import { toolLabel } from "./dispatch";
 import { perimeterKey } from "./git-top";
+import { crossLinkAliases } from "./perimeter";
 
 /** How many outside paths the mixed-change-set reason names before "and N more". */
 const MAX_OUTSIDE_LISTED = 5;
@@ -462,6 +463,14 @@ export async function accept(
         }
         : {}),
       ...(placements !== undefined ? { placements } : {}),
+      // Cross-repo P3a (SD-P3a-5, -10): with a foreign placement (v2 roles only), W's git top and the consumer link spellings of
+      // it, for a consumer testsPass with an explicit scope=affected (deterministic.ts). Never set without a foreign placement.
+      ...(hasForeign
+        ? {
+          changeRoot,
+          crossLinkAliases: deps.deterministic.crossLinkAliases ?? ((consumerCwd: string) => crossLinkAliases(consumerCwd, changeRoot)),
+        }
+        : {}),
     });
   } else {
     // "checker" is the only remaining checkable kind.

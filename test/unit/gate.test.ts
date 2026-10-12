@@ -692,6 +692,90 @@ describe("accept() — per-check placements (P2.4)", () => {
     expect(exec).not.toHaveBeenCalled();
   });
 
+  // Cross-repo P3a (Y5, SD-P3a-5, -10): with a foreign placement (v2 roles only) the runner gets W's git top and the consumer
+  // link spellings of it, for a consumer testsPass with an explicit scope=affected. accept() is the one deterministic call site
+  // of both the synchronous and the deferred verification (wiring.ts buildGateDeps), so these pins cover both paths.
+  describe("cross-link change root (cross-repo P3a, Y5)", () => {
+    it("with a foreign check the runner gets changeRoot = artefact.changeRoot and an alias provider", async () => {
+      const { d, dod } = setup([runCheck, runCheck]);
+      const r = await accept({ dod, workRoot: W, checkPlacements: [undefined, foreign] }, wrote("a.ts"), d);
+      expect(r.verdict.outcome).toBe("pass");
+      const args = lastRunArgs();
+      expect(args.changeRoot).toBe(W);
+      expect(typeof args.crossLinkAliases).toBe("function");
+      // W and C do not exist here: the provider is fail-soft and spells nothing.
+      expect(args.crossLinkAliases?.(C)).toEqual([]);
+    });
+
+    it("without artefact.changeRoot the change root is the effective base dir", async () => {
+      const { d, dod } = setup([runCheck, runCheck]);
+      const art = { ...wrote("a.ts") };
+      delete (art as { changeRoot?: string }).changeRoot;
+      const r = await accept({ dod, workRoot: W, checkPlacements: [undefined, foreign] }, art, d);
+      expect(r.verdict.outcome).toBe("pass");
+      expect(lastRunArgs().changeRoot).toBe(W);
+    });
+
+    it("a given alias provider is kept", async () => {
+      const given = (_consumer: string): readonly string[] => ["/spelled/w"];
+      const { d, dod } = setup([runCheck, runCheck], { crossLinkAliases: given });
+      await accept({ dod, workRoot: W, checkPlacements: [undefined, foreign] }, wrote("a.ts"), d);
+      expect(lastRunArgs().crossLinkAliases).toBe(given);
+    });
+
+    it("the default provider spells W as each consumer link's JS realpath (real dirs)", async () => {
+      const fs = await import("node:fs");
+      const base = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "p3a-gate-")));
+      try {
+        const w = join(base, "w");
+        const c = join(base, "c");
+        fs.mkdirSync(w, { recursive: true });
+        fs.mkdirSync(join(c, "node_modules", "@scope"), { recursive: true });
+        const win = process.platform === "win32";
+        fs.symlinkSync(w, join(c, "node_modules", "lib"), win ? "junction" : "dir");
+        // win32: a junction target written in another case than the disk; the JS realpath keeps that text (spike C4).
+        fs.symlinkSync(win ? w.toUpperCase() : w, join(c, "node_modules", "@scope", "lib"), win ? "junction" : "dir");
+        fs.mkdirSync(join(c, "node_modules", "plain"));
+        const { d, dod } = setup([runCheck, runCheck], { cwd: w });
+        const art = artefact({ changeRoot: w, changedFiles: [{ path: join(w, "a.ts"), status: "M" }] });
+        const r = await accept({ dod, workRoot: w, checkPlacements: [undefined, { cwd: c, top: c, foreign: true }] }, art, d);
+        expect(r.verdict.outcome).toBe("pass");
+        const args = lastRunArgs();
+        expect(args.changeRoot).toBe(w);
+        const aliases = args.crossLinkAliases?.(c) ?? [];
+        const expected = new Set([fs.realpathSync(join(c, "node_modules", "lib")), fs.realpathSync(join(c, "node_modules", "@scope", "lib"))]);
+        expect([...aliases].sort()).toEqual([...expected].sort());
+        expect(aliases.some(alias => alias.split(/[\\/]/).includes("node_modules"))).toBe(false);
+      } finally {
+        fs.rmSync(base, { recursive: true, force: true });
+      }
+    });
+
+    it("without a foreign check (in-repo placements, or none as on v1 and tiers) neither is set", async () => {
+      const { d, dod } = setup([runCheck, runCheck]);
+      await accept({ dod, workRoot: W, checkPlacements: [undefined, local] }, wrote("a.ts"), d);
+      expect(lastRunArgs()).not.toHaveProperty("changeRoot");
+      expect(lastRunArgs()).not.toHaveProperty("crossLinkAliases");
+      await accept({ dod, workRoot: W }, wrote("a.ts"), d);
+      expect(lastRunArgs()).not.toHaveProperty("changeRoot");
+      expect(lastRunArgs()).not.toHaveProperty("crossLinkAliases");
+      await accept({ dod }, wrote("a.ts"), d);
+      expect(lastRunArgs()).not.toHaveProperty("changeRoot");
+      expect(lastRunArgs()).not.toHaveProperty("crossLinkAliases");
+    });
+
+    it("a v2 tier's per-check cwd= is refused first (OD1): the runner is never called, so no changeRoot", async () => {
+      const { exec, d, dod } = setup([runCheck, { kind: "testsPass", command: "npm test" }]);
+      vi.mocked(runDeterministic).mockClear();
+      const refusedCheck = { index: 1, kind: "testsPass", text: "../consumer", why: "tier" as const };
+      const r = await accept({ dod, refusedCheck }, wrote("a.ts"), d);
+      expect(r.verdict.outcome).toBe("unverifiable");
+      expect(r.verdict.reasons).toEqual(["check 2 (testsPass) cwd=../consumer: a per-check cwd= is honoured only in roles mode; nothing ran"]);
+      expect(vi.mocked(runDeterministic)).not.toHaveBeenCalled();
+      expect(exec).not.toHaveBeenCalled();
+    });
+  });
+
   it("F7: with a foreign check, relative changed paths reach the runner absolute, against the change root", async () => {
     const changedFiles = [{ path: "a.ts", status: "M" }, { path: "b.ts", status: "R", previousPath: "old.ts" }, { path: join(W, "c.ts") }];
     const { d, dod } = setup([runCheck, runCheck], { changedFiles });

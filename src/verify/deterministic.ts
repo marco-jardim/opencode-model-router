@@ -1538,8 +1538,37 @@ function defaultReference(deps: DeterministicDeps): ReferenceState {
   return deps.budget?.failureRecheck === false ? { kind: "disabled" } : { kind: "none", reason: REFERENCE_NONE.untracked };
 }
 
+/**
+ * Cross-repo P3a (SD-P3a-1, -2, -5): the cross-link inputs of a foreign testsPass with an explicit scope=affected: W's git top
+ * and the other spellings of it seen from the consumer (`DeterministicDeps.crossLinkAliases`).
+ */
+interface CrossLinkTarget {
+  readonly root: string;
+  readonly aliases?: readonly string[];
+}
+
+/** The cross-link target for a consumer cwd; the alias provider is fail-soft (an error or a non-array gives no aliases). */
+function crossLinkTarget(deps: DeterministicDeps, root: string, consumerCwd: string): CrossLinkTarget {
+  let aliases: readonly string[] | undefined;
+  if (deps.crossLinkAliases !== undefined) {
+    try {
+      const given = deps.crossLinkAliases(consumerCwd);
+      if (Array.isArray(given)) aliases = given.filter((alias): alias is string => typeof alias === "string" && alias !== "");
+    } catch {
+      aliases = undefined;
+    }
+  }
+  return { root, ...(aliases !== undefined ? { aliases } : {}) };
+}
+
 /** P0-P8 for one testsPass check whose command already passed the allowlist (P1). Never rejects. */
-async function runTestsPass(command: string, deps: DeterministicDeps, timeoutMs: number, scope?: "affected" | "full"): Promise<CheckResult> {
+async function runTestsPass(
+  command: string,
+  deps: DeterministicDeps,
+  timeoutMs: number,
+  scope?: "affected" | "full",
+  crossLink?: CrossLinkTarget,
+): Promise<CheckResult> {
   if (!deps.testsPass) return { ok: false, unverifiable: true, reason: `${NO_TESTS_PASS_HOOK}: ${command}` };
   if (!deps.cwd || !isAbsolute(deps.cwd)) {
     return { ok: false, unverifiable: true, reason: `testsPass cannot run without an absolute working directory: ${command}` };
@@ -1555,6 +1584,8 @@ async function runTestsPass(command: string, deps: DeterministicDeps, timeoutMs:
         changedFiles: deps.changedFiles ?? "unavailable",
         reference: deps.reference ?? defaultReference(deps),
         deadline,
+        ...(crossLink !== undefined ? { crossLinkRoot: crossLink.root } : {}),
+        ...(crossLink?.aliases !== undefined ? { crossLinkAliases: crossLink.aliases } : {}),
       });
       // QA-G-B-2-1: a carried acceptance never passes on a run that never happened.
       if (deps.noAffectedUnverifiable !== undefined && run.scoped.kind === "no-affected") {
@@ -1574,6 +1605,7 @@ async function runCommandCheck(
   allowlist: string[],
   timeoutMs: number,
   scope?: "affected" | "full",
+  crossLink?: CrossLinkTarget,
 ): Promise<CheckResult> {
   let command = resolveRepoCommand(check, kind, deps.defaults);
   if (kind === "buildPasses" && !check.command && !deps.defaults?.buildCommand) {
@@ -1601,7 +1633,7 @@ async function runCommandCheck(
     if (!isCommandAllowed(command, allowlist)) {
       return { ok: false, unverifiable: true, reason: `command not allowlisted: ${command}` };
     }
-    return runTestsPass(command, deps, timeoutMs, scope);
+    return runTestsPass(command, deps, timeoutMs, scope, crossLink);
   }
 
   const fn = async (): Promise<CheckResult> => {
@@ -1725,9 +1757,17 @@ export async function runDeterministic(dod: DoD, deps: DeterministicDeps): Promi
       ? { ...deps, cwd: placement.cwd, ...(placement.foreign ? { reference: { kind: "none", reason: FOREIGN_REFERENCE_NONE } satisfies ReferenceState } : {}) }
       : deps;
 
-    // A test or lint check in a consumer repository must use scope=full: the change under verification is in the work root, so
-    // an affected-only run cannot be attributed to it. Unverifiable without running; never a recorded failure.
-    if (placement?.foreign === true && (check.kind === "testsPass" || check.kind === "lintClean") && placement.scope !== "full") {
+    // Cross-repo P3a (SD-P3a-1, D22): a consumer testsPass with an explicit scope=affected runs `related` through the link into
+    // W (deps.changeRoot, set by the gate only with foreign placements); without changeRoot it keeps the refusal below.
+    const crossLink =
+      placement?.foreign === true && check.kind === "testsPass" && placement.scope === "affected" && deps.changeRoot !== undefined
+        ? crossLinkTarget(deps, deps.changeRoot, placement.cwd)
+        : undefined;
+
+    // A test or lint check in a consumer repository must use scope=full (except the cross-link testsPass above): the change under
+    // verification is in the work root, so an affected-only run cannot be attributed to it. Unverifiable without running; never a
+    // recorded failure.
+    if (placement?.foreign === true && (check.kind === "testsPass" || check.kind === "lintClean") && placement.scope !== "full" && crossLink === undefined) {
       results.push({
         ok: false,
         unverifiable: true,
@@ -1746,7 +1786,7 @@ export async function runDeterministic(dod: DoD, deps: DeterministicDeps): Promi
       case "testsPass":
       case "buildPasses":
       case "lintClean":
-        result = await runCommandCheck(check, check.kind, cd, allowlist, timeoutMs, placement?.scope);
+        result = await runCommandCheck(check, check.kind, cd, allowlist, timeoutMs, placement?.scope, crossLink);
         break;
       case "schemaMatch":
         result = await runSchemaMatch(check, cd);

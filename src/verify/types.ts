@@ -129,6 +129,17 @@ export interface DeterministicDeps {
    */
   placements?: readonly (CheckPlacement | undefined)[];
   /**
+   * Cross-repo P3a (SD-P3a-1, -5): W's git top (the gate's `artefact.changeRoot`, else its effective base dir). Set only with
+   * foreign placements (v2 roles). With it, a foreign testsPass whose placement says an explicit `scope=affected` runs scoped
+   * through the link (`TestsPassRequest.crossLinkRoot`) instead of being refused; absent: the refusal as before.
+   */
+  changeRoot?: string;
+  /**
+   * Cross-repo P3a (SD-P3a-2 amended): for a consumer cwd, other spellings of `changeRoot`'s directory (the JS fs.realpathSync of
+   * each consumer link into W). Called only for a cross-link testsPass; fail-soft (errors give no aliases).
+   */
+  crossLinkAliases?: (consumerCwd: string) => readonly string[];
+  /**
    * #84 QA-G-B-2-1: set for a CARRIED acceptance (a role resume re-checking the block of an earlier attempt): a testsPass or
    * lintClean check that ran no process (NoAffected: nothing of the change set maps to a test or a lintable file) is unverifiable
    * with this reason, never a pass. Absent (every other gate, I1): NoAffected passes with its note, as before.

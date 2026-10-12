@@ -1141,7 +1141,7 @@ describe("runDeterministic — per-check placements (P2.4)", () => {
       expect(failures).toEqual([]);
     });
 
-    it("foreign testsPass with scope=affected: the same", async () => {
+    it("foreign testsPass with scope=affected and no changeRoot: the same", async () => {
       const hook = testsPassHook();
       const verdict = await runDeterministic(
         makeDoD([{ kind: "run", command: "node a.js" }, { kind: "testsPass", command: "npm test" }]),
@@ -1150,6 +1150,114 @@ describe("runDeterministic — per-check placements (P2.4)", () => {
       expect(verdict.outcome).toBe("unverifiable");
       expect(verdict.reasons).toEqual([reasonOf(2, "testsPass")]);
       expect(hook.requests).toEqual([]);
+    });
+
+    // Cross-repo P3a (Y5, SD-P3a-1, D22): flipped on purpose. With the gate's changeRoot, an explicit scope=affected runs related
+    // through the link into W instead of being refused; no scope= and lintClean keep the refusal above.
+    describe("foreign testsPass with scope=affected and a changeRoot (cross-repo P3a, Y5)", () => {
+      const W = "/work/w";
+
+      it("calls the hook with testScope affected, the placement cwd, crossLinkRoot = changeRoot and the consumer's aliases", async () => {
+        const hook = testsPassHook();
+        const aliasCalls: string[] = [];
+        const verdict = await runDeterministic(
+          makeDoD([{ kind: "run", command: "node a.js" }, { kind: "testsPass", command: "npm test" }]),
+          makeDeps({
+            testsPass: hook.fn,
+            placements: [undefined, { ...foreign, scope: "affected" }],
+            changeRoot: W,
+            crossLinkAliases: consumerCwd => {
+              aliasCalls.push(consumerCwd);
+              return ["/spelled/w"];
+            },
+          }),
+        );
+        expect(verdict.outcome).toBe("pass");
+        expect(hook.requests).toHaveLength(1);
+        expect(hook.requests[0]).toMatchObject({ cwd: OTHER, testScope: "affected", crossLinkRoot: W, crossLinkAliases: ["/spelled/w"] });
+        expect(hook.requests[0]?.reference.kind).toBe("none");
+        expect(aliasCalls).toEqual([OTHER]);
+      });
+
+      it("a failing cross-link run stays unverifiable, never fail, and never reaches onFailure", async () => {
+        const hook = testsPassHook({
+          scoped: {
+            kind: "ran",
+            exitCode: 1,
+            notes: [],
+            result: { failingIds: ["test/a.test.js > a"], failingFiles: [`${OTHER}/test/a.test.js`], collectionError: false, total: 1, complete: true, source: "report" },
+          },
+          recheck: undefined,
+        });
+        const failures: string[] = [];
+        const verdict = await runDeterministic(
+          makeDoD([{ kind: "testsPass", command: "npm test" }]),
+          makeDeps({ testsPass: hook.fn, onFailure: r => failures.push(r), placements: [{ ...foreign, scope: "affected" }], changeRoot: W }),
+        );
+        expect(hook.requests).toHaveLength(1);
+        expect(verdict.outcome).toBe("unverifiable");
+        expect(verdict.pass).toBe(false);
+        expect(failures).toEqual([]);
+      });
+
+      it("without an alias provider the request carries crossLinkRoot and no crossLinkAliases", async () => {
+        const hook = testsPassHook();
+        await runDeterministic(
+          makeDoD([{ kind: "testsPass", command: "npm test" }]),
+          makeDeps({ testsPass: hook.fn, placements: [{ ...foreign, scope: "affected" }], changeRoot: W }),
+        );
+        expect(hook.requests).toHaveLength(1);
+        expect(hook.requests[0]).toMatchObject({ cwd: OTHER, testScope: "affected", crossLinkRoot: W });
+        expect(hook.requests[0]).not.toHaveProperty("crossLinkAliases");
+      });
+
+      it("a throwing alias provider gives no aliases (fail-soft), the run still happens", async () => {
+        const hook = testsPassHook();
+        const verdict = await runDeterministic(
+          makeDoD([{ kind: "testsPass", command: "npm test" }]),
+          makeDeps({
+            testsPass: hook.fn,
+            placements: [{ ...foreign, scope: "affected" }],
+            changeRoot: W,
+            crossLinkAliases: () => {
+              throw new Error("boom");
+            },
+          }),
+        );
+        expect(verdict.outcome).toBe("pass");
+        expect(hook.requests[0]).toMatchObject({ crossLinkRoot: W });
+        expect(hook.requests[0]).not.toHaveProperty("crossLinkAliases");
+      });
+
+      it("no scope= and lintClean keep the refusal byte-identical with a changeRoot", async () => {
+        const hook = testsPassHook();
+        const execCwds: (string | undefined)[] = [];
+        const verdict = await runDeterministic(
+          makeDoD([{ kind: "testsPass", command: "npm test" }, { kind: "lintClean", command: "npx eslint ." }]),
+          makeDeps({
+            testsPass: hook.fn,
+            exec: async (_c, opts) => { execCwds.push(opts?.cwd); return { code: 0, stdout: "", stderr: "" }; },
+            placements: [foreign, { ...foreign, scope: "affected" }],
+            changeRoot: W,
+            crossLinkAliases: () => ["/spelled/w"],
+          }),
+        );
+        expect(verdict.outcome).toBe("unverifiable");
+        expect(verdict.reasons).toEqual([reasonOf(1, "testsPass"), reasonOf(2, "lintClean")]);
+        expect(hook.requests).toEqual([]);
+        expect(execCwds).toEqual([]);
+      });
+
+      it("an in-repo testsPass with scope=affected never carries the cross-link root", async () => {
+        const hook = testsPassHook();
+        await runDeterministic(
+          makeDoD([{ kind: "testsPass", command: "npm test" }]),
+          makeDeps({ testsPass: hook.fn, placements: [{ ...here, scope: "affected" }], changeRoot: W, crossLinkAliases: () => ["/spelled/w"] }),
+        );
+        expect(hook.requests).toHaveLength(1);
+        expect(hook.requests[0]).not.toHaveProperty("crossLinkRoot");
+        expect(hook.requests[0]).not.toHaveProperty("crossLinkAliases");
+      });
     });
 
     it("foreign lintClean without full: unverifiable, nothing runs", async () => {

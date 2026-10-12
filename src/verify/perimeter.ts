@@ -125,6 +125,69 @@ export function linkedTargets(w: string, io: LinkIO = defaultLinkIO): string[] {
   return [...targets.values()];
 }
 
+/** Cross-repo P3a: the link primitives `crossLinkAliases` uses; injectable for tests. */
+export interface AliasIO extends LinkIO {
+  /** The JS (not native) realpath: on win32 it keeps a junction's stored target text, the spelling vite uses (spike C4). */
+  readonly jsRealpath: (p: string) => string;
+}
+
+const defaultAliasIO: AliasIO = { ...defaultLinkIO, jsRealpath: (p) => realpathSync(p) };
+
+/** `packageEntries`, bounded: at most `max` entries (top level and `@scope/*`), in directory order. */
+function boundedPackageEntries(dir: string, max: number): string[] {
+  const modules = path.join(dir, "node_modules");
+  const entries: string[] = [];
+  for (const name of readNames(modules)) {
+    if (entries.length >= max) break;
+    if (name.startsWith(".")) continue;
+    const full = path.join(modules, name);
+    if (!name.startsWith("@")) {
+      entries.push(full);
+      continue;
+    }
+    for (const sub of readNames(full)) {
+      if (entries.length >= max) break;
+      if (!sub.startsWith(".")) entries.push(path.join(full, sub));
+    }
+  }
+  return entries;
+}
+
+/**
+ * Cross-repo P3a (SD-P3a-2 amended by the spike): W's top as a consumer's package links spell it. For each link in
+ * `<consumer>/node_modules` (top level and `@scope/*`) whose native real path lies inside W, the JS `fs.realpathSync` of the link
+ * (it keeps a junction's stored target text, the id vite gives the module), walked up to W's top when the link targets a
+ * directory below it. Never a `node_modules` spelling. Bounded (CONSUMER_READ_MAX entries, CONSUMER_SCAN_MAX links) and
+ * fail-soft: an unreadable link is skipped, any other error gives what was found so far (the zero guard is the backstop).
+ */
+export function crossLinkAliases(consumer: string, w: string, io: AliasIO = defaultAliasIO): string[] {
+  const aliases: string[] = [];
+  let realW: string;
+  try {
+    realW = io.realpath(w);
+  } catch {
+    return aliases;
+  }
+  let links = 0;
+  for (const entry of boundedPackageEntries(consumer, CONSUMER_READ_MAX)) {
+    try {
+      if (!io.lstat(entry).isSymbolicLink()) continue;
+      if (++links > CONSUMER_SCAN_MAX) break;
+      if (isUncLinkText(io.readlink(entry))) continue;
+      const real = io.realpath(entry);
+      if (!insideOrEqual(real, realW)) continue;
+      const rel = path.relative(realW, real);
+      const up = rel === "" ? [] : rel.split(/[\\/]+/).filter(segment => segment !== "").map(() => "..");
+      const alias = path.resolve(io.jsRealpath(entry), ...up);
+      if (alias.split(/[\\/]+/).includes("node_modules")) continue;
+      if (!aliases.includes(alias)) aliases.push(alias);
+    } catch {
+      continue; // Unreadable or dangling: it spells nothing.
+    }
+  }
+  return aliases;
+}
+
 /** Cross-repo P2b.3: one working-set worktree whose `node_modules` links into W. */
 export interface PerimeterConsumer {
   readonly root: string;
