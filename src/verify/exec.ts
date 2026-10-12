@@ -45,6 +45,7 @@
 import { execFile, spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { constants as osConstants, setPriority, tmpdir } from "node:os";
 import { join } from "node:path";
+import type { SlotEnv } from "../executor/slots/env";
 import type { ArgvSeam, ExecOptions, ExecSeam } from "./types";
 
 export interface ShellResult {
@@ -196,7 +197,7 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions, nic
     try {
       child = spawn(file, args, {
         cwd: opts.cwd,
-        env: mergeEnv(opts.env),
+        env: mergeEnv(opts.env, opts.cwd),
         shell,
         windowsHide: true,
         // Its own process group on POSIX, so the whole tree can be signalled at once.
@@ -387,15 +388,37 @@ export function deadlineOf(opts: RunOptions): number | undefined {
   return Math.min(Math.max(t, 0), MAX_TIMER_MS);
 }
 
+interface SlotEnvHook {
+  slotEnvFor(cwd: string, platform: NodeJS.Platform): SlotEnv | null;
+  applySlotEnv(env: NodeJS.ProcessEnv, s: SlotEnv | null, platform: NodeJS.Platform): NodeJS.ProcessEnv;
+}
+
+/**
+ * The slot-environment functions executor/slots/env.ts publishes when it loads. This file
+ * is also loaded alone by Node's type stripping (no module resolution beyond node:
+ * built-ins), so it reads the hook from globalThis instead of importing the module. Absent
+ * (v1, or no executor loaded), nothing changes.
+ */
+function slotEnvHook(): SlotEnvHook | null {
+  const hook: unknown = Reflect.get(globalThis, Symbol.for("omr.executor.slotEnvHook"));
+  if (typeof hook !== "object" || hook === null) return null;
+  const find: unknown = Reflect.get(hook, "slotEnvFor");
+  const apply: unknown = Reflect.get(hook, "applySlotEnv");
+  return typeof find === "function" && typeof apply === "function" ? (hook as SlotEnvHook) : null;
+}
+
 /**
  * Overrides merged over process.env. Windows environment names are
  * case-insensitive and Node keeps only one of two keys that differ in case
  * (the first in sort order, not the override), so an inherited key that
  * matches an override case-insensitively is dropped first.
  */
-function mergeEnv(overrides: Record<string, string> | undefined): NodeJS.ProcessEnv {
-  if (!overrides) return process.env;
-  const env: NodeJS.ProcessEnv = { ...process.env };
+function mergeEnv(overrides: Record<string, string> | undefined, cwd?: string): NodeJS.ProcessEnv {
+  const hook = cwd === undefined ? null : slotEnvHook();
+  const slot = hook === null || cwd === undefined ? null : hook.slotEnvFor(cwd, process.platform);
+  if (!slot && !overrides) return process.env;
+  const env: NodeJS.ProcessEnv = slot && hook ? hook.applySlotEnv({ ...process.env }, slot, process.platform) : { ...process.env };
+  if (!overrides) return env;
   for (const [key, value] of Object.entries(overrides)) {
     if (isWin) {
       const upper = key.toUpperCase();

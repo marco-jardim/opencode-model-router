@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync, spawnSync } from "node:child_process";
 import * as childProcess from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, parse } from "node:path";
 import { gitEnvironment, gitExecutable, mainWorktree, nearestCheckout, spawnBounded, workRootGuards } from "../../src/router/git-tools";
@@ -13,6 +13,7 @@ import {
   runEnvironment, RUN_HEAD_BYTES, RUN_OUTPUT_BYTES, RUN_RENDERED_MAX_BYTES, RUN_STDERR_TAIL_BYTES, RUN_TAIL_BYTES, scriptAllowed, validateRunArgs,
   type RunRecord, type RunToolDeps,
 } from "../../src/router/run-tools";
+import type { SlotBin } from "../../src/executor/slots/env";
 
 vi.mock("node:child_process", async importOriginal => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -56,6 +57,83 @@ function project(dir: string, scripts: Record<string, string> = { test: "node pr
     "if (process.argv[2] === 'exit') process.exit(Number(process.argv[3]));",
   ].join("\n"));
 }
+describe("planRun inside an executor slot (QA-2.4-6)", () => {
+  beforeEach(() => { recorded = undefined; });
+  const exe = (name: string): string => (WIN ? `${name}.exe` : name);
+  const binDir = (): string => join(root, "node_modules", ".bin");
+  const venvDir = (): string => join(root, ".venv", WIN ? "Scripts" : "bin");
+  /** What the pool records right after provisioning: every file below the tool directories, with size and mtime. */
+  const snapshot = (dirs: string[]): SlotBin[] => dirs.filter(dir => existsSync(dir)).flatMap(dir => readdirSync(dir).map(name => {
+    const path = join(dir, name);
+    const st = lstatSync(path);
+    return { path, size: st.size, mtimeMs: st.mtimeMs };
+  }));
+  let recorded: SlotBin[] | undefined;
+  const slotEnv = (dirs: string[]) => () => ({ root, set: {}, prependPath: dirs, unset: [], bins: recorded ?? snapshot(dirs) });
+  const cmds = (name: string): RunConfig => config({ commands: { [name]: { argv: [name] } } });
+  const hostFor = (dirs: string[] | null) => ({
+    platform: process.platform, env: testEnv(), slotEnv: dirs === null ? () => null : slotEnv(dirs),
+  });
+  const touch = (dir: string, file: string): string => {
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, file);
+    writeFileSync(path, "");
+    return path;
+  };
+
+  const plan = (script: string, cfg: RunConfig, dirs: string[] | null) => planRun({ script, cwd: root }, root, cfg, hostFor(dirs));
+
+  it("finds a bare name in the slot's node_modules/.bin and .venv before PATH", () => {
+    const tool = touch(binDir(), exe("slottool"));
+    const py = touch(venvDir(), exe("slotpy"));
+    const dirs = [venvDir(), binDir()];
+    expect(plan("slottool", cmds("slottool"), dirs).executable).toBe(tool);
+    expect(plan("slotpy", cmds("slotpy"), dirs).executable).toBe(py);
+  });
+
+  // QA-2.4-27
+  it("takes a slot executable only when it matches the snapshot recorded after provisioning", () => {
+    const tool = touch(binDir(), exe("slottool"));
+    recorded = snapshot([binDir()]);
+    expect(plan("slottool", cmds("slottool"), [binDir()]).executable).toBe(tool);
+    // written by an agent later: not in the snapshot -> PATH lookup, which does not find it
+    const late = touch(binDir(), exe("latetool"));
+    expect(existsSync(late)).toBe(true);
+    expect(() => plan("latetool", cmds("latetool"), [binDir()])).toThrow(/not found on an absolute PATH entry/);
+    // an empty snapshot accepts nothing
+    recorded = [];
+    expect(() => plan("slottool", cmds("slottool"), [binDir()])).toThrow(/not found on an absolute PATH entry/);
+    // a recorded file whose size or mtime changed is not the one that was installed
+    recorded = snapshot([binDir()]);
+    writeFileSync(tool, "replaced by the agent");
+    expect(() => plan("slottool", cmds("slottool"), [binDir()])).toThrow(/not found on an absolute PATH entry/);
+  });
+
+  it("outside a slot the same bare name is still refused as not found", () => {
+    touch(binDir(), exe("slottool"));
+    expect(() => plan("slottool", cmds("slottool"), null)).toThrow(/not found on an absolute PATH entry/);
+  });
+
+  it("an absolute path inside the work root stays refused, slot or not", () => {
+    const tool = touch(binDir(), exe("slottool"));
+    const absolute: RunConfig = config({ commands: { abs: { argv: [tool] } } });
+    expect(() => plan("abs", absolute, [binDir()])).toThrow(/inside the work root/);
+  });
+
+  it("a shell found in the slot's bin directory is still refused", () => {
+    const shell = WIN ? "cmd" : "sh";
+    touch(binDir(), exe(shell));
+    expect(() => plan(shell, cmds(shell), [binDir()])).toThrow(/is a shell/);
+  });
+
+  it.skipIf(WIN)("a node_modules/.bin entry that links outside the slot is not used", () => {
+    const outside = touch(sibling, "elsewhere");
+    mkdirSync(binDir(), { recursive: true });
+    symlinkSync(outside, join(binDir(), "linked"));
+    expect(() => plan("linked", cmds("linked"), [binDir()])).toThrow(/not found on an absolute PATH entry/);
+  });
+});
+
 type Execute = (args: unknown, context: unknown) => Promise<string>;
 function git(dir: string, ...args: string[]): string {
   return execFileSync(gitExecutable(), ["-c", "gc.auto=0", "-c", "maintenance.auto=false", ...args], { cwd: dir, env: gitEnvironment(), encoding: "utf8" });
