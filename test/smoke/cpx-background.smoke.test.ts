@@ -168,9 +168,11 @@ d("cpx background: dispatch, holding and leases on a real v2 host", () => {
       check("in-flight-tail", inFlight, "a root request made while the child runs must list it in flight in the tail");
 
       observed.childEnd = await childEnded(host, call.childID);
-      const requestsAtEnd = primaryRequests(host, root).length;
       // The completion line is shown ONCE: the host wakes the idle root with the completion (its own request), and the root's execution end
-      // drops the line already shown. So look at every root request made after the end, not only at the last one.
+      // drops the line already shown. So look at every root request made after the dispatch returned, not only at the last one. Counting
+      // from the dispatch's return (not from when `childEnded` resolved) avoids a race: the host's wake request can land before the end
+      // event is observed here. A request made before the child ended cannot carry the line.
+      const requestsAtEnd = rootRequests.length;
       const annotated = await waitFor("a root request after the end carrying the completion annotation", () => {
         const after = primaryRequests(host, root).slice(requestsAtEnd).filter(r => tailOf(r).includes(COMPLETED_LINE) && !tailOf(r).includes("router guarantees pending"));
         return after.length > 0 ? after : undefined;
