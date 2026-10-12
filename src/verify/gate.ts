@@ -30,6 +30,7 @@ import { isWithinDir, resolveBaseDir } from "./paths";
 import { toolLabel } from "./dispatch";
 import { perimeterKey } from "./git-top";
 import { crossLinkAliases } from "./perimeter";
+import { displaySafe } from "../routing/roles/read-set";
 
 /** How many outside paths the mixed-change-set reason names before "and N more". */
 const MAX_OUTSIDE_LISTED = 5;
@@ -62,9 +63,10 @@ export interface PerimeterObservation {
   readonly roots: readonly PerimeterRoot[];
   /**
    * Cross-repo P2b.3 (D6): working-set worktrees other than W whose `node_modules` link into W, found by `discoverConsumers`.
-   * Absent or empty: none known, no consumer caveat.
+   * Absent or empty: none known, no consumer caveat. Cross-repo P3c.5 (SD-P3c-5, F6): a `node_modules` consumer carries its
+   * link `entry`; one whose declared dependency edge leads into W carries `via` instead (the declaring file and its fixed label).
    */
-  readonly consumers?: readonly { readonly root: string; readonly name?: string; readonly entry: string }[];
+  readonly consumers?: readonly { readonly root: string; readonly name?: string; readonly entry?: string; readonly via?: string }[];
   /**
    * Cross-repo QA-2 #2: working-set worktrees whose consumer discovery stopped on its entry budget before it finished. A
    * repository there may link W unchecked, so a would-be pass with a change carries a caveat per entry.
@@ -542,9 +544,15 @@ function unverifiedConsumerCaveats(
     const top = placements?.[index]?.top;
     if (top !== undefined && CONSUMER_CHECK_KINDS.has(check.kind)) covered.add(perimeterKey(top));
   });
+  // Cross-repo P3c.5 (SD-P3c-5, F6): a `node_modules` consumer keeps its pinned `(node_modules/<entry>)` literal; an edge consumer
+  // reads `(<via>)`, the declaring file and its fixed label through `displaySafe` (the raw spec is never echoed).
+  const linkOf = (consumer: { readonly entry?: string; readonly via?: string }): string =>
+    consumer.entry !== undefined || consumer.via === undefined
+      ? `links this work root (node_modules/${consumer.entry})`
+      : `links this work root (${displaySafe(consumer.via)})`;
   const unchecked = consumers
     .filter(consumer => !covered.has(perimeterKey(consumer.root)))
-    .map(consumer => `${consumer.name ?? consumer.root} at ${consumer.root} links this work root (node_modules/${consumer.entry}) and no check ran there; add a check such as: check: testsPass cwd="${consumer.root}" scope=full`);
+    .map(consumer => `${consumer.name ?? consumer.root} at ${consumer.root} ${linkOf(consumer)} and no check ran there; add a check such as: check: testsPass cwd="${consumer.root}" scope=full`);
   // QA-2 #2: discovery stopped on its budget; a repository there may link this work root unchecked.
   // QA round 2 M2: cleared by the same coverage as a consumer (a consumer check placed with its top equal to that root).
   const incomplete = (artefact.perimeter?.consumersIncomplete ?? [])

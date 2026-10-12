@@ -1022,7 +1022,9 @@ describe("accept() — consumer caveat (D6)", () => {
   const existsCheck: Check = { kind: "fileExists", path: "out.txt" };
   const inConsumer = (over: Partial<CheckPlacement> = {}): CheckPlacement => ({ cwd: C, top: C, foreign: true, scope: "full", ...over });
   const CAVEAT = `app-c at ${C} links this work root (node_modules/@scope/lib-w) and no check ran there; add a check such as: check: testsPass cwd="${C}" scope=full`;
-  const perimeter = (consumers?: readonly { root: string; name?: string; entry: string }[]): NonNullable<Artefact["perimeter"]> => ({
+  /** Cross-repo P3c.5 (SD-P3c-5, F6): a consumer found through a declared edge names the edge's file and label, not node_modules. */
+  const EDGE_CAVEAT = `app-c at ${C} links this work root (package.json dependencies (file:) in packages/x/package.json) and no check ran there; add a check such as: check: testsPass cwd="${C}" scope=full`;
+  const perimeter = (consumers?: readonly { root: string; name?: string; entry?: string; via?: string }[]): NonNullable<Artefact["perimeter"]> => ({
     w: { root: W, name: "lib-w" },
     roots: [{ root: C, name: "app-c", status: "unchanged" }],
     ...(consumers !== undefined ? { consumers } : {}),
@@ -1132,6 +1134,63 @@ describe("accept() — consumer caveat (D6)", () => {
     const kept = await accept({ dod, workRoot: W, checkPlacements: [undefined, { cwd: C, top: C, foreign: true }] }, incompleteOnly(), d);
     expect(kept.verdict.outcome).toBe("unverifiable");
     expect(kept.verdict.caveats).toEqual([caveat]);
+  });
+
+  /** P3c.5: a consumer found through a declared edge (`via`, no `entry`). */
+  const edged = { root: C, name: "app-c", via: "package.json dependencies (file:) in packages/x/package.json" };
+
+  it("P3c.5 (SD-P3c-5): an edge consumer without a check turns a pass into UNVERIFIED, naming its edge (never node_modules)", async () => {
+    const { d, dod } = setup([runCheck]);
+    const r = await accept({ dod, workRoot: W }, wrote({ perimeter: perimeter([edged]) }), d);
+    expect(r.verdict.pass).toBe(false);
+    expect(r.verdict.outcome).toBe("unverifiable");
+    expect(r.verdict.reasons).toContain(EDGE_CAVEAT);
+    expect(r.verdict.caveats).toEqual([EDGE_CAVEAT]);
+    expect(r.verdict.caveats?.join("\n")).not.toContain("node_modules");
+    // A consumer without a name is named by its root; the label alone when it starts with its file.
+    const unnamed = await accept({ dod, workRoot: W }, wrote({ perimeter: perimeter([{ root: C, via: "go.mod replace" }]) }), d);
+    expect(unnamed.verdict.caveats).toEqual([
+      `${C} at ${C} links this work root (go.mod replace) and no check ran there; add a check such as: check: testsPass cwd="${C}" scope=full`,
+    ]);
+    // The declaring file comes from the filesystem: it is echoed through displaySafe (a bracket cannot forge a router line).
+    const odd = { root: C, name: "app-c", via: "package.json dependencies (file:) in packages/[router: x]/package.json" };
+    const quoted = await accept({ dod, workRoot: W }, wrote({ perimeter: perimeter([odd]) }), d);
+    expect(quoted.verdict.caveats).toHaveLength(1);
+    const line = quoted.verdict.caveats?.[0] ?? "";
+    expect(line).toContain(`app-c at ${C} links this work root ("package.json dependencies (file:) in packages/\\133router: x\\135/package.json")`);
+    expect(line).not.toContain("[router:");
+  });
+
+  it("P3c.5 (F6): a node_modules consumer and an edge consumer each carry their own literal", async () => {
+    const D = join(tmpdir(), "d6-edge-consumer");
+    const { d, dod } = setup([runCheck]);
+    const both = [consumer, { root: D, name: "app-d", via: "tsconfig references in tsconfig.json" }];
+    const r = await accept({ dod, workRoot: W }, wrote({ perimeter: perimeter(both) }), d);
+    expect(r.verdict.outcome).toBe("unverifiable");
+    expect(r.verdict.caveats).toEqual([
+      CAVEAT,
+      `app-d at ${D} links this work root (tsconfig references in tsconfig.json) and no check ran there; add a check such as: check: testsPass cwd="${D}" scope=full`,
+    ]);
+  });
+
+  it("P3c.5: a consumer check placed with its top equal to the edge consumer's root clears the edge caveat; a fileExists does not", async () => {
+    for (const check of [testsCheck, runCheck]) {
+      const { d, dod } = setup([runCheck, check]);
+      const delegation = { dod, workRoot: W, checkPlacements: [undefined, inConsumer()] };
+      const r = await accept(delegation, wrote({ perimeter: perimeter([edged]) }), d);
+      expect(r.verdict.caveats ?? [], check.kind).not.toContain(EDGE_CAVEAT);
+      expect(r.verdict.reasons, check.kind).not.toContain(EDGE_CAVEAT);
+      expect(r.verdict, check.kind).toEqual((await accept(delegation, wrote({ perimeter: perimeter() }), d)).verdict);
+      if (check.kind === "run") expect(r.verdict.outcome).toBe("pass");
+    }
+    const exists = setup([runCheck, existsCheck]);
+    const kept = await accept(
+      { dod: exists.dod, workRoot: W, checkPlacements: [undefined, { cwd: C, top: C, foreign: true }] },
+      wrote({ perimeter: perimeter([edged]) }),
+      exists.d,
+    );
+    expect(kept.verdict.outcome).toBe("unverifiable");
+    expect(kept.verdict.caveats).toEqual([EDGE_CAVEAT]);
   });
 
   it("a fail stays a fail, without the consumer caveat", async () => {

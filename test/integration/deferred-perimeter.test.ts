@@ -326,6 +326,25 @@ describe("deferred perimeter at router_verify", () => {
     expect(acceptSpy.mock.calls[0]?.[1].perimeter?.consumers).toEqual([{ root: consumer, name: "consumer-c", entry: "app-a" }]);
   });
 
+  it("P3c.5 edge consumer found at router_verify (an uninstalled file: dependency) → UNVERIFIED with the edge caveat", async () => {
+    const h = await makePlugin();
+    // No node_modules link: the consumer only declares W as a file: dependency.
+    fs.writeFileSync(path.join(consumer, "package.json"), JSON.stringify({ name: "consumer-c", dependencies: { "app-a": "file:../app-a" } }), "utf-8");
+    const handle = register({ perimeter: frozen("unchanged", { workingSet: [{ root: consumer, name: "consumer-c" }] }) });
+    const out = await verify(h, handle);
+    expect(state.discoveries).toEqual([{ w: work, roots: [consumer] }]);
+    const edgeCaveat = `consumer-c at ${consumer} links this work root (package.json dependencies (file:)) and no check ran there; add a check such as: check: testsPass cwd="${consumer}" scope=full`;
+    expect(out).toMatch(/consumer-c at \S+ links this work root \(package\.json dependencies \(file:\)\) and no check ran there; add a check such as: check: testsPass cwd="[^"]+" scope=full/);
+    expect(out).not.toMatch(CONSUMER_CAVEAT);
+    expect(out).not.toMatch(/\bpass$/m);
+    const result = await acceptSpy.mock.results[0]?.value;
+    expect(result?.verdict.outcome).toBe("unverifiable");
+    expect(result?.verdict.caveats).toEqual([edgeCaveat]);
+    const consumers = acceptSpy.mock.calls[0]?.[1].perimeter?.consumers;
+    expect(consumers).toEqual([{ root: consumer, name: "consumer-c", via: "package.json dependencies (file:)" }]);
+    expect(consumers?.[0] !== undefined && "entry" in consumers[0]).toBe(false);
+  });
+
   it("pins reach materialize; pinNow admits the frozen link", async () => {
     const h = await makePlugin();
     const pins: readonly LinkPin[] = [{ kind: "pinned", root: libB, head: HEAD_B, fingerprint: "pinned-fp", ignored: "ign", nested: [] }];

@@ -27,7 +27,9 @@
  * is the union of W's package links and its declared edges (edges.ts), each edge admitted by its text first
  * (`resolveEdgeTarget`) with the same admission as a link (`admissionContext`). `planPerimeter` adds them to P as seed origin
  * "edge" (a working-set root an edge covers gets `edged`; a link and an edge into one repository stay one "link" seed);
- * edge-only seeds are never pinned (SD-P3c-2, F3) and not frozen for S11 yet (P3c.4).
+ * edge-only seeds are never pinned (SD-P3c-2, F3) and not frozen for S11 yet (P3c.4). Consumer discovery (§6, P3c.5,
+ * SD-P3c-4, SD-P3c-5) reads the same edges in reverse: a working-set root whose declared edge resolves, as text, inside W's top
+ * is a consumer `{root, name?, via}` (a `node_modules` consumer keeps `{root, name?, entry}`, F6).
  */
 import { type Dirent, lstatSync, readFileSync, readdirSync, readlinkSync, realpathSync } from "node:fs";
 import { lstat, readFile, readdir, readlink, realpath } from "node:fs/promises";
@@ -37,7 +39,7 @@ import type { RepoLocation } from "../routing/roles/admission";
 import { routedRoleOf } from "../routing/wire/dispatch";
 import { workingSetOf } from "../routing/wire/working-set";
 import type { DispatchPerimeter, PerimeterSeed } from "./dispatch";
-import { type DeclaredEdge, type EdgeIO, type EdgeVia, declaredEdges, defaultEdgeIO, isUncSpec, workspacePatterns } from "./edges";
+import { type DeclaredEdge, type EdgeIO, type EdgeLimits, type EdgeVia, EDGE_LIMITS, declaredEdges, defaultEdgeIO, isUncSpec, workspacePatterns } from "./edges";
 import { depthBelow, gitTopOf, perimeterKey } from "./git-top";
 import { isStoreLikeLink } from "./reference";
 
@@ -422,12 +424,21 @@ export function crossLinkAliases(consumer: string, w: string, io: AliasIO = defa
   return aliases;
 }
 
-/** Cross-repo P2b.3: one working-set worktree whose `node_modules` links into W. */
+/**
+ * Cross-repo P2b.3: one working-set worktree whose `node_modules` links into W (`entry`); cross-repo P3c.5 (SD-P3c-5, F6): or
+ * one whose declared dependency edge leads into W (`via`). Exactly one of `entry` and `via` is set: a `node_modules` consumer
+ * keeps its shape `{root, name?, entry}`, an edge consumer is `{root, name?, via}`.
+ */
 export interface PerimeterConsumer {
   readonly root: string;
   readonly name?: string;
   /** The link, relative to `<root>/node_modules` (for example `lib` or `@scope/lib`), "/" separated. */
-  readonly entry: string;
+  readonly entry?: string;
+  /**
+   * P3c.5: the edge, as the declaring file relative to `root` ("/" separated) and its fixed `EDGE_VIAS` label, for example
+   * `package.json dependencies (file:)`. Never the raw spec.
+   */
+  readonly via?: string;
 }
 
 /** Cross-repo P2b.3: the bound on `node_modules` LINK entries checked by `discoverConsumers`, per root (QA-1 #2, M2: plain entries are free). */
@@ -441,6 +452,24 @@ export const CONSUMER_NAMES_MAX = 64;
 
 /** Cross-repo QA-1 #2: the bound on the workspace `package.json` files read to learn W's package names. */
 const WORKSPACE_MANIFESTS_MAX = 256;
+
+/**
+ * Cross-repo P3c.5 (SD-P3c-4): the bounds of a working-set root's declared edges read in reverse for consumer discovery: at
+ * most WORKSPACE_MANIFESTS_MAX workspace packages (a package.json and a tsconfig.json each, plus the root's own files).
+ */
+const CONSUMER_EDGE_LIMITS: EdgeLimits = Object.freeze({
+  ...EDGE_LIMITS,
+  workspaces: WORKSPACE_MANIFESTS_MAX,
+  files: Math.max(EDGE_LIMITS.files, 2 * WORKSPACE_MANIFESTS_MAX + 16),
+});
+
+/**
+ * Cross-repo P3c.5 (SD-P3c-5): how an edge consumer names its edge in the caveat: the fixed `EDGE_VIAS` label, plus the declaring
+ * file (relative to the consumer root, "/" separated) when the label does not already start with it. Never the raw spec.
+ */
+function consumerVia(edge: DeclaredEdge): string {
+  return edge.via === edge.from || edge.via.startsWith(`${edge.from} `) ? edge.via : `${edge.via} in ${edge.from}`;
+}
 
 /** A `package.json` larger than this is not read for names. */
 const MANIFEST_BYTES_MAX = 1024 * 1024;
@@ -535,19 +564,29 @@ async function packageNamesOf(w: string, stop: () => boolean): Promise<string[]>
  * (QA-2 M2). A root whose scan stops on either bound without finding a consumer is incomplete; so is
  * every root not finished when `opts.signal` aborts (QA-1 #13, the gate deadline). A link whose text names a UNC or device
  * path is never resolved (QA-1 #3). One entry per consumer (the first link found); both lists follow the order of `roots`.
+ *
+ * Cross-repo P3c.5 (SD-P3c-3..5): then, for a root with no `node_modules` link into W, (c) its declared dependency edges
+ * (`declaredEdges`, read in reverse with CONSUMER_EDGE_LIMITS: at most WORKSPACE_MANIFESTS_MAX workspace packages, EDGES_MAX
+ * edges): an edge whose spec, resolved as text against its declaring file's directory, lies inside W's top (W as given or
+ * canonical, its git top level) and not under a `node_modules` segment makes the root a consumer `{root, name?, via}` (F6: a
+ * `node_modules` consumer keeps `{root, name?, entry}`). Edge text is never resolved on the filesystem (I11): an edge spelling
+ * W only through a junction is not seen. A root inside W's top (W's own repository) reads no edges. A root with no consumer
+ * whose edge reading a bound cut is incomplete, as one whose scan stopped on its budget.
  */
 export async function discoverConsumers(
   w: string,
   roots: readonly ConsumerRoot[],
-  opts?: { maxEntries?: number; maxRead?: number; signal?: AbortSignal },
+  opts?: { maxEntries?: number; maxRead?: number; signal?: AbortSignal; edgeIO?: EdgeIO; edgeLimits?: EdgeLimits },
 ): Promise<ConsumerDiscovery> {
   const maxEntries = Math.max(0, Math.floor(opts?.maxEntries ?? CONSUMER_SCAN_MAX));
   const readMax = Math.max(0, Math.floor(opts?.maxRead ?? CONSUMER_READ_MAX));
+  const edgeIO = opts?.edgeIO ?? defaultEdgeIO;
+  const edgeLimits = opts?.edgeLimits ?? CONSUMER_EDGE_LIMITS;
   const signal = opts?.signal;
   const stopped = (): boolean => signal?.aborted === true;
-  // Per root, by index: a consumer's entry, "incomplete", "none"; unset while the root is not finished.
+  // Per root, by index: a consumer's entry (a link) or via (an edge), "incomplete", "none"; unset while the root is not finished.
   // W (or a root around it) is never scanned, so never incomplete either: settled before any fs call, by text.
-  const outcomes: (string | { readonly incomplete: true } | null | undefined)[] = roots.map(({ root }) =>
+  const outcomes: (string | { readonly via: string } | { readonly incomplete: true } | null | undefined)[] = roots.map(({ root }) =>
     (insideOrEqual(root, w) || insideOrEqual(w, root) ? null : undefined));
   const assemble = (): ConsumerDiscovery => {
     const consumers: PerimeterConsumer[] = [];
@@ -556,6 +595,7 @@ export async function discoverConsumers(
       const outcome = outcomes[index];
       const named = name !== undefined ? { name } : {};
       if (typeof outcome === "string") consumers.push({ root, ...named, entry: outcome });
+      else if (outcome !== null && outcome !== undefined && "via" in outcome) consumers.push({ root, ...named, via: outcome.via });
       else if (outcome !== null) incomplete.push({ root, ...named });
     });
     return { consumers, incomplete };
@@ -564,6 +604,18 @@ export async function discoverConsumers(
     // Link targets are real paths: W is matched as given and as its real path (a junction or 8.3 spelling of W).
     const wReal = await realpath(w).catch(() => w);
     const inW = (dir: string): boolean => insideOrEqual(dir, w) || insideOrEqual(dir, wReal);
+    // P3c.5: W's top level (W may be a folder of its repository), as found and canonical; edges are matched against them by text.
+    const wTop = gitTopOf(w) ?? w;
+    const wTopReal = await realpath(wTop).catch(() => wTop);
+    const wSpellings = [...new Map([w, wReal, wTop, wTopReal].map((at) => [perimeterKey(at), at])).values()];
+    const inWTop = (dir: string): boolean => insideOrEqual(dir, wTop) || insideOrEqual(dir, wTopReal);
+    /** By text only (I11): the edge's target, resolved against its declaring file's directory, lies inside W's top. */
+    const edgeIntoW = (root: string, edge: DeclaredEdge): boolean => {
+      if (edge.unc === true || isUncSpec(edge.spec)) return false;
+      const target = path.resolve(path.dirname(path.join(root, edge.from)), edge.spec);
+      if (isUncSpec(target)) return false;
+      return wSpellings.some((at) => insideOrEqual(target, at) && !hasNodeModulesSegment(path.relative(at, target)));
+    };
     const linksIntoW = async (full: string): Promise<boolean> => {
       try {
         if (!(await lstat(full)).isSymbolicLink()) return false;
@@ -642,8 +694,18 @@ export async function discoverConsumers(
           }
         }
       }
-      // (c) Stopped on the budget without a consumer: incomplete.
-      outcomes[index] = found !== undefined ? found : exhausted ? { incomplete: true } : null;
+      // (c) P3c.5: no link into W: the root's declared dependency edges, by text (never W's own repository).
+      let via: string | undefined;
+      let edgesCut = false;
+      if (found === undefined && !inWTop(root) && !insideOrEqual(wTop, root)) {
+        if (stopped()) return;
+        const declared = declaredEdges(root, edgeIO, edgeLimits);
+        const edge = declared.edges.find((candidate) => edgeIntoW(root, candidate));
+        if (edge !== undefined) via = consumerVia(edge);
+        else edgesCut = declared.incomplete;
+      }
+      // Stopped on a budget or a bound without a consumer: incomplete.
+      outcomes[index] = found !== undefined ? found : via !== undefined ? { via } : exhausted || edgesCut ? { incomplete: true } : null;
     }
   };
   if (signal === undefined) {

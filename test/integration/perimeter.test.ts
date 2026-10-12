@@ -39,6 +39,7 @@ import * as deterministicModule from "../../src/verify/deterministic";
 import { samePin, type LinkPin } from "../../src/verify/pin";
 import type { DoD } from "../../src/verify/dod";
 import { PERIMETER_MAX, planPerimeter } from "../../src/verify/perimeter";
+import { defaultEdgeIO, EDGE_LIMITS, type EdgeIO } from "../../src/verify/edges";
 
 type Tree = Awaited<ReturnType<typeof import("../../src/verify/tree").snapshotTree>>;
 
@@ -1395,6 +1396,136 @@ describe("consumer discovery (§6)", () => {
     // W itself is never scanned, so never incomplete; the two others were not finished.
     expect(await perimeterModule.discoverConsumers(repo, roots, { signal: controller.signal }))
       .toEqual({ consumers: [], incomplete: [{ root: lib, name: "lib-b" }, { root: second, name: "lib-c" }] });
+  });
+
+  /** P3c.5: `to` relative to `from`, "/" separated (a declared spec's spelling). */
+  const relativeSpec = (from: string, to: string): string => path.relative(from, to).replace(/\\/g, "/");
+
+  it("P3c.5: an uninstalled file: dependency into W (no node_modules) makes the root a consumer {root, name, via}, with no entry", async () => {
+    fs.writeFileSync(path.join(lib, "package.json"), JSON.stringify({ name: "lib-b", dependencies: { "app-a": `file:${relativeSpec(lib, repo)}` } }));
+    expect(fs.existsSync(path.join(lib, "node_modules"))).toBe(false);
+    const found = await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }]);
+    expect(found).toEqual({ consumers: [{ root: lib, name: "lib-b", via: "package.json dependencies (file:)" }], incomplete: [] });
+    expect(Object.keys(found.consumers[0] ?? {}).sort()).toEqual(["name", "root", "via"]);
+    // A spec into a directory below W counts too.
+    fs.mkdirSync(path.join(repo, "packages", "core"), { recursive: true });
+    fs.writeFileSync(path.join(lib, "package.json"), JSON.stringify({ devDependencies: { core: `link:${relativeSpec(lib, path.join(repo, "packages", "core"))}` } }));
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib }]))
+      .toEqual({ consumers: [{ root: lib, via: "package.json devDependencies (link:)" }], incomplete: [] });
+  });
+
+  it("P3c.5 (F6): a root with a node_modules link into W and an edge into W keeps the exact {root, name?, entry} shape", async () => {
+    fs.writeFileSync(path.join(lib, "package.json"), JSON.stringify({ name: "lib-b", dependencies: { "app-a": `file:${relativeSpec(lib, repo)}` } }));
+    link(repo, path.join(lib, "node_modules", "app-a"));
+    const found = await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }]);
+    expect(found).toEqual({ consumers: [{ root: lib, name: "lib-b", entry: "app-a" }], incomplete: [] });
+    expect(Object.keys(found.consumers[0] ?? {}).sort()).toEqual(["entry", "name", "root"]);
+    const unnamed = await perimeterModule.discoverConsumers(repo, [{ root: lib }]);
+    expect(Object.keys(unnamed.consumers[0] ?? {}).sort()).toEqual(["entry", "root"]);
+  });
+
+  it("P3c.5: an edge into a sibling repository that is not W is not a consumer", async () => {
+    const sibling = path.join(parent, "lib-c");
+    fs.mkdirSync(sibling, { recursive: true });
+    fs.writeFileSync(path.join(lib, "package.json"), JSON.stringify({ name: "lib-b", dependencies: { "lib-c": `file:${relativeSpec(lib, sibling)}` } }));
+    fs.writeFileSync(path.join(lib, "tsconfig.json"), JSON.stringify({ references: [{ path: relativeSpec(lib, sibling) }] }));
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }])).toEqual(NONE);
+    // A spec sharing W's name as a prefix ("app-a-other") is not inside W either.
+    const lookalike = `${repo}-other`;
+    fs.mkdirSync(lookalike, { recursive: true });
+    fs.writeFileSync(path.join(lib, "package.json"), JSON.stringify({ dependencies: { x: `file:${relativeSpec(lib, lookalike)}` } }));
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }])).toEqual(NONE);
+  });
+
+  it("P3c.5 (I11): an edge whose text lies outside the parents is not a consumer, and no filesystem call is made on it", async () => {
+    const far = path.resolve(lib, "..", "..", "..", "omr-p3c5-far-away", "pkg");
+    expect(seam.key(far).startsWith(`${seam.key(parent)}/`)).toBe(false);
+    fs.writeFileSync(path.join(lib, "package.json"), JSON.stringify({ name: "lib-b", dependencies: { far: `file:${relativeSpec(lib, far)}` } }));
+    const touched: string[] = [];
+    const edgeIO: EdgeIO = {
+      stat: vi.fn((p: string) => {
+        touched.push(p);
+        return defaultEdgeIO.stat(p);
+      }),
+      readFile: vi.fn((p: string) => {
+        touched.push(p);
+        return defaultEdgeIO.readFile(p);
+      }),
+      readdir: vi.fn((dir: string, max: number) => {
+        touched.push(dir);
+        return defaultEdgeIO.readdir(dir, max);
+      }),
+    };
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }], { edgeIO })).toEqual(NONE);
+    // The edges were read through the injected IO (the manifest at least), never at the edge's target.
+    expect(touched.map(seam.key)).toContain(seam.key(path.join(lib, "package.json")));
+    const farKey = seam.key(far);
+    expect(touched.filter(p => seam.key(p) === farKey || seam.key(p).startsWith(`${farKey}/`))).toEqual([]);
+    // Every call stayed in the declaring root.
+    expect(touched.filter(p => seam.key(p) !== seam.key(lib) && !seam.key(p).startsWith(`${seam.key(lib)}/`))).toEqual([]);
+  });
+
+  it("P3c.5: a tsconfig `references` entry into W makes the root a consumer, the label naming the declaring file", async () => {
+    fs.writeFileSync(path.join(lib, "tsconfig.json"), `// a comment\n{ "references": [{ "path": "${relativeSpec(lib, repo)}" }], }\n`);
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }]))
+      .toEqual({ consumers: [{ root: lib, name: "lib-b", via: "tsconfig references in tsconfig.json" }], incomplete: [] });
+  });
+
+  it("P3c.5: a .venv .pth line into W (an editable install) makes the root a consumer", async () => {
+    const venv = path.join(lib, ".venv");
+    const site = path.join(venv, "Lib", "site-packages");
+    fs.mkdirSync(site, { recursive: true });
+    fs.writeFileSync(path.join(venv, "pyvenv.cfg"), "home = /usr/bin\n");
+    fs.writeFileSync(path.join(site, "__editable__.app_a-0.1.pth"), `# editable\nimport os\n${path.join(repo, "src")}\n`);
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }])).toEqual({
+      consumers: [{ root: lib, name: "lib-b", via: "python editable install in .venv/Lib/site-packages/__editable__.app_a-0.1.pth" }],
+      incomplete: [],
+    });
+  });
+
+  it("P3c.5: a go.mod `replace … => ../<W>` makes the root a consumer", async () => {
+    fs.writeFileSync(path.join(lib, "go.mod"), `module example.com/libb\n\ngo 1.22\n\nreplace example.com/appa => ${relativeSpec(lib, repo)} // local\n`);
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }]))
+      .toEqual({ consumers: [{ root: lib, name: "lib-b", via: "go.mod replace" }], incomplete: [] });
+  });
+
+  it("P3c.5: edges match W's top; W's own repository reads no edges; an edge into node_modules below W is not a consumer", async () => {
+    fs.writeFileSync(path.join(lib, "package.json"), JSON.stringify({ dependencies: { x: `file:${relativeSpec(lib, path.join(repo, "node_modules", "x"))}` } }));
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }])).toEqual(NONE);
+    // W a folder of its repository: an edge into the repository's top level is into W's top.
+    const core = path.join(repo, "packages", "core");
+    const other = path.join(repo, "packages", "other");
+    fs.mkdirSync(core, { recursive: true });
+    fs.mkdirSync(other, { recursive: true });
+    fs.writeFileSync(path.join(lib, "package.json"), JSON.stringify({ dependencies: { "app-a": `file:${relativeSpec(lib, repo)}` } }));
+    expect(await perimeterModule.discoverConsumers(core, [{ root: lib, name: "lib-b" }]))
+      .toEqual({ consumers: [{ root: lib, name: "lib-b", via: "package.json dependencies (file:)" }], incomplete: [] });
+    // A root inside W's top (another folder of W's repository) reads no edges, even one into W.
+    fs.writeFileSync(path.join(other, "package.json"), JSON.stringify({ dependencies: { core: "file:../core" } }));
+    expect(await perimeterModule.discoverConsumers(core, [{ root: other, name: "other" }])).toEqual(NONE);
+  });
+
+  it("P3c.5 (SD-P3c-4): a root whose edge reading a bound cuts, with no consumer, is incomplete", async () => {
+    const sibling = path.join(parent, "lib-c");
+    fs.mkdirSync(sibling, { recursive: true });
+    fs.writeFileSync(path.join(lib, "package.json"), JSON.stringify({ name: "lib-b", workspaces: ["packages/*"] }));
+    for (const name of ["a", "b"]) {
+      const dir = path.join(lib, "packages", name);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name, dependencies: { "lib-c": `file:${relativeSpec(dir, sibling)}` } }));
+    }
+    const edgeLimits = { ...EDGE_LIMITS, workspaces: 1 };
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }], { edgeLimits }))
+      .toEqual({ consumers: [], incomplete: [{ root: lib, name: "lib-b" }] });
+    // Within the bound (and by default): complete, no consumer.
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }], { edgeLimits: { ...EDGE_LIMITS, workspaces: 2 } })).toEqual(NONE);
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }])).toEqual(NONE);
+    // A workspace package's edge into W is found, named with its declaring file.
+    fs.writeFileSync(path.join(lib, "packages", "b", "package.json"), JSON.stringify({ name: "b", dependencies: { "app-a": `file:${relativeSpec(path.join(lib, "packages", "b"), repo)}` } }));
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }])).toEqual({
+      consumers: [{ root: lib, name: "lib-b", via: "package.json dependencies (file:) in packages/b/package.json" }],
+      incomplete: [],
+    });
   });
 
   it("QA-1 #3: a link whose text is a UNC or device path is never realpath'ed", async () => {
