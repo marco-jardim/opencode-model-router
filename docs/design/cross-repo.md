@@ -114,12 +114,19 @@ Purpose: admit a repository outside `routing.repoParents` without editing config
 - The host's own "Allow always" saves a durable, project-scoped allow rule with no expiry (v2 permissions docs). It is keyed by the tool's proposed patterns, not by a repository, so it cannot carry this approval by itself.
 - `router_request_authority` widens a grant on the orchestrator's resume (`authority.ts:7-16`, `v2-hooks.ts:374-376`, `:1576`): the approver there is the orchestrator agent, not a human. It is not a model for this feature.
 
-**Spikes before implementation (not verified):**
+**Spikes (run live 2026-10-12, OpenCode v2.0.26):**
 - **T1.** Does the v2 evaluate event for the orchestrator's `subagent` call carry the dispatch prompt (or a call ID that links it to the `execute.before` arguments)? The event has `sessionID`, `agent`, `action`, `resources`, `metadata`, `source`; the content of `metadata` is unconfirmed.
+  - Result: answered by correlation. The evaluate event for the orchestrator's `subagent` call is `{sessionID, agent, action: "subagent", resources: ["<role agent id>"], metadata: {}, source: {type: "tool", messageID, id}}`; `metadata` is empty. The dispatch prompt is not in it (a sentinel in the description raised nothing). `source.id` equals the `id` that `tool.execute.before` receives for the same call, and `tool.execute.before` runs first: the router can read the route line there and raise the ask in the evaluate of the same call.
 - **T2.** Does an `ask` raised inside a child session reach the human in the TUI and desktop app, and what does a background child do while it waits? The S11 probe turned an `ask` into a deny to avoid hangs (`docs/qa/role-tier/spikes.md:191`).
+  - Result: partly answered. An ask raised in a role child session reached the human in the TUI; the foreground child waited (about 27 s) for the reply. Background children and `opencode run` were not tested; the host source has no timeout (it waits indefinitely). Not needed while the ask is raised in the orchestrator session.
 - **T3.** The payload of `permission.replied` (request ID, reply `once` / `always` / `reject`) and whether the plugin can correlate it with the request it raised.
+  - Result: answered. `permission.asked` data is `{id: "per_…", sessionID, action, resources, save, source: {type, messageID, id}}`; `permission.replied` data is `{sessionID, requestID, reply: "once" | "always" | "reject"}`. Correlation: tool call id → `asked.source.id` → `asked.id` = `replied.requestID`. From the host source: one `always` may publish `always` for other pending requests it re-evaluates; `reject` rejects every pending request of the session; closing the session rejects all of them.
 - **T4.** After a human answers "Allow always" to a router-raised ask, does the host's saved rule change later evaluations in a way the hook cannot override? (Hooks run for allow decisions too, so the router should still be able to ask again.)
+  - Result: answered. After "Allow always" the host saved a project rule (`save: ["*"]` for `read`), and the next matching request still reached the hook (effect `allow`), which raised the ask again. The router stays in control, but an "always" on its `subagent` ask leaves a host project rule allowing that role with no expiry; the router must ignore it and rely on its own store. (Side effect of the spike: a saved project rule `read *` = allow remains in the dogfood instance.)
 - **T5.** Does the `tool.execute.after` hook of the `question` tool see the human's answer, unmodified?
+  - Result: answered. `tool.execute.after` of `question` receives `result.output.answers` (for example `[["B"]]`) and `result.metadata.answers`: the human's selection, structured. The fallback channel is viable.
+
+Outcome: channel 1 (ask on the orchestrator's `subagent` evaluation) is viable; channel 2 stays the fallback.
 
 **Trigger.** A dispatch names `root=` for a git top level outside every parent that:
 - passes the sanitising rules (no UNC or device path, no 8.3 segment, no `.` or `..`);
@@ -688,7 +695,7 @@ After QA rounds 1 and 2 (facts checked at HEAD effcdb3):
 - **Q2.** Decided 2026-10-12: `../` imports and tsconfig/vite aliases that leave the repository resolve differently in the reference worktree under `%TEMP%`. They are documented as a limit (D25, OD-P3c-2 (a)); failing closed (a config scan for references outside the root makes the reference approximate) is recorded as a follow-up.
 - **Q3.** Concurrent sibling writes into P. Phase 1 fails closed: unverifiable, with a reason naming the dispatches whose W is that repository. Should changes matching a sibling's tool-observed edits be attributed to the sibling instead?
 - **Q4.** Decided 2026-10-10: hook-level allow approved (D13, I18).
-- **Q5.** Approval defaults: 14 days after last use and a 90-day cap. Should an approval offer a read-only variant (R only, never W)?
+- **Q5.** Decided 2026-10-12: keep 14 days after the last use, 90-day cap; no read-only variant (D28). (Was: approval defaults of 14 days after last use and a 90-day cap; should an approval offer a read-only variant, R only, never W?)
 - **Q6.** Same-branch history rewrite across a roles lineage: carried attempts compare names and heads only.
 - **Q7.** Decided 2026-10-12: keep the generated external_directory catch-all `deny`. A worktree outside `routing.repoParents` is reached by adding its parent to `repoParents`; turning the catch-all into `ask` could leave a background child waiting on a prompt.
 - **Q8.** Decided 2026-10-11: the role dispatch header (OD6) follows I9. It is emitted only when `routing.repoParents` is set, the route line declares `repo=`, `branch=` or `root=`, or the work root differs from the session directory; otherwise the dispatch prompt is byte-identical to what it was before the header existed (D14).
@@ -701,7 +708,7 @@ After QA rounds 1 and 2 (facts checked at HEAD effcdb3):
 - The `git symbolic-ref` exit codes (settled: the snapshot no longer uses `symbolic-ref`; head and branch come from one `rev-parse`).
 - Snapshot time for a working set of 5–10 repositories within `baselineTimeoutMs`.
 - Which agent grader sessions run as (`wiring.ts:1299-1306` passes none).
-- Spikes T1–T5 (section 3).
+- Spikes T1–T5 (settled: run live 2026-10-12, results in section 3, "Spikes"; T2 partly answered).
 
 ## 11. Decision log
 
@@ -734,6 +741,7 @@ After QA rounds 1 and 2 (facts checked at HEAD effcdb3):
 | D25 | 2026-10-12 | OD-P3c-2 = (a): Q2 (approximate reference for edges leaving the repository) is closed as a documented, narrower limit; failing closed is recorded as a follow-up. Decided, not yet implemented. |
 | D26 | 2026-10-12 | OD-P3c-3 = (b): W's dependency targets are read again at return, and the new admitted ones are frozen, so a dependency added during the dispatch is not "changed" at `router_verify`. Decided, not yet implemented. |
 | D27 | 2026-10-12 | QA-1 M2, owner decision: a post-run completeness check for the cross-link run: every consumer test file that names a W package in an import/require specifier must have run, else the result is incomplete. Implemented (Phase 3 (a), `830d5db..9ccabd0`). |
+| D28 | 2026-10-12 | Phase 4 goes ahead after spikes T1–T5 (all viable; T2 partly): the ask is raised on the orchestrator's `subagent` evaluation, correlated by tool call id; Q5 decided (14/90 days, no read-only variant). One lot, one heavy QA round plus a re-check of its fixes, batched dogfood. |
 
 ## 12. Alternatives considered
 
