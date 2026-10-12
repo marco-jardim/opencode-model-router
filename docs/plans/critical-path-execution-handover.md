@@ -442,6 +442,17 @@ implementations, so the plan now runs on its own data/state dirs (owner decision
   background tests, helper) for -1/-2/-5/-6/-7/-9; B `ses_ecde4683affevrB19VMMzc8n6t` (W `timings.ts`, its test,
   `CHANGELOG.md`) for -3/-4/-8. In flight Wave 3: 3.1.6 `ses_ecded6271ffe2CdyUJ3Qx8P3CD` (W `runtime.ts`), 3.2.4
   `ses_ecde5881bffeulfqr317KFYVDP` (W `phase-suite.ts`, `bisect.ts`), 3.2.5 `ses_ecde55d3affeYnsX1ugioHtVgp` (W `land.ts`).
+- **Progress (19:05):** pdf1-2 QA fixes B `41158dc` (422 green). 3.2.5 `f49ec35`, 3.2.4 `b8a110f`, 3.1.6 `b00d5e0` (tsc
+  clean; tests in 3.2.6/3.1.8). Deviation: the 3.1.6 implementer ran the full `test` script through router_run (330 s,
+  35 timeouts/failures, no baseline) against the plan's scoped-test rule; runtime.ts is imported by nothing, so no
+  attribution; later dispatches say "router_run typecheck only". In flight: 3.2.6 unit `ses_ecddf99f8ffe9MdfUHeXEBV3QO`,
+  real-git `ses_ecddf6e4affeIYzoSyo9Cyj5Nk`; 3.1.7 `ses_ecdde066fffe5ybmYFw3oy0i7a` waiting for a lease.
+- **Dogfood fault DF-1.1-4 (to record in `dogfood.md`):** the 3.1.7 implementer (root `D:\git\omr-cpx-p31`) was
+  refused an edit of `D:\git\omr-cpx-p31\src\compat\v2-hooks.ts` because the pdf1-2 fixer
+  `ses_ecde49833ffeB6QJ3P9dWdhhr5` (root `D:\git\omr-cpx-pdf1-2`) holds a lease on its own worktree's `v2-hooks.ts`:
+  leases collide across worktrees (keyed by repo-relative path, or by the common git dir, instead of the tree). Plan
+  §0.6 assumes one worktree per phase is isolation enough. Workaround: serialize hub-file writers across worktrees.
+  Fix candidate for `pdf1-2` round 2 or a later fix phase (lease key must include the work tree).
 
 *(superseded)* **NEXT ACTION (2026-10-12 ≈16:30): DF-1.1 re-switch — waiting for the owner restart; then the DF-1.1 self-check and
 re-probes (DF1.4.a with `df1.1`, c runner criterion, d, e), then Wave 3.** `cpx/pdf1-1` merged into `cpx/main` as
