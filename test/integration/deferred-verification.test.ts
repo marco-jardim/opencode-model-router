@@ -12,6 +12,7 @@
  * delegation must leave the exec record empty and never construct the S3 slot's scope opener.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -60,6 +61,10 @@ const state = vi.hoisted(() => ({
   queues: 0,
   /** P2e: the cwd of every planStaticScoping call (the deferred finish's static scoping). */
   scopingCwds: [] as string[],
+  /** Y6: the input of every planStaticScoping call. */
+  scopingInputs: [] as import("../../src/verify/runner").StaticScopingInput[],
+  /** Y6: replaces the real planStaticScoping when set (undefined: the real planner). */
+  scopingImpl: undefined as ((input: import("../../src/verify/runner").StaticScopingInput) => Promise<import("../../src/verify/runner").StaticScoping>) | undefined,
   /** P2e: the scopingPlan every assessRisk call received (a scoped plan, S6, or the neutral full-scope plan). */
   scopingPlans: [] as (import("../../src/verify/runner").StaticScoping | import("../../src/verify/risk").FullScopePlan)[],
 }));
@@ -81,7 +86,8 @@ vi.mock("../../src/verify/runner", async importOriginal => {
     ...actual,
     planStaticScoping: (input: Parameters<typeof actual.planStaticScoping>[0]) => {
       state.scopingCwds.push(input.cwd);
-      return actual.planStaticScoping(input);
+      state.scopingInputs.push(input);
+      return state.scopingImpl !== undefined ? state.scopingImpl(input) : actual.planStaticScoping(input);
     },
   };
 });
@@ -221,6 +227,8 @@ beforeEach(() => {
     slotAcquires: 0,
     queues: 0,
     scopingCwds: [],
+    scopingInputs: [],
+    scopingImpl: undefined,
     scopingPlans: [],
   });
 });
@@ -768,7 +776,8 @@ describe("wiring (2.4.2a)", () => {
       state.snapshot = changed();
       const finish = deferredOf(await wiring.finishDeferred(store, input({
         dod: TESTS_DOD,
-        placements: [{ cwd: elsewhere, top: elsewhere, foreign: true, scope: "affected" }],
+        // Y6: without scope= (an explicit scope=affected is a cross-link plan now, tested below).
+        placements: [{ cwd: elsewhere, top: elsewhere, foreign: true }],
       })));
       // Not planned (no attribution in that repository) and S6 attribution-unavailable: the risk of today's S6.
       expect(state.scopingCwds).toEqual([]);
@@ -776,6 +785,126 @@ describe("wiring (2.4.2a)", () => {
       expect(finish.risk.reasons).toContain(REASONS.unverifiable);
       expect(finish.risk.level).not.toBe("low");
       expect(state.commands).toEqual([]);
+    });
+
+    it("Y6: a foreign testsPass without scope= stays S6 attribution-unavailable; a foreign lintClean is not planned", async () => {
+      const LINT_AND_TESTS: DoD = { ...TESTS_DOD, checks: [{ kind: "testsPass", command: "npm test" }, { kind: "lintClean", command: "npm run lint" }] };
+      const { wiring, store } = makeWiring();
+      await wiring.startDispatch(store, "task:orch:1", root, LINT_AND_TESTS, "", false);
+      state.snapshot = changed();
+      const finish = deferredOf(await wiring.finishDeferred(store, input({
+        dod: LINT_AND_TESTS,
+        placements: [{ cwd: elsewhere, top: elsewhere, foreign: true }, { cwd: elsewhere, top: elsewhere, foreign: true, scope: "affected" }],
+      })));
+      // Only an explicit scope=affected testsPass crosses the link: neither check is planned, and the testsPass is today's S6.
+      expect(state.scopingCwds).toEqual([]);
+      expect(state.scopingPlans).toEqual([expect.objectContaining({ unverifiable: true, code: "attribution-unavailable" })]);
+      expect(finish.risk.reasons).toContain(REASONS.unverifiable);
+      expect(state.commands).toEqual([]);
+    });
+
+    it("Y6: a foreign scope=affected testsPass is planned across the link (W's root, the consumer spellings, absolute paths)", async () => {
+      const scopable = { scopable: true, runner: "vitest", pendingSearches: 0, notes: [] } as const;
+      state.scopingImpl = async () => scopable;
+      const { wiring, store } = makeWiring();
+      await wiring.startDispatch(store, "task:orch:1", root, TWO_TESTS_DOD, "", false);
+      state.snapshot = changed();
+      const finish = deferredOf(await wiring.finishDeferred(store, input({
+        placements: [{ cwd: elsewhere, top: elsewhere, foreign: true, scope: "affected" }, { cwd: pkgB, top: root, foreign: false }],
+      })));
+      expect(state.scopingCwds).toEqual([elsewhere, pkgB]);
+      // The gate's inputs (gate.ts, deterministic.ts): crossLinkRoot = W's root (the snapshot's), the consumer's link spellings
+      // of it (none here: nothing links it), the changed paths absolute against W.
+      const [linked, local] = state.scopingInputs;
+      expect(linked).toMatchObject({ command: "npm test", cwd: elsewhere, crossLinkRoot: root, crossLinkAliases: [] });
+      expect(linked?.changedFiles).toEqual([expect.objectContaining({ path: resolve(root, "packages", "a", "src", "a.ts") })]);
+      // A local check is planned as before: no cross-link input.
+      expect(local?.cwd).toBe(pkgB);
+      expect(local).not.toHaveProperty("crossLinkRoot");
+      expect(local).not.toHaveProperty("crossLinkAliases");
+      // A scopable plan: no S6, so no "unverifiable" risk reason.
+      expect(state.scopingPlans).toEqual([scopable]);
+      expect(finish.risk.reasons).not.toContain(REASONS.unverifiable);
+      expect(state.commands).toEqual([]);
+    });
+
+    /** Y6: this repository's vitest (the consumer links it, as cross-link-related.test.ts does). */
+    const OWN_VITEST = path.join(process.cwd(), "node_modules", "vitest");
+    /** Y6: a lib repository W and a consumer C linking W (and this repository's vitest 5) through node_modules, in a temp dir. */
+    const makeLinked = () => {
+      const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "omr-y6-")));
+      const lib = path.join(base, "lib");
+      const consumer = path.join(base, "consumer");
+      const dirLink = process.platform === "win32" ? "junction" : "dir";
+      fs.mkdirSync(lib, { recursive: true });
+      fs.writeFileSync(path.join(lib, "package.json"), JSON.stringify({ name: "y6-lib", version: "1.0.0", type: "module", main: "index.js" }));
+      fs.writeFileSync(path.join(lib, "index.js"), "export const one = 1;\n");
+      fs.mkdirSync(path.join(consumer, "test"), { recursive: true });
+      fs.writeFileSync(path.join(consumer, "package.json"), JSON.stringify({ name: "y6-consumer", version: "1.0.0", type: "module", private: true }));
+      fs.writeFileSync(path.join(consumer, ".gitignore"), "node_modules\n");
+      fs.writeFileSync(
+        path.join(consumer, "test", "uses-lib.test.js"),
+        `import { expect, test } from "vitest";\nimport { one } from "y6-lib";\n\ntest("one", () => {\n  expect(one).toBe(1);\n});\n`,
+      );
+      execFileSync("git", ["init", "-q"], { cwd: lib, stdio: "ignore" });
+      execFileSync("git", ["init", "-q"], { cwd: consumer, stdio: "ignore" });
+      fs.mkdirSync(path.join(consumer, "node_modules"), { recursive: true });
+      fs.symlinkSync(lib, path.join(consumer, "node_modules", "y6-lib"), dirLink);
+      fs.symlinkSync(OWN_VITEST, path.join(consumer, "node_modules", "vitest"), dirLink);
+      return { base, lib, consumer };
+    };
+    /** The deferred finish of one foreign scope=affected testsPass in C for a change to W's index.js (the real planner). */
+    const finishLinked = async (fx: ReturnType<typeof makeLinked>, command: string) => {
+      const dod: DoD = { ...TESTS_DOD, checks: [{ kind: "testsPass", command }] };
+      const at = (files: TreeSnapshot["files"], fingerprint: string): TreeSnapshot =>
+        ({ cwd: fx.lib, root: fx.lib, head: "HEAD", fingerprint, dirty: files.length > 0, files, digests: new Map() });
+      const { wiring, store } = makeWiring();
+      state.snapshot = at([], "clean");
+      await wiring.startDispatch(store, "task:orch:1", fx.lib, dod, "", false);
+      fs.writeFileSync(path.join(fx.lib, "index.js"), "export const one = 2 - 1;\n");
+      state.snapshot = at([{ path: path.join(fx.lib, "index.js"), status: " M" }], "after");
+      return deferredOf(await wiring.finishDeferred(store, input({
+        cwd: fx.lib,
+        dod,
+        placements: [{ cwd: fx.consumer, top: fx.consumer, foreign: true, scope: "affected" }],
+      })));
+    };
+
+    describe.skipIf(!fs.existsSync(path.join(OWN_VITEST, "vitest.mjs")))("Y6: a real cross-link plan", () => {
+      it("Y6: vitest 5 through the link is scopable: no \"unverifiable\" risk reason", async () => {
+        const fx = makeLinked();
+        try {
+          const finish = await finishLinked(fx, "npx vitest run");
+          expect(state.scopingCwds).toEqual([fx.consumer]);
+          expect(state.scopingInputs[0]).toMatchObject({ cwd: fx.consumer, crossLinkRoot: fx.lib });
+          expect(state.scopingInputs[0]?.crossLinkAliases?.length).toBeGreaterThan(0);
+          expect(state.scopingPlans).toEqual([expect.objectContaining({ scopable: true, runner: "vitest" })]);
+          expect(finish.risk.reasons).not.toContain(REASONS.unverifiable);
+          expect(state.commands).toEqual([]);
+        } finally {
+          fs.rmSync(fx.base, { recursive: true, force: true, maxRetries: 3 });
+        }
+      });
+
+      it("Y6: jest through the link stays S6 (cross-link-unsupported): the \"unverifiable\" risk reason", async () => {
+        const fx = makeLinked();
+        try {
+          fs.mkdirSync(path.join(fx.consumer, "node_modules", "jest", "bin"), { recursive: true });
+          fs.writeFileSync(
+            path.join(fx.consumer, "node_modules", "jest", "package.json"),
+            JSON.stringify({ name: "jest", version: "29.7.0", bin: { jest: "bin/jest.js" } }),
+          );
+          fs.writeFileSync(path.join(fx.consumer, "node_modules", "jest", "bin", "jest.js"), "process.exit(0);\n");
+          const finish = await finishLinked(fx, "npx jest");
+          expect(state.scopingCwds).toEqual([fx.consumer]);
+          expect(state.scopingPlans).toEqual([expect.objectContaining({ unverifiable: true, code: "cross-link-unsupported" })]);
+          expect(finish.risk.reasons).toContain(REASONS.unverifiable);
+          expect(finish.risk.level).not.toBe("low");
+          expect(state.commands).toEqual([]);
+        } finally {
+          fs.rmSync(fx.base, { recursive: true, force: true, maxRetries: 3 });
+        }
+      });
     });
   });
 

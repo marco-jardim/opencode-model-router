@@ -76,7 +76,7 @@ import {
 } from "./dispatch";
 import { runArgv, runShell } from "./exec";
 import { listIgnoredModules, snapshotTree } from "./tree";
-import { discoverConsumers, linkedTargets, planPerimeter, type ConsumerDiscovery } from "./perimeter";
+import { crossLinkAliases, discoverConsumers, linkedTargets, planPerimeter, type ConsumerDiscovery } from "./perimeter";
 import { defaultExternalLinks, pinTarget, type LinkPin } from "./pin";
 import { depthBelow, gitTopOf, perimeterKey } from "./git-top";
 import type { DispatchPerimeter, PerimeterEntry } from "./dispatch";
@@ -88,7 +88,7 @@ import { REFERENCE_NONE } from "./baseline";
 import { scrubText } from "../guard/scrub";
 import type { DoD } from "./dod";
 import type { ArgvSeam, CheckPlacement, Deadline, ExecOptions, ExecResult as SeamResult, ExecSeam, ReferenceState, TestsPassHook, Verdict } from "./types";
-import { planScopedRun, planStaticScoping, type ChangedPath, type RunnerFs, type StaticScoping, type TestSearchSeam } from "./runner";
+import { planScopedRun, planStaticScoping, type ChangedPath, type RunnerFs, type StaticScoping, type StaticScopingInput, type TestSearchSeam } from "./runner";
 import {
   DEFAULT_GATE_BUDGET_MS,
   graderTimeoutMs,
@@ -2107,10 +2107,17 @@ export function createVerificationWiring(deps: {
    *
    * Cross-repo P2e: with `placements` (index-aligned with `dod.checks`), each testsPass check is planned at its placement's
    * cwd; a placement with `scope === "full"` is not planned (it runs in full); a foreign placement is S6
-   * (attribution-unavailable). A check without a placement, or no placements at all: the base dir, as before.
+   * (attribution-unavailable), unless it is a cross-link plan (Y6, below). A check without a placement, or no placements at
+   * all: the base dir, as before.
    *
    * P2e QA-1 #6: with `fullScope` (OD-P2e-2) no testsPass check is planned as affected (each runs in full); when every testsPass
    * check runs in full, the result is the neutral FULL_SCOPE plan, never the unfinished S6 one.
+   *
+   * Cross-repo P3a (Y6): a foreign testsPass with an explicit scope=affected is planned as the gate runs it (deterministic.ts):
+   * at its placement's cwd, with `crossLinkRoot` = W's root (`changeRoot`, else the base dir, as the gate falls back) and the
+   * consumer link spellings of it (perimeter.ts crossLinkAliases), the changed paths made absolute against that root (F7).
+   * A scopable cross-link plan then raises no S6; a runner the link does not reach (jest, pytest, another vitest major) still
+   * does. Any other foreign placement stays S6 (attribution-unavailable).
    */
   const staticScoping = async (
     dod: DoD,
@@ -2119,10 +2126,22 @@ export function createVerificationWiring(deps: {
     deadline: Deadline,
     placements?: readonly (CheckPlacement | undefined)[],
     fullScope?: boolean,
+    changeRoot?: string,
   ): Promise<StaticScoping | FullScopePlan> => {
     const unfinished: StaticScoping = { unverifiable: true, code: "search-failed", reason: STATIC_SCOPING_UNFINISHED_REASON };
     const budget = resolveVerifyBudget(getConfig());
     const base = resolveBaseDir(cwd, directory);
+    // Y6: W's root as the gate takes it (gate.ts: artefact.changeRoot ?? effectiveBaseDir), and (F7) the changed paths absolute
+    // against it, computed once and only for a cross-link plan.
+    const linkRoot = changeRoot ?? base;
+    let absoluteChanged: readonly ChangedPath[] | undefined;
+    const linkChangedFiles = (): readonly ChangedPath[] => (absoluteChanged ??= changedFiles.map(file => ({
+      ...file,
+      path: isAbsolute(file.path) ? file.path : resolve(linkRoot, file.path),
+      ...(file.previousPath !== undefined
+        ? { previousPath: isAbsolute(file.previousPath) ? file.previousPath : resolve(linkRoot, file.previousPath) }
+        : {}),
+    })));
     const plans: StaticScoping[] = [];
     let ranFull = false;
     for (const [index, check] of dod.checks.entries()) {
@@ -2137,7 +2156,9 @@ export function createVerificationWiring(deps: {
         ranFull = true;
         continue;
       }
-      if (placement?.foreign === true) {
+      // Y6: only an explicit scope=affected crosses the link (deterministic.ts runDeterministic); any other foreign check is S6.
+      const crossLink = placement?.foreign === true && placement.scope === "affected";
+      if (placement?.foreign === true && !crossLink) {
         plans.push({
           unverifiable: true,
           code: "attribution-unavailable",
@@ -2152,11 +2173,25 @@ export function createVerificationWiring(deps: {
         continue;
       }
       try {
-        plans.push(await withTimeout(
-          planStaticScoping({ command, cwd: at, changedFiles, budget: { maxWorkers: budget.maxWorkers }, fs: fsSeam }),
-          ms,
-          "static scoping",
-        ));
+        const input: StaticScopingInput = crossLink
+          ? {
+            command,
+            cwd: at,
+            changedFiles: linkChangedFiles(),
+            budget: { maxWorkers: budget.maxWorkers },
+            fs: fsSeam,
+            crossLinkRoot: linkRoot,
+            // Fail-soft, as the gate's alias provider (deterministic.ts crossLinkTarget): an error gives no aliases.
+            ...(() => {
+              try {
+                return { crossLinkAliases: crossLinkAliases(at, linkRoot) };
+              } catch {
+                return {};
+              }
+            })(),
+          }
+          : { command, cwd: at, changedFiles, budget: { maxWorkers: budget.maxWorkers }, fs: fsSeam };
+        plans.push(await withTimeout(planStaticScoping(input), ms, "static scoping"));
       } catch {
         plans.push(unfinished);
       }
@@ -2237,7 +2272,10 @@ export function createVerificationWiring(deps: {
           ...(f.previousPath !== undefined ? { previousPath: f.previousPath } : {}),
         }));
         changedFiles = paths;
-        const scopingPlan = await staticScoping(input.dod, input.cwd, paths, deadline, input.placements, input.fullScope);
+        // Y6: W's root (the snapshot's git top) is the cross-link root of a foreign scope=affected testsPass.
+        const scopingPlan = await staticScoping(
+          input.dod, input.cwd, paths, deadline, input.placements, input.fullScope, change.snapshot?.root,
+        );
         risk = assessRisk({ changedFiles: paths, reference: referenceCaptured, producerTier, scopingPlan, root: change.snapshot?.root });
         // QA-2.4-8: the drift baseline is taken BEFORE the result is released (fs reads only, under
         // the same DEFERRED_FINISH_MS bound). An edit that lands right after the return is then
