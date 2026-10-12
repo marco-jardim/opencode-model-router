@@ -117,7 +117,10 @@ Build `cpx/df1` = `226d967` (`D:\git\omr-cpx-dogfood-df1`), loaded since 2026-10
   `D:\git\omr-cpx-scratch` at 15:36:41.9Z and loaded a second router instance there (QA-DF1-1 probe worktree).
   Hypothesis: a router instance starting in a new location reloads the shared pending journal and settles the other
   instance's live handles as lost. Code fault → `pdf1-1` (hinders execution: every new worktree location — Wave 3 opens
-  several — can void in-flight verifications).
+  several — can void in-flight verifications). Reproduced 16:04:40Z: the host evicted the `C:\Users\Marquinho` and
+  `D:\git\opencode-model-router` locations and booted them again (`loading plugin` df1 in both, no new worktree); the
+  orchestrator then received `lost in restart` twice for implementer `ses_ecf25d227ffeXewxYpZq1dT44a` (pdf1-1 H3,
+  `vrf_c8e40a80…`) while it was still running. DF-1-1 recurs with every such re-boot (host project probes only).
 - **DF-1-11 — the restart opened a fresh session, not `-s ses_ed82f88a7ffej5iKaRHuwIa6fd` (QA-DF1-5).** The owner used
   the §0b fresh-session kickoff (`d93d4d8`, 12:02, after the DF1.2 record); the live orchestrator is
   `ses_ecf5bd114ffe5QT3S5xVTAQcF4`. DF1.3 and §0.12-3.5 say "continue the same session". Effect: the launch and revert
@@ -265,3 +268,20 @@ Round 1 (reviewer `ses_ecf4a6d14ffeI81Bz7erefp9TM`, heavy, at `30ff5b2`): 15 fin
 DF-1 is **open**: DF1.4.a, b, f, h pass; c (runner criterion), d and e are re-probed on `cpx/df1.1` after `pdf1-1`
 (DF-1-3, -4, -5, -6, -9, -10, QA-DF1-12 and the DF-1-1 hardening), with its own run-scoped self-check. Until then the plan
 continues on df1 under the binding workaround.
+
+### Fix phase `pdf1-1` (branch `cpx/pdf1-1`, worktree `D:\git\omr-cpx-pdf1-1`, from `30ff5b2`)
+
+| Commit | Faults | Producer |
+|---|---|---|
+| `b871c00` | DF-1-3 (grader launched from the orchestrator on background and held gates; UNVERIFIABLE tag for accepted unverifiable results), DF-1-4 (a resumed attempt never takes the previous turn's completion element, parked end or answer), DF-1-2 (roles.runtime expectations refreshed for 2.1) | implementer `ses_ecf494a78ffeIBjqCOSUjN2KxX` (heavy), `ses_ecf48defcffeiMPXtA1KqK8UAC` |
+| `12774fc` | DF-1-9 (unrecorded parent resolved, never root by default), DF-1-5 (a root run's end closes its turn row), QA-DF1-12 (route-line `root=` wins), DF-1-6 smoke scenario `DF-1-6 background tail` | `ses_ecf36b2c4ffevivgCiXW74CHnj` (heavy), `ses_ecf3498f9ffezzS1v2Zd7sE4E8` (heavy) |
+| `51d3c51` | DF-1-10 (per-instance beat files; a same-pid claim with a fresh beat is refused across module copies, a dead owner is still taken over), DF-1-1 hardening (v2 start-up reference GC skipped for a location outside a configured `routing.workRoots`) | `ses_ecf25d227ffeXewxYpZq1dT44a` (heavy); orchestrator fixed one test (sentinel identity across module copies) |
+
+DF-1-6 itself is fixed outside this repository (marco-jardim/opencode-anthropic-fix#42, see above).
+
+Verification (orchestrator shell, at `51d3c51`): typecheck green; scoped run of the 109 test files importing the changed
+hubs at `12774fc`: 6118 passed / 16 skipped; the H3 scoped files green. One unintended full-suite run (a pwsh array
+splat expanded to no file filter): 229 files passed, 2 failed — the H3 sentinel test (fixed) and
+`test\unit\exec.test.ts` "a deadline after the direct child exited kills what it left running within 3 s (QA-1.2-1,
+G4)", which passes isolated (`--maxWorkers=1`): a load-sensitive timing flake, recorded for the 6.2 pre-flight.
+`smoke:cpx` 57/57, `smoke:v2` 2/2, `smoke:v1` 27 passed / 11 skipped (1.18.35 on PATH).
