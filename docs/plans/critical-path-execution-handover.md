@@ -420,6 +420,12 @@ implementations, so the plan now runs on its own data/state dirs (owner decision
   the recorded baseline difference); router entrypoint `file:///D:/git/omr-cpx-dogfood-df1.1/server.ts`; one
   `router_verify` tool. **Pass.** Provider turns work (credential fix holds). The session was started with the
   §0 kickoff prompt; the orchestrator resumed from this NEXT ACTION instead of re-running 0.P (done 2026-10-10).
+- **In flight (18:30):** fix phase `pdf1-2` created (`D:\git\omr-cpx-pdf1-2`, branch `cpx/pdf1-2`, tag
+  `cpx/pdf1-2-base` = `b452dea`, `npm ci` done); explorer `ses_ece005aeaffe2vkqwiYeU6Grv0` (DF-1.1-1/-2 recon, R only).
+  Wave 3: p31 implementers 3.1.2 `ses_ecdffdc99ffemfi24BJRhggi5C` (W `schedule.ts` + test), 3.1.3
+  `ses_ecdffab07ffeTDH3rknizw7W4E` (W `capacity.ts` + test), 3.1.4 `ses_ecdff6ed1ffeBXU36iCqBmtU3b` (W `expand.ts` + test);
+  p32 implementer 3.2.2 + V2-V8 `ses_ecdff07afffeZ3PYj1J2dNUrcQ` (W `integrate\checks.ts`, exports in `verify\runner.ts`,
+  `verify\slot.ts`).
 
 *(superseded)* **NEXT ACTION (2026-10-12 ≈16:30): DF-1.1 re-switch — waiting for the owner restart; then the DF-1.1 self-check and
 re-probes (DF1.4.a with `df1.1`, c runner criterion, d, e), then Wave 3.** `cpx/pdf1-1` merged into `cpx/main` as
