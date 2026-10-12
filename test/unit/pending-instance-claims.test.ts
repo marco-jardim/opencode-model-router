@@ -174,7 +174,7 @@ describe("DF-1-10: instance beat files (sibling module copies in one host proces
     }
   });
 
-  it("DF-1-10 same pid, other token, stale heartbeat → taken; no beat file or another pid's beat → taken (df1 behaviour)", () => {
+  it("DF-1-10 same pid, other token, stale heartbeat → taken; no beat file or another pid's beat → taken (df1 behaviour) (guard)", () => {
     const { claims, beats } = dirs();
     const mine = createInstanceClaimToken(beats);
     try {

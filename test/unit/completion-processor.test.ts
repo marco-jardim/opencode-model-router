@@ -146,7 +146,7 @@ describe("DF-1-4 resumed background dispatch (registry)", () => {
     expect(r.reg.takeEarlyEnd("ses_c3")?.eventID).toBe("e_own");
   });
 
-  it("DF-1-4 an end met before the turn has an answer waits; the turn's own end delivers exactly one verdict with its answer", async () => {
+  it("DF-1-4 an end met before the turn has an answer waits; the turn's own end delivers exactly one verdict with its answer (guard)", async () => {
     const r = rig();
     await launch(r, "c2", "ses_c2", { handle: "vrf_2" });
     const reads: Array<{ text?: string } | undefined> = [undefined, { text: "turn 2 answer" }];

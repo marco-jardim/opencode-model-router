@@ -380,7 +380,7 @@
 // ===============================================================================================
 
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { appendFile, mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
@@ -975,7 +975,7 @@ export function createPendingFileJournal(path: string, options: PendingFileJourn
       compactionWarned: false,
       markAt: undefined,
       refs: 0,
-      providers: new Map(),
+      providers: processSnapshotProviders(key),
     };
     SHARED_JOURNALS.set(key, found);
   }
@@ -1163,7 +1163,8 @@ export function createPendingFileJournal(path: string, options: PendingFileJourn
 
   /**
    * QA-2.1-33: `records` (the caller's own state) plus the snapshot of every OTHER journal object of this path that
-   * registered a provider, in registration order: the caller's own provider is not asked again. One record per identity
+   * registered a provider, in registration order: the caller's own provider is not asked again. QA-DF1-18: the journal
+   * objects of every module copy of the plugin in this process count (`processSnapshotProviders`). One record per identity
    * (`mergePendingSnapshots`): the same hold or attempt reaches the union from several sources with other field values.
    * A throwing provider fails the recreate, which then changes nothing.
    */
@@ -1179,7 +1180,8 @@ export function createPendingFileJournal(path: string, options: PendingFileJourn
     const body = records.map((record) => `${JSON.stringify(record)}\n`).join("");
     await mkdir(dirname(file), { recursive: true });
     state.madeDir = true;
-    const temp = `${file}.${process.pid}.compact`;
+    // QA-DF1-18: per module copy (`<pid>.<token>`): two copies of the plugin in one process never share a temp file.
+    const temp = `${file}.${process.pid}.${PROCESS_CLAIM_TOKEN}.compact`;
     try {
       const handle = await open(temp, "w");
       try {
@@ -1223,8 +1225,10 @@ export function createPendingFileJournal(path: string, options: PendingFileJourn
 
   /**
    * Marks this process as a writer of the journal and reports whether another live process holds a fresh mark too
-   * (QA-2.1-22): a dead pid's mark, and one of this pid from an earlier process (another token), is removed; a live pid's mark
-   * older than `writerStaleMs` (a reused pid: a live writer re-stamps its mark while it appends) does not block.
+   * (QA-2.1-22): a dead pid's mark is removed; a live pid's mark older than `writerStaleMs` (a reused pid: a live writer
+   * re-stamps its mark while it appends) does not block. QA-DF1-18: a mark of this pid under another token is another module
+   * copy of the plugin in this process while it is fresh (`siblingCopyIsLive`) and blocks; a stale one is an earlier process
+   * that had this pid and is removed.
    */
   async function otherLiveWriter(): Promise<boolean> {
     await writeMark();
@@ -1237,9 +1241,31 @@ export function createPendingFileJournal(path: string, options: PendingFileJourn
         if (age !== undefined && age <= staleMs) other = true;
         continue;
       }
+      if (pid === process.pid && (await siblingCopyIsLive(name))) {
+        // QA-DF1-18: another module copy of this plugin in this process (same pid, another token) is a live writer.
+        other = true;
+        continue;
+      }
       await rm(join(writersDir, name), { force: true });
     }
     return other;
+  }
+
+  /**
+   * QA-DF1-18: a mark of this pid under another token is a separately loaded module copy of this plugin in this process
+   * (one per booted location), or an earlier process that had this pid. It is a live writer while it is fresh: its mark
+   * was stamped within `writerStaleMs` (a writer re-stamps it while it appends), or a beat file of one of the copy's
+   * instances under `pending.instances` (`<copy token>.<instance>`, `writeInstanceBeat`) is fresh (`CLAIM_STALE_MS`).
+   * Otherwise it is stale and removed, as before: an earlier process of this pid, or a copy that neither appends nor beats.
+   */
+  async function siblingCopyIsLive(name: string): Promise<boolean> {
+    const cut = name.indexOf(".");
+    const token = cut < 0 ? "" : name.slice(cut + 1);
+    if (token === "" || token === PROCESS_CLAIM_TOKEN) return false;
+    const age = await markAge(join(writersDir, name));
+    if (age === undefined) return false;
+    if (age <= staleMs) return true;
+    return moduleCopyBeatIsFresh(join(dirname(file), PENDING_INSTANCES_DIRNAME), token, process.pid, now(), CLAIM_STALE_MS);
   }
 
   /** The age of a writer mark (its `at`, else its mtime); undefined when it is gone. */
@@ -1274,12 +1300,38 @@ interface SharedJournal {
   markAt: number | undefined;
   /** Journal objects of this path in this process that are not disposed. */
   refs: number;
-  /** QA-2.1-33: the snapshot provider of each journal object of this path that registered one (`setSnapshotProvider`). */
+  /**
+   * QA-2.1-33: the snapshot provider of each journal object of this path that registered one (`setSnapshotProvider`).
+   * QA-DF1-18: the same map in every module copy of the process (`processSnapshotProviders`).
+   */
   readonly providers: Map<object, PendingSnapshotProvider>;
 }
 
 /** QA-2.1-15: one shared journal state per resolved path in this process (case-insensitive on Windows). */
 const SHARED_JOURNALS = new Map<string, SharedJournal>();
+
+/**
+ * QA-DF1-18: the snapshot providers of a journal path, shared by every module copy of this plugin in the process (one copy per
+ * booted location; each has its own `SHARED_JOURNALS`), so a `recreate` in one copy also merges the records another copy
+ * holds. Kept on `globalThis` under a registered symbol; a value that is not a map is replaced.
+ */
+const PROCESS_PROVIDERS_KEY = Symbol.for("opencode-model-router.pending.snapshot-providers.v1");
+
+function processSnapshotProviders(key: string): Map<object, PendingSnapshotProvider> {
+  const holder = globalThis as unknown as Record<symbol, unknown>;
+  let all = holder[PROCESS_PROVIDERS_KEY];
+  if (!(all instanceof Map)) {
+    all = new Map<string, Map<object, PendingSnapshotProvider>>();
+    holder[PROCESS_PROVIDERS_KEY] = all;
+  }
+  const byPath = all as Map<string, Map<object, PendingSnapshotProvider>>;
+  let found = byPath.get(key);
+  if (found === undefined) {
+    found = new Map();
+    byPath.set(key, found);
+  }
+  return found;
+}
 
 /**
  * QA-2.1-16/-33: what identifies a record a recreation rewrites from memory: its kind and its attempt key, else its handle
@@ -1730,9 +1782,11 @@ const LIVE_INSTANCE_TOKENS = new Set<string>();
  * QA-2.1-19: a claim token for one plugin instance. While it is not released, a claim this process wrote under it is
  * refused to every other instance of the process (`claimPendingSession`); once released (dispose), the claim is stale for
  * them and is taken over. Idempotent release. DF-1-10: with `beatsDir`, `beat()` re-stamps the instance's beat file (the
- * owner calls it with its claims) and `release()` removes it, so instances in other module copies see it too.
+ * owner calls it with its claims) and `release()` removes it, so instances in other module copies see it too. QA-DF1-22:
+ * with `beatsDir`, the stale beats of crashed instances are swept first (`sweepInstanceBeats`).
  */
 export function createInstanceClaimToken(beatsDir?: string): { readonly token: string; beat(now?: number): void; release(): void } {
+  if (beatsDir !== undefined) sweepInstanceBeats(beatsDir, { now: Date.now() });
   const token = `${PROCESS_CLAIM_TOKEN}.${toHex(randomBytes(4))}`;
   LIVE_INSTANCE_TOKENS.add(token);
   const beat = (now: number = Date.now()): void => {
@@ -1751,16 +1805,61 @@ export function createInstanceClaimToken(beatsDir?: string): { readonly token: s
 /**
  * DF-1-10: the beat file of one plugin instance, `<beatsDir>\<token>` (`{pid, at}`). One host process may load a separate copy
  * of this module per booted location, and `LIVE_INSTANCE_TOKENS` never holds a sibling copy's tokens; a beat of the claim's pid
- * younger than the stale bound marks that instance live to every copy (`claimPendingSession`). Written at start, re-stamped
- * with the claims (`CLAIM_REFRESH_MS`), removed on release; a crashed instance's beat goes stale. Never throws.
+ * younger than the stale bound marks that instance live to every copy (`claimPendingSession`). Written with the instance's
+ * first claim, re-stamped with the claims (`CLAIM_REFRESH_MS`), removed on release; a crashed instance's beat goes stale
+ * (`sweepInstanceBeats` removes it when the next instance starts). QA-DF1-22: written to a temp file renamed over the beat,
+ * so a reader never sees a half-written beat; where the rename fails (a reader holds the file open on win32) the beat is
+ * written in place, and a reader that finds it half-written goes by its mtime. Never throws.
  */
 export function writeInstanceBeat(beatsDir: string, token: string, seams: { pid: number; now: number }): void {
+  const target = join(beatsDir, encodeURIComponent(token));
+  const temp = `${target}${BEAT_TEMP_SUFFIX}`;
+  const body = `${JSON.stringify({ pid: seams.pid, token, at: seams.now })}\n`;
   try {
     mkdirSync(beatsDir, { recursive: true });
-    writeFileSync(join(beatsDir, encodeURIComponent(token)), `${JSON.stringify({ pid: seams.pid, token, at: seams.now })}\n`);
+    try {
+      writeFileSync(temp, body);
+      renameSync(temp, target);
+    } catch (error) {
+      void error; // the beat is written in place instead; a torn one is read by its mtime (`beatFileIsFresh`)
+      rmSync(temp, { force: true });
+      writeFileSync(target, body);
+    }
   } catch (error) {
     void error; // no beat: a sibling copy takes this instance's claims over, as before DF-1-10
   }
+}
+
+/** QA-DF1-22: the suffix of a beat's temp file (`writeInstanceBeat`); never a beat itself. */
+const BEAT_TEMP_SUFFIX = ".beat-tmp";
+
+/**
+ * QA-DF1-22: removes the beat files under `beatsDir` that are no longer fresh (`beatFileIsFresh`, any pid: a live
+ * instance re-stamps its beat well within `staleMs`) and leftover temp files of the same age: the beats of crashed
+ * instances. A fresh beat, by its `at` or (unreadable) by its mtime, stays. Returns how many files it removed. Never throws.
+ */
+export function sweepInstanceBeats(beatsDir: string, seams: { now: number; staleMs?: number }): number {
+  const staleMs = seams.staleMs ?? CLAIM_STALE_MS;
+  let names: string[];
+  try {
+    names = readdirSync(beatsDir);
+  } catch (error) {
+    void error; // no beats directory yet: nothing to sweep
+    return 0;
+  }
+  let removed = 0;
+  for (const name of names) {
+    const path = join(beatsDir, name);
+    const fresh = name.endsWith(BEAT_TEMP_SUFFIX) ? mtimeIsFresh(path, seams.now, staleMs) : beatFileIsFresh(path, undefined, seams.now, staleMs);
+    if (fresh) continue;
+    try {
+      rmSync(path, { force: true });
+      removed += 1;
+    } catch (error) {
+      void error; // a beat that cannot be removed is tried again at the next start
+    }
+  }
+  return removed;
 }
 
 /** DF-1-10: removes an instance's beat file (release, dispose). Never throws. */
@@ -1774,8 +1873,45 @@ export function removeInstanceBeat(beatsDir: string, token: string): void {
 
 /** DF-1-10: the instance of `token` (on `pid`) re-stamped its beat file within `staleMs`. */
 function instanceBeatIsFresh(beatsDir: string, token: string, pid: number, now: number, staleMs: number): boolean {
-  const beat = readClaim(join(beatsDir, encodeURIComponent(token)));
-  return beat?.pid === pid && beat.at !== undefined && now - beat.at <= staleMs;
+  return beatFileIsFresh(join(beatsDir, encodeURIComponent(token)), pid, now, staleMs);
+}
+
+/**
+ * QA-DF1-18: a beat of one module copy's instances (`<copy token>.<instance>`, `createInstanceClaimToken`) on `pid` is
+ * fresh. Never throws: an unreadable beats directory counts as no beat.
+ */
+function moduleCopyBeatIsFresh(beatsDir: string, copyToken: string, pid: number, now: number, staleMs: number): boolean {
+  let names: string[];
+  try {
+    names = readdirSync(beatsDir);
+  } catch (error) {
+    void error; // no beats directory: no beat
+    return false;
+  }
+  const prefix = encodeURIComponent(`${copyToken}.`);
+  return names.some((name) => name.startsWith(prefix) && !name.endsWith(BEAT_TEMP_SUFFIX) && beatFileIsFresh(join(beatsDir, name), pid, now, staleMs));
+}
+
+/**
+ * QA-DF1-22: a beat file stamped within `staleMs` (its `at`) by `pid` (any pid when undefined). A beat that cannot be read or
+ * parsed (half-written, torn) goes by its mtime, failing closed: a fresh mtime counts as a live instance. A vanished beat is
+ * not fresh.
+ */
+function beatFileIsFresh(path: string, pid: number | undefined, now: number, staleMs: number): boolean {
+  const beat = readClaim(path);
+  if (beat?.at !== undefined) return (pid === undefined || beat.pid === pid) && now - beat.at <= staleMs;
+  if (beat?.pid !== undefined && pid !== undefined && beat.pid !== pid) return false;
+  return mtimeIsFresh(path, now, staleMs);
+}
+
+/** QA-DF1-22: the file's mtime lies within `staleMs` of `now`; false when it is gone or cannot be stat'ed. */
+function mtimeIsFresh(path: string, now: number, staleMs: number): boolean {
+  try {
+    return now - statSync(path).mtimeMs <= staleMs;
+  } catch (error) {
+    void error; // a vanished file is not fresh
+    return false;
+  }
 }
 
 /** DF-1-10: the per-user directory of the instance beat files, next to `pending.claims`. */

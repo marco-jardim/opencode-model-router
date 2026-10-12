@@ -69,8 +69,10 @@ function contextEvent(messages: unknown[], sessionID = ORCH) {
 }
 
 const user = (text: string) => ({ id: "m-user", role: "user", content: [{ type: "text", text }] });
+// QA-DF1-20: the host gives every message its own id (the adapter tells completion elements apart by it, never by content).
+let completionSeq = 0;
 const completion = (child: string, body: string) => ({
-  id: "m-completion",
+  id: `m-completion-${++completionSeq}`,
   role: "user",
   content: [{ type: "text", text: `<subagent sessionID="${child}" state="completed">${body}</subagent>` }],
 });
@@ -347,6 +349,151 @@ describe("background dispatch: acknowledgement, in-flight list, completion annot
     await h.after({ ...call, status: "error", error: new Error("host failure") });
     const event = await request(h, [user("again")]);
     expect(allText(event)).not.toContain("In flight");
+  });
+});
+
+describe("QA-DF1 round 2: the completion elements of a resumed background dispatch", () => {
+  const verdicts = (h: BgHost): string[] => h.synthetic.filter((s) => s.text.startsWith("<router-verdict ")).map((s) => s.text);
+  const say = (text: string) => ({ type: "assistant", content: [{ type: "text", text }], finish: "stop", time: { created: 1, completed: 2 } });
+  const ask = (text: string) => ({ type: "user", content: [{ type: "text", text }] });
+
+  it("QA-DF1-17: an element scanned while turn 1 is processing is never taken by the resumed attempt", async () => {
+    const h = await boot("auto");
+    h.emit(created(CHILD, ORCH));
+    const first = await h.before(dispatch({ background: true }));
+    await h.after({ ...first, status: "completed", result: structuredClone(RUNNING) });
+    await request(h, [user("start")]);
+    // Turn 1's end starts its processing; its read of the child's history waits on a gate: the attempt stays `processing`.
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const read = h.childContext.get.bind(h.childContext);
+    let gated = true;
+    const spy = vi.spyOn(h.childContext, "get").mockImplementation((sessionID: string) => {
+      if (sessionID !== CHILD || !gated) return read(sessionID);
+      gated = false;
+      return gate.then(() => read(sessionID)) as unknown as unknown[];
+    });
+    h.childContext.set(CHILD, [ask("do the work"), say("NEED MORE: turn one")]);
+    h.emit({ type: "session.execution.succeeded", id: "ev-end-qa17-turn-1", created: 2, data: { sessionID: CHILD } });
+    await vi.waitFor(() => expect(gated).toBe(false), { timeout: 20_000 });
+    // The parent's wake request carries turn 1's element while turn 1 is still processing (seen, not remembered).
+    const turnOne = completion(CHILD, "NEED MORE: turn one");
+    await request(h, [user("start"), turnOne]);
+    // Turn 1's processing ends (its verdict posted, its hold released: a held child cannot be resumed before) with no request
+    // of the parent since that scan: the parent's history still holds turn 1's element, never remembered.
+    release();
+    await h.settled();
+    spy.mockRestore();
+    await vi.waitFor(() => expect(verdicts(h)).toHaveLength(1), { timeout: 20_000 });
+    const posted = verdicts(h).length;
+    // The resume is decided now.
+    const second = await h.before(dispatch({ background: true, sessionID: CHILD, prompt: "resume prompt" }));
+    await h.after({ ...second, status: "completed", result: structuredClone(RUNNING) });
+    // The next request still carries turn 1's element: the resumed attempt never takes it (pre-fix: turn 1's text was its answer).
+    await request(h, [user("start"), turnOne, user("resumed")]);
+    await h.settled();
+    expect(verdicts(h)).toHaveLength(posted);
+    // The resumed turn's own end delivers its own answer.
+    h.childContext.set(CHILD, [ask("do the work"), say("NEED MORE: turn one"), ask("resume prompt"), say("DONE: turn two")]);
+    h.emit({ type: "session.execution.succeeded", id: "ev-end-qa17-turn-2", created: 3, data: { sessionID: CHILD } });
+    await h.settled();
+    await vi.waitFor(() => expect(verdicts(h)).toHaveLength(posted + 1), { timeout: 20_000 });
+    expect(verdicts(h).at(-1)).toContain("DONE: turn two");
+    expect(verdicts(h).slice(posted).join("\n")).not.toContain("NEED MORE: turn one");
+  });
+
+  it("QA-DF1-20: an attempt its end left `child-ended` is read again on the parent's next request, with no new completion element", async () => {
+    const h = await boot("auto");
+    h.emit(created(CHILD, ORCH));
+    const first = await h.before(dispatch({ background: true }));
+    await h.after({ ...first, status: "completed", result: structuredClone(RUNNING) });
+    await request(h, [user("start")]);
+    // The end comes before the turn's answer is readable: the attempt is left `child-ended`.
+    h.childContext.set(CHILD, [ask("do the work")]);
+    h.emit({ type: "session.execution.succeeded", id: "ev-end-qa20-reread", created: 2, data: { sessionID: CHILD } });
+    await h.settled();
+    expect(verdicts(h)).toHaveLength(0);
+    // The answer is readable now; the parent's next request carries no element that is new to this adapter (pre-fix: the sweep).
+    h.childContext.set(CHILD, [ask("do the work"), say("DONE: read again")]);
+    await request(h, [user("start"), user("next")]);
+    await h.settled();
+    await vi.waitFor(() => expect(verdicts(h)).toHaveLength(1), { timeout: 3_000 }); // within the test's 5 s: a failure is this assertion
+    expect(verdicts(h)[0]).toContain("DONE: read again");
+  });
+
+  it("QA-DF1-20: two turns with the byte-identical answer \"NEED MORE: budget\" each deliver exactly one verdict", async () => {
+    const h = await boot("auto");
+    h.emit(created(CHILD, ORCH));
+    const first = await h.before(dispatch({ background: true }));
+    await h.after({ ...first, status: "completed", result: structuredClone(RUNNING) });
+    await request(h, [user("start")]);
+    h.childContext.set(CHILD, [ask("do the work"), say("NEED MORE: budget")]);
+    h.emit({ type: "session.execution.succeeded", id: "ev-end-qa20-turn-1", created: 2, data: { sessionID: CHILD } });
+    await h.settled();
+    await vi.waitFor(() => expect(verdicts(h)).toHaveLength(1), { timeout: 20_000 });
+    const turnOne = completion(CHILD, "NEED MORE: budget");
+    await request(h, [user("start"), turnOne]);
+    await h.settled();
+
+    const second = await h.before(dispatch({ background: true, sessionID: CHILD, prompt: "resume prompt" }));
+    await h.after({ ...second, status: "completed", result: structuredClone(RUNNING) });
+    await request(h, [user("start"), turnOne, user("resumed")]);
+    await h.settled();
+    // The resumed turn's end comes before its answer is readable: the attempt is left `child-ended`.
+    h.childContext.set(CHILD, [ask("do the work"), say("NEED MORE: budget"), ask("resume prompt")]);
+    h.emit({ type: "session.execution.succeeded", id: "ev-end-qa20-turn-2", created: 3, data: { sessionID: CHILD } });
+    await h.settled();
+    expect(verdicts(h)).toHaveLength(1);
+    // The resumed turn's completion element carries the very bytes of turn 1's: it is a new element all the same. The child's
+    // history is left without the answer, so only the element (never the `child-ended` re-read) can deliver this verdict.
+    const turnTwo = completion(CHILD, "NEED MORE: budget");
+    await request(h, [user("start"), turnOne, user("resumed"), turnTwo]);
+    await h.settled();
+    await vi.waitFor(() => expect(verdicts(h)).toHaveLength(2), { timeout: 3_000 }); // within the test's 5 s: a failure is this assertion
+    await request(h, [user("start"), turnOne, user("resumed"), turnTwo, user("again")]);
+    await h.settled();
+    expect(verdicts(h)).toHaveLength(2);
+  });
+});
+
+describe("QA-DF1-23 (DF-1-9): the background decision for a parent the plugin never recorded (finish API attached: bgActive)", () => {
+  const UNRECORDED = "u1";
+  const bootUnrecorded = () => boot("auto", { sessions: { [UNRECORDED]: { parentID: ORCH } } }); // no `session.created` for u1
+
+  // D1 row 2 (`!parentIsRoot`) answers the pre-2.1 value: for a tier dispatch that is the model's own flag (`nativeArgs` keeps
+  // it), never a router-made `background: true` from the explicit or `auto` rows. The value a recorded child gets is the reference.
+  const RECORDED = "r1";
+  const valueOf = async (h: BgHost, parent: string, explicit: boolean | undefined): Promise<unknown> =>
+    inputOf(await h.before(dispatch({ agent: "fast", ...(explicit === undefined ? {} : { background: explicit }) }, parent))).background;
+
+  it("QA-DF1-23 a tier (non-role) dispatch from an unrecorded child stays foreground: a recorded child's value (guard)", async () => {
+    const h = await boot("auto", { sessions: { [UNRECORDED]: { parentID: ORCH }, [RECORDED]: { parentID: ORCH } } });
+    h.emit(created(RECORDED, ORCH));
+    await h.drain();
+    expect(await valueOf(h, UNRECORDED, undefined)).not.toBe(true);
+    for (const explicit of [undefined, true, false]) {
+      expect(await valueOf(h, UNRECORDED, explicit)).toBe(await valueOf(h, RECORDED, explicit));
+    }
+  });
+
+  it("QA-DF1-23 a failed session lookup keeps the foreground value: a recorded child's value (guard)", async () => {
+    const h = await boot("auto", { sessions: { [UNRECORDED]: { parentID: ORCH }, [RECORDED]: { parentID: ORCH } } });
+    h.emit(created(RECORDED, ORCH));
+    await h.drain();
+    h.failingSessionLookups.add(UNRECORDED);
+    expect(await valueOf(h, UNRECORDED, undefined)).not.toBe(true); // `unknown` is no root
+    for (const explicit of [undefined, true]) {
+      expect(await valueOf(h, UNRECORDED, explicit)).toBe(await valueOf(h, RECORDED, explicit));
+    }
+  });
+
+  it("QA-DF1-23 an unrecorded parent costs exactly one session.get, however many dispatches", async () => {
+    const h = await bootUnrecorded();
+    const lookups = vi.spyOn(h.sessions, "get");
+    for (let i = 0; i < 3; i++) await h.before(dispatch({ background: true }, UNRECORDED));
+    expect(lookups.mock.calls.filter(([id]) => id === UNRECORDED)).toHaveLength(1);
   });
 });
 

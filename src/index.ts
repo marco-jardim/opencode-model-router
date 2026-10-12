@@ -957,7 +957,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // QA-2.1-11: deferred (unref'd timer), so plugin start never holds the project directory with a
   // git child; dispose cancels it.
   // DF-1-1 (v2 only): with `routing.workRoots` configured and non-empty, a location outside every entry is not the plan's:
-  // nothing started here runs git in (or writes to) its repository. Unset or empty: unchanged.
+  // the start-up reference GC is skipped (it would run git in, and write to, that repository). Unset or empty: unchanged.
   const outsideWorkRoots = isV2Host && locationOutsideWorkRoots(ctx.directory, cfg.routing?.workRoots);
   if (outsideWorkRoots) logger.info?.(`[router] ${ctx.directory} is outside routing.workRoots: the start-up reference GC is skipped`);
   const stopReferenceGc = outsideWorkRoots ? (): void => undefined : startReferenceGc();
@@ -3319,7 +3319,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   type FinishOutcome =
     | { kind: "none" }
     | { kind: "deferred"; handle: string }
-    | { kind: "required"; verdict: "PASS" | "FAIL" | "UNVERIFIABLE"; detail: string }
+    // QA-DF1-16: `gate` is the gate's own verdict (method, outcome, reasons, caveats, notes); a held entry settles with it.
+    | { kind: "required"; verdict: "PASS" | "FAIL" | "UNVERIFIABLE"; detail: string; gate: HeldSettlement }
     // QA-2.1-1: the gate was not run on purpose (a read-only delegation) or failed; neither is a verdict.
     | { kind: "skipped"; reason: string }
     | { kind: "error"; reason: string };
@@ -3557,6 +3558,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             // DF-1-3: the tag follows the outcome; an accepted unverifiable result (gate.ts, not strictUnverifiable) is UNVERIFIABLE.
             verdict: res.verdict.outcome === "unverifiable" ? "UNVERIFIABLE" : res.accepted ? "PASS" : "FAIL",
             detail: res.verdict.reasons.join("; "),
+            // QA-DF1-16: the gate's real verdict, so router_verify on a held handle reports what the posted text says.
+            gate: { verdict: res.verdict, retryable: false },
           };
         } catch (error) {
           // fail-closed: a verification error must NEVER throw out of the after-hook. QA-2.1-1: it is logged and reported as an
@@ -3596,13 +3599,15 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   /**
    * The foreground-equivalent text of a held dispatch, kept from the end of its gate until onVerdict posts it. QA-2.1-13:
    * bounded (oldest first; an evicted hold posts the generic verdict line) and forgotten with its parent session.
+   * QA-DF1-16: `post` is the tag and reason the held gate posts with its text (its settled verdict keeps every reason).
    */
-  const heldTexts = new Map<string, { readonly sessionID: string; readonly text: string }>();
+  type HeldPost = { readonly verdict: "PASS" | "FAIL" | "UNVERIFIABLE"; readonly reason?: string };
+  const heldTexts = new Map<string, { readonly sessionID: string; readonly text: string; readonly post?: HeldPost }>();
   /** = MAX_HOLDS_GLOBAL (background.ts): there are never more live holds than this. */
   const MAX_HELD_TEXTS = 10_000;
-  function rememberHeldText(handle: string, sessionID: string, text: string): void {
+  function rememberHeldText(handle: string, sessionID: string, text: string, post?: HeldPost): void {
     heldTexts.delete(handle);
-    heldTexts.set(handle, { sessionID, text });
+    heldTexts.set(handle, { sessionID, text, ...(post === undefined ? {} : { post }) });
     while (heldTexts.size > MAX_HELD_TEXTS) {
       const oldest = heldTexts.keys().next();
       if (oldest.done === true) break;
@@ -3647,9 +3652,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     // QA-2.1-31: settled by `settleHeldDirect` after the adapter posted the verdict itself.
     if (directlySettled.has(entry.handle)) return;
     if (entry.hold === undefined || heldSink === undefined) return;
-    const verdict = heldVerdictKind(result.verdict.outcome, result.verdict.pass);
-    const reason = result.verdict.reasons[0];
-    const text = heldTexts.get(entry.handle)?.text ?? `[router] ${entry.handle}: verification ended ${verdict}${reason !== undefined ? ` — ${scrubText(reason)}` : ""}`;
+    // QA-DF1-16: a held gate's text posts with the tag and reason it was written for (unchanged by its full settled verdict).
+    const held = heldTexts.get(entry.handle);
+    const verdict = held?.post?.verdict ?? heldVerdictKind(result.verdict.outcome, result.verdict.pass);
+    const reason = held?.post !== undefined ? held.post.reason : result.verdict.reasons[0];
+    const text = held?.text ?? `[router] ${entry.handle}: verification ended ${verdict}${reason !== undefined ? ` — ${scrubText(reason)}` : ""}`;
     heldTexts.delete(entry.handle);
     heldSink.verdict(entry.handle, { verdict, text, ...(reason !== undefined ? { reason } : {}) }).catch((error: unknown) => {
       logger.warn("[router] held verdict not posted", { handle: entry.handle, error: describeError(error) });
@@ -3714,9 +3721,19 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   /** QA-2.1-31: handles whose restored pending entry the adapter settled after posting the verdict itself (no second post). */
   const directlySettled = new Set<string>();
   type HeldClaim = Extract<ReturnType<typeof pending.markVerifying>, { kind: "claimed" }>;
+  type HeldSettlement = Parameters<HeldClaim["settle"]>[0];
   type HeldScratch = { output: string; title: string; metadata: Record<string, unknown> };
-  /** A deterministic, non-retryable result for a held entry. */
-  function heldVerification(verdict: "PASS" | "FAIL" | "UNVERIFIABLE", reasons: string[]): Parameters<HeldClaim["settle"]>[0] {
+  /** QA-DF1-16: what a held entry settles with: a gate verdict as the gate reached it, anything else as `heldVerification`. */
+  function heldSettlementOf(outcome: FinishOutcome, held: { verdict: "PASS" | "FAIL" | "UNVERIFIABLE"; reasons: string[] }): HeldSettlement {
+    return outcome.kind === "required" ? outcome.gate : heldVerification(held.verdict, held.reasons);
+  }
+  /**
+   * A deterministic, non-retryable result for a held entry whose outcome is not a gate verdict (QA-DF1-16): the held gate's
+   * none/deferred/skipped/error outcomes (verification not required, a read-only skip, a deferral, a gate failure), a restart
+   * that lost the verification data (`finishRestored`), and a verdict the adapter posted itself (`settleHeldDirect`: only its
+   * tag and reason cross the finish API). A gate verdict settles with the gate's own verdict (see `heldSettlementOf`).
+   */
+  function heldVerification(verdict: "PASS" | "FAIL" | "UNVERIFIABLE", reasons: string[]): HeldSettlement {
     return {
       verdict: {
         pass: verdict === "PASS",
@@ -3779,8 +3796,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       const text = held.line === undefined ? scratch.output : `${scratch.output.trimEnd()}\n\n${held.line}`;
       const reason = held.reasons[0];
       if (claim.kind !== "claimed") return postHeldDirect(handle, held.verdict, text, reason);
-      rememberHeldText(handle, fin.parentSessionID, text);
-      claim.settle(heldVerification(held.verdict, held.reasons));
+      rememberHeldText(handle, fin.parentSessionID, text, { verdict: held.verdict, ...(reason !== undefined ? { reason } : {}) });
+      // QA-DF1-16: a gate verdict settles as the gate reached it (method, outcome, reasons, caveats, notes).
+      claim.settle(heldSettlementOf(outcome, held));
       // onVerdict posts only for an entry that carries its hold.
       return claim.entry.hold === undefined ? postHeldDirect(handle, held.verdict, text, reason) : undefined;
     };

@@ -590,10 +590,12 @@ describe("pending.jsonl journal (memo 11.1, 11.2)", () => {
     const writers = join(dir, PENDING_WRITERS_DIRNAME);
     mkdirSync(writers, { recursive: true });
     const stale = Date.now() - WRITER_MARK_STALE_MS - 60_000;
-    // A dead pid's mark, this pid's mark from an earlier process (another token) and a live pid's mark past the stale age (pid reuse).
+    // A dead pid's mark, this pid's mark from an earlier process (another token, past the stale age) and a live pid's mark past
+    // the stale age (pid reuse). QA-DF1-18: a FRESH mark of this pid under another token is a live module copy of the plugin in
+    // this process and blocks (test/unit/pending-module-copies.test.ts).
     const deadPid = 2_147_483_646;
     writeFileSync(join(writers, `${deadPid}.dead`), `${JSON.stringify({ pid: deadPid, token: "dead", at: Date.now() })}\n`);
-    writeFileSync(join(writers, `${process.pid}.earlier`), `${JSON.stringify({ pid: process.pid, token: "earlier", at: Date.now() })}\n`);
+    writeFileSync(join(writers, `${process.pid}.earlier`), `${JSON.stringify({ pid: process.pid, token: "earlier", at: stale })}\n`);
     writeFileSync(join(writers, `${process.ppid}.reused`), `${JSON.stringify({ pid: process.ppid, token: "reused", at: stale })}\n`);
     const file = join(dir, "pending.jsonl");
     writeFileSync(file, body);

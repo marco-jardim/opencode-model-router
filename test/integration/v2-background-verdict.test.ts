@@ -6,6 +6,8 @@
  *   posts UNVERIFIABLE with a reason, never PASS.
  * - QA-2.1-5: a child that did not succeed is never verified: `finish` returns no verification and the gate does not run.
  * - QA-2.1-9 / QA-2.1-11 (the pieces router_verify and the gate use): a held entry's report line; the producer-aware lease wait.
+ * - QA-DF1-16: a held gate's verdict settles as the gate reached it (method, outcome, reasons, caveats), so router_verify on the
+ *   held handle reports what the posted text says; the held gate's grader launches from the orchestrator.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
@@ -19,7 +21,21 @@ import { invalidateConfigCache } from "../../src/router/config";
 import { backgroundOutcomes, formatVerifyReport, HELD_RESULT_TEXT, waitTreeFreeExcept } from "../../src/verify/wiring";
 import { removeDirWhenReleased } from "../helpers/remove-dir";
 
-const gate = vi.hoisted(() => ({ parsed: 0 }));
+const gate = vi.hoisted(() => ({ parsed: 0, passCaveat: undefined as string | undefined }));
+
+// QA-DF1-16: the real checker (its grader launches through the test's runner); with `passCaveat` set, its pass carries that
+// caveat (a pass with caveats, which the gate lets through as `⚠ UNVERIFIED`).
+vi.mock("../../src/verify/checker", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../src/verify/checker")>();
+  return {
+    ...actual,
+    runChecker: async (...args: Parameters<typeof actual.runChecker>) => {
+      const verdict = await actual.runChecker(...args);
+      const caveat = gate.passCaveat;
+      return caveat !== undefined && verdict.outcome === "pass" ? { ...verdict, caveats: [...(verdict.caveats ?? []), caveat] } : verdict;
+    },
+  };
+});
 
 vi.mock("../../src/verify/reference", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/verify/reference")>()),
@@ -46,6 +62,7 @@ beforeEach(() => {
   process.env.HOME = home;
   process.env.USERPROFILE = home;
   gate.parsed = 0;
+  gate.passCaveat = undefined;
   invalidateConfigCache();
 });
 
@@ -83,6 +100,15 @@ async function attach(runner?: { run(request: { parentSessionID?: string }): Pro
   const api = channel({ host: "v2", held }) as FinishApi | undefined;
   if (api === undefined) throw new Error("v2 attach returned no finish API");
   return { api, posted, hooks };
+}
+
+/** QA-DF1-16: the plugin's own `router_verify` tool on one handle of the orchestrator's session, as the model calls it. */
+async function routerVerify(hooks: Hooks, handle: string): Promise<string> {
+  const verify = hooks.tool?.router_verify;
+  if (verify === undefined) throw new Error("the plugin registers no router_verify tool");
+  const context = { sessionID: "ses_parent", messageID: "msg_df116", agent: "build", abort: new AbortController().signal };
+  const result: unknown = await verify.execute({ handles: [handle] }, context as unknown as Parameters<typeof verify.execute>[1]);
+  return typeof result === "string" ? result : JSON.stringify(result);
 }
 
 async function finishHeld(api: FinishApi, callID: string): Promise<string> {
@@ -160,6 +186,84 @@ describe("DF-1-3 a background completion without a deterministic check", () => {
     // Acceptance is unchanged: an unverifiable result is accepted (not strictUnverifiable), so no forcing note.
     expect(result.outputText.startsWith("The parser starts in parse().")).toBe(true);
     expect(result.outputText).not.toContain("NEXT: address the above");
+  }, 30_000);
+});
+
+describe("QA-DF1-16 a held gate verdict is settled as the gate reached it", () => {
+  type Launched = { parentSessionID?: string };
+  // A held background dispatch through the real before hook and finish API; the grader answers through `answer`.
+  async function heldGraderRun(callID: string, answer: () => Promise<{ sessionID: string; text: string }>) {
+    process.env.MODEL_ROUTER_ENFORCE = "1";
+    execFileSync("git", ["init", "-q"], { cwd: home }); // a work tree the gate can prepare its verification in
+    const launched: Launched[] = [];
+    const runner = {
+      run: async (request: Launched) => {
+        launched.push(request);
+        return answer();
+      },
+      dispose: async () => undefined,
+    };
+    const { api, posted, hooks } = await attach(runner);
+    const prompt = ["Explain the parser.", "", "[acceptance]", "criteria: the explanation names the parser's entry point", "[/acceptance]"].join("\n");
+    const before = hooks["tool.execute.before"] as unknown as ((input: unknown, output: unknown) => Promise<void>) | undefined;
+    await before?.({ tool: "task", sessionID: "ses_parent", callID }, { args: { subagent_type: "fast", description: "explain the parser", prompt } })
+      .catch(() => undefined);
+    const handle = api.reserveHeld("ses_parent", callID);
+    if (handle === undefined) throw new Error("no handle reserved");
+    const result = await api.finish({
+      callID,
+      parentSessionID: "ses_parent",
+      childSessionID: `ses_child_${callID}`,
+      outputText: "The parser starts in parse().",
+      status: "succeeded",
+      mode: "background",
+      heldHandle: handle,
+      endedAt: Date.now(),
+    });
+    expect(result.verification).toEqual({ kind: "held", handle });
+    await vi.waitFor(() => expect(posted).toHaveLength(1), { timeout: 25_000 });
+    return { handle, launched, posted, hooks };
+  }
+
+  it("QA-DF1-16 a checker result that could not be verified: the grader launches from the orchestrator; router_verify reports the gate's method and reason", async () => {
+    const { handle, launched, posted, hooks } = await heldGraderRun("call-df116-a", async () => {
+      throw new Error("Tool.Error: Subagent denied: model-router-grader");
+    });
+    expect(launched.length).toBeGreaterThan(0);
+    for (const request of launched) expect(request.parentSessionID).toBe("ses_parent");
+    expect(posted[0]).toMatchObject({ handle, verdict: "UNVERIFIABLE" });
+    expect(posted[0].text).toContain("[router \u26a0 UNVERIFIED: checker]");
+    const text = await routerVerify(hooks, handle);
+    // The settled held entry's verdict, reported (nothing is run again) with the gate's outcome and method, and the grader's
+    // reason (an unverifiable checker result carries it as a caveat).
+    expect(text).toContain(`- ${handle} \u00b7 `);
+    expect(text).toContain(" \u00b7 unverifiable (cached verdict; nothing was run)");
+    expect(text).toContain("[router \u26a0 UNVERIFIED: checker]");
+    expect(text).toContain("Verification caveats");
+    expect(text).toContain("grader dispatch failed");
+    expect(text).not.toContain("deterministic");
+    expect(text).not.toContain("\u2713 verified");
+  }, 30_000);
+
+  // The gate's pass with caveats (the posted text reads `⚠ UNVERIFIED`); `heldVerification` used to settle it as a clean pass.
+  it("QA-DF1-16 a pass with caveats: router_verify reports it UNVERIFIED with its caveats, as the posted text does (never \u2713 verified)", async () => {
+    gate.passCaveat = "the grader saw only the final text (QA-DF1-16 caveat)";
+    const { handle, launched, posted, hooks } = await heldGraderRun("call-df116-b", async () => ({
+      sessionID: "ses_grader_df116_b",
+      text: JSON.stringify({ pass: true, reasons: ["the explanation names parse()"] }),
+    }));
+    expect(launched.length).toBeGreaterThan(0);
+    for (const request of launched) expect(request.parentSessionID).toBe("ses_parent");
+    expect(posted[0]).toMatchObject({ handle, verdict: "PASS" });
+    expect(posted[0].text).toContain("[router \u26a0 UNVERIFIED: checker]");
+    expect(posted[0].text).toContain("QA-DF1-16 caveat");
+    const text = await routerVerify(hooks, handle);
+    expect(text).toContain(" \u00b7 pass (cached verdict; nothing was run)");
+    expect(text).toContain("[router \u26a0 UNVERIFIED: checker]");
+    expect(text).toContain("Verification caveats");
+    expect(text).toContain("QA-DF1-16 caveat");
+    expect(text).not.toContain("\u2713 verified");
+    expect(text).not.toContain("deterministic");
   }, 30_000);
 });
 

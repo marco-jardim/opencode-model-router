@@ -18,6 +18,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ADOPTION_RETRY_MS } from "../../src/compat/background";
+import { processToken } from "../../src/compat/v2-hooks";
 import { CLAIM_STALE_MS, PENDING_INSTANCES_DIRNAME } from "../../src/verify/pending";
 import { bootBgHost, restoreEnv, type BgHost, type SyntheticCall } from "../helpers/v2-bg-host";
 
@@ -261,6 +262,55 @@ describe("DF-1-10: a sibling plugin instance of this process (another booted loc
     expect(posts[0]?.text).toContain(handle);
     expect(posts[0]?.text).toContain("lost in restart");
     expect(JSON.parse(readFileSync(join(dirname(h.journalPath), "pending.claims", ORCH), "utf8"))).toMatchObject({ pid: process.pid });
+  });
+});
+
+describe("QA-DF1-21: an adopted dispatch of this very process whose child is still running", () => {
+  // Each test its own call id: the in-flight registry's call claims are process-wide.
+  const record = (process: string, callID: string): Record<string, unknown> => ({
+    v: 1, kind: "inflight", key: `${CHILD}\u0000${callID}`, callID, parentSessionID: ORCH, childSessionID: CHILD,
+    // `at`: now (a record older than the attempt sweep age is closed, never recovered).
+    label: "fast", at: Date.now(), agent: "fast", description: "background work", verifying: false, verificationMode: "none", hold: null, process,
+  });
+  const lostNotices = (h: BgHost): SyntheticCall[] => h.synthetic.filter((s) => s.sessionID === ORCH && /lost in|Dispatch it again/.test(s.text));
+  /** The child's last step is cut: text, no step end, no execution end. */
+  const midStep = (h: BgHost): void => {
+    h.childContext.set(CHILD, [{ type: "assistant", role: "assistant", content: [{ type: "text", text: "half way" }], time: { created: 1 } }]);
+  };
+  const parentRequest = async (h: BgHost): Promise<string> => {
+    const event = {
+      sessionID: ORCH, agent: "build", model: { providerID: "anthropic", id: "claude-sonnet-5-5" }, options: {},
+      system: [{ type: "text", text: "Host instructions" }], messages: [{ id: "m-user", role: "user", content: [{ type: "text", text: "next" }] }], tools: {},
+    };
+    await h.context(event);
+    return JSON.stringify(event.messages);
+  };
+
+  it("QA-DF1-21 an evicted location's dispatch (same process) stays dormant until its end event, never `lost in restart`", async () => {
+    const h = await boot([record(processToken(), "call-qa21-same")]);
+    midStep(h);
+    await parentRequest(h); // the root request that teaches the adapter ORCH is a root (only a root's request carries the tail)
+    adoptOrchestrator(h);
+    await h.settled();
+    expect(lostNotices(h)).toHaveLength(0);
+    // Its end event processes it like any running background dispatch.
+    h.childContext.set(CHILD, [{ role: "assistant", content: [{ type: "text", text: "DONE: finished" }], finish: "stop", time: { created: 1, completed: 2 } }]);
+    h.emit({ type: "session.execution.succeeded", id: "ev-end-qa21", created: 3, data: { sessionID: CHILD } });
+    await h.settled();
+    const tail = await parentRequest(h);
+    expect(tail).toContain("Completed since your last turn");
+    expect(lostNotices(h)).toHaveLength(0);
+    expect(tail).not.toContain("lost in");
+  });
+
+  it("QA-DF1-21 (guard) the same unfinished child journaled by another process is still lost in restart", async () => {
+    const h = await boot([record("another-process", "call-qa21-other")]);
+    midStep(h);
+    await parentRequest(h);
+    adoptOrchestrator(h);
+    await h.settled();
+    await vi.waitFor(() => expect(h.synthetic.map((s) => `${s.sessionID}|${s.text.slice(0, 160)}`).join("\n")).toMatch(/lost in/), { timeout: 3_000 });
+    expect(lostNotices(h)).toHaveLength(1);
   });
 });
 

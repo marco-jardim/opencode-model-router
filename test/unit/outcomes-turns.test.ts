@@ -147,6 +147,53 @@ describe("orchestrator turns: aggregation", () => {
     expect(turnRows().map(r => [r.sessionID, r.turn, r.steps, r.input, r.cacheRead, r.cacheWrite])).toEqual([["root", 1, 1, 1, 2, 3]]);
   });
 
+  // QA-DF1-24: the prompt boundary and the run-end boundary of DF-1-5 meet. Each closes the steps counted so far; a boundary with
+  // no step since writes nothing, so neither order loses a step or writes a row twice. The recorder sees events in arrival order:
+  // if the event loop lags and a run's last step event is handled after the next prompt, that step opens the next turn, so the
+  // run's steps are split over two rows (the sums stay whole; the run-end of that run then closes the row holding the late step).
+  const sums = () => turnRows().map(r => [r.turn, r.steps, r.input, r.cacheRead, r.cacheWrite]);
+
+  it("QA-DF1-24 (DF-1-5): a prompt before the root run end closes the turn; the run end then writes no second row and no step is lost", async () => {
+    const rec = recorder();
+    rec.markRootSession("root");
+    rec.onRootStep("root", tokens(10, 100, 1));
+    rec.onRootStep("root", tokens(20, 200, 2));
+    await rec.onRootPrompt("root", NOW); // the next prompt is handled before the run's end event
+    expect(sums()).toEqual([[1, 2, 30, 300, 3]]);
+    await rec.onRootExecutionEnd("root", "run-1"); // no step since the prompt: nothing to close
+    expect(sums()).toEqual([[1, 2, 30, 300, 3]]);
+    rec.onRootStep("root", tokens(5, 50, 0)); // the prompted run
+    await rec.onRootExecutionEnd("root", "run-2");
+    expect(sums()).toEqual([[1, 2, 30, 300, 3], [2, 1, 5, 50, 0]]);
+  });
+
+  it("QA-DF1-24 (DF-1-5): a prompt after the root run end writes no second row; the next turn's steps are kept", async () => {
+    const rec = recorder();
+    rec.markRootSession("root");
+    rec.onRootStep("root", tokens(10, 100, 1));
+    await rec.onRootExecutionEnd("root", "run-1");
+    expect(sums()).toEqual([[1, 1, 10, 100, 1]]);
+    await rec.onRootPrompt("root", NOW + 1); // no step since the run end: nothing to close
+    expect(sums()).toEqual([[1, 1, 10, 100, 1]]);
+    rec.onRootStep("root", tokens(2, 20, 0));
+    rec.onRootStep("root", tokens(3, 30, 0));
+    await rec.onRootPrompt("root", NOW + 2);
+    await rec.onRootExecutionEnd("root", "run-2"); // after the prompt that closed the turn: nothing
+    expect(sums()).toEqual([[1, 1, 10, 100, 1], [2, 2, 5, 50, 0]]);
+  });
+
+  it("QA-DF1-24 (DF-1-5): a run's step handled after the next prompt (event loop lag) splits that run over two rows, sums whole (documented)", async () => {
+    const rec = recorder();
+    rec.markRootSession("root");
+    rec.onRootStep("root", tokens(10, 100, 1));
+    await rec.onRootPrompt("root", NOW); // arrives before the run's last step event is handled
+    rec.onRootStep("root", tokens(20, 200, 2)); // run 1's late step: counted in the open turn
+    await rec.onRootExecutionEnd("root", "run-1");
+    expect(sums()).toEqual([[1, 1, 10, 100, 1], [2, 1, 20, 200, 2]]);
+    const all = turnRows();
+    expect(all.reduce((n, r) => n + r.steps, 0)).toBe(2); // no step lost, none counted twice
+  });
+
   it("each row is on disk when onRootPrompt returns", async () => {
     const rec = recorder();
     rec.markRootSession("root");
