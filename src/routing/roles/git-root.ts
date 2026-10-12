@@ -32,6 +32,21 @@ import { displaySafe, gitMetadataSegment } from "./read-set";
 export const GIT_ROOT_MAX_LENGTH = 4096;
 
 // ── Text fragments (pinned by the docs-drift test, 3b.6) ─────────────────────────────────────────────────────────────────
+/** Step 1 (the caller's session gates, `index.ts`): not a role session (D21). */
+export const GIT_ROOT_ROLE_ONLY = "root is only for role agents (roles mode); this session inspects its own repository: omit root";
+/** Step 1: no exact binding, no work root or no `router_git` in the grant: the tool's existing I9 text (`git-tools.ts`). */
+export const GIT_ROOT_NO_WORK_ROOT = "this role session has no bound work root (I9)";
+/** Step 1: the grant has `router_git` but no local read action (SD-3b-5); `<actions>` goes between the two parts. */
+export const GIT_ROOT_NEEDS_READ = "root reads another repository and needs read, glob or grep in this dispatch's grant";
+export const GIT_ROOT_GIT_ALONE = "router_git alone stays in the work root";
+/** Step 1: `routing.repoParents` emptied by a hot reload after start. */
+export const GIT_ROOT_NO_PARENTS = "root needs routing.repoParents (cross-repo is not configured); nothing ran";
+
+/** Step 1: the refusal for a grant without a local read action. */
+export function gitRootNeedsRead(actions: readonly string[]): string {
+  return `${GIT_ROOT_NEEDS_READ} (${actions.map(displaySafe).join(", ")}); ${GIT_ROOT_GIT_ALONE}`;
+}
+
 /** Step 2: closes every text refusal. */
 export const GIT_ROOT_TEXT_HINT = "; pass the absolute top level of a repository or its name";
 export const GIT_ROOT_WHITESPACE = "has leading or trailing whitespace";
@@ -65,6 +80,10 @@ export const GIT_ROOT_PROVENANCE_SUFFIX = " — read-only in this dispatch]";
 
 /** Every fragment above, for the docs-drift test. */
 export const GIT_ROOT_TEXTS: readonly string[] = [
+  GIT_ROOT_ROLE_ONLY,
+  GIT_ROOT_NEEDS_READ,
+  GIT_ROOT_GIT_ALONE,
+  GIT_ROOT_NO_PARENTS,
   GIT_ROOT_TEXT_HINT,
   GIT_ROOT_WHITESPACE,
   GIT_ROOT_TOO_LONG,

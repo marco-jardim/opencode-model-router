@@ -23,7 +23,7 @@ import {
 } from "./router/config";
 import type { RouterConfig, TierConfig, Preset, ModeConfig, EffortLevel } from "./router/config";
 import { buildAgentOptions, warnAgentOptionsEffortOnce } from "./router/agent-options";
-import { gitTools } from "./router/git-tools";
+import { gitTools, nearestCheckout, type GitRootResolver } from "./router/git-tools";
 import { isReadOnlyTier, legacyReadOnlyTools, mergePermissions, readOnlyPermissions } from "./router/read-only";
 import { buildPluginAgentDefinition, mergeHostAgentEntry, pluginAgentMarker } from "./router/plugin-agents";
 import { filterSensitiveGrep } from "./router/sensitive-paths";
@@ -126,7 +126,7 @@ import { createTrajectoryStore } from "./telemetry/trajectory";
 import { createGuardStore } from "./guard/store";
 import { createIdleTtlSweeper } from "./router/idle-sweep";
 import { guardBeforeCall, guardAfterCall, guardRefusedCall, formatScorecard } from "./guard/enforce";
-import { mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync, realpathSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, isAbsolute } from "node:path";
 import { access, readFile as fsReadFile } from "node:fs/promises";
@@ -621,6 +621,72 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     const member = readSetMemberOf(routed.parentSessionID === "" ? undefined : routed.parentSessionID);
     return member === undefined ? undefined : (absPath) => member(absPath) !== undefined;
   };
+  /** F11: the orchestrator that dispatched role session `sid`: its dispatch record, else the session's parent (as the v2 adapter's readSetOf). */
+  const orchestratorOf = async (sid: string): Promise<string | undefined> => {
+    const recorded = lookupDispatch(sid)?.parentSessionID ?? undefined;
+    if (recorded !== undefined && recorded !== "") return recorded;
+    const res = await ctx.client.session.get({ path: { id: sid } });
+    const parentID = res?.data?.parentID;
+    return typeof parentID === "string" && parentID !== "" ? parentID : undefined;
+  };
+  /**
+   * Cross-repo 3b.4 (F10): one admission per resolved `{ repoParents, repoDepth, repoExclude }` for `router_git` `root` (it caches its
+   * git results for 5 s). Loaded lazily, as `routing/wire/dispatch.ts` does: admission imports the wire layer.
+   */
+  type GitRootAdmission = Pick<import("./routing/roles/admission").AdmissionService, "admit" | "find">;
+  let gitRootAdmissionMemo: { readonly key: string; readonly service: GitRootAdmission } | undefined;
+  const gitRootAdmissionFor = async (config: import("./routing/roles/admission").AdmissionConfig): Promise<GitRootAdmission> => {
+    const key = JSON.stringify([config.parents, config.depth, config.exclude]);
+    if (gitRootAdmissionMemo !== undefined && gitRootAdmissionMemo.key === key) return gitRootAdmissionMemo.service;
+    const service = (await import("./routing/roles/admission")).createAdmission(config);
+    gitRootAdmissionMemo = { key, service };
+    return service;
+  };
+  /**
+   * Cross-repo 3b.4 (OpenCode v2, roles mode, `routing.repoParents` at start; SD-3b-1): the `root` resolver of `router_git_*`. Step 1
+   * here, no filesystem call and no spawn: a role session (D21), an exact binding with a work root and `router_git` in the grant (I9,
+   * F12), a local read action in the grant (SD-3b-5), parents still configured. Steps 2–10: `routing/roles/git-root.ts` (lazy).
+   */
+  const resolveGitRootFor: GitRootResolver = async (value, { sessionID, signal, deadlineAt }) => {
+    const gitRoot = await import("./routing/roles/git-root");
+    if (roleOfSession(sessionID) === undefined) return { ok: false, reason: gitRoot.GIT_ROOT_ROLE_ONLY };
+    const binding = currentBinding(sessionID, { maxOf: roleMaxOf });
+    const grant = binding?.kind === "exact" ? binding.grant : undefined;
+    const workRoot = grant?.workRoot;
+    if (grant === undefined || workRoot === null || workRoot === undefined || workRoot === "" || !grant.actions.has("router_git")) {
+      return { ok: false, reason: gitRoot.GIT_ROOT_NO_WORK_ROOT };
+    }
+    if (!grant.actions.has("read") && !grant.actions.has("glob") && !grant.actions.has("grep")) {
+      return { ok: false, reason: gitRoot.gitRootNeedsRead([...grant.actions].sort()) };
+    }
+    const routing = resolveRolesRouting(cfg, "v2");
+    if (routing.repoParents.length === 0) return { ok: false, reason: gitRoot.GIT_ROOT_NO_PARENTS };
+    let orchestrator: string | undefined;
+    try {
+      orchestrator = await orchestratorOf(sessionID);
+    } catch {
+      orchestrator = undefined; // no working set: R narrows to the parents (fail closed)
+    }
+    const workingSet = (orchestrator === undefined ? [] : workingSetOf(orchestrator)).map((location) => location.worktree);
+    const member = readSetMemberOf(orchestrator);
+    const admissionConfig = { parents: routing.repoParents, depth: routing.repoDepth, exclude: routing.repoExclude };
+    const known = [ctx.directory, ...(grant.location?.repository === undefined ? [] : [grant.location.repository]), ...workingSet];
+    return gitRoot.resolveGitRoot(value, { workRoot, parents: routing.repoParents, workingSet }, {
+      realpath: (path) => realpathSync.native(path),
+      isDirectory: (path) => statSync(path).isDirectory(),
+      nearestCheckout,
+      inReadSet: (path) => member !== undefined && member(path) !== undefined,
+      // Created on first use only: a text refusal never loads admission.
+      admission: {
+        admit: async (root, knownRepositories) => (await gitRootAdmissionFor(admissionConfig)).admit(root, knownRepositories),
+        find: async (name) => (await gitRootAdmissionFor(admissionConfig)).find(name),
+      },
+      known,
+      platform: process.platform,
+      ...(signal === undefined ? {} : { signal }),
+      deadlineAt,
+    });
+  };
   const readProvenanceLine = async (input: any): Promise<string | undefined> => {
     const sid: unknown = input?.sessionID;
     if (ctx.routerHost !== "v2" || typeof sid !== "string" || !["read", "glob", "grep"].includes(input?.tool)) return undefined;
@@ -638,12 +704,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     const canonical = canonicalAuthorityPath(target, workRoot);
     if (canonical === undefined || insideWorkRoot(canonical, workRoot) || !readSetEligible(target, canonical)) return undefined;
     // The orchestrator that dispatched this role: its dispatch record, else the session's parent (as the v2 adapter's readSetOf).
-    let orchestrator = lookupDispatch(sid)?.parentSessionID ?? undefined;
-    if (orchestrator === undefined || orchestrator === "") {
-      const res = await ctx.client.session.get({ path: { id: sid } });
-      const parentID = res?.data?.parentID;
-      orchestrator = typeof parentID === "string" && parentID !== "" ? parentID : undefined;
-    }
+    const orchestrator = await orchestratorOf(sid);
     const member = readSetMemberOf(orchestrator)?.(canonical);
     if (member === undefined) return undefined;
     // QA-1 F2: the name, branch and path come from the filesystem: display-safe.
@@ -1183,6 +1244,18 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // directory resolution). Switching to roles mode registers them on the next start.
   const rolesAtStart = rolesNow().size > 0;
   const dynamicRolesAtStart = [...rolesNow().values()].some((spec) => spec.authority.mode === "dynamic");
+  /**
+   * Cross-repo 3b.4 (SD-3b-1): `router_git_*` declare `root` only on v2, in roles mode, with `routing.repoParents` non-empty at start
+   * (the tool map is fixed at start). Everywhere else, v1 included, schema and description stay byte-identical; no notice.
+   */
+  const crossRepoAtStart = ((): boolean => {
+    if (!isV2Host || !rolesAtStart) return false;
+    try {
+      return resolveRolesRouting(cfg, "v2").repoParents.length > 0;
+    } catch {
+      return false;
+    }
+  })();
   /** `router_request_authority` dependencies (P1.6): the role by child session; only the parent of `dispatchOf` is read. */
   const authorityDeps = {
     roleOf: (child: string) => roleOfSession(child),
@@ -1384,7 +1457,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     },
     tool: {
       // QA-G-A2-2: a role session's work root must belong to the repository its dispatch listed the worktrees in (this directory's).
-      ...gitTools(rolesAtStart ? { resolveWorkRoot: resolveWorkRootFor("router_git"), ...(ctx.directory ? { dispatchRepository: ctx.directory } : {}) } : {}),
+      ...gitTools(rolesAtStart ? {
+        resolveWorkRoot: resolveWorkRootFor("router_git"), ...(ctx.directory ? { dispatchRepository: ctx.directory } : {}),
+        ...(crossRepoAtStart ? { resolveRoot: resolveGitRootFor } : {}),
+      } : {}),
       // #84 P2.1 (handoffs 11, 13): roles mode only. `router_run` runs in the bound work root; each run feeds the `run` signal.
       ...(rolesAtStart ? {
         router_run: routerRunTool({
