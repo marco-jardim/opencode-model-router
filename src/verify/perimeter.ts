@@ -133,34 +133,57 @@ export interface AliasIO extends LinkIO {
 
 const defaultAliasIO: AliasIO = { ...defaultLinkIO, jsRealpath: (p) => realpathSync(p) };
 
-/** `packageEntries`, bounded: at most `max` entries (top level and `@scope/*`), in directory order. */
-function boundedPackageEntries(dir: string, max: number): string[] {
-  const modules = path.join(dir, "node_modules");
-  const entries: string[] = [];
-  for (const name of readNames(modules)) {
-    if (entries.length >= max) break;
-    if (name.startsWith(".")) continue;
-    const full = path.join(modules, name);
-    if (!name.startsWith("@")) {
-      entries.push(full);
-      continue;
-    }
-    for (const sub of readNames(full)) {
-      if (entries.length >= max) break;
-      if (!sub.startsWith(".")) entries.push(path.join(full, sub));
+/** Cross-repo QA-1 M2: the bounds of one `crossLinkAliases` call, each a total over the whole call. */
+export interface AliasBounds {
+  /** `node_modules` directories read: the consumer's, its ancestors' up to its git top, then W's. */
+  readonly dirs: number;
+  /** Directory entries looked at, in those directories, their `@scope` directories and pnpm's `.pnpm` store. */
+  readonly entries: number;
+  /** pnpm `.pnpm/<entry>` directories looked at. */
+  readonly pnpm: number;
+}
+
+/** Cross-repo QA-1 M2: the default `crossLinkAliases` bounds. */
+export const ALIAS_BOUNDS: AliasBounds = { dirs: 64, entries: 4000, pnpm: 256 };
+
+/**
+ * QA-1 M2: the `node_modules` directories whose links can spell W for a consumer, de-duplicated, in order: the consumer's own;
+ * each ancestor's up to and including the consumer's git top (hoisted links, a check `cwd=` set to a workspace sub-package),
+ * none when it has no git top or is a UNC path; then W's own (its workspace links into W, reached through a consumer link).
+ */
+function aliasModuleDirs(consumer: string, w: string): string[] {
+  const dirs = [path.resolve(consumer)];
+  const top = isUncLinkText(consumer) ? undefined : gitTopOf(consumer);
+  if (top !== undefined && insideOrEqual(dirs[0]!, top)) {
+    for (let at = dirs[0]!; perimeterKey(at) !== perimeterKey(top); ) {
+      const up = path.dirname(at);
+      if (up === at) break;
+      dirs.push(up);
+      at = up;
     }
   }
-  return entries;
+  dirs.push(path.resolve(w));
+  const seen = new Set<string>();
+  const modules: string[] = [];
+  for (const dir of dirs) {
+    if (seen.has(perimeterKey(dir))) continue;
+    seen.add(perimeterKey(dir));
+    modules.push(path.join(dir, "node_modules"));
+  }
+  return modules;
 }
 
 /**
- * Cross-repo P3a (SD-P3a-2 amended by the spike): W's top as a consumer's package links spell it. For each link in
- * `<consumer>/node_modules` (top level and `@scope/*`) whose native real path lies inside W, the JS `fs.realpathSync` of the link
- * (it keeps a junction's stored target text, the id vite gives the module), walked up to W's top when the link targets a
- * directory below it. Never a `node_modules` spelling. Bounded (CONSUMER_READ_MAX entries, CONSUMER_SCAN_MAX links) and
- * fail-soft: an unreadable link is skipped, any other error gives what was found so far (the zero guard is the backstop).
+ * Cross-repo P3a (SD-P3a-2 amended by the spike; QA-1 M2): W's top as a consumer's package links spell it. The links read: the
+ * top level and `@scope/*` of `<consumer>/node_modules`, of each ancestor's `node_modules` up to the consumer's git top, and of
+ * `<W>/node_modules`; then pnpm's `.pnpm/<entry>/node_modules/<name>` (and `@scope/*`) under each of them. For each link whose native
+ * real path lies inside W, the JS `fs.realpathSync` of the link (it keeps a junction's stored target text, the id vite gives the
+ * module), walked up to W's top when the link targets a directory below it. Never a spelling holding the substring
+ * `node_modules` (vitest skips those ids, case-sensitively); case-only variants are kept. A UNC link target is never resolved.
+ * Bounded (`bounds`: directories, entries and `.pnpm` entries read; CONSUMER_SCAN_MAX links) and fail-soft: an unreadable link
+ * or directory is skipped (the zero guard is the backstop).
  */
-export function crossLinkAliases(consumer: string, w: string, io: AliasIO = defaultAliasIO): string[] {
+export function crossLinkAliases(consumer: string, w: string, io: AliasIO = defaultAliasIO, bounds: AliasBounds = ALIAS_BOUNDS): string[] {
   const aliases: string[] = [];
   let realW: string;
   try {
@@ -168,22 +191,59 @@ export function crossLinkAliases(consumer: string, w: string, io: AliasIO = defa
   } catch {
     return aliases;
   }
+  let entries = 0;
   let links = 0;
-  for (const entry of boundedPackageEntries(consumer, CONSUMER_READ_MAX)) {
+  let pnpm = 0;
+  const spent = (): boolean => links > CONSUMER_SCAN_MAX || entries >= bounds.entries;
+  /** The names in `dir`, at most `cap` and what the entry budget has left; each name taken costs one entry. */
+  const namesOf = (dir: string, cap = Number.POSITIVE_INFINITY): string[] => {
+    const room = Math.min(cap, bounds.entries - entries);
+    if (room <= 0 || spent()) return [];
+    const names = readNames(dir).slice(0, room);
+    entries += names.length;
+    return names;
+  };
+  const consider = (entry: string): void => {
     try {
-      if (!io.lstat(entry).isSymbolicLink()) continue;
-      if (++links > CONSUMER_SCAN_MAX) break;
-      if (isUncLinkText(io.readlink(entry))) continue;
+      if (!io.lstat(entry).isSymbolicLink()) return;
+      if (++links > CONSUMER_SCAN_MAX) return;
+      if (isUncLinkText(io.readlink(entry))) return;
       const real = io.realpath(entry);
-      if (!insideOrEqual(real, realW)) continue;
+      if (!insideOrEqual(real, realW)) return;
       const rel = path.relative(realW, real);
       const up = rel === "" ? [] : rel.split(/[\\/]+/).filter(segment => segment !== "").map(() => "..");
       const alias = path.resolve(io.jsRealpath(entry), ...up);
-      if (alias.split(/[\\/]+/).includes("node_modules")) continue;
+      // vitest drops every module id holding the substring "node_modules" (case-sensitive), so such a spelling matches nothing.
+      if (alias.includes("node_modules")) return;
       if (!aliases.includes(alias)) aliases.push(alias);
     } catch {
-      continue; // Unreadable or dangling: it spells nothing.
+      // Unreadable or dangling: it spells nothing.
     }
+  };
+  /** The package entries of one `node_modules` directory: the top level, and one level under `@scope`. Dot-entries are tool state. */
+  const scanPackages = (modules: string): void => {
+    for (const name of namesOf(modules)) {
+      if (spent()) return;
+      if (name.startsWith(".")) continue;
+      const full = path.join(modules, name);
+      if (!name.startsWith("@")) {
+        consider(full);
+        continue;
+      }
+      for (const sub of namesOf(full)) {
+        if (spent()) return;
+        if (!sub.startsWith(".")) consider(path.join(full, sub));
+      }
+    }
+  };
+  const dirs = aliasModuleDirs(consumer, w).slice(0, Math.max(0, bounds.dirs));
+  for (const modules of dirs) scanPackages(modules);
+  // pnpm: `<modules>/.pnpm/<entry>/node_modules/<name>`, after every top level (the likelier spellings first).
+  for (const modules of dirs) {
+    const store = path.join(modules, ".pnpm");
+    const names = namesOf(store, bounds.pnpm - pnpm);
+    pnpm += names.length;
+    for (const name of names) if (!name.startsWith(".")) scanPackages(path.join(store, name, "node_modules"));
   }
   return aliases;
 }

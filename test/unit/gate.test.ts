@@ -751,6 +751,146 @@ describe("accept() — per-check placements (P2.4)", () => {
       }
     });
 
+    // QA round 1 M2 (spelling): besides `<consumer>/node_modules`, the provider reads the hoisted links of the consumer's
+    // ancestors up to its git top, W's own workspace links into W, and pnpm's `.pnpm/*/node_modules/<name>` links; bounded.
+    describe("crossLinkAliases spellings (QA-1 M2)", () => {
+      type FS = typeof import("node:fs");
+      type Path = typeof import("node:path");
+      type Aliases = typeof import("../../src/verify/perimeter").crossLinkAliases;
+      const win = process.platform === "win32";
+      const link = (fs: FS, target: string, at: string): void => {
+        fs.mkdirSync(join(at, ".."), { recursive: true });
+        fs.symlinkSync(target, at, win ? "junction" : "dir");
+      };
+      /** win32: the k-th case spelling of p (a junction's JS realpath keeps it, spike C4); posix: p. */
+      const spell = (p: string, k: number): string => (win ? [p, p.toUpperCase(), p.toLowerCase()][k % 3]! : p);
+      const sorted = (xs: readonly string[]): string[] => [...new Set(xs)].sort();
+      const noNodeModules = (xs: readonly string[]): boolean => xs.every(x => !x.includes("node_modules"));
+      const fixture = async (run: (fs: FS, path: Path, base: string, aliasesOf: Aliases) => void): Promise<void> => {
+        const fs = await import("node:fs");
+        const path = await import("node:path");
+        const { crossLinkAliases: aliasesOf } = await import("../../src/verify/perimeter");
+        const base = fs.realpathSync.native(fs.mkdtempSync(join(tmpdir(), "p3a-m2-")));
+        try {
+          run(fs, path, base, aliasesOf);
+        } finally {
+          fs.rmSync(base, { recursive: true, force: true });
+        }
+      };
+
+      it("an ancestor's hoisted link, up to and including the consumer's git top, is found; one above the top is not", () =>
+        fixture((fs, path, base, aliasesOf) => {
+          const w = join(base, "w");
+          const top = join(base, "outer", "c");
+          const app = join(top, "packages", "app");
+          fs.mkdirSync(join(w, "src"), { recursive: true });
+          fs.mkdirSync(join(top, ".git"), { recursive: true });
+          fs.mkdirSync(join(app, "node_modules"), { recursive: true });
+          link(fs, spell(w, 1), join(base, "outer", "node_modules", "lib"));
+          expect(aliasesOf(app, w)).toEqual([]);
+          const hoisted = join(top, "node_modules", "@scope", "lib");
+          const between = join(top, "packages", "node_modules", "mid");
+          link(fs, spell(w, 2), hoisted);
+          link(fs, spell(join(w, "src"), 1), between);
+          const aliases = aliasesOf(app, w);
+          expect(aliases).toHaveLength(new Set(aliases).size);
+          expect(sorted(aliases)).toEqual(sorted([path.resolve(fs.realpathSync(hoisted)), path.resolve(fs.realpathSync(between), "..")]));
+          expect(noNodeModules(aliases)).toBe(true);
+        }));
+
+      it("W's own workspace link into W is found (W/node_modules/@w/core, reached through @w/ui); links out of W are not", () =>
+        fixture((fs, path, base, aliasesOf) => {
+          const w = join(base, "w");
+          const c = join(base, "c");
+          const other = join(base, "other");
+          fs.mkdirSync(join(w, "packages", "core"), { recursive: true });
+          fs.mkdirSync(other, { recursive: true });
+          fs.mkdirSync(join(c, "node_modules"), { recursive: true });
+          link(fs, other, join(w, "node_modules", "ext"));
+          link(fs, other, join(c, "node_modules", "other"));
+          expect(aliasesOf(c, w)).toEqual([]);
+          const core = join(w, "node_modules", "@w", "core");
+          link(fs, spell(join(w, "packages", "core"), 1), core);
+          const aliases = aliasesOf(c, w);
+          expect(aliases).toEqual([path.resolve(fs.realpathSync(core), "..", "..")]);
+          expect(noNodeModules(aliases)).toBe(true);
+        }));
+
+      it("pnpm's .pnpm/*/node_modules/<name> links into W are found (top level and @scope)", () =>
+        fixture((fs, path, base, aliasesOf) => {
+          const w = join(base, "w");
+          const c = join(base, "c");
+          const store = join(c, "node_modules", ".pnpm");
+          fs.mkdirSync(join(w, "packages", "lib"), { recursive: true });
+          fs.mkdirSync(join(store, "plain@1.0.0", "node_modules", "plain"), { recursive: true });
+          const named = join(store, "w@file+..+w", "node_modules", "w");
+          const scoped = join(store, "@s+lib@file+..+w+packages+lib", "node_modules", "@s", "lib");
+          link(fs, spell(w, 1), named);
+          link(fs, spell(join(w, "packages", "lib"), 2), scoped);
+          const aliases = aliasesOf(c, w);
+          expect(sorted(aliases)).toEqual(sorted([path.resolve(fs.realpathSync(named)), path.resolve(fs.realpathSync(scoped), "..", "..")]));
+          expect(noNodeModules(aliases)).toBe(true);
+        }));
+
+      it("bounds: node_modules directories, entries and .pnpm entries read are capped", () =>
+        fixture((fs, path, base, aliasesOf) => {
+          const w = join(base, "w");
+          const top = join(base, "c");
+          const app = join(top, "app");
+          const store = join(top, "node_modules", ".pnpm");
+          fs.mkdirSync(w, { recursive: true });
+          fs.mkdirSync(join(top, ".git"), { recursive: true });
+          fs.mkdirSync(app, { recursive: true });
+          for (const name of ["a", "b", "d", "e", "f"]) fs.mkdirSync(join(top, "node_modules", name), { recursive: true });
+          link(fs, w, join(top, "node_modules", "lib"));
+          for (const k of [0, 1, 2]) link(fs, spell(w, k), join(store, `w${k}@1.0.0`, "node_modules", "w"));
+          const lstats: string[] = [];
+          const io = {
+            lstat: (p: string) => {
+              lstats.push(p);
+              return fs.lstatSync(p);
+            },
+            readlink: (p: string) => fs.readlinkSync(p),
+            realpath: (p: string) => fs.realpathSync.native(p),
+            jsRealpath: (p: string) => fs.realpathSync(p),
+          };
+          const all = { dirs: 64, entries: 4000, pnpm: 256 };
+          expect(aliasesOf(app, w, io, all).length).toBeGreaterThan(0);
+          // One directory: only the consumer's own node_modules (absent) is read.
+          expect(aliasesOf(app, w, io, { ...all, dirs: 1 })).toEqual([]);
+          lstats.length = 0;
+          aliasesOf(app, w, io, { ...all, entries: 3 });
+          expect(lstats.length).toBeLessThanOrEqual(3);
+          const pnpmEntries = (): Set<string> =>
+            new Set(lstats.filter(p => p.startsWith(store)).map(p => path.relative(store, p).split(/[\\/]/)[0]!));
+          lstats.length = 0;
+          expect(aliasesOf(app, w, io, { ...all, pnpm: 1 }).length).toBeGreaterThan(0);
+          expect(pnpmEntries().size).toBe(1);
+          lstats.length = 0;
+          aliasesOf(app, w, io, { ...all, pnpm: 0 });
+          expect(pnpmEntries().size).toBe(0);
+        }));
+
+      it("never a spelling containing the substring node_modules (vitest's case-sensitive rule); case-only variants kept", () =>
+        fixture((fs, path, base, aliasesOf) => {
+          const hidden = join(base, "x_node_modules", "w");
+          const shown = join(base, "Y_NODE_MODULES", "w");
+          const c = join(base, "c");
+          fs.mkdirSync(hidden, { recursive: true });
+          fs.mkdirSync(shown, { recursive: true });
+          link(fs, hidden, join(c, "node_modules", "hidden"));
+          expect(aliasesOf(c, hidden)).toEqual([]);
+          const links = [join(c, "node_modules", "shown"), join(c, "node_modules", "shown-upper"), join(c, "node_modules", "shown-lower")];
+          links.forEach((at, k) => link(fs, spell(shown, k), at));
+          const aliases = aliasesOf(c, shown);
+          expect(aliases).toHaveLength(new Set(aliases).size);
+          expect(aliases.length).toBeGreaterThan(0);
+          // win32: the lower-case spelling holds "y_node_modules" and is dropped; "Y_NODE_MODULES" is kept (case-sensitive).
+          const expected = links.map(at => path.resolve(fs.realpathSync(at))).filter(spelling => !spelling.includes("node_modules"));
+          expect(sorted(aliases)).toEqual(sorted(expected));
+        }));
+    });
+
     it("without a foreign check (in-repo placements, or none as on v1 and tiers) neither is set", async () => {
       const { d, dod } = setup([runCheck, runCheck]);
       await accept({ dod, workRoot: W, checkPlacements: [undefined, local] }, wrote("a.ts"), d);
