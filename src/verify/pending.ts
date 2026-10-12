@@ -1693,6 +1693,8 @@ export function claimPendingSession(
     token?: string;
     /** A live pid's claim older than this is taken over (a reused pid never refreshes it); default `CLAIM_STALE_MS`. */
     staleMs?: number;
+    /** DF-1-10: the directory of the instance beat files (`writeInstanceBeat`); unset: only this module's live tokens count. */
+    beatsDir?: string;
   },
 ): boolean {
   const file = join(claimsDir, encodeURIComponent(sessionID));
@@ -1713,7 +1715,10 @@ export function claimPendingSession(
   const fresh = owner?.at !== undefined && seams.now - owner.at <= (seams.staleMs ?? CLAIM_STALE_MS);
   if (owner?.pid !== undefined && owner.pid !== seams.pid && fresh && seams.isAlive(owner.pid)) return false;
   // QA-2.1-19: a claim of this pid under the token of ANOTHER live plugin instance of this process is that instance's.
-  if (owner?.pid === seams.pid && owner.token !== undefined && owner.token !== token && LIVE_INSTANCE_TOKENS.has(owner.token)) return false;
+  // DF-1-10: a sibling instance may run a separately loaded copy of this module (one per booted location), whose tokens this
+  // copy's set never holds; its fresh beat file (`writeInstanceBeat`) marks it live just the same. No beat file: as before.
+  if (owner?.pid === seams.pid && owner.token !== undefined && owner.token !== token
+    && (LIVE_INSTANCE_TOKENS.has(owner.token) || (seams.beatsDir !== undefined && instanceBeatIsFresh(seams.beatsDir, owner.token, seams.pid, seams.now, seams.staleMs ?? CLAIM_STALE_MS)))) return false;
   writeFileSync(file, body);
   return true;
 }
@@ -1724,13 +1729,57 @@ const LIVE_INSTANCE_TOKENS = new Set<string>();
 /**
  * QA-2.1-19: a claim token for one plugin instance. While it is not released, a claim this process wrote under it is
  * refused to every other instance of the process (`claimPendingSession`); once released (dispose), the claim is stale for
- * them and is taken over. Idempotent release.
+ * them and is taken over. Idempotent release. DF-1-10: with `beatsDir`, `beat()` re-stamps the instance's beat file (the
+ * owner calls it with its claims) and `release()` removes it, so instances in other module copies see it too.
  */
-export function createInstanceClaimToken(): { readonly token: string; release(): void } {
+export function createInstanceClaimToken(beatsDir?: string): { readonly token: string; beat(now?: number): void; release(): void } {
   const token = `${PROCESS_CLAIM_TOKEN}.${toHex(randomBytes(4))}`;
   LIVE_INSTANCE_TOKENS.add(token);
-  return { token, release: () => { LIVE_INSTANCE_TOKENS.delete(token); } };
+  const beat = (now: number = Date.now()): void => {
+    if (beatsDir !== undefined && LIVE_INSTANCE_TOKENS.has(token)) writeInstanceBeat(beatsDir, token, { pid: process.pid, now });
+  };
+  return {
+    token,
+    beat,
+    release: () => {
+      LIVE_INSTANCE_TOKENS.delete(token);
+      if (beatsDir !== undefined) removeInstanceBeat(beatsDir, token);
+    },
+  };
 }
+
+/**
+ * DF-1-10: the beat file of one plugin instance, `<beatsDir>\<token>` (`{pid, at}`). One host process may load a separate copy
+ * of this module per booted location, and `LIVE_INSTANCE_TOKENS` never holds a sibling copy's tokens; a beat of the claim's pid
+ * younger than the stale bound marks that instance live to every copy (`claimPendingSession`). Written at start, re-stamped
+ * with the claims (`CLAIM_REFRESH_MS`), removed on release; a crashed instance's beat goes stale. Never throws.
+ */
+export function writeInstanceBeat(beatsDir: string, token: string, seams: { pid: number; now: number }): void {
+  try {
+    mkdirSync(beatsDir, { recursive: true });
+    writeFileSync(join(beatsDir, encodeURIComponent(token)), `${JSON.stringify({ pid: seams.pid, token, at: seams.now })}\n`);
+  } catch (error) {
+    void error; // no beat: a sibling copy takes this instance's claims over, as before DF-1-10
+  }
+}
+
+/** DF-1-10: removes an instance's beat file (release, dispose). Never throws. */
+export function removeInstanceBeat(beatsDir: string, token: string): void {
+  try {
+    rmSync(join(beatsDir, encodeURIComponent(token)), { force: true });
+  } catch (error) {
+    void error; // a beat that cannot be removed goes stale after CLAIM_STALE_MS
+  }
+}
+
+/** DF-1-10: the instance of `token` (on `pid`) re-stamped its beat file within `staleMs`. */
+function instanceBeatIsFresh(beatsDir: string, token: string, pid: number, now: number, staleMs: number): boolean {
+  const beat = readClaim(join(beatsDir, encodeURIComponent(token)));
+  return beat?.pid === pid && beat.at !== undefined && now - beat.at <= staleMs;
+}
+
+/** DF-1-10: the per-user directory of the instance beat files, next to `pending.claims`. */
+export const PENDING_INSTANCES_DIRNAME = "pending.instances";
 
 /**
  * QA-2.1-13/-34: a claim of another pid older than this no longer protects it, even while that pid is alive: a live owner

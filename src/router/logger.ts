@@ -43,6 +43,8 @@
 
 export interface PluginLogger {
   warn(message: string, extra?: Record<string, unknown>): void;
+  /** An informational entry (level `info`), posted like `warn`; optional so bare logger stubs stay valid. */
+  info?(message: string, extra?: Record<string, unknown>): void;
   /**
    * Await every post still in flight, so a shutting-down process does not drop
    * warnings it already decided to emit. Never rejects: a failing flush must
@@ -105,6 +107,9 @@ export function createPluginLogger(client?: unknown): PluginLogger {
       warn(message) {
         console.warn(`${CONSOLE_PREFIX} ${message}`);
       },
+      info(message) {
+        console.info(`${CONSOLE_PREFIX} ${message}`);
+      },
       // console.warn is synchronous, so there is never anything to wait for.
       flush: () => Promise.resolve(),
     };
@@ -114,40 +119,47 @@ export function createPluginLogger(client?: unknown): PluginLogger {
   // stays bounded on a long-lived server rather than growing for its lifetime.
   const inFlight = new Set<Promise<void>>();
 
+  const post = (level: "warn" | "info", message: string, extra?: Record<string, unknown>): void => {
+    const toConsole = () => (level === "warn" ? console.warn : console.info)(`${CONSOLE_PREFIX} ${message}`);
+    let result: unknown;
+    try {
+      // Bound to `app` on purpose — see (1) in the module comment. Calling
+      // the detached reference would throw on every real client.
+      result = log.call(app, {
+        body: {
+          service: LOG_SERVICE,
+          level,
+          message,
+          ...(extra ? { extra } : {}),
+        },
+      });
+    } catch {
+      // A synchronous throw means the transport is unusable; say it somewhere.
+      toConsole();
+      return;
+    }
+    // Fire-and-forget: never await, but never leave a rejection unhandled
+    // either, and do not lose the diagnostic when the post fails — whether it
+    // fails by rejecting or by resolving with an error. See (2) above.
+    const settled: Promise<void> = Promise.resolve(result)
+      .then((value) => {
+        if (isErrorResult(value)) toConsole();
+      })
+      .catch(toConsole);
+    // Tracked so `flush` can wait for it. `settled` already absorbs its own
+    // failures, so nothing here can reject. See (3) above.
+    inFlight.add(settled);
+    void settled.finally(() => {
+      inFlight.delete(settled);
+    });
+  };
+
   return {
     warn(message, extra) {
-      const toConsole = () => console.warn(`${CONSOLE_PREFIX} ${message}`);
-      let result: unknown;
-      try {
-        // Bound to `app` on purpose — see (1) in the module comment. Calling
-        // the detached reference would throw on every real client.
-        result = log.call(app, {
-          body: {
-            service: LOG_SERVICE,
-            level: "warn",
-            message,
-            ...(extra ? { extra } : {}),
-          },
-        });
-      } catch {
-        // A synchronous throw means the transport is unusable; say it somewhere.
-        toConsole();
-        return;
-      }
-      // Fire-and-forget: never await, but never leave a rejection unhandled
-      // either, and do not lose the diagnostic when the post fails — whether it
-      // fails by rejecting or by resolving with an error. See (2) above.
-      const settled: Promise<void> = Promise.resolve(result)
-        .then((value) => {
-          if (isErrorResult(value)) toConsole();
-        })
-        .catch(toConsole);
-      // Tracked so `flush` can wait for it. `settled` already absorbs its own
-      // failures, so nothing here can reject. See (3) above.
-      inFlight.add(settled);
-      void settled.finally(() => {
-        inFlight.delete(settled);
-      });
+      post("warn", message, extra);
+    },
+    info(message, extra) {
+      post("info", message, extra);
     },
     async flush() {
       await Promise.allSettled([...inFlight]);

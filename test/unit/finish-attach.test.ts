@@ -160,6 +160,40 @@ describe("finish attach channel", () => {
     }
   });
 
+  it("DF-1-10 two plugin instances in separately loaded module copies of one process: the second never adopts the live owner's session; it does once the owner disposes", async () => {
+    const savedXdg = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = join(home, ".local", "state");
+    try {
+      const ownerHooks = await load("v2");
+      const owner = attachOf(ownerHooks)({ host: "v2", held: sink });
+      if (owner === undefined) throw new Error("no finish API");
+      await owner.journal.append({
+        v: 1, kind: "inflight", key: "k-copy\u0000c-copy", callID: "c-copy", parentSessionID: "ses_copy", childSessionID: "k-copy", at: Date.now(),
+      }, { fsync: true });
+      // A second booted location: the host loads the plugin module again (own module-level state, own live-token set).
+      vi.resetModules();
+      const copy = await import("../../src/index");
+      const otherHooks = await copy.default({
+        directory: home, worktree: home, project: {}, serverUrl: new URL("http://localhost"), $: () => undefined, routerHost: "v2",
+        client: { session: { get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id } }) } },
+      } as unknown as Parameters<typeof ModelRouterPlugin>[0]);
+      const other = attachOf(otherHooks)({ host: "v2", held: sink });
+      if (other === undefined) throw new Error("no finish API");
+      await other.reload();
+      // The owner's beat file marks it live to the other copy: refused, and the records stay dormant. The refusal is the
+      // copy's own sentinel (a separately loaded module), so it is checked with the shared predicate, not by identity.
+      expect(isAdoptionRefused(other.adopt("ses_copy"))).toBe(true);
+      expect(isAdoptionRefused(other.adopt("ses_copy"))).toBe(true);
+      // The owner disposes (claims released, beat removed): restart recovery still takes the very same records over.
+      await (ownerHooks as { dispose?: () => Promise<void> }).dispose?.();
+      expect(adoptedCallIDs(other.adopt("ses_copy"))).toEqual(["c-copy"]);
+      await (otherHooks as { dispose?: () => Promise<void> }).dispose?.();
+    } finally {
+      if (savedXdg === undefined) delete process.env.XDG_STATE_HOME;
+      else process.env.XDG_STATE_HOME = savedXdg;
+    }
+  });
+
   it("QA-2.1-34: a claim of another live pid is refused while fresh and taken over once older than CLAIM_STALE_MS (a reused pid never refreshes it)", async () => {
     const savedXdg = process.env.XDG_STATE_HOME;
     process.env.XDG_STATE_HOME = join(home, ".local", "state");

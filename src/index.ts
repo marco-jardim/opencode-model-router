@@ -140,7 +140,8 @@ import { tool } from "@opencode-ai/plugin";
 import { scrubText } from "./guard/scrub";
 import { accept, unverifiableGateResult } from "./verify/gate";
 import { applyDispatchCaveats, createVerificationWiring, resolvePendingTtlMs, dispatchDirectiveText, extractAssistantText, parseRouterVerifyArgs, type DispatchStart, type HandleReport } from "./verify/wiring";
-import { CLAIM_REFRESH_MS, claimPendingSession, createInstanceClaimToken, createPendingFileJournal, foldDormantRecords, refreshPendingClaims, releasePendingClaim, resolvePendingJournalDir, processedKeyOf, appendRouterFooter, buildLateNoticeBlock, buildPendingListBlock, unattributedRisk, type DormantSession, type LateNotice, type PendingEntry, type SettledVerification } from "./verify/pending";
+import { locationOutsideWorkRoots } from "./router/work-roots";
+import { CLAIM_REFRESH_MS, PENDING_INSTANCES_DIRNAME, claimPendingSession, createInstanceClaimToken, createPendingFileJournal, foldDormantRecords, refreshPendingClaims, releasePendingClaim, resolvePendingJournalDir, processedKeyOf, appendRouterFooter, buildLateNoticeBlock, buildPendingListBlock, unattributedRisk, type DormantSession, type LateNotice, type PendingEntry, type SettledVerification } from "./verify/pending";
 import { createDeadline } from "./verify/deterministic";
 import {
   DEFAULT_DELEGATE_PROMPT_TIMEOUT_MS,
@@ -839,6 +840,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       });
   /** Section 11.3: the exclusive per-session claim files of the journal's sessions (v2 only). */
   const pendingClaimsDir = pendingDir === undefined ? undefined : join(pendingDir, "pending.claims");
+  /** DF-1-10: the beat files of the live plugin instances, which every module copy loaded into one host process can read. */
+  const pendingBeatsDir = pendingDir === undefined ? undefined : join(pendingDir, PENDING_INSTANCES_DIRNAME);
   /** QA-2.1-33: the v2 adapter's live attempts and holds (`FinishApi.setAdapterSnapshot`); none before it attaches. */
   let adapterSnapshot: (() => readonly PersistedRecord[]) | undefined;
   /**
@@ -870,6 +873,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     const claimsDir = pendingClaimsDir;
     claimRefreshTimer = setInterval(() => {
       refreshPendingClaims(claimsDir, claimedSessions, { pid: process.pid, now: Date.now(), ...(instanceClaim === undefined ? {} : { token: instanceClaim.token }) });
+      // DF-1-10: the instance beat stays fresh while this instance holds a claim (a sibling module copy checks it).
+      instanceClaim?.beat();
     }, CLAIM_REFRESH_MS);
     claimRefreshTimer.unref?.();
   }
@@ -887,9 +892,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   }
   /**
    * QA-2.1-19 (v2 only): this instance's claim token. Its claims are refused to every other live instance (of this
-   * process: the token; of another process: the pid) until it disposes.
+   * process: the token; of another process: the pid) until it disposes. DF-1-10: its beat file in `pending.instances`
+   * makes the token visible to instances of this process that run another copy of the plugin modules.
    */
-  const instanceClaim = pendingClaimsDir === undefined ? undefined : createInstanceClaimToken();
+  const instanceClaim = pendingClaimsDir === undefined ? undefined : createInstanceClaimToken(pendingBeatsDir);
   /**
    * QA-2.1-19: takes the claim of `sessionID` for this instance (pid + token), once. The live owner claims at its first
    * `inflight`/`hold` write; `adopt` claims before handing dormant records over. False when another live instance holds
@@ -907,7 +913,12 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           return (error as NodeJS.ErrnoException).code === "EPERM";
         }
       };
-      if (!claimPendingSession(pendingClaimsDir, sessionID, { pid: process.pid, now: Date.now(), isAlive: pidAliveNow, token: instanceClaim.token })) return false;
+      // DF-1-10: the beat is fresh before the claim lands, so a sibling copy of the module never reads it as orphaned.
+      if (claimRefreshTimer === undefined) instanceClaim.beat();
+      if (!claimPendingSession(pendingClaimsDir, sessionID, {
+        pid: process.pid, now: Date.now(), isAlive: pidAliveNow, token: instanceClaim.token,
+        ...(pendingBeatsDir === undefined ? {} : { beatsDir: pendingBeatsDir }),
+      })) return false;
     } catch (error) {
       logger.warn("[router] the pending session claim could not be taken", { sessionID, error: describeError(error) });
       return false;
@@ -945,7 +956,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // 2.1.5b: sweep reference dirs a crashed instance left behind. Fire-and-forget; never throws.
   // QA-2.1-11: deferred (unref'd timer), so plugin start never holds the project directory with a
   // git child; dispose cancels it.
-  const stopReferenceGc = startReferenceGc();
+  // DF-1-1 (v2 only): with `routing.workRoots` configured and non-empty, a location outside every entry is not the plan's:
+  // nothing started here runs git in (or writes to) its repository. Unset or empty: unchanged.
+  const outsideWorkRoots = isV2Host && locationOutsideWorkRoots(ctx.directory, cfg.routing?.workRoots);
+  if (outsideWorkRoots) logger.info?.(`[router] ${ctx.directory} is outside routing.workRoots: the start-up reference GC is skipped`);
+  const stopReferenceGc = outsideWorkRoots ? (): void => undefined : startReferenceGc();
 
   // Phase 1.2 (v2 only): the turn-state registry the adapter injects. Without it (v1, or a v2 host that injects none) nothing
   // below is registered or buffered, and the system transform keeps pushing the pending list and the late notices.

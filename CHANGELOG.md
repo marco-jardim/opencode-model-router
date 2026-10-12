@@ -57,6 +57,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Role prompts: the dispatch's `root=` wins over the host's environment block.** The work-root rule of every role
   prompt now says that the route line's `root=` takes precedence over the directory the host's environment block
   names, so a role no longer refuses its work root because the host named the parent's directory.
+- **OpenCode v2: a second booted location no longer settles another location's running dispatch as `lost in
+  restart`.** When one host process loads a router instance per location, each instance now keeps a beat file in
+  `pending.instances` next to `pending.claims` while it holds a session claim. A new instance refuses to adopt a
+  session whose claim belongs to a live sibling instance, so that instance's records stay dormant and its verdict is
+  the only one delivered. A dead owner (stale beat, or dead pid) is still recovered as before. Journal and claim
+  records written by earlier builds read as before. OpenCode v1 is unchanged.
+- **OpenCode v2: no start-up git in a location outside `routing.workRoots`.** When `routing.workRoots` is configured and
+  non-empty, an instance loaded in a directory outside every entry skips the start-up reference GC (git commands with
+  that directory as cwd) and logs one info line naming the skip. Without `routing.workRoots` nothing changes. OpenCode v1
+  is unchanged.
 
 ## [2.7.0] - 2026-10-10
 

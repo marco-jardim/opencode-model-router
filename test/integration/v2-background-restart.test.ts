@@ -11,12 +11,14 @@
  * - QA-2.1-29: a restored hold whose `inflight` recovery is skipped is settled, not left held until the TTL.
  * - QA-2.1-34: an adoption refused by another live pid's claim is tried again at a later sighting (rate-limited), and a claim
  *   nobody re-stamps goes stale (a crashed owner whose pid was reused never blocks recovery).
+ * - DF-1-10: a session a live sibling instance of this process owns (another booted location: another module copy, its fresh
+ *   beat file in `pending.instances`) is never adopted nor settled `lost in restart`; a dead sibling (stale beat) still is.
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ADOPTION_RETRY_MS } from "../../src/compat/background";
-import { CLAIM_STALE_MS } from "../../src/verify/pending";
+import { CLAIM_STALE_MS, PENDING_INSTANCES_DIRNAME } from "../../src/verify/pending";
 import { bootBgHost, restoreEnv, type BgHost, type SyntheticCall } from "../helpers/v2-bg-host";
 
 let host: BgHost | undefined;
@@ -147,6 +149,118 @@ describe("a refused adoption is tried again at a later sighting, rate-limited (Q
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("DF-1-10: a sibling plugin instance of this process (another booted location, another module copy) owns the session", () => {
+  const RUNNING = (handle: string, at: number): Array<Record<string, unknown>> => [
+    {
+      v: 1, kind: "inflight", key: `${CHILD}\u0000call-df110`, callID: "call-df110", parentSessionID: ORCH, childSessionID: CHILD,
+      label: 'medium "implement"', agent: "medium", description: "implement", verifying: true, verificationMode: "required", handle, hold: handle, at,
+    },
+    { v: 1, kind: "hold", handle, parent: ORCH, child: CHILD, callID: "call-df110", label: 'medium "implement"', dispatch: { prompt: "implement it" }, at },
+  ];
+  /** The owner's live background dispatch of ORCH: acknowledged as running, so its `inflight` and `hold` records are journaled. */
+  const startRunningDispatch = async (h: BgHost): Promise<void> => {
+    h.emit({ type: "session.created", id: `ev-created-${CHILD}`, created: 1, data: { sessionID: CHILD, parentID: ORCH } });
+    await h.drain();
+    const call = await h.before({
+      sessionID: ORCH, agent: "build", messageID: "m-df110", id: "call-df110-live", tool: "subagent",
+      input: { agent: "fast", description: "background work", prompt: "do the work", background: true },
+    });
+    const running = { output: { sessionID: CHILD, status: "running", output: "Working in the background" }, content: "Working in the background", metadata: { sessionID: CHILD } };
+    await h.after({ ...call, status: "completed", result: running });
+    await h.settled();
+  };
+  /** The owner's child ends (failed: its verdict is UNVERIFIABLE without running a gate) and the owner posts that verdict. */
+  const completeRunningDispatch = async (h: BgHost): Promise<void> => {
+    h.childContext.set(CHILD, [{ role: "assistant", content: [{ type: "text", text: "partial work" }], finish: "stop", time: { created: 1, completed: 2 } }]);
+    h.emit({ type: "session.execution.failed", id: `ev-end-${CHILD}-failed`, created: 2, data: { sessionID: CHILD } });
+    await h.drain();
+    // The processor journals (file I/O) before it posts, which microtask turns alone do not cover.
+    await vi.waitFor(() => expect(verdictPosts(h)).toHaveLength(1));
+    await h.settled();
+  };
+  /** The sibling instance's claim of ORCH (this pid, a token this module copy never issued) and its beat file. */
+  const writeSibling = (h: BgHost, claimAt: number, beatAt: number | undefined): void => {
+    const stateDir = dirname(h.journalPath);
+    mkdirSync(join(stateDir, "pending.claims"), { recursive: true });
+    writeFileSync(join(stateDir, "pending.claims", ORCH), `${JSON.stringify({ pid: process.pid, token: "sibling-instance", at: claimAt })}\n`);
+    if (beatAt === undefined) return;
+    mkdirSync(join(stateDir, PENDING_INSTANCES_DIRNAME), { recursive: true });
+    writeFileSync(join(stateDir, PENDING_INSTANCES_DIRNAME, "sibling-instance"), `${JSON.stringify({ pid: process.pid, token: "sibling-instance", at: beatAt })}\n`);
+  };
+
+  it("DF-1-10 a live sibling's running hold is never settled `lost in restart`: the adoption is refused and the records stay dormant", async () => {
+    const handle = `vrf_${"f".repeat(24)}`;
+    const t0 = Date.now();
+    vi.useFakeTimers({ toFake: ["Date"], now: t0 });
+    try {
+      const h = await boot(RUNNING(handle, t0), { "child-event-2": { parentID: ORCH } });
+      writeSibling(h, t0, t0);
+      adoptOrchestrator(h);
+      await h.settled();
+      expect(verdictPosts(h)).toEqual([]);
+      expect(h.synthetic.some((s) => s.text.includes("lost in restart"))).toBe(false);
+      // The sibling keeps beating: a later sighting is refused again, nothing is posted, the claim stays the sibling's.
+      vi.setSystemTime(t0 + ADOPTION_RETRY_MS + 1);
+      writeSibling(h, t0 + ADOPTION_RETRY_MS, t0 + ADOPTION_RETRY_MS);
+      h.emit({ type: "session.created", id: "ev-created-child-event-2", created: 1, data: { sessionID: "child-event-2", parentID: ORCH } });
+      await h.settled();
+      expect(verdictPosts(h)).toEqual([]);
+      expect(JSON.parse(readFileSync(join(dirname(h.journalPath), "pending.claims", ORCH), "utf8"))).toMatchObject({ token: "sibling-instance" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("DF-1-10 two real instances over one journal (second from another module copy): the second never settles the owner's running dispatch; the owner delivers exactly one verdict", async () => {
+    const owner = await bootBgHost({
+      overrides: { routing: { background: { mode: "auto" }, leases: { mode: "off" } } },
+      sessions: { [ORCH]: {}, [CHILD]: { parentID: ORCH }, [EVENT_CHILD]: { parentID: ORCH } },
+    });
+    host = owner;
+    await startRunningDispatch(owner);
+    // The host boots another location: a second instance, from a separately loaded copy of the plugin modules, on the same
+    // per-user journal (same home), reloads it and sights ORCH.
+    vi.resetModules();
+    const copy = await import("../helpers/v2-bg-host");
+    const second = await copy.bootBgHost({
+      home: owner.home,
+      overrides: { routing: { background: { mode: "auto" }, leases: { mode: "off" } } },
+      sessions: { [ORCH]: {}, [CHILD]: { parentID: ORCH }, [EVENT_CHILD]: { parentID: ORCH } },
+    });
+    try {
+      adoptOrchestrator(second);
+      await second.settled();
+      expect(second.synthetic).toEqual([]);
+      expect(owner.synthetic.some((s) => s.text.includes("lost in restart"))).toBe(false);
+      // The owner's child completes: its verdict is delivered once, by the owner, under its handle.
+      await completeRunningDispatch(owner);
+      await owner.settled();
+      await second.settled();
+      const posts = verdictPosts(owner);
+      expect(posts).toHaveLength(1);
+      expect(posts[0]?.text).not.toContain("lost in restart");
+      expect(second.synthetic).toEqual([]);
+    } finally {
+      // The shared home goes with the first dispose; the owner (`host`) disposes after it.
+      await second.dispose();
+    }
+  });
+
+  it("DF-1-10 a dead sibling (stale beat) still yields `lost in restart` for its hold, once", async () => {
+    const handle = `vrf_${"0".repeat(24)}`;
+    const t0 = Date.now();
+    const h = await boot([{ v: 1, kind: "hold", handle, parent: ORCH, child: CHILD, callID: "call-df110-dead", at: t0 }]);
+    writeSibling(h, t0, t0 - CLAIM_STALE_MS - 1_000);
+    adoptOrchestrator(h);
+    await h.settled();
+    const posts = verdictPosts(h);
+    expect(posts).toHaveLength(1);
+    expect(posts[0]?.text).toContain(handle);
+    expect(posts[0]?.text).toContain("lost in restart");
+    expect(JSON.parse(readFileSync(join(dirname(h.journalPath), "pending.claims", ORCH), "utf8"))).toMatchObject({ pid: process.pid });
   });
 });
 
