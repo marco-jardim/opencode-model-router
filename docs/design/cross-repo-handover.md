@@ -25,7 +25,7 @@ Read this first in a new session. The design is `docs/design/cross-repo.md`, and
 | P0: integrity fixes in the shared verification engine (both hosts) | Done. QA'd twice. Live check: the unobservable-writers caveat appeared on a real dispatch. |
 | P1: v2 roles cross-repo (P1.1–P1.10) | Done. QA'd twice. Docs updated. Live dogfood done (see "Phase 1 live dogfood"). |
 | P2 lot 1: P2a–P2d + P2g (plan `docs/design/cross-repo-phase2-plan.md`) | Done. QA'd twice (round 1: 4 major + 9 minor fixed; round 2: 3 major fixed, minors recorded in design §9). Docs and CHANGELOG updated. Live dogfood done (see "Phase 2 live dogfood"); findings F-D1, F-D2 wait for the owner. |
-| P2 lot 2: P2e (deferred P), owner decision OD4 | Implemented (`3037ab8`..`722c5db`, docs after): a role dispatch with a perimeter or per-check keys defers; P frozen at return; S11 caveat (OD-P2e-1 = UNVERIFIED); F13 v2-only (OD-P2e-2). **Heavy QA and live dogfood pending.** |
+| P2 lot 2: P2e (deferred P), owner decision OD4 | Implemented (`3037ab8`..`722c5db`, docs after): a role dispatch with a perimeter or per-check keys defers; P frozen at return; S11 caveat (OD-P2e-1 = UNVERIFIED); F13 v2-only (OD-P2e-2). QA'd twice (round 1: 1 major + 5 minor fixed; round 2: 1 major fixed, minors in design §9). Live dogfood done (see "Progress after resuming"). |
 | P3 / P4 | Not started |
 
 Last checks (HEAD after the round 2 fixes):
@@ -37,7 +37,15 @@ Last checks (HEAD after the round 2 fixes):
 
 - Fan-out A, B, C, D done: the WIP was completed (`29abefc`), user docs corrected (`d8bd374`), design follow-ups recorded (`1c44f2f`), P2e QA round 2 run. Its one major (the deferred link re-check read the git top level instead of the W the dispatch read; W in a repository subfolder reported every link as changed) is fixed in `7dbb317`; its minors are recorded in design §9 (`99b31a1`).
 - Checks at `7dbb317`: typecheck clean; `deferred-perimeter` 26/26, `perimeter` 54/54, `deferred-verification` 72/72, `pending` 90/90, `docs-drift` 90/90.
-- Remaining: full `npx vitest run` with nothing else running (then each failing file alone), `test/golden`, the live P2e dogfood, then the handover status table and the P2 status comment on #107. Still open: Q7.
+- Full `npx vitest run` with nothing else running (HEAD `5b14d31`): **2 failures in 2 files** (`test/integration/routing-ladder-resume.test.ts`, 28/28 alone; `test/unit/exec.test.ts`, the known timing tests). `test/golden`: 9 files, 92/92.
+- **P2e live dogfood (2026-10-12)**, junction `node_modules\omr-xr-dogfood-lib` (removed afterwards; scratch repository clean):
+  1. S11 control, deferred role dispatch in this worktree with `testsPass … scope=full`: handle; `router_verify` → `✓ verified`, `verified scope: opencode-model-router-cross-repo (feat/cross-repo @ 5b14d31); also observed: omr-xr-dogfood-lib (main @ 2d133c4)`.
+  2. S11: same, then a file added to the lib before `router_verify` → UNVERIFIED `the linked repository omr-xr-dogfood-lib at D:\git\omr-xr-dogfood-lib changed since the producer returned; the checks ran against its new state`.
+  3. Deferred consumer check (`repo=omr-xr-dogfood-lib`, `testsPass … cwd="<this worktree>" scope=full`): handle; `router_verify` → pass. A DoD without `testsPass` is verified at once (only testsPass DoDs defer).
+  4. I4 at return (`router_run` writing into the lib through the junction, `VERIFY:deferred`): no handle, the I4 UNVERIFIED reason.
+  5. Refused placement with `VERIFY:deferred` (`cwd="C:\Windows"`): no handle, `check 2 (testsPass) cwd=C:\Windows is outside the work root … nothing ran`.
+  - Not shown live: the D6 consumer caveat at `router_verify` (the lib has no test runner, so a deferrable `testsPass` there cannot pass; covered by `deferred-perimeter.test.ts`). After an OpenCode server restart the working set is empty (in memory), so a lib dispatch has no consumer until a dispatch binds the consumer again.
+- Remaining: the P2 status comment on #107 (owner). Still open: Q7. Phase 3/4 not started.
 - The OpenCode server restarted several times during this session; a dispatch interrupted by a restart leaves its edits in the tree. Check `git status` and `git diff --stat` before re-dispatching.
 
 ## Resume here (2026-10-11, session paused by the owner) — superseded by the section above
