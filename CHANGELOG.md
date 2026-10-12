@@ -75,8 +75,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decision Q9 entry under Changed). The verification perimeter is planned for every routed role dispatch with a work root whenever
   `routing.repoParents` is set, even without `repo=`; a pass shows `verified scope: …` and link targets are named
   `(not admitted)` or `(not observed)`.
+- **`router_git_*` in other repositories (OpenCode v2, roles mode; inert on v1) (#107).** A role agent with an exact
+  binding and `read`, `glob` or `grep` in its grant may pass `root` to a `router_git_*` tool to read the history of
+  another repository of its read set, by absolute top-level path or by name below `routing.repoParents` (`repo=`
+  semantics, no branch). The output starts with the read-provenance line; git stays read-only. The argument exists only
+  when `routing.repoParents` is non-empty at start (restart after adding parents); tier agents and the orchestrator are
+  refused, and every refusal runs nothing (see `docs/ROLES.md`).
 
 ### Changed
+
+- **Worktrees of an excluded repository are refused (OpenCode v2, roles mode) (#107).** The linked worktrees of a
+  repository excluded by `routing.repoExclude` are now excluded with it: a `repo=`, `branch=` or `root=` route line that
+  names one is refused, and they are kept out of the read set.
 
 - **A full-scope `testsPass` is no longer run synchronously when the producer changed nothing (OpenCode v2) (#107).**
   Before, a dispatch with no changed files and config `testScope: "full"` ran the full suite synchronously before the

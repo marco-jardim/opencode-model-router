@@ -43,6 +43,10 @@ import { buildLadder, buildRoleLadder, resolveChosen } from "../../src/routing/e
 import { createDispatchRouter, resetDispatchRouting } from "../../src/routing/wire/dispatch";
 import { createEngineRuntime } from "../../src/routing/wire/runtime";
 import { resetBindingRegistryForTests } from "../../src/routing/roles/binding";
+import {
+  GIT_ROOT_MAX_LENGTH, GIT_ROOT_OUTSIDE_PLACEHOLDER, GIT_ROOT_PROVENANCE_PREFIX, GIT_ROOT_PROVENANCE_SUFFIX, GIT_ROOT_TEXTS, GIT_ROOT_TOO_LONG, gitRootCappedNote,
+} from "../../src/routing/roles/git-root";
+import { LOOKUP_MAX_DIRS } from "../../src/routing/roles/admission";
 import { classifyTrivial, createSessionStore, DEFAULT_TIER_CAPS, resetDispatchRegistry } from "../../src/router/sessions";
 import { candidateKey, decide, MAX_EXPLORATION_RATE } from "../../src/routing/engine/kernel";
 import { createOutcomeStore } from "../../src/routing/outcomes/store";
@@ -1292,6 +1296,41 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     expect(unreleased).not.toContain("verified synchronously, never deferred");
   });
 
+  it("P3b: router_git root — the texts of git-root.ts are in ROLES.md, the other docs and the [Unreleased] entries", () => {
+    const source = read("src/routing/roles/git-root.ts");
+    const roles = read("docs/ROLES.md").replace(/\s+/g, " ");
+    // code-to-doc: each fragment is a string literal of git-root.ts AND in the guide; a template pins its static parts in the source
+    const templates = new Map<string, readonly string[]>([[GIT_ROOT_TOO_LONG, ["`is longer than ", " characters`"]]]);
+    expect(GIT_ROOT_TEXTS.length).toBeGreaterThan(0);
+    for (const fragment of GIT_ROOT_TEXTS) {
+      for (const part of templates.get(fragment) ?? [JSON.stringify(fragment)]) expect(source, fragment).toContain(part);
+      expect(roles, fragment).toContain(fragment);
+    }
+    expect(GIT_ROOT_TOO_LONG).toBe(`is longer than ${GIT_ROOT_MAX_LENGTH} characters`);
+    // not in GIT_ROOT_TEXTS: the redaction placeholder (F6) and the cap note of the name lookup (N2, a template)
+    expect(source).toContain(JSON.stringify(GIT_ROOT_OUTSIDE_PLACEHOLDER));
+    expect(roles).toContain(`\`${GIT_ROOT_OUTSIDE_PLACEHOLDER}\``);
+    for (const part of ["`The search stopped after ", " directories`"]) expect(source, part).toContain(part);
+    expect(roles).toContain(gitRootCappedNote(LOOKUP_MAX_DIRS));
+    // the provenance line (its fixed parts are literals of the source) and the tool's refusal prefix
+    for (const part of [GIT_ROOT_PROVENANCE_PREFIX, GIT_ROOT_PROVENANCE_SUFFIX]) expect(source, part).toContain(JSON.stringify(part));
+    expect(roles).toContain(`\`${GIT_ROOT_PROVENANCE_PREFIX}<name> (<branch>) at <worktree>${GIT_ROOT_PROVENANCE_SUFFIX}\``);
+    expect(read("src/router/git-tools.ts")).toContain("[router_git] error: refused: ");
+    expect(roles).toContain("start with `[router_git] error: refused: ` and nothing runs");
+    // the guide's statements: who may pass root, when the argument exists, W as root, read-only, repoExclude worktrees
+    for (const text of ["role agents only", "a restart is needed after adding parents", "`root` equal to the work root behaves as no `root`",
+      "no branch argument", "never refreshes the index", "worktrees of a repository excluded by `routing.repoExclude`"]) expect(roles, text).toContain(text);
+    // the other docs
+    expect(read("docs/READ_ONLY_TIERS.md").replace(/\s+/g, " ")).toContain("`root` is a roles-mode feature: tier agents and the orchestrator are refused");
+    const config = read("docs/CONFIG_REFERENCE.md").replace(/\s+/g, " ");
+    expect(config).toContain("enables the `root` argument of `router_git_*`");
+    expect(config).toContain("also covers the linked worktrees of an excluded repository");
+    // the changelog entries
+    const unreleased = /## \[Unreleased\]([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
+    expect(unreleased).toContain("**`router_git_*` in other repositories (OpenCode v2, roles mode; inert on v1) (#107).**");
+    expect(unreleased).toContain("**Worktrees of an excluded repository are refused (OpenCode v2, roles mode) (#107).**");
+  });
+
   it("P2e: deferred verification across repositories is documented as the code words it (S11 caveat, cross-repo reasons, placement identity)", () => {
     const wiring = read("src/verify/wiring.ts");
     const verificationFlat = read("docs/VERIFICATION.md").replace(/\s+/g, " ");
@@ -1330,6 +1369,8 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     expect(roles).toContain("The dispatch is verified at once, not deferred, when I4 already refuses at return");
     const design = read("docs/design/cross-repo.md").replace(/\s+/g, " ");
     for (const text of ["| D18 |", "| D19 |", "### Phase 2 implemented (notes)", "LINK_DRIFT_CAVEAT"]) expect(design, text).toContain(text);
+    // Phase 3 (b): the owner decisions and the QA follow-ups are recorded in the design.
+    for (const text of ["| D20 |", "| D21 |", "Known follow-ups (P3b QA)"]) expect(design, text).toContain(text);
   });
 
   it("QA-P32-2: a missing d= is none, graders weigh half only when independent, run matching by entry name, R9(5), code map", () => {

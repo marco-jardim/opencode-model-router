@@ -204,7 +204,9 @@ named on the route line with `root=<absolute path>` (and repeated in ENVIRONMENT
 - `router_git_*` run in the bound work root, never in the session location, and are limited to it: for a work root
   below the repository's top level every path and listing is limited to that subdirectory (a pathspec). They are
   refused when the work root belongs to another repository than the one the dispatch listed its worktrees in, or when
-  a `.git` pointer (or a directory git reports) names a network or device path.
+  a `.git` pointer (or a directory git reports) names a network or device path. With cross-repo configured, a role
+  agent may pass `root` to read another repository of its read set instead (see **`router_git_*` in other
+  repositories** below); the work root's limits above still apply to every call without it.
 - The `git worktree list` runs that validate work roots inherit the user's system and global `safe.directory` values
   (only those), so a repository trusted that way does not fail with "dubious ownership".
 - **Acceptance checks run in the work root.** The deterministic checks of a role dispatch's `[acceptance]` block run in
@@ -269,7 +271,9 @@ Text checks come before any git call: UNC, device, 8.3 and `..` paths are refuse
 (`[router] role dispatch @<agent> refused: <note>`). A final gate runs on every
 admission: `repoExclude` applies to both the shown and the canonical path, a candidate is never a configured parent or
 an ancestor of one, and a path whose text lies below a parent must also lie below it canonically. An excluded or
-link-escaping candidate is refused outright, with no fallback to rule 2. When admission is in use, a `root=` other than
+link-escaping candidate is refused outright, with no fallback to rule 2. The linked worktrees of a repository excluded
+by `routing.repoExclude` are excluded with it: a `repo=`, `branch=` or `root=` route line that names one is refused, and
+they are kept out of the read set. When admission is in use, a `root=` other than
 the session directory binds only through admission. The `repo=` lookup needs a `.git` entry before it runs git, skips
 dot-directories, `node_modules` and excluded directories, visits at most 2000 directories and lists at most 10 notes.
 The grant carries the repository, branch and worktree. The orchestrator session keeps a working set of up to 16 bound
@@ -306,7 +310,9 @@ written fully qualified, or explicit search roots, reach the read set. A relativ
 refusal. A repository in the read set needs a real `.git` (`HEAD` plus `objects` or `commondir`, or a gitdir file whose
 target has `HEAD`); links are refused, a gitdir target is checked for network paths after realpath, and `HEAD` is read
 only from a regular file of at most 4 KiB. `repoExclude` applies to every ancestor, and `.git` internals are never read
-outside the work root. A read outside the work root but inside the read set is annotated:
+outside the work root: `read`, `glob` and `grep` still never open `.git` files there, while `router_git_*` read history
+through hardened git, now also in another repository of the read set with `root` (see below). A read outside the work
+root but inside the read set is annotated:
 
 ```text
 [router: read from lib-b (main) at D:\git\lib-b — read-only in this dispatch]
@@ -322,10 +328,49 @@ where the path lives and what to do:
   repo=<name>.`
 
 Any other path outside the read set keeps the earlier text (`read: <path> is outside this dispatch's work root <root>
-(use an absolute path inside it)`). The worktree re-checks and `router_git_*` check against the binding's repository.
+(use an absolute path inside it)`). The worktree re-checks and `router_git_*` check against the binding's repository;
+a `router_git_*` call with `root` checks against the repository it names.
 A host `ask` for `external_directory` inside the work root or the read set is lifted to `allow` for an exactly bound
 session when cross-repo is in use; a deny is never changed, and the session's own tool-output directory is never
 lifted.
+
+**`router_git_*` in other repositories.** A role agent reads the history of another repository of its read set by
+passing `root` to a `router_git_*` tool: the absolute top-level path of a repository in the read set, or its name below
+`routing.repoParents`. A name has the `repo=` semantics (a repository name, or the directory name of one of its linked
+worktrees), with no branch argument: a name that matches several repositories, or a repository with several worktrees,
+is refused and the paths to pass are listed. `root` is for role agents only, with an exact binding and `read`, `glob` or
+`grep` in the grant. The argument is registered only on OpenCode v2 in roles mode when `routing.repoParents` is
+non-empty at start; the tool map is fixed at start, so a restart is needed after adding parents. `root` equal to the
+work root behaves as no `root`. Otherwise the tool runs in the admitted worktree with the same hardened git, read-only
+(it never refreshes the index), and its output starts with the provenance line
+`[router: read from <name> (<branch>) at <worktree> — read-only in this dispatch]`. Refusals start with
+`[router_git] error: refused: ` and nothing runs; the reason names the value as `root=<value>`:
+
+- not a role session (a tier agent or the orchestrator): `root is only for role agents (roles mode); this session
+  inspects its own repository: omit root`; no exact binding: the I9 refusal of the tool; `router_git` without a local
+  read action: `root reads another repository and needs read, glob or grep in this dispatch's grant (<actions>);
+  router_git alone stays in the work root`; parents emptied by a reload after start: `root needs routing.repoParents
+  (cross-repo is not configured); nothing ran`.
+- the text, before any filesystem call: `has leading or trailing whitespace`, `is longer than 4096 characters`, an
+  invalid path or name, or `names a .git directory`, each followed by `; pass the absolute top level of a repository or
+  its name`.
+- inside the work root: `root=<value> is inside your work root <W>; omit root and pass path=<rel>`.
+- outside the read set, on the text alone (a junction from outside the parents is refused without being resolved):
+  `root=<value> is outside this dispatch's read set (the work root, the session's repositories and the repositories
+  below <parents>); nothing ran`; after `realpath`: `root=<value> resolves to <path>, outside this dispatch's read set;
+  nothing ran`, or `root=<value> is not a directory; nothing ran`.
+- below a repository's top level: `root=<value> is inside the repository at <top>; pass root=<top> and path=<rel>`.
+- admission (depth, `repoExclude`, working set) refuses: its reason, with `; nothing ran.` in place of `: no work
+  root.`; an absolute path in it outside the read set is shown as `<outside the read set>`. A worktree that admits
+  as another path: `root=<value>: the admitted worktree <worktree> resolves to <path>; nothing ran`.
+- a name: `root=<name> matches no repository below routing.repoParents (searched <parents>); nothing ran` (followed by
+  `. The search stopped after 2000 directories` when the lookup was capped); `root=<name> matches <n> repositories:
+  <paths>; nothing ran. Pass root as one of these absolute paths`; `root=<name> has <n> worktrees: <path> → <branch>;
+  …; nothing ran. Pass root as one of these absolute paths`.
+- the call's deadline or abort: `resolving the repository timed out; nothing ran`, `resolving the repository was
+  aborted; nothing ran`; an unexpected failure fails closed with `resolving the repository failed; nothing ran`.
+
+On OpenCode v1, in tiers mode or without parents at start the argument does not exist.
 
 **Verification perimeter.** The perimeter is planned for every routed role dispatch with a work root when
 `routing.repoParents` is set, even without `repo=`, and also when the grant has a cross-repo location or the session

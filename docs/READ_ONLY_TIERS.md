@@ -131,6 +131,13 @@ Examples: status `{}`, log `{ "limit": 10 }`, diff
 `git-info` dispatches should use these tools, not shell commands; edits including
 renames belong to `medium`.
 
+On OpenCode v2 in roles mode with `routing.repoParents` non-empty at start, each
+tool also takes `root`: another repository of the dispatch's read set, by
+absolute top-level path or name. `root` is a roles-mode feature: tier agents and
+the orchestrator are refused (`root is only for role agents (roles mode); this
+session inspects its own repository: omit root`). See
+[`router_git_*` in other repositories](./ROLES.md) in the roles guide.
+
 The repository root comes from `git rev-parse --show-toplevel` in the **session's
 directory**, not an arbitrary caller-supplied working directory. Paths are
 literal, repository-relative (maximum 4096 characters), with absolute paths,
