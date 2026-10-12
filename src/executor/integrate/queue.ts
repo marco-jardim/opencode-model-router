@@ -542,6 +542,8 @@ class Queue implements IntegrationQueue {
       // Outcome unknown (2.2 handoff): no further git or listener call; the next writer's resume() reconciles.
       this.disposed = true;
       this.ctl.abort();
+      // dispose() returns early once `disposed` is set, so the repo lock (and its heartbeat) would otherwise never be released.
+      await this.releaseLock();
       return;
     }
     if (code === "E_ILLEGAL_TRANSITION") {
@@ -664,10 +666,6 @@ class Queue implements IntegrationQueue {
     if (takeover === "dead-pid" || takeover === "stale") {
       this.counters.push(counterEvent("integration.lock.takeover", 1, { reason: takeover }));
     }
-  }
-
-  private lockLost(): boolean {
-    return this.lock !== null && this.lock.lost.aborted;
   }
 
   /** A StepJournal over a live entry, for the suite and revert runners (they never close). */
@@ -1619,6 +1617,12 @@ class Queue implements IntegrationQueue {
         const t = l.tasks[e.to];
         if (t === undefined || (t.state !== "ready" && t.state !== "dispatched" && t.state !== "running")) continue;
         if (released.some(r => r.id === t.id)) continue;
+        // `blocked` holds no open attempt (A1-7 `open-attempt`): the in-flight attempt ends before the transition, or the
+        // ledger rejects the whole row-34 batch.
+        const last = t.attempts[t.attempts.length - 1];
+        if (last !== undefined && last.outcome === null) {
+          out.push({ type: "attempt-ended", taskId: t.id, n: last.n, outcome: "interrupted", endedAt: this.d.clock.iso(), detail: "dep-reverted" });
+        }
         out.push(...this.tt(l, t.id, "blocked", "dep-reverted"));
         if (t.slot !== null) out.push({ type: "task-slot", taskId: t.id, slot: null, branch: t.branch });
         released.push({ id: t.id, slot: t.slot, live: t.state !== "ready" });
