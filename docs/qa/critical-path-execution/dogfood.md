@@ -313,3 +313,36 @@ Correction (QA-DF1-19/-27): the DF-1-1 follow-up above relied on host log lines,
 processes; in roles mode the router also ran `git worktree list --porcelain` at start in every booted location,
 `D:\git\opencode-model-router` included (read-only). The `51d3c51` claim "no start-up git outside `workRoots`" covered
 only the reference GC.
+
+### DF1.QA round 2 fixes and round 3 (bounded)
+
+| Commit (`cpx/pdf1-1`) | Content |
+|---|---|
+| `7180ac8` | QA-DF1-16..-28: held gates settle with the gate's verdict; resumed attempts never take an earlier element (message identity, `child-ended` re-read, resume marks the last scan); same-process evicted locations stay dormant; module copies share the pending journal (live same-pid marks, per-copy compaction file, merged snapshot providers, atomic beats, sweep); roles-mode registration skips `git worktree list` outside `workRoots`; documented glob semantics + realpath; bounded parent lookup (1 s); work-root rule wording; CHANGELOG corrected |
+| `fa59281` | QA-DF1-29 (major, introduced by the QA-DF1-16 fix): the stored pass/outcome of a held entry follow the posted tag (trivial skip no longer reads fail; `strictUnverifiable` pass with caveats re-posted FAIL after a restart) |
+| `51b78e9` | QA-DF1-30 (major, introduced by QA-DF1-29): `router_verify` keeps a skipped check `⚠ UNVERIFIED` |
+
+Producers: implementers `ses_eced73d3dffeXGvB5odvM2bL1z` (QA-DF1-16/-29/-30), `ses_eced6fd01ffeZ7veeWhEOz6lQD`
+(QA-DF1-17/-20/-21/-23/-24/-28; it also fixed three of its own tests whose fixtures were wrong — each new test fails with
+its fix disabled), `ses_eced69627ffe5v2N29WcmkRXdW` (QA-DF1-18/-19/-22/-25/-26). Round 3 reviewer
+`ses_eceae3276ffeogdycDuAaeSjcu` (bounded to the round-2 majors): QA-DF1-17/-18/-19 correct; QA-DF1-29 and, after its
+fix, QA-DF1-30 found and fixed; final verdict "cpx/pdf1-1 can be merged and tagged cpx/df1.1". The ENOENT compaction
+warning seen in tests is a test-hygiene race (plugins never disposed before the temp home is deleted), not a product
+defect.
+
+Deferred minors (round 3): undisposed plugin instances in the v2-background tests; per-copy compaction temp files left
+by a crash are never swept; recreates of two copies are not serialized (append-loss race, hold resurrection across
+copies, as QA-2.1-33); position fallback `at:<index>` for host messages without an id; a same-pid mark of a crashed
+earlier process blocks compaction up to `WRITER_MARK_STALE_MS`; QA-DF1-21 child aborted before any assistant message
+waits for the sweep. Earlier deferred: the `exec.test.ts` deadline flake under load (6.2 pre-flight).
+
+Verification at `51b78e9` (orchestrator shell): typecheck green; at `7180ac8` the 120 test files importing the changed
+hubs: 119 passed, 1 skipped (6397 tests); after `fa59281`/`51b78e9` the touched files (17 + 15 files, 369 + 327 tests)
+green. The router's own verdicts for the three fix handles (`vrf_e7dbd395…`, `vrf_8bd03f89…`, `vrf_ef89f090…`) were
+never produced: every `router_verify` returned "not judged" (gate timed out after 90 s, or the machine-wide verification
+slot busy for 60 s while the orchestrator ran tests and smokes). Recorded as observed behaviour of `cpx/df1`; no fault
+filed (the slot is shared by design), but the DF-1.1 re-probe drains them first.
+
+opencode-anthropic-fix PR #42 (DF-1-6): Codex review P1 (contract doc + `index.test.mjs` case) addressed in `56377cf`;
+P2 (string-content shorthand before a separate tail message left no breakpoint) addressed in the next commit (string
+normalized to one text block carrying the breakpoint). Suite 2100 passed / 2 skipped.
