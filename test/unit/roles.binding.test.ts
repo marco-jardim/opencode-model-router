@@ -59,6 +59,69 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe("bindPlanChild (3.1.5, A3 handoff)", () => {
+  const input = {
+    childSessionID: "ses_plan_child", role: "implementer", agent: "implementer", workRoot: ROOT,
+    grant: ["read", "edit", "router_run", "not-an-action"], planId: "plan-one", taskId: "T1", attempt: 2,
+  };
+
+  it("writes an exact record with role, agent, grant, work root and the plan identity, with no pending dispatch", () => {
+    binding.bindPlanChild(input);
+    expect(bindingRegistrySize()).toMatchObject({ pending: 0, bound: 1 });
+    const got = currentBinding("ses_plan_child", OPTS);
+    expect(got).toMatchObject({
+      childSessionID: "ses_plan_child", kind: "exact", role: "implementer", decisionID: null, budget: null, candidates: [],
+      plan: { planId: "plan-one", taskId: "T1", attempt: 2, taskRef: "plan-one:T1", scope: "until-integrated" },
+    });
+    expect([...got!.grant.actions]).toEqual(["read", "router_run", "edit"]); // an unknown name never grants
+    expect(got!.grant.workRoot).toBe(ROOT);
+  });
+
+  it("is still cut down by the role max of its agent", () => {
+    binding.bindPlanChild({ ...input, grant: ["read", "edit", "webfetch"] });
+    const got = currentBinding("ses_plan_child", { maxOf: () => ["read"] });
+    expect([...got!.grant.actions]).toEqual(["read"]);
+    expect(got!.plan?.taskId).toBe("T1");
+  });
+
+  it("answers the lazy lookup from the cache, without asking the host", async () => {
+    binding.bindPlanChild(input);
+    const lookup = vi.fn<SessionLookup>(async () => undefined);
+    const got = await bind("ses_plan_child", lookup, OPTS);
+    expect(lookup).not.toHaveBeenCalled();
+    expect(got.kind).toBe("exact");
+    expect(got.plan?.attempt).toBe(2);
+  });
+
+  it("throws (fails closed) when the child is already bound with another role or work root", () => {
+    binding.bindPlanChild(input);
+    expect(() => binding.bindPlanChild({ ...input, role: "reviewer" })).toThrow(/already bound/);
+    expect(() => binding.bindPlanChild({ ...input, workRoot: OTHER_ROOT })).toThrow(/already bound/);
+    expect(currentBinding("ses_plan_child", OPTS)).toMatchObject({ role: "implementer", grant: { workRoot: ROOT } });
+    expect(() => binding.bindPlanChild({ ...input, attempt: 3 })).not.toThrow(); // same role and root: the identity is replaced
+    expect(currentBinding("ses_plan_child", OPTS)?.plan?.attempt).toBe(3);
+  });
+
+  it("refuses a relative work root and a deleted session; evict drops the record", () => {
+    expect(() => binding.bindPlanChild({ ...input, workRoot: "relative/slot" })).toThrow(/absolute work root/);
+    binding.bindPlanChild(input);
+    evict("ses_plan_child");
+    expect(currentBinding("ses_plan_child", OPTS)).toBeUndefined();
+    expect(() => binding.bindPlanChild(input)).toThrow(/deleted/);
+  });
+
+  it("leaves lazily bound records without role or plan", async () => {
+    registerPending({
+      parentSessionID: PARENT, callID: "c1", agent: "implementer", description: "d", nonce: nz("c1"),
+      grant: grant(["read"]), budget: 5, decisionID: "d1", registeredAt: clock,
+    });
+    const got = await bind("ses_lazy", async () => ({ parentID: PARENT, agent: "implementer", firstText: `x\nOMR_NONCE=${nz("c1")}` }), OPTS);
+    expect(got.kind).toBe("exact");
+    expect(got).not.toHaveProperty("role");
+    expect(got).not.toHaveProperty("plan");
+  });
+});
+
 /** A valid nonce for a test call id. */
 function nz(id: string): string {
   return `nonce-${id}-0000000000`;
