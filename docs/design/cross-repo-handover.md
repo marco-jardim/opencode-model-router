@@ -27,7 +27,7 @@ Read this first in a new session. The design is `docs/design/cross-repo.md`, and
 | P2 lot 1: P2a–P2d + P2g (plan `docs/design/cross-repo-phase2-plan.md`) | Done. QA'd twice (round 1: 4 major + 9 minor fixed; round 2: 3 major fixed, minors recorded in design §9). Docs and CHANGELOG updated. Live dogfood done (see "Phase 2 live dogfood"); findings F-D1, F-D2 wait for the owner. |
 | P2 lot 2: P2e (deferred P), owner decision OD4 | Implemented (`3037ab8`..`722c5db`, docs after): a role dispatch with a perimeter or per-check keys defers; P frozen at return; S11 caveat (OD-P2e-1 = UNVERIFIED); F13 v2-only (OD-P2e-2). QA'd twice (round 1: 1 major + 5 minor fixed; round 2: 1 major fixed, minors in design §9). Live dogfood done (see "Progress after resuming"). |
 | P3 lot 1: item (b), `router_git_*` `root` (plan `docs/design/cross-repo-phase3-plan.md`) | Done (`3b6aec8`..`bc9930c`). QA'd twice (round 1: 1 major + 5 minor + nits fixed; round 2: 1 major (M1, read set vs repoExclude) fixed in `219e5c5`, minors in design §9). Docs and CHANGELOG updated. Live dogfood done (see "Phase 3 lot 1 live dogfood"). |
-| P3 lot 2: item (a), `vitest related` across a link | Spike done (YES, amended path spelling; plan "Spike result"). Not implemented. |
+| P3 lot 2: item (a), `vitest related` across a link | Done (`830d5db`..`702c858`). QA'd twice (round 1: 1 blocking + 1 critical + 4 major fixed, owner decisions D23 amended and D27; round 2: 2 major fixed, minors in design §9). Docs and CHANGELOG updated. Live dogfood done (see "Phase 3 lot 2 live dogfood"). |
 | P3 lot 3: item (c), edges outside `node_modules` | Not started. |
 | P4 | Not started |
 
@@ -45,6 +45,19 @@ Phase 2 is closed: code, docs, two QA rounds per lot, live dogfood, clean full-s
 **Next: Phase 3** (design §7 "Phase 3", `docs/design/cross-repo.md` ~:478): (a) the `vitest related` cross-link spike; (b) a read-only `root` argument for `router_git_*` that names an admitted repository; (c) discovery of dependency edges that do not go through `node_modules`, with no per-repository configuration. The design gives no file-level plan for it: start with a pre-flight (architect) that writes a plan like `docs/design/cross-repo-phase2-plan.md`, ask the owner the real decisions, then implement test-first, QA twice, dogfood live.
 
 **Working rules that bit this session:** delegates hit a read guard after 3 consecutive reads (tell them to alternate read and edit, and paste file:line ranges); "Agent not found" on parallel implementer dispatches usually means the child still runs — check `git status`/`git diff --stat` and resume the same session; every edit must leave `src/` loadable (the live router loads it); run `router_run` calls one at a time; a full suite run only with nothing else running; the gate's `testsPass` cannot scope this repo ("attribution-unavailable"), so verify every change in the shell (typecheck plus the touched test files).
+
+## Phase 3 lot 2 live dogfood (2026-10-12)
+
+Run live at HEAD `702c858`, no restart. Scratch consumer `D:\git\omr-xr-dogfood-app` (git, `"type":"module"`, two tests; `node_modules\vitest` a junction to this worktree's vitest plus `.bin` shims, `node_modules\omr-xr-dogfood-lib` a junction to the lib); untracked `math.mjs` and `unused.mjs` in the lib. All removed afterwards (junctions with `cmd /c rmdir`); the lib is clean.
+
+| # | Dispatch (`implementer repo=omr-xr-dogfood-lib`, `VERIFY:required`) | Result |
+|---|---|---|
+| 1 | Comment added to `math.mjs`; `fileExists` + `testsPass command="npx vitest run" cwd="<app>" scope=affected` | Pass. `✓ verified: deterministic`. |
+| 2 | `math.mjs` broken (`a - b`) | Pass. UNVERIFIED, never FAIL: `no reference … observed failures: test/uses-lib.test.js > adds through the link` (only the importing test ran). |
+| 3 | `unused.mjs` changed (no test imports it) | Pass. UNVERIFIED: `vitest selected no test in D:\git\omr-xr-dogfood-app for the change in D:\git\omr-xr-dogfood-lib; the link may not be followed (…): use scope=full`. |
+| 4 | Same, `testsPass` without `scope=` | Pass. The unchanged refusal: `check 2 (testsPass) runs in another repository (…) and must use scope=full: …`. |
+
+Setup note: the consumer needs `node_modules\.bin\vitest(.cmd)` shims for `npx vitest`; a junction to the vitest package alone is not enough.
 
 ## Phase 3 lot 1 live dogfood (2026-10-12)
 
