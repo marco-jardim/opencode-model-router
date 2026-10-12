@@ -1833,6 +1833,14 @@ describe("planScopedRun — cross-link inputs (cross-repo P3a)", () => {
     expect(s.mode).toBe("related");
   });
 
+  it("Y2: a crossLink spec carries crossLinkRoot as given; an in-repo-only spec carries neither", async () => {
+    const s = spec(await planScopedRun(xin(changed("/r/src/a.ts", "/w/src/math.ts"))));
+    expect(s).toMatchObject({ crossLink: true, crossLinkRoot: "/w" });
+    const local = spec(await planScopedRun(xin(changed("/r/src/a.ts"))));
+    expect("crossLink" in local).toBe(false);
+    expect("crossLinkRoot" in local).toBe(false);
+  });
+
   it("a path outside both roots is dropped", async () => {
     const s = spec(await planScopedRun(xin(changed("/w/src/math.ts", "/elsewhere/x.ts"))));
     expect(s.inputs).toEqual(MATH);
@@ -3224,6 +3232,34 @@ describe("QA-1.3-19: the zero-test guard covers every runner; lexical mode stays
     const sp = mkSpec({ runner: "pytest", reportPath: RPT_XML, inputs: ["/root/vitest-proj/tests/test_a.py"], inputsAreTests: true });
     expect(await read(sp, { [RPT_XML]: report("pytest-none.xml", "/root") }, 5)).toMatchObject({ complete: false, note: "pytest ran no tests although a test file was passed" });
     expect(await zero({ runner: "vitest", inputs: [], lexicalPaths: true })).toMatchObject({ total: 0, complete: true });
+  });
+
+  describe("Y2: a cross-link related run that selects no test is incomplete", () => {
+    const SOURCES = ["/root/vitest-proj/src/str.js", "/w/src/math.ts"];
+    const plain: Partial<ScopedSpec> = { runner: "vitest", mode: "related", inputs: SOURCES, inputsAreTests: false };
+    const cross: Partial<ScopedSpec> = { ...plain, crossLink: true, crossLinkRoot: "/w" };
+    const crossNote = (cwd: string) =>
+      `vitest selected no test in ${cwd} for the change in /w; the link may not be followed ` +
+      "(resolve.preserveSymlinks, a built entry, or no test imports the changed files): use scope=full";
+
+    it("total 0 and exit 0 -> complete false with the scope=full note", async () => {
+      const sp = mkSpec(cross);
+      expect(await read(sp, { [RPT_JSON]: jsonReport(0) }, 0)).toMatchObject({ total: 0, complete: false, note: crossNote(sp.cwd) });
+    });
+
+    it("total > 0 is unchanged", async () => {
+      const { fs: _a, ...withLink } = await read(mkSpec(cross), { [RPT_JSON]: jsonReport(2) }, 0);
+      const { fs: _b, ...without } = await read(mkSpec(plain), { [RPT_JSON]: jsonReport(2) }, 0);
+      expect(withLink).toEqual(without);
+      expect(withLink).toMatchObject({ total: 2, complete: true });
+      expect(withLink.note).toBeUndefined();
+    });
+
+    it("a related spec without crossLink and total 0 stays complete", async () => {
+      const r = await read(mkSpec(plain), { [RPT_JSON]: jsonReport(0) }, 0);
+      expect(r).toMatchObject({ total: 0, complete: true });
+      expect(r.note).toBeUndefined();
+    });
   });
 
   it("win32 lexical mode: ::$DATA spellings of a trigger or a rerun file are the file itself", async () => {

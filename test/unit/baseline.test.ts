@@ -582,6 +582,25 @@ it("validateConfig validates both baseline settings without requiring either", (
   for (const baselineTimeoutMs of [0, -1, 1.5, "100", Infinity]) expect(() => validateConfig({ ...cfg, enforcement: { verify: { baselineTimeoutMs } } })).toThrow("baselineTimeoutMs must be an integer");
 });
 
+describe("Y2: a cross-link related run that selected no test", () => {
+  const CROSS_NOTE =
+    "vitest selected no test in /app for the change in /w; the link may not be followed " +
+    "(resolve.preserveSymlinks, a built entry, or no test imports the changed files): use scope=full";
+  const zeroRun = (complete: boolean, note?: string): RunResult => result([], { total: 0, complete, ...(note === undefined ? {} : { note }) });
+
+  it("is unverifiable as an incomplete scoped result, never a pass", () => {
+    expect(judgeScoped(scopedRun(zeroRun(false, CROSS_NOTE)), undefined)).toEqual({
+      ok: false,
+      unverifiable: true,
+      reason: `testsPass: the scoped result is incomplete: ${CROSS_NOTE} (exit 0)`,
+    });
+  });
+
+  it("a related run without crossLink and total 0 still passes with no affected tests ran", () => {
+    expect(judgeScoped(scopedRun(zeroRun(true)), undefined)).toMatchObject({ ok: true, unverifiable: false, note: "testsPass: no affected tests ran" });
+  });
+});
+
 describe("judgeScoped verdict algebra (deterministic.ts T5-T7)", () => {
   const ID = "a.test.ts > t1";
   const OBS = `; observed failures: ${ID}`;

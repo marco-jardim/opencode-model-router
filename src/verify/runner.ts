@@ -774,6 +774,10 @@
 //     non-empty inputs, becomes complete = false when
 //       - mode is "rerun" (every input is an existing test file), note `rerun ran no tests
 //         although every input is a test file`;
+//       - the spec has crossLink (Y2: a link vitest does not follow selects 0 tests), note `vitest
+//         selected no test in <cwd> for the change in <crossLinkRoot>; the link may not be followed
+//         (resolve.preserveSymlinks, a built entry, or no test imports the changed files): use
+//         scope=full`;
 //       - the inputs are test files (inputsAreTests: pytest), or related was given a JS test file
 //         (G.8 rule; a test file passed to related runs itself), note `<runner> ran no tests
 //         although a test file was passed`;
@@ -1486,6 +1490,11 @@ export interface ScopedSpec {
    * consumer reaches through a link. Always a vitest `related` spec.
    */
   readonly crossLink?: true;
+  /**
+   * Cross-repo P3a (Y2): with crossLink, the cross-link root as given (StaticScopingInput.crossLinkRoot),
+   * for the zero-tests note.
+   */
+  readonly crossLinkRoot?: string;
 }
 
 /** An executable scoped eslint run (section K). Pass or fail comes from the exit code. */
@@ -4801,7 +4810,8 @@ async function classify(
   if (long) return long;
   const py = await pytestAtInputs(ctx, fs, det, F, det.runnerCwd, allNotes);
   if (py !== undefined && isS6(py)) return py;
-  return buildSpec(ctx, det, pre.entry, F, input.budget, input.cores, allNotes, "related", det.runnerCwd, gitRoot, !fs.realpath, py, crossInputs.size > 0);
+  const crossRoot = crossInputs.size > 0 ? cross?.spellings[0] : undefined;
+  return buildSpec(ctx, det, pre.entry, F, input.budget, input.cores, allNotes, "related", det.runnerCwd, gitRoot, !fs.realpath, py, crossRoot);
 }
 
 /**
@@ -4870,7 +4880,7 @@ function buildSpec(
   gitRoot: string,
   lexical: boolean,
   py: PytestEvidence | undefined,
-  crossLink = false,
+  crossLinkRoot?: string,
 ): ScopedSpec | Unverifiable {
   const C = inputCores ?? ctx.host.cores;
   const xdist = py ? py.xdist : det.xdist;
@@ -4915,7 +4925,7 @@ function buildSpec(
     workers,
     notes,
     ...(lexical ? { lexicalPaths: true as const } : {}),
-    ...(crossLink ? { crossLink: true as const } : {}),
+    ...(crossLinkRoot !== undefined ? { crossLink: true as const, crossLinkRoot } : {}),
   };
 }
 
@@ -5224,20 +5234,32 @@ function isJsTestPath(p: string): boolean {
 /**
  * I step 2a (QA-1.3-1, QA-1.3-19): a report that lists no test at all is not trusted when the
  * inputs say tests must have run, for every runner: a rerun, inputs that are test files (pytest,
- * or a JS test file given to related), and any spec planned without realpath (jest and vitest
- * both match nothing through a junction cwd).
+ * or a JS test file given to related), any spec planned without realpath (jest and vitest
+ * both match nothing through a junction cwd), and a cross-link spec (Y2: every way vitest fails to
+ * follow the link, such as resolve.preserveSymlinks or a built entry, selects 0 tests).
  */
 function zeroTestsGuard(spec: ScopedSpec, r: RunResult): RunResult {
   if (r.total !== 0 || !r.complete || r.failingIds.length > 0 || r.collectionError || spec.inputs.length === 0) return r;
   const note =
     spec.mode === "rerun"
       ? "rerun ran no tests although every input is a test file"
-      : spec.inputsAreTests || spec.inputs.some(isJsTestPath)
-        ? `${spec.runner} ran no tests although a test file was passed`
-        : spec.lexicalPaths === true
-          ? `${spec.runner} ran no tests and the paths were not canonicalized (no realpath seam)`
-          : undefined;
+      : spec.crossLink === true
+        ? crossLinkZeroNote(spec)
+        : spec.inputsAreTests || spec.inputs.some(isJsTestPath)
+          ? `${spec.runner} ran no tests although a test file was passed`
+          : spec.lexicalPaths === true
+            ? `${spec.runner} ran no tests and the paths were not canonicalized (no realpath seam)`
+            : undefined;
   return note === undefined ? r : { ...r, complete: false, note };
+}
+
+/** Y2: the zero-tests note of a cross-link related run; the fix is a full run. */
+function crossLinkZeroNote(spec: ScopedSpec): string {
+  const root = spec.crossLinkRoot ?? "the linked repository";
+  return (
+    `vitest selected no test in ${spec.cwd} for the change in ${root}; the link may not be followed ` +
+    "(resolve.preserveSymlinks, a built entry, or no test imports the changed files): use scope=full"
+  );
 }
 
 const XML_ENTITIES: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };
