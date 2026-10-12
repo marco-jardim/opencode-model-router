@@ -473,7 +473,18 @@ export interface DeferredPerimeter {
     readonly head: string;
     readonly fingerprint: string;
     readonly admit?: (root: string) => boolean;
+    /**
+     * Cross-repo P3 QA-1 M3: a dispatch-time dependency W no longer declared at return (the producer removed or retargeted
+     * it): not an input of the change, so router_verify skips it entirely (neither "no longer links" nor re-observed).
+     */
+    readonly removedAtReturn?: true;
   }[];
+  /**
+   * Cross-repo P3 QA-1 M4: the dependency targets the producer added during the dispatch that were not admitted (an unadmitted
+   * edge's text, a link outside every parent and worktree, no or a refused top level), as read at return. Covering only, never
+   * seeds (I13) nor observed (I11): router_verify does not name them new, as it does not the dispatch-time unadmitted ones.
+   */
+  readonly unadmittedAtReturn?: readonly string[];
   readonly pins: Promise<readonly LinkPin[]>;
   /**
    * The W directory `planPerimeter` read package links from at dispatch (<W>/node_modules): the bound worktree, else
@@ -852,6 +863,8 @@ function freezePerimeter(perimeter: DeferredPerimeter | undefined): DeferredPeri
     ...(perimeter.admission === undefined ? {} : { admission: freezeAdmission(perimeter.admission) }),
     workingSet: Object.freeze(perimeter.workingSet.map((w) => Object.freeze({ ...w }))),
     links: Object.freeze(perimeter.links.map((l) => Object.freeze({ ...l }))),
+    // P3 QA-1 M4: copied and frozen; absent stays absent.
+    ...(perimeter.unadmittedAtReturn === undefined ? {} : { unadmittedAtReturn: Object.freeze([...perimeter.unadmittedAtReturn]) }),
     pins: perimeter.pins.then(
       (pins) => pins,
       (): readonly LinkPin[] => [],
@@ -1131,7 +1144,7 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
     const placements = reg.placements !== undefined ? Object.freeze([...reg.placements]) : undefined;
     const pathWeight =
       (changedFiles === "unavailable" ? 0 : changedFiles.length) +
-      (perimeter !== undefined ? perimeter.workingSet.length + perimeter.links.length : 0) +
+      (perimeter !== undefined ? perimeter.workingSet.length + perimeter.links.length + (perimeter.unadmittedAtReturn?.length ?? 0) : 0) +
       (placements !== undefined ? placements.length : 0);
 
     // Plan the evictions first: a registration that cannot fit evicts nothing.

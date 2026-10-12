@@ -86,6 +86,7 @@ import {
   type ConsumerDiscovery,
   type DependencyTargets,
 } from "./perimeter";
+import { PERIMETER_MAX } from "./perimeter";
 import { defaultExternalLinks, pinTarget, type LinkPin } from "./pin";
 import { depthBelow, gitTopOf, perimeterKey } from "./git-top";
 import type { DispatchPerimeter, PerimeterEntry } from "./dispatch";
@@ -95,6 +96,7 @@ import { captureReference, DEFAULT_CAPTURE_TIMEOUT_MS, gcStaleReferences, nodeRe
 import type { PluginLogger } from "../router/logger";
 import { REFERENCE_NONE } from "./baseline";
 import { scrubText } from "../guard/scrub";
+import { displaySafe } from "../routing/roles/read-set";
 import type { DoD } from "./dod";
 import type { ArgvSeam, CheckPlacement, Deadline, ExecOptions, ExecResult as SeamResult, ExecSeam, ReferenceState, TestsPassHook, Verdict } from "./types";
 import { planScopedRun, planStaticScoping, type ChangedPath, type RunnerFs, type StaticScoping, type StaticScopingInput, type TestSearchSeam } from "./runner";
@@ -628,10 +630,26 @@ export const DRIFT_UNCHECKED_NOTICE = "drift since delegation could not be check
  */
 export const LINK_DRIFT_CAVEAT = {
   changed: (name: string, root: string): string =>
-    `the linked repository ${name} at ${root} changed since the producer returned; the checks ran against its new state`,
+    `the linked repository ${linkCaveatText(name)} at ${linkCaveatText(root)} changed since the producer returned; the checks ran against its new state`,
   unobserved: (name: string, root: string): string =>
-    `the linked repository ${name} at ${root} could not be observed again since the producer returned`,
+    `the linked repository ${linkCaveatText(name)} at ${linkCaveatText(root)} could not be observed again since the producer returned`,
 } as const;
+/** Cross-repo P3 QA-1 M5: the longest repository text (a link's name or root) a router line quotes; past it, cut with "…". */
+export const LINK_CAVEAT_TEXT_MAX = 256;
+/**
+ * Cross-repo P3 QA-1 M5: repository text (a link's name or root, read from a manifest or the file system) as a router line
+ * quotes it: capped at LINK_CAVEAT_TEXT_MAX characters (never splitting a surrogate pair), then escaped.
+ */
+function linkCaveatText(text: string): string {
+  let shown = text;
+  if (shown.length > LINK_CAVEAT_TEXT_MAX) {
+    let end = LINK_CAVEAT_TEXT_MAX - 1;
+    const last = shown.charCodeAt(end - 1);
+    if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+    shown = `${shown.slice(0, end)}…`;
+  }
+  return displaySafe(shown);
+}
 export const ROUTER_VERIFY_CANCELLED_REASON = "router_verify was cancelled before a verdict";
 export const ROUTER_VERIFY_RELEASED_REASON = "the delegation's verification data was released";
 /** Drifted paths named per handle; the rest are counted. */
@@ -1898,8 +1916,10 @@ export function createVerificationWiring(deps: {
    * directory and top level, as planPerimeter skips them), is snapshotted, hardened, within what remains of `deadline` (the
    * deferral bound), and frozen as a link. `unobserved`: one could not be observed in time, or its top level is no longer
    * admitted (X7: not deferred). An unadmitted target (no parent or worktree holds it, no git top level, a top the admission
-   * refuses, or an unadmitted edge) is not snapshotted: router_verify names it. Never a perimeter seed: P stays fixed at
-   * dispatch for writer attribution (I4, I13). Never throws.
+   * refuses, or an unadmitted edge) is not snapshotted: it is returned in `unadmitted` (P3 QA-1 M4), frozen as covering only so
+   * that router_verify does not name it new. Never a perimeter seed: P stays fixed at dispatch for writer attribution (I4, I13).
+   * `targets`: what W depends on at return, so that a dispatch-time dependency the producer removed is frozen as such (P3 QA-1
+   * M3). More new targets than `room` (P3 QA-1 m2: PERIMETER_MAX) are not snapshotted: `unobserved`. Never throws.
    */
   const dependenciesAddedAtReturn = async (
     linkBase: string,
@@ -1907,7 +1927,17 @@ export function createVerificationWiring(deps: {
     covering: readonly string[],
     own: readonly string[],
     deadline: Deadline,
-  ): Promise<{ links: FrozenPerimeter["links"]; unobserved: boolean }> => {
+    // P3 QA-1 m2: how many new targets P may still take (PERIMETER_MAX, W and the dispatch's observed roots counted); past it
+    // none is snapshotted and `unobserved` is set (fail closed: verified at once).
+    room = Number.POSITIVE_INFINITY,
+  ): Promise<{
+    links: FrozenPerimeter["links"];
+    unobserved: boolean;
+    /** P3 QA-1 M3: what W depends on at return (its targets' paths, unadmitted edges' text excluded). Absent: not read. */
+    targets?: readonly string[];
+    /** P3 QA-1 M4: the new targets not admitted, as router_verify names them (covering only, never seeds: I13). */
+    unadmitted?: readonly string[];
+  }> => {
     const read = ((): { context: ReturnType<typeof admissionFromData>; dependencies: DependencyTargets } | undefined => {
       try {
         const context = admissionFromData(admission);
@@ -1919,14 +1949,21 @@ export function createVerificationWiring(deps: {
     // Fail closed: W's dependencies at return are unknown, so a new one cannot be ruled out (not deferred).
     if (read === undefined) return { links: [], unobserved: true };
     const { context, dependencies } = read;
+    const targets = dependencies.targets.filter(target => !("fixed" in target)).map(target => target.at);
     // Held by a perimeter root, or W's own repository (inside W, or W inside it): W's snapshot covers it.
     const covered = (at: string): boolean =>
       covering.some(root => depthBelow(at, root) >= 0) || own.some(dir => depthBelow(at, dir) >= 0 || depthBelow(dir, at) >= 0);
     // The admitted top level of each new target, once per repository.
     const added = new Map<string, string>();
+    // P3 QA-1 M4: a new target not admitted, by the path router_verify reads it at (its text for an unadmitted edge).
+    const unadmitted = new Map<string, string>();
     for (const target of dependencies.targets) {
+      if (covered(target.at)) continue;
       // An unadmitted edge target is text only: never observed (I11).
-      if ("fixed" in target || covered(target.at)) continue;
+      if ("fixed" in target) {
+        unadmitted.set(perimeterKey(target.at), target.at);
+        continue;
+      }
       let top: string | undefined;
       if (target.origin === "edge") {
         top = target.at; // Already its admitted top level (resolveEdgeTarget).
@@ -1935,14 +1972,27 @@ export function createVerificationWiring(deps: {
         // above its working-set worktree), then admitted by the frozen admission.
         const parent = context.parentOf(target.at);
         const worktree = context.worktreeOf(target.at);
-        if (parent === undefined && worktree === undefined) continue;
+        if (parent === undefined && worktree === undefined) {
+          unadmitted.set(perimeterKey(target.at), target.at);
+          continue;
+        }
         top = gitTopOf(target.at, worktree !== undefined ? dirname(worktree.worktree) : parent);
-        if (top === undefined || !context.admitTop(top)) continue;
+        if (top === undefined || !context.admitTop(top)) {
+          unadmitted.set(perimeterKey(target.at), target.at);
+          continue;
+        }
       }
       if (covered(top) || added.has(perimeterKey(top))) continue;
       added.set(perimeterKey(top), top);
     }
-    if (added.size === 0) return { links: [], unobserved: false };
+    // M3: only a complete read rules a dependency out (an unread manifest could still declare it: none is frozen as removed).
+    const atReturn = {
+      ...(dependencies.incomplete ? {} : { targets }),
+      ...(unadmitted.size > 0 ? { unadmitted: [...unadmitted.values()] } : {}),
+    };
+    if (added.size === 0) return { links: [], unobserved: false, ...atReturn };
+    // P3 QA-1 m2: more new targets than P may take: none is snapshotted (not deferred, X7).
+    if (added.size > room) return { links: [], unobserved: true, ...atReturn };
     const lowPriority = configuredLowPriority();
     const observed = await Promise.all([...added.values()].map(async top => ({ top, now: await hardenedSnapshotFor(top, deadline, lowPriority) })));
     const links: FrozenPerimeter["links"][number][] = [];
@@ -1962,7 +2012,7 @@ export function createVerificationWiring(deps: {
         admit: context.admitTop,
       });
     }
-    return { links, unobserved };
+    return { links, unobserved, ...atReturn };
   };
 
   /**
@@ -1993,6 +2043,8 @@ export function createVerificationWiring(deps: {
     linkUnobserved: boolean;
     /** P3c.4 (SD-P3c-9): the dispatch's admission (planPerimeter), frozen with the perimeter. Absent: none recorded. */
     admission?: DispatchPerimeter["admission"];
+    /** P3 QA-1 M4: the unadmitted dependency targets the producer added during the dispatch (covering only). Absent: none. */
+    unadmitted?: readonly string[];
   } | undefined> => {
     const observation = await perimeterAtGate(planned, snapshot, base, undefined, { discover: false });
     if (planned === undefined || observation === undefined) return undefined;
@@ -2000,6 +2052,7 @@ export function createVerificationWiring(deps: {
     const workingSet = new Map<string, FrozenPerimeter["workingSet"][number]>();
     const links = new Map<string, FrozenPerimeter["links"][number]>();
     let linkUnobserved = false;
+    let unadmitted: readonly string[] = [];
     for (const { entry, before, now } of planned.snapshots) {
       const seed = entry.seed;
       const fixed = seed.fixed;
@@ -2042,6 +2095,7 @@ export function createVerificationWiring(deps: {
     // P3c.6 (D26): a dependency target the producer added during the dispatch, frozen with the links so that router_verify (S11)
     // compares it with its state at return; never a seed (I13: P stays the dispatch's for writer attribution, I4). Not read when
     // the dispatch is verified at once anyway, without a frozen admission (an entry planned before P3c.4), or without a bound.
+    // The same read freezes which dispatch-time dependencies W no longer declares (M3) and the unadmitted new targets (M4).
     if (!linkUnobserved && planned.admission !== undefined && deadline !== undefined) {
       // What covers a target at router_verify: the roots frozen here (the perimeter's, fixed ones where they were planned).
       const covering = [
@@ -2049,12 +2103,24 @@ export function createVerificationWiring(deps: {
         ...planned.snapshots.map(({ entry }) => entry.seed.at),
         ...[...links.values()].map(link => link.root),
       ];
-      const added = await dependenciesAddedAtReturn(base, planned.admission, covering, [base, observation.w.root], deadline);
+      // P3 QA-1 m2: P holds at most PERIMETER_MAX snapshotted roots, W and the dispatch's observed roots included.
+      const observedSeeds = planned.snapshots.filter(({ entry }) => entry.seed.fixed === undefined).length;
+      const room = Math.max(0, PERIMETER_MAX - 1 - observedSeeds);
+      const added = await dependenciesAddedAtReturn(base, planned.admission, covering, [base, observation.w.root], deadline, room);
       if (added.unobserved) linkUnobserved = true;
+      // P3 QA-1 M3: a dispatch-time dependency W no longer declares at return (the producer removed or retargeted it) is not an
+      // input of the change: frozen as removed, router_verify skips it (no "no longer links", no re-observation).
+      const atReturn = added.targets;
+      if (atReturn !== undefined) {
+        for (const [key, link] of links) {
+          if (!atReturn.some(target => depthBelow(target, link.root) >= 0)) links.set(key, { ...link, removedAtReturn: true });
+        }
+      }
       for (const link of added.links) {
         const key = perimeterKey(link.root);
         if (key !== wKey && !links.has(key)) links.set(key, link);
       }
+      if (added.unadmitted !== undefined) unadmitted = added.unadmitted;
     }
     return {
       observation,
@@ -2062,6 +2128,7 @@ export function createVerificationWiring(deps: {
       links: [...links.values()],
       linkUnobserved,
       ...(planned.admission !== undefined ? { admission: planned.admission } : {}),
+      ...(unadmitted.length > 0 ? { unadmitted } : {}),
     };
   };
 
@@ -2478,6 +2545,7 @@ export function createVerificationWiring(deps: {
               // P3c.4 (SD-P3c-9): the admission the dispatch's planPerimeter read W's links and edges with; router_verify reads
               // W's dependency targets again through it (the registry freezes a copy).
               ...(frozen.admission !== undefined ? { admission: frozen.admission } : {}),
+              ...(frozen.unadmitted !== undefined ? { unadmittedAtReturn: frozen.unadmitted } : {}),
             },
           }
           : {}),
@@ -2835,6 +2903,11 @@ export function createVerificationWiring(deps: {
       // declared edges' top levels (P3c.4, SD-P3c-1: `dependencyTargets`, fs only, no git run).
       const observeLink = async (link: FrozenLink, real: string | undefined, targets: readonly string[]): Promise<Drift | undefined> => {
         const name = link.name ?? basename(link.root);
+        // P3 QA-1 M3: a dependency the producer removed (or retargeted) during the dispatch is not an input of the change: skipped
+        // entirely while W still does not depend on it; W depending on it again since the return is a new dependency: "changed".
+        if (link.removedAtReturn === true) {
+          return targets.some(target => depthBelow(target, link.root) >= 0) ? { name, root: link.root, why: "changed" } : undefined;
+        }
         // P2e QA-1 #4 (I12): no git where the link no longer resolves inside its frozen root, or where its admission refuses.
         if (real === undefined || depthBelow(real, link.root) < 0 || link.admit?.(link.root) === false) {
           return { name, root: link.root, why: "unobserved" };
@@ -2887,10 +2960,14 @@ export function createVerificationWiring(deps: {
         // roots, frozen at return, and its observed roots) is new: "changed". W's own repository is W's snapshot, as at
         // dispatch (planPerimeter); W's dependencies are read from `wRoot` (the dispatch's W), never from the snapshot root
         // (which is the git top level).
+        // P3 QA-1 M3: a link removed at return covers nothing (observeLink names it when W depends on it again).
+        // P3 QA-1 M4: an unadmitted target the producer added during the dispatch covers itself, as a dispatch-time one does
+        // through its unadmitted root.
         const covering = [
-          ...frozen.links.map(link => link.root),
-          ...reals.filter((real): real is string => real !== undefined),
+          ...frozen.links.filter(link => link.removedAtReturn !== true).map(link => link.root),
+          ...reals.filter((real, index): real is string => real !== undefined && frozen.links[index]?.removedAtReturn !== true),
           ...frozen.observation.roots.map(root => root.root),
+          ...(frozen.unadmittedAtReturn ?? []),
         ];
         // A new link target is named by its top level, found without git: below its parent (or above its working-set worktree)
         // as at dispatch (SD-P3c-9, F8). Outside every parent and worktree, it is named by its text: nothing runs there (I11).

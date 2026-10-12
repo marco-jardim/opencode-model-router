@@ -32,6 +32,24 @@ import { perimeterKey } from "./git-top";
 import { crossLinkAliases } from "./perimeter";
 import { displaySafe } from "../routing/roles/read-set";
 
+/** Cross-repo P3 QA-1 M5: the longest repository text (a name or a root) the verified-scope line quotes; past it, cut with "…". */
+export const SCOPE_TEXT_MAX = 256;
+
+/**
+ * Cross-repo P3 QA-1 M5: repository text (a perimeter root's name or path, read from a manifest or the file system) as the
+ * verified-scope line quotes it: capped at SCOPE_TEXT_MAX characters (never splitting a surrogate pair), then escaped.
+ */
+function scopeText(text: string): string {
+  let shown = text;
+  if (shown.length > SCOPE_TEXT_MAX) {
+    let end = SCOPE_TEXT_MAX - 1;
+    const last = shown.charCodeAt(end - 1);
+    if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+    shown = `${shown.slice(0, end)}…`;
+  }
+  return displaySafe(shown);
+}
+
 /** How many outside paths the mixed-change-set reason names before "and N more". */
 const MAX_OUTSIDE_LISTED = 5;
 
@@ -597,12 +615,13 @@ export function perimeterChangeReasons(artefact: Pick<Artefact, "perimeter" | "u
  * that changed without an unattributable writer is shown as changed.
  */
 export function verifiedScopeLine(perimeter: PerimeterObservation): string {
+  // P3 QA-1 M5: a name, a branch and a head come from the repositories (a manifest, a file system): escaped and capped.
   const show = (repo: PerimeterRepo, suffix = ""): string =>
-    `${repo.name} (${repo.branch ?? "detached"} @ ${repo.head !== undefined && repo.head !== "" ? repo.head.slice(0, 7) : "unknown"}${suffix})`;
+    `${scopeText(repo.name)} (${scopeText(repo.branch ?? "detached")} @ ${repo.head !== undefined && repo.head !== "" ? scopeText(repo.head.slice(0, 7)) : "unknown"}${suffix})`;
   const others = perimeter.roots.map(root => {
     if (root.name === PERIMETER_UNPLANNED) return PERIMETER_UNPLANNED;
-    if (root.status === "unadmitted") return `${root.name} (not admitted)`;
-    if (root.status === "unobserved") return `${root.name} (not observed)`;
+    if (root.status === "unadmitted") return `${scopeText(root.name)} (not admitted)`;
+    if (root.status === "unobserved") return `${scopeText(root.name)} (not observed)`;
     return root.status === "changed" ? show(root, ", changed during the dispatch") : show(root);
   });
   return `verified scope: ${show(perimeter.w)}; also observed: ${others.join(", ")}`;

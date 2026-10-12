@@ -1296,6 +1296,86 @@ describe("deferred P (P2e)", () => {
       expect(verified).not.toMatch(ANY_I4);
       expect(verified).not.toMatch(NEW_LIB_B);
     }, 90_000);
+
+    const LIB_C_CAVEAT = /the linked repository lib-c /;
+    const linkOf = (handle: string, root: string) => entryOf(handle).perimeter?.links.find(link => seam.key(link.root) === seam.key(root));
+
+    it("P3 QA-1 M3: the producer drops the `file:` dependency on lib-b during the dispatch, lib-b unchanged → pass, no S11", async () => {
+      const hooks = await withLibC();
+      await declareLibB(); // lib-b is a declared edge of W at dispatch.
+      const handle = handleIn(await runTask(hooks, `Implement it.\n${DOD_FULL}`, async () => {
+        fs.writeFileSync(path.join(repo, "package.json"), `{ "name": "app-a", "private": true, "description": "no lib-b", "scripts": { "test": "node --version" } }\n`);
+        await pin(repo);
+      }));
+      expect(linkOf(handle, lib)?.removedAtReturn).toBe(true);
+      expect(linkOf(handle, libC)?.removedAtReturn).toBeUndefined();
+      const out = await verify(hooks, handle);
+      expect(out).not.toMatch(NEW_LIB_B);
+      expect(outcomeOf(out, handle), out).toBe("pass");
+    }, 90_000);
+
+    it("P3 QA-1 M3: the producer removes W's node_modules link to lib-c during the dispatch, lib-c unchanged → pass, no S11", async () => {
+      const hooks = await withLibC();
+      const handle = handleIn(await runTask(hooks, `Implement it.\n${DOD_FULL}`, async () => {
+        fs.rmSync(path.join(repo, "node_modules", "lib-c"), { recursive: false, force: true });
+      }));
+      expect(linkOf(handle, libC)?.removedAtReturn).toBe(true);
+      const out = await verify(hooks, handle);
+      expect(out).not.toMatch(LIB_C_CAVEAT);
+      expect(outcomeOf(out, handle), out).toBe("pass");
+    }, 90_000);
+
+    it("P3 QA-1 M3: the producer retargets the junction from lib-c to lib-b → the old target skipped, the new one frozen (P3c.6)", async () => {
+      const hooks = await withLibC();
+      const handle = handleIn(await runTask(hooks, `Implement it.\n${DOD_FULL}`, async () => {
+        const at = path.join(repo, "node_modules", "lib-c");
+        fs.rmSync(at, { recursive: false, force: true });
+        fs.symlinkSync(lib, at, "junction");
+      }));
+      expect(linkOf(handle, libC)?.removedAtReturn).toBe(true);
+      expect(linkOf(handle, lib)).toBeDefined();
+      expect(linkOf(handle, lib)?.removedAtReturn).toBeUndefined();
+      const out = await verify(hooks, handle);
+      expect(out).not.toMatch(LIB_C_CAVEAT);
+      expect(out).not.toMatch(NEW_LIB_B);
+      expect(outcomeOf(out, handle), out).toBe("pass");
+    }, 90_000);
+
+    it("P3 QA-1 M4: the producer adds `extends: \"../tsconfig.base.json\"` (a plain file in the parent) → frozen covering only, pass", async () => {
+      const hooks = await withLibC();
+      const handle = handleIn(await runTask(hooks, `Implement it.\n${DOD_FULL}`, async () => {
+        fs.writeFileSync(path.join(parent, "tsconfig.base.json"), "{}\n");
+        fs.writeFileSync(path.join(repo, "tsconfig.json"), `{ "extends": "../tsconfig.base.json" }\n`);
+        await pin(repo);
+      }));
+      const frozen = entryOf(handle).perimeter;
+      expect(frozen?.unadmittedAtReturn?.length).toBe(1);
+      // Covering only: never a seed (I13), never a frozen link.
+      expect(frozen?.observation.roots.map(root => root.name)).toEqual(["lib-c"]);
+      expect(frozen?.links.map(link => path.basename(link.root))).toEqual(["lib-c"]);
+      const out = await verify(hooks, handle);
+      expect(out).not.toMatch(/the linked repository tsconfig\.base\.json /);
+      expect(outcomeOf(out, handle), out).toBe("pass");
+    }, 90_000);
+
+    it("P3 QA-1 m2: more new dependencies than PERIMETER_MAX leaves room for → none snapshotted, no handle (verified at once)", async () => {
+      const hooks = await withLibC();
+      // P holds W and lib-c: PERIMETER_MAX - 1 new repositories are one past the room.
+      const names = Array.from({ length: perimeterModule.PERIMETER_MAX - 1 }, (_, i) => `lib-n${i}`);
+      for (const name of names) fs.mkdirSync(path.join(parent, name, ".git"), { recursive: true });
+      const out = await runTask(hooks, `Implement it.\n${DOD_FULL}`, async () => {
+        const dependencies = Object.fromEntries(names.map(name => [name, `file:../${name}`]));
+        fs.writeFileSync(
+          path.join(repo, "package.json"),
+          `${JSON.stringify({ name: "app-a", private: true, scripts: { test: "node --version" }, dependencies })}\n`,
+        );
+        await pin(repo);
+      });
+      expect(HANDLE.exec(out)?.[0], out).toBeUndefined();
+      expect(artefacts()).toHaveLength(1);
+      // Past the cap none of them is snapshotted (at return or later).
+      expect(seam.calls.filter(key => names.some(name => key.endsWith(`/${name}`)))).toEqual([]);
+    }, 90_000);
   });
 });
 
