@@ -97,7 +97,7 @@ describe("finish attach channel", () => {
     expect(handle).toMatch(/^vrf_[0-9a-f]{24}$/);
   });
 
-  it("v1 is inert: one notice per configured v2-only key per process, no finish channel, no journal file", async () => {
+  it("v1 is inert: one notice per process naming every configured v2-only key (QA-2.1-12), no finish channel, no journal file", async () => {
     vi.resetModules();
     const config = await import("../../src/router/config");
     const fresh = await import("../../src/index");
@@ -117,10 +117,11 @@ describe("finish attach channel", () => {
       const first = await boot();
       const notices = () => warn.mock.calls.map((c) => c.join(" ")).filter((line) => line.includes("requires OpenCode v2; ignored"));
       const afterFirst = notices();
-      expect(afterFirst.length).toBeGreaterThanOrEqual(2);
-      expect(new Set(afterFirst).size).toBe(afterFirst.length); // one per key
-      expect(afterFirst.some((line) => line.includes("background"))).toBe(true);
-      expect(afterFirst.some((line) => line.includes("leases"))).toBe(true);
+      // AGENTS.md: a v2-only feature logs at most one notice per process on v1, whatever the number of keys.
+      expect(afterFirst).toHaveLength(1);
+      for (const key of ["routing.background.mode", "routing.background.minPredictedMs", "routing.leases.mode", "routing.leases.run"]) {
+        expect(afterFirst[0]).toContain(key);
+      }
       expect(Reflect.get(first, ROUTER_FINISH_ATTACH)).toBeUndefined();
       await boot(); // a second plugin instance of the same process says nothing more
       expect(notices()).toEqual(afterFirst);

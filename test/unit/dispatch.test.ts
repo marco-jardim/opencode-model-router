@@ -464,4 +464,23 @@ describe("QA-3.1-3: the tool that discarded a dispatch's snapshot or capture", (
     clean.record("child2", "edit", { filePath: "/p/b.ts" });
     expect(clean.captureDelta("e", "child2").files).toEqual([{ path: "/p/b.ts", status: "modified" }]);
   });
+
+  it("QA-2.1-7: captureDelta finds the dispatch record by its dispatch id (`task:<parent>:<callID>`), not by the bare call id", async () => {
+    const store = createChangedFileStore();
+    const dispatchID = "task:ses_parent:call-7";
+    const begun = store.beginDispatch(dispatchID, resolve("qa-2-1-7"), {
+      snapshot: () => new Promise<TreeSnapshot>(ok => { setTimeout(() => ok({ cwd: "x", root: "x", head: "h", fingerprint: "f", dirty: false, files: [] }), 0); }),
+      timeoutMs: 1_000,
+    });
+    store.observeEdit("github_create_file");
+    store.record("child", "edit", { filePath: "/p/a.ts" });
+    await begun;
+    // Keyed by the bare call id, the contaminated record is missed and the narrow observed list is returned as if clean.
+    expect(store.captureDelta("call-7", "child").files).toEqual([{ path: "/p/a.ts", status: "modified" }]);
+    // Keyed by the dispatch id, the contamination is seen; the delta still names the call.
+    const delta = store.captureDelta("call-7", "child", dispatchID);
+    expect(delta.callID).toBe("call-7");
+    expect(delta.files).toBe("unavailable");
+    expect(delta.contaminatedBy).toBe("github_create_file");
+  });
 });

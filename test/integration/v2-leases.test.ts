@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { acquireLeaseRegistry, createLeaseGuard } from "../../src/compat/background";
+import { acquireLeaseRegistry, createLeaseGuard, LEASE_LOOKUP_NEGATIVE_TTL_MS } from "../../src/compat/background";
 import { createLeaseRegistry } from "../../src/router/leases";
 import { bootBgHost, restoreEnv, type BgHost, type ToolEvent } from "../helpers/v2-bg-host";
 
@@ -338,6 +338,59 @@ describe("leases: a host lookup that never answers (memo 14.1)", () => {
     const pending = guard.before({ sessionID: "ses_hang2", tool: "edit", args: { filePath: "a.txt" }, callID: "call-2" });
     await vi.advanceTimersByTimeAsync(5_100);
     await expect(pending).resolves.toEqual({});
+  });
+
+  it("QA-2.1-11: one host lookup per session; a failed directory lookup is not repeated within the negative TTL", async () => {
+    const dir = join(tmpdir(), "omr-lease-cache");
+    const registry = createLeaseRegistry({ realpath: (path) => path, repoKeyOf: () => undefined, now: () => 1 }, { runMode: "annotate" });
+    let clock = 1_000;
+    let kindCalls = 0;
+    let dirCalls = 0;
+    let failDir = true;
+    const guard = createLeaseGuard({
+      registry,
+      sessionKind: async () => {
+        kindCalls += 1;
+        return "child";
+      },
+      sessionDir: async () => {
+        dirCalls += 1;
+        if (failDir) throw new Error("host busy");
+        return dir;
+      },
+      gitRootOf: () => undefined, holderLabel: (id) => `session ${id}`, planTaskOf: () => undefined,
+      events: { onRelease: () => () => undefined }, now: () => clock,
+    });
+    const call = (n: number) => guard.before({ sessionID: "ses_cache", tool: "edit", args: { filePath: join(dir, "a.txt") }, callID: `call-${n}` });
+    await expect(call(1)).resolves.toEqual({});
+    await expect(call(2)).resolves.toEqual({});
+    expect(dirCalls).toBe(1);
+    clock += LEASE_LOOKUP_NEGATIVE_TTL_MS;
+    failDir = false;
+    await call(3);
+    expect(dirCalls).toBe(2);
+    await call(4);
+    await call(5);
+    expect(dirCalls).toBe(2);
+    expect(kindCalls).toBe(2);
+  });
+
+  it("QA-2.1-11: a kind lookup that answers unknown keeps root semantics but gets the child's wording", async () => {
+    const tree = join(tmpdir(), "omr-lease-wording");
+    const target = join(tree, "a.ts");
+    const guardOf = (kind: "root" | "unknown") => {
+      const registry = createLeaseRegistry({ realpath: (path) => path, repoKeyOf: () => undefined, now: () => 1 }, { runMode: "annotate" });
+      registry.acquireWrite({ holderID: "holder", tree, isChild: true, scope: "until-complete" }, target);
+      return createLeaseGuard({
+        registry, sessionKind: async () => kind, sessionDir: async () => tree, gitRootOf: () => undefined,
+        holderLabel: (id) => `session ${id}`, planTaskOf: () => undefined, events: { onRelease: () => () => undefined },
+      });
+    };
+    const root = await guardOf("root").before({ sessionID: "ses_kind", tool: "edit", args: { filePath: target }, callID: "call-r" });
+    expect(root.refuse).toContain("Wait for that session to end.");
+    const unknown = await guardOf("unknown").before({ sessionID: "ses_kind", tool: "edit", args: { filePath: target }, callID: "call-u" });
+    expect(unknown.refuse).toContain("Finish without that file");
+    expect(unknown.refuse).not.toContain("Wait for that session to end.");
   });
 });
 

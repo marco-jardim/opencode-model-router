@@ -2,19 +2,23 @@
  * test/integration/v2-background.test.ts
  *
  * Phase 2.1 (task 2.1.8): background-first dispatch through the real plugin behind the real v2 adapter, driven by the fake host
- * of test/helpers/v2-bg-host.ts (no sleeps: events are queued and drained by microtask turns).
+ * of test/helpers/v2-bg-host.ts (no sleeps: events are queued and drained by microtask turns; what an adoption or a gate
+ * starts in the background is awaited with `settled()`, never polled).
  *
  * Held-result scenarios (placeholder stability, refusal of a resume, compaction) start from a hold record in `pending.jsonl`
  * written by a previous process: the reload / adoption path (memo 11.3, R20) is the one a restart takes, and it exercises the
  * same matcher the live path uses.
  *
- * The defects found by 2.1.8 are fixed and pinned by plain tests named "Dn: ...": D2 early end processed at the ack, D3 held
- * verdict posted (the pending journal survives a removed directory), D4 resume by `task_id` of a held child refused, D5 a lost
+ * The defects found by 2.1.8 are fixed and pinned by plain tests named "Dn: ...": D2 early end processed at the ack, D3 a failed
+ * held child's UNVERIFIABLE verdict posted (a journal that vanishes now fails closed instead, QA-2.1-8), D4 resume by `task_id` of a held child refused, D5 a lost
  * child (empty history) annotated. Verdict posting through the real adapter to a busy and to an idle parent (PASS, FAIL: one
  * `synthetic` with `resume: true`) is tested in "held verdicts posted to the parent" below. Timing rows of the static engine feeding
  * the background decision ("static engine: timing rows…") and the route hint never carrying held output are tested here too.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { PENDING_RELOAD_RETRY_MS } from "../../src/compat/v2-hooks";
 import { bootBgHost, restoreEnv, type BgHost, type ToolEvent } from "../helpers/v2-bg-host";
 
 let host: BgHost | undefined;
@@ -396,6 +400,51 @@ describe("held results across a restart (R20): placeholder, refusal, compaction"
     expect(messages[0]?.content[0]?.text).toBe("earlier");
   });
 
+  // QA-2.1-6 (R20): a restored hold owes a verdict. With no child text and no open dispatch record nothing can be verified: it
+  // ends UNVERIFIABLE at adoption, posted once with resume: true, and its placeholder stays (the raw completion stays hidden).
+  it("QA-2.1-6: a restored hold without child text ends UNVERIFIABLE once at adoption; the placeholder stays", async () => {
+    const h = await boot("auto", { journalText: holdJournal(HANDLE, CHILD, "call-restored") });
+    await request(h, [user("hello")]); // the first request of the parent adopts its records
+    // Adoption settles the restored hold in the background (history read, journal appends, post): awaited, not polled.
+    await h.settled();
+    const verdicts = () => h.synthetic.filter((s) => s.text.startsWith(`<router-verdict handle="${HANDLE}"`));
+    expect(verdicts()).toHaveLength(1);
+    expect(verdicts()[0]?.text).toContain('verdict="UNVERIFIABLE"');
+    expect(verdicts()[0]?.resume).toBe(true);
+    const event = await request(h, [user("again"), { id: "m-completion", role: "user", content: [{ type: "text", text: original }] }]);
+    expect(allText(event)).not.toContain("SECRET");
+    // The hold is settled, so nothing lists it as held: with nothing else to say the turn state is empty (no tail at all), and
+    // whatever the request carries, tail included, never names it.
+    expect(allText(event)).not.toContain("Held for verification");
+    await h.settled();
+    expect(verdicts()).toHaveLength(1);
+  });
+
+  // QA-2.1-2 (R21): a `posting` without `posted` is posted again with its journaled text, unless the parent already shows it.
+  it("QA-2.1-2: a journaled posting without posted is re-posted with its journaled text, once", async () => {
+    const text = `<router-verdict handle="${HANDLE}" sessionID="${CHILD}" verdict="PASS">\njournaled verdict\n</router-verdict>`;
+    const journal = `${holdJournal(HANDLE, CHILD, "call-repost")}${JSON.stringify({ v: 1, kind: "posting", handle: HANDLE, text, at: 2 })}\n`;
+    const h = await boot("auto", { journalText: journal });
+    await request(h, [user("hello")]);
+    await h.settled();
+    expect(h.synthetic.filter((s) => s.text === text)).toHaveLength(1);
+    await request(h, [user("again")]);
+    await h.settled();
+    expect(h.synthetic.filter((s) => s.text.includes(HANDLE))).toHaveLength(1);
+    expect(readFileSync(h.journalPath, "utf8")).toContain(`"kind":"posted","handle":"${HANDLE}"`);
+  });
+
+  it("QA-2.1-2: a posting the parent's history already carries (metadata.router.handle) is recorded as posted, not posted again", async () => {
+    const text = `<router-verdict handle="${HANDLE}" sessionID="${CHILD}" verdict="FAIL">\nfindings\n</router-verdict>`;
+    const journal = `${holdJournal(HANDLE, CHILD, "call-seen")}${JSON.stringify({ v: 1, kind: "posting", handle: HANDLE, text, at: 2 })}\n`;
+    const h = await boot("auto", { journalText: journal });
+    h.childContext.set(ORCH, [{ type: "synthetic", text, metadata: { router: { kind: "held-verdict", handle: HANDLE, child: CHILD } } }]);
+    await request(h, [user("hello")]);
+    await h.settled();
+    expect(readFileSync(h.journalPath, "utf8")).toContain(`"kind":"posted","handle":"${HANDLE}"`);
+    expect(h.synthetic.filter((s) => s.text.includes(HANDLE))).toEqual([]);
+  });
+
   it("without the compaction hook holding is unavailable: a verified explicit background call stays in the foreground", async () => {
     const h = await boot("auto", { omitCompaction: true });
     const call = await h.before(dispatch({ background: true }));
@@ -492,6 +541,108 @@ describe("a restart between the ack and the end (R18)", () => {
     // The recovery reads the child's history and journals before it annotates (file I/O): a later request carries the line.
     await vi.waitFor(async () => {
       expect(allText(await request(h, [user("hello")]))).toContain("the dispatch was lost in a restart");
+    });
+  });
+
+  // QA-2.1-6: a lost dispatch without a hold wakes its parent with exactly one `resume: true` entry, whichever hook or event saw
+  // the parent first, and however often the parent is seen afterwards.
+  it("a lost non-held child wakes its parent once with resume: true (QA-2.1-6)", async () => {
+    const journal = `${JSON.stringify({ v: 1, kind: "inflight", key: `${CHILD}\u0000call-wake`, callID: "call-wake", parentSessionID: ORCH, childSessionID: CHILD, label: "fast \"x\"", agent: "fast", description: "x", verifying: false, verificationMode: "none", hold: null, at: Date.now() })}\n`;
+    const h = await boot("auto", { journalText: journal });
+    await request(h, [user("hello")]);
+    await h.drain();
+    const lostWakes = () => h.synthetic.filter((s) => s.resume === true && s.sessionID === ORCH && s.text.includes("was lost in a restart"));
+    await vi.waitFor(() => {
+      expect(lostWakes()).toHaveLength(1);
+    });
+    await request(h, [user("hello again")]);
+    h.emit(created("child-unrelated", ORCH));
+    await h.drain();
+    expect(lostWakes()).toHaveLength(1);
+    expect(lostWakes()[0]?.metadata).toMatchObject({ router: { kind: "lost-dispatch", child: CHILD, callID: "call-wake" } });
+  });
+
+  // QA-2.1-6: a child that ended with an error while the process was down is recovered as failed, not as a success.
+  it("a recovered child whose last message is an error is processed as failed, with no lost wake (QA-2.1-6)", async () => {
+    const journal = `${JSON.stringify({ v: 1, kind: "inflight", key: `${CHILD}\u0000call-err`, callID: "call-err", parentSessionID: ORCH, childSessionID: CHILD, label: "fast \"x\"", agent: "fast", description: "x", verifying: false, verificationMode: "none", hold: null, at: Date.now() })}\n`;
+    const h = await boot("auto", { journalText: journal });
+    h.childContext.set(CHILD, [{ type: "assistant", role: "assistant", error: { name: "ProviderError", message: "rate limited" }, content: [{ type: "text", text: "half done" }] }]);
+    await request(h, [user("hello")]);
+    await h.drain();
+    await vi.waitFor(async () => {
+      expect(tail(await request(h, [user("hello")]))).toContain("[router] Completed since your last turn:");
+    });
+    expect(h.synthetic.filter((s) => s.text.includes("was lost in a restart"))).toEqual([]);
+  });
+});
+
+describe("the pending journal fails under a held dispatch (QA-2.1-3, QA-2.1-8)", () => {
+  it("QA-2.1-3: an ack whose journal writes fail says the result arrives unverified and holds nothing", async () => {
+    const h = await boot("auto");
+    h.emit(created(CHILD, ORCH));
+    await h.drain();
+    // The journal's directory is a file: the inflight and hold writes fail.
+    rmSync(dirname(h.journalPath), { recursive: true, force: true });
+    // The state directory's parent exists whether or not the plugin wrote the journal yet; the blocker file takes its place.
+    mkdirSync(dirname(dirname(h.journalPath)), { recursive: true });
+    writeFileSync(dirname(h.journalPath), "not a directory");
+    const call = await h.before(dispatch({ background: true }));
+    const done = await h.after({ ...call, status: "completed", result: structuredClone(RUNNING) });
+    const shown = JSON.stringify(done.result);
+    expect(shown).toContain("Its result will arrive unverified");
+    expect(shown).not.toContain("held until verification finishes");
+    expect(tail(await request(h, [user("go on")]))).not.toContain("Held for verification");
+  });
+
+  it("QA-2.1-8: a journal that vanishes under the process fails closed and is never recreated", async () => {
+    const h = await boot("auto");
+    h.emit(created(CHILD, ORCH));
+    await h.drain();
+    const call = await h.before(dispatch({ background: true }));
+    await h.after({ ...call, status: "completed", result: structuredClone(RUNNING) });
+    expect(existsSync(h.journalPath)).toBe(true);
+    rmSync(h.journalPath);
+    const second = "child-2";
+    h.sessions.set(second, { parentID: ORCH });
+    h.emit(created(second, ORCH));
+    await h.drain();
+    const next = await h.before(dispatch({ background: true }));
+    await h.after({ ...next, status: "completed", result: { output: { sessionID: second, status: "running", output: "Working" }, content: "Working", metadata: { sessionID: second } } });
+    // Fail closed (memo 12): a completion this process cannot prove processed is redacted.
+    const event = await request(h, [user("go on"), completion("child-unknown", "SECRET unprocessed output")]);
+    expect(allText(event)).not.toContain("SECRET unprocessed output");
+    // The compaction hook fails closed the same way: a summary never carries it either.
+    const compaction = h.sessionHooks.compaction;
+    if (compaction === undefined) throw new Error("no compaction hook");
+    const messages = [{ id: "m1", role: "user", content: [{ type: "text", text: `<subagent sessionID="child-unknown" state="completed">SECRET unprocessed output</subagent>` }] }];
+    await compaction({ sessionID: ORCH, messages } as never);
+    expect(JSON.stringify(messages)).not.toContain("SECRET unprocessed output");
+    await h.drain();
+    expect(existsSync(h.journalPath)).toBe(false);
+    // The failed state is not permanent: once the journal is back, a later hook retries the reload (at most every
+    // PENDING_RELOAD_RETRY_MS) and the fail-closed redaction ends.
+    writeFileSync(h.journalPath, "");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(Date.now() + PENDING_RELOAD_RETRY_MS + 1_000);
+      await vi.waitFor(async () => {
+        const again = await request(h, [user("later"), completion("child-other", "VISIBLE after the reload")]);
+        expect(allText(again)).toContain("VISIBLE after the reload");
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("adoption from the event loop (QA-2.1-6)", () => {
+  it("a parent seen only through a host event adopts its records: the lost child wakes it once", async () => {
+    const journal = `${JSON.stringify({ v: 1, kind: "inflight", key: `${CHILD}\u0000call-event`, callID: "call-event", parentSessionID: ORCH, childSessionID: CHILD, label: "fast \"x\"", agent: "fast", description: "x", verifying: false, verificationMode: "none", hold: null, at: Date.now() })}\n`;
+    const h = await boot("auto", { journalText: journal, sessions: { "child-event": { parentID: ORCH } } });
+    h.emit(created("child-event", ORCH));
+    await h.drain();
+    await vi.waitFor(() => {
+      expect(h.synthetic.filter((s) => s.resume === true && s.sessionID === ORCH && s.text.includes("was lost in a restart"))).toHaveLength(1);
     });
   });
 });

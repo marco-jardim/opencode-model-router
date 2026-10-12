@@ -270,7 +270,7 @@ export interface FinishApi {
 | `routing.leases.run` | `"annotate"\|"refuse"` | `"annotate"` | enum |
 
 - Values go through `ROUTING_DEFAULTS`/`resolveRouting`; an invalid value warns and falls back to the default.
-- `export function configuredV2OnlyKeys(raw): string[]` lists the keys the user configured. `index.ts` (2.1.4) logs `[router] <key> requires OpenCode v2; ignored` once per key per process when `ctx.routerHost !== "v2"`.
+- `export function configuredV2OnlyKeys(raw): string[]` lists the keys the user configured. `index.ts` (2.1.4) logs one notice per process (`[router] background dispatch requires OpenCode v2; ignored: <keys>`) naming every configured key when `ctx.routerHost !== "v2"`.
 
 ### 2.7 `src\routing\wire\dispatch.ts` (2.1.5)
 

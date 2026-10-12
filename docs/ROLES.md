@@ -412,8 +412,8 @@ so a role orchestrator is told to:
   flight;
 - resolve a lease refusal by waiting for the holder, not by retrying.
 
-The background rules are left out of the block when `routing.background.mode` is `off`, and the lease rule when
-`routing.leases.mode` is `off`.
+The whole block, the lease rule included, is left out when `routing.background.mode` is `off` (leases are still
+enforced; only the prompt line goes), and the lease rule alone when `routing.leases.mode` is `off`.
 
 Whether a `subagent` call to a role agent runs in the background is decided per call by `routing.background.mode`
 (`auto` by default, `model`, `off`) and `routing.background.minPredictedMs` (default `45000`); the rules, the held

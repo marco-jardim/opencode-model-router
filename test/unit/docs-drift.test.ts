@@ -629,13 +629,13 @@ describe("docs drift: defaults, ranges, ids and severities (QA-3.1-18)", () => {
       expect(cells, `row ${key}`).toBeDefined();
       expect(cells![3]!.replace(/[\\`]/g, "").split("|").map((v) => v.trim())).toEqual([...values]);
       expect(cells![4], `${key} v2 only`).toContain("OpenCode v2 only");
-      expect(cells![4], `${key} v1`).toContain("v1 logs one notice per configured key and ignores it");
+      expect(cells![4], `${key} v1`).toContain("v1 ignores it and logs one notice per process (`background dispatch requires OpenCode v2; ignored: <keys>`) naming every configured key");
     }
     const ms = keyRow(doc, "background.minPredictedMs");
     expect(ms?.[1]).toBe("`integer`");
     expect(parseRange(ms![3]!)).toEqual({ lo: 0, hi: 3_600_000, loExcluded: false });
     expect(ms![4]).toContain("OpenCode v2 only");
-    expect(ms![4]).toContain("v1 logs one notice per configured key and ignores it");
+    expect(ms![4]).toContain("v1 ignores it and logs one notice per process (`background dispatch requires OpenCode v2; ignored: <keys>`) naming every configured key");
     // the code takes the documented bounds and falls back to the default outside them
     const minMs = (v: unknown) => resolveRouting(validateConfig({ ...bundled, routing: { background: { minPredictedMs: v } } }), "v2", { warn: () => {} }).background.minPredictedMs;
     resetRoutingWarnings();
@@ -1719,7 +1719,9 @@ describe("docs drift: background-first dispatch, held results, leases and pendin
     expect(flatBackground).toMatch(/a held result is not usable until its verdict/);
     expect(flatBackground).toMatch(/never report a task done while dispatches are listed in flight/);
     expect(flatBackground).toMatch(/a lease refusal is resolved by waiting for the holder, not by retrying/);
-    expect(flatBackground).toMatch(/The first two rules are left out when `routing.background.mode` is `off`, the lease rule when `routing.leases.mode` is `off`/);
+    // QA-2.1-12: `routing.background.mode: "off"` renders no block at all, the lease rule included.
+    expect(flatBackground).toMatch(/The whole block, the lease rule included, is left out when `routing.background.mode` is `off`; the lease rule alone when `routing.leases.mode` is `off`/);
+    expect(read("src/router/protocol.ts")).toContain('if (routing.background.mode === "off") return "";');
     expect(flatBackground).toMatch(/The v1 protocol is unchanged/);
     expect(read("src/router/protocol.ts")).toContain('export const BACKGROUND_DISPATCHES_HEADING = "## Background dispatches";');
     expect(flatBackground).toContain("`routing.background.mode`");
@@ -1822,6 +1824,8 @@ describe("docs drift: background-first dispatch, held results, leases and pendin
     expect(flatVerification).toMatch(/On OpenCode v2 they are also written to disk and survive a restart/);
     expect(flatVerification).toContain("`pending.jsonl`");
     expect(flatVerification).toContain("`routing.outcomes.path`");
+    // QA-2.1-8: the documented location is the one `resolvePendingJournalDir` returns.
+    expect(flatVerification).toContain("`$XDG_STATE_HOME/opencode-model-router` when that variable is an absolute path (not on Windows), else `~/.local/state/opencode-model-router`");
     expect(flatVerification).toMatch(/append-only, one JSON object per line with `"v": 1`/);
     expect(flatVerification).toMatch(/`inflight` and hold records are fsynced before the router acknowledges the dispatch/);
     expect(flatVerification).toMatch(/A torn or invalid line, and a line of an unknown version, is skipped/);
@@ -1841,7 +1845,8 @@ describe("docs drift: background-first dispatch, held results, leases and pendin
     expect(index).toContain('join(pendingDir, "pending.jsonl")');
     expect(index).toContain('join(pendingDir, "pending.claims")');
     expect(index).toContain('record.kind === "inflight" || record.kind === "hold"');
-    expect(index).toContain("resolveOutcomesDir(cfg.routing?.outcomes?.path");
+    // QA-2.1-8: the journal lives in the durable per-user state directory, not next to the outcome store.
+    expect(index).toContain("resolvePendingJournalDir({ homedir: homedir(), platform: process.platform, xdgStateHome: process.env.XDG_STATE_HOME })");
     expect(backgroundSource).toContain("[router] the dispatch was lost in a restart");
     expect(backgroundSource).toContain("[router] not verified: lost in restart");
     expect(hooksSource).toContain("Its result is held until verification finishes.");

@@ -16,9 +16,10 @@ import { vi } from "vitest";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import type { Hooks } from "@opencode-ai/plugin";
 import { ROUTER_FINISH_ATTACH, type HeldResults } from "../../src/compat/background";
-import { registerV2Hooks } from "../../src/compat/v2-hooks";
+import { registerV2Hooks, V2_BACKGROUND_SETTLED } from "../../src/compat/v2-hooks";
 import ModelRouterPlugin from "../../src/index";
 import { invalidateConfigCache, overridePath } from "../../src/router/config";
+import { createPendingFileJournal, resolvePendingJournalDir, type PendingRecord } from "../../src/verify/pending";
 import { removeDirWhenReleased } from "./remove-dir";
 
 export interface SessionSpec {
@@ -54,6 +55,8 @@ type AnyHook = (event: never) => Promise<void>;
 export interface BgHost {
   home: string;
   project: string;
+  /** QA-2.1-8: the pending journal of this host (the durable per-user state dir inside `home`). */
+  journalPath: string;
   sessions: Map<string, SessionSpec>;
   /** `session.context(child)` answers; `undefined` = an empty context. */
   childContext: Map<string, unknown[]>;
@@ -71,6 +74,11 @@ export interface BgHost {
   emit(event: unknown): void;
   /** Resolves when the event loop consumed everything queued and settled its async work (bounded microtask turns). */
   drain(): Promise<void>;
+  /**
+   * `drain`, then waits for the adapter's background work in flight (verdict posts, recoveries, reloads; `V2_BACKGROUND_SETTLED`)
+   * until none is left: what an adoption or a gate started, including its file writes, has finished. No timers.
+   */
+  settled(): Promise<void>;
   before(event: ToolEvent): Promise<ToolEvent>;
   after(event: ToolEvent): Promise<ToolEvent>;
   context(event: unknown): Promise<void>;
@@ -84,17 +92,21 @@ export interface BootOptions {
   /** Extra `ctx.session` members (e.g. no `synthetic`). */
   omitSynthetic?: boolean;
   omitCompaction?: boolean;
-  /** A fixed pending.jsonl text written under the outcomes dir before boot (a previous process's journal). */
+  /** A previous process's pending.jsonl (JSON lines), written to `journalPath` by the real journal writer before boot. */
   journalText?: string;
   /** Re-use a home from an earlier boot (a restart). */
   home?: string;
   routerHost?: "v2" | "v1";
 }
 
-const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, ENFORCE: process.env.MODEL_ROUTER_ENFORCE };
+const saved = {
+  HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, ENFORCE: process.env.MODEL_ROUTER_ENFORCE, XDG_STATE_HOME: process.env.XDG_STATE_HOME,
+};
 
 export function restoreEnv(): void {
-  for (const [key, value] of [["HOME", saved.HOME], ["USERPROFILE", saved.USERPROFILE], ["MODEL_ROUTER_ENFORCE", saved.ENFORCE]] as const) {
+  for (const [key, value] of [
+    ["HOME", saved.HOME], ["USERPROFILE", saved.USERPROFILE], ["MODEL_ROUTER_ENFORCE", saved.ENFORCE], ["XDG_STATE_HOME", saved.XDG_STATE_HOME],
+  ] as const) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
@@ -105,11 +117,18 @@ export async function bootBgHost(options: BootOptions = {}): Promise<BgHost> {
   const home = options.home ?? mkdtempSync(join(tmpdir(), "omr-v2-bg-"));
   process.env.HOME = home;
   process.env.USERPROFILE = home;
+  // QA-2.1-8: the per-user pending journal dir (`resolvePendingJournalDir`) must resolve inside the test home on every platform
+  // (a CI runner's own XDG_STATE_HOME would otherwise share one journal across tests). `restoreEnv` puts the old value back.
+  process.env.XDG_STATE_HOME = join(home, ".local", "state");
   const project = join(home, "project");
   mkdirSync(project, { recursive: true });
   mkdirSync(dirname(overridePath()), { recursive: true });
-  // The outcome store (and pending.jsonl next to it) lives under the test's home: a restart re-uses `options.home`.
-  const outcomes = join(home, "outcomes");
+  // QA-2.1-8: pending.jsonl lives in the durable per-user state dir (`resolvePendingJournalDir`), here inside the test's home (a
+  // restart re-uses `options.home`). The outcome store is pointed at the same dir, so the journal is found there whether the
+  // plugin resolves it from the per-user dir or next to the outcome store.
+  const journalDir = resolvePendingJournalDir({ homedir: home, platform: process.platform, xdgStateHome: process.env.XDG_STATE_HOME });
+  const outcomes = journalDir;
+  const journalPath = join(journalDir, "pending.jsonl");
   const given = (options.overrides ?? {}) as { routing?: Record<string, unknown> };
   writeFileSync(overridePath(), JSON.stringify({ ...given, routing: { ...(given.routing ?? {}), outcomes: { path: outcomes } } }), "utf-8");
   invalidateConfigCache();
@@ -193,8 +212,14 @@ export async function bootBgHost(options: BootOptions = {}): Promise<BgHost> {
   };
 
   if (options.journalText !== undefined) {
-    mkdirSync(outcomes, { recursive: true });
-    writeFileSync(join(outcomes, "pending.jsonl"), options.journalText, "utf-8");
+    // The previous process's journal, written by the real journal writer: it creates its directory itself (no mkdirSync
+    // workaround) and every record has reached the file before the plugin boots. `journalText` is JSON lines.
+    const previous = createPendingFileJournal(journalPath, { compactAtStart: false });
+    for (const line of options.journalText.split("\n")) {
+      if (line.trim() === "") continue;
+      await previous.append(JSON.parse(line) as PendingRecord, { fsync: true });
+    }
+    await previous.flush();
   }
 
   const hooks = await ModelRouterPlugin({
@@ -233,10 +258,24 @@ export async function bootBgHost(options: BootOptions = {}): Promise<BgHost> {
     if (found === undefined) throw new Error(`the adapter registered no ${name} hook`);
     return found;
   };
+  const drain = async (): Promise<void> => {
+    for (let i = 0; i < 200 && (queue.length > 0 || !waiting); i += 1) await turns(5);
+    await turns();
+  };
+  const settleBackground: unknown = Reflect.get(cleanup, V2_BACKGROUND_SETTLED);
+  if (typeof settleBackground !== "function") throw new Error("the adapter exposes no V2_BACKGROUND_SETTLED");
+  const settled = async (): Promise<void> => {
+    await drain();
+    await (settleBackground as () => Promise<void>)();
+    // What the settled work handed back to the event loop (a queued event, a post's continuation) is drained too.
+    await drain();
+  };
+  let disposed = false;
 
   return {
     home,
     project,
+    journalPath,
     sessions,
     childContext,
     synthetic,
@@ -256,10 +295,8 @@ export async function bootBgHost(options: BootOptions = {}): Promise<BgHost> {
       queue.push(event);
       wake();
     },
-    async drain() {
-      for (let i = 0; i < 200 && (queue.length > 0 || !waiting); i += 1) await turns(5);
-      await turns();
-    },
+    drain,
+    settled,
     async before(event) {
       await hook(toolHooks, "execute.before")(event as never);
       return event;
@@ -272,6 +309,11 @@ export async function bootBgHost(options: BootOptions = {}): Promise<BgHost> {
       await hook(sessionHooks, "context")(event as never);
     },
     async dispose() {
+      if (disposed) return;
+      disposed = true;
+      // QA-2.1-8: the queued events and the work they started settle first; the adapter's cleanup then waits (bounded) for its
+      // background work in flight (verdict posts, recoveries); only then is the home (and the journal in it) removed.
+      await drain();
       await cleanup();
       invalidateConfigCache();
       await removeDirWhenReleased(home);

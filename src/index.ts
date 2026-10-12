@@ -134,14 +134,13 @@ import { createIdleTtlSweeper } from "./router/idle-sweep";
 import { guardBeforeCall, guardAfterCall, guardRefusedCall, formatScorecard } from "./guard/enforce";
 import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { resolveOutcomesDir } from "./routing/outcomes/persist";
 import { join, isAbsolute } from "node:path";
 import { access, readFile as fsReadFile } from "node:fs/promises";
 import { tool } from "@opencode-ai/plugin";
 import { scrubText } from "./guard/scrub";
 import { accept, unverifiableGateResult } from "./verify/gate";
 import { applyDispatchCaveats, createVerificationWiring, DEFAULT_PENDING_TTL_MS, dispatchDirectiveText, extractAssistantText, parseRouterVerifyArgs, type DispatchStart, type HandleReport } from "./verify/wiring";
-import { claimPendingSession, createPendingFileJournal, foldDormantRecords, processedKeyOf, appendRouterFooter, buildLateNoticeBlock, buildPendingListBlock, unattributedRisk, type DormantSession, type LateNotice, type PendingEntry, type SettledVerification } from "./verify/pending";
+import { CLAIM_STALE_MS, claimPendingSession, createPendingFileJournal, foldDormantRecords, refreshPendingClaims, releasePendingClaim, resolvePendingJournalDir, processedKeyOf, appendRouterFooter, buildLateNoticeBlock, buildPendingListBlock, unattributedRisk, type DormantSession, type LateNotice, type PendingEntry, type SettledVerification } from "./verify/pending";
 import { createDeadline } from "./verify/deterministic";
 import {
   DEFAULT_DELEGATE_PROMPT_TIMEOUT_MS,
@@ -414,7 +413,10 @@ function createLateBuffer(): LateBuffer {
   };
 }
 
-/** The handles a router_verify report answers: a verdict, an unknown input, an expired handle. A run that outlived the call ("elsewhere") has no verdict yet. */
+/**
+ * The handles a router_verify report answers: a verdict, an unknown input, an expired handle. A run that outlived the call
+ * ("elsewhere") and a held background result ("held", QA-2.1-9: its own gate posts the verdict) have no verdict yet.
+ */
 function answeredHandles(items: readonly HandleReport[]): string[] {
   const handles: string[] = [];
   for (const item of items) {
@@ -752,11 +754,12 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // #84 P2.1 (handoff 1): v1 + any roles key: the "roles delegation requires OpenCode v2" notice, once, at startup.
   resolveRolesRouting(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger);
   if (!isV2Host) {
-    // Phase 2.1: the background and lease keys exist on v2 only; a v1 host says so once per key, and does nothing else with them.
-    for (const key of configuredV2OnlyKeys(cfg)) {
-      if (warnedV2OnlyKeys.has(key)) continue;
-      warnedV2OnlyKeys.add(key);
-      logger.warn(`[router] ${key} requires OpenCode v2; ignored`);
+    // Phase 2.1: the background and lease keys exist on v2 only; a v1 host does nothing with them. QA-2.1-12 (AGENTS.md: at most
+    // one notice per process for a v2-only feature): one notice names every configured key, and no later instance logs another.
+    const keys = [...configuredV2OnlyKeys(cfg)];
+    if (keys.length > 0 && warnedV2OnlyKeys.size === 0) {
+      for (const key of keys) warnedV2OnlyKeys.add(key);
+      logger.warn(`[router] background dispatch requires OpenCode v2; ignored: ${keys.join(", ")}`);
     }
   }
   const depthTracker = createDepthTracker({
@@ -813,9 +816,46 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     }
   };
 
-  // Phase 2.1 (v2 only): pending.jsonl, next to the outcome store. On v1 there is no journal, no held state and no restore.
-  const pendingDir = isV2Host ? resolveOutcomesDir(cfg.routing?.outcomes?.path, { tmpdir: tmpdir(), homedir: homedir() }) : undefined;
-  const pendingFile = pendingDir === undefined ? undefined : createPendingFileJournal(join(pendingDir, "pending.jsonl"));
+  // Phase 2.1 (v2 only): pending.jsonl in the durable per-user state directory, never the temp directory (QA-2.1-8).
+  // On v1 there is no journal, no held state and no restore.
+  const pendingDir = isV2Host
+    ? resolvePendingJournalDir({ homedir: homedir(), platform: process.platform, xdgStateHome: process.env.XDG_STATE_HOME })
+    : undefined;
+  const pendingFile = pendingDir === undefined
+    ? undefined
+    : createPendingFileJournal(join(pendingDir, "pending.jsonl"), { ttlMs: DEFAULT_PENDING_TTL_MS });
+  /** Section 11.3: the exclusive per-session claim files of the journal's sessions (v2 only). */
+  const pendingClaimsDir = pendingDir === undefined ? undefined : join(pendingDir, "pending.claims");
+  /** QA-2.1-13: the sessions whose claim this process took at adoption; re-stamped while held, released on delete and dispose. */
+  const claimedSessions = new Set<string>();
+  /** Hourly: 24 refreshes per CLAIM_STALE_MS. */
+  const CLAIM_REFRESH_MS = CLAIM_STALE_MS / 24;
+  let claimRefreshTimer: ReturnType<typeof setInterval> | undefined;
+  function stopClaimRefresh(): void {
+    if (claimRefreshTimer === undefined) return;
+    clearInterval(claimRefreshTimer);
+    claimRefreshTimer = undefined;
+  }
+  /** QA-2.1-13: a live owner re-stamps its claims well within CLAIM_STALE_MS, so they never read as a reused pid's. */
+  function trackPendingClaim(sessionID: string): void {
+    claimedSessions.add(sessionID);
+    if (claimRefreshTimer !== undefined || pendingClaimsDir === undefined) return;
+    const claimsDir = pendingClaimsDir;
+    claimRefreshTimer = setInterval(() => {
+      refreshPendingClaims(claimsDir, claimedSessions, { pid: process.pid, now: Date.now() });
+    }, CLAIM_REFRESH_MS);
+    claimRefreshTimer.unref?.();
+  }
+  function releasePendingClaimOf(sessionID: string): void {
+    if (!claimedSessions.delete(sessionID) || pendingClaimsDir === undefined) return;
+    releasePendingClaim(pendingClaimsDir, sessionID);
+    if (claimedSessions.size === 0) stopClaimRefresh();
+  }
+  function releaseAllPendingClaims(): void {
+    stopClaimRefresh();
+    if (pendingClaimsDir !== undefined) for (const sessionID of claimedSessions) releasePendingClaim(pendingClaimsDir, sessionID);
+    claimedSessions.clear();
+  }
   /** Late-bound: the lease guard exists only once the v2 adapter attaches (FinishAttach `leaseGate`); the wiring reads it per use. */
   let leaseGateRef: Pick<LeaseGuard, "waitTreeFree"> | undefined;
   const {
@@ -1454,6 +1494,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       background?.dispose();
       // 2.4.2b: evict every pending delegation; in-flight router_verify runs resolve (pending.ts R5).
       pending.dispose();
+      // QA-2.1-13 (v2 only): stop re-stamping and give back every session claim this process took at adoption.
+      releaseAllPendingClaims();
       // 2.2.3: settle batched testsPass requests and kill running batches (never rejects).
       await disposeVerification();
       // 2.1.3: flush and release the outcome bundle held by this instance (never rejects).
@@ -2601,6 +2643,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             // 2.4.5: so do its background requests and late notices; its run in flight is aborted.
             background?.forgetSession(id);
             pending.forgetSession(id);
+            // QA-2.1-13 (v2 only): its held texts go, and its adoption claim is given back.
+            forgetHeldTexts(id);
+            releasePendingClaimOf(id);
           }
         } catch {
           // best-effort: cleanup must never crash a real session
@@ -3195,7 +3240,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   type FinishOutcome =
     | { kind: "none" }
     | { kind: "deferred"; handle: string }
-    | { kind: "required"; verdict: "PASS" | "FAIL" | "UNVERIFIABLE"; detail: string };
+    | { kind: "required"; verdict: "PASS" | "FAIL" | "UNVERIFIABLE"; detail: string }
+    // QA-2.1-1: the gate was not run on purpose (a read-only delegation) or failed; neither is a verdict.
+    | { kind: "skipped"; reason: string }
+    | { kind: "error"; reason: string };
 
   /**
    * Phase 2.1.4.a: the verification of a finished `task` call, extracted unchanged from the legacy
@@ -3325,6 +3373,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             gateDeadline.dispose();
             if (childSessionID) changedFileStore.clear(childSessionID);
             changedFileStore.clear(dispatchID);
+            outcome = { kind: "skipped", reason: "read-only delegation: no files changed and no explicit acceptance to verify" };
             return outcome;
           }
 
@@ -3427,8 +3476,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             verdict: res.accepted ? "PASS" : res.verdict.outcome === "unverifiable" ? "UNVERIFIABLE" : "FAIL",
             detail: res.verdict.reasons.join("; "),
           };
-        } catch {
-          // fail-closed: a verification error must NEVER throw out of the after-hook
+        } catch (error) {
+          // fail-closed: a verification error must NEVER throw out of the after-hook. QA-2.1-1: it is logged and reported as an
+          // `error` outcome, so a held dispatch posts UNVERIFIABLE with this reason instead of a PASS.
+          logger.warn("[router] verification failed in the after-hook", { tool: input?.tool, error: describeError(error) });
+          outcome = { kind: "error", reason: `verification unavailable: ${scrubText(String(error))}` };
         }
       }
     }
@@ -3438,21 +3490,46 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   /** Phase 2.1.4.a (v2 only): the `task` arguments of a call in flight, kept for FinishApi.verificationFor / finish. */
   const MAX_TASK_ARGS = 1000;
   const taskArgsByCall = new Map<string, Record<string, unknown>>();
+  /** QA-2.1-7: the parent session of a call in flight (same keys and bound), so captureDelta finds the dispatch record. */
+  const taskParentByCall = new Map<string, string>();
   function rememberTaskArgs(input: any, output: any): void {
     if (!isV2Host || input?.tool !== "task" || typeof input.callID !== "string") return;
     const args = output?.args;
     if (typeof args !== "object" || args === null) return;
     taskArgsByCall.set(input.callID, { ...(args as Record<string, unknown>) });
+    if (typeof input.sessionID === "string") taskParentByCall.set(input.callID, input.sessionID);
     while (taskArgsByCall.size > MAX_TASK_ARGS) {
       const oldest = taskArgsByCall.keys().next();
       if (oldest.done === true) break;
       taskArgsByCall.delete(oldest.value);
+      taskParentByCall.delete(oldest.value);
     }
+  }
+  function forgetTaskArgs(callID: string): void {
+    taskArgsByCall.delete(callID);
+    taskParentByCall.delete(callID);
   }
 
   // ---- Phase 2.1.4.a (v2 only): the finish API ------------------------------------------------------
-  /** The foreground-equivalent text of a held dispatch, kept from the end of its gate until onVerdict posts it. */
-  const heldTexts = new Map<string, string>();
+  /**
+   * The foreground-equivalent text of a held dispatch, kept from the end of its gate until onVerdict posts it. QA-2.1-13:
+   * bounded (oldest first; an evicted hold posts the generic verdict line) and forgotten with its parent session.
+   */
+  const heldTexts = new Map<string, { readonly sessionID: string; readonly text: string }>();
+  /** = MAX_HOLDS_GLOBAL (background.ts): there are never more live holds than this. */
+  const MAX_HELD_TEXTS = 10_000;
+  function rememberHeldText(handle: string, sessionID: string, text: string): void {
+    heldTexts.delete(handle);
+    heldTexts.set(handle, { sessionID, text });
+    while (heldTexts.size > MAX_HELD_TEXTS) {
+      const oldest = heldTexts.keys().next();
+      if (oldest.done === true) break;
+      heldTexts.delete(oldest.value);
+    }
+  }
+  function forgetHeldTexts(sessionID: string): void {
+    for (const [handle, held] of heldTexts) if (held.sessionID === sessionID) heldTexts.delete(handle);
+  }
   let heldSink: HeldSink | undefined;
 
   /** pending.onVerdict: a held entry's verdict goes to the parent through the HeldSink (v2 adapter). */
@@ -3460,7 +3537,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     if (entry.hold === undefined || heldSink === undefined) return;
     const verdict = heldVerdictKind(result.verdict.outcome, result.verdict.pass);
     const reason = result.verdict.reasons[0];
-    const text = heldTexts.get(entry.handle) ?? `[router] ${entry.handle}: verification ended ${verdict}${reason !== undefined ? ` — ${scrubText(reason)}` : ""}`;
+    const text = heldTexts.get(entry.handle)?.text ?? `[router] ${entry.handle}: verification ended ${verdict}${reason !== undefined ? ` — ${scrubText(reason)}` : ""}`;
     heldTexts.delete(entry.handle);
     heldSink.verdict(entry.handle, { verdict, text, ...(reason !== undefined ? { reason } : {}) }).catch((error: unknown) => {
       logger.warn("[router] held verdict not posted", { handle: entry.handle, error: describeError(error) });
@@ -3470,6 +3547,21 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   function heldVerdictKind(outcome: string | undefined, pass: boolean): "PASS" | "FAIL" | "UNVERIFIABLE" {
     if (outcome === "unverifiable") return "UNVERIFIABLE";
     return pass ? "PASS" : "FAIL";
+  }
+
+  /**
+   * QA-2.1-1: the verdict a held dispatch posts for what its gate ended in. Only a `required` outcome carries a gate verdict;
+   * every other outcome is UNVERIFIABLE with its reason, and `line` is the router line appended to the posted text.
+   */
+  function heldOutcomeOf(outcome: FinishOutcome): { verdict: "PASS" | "FAIL" | "UNVERIFIABLE"; reasons: string[]; line?: string } {
+    if (outcome.kind === "required") return { verdict: outcome.verdict, reasons: outcome.detail !== "" ? [outcome.detail] : [] };
+    const reason =
+      outcome.kind === "skipped" ? `not verified: ${outcome.reason}`
+        : outcome.kind === "error" ? outcome.reason
+          : outcome.kind === "deferred" ? `not verified: deferred to router_verify as ${outcome.handle}`
+            : "not verified: verification is not required for this dispatch";
+    const scrubbed = scrubText(reason);
+    return { verdict: "UNVERIFIABLE", reasons: [scrubbed], line: `[router] UNVERIFIABLE — ${scrubbed}` };
   }
 
   /** The `task` result the host would have handed the hook: the child's id and its final text. */
@@ -3489,7 +3581,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       if (pendingFile === undefined) return;
       // `inflight` and `hold` records are fsync'd (memo §11.2); the rest only when the caller asks.
       const fsync = opts?.fsync === true || record.kind === "inflight" || record.kind === "hold";
-      // The file journal makes its directory once; a directory removed since (a cleaned store, a tmp sweep) must not turn every
+      // The file journal makes its directory once; a directory removed since (a cleaned state directory) must not turn every
       // later append (`processed`, `posting`, `posted`) into an ENOENT, so it is made again before each append.
       if (pendingDir !== undefined && !existsSync(pendingDir)) mkdirSync(pendingDir, { recursive: true });
       await pendingFile.append(record, fsync ? { fsync: true } : undefined);
@@ -3506,7 +3598,13 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   };
   const finishApi: FinishApi = {
     journal: sharedJournal,
-    captureDelta: async (callID, childSessionID) => changedFileStore.captureDelta(callID, childSessionID),
+    // QA-2.1-7: the change-set store keys a dispatch by `task:<parent>:<callID>` (finishDispatch), never by the bare call id.
+    // The background path passes the key (it knows the parent); the foreground path maps the parent through `taskParentByCall`.
+    captureDelta: async (callID, childSessionID, dispatchID) => {
+      if (dispatchID !== undefined) return changedFileStore.captureDelta(callID, childSessionID, dispatchID);
+      const parent = taskParentByCall.get(callID);
+      return changedFileStore.captureDelta(callID, childSessionID, parent === undefined ? undefined : `task:${parent}:${callID}`);
+    },
     async reload() {
       if (pendingFile === undefined) return;
       const folded = foldDormantRecords(await pendingFile.load(), { now: Date.now(), ttlMs: DEFAULT_PENDING_TTL_MS });
@@ -3515,9 +3613,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     },
     adopt(sessionID): AdoptedRecords | undefined {
       const session = dormantSessions.get(sessionID);
-      if (session === undefined || pendingDir === undefined) return undefined;
+      if (session === undefined || pendingClaimsDir === undefined) return undefined;
       dormantSessions.delete(sessionID);
-      if (!claimPendingSession(join(pendingDir, "pending.claims"), sessionID, { pid: process.pid, now: Date.now(), isAlive: pidAlive })) return undefined;
+      if (!claimPendingSession(pendingClaimsDir, sessionID, { pid: process.pid, now: Date.now(), isAlive: pidAlive })) return undefined;
+      trackPendingClaim(sessionID);
       return { holds: session.holds, inflight: session.inflight };
     },
     verificationFor(callID) {
@@ -3553,6 +3652,14 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       const scratch = { output: taskOutputText(fin.childSessionID, fin.outputText), title: "", metadata: { sessionId: fin.childSessionID } as Record<string, unknown> };
       const base = scratch.output.trimEnd();
       const suffixOf = (): string => (scratch.output.startsWith(base) ? scratch.output.slice(base.length) : "");
+      if (fin.status !== "succeeded") {
+        // QA-2.1-5: a failed, interrupted or unknown child produced no result to verify; the gate never runs on it. The
+        // change-set records of the dispatch are dropped here, as finishDispatch would have.
+        changedFileStore.clear(`task:${fin.parentSessionID}:${fin.callID}`);
+        changedFileStore.clear(fin.childSessionID);
+        forgetTaskArgs(fin.callID);
+        return { outputText: fin.outputText, suffix: "", verification: { kind: "none" }, metadata: {} };
+      }
       if (fin.heldHandle !== undefined) {
         const handle = fin.heldHandle;
         const dod = buildDelegationDoD({
@@ -3576,29 +3683,38 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           hold: { childSessionID: fin.childSessionID, callID: fin.callID },
         });
         if (!reg.ok) logger.warn("[router] held dispatch not registered", { code: reg.code, detail: reg.detail });
+        const settleHeld = (outcome: FinishOutcome): void => {
+          const claim = pending.markVerifying(fin.parentSessionID, handle);
+          // QA-2.1-1: only a gate verdict is a verdict; none/deferred/skipped/error post UNVERIFIABLE with their reason.
+          const held = heldOutcomeOf(outcome);
+          const text = held.line === undefined ? scratch.output : `${scratch.output.trimEnd()}\n\n${held.line}`;
+          rememberHeldText(handle, fin.parentSessionID, text);
+          if (claim.kind === "claimed") {
+            claim.settle({
+              verdict: {
+                pass: held.verdict === "PASS",
+                outcome: held.verdict === "PASS" ? "pass" : held.verdict === "FAIL" ? "fail" : "unverifiable",
+                method: "deterministic",
+                reasons: held.reasons,
+                caveats: [],
+              },
+              retryable: false,
+            });
+          } else if (heldSink !== undefined) {
+            heldTexts.delete(handle);
+            const reason = held.reasons[0];
+            heldSink.verdict(handle, { verdict: held.verdict, text, ...(reason !== undefined ? { reason } : {}) }).catch((error: unknown) => {
+              logger.warn("[router] held verdict not posted", { handle, error: describeError(error) });
+            });
+          }
+        };
         // The same required gate the foreground path runs; not awaited. Its verdict is posted through pending.onVerdict.
-        void finishDispatch(callInput, scratch, undefined, delta === undefined ? undefined : { delta }).then(
-          (outcome) => {
-            const claim = pending.markVerifying(fin.parentSessionID, handle);
-            const verdict = outcome.kind === "required" ? outcome.verdict : "PASS";
-            heldTexts.set(handle, scratch.output);
-            if (claim.kind === "claimed") {
-              claim.settle({
-                verdict: {
-                  pass: verdict === "PASS",
-                  outcome: verdict === "PASS" ? "pass" : verdict === "FAIL" ? "fail" : "unverifiable",
-                  method: "deterministic",
-                  reasons: outcome.kind === "required" && outcome.detail !== "" ? [outcome.detail] : [],
-                  caveats: [],
-                },
-                retryable: false,
-              });
-            } else if (heldSink !== undefined) {
-              void heldSink.verdict(handle, { verdict, text: scratch.output });
-            }
-          },
-          (error: unknown) => logger.warn("[router] held verification failed", { error: describeError(error) }),
-        );
+        void finishDispatch(callInput, scratch, undefined, delta === undefined ? undefined : { delta })
+          .then(settleHeld, (error: unknown) => {
+            logger.warn("[router] held verification failed", { handle, error: describeError(error) });
+            settleHeld({ kind: "error", reason: `verification unavailable: ${scrubText(String(error))}` });
+          })
+          .catch((error: unknown) => logger.warn("[router] held verdict not settled", { handle, error: describeError(error) }));
         return { outputText: fin.outputText, suffix: "", verification: { kind: "held", handle }, metadata: {} };
       }
       const outcome = await finishDispatch(callInput, scratch, undefined, delta === undefined ? undefined : { delta });
@@ -3607,7 +3723,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         outcome.kind === "deferred" ? { kind: "deferred", handle: outcome.handle }
           : outcome.kind === "required" ? { kind: "required", verdict: outcome.verdict }
             : { kind: "none" };
-      taskArgsByCall.delete(fin.callID);
+      forgetTaskArgs(fin.callID);
       return { outputText: fin.outputText + suffix, suffix, verification, metadata: {} };
     },
   };

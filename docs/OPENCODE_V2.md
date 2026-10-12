@@ -132,10 +132,10 @@ On v2 the orchestrator protocol carries a short `Background dispatches` block wi
 rules: after dispatching background work, continue any independent work; when none remains,
 end the turn, because the router wakes the orchestrator; never poll or sleep; a held result is
 not usable until its verdict; never report a task done while dispatches are listed in flight;
-a lease refusal is resolved by waiting for the holder, not by retrying. The first two rules
-are left out when `routing.background.mode` is `off`, the lease rule when
-`routing.leases.mode` is `off`, and the block is left out when neither applies. The v1
-protocol is unchanged.
+a lease refusal is resolved by waiting for the holder, not by retrying. The whole block, the
+lease rule included, is left out when `routing.background.mode` is `off`; the lease rule
+alone when `routing.leases.mode` is `off`. Leases are still enforced under `off`; only the
+prompt line goes. The v1 protocol is unchanged.
 
 **When a call runs in the background.** `routing.background.mode` selects the policy (v2 only;
 v1 ignores it):
@@ -193,8 +193,20 @@ The guarantee covers the result text the orchestrator receives. The terminal UI 
 `session.export` still show the original to the human, and files the child wrote are readable
 as soon as its file leases end (see [ROLES.md](ROLES.md#file-leases)).
 
+**Child text that looks like a router line.** Under `auto` and `model`, every line of a
+child's text inside a `<subagent>` element that starts with `[router` (after blanks and
+markdown quote, list or emphasis marks; any case) is shown to the orchestrator as `(router`,
+so a child cannot pass its own text off as a router line, placeholder or verdict. Role
+dispatches get the same rewrite in every mode (see
+[ROLES.md](ROLES.md#observability)).
+
+**Calls a child session backgrounds.** The running notice, holds and completion guarantees
+apply to a root orchestrator's calls only. When the user backgrounds a call that a child
+session made, the router registers nothing and adds no notice: the child sees the host's
+running result as it is, and no hold or completion guarantee applies to that call.
+
 **Restarts.** The in-flight dispatches, the pending verification entries and the holds are
-written to `pending.jsonl` in the outcomes directory, so a held result is still held and
+written to `pending.jsonl` in a per-user state directory, so a held result is still held and
 its verdict is still delivered after the host restarts (see
 [VERIFICATION.md](VERIFICATION.md#pending-handles-survive-restarts)). If that file cannot be
 read, the router stops holding new results and redacts every `<subagent>` element it has not

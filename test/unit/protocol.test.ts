@@ -43,6 +43,13 @@ describe("assembleSystemPrompt host (background rules, v2 only)", () => {
     expect(assembleSystemPrompt(cfg, undefined, false, "v2")).toBe(buildDelegationProtocol(cfg));
   });
 
+  it("QA-2.1-12: background off emits nothing even with leases enforced (no lease line)", () => {
+    const cfg = withRouting({ background: { mode: "off" }, leases: { mode: "enforce" } });
+    expect(buildBackgroundDispatchesBlock(cfg)).toBe("");
+    expect(assembleSystemPrompt(cfg, undefined, false, "v2")).toBe(buildDelegationProtocol(cfg));
+    expect(assembleSystemPrompt(cfg, undefined, false, "v2")).not.toContain("lease refusal");
+  });
+
   it("a model-driven background mode still carries the background rules", () => {
     const block = buildBackgroundDispatchesBlock(withRouting({ background: { mode: "model" }, leases: { mode: "off" } }));
     expect(block).toContain("Never poll or sleep.");

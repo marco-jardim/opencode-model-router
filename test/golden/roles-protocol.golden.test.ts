@@ -264,11 +264,12 @@ describe("Background dispatches block (v2 only; memo 2.8)", () => {
   const FLIGHT = "Never report a task done while dispatches are listed in flight.";
   const LEASE = "A lease refusal is resolved by waiting for the holder, not by retrying.";
 
-  it("v2 snapshots: the block of the defaults, background only and leases only", async () => {
+  it("v2 snapshots: the block of the defaults and background only; background off renders no block (QA-2.1-12)", async () => {
     const block = (routing: Record<string, unknown>): string => buildBackgroundDispatchesBlock(withRouting(tiersCfg(), routing));
     await expect(block({})).toMatchFileSnapshot("__snapshots__/v2-background-protocol.default.txt");
     await expect(block({ leases: { mode: "off" } })).toMatchFileSnapshot("__snapshots__/v2-background-protocol.background-only.txt");
-    await expect(block({ background: { mode: "off" } })).toMatchFileSnapshot("__snapshots__/v2-background-protocol.leases-only.txt");
+    expect(block({ background: { mode: "off" } })).toBe("");
+    expect(block({ background: { mode: "off" }, leases: { mode: "enforce" } })).toBe("");
   });
 
   it("the roles prompt and the v2 tiers prompt carry the identical block", () => {
@@ -306,8 +307,10 @@ describe("Background dispatches block (v2 only; memo 2.8)", () => {
     expect(bgOnly).toContain(FLIGHT);
     expect(bgOnly).toContain("Never poll or sleep.");
     expect(bgOnly).not.toContain(LEASE);
+    // QA-2.1-12: background off leaves the prompt as before phase 2.1, whatever the lease mode.
     const leaseOnly = render({ background: { mode: "off" }, leases: { mode: "enforce" } });
-    expect(leaseOnly.endsWith(`## Background dispatches\n- ${LEASE}`)).toBe(true);
+    expect(leaseOnly).toBe(buildDelegationProtocol(tiersCfg()));
+    expect(leaseOnly).not.toContain(LEASE);
     expect(leaseOnly).not.toContain(FLIGHT);
     const neither = render({ background: { mode: "off" }, leases: { mode: "off" } });
     expect(neither).toBe(buildDelegationProtocol(tiersCfg()));
@@ -320,7 +323,9 @@ describe("Background dispatches block (v2 only; memo 2.8)", () => {
     expect(text).not.toContain("Background dispatches");
     const leaseOnly = withRouting(rolesCfg(), { background: { mode: "off" }, leases: { mode: "enforce" } });
     const lease = buildRolesProtocol(leaseOnly, resolveRoles(leaseOnly, "v2"));
-    expect(lease).toContain(`## Background dispatches\n- ${LEASE}\n\nThis protocol overrides`);
+    // QA-2.1-12: background off renders no block, the lease rule included.
+    expect(lease).not.toContain("Background dispatches");
+    expect(lease).not.toContain(LEASE);
     expect(lease).not.toContain(FLIGHT);
   });
 });

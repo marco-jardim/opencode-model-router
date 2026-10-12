@@ -175,6 +175,11 @@ export interface PreparedVerification {
   concurrentDispatches?: number;
   /** QA-3.1-3: the tool whose call discarded the dispatch snapshot, which left the change set unavailable. */
   contaminatedBy?: string;
+  /**
+   * QA-2.1-11 (phase 2.1, v2 only): the producer's session. Its own tree leases are still held while its gate runs, so the
+   * gate's lease wait leaves them out. Absent or "": none known.
+   */
+  producerSessionID?: string;
 }
 
 /**
@@ -555,7 +560,9 @@ export type HandleReport =
   | { readonly kind: "unknown"; readonly input: string }
   | { readonly kind: "expired"; readonly handle: string }
   /** Joined another call's run, which outlived this call's deadline (R8). */
-  | { readonly kind: "elsewhere"; readonly handle: string; readonly description: string };
+  | { readonly kind: "elsewhere"; readonly handle: string; readonly description: string }
+  /** QA-2.1-9 (phase 2.1): a held background result; its own gate posts the verdict to the session, so nothing ran here. */
+  | { readonly kind: "held"; readonly handle: string; readonly description: string };
 
 export interface VerifyReport {
   readonly items: readonly HandleReport[];
@@ -574,6 +581,9 @@ export const DRIFT_NOTICE = "tree drifted since delegation; verdict reflects cur
 export const DRIFT_UNCHECKED_NOTICE = "drift since delegation could not be checked; verdict reflects current state";
 export const ROUTER_VERIFY_CANCELLED_REASON = "router_verify was cancelled before a verdict";
 export const ROUTER_VERIFY_RELEASED_REASON = "the delegation's verification data was released";
+/** QA-2.1-9: the line of a held background result named to router_verify (refused; its gate posts the verdict). */
+export const HELD_RESULT_TEXT =
+  "held background result: its own verification gate posts the verdict to this session when it settles; nothing was run.";
 /** Drifted paths named per handle; the rest are counted. */
 export const DRIFT_MAX_PATHS = 10;
 
@@ -683,6 +693,10 @@ export function formatVerifyReport(
       blocks.push(`- ${item.handle} \u00b7 ${item.description} \u00b7 ${VERIFYING_ELSEWHERE_TEXT}`);
       continue;
     }
+    if (item.kind === "held") {
+      blocks.push(`- ${item.handle} \u00b7 ${item.description} \u00b7 ${HELD_RESULT_TEXT}`);
+      continue;
+    }
     const { result } = item;
     const verdict = result.verdict;
     const via = item.via === "joined" ? " (joined a run already in progress)" : item.via === "cached" ? " (cached verdict; nothing was run)" : "";
@@ -734,9 +748,50 @@ export function backgroundOutcomes(items: readonly HandleReport[]): BackgroundOu
         ? { kind: "judged", handle: item.handle, description: item.description, result: item.result }
         : { kind: "reported", handle: item.handle };
     }
-    if (item.kind === "elsewhere") return { kind: "reported", handle: item.handle };
+    if (item.kind === "elsewhere" || item.kind === "held") return { kind: "reported", handle: item.handle };
     return { kind: "gone", handle: item.kind === "unknown" ? item.input : item.handle };
   });
+}
+
+/** QA-2.1-11: how often a lease wait that ignores the producer's own holder probes the tree again. */
+const LEASE_WAIT_POLL_MS = 100;
+
+/**
+ * QA-2.1-11 (phase 2.1, v2 only): waits until no holder of `tree` other than the sessions in `exclude` edits it, or `deadlineMs`
+ * passes. The producer's own leases stay until its completion is processed, after this gate, so waiting for them only delays
+ * its own check. `waitTreeFree` waits for every other holder: with no excluded holder in the tree it is called as is (event
+ * driven); otherwise it is used as a probe (deadline 0) and polled. Returns the holders that remain, excluded ones left out.
+ */
+export async function waitTreeFreeExcept(
+  gate: Pick<import("../compat/background").LeaseGuard, "waitTreeFree">,
+  tree: string,
+  owner: { producer: string },
+  exclude: ReadonlySet<string>,
+  deadlineMs: number,
+  signal: AbortSignal,
+  now: () => number = Date.now,
+): Promise<{ waitedMs: number; holders: string[] }> {
+  const started = now();
+  for (;;) {
+    const probe = await gate.waitTreeFree(tree, owner, 0, signal);
+    const holders = probe.holders.filter(h => !exclude.has(h));
+    const left = deadlineMs - (now() - started);
+    if (holders.length === 0 || left <= 0 || signal.aborted) return { waitedMs: now() - started, holders };
+    if (holders.length === probe.holders.length) {
+      const wait = await gate.waitTreeFree(tree, owner, left, signal);
+      return { waitedMs: now() - started, holders: wait.holders.filter(h => !exclude.has(h)) };
+    }
+    await new Promise<void>(resolve => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const done = (): void => {
+        if (timer !== undefined) clearTimeout(timer);
+        signal.removeEventListener("abort", done);
+        resolve();
+      };
+      timer = setTimeout(done, Math.min(LEASE_WAIT_POLL_MS, left));
+      signal.addEventListener("abort", done, { once: true });
+    });
+  }
 }
 
 /** A never-rejecting wait for `promise` that ends with `fallback()` once `signal` aborts. */
@@ -1475,9 +1530,13 @@ export function createVerificationWiring(deps: {
           // anyway, with the concurrent-dispatches caveat for the holders that remain.
           if (deps.leaseGate !== undefined) {
             try {
-              const wait = await deps.leaseGate.waitTreeFree(
+              // QA-2.1-11: the producer's own leases never delay its own check.
+              const producer = prepared?.producerSessionID;
+              const wait = await waitTreeFreeExcept(
+                deps.leaseGate,
                 prepared?.snapshot?.root ?? directory,
                 { producer: parentSessionID ?? creatorSessionID ?? "router" },
+                new Set(producer !== undefined && producer !== "" ? [producer] : []),
                 Math.min(Math.floor(resolved.gateBudgetMs / 4), deadline?.remaining() ?? resolved.gateBudgetMs),
                 deadline?.signal ?? new AbortController().signal,
               );
@@ -1596,6 +1655,7 @@ export function createVerificationWiring(deps: {
       snapshot,
       concurrentDispatches: store.concurrentDispatches(id, snapshot?.root),
       ...(contaminatedBy !== undefined ? { contaminatedBy } : {}),
+      ...(childID !== "" ? { producerSessionID: childID } : {}),
     };
   };
 
@@ -1711,11 +1771,14 @@ export function createVerificationWiring(deps: {
     let deferred = false;
     try {
       const observed = await observeChange(store, input.dispatchID, input.producerSessionID, input.cwd, deadline);
-      // Phase 2.1.4.b: a background completion registers the set frozen at child end, not the tree as it stands now.
+      // Phase 2.1.4.b / QA-2.1-7: the set frozen at child end holds only the child's tool-observed paths, a subset of the
+      // observed change set (which also holds the tree delta, shell edits and commits), so it never replaces it. A delta whose
+      // dispatch snapshot a foreign write contaminated makes the change set unavailable, as the foreground gate treats it.
       const delta = input.delta;
-      const change = delta === undefined ? observed : {
+      const change = delta === undefined || delta.files !== "unavailable" ? observed : {
         ...observed,
-        ...(delta.files === "unavailable" ? { changeBaseline: "unavailable" as const, changedFiles: [] } : { changedFiles: [...delta.files] }),
+        changeBaseline: "unavailable" as const,
+        changedFiles: [],
         ...(delta.contaminatedBy !== undefined ? { contaminatedBy: delta.contaminatedBy } : {}),
       };
       // QA-2.4-10: an attributed empty change set is passed by the required gate with no process
@@ -1930,6 +1993,8 @@ export function createVerificationWiring(deps: {
         changeBaseline: changed === "unavailable" ? "unavailable" : "available",
         reference,
         snapshot: tree,
+        // QA-2.1-11: the producer's own retained leases never delay its own check.
+        ...(entry.producerSessionID !== "" ? { producerSessionID: entry.producerSessionID } : {}),
       },
       drift,
       root: entry.root ?? tree?.root,
@@ -2111,6 +2176,15 @@ export function createVerificationWiring(deps: {
         for (const t of targets) {
           if (t.handle === undefined || sessionID === "") {
             slots.push({ kind: "unknown", input: t.handle ?? t.input });
+            continue;
+          }
+          // QA-2.1-9 (phase 2.1, v2 only): a held entry is verified by its background gate, which posts the verdict to the
+          // parent. Before that gate claims it, router_verify refuses it (never a second run, never a second post); once the
+          // gate runs, the claim below joins it, and a settled entry reports the cached verdict.
+          // A held entry starts in state "held" (pending.ts); "verifying" is the gate's claim, "verified" its verdict.
+          const looked = pending.get(sessionID, t.handle);
+          if (looked.kind === "found" && looked.entry.hold !== undefined && looked.entry.state !== "verifying" && looked.entry.state !== "verified") {
+            slots.push({ kind: "held", handle: looked.entry.handle, description: looked.entry.description });
             continue;
           }
           const c = pending.markVerifying(sessionID, t.handle);

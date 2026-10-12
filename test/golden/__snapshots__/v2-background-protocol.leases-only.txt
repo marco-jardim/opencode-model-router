@@ -1,2 +1,0 @@
-## Background dispatches
-- A lease refusal is resolved by waiting for the holder, not by retrying.

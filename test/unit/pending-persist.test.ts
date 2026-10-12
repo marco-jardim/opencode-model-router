@@ -1,16 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  CLAIM_STALE_MS,
   claimPendingSession,
+  compactPendingRecords,
   createPendingFileJournal,
   createPendingRegistry,
   foldDormantRecords,
   HANDLE_PATTERN,
+  HELD_RESERVATION_TTL_MS,
   HELD_TTL_REASON,
+  MAX_DORMANT_POSTED_HOLDS,
+  PENDING_JOURNAL_VANISHED,
   processedKeyOf,
   REFERENCE_UNRESTORED_REASON,
+  refreshPendingClaims,
+  releasePendingClaim,
+  resolvePendingJournalDir,
   type PendingRecord,
   type PendingRegistration,
   type PendingRegistryOptions,
@@ -77,20 +85,42 @@ describe("foldDormantRecords (memo 11.3)", () => {
     expect(processed).toEqual(new Set(["k1\u0000c1", "explicit-key"]));
   });
 
-  it("posted closes a hold; tomb closes a hold and the inflight of its callID", () => {
+  it("posted turns a hold into an inactive placeholder (QA-2.1-10); tomb closes a hold and the inflight of its callID", () => {
     const { sessions } = foldDormantRecords(
       [
         rec("hold", { handle: "vrf_a", parent: "p1", child: "k1", callID: "c1" }),
         rec("hold", { handle: "vrf_b", parent: "p1", child: "k2", callID: "c2" }),
         rec("hold", { handle: "vrf_c", parent: "p1", child: "k3", callID: "c3" }),
         rec("inflight", { callID: "c2", parent: "p1", child: "k2", at: NOW }),
+        rec("hold-text", { handle: "vrf_a", text: "child said", at: NOW }),
+        rec("posting", { handle: "vrf_a", text: "verdict", at: NOW }),
         rec("posted", { handle: "vrf_a", at: NOW }),
         rec("tomb", { handle: "vrf_b", callID: "c2", cause: "ttl", at: NOW }),
       ],
       { now: NOW, ttlMs: TTL },
     );
-    expect(sessions.get("p1")?.holds.map((r) => r.handle)).toEqual(["vrf_c"]);
+    // One `hold` record per hold; the posted one is followed by its `posted` record only (its text and posting are gone).
+    expect(sessions.get("p1")?.holds.map((r) => `${r.kind}:${String(r.handle)}`)).toEqual(["hold:vrf_a", "posted:vrf_a", "hold:vrf_c"]);
+    expect(sessions.get("p1")?.holds.filter((r) => r.kind === "hold").map((r) => r.handle)).toEqual(["vrf_a", "vrf_c"]);
     expect(sessions.get("p1")?.inflight).toEqual([]);
+  });
+
+  it("an open hold carries its hold-text and only its newest posting record (QA-2.1-2, QA-2.1-6)", () => {
+    const { sessions } = foldDormantRecords(
+      [
+        rec("hold", { handle: "vrf_a", parent: "p1", child: "k1", callID: "c1" }),
+        rec("hold-text", { handle: "vrf_a", text: "child said", at: NOW }),
+        rec("posting", { handle: "vrf_a", text: "first", at: NOW }),
+        rec("posting", { handle: "vrf_a", text: "second", at: NOW }),
+        rec("posting", { handle: "vrf_unknown", text: "orphan", at: NOW }),
+      ],
+      { now: NOW, ttlMs: TTL },
+    );
+    expect(sessions.get("p1")?.holds.map((r) => [r.kind, r.text])).toEqual([
+      ["hold", undefined],
+      ["hold-text", "child said"],
+      ["posting", "second"],
+    ]);
   });
 
   it("forget removes the session's earlier records but not later ones", () => {
@@ -176,6 +206,7 @@ describe("pending.jsonl journal (memo 11.1, 11.2)", () => {
     const loaded = await journal.load();
     expect(loaded.map((r) => r.kind)).toEqual(["inflight", "hold", "posted"]);
     expect(readFileSync(file, "utf8").split("\n").filter((l) => l !== "")).toHaveLength(3);
+    await journal.flush(); // the compaction at start runs behind the load
   });
 
   it("a missing file loads as empty", async () => {
@@ -217,6 +248,187 @@ describe("pending.jsonl journal (memo 11.1, 11.2)", () => {
     await Promise.all(Array.from({ length: 20 }, (_, i) => journal.append(rec("inflight", { callID: `c${i}` }), { fsync: i % 2 === 0 })));
     const loaded = await journal.load();
     expect(loaded.map((r) => r.callID)).toEqual(Array.from({ length: 20 }, (_, i) => `c${i}`));
+    await journal.flush(); // the compaction at start runs behind the load
+  });
+
+  it("a journal this process knew that goes missing fails the next load and append, never recreated (QA-2.1-8)", async () => {
+    const file = join(dir, "pending.jsonl");
+    const journal = createPendingFileJournal(file, { compactAtStart: false });
+    await journal.append(rec("inflight", { callID: "c1" }));
+    rmSync(file);
+    await expect(journal.load()).rejects.toThrow(PENDING_JOURNAL_VANISHED);
+    await expect(journal.append(rec("inflight", { callID: "c2" }))).rejects.toThrow(PENDING_JOURNAL_VANISHED);
+    await journal.flush();
+    expect(existsSync(file)).toBe(false);
+  });
+
+  it("a journal read once that goes missing fails the next load (QA-2.1-8)", async () => {
+    const file = join(dir, "pending.jsonl");
+    writeFileSync(file, `${JSON.stringify(rec("inflight", { callID: "c1" }))}\n`);
+    const journal = createPendingFileJournal(file, { compactAtStart: false });
+    expect(await journal.load()).toHaveLength(1);
+    rmSync(file);
+    await expect(journal.load()).rejects.toThrow(PENDING_JOURNAL_VANISHED);
+  });
+
+  it("concurrent loads share one read and hand out separate arrays", async () => {
+    const file = join(dir, "pending.jsonl");
+    writeFileSync(file, `${JSON.stringify(rec("inflight", { callID: "c1" }))}\n`);
+    const journal = createPendingFileJournal(file, { compactAtStart: false });
+    const [a, b] = await Promise.all([journal.load(), journal.load()]);
+    expect(a).toEqual(b);
+    expect(a).not.toBe(b);
+    a.length = 0;
+    expect(await journal.load()).toHaveLength(1);
+  });
+
+  it("the first load compacts the journal behind it: closed records go, open ones stay in order (QA-2.1-8)", async () => {
+    const file = join(dir, "pending.jsonl");
+    const lines = [
+      rec("inflight", { callID: "c1", parent: "p1", child: "k1", at: NOW }),
+      rec("processed", { callID: "c1", child: "k1", at: NOW }),
+      rec("inflight", { callID: "c2", parent: "p1", child: "k2", at: NOW }),
+    ];
+    writeFileSync(file, lines.map((r) => `${JSON.stringify(r)}\n`).join(""));
+    const journal = createPendingFileJournal(file);
+    expect((await journal.load()).map((r) => r.kind)).toEqual(["inflight", "processed", "inflight"]);
+    await journal.flush();
+    expect(journal.compactionError).toBeUndefined();
+    expect(readFileSync(file, "utf8").split("\n").filter((l) => l !== "").map((l) => (JSON.parse(l) as PendingRecord).callID)).toEqual(["c2"]);
+    expect((await journal.load()).map((r) => r.callID)).toEqual(["c2"]);
+    // The compacted file exists from now on: a missing one has vanished.
+    rmSync(file);
+    await expect(journal.load()).rejects.toThrow(PENDING_JOURNAL_VANISHED);
+  });
+
+  it("no compaction while another live process writes the same journal (its writers mark)", async () => {
+    const file = join(dir, "pending.jsonl");
+    const lines = [rec("inflight", { callID: "c1", parent: "p1", child: "k1", at: NOW }), rec("processed", { callID: "c1", child: "k1", at: NOW })];
+    writeFileSync(file, lines.map((r) => `${JSON.stringify(r)}\n`).join(""));
+    mkdirSync(join(dir, "pending.writers"), { recursive: true });
+    writeFileSync(join(dir, "pending.writers", `${process.ppid}.other`), "{}\n");
+    const journal = createPendingFileJournal(file);
+    await journal.load();
+    await journal.flush();
+    expect(readFileSync(file, "utf8").split("\n").filter((l) => l !== "")).toHaveLength(2);
+  });
+
+  it("compactAtStart: false keeps the file as it is", async () => {
+    const file = join(dir, "pending.jsonl");
+    writeFileSync(file, `${JSON.stringify(rec("processed", { callID: "c1", child: "k1" }))}\n`);
+    const journal = createPendingFileJournal(file, { compactAtStart: false });
+    await journal.load();
+    await journal.flush();
+    expect(readFileSync(file, "utf8").split("\n").filter((l) => l !== "")).toHaveLength(1);
+  });
+
+  it("compact rewrites the file with the given records, behind earlier appends", async () => {
+    const file = join(dir, "pending.jsonl");
+    const journal = createPendingFileJournal(file, { compactAtStart: false });
+    void journal.append(rec("inflight", { callID: "c1" }));
+    await journal.compact([rec("inflight", { callID: "c9" })]);
+    expect((await journal.load()).map((r) => r.callID)).toEqual(["c9"]);
+  });
+});
+
+describe("pending journal dir (QA-2.1-8)", () => {
+  it("is per user and durable: XDG_STATE_HOME when absolute (not on Windows), else ~/.local/state", () => {
+    const home = join(dir, "home");
+    const fallback = join(home, ".local", "state", "opencode-model-router");
+    expect(resolvePendingJournalDir({ homedir: home, platform: "linux" })).toBe(fallback);
+    expect(resolvePendingJournalDir({ homedir: home, platform: "linux", xdgStateHome: join(dir, "xdg") })).toBe(join(dir, "xdg", "opencode-model-router"));
+    expect(resolvePendingJournalDir({ homedir: home, platform: "linux", xdgStateHome: "relative/state" })).toBe(fallback);
+    expect(resolvePendingJournalDir({ homedir: home, platform: "linux", xdgStateHome: "" })).toBe(fallback);
+    expect(resolvePendingJournalDir({ homedir: home, platform: "win32", xdgStateHome: join(dir, "xdg") })).toBe(fallback);
+  });
+
+  it("never resolves into the temp directory on its own", () => {
+    const resolved = resolvePendingJournalDir({ homedir: "/home/u", platform: "linux" });
+    expect(resolved.startsWith(tmpdir())).toBe(false);
+  });
+});
+
+describe("compactPendingRecords (QA-2.1-8)", () => {
+  const label = (r: PendingRecord): string => `${r.kind}:${String(r.handle ?? r.callID ?? "")}`;
+
+  it("drops superseded, verified and closed records and keeps unknown kinds, in journal order", () => {
+    const records = [
+      rec("entry", { handle: "vrf_1", parent: "p1", state: "unverified", createdAt: NOW }),
+      rec("state", { handle: "vrf_1", state: "verifying", at: NOW }),
+      rec("state", { handle: "vrf_1", state: "unverified", at: NOW }),
+      rec("entry", { handle: "vrf_2", parent: "p1", state: "unverified", createdAt: NOW }),
+      rec("state", { handle: "vrf_2", state: "verified", at: NOW }),
+      rec("state", { handle: "vrf_unknown", state: "verified", at: NOW }),
+      rec("hold", { handle: "vrf_h", parent: "p1", child: "k1", callID: "c1" }),
+      rec("hold-text", { handle: "vrf_h", text: "t" }),
+      rec("posting", { handle: "vrf_h", text: "v" }),
+      rec("posted", { handle: "vrf_h" }),
+      rec("inflight", { callID: "c9", parent: "p1", child: "k9", at: NOW }),
+      rec("processed", { callID: "c9", child: "k9" }),
+      rec("future-kind", { x: 1 }),
+    ];
+    const kept = compactPendingRecords(records, { now: NOW });
+    expect(kept.map(label)).toEqual(["entry:vrf_1", "state:vrf_1", "hold:vrf_h", "posted:vrf_h", "future-kind:"]);
+    expect(kept[1]?.state).toBe("unverified");
+    // The dormant fold reads the same sessions from the compacted journal.
+    expect(foldDormantRecords(kept, { now: NOW, ttlMs: TTL }).sessions).toEqual(foldDormantRecords(records, { now: NOW, ttlMs: TTL }).sessions);
+  });
+
+  it("an open hold keeps its hold-text and newest posting (QA-2.1-2)", () => {
+    const kept = compactPendingRecords(
+      [
+        rec("hold", { handle: "vrf_h", parent: "p1", child: "k1", callID: "c1" }),
+        rec("hold-text", { handle: "vrf_h", text: "t1" }),
+        rec("posting", { handle: "vrf_h", text: "v1" }),
+        rec("posting", { handle: "vrf_h", text: "v2" }),
+      ],
+      { now: NOW },
+    );
+    expect(kept.map((r) => [r.kind, r.text])).toEqual([
+      ["hold", undefined],
+      ["hold-text", "t1"],
+      ["posting", "v2"],
+    ]);
+  });
+
+  it("a tomb and a forget close their records (and go themselves); later records stay", () => {
+    const kept = compactPendingRecords(
+      [
+        rec("entry", { handle: "vrf_t", parent: "p1", state: "held", createdAt: NOW }),
+        rec("hold", { handle: "vrf_t", parent: "p1", child: "k1", callID: "c1" }),
+        rec("inflight", { callID: "c1", parent: "p1", child: "k1", at: NOW }),
+        rec("tomb", { handle: "vrf_t", callID: "c1" }),
+        rec("entry", { handle: "vrf_f", parent: "p2", state: "unverified", createdAt: NOW }),
+        rec("forget", { session: "p2" }),
+        rec("entry", { handle: "vrf_after", parent: "p2", state: "unverified", createdAt: NOW }),
+      ],
+      { now: NOW },
+    );
+    expect(kept.map(label)).toEqual(["entry:vrf_after"]);
+  });
+
+  it("with ttlMs, unheld entries and inflight records past it go; held entries stay", () => {
+    const kept = compactPendingRecords(
+      [
+        rec("entry", { handle: "vrf_old", parent: "p1", state: "unverified", createdAt: NOW - TTL }),
+        rec("entry", { handle: "vrf_held", parent: "p1", state: "held", createdAt: NOW - TTL }),
+        rec("inflight", { callID: "old", parent: "p1", child: "k1", at: NOW - TTL - 1 }),
+        rec("inflight", { callID: "edge", parent: "p1", child: "k2", at: NOW - TTL }),
+      ],
+      { now: NOW, ttlMs: TTL },
+    );
+    expect(kept.map(label)).toEqual(["entry:vrf_held", "inflight:edge"]);
+  });
+
+  it("the dormant fold keeps at most MAX_DORMANT_POSTED_HOLDS posted placeholders, oldest dropped first, never an open hold", () => {
+    const records: PendingRecord[] = [rec("hold", { handle: "vrf_open", parent: "p1", child: "k0", callID: "c0" })];
+    for (let i = 0; i < MAX_DORMANT_POSTED_HOLDS + 2; i += 1) {
+      records.push(rec("hold", { handle: `vrf_${i}`, parent: "p1", child: `k${i}`, callID: `c${i}` }), rec("posted", { handle: `vrf_${i}` }));
+    }
+    const holds = foldDormantRecords(records, { now: NOW, ttlMs: TTL }).sessions.get("p1")?.holds.filter((r) => r.kind === "hold") ?? [];
+    expect(holds).toHaveLength(MAX_DORMANT_POSTED_HOLDS + 1);
+    expect(holds[0]?.handle).toBe("vrf_open");
+    expect(holds[1]?.handle).toBe("vrf_2");
   });
 });
 
@@ -563,30 +775,103 @@ describe("pending registry: held entries across a restart (R20)", () => {
     if (handle !== undefined) reg.releaseHandle(handle);
     expect(reg.reserveHandle("")).toBeUndefined();
   });
+
+  it("a reservation nobody registers nor releases frees its slot after the reservation TTL (QA-2.1-4)", () => {
+    let t = NOW;
+    const reg = createPendingRegistry({ ttlMs: TTL, maxVerifyingMs: 60_000, now: () => t, random: counterRandom(0), maxPerSession: 1, reservationTtlMs: 1000 });
+    expect(reg.reserveHandle("p1")).toMatch(HANDLE_PATTERN);
+    expect(reg.hasSlot("p1")).toBe(false);
+    t = NOW + 999;
+    expect(reg.hasSlot("p1")).toBe(false);
+    t = NOW + 1000;
+    expect(reg.hasSlot("p1")).toBe(true);
+    expect(reg.reserveHandle("p1")).toMatch(HANDLE_PATTERN);
+  });
+
+  it("the default reservation TTL outlives the background sweep (6 h)", () => {
+    let t = NOW;
+    const reg = createPendingRegistry({ ttlMs: TTL, maxVerifyingMs: 60_000, now: () => t, random: counterRandom(0), maxPerSession: 1 });
+    reg.reserveHandle("p1");
+    t = NOW + 6 * 3600_000;
+    expect(reg.hasSlot("p1")).toBe(false);
+    t = NOW + HELD_RESERVATION_TTL_MS;
+    expect(reg.hasSlot("p1")).toBe(true);
+  });
 });
 
 describe("claim files (memo 11.3)", () => {
   const alive = (pids: number[]) => (pid: number) => pids.includes(pid);
 
-  it("the first process takes the claim and writes {pid, at}", () => {
+  // QA-2.1-13: the body carries the process token too (PID reuse); the tokens below stand for two processes.
+  it("the first process takes the claim and writes {pid, token, at}", () => {
+    const claims = join(dir, "pending.claims");
+    expect(claimPendingSession(claims, "ses_1", { pid: 100, now: 5, isAlive: alive([]), token: "tok-a" })).toBe(true);
+    const body: unknown = JSON.parse(readFileSync(join(claims, "ses_1"), "utf8"));
+    expect(body).toEqual({ pid: 100, token: "tok-a", at: 5 });
+  });
+
+  it("without a token seam the body still names the process with a module token", () => {
     const claims = join(dir, "pending.claims");
     expect(claimPendingSession(claims, "ses_1", { pid: 100, now: 5, isAlive: alive([]) })).toBe(true);
-    const body: unknown = JSON.parse(readFileSync(join(claims, "ses_1"), "utf8"));
-    expect(body).toEqual({ pid: 100, at: 5 });
+    const body = JSON.parse(readFileSync(join(claims, "ses_1"), "utf8")) as { pid: number; token: unknown; at: number };
+    expect(body.pid).toBe(100);
+    expect(body.at).toBe(5);
+    expect(body.token).toMatch(/^[0-9a-f]{16}$/);
   });
 
   it("a second live process is refused", () => {
     const claims = join(dir, "pending.claims");
+    claimPendingSession(claims, "ses_1", { pid: 100, now: 5, isAlive: alive([]), token: "tok-a" });
+    expect(claimPendingSession(claims, "ses_1", { pid: 200, now: 6, isAlive: alive([100]), token: "tok-b" })).toBe(false);
+    expect(JSON.parse(readFileSync(join(claims, "ses_1"), "utf8"))).toEqual({ pid: 100, token: "tok-a", at: 5 });
+  });
+
+  it("a second live process is refused even when it shares the module token (two hosts in one test process)", () => {
+    const claims = join(dir, "pending.claims");
     claimPendingSession(claims, "ses_1", { pid: 100, now: 5, isAlive: alive([]) });
     expect(claimPendingSession(claims, "ses_1", { pid: 200, now: 6, isAlive: alive([100]) })).toBe(false);
-    expect(JSON.parse(readFileSync(join(claims, "ses_1"), "utf8"))).toEqual({ pid: 100, at: 5 });
   });
 
   it("a claim of a dead pid is stale and is taken over", () => {
     const claims = join(dir, "pending.claims");
-    claimPendingSession(claims, "ses_1", { pid: 100, now: 5, isAlive: alive([]) });
-    expect(claimPendingSession(claims, "ses_1", { pid: 200, now: 6, isAlive: alive([]) })).toBe(true);
-    expect(JSON.parse(readFileSync(join(claims, "ses_1"), "utf8"))).toEqual({ pid: 200, at: 6 });
+    claimPendingSession(claims, "ses_1", { pid: 100, now: 5, isAlive: alive([]), token: "tok-a" });
+    expect(claimPendingSession(claims, "ses_1", { pid: 200, now: 6, isAlive: alive([]), token: "tok-b" })).toBe(true);
+    expect(JSON.parse(readFileSync(join(claims, "ses_1"), "utf8"))).toEqual({ pid: 200, token: "tok-b", at: 6 });
+  });
+
+  it("a live pid whose claim is older than staleMs is a reused pid and is taken over (QA-2.1-13)", () => {
+    const claims = join(dir, "pending.claims");
+    claimPendingSession(claims, "ses_1", { pid: 100, now: 5, isAlive: alive([]), token: "tok-a" });
+    expect(claimPendingSession(claims, "ses_1", { pid: 200, now: 5 + 1000, isAlive: alive([100]), token: "tok-b", staleMs: 1000 })).toBe(false);
+    expect(claimPendingSession(claims, "ses_1", { pid: 200, now: 5 + 1001, isAlive: alive([100]), token: "tok-b", staleMs: 1000 })).toBe(true);
+    expect(CLAIM_STALE_MS).toBe(24 * 3600_000);
+  });
+
+  it("this pid with another token is a dead process whose pid was reused: taken over (QA-2.1-13)", () => {
+    const claims = join(dir, "pending.claims");
+    claimPendingSession(claims, "ses_1", { pid: 100, now: 5, isAlive: alive([]), token: "tok-old" });
+    expect(claimPendingSession(claims, "ses_1", { pid: 100, now: 6, isAlive: alive([100]), token: "tok-new" })).toBe(true);
+    expect(JSON.parse(readFileSync(join(claims, "ses_1"), "utf8"))).toEqual({ pid: 100, token: "tok-new", at: 6 });
+  });
+
+  it("releasePendingClaim removes only this process's own claim (QA-2.1-13)", () => {
+    const claims = join(dir, "pending.claims");
+    claimPendingSession(claims, "ses_1", { pid: 100, now: 5, isAlive: alive([]), token: "tok-a" });
+    expect(releasePendingClaim(claims, "ses_1", "tok-b")).toBe(false);
+    expect(existsSync(join(claims, "ses_1"))).toBe(true);
+    expect(releasePendingClaim(claims, "ses_1", "tok-a")).toBe(true);
+    expect(existsSync(join(claims, "ses_1"))).toBe(false);
+    expect(releasePendingClaim(claims, "ses_missing", "tok-a")).toBe(false);
+  });
+
+  it("refreshPendingClaims re-stamps only this process's own claims (QA-2.1-13)", () => {
+    const claims = join(dir, "pending.claims");
+    claimPendingSession(claims, "ses_1", { pid: 100, now: 5, isAlive: alive([]), token: "tok-a" });
+    claimPendingSession(claims, "ses_2", { pid: 200, now: 5, isAlive: alive([]), token: "tok-b" });
+    refreshPendingClaims(claims, ["ses_1", "ses_2", "ses_missing"], { pid: 100, now: 50, token: "tok-a" });
+    expect(JSON.parse(readFileSync(join(claims, "ses_1"), "utf8"))).toEqual({ pid: 100, token: "tok-a", at: 50 });
+    expect(JSON.parse(readFileSync(join(claims, "ses_2"), "utf8"))).toEqual({ pid: 200, token: "tok-b", at: 5 });
+    expect(existsSync(join(claims, "ses_missing"))).toBe(false);
   });
 
   it("this process's own earlier claim is stale (a restarted pid reuse) and is retaken", () => {

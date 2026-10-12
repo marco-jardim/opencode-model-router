@@ -1157,6 +1157,8 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     const home = mkdtempSync(join(tmpdir(), "router-v2-ingest-"));
     const outcomes = join(home, "outcomes");
     vi.stubEnv("HOME", home); vi.stubEnv("USERPROFILE", home);
+    // QA-2.1-8: the per-user pending journal dir resolves inside this home on every platform, never in the runner's own state dir.
+    vi.stubEnv("XDG_STATE_HOME", join(home, ".local", "state"));
     // QA-2.1-4: every config, the static ones included, names an explicit empty outcomes directory, and the tests
     // assert it stays empty. A routing block without `engine` is static.
     mkdirSync(outcomes, { recursive: true });

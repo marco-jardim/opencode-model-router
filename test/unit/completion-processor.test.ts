@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ATTEMPT_SWEEP_AGE_MS,
+  DECIDED_LIVE_MS,
   EARLY_END_TTL_MS,
   MAX_CALL_RECORDS,
   PENDING_GUARANTEES_TEXT,
@@ -13,6 +14,7 @@ import {
   renderCompleted,
   renderHeld,
   renderInFlight,
+  verdictText,
   type Attempt,
   type BackgroundDecision,
   type CallRecord,
@@ -44,6 +46,8 @@ interface Rig {
   warns: string[];
   closed: Array<{ attempt: Attempt; cause: CloseCause }>;
   claims: Set<string>;
+  /** QA-2.1-4: handles given back through `releaseHeld`. */
+  releasedHandles: string[];
   behavior: {
     finish: (input: FinishInput) => Promise<FinishResult>;
     read: (child: string) => Promise<{ text?: string } | undefined>;
@@ -81,6 +85,7 @@ function rig(opts: { withCapture?: boolean } = {}): Rig {
   const posts: Array<Parameters<SyntheticFn>[0]> = [];
   const finishCalls: FinishInput[] = [];
   const released: string[] = [];
+  const releasedHandles: string[] = [];
   const behavior: Rig["behavior"] = {
     finish: async () => finishResult(),
     read: async () => ({ text: "child text" }),
@@ -112,9 +117,10 @@ function rig(opts: { withCapture?: boolean } = {}): Rig {
     persist,
     now: () => clock.t,
     logger,
+    releaseHeld: (handle) => void releasedHandles.push(handle),
     ...(opts.withCapture === true ? { captureDelta: (callID: string, child: string) => (behavior.capture ?? (async () => undefined))(callID, child) } : {}),
   });
-  return { clock, reg, proc, held, finishCalls, released, records, processedKeys, posts, warns, closed, claims, behavior };
+  return { clock, reg, proc, held, finishCalls, released, records, processedKeys, posts, warns, closed, claims, releasedHandles, behavior };
 }
 
 function callRecord(callID: string, over: Partial<CallRecord> = {}): CallRecord {
@@ -152,6 +158,11 @@ function completion(state: "completed" | "error" | "cancelled" = "completed", bo
 afterEach(() => {
   vi.useRealTimers();
 });
+
+/** Lets every promise chain started so far settle (a macrotask turn). */
+async function flushAll(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}
 
 describe("registry: decide / acknowledge / claims", () => {
   it("decide claims a callID once per process-wide set", () => {
@@ -752,6 +763,64 @@ describe("completion processor: held results", () => {
     expect(a.state).toBe("held");
     expect(r.warns).toContain("[router] held verdict failed");
   });
+
+  it("a held register keeps its reserved handle; every other end of a held attempt gives it back (QA-2.1-4)", async () => {
+    const gated = rig();
+    gated.behavior.finish = async () => finishResult({ verification: { kind: "held", handle: "vrf_h1" } });
+    await launch(gated, "c1", "ses_c1", { handle: "vrf_h1" });
+    await gated.proc.process("ses_c1", completion());
+    expect(gated.releasedHandles).toEqual([]);
+
+    const failed = rig();
+    await launch(failed, "c1", "ses_c1", { handle: "vrf_h1" });
+    await failed.proc.process("ses_c1", completion("error", "boom"));
+    expect(failed.releasedHandles).toEqual(["vrf_h1"]);
+
+    const interrupted = rig();
+    await launch(interrupted, "c1", "ses_c1", { handle: "vrf_h1" });
+    await interrupted.proc.process("ses_c1", completion("cancelled", "stopped"));
+    expect(interrupted.releasedHandles).toEqual(["vrf_h1"]);
+
+    const answered = rig();
+    answered.behavior.finish = async () => finishResult({ verification: { kind: "required", verdict: "PASS" } });
+    await launch(answered, "c1", "ses_c1", { handle: "vrf_h1" });
+    await answered.proc.process("ses_c1", completion());
+    expect(answered.releasedHandles).toEqual(["vrf_h1"]);
+
+    const lost = rig();
+    await launch(lost, "c1", "ses_c1", { handle: "vrf_h1" });
+    await lost.proc.process("ses_c1", { kind: "recovery", outcome: "lost", text: undefined, at: 7 });
+    expect(lost.releasedHandles).toEqual(["vrf_h1"]);
+
+    const thrown = rig();
+    thrown.behavior.finish = async () => {
+      throw new Error("gate exploded");
+    };
+    await launch(thrown, "c1", "ses_c1", { handle: "vrf_h1" });
+    await thrown.proc.process("ses_c1", completion());
+    expect(thrown.releasedHandles).toEqual(["vrf_h1"]);
+
+    const closed = rig();
+    const a = await launch(closed, "c1", "ses_c1", { handle: "vrf_h1" });
+    await closed.proc.closeUnknown(a, "superseded");
+    expect(closed.releasedHandles).toEqual(["vrf_h1"]);
+    expect(closed.posts[0]?.text).toContain("not verified: superseded");
+
+    const plain = rig();
+    await launch(plain, "c1", "ses_c1");
+    await plain.proc.process("ses_c1", completion("error", "boom"));
+    expect(plain.releasedHandles).toEqual([]);
+  });
+
+  it("a held attempt journals the child text with its hold before the gate runs (QA-2.1-6)", async () => {
+    const r = rig();
+    r.behavior.finish = async () => finishResult({ verification: { kind: "held", handle: "vrf_h1" } });
+    await launch(r, "c1", "ses_c1", { handle: "vrf_h1" });
+    await r.proc.process("ses_c1", completion("completed", "the child said"));
+    const kinds = r.records.map((x) => x.kind);
+    expect(r.records.find((x) => x.kind === "hold-text")).toMatchObject({ handle: "vrf_h1", text: "the child said" });
+    expect(kinds.indexOf("hold-text")).toBeLessThan(kinds.indexOf("processed"));
+  });
 });
 
 describe("completed provider: completedFor / endTurn", () => {
@@ -1082,11 +1151,17 @@ describe("held results: placeholder, matcher, refusal, verdict delivery (memo 5,
     expect(r.held.isHeld(CHILD)).toBe(false);
   });
 
-  it("a journal that throws on posting is logged and the hold stays active", async () => {
+  // QA-2.1-2 changed this contract: a journal failure no longer keeps the verdict back (the old test expected
+  // "[router] held verdict journal failed" and an active hold). The verdict is posted anyway, exactly once, and a journal
+  // failure is never retried through synthetic.
+  it("a journal that throws on posting is logged and the verdict is posted anyway, once (QA-2.1-2)", async () => {
     const warns: string[] = [];
+    const posts: string[] = [];
     let fail = false;
     const held = createHeldResults({
-      synthetic: async () => undefined,
+      synthetic: async (input) => {
+        posts.push(input.text);
+      },
       journal: {
         append: async () => {
           if (fail) throw new Error("ENOSPC");
@@ -1100,8 +1175,33 @@ describe("held results: placeholder, matcher, refusal, verdict delivery (memo 5,
     await held.hold({ handle: HANDLE, parentSessionID: PARENT, childSessionID: CHILD, callID: "c" });
     fail = true;
     await held.verdict(HANDLE, { verdict: "PASS", text: "x" });
-    expect(warns).toContain("[router] held verdict journal failed");
-    expect(held.isHeld(CHILD)).toBe(true);
+    await held.verdict(HANDLE, { verdict: "PASS", text: "x again" });
+    expect(warns).toContain("[router] held verdict posting not journaled; posting anyway");
+    expect(posts).toHaveLength(1);
+    expect(held.isHeld(CHILD)).toBe(false);
+  });
+
+  it("a journal that throws on posted after a successful post never posts twice (QA-2.1-2)", async () => {
+    const posts: string[] = [];
+    const held = createHeldResults({
+      synthetic: async (input) => {
+        posts.push(input.text);
+      },
+      journal: {
+        append: async (record) => {
+          if (record.kind === "posted") throw new Error("ENOSPC");
+        },
+        hasProcessed: () => false,
+      },
+      available: true,
+      logger: { warn: () => undefined },
+      sleep: async () => undefined,
+    });
+    await held.hold({ handle: HANDLE, parentSessionID: PARENT, childSessionID: CHILD, callID: "c" });
+    await held.verdict(HANDLE, { verdict: "FAIL", text: "x" });
+    await held.verdict(HANDLE, { verdict: "FAIL", text: "x" });
+    expect(posts).toHaveLength(1);
+    expect(held.isHeld(CHILD)).toBe(false);
   });
 
   it("forgetSession drops the session's holds and journals a forget record", async () => {
@@ -1149,6 +1249,133 @@ describe("held results: placeholder, matcher, refusal, verdict delivery (memo 5,
     expect(r.held.isHeld("ses_2")).toBe(false);
     expect(r.held.isHeld("ses_3")).toBe(false);
     expect(r.held.applyText(PARENT, '<subagent sessionID="ses_2" state="completed">x</subagent>')).toBe(heldPlaceholder("vrf_2", "ses_2"));
+  });
+
+  it("a verdict that settles before hold inserts the entry is queued and delivered by hold (QA-2.1-2)", async () => {
+    const r = rig();
+    await r.held.verdict(HANDLE, { verdict: "PASS", text: "early" });
+    expect(r.posts).toEqual([]);
+    await r.held.hold({ handle: HANDLE, parentSessionID: PARENT, childSessionID: CHILD, callID: "c1" });
+    await flushAll();
+    expect(r.posts).toHaveLength(1);
+    expect(r.posts[0]?.text).toContain("early");
+    expect(r.held.isHeld(CHILD)).toBe(false);
+  });
+
+  it("a verdict that settles while the hold record is being written waits for it and is posted once (QA-2.1-2)", async () => {
+    const r = rig();
+    const holding = r.held.hold({ handle: HANDLE, parentSessionID: PARENT, childSessionID: CHILD, callID: "c1" });
+    // The entry exists before the fsync resolves: it is held and a verdict joins it instead of being dropped.
+    expect(r.held.isHeld(CHILD)).toBe(true);
+    const delivering = r.held.verdict(HANDLE, { verdict: "FAIL", text: "during fsync" });
+    await holding;
+    await delivering;
+    expect(r.posts).toHaveLength(1);
+    expect(r.records.map((x) => x.kind)).toEqual(["hold", "posting", "posted"]);
+  });
+
+  it("the posting record carries the verdict text (QA-2.1-2, R21)", async () => {
+    const r = await heldRig();
+    await r.held.verdict(HANDLE, { verdict: "PASS", text: "the findings" });
+    expect(r.records.find((x) => x.kind === "posting")).toMatchObject({ handle: HANDLE, text: verdictText(HANDLE, CHILD, { verdict: "PASS", text: "the findings" }) });
+  });
+
+  it("noteText journals the child text with the hold (hold-text, fsync) and restore hands it back for the gate (QA-2.1-6)", async () => {
+    const r = await heldRig();
+    await r.held.noteText(HANDLE, "the child said");
+    const note = r.records.find((x) => x.kind === "hold-text");
+    expect(note).toMatchObject({ handle: HANDLE, text: "the child said" });
+    const next = rig();
+    const restored = next.held.restore(r.records);
+    expect(restored.reposts).toEqual([]);
+    expect(restored.unverified).toEqual([{ handle: HANDLE, parentSessionID: PARENT, childSessionID: CHILD, callID: "c1", childText: "the child said" }]);
+    expect(next.held.isHeld(CHILD)).toBe(true);
+  });
+
+  it("a restored posting without posted is handed back as a repost; settleRestored(true) records posted without posting (R21)", async () => {
+    const r = rig();
+    const restored = r.held.restore([
+      { v: 1, kind: "hold", handle: HANDLE, parent: PARENT, child: CHILD, callID: "c1" },
+      { v: 1, kind: "posting", handle: HANDLE, text: "journaled verdict" },
+    ]);
+    expect(restored.reposts).toEqual([{ handle: HANDLE, parentSessionID: PARENT, childSessionID: CHILD, text: "journaled verdict" }]);
+    expect(restored.unverified).toEqual([]);
+    // A new verdict for a posting hold never posts a second entry.
+    await r.held.verdict(HANDLE, { verdict: "PASS", text: "again" });
+    expect(r.posts).toEqual([]);
+    await r.held.settleRestored(HANDLE, true);
+    expect(r.posts).toEqual([]);
+    expect(r.records.map((x) => x.kind)).toEqual(["posted"]);
+    expect(r.held.isHeld(CHILD)).toBe(false);
+  });
+
+  it("settleRestored(false) re-posts the journaled verdict text, once (R21)", async () => {
+    const r = rig();
+    r.held.restore([
+      { v: 1, kind: "hold", handle: HANDLE, parent: PARENT, child: CHILD, callID: "c1" },
+      { v: 1, kind: "posting", handle: HANDLE, text: "journaled verdict" },
+    ]);
+    await r.held.settleRestored(HANDLE, false);
+    await r.held.settleRestored(HANDLE, false);
+    expect(r.posts.map((p) => p.text)).toEqual(["journaled verdict"]);
+    expect(r.records.map((x) => x.kind)).toEqual(["posting", "posted"]);
+  });
+
+  it("a posted hold restores as an inactive placeholder: no repost, no gate, the raw completion stays hidden (QA-2.1-10)", () => {
+    const r = rig();
+    const restored = r.held.restore([
+      { v: 1, kind: "hold", handle: HANDLE, parent: PARENT, child: CHILD, callID: "c1" },
+      { v: 1, kind: "posted", handle: HANDLE },
+    ]);
+    expect(restored).toEqual({ reposts: [], unverified: [] });
+    expect(r.held.isHeld(CHILD)).toBe(false);
+    expect(r.held.heldFor(PARENT)).toEqual([]);
+    expect(r.held.applyText(PARENT, `<subagent sessionID="${CHILD}" state="completed">raw</subagent>`)).toBe(PH);
+  });
+
+  it("a second restore of a known hold never resets it", async () => {
+    const r = await heldRig();
+    await r.held.verdict(HANDLE, { verdict: "PASS", text: "ok" });
+    const again = r.held.restore([{ v: 1, kind: "hold", handle: HANDLE, parent: PARENT, child: CHILD, callID: "c1" }]);
+    expect(again).toEqual({ reposts: [], unverified: [] });
+    expect(r.held.isHeld(CHILD)).toBe(false);
+  });
+});
+
+describe("bookkeeping bounds (QA-2.1-13)", () => {
+  it("dispose gives back exactly the call claims this instance took; another instance's claims stay", () => {
+    const claims = new Set<string>(["bg:foreign"]);
+    const logger = { warn: () => undefined };
+    const reg = createInFlightRegistry({ now: () => 1, logger, claims });
+    expect(reg.decide(callRecord("c1"))).toBe(true);
+    expect(reg.decide(callRecord("c2"))).toBe(true);
+    expect(claims).toEqual(new Set(["bg:foreign", "bg:c1", "bg:c2"]));
+    reg.dispose();
+    expect(claims).toEqual(new Set(["bg:foreign"]));
+    // A reloaded instance can decide the same calls again.
+    const next = createInFlightRegistry({ now: () => 1, logger, claims });
+    expect(next.decide(callRecord("c1"))).toBe(true);
+  });
+
+  it("forgetSession gives the session's claims back", () => {
+    const claims = new Set<string>();
+    const reg = createInFlightRegistry({ now: () => 1, logger: { warn: () => undefined }, claims });
+    reg.decide(callRecord("c1"));
+    reg.decide(callRecord("c2", { parentSessionID: "ses_other" }));
+    reg.forgetSession(PARENT);
+    expect(claims).toEqual(new Set(["bg:c2"]));
+  });
+
+  it("a decision waiting for its acknowledgement counts as live only while fresh and only when it is a background one", () => {
+    let t = 1_000_000;
+    const reg = createInFlightRegistry({ now: () => t, logger: { warn: () => undefined }, claims: new Set() });
+    reg.decide(callRecord("c1", { at: t }));
+    reg.decide(callRecord("c2", { at: t, decision: { background: false, hold: false, reason: "estimate" } }));
+    expect(reg.liveCount()).toBe(1);
+    t += DECIDED_LIVE_MS;
+    expect(reg.liveCount()).toBe(1);
+    t += 1;
+    expect(reg.liveCount()).toBe(0);
   });
 });
 

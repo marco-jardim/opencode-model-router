@@ -193,14 +193,23 @@ export interface FinishApi {
   canHold(parentSessionID: string): boolean;
   /** `pending.reserveHandle`. */
   reserveHeld(parentSessionID: string, callID: string): string | undefined;
+  /**
+   * `pending.releaseHandle` (QA-2.1-3, QA-2.1-4): gives a reserved handle back when its attempt ends without a held register
+   * (the hold write failed, the child failed or was interrupted, the attempt was closed unknown). Idempotent. Optional for
+   * compatibility: absent, the reservation expires after `HELD_RESERVATION_TTL_MS` (verify/pending.ts).
+   */
+  releaseHeld?(handle: string): void;
   finish(input: FinishInput): Promise<FinishResult>;
   /**
    * The ONE journal (memo §11): `pending.jsonl`, shared by the pending store, the in-flight registry and the held results.
    * `inflight` and `hold` appends are fsync'd by the caller (`{fsync: true}`).
    */
   journal: InflightJournal;
-  /** The change set of a dispatch at child end (verify/dispatch.ts `captureDelta`, 2.1.4.b); absent = none. */
-  captureDelta?(callID: string, childSessionID: string): Promise<unknown>;
+  /**
+   * The change set of a dispatch at child end (verify/dispatch.ts `captureDelta`, 2.1.4.b); absent = none. QA-2.1-7:
+   * `dispatchID` is the change-set key `task:<parent>:<callID>`; absent, the implementation derives it from the call id.
+   */
+  captureDelta?(callID: string, childSessionID: string, dispatchID?: string): Promise<unknown>;
   /**
    * Memo §4.1 step 3 / §11.3: reloads `pending.jsonl` (parsed per line, folded by key, TTL applied) and keeps the surviving
    * records dormant. Rejects when the file cannot be read (the caller then fails closed, §12).
@@ -288,7 +297,12 @@ export interface InFlightRegistry {
   forgetSession(sessionID: string): void;
   /** Open for longer than `ATTEMPT_SWEEP_AGE_MS` becomes `closed-unknown`; the closed attempts are returned. */
   sweep(now: number): readonly Attempt[];
+  /** Gives this instance's process-wide call claims back (plugin dispose / reload, QA-2.1-13). */
+  dispose(): void;
 }
+
+/** QA-2.1-13: a background decision counts as live this long while it waits for its acknowledgement. */
+export const DECIDED_LIVE_MS = EARLY_END_TTL_MS;
 
 /** Why the registry closed an open attempt without an end (the owner posts the verdict of a held one). */
 export type CloseCause = "superseded" | "sweep";
@@ -333,6 +347,12 @@ export function createInFlightRegistry(deps: {
   onClosed?(attempt: Attempt, cause: CloseCause): void;
 }): InFlightRegistry {
   const claims = deps.claims ?? PROCESS_CLAIMS;
+  /** QA-2.1-13: the claims this instance added, so `forgetSession` and `dispose` give exactly those back. */
+  const own = new Set<string>();
+  function releaseClaim(callID: string): void {
+    const claim = `bg:${callID}`;
+    if (own.delete(claim)) claims.delete(claim);
+  }
   const calls = new Map<string, CallRecord | Attempt>();
   const attempts = new Map<string, Attempt>();
   const newestByChild = new Map<string, string>();
@@ -383,6 +403,7 @@ export function createInFlightRegistry(deps: {
       const claim = `bg:${rec.callID}`;
       if (claims.has(claim)) return false;
       claims.add(claim);
+      addBounded(own, claim, MAX_CLAIMS);
       if (claims.size > MAX_CLAIMS) {
         for (const old of claims) {
           if (claims.size <= MAX_CLAIMS) break;
@@ -467,8 +488,14 @@ export function createInFlightRegistry(deps: {
 
     liveCount() {
       let n = 0;
+      const at = deps.now();
       for (const rec of calls.values()) {
-        if (!isAttempt(rec) || OPEN_STATES.has(rec.state)) n += 1;
+        if (isAttempt(rec)) {
+          if (OPEN_STATES.has(rec.state)) n += 1;
+        } else if (rec.decision.background === true && at - rec.at <= DECIDED_LIVE_MS) {
+          // QA-2.1-13: only a fresh background decision awaits its acknowledgement; a foreground one or a stale one is not live.
+          n += 1;
+        }
       }
       return n;
     },
@@ -477,10 +504,17 @@ export function createInFlightRegistry(deps: {
       for (const [callID, rec] of calls) {
         if (rec.parentSessionID === sessionID || (isAttempt(rec) && rec.childSessionID === sessionID)) {
           calls.delete(callID);
+          releaseClaim(callID);
           if (isAttempt(rec)) dropAttempt(rec.key);
         }
       }
       earlyEnds.delete(sessionID);
+    },
+
+    dispose() {
+      // QA-2.1-13: a disposed instance (a reload) gives its process-wide call claims back.
+      for (const claim of own) claims.delete(claim);
+      own.clear();
     },
 
     sweep(now) {
@@ -493,7 +527,10 @@ export function createInFlightRegistry(deps: {
       }
       for (const [child, parked] of earlyEnds) if (now - parked.seen > EARLY_END_TTL_MS) earlyEnds.delete(child);
       for (const [callID, rec] of calls) {
-        if (!isAttempt(rec) && now - rec.at > ATTEMPT_SWEEP_AGE_MS) calls.delete(callID);
+        if (!isAttempt(rec) && now - rec.at > ATTEMPT_SWEEP_AGE_MS) {
+          calls.delete(callID);
+          releaseClaim(callID);
+        }
       }
       return closed;
     },
@@ -517,6 +554,31 @@ export interface HeldRecord {
   label?: string;
   /** The completion body known to the owner (persisted digest or child text); lets the matcher cut precisely. */
   body?: string;
+  /** The child's final text, persisted with the hold so a restart can re-run the gate (QA-2.1-6). */
+  childText?: string;
+}
+
+/** A restored hold whose verdict was being posted (`posting` without `posted`): re-post after a parent check (R21). */
+export interface RestoredPosting {
+  handle: string;
+  parentSessionID: string;
+  childSessionID: string;
+  text: string;
+}
+
+/** A restored hold with no verdict yet: the gate runs again at adoption (R20, QA-2.1-6). */
+export interface RestoredHold {
+  handle: string;
+  parentSessionID: string;
+  childSessionID: string;
+  callID: string;
+  childText?: string;
+}
+
+/** What `HeldResults.restore` hands back to the adopter. */
+export interface RestoredHolds {
+  reposts: readonly RestoredPosting[];
+  unverified: readonly RestoredHold[];
 }
 
 export interface HeldEntryView {
@@ -529,8 +591,13 @@ export interface HeldEntryView {
 export interface HeldResults extends HeldSink {
   /** Context AND compaction hooks registered AND `ctx.session.synthetic` is a function. */
   readonly available: boolean;
-  /** Appends the hold record (fsync), then makes it active. */
+  /**
+   * Makes the hold active, then appends the hold record (fsync); a failed append removes it again and rejects. A verdict
+   * that arrives before the append settles waits for it; one that arrives before `hold` is queued (QA-2.1-2).
+   */
   hold(rec: HeldRecord): Promise<void>;
+  /** Persists the child's final text with an active hold (`hold-text`), so a restart can re-run the gate (QA-2.1-6). */
+  noteText(handle: string, text: string): Promise<void>;
   /** True until the verdict entry is posted. */
   isHeld(child: string): boolean;
   /** Pure (§7.1). */
@@ -543,7 +610,16 @@ export interface HeldResults extends HeldSink {
   refusal(sessionID: string, tool: string, args: unknown): string | undefined;
   heldFor(parent: string): readonly HeldEntryView[];
   forgetSession(sessionID: string): void;
-  restore(records: readonly PersistedRecord[]): void;
+  /**
+   * Restores adopted records: an unposted hold becomes active again, a posted one an inactive placeholder (QA-2.1-10).
+   * Returns the holds whose verdict was being posted and the holds that still need a verdict (R20, R21).
+   */
+  restore(records: readonly PersistedRecord[]): RestoredHolds;
+  /**
+   * Settles a restored `posting` hold (R21): `alreadyPosted` (the parent context carries the verdict's
+   * `metadata.router.handle`) records `posted`; otherwise the journaled verdict text is posted again.
+   */
+  settleRestored(handle: string, alreadyPosted: boolean): Promise<void>;
 }
 
 const SUBAGENT_CLOSE = "</subagent>";
@@ -598,7 +674,14 @@ interface HoldEntry extends HeldRecord {
   /** A post is in flight or was journaled as `posting`. */
   posting: boolean;
   status: string;
+  /** The verdict text being (or last) posted; journaled with `posting` (QA-2.1-2). */
+  verdictText?: string;
+  /** The `hold` append is in flight; a verdict arriving meanwhile waits for it (QA-2.1-2). */
+  ready?: Promise<boolean>;
 }
+
+/** Verdicts that arrive for a handle before its hold is inserted; consumed by `hold` (QA-2.1-2). */
+const MAX_EARLY_VERDICTS = 200;
 
 /**
  * Creates the held-result store (memo §5, §7). Holds are bounded per parent and globally; the placeholder of a
@@ -615,6 +698,7 @@ export function createHeldResults(deps: {
 }): HeldResults {
   const byHandle = new Map<string, HoldEntry>();
   const byParent = new Map<string, Map<string, HoldEntry>>();
+  const early = new Map<string, { v: HeldVerdict; at: number }>();
   const now = deps.now ?? (() => Date.now());
   const retryBase = deps.retryBaseMs ?? DEFAULT_RETRY_BASE_MS;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
@@ -694,10 +778,26 @@ export function createHeldResults(deps: {
   }
 
   async function post(entry: HoldEntry, v: HeldVerdict): Promise<void> {
-    const text = verdictText(entry.handle, entry.childSessionID, v);
-    await deps.journal.append({ v: 1, kind: "posting", handle: entry.handle, at: now() });
+    await postText(entry, verdictText(entry.handle, entry.childSessionID, v));
+  }
+
+  /**
+   * QA-2.1-2: deliver one verdict text. The text is journaled with `posting` (so the next start can re-post it, R21),
+   * a journal failure never blocks or repeats the post, and only a failed `synthetic` call is retried.
+   */
+  async function postText(entry: HoldEntry, text: string): Promise<void> {
+    entry.verdictText = text;
+    try {
+      await deps.journal.append({ v: 1, kind: "posting", handle: entry.handle, text, at: now() });
+    } catch (error) {
+      warnSafe(deps.logger, "[router] held verdict posting not journaled; posting anyway", {
+        handle: entry.handle,
+        error: errorText(error),
+      });
+    }
     let lastError: unknown;
-    for (let attempt = 0; attempt < SYNTHETIC_ATTEMPTS; attempt += 1) {
+    let delivered = false;
+    for (let attempt = 0; attempt < SYNTHETIC_ATTEMPTS && !delivered; attempt += 1) {
       try {
         await deps.synthetic({
           sessionID: entry.parentSessionID,
@@ -706,20 +806,46 @@ export function createHeldResults(deps: {
           metadata: { router: { kind: "held-verdict", handle: entry.handle, child: entry.childSessionID } },
           resume: true,
         });
-        await deps.journal.append({ v: 1, kind: "posted", handle: entry.handle, at: now() });
-        entry.active = false;
-        entry.status = "released";
-        return;
+        delivered = true;
       } catch (error) {
         lastError = error;
         if (attempt < SYNTHETIC_ATTEMPTS - 1) await sleep(retryBase * 2 ** attempt);
       }
     }
-    // Keep `posting`: the next start finds the journal entry and decides again (R21).
-    warnSafe(deps.logger, "[router] held verdict not posted; kept for the next start", {
-      handle: entry.handle,
-      error: errorText(lastError),
-    });
+    if (!delivered) {
+      // Keep `posting`: the next start finds the journal entry and decides again (R21).
+      warnSafe(deps.logger, "[router] held verdict not posted; kept for the next start", {
+        handle: entry.handle,
+        error: errorText(lastError),
+      });
+      return;
+    }
+    entry.active = false;
+    entry.status = "released";
+    entry.childText = undefined;
+    try {
+      await deps.journal.append({ v: 1, kind: "posted", handle: entry.handle, at: now() });
+    } catch (error) {
+      // Never post again for a journal failure: the parent context check at the next start finds the delivered post.
+      warnSafe(deps.logger, "[router] held verdict posted but not journaled", { handle: entry.handle, error: errorText(error) });
+    }
+  }
+
+  /** Delivers one verdict for an entry; waits for an in-flight `hold` append first. Never throws. */
+  async function deliver(entry: HoldEntry, v: HeldVerdict): Promise<void> {
+    if (entry.ready !== undefined && !(await entry.ready)) {
+      warnSafe(deps.logger, "[router] held verdict dropped: the hold was never journaled", { handle: entry.handle });
+      return;
+    }
+    if (!entry.active || entry.posting) return;
+    entry.posting = true;
+    try {
+      await post(entry, v);
+    } catch (error) {
+      warnSafe(deps.logger, "[router] held verdict post failed", { handle: entry.handle, error: errorText(error) });
+    } finally {
+      entry.posting = false;
+    }
   }
 
   return {
@@ -728,11 +854,47 @@ export function createHeldResults(deps: {
     async hold(rec) {
       if (!deps.available) throw new Error("holding is not available");
       if (!makeRoom(rec.parentSessionID)) throw new Error("hold capacity reached");
-      await deps.journal.append(
-        { v: 1, kind: "hold", handle: rec.handle, parent: rec.parentSessionID, child: rec.childSessionID, callID: rec.callID, at: now() },
-        { fsync: true },
-      );
-      insert({ ...rec, active: true, posting: false, status: "verifying" });
+      // QA-2.1-2: the entry exists before the fsync; a verdict that settles meanwhile waits for the write instead of being dropped.
+      let settle: (ok: boolean) => void = () => undefined;
+      const entry: HoldEntry = {
+        ...rec,
+        active: true,
+        posting: false,
+        status: "verifying",
+        ready: new Promise<boolean>((resolve) => {
+          settle = resolve;
+        }),
+      };
+      insert(entry);
+      try {
+        await deps.journal.append(
+          {
+            v: 1,
+            kind: "hold",
+            handle: rec.handle,
+            parent: rec.parentSessionID,
+            child: rec.childSessionID,
+            callID: rec.callID,
+            ...(rec.label === undefined ? {} : { label: rec.label }),
+            ...(rec.childText === undefined ? {} : { text: rec.childText }),
+            at: now(),
+          },
+          { fsync: true },
+        );
+      } catch (error) {
+        entry.active = false;
+        if (byHandle.get(rec.handle) === entry) remove(entry);
+        settle(false);
+        entry.ready = undefined;
+        throw error;
+      }
+      settle(true);
+      entry.ready = undefined;
+      const queued = early.get(rec.handle);
+      if (queued !== undefined) {
+        early.delete(rec.handle);
+        if (now() - queued.at <= EARLY_END_TTL_MS) void deliver(entry, queued.v);
+      }
     },
 
     isHeld(child) {
@@ -784,42 +946,127 @@ export function createHeldResults(deps: {
 
     async verdict(handle, v) {
       const entry = byHandle.get(handle);
-      if (entry === undefined || !entry.active || entry.posting) return;
-      entry.posting = true;
+      if (entry === undefined) {
+        // QA-2.1-2: the verdict settled before `hold` inserted the entry; `hold` delivers it.
+        early.delete(handle);
+        early.set(handle, { v, at: now() });
+        trimMap(early, MAX_EARLY_VERDICTS, () => false);
+        return;
+      }
+      await deliver(entry, v);
+    },
+
+    async noteText(handle, text) {
+      const entry = byHandle.get(handle);
+      if (entry === undefined || !entry.active) return;
+      entry.childText = text;
+      entry.body ??= text;
       try {
-        await post(entry, v);
+        await deps.journal.append({ v: 1, kind: "hold-text", handle, text, at: now() }, { fsync: true });
       } catch (error) {
-        warnSafe(deps.logger, "[router] held verdict journal failed", { handle, error: errorText(error) });
-      } finally {
-        entry.posting = false;
+        warnSafe(deps.logger, "[router] held child text not journaled", { handle, error: errorText(error) });
       }
     },
 
     forgetSession(sessionID) {
-      for (const entry of heldChildren(sessionID)) remove(entry);
+      for (const entry of heldChildren(sessionID)) {
+        remove(entry);
+        early.delete(entry.handle);
+      }
       deps.journal.append({ v: 1, kind: "forget", session: sessionID, at: now() }).catch((error: unknown) => {
         warnSafe(deps.logger, "[router] held forget not journaled", { sessionID, error: errorText(error) });
       });
     },
 
     restore(records) {
+      const restored: HoldEntry[] = [];
+      const postingText = new Map<string, string>();
+      const delivered = new Set<string>();
       for (const r of records) {
         if (r.kind === "hold" && typeof r.handle === "string" && typeof r.parent === "string" && typeof r.child === "string") {
-          insert({
+          // A hold this process already knows stays as it is (a second adoption never resets it).
+          if (byHandle.has(r.handle)) continue;
+          const entry: HoldEntry = {
             handle: r.handle,
             parentSessionID: r.parent,
             childSessionID: r.child,
             callID: typeof r.callID === "string" ? r.callID : "",
+            ...(typeof r.label === "string" ? { label: r.label } : {}),
+            ...(typeof r.text === "string" ? { childText: r.text, body: r.text } : {}),
             active: true,
             posting: false,
             status: "verifying",
-          });
-        } else if (r.kind === "posted" && typeof r.handle === "string") {
+          };
+          insert(entry);
+          restored.push(entry);
+        } else if (r.kind === "hold-text" && typeof r.handle === "string" && typeof r.text === "string") {
           const e = byHandle.get(r.handle);
-          if (e !== undefined) e.active = false;
+          if (e !== undefined && restored.includes(e)) {
+            e.childText = r.text;
+            e.body ??= r.text;
+          }
+        } else if (r.kind === "posting" && typeof r.handle === "string") {
+          if (typeof r.text === "string") postingText.set(r.handle, r.text);
+        } else if (r.kind === "posted" && typeof r.handle === "string") {
+          delivered.add(r.handle);
         } else if (r.kind === "forget" && typeof r.session === "string") {
           for (const e of heldChildren(r.session)) remove(e);
         }
+      }
+      const reposts: RestoredPosting[] = [];
+      const unverified: RestoredHold[] = [];
+      for (const e of restored) {
+        if (byHandle.get(e.handle) !== e) continue;
+        if (delivered.has(e.handle)) {
+          // QA-2.1-10: a posted hold stays as an inactive placeholder (the host history still holds the raw completion).
+          e.active = false;
+          e.status = "released";
+          e.childText = undefined;
+          continue;
+        }
+        const text = postingText.get(e.handle);
+        if (text !== undefined) {
+          e.verdictText = text;
+          e.posting = true;
+          e.status = "posting";
+          reposts.push({ handle: e.handle, parentSessionID: e.parentSessionID, childSessionID: e.childSessionID, text });
+        } else {
+          unverified.push({
+            handle: e.handle,
+            parentSessionID: e.parentSessionID,
+            childSessionID: e.childSessionID,
+            callID: e.callID,
+            ...(e.childText === undefined ? {} : { childText: e.childText }),
+          });
+        }
+      }
+      return { reposts, unverified };
+    },
+
+    async settleRestored(handle, alreadyPosted) {
+      const entry = byHandle.get(handle);
+      if (entry === undefined || !entry.active) return;
+      if (alreadyPosted) {
+        entry.active = false;
+        entry.posting = false;
+        entry.status = "released";
+        entry.childText = undefined;
+        try {
+          await deps.journal.append({ v: 1, kind: "posted", handle, at: now() });
+        } catch (error) {
+          warnSafe(deps.logger, "[router] held verdict posted but not journaled", { handle, error: errorText(error) });
+        }
+        return;
+      }
+      const text = entry.verdictText;
+      if (text === undefined) return;
+      entry.posting = true;
+      try {
+        await postText(entry, text);
+      } catch (error) {
+        warnSafe(deps.logger, "[router] held verdict re-post failed", { handle, error: errorText(error) });
+      } finally {
+        entry.posting = false;
       }
     },
   };
@@ -847,8 +1094,13 @@ export interface CompletionDeps {
   persist: InflightJournal;
   now(): number;
   logger: Logger;
-  /** The change set at child end (verify/dispatch.ts `captureDelta`, 2.1.4.b); absent = none. */
-  captureDelta?(callID: string, child: string): Promise<unknown>;
+  /** The change set at child end (verify/dispatch.ts `captureDelta`, 2.1.4.b); absent = none. `dispatchID`: `task:<parent>:<callID>`. */
+  captureDelta?(callID: string, child: string, dispatchID?: string): Promise<unknown>;
+  /**
+   * `pending.releaseHandle` (QA-2.1-4): frees the reserved handle of a held attempt that ends without a held register
+   * (failed, interrupted, lost, closed unknown, or a gate that answered at once). Idempotent; a registered entry is kept.
+   */
+  releaseHeld?(handle: string): void;
 }
 
 export interface CompletedLine {
@@ -966,6 +1218,23 @@ export function createCompletionProcessor(reg: InFlightRegistry, deps: Completio
     }
   }
 
+  /** QA-2.1-4: a held attempt that ends without a held register gives its reserved handle back. */
+  function releaseHandleSafe(handle: string): void {
+    try {
+      deps.releaseHeld?.(handle);
+    } catch (error) {
+      warnSafe(deps.logger, "[router] held handle release failed", { handle, error: errorText(error) });
+    }
+  }
+
+  async function noteTextSafe(handle: string, text: string): Promise<void> {
+    try {
+      await deps.held.noteText(handle, text);
+    } catch (error) {
+      warnSafe(deps.logger, "[router] held child text not kept", { handle, error: errorText(error) });
+    }
+  }
+
   /** A held attempt whose verdict was posted has left the hold. */
   function refresh(a: Attempt): void {
     if (a.state === "held" && !deps.held.isHeld(a.childSessionID)) a.state = "released";
@@ -1010,17 +1279,21 @@ export function createCompletionProcessor(reg: InFlightRegistry, deps: Completio
       await markProcessed(a);
       if (handle !== undefined) {
         await verdictSafe(handle, { verdict: "UNVERIFIABLE", text: "[router] not verified: lost in restart", reason: "lost in restart" });
+        releaseHandleSafe(handle);
       }
       a.state = handle !== undefined ? "released" : "annotated";
       return;
     }
 
     ctx.text = text;
+    // QA-2.1-6: the child text lives in the journal with the hold, so a restart can re-run the gate.
+    if (handle !== undefined) await noteTextSafe(handle, text);
     const status = end.status ?? "unknown";
     let delta: unknown;
     if (deps.captureDelta !== undefined) {
       try {
-        delta = await deps.captureDelta(a.callID, a.childSessionID);
+        // QA-2.1-7: the change-set store keys a dispatch by `task:<parent>:<callID>`; the parent is known here.
+        delta = await deps.captureDelta(a.callID, a.childSessionID, `task:${a.parentSessionID}:${a.callID}`);
       } catch (error) {
         warnSafe(deps.logger, "[router] change-set capture failed", { callID: a.callID, error: errorText(error) });
       }
@@ -1053,6 +1326,7 @@ export function createCompletionProcessor(reg: InFlightRegistry, deps: Completio
       return;
     }
     // No gate will post for this hold: release it with the verdict the result implies (§4.7 step 7).
+    releaseHandleSafe(handle);
     const v = result.verification;
     if (status !== "succeeded") {
       await verdictSafe(handle, {
@@ -1082,6 +1356,7 @@ export function createCompletionProcessor(reg: InFlightRegistry, deps: Completio
     if (handle !== undefined) {
       const shown = ctx.text === undefined ? "" : `${ctx.text}\n`;
       await verdictSafe(handle, { verdict: "UNVERIFIABLE", text: `${shown}[router] not verified: ${reason}`, reason });
+      releaseHandleSafe(handle);
     }
     a.state = deps.held.isHeld(a.childSessionID) ? "held" : handle !== undefined ? "released" : "annotated";
   }
@@ -1189,6 +1464,7 @@ export function createCompletionProcessor(reg: InFlightRegistry, deps: Completio
         if (handle !== undefined && deps.held.isHeld(a.childSessionID)) {
           await verdictSafe(handle, { verdict: "UNVERIFIABLE", text: `[router] not verified: ${reason}`, reason });
         }
+        if (handle !== undefined) releaseHandleSafe(handle);
       } catch (error) {
         warnSafe(deps.logger, "[router] closing an attempt failed", { callID: a.callID, error: errorText(error) });
       }
@@ -1329,7 +1605,8 @@ export interface LeaseGuard {
 
 export interface LeaseGuardDeps {
   registry: LeaseRegistry;
-  sessionKind(sid: string): Promise<"root" | "child">;
+  /** `unknown` (or a rejection): the kind could not be read; root semantics, child wording (QA-2.1-11). */
+  sessionKind(sid: string): Promise<"root" | "child" | "unknown">;
   sessionDir(sid: string): Promise<string>;
   gitRootOf(dir: string): string | undefined;
   holderLabel(holderID: string): string;
@@ -1344,6 +1621,18 @@ const TREE_POLL_MS = 5000;
 /** Bound of one host lookup (session kind / directory) made from inside a tool hook. */
 const LOOKUP_TIMEOUT_MS = 5000;
 const MAX_ACTOR_CACHE = 1000;
+/** QA-2.1-11: a failed session-directory lookup is not repeated for this long. */
+export const LEASE_LOOKUP_NEGATIVE_TTL_MS = 30_000;
+/** QA-2.1-13: warn-once keys remembered. */
+const MAX_WARNED_KEYS = 1000;
+
+/** A resolved lease actor (QA-2.1-11: `childWording` = the kind is child, or unknown). */
+interface Actor {
+  kind: "root" | "child";
+  tree: string;
+  dir: string;
+  childWording: boolean;
+}
 
 /** The task reference of a plan task (the owner of the leases of its slot); = `leaseTaskRef` (executor/types.ts:1446). */
 function planTaskRef(planId: string, taskId: string): string {
@@ -1366,13 +1655,17 @@ function searchEntryPath(tool: "glob" | "grep", line: string): string {
  * refusal texts. Roots take no lease; a failed session-kind lookup means root semantics.
  */
 export function createLeaseGuard(deps: LeaseGuardDeps): LeaseGuard {
-  const actors = new Map<string, { kind: "root" | "child"; tree: string; dir: string }>();
+  /** QA-2.1-11: resolved actors, cached per session (bounded); an actor whose kind lookup failed is not cached (retried). */
+  const actors = new Map<string, Actor>();
+  /** QA-2.1-11: negative cache: a failed directory lookup is not repeated for LEASE_LOOKUP_NEGATIVE_TTL_MS. */
+  const failedLookups = new Map<string, number>();
+  /** QA-2.1-13: bounded (oldest first out), so per-session keys cannot grow it without end. */
   const warned = new Set<string>();
   const now = deps.now ?? (() => Date.now());
 
   function warnOnce(key: string, message: string, meta?: object): void {
     if (warned.has(key) || deps.logger === undefined) return;
-    warned.add(key);
+    addBounded(warned, key, MAX_WARNED_KEYS);
     warnSafe(deps.logger, message, meta);
   }
 
@@ -1389,25 +1682,42 @@ export function createLeaseGuard(deps: LeaseGuardDeps): LeaseGuard {
     }
   }
 
-  async function resolveActor(sessionID: string): Promise<{ kind: "root" | "child"; tree: string; dir: string } | undefined> {
+  async function resolveActor(sessionID: string): Promise<Actor | undefined> {
+    // QA-2.1-11: one host lookup per session, not one per tool call.
+    const cached = actors.get(sessionID);
+    if (cached !== undefined) return cached;
+    const failedAt = failedLookups.get(sessionID);
+    if (failedAt !== undefined && now() - failedAt < LEASE_LOOKUP_NEGATIVE_TTL_MS) return undefined;
     let kind: "root" | "child" = "root";
+    let kindKnown = true;
     try {
-      kind = await bounded(deps.sessionKind(sessionID), "session kind lookup");
+      const looked = await bounded(deps.sessionKind(sessionID), "session kind lookup");
+      // QA-2.1-11: a lookup that answers `unknown` (the adapter's own failed or negatively cached lookup) is a failed one.
+      if (looked === "unknown") kindKnown = false;
+      else kind = looked;
     } catch (error) {
+      kindKnown = false;
       warnOnce(`kind:${sessionID}`, "[router] lease session kind lookup failed; treating as root", { error: errorText(error) });
     }
     let dir: string;
     try {
       dir = await bounded(deps.sessionDir(sessionID), "session directory lookup");
     } catch (error) {
+      failedLookups.delete(sessionID);
+      failedLookups.set(sessionID, now());
+      trimMap(failedLookups, MAX_ACTOR_CACHE, () => false);
       warnOnce(`dir:${sessionID}`, "[router] lease session directory lookup failed; no lease check", { error: errorText(error) });
       return undefined;
     }
+    failedLookups.delete(sessionID);
     const gitRoot = deps.gitRootOf(dir);
-    const entry = { kind, dir, tree: foldKeyPath(gitRoot ?? dir) };
-    actors.delete(sessionID);
-    actors.set(sessionID, entry);
-    trimMap(actors, MAX_ACTOR_CACHE, () => false);
+    // QA-2.1-11: an unknown kind keeps root semantics (no lease taken) but gets the child's wording: it may well be a child.
+    const entry: Actor = { kind, dir, tree: foldKeyPath(gitRoot ?? dir), childWording: kind === "child" || !kindKnown };
+    if (kindKnown) {
+      actors.delete(sessionID);
+      actors.set(sessionID, entry);
+      trimMap(actors, MAX_ACTOR_CACHE, () => false);
+    }
     return entry;
   }
 
@@ -1458,7 +1768,7 @@ export function createLeaseGuard(deps: LeaseGuardDeps): LeaseGuard {
           if (r.ok) return {};
           if (r.reason === "held") {
             const who = holderLabels(deps, r.holders);
-            if (!holder.isChild) return { refuse: `[router] Refused: ${r.path} is being edited by ${who}. Wait for that session to end.` };
+            if (!holder.isChild && !a.childWording) return { refuse: `[router] Refused: ${r.path} is being edited by ${who}. Wait for that session to end.` };
             return {
               refuse: `[router] Refused: ${r.path} is being edited by ${who}. Finish without that file, or return \`NEED MORE: lease ${r.path}\`. Do not retry: the lease ends when that session ends.`,
             };

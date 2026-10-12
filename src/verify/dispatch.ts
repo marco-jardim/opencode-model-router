@@ -487,10 +487,11 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
     /**
      * Phase 2.1.4.b: freezes the files the child changed so far (the tool calls observed in its session)
      * at child end. A contaminated dispatch snapshot makes the set "unavailable", as the foreground gate
-     * treats it. Pure read: the child's record stays until clear().
+     * treats it. Pure read: the child's record stays until clear(). QA-2.1-7: the dispatch record is keyed by its dispatch
+     * id (`task:<parent>:<callID>`), which the caller passes as `dispatchID`; it defaults to `callID`.
      */
-    captureDelta(callID: string, childSessionID: string): DispatchDelta {
-      const contaminatedBy = dispatches.get(callID)?.snapshotContaminatedBy;
+    captureDelta(callID: string, childSessionID: string, dispatchID: string = callID): DispatchDelta {
+      const contaminatedBy = dispatches.get(dispatchID)?.snapshotContaminatedBy;
       const files = contaminatedBy !== undefined ? "unavailable" : [...(bySession.get(childSessionID)?.entries() ?? [])].map(
         ([path, status]): ChangedFile => ({ path, status }),
       );

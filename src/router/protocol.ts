@@ -447,22 +447,21 @@ export const BACKGROUND_DISPATCHES_HEADING = "## Background dispatches";
 
 /**
  * The "Background dispatches" block (OpenCode v2 only), rendered from the resolved `routing.background.mode` and
- * `routing.leases.mode`: the heading and the first two rules when background is not `off`, the lease rule when leases
- * are `enforce`, "" when neither applies. Cache-stable: depends on those two modes only. Callers add it on v2 only.
+ * `routing.leases.mode`: "" when background is `off` (QA-2.1-12: the whole block, the lease rule included, so `off`
+ * leaves the prompt as before phase 2.1); otherwise the heading and the first two rules, plus the lease rule when leases
+ * are `enforce`. Cache-stable: depends on those two modes only. Callers add it on v2 only.
  */
 export function buildBackgroundDispatchesBlock(cfg: RouterConfig): string {
   const routing = resolveRouting(cfg, "v2");
-  const lines: string[] = [];
-  if (routing.background.mode !== "off") {
-    lines.push(
-      `- After a background dispatch, continue any independent work; when none remains, end the turn — the router wakes you. Never poll or sleep.`,
-      `- A held result is not usable until its verdict arrives. Never report a task done while dispatches are listed in flight.`,
-    );
-  }
+  if (routing.background.mode === "off") return "";
+  const lines: string[] = [
+    `- After a background dispatch, continue any independent work; when none remains, end the turn — the router wakes you. Never poll or sleep.`,
+    `- A held result is not usable until its verdict arrives. Never report a task done while dispatches are listed in flight.`,
+  ];
   if (routing.leases.mode === "enforce") {
     lines.push(`- A lease refusal is resolved by waiting for the holder, not by retrying.`);
   }
-  return lines.length === 0 ? "" : [BACKGROUND_DISPATCHES_HEADING, ...lines].join("\n");
+  return [BACKGROUND_DISPATCHES_HEADING, ...lines].join("\n");
 }
 
 /**
