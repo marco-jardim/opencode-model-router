@@ -26,7 +26,10 @@ Read this first in a new session. The design is `docs/design/cross-repo.md`, and
 | P1: v2 roles cross-repo (P1.1–P1.10) | Done. QA'd twice. Docs updated. Live dogfood done (see "Phase 1 live dogfood"). |
 | P2 lot 1: P2a–P2d + P2g (plan `docs/design/cross-repo-phase2-plan.md`) | Done. QA'd twice (round 1: 4 major + 9 minor fixed; round 2: 3 major fixed, minors recorded in design §9). Docs and CHANGELOG updated. Live dogfood done (see "Phase 2 live dogfood"); findings F-D1, F-D2 wait for the owner. |
 | P2 lot 2: P2e (deferred P), owner decision OD4 | Implemented (`3037ab8`..`722c5db`, docs after): a role dispatch with a perimeter or per-check keys defers; P frozen at return; S11 caveat (OD-P2e-1 = UNVERIFIED); F13 v2-only (OD-P2e-2). QA'd twice (round 1: 1 major + 5 minor fixed; round 2: 1 major fixed, minors in design §9). Live dogfood done (see "Progress after resuming"). |
-| P3 / P4 | Not started |
+| P3 lot 1: item (b), `router_git_*` `root` (plan `docs/design/cross-repo-phase3-plan.md`) | Done (`3b6aec8`..`bc9930c`). QA'd twice (round 1: 1 major + 5 minor + nits fixed; round 2: 1 major (M1, read set vs repoExclude) fixed in `219e5c5`, minors in design §9). Docs and CHANGELOG updated. Live dogfood done (see "Phase 3 lot 1 live dogfood"). |
+| P3 lot 2: item (a), `vitest related` across a link | Spike done (YES, amended path spelling; plan "Spike result"). Not implemented. |
+| P3 lot 3: item (c), edges outside `node_modules` | Not started. |
+| P4 | Not started |
 
 Last checks (HEAD after the round 2 fixes):
 - `npm run typecheck`: clean.
@@ -42,6 +45,24 @@ Phase 2 is closed: code, docs, two QA rounds per lot, live dogfood, clean full-s
 **Next: Phase 3** (design §7 "Phase 3", `docs/design/cross-repo.md` ~:478): (a) the `vitest related` cross-link spike; (b) a read-only `root` argument for `router_git_*` that names an admitted repository; (c) discovery of dependency edges that do not go through `node_modules`, with no per-repository configuration. The design gives no file-level plan for it: start with a pre-flight (architect) that writes a plan like `docs/design/cross-repo-phase2-plan.md`, ask the owner the real decisions, then implement test-first, QA twice, dogfood live.
 
 **Working rules that bit this session:** delegates hit a read guard after 3 consecutive reads (tell them to alternate read and edit, and paste file:line ranges); "Agent not found" on parallel implementer dispatches usually means the child still runs — check `git status`/`git diff --stat` and resume the same session; every edit must leave `src/` loadable (the live router loads it); run `router_run` calls one at a time; a full suite run only with nothing else running; the gate's `testsPass` cannot scope this repo ("attribution-unavailable"), so verify every change in the shell (typecheck plus the touched test files).
+
+## Phase 3 lot 1 live dogfood (2026-10-12)
+
+Run live in the dogfood instance at HEAD `bc9930c`, no restart (the `root` argument was registered without one). Scratch: a second worktree `D:\git\omr-xr-dogfood-lib-p3b` (branch `dogfood-p3b`), a repository `%LOCALAPPDATA%\omr-cross-repo\p3b-outside` and a junction `D:\git\omr-xr-p3b-junction` to it; all removed afterwards.
+
+| # | Call | Result |
+|---|---|---|
+| 0 | Before 3b.3, `router_git_log {root, limit}` | The host stripped the unknown key and ran in this worktree (F3 settled: `root` must be a declared key). |
+| 1 | Explorer, `root:"D:\\git\\omr-xr-dogfood-lib"` (log) and `root:"omr-xr-dogfood-lib"` (status) | Pass. Provenance first line, the lib's `2d133c4`, empty status. The lib's `.git\index` mtime unchanged. |
+| 2 | `root:"mcp-reader"` | Pass. Provenance `mcp-reader (main) at D:\git\mcp-reader`, then its status. |
+| 3 | `root` = this worktree | Pass. Identical to no `root`, no provenance line. |
+| 4 | Name with two worktrees; the worktree directory name | Pass. `root=omr-xr-dogfood-lib has 2 worktrees: … → main; … → dogfood-p3b; nothing ran. Pass root as one of these absolute paths`; `omr-xr-dogfood-lib-p3b` → provenance `(dogfood-p3b)`. |
+| 5 | `C:\Windows`, `D:\git`, `..\mcp-reader`, `\\localhost\c$\x`, `…\.git`, `D:\git\mcp-reader\docs` | Pass. Steps 3, 3, 2, 2, 2, 6 texts (the last: `pass root=D:\git\mcp-reader and path=docs`). |
+| 6 | The junction leading out of the parents | Pass. `resolves to C:\Users\…\p3b-outside, outside this dispatch's read set; nothing ran`. |
+| 7 | The orchestrator, and an explicit `fast` tier | Pass. `refused: root is only for role agents (roles mode); …`. |
+| 8 | Implementer, `VERIFY:required`, a probe file plus `router_git_status {root}` | Pass. `✓ verified: deterministic`, no I4/I5 caveat. |
+
+Observation: in the delegate results relayed to the orchestrator, the provenance line reads `(router: read from …]`; the refusals keep `[router_git]`. The router code has no such rewrite and the unit tests pin `[router: read from`, so it is a substitution in the host's prompt pipeline (like the `Claude`/`opencode` path substitution noted in the Phase 1 dogfood).
 
 ## Progress after resuming (2026-10-12)
 
