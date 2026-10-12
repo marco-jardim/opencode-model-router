@@ -772,6 +772,14 @@ Round-2 cross-check (second heavy reviewer `ses_ed0039d1fffeYXYuY3nQR98Qgy`, sam
 - QA-2.1-31 (minor): `router_verify` "joins a running gate" never happens (background gate claims and settles synchronously, `index.ts:3686-3702`); restored holds settled through the sink leave the pending entry `held`, so `router_verify` keeps saying the verdict will post. Fix: correct the comment and `VERIFICATION.md` step 3; settle the pending entry on direct verdicts.
 - QA-2.1-32 (nit): `config.ts:1861` still says "one notice per key"; the v1 notice says "background dispatch" when only `routing.leases.*` is set; CHANGELOG entry for the per-user journal location missing (phase end).
 
+Round-2 fixes: `80562d0` (part 1), `934ded5` + `1bfef5b` (part 2). At `1bfef5b`: typecheck green, 72 touched test files 2158 pass; real-host smoke `cpx-background` 4/4 on OpenCode 2.0.26.
+
+### Round 3 (heavy reviewer `ses_ecfbd9baeffeBSyISERWmXTkYf`, at `1bfef5b`, bounded to the round-2 majors) — -14, -15, -17, -18 fixed; -16, -19 partially; 2 new majors
+
+- QA-2.1-33 (major): one instance's `recreate` replaces the shared journal (`pending.ts:1033-1040`) with only its own memory (`index.ts:3859-3865`, `v2-hooks.ts:1487-1526`), losing the other instance's records (the -15 multi-instance case). Fix: recreate writes the union of every journal object's snapshot provider registered on the shared state (or replace only while still missing, else append and have each instance re-append its state once).
+- QA-2.1-34 (major): a refused adoption is permanent (`v2-hooks.ts:1636-1644` marks adopted before `adopt`; `adopt` returns `undefined` for refusal and for nothing-to-adopt, `index.ts:3825`), and claims written at the first record (`index.ts:3663-3670`) are honoured for 24 h while the pid is alive (`pending.ts:1629-1630`), so pid reuse after a crash blocks recovery. Fix: distinct refusal result, un-mark and retry later (rate-limited); pid-reuse-safe claims (short heartbeat ≈60 s / stale ≈5 min, or process start time in the claim).
+- Minor leftovers recorded, not fixed (rule: after round 2 only blocking/critical/major): `background.ts:238` doc comment "Optional for compatibility"; `ref` records not rewritten by recreate; `restoredTaskArgs` ignores the journaled `workRoot`; test-only settled seam can hang on a gate whose settle throws.
+
 ## Fixes
 ## Deferred findings
 
