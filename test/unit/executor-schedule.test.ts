@@ -1,5 +1,6 @@
 // test/unit/executor-schedule.test.ts
 // Critical-path scheduler (3.1.2, memo phase-3.1 M9-M13). Deterministic: seeded PRNG, no wall clock.
+// The reference list scheduler at the bottom is independent: plain arrays, its own levels, no import of bottomLevels.
 import { describe, expect, it } from "vitest";
 import {
   bottomLevels,

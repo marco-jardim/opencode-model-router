@@ -149,6 +149,12 @@ function phaseAdmits(phases: ReadonlyMap<PhaseId, PhaseRecord>, task: TaskNode):
   return task.kind !== "qa" || p.gate === "awaiting-qa";
 }
 
+/**
+ * Ready set (M11, 3.1.2.a): `[]` unless the plan is running. Candidates are `ready` tasks that are not manual or
+ * preflight, not in flight, in an admitting phase, with every incoming edge satisfied; they are sorted by bottom
+ * level (desc) then plan order and picked greedily under the soft lease check, the in-selection overlap check and
+ * the per-provider capacity counters.
+ */
 function readySet(
   ledger: LedgerV1, inFlight: ReadonlySet<TaskId>, leases: LeaseView, capacity: CapacityView,
 ): ScheduledTask[] {
