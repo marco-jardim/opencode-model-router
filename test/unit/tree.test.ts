@@ -452,14 +452,20 @@ describe("listIgnoredModules — the linked repository's ignored modules (cross-
   let repo: string;
   let outside: string;
   let write: (rel: string, content: string) => Promise<void>;
+  /** Sets a fixture file's own atime and mtime (fs.utimesSync). */
+  let touch: (rel: string, at: Date) => void;
   let readIndex: () => Promise<Buffer>;
   const signal = new AbortController().signal;
   let cleanup: (() => Promise<void>) | undefined;
   /** The module files the fixture writes, relative to the repository (sorted as the lister sorts absolute paths). */
   const MODULES = [
-    "dist/a.cts", "dist/a.mts", "dist/c.tsx", "dist/cjs/index.cjs", "dist/d.jsx", "dist/esm/index.mjs", "dist/index.d.ts",
+    "dist/a.cts", "dist/a.mts", "dist/c.tsx", "dist/cjs/index.cjs", "dist/d.jsx", "dist/esm/index.mjs",
     "dist/index.js", "dist/package.json", "generated.json",
   ];
+  /** QA M4: declaration files the fixture writes under the ignored `dist/`: never listed. */
+  const DECLARATIONS = ["dist/index.d.ts", "dist/esm/index.d.mts", "dist/cjs/index.d.cts", "dist/upper.D.TS"];
+  /** QA M4: modules inside a nested repository (`.git` directory) and a worktree (`.git` file) under `dist/`: never listed. */
+  const NESTED = ["dist/nested/x.js", "dist/nested/deep/y.js", "dist/wt/z.js", "dist/wt/sub/w.json"];
 
   afterAll(async () => {
     await cleanup?.();
@@ -475,6 +481,7 @@ describe("listIgnoredModules — the linked repository's ignored modules (cross-
     const cp = await vi.importActual<typeof import("node:child_process")>("node:child_process");
     const os = await vi.importActual<typeof import("node:os")>("node:os");
     const path = await vi.importActual<typeof import("node:path")>("node:path");
+    const fsSync = await vi.importActual<typeof import("node:fs")>("node:fs");
     repo = await fs.mkdtemp(path.join(os.tmpdir(), "omr-ignored-modules-"));
     outside = await fs.mkdtemp(path.join(os.tmpdir(), "omr-not-a-repo-"));
     write = async (rel, content) => {
@@ -482,6 +489,7 @@ describe("listIgnoredModules — the linked repository's ignored modules (cross-
       await fs.mkdir(path.dirname(file), { recursive: true });
       await fs.writeFile(file, content);
     };
+    touch = (rel, at) => fsSync.utimesSync(path.join(repo, rel), at, at);
     readIndex = () => fs.readFile(path.join(repo, ".git", "index"));
     const env = {
       ...process.env,
@@ -505,6 +513,12 @@ describe("listIgnoredModules — the linked repository's ignored modules (cross-
     for (const rel of ["node_modules/x/y.js", "node_modules/x/package.json", "dist/node_modules/k/index.js"]) await write(rel, "x");
     // Untracked but not ignored, and tracked: not the lister's (W's change set already holds them).
     await write("src/new.ts", "export const n = 1;\n");
+    // QA M4: declaration files are never loaded modules.
+    for (const rel of DECLARATIONS) await write(rel, "x");
+    // QA M4: a nested repository (a `.git` directory) and a worktree (a `.git` file) under the ignored `dist/`: skipped whole.
+    await write("dist/nested/.git/HEAD", "ref: refs/heads/main\n");
+    await write("dist/wt/.git", "gitdir: ../../.git/worktrees/wt\n");
+    for (const rel of NESTED) await write(rel, "x");
   }, 60_000);
 
   const abs = (rels: readonly string[]) => rels.map(rel => resolve(repo, rel)).sort();
@@ -560,5 +574,42 @@ describe("listIgnoredModules — the linked repository's ignored modules (cross-
     const aborted = new AbortController();
     aborted.abort();
     expect(await tree.listIgnoredModules(repo, { signal: aborted.signal })).toEqual({ unavailable: true });
+  }, 60_000);
+
+  it("drops declaration files (.d.ts, .d.mts, .d.cts, any case) — QA M4", async () => {
+    const result = await tree.listIgnoredModules(repo, { signal });
+    const files = "files" in result ? result.files : [];
+    expect(files.length).toBeGreaterThan(0);
+    for (const declaration of abs(DECLARATIONS)) expect(files).not.toContain(declaration);
+    expect(files.some(file => /\.d\.[cm]?ts$/i.test(file))).toBe(false);
+    // Not a declaration: an ordinary .ts/.mts/.cts module is still listed.
+    expect(files).toContain(resolve(repo, "dist/a.mts"));
+    expect(files).toContain(resolve(repo, "dist/a.cts"));
+  }, 60_000);
+
+  it("skips a directory holding a .git entry (nested repository or worktree) entirely, its subtree included — QA M4", async () => {
+    const result = await tree.listIgnoredModules(repo, { signal });
+    expect(result).toEqual({ files: abs(MODULES) });
+    const files = "files" in result ? result.files : [];
+    for (const nested of abs(NESTED)) expect(files).not.toContain(nested);
+    expect(files.some(file => file.split(/[\\/]/).includes(".git"))).toBe(false);
+  }, 60_000);
+
+  it("with since: keeps only the files whose own mtime is at or after it (fs.utimesSync) — QA C1, D23 as amended", async () => {
+    const since = new Date(Date.UTC(2020, 0, 1, 0, 0, 0));
+    const old = new Date(Date.UTC(2001, 0, 1, 0, 0, 0));
+    const fresh = new Date(Date.UTC(2021, 0, 1, 0, 0, 0));
+    const stale = ["dist/index.js", "dist/esm/index.mjs", "generated.json"];
+    for (const rel of stale) touch(rel, old);
+    for (const rel of MODULES.filter(rel => !stale.includes(rel))) touch(rel, fresh);
+    touch("dist/d.jsx", since); // exactly at `since`: kept (>=)
+    const kept = MODULES.filter(rel => !stale.includes(rel));
+    expect(await tree.listIgnoredModules(repo, { signal, since: since.getTime() })).toEqual({ files: abs(kept) });
+    // An old build output is excluded, a fresh one included; nothing at all when every file predates `since`.
+    expect(await tree.listIgnoredModules(repo, { signal, since: fresh.getTime() + 1_000 })).toEqual({ files: [] });
+    // Without since: no mtime filter (the hook never calls without one).
+    expect(await tree.listIgnoredModules(repo, { signal })).toEqual({ files: abs(MODULES) });
+    // The bounds count only the kept files.
+    expect(await tree.listIgnoredModules(repo, { signal, since: since.getTime(), maxFiles: kept.length })).toEqual({ files: abs(kept) });
   }, 60_000);
 });

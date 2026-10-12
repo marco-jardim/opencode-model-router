@@ -1211,6 +1211,29 @@ describe("runDeterministic — per-check placements (P2.4)", () => {
         expect(hook.requests[0]).not.toHaveProperty("crossLinkAliases");
       });
 
+      it("forwards the deps' dispatchStartedAt to a cross-link request only (D23 as amended, QA C1)", async () => {
+        const started = 1_760_000_000_000;
+        const hook = testsPassHook();
+        await runDeterministic(
+          makeDoD([{ kind: "testsPass", command: "npm test" }]),
+          makeDeps({ testsPass: hook.fn, placements: [{ ...foreign, scope: "affected" }], changeRoot: W, dispatchStartedAt: started }),
+        );
+        expect(hook.requests[0]).toMatchObject({ crossLinkRoot: W, dispatchStartedAt: started });
+        // Without it, a cross-link request carries no start (the hook then lists no ignored module).
+        const without = testsPassHook();
+        await runDeterministic(
+          makeDoD([{ kind: "testsPass", command: "npm test" }]),
+          makeDeps({ testsPass: without.fn, placements: [{ ...foreign, scope: "affected" }], changeRoot: W }),
+        );
+        expect(without.requests[0]).toMatchObject({ crossLinkRoot: W });
+        expect(without.requests[0]).not.toHaveProperty("dispatchStartedAt");
+        // A request that is not cross-link never carries it (its plan input is the pre-P3a one).
+        const home = testsPassHook();
+        await runDeterministic(makeDoD([{ kind: "testsPass", command: "npm test" }]), makeDeps({ testsPass: home.fn, dispatchStartedAt: started }));
+        expect(home.requests[0]).not.toHaveProperty("crossLinkRoot");
+        expect(home.requests[0]).not.toHaveProperty("dispatchStartedAt");
+      });
+
       it("a throwing alias provider gives no aliases (fail-soft), the run still happens", async () => {
         const hook = testsPassHook();
         const verdict = await runDeterministic(
@@ -1383,6 +1406,8 @@ describe("createDirectTestsPassHook — cross-link root (cross-repo P3a)", () =>
   describe("the linked repository's ignored modules (D23)", () => {
     type ListIgnored = NonNullable<Parameters<typeof createDirectTestsPassHook>[0]["listIgnored"]>;
     type IgnoredModules = import("../../src/verify/tree").IgnoredModules;
+    /** D23 as amended (2026-10-12, QA C1): the dispatch start a cross-link request carries (ms epoch). */
+    const STARTED = 1_760_000_000_000;
 
     function setupWith(answer: IgnoredModules | (() => Promise<IgnoredModules>)) {
       const inputs: PlanScopedRunInput[] = [];
@@ -1390,9 +1415,9 @@ describe("createDirectTestsPassHook — cross-link root (cross-repo P3a)", () =>
         inputs.push(input);
         return { noAffected: true, note: "no affected tests" };
       };
-      const calls: { root: string; signal: AbortSignal }[] = [];
-      const listIgnored: ListIgnored = async (root, signal) => {
-        calls.push({ root, signal });
+      const calls: { root: string; signal: AbortSignal; since: number }[] = [];
+      const listIgnored: ListIgnored = async (root, signal, since) => {
+        calls.push({ root, signal, since });
         return typeof answer === "function" ? answer() : answer;
       };
       const openScope: OpenCheckScope = () => { throw new Error("planning outcomes open no scope"); };
@@ -1408,9 +1433,9 @@ describe("createDirectTestsPassHook — cross-link root (cross-repo P3a)", () =>
 
     it("appends W's ignored modules to the plan's changed files, deduplicated, listing W once with the gate's signal", async () => {
       const s = setupWith({ files: [`${W}/dist/index.js`, `${W}/src/a.ts`, `${W}/dist/esm/index.mjs`] });
-      const req = request({ crossLinkRoot: W });
+      const req = request({ crossLinkRoot: W, dispatchStartedAt: STARTED });
       expect(await s.hook(req)).toEqual({ scoped: { kind: "no-affected", note: "no affected tests" }, recheck: undefined });
-      expect(s.calls).toEqual([{ root: W, signal: req.deadline.signal }]);
+      expect(s.calls).toEqual([{ root: W, signal: req.deadline.signal, since: STARTED }]);
       expect(s.inputs).toHaveLength(1);
       expect(s.inputs[0]).toStrictEqual({
         ...s.today,
@@ -1426,13 +1451,48 @@ describe("createDirectTestsPassHook — cross-link root (cross-repo P3a)", () =>
 
     it("no ignored module: the plan input is the one without a lister", async () => {
       const s = setupWith({ files: [] });
-      await s.hook(request({ crossLinkRoot: W }));
+      await s.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED }));
+      expect(s.calls).toHaveLength(1);
       expect(s.inputs[0]).toStrictEqual({ ...s.today, crossLinkRoot: W });
+    });
+
+    it("passes since = the request's dispatch start to the lister (D23 as amended, QA C1)", async () => {
+      const s = setupWith({ files: [`${W}/dist/index.js`] });
+      await s.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED + 42 }));
+      expect(s.calls.map(call => call.since)).toEqual([STARTED + 42]);
+      expect(s.inputs[0]!.changedFiles).toEqual([...CHANGED, { path: `${W}/dist/index.js`, status: "!!" }]);
+    });
+
+    it("no dispatch start (absent or not finite) → the lister is never called and no ignored module is an input (QA C1)", async () => {
+      for (const over of [{}, { dispatchStartedAt: Number.NaN }, { dispatchStartedAt: Number.POSITIVE_INFINITY }]) {
+        // Even a lister that would answer over-bounds is never reached: fail toward zero selection, never toward stale inputs.
+        const s = setupWith({ overBounds: true });
+        expect(await s.hook(request({ crossLinkRoot: W, ...over })))
+          .toEqual({ scoped: { kind: "no-affected", note: "no affected tests" }, recheck: undefined });
+        expect(s.calls).toHaveLength(0);
+        expect(s.inputs).toHaveLength(1);
+        expect(s.inputs[0]).toStrictEqual({ ...s.today, crossLinkRoot: W });
+      }
+    });
+
+    it("an empty change set for W → the lister is never called and no ignored module is an input (QA M4)", async () => {
+      const s = setupWith({ files: [`${W}/dist/index.js`] });
+      await s.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED, changedFiles: [] }));
+      expect(s.calls).toHaveLength(0);
+      expect(s.inputs).toHaveLength(1);
+      expect(s.inputs[0]!.changedFiles).toEqual([]);
+      expect(s.inputs[0]!.crossLinkRoot).toBe(W);
+    });
+
+    it("unavailable changed files → the lister is never called (the request's own changed files)", async () => {
+      const s = setupWith({ files: [`${W}/dist/index.js`] });
+      await s.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED, changedFiles: "unavailable" }));
+      expect(s.calls).toHaveLength(0);
     });
 
     it("over bounds → unverifiable S6 cross-link-ignored-over-bounds naming W; the plan is never called", async () => {
       const s = setupWith({ overBounds: true });
-      const run = await s.hook(request({ crossLinkRoot: W }));
+      const run = await s.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED }));
       expect(run).toEqual({
         scoped: {
           kind: "unverifiable",
@@ -1454,16 +1514,16 @@ describe("createDirectTestsPassHook — cross-link root (cross-repo P3a)", () =>
         recheck: undefined,
       };
       const s = setupWith({ unavailable: true });
-      expect(await s.hook(request({ crossLinkRoot: W }))).toEqual(unavailable);
+      expect(await s.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED }))).toEqual(unavailable);
       expect(s.inputs).toHaveLength(0);
       const thrown = setupWith(async () => { throw new Error("boom"); });
-      expect(await thrown.hook(request({ crossLinkRoot: W }))).toEqual(unavailable);
+      expect(await thrown.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED }))).toEqual(unavailable);
       expect(thrown.inputs).toHaveLength(0);
     });
 
     it("without crossLinkRoot the lister is never called and the plan input is the pre-P3a one", async () => {
       const s = setupWith({ files: [`${W}/dist/index.js`] });
-      await s.hook(request());
+      await s.hook(request({ dispatchStartedAt: STARTED }));
       expect(s.calls).toHaveLength(0);
       expect(s.inputs[0]).toStrictEqual(s.today);
     });
@@ -1475,9 +1535,9 @@ describe("createDirectTestsPassHook — cross-link root (cross-repo P3a)", () =>
         openScope, plannerFs: { fileExists: async () => true, readFile: async () => "{}" },
         search: { findByName: async () => [], findByContent: async () => [] },
         budget: { maxWorkers: 2, failureRecheck: true },
-        listIgnored: async (root, signal) => { s.calls.push({ root, signal }); return { overBounds: true }; },
+        listIgnored: async (root, signal, since) => { s.calls.push({ root, signal, since }); return { overBounds: true }; },
       });
-      const run = await hook(request({ crossLinkRoot: W, testScope: "full" }));
+      const run = await hook(request({ crossLinkRoot: W, testScope: "full", dispatchStartedAt: STARTED }));
       expect(run.scoped.kind).toBe("error");
       expect(s.calls).toHaveLength(0);
     });

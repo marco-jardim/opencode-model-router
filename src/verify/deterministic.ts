@@ -1243,9 +1243,10 @@ export interface DirectTestsPassHookDeps {
   /**
    * Cross-repo P3a (D23, OD-P3a-2 b): lists the linked repository's git-ignored modules (tree.ts listIgnoredModules), added to a
    * cross-link request's changed files so a consumer that loads W's build output (`dist/`) is selected. Called only for a request
-   * with `crossLinkRoot`; absent: nothing is added (as before).
+   * with `crossLinkRoot`, a `dispatchStartedAt` (`since`: only the files modified at or after it, D23 as amended 2026-10-12)
+   * and a non-empty change set; absent: nothing is added (as before).
    */
-  listIgnored?: (root: string, signal: AbortSignal) => Promise<import("./tree").IgnoredModules>;
+  listIgnored?: (root: string, signal: AbortSignal, since: number) => Promise<import("./tree").IgnoredModules>;
   logger?: Pick<PluginLogger, "warn">;
 }
 
@@ -1313,15 +1314,22 @@ export function createDirectTestsPassHook(deps: DirectTestsPassHookDeps): TestsP
    * changed files (exact-path duplicates dropped; status `!!`, git's code for an ignored file), so a consumer that loads W's
    * build output (`dist/`) is selected. Over the bounds, unlisted or a throwing lister → S6 (fail closed), before any plan.
    * Otherwise (no cross-link root, no lister, unavailable changed files, nothing ignored) the request's own changed files.
+   *
+   * D23 as amended (2026-10-12, QA C1/M4): only the modules modified during the dispatch (lister `since` = the request's
+   * `dispatchStartedAt`, the original start of a deferred one), so a build output older than the change is never a run input.
+   * No start time, or no change of W's in the request: the lister is not called and nothing is added (toward zero selection,
+   * never toward stale inputs).
    */
   const withIgnoredModules = async (req: TestsPassRequest): Promise<{ files: TestsPassRequest["changedFiles"] } | Unverifiable> => {
     if (req.crossLinkRoot === undefined || deps.listIgnored === undefined || req.changedFiles === "unavailable") {
       return { files: req.changedFiles };
     }
+    const since = req.dispatchStartedAt;
+    if (since === undefined || !Number.isFinite(since) || req.changedFiles.length === 0) return { files: req.changedFiles };
     const root = req.crossLinkRoot;
     let listed: import("./tree").IgnoredModules;
     try {
-      listed = await deps.listIgnored(root, req.deadline.signal);
+      listed = await deps.listIgnored(root, req.deadline.signal, since);
     } catch {
       listed = { unavailable: true };
     }
@@ -1586,6 +1594,8 @@ async function runTestsPass(
         deadline,
         ...(crossLink !== undefined ? { crossLinkRoot: crossLink.root } : {}),
         ...(crossLink?.aliases !== undefined ? { crossLinkAliases: crossLink.aliases } : {}),
+        // D23 as amended (QA C1): the dispatch start, so only W's ignored modules modified during the dispatch are inputs.
+        ...(crossLink !== undefined && deps.dispatchStartedAt !== undefined ? { dispatchStartedAt: deps.dispatchStartedAt } : {}),
       });
       // QA-G-B-2-1: a carried acceptance never passes on a run that never happened.
       if (deps.noAffectedUnverifiable !== undefined && run.scoped.kind === "no-affected") {

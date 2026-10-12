@@ -198,6 +198,12 @@ export interface PreparedVerification {
    * (Artefact.perimeter). Absent: the dispatch has no perimeter.
    */
   perimeter?: PerimeterObservation;
+  /**
+   * Cross-repo P3a (D23 as amended 2026-10-12, QA C1): when the dispatch began (DispatchStart.dispatchedAt; for a deferred
+   * verification, the entry's original dispatchedAt, never the router_verify time). buildGateDeps hands it to the gate
+   * (DeterministicDeps.dispatchStartedAt): only W's ignored modules modified since are cross-link inputs. Absent: none are.
+   */
+  dispatchStartedAt?: number;
 }
 
 /**
@@ -406,7 +412,11 @@ export const FALLBACK_CAPTURE_WAIT_MS = Math.min(5_000, DEFAULT_CAPTURE_TIMEOUT_
 /** What the orchestrator asked for at dispatch (directives.ts, parsed from its own prompt only). */
 export interface DispatchStart {
   readonly directives: VerifyDirectives;
-  /** Clock value when the dispatch started (pending.ts R3 dispatchedAt, R11 lineage). */
+  /**
+   * Clock value when the dispatch started (pending.ts R3 dispatchedAt, R11 lineage). Cross-repo P3a (D23 as amended 2026-10-12,
+   * QA C1): also the gate's `DeterministicDeps.dispatchStartedAt`, the `since` of W's ignored-module listing, on the synchronous
+   * and the deferred path alike (the deferred entry keeps this value, never the router_verify time).
+   */
   readonly dispatchedAt: number;
 }
 
@@ -965,13 +975,18 @@ export interface VerificationWiring {
    * clears a pending timer and aborts the git calls of a GC in flight. Never throws.
    */
   startReferenceGc(delayMs?: number): () => void;
-  /** P0: the snapshot, the changed files and the settled reference, each bounded by `deadline` when given. */
+  /**
+   * P0: the snapshot, the changed files and the settled reference, each bounded by `deadline` when given.
+   * Cross-repo P3a (D23 as amended 2026-10-12, QA C1): `dispatchStartedAt` is the dispatch's start (DispatchStart.dispatchedAt),
+   * carried as PreparedVerification.dispatchStartedAt; absent: W's ignored modules are never cross-link inputs.
+   */
   prepareVerification(
     store: ReturnType<typeof createChangedFileStore>,
     id: string,
     childID: string,
     cwd?: string,
     deadline?: Deadline,
+    dispatchStartedAt?: number,
   ): Promise<PreparedVerification>;
   /** Session ids currently running a grader prompt, so hooks can skip them. */
   graderSessions: Set<string>;
@@ -1445,8 +1460,9 @@ export function createVerificationWiring(deps: {
       search: testSearch(budget, deadline),
       budget,
       ...currentTree,
-      // Cross-repo P3a (D23): the linked repository's ignored modules, hardened and bounded; called only with crossLinkRoot.
-      listIgnored: (root, signal) => listIgnoredModules(root, { signal, lowPriority: budget.lowPriority }),
+      // Cross-repo P3a (D23): the linked repository's ignored modules, hardened and bounded; called only with crossLinkRoot and
+      // the dispatch start (D23 as amended 2026-10-12: only the modules modified since, never a stale build output).
+      listIgnored: (root, signal, since) => listIgnoredModules(root, { signal, since, lowPriority: budget.lowPriority }),
     });
     // 2.2.3 (S5): with a batch window, concurrent testsPass checks of this plugin instance meet in
     // the coordinator; the direct hook stays behind it for "full" scope and single requests (B2).
@@ -1502,6 +1518,8 @@ export function createVerificationWiring(deps: {
         changedFiles: prepared?.changeBaseline === "available" ? prepared.changedFiles : "unavailable",
         ...(prepared !== undefined ? { reference: prepared.reference } : {}),
         ...(deadline !== undefined ? { deadline } : {}),
+        // Cross-repo P3a (D23 as amended, QA C1): the dispatch start, the `since` of W's ignored-module listing; absent: none listed.
+        ...(prepared?.dispatchStartedAt !== undefined ? { dispatchStartedAt: prepared.dispatchStartedAt } : {}),
       },
       checker: {
         dispatchGrader: (req: GraderRequest) =>
@@ -2760,6 +2778,8 @@ export function createVerificationWiring(deps: {
         ...(branchSwitch !== undefined ? { branchSwitch } : {}),
         ...(entry.unattributedWriters !== undefined ? { unattributedWriters: [...entry.unattributedWriters] } : {}),
         ...(perimeter !== undefined ? { perimeter } : {}),
+        // Cross-repo P3a (D23 as amended, QA C1): the ORIGINAL dispatch start (the entry's), never the router_verify time.
+        ...(Number.isFinite(entry.dispatchedAt) ? { dispatchStartedAt: entry.dispatchedAt } : {}),
       },
       drift,
       root,
@@ -3175,7 +3195,7 @@ export function createVerificationWiring(deps: {
         stop.abort();
       };
     },
-    async prepareVerification(store, id, childID, cwd, deadline) {
+    async prepareVerification(store, id, childID, cwd, deadline, dispatchStartedAt?: number) {
       const change = await observeChange(store, id, childID, cwd, deadline);
       const captured = await store.reference(id, deadline?.signal);
       // Cross-repo P2d.3 (P2.6): the pins of the admitted link targets travel with a captured reference (required gate only).
@@ -3185,7 +3205,13 @@ export function createVerificationWiring(deps: {
       const reference: ReferenceState = pins.length > 0 && captured.kind === "captured"
         ? { kind: "captured", reference: { ...captured.reference, pins } }
         : captured;
-      return { ...change, reference };
+      // Cross-repo P3a (D23 as amended, QA C1): the dispatch start the caller holds (DispatchStart.dispatchedAt), the `since` of
+      // W's ignored-module listing. Unknown: none listed (toward zero selection, never toward a stale build output).
+      return {
+        ...change,
+        reference,
+        ...(dispatchStartedAt !== undefined && Number.isFinite(dispatchStartedAt) ? { dispatchStartedAt } : {}),
+      };
     },
     graderSessions,
     disposeChildSession,

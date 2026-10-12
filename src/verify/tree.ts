@@ -216,6 +216,8 @@ export const IGNORED_MODULE_EXTENSIONS: readonly string[] = [".js", ".cjs", ".mj
 
 /**
  * Cross-repo P3a (D23): what `listIgnoredModules` found: the absolute paths (sorted, deduplicated), or why there is no list.
+ * The file bounds count only the kept files (after the extension, declaration and `since` filters); the walk bound counts
+ * every directory entry read, a skipped nested repository's included.
  * `overBounds`: past MAX_IGNORED_MODULES, MAX_IGNORED_MODULE_PATH_BYTES or MAX_IGNORED_WALK_ENTRIES (never truncated).
  * `unavailable`: not a repository, a git failure, an unreadable directory or an abort (fail closed).
  */
@@ -234,9 +236,18 @@ export interface ListIgnoredModulesOptions {
   readonly maxPathBytes?: number;
   /** Default MAX_IGNORED_WALK_ENTRIES. */
   readonly maxWalkEntries?: number;
+  /**
+   * Cross-repo P3a (D23 as amended 2026-10-12, QA C1): a ms epoch (the dispatch start). When set, only the files whose own
+   * mtime (lstat, a link never followed) is at or after it are listed: a build output older than the dispatch is stale for
+   * the change and is never a run input. Absent: no mtime filter (the hook never calls without it).
+   */
+  readonly since?: number;
   /** The git process seam (tests). Default execGit. */
   readonly git?: SnapshotGit;
 }
+
+/** Cross-repo P3a (QA M4): declaration files are never modules a consumer loads at run time. */
+const DECLARATION_FILE = /\.d\.[cm]?ts$/i;
 
 /**
  * Cross-repo P2.6: a digest of the ignored files `git ls-files` lists (IGNORED_LIST_ARGS), minus any path with a
@@ -309,7 +320,9 @@ async function ignoredFilesDigest(
  * as absolute paths under `root` as given, so a consumer that loads the linked repository's build output (`dist/`) is
  * selected by a cross-link `vitest related` run. Listed as the ignored digest lists (IGNORED_LIST_ARGS, `--directory`),
  * always hardened (`hardenedGit`: no hooks, no fsmonitor, no optional locks, so no index refresh; read-only), the reported
- * directories walked here, bounded, never into a `node_modules` or a `.git`. Never throws.
+ * directories walked here, bounded, never into a `node_modules` nor into a directory holding a `.git` entry (a nested
+ * repository or worktree, skipped entirely). Declaration files (`.d.ts`, `.d.mts`, `.d.cts`) are dropped; with `since`, so is
+ * every file whose own mtime is before it (D23 as amended 2026-10-12: only the modules modified during the dispatch). Never throws.
  */
 export async function listIgnoredModules(root: string, opts: ListIgnoredModulesOptions): Promise<IgnoredModules> {
   const run = opts.git ?? execGit;
@@ -326,13 +339,17 @@ export async function listIgnoredModules(root: string, opts: ListIgnoredModulesO
       lowPriority: opts.lowPriority === true, env: hardened.env, executable: hardened.executable,
     });
     const files = new Set<string>();
+    const since = opts.since;
     let bytes = 0;
     let walked = 0;
     /** False once a bound is passed. */
-    const add = (relative: string): boolean => {
+    const add = async (relative: string): Promise<boolean> => {
       if (!IGNORED_MODULE_EXTENSIONS.includes(extname(relative).toLowerCase())) return true;
+      if (DECLARATION_FILE.test(relative)) return true; // QA M4: `.d.ts`, `.d.mts`, `.d.cts` are never loaded.
       const absolute = resolve(root, relative);
       if (files.has(absolute)) return true;
+      // QA C1: a file not modified since the dispatch start is stale for the change (lstat: a link's own mtime).
+      if (since !== undefined && !((await lstat(absolute)).mtimeMs >= since)) return true;
       files.add(absolute);
       bytes += Buffer.byteLength(absolute, "utf8");
       return files.size <= maxFiles && bytes <= maxPathBytes;
@@ -340,7 +357,7 @@ export async function listIgnoredModules(root: string, opts: ListIgnoredModulesO
     for (const path of listing.split("\0")) {
       if (path === "" || path.split(/[\\/]/).includes("node_modules")) continue;
       if (!/[\\/]$/.test(path)) {
-        if (!add(path)) return overBounds;
+        if (!(await add(path))) return overBounds;
         continue;
       }
       // `--directory`: a wholly ignored directory (`dist/`) is reported once; walk it. Links are entries, never followed.
@@ -348,12 +365,16 @@ export async function listIgnoredModules(root: string, opts: ListIgnoredModulesO
       while (pending.length > 0) {
         if (opts.signal.aborted) return unavailable;
         const dir = pending.pop() as string;
-        for (const entry of await readdir(resolve(root, dir), { withFileTypes: true })) {
-          if (++walked > maxWalk) return overBounds;
-          if (entry.name === "node_modules" || entry.name === ".git") continue;
+        const entries = await readdir(resolve(root, dir), { withFileTypes: true });
+        walked += entries.length;
+        if (walked > maxWalk) return overBounds;
+        // QA M4: a directory holding a `.git` entry (a nested repository or worktree) is skipped entirely, its subtree too.
+        if (entries.some(entry => entry.name === ".git")) continue;
+        for (const entry of entries) {
+          if (entry.name === "node_modules") continue;
           const child = `${dir}/${entry.name}`;
           if (entry.isDirectory()) pending.push(child);
-          else if (!add(child)) return overBounds;
+          else if (!(await add(child))) return overBounds;
         }
       }
     }

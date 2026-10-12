@@ -1826,7 +1826,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               const gateDeadline = createDeadline(gateBudgetMs);
               let verification;
               try {
-                verification = await prepareVerification(changedFileStore, baselineID, producerSid, effectiveCwd, gateDeadline);
+                // Cross-repo P3a (D23 as amended, QA C1): the dispatch's own start, the `since` of W's ignored-module listing.
+                verification = await prepareVerification(changedFileStore, baselineID, producerSid, effectiveCwd, gateDeadline, dispatchStart?.dispatchedAt);
               } catch (error) {
                 gateDeadline.dispose();
                 throw error;
@@ -2670,7 +2671,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             const gateDeadline = createDeadline(gateBudgetMs);
             let verification;
             try {
-              verification = await prepareVerification(changedFileStore, dispatchID, childSessionID ?? "", captureRootOf(scope), gateDeadline);
+              // Cross-repo P3a (D23 as amended, QA C1): the dispatch's start (takeDispatch), the `since` of W's ignored-module
+              // listing. A start that was never remembered reads as now (the return), which lists nothing older: never stale inputs.
+              verification = await prepareVerification(changedFileStore, dispatchID, childSessionID ?? "", captureRootOf(scope), gateDeadline, start.dispatchedAt);
             } catch (error) {
               gateDeadline.dispose();
               throw error;

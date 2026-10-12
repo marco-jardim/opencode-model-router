@@ -145,6 +145,8 @@ vi.mock("../../src/verify/deterministic", async importOriginal => {
 const captured = vi.hoisted(() => ({
   wiring: undefined as import("../../src/verify/wiring").VerificationWiring | undefined,
   lineage: [] as Array<import("../../src/verify/wiring").LineageContext>,
+  /** Cross-repo P3a (D23 as amended, QA C1): each gate's DeterministicDeps.dispatchStartedAt, in call order. */
+  gateStarts: [] as Array<number | undefined>,
 }));
 vi.mock("../../src/verify/wiring", async importOriginal => {
   const actual = await importOriginal<typeof import("../../src/verify/wiring")>();
@@ -179,6 +181,17 @@ vi.mock("../../src/verify/reference", async importOriginal => ({
   },
   gcStaleReferences: async () => ({ removed: [], kept: [], failed: [] }),
 }));
+// Cross-repo P3a (D23 as amended, QA C1): a pass-through gate that records the dispatch start each gate is handed.
+vi.mock("../../src/verify/gate", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../src/verify/gate")>();
+  return {
+    ...actual,
+    accept: (...args: Parameters<typeof actual.accept>) => {
+      captured.gateStarts.push(args[2].deterministic.dispatchStartedAt);
+      return actual.accept(...args);
+    },
+  };
+});
 
 const root = resolve("deferred-verification-project");
 const REF: DispatchReference = { root, head: "HEAD", commit: "HEAD", untracked: new Map(), tracked: new Map(), captureReasons: [], capturedAt: 0 };
@@ -1066,6 +1079,7 @@ describe("the plugin routes by mode on both dispatch paths", () => {
     invalidateConfigCache();
     captured.wiring = undefined;
     captured.lineage = [];
+    captured.gateStarts = [];
   });
 
   afterEach(() => {
@@ -1324,6 +1338,42 @@ describe("the plugin routes by mode on both dispatch paths", () => {
         expect(ctx.returnedAt).toBeGreaterThanOrEqual(ctx.dispatchedAt);
         expect(ctx.root).toBe(root);
       }
+    });
+
+    it("D23 as amended (QA C1): the required gate is handed the dispatch's own start as dispatchStartedAt", async () => {
+      const h = await makePlugin(home);
+      const before = Date.now();
+      await h.run(p, `VERIFY:required\nImplement it.\n${ACCEPT_TESTS_AND_MISSING}`);
+      const after = Date.now();
+      expect(captured.gateStarts.length).toBeGreaterThan(0);
+      for (const at of captured.gateStarts) {
+        expect(at).toBeGreaterThanOrEqual(before);
+        expect(at).toBeLessThanOrEqual(after);
+      }
+      // The same start R11 lineage judges the dispatch with.
+      expect(captured.lineage.length).toBeGreaterThan(0);
+      expect(captured.gateStarts[0]).toBe(captured.lineage[0]!.dispatchedAt);
+    });
+
+    it("D23 as amended (QA C1): router_verify hands its gate the ORIGINAL dispatch start, never the router_verify time", async () => {
+      producerChanges();
+      const h = await makePlugin(home);
+      const before = Date.now();
+      const out = await h.run(p, `Implement it.\n${ACCEPT_TESTS}`);
+      expect(out).toMatch(FOOTER_LINE);
+      // Deferred: no gate ran at return.
+      expect(captured.gateStarts).toEqual([]);
+      const entries = pendingOf("orch");
+      expect(entries).toHaveLength(1);
+      const dispatchedAt = entries[0].dispatchedAt;
+      expect(dispatchedAt).toBeGreaterThanOrEqual(before);
+      // router_verify runs strictly later than the dispatch began.
+      await new Promise(resolveWait => setTimeout(resolveWait, 25));
+      const verifyAt = Date.now();
+      await h.hooks.tool.router_verify.execute({ handles: [entries[0].handle] }, { sessionID: "orch" });
+      expect(captured.gateStarts.length).toBeGreaterThan(0);
+      for (const at of captured.gateStarts) expect(at).toBe(dispatchedAt);
+      expect(dispatchedAt).toBeLessThan(verifyAt);
     });
 
     it("VERIFY_WAIT:5s with a capture that takes 20 s: the producer starts at 5 s", async () => {

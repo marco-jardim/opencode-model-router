@@ -140,6 +140,12 @@ export interface DeterministicDeps {
    */
   crossLinkAliases?: (consumerCwd: string) => readonly string[];
   /**
+   * Cross-repo P3a (D23 as amended 2026-10-12, QA C1): when the dispatch began (ms epoch; the original start for a deferred
+   * verification, never the router_verify time). Forwarded to a cross-link testsPass request (`TestsPassRequest.dispatchStartedAt`)
+   * so only W's ignored modules modified during the dispatch are inputs; absent: none are.
+   */
+  dispatchStartedAt?: number;
+  /**
    * #84 QA-G-B-2-1: set for a CARRIED acceptance (a role resume re-checking the block of an earlier attempt): a testsPass or
    * lintClean check that ran no process (NoAffected: nothing of the change set maps to a test or a lintable file) is unverifiable
    * with this reason, never a pass. Absent (every other gate, I1): NoAffected passes with its note, as before.
@@ -390,6 +396,12 @@ export interface TestsPassRequest {
   readonly crossLinkRoot?: string;
   /** Other spellings of crossLinkRoot's directory (runner.ts PlanScopedRunInput); used only with crossLinkRoot. */
   readonly crossLinkAliases?: readonly string[];
+  /**
+   * Cross-repo P3a (D23 as amended 2026-10-12, QA C1): when the dispatch began (ms epoch), the original start even for a
+   * deferred verification. With crossLinkRoot, only W's ignored modules modified at or after it are added to the run's inputs;
+   * absent: none are (never a stale build output).
+   */
+  readonly dispatchStartedAt?: number;
 }
 
 /** What the S5 hook returns for one request; judgeScoped turns it into the check result. */
