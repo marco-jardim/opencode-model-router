@@ -333,6 +333,8 @@ Everything else is work: resolve it, record it, continue.
 
 ## 7. Live state (§0.11 — keep current)
 
+**Update 2026-10-12 ≈08:40:** 2.2, 2.3 and 2.4 merged into `cpx/main` (coverage top-ups, reports, M1-M10, amendments A-2.2-1/A-2.3-1/A-2.4-1 in `8439081`). 2.1 round-1 fixes in progress in `D:\git\omr-cpx-p21` (uncommitted; dispatch A done, dispatch B running). Lesson: `router_run` refuses vitest with file arguments (package scripts take no arguments; `vitest`/`npx` not allowlisted) — implementers write tests, the orchestrator runs them. The host restarted twice this morning; the AGENTS.md source flipped between the process-scoped config and the global one (reported to the owner).
+
 **Next action (paused 2026-10-11 ≈11:30 for an owner shutdown; resume with the fan-out below):** Wave 2 in flight. All four phase branches are pushed and clean: `cpx/p21` @ `bc0a9b4`, `cpx/p22` @ `073e5bf`, `cpx/p23` @ `6d1c994`, `cpx/p24` @ `0b73acc`. `cpx/main` @ this commit.
 
 **Resume fan-out (dispatch in parallel, one message; every dispatch says "alternate one read, one edit"):**
@@ -359,9 +361,11 @@ implementation's worktree `D:\git\opencode-model-router-cross-repo` (branch `fea
 | 1.2 | **done** 2026-10-11 | 3 (r1: 13, r2: 6, r3: clean) | merged `a9e32c1`; cache-prefix smoke and routing-engine 2/4 green on 2.0.26 |
 | 1.3 | **done** 2026-10-11 | 3 (r1: 17, r2: 17, r3: clean) | merged `6d310eb` |
 | 1.4 | **done** 2026-10-11 | 3 (r1: 20, r2: 11, r3: 3 major — fixed) | merged `12d42b7`; contract addenda A1–A3 in `phase-1.4.md` |
-| 2.1 | waiting | — | |
+| 2.1 | in progress (QA r1 fixes) | 1 (13 findings) | round-1 fixes in `cpx/p21`, then QA r2, `cpx-background` smoke |
 | DF-1 | waiting | — | |
-| 2.2 · 2.3 · 2.4 | waiting | — | |
+| 2.2 | **done** 2026-10-12 | 3 (r1 14, r2 9, r3 1 major — fixed) | merged `ded2e88`; ledger.ts 96.01 branches after top-up `fe3a178` |
+| 2.3 | **done** 2026-10-12 | 3 (r1 17, r2 15, r3 1 major — fixed) | merged `9b44413`; estimate 97.5 / index 92.46 branches after top-up `ca5cb81` |
+| 2.4 | **done** 2026-10-12 | 3 (r1 21, r2 9, r3 1 major — fixed) | merged `6eaf7f0`; M1-M10 measured (all constants kept); `smoke:cpx:provision` 4/4 |
 | 3.1 · 3.2 | waiting | — | |
 | 4.1 · 4.2 | waiting | — | |
 | 5.1 | waiting | — | |
@@ -497,3 +501,4 @@ host typings) — reported to the owner, out of plan scope. PF-2 ROLES.md regist
 `D:\git\omr-cpx-main\test\smoke\deferred-catalog.smoke.test.ts` leaked `OPENCODE_*` into its host — fixed in `46dac26`
 (QA-0.P-17), then reverted in `9943abe` (v1-frozen file); the leak stays mitigated per shell. `test\setup\smoke-tmp-guard.ts` `keyedSmokeEnv` also passes the environment through (keyed smokes use the
 real config on purpose); covered by the per-shell `OPENCODE_CONFIG_DIR` removal. PF-4 `test\smoke\routing-engine.smoke.test.ts` scenario `5-advisor` fails on OpenCode 2.0.26 also at `cpx/p01-base` (checked in a scratch worktree, removed afterwards) — host catalog drift, not caused by this plan; to be fixed by the phase that next owns that smoke, or recorded for the owner.
+
