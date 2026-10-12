@@ -465,6 +465,20 @@ implementations, so the plan now runs on its own data/state dirs (owner decision
   open: retry stop has no writable host field, no sync RouteResolver, no executor decision-row writer, DispatchBookkeeping
   lacks planId). 3.2.6 unit tests + `revertMessage` fix `d01ff2c` (163 green). Real-git test file uncommitted: 19/25
   green, 5 queue-settle timeouts suspected from the `kick()` lost-wake gap (fix in flight) + 1 assertion.
+- **Progress (20:05):** pdf1-2 QA r2 fixes `e62b115` (501 + 856 green); **pdf1-2 merged into `cpx/main` as `92f09d1`**
+  (12 files 856 green, tsc clean); tag `cpx/df1.2` = `92f09d1` pushed; worktree `D:\git\omr-cpx-dogfood-df1.2`
+  (detached, `npm ci` done, clean). Config copy switched to df1.2 (regenerated from the global `opencode.json`, router
+  entry only; directory entries and hard-linked hashes checked equal; previous copy saved as
+  `%LOCALAPPDATA%\omr-cpx\opencode.json.df1.1.bak`). **Deviation DF-1.2-1:** the running 2.0.26 server hot-reloaded the
+  config at 23:02:16Z and loaded `file:///D:/git/omr-cpx-dogfood-df1.2/server.ts` twice (one per location) in the SAME
+  run `c39fd4cd`, without an owner restart; a background dispatch in flight then (3.2.6b `ses_ecddf6e4affeIYzoSyo9Cyj5Nk`)
+  vanished from the in-flight list and was resumed. Plan §0.12 assumed a switch needs a restart; it does not on this host.
+  Rollback = restore the `.df1.1.bak` copy (also hot). DF-1.2 probes still owed (DF-1.1-1 re-probe: a background `d=none`
+  dispatch's grader must not be denied — the QA dispatches since 23:02 are the probe). p31: 3.1.7 `2330b88`, 3.1.8
+  `f4a59e9` + `e9699c3` (runtime.ts dispose no longer waits on a live child; retry hook only with a built executor);
+  414 green. p31 coverage below gate (runtime 64.7 branches, launch 88.2, expand 86.6): top-ups in flight
+  `ses_ecda3f914ffecrInDmoj6twQ26` (runtime test), `ses_ecda3de14ffeip6TaGO8Wk009l` (launch/expand tests). p32: `kick()`
+  fix `9b81022` (165 unit green); real-git file still 19/25.
 
 *(superseded)* **NEXT ACTION (2026-10-12 ≈16:30): DF-1.1 re-switch — waiting for the owner restart; then the DF-1.1 self-check and
 re-probes (DF1.4.a with `df1.1`, c runner criterion, d, e), then Wave 3.** `cpx/pdf1-1` merged into `cpx/main` as
