@@ -389,7 +389,17 @@ implementations, so the plan now runs on its own data/state dirs (owner decision
   then paste the kickoff prompt of §0b with "NEXT ACTION (≈16:45)" as the starting point. `opencode debug paths` with
   these variables gives data/log/db under `%LOCALAPPDATA%\omr-cpx\xdg-data\opencode`, state under `xdg-state`, config =
   the process-scoped copy (checked). `auth.json`, `account.json`, `mcp-auth.json` copied there (re-copy if a login
-  expires). The host log for self-checks is now `%LOCALAPPDATA%\omr-cpx\xdg-data\opencode\log\opencode.log`; subagent
+  expires). **The files are not enough on v2:** the active provider connection lives in `opencode.db` table `credential`.
+  With an empty table, opencode-anthropic-fix loads but does not take over `anthropic` (`lib\host\v2.mjs` ≈79-104,
+  `managed` needs an active credential with `methodID` `opencode-anthropic-fix`), so the native transport sends the
+  OAuth token and every turn fails with `Your credit balance is too low` (runs `07c4890a`, `3e7551fc`, `0b4f83a8`,
+  `0f7045b4`). Fixed 2026-10-12 ≈18:20 (orchestrator takeover: roles cannot write outside the work root), with no
+  isolated 2.0.26 process running: the shared DB's active credential `cred_108ab2d13001yBMlonTsRHUSlx` and the kv
+  marker `migration.v1-v2` were copied into the isolated DB (`quick_check` ok). Script:
+  `%TEMP%\Claude\copy-credential.mjs`. Backup: `%LOCALAPPDATA%\omr-cpx\db-backup-20261012-pre-credential`. If the
+  `[anthropic] ... could not be resolved` warning or the credit error comes back, use `/connect` → Anthropic → "Claude
+  Pro/Max (multi-account)" in the isolated session (the script refuses to run once an `anthropic` row exists). The isolated server also boots the location `C:\Users\Marquinho`, so each
+  plugin loads twice; record it as a deviation in the self-check (QA-DF1-13). The host log for self-checks is now `%LOCALAPPDATA%\omr-cpx\xdg-data\opencode\log\opencode.log`; subagent
   outputs are in that directory's `opencode.db`. Still shared with the owner's servers: the router's pending journal
   (`~/.local/state/opencode-model-router`, guarded by the DF-1-10 beats) and the outcome dir under `%TEMP%`.
 - **First steps in the new session:** (1) run-scoped self-check against the new log (df1.1 entrypoint, 2.0.26, one
@@ -403,6 +413,13 @@ implementations, so the plan now runs on its own data/state dirs (owner decision
   memo (run V1-V8 first; V1 true). DF-1.1 re-probes c passed, d passed with DF-1.1-2 (duplicate turn rows per module
   copy, fix in `pdf1-2`), e fails until opencode-anthropic-fix#42 is merged.
 - **Revert:** as below; drop the two XDG variables to return to the shared DB.
+- **Self-check (2026-10-12 18:22, fresh session on the isolated DB):** nonce `omr-selfcheck-c41e9a07b3d2`, run
+  `c39fd4cd` in `%LOCALAPPDATA%\omr-cpx\xdg-data\opencode\log\opencode.log`: `cli starting version=2.0.26`; locations
+  `D:\git\omr-cpx-main` and `C:\Users\Marquinho` (deviation QA-DF1-13, known), no `D:\git\opencode-model-router`
+  location; per location the loaded plugins are {`opencode-anthropic-fix`, `omr-cpx-dogfood-df1.1`} (telegram absent,
+  the recorded baseline difference); router entrypoint `file:///D:/git/omr-cpx-dogfood-df1.1/server.ts`; one
+  `router_verify` tool. **Pass.** Provider turns work (credential fix holds). The session was started with the
+  §0 kickoff prompt; the orchestrator resumed from this NEXT ACTION instead of re-running 0.P (done 2026-10-10).
 
 *(superseded)* **NEXT ACTION (2026-10-12 ≈16:30): DF-1.1 re-switch — waiting for the owner restart; then the DF-1.1 self-check and
 re-probes (DF1.4.a with `df1.1`, c runner criterion, d, e), then Wave 3.** `cpx/pdf1-1` merged into `cpx/main` as
