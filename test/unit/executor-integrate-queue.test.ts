@@ -640,7 +640,12 @@ class PoolDouble implements SlotPool {
     if (slot === "integration") this.w.iwtHead = commit;
   }
   async cleanForChecks(): Promise<void> {}
-  async release(slot: string): Promise<void> { this.released.push(slot); }
+  /** Called synchronously at the start of every release (test hook). */
+  onRelease: ((slot: string) => void) | null = null;
+  async release(slot: string): Promise<void> {
+    this.released.push(slot);
+    this.onRelease?.(slot);
+  }
   async get(slot: string): Promise<SlotRecord | null> {
     return { schema: 1, slot, path: slotPath(slot), kind: slot === "integration" ? "integration" : slot === "ci" ? "ci" : "task", planId: PLAN_ID,
       repoKey: "repo-key", state: "leased", owner: null, commit: this.w.slotCommit.get(slot) ?? null, managers: [], manifests: {},
@@ -691,8 +696,11 @@ class SuiteDouble implements PhaseSuiteRunner {
   readonly reverts: RevertRequest[] = [];
   constructor(private readonly w: World) {}
   async resolve(): Promise<SuiteResolution> { return this.resolution; }
+  /** When set, every run waits for it before returning its verdict. */
+  runGate: Promise<void> | null = null;
   async run(req: SuiteRunRequest, _j: StepJournal): Promise<SuiteVerdict> {
     this.runs.push(req);
+    if (this.runGate !== null) await this.runGate;
     return this.onRun === null ? { kind: "passed" } : this.onRun(req);
   }
   async revert(req: RevertRequest, j: StepJournal): Promise<RevertVerdict> {
@@ -719,7 +727,10 @@ class LanderDouble implements Lander {
     this.inspectResult = { ok: true, baseTip: w.base, noop: false };
   }
   tagName(planId: string, phaseId: string): string { return `omr/${planId}/phase/${phaseId}`; }
+  /** Called synchronously at the start of every tag (test hook). */
+  onTag: (() => void) | null = null;
   async tag(req: { cwd: string; name: string; commit: string }): Promise<TagOutcome> {
+    this.onTag?.();
     this.w.write("tag", req.cwd);
     if (this.tagOutcome !== null) return this.tagOutcome;
     const at = this.tags.get(req.name);
@@ -760,9 +771,21 @@ class CrashWriter implements LedgerWriter {
   /** Appends whose promise has not settled yet (the harness waits for 0 before it looks at side effects). */
   inflight = 0;
   crashAfter: number | null = null;
+  /**
+   * One-shot hook run synchronously at the queue's next read of `ledger` (the tests read `inner.ledger`, so only the queue
+   * triggers it). Used to land a kick at an exact point of a lane loop (lost wake-up regression).
+   */
+  onNextRead: (() => void) | null = null;
   constructor(readonly inner: LedgerWriter, private readonly w: World) {}
   get planId(): string { return this.inner.planId; }
-  get ledger(): Readonly<LedgerV1> { return this.inner.ledger; }
+  get ledger(): Readonly<LedgerV1> {
+    const hook = this.onNextRead;
+    if (hook !== null) {
+      this.onNextRead = null;
+      hook();
+    }
+    return this.inner.ledger;
+  }
   async append(batch: readonly ExecutorEventInput[] | BatchBuilder): Promise<Readonly<LedgerV1>> {
     if (this.w.dead) throw new CrashError("crash (dead)");
     this.inflight++;
@@ -856,7 +879,8 @@ class Env {
     await this.open(false, null);
   }
 
-  get ledger(): Readonly<LedgerV1> { return this.writer.ledger; }
+  /** The test's view of the ledger; bypasses `CrashWriter.onNextRead` so only queue reads trigger the hook. */
+  get ledger(): Readonly<LedgerV1> { return this.writer.inner.ledger; }
   state(id: string): TaskState | "missing" { return this.ledger.tasks[id]?.state ?? "missing"; }
   phase(id = "p1"): LedgerV1["phases"][number] {
     const p = this.ledger.phases.find(x => x.id === id);
@@ -1855,6 +1879,80 @@ describe("abort (4.9)", () => {
     expect(await env.steps()).toEqual([]);
     expect(env.state("T1")).toBe("verified");
     await env.queue.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// M4 lanes: a kick that lands while a lane loop is exiting is never lost (lost wake-up regression)
+// ---------------------------------------------------------------------------------------------------------------
+//
+// The gap: a lane loop finds nothing to do and returns, but its running flag is cleared only in the `.finally` reaction,
+// which is queued when the loop's promise settles. A kick that runs in between used to see the lane "running" and do
+// nothing, stranding the work queued with it. Both tests land the kick exactly there: the hook fires at the queue's first
+// ledger read after the lane's last job (the loop's own `laneOpen()` on the iteration that finds nothing) and queues the
+// kick as a microtask, which runs after the loop returned (same synchronous run) and before the `.finally` (queued later).
+
+describe("lanes (M4): no lost wake-up", () => {
+  it("serial: an enqueue landing after the loop found nothing to do, before it cleared its running flag, still integrates", async () => {
+    const env = await setup({ tasks: 1, resume: false, mutate: l => {
+      const p = l.phases[0];
+      if (p !== undefined) p.gate = "passed"; // resume queues a tag entry: the serial lane's only job
+      const t = l.tasks.T1;
+      if (t !== undefined) t.phase = null; // outside the phase; enqueued only by the hook
+    } });
+    let fired = false;
+    // After `lander.tag` the tag job reads the ledger no more (closing batch, lock release), so the next queue read is the
+    // serial loop's `laneOpen()` on its exit iteration.
+    env.lander.onTag = () => {
+      env.lander.onTag = null;
+      env.writer.onNextRead = () => {
+        queueMicrotask(() => {
+          env.queue.enqueue(["T1"]);
+          fired = true;
+        });
+      };
+    };
+    await env.queue.resume();
+    await env.until(() => fired, "the hook", 20_000);
+    await env.until(() => env.state("T1") === "integrated" && env.quiet(), "T1 integrated after a kick in the serial exit gap", 20_000);
+    expect(env.phase().tag).not.toBeNull();
+    expect(env.queue.queued()).toEqual([]);
+    expect(env.w.integratedCount()).toEqual({ T1: 1 });
+    env.assertInvariants();
+  });
+
+  it("background: a suite queued after the loop found no suite, before it cleared its running flag, still runs", async () => {
+    const env = await setup({ tasks: 0, resume: false, mutate: l => {
+      // p1 has no tasks, so it is integrated and resume starts its suite. p2 is `suite-running` with no open entry (the A2-1
+      // recovery row) but paused, so resume leaves it alone until the test unpauses it.
+      l.phases.push({ id: "p2", title: "Phase 2", wave: "w1", dependsOn: [], gate: "suite-running", qaRound: 1, paused: true, tag: null });
+      l.waves[0]?.phases.push("p2");
+    } });
+    env.suite.resolution = RUNS;
+    let release!: () => void;
+    env.suite.runGate = new Promise<void>(resolve => { release = resolve; });
+    let fired = false;
+    // runSuite's `finally` releases `ci` after the closing batch; the next queue read is the background loop's `laneOpen()`
+    // on its exit iteration. checkPhase(p2) (suite-running, no open entry) queues the suite and kicks synchronously.
+    env.pool.onRelease = slot => {
+      if (slot !== "ci") return;
+      env.pool.onRelease = null;
+      env.writer.onNextRead = () => {
+        queueMicrotask(() => {
+          void env.queue.checkPhase("p2");
+          fired = true;
+        });
+      };
+    };
+    await env.queue.resume();
+    await env.until(() => env.suite.runs.length === 1, "the p1 suite to start", 20_000);
+    await env.writer.append([{ type: "phase-paused", phaseId: "p2", paused: false, reason: "unpause" }]);
+    release();
+    await env.until(() => fired, "the hook", 20_000);
+    await env.until(() => env.phase("p2").gate === "awaiting-qa" && env.quiet(), "the p2 suite after a kick in the background exit gap", 20_000);
+    expect(env.phase("p1").gate).toBe("awaiting-qa");
+    expect(env.suite.runs.map(r => r.phaseId)).toEqual(["p1", "p2"]);
+    env.assertInvariants();
   });
 });
 

@@ -1295,17 +1295,43 @@ class Queue implements IntegrationQueue {
   // Lanes (M4)
   // -------------------------------------------------------------------------------------------------------------
 
+  /**
+   * Starts each lane loop that is not running. A kick that finds a loop running sets that lane's `wanted` flag, which the
+   * loop's `.finally` re-checks: a loop that already decided it had nothing to do (pickSerial null, no suite) but has not
+   * cleared its running flag yet would otherwise swallow the kick, and the work queued with it would wait for the next one.
+   */
   private kick(): void {
     if (this.disposed || this.stopped || this.aborting || !this.resumed) return;
-    if (!this.serialRunning) {
+    if (this.serialRunning) {
+      this.serialWanted = true;
+    } else {
       this.serialRunning = true;
-      this.serialLoopP = this.serialLoop().finally(() => { this.serialRunning = false; });
+      this.serialWanted = false;
+      this.serialLoopP = this.serialLoop().finally(() => {
+        this.serialRunning = false;
+        if (this.serialWanted) {
+          this.serialWanted = false;
+          this.kick();
+        }
+      });
     }
-    if (!this.backgroundRunning) {
+    if (this.backgroundRunning) {
+      this.backgroundWanted = true;
+    } else {
       this.backgroundRunning = true;
-      this.backgroundLoopP = this.backgroundLoop().finally(() => { this.backgroundRunning = false; });
+      this.backgroundWanted = false;
+      this.backgroundLoopP = this.backgroundLoop().finally(() => {
+        this.backgroundRunning = false;
+        if (this.backgroundWanted) {
+          this.backgroundWanted = false;
+          this.kick();
+        }
+      });
     }
   }
+
+  private serialWanted = false;
+  private backgroundWanted = false;
 
   private laneOpen(): boolean {
     return this.resumed && !this.disposed && !this.stopped && !this.aborting && this.ledger.status === "running";
