@@ -1,7 +1,7 @@
 // Impure, bounded Git fingerprint adapter. Never interpolates paths into a shell.
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstat, readdir, readFile, readlink, realpath } from "node:fs/promises";
+import { lstat, readdir, readFile, readlink, realpath, stat } from "node:fs/promises";
 import { constants as osConstants, setPriority } from "node:os";
 import { extname, join, resolve } from "node:path";
 import { ABSENT_DIGEST, FILE_DIGEST_PREFIX, LINK_DIGEST_PREFIX, type TreeSnapshot, type ChangedFile } from "./dispatch";
@@ -215,14 +215,24 @@ export const MAX_IGNORED_WALK_ENTRIES = 50_000;
 export const IGNORED_MODULE_EXTENSIONS: readonly string[] = [".js", ".cjs", ".mjs", ".ts", ".cts", ".mts", ".tsx", ".jsx", ".json"];
 
 /**
+ * Cross-repo P3a (D23, QA round 2 M-A): the tool-state directories `listIgnoredModules` never lists nor walks, at any depth
+ * (a `node_modules`, so `node_modules/.vite`, is never walked either): a check of the linked repository run earlier by the gate
+ * can write fresh files there, which are neither build output nor modules a consumer loads.
+ */
+export const IGNORED_TOOL_STATE_DIRS: readonly string[] = ["coverage", ".nyc_output", ".vitest", ".cache"];
+
+/**
  * Cross-repo P3a (D23): what `listIgnoredModules` found: the absolute paths (sorted, deduplicated), or why there is no list.
  * The file bounds count only the kept files (after the extension, declaration and `since` filters); the walk bound counts
  * every directory entry read, a skipped nested repository's included.
+ * `newestMtimeByDir` (QA round 2 M-A): per ignored directory that contributed files, the newest own mtime (lstat, ms) of
+ * its listed files. The key is the directory git reports (`--directory`, e.g. `dist`), relative to the root with `/`
+ * separators and no trailing slash; a file git lists on its own is keyed by its parent directory (`.` at the root).
  * `overBounds`: past MAX_IGNORED_MODULES, MAX_IGNORED_MODULE_PATH_BYTES or MAX_IGNORED_WALK_ENTRIES (never truncated).
  * `unavailable`: not a repository, a git failure, an unreadable directory or an abort (fail closed).
  */
 export type IgnoredModules =
-  | { readonly files: readonly string[] }
+  | { readonly files: readonly string[]; readonly newestMtimeByDir: Readonly<Record<string, number>> }
   | { readonly overBounds: true }
   | { readonly unavailable: true };
 
@@ -248,6 +258,11 @@ export interface ListIgnoredModulesOptions {
 
 /** Cross-repo P3a (QA M4): declaration files are never modules a consumer loads at run time. */
 const DECLARATION_FILE = /\.d\.[cm]?ts$/i;
+
+/** Cross-repo P3a (D23, QA round 2 M-A): a `node_modules` or tool-state (IGNORED_TOOL_STATE_DIRS) path segment, any case for the latter. */
+function isSkippedIgnoredSegment(segment: string): boolean {
+  return segment === "node_modules" || IGNORED_TOOL_STATE_DIRS.includes(segment.toLowerCase());
+}
 
 /**
  * Cross-repo P2.6: a digest of the ignored files `git ls-files` lists (IGNORED_LIST_ARGS), minus any path with a
@@ -322,7 +337,9 @@ async function ignoredFilesDigest(
  * always hardened (`hardenedGit`: no hooks, no fsmonitor, no optional locks, so no index refresh; read-only), the reported
  * directories walked here, bounded, never into a `node_modules` nor into a directory holding a `.git` entry (a nested
  * repository or worktree, skipped entirely). Declaration files (`.d.ts`, `.d.mts`, `.d.cts`) are dropped; with `since`, so is
- * every file whose own mtime is before it (D23 as amended 2026-10-12: only the modules modified during the dispatch). Never throws.
+ * every file whose own mtime is before it (D23 as amended 2026-10-12: only the modules modified during the dispatch). The
+ * tool-state directories (IGNORED_TOOL_STATE_DIRS) are neither listed nor walked, and each listed file's mtime feeds
+ * `newestMtimeByDir` (QA round 2 M-A). Never throws.
  */
 export async function listIgnoredModules(root: string, opts: ListIgnoredModulesOptions): Promise<IgnoredModules> {
   const run = opts.git ?? execGit;
@@ -339,29 +356,36 @@ export async function listIgnoredModules(root: string, opts: ListIgnoredModulesO
       lowPriority: opts.lowPriority === true, env: hardened.env, executable: hardened.executable,
     });
     const files = new Set<string>();
+    const newest = new Map<string, number>();
     const since = opts.since;
     let bytes = 0;
     let walked = 0;
-    /** False once a bound is passed. */
-    const add = async (relative: string): Promise<boolean> => {
+    /** False once a bound is passed. `dir`: the newestMtimeByDir key the file counts toward. */
+    const add = async (relative: string, dir: string): Promise<boolean> => {
       if (!IGNORED_MODULE_EXTENSIONS.includes(extname(relative).toLowerCase())) return true;
       if (DECLARATION_FILE.test(relative)) return true; // QA M4: `.d.ts`, `.d.mts`, `.d.cts` are never loaded.
       const absolute = resolve(root, relative);
       if (files.has(absolute)) return true;
       // QA C1: a file not modified since the dispatch start is stale for the change (lstat: a link's own mtime).
-      if (since !== undefined && !((await lstat(absolute)).mtimeMs >= since)) return true;
+      const mtime = (await lstat(absolute)).mtimeMs;
+      if (since !== undefined && !(mtime >= since)) return true;
       files.add(absolute);
+      // QA round 2 M-A: the newest listed file per ignored directory, for the hook's build-staleness check.
+      if (!(mtime <= (newest.get(dir) ?? -Infinity))) newest.set(dir, mtime);
       bytes += Buffer.byteLength(absolute, "utf8");
       return files.size <= maxFiles && bytes <= maxPathBytes;
     };
     for (const path of listing.split("\0")) {
-      if (path === "" || path.split(/[\\/]/).includes("node_modules")) continue;
+      if (path === "" || path.split(/[\\/]/).some(isSkippedIgnoredSegment)) continue;
       if (!/[\\/]$/.test(path)) {
-        if (!(await add(path))) return overBounds;
+        const slash = path.search(/[\\/][^\\/]*$/);
+        if (!(await add(path, slash < 0 ? "." : path.slice(0, slash).replace(/\\/g, "/")))) return overBounds;
         continue;
       }
       // `--directory`: a wholly ignored directory (`dist/`) is reported once; walk it. Links are entries, never followed.
-      const pending = [path.replace(/[\\/]+$/, "")];
+      const top = path.replace(/[\\/]+$/, "");
+      const key = top.replace(/\\/g, "/");
+      const pending = [top];
       while (pending.length > 0) {
         if (opts.signal.aborted) return unavailable;
         const dir = pending.pop() as string;
@@ -371,17 +395,34 @@ export async function listIgnoredModules(root: string, opts: ListIgnoredModulesO
         // QA M4: a directory holding a `.git` entry (a nested repository or worktree) is skipped entirely, its subtree too.
         if (entries.some(entry => entry.name === ".git")) continue;
         for (const entry of entries) {
-          if (entry.name === "node_modules") continue;
+          if (isSkippedIgnoredSegment(entry.name)) continue;
           const child = `${dir}/${entry.name}`;
           if (entry.isDirectory()) pending.push(child);
-          else if (!(await add(child))) return overBounds;
+          else if (!(await add(child, key))) return overBounds;
         }
       }
     }
     if (opts.signal.aborted) return unavailable;
-    return { files: [...files].sort() };
+    const newestMtimeByDir: Record<string, number> = {};
+    for (const dir of [...newest.keys()].sort()) newestMtimeByDir[dir] = newest.get(dir) as number;
+    return { files: [...files].sort(), newestMtimeByDir };
   } catch {
     return unavailable; // Not a repository, git failed or timed out, a directory vanished or is unreadable: fail closed.
+  }
+}
+
+/**
+ * Cross-repo P3a (D23, QA round 2 M-A): a changed source's mtime in ms (stat: a link's target, whose content the build reads),
+ * undefined when it does not exist (ENOENT, ENOTDIR). Any other error throws (the testsPass hook counts it as newer than
+ * any build: fail closed).
+ */
+export async function fileMtimeMs(path: string): Promise<number | undefined> {
+  try {
+    return (await stat(path)).mtimeMs;
+  } catch (err) {
+    const code = errorCode(err);
+    if (code === "ENOENT" || code === "ENOTDIR") return undefined;
+    throw err;
   }
 }
 

@@ -60,6 +60,7 @@ import {
   resolveEntry,
 } from "./runner";
 import { fileKeyOfId } from "./baseline";
+import { isTestPath } from "./risk";
 import { DEFAULT_MATERIALIZE_TIMEOUT_MS, gcStaleReferences, materialize, nodeReferenceFs } from "./reference";
 import { acquireSlot, type SlotHandle } from "./slot";
 
@@ -1247,6 +1248,12 @@ export interface DirectTestsPassHookDeps {
    * and a non-empty change set; absent: nothing is added (as before).
    */
   listIgnored?: (root: string, signal: AbortSignal, since: number) => Promise<import("./tree").IgnoredModules>;
+  /**
+   * Cross-repo P3a (D23, QA round 2 M-A): a changed source's mtime in ms (tree.ts fileMtimeMs), undefined when the file does not
+   * exist. Compared with the newest listed ignored module of each ignored directory; absent, or a throw, counts as newer than
+   * any build (fail closed: S6 cross-link-build-stale).
+   */
+  mtimeOf?: (path: string) => Promise<number | undefined>;
   logger?: Pick<PluginLogger, "warn">;
 }
 
@@ -1283,6 +1290,78 @@ async function synthesizeFullResult(
   };
 }
 
+/** Cross-repo P3a (D23, QA round 2 M-A): declaration files are never build inputs whose edit leaves the build output stale. */
+const DECLARATION_SOURCE = /\.d\.[cm]?ts$/i;
+
+/**
+ * Cross-repo P3a (D23, QA round 2 M-A): mirrors tree.ts IGNORED_TOOL_STATE_DIRS (not imported: this module stays pure). A path
+ * relative to W with a `node_modules` (so `node_modules/.vite`) or tool-state segment, any case for the latter.
+ */
+const TOOL_STATE_DIRS: readonly string[] = ["coverage", ".nyc_output", ".vitest", ".cache"];
+function isToolStatePath(relative: string): boolean {
+  return relative.split(/[\\/]/).some(segment => segment === "node_modules" || TOOL_STATE_DIRS.includes(segment.toLowerCase()));
+}
+
+/** A deleted status: a porcelain XY code with D in either column, else (`D`, `deleted`) its first letter (as risk.ts). */
+function isDeletedStatus(status: string | undefined): boolean {
+  if (status === undefined) return false;
+  return /^[ MADRCU?!]{2}$/.test(status) ? status.includes("D") : /^d/i.test(status);
+}
+
+/**
+ * Cross-repo P3a (D23, QA round 2 M-A): S6 `cross-link-build-stale` when a changed source of W is newer than the newest listed
+ * ignored module of an ignored directory (`newestByDir`, tree.ts newestMtimeByDir), else undefined. The sources: the request's
+ * changed files under `root` that are not tests (risk.ts isTestPath, on the W-relative path), not declaration files, not
+ * deleted and not ignored (`!!`). A source that no longer exists (`mtimeOf` undefined) is skipped; a source whose mtime cannot
+ * be read (a throw, or no `mtimeOf`) counts as newer than any build (fail closed). The newest source names the S6; the
+ * directories are compared in sorted order.
+ */
+async function buildStaleness(
+  req: TestsPassRequest,
+  root: string,
+  newestByDir: Readonly<Record<string, number>>,
+  mtimeOf: ((path: string) => Promise<number | undefined>) | undefined,
+  host: Partial<RunnerHost> | undefined,
+): Promise<Unverifiable | undefined> {
+  if (req.changedFiles === "unavailable") return undefined;
+  const P = (host?.platform ?? process.platform) === "win32" ? pathWin32 : pathPosix;
+  let newestSource: { rel: string; mtime: number } | undefined;
+  const sources = req.changedFiles
+    .filter(f => f.status !== "!!" && !isDeletedStatus(f.status))
+    .map(f => {
+      const absolute = P.isAbsolute(f.path) ? f.path : P.resolve(req.cwd, f.path);
+      return { absolute, rel: P.relative(root, absolute).replace(/\\/g, "/") };
+    })
+    .filter(s => s.rel !== "" && s.rel !== ".." && !s.rel.startsWith("../") && !P.isAbsolute(s.rel))
+    .filter(s => !isTestPath(s.rel) && !DECLARATION_SOURCE.test(s.rel))
+    .sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
+  for (const source of sources) {
+    let mtime: number | undefined;
+    try {
+      mtime = mtimeOf === undefined ? Infinity : await mtimeOf(source.absolute);
+    } catch {
+      mtime = Infinity;
+    }
+    if (mtime === undefined) continue; // Gone: no content of it can be newer than the build.
+    if (Number.isNaN(mtime)) mtime = Infinity; // Unreadable: fail closed.
+    if (newestSource === undefined || mtime > newestSource.mtime) newestSource = { rel: source.rel, mtime };
+  }
+  if (newestSource === undefined) return undefined;
+  for (const dir of Object.keys(newestByDir).sort()) {
+    if (newestSource.mtime > newestByDir[dir]) {
+      const where = dir === "." ? root : `${root}/${dir}`;
+      return {
+        unverifiable: true,
+        code: "cross-link-build-stale",
+        reason:
+          `the build output in ${where} is older than ${newestSource.rel} changed in the linked repository; ` +
+          "rebuild it (e.g. a buildPasses check in the linked repository before this one) or use scope=full",
+      };
+    }
+  }
+  return undefined;
+}
+
 /**
  * S5 as a direct call (2.1.2.4; 2.2 swaps in the batch coordinator): plan, run under ONE scope,
  * recheck the failing files at the dispatch reference, close the scope. Never rejects.
@@ -1315,10 +1394,14 @@ export function createDirectTestsPassHook(deps: DirectTestsPassHookDeps): TestsP
    * build output (`dist/`) is selected. Over the bounds, unlisted or a throwing lister → S6 (fail closed), before any plan.
    * Otherwise (no cross-link root, no lister, unavailable changed files, nothing ignored) the request's own changed files.
    *
-   * D23 as amended (2026-10-12, QA C1/M4): only the modules modified during the dispatch (lister `since` = the request's
-   * `dispatchStartedAt`, the original start of a deferred one), so a build output older than the change is never a run input.
-   * No start time, or no change of W's in the request: the lister is not called and nothing is added (toward zero selection,
-   * never toward stale inputs).
+   * D23 as amended (2026-10-12, QA C1/M4): only the modules whose own mtime is at or after the dispatch start are listed (lister
+   * `since` = the request's `dispatchStartedAt`, the original start of a deferred one; tool-state directories such as
+   * `coverage/` never), so a build output older than the dispatch is never a run input. A module written during the dispatch
+   * is still stale when W's source changed again after it (QA round 2 M-A): when any changed source of W (buildStaleness) is
+   * newer than the newest listed module of an ignored directory that contributed modules (`dist/`), the request is S6
+   * `cross-link-build-stale` (fail closed), before any plan. No start time, or no change of W's in the request: the lister is
+   * not called and nothing is added; nothing listed: nothing is added and nothing is compared (toward zero selection, never
+   * toward stale inputs).
    */
   const withIgnoredModules = async (req: TestsPassRequest): Promise<{ files: TestsPassRequest["changedFiles"] } | Unverifiable> => {
     if (req.crossLinkRoot === undefined || deps.listIgnored === undefined || req.changedFiles === "unavailable") {
@@ -1335,9 +1418,18 @@ export function createDirectTestsPassHook(deps: DirectTestsPassHookDeps): TestsP
     }
     if ("overBounds" in listed) return crossLinkIgnoredS6("over-bounds", root);
     if (!("files" in listed)) return crossLinkIgnoredS6("unavailable", root);
+    // QA round 2 M-A: tool-state files (`coverage/`, ...) are neither inputs nor build output, whatever the lister answers.
+    const P = (deps.host?.platform ?? process.platform) === "win32" ? pathWin32 : pathPosix;
+    const modules = listed.files.filter(path => !isToolStatePath(P.relative(root, path)));
+    if (modules.length > 0) {
+      const newestByDir: Record<string, number> = {};
+      for (const [dir, mtime] of Object.entries(listed.newestMtimeByDir)) if (!isToolStatePath(dir)) newestByDir[dir] = mtime;
+      const stale = await buildStaleness(req, root, newestByDir, deps.mtimeOf, deps.host);
+      if (stale !== undefined) return stale;
+    }
     const seen = new Set(req.changedFiles.map(f => f.path));
     const added: { path: string; status: string }[] = [];
-    for (const path of listed.files) {
+    for (const path of modules) {
       if (seen.has(path)) continue;
       seen.add(path);
       added.push({ path, status: "!!" });

@@ -75,7 +75,7 @@ import {
   type TreeSnapshot,
 } from "./dispatch";
 import { runArgv, runShell } from "./exec";
-import { listIgnoredModules, snapshotTree } from "./tree";
+import { fileMtimeMs, listIgnoredModules, snapshotTree } from "./tree";
 import { crossLinkAliases, discoverConsumers, linkedTargets, planPerimeter, type ConsumerDiscovery } from "./perimeter";
 import { defaultExternalLinks, pinTarget, type LinkPin } from "./pin";
 import { depthBelow, gitTopOf, perimeterKey } from "./git-top";
@@ -1463,6 +1463,8 @@ export function createVerificationWiring(deps: {
       // Cross-repo P3a (D23): the linked repository's ignored modules, hardened and bounded; called only with crossLinkRoot and
       // the dispatch start (D23 as amended 2026-10-12: only the modules modified since, never a stale build output).
       listIgnored: (root, signal, since) => listIgnoredModules(root, { signal, since, lowPriority: budget.lowPriority }),
+      // QA round 2 M-A: a changed source of W newer than the newest listed build output makes the request S6 build-stale.
+      mtimeOf: (path) => fileMtimeMs(path),
     });
     // 2.2.3 (S5): with a batch window, concurrent testsPass checks of this plugin instance meet in
     // the coordinator; the direct hook stays behind it for "full" scope and single requests (B2).

@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createDirectTestsPassHook, createScopeOpener, runDeterministic } from "../../src/verify/deterministic";
 import { runArgv, runShell } from "../../src/verify/exec";
 import { crossLinkAliases } from "../../src/verify/perimeter";
-import { listIgnoredModules } from "../../src/verify/tree";
+import { fileMtimeMs, listIgnoredModules } from "../../src/verify/tree";
 import type { RunnerFs, TestSearchSeam } from "../../src/verify/runner";
 import type { TestsPassHook, TestsPassRun } from "../../src/verify/types";
 import { resolveVerifyBudget, type VerifyBudget } from "../../src/router/config";
@@ -87,6 +87,8 @@ function realHook(budget: VerifyBudget): TestsPassHook {
     budget,
     // wiring.ts: W's git-ignored modules modified at or after the dispatch start (D23, QA C1).
     listIgnored: (root, signal, since) => listIgnoredModules(root, { signal, since, lowPriority: budget.lowPriority }),
+    // wiring.ts (QA round 2 M-A): a changed source of W newer than the newest listed build output → S6 build-stale.
+    mtimeOf: fileMtimeMs,
   });
 }
 
@@ -337,6 +339,35 @@ describe.skipIf(!existsSync(join(OWN_VITEST, "vitest.mjs")))("cross-link related
       const scoped = runs[0]?.scoped;
       expect(scoped?.kind).toBe("ran");
       if (scoped?.kind === "ran") expect(scoped.result.total).toBe(0);
+      expect(failures).toEqual([]);
+    }, RUN_TIMEOUT_MS);
+
+    it("QA round 2 M-A: src edited again after the build (dist fresh, but older than src): unverifiable cross-link-build-stale, never a pass on the intermediate build", async () => {
+      const { src, dist } = buildLib();
+      const started = Date.now() - 60_000;
+      const edited = new Date(started + 10_000);
+      const built = new Date(started + 20_000);
+      const reedited = new Date(started + 30_000);
+      // The producer edits src, builds dist (fresh: after the dispatch start), then edits src again, breaking C, and never rebuilds.
+      write(src, "export function add(a, b) {\n  return b + a;\n}\n");
+      utimesSync(src, edited, edited);
+      write(dist, "export function add(a, b) {\n  return b + a;\n}\n");
+      utimesSync(dist, built, built);
+      write(src, "export function add(a, b) {\n  return a - b;\n}\n");
+      utimesSync(src, reedited, reedited);
+      const { verdict, runs, failures } = await runConsumerCheck(fx, "npx vitest run", [src], started);
+      expect(verdict.outcome).toBe("unverifiable");
+      const scoped = runs[0]?.scoped;
+      expect(scoped?.kind).toBe("unverifiable");
+      if (scoped?.kind === "unverifiable") {
+        expect(scoped.code).toBe("cross-link-build-stale");
+        expect(scoped.reason.startsWith("the build output in ")).toBe(true);
+        expect(scoped.reason.endsWith(
+          "/dist is older than src/index.js changed in the linked repository; " +
+          "rebuild it (e.g. a buildPasses check in the linked repository before this one) or use scope=full",
+        )).toBe(true);
+      }
+      expect(verdict.reasons.join("\n")).toContain("is older than src/index.js changed in the linked repository");
       expect(failures).toEqual([]);
     }, RUN_TIMEOUT_MS);
   });

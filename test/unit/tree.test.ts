@@ -466,6 +466,11 @@ describe("listIgnoredModules — the linked repository's ignored modules (cross-
   const DECLARATIONS = ["dist/index.d.ts", "dist/esm/index.d.mts", "dist/cjs/index.d.cts", "dist/upper.D.TS"];
   /** QA M4: modules inside a nested repository (`.git` directory) and a worktree (`.git` file) under `dist/`: never listed. */
   const NESTED = ["dist/nested/x.js", "dist/nested/deep/y.js", "dist/wt/z.js", "dist/wt/sub/w.json"];
+  /** QA round 2 M-A: modules in tool-state directories a check run earlier by the gate can write: never listed. */
+  const TOOL_STATE = [
+    "coverage/lcov-report/prettify.js", ".nyc_output/out.json", ".vitest/results.json", ".cache/x.js",
+    "dist/.cache/y.js", "dist/coverage/z.json", "node_modules/.vite/deps/chunk.js",
+  ];
 
   afterAll(async () => {
     await cleanup?.();
@@ -496,7 +501,7 @@ describe("listIgnoredModules — the linked repository's ignored modules (cross-
       GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.com",
     };
     const git = (...args: string[]) => cp.execFileSync("git", ["-c", "core.autocrlf=false", "-c", "commit.gpgsign=false", ...args], { cwd: repo, env, stdio: "ignore" });
-    await write(".gitignore", "dist/\nnode_modules/\ngenerated.json\n*.log\n");
+    await write(".gitignore", "dist/\nnode_modules/\ngenerated.json\n*.log\ncoverage/\n.nyc_output/\n.vitest/\n.cache/\n");
     await write("src/a.ts", "export const a = 1;\n");
     await write("package.json", "{}\n");
     cleanup = async () => {
@@ -519,6 +524,8 @@ describe("listIgnoredModules — the linked repository's ignored modules (cross-
     await write("dist/nested/.git/HEAD", "ref: refs/heads/main\n");
     await write("dist/wt/.git", "gitdir: ../../.git/worktrees/wt\n");
     for (const rel of NESTED) await write(rel, "x");
+    // QA round 2 M-A: tool-state modules (top level and inside the ignored `dist/`): never listed, never walked.
+    for (const rel of TOOL_STATE) await write(rel, "x");
   }, 60_000);
 
   const abs = (rels: readonly string[]) => rels.map(rel => resolve(repo, rel)).sort();
@@ -526,7 +533,7 @@ describe("listIgnoredModules — the linked repository's ignored modules (cross-
   it("lists the ignored .js/.cjs/.mjs/.ts/.cts/.mts/.tsx/.jsx/.json files under the root as absolute paths, never under node_modules", async () => {
     expect([...tree.IGNORED_MODULE_EXTENSIONS].sort()).toEqual([".cjs", ".cts", ".js", ".json", ".jsx", ".mjs", ".mts", ".ts", ".tsx"]);
     const result = await tree.listIgnoredModules(repo, { signal });
-    expect(result).toEqual({ files: abs(MODULES) });
+    expect(result).toMatchObject({ files: abs(MODULES) });
     const files = "files" in result ? result.files : [];
     expect(files.every(file => !file.split(/[\\/]/).includes("node_modules"))).toBe(true);
     expect(files).not.toContain(resolve(repo, "src/a.ts")); // tracked
@@ -540,7 +547,7 @@ describe("listIgnoredModules — the linked repository's ignored modules (cross-
     expect(tree.MAX_IGNORED_WALK_ENTRIES).toBe(50_000);
     const bytes = abs(MODULES).reduce((sum, file) => sum + Buffer.byteLength(file, "utf8"), 0);
     // Exactly at the bounds (node_modules and non-module files not counted): the whole list.
-    expect(await tree.listIgnoredModules(repo, { signal, maxFiles: MODULES.length, maxPathBytes: bytes })).toEqual({ files: abs(MODULES) });
+    expect(await tree.listIgnoredModules(repo, { signal, maxFiles: MODULES.length, maxPathBytes: bytes })).toMatchObject({ files: abs(MODULES) });
     expect(await tree.listIgnoredModules(repo, { signal, maxFiles: MODULES.length - 1 })).toEqual({ overBounds: true });
     expect(await tree.listIgnoredModules(repo, { signal, maxPathBytes: bytes - 1 })).toEqual({ overBounds: true });
     expect(await tree.listIgnoredModules(repo, { signal, maxWalkEntries: 1 })).toEqual({ overBounds: true });
@@ -553,7 +560,7 @@ describe("listIgnoredModules — the linked repository's ignored modules (cross-
       return tree.execGit(args, opts);
     };
     const index = await readIndex();
-    expect(await tree.listIgnoredModules(repo, { signal, git, lowPriority: true })).toEqual({ files: abs(MODULES) });
+    expect(await tree.listIgnoredModules(repo, { signal, git, lowPriority: true })).toMatchObject({ files: abs(MODULES) });
     expect(seen).toHaveLength(1);
     const { args, opts } = seen[0] as { args: readonly string[]; opts: GitOptions };
     expect(args.slice(args.indexOf("ls-files"))).toEqual([...tree.IGNORED_LIST_ARGS]);
@@ -589,7 +596,7 @@ describe("listIgnoredModules — the linked repository's ignored modules (cross-
 
   it("skips a directory holding a .git entry (nested repository or worktree) entirely, its subtree included — QA M4", async () => {
     const result = await tree.listIgnoredModules(repo, { signal });
-    expect(result).toEqual({ files: abs(MODULES) });
+    expect(result).toMatchObject({ files: abs(MODULES) });
     const files = "files" in result ? result.files : [];
     for (const nested of abs(NESTED)) expect(files).not.toContain(nested);
     expect(files.some(file => file.split(/[\\/]/).includes(".git"))).toBe(false);
@@ -604,12 +611,54 @@ describe("listIgnoredModules — the linked repository's ignored modules (cross-
     for (const rel of MODULES.filter(rel => !stale.includes(rel))) touch(rel, fresh);
     touch("dist/d.jsx", since); // exactly at `since`: kept (>=)
     const kept = MODULES.filter(rel => !stale.includes(rel));
-    expect(await tree.listIgnoredModules(repo, { signal, since: since.getTime() })).toEqual({ files: abs(kept) });
+    expect(await tree.listIgnoredModules(repo, { signal, since: since.getTime() })).toMatchObject({ files: abs(kept) });
     // An old build output is excluded, a fresh one included; nothing at all when every file predates `since`.
-    expect(await tree.listIgnoredModules(repo, { signal, since: fresh.getTime() + 1_000 })).toEqual({ files: [] });
+    expect(await tree.listIgnoredModules(repo, { signal, since: fresh.getTime() + 1_000 })).toEqual({ files: [], newestMtimeByDir: {} });
     // Without since: no mtime filter (the hook never calls without one).
-    expect(await tree.listIgnoredModules(repo, { signal })).toEqual({ files: abs(MODULES) });
+    expect(await tree.listIgnoredModules(repo, { signal })).toMatchObject({ files: abs(MODULES) });
     // The bounds count only the kept files.
-    expect(await tree.listIgnoredModules(repo, { signal, since: since.getTime(), maxFiles: kept.length })).toEqual({ files: abs(kept) });
+    expect(await tree.listIgnoredModules(repo, { signal, since: since.getTime(), maxFiles: kept.length })).toMatchObject({ files: abs(kept) });
+  }, 60_000);
+
+  it("returns the newest own mtime of the listed files per ignored directory (git's `dist`, `.` for a root file) — QA round 2 M-A", async () => {
+    const t1 = new Date(Date.UTC(2022, 0, 1, 0, 0, 0));
+    const t2 = new Date(Date.UTC(2022, 1, 1, 0, 0, 0));
+    const t3 = new Date(Date.UTC(2022, 2, 1, 0, 0, 0));
+    const t4 = new Date(Date.UTC(2022, 3, 1, 0, 0, 0));
+    for (const rel of MODULES) touch(rel, t1);
+    touch("dist/esm/index.mjs", t3); // the newest of `dist`, deep in it
+    touch("generated.json", t2); // listed on its own at the root: key `.`
+    // Never listed, so never counted, however fresh: declarations, nested repositories, tool state, non-modules.
+    for (const rel of [...DECLARATIONS, ...NESTED, ...TOOL_STATE, "dist/index.js.map"]) touch(rel, t4);
+    expect(await tree.listIgnoredModules(repo, { signal }))
+      .toEqual({ files: abs(MODULES), newestMtimeByDir: { ".": t2.getTime(), dist: t3.getTime() } });
+    // With since: only the kept files count.
+    expect(await tree.listIgnoredModules(repo, { signal, since: t2.getTime() })).toEqual({
+      files: abs(["dist/esm/index.mjs", "generated.json"]),
+      newestMtimeByDir: { ".": t2.getTime(), dist: t3.getTime() },
+    });
+    expect(await tree.listIgnoredModules(repo, { signal, since: t3.getTime() }))
+      .toEqual({ files: abs(["dist/esm/index.mjs"]), newestMtimeByDir: { dist: t3.getTime() } });
+  }, 60_000);
+
+  it("never lists nor walks the tool-state directories (coverage/, .nyc_output/, .vitest/, .cache/, node_modules/.vite), at any depth — QA round 2 M-A", async () => {
+    expect([...tree.IGNORED_TOOL_STATE_DIRS].sort()).toEqual([".cache", ".nyc_output", ".vitest", "coverage"]);
+    const now = new Date();
+    for (const rel of TOOL_STATE) touch(rel, now); // fresh: a W check run earlier by the gate wrote them
+    const result = await tree.listIgnoredModules(repo, { signal, since: now.getTime() - 60_000 });
+    const files = "files" in result ? result.files : [];
+    for (const file of abs(TOOL_STATE)) expect(files).not.toContain(file);
+    const dirs = "newestMtimeByDir" in result ? Object.keys(result.newestMtimeByDir) : [];
+    expect(dirs.filter(dir => /(^|\/)(coverage|\.nyc_output|\.vitest|\.cache|node_modules)(\/|$)/.test(dir))).toEqual([]);
+    // Without since, too: only the modules.
+    expect(await tree.listIgnoredModules(repo, { signal })).toMatchObject({ files: abs(MODULES) });
+  }, 60_000);
+
+  it("fileMtimeMs: a file's mtime (fs.utimesSync), undefined when it does not exist — QA round 2 M-A", async () => {
+    const at = new Date(Date.UTC(2023, 4, 5, 6, 7, 8));
+    touch("src/a.ts", at);
+    expect(await tree.fileMtimeMs(resolve(repo, "src/a.ts"))).toBe(at.getTime());
+    expect(await tree.fileMtimeMs(resolve(repo, "src/missing.ts"))).toBeUndefined();
+    expect(await tree.fileMtimeMs(resolve(repo, "src/a.ts/child.ts"))).toBeUndefined(); // ENOTDIR (ENOENT on Windows)
   }, 60_000);
 });

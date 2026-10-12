@@ -1409,7 +1409,19 @@ describe("createDirectTestsPassHook — cross-link root (cross-repo P3a)", () =>
     /** D23 as amended (2026-10-12, QA C1): the dispatch start a cross-link request carries (ms epoch). */
     const STARTED = 1_760_000_000_000;
 
-    function setupWith(answer: IgnoredModules | (() => Promise<IgnoredModules>)) {
+    /** QA round 2 M-A: the newest listed build output, after the dispatch start and after every source (SOURCE_MTIME). */
+    const BUILT = STARTED + 1_000;
+    /** QA round 2 M-A: the default mtime of every changed source of W: after the dispatch start, before the build. */
+    const SOURCE_MTIME = STARTED + 500;
+    /** A listing whose every file counts toward one ignored directory (`dist` unless named) built at `newest`. */
+    function listing(files: string[], newestMtimeByDir: Record<string, number> = { dist: BUILT }): IgnoredModules {
+      return { files, newestMtimeByDir };
+    }
+
+    function setupWith(
+      answer: IgnoredModules | (() => Promise<IgnoredModules>),
+      mtimeOf: ((path: string) => Promise<number | undefined>) | null = async () => SOURCE_MTIME,
+    ) {
       const inputs: PlanScopedRunInput[] = [];
       const plan = async (input: PlanScopedRunInput): Promise<ScopingPlan> => {
         inputs.push(input);
@@ -1420,19 +1432,24 @@ describe("createDirectTestsPassHook — cross-link root (cross-repo P3a)", () =>
         calls.push({ root, signal, since });
         return typeof answer === "function" ? answer() : answer;
       };
+      const stats: string[] = [];
+      const seam = mtimeOf === null
+        ? undefined
+        : ((fn: (path: string) => Promise<number | undefined>) => async (path: string) => { stats.push(path); return fn(path); })(mtimeOf);
       const openScope: OpenCheckScope = () => { throw new Error("planning outcomes open no scope"); };
       const plannerFs: PlannerFs = { fileExists: async () => true, readFile: async () => "{}" };
       const search: TestSearchSeam = { findByName: async () => [], findByContent: async () => [] };
       const host = { platform: "linux" as const };
       const hook = createDirectTestsPassHook({
         openScope, plannerFs, search, plan, host, budget: { maxWorkers: 2, failureRecheck: true }, listIgnored,
+        ...(seam !== undefined ? { mtimeOf: seam } : {}),
       });
       const today = { command: "npx vitest run", cwd: CWD, changedFiles: CHANGED, budget: { maxWorkers: 2 }, fs: plannerFs, search, host };
-      return { hook, inputs, calls, today };
+      return { hook, inputs, calls, stats, today };
     }
 
     it("appends W's ignored modules to the plan's changed files, deduplicated, listing W once with the gate's signal", async () => {
-      const s = setupWith({ files: [`${W}/dist/index.js`, `${W}/src/a.ts`, `${W}/dist/esm/index.mjs`] });
+      const s = setupWith(listing([`${W}/dist/index.js`, `${W}/src/a.ts`, `${W}/dist/esm/index.mjs`], { dist: BUILT, src: BUILT }));
       const req = request({ crossLinkRoot: W, dispatchStartedAt: STARTED });
       expect(await s.hook(req)).toEqual({ scoped: { kind: "no-affected", note: "no affected tests" }, recheck: undefined });
       expect(s.calls).toEqual([{ root: W, signal: req.deadline.signal, since: STARTED }]);
@@ -1450,14 +1467,91 @@ describe("createDirectTestsPassHook — cross-link root (cross-repo P3a)", () =>
     });
 
     it("no ignored module: the plan input is the one without a lister", async () => {
-      const s = setupWith({ files: [] });
+      const s = setupWith(listing([], {}));
       await s.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED }));
       expect(s.calls).toHaveLength(1);
       expect(s.inputs[0]).toStrictEqual({ ...s.today, crossLinkRoot: W });
+      // QA round 2 M-A: nothing listed, nothing compared (zero selection guards it).
+      expect(s.stats).toEqual([]);
+    });
+
+    // QA round 2 M-A: a build written during the dispatch is still stale when a source of W changed again after it.
+    const STALE = {
+      scoped: {
+        kind: "unverifiable",
+        code: "cross-link-build-stale",
+        reason:
+          `the build output in ${W}/dist is older than src/a.ts changed in the linked repository; ` +
+          "rebuild it (e.g. a buildPasses check in the linked repository before this one) or use scope=full",
+      },
+      recheck: undefined,
+    };
+
+    it("a changed source of W newer than the newest fresh build in that directory → S6 cross-link-build-stale; the plan is never called (QA round 2 M-A)", async () => {
+      const s = setupWith(listing([`${W}/dist/index.js`, `${W}/dist/esm/index.mjs`]), async () => BUILT + 1);
+      expect(await s.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED }))).toEqual(STALE);
+      expect(s.stats).toEqual([`${W}/src/a.ts`]);
+      expect(s.inputs).toHaveLength(0);
+    });
+
+    it("a changed source of W older than (or as old as) the newest fresh build → the modules are appended as before (QA round 2 M-A)", async () => {
+      for (const mtime of [BUILT - 1, BUILT]) {
+        const s = setupWith(listing([`${W}/dist/index.js`]), async () => mtime);
+        await s.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED }));
+        expect(s.stats).toEqual([`${W}/src/a.ts`]);
+        expect(s.inputs[0]!.changedFiles).toEqual([...CHANGED, { path: `${W}/dist/index.js`, status: "!!" }]);
+      }
+    });
+
+    it("each ignored directory that contributed modules is compared on its own newest module (QA round 2 M-A)", async () => {
+      const s = setupWith(listing([`${W}/dist/index.js`, `${W}/types-gen/index.js`], { dist: BUILT + 10, "types-gen": BUILT }), async () => BUILT + 1);
+      const run = await s.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED }));
+      expect(run.scoped).toEqual({ ...STALE.scoped, reason: STALE.scoped.reason.replace(`${W}/dist`, `${W}/types-gen`) });
+      expect(s.inputs).toHaveLength(0);
+    });
+
+    it("a fresh tool-state file (`coverage/`, `.vitest/`, `node_modules/.vite`) is neither compared nor appended (QA round 2 M-A)", async () => {
+      const files = [`${W}/coverage/prettify.js`, `${W}/dist/index.js`, `${W}/.vitest/results.json`, `${W}/node_modules/.vite/deps.js`];
+      const newest = { coverage: SOURCE_MTIME - 1, dist: BUILT, ".vitest": SOURCE_MTIME - 1, "node_modules/.vite": SOURCE_MTIME - 1 };
+      const s = setupWith(listing(files, newest));
+      await s.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED }));
+      expect(s.inputs[0]!.changedFiles).toEqual([...CHANGED, { path: `${W}/dist/index.js`, status: "!!" }]);
+      // Only tool state fresh: nothing is appended and nothing compared.
+      const only = setupWith(listing([`${W}/coverage/prettify.js`], { coverage: SOURCE_MTIME - 1 }));
+      await only.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED }));
+      expect(only.stats).toEqual([]);
+      expect(only.inputs[0]).toStrictEqual({ ...only.today, crossLinkRoot: W });
+    });
+
+    it("only W's changed sources count: tests, declaration files, deleted, ignored (`!!`), gone and outside-W files never make the build stale (QA round 2 M-A)", async () => {
+      const changedFiles = [
+        { path: `${W}/test/a.test.ts`, status: "modified" },
+        { path: `${W}/src/a.spec.ts`, status: "modified" },
+        { path: `${W}/src/types.d.ts`, status: "modified" },
+        { path: `${W}/src/old.ts`, status: "deleted" },
+        { path: `${W}/src/older.ts`, status: " D" },
+        { path: `${W}/dist/extra.js`, status: "!!" },
+        { path: `${W}/src/gone.ts`, status: "modified" },
+        { path: `${CWD}/src/consumer.ts`, status: "modified" },
+      ];
+      const s = setupWith(listing([`${W}/dist/index.js`]), async path => (path === `${W}/src/gone.ts` ? undefined : BUILT + 1));
+      const run = await s.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED, changedFiles }));
+      expect(run.scoped.kind).toBe("no-affected");
+      expect(s.stats).toEqual([`${W}/src/gone.ts`]);
+      expect(s.inputs[0]!.changedFiles).toEqual([...changedFiles, { path: `${W}/dist/index.js`, status: "!!" }]);
+    });
+
+    it("a source whose mtime cannot be read, or no mtime seam at all, counts as newer than the build (fail closed, QA round 2 M-A)", async () => {
+      const thrown = setupWith(listing([`${W}/dist/index.js`]), async () => { throw new Error("EACCES"); });
+      expect(await thrown.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED }))).toEqual(STALE);
+      expect(thrown.inputs).toHaveLength(0);
+      const unseamed = setupWith(listing([`${W}/dist/index.js`]), null);
+      expect(await unseamed.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED }))).toEqual(STALE);
+      expect(unseamed.inputs).toHaveLength(0);
     });
 
     it("passes since = the request's dispatch start to the lister (D23 as amended, QA C1)", async () => {
-      const s = setupWith({ files: [`${W}/dist/index.js`] });
+      const s = setupWith(listing([`${W}/dist/index.js`]));
       await s.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED + 42 }));
       expect(s.calls.map(call => call.since)).toEqual([STARTED + 42]);
       expect(s.inputs[0]!.changedFiles).toEqual([...CHANGED, { path: `${W}/dist/index.js`, status: "!!" }]);
@@ -1476,7 +1570,7 @@ describe("createDirectTestsPassHook — cross-link root (cross-repo P3a)", () =>
     });
 
     it("an empty change set for W → the lister is never called and no ignored module is an input (QA M4)", async () => {
-      const s = setupWith({ files: [`${W}/dist/index.js`] });
+      const s = setupWith(listing([`${W}/dist/index.js`]));
       await s.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED, changedFiles: [] }));
       expect(s.calls).toHaveLength(0);
       expect(s.inputs).toHaveLength(1);
@@ -1485,7 +1579,7 @@ describe("createDirectTestsPassHook — cross-link root (cross-repo P3a)", () =>
     });
 
     it("unavailable changed files → the lister is never called (the request's own changed files)", async () => {
-      const s = setupWith({ files: [`${W}/dist/index.js`] });
+      const s = setupWith(listing([`${W}/dist/index.js`]));
       await s.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED, changedFiles: "unavailable" }));
       expect(s.calls).toHaveLength(0);
     });
@@ -1522,7 +1616,7 @@ describe("createDirectTestsPassHook — cross-link root (cross-repo P3a)", () =>
     });
 
     it("without crossLinkRoot the lister is never called and the plan input is the pre-P3a one", async () => {
-      const s = setupWith({ files: [`${W}/dist/index.js`] });
+      const s = setupWith(listing([`${W}/dist/index.js`]));
       await s.hook(request({ dispatchStartedAt: STARTED }));
       expect(s.calls).toHaveLength(0);
       expect(s.inputs[0]).toStrictEqual(s.today);
