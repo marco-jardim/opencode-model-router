@@ -37,6 +37,7 @@ import type {
   RunnerHost,
   RunResult,
   TestSearchSeam,
+  Unverifiable,
 } from "./runner";
 import type { DispatchReference, MaterializedReference, ReferenceDeps } from "./reference";
 import type { TreeSnapshot } from "./dispatch";
@@ -47,6 +48,7 @@ import { resolveAgainst } from "./paths";
 import { isAbsolute, posix as pathPosix, win32 as pathWin32 } from "node:path";
 import { judgeScoped, observeTests, REFERENCE_NONE } from "./baseline";
 import {
+  crossLinkIgnoredS6,
   detectRunner,
   isNoAffected,
   isUnscoped,
@@ -1238,6 +1240,12 @@ export interface DirectTestsPassHookDeps {
   currentTree?: TreeSnapshot;
   /** Planner seam; default planScopedRun. */
   plan?: typeof planScopedRun;
+  /**
+   * Cross-repo P3a (D23, OD-P3a-2 b): lists the linked repository's git-ignored modules (tree.ts listIgnoredModules), added to a
+   * cross-link request's changed files so a consumer that loads W's build output (`dist/`) is selected. Called only for a request
+   * with `crossLinkRoot`; absent: nothing is added (as before).
+   */
+  listIgnored?: (root: string, signal: AbortSignal) => Promise<import("./tree").IgnoredModules>;
   logger?: Pick<PluginLogger, "warn">;
 }
 
@@ -1300,6 +1308,35 @@ export function createDirectTestsPassHook(deps: DirectTestsPassHookDeps): TestsP
     return scope.rechecker(req.command, req.cwd, deps.currentTree)(ref.reference, scoped.result.failingFiles, req.deadline);
   };
 
+  /**
+   * Cross-repo P3a (D23, OD-P3a-2 b, finding X6): with `crossLinkRoot` and a lister, W's git-ignored modules are appended to the
+   * changed files (exact-path duplicates dropped; status `!!`, git's code for an ignored file), so a consumer that loads W's
+   * build output (`dist/`) is selected. Over the bounds, unlisted or a throwing lister → S6 (fail closed), before any plan.
+   * Otherwise (no cross-link root, no lister, unavailable changed files, nothing ignored) the request's own changed files.
+   */
+  const withIgnoredModules = async (req: TestsPassRequest): Promise<{ files: TestsPassRequest["changedFiles"] } | Unverifiable> => {
+    if (req.crossLinkRoot === undefined || deps.listIgnored === undefined || req.changedFiles === "unavailable") {
+      return { files: req.changedFiles };
+    }
+    const root = req.crossLinkRoot;
+    let listed: import("./tree").IgnoredModules;
+    try {
+      listed = await deps.listIgnored(root, req.deadline.signal);
+    } catch {
+      listed = { unavailable: true };
+    }
+    if ("overBounds" in listed) return crossLinkIgnoredS6("over-bounds", root);
+    if (!("files" in listed)) return crossLinkIgnoredS6("unavailable", root);
+    const seen = new Set(req.changedFiles.map(f => f.path));
+    const added: { path: string; status: string }[] = [];
+    for (const path of listed.files) {
+      if (seen.has(path)) continue;
+      seen.add(path);
+      added.push({ path, status: "!!" });
+    }
+    return { files: added.length === 0 ? req.changedFiles : [...req.changedFiles, ...added] };
+  };
+
   return async (req): Promise<TestsPassRun> => {
     let scope: CheckScope | undefined;
     let scoped: ScopedOutcome | undefined;
@@ -1308,11 +1345,16 @@ export function createDirectTestsPassHook(deps: DirectTestsPassHookDeps): TestsP
         scope = deps.openScope({ cwd: req.cwd, command: req.command });
         scoped = await runFull(req, scope);
       } else {
+        // Cross-repo P3a (D23): a cross-link request also passes W's ignored modules (its build output), or is S6 without them.
+        const changedFiles = await withIgnoredModules(req);
+        if ("unverifiable" in changedFiles) {
+          return { scoped: { kind: "unverifiable", code: changedFiles.code, reason: changedFiles.reason }, recheck: undefined };
+        }
         // P2/P3: planning outcomes take no slot and spawn nothing.
         const planned = await plan({
           command: req.command,
           cwd: req.cwd,
-          changedFiles: req.changedFiles,
+          changedFiles: changedFiles.files,
           budget: { maxWorkers: deps.budget.maxWorkers },
           fs: deps.plannerFs,
           search: deps.search,

@@ -75,7 +75,7 @@ import {
   type TreeSnapshot,
 } from "./dispatch";
 import { runArgv, runShell } from "./exec";
-import { snapshotTree } from "./tree";
+import { listIgnoredModules, snapshotTree } from "./tree";
 import { discoverConsumers, linkedTargets, planPerimeter, type ConsumerDiscovery } from "./perimeter";
 import { defaultExternalLinks, pinTarget, type LinkPin } from "./pin";
 import { depthBelow, gitTopOf, perimeterKey } from "./git-top";
@@ -1445,6 +1445,8 @@ export function createVerificationWiring(deps: {
       search: testSearch(budget, deadline),
       budget,
       ...currentTree,
+      // Cross-repo P3a (D23): the linked repository's ignored modules, hardened and bounded; called only with crossLinkRoot.
+      listIgnored: (root, signal) => listIgnoredModules(root, { signal, lowPriority: budget.lowPriority }),
     });
     // 2.2.3 (S5): with a batch window, concurrent testsPass checks of this plugin instance meet in
     // the coordinator; the direct hook stays behind it for "full" scope and single requests (B2).

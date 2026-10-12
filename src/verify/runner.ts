@@ -973,6 +973,14 @@
 //                              node_modules, which vitest related skips   (G.4b, cross-repo P3a)
 //     cross-link-gone          changed file gone in the linked repository (deleted or renamed
 //                              away): <rel>   (G.4b; <rel> is relative to the linked repository)
+//     cross-link-ignored-over-bounds
+//                              too many ignored modules in the linked repository to pass as
+//                              inputs: <root>   (the testsPass hook, D23; over tree.ts
+//                              MAX_IGNORED_MODULES files, MAX_IGNORED_MODULE_PATH_BYTES path bytes
+//                              or MAX_IGNORED_WALK_ENTRIES walked entries)
+//     cross-link-ignored-unavailable
+//                              the ignored modules of the linked repository could not be listed:
+//                              <root>   (the testsPass hook, D23; not a repository, git failed)
 //   M.2 NoAffected notes:
 //     "no changed files, no affected tests"                          (section 1.5-6, exactly)
 //     "no affected tests: no changed file is a test input"           (docs only, dropped paths,
@@ -1216,7 +1224,9 @@ export type S6Code =
   | "config-too-large"
   | "unmapped-module"
   | "cross-link-unsupported"
-  | "cross-link-gone";
+  | "cross-link-gone"
+  | "cross-link-ignored-over-bounds"
+  | "cross-link-ignored-unavailable";
 
 /** S6: scoping is impossible. The reason names the construct (section M.1) and never triggers a full suite. */
 export interface Unverifiable {
@@ -1745,6 +1755,17 @@ function dirListing(ctx: Ctx, fs: PlannerFs, dir: string): Promise<DirListing | 
 
 function s6(code: S6Code, reason: string): Unverifiable {
   return { unverifiable: true, code, reason };
+}
+
+/**
+ * Cross-repo P3a (D23, OD-P3a-2 b): the S6 of a cross-link request whose linked repository's ignored modules (tree.ts
+ * listIgnoredModules) are over the bounds or could not be listed (M.1). `root` is the cross-link root as given. The testsPass
+ * hook returns it before planning: the related run would otherwise miss a consumer that loads W's build output.
+ */
+export function crossLinkIgnoredS6(kind: "over-bounds" | "unavailable", root: string): Unverifiable {
+  return kind === "over-bounds"
+    ? s6("cross-link-ignored-over-bounds", `too many ignored modules in the linked repository to pass as inputs: ${root}`)
+    : s6("cross-link-ignored-unavailable", `the ignored modules of the linked repository could not be listed: ${root}`);
 }
 
 function noAffected(note: string): NoAffected {

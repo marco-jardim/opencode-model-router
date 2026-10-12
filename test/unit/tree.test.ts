@@ -442,3 +442,123 @@ describe("snapshotTree — ignored-files digest (P2.6)", () => {
     expect(snapshot && "ignored" in snapshot).toBe(false);
   }, 60_000);
 });
+
+// Cross-repo P3a (D23, OD-P3a-2 b, finding X6): the linked repository's git-ignored modules (its build output) a cross-link
+// run adds to its related inputs. Real git in real temp directories, without the file-wide mocks (as the block above).
+describe("listIgnoredModules — the linked repository's ignored modules (cross-repo P3a, D23)", () => {
+  type TreeModule = typeof import("../../src/verify/tree");
+  type GitOptions = import("../../src/verify/tree").SnapshotGitOptions;
+  let tree: TreeModule;
+  let repo: string;
+  let outside: string;
+  let write: (rel: string, content: string) => Promise<void>;
+  let readIndex: () => Promise<Buffer>;
+  const signal = new AbortController().signal;
+  let cleanup: (() => Promise<void>) | undefined;
+  /** The module files the fixture writes, relative to the repository (sorted as the lister sorts absolute paths). */
+  const MODULES = [
+    "dist/a.cts", "dist/a.mts", "dist/c.tsx", "dist/cjs/index.cjs", "dist/d.jsx", "dist/esm/index.mjs", "dist/index.d.ts",
+    "dist/index.js", "dist/package.json", "generated.json",
+  ];
+
+  afterAll(async () => {
+    await cleanup?.();
+  });
+
+  beforeAll(async () => {
+    vi.doUnmock("node:fs/promises");
+    vi.doUnmock("node:child_process");
+    vi.doUnmock("../../src/router/git-tools");
+    vi.resetModules();
+    tree = await import("../../src/verify/tree");
+    const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    const cp = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+    const os = await vi.importActual<typeof import("node:os")>("node:os");
+    const path = await vi.importActual<typeof import("node:path")>("node:path");
+    repo = await fs.mkdtemp(path.join(os.tmpdir(), "omr-ignored-modules-"));
+    outside = await fs.mkdtemp(path.join(os.tmpdir(), "omr-not-a-repo-"));
+    write = async (rel, content) => {
+      const file = path.join(repo, rel);
+      await fs.mkdir(path.dirname(file), { recursive: true });
+      await fs.writeFile(file, content);
+    };
+    readIndex = () => fs.readFile(path.join(repo, ".git", "index"));
+    const env = {
+      ...process.env,
+      GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.com",
+    };
+    const git = (...args: string[]) => cp.execFileSync("git", ["-c", "core.autocrlf=false", "-c", "commit.gpgsign=false", ...args], { cwd: repo, env, stdio: "ignore" });
+    await write(".gitignore", "dist/\nnode_modules/\ngenerated.json\n*.log\n");
+    await write("src/a.ts", "export const a = 1;\n");
+    await write("package.json", "{}\n");
+    cleanup = async () => {
+      await fs.rm(repo, { recursive: true, force: true });
+      await fs.rm(outside, { recursive: true, force: true });
+    };
+    git("init", "-q");
+    git("add", ".");
+    git("commit", "-q", "-m", "init");
+    for (const rel of MODULES) await write(rel, "x");
+    // Ignored, but not modules: never listed.
+    for (const rel of ["dist/index.js.map", "dist/README.md", "dist/style.css", "debug.log"]) await write(rel, "x");
+    // Modules under a node_modules segment (top-level and inside an ignored directory): never listed.
+    for (const rel of ["node_modules/x/y.js", "node_modules/x/package.json", "dist/node_modules/k/index.js"]) await write(rel, "x");
+    // Untracked but not ignored, and tracked: not the lister's (W's change set already holds them).
+    await write("src/new.ts", "export const n = 1;\n");
+  }, 60_000);
+
+  const abs = (rels: readonly string[]) => rels.map(rel => resolve(repo, rel)).sort();
+
+  it("lists the ignored .js/.cjs/.mjs/.ts/.cts/.mts/.tsx/.jsx/.json files under the root as absolute paths, never under node_modules", async () => {
+    expect([...tree.IGNORED_MODULE_EXTENSIONS].sort()).toEqual([".cjs", ".cts", ".js", ".json", ".jsx", ".mjs", ".mts", ".ts", ".tsx"]);
+    const result = await tree.listIgnoredModules(repo, { signal });
+    expect(result).toEqual({ files: abs(MODULES) });
+    const files = "files" in result ? result.files : [];
+    expect(files.every(file => !file.split(/[\\/]/).includes("node_modules"))).toBe(true);
+    expect(files).not.toContain(resolve(repo, "src/a.ts")); // tracked
+    expect(files).not.toContain(resolve(repo, "src/new.ts")); // untracked, not ignored
+    expect(files).not.toContain(resolve(repo, "dist/index.js.map"));
+  }, 60_000);
+
+  it("is bounded by file count, total path bytes and walked entries (exported constants); over a bound → overBounds, never truncated", async () => {
+    expect(tree.MAX_IGNORED_MODULES).toBe(2_000);
+    expect(tree.MAX_IGNORED_MODULE_PATH_BYTES).toBe(256 * 1024);
+    expect(tree.MAX_IGNORED_WALK_ENTRIES).toBe(50_000);
+    const bytes = abs(MODULES).reduce((sum, file) => sum + Buffer.byteLength(file, "utf8"), 0);
+    // Exactly at the bounds (node_modules and non-module files not counted): the whole list.
+    expect(await tree.listIgnoredModules(repo, { signal, maxFiles: MODULES.length, maxPathBytes: bytes })).toEqual({ files: abs(MODULES) });
+    expect(await tree.listIgnoredModules(repo, { signal, maxFiles: MODULES.length - 1 })).toEqual({ overBounds: true });
+    expect(await tree.listIgnoredModules(repo, { signal, maxPathBytes: bytes - 1 })).toEqual({ overBounds: true });
+    expect(await tree.listIgnoredModules(repo, { signal, maxWalkEntries: 1 })).toEqual({ overBounds: true });
+  }, 60_000);
+
+  it("runs the ignored listing (IGNORED_LIST_ARGS) hardened, once, and leaves the index untouched", async () => {
+    const seen: { args: readonly string[]; opts: GitOptions }[] = [];
+    const git = async (args: readonly string[], opts: GitOptions) => {
+      seen.push({ args, opts });
+      return tree.execGit(args, opts);
+    };
+    const index = await readIndex();
+    expect(await tree.listIgnoredModules(repo, { signal, git, lowPriority: true })).toEqual({ files: abs(MODULES) });
+    expect(seen).toHaveLength(1);
+    const { args, opts } = seen[0] as { args: readonly string[]; opts: GitOptions };
+    expect(args.slice(args.indexOf("ls-files"))).toEqual([...tree.IGNORED_LIST_ARGS]);
+    expect(args.slice(0, args.indexOf("ls-files"))).toEqual(expect.arrayContaining(["--no-optional-locks", "core.fsmonitor=false"]));
+    expect(args.some(arg => arg.startsWith("core.hooksPath="))).toBe(true);
+    expect(opts).toMatchObject({ cwd: repo, lowPriority: true, timeoutMs: tree.SNAPSHOT_GIT_TIMEOUT_MS, maxBuffer: tree.SNAPSHOT_GIT_MAX_BUFFER });
+    expect(opts.env).toBeDefined();
+    expect(opts.executable).toBeDefined();
+    expect((await readIndex()).equals(index)).toBe(true);
+  }, 60_000);
+
+  it("fails closed: a non-repository, a git failure or an abort → unavailable, never a throw", async () => {
+    expect(await tree.listIgnoredModules(outside, { signal })).toEqual({ unavailable: true });
+    const failing = async () => {
+      throw new Error("boom");
+    };
+    expect(await tree.listIgnoredModules(repo, { signal, git: failing })).toEqual({ unavailable: true });
+    const aborted = new AbortController();
+    aborted.abort();
+    expect(await tree.listIgnoredModules(repo, { signal: aborted.signal })).toEqual({ unavailable: true });
+  }, 60_000);
+});

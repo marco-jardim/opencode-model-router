@@ -1270,4 +1270,108 @@ describe("createDirectTestsPassHook — cross-link root (cross-repo P3a)", () =>
     expect(s.inputs[0]).toStrictEqual({ ...s.today, crossLinkRoot: W });
     expect("crossLinkAliases" in s.inputs[0]!).toBe(false);
   });
+
+  // D23 (OD-P3a-2 b, finding X6): W's git-ignored modules (its build output) become cross-link inputs.
+  describe("the linked repository's ignored modules (D23)", () => {
+    type ListIgnored = NonNullable<Parameters<typeof createDirectTestsPassHook>[0]["listIgnored"]>;
+    type IgnoredModules = import("../../src/verify/tree").IgnoredModules;
+
+    function setupWith(answer: IgnoredModules | (() => Promise<IgnoredModules>)) {
+      const inputs: PlanScopedRunInput[] = [];
+      const plan = async (input: PlanScopedRunInput): Promise<ScopingPlan> => {
+        inputs.push(input);
+        return { noAffected: true, note: "no affected tests" };
+      };
+      const calls: { root: string; signal: AbortSignal }[] = [];
+      const listIgnored: ListIgnored = async (root, signal) => {
+        calls.push({ root, signal });
+        return typeof answer === "function" ? answer() : answer;
+      };
+      const openScope: OpenCheckScope = () => { throw new Error("planning outcomes open no scope"); };
+      const plannerFs: PlannerFs = { fileExists: async () => true, readFile: async () => "{}" };
+      const search: TestSearchSeam = { findByName: async () => [], findByContent: async () => [] };
+      const host = { platform: "linux" as const };
+      const hook = createDirectTestsPassHook({
+        openScope, plannerFs, search, plan, host, budget: { maxWorkers: 2, failureRecheck: true }, listIgnored,
+      });
+      const today = { command: "npx vitest run", cwd: CWD, changedFiles: CHANGED, budget: { maxWorkers: 2 }, fs: plannerFs, search, host };
+      return { hook, inputs, calls, today };
+    }
+
+    it("appends W's ignored modules to the plan's changed files, deduplicated, listing W once with the gate's signal", async () => {
+      const s = setupWith({ files: [`${W}/dist/index.js`, `${W}/src/a.ts`, `${W}/dist/esm/index.mjs`] });
+      const req = request({ crossLinkRoot: W });
+      expect(await s.hook(req)).toEqual({ scoped: { kind: "no-affected", note: "no affected tests" }, recheck: undefined });
+      expect(s.calls).toEqual([{ root: W, signal: req.deadline.signal }]);
+      expect(s.inputs).toHaveLength(1);
+      expect(s.inputs[0]).toStrictEqual({
+        ...s.today,
+        changedFiles: [
+          ...CHANGED,
+          // `!!`: git porcelain's code for an ignored file (ChangedPath.status is informational only).
+          { path: `${W}/dist/index.js`, status: "!!" },
+          { path: `${W}/dist/esm/index.mjs`, status: "!!" },
+        ],
+        crossLinkRoot: W,
+      });
+    });
+
+    it("no ignored module: the plan input is the one without a lister", async () => {
+      const s = setupWith({ files: [] });
+      await s.hook(request({ crossLinkRoot: W }));
+      expect(s.inputs[0]).toStrictEqual({ ...s.today, crossLinkRoot: W });
+    });
+
+    it("over bounds → unverifiable S6 cross-link-ignored-over-bounds naming W; the plan is never called", async () => {
+      const s = setupWith({ overBounds: true });
+      const run = await s.hook(request({ crossLinkRoot: W }));
+      expect(run).toEqual({
+        scoped: {
+          kind: "unverifiable",
+          code: "cross-link-ignored-over-bounds",
+          reason: `too many ignored modules in the linked repository to pass as inputs: ${W}`,
+        },
+        recheck: undefined,
+      });
+      expect(s.inputs).toHaveLength(0);
+    });
+
+    it("unavailable (or a lister that throws) → unverifiable S6 cross-link-ignored-unavailable; the plan is never called", async () => {
+      const unavailable = {
+        scoped: {
+          kind: "unverifiable",
+          code: "cross-link-ignored-unavailable",
+          reason: `the ignored modules of the linked repository could not be listed: ${W}`,
+        },
+        recheck: undefined,
+      };
+      const s = setupWith({ unavailable: true });
+      expect(await s.hook(request({ crossLinkRoot: W }))).toEqual(unavailable);
+      expect(s.inputs).toHaveLength(0);
+      const thrown = setupWith(async () => { throw new Error("boom"); });
+      expect(await thrown.hook(request({ crossLinkRoot: W }))).toEqual(unavailable);
+      expect(thrown.inputs).toHaveLength(0);
+    });
+
+    it("without crossLinkRoot the lister is never called and the plan input is the pre-P3a one", async () => {
+      const s = setupWith({ files: [`${W}/dist/index.js`] });
+      await s.hook(request());
+      expect(s.calls).toHaveLength(0);
+      expect(s.inputs[0]).toStrictEqual(s.today);
+    });
+
+    it("testScope full never lists W's ignored modules", async () => {
+      const s = setupWith({ overBounds: true });
+      const openScope: OpenCheckScope = () => { throw new Error("full opens a scope"); };
+      const hook = createDirectTestsPassHook({
+        openScope, plannerFs: { fileExists: async () => true, readFile: async () => "{}" },
+        search: { findByName: async () => [], findByContent: async () => [] },
+        budget: { maxWorkers: 2, failureRecheck: true },
+        listIgnored: async (root, signal) => { s.calls.push({ root, signal }); return { overBounds: true }; },
+      });
+      const run = await hook(request({ crossLinkRoot: W, testScope: "full" }));
+      expect(run.scoped.kind).toBe("error");
+      expect(s.calls).toHaveLength(0);
+    });
+  });
 });

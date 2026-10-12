@@ -3,7 +3,7 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstat, readdir, readFile, readlink, realpath } from "node:fs/promises";
 import { constants as osConstants, setPriority } from "node:os";
-import { join, resolve } from "node:path";
+import { extname, join, resolve } from "node:path";
 import { ABSENT_DIGEST, FILE_DIGEST_PREFIX, LINK_DIGEST_PREFIX, type TreeSnapshot, type ChangedFile } from "./dispatch";
 
 /** Each git process of a snapshot. */
@@ -204,6 +204,41 @@ export const IGNORED_LIST_ARGS: readonly string[] = [
 export const INDEX_TAGS_ARGS: readonly string[] = ["ls-files", "-v", "-z"];
 
 /**
+ * Cross-repo P3a (D23, OD-P3a-2 b): bounds of the git-ignored module list a cross-link run adds to its related
+ * inputs (`listIgnoredModules`). Over either bound the list is refused (`overBounds`), never truncated.
+ */
+export const MAX_IGNORED_MODULES = 2_000;
+export const MAX_IGNORED_MODULE_PATH_BYTES = 256 * 1024;
+/** Cross-repo P3a (D23): the directory entries `listIgnoredModules` reads while walking ignored directories, any kind. */
+export const MAX_IGNORED_WALK_ENTRIES = 50_000;
+/** Cross-repo P3a (D23): the extensions of the ignored files that can be modules a consumer loads (`dist/`). */
+export const IGNORED_MODULE_EXTENSIONS: readonly string[] = [".js", ".cjs", ".mjs", ".ts", ".cts", ".mts", ".tsx", ".jsx", ".json"];
+
+/**
+ * Cross-repo P3a (D23): what `listIgnoredModules` found: the absolute paths (sorted, deduplicated), or why there is no list.
+ * `overBounds`: past MAX_IGNORED_MODULES, MAX_IGNORED_MODULE_PATH_BYTES or MAX_IGNORED_WALK_ENTRIES (never truncated).
+ * `unavailable`: not a repository, a git failure, an unreadable directory or an abort (fail closed).
+ */
+export type IgnoredModules =
+  | { readonly files: readonly string[] }
+  | { readonly overBounds: true }
+  | { readonly unavailable: true };
+
+export interface ListIgnoredModulesOptions {
+  readonly signal: AbortSignal;
+  /** VerifyBudget.lowPriority, as the snapshot's git processes. Default false. */
+  readonly lowPriority?: boolean;
+  /** Default MAX_IGNORED_MODULES. */
+  readonly maxFiles?: number;
+  /** Default MAX_IGNORED_MODULE_PATH_BYTES: the UTF-8 bytes of the returned absolute paths, summed. */
+  readonly maxPathBytes?: number;
+  /** Default MAX_IGNORED_WALK_ENTRIES. */
+  readonly maxWalkEntries?: number;
+  /** The git process seam (tests). Default execGit. */
+  readonly git?: SnapshotGit;
+}
+
+/**
  * Cross-repo P2.6: a digest of the ignored files `git ls-files` lists (IGNORED_LIST_ARGS), minus any path with a
  * `node_modules` segment: sha256 over the sorted paths with their size and content (a link: its target). "over-bounds"
  * above `maxFiles` paths or `maxBytes` bytes (sizes come from lstat before anything is read); undefined on any error
@@ -266,6 +301,66 @@ async function ignoredFilesDigest(
     return hash.digest("hex");
   } catch {
     return undefined; // Unlisted, vanished or unreadable: no digest, never a throw.
+  }
+}
+
+/**
+ * Cross-repo P3a (D23, OD-P3a-2 b, finding X6): the git-ignored JS/TS/JSON files under `root` (IGNORED_MODULE_EXTENSIONS),
+ * as absolute paths under `root` as given, so a consumer that loads the linked repository's build output (`dist/`) is
+ * selected by a cross-link `vitest related` run. Listed as the ignored digest lists (IGNORED_LIST_ARGS, `--directory`),
+ * always hardened (`hardenedGit`: no hooks, no fsmonitor, no optional locks, so no index refresh; read-only), the reported
+ * directories walked here, bounded, never into a `node_modules` or a `.git`. Never throws.
+ */
+export async function listIgnoredModules(root: string, opts: ListIgnoredModulesOptions): Promise<IgnoredModules> {
+  const run = opts.git ?? execGit;
+  const maxFiles = opts.maxFiles ?? MAX_IGNORED_MODULES;
+  const maxPathBytes = opts.maxPathBytes ?? MAX_IGNORED_MODULE_PATH_BYTES;
+  const maxWalk = opts.maxWalkEntries ?? MAX_IGNORED_WALK_ENTRIES;
+  const unavailable: IgnoredModules = { unavailable: true };
+  const overBounds: IgnoredModules = { overBounds: true };
+  try {
+    if (opts.signal.aborted) return unavailable;
+    const hardened = await hardenedGit(root);
+    const listing = await run([...hardened.prefix, ...IGNORED_LIST_ARGS], {
+      cwd: root, signal: opts.signal, timeoutMs: SNAPSHOT_GIT_TIMEOUT_MS, maxBuffer: SNAPSHOT_GIT_MAX_BUFFER,
+      lowPriority: opts.lowPriority === true, env: hardened.env, executable: hardened.executable,
+    });
+    const files = new Set<string>();
+    let bytes = 0;
+    let walked = 0;
+    /** False once a bound is passed. */
+    const add = (relative: string): boolean => {
+      if (!IGNORED_MODULE_EXTENSIONS.includes(extname(relative).toLowerCase())) return true;
+      const absolute = resolve(root, relative);
+      if (files.has(absolute)) return true;
+      files.add(absolute);
+      bytes += Buffer.byteLength(absolute, "utf8");
+      return files.size <= maxFiles && bytes <= maxPathBytes;
+    };
+    for (const path of listing.split("\0")) {
+      if (path === "" || path.split(/[\\/]/).includes("node_modules")) continue;
+      if (!/[\\/]$/.test(path)) {
+        if (!add(path)) return overBounds;
+        continue;
+      }
+      // `--directory`: a wholly ignored directory (`dist/`) is reported once; walk it. Links are entries, never followed.
+      const pending = [path.replace(/[\\/]+$/, "")];
+      while (pending.length > 0) {
+        if (opts.signal.aborted) return unavailable;
+        const dir = pending.pop() as string;
+        for (const entry of await readdir(resolve(root, dir), { withFileTypes: true })) {
+          if (++walked > maxWalk) return overBounds;
+          if (entry.name === "node_modules" || entry.name === ".git") continue;
+          const child = `${dir}/${entry.name}`;
+          if (entry.isDirectory()) pending.push(child);
+          else if (!add(child)) return overBounds;
+        }
+      }
+    }
+    if (opts.signal.aborted) return unavailable;
+    return { files: [...files].sort() };
+  } catch {
+    return unavailable; // Not a repository, git failed or timed out, a directory vanished or is unreadable: fail closed.
   }
 }
 

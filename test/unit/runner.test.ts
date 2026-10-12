@@ -5,6 +5,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
+  crossLinkIgnoredS6,
   detectRunner,
   effectiveWorkers,
   isNoAffected,
@@ -1928,6 +1929,24 @@ describe("planScopedRun — cross-link inputs (cross-repo P3a)", () => {
     }
     expect(codes).toEqual(["cross-link-gone", "config-changed", "cross-link-unsupported", "cross-link-unsupported", "attribution-unavailable"]);
     expect(await planStaticScoping(xin(changed("/w/src/math.ts")))).toMatchObject({ scopable: true, runner: "vitest", pendingSearches: 0 });
+  });
+
+  it("D23: the ignored-module S6 codes and their reasons are the ones header M.1 lists", () => {
+    const over = crossLinkIgnoredS6("over-bounds", "/w");
+    const unavailable = crossLinkIgnoredS6("unavailable", "/w");
+    expectS6(over, "cross-link-ignored-over-bounds", "too many ignored modules in the linked repository to pass as inputs: /w");
+    expectS6(unavailable, "cross-link-ignored-unavailable", "the ignored modules of the linked repository could not be listed: /w");
+    // Header M.1, comment markers dropped and whitespace collapsed: each code is followed by its reason, `<root>` for the root.
+    const source = readFileSync(new URL("../../src/verify/runner.ts", import.meta.url), "utf8");
+    const start = source.search(/^\/\/\s+M\.1\b/m);
+    const end = source.search(/^\/\/\s+M\.2\b/m);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const m1 = source.slice(start, end).replace(/^\/\/ ?/gm, "").replace(/\s+/g, " ");
+    for (const kind of ["over-bounds", "unavailable"] as const) {
+      const s6 = crossLinkIgnoredS6(kind, "<root>");
+      expect(m1).toContain(`${s6.code} ${s6.reason}`);
+    }
   });
 });
 
