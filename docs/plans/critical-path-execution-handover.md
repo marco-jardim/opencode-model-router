@@ -333,6 +333,14 @@ Everything else is work: resolve it, record it, continue.
 
 ## 7. Live state (§0.11 — keep current)
 
+**NEXT ACTION (2026-10-12 ≈11:50): DF-1 self-check.** Wave 2 is done and merged (2.1 `bc0df8a` + smoke-harness follow-up `226d967`; 2.2 `ded2e88`; 2.3 `9b44413`; 2.4 `6eaf7f0`; amendments A-2.1-1..A-2.4-1). DF-1 pre-flight on `cpx/main` @ `226d967`: typecheck green; scoped tests of 2.1-2.4 green; `smoke:cpx` 56/56 (after `cpx/p21f`: the contract probes C3/C13 read the router's `<router-state>` tail as the caller's last message — harness fix, no product change); `smoke:v2` 2/2; `smoke:v1` 27 pass / 11 skipped on 1.18.35 (no failure); `router_verify pending:true` → nothing pending; `dogfood.md` baseline `5370e76`. Tracking issue: GitHub #109.
+- DF1.1: tag `cpx/df1` = `226d967`, pushed.
+- DF1.2: worktree `D:\git\omr-cpx-dogfood-df1` (detached at `cpx/df1`, `npm ci` done). Switch: `$env:LOCALAPPDATA\omr-cpx\opencode-config\opencode.json` regenerated from the current global `opencode.json`, only the router entry changed `D:\\git\\opencode-model-router` → `D:\\git\\omr-cpx-dogfood-df1`; hard-linked files re-checked against the global originals (all equal), top-level entries unchanged. Override `D:\git\omr-cpx-main\.opencode\opencode-model-router.overrides.jsonc` = `{ "enforcement": { "verify": { "pendingTtlMs": 86400000 } } }` (git-ignored; DF2.4.a removes it).
+- DF1.3 launch (owner): close this window, then in a new pwsh:
+  `$env:OPENCODE_CONFIG_DIR = "$env:LOCALAPPDATA\omr-cpx\opencode-config"; $env:OPENCODE_V2_BIN = "C:\Users\Marquinho\AppData\Local\omr-cpx\bin\opencode2-2.0.26\opencode.exe"; & $env:OPENCODE_V2_BIN --standalone -s ses_ed82f88a7ffej5iKaRHuwIa6fd D:\git\omr-cpx-main` and type `continue`.
+- Revert (last build that passed its self-check = df0): in `$env:LOCALAPPDATA\omr-cpx\opencode-config\opencode.json` set the router entry back to `D:\\git\\omr-cpx-dogfood-df0`, then relaunch with the command above.
+- After the restart: DF1.4.a-h probes (scratch worktree `D:\git\omr-cpx-scratch`, branch `cpx/scratch-df1`), DF1.5 record in `dogfood.md`, DF1.QA (heavy), then Wave 3 (3.1 ∥ 3.2).
+
 **Update 2026-10-12 ≈08:40:** 2.2, 2.3 and 2.4 merged into `cpx/main` (coverage top-ups, reports, M1-M10, amendments A-2.2-1/A-2.3-1/A-2.4-1 in `8439081`). 2.1 round-1 fixes in progress in `D:\git\omr-cpx-p21` (uncommitted; dispatch A done, dispatch B running). Lesson: `router_run` refuses vitest with file arguments (package scripts take no arguments; `vitest`/`npx` not allowlisted) — implementers write tests, the orchestrator runs them. The host restarted twice this morning; the AGENTS.md source flipped between the process-scoped config and the global one (reported to the owner).
 
 **Next action (paused 2026-10-11 ≈11:30 for an owner shutdown; resume with the fan-out below):** Wave 2 in flight. All four phase branches are pushed and clean: `cpx/p21` @ `bc0a9b4`, `cpx/p22` @ `073e5bf`, `cpx/p23` @ `6d1c994`, `cpx/p24` @ `0b73acc`. `cpx/main` @ this commit.
@@ -361,8 +369,8 @@ implementation's worktree `D:\git\opencode-model-router-cross-repo` (branch `fea
 | 1.2 | **done** 2026-10-11 | 3 (r1: 13, r2: 6, r3: clean) | merged `a9e32c1`; cache-prefix smoke and routing-engine 2/4 green on 2.0.26 |
 | 1.3 | **done** 2026-10-11 | 3 (r1: 17, r2: 17, r3: clean) | merged `6d310eb` |
 | 1.4 | **done** 2026-10-11 | 3 (r1: 20, r2: 11, r3: 3 major — fixed) | merged `12d42b7`; contract addenda A1–A3 in `phase-1.4.md` |
-| 2.1 | in progress (QA r1 fixes) | 1 (13 findings) | round-1 fixes in `cpx/p21`, then QA r2, `cpx-background` smoke |
-| DF-1 | waiting | — | |
+| 2.1 | **done** 2026-10-12 | 3 (r1 13, r2 19, r3 2 major — all fixed; round-3 minors deferred) | merged `bc0df8a`; follow-up `cpx/p21f` merged `226d967` |
+| DF-1 | in progress: switch done, waiting for the owner restart | — | tag `cpx/df1` = `226d967` |
 | 2.2 | **done** 2026-10-12 | 3 (r1 14, r2 9, r3 1 major — fixed) | merged `ded2e88`; ledger.ts 96.01 branches after top-up `fe3a178` |
 | 2.3 | **done** 2026-10-12 | 3 (r1 17, r2 15, r3 1 major — fixed) | merged `9b44413`; estimate 97.5 / index 92.46 branches after top-up `ca5cb81` |
 | 2.4 | **done** 2026-10-12 | 3 (r1 21, r2 9, r3 1 major — fixed) | merged `6eaf7f0`; M1-M10 measured (all constants kept); `smoke:cpx:provision` 4/4 |
