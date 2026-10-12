@@ -739,7 +739,10 @@ export function resumeTargetsOf(tool: string, args: unknown, caller: string): st
 }
 
 /** QA-2.1-6: what a persisted dispatch's child history says about its end. */
-type ChildEndState = { outcome: "succeeded" | "failed" | "interrupted"; text?: string } | { outcome: "lost"; text?: undefined };
+/** `incomplete` (QA-DF1-21): the child's last step has no end (no step end, no execution end): it may still be running. */
+type ChildEndState =
+  | { outcome: "succeeded" | "failed" | "interrupted"; text?: string }
+  | { outcome: "lost"; text?: undefined; incomplete?: boolean };
 
 /**
  * QA-2.1-18: whether an assistant entry of a child's history ended its step (top level or under `info`): a finish reason other
@@ -777,10 +780,18 @@ export const SESSION_DIR_NEGATIVE_TTL_MS = 2_000;
  * semantics, no lease), so a write in that window is unguarded; the window only spares a burst of tool calls a failing host call each.
  */
 export const SESSION_KIND_NEGATIVE_TTL_MS = 2_000;
+/**
+ * QA-DF1-23 (DF-1-9): the background decision waits at most this long for the kind of an unrecorded parent; past it the parent
+ * is no root (the dispatch stays foreground). Short: the dispatch's `execute.before` waits for it.
+ */
+export const SESSION_KIND_DISPATCH_TIMEOUT_MS = 1_000;
 /** QA-2.1-11: session directories cached (oldest first out). */
 const MAX_SESSION_DIRS = 1000;
 /** QA-2.1-13: parent sessions remembered as adopted (oldest first out). */
 const MAX_ADOPTED_SESSIONS = 5000;
+/** DF-1-4: the children whose completion elements are remembered, and the elements kept per child. */
+const MAX_SEEN_COMPLETION_CHILDREN = 1000;
+const MAX_SEEN_COMPLETION_ELEMENTS = 64;
 /** QA-2.1-8: a failed pending-journal reload is tried again at most this often (fail closed meanwhile). */
 export const PENDING_RELOAD_RETRY_MS = 30_000;
 /** QA-2.1-8: `dispose` waits at most this long for the background work in flight (verdict posts, recoveries). */
@@ -803,6 +814,31 @@ function completionElementsOf(text: string): CompletionElement[] {
     found.push({ child: m[1] ?? "", state, body: m[3] ?? "" });
   }
   return found;
+}
+
+/** QA-DF1-21: the global slot of this process's journal token (`Symbol.for`: one token for every module copy in the process). */
+const PROCESS_TOKEN_SLOT = Symbol.for("opencode-model-router.v2.process-token");
+/**
+ * QA-DF1-21: this process's identity, stamped on the `inflight` records it journals. A record bearing it was written by an
+ * instance of this very process (an owning location the host evicted), never by an earlier one: a later process may reuse the
+ * pid, never the token.
+ */
+export function processToken(): string {
+  const known: unknown = Reflect.get(globalThis, PROCESS_TOKEN_SLOT);
+  if (typeof known === "string") return known;
+  const token = `${process.pid.toString(16)}-${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 10)}`;
+  Reflect.set(globalThis, PROCESS_TOKEN_SLOT, token);
+  return token;
+}
+
+/**
+ * QA-DF1-20: the identity of the message that holds a completion element, never its content: the host's message id when the
+ * message carries one, else its position in the request's history (a session's history only grows between its requests).
+ */
+function completionMessageKey(message: object, index: number): string {
+  const id = "id" in message ? message.id : undefined;
+  if (typeof id === "string" && id !== "") return `id:${id}`;
+  return `at:${index}`;
 }
 
 /** Applies `defang` to the body of every `<subagent …>` element of a text (a pure rewrite; the element tags stay). */
@@ -1295,13 +1331,36 @@ export async function registerV2Hooks(
       failedKinds.delete(sessionID);
       failedKinds.set(sessionID, Date.now());
       while (failedKinds.size > MAX_SESSION_DIRS) failedKinds.delete(failedKinds.keys().next().value!);
-      ingestLogger.warn("[router] leases: the session kind could not be read; root semantics with child wording", { error: String(error) });
+      // QA-DF1-23: one lookup serves the leases and the background decision; the warning names what each does with the failure.
+      ingestLogger.warn("[router] the session kind could not be read: leases use root semantics with child wording; a background decision stays foreground", {
+        session: sessionID, error: String(error),
+      });
       return "unknown";
     }
   };
   /**
+   * QA-DF1-23 (DF-1-9): the background decision's lookup of an unrecorded parent, bounded by SESSION_KIND_DISPATCH_TIMEOUT_MS. A
+   * slow host answers `unknown` (no root: the dispatch stays foreground) once the bound passes; the lookup itself goes on and
+   * records the kind for the next dispatch.
+   */
+  const dispatchSessionKindOf = async (sessionID: string): Promise<"root" | "child" | "unknown"> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const bound = new Promise<"unknown">((resolve) => {
+      timer = setTimeout(() => resolve("unknown"), SESSION_KIND_DISPATCH_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([sessionKindOf(sessionID), bound]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  };
+  /**
    * The kind of a session WITHOUT a host call (`session.created` and the `prompt` hook record it): an unknown session is a root,
-   * as in the lease guard (memo §14.1). The dispatch path must not add host calls (a static session stays silent, §1.2).
+   * as in the lease guard (memo §14.1). The dispatch path adds no host call of its own (a static session stays silent, §1.2),
+   * with one exception: DF-1-9 / QA-DF1-23, never for the background decision — while background routing is active
+   * (`bgActive()`), an unrecorded parent is resolved once with `dispatchSessionKindOf` (one `session.get`, bounded by
+   * SESSION_KIND_DISPATCH_TIMEOUT_MS, cached once answered; `unknown` is no root).
    */
   const knownKindOf = (sessionID: string): "root" | "child" => sessionKinds.get(sessionID) ?? "root";
   /** The in-flight registry and held results exist whatever the mode; they hold nothing until a background dispatch is acknowledged. */
@@ -1496,7 +1555,7 @@ export async function registerV2Hooks(
         agent: attempt.agent, description: attempt.description, verifying: attempt.verifying, verificationMode: attempt.verificationMode,
         ...(attempt.role === undefined ? {} : { role: attempt.role }),
         ...(attempt.hold === undefined ? {} : { handle: attempt.hold.handle }), hold: attempt.hold?.handle ?? null,
-        ...(dispatch === undefined ? {} : { dispatch }),
+        ...(dispatch === undefined ? {} : { dispatch }), process: processToken(),
       });
     }
     out.push(...held.persisted());
@@ -2179,17 +2238,58 @@ export async function registerV2Hooks(
       return changed ? next : undefined;
     };
     /**
+     * DF-1-4: per child, the completion elements already seen in its parent's context, by the message that holds them (QA-DF1-20:
+     * message id, part and element index; never their content); bounded. Per adapter copy and lost on restart: a `child-ended`
+     * attempt is read again on its parent's next request, so a skipped element never leaves it waiting for the sweep.
+     */
+    const seenCompletionElements = new Map<string, Set<string>>();
+    /** Records a completion element of `child`; true only the first time it is seen. */
+    const noteCompletionElement = (child: string, signature: string): boolean => {
+      let seen = seenCompletionElements.get(child);
+      if (seen?.has(signature)) return false;
+      if (seen === undefined) {
+        seen = new Set<string>();
+        seenCompletionElements.set(child, seen);
+        for (const old of seenCompletionElements.keys()) {
+          if (seenCompletionElements.size <= MAX_SEEN_COMPLETION_CHILDREN) break;
+          seenCompletionElements.delete(old);
+        }
+      }
+      seen.add(signature);
+      for (const old of seen) {
+        if (seen.size <= MAX_SEEN_COMPLETION_ELEMENTS) break;
+        seen.delete(old);
+      }
+      return true;
+    };
+    /** QA-DF1-17: per parent session, the completion elements (child, identity) of its last scanned history; bounded. */
+    const lastScannedElements = new Map<string, ReadonlyArray<{ child: string; signature: string }>>();
+    /**
+     * QA-DF1-17: a resume of `child` is decided. Every completion element of that child in its parent's last scanned history belongs
+     * to an earlier turn, whatever that turn's attempt state was when it was scanned (a `processing` one left it unremembered):
+     * each is remembered now, so the resumed attempt never takes it.
+     */
+    const rememberElementsOnResume = (parent: string, child: string): void => {
+      for (const element of lastScannedElements.get(parent) ?? []) {
+        if (element.child === child) noteCompletionElement(child, element.signature);
+      }
+    };
+    /**
      * A root session's request: every completion element of an acknowledged attempt starts its processing (not awaited), and the
      * first request that sees an attempt waits for it at most COMPLETION_SETTLE_MS (one shared budget, never again for that attempt).
      */
     const scanCompletions = async (sid: string, messages: readonly ContextMessage[]): Promise<void> => {
       if (processor === undefined) return;
       const waits: string[] = [];
-      for (const message of messages) {
+      const scanned: Array<{ child: string; signature: string }> = [];
+      /** The children an element of this request started processing for. */
+      const taken = new Set<string>();
+      for (const [messageIndex, message] of messages.entries()) {
         if (!Array.isArray(message.content)) continue;
-        for (const part of message.content) {
+        const messageKey = completionMessageKey(message, messageIndex);
+        for (const [partIndex, part] of message.content.entries()) {
           if (part.type !== "text") continue;
-          for (const element of completionElementsOf(part.text)) {
+          for (const [elementIndex, element] of completionElementsOf(part.text).entries()) {
             const attempt = inflight.byChild(element.child);
             if (attempt === undefined || attempt.parentSessionID !== sid) {
               ingestLogger.warn("[router] background: a completion element names a child with no attempt of this parent", {
@@ -2197,7 +2297,19 @@ export async function registerV2Hooks(
               });
               continue;
             }
-            if (attempt.state === "acknowledged" || attempt.state === "child-ended") {
+            // DF-1-4: the parent's history keeps the completion element of every earlier turn of a resumed child. An element is
+            // remembered once an attempt took it or had finished when it was seen; a remembered one never starts a later attempt
+            // (the resume's own element, or its end event, follows). Seen during a processing, it is left for the next request,
+            // unless a resume of its child is decided first (QA-DF1-17: the resume marks every element of the child last scanned).
+            // QA-DF1-20: an element is identified by the message that holds it (message id, part and element index), never by its
+            // state and body: a resumed turn's byte-identical answer is a new element.
+            const signature = `${messageKey}\0${partIndex}\0${elementIndex}`;
+            scanned.push({ child: element.child, signature });
+            const open = attempt.state === "acknowledged" || attempt.state === "child-ended";
+            if (open && !noteCompletionElement(element.child, signature)) continue;
+            if (!open && attempt.state !== "processing") noteCompletionElement(element.child, signature);
+            if (open) {
+              taken.add(element.child);
               trackBackground(processor.process(element.child, { kind: "completion", state: element.state, body: element.body, at: nowMs() }));
             }
             if (!attempt.waitedOnce && !waits.includes(element.child)) {
@@ -2206,6 +2318,23 @@ export async function registerV2Hooks(
             }
           }
         }
+      }
+      // QA-DF1-20: an attempt whose end left it `child-ended` (its answer not readable yet) that no element of this request took
+      // reads its child again now, instead of waiting for an element that may never be new to this copy, or for the sweep.
+      for (const attempt of inflight.listForParent(sid)) {
+        if (attempt.state !== "child-ended" || taken.has(attempt.childSessionID)) continue;
+        if (inflight.byChild(attempt.childSessionID) !== attempt) continue;
+        const outcome = attempt.outcome;
+        if (outcome === undefined || outcome === "unknown") continue;
+        // The end it met is replayed as is (its outcome and time): only the child's answer is read again.
+        const end = { outcome, eventID: `reread:${attempt.key}`, at: attempt.endedAt ?? nowMs() };
+        trackBackground(processor.process(attempt.childSessionID, { kind: "early-end", end }));
+      }
+      lastScannedElements.delete(sid);
+      lastScannedElements.set(sid, scanned);
+      for (const old of lastScannedElements.keys()) {
+        if (lastScannedElements.size <= MAX_SEEN_COMPLETION_CHILDREN) break;
+        lastScannedElements.delete(old);
       }
       if (waits.length > 0) await Promise.all(waits.map((child) => processor?.settled(child, COMPLETION_SETTLE_MS)));
     };
@@ -2533,6 +2662,14 @@ export async function registerV2Hooks(
         // #84 P2.1-C: a fresh role dispatch carries its nonce at the END of the description (title marker, handoff 31).
         if (routed.description !== undefined) args.description = routed.description;
         if (routed.role !== undefined) roleForeground = true;
+        // DF-1-9: a role decision read the session (dispatch.ts routeRoleCall): the floor rung is a delegate's (it has a parent), any
+        // other is the orchestrator's — the kind of an unrecorded session is known without another host call. A root is marked for
+        // the timing recorder too, as `session.created` does (a recorded kind skips the step path's own lookup).
+        if (routed.role !== undefined && !sessionKinds.has(String(event.sessionID))) {
+          const kind = routed.role.delegate === true ? "child" : "root";
+          noteSessionKind(String(event.sessionID), kind);
+          if (kind === "root") timings?.markRootSession(String(event.sessionID));
+        }
         if (routed.agent !== undefined) { args.agent = routed.agent; args.subagent_type = routed.agent; }
         if (routed.model !== undefined) args.model = routed.model;
         if (args.model === undefined && tierModel !== undefined) args.model = tierModel;
@@ -2563,6 +2700,12 @@ export async function registerV2Hooks(
         let background: boolean | undefined = verifying || roleForeground ? false : undefined;
         if (event.tool === "subagent" && bgActive() && finishApi !== undefined) {
           const parent = String(event.sessionID);
+          // DF-1-9: a parent the plugin never recorded (a reload, past the bound) is resolved, never assumed a root: an
+          // unrecorded child must not reach the `auto` rows (A-2.1-1, root parents only). A lookup that fails stays foreground;
+          // QA-DF1-23: so does one the host has not answered within SESSION_KIND_DISPATCH_TIMEOUT_MS.
+          const recordedKind = sessionKinds.get(parent);
+          const parentKind = recordedKind ?? await dispatchSessionKindOf(parent);
+          if (recordedKind === undefined && parentKind === "root") timings?.markRootSession(parent); // as the step path's lookup does
           const info = dispatchRouter.decisionOf(event.id);
           const roleLabel = info?.role ?? "unknown";
           const verification = finishApi.verificationFor(event.id);
@@ -2575,14 +2718,17 @@ export async function registerV2Hooks(
             acceptance: verification?.acceptance ?? { testsPass: false, buildPasses: false },
             planTask: false,
             holdingAvailable: held.available && !reloadFailed && finishApi.canHold(parent),
-            parentIsRoot: knownKindOf(parent) === "root", liveCount: inflight.liveCount(),
+            parentIsRoot: parentKind === "root", liveCount: inflight.liveCount(),
           });
           background = decision.background;
+          const resumeOf = typeof output.args?.sessionID === "string" && output.args.sessionID !== "" ? output.args.sessionID : undefined;
+          // QA-DF1-17: the earlier turns' completion elements of a resumed child are never the resume's, whatever their state.
+          if (resumeOf !== undefined) rememberElementsOnResume(parent, resumeOf);
           inflight.decide({
             callID: event.id, parentSessionID: parent, agent: String(output.args?.agent ?? ""), ...(info?.role === undefined ? {} : { role: info.role }),
             description: typeof output.args?.description === "string" ? output.args.description : "", verifying,
             verificationMode: verification?.mode ?? "none", decision,
-            ...(typeof output.args?.sessionID === "string" && output.args.sessionID !== "" ? { resumeOf: output.args.sessionID } : {}),
+            ...(resumeOf === undefined ? {} : { resumeOf }),
             at: nowMs(),
           });
         }
@@ -2675,7 +2821,10 @@ export async function registerV2Hooks(
     };
     // Phase 2.1 (memo §4.7): the completion processor. Only when the plugin attached its finish API; otherwise nothing is processed.
     let processor: CompletionProcessor | undefined;
-    /** The child's last assistant message (`ctx.session.context`, C7/O1); also the recovery read of a persisted dispatch. */
+    /**
+     * The child's last assistant message of its current turn (after its newest user prompt, DF-1-4) (`ctx.session.context`,
+     * C7/O1); also the recovery read of a persisted dispatch.
+     */
     const lastAssistantText = async (child: string): Promise<{ text: string } | undefined> => {
       const history = await ctx.session.context({ sessionID: child } as Parameters<typeof ctx.session.context>[0]);
       const messages: readonly unknown[] = Array.isArray(history) ? history : [];
@@ -2687,6 +2836,8 @@ export async function registerV2Hooks(
           const text = messageText(message);
           if (text !== undefined) return { text };
         }
+        // DF-1-4: the newest user prompt opens the current turn; an answer before it belongs to an earlier turn (a resume).
+        if (message?.type === "user" || message?.role === "user") break;
       }
       ingestLogger.warn("[router] background: the child's context holds no assistant message", {
         child,
@@ -2709,7 +2860,8 @@ export async function registerV2Hooks(
       for (let index = messages.length - 1; index >= 0; index--) {
         const message = messages[index] as { type?: unknown; role?: unknown; error?: unknown; info?: { error?: unknown } } | undefined;
         if (message?.type === "synthetic") continue;
-        if (message?.type !== "assistant" && message?.role !== "assistant") return { outcome: "lost" };
+        // QA-DF1-21: a user or tool turn last, or a step without its end, is an execution that has not ended (`incomplete`).
+        if (message?.type !== "assistant" && message?.role !== "assistant") return { outcome: "lost", incomplete: true };
         const text = messageText(message);
         const error = message.error ?? message.info?.error;
         if (error !== undefined && error !== null && error !== false) {
@@ -2717,7 +2869,7 @@ export async function registerV2Hooks(
           return { outcome: /abort|interrupt|cancel/i.test(described) ? "interrupted" : "failed", ...(text === undefined ? {} : { text }) };
         }
         // QA-2.1-18: text alone is not an end: a child cut mid-step has partial text. Without a completion marker it is lost.
-        if (!assistantStepCompleted(message)) return { outcome: "lost" };
+        if (!assistantStepCompleted(message)) return { outcome: "lost", incomplete: true };
         return text === undefined ? { outcome: "lost" } : { outcome: "succeeded", text };
       }
       return { outcome: "lost" };
@@ -2836,6 +2988,8 @@ export async function registerV2Hooks(
           const callID = typeof rec.callID === "string" ? rec.callID : undefined;
           const child = typeof rec.childSessionID === "string" ? rec.childSessionID : typeof rec.child === "string" ? rec.child : undefined;
           if (callID === undefined || child === undefined) continue;
+          // QA-DF1-21: written by this very process (its token, never just its pid, which a later process may reuse).
+          const sameProcess = rec.process === processToken();
           const mode = rec.verificationMode === "required" || rec.verificationMode === "deferred" ? rec.verificationMode : "none";
           const registered = inflight.decide({
             callID, parentSessionID: sessionID, agent: typeof rec.agent === "string" ? rec.agent : "",
@@ -2862,6 +3016,12 @@ export async function registerV2Hooks(
               end = await childEndState(child);
             } catch (error) {
               ingestLogger.warn("[router] background: the child of a persisted dispatch could not be read; treated as lost", { child, error: String(error) });
+            }
+            // QA-DF1-21: a record of this very process (an owning location the host evicted, not a restart) whose child's last step
+            // has no end is a child still running here: its attempt stays acknowledged (dormant) until its end event processes it.
+            if (end.outcome === "lost" && end.incomplete === true && sameProcess) {
+              ingestLogger.info?.("[router] background: an adopted dispatch of this process is still running; waiting for its end", { child, callID });
+              return;
             }
             await closing.process(child, end.outcome === "lost"
               ? { kind: "recovery", outcome: "lost", text: undefined, at: nowMs() }
@@ -2958,7 +3118,7 @@ export async function registerV2Hooks(
                   label: attemptLabel(attempt), ...(handle === undefined ? {} : { handle }), at: nowMs(),
                   agent: rec.agent, description: rec.description, verifying: rec.verifying, verificationMode: rec.verificationMode,
                   ...(rec.role === undefined ? {} : { role: rec.role }), hold: handle ?? null,
-                  ...(dispatch === undefined ? {} : { dispatch }),
+                  ...(dispatch === undefined ? {} : { dispatch }), process: processToken(),
                 }, { fsync: true });
               } catch (error) {
                 journaled = false;
@@ -3216,6 +3376,14 @@ export async function registerV2Hooks(
                 trackBackground(endHandled);
                 await endHandled;
               }
+              // DF-1-5: a root run's end closes its orchestrator turn, whatever the background mode: under background-first dispatch
+              // the kickoff and each synthetic wake-up are runs without a `prompt` hook, so no prompt would ever close them.
+              if (timings?.isRootSession(sid) === true) {
+                const turnDone = timings.onRootExecutionEnd(sid, event.id)
+                  .catch((error: unknown) => ingestLogger.warn("[router] timing: the turn boundary could not be recorded", { error: String(error) }));
+                trackBackground(turnDone);
+                await turnDone;
+              }
               leaseGuard?.releaseChild(sid);
               leaseHandle?.notifyReleased();
               // QA-2.1-6: an end event adopts the parent's records: the root itself, or (for a child this process has no attempt for)
@@ -3238,7 +3406,8 @@ export async function registerV2Hooks(
                 const attempt = inflight.byChild(sid);
                 if (attempt !== undefined) {
                   // QA-2.1-21: tracked, so `dispose` and the settled seam wait for the completion it starts.
-                  if (attempt.state === "acknowledged") trackBackground(processor.process(sid, { kind: "end-event", outcome, eventID: event.id, at }));
+                  // DF-1-4: a `child-ended` attempt met an end before its turn had an answer to read: this end delivers it.
+                  if (attempt.state === "acknowledged" || attempt.state === "child-ended") trackBackground(processor.process(sid, { kind: "end-event", outcome, eventID: event.id, at }));
                   else ingestLogger.warn("[router] background: an end event met an attempt that is not awaiting one", { child: sid, state: attempt.state, outcome });
                 } else if (sessionKinds.get(sid) !== "root") {
                   // A session whose kind is not yet known may be a child whose acknowledgement is still to come (bounded, TTL).
@@ -3269,6 +3438,8 @@ export async function registerV2Hooks(
               effortStore.forget(data.sessionID); // #90 P1.2: a deleted session is no longer answered
               // Phase 2.1 (memo §4.6): the session's attempts, holds, leases and cached kind go with it.
               inflight.forgetSession(data.sessionID);
+              seenCompletionElements.delete(data.sessionID);
+              lastScannedElements.delete(data.sessionID);
               processor?.forgetSession(data.sessionID);
               held.forgetSession(data.sessionID);
               leaseGuard?.releaseChild(data.sessionID);

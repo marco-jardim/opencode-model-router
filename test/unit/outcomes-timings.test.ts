@@ -1308,6 +1308,7 @@ describe("timing recorder: independent of routing.engine", () => {
         "markRootSession",
         "onCapacitySignal",
         "onExecutionOutcome",
+        "onRootExecutionEnd",
         "onRootPrompt",
         "onRootStep",
         "recordDispatchStart",

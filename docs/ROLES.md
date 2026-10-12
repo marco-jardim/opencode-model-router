@@ -174,7 +174,10 @@ name. At dispatch time a grant that would mix them loses its egress, with a note
 
 Every role dispatch has exactly one **work root**: the session directory, or a git worktree of the same repository
 named on the route line with `root=<absolute path>` (and repeated in ENVIRONMENT). `read`, `glob`, `grep`,
-`router_git_*`, `edit` and `router_run` work inside it only; any other path is denied.
+`router_git_*`, `edit` and `router_run` work inside it only; any other path is denied. A role child gets its task
+without the route line, so the role prompt says: "The work root this dispatch names (its ENVIRONMENT section, or
+`root=`) wins over the working directory in the host's environment block." The host's block can name the parent's
+directory.
 
 - **Resolution.** The `root=` text is normalised and compared with the session directory and with every entry of
   `git worktree list --porcelain` before any filesystem call on it; a match becomes its canonical long form. Anything
@@ -190,7 +193,9 @@ named on the route line with `root=<absolute path>` (and repeated in ENVIRONMENT
 - **Registration.** The role agents' max policy allows `external_directory` for the worktree roots git lists when the
   agents are registered, plus the `routing.workRoots` globs (global layer only, default `[]`), never `*`. A worktree
   created after the plugin started is covered only by a matching `routing.workRoots` glob (or a restart). Roles
-  without local actions (`researcher`) get no `external_directory` rule.
+  without local actions (`researcher`) get no `external_directory` rule. When `routing.workRoots` is set and the
+  directory OpenCode started in lies outside every entry (compared in its canonical form), the router runs no
+  `git worktree list` at start. The role agents then get only the `routing.workRoots` globs.
 - **Canonical long form.** Write `routing.workRoots` entries in their canonical long spelling: an 8.3 short segment
   (`PROGRA~1`) is refused, because the host compares spellings and a short name can alias another directory.
 - **Over-match.** `*` crosses separators: `D:/git/omr-rta-*` allows every directory starting with `omr-rta-`, nested

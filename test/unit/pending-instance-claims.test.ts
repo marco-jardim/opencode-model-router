@@ -1,10 +1,13 @@
 // QA-2.1-19: a session claim names its owner by pid AND per-instance token, so a second plugin instance of the same
 // process can never adopt (and post or wake for) a session the first one is still running a dispatch for.
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { CLAIM_REFRESH_MS, CLAIM_STALE_MS, claimPendingSession, createInstanceClaimToken, refreshPendingClaims, releasePendingClaim } from "../../src/verify/pending";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  CLAIM_REFRESH_MS, CLAIM_STALE_MS, PENDING_INSTANCES_DIRNAME, claimPendingSession, createInstanceClaimToken, refreshPendingClaims, releasePendingClaim,
+  writeInstanceBeat,
+} from "../../src/verify/pending";
 
 describe("QA-2.1-19: per-instance session claims", () => {
   const roots: string[] = [];
@@ -139,6 +142,77 @@ describe("QA-2.1-34: pid-reuse-safe claims (refresh every CLAIM_REFRESH_MS, stal
     } finally {
       first.release();
       second.release();
+    }
+  });
+});
+
+describe("DF-1-10: instance beat files (sibling module copies in one host process)", () => {
+  const roots: string[] = [];
+  afterEach(() => {
+    for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  });
+  const dirs = (): { claims: string; beats: string } => {
+    const root = mkdtempSync(join(tmpdir(), "omr-claims-beat-"));
+    roots.push(root);
+    return { claims: join(root, "pending.claims"), beats: join(root, PENDING_INSTANCES_DIRNAME) };
+  };
+  const alive = (): boolean => true;
+  // A token of another module copy: never in this copy's live-token set.
+  const siblingToken = "sibling-copy-token.0001";
+
+  it("DF-1-10 same pid, other token, fresh heartbeat → refused (the claim stays the owner's)", () => {
+    const { claims, beats } = dirs();
+    const mine = createInstanceClaimToken(beats);
+    try {
+      const t0 = 3_000_000;
+      expect(claimPendingSession(claims, "ses_live", { pid: process.pid, now: t0, isAlive: alive, token: siblingToken })).toBe(true);
+      writeInstanceBeat(beats, siblingToken, { pid: process.pid, now: t0 });
+      expect(claimPendingSession(claims, "ses_live", { pid: process.pid, now: t0 + CLAIM_STALE_MS, isAlive: alive, token: mine.token, beatsDir: beats })).toBe(false);
+      expect(JSON.parse(readFileSync(join(claims, "ses_live"), "utf8"))).toMatchObject({ pid: process.pid, token: siblingToken, at: t0 });
+    } finally {
+      mine.release();
+    }
+  });
+
+  it("DF-1-10 same pid, other token, stale heartbeat → taken; no beat file or another pid's beat → taken (df1 behaviour) (guard)", () => {
+    const { claims, beats } = dirs();
+    const mine = createInstanceClaimToken(beats);
+    try {
+      const t0 = 4_000_000;
+      expect(claimPendingSession(claims, "ses_stale", { pid: process.pid, now: t0, isAlive: alive, token: siblingToken })).toBe(true);
+      writeInstanceBeat(beats, siblingToken, { pid: process.pid, now: t0 });
+      expect(claimPendingSession(claims, "ses_stale", { pid: process.pid, now: t0 + CLAIM_STALE_MS + 1, isAlive: alive, token: mine.token, beatsDir: beats })).toBe(true);
+      expect(JSON.parse(readFileSync(join(claims, "ses_stale"), "utf8"))).toMatchObject({ token: mine.token });
+
+      expect(claimPendingSession(claims, "ses_nobeat", { pid: process.pid, now: t0, isAlive: alive, token: "df1-build-token" })).toBe(true);
+      expect(claimPendingSession(claims, "ses_nobeat", { pid: process.pid, now: t0 + 1, isAlive: alive, token: mine.token, beatsDir: beats })).toBe(true);
+
+      expect(claimPendingSession(claims, "ses_otherpid", { pid: process.pid, now: t0, isAlive: alive, token: "reused-pid-token" })).toBe(true);
+      writeInstanceBeat(beats, "reused-pid-token", { pid: process.pid + 100_000, now: t0 });
+      expect(claimPendingSession(claims, "ses_otherpid", { pid: process.pid, now: t0 + 1, isAlive: alive, token: mine.token, beatsDir: beats })).toBe(true);
+    } finally {
+      mine.release();
+    }
+  });
+
+  it("DF-1-10 a second module copy refuses a live instance's claim while it beats, and takes it once that instance releases", async () => {
+    const { claims, beats } = dirs();
+    vi.resetModules();
+    const sibling = await import("../../src/verify/pending");
+    const owner = createInstanceClaimToken(beats);
+    const other = sibling.createInstanceClaimToken(beats);
+    try {
+      expect(claimPendingSession(claims, "ses_s", { pid: process.pid, now: Date.now(), isAlive: alive, token: owner.token })).toBe(true);
+      // The copies share no live-token set; the owner's beat file is what the sibling copy sees.
+      owner.beat();
+      expect(readdirSync(beats)).toContain(encodeURIComponent(owner.token));
+      expect(sibling.claimPendingSession(claims, "ses_s", { pid: process.pid, now: Date.now(), isAlive: alive, token: other.token, beatsDir: beats })).toBe(false);
+      owner.release();
+      expect(readdirSync(beats)).not.toContain(encodeURIComponent(owner.token));
+      expect(sibling.claimPendingSession(claims, "ses_s", { pid: process.pid, now: Date.now(), isAlive: alive, token: other.token, beatsDir: beats })).toBe(true);
+    } finally {
+      owner.release();
+      other.release();
     }
   });
 });

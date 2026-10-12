@@ -1,7 +1,8 @@
 /**
  * #84 P2.1 T2.1.3 / T2.1.4: the role runtime wired into the plugin (`src/index.ts`) and the v2 adapter (`src/compat/v2-hooks.ts`):
  * protocol switch, role tools and the one work-root resolver, guard profiles, budget/authority annotations of the parent's result,
- * the authority ladder's resume, session eviction, P-5 foreground, signals with the real guard state. Tiers mode and v1 unchanged.
+ * the authority ladder's resume, session eviction, P-5 foreground, signals with the real guard state. v1 unchanged; v2 tiers
+ * mode unchanged except for the phase 2.1 "Background dispatches" block (v2 only).
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -221,7 +222,12 @@ describe("tiers mode and v1 stay unchanged (I1, I8)", () => {
     const output = { system: [] as string[] };
     await hooks["experimental.chat.system.transform"]({ sessionID: "root", model: { providerID: "openai", modelID: "gpt-x" } }, output);
     const enfOn = resolveEnforcementMode({ config: cfg, env: process.env }).mode !== "off";
-    expect(output.system[0]).toBe(assembleSystemPrompt(cfg, "openai/gpt-x", enfOn));
+    // Today's tiers protocol plus, since phase 2.1, the v2-only "Background dispatches" block — nothing else changes.
+    expect(output.system[0]).toBe(assembleSystemPrompt(cfg, "openai/gpt-x", enfOn, "v2"));
+    expect(output.system[0]).toContain("## Background dispatches");
+    expect(output.system[0]).toContain("- After a background dispatch, continue any independent work;");
+    expect(output.system[0]).toContain("- A held result is not usable until its verdict arrives.");
+    expect(output.system[0]!.replace(/\n\n## Background dispatches\n[\s\S]*?(?=\n\n---\n\n|$)/, "")).toBe(assembleSystemPrompt(cfg, "openai/gpt-x", enfOn));
   });
 
   it("v1 with roles keys: tiers protocol, no role tool, the v2-only notice", async () => {
@@ -438,7 +444,9 @@ describe("role dispatch through the adapter (P2.1-C, P-5)", () => {
     expect(role.input.description).toMatch(/^find parser \[nonce [A-Za-z0-9_-]{16,128}\]$/);
     expect(String(role.input.prompt)).toMatch(/\nOMR_NONCE=[A-Za-z0-9_-]{16,128}$/);
     expect(typeof role.input.model).toBe("string");
-    expect(role.input.background).toBe(false);
+    // Phase 2.1 (D1, `auto` with a thin duration store, verification off): a role dispatch is no longer forced to
+    // `background: false`; it gets no key at all, so it runs in the host's default foreground (role-spikes update).
+    expect(Object.hasOwn(role.input, "background")).toBe(false);
 
     const tiers = home({}, { MODEL_ROUTER_ENFORCE: "0" });
     const tierPlugin = await plugin(tiers.dir);
@@ -768,9 +776,24 @@ describe("QA round 1 (P2.1)", () => {
       const event = { sessionID: "d1", agent: "medium", messageID: "m", id: `dc${i}`, tool: "subagent", input };
       await v2.toolHooks["execute.before"](event);
       expect(event.input.model).toBe(rungRef(cfg, "fast")); // implementer floor on the local-only grant
+      // Phase 2.1 D1 row 2 (`!parentIsRoot` → row 1): a child's role-routed dispatch stays `background: false`.
       expect(event.input.background).toBe(false);
       expect(String(event.input.prompt)).toContain("[route tier=heavy]"); // the delegate's prompt is not parsed or rewritten
       expect(event.input.description).toBe("patch"); // no nonce: nothing registered
+    }
+  });
+
+  it("DF-1-9: an unrecorded child's dispatch is never backgrounded as a root's (A-2.1-1, root parents only)", async () => {
+    const { dir, cfg } = home(ROLES, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    // No `session.created` and no `prompt` hook for u1 (a reload, or past the 1000-entry bound): only the host knows its parent.
+    const v2 = host(dir, cfg, { u1: { id: "u1", parentID: "root", agent: "medium", location: { directory: dir } } });
+    await v2.start(hooks);
+    for (const [i, explicit] of [undefined, true].entries()) {
+      const input: Record<string, unknown> = { agent: "implementer", description: "patch", prompt: "Patch the parser", ...(explicit === undefined ? {} : { background: explicit }) };
+      const event = { sessionID: "u1", agent: "medium", messageID: "m", id: `df19-${i}`, tool: "subagent", input };
+      await v2.toolHooks["execute.before"](event);
+      expect(event.input.background).toBe(false); // D1 row 2: `!parentIsRoot` → the pre-2.1 value, before any explicit or `auto` row
     }
   });
 
@@ -1187,7 +1210,12 @@ describe("QA round 1 (P2.1)", () => {
     const output = { system: [] as string[] };
     await hooks["experimental.chat.system.transform"]({ sessionID: "root", model: { providerID: "openai", modelID: "gpt-x" } }, output);
     const enfOn = resolveEnforcementMode({ config: cfg, env: process.env }).mode !== "off";
-    expect(output.system[0]).toBe(assembleSystemPrompt(cfg, "openai/gpt-x", enfOn));
+    // The tiers protocol on v2: since phase 2.1 it carries the "Background dispatches" block (v2 only), nothing else.
+    expect(output.system[0]).toBe(assembleSystemPrompt(cfg, "openai/gpt-x", enfOn, "v2"));
+    expect(output.system[0]).toContain("## Background dispatches");
+    expect(output.system[0]).toContain("- After a background dispatch, continue any independent work;");
+    expect(output.system[0]).toContain("- A held result is not usable until its verdict arrives.");
+    expect(output.system[0]!.replace(/\n\n## Background dispatches\n[\s\S]*?(?=\n\n---\n\n|$)/, "")).toBe(assembleSystemPrompt(cfg, "openai/gpt-x", enfOn));
   });
 
   it("QA-P21-2 nit 1: a context overflow named in error.data.message is a stop", () => {

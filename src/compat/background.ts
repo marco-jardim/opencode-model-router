@@ -565,6 +565,11 @@ export function createInFlightRegistry(deps: {
       const parked = earlyEnds.get(child);
       if (parked === undefined) return undefined;
       earlyEnds.delete(child);
+      // DF-1-4: an end parked before a resume of the child was decided ended an earlier turn, never the resumed one: it is
+      // dropped, and the attempt waits for its own end.
+      const newestKey = newestByChild.get(child);
+      const newest = newestKey === undefined ? undefined : attempts.get(newestKey);
+      if (newest?.resumeOf === child && parked.seen < newest.at) return undefined;
       return deps.now() - parked.seen > EARLY_END_TTL_MS ? undefined : parked.end;
     },
 

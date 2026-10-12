@@ -140,7 +140,8 @@ import { tool } from "@opencode-ai/plugin";
 import { scrubText } from "./guard/scrub";
 import { accept, unverifiableGateResult } from "./verify/gate";
 import { applyDispatchCaveats, createVerificationWiring, resolvePendingTtlMs, dispatchDirectiveText, extractAssistantText, parseRouterVerifyArgs, type DispatchStart, type HandleReport } from "./verify/wiring";
-import { CLAIM_REFRESH_MS, claimPendingSession, createInstanceClaimToken, createPendingFileJournal, foldDormantRecords, refreshPendingClaims, releasePendingClaim, resolvePendingJournalDir, processedKeyOf, appendRouterFooter, buildLateNoticeBlock, buildPendingListBlock, unattributedRisk, type DormantSession, type LateNotice, type PendingEntry, type SettledVerification } from "./verify/pending";
+import { locationOutsideWorkRoots } from "./router/work-roots";
+import { CLAIM_REFRESH_MS, PENDING_INSTANCES_DIRNAME, claimPendingSession, createInstanceClaimToken, createPendingFileJournal, foldDormantRecords, refreshPendingClaims, releasePendingClaim, resolvePendingJournalDir, processedKeyOf, appendRouterFooter, buildLateNoticeBlock, buildPendingListBlock, unattributedRisk, type DormantSession, type LateNotice, type PendingEntry, type SettledVerification } from "./verify/pending";
 import { createDeadline } from "./verify/deterministic";
 import {
   DEFAULT_DELEGATE_PROMPT_TIMEOUT_MS,
@@ -839,6 +840,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       });
   /** Section 11.3: the exclusive per-session claim files of the journal's sessions (v2 only). */
   const pendingClaimsDir = pendingDir === undefined ? undefined : join(pendingDir, "pending.claims");
+  /** DF-1-10: the beat files of the live plugin instances, which every module copy loaded into one host process can read. */
+  const pendingBeatsDir = pendingDir === undefined ? undefined : join(pendingDir, PENDING_INSTANCES_DIRNAME);
   /** QA-2.1-33: the v2 adapter's live attempts and holds (`FinishApi.setAdapterSnapshot`); none before it attaches. */
   let adapterSnapshot: (() => readonly PersistedRecord[]) | undefined;
   /**
@@ -870,6 +873,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     const claimsDir = pendingClaimsDir;
     claimRefreshTimer = setInterval(() => {
       refreshPendingClaims(claimsDir, claimedSessions, { pid: process.pid, now: Date.now(), ...(instanceClaim === undefined ? {} : { token: instanceClaim.token }) });
+      // DF-1-10: the instance beat stays fresh while this instance holds a claim (a sibling module copy checks it).
+      instanceClaim?.beat();
     }, CLAIM_REFRESH_MS);
     claimRefreshTimer.unref?.();
   }
@@ -887,9 +892,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   }
   /**
    * QA-2.1-19 (v2 only): this instance's claim token. Its claims are refused to every other live instance (of this
-   * process: the token; of another process: the pid) until it disposes.
+   * process: the token; of another process: the pid) until it disposes. DF-1-10: its beat file in `pending.instances`
+   * makes the token visible to instances of this process that run another copy of the plugin modules.
    */
-  const instanceClaim = pendingClaimsDir === undefined ? undefined : createInstanceClaimToken();
+  const instanceClaim = pendingClaimsDir === undefined ? undefined : createInstanceClaimToken(pendingBeatsDir);
   /**
    * QA-2.1-19: takes the claim of `sessionID` for this instance (pid + token), once. The live owner claims at its first
    * `inflight`/`hold` write; `adopt` claims before handing dormant records over. False when another live instance holds
@@ -907,7 +913,12 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           return (error as NodeJS.ErrnoException).code === "EPERM";
         }
       };
-      if (!claimPendingSession(pendingClaimsDir, sessionID, { pid: process.pid, now: Date.now(), isAlive: pidAliveNow, token: instanceClaim.token })) return false;
+      // DF-1-10: the beat is fresh before the claim lands, so a sibling copy of the module never reads it as orphaned.
+      if (claimRefreshTimer === undefined) instanceClaim.beat();
+      if (!claimPendingSession(pendingClaimsDir, sessionID, {
+        pid: process.pid, now: Date.now(), isAlive: pidAliveNow, token: instanceClaim.token,
+        ...(pendingBeatsDir === undefined ? {} : { beatsDir: pendingBeatsDir }),
+      })) return false;
     } catch (error) {
       logger.warn("[router] the pending session claim could not be taken", { sessionID, error: describeError(error) });
       return false;
@@ -945,7 +956,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // 2.1.5b: sweep reference dirs a crashed instance left behind. Fire-and-forget; never throws.
   // QA-2.1-11: deferred (unref'd timer), so plugin start never holds the project directory with a
   // git child; dispose cancels it.
-  const stopReferenceGc = startReferenceGc();
+  // DF-1-1 (v2 only): with `routing.workRoots` configured and non-empty, a location outside every entry is not the plan's:
+  // the start-up reference GC is skipped (it would run git in, and write to, that repository). Unset or empty: unchanged.
+  const outsideWorkRoots = isV2Host && locationOutsideWorkRoots(ctx.directory, cfg.routing?.workRoots);
+  if (outsideWorkRoots) logger.info?.(`[router] ${ctx.directory} is outside routing.workRoots: the start-up reference GC is skipped`);
+  const stopReferenceGc = outsideWorkRoots ? (): void => undefined : startReferenceGc();
 
   // Phase 1.2 (v2 only): the turn-state registry the adapter injects. Without it (v1, or a v2 host that injects none) nothing
   // below is registered or buffered, and the system transform keeps pushing the pending list and the late notices.
@@ -3304,7 +3319,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   type FinishOutcome =
     | { kind: "none" }
     | { kind: "deferred"; handle: string }
-    | { kind: "required"; verdict: "PASS" | "FAIL" | "UNVERIFIABLE"; detail: string }
+    // QA-DF1-16: `gate` is the gate's own verdict (method, outcome, reasons, caveats, notes); a held entry settles with it,
+    // QA-DF1-29: with its pass/outcome set from `verdict` (the tag the gate's decision gives; see heldSettlementOf).
+    | { kind: "required"; verdict: "PASS" | "FAIL" | "UNVERIFIABLE"; detail: string; gate: HeldSettlement }
     // QA-2.1-1: the gate was not run on purpose (a read-only delegation) or failed; neither is a verdict.
     | { kind: "skipped"; reason: string }
     | { kind: "error"; reason: string };
@@ -3318,7 +3335,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     input: any,
     output: any,
     unbannered: { output: unknown } | undefined,
-    extra?: { delta?: DispatchDelta; dod?: ReturnType<typeof buildDelegationDoD> },
+    extra?: { delta?: DispatchDelta; dod?: ReturnType<typeof buildDelegationDoD>; graderParentSessionID?: string },
   ): Promise<FinishOutcome> {
     let outcome: FinishOutcome = { kind: "none" };
     if (typeof input?.tool === "string") {
@@ -3444,8 +3461,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
           const gateGraderSessions = new Set<string>();
           const completedFailures: string[] = [];
-          // Keep the native grader unparented on the backend; only depth tracking uses its caller.
-          const gateDeps = buildGateDeps(undefined, gateGraderSessions, verification, gateDeadline, false, orchestratorSessionID || null);
+          // Keep the native grader unparented on the backend; only depth tracking uses its caller. DF-1-3 (v2 finish API only,
+          // absent on the v1 after-hook): a background completion names the parent whose retained context launches the grader.
+          const gateDeps = buildGateDeps(extra?.graderParentSessionID, gateGraderSessions, verification, gateDeadline, false, orchestratorSessionID || null);
           gateDeps.deterministic.onFailure = reason => completedFailures.push(reason);
           // #84 QA-G-B-2-1: a carried acceptance never passes on a testsPass/lintClean that ran no process.
           if (carriedRole) gateDeps.deterministic.noAffectedUnverifiable = CARRIED_NO_PROCESS_REASON;
@@ -3538,8 +3556,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           changedFileStore.clear(dispatchID);
           outcome = {
             kind: "required",
-            verdict: res.accepted ? "PASS" : res.verdict.outcome === "unverifiable" ? "UNVERIFIABLE" : "FAIL",
+            // DF-1-3: the tag follows the outcome; an accepted unverifiable result (gate.ts, not strictUnverifiable) is UNVERIFIABLE.
+            verdict: res.verdict.outcome === "unverifiable" ? "UNVERIFIABLE" : res.accepted ? "PASS" : "FAIL",
             detail: res.verdict.reasons.join("; "),
+            // QA-DF1-16: the gate's real verdict, so router_verify on a held handle reports what the posted text says.
+            gate: { verdict: res.verdict, retryable: false },
           };
         } catch (error) {
           // fail-closed: a verification error must NEVER throw out of the after-hook. QA-2.1-1: it is logged and reported as an
@@ -3579,13 +3600,15 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   /**
    * The foreground-equivalent text of a held dispatch, kept from the end of its gate until onVerdict posts it. QA-2.1-13:
    * bounded (oldest first; an evicted hold posts the generic verdict line) and forgotten with its parent session.
+   * QA-DF1-16: `post` is the tag and reason the held gate posts with its text (its settled verdict keeps every reason).
    */
-  const heldTexts = new Map<string, { readonly sessionID: string; readonly text: string }>();
+  type HeldPost = { readonly verdict: "PASS" | "FAIL" | "UNVERIFIABLE"; readonly reason?: string };
+  const heldTexts = new Map<string, { readonly sessionID: string; readonly text: string; readonly post?: HeldPost }>();
   /** = MAX_HOLDS_GLOBAL (background.ts): there are never more live holds than this. */
   const MAX_HELD_TEXTS = 10_000;
-  function rememberHeldText(handle: string, sessionID: string, text: string): void {
+  function rememberHeldText(handle: string, sessionID: string, text: string, post?: HeldPost): void {
     heldTexts.delete(handle);
-    heldTexts.set(handle, { sessionID, text });
+    heldTexts.set(handle, { sessionID, text, ...(post === undefined ? {} : { post }) });
     while (heldTexts.size > MAX_HELD_TEXTS) {
       const oldest = heldTexts.keys().next();
       if (oldest.done === true) break;
@@ -3630,9 +3653,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     // QA-2.1-31: settled by `settleHeldDirect` after the adapter posted the verdict itself.
     if (directlySettled.has(entry.handle)) return;
     if (entry.hold === undefined || heldSink === undefined) return;
-    const verdict = heldVerdictKind(result.verdict.outcome, result.verdict.pass);
-    const reason = result.verdict.reasons[0];
-    const text = heldTexts.get(entry.handle)?.text ?? `[router] ${entry.handle}: verification ended ${verdict}${reason !== undefined ? ` — ${scrubText(reason)}` : ""}`;
+    // QA-DF1-16: a held gate's text posts with the tag and reason it was written for (unchanged by its full settled verdict).
+    const held = heldTexts.get(entry.handle);
+    const verdict = held?.post?.verdict ?? heldVerdictKind(result.verdict.outcome, result.verdict.pass);
+    const reason = held?.post !== undefined ? held.post.reason : result.verdict.reasons[0];
+    const text = held?.text ?? `[router] ${entry.handle}: verification ended ${verdict}${reason !== undefined ? ` — ${scrubText(reason)}` : ""}`;
     heldTexts.delete(entry.handle);
     heldSink.verdict(entry.handle, { verdict, text, ...(reason !== undefined ? { reason } : {}) }).catch((error: unknown) => {
       logger.warn("[router] held verdict not posted", { handle: entry.handle, error: describeError(error) });
@@ -3697,9 +3722,31 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   /** QA-2.1-31: handles whose restored pending entry the adapter settled after posting the verdict itself (no second post). */
   const directlySettled = new Set<string>();
   type HeldClaim = Extract<ReturnType<typeof pending.markVerifying>, { kind: "claimed" }>;
+  type HeldSettlement = Parameters<HeldClaim["settle"]>[0];
   type HeldScratch = { output: string; title: string; metadata: Record<string, unknown> };
-  /** A deterministic, non-retryable result for a held entry. */
-  function heldVerification(verdict: "PASS" | "FAIL" | "UNVERIFIABLE", reasons: string[]): Parameters<HeldClaim["settle"]>[0] {
+  /**
+   * QA-DF1-16: what a held entry settles with: a gate verdict as the gate reached it (method, reasons, caveats, notes), anything
+   * else as `heldVerification`. QA-DF1-29: its `pass`/`outcome` are those of the posted tag (the gate's decision, `accepted`, which
+   * a trivial skip or `strictUnverifiable` sets apart from the raw verdict), so every reader that re-derives a tag from them
+   * (router_verify through `gateResult`, the restart re-post and the onVerdict fallback through `heldVerdictKind`) reads the
+   * posted one. Done here, once, not by each reader: a reader cannot re-derive a trivial skip's acceptance (gate.ts accepts it
+   * outside `gateResult`), and `strictUnverifiable` read after a restart need not be the value the gate decided under.
+   */
+  function heldSettlementOf(outcome: FinishOutcome, held: { verdict: "PASS" | "FAIL" | "UNVERIFIABLE"; reasons: string[] }): HeldSettlement {
+    if (outcome.kind !== "required") return heldVerification(held.verdict, held.reasons);
+    const tag = outcome.verdict;
+    return {
+      ...outcome.gate,
+      verdict: { ...outcome.gate.verdict, pass: tag === "PASS", outcome: tag === "PASS" ? "pass" : tag === "FAIL" ? "fail" : "unverifiable" },
+    };
+  }
+  /**
+   * A deterministic, non-retryable result for a held entry whose outcome is not a gate verdict (QA-DF1-16): the held gate's
+   * none/deferred/skipped/error outcomes (verification not required, a read-only skip, a deferral, a gate failure), a restart
+   * that lost the verification data (`finishRestored`), and a verdict the adapter posted itself (`settleHeldDirect`: only its
+   * tag and reason cross the finish API). A gate verdict settles with the gate's own verdict (see `heldSettlementOf`).
+   */
+  function heldVerification(verdict: "PASS" | "FAIL" | "UNVERIFIABLE", reasons: string[]): HeldSettlement {
     return {
       verdict: {
         pass: verdict === "PASS",
@@ -3762,12 +3809,14 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       const text = held.line === undefined ? scratch.output : `${scratch.output.trimEnd()}\n\n${held.line}`;
       const reason = held.reasons[0];
       if (claim.kind !== "claimed") return postHeldDirect(handle, held.verdict, text, reason);
-      rememberHeldText(handle, fin.parentSessionID, text);
-      claim.settle(heldVerification(held.verdict, held.reasons));
+      rememberHeldText(handle, fin.parentSessionID, text, { verdict: held.verdict, ...(reason !== undefined ? { reason } : {}) });
+      // QA-DF1-16: a gate verdict settles as the gate reached it (method, outcome, reasons, caveats, notes).
+      claim.settle(heldSettlementOf(outcome, held));
       // onVerdict posts only for an entry that carries its hold.
       return claim.entry.hold === undefined ? postHeldDirect(handle, held.verdict, text, reason) : undefined;
     };
-    trackHeldGate(finishDispatch(callInput, scratch, undefined, extra).then(settleHeld, (error: unknown) => {
+    // DF-1-3: the held gate's grader launches from the orchestrator's retained context too (C14 launcher A).
+    trackHeldGate(finishDispatch(callInput, scratch, undefined, { ...extra, graderParentSessionID: fin.parentSessionID }).then(settleHeld, (error: unknown) => {
       logger.warn("[router] held verification failed", { handle, error: describeError(error) });
       return settleHeld({ kind: "error", reason: `verification unavailable: ${scrubText(String(error))}` });
     }));
@@ -3963,7 +4012,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         runHeldGate(fin, handle, callInput, scratch, delta === undefined ? undefined : { delta }, undefined);
         return { outputText: fin.outputText, suffix: "", verification: { kind: "held", handle }, metadata: {} };
       }
-      const outcome = await finishDispatch(callInput, scratch, undefined, delta === undefined ? undefined : { delta });
+      // DF-1-3: a background completion has no tool context of the orchestrator; its grader launches from the retained context of
+      // the parent (C14 launcher A), never from whatever context is current (a role child's denies `subagent`).
+      const outcome = await finishDispatch(callInput, scratch, undefined, { ...(delta === undefined ? {} : { delta }), graderParentSessionID: fin.parentSessionID });
       const suffix = suffixOf();
       const verification: FinishResult["verification"] =
         outcome.kind === "deferred" ? { kind: "deferred", handle: outcome.handle }

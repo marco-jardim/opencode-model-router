@@ -124,10 +124,18 @@ export interface TimingRecorder {
   /** True when `sessionID` is a tracked root session. */
   isRootSession(sessionID: string): boolean;
   /**
-   * Turn boundary of a root session: appends the current turn's row if it has steps, then starts the next turn. `turn` counts
-   * per process (a restart numbers from 1 again). A seen `eventId` is ignored.
+   * Turn boundary of a root session (a user prompt): appends the current turn's row if it has steps, then starts the next turn.
+   * `turn` counts per process (a restart numbers from 1 again). A seen `eventId` is ignored. The end of a root run closes a turn
+   * too ({@link onRootExecutionEnd}), so a turn is one orchestrator run, closed by whichever boundary comes first.
    */
   onRootPrompt(sessionID: string, at: number, eventId?: string): Promise<void>;
+  /**
+   * End of a root session's run (`session.execution.*`, DF-1-5): appends the current turn's row if it has steps, then starts the
+   * next turn, as {@link onRootPrompt} does. Under background-first dispatch the orchestrator's kickoff and each synthetic
+   * wake-up are runs without a `prompt` hook, so each run closes its own turn here (an open dispatch start does not keep it
+   * open). Any other session, or a turn with no step, is ignored. A seen `eventId` is ignored.
+   */
+  onRootExecutionEnd(sessionID: string, eventId?: string): Promise<void>;
   /**
    * Adds one step to the current turn of a root session; any other session is ignored. A seen `eventId` is ignored.
    * Returns whether the step was counted.
@@ -619,6 +627,21 @@ export function createTimingRecorder(options: TimingRecorderOptions): TimingReco
       }
     },
 
+    async onRootExecutionEnd(sessionID: string, eventId?: string): Promise<void> {
+      try {
+        const state = roots.get(sessionID);
+        if (state === undefined) return;
+        if (hasId(eventId) && !rememberOnce(seenEvents, `${namespace}|run-end|${eventId}`, MAX_SEEN_EVENT_IDS)) return;
+        if (state.steps === 0) return; // a run that counted no step (its steps preceded `markRootSession`): nothing to close
+        touchRoot(sessionID, state);
+        state.lastStepAt = clock();
+        const row = takeTurn(sessionID, state);
+        if (row !== null) await appendTurnRows([row]);
+      } catch (error) {
+        warnOnce("internal", "[router] timing recorder failed to close an orchestrator turn", error);
+      }
+    },
+
     onRootStep(sessionID: string, tokens: RootStepTokens, eventId?: string): boolean {
       try {
         const state = roots.get(sessionID);
@@ -755,6 +778,7 @@ export function acquireTimingRecorder(options: AcquireTimingRecorderOptions): Ti
     markRootSession: (sessionID) => shared.recorder.markRootSession(sessionID),
     isRootSession: (sessionID) => shared.recorder.isRootSession(sessionID),
     onRootPrompt: (sessionID, at, eventId) => shared.recorder.onRootPrompt(sessionID, at, eventId),
+    onRootExecutionEnd: (sessionID, eventId) => shared.recorder.onRootExecutionEnd(sessionID, eventId),
     onRootStep: (sessionID, tokens, eventId) => shared.recorder.onRootStep(sessionID, tokens, eventId),
     sweep: (at) => shared.recorder.sweep(at),
     flush: () => shared.recorder.flush(),

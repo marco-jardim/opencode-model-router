@@ -248,7 +248,8 @@ describe("registerRoleAgents", () => {
     const fast = JSON.stringify(agents.fast);
     const wt = join(base, "wt-1");
     mkdirSync(wt);
-    const opts = options({ listWorktrees: async () => [wt.replaceAll("\\", "/")], seed: { general: { mode: "subagent", model: "host/general" } } });
+    // QA-DF1-19: the location lies inside `routing.workRoots`, so the worktrees are listed at start.
+    const opts = options({ directory: join(base, "omr-main"), listWorktrees: async () => [wt.replaceAll("\\", "/")], seed: { general: { mode: "subagent", model: "host/general" } } });
     const result = await registerRoleAgents(agents, cfg, opts);
     const table = resolveRoleTable(cfg, "v2", { context7: false });
     expect(result.failed).toBe(false);

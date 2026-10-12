@@ -39,6 +39,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   conversation, so the system prompt stays byte-stable across turns. Late notices are repeated every turn until
   `router_verify` reads them. OpenCode v1 is unchanged.
 
+### Fixed
+
+- **OpenCode v2: a resumed background dispatch delivers its own answer.** It no longer takes an earlier turn's
+  completion as its own result, even when the earlier turn was still being processed when the parent saw it, nor the
+  child's earlier answer. Completions are told apart by the message that carries them rather than by their text, so two
+  turns with the same answer each get one verdict; a dispatch whose child ended before its answer could be read is
+  read again on the parent's next request instead of waiting for the 6 h sweep. Known limit: the set of completions
+  already taken lives in memory, so a resume right after a plugin restart can still mis-attribute.
+- **OpenCode v2: background dispatches without a deterministic check are graded.** Their grader launches from the
+  orchestrator's context, never from a role child's (which denies `subagent`), and a result that could not be verified
+  is tagged `UNVERIFIABLE` instead of `PASS`. Acceptance is unchanged. OpenCode v1 is unchanged.
+- **OpenCode v2: an unrecorded child session never backgrounds a dispatch.** A child the plugin never recorded (after a
+  reload, or past the 1000-entry bound) no longer counts as a root parent in the background decision (root parents
+  only): its kind comes from the role decision's session read or from the host, and a failed lookup keeps the
+  foreground value. OpenCode v1 is unchanged.
+- **OpenCode v2: background-first runs write `turns.jsonl` rows.** The end of a root session's run now closes its
+  orchestrator turn, so the kickoff and each wake-up (runs that no user prompt starts) get one row each, even while a
+  background dispatch is still open. OpenCode v1 is unchanged.
+- **Role prompts: the dispatch's work root wins over the host's environment block.** The work-root rule of every role
+  prompt now says that the work root a dispatch names (its ENVIRONMENT section, or `root=`) wins over the working
+  directory in the host's environment block (role children get the task without the route line), so a role no longer
+  refuses its work root because the host named the parent's directory.
+- **OpenCode v2: a second booted location no longer settles another location's running dispatch as `lost in
+  restart`.** When one host process loads a router instance per location, each instance now keeps a beat file in
+  `pending.instances` next to `pending.claims` while it holds a session claim. A new instance refuses to adopt a
+  session whose claim belongs to a live sibling instance, so that instance's records stay dormant and its verdict is
+  the only one delivered. A dead owner (stale beat, or dead pid) is still recovered as before. Journal and claim
+  records written by earlier builds read as before. OpenCode v1 is unchanged.
+- **OpenCode v2: no start-up git in a location outside `routing.workRoots`.** When `routing.workRoots` is configured and
+  non-empty, an instance loaded in a directory outside every entry skips the start-up reference GC and logs one info
+  line naming the skip; in roles mode, role agent registration there runs no `git worktree list` and the role agents
+  get only the `routing.workRoots` patterns as `external_directory` rules. The location check uses the documented
+  glob semantics (`*` crosses separators, as in the role agents' rules) and compares canonical paths. Without
+  `routing.workRoots` nothing changes. OpenCode v1 is unchanged.
+- **OpenCode v2: `router_verify` on a held background handle reports the verdict its gate reached** (method, outcome,
+  reasons, caveats and notes). It used to settle every held gate verdict as a deterministic result with no caveats, so
+  a checker that could not verify showed "UNVERIFIED: deterministic" without the grader's reason and a pass with
+  caveats showed "✓ verified". The stored pass/outcome always match the posted tag (a trivial dispatch the gate accepts
+  unverified reads pass, a pass that `strictUnverifiable` rejects reads fail, also when re-posted after a restart). The
+  posted verdict is unchanged. OpenCode v1 is unchanged.
+- **OpenCode v2: plugin copies loaded per booted location share the pending journal safely.** A fresh writer mark of
+  the same process under another module token counts as a live writer (start-up compaction is skipped), each copy
+  compacts through its own temp file, and a recreate merges the records of every copy. Beat files in
+  `pending.instances` are written atomically, a half-written beat counts as live while its modification time is
+  fresh, and stale beats are swept at start. When the host evicts a location while its child still runs, the adopting
+  instance keeps that dispatch dormant until its end event instead of reporting it `lost in restart`.
+- **OpenCode v2: the background decision's parent lookup is bounded.** An unrecorded parent is looked up at most once
+  and for at most 1 s; on timeout the dispatch stays in the foreground.
+
 ## [2.7.0] - 2026-10-10
 
 ### Added

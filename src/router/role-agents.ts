@@ -22,7 +22,8 @@ import { positiveBudget, REFUSAL_CAP, ROUTE_BUDGET_RAISE_MAX, TIER_GUARD_BUDGET 
 import { PLUGIN_AGENT, pluginAgentMarker, pluginAgentPolicy, type PluginAgentMarker } from "./plugin-agents";
 import { CONTEXT7_DOC_TOOLS, type PermissionMap } from "./read-only";
 import { ACTION_CLASS, HOST_NATIVE_ROLE_NAMES, resolveRoleTable, SHIPPED_ROLE_SPECS, type AuthorityAction, type RoleSpec, type RoleTable } from "./roles";
-import { workRootProblem } from "./roles-config";
+import { workRootGlobIndex, workRootProblem } from "./roles-config";
+import { locationOutsideWorkRoots } from "./work-roots";
 
 /**
  * Steps above the largest guard budget a role dispatch can reach. The guard's `NEED MORE: budget`
@@ -215,7 +216,7 @@ export function worktreeRootPattern(root: string, realpath: Realpath = nativeRea
 export function workRootPattern(entry: string, realpath: Realpath = nativeRealpath): { pattern?: string; problem?: string } {
   const problem = workRootProblem(entry);
   if (problem !== undefined) return { problem };
-  const globAt = entry.search(/[*?[\]{}]/);
+  const globAt = workRootGlobIndex(entry);
   if (globAt === -1) {
     const pattern = worktreeRootPattern(entry, realpath);
     return pattern === undefined ? { problem: "does not resolve to a directory in canonical long form" } : { pattern };
@@ -286,7 +287,10 @@ const NONE: RoleRegistration = Object.freeze({
 export interface RoleRegistrationOptions {
   /** The context7 MCP server is configured (its documentation tools become direct tools). */
   context7: boolean;
-  /** The project directory: its repository's worktrees are listed. */
+  /**
+   * The project directory: its repository's worktrees are listed, unless `routing.workRoots` is set and the directory lies
+   * outside every entry (`locationOutsideWorkRoots`, QA-DF1-19): then no git runs and only the `workRoots` patterns count.
+   */
   directory: string;
   /** The host's own agents at setup (name → seed definition); a removed #81 entry falls back to it. */
   seed: Readonly<Record<string, Record<string, unknown>>>;
@@ -337,7 +341,10 @@ export async function registerRoleAgents(
     table = (opts.resolveTable ?? resolveRoleTable)(cfg, "v2", { context7: opts.context7 });
     const tiers = resolveActiveTiers(cfg);
     let worktrees: string[] = [];
-    if ([...table.roles.values()].some(roleHasLocalActions)) {
+    // QA-DF1-19: a location outside a configured `routing.workRoots` runs no start-up git: no worktree listing, only the
+    // `workRoots` patterns become external_directory rules. Unset or empty `workRoots`: the worktrees are listed as before.
+    const outside = locationOutsideWorkRoots(opts.directory, routing.workRoots, process.platform, opts.realpath ?? nativeRealpath);
+    if (!outside && [...table.roles.values()].some(roleHasLocalActions)) {
       try {
         worktrees = await (opts.listWorktrees ?? listWorktrees)(opts.directory);
       } catch (error) {

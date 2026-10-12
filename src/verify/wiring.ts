@@ -732,7 +732,8 @@ export function formatVerifyReport(
       lines.push(indent(`[router] ${DRIFT_UNCHECKED_NOTICE}`));
     }
     if (judged.accepted) {
-      lines.push(indent(buildAcceptedSuffix(verdict.method, judged.verdict.outcome, judged.verdict.caveats, verdict.notes).trim()));
+      // QA-DF1-30 (QA-3.1-21): a skipped check reads `⚠ UNVERIFIED`, never verified (a held trivial skip is stored as a pass).
+      lines.push(indent(buildAcceptedSuffix(verdict.method, verdict.skipped === true ? undefined : judged.verdict.outcome, judged.verdict.caveats, verdict.notes).trim()));
     } else {
       lines.push(indent(scrubText(buildForcingNote(verdict.reasons, { producerTier: item.producerTier, nextTier: result.nextTier ?? null, incomplete: isIncompleteVerdict(verdict) }))));
       lines.push(indent(ROUTER_VERIFY_NO_RETRY_TEXT));
