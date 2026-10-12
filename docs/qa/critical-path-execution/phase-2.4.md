@@ -530,12 +530,97 @@ Record these in phase-2.4.md `## Measurements` with `git --version`, `node -v`, 
    - provisioning runs repository-controlled code (lifecycle scripts, `yarnPath`, build backends) as a manual install would, with credentials stripped.
 7. CHANGELOG: nothing is user-visible until the executor ships. The orchestrator decides whether to add an entry under `[Unreleased]`.
 
+## Measurements
+
+Spec: design memo §8 above (M1-M10). Tool versions: see the measured block below.
+
+- M4 (does git follow junctions): recorded by the orchestrator: `git clean` did not follow a junction on this host. Spec: temp repo on D:, junction `repo\junk` to `<tmp>\outside` holding `keep.txt`, `git clean -ffdx` with and without `-e`, `git checkout --force`; `keep.txt` must survive. Confirms the §4.5 sweep.
+
+M4 evidence in the repository: `test/integration/executor-slots-git.test.ts:284-312` (describe QA-2.4-1; test "M4 measurement: plain `git clean -ffdx` over an untracked tools/node_modules/x junction (recorded result: target survives)", line 305).
+
+Constants that the other measurements are meant to confirm (current values, not measurements):
+- `PROVISION_STEP_TIMEOUT_MS = 1_200_000` (`src/executor/slots/provision.ts:62`) — M1, M2.
+- `SLOT_SWEEP_MAX_ENTRIES = 2_000_000` (`src/executor/slots/provision.ts:68`) — M10 (spec: at least 4x the measured count).
+- `SLOT_RM_BUDGET_MS = 120_000` (`src/executor/slots/pool.ts:19`, comment "per slot, confirm with M7") — M7.
+- `MIN_GIT_VERSION = [2, 33, 0]` (`src/executor/git.ts:22`) — M5.
+- `GIT_OP_TIMEOUT_MS = 120_000`, `GIT_WORKTREE_ADD_TIMEOUT_MS = 600_000` (`src/executor/git.ts:23-24`) — M6.
+- `UV_CACHE_DIR` rule: on win32, when `uv cache dir` is on another drive, set `<slot drive>:\.omr-cache\uv` (`src/executor/slots/provision.ts:799-813`) — M3, M9.
+
+Measured by the orchestrator on 2026-10-12 (script run from `D:\git\omr-cpx-p24` at `b65bb4d`, scratch root `D:\tmp\omr-m24`, removed afterwards). Versions: git 2.51.0.windows.1, node v24.21.0, pnpm 11.22.0, Python 3.14.7, uv 0.11.7. Windows Defender antivirus and real-time protection on.
+
+| ID | Value | Decision |
+|---|---|---|
+| M1 | pnpm `install --frozen-lockfile --prefer-offline` of the `node-pnpm` fixture in a fresh worktree: 756 / 739 / 650 ms, median of runs 2-3 = 695 ms. Real-dependency stand-in: M7's `npm ci` of this repository, 24.7 s. | `PROVISION_STEP_TIMEOUT_MS` = 1_200_000 kept (≥ 48× the real install). |
+| M2 | `py -3 -m venv`: 4.9 s; pip install of the fixture's comment-only `requirements.txt`: 1.06 s cold, 1.08 s warm; pip install of a real dependency (`pytest`): 4.2 s. | same constant kept. |
+| M3 | `pnpm store path` from a directory on D: = `D:\.pnpm-store\v11` (same drive as the slots). | no pnpm store override needed; docs unchanged. |
+| M4 | `keep.txt` behind a junction `repo\junk` survived all four: `git clean -ffdx`, `git clean -ffdx -e junk`, `git clean -ffdx -e other`, `git checkout --force HEAD`. Regression test: `test/integration/executor-slots-git.test.ts:305-313`. | git does not follow junctions here; the §4.5 sweep stays mandatory (defense in depth, memo §7). |
+| M5 | `git worktree add --detach --lock --reason m5` succeeded on git 2.51.0; `worktree list --porcelain` showed `locked m5`. | `MIN_GIT_VERSION` = 2.33.0 kept. |
+| M6 | reset of a provisioned slot (`checkout --detach --force` + `clean -ffd`): 426 ms; `git worktree add --detach` of this repository: 550 ms. | `GIT_OP_TIMEOUT_MS` 120_000 and `GIT_WORKTREE_ADD_TIMEOUT_MS` 600_000 kept (≥ 200× margin). |
+| M7 | `rmSync(node_modules, {recursive, force, maxRetries: 0})` right after `npm ci` (≈35k entries): 10.5 s, then 8.4 / 11.3 / 13.5 s on three repeats; EBUSY 0 of 4. | `SLOT_RM_BUDGET_MS` = 120_000 kept (≈ 9× the worst run). |
+| M8 | longest path under `node_modules` relative to the slot root: 136 characters; `LongPathsEnabled` = 1. | long-path warning stays as designed; this host has long paths on. |
+| M9 | `uv cache dir` = `C:\Users\Marquinho\.uv-cache` (drive C:, slots on D:). | the win32 rule applies: provisioning sets `UV_CACHE_DIR` to `<slot drive>:\.omr-cache\uv` (`provision.ts:799-813`). |
+| M10 | entries in the provisioned slot (this repository + `node_modules`): 35,476; full recursive enumeration 1.6 s. | `SLOT_SWEEP_MAX_ENTRIES` = 2_000_000 kept (≥ 4× = 141,904; margin 56×). |
+
+Limits: the fixtures have no dependencies, so M1 and M2 use real installs (this repository's `npm ci`, pip `pytest`) as stand-ins for a large project; no pnpm project with a real dependency tree was measured.
+
 ## Findings
+
+Three QA rounds, 31 findings (QA-2.4-1 to -31), all fixed.
+
+| Round | Findings | Status |
+|---|---|---|
+| 1 | 21 (QA-2.4-1 to -21) | fixed in `a49e023`; follow-up tests `2511500`, `2f256aa` |
+| 2 | 9 (QA-2.4-22 to -30) | fixed in `ba520bf` |
+| 3 | 1 (major, QA-2.4-31) | fixed in `0b73acc` |
 
 ## Fixes
 
+- Round 1, `a49e023`: sweep what git clean will delete (-1); real-directory slot checks with lexical back-pointers (-2); GC proves ownership by trusted parent and lock reason (-3); branchForce without deref and with mandatory compare-and-swap (-4); workspace-aware pnpm (-5); slot executables for router_run (-6); GC under slot mutexes with pool close and provisioning abort (-7); checks restore tracked files (-8); minors -9 to -21.
+- Round 2, `ba520bf`: C locale for hardened git (-22), install steps isolated from the user's Python environment (-23), preview with the real clean's flags (-24), persisted produced files (-25), gc without slot waits for running plans (-26), snapshot-checked slot executables (-27), shared sweep cap (-28), typed stage driver (-29), dead config removed (-30).
+- QA-2.4-31 (round 3, major): commit `0b73acc` (oversized slot sidecars never break provisioning).
+- Coverage top-up: commit `b65bb4d` (tests only, no source change). Before it, `pool.ts` branches were 89.17% and `provision.ts` branches 89.95%, below the CI gate of 90.
+- Fix commits for the round 1 and round 2 findings: not recorded in this report.
+
+## Coverage
+
+Run by the orchestrator on 2026-10-12: `npx vitest run --coverage` over the unit tests `executor-git`, `executor-provision-env`, `executor-provision`, `executor-slots`, `executor-slots-coverage`, `executor-provision-coverage` and the integration test `executor-slots-git`. Result: 473 passed, 3 skipped.
+
+| File | Statements | Branches | Functions | Lines |
+|---|---|---|---|---|
+| `src/executor/slots/pool.ts` | 98.02 | 96.33 | 100 | 98.91 |
+| `src/executor/slots/provision.ts` | 99.27 | 97.84 | 98.95 | 100 |
+| `src/executor/git.ts` (same run, earlier) | 95.69 | 91.2 | 98.85 | 97.62 |
+| `src/executor/slots/env.ts` | no uncovered branches | | | |
+
+CI gate per file: 90 statements / 90 branches / 90 functions. All files meet it after top-up `b65bb4d`. The 3 skipped tests are not itemised here (the plan allows `skipIf(!uv)` with a recorded reason).
+
+## Smoke
+
+`npm run smoke:cpx:provision` on 2026-10-12 at `b65bb4d` with OpenCode 2.0.26: exit 0, 1 file, 4/4 tests passed. The informational acquire times of the second task are not recorded in this report. The smoke file skips unless `OMR_CPX_SMOKE=1`, so `npm test` never runs it.
+
 ## Deferred findings
+
+- M1 and M2 were measured on dependency-free fixtures plus real-install stand-ins (see ## Measurements), not on a large pnpm project.
+- Known limitations from memo §10.6: git-lfs and submodules are not set up in slots; provisioning runs repository-controlled code with credentials stripped.
+- CHANGELOG: nothing is user-visible until the executor ships (memo §10.7); the orchestrator decides whether to add an `[Unreleased]` entry.
+- Per-finding dispositions for rounds 1 and 2: not recorded in this report.
 
 ## Handoffs
 
+- 3.1: passes `trustedSlotsDirs`; creates `LeaseService` after `acquire`; calls `pool.close()`.
+- 3.2: slots stay detached; branches move only through `branchForce` with compare-and-swap (tag names from `phaseTagName`).
+- 5.1 (role-agents.ts): grant role children their own slot and deny executor home (memo §10.3).
+- D18: confirm the computed `slotsDir` is plan-unique, uses a drive letter and sits outside the toplevel (memo §10.2).
+
+## Plan amendments
+
+A-2.4-1: the orchestrator decisions recorded in `## Implementation notes` change the plan text:
+- DV1-DV10 of the design memo (§0 "Decisions that change the plan text") are approved and binding.
+- `package.json` (script `smoke:cpx:provision`) joins the 2.4.6 Writes list (memo §10.1).
+- 2.3 O1: `defaultSlotsDir(toplevel, planId)` = `<repo drive>:\.omr-slots\<planId>` is exported from `slots\pool.ts`; the integration slot path is `ledger.integration.worktree`.
+
+The individual DV items are in memo §0 and are not repeated here. The plan file itself was outside this step's work root and was not compared line by line; the orchestrator should apply A-2.4-1 to it.
+
 ## Verdict
+
+Done, pending merge into `cpx/main`. M1-M10 recorded (all constants kept), coverage above the gate on every file, 473 tests passed, `smoke:cpx:provision` 4/4, every QA finding fixed.
