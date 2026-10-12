@@ -1218,6 +1218,20 @@ async function inspectRoot(operation: GitOperation, input: GitInput, value: unkn
     const answer = checkGitRootAnswer(await resolveRoot(value, { sessionID, signal, deadlineAt }));
     if (!answer.ok) return `[router_git] error: refused: ${stripUrlUserinfo(answer.reason)}`;
     if (answer.inWorkRoot) return undefined;
+    // F2, before anything is spawned: `root` is still the real path the resolver answered (no junction or link swapped in since
+    // resolution), and a main worktree's `.git` is its own git directory (no gitdir file, link or junction naming another
+    // repository): for a main worktree the dispatch check below compares `root` with itself.
+    let real: string | undefined;
+    try { real = realpath(answer.root); } catch { real = undefined; }
+    if (real === undefined || foldCase(real) !== foldCase(answer.root)) {
+      return `[router_git] error: refused: root=${displayRoot(value)}: ${displayRoot(answer.root)} changed since it was resolved; nothing ran`;
+    }
+    if (sameOnDisk(answer.repository, answer.root)) {
+      const dotGit = join(answer.root, ".git");
+      let own = false;
+      try { const stats = lstatSync(dotGit); own = stats.isDirectory() && !stats.isSymbolicLink(); } catch { own = false; }
+      if (!own) return `[router_git] error: refused: root=${displayRoot(value)}: ${displayRoot(dotGit)} is not the repository's own git directory; nothing ran`;
+    }
     const output = await inspectGit(operation, input, answer.root, signal, {
       executables, guards: [...workRootGuards(answer.root), ...workRootGuards(answer.workRoot)],
       role: { dispatchRepository: answer.repository }, deadlineAt,

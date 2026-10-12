@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import * as childProcess from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative } from "node:path";
 import {
@@ -271,6 +271,69 @@ describe("router_git_* root (3b.3)", () => {
     expect(output).not.toContain("work initial");
     expect(spawns()).toHaveLength(0);
   });
+
+  it("F2: a main worktree whose .git is not its own git directory is refused before anything is spawned", async () => {
+    const refusal = (root: string) =>
+      `[router_git] error: refused: root=${VALUE}: ${join(root, ".git")} is not the repository's own git directory; nothing ran`;
+    // A .git file redirecting into another repository (W), the resolver answering repository === root (a main worktree).
+    const redirect = join(scratch, "redirect");
+    mkdirSync(redirect);
+    writeFileSync(join(redirect, ".git"), `gitdir: ${join(work, ".git")}\n`);
+    // A .git junction (a symbolic link elsewhere) to W's git directory.
+    const linkedGit = join(scratch, "linked-git");
+    mkdirSync(linkedGit);
+    symlinkSync(join(work, ".git"), join(linkedGit, ".git"), "junction");
+    // No .git at all.
+    const plain = join(scratch, "plain");
+    mkdirSync(plain);
+    for (const root of [redirect, linkedGit, plain]) {
+      const tools = roleTools({ resolveRoot: resolver(admitted({ root, repository: root })) });
+      resetSpawns();
+      for (const name of ["router_git_log", "router_git_status", "router_git_ls_files"]) {
+        const output = await run(tools, name, { root: VALUE });
+        expect(output, `${root} ${name}`).toBe(refusal(root));
+        expect(output).not.toContain("work initial");
+        expect(output).not.toContain("[router: read from");
+      }
+      expect(spawns()).toHaveLength(0);
+    }
+  });
+
+  it("F2: a root that is no longer its resolved real path (a junction swapped in) is refused before anything is spawned", async () => {
+    const junction = join(scratch, "junction");
+    symlinkSync(work, junction, "junction");
+    expect(same(junction, work)).toBe(true);
+    for (const repository of [junction, target, work]) {
+      const tools = roleTools({ resolveRoot: resolver(admitted({ root: junction, repository })) });
+      resetSpawns();
+      const output = await run(tools, "router_git_log", { root: VALUE });
+      expect(output, repository).toBe(`[router_git] error: refused: root=${VALUE}: ${junction} changed since it was resolved; nothing ran`);
+      expect(output).not.toContain("work initial");
+      expect(spawns()).toHaveLength(0);
+    }
+    // A root removed since it was resolved is refused the same way.
+    const gone = join(scratch, "gone");
+    const tools = roleTools({ resolveRoot: resolver(admitted({ root: gone, repository: gone })) });
+    resetSpawns();
+    expect(await run(tools, "router_git_status", { root: VALUE }))
+      .toBe(`[router_git] error: refused: root=${VALUE}: ${gone} changed since it was resolved; nothing ran`);
+    expect(spawns()).toHaveLength(0);
+  });
+
+  it("F2: a normal main worktree and a linked worktree of the admitted repository are still inspected", async () => {
+    const main = roleTools({ resolveRoot: resolver(admitted()) });
+    expect(await run(main, "router_git_ls_files", { root: VALUE })).toBe(`${provenance}\nlib.txt\n`);
+    const linked = join(scratch, "lib-linked");
+    gitIn(target, "worktree", "add", "-q", "-b", "side", linked);
+    writeFileSync(join(linked, "side-new.txt"), "side\n");
+    const tools = roleTools({ resolveRoot: resolver(admitted({ root: linked, repository: target })) });
+    expect(await run(tools, "router_git_ls_files", { root: VALUE })).toBe(`${provenance}\nlib.txt\n`);
+    expect(await run(tools, "router_git_status", { root: VALUE })).toBe(`${provenance}\n?? side-new.txt\n`);
+    const log = await run(tools, "router_git_log", { root: VALUE, limit: 1 });
+    expect(log.startsWith(`${provenance}\ncommit `)).toBe(true);
+    expect(log).toContain("lib initial");
+    expect(log).not.toContain("work initial");
+  }, 60_000);
 
   it("one deadline covers resolution and inspection (SD-3b-8)", async () => {
     // The resolver uses up the call's 15 s: the inspection's first budget check (before its first spawn) times out, rather
