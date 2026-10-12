@@ -14,6 +14,13 @@
  * (O2), C14 launches 8 retained children (O3), C13 / C14b interrupt an ACTIVE root (O4), C15 completes a compaction (O5) and the O6
  * scenario posts `session.synthetic` with `resume`. A host upgrade that changes a decided behaviour fails `npm run smoke:cpx`.
  *
+ * Router turn-state tail: the router stays at its defaults here (routing.background included). Since Phase 2.1 it appends its
+ * `<router-state>` tail (src/compat/turn-state.ts `placeTurnState`, "in-flight" provider in src/compat/v2-hooks.ts) as the LAST wire
+ * message of a root with background children in flight. Wire helpers that mean "the caller's last message" (`lastIsToolResult`,
+ * `toolResultIds`, `toolResultText`, the root match of `Gates`) therefore read `lastRealMessage`, which skips that tail, like the
+ * scripted provider does (helpers/routing-host.ts `isStateTail`). Reading the literal last message held nothing in C3 (slow request) and
+ * C13 O4a (busy root turn).
+ *
  * Probe wiring: RoutingHost builds the host env from an allowlist, so CPX_PROBE_* cannot travel from the test process. The generated
  * `server.mjs` of the wrapper directory starts with `process.env.CPX_PROBE_* = ...` lines (the host loads native plugins in-process; only
  * `node:` modules are imported, so the assignments run before the probe reads its env), followed by the unchanged probe source. One host
@@ -249,7 +256,19 @@ function front(host: RoutingHost): CpxFront {
 const parentRequests = (host: RoutingHost, session: string): CpxRequest[] => front(host).requests.filter(r => hdr(r, "x-proof-session") === session && hdr(r, "x-proof-kind") === "primary");
 const bodyMessages = (r: CpxRequest): Obj[] => arr(obj(r.body).messages).map(obj);
 const hasToolResult = (m: Obj | undefined): boolean => arr(m?.content).map(obj).some(b => b.type === "tool_result");
-const lastIsToolResult = (r: CpxRequest): boolean => hasToolResult(bodyMessages(r).at(-1));
+/** The router's turn-state tail (src/compat/turn-state.ts `placeTurnState`: a trailing user message `<router-state>...`) is never the caller's
+ *  turn. Since Phase 2.1 the router renders it for a root with background dispatches in flight, so the literal last wire message of such a
+ *  root is the tail. Same rule as the scripted provider (helpers/routing-host.ts `isStateTail`). */
+const isStateTail = (m: Obj): boolean => m.role === "user"
+  && (typeof m.content === "string" ? m.content : arr(m.content).map(obj).map(b => String(b.text ?? "")).join("\n")).trimStart().startsWith("<router-state>");
+/** The last wire message that is not the router's turn-state tail. */
+const lastRealMessage = (r: CpxRequest): Obj | undefined => {
+  const messages = bodyMessages(r);
+  let index = messages.length - 1;
+  while (index >= 0 && isStateTail(messages[index]!)) index -= 1;
+  return index >= 0 ? messages[index] : undefined;
+};
+const lastIsToolResult = (r: CpxRequest): boolean => hasToolResult(lastRealMessage(r));
 const json = (value: unknown): string => JSON.stringify(value) ?? "";
 const indexesWhere = (messages: Obj[], test: (text: string) => boolean): number[] => messages.flatMap((m, i) => (test(json(m)) ? [i] : []));
 const envelopeMessages = (messages: Obj[]): Obj[] => messages.flatMap((m, i) => (ENVELOPE.test(json(m)) ? [{ index: i, role: str(m.role) ?? str(m.type), message: clip(m, 1200) }] : []));
@@ -803,11 +822,11 @@ function toolInput(tool: string, props: readonly string[], project: string): Obj
   if (tool === "patch" || tool === "apply_patch") return { [pick("patchText", "patch", "input")]: "*** Begin Patch\n*** End Patch" };
   return input;
 }
-/** `tool_use_id` of the tool_result blocks in the LAST message of a provider request. */
-const toolResultIds = (r: CpxRequest): string[] => arr(bodyMessages(r).at(-1)?.content).map(obj).filter(b => b.type === "tool_result").flatMap(b => { const id = str(b.tool_use_id); return id === undefined ? [] : [id]; });
-/** Text of the tool_result blocks in the LAST message of a provider request: what the model was handed back. */
+/** `tool_use_id` of the tool_result blocks in the LAST message of a provider request (the router's turn-state tail skipped, as in `lastIsToolResult`). */
+const toolResultIds = (r: CpxRequest): string[] => arr(lastRealMessage(r)?.content).map(obj).filter(b => b.type === "tool_result").flatMap(b => { const id = str(b.tool_use_id); return id === undefined ? [] : [id]; });
+/** Text of the tool_result blocks in the LAST message of a provider request (tail skipped): what the model was handed back. */
 function toolResultText(r: CpxRequest): string {
-  const last = bodyMessages(r).at(-1);
+  const last = lastRealMessage(r);
   return arr(last?.content).map(obj).filter(b => b.type === "tool_result").map(b => (typeof b.content === "string" ? b.content : arr(b.content).map(c => str(obj(c).text) ?? "").join("\n"))).join("\n");
 }
 
@@ -1031,7 +1050,8 @@ class Gates {
       const session = hdr(request, "x-proof-session");
       if (session === undefined || hdr(request, "x-proof-kind") !== "primary") return 0;
       const isRoot = session === this.root;
-      const text = json(isRoot ? bodyMessages(request).at(-1) : bodyMessages(request));
+      // A root is matched on its last REAL message: with background children in flight the router's `<router-state>` tail follows it (lastRealMessage).
+      const text = json(isRoot ? lastRealMessage(request) : bodyMessages(request));
       const code = this.all.findIndex((t, i) => (i >= this.tokens.length) === isRoot && !this.released.has(t) && text.includes(t));
       if (code < 0) return 0;
       this.arrivals.push({ token: this.all[code]!, index: request.index, session, at: Date.now() });
