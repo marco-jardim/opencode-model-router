@@ -3,14 +3,14 @@
  * to obtain the finish API; on Claude Code v1 nothing calls it and the hooks object is unchanged.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Hooks } from "@opencode-ai/plugin";
 import ModelRouterPlugin from "../../src/index";
-import { ROUTER_FINISH_ATTACH, type FinishApi, type FinishAttach, type HeldSink } from "../../src/compat/background";
+import { ADOPTION_REFUSED, isAdoptionRefused, ROUTER_FINISH_ATTACH, type FinishApi, type FinishAttach, type HeldSink, type PersistedRecord } from "../../src/compat/background";
 import { invalidateConfigCache } from "../../src/router/config";
-import { MAX_ENTRIES_PER_SESSION } from "../../src/verify/pending";
+import { CLAIM_REFRESH_MS, CLAIM_STALE_MS, claimPendingSession, MAX_ENTRIES_PER_SESSION } from "../../src/verify/pending";
 import { removeDirWhenReleased } from "../helpers/remove-dir";
 
 vi.mock("../../src/verify/reference", async importOriginal => ({
@@ -56,6 +56,13 @@ function attachOf(hooks: Hooks): FinishAttach {
 }
 
 const sink: HeldSink = { verdict: async () => undefined };
+
+/** The call ids of the adopted `inflight` records; undefined for "nothing to adopt", "refused" for a refusal (QA-2.1-34). */
+function adoptedCallIDs(result: ReturnType<FinishApi["adopt"]>): unknown[] | "refused" | undefined {
+  if (result === undefined) return undefined;
+  if (isAdoptionRefused(result)) return "refused";
+  return result.inflight.map((r) => r.callID);
+}
 
 describe("finish attach channel", () => {
   it("is the registered symbol router.finishDispatch.attach", () => {
@@ -114,7 +121,7 @@ describe("finish attach channel", () => {
       const api = attachOf(await load("v2"))({ host: "v2", held: sink });
       if (api === undefined) throw new Error("no finish API");
       await api.reload();
-      expect(api.adopt("ses_ttl")?.inflight.map((r) => r.callID)).toEqual(["c-ttl"]);
+      expect(adoptedCallIDs(api.adopt("ses_ttl"))).toEqual(["c-ttl"]);
     } finally {
       if (savedXdg === undefined) delete process.env.XDG_STATE_HOME;
       else process.env.XDG_STATE_HOME = savedXdg;
@@ -137,15 +144,115 @@ describe("finish attach channel", () => {
       const other = attachOf(otherHooks)({ host: "v2", held: sink });
       if (other === undefined) throw new Error("no finish API");
       await other.reload();
-      // Same pid, another live instance token: refused, and the dormant records stay for a later adoption.
-      expect(other.adopt("ses_two")).toBeUndefined();
-      expect(other.adopt("ses_two")).toBeUndefined();
+      // Same pid, another live instance token: refused (QA-2.1-34: told apart from "nothing to adopt"), and the dormant
+      // records stay for a later adoption.
+      expect(other.adopt("ses_two")).toBe(ADOPTION_REFUSED);
+      expect(other.adopt("ses_two")).toBe(ADOPTION_REFUSED);
       // The owner disposes (its claims and its token go): now the other instance adopts the very same records.
       await (ownerHooks as { dispose?: () => Promise<void> }).dispose?.();
-      expect(other.adopt("ses_two")?.inflight.map((r) => r.callID)).toEqual(["c-two"]);
+      expect(adoptedCallIDs(other.adopt("ses_two"))).toEqual(["c-two"]);
       // Handed over once.
       expect(other.adopt("ses_two")).toBeUndefined();
       await (otherHooks as { dispose?: () => Promise<void> }).dispose?.();
+    } finally {
+      if (savedXdg === undefined) delete process.env.XDG_STATE_HOME;
+      else process.env.XDG_STATE_HOME = savedXdg;
+    }
+  });
+
+  it("QA-2.1-34: a claim of another live pid is refused while fresh and taken over once older than CLAIM_STALE_MS (a reused pid never refreshes it)", async () => {
+    const savedXdg = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = join(home, ".local", "state");
+    try {
+      const stateDir = join(home, ".local", "state", "opencode-model-router");
+      mkdirSync(join(stateDir, "pending.claims"), { recursive: true });
+      writeFileSync(join(stateDir, "pending.jsonl"), `${JSON.stringify({
+        v: 1, kind: "inflight", key: "k-reused\u0000c-reused", callID: "c-reused", parentSessionID: "ses_reused", childSessionID: "k-reused", at: Date.now(),
+      })}\n`);
+      // The crashed owner's claim; its pid now belongs to a live, unrelated process (the parent of this one).
+      const claim = join(stateDir, "pending.claims", "ses_reused");
+      writeFileSync(claim, `${JSON.stringify({ pid: process.ppid, token: "crashed-owner", at: Date.now() })}\n`);
+      const hooks = await load("v2");
+      const api = attachOf(hooks)({ host: "v2", held: sink });
+      if (api === undefined) throw new Error("no finish API");
+      await api.reload();
+      // Fresh: a distinct refusal (not "nothing to adopt"), and the records stay dormant.
+      expect(api.adopt("ses_reused")).toBe(ADOPTION_REFUSED);
+      expect(api.adopt("ses_nothing")).toBeUndefined();
+      // Nobody re-stamped it for longer than the stale age: the retry takes it over and adopts the very same records.
+      writeFileSync(claim, `${JSON.stringify({ pid: process.ppid, token: "crashed-owner", at: Date.now() - CLAIM_STALE_MS - 1_000 })}\n`);
+      expect(adoptedCallIDs(api.adopt("ses_reused"))).toEqual(["c-reused"]);
+      expect(JSON.parse(readFileSync(claim, "utf8"))).toMatchObject({ pid: process.pid });
+      await (hooks as { dispose?: () => Promise<void> }).dispose?.();
+    } finally {
+      if (savedXdg === undefined) delete process.env.XDG_STATE_HOME;
+      else process.env.XDG_STATE_HOME = savedXdg;
+    }
+  });
+
+  it("QA-2.1-34: the live owner re-stamps its claim every CLAIM_REFRESH_MS (fake clock), so it never goes stale; dispose gives it back", async () => {
+    const savedXdg = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = join(home, ".local", "state");
+    try {
+      const claimsDir = join(home, ".local", "state", "opencode-model-router", "pending.claims");
+      const claim = join(claimsDir, "ses_fresh");
+      const hooks = await load("v2");
+      const owner = attachOf(hooks)({ host: "v2", held: sink });
+      if (owner === undefined) throw new Error("no finish API");
+      const t0 = Date.now();
+      // Only the clock and the interval timers are faked: the journal's file I/O stays real.
+      vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"], now: t0 });
+      try {
+        await owner.journal.append({
+          v: 1, kind: "inflight", key: "k-fresh\u0000c-fresh", callID: "c-fresh", parentSessionID: "ses_fresh", childSessionID: "k-fresh", at: t0,
+        }, { fsync: true });
+        const stampedAt = (): unknown => (JSON.parse(readFileSync(claim, "utf8")) as { at?: unknown }).at;
+        expect(stampedAt()).toBe(t0);
+        vi.advanceTimersByTime(CLAIM_REFRESH_MS - 1);
+        expect(stampedAt()).toBe(t0);
+        vi.advanceTimersByTime(1);
+        expect(stampedAt()).toBe(t0 + CLAIM_REFRESH_MS);
+        // Three stale ages later the claim is as fresh as the last refresh: another live process is still refused.
+        vi.advanceTimersByTime(3 * CLAIM_STALE_MS - CLAIM_REFRESH_MS);
+        expect(stampedAt()).toBe(t0 + 3 * CLAIM_STALE_MS);
+        expect(claimPendingSession(claimsDir, "ses_fresh", { pid: process.ppid, now: Date.now() + 1, isAlive: () => true, token: "other-process" })).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
+      await (hooks as { dispose?: () => Promise<void> }).dispose?.();
+      expect(existsSync(claim)).toBe(false);
+    } finally {
+      if (savedXdg === undefined) delete process.env.XDG_STATE_HOME;
+      else process.env.XDG_STATE_HOME = savedXdg;
+    }
+  });
+
+  it("QA-2.1-33: two plugin instances on one journal: one instance's recreate writes the other's live records too, each once", async () => {
+    const savedXdg = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = join(home, ".local", "state");
+    try {
+      const journalPath = join(home, ".local", "state", "opencode-model-router", "pending.jsonl");
+      const inflight = (id: string): PersistedRecord => ({
+        v: 1, kind: "inflight", key: `k-${id}\u0000c-${id}`, callID: `c-${id}`, parentSessionID: `ses_${id}`, childSessionID: `k-${id}`, at: 1_000,
+      });
+      const aHooks = await load("v2");
+      const a = attachOf(aHooks)({ host: "v2", held: sink });
+      const bHooks = await load("v2");
+      const b = attachOf(bHooks)({ host: "v2", held: sink });
+      if (a === undefined || b === undefined) throw new Error("no finish API");
+      expect(typeof a.setAdapterSnapshot).toBe("function");
+      // Each adapter's live attempts (what the v2 adapter registers at attach).
+      a.setAdapterSnapshot?.(() => [inflight("a")]);
+      b.setAdapterSnapshot?.(() => [inflight("b")]);
+      await a.journal.append(inflight("a"), { fsync: true });
+      await b.journal.append(inflight("b"), { fsync: true });
+      rmSync(journalPath);
+      // Only the first instance notices and recreates, from its own memory.
+      await a.recreateJournal([inflight("a")]);
+      const callIDs = readFileSync(journalPath, "utf8").split("\n").filter((l) => l !== "").map((l) => (JSON.parse(l) as PersistedRecord).callID);
+      expect([...callIDs].sort()).toEqual(["c-a", "c-b"]);
+      await (aHooks as { dispose?: () => Promise<void> }).dispose?.();
+      await (bHooks as { dispose?: () => Promise<void> }).dispose?.();
     } finally {
       if (savedXdg === undefined) delete process.env.XDG_STATE_HOME;
       else process.env.XDG_STATE_HOME = savedXdg;

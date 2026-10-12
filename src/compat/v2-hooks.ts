@@ -46,8 +46,8 @@ import { filterSensitiveGrep, isSensitivePath } from "../router/sensitive-paths"
 import { canonicalAuthorityPath, insideWorkRoot } from "../routing/roles/work-root";
 import { appliedEffort, appliedThinkingBudget, createEffortStore, registerEffortChannel } from "../tui/effort-channel";
 import {
-  acquireLeaseRegistry, attemptLabel, COMPLETION_SETTLE_MS, createCompletionProcessor, createHeldResults, createInFlightRegistry,
-  createLeaseGuard, decideBackground, PENDING_GUARANTEES_TEXT, PROVIDER_ORDER, renderCompleted, renderHeld, renderInFlight,
+  acquireLeaseRegistry, ADOPTION_RETRY_MS, attemptLabel, COMPLETION_SETTLE_MS, createCompletionProcessor, createHeldResults, createInFlightRegistry,
+  createLeaseGuard, decideBackground, isAdoptionRefused, PENDING_GUARANTEES_TEXT, PROVIDER_ORDER, renderCompleted, renderHeld, renderInFlight,
   restoredDispatchOf, ROUTER_FINISH_ATTACH,
 } from "./background";
 import { acquireTimingRecorder, classifyCapacity } from "../routing/outcomes/timings";
@@ -67,7 +67,7 @@ import type {
   Attempt, CompletionProcessor, FinishApi, FinishAttach, HeldResults, InFlightRegistry, InflightJournal, LeaseGuard, PersistedRecord,
   RestoredDispatch, RestoredHold, RestoredHolds,
 } from "./background";
-import { PENDING_JOURNAL_VANISHED } from "../verify/pending";
+import { PENDING_JOURNAL_VANISHED, pendingRecordIdentity } from "../verify/pending";
 
 /** Translate the router's own v1 tool vocabulary at the v2 boundary. */
 export function v2Instructions(text: string): string {
@@ -1503,11 +1503,11 @@ export async function registerV2Hooks(
     for (const records of dormantInflight.values()) out.push(...records);
     return out;
   };
-  /** QA-2.1-16: what identifies a record a recreation rewrites from memory: its kind and its attempt key or hold handle. */
-  const recordIdentity = (record: PersistedRecord): string | undefined => {
-    const id = typeof record.key === "string" ? record.key : typeof record.handle === "string" ? record.handle : undefined;
-    return id === undefined ? undefined : `${record.kind}\u0000${id}`;
-  };
+  /**
+   * QA-2.1-16: what identifies a record a recreation rewrites from memory: its kind and its attempt key or hold handle. The
+   * same identity the recreation itself merges by (QA-2.1-33, `mergePendingSnapshots`).
+   */
+  const recordIdentity = (record: PersistedRecord): string | undefined => pendingRecordIdentity(record);
   /** QA-2.1-16: the identities the last successful recreation wrote; a retried append among them is not written again. */
   let recreatedIdentities = new Set<string>();
   let recreating: Promise<boolean> | undefined;
@@ -1619,6 +1619,8 @@ export async function registerV2Hooks(
           },
         };
         finishApi = (attachFinish as FinishAttach)({ host: "v2", held: trackedHeld, ...(leaseGuard === undefined ? {} : { leaseGate: leaseGuard }) });
+        // QA-2.1-33: a recreation of the shared journal by another plugin instance of this process writes these records too.
+        finishApi?.setAdapterSnapshot?.(adapterRecords);
       } catch (error) {
         ingestLogger.warn("[router] background: the plugin could not attach the finish API; no background processing", { error: String(error) });
       }
@@ -1628,12 +1630,21 @@ export async function registerV2Hooks(
   /**
    * Memo §11.3: the first sight of a parent session adopts its dormant records (claim file); idempotent per session. Bounded
    * (QA-2.1-13): a forgotten session leaves the set, and the oldest sightings go first past MAX_ADOPTED_SESSIONS (a second
-   * adoption of an evicted session finds no dormant records: `adopt` hands each session over once).
+   * adoption of an evicted session finds no dormant records: `adopt` hands each session over once). QA-2.1-34: a refused
+   * adoption (another live instance holds the claim) leaves the session unmarked; a later sighting tries again, at most
+   * once per ADOPTION_RETRY_MS (`refusedAdoptions`).
    */
   const adoptedSessions = new Set<string>();
+  /**
+   * QA-2.1-34: when the adoption of a session was last refused (another live instance holds its claim). The session is not
+   * marked adopted; a later sighting tries again once ADOPTION_RETRY_MS has passed. Bounded like `adoptedSessions`.
+   */
+  const refusedAdoptions = new Map<string, number>();
   const adoptSession = (sessionID: string): void => {
     if (reloadFailed) retryReload();
     if (finishApi === undefined || reloadFailed || adoptedSessions.has(sessionID)) return;
+    const refusedAt = refusedAdoptions.get(sessionID);
+    if (refusedAt !== undefined && nowMs() - refusedAt < ADOPTION_RETRY_MS) return;
     adoptedSessions.add(sessionID);
     for (const old of adoptedSessions) {
       if (adoptedSessions.size <= MAX_ADOPTED_SESSIONS) break;
@@ -1641,6 +1652,17 @@ export async function registerV2Hooks(
     }
     try {
       const adopted = finishApi.adopt(sessionID);
+      if (isAdoptionRefused(adopted)) {
+        adoptedSessions.delete(sessionID);
+        refusedAdoptions.delete(sessionID);
+        refusedAdoptions.set(sessionID, nowMs());
+        for (const old of refusedAdoptions.keys()) {
+          if (refusedAdoptions.size <= MAX_ADOPTED_SESSIONS) break;
+          refusedAdoptions.delete(old);
+        }
+        return;
+      }
+      refusedAdoptions.delete(sessionID);
       if (adopted === undefined) return;
       const restored = adopted.holds.length > 0 ? held.restore(adopted.holds) : { reposts: [], unverified: [] };
       let recovering = new Set<string>();
@@ -3256,6 +3278,7 @@ export async function registerV2Hooks(
               sessionDirs.delete(data.sessionID);
               failedKinds.delete(data.sessionID);
               adoptedSessions.delete(data.sessionID);
+              refusedAdoptions.delete(data.sessionID);
             }
             await ingesting("session.deleted", () => ingest.onSessionGone(data.sessionID));
           } else if (FLUSH_EVENT_TYPES.has(event.type)) {

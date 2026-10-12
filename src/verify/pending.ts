@@ -509,6 +509,9 @@ export interface HoldRef {
 /** A record in pending.jsonl (phase 2.1 section 11.1); structurally the background journal's record. */
 export type PendingRecord = { v: 1; kind: string } & Record<string, unknown>;
 
+/** QA-2.1-33: the records one journal object's owner needs after a restart; called by every `recreate` of the shared path. */
+export type PendingSnapshotProvider = () => readonly PendingRecord[] | Promise<readonly PendingRecord[]>;
+
 /** The append-only journal seam; passed only when `ctx.routerHost === "v2"`. */
 export interface PendingJournal {
   append(record: PendingRecord, opts?: { fsync?: boolean }): Promise<void>;
@@ -883,8 +886,19 @@ export interface PendingFileJournal extends PendingJournal {
    * behind every append so far. It is the recovery of a vanished journal: once it resolves, the vanished state is
    * reset, so later `load` and `append` calls succeed again. Rejects (and changes nothing) when the rewrite fails;
    * the caller then stays fail closed and may retry.
+   *
+   * QA-2.1-33: the rewrite is the union of `records` (the caller's own state: its own provider is not asked again) and
+   * the snapshot of every other journal object of the same path in this process that registered a provider
+   * (`setSnapshotProvider`), one record per identity (`mergePendingSnapshots`), so one instance's recreate never drops
+   * another instance's records. A provider that throws or rejects fails the recreate.
    */
   recreate(records: readonly PendingRecord[]): Promise<void>;
+  /**
+   * QA-2.1-33: registers (or, with undefined, removes) this journal object's snapshot provider: the records a later
+   * restore needs from this object's owner. Every `recreate` of the path in this process by ANOTHER journal object calls
+   * it inside the shared queue (this object's own `recreate` takes its state from `records`). Removed on `dispose`.
+   */
+  setSnapshotProvider(provider: PendingSnapshotProvider | undefined): void;
   /** QA-2.1-8: why the compaction at start failed (the journal then stays as it was); undefined when it did not fail. */
   readonly compactionError: string | undefined;
   /**
@@ -961,12 +975,15 @@ export function createPendingFileJournal(path: string, options: PendingFileJourn
       compactionWarned: false,
       markAt: undefined,
       refs: 0,
+      providers: new Map(),
     };
     SHARED_JOURNALS.set(key, found);
   }
   const state: SharedJournal = found;
   state.refs += 1;
   let disposed = false;
+  /** QA-2.1-33: this journal object's key in `state.providers`. */
+  const self = {};
   const file = state.path;
   const now = options.now ?? Date.now;
   const staleMs = options.writerStaleMs ?? WRITER_MARK_STALE_MS;
@@ -1032,11 +1049,16 @@ export function createPendingFileJournal(path: string, options: PendingFileJourn
     },
     recreate(records) {
       // QA-2.1-16: the writers directory may have vanished with the journal, so the mark is written again right away.
+      // QA-2.1-33: the snapshots are taken inside the queue, so every append queued before this rewrite is in them too.
       return enqueue(async () => {
-        await replaceFile(records);
+        await replaceFile(await unionOfSnapshots(records));
         state.markAt = undefined;
         await refreshMark();
       });
+    },
+    setSnapshotProvider(provider) {
+      if (provider === undefined || disposed) state.providers.delete(self);
+      else state.providers.set(self, provider);
     },
     load() {
       // QA-2.1-8: concurrent loads share one read, and a file unchanged since the last read (size and mtime) is not read again.
@@ -1051,6 +1073,7 @@ export function createPendingFileJournal(path: string, options: PendingFileJourn
     dispose() {
       if (disposed) return Promise.resolve();
       disposed = true;
+      state.providers.delete(self);
       state.refs -= 1;
       if (state.refs > 0) return Promise.resolve();
       const done = state.tail
@@ -1136,6 +1159,20 @@ export function createPendingFileJournal(path: string, options: PendingFileJourn
     });
     state.tail = settled;
     return settled;
+  }
+
+  /**
+   * QA-2.1-33: `records` (the caller's own state) plus the snapshot of every OTHER journal object of this path that
+   * registered a provider, in registration order: the caller's own provider is not asked again. One record per identity
+   * (`mergePendingSnapshots`): the same hold or attempt reaches the union from several sources with other field values.
+   * A throwing provider fails the recreate, which then changes nothing.
+   */
+  async function unionOfSnapshots(records: readonly PendingRecord[]): Promise<PendingRecord[]> {
+    const sources: (readonly PendingRecord[])[] = [records];
+    for (const [owner, provider] of [...state.providers]) {
+      if (owner !== self) sources.push(await provider());
+    }
+    return mergePendingSnapshots(sources);
   }
 
   async function replaceFile(records: readonly PendingRecord[]): Promise<void> {
@@ -1237,10 +1274,57 @@ interface SharedJournal {
   markAt: number | undefined;
   /** Journal objects of this path in this process that are not disposed. */
   refs: number;
+  /** QA-2.1-33: the snapshot provider of each journal object of this path that registered one (`setSnapshotProvider`). */
+  readonly providers: Map<object, PendingSnapshotProvider>;
 }
 
 /** QA-2.1-15: one shared journal state per resolved path in this process (case-insensitive on Windows). */
 const SHARED_JOURNALS = new Map<string, SharedJournal>();
+
+/**
+ * QA-2.1-16/-33: what identifies a record a recreation rewrites from memory: its kind and its attempt key, else its handle
+ * (`hold`, `hold-text`, `posting`, `posted`, entry and state records). Undefined for a record with neither. Pure.
+ */
+export function pendingRecordIdentity(record: { readonly kind: string; readonly [field: string]: unknown }): string | undefined {
+  const id = typeof record.key === "string" ? record.key : typeof record.handle === "string" ? record.handle : undefined;
+  return id === undefined ? undefined : `${record.kind}\u0000${id}`;
+}
+
+/**
+ * QA-2.1-33: merges record lists (the caller's state, then each other instance's snapshot) into one list with one record
+ * per identity (`pendingRecordIdentity`; a record without one is identified by its serialized form), whichever list or
+ * position it comes from: the same hold may arrive from the adapter, the plugin and another instance with other field
+ * values or field order. Of one identity the newest record (`at`) is kept, on a tie the most complete one (more fields),
+ * else the first; it takes the position of the first occurrence, so the order of the first list is kept. Pure.
+ */
+export function mergePendingSnapshots(lists: ReadonlyArray<readonly PendingRecord[]>): PendingRecord[] {
+  const positions = new Map<string, number>();
+  const union: PendingRecord[] = [];
+  for (const list of lists) {
+    for (const record of list) {
+      const id = pendingRecordIdentity(record) ?? `json\u0000${JSON.stringify(record)}`;
+      const position = positions.get(id);
+      if (position === undefined) {
+        positions.set(id, union.length);
+        union.push(record);
+        continue;
+      }
+      const kept = union[position];
+      if (kept === undefined || supersedes(record, kept)) union[position] = record;
+    }
+  }
+  return union;
+}
+
+/** QA-2.1-33: whether `candidate` replaces `kept` (same identity): a newer `at`, else (same or no `at`) more fields. */
+function supersedes(candidate: PendingRecord, kept: PendingRecord): boolean {
+  const next = typeof candidate.at === "number" && Number.isFinite(candidate.at) ? candidate.at : undefined;
+  const prev = typeof kept.at === "number" && Number.isFinite(kept.at) ? kept.at : undefined;
+  if (next !== undefined && prev !== undefined && next !== prev) return next > prev;
+  if (next !== undefined && prev === undefined) return true;
+  if (next === undefined && prev !== undefined) return false;
+  return Object.keys(candidate).length > Object.keys(kept).length;
+}
 
 /** QA-2.1-22: the directory of the writer marks, next to `pending.jsonl`. */
 export const PENDING_WRITERS_DIRNAME = "pending.writers";
@@ -1648,8 +1732,14 @@ export function createInstanceClaimToken(): { readonly token: string; release():
   return { token, release: () => { LIVE_INSTANCE_TOKENS.delete(token); } };
 }
 
-/** A claim older than this no longer protects a live pid (QA-2.1-13); live owners refresh well within it. */
-export const CLAIM_STALE_MS = 24 * 3600_000;
+/**
+ * QA-2.1-13/-34: a claim of another pid older than this no longer protects it, even while that pid is alive: a live owner
+ * re-stamps its claims every `CLAIM_REFRESH_MS` (`refreshPendingClaims`), so a claim this old belongs to a crashed process
+ * whose pid was reused.
+ */
+export const CLAIM_STALE_MS = 5 * 60_000;
+/** QA-2.1-34: how often a live owner re-stamps its claims; well within `CLAIM_STALE_MS`. */
+export const CLAIM_REFRESH_MS = 60_000;
 
 /** One token per module load: two processes that share a pid over time never share a token. */
 const PROCESS_CLAIM_TOKEN = toHex(randomBytes(8));

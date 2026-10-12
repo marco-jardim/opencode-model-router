@@ -91,7 +91,7 @@ import { createPersister, nodePersistDeps, summarizeRoles } from "./routing/outc
 import { roleAgentSteps } from "./router/role-agents";
 import type { HostBudgetObservation } from "./compat/v2-hooks";
 import { ROUTER_TURN_STATE_ATTACH, TURN_STATE_ROOT, type TurnStateRegistry } from "./compat/turn-state";
-import { ROUTER_FINISH_ATTACH, type AdoptedRecords, type FinishApi, type FinishAttach, type FinishInput, type FinishResult, type HeldSink, type InflightJournal, type LeaseGuard, type PersistedRecord, type RestoredDispatch } from "./compat/background";
+import { ADOPTION_REFUSED, ROUTER_FINISH_ATTACH, type AdoptedRecords, type AdoptionRefused, type FinishApi, type FinishAttach, type FinishInput, type FinishResult, type HeldSink, type InflightJournal, type LeaseGuard, type PersistedRecord, type RestoredDispatch } from "./compat/background";
 import type { DispatchDelta } from "./verify/dispatch";
 import { configuredV2OnlyKeys } from "./router/config";
 
@@ -140,7 +140,7 @@ import { tool } from "@opencode-ai/plugin";
 import { scrubText } from "./guard/scrub";
 import { accept, unverifiableGateResult } from "./verify/gate";
 import { applyDispatchCaveats, createVerificationWiring, resolvePendingTtlMs, dispatchDirectiveText, extractAssistantText, parseRouterVerifyArgs, type DispatchStart, type HandleReport } from "./verify/wiring";
-import { CLAIM_STALE_MS, claimPendingSession, createInstanceClaimToken, createPendingFileJournal, foldDormantRecords, refreshPendingClaims, releasePendingClaim, resolvePendingJournalDir, processedKeyOf, appendRouterFooter, buildLateNoticeBlock, buildPendingListBlock, unattributedRisk, type DormantSession, type LateNotice, type PendingEntry, type SettledVerification } from "./verify/pending";
+import { CLAIM_REFRESH_MS, claimPendingSession, createInstanceClaimToken, createPendingFileJournal, foldDormantRecords, refreshPendingClaims, releasePendingClaim, resolvePendingJournalDir, processedKeyOf, appendRouterFooter, buildLateNoticeBlock, buildPendingListBlock, unattributedRisk, type DormantSession, type LateNotice, type PendingEntry, type SettledVerification } from "./verify/pending";
 import { createDeadline } from "./verify/deterministic";
 import {
   DEFAULT_DELEGATE_PROMPT_TIMEOUT_MS,
@@ -839,17 +839,31 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       });
   /** Section 11.3: the exclusive per-session claim files of the journal's sessions (v2 only). */
   const pendingClaimsDir = pendingDir === undefined ? undefined : join(pendingDir, "pending.claims");
+  /** QA-2.1-33: the v2 adapter's live attempts and holds (`FinishApi.setAdapterSnapshot`); none before it attaches. */
+  let adapterSnapshot: (() => readonly PersistedRecord[]) | undefined;
+  /**
+   * QA-2.1-16/-33: every record a later restore needs from this instance: the live pending entries, the sessions not
+   * adopted yet, and the adapter's live attempts and holds. Registered on the journal (next to `dormantSessions`, once that
+   * state exists), so a `recreate` by any instance of this process on the same path writes this instance's records too.
+   */
+  function journalSnapshot(): PersistedRecord[] {
+    const dormant: PersistedRecord[] = [];
+    for (const session of dormantSessions.values()) dormant.push(...session.holds, ...session.inflight);
+    return [...pending.persistedRecords(), ...dormant, ...(adapterSnapshot?.() ?? [])];
+  }
   /** QA-2.1-13: the sessions whose claim this process took at adoption; re-stamped while held, released on delete and dispose. */
   const claimedSessions = new Set<string>();
-  /** Hourly: 24 refreshes per CLAIM_STALE_MS. */
-  const CLAIM_REFRESH_MS = CLAIM_STALE_MS / 24;
   let claimRefreshTimer: ReturnType<typeof setInterval> | undefined;
   function stopClaimRefresh(): void {
     if (claimRefreshTimer === undefined) return;
     clearInterval(claimRefreshTimer);
     claimRefreshTimer = undefined;
   }
-  /** QA-2.1-13: a live owner re-stamps its claims well within CLAIM_STALE_MS, so they never read as a reused pid's. */
+  /**
+   * QA-2.1-13/-34: a live owner re-stamps its claims every CLAIM_REFRESH_MS (unref'd timer, stopped when it holds no claim
+   * and on dispose), well within CLAIM_STALE_MS, so they never read as a reused pid's; a crashed owner's claims go stale
+   * within minutes, even when its pid is reused.
+   */
   function trackPendingClaim(sessionID: string): void {
     claimedSessions.add(sessionID);
     if (claimRefreshTimer !== undefined || pendingClaimsDir === undefined) return;
@@ -3653,6 +3667,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // ONE journal (memo §11): the same `pending.jsonl` the pending store and the held results append to. Absent on v1 (accepts and forgets).
   const processedKeys = new Set<string>();
   let dormantSessions = new Map<string, DormantSession>();
+  // QA-2.1-33: registered only now that `pending` and `dormantSessions` exist: another instance's recreate may call it at any time.
+  pendingFile?.setSnapshotProvider(journalSnapshot);
   const sharedJournal: InflightJournal = {
     async append(record, opts) {
       if (record.kind === "processed") {
@@ -3817,12 +3833,13 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       dormantSessions = folded.sessions;
       for (const key of folded.processed) processedKeys.add(key);
     },
-    adopt(sessionID): AdoptedRecords | undefined {
+    adopt(sessionID): AdoptedRecords | AdoptionRefused | undefined {
       const session = dormantSessions.get(sessionID);
       if (session === undefined || pendingClaimsDir === undefined) return undefined;
       // QA-2.1-19: a session another live instance (pid, token) claimed is not adopted, and its dormant records stay: they
       // are that instance's running dispatches, or they wait for a later adoption once its claim is gone.
-      if (!claimSessionOnce(sessionID)) return undefined;
+      // QA-2.1-34: told apart from "nothing to adopt", so the adapter tries again at a later sighting.
+      if (!claimSessionOnce(sessionID)) return ADOPTION_REFUSED;
       dormantSessions.delete(sessionID);
       return { holds: session.holds, inflight: session.inflight };
     },
@@ -3860,9 +3877,12 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       if (pendingFile === undefined) return;
       // QA-2.1-16: every record a later restore needs: the live pending entries, the sessions not adopted yet, and the
       // adapter's live attempts and holds. `recreate` resets the vanished state once the file is back.
-      const dormant: PersistedRecord[] = [];
-      for (const session of dormantSessions.values()) dormant.push(...session.holds, ...session.inflight);
-      await pendingFile.recreate([...pending.persistedRecords(), ...dormant, ...records]);
+      // QA-2.1-33: `recreate` adds the snapshot of every other instance of this process on the same journal
+      // (`journalSnapshot`, registered below), so their records survive this instance's rewrite.
+      await pendingFile.recreate([...journalSnapshot(), ...records]);
+    },
+    setAdapterSnapshot(provider) {
+      adapterSnapshot = provider;
     },
     idle: () => heldGatesIdle(),
     settleHeldDirect(parentSessionID, handle, v) {

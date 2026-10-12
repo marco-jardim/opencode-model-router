@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  CLAIM_REFRESH_MS,
   CLAIM_STALE_MS,
   claimPendingSession,
   compactPendingRecords,
@@ -13,7 +14,9 @@ import {
   HELD_RESERVATION_TTL_MS,
   HELD_TTL_REASON,
   MAX_DORMANT_POSTED_HOLDS,
+  mergePendingSnapshots,
   PENDING_JOURNAL_VANISHED,
+  pendingRecordIdentity,
   PENDING_COMPACTION_FAILED,
   PENDING_WRITERS_DIRNAME,
   WRITER_MARK_STALE_MS,
@@ -437,6 +440,124 @@ describe("pending.jsonl journal (memo 11.1, 11.2)", () => {
     await expect(journal.load()).rejects.toThrow(PENDING_JOURNAL_VANISHED);
     await journal.recreate([rec("hold", { handle: "vrf_1" })]);
     expect((await journal.load()).map((r) => r.handle)).toEqual(["vrf_1"]);
+  });
+
+  it("QA-2.1-33: two journals of one path with distinct in-memory records: one instance's recreate writes both sets, each record once", async () => {
+    const stateDir = join(dir, "state");
+    const file = join(stateDir, "pending.jsonl");
+    const first = createPendingFileJournal(file, { compactAtStart: false });
+    // Another plugin instance of the same process, with another spelling of the same path.
+    const second = createPendingFileJournal(join(stateDir, ".", "pending.jsonl"), { compactAtStart: false });
+    const shared = rec("hold", { handle: "vrf_both" }); // both instances loaded it from the journal
+    const firstState = [rec("hold", { handle: "vrf_a" }), rec("inflight", { callID: "c-a" }), shared];
+    const secondState = [rec("hold", { handle: "vrf_b" }), rec("inflight", { callID: "c-b" }), shared];
+    let secondCalls = 0;
+    let firstCalls = 0;
+    first.setSnapshotProvider(() => {
+      firstCalls += 1;
+      return firstState;
+    });
+    // A provider may be async; the second instance does nothing when the first one recreates.
+    second.setSnapshotProvider(async () => {
+      secondCalls += 1;
+      return secondState;
+    });
+    await first.append(rec("hold", { handle: "vrf_a" }), { fsync: true });
+    await second.append(rec("hold", { handle: "vrf_b" }), { fsync: true });
+    rmSync(stateDir, { recursive: true, force: true });
+    await expect(first.load()).rejects.toThrow(PENDING_JOURNAL_VANISHED);
+    // The first instance recreates from its memory (as the plugin does: its own snapshot is also its `records`).
+    await first.recreate(firstState);
+    const lines = readFileSync(file, "utf8").split("\n").filter((l) => l !== "");
+    expect(lines).toEqual([...firstState, ...secondState.filter((r) => r !== shared)].map((r) => JSON.stringify(r)));
+    expect(new Set(lines).size).toBe(lines.length);
+    expect(secondCalls).toBe(1);
+    // The caller's own provider is not asked again: its state is `records`, counted once.
+    expect(firstCalls).toBe(0);
+    // Both instances read the recreated file, and both append again.
+    expect((await second.load()).map((r) => r.handle ?? r.callID).sort()).toEqual(["c-a", "c-b", "vrf_a", "vrf_b", "vrf_both"]);
+    await second.append(rec("posted", { handle: "vrf_b" }));
+    expect((await first.load()).map((r) => r.kind)).toEqual(["hold", "inflight", "hold", "hold", "inflight", "posted"]);
+    // The other instance recreates next time: now the first one's provider is asked, once.
+    rmSync(file);
+    await second.recreate(secondState);
+    expect([firstCalls, secondCalls]).toEqual([1, 1]);
+    expect((await second.load()).map((r) => r.handle ?? r.callID)).toEqual(["vrf_b", "c-b", "vrf_both", "vrf_a", "c-a"]);
+    // An unregistered provider is not called.
+    first.setSnapshotProvider(undefined);
+    rmSync(file);
+    await second.recreate([rec("hold", { handle: "vrf_only" })]);
+    expect((await second.load()).map((r) => r.handle)).toEqual(["vrf_only"]);
+    expect([firstCalls, secondCalls]).toEqual([1, 1]);
+    // Nor is a disposed journal's provider.
+    first.setSnapshotProvider(() => {
+      firstCalls += 1;
+      return firstState;
+    });
+    await first.dispose();
+    rmSync(file);
+    await second.recreate([]);
+    expect(await second.load()).toEqual([]);
+    expect([firstCalls, secondCalls]).toEqual([1, 1]);
+    await second.dispose();
+  });
+
+  it("QA-2.1-33: the same hold from the caller and two providers, with other field values and field order, is written once (newest, most complete)", async () => {
+    const stateDir = join(dir, "state");
+    const file = join(stateDir, "pending.jsonl");
+    const first = createPendingFileJournal(file, { compactAtStart: false });
+    const second = createPendingFileJournal(file, { compactAtStart: false });
+    const third = createPendingFileJournal(file, { compactAtStart: false });
+    const handle = "vrf_same";
+    // The caller lists the hold twice (plugin snapshot + adapter records), field order differing.
+    const callerHold = { v: 1 as const, kind: "hold", handle, parent: "p1", child: "k1", at: NOW };
+    const callerHoldReordered = { child: "k1", parent: "p1", at: NOW, handle, kind: "hold", v: 1 as const };
+    // Another instance holds it with a newer time; a third one with the old time but more fields.
+    const newer = { kind: "hold", v: 1 as const, at: NOW + 5, handle, child: "k1", parent: "p1" };
+    const richer = { v: 1 as const, kind: "hold", handle, parent: "p1", child: "k1", at: NOW, dispatch: { prompt: "x" } };
+    second.setSnapshotProvider(() => [newer, rec("hold-text", { handle, text: "t", at: NOW })]);
+    third.setSnapshotProvider(async () => [richer, rec("inflight", { key: "k1\u0000c1", callID: "c1", at: NOW })]);
+    await first.append(rec("inflight", { callID: "c0" }));
+    rmSync(stateDir, { recursive: true, force: true });
+    await first.recreate([callerHold, rec("inflight", { key: "k1\u0000c1", callID: "c1", at: NOW - 1 }), callerHoldReordered]);
+    const written = readFileSync(file, "utf8").split("\n").filter((l) => l !== "").map((l) => JSON.parse(l) as PendingRecord);
+    // One record per identity, in the caller's order: the hold (newest wins), the attempt (newest wins), then the hold text.
+    expect(written.map((r) => `${r.kind}:${String(r.handle ?? r.key)}`)).toEqual([`hold:${handle}`, "inflight:k1\u0000c1", `hold-text:${handle}`]);
+    expect(written[0]).toEqual(newer);
+    expect(written[1]?.at).toBe(NOW);
+    expect(mergePendingSnapshots([[callerHold], [richer]])).toEqual([richer]);
+    expect(mergePendingSnapshots([[richer], [callerHoldReordered]])).toEqual([richer]);
+    // Records without key or handle are merged by their serialized form only.
+    expect(mergePendingSnapshots([[rec("processed", { callID: "c1", child: "k1" })], [rec("processed", { callID: "c1", child: "k1" }), rec("processed", { callID: "c2", child: "k2" })]]))
+      .toEqual([rec("processed", { callID: "c1", child: "k1" }), rec("processed", { callID: "c2", child: "k2" })]);
+    expect(pendingRecordIdentity(rec("inflight", { key: "k\u0000c", handle: "vrf_x" }))).toBe("inflight\u0000k\u0000c");
+    expect(pendingRecordIdentity(rec("hold", { handle: "vrf_x" }))).toBe("hold\u0000vrf_x");
+    expect(pendingRecordIdentity(rec("processed", { callID: "c" }))).toBeUndefined();
+    await third.dispose();
+    await second.dispose();
+    await first.dispose();
+  });
+
+  it("QA-2.1-33: a throwing snapshot provider fails the recreate, which changes nothing; a retry once it recovers succeeds", async () => {
+    const stateDir = join(dir, "state");
+    const file = join(stateDir, "pending.jsonl");
+    const first = createPendingFileJournal(file, { compactAtStart: false });
+    const second = createPendingFileJournal(file, { compactAtStart: false });
+    let broken = true;
+    second.setSnapshotProvider(() => {
+      if (broken) throw new Error("snapshot failed");
+      return [rec("hold", { handle: "vrf_b" })];
+    });
+    await first.append(rec("hold", { handle: "vrf_a" }));
+    rmSync(stateDir, { recursive: true, force: true });
+    await expect(first.recreate([rec("hold", { handle: "vrf_a" })])).rejects.toThrow("snapshot failed");
+    expect(existsSync(file)).toBe(false);
+    await expect(first.load()).rejects.toThrow(PENDING_JOURNAL_VANISHED);
+    broken = false;
+    await first.recreate([rec("hold", { handle: "vrf_a" })]);
+    expect((await first.load()).map((r) => r.handle)).toEqual(["vrf_a", "vrf_b"]);
+    await second.dispose();
+    await first.dispose();
   });
 
   it("QA-2.1-22: a writer mark carries pid, token and time; it is removed when the last journal of the path is disposed", async () => {
@@ -1071,7 +1192,9 @@ describe("claim files (memo 11.3)", () => {
     claimPendingSession(claims, "ses_1", { pid: 100, now: 5, isAlive: alive([]), token: "tok-a" });
     expect(claimPendingSession(claims, "ses_1", { pid: 200, now: 5 + 1000, isAlive: alive([100]), token: "tok-b", staleMs: 1000 })).toBe(false);
     expect(claimPendingSession(claims, "ses_1", { pid: 200, now: 5 + 1001, isAlive: alive([100]), token: "tok-b", staleMs: 1000 })).toBe(true);
-    expect(CLAIM_STALE_MS).toBe(24 * 3600_000);
+    // QA-2.1-34: minutes, not hours (live owners re-stamp every CLAIM_REFRESH_MS), so a reused pid never blocks recovery for long.
+    expect(CLAIM_STALE_MS).toBe(5 * 60_000);
+    expect(CLAIM_REFRESH_MS).toBe(60_000);
   });
 
   it("this pid with another token is a dead process whose pid was reused: taken over (QA-2.1-13)", () => {

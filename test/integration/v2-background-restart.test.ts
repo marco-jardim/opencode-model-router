@@ -9,8 +9,14 @@
  *   set died with the old process) ends UNVERIFIABLE "verification data lost in restart"; a verdict the gate reached before the
  *   restart (its `verified` state record) is posted as it was, never recomputed.
  * - QA-2.1-29: a restored hold whose `inflight` recovery is skipped is settled, not left held until the TTL.
+ * - QA-2.1-34: an adoption refused by another live pid's claim is tried again at a later sighting (rate-limited), and a claim
+ *   nobody re-stamps goes stale (a crashed owner whose pid was reused never blocks recovery).
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { ADOPTION_RETRY_MS } from "../../src/compat/background";
+import { CLAIM_STALE_MS } from "../../src/verify/pending";
 import { bootBgHost, restoreEnv, type BgHost, type SyntheticCall } from "../helpers/v2-bg-host";
 
 let host: BgHost | undefined;
@@ -96,6 +102,51 @@ describe("restart recovery of held results (QA-2.1-17)", () => {
     expect(posts).toHaveLength(1);
     expect(posts[0]?.text).toContain("lost in restart");
     expect(posts[0]?.text).not.toContain("partial output of a failed child");
+  });
+});
+
+describe("a refused adoption is tried again at a later sighting, rate-limited (QA-2.1-34)", () => {
+  it("another live pid's fresh claim refuses it; once the claim is stale, a sighting ADOPTION_RETRY_MS later adopts and posts", async () => {
+    const handle = `vrf_${"e".repeat(24)}`;
+    const t0 = Date.now();
+    vi.useFakeTimers({ toFake: ["Date"], now: t0 });
+    try {
+      const h = await boot([
+        { v: 1, kind: "hold", handle, parent: ORCH, child: CHILD, callID: "call-q34", label: 'fast "write e"', dispatch: { prompt: "write src/e.ts" }, at: t0 },
+        { v: 1, kind: "hold-text", handle, text: "I wrote src/e.ts", status: "succeeded", at: t0 },
+      ], { "child-event-2": { parentID: ORCH }, "child-event-3": { parentID: ORCH } });
+      // ORCH is claimed by another live process (its pid: the parent of this one), freshly re-stamped.
+      const claim = join(dirname(h.journalPath), "pending.claims", ORCH);
+      const writeClaim = (at: number): void => {
+        mkdirSync(dirname(claim), { recursive: true });
+        writeFileSync(claim, `${JSON.stringify({ pid: process.ppid, token: "other-process", at })}\n`);
+      };
+      writeClaim(t0);
+      const sight = (child: string): void => {
+        h.emit({ type: "session.created", id: `ev-created-${child}`, created: 1, data: { sessionID: child, parentID: ORCH } });
+      };
+      sight(EVENT_CHILD);
+      await h.settled();
+      expect(verdictPosts(h)).toEqual([]);
+      // The owner crashed and its pid was reused: nobody re-stamps the claim. A sighting within ADOPTION_RETRY_MS of the
+      // refusal does not try again (rate limit).
+      writeClaim(t0 - CLAIM_STALE_MS - 1_000);
+      vi.setSystemTime(t0 + ADOPTION_RETRY_MS - 1);
+      sight("child-event-2");
+      await h.settled();
+      expect(verdictPosts(h)).toEqual([]);
+      // The next sighting after ADOPTION_RETRY_MS adopts the very same records: the restored hold gets its verdict, once.
+      vi.setSystemTime(t0 + ADOPTION_RETRY_MS + 1);
+      sight("child-event-3");
+      await h.settled();
+      const posts = verdictPosts(h);
+      expect(posts).toHaveLength(1);
+      expect(posts[0]?.text).toContain(handle);
+      expect(posts[0]?.text).toContain("I wrote src/e.ts");
+      expect(JSON.parse(readFileSync(claim, "utf8"))).toMatchObject({ pid: process.pid });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

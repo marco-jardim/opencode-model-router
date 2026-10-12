@@ -232,8 +232,8 @@ export interface FinishApi {
   reserveHeld(parentSessionID: string, callID: string): string | undefined;
   /**
    * `pending.releaseHandle` (QA-2.1-3, QA-2.1-4): gives a reserved handle back when its attempt ends without a held register
-   * (the hold write failed, the child failed or was interrupted, the attempt was closed unknown). Idempotent. Optional for
-   * compatibility: absent, the reservation expires after `HELD_RESERVATION_TTL_MS` (verify/pending.ts).
+   * (the hold write failed, the child failed or was interrupted, the attempt was closed unknown). Idempotent. A reservation
+   * that is never given back expires after `HELD_RESERVATION_TTL_MS` (verify/pending.ts).
    */
   releaseHeld(handle: string): void;
   /**
@@ -266,10 +266,17 @@ export interface FinishApi {
   /**
    * QA-2.1-16: rewrites a vanished `pending.jsonl` from in-memory state: the plugin's live pending entries (and their
    * verdicts), its dormant records, and `records` (the caller's live `inflight` attempts, holds with their `hold-text` and
-   * `posting` lines, and its own dormant records). Afterwards appends and reloads succeed again. Rejects when the rewrite
-   * fails (the caller stays fail closed and may retry).
+   * `posting` lines, and its own dormant records). QA-2.1-33: plus the same snapshot of every other plugin instance of this
+   * process on the same journal, each record once, so one instance's rewrite never drops another's records. Afterwards
+   * appends and reloads succeed again. Rejects when the rewrite fails (the caller stays fail closed and may retry).
    */
   recreateJournal(records: readonly PersistedRecord[]): Promise<void>;
+  /**
+   * QA-2.1-33: registers the adapter's snapshot of its live records (the `records` it passes to `recreateJournal`), so a
+   * `recreate` of the shared journal by ANOTHER plugin instance of this process writes them too. Absent: only this
+   * adapter's own `recreateJournal` calls carry them.
+   */
+  setAdapterSnapshot?(provider: () => readonly PersistedRecord[]): void;
   /**
    * QA-2.1-21: resolves once the held gates the plugin started (`finish` with a held handle runs its gate without awaiting
    * it) and their verdict posts have ended, including gates started meanwhile. The adapter's settled seam and `dispose`
@@ -278,9 +285,27 @@ export interface FinishApi {
   idle(): Promise<void>;
   /**
    * Memo §11.3: this process saw `sessionID`. Takes the exclusive claim file `pending.claims\<id>` and hands over the dormant
-   * records of that session; `undefined` when there are none or another live process holds the claim. Synchronous, once per session.
+   * records of that session; `undefined` when there are none. QA-2.1-34: `ADOPTION_REFUSED` when another live instance holds
+   * the claim: its records stay dormant and the caller tries again at a later sighting (rate-limited,
+   * `ADOPTION_RETRY_MS`). Synchronous.
    */
-  adopt(sessionID: string): AdoptedRecords | undefined;
+  adopt(sessionID: string): AdoptedRecords | AdoptionRefused | undefined;
+}
+
+/** QA-2.1-34: `FinishApi.adopt` found dormant records but another live instance holds the session's claim. */
+export interface AdoptionRefused {
+  readonly refused: true;
+}
+
+/** QA-2.1-34: the one refusal value of `FinishApi.adopt`. */
+export const ADOPTION_REFUSED: AdoptionRefused = Object.freeze({ refused: true });
+
+/** QA-2.1-34: a refused adoption is tried again at a sighting at least this long after the last attempt (per session). */
+export const ADOPTION_RETRY_MS = 30_000;
+
+/** QA-2.1-34: whether an `adopt` result is a refusal (not adopted records, not "nothing to adopt"). Pure. */
+export function isAdoptionRefused(result: AdoptedRecords | AdoptionRefused | undefined): result is AdoptionRefused {
+  return result !== undefined && "refused" in result && result.refused;
 }
 
 /** The reloaded records of one adopted parent session (memo §11.3). */
