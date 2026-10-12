@@ -30,16 +30,33 @@
  * edge-only seeds are never pinned (SD-P3c-2, F3) and not frozen for S11 yet (P3c.4). Consumer discovery (§6, P3c.5,
  * SD-P3c-4, SD-P3c-5) reads the same edges in reverse: a working-set root whose declared edge resolves, as text, inside W's top
  * is a consumer `{root, name?, via}` (a `node_modules` consumer keeps `{root, name?, entry}`, F6).
+ *
+ * P3c QA round 1: a spec past EDGE_SPEC_MAX characters, or a target past EDGE_WALK_MAX segments below its parent, is unadmitted
+ * with no filesystem call (M1); an unadmitted edge's name is `displaySafe` and capped, and `displayEdgeText` is how a router
+ * line shows any other edge text (M5); `planPerimeter` returns how the forward bounds cut W's edges, for its caller to log (m4).
  */
 import { type Dirent, lstatSync, readFileSync, readdirSync, readlinkSync, realpathSync } from "node:fs";
 import { lstat, readFile, readdir, readlink, realpath } from "node:fs/promises";
 import * as path from "node:path";
 import { permissionMatches } from "../router/read-only";
 import type { RepoLocation } from "../routing/roles/admission";
+import { displaySafe } from "../routing/roles/read-set";
 import { routedRoleOf } from "../routing/wire/dispatch";
 import { workingSetOf } from "../routing/wire/working-set";
 import type { DispatchPerimeter, PerimeterSeed } from "./dispatch";
-import { type DeclaredEdge, type EdgeIO, type EdgeLimits, type EdgeVia, EDGE_LIMITS, declaredEdges, defaultEdgeIO, isUncSpec, workspacePatterns } from "./edges";
+import {
+  type DeclaredEdge,
+  type EdgeIO,
+  type EdgeLimits,
+  type EdgeVia,
+  EDGE_LIMITS,
+  EDGE_WORKSPACE_PATTERNS_MAX,
+  declaredEdges,
+  defaultEdgeIO,
+  isUncSpec,
+  workspacePatterns,
+  workspaceSegmentMatches,
+} from "./edges";
 import { depthBelow, gitTopOf, perimeterKey } from "./git-top";
 import { isStoreLikeLink } from "./reference";
 
@@ -48,6 +65,55 @@ export const PERIMETER_MAX = 16;
 
 /** Cross-repo P3c (SD-P3c-4): at most this many unadmitted declared-edge targets are named; the others are counted only. */
 export const EDGE_UNADMITTED_NAMES_MAX = 8;
+
+/**
+ * Cross-repo P3c QA-1 M1: a declared edge's spec longer than this many characters is never walked: its target is unadmitted,
+ * named from its text, with no filesystem call.
+ */
+export const EDGE_SPEC_MAX = 4096;
+
+/**
+ * Cross-repo P3c QA-1 M1: `resolveEdgeTarget` walks at most this many segments up from a target looking for its nearest
+ * existing ancestor; a target deeper than that below its parent (or its worktree) is unadmitted, with no filesystem call.
+ */
+export const EDGE_WALK_MAX = 32;
+
+/** Cross-repo P3c QA-1 M5: an unadmitted edge seed's name (the last segment of its text) is at most this many characters. */
+export const EDGE_NAME_MAX = 64;
+
+/** Cross-repo P3c QA-1 M5: `displayEdgeText` shows at most this many characters of an edge target's text. */
+export const EDGE_TEXT_DISPLAY_MAX = 256;
+
+/**
+ * `displaySafe(text)` in at most `max` characters, the ellipsis included: past it, the longest prefix of `text` (whole code
+ * points, at most `max` of them, so a 1 MiB text is never quoted whole) whose `displaySafe` form fits with a trailing "…".
+ */
+function cappedDisplay(text: string, max: number): string {
+  if (text.length <= max) {
+    const safe = displaySafe(text);
+    if (safe.length <= max) return safe;
+  }
+  const points = Array.from(text.slice(0, max));
+  // A surrogate pair the slice cut leaves a lone high surrogate last: drop it.
+  const last = points[points.length - 1];
+  if (last !== undefined && /^[\uD800-\uDBFF]$/.test(last)) points.pop();
+  while (points.length > 0) {
+    const safe = displaySafe(points.join(""));
+    if (safe.length + 1 <= max) return `${safe}…`;
+    // Quoting expands the text (up to 16 characters per code point): shrink in proportion, by one code point at least.
+    points.length = Math.max(0, Math.min(points.length - 1, Math.floor((points.length * (max - 1)) / safe.length)));
+  }
+  return "…";
+}
+
+/**
+ * Cross-repo P3c QA-1 M5: an edge target's text (a declared spec, a path resolved from one, an unadmitted top level) as a router
+ * line may show it: `displaySafe` (no control, format or bidi character, no `[` `]`), at most EDGE_TEXT_DISPLAY_MAX characters.
+ * The text itself stays a path (a seed's `at`, a comparison key); only its display goes through here.
+ */
+export function displayEdgeText(text: string): string {
+  return cappedDisplay(text, EDGE_TEXT_DISPLAY_MAX);
+}
 
 /** What link admission needs: `routing.repoParents`, `routing.repoDepth` and `routing.repoExclude`. */
 export interface PerimeterAdmission {
@@ -178,6 +244,14 @@ function textName(at: string): string {
   return segments[segments.length - 1] ?? at;
 }
 
+/**
+ * QA-1 M5: an unadmitted edge seed's name, shown in the scope note and the S11 caveat: the last segment of its text, `displaySafe`
+ * and at most EDGE_NAME_MAX characters (repository text never reaches a router line raw).
+ */
+function edgeName(at: string): string {
+  return cappedDisplay(textName(at), EDGE_NAME_MAX);
+}
+
 function hasNodeModulesSegment(at: string): boolean {
   return at.split(/[\\/]/).some((segment) => segment.toLowerCase() === "node_modules");
 }
@@ -200,16 +274,25 @@ export function resolveEdgeTarget(
   const python = edge.kind === "python";
   // A UNC share or a device path: never resolved (QA-1 #3), so no network access.
   if (edge.unc === true || isUncSpec(edge.spec)) {
-    return python ? { status: "skipped", reason: "pythonOutside" } : { status: "unadmitted", at: edge.spec, name: textName(edge.spec) };
+    return python ? { status: "skipped", reason: "pythonOutside" } : { status: "unadmitted", at: edge.spec, name: edgeName(edge.spec) };
   }
   const target = path.resolve(path.dirname(path.join(ctx.root, edge.from)), edge.spec);
-  const unadmittedText: EdgeResolution = { status: "unadmitted", at: target, name: textName(target) };
+  const unadmittedText: EdgeResolution = { status: "unadmitted", at: target, name: edgeName(target) };
+  // QA-1 M1: an overlong spec is never walked (each step of the walk below is a filesystem call plus passes over the text).
+  if (edge.spec.length > EDGE_SPEC_MAX) return unadmittedText;
   if (isUncSpec(target)) return python ? { status: "skipped", reason: "pythonOutside" } : unadmittedText;
   if (hasNodeModulesSegment(target)) return { status: "skipped", reason: "nodeModules" };
   if (insideOrEqual(target, wTop) || insideOrEqual(wTop, target)) return { status: "skipped", reason: "insideW" };
   const parent = ctx.parentOf(target);
   const worktree = ctx.worktreeOf(target);
   if (parent === undefined && worktree === undefined) return python ? { status: "skipped", reason: "pythonOutside" } : unadmittedText;
+  // QA-1 M1: the walk below takes one step per segment between the target and its parent (or its worktree, included); past
+  // EDGE_WALK_MAX steps the target is unadmitted, before any filesystem call.
+  const steps = Math.max(
+    parent !== undefined ? depthBelow(target, parent) : 0,
+    worktree !== undefined ? depthBelow(target, worktree.worktree) + 1 : 0,
+  );
+  if (steps > EDGE_WALK_MAX) return unadmittedText;
 
   // The nearest existing ancestor, never at or above the parent (nor above the worktree).
   const within = (dir: string): boolean =>
@@ -232,8 +315,9 @@ export function resolveEdgeTarget(
   const top = io.gitTop(real, realWorktree !== undefined ? path.dirname(realWorktree.worktree) : realParent);
   if (top === undefined) return unadmittedText; // Not in a git repository: nothing to observe.
   if (insideOrEqual(top, wTop) || insideOrEqual(wTop, top)) return { status: "skipped", reason: "insideW" };
+  // QA-1 m7: admission first, as for a link: an unadmitted top level never has its `.git` read (`sameRepository`).
+  if (!ctx.admitTop(top)) return { status: "unadmitted", at: top, name: edgeName(top) };
   if (ctx.sameRepository(top)) return { status: "skipped", reason: "sameRepository" };
-  if (!ctx.admitTop(top)) return { status: "unadmitted", at: top, name: path.basename(top) };
   return { status: "admitted", top };
 }
 
@@ -514,8 +598,6 @@ export async function workspaceDirs(w: string, pattern: string, limit: number): 
   const head = segments.slice(0, -1);
   if (head.some((segment) => segment.includes("*"))) return [];
   if (!last.includes("*")) return [path.join(w, ...segments)];
-  const escaped = last.split("*").map((piece) => piece.replace(/[.+?^${}()|[\]\\]/g, "\\$&"));
-  const match = new RegExp(`^${escaped.join("[^/\\\\]*")}$`, process.platform === "win32" ? "i" : "");
   const base = path.join(w, ...head);
   let children: string[];
   try {
@@ -523,8 +605,9 @@ export async function workspaceDirs(w: string, pattern: string, limit: number): 
   } catch {
     return [];
   }
+  // QA-1 C1: the linear matcher of edges.ts, never a regular expression built from the pattern.
   return children
-    .filter((child) => !child.startsWith(".") && child !== "node_modules" && match.test(child))
+    .filter((child) => !child.startsWith(".") && child !== "node_modules" && workspaceSegmentMatches(last, child))
     .slice(0, limit)
     .map((child) => path.join(base, child));
 }
@@ -544,7 +627,8 @@ async function packageNamesOf(w: string, stop: () => boolean): Promise<string[]>
   if (manifest === undefined) return [];
   take(manifest);
   let read = 0;
-  for (const pattern of workspacePatterns(manifest)) {
+  // QA-1 M2: at most EDGE_WORKSPACE_PATTERNS_MAX patterns (each wildcard one is a directory listing), as edges.ts reads them.
+  for (const pattern of workspacePatterns(manifest).slice(0, EDGE_WORKSPACE_PATTERNS_MAX)) {
     if (stop() || names.size >= CONSUMER_NAMES_MAX || read >= WORKSPACE_MANIFESTS_MAX) break;
     for (const dir of await workspaceDirs(w, pattern, WORKSPACE_MANIFESTS_MAX - read)) {
       if (stop() || names.size >= CONSUMER_NAMES_MAX || read >= WORKSPACE_MANIFESTS_MAX) break;
@@ -570,13 +654,22 @@ async function packageNamesOf(w: string, stop: () => boolean): Promise<string[]>
  * edges): an edge whose spec, resolved as text against its declaring file's directory, lies inside W's top (W as given or
  * canonical, its git top level) and not under a `node_modules` segment makes the root a consumer `{root, name?, via}` (F6: a
  * `node_modules` consumer keeps `{root, name?, entry}`). Edge text is never resolved on the filesystem (I11): an edge spelling
- * W only through a junction is not seen. A root inside W's top (W's own repository) reads no edges. A root with no consumer
+ * W only through a junction is not seen, unless the junction is a spelling of W's parent given in `opts.parents` (QA-1 m5: W's
+ * top is matched under every spelling of its parent). A root inside W's top (W's own repository) reads no edges. A root with no consumer
  * whose edge reading a bound cut is incomplete, as one whose scan stopped on its budget.
  */
 export async function discoverConsumers(
   w: string,
   roots: readonly ConsumerRoot[],
-  opts?: { maxEntries?: number; maxRead?: number; signal?: AbortSignal; edgeIO?: EdgeIO; edgeLimits?: EdgeLimits },
+  opts?: {
+    maxEntries?: number;
+    maxRead?: number;
+    signal?: AbortSignal;
+    edgeIO?: EdgeIO;
+    edgeLimits?: EdgeLimits;
+    /** QA-1 m5: the admission's parents in both spellings (`AdmissionData.parents`); edges are matched against W's top under each. */
+    parents?: readonly string[];
+  },
 ): Promise<ConsumerDiscovery> {
   const maxEntries = Math.max(0, Math.floor(opts?.maxEntries ?? CONSUMER_SCAN_MAX));
   const readMax = Math.max(0, Math.floor(opts?.maxRead ?? CONSUMER_READ_MAX));
@@ -607,7 +700,28 @@ export async function discoverConsumers(
     // P3c.5: W's top level (W may be a folder of its repository), as found and canonical; edges are matched against them by text.
     const wTop = gitTopOf(w) ?? w;
     const wTopReal = await realpath(wTop).catch(() => wTop);
-    const wSpellings = [...new Map([w, wReal, wTop, wTopReal].map((at) => [perimeterKey(at), at])).values()];
+    // QA-1 m5: W's top as every spelling of its parent spells it (`opts.parents`, the admission's parents as configured and
+    // canonical): an edge written through a junction-spelled parent still lies inside W's top, by text. Spellings of one parent
+    // are those with one canonical path.
+    const rewritten: string[] = [];
+    const parentSpellings = opts?.parents ?? [];
+    if (parentSpellings.length > 0) {
+      const groups = new Map<string, string[]>();
+      for (const spelling of parentSpellings) {
+        const key = perimeterKey(await realpath(spelling).catch(() => spelling));
+        groups.set(key, [...(groups.get(key) ?? []), spelling]);
+      }
+      for (const group of groups.values()) {
+        for (const from of group) {
+          for (const top of [wTop, wTopReal]) {
+            if (depthBelow(top, from) < 1) continue;
+            const below = path.relative(from, top);
+            for (const to of group) if (to !== from) rewritten.push(path.join(to, below));
+          }
+        }
+      }
+    }
+    const wSpellings = [...new Map([w, wReal, wTop, wTopReal, ...rewritten].map((at) => [perimeterKey(at), at])).values()];
     const inWTop = (dir: string): boolean => insideOrEqual(dir, wTop) || insideOrEqual(dir, wTopReal);
     /** By text only (I11): the edge's target, resolved against its declaring file's directory, lies inside W's top. */
     const edgeIntoW = (root: string, edge: DeclaredEdge): boolean => {
@@ -831,6 +945,17 @@ export function admissionFromData(data: AdmissionData): AdmissionContext {
 }
 
 /**
+ * Cross-repo P3c QA-1 m4: what `planPerimeter` returns: P, plus how W's declared edges were cut on the way forward, for the
+ * caller to log once per dispatch ("past a forward bound: logged", SD-P3c-4; perimeter.ts has no logger of its own).
+ */
+export interface PlannedPerimeter extends DispatchPerimeter {
+  /** A `declaredEdges` bound cut the reading of W's declared edges. */
+  readonly edgesIncomplete?: true;
+  /** Unadmitted edge targets past EDGE_UNADMITTED_NAMES_MAX: counted, not named. Absent when 0. */
+  readonly unadmittedMore?: number;
+}
+
+/**
  * The perimeter beyond W of the dispatch `dispatchID` (a native `task` dispatch, `task:<orchestrator>:<callID>`) verified at
  * `cwd`, or undefined when it has none (I9): not a routed role dispatch, or neither a grant location nor another working-set
  * root, or no extra root at all. W is the grant location's worktree, else `cwd`. `admission` is read for W's package links and
@@ -841,7 +966,7 @@ export function planPerimeter(
   cwd: string,
   admission: () => PerimeterAdmission,
   io: DependencyIO = defaultDependencyIO,
-): DispatchPerimeter | undefined {
+): PlannedPerimeter | undefined {
   if (!dispatchID.startsWith("task:")) return undefined;
   const rest = dispatchID.slice("task:".length);
   const separator = rest.indexOf(":");
@@ -969,5 +1094,12 @@ export function planPerimeter(
     add({ at: top, admit: admitTop, origin: "edge" });
   }
   if (seeds.length === 0) return undefined;
-  return { ...(location !== undefined ? { name: location.name } : {}), roots: seeds, admission: frozenAdmission };
+  return {
+    ...(location !== undefined ? { name: location.name } : {}),
+    roots: seeds,
+    admission: frozenAdmission,
+    // QA-1 m4: the forward bounds' outcome, for the caller to log once per dispatch (this module has no logger).
+    ...(dependencies.incomplete ? { edgesIncomplete: true as const } : {}),
+    ...(dependencies.unadmittedMore > 0 ? { unadmittedMore: dependencies.unadmittedMore } : {}),
+  };
 }

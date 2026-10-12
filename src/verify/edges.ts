@@ -29,6 +29,12 @@ export const EDGES_MAX = 64;
 export const EDGE_WORKSPACES_MAX = 64;
 /** SD-P3c-4: a tsconfig `extends` chain is followed at most this deep, and only inside the declaring root. */
 export const EDGE_EXTENDS_DEPTH_MAX = 4;
+/** QA-1 M2: at most this many entries of one tsconfig `extends` array are read (each may cost a stat); past it, `incomplete`. */
+export const EDGE_EXTENDS_ENTRIES_MAX = 8;
+/** QA-1 M2: at most this many `workspaces` patterns are read (each wildcard one costs a directory listing); past it, `incomplete`. */
+export const EDGE_WORKSPACE_PATTERNS_MAX = 64;
+/** QA-1 M2: the directory entries the `workspaces` wildcard listings read in total, per root; past it, `incomplete`. */
+export const EDGE_WORKSPACE_ENTRIES_MAX = 8000;
 /** A2: at most this many root `tsconfig.*.json` variants are read. */
 export const EDGE_TSCONFIG_VARIANTS_MAX = 8;
 /** A1: npm `overrides` string leaves are read at most this deep. */
@@ -241,32 +247,83 @@ export function workspacePatterns(manifest: Record<string, unknown>): string[] {
   return Array.isArray(packages) ? packages.filter((entry): entry is string => typeof entry === "string") : [];
 }
 
-/** The directories of one `workspaces` pattern, and whether the listing was cut at `entries` names. */
-function matchWorkspace(w: string, pattern: string, limit: number, io: EdgeIO, entries: number): { dirs: string[]; cut: boolean } {
-  if (pattern.startsWith("!") || path.isAbsolute(pattern) || /^[\\/]/.test(pattern)) return { dirs: [], cut: false };
+/**
+ * One code unit as a case-insensitive, non-unicode regular expression compares it (ECMA-262 Canonicalize): its upper case
+ * when that is one code unit, and not an ASCII one for a non-ASCII unit; else itself.
+ */
+function foldUnit(unit: string): string {
+  const upper = unit.toUpperCase();
+  return upper.length === 1 && !(unit.charCodeAt(0) >= 128 && upper.charCodeAt(0) < 128) ? upper : unit;
+}
+
+/**
+ * Cross-repo P3c QA-1 C1: whether the directory entry `name` matches the one-segment `workspaces` pattern `pattern`, whose only
+ * wildcard is `*` (`**` is one), a run of any characters but a separator; case-insensitive on win32 (`ignoreCase`), as the
+ * regular expression it replaces. No regular expression is built from repository text: two pointers, the last `*` the only
+ * backtracking point, so the time is at most quadratic in `name` (a directory entry) and linear in `pattern`. A pattern holding
+ * a separator matches nothing (a segment never holds one).
+ */
+export function workspaceSegmentMatches(pattern: string, name: string, ignoreCase: boolean = process.platform === "win32"): boolean {
+  if (/[\\/]/.test(pattern) || /[\\/]/.test(name)) return false;
+  let literals = 0;
+  for (let i = 0; i < pattern.length; i++) if (pattern[i] !== "*") literals += 1;
+  if (literals > name.length) return false;
+  const same = ignoreCase ? (a: string, b: string): boolean => a === b || foldUnit(a) === foldUnit(b) : (a: string, b: string): boolean => a === b;
+  let p = 0;
+  let n = 0;
+  let star = -1;
+  let mark = 0;
+  while (n < name.length) {
+    if (p < pattern.length && pattern[p] === "*") {
+      star = p;
+      p += 1;
+      mark = n;
+    } else if (p < pattern.length && same(pattern[p]!, name[n]!)) {
+      p += 1;
+      n += 1;
+    } else if (star >= 0) {
+      // The last `*` takes one more character (never a separator: `name` holds none), and the rest is matched again.
+      p = star + 1;
+      mark += 1;
+      n = mark;
+    } else {
+      return false;
+    }
+  }
+  while (p < pattern.length && pattern[p] === "*") p += 1;
+  return p === pattern.length;
+}
+
+/** The directories of one `workspaces` pattern, whether the listing was cut at `entries` names, and how many names it read. */
+function matchWorkspace(
+  w: string,
+  pattern: string,
+  limit: number,
+  io: EdgeIO,
+  entries: number,
+): { dirs: string[]; cut: boolean; listed: number } {
+  if (pattern.startsWith("!") || path.isAbsolute(pattern) || /^[\\/]/.test(pattern)) return { dirs: [], cut: false, listed: 0 };
   const segments = pattern.split(/[\\/]/).filter((segment) => segment !== "" && segment !== ".");
-  if (segments.length === 0 || segments.some((segment) => segment === "..")) return { dirs: [], cut: false };
+  if (segments.length === 0 || segments.some((segment) => segment === "..")) return { dirs: [], cut: false, listed: 0 };
   const last = segments[segments.length - 1] ?? "";
   const head = segments.slice(0, -1);
-  if (head.some((segment) => segment.includes("*"))) return { dirs: [], cut: false };
-  if (!last.includes("*")) return { dirs: [path.join(w, ...segments)], cut: false };
-  const escaped = last.split("*").map((piece) => piece.replace(/[.+?^${}()|[\]\\]/g, "\\$&"));
-  const match = new RegExp(`^${escaped.join("[^/\\\\]*")}$`, process.platform === "win32" ? "i" : "");
+  if (head.some((segment) => segment.includes("*"))) return { dirs: [], cut: false, listed: 0 };
+  if (!last.includes("*")) return { dirs: [path.join(w, ...segments)], cut: false, listed: 0 };
   const base = path.join(w, ...head);
   let children: string[];
   try {
     children = io.readdir(base, entries);
   } catch {
-    return { dirs: [], cut: false };
+    return { dirs: [], cut: false, listed: 0 };
   }
   // Code-unit order: fs.readdir's (libuv sorts with strcmp) on posix, and NTFS order for same-case names on win32.
   const dirs = children
     .slice(0, entries)
     .sort(byCodeUnit)
-    .filter((child) => !child.startsWith(".") && child !== "node_modules" && match.test(child))
+    .filter((child) => !child.startsWith(".") && child !== "node_modules" && workspaceSegmentMatches(last, child))
     .slice(0, limit)
     .map((child) => path.join(base, child));
-  return { dirs, cut: children.length > entries };
+  return { dirs, cut: children.length > entries, listed: Math.min(children.length, entries + 1) };
 }
 
 /**
@@ -351,6 +408,85 @@ function pythonString(body: string): string {
 
 /** A3: the files of a site-packages directory that declare editable installs. */
 const SITE_FILE = /(?:\.pth|\.egg-link)$|^__editable___.*_finder\.py$/i;
+
+const LINE_TERMINATORS = "\n\r\u2028\u2029";
+const WHITESPACE = /\s/;
+
+/**
+ * A3, QA-1 M2: the body of an editable finder's `MAPPING` dict literal, as the multiline regular expression
+ * `^MAPPING\s*(?::[^=\n]*)?=\s*\{([^}]*)\}` finds it first (group 1), in linear time: each `MAPPING` at a line start is parsed
+ * forward once; a `MAPPING` whose annotation starts before where the previous one's stopped fails as that one did, and once
+ * no `}` follows a `{` none follows any later one either. Undefined when there is none.
+ */
+export function finderMappingBody(text: string): string | undefined {
+  let stopped = -1; // Where the last annotation scan stopped: a later scan starting before it ends there too, as that one did.
+  for (let at = text.indexOf("MAPPING"); at >= 0; at = text.indexOf("MAPPING", at + 7)) {
+    if (at > 0 && !LINE_TERMINATORS.includes(text[at - 1]!)) continue;
+    let i = at + 7;
+    while (i < text.length && WHITESPACE.test(text[i]!)) i += 1;
+    if (text[i] === ":") {
+      if (i < stopped) continue;
+      i += 1;
+      while (i < text.length && text[i] !== "=" && text[i] !== "\n") i += 1;
+      stopped = i;
+    }
+    if (text[i] !== "=") continue;
+    i += 1;
+    while (i < text.length && WHITESPACE.test(text[i]!)) i += 1;
+    if (text[i] !== "{") continue;
+    const close = text.indexOf("}", i + 1);
+    if (close < 0) return undefined; // No `}` after this `{`: none after a later one either.
+    return text.slice(i + 1, close);
+  }
+  return undefined;
+}
+
+/**
+ * A3, QA-1 M2: the values of the `'key': 'value'` pairs of a finder `MAPPING` body (each value's text, still escaped), in
+ * linear time. It replaces the regular expression `(['"])(?:\\.|(?!\1)[^\\])*\1\s*:\s*(['"])((?:\\.|(?!\2)[^\\])*)\2`, which
+ * retried at every quote and so was quadratic on `'\'\'\'…`: string literals are read left to right as Python reads them, each
+ * once (a quote inside a literal opens none); a literal followed by `:` and another literal is a pair. The two agree on the
+ * `repr` text setuptools writes. An unclosed literal ends the reading (the file is no valid Python past it).
+ */
+export function finderMappingValues(body: string): string[] {
+  const values: string[] = [];
+  /** The end (after the closing quote) of the string literal opening at `start`, or -1 when it is not closed. */
+  const literalEnd = (start: number): number => {
+    const quote = body[start];
+    for (let i = start + 1; i < body.length; i++) {
+      if (body[i] === "\\") i += 1;
+      else if (body[i] === quote) return i + 1;
+    }
+    return -1;
+  };
+  const isQuote = (c: string | undefined): boolean => c === "'" || c === '"';
+  let i = 0;
+  while (i < body.length) {
+    if (!isQuote(body[i])) {
+      i += 1;
+      continue;
+    }
+    const keyEnd = literalEnd(i);
+    if (keyEnd < 0) return values; // Unclosed: no valid Python past it.
+    let j = keyEnd;
+    while (j < body.length && WHITESPACE.test(body[j]!)) j += 1;
+    if (body[j] !== ":") {
+      i = keyEnd;
+      continue;
+    }
+    j += 1;
+    while (j < body.length && WHITESPACE.test(body[j]!)) j += 1;
+    if (!isQuote(body[j])) {
+      i = j;
+      continue;
+    }
+    const valueEnd = literalEnd(j);
+    if (valueEnd < 0) return values;
+    values.push(body.slice(j + 1, valueEnd - 1));
+    i = valueEnd;
+  }
+  return values;
+}
 
 /**
  * Cross-repo P3c.1 (SD-P3c-1..10, D24): the dependency edges `root` declares outside `node_modules`, Tier A only (see the
@@ -488,7 +624,9 @@ export function declaredEdges(root: string, io: EdgeIO = defaultEdgeIO, limits: 
     const dir = path.dirname(file);
     const strings = (value: unknown): string[] => Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
     const extendsSpecs = typeof config.extends === "string" ? [config.extends] : strings(config.extends);
-    for (const spec of extendsSpecs) {
+    // QA-1 M2: at most EDGE_EXTENDS_ENTRIES_MAX entries, each followed (a stat or two) only while the file cap has room.
+    if (extendsSpecs.length > EDGE_EXTENDS_ENTRIES_MAX) incomplete = true;
+    for (const spec of extendsSpecs.slice(0, EDGE_EXTENDS_ENTRIES_MAX)) {
       if (!isPathSpec(spec)) continue; // A package name: resolved through node_modules, not an edge.
       add("tsconfig", spec, "tsconfig extends", file);
       if (isUncSpec(spec)) continue;
@@ -496,6 +634,11 @@ export function declaredEdges(root: string, io: EdgeIO = defaultEdgeIO, limits: 
       if (!insideOrEqual(target, base)) continue;
       if (depth >= limits.extendsDepth) {
         incomplete = true;
+        continue;
+      }
+      if (files >= limits.files) {
+        // Past the file cap: not stat'ed at all (a cut), unless it was read already (a cycle, no cut).
+        if (!seen.has(perimeterKey(target)) && !seen.has(perimeterKey(`${target}.json`))) incomplete = true;
         continue;
       }
       tsconfig(isFile(target) || target.toLowerCase().endsWith(".json") ? target : `${target}.json`, depth + 1);
@@ -576,12 +719,10 @@ export function declaredEdges(root: string, io: EdgeIO = defaultEdgeIO, limits: 
       } else if (lower.endsWith(".egg-link")) {
         add("python", text.split(/\r?\n|\r/)[0] ?? "", "python editable install", file);
       } else {
-        // setuptools >= 64 editable finder: the `MAPPING` dict literal, read by regex, never executed.
-        const mapping = /^MAPPING\s*(?::[^=\n]*)?=\s*\{([^}]*)\}/m.exec(text);
-        if (mapping === null) continue;
-        for (const pair of (mapping[1] ?? "").matchAll(/(['"])(?:\\.|(?!\1)[^\\])*\1\s*:\s*(['"])((?:\\.|(?!\2)[^\\])*)\2/g)) {
-          add("python", pythonString(pair[3] ?? ""), "python editable install", file);
-        }
+        // setuptools >= 64 editable finder: the `MAPPING` dict literal, read as text in linear time (QA-1 M2), never executed.
+        const mapping = finderMappingBody(text);
+        if (mapping === undefined) continue;
+        for (const value of finderMappingValues(mapping)) add("python", pythonString(value), "python editable install", file);
       }
     }
   };
@@ -597,9 +738,19 @@ export function declaredEdges(root: string, io: EdgeIO = defaultEdgeIO, limits: 
   venv();
   if (manifest !== undefined) {
     const dirs = new Map<string, string>();
-    for (const pattern of workspacePatterns(manifest)) {
+    // QA-1 M2: at most EDGE_WORKSPACE_PATTERNS_MAX patterns, their listings reading EDGE_WORKSPACE_ENTRIES_MAX names in total.
+    const patterns = workspacePatterns(manifest);
+    if (patterns.length > EDGE_WORKSPACE_PATTERNS_MAX) incomplete = true;
+    let listed = 0;
+    for (const pattern of patterns.slice(0, EDGE_WORKSPACE_PATTERNS_MAX)) {
       if (dirs.size > limits.workspaces) break;
-      const found = matchWorkspace(base, pattern, limits.workspaces + 1 - dirs.size, io, limits.entries);
+      const budget = Math.max(0, Math.min(limits.entries, EDGE_WORKSPACE_ENTRIES_MAX - listed));
+      if (budget === 0 && pattern.includes("*")) {
+        incomplete = true; // A wildcard needs a listing, and the total is spent; a literal pattern lists nothing.
+        continue;
+      }
+      const found = matchWorkspace(base, pattern, limits.workspaces + 1 - dirs.size, io, budget);
+      listed += found.listed;
       if (found.cut) incomplete = true;
       for (const dir of found.dirs) {
         const key = perimeterKey(dir);
