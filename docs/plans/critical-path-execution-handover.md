@@ -380,7 +380,31 @@ Everything else is work: resolve it, record it, continue.
 
 ## 7. Live state (§0.11 — keep current)
 
-**NEXT ACTION (2026-10-12 ≈16:30): DF-1.1 re-switch — waiting for the owner restart; then the DF-1.1 self-check and
+**NEXT ACTION (2026-10-12 ≈16:45): fresh session on an isolated session DB, then resume Wave 3.** Why: DF-1.1-3
+(`dogfood.md`) — the owner's scoop OpenCode 2.0.27 `serve --service` shares `~/.local/share/opencode/opencode.db`, boots
+every project in it and drained this plan's sessions with the base build; the owner keeps working on other
+implementations, so the plan now runs on its own data/state dirs (owner decision 2026-10-12).
+- **Launch (new; replaces the one below):** close the plan's window, then in a new pwsh:
+  `$env:OPENCODE_CONFIG_DIR = "$env:LOCALAPPDATA\omr-cpx\opencode-config"; $env:XDG_DATA_HOME = "$env:LOCALAPPDATA\omr-cpx\xdg-data"; $env:XDG_STATE_HOME = "$env:LOCALAPPDATA\omr-cpx\xdg-state"; $env:OPENCODE_V2_BIN = "C:\Users\Marquinho\AppData\Local\omr-cpx\bin\opencode2-2.0.26\opencode.exe"; & $env:OPENCODE_V2_BIN --standalone D:\git\omr-cpx-main`
+  then paste the kickoff prompt of §0b with "NEXT ACTION (≈16:45)" as the starting point. `opencode debug paths` with
+  these variables gives data/log/db under `%LOCALAPPDATA%\omr-cpx\xdg-data\opencode`, state under `xdg-state`, config =
+  the process-scoped copy (checked). `auth.json`, `account.json`, `mcp-auth.json` copied there (re-copy if a login
+  expires). The host log for self-checks is now `%LOCALAPPDATA%\omr-cpx\xdg-data\opencode\log\opencode.log`; subagent
+  outputs are in that directory's `opencode.db`. Still shared with the owner's servers: the router's pending journal
+  (`~/.local/state/opencode-model-router`, guarded by the DF-1-10 beats) and the outcome dir under `%TEMP%`.
+- **First steps in the new session:** (1) run-scoped self-check against the new log (df1.1 entrypoint, 2.0.26, one
+  load per location; expect no `D:\git\opencode-model-router` location now); (2) DF-1.1-1 fix (background grader runs
+  with the role's agent: record the caller's agent in `CallRecord` at decide, `src\compat\v2-hooks.ts` ≈2727, and use it
+  in the background/held finish wrappers ≈2932/≈2952; root cause in `dogfood.md`), as fix phase `pdf1-2`, then
+  `cpx/df1.2`; (3) Wave 3: `D:\git\omr-cpx-p31` @ `7f375f3` has WIP `schedule.ts` (+test), `capacity.ts` (impl done, test
+  placeholder; decisions listed by implementer `ses_ece758056ffewdDJqblIpj8yCs` in this session's history — inbox
+  severity `info`, taskId null, floor renewals, metric `until`, capacityView WeakMap, onMetric errors propagate),
+  `expand.ts` (partial) — finish 3.1.2-3.1.4 per `phase-3.1.md`; `D:\git\omr-cpx-p32` @ `c7df8d6` has the complete 3.2.1
+  memo (run V1-V8 first; V1 true). DF-1.1 re-probes c passed, d passed with DF-1.1-2 (duplicate turn rows per module
+  copy, fix in `pdf1-2`), e fails until opencode-anthropic-fix#42 is merged.
+- **Revert:** as below; drop the two XDG variables to return to the shared DB.
+
+*(superseded)* **NEXT ACTION (2026-10-12 ≈16:30): DF-1.1 re-switch — waiting for the owner restart; then the DF-1.1 self-check and
 re-probes (DF1.4.a with `df1.1`, c runner criterion, d, e), then Wave 3.** `cpx/pdf1-1` merged into `cpx/main` as
 `9fa7607` (DF1.QA rounds 1-3 closed; record in `dogfood.md`). Tag `cpx/df1.1` = `9fa7607`, pushed. Worktree
 `D:\git\omr-cpx-dogfood-df1.1` (detached at `cpx/df1.1`, `npm ci` done, clean). Switch: the copy
