@@ -1943,11 +1943,98 @@ describe("planScopedRun — cross-link inputs (cross-repo P3a)", () => {
     // setupFiles by stem, among other W changes.
     const env = withConfig('export default { test: { setupFiles: ["../lib/src/env"] } }');
     expectS6(await planScopedRun(lin(env, ["/lib/src/math.ts", "/lib/src/env.ts"])), "config-changed", reason("src/env.ts"));
-    // A reference through another spelling of W (a consumer link, crossLinkAliases) names it too.
+    // QA-2 M-B (d): a reference through a consumer link (node_modules/w -> /lib). Production never passes a
+    // node_modules spelling as an alias (the gate drops them), so the reference is caught by its own
+    // spelling: any setup path containing node_modules/ is S6 when any W input changes, the setup file or not.
+    const raw = (v: string, rel: string) => `the consumer's setup file "${v}" may come from the linked repository: ${rel} changed`;
     const viaLink = withConfig('export default { test: { setupFiles: ["./node_modules/w/setup.ts"] } }');
-    expectS6(await planScopedRun(lin(viaLink, ["/lib/setup.ts"], { crossLinkAliases: ["/r/node_modules/w"] })), "config-changed", reason("setup.ts"));
+    for (const over of [{}, { crossLinkAliases: ["/mnt/lib"] }]) {
+      expectS6(await planScopedRun(lin(viaLink, ["/lib/setup.ts"], over)), "config-changed", raw("./node_modules/w/setup.ts", "setup.ts"));
+      expectS6(await planScopedRun(lin(viaLink, ["/lib/src/math.ts"], over)), "config-changed", raw("./node_modules/w/setup.ts", "src/math.ts"));
+      expectS6(await planStaticScoping(lin(viaLink, ["/lib/src/math.ts"], over)), "config-changed", raw("./node_modules/w/setup.ts", "src/math.ts"));
+    }
+    // A Windows-style separator counts too; an in-repo-only change with the same config is not affected.
+    const viaLinkWin = withConfig(String.raw`export default { test: { globalSetup: "node_modules\\w\\setup.ts" } }`);
+    expectS6(await planScopedRun(lin(viaLinkWin, ["/lib/src/math.ts"])), "config-changed", raw(String.raw`node_modules\w\setup.ts`, "src/math.ts"));
+    expect(spec(await planScopedRun(lin(viaLink, ["/r/src/a.ts"]))).inputs).toEqual(["/r/src/a.ts"]);
     // A W file no config names stays a related input.
     expect(spec(await planScopedRun(lin(global, ["/lib/src/math.ts"]))).inputs).toEqual(["/lib/src/math.ts"]);
+  });
+
+  describe("QA-2 M-B: W setup files vitest never reruns for (globalSetup, a non-root setupFiles)", () => {
+    const LIB: Record<string, string> = {
+      "/lib/.git": "",
+      "/lib/package.json": JSON.stringify({ name: "@acme/testkit", workspaces: ["packages/kit"] }),
+      "/lib/packages/kit/package.json": JSON.stringify({ name: "@acme/kit" }),
+      "/lib/src/math.ts": "",
+      "/lib/src/setup.ts": "",
+      "/lib/vitest.setup.ts": "",
+      "/lib/test/setup.ts": "",
+      "/lib/src/global-teardown.mjs": "",
+    };
+    const files = (cfg?: string, extra: Record<string, string> = {}) => ({ ...repo(), ...LIB, ...(cfg === undefined ? {} : { "/r/vitest.config.ts": cfg }), ...extra });
+    const lin = (f: Record<string, string>, paths: string[], over: Partial<PlanScopedRunInput> = {}) =>
+      input({ changedFiles: changed(...paths), fs: crossFs(f), crossLinkRoot: "/lib", ...over });
+    const both = async (i: PlanScopedRunInput, code: string, reason: string) => {
+      expectS6(await planScopedRun(i), code, reason);
+      expectS6(await planStaticScoping(i), code, reason);
+    };
+    const named = (rel: string) => `config file changed in the linked repository: ${rel}`;
+    const raw = (v: string, rel: string) => `the consumer's setup file "${v}" may come from the linked repository: ${rel} changed`;
+    const PROJECTS = "the consumer's vitest projects are not read; use scope=full";
+
+    it("(a) a W file named like a setup file is S6 config-changed, as an in-repo one is; a bare setup.ts outside a test directory is not", async () => {
+      await both(lin(files(), ["/lib/src/math.ts", "/lib/vitest.setup.ts"]), "config-changed", named("vitest.setup.ts"));
+      await both(lin(files(), ["/lib/test/setup.ts"]), "config-changed", named("test/setup.ts"));
+      await both(lin(files(), ["/lib/src/global-teardown.mjs"]), "config-changed", named("src/global-teardown.mjs"));
+      expect(spec(await planScopedRun(lin(files(), ["/lib/src/setup.ts"]))).inputs).toEqual(["/lib/src/setup.ts"]);
+      // An ignored module (`!!`) is never matched by name.
+      const ignored = input({ changedFiles: [{ path: "/lib/vitest.setup.ts", status: "!!" }], fs: crossFs(files()), crossLinkRoot: "/lib" });
+      expect(spec(await planScopedRun(ignored)).inputs).toEqual(["/lib/vitest.setup.ts"]);
+    });
+
+    it("(b) a bare specifier naming a W package (its name or name/...) is S6 config-changed for any W input; another package is not", async () => {
+      const gs = files('export default { test: { globalSetup: ["@acme/testkit/global-setup"] } }');
+      await both(lin(gs, ["/lib/src/math.ts"]), "config-changed", raw("@acme/testkit/global-setup", "src/math.ts"));
+      const exact = files('export default { test: { setupFiles: "@acme/testkit" } }');
+      await both(lin(exact, ["/lib/src/math.ts"]), "config-changed", raw("@acme/testkit", "src/math.ts"));
+      // A workspace package of W, through require.resolve.
+      const ws = files('export default { test: { globalSetup: require.resolve("@acme/kit/setup") } }');
+      await both(lin(ws, ["/lib/src/math.ts"]), "config-changed", raw("@acme/kit/setup", "src/math.ts"));
+      // An ignored W module (a built dist/ file the specifier resolves to) counts as a W input.
+      const ignored = input({ changedFiles: [{ path: "/lib/src/math.ts", status: "!!" }], fs: crossFs(gs), crossLinkRoot: "/lib" });
+      expectS6(await planScopedRun(ignored), "config-changed", raw("@acme/testkit/global-setup", "src/math.ts"));
+      // Not W's: another package, a name W's is a prefix of, a relative path.
+      for (const v of ["@acme/other/setup", "@acme/testkit-extra/setup", "./test/setup.ts", "vitest.setup.ts"]) {
+        const other = files(`export default { test: { globalSetup: ["${v}"] } }`, { "/r/test/setup.ts": "", "/r/vitest.setup.ts": "" });
+        expect(spec(await planScopedRun(lin(other, ["/lib/src/math.ts"]))).inputs).toEqual(["/lib/src/math.ts"]);
+      }
+      // An in-repo-only change with the same config is not affected.
+      expect(spec(await planScopedRun(lin(gs, ["/r/src/a.ts"]))).inputs).toEqual(["/r/src/a.ts"]);
+    });
+
+    it("(b) a bare setup reference while W's package names cannot be read fails closed (S6 cross-link-unchecked)", async () => {
+      const gs = files('export default { test: { globalSetup: ["@acme/testkit/global-setup"] } }', { "/lib/package.json": "{" });
+      await both(lin(gs, ["/lib/src/math.ts"]), "cross-link-unchecked", "cannot check which consumer tests import the linked repository /lib: its package.json cannot be read; use scope=full");
+    });
+
+    it("(c) consumer vitest projects (projects, workspace, a vitest.workspace.* file) are S6 cross-link-unchecked for a W change", async () => {
+      for (const cfg of [
+        'export default { test: { projects: ["packages/*"] } }',
+        "export default defineConfig({ test: { workspace: [{ test: { name: 'unit' } }] } })",
+        'export default { "test": { "projects": [] } }',
+      ]) {
+        await both(lin(files(cfg), ["/lib/src/math.ts"]), "cross-link-unchecked", PROJECTS);
+      }
+      for (const name of ["vitest.workspace.ts", "vitest.workspace.json"]) {
+        await both(lin(files(undefined, { [`/r/${name}`]: "export default []" }), ["/lib/src/math.ts"]), "cross-link-unchecked", PROJECTS);
+      }
+      // A W setup reference is reported first; an in-repo-only change is not affected; no projects, no S6.
+      const gs = files('export default { test: { projects: ["a"], globalSetup: "@acme/testkit/gs" } }');
+      await both(lin(gs, ["/lib/src/math.ts"]), "config-changed", raw("@acme/testkit/gs", "src/math.ts"));
+      expect(spec(await planScopedRun(lin(files('export default { test: { projects: ["a"] } }'), ["/r/src/a.ts"]))).inputs).toEqual(["/r/src/a.ts"]);
+      expect(spec(await planScopedRun(lin(files("export default { test: { include: ['src/**'] } }"), ["/lib/src/math.ts"]))).inputs).toEqual(["/lib/src/math.ts"]);
+    });
   });
 
   it("M4: an ignored module (status !!, D23) is never matched against the config trigger names", async () => {
@@ -2098,7 +2185,9 @@ describe("planScopedRun — cross-link inputs (cross-repo P3a)", () => {
       "w-util": ["/r/test/util.test.ts", "/r/test/other.test.ts"],
       "w-root": ["/r/test/root.spec.mjs"],
     };
-    const EXPECTED = ["/r/test/core.test.ts", "/r/test/root.spec.mjs", "/r/test/util.test.ts"];
+    // QA-2 minor 1, flipped on purpose: vitest 5's default exclude is only node_modules and .git, so a
+    // consumer test under dist/ runs and is expected (it was skipped under the older default list).
+    const EXPECTED = ["/r/dist/core.test.js", "/r/test/core.test.ts", "/r/test/root.spec.mjs", "/r/test/util.test.ts"];
     const wsFiles = (over: Record<string, string> = {}): Record<string, string> => ({ ...repo(), ...WS, ...CONSUMER, ...over });
     /** crossFs plus a readdir over the files' paths (the workspace `*` expansion needs it). */
     const wsFs = (files: Record<string, string>) =>
@@ -2126,6 +2215,17 @@ describe("planScopedRun — cross-link inputs (cross-repo P3a)", () => {
       );
       // The related inputs are unchanged.
       expect(s.inputs).toEqual(MATH);
+    });
+
+    it("QA-2 minor 1: vitest 5's default exclude (node_modules, .git only) decides which consumer tests are expected", async () => {
+      const kept = ["/r/.cache/c.test.ts", "/r/.idea/i.test.ts", "/r/.output/o.test.ts", "/r/.temp/t.test.ts", "/r/cypress/e2e.test.ts", "/r/dist/core.test.js"];
+      const dropped = ["/r/.git/hooks/h.test.ts", "/r/node_modules/x/n.test.ts", "/r/packages/a/node_modules/y/m.test.ts"];
+      const files = wsFiles(Object.fromEntries([...kept, ...dropped].map((p) => [p, 'import "@w/core";'])));
+      const hits = { ...HITS, "@w/core": [...kept, ...dropped] };
+      const s = spec(await planScopedRun(wsIn(files, stubSearch(hits))));
+      // W's other names still contribute their own hits; only the exclude rule is under test here.
+      expect(s.crossLinkExpected).toEqual(expect.arrayContaining(kept));
+      for (const p of dropped) expect(s.crossLinkExpected).not.toContain(p);
     });
 
     it("pnpm-workspace.yaml packages count as workspaces; a W with names no consumer test uses expects nothing", async () => {

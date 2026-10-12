@@ -998,6 +998,7 @@
 //     cross-link-ignored-unavailable
 //                              the ignored modules of the linked repository could not be listed:
 //                              <root>   (the testsPass hook, D23; not a repository, git failed)
+//     cross-link-build-stale   the build output in <W>/<dir> is older than <rel> changed in the linked repository; rebuild it (e.g. a buildPasses check in the linked repository before this one) or use scope=full   (the testsPass hook, D23 QA round 2 M-A)
 //     cross-link-unchecked     cannot check which consumer tests import the linked repository
 //                              <root>: <why>; use scope=full   (G.4b, QA-1 M2 completeness check;
 //                              <why>: it has no package.json | its package.json cannot be read |
@@ -1254,6 +1255,7 @@ export type S6Code =
   | "cross-link-gone"
   | "cross-link-ignored-over-bounds"
   | "cross-link-ignored-unavailable"
+  | "cross-link-build-stale"
   | "cross-link-unchecked";
 
 /** S6: scoping is impossible. The reason names the construct (section M.1) and never triggers a full suite. */
@@ -3962,12 +3964,27 @@ const SETUP_FILE_RE = new RegExp(
 const SETUP_BARE_RE = new RegExp(String.raw`^(?:setup|teardown)${JS_EXT}`, "i");
 const SETUP_DIR_RE = /^(?:tests?|specs?|testing|jest|vitest|__tests__)$/i;
 
+/**
+ * G.7 (QA-1.3-29): `f` is a setup file by name (`names`, its namesOf, [] for an ignored module):
+ * not a test file, and SETUP_FILE_RE, or SETUP_BARE_RE below a test directory (SETUP_DIR_RE).
+ * QA-2 M-B (a): the same rule for a W file, on its path relative to W.
+ */
+function isSetupByName(f: FileRef, names: readonly string[]): boolean {
+  if (isJsTestPath(f.rel)) return false;
+  const segs = f.rel.split("/");
+  return names.some((b) => SETUP_FILE_RE.test(b)) || (names.some((b) => SETUP_BARE_RE.test(b)) && segs.slice(0, -1).some((s) => SETUP_DIR_RE.test(s)));
+}
+
 /** The JS runner config files scanned for static references (G.7a), per directory from runnerCwd up to gitRoot. */
 const JS_CONFIG_EXTS = ["js", "ts", "mjs", "cjs", "mts", "cts"];
 const JS_CONFIG_NAMES: Readonly<Record<"vitest" | "jest", readonly string[]>> = {
   vitest: ["vitest.config", "vite.config"].flatMap((b) => JS_CONFIG_EXTS.map((x) => `${b}.${x}`)),
   jest: [...JS_CONFIG_EXTS.map((x) => `jest.config.${x}`), "jest.config.json", "package.json"],
 };
+/** QA-2 M-B (c): vitest's workspace files (projects defined outside the config). */
+const VITEST_WORKSPACE_NAMES = [...JS_CONFIG_EXTS, "json"].map((x) => `vitest.workspace.${x}`);
+/** QA-2 M-B (c): a vitest config that sets `projects` or `workspace` (a key, quoted or not; a comment that names one only adds S6). */
+const VITEST_PROJECTS_KEY_RE = /(?<![\w$])["'`]?(?:projects|workspace)["'`]?[ \t]*:/;
 /** Config keys whose values name setup files (vitest and jest share them). */
 const SETUP_KEYS = ["setupFiles", "setupFilesAfterEnv", "globalSetup", "globalTeardown"] as const;
 const CONFIG_KEY_RE = /(?<![\w$])["']?(setupFiles|setupFilesAfterEnv|globalSetup|globalTeardown|rootDir|root)["']?[ \t]*:[ \t\r\n]*/g;
@@ -4117,6 +4134,13 @@ interface JsConfigFacts {
   readonly setupStems: ReadonlySet<string>;
   /** QA-1.3-50: path tails ("testing/boot.js") of references built on an argument the scan cannot resolve; any file ending with one counts. */
   readonly setupTails: ReadonlySet<string>;
+  /**
+   * QA-2 M-B (cross-link): every setup reference string as the configs spell it, unresolved and
+   * unfiltered (a bare specifier such as `@acme/testkit/global-setup` names a package, not a path).
+   */
+  readonly setupRaw: readonly string[] | "too-many";
+  /** QA-2 M-B (cross-link): a read vitest config that sets `projects`/`workspace`, or a vitest.workspace.* file, when there is one. */
+  readonly projectsIn?: string;
 }
 
 /**
@@ -4158,15 +4182,28 @@ async function jsConfigFacts(
   // QA-1.3-51: one listing per directory where the seam can list (hasEntry). The listings are
   // started together; the configs are still taken in directory order.
   await Promise.all([...dirs.values()].map((d) => dirListing(ctx, fs, d)));
+  let workspaceFile: string | undefined;
   for (const d of dirs.values()) {
     for (const n of JS_CONFIG_NAMES[kind]) {
       if (await hasEntry(ctx, fs, d, n)) files.add(P.join(d, n));
+    }
+    // QA-2 M-B (c): a vitest.workspace.* file defines projects whose configs are never read here.
+    if (kind === "vitest" && workspaceFile === undefined) {
+      for (const n of VITEST_WORKSPACE_NAMES) {
+        if (await hasEntry(ctx, fs, d, n)) {
+          workspaceFile = P.join(d, n);
+          break;
+        }
+      }
     }
   }
   const cliRoot = kind === "jest" ? jestCliRootDir(det) : undefined;
   const setupKeys = new Set<string>();
   const setupStems = new Set<string>();
   const setupTails = new Set<string>();
+  // QA-2 M-B: the setup strings as spelled (a bare specifier is a package, not a path), bounded by budget.
+  const setupRaw = new Set<string>();
+  let projectsIn: string | undefined = workspaceFile;
   const trailing = ctx.win ? /[\\/]+$/ : /\/+$/;
   // The last segment of a reference; "", ".", "..", "<rootDir>" or a drive only resolve to know.
   const wanted = (v: string): boolean => {
@@ -4181,13 +4218,21 @@ async function jsConfigFacts(
   const addRefs = (lits: ReadonlyMap<string, readonly string[]>, dir: string, where: string, floating?: ReadonlyMap<string, readonly string[]>): Unverifiable | undefined => {
     const refs = new Set<string>();
     const tails = new Set<string>();
+    const raw = new Set<string>();
     for (const key of SETUP_KEYS) {
-      for (const v of lits.get(key) ?? []) if (usable(v)) refs.add(v);
+      for (const v of lits.get(key) ?? []) {
+        raw.add(v);
+        if (usable(v)) refs.add(v);
+      }
       for (const v of floating?.get(key) ?? []) {
+        raw.add(v);
         const t = pathTail(v);
         if (t !== undefined && usable(t)) tails.add(ctx.key(t));
       }
     }
+    // QA-2 M-B: kept apart from the resolution budget (no plan without a cross link changes); past
+    // SETUP_REF_LIMIT distinct strings a cross-link plan fails closed (crossSetupCheck).
+    for (const v of raw) if (setupRaw.size <= SETUP_REF_LIMIT) setupRaw.add(v);
     // QA-1.3-50: a tail costs one set entry, and a suffix check per changed file.
     budget -= tails.size;
     if (budget < 0) return s6("config-too-large", `too many setup references in ${where} (limit ${SETUP_REF_LIMIT})`);
@@ -4214,6 +4259,7 @@ async function jsConfigFacts(
     if (t === "too-large") return tooLarge(file);
     if (t === "unreadable") continue;
     const { lits, floating } = configLiterals(t.text);
+    if (kind === "vitest" && projectsIn === undefined && VITEST_PROJECTS_KEY_RE.test(t.text)) projectsIn = file;
     if (P.extname(file) === ".json") {
       // QA-1.3-46: jest-config reads a JSON config as parseJson(stripJsonComments(text)). One that
       // still does not parse fails the user's run; package.json is the exception, because jest's
@@ -4231,7 +4277,7 @@ async function jsConfigFacts(
     const bad = addRefs(jsonLiterals(parseJson(c)), det.runnerCwd, "the inline jest --config");
     if (bad) return bad;
   }
-  return { setupKeys, setupStems, setupTails };
+  return { setupKeys, setupStems, setupTails, setupRaw: setupRaw.size > SETUP_REF_LIMIT ? "too-many" : [...setupRaw], projectsIn };
 }
 
 /** QA-1.3-45: the last jest `--rootDir` in the kept arguments; jest-config's setFromArgv puts it over every config's rootDir. */
@@ -4459,7 +4505,8 @@ function isCrossNonInput(ctx: Ctx, f: FileRef): boolean {
  * so planScopedRun and planStaticScoping agree. Non-input external files (G.8, and W declaration
  * files, M4) are never looked at here; classify skips them. B1: the runner check applies to every
  * request with a cross-link root, with or without external files. M4: an ignored module (`!!`) is
- * never matched against the trigger names. The vitest major is checked after the entry is resolved
+ * never matched against the trigger names. QA-2 M-B (a): nor against the setup name rule
+ * (isSetupByName), which W's files meet as in-repo ones do. The vitest major is checked after the entry is resolved
  * (classify), for every request with a cross-link root too.
  */
 async function crossLinkChecks(
@@ -4474,7 +4521,10 @@ async function crossLinkChecks(
   }
   const ext = crossInputFiles(ctx, sorted);
   for (const f of ext) {
-    if (f.ignored !== true && namesOf(ctx, f).some((b) => TRIGGERS.vitest.test(b))) {
+    // QA-2 M-B (a): W's setup files by name too (vitest reruns nothing for a globalSetup or a
+    // non-root setupFiles entry, so a related run cannot scope one).
+    const names = f.ignored === true ? [] : namesOf(ctx, f);
+    if (names.some((b) => TRIGGERS.vitest.test(b)) || isSetupByName(f, names)) {
       return s6("config-changed", `config file changed in the linked repository: ${f.rel}`);
     }
   }
@@ -4499,16 +4549,48 @@ function crossInputFiles(ctx: Ctx, sorted: readonly FileRef[]): FileRef[] {
  * M3 (G.7a for W): a W file the consumer's config names as a setup file (setupFiles, globalSetup,
  * ...): vitest reruns everything for a setupFiles entry only on an exact spelling match and never
  * for globalSetup, so a related run cannot scope it -> S6 config-changed. Every spelling of each W
- * file is checked, the node_modules ones too (a config may name W through a consumer link). The
- * facts come from the consumer's configs only; nothing under W is read.
+ * file is checked. The facts come from the consumer's configs only; nothing under W is read but
+ * its manifests (crossLinkNames).
+ * QA-2 M-B: vitest adds only the root config's setupFiles to forceRerunTriggers and never
+ * globalSetup, and a path resolution misses a W file named through a package or a consumer link
+ * (production never passes a node_modules alias). So, when any W input changed: (b) a setup string
+ * that contains node_modules/ (either separator), or a bare specifier naming a W package (`name` or
+ * `name/...`, crossLinkNames) -> S6 config-changed; (c) a consumer config that sets `projects` or
+ * `workspace`, or a vitest.workspace.* file, whose project configs this scan never reads -> S6
+ * cross-link-unchecked.
  */
-function crossSetupCheck(ctx: Ctx, facts: JsConfigFacts, cross: CrossLink, ext: readonly FileRef[]): Unverifiable | undefined {
+async function crossSetupCheck(ctx: Ctx, fs: PlannerFs, facts: JsConfigFacts, cross: CrossLink, ext: readonly FileRef[]): Promise<Unverifiable | undefined> {
+  if (ext.length === 0) return undefined;
   for (const f of ext) {
     if (allCrossSpellings(ctx, cross, f).some((s) => isReferencedSetup(ctx, facts, s))) {
       return s6("config-changed", `config file changed in the linked repository: ${f.rel}`);
     }
   }
+  const R = facts.setupRaw;
+  if (R === "too-many") return s6("config-too-large", `too many setup references in the consumer's configs (limit ${SETUP_REF_LIMIT})`);
+  const changedOne = ext[0].rel;
+  const viaLink = R.find((v) => v.replace(/\\/g, "/").includes("node_modules/"));
+  if (viaLink !== undefined) return s6("config-changed", crossSetupReason(viaLink, changedOne));
+  const bare = R.filter((v) => isBareSpecifier(ctx, v));
+  if (bare.length > 0) {
+    const names = await crossLinkNames(ctx, fs, cross);
+    if (isS6(names)) return names;
+    const hit = bare.find((v) => names.some((n) => v === n || v.startsWith(`${n}/`)));
+    if (hit !== undefined) return s6("config-changed", crossSetupReason(hit, changedOne));
+  }
+  if (facts.projectsIn !== undefined) return s6("cross-link-unchecked", "the consumer's vitest projects are not read; use scope=full");
   return undefined;
+}
+
+/** QA-2 M-B (b): the reason of a consumer setup string that may name a file of W. */
+function crossSetupReason(v: string, rel: string): string {
+  return `the consumer's setup file "${v}" may come from the linked repository: ${rel} changed`;
+}
+
+/** QA-2 M-B (b): `v` may be a package specifier: not relative, not absolute, not a drive or `<rootDir>` path. */
+function isBareSpecifier(ctx: Ctx, v: string): boolean {
+  const t = v.trim();
+  return t !== "" && !t.startsWith(".") && !/^[\\/]/.test(t) && !/^[A-Za-z]:/.test(t) && !t.includes("<") && !ctx.P.isAbsolute(t);
 }
 
 /** M3: the external files as one FileRef per spelling, so changedNames covers every spelling's names. */
@@ -4550,8 +4632,12 @@ export const CROSS_LINK_CANDIDATE_LIMIT = 200;
 
 /** QA-1 M2: vitest's default test-file include (`**\/*.{test,spec}.?(c|m)[jt]s?(x)`), on the basename. */
 const VITEST_TEST_RE = /\.(?:test|spec)\.[cm]?[jt]sx?$/;
-/** QA-1 M2: path segments vitest's default exclude skips. */
-const VITEST_EXCLUDED_SEGMENTS = new Set(["node_modules", "dist", "cypress", ".idea", ".git", ".cache", ".output", ".temp"]);
+/**
+ * QA-1 M2: path segments vitest's default exclude skips. QA-2 minor 1: vitest 5 (the pinned major,
+ * CROSS_LINK_VITEST_MAJOR) excludes only `**\/node_modules/**` and `**\/.git/**` by default, so a
+ * consumer test under dist/, cypress/, .cache/ and the like runs and is expected.
+ */
+const VITEST_EXCLUDED_SEGMENTS = new Set(["node_modules", ".git"]);
 /** QA-1 M2: an npm package name, optionally scoped. */
 const PACKAGE_NAME_RE = /^(?:@[A-Za-z0-9._~-]+\/)?[A-Za-z0-9._~-]+$/;
 
@@ -4785,7 +4871,8 @@ async function plan(input: StaticScopingInput, search: TestSearchSeam | undefine
   }
   // G.4b: G.7 and G.7a read configs from the in-repo files' directories only, so no config read
   // walks into W. M3: the setup references those configs hold are matched against every changed
-  // file, W's (non-input ones aside, isCrossNonInput) in every spelling.
+  // file, W's (non-input ones aside, isCrossNonInput) in every spelling. QA-2 M-B: and, as spelled,
+  // against W's package names and node_modules/ paths; consumer projects fail closed (crossSetupCheck).
   const local = cross ? sorted.filter((f) => f.external !== true) : sorted;
   const ext = cross ? crossInputFiles(ctx, sorted) : [];
 
@@ -4806,10 +4893,7 @@ async function plan(input: StaticScopingInput, search: TestSearchSeam | undefine
     const segs = f.rel.split("/");
     // QA-1.3-29: a setup file by name (not a test file), a bare setup.* in a test directory, or a
     // file the vitest/jest config names as a setup file.
-    const setup =
-      js &&
-      ((!isJsTestPath(f.rel) && (names.some((b) => SETUP_FILE_RE.test(b)) || (names.some((b) => SETUP_BARE_RE.test(b)) && segs.slice(0, -1).some((s) => SETUP_DIR_RE.test(s))))) ||
-        (facts !== undefined && isReferencedSetup(ctx, facts, f.abs)));
+    const setup = js && (isSetupByName(f, names) || (facts !== undefined && isReferencedSetup(ctx, facts, f.abs)));
     const reqDir =
       det.kind === "pytest" && f.ignored !== true && PY_REQ_DIR_FILE_RE.test(segs[segs.length - 1]) && segs.slice(0, -1).some((s) => ctx.key(s) === "requirements");
     if (setup || reqDir || names.some((b) => TRIGGERS[det.kind].test(b)) || ctx.key(f.abs) === sourcePj || configKeys.has(ctx.key(f.abs))) {
@@ -4817,7 +4901,7 @@ async function plan(input: StaticScopingInput, search: TestSearchSeam | undefine
     }
   }
   if (cross && facts) {
-    const bad = crossSetupCheck(ctx, facts, cross, ext);
+    const bad = await crossSetupCheck(ctx, fs, facts, cross, ext);
     if (bad) return bad;
   }
   return classify(ctx, input, det, sorted, notes, search, cross);
