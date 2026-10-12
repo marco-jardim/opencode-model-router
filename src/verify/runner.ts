@@ -786,7 +786,13 @@
 //       - the spec has crossLink (Y2: a link vitest does not follow selects 0 tests), note `vitest
 //         selected no test in <cwd> for the change in <crossLinkRoot>; the link may not be followed
 //         (resolve.preserveSymlinks, a built entry, or no test imports the changed files): use
-//         scope=full`;
+//         scope=full`. QA-1 M2 (completeness check, after this guard, on every result path, the
+//         text fallback included): a still complete result of a spec with crossLinkExpected
+//         becomes complete = false when an expected file is not a testsByFile key (cwd-relative,
+//         ctx.key), note `vitest did not run <n> consumer test file(s) that import the linked
+//         repository (<first 3 rel paths>[, …]); the link may not be followed: use scope=full`,
+//         or, without testsByFile, note `vitest gave no per-file results, so the consumer test
+//         files that import the linked repository cannot be checked: use scope=full`;
 //       - the inputs are test files (inputsAreTests: pytest), or related was given a JS test file
 //         (G.8 rule; a test file passed to related runs itself), note `<runner> ran no tests
 //         although a test file was passed`;
@@ -992,6 +998,15 @@
 //     cross-link-ignored-unavailable
 //                              the ignored modules of the linked repository could not be listed:
 //                              <root>   (the testsPass hook, D23; not a repository, git failed)
+//     cross-link-unchecked     cannot check which consumer tests import the linked repository
+//                              <root>: <why>; use scope=full   (G.4b, QA-1 M2 completeness check;
+//                              <why>: it has no package.json | its package.json cannot be read |
+//                              its workspace list cannot be read | a workspace pattern cannot be
+//                              expanded | more than 256 workspace directories | <rel>/package.json
+//                              cannot be read | more than 64 package names | it names no package
+//                              (the eight above also from planStaticScoping) | the test search for
+//                              "<name>" failed | more than 200 consumer test files contain its
+//                              package names | cannot read <rel>)
 //   M.2 NoAffected notes:
 //     "no changed files, no affected tests"                          (section 1.5-6, exactly)
 //     "no affected tests: no changed file is a test input"           (docs only, dropped paths,
@@ -1238,7 +1253,8 @@ export type S6Code =
   | "cross-link-unreachable"
   | "cross-link-gone"
   | "cross-link-ignored-over-bounds"
-  | "cross-link-ignored-unavailable";
+  | "cross-link-ignored-unavailable"
+  | "cross-link-unchecked";
 
 /** S6: scoping is impossible. The reason names the construct (section M.1) and never triggers a full suite. */
 export interface Unverifiable {
@@ -1519,6 +1535,13 @@ export interface ScopedSpec {
    * for the zero-tests note.
    */
   readonly crossLinkRoot?: string;
+  /**
+   * Cross-repo QA-1 M2 (completeness check): with crossLink, the consumer's test files (absolute, as the
+   * search returned them, sorted) whose content names a package of the linked repository in an import or
+   * require specifier (`"<name>"`, `'<name>/…'`). readResult requires each of them in the run's per-file
+   * results; a missing one makes the run incomplete (the link may not be followed for it).
+   */
+  readonly crossLinkExpected?: readonly string[];
 }
 
 /** An executable scoped eslint run (section K). Pass or fail comes from the exit code. */
@@ -4500,6 +4523,237 @@ function crossLinkVersion(entry: ResolvedEntry): Unverifiable | undefined {
   return s6("cross-link-unsupported", `a change in a linked repository needs vitest ${CROSS_LINK_VITEST_MAJOR} to scope: the resolved vitest is ${found}`);
 }
 
+// QA-1 M2 (completeness check). The zero-selection guard (Y2) catches a related run that selects no
+// test; a run that selects one consumer test and misses another (an uncovered link spelling, a vite
+// alias, a require(), a per-project preserveSymlinks) passed. So, at plan time, the consumer's test
+// files that name a package of W in an import or require specifier (`"<name>"`, `'<name>/...'`) are
+// the expected files (ScopedSpec.crossLinkExpected), and readResult requires each of them in the
+// run's per-file results. W's names: `name` in W's top package.json plus each workspace package's
+// (package.json `workspaces`, an array or { packages }, and pnpm-workspace.yaml `packages`; a pattern
+// is literal directories with at most a final `*` segment, negations are ignored). Only manifests are
+// read, with the config size limit; nothing is executed. Fail closed (S6 cross-link-unchecked) when W
+// has no package.json, a manifest or workspace list cannot be read or expanded, W names no package or
+// more than CROSS_LINK_NAME_LIMIT, a search fails, or more than CROSS_LINK_CANDIDATE_LIMIT consumer
+// test files name W's packages: the run could not be checked, so it would be unverifiable anyway.
+// planStaticScoping reads the names too (fs only), so it reaches the same S6 for them; the searches
+// are planScopedRun's. Not covered: a consumer test that reaches W only through a relative specifier
+// (`../w/src/x`), which has no literal needle; the zero-selection guard still covers a run that
+// selects none. An expected file the consumer's vitest config does not include (a narrowed
+// `include`, a project) is reported as not run: the check fails closed to scope=full.
+
+/** QA-1 M2: the most package names (W's top plus its workspace packages) the completeness check searches for. */
+export const CROSS_LINK_NAME_LIMIT = 64;
+/** QA-1 M2: the most workspace directories the completeness check looks into. */
+const CROSS_LINK_DIR_LIMIT = 256;
+/** QA-1 M2: the most consumer test files, over every name's search, the completeness check reads. */
+export const CROSS_LINK_CANDIDATE_LIMIT = 200;
+
+/** QA-1 M2: vitest's default test-file include (`**\/*.{test,spec}.?(c|m)[jt]s?(x)`), on the basename. */
+const VITEST_TEST_RE = /\.(?:test|spec)\.[cm]?[jt]sx?$/;
+/** QA-1 M2: path segments vitest's default exclude skips. */
+const VITEST_EXCLUDED_SEGMENTS = new Set(["node_modules", "dist", "cypress", ".idea", ".git", ".cache", ".output", ".temp"]);
+/** QA-1 M2: an npm package name, optionally scoped. */
+const PACKAGE_NAME_RE = /^(?:@[A-Za-z0-9._~-]+\/)?[A-Za-z0-9._~-]+$/;
+
+/** QA-1 M2: the S6 of a cross-link request whose completeness check cannot be prepared. */
+function crossUnchecked(root: string, why: string): Unverifiable {
+  return s6("cross-link-unchecked", `cannot check which consumer tests import the linked repository ${root}: ${why}; use scope=full`);
+}
+
+/** QA-1 M2: a manifest (package.json) as a record, or undefined when it cannot be read, is over the size limit or is not an object. */
+async function readManifest(ctx: Ctx, fs: PlannerFs, p: string): Promise<Record<string, unknown> | undefined> {
+  const read = await readConfigText(ctx, fs, p);
+  if (typeof read !== "object") return undefined;
+  try {
+    const value: unknown = JSON.parse(read.text.replace(/^\uFEFF/, ""));
+    return isRecord(value) ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** QA-1 M2: one YAML block-sequence scalar (plain, or single/double quoted without escapes), or undefined. */
+function yamlScalar(v: string): string | undefined {
+  const s = v.trim();
+  const q = s[0];
+  if (q === "'" || q === '"') {
+    const end = s.indexOf(q, 1);
+    if (end < 0) return undefined;
+    const rest = s.slice(end + 1).trim();
+    if (rest !== "" && !rest.startsWith("#")) return undefined;
+    const inner = s.slice(1, end);
+    return q === '"' && inner.includes("\\") ? undefined : inner;
+  }
+  const plain = s.replace(/\s+#.*$/, "").trim();
+  return plain === "" || /^[[\]{}&*!|>%@`#]/.test(plain) ? undefined : plain;
+}
+
+/**
+ * QA-1 M2: the `packages` list of a pnpm-workspace.yaml, block style only (`packages:` then `- item` lines,
+ * indented or not). Undefined when it cannot be read that way (a flow list, an anchor, a second key).
+ */
+function pnpmWorkspacePackages(text: string): string[] | undefined {
+  const out: string[] = [];
+  let inList = false;
+  let seen = false;
+  for (const raw of text.replace(/^\uFEFF/, "").split(/\r?\n/)) {
+    if (/^\s*(?:#.*)?$/.test(raw)) continue;
+    const item = /^\s*-(?:\s+(.*))?$/.exec(raw);
+    if (inList && item) {
+      const v = yamlScalar(item[1] ?? "");
+      if (v === undefined) return undefined;
+      out.push(v);
+      continue;
+    }
+    if (/^\s/.test(raw)) {
+      if (inList) return undefined;
+      continue;
+    }
+    inList = false;
+    const key = /^packages\s*:(.*)$/.exec(raw);
+    if (!key) continue;
+    if (seen) return undefined;
+    seen = true;
+    const rest = key[1].replace(/\s+#.*$/, "").trim();
+    if (rest === "[]") continue;
+    if (rest !== "") return undefined;
+    inList = true;
+  }
+  return out;
+}
+
+/** QA-1 M2: W's workspace patterns (package.json `workspaces` and pnpm-workspace.yaml), or undefined when one cannot be read. */
+async function workspacePatterns(ctx: Ctx, fs: PlannerFs, real: string, manifest: Record<string, unknown>): Promise<string[] | undefined> {
+  const out: string[] = [];
+  const ws = manifest.workspaces;
+  const list = isRecord(ws) ? ws.packages : ws;
+  if (list !== undefined) {
+    if (!Array.isArray(list) || !list.every((x): x is string => typeof x === "string")) return undefined;
+    out.push(...list);
+  }
+  const pnpm = ctx.P.join(real, "pnpm-workspace.yaml");
+  if (await existsCached(ctx, fs, pnpm)) {
+    const read = await readConfigText(ctx, fs, pnpm);
+    if (typeof read !== "object") return undefined;
+    const packages = pnpmWorkspacePackages(read.text);
+    if (packages === undefined) return undefined;
+    out.push(...packages);
+  }
+  return out;
+}
+
+/**
+ * QA-1 M2: the directories W's workspace patterns name, below `real`. A pattern is literal segments
+ * with at most a final `*` (one level, no dot entries, no node_modules); a negation is ignored. Undefined
+ * when a pattern is any other glob, leaves W, or needs a directory listing the fs seam cannot give.
+ * "over" when more than CROSS_LINK_DIR_LIMIT directories.
+ */
+async function workspaceDirs(ctx: Ctx, fs: PlannerFs, real: string, patterns: readonly string[]): Promise<string[] | "over" | undefined> {
+  const P = ctx.P;
+  const dirs = new Map<string, string>();
+  const add = (d: string) => dirs.set(ctx.key(d), d);
+  for (const pattern of patterns) {
+    if (pattern.startsWith("!")) continue;
+    const segs = pattern.replace(/\\/g, "/").split("/").filter((s) => s !== "" && s !== ".");
+    if (segs.length === 0) continue;
+    const last = segs[segs.length - 1];
+    const fixed = last === "*" ? segs.slice(0, -1) : segs;
+    if (fixed.some((s) => s === ".." || /[*?[\]{}!]/.test(s)) || P.isAbsolute(pattern) || /^[A-Za-z]:/.test(pattern)) return undefined;
+    const base = P.join(real, ...fixed);
+    if (last !== "*") add(base);
+    else if (await existsCached(ctx, fs, base)) {
+      if (!fs.readdir) return undefined;
+      let entries: readonly string[];
+      try {
+        entries = await fs.readdir(base);
+      } catch {
+        return undefined;
+      }
+      for (const e of entries) if (!e.startsWith(".") && e !== "node_modules") add(P.join(base, e));
+    }
+    if (dirs.size > CROSS_LINK_DIR_LIMIT) return "over";
+  }
+  return [...dirs.entries()].sort(byKey).map(([, v]) => v);
+}
+
+/**
+ * QA-1 M2: the package names of W (its top package.json `name` plus each workspace package's), sorted,
+ * or S6 cross-link-unchecked. fs only, so planScopedRun and planStaticScoping agree.
+ */
+async function crossLinkNames(ctx: Ctx, fs: PlannerFs, cross: CrossLink): Promise<readonly string[] | Unverifiable> {
+  const root = cross.spellings[0];
+  const P = ctx.P;
+  const top = P.join(cross.real, "package.json");
+  if (!(await existsCached(ctx, fs, top))) return crossUnchecked(root, "it has no package.json");
+  const manifest = await readManifest(ctx, fs, top);
+  if (manifest === undefined) return crossUnchecked(root, "its package.json cannot be read");
+  const names = new Set<string>();
+  const addName = (m: Record<string, unknown>) => {
+    if (typeof m.name === "string" && m.name.length <= 214 && PACKAGE_NAME_RE.test(m.name)) names.add(m.name);
+  };
+  addName(manifest);
+  const patterns = await workspacePatterns(ctx, fs, cross.real, manifest);
+  if (patterns === undefined) return crossUnchecked(root, "its workspace list cannot be read");
+  const dirs = await workspaceDirs(ctx, fs, cross.real, patterns);
+  if (dirs === undefined) return crossUnchecked(root, "a workspace pattern cannot be expanded");
+  if (dirs === "over") return crossUnchecked(root, `more than ${CROSS_LINK_DIR_LIMIT} workspace directories`);
+  for (const d of dirs) {
+    const pj = P.join(d, "package.json");
+    if (!(await existsCached(ctx, fs, pj))) continue;
+    const m = await readManifest(ctx, fs, pj);
+    if (m === undefined) return crossUnchecked(root, `${toSlash(ctx, P.relative(cross.real, pj))} cannot be read`);
+    addName(m);
+    if (names.size > CROSS_LINK_NAME_LIMIT) return crossUnchecked(root, `more than ${CROSS_LINK_NAME_LIMIT} package names`);
+  }
+  if (names.size === 0) return crossUnchecked(root, "it names no package");
+  return [...names].sort();
+}
+
+/** QA-1 M2: an import or require specifier naming the package `name` (`"<name>"`, `'<name>/...'`, any quote). */
+function specifierRe(name: string): RegExp {
+  return new RegExp(`(["'\`])${name.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")}(?:\\1|/)`);
+}
+
+/**
+ * QA-1 M2: the consumer's test files (vitest's default include and exclude, below the runner's cwd)
+ * whose content names one of `names` in a specifier, absolute and sorted by key; or S6 cross-link-unchecked
+ * when a search fails or more than CROSS_LINK_CANDIDATE_LIMIT test files contain a name.
+ */
+async function crossLinkExpected(
+  ctx: Ctx,
+  fs: PlannerFs,
+  search: TestSearchSeam,
+  gitRoot: string,
+  runnerCwd: string,
+  names: readonly string[],
+  root: string,
+): Promise<readonly string[] | Unverifiable> {
+  const P = ctx.P;
+  const candidates = new Map<string, string>();
+  for (const name of names) {
+    const hits = await search.findByContent(gitRoot, name, JS_TEST_GLOBS);
+    if (hits === undefined) return crossUnchecked(root, `the test search for "${name}" failed`);
+    for (const h of hits) {
+      const ref = canonicalize(ctx, gitRoot, gitRoot, h);
+      if (!ref || !isInside(ctx, runnerCwd, ref.abs) || !VITEST_TEST_RE.test(P.basename(ref.abs))) continue;
+      if (ref.rel.split("/").some((s) => VITEST_EXCLUDED_SEGMENTS.has(s))) continue;
+      candidates.set(ctx.key(ref.abs), ref.abs);
+      if (candidates.size > CROSS_LINK_CANDIDATE_LIMIT) {
+        return crossUnchecked(root, `more than ${CROSS_LINK_CANDIDATE_LIMIT} consumer test files contain its package names`);
+      }
+    }
+  }
+  const res = names.map(specifierRe);
+  const expected: string[] = [];
+  for (const [, abs] of [...candidates.entries()].sort(byKey)) {
+    if (!(await fs.fileExists(abs))) continue;
+    const text = await readBounded(fs, abs);
+    if (text === undefined) return crossUnchecked(root, `cannot read ${toSlash(ctx, P.relative(gitRoot, abs))}`);
+    if (res.some((re) => re.test(text))) expected.push(abs);
+  }
+  return expected;
+}
+
 /** G.3-G.5 for one path: canonical absolute path inside gitRoot, or undefined. */
 function canonicalize(ctx: Ctx, cwd: string, gitRoot: string, p: string): FileRef | undefined {
   const abs = ctx.P.resolve(cwd, p);
@@ -4760,6 +5014,11 @@ async function classify(
     // B1: the vitest major is checked for every request with a cross-link root.
     const old = cross ? crossLinkVersion(pre.entry) : undefined;
     if (old) return old;
+    // QA-1 M2: W's package names are read here too (fs only), so a name S6 is the same as planScopedRun's.
+    if (cross) {
+      const names = await crossLinkNames(ctx, fs, cross);
+      if (isS6(names)) return names;
+    }
     const staticNotes = [...notes, ...pre.notes];
     // QA-1.3-27: the spec-time pytest config lookup needs only the fs. Run it over the test inputs
     // known without a search, so 1.6 sees the S6 planScopedRun would return for them.
@@ -4909,6 +5168,15 @@ async function classify(
   // B1: the vitest major is checked for every request with a cross-link root.
   const old = cross ? crossLinkVersion(pre.entry) : undefined;
   if (old) return old;
+  // QA-1 M2 (completeness check): the consumer test files that name a package of W must all run.
+  let expected: readonly string[] | undefined;
+  if (cross) {
+    const names = await crossLinkNames(ctx, fs, cross);
+    if (isS6(names)) return names;
+    const found = await crossLinkExpected(ctx, fs, search, gitRoot, det.runnerCwd, names, cross.spellings[0]);
+    if (isS6(found)) return found;
+    expected = found;
+  }
   const F = crossInputs.size === 0 ? [...inputs.entries()].sort(byKey).map(([, v]) => v) : withCrossInputs(ctx, inputs, crossInputs);
   const allNotes = [...notes, ...pre.notes];
   const long = pytestArgvFloor(ctx, det, pre.entry, F);
@@ -4918,7 +5186,7 @@ async function classify(
   // B1 (Y2): every spec planned with a cross-link root is a cross-link spec, linked inputs or not,
   // so a related run that selects no test is never taken as "no affected tests".
   const crossRoot = cross?.spellings[0];
-  return buildSpec(ctx, det, pre.entry, F, input.budget, input.cores, allNotes, "related", det.runnerCwd, gitRoot, !fs.realpath, py, crossRoot);
+  return buildSpec(ctx, det, pre.entry, F, input.budget, input.cores, allNotes, "related", det.runnerCwd, gitRoot, !fs.realpath, py, crossRoot, expected);
 }
 
 /**
@@ -4988,6 +5256,7 @@ function buildSpec(
   lexical: boolean,
   py: PytestEvidence | undefined,
   crossLinkRoot?: string,
+  crossLinkExpected?: readonly string[],
 ): ScopedSpec | Unverifiable {
   const C = inputCores ?? ctx.host.cores;
   const xdist = py ? py.xdist : det.xdist;
@@ -5033,6 +5302,7 @@ function buildSpec(
     notes,
     ...(lexical ? { lexicalPaths: true as const } : {}),
     ...(crossLinkRoot !== undefined ? { crossLink: true as const, crossLinkRoot } : {}),
+    ...(crossLinkRoot !== undefined && crossLinkExpected !== undefined && crossLinkExpected.length > 0 ? { crossLinkExpected } : {}),
   };
 }
 
@@ -5144,22 +5414,23 @@ export async function readResult(
     ctx.key(P.dirname(P.resolve(spec.reportPath))) === ctx.key(P.resolve(ctx.host.tmpdir)) &&
     REPORT_NAME_RE.test(P.basename(spec.reportPath));
   try {
-    if (!allowed) return textResult(ctx, spec, execResult, `report path rejected: ${spec.reportPath}`);
+    if (!allowed) return crossLinkCompleteness(ctx, spec, textResult(ctx, spec, execResult, `report path rejected: ${spec.reportPath}`));
     let text: string | undefined;
     try {
       text = await fs.readFile(spec.reportPath);
     } catch {
       text = undefined; // Missing or unreadable: step 4.
     }
-    if (text === undefined) return textResult(ctx, spec, execResult, undefined);
+    if (text === undefined) return crossLinkCompleteness(ctx, spec, textResult(ctx, spec, execResult, undefined));
     let parsed: RunResult | undefined;
     try {
       parsed = spec.runner === "pytest" ? parseJunit(ctx, spec, text, execResult.code) : parseJestJson(ctx, spec, text, execResult.code);
     } catch (err) {
       // I step 1 (QA-1.3-12): a parser failure is an unusable report, never a rejection.
-      return textResult(ctx, spec, execResult, `report could not be parsed: ${err instanceof Error ? err.message : String(err)}`);
+      return crossLinkCompleteness(ctx, spec, textResult(ctx, spec, execResult, `report could not be parsed: ${err instanceof Error ? err.message : String(err)}`));
     }
-    return parsed ? zeroTestsGuard(spec, parsed) : textResult(ctx, spec, execResult, undefined);
+    // QA-1 M2: a cross-link run is then checked for the consumer test files it had to run.
+    return crossLinkCompleteness(ctx, spec, parsed ? zeroTestsGuard(spec, parsed) : textResult(ctx, spec, execResult, undefined));
   } finally {
     if (allowed) {
       try {
@@ -5367,6 +5638,31 @@ function crossLinkZeroNote(spec: ScopedSpec): string {
     `vitest selected no test in ${spec.cwd} for the change in ${root}; the link may not be followed ` +
     "(resolve.preserveSymlinks, a built entry, or no test imports the changed files): use scope=full"
   );
+}
+
+/**
+ * QA-1 M2 (completeness check): a cross-link run must have run every consumer test file that names a
+ * package of the linked repository (ScopedSpec.crossLinkExpected, G.4b). Each one is looked up in the
+ * run's per-file results (testsByFile, cwd-relative "/" keys, compared by ctx.key: case-insensitive on
+ * win32); a missing one makes the run incomplete, so it never passes. Without per-file results (the
+ * text fallback) a complete result cannot be checked and is incomplete too. A spec without
+ * crossLinkExpected, or a result already incomplete, is returned unchanged.
+ */
+function crossLinkCompleteness(ctx: Ctx, spec: ScopedSpec, r: RunResult): RunResult {
+  const expected = spec.crossLinkExpected;
+  if (spec.crossLink !== true || expected === undefined || expected.length === 0 || !r.complete) return r;
+  if (r.testsByFile === undefined) {
+    return { ...r, complete: false, note: "vitest gave no per-file results, so the consumer test files that import the linked repository cannot be checked: use scope=full" };
+  }
+  const ran = new Set(Object.keys(r.testsByFile).map((k) => ctx.key(k)));
+  const missing = expected.map((f) => relSlash(ctx, spec.cwd, f)).filter((rel) => !ran.has(ctx.key(rel)));
+  if (missing.length === 0) return r;
+  const shown = missing.slice(0, 3).join(", ") + (missing.length > 3 ? ", …" : "");
+  return {
+    ...r,
+    complete: false,
+    note: `vitest did not run ${missing.length} consumer test file(s) that import the linked repository (${shown}); the link may not be followed: use scope=full`,
+  };
 }
 
 const XML_ENTITIES: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };

@@ -1797,7 +1797,9 @@ describe("planScopedRun — cross-link inputs (cross-repo P3a)", () => {
     expect(s.gitRoot).toBe("/r");
     expect(s.cwd).toBe("/r");
     expect("lexicalPaths" in s).toBe(false);
-    expect(i.search.findByContent).not.toHaveBeenCalled();
+    // QA-1 M2: the only content search is the completeness check's, one per package name of W, in the consumer.
+    expect(i.search.findByContent).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(i.search.findByContent).mock.calls[0]?.[0]).toBe("/r");
   });
 
   it("win32: case-only variants of W's top stay separate inputs (exact-string dedup)", async () => {
@@ -1807,6 +1809,7 @@ describe("planScopedRun — cross-link inputs (cross-repo P3a)", () => {
       "C:\\app\\node_modules\\vitest\\package.json": V5,
       "C:\\app\\node_modules\\vitest\\vitest.mjs": "",
       "D:\\Temp\\claude\\lib\\.git": "",
+      "D:\\Temp\\claude\\lib\\package.json": JSON.stringify({ name: "lib" }),
       "D:\\Temp\\claude\\lib\\src\\math.ts": "",
     };
     const s = spec(
@@ -1847,7 +1850,11 @@ describe("planScopedRun — cross-link inputs (cross-repo P3a)", () => {
   });
 
   describe("B1: W nested inside the consumer's git root (a submodule or a nested clone)", () => {
-    const NESTED: Record<string, string> = { "/r/lib/.git": "gitdir: ../.git/modules/lib", "/r/lib/src/math.ts": "export const x = 1;" };
+    const NESTED: Record<string, string> = {
+      "/r/lib/.git": "gitdir: ../.git/modules/lib",
+      "/r/lib/package.json": JSON.stringify({ name: "lib" }),
+      "/r/lib/src/math.ts": "export const x = 1;",
+    };
     const nested = (vitest = V5) => jsRepo({}, { "/r/node_modules/vitest/package.json": vitest, "/r/src/a.ts": "", ...NESTED });
     const nin = (changedFiles: ChangedPath[], over: Partial<PlanScopedRunInput> = {}, files = nested()): PlanScopedRunInput =>
       input({ changedFiles, fs: crossFs(files), crossLinkRoot: "/r/lib", ...over });
@@ -1899,7 +1906,13 @@ describe("planScopedRun — cross-link inputs (cross-repo P3a)", () => {
     expectS6(await planStaticScoping(scan), "cross-link-unreachable", unreachable("src/node_modules_scan.js"));
     // W's top contains node_modules as text, not as a segment, in its only spelling.
     const LIB = "/opt/my_node_modules_lib";
-    const libFiles = { ...repo(), [`${LIB}/.git`]: "", [`${LIB}/src/math.ts`]: "", [`${LIB}/src/Node_Modules_scan.ts`]: "" };
+    const libFiles = {
+      ...repo(),
+      [`${LIB}/.git`]: "",
+      [`${LIB}/package.json`]: JSON.stringify({ name: "lib" }),
+      [`${LIB}/src/math.ts`]: "",
+      [`${LIB}/src/Node_Modules_scan.ts`]: "",
+    };
     const top = input({ changedFiles: changed(`${LIB}/src/math.ts`), fs: crossFs(libFiles), crossLinkRoot: LIB });
     expectS6(await planScopedRun(top), "cross-link-unreachable", unreachable("src/math.ts"));
     expectS6(await planStaticScoping(top), "cross-link-unreachable", unreachable("src/math.ts"));
@@ -1915,7 +1928,7 @@ describe("planScopedRun — cross-link inputs (cross-repo P3a)", () => {
   });
 
   it("M3: a W file the consumer's config names as globalSetup or setupFiles is S6 config-changed; configs are read only in the consumer", async () => {
-    const lib = { "/lib/.git": "", "/lib/setup.ts": "", "/lib/src/env.ts": "", "/lib/src/math.ts": "" };
+    const lib = { "/lib/.git": "", "/lib/package.json": JSON.stringify({ name: "lib" }), "/lib/setup.ts": "", "/lib/src/env.ts": "", "/lib/src/math.ts": "" };
     const withConfig = (cfg: string) => ({ ...repo(), ...lib, "/r/vitest.config.ts": cfg });
     const lin = (files: Record<string, string>, paths: string[], over: Partial<PlanScopedRunInput> = {}) =>
       input({ changedFiles: changed(...paths), fs: crossFs(files), crossLinkRoot: "/lib", ...over });
@@ -2028,12 +2041,12 @@ describe("planScopedRun — cross-link inputs (cross-repo P3a)", () => {
     expect(isNoAffected(await planStaticScoping(i))).toBe(true);
   });
 
-  it("G.7a never reads or probes a config file under W", async () => {
+  it("G.7a never reads or probes a config file under W; only W's manifests are (QA-1 M2: its package names)", async () => {
     const fs = crossFs(repo(), false, LINKS);
     spec(await planScopedRun(xin(changed("/w/src/math.ts"), { fs })));
     const underW = (p: string) => ["/data/w", "/w", "/mnt/w"].some((d) => p === d || p.startsWith(`${d}/`));
-    expect(fs.reads.filter(underW)).toEqual([]);
-    expect([...new Set(fs.probes.filter(underW))]).toEqual(["/data/w/src/math.ts"]);
+    expect([...new Set(fs.reads.filter(underW))]).toEqual(["/data/w/package.json"]);
+    expect([...new Set(fs.probes.filter(underW))].sort()).toEqual(["/data/w/package.json", "/data/w/pnpm-workspace.yaml", "/data/w/src/math.ts"]);
     // The seam does see the consumer's own config probe.
     expect(fs.probes.some((p) => /^\/r\/vit(e|est)\.config\./.test(p))).toBe(true);
   });
@@ -2058,6 +2071,202 @@ describe("planScopedRun — cross-link inputs (cross-repo P3a)", () => {
     }
     expect(codes).toEqual(["cross-link-gone", "config-changed", "cross-link-unsupported", "cross-link-unsupported", "attribution-unavailable"]);
     expect(await planStaticScoping(xin(changed("/w/src/math.ts")))).toMatchObject({ scopable: true, runner: "vitest", pendingSearches: 0 });
+  });
+
+  describe("QA-1 M2: completeness check — the consumer tests that name a package of W must all run", () => {
+    /** W as a workspace: a top name, two `packages/*` packages and one literal workspace directory. */
+    const WS: Record<string, string> = {
+      ...W,
+      "/data/w/package.json": JSON.stringify({ name: "w-root", workspaces: ["packages/*", "tools/cli", "!packages/skip"] }),
+      "/data/w/packages/core/package.json": JSON.stringify({ name: "@w/core" }),
+      "/data/w/packages/util/package.json": JSON.stringify({ name: "w-util" }),
+      "/data/w/packages/README.md": "",
+      "/data/w/tools/cli/package.json": JSON.stringify({ name: "w-cli" }),
+    };
+    /** Consumer test files: three name a W package in a specifier, the others do not count. */
+    const CONSUMER: Record<string, string> = {
+      "/r/test/core.test.ts": 'import { add } from "@w/core";',
+      "/r/test/util.test.ts": "const u = require('w-util/lib/x');",
+      "/r/test/root.spec.mjs": "const w = await import(`w-root`);",
+      "/r/test/other.test.ts": 'import { x } from "w-utility";',
+      "/r/test/mention.test.ts": "// the @w/core docs say so",
+      "/r/test/helper.ts": 'import "@w/core";',
+      "/r/dist/core.test.js": 'import "@w/core";',
+    };
+    const HITS: Record<string, readonly string[]> = {
+      "@w/core": ["/r/test/core.test.ts", "/r/test/mention.test.ts", "/r/test/helper.ts", "/r/dist/core.test.js"],
+      "w-util": ["/r/test/util.test.ts", "/r/test/other.test.ts"],
+      "w-root": ["/r/test/root.spec.mjs"],
+    };
+    const EXPECTED = ["/r/test/core.test.ts", "/r/test/root.spec.mjs", "/r/test/util.test.ts"];
+    const wsFiles = (over: Record<string, string> = {}): Record<string, string> => ({ ...repo(), ...WS, ...CONSUMER, ...over });
+    /** crossFs plus a readdir over the files' paths (the workspace `*` expansion needs it). */
+    const wsFs = (files: Record<string, string>) =>
+      Object.assign(crossFs(files, false, LINKS), {
+        readdir: async (d: string): Promise<readonly string[]> => {
+          const prefix = d.endsWith("/") ? d : `${d}/`;
+          const names = new Set(Object.keys(files).filter((p) => p.startsWith(prefix)).map((p) => p.slice(prefix.length).split("/")[0]));
+          if (names.size === 0) throw new Error(`ENOENT ${d}`);
+          return [...names];
+        },
+      });
+    /** A W change (src/math.ts) planned against `files`, with readdir and the given search. */
+    const wsIn = (files: Record<string, string>, search: TestSearchSeam = stubSearch(HITS)) =>
+      xin(changed("/w/src/math.ts"), { fs: wsFs(files), search }, files);
+    const unchecked = (why: string) => `cannot check which consumer tests import the linked repository /w: ${why}; use scope=full`;
+
+    it("the expected files are the consumer tests that name W's top or a workspace package in an import or require specifier", async () => {
+      const search = stubSearch(HITS);
+      const s = spec(await planScopedRun(wsIn(wsFiles(), search)));
+      expect(s).toMatchObject({ crossLink: true, crossLinkRoot: "/w" });
+      expect(s.crossLinkExpected).toEqual(EXPECTED);
+      // One content search per name (top, `packages/*`, the literal tools/cli; the negation is ignored), sorted.
+      expect(vi.mocked(search.findByContent).mock.calls.map((c) => [c[0], c[1], c[2]])).toEqual(
+        ["@w/core", "w-cli", "w-root", "w-util"].map((n) => ["/r", n, JS_TEST_GLOBS]),
+      );
+      // The related inputs are unchanged.
+      expect(s.inputs).toEqual(MATH);
+    });
+
+    it("pnpm-workspace.yaml packages count as workspaces; a W with names no consumer test uses expects nothing", async () => {
+      const pnpm = {
+        "/data/w/package.json": JSON.stringify({ name: "w" }),
+        "/data/w/pnpm-workspace.yaml": "packages:\n  # the libraries\n  - 'packages/*'\n  - \"!packages/skip\" # not this one\n",
+        "/data/w/packages/a/package.json": JSON.stringify({ name: "@w/a" }),
+      };
+      const search = stubSearch({ "@w/a": ["/r/test/a.test.ts"] });
+      const s = spec(await planScopedRun(wsIn(wsFiles({ ...pnpm, "/r/test/a.test.ts": "import a from '@w/a'" }), search)));
+      expect(s.crossLinkExpected).toEqual(["/r/test/a.test.ts"]);
+      // pnpm's `packages/*` (WS's core and util directories too) replaces nothing: the top has no `workspaces` here.
+      expect(vi.mocked(search.findByContent).mock.calls.map((c) => c[1])).toEqual(["@w/a", "@w/core", "w", "w-util"]);
+      // No hit at all: no expected list on the spec (the zero-selection guard still applies).
+      const none = spec(await planScopedRun(wsIn(wsFiles(), stubSearch())));
+      expect(none.crossLink).toBe(true);
+      expect("crossLinkExpected" in none).toBe(false);
+    });
+
+    it("W's names cannot be read -> S6 cross-link-unchecked, the same from planStaticScoping", async () => {
+      const many: Record<string, string> = {};
+      for (let i = 0; i < 65; i++) many[`/data/w/packages/p${i}/package.json`] = JSON.stringify({ name: `p${i}` });
+      const cases: [Record<string, string>, string, boolean][] = [
+        [{ "/data/w/package.json": "{ not json" }, "its package.json cannot be read", true],
+        [{ "/data/w/package.json": JSON.stringify({ name: "w", workspaces: "packages/*" }) }, "its workspace list cannot be read", true],
+        [{ "/data/w/pnpm-workspace.yaml": "packages: [a, b]\n" }, "its workspace list cannot be read", true],
+        [{ "/data/w/package.json": JSON.stringify({ name: "w", workspaces: ["packages/**"] }) }, "a workspace pattern cannot be expanded", true],
+        [{ "/data/w/package.json": JSON.stringify({ name: "w", workspaces: ["../elsewhere"] }) }, "a workspace pattern cannot be expanded", true],
+        // `*` needs PlannerFs.readdir: without it the pattern cannot be expanded.
+        [{}, "a workspace pattern cannot be expanded", false],
+        [{ "/data/w/packages/core/package.json": "[" }, "packages/core/package.json cannot be read", true],
+        [{ "/data/w/package.json": JSON.stringify({ private: true }), "/data/w/packages/core/package.json": "{}", "/data/w/packages/util/package.json": "{}", "/data/w/tools/cli/package.json": "{}" }, "it names no package", true],
+        [{ "/data/w/package.json": JSON.stringify({ name: "w", workspaces: ["packages/*"] }), ...many }, "more than 64 package names", true],
+      ];
+      for (const [over, why, readdir] of cases) {
+        const files = wsFiles(over);
+        const i = readdir ? wsIn(files) : xin(changed("/w/src/math.ts"), { search: stubSearch(HITS) }, files);
+        const run = await planScopedRun(i);
+        expectS6(run, "cross-link-unchecked", unchecked(why));
+        expectS6(await planStaticScoping(i), "cross-link-unchecked", unchecked(why));
+        expect(i.search.findByContent).not.toHaveBeenCalled();
+      }
+      // No package.json at all.
+      const bare = { ...repo() };
+      delete bare["/data/w/package.json"];
+      const i = xin(changed("/w/src/math.ts"), {}, bare);
+      expectS6(await planScopedRun(i), "cross-link-unchecked", unchecked("it has no package.json"));
+      expectS6(await planStaticScoping(i), "cross-link-unchecked", unchecked("it has no package.json"));
+    });
+
+    it("a failed search or one over its bounds -> S6 cross-link-unchecked (planScopedRun; planStaticScoping starts no search)", async () => {
+      const failing = stubSearch({ ...HITS, "w-cli": undefined });
+      expectS6(await planScopedRun(wsIn(wsFiles(), failing)), "cross-link-unchecked", unchecked('the test search for "w-cli" failed'));
+      const over: Record<string, string> = {};
+      const hits: string[] = [];
+      for (let i = 0; i < 201; i++) {
+        over[`/r/test/t${i}.test.ts`] = 'import "@w/core";';
+        hits.push(`/r/test/t${i}.test.ts`);
+      }
+      const big = wsIn(wsFiles(over), stubSearch({ "@w/core": hits }));
+      expectS6(await planScopedRun(big), "cross-link-unchecked", unchecked("more than 200 consumer test files contain its package names"));
+      expect(await planStaticScoping(big)).toMatchObject({ scopable: true, runner: "vitest" });
+      // 200 are within the bound.
+      const ok = spec(await planScopedRun(wsIn(wsFiles(over), stubSearch({ "@w/core": hits.slice(0, 200) }))));
+      expect(ok.crossLinkExpected).toHaveLength(200);
+    });
+
+    describe("readResult", () => {
+      const A = "/r/test/a.test.ts";
+      const B = "/r/test/b.test.ts";
+      /** A vitest JSON report in which each file ran one passing test. */
+      const ranFiles = (files: string[]) =>
+        JSON.stringify({
+          numTotalTests: files.length,
+          numFailedTests: 0,
+          testResults: files.map((name) => ({ name, status: "passed", assertionResults: [{ title: "t", ancestorTitles: [], status: "passed" }] })),
+        });
+      const crossSpec = (over: Partial<ScopedSpec> = {}) =>
+        mkSpec({ cwd: "/r", gitRoot: "/r", inputs: MATH, crossLink: true, crossLinkRoot: "/w", crossLinkExpected: [A, B], ...over });
+
+      it("every expected file in the per-file results -> complete", async () => {
+        const r = await read(crossSpec(), { [RPT_JSON]: ranFiles([A, B, "/r/test/extra.test.ts"]) }, 0);
+        expect(r).toMatchObject({ complete: true, total: 3, failingIds: [] });
+        expect(r.note).toBeUndefined();
+      });
+
+      it("one expected file missing -> incomplete with the exact note", async () => {
+        const r = await read(crossSpec(), { [RPT_JSON]: ranFiles([A]) }, 0);
+        expect(r).toMatchObject({
+          complete: false,
+          total: 1,
+          note: "vitest did not run 1 consumer test file(s) that import the linked repository (test/b.test.ts); the link may not be followed: use scope=full",
+        });
+      });
+
+      it("more than three missing: the first three, then an ellipsis; a failure stays reported", async () => {
+        const expected = ["a", "b", "c", "d", "e"].map((n) => `/r/test/${n}.test.ts`);
+        const report = JSON.stringify({
+          numTotalTests: 1,
+          numFailedTests: 1,
+          testResults: [{ name: "/r/test/z.test.ts", status: "failed", assertionResults: [{ title: "t", ancestorTitles: [], status: "failed" }] }],
+        });
+        const r = await read(crossSpec({ crossLinkExpected: expected }), { [RPT_JSON]: report }, 1);
+        expect(r.failingIds).toEqual(["test/z.test.ts > t"]);
+        expect(r.complete).toBe(false);
+        expect(r.note).toBe(
+          "vitest did not run 5 consumer test file(s) that import the linked repository (test/a.test.ts, test/b.test.ts, test/c.test.ts, …); " +
+            "the link may not be followed: use scope=full",
+        );
+      });
+
+      it("win32: the expected files are matched case-insensitively", async () => {
+        const sp = mkSpec({
+          cwd: "C:\\r",
+          gitRoot: "C:\\r",
+          reportPath: `C:\\Temp\\omr-verify-${UUID}.json`,
+          inputs: ["D:\\w\\src\\math.ts"],
+          crossLink: true,
+          crossLinkRoot: "D:\\w",
+          crossLinkExpected: ["C:\\r\\Test\\A.test.ts"],
+        });
+        const r = await read(sp, { [sp.reportPath]: ranFiles(["C:/r/test/a.test.ts"]) }, 0, WIN_HOST);
+        expect(r).toMatchObject({ complete: true, total: 1 });
+      });
+
+      it("a spec without crossLink or without an expected list is unaffected; the zero guard keeps its own note", async () => {
+        const plain = await read(mkSpec({ cwd: "/r", inputs: ["/r/src/a.ts"], crossLinkExpected: [A, B] }), { [RPT_JSON]: ranFiles([A]) }, 0);
+        expect(plain).toMatchObject({ complete: true, total: 1 });
+        const noList = await read(crossSpec({ crossLinkExpected: undefined }), { [RPT_JSON]: ranFiles([A]) }, 0);
+        expect(noList).toMatchObject({ complete: true, total: 1 });
+        const zero = await read(crossSpec(), { [RPT_JSON]: ranFiles([]) }, 0);
+        expect(zero.complete).toBe(false);
+        expect(zero.note).toMatch(/^vitest selected no test in \/r for the change in \/w; /);
+      });
+
+      it("no per-file results (the text fallback) -> a complete result cannot be checked and is incomplete", async () => {
+        const r = await read(crossSpec(), {}, 0, POSIX_HOST, " Test Files  2 passed (2)\n      Tests  2 passed (2)\n");
+        expect(r.complete).toBe(false);
+        expect(r.testsByFile).toBeUndefined();
+      });
+    });
   });
 
   it("D23: the ignored-module S6 codes and their reasons are the ones header M.1 lists", () => {

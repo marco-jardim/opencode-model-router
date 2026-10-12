@@ -1,7 +1,9 @@
 // Cross-repo P3a (Y5): a consumer testsPass with scope=affected runs `vitest related` through a link
 // into the changed repository W, with this repository's own vitest, in temp dirs (spike C1/R1).
+// QA-1 M2/m4: the planner's searches are real git (the completeness check finds the consumer tests that
+// name W's package), and the hook gets wiring.ts's ignored-module lister and the dispatch start (D23).
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { access, readdir, readFile, realpath, stat, unlink } from "node:fs/promises";
@@ -9,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createDirectTestsPassHook, createScopeOpener, runDeterministic } from "../../src/verify/deterministic";
 import { runArgv, runShell } from "../../src/verify/exec";
 import { crossLinkAliases } from "../../src/verify/perimeter";
+import { listIgnoredModules } from "../../src/verify/tree";
 import type { RunnerFs, TestSearchSeam } from "../../src/verify/runner";
 import type { TestsPassHook, TestsPassRun } from "../../src/verify/types";
 import { resolveVerifyBudget, type VerifyBudget } from "../../src/router/config";
@@ -39,10 +42,33 @@ const nodeFs: RunnerFs = {
   },
 };
 
-/** The planner's git searches find nothing here: a related run needs none (vitest's own graph selects). */
-const noSearch: TestSearchSeam = {
-  findByName: async () => [],
-  findByContent: async () => [],
+/** git's stdout split on NUL into absolute paths under `root`. */
+function nulPaths(root: string, out: string): string[] {
+  return out.split("\0").filter(Boolean).map(rel => join(root, rel));
+}
+
+/**
+ * wiring.ts's TestSearchSeam over real git (TestSearchSeam's contract: `git ls-files` and `git grep -l -z -F --untracked`,
+ * exit 1 = no match, any other failure = undefined). QA-1 M2: the completeness check searches the consumer's test files for
+ * W's package names with it.
+ */
+const gitSearch: TestSearchSeam = {
+  async findByName(gitRoot, names) {
+    try {
+      const specs = names.map(n => `:(glob)**/${n}`);
+      return nulPaths(gitRoot, execFileSync("git", ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", ...specs], { cwd: gitRoot, encoding: "utf8" }));
+    } catch {
+      return undefined;
+    }
+  },
+  async findByContent(gitRoot, needle, globs, options) {
+    const args = ["grep", "-l", "-z", "-F", "--untracked", ...(options?.word === true ? ["-w"] : []), "-e", needle, "--", ...globs];
+    try {
+      return nulPaths(gitRoot, execFileSync("git", args, { cwd: gitRoot, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }));
+    } catch (err) {
+      return (err as { status?: number }).status === 1 ? [] : undefined;
+    }
+  },
 };
 
 /** The production direct hook (wiring.ts buildGateDeps) over real processes, no batching, no recheck reference. */
@@ -54,11 +80,21 @@ function realHook(budget: VerifyBudget): TestsPassHook {
     budget,
     checkTimeoutMs: RUN_TIMEOUT_MS,
   });
-  return createDirectTestsPassHook({ openScope, plannerFs: nodeFs, search: noSearch, budget });
+  return createDirectTestsPassHook({
+    openScope,
+    plannerFs: nodeFs,
+    search: gitSearch,
+    budget,
+    // wiring.ts: W's git-ignored modules modified at or after the dispatch start (D23, QA C1).
+    listIgnored: (root, signal, since) => listIgnoredModules(root, { signal, since, lowPriority: budget.lowPriority }),
+  });
 }
 
-/** One foreign testsPass with an explicit scope=affected in C, run as the gate runs it for a change in L (W). */
-async function runConsumerCheck(fx: Fixture, command: string, changed: readonly string[]) {
+/**
+ * One foreign testsPass with an explicit scope=affected in C, run as the gate runs it for a change in L (W). `dispatchStartedAt`
+ * (D23): the dispatch start the gate passes on; W's ignored modules older than it are never inputs.
+ */
+async function runConsumerCheck(fx: Fixture, command: string, changed: readonly string[], dispatchStartedAt = Date.now() - 60_000) {
   const budget = resolveVerifyBudget(undefined, { cores: 2 });
   const direct = realHook(budget);
   const runs: TestsPassRun[] = [];
@@ -82,6 +118,7 @@ async function runConsumerCheck(fx: Fixture, command: string, changed: readonly 
       crossLinkAliases: consumerCwd => crossLinkAliases(consumerCwd, fx.lib),
       onFailure: reason => failures.push(reason),
       timeoutMs: RUN_TIMEOUT_MS,
+      dispatchStartedAt,
     },
   );
   return { verdict, runs, failures };
@@ -204,20 +241,105 @@ describe.skipIf(!existsSync(join(OWN_VITEST, "vitest.mjs")))("cross-link related
     expect(runs).toHaveLength(1);
     const scoped = runs[0]?.scoped;
     expect(scoped?.kind).toBe("ran");
-    // uses-lib.test.js's one test; other.test.js (one test, no import of the lib) is not selected.
-    if (scoped?.kind === "ran") expect(scoped.result.total).toBe(1);
+    // QA m4: WHICH file ran, by file: uses-lib.test.js (its one test); other.test.js (no import of the lib) is not selected.
+    if (scoped?.kind === "ran") {
+      expect(scoped.result.testsByFile).toEqual({ "test/uses-lib.test.js": 1 });
+      expect(scoped.result.complete).toBe(true);
+    }
     expect(failures).toEqual([]);
   }, RUN_TIMEOUT_MS);
 
-  it("an L change that breaks C: unverifiable, never fail", async () => {
+  it("an L change that breaks C: the failure is observed, and the verdict is unverifiable, never fail", async () => {
     const changed = changeLib(fx, "index.js", "export function add(a, b) {\n  return a - b;\n}\n");
     const { verdict, runs, failures } = await runConsumerCheck(fx, "npx vitest run", [changed]);
     expect(verdict.outcome).toBe("unverifiable");
     expect(verdict.pass).toBe(false);
     expect(runs).toHaveLength(1);
-    expect(runs[0]?.scoped.kind).toBe("ran");
+    const scoped = runs[0]?.scoped;
+    expect(scoped?.kind).toBe("ran");
+    // QA m4: the run really failed in uses-lib.test.js (a complete inventory), not merely an unverifiable run.
+    if (scoped?.kind === "ran") {
+      expect(scoped.result.failingIds).toEqual(["test/uses-lib.test.js > adds through the link"]);
+      expect(scoped.result.complete).toBe(true);
+      expect(scoped.result.testsByFile).toEqual({ "test/uses-lib.test.js": 1 });
+    }
     expect(failures).toEqual([]);
   }, RUN_TIMEOUT_MS);
+
+  it("QA-1 M2: a consumer test vitest misses (a require() of the lib) makes the run unverifiable through the completeness check", async () => {
+    // A second consumer test reaches the lib through createRequire: vite's graph never sees it, so `vitest related` misses it.
+    write(
+      join(fx.consumer, "test", "requires-lib.test.js"),
+      'import { createRequire } from "node:module";\nimport { expect, test } from "vitest";\n\n' +
+        "const require = createRequire(import.meta.url);\n\n" +
+        `test("reads the lib through require", () => {\n  expect(require("${LIB_NAME}/package.json").name).toBe("${LIB_NAME}");\n});\n`,
+    );
+    const changed = changeLib(fx, "index.js", "export function add(a, b) {\n  // still a sum\n  return b + a;\n}\n");
+    const { verdict, runs, failures } = await runConsumerCheck(fx, "npx vitest run", [changed]);
+    expect(runs).toHaveLength(1);
+    const scoped = runs[0]?.scoped;
+    expect(scoped?.kind).toBe("ran");
+    if (scoped?.kind === "ran") {
+      // vitest selected only the importing test, and it passed ...
+      expect(scoped.result.testsByFile).toEqual({ "test/uses-lib.test.js": 1 });
+      expect(scoped.result.failingIds).toEqual([]);
+      // ... but the run is incomplete: requires-lib.test.js names the lib and did not run.
+      expect(scoped.result.complete).toBe(false);
+      expect(scoped.result.note).toBe(
+        "vitest did not run 1 consumer test file(s) that import the linked repository (test/requires-lib.test.js); " +
+          "the link may not be followed: use scope=full",
+      );
+    }
+    expect(verdict.outcome).toBe("unverifiable");
+    expect(verdict.pass).toBe(false);
+    expect(verdict.reasons.join("\n")).toContain("vitest did not run 1 consumer test file(s) that import the linked repository");
+    expect(failures).toEqual([]);
+  }, RUN_TIMEOUT_MS);
+
+  describe("D23: W's main is a git-ignored build output (dist/)", () => {
+    /** L's entry becomes dist/index.js, ignored by git; src/index.js is its tracked source. */
+    function buildLib(): { src: string; dist: string } {
+      write(join(fx.lib, "package.json"), JSON.stringify({ name: LIB_NAME, version: "1.0.0", type: "module", main: "dist/index.js" }, null, 2));
+      write(join(fx.lib, ".gitignore"), "dist\n");
+      const src = join(fx.lib, "src", "index.js");
+      write(src, "export function add(a, b) {\n  return a + b;\n}\n");
+      const dist = join(fx.lib, "dist", "index.js");
+      write(dist, "export function add(a, b) {\n  return a + b;\n}\n");
+      commitAll(fx.lib);
+      return { src, dist };
+    }
+
+    it("the producer rebuilt dist (mtime at or after the dispatch start): the consumer test is selected and passes", async () => {
+      const { src, dist } = buildLib();
+      const started = Date.now() - 5_000;
+      write(src, "export function add(a, b) {\n  return b + a;\n}\n");
+      write(dist, "export function add(a, b) {\n  return b + a;\n}\n");
+      const { verdict, runs, failures } = await runConsumerCheck(fx, "npx vitest run", [src], started);
+      expect(verdict.reasons).toEqual(["all 1 deterministic checks passed"]);
+      expect(verdict.outcome).toBe("pass");
+      const scoped = runs[0]?.scoped;
+      expect(scoped?.kind).toBe("ran");
+      if (scoped?.kind === "ran") {
+        expect(scoped.result.testsByFile).toEqual({ "test/uses-lib.test.js": 1 });
+        expect(scoped.result.complete).toBe(true);
+      }
+      expect(failures).toEqual([]);
+    }, RUN_TIMEOUT_MS);
+
+    it("a stale dist (mtime before the dispatch start) is no input: zero selection, unverifiable", async () => {
+      const { src, dist } = buildLib();
+      const old = new Date(Date.now() - 600_000);
+      utimesSync(dist, old, old);
+      write(src, "export function add(a, b) {\n  return b + a;\n}\n");
+      const { verdict, runs, failures } = await runConsumerCheck(fx, "npx vitest run", [src], Date.now() - 5_000);
+      expect(verdict.outcome).toBe("unverifiable");
+      expect(verdict.reasons.join("\n")).toContain(`vitest selected no test in ${fx.consumer} for the change in ${fx.lib}`);
+      const scoped = runs[0]?.scoped;
+      expect(scoped?.kind).toBe("ran");
+      if (scoped?.kind === "ran") expect(scoped.result.total).toBe(0);
+      expect(failures).toEqual([]);
+    }, RUN_TIMEOUT_MS);
+  });
 
   it("an L change no C test imports: unverifiable with the zero-selection note", async () => {
     const changed = changeLib(fx, "unused.js", "export const unused = 2;\n");
