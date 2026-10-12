@@ -27,6 +27,7 @@ import { type Dirent, lstatSync, readFileSync, readdirSync, readlinkSync, realpa
 import { lstat, readFile, readdir, readlink, realpath } from "node:fs/promises";
 import * as path from "node:path";
 import { permissionMatches } from "../router/read-only";
+import type { RepoLocation } from "../routing/roles/admission";
 import { routedRoleOf } from "../routing/wire/dispatch";
 import { workingSetOf } from "../routing/wire/working-set";
 import type { DispatchPerimeter, PerimeterSeed } from "./dispatch";
@@ -512,6 +513,51 @@ function commonDirOf(top: string | undefined): string | undefined {
   }
 }
 
+/** Link admission (QA-1 F4, I11, I12): `routing.repoParents`, `routing.repoDepth`, `routing.repoExclude` and the working set. */
+export interface AdmissionContext {
+  /** Both spellings of each parent: as configured, and canonical (link targets are real paths), one per comparison key. */
+  readonly parents: readonly string[];
+  /** The first parent `dir` lies at least one segment below, if any (admission by text, without touching `dir`). */
+  readonly parentOf: (dir: string) => string | undefined;
+  /** The working-set entry whose worktree holds `dir` (or is `dir`), if any. */
+  readonly worktreeOf: (dir: string) => RepoLocation | undefined;
+  /**
+   * Whether the top level `top` is admitted: it is a working-set worktree, or it lies 1..`routing.repoDepth` segments below a
+   * parent and no `routing.repoExclude` glob matches it or a directory between that parent and it.
+   */
+  readonly admitTop: (top: string) => boolean;
+}
+
+/**
+ * Cross-repo P3c.2a: the link admission of `planPerimeter`, factored out so that other admissions (the workspace edges, P3c.2b)
+ * read the same parents, depth, excludes and working set. Reads the filesystem only to canonicalise each parent.
+ */
+export function admissionContext(config: PerimeterAdmission, workingSet: readonly RepoLocation[]): AdmissionContext {
+  const depth = Math.max(1, Math.floor(config.depth));
+  const exclude = config.exclude ?? [];
+  // Both spellings of each parent: as configured, and canonical (link targets are real paths).
+  const parents = [...new Map(config.parents.flatMap((parent) => [parent, canonical(parent)]).map((p) => [perimeterKey(p), p])).values()];
+  const excluded = (parent: string, top: string): boolean => {
+    if (exclude.length === 0) return false;
+    const segments = path.relative(parent, top).split(/[\\/]/).filter((segment) => segment !== "");
+    for (let level = 1; level <= segments.length; level++) {
+      const dir = path.join(parent, ...segments.slice(0, level));
+      if (exclude.some((glob) => permissionMatches(dir, glob))) return true;
+    }
+    return false;
+  };
+  const parentOf = (dir: string): string | undefined => parents.find((parent) => depthBelow(dir, parent) >= 1);
+  const worktreeOf = (dir: string): RepoLocation | undefined => workingSet.find((entry) => insideOrEqual(dir, entry.worktree));
+  // QA-1 F4 (I11, I12): admission by top level, before any git call; the snapshot's top level is checked again at the gate.
+  const admitTop = (top: string): boolean =>
+    workingSet.some((entry) => perimeterKey(entry.worktree) === perimeterKey(top))
+    || parents.some((parent) => {
+      const below = depthBelow(top, parent);
+      return below >= 1 && below <= depth && !excluded(parent, top);
+    });
+  return { parents, parentOf, worktreeOf, admitTop };
+}
+
 /**
  * The perimeter beyond W of the dispatch `dispatchID` (a native `task` dispatch, `task:<orchestrator>:<callID>`) verified at
  * `cwd`, or undefined when it has none (I9): not a routed role dispatch, or neither a grant location nor another working-set
@@ -572,28 +618,8 @@ export function planPerimeter(dispatchID: string, cwd: string, admission: () => 
     });
   }
 
-  const depth = Math.max(1, Math.floor(config.depth));
-  const exclude = config.exclude ?? [];
-  // Both spellings of each parent: as configured, and canonical (link targets are real paths).
-  const parents = [...new Map(config.parents.flatMap((parent) => [parent, canonical(parent)]).map((p) => [perimeterKey(p), p])).values()];
-  const excluded = (parent: string, top: string): boolean => {
-    if (exclude.length === 0) return false;
-    const segments = path.relative(parent, top).split(/[\\/]/).filter((segment) => segment !== "");
-    for (let level = 1; level <= segments.length; level++) {
-      const dir = path.join(parent, ...segments.slice(0, level));
-      if (exclude.some((glob) => permissionMatches(dir, glob))) return true;
-    }
-    return false;
-  };
-  const parentOf = (dir: string): string | undefined => parents.find((parent) => depthBelow(dir, parent) >= 1);
-  const worktreeOf = (dir: string) => workingSet.find((entry) => insideOrEqual(dir, entry.worktree));
-  // QA-1 F4 (I11, I12): admission by top level, before any git call; the snapshot's top level is checked again at the gate.
-  const admitTop = (top: string): boolean =>
-    workingSet.some((entry) => perimeterKey(entry.worktree) === perimeterKey(top))
-    || parents.some((parent) => {
-      const below = depthBelow(top, parent);
-      return below >= 1 && below <= depth && !excluded(parent, top);
-    });
+  // P3c.2a: link admission (parents in both spellings, depth, excludes, working set), factored into `admissionContext`.
+  const { parentOf, worktreeOf, admitTop } = admissionContext(config, workingSet);
 
   for (const real of linkedTargets(w)) {
     // Admission by text first: a link outside every parent and every working-set worktree is not in P, but it is not dropped
