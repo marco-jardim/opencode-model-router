@@ -783,6 +783,20 @@ describe("QA round 1 (P2.1)", () => {
     }
   });
 
+  it("DF-1-9: an unrecorded child's dispatch is never backgrounded as a root's (A-2.1-1, root parents only)", async () => {
+    const { dir, cfg } = home(ROLES, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    // No `session.created` and no `prompt` hook for u1 (a reload, or past the 1000-entry bound): only the host knows its parent.
+    const v2 = host(dir, cfg, { u1: { id: "u1", parentID: "root", agent: "medium", location: { directory: dir } } });
+    await v2.start(hooks);
+    for (const [i, explicit] of [undefined, true].entries()) {
+      const input: Record<string, unknown> = { agent: "implementer", description: "patch", prompt: "Patch the parser", ...(explicit === undefined ? {} : { background: explicit }) };
+      const event = { sessionID: "u1", agent: "medium", messageID: "m", id: `df19-${i}`, tool: "subagent", input };
+      await v2.toolHooks["execute.before"](event);
+      expect(event.input.background).toBe(false); // D1 row 2: `!parentIsRoot` → the pre-2.1 value, before any explicit or `auto` row
+    }
+  });
+
   it("QA-P21-1-2: a deferred testsPass acceptance never backs a deterministic detection; VERIFY: required does", async () => {
     const { dir, cfg } = home(ROLES);
     const { hooks } = await plugin(dir);

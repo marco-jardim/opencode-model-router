@@ -10,7 +10,7 @@ import { getActiveTiers } from "../../src/router/protocol";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync, rmSync } from "node:fs";
 import v2Plugin from "../../src/v2";
 import type { Plugin } from "@opencode/plugin";
 import { lastStepContext, rememberDispatch, resetDispatchRegistry } from "../../src/router/sessions";
@@ -1316,6 +1316,26 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     await cleanup();
     expect(readdirSync(outcomes).filter((name) => name !== "pending.jsonl")).toEqual([]); // v2 pending journal (2.1.4) is the one visible file
     expect(model.list).not.toHaveBeenCalled();
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  });
+
+  it("DF-1-5: a root run's end writes its turns row, with a subagent start still open and no prompt hook", async () => {
+    const { home, outcomes } = routingHome();
+    const f = fixture();
+    const { cleanup, forgetSession } = await start(f, catalog());
+    f.emit({ id: "c-root", type: "session.created", data: { sessionID: "root-r" } }); // no parentID: a root session
+    await barrier(f, forgetSession, "barrier-1");
+    const call = { sessionID: "root-r", agent: "build", messageID: "m", id: "call-df15", tool: "subagent", input: { agent: "medium", prompt: "Patch it", background: true } as Record<string, unknown> };
+    await f.toolHooks["execute.before"](call); // its start stays open: the child keeps running in the background
+    f.emit(stepEvent("s1", "root-r"));
+    f.emit(stepEvent("s2", "root-r"));
+    f.emit({ id: "x-root", type: "session.execution.succeeded", data: { sessionID: "root-r" } }); // the kickoff run ends
+    await barrier(f, forgetSession, "barrier-2");
+    const turns = join(outcomes, "turns.jsonl");
+    expect(existsSync(turns)).toBe(true);
+    const rows = readFileSync(turns, "utf8").split("\n").filter((line) => line !== "").map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(rows).toEqual([expect.objectContaining({ kind: "orchestrator-turn", sessionID: "root-r", turn: 1, steps: 2, input: 2000, cacheRead: 0, cacheWrite: 0 })]);
+    await cleanup();
     rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 

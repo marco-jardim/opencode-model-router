@@ -1305,6 +1305,7 @@ export async function registerV2Hooks(
   /**
    * The kind of a session WITHOUT a host call (`session.created` and the `prompt` hook record it): an unknown session is a root,
    * as in the lease guard (memo §14.1). The dispatch path must not add host calls (a static session stays silent, §1.2).
+   * DF-1-9: never for the background decision — there an unrecorded parent is resolved with `sessionKindOf` (`unknown` is no root).
    */
   const knownKindOf = (sessionID: string): "root" | "child" => sessionKinds.get(sessionID) ?? "root";
   /** The in-flight registry and held results exist whatever the mode; they hold nothing until a background dispatch is acknowledged. */
@@ -2564,6 +2565,14 @@ export async function registerV2Hooks(
         // #84 P2.1-C: a fresh role dispatch carries its nonce at the END of the description (title marker, handoff 31).
         if (routed.description !== undefined) args.description = routed.description;
         if (routed.role !== undefined) roleForeground = true;
+        // DF-1-9: a role decision read the session (dispatch.ts routeRoleCall): the floor rung is a delegate's (it has a parent), any
+        // other is the orchestrator's — the kind of an unrecorded session is known without another host call. A root is marked for
+        // the timing recorder too, as `session.created` does (a recorded kind skips the step path's own lookup).
+        if (routed.role !== undefined && !sessionKinds.has(String(event.sessionID))) {
+          const kind = routed.role.delegate === true ? "child" : "root";
+          noteSessionKind(String(event.sessionID), kind);
+          if (kind === "root") timings?.markRootSession(String(event.sessionID));
+        }
         if (routed.agent !== undefined) { args.agent = routed.agent; args.subagent_type = routed.agent; }
         if (routed.model !== undefined) args.model = routed.model;
         if (args.model === undefined && tierModel !== undefined) args.model = tierModel;
@@ -2594,6 +2603,11 @@ export async function registerV2Hooks(
         let background: boolean | undefined = verifying || roleForeground ? false : undefined;
         if (event.tool === "subagent" && bgActive() && finishApi !== undefined) {
           const parent = String(event.sessionID);
+          // DF-1-9: a parent the plugin never recorded (a reload, past the bound) is resolved, never assumed a root: an
+          // unrecorded child must not reach the `auto` rows (A-2.1-1, root parents only). A lookup that fails stays foreground.
+          const recordedKind = sessionKinds.get(parent);
+          const parentKind = recordedKind ?? await sessionKindOf(parent);
+          if (recordedKind === undefined && parentKind === "root") timings?.markRootSession(parent); // as the step path's lookup does
           const info = dispatchRouter.decisionOf(event.id);
           const roleLabel = info?.role ?? "unknown";
           const verification = finishApi.verificationFor(event.id);
@@ -2606,7 +2620,7 @@ export async function registerV2Hooks(
             acceptance: verification?.acceptance ?? { testsPass: false, buildPasses: false },
             planTask: false,
             holdingAvailable: held.available && !reloadFailed && finishApi.canHold(parent),
-            parentIsRoot: knownKindOf(parent) === "root", liveCount: inflight.liveCount(),
+            parentIsRoot: parentKind === "root", liveCount: inflight.liveCount(),
           });
           background = decision.background;
           inflight.decide({
@@ -3251,6 +3265,14 @@ export async function registerV2Hooks(
                 const endHandled = Promise.resolve(timingDone).then(() => undefined);
                 trackBackground(endHandled);
                 await endHandled;
+              }
+              // DF-1-5: a root run's end closes its orchestrator turn, whatever the background mode: under background-first dispatch
+              // the kickoff and each synthetic wake-up are runs without a `prompt` hook, so no prompt would ever close them.
+              if (timings?.isRootSession(sid) === true) {
+                const turnDone = timings.onRootExecutionEnd(sid, event.id)
+                  .catch((error: unknown) => ingestLogger.warn("[router] timing: the turn boundary could not be recorded", { error: String(error) }));
+                trackBackground(turnDone);
+                await turnDone;
               }
               leaseGuard?.releaseChild(sid);
               leaseHandle?.notifyReleased();

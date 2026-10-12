@@ -24,6 +24,16 @@
  *
  * Output: the observation `<OBS_DIR>/<runId>/cache-prefix.json` (+ `<OBS_DIR>/latest/cache-prefix.json`) is written BEFORE any assertion, with
  * OBS_DIR as in cpx-host-contract (`<OMR_CPX_PROBE_DIR | OMR_SMOKE_REAL_TMPDIR | os.tmpdir()>/omr-cpx-probe`).
+ *
+ * Scenario `DF-1-6 background tail` (dogfood fault DF-1-6, measurement only): a second host (same seed, background `auto`, leases off)
+ * reproduces the live shape in which the orchestrator's cache read stopped advancing while the router-state tail was non-empty: an
+ * ordinary turn; a verified (VERIFY:required + passing fileExists acceptance) `subagent` call with `background: true`, acknowledged as
+ * running and held (the child's first request is held by the provider so it stays in flight); a turn while it runs; the host's synthetic
+ * `<subagent … state="completed">` completion and the router's `<router-verdict>` synthetic waking the root; two turns after the release.
+ * Per request: (c) exactly one message `cache_control`, on the last real message (the one before the `<router-state>` tail), never on the
+ * tail. Per consecutive pair N, N+1: (a) `system` and `tools` byte-identical; (b) N+1 byte-identical to N through N's last real message
+ * with `cache_control` stripped. A failure prints the first differing byte offset and ±200 chars of both sides; the observation
+ * `<OBS_DIR>/<runId>/cache-prefix-df16.json` also records every request's phase, tail, markers and synthetic-message renderings.
  */
 import { afterAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
@@ -32,7 +42,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { makeKey } from "../../src/routing/outcomes";
 import type { CpxFront, CpxRequest } from "./helpers/cpx-scripted-provider";
-import { RoutingHost, arr, clip, obj, redact, stopAllHosts, type Obj, type Seed } from "./helpers/routing-host";
+import { RoutingHost, arr, clip, obj, redact, stopAllHosts, waitFor, type Obj, type Seed } from "./helpers/routing-host";
 
 const RUN = process.env.RUN_OC_SMOKE_CPX === "1";
 const BIN = process.env.OPENCODE_V2_BIN;
@@ -60,6 +70,31 @@ const SECOND_ASK = "Find every usage of parseOther in the repository and list th
 const SEARCH_PROMPT = "[route class=search risk=low scope=single]\nFind every usage of parseThing in the repository and list the files.";
 const TAIL_OPEN = "<router-state>";
 const HINT = /Route hint: for \w+ work like this turn, prefer @/;
+// DF-1-6 (background tail): the host's synthetic completion of a background child and the router's held-verdict synthetic.
+const SUBAGENT_COMPLETED = /<subagent\b[^>]*\bstate=\\?"completed\\?"/;
+/** Any `<subagent … state=…>` rendering in the history (the host's `completed`, or the router's `held` placeholder substituted for it). */
+const DF16_SUBAGENT_STATE = /<subagent\b[^>]*\bstate=\\?"\w+\\?"/;
+const ROUTER_VERDICT = "<router-verdict";
+/** Background on (auto), leases off, advise engine (with MOVE_SEED the route hint keeps the tail non-empty on every root request). */
+const DF16_ROUTING = { engine: "advise", background: { mode: "auto" }, leases: { mode: "off" } } as const;
+/** Child requests whose last user text carries this marker are answered DF16_CHILD_HOLD_MS after they arrive (the provider's hold). */
+const DF16_HOLD_MARKER = "HOLD_CHILD";
+const DF16_CHILD_HOLD_MS = 15_000;
+const DF16_IMPLEMENT_PROMPT = "[route class=implement risk=low scope=single]\nImplement the feature in src/a.ts and report the file.";
+/** A verified background dispatch (VERIFY:required + a deterministic fileExists check that passes): the result is held until the verdict. */
+const DF16_DISPATCH = (verified: string): Obj => ({
+  agent: "fast", description: "Implement feature", background: true,
+  prompt: `${DF16_IMPLEMENT_PROMPT}\n${DF16_HOLD_MARKER}\nVERIFY:required\n[acceptance]\ncheck: fileExists path=${verified}\n[/acceptance]`,
+});
+const DF16_IN_FLIGHT_ASK = "Find every usage of parseOther in the repository and list the files.";
+const DF16_AFTER_ASK_1 = "Find every usage of parseThird in the repository and list the files.";
+const DF16_AFTER_ASK_2 = "Find every usage of parseFourth in the repository and list the files.";
+const DF16_END = /^session\.execution\.(succeeded|failed|interrupted)$/;
+/** Background lines of the router-state tail (src/compat/background.ts): a child in flight, a held result, a completion. */
+const DF16_TAIL_BUSY = /\[router\] (In flight \(background\)|Held for verification|Completed since your last turn)/;
+const DF16_TAIL_BUSY_ALL = new RegExp(DF16_TAIL_BUSY.source, "g");
+/** The tail of a request made while the child is still running (or its result still held): the live DF-1-6 condition. */
+const DF16_TAIL_IN_FLIGHT = /\[router\] (In flight \(background\)|Held for verification)/;
 
 // ------------------------------------------------------------------------------------------------ wire helpers ----
 const json = (value: unknown): string => JSON.stringify(value) ?? "";
@@ -211,19 +246,99 @@ function comparePair(a: CpxRequest, b: CpxRequest, va: RequestView, vb: RequestV
   };
 }
 
+/** DF-1-6: the first differing character offset of two serialized bodies with ±200 chars of both around it; undefined when equal. */
+function byteDiff(earlier: string, later: string, radius = 200): { offset: number; charOffset: number; earlierLength: number; laterLength: number; earlier: string; later: string } | undefined {
+  if (earlier === later) return undefined;
+  let at = 0;
+  while (at < earlier.length && at < later.length && earlier[at] === later[at]) at += 1;
+  const from = Math.max(0, at - radius);
+  return {
+    offset: Buffer.byteLength(earlier.slice(0, at), "utf8"), charOffset: at,
+    earlierLength: Buffer.byteLength(earlier, "utf8"), laterLength: Buffer.byteLength(later, "utf8"),
+    earlier: earlier.slice(from, at + radius), later: later.slice(from, at + radius),
+  };
+}
+const showDiff = (diff: ReturnType<typeof byteDiff>): string =>
+  diff === undefined ? "identical" : `first differing byte offset ${diff.offset} (char ${diff.charOffset}; UTF-8 lengths ${diff.earlierLength} / ${diff.laterLength})\n    N   [±200 chars]: ${JSON.stringify(diff.earlier)}\n    N+1 [±200 chars]: ${JSON.stringify(diff.later)}`;
+/** DF-1-6: the `<router-state>` message of a request as JSON text ("" when it has none). */
+const tailText = (r: CpxRequest): string => bodyMessages(r).map(json).filter(t => t.includes(TAIL_OPEN)).at(-1) ?? "";
+/** DF-1-6: every message of a request except the `<router-state>` tail, as JSON text. */
+const historyText = (r: CpxRequest): string => bodyMessages(r).map(json).filter(t => !t.includes(TAIL_OPEN)).join("\n");
+/** DF-1-6: the request fields other than messages/system/tools (model, max_tokens, thinking…), for the observation. */
+const otherFields = (r: CpxRequest): Obj => Object.fromEntries(Object.entries(obj(r.body)).filter(([k]) => !["messages", "system", "tools"].includes(k)));
+/** DF-1-6: what the request carries of the background life cycle, so a failing pair names the step it belongs to. */
+function phaseOf(r: CpxRequest): string {
+  const tail = tailText(r);
+  const history = historyText(r);
+  const states = [...history.matchAll(/<subagent\b[^>]*\bstate=\\?"(\w+)\\?"/g)].map(m => m[1]);
+  const verdicts = (history.match(/<router-verdict/g) ?? []).length;
+  const lines = [...tail.matchAll(DF16_TAIL_BUSY_ALL)].map(m => m[1]);
+  return `tail[${lines.join("|") || (tail === "" ? "none" : "hint only")}] history[subagent states=${states.join(",") || "-"}; verdicts=${verdicts}; last=${String(bodyMessages(r).at(lastRealOfMessages(bodyMessages(r)))?.role ?? "?")}${hasToolResult(bodyMessages(r).at(lastRealOfMessages(bodyMessages(r)))) ? " tool_result" : ""}]`;
+}
+/** The last real message index computed from the messages alone (the one before the tail, else the last). */
+const lastRealOfMessages = (messages: readonly Obj[]): number => {
+  const tails = messages.flatMap((m, i) => (json(m).includes(TAIL_OPEN) ? [i] : []));
+  return tails.length > 0 ? tails[tails.length - 1]! - 1 : messages.length - 1;
+};
+/** DF-1-6: the last real message of a request: the one before its `<router-state>` tail, or its last message when it has no tail. */
+const lastRealOf = (v: RequestView): number => (v.tailAt.length > 0 ? v.tailAt[v.tailAt.length - 1]! - 1 : v.messageCount - 1);
+/** DF-1-6: one pair N, N+1 of consecutive root requests, compared part by part on the serialized wire bodies (the front's parsed body
+ * re-serialized: same key order as the host sent). `system` and `tools` byte for byte (markers included); `messages` through N's last
+ * real message with `cache_control` stripped on both sides. Each difference carries its first differing byte offset and ±200 chars. */
+function compareTailPair(a: CpxRequest, b: CpxRequest, va: RequestView, vb: RequestView): Obj {
+  const ab = obj(a.body);
+  const bb = obj(b.body);
+  const through = lastRealOf(va) + 1;
+  const earlier = withoutCacheControl(bodyMessages(a).slice(0, through));
+  const later = withoutCacheControl(bodyMessages(b).slice(0, through));
+  const prefixDiff = byteDiff(json(earlier), json(later));
+  return {
+    from: a.index,
+    to: b.index,
+    comparedMessages: through,
+    laterMessageCount: vb.messageCount,
+    systemDiff: byteDiff(json(ab.system), json(bb.system)),
+    toolsDiff: byteDiff(json(ab.tools), json(bb.tools)),
+    prefixDiff,
+    prefixDiffPath: prefixDiff === undefined ? undefined : firstPathDiff(earlier, later, "$.messages"),
+  };
+}
+/** DF-1-6 assertions (a)-(c) over the consecutive root requests; every failure message carries what is needed to root-cause it. */
+function checkTailPairs(phases: readonly string[], views: readonly RequestView[], pairs: readonly Obj[], check: (id: string, ok: boolean, message: string) => void): void {
+  views.forEach((v, n) => {
+    const label = `request ${n + 1} (#${v.index}, ${phases[n] ?? "?"})`;
+    const lastReal = lastRealOf(v);
+    // (c) exactly one message-level breakpoint, on the last real message, never on the tail.
+    check("df16-breakpoint", v.messageBreakpoints.length === 1 && lastReal >= 0 && v.messageBreakpoints[0] === lastReal, `${label}: exactly one message cache_control, on the last real message (got [${v.messageBreakpoints.join(",")}], last real ${lastReal}, tail at [${v.tailAt.join(",")}] of ${v.messageCount}; marked parts ${json(v.partMarks)})`);
+    check("df16-breakpoint-tail", v.tailAt.every(t => !v.messageBreakpoints.includes(t)), `${label}: no cache_control on the <router-state> tail (breakpoints [${v.messageBreakpoints.join(",")}], tail at [${v.tailAt.join(",")}])`);
+    check("df16-tail-last", v.tailAt.length <= 1 && (v.tailAt.length === 0 || v.tailAt[0] === v.messageCount - 1), `${label}: at most one <router-state> message and it is the LAST message (tail at [${v.tailAt.join(",")}] of ${v.messageCount})`);
+  });
+  pairs.forEach((p, n) => {
+    const label = `request #${String(p.from)} (${phases[n] ?? "?"}) -> #${String(p.to)} (${phases[n + 1] ?? "?"})`;
+    const systemDiff = p.systemDiff as ReturnType<typeof byteDiff>;
+    const toolsDiff = p.toolsDiff as ReturnType<typeof byteDiff>;
+    const prefixDiff = p.prefixDiff as ReturnType<typeof byteDiff>;
+    // (a) the system array and the tools are byte-identical (cache_control markers included).
+    check("df16-system", systemDiff === undefined, `${label}: system must be byte-identical: ${showDiff(systemDiff)}`);
+    check("df16-tools", toolsDiff === undefined, `${label}: tools must be byte-identical: ${showDiff(toolsDiff)}`);
+    // (b) N+1 equals N byte for byte through N's last real message, cache_control stripped on both sides.
+    check("df16-prefix", prefixDiff === undefined, `${label}: N+1 must equal N through N's last real message (${String(p.comparedMessages)} messages; N+1 has ${String(p.laterMessageCount)}) once cache_control is stripped; first differing path ${String(p.prefixDiffPath)}: ${showDiff(prefixDiff)}`);
+  });
+}
+
 // ------------------------------------------------------------------------------------------------ observation ----
 const obsBaseDir = (): string => path.join(process.env.OMR_CPX_PROBE_DIR || process.env.OMR_SMOKE_REAL_TMPDIR || tmpdir(), "omr-cpx-probe");
 interface Check { id: string; ok: boolean; message: string }
 
-async function writeObservation(record: Obj): Promise<string> {
+async function writeObservation(record: Obj, name = "cache-prefix"): Promise<string> {
   const base = obsBaseDir();
   const dir = path.join(base, RUN_ID);
   await mkdir(dir, { recursive: true });
   await mkdir(path.join(base, "latest"), { recursive: true });
   const text = `${JSON.stringify(redact(record), null, 2)}\n`;
-  const file = path.join(dir, "cache-prefix.json");
+  const file = path.join(dir, `${name}.json`);
   await writeFile(file, text);
-  await writeFile(path.join(base, "latest", "cache-prefix.json"), text);
+  await writeFile(path.join(base, "latest", `${name}.json`), text);
   console.log(`[cpx-cache-prefix] observation written to ${file}`);
   return file;
 }
@@ -312,4 +427,87 @@ d("cpx cache prefix: the turn-state tail never touches the cached prefix", () =>
     if (broken.length > 0) throw new Error(`cpx-cache-prefix: ${broken.length} check(s) failed (observation: ${file})\n${broken.map(c => `  - ${c.id}: ${c.message}`).join("\n")}`);
     expect(broken).toHaveLength(0);
   }, 600_000);
+
+  it("DF-1-6 background tail", async () => {
+    const observed: Obj = {};
+    const checks: Check[] = [];
+    const check = (id: string, ok: boolean, message: string): void => { checks.push({ id, ok, message }); };
+    let failure: unknown;
+    const host = await RoutingHost.start("cpx-cache-prefix-df16", { routing: DF16_ROUTING, seed: MOVE_SEED, provider: {} });
+    try {
+      host.provider.holdMarked(DF16_HOLD_MARKER, DF16_CHILD_HOLD_MS);
+      const verified = path.join(host.project, "df16-held-pass.txt");
+      await writeFile(verified, "present\n");
+      const root = await host.newRoot("cpx cache prefix df16 root");
+      observed.rootID = root;
+      // 1. An ordinary turn first, so the background dispatch lands on an established prefix.
+      await host.prompt(root, FIRST_ASK);
+      // 2. The background dispatch, verified (VERIFY:required + a deterministic acceptance check that passes): its result is HELD.
+      const call = await host.dispatch(root, DF16_DISPATCH(verified));
+      observed.childID = call.childID;
+      observed.ack = clip(json(call.after.result), 800);
+      check("df16-ack", /Running in the background/.test(json(call.after.result)), `the dispatch result must be the background acknowledgement (got ${clip(json(call.after.result), 400) as string})`);
+      check("df16-ack-held", /held until verification finishes/.test(json(call.after.result)), "the acknowledgement must say the result is held until verification finishes");
+      // 3. A turn while the child is in flight (the tail lists it in flight / held).
+      const endedEarly = (await host.eventsOf(call.childID)).some(e => DF16_END.test(e.type));
+      observed.childEndedBeforeInFlightTurn = endedEarly;
+      await host.prompt(root, DF16_IN_FLIGHT_ASK);
+      // 4. The child ends: the host's synthetic `<subagent … state="completed">` and the router's `<router-verdict>` wake the root.
+      observed.childEnd = await waitFor(`end event of ${call.childID}`, async () => (await host.eventsOf(call.childID)).find(e => DF16_END.test(e.type))?.type, 120_000, 250);
+      const verdictRequest = await waitFor("a root request carrying the verdict entry", () => primaryRequests(host, root).find(r => historyText(r).includes(ROUTER_VERDICT)), 120_000, 500).catch(() => undefined);
+      observed.verdictRequest = verdictRequest?.index;
+      await host.settle(root);
+      // 5. Two turns after the release.
+      await host.prompt(root, DF16_AFTER_ASK_1);
+      await host.prompt(root, DF16_AFTER_ASK_2);
+
+      const requests = primaryRequests(host, root);
+      const views = requests.map(view);
+      const phases = requests.map(phaseOf);
+      const pairs = requests.slice(1).map((r, i) => compareTailPair(requests[i]!, r, views[i]!, views[i + 1]!));
+      observed.requestCount = requests.length;
+      observed.phases = requests.map((r, n) => ({ request: r.index, phase: phases[n], messageCount: views[n]!.messageCount, tailAt: views[n]!.tailAt, lastReal: lastRealOf(views[n]!), messageBreakpoints: views[n]!.messageBreakpoints, partMarks: views[n]!.partMarks, systemBreakpoints: views[n]!.systemBreakpoints, totalMarkers: views[n]!.totalMarkers }));
+      observed.pairs = pairs;
+      observed.tails = requests.map(r => clip(tailText(r), 900));
+      // H2 evidence: how each request renders the child's completion (the host's `completed` record, or the router's `held` placeholder
+      // substituted for it while the hold is active) and the verdict entry, message by message.
+      observed.syntheticMessages = requests.map(r => ({
+        request: r.index,
+        messages: bodyMessages(r).flatMap((m, i) => (json(m).includes("<subagent") || json(m).includes(ROUTER_VERDICT)
+          ? [{ at: i, role: m.role, completed: SUBAGENT_COMPLETED.test(json(m)), heldPlaceholder: json(m).includes('state=\\"held\\"'), verdict: json(m).includes(ROUTER_VERDICT), length: json(m).length, text: clip(json(m), 900) }]
+          : [])),
+      }));
+      observed.otherFields = requests.slice(1).map((r, i) => ({ from: requests[i]!.index, to: r.index, diff: byteDiff(json(otherFields(requests[i]!)), json(otherFields(r))) }));
+      observed.hostErrors = clip(host.errorLines(), 400);
+      observed.routerLog = clip(host.routerLogLines(), 400);
+      observed.providerErrors = clip(host.provider.errors, 400);
+
+      // The live shape must have been reproduced (otherwise (a)-(c) prove nothing about DF-1-6).
+      check("df16-requests", requests.length >= 4, `expected at least 4 consecutive primary requests of the root, got ${requests.length}`);
+      // The in-flight turn is the first request whose history carries its ask; its tail must list the child in flight / held.
+      const inFlightTurn = requests.find(r => historyText(r).includes(DF16_IN_FLIGHT_ASK));
+      observed.inFlightTurn = inFlightTurn?.index;
+      observed.inFlightTails = requests.filter(r => DF16_TAIL_IN_FLIGHT.test(tailText(r))).map(r => r.index);
+      check("df16-shape-in-flight", !endedEarly && inFlightTurn !== undefined && DF16_TAIL_IN_FLIGHT.test(tailText(inFlightTurn)), `the turn made while the child runs (#${String(inFlightTurn?.index)}) must carry the background tail (in flight / held); child ended before that turn: ${String(endedEarly)}; tail ${clip(inFlightTurn === undefined ? "" : tailText(inFlightTurn), 400) as string}`);
+      check("df16-shape-completion", requests.some(r => DF16_SUBAGENT_STATE.test(historyText(r))), "the host's synthetic <subagent … state=…> completion message must reach a root request");
+      check("df16-shape-verdict", verdictRequest !== undefined, "the router's <router-verdict> synthetic must reach a root request");
+      check("df16-shape-released", verdictRequest !== undefined && requests.filter(r => r.index > verdictRequest.index).length >= 2, "at least two root requests must follow the verdict request (after the release)");
+      checkTailPairs(phases, views, pairs, check);
+    } catch (error) {
+      failure = error;
+      observed.scenarioError = error instanceof Error ? (error.stack ?? error.message) : String(error);
+    } finally {
+      let teardown: Obj;
+      try { teardown = { ...(await host.stop()) }; } catch (error) { teardown = { stopError: error instanceof Error ? (error.stack ?? error.message) : String(error) }; }
+      observed.teardown = teardown;
+      check("teardown", teardown.stopError === undefined && teardown.rootRemoved === true && teardown.hostPortClosed === true, "host.stop() must remove the scratch root and close the host port");
+    }
+    const file = await writeObservation({
+      scenario: "cpx-cache-prefix-df16", runId: RUN_ID, recordedAt: new Date().toISOString(), obsDir: obsBaseDir(), vitestTmpdir: tmpdir(), checks, observed: clip(observed, 12000),
+    }, "cache-prefix-df16");
+    if (failure !== undefined) throw failure;
+    const broken = checks.filter(c => !c.ok);
+    if (broken.length > 0) throw new Error(`cpx-cache-prefix DF-1-6: ${broken.length} check(s) failed (observation: ${file})\n${broken.map(c => `  - ${c.id}: ${c.message}`).join("\n")}`);
+    expect(broken).toHaveLength(0);
+  }, 900_000);
 });

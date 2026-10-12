@@ -110,6 +110,43 @@ describe("orchestrator turns: aggregation", () => {
     ]);
   });
 
+  it("DF-1-5: a root run's end closes its turn with the step sums, though a background dispatch start is still open", async () => {
+    const rec = recorder();
+    rec.markRootSession("root");
+    rec.recordDispatchStart({
+      callID: "call-1", childSessionID: null, parentSessionID: "root", role: "implementer", class: "implement", scope: "single",
+      tier: "medium", model: "anthropic/claude-sonnet-4-5", background: true, at: NOW,
+    });
+    rec.bindChild("call-1", "child-1"); // the child keeps running: no outcome, the start stays open
+    rec.onRootStep("root", tokens(10, 100, 1));
+    rec.onRootStep("root", tokens(20, 200, 2));
+    rec.onRootStep("root", tokens(30, 300, 3));
+    await rec.onRootExecutionEnd("root", "run-1"); // no prompt hook: the kickoff run ends
+    expect(turnRows().map(r => [r.sessionID, r.turn, r.steps, r.input, r.cacheRead, r.cacheWrite])).toEqual([["root", 1, 3, 60, 600, 6]]);
+    await rec.onRootExecutionEnd("root", "run-2"); // no step since: nothing is written
+    expect(turnRows()).toHaveLength(1);
+    rec.onRootStep("root", tokens(5, 50, 0)); // the synthetic wake-up run
+    await rec.onRootExecutionEnd("root", "run-1"); // a seen event id: ignored, the step stays in the open turn
+    expect(turnRows()).toHaveLength(1);
+    await rec.onRootExecutionEnd("root", "run-3");
+    expect(turnRows().map(r => [r.turn, r.steps, r.input, r.cacheRead, r.cacheWrite])).toEqual([
+      [1, 3, 60, 600, 6],
+      [2, 1, 5, 50, 0],
+    ]);
+  });
+
+  it("DF-1-5: the run end of a child or of an unknown session writes no row and leaves the root's turn open", async () => {
+    const rec = recorder();
+    rec.markRootSession("root");
+    rec.onRootStep("root", tokens(1, 2, 3));
+    expect(rec.onRootStep("child-1", tokens(7, 7, 7))).toBe(false); // not a root
+    await rec.onRootExecutionEnd("child-1", "c-1");
+    await rec.onRootExecutionEnd("never-seen", "c-2");
+    expect(turnRows()).toEqual([]);
+    await rec.onRootExecutionEnd("root");
+    expect(turnRows().map(r => [r.sessionID, r.turn, r.steps, r.input, r.cacheRead, r.cacheWrite])).toEqual([["root", 1, 1, 1, 2, 3]]);
+  });
+
   it("each row is on disk when onRootPrompt returns", async () => {
     const rec = recorder();
     rec.markRootSession("root");

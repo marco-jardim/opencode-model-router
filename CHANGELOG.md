@@ -47,6 +47,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **OpenCode v2: background dispatches without a deterministic check are graded.** Their grader launches from the
   orchestrator's context, never from a role child's (which denies `subagent`), and a result that could not be verified
   is tagged `UNVERIFIABLE` instead of `PASS`. Acceptance is unchanged. OpenCode v1 is unchanged.
+- **OpenCode v2: an unrecorded child session never backgrounds a dispatch.** A child the plugin never recorded (after a
+  reload, or past the 1000-entry bound) no longer counts as a root parent in the background decision (root parents
+  only): its kind comes from the role decision's session read or from the host, and a failed lookup keeps the
+  foreground value. OpenCode v1 is unchanged.
+- **OpenCode v2: background-first runs write `turns.jsonl` rows.** The end of a root session's run now closes its
+  orchestrator turn, so the kickoff and each wake-up (runs that no user prompt starts) get one row each, even while a
+  background dispatch is still open. OpenCode v1 is unchanged.
+- **Role prompts: the dispatch's `root=` wins over the host's environment block.** The work-root rule of every role
+  prompt now says that the route line's `root=` takes precedence over the directory the host's environment block
+  names, so a role no longer refuses its work root because the host named the parent's directory.
 
 ## [2.7.0] - 2026-10-10
 
