@@ -17,6 +17,8 @@
  * - P3c.3: a declared dependency edge of W outside node_modules (`file:`, tsconfig `references`) puts its repository in P as an
  *   "edge" seed (observed for I4/I8, never pinned); a link and an edge into one repository are one pinned "link" seed.
  * - A write while an extra root's dispatch snapshot is in flight discards that snapshot ("could not be observed").
+ * - P3 QA-1 m5: consumer discovery at the gate reads the dispatch's admission parents (both spellings), so a `file:` edge
+ *   spelled through a junction-spelled repoParents entry is a consumer. m4: a forward bound cutting W's declared edges is logged.
  *
  * The harness is test/integration/unattributed-writers.test.ts's: real temporary git repositories, the real plugin and gate, real
  * tree snapshots pinned (per directory here) through the `src/verify/tree` mock seam. The dispatch is made a routed role dispatch
@@ -38,6 +40,7 @@ import * as storeModule from "../../src/verify/dispatch";
 import * as pendingModule from "../../src/verify/pending";
 import * as perimeterModule from "../../src/verify/perimeter";
 import * as deterministicModule from "../../src/verify/deterministic";
+import * as loggerModule from "../../src/router/logger";
 import { samePin, type LinkPin } from "../../src/verify/pin";
 import type { DoD } from "../../src/verify/dod";
 import { PERIMETER_MAX, planPerimeter } from "../../src/verify/perimeter";
@@ -908,6 +911,51 @@ describe("declared dependency edges in P (P3c)", () => {
     expect(seam.calls.some(key => key.includes("omr-outside-"))).toBe(false);
   }, 60_000);
 
+  /** The plugin logger's warn calls (createPluginLogger spied before the plugin is built). */
+  const watchWarnings = (): unknown[][] => {
+    const warned: unknown[][] = [];
+    const realLogger = loggerModule.createPluginLogger;
+    vi.spyOn(loggerModule, "createPluginLogger").mockImplementation((...args) => {
+      const logger = realLogger(...args);
+      const warn = logger.warn.bind(logger);
+      vi.spyOn(logger, "warn").mockImplementation((...warnArgs: Parameters<typeof logger.warn>) => {
+        warned.push(warnArgs);
+        return warn(...warnArgs);
+      });
+      return logger;
+    });
+    return warned;
+  };
+  const EDGES_CUT = "[verify] dispatch perimeter: declared dependency edges were cut by a bound";
+
+  it("P3 QA-1 m4: more than 8 unadmitted edge targets → the bound cut is logged once with { id, incomplete, unadmittedMore }", async () => {
+    const warned = watchWarnings();
+    routeAsRole(location(repo, "app-a"));
+    const names = Array.from({ length: 10 }, (_, index) => `omr-outside-${index}`);
+    declare(Object.fromEntries(names.map(name => [name, `file:../../${name}`])));
+    const hooks = await edgedPlugin();
+    const out = await runTask(hooks, `Implement it.\n${SYNC_DOD}`, async () => undefined);
+    expect(out).toContain("✓ verified");
+    // The dispatch id the perimeter was planned under (edgedPlugin's planPerimeter spy).
+    const id = vi.mocked(perimeterModule.planPerimeter).mock.calls[0]?.[0];
+    expect(id).toEqual(expect.stringContaining("call1"));
+    // 10 unadmitted targets: 8 named in P, 2 cut by the bound (EDGE_UNADMITTED_NAMES_MAX); the edge reading itself was complete.
+    expect(warned.filter(args => args[0] === EDGES_CUT)).toEqual([[EDGES_CUT, { id, incomplete: false, unadmittedMore: 2 }]]);
+  }, 60_000);
+
+  it("P3 QA-1 m4: a normal dispatch (one admitted edge) logs no bound cut", async () => {
+    const warned = watchWarnings();
+    routeAsRole(location(repo, "app-a"));
+    declare({ "lib-b": "file:../lib-b" });
+    const hooks = await edgedPlugin();
+    const out = await runTask(hooks, `Implement it.\n${SYNC_DOD}`, async () => undefined);
+    expect(out).toContain("✓ verified");
+    expect(artefacts()[0]?.perimeter?.roots.map(root => root.name)).toEqual(["lib-b"]);
+    // Not vacuous: the plugin's logger is the watched one.
+    expect(vi.mocked(loggerModule.createPluginLogger)).toHaveBeenCalled();
+    expect(warned.filter(args => args[0] === EDGES_CUT)).toEqual([]);
+  }, 60_000);
+
   it("I9: no parents, no location and no working set: no perimeter, and no edge file is read", () => {
     routeAsRole(); // No grant location, and no working set.
     declare({ "lib-b": "file:../lib-b" });
@@ -1487,6 +1535,35 @@ describe("consumer discovery (§6)", () => {
     expect(seam.key(named?.[2] ?? "")).toBe(seam.key(lib));
     expect(artefacts()[1]?.perimeter?.consumers?.map(consumer => [seam.key(consumer.root), consumer.name, consumer.entry]))
       .toEqual([[seam.key(lib), "lib-b", "app-a"]]);
+  }, 90_000);
+
+  it("P3 QA-1 m5: a working-set root's file: edge into W spelled through a junction-spelled repoParents entry is a consumer at the gate", async () => {
+    // routing.repoParents names the parent through a junction (win32) / a directory symlink (posix); lib-b's edge into W is
+    // spelled through that alias, so only the dispatch's admission parents (both spellings) put its text inside a parent.
+    const alias = path.join(home, "parent-alias");
+    fs.symlinkSync(parent, alias, process.platform === "win32" ? "junction" : "dir");
+    links.push(alias);
+    const aliased = path.join(alias, "app-a").replace(/\\/g, "/");
+    fs.writeFileSync(path.join(lib, "package.json"), JSON.stringify({ name: "lib-b", dependencies: { "app-a": `file:${aliased}` } }));
+    addToWorkingSet("orch", location(lib, "lib-b"));
+    routeAsRole(location(repo, "app-a"));
+    const realPlan = perimeterModule.planPerimeter;
+    vi.spyOn(perimeterModule, "planPerimeter").mockImplementation((id, cwd) => realPlan(id, cwd, () => ({ parents: [alias], depth: 1, exclude: [] })));
+    const hooks = await makePlugin();
+    await pin(repo);
+    await pin(lib);
+    const out = await runTask(hooks, `Implement it.\n${SYNC_DOD}`, async () => {
+      fs.writeFileSync(path.join(repo, "index.ts"), "export const v = 1;\n");
+      await pin(repo);
+    });
+    expect(out).toMatch(/lib-b at \S+ links this work root \(package\.json dependencies \(file:\)\) and no check ran there/);
+    expect(out).toContain("UNVERIFIED");
+    expect(artefacts()[0]?.perimeter?.consumers?.map(consumer => [seam.key(consumer.root), consumer.name, consumer.via]))
+      .toEqual([[seam.key(lib), "lib-b", "package.json dependencies (file:)"]]);
+    // Control (what the gate did before m5): without the admission's parents the aliased edge text is not inside W's top.
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }])).toEqual(NONE);
+    expect(await perimeterModule.discoverConsumers(repo, [{ root: lib, name: "lib-b" }], { parents: [alias, parent] }))
+      .toEqual({ consumers: [{ root: lib, name: "lib-b", via: "package.json dependencies (file:)" }], incomplete: [] });
   }, 90_000);
 
   // QA-1 #2: the scan budget is per root, a root stopped on it is incomplete (the old test, "past the bound, scanning stops", read

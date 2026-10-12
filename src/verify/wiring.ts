@@ -1660,10 +1660,19 @@ export function createVerificationWiring(deps: {
     let perimeter: DispatchPerimeter | undefined;
     if (store.perimeterOf(id) === undefined) {
       try {
-        perimeter = planPerimeter(id, at, () => {
+        const plannedPerimeter = planPerimeter(id, at, () => {
           const routing = resolveRolesRouting(getConfig(), "v2");
           return { parents: routing.repoParents, depth: routing.repoDepth, exclude: routing.repoExclude };
         });
+        perimeter = plannedPerimeter;
+        // P3 QA-1 m4 (SD-P3c-4): a forward bound cut W's declared edges; logged, the cut targets are not in P.
+        if (plannedPerimeter?.edgesIncomplete === true || (plannedPerimeter?.unadmittedMore ?? 0) > 0) {
+          logger.warn("[verify] dispatch perimeter: declared dependency edges were cut by a bound", {
+            id,
+            incomplete: plannedPerimeter?.edgesIncomplete === true,
+            unadmittedMore: plannedPerimeter?.unadmittedMore ?? 0,
+          });
+        }
       } catch (err) {
         logger.warn("[verify] dispatch perimeter could not be planned", { id, error: errorText(err) });
         // QA-1 F10: fail closed. A placeholder root that is never observed: a dispatch whose producer ran an unattributable
@@ -1827,7 +1836,7 @@ export function createVerificationWiring(deps: {
    * consumers (perimeter.ts discoverConsumers: fs only, bounded, never throws).
    */
   const perimeterAtGate = async (
-    planned: { name?: string; snapshots: PerimeterSnapshots } | undefined,
+    planned: { name?: string; snapshots: PerimeterSnapshots; admission?: { readonly parents: readonly string[] } } | undefined,
     snapshot: TreeSnapshot | undefined,
     base: string,
     deadline?: Deadline,
@@ -1882,7 +1891,9 @@ export function createVerificationWiring(deps: {
       deadline?.signal.addEventListener("abort", onAbort, { once: true });
       const timer = setTimeout(onAbort, Math.max(0, ms));
       try {
-        return await discoverConsumers(wRoot, candidates, { signal: controller.signal });
+        // P3 QA-1 m5: both spellings of each parent, so an edge spelled through a junction-spelled parent is matched.
+        const parents = planned.admission?.parents;
+        return await discoverConsumers(wRoot, candidates, { signal: controller.signal, ...(parents !== undefined ? { parents } : {}) });
       } catch {
         return { consumers: [], incomplete: candidates }; // Never expected (it never throws): fail closed.
       } finally {
@@ -2882,7 +2893,8 @@ export function createVerificationWiring(deps: {
         deadline.signal.addEventListener("abort", onAbort, { once: true });
         const timer = setTimeout(onAbort, Math.max(0, ms));
         try {
-          return await discoverConsumers(frozen.observation.w.root, candidates, { signal: controller.signal });
+          const parents = frozen.admission?.parents;
+          return await discoverConsumers(frozen.observation.w.root, candidates, { signal: controller.signal, ...(parents !== undefined ? { parents } : {}) });
         } catch {
           return { consumers: [], incomplete: candidates }; // Never expected (it never throws): fail closed.
         } finally {
