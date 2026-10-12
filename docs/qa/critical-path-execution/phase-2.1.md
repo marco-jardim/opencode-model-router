@@ -743,6 +743,24 @@ Append-only, one JSON object per line, `"v": 1`. Records:
 - QA-2.1-12 (minor): `off` still adds the lease line (`protocol.ts`), child-parent user-backgrounded notice, undocumented `[router`→`(router` defang, v1 logs up to 4 notices (AGENTS.md: at most one). Fix docs or code; fold v1 notices into one.
 - QA-2.1-13 (minor): bookkeeping leaks (`heldTexts`, `adoptedSessions`, `warned`, claim files/PID reuse, decided-but-unacked records counted live, `PROCESS_CLAIMS` across reloads).
 
+### Round 2 (heavy reviewer `ses_ed00891ddffexcSo7do62ix9hv`, at `01d6f90`) — 13 findings (6 major, 6 minor, 1 nit); fixes pending
+
+Round-1 verdicts: -1, -2, -5, -7, -9, -10, -11, -12, -13 fixed; -3, -4 partially (release never wired, -14); -6 partially (-17, -18, -19); -8 partially (-15, -16, -20..-23).
+
+- QA-2.1-14 (major): `FinishApi.releaseHeld` optional and never implemented by the plugin's `finishApi` (`index.ts:3599-3729`); every `?.releaseHeld` call (`v2-hooks.ts:1551,2520,2534,2563,2696`) is a no-op; reservations count toward the 32/128 caps for 7 h. Fix: implement it, make it required, integration test through the real plugin.
+- QA-2.1-15 (major, regression): start-up compaction of a second plugin instance in the same process can drop the first instance's fsync'd records (separate journals per instance, writer marks by pid only, read→rename window; `pending.ts:1018-1075`, `index.ts:824-826`). Fix: one journal object per path per process (shared append queue), or per-instance token plus a lock across read→rename.
+- QA-2.1-16 (major): a vanished journal fails closed for the process lifetime (`known` never reset, `pending.ts:915-998`; retry never succeeds, `v2-hooks.ts:1266-1386`), refusing resumes and redacting completions until restart. Fix: recreate the file from in-memory state, then clear `reloadFailed`; correct the doc comment.
+- QA-2.1-17 (major): the gate re-run after a restart has no args/DoD/cwd/change set (`index.ts:3649,3665-3675`; `inflight` keeps only `description`) and can report "read-only delegation" for a writing child. Fix: journal prompt/DoD and cwd/work root with `inflight`/`hold` and pass them to `finish`; when missing, UNVERIFIABLE "verification data lost in restart".
+- QA-2.1-18 (major): `childEndState` treats any assistant text without error as `succeeded` (`v2-hooks.ts:2481-2497`); a child cut mid-step is gated on partial text. Fix: require a completion marker, else `lost`.
+- QA-2.1-19 (major): the live owner never claims its sessions (claims only in `adopt`, `index.ts:3614-3620`); with adoption from events another instance/process can adopt and post or wake for a running child. Fix: claim at the first `inflight`/`hold` record with a per-instance token; refuse adoption held by another live (pid, token).
+- QA-2.1-20 (minor): the reload-failed resume refusal covers `subagent` only (`v2-hooks.ts:2226`), not Code Mode `execute`. Fix: same check as `held.refusal`.
+- QA-2.1-21 (minor): `dispose`/settled miss `void processor.process` (`v2-hooks.ts:2916`) and `void finishDispatch` (`index.ts:3712`). Fix: track both.
+- QA-2.1-22 (minor): compaction disabled forever by a stale writer mark (pid reuse; marks never removed), `compactionError` never logged, temp file left on failed rename, full child text in `hold-text`/`posting`. Fix: token+age marks, remove own mark at dispose, log, clean temp.
+- QA-2.1-23 (minor): the mkdirSync workaround is still in `index.ts:3584-3586`. Fix: remove.
+- QA-2.1-24 (minor): a failed hold append drops an early or concurrent verdict (`background.ts:835-838,893-897`) while the ack says the verdict follows. Fix: post pending/queued verdicts as a plain notice when the hold fails.
+- QA-2.1-25 (minor): a failed kind lookup answers `unknown` (root semantics, no lease) for 30 s (`v2-hooks.ts:1216-1234`). Fix: short TTL or retry on write.
+- QA-2.1-26 (nit): `V2_BACKGROUND_SETTLED` uses global `Symbol.for` on the production cleanup; the test host points `outcomes.path` at the journal dir, hiding a fallback regression. Fix: module-private `Symbol()`; separate outcomes dir in the helper.
+
 ## Fixes
 ## Deferred findings
 
