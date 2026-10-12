@@ -604,6 +604,19 @@ After QA rounds 1 and 2 (facts checked at HEAD effcdb3):
   - The `branch-switched` early return of the deferred finish leaves the perimeter snapshots running until their own timeouts.
   - The `cross-repo` reason and its details are internal: nothing shows them to the orchestrator.
   - S11 covers W's direct link targets only. Nested link targets, ignored files (`dist/`) and skip-worktree/assume-unchanged edits in a linked repository are not re-observed.
+- **Known follow-ups (P2e QA round 2, minor), accepted for now:**
+  - A link the producer created during the dispatch (`file:`/`npm link`), or one added after return, is reported at `router_verify` as "changed since the producer returned" (final), where the synchronous gate passes. Registry installs and package-store links are not affected.
+  - A link whose `at` is missing, or now resolves outside its frozen root, is "unobserved" and therefore retryable ("not judged" until the TTL); each retry runs the whole DoD first. Placements treat ENOENT as final drift.
+  - A temporary read error on W's `node_modules` (EBUSY/EPERM) makes every frozen link "changed" (final) instead of retryable.
+  - With config `testScope: "full"` on OpenCode v2, every deferred dispatch gets at least medium risk with the reason "the full suite runs (scope=full)", even when the scope comes from config. A foreign check without `scope=full` also gets that reason although the gate refuses it.
+  - The "new link" check counts links into any observed root (working-set roots included) as covered, so a link added after return into a working-set root is not flagged.
+  - User docs and D18 still say an unobservable link makes a pass UNVERIFIED; the code now leaves the handle open ("not judged", retryable). The message `could not be checked since the producer returned (<code>); nothing ran` is undocumented.
+  - The new-link check calls `gitTopOf` without a ceiling: an outer repository (e.g. a dotfiles repo in the home folder) can hide a new link, and a mapped drive whose realpath is UNC makes blocking network calls.
+  - I12 can still be bypassed if `<link.at>/.git` is removed after return: the hardened snapshot sets no `GIT_CEILING_DIRECTORIES`. The checks after the snapshot keep the verdict correct.
+  - A capped working-set root that is also W's link target is deduplicated and never sets `linkUnobserved`, so it defers and S11 does not re-check it (needs 16 other working-set roots).
+  - When perimeter planning fails, the dispatch still defers, and every outside link is later reported as "changed".
+  - The missing-directory placement message holds only if the directory is still missing at `router_verify`.
+  - `linkedTargets` runs once per entry per `router_verify` call, not shared.
 - **Consumers** are discovered only in the working set, and only through `node_modules` links. Python editable installs, Go `replace`, Cargo path dependencies, and `../` or alias imports are not discovered (Q2).
 - **A consumer check's failures** are unverifiable, never "fail". The dependency is the changed repository, so the reference can neither excuse nor prove them.
 - **`router_run` scripts** remain trusted repository content (`run-tools.ts:11-13`).
