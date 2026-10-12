@@ -3,17 +3,25 @@
  * `router_git_*` `root` against the read set and admission. Every dependency is a fake: no git, no real filesystem.
  */
 import { describe, expect, it, vi } from "vitest";
-import type { Admission, AdmissionLookup, RepoLocation, WorktreeEntry } from "../../src/routing/roles/admission";
+import { LOOKUP_MAX_DIRS, type Admission, type AdmissionFindOptions, type AdmissionLookup, type RepoLocation, type WorktreeEntry } from "../../src/routing/roles/admission";
 import {
+  GIT_ROOT_OUTSIDE_PLACEHOLDER,
   GIT_ROOT_TEXT_HINT,
+  gitRootBounded,
+  gitRootStopReason,
   resolveGitRoot,
   type GitRootContext,
   type GitRootDeps,
+  type GitRootResolution,
 } from "../../src/routing/roles/git-root";
 import { displaySafe } from "../../src/routing/roles/read-set";
 
 const W = "D:\\git\\app";
 const P = "D:\\repos";
+/** QA round 1 (F1): a parent that is a link (a subst drive, a junction or a symlink) and its canonical form. */
+const LP = "S:\\repos";
+const LP_REAL = "D:\\real\\repos";
+const PARENT_TEXTS: readonly string[] = [P, LP];
 const WS = "E:\\elsewhere\\lib-wt";
 const CTX: GitRootContext = { workRoot: W, parents: [P], workingSet: [WS] };
 const KNOWN = [W, "D:\\repos\\session"];
@@ -39,7 +47,7 @@ interface Fake {
   tops?: Record<string, string | undefined>;
   readSet?: (real: string) => boolean;
   admit?: (root: string, known?: readonly string[]) => Promise<Admission>;
-  find?: (name: string) => Promise<AdmissionLookup>;
+  find?: (name: string, opts?: AdmissionFindOptions) => Promise<AdmissionLookup>;
   signal?: AbortSignal;
   deadlineAt?: number;
 }
@@ -63,7 +71,7 @@ function harness(fake: Fake = {}) {
   const admit = vi.fn<(root: string, known?: readonly string[]) => Promise<Admission>>(
     fake.admit ?? (async (root: string): Promise<Admission> => ({ ok: true, location: loc(links[root] ?? root) })),
   );
-  const find = vi.fn<(name: string) => Promise<AdmissionLookup>>(
+  const find = vi.fn<(name: string, opts?: AdmissionFindOptions) => Promise<AdmissionLookup>>(
     fake.find ?? (async (): Promise<AdmissionLookup> => ({ found: [], refused: [], searched: [], capped: false })),
   );
   const deps: GitRootDeps = {
@@ -77,9 +85,11 @@ function harness(fake: Fake = {}) {
     ...(fake.signal === undefined ? {} : { signal: fake.signal }),
     ...(fake.deadlineAt === undefined ? {} : { deadlineAt: fake.deadlineAt }),
   };
+  // QA round 1 (F1): the configured parents are trusted and may be resolved at the text gate; the value never is.
+  const valueRealpaths = (): number => realpath.mock.calls.filter(([path]) => !PARENT_TEXTS.includes(path)).length;
   const calls = (): number =>
-    realpath.mock.calls.length + isDirectory.mock.calls.length + nearestCheckout.mock.calls.length + inReadSet.mock.calls.length + admit.mock.calls.length + find.mock.calls.length;
-  return { deps, realpath, isDirectory, nearestCheckout, inReadSet, admit, find, calls };
+    valueRealpaths() + isDirectory.mock.calls.length + nearestCheckout.mock.calls.length + inReadSet.mock.calls.length + admit.mock.calls.length + find.mock.calls.length;
+  return { deps, realpath, isDirectory, nearestCheckout, inReadSet, admit, find, calls, valueRealpaths };
 }
 
 describe("resolveGitRoot — text checks (step 2), no dependency call", () => {
@@ -326,7 +336,7 @@ describe("resolveGitRoot — names (step 8)", () => {
       ok: false,
       reason: "root=nope matches no repository below routing.repoParents (searched D:\\repos\\nope, D:\\repos\\*\\nope); nothing ran",
     });
-    expect(h.find).toHaveBeenCalledWith("nope");
+    expect(h.find).toHaveBeenCalledWith("nope", { eligible: expect.any(Function) });
     expect(h.realpath).not.toHaveBeenCalled();
     expect(h.admit).not.toHaveBeenCalled();
   });
@@ -379,7 +389,7 @@ describe("resolveGitRoot — names (step 8)", () => {
     const h = harness({ find: async () => lookup([loc("D:\\repos\\lib", { worktrees: [wt("D:/repos/lib", "main"), wt("D:/repos/lib-bare", null, { bare: true })] })]) });
     const result = await resolveGitRoot("LIB", CTX, h.deps);
     expect(result.ok && !result.inWorkRoot ? result.provenance : result).toBe("[router: read from lib (main) at D:\\repos\\lib — read-only in this dispatch]");
-    expect(h.find).toHaveBeenCalledWith("LIB");
+    expect(h.find).toHaveBeenCalledWith("LIB", { eligible: expect.any(Function) });
     expect(h.realpath).toHaveBeenCalledWith("D:\\repos\\lib");
     expect(h.inReadSet).toHaveBeenCalledWith("D:\\repos\\lib");
     expect(h.admit).toHaveBeenCalledWith("D:\\repos\\lib", [...KNOWN, "D:\\repos\\lib"]);
@@ -444,5 +454,186 @@ describe("resolveGitRoot — deadline and abort (step 9)", () => {
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("is outside this dispatch's read set");
     expect(h.calls()).toBe(0);
+  });
+
+  it("gitRootBounded stops a hanging call at the deadline or on abort and fails closed; gitRootStopReason is step 9's text (QA F5)", async () => {
+    const hang = (): Promise<never> => new Promise<never>(() => undefined);
+    expect(await gitRootBounded(hang, { deadlineAt: Date.now() + 20 })).toEqual({ stop: "timed out" });
+    expect(await gitRootBounded(hang, { deadlineAt: Date.now() - 1 })).toEqual({ stop: "timed out" });
+    const controller = new AbortController();
+    const pending = gitRootBounded(hang, { signal: controller.signal });
+    setTimeout(() => controller.abort(), 5);
+    expect(await pending).toEqual({ stop: "aborted" });
+    expect(await gitRootBounded(async () => { throw new Error("boom"); }, {})).toEqual({ stop: "failed" });
+    expect(await gitRootBounded(() => { throw new Error("sync boom"); }, {})).toEqual({ stop: "failed" });
+    expect(await gitRootBounded(async () => 7, {})).toEqual({ value: 7 });
+    expect(gitRootStopReason("lib", "timed out")).toBe("root=lib: resolving the repository timed out; nothing ran");
+    expect(gitRootStopReason("lib", "aborted")).toBe("root=lib: resolving the repository was aborted; nothing ran");
+    expect(gitRootStopReason("lib", "failed")).toBe("root=lib: resolving the repository failed; nothing ran");
+  });
+});
+
+describe("resolveGitRoot — QA round 1 (Phase 3 lot 1)", () => {
+  /** The parent configured as a link `LP` whose canonical form is `LP_REAL` (no working set). */
+  const LCTX: GitRootContext = { workRoot: W, parents: [LP], workingSet: [] };
+  const linkFake = (extra: Fake = {}): Fake => ({
+    dirs: [W, `${LP_REAL}\\lib`, `${LP_REAL}\\team\\lib`],
+    links: { [LP]: LP_REAL, [`${LP}\\lib`]: `${LP_REAL}\\lib`, [`${LP}\\team\\lib`]: `${LP_REAL}\\team\\lib` },
+    readSet: (real) => real.toLowerCase().startsWith(`${LP_REAL.toLowerCase()}\\`),
+    // Admission's rule 1 knows the parent as configured only; the location it admits is canonical.
+    admit: async (root) => root.toLowerCase().startsWith(`${LP.toLowerCase()}\\`)
+      ? { ok: true, location: loc(`${LP_REAL}${root.slice(LP.length)}`) }
+      : { ok: false, reason: `root=${root} is not below routing.repoParents (${LP}) and is not a worktree of a repository in this session: no work root.` },
+    ...extra,
+  });
+  const success = (worktree: string): GitRootResolution => ({
+    ok: true,
+    inWorkRoot: false,
+    root: worktree,
+    repository: worktree,
+    name: "lib",
+    branch: "main",
+    workRoot: W,
+    provenance: `[router: read from lib (main) at ${worktree} — read-only in this dispatch]`,
+  });
+
+  it("F1: a path below a link parent's canonical form passes the text gate and is admitted in the parent's configured form", async () => {
+    const h = harness(linkFake());
+    expect(await resolveGitRoot(`${LP_REAL}\\lib`, LCTX, h.deps)).toEqual(success(`${LP_REAL}\\lib`));
+    expect(h.admit).toHaveBeenCalledWith(`${LP}\\lib`, KNOWN);
+    // The parent is resolved at the text gate; the value only at step 4, after it.
+    // (W is resolved at step 4 as before, for the canonical work-root check.)
+    expect(h.realpath.mock.calls.map(([path]) => path)).toEqual([LP, `${LP_REAL}\\lib`, W]);
+  });
+
+  it("F1: the path through the link as configured is admitted as before, without resolving the parent", async () => {
+    const h = harness(linkFake());
+    expect(await resolveGitRoot(`${LP}\\lib`, LCTX, h.deps)).toEqual(success(`${LP_REAL}\\lib`));
+    expect(h.admit).toHaveBeenCalledWith(`${LP}\\lib`, KNOWN);
+    expect(h.realpath).not.toHaveBeenCalledWith(LP);
+  });
+
+  it("F1: a bare name found below a link parent resolves, and the provenance path passed back resolves to the same", async () => {
+    const h = harness(linkFake({ find: async () => ({ found: [loc(`${LP_REAL}\\lib`)], refused: [], searched: [`${LP}\\lib`], capped: false }) }));
+    const byName = await resolveGitRoot("lib", LCTX, h.deps);
+    expect(byName).toEqual(success(`${LP_REAL}\\lib`));
+    expect(h.admit).toHaveBeenCalledWith(`${LP}\\lib`, [...KNOWN, `${LP_REAL}\\lib`]);
+    const back = harness(linkFake());
+    expect(await resolveGitRoot(byName.ok && !byName.inWorkRoot ? byName.root : "", LCTX, back.deps)).toEqual(byName);
+  });
+
+  it("F1: the paths a multi-match refusal lists below a link parent are accepted when passed back", async () => {
+    const both = [loc(`${LP_REAL}\\lib`), loc(`${LP_REAL}\\team\\lib`)];
+    const h = harness(linkFake({ find: async () => ({ found: both, refused: [], searched: [], capped: false }) }));
+    expect(await resolveGitRoot("lib", LCTX, h.deps)).toEqual({
+      ok: false,
+      reason: `root=lib matches 2 repositories: ${LP_REAL}\\lib, ${LP_REAL}\\team\\lib; nothing ran. Pass root as one of these absolute paths`,
+    });
+    for (const location of both) {
+      const again = harness(linkFake());
+      expect(await resolveGitRoot(location.worktree, LCTX, again.deps)).toEqual(success(location.worktree));
+    }
+  });
+
+  it("F1: the canonical parent itself and a path below neither form are refused at the text gate, the value never resolved", async () => {
+    for (const value of [LP_REAL, "D:\\real\\other\\lib"]) {
+      const h = harness(linkFake());
+      expect(await resolveGitRoot(value, LCTX, h.deps)).toEqual({
+        ok: false,
+        reason: `root=${value} is outside this dispatch's read set (the work root, the session's repositories and the repositories below ${LP}); nothing ran`,
+      });
+      expect(h.calls()).toBe(0);
+      expect(h.realpath.mock.calls).toEqual([[LP]]);
+    }
+  });
+
+  it("F1: a parent that does not resolve is tolerated (its text form only)", async () => {
+    const h = harness(linkFake());
+    const ctx: GitRootContext = { ...LCTX, parents: ["Q:\\gone", LP] };
+    expect(await resolveGitRoot(`${LP_REAL}\\lib`, ctx, h.deps)).toEqual(success(`${LP_REAL}\\lib`));
+    expect(h.realpath).toHaveBeenCalledWith("Q:\\gone");
+  });
+
+  it("F4: find gets an eligible predicate: the text gate first (no resolution), then R on the canonical path", async () => {
+    let eligible: ((candidate: string) => boolean) | undefined;
+    const h = harness({
+      links: { "D:\\repos\\junction-out": "C:\\outside\\repo" },
+      find: async (_name, opts) => {
+        eligible = opts?.eligible;
+        return { found: [], refused: [], searched: [], capped: false };
+      },
+    });
+    await resolveGitRoot("lib", CTX, h.deps);
+    expect(eligible).toBeTypeOf("function");
+    const check = eligible!;
+    expect(check("D:\\repos\\lib")).toBe(true);
+    expect(h.inReadSet).toHaveBeenLastCalledWith("D:\\repos\\lib");
+    // Below a parent by its text, outside R once resolved: git never runs on it.
+    expect(check("D:\\repos\\junction-out")).toBe(false);
+    expect(h.inReadSet).toHaveBeenLastCalledWith("C:\\outside\\repo");
+    // Outside the parents by its text: refused without resolving it.
+    expect(check("C:\\elsewhere\\lib")).toBe(false);
+    expect(h.realpath).not.toHaveBeenCalledWith("C:\\elsewhere\\lib");
+    // A candidate that does not resolve throws; admission counts a throw as not eligible.
+    expect(() => check("D:\\repos\\missing")).toThrow();
+    // The work root stays eligible (step 3 answers it as the work root).
+    expect(check(W)).toBe(true);
+  });
+
+  it("F6: absolute paths outside the read set in an admission reason are redacted; paths in it are kept", async () => {
+    const outside = harness({ admit: async () => ({ ok: false, reason: "root=D:\\repos\\lib is not listed by git worktree list of C:\\secret\\repo: no work root." }) });
+    expect(await resolveGitRoot("D:\\repos\\lib", CTX, outside.deps)).toEqual({
+      ok: false,
+      reason: `root=D:\\repos\\lib is not listed by git worktree list of ${GIT_ROOT_OUTSIDE_PLACEHOLDER}; nothing ran.`,
+    });
+    const spaces = harness({
+      admit: async () => ({
+        ok: false,
+        reason: "root=D:\\repos\\lib is listed by git worktree list of C:\\secret dir\\repo, but it leads through a link to C:/other place/x, which belongs to another repository (git rev-parse --git-common-dir differs): no work root.",
+      }),
+    });
+    expect(await resolveGitRoot("D:\\repos\\lib", CTX, spaces.deps)).toEqual({
+      ok: false,
+      reason: `root=D:\\repos\\lib is listed by git worktree list of ${GIT_ROOT_OUTSIDE_PLACEHOLDER}, but it leads through a link to ${GIT_ROOT_OUTSIDE_PLACEHOLDER}, which belongs to another repository (git rev-parse --git-common-dir differs); nothing ran.`,
+    });
+    const inside = harness({ admit: async () => ({ ok: false, reason: "root=D:\\repos\\lib is no longer a worktree of D:\\repos\\main: no work root." }) });
+    expect(await resolveGitRoot("D:\\repos\\lib", CTX, inside.deps)).toEqual({
+      ok: false,
+      reason: "root=D:\\repos\\lib is no longer a worktree of D:\\repos\\main; nothing ran.",
+    });
+    // The work root and the working set are kept whatever R answers.
+    const own = harness({
+      readSet: (real) => real === WS,
+      admit: async () => ({ ok: false, reason: `root=${WS} is not listed by git worktree list of ${W}: no work root.` }),
+    });
+    expect(await resolveGitRoot(WS, CTX, own.deps)).toEqual({ ok: false, reason: `root=${WS} is not listed by git worktree list of ${W}; nothing ran.` });
+  });
+
+  it("N1: only the echoed value is display-safe, the admission sentence is not quoted; control characters are replaced", async () => {
+    const value = "D:\\repos\\li[b]";
+    const h = harness({ dirs: [W, value], admit: async () => ({ ok: false, reason: `root=${value} is not the top level of a git repository: no work root.` }) });
+    expect(await resolveGitRoot(value, CTX, h.deps)).toEqual({
+      ok: false,
+      reason: `root=${displaySafe(value)} is not the top level of a git repository; nothing ran.`,
+    });
+    const control = harness({ admit: async () => ({ ok: false, reason: "root=D:\\repos\\lib is not listed by git worktree list of D:\\repos\\ma\nin\u202e: no work root." }) });
+    expect(await resolveGitRoot("D:\\repos\\lib", CTX, control.deps)).toEqual({
+      ok: false,
+      reason: "root=D:\\repos\\lib is not listed by git worktree list of D:\\repos\\ma?in?; nothing ran.",
+    });
+  });
+
+  it("N2: a capped lookup that found nothing says so, with the route line's wording", async () => {
+    const h = harness({ find: async () => ({ found: [], refused: ["root=D:\\repos\\nope is not a directory: no work root."], searched: ["D:\\repos\\nope"], capped: true }) });
+    expect(await resolveGitRoot("nope", CTX, h.deps)).toEqual({
+      ok: false,
+      reason: `root=nope matches no repository below routing.repoParents (searched D:\\repos\\nope); nothing ran. The search stopped after ${String(LOOKUP_MAX_DIRS)} directories`,
+    });
+  });
+
+  it("N2: a single match of a capped lookup is kept, as repo= keeps it", async () => {
+    const h = harness({ find: async () => ({ found: [loc("D:\\repos\\lib")], refused: [], searched: ["D:\\repos\\lib"], capped: true }) });
+    const result = await resolveGitRoot("lib", CTX, h.deps);
+    expect(result.ok && !result.inWorkRoot ? result.root : result).toBe("D:\\repos\\lib");
   });
 });

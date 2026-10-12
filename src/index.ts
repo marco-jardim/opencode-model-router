@@ -661,12 +661,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     }
     const routing = resolveRolesRouting(cfg, "v2");
     if (routing.repoParents.length === 0) return { ok: false, reason: gitRoot.GIT_ROOT_NO_PARENTS };
-    let orchestrator: string | undefined;
-    try {
-      orchestrator = await orchestratorOf(sessionID);
-    } catch {
-      orchestrator = undefined; // no working set: R narrows to the parents (fail closed)
-    }
+    // QA round 1 (Phase 3 lot 1, F5): the session lookup is bounded by the call's deadline and signal (SD-3b-8).
+    const asked = await gitRoot.gitRootBounded(() => orchestratorOf(sessionID), { ...(signal === undefined ? {} : { signal }), deadlineAt });
+    if ("stop" in asked && asked.stop !== "failed") return { ok: false, reason: gitRoot.gitRootStopReason(value, asked.stop) };
+    // A failed lookup: no working set, R narrows to the parents (fail closed).
+    const orchestrator = "value" in asked ? asked.value : undefined;
     const workingSet = (orchestrator === undefined ? [] : workingSetOf(orchestrator)).map((location) => location.worktree);
     const member = readSetMemberOf(orchestrator);
     const admissionConfig = { parents: routing.repoParents, depth: routing.repoDepth, exclude: routing.repoExclude };
@@ -679,7 +678,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       // Created on first use only: a text refusal never loads admission.
       admission: {
         admit: async (root, knownRepositories) => (await gitRootAdmissionFor(admissionConfig)).admit(root, knownRepositories),
-        find: async (name) => (await gitRootAdmissionFor(admissionConfig)).find(name),
+        // QA round 1 (Phase 3 lot 1, F4): the resolver's `eligible` (the text gate and R) reaches the lookup.
+        find: async (name, opts) => (await gitRootAdmissionFor(admissionConfig)).find(name, opts),
       },
       known,
       platform: process.platform,

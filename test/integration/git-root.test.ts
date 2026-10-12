@@ -213,6 +213,44 @@ describe("router_git root through junctions and worktrees (3b.5)", () => {
     expect(git(main, "--no-optional-locks", "status", "--porcelain")).toBe("");
   });
 
+  it("a routing.repoParents entry that is a link: a bare name, the provenance path and the multi-match hint paths are accepted (QA F1)", async () => {
+    const work = gitRepo(temp("omr-3b5-work-"));
+    const realParent = temp("omr-3b5-realparent-");
+    gitRepo(join(realParent, "lib-b"));
+    gitRepo(join(realParent, "lib"), "init lib top");
+    gitRepo(join(realParent, "team", "lib"), "init lib team");
+    const linkParent = link(realParent, join(temp("omr-3b5-linkhost-"), "P"));
+    const { dir } = home({ routing: { delegation: "roles", repoParents: [linkParent], repoDepth: 2 } });
+    const hooks = await plugin(dir);
+    await bindExact(hooks, dir, work);
+
+    // A bare name: found below the link, admitted (provenance at the canonical path).
+    const byName = await call(hooks, "router_git_status", { root: "lib-b" });
+    expect(byName).not.toContain("[router_git] error");
+    const line = provenanceOf(byName);
+    expect(line).toMatchObject({ name: "lib-b", branch: "main" });
+    expect(samePath(line!.worktree, join(realParent, "lib-b"))).toBe(true);
+    // The provenance path passed back, and the path through the link as configured: the same repository.
+    expect(provenanceOf(await call(hooks, "router_git_log", { root: line!.worktree, limit: 1 }))).toEqual(line);
+    expect(provenanceOf(await call(hooks, "router_git_status", { root: join(linkParent, "lib-b") }))).toEqual(line);
+
+    // Two repositories named lib: the hint lists paths that are accepted when passed back.
+    const ambiguous = await call(hooks, "router_git_status", { root: "lib" });
+    const hint = /^\[router_git\] error: refused: root=lib matches 2 repositories: (.+); nothing ran\. Pass root as one of these absolute paths$/.exec(ambiguous);
+    expect(hint, ambiguous).not.toBeNull();
+    const listed = hint![1]!.split(", ");
+    expect(listed).toHaveLength(2);
+    const messages: string[] = [];
+    for (const path of listed) {
+      const log = await call(hooks, "router_git_log", { root: path, limit: 1 });
+      expect(log, path).not.toContain("[router_git] error");
+      expect(samePath(provenanceOf(log)!.worktree, path)).toBe(true);
+      messages.push(log);
+    }
+    expect(messages.some((log) => log.includes("init lib top"))).toBe(true);
+    expect(messages.some((log) => log.includes("init lib team"))).toBe(true);
+  });
+
   it("status, diff and log with root leave the target repository's .git/index and its status unchanged", async () => {
     const { work, parent, repo } = fixture();
     writeFileSync(join(repo, "c.ts"), "y\n");

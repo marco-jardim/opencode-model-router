@@ -988,6 +988,67 @@ describe("router_git root (cross-repo P3b)", () => {
     await hooks["tool.execute.after"]({ tool: "router_git_status", sessionID: CHILD, agent: "explorer", callID: "g-after", args: { root: repo } }, output);
     expect(output.output.split("[router: read from").length - 1).toBe(1);
   });
+
+  /** The git commands of the tools themselves among the spawns since the last reset (admission's probes are rev-parse and worktree). */
+  const TOOL_COMMANDS = new Set(["status", "log", "diff", "show", "blame", "ls-files"]);
+  const toolCommands = (): string[] => gitSpawns()
+    .flatMap((args) => (Array.isArray(args[1]) ? (args[1] as unknown[]).map(String) : []).filter((arg) => TOOL_COMMANDS.has(arg)));
+
+  it("name refusals spawn no git command of the tool: no match (nothing at all), several repositories, several worktrees (QA N6)", async () => {
+    const { work, parent } = await fixture();
+    await gitRepo(join(parent, "lib"));
+    await gitRepo(join(parent, "team", "lib"));
+    const multi = await gitRepo(join(parent, "lib-w"));
+    const { execFileSync } = await import("node:child_process");
+    execFileSync("git", ["worktree", "add", "-q", "-b", "feat", join(parent, "lib-w-feat")], { cwd: multi, stdio: "ignore" });
+    const { dir } = home({ routing: { delegation: "roles", repoParents: [parent], repoDepth: 2 } }, ENF0);
+    const { hooks } = await plugin(dir);
+    await bindExact(hooks, dir, work);
+
+    resetSpawns();
+    expect(await call(hooks, "router_git_status", { root: "nope" }))
+      .toMatch(/^\[router_git\] error: refused: root=nope matches no repository below routing\.repoParents \(searched .+\); nothing ran$/);
+    expect(gitSpawns()).toEqual([]);
+
+    resetSpawns();
+    expect(await call(hooks, "router_git_log", { root: "lib", limit: 1 }))
+      .toMatch(/^\[router_git\] error: refused: root=lib matches 2 repositories: .+; nothing ran\. Pass root as one of these absolute paths$/);
+    expect(await call(hooks, "router_git_status", { root: "lib-w" }))
+      .toMatch(/^\[router_git\] error: refused: root=lib-w has 2 worktrees: .+; nothing ran\. Pass root as one of these absolute paths$/);
+    // The lookup's read-only probes may run; no git command of the tool does.
+    expect(toolCommands()).toEqual([]);
+
+    // The filter is not vacuous: an admitted name runs the tool's command.
+    resetSpawns();
+    expect(provenanceOf(await call(hooks, "router_git_status", { root: "lib-b" }))).toMatchObject({ name: "lib-b", branch: "main" });
+    expect(toolCommands()).toContain("status");
+  });
+
+  it("the orchestrator lookup is bounded by the call's signal: a hanging session lookup ends in the aborted refusal (QA F5)", async () => {
+    const { work, parent, repo } = await fixture();
+    const { dir } = home({ routing: { delegation: "roles", repoParents: [parent] } }, ENF0);
+    let hang = false;
+    const hooks = await ModelRouterPlugin({
+      directory: dir, worktree: dir, routerHost: "v2",
+      client: {
+        session: {
+          get: async ({ path }: { path: { id: string } }) => hang
+            ? new Promise<never>(() => undefined)
+            : { data: { id: path.id, ...(path.id === "root" ? {} : { parentID: "root" }) } },
+        },
+        app: { log: vi.fn(async () => ({})) },
+      },
+    } as unknown as RouterPluginInput) as Record<string, any>;
+    cleanups.push(async () => { await hooks.dispose?.(); });
+    await bindExact(hooks, dir, work);
+    hang = true;
+    resetSpawns();
+    const controller = new AbortController();
+    const pending = toolsOf(hooks).router_git_status!.execute({ root: repo }, { ...toolCtx(CHILD), abort: controller.signal });
+    setTimeout(() => controller.abort(), 20);
+    expect(await pending).toBe(`[router_git] error: refused: root=${repo}: resolving the repository was aborted; nothing ran`);
+    expect(gitSpawns()).toEqual([]);
+  });
 });
 
 describe("adapter helpers", () => {

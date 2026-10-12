@@ -8,24 +8,29 @@
  *
  * 2. Text checks, no call: surrounding whitespace, more than {@link GIT_ROOT_MAX_LENGTH} characters, `rootTextProblem` (a path)
  *    or `repoNameProblem` (a name), any `.git` segment.
- * 3. Text gate, no call: equal to W → `{ ok: true, inWorkRoot: true }`; inside W → a `path=` hint; below a parent or equal to a
- *    working-set worktree → continue; anything else is outside the read set. A junction from outside the parents into R is
- *    therefore refused without resolving it (SD-3b-3).
+ * 3. Text gate, no call on the value: equal to W → `{ ok: true, inWorkRoot: true }`; inside W → a `path=` hint; below a parent
+ *    as configured, below a parent's canonical form (QA round 1 F1: a parent that is a junction, symlink or subst drive; the
+ *    parents are trusted configuration, resolved once per call) or equal to a working-set worktree → continue; anything else is
+ *    outside the read set. A junction from outside the parents into R is therefore refused without resolving it (SD-3b-3).
  * 4. `realpath` and a directory; the canonical path is re-checked against W.
  * 5. The canonical path must be in the read set R (filesystem only, no git: SD-3b-2).
  * 6. It must be the top level of its checkout (`nearestCheckout`), else a `root=<top> path=<rel>` hint.
- * 7. Admission (`admit`, with `known`); its reason keeps its text with `: no work root.` → `; nothing ran.` (SD-3b-9). The admitted
- *    worktree must be the canonical path (F6: the git cwd is admission's `location.worktree`, never R's main worktree).
- * 8. A name goes through `admission.find(name)` first: no match, several repositories or several worktrees are refused; the one
- *    worktree then goes through steps 3–7.
+ * 7. Admission (`admit`, with `known`; a path below a parent's canonical form is passed in the parent's configured form, the one
+ *    admission's rule 1 knows); its reason keeps its text with `: no work root.` → `; nothing ran.` (SD-3b-9), control characters
+ *    replaced, the leading value display-safe (N1) and every absolute path outside the read set replaced by
+ *    {@link GIT_ROOT_OUTSIDE_PLACEHOLDER} (F6). The admitted worktree must be the canonical path (F6 of 3b: the git cwd is
+ *    admission's `location.worktree`, never R's main worktree).
+ * 8. A name goes through `admission.find(name, { eligible })` first (F4: `eligible` is the text gate and R, so git never runs on a
+ *    candidate outside R): no match (with the cap note when the lookup was capped, N2), several repositories or several worktrees
+ *    are refused; the one worktree then goes through steps 3–7. A single match in a capped lookup is kept, as `repo=` does.
  * 9. The deadline and the abort signal are checked before the filesystem steps and bound every admission call.
  *
  * Refusal reasons start at `root=<v> …`; the tool adds `[router_git] error: refused: ` (3b.3). Echoed values go through
- * `displaySafe`. On success the provenance line has the format of the read-provenance line (`index.ts`), built here so that
+ * `displaySafe`; an admission sentence (step 7) goes through {@link sanitiseReason} instead, its leading value through `displaySafe`. On success the provenance line has the format of the read-provenance line (`index.ts`), built here so that
  * `git-tools.ts` never imports `read-set.ts` (SD-3b-7). Nothing in `src/router/git-tools.ts` may import this module.
  */
 import { normalizeRootText } from "../wire/dispatch";
-import { repoNameProblem, rootTextProblem, type Admission, type AdmissionService, type RepoLocation, type WorktreeEntry } from "./admission";
+import { LOOKUP_MAX_DIRS, repoNameProblem, rootTextProblem, type Admission, type AdmissionService, type RepoLocation, type WorktreeEntry } from "./admission";
 import { displaySafe, gitMetadataSegment } from "./read-set";
 
 /** Step 2: the longest `root` accepted, in UTF-16 code units. */
@@ -74,6 +79,12 @@ export const GIT_ROOT_TIMED_OUT = "resolving the repository timed out; nothing r
 export const GIT_ROOT_ABORTED = "resolving the repository was aborted; nothing ran";
 /** An admission call that rejected (it never should): fail closed. */
 export const GIT_ROOT_FAILED = "resolving the repository failed; nothing ran";
+/** Step 7 (QA round 1, F6): replaces an absolute path in an admission reason that is not in the read set. */
+export const GIT_ROOT_OUTSIDE_PLACEHOLDER = "<outside the read set>";
+/** Step 8 (QA round 1, N2): appended when the name lookup visited its maximum of directories (the route-line wording). */
+export function gitRootCappedNote(maxDirs: number): string {
+  return `The search stopped after ${String(maxDirs)} directories`;
+}
 /** Success: the read-provenance line's fixed parts. */
 export const GIT_ROOT_PROVENANCE_PREFIX = "[router: read from ";
 export const GIT_ROOT_PROVENANCE_SUFFIX = " — read-only in this dispatch]";
@@ -160,6 +171,16 @@ export function mapAdmissionReason(reason: string): string {
   return `${reason.trimEnd().replace(/\.$/, "")}${GIT_ROOT_NOTHING_RAN}`;
 }
 
+/**
+ * QA round 1 (N1): admission's reasons are router-authored sentences that echo raw values; quoting the whole sentence would wrap
+ * it in `"…"` for one `[` in a path. Only the characters `displaySafe` treats as unsafe apart from `[` and `]` (control and format
+ * characters, newlines and line separators included, unassigned, private-use and surrogate code points) are replaced, by `?`, so
+ * the refusal stays one plain line.
+ */
+export function sanitiseReason(reason: string): string {
+  return reason.replace(/[\p{Cc}\p{Cf}\p{Cn}\p{Co}\p{Cs}\u2028\u2029]/gu, "?");
+}
+
 /** A value with no path separator and no drive is a name. */
 function isName(value: string): boolean {
   return !/[\\/]/.test(value) && !/^[A-Za-z]:/.test(value);
@@ -173,7 +194,48 @@ function textProblem(value: string, platform: NodeJS.Platform): string | undefin
   return rootTextProblem(value, platform) ?? (value.split(/[\\/]/).some(gitMetadataSegment) ? GIT_ROOT_GIT_SEGMENT : undefined);
 }
 
-type Stop = "timed out" | "aborted" | "failed";
+/** Why step 9 stopped. */
+export type GitRootStop = "timed out" | "aborted" | "failed";
+type Stop = GitRootStop;
+
+/** Step 9's refusal for `value` (shown as step 2 shows it). Also the caller's, for its own bounded calls (`index.ts`, QA F5). */
+export function gitRootStopReason(value: string, stop: GitRootStop): string {
+  const shown = value.length > GIT_ROOT_MAX_LENGTH ? `${displaySafe(value.slice(0, 80))}…` : displaySafe(value);
+  return `root=${shown}: ${stop === "aborted" ? GIT_ROOT_ABORTED : stop === "timed out" ? GIT_ROOT_TIMED_OUT : GIT_ROOT_FAILED}`;
+}
+
+/**
+ * Step 9: `work`, unless the deadline passes or the signal aborts first; a rejection (or a throw) fails closed as `failed`.
+ * Exported for the caller's own asynchronous steps (`index.ts`: the orchestrator lookup, QA F5).
+ */
+export function gitRootBounded<T>(
+  work: () => Promise<T>,
+  limits: { readonly signal?: AbortSignal; readonly deadlineAt?: number },
+): Promise<{ readonly value: T } | { readonly stop: GitRootStop }> {
+  if (limits.signal?.aborted === true) return Promise.resolve({ stop: "aborted" });
+  if (limits.deadlineAt !== undefined && Date.now() >= limits.deadlineAt) return Promise.resolve({ stop: "timed out" });
+  return new Promise((resolve) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
+    const finish = (result: { readonly value: T } | { readonly stop: GitRootStop }): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      limits.signal?.removeEventListener("abort", onAbort);
+      resolve(result);
+    };
+    const onAbort = (): void => finish({ stop: "aborted" });
+    if (limits.deadlineAt !== undefined) timer = setTimeout(() => finish({ stop: "timed out" }), Math.max(0, limits.deadlineAt - Date.now()));
+    limits.signal?.addEventListener("abort", onAbort, { once: true });
+    let started: Promise<T>;
+    try {
+      started = work();
+    } catch (error) {
+      started = Promise.reject(error instanceof Error ? error : new Error(String(error)));
+    }
+    started.then((result) => finish({ value: result }), () => finish({ stop: "failed" }));
+  });
+}
 
 export async function resolveGitRoot(value: string, ctx: GitRootContext, deps: GitRootDeps): Promise<GitRootResolution> {
   const platform = deps.platform;
@@ -205,47 +267,128 @@ export async function resolveGitRoot(value: string, ctx: GitRootContext, deps: G
     if (deps.deadlineAt !== undefined && Date.now() >= deps.deadlineAt) return "timed out";
     return undefined;
   };
-  const stopReason = (stop: Stop): GitRootResolution =>
-    refuse(`root=${label}: ${stop === "aborted" ? GIT_ROOT_ABORTED : stop === "timed out" ? GIT_ROOT_TIMED_OUT : GIT_ROOT_FAILED}`);
+  const stopReason = (stop: Stop): GitRootResolution => refuse(gitRootStopReason(value, stop));
   /** Step 9: `work`, unless the deadline passes or the signal aborts first; a rejection fails closed. */
-  const bounded = <T>(work: () => Promise<T>): Promise<{ readonly value: T } | { readonly stop: Stop }> => {
-    const early = stopped();
-    if (early !== undefined) return Promise.resolve({ stop: early });
-    return new Promise((resolve) => {
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const finish = (result: { readonly value: T } | { readonly stop: Stop }): void => {
-        if (timer !== undefined) clearTimeout(timer);
-        deps.signal?.removeEventListener("abort", onAbort);
-        resolve(result);
-      };
-      const onAbort = (): void => finish({ stop: "aborted" });
-      if (deps.deadlineAt !== undefined) timer = setTimeout(() => finish({ stop: "timed out" }), Math.max(0, deps.deadlineAt - Date.now()));
-      deps.signal?.addEventListener("abort", onAbort, { once: true });
-      let started: Promise<T>;
-      try {
-        started = work();
-      } catch (error) {
-        started = Promise.reject(error instanceof Error ? error : new Error(String(error)));
-      }
-      started.then((result) => finish({ value: result }), () => finish({ stop: "failed" }));
+  const bounded = <T>(work: () => Promise<T>): Promise<{ readonly value: T } | { readonly stop: Stop }> =>
+    gitRootBounded(work, {
+      ...(deps.signal === undefined ? {} : { signal: deps.signal }),
+      ...(deps.deadlineAt === undefined ? {} : { deadlineAt: deps.deadlineAt }),
     });
+
+  /** The configured parents whose text is a usable path. */
+  const parents = ctx.parents.map((parent) => parent.trim()).filter((parent) => rootTextProblem(parent, platform) === undefined);
+  /**
+   * QA round 1 (F1): each parent's canonical form, when it differs from its text (a junction, symlink or subst drive). The parents
+   * are trusted configuration: resolved once per call, on first need; a parent that does not resolve keeps its text form only.
+   * The value itself is never resolved before the text gate.
+   */
+  let realParentsMemo: Array<{ readonly parent: string; readonly real: string }> | undefined;
+  const realParents = (): ReadonlyArray<{ readonly parent: string; readonly real: string }> => {
+    if (realParentsMemo !== undefined) return realParentsMemo;
+    const resolved: Array<{ readonly parent: string; readonly real: string }> = [];
+    for (const parent of parents) {
+      try {
+        const real = deps.realpath(parent);
+        if (typeof real === "string" && real !== "" && text(real) !== text(parent)) resolved.push({ parent, real });
+      } catch {
+        // The parent does not resolve: its text form only.
+      }
+    }
+    realParentsMemo = resolved;
+    return resolved;
+  };
+  type Gate =
+    | { readonly kind: "work-root" }
+    | { readonly kind: "inside"; readonly rel: string }
+    | { readonly kind: "outside" }
+    /** `admitAs`: the form admission's rule 1 knows (below a parent as configured). */
+    | { readonly kind: "member"; readonly admitAs: string };
+  /** Step 3: text only for `path`; at most the parents are resolved (F1). */
+  const textGate = (path: string): Gate => {
+    const pathText = text(path);
+    if (pathText === text(ctx.workRoot)) return { kind: "work-root" };
+    const insideW = relativeBelow(path, ctx.workRoot);
+    if (insideW !== undefined) return { kind: "inside", rel: insideW };
+    if (parents.some((parent) => below(pathText, text(parent)))) return { kind: "member", admitAs: path };
+    if (ctx.workingSet.some((worktree) => text(worktree) === pathText)) return { kind: "member", admitAs: path };
+    for (const { parent, real } of realParents()) {
+      const rel = relativeBelow(path, real);
+      if (rel !== undefined) return { kind: "member", admitAs: `${native(parent).replace(/[\\/]+$/, "")}${sep}${rel}` };
+    }
+    return { kind: "outside" };
+  };
+  /**
+   * QA round 1 (F4): the name lookup's `eligible`, asked before admission runs anything on a candidate: the text gate, then R on
+   * the canonical path (filesystem only, as step 5). The work root and paths inside it stay eligible (steps 3–4 answer them).
+   */
+  const eligible = (candidate: string): boolean => {
+    const gate = textGate(candidate);
+    if (gate.kind === "outside") return false;
+    if (gate.kind !== "member") return true;
+    const real = deps.realpath(candidate);
+    if (typeof real !== "string" || real === "") return false;
+    if (text(real) === text(ctx.workRoot) || relativeBelow(real, ctx.workRoot) !== undefined) return true;
+    return deps.inReadSet(real) === true;
+  };
+  /** QA round 1 (F6): absolute paths in a router-authored sentence (win32: drive or UNC; posix: rooted), after a boundary. */
+  const ABSOLUTE = win ? /(?<![^\s(=,;"'])(?:[A-Za-z]:[\\/]|\\\\)[^\s,;()"'<>|]*/g : /(?<![^\s(=,;"'])\/[^\s,;()"'<>|]*/g;
+  /** A following space-separated chunk that holds a separator continues a path with spaces. */
+  const CONTINUED = /^ +[^\s,;()"'<>|]*[\\/][^\s,;()"'<>|]*/;
+  /** F6: `body` with every absolute path that is not in `safe`, not W or inside it, and not in R replaced by the placeholder. */
+  const redactOutside = (body: string, safe: readonly string[]): string => {
+    const safeTexts = new Set([...safe, ...parents, ...realParents().map((entry) => entry.real), ...ctx.workingSet, ...deps.known].map(text));
+    const keep = (path: string): boolean => {
+      if (safeTexts.has(text(path))) return true;
+      if (text(path) === text(ctx.workRoot) || relativeBelow(path, ctx.workRoot) !== undefined) return true;
+      try {
+        return deps.inReadSet(path) === true;
+      } catch {
+        return false;
+      }
+    };
+    const pattern = new RegExp(ABSOLUTE.source, "g");
+    let out = "";
+    let last = 0;
+    for (let match = pattern.exec(body); match !== null; match = pattern.exec(body)) {
+      let end = match.index + match[0].length;
+      for (let more = CONTINUED.exec(body.slice(end)); more !== null; more = CONTINUED.exec(body.slice(end))) end += more[0].length;
+      const token = body.slice(match.index, end).replace(/[.:]+$/, "");
+      end = match.index + token.length;
+      pattern.lastIndex = Math.max(end, match.index + 1);
+      if (token === "" || keep(token)) continue;
+      out += `${body.slice(last, match.index)}${GIT_ROOT_OUTSIDE_PLACEHOLDER}`;
+      last = end;
+    }
+    return `${out}${body.slice(last)}`;
+  };
+  /**
+   * Step 7's refusal (SD-3b-9, QA round 1 N1/F6): the admission reason mapped, control characters replaced, its leading
+   * `root=<the form admitted>` shown as the value passed (display-safe), every other absolute path outside R redacted.
+   */
+  const admissionRefusal = (reason: string, path: string, admitAs: string, real: string): string => {
+    const mapped = sanitiseReason(mapAdmissionReason(reason));
+    for (const form of admitAs === path ? [path] : [admitAs, path]) {
+      const prefix = `root=${form}`;
+      const next = mapped.charAt(prefix.length);
+      if (mapped.startsWith(prefix) && (next === "" || /[\s:;,.]/.test(next))) {
+        return `root=${show(path)}${redactOutside(mapped.slice(prefix.length), [path, admitAs, real])}`;
+      }
+    }
+    return redactOutside(mapped, [path, admitAs, real]);
   };
 
   /** Steps 3–7 for an absolute path; `extraKnown` joins `deps.known` for admission. */
   const throughPath = async (path: string, extraKnown: readonly string[]): Promise<GitRootResolution> => {
     const shown = show(path);
-    // Step 3: text only.
-    const pathText = text(path);
-    if (pathText === text(ctx.workRoot)) return IN_WORK_ROOT;
-    const insideW = relativeBelow(path, ctx.workRoot);
-    if (insideW !== undefined) return refuse(`root=${shown} ${GIT_ROOT_INSIDE_WORK_ROOT} ${show(ctx.workRoot)}; ${GIT_ROOT_OMIT_ROOT}${show(insideW)}`);
-    const parents = ctx.parents.map((parent) => parent.trim()).filter((parent) => rootTextProblem(parent, platform) === undefined);
-    const belowParent = parents.some((parent) => below(pathText, text(parent)));
-    const inWorkingSet = ctx.workingSet.some((worktree) => text(worktree) === pathText);
-    if (!belowParent && !inWorkingSet) {
+    // Step 3: text only for the value (the parents may be resolved, F1).
+    const gate = textGate(path);
+    if (gate.kind === "work-root") return IN_WORK_ROOT;
+    if (gate.kind === "inside") return refuse(`root=${shown} ${GIT_ROOT_INSIDE_WORK_ROOT} ${show(ctx.workRoot)}; ${GIT_ROOT_OMIT_ROOT}${show(gate.rel)}`);
+    if (gate.kind === "outside") {
       const list = parents.length === 0 ? "routing.repoParents (none configured)" : parents.map(show).join(", ");
       return refuse(`root=${shown} ${GIT_ROOT_OUTSIDE_READ_SET} ${list}); nothing ran`);
     }
+    const admitAs = gate.admitAs;
 
     // Step 4: the filesystem, from here on.
     const early = stopped();
@@ -303,10 +446,10 @@ export async function resolveGitRoot(value: string, ctx: GitRootContext, deps: G
     // Step 7: admission (git), then the admitted worktree must be this directory.
     const known = [...deps.known];
     for (const repository of extraKnown) if (!known.some((entry) => text(entry) === text(repository))) known.push(repository);
-    const answer = await bounded<Admission>(() => deps.admission.admit(path, known));
+    const answer = await bounded<Admission>(() => deps.admission.admit(admitAs, known));
     if ("stop" in answer) return stopReason(answer.stop);
     const admitted = answer.value;
-    if (!admitted.ok) return refuse(displaySafe(mapAdmissionReason(admitted.reason)));
+    if (!admitted.ok) return refuse(admissionRefusal(admitted.reason, path, admitAs, real));
     const location = admitted.location;
     if (text(location.worktree) !== realText) {
       return refuse(`root=${shown}: ${GIT_ROOT_ADMITTED_WORKTREE} ${show(location.worktree)} resolves to ${show(real)}; nothing ran`);
@@ -326,12 +469,14 @@ export async function resolveGitRoot(value: string, ctx: GitRootContext, deps: G
   if (!isName(value)) return throughPath(value, []);
 
   // Step 8: a name, through the `repo=` lookup.
-  const answer = await bounded(() => deps.admission.find(value));
+  const answer = await bounded(() => deps.admission.find(value, { eligible }));
   if ("stop" in answer) return stopReason(answer.stop);
-  const { found, searched } = answer.value;
+  const { found, searched, capped } = answer.value;
   if (found.length === 0) {
     const where = searched.length === 0 ? "nothing: none configured" : searched.map(show).join(", ");
-    return refuse(`root=${label} ${GIT_ROOT_NO_MATCH} (searched ${where}); nothing ran`);
+    // QA round 1 (N2): the route line's cap note. A single match in a capped lookup is kept below, as `repo=` keeps it.
+    const stoppedNote = capped === true ? `. ${gitRootCappedNote(LOOKUP_MAX_DIRS)}` : "";
+    return refuse(`root=${label} ${GIT_ROOT_NO_MATCH} (searched ${where}); nothing ran${stoppedNote}`);
   }
   if (found.length > 1) {
     return refuse(`root=${label} matches ${String(found.length)} repositories: ${found.map((location) => show(location.worktree)).join(", ")}; ${GIT_ROOT_PASS_ONE}`);
