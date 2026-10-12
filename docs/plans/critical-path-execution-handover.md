@@ -401,15 +401,16 @@ The DF-0 run-scoped self-check (marker `omr-selfcheck-7f3a91c2d4`, server execut
 **Plan base / `origin/master` sync:** `b716ee9` (fetched 2026-10-10 by 0.P.1; `origin/master` unchanged, no merge).
 
 **Environment:**
-- `OPENCODE_V2_BIN` = `C:\Users\Marquinho\scoop\apps\opencode2\2.0.26\opencode.exe` (v2.0.26, the version under test).
+- 2026-10-12: scoop upgraded OpenCode to 2.0.27 / 1.19.0 and removed 2.0.26 / 1.18.35. Verified copies (npm sha512 for 2.0.26; scoop manifest sha256 `c90d248c…` for 1.18.35) live in `%LOCALAPPDATA%\omr-cpx\bin\`; every path below points there. Do not `scoop update` until the plan ends.
+- `OPENCODE_V2_BIN` = `C:\Users\Marquinho\AppData\Local\omr-cpx\bin\opencode2-2.0.26\opencode.exe` (v2.0.26, the version under test).
   Not set at user scope (removed by QA-0.P-8); set in the launch command and per orchestrator shell run.
 - **Every orchestrator smoke shell** first runs `Remove-Item Env:OPENCODE_CONFIG_DIR -ErrorAction SilentlyContinue`
   (QA-0.P-17: the plan's host exports it; OpenCode 1.18.35 merges it additively, so a smoke host would load the
   dogfood router as a second router). This per-shell removal is the only mitigation: the harness fix `46dac26` was
   reverted (`9943abe`) because `test\smoke\deferred-catalog.smoke.test.ts` is v1-frozen (scenario `6-v1-untouched` of
   `test\smoke\routing-engine.smoke.test.ts` pins it to `bd1ecd1`).
-- OpenCode 1.x: `C:\Users\Marquinho\scoop\apps\opencode\1.18.35\opencode.exe`. Every v1-host smoke (`smoke:v1`,
-  `smoke:keyless`) runs with `C:\Users\Marquinho\scoop\apps\opencode\1.18.35` prepended to `PATH` (QA-0.P-7).
+- OpenCode 1.x: `C:\Users\Marquinho\AppData\Local\omr-cpx\bin\opencode-1.18.35\opencode.exe`. Every v1-host smoke (`smoke:v1`,
+  `smoke:keyless`) runs with `C:\Users\Marquinho\AppData\Local\omr-cpx\bin\opencode-1.18.35` prepended to `PATH` (QA-0.P-7).
 - Scoped test workers: `--maxWorkers=14` (16 cores).
 - Smoke evidence: every smoke run sets `OMR_SMOKE_EVIDENCE_DIR=$env:TEMP\omr-evidence`.
 - Global override has `routing.workRoots` `D:/git/omr-cpx-main`, `D:/git/omr-cpx-p*`, `D:/git/omr-cpx-pdf*`,
@@ -428,7 +429,7 @@ The DF-0 run-scoped self-check (marker `omr-selfcheck-7f3a91c2d4`, server execut
 `C:\Users\Marquinho\.config\opencode`, except `opencode.json`, a copy whose router entry is the dogfood worktree).
 Global `opencode.json` unchanged (backup `$env:LOCALAPPDATA\omr-cpx\opencode-config.backup`).
 - **Launch (every DF-n restart; versioned executable, QA-0.P-9):** close the plan's OpenCode window, then in a new pwsh:
-  `$env:OPENCODE_CONFIG_DIR = "$env:LOCALAPPDATA\omr-cpx\opencode-config"; $env:OPENCODE_V2_BIN = "C:\Users\Marquinho\scoop\apps\opencode2\2.0.26\opencode.exe"; & $env:OPENCODE_V2_BIN --standalone -s ses_ed82f88a7ffej5iKaRHuwIa6fd D:\git\omr-cpx-main`
+  `$env:OPENCODE_CONFIG_DIR = "$env:LOCALAPPDATA\omr-cpx\opencode-config"; $env:OPENCODE_V2_BIN = "C:\Users\Marquinho\AppData\Local\omr-cpx\bin\opencode2-2.0.26\opencode.exe"; & $env:OPENCODE_V2_BIN --standalone -s ses_ed82f88a7ffej5iKaRHuwIa6fd D:\git\omr-cpx-main`
   and type `continue`.
 - **Switch (QA-0.P-14/-23):** regenerate `$env:LOCALAPPDATA\omr-cpx\opencode-config\opencode.json` from the current
   global `opencode.json`, changing only the router entry to `D:\\git\\omr-cpx-dogfood-df<n>[.<k>]`; mirror the global
