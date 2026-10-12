@@ -1,0 +1,8 @@
+{
+  "name": "integrate-stale-dist",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "typecheck": "node check.js"
+  }
+}
