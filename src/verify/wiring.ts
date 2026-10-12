@@ -1930,7 +1930,8 @@ export function createVerificationWiring(deps: {
    * refuses, or an unadmitted edge) is not snapshotted: it is returned in `unadmitted` (P3 QA-1 M4), frozen as covering only so
    * that router_verify does not name it new. Never a perimeter seed: P stays fixed at dispatch for writer attribution (I4, I13).
    * `targets`: what W depends on at return, so that a dispatch-time dependency the producer removed is frozen as such (P3 QA-1
-   * M3). More new targets than `room` (P3 QA-1 m2: PERIMETER_MAX) are not snapshotted: `unobserved`. Never throws.
+   * M3); every target's path, an unadmitted one's included (P3 QA-2 F-2: a spelling the admission refuses still declares the
+   * dependency), and absent when the read was cut (`incomplete`, or unadmitted targets past the names bound). More new targets than `room` (P3 QA-1 m2: PERIMETER_MAX) are not snapshotted: `unobserved`. Never throws.
    */
   const dependenciesAddedAtReturn = async (
     linkBase: string,
@@ -1944,7 +1945,10 @@ export function createVerificationWiring(deps: {
   ): Promise<{
     links: FrozenPerimeter["links"];
     unobserved: boolean;
-    /** P3 QA-1 M3: what W depends on at return (its targets' paths, unadmitted edges' text excluded). Absent: not read. */
+    /**
+     * P3 QA-1 M3: what W depends on at return (every target's path, an unadmitted one's included: P3 QA-2 F-2). Absent: not
+     * read, cut by a bound, or unadmitted targets past the names bound.
+     */
     targets?: readonly string[];
     /** P3 QA-1 M4: the new targets not admitted, as router_verify names them (covering only, never seeds: I13). */
     unadmitted?: readonly string[];
@@ -1960,7 +1964,8 @@ export function createVerificationWiring(deps: {
     // Fail closed: W's dependencies at return are unknown, so a new one cannot be ruled out (not deferred).
     if (read === undefined) return { links: [], unobserved: true };
     const { context, dependencies } = read;
-    const targets = dependencies.targets.filter(target => !("fixed" in target)).map(target => target.at);
+    // P3 QA-2 F-2: every target, an unadmitted one included (its path: a spelling into a dispatch-time dependency still declares it).
+    const targets = dependencies.targets.map(target => target.at);
     // Held by a perimeter root, or W's own repository (inside W, or W inside it): W's snapshot covers it.
     const covered = (at: string): boolean =>
       covering.some(root => depthBelow(at, root) >= 0) || own.some(dir => depthBelow(at, dir) >= 0 || depthBelow(dir, at) >= 0);
@@ -1996,9 +2001,10 @@ export function createVerificationWiring(deps: {
       if (covered(top) || added.has(perimeterKey(top))) continue;
       added.set(perimeterKey(top), top);
     }
-    // M3: only a complete read rules a dependency out (an unread manifest could still declare it: none is frozen as removed).
+    // M3: only a complete read rules a dependency out (an unread manifest could still declare it: none is frozen as removed). P3
+    // QA-2 F-2: nor one whose unadmitted targets the bound cut (one of them could lie in a dispatch-time dependency).
     const atReturn = {
-      ...(dependencies.incomplete ? {} : { targets }),
+      ...(dependencies.incomplete || dependencies.unadmittedMore > 0 ? {} : { targets }),
       ...(unadmitted.size > 0 ? { unadmitted: [...unadmitted.values()] } : {}),
     };
     if (added.size === 0) return { links: [], unobserved: false, ...atReturn };
@@ -2912,13 +2918,20 @@ export function createVerificationWiring(deps: {
       type FrozenLink = NonNullable<PendingEntry["perimeter"]>["links"][number];
       type Drift = { readonly name: string; readonly root: string; readonly why: "changed" | "unobserved" };
       // `real`: where link.at resolves now (fs only); `targets`: what W depends on now, its package link targets and its admitted
-      // declared edges' top levels (P3c.4, SD-P3c-1: `dependencyTargets`, fs only, no git run).
-      const observeLink = async (link: FrozenLink, real: string | undefined, targets: readonly string[]): Promise<Drift | undefined> => {
+      // declared edges' top levels (P3c.4, SD-P3c-1: `dependencyTargets`, fs only, no git run); `every`: those and its unadmitted
+      // edge targets' paths (P3 QA-2 F-2).
+      const observeLink = async (
+        link: FrozenLink,
+        real: string | undefined,
+        targets: readonly string[],
+        every: readonly string[],
+      ): Promise<Drift | undefined> => {
         const name = link.name ?? basename(link.root);
         // P3 QA-1 M3: a dependency the producer removed (or retargeted) during the dispatch is not an input of the change: skipped
         // entirely while W still does not depend on it; W depending on it again since the return is a new dependency: "changed".
+        // P3 QA-2 F-2: an unadmitted spelling into it still declares it (frozen removed only when no target of any kind lay in it).
         if (link.removedAtReturn === true) {
-          return targets.some(target => depthBelow(target, link.root) >= 0) ? { name, root: link.root, why: "changed" } : undefined;
+          return every.some(target => depthBelow(target, link.root) >= 0) ? { name, root: link.root, why: "changed" } : undefined;
         }
         // P2e QA-1 #4 (I12): no git where the link no longer resolves inside its frozen root, or where its admission refuses.
         if (real === undefined || depthBelow(real, link.root) < 0 || link.admit?.(link.root) === false) {
@@ -2967,20 +2980,34 @@ export function createVerificationWiring(deps: {
         // What W still depends on: its link targets (admitted or not, as before) and its admitted edges' top levels. An
         // unadmitted edge target is text only (never observed): it only names a new dependency below.
         const targets = current.filter(target => !("fixed" in target)).map(target => target.at);
-        const drifts = await Promise.all(frozen.links.map((link, index) => observeLink(link, reals[index], targets)));
+        // P3 QA-2 F-2: a link removed at return is judged against every target, unadmitted ones included (as frozen at return).
+        const every = current.map(target => target.at);
+        const drifts = await Promise.all(frozen.links.map((link, index) => observeLink(link, reals[index], targets, every)));
         // P2e QA-1 #2: a dependency target of W now that none of the perimeter frozen at return covers (its links and edges'
         // roots, frozen at return, and its observed roots) is new: "changed". W's own repository is W's snapshot, as at
         // dispatch (planPerimeter); W's dependencies are read from `wRoot` (the dispatch's W), never from the snapshot root
         // (which is the git top level).
         // P3 QA-1 M3: a link removed at return covers nothing (observeLink names it when W depends on it again).
-        // P3 QA-1 M4: an unadmitted target the producer added during the dispatch covers itself, as a dispatch-time one does
-        // through its unadmitted root.
         const covering = [
           ...frozen.links.filter(link => link.removedAtReturn !== true).map(link => link.root),
           ...reals.filter((real, index): real is string => real !== undefined && frozen.links[index]?.removedAtReturn !== true),
           ...frozen.observation.roots.map(root => root.root),
-          ...(frozen.unadmittedAtReturn ?? []),
         ];
+        // P3 QA-1 M4: an unadmitted target the producer added during the dispatch covers itself, as a dispatch-time one does
+        // through its unadmitted root. P3 QA-2 F-3: itself only (same key), and only while it is still unadmitted: an admitted
+        // target at or below it is a new dependency ("changed").
+        const unadmittedAtReturn = new Set((frozen.unadmittedAtReturn ?? []).map(at => perimeterKey(at)));
+        // Not admitted now, as dependenciesAddedAtReturn judged it at return: an unadmitted edge, or a link target outside every
+        // parent and worktree, without a git top level, or whose top level the frozen admission refuses.
+        const unadmittedNow = (target: DependencyTargets["targets"][number]): boolean => {
+          if ("fixed" in target) return true;
+          if (target.origin === "edge" || context === undefined) return false;
+          const parent = context.parentOf(target.at);
+          const worktree = context.worktreeOf(target.at);
+          if (parent === undefined && worktree === undefined) return true;
+          const top = gitTopOf(target.at, worktree !== undefined ? dirname(worktree.worktree) : parent);
+          return top === undefined || !context.admitTop(top);
+        };
         // A new link target is named by its top level, found without git: below its parent (or above its working-set worktree)
         // as at dispatch (SD-P3c-9, F8). Outside every parent and worktree, it is named by its text: nothing runs there (I11).
         // Without a frozen admission: its top level, as before P3c.
@@ -2994,6 +3021,7 @@ export function createVerificationWiring(deps: {
         const fresh = new Map<string, Drift>();
         for (const target of current) {
           if (covering.some(root => depthBelow(target.at, root) >= 0)) continue;
+          if (unadmittedAtReturn.has(perimeterKey(target.at)) && unadmittedNow(target)) continue;
           // An edge target is already its top level (admitted, found below its parent by `resolveEdgeTarget`) or text (not
           // admitted: named from its text, with no filesystem call, I11).
           const top = target.origin === "edge" ? target.at : linkTop(target.at);
@@ -3005,8 +3033,18 @@ export function createVerificationWiring(deps: {
       };
       const [found, pins, drifted] = await Promise.all([discoverFrozen(), awaitPins(), observeLinks()]);
       if (drifted.length > 0) linkDrift = drifted;
+      // P3 QA-2 F-3 (I8): an unadmitted dependency the producer added during the dispatch is named as a dispatch-time one is, a
+      // root "unadmitted" (`<name> (not admitted)` in the verified-scope line, never refused), once per root already named.
+      const named = new Set([frozen.observation.w.root, ...frozen.observation.roots.map(root => root.root)].map(at => perimeterKey(at)));
+      const unadmittedRoots: PerimeterObservation["roots"][number][] = [];
+      for (const at of frozen.unadmittedAtReturn ?? []) {
+        if (named.has(perimeterKey(at))) continue;
+        named.add(perimeterKey(at));
+        unadmittedRoots.push({ root: at, name: basename(at), status: "unadmitted" });
+      }
       perimeter = {
         ...frozen.observation,
+        ...(unadmittedRoots.length > 0 ? { roots: [...frozen.observation.roots, ...unadmittedRoots] } : {}),
         ...(found.consumers.length > 0 ? { consumers: found.consumers } : {}),
         ...(found.incomplete.length > 0 ? { consumersIncomplete: found.incomplete } : {}),
       };

@@ -1362,6 +1362,27 @@ describe("deferred P (P2e)", () => {
       expect(outcomeOf(out, handle), out).toBe("pass");
     }, 90_000);
 
+    it("P3 QA-2 F-2: the producer respells `file:../lib-b` past EDGE_SPEC_MAX (unadmitted, still into lib-b) → not frozen removed, S11", async () => {
+      const hooks = await withLibC();
+      await declareLibB(); // lib-b is a declared edge of W at dispatch.
+      const handle = handleIn(await runTask(hooks, `Implement it.\n${DOD_FULL}`, async () => {
+        const spec = `file:${"./".repeat(perimeterModule.EDGE_SPEC_MAX)}../lib-b`;
+        fs.writeFileSync(
+          path.join(repo, "package.json"),
+          `${JSON.stringify({ name: "app-a", private: true, scripts: { test: "node --version" }, dependencies: { "lib-b": spec } })}\n`,
+        );
+        await pin(repo);
+      }));
+      // Still declared (through a spelling the admission does not admit): never skipped as removed.
+      expect(linkOf(handle, lib)).toBeDefined();
+      expect(linkOf(handle, lib)?.removedAtReturn).toBeUndefined();
+      fs.writeFileSync(path.join(lib, "index.ts"), "export const b = 1;\n");
+      await pin(lib);
+      const out = await verify(hooks, handle);
+      expect(outcomeOf(out, handle), out).toBe("unverifiable");
+      expect(out).toMatch(S11_CHANGED);
+    }, 90_000);
+
     it("P3 QA-1 M3: the producer removes W's node_modules link to lib-c during the dispatch, lib-c unchanged → pass, no S11", async () => {
       const hooks = await withLibC();
       const handle = handleIn(await runTask(hooks, `Implement it.\n${DOD_FULL}`, async () => {

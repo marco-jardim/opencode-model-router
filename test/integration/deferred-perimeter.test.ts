@@ -31,6 +31,7 @@ import type { LinkPin } from "../../src/verify/pin";
 import type { CheckPlacement } from "../../src/verify/types";
 import { createHash } from "node:crypto";
 import { LINK_DRIFT_CAVEAT } from "../../src/verify/wiring";
+import { EDGE_SPEC_MAX } from "../../src/verify/perimeter";
 
 const state = vi.hoisted(() => ({
   /** What snapshotTree resolves with for a directory (else `fallback`). */
@@ -656,6 +657,61 @@ describe("declared dependency edges at router_verify (P3c)", () => {
     const out = await verify(h, handle);
     expect(outcomeOf(out, handle)).toBe("unverifiable");
     expect(out).toContain(LINK_DRIFT_CAVEAT.changed("lib-b", libB));
+  });
+
+  it("P3 QA-2 F-2: a link frozen removed while W still declares lib-b through an unadmitted (over-long) spelling → S11 changed", async () => {
+    const h = await makePlugin();
+    // Past EDGE_SPEC_MAX: classified unadmitted, at <parent>/lib-b (text only, never observed).
+    declare(work, { "lib-b": `file:${"./".repeat(EDGE_SPEC_MAX)}../lib-b` });
+    state.byDir.set(libB, treeOf(libB, "c".repeat(40)));
+    const handle = register({ perimeter: frozenEdges([{ ...edgeLink(), removedAtReturn: true }]) });
+    const out = await verify(h, handle);
+    expect(outcomeOf(out, handle)).toBe("unverifiable");
+    expect(out).toContain(LINK_DRIFT_CAVEAT.changed("lib-b", libB));
+  });
+
+  it("P3 QA-2 F-3: an unadmitted dependency added during the dispatch, still unadmitted → pass, named `(not admitted)` (I8)", async () => {
+    const h = await makePlugin();
+    // A plain directory below the parent: no git top level, so unadmitted at return and now.
+    const shared = path.join(realHome, "shared-types");
+    fs.mkdirSync(shared, { recursive: true });
+    declare(work, { "lib-b": "file:../lib-b", "shared-types": "file:../shared-types" });
+    state.byDir.set(libB, treeOf(libB, HEAD_B));
+    const handle = register({ perimeter: { ...frozenEdges([edgeLink()]), unadmittedAtReturn: [shared] } });
+    const out = await verify(h, handle);
+    expect(outcomeOf(out, handle)).toBe("pass");
+    expect(out).not.toMatch(ANY_LINK_CAVEAT);
+    expect(await gateResults()).toMatch(/also observed: lib-b \(main @ bbbbbbb\), shared-types \(not admitted\)/);
+    // Never observed (I11): no snapshot of it.
+    expect(state.calls).not.toContain(shared);
+  });
+
+  it("P3 QA-2 F-3: an unadmitted dependency added during the dispatch that became an admitted repository → S11 changed", async () => {
+    const h = await makePlugin();
+    const libNew = path.join(realHome, "lib-new");
+    fs.mkdirSync(libNew, { recursive: true });
+    declare(work, { "lib-b": "file:../lib-b", "lib-new": "file:../lib-new" });
+    state.byDir.set(libB, treeOf(libB, HEAD_B));
+    // Frozen at return while lib-new was not a git repository; it is one now.
+    const handle = register({ perimeter: { ...frozenEdges([edgeLink()]), unadmittedAtReturn: [libNew] } });
+    gitRepo(libNew);
+    const out = await verify(h, handle);
+    expect(outcomeOf(out, handle)).toBe("unverifiable");
+    expect(out).toContain(LINK_DRIFT_CAVEAT.changed("lib-new", libNew));
+  });
+
+  it("P3 QA-2 F-3: a frozen unadmitted path does not cover a repository below it (no prefix covering) → S11 changed", async () => {
+    const h = await makePlugin();
+    const vendor = path.join(realHome, "vendor");
+    const libX = path.join(vendor, "lib-x");
+    fs.mkdirSync(libX, { recursive: true });
+    gitRepo(libX);
+    declare(work, { "lib-b": "file:../lib-b", "lib-x": "file:../vendor/lib-x" });
+    state.byDir.set(libB, treeOf(libB, HEAD_B));
+    const handle = register({ perimeter: { ...frozenEdges([edgeLink()]), admission: { ...admission(), depth: 2 }, unadmittedAtReturn: [vendor] } });
+    const out = await verify(h, handle);
+    expect(outcomeOf(out, handle)).toBe("unverifiable");
+    expect(out).toContain(LINK_DRIFT_CAVEAT.changed("lib-x", libX));
   });
 
   it("P3 QA-1 M5: a frozen link name holding `[router ✓`, a newline and a bidi control is escaped in the S11 caveat", async () => {
