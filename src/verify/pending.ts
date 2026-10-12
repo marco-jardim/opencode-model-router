@@ -475,6 +475,11 @@ export interface DeferredPerimeter {
     readonly admit?: (root: string) => boolean;
   }[];
   readonly pins: Promise<readonly LinkPin[]>;
+  /**
+   * The W directory `planPerimeter` read package links from at dispatch (<W>/node_modules): the bound worktree, else
+   * the canonical session folder. It can be a subfolder of the git top level. Absent: fall back to observation.w.root.
+   */
+  readonly linkBase?: string;
 }
 
 /** Absolute path -> sha256 hex of the file bytes, or ABSENT_DIGEST for a missing path (R3). */
@@ -822,6 +827,8 @@ function freezePerimeter(perimeter: DeferredPerimeter | undefined): DeferredPeri
   if (perimeter === undefined) return undefined;
   return Object.freeze({
     observation: perimeter.observation,
+    // Kept as given (a path string); absent stays absent (router_verify then falls back to observation.w.root).
+    ...(perimeter.linkBase === undefined ? {} : { linkBase: perimeter.linkBase }),
     workingSet: Object.freeze(perimeter.workingSet.map((w) => Object.freeze({ ...w }))),
     links: Object.freeze(perimeter.links.map((l) => Object.freeze({ ...l }))),
     pins: perimeter.pins.then(

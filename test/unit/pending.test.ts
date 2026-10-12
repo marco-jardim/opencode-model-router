@@ -231,6 +231,16 @@ function foundEntry(registry: ReturnType<typeof setup>["registry"], handle: stri
 }
 
 describe("R3 cross-repo P2e: perimeter and placements", () => {
+  it("#107: linkBase (the W the links were read from) is stored with the frozen perimeter", () => {
+    const { registry, add } = setup();
+    const handle = add({ perimeter: { ...p2ePerimeter(), linkBase: "/repo/packages/web" } });
+    const perimeter = foundEntry(registry, handle).perimeter;
+    expect(perimeter?.linkBase).toBe("/repo/packages/web");
+    expect(Object.isFrozen(perimeter)).toBe(true);
+    const without = add({ perimeter: p2ePerimeter() });
+    expect(foundEntry(registry, without).perimeter?.linkBase).toBeUndefined();
+  });
+
   it("stored and frozen in get/list", () => {
     const { registry, add } = setup();
     const handle = add({ perimeter: p2ePerimeter(), placements: P2E_PLACEMENTS });

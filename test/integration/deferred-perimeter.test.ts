@@ -410,6 +410,62 @@ describe("S11 link drift (P2e.4a)", () => {
   });
 });
 
+describe("P2e QA round 2 (#107): W is a subfolder of its repository", () => {
+  let top = "";
+  let sub = "";
+  const libLink = (): DeferredPerimeter["links"][number] => ({ at: libB, root: libB, name: "lib-b", head: HEAD_B, fingerprint: "fp-lib-b" });
+  /** The perimeter frozen for a dispatch whose snapshot root is `top` and whose W (the dir planPerimeter read links from) is `sub`. */
+  const frozenAt = (links: DeferredPerimeter["links"]): DeferredPerimeter => {
+    const base = frozen("unchanged", { links });
+    return { ...base, observation: { ...base.observation, w: { ...base.observation.w, root: top } }, linkBase: sub };
+  };
+
+  beforeEach(() => {
+    top = fs.realpathSync.native(fs.mkdtempSync(path.join(home, "mono-")));
+    sub = path.join(top, "packages", "x");
+    fs.mkdirSync(sub, { recursive: true });
+  });
+
+  it("the link of <W>/node_modules, unchanged → pass, no S11", async () => {
+    const h = await makePlugin();
+    fs.mkdirSync(path.join(sub, "node_modules"), { recursive: true });
+    junction(libB, path.join(sub, "node_modules", "lib"));
+    state.byDir.set(libB, treeOf(libB, HEAD_B));
+    const handle = register({ perimeter: frozenAt([libLink()]) });
+    const out = await verify(h, handle);
+    expect(outcomeOf(out, handle)).toBe("pass");
+    expect(out).not.toMatch(ANY_LINK_CAVEAT);
+  });
+
+  it("the link retargeted after return → UNVERIFIED with S11 changed", async () => {
+    const h = await makePlugin();
+    const other = path.join(home, "lib-other");
+    fs.mkdirSync(other, { recursive: true });
+    fs.mkdirSync(path.join(sub, "node_modules"), { recursive: true });
+    const at = path.join(sub, "node_modules", "lib");
+    junction(libB, at);
+    state.byDir.set(libB, treeOf(libB, HEAD_B));
+    const handle = register({ perimeter: frozenAt([libLink()]) });
+    fs.rmSync(at, { recursive: false, force: true });
+    junction(other, at);
+    const out = await verify(h, handle);
+    expect(outcomeOf(out, handle)).toBe("unverifiable");
+    expect(out).toContain(LINK_DRIFT_CAVEAT.changed("lib-b", libB));
+  });
+
+  it("an outside link at <top>/node_modules only (not in W) is not reported as new", async () => {
+    const h = await makePlugin();
+    const outside = path.join(home, "outside-lib");
+    fs.mkdirSync(outside, { recursive: true });
+    fs.mkdirSync(path.join(top, "node_modules"), { recursive: true });
+    junction(outside, path.join(top, "node_modules", "outside-lib"));
+    const handle = register({ perimeter: frozenAt([]) });
+    const out = await verify(h, handle);
+    expect(outcomeOf(out, handle)).toBe("pass");
+    expect(out).not.toMatch(ANY_LINK_CAVEAT);
+  });
+});
+
 describe("placements at router_verify (P2e.4b)", () => {
   const NOTHING_RAN = /check 2 \(fileExists\) cwd=\S+ no longer resolves to the same repository since the producer returned; nothing ran/;
   /** Check 1 runs in W (it covers W's change, I3); check 2 is placed in lib-b, a git repository holding lib.txt (W does not). */

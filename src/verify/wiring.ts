@@ -2280,7 +2280,16 @@ export function createVerificationWiring(deps: {
         ...(change.unattributedWriters !== undefined && change.unattributedWriters.length > 0 ? { unattributedWriters: change.unattributedWriters } : {}),
         // Cross-repo P2e.5: the perimeter frozen at return (router_verify gates with it) and the dispatch's placements.
         ...(frozen !== undefined && frozenPins !== undefined
-          ? { perimeter: { observation: frozen.observation, workingSet: frozen.workingSet, links: frozen.links, pins: frozenPins } }
+          ? {
+            perimeter: {
+              observation: frozen.observation,
+              // The W directory the dispatch's planPerimeter read <W>/node_modules from (the cwd observeChange ran at, as `base` below; beginDispatch planned with the same captureRootOf).
+              linkBase: resolve(directory, changeCwd || "."),
+              workingSet: frozen.workingSet,
+              links: frozen.links,
+              pins: frozenPins,
+            },
+          }
           : {}),
         ...(input.placements !== undefined ? { placements: input.placements } : {}),
       });
@@ -2651,7 +2660,9 @@ export function createVerificationWiring(deps: {
       };
       const observeLinks = async (): Promise<Drift[]> => {
         const reals = await Promise.all(frozen.links.map(link => realpath(link.at).catch(() => undefined)));
-        const wRoot = frozen.observation.w.root;
+        // The W directory planPerimeter read links from at dispatch (it can be a subfolder of the git top level); an entry
+        // registered without one falls back to the snapshot root.
+        const wRoot = frozen.linkBase ?? frozen.observation.w.root;
         let targets: string[];
         try {
           targets = linkedTargets(wRoot);
@@ -2660,7 +2671,8 @@ export function createVerificationWiring(deps: {
         }
         const drifts = await Promise.all(frozen.links.map((link, index) => observeLink(link, reals[index], targets)));
         // P2e QA-1 #2: a link target of W now that none of the perimeter frozen at return covers is new: "changed", named by
-        // its top level (found without git). W's own repository is W's snapshot, as at dispatch (planPerimeter).
+        // its top level (found without git). W's own repository is W's snapshot, as at dispatch (planPerimeter); links are
+        // read from `wRoot` (the dispatch's W), never from the snapshot root (which is the git top level).
         const covering = [
           ...frozen.links.map(link => link.root),
           ...reals.filter((real): real is string => real !== undefined),
