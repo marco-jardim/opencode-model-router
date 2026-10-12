@@ -692,7 +692,7 @@ export interface AdmissionContext {
   /** The first parent `dir` lies at least one segment below, if any (admission by text, without touching `dir`). */
   readonly parentOf: (dir: string) => string | undefined;
   /** The working-set entry whose worktree holds `dir` (or is `dir`), if any. */
-  readonly worktreeOf: (dir: string) => RepoLocation | undefined;
+  readonly worktreeOf: (dir: string) => AdmissionWorktree | undefined;
   /**
    * Whether the top level `top` is admitted: it is a working-set worktree, or it lies 1..`routing.repoDepth` segments below a
    * parent and no `routing.repoExclude` glob matches it or a directory between that parent and it.
@@ -700,15 +700,53 @@ export interface AdmissionContext {
   readonly admitTop: (top: string) => boolean;
 }
 
+/** A working-set entry as admission reads it: its worktree (and its name). A `RepoLocation` is one. */
+export interface AdmissionWorktree {
+  readonly worktree: string;
+  readonly name?: string;
+}
+
+/**
+ * Cross-repo P3c.4 (SD-P3c-9): what an `AdmissionContext` is built from, as data: the parents in both spellings (as configured,
+ * and canonical, one per comparison key), `routing.repoDepth`, `routing.repoExclude` and the working set. A deferred perimeter
+ * freezes it at dispatch, so that `router_verify` admits W's dependency targets as the dispatch did, reading no configuration.
+ */
+export interface AdmissionData {
+  readonly parents: readonly string[];
+  readonly depth: number;
+  readonly exclude?: readonly string[];
+  readonly workingSet: readonly AdmissionWorktree[];
+}
+
+/** P3c.4: the admission data of `config` and `workingSet`. Reads the filesystem only to canonicalise each parent. */
+export function admissionData(config: PerimeterAdmission, workingSet: readonly AdmissionWorktree[]): AdmissionData {
+  // Both spellings of each parent: as configured, and canonical (link targets are real paths).
+  const parents = [...new Map(config.parents.flatMap((parent) => [parent, canonical(parent)]).map((p) => [perimeterKey(p), p])).values()];
+  return {
+    parents,
+    depth: config.depth,
+    ...(config.exclude !== undefined ? { exclude: [...config.exclude] } : {}),
+    workingSet: workingSet.map((entry) => ({ worktree: entry.worktree, ...(entry.name !== undefined ? { name: entry.name } : {}) })),
+  };
+}
+
 /**
  * Cross-repo P3c.2a: the link admission of `planPerimeter`, factored out so that other admissions (the workspace edges, P3c.2b)
  * read the same parents, depth, excludes and working set. Reads the filesystem only to canonicalise each parent.
  */
-export function admissionContext(config: PerimeterAdmission, workingSet: readonly RepoLocation[]): AdmissionContext {
-  const depth = Math.max(1, Math.floor(config.depth));
-  const exclude = config.exclude ?? [];
-  // Both spellings of each parent: as configured, and canonical (link targets are real paths).
-  const parents = [...new Map(config.parents.flatMap((parent) => [parent, canonical(parent)]).map((p) => [perimeterKey(p), p])).values()];
+export function admissionContext(config: PerimeterAdmission, workingSet: readonly AdmissionWorktree[]): AdmissionContext {
+  return admissionFromData(admissionData(config, workingSet));
+}
+
+/**
+ * Cross-repo P3c.4 (SD-P3c-9): the admission of frozen `data` (its parents already in both spellings). No filesystem call: the
+ * admission `router_verify` reads W's dependency targets with is the dispatch's.
+ */
+export function admissionFromData(data: AdmissionData): AdmissionContext {
+  const depth = Math.max(1, Math.floor(data.depth));
+  const exclude = data.exclude ?? [];
+  const parents = data.parents;
+  const workingSet = data.workingSet;
   const excluded = (parent: string, top: string): boolean => {
     if (exclude.length === 0) return false;
     const segments = path.relative(parent, top).split(/[\\/]/).filter((segment) => segment !== "");
@@ -719,7 +757,7 @@ export function admissionContext(config: PerimeterAdmission, workingSet: readonl
     return false;
   };
   const parentOf = (dir: string): string | undefined => parents.find((parent) => depthBelow(dir, parent) >= 1);
-  const worktreeOf = (dir: string): RepoLocation | undefined => workingSet.find((entry) => insideOrEqual(dir, entry.worktree));
+  const worktreeOf = (dir: string): AdmissionWorktree | undefined => workingSet.find((entry) => insideOrEqual(dir, entry.worktree));
   // QA-1 F4 (I11, I12): admission by top level, before any git call; the snapshot's top level is checked again at the gate.
   const admitTop = (top: string): boolean =>
     workingSet.some((entry) => perimeterKey(entry.worktree) === perimeterKey(top))
@@ -797,7 +835,9 @@ export function planPerimeter(
   }
 
   // P3c.2a: link admission (parents in both spellings, depth, excludes, working set), factored into `admissionContext`.
-  const linkAdmission = admissionContext(config, workingSet);
+  // P3c.4 (SD-P3c-9): its data is returned with P, frozen with a deferred perimeter for router_verify.
+  const frozenAdmission = admissionData(config, workingSet);
+  const linkAdmission = admissionFromData(frozenAdmission);
   const { parentOf, worktreeOf, admitTop } = linkAdmission;
   // P3c.3 (SD-P3c-1): W's package links first (`linkedTargets`, unchanged), then its declared edges, read once.
   const dependencies = dependencyTargets(w, { ...linkAdmission, sameRepository }, io);
@@ -845,7 +885,7 @@ export function planPerimeter(
 
   // P3c.3 (SD-P3c-2): W's declared dependency edges outside `node_modules`, after the links, so that a link and an edge into one
   // repository are one "link" seed (pinned as before). An admitted edge is a seed of origin "edge", observed like a link target
-  // (I4, I8) and counted toward PERIMETER_MAX, but never pinned (F3) and not frozen for S11 yet (P3c.4). An unadmitted one is
+  // (I4, I8), counted toward PERIMETER_MAX and frozen for S11 (P3c.4), but never pinned (F3). An unadmitted one is
   // named (`name (not admitted)`, at most EDGE_UNADMITTED_NAMES_MAX, `dependencyTargets`), never snapshotted (I11, I12).
   for (const dependency of dependencies.targets) {
     if (dependency.origin !== "edge") continue;
@@ -867,5 +907,5 @@ export function planPerimeter(
     add({ at: top, admit: admitTop, origin: "edge" });
   }
   if (seeds.length === 0) return undefined;
-  return { ...(location !== undefined ? { name: location.name } : {}), roots: seeds };
+  return { ...(location !== undefined ? { name: location.name } : {}), roots: seeds, admission: frozenAdmission };
 }

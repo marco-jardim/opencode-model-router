@@ -241,6 +241,40 @@ describe("R3 cross-repo P2e: perimeter and placements", () => {
     expect(foundEntry(registry, without).perimeter?.linkBase).toBeUndefined();
   });
 
+  it("P3c.4: the admission (parents in both spellings, depth, exclude, working set) is stored as a frozen copy", () => {
+    const { registry, add } = setup();
+    const parents = ["/Parent", "/real/parent"];
+    const exclude = ["/real/parent/skip-*"];
+    const workingSet = [{ worktree: "/repo", name: "repo" }, { worktree: "/other" }];
+    const handle = add({ perimeter: { ...p2ePerimeter(), admission: { parents, depth: 2, exclude, workingSet } } });
+    const admission = foundEntry(registry, handle).perimeter?.admission;
+    expect(admission).toEqual({
+      parents: ["/Parent", "/real/parent"],
+      depth: 2,
+      exclude: ["/real/parent/skip-*"],
+      workingSet: [{ worktree: "/repo", name: "repo" }, { worktree: "/other" }],
+    });
+    if (admission === undefined) throw new Error("admission missing");
+    // Frozen at every level, and never aliasing the caller's arrays: a later change by the caller is not seen.
+    expect(Object.isFrozen(admission)).toBe(true);
+    expect(Object.isFrozen(admission.parents)).toBe(true);
+    expect(Object.isFrozen(admission.exclude)).toBe(true);
+    expect(Object.isFrozen(admission.workingSet)).toBe(true);
+    for (const entry of admission.workingSet) expect(Object.isFrozen(entry)).toBe(true);
+    parents.push("/late");
+    exclude.length = 0;
+    workingSet[0] = { worktree: "/late" };
+    expect(admission.parents).toEqual(["/Parent", "/real/parent"]);
+    expect(admission.exclude).toEqual(["/real/parent/skip-*"]);
+    expect(admission.workingSet[0]).toEqual({ worktree: "/repo", name: "repo" });
+    expect(registry.listPending("orch")[0]?.perimeter?.admission).toEqual(admission);
+    // Absent stays absent (exclude too): router_verify then reads W's package links only, as before P3c.
+    const without = add({ perimeter: p2ePerimeter() });
+    expect(foundEntry(registry, without).perimeter?.admission).toBeUndefined();
+    const noExclude = add({ perimeter: { ...p2ePerimeter(), admission: { parents, depth: 1, workingSet: [] } } });
+    expect(foundEntry(registry, noExclude).perimeter?.admission).not.toHaveProperty("exclude");
+  });
+
   it("stored and frozen in get/list", () => {
     const { registry, add } = setup();
     const handle = add({ perimeter: p2ePerimeter(), placements: P2E_PLACEMENTS });

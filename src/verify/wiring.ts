@@ -16,7 +16,7 @@
 import { createHash } from "node:crypto";
 import type { ChildSessionRunner } from "../compat/child-session";
 import { access, readdir, readFile as fsReadFile, realpath, stat, unlink } from "node:fs/promises";
-import { basename, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { createBatchCoordinator, type BatchCoordinatorOptions, type BatchPlanner } from "./batch";
 import {
   createDeadline,
@@ -76,7 +76,16 @@ import {
 } from "./dispatch";
 import { runArgv, runShell } from "./exec";
 import { fileMtimeMs, listIgnoredModules, snapshotTree } from "./tree";
-import { crossLinkAliases, discoverConsumers, linkedTargets, planPerimeter, type ConsumerDiscovery } from "./perimeter";
+import {
+  admissionFromData,
+  crossLinkAliases,
+  dependencyTargets,
+  discoverConsumers,
+  linkedTargets,
+  planPerimeter,
+  type ConsumerDiscovery,
+  type DependencyTargets,
+} from "./perimeter";
 import { defaultExternalLinks, pinTarget, type LinkPin } from "./pin";
 import { depthBelow, gitTopOf, perimeterKey } from "./git-top";
 import type { DispatchPerimeter, PerimeterEntry } from "./dispatch";
@@ -1758,7 +1767,7 @@ export function createVerificationWiring(deps: {
     store: ReturnType<typeof createChangedFileStore>,
     id: string,
     deadline: Deadline | undefined,
-  ): Promise<{ name?: string; snapshots: PerimeterSnapshots } | undefined> => {
+  ): Promise<{ name?: string; snapshots: PerimeterSnapshots; admission?: DispatchPerimeter["admission"] } | undefined> => {
     const planned = store.perimeterOf(id);
     if (planned === undefined || planned.entries.size === 0) return undefined;
     const bound = (): number => (deadline ? deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS) : GRADE_SNAPSHOT_TIMEOUT_MS);
@@ -1783,7 +1792,12 @@ export function createVerificationWiring(deps: {
       })();
       return { entry, before: await before, now: await now };
     }));
-    return { ...(planned.name !== undefined ? { name: planned.name } : {}), snapshots };
+    return {
+      ...(planned.name !== undefined ? { name: planned.name } : {}),
+      snapshots,
+      // P3c.4 (SD-P3c-9): the dispatch's admission, for the perimeter frozen at return (perimeterAtReturn).
+      ...(planned.admission !== undefined ? { admission: planned.admission } : {}),
+    };
   };
 
   /**
@@ -1886,7 +1900,7 @@ export function createVerificationWiring(deps: {
    * dispatch has no perimeter or none of it remains beyond W.
    */
   const perimeterAtReturn = async (
-    planned: { name?: string; snapshots: PerimeterSnapshots } | undefined,
+    planned: { name?: string; snapshots: PerimeterSnapshots; admission?: DispatchPerimeter["admission"] } | undefined,
     snapshot: TreeSnapshot | undefined,
     base: string,
   ): Promise<{
@@ -1894,6 +1908,8 @@ export function createVerificationWiring(deps: {
     workingSet: FrozenPerimeter["workingSet"];
     links: FrozenPerimeter["links"];
     linkUnobserved: boolean;
+    /** P3c.4 (SD-P3c-9): the dispatch's admission (planPerimeter), frozen with the perimeter. Absent: none recorded. */
+    admission?: DispatchPerimeter["admission"];
   } | undefined> => {
     const observation = await perimeterAtGate(planned, snapshot, base, undefined, { discover: false });
     if (planned === undefined || observation === undefined) return undefined;
@@ -1915,13 +1931,16 @@ export function createVerificationWiring(deps: {
       if (seed.origin === "working-set" && !workingSet.has(key)) {
         workingSet.set(key, { root, ...(seed.name !== undefined ? { name: seed.name } : {}) });
       }
-      const isLink = seed.origin === "link" || seed.linked === true;
+      // P3c.4 (SD-P3c-2, S11): a dependency of W, a package link target or a declared edge's repository (origin "link" or
+      // "edge", or a working-set root `linked` or `edged`), is frozen and observed again at router_verify, where W's
+      // dependency targets are read through the same union (`dependencyTargets`, F1).
+      const isDependency = seed.origin === "link" || seed.linked === true || seed.origin === "edge" || seed.edged === true;
       if (fixed !== undefined) {
-        // P2e QA-1 #1: a link target past the cap was never observed: not deferred (X7). An unadmitted one is never observed.
-        if (fixed === "unobserved" && isLink) linkUnobserved = true;
+        // P2e QA-1 #1: a dependency past the cap was never observed: not deferred (X7). An unadmitted one is never observed.
+        if (fixed === "unobserved" && isDependency) linkUnobserved = true;
         continue;
       }
-      if (!isLink) continue;
+      if (!isDependency) continue;
       if (refused || before === undefined || now === undefined || now.root === undefined) {
         linkUnobserved = true;
         continue;
@@ -1937,7 +1956,13 @@ export function createVerificationWiring(deps: {
         });
       }
     }
-    return { observation, workingSet: [...workingSet.values()], links: [...links.values()], linkUnobserved };
+    return {
+      observation,
+      workingSet: [...workingSet.values()],
+      links: [...links.values()],
+      linkUnobserved,
+      ...(planned.admission !== undefined ? { admission: planned.admission } : {}),
+    };
   };
 
   /**
@@ -2349,6 +2374,9 @@ export function createVerificationWiring(deps: {
               workingSet: frozen.workingSet,
               links: frozen.links,
               pins: frozenPins,
+              // P3c.4 (SD-P3c-9): the admission the dispatch's planPerimeter read W's links and edges with; router_verify reads
+              // W's dependency targets again through it (the registry freezes a copy).
+              ...(frozen.admission !== undefined ? { admission: frozen.admission } : {}),
             },
           }
           : {}),
@@ -2583,12 +2611,19 @@ export function createVerificationWiring(deps: {
     | { readonly kind: "final"; readonly result: VerificationResult }
     | { readonly kind: "gate"; readonly res: GateResult; readonly retryable: boolean; readonly strict: boolean };
 
+  /**
+   * Cross-repo P3c.4 (SD-P3c-8): W's dependency targets (`dependencyTargets`) read at one router_verify call, keyed by W's
+   * comparison key and the frozen admission it was read with: the call's entries of one W read them once.
+   */
+  type DependencyMemo = Map<string, DependencyTargets | undefined>;
+
   /** 2.4.3a P0 from the pending entry: stored change set and reference, current tree, drift. */
   const prepareClaim = async (
     entry: PendingEntry,
     deadline: Deadline,
     snapshots: Map<string, Promise<TreeSnapshot | undefined>>,
     lowPriority: boolean,
+    dependencies: DependencyMemo = new Map(),
   ): Promise<ClaimPreparation> => {
     let snapshot = snapshots.get(entry.cwd);
     if (snapshot === undefined) {
@@ -2695,7 +2730,8 @@ export function createVerificationWiring(deps: {
       // the call's entries through `snapshots`). Working-set roots are not: the I4 window ended at return.
       type FrozenLink = NonNullable<PendingEntry["perimeter"]>["links"][number];
       type Drift = { readonly name: string; readonly root: string; readonly why: "changed" | "unobserved" };
-      // `real`: where link.at resolves now (fs only); `targets`: W's package link targets now (linkedTargets: fs only, no git).
+      // `real`: where link.at resolves now (fs only); `targets`: what W depends on now, its package link targets and its admitted
+      // declared edges' top levels (P3c.4, SD-P3c-1: `dependencyTargets`, fs only, no git run).
       const observeLink = async (link: FrozenLink, real: string | undefined, targets: readonly string[]): Promise<Drift | undefined> => {
         const name = link.name ?? basename(link.root);
         // P2e QA-1 #4 (I12): no git where the link no longer resolves inside its frozen root, or where its admission refuses.
@@ -2724,27 +2760,56 @@ export function createVerificationWiring(deps: {
         // The W directory planPerimeter read links from at dispatch (it can be a subfolder of the git top level); an entry
         // registered without one falls back to the snapshot root.
         const wRoot = frozen.linkBase ?? frozen.observation.w.root;
-        let targets: string[];
-        try {
-          targets = linkedTargets(wRoot);
-        } catch {
-          targets = []; // Never expected (it skips what it cannot read): every frozen link is then "changed".
+        // P3c.4 (SD-P3c-1, F1): W's dependency targets now, the union of its package links and its declared edges, read through
+        // the admission frozen at dispatch (SD-P3c-9) and once per W for this call's entries (SD-P3c-8). An entry registered
+        // without a frozen admission reads W's package links only, as before P3c.
+        const admission = frozen.admission;
+        const context = admission !== undefined ? admissionFromData(admission) : undefined;
+        const memoKey = `${perimeterKey(wRoot)}\0${admission !== undefined ? JSON.stringify(admission) : ""}`;
+        if (!dependencies.has(memoKey)) {
+          let read: DependencyTargets | undefined;
+          try {
+            read = context !== undefined
+              ? dependencyTargets(wRoot, context)
+              : { targets: linkedTargets(wRoot).map(at => ({ origin: "link" as const, at })), unadmittedMore: 0, incomplete: false };
+          } catch {
+            read = undefined; // Never expected (both skip what they cannot read): every frozen dependency is then "changed".
+          }
+          dependencies.set(memoKey, read);
         }
+        const current = dependencies.get(memoKey)?.targets ?? [];
+        // What W still depends on: its link targets (admitted or not, as before) and its admitted edges' top levels. An
+        // unadmitted edge target is text only (never observed): it only names a new dependency below.
+        const targets = current.filter(target => !("fixed" in target)).map(target => target.at);
         const drifts = await Promise.all(frozen.links.map((link, index) => observeLink(link, reals[index], targets)));
-        // P2e QA-1 #2: a link target of W now that none of the perimeter frozen at return covers is new: "changed", named by
-        // its top level (found without git). W's own repository is W's snapshot, as at dispatch (planPerimeter); links are
-        // read from `wRoot` (the dispatch's W), never from the snapshot root (which is the git top level).
+        // P2e QA-1 #2: a dependency target of W now that none of the perimeter frozen at return covers (its links and edges'
+        // roots, frozen at return, and its observed roots) is new: "changed". W's own repository is W's snapshot, as at
+        // dispatch (planPerimeter); W's dependencies are read from `wRoot` (the dispatch's W), never from the snapshot root
+        // (which is the git top level).
         const covering = [
           ...frozen.links.map(link => link.root),
           ...reals.filter((real): real is string => real !== undefined),
           ...frozen.observation.roots.map(root => root.root),
         ];
+        // A new link target is named by its top level, found without git: below its parent (or above its working-set worktree)
+        // as at dispatch (SD-P3c-9, F8). Outside every parent and worktree, it is named by its text: nothing runs there (I11).
+        // Without a frozen admission: its top level, as before P3c.
+        const linkTop = (target: string): string => {
+          if (context === undefined) return gitTopOf(target) ?? target;
+          const parent = context.parentOf(target);
+          const worktree = context.worktreeOf(target);
+          if (parent === undefined && worktree === undefined) return target;
+          return gitTopOf(target, worktree !== undefined ? dirname(worktree.worktree) : parent) ?? target;
+        };
         const fresh = new Map<string, Drift>();
-        for (const target of targets) {
-          if (covering.some(root => depthBelow(target, root) >= 0)) continue;
-          const top = gitTopOf(target) ?? target;
+        for (const target of current) {
+          if (covering.some(root => depthBelow(target.at, root) >= 0)) continue;
+          // An edge target is already its top level (admitted, found below its parent by `resolveEdgeTarget`) or text (not
+          // admitted: named from its text, with no filesystem call, I11).
+          const top = target.origin === "edge" ? target.at : linkTop(target.at);
           if (depthBelow(top, wRoot) >= 0 || depthBelow(wRoot, top) >= 0) continue;
-          if (!fresh.has(perimeterKey(top))) fresh.set(perimeterKey(top), { name: basename(top), root: top, why: "changed" });
+          const name = "fixed" in target ? target.name : basename(top);
+          if (!fresh.has(perimeterKey(top))) fresh.set(perimeterKey(top), { name, root: top, why: "changed" });
         }
         return [...drifts.filter((drift): drift is Drift => drift !== undefined), ...fresh.values()];
       };
@@ -3037,8 +3102,10 @@ export function createVerificationWiring(deps: {
       // 4. Every preparation first, then every gate at once: the testsPass requests share the
       //    deadline and reach the S5 coordinator together (one window, one batch).
       const snapshots = new Map<string, Promise<TreeSnapshot | undefined>>();
+      // P3c.4 (SD-P3c-8): W's dependency targets, read once per W for this call's entries.
+      const dependencies: DependencyMemo = new Map();
       // QA-3.1-8: the current-tree snapshot at the configured priority; a background run's always low.
-      const preparations = claims.map(c => prepareClaim(c.entry, owned, snapshots, budget.lowPriority || options.background === true));
+      const preparations = claims.map(c => prepareClaim(c.entry, owned, snapshots, budget.lowPriority || options.background === true, dependencies));
       const allPrepared = Promise.allSettled(preparations);
       const gates = claims.map(async (c, i): Promise<{ readonly prep: ClaimPreparation | undefined; readonly gate: ClaimGate }> => {
         let prep: ClaimPreparation | undefined;

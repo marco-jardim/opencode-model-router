@@ -7,6 +7,8 @@
  * - D6: consumers are discovered at router_verify over the frozen working set.
  * - The frozen pins reach materialize, and pinNow admits exactly the frozen links.
  * - An entry with no perimeter takes no extra snapshot or discovery.
+ * - Cross-repo P3c.4 (S11): W's dependency targets (package links and declared edges, `dependencyTargets`) are read again
+ *   through the admission frozen at return, once per W per call; a frozen edge target is observed again like a link's.
  *
  * Entries are registered directly through the wiring's pending registry (nothing registers a perimeter yet), then claimed through
  * the real router_verify. The tree snapshot is pinned per directory through the `src/verify/tree` mock seam
@@ -42,12 +44,18 @@ const state = vi.hoisted(() => ({
   openers: [] as { pinNow: (root: string) => Promise<unknown> }[],
   /** P2e QA-1 #5b: paths whose fs/promises realpath fails, with the error code. */
   realpathFails: new Map<string, string>(),
+  /** P3c.4: the W of every dependencyTargets call the wiring made (SD-P3c-8). */
+  dependencyReads: [] as string[],
+  /** P3c.4: every directory gitTopOf started from, and every path fs/promises realpath was called on (I11 spies). */
+  gitTops: [] as string[],
+  realpaths: [] as string[],
 }));
 
 vi.mock("node:fs/promises", async importOriginal => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
   const realReal = actual.realpath as (p: string, ...rest: unknown[]) => Promise<string>;
   const realpath = async (p: string, ...rest: unknown[]): Promise<string> => {
+    state.realpaths.push(String(p));
     const code = state.realpathFails.get(String(p));
     if (code !== undefined) throw Object.assign(new Error(`${code}: realpath ${String(p)}`), { code });
     return realReal(p, ...rest);
@@ -70,6 +78,20 @@ vi.mock("../../src/verify/perimeter", async importOriginal => {
     discoverConsumers: (...args: Parameters<typeof actual.discoverConsumers>) => {
       state.discoveries.push({ w: args[0], roots: args[1].map(candidate => candidate.root) });
       return actual.discoverConsumers(...args);
+    },
+    dependencyTargets: (...args: Parameters<typeof actual.dependencyTargets>) => {
+      state.dependencyReads.push(args[0]);
+      return actual.dependencyTargets(...args);
+    },
+  };
+});
+vi.mock("../../src/verify/git-top", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../src/verify/git-top")>();
+  return {
+    ...actual,
+    gitTopOf: (...args: Parameters<typeof actual.gitTopOf>) => {
+      state.gitTops.push(args[0]);
+      return actual.gitTopOf(...args);
     },
   };
 });
@@ -164,6 +186,8 @@ interface Registered {
   captured?: boolean;
   dod?: DoD;
   placements?: readonly (CheckPlacement | undefined)[];
+  /** P3c.4: another dispatch (two entries of one W). Default: d1 / child1. */
+  dispatch?: { readonly id: string; readonly producer: string };
 }
 
 /** The digests of the producer's file right after it returned (the file is never touched again: no drift). */
@@ -176,8 +200,8 @@ function register(reg: Registered): string {
   if (wiring === undefined) throw new Error("the plugin built no wiring");
   const result = wiring.pending.register({
     orchestratorSessionID: "orch",
-    dispatchID: "d1",
-    producerSessionID: "child1",
+    dispatchID: reg.dispatch?.id ?? "d1",
+    producerSessionID: reg.dispatch?.producer ?? "child1",
     producerTier: "fast",
     description: "the work",
     cwd: work,
@@ -237,6 +261,9 @@ beforeEach(() => {
   state.discoveries.length = 0;
   state.openers.length = 0;
   state.realpathFails.clear();
+  state.dependencyReads.length = 0;
+  state.gitTops.length = 0;
+  state.realpaths.length = 0;
   state.fallback = treeOf(work, HEAD_W);
   acceptSpy = vi.spyOn(gateModule, "accept");
 });
@@ -463,6 +490,131 @@ describe("P2e QA round 2 (#107): W is a subfolder of its repository", () => {
     const out = await verify(h, handle);
     expect(outcomeOf(out, handle)).toBe("pass");
     expect(out).not.toMatch(ANY_LINK_CAVEAT);
+  });
+});
+
+describe("declared dependency edges at router_verify (P3c)", () => {
+  let realHome = "";
+  let libC = "";
+  /** lib-b as W's frozen edge target (an "edge" seed is its top level): head and fingerprint at return are treeOf(libB, HEAD_B)'s. */
+  const edgeLink = (): DeferredPerimeter["links"][number] => ({ at: libB, root: libB, name: "lib-b", head: HEAD_B, fingerprint: "fp-lib-b" });
+  /** The admission the dispatch read W's dependencies with (frozen at return): the temporary home is the parent, both spellings. */
+  const admission = (): NonNullable<DeferredPerimeter["admission"]> => ({ parents: [...new Set([home, realHome])], depth: 1, workingSet: [] });
+  const frozenEdges = (links: DeferredPerimeter["links"]): DeferredPerimeter => ({ ...frozen("unchanged", { links }), admission: admission() });
+  /** `dir`'s package.json declaring `deps` (name → `file:` spec): declared edges, no node_modules link. */
+  const declare = (dir: string, deps: Record<string, string>): void => {
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: path.basename(dir), dependencies: deps }), "utf-8");
+  };
+  const gitRepo = (dir: string): void => {
+    fs.mkdirSync(path.join(dir, ".git"), { recursive: true });
+  };
+
+  beforeEach(() => {
+    realHome = fs.realpathSync.native(home);
+    gitRepo(libB);
+    libC = path.join(realHome, "lib-c");
+    fs.mkdirSync(libC, { recursive: true });
+    gitRepo(libC);
+  });
+
+  it("an unchanged edge target → pass, no S11 caveat (F1: read again through the union)", async () => {
+    const h = await makePlugin();
+    declare(work, { "lib-b": "file:../lib-b" });
+    state.byDir.set(libB, treeOf(libB, HEAD_B));
+    const handle = register({ perimeter: frozenEdges([edgeLink()]) });
+    const out = await verify(h, handle);
+    expect(outcomeOf(out, handle)).toBe("pass");
+    expect(out).not.toMatch(ANY_LINK_CAVEAT);
+    expect(state.dependencyReads).toEqual([work]);
+    // One hardened snapshot of the edge root for the call.
+    expect(state.calls.filter(at => at === libB)).toHaveLength(1);
+  });
+
+  it("the edge target changed after return → UNVERIFIED with S11 changed", async () => {
+    const h = await makePlugin();
+    declare(work, { "lib-b": "file:../lib-b" });
+    state.byDir.set(libB, treeOf(libB, "c".repeat(40)));
+    const handle = register({ perimeter: frozenEdges([edgeLink()]) });
+    const out = await verify(h, handle);
+    expect(outcomeOf(out, handle)).toBe("unverifiable");
+    expect(out).toContain(LINK_DRIFT_CAVEAT.changed("lib-b", libB));
+  });
+
+  it("the edge removed after return → S11 changed", async () => {
+    const h = await makePlugin();
+    declare(work, { "lib-b": "file:../lib-b" });
+    state.byDir.set(libB, treeOf(libB, HEAD_B));
+    const handle = register({ perimeter: frozenEdges([edgeLink()]) });
+    declare(work, {});
+    const out = await verify(h, handle);
+    expect(outcomeOf(out, handle)).toBe("unverifiable");
+    expect(out).toContain(LINK_DRIFT_CAVEAT.changed("lib-b", libB));
+  });
+
+  it("an edge added after return → S11 changed, named by its top level", async () => {
+    const h = await makePlugin();
+    declare(work, { "lib-b": "file:../lib-b" });
+    state.byDir.set(libB, treeOf(libB, HEAD_B));
+    const handle = register({ perimeter: frozenEdges([edgeLink()]) });
+    declare(work, { "lib-b": "file:../lib-b", "lib-c": "file:../lib-c/dist" });
+    const out = await verify(h, handle);
+    expect(outcomeOf(out, handle)).toBe("unverifiable");
+    expect(out).toContain(LINK_DRIFT_CAVEAT.changed("lib-c", libC));
+    expect(out).not.toContain(LINK_DRIFT_CAVEAT.changed("lib-b", libB));
+    // Named only: a new dependency is never snapshotted at router_verify.
+    expect(state.calls).not.toContain(libC);
+  });
+
+  it("a new edge outside the parents → S11 changed, named from its text, with no filesystem call on it (I11)", async () => {
+    const h = await makePlugin();
+    const outsideDir = path.join(path.dirname(realHome), `omr-outside-${path.basename(realHome)}`);
+    const outside = path.join(outsideDir, "lib-z");
+    declare(work, { "lib-b": "file:../lib-b" });
+    state.byDir.set(libB, treeOf(libB, HEAD_B));
+    const handle = register({ perimeter: frozenEdges([edgeLink()]) });
+    declare(work, { "lib-b": "file:../lib-b", "lib-z": `file:../../${path.basename(outsideDir)}/lib-z` });
+    const nativeSpy = vi.spyOn(fs.realpathSync, "native");
+    let out = "";
+    try {
+      out = await verify(h, handle);
+    } finally {
+      nativeSpy.mockRestore();
+    }
+    expect(outcomeOf(out, handle)).toBe("unverifiable");
+    expect(out).toContain(LINK_DRIFT_CAVEAT.changed("lib-z", outside));
+    const touched = [...nativeSpy.mock.calls.map(call => String(call[0])), ...state.gitTops, ...state.realpaths];
+    expect(touched.filter(at => at.toLowerCase().startsWith(outsideDir.toLowerCase()))).toEqual([]);
+    expect(fs.existsSync(outsideDir)).toBe(false);
+  });
+
+  it("W a subfolder of its repository: edges are read from linkBase, never from the top level", async () => {
+    const h = await makePlugin();
+    const top = fs.realpathSync.native(fs.mkdtempSync(path.join(home, "mono-")));
+    const sub = path.join(top, "packages", "x");
+    fs.mkdirSync(sub, { recursive: true });
+    declare(sub, { "lib-b": "file:../../../lib-b" });
+    // The top level declares lib-c: W (the subfolder) does not depend on it, so it is not new.
+    declare(top, { "lib-c": "file:../lib-c" });
+    state.byDir.set(libB, treeOf(libB, HEAD_B));
+    const base = frozenEdges([edgeLink()]);
+    const handle = register({ perimeter: { ...base, observation: { ...base.observation, w: { ...base.observation.w, root: top } }, linkBase: sub } });
+    const out = await verify(h, handle);
+    expect(outcomeOf(out, handle)).toBe("pass");
+    expect(out).not.toMatch(ANY_LINK_CAVEAT);
+    expect(state.dependencyReads).toEqual([sub]);
+  });
+
+  it("two entries of one W in one router_verify read its dependency targets once (SD-P3c-8)", async () => {
+    const h = await makePlugin();
+    declare(work, { "lib-b": "file:../lib-b" });
+    state.byDir.set(libB, treeOf(libB, HEAD_B));
+    const first = register({ perimeter: frozenEdges([edgeLink()]) });
+    const second = register({ perimeter: frozenEdges([edgeLink()]), dispatch: { id: "d2", producer: "child2" } });
+    const out: string = await h.hooks.tool.router_verify.execute({ handles: [first, second] }, { sessionID: "orch" });
+    expect(outcomeOf(out, first)).toBe("pass");
+    expect(outcomeOf(out, second)).toBe("pass");
+    expect(out).not.toMatch(ANY_LINK_CAVEAT);
+    expect(state.dependencyReads).toEqual([work]);
   });
 });
 

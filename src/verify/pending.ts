@@ -480,6 +480,25 @@ export interface DeferredPerimeter {
    * the canonical session folder. It can be a subfolder of the git top level. Absent: fall back to observation.w.root.
    */
   readonly linkBase?: string;
+  /**
+   * Cross-repo P3c.4 (SD-P3c-9): the admission W's dependencies were read with at dispatch, as data. At router_verify W's
+   * dependency targets are read again through it (`dependencyTargets`), so that a target outside the parents is named from its
+   * text and a new target's top level is found below its parent (the `gitTopOf` ceiling). Absent: an entry registered without
+   * one; then only W's package links are read again, admitted by nothing (as before P3c).
+   */
+  readonly admission?: DeferredAdmission;
+}
+
+/** Cross-repo P3c.4: the frozen admission of a deferred perimeter (data only, `admissionContext`'s inputs and parents). */
+export interface DeferredAdmission {
+  /** Both spellings of each parent (as configured, and canonical), as `admissionContext` computed them at dispatch. */
+  readonly parents: readonly string[];
+  /** `routing.repoDepth` at dispatch. */
+  readonly depth: number;
+  /** `routing.repoExclude` at dispatch. Absent: none. */
+  readonly exclude?: readonly string[];
+  /** The working set at dispatch (the orchestrator's, W's own entry included). */
+  readonly workingSet: readonly { readonly worktree: string; readonly name?: string }[];
 }
 
 /** Absolute path -> sha256 hex of the file bytes, or ABSENT_DIGEST for a missing path (R3). */
@@ -829,12 +848,24 @@ function freezePerimeter(perimeter: DeferredPerimeter | undefined): DeferredPeri
     observation: perimeter.observation,
     // Kept as given (a path string); absent stays absent (router_verify then falls back to observation.w.root).
     ...(perimeter.linkBase === undefined ? {} : { linkBase: perimeter.linkBase }),
+    // P3c.4: copied and frozen (the caller's arrays never alias it); absent stays absent (links only at router_verify).
+    ...(perimeter.admission === undefined ? {} : { admission: freezeAdmission(perimeter.admission) }),
     workingSet: Object.freeze(perimeter.workingSet.map((w) => Object.freeze({ ...w }))),
     links: Object.freeze(perimeter.links.map((l) => Object.freeze({ ...l }))),
     pins: perimeter.pins.then(
       (pins) => pins,
       (): readonly LinkPin[] => [],
     ),
+  });
+}
+
+/** P3c.4: a frozen copy of a deferred perimeter's admission data. */
+function freezeAdmission(admission: DeferredAdmission): DeferredAdmission {
+  return Object.freeze({
+    parents: Object.freeze([...admission.parents]),
+    depth: admission.depth,
+    ...(admission.exclude === undefined ? {} : { exclude: Object.freeze([...admission.exclude]) }),
+    workingSet: Object.freeze(admission.workingSet.map((entry) => Object.freeze({ ...entry }))),
   });
 }
 

@@ -124,6 +124,17 @@ export interface DispatchPerimeter {
   /** W's repository name when the grant's location names it. */
   readonly name?: string;
   readonly roots: readonly PerimeterSeed[];
+  /**
+   * Cross-repo P3c.4 (SD-P3c-9): the admission W's package links and declared edges were read with (perimeter.ts
+   * `AdmissionData`: the parents in both spellings, depth, excludes, working set). A deferred perimeter freezes it so that
+   * `router_verify` reads W's dependency targets again as the dispatch did. Absent: none recorded (links only at router_verify).
+   */
+  readonly admission?: {
+    readonly parents: readonly string[];
+    readonly depth: number;
+    readonly exclude?: readonly string[];
+    readonly workingSet: readonly { readonly worktree: string; readonly name?: string }[];
+  };
 }
 
 /** Cross-repo P1.8: the dispatch-time state of one extra root of the perimeter. */
@@ -339,7 +350,12 @@ interface DispatchRecord {
   /** P0.3: the unattributable writers (isUnattributedWriter) of every session in `producers`. */
   writers: Set<string>;
   /** Cross-repo P1.8 (I13): the extra roots of the dispatch's perimeter, by snapshot directory; absent: no perimeter. */
-  perimeter?: { readonly name?: string; readonly entries: Map<string, PerimeterEntry> };
+  perimeter?: {
+    readonly name?: string;
+    readonly entries: Map<string, PerimeterEntry>;
+    /** Cross-repo P3c.4: the admission the perimeter was planned with (DispatchPerimeter.admission). */
+    readonly admission?: DispatchPerimeter["admission"];
+  };
 }
 
 /**
@@ -531,7 +547,11 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
           })();
           entries.set(seed.at, entry);
         }
-        d.perimeter = { ...(deps.perimeter.name !== undefined ? { name: deps.perimeter.name } : {}), entries };
+        d.perimeter = {
+          ...(deps.perimeter.name !== undefined ? { name: deps.perimeter.name } : {}),
+          entries,
+          ...(deps.perimeter.admission !== undefined ? { admission: deps.perimeter.admission } : {}),
+        };
       }
       const readHead = deps.headState;
       if (readHead !== undefined) {
@@ -707,7 +727,11 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
       return dispatches.get(id)?.snapshotContaminatedBy;
     },
     /** Cross-repo P1.8: the dispatch's perimeter beyond W, planned at dispatch; undefined when it has none or is untracked. */
-    perimeterOf(id: string): { readonly name?: string; readonly entries: ReadonlyMap<string, PerimeterEntry> } | undefined {
+    perimeterOf(id: string): {
+      readonly name?: string;
+      readonly entries: ReadonlyMap<string, PerimeterEntry>;
+      readonly admission?: DispatchPerimeter["admission"];
+    } | undefined {
       return dispatches.get(id)?.perimeter;
     },
     record(sessionID: string, tool: string, args: unknown): void {
