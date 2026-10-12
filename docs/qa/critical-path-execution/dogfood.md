@@ -374,3 +374,19 @@ Build `cpx/df1.1` = `9fa7607` (`D:\git\omr-cpx-dogfood-df1.1`), loaded since 202
   run (QA-DF1-24 predicted it). The cache-share statistic therefore over-counts. Fix: one recorder per process (shared
   registry on `globalThis`, like the pending snapshot providers), or record turns only in the instance whose location
   owns the session.
+- **DF-1.1-3 — STOP: a second server drained this plan's sessions (2026-10-12 19:17Z).** The scoop OpenCode 2.0.27
+  background service (`opencode.exe serve --service`, pid 69232, started 16:17:45 -03:00 by pid 36096 =
+  `opencode -c`, global config, router `file:///D:/git/opencode-model-router/server.ts`; server run `6d23db21`)
+  booted locations for every project in the shared session DB, `D:\git\omr-cpx-main` and
+  `D:\git\opencode-model-router-cross-repo` included, and tried to drain this plan's sessions:
+  `Failed to drain Session sessionID=ses_ece75a308ffeiewvtn1iIXGAms` (19:18:47Z) and
+  `sessionID=ses_ecf5bd114ffe5QT3S5xVTAQcF4` (the orchestrator, 19:19:04Z), both
+  `AI.Error: messages.N.content.1.tool_use.input: Input should be an object`. From then on the orchestrator's turns
+  alternate between the two servers: a shell marker landed in run `6d23db21` (19:18:43Z), the next in the df1.1 run
+  `59ec52b7` (19:19:15Z), and the injected AGENTS.md source flips between the global and the process-scoped config.
+  Children were affected: 3.1.2 and 3.1.4 implementers ended with the same `tool_use.input` error; the 3.1.3 implementer
+  and the DF1.4.c child 1 were re-bound to work root `D:\git\omr-cpx-main` (the base build's binding) and stopped.
+  Effect on the other implementation: its service server ran this plan's sessions with the base build (the router of
+  `D:\git\opencode-model-router`). Critical per handover §6 ("any effect on the other implementation"): dispatching is
+  stopped until the owner decides. Uncommitted work in `D:\git\omr-cpx-p31` (`schedule.ts`, `capacity.ts`, `expand.ts`
+  and tests, partial) is kept as is.
