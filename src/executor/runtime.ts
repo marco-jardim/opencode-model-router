@@ -710,6 +710,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     l = p.writer.ledger;
     if (l.status !== "running") {
       closeIdle(p);
+      // A plan-completed wake that was debounced or failed is retried by the tick wakeOnce re-armed (M32); idempotent per key.
+      if (l.status === "completed") await wakeOnce(p, "plan-completed", `plan-completed:${p.planId}`);
       return;
     }
     const ready = d.scheduler.readySet(l, p.inFlight, p.leases, p.capView);

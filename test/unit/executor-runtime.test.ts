@@ -18,13 +18,16 @@ import {
   commitTaskInSlot,
   createExecutorRuntime,
   createLeaseService,
+  createWaker,
   type ExecutorRuntimeHandle,
   type LeaseRegistryPort,
   type PlanCollaborators,
   type RuntimeDeps,
 } from "../../src/executor/runtime.js";
 import { createScheduler } from "../../src/executor/schedule.js";
+import { defaultSlotsDir } from "../../src/executor/slots/pool.js";
 import {
+  ExecutorError,
   QA_UNPARSABLE_CONTEXT_PREFIX,
   countsTowardMaxAttempts,
   formatInboxId,
@@ -60,6 +63,7 @@ import {
   type ProcOpts,
   type ProcessResult,
   type QaLoop,
+  type RecoveryService,
   type ResumeReport,
   type RetainedContextInfo,
   type RouteResolver,
@@ -161,12 +165,14 @@ function need<T>(v: T | null | undefined, what: string): T {
   return v;
 }
 
-function deferred<T>(): { promise: Promise<T>; resolve(v: T): void } {
+function deferred<T>(): { promise: Promise<T>; resolve(v: T): void; reject(e: unknown): void } {
   let resolve: (v: T) => void = () => undefined;
-  const promise = new Promise<T>((r) => {
-    resolve = r;
+  let reject: (e: unknown) => void = () => undefined;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
   });
-  return { promise, resolve: (v) => resolve(v) };
+  return { promise, resolve: (v) => resolve(v), reject: (e) => reject(e) };
 }
 
 async function pause(ms: number): Promise<void> {
@@ -300,7 +306,10 @@ class SlotPoolDouble implements SlotPool {
   async list(): Promise<SlotRecord[]> {
     return [...this.records.values()];
   }
-  async gc(): Promise<{ removed: string[]; reported: string[] }> {
+  /** The predicate the runtime handed to the last `gc` call. */
+  gcPredicate: Parameters<SlotPool["gc"]>[0] | null = null;
+  async gc(isDone?: Parameters<SlotPool["gc"]>[0]): Promise<{ removed: string[]; reported: string[] }> {
+    this.gcPredicate = isDone ?? null;
     return { removed: [], reported: [] };
   }
 }
@@ -438,7 +447,7 @@ class PolicyDouble implements UnattendedPolicy {
     if (slot !== null) await this.slots.release(slot);
     return this.add({ kind: cause === "exhausted" ? "failure" : "question", severity: "blocking", taskId, text, options: [] });
   }
-  async answer(): Promise<{ resumed: TaskId | null }> {
+  async answer(_inboxId?: string, _text?: string): Promise<{ resumed: TaskId | null }> {
     return { resumed: null };
   }
   async unblock(): Promise<TaskId[]> {
@@ -480,12 +489,15 @@ class GitDouble implements GitRunner {
   readonly calls: Array<{ args: readonly string[]; cwd: string }> = [];
   dirty: (cwd: string) => boolean = () => true;
   failOn: { verb: string; stderr: string } | null = null;
+  /** Every ref `for-each-ref` lists, whatever prefix was asked for. */
+  refs: string[] = [];
   private commits = 0;
   async run(args: readonly string[], o: ProcOpts): Promise<ProcessResult> {
     this.calls.push({ args: [...args], cwd: o.cwd });
     const verb = args[0] ?? "";
     const ok = (stdout = ""): ProcessResult => ({ code: 0, signal: null, stdout, stderr: "", truncated: false, durationMs: 0 });
     if (this.failOn !== null && this.failOn.verb === verb) return { ...ok(), code: 1, stderr: this.failOn.stderr };
+    if (verb === "for-each-ref") return ok(this.refs.join("\n"));
     if (verb === "worktree") return ok(`worktree ${REPO}\nHEAD ${SHA}\nbranch refs/heads/main\n`);
     if (verb === "config") return { ...ok(), code: 1 };
     if (verb === "status") return ok(this.dirty(o.cwd) ? " M src/a.ts\n" : "");
@@ -584,6 +596,10 @@ class RunDouble {
 
 class LauncherDouble implements TaskLauncher {
   gateValue: LaunchGate = OK_GATE;
+  /** When set, the next `launch` throws it (one shot). */
+  launchFailure: Error | null = null;
+  /** Set by `releaseAll`. */
+  closed = false;
   readonly runs: RunDouble[] = [];
   disposed = 0;
   constructor(
@@ -596,6 +612,28 @@ class LauncherDouble implements TaskLauncher {
     return this.gateValue;
   }
   launch(req: LaunchRequest, hooks: LaunchHooks): LaunchHandle {
+    if (this.closed) {
+      // Teardown already ran `releaseAll`: a launch that raced it is settled at once so dispose never waits for it.
+      const late = new RunDouble(req, hooks, false, this.clock);
+      this.runs.push(late);
+      late.confirm({ kind: "confirmed", childSessionID: "ses-none", latencyMs: 0 });
+      late.end({ kind: "interrupted", childSessionID: null, reason: "dispose", endedAt: this.clock.iso() });
+      return {
+        taskId: req.taskId,
+        attempt: req.attempt,
+        nonce: req.nonce,
+        context: req.context,
+        contextAgeMs: 0,
+        startedAt: this.clock.iso(),
+        confirmation: late.confirmation.promise,
+        completion: late.completion.promise,
+      };
+    }
+    if (this.launchFailure !== null) {
+      const failure = this.launchFailure;
+      this.launchFailure = null;
+      throw failure;
+    }
     const t = this.ledgerOf()?.tasks[req.taskId];
     const a = t?.attempts[t.attempts.length - 1];
     const durable = a !== undefined && a.n === req.attempt && a.nonce === req.nonce && a.outcome === null;
@@ -632,11 +670,16 @@ class LauncherDouble implements TaskLauncher {
   runOf(taskId: TaskId, attempt: number): RunDouble | undefined {
     return this.runs.find((r) => r.req.taskId === taskId && r.req.attempt === attempt);
   }
-  /** Ends every live handle without journaling anything (used at test end, after the gate is closed). */
+  /**
+   * Settles every handle without journaling anything (used at test end, after the gate is closed): every confirmation
+   * (a run a test ended without confirming would otherwise keep `dispose` waiting) and every completion still open.
+   * Later launches settle at once (`closed`).
+   */
   releaseAll(): void {
+    this.closed = true;
     for (const r of this.runs) {
-      if (r.settled) continue;
       r.confirm({ kind: "confirmed", childSessionID: r.childSessionID ?? "ses-none", latencyMs: 0 });
+      if (r.settled) continue;
       r.end({ kind: "interrupted", childSessionID: r.childSessionID, reason: "dispose", endedAt: this.clock.iso() });
     }
   }
@@ -644,12 +687,23 @@ class LauncherDouble implements TaskLauncher {
 
 class CompilerDouble implements PlanCompiler {
   readonly compiled: string[] = [];
+  readonly compileOpts: Array<Record<string, unknown>> = [];
+  /** When set, `compile` also answers a residue request with this prompt. */
+  residuePrompt: string | null = null;
+  /** The draft `mergeResidue` returns (null: it throws like the real compiler on a bad answer). */
+  merged: LedgerV1 | null = null;
+  readonly residueTexts: string[] = [];
+  /** What `addTasks` returns (null: it throws like the real compiler on a cycle). */
+  added: { tasks: TaskNode[]; edges: Edge[]; reopened: TaskId[] } | null = null;
+  readonly addTexts: string[] = [];
   constructor(private readonly draft: LedgerV1) {}
   async compile(planPath: string, opts: { orchestratorSessionID: string }): ReturnType<PlanCompiler["compile"]> {
     this.compiled.push(planPath);
+    this.compileOpts.push({ ...opts });
     const draft: LedgerV1 = JSON.parse(JSON.stringify(this.draft)) as LedgerV1;
     draft.orchestrator = { sessionID: opts.orchestratorSessionID, boundAt: T0 };
     return {
+      ...(this.residuePrompt === null ? {} : { residueRequest: { prompt: this.residuePrompt, schema: {}, taskIds: [] } }),
       draft,
       summary: {
         tasks: Object.keys(draft.tasks).length,
@@ -664,11 +718,28 @@ class CompilerDouble implements PlanCompiler {
       },
     };
   }
-  mergeResidue(): never {
-    throw new Error("mergeResidue is not used here");
+  mergeResidue(_draft: LedgerV1, responseText: string): ReturnType<PlanCompiler["mergeResidue"]> {
+    this.residueTexts.push(responseText);
+    if (this.merged === null) throw new ExecutorError("E_RESIDUE", "answer does not match the schema");
+    return {
+      draft: this.merged,
+      summary: {
+        tasks: Object.keys(this.merged.tasks).length,
+        phases: this.merged.phases.length,
+        edges: this.merged.edges.length,
+        workMs: 0,
+        criticalPathMs: 0,
+        width: 1,
+        expectedMakespanMs: 0,
+        manual: [],
+        warnings: ["merged"],
+      },
+    };
   }
-  addTasks(): never {
-    throw new Error("addTasks is not used here");
+  addTasks(_ledger: LedgerV1, text: string): ReturnType<PlanCompiler["addTasks"]> {
+    this.addTexts.push(text);
+    if (this.added === null) throw new ExecutorError("E_CYCLE", "cycle");
+    return this.added;
   }
   validate(): Array<{ code: string; message: string; taskIds: TaskId[] }> {
     return [];
@@ -703,6 +774,8 @@ interface Harness {
   hosts: HostsDouble;
   pins: string[];
   unpins: string[];
+  compiler: CompilerDouble;
+  deps: RuntimeDeps;
   runtime: ExecutorRuntimeHandle;
   parts(): PlanParts;
   ledger(): Readonly<LedgerV1>;
@@ -759,9 +832,10 @@ async function mk(draft: LedgerV1): Promise<Harness> {
   const launcher = new LauncherDouble(log, clock, () => st.parts?.writer.ledger ?? null, snap);
   const pins: string[] = [];
   const unpins: string[] = [];
+  const compiler = new CompilerDouble(draft);
   const deps: RuntimeDeps = {
     store,
-    compiler: new CompilerDouble(draft),
+    compiler,
     slots,
     scheduler: createScheduler(),
     launcher,
@@ -808,6 +882,8 @@ async function mk(draft: LedgerV1): Promise<Harness> {
     hosts,
     pins,
     unpins,
+    compiler,
+    deps,
     runtime: createExecutorRuntime(deps),
     parts: () => need(st.parts, "plan collaborators"),
     ledger: () => need(st.parts, "plan collaborators").writer.ledger,
@@ -1003,6 +1079,21 @@ describe("lifecycle to integrated and done", () => {
     expect(h.slots.released).toEqual(["slot-1"]);
     expect(h.registry.releases.at(-1)).toBe("plan-one:T1");
     expect((await h.events()).some((e) => e.type === "task-transition" && e.to === "done" && e.trigger === "no-changes")).toBe(true);
+  });
+
+  it("a slot release that throws is logged as a warning and the task still ends done", async () => {
+    const h = await mk(planOf([task("T1", { footprint: { writes: [], reads: [], confidence: "explicit", sources: ["path"] } })]));
+    h.git.dirty = () => false;
+    h.slots.release = async () => {
+      throw new Error("release boom");
+    };
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    run.complete("Nothing to change.");
+    await until(() => h.state("T1") === "done", "T1 done");
+    await until(() => h.logs.some((l) => l.startsWith("warn: slot release failed")), "slot release warning");
+    expect(h.logs.find((l) => l.startsWith("warn: slot release failed"))).toContain("release boom");
+    expect(h.registry.heldBy("plan-one:T1")).toEqual([]);
   });
 
   it("M39: a required, writing task that produced no changes fails 'no changes' (counted) and is retried", async () => {
@@ -1290,6 +1381,421 @@ describe("wakes (D15, M32)", () => {
     await h.settled();
     expect(h.hosts.attempted).toHaveLength(3);
     expect(h.hosts.delivered).toEqual([]);
+  });
+});
+
+describe("launch step edges (M37)", () => {
+  const counterWith = async (h: Harness, key: string, label: string, value: string): Promise<boolean> =>
+    (await h.counters()).some((c) => c.key === key && c.labels[label] === value);
+
+  it("a slot pool without a free slot skips the launch as 'slot-unavailable' and leaves the task ready", async () => {
+    const h = await mk(planOf([task("T1")]));
+    h.slots.acquire = async () => {
+      throw new ExecutorError("E_SLOT_UNAVAILABLE", "no slot");
+    };
+    await h.begin();
+    await until(() => counterWith(h, "launch-skipped", "reason", "slot-unavailable"), "slot-unavailable counter");
+    expect(h.launcher.runs).toHaveLength(0);
+    expect(h.state("T1")).toBe("ready");
+    expect(h.registry.heldBy("plan-one:T1")).toEqual([]);
+  });
+
+  it("any other slot error skips the launch as 'provision'", async () => {
+    const h = await mk(planOf([task("T1")]));
+    h.slots.acquire = async () => {
+      throw new Error("disk gone");
+    };
+    await h.begin();
+    await until(() => counterWith(h, "launch-skipped", "reason", "provision"), "provision counter");
+    expect(h.launcher.runs).toHaveLength(0);
+    expect(h.state("T1")).toBe("ready");
+  });
+
+  it("a context that goes stale between the tick and the launch abandons the step and frees what it took", async () => {
+    const h = await mk(planOf([task("T1")]));
+    h.slots.onAcquire = () => {
+      h.slots.onAcquire = null;
+      h.launcher.gateValue = DISPOSED_GATE;
+    };
+    await h.begin();
+    await until(() => h.slots.released.length === 1, "slot released by the abandoned step");
+    expect(h.launcher.runs).toHaveLength(0);
+    expect(h.state("T1")).toBe("ready");
+    expect(h.task("T1").attempts).toEqual([]);
+    expect(h.registry.heldBy("plan-one:T1")).toEqual([]);
+  });
+
+  it("a phase paused between the tick and the dispatch batch makes row 4 write nothing; the step frees what it took", async () => {
+    const h = await mk(planOf([task("T1")]));
+    h.slots.onAcquire = () => {
+      h.slots.onAcquire = null;
+      // Queued on the writer before row 4's batch, so the batch sees the phase paused.
+      void h.parts().writer.append([{ type: "phase-paused", phaseId: "p1", paused: true, reason: "test" }]);
+    };
+    await h.begin();
+    await until(() => h.slots.released.length === 1, "slot released by the abandoned step");
+    expect(h.ledger().phases[0]?.paused).toBe(true);
+    expect(h.launcher.runs).toHaveLength(0);
+    expect(h.task("T1").attempts).toEqual([]);
+    expect(h.state("T1")).toBe("ready");
+    expect(h.registry.heldBy("plan-one:T1")).toEqual([]);
+  });
+
+  it("a git failure while preparing the prompt skips the launch as 'provision' and frees the fresh slot", async () => {
+    const h = await mk(planOf([task("T1")]));
+    h.git.failOn = { verb: "worktree", stderr: "fatal: not a git repository" };
+    await h.begin();
+    await until(() => h.slots.released.length === 1, "slot released");
+    expect(h.slots.released).toEqual(["slot-1"]);
+    expect(h.launcher.runs).toHaveLength(0);
+    expect(h.task("T1").attempts).toEqual([]);
+    await until(async () => (await h.counters()).some((c) => c.key === "launch-skipped" && c.labels.reason === "provision"), "provision counter");
+  });
+
+  it("a launcher that throws E_LAUNCH_TASK (L2) fails the attempt and counts it", async () => {
+    const h = await mk(planOf([task("T1")]));
+    h.launcher.launchFailure = new ExecutorError("E_LAUNCH_TASK", "bad route");
+    await h.begin();
+    await h.runOf("T1", 2);
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "failed" });
+    expect(h.parts().policy.counted.map((c) => c.n)).toEqual([1]);
+    expect(await counterWith(h, "launch-failed", "row", "L2")).toBe(true);
+  });
+
+  it("a launcher that throws E_NO_CONTEXT (L3) loses the attempt with 'no-context' and relaunches", async () => {
+    const h = await mk(planOf([task("T1")]));
+    h.launcher.launchFailure = new ExecutorError("E_NO_CONTEXT", "no context");
+    await h.begin();
+    await h.runOf("T1", 2);
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "lost" });
+    expect(h.parts().policy.counted).toEqual([]);
+    expect(await counterWith(h, "launch-failed", "row", "L3")).toBe(true);
+  });
+
+  it("a launcher that throws an unknown error (L4) loses the attempt as 'launch-error'", async () => {
+    const h = await mk(planOf([task("T1")]));
+    h.launcher.launchFailure = new Error("spawn failed");
+    await h.begin();
+    await h.runOf("T1", 2);
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "lost" });
+    expect(await counterWith(h, "launch-failed", "row", "L4")).toBe(true);
+  });
+
+  it("a launcher that is disposed (E_DISPOSED) releases only the capacity token", async () => {
+    const h = await mk(planOf([task("T1")]));
+    h.launcher.launchFailure = new ExecutorError("E_DISPOSED", "disposed");
+    await h.begin();
+    await until(async () => (await counterWith(h, "launch-failed", "row", "L4")), "launch-failed counter");
+    expect(h.launcher.runs).toHaveLength(0);
+    expect(h.state("T1")).toBe("dispatched");
+  });
+});
+
+describe("confirmations and child ends (rows 11, 12, 16, 18)", () => {
+  const counterWith = async (h: Harness, key: string, label: string, value: string): Promise<boolean> =>
+    (await h.counters()).some((c) => c.key === key && c.labels[label] === value);
+
+  it("a task-error confirmation fails the attempt (counted) with the launcher's message and retries", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.runOf("T1", 1);
+    run.confirm({ kind: "unconfirmed", reason: "task-error", error: "unknown model" });
+    await h.runOf("T1", 2);
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "failed", context: "unknown model" });
+    expect(h.parts().policy.counted.map((c) => c.n)).toEqual([1]);
+    expect(await counterWith(h, "launch-failed", "row", "L8")).toBe(true);
+  });
+
+  it("a task-error confirmation without a message falls back to 'task error'", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.runOf("T1", 1);
+    run.confirm({ kind: "unconfirmed", reason: "task-error", error: null });
+    await h.runOf("T1", 2);
+    expect(h.task("T1").attempts[0]?.context).toBe("task error");
+  });
+
+  it.each([
+    ["superseded", "L5"],
+    ["threw", "L6"],
+    ["timeout", "L7"],
+    ["hook-failed", "L9"],
+  ] as const)("a '%s' confirmation loses the dispatched attempt uncounted (%s) and relaunches", async (reason, row) => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.runOf("T1", 1);
+    run.confirm({ kind: "unconfirmed", reason, error: null });
+    await h.runOf("T1", 2);
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "lost" });
+    expect(h.parts().policy.counted).toEqual([]);
+    expect(await counterWith(h, "launch-failed", "row", row)).toBe(true);
+  });
+
+  it("a confirmation that arrives after the child started changes nothing", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.runOf("T1", 1);
+    await run.hooks.onChildCreated("ses-c1");
+    run.confirm({ kind: "unconfirmed", reason: "timeout", error: null });
+    await pause(30);
+    expect(h.state("T1")).toBe("running");
+    expect(h.task("T1").attempts[0]?.outcome).toBeNull();
+    expect(h.launcher.runs).toHaveLength(1);
+  });
+
+  it("a child that ends 'lost' while still dispatched is uncounted and relaunched (row 11)", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.runOf("T1", 1);
+    run.end({ kind: "lost", childSessionID: null, reason: "restart", endedAt: h.clock.iso() });
+    await h.runOf("T1", 2);
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "lost" });
+    expect(h.parts().policy.counted).toEqual([]);
+  });
+
+  it("an end of kind 'capacity' returns the running task to ready, uncounted", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    run.end({ kind: "capacity", childSessionID: "ses-c1", error: ERR_RATE_LIMIT, endedAt: h.clock.iso() });
+    await h.runOf("T1", 2);
+    const a1 = need(h.task("T1").attempts[0], "attempt 1");
+    expect(a1.outcome).toBe("capacity");
+    expect(countsTowardMaxAttempts(a1)).toBe(false);
+    expect(h.parts().policy.counted).toEqual([]);
+  });
+
+  it("an end of a task that is not running (here: still dispatched, 'completed') is ignored", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.runOf("T1", 1);
+    run.complete("Done before the child was journaled.");
+    await pause(30);
+    expect(h.state("T1")).toBe("dispatched");
+    expect(h.task("T1").attempts[0]?.outcome).toBeNull();
+    expect(h.verifier.calls).toEqual([]);
+  });
+
+  it.each([
+    ["ESCALATE: need a decision\nplease advise", "escalate"],
+    ["NEED CONTEXT: which API?", "ambiguity"],
+    ["SCOPE GROWTH: this is bigger than planned", "ambiguity"],
+    ["NEED MORE: something else entirely", "ambiguity"],
+  ] as const)("child text %j parks the task through the policy as '%s'", async (text, cause) => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    run.complete(text);
+    await until(() => h.state("T1") === "parked", "T1 parked");
+    expect(h.parts().policy.parks).toEqual([{ taskId: "T1", cause, text }]);
+    expect(h.verifier.calls).toEqual([]);
+    expect(h.parts().queue.enqueued).toEqual([]);
+  });
+
+  it("a qa task whose unparsable output starts with a lease request is treated as a lease request, not as bad output", async () => {
+    const qa = task("Q1", {
+      kind: "qa",
+      verify: "none",
+      footprint: { writes: [], reads: [], confidence: "explicit", sources: ["path"] },
+    });
+    const h = await mk(planOf([qa], { gate: "awaiting-qa" }));
+    await h.begin();
+    const run = await h.running("Q1", 1, "ses-q1");
+    run.complete("NEED MORE: lease src/extra.ts\nI need to write a file.");
+    await h.runOf("Q1", 2);
+    expect(h.task("Q1").footprint.writes).toEqual(["src/extra.ts"]);
+    expect(h.task("Q1").attempts[0]).toMatchObject({ outcome: "interrupted" });
+    expect(h.parts().qa.results).toEqual([]);
+  });
+
+  it("a stale end for an attempt that is no longer open does nothing", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const old = await h.runOf("T1", 1);
+    old.confirm({ kind: "unconfirmed", reason: "timeout", error: null });
+    const fresh = await h.runOf("T1", 2);
+    const before = h.task("T1").attempts.map((a) => a.outcome);
+    old.complete("late");
+    await pause(30);
+    expect(h.task("T1").attempts.map((a) => a.outcome)).toEqual(before);
+    expect(fresh.settled).toBe(false);
+  });
+});
+
+describe("verification outcomes", () => {
+  it("a verifier that throws counts as 'unverifiable': the attempt fails with the error text and retries", async () => {
+    const h = await mk(planOf([task("T1")]));
+    h.verifier.verify = async () => {
+      throw new Error("checks crashed");
+    };
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    run.complete("Done.");
+    await h.runOf("T1", 2);
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "succeeded", verdict: "unverifiable", context: "checks crashed" });
+    expect(h.parts().queue.enqueued).toEqual([]);
+    expect(h.parts().policy.counted.map((c) => c.n)).toEqual([1]);
+  });
+
+  it("an 'unverifiable' verdict from the verifier is a failure like 'fail'", async () => {
+    const h = await mk(planOf([task("T1")], { config: { maxAttempts: 1 } }));
+    h.verifier.queue.push({ verdict: "unverifiable", findings: "no test runner" });
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    run.complete("Done.");
+    await until(() => h.state("T1") === "parked", "T1 parked");
+    expect(h.parts().policy.parks).toEqual([{ taskId: "T1", cause: "exhausted", text: "no test runner" }]);
+  });
+
+  it("an attempt context that is empty parks with the 'attempts exhausted' text", async () => {
+    const h = await mk(planOf([task("T1")], { config: { maxAttempts: 1 } }));
+    h.verifier.queue.push({ verdict: "fail", findings: "" });
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    run.complete("Done.");
+    await until(() => h.state("T1") === "parked", "T1 parked");
+    expect(h.parts().policy.parks).toEqual([{ taskId: "T1", cause: "exhausted", text: "attempts exhausted (1)" }]);
+  });
+
+  it("a git failure while inspecting the slot fails the attempt with the git message instead of throwing", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    h.git.failOn = { verb: "status", stderr: "fatal: not a git repository" };
+    run.complete("Done.");
+    await h.runOf("T1", 2);
+    expect(h.task("T1").attempts[0]?.context).toBe("git status failed");
+    expect(h.verifier.calls).toEqual([]);
+  });
+});
+
+describe("integration listener (Q -> Rt)", () => {
+  it("onFailed counts the last attempt and retries the task Q failed", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await toVerified(h, "T1");
+    await h.parts().writer.append([tr("T1", "verified", "integrating", "dequeued"), tr("T1", "integrating", "failed", "checks-failed")]);
+    h.parts().listener.onFailed("T1");
+    await h.runOf("T1", 2);
+    expect(h.parts().policy.counted.map((c) => c.n)).toEqual([1, 1]);
+    expect((await h.events()).some((e) => e.type === "task-transition" && e.from === "failed" && e.to === "ready" && e.trigger === "retry")).toBe(true);
+  });
+
+  it("onGate 'awaiting-qa' tells the QA loop; any other gate only re-ticks", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.runOf("T1", 1);
+    h.parts().listener.onGate("p1", "awaiting-qa");
+    await until(() => h.parts().qa.awaiting.length === 1, "onAwaitingQa");
+    expect(h.parts().qa.awaiting).toEqual(["p1"]);
+    h.parts().listener.onGate("p1", "qa-running");
+    await pause(30);
+    expect(h.parts().qa.awaiting).toEqual(["p1"]);
+  });
+
+  it("onInbox wakes the orchestrator once per inbox id", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.runOf("T1", 1);
+    const item: InboxItem = {
+      id: formatInboxId("question", 1),
+      kind: "question",
+      severity: "blocking",
+      taskId: "T1",
+      text: "which one?",
+      options: [],
+      answer: null,
+      createdAt: T0,
+    };
+    const key = `inbox:${item.id}`;
+    h.parts().listener.onInbox(item);
+    await until(() => h.hosts.keys().includes(key), "inbox wake");
+    h.parts().listener.onInbox(item);
+    await pause(30);
+    expect(h.hosts.keys().filter((k) => k === key)).toHaveLength(1);
+  });
+
+  it("a listener call after dispose is ignored", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1"); // confirmed: dispose waits for an unconfirmed launch, never for a live child
+    const listener = h.parts().listener;
+    await h.runtime.dispose();
+    const launches = h.launcher.runs.length;
+    listener.onIntegrated("T1");
+    listener.onFailed("T1");
+    await pause(30);
+    expect(h.launcher.runs).toHaveLength(launches);
+  });
+});
+
+describe("restart: lease rebuild, slot lookup and capacity restore", () => {
+  it("a lease that cannot be re-taken after restart is counted and raised as a blocking item", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    const release = h.registry.releaseTask.bind(h.registry);
+    h.registry.releaseTask = (ref: string): void => {
+      release(ref);
+      h.registry.plant("src/T1.ts", "ses-foreign", null);
+    };
+    await h.restart();
+    await until(() => h.parts().policy.raised.length === 1, "lease rebuild item");
+    const raised = need(h.parts().policy.raised[0], "raised item");
+    expect(raised).toMatchObject({ kind: "failure", severity: "blocking", taskId: "T1" });
+    expect(raised.text).toBe("could not re-take the leases of T1 after restart; held by ses-foreign");
+    await until(async () => (await h.counters()).some((c) => c.key === "lease-rebuild-failed" && c.labels.taskId === "T1"), "lease-rebuild-failed counter");
+  });
+
+  it("after a restart the slot of a finishing child is looked up again and the task is verified", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.restart();
+    await h.runtime.onChildEnd("T1", 1, { kind: "completed", childSessionID: "ses-c1", text: "Done.", endedAt: h.clock.iso() });
+    await untilEnqueued(h, "T1");
+    expect(h.task("T1").slot).toBe("slot-1");
+    expect(h.verifier.calls).toEqual(["T1#1"]);
+    expect(h.git.calls.some((c) => c.args[0] === "commit" && c.cwd === slotPathOf("slot-1"))).toBe(true);
+  });
+
+  it("after a restart a slot whose record is gone fails the commit step and the task is retried", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.restart();
+    h.slots.records.clear();
+    await h.runtime.onChildEnd("T1", 1, { kind: "completed", childSessionID: "ses-c1", text: "Done.", endedAt: h.clock.iso() });
+    await h.runOf("T1", 2);
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "succeeded", context: "slot record missing" });
+    expect(h.verifier.calls).toEqual([]);
+    expect(h.parts().policy.counted.map((c) => c.n)).toEqual([1]);
+  });
+
+  it("a slot lookup that throws on restart is logged and the task is rebuilt without a tree", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    h.slots.get = async () => {
+      throw new Error("registry unreadable");
+    };
+    await h.restart();
+    expect(h.logs.some((l) => l.startsWith("warn: slot lookup failed") && l.includes("registry unreadable"))).toBe(true);
+    expect(h.parts().policy.raised).toEqual([]);
+  });
+
+  it("a capacity restore that fails on restart is logged and the plan still attaches", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1"); // confirmed, so the restart's dispose does not wait for the launch
+    const real = h.store.exportPlan.bind(h.store);
+    h.store.exportPlan = async () => {
+      throw new Error("history unreadable");
+    };
+    await h.restart();
+    expect(h.logs.some((l) => l.startsWith("warn: capacity restore failed") && l.includes("history unreadable"))).toBe(true);
+    h.store.exportPlan = real;
+    expect(h.runtime.planLine(ORCH)).toContain(`plan ${PLAN_ID}:`);
   });
 });
 
@@ -1660,6 +2166,16 @@ describe("public surface", () => {
     expect(h.runtime.planLine("ses-intruder")).toBeNull();
   });
 
+  it("resume and abort by another session are refused with E_NOT_OWNER and change nothing", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.runOf("T1", 1);
+    await expect(h.runtime.resume(PLAN_ID, "ses-intruder")).rejects.toMatchObject({ code: "E_NOT_OWNER" });
+    await expect(h.runtime.abort(PLAN_ID, "ses-intruder")).rejects.toMatchObject({ code: "E_NOT_OWNER" });
+    expect(h.ledger().status).toBe("running");
+    expect(h.parts().queue.aborted).toBe(0);
+  });
+
   it("pause stops launching; resume re-checks every phase suite (A2-1) and relaunches", async () => {
     const h = await mk(planOf([task("T1")]));
     await h.begin();
@@ -1673,6 +2189,1124 @@ describe("public surface", () => {
     expect(h.ledger().status).toBe("running");
     expect(h.parts().queue.checked).toEqual(["p1"]);
     expect(run.req.attempt).toBe(1);
+  });
+});
+
+/** LedgerWriter double for createWaker: keeps the wake keys it was given and can fail its append. */
+class WakeWriter implements LedgerWriter {
+  readonly planId = PLAN_ID;
+  readonly ledger: Readonly<LedgerV1> = planOf([]);
+  readonly keys = new Set<string>();
+  failAppend = false;
+  openIntegration(): never[] {
+    return [];
+  }
+  wakeKeys(): ReadonlySet<string> {
+    return this.keys;
+  }
+  async append(batch: Parameters<LedgerWriter["append"]>[0]): Promise<Readonly<LedgerV1>> {
+    if (this.failAppend) throw new Error("disk full");
+    if (typeof batch !== "function") {
+      for (const e of batch) if (e.type === "wake") this.keys.add(e.stateKey);
+    }
+    return this.ledger;
+  }
+  async snapshot(): Promise<void> {}
+  async close(): Promise<void> {}
+}
+
+describe("createWaker", () => {
+  const mkWaker = (debounceMs: number, onMetric: (m: { result: string }) => void = () => undefined) => {
+    const clock = new TestClock();
+    const hosts = new HostsDouble();
+    const writer = new WakeWriter();
+    const waker = createWaker({
+      writer,
+      hosts,
+      clock,
+      debounceMs,
+      text: (reason, key) => `wake ${reason} ${key}`,
+      onMetric,
+    });
+    return { clock, hosts, writer, waker };
+  };
+
+  it("sends once per key, answers duplicate for a journaled key, and debounces a different key inside the window", async () => {
+    const results: string[] = [];
+    const w = mkWaker(1000, (m) => results.push(m.result));
+    expect(await w.waker.wake("stale-context", "k1")).toBe("sent");
+    expect(w.hosts.delivered[0]).toMatchObject({ sessionID: ORCH, text: "wake stale-context k1", resume: true });
+    expect(await w.waker.wake("stale-context", "k1")).toBe("duplicate");
+    expect(await w.waker.wake("manual-ready", "k2")).toBe("debounced");
+    w.clock.advance(1000);
+    expect(await w.waker.wake("manual-ready", "k2")).toBe("sent");
+    expect(w.hosts.keys()).toEqual(["k1", "k2"]);
+    expect(results).toEqual(["sent", "duplicate", "debounced", "sent"]);
+  });
+
+  it("a failing journal append is 'failed' and nothing is delivered; a failing delivery is 'failed' too", async () => {
+    const w = mkWaker(1000);
+    w.writer.failAppend = true;
+    expect(await w.waker.wake("stale-context", "k1")).toBe("failed");
+    expect(w.hosts.attempted).toEqual([]);
+    w.writer.failAppend = false;
+    w.hosts.failures = 1;
+    expect(await w.waker.wake("stale-context", "k1")).toBe("failed");
+    expect(w.hosts.attempted).toEqual(["k1"]);
+  });
+
+  it("a throwing metric sink never breaks the wake path or the chain behind it", async () => {
+    const w = mkWaker(0, () => {
+      throw new Error("sink down");
+    });
+    expect(await w.waker.wake("stale-context", "k1")).toBe("sent");
+    expect(await w.waker.wake("manual-ready", "k2")).toBe("sent");
+    expect(w.hosts.keys()).toEqual(["k1", "k2"]);
+  });
+});
+
+describe("plan lifecycle methods (status, ready, done, land, answer, gc, exportPlan, purge)", () => {
+  const manualTask = (id: TaskId): TaskNode =>
+    task(id, { kind: "manual", verify: "none", footprint: { writes: [], reads: [], confidence: "explicit", sources: ["path"] } });
+
+  it("status renders the board: counts, phases, running tasks, manual waits, the open inbox and the metrics line", async () => {
+    const h = await mk(planOf([task("T1"), manualTask("M1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await until(() => h.hosts.delivered.length === 1, "manual-ready wake"); // keeps the wake counter still while the board is read
+    await until(async () => (await h.metrics()).some((m) => m.name === "wake" && m.result === "sent"), "wake metric journaled");
+    await h.parts().policy.raise({ kind: "question", severity: "blocking", taskId: "T1", text: "which db?", options: [] });
+    await h.parts().policy.raise({ kind: "flaky", severity: "blocking", taskId: null, text: "FYI", options: [] });
+
+    const board = await h.runtime.status(PLAN_ID, ORCH);
+    expect(board).toContain(`Plan ${PLAN_ID} [running] `);
+    expect(board).toMatch(/Tasks: .*running 1/);
+    expect(board).toMatch(/Phase p1: gate \S+ - /);
+    expect(board).toContain("Ready:");
+    expect(board).toContain("  M1 manual (manual) - waiting for router_plan action=done");
+    expect(board).toContain("Running: T1 attempt 1");
+    expect(board).toMatch(/Inbox:\n {2}\S+ question\/blocking T1: which db\?\n {2}\S+ flaky\/blocking: FYI/);
+    expect(board).toContain("Metrics: launches 1, wakes");
+    expect(await h.runtime.status(null, ORCH)).toBe(board);
+  });
+
+  it("status and ready of a plan that is not attached read the stored ledger; an unknown session has no plan", async () => {
+    const h = await mk(planOf([manualTask("M1")]));
+    await h.begin();
+    await h.runtime.dispose();
+
+    const byId = await h.runtime.status(PLAN_ID, ORCH);
+    expect(byId).toContain(`Plan ${PLAN_ID} [running] `);
+    expect(byId).not.toContain("Metrics:");
+    expect(await h.runtime.status(null, ORCH)).toBe(byId);
+    await expect(h.runtime.status(null, "ses-nobody")).rejects.toMatchObject({ code: "E_LEDGER_NOT_FOUND" });
+    expect(await h.runtime.ready(PLAN_ID)).toEqual({ launchable: [], manual: ["M1"] });
+  });
+
+  it("done refuses a task that is not a ready manual or preflight task", async () => {
+    const h = await mk(planOf([task("T1"), manualTask("M1")]));
+    await h.begin();
+    await h.runOf("T1", 1);
+    await expect(h.runtime.done(PLAN_ID, "T1", ORCH)).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
+    await expect(h.runtime.done(PLAN_ID, "T-missing", ORCH)).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
+    await expect(h.runtime.done(PLAN_ID, "M1", "ses-intruder")).rejects.toMatchObject({ code: "E_NOT_OWNER" });
+    expect(h.state("M1")).toBe("ready");
+    await h.runtime.done(PLAN_ID, "M1", ORCH);
+    expect(h.state("M1")).toBe("done");
+  });
+
+  it("the plan line says why launching is blocked, but not when the host is merely disposed", async () => {
+    const h = await mk(planOf([task("T1")]));
+    h.launcher.gateValue = staleGate("stale-context:boot:1");
+    await h.begin();
+    await until(() => h.hosts.delivered.length === 1, "stale-context wake");
+    expect(h.runtime.planLine(ORCH)).toBe(`plan ${PLAN_ID}: 0/1 done, 0 running, 1 ready (launch blocked: context-stale)`);
+    h.launcher.gateValue = DISPOSED_GATE;
+    expect(h.runtime.planLine(ORCH)).toBe(`plan ${PLAN_ID}: 0/1 done, 0 running, 1 ready`);
+  });
+
+  it("land runs the integration queue's land for the owner only", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await expect(h.runtime.land(PLAN_ID, "ses-intruder")).rejects.toMatchObject({ code: "E_NOT_OWNER" });
+    expect(h.parts().queue.landed).toBe(0);
+    await h.runtime.land(PLAN_ID, ORCH);
+    expect(h.parts().queue.landed).toBe(1);
+  });
+
+  it("answer forwards to the policy and re-ticks; another session is refused", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.runOf("T1", 1);
+    const answers: string[] = [];
+    h.parts().policy.answer = async (id: string, text: string) => {
+      answers.push(`${id}=${text}`);
+      return { resumed: null };
+    };
+    await expect(h.runtime.answer(PLAN_ID, "Q-1", "yes", "ses-intruder")).rejects.toMatchObject({ code: "E_NOT_OWNER" });
+    await h.runtime.answer(PLAN_ID, "Q-1", "yes", ORCH);
+    expect(answers).toEqual(["Q-1=yes"]);
+  });
+
+  it("gc hands the slot pool a predicate: attached plans by status, stored plans by ledger, unknown plans as null", async () => {
+    const h = await mk(planOf([manualTask("M1")]));
+    await h.begin();
+    expect(await h.runtime.gc()).toEqual({ removed: [], reported: [] });
+    const isDone = need(h.slots.gcPredicate, "gc predicate");
+    expect(await isDone(PLAN_ID)).toBe(false);
+    expect(await isDone("no-such-plan")).toBeNull();
+
+    await h.runtime.abort(PLAN_ID, ORCH);
+    expect(await isDone(PLAN_ID)).toBe(true);
+    await h.runtime.dispose();
+    expect(await isDone(PLAN_ID)).toBe(true); // not attached any more: read from the store
+
+    h.store.read = async () => {
+      throw new Error("io failure");
+    };
+    await expect(isDone(PLAN_ID)).rejects.toThrow("io failure");
+  });
+
+  it("exportPlan returns the snapshot and the merged events as JSON", async () => {
+    const h = await mk(planOf([manualTask("M1")]));
+    await h.begin();
+    const parsed = JSON.parse(await h.runtime.exportPlan(PLAN_ID)) as { snapshot: LedgerV1; events: ExecutorEvent[] };
+    expect(parsed.snapshot.planId).toBe(PLAN_ID);
+    expect(parsed.events.length).toBeGreaterThan(0);
+    expect(parsed.events.map((e) => e.seq)).toEqual([...parsed.events.map((e) => e.seq)].sort((a, b) => a - b));
+  });
+
+  it("purge refuses a running plan and a foreign session; on an aborted plan it deletes its refs and the plan directory", async () => {
+    const h = await mk(planOf([manualTask("M1")]));
+    await h.begin();
+    await expect(h.runtime.purge(PLAN_ID, ORCH)).rejects.toMatchObject({ code: "E_PLAN_STATE" });
+    await expect(h.runtime.purge(PLAN_ID, "ses-intruder")).rejects.toMatchObject({ code: "E_NOT_OWNER" });
+    await h.runtime.abort(PLAN_ID, ORCH);
+
+    h.git.refs = [
+      `refs/heads/omr/${PLAN_ID}/t/M1`,
+      `refs/tags/omr/${PLAN_ID}/p1`,
+      "refs/heads/omr/other-plan/t/X",
+      "",
+    ];
+    await h.runtime.purge(PLAN_ID, ORCH);
+
+    const calls = h.git.calls.filter((c) => c.args[0] === "for-each-ref" || c.args[0] === "update-ref");
+    expect(calls.map((c) => c.args.join(" "))).toEqual([
+      `for-each-ref --format=%(refname) refs/heads/omr/${PLAN_ID}/`,
+      `update-ref -d refs/heads/omr/${PLAN_ID}/t/M1`,
+      `for-each-ref --format=%(refname) refs/tags/omr/${PLAN_ID}/`,
+      `update-ref -d refs/tags/omr/${PLAN_ID}/p1`,
+    ]);
+    expect(calls.every((c) => c.cwd === REPO)).toBe(true);
+    expect(need(h.slots.gcPredicate, "gc predicate")).toBeTypeOf("function");
+    expect(await need(h.slots.gcPredicate, "gc predicate")(PLAN_ID)).toBe(true);
+    expect(await need(h.slots.gcPredicate, "gc predicate")("other")).toBeNull();
+    await expect(h.store.read(PLAN_ID)).rejects.toMatchObject({ code: "E_LEDGER_NOT_FOUND" });
+    expect(h.runtime.planLine(ORCH)).toBeNull();
+  });
+
+  it("purge keeps going when listing refs fails", async () => {
+    const h = await mk(planOf([manualTask("M1")]));
+    await h.begin();
+    await h.runtime.abort(PLAN_ID, ORCH);
+    h.git.failOn = { verb: "for-each-ref", stderr: "fatal: bad" };
+    h.git.refs = [`refs/heads/omr/${PLAN_ID}/t/M1`];
+    await h.runtime.purge(PLAN_ID, ORCH);
+    expect(h.git.calls.some((c) => c.args[0] === "update-ref")).toBe(false);
+    await expect(h.store.read(PLAN_ID)).rejects.toMatchObject({ code: "E_LEDGER_NOT_FOUND" });
+  });
+
+  it("a second abort, and a resume of a running plan, are E_PLAN_STATE", async () => {
+    const h = await mk(planOf([manualTask("M1")]));
+    await h.begin();
+    await expect(h.runtime.resume(PLAN_ID, ORCH)).rejects.toMatchObject({ code: "E_PLAN_STATE" });
+    await h.runtime.abort(PLAN_ID, ORCH);
+    await expect(h.runtime.abort(PLAN_ID, ORCH)).rejects.toMatchObject({ code: "E_PLAN_STATE" });
+    expect(h.parts().queue.aborted).toBe(1);
+  });
+
+  it("abort goes on when the queue's abort throws, and still ends in aborted", async () => {
+    const h = await mk(planOf([manualTask("M1")]));
+    await h.begin();
+    h.parts().queue.abort = async () => {
+      throw new Error("queue down");
+    };
+    await h.runtime.abort(PLAN_ID, ORCH);
+    expect(h.ledger().status).toBe("aborted");
+    expect(h.state("M1")).toBe("cancelled");
+    expect(h.logs.some((l) => l.startsWith("error: queue abort failed") && l.includes("queue down"))).toBe(true);
+  });
+
+  it("resume re-enqueues verified tasks and logs a phase re-check that throws", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await toVerified(h, "T1");
+    await h.runtime.pause(PLAN_ID, ORCH);
+    h.parts().queue.checkPhase = async () => {
+      throw new Error("suite crashed");
+    };
+    await h.runtime.resume(PLAN_ID, ORCH);
+    expect(h.parts().queue.enqueued).toEqual([["T1"], ["T1"]]);
+    expect(h.logs.some((l) => l.startsWith("warn: checkPhase p1 failed") && l.includes("suite crashed"))).toBe(true);
+  });
+
+  it("addTasks journals the new tasks and edges, sends a reopened task back to pending and frees its slot", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.runOf("T1", 1);
+    h.launcher.gateValue = staleGate("stale-context:boot:1");
+    run.confirm({ kind: "unconfirmed", reason: "timeout", error: null });
+    await until(() => h.state("T1") === "ready", "T1 back to ready");
+    expect(h.task("T1").slot).toBe("slot-1");
+
+    h.compiler.added = { tasks: [task("T2", { state: "pending" })], edges: [edge("T2", "T1")], reopened: ["T1", "T-gone"] };
+    await expect(h.runtime.addTasks(PLAN_ID, "more", "ses-intruder")).rejects.toMatchObject({ code: "E_NOT_OWNER" });
+    const r = await h.runtime.addTasks(PLAN_ID, "T2: do more", ORCH);
+
+    expect(r).toEqual({ added: ["T2"], reopened: ["T1", "T-gone"] });
+    expect(h.compiler.addTexts).toEqual(["T2: do more"]);
+    expect(h.state("T1")).toBe("pending");
+    expect(h.task("T1").slot).toBeNull();
+    expect(["pending", "ready"]).toContain(h.state("T2"));
+    expect(h.ledger().edges).toContainEqual(edge("T2", "T1"));
+    expect(h.slots.released).toEqual(["slot-1"]);
+    expect(h.registry.heldBy("plan-one:T1")).toEqual([]);
+  });
+
+  it("addTasks surfaces the compiler's refusal and writes nothing", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.runOf("T1", 1);
+    const seq = h.ledger().seq;
+    await expect(h.runtime.addTasks(PLAN_ID, "bad", ORCH)).rejects.toMatchObject({ code: "E_CYCLE" });
+    expect(h.ledger().seq).toBe(seq);
+  });
+
+  it("onChildEnd routes an end to the plan that owns the task and ignores unknown tasks", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.runtime.onChildEnd("T-unknown", 1, { kind: "lost", childSessionID: null, reason: "restart", endedAt: h.clock.iso() });
+    expect(h.state("T1")).toBe("running");
+
+    await h.runtime.onChildEnd("T1", 9, { kind: "lost", childSessionID: "ses-c1", reason: "restart", endedAt: h.clock.iso() });
+    expect(h.state("T1")).toBe("running"); // attempt 9 is not open: ignored
+
+    await h.runtime.onChildEnd("T1", 1, { kind: "failed", childSessionID: "ses-c1", error: { type: "provider.internal", status: 500, message: "boom" }, endedAt: h.clock.iso() });
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "failed", context: "provider.internal: boom" });
+    const second = await h.runOf("T1", 2); // the retry relaunches; wait for it so teardown never races the launch
+    expect(second.req.prompt).toContain("provider.internal: boom");
+  });
+});
+
+describe("residue, approval, completion and recovery wiring", () => {
+  const manualOnly = (id: TaskId): TaskNode =>
+    task(id, { kind: "manual", verify: "none", footprint: { writes: [], reads: [], confidence: "explicit", sources: ["path"] } });
+
+  it("compile passes the phase selection through and returns the residue prompt; residue merges and moves to awaiting-approval", async () => {
+    const draft = planOf([task("T1")]);
+    draft.status = "awaiting-residue";
+    const h = await mk(draft);
+    h.compiler.residuePrompt = "Please answer the residue.";
+    const r = await h.runtime.compile({ path: `${REPO}/PLAN.md`, sessionID: ORCH, phases: ["p1"], doneBefore: "p1" });
+
+    expect(r.residuePrompt).toBe("Please answer the residue.");
+    expect(h.compiler.compileOpts[0]).toMatchObject({ phases: ["p1"], doneBefore: "p1", orchestratorSessionID: ORCH });
+    expect(h.ledger().status).toBe("awaiting-residue");
+    expect(h.pins).toEqual([]);
+    expect(h.runtime.planLine(ORCH)).toBeNull();
+
+    await expect(h.runtime.residue(PLAN_ID, "answer", "ses-intruder")).rejects.toMatchObject({ code: "E_NOT_OWNER" });
+    await expect(h.runtime.residue(PLAN_ID, "garbage", ORCH)).rejects.toMatchObject({ code: "E_RESIDUE" });
+    expect(h.ledger().status).toBe("awaiting-residue");
+
+    h.compiler.merged = planOf([task("T1"), task("T2")]);
+    const summary = await h.runtime.residue(PLAN_ID, "answer", ORCH);
+    expect(summary).toMatchObject({ tasks: 2, warnings: ["merged"] });
+    expect(h.compiler.residueTexts).toEqual(["garbage", "answer"]);
+    expect(h.ledger().status).toBe("awaiting-approval");
+    expect(Object.keys(h.ledger().tasks).sort()).toEqual(["T1", "T2"]);
+    await expect(h.runtime.residue(PLAN_ID, "again", ORCH)).rejects.toMatchObject({ code: "E_PLAN_STATE" });
+  });
+
+  it("approve resolves the slots directory, starts the plan and pins the orchestrator; a second approve is E_PLAN_STATE", async () => {
+    const draft = planOf([task("T1")]);
+    draft.status = "awaiting-approval";
+    draft.config = { ...draft.config, slotsDir: null };
+    const h = await mk(draft);
+    await h.begin();
+    expect(h.launcher.runs).toHaveLength(0);
+    await expect(h.runtime.approve(PLAN_ID, "ses-intruder")).rejects.toMatchObject({ code: "E_NOT_OWNER" });
+
+    await h.runtime.approve(PLAN_ID, ORCH);
+    expect(h.ledger().status).toBe("running");
+    expect(h.ledger().config.slotsDir).toBe(defaultSlotsDir(REPO, PLAN_ID));
+    expect(h.pins).toEqual([ORCH]);
+    await h.runOf("T1", 1);
+    await expect(h.runtime.approve(PLAN_ID, ORCH)).rejects.toMatchObject({ code: "E_PLAN_STATE" });
+  });
+
+  it("approve keeps a slots directory that was already resolved", async () => {
+    const draft = planOf([task("T1")]);
+    draft.status = "awaiting-approval";
+    const h = await mk(draft);
+    await h.begin();
+    await h.runtime.approve(PLAN_ID, ORCH);
+    expect(h.ledger().config.slotsDir).toBe("C:/slots");
+  });
+
+  it("a plan that is aborted while awaiting approval cancels its tasks and launches nothing", async () => {
+    const draft = planOf([task("T1"), task("T2")]);
+    draft.status = "awaiting-approval";
+    const h = await mk(draft);
+    await h.begin();
+    await h.runtime.abort(PLAN_ID, ORCH);
+    expect(h.ledger().status).toBe("aborted");
+    expect(h.state("T1")).toBe("cancelled");
+    expect(h.state("T2")).toBe("cancelled");
+    expect(h.launcher.runs).toHaveLength(0);
+  });
+
+  it("when every task is complete and every gate passed the plan completes and lands (ff-when-clean)", async () => {
+    const h = await mk(planOf([manualOnly("M1")], { gate: "passed" }));
+    await h.begin();
+    await until(() => h.hosts.delivered.length === 1, "manual-ready wake");
+    h.clock.advance(1000); // past the debounce of the manual-ready wake
+    await h.runtime.done(PLAN_ID, "M1", ORCH);
+    await until(() => h.ledger().status === "completed", "plan completed");
+    await until(() => h.hosts.keys().includes(`plan-completed:${PLAN_ID}`), "plan-completed wake");
+    await until(() => h.parts().queue.landed === 1, "queue.land");
+    expect(h.hosts.keys()).toEqual(["manual-ready:M1:0", `plan-completed:${PLAN_ID}`]);
+    expect(h.runtime.planLine(ORCH)).toBeNull();
+    expect((await h.events()).some((e) => e.type === "status-changed" && e.to === "completed" && e.reason === "all-tasks-complete")).toBe(true);
+  });
+
+  it("a plan-completed wake debounced by an earlier wake is sent once the debounce ends (M32 re-armed tick)", async () => {
+    const h = await mk(planOf([manualOnly("M1")], { gate: "passed" }));
+    await h.begin();
+    await until(() => h.hosts.delivered.length === 1, "manual-ready wake");
+    await h.runtime.done(PLAN_ID, "M1", ORCH); // inside the debounce window of the manual-ready wake
+    await until(() => h.ledger().status === "completed", "plan completed");
+    await until(() => h.parts().queue.landed === 1, "queue.land");
+    await h.settled();
+    expect(h.hosts.keys()).toEqual(["manual-ready:M1:0"]);
+    expect(h.clock.pendingTimers()).toBeGreaterThan(0);
+
+    h.clock.advance(1000);
+    await until(() => h.hosts.keys().includes(`plan-completed:${PLAN_ID}`), "plan-completed wake after the debounce");
+    await h.settled();
+    h.runtime.onRouterToolCall(ORCH);
+    await h.settled();
+    expect(h.hosts.keys()).toEqual(["manual-ready:M1:0", `plan-completed:${PLAN_ID}`]);
+  });
+
+  it("with land 'manual' a completed plan does not land by itself", async () => {
+    const h = await mk(planOf([manualOnly("M1")], { gate: "passed", config: { land: "manual" } }));
+    await h.begin();
+    await h.runtime.done(PLAN_ID, "M1", ORCH);
+    await until(() => h.ledger().status === "completed", "plan completed");
+    await h.settled();
+    expect(h.parts().queue.landed).toBe(0);
+  });
+
+  it("adopt without recovery is E_PLAN_STATE", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await expect(h.runtime.adopt(PLAN_ID, "ses-new")).rejects.toMatchObject({ code: "E_PLAN_STATE" });
+  });
+
+  it("adopt closes the attached plan, lets recovery take it over and attaches the reopened ledger", async () => {
+    const h = await mk(planOf([manualOnly("M1")]));
+    await h.begin();
+    const calls: string[] = [];
+    const recovery: RecoveryService = {
+      async recover() {
+        return [];
+      },
+      async adopt(planId, sessionID) {
+        calls.push(`${planId}/${sessionID}/attached=${String(h.runtime.planLine(ORCH) !== null)}`);
+      },
+    };
+    h.deps.recovery = recovery;
+    const before = h.parts();
+    await h.runtime.adopt(PLAN_ID, ORCH);
+    expect(calls).toEqual([`${PLAN_ID}/${ORCH}/attached=false`]); // the old attachment was closed before recovery ran
+    expect(h.parts()).not.toBe(before);
+    expect(h.runtime.planLine(ORCH)).toContain(`plan ${PLAN_ID}:`);
+  });
+
+  it("adopt takes the lock over when the plan is still locked, and rethrows any other open failure", async () => {
+    const h = await mk(planOf([manualOnly("M1")]));
+    await h.begin();
+    h.deps.recovery = {
+      async recover() {
+        return [];
+      },
+      async adopt() {},
+    };
+    await h.runtime.dispose();
+
+    const reasons: string[] = [];
+    const open = h.store.open.bind(h.store);
+    h.store.takeover = async (planId, holder, reason) => {
+      reasons.push(reason);
+      return open(planId, holder);
+    };
+    h.store.open = async () => {
+      throw new ExecutorError("E_LOCK_HELD", "locked");
+    };
+    await h.runtime.adopt(PLAN_ID, ORCH);
+    expect(reasons).toEqual(["adopt"]);
+    expect(h.runtime.planLine(ORCH)).toContain(`plan ${PLAN_ID}:`);
+
+    h.store.open = async () => {
+      throw new Error("disk unreadable");
+    };
+    await expect(h.runtime.adopt(PLAN_ID, ORCH)).rejects.toThrow("disk unreadable");
+    h.store.open = open;
+  });
+
+  it("start runs recovery once, logs a failing recovery, and logs a plan it cannot open without stopping", async () => {
+    const h = await mk(planOf([manualOnly("M1")]));
+    await h.begin();
+    const recovered: number[] = [];
+    h.deps.recovery = {
+      async recover() {
+        recovered.push(1);
+        throw new Error("recovery exploded");
+      },
+      async adopt() {},
+    };
+    h.store.open = async () => {
+      throw new Error("lock busy");
+    };
+    await h.restart();
+    expect(recovered).toEqual([1]);
+    expect(h.logs.some((l) => l.startsWith("error: recovery failed") && l.includes("recovery exploded"))).toBe(true);
+    expect(h.logs.some((l) => l.startsWith(`warn: plan ${PLAN_ID} not attached`) && l.includes("lock busy"))).toBe(true);
+    expect(h.runtime.planLine(ORCH)).toBeNull();
+  });
+});
+
+describe("Q results that touch live children and the integration listener's edge paths", () => {
+  it("a conflict whose slot reset fails is logged and the task is still retried", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await toVerified(h, "T1");
+    const reset = h.slots.reset.bind(h.slots);
+    h.slots.reset = async () => {
+      h.slots.reset = reset; // one shot: the relaunch resets the slot again and must succeed
+      throw new Error("reset boom");
+    };
+    await qConflict(h, "T1", "CONFLICT (content): src/T1.ts");
+    await h.runOf("T1", 2);
+    expect(h.logs.some((l) => l.startsWith("warn: slot reset after conflict failed") && l.includes("reset boom"))).toBe(true);
+    expect(h.task("T1").attempts[0]?.context).toBe("CONFLICT (content): src/T1.ts");
+  });
+
+  it("onReverted cancels the live child of a task Q moved to blocked and releases its slot once the child is gone (M8)", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    const slot = need(h.task("T1").slot, "T1 slot");
+    await h.parts().writer.append([
+      { type: "attempt-ended", taskId: "T1", n: 1, outcome: "interrupted", endedAt: h.clock.iso(), detail: "dep-reverted" },
+      tr("T1", "running", "blocked", "dep-reverted"),
+      { type: "task-slot", taskId: "T1", slot: null, branch: null },
+    ]);
+    h.parts().listener.onReverted("T1");
+    await until(() => h.slots.released.includes(slot), "slot released after the blocked cancel");
+
+    expect(run.cancelReasons).toEqual(["blocked"]);
+    expect(h.log.some((l) => l.startsWith("launcher.cancel:T1#1:blocked"))).toBe(true);
+    expect(h.registry.heldBy("plan-one:T1")).toEqual([]);
+    expect(h.state("T1")).toBe("blocked");
+  });
+
+  it("a listener callback that throws is logged by name and never escapes", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.runOf("T1", 1);
+    h.parts().qa.onAwaitingQa = async () => {
+      throw new Error("qa down");
+    };
+    h.parts().listener.onGate("p1", "awaiting-qa");
+    await until(() => h.logs.some((l) => l.startsWith("error: onGate failed") && l.includes("qa down")), "onGate failure logged");
+  });
+
+  it("a launch step that throws is logged and the task stays ready; the next tick launches it", async () => {
+    const h = await mk(planOf([task("T1")]));
+    const acquire = h.registry.acquireWrite.bind(h.registry);
+    h.registry.acquireWrite = () => {
+      throw new Error("registry down");
+    };
+    await h.begin();
+    await until(() => h.logs.some((l) => l.startsWith("error: launch step failed") && l.includes("registry down")), "launch step failure logged");
+    expect(h.state("T1")).toBe("ready");
+    expect(h.launcher.runs).toHaveLength(0);
+
+    h.registry.acquireWrite = acquire;
+    h.runtime.onRouterToolCall(ORCH);
+    await h.runOf("T1", 1);
+    expect(h.state("T1")).toBe("dispatched");
+  });
+
+  it("a failure while processing a child's end is logged and does not stop later work", async () => {
+    const h = await mk(planOf([task("T1")], { config: { maxAttempts: 1 } }));
+    await h.begin();
+    h.parts().policy.park = async () => {
+      throw new Error("park boom");
+    };
+    h.verifier.queue.push({ verdict: "fail", findings: "tests failed" });
+    const run = await h.running("T1", 1, "ses-c1");
+    run.complete("Done.");
+    await until(() => h.logs.some((l) => l.startsWith("error: child end processing failed") && l.includes("park boom")), "end failure logged");
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "succeeded", verdict: "fail" });
+  });
+
+  it("status lists a launchable task under 'Ready:' even while the launch gate is closed", async () => {
+    const h = await mk(planOf([task("T1")]));
+    h.launcher.gateValue = staleGate("stale-context:boot:1");
+    await h.begin();
+    await until(() => h.hosts.delivered.length === 1, "stale-context wake");
+    expect(await h.runtime.status(PLAN_ID, ORCH)).toContain("Ready:\n  T1");
+  });
+
+  it("onReverted does not cancel a child whose task is not blocked", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.runOf("T1", 1);
+    h.parts().listener.onReverted("T1");
+    await pause(30);
+    expect(h.log.some((l) => l.startsWith("launcher.cancel"))).toBe(false);
+  });
+
+  it("a blocked task whose dependencies are done is handed to the policy to unblock", async () => {
+    const h = await mk(planOf([task("T1", { state: "done" }), task("T2", { state: "blocked" })], { edges: [edge("T1", "T2")] }));
+    await h.begin();
+    await until(() => h.parts().policy.unblocks > 0, "policy.unblock");
+    expect(h.launcher.runs).toHaveLength(0);
+  });
+
+  it("a failing cancel of the superseded launch is logged and the relaunch goes ahead", async () => {
+    const h = await mk(planOf([task("T1")]));
+    h.launcher.cancel = async () => {
+      throw new Error("cancel boom");
+    };
+    await h.begin();
+    const old = await h.runOf("T1", 1);
+    old.confirm({ kind: "unconfirmed", reason: "timeout", error: null });
+    await h.runOf("T1", 2);
+    expect(h.logs.some((l) => l.startsWith("warn: cancel superseded failed") && l.includes("cancel boom"))).toBe(true);
+  });
+
+  it("a rejected launch confirmation is logged and changes nothing", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.runOf("T1", 1);
+    run.confirmation.reject(new Error("confirm boom"));
+    await until(() => h.logs.some((l) => l.startsWith("warn: confirmation rejected") && l.includes("confirm boom")), "rejection logged");
+    expect(h.state("T1")).toBe("dispatched");
+  });
+
+  it("the late-child hook refuses once the plan is aborted", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.runOf("T1", 1);
+    h.launcher.gateValue = staleGate("stale-context:boot:1");
+    run.confirm({ kind: "unconfirmed", reason: "timeout", error: null });
+    await until(() => h.state("T1") === "ready", "T1 back to ready");
+    expect(await run.hooks.onLateChild("ses-late")).toBe("adopt");
+    await h.runtime.abort(PLAN_ID, ORCH);
+    expect(await run.hooks.onLateChild("ses-late")).toBe("refuse");
+    await expect(run.hooks.onChildCreated("ses-late")).rejects.toMatchObject({ code: "E_PLAN_STATE" });
+  });
+});
+
+describe("usage-limit pauses and paused phases", () => {
+  const QUOTA = { type: "provider.quota", status: 402, message: "usage limit reached" };
+
+  it("a quota failure pauses the provider, raises one usage-limit item and re-arms the tick; a repeat raises nothing", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    h.runtime.onHostEvent({ type: "step.started", sessionID: "ses-c1", providerID: PROVIDER, modelID: "model-1", at: h.clock.iso() });
+    h.runtime.onHostEvent({ type: "step.failed", sessionID: "ses-c1", error: QUOTA, at: h.clock.iso() });
+    await until(() => h.parts().policy.raised.length === 1, "usage-limit item");
+
+    expect(h.parts().policy.raised[0]).toMatchObject({ kind: "usage-limit" });
+    expect(h.clock.pendingTimers()).toBeGreaterThan(0);
+    await until(async () => (await h.metrics()).some((m) => m.name === "capacity" && m.change === "pause"), "capacity pause metric");
+
+    h.runtime.onHostEvent({ type: "step.failed", sessionID: "ses-c1", error: QUOTA, at: h.clock.iso() });
+    await pause(30);
+    expect(h.parts().policy.raised).toHaveLength(1);
+  });
+
+  it("while the provider is paused the retry hook stops a plan child's retries, and not another session's", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    h.runtime.onHostEvent({ type: "step.started", sessionID: "ses-c1", providerID: PROVIDER, modelID: "model-1", at: h.clock.iso() });
+    h.runtime.onHostEvent({ type: "execution.failed", sessionID: "ses-other", error: QUOTA, at: h.clock.iso() });
+    await until(() => h.parts().policy.raised.length === 1, "usage-limit item");
+
+    expect(h.runtime.onRetryHook({ sessionID: "ses-c1", stepKey: "k1", error: QUOTA })).toEqual({ stop: true });
+    expect(h.runtime.onRetryHook({ sessionID: "ses-other", stepKey: "k2", error: QUOTA })).toEqual({ stop: false });
+
+    run.end({ kind: "failed", childSessionID: "ses-c1", error: QUOTA, endedAt: h.clock.iso() });
+    await until(() => h.task("T1").attempts[0]?.outcome === "capacity", "capacity outcome");
+    expect(h.parts().policy.counted).toEqual([]);
+  });
+
+  it("a retry event that was not scheduled by the host is not a capacity signal", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.runOf("T1", 1);
+    h.runtime.onHostEvent({ type: "step.started", sessionID: "ses-x", providerID: PROVIDER, modelID: "model-1", at: h.clock.iso() });
+    h.runtime.onHostEvent({ type: "retry", sessionID: "ses-x", stepKey: "k1", source: "hook", error: ERR_RATE_LIMIT, at: h.clock.iso() });
+    await pause(30);
+    expect((await h.metrics()).some((m) => m.name === "capacity")).toBe(false);
+  });
+
+  it("a paused phase wakes the orchestrator once per anchor and launches none of its tasks", async () => {
+    const draft = planOf([task("T1")]);
+    need(draft.phases[0], "phase").paused = true;
+    const h = await mk(draft);
+    await h.begin();
+    await until(() => h.hosts.keys().includes("phase-paused:p1:none"), "phase-paused wake");
+    h.runtime.onRouterToolCall(ORCH);
+    await h.settled();
+    expect(h.hosts.keys()).toEqual(["phase-paused:p1:none"]);
+    expect(h.launcher.runs).toHaveLength(0);
+  });
+
+  it("a paused phase whose newest inbox item was already woken for does not wake again", async () => {
+    const draft = planOf([task("T1")]);
+    need(draft.phases[0], "phase").paused = true;
+    const h = await mk(draft);
+    await h.begin();
+    await until(() => h.hosts.keys().includes("phase-paused:p1:none"), "first phase-paused wake");
+    await h.settled();
+    h.clock.advance(1000); // past the debounce of the first wake
+
+    const item = await h.parts().policy.raise({ kind: "question", severity: "blocking", taskId: "T1", text: "why?", options: [] });
+    h.parts().listener.onInbox(item);
+    await until(() => h.hosts.keys().includes(`inbox:${item.id}`), "inbox wake");
+    // A newer item that names no task is skipped when the anchor is searched: the anchor stays the T1 item.
+    await h.parts().policy.raise({ kind: "flaky", severity: "blocking", taskId: null, text: "flaky check", options: [] });
+    h.runtime.onRouterToolCall(ORCH);
+    await h.settled();
+    expect(h.hosts.keys()).toEqual(["phase-paused:p1:none", `inbox:${item.id}`]);
+  });
+});
+
+describe("late child end synthesized from host events", () => {
+  /** The launch completion settles as 'interrupted' (ignored by the runtime) while the child session keeps running. */
+  const detach = async (h: Harness, sessionID: string): Promise<RunDouble> => {
+    const run = await h.running("T1", 1, sessionID);
+    run.end({ kind: "interrupted", childSessionID: sessionID, reason: "dispose", endedAt: h.clock.iso() });
+    await pause(20);
+    expect(h.state("T1")).toBe("running");
+    return run;
+  };
+  const hostEvent = (h: Harness, type: "execution.completed" | "execution.interrupted", sessionID: string): void =>
+    h.runtime.onHostEvent({ type, sessionID, at: h.clock.iso() });
+
+  it("execution.completed takes the child's last assistant message as its result and the task moves on to verified", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await detach(h, "ses-c1");
+    h.hosts.contexts.set("ses-c1", {
+      messages: [
+        { role: "assistant", text: "Done. Implemented it.", outcome: null },
+        { role: "assistant", text: null, outcome: null },
+        { role: "user", text: "thanks", outcome: null },
+      ],
+    });
+    hostEvent(h, "execution.completed", "ses-c1");
+    await untilEnqueued(h, "T1");
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "succeeded", verdict: "pass" });
+  });
+
+  it("the last assistant message decides how the result is classified", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await detach(h, "ses-c1");
+    h.hosts.contexts.set("ses-c1", { messages: [{ role: "assistant", text: "NEED CONTEXT: which API?", outcome: null }] });
+    hostEvent(h, "execution.completed", "ses-c1");
+    await until(() => h.state("T1") === "parked", "T1 parked");
+    expect(h.parts().policy.parks).toEqual([{ taskId: "T1", cause: "ambiguity", text: "NEED CONTEXT: which API?" }]);
+  });
+
+  it("an unreadable child context is logged and the result counts as an empty ordinary completion", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await detach(h, "ses-c1");
+    h.hosts.context = async () => {
+      throw new Error("session gone");
+    };
+    hostEvent(h, "execution.completed", "ses-c1");
+    await untilEnqueued(h, "T1");
+    expect(h.logs.some((l) => l.startsWith("warn: child context read failed") && l.includes("session gone"))).toBe(true);
+  });
+
+  it("execution.failed with an ordinary error fails the attempt; with a capacity error it is uncounted", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await detach(h, "ses-c1");
+    h.runtime.onHostEvent({
+      type: "execution.failed",
+      sessionID: "ses-c1",
+      error: { type: "provider.internal", status: 500, message: "boom" },
+      at: h.clock.iso(),
+    });
+    await h.runOf("T1", 2);
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "failed", context: "provider.internal: boom" });
+
+    await h.running("T1", 2, "ses-c2").then((run) => run.end({ kind: "interrupted", childSessionID: "ses-c2", reason: "dispose", endedAt: h.clock.iso() }));
+    await pause(20);
+    h.runtime.onHostEvent({ type: "execution.failed", sessionID: "ses-c2", error: ERR_RATE_LIMIT, at: h.clock.iso() });
+    await h.runOf("T1", 3);
+    const a2 = need(h.task("T1").attempts[1], "attempt 2");
+    expect(a2.outcome).toBe("capacity");
+    expect(countsTowardMaxAttempts(a2)).toBe(false);
+  });
+
+  it("execution.interrupted loses the running attempt without counting it", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await detach(h, "ses-c1");
+    hostEvent(h, "execution.interrupted", "ses-c1");
+    await h.runOf("T1", 2);
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "lost" });
+    expect(h.parts().policy.counted).toEqual([]);
+  });
+
+  it("a terminal event for a child whose launch is still pending is left to the launcher", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    hostEvent(h, "execution.completed", "ses-c1");
+    hostEvent(h, "execution.completed", "ses-unrelated");
+    await pause(30);
+    expect(h.state("T1")).toBe("running");
+    expect(h.launcher.runs).toHaveLength(1);
+  });
+
+  it("events of other kinds for the child do nothing and the orchestrator's own events flip the idle flag", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await detach(h, "ses-c1");
+    h.runtime.onHostEvent({ type: "step.started", sessionID: "ses-c1", providerID: PROVIDER, modelID: "model-1", at: h.clock.iso() });
+    h.runtime.onHostEvent({ type: "step.started", sessionID: ORCH, providerID: PROVIDER, modelID: "model-1", at: h.clock.iso() });
+    h.runtime.onHostEvent({ type: "execution.failed", sessionID: ORCH, error: { type: "provider.internal", status: 500, message: "x" }, at: h.clock.iso() });
+    await pause(30);
+    expect(h.state("T1")).toBe("running");
+  });
+});
+
+describe("capacity, metric, dispose and restart failure paths", () => {
+  const manualOnly = (id: TaskId): TaskNode =>
+    task(id, { kind: "manual", verify: "none", footprint: { writes: [], reads: [], confidence: "explicit", sources: ["path"] } });
+  const logged = (h: Harness, prefix: string, text: string): boolean => h.logs.some((l) => l.startsWith(prefix) && l.includes(text));
+
+  it("a capacity token that cannot be taken at launch skips the task as 'capacity-race' before any slot is taken", async () => {
+    const h = await mk(planOf([task("T1")]));
+    h.deps.capacity = (o) => {
+      const c = createCapacityController(o);
+      c.acquire = () => {
+        throw new ExecutorError("E_CAPACITY", "no token");
+      };
+      return c;
+    };
+    await h.begin();
+    await until(async () => (await h.counters()).some((c) => c.key === "launch-skipped" && c.labels.reason === "capacity-race"), "capacity-race counter");
+    expect(h.launcher.runs).toHaveLength(0);
+    expect(h.log.some((l) => l.startsWith("slots.acquire"))).toBe(false);
+    expect(h.state("T1")).toBe("ready");
+  });
+
+  it("adopting a late child when no capacity token can be forced refuses it with E_CAPACITY and keeps the task ready", async () => {
+    const h = await mk(planOf([task("T1")]));
+    h.deps.capacity = (o) => {
+      const c = createCapacityController(o);
+      const acquire = c.acquire.bind(c);
+      c.acquire = (provider, heavy, taskId, attempt, opts) => {
+        if (opts?.force === true) throw new Error("capacity exhausted");
+        return acquire(provider, heavy, taskId, attempt, opts);
+      };
+      return c;
+    };
+    await h.begin();
+    const run = await h.runOf("T1", 1);
+    h.launcher.gateValue = staleGate("stale-context:boot:1");
+    run.confirm({ kind: "unconfirmed", reason: "timeout", error: null });
+    await until(() => h.state("T1") === "ready", "T1 back to ready");
+    expect(await run.hooks.onLateChild("ses-late")).toBe("adopt");
+    await expect(run.hooks.onChildCreated("ses-late")).rejects.toMatchObject({ code: "E_CAPACITY" });
+    expect(h.state("T1")).toBe("ready");
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "lost", childSessionID: null });
+  });
+
+  it("capacity errors never escape: a failing signal feed is logged and stops no retry, a failing release is a warning", async () => {
+    const h = await mk(planOf([task("T1")]));
+    h.deps.capacity = (o) => {
+      const c = createCapacityController(o);
+      c.release = () => {
+        throw new Error("release boom");
+      };
+      c.onSignal = () => {
+        throw new Error("signal boom");
+      };
+      return c;
+    };
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    expect(h.runtime.onRetryHook({ sessionID: "ses-c1", stepKey: "s1", error: ERR_RATE_LIMIT })).toEqual({ stop: false });
+    expect(logged(h, "error: retry hook failed", "signal boom")).toBe(true);
+    h.runtime.onHostEvent({ type: "retry", sessionID: "ses-c1", stepKey: "s1", source: "scheduled", error: ERR_RATE_LIMIT, at: h.clock.iso() });
+    expect(logged(h, "error: host event handling failed", "signal boom")).toBe(true);
+
+    run.complete("Done.");
+    await untilEnqueued(h, "T1");
+    expect(logged(h, "warn: capacity release failed", "release boom")).toBe(true);
+  });
+
+  it("each new step of a session is a new step key: only the first rate-limit signal of a step decreases capacity", async () => {
+    const h = await mk(planOf([manualOnly("M1")]));
+    await h.begin();
+    const at = h.clock.iso();
+    h.runtime.onHostEvent({ type: "step.started", sessionID: "ses-x", providerID: PROVIDER, modelID: "model-1", at });
+    h.runtime.onHostEvent({ type: "step.failed", sessionID: "ses-x", error: ERR_RATE_LIMIT, at });
+    h.runtime.onHostEvent({ type: "step.failed", sessionID: "ses-x", error: ERR_RATE_LIMIT, at }); // same step: no second decrease
+    h.runtime.onHostEvent({ type: "step.started", sessionID: "ses-x", providerID: PROVIDER, modelID: "model-1", at });
+    h.runtime.onHostEvent({ type: "step.failed", sessionID: "ses-x", error: ERR_RATE_LIMIT, at });
+    await h.settled();
+    const decreases = (await h.metrics()).filter((m) => m.name === "capacity" && m.change === "decrease");
+    expect(decreases).toHaveLength(2);
+  });
+
+  it("a metric that cannot be journaled is a warning, and the metrics after it still land", async () => {
+    const h = await mk(planOf([manualOnly("M1")]));
+    await h.begin();
+    await h.settled();
+    const w = h.parts().writer;
+    const append = w.append.bind(w);
+    w.append = async (b) => {
+      if (typeof b !== "function" && JSON.stringify(b).includes('"key":"lost-metric"')) throw new Error("disk full");
+      return append(b);
+    };
+    h.runtime.recordMetric(PLAN_ID, { name: "counter", key: "lost-metric", value: 1, labels: {} });
+    h.runtime.recordMetric(PLAN_ID, { name: "counter", key: "kept-metric", value: 1, labels: {} });
+    await h.settled();
+    expect(logged(h, "warn: metric append failed", "disk full")).toBe(true);
+    const keys = (await h.counters()).map((c) => c.key);
+    expect(keys).toContain("kept-metric");
+    expect(keys).not.toContain("lost-metric");
+  });
+
+  it("dispose logs a launcher that fails to dispose and a plan that fails to close, and still detaches the plan", async () => {
+    const h = await mk(planOf([manualOnly("M1")]));
+    await h.begin();
+    h.launcher.dispose = async () => {
+      throw new Error("launcher boom");
+    };
+    const w = h.parts().writer;
+    const close = w.close.bind(w);
+    w.close = async () => {
+      await close();
+      throw new Error("close boom");
+    };
+    await h.runtime.dispose();
+    expect(logged(h, "warn: launcher dispose failed", "launcher boom")).toBe(true);
+    expect(logged(h, "warn: plan close failed", "close boom")).toBe(true);
+    expect(h.runtime.planLine(ORCH)).toBeNull();
+    expect(h.unpins).toEqual([ORCH]);
+  });
+
+  it("a lease rebuild item that cannot be raised is a warning and the plan still attaches", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    const release = h.registry.releaseTask.bind(h.registry);
+    h.registry.releaseTask = (ref: string): void => {
+      release(ref);
+      h.registry.plant("src/T1.ts", "ses-foreign", null);
+    };
+    const collaborators = h.deps.collaborators;
+    h.deps.collaborators = (i) => {
+      const c = collaborators(i);
+      c.policy.raise = async () => {
+        throw new Error("inbox down");
+      };
+      return c;
+    };
+    await h.restart();
+    expect(logged(h, "warn: lease rebuild inbox failed", "inbox down")).toBe(true);
+    expect(h.runtime.planLine(ORCH)).toContain(`plan ${PLAN_ID}:`);
+  });
+
+  it("a tick before a failed wake's retry is due re-arms instead of sending early", async () => {
+    const h = await mk(planOf([task("T1")]));
+    h.launcher.gateValue = staleGate("stale-context:boot:1");
+    h.hosts.failures = 1;
+    await h.begin();
+    await until(() => h.hosts.attempted.length === 1, "first attempt");
+    await h.settled();
+    h.clock.advance(500);
+    h.runtime.onRouterToolCall(ORCH);
+    await h.settled();
+    expect(h.hosts.attempted).toEqual(["stale-context:boot:1"]);
+
+    h.clock.advance(500);
+    await until(() => h.hosts.attempted.length === 2, "retry when due");
+    expect(h.hosts.keys()).toEqual(["stale-context:boot:1#2"]);
+  });
+
+  it("start attaches only running or paused plans that are not attached yet", async () => {
+    const h = await mk(planOf([manualOnly("M1")]));
+    await h.begin();
+    const parts = h.parts();
+    await h.runtime.start();
+    expect(h.parts()).toBe(parts);
+    expect(h.pins).toEqual([ORCH]);
+
+    await h.runtime.abort(PLAN_ID, ORCH);
+    await h.restart();
+    expect(h.parts()).toBe(parts); // the aborted plan was not attached again
+    expect(h.runtime.planLine(ORCH)).toBeNull();
+    expect(h.runtime.manualReady(ORCH)).toEqual([]);
+  });
+
+  it("manualReady lists only the plans of the asking session", async () => {
+    const h = await mk(planOf([manualOnly("M1")]));
+    await h.begin();
+    await until(() => h.runtime.manualReady(ORCH).length === 1, "M1 ready");
+    expect(h.runtime.manualReady("ses-other")).toEqual([]);
+  });
+});
+
+describe("qa gates, own-path leases and abort leftovers", () => {
+  const qaTask = (patch: Partial<TaskNode> = {}): TaskNode =>
+    task("Q1", { kind: "qa", verify: "none", footprint: { writes: [], reads: [], confidence: "explicit", sources: ["path"] }, ...patch });
+
+  it("a qa launch that is lost puts the phase gate back to awaiting-qa (G2)", async () => {
+    const h = await mk(planOf([qaTask()], { gate: "awaiting-qa" }));
+    await h.begin();
+    const run = await h.runOf("Q1", 1);
+    expect(h.ledger().phases[0]?.gate).toBe("qa-running");
+    h.launcher.gateValue = staleGate("stale-context:boot:1");
+    run.confirm({ kind: "unconfirmed", reason: "timeout", error: null });
+    await until(() => h.state("Q1") === "ready", "Q1 back to ready");
+    expect(h.ledger().phases[0]?.gate).toBe("awaiting-qa");
+    expect(h.task("Q1").attempts[0]?.outcome).toBe("lost");
+  });
+
+  it("a qa child that is lost while running puts the gate back to awaiting-qa", async () => {
+    const h = await mk(planOf([qaTask()], { gate: "awaiting-qa" }));
+    await h.begin();
+    const run = await h.running("Q1", 1, "ses-q1");
+    h.launcher.gateValue = staleGate("stale-context:boot:1");
+    run.end({ kind: "lost", childSessionID: "ses-q1", reason: "restart", endedAt: h.clock.iso() });
+    await until(() => h.state("Q1") === "ready", "Q1 back to ready");
+    expect(h.ledger().phases[0]?.gate).toBe("awaiting-qa");
+  });
+
+  it("a qa task with a malformed route line fails at prep (row 4b) and leaves the gate awaiting-qa", async () => {
+    const h = await mk(
+      planOf([qaTask({ route: { line: "task: do it", role: "implementer", tier: "fast", pin: false } })], {
+        gate: "awaiting-qa",
+        config: { maxAttempts: 1 },
+      }),
+    );
+    await h.begin();
+    await until(() => h.state("Q1") === "parked", "Q1 parked");
+    expect(h.launcher.runs).toHaveLength(0);
+    expect(h.task("Q1").attempts[0]?.outcome).toBe("failed");
+    expect(h.ledger().phases[0]?.gate).toBe("awaiting-qa");
+    const gates = (await h.events()).flatMap((e) => (e.type === "gate-changed" ? [`${e.from}>${e.to}:${e.trigger}`] : []));
+    expect(gates).toEqual(["awaiting-qa>qa-running:qa-dispatched", "qa-running>awaiting-qa:qa-requeued"]);
+  });
+
+  it("R6: a lease request for a path the task already holds itself is unresolvable", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    run.complete("NEED MORE: lease src/T1.ts\nagain");
+    await h.runOf("T1", 2);
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "failed", context: "lease-unresolvable: NEED MORE: lease src/T1.ts" });
+    expect(h.task("T1").footprint.writes).toEqual(["src/T1.ts"]);
+  });
+
+  it("abort frees the slots of a verified task and of a ready task with no live child, cancelling no launch", async () => {
+    const h = await mk(planOf([task("T1"), task("T2")]));
+    await h.begin();
+    const r2 = await h.runOf("T2", 1);
+    await toVerified(h, "T1");
+    const slot1 = need(h.task("T1").slot, "T1 slot");
+    h.launcher.gateValue = staleGate("stale-context:boot:1");
+    r2.end({ kind: "lost", childSessionID: null, reason: "restart", endedAt: h.clock.iso() });
+    await until(() => h.state("T2") === "ready", "T2 ready");
+    const slot2 = need(h.task("T2").slot, "T2 slot");
+    expect(h.slots.released).toEqual([]);
+
+    await h.runtime.abort(PLAN_ID, ORCH);
+    expect(h.ledger().status).toBe("aborted");
+    expect(h.state("T1")).toBe("cancelled");
+    expect(h.state("T2")).toBe("cancelled");
+    expect(h.task("T1").slot).toBeNull();
+    expect(h.task("T2").slot).toBeNull();
+    expect([...h.slots.released].sort()).toEqual([slot1, slot2].sort());
+    expect(h.registry.heldBy("plan-one:T1")).toEqual([]);
+    expect(h.registry.heldBy("plan-one:T2")).toEqual([]);
+    expect(h.log.some((l) => l.startsWith("launcher.cancel"))).toBe(false);
+  });
+});
+
+describe("small rules: end clamping, model labels, lease path normalization", () => {
+  it("an end reported before the attempt started is clamped to the start (A2-6)", async () => {
+    const h = await mk(planOf([task("T1")]));
+    h.clock.advance(5000);
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    run.end({ kind: "failed", childSessionID: "ses-c1", error: { type: "provider.internal", status: 500, message: "boom" }, endedAt: T0 });
+    await h.runOf("T1", 2);
+    const a1 = need(h.task("T1").attempts[0], "attempt 1");
+    expect(Date.parse(a1.startedAt)).toBe(Date.parse(T0) + 5000);
+    expect(a1.endedAt).toBe(a1.startedAt);
+  });
+
+  it("the launch metric names the model variant when the route has one", async () => {
+    const h = await mk(planOf([task("T1")]));
+    h.deps.routes = {
+      route: (t) => ({ ...routes.route(t), model: { providerID: PROVIDER, modelID: "model-1", variant: "high" } }),
+    };
+    await h.begin();
+    await h.runOf("T1", 1);
+    await until(async () => (await h.metrics()).some((m) => m.name === "launch"), "launch metric");
+    expect((await h.metrics()).find((m) => m.name === "launch")).toMatchObject({ model: `${PROVIDER}/model-1#high` });
+  });
+
+  it("a lease request path is normalized: backticks, a leading ./ and a trailing / are dropped", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    run.complete("NEED MORE: lease `./src/extra.ts/`\nplease");
+    await h.runOf("T1", 2);
+    expect(h.task("T1").footprint.writes).toEqual(["src/T1.ts", "src/extra.ts"]);
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "interrupted" });
+  });
+
+  it.each([["src/../secret.ts"], ["./"], ["src//x.ts"]])("a lease request for %j is not a legal path and is unresolvable", async (path) => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    run.complete(`NEED MORE: lease ${path}`);
+    await h.runOf("T1", 2);
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "failed", context: `lease-unresolvable: NEED MORE: lease ${path}` });
+    expect(h.task("T1").footprint.writes).toEqual(["src/T1.ts"]);
   });
 });
 
@@ -1697,6 +3331,41 @@ describe("helpers exported by runtime.ts", () => {
 
     svc.releaseTask("T1");
     expect(svc.holder("a.ts")).toBeNull();
+  });
+
+  it("createLeaseService: non-held refusals keep their reason; a held answer with no holders names 'unknown'; odd task refs lose their plan", () => {
+    const reg = new RegistryDouble([]);
+    const svc = createLeaseService(PLAN_ID, reg);
+    const refusal = (r: ReturnType<LeaseRegistryPort["acquireWrite"]>) => (): ReturnType<LeaseRegistryPort["acquireWrite"]> => r;
+
+    reg.acquireWrite = refusal({ ok: false, reason: "cap", message: "too many" });
+    expect(svc.acquireTask({ taskId: "T1", tree: "C:/s1", writes: ["a.ts"] })).toEqual({ ok: false, reason: "cap", message: "too many" });
+    reg.acquireWrite = refusal({ ok: false, reason: "held", holders: [] });
+    expect(svc.acquireTask({ taskId: "T1", tree: "C:/s1", writes: ["a.ts"] })).toEqual({
+      ok: false,
+      reason: "held",
+      holders: [{ planId: null, taskId: null, holderID: "unknown" }],
+    });
+
+    // taskRef shapes: no colon, leading colon and trailing colon are not plan refs; a proper one splits at the first colon.
+    reg.plant("nocolon.ts", "h1", "nocolon");
+    reg.plant("lead.ts", "h2", ":T9");
+    reg.plant("trail.ts", "h3", "plan-one:");
+    reg.plant("ok.ts", "h4", "plan-two:T7");
+    expect(svc.holder("nocolon.ts")).toEqual({ planId: null, taskId: null, holderID: "h1" });
+    expect(svc.holder("lead.ts")).toEqual({ planId: null, taskId: null, holderID: "h2" });
+    expect(svc.holder("trail.ts")).toEqual({ planId: null, taskId: null, holderID: "h3" });
+    expect(svc.holder("ok.ts")).toEqual({ planId: "plan-two", taskId: "T7", holderID: "h4" });
+  });
+
+  it("createLeaseService.rebuild labels a non-held refusal as lease-<reason>", () => {
+    const reg = new RegistryDouble([]);
+    reg.acquireWrite = () => ({ ok: false, reason: "invalid", message: "bad path" });
+    const svc = createLeaseService(PLAN_ID, reg);
+    const failed = svc.rebuild([
+      { id: "T1", slot: "slot-1", tree: "C:/s1", footprint: { writes: ["a.ts"], reads: [], confidence: "explicit", sources: ["path"] } },
+    ]);
+    expect(failed).toEqual([{ taskId: "T1", holders: [{ planId: null, taskId: null, holderID: "lease-invalid" }] }]);
   });
 
   it("createLeaseService.rebuild re-takes held slots and reports what it cannot", () => {
