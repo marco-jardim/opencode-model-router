@@ -47,6 +47,12 @@ import {
   GIT_ROOT_MAX_LENGTH, GIT_ROOT_OUTSIDE_PLACEHOLDER, GIT_ROOT_PROVENANCE_PREFIX, GIT_ROOT_PROVENANCE_SUFFIX, GIT_ROOT_TEXTS, GIT_ROOT_TOO_LONG, gitRootCappedNote,
 } from "../../src/routing/roles/git-root";
 import { LOOKUP_MAX_DIRS } from "../../src/routing/roles/admission";
+import {
+  EDGE_EXTENDS_DEPTH_MAX, EDGE_EXTENDS_ENTRIES_MAX, EDGE_FILE_BYTES_MAX, EDGE_FILES_MAX, EDGE_OVERRIDES_DEPTH_MAX, EDGE_SPEC_MAX, EDGE_TSCONFIG_VARIANTS_MAX,
+  EDGE_VIAS, EDGE_WORKSPACE_ENTRIES_MAX, EDGE_WORKSPACE_PATTERNS_MAX, EDGE_WORKSPACES_MAX, EDGES_MAX, PACKAGE_EDGE_FIELDS, PACKAGE_EDGE_PROTOCOLS,
+  SITE_PACKAGES_ENTRIES_MAX, SITE_PACKAGES_FILES_MAX, TSCONFIG_EDGE_KEYS,
+} from "../../src/verify/edges";
+import { EDGE_NAME_MAX, EDGE_UNADMITTED_NAMES_MAX, EDGE_WALK_MAX, PERIMETER_MAX } from "../../src/verify/perimeter";
 import { classifyTrivial, createSessionStore, DEFAULT_TIER_CAPS, resetDispatchRegistry } from "../../src/router/sessions";
 import { candidateKey, decide, MAX_EXPLORATION_RATE } from "../../src/routing/engine/kernel";
 import { createOutcomeStore } from "../../src/routing/outcomes/store";
@@ -1409,6 +1415,77 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     for (const text of ["| D18 |", "| D19 |", "### Phase 2 implemented (notes)", "LINK_DRIFT_CAVEAT"]) expect(design, text).toContain(text);
     // Phase 3 (b): the owner decisions and the QA follow-ups are recorded in the design.
     for (const text of ["| D20 |", "| D21 |", "Known follow-ups (P3b QA)"]) expect(design, text).toContain(text);
+  });
+
+  it("P3c: dependency edges outside node_modules — the labels, bounds and texts of the code are in VERIFICATION.md and the [Unreleased] entries", () => {
+    const doc = read("docs/VERIFICATION.md");
+    const verificationFlat = doc.replace(/\s+/g, " ");
+    const section = /### Dependencies outside node_modules([\s\S]*?)\n### /.exec(doc)?.[1]?.replace(/\s+/g, " ") ?? "";
+    expect(section).not.toBe("");
+    const perimeter = read("src/verify/perimeter.ts");
+    const gate = read("src/verify/gate.ts");
+    const wiring = read("src/verify/wiring.ts");
+    // every `via` label of the fixed vocabulary (SD-P3c-5): the package.json template with each field and protocol, the others verbatim
+    expect(EDGE_VIAS.length).toBe(PACKAGE_EDGE_FIELDS.length * PACKAGE_EDGE_PROTOCOLS.length + TSCONFIG_EDGE_KEYS.length + 4);
+    expect(section).toContain("`package.json <field> (<protocol>)`");
+    for (const via of EDGE_VIAS) {
+      const pkg = /^package\.json (\S+) \((\S+)\)$/.exec(via);
+      if (pkg === null) expect(section, via).toContain(`\`${via}\``);
+      else for (const part of [pkg[1]!, pkg[2]!]) expect(section, via).toContain(`\`${part}\``);
+    }
+    // every bound, as the code sets it (SD-P3c-4; QA-1 M1, M2, M5; QA-1 m2)
+    const workspaceManifests = Number(/const WORKSPACE_MANIFESTS_MAX = (\d+);/.exec(perimeter)?.[1]);
+    expect(perimeter).toContain("files: Math.max(EDGE_LIMITS.files, 2 * WORKSPACE_MANIFESTS_MAX + 16)");
+    const consumerFiles = Math.max(EDGE_FILES_MAX, 2 * workspaceManifests + 16);
+    const scopeTextMax = Number(/export const SCOPE_TEXT_MAX = (\d+);/.exec(gate)?.[1]);
+    expect(Number(/export const LINK_CAVEAT_TEXT_MAX = (\d+);/.exec(wiring)?.[1])).toBe(scopeTextMax);
+    expect(wiring).toContain("const room = Math.max(0, PERIMETER_MAX - 1 - observedSeeds);");
+    for (const text of [
+      `a file over ${EDGE_FILE_BYTES_MAX / (1024 * 1024)} MiB is skipped`,
+      `at most ${EDGES_MAX} distinct targets, ${EDGE_FILES_MAX} files and ${EDGE_WORKSPACES_MAX} workspace packages (${consumerFiles} files and ${workspaceManifests} packages when the edges of a working-set worktree are read for consumers)`,
+      `from at most ${EDGE_WORKSPACE_PATTERNS_MAX} \`workspaces\` patterns whose listings read at most ${EDGE_WORKSPACE_ENTRIES_MAX} entries in total`,
+      `${EDGE_TSCONFIG_VARIANTS_MAX} root \`tsconfig.*.json\` files`,
+      `an \`extends\` chain at most ${EDGE_EXTENDS_DEPTH_MAX} deep, at most ${EDGE_EXTENDS_ENTRIES_MAX} entries of one \`extends\` array`,
+      `\`overrides\` at most ${EDGE_OVERRIDES_DEPTH_MAX} levels deep`,
+      `one site-packages listing of at most ${SITE_PACKAGES_ENTRIES_MAX} entries, and at most ${SITE_PACKAGES_FILES_MAX} \`.pth\`, finder and \`.egg-link\` files`,
+      `A spec longer than ${EDGE_SPEC_MAX} characters, or a target more than ${EDGE_WALK_MAX} directories below its parent, is not admitted, with no filesystem call.`,
+      `At most ${EDGE_UNADMITTED_NAMES_MAX} unadmitted targets are named; the others are counted only.`,
+      `is capped at ${scopeTextMax} characters, with a trailing \`…\` when cut, then escaped`,
+      `an unadmitted edge target's name is at most ${EDGE_NAME_MAX} characters`,
+      `it counts toward the perimeter's ${PERIMETER_MAX} roots`,
+      `more new dependencies than the perimeter's ${PERIMETER_MAX} roots leave room for, means the dispatch is verified at once (no handle)`,
+    ]) expect(section, text).toContain(text);
+    // code-to-doc: each fragment is in the source that emits it, and the section quotes it
+    const pinned: Array<[source: string, code: string, quoted: string]> = [
+      [gate, "links this work root (${displaySafe(consumer.via)})", "`links this work root (<via>)`"],
+      [perimeter, "`${edge.via} in ${edge.from}`", "followed by ` in <file>`"],
+      [gate, "${scopeText(root.name)} (not admitted)", "`<name> (not admitted)`"],
+      [wiring, "\"[verify] dispatch perimeter: declared dependency edges were cut by a bound\"", "`[verify] dispatch perimeter: declared dependency edges were cut by a bound`"],
+    ];
+    for (const [source, code, quoted] of pinned) {
+      expect(source, code).toContain(code);
+      expect(section, quoted).toContain(quoted);
+    }
+    // the guide's statements: v2 only, never pinned, the junction-spelled parent, the removed dependency, the consumer and PnP notes
+    for (const text of ["(OpenCode v2, roles mode; inert on v1, no config key)", "**In the perimeter, never pinned.**", "repository code is never evaluated",
+      "so a `file:` edge written through a junction-spelled parent is a consumer too",
+      "A dependency the producer removed during the dispatch is not observed again at `router_verify`, unless `W` declares it again; then it is \"changed\".",
+      "An edge never makes the reference approximate (a documented limit)."]) expect(section, text).toContain(text);
+    for (const text of ["So is one with no such link that declares a dependency edge into `W`'s repository",
+      "In roles mode on OpenCode v2, a `portal:`/`link:` spec in `package.json` is still read as a declared dependency edge",
+      `a dependency the producer added during the dispatch could not be observed within the deferral bound, or more were added than the perimeter's ${PERIMETER_MAX} roots leave room for`,
+      "**Declared dependency edges at S11.** S11 observes the admitted targets of `W`'s declared dependency edges again as it does link targets, with the same caveats, and notices an edge added or retargeted after the return; an edge target is never pinned."])
+      expect(verificationFlat, text).toContain(text);
+    // the other docs
+    const roles = read("docs/ROLES.md").replace(/\s+/g, " ");
+    for (const text of ["(./VERIFICATION.md#dependencies-outside-node_modules)", "A link or edge target that is not admitted is named `(not admitted)`"]) expect(roles, text).toContain(text);
+    expect(read("docs/CONFIG_REFERENCE.md").replace(/\s+/g, " ")).toContain("No config key turns the edges on or off; see `docs/VERIFICATION.md` → \"Dependencies outside node_modules\".");
+    // the changelog entries
+    const unreleased = /## \[Unreleased\]([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
+    for (const item of ["**Dependencies outside `node_modules` (OpenCode v2, roles mode; inert on v1) (#107).**", "`<name> (not admitted)`",
+      "`links this work root (<via>)`", "`[verify] dispatch perimeter: declared dependency edges were cut by a bound`",
+      "**A dependency the producer adds during a deferred dispatch is frozen at return (OpenCode v2, roles mode) (#107).**",
+      "verify the dispatch at once (no handle)", "unless the work root declares it again (then it is \"changed\")"]) expect(unreleased, item).toContain(item);
   });
 
   it("QA-P32-2: a missing d= is none, graders weigh half only when independent, run matching by entry name, R9(5), code map", () => {

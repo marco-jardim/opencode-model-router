@@ -565,7 +565,9 @@ All of these must hold:
   roles mode), is not an exception any more: it defers like any other, unless it is
   verified at once (nothing is shown to the user for this; a refusal never reaches the
   deferred finish): I4 already refuses at return, a linked repository could not be
-  observed within the deferral bound, a check placement is refused, or a v2 tier
+  observed within the deferral bound, a dependency added during the dispatch could not
+  be observed in time or more were added than the perimeter has room for, a check
+  placement is refused, or a v2 tier
   dispatch carries a per-check `cwd=`. With `routing.repoParents`
   set, role dispatches therefore defer by default where they used to be synchronous.
 
@@ -583,12 +585,17 @@ before return in either mode, and its checks run synchronously; `VERIFY:deferred
 does not change that.
 
 **A deferred dispatch with a perimeter.** At return the router freezes the perimeter
-(the statuses for I4 and I8, the working-set roots, the observed link targets, the
-placements and the link pins). At `router_verify` the I4 window is the dispatch and is
-not decided again; consumers are discovered over the frozen working-set roots; link
-targets are observed again: one that changed since the producer returned, or cannot be
-observed again, turns a pass UNVERIFIED (a fail keeps it); a placement whose path or git
-top changed since the return runs nothing. A no-change dispatch with a full-scope
+(the statuses for I4 and I8, the working-set roots, the observed link targets and the
+targets of the work root's dependency edges declared outside `node_modules`, those the
+producer added during the dispatch included, the placements and the link pins; edge
+targets are never pinned). At `router_verify` the I4 window is the dispatch and is not
+decided again; consumers are discovered over the frozen working-set roots, through
+`node_modules` links and declared edges; link and edge targets are observed again: one
+that changed since the producer returned, or cannot be observed again, turns a pass
+UNVERIFIED (a fail keeps it), and one the producer removed during the dispatch is skipped
+unless the work root declares it again; a placement whose path or git top changed since
+the return runs nothing. No config key turns the edges on or off; see
+`docs/VERIFICATION.md` → "Dependencies outside node_modules". A no-change dispatch with a full-scope
 `testsPass` (per-check `scope=full`, or config `testScope: "full"` on OpenCode v2 only)
 defers instead of blocking the return; config `testScope` does not affect `lintClean`
 (only a per-check `scope=full` runs lint unscoped), so a no-change `lintClean` still

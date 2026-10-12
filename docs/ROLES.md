@@ -375,12 +375,14 @@ On OpenCode v1, in tiers mode or without parents at start the argument does not 
 **Verification perimeter.** The perimeter is planned for every routed role dispatch with a work root when
 `routing.repoParents` is set, even without `repo=`, and also when the grant has a cross-repo location or the session
 working set holds other roots. It is the work root's repository, the working-set worktrees, and the admitted
-repositories the work root links to through `node_modules` (store links excluded), at most 16 (roots past the cap are
-kept as unobserved), snapshotted at dispatch and at the gate. Links are de-duplicated by repository top level, found by
+repositories the work root links to through `node_modules` (store links excluded) or declares a dependency on outside
+`node_modules` (a `file:` spec, tsconfig `references`, a Python editable install, a Go `replace`; read as text and never
+pinned, see [Dependencies outside node_modules](./VERIFICATION.md#dependencies-outside-node_modules)), at most 16 (roots
+past the cap are kept as unobserved), snapshotted at dispatch and at the gate. Links are de-duplicated by repository top level, found by
 walking up to `.git` with no git call. Repositories are admitted (depth, `repoExclude`, working set) before any git
 runs, and snapshotted with hardened git that keeps the inherited core settings (`autocrlf`, `eol`, `safecrlf`,
-`longpaths`, `quotepath`) unless the repository sets them. A link target that is not admitted is named `(not
-admitted)`; one that could not be snapshotted is named `(not observed)`. A pending snapshot of another repository is
+`longpaths`, `quotepath`) unless the repository sets them. A link or edge target that is not admitted is named `(not
+admitted)` (at most 8 edge targets), never refused; one that could not be snapshotted is named `(not observed)`. A pending snapshot of another repository is
 discarded when an unattributable writer runs, not only when it writes an overlapping directory, and that repository is
 then "could not be observed". A planning failure fails closed, with a placeholder root "the verification perimeter
 could not be planned…". When a root in the perimeter changed, or could not be observed, while the producer ran a tool
@@ -394,11 +396,14 @@ unattributable-writer case above) is not deferred: it is verified at once, befor
 
 **Deferred verification across repositories.** A role dispatch with a perimeter, or with per-check `cwd=`/`scope=`, may
 be deferred (`VERIFY:deferred`, the default; OpenCode v2). At return the router freezes the perimeter (the statuses for
-I4 and I8, the working-set roots, the observed link targets, the check placements and the link pins). The I4 window is the
-dispatch and is never decided again; `router_verify` discovers consumers over the frozen working-set roots and observes
-the link targets again (a changed or unobservable one turns a pass UNVERIFIED). The dispatch is verified at once, not
-deferred, when I4 already refuses at return, when a linked repository could not be observed within the deferral bound,
-and when a placement or a v2 tier per-check `cwd=` is refused (a refusal never reaches the deferred finish). Details are in
+I4 and I8, the working-set roots, the observed link and edge targets (those the producer added during the dispatch
+included), the check placements and the link pins). The I4 window is the dispatch and is never decided again;
+`router_verify` discovers consumers over the frozen working-set roots (through `node_modules` links and declared edges)
+and observes the link and edge targets again (a changed or unobservable one turns a pass UNVERIFIED; a dependency the
+producer removed during the dispatch is skipped unless the work root declares it again). The dispatch is verified at
+once, not deferred, when I4 already refuses at return, when a linked repository could not be observed within the
+deferral bound, when a dependency added during the dispatch could not be observed or more were added than the perimeter
+has room for, and when a placement or a v2 tier per-check `cwd=` is refused (a refusal never reaches the deferred finish). Details are in
 [Deferred verification across repositories](./VERIFICATION.md#deferred-verification-across-repositories).
 
 - **With `routing.repoParents` set**, role dispatches are deferred by default where they used to be synchronous. A

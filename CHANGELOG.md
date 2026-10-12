@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Dependencies outside `node_modules` (OpenCode v2, roles mode; inert on v1) (#107).** A role dispatch's perimeter
+  also holds the repositories the work root declares a dependency on outside `node_modules` (owner decision D24, Tier
+  A): `file:`, `link:` and `portal:` specs in `package.json` (root and workspace manifests, `overrides`, `resolutions`,
+  `pnpm.overrides`); tsconfig/jsconfig `extends`, `references`, `paths`, `baseUrl`, `rootDirs`, `typeRoots`, `include`
+  and `files`; Python editable installs in a venv inside the work root (`.pth`, `.egg-link`, setuptools editable
+  finders); Go `replace` and `go.work use`. They are read as text, never evaluated, and bounded; no config key. An
+  admitted target is observed for I4, named in the verified-scope line and observed again at `router_verify` (S11), but
+  never pinned, so the reference does not cover it. A target that is not admitted is named `<name> (not admitted)`,
+  never refused. A working-set worktree that declares an edge into the work root is a consumer:
+  `links this work root (<via>)`, never the raw spec. A bound that cuts the reading at dispatch is logged:
+  `[verify] dispatch perimeter: declared dependency edges were cut by a bound`. See
+  [Dependencies outside node_modules](docs/VERIFICATION.md#dependencies-outside-node_modules).
 - **Roles mode (OpenCode v2; cross-repo, #107, owner decision Q10): `repo=` also matches a worktree directory name.** A
   route line's `repo=<name>` also matches a linked worktree whose directory name is `<name>` below `routing.repoParents`,
   and binds that worktree (with `branch=`, the worktree of its repository on that branch). A repository and a worktree
@@ -115,6 +127,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A dependency the producer adds during a deferred dispatch is frozen at return (OpenCode v2, roles mode) (#107).**
+  `router_verify` reported a dependency of the work root added during the dispatch as changed (`the linked repository
+  <name> at <root> changed since the producer returned; …`) every time. The work root's package links and declared
+  edges are now read again when the producer returns (owner decision D26): a new admitted dependency is observed then,
+  and `router_verify` compares it with that state; one that cannot be observed within the deferral bound, or more new
+  dependencies than the perimeter has room for, verify the dispatch at once (no handle); a new one that is not admitted
+  is named `<name> (not admitted)` in the verified-scope line. A dependency the producer removed during the dispatch is
+  no longer observed again at `router_verify`, unless the work root declares it again (then it is "changed").
 - **A change set that mixes paths inside and outside the observed repository is no longer verified as a pass on the
   inside paths alone.** The runner dropped the outside paths with a note and ran the scoped checks on the rest, and a
   grader, which checks against and runs in the working directory, could not inspect them. The gate now reports
