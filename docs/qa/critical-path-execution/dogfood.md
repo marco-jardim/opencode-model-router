@@ -51,11 +51,11 @@ Build `cpx/df1` = `226d967` (`D:\git\omr-cpx-dogfood-df1`), loaded since 2026-10
 | Probe | Result | Evidence |
 |---|---|---|
 | DF1.4.a build loaded | **pass** | Marker `omr-selfcheck-df1-c84e2b19a6` → newest `spawning process` line in run `27717102` (2026-10-12T15:04:09Z). That run's `cli starting` line: `version=2.0.26`. `loading plugin` ids per load pass: {`D:\\git\\opencode-anthropic-fix`, `D:\\git\\omr-cpx-dogfood-df1`}, each once per pass, router entrypoint exactly `file:///D:/git/omr-cpx-dogfood-df1/server.ts` (3 passes, one per booted location: `D:\git\omr-cpx-main`, `C:\Users\Marquinho`, `D:\git\opencode-model-router` — see DF-1-1). Config plugin list also has `D:\git\opencode-telegram-plugin`, not loaded (expected baseline difference, as at DF-0). Server processes 44768/66968: `C:\Users\Marquinho\AppData\Local\omr-cpx\bin\opencode2-2.0.26\opencode.exe`, created 12:03:38. `git -C D:\git\omr-cpx-dogfood-df1 rev-parse HEAD` = `git rev-parse cpx/df1^{commit}` = `226d96796c95b1cf526d0c9bf558f376cc333078`, worktree clean. Exactly one `router_verify` tool in the orchestrator's tool list. |
-| DF1.4.b background | **pass** | Runner `ses_ecf59b94cffevkR0HUsEQiLxLh` (haiku-5-5#medium, `tier=fast pin`): the call returned `[router] Running in the background … Its result will arrive unverified` at once; the orchestrator made a shell call (12:06:15) before the child ended; the completion arrived with `vrf_a3e65a0e7217c54f3417aa79` in the router state; `router_verify` → `pass`, `verified: deterministic` (no changed files). turn-state 38/38. |
-| DF1.4.c leases | **pass** (with DF-1-3, DF-1-4, DF-1-8) | Child 1 `ses_ecf58ce08ffexe2KbR1ddI3pKv` wrote `docs/dogfood-probe.md` (seen by `git status --porcelain` at the first poll, 12:07:15), then held the lease through a 428 s `test-files test/unit` run. Child 2 `ses_ecf57565cfferlWiIU4SXdZds4`: read refused and write refused, both naming `implementer "DF1.4.c lease child 1 [nonce 25246ebd-…]" (session ses_ecf58ce08ffexe2KbR1ddI3pKv)`; the write refusal: `… is being edited by implementer … Do not retry: the lease ends when that session ends.` Explorer `ses_ecf574ab3ffeoxuEgaOwUDWyNY`: read refused, holder named. Runner `ses_ecf573be9ffenpQvMKZMa91y0j` (second turn, 12:09:40, child 1 still holding): `[router] ran while implementer "DF1.4.c lease child 1 [nonce 25246ebd-…]" (session ses_ecf58ce08ffexe2KbR1ddI3pKv) edits 1 file(s); result may be contaminated` (recovered from the host DB, see DF-1-4). After child 1 ended, explorer `ses_ecf504c7cffe44IxPyJdMFPQGB` read the file (3 lines, verbatim). |
-| DF1.4.d telemetry | **partial** (DF-1-5) | `node D:\git\omr-cpx-dogfood-df1\scripts\routing-stats.ts --since 2026-10-12T12:03:00-03:00` (no `routing.outcomes.path` set): dispatch-duration rows present (explorer p50 5.4 s / p90 11.9 s n=2; implementer 26.5 s / 467.5 s n=2; runner 7.1 s / 10.2 s n=3), `timings.jsonl` rows carry `background: true`. **No orchestrator cache-read-share section**: the outcome directory has no `turns.jsonl`. Counts include the other implementation's sessions (shared default directory: 11 dispatches, of which 7 are this plan's probes). |
-| DF1.4.e cache | **pass on the host's numbers; router telemetry missing** (DF-1-5, DF-1-6) | From the host DB (`session_message.tokens` of `ses_ecf5bd114ffe5QT3S5xVTAQcF4`): first 5 orchestrator steps' cache-read share 0.221, 0.966, 0.569, 0.996, 0.987 (p50 0.966 ≥ 0.5); first 39 steps: p50 0.964, weighted 0.853 (read 2 687 836, write 461 600, uncached input 120). The router recorded one orchestrator turn for the whole session (no user prompt after `continue`), so "turns" here are host steps. Per-step table: `$env:TEMP\omr-evidence\df1-orchestrator-steps.txt`. |
-| DF1.4.f held results | **pass** (with DF-1-3) | C4/C15 hold (Phase 0.1). Runner `ses_ecf4f55cdffe03G7QXLlHryk7o`, `VERIFY:required` in the background: the call returned `Its result is held until verification finishes`; the completion arrived as `held — verdict pending (vrf_02dc7ee3b0cb16b6cf986c47)`, then the verdict with the output and `[router ✓ verified: deterministic]`. |
+| DF1.4.b background | **pass** | Runner `ses_ecf59b94cffevkR0HUsEQiLxLh` (haiku-5-5#medium, `tier=fast pin`): the call returned `[router] Running in the background … Its result will arrive unverified` at once; the orchestrator made a shell call (12:06:15) before the child ended (child output: vitest "Start at 12:06:08", completion delivered after 12:06:15); the completion arrived with `vrf_a3e65a0e7217c54f3417aa79` in the router state; `router_verify` → `pass`, `verified: deterministic` (no changed files). turn-state 38/38. |
+| DF1.4.c leases | **partial** (QA-DF1-3): criteria 1, 2 and "read allowed after" met; criterion 3 (the runner's *delivered* result carries the contamination annotation) not met — the delivered result was the stale first-turn text (DF-1-4); the annotation exists only in the host DB. Re-probe on the fix build. | Child 1 `ses_ecf58ce08ffexe2KbR1ddI3pKv` wrote `docs/dogfood-probe.md` (seen by `git status --porcelain` at the first poll, 12:07:15), then held the lease through a 428 s `test-files test/unit` run. Child 2 `ses_ecf57565cfferlWiIU4SXdZds4`: read refused and write refused, both naming `implementer "DF1.4.c lease child 1 [nonce 25246ebd-…]" (session ses_ecf58ce08ffexe2KbR1ddI3pKv)`; the write refusal: `… is being edited by implementer … Do not retry: the lease ends when that session ends.` Explorer `ses_ecf574ab3ffeoxuEgaOwUDWyNY`: read refused, holder named. Runner `ses_ecf573be9ffenpQvMKZMa91y0j` (second turn, 12:09:40, child 1 still holding): `[router] ran while implementer "DF1.4.c lease child 1 [nonce 25246ebd-…]" (session ses_ecf58ce08ffexe2KbR1ddI3pKv) edits 1 file(s); result may be contaminated` (recovered from the host DB, see DF-1-4). After child 1 ended, explorer `ses_ecf504c7cffe44IxPyJdMFPQGB` read the file (3 lines, verbatim). |
+| DF1.4.d telemetry | **partial** (DF-1-5): duration rows yes, cache-read-share line no. Re-probe on the fix build. | `node D:\git\omr-cpx-dogfood-df1\scripts\routing-stats.ts --since 2026-10-12T12:03:00-03:00` (no `routing.outcomes.path` set): dispatch-duration rows present (explorer p50 5.4 s / p90 11.9 s n=2; implementer 26.5 s / 467.5 s n=2; runner 7.1 s / 10.2 s n=3), `timings.jsonl` rows carry `background: true`. **No orchestrator cache-read-share section**: the outcome directory has no `turns.jsonl`. Counts include the other implementation's sessions (shared default directory: 11 dispatches, of which 7 are this plan's probes). |
+| DF1.4.e cache | **not measurable on df1** (DF-1-5, QA-DF1-3): the plan's source (`routing-stats.ts`, orchestrator turns) has no rows. Supporting evidence only: | From the host DB (`session_message.tokens` of `ses_ecf5bd114ffe5QT3S5xVTAQcF4`): first 5 orchestrator steps' cache-read share 0.221, 0.966, 0.569, 0.996, 0.987 (p50 0.966 ≥ 0.5); first 39 steps: p50 0.964, weighted 0.853 (read 2 687 836, write 461 600, uncached input 120). The router recorded one orchestrator turn for the whole session (no user prompt after `continue`), so "turns" here are host steps. Per-step table below ("Orchestrator steps"). Re-probe on the fix build. |
+| DF1.4.f held results | **pass** (with DF-1-3) | C4/C15 hold (Phase 0.1). The gate ran no test ("no changed files, no affected tests", QA-DF1-15), so the probe shows the hold/verdict sequence, not a test run. Runner `ses_ecf4f55cdffe03G7QXLlHryk7o`, `VERIFY:required` in the background: the call returned `Its result is held until verification finishes`; the completion arrived as `held — verdict pending (vrf_02dc7ee3b0cb16b6cf986c47)`, then the verdict with the output and `[router ✓ verified: deterministic]`. |
 | DF1.4.h cleanup | **pass** | Probe file deleted, `git worktree remove D:\git\omr-cpx-scratch`, `git branch -D cpx/scratch-df1` (was `d93d4d8`); `D:\git\omr-cpx-scratch` absent. Scratch worktree `D:\git\omr-cpx-scratch-pre` (for DF-1-2, detached at `cf7e5b6`, `node_modules` junction) removed the same way after removing the junction. |
 
 ### Deviations
@@ -102,3 +102,147 @@ Build `cpx/df1` = `226d967` (`D:\git\omr-cpx-dogfood-df1`), loaded since 2026-10
   (`D:\git\omr-cpx-main`) as its work root although the route line set `root=D:\git\omr-cpx-scratch`; the resume with
   "attempt it now" ran it. Model behaviour on the fast tier; the role prompt's work-root wording is to be checked in
   `pdf1-1`.
+- **DF-1-9 — a child session the plugin never saw created is treated as a root for the background decision**
+  (found while fixing DF-1-2). Three of the four DF-1-2 failures are stale expectations (2.1 adds the v2
+  `## Background dispatches` block and stops forcing `background: false` on a thin duration store). The fourth,
+  `QA-P21-1-1`, is a product fault: `knownKindOf` (`src\compat\v2-hooks.ts` ≈1306) returns `root` for an unknown
+  session, so `parentIsRoot` (≈2578) is true for a child the plugin did not record (e.g. after a reload), and the `auto`
+  rows can background a child's dispatch, contrary to row 2 of the 2.1 decision table (`phase-2.1.md` ≈432-433). Code
+  fault → `pdf1-1`.
+- **DF-1-10 — a running background dispatch was settled "lost in restart" without a restart.** At ≈15:37Z the
+  orchestrator received `<router-verdict handle="vrf_b09dfc0e…" verdict="UNVERIFIABLE">[router] not verified: lost in
+  restart` for implementer `ses_ecf494a78ffeIBjqCOSUjN2KxX` (pdf1-1 H1), which was still producing steps (host DB: step
+  77 at 15:39:29Z), and the router state still lists it as in flight and "verifying". No server restarted (processes
+  44768/66968 since 12:03:38; one `cli starting` for run `27717102`). The host booted a new location
+  `D:\git\omr-cpx-scratch` at 15:36:41.9Z and loaded a second router instance there (QA-DF1-1 probe worktree).
+  Hypothesis: a router instance starting in a new location reloads the shared pending journal and settles the other
+  instance's live handles as lost. Code fault → `pdf1-1` (hinders execution: every new worktree location — Wave 3 opens
+  several — can void in-flight verifications).
+- **DF-1-11 — the restart opened a fresh session, not `-s ses_ed82f88a7ffej5iKaRHuwIa6fd` (QA-DF1-5).** The owner used
+  the §0b fresh-session kickoff (`d93d4d8`, 12:02, after the DF1.2 record); the live orchestrator is
+  `ses_ecf5bd114ffe5QT3S5xVTAQcF4`. DF1.3 and §0.12-3.5 say "continue the same session". Effect: the launch and revert
+  commands in handover §7 named the old session (fixed with this record), and the "no user prompt after `continue`"
+  wording above means "one kickoff prompt, no later user prompt". Probably also the trigger of DF-1-1 (DF-0, launched
+  with `-s`, booted only plan worktrees); not proven.
+
+**DF-1-1 follow-up (QA-DF1-7).** In run `27717102` every command with cwd `D:\git\opencode-model-router` is a host
+project probe: `rev-parse --git-dir --git-common-dir --show-toplevel` (15:03:40.5Z, 15:03:55.9Z), `remote get-url
+origin` (15:03:40.7Z), `symbolic-ref` / `remote` (15:03:50.6-50.8Z); plus MCP connections and config events for that
+location. Every `git worktree list --porcelain` of the run (the reference GC included) has cwd `D:\git\omr-cpx-main`;
+nothing ran there after 15:03:56Z. So the df1 router was loaded in that location (it reads that checkout's project
+overrides at start) but ran no git command and wrote nothing there that the log shows. Disposition: host behaviour
+triggered by the fresh-session launch, not a router regression; told to the owner on 2026-10-12 with a request for
+acknowledgement; hardening (skip plugin-start side effects when `ctx.directory` is outside `routing.workRoots`) is
+scheduled in `pdf1-1`.
+
+**DF-1-7 disposition (QA-DF1-10): not a fault.** The DF1.4.c route lines ask for `needs=edit,shell` with `d=none`; the
+authority floor for write + exec without a deterministic check is heavy (`src\router\policy.ts` ≈217-229) and a pin
+below the floor is lifted with `lift:authority` (≈406-408). The plan's DF1.4.c / DF2 route lines run heavy by design.
+
+**Workaround probes (QA-DF1-1, 2026-10-12 12:35-12:37 -03:00, scratch worktree `D:\git\omr-cpx-scratch` on branch
+`cpx/scratch-df1b`, both removed afterwards).**
+- (b) foreground `d=none` implementer `ses_ecf3dc9c5ffecP2uCAiksAhtgw` wrote the probe file →
+  `[router ✓ verified: checker]`: the grader runs in the foreground. **pass**
+- (a) foreground resume of the same session with a marker → delivered `DONE: turn 2 marker 4f1c appended` (this turn's
+  answer), `[router ✓ verified: checker]`. **pass**
+
+**Binding workaround until `cpx/df1.1` is loaded (§0.12-6):** every resume of a role session runs in the foreground
+(`background: false`); producer dispatches without a deterministic acceptance check run in the foreground or carry an
+`[acceptance]` block; `⚠ UNVERIFIED` means unverified whatever the `verdict=` attribute says, and the handles listed
+in DF-1-3 do not count as verified; a `lost in restart` verdict for a dispatch that is still listed in flight is
+ignored until its real completion (DF-1-10). With the workaround the plan continues on df1; `pdf1-1` ships as a
+re-switch `cpx/df1.1` (these faults hinder execution, so it does not wait for DF-2).
+
+**Other implementation unaffected (QA-DF1-8).** The other servers are the scoop 2.0.27 executables (processes
+41232/48472/28388 and 2412/36096/46636, created 08:02 and 08:22, before the switch) and load their own config; the
+global `C:\Users\Marquinho\.config\opencode\opencode.json` hash `CD913FB1…5709` equals the backup
+`$env:LOCALAPPDATA\omr-cpx\opencode-config.backup\opencode-config.backup` (unchanged since 2026-10-10 00:39:51); run
+`27717102` boots no location in `D:\git\opencode-model-router-cross-repo`, and in `D:\git\opencode-model-router` only
+the host probes above (no prompt, no session). Shared state df1 now writes: `timings.jsonl` in the default outcome
+directory (rows carry this plan's session ids only: parent `ses_ecf5bd114ffe5QT3S5xVTAQcF4`), the pending journal and
+lease claim files (§0.13-5).
+
+**Leftover state (QA-DF1-11).** `git worktree list` after cleanup: no `omr-ref*` or scratch worktree; `cpx/scratch-df1`
+and `cpx/scratch-df1b` deleted. Probe handles left in the pending journal (24 h TTL): the DF-1-3 handles (settled with
+a wrong `PASS`, QA-DF1-2), `vrf_98eda506…` and `vrf_9e44e784…` (stale deliveries, DF-1-4). They name the removed
+scratch worktree; `pdf1-1`'s re-probe drains the journal with `router_verify pending:true` before the `cpx/df1.1` tag.
+
+**Pre-flight correction (QA-DF1-9).** The DF-1 pre-flight claim "scoped tests of 2.1-2.4 green" was false: the list
+missed `test\unit\roles.runtime.test.ts` (DF-1-2), so §0.12-3.1 was not met when `cpx/df1` was tagged. From now on the
+pre-flight's scoped list includes every test that imports a changed module.
+
+### Orchestrator steps (host DB, `ses_ecf5bd114ffe5QT3S5xVTAQcF4`; UTC; DF1.4.e and DF-1-6 evidence)
+
+| Step | Time | Uncached input | Cache read | Cache write |
+|---|---|---|---|---|
+| 1 | 15:03:55 | 4 | 6857 | 24154 |
+| 2 | 15:04:01 | 2 | 31011 | 1078 |
+| 3 | 15:04:05 | 2 | 32089 | 24273 |
+| 4 | 15:04:12 | 2 | 56362 | 211 |
+| 5 | 15:04:19 | 2 | 56573 | 747 |
+| 6 | 15:04:26 | 2 | 57320 | 1208 |
+| 7 | 15:04:35 | 2 | 58528 | 7085 |
+| 8 | 15:04:45 | 2 | 65613 | 3053 |
+| 9 | 15:04:56 | 2 | 68666 | 1465 |
+| 10 | 15:05:11 | 2 | 70131 | 1149 |
+| 11 | 15:05:18 | 2 | 71280 | 371 |
+| 12 | 15:05:50 | 2 | 71651 | 325 |
+| 13 | 15:06:06 | 4 | 71976 | 1326 |
+| 14 | 15:06:15 | 4 | 71976 | 2102 |
+| 15 | 15:06:21 | 4 | 71976 | 2178 |
+| 16 | 15:07:06 | 4 | 71976 | 3310 |
+| 17 | 15:07:16 | 4 | 71976 | 3535 |
+| 18 | 15:08:49 | 4 | 71976 | 6465 |
+| 19 | 15:09:23 | 4 | 29302 | 51214 |
+| 20 | 15:09:34 | 4 | 29302 | 51824 |
+| 21 | 15:09:42 | 4 | 29302 | 53962 |
+| 22 | 15:09:49 | 4 | 29302 | 54062 |
+| 23 | 15:14:53 | 4 | 29302 | 53891 |
+| 24 | 15:15:00 | 4 | 29302 | 55086 |
+| 25 | 15:15:31 | 2 | 84388 | 2791 |
+| 26 | 15:15:51 | 2 | 87179 | 3501 |
+| 27 | 15:16:14 | 2 | 90680 | 1696 |
+| 28 | 15:16:41 | 4 | 92376 | 2046 |
+| 29 | 15:16:47 | 2 | 94422 | 581 |
+| 30 | 15:16:53 | 2 | 95003 | 1684 |
+| 31 | 15:17:05 | 2 | 96687 | 1152 |
+| 32 | 15:17:16 | 2 | 97839 | 1520 |
+| 33 | 15:17:34 | 4 | 99359 | 3034 |
+| 34 | 15:17:44 | 4 | 99359 | 3758 |
+| 35 | 15:17:58 | 4 | 99359 | 5198 |
+| 36 | 15:18:26 | 4 | 99359 | 5234 |
+| 37 | 15:18:28 | 4 | 99359 | 7913 |
+| 38 | 15:18:35 | 4 | 99359 | 8264 |
+| 39 | 15:18:45 | 4 | 99359 | 9154 |
+
+Note: uncached input 4 (vs 2) marks the steps where the request carried the router-state tail (in flight or held);
+every plateau coincides with those steps.
+
+### DF1.QA
+
+Round 1 (reviewer `ses_ecf4a6d14ffeI81Bz7erefp9TM`, heavy, at `30ff5b2`): 15 findings (1 critical, 8 major, 5 minor,
+1 nit).
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| QA-DF1-1 no workaround / §0.12-4/-6 decision | critical | fixed: workaround probes (a), (b) pass; binding workaround and `cpx/df1.1` re-switch recorded above |
+| QA-DF1-2 unverifiable settled as deterministic pass | major | added to DF-1-3; fix in `pdf1-1` (align `index.ts` ≈3541 with `heldVerdictKind`, no hard-coded `method: "deterministic"`, regression test) |
+| QA-DF1-3 c/e passed on substitute evidence | major | fixed: rows relabelled (c partial, e not measurable); re-probe on `cpx/df1.1` |
+| QA-DF1-4 no verdict / no re-probe plan | major | fixed: verdict below |
+| QA-DF1-5 rollback resumes the wrong session | major | fixed: DF-1-11; handover §7 launch/revert use the live session id, revert drains holds first |
+| QA-DF1-6 handover §7 stale | major | fixed in handover §7 (next action, DF-1 row, builds list, session line) |
+| QA-DF1-7 DF-1-1 understated | major | fixed: follow-up above; owner told; hardening in `pdf1-1` |
+| QA-DF1-8 other implementation not evidenced | major | fixed: paragraph above |
+| QA-DF1-9 DF-1-2 mixes causes; pre-flight claim false | major | fixed: DF-1-9 split out; pre-flight correction above |
+| QA-DF1-10 DF-1-7 by design | minor | fixed: closed as not a fault |
+| QA-DF1-11 leftover state | minor | fixed: paragraph above; journal drain scheduled |
+| QA-DF1-12 DF-1-8 is a prompt issue too | minor | `pdf1-1`: `root=` takes precedence over the host environment block in `WORK_ROOT_RULE` (`src\router\roles.ts` ≈166) |
+| QA-DF1-13 self-check wording | minor | fixed: handover §7 self-check amended ("once per booted location; any location outside the plan's worktrees is a deviation"); 44768 = `opencode.exe --standalone` TUI, 66968 = its `serve --stdio` server child (run `27717102`) |
+| QA-DF1-14 evidence outside the repo | minor | fixed: steps table above |
+| QA-DF1-15 record gaps | nit | fixed: DF1.4.b end time and DF1.4.f "no test ran" notes; the probe window closes at the 12:22 commit, follow-ups to 12:40 |
+
+### Verdict
+
+DF-1 is **open**: DF1.4.a, b, f, h pass; c (runner criterion), d and e are re-probed on `cpx/df1.1` after `pdf1-1`
+(DF-1-3, -4, -5, -6, -9, -10, QA-DF1-12 and the DF-1-1 hardening), with its own run-scoped self-check. Until then the plan
+continues on df1 under the binding workaround.

@@ -380,7 +380,17 @@ Everything else is work: resolve it, record it, continue.
 
 ## 7. Live state (§0.11 — keep current)
 
-**NEXT ACTION (2026-10-12 ≈11:50): DF-1 self-check.** Wave 2 is done and merged (2.1 `bc0df8a` + smoke-harness follow-up `226d967`; 2.2 `ded2e88`; 2.3 `9b44413`; 2.4 `6eaf7f0`; amendments A-2.1-1..A-2.4-1). DF-1 pre-flight on `cpx/main` @ `226d967`: typecheck green; scoped tests of 2.1-2.4 green; `smoke:cpx` 56/56 (after `cpx/p21f`: the contract probes C3/C13 read the router's `<router-state>` tail as the caller's last message — harness fix, no product change); `smoke:v2` 2/2; `smoke:v1` 27 pass / 11 skipped on 1.18.35 (no failure); `router_verify pending:true` → nothing pending; `dogfood.md` baseline `5370e76`. Tracking issue: GitHub #109.
+**NEXT ACTION (2026-10-12 ≈12:45): fix phase `pdf1-1` → re-switch `cpx/df1.1`, then Wave 3.** DF-1 ran on `cpx/df1`
+(server run `27717102`, orchestrator session `ses_ecf5bd114ffe5QT3S5xVTAQcF4`): DF1.4.a/b/f/h pass, c (runner
+criterion)/d/e re-probe on `cpx/df1.1`; faults DF-1-1..DF-1-11 and DF1.QA round 1 (15 findings, all dispositioned) in
+`docs\qa\critical-path-execution\dogfood.md`. The plan continues on df1 under the **binding workaround** recorded
+there (resumes and `d=none` producers in the foreground; `⚠ UNVERIFIED` is unverified whatever `verdict=` says;
+ignore `lost in restart` for a dispatch still listed in flight). `pdf1-1`: worktree `D:\git\omr-cpx-pdf1-1`, branch
+`cpx/pdf1-1`; H1 (DF-1-3 + DF-1-4, implementer `ses_ecf494a78ffeIBjqCOSUjN2KxX`) and the DF-1-2 test refresh
+(`ses_ecf48defcffeiMPXtA1KqK8UAC`, uncommitted) in flight; DF-1-5/-6 analysis done (architect
+`ses_ecf48a2c7ffeywA7V8TN9lyjYW`); then DF-1-9, DF-1-10, QA-DF1-12, DF-1-1 hardening, DF1.QA round 2.
+
+*(superseded)* **DF-1 self-check (2026-10-12 ≈11:50).** Wave 2 is done and merged (2.1 `bc0df8a` + smoke-harness follow-up `226d967`; 2.2 `ded2e88`; 2.3 `9b44413`; 2.4 `6eaf7f0`; amendments A-2.1-1..A-2.4-1). DF-1 pre-flight on `cpx/main` @ `226d967`: typecheck green; scoped tests of 2.1-2.4 green; `smoke:cpx` 56/56 (after `cpx/p21f`: the contract probes C3/C13 read the router's `<router-state>` tail as the caller's last message — harness fix, no product change); `smoke:v2` 2/2; `smoke:v1` 27 pass / 11 skipped on 1.18.35 (no failure); `router_verify pending:true` → nothing pending; `dogfood.md` baseline `5370e76`. Tracking issue: GitHub #109.
 - DF1.1: tag `cpx/df1` = `226d967`, pushed.
 - DF1.2: worktree `D:\git\omr-cpx-dogfood-df1` (detached at `cpx/df1`, `npm ci` done). Switch: `$env:LOCALAPPDATA\omr-cpx\opencode-config\opencode.json` regenerated from the current global `opencode.json`, only the router entry changed `D:\\git\\opencode-model-router` → `D:\\git\\omr-cpx-dogfood-df1`; hard-linked files re-checked against the global originals (all equal), top-level entries unchanged. Override `D:\git\omr-cpx-main\.opencode\opencode-model-router.overrides.jsonc` = `{ "enforcement": { "verify": { "pendingTtlMs": 86400000 } } }` (git-ignored; DF2.4.a removes it).
 - DF1.3 launch (owner): close this window, then in a new pwsh:
@@ -401,7 +411,7 @@ Everything else is work: resolve it, record it, continue.
 
 **Session ids worth resuming (if the host kept them):** 2.1 fixers `ses_ed4e80b99ffeXBvANNxkTAYv3E` (smoke debug), `ses_ed52eedd8ffeqZGXqHcrcKhiY6` (D1–D6); 2.3 coverage `ses_ed5073436ffeO0sghh9IZsv43C`; 2.4 coverage `ses_ed4d09b82ffeev34Qgn4lmBrLM`. Memos are recorded in each `phase-2.x.md`; subagent outputs can also be recovered from `%USERPROFILE%\.local\share\opencode\opencode.db` (`session_message`/`part` by `session_id`).
 
-**Orchestrator session:** `ses_ed82f88a7ffej5iKaRHuwIa6fd` (directory `D:\git\omr-cpx-main`).
+**Orchestrator session:** `ses_ecf5bd114ffe5QT3S5xVTAQcF4` since the DF-1 restart (fresh session, DF-1-11; before it: `ses_ed82f88a7ffej5iKaRHuwIa6fd`), directory `D:\git\omr-cpx-main`.
 
 **Worktrees:** working (plan home) `D:\git\omr-cpx-main` (branch `cpx/main`, upstream `origin/cpx/main`); dogfood
 `D:\git\omr-cpx-dogfood-df0` (detached at `cpx/df0` = `b716ee9`, loaded by the plan's host); phase worktrees in
@@ -417,7 +427,7 @@ implementation's worktree `D:\git\opencode-model-router-cross-repo` (branch `fea
 | 1.3 | **done** 2026-10-11 | 3 (r1: 17, r2: 17, r3: clean) | merged `6d310eb` |
 | 1.4 | **done** 2026-10-11 | 3 (r1: 20, r2: 11, r3: 3 major — fixed) | merged `12d42b7`; contract addenda A1–A3 in `phase-1.4.md` |
 | 2.1 | **done** 2026-10-12 | 3 (r1 13, r2 19, r3 2 major — all fixed; round-3 minors deferred) | merged `bc0df8a`; follow-up `cpx/p21f` merged `226d967` |
-| DF-1 | in progress: switch done, waiting for the owner restart | — | tag `cpx/df1` = `226d967` |
+| DF-1 | **open** 2026-10-12: df1 loaded and self-checked (DF1.4.a); c/d/e re-probe on `cpx/df1.1` | 1 (15 findings, all dispositioned; round 2 after `pdf1-1`) | tag `cpx/df1` = `226d967`; record in `dogfood.md`; fix phase `pdf1-1` |
 | 2.2 | **done** 2026-10-12 | 3 (r1 14, r2 9, r3 1 major — fixed) | merged `ded2e88`; ledger.ts 96.01 branches after top-up `fe3a178` |
 | 2.3 | **done** 2026-10-12 | 3 (r1 17, r2 15, r3 1 major — fixed) | merged `9b44413`; estimate 97.5 / index 92.46 branches after top-up `ca5cb81` |
 | 2.4 | **done** 2026-10-12 | 3 (r1 21, r2 9, r3 1 major — fixed) | merged `6eaf7f0`; M1-M10 measured (all constants kept); `smoke:cpx:provision` 4/4 |
@@ -477,15 +487,17 @@ The DF-0 run-scoped self-check (marker `omr-selfcheck-7f3a91c2d4`, server execut
   (DF-2 pre-flight executor keys) is announced to the owner first.
 
 **Router builds that passed their self-check:** `cpx/df0` (`b716ee9`, `D:\git\omr-cpx-dogfood-df0`, server run
-`461f3bf1`, 2026-10-10). In use now: df0, through the process-scoped config.
+`461f3bf1`, 2026-10-10); `cpx/df1` (`226d967`, `D:\git\omr-cpx-dogfood-df1`, server run `27717102`, 2026-10-12 —
+self-check passed; known faults DF-1-3/-4/-10 under the binding workaround in `dogfood.md`). In use now: df1, through
+the process-scoped config. Rollback target for `cpx/df1.1`: df1.
 
 **Plugin-entry scope, launch and revert (0.P.3.f):** process-scoped (§0.12-2 option 1). Config directory
 `$env:LOCALAPPDATA\omr-cpx\opencode-config` (files hard-linked and directories junctioned from
 `C:\Users\Marquinho\.config\opencode`, except `opencode.json`, a copy whose router entry is the dogfood worktree).
 Global `opencode.json` unchanged (backup `$env:LOCALAPPDATA\omr-cpx\opencode-config.backup`).
 - **Launch (every DF-n restart; versioned executable, QA-0.P-9):** close the plan's OpenCode window, then in a new pwsh:
-  `$env:OPENCODE_CONFIG_DIR = "$env:LOCALAPPDATA\omr-cpx\opencode-config"; $env:OPENCODE_V2_BIN = "C:\Users\Marquinho\AppData\Local\omr-cpx\bin\opencode2-2.0.26\opencode.exe"; & $env:OPENCODE_V2_BIN --standalone -s ses_ed82f88a7ffej5iKaRHuwIa6fd D:\git\omr-cpx-main`
-  and type `continue`.
+  `$env:OPENCODE_CONFIG_DIR = "$env:LOCALAPPDATA\omr-cpx\opencode-config"; $env:OPENCODE_V2_BIN = "C:\Users\Marquinho\AppData\Local\omr-cpx\bin\opencode2-2.0.26\opencode.exe"; & $env:OPENCODE_V2_BIN --standalone -s ses_ecf5bd114ffe5QT3S5xVTAQcF4 D:\git\omr-cpx-main`
+  and type `continue` (QA-DF1-5: the live orchestrator session since DF-1; a fresh session instead is a deviation to record).
 - **Switch (QA-0.P-14/-23):** regenerate `$env:LOCALAPPDATA\omr-cpx\opencode-config\opencode.json` from the current
   global `opencode.json`, changing only the router entry to `D:\\git\\omr-cpx-dogfood-df<n>[.<k>]`; mirror the global
   directory's current top-level entries (new files hard-linked, new directories junctioned, removed ones removed, same
@@ -494,12 +506,14 @@ Global `opencode.json` unchanged (backup `$env:LOCALAPPDATA\omr-cpx\opencode-con
 - **Revert (QA-0.P-11/-18):**
   - *Back to before DF-0 only:* close the plan's window, then `Remove-Item Env:OPENCODE_CONFIG_DIR -ErrorAction SilentlyContinue; opencode -s ses_ed82f88a7ffej5iKaRHuwIa6fd D:\git\omr-cpx-main`
     (global config; loads the main checkout's moving build).
-  - *After DF-1 or later:* set the copy's router entry back to the **last build that passed its self-check** (list
+  - *After DF-1 or later:* first drain held verifications (`router_verify pending:true`; a build cannot release another
+    build's holds), then set the copy's router entry back to the **last build that passed its self-check** (list
     above) and relaunch with the launch command (§0.12-6).
 
 **DF self-check (amended 0.P.6, QA-0.P-6/-9/-16/-18):** run `Write-Output omr-selfcheck-<fresh literal nonce>`; take the
 `run=` id of the newest `spawning process` line carrying it in `C:\Users\Marquinho\.local\share\opencode\log\opencode.log`
-(shared by every server); in that run the `loading plugin` ids equal the regenerated config's plugin list, once each,
+(shared by every server); in that run the `loading plugin` ids equal the regenerated config's plugin list, once per booted location (list the
+locations; any location outside the plan's worktrees is a deviation, QA-DF1-13),
 router entrypoint exactly `file:///D:/git/omr-cpx-dogfood-df<n>[.<k>]/server.ts`; the server process executable is the
 2.0.26 path above; exactly one `router_verify` tool. DF1.4.a and DF2.4.0 are amended to use it. DF-0 result: run
 `461f3bf1` — plugins {`D:\\git\\omr-cpx-dogfood-df0`, `D:\\git\\opencode-anthropic-fix`}; the config also lists
