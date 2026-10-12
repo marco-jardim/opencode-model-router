@@ -194,6 +194,7 @@ export function createCapacityController(o: CapacityOptions): CapacityController
           return { decreased: false, pausedUntil: isoOrNull(s.pausedUntilMs), inbox: null };
         }
         firstSignalAt.set(sig.stepKey, now);
+        // A first signal at the floor (limit 1) still renews the hold and emits `decrease` 1 -> 1 (`decreased: false`).
         const from = s.limit;
         s.limit = Math.max(1, Math.floor(from / 2));
         s.holdUntilMs = now + cooldownMs;
@@ -228,7 +229,7 @@ export function createCapacityController(o: CapacityOptions): CapacityController
       if (stop && !retryStopped.has(i.stepKey)) {
         retryStopped.add(i.stepKey);
         emit({
-          provider: i.provider, change: "retry-stop", from: s.limit, to: s.limit, until: isoOrNull(s.pausedUntilMs),
+          provider: i.provider, change: "retry-stop", from: s.limit, to: s.limit, until: null,
           errorType: null, status: null,
         });
       }
