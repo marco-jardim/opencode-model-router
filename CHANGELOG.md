@@ -49,7 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already taken lives in memory, so a resume right after a plugin restart can still mis-attribute.
 - **OpenCode v2: background dispatches without a deterministic check are graded.** Their grader launches as the
   orchestrator agent that made the call, also after a restart, never from a role child's context (which denies
-  `subagent`), and a result that could not be verified is tagged `UNVERIFIABLE` instead of `PASS`. Acceptance is
+  `subagent`); an entry journaled by an older build falls back to the parent session's current agent, and a result that could not be verified is tagged `UNVERIFIABLE` instead of `PASS`. Acceptance is
   unchanged. OpenCode v1 is unchanged.
 - **OpenCode v2: an unrecorded child session never backgrounds a dispatch.** A child the plugin never recorded (after a
   reload, or past the 1000-entry bound) no longer counts as a root parent in the background decision (root parents
