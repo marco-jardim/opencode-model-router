@@ -47,9 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   turns with the same answer each get one verdict; a dispatch whose child ended before its answer could be read is
   read again on the parent's next request instead of waiting for the 6 h sweep. Known limit: the set of completions
   already taken lives in memory, so a resume right after a plugin restart can still mis-attribute.
-- **OpenCode v2: background dispatches without a deterministic check are graded.** Their grader launches from the
-  orchestrator's context, never from a role child's (which denies `subagent`), and a result that could not be verified
-  is tagged `UNVERIFIABLE` instead of `PASS`. Acceptance is unchanged. OpenCode v1 is unchanged.
+- **OpenCode v2: background dispatches without a deterministic check are graded.** Their grader launches as the
+  orchestrator agent that made the call, also after a restart, never from a role child's context (which denies
+  `subagent`), and a result that could not be verified is tagged `UNVERIFIABLE` instead of `PASS`. Acceptance is
+  unchanged. OpenCode v1 is unchanged.
 - **OpenCode v2: an unrecorded child session never backgrounds a dispatch.** A child the plugin never recorded (after a
   reload, or past the 1000-entry bound) no longer counts as a root parent in the background decision (root parents
   only): its kind comes from the role decision's session read or from the host, and a failed lookup keeps the
@@ -87,6 +88,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instance keeps that dispatch dormant until its end event instead of reporting it `lost in restart`.
 - **OpenCode v2: the background decision's parent lookup is bounded.** An unrecorded parent is looked up at most once
   and for at most 1 s; on timeout the dispatch stays in the foreground.
+- **OpenCode v2: plugin copies loaded per host location share one timing recorder.** When one host process loads the
+  plugin once per location, `turns.jsonl` no longer gets repeated rows and its turn numbers no longer restart, and the
+  `/router stats` orchestrator cache-read share is no longer over-counted. The recorder is shared per directory across
+  the copies; a recorder registered by a build with another registry version is left alone and the copy records on its
+  own. OpenCode v1 is unchanged.
 
 ## [2.7.0] - 2026-10-10
 

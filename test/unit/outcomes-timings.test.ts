@@ -1,6 +1,6 @@
 import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDurationModel } from "../../src/routing/outcomes/durations";
@@ -1206,7 +1206,7 @@ describe("timing recorder: shared per directory (QA-1.1-3)", () => {
     expect(seen).toEqual(["dispatch-timing"]);
   });
 
-  it("a later acquirer with other settings is told once, at info; the first caller's settings apply (QA-1.1-24)", () => {
+  it("a later acquirer with another clock, logger or turnIdleMs is not reported: every plugin instance passes its own (QA-PDF12-8)", () => {
     const infos: Logged[] = [];
     const infoLogger: TimingLogger = {
       warn: () => undefined,
@@ -1214,35 +1214,14 @@ describe("timing recorder: shared per directory (QA-1.1-3)", () => {
         infos.push({ message, extra });
       },
     };
-    const first = acquireTimingRecorder({ dir, now, logger: infoLogger, turnIdleMs: 1_000 });
-    holders.push(first);
-    holders.push(acquireTimingRecorder({ dir, now, logger: infoLogger, turnIdleMs: 1_000 })); // identical: silent
-    expect(infos).toEqual([]);
+    holders.push(acquireTimingRecorder({ dir, now, logger: infoLogger, turnIdleMs: 1_000 }));
     holders.push(acquireTimingRecorder({ dir, now, logger: infoLogger, turnIdleMs: 5_000 }));
     holders.push(acquireTimingRecorder({ dir, now: () => NOW + 1, logger: infoLogger }));
-    expect(infos).toHaveLength(1);
-    expect(infos[0]?.extra).toEqual({ dir });
+    holders.push(acquireTimingRecorder({ dir, now, logger: { warn: () => undefined, info: (message, extra) => void infos.push({ message, extra }) } }));
+    expect(infos).toEqual([]);
   });
 
-  it("a later acquirer with a different clock or logger is told too, on that logger (QA-1.1-24)", () => {
-    const infos: Logged[] = [];
-    holders.push(acquire());
-    holders.push(
-      acquireTimingRecorder({
-        dir,
-        now,
-        logger: {
-          warn: () => undefined,
-          info: (message, extra) => {
-            infos.push({ message, extra });
-          },
-        },
-      }),
-    );
-    expect(infos).toHaveLength(1);
-  });
-
-  it("a later acquirer that passes nothing different, or whose logger has no info, is silent", () => {
+  it("a later acquirer whose logger has no info does not throw and stays silent", () => {
     holders.push(acquire());
     expect(() => holders.push(acquireTimingRecorder({ dir, now, logger: { warn: () => undefined }, turnIdleMs: 9 }))).not.toThrow();
     holders.push(acquireTimingRecorder({ dir, now }));
@@ -1334,6 +1313,53 @@ describe("timing recorder: shared across module copies (DF-1.1-2)", () => {
     holder.markRootSession("root-1");
     expect(holder.isRootSession("root-1")).toBe(true);
     expect((globalThis as unknown as Record<symbol, unknown>)[REGISTRY_KEY]).toBeInstanceOf(Map);
+  });
+
+  describe("version guard (QA-PDF12-4)", () => {
+    // Another build's entry: same directory key, other version, a recorder of another shape (no methods at all).
+    function plantForeignEntry(version: unknown): { entry: Record<string, unknown>; registry: Map<string, unknown> } {
+      const registry = new Map<string, unknown>();
+      const entry: Record<string, unknown> = { version, recorder: { foreign: true }, observers: new Set(), refs: 1 };
+      const id = process.platform === "win32" ? resolve(dir).toLowerCase() : resolve(dir);
+      registry.set(id, entry);
+      (globalThis as unknown as Record<symbol, unknown>)[REGISTRY_KEY] = registry;
+      return { entry, registry };
+    }
+
+    it("exports the version the entries are stamped with", async () => {
+      const copy = await loadCopy();
+      expect(copy.TIMING_REGISTRY_VERSION).toBe(1);
+    });
+
+    it.each([[999], ["1"], [undefined]])("an entry of version %s is not reused and not touched; the copy records on its own", async version => {
+      const { entry, registry } = plantForeignEntry(version);
+      const snapshot = { ...entry };
+      const copy = await loadCopy();
+      const holder = copy.acquireTimingRecorder({ dir, now, logger });
+      holders.push(holder);
+      holder.markRootSession("root-1");
+      expect(holder.isRootSession("root-1")).toBe(true); // its own recorder, not the foreign `{ foreign: true }`
+      expect(registry.size).toBe(1);
+      expect(registry.get([...registry.keys()][0] as string)).toBe(entry);
+      expect(entry).toEqual(snapshot);
+      expect(entry.refs).toBe(1);
+      await holder.release();
+      expect(registry.size).toBe(1); // releasing its own entry leaves the foreign one in place
+      expect(entry).toEqual(snapshot);
+    });
+
+    it("an entry of the current version is reused", async () => {
+      const copyA = await loadCopy();
+      const a = copyA.acquireTimingRecorder({ dir, now, logger });
+      holders.push(a);
+      const copyB = await loadCopy();
+      const b = copyB.acquireTimingRecorder({ dir, now, logger });
+      holders.push(b);
+      a.markRootSession("root-1");
+      expect(b.isRootSession("root-1")).toBe(true);
+      const registry = (globalThis as unknown as Record<symbol, Map<string, { version: number }>>)[REGISTRY_KEY];
+      expect([...(registry?.values() ?? [])].map(e => e.version)).toEqual([copyA.TIMING_REGISTRY_VERSION]);
+    });
   });
 });
 

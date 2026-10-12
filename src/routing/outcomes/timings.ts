@@ -703,13 +703,16 @@ export interface TimingRecorderHolder extends TimingRecorder {
   release(): Promise<void>;
 }
 
+/**
+ * Layout/behaviour version of a registry entry; bump it whenever `RegistryEntry` or the recorder it holds changes shape.
+ * An entry of another version in the process-wide map is foreign: it is neither reused nor touched (QA-PDF12-4).
+ */
+export const TIMING_REGISTRY_VERSION = 1;
+
 interface RegistryEntry {
+  readonly version: number;
   readonly recorder: TimingRecorder;
   readonly observers: Set<(row: DispatchTimingRow | OrchestratorTurnRow) => void>;
-  /** What the first acquirer asked for (the settings that apply). */
-  readonly first: { readonly now: Clock; readonly logger: TimingLogger; readonly turnIdleMs: number | undefined };
-  /** True once a later caller with other settings was told (once per recorder). */
-  noticedMismatch: boolean;
   refs: number;
 }
 
@@ -731,6 +734,18 @@ function processRegistry(): Map<string, RegistryEntry> {
   return all as Map<string, RegistryEntry>;
 }
 
+/** Entries this copy keeps for itself where the process-wide map holds a foreign (other-version) entry of the same directory. */
+const privateRegistry = new Map<string, RegistryEntry>();
+
+/** The map that holds (or may hold) this copy's entry of `id`: the shared one, or the private one beside a foreign entry. */
+function registryFor(id: string): Map<string, RegistryEntry> {
+  const shared = processRegistry();
+  const existing: unknown = shared.get(id);
+  if (existing === undefined) return shared;
+  const version = typeof existing === "object" && existing !== null ? (existing as Partial<RegistryEntry>).version : undefined;
+  return version === TIMING_REGISTRY_VERSION ? shared : privateRegistry;
+}
+
 function registryId(dir: string): string {
   const abs = resolve(dir);
   return process.platform === "win32" ? abs.toLowerCase() : abs;
@@ -743,7 +758,7 @@ function registryId(dir: string): string {
  */
 export function acquireTimingRecorder(options: AcquireTimingRecorderOptions): TimingRecorderHolder {
   const id = registryId(options.dir);
-  const registry = processRegistry();
+  const registry = registryFor(id);
   let entry = registry.get(id);
   if (entry === undefined) {
     const observers = new Set<(row: DispatchTimingRow | OrchestratorTurnRow) => void>();
@@ -764,21 +779,11 @@ export function acquireTimingRecorder(options: AcquireTimingRecorderOptions): Ti
         }
       },
     });
-    entry = { recorder, observers, refs: 0, first: { now: options.now, logger, turnIdleMs: options.turnIdleMs }, noticedMismatch: false };
+    entry = { version: TIMING_REGISTRY_VERSION, recorder, observers, refs: 0 };
     registry.set(id, entry);
-  } else if (!entry.noticedMismatch) {
-    // QA-1.1-24: the first acquirer's settings apply; a later caller that asked for others is told once.
-    const { first } = entry;
-    const differs = options.now !== first.now || options.turnIdleMs !== first.turnIdleMs || (options.logger !== undefined && options.logger !== first.logger);
-    if (differs) {
-      entry.noticedMismatch = true;
-      try {
-        (options.logger ?? first.logger).info?.("[router] timing recorder already acquired for this directory; the first caller's clock, logger and turnIdleMs apply", { dir: options.dir });
-      } catch {
-        entry.noticedMismatch = true; // a failing logger must not reach the caller; the notice is not repeated
-      }
-    }
   }
+  // QA-PDF12-8: the first acquirer's clock, logger and turnIdleMs apply; every plugin instance passes its own closures, so a
+  // later caller with other ones is the normal case and is not reported.
   const shared = entry;
   shared.refs += 1;
   const observer = options.onRow;
@@ -806,8 +811,7 @@ export function acquireTimingRecorder(options: AcquireTimingRecorderOptions): Ti
       if (observer !== undefined) shared.observers.delete(observer);
       shared.refs -= 1;
       if (shared.refs > 0) return;
-      const current = processRegistry();
-      if (current.get(id) === shared) current.delete(id);
+      if (registry.get(id) === shared) registry.delete(id);
       await shared.recorder.flush();
     },
   };
