@@ -502,6 +502,7 @@ After QA rounds 1 and 2 (facts checked at HEAD effcdb3):
 - **F13 (D19).** A full-scope `testsPass`/`lintClean` is never the cheap no-change shortcut: per-check `scope=full`, and config `testScope: "full"` on OpenCode v2 only (v1 unchanged).
 - **X12.** With `routing.repoParents` set, role dispatches are deferred by default where they used to be synchronous: a "continue and finish" resume of a deferred attempt cannot back a `deterministic` detection (`docs/ROLES.md`).
 - **User docs.** `docs/VERIFICATION.md` → "Deferred verification across repositories", `docs/ROLES.md`, `docs/CONFIG_REFERENCE.md` → "Which delegations defer".
+- **P2e QA round 1.** The perimeter cap, retargeted links (S11), nested pin admission, I12 before re-observation, retryable unobserved drift, and a neutral full-scope risk reason were fixed (`2c6e39e` and its follow-up).
 
 ## 8. Test plan
 
@@ -595,6 +596,14 @@ After QA rounds 1 and 2 (facts checked at HEAD effcdb3):
   - A child bound by `root=` without admission refuses any `repo=`/`branch=` on resume.
   - When `repo=` matches nothing, the hint "name a worktree of <repo> with root=" reads oddly.
   - An explicit `root=` with `repo=X` is accepted by directory name even when a repository named X also exists (`root=` is explicit).
+- **Known follow-ups (P2e QA round 1), accepted for now:**
+  - A placement whose directory did not exist at return is reported at `router_verify` as "no longer resolves to the same repository since the producer returned". The synchronous gate would have failed the `fileExists` check instead.
+  - Consumer discovery is not shared between the entries of one `router_verify` call (up to 32 entries).
+  - Link snapshots digest every dirty file of the linked repository, at return inside the 2 s deferral bound and again at `router_verify`.
+  - A DoD that I3 across check roots will certainly refuse still defers. The refusal comes at `router_verify`.
+  - The `branch-switched` early return of the deferred finish leaves the perimeter snapshots running until their own timeouts.
+  - The `cross-repo` reason and its details are internal: nothing shows them to the orchestrator.
+  - S11 covers W's direct link targets only. Nested link targets, ignored files (`dist/`) and skip-worktree/assume-unchanged edits in a linked repository are not re-observed.
 - **Consumers** are discovered only in the working set, and only through `node_modules` links. Python editable installs, Go `replace`, Cargo path dependencies, and `../` or alias imports are not discovered (Q2).
 - **A consumer check's failures** are unverifiable, never "fail". The dependency is the changed repository, so the reference can neither excuse nor prove them.
 - **`router_run` scripts** remain trusted repository content (`run-tools.ts:11-13`).
