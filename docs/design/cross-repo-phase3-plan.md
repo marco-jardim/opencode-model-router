@@ -66,11 +66,11 @@ Settled by the orchestrator (not asked): **SD-P3a-12** (was OD-P3a-3): the confi
 | F14 | — | No golden covers tool schemas; header golden pins the repositories paragraph (`dispatch-header.golden.test.ts:39-60`). | New schema golden (3b.3). |
 | F15 | minor | `inspectGit` starts its own 15 s budget (`git-tools.ts:1019-1024`). | SD-3b-8 |
 | F16 | — | The tools are non-writing by exact name (`verify/dispatch.ts:197-200`); hardening never writes `.git` (`git-tools.ts:145-159`). | Tests: `.git` digest and index mtime unchanged. |
-| F17 | nit | Stale refs: `cross-repo.md:420` cites `git-tools.ts:953-963` (now `:978-990`), `index.ts:1312` (now `:1387`), `resolveWorkRootFor (:567-572)` (now `:593-601`). | 3b.7 |
+| F17 | nit | Stale refs: `cross-repo.md:420` cites `git-tools.ts:953-963` (now `:978-990`), `index.ts:1312` (now the `gitTools` registration, `:1460` after 3b.4), `resolveWorkRootFor (:567-572)` (now `:593-601`). | 3b.7 |
 
 ## Contract: resolution order and texts
 
-All refusals start with `[router_git] error: refused: `. Echoed values go through `displaySafe`. Steps 1–3 make no filesystem call and spawn nothing.
+All refusals start with `[router_git] error: refused: `. Echoed values go through `displaySafe`. Steps 1–3 make no filesystem call on the value and spawn nothing. Since QA-1 F1, step 3 may resolve the configured parents (never the value), so a `root` in the canonical spelling of a junctioned parent is accepted.
 
 1. **Session gates.** Not a role session: `root is only for role agents (roles mode); this session inspects its own repository: omit root`. No exact binding / no work root / no `router_git` in the grant: the existing `this role session has no bound work root (I9)`. No local read action: `root reads another repository and needs read, glob or grep in this dispatch's grant (<actions>); router_git alone stays in the work root`. Parents removed by hot reload: `root needs routing.repoParents (cross-repo is not configured); nothing ran`.
 2. **Text checks** (`root=<v> <problem>; pass the absolute top level of a repository or its name`): surrounding whitespace; > 4096 chars; `rootTextProblem` (`admission.ts:217-233`); any `.git` segment (`read-set.ts:28-30`); a bare name failing `repoNameProblem` (`:235-242`) or `.git`.
@@ -83,7 +83,7 @@ All refusals start with `[router_git] error: refused: `. Echoed values go throug
 9. **Deadline/abort.** `root=<v>: resolving the repository timed out; nothing ran` / `… was aborted; nothing ran`.
 10. **Inspection errors.** `[router_git] error: root=<v>: <existing redacted message>`.
 
-Security: `root` is only the spawn `cwd`, never a git argument; a name joins as one segment; UNC/device/8.3 refused before any filesystem call; gitdir redirection caught by the common-dir check (`git-tools.ts:983-988`, `:1004-1014`) and re-checked at spawn; no git executable from W or the target; existing hardening (hooks, fsmonitor, drivers, `GIT_*` stripped, ceiling) unchanged; nothing written (`--no-optional-locks`, `GIT_OPTIONAL_LOCKS=0`, `diff.autoRefreshIndex=false`).
+Security: `root` is only the spawn `cwd`, never a git argument; a name joins as one segment; UNC/device/8.3 refused before any filesystem call; gitdir redirection caught by the common-dir check (`git-tools.ts:983-988`, `:1004-1014`) and re-checked at spawn (the F2 checks, `23f404b`); no git executable from W or the target; existing hardening (hooks, fsmonitor, drivers, `GIT_*` stripped, ceiling) unchanged; nothing written (`--no-optional-locks`, `GIT_OPTIONAL_LOCKS=0`, `diff.autoRefreshIndex=false`).
 
 ## Tasks (lot 1)
 

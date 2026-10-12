@@ -31,7 +31,7 @@
 | Term | Meaning | Authority |
 |---|---|---|
 | **W**, write root | The one directory a role dispatch edits and runs in. It is the session directory, a worktree of the session repository, an admitted repository, or a worktree of one. | `edit`, `router_run`, `router_git` |
-| **R**, read set | W plus every admitted repository and its worktrees (section 3). | `read`, `glob`, `grep` |
+| **R**, read set | W plus every admitted repository and its worktrees (section 3). | `read`, `glob`, `grep`; `router_git` with `root` (role agents, read-only; Phase 3 (b)) |
 | **Working set** | Every worktree root bound as W by any dispatch of the same orchestrator session, with its repository name and branch. | none (observation and display only) |
 | **P**, perimeter | W's repository, plus the admitted repositories W links to (package links in W's `node_modules` whose real path is outside W and has no `node_modules` segment), plus the working set as it is when the dispatch starts. | none (observation only) |
 | **C**, check roots | Where acceptance checks run: W by default; in Phase 2 also a per-check `cwd=` inside R. | none |
@@ -175,7 +175,7 @@ Allow once = this dispatch only. Allow always = until it expires. Reject = no wo
   - the `execute.before` path check (`v2-hooks.ts:1000-1019`);
   - `router_run` `authorizeCwd` (`run-tools.ts:251-267`).
 
-  `router_git_*` runs only in W.
+  `router_git_*` runs only in W, unless a role agent passes `root` naming a repository in R that admission admits; that call is read-only (Phase 3 (b)).
 - **I2 — Capture anchored at W.** The change baseline, change set and reference are captured in W and P, never in a check cwd.
 - **I3 — Coverage.** If any absolute changed path lies outside the git top level of every check root, the verdict is never pass. This includes change sets that are partly inside, and change sets that are entirely outside. It holds on both verifiers (deterministic and grader), and a relative path that climbs out (`../x`, resolved against the base) counts as outside.
 - **I4 — Perimeter changes.** A change in P outside W during the dispatch:
@@ -417,7 +417,7 @@ Each slice lands test-first: the failing test reproduces the scenario row, then 
 | P1.2 | new `src/routing/roles/admission.ts`; `src/routing/wire/dispatch.ts` new `parseWorktreeEntries` next to `parseWorktreeList` (`:482-502`) | Implement `admit(path)`, `resolveName(name)` and `locationOf(path)` (repository, name, worktree, branch, HEAD) with hardened git and a 5 s cache. Parse HEAD, branch, detached and prunable from the worktree list. |
 | P1.3 | `src/routing/classify/route-line.ts` `parseFields` (`:91-188`); `src/routing/classify/types.ts` `RouteLine` | Add `repo=` and `branch=` (raw value). |
 | P1.4 | `dispatch.ts` `resolveRoleWorkRoot` (`:550-585`), route flow (`:1516-1569`), resume (`:835-849`); `src/routing/roles/policy.ts` `DispatchGrant` (`:15-27`) | Admission and declare-then-check. The resolution and the grant carry `repository` and `location`. |
-| P1.5 | `src/compat/v2-hooks.ts` `roleAuthorityDecision` (`:588-642`), `checkWorktree` (`:913-919`); `src/index.ts:1312`, `resolveWorkRootFor` (`:567-572`) | **Only the external_directory branch (`:607-615`) and the read/glob/grep branch (`:629-639`) widen**, to R, through an injected location resolver so the decision stays pure. The edit branch (`:622`, `:632`) and the `execute.before` edit paths are unchanged. Refusal texts carry the location (section 5). `checkWorktree` lists the binding's repository instead of `ctx.location.directory`. `dispatchRepository` comes from the binding. The logic of `roleRepository` (`git-tools.ts:953-963`) is unchanged. |
+| P1.5 | `src/compat/v2-hooks.ts` `roleAuthorityDecision` (`:588-642`), `checkWorktree` (`:913-919`); `src/index.ts` `gitTools` registration (`:1460-1461`), `resolveWorkRootFor` (`:593-601`) | **Only the external_directory branch (`:607-615`) and the read/glob/grep branch (`:629-639`) widen**, to R, through an injected location resolver so the decision stays pure. The edit branch (`:622`, `:632`) and the `execute.before` edit paths are unchanged. Refusal texts carry the location (section 5). `checkWorktree` lists the binding's repository instead of `ctx.location.directory`. `dispatchRepository` comes from the binding. The logic of `roleRepository` (`git-tools.ts:980-992`) is unchanged. |
 | P1.6 | `src/router/role-agents.ts` `registerRoleAgents` (`:347`) | Pass `<parent>/*` for each parent into `externalDirectoryPatterns` (`:242-263`). |
 | P1.7 | new `src/routing/wire/working-set.ts`; `dispatch-header.ts` `buildDispatchHeader` (`:29-53`); `src/router/protocol.ts` `buildRolesProtocol` | The working set per orchestrator session, cleared on `session.deleted`. The header gains its location and working-set lines. The protocol gains one sentence and the `repo=`/`branch=` template, only when configured. |
 | P1.8 | new `src/verify/perimeter.ts` (link discovery reusing `packageEntries` from `reference.ts`); `wiring.ts` `captureDepsFor` (`:1321-1347`), `observeChange`; `dispatch.ts` `observeEdit` overlap (`:223-224`), `concurrentDispatches` (`:456-463`); `gate.ts` | Snapshot P at dispatch and at return. Apply I4 and the I8 evidence, add the consumer note, and treat P roots as overlapping for capture contamination and for the concurrency count. |
@@ -478,7 +478,7 @@ After QA rounds 1 and 2 (facts checked at HEAD effcdb3):
 ### Phase 3
 
 - The `vitest related` cross-link spike.
-- A read-only `root` argument for `router_git_*` that names an admitted repository.
+- A read-only `root` argument for `router_git_*` that names an admitted repository. **Implemented** (`3b6aec8..219e5c5`; plan and QA in [cross-repo-phase3-plan.md](cross-repo-phase3-plan.md), decisions D20 and D21; limits in section 9, "Known follow-ups (P3b QA)").
 - Discovery of dependency edges that do not go through `node_modules` (no per-repository configuration).
 
 ### Phase 4 — first-use approval (v2 only, after spikes T1–T5)
@@ -561,7 +561,7 @@ After QA rounds 1 and 2 (facts checked at HEAD effcdb3):
   - The conflict note says "not a valid name" for two conflicting lines.
   - Admission notes and the plain "outside this dispatch's work root" refusal are not escaped.
   - R's exclude globs match only the canonical parent spelling.
-  - A `root=` in the canonical spelling of a junctioned parent is refused.
+  - A `root=` in the canonical spelling of a junctioned parent is refused on the route line. The `root` argument of `router_git_*` accepts it (Phase 3 (b), QA-1 F1).
   - A configured parent inside the session repository refuses that repository for `branch=`.
   - Contamination of perimeter snapshots is global across parallel dispatches.
   - Planning reruns on retries that already had no perimeter.
@@ -617,6 +617,23 @@ After QA rounds 1 and 2 (facts checked at HEAD effcdb3):
   - When perimeter planning fails, the dispatch still defers, and every outside link is later reported as "changed".
   - The missing-directory placement message holds only if the directory is still missing at `router_verify`.
   - `linkedTargets` runs once per entry per `router_verify` call, not shared.
+- **Known follow-ups (P3b QA), accepted for now** (the `root` argument of `router_git_*`; step numbers refer to the resolution in [cross-repo-phase3-plan.md](cross-repo-phase3-plan.md)):
+  - Names resolve only below the parents. `root` also reaches working-set worktrees outside the parents, where the host's static catch-all deny (Q7) blocks `read`.
+  - A junction from outside the parents into R is refused for `router_git_*` but allowed for `read`.
+  - Inspection errors keep the work-root wording behind the `root=<v>:` prefix.
+  - A bare main repository is refused.
+  - The provenance branch can be up to 5 s stale (admission cache).
+  - N3: `{root: W}` is refused by the session gates while `{}` succeeds.
+  - N4: `root` set to the top level of W's repository lifts W's subdirectory scope, as the read set allows.
+  - N5: host `permission.read` and `external_directory` denies inside a parent are not consulted; only `routing.repoExclude` is.
+  - F5 (rest): admission's `find()` directory walk is synchronous (at most 2000 stats), and admission's git calls are not aborted by the tool's deadline.
+  - F3 changes dispatch-time behaviour: route lines refuse worktrees of excluded repositories. The read set agrees (M1).
+- **Known follow-ups (P3b QA round 2, minor), accepted for now:**
+  - m1: The "has N worktrees" refusal lists worktrees outside R, and treats a repository with one worktree in R and one outside as ambiguous.
+  - m2: With overlapping parents, `root=<name>` is handed to admission in the first matching parent's spelling, which can give a depth refusal.
+  - m3: F3 matches exact paths. An exclude glob on an ancestor of the repository, or one written in a link parent's spelling, does not refuse its linked worktree at admission. The read set checks ancestors since `219e5c5`.
+  - m4: F6 redaction is regex-based: paths with spaces or `,;()'"<>|` leak or are mis-redacted. Structured paths from admission would fix it.
+  - Nits: n1 the orchestrator lookup runs before the step-2 text checks, and the `readProvenanceLine` lookup is unbounded; n3 `objects/info/alternates` lets `show <sha>` read another object store, and a directory can be swapped between the last check and the spawn; n4 the step-5 refusal prints a junction's real target outside R; n5 `isDirectory` runs before `eligible` in `find()`; n7 a single capped match is kept, as for `repo=`; n8 each parent is resolved with a synchronous realpath on a refusal.
 - **Consumers** are discovered only in the working set, and only through `node_modules` links. Python editable installs, Go `replace`, Cargo path dependencies, and `../` or alias imports are not discovered (Q2).
 - **A consumer check's failures** are unverifiable, never "fail". The dependency is the changed repository, so the reference can neither excuse nor prove them.
 - **`router_run` scripts** remain trusted repository content (`run-tools.ts:11-13`).
@@ -668,6 +685,13 @@ After QA rounds 1 and 2 (facts checked at HEAD effcdb3):
 | D17 | 2026-10-11 | QA of D15. (1) A `root=` the route-line parser rejected (invalid value, bare key, duplicate, or conflicting between lines) is an invalid declaration like `repo=`/`branch=`: it refuses the dispatch with `root=<value> is not a valid absolute work root: no work root. Fix the route line.` (`dispatch.ts`, `bindWorkRoot`). (2) An exact resume whose route line declares a target other than the child's bound root (`root=` not equal to the bound work root or its worktree, `repo=` not the bound repository's name, `branch=` not the bound branch, an invalid declaration, or a bound grant without a work root) is refused: `this child is bound to <work root> (repository <name>, branch <branch>); a resume cannot change its work root: dispatch a new child` (`declaresBoundRoot`, `boundRootRefusal`). A resume that declares nothing, or the bound target, is unchanged. |
 | D18 | 2026-10-11 | OD-P2e-1 (S11): at `router_verify`, a frozen link target that changed since the producer returned, or cannot be observed again, turns a would-be pass **UNVERIFIED** with a caveat (`the linked repository <name> at <root> changed since the producer returned; the checks ran against its new state` / `… could not be observed again since the producer returned`, `LINK_DRIFT_CAVEAT`). A fail stays a fail and carries the caveat. Staleness is not silently accepted. |
 | D19 | 2026-10-11 | OD-P2e-2 (F13): a full-scope `testsPass`/`lintClean` is never the cheap no-change shortcut. It applies to per-check `scope=full`, and to config `testScope: "full"` on OpenCode v2 only; v1 is unchanged (feature freeze). |
+| D20 | 2026-10-12 | OD-P3b-1 = (b): the `root` argument of `router_git_*` is an absolute top-level path, or a bare name with the route-line `repo=` semantics (D16). There is no `branch` argument. Implemented (Phase 3 (b), `3b6aec8..219e5c5`). |
+| D21 | 2026-10-12 | OD-P3b-2 = (a): only role agents may pass `root`, with an exact binding and `read`/`glob`/`grep` in the grant. Tiers and the orchestrator may not. Implemented (Phase 3 (b), `3b6aec8..219e5c5`). |
+| D22 | 2026-10-12 | OD-P3a-1 = (a): a consumer `testsPass` opts in to the cross-link run only with an explicit `scope=affected`. Decided, not yet implemented. |
+| D23 | 2026-10-12 | OD-P3a-2 = (b): ignored build output in W (`dist/`): a bounded gate-time list of W's ignored JS/TS/JSON files is added to the related inputs. Decided, not yet implemented. |
+| D24 | 2026-10-12 | OD-P3c-1 = (a): the dependency edge kinds that ship are Tier A: `package.json` path specs, tsconfig, Python editable installs in an in-repo venv, Go `replace`/`go.work`. Decided, not yet implemented. |
+| D25 | 2026-10-12 | OD-P3c-2 = (a): Q2 (approximate reference for edges leaving the repository) is closed as a documented, narrower limit; failing closed is recorded as a follow-up. Decided, not yet implemented. |
+| D26 | 2026-10-12 | OD-P3c-3 = (b): W's dependency targets are read again at return, and the new admitted ones are frozen, so a dependency added during the dispatch is not "changed" at `router_verify`. Decided, not yet implemented. |
 
 ## 12. Alternatives considered
 
