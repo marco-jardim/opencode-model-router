@@ -1,0 +1,2180 @@
+// Durable ledger store (plan task 2.2.2): snapshot + journal + history under one writer lock, all I/O through the `FileSystem` seam.
+// Nothing here touches the filesystem, the clock or the process at module load.
+import { randomBytes } from "node:crypto";
+import * as nodeFsp from "node:fs/promises";
+import { constants as nodeFsConstants } from "node:fs";
+
+/** `appendText` options as the ledger passes them: `create: false` means "the file must already exist" (ENOENT = fenced). */
+type AppendOptions = { fsync: boolean; create?: boolean };
+import { hostname } from "node:os";
+import { join } from "node:path";
+import { isPlanId, planDir, SLOT_MARKERS_DIRNAME } from "./paths.js";
+import {
+  GATE_TRANSITION_TRIGGERS,
+  INBOX_ID_PATTERN,
+  INBOX_ID_PREFIX,
+  LEDGER_SCHEMA,
+  RESERVED_TASK_IDS,
+  TRANSITION_TRIGGERS,
+  ExecutorError,
+  canGateTransition,
+  canStatusTransition,
+  canTransition,
+  isDurableEvent,
+  isHistoryEvent,
+  isLedgerV1,
+  ledgerSchemaOf,
+  ledgerViolations,
+  type Attempt,
+  type BatchBuilder,
+  type Clock,
+  type ExecutorEvent,
+  type ExecutorEventInput,
+  type FileSystem,
+  type FsStat,
+  type GateRef,
+  type GateTransitionKey,
+  type IntegrationEntry,
+  type IntegrationStep,
+  type IntegrationStepResult,
+  type JsonValue,
+  type LedgerStatus,
+  type LedgerStore,
+  type LedgerV1,
+  type LedgerWriter,
+  type LockHolder,
+  type OpenIntegrationEntry,
+  type PlanId,
+  type TaskNode,
+  type TransitionKey,
+} from "./types.js";
+
+type Rec = Record<string, unknown>;
+
+function isRec(v: unknown): v is Rec {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+function hasOwn(o: object, k: string): boolean {
+  return Object.prototype.hasOwnProperty.call(o, k);
+}
+function errMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+/** One parsed journal line: the event and its exact original text (history copies are byte-identical). */
+interface JournalLine {
+  event: ExecutorEvent;
+  text: string;
+}
+
+interface ParsedJournal {
+  lines: JournalLine[];
+  /** A torn (unparsable / unterminated) last line was dropped. */
+  torn: boolean;
+}
+
+/** Shape check of the envelope only; payload checks happen in replay (per-event preconditions). */
+function isEnvelope(v: unknown): v is ExecutorEvent {
+  return isRec(v) && Number.isInteger(v.seq) && typeof v.at === "string" && Number.isInteger(v.batch) &&
+    typeof v.last === "boolean" && typeof v.type === "string";
+}
+
+/**
+ * Splits a journal file into events. A last line without a terminating newline, or one that fails to parse, is torn
+ * and dropped (A1-2 rule 1). An unparsable line anywhere else is corruption (E_SEQ_GAP).
+ */
+function parseJournal(text: string, file: string): ParsedJournal {
+  const lines: JournalLine[] = [];
+  if (text === "") return { lines, torn: false };
+  const parts = text.split("\n");
+  // `split` leaves "" after a trailing newline; anything else after the last "\n" is an unterminated (torn) line.
+  const tail = parts.pop() ?? "";
+  let torn = tail !== "";
+  for (let i = 0; i < parts.length; i++) {
+    const raw = parts[i] ?? "";
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      if (i === parts.length - 1 && tail === "") {
+        // A last terminated line that does not parse: the write was cut after the newline of a garbled block.
+        torn = true;
+        break;
+      }
+      throw new ExecutorError("E_SEQ_GAP", `unparsable journal line ${i + 1} in ${file}: ${errMessage(e)}`, { file, line: i + 1 });
+    }
+    if (!isEnvelope(parsed)) {
+      if (i === parts.length - 1 && tail === "") {
+        torn = true;
+        break;
+      }
+      throw new ExecutorError("E_SEQ_GAP", `malformed journal line ${i + 1} in ${file}`, { file, line: i + 1 });
+    }
+    lines.push({ event: parsed, text: raw });
+  }
+  return { lines, torn };
+}
+
+/** Result of framing validation over one journal file. */
+interface FramedJournal {
+  /** Complete batches only, in order. */
+  lines: JournalLine[];
+  /** Number of events of a trailing incomplete batch that were dropped. */
+  droppedIncomplete: number;
+}
+
+/**
+ * A1-2 rules (2) and (3), main journal only: `seq` +1; the first event of a file and any event after `last: true` has `batch === seq`;
+ * the others share the previous `batch`. A trailing batch without `last: true` is dropped. `firstSeq` is the file's expected first seq
+ * (null: any, used for the first-seq of the file name check by the caller).
+ */
+function frameJournal(lines: readonly JournalLine[], file: string, expectedFirst: number | null): FramedJournal {
+  let prev: ExecutorEvent | null = null;
+  let completeEnd = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const e = (lines[i] as JournalLine).event;
+    const where = { file, seq: e.seq, type: e.type };
+    if (prev === null) {
+      if (expectedFirst !== null && e.seq !== expectedFirst) {
+        throw new ExecutorError("E_SEQ_GAP", `journal ${file} starts at seq ${e.seq}, expected ${expectedFirst}`, where);
+      }
+      if (e.batch !== e.seq) {
+        throw new ExecutorError("E_SEQ_GAP", `journal ${file}: first event seq ${e.seq} has batch ${e.batch}`, where);
+      }
+    } else {
+      if (e.seq !== prev.seq + 1) {
+        throw new ExecutorError("E_SEQ_GAP", `journal ${file}: seq ${e.seq} follows ${prev.seq}`, where);
+      }
+      const expectedBatch = prev.last ? e.seq : prev.batch;
+      if (e.batch !== expectedBatch) {
+        throw new ExecutorError("E_SEQ_GAP", `journal ${file}: seq ${e.seq} has batch ${e.batch}, expected ${expectedBatch}`, where);
+      }
+    }
+    if (e.last) completeEnd = i + 1;
+    prev = e;
+  }
+  return { lines: lines.slice(0, completeEnd), droppedIncomplete: lines.length - completeEnd };
+}
+
+function jsonDetail(v: unknown): JsonValue {
+  return JSON.parse(JSON.stringify(v ?? null)) as JsonValue;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// History tracker (A1-3): open integration entries and wake keys, derived from history-class events.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Mutable view of one open integration entry. */
+interface OpenEntryState {
+  entry: IntegrationEntry;
+  startSeq: number;
+  step: IntegrationStep;
+  edge: "start" | "end";
+  result: IntegrationStepResult | null;
+}
+
+class HistoryTracker {
+  private open = new Map<string, OpenEntryState>();
+  private keys = new Set<string>();
+  /** Tasks whose most recent integration entry closed `rolled-back` (A1-3a: they may be `integrating` with no open entry). */
+  private rolledBack = new Set<string>();
+  lastSeq = 0;
+
+  clone(): HistoryTracker {
+    const t = new HistoryTracker();
+    for (const [id, s] of this.open) t.open.set(id, { ...s, entry: { ...s.entry, taskIds: [...s.entry.taskIds] } });
+    t.keys = new Set(this.keys);
+    t.rolledBack = new Set(this.rolledBack);
+    t.lastSeq = this.lastSeq;
+    return t;
+  }
+
+  /** Tasks that are `integrating` while no entry is open for them and their last entry did not close rolled-back (A1-3a), in plan order. */
+  integratingWithoutEntry(l: LedgerV1): string[] {
+    const open = new Set<string>();
+    for (const s of this.open.values()) for (const id of s.entry.taskIds) open.add(id);
+    return Object.values(l.tasks)
+      .filter((t) => t.state === "integrating" && !open.has(t.id) && !this.rolledBack.has(t.id))
+      .map((t) => t.id);
+  }
+
+  openEntries(): readonly OpenIntegrationEntry[] {
+    return [...this.open.values()].map((s) => ({
+      entry: { ...s.entry, taskIds: [...s.entry.taskIds] },
+      startSeq: s.startSeq,
+      step: s.step,
+      edge: s.edge,
+      result: s.result,
+    }));
+  }
+
+  wakeKeys(): ReadonlySet<string> {
+    return this.keys;
+  }
+
+  /** Applies a history-class event; returns a violation code (state unchanged) or null. Non-history events are ignored. */
+  apply(e: ExecutorEvent): string | null {
+    if (e.type === "wake") {
+      this.keys.add(e.stateKey);
+      this.lastSeq = e.seq;
+      return null;
+    }
+    if (e.type !== "integration-step") {
+      if (isHistoryEvent(e)) this.lastSeq = e.seq;
+      return null;
+    }
+    const cur = this.open.get(e.entry.id);
+    if (cur === undefined) {
+      if (e.edge !== "start") return "entry-not-open";
+      if (e.entry.id !== `i-${e.seq}`) return "entry-id-mismatch";
+      if (e.closes) return "closes-on-start";
+      this.open.set(e.entry.id, {
+        entry: { ...e.entry, taskIds: [...e.entry.taskIds] },
+        startSeq: e.seq,
+        step: e.step,
+        edge: "start",
+        result: null,
+      });
+      this.lastSeq = e.seq;
+      return null;
+    }
+    if (e.entry.kind !== cur.entry.kind || e.entry.phaseId !== cur.entry.phaseId || e.entry.baseHead !== cur.entry.baseHead) {
+      return "entry-fixed-field-changed";
+    }
+    if (e.edge === "start") {
+      if (cur.edge !== "end") return "step-start-before-end";
+      if (e.closes) return "closes-on-start";
+    } else {
+      if (cur.edge !== "start" || cur.step !== e.step) return "end-without-matching-start";
+    }
+    cur.entry = { ...e.entry, taskIds: [...e.entry.taskIds] };
+    cur.step = e.step;
+    cur.edge = e.edge;
+    cur.result = e.edge === "end" ? e.result : null;
+    if (e.edge === "end" && e.closes) {
+      this.open.delete(e.entry.id);
+      for (const id of e.entry.taskIds) {
+        if (e.result === "rolled-back") this.rolledBack.add(id);
+        else this.rolledBack.delete(id);
+      }
+    }
+    this.lastSeq = e.seq;
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Replay: per-event preconditions (A1-2) and the ledger reducer.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Per-batch bookkeeping for rules that span events of one batch. */
+interface BatchCtx {
+  /** `plan-approved` was applied and no `status-changed -> running` has followed yet. */
+  approvalPending: boolean;
+}
+
+function newBatchCtx(): BatchCtx {
+  return { approvalPending: false };
+}
+
+const PRE_APPROVAL_STATUSES: readonly LedgerStatus[] = ["compiling", "awaiting-residue", "awaiting-approval"];
+
+function taskOf(l: LedgerV1, id: string): TaskNode | null {
+  return hasOwn(l.tasks, id) ? (l.tasks[id] as TaskNode) : null;
+}
+
+function latestAttempt(t: TaskNode): Attempt | null {
+  return t.attempts.length === 0 ? null : (t.attempts[t.attempts.length - 1] as Attempt);
+}
+
+function isOpenAttemptShape(a: Attempt): boolean {
+  return a.endedAt === null && a.outcome === null && a.verdict === null && a.childSessionID === null && a.context === "";
+}
+
+function edgeEndpointExists(l: LedgerV1, id: string): boolean {
+  if (id.startsWith("gate:")) {
+    const phaseId = (id as GateRef).slice("gate:".length);
+    return l.phases.some((p) => p.id === phaseId);
+  }
+  return taskOf(l, id) !== null;
+}
+
+function sameStrings(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((x, i) => x === b[i]);
+}
+
+function isSuperset(next: readonly string[], prev: readonly string[]): boolean {
+  return prev.every((p) => next.includes(p));
+}
+
+/**
+ * Checks the per-event precondition of `e` against `l` (the state just before `e`) and, when it holds, applies `e` to `l` in place.
+ * Returns a violation code or null. On a non-null return `l` may be partly changed: callers work on a copy.
+ */
+function applyEvent(l: LedgerV1, e: ExecutorEvent, ctx: BatchCtx): string | null {
+  switch (e.type) {
+    case "ledger-init":
+      return "ledger-init-not-first"; // handled by the caller at the start of a journal; never mid-journal
+    case "draft-replaced": {
+      if (!PRE_APPROVAL_STATUSES.includes(l.status)) return "draft-replaced-status";
+      const d = e.draft;
+      l.planDigest = d.planDigest;
+      l.sharedContext = d.sharedContext;
+      l.waves = d.waves;
+      l.phases = d.phases;
+      l.tasks = d.tasks;
+      l.edges = d.edges;
+      break;
+    }
+    case "status-changed":
+      if (e.from !== l.status) return "status-from-mismatch";
+      if (!canStatusTransition(e.from, e.to)) return "status-illegal";
+      l.status = e.to;
+      if (e.to === "running") ctx.approvalPending = false;
+      break;
+    case "plan-approved":
+      if (l.status !== "awaiting-approval") return "approve-status";
+      if (e.config.slotsDir === null) return "approve-slots-dir";
+      l.config = e.config;
+      ctx.approvalPending = true;
+      break;
+    case "orchestrator-bound":
+      l.orchestrator = { sessionID: e.sessionID, boundAt: e.at };
+      break;
+    case "lock-takeover":
+      break;
+    case "task-created": {
+      const t = e.task;
+      if (typeof t.id !== "string" || RESERVED_TASK_IDS.has(t.id) || hasOwn(l.tasks, t.id)) return "task-exists";
+      if (t.state !== "pending" && t.state !== "done") return "task-created-state";
+      if (!Array.isArray(t.attempts) || t.attempts.length !== 0) return "task-created-attempts";
+      if (t.slot !== null) return "task-created-slot";
+      l.tasks[t.id] = t;
+      break;
+    }
+    case "edge-added":
+      if (!edgeEndpointExists(l, e.edge.from) || !edgeEndpointExists(l, e.edge.to)) return "edge-endpoint";
+      l.edges.push(e.edge);
+      break;
+    case "task-transition": {
+      const t = taskOf(l, e.taskId);
+      if (t === null) return "task-missing";
+      if (e.from !== t.state) return "transition-from-mismatch";
+      if (!canTransition(e.from, e.to)) return "transition-illegal";
+      const triggers = TRANSITION_TRIGGERS[`${e.from}>${e.to}` as TransitionKey];
+      if (triggers === undefined || !triggers.includes(e.trigger)) return "transition-trigger";
+      t.state = e.to;
+      break;
+    }
+    case "attempt-started": {
+      const t = taskOf(l, e.taskId);
+      if (t === null) return "task-missing";
+      const a = e.attempt;
+      if (t.state !== "ready") return "attempt-started-state";
+      if (t.attempts.some((x) => x.outcome === null)) return "attempt-open-exists";
+      if (a.n !== t.attempts.length + 1) return "attempt-n";
+      if (!isOpenAttemptShape(a)) return "attempt-open-shape";
+      if (t.attempts.some((x) => x.nonce === a.nonce)) return "attempt-nonce-reused";
+      t.attempts.push(a);
+      break;
+    }
+    case "attempt-child": {
+      const t = taskOf(l, e.taskId);
+      if (t === null) return "task-missing";
+      const a = latestAttempt(t);
+      if (t.state !== "dispatched") return "attempt-child-state";
+      if (a === null || a.n !== e.n || a.outcome !== null || a.childSessionID !== null) return "attempt-child-target";
+      a.childSessionID = e.childSessionID;
+      break;
+    }
+    case "attempt-adopted": {
+      const t = taskOf(l, e.taskId);
+      if (t === null) return "task-missing";
+      const a = latestAttempt(t);
+      if (t.state !== "ready") return "attempt-adopted-state";
+      if (a === null || a.n !== e.n || a.outcome !== "lost") return "attempt-adopted-target";
+      // The late child continues this attempt: it is open again (the row-7 transition to running follows in the batch).
+      a.childSessionID = e.childSessionID;
+      a.outcome = null;
+      a.endedAt = null;
+      break;
+    }
+    case "attempt-ended": {
+      const t = taskOf(l, e.taskId);
+      if (t === null) return "task-missing";
+      const a = latestAttempt(t);
+      if (t.state !== "dispatched" && t.state !== "running") return "attempt-ended-state";
+      if (a === null || a.n !== e.n || a.outcome !== null) return "attempt-ended-target";
+      a.outcome = e.outcome;
+      a.endedAt = e.endedAt;
+      break;
+    }
+    case "attempt-verdict": {
+      const t = taskOf(l, e.taskId);
+      if (t === null) return "task-missing";
+      const a = latestAttempt(t);
+      if (t.state !== "verifying") return "attempt-verdict-state";
+      if (a === null || a.n !== e.n || a.outcome !== "succeeded" || a.verdict !== null) return "attempt-verdict-target";
+      a.verdict = e.verdict;
+      break;
+    }
+    case "attempt-context": {
+      const t = taskOf(l, e.taskId);
+      if (t === null) return "task-missing";
+      if (e.n !== t.attempts.length || e.n < 1) return "attempt-context-target";
+      (t.attempts[e.n - 1] as Attempt).context = e.context;
+      break;
+    }
+    case "task-slot": {
+      const t = taskOf(l, e.taskId);
+      if (t === null) return "task-missing";
+      t.slot = e.slot;
+      t.branch = e.branch;
+      break;
+    }
+    case "task-footprint": {
+      const t = taskOf(l, e.taskId);
+      if (t === null) return "task-missing";
+      const o = t.footprint;
+      const n = e.footprint;
+      if (!isSuperset(n.writes, o.writes) || !isSuperset(n.reads, o.reads) || !isSuperset(n.sources, o.sources)) {
+        return "footprint-not-monotone";
+      }
+      t.footprint = n;
+      break;
+    }
+    case "task-integrated": {
+      const t = taskOf(l, e.taskId);
+      if (t === null) return "task-missing";
+      if (t.state !== "integrating") return "task-integrated-state";
+      t.integrated = { from: e.from, to: e.to };
+      break;
+    }
+    case "integration-head":
+      l.integration.head = e.head;
+      break;
+    case "gate-changed": {
+      const p = l.phases.find((x) => x.id === e.phaseId);
+      if (p === undefined) return "phase-missing";
+      if (e.from !== p.gate) return "gate-from-mismatch";
+      if (!canGateTransition(e.from, e.to)) return "gate-illegal";
+      const triggers = GATE_TRANSITION_TRIGGERS[`${e.from}>${e.to}` as GateTransitionKey];
+      if (triggers === undefined || !triggers.includes(e.trigger)) return "gate-trigger";
+      const bump = e.trigger === "qa-next-round" || e.trigger === "cap-fix" ? 1 : 0;
+      if (e.qaRound !== p.qaRound + bump) return "gate-qa-round";
+      p.gate = e.to;
+      p.qaRound = e.qaRound;
+      break;
+    }
+    case "phase-paused": {
+      const p = l.phases.find((x) => x.id === e.phaseId);
+      if (p === undefined) return "phase-missing";
+      if (p.paused === e.paused) return "phase-paused-unchanged";
+      p.paused = e.paused;
+      break;
+    }
+    case "phase-tagged": {
+      const p = l.phases.find((x) => x.id === e.phaseId);
+      if (p === undefined) return "phase-missing";
+      p.tag = e.tag;
+      break;
+    }
+    case "inbox-added": {
+      const m = INBOX_ID_PATTERN.exec(e.item.id);
+      if (m === null || m[1] !== INBOX_ID_PREFIX[e.item.kind]) return "inbox-id";
+      const n = Number(m[2]);
+      if (l.inbox.some((x) => {
+        const mx = INBOX_ID_PATTERN.exec(x.id);
+        return mx !== null && Number(mx[2]) >= n;
+      })) return "inbox-id-not-increasing";
+      l.inbox.push(e.item);
+      break;
+    }
+    case "inbox-answered": {
+      const item = l.inbox.find((x) => x.id === e.id);
+      if (item === undefined) return "inbox-missing";
+      if (item.answer !== null) return "inbox-already-answered";
+      if (item.kind === "qa-cap" && item.severity === "critical" && !item.options.includes(e.answer)) return "inbox-answer-option";
+      item.answer = e.answer;
+      break;
+    }
+    case "integration-step":
+    case "wake":
+    case "metric":
+      break;
+    default:
+      return "unknown-event-type";
+  }
+  l.seq = e.seq;
+  return null;
+}
+
+/** Whole-ledger invariants, checked at batch end only (A1-2 rule 4), plus the batch-spanning rule of `plan-approved`. */
+function batchEndViolation(l: LedgerV1, ctx: BatchCtx): { code: string; codes: string[] } | null {
+  const codes: string[] = [];
+  if (ctx.approvalPending) codes.push("plan-approved-without-running");
+  for (const v of ledgerViolations(l)) codes.push(`${v.code}@${v.at}`);
+  return codes.length === 0 ? null : { code: codes[0] as string, codes };
+}
+
+/** Event reference carried in error details (names the offending event). */
+function eventRef(e: ExecutorEvent): JsonValue {
+  return { seq: e.seq, batch: e.batch, type: e.type };
+}
+
+/** Starting ledger of a journal: the `ledger-init` event's ledger, checked for shape. */
+function initLedger(e: ExecutorEvent): LedgerV1 {
+  if (e.type !== "ledger-init") throw new ExecutorError("E_SCHEMA_INVALID", "journal does not start with ledger-init", eventRef(e));
+  return checkLedger(e.ledger, `ledger-init seq ${e.seq}`);
+}
+
+/** Schema gate shared by snapshot and ledger-init: newer is refused, older migrates through the table, anything else must be a LedgerV1. */
+const MIGRATIONS: Readonly<Record<number, (old: unknown) => unknown>> = {};
+
+function checkLedger(v: unknown, what: string): LedgerV1 {
+  let cur: unknown = v;
+  const schema = ledgerSchemaOf(cur);
+  if (schema !== null && schema > LEDGER_SCHEMA) {
+    throw new ExecutorError("E_SCHEMA_NEWER", `${what}: ledger schema ${schema} is newer than supported ${LEDGER_SCHEMA}`, { schema });
+  }
+  let s = schema;
+  while (s !== null && s < LEDGER_SCHEMA) {
+    const step = hasOwn(MIGRATIONS, String(s)) ? MIGRATIONS[s] : undefined;
+    if (step === undefined) throw new ExecutorError("E_SCHEMA_INVALID", `${what}: no migration from schema ${s}`, { schema: s });
+    cur = step(cur);
+    const migrated = ledgerSchemaOf(cur);
+    if (migrated === null || migrated <= s) {
+      throw new ExecutorError("E_SCHEMA_INVALID", `${what}: migration from schema ${s} did not advance the schema`, { schema: s });
+    }
+    s = migrated;
+  }
+  if (!isLedgerV1(cur)) {
+    const viol = ledgerViolations(cur);
+    throw new ExecutorError("E_SCHEMA_INVALID", `${what}: not a valid ledger`, jsonDetail(viol.slice(0, 20)));
+  }
+  return cur;
+}
+
+function illegal(e: ExecutorEvent, code: string, codes: string[] = [code]): ExecutorError {
+  return new ExecutorError("E_ILLEGAL_TRANSITION", `event seq ${e.seq} (${e.type}) is illegal: ${codes.join(", ")}`, {
+    event: eventRef(e),
+    codes,
+  });
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Files, retry, locks.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** `ledger.<writerEpoch>.json`: one snapshot per writer epoch; the loader takes the highest epoch (see `snapshotName`). */
+const SNAPSHOT_PATTERN = /^ledger\.(\d+)\.json$/;
+const LOCK_FILE = "writer.lock";
+const LOCK_GUARD_FILE = "writer.lock.guard";
+const LOCK_GUARD_BREAK_FILE = "writer.lock.guard.break";
+const HISTORY_FILE = "history.jsonl";
+/** `events.<firstSeq>.<writerEpoch>.jsonl`: the epoch fences a takeover's predecessor (see `trustedChain`). */
+const JOURNAL_PATTERN = /^events\.(\d+)\.(\d+)\.jsonl$/;
+const TMP_PATTERN = /^(?:ledger\.\d+\.json|writer\.lock|history\.jsonl|writer\.[A-Za-z0-9_-]+\.beat)\.tmp-/;
+const BEAT_PATTERN = /^writer\.([A-Za-z0-9_-]+)\.beat$/;
+const TOKEN_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
+/**
+ * The only takeover `reason` that may replace a LIVE holder, matched exactly. It applies only when the live holder is this same
+ * process (same pid and host), until fencing proves an older writer out; any other live holder is refused with E_LOCK_HELD.
+ */
+export const ADOPT_TAKEOVER_REASON = "adopt";
+
+function beatFileName(token: string): string {
+  return `writer.${token}.beat`;
+}
+
+/** The lock file's content: the public holder plus the store-stamped token (identity) and the writer epoch (fencing). */
+interface LockRecord extends LockHolder {
+  token: string;
+  epoch: number;
+}
+
+/** What a reader of `writer.lock` learns: the raw text (for a content re-check), the parsed record and the freshness facts. */
+interface LockRead {
+  exists: boolean;
+  text: string | null;
+  holder: LockRecord | null;
+  mtimeMs: number | null;
+  /** The holder's own beat file stamp, when present. */
+  beatMs: number | null;
+}
+
+/** The holder as recorded in events and error details (no store-private fields). */
+function publicHolder(r: LockHolder): LockHolder {
+  return { pid: r.pid, hostname: r.hostname, sessionID: r.sessionID, startedAt: r.startedAt, heartbeatAt: r.heartbeatAt };
+}
+
+/** Defaults (2.2.2.b, .e). */
+const SNAPSHOT_EVERY_EVENTS = 200;
+const HEARTBEAT_MS = 10_000;
+const LOCK_STALE_MS = 60_000;
+const RETRY_BUDGET_MS = 2_000;
+const READ_RETRIES = 8;
+const GUARD_STALE_MS = 15_000;
+
+/** Pid/host facts the lock needs; a `Spawner` satisfies it. */
+export interface LedgerProcessInfo {
+  readonly pid: number;
+  readonly hostname: string;
+  isAlive(pid: number): boolean;
+}
+
+export interface LedgerStoreDeps {
+  /** The executor home (`resolveExecutorHome`); plans live in `planDir(home, planId)`. */
+  home: string;
+  /** Default: {@link createNodeFileSystem}. */
+  fs?: FileSystem;
+  /** Default: {@link createNodeClock}. */
+  clock?: Clock;
+  /** Default: this process. */
+  proc?: LedgerProcessInfo;
+  /** Receives warnings (torn last line, dropped incomplete batch, failed cleanup). Default: dropped. */
+  warn?: (message: string) => void;
+  /** Lock heartbeat period; default 10 s. */
+  heartbeatMs?: number;
+  /** A heartbeat older than this is stale; default 60 s. */
+  staleMs?: number;
+  /** Events between snapshots; default 200. */
+  snapshotEvery?: number;
+}
+
+/** Production `Clock`. Timers are unref'd so a pending heartbeat never keeps the process alive. */
+export function createNodeClock(): Clock {
+  const timers = new Map<number, ReturnType<typeof setTimeout>>();
+  let nextId = 1;
+  return {
+    now: () => Date.now(),
+    iso: (ms) => new Date(ms ?? Date.now()).toISOString(),
+    setTimer(ms, fn) {
+      const id = nextId++;
+      const h = setTimeout(() => {
+        timers.delete(id);
+        fn();
+      }, ms);
+      h.unref();
+      timers.set(id, h);
+      return { id };
+    },
+    clearTimer(h) {
+      const t = timers.get(h.id);
+      if (t !== undefined) {
+        clearTimeout(t);
+        timers.delete(h.id);
+      }
+    },
+    randomHex: (bytes) => randomBytes(bytes).toString("hex"),
+  };
+}
+
+function createNodeProcessInfo(): LedgerProcessInfo {
+  return {
+    pid: process.pid,
+    hostname: hostname(),
+    isAlive(pid) {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (e) {
+        return fsErrorCode(e) === "EPERM"; // exists, owned by someone else
+      }
+    },
+  };
+}
+
+function sleep(clock: Clock, ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    clock.setTimer(ms, resolve);
+  });
+}
+
+/** Retries `op` while it fails with EPERM/EBUSY (antivirus, indexers, a reader holding the file), within the 2 s budget (2.2.2.b). */
+async function retryBusy<T>(clock: Clock, op: () => Promise<T>): Promise<T> {
+  const start = clock.now();
+  let delay = 10;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await op();
+    } catch (e) {
+      const code = fsErrorCode(e);
+      if ((code !== "EPERM" && code !== "EBUSY") || clock.now() - start >= RETRY_BUDGET_MS || attempt >= 100) throw e;
+      await sleep(clock, delay);
+      delay = Math.min(delay * 2, 200);
+    }
+  }
+}
+
+async function readOptional(fs: FileSystem, path: string): Promise<string | null> {
+  try {
+    return await fs.readText(path);
+  } catch (e) {
+    if (fsErrorCode(e) === "ENOENT") return null;
+    throw e;
+  }
+}
+
+/** Removes a file that may already be gone. */
+async function rmQuiet(fs: FileSystem, path: string, recursive = false): Promise<void> {
+  try {
+    await fs.rm(path, { recursive });
+  } catch (e) {
+    if (fsErrorCode(e) !== "ENOENT") throw e;
+  }
+}
+
+function parseLockText(text: string): LockRecord | null {
+  let v: unknown;
+  try {
+    v = JSON.parse(text);
+  } catch {
+    return null; // torn lock file: no holder can be named
+  }
+  if (!isRec(v)) return null;
+  const { pid, hostname: host, sessionID, startedAt, heartbeatAt, token, epoch } = v;
+  if (typeof pid !== "number" || typeof host !== "string" || typeof sessionID !== "string") return null;
+  if (typeof startedAt !== "string" || typeof heartbeatAt !== "string") return null;
+  if (typeof token !== "string" || !TOKEN_PATTERN.test(token)) return null;
+  if (typeof epoch !== "number" || !Number.isInteger(epoch) || epoch < 1) return null;
+  return { pid, hostname: host, sessionID, startedAt, heartbeatAt, token, epoch };
+}
+
+/** Identity is the store-stamped random token (two holders never share one); pid and host are compared as a sanity check. */
+function sameLockIdentity(a: LockRecord, b: LockRecord): boolean {
+  return a.token === b.token && a.pid === b.pid && a.hostname === b.hostname;
+}
+
+function parseBeatText(text: string): number | null {
+  try {
+    const v: unknown = JSON.parse(text);
+    if (!isRec(v) || typeof v.heartbeatAt !== "string") return null;
+    const ms = Date.parse(v.heartbeatAt);
+    return Number.isFinite(ms) ? ms : null;
+  } catch {
+    return null; // torn beat file: the lock's own heartbeat stands
+  }
+}
+
+/** Fails with E_LOCK_LOST unless `writer.lock` names `lock`. Used before every destructive step, by writers and by the open path. */
+async function assertLockHeld(env: { fs: FileSystem; dir: string; planId: PlanId }, lock: LockRecord): Promise<void> {
+  const text = await readOptional(env.fs, join(env.dir, LOCK_FILE));
+  const holder = text === null ? null : parseLockText(text);
+  if (holder === null || !sameLockIdentity(holder, lock)) {
+    throw new ExecutorError("E_LOCK_LOST", `writer lock for ${env.planId} is held by another writer`, jsonDetail(holder === null ? null : publicHolder(holder)));
+  }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Load (snapshot + journal replay).
+// ---------------------------------------------------------------------------------------------------------------
+
+/** The snapshot and the journal listing disagree; a reader retries (2.2.2.b). */
+class SnapshotMismatch extends Error {}
+
+interface JournalFile {
+  name: string;
+  first: number;
+  epoch: number;
+}
+
+function journalName(first: number, epoch: number): string {
+  return `events.${first}.${epoch}.jsonl`;
+}
+
+interface MainState {
+  ledger: LedgerV1;
+  /** 0 when there is no snapshot file (a plan whose first snapshot was never renamed into place). */
+  snapshotSeq: number;
+  /** The writer epoch stamped in the snapshot (0 when there is no snapshot). */
+  snapshotEpoch: number;
+  /** The trusted journal chain, ascending. */
+  files: JournalFile[];
+  /** Every complete, framed line of the relevant journal files, ascending (may include seq <= snapshotSeq). */
+  events: JournalLine[];
+  /** The last journal file ends in a torn line or an incomplete batch: appending to it is unsafe. */
+  dirty: boolean;
+  warnings: string[];
+}
+
+function parseSnapshot(text: string, file: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    throw new ExecutorError("E_SCHEMA_INVALID", `${file} is not valid JSON: ${errMessage(e)}`);
+  }
+}
+
+function snapshotName(epoch: number): string {
+  return `ledger.${epoch}.json`;
+}
+
+/** The journal files among directory `names`, ascending by first seq. */
+function journalsOf(names: readonly string[]): JournalFile[] {
+  const files: JournalFile[] = [];
+  for (const name of names) {
+    const m = JOURNAL_PATTERN.exec(name);
+    if (m !== null) files.push({ name, first: Number(m[1]), epoch: Number(m[2]) });
+  }
+  // Same first seq: the higher epoch sorts first, so `trustedChain` drops the superseded lower-epoch file.
+  return files.sort((a, b) => a.first - b.first || b.epoch - a.epoch);
+}
+
+/** The highest writer epoch among the snapshot files in `names`, or null when there is none. */
+function newestSnapshotEpoch(names: readonly string[]): number | null {
+  let max: number | null = null;
+  for (const name of names) {
+    const m = SNAPSHOT_PATTERN.exec(name);
+    if (m !== null && (max === null || Number(m[1]) > max)) max = Number(m[1]);
+  }
+  return max;
+}
+
+async function listPlanDir(fs: FileSystem, dir: string): Promise<string[]> {
+  try {
+    return await fs.readdir(dir);
+  } catch (e) {
+    if (fsErrorCode(e) === "ENOENT") throw new ExecutorError("E_LEDGER_NOT_FOUND", `no plan directory ${dir}`);
+    throw e;
+  }
+}
+
+/**
+ * Splits the listed journals into the trusted chain and the rest. A file is dropped when a file with a higher writer epoch starts at or
+ * before it: a takeover's new epoch is authoritative from its first seq, so whatever an older-epoch writer wrote at or after that point
+ * (late appends, a late rotation) is never read.
+ */
+function trustedChain(files: readonly JournalFile[]): { chain: JournalFile[] } {
+  const chain: JournalFile[] = [];
+  let maxEpoch = 0;
+  for (const f of files) {
+    if (f.epoch >= maxEpoch) {
+      chain.push(f);
+      maxEpoch = f.epoch;
+    }
+  }
+  return { chain };
+}
+
+/** Highest writer epoch visible on disk (journal names, snapshot stamp); a new writer takes the next one. */
+async function maxEpochOnDisk(fs: FileSystem, dir: string): Promise<number> {
+  let max = 0;
+  for (const name of await fs.readdir(dir)) {
+    const m = JOURNAL_PATTERN.exec(name) ?? SNAPSHOT_PATTERN.exec(name);
+    if (m !== null) max = Math.max(max, Number(m[m.length - 1]));
+  }
+  return max;
+}
+
+/**
+ * Snapshot plus replay of the events with a greater `seq` (2.2.2.c). A journal file is authoritative only for `seq` below the next
+ * file's first `seq`: that is what makes rotation (and a takeover's rotation) fence a slow old writer.
+ */
+async function loadMain(fs: FileSystem, dir: string, mode: "reader" | "writer"): Promise<MainState> {
+  const names = await listPlanDir(fs, dir);
+  const listed = journalsOf(names);
+  const { chain: files } = trustedChain(listed);
+  // The snapshot of the highest writer epoch wins: a fenced writer's late rename can only touch its own (lower) epoch's file.
+  const newest = newestSnapshotEpoch(names);
+  if (newest === null && listed.length === 0) throw new ExecutorError("E_LEDGER_NOT_FOUND", `no ledger in ${dir}`);
+  const snapFile = newest === null ? null : snapshotName(newest);
+  const snapText = snapFile === null ? null : await readOptional(fs, join(dir, snapFile));
+  const snapshotEpoch = newest ?? 0;
+  let snapshot: LedgerV1 | null = null;
+  if (snapFile !== null) {
+    // A listed snapshot that is gone was superseded (and deleted) by a newer writer's while this load ran.
+    if (snapText === null) {
+      const msg = `${snapFile} vanished while loading`;
+      throw mode === "reader" ? new SnapshotMismatch(msg) : new ExecutorError("E_SEQ_GAP", msg, { dir });
+    }
+    snapshot = checkLedger(parseSnapshot(snapText, snapFile), snapFile);
+  }
+  const S = snapshot === null ? 0 : snapshot.seq;
+  const mismatch = (msg: string): Error =>
+    mode === "reader" ? new SnapshotMismatch(msg) : new ExecutorError("E_SEQ_GAP", msg, { snapshotSeq: S });
+  if (snapshot === null && (files[0] === undefined || files[0].first !== 1)) {
+    throw new ExecutorError("E_SEQ_GAP", `no snapshot file and the journal does not start at seq 1`, { dir });
+  }
+  for (const f of files) {
+    // A journal that starts beyond the next seq the snapshot needs (even an empty one) means the snapshot is behind: a rotation race.
+    if (snapshot !== null && f.first > S + 1) throw mismatch(`snapshot is at seq ${S} but ${f.name} starts at seq ${f.first}`);
+    // A snapshot written by an older epoch than a journal that starts at or before it came from a fenced writer.
+    if (snapshot !== null && f.first <= S && f.epoch > snapshotEpoch) {
+      throw mismatch(`snapshot at seq ${S} (epoch ${snapshotEpoch}) is older than ${f.name}`);
+    }
+  }
+
+  const events: JournalLine[] = [];
+  const warnings: string[] = [];
+  let dirty = false;
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i] as JournalFile;
+    const next = files[i + 1];
+    if (next !== undefined && next.first <= S + 1) continue; // only seq <= S: covered by the snapshot
+    const text = await readOptional(fs, join(dir, f.name));
+    if (text === null) throw mismatch(`journal ${f.name} vanished while loading`);
+    const parsed = parseJournal(text, f.name);
+    // A file of an older writer epoch than the snapshot is trusted only up to the snapshot's seq: anything a fenced writer appended
+    // after the newer writer's snapshot is ignored, even before the newer writer's own journal file exists.
+    const fenced = f.epoch < snapshotEpoch;
+    const kept = parsed.lines.filter((l) => (next === undefined || l.event.seq < next.first) && (!fenced || l.event.seq <= S));
+    const framed = frameJournal(kept, f.name, f.first);
+    if (next !== undefined) {
+      if (framed.droppedIncomplete > 0) {
+        throw new ExecutorError("E_SEQ_GAP", `journal ${f.name} ends inside a batch before the next journal starts`, { file: f.name });
+      }
+    } else {
+      if (parsed.torn) {
+        dirty = true;
+        warnings.push(`${f.name}: torn last line dropped`);
+      }
+      if (framed.droppedIncomplete > 0) {
+        dirty = true;
+        warnings.push(`${f.name}: incomplete trailing batch dropped (${framed.droppedIncomplete} events, incomplete-batch)`);
+      }
+    }
+    let fileStart = true;
+    for (const l of framed.lines) {
+      const prev = events[events.length - 1];
+      // Only the first line of a file is checked against the previous file's tail; inside a file `frameJournal` decides.
+      if (fileStart && prev !== undefined && (l.event.seq !== prev.event.seq + 1 || !prev.event.last)) {
+        throw new ExecutorError("E_SEQ_GAP", `seq ${l.event.seq} follows ${prev.event.seq} across journal files`, { file: f.name });
+      }
+      fileStart = false;
+      events.push(l);
+    }
+  }
+
+  const after = events.filter((l) => l.event.seq > S);
+  const first = after[0];
+  let ledger: LedgerV1;
+  let rest: JournalLine[];
+  if (snapshot === null) {
+    if (first === undefined) throw new ExecutorError("E_LEDGER_NOT_FOUND", `no complete ledger-init in ${dir}`);
+    const e = first.event;
+    if (e.type !== "ledger-init" || e.seq !== 1 || e.batch !== 1 || !e.last) {
+      throw new ExecutorError("E_SEQ_GAP", "journal does not start with a lone ledger-init at seq 1", eventRef(e));
+    }
+    ledger = initLedger(e);
+    if (ledger.seq !== 1) throw illegal(e, "ledger-init-seq");
+    rest = after.slice(1);
+  } else {
+    if (first !== undefined && first.event.seq !== S + 1) {
+      throw mismatch(`snapshot is at seq ${S} but the journal continues at seq ${first.event.seq}`);
+    }
+    ledger = snapshot;
+    rest = after;
+  }
+  let ctx = newBatchCtx();
+  for (const l of rest) {
+    const e = l.event;
+    if (e.batch === e.seq) ctx = newBatchCtx();
+    const code = applyEvent(ledger, e, ctx);
+    if (code !== null) throw illegal(e, code);
+    if (e.last) {
+      const v = batchEndViolation(ledger, ctx);
+      if (v !== null) throw illegal(e, v.code, v.codes);
+    }
+  }
+  return { ledger, snapshotSeq: S, snapshotEpoch, files, events, dirty, warnings };
+}
+
+/** Retries `loadMain` while the snapshot and the journal listing disagree (a reader racing a rotation). */
+async function loadMainConsistent(fs: FileSystem, clock: Clock, dir: string): Promise<MainState> {
+  let last = "";
+  for (let attempt = 0; attempt < READ_RETRIES; attempt++) {
+    try {
+      return await loadMain(fs, dir, "reader");
+    } catch (e) {
+      if (!(e instanceof SnapshotMismatch)) throw e;
+      last = e.message;
+      await sleep(clock, 5 * (attempt + 1));
+    }
+  }
+  throw new ExecutorError("E_SEQ_GAP", `snapshot and journal never agreed: ${last}`);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// History journal (A1-3).
+// ---------------------------------------------------------------------------------------------------------------
+
+interface HistoryLoad {
+  /** Valid lines to keep (seq <= the ledger's seq), then the lines repaired from the main journal. */
+  kept: JournalLine[];
+  added: JournalLine[];
+  /** The file has torn bytes or events beyond the main journal: it must be rewritten, not appended to. */
+  rewrite: boolean;
+}
+
+async function loadHistory(fs: FileSystem, dir: string, ledgerSeq: number, main: readonly JournalLine[]): Promise<HistoryLoad> {
+  const text = (await readOptional(fs, join(dir, HISTORY_FILE))) ?? "";
+  const parsed = parseJournal(text, HISTORY_FILE);
+  const { kept, repaired } = repairHistory(parsed.lines, ledgerSeq, main);
+  const have = new Set(kept.map((l) => l.event.seq));
+  const lastSeq = kept.length === 0 ? 0 : (kept[kept.length - 1] as JournalLine).event.seq;
+  const added = main.filter((l) => isHistoryEvent(l.event) && l.event.seq <= ledgerSeq && !have.has(l.event.seq));
+  const appendOnly = added.every((l) => l.event.seq > lastSeq);
+  return { kept, added, rewrite: parsed.torn || repaired || !appendOnly };
+}
+
+/**
+ * Validates history lines against the main journal (A1-3, QA-2.2-2). Lines must strictly increase; a line beyond `ledgerSeq`, or an exact
+ * duplicate of a kept line (a fenced writer's late copy of an event the new writer copied too), is dropped. At or after the main
+ * journal's last `lock-takeover`, a line that does not match the main journal's event at its seq, or that is out of order, is a fenced
+ * writer's late copy and is dropped too. Any other out-of-order line is corruption (E_SEQ_GAP). Pure: readers use it as well.
+ */
+function repairHistory(
+  lines: readonly JournalLine[],
+  ledgerSeq: number,
+  main: readonly JournalLine[],
+): { kept: JournalLine[]; repaired: boolean } {
+  const mainBySeq = new Map<number, JournalLine>();
+  let takeoverSeq = 0;
+  for (const l of main) {
+    if (l.event.seq > ledgerSeq) continue;
+    mainBySeq.set(l.event.seq, l);
+    if (l.event.type === "lock-takeover") takeoverSeq = Math.max(takeoverSeq, l.event.seq);
+  }
+  const kept: JournalLine[] = [];
+  const keptText = new Map<number, string>();
+  let repaired = false;
+  for (const l of lines) {
+    const seq = l.event.seq;
+    if (seq > ledgerSeq || keptText.get(seq) === l.text) {
+      repaired = true;
+      continue;
+    }
+    const afterTakeover = takeoverSeq > 0 && seq >= takeoverSeq;
+    const m = mainBySeq.get(seq);
+    if (afterTakeover && m !== undefined && (m.text !== l.text || !isHistoryEvent(m.event))) {
+      repaired = true;
+      continue;
+    }
+    const prev = kept[kept.length - 1];
+    if (prev !== undefined && seq <= prev.event.seq) {
+      if (afterTakeover) {
+        repaired = true;
+        continue;
+      }
+      throw new ExecutorError("E_SEQ_GAP", `history ${HISTORY_FILE}: seq ${seq} follows ${prev.event.seq}`, { file: HISTORY_FILE, seq });
+    }
+    kept.push(l);
+    keptText.set(seq, l.text);
+  }
+  return { kept, repaired };
+}
+
+function trackerOf(lines: readonly JournalLine[]): HistoryTracker {
+  const t = new HistoryTracker();
+  for (const l of lines) {
+    const code = t.apply(l.event);
+    if (code !== null) throw illegal(l.event, code);
+  }
+  return t;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The writer.
+// ---------------------------------------------------------------------------------------------------------------
+
+interface WriterEnv {
+  fs: FileSystem;
+  clock: Clock;
+  proc: LedgerProcessInfo;
+  warn: (message: string) => void;
+  dir: string;
+  heartbeatMs: number;
+  staleMs: number;
+  snapshotEvery: number;
+}
+
+interface WriterInit {
+  planId: PlanId;
+  ledger: LedgerV1;
+  tracker: HistoryTracker;
+  lock: LockRecord;
+  /** The snapshot file holds this seq. */
+  snapshotSeq: number;
+  /** The writer epoch of that snapshot file (0 when there is none). */
+  snapshotEpoch: number;
+  /** Journal file to append to, and its first seq. */
+  journal: JournalFile | null;
+  /** The journal file cannot be appended to (torn tail) and must be replaced by a rotation. */
+  needsRotate: boolean;
+  /** The journal was created and fsynced by this call and holds exactly the events up to the snapshot (a plan just created). */
+  journalFresh?: boolean;
+}
+
+class StoreWriter implements LedgerWriter {
+  readonly planId: PlanId;
+  private current: LedgerV1;
+  private tracker: HistoryTracker;
+  private readonly lock: LockRecord;
+  private lastSnapshotSeq: number;
+  /** Epoch of the newest snapshot file on disk; below this writer's epoch until it writes its own. */
+  private lastSnapshotEpoch: number;
+  private journal: JournalFile | null;
+  private needsRotate: boolean;
+  private journalFresh: boolean;
+  /** Appends since the last fsync of the active journal (a snapshot must not outrun the journal on disk). */
+  private journalUnsynced = false;
+  /** Live view returned by `wakeKeys()`: updated in place on every commit. */
+  private readonly wakeView: Set<string>;
+  private eventsSince = 0;
+  private pendingHistory: string[] = [];
+  private historyDirty = false;
+  private historyUnsynced = true;
+  private lost = false;
+  private closed = false;
+  private chain: Promise<void> = Promise.resolve();
+  private timer: { readonly id: number } | null = null;
+
+  constructor(private readonly env: WriterEnv, init: WriterInit) {
+    this.planId = init.planId;
+    this.current = init.ledger;
+    this.tracker = init.tracker;
+    this.lock = init.lock;
+    this.lastSnapshotSeq = init.snapshotSeq;
+    this.lastSnapshotEpoch = init.snapshotEpoch;
+    this.journal = init.journal;
+    this.needsRotate = init.needsRotate;
+    this.journalFresh = init.journalFresh === true;
+    this.wakeView = new Set(init.tracker.wakeKeys());
+  }
+
+  get ledger(): Readonly<LedgerV1> {
+    return this.current;
+  }
+
+  /** Stops the heartbeat and refuses further use without touching the files or the lock (a failed open/takeover). */
+  abandon(): void {
+    this.closed = true;
+    this.disarmHeartbeat();
+  }
+
+  openIntegration(): readonly OpenIntegrationEntry[] {
+    return this.tracker.openEntries();
+  }
+
+  /** A live view: the same set is returned every time and keys are added to it in place when a batch commits. */
+  wakeKeys(): ReadonlySet<string> {
+    return this.wakeView;
+  }
+
+  /** Serialises `fn` after every earlier call; a failure does not poison the chain. */
+  private serial<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.chain.then(fn);
+    this.chain = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  /** Brings a freshly built writer to a clean state (snapshot + rotation when the journal tail is unusable) and starts the heartbeat. */
+  start(): Promise<void> {
+    return this.serial(async () => {
+      // Before any snapshot, rotation, deletion or history rewrite: a writer that was taken over while loading must not touch anything.
+      await this.verifyLock();
+      if (this.rotationNeeded()) await this.snapshotNow();
+      this.armHeartbeat();
+    });
+  }
+
+  /** The snapshot is behind, the journal tail is unusable, or the active file is not this epoch's `events.(S+1).*` (QA-2.2-6). */
+  private rotationNeeded(): boolean {
+    const j = this.journal;
+    if (this.needsRotate || j === null || this.lastSnapshotSeq !== this.current.seq || j.epoch !== this.lock.epoch) return true;
+    if (this.lastSnapshotEpoch !== this.lock.epoch) return true;
+    return j.first !== this.lastSnapshotSeq + 1 && !this.journalFresh;
+  }
+
+  /**
+   * Appends one batch. A rejection with `E_LOCK_LOST` means the OUTCOME IS UNKNOWN: the batch may or may not be visible to the next writer
+   * (it is fenced only when the takeover happened before that writer loaded the journal), so the caller reads the ledger back from the new
+   * owner instead of retrying. Any other rejection from the post-write lock check leaves the batch on disk and the writer rotates past it.
+   */
+  append(batch: readonly ExecutorEventInput[] | BatchBuilder): Promise<Readonly<LedgerV1>> {
+    return this.serial(() => this.appendNow(batch));
+  }
+
+  snapshot(): Promise<void> {
+    return this.serial(async () => {
+      this.assertUsable();
+      await this.verifyLock();
+      await this.snapshotNow();
+    });
+  }
+
+  close(): Promise<void> {
+    return this.serial(async () => {
+      if (this.closed) return;
+      let failure: unknown = null;
+      if (!this.lost) {
+        try {
+          await this.verifyLock();
+          await this.snapshotNow();
+        } catch (e) {
+          failure = e;
+        }
+      }
+      this.closed = true;
+      this.disarmHeartbeat();
+      if (!this.lost) await this.releaseLock();
+      if (failure !== null && !(failure instanceof ExecutorError && failure.code === "E_LOCK_LOST")) throw failure;
+    });
+  }
+
+  // -- append ------------------------------------------------------------------------------------------------
+
+  private assertUsable(): void {
+    if (this.closed) throw new ExecutorError("E_DISPOSED", `ledger writer for ${this.planId} is closed`);
+    if (this.lost) throw new ExecutorError("E_LOCK_LOST", `writer lock for ${this.planId} was lost`);
+  }
+
+  private async appendNow(input: readonly ExecutorEventInput[] | BatchBuilder): Promise<Readonly<LedgerV1>> {
+    this.assertUsable();
+    await this.verifyLock();
+    if (this.needsRotate) await this.snapshotNow();
+    const inputs = typeof input === "function" ? input(this.current) : input;
+    if (inputs.length === 0) return this.current;
+
+    const first = this.current.seq + 1;
+    const at = this.env.clock.iso();
+    // What is validated and applied is exactly what is written: serialise first, then parse the text back.
+    const lines: string[] = [];
+    const events: ExecutorEvent[] = [];
+    inputs.forEach((inp, i) => {
+      const draft = { ...inp, seq: first + i, at, batch: first, last: i === inputs.length - 1 };
+      let text: string;
+      try {
+        text = JSON.stringify(draft);
+      } catch (e) {
+        throw new ExecutorError("E_INVALID_INPUT", `event ${i} of the batch is not serialisable: ${errMessage(e)}`, { eventIndex: i });
+      }
+      lines.push(text);
+      events.push(JSON.parse(text) as ExecutorEvent);
+    });
+
+    const work = structuredClone(this.current);
+    const tracker = this.tracker.clone();
+    const ctx = newBatchCtx();
+    for (let i = 0; i < events.length; i++) {
+      const ev = events[i] as ExecutorEvent;
+      const code = applyEvent(work, ev, ctx) ?? (isHistoryEvent(ev) ? tracker.apply(ev) : null);
+      if (code !== null) {
+        throw new ExecutorError("E_ILLEGAL_TRANSITION", `batch ${first}: event ${i} (${ev.type}) is illegal: ${code}`, {
+          batchIndex: first,
+          eventIndex: i,
+          codes: [code],
+        });
+      }
+    }
+    const end = batchEndViolation(work, ctx);
+    if (end !== null) {
+      throw new ExecutorError("E_ILLEGAL_TRANSITION", `batch ${first} leaves the ledger invalid: ${end.codes.join(", ")}`, {
+        batchIndex: first,
+        eventIndex: null,
+        codes: end.codes,
+      });
+    }
+    // A1-3a: `integrating` needs an open entry unless the task's last entry closed rolled-back. A batch must not create such a task; one
+    // that already was (only a hand-made draft can start that way, and open refuses it) does not block unrelated batches.
+    const before = new Set(this.tracker.integratingWithoutEntry(this.current));
+    const orphan = tracker.integratingWithoutEntry(work).find((id) => !before.has(id));
+    if (orphan !== undefined) {
+      throw new ExecutorError("E_ILLEGAL_TRANSITION", `batch ${first} leaves task ${orphan} integrating with no open integration entry`, {
+        batchIndex: first,
+        eventIndex: null,
+        codes: ["integrating-without-entry"],
+        taskId: orphan,
+      });
+    }
+
+    const durable = inputs.some(isDurableEvent);
+    const journal = await this.ensureJournal();
+    try {
+      // Never create the journal here: a missing file means a takeover rotated it away, so this writer is fenced (QA-2.2-24).
+      const opts: AppendOptions = { fsync: durable, create: false };
+      await this.env.fs.appendText(join(this.env.dir, journal.name), `${lines.join("\n")}\n`, opts);
+      this.journalUnsynced = !durable;
+    } catch (e) {
+      // The file may now end in a partial batch: never append to it again.
+      this.needsRotate = true;
+      if (fsErrorCode(e) === "ENOENT") {
+        throw new ExecutorError("E_LOCK_LOST", `journal ${journal.name} no longer exists: the writer lock was taken over`);
+      }
+      throw e;
+    }
+    // A takeover between the lock check and the write fences this batch, but the new owner may have loaded before or after the write: the
+    // outcome of a batch that fails with E_LOCK_LOST is unknown (it may or may not be visible), and the caller must not believe it committed.
+    // Any other failure of this check leaves the batch on disk while `current` stays behind: the next append must rotate past it.
+    try {
+      await this.verifyLock();
+    } catch (e) {
+      this.needsRotate = true;
+      throw e;
+    }
+    this.current = work;
+    this.tracker = tracker;
+    this.eventsSince += events.length;
+    for (const k of tracker.wakeKeys()) this.wakeView.add(k);
+
+    events.forEach((ev, i) => {
+      if (isHistoryEvent(ev)) this.pendingHistory.push(lines[i] as string);
+    });
+    await this.flushHistory(durable, false);
+
+    if (this.eventsSince >= this.env.snapshotEvery) {
+      try {
+        await this.snapshotNow();
+      } catch (e) {
+        this.env.warn(`snapshot of ${this.planId} at seq ${this.current.seq} failed, will retry: ${errMessage(e)}`);
+      }
+    }
+    return this.current;
+  }
+
+  private async ensureJournal(): Promise<JournalFile> {
+    if (this.journal === null) await this.snapshotNow();
+    if (this.journal === null) throw new ExecutorError("E_LEDGER_NOT_FOUND", `no journal file for ${this.planId}`);
+    return this.journal;
+  }
+
+  // -- history ------------------------------------------------------------------------------------------------
+
+  /** Writes pending history copies after the main journal. A failure is remembered (main is the authority) and retried by a rewrite. */
+  private async flushHistory(fsync: boolean, strict: boolean): Promise<void> {
+    const path = join(this.env.dir, HISTORY_FILE);
+    try {
+      // Every caller verified the lock just before; the rewrite re-checks it again immediately before its rename.
+      if (this.historyDirty) {
+        await this.rewriteHistory();
+        this.historyDirty = false;
+        this.historyUnsynced = false;
+        return;
+      }
+      if (this.pendingHistory.length > 0) {
+        await this.env.fs.appendText(path, `${this.pendingHistory.join("\n")}\n`, { fsync });
+        this.pendingHistory = [];
+        this.historyUnsynced = !fsync;
+      } else if (fsync && this.historyUnsynced) {
+        await this.env.fs.appendText(path, "", { fsync: true });
+        this.historyUnsynced = false;
+      }
+    } catch (e) {
+      if (e instanceof ExecutorError && e.code === "E_LOCK_LOST") throw e; // fenced: never repair history from a lost lock
+      this.historyDirty = true;
+      if (strict) throw e;
+      this.env.warn(`history copy for ${this.planId} failed, will be repaired: ${errMessage(e)}`);
+    }
+  }
+
+  /** Rebuilds history.jsonl from what it holds (minus a torn tail) plus the pending copies, through a temp file. */
+  private async rewriteHistory(): Promise<void> {
+    const { fs, dir } = this.env;
+    const text = (await readOptional(fs, join(dir, HISTORY_FILE))) ?? "";
+    const parsed = parseJournal(text, HISTORY_FILE);
+    const have = parsed.lines.filter((l) => l.event.seq <= this.current.seq);
+    const lastSeq = have.length === 0 ? 0 : (have[have.length - 1] as JournalLine).event.seq;
+    const pending = this.pendingHistory.filter((t) => (JSON.parse(t) as { seq: number }).seq > lastSeq);
+    await writeHistoryFile(this.env, [...have.map((l) => l.text), ...pending], () => this.verifyLock());
+    this.pendingHistory = [];
+  }
+
+  // -- snapshot and rotation --------------------------------------------------------------------------------
+
+  private makeJournal(first: number): JournalFile {
+    return { name: journalName(first, this.lock.epoch), first, epoch: this.lock.epoch };
+  }
+
+  /**
+   * Snapshot at the current seq (a batch boundary), then rotate: the new journal file exists before the old ones are deleted, and a
+   * journal file is only authoritative below the next file's first seq, so a late write to an old file is never read.
+   */
+  private async snapshotNow(): Promise<void> {
+    const { fs, dir, clock } = this.env;
+    const N = this.current.seq;
+    if (!this.rotationNeeded()) return;
+    await this.flushHistory(true, true);
+    // A writer always writes its own epoch's snapshot, even when nothing was appended since the previous one: the loader takes the highest
+    // epoch, and a fenced writer's late rename can only land on its own (lower) epoch's name.
+    if (N !== this.lastSnapshotSeq || this.lastSnapshotEpoch !== this.lock.epoch) {
+      if (this.journalUnsynced && this.journal !== null) {
+        // The snapshot must not outrun the journal on disk: a crash would leave a snapshot ahead of a journal that lost its tail.
+        await this.verifyLock();
+        await fs.appendText(join(dir, this.journal.name), "", { fsync: true });
+        this.journalUnsynced = false;
+      }
+      const name = snapshotName(this.lock.epoch);
+      const tmp = join(dir, `${name}.tmp-${this.env.proc.pid}-${clock.randomHex(4)}`);
+      try {
+        await fs.writeText(tmp, JSON.stringify(this.current), { fsync: true });
+        await this.verifyLock(); // immediately before the rename that publishes the snapshot
+        await retryBusy(clock, () => fs.rename(tmp, join(dir, name)));
+      } catch (e) {
+        await this.discardTemp(tmp);
+        throw e;
+      }
+      await fs.fsyncDir(dir);
+      this.lastSnapshotSeq = N;
+      this.lastSnapshotEpoch = this.lock.epoch;
+      await this.deleteLowerSnapshots();
+    }
+    const next = this.makeJournal(N + 1);
+    await this.createJournal(next);
+    await fs.fsyncDir(dir);
+    this.journal = next;
+    this.journalFresh = false;
+    this.journalUnsynced = false;
+    this.needsRotate = false;
+    this.eventsSince = 0;
+    await this.deleteOldJournals(next);
+  }
+
+  /**
+   * Creates the next journal file exclusively. An existing file is reused only when it is empty, or when it is this writer's own active file
+   * after a failed append (then it is replaced); any other content under this epoch's name is foreign and refused.
+   */
+  private async createJournal(next: JournalFile): Promise<void> {
+    const { fs, dir } = this.env;
+    const path = join(dir, next.name);
+    await this.verifyLock();
+    try {
+      await fs.writeText(path, "", { exclusive: true, fsync: true });
+      return;
+    } catch (e) {
+      if (fsErrorCode(e) !== "EEXIST") throw e;
+    }
+    const existing = await readOptional(fs, path);
+    if (existing === "") return;
+    if (this.journal === null || this.journal.name !== next.name) {
+      throw new ExecutorError("E_SEQ_GAP", `journal ${next.name} already exists with content`, { file: next.name });
+    }
+    await this.verifyLock();
+    await rmQuiet(fs, path);
+    await fs.writeText(path, "", { exclusive: true, fsync: true });
+  }
+
+  private async discardTemp(path: string): Promise<void> {
+    try {
+      await rmQuiet(this.env.fs, path);
+    } catch (e) {
+      this.env.warn(`could not remove temp file ${path}: ${errMessage(e)}`);
+    }
+  }
+
+  /**
+   * Deletes journal files superseded by `keep` (an earlier first seq, or an older epoch, which includes a fenced writer's late files); only
+   * after a successful snapshot. The lock is re-checked before every delete. A failure only leaves superseded files behind.
+   */
+  private async deleteOldJournals(keep: JournalFile): Promise<void> {
+    const { fs, dir } = this.env;
+    let names: string[];
+    try {
+      names = await fs.readdir(dir);
+    } catch (e) {
+      this.env.warn(`could not list ${dir}: ${errMessage(e)}`);
+      return;
+    }
+    const doomed: string[] = [];
+    for (const name of names) {
+      const m = JOURNAL_PATTERN.exec(name);
+      if (m === null || name === keep.name) continue;
+      if (Number(m[1]) >= keep.first && Number(m[2]) >= keep.epoch) continue;
+      doomed.push(name);
+    }
+    if (doomed.length === 0) return;
+    // The journals are the authority for history: a fenced writer's late history rewrite may have dropped lines that only these files
+    // still hold. Repair history from them first; when that cannot be done, the files stay.
+    try {
+      await this.repairHistoryFromJournals(names, keep);
+    } catch (e) {
+      if (e instanceof ExecutorError && e.code === "E_LOCK_LOST") throw e;
+      this.env.warn(`history of ${this.planId} could not be verified, old journals kept: ${errMessage(e)}`);
+      return;
+    }
+    for (const name of doomed) {
+      await this.verifyLock();
+      try {
+        await rmQuiet(fs, join(dir, name));
+      } catch (e) {
+        this.env.warn(`could not delete old journal ${name}: ${errMessage(e)}`);
+      }
+    }
+  }
+
+  /** Re-runs the history repair over the trusted journal files about to be deleted and rewrites `history.jsonl` when anything is missing. */
+  private async repairHistoryFromJournals(names: readonly string[], keep: JournalFile): Promise<void> {
+    const { fs, dir } = this.env;
+    const N = this.current.seq;
+    const { chain } = trustedChain(journalsOf(names));
+    // Same trust rules as `loadMain`: a file of an older epoch than the newest snapshot counts only up to that snapshot's seq.
+    const newest = newestSnapshotEpoch(names);
+    let snapshotSeq = N;
+    if (newest !== null) {
+      const snapName = snapshotName(newest);
+      const snapText = await readOptional(fs, join(dir, snapName));
+      if (snapText !== null) snapshotSeq = Math.min(N, checkLedger(parseSnapshot(snapText, snapName), snapName).seq);
+    }
+    const snapshotEpoch = newest ?? 0;
+    const lines: JournalLine[] = [];
+    for (let i = 0; i < chain.length; i++) {
+      const f = chain[i] as JournalFile;
+      if (f.name === keep.name) continue;
+      const next = chain[i + 1];
+      const text = await readOptional(fs, join(dir, f.name));
+      if (text === null) continue;
+      const fenced = f.epoch < snapshotEpoch;
+      const kept = parseJournal(text, f.name).lines.filter(
+        (l) => l.event.seq <= N && (next === undefined || l.event.seq < next.first) && (!fenced || l.event.seq <= snapshotSeq),
+      );
+      // Framing per file against the first seq in its name; an incomplete trailing batch is never history.
+      for (const l of frameJournal(kept, f.name, f.first).lines) lines.push(l);
+    }
+    const hl = await loadHistory(fs, dir, N, lines);
+    if (!hl.rewrite && hl.added.length === 0) return;
+    const all = [...hl.kept, ...hl.added].sort((x, y) => x.event.seq - y.event.seq);
+    await writeHistoryFile(this.env, all.map((l) => l.text), () => this.verifyLock());
+  }
+
+  /** Deletes the snapshot files of lower epochs; only called once this writer's own snapshot is renamed into place and the directory synced. */
+  private async deleteLowerSnapshots(): Promise<void> {
+    const { fs, dir } = this.env;
+    let names: string[];
+    try {
+      names = await fs.readdir(dir);
+    } catch (e) {
+      this.env.warn(`could not list ${dir}: ${errMessage(e)}`);
+      return;
+    }
+    for (const name of names) {
+      const m = SNAPSHOT_PATTERN.exec(name);
+      if (m === null || Number(m[1]) >= this.lock.epoch) continue;
+      await this.verifyLock();
+      try {
+        await rmQuiet(fs, join(dir, name));
+      } catch (e) {
+        this.env.warn(`could not delete old snapshot ${name}: ${errMessage(e)}`);
+      }
+    }
+  }
+
+  // -- lock ---------------------------------------------------------------------------------------------------
+
+  /** Fails with E_LOCK_LOST (and stays failed) when the lock file no longer names this writer. */
+  private async verifyLock(): Promise<void> {
+    try {
+      await assertLockHeld({ fs: this.env.fs, dir: this.env.dir, planId: this.planId }, this.lock);
+    } catch (e) {
+      if (e instanceof ExecutorError && e.code === "E_LOCK_LOST") {
+        this.lost = true;
+        this.disarmHeartbeat();
+      }
+      throw e;
+    }
+  }
+
+  /** Removes `writer.lock` only while it still names this writer (a foreign lock is never deleted), and this writer's beat file. */
+  private async releaseLock(): Promise<void> {
+    const { fs, dir } = this.env;
+    try {
+      const text = await readOptional(fs, join(dir, LOCK_FILE));
+      const holder = text === null ? null : parseLockText(text);
+      if (holder !== null && sameLockIdentity(holder, this.lock)) await rmQuiet(fs, join(dir, LOCK_FILE));
+      await rmQuiet(fs, join(dir, beatFileName(this.lock.token)));
+    } catch (e) {
+      this.env.warn(`could not release the lock of ${this.planId}: ${errMessage(e)}`);
+    }
+  }
+
+  private armHeartbeat(): void {
+    if (this.closed || this.lost || this.timer !== null) return;
+    this.timer = this.env.clock.setTimer(this.env.heartbeatMs, () => {
+      this.timer = null;
+      this.serial(() => this.beat()).then(
+        () => this.armHeartbeat(),
+        (e: unknown) => {
+          this.env.warn(`heartbeat of ${this.planId} failed: ${errMessage(e)}`);
+          this.armHeartbeat();
+        },
+      );
+    });
+  }
+
+  private disarmHeartbeat(): void {
+    if (this.timer !== null) {
+      this.env.clock.clearTimer(this.timer);
+      this.timer = null;
+    }
+  }
+
+  private async beat(): Promise<void> {
+    if (this.closed || this.lost) return;
+    await this.verifyLock();
+    // The heartbeat never rewrites writer.lock (a late rename could restore a lock a takeover replaced): it stamps this holder's own
+    // beat file, which only this holder writes and which `isStale` reads.
+    await writeBeatFile(this.env, this.lock);
+  }
+}
+
+/** Atomically (temp + rename) stamps `writer.<token>.beat` with the current time. Only the holder named by `lock` writes this file. */
+async function writeBeatFile(env: WriterEnv, lock: LockRecord): Promise<void> {
+  const { fs, clock, dir } = env;
+  const path = join(dir, beatFileName(lock.token));
+  const tmp = `${path}.tmp-${env.proc.pid}-${clock.randomHex(4)}`;
+  try {
+    await fs.writeText(tmp, JSON.stringify({ heartbeatAt: clock.iso() }), { fsync: true });
+    await retryBusy(clock, () => fs.rename(tmp, path));
+  } catch (e) {
+    try {
+      await rmQuiet(fs, tmp);
+    } catch (cleanup) {
+      env.warn(`could not remove temp beat ${tmp}: ${errMessage(cleanup)}`);
+    }
+    throw e;
+  }
+}
+
+/**
+ * Replaces history.jsonl with exactly `texts` (one event per entry), through a temp file. `beforeRename` runs immediately before the
+ * rename (the caller re-checks its lock there).
+ */
+async function writeHistoryFile(env: WriterEnv, texts: readonly string[], beforeRename: () => Promise<void>): Promise<void> {
+  const { fs, clock, dir } = env;
+  const tmp = join(dir, `${HISTORY_FILE}.tmp-${env.proc.pid}-${clock.randomHex(4)}`);
+  try {
+    await fs.writeText(tmp, texts.length === 0 ? "" : `${texts.join("\n")}\n`, { fsync: true });
+    await beforeRename();
+    await retryBusy(clock, () => fs.rename(tmp, join(dir, HISTORY_FILE)));
+  } catch (e) {
+    try {
+      await rmQuiet(fs, tmp);
+    } catch (cleanup) {
+      env.warn(`could not remove temp history ${tmp}: ${errMessage(cleanup)}`);
+    }
+    throw e;
+  }
+  await fs.fsyncDir(dir);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The store.
+// ---------------------------------------------------------------------------------------------------------------
+
+function noWarn(): void {
+  // Warnings are dropped unless the caller supplies a sink.
+}
+
+/**
+ * `LedgerStore` over the injected seams (2.2.2). One writer per plan holds `writer.lock` (pid, host, session, heartbeat); readers
+ * (`read`, `list`, `exportPlan`) never take it. All files of a plan live in `planDir(home, planId)`:
+ * `ledger.<epoch>.json` (snapshot, one per writer epoch: the loader takes the highest, so a fenced writer's late rename lands on its
+ * own older name; a writer deletes lower-epoch snapshots only after its own is in place), `events.<firstSeq>.<epoch>.jsonl` (journal, rotated at snapshots; every writer, takeovers included, starts a
+ * new file under a new writer epoch and only the newest epoch's files are trusted), `history.jsonl` (never rotated), `writer.lock`
+ * (written once per holder: pid, host, session, store-stamped token and epoch) and `writer.<token>.beat` (the holder's heartbeat).
+ *
+ * `takeover` replaces a stale lock. A live holder is refused (E_LOCK_HELD) unless `reason` is exactly {@link ADOPT_TAKEOVER_REASON} and
+ * the live holder is this same process (pid and host); that exception stands until fencing proves an older writer out.
+ */
+export function createLedgerStore(deps: LedgerStoreDeps): LedgerStore {
+  const fs = deps.fs ?? createNodeFileSystem();
+  const clock = deps.clock ?? createNodeClock();
+  const proc = deps.proc ?? createNodeProcessInfo();
+  const warn = deps.warn ?? noWarn;
+  const heartbeatMs = deps.heartbeatMs ?? HEARTBEAT_MS;
+  const staleMs = deps.staleMs ?? LOCK_STALE_MS;
+  const snapshotEvery = deps.snapshotEvery ?? SNAPSHOT_EVERY_EVENTS;
+
+  const dirOf = (planId: PlanId): string => {
+    if (!isPlanId(planId)) throw new ExecutorError("E_INVALID_INPUT", `invalid plan id ${JSON.stringify(planId)}`, { planId });
+    return planDir(deps.home, planId);
+  };
+  const envOf = (dir: string): WriterEnv => ({ fs, clock, proc, warn, dir, heartbeatMs, staleMs, snapshotEvery });
+  const emit = (warnings: readonly string[]): void => {
+    for (const w of warnings) warn(w);
+  };
+
+  /**
+   * Dead pid on this host, or a heartbeat older than `staleMs`; a torn lock file is stale once its mtime is that old. The heartbeat is the
+   * later of the lock's own stamp (its acquisition) and the holder's beat file (`writer.<token>.beat`).
+   */
+  const isStale = (cur: LockRead): boolean => {
+    const h = cur.holder;
+    if (h === null) return cur.mtimeMs !== null && clock.now() - cur.mtimeMs > staleMs;
+    if (h.hostname === proc.hostname && !proc.isAlive(h.pid)) return true;
+    const own = Date.parse(h.heartbeatAt);
+    const beat = Math.max(Number.isFinite(own) ? own : Number.NEGATIVE_INFINITY, cur.beatMs ?? Number.NEGATIVE_INFINITY);
+    return !Number.isFinite(beat) || clock.now() - beat > staleMs;
+  };
+
+  const readLock = async (dir: string): Promise<LockRead> => {
+    const path = join(dir, LOCK_FILE);
+    const text = await readOptional(fs, path);
+    if (text === null) return { exists: false, text: null, holder: null, mtimeMs: null, beatMs: null };
+    const st = await fs.lstat(path);
+    const holder = parseLockText(text);
+    const beatText = holder === null ? null : await readOptional(fs, join(dir, beatFileName(holder.token)));
+    return { exists: true, text, holder, mtimeMs: st === null ? null : st.mtimeMs, beatMs: beatText === null ? null : parseBeatText(beatText) };
+  };
+
+  /** Stamps a lock record: the store, not the caller, chooses the token, the start time and the epoch. */
+  const stampLock = (holder: LockHolder, epoch: number): LockRecord => {
+    const now = clock.iso();
+    // The pid prefix keeps tokens of two processes apart even if their random sources collide.
+    const token = `${holder.pid.toString(16)}-${clock.randomHex(8)}`;
+    return { pid: holder.pid, hostname: holder.hostname, sessionID: holder.sessionID, startedAt: now, heartbeatAt: now, token, epoch };
+  };
+
+  const lockHeld = async (dir: string): Promise<ExecutorError> => {
+    const cur = await readLock(dir);
+    const stale = cur.exists && isStale(cur);
+    const who = cur.holder === null ? "unknown holder" : `pid ${cur.holder.pid} on ${cur.holder.hostname} (session ${cur.holder.sessionID})`;
+    return new ExecutorError(
+      "E_LOCK_HELD",
+      `ledger writer lock is held by ${who}${stale ? "; it is stale, use takeover" : ""}`,
+      jsonDetail(cur.holder === null ? null : publicHolder(cur.holder)),
+    );
+  };
+
+  /** Creates the lock file exclusively; EEXIST means another writer (stale or not) holds it. The store stamps token, start time and epoch. */
+  const acquireExclusive = async (dir: string, holder: LockHolder): Promise<LockRecord> => {
+    const mine = stampLock(holder, (await maxEpochOnDisk(fs, dir)) + 1);
+    try {
+      await fs.writeText(join(dir, LOCK_FILE), JSON.stringify(mine), { exclusive: true, fsync: true });
+    } catch (e) {
+      if (fsErrorCode(e) === "EEXIST") throw await lockHeld(dir);
+      throw e;
+    }
+    return mine;
+  };
+
+  /** Removes the lock (and its beat file) only while it still names `mine`. */
+  const releaseLockQuietly = async (dir: string, mine: LockRecord): Promise<void> => {
+    try {
+      const cur = await readLock(dir);
+      if (cur.holder !== null && sameLockIdentity(cur.holder, mine)) await rmQuiet(fs, join(dir, LOCK_FILE));
+      await rmQuiet(fs, join(dir, beatFileName(mine.token)));
+    } catch (e) {
+      warn(`could not release the lock in ${dir}: ${errMessage(e)}`);
+    }
+  };
+
+  /** Creates `path` exclusively with `content`; false when it already exists. */
+  const createExclusive = async (path: string, content: string): Promise<boolean> => {
+    try {
+      await fs.writeText(path, content, { exclusive: true, fsync: true });
+      return true;
+    } catch (e) {
+      if (fsErrorCode(e) === "EEXIST") return false;
+      throw e;
+    }
+  };
+
+  /**
+   * Breaks a stale guard. The break itself is serialised under its own exclusive file, and the guard is deleted only if its content is
+   * still what was judged stale (a guard another taker re-created in between is left alone). True when the guard is gone.
+   */
+  const breakStaleGuard = async (dir: string, guard: string, ticket: string): Promise<boolean> => {
+    // A guard that vanished meanwhile belonged to a taker that just finished: report a takeover in progress rather than race it.
+    const seen = await readOptional(fs, guard);
+    if (seen === null) return false;
+    const st = await fs.lstat(guard);
+    if (st === null || clock.now() - st.mtimeMs <= GUARD_STALE_MS) return false;
+    const brk = join(dir, LOCK_GUARD_BREAK_FILE);
+    if (!(await createExclusive(brk, ticket))) {
+      const bst = await fs.lstat(brk);
+      if (bst !== null && clock.now() - bst.mtimeMs > GUARD_STALE_MS) await rmQuiet(fs, brk); // a dead breaker; the next attempt wins
+      return false;
+    }
+    try {
+      // Content re-check under the break file: delete only the guard that was judged stale, never one re-created since.
+      if ((await readOptional(fs, guard)) !== seen) return false;
+      await rmQuiet(fs, guard);
+      return true;
+    } finally {
+      // Only this breaker's own file: a stale-break cleanup by another taker may have replaced it meanwhile.
+      if ((await readOptional(fs, brk)) === ticket) await rmQuiet(fs, brk);
+    }
+  };
+
+  /**
+   * Replaces a stale lock (or none) under a short-lived guard file so two takers cannot both win. A LIVE holder is refused with
+   * E_LOCK_HELD, except that reason {@link ADOPT_TAKEOVER_REASON} (matched exactly) replaces it when the holder is this same process
+   * (same pid and host), until fencing proves an older writer out.
+   */
+  const takeLock = async (
+    dir: string,
+    holder: LockHolder,
+    reason: string,
+  ): Promise<{ mine: LockRecord; previous: LockRecord | null }> => {
+    const guard = join(dir, LOCK_GUARD_FILE);
+    const ticket = JSON.stringify({ pid: proc.pid, token: clock.randomHex(8), at: clock.iso() });
+    if (!(await createExclusive(guard, ticket))) {
+      if (!(await breakStaleGuard(dir, guard, ticket)) || !(await createExclusive(guard, ticket))) {
+        throw new ExecutorError("E_LOCK_HELD", "another takeover of this ledger is in progress", null);
+      }
+    }
+    try {
+      return await takeLockGuarded(dir, holder, reason);
+    } finally {
+      try {
+        if ((await readOptional(fs, guard)) === ticket) await rmQuiet(fs, guard);
+      } catch (e) {
+        warn(`could not remove ${guard}: ${errMessage(e)}`);
+      }
+    }
+  };
+
+  const takeLockGuarded = async (
+    dir: string,
+    holder: LockHolder,
+    reason: string,
+  ): Promise<{ mine: LockRecord; previous: LockRecord | null }> => {
+    const cur = await readLock(dir);
+    const sameProcess = cur.holder !== null && cur.holder.pid === proc.pid && cur.holder.hostname === proc.hostname;
+    const adopting = reason === ADOPT_TAKEOVER_REASON && sameProcess;
+    if (cur.exists && !adopting && !isStale(cur)) throw await lockHeld(dir);
+    const epoch = Math.max(cur.holder === null ? 0 : cur.holder.epoch, await maxEpochOnDisk(fs, dir)) + 1;
+    const mine = stampLock(holder, epoch);
+    const lockPath = join(dir, LOCK_FILE);
+    if (!cur.exists) {
+      if (!(await createExclusive(lockPath, JSON.stringify(mine)))) throw await lockHeld(dir);
+    } else {
+      if ((await readOptional(fs, lockPath)) !== cur.text) throw await lockHeld(dir); // changed since it was judged
+      const tmp = join(dir, `${LOCK_FILE}.tmp-${proc.pid}-${clock.randomHex(4)}`);
+      try {
+        await fs.writeText(tmp, JSON.stringify(mine), { fsync: true });
+        await retryBusy(clock, () => fs.rename(tmp, lockPath));
+      } catch (e) {
+        try {
+          await rmQuiet(fs, tmp);
+        } catch (cleanup) {
+          warn(`could not remove temp lock ${tmp}: ${errMessage(cleanup)}`);
+        }
+        throw e;
+      }
+    }
+    await fs.fsyncDir(dir);
+    return { mine, previous: cur.holder };
+  };
+
+  /** Removes leftover temp files and the beat files of earlier holders; the caller holds the lock `mine`. */
+  const cleanupTemps = async (dir: string, mine: LockRecord): Promise<void> => {
+    for (const name of await fs.readdir(dir)) {
+      const beat = BEAT_PATTERN.exec(name);
+      if (!TMP_PATTERN.test(name) && (beat === null || beat[1] === mine.token)) continue;
+      try {
+        await rmQuiet(fs, join(dir, name));
+      } catch (e) {
+        warn(`could not remove leftover ${name}: ${errMessage(e)}`);
+      }
+    }
+  };
+
+  /** Loads the plan under the lock `mine`, repairs history, takes a snapshot when the journal tail is unusable, and starts the heartbeat. */
+  const buildWriter = async (
+    planId: PlanId,
+    dir: string,
+    mine: LockRecord,
+    takeover: { reason: string; previous: LockRecord | null } | null,
+  ): Promise<LedgerWriter> => {
+    const env = envOf(dir);
+    let writer: StoreWriter | null = null;
+    try {
+      const lockEnv = { fs, dir, planId };
+      await assertLockHeld(lockEnv, mine); // before anything on disk is touched
+      await cleanupTemps(dir, mine);
+      const st = await loadMain(fs, dir, "writer");
+      emit(st.warnings);
+      const hl = await loadHistory(fs, dir, st.ledger.seq, st.events);
+      const all = [...hl.kept, ...hl.added].sort((x, y) => x.event.seq - y.event.seq);
+      const tracker = trackerOf(all);
+      // A1-3a: `integrating` needs an open entry unless the task's last entry closed rolled-back.
+      const orphan = tracker.integratingWithoutEntry(st.ledger)[0];
+      if (orphan !== undefined) {
+        throw new ExecutorError("E_ILLEGAL_TRANSITION", `task ${orphan} is integrating but no integration entry is open`, {
+          taskId: orphan,
+          codes: ["integrating-without-entry"],
+        });
+      }
+      if (hl.rewrite) {
+        await writeHistoryFile(env, all.map((l) => l.text), () => assertLockHeld(lockEnv, mine));
+      } else if (hl.added.length > 0) {
+        await assertLockHeld(lockEnv, mine);
+        await fs.appendText(join(dir, HISTORY_FILE), `${hl.added.map((l) => l.text).join("\n")}\n`, { fsync: true });
+      }
+      writer = new StoreWriter(env, {
+        planId,
+        ledger: st.ledger,
+        tracker,
+        lock: mine,
+        snapshotSeq: st.snapshotSeq,
+        snapshotEpoch: st.snapshotEpoch,
+        journal: st.files[st.files.length - 1] ?? null,
+        needsRotate: st.dirty,
+      });
+      await writer.start();
+      if (takeover !== null) {
+        await writer.append([
+          {
+            type: "lock-takeover",
+            reason: takeover.reason,
+            previous: takeover.previous === null ? null : publicHolder(takeover.previous),
+            holder: publicHolder(mine),
+          },
+        ]);
+      }
+      return writer;
+    } catch (e) {
+      if (writer !== null) writer.abandon();
+      await releaseLockQuietly(dir, mine);
+      throw e;
+    }
+  };
+
+  const requireDir = async (planId: PlanId): Promise<string> => {
+    const dir = dirOf(planId);
+    if ((await fs.lstat(dir)) === null) throw new ExecutorError("E_LEDGER_NOT_FOUND", `no ledger for plan ${planId}`, { planId });
+    return dir;
+  };
+
+  const read = async (planId: PlanId): Promise<LedgerV1> => {
+    const dir = await requireDir(planId);
+    const st = await loadMainConsistent(fs, clock, dir);
+    emit(st.warnings);
+    return st.ledger;
+  };
+
+  return {
+    async create(draft, holder) {
+      if (!isLedgerV1(draft) || draft.seq !== 1) {
+        throw new ExecutorError("E_SCHEMA_INVALID", "create needs a valid LedgerV1 draft with seq 1", jsonDetail(ledgerViolations(draft).slice(0, 20)));
+      }
+      const planId = draft.planId;
+      // A1-3a: a fresh plan has no integration entry, so a draft with an `integrating` task could never be opened again.
+      const orphan = new HistoryTracker().integratingWithoutEntry(draft)[0];
+      if (orphan !== undefined) {
+        throw new ExecutorError("E_ILLEGAL_TRANSITION", `draft has task ${orphan} integrating with no open integration entry`, {
+          taskId: orphan,
+          codes: ["integrating-without-entry"],
+        });
+      }
+      const dir = dirOf(planId);
+      if ((await fs.lstat(dir)) !== null) throw new ExecutorError("E_EXISTS", `plan ${planId} already exists`, { planId });
+      await fs.mkdir(dir);
+      let mine: LockRecord;
+      try {
+        mine = await acquireExclusive(dir, holder);
+      } catch (e) {
+        if (e instanceof ExecutorError && e.code === "E_LOCK_HELD") {
+          throw new ExecutorError("E_EXISTS", `plan ${planId} is being created elsewhere`, { planId });
+        }
+        try {
+          // Remove the directory this call created, but only while it is still empty.
+          if ((await fs.readdir(dir)).length === 0) await rmQuiet(fs, dir, true);
+        } catch (cleanup) {
+          warn(`could not remove the empty plan directory ${dir}: ${errMessage(cleanup)}`);
+        }
+        throw e;
+      }
+      try {
+        const ledger = JSON.parse(JSON.stringify(draft)) as LedgerV1;
+        const init: ExecutorEvent = { seq: 1, at: clock.iso(), batch: 1, last: true, type: "ledger-init", ledger };
+        const journal: JournalFile = { name: journalName(1, mine.epoch), first: 1, epoch: mine.epoch };
+        await fs.writeText(join(dir, journal.name), `${JSON.stringify(init)}\n`, { exclusive: true, fsync: true });
+        const snapName = snapshotName(mine.epoch);
+        const tmp = join(dir, `${snapName}.tmp-${proc.pid}-${clock.randomHex(4)}`);
+        await fs.writeText(tmp, JSON.stringify(ledger), { fsync: true });
+        await assertLockHeld({ fs, dir, planId }, mine); // immediately before the rename that publishes the snapshot
+        await retryBusy(clock, () => fs.rename(tmp, join(dir, snapName)));
+        await fs.fsyncDir(dir);
+        const writer = new StoreWriter(envOf(dir), {
+          planId,
+          ledger,
+          tracker: new HistoryTracker(),
+          lock: mine,
+          snapshotSeq: 1,
+          snapshotEpoch: mine.epoch,
+          journal,
+          needsRotate: false,
+          journalFresh: true,
+        });
+        await writer.start();
+        return writer;
+      } catch (e) {
+        // A lost lock means another writer owns the directory now: it is not ours to delete. Otherwise the lock is re-checked right
+        // before the recursive delete.
+        if (!(e instanceof ExecutorError && e.code === "E_LOCK_LOST")) {
+          try {
+            await assertLockHeld({ fs, dir, planId }, mine);
+            await rmQuiet(fs, dir, true);
+          } catch (cleanup) {
+            warn(`could not remove the half-created plan directory ${dir}: ${errMessage(cleanup)}`);
+          }
+        }
+        throw e;
+      }
+    },
+
+    async open(planId, holder) {
+      const dir = await requireDir(planId);
+      const mine = await acquireExclusive(dir, holder);
+      return buildWriter(planId, dir, mine, null);
+    },
+
+    async takeover(planId, holder, reason) {
+      const dir = await requireDir(planId);
+      const { mine, previous } = await takeLock(dir, holder, reason);
+      return buildWriter(planId, dir, mine, { reason, previous });
+    },
+
+    read,
+
+    async list() {
+      let names: string[];
+      try {
+        names = await fs.readdir(deps.home);
+      } catch (e) {
+        if (fsErrorCode(e) === "ENOENT") return [];
+        throw e;
+      }
+      const out: Array<{ planId: PlanId; status: LedgerStatus; toplevel: string; orchestratorSessionID: string; seq: number }> = [];
+      for (const name of names.sort()) {
+        if (name === SLOT_MARKERS_DIRNAME || !isPlanId(name)) continue;
+        try {
+          const l = await read(name);
+          out.push({ planId: l.planId, status: l.status, toplevel: l.repo.toplevel, orchestratorSessionID: l.orchestrator.sessionID, seq: l.seq });
+        } catch (e) {
+          if (e instanceof ExecutorError && e.code === "E_LEDGER_NOT_FOUND") continue;
+          warn(`plan ${name} is unreadable and skipped: ${errMessage(e)}`);
+        }
+      }
+      return out;
+    },
+
+    async exportPlan(planId) {
+      const dir = await requireDir(planId);
+      const st = await loadMainConsistent(fs, clock, dir);
+      emit(st.warnings);
+      const hist = parseJournal((await readOptional(fs, join(dir, HISTORY_FILE))) ?? "", HISTORY_FILE);
+      const bySeq = new Map<number, ExecutorEvent>();
+      for (const l of repairHistory(hist.lines, st.ledger.seq, st.events).kept) bySeq.set(l.event.seq, l.event);
+      for (const l of st.events) if (l.event.seq <= st.ledger.seq) bySeq.set(l.event.seq, l.event);
+      const events = [...bySeq.values()].sort((a, b) => a.seq - b.seq);
+      return { snapshot: st.ledger, events };
+    },
+
+    async remove(planId) {
+      const dir = dirOf(planId);
+      if ((await fs.lstat(dir)) === null) return false;
+      const me: LockHolder = { pid: proc.pid, hostname: proc.hostname, sessionID: "remove", startedAt: clock.iso(), heartbeatAt: clock.iso() };
+      // The guarded path: a free lock is created exclusively, a stale one is replaced under the takeover guard, a live one is refused.
+      const { mine } = await takeLock(dir, me, "remove");
+      try {
+        let status: LedgerStatus | null = null;
+        try {
+          status = (await loadMain(fs, dir, "writer")).ledger.status;
+        } catch (e) {
+          // A directory that never got a ledger (a create that died early) holds nothing worth keeping.
+          if (!(e instanceof ExecutorError) || e.code !== "E_LEDGER_NOT_FOUND") throw e;
+        }
+        if (status !== null && status !== "completed" && status !== "aborted") {
+          throw new ExecutorError("E_PLAN_STATE", `plan ${planId} is ${status}; only completed or aborted plans can be removed`, { planId, status });
+        }
+      } catch (e) {
+        await releaseLockQuietly(dir, mine);
+        throw e;
+      }
+      // The delete is irreversible: re-check the lock, then move the directory aside in one rename (a takeover after the check finds no
+      // plan instead of a half-deleted one) and delete the tombstone.
+      const tomb = `${dir}.removing-${mine.token}`;
+      try {
+        await assertLockHeld({ fs, dir, planId }, mine);
+        await retryBusy(clock, () => fs.rename(dir, tomb));
+      } catch (e) {
+        await releaseLockQuietly(dir, mine); // a no-op when the lock is no longer ours
+        throw e;
+      }
+      try {
+        await retryBusy(clock, () => fs.rm(tomb, { recursive: true }));
+      } catch (e) {
+        warn(`plan ${planId} was removed but its tombstone ${tomb} could not be deleted: ${errMessage(e)}`);
+      }
+      return true;
+    },
+  };
+}
+
+function fsErrorCode(e: unknown): string | undefined {
+  if (typeof e === "object" && e !== null && "code" in e) {
+    const c = (e as { code?: unknown }).code;
+    return typeof c === "string" ? c : undefined;
+  }
+  return undefined;
+}
+
+/** Production `FileSystem` over node:fs. Nothing runs at module load; every call is made on demand. */
+export function createNodeFileSystem(): FileSystem {
+  return {
+    readText: (p) => nodeFsp.readFile(p, "utf8"),
+    async writeText(p, data, o) {
+      const fh = await nodeFsp.open(p, o?.exclusive === true ? "wx" : "w");
+      try {
+        await fh.writeFile(data, "utf8");
+        if (o?.fsync === true) await fh.sync();
+      } finally {
+        await fh.close();
+      }
+    },
+    async appendText(p, data, o) {
+      // `create: false` (journal appends): O_APPEND without O_CREAT, so a fenced writer whose file was deleted cannot re-create it.
+      const noCreate = (o as AppendOptions).create === false;
+      const fh = await nodeFsp.open(p, noCreate ? nodeFsConstants.O_WRONLY | nodeFsConstants.O_APPEND : "a");
+      try {
+        await fh.appendFile(data, "utf8");
+        if (o.fsync) await fh.sync();
+      } finally {
+        await fh.close();
+      }
+    },
+    rename: (a, b) => nodeFsp.rename(a, b),
+    rm: (p, o) => nodeFsp.rm(p, { recursive: o.recursive, force: true }),
+    async mkdir(p) {
+      await nodeFsp.mkdir(p, { recursive: true });
+    },
+    readdir: (p) => nodeFsp.readdir(p),
+    async lstat(p): Promise<FsStat | null> {
+      try {
+        const s = await nodeFsp.lstat(p);
+        const kind: FsStat["kind"] = s.isSymbolicLink() ? "symlink" : s.isDirectory() ? "dir" : s.isFile() ? "file" : "other";
+        return { kind, size: s.size, mtimeMs: s.mtimeMs };
+      } catch (e) {
+        if (fsErrorCode(e) === "ENOENT") return null;
+        throw e;
+      }
+    },
+    realpath: (p) => nodeFsp.realpath(p),
+    async fsyncDir(p) {
+      // Windows cannot open a directory for fsync (EPERM/EACCES/EISDIR); NTFS journals the directory entry itself.
+      const ignorable = (e: unknown): boolean => {
+        if (process.platform !== "win32") return false;
+        const c = fsErrorCode(e);
+        return c === "EPERM" || c === "EACCES" || c === "EISDIR";
+      };
+      let fh: nodeFsp.FileHandle;
+      try {
+        fh = await nodeFsp.open(p, "r");
+      } catch (e) {
+        if (ignorable(e)) return;
+        throw e;
+      }
+      try {
+        await fh.sync();
+      } catch (e) {
+        if (!ignorable(e)) throw e;
+      } finally {
+        await fh.close();
+      }
+    },
+  };
+}
