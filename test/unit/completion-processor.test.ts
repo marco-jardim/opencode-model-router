@@ -14,6 +14,7 @@ import {
   renderCompleted,
   renderHeld,
   renderInFlight,
+  unheldVerdictText,
   verdictText,
   type Attempt,
   type BackgroundDecision,
@@ -1272,6 +1273,95 @@ describe("held results: placeholder, matcher, refusal, verdict delivery (memo 5,
     await delivering;
     expect(r.posts).toHaveLength(1);
     expect(r.records.map((x) => x.kind)).toEqual(["hold", "posting", "posted"]);
+  });
+
+  /** QA-2.1-24: a held store whose `hold` record fails (the `hold` append rejects through `failHold`, or at once). */
+  function failingHoldRig(mode: "now" | "later") {
+    const posts: Array<Record<string, unknown>> = [];
+    const warns: string[] = [];
+    const kinds: string[] = [];
+    let failHold: (error: Error) => void = () => undefined;
+    const held = createHeldResults({
+      synthetic: async (input) => {
+        posts.push({ ...input });
+      },
+      journal: {
+        append: (record) => {
+          kinds.push(String(record.kind));
+          if (record.kind !== "hold") return Promise.resolve();
+          if (mode === "now") return Promise.reject(new Error("ENOSPC"));
+          return new Promise<void>((_resolve, reject) => {
+            failHold = reject;
+          });
+        },
+        hasProcessed: () => false,
+      },
+      available: true,
+      logger: { warn: (m) => void warns.push(m) },
+      sleep: async () => undefined,
+    });
+    return { held, posts, warns, kinds, failHold: (error: Error) => failHold(error) };
+  }
+
+  it("QA-2.1-24: a verdict queued before a hold whose record fails is posted as a plain notice, once", async () => {
+    const r = failingHoldRig("now");
+    await r.held.verdict(HANDLE, { verdict: "FAIL", text: "early findings" });
+    expect(r.posts).toEqual([]);
+    await expect(r.held.hold({ handle: HANDLE, parentSessionID: PARENT, childSessionID: CHILD, callID: "c1" })).rejects.toThrow("ENOSPC");
+    await flushAll();
+    expect(r.posts).toHaveLength(1);
+    expect(r.posts[0]).toMatchObject({
+      sessionID: PARENT,
+      text: unheldVerdictText(HANDLE, CHILD, { verdict: "FAIL", text: "early findings" }),
+      resume: true,
+      metadata: { router: { kind: "unheld-verdict", handle: HANDLE, child: CHILD } },
+    });
+    expect(String(r.posts[0]?.text)).not.toContain("<router-verdict ");
+    expect(r.held.isHeld(CHILD)).toBe(false);
+    // Nothing was held, so nothing about the post is journaled.
+    expect(r.kinds).toEqual(["hold"]);
+  });
+
+  it("QA-2.1-24: a verdict that settles while a failing hold record is written is posted as a plain notice, not dropped", async () => {
+    const r = failingHoldRig("later");
+    const holding = r.held.hold({ handle: HANDLE, parentSessionID: PARENT, childSessionID: CHILD, callID: "c1" });
+    const delivering = r.held.verdict(HANDLE, { verdict: "PASS", text: "during the write" });
+    r.failHold(new Error("EIO"));
+    await expect(holding).rejects.toThrow("EIO");
+    await delivering;
+    await flushAll();
+    expect(r.posts).toHaveLength(1);
+    expect(r.posts[0]).toMatchObject({ sessionID: PARENT, text: unheldVerdictText(HANDLE, CHILD, { verdict: "PASS", text: "during the write" }), resume: true });
+    expect(r.warns).not.toContain("[router] held verdict dropped: the hold was never journaled");
+  });
+
+  it("QA-2.1-24: a verdict that settles after its hold record failed is posted as a plain notice, once", async () => {
+    const r = failingHoldRig("now");
+    await expect(r.held.hold({ handle: HANDLE, parentSessionID: PARENT, childSessionID: CHILD, callID: "c1" })).rejects.toThrow("ENOSPC");
+    await r.held.verdict(HANDLE, { verdict: "UNVERIFIABLE", text: "late", reason: "gate timed out" });
+    await r.held.verdict(HANDLE, { verdict: "UNVERIFIABLE", text: "late again", reason: "gate timed out" });
+    await flushAll();
+    expect(r.posts).toHaveLength(1);
+    expect(r.posts[0]).toMatchObject({ text: unheldVerdictText(HANDLE, CHILD, { verdict: "UNVERIFIABLE", text: "late" }) });
+  });
+
+  it("QA-2.1-24: a plain notice whose synthetic call fails is retried, then logged", async () => {
+    const warns: string[] = [];
+    let calls = 0;
+    const held = createHeldResults({
+      synthetic: async () => {
+        calls += 1;
+        throw new Error("host busy");
+      },
+      journal: { append: async (record) => { if (record.kind === "hold") throw new Error("ENOSPC"); }, hasProcessed: () => false },
+      available: true,
+      logger: { warn: (m) => void warns.push(m) },
+      sleep: async () => undefined,
+    });
+    await expect(held.hold({ handle: HANDLE, parentSessionID: PARENT, childSessionID: CHILD, callID: "c1" })).rejects.toThrow("ENOSPC");
+    await held.verdict(HANDLE, { verdict: "PASS", text: "x" });
+    expect(calls).toBe(3);
+    expect(warns).toContain("[router] verdict of a result that could not be held was not posted");
   });
 
   it("the posting record carries the verdict text (QA-2.1-2, R21)", async () => {

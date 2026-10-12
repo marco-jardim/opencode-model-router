@@ -198,7 +198,7 @@ export interface FinishApi {
    * (the hold write failed, the child failed or was interrupted, the attempt was closed unknown). Idempotent. Optional for
    * compatibility: absent, the reservation expires after `HELD_RESERVATION_TTL_MS` (verify/pending.ts).
    */
-  releaseHeld?(handle: string): void;
+  releaseHeld(handle: string): void;
   finish(input: FinishInput): Promise<FinishResult>;
   /**
    * The ONE journal (memo §11): `pending.jsonl`, shared by the pending store, the in-flight registry and the held results.
@@ -638,6 +638,14 @@ export function verdictText(handle: string, child: string, v: HeldVerdict): stri
   return `<router-verdict handle="${handle}" sessionID="${child}" verdict="${v.verdict}">\n${v.text}\n</router-verdict>`;
 }
 
+/**
+ * QA-2.1-24: the plain notice that carries the verdict of a result that could not be held (its hold record failed): the result
+ * reached the parent unverified, so this is not a `<router-verdict>` release, only the verdict after it.
+ */
+export function unheldVerdictText(handle: string, child: string, v: HeldVerdict): string {
+  return `[router] Verdict for session ${child} (${handle}): ${v.verdict}. Its result could not be held, so it reached you unverified; this is the verification that followed.\n${v.text}`;
+}
+
 /** The refusal for a resume of, or a Code Mode reference to, a held child (memo §7.4). */
 export function heldRefusalText(child: string, handle: string): string {
   return `[router] Refused: session ${child} is held for verification (${handle}). Its result arrives with the verdict; resume it after that.`;
@@ -699,6 +707,8 @@ export function createHeldResults(deps: {
   const byHandle = new Map<string, HoldEntry>();
   const byParent = new Map<string, Map<string, HoldEntry>>();
   const early = new Map<string, { v: HeldVerdict; at: number }>();
+  /** QA-2.1-24: holds whose append failed, until their verdict is posted as a plain notice (bounded, oldest first out). */
+  const unheld = new Map<string, HeldRecord>();
   const now = deps.now ?? (() => Date.now());
   const retryBase = deps.retryBaseMs ?? DEFAULT_RETRY_BASE_MS;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
@@ -831,10 +841,40 @@ export function createHeldResults(deps: {
     }
   }
 
+  /**
+   * QA-2.1-24: the verdict of a hold whose append failed (it settled before or during the append): nothing is held or journaled,
+   * so it is posted once as a plain notice to the parent (the result itself was never withheld). The ack said a verdict
+   * follows; it is never dropped. Only a failed `synthetic` call is retried. Never throws.
+   */
+  async function postUnheld(rec: HeldRecord, v: HeldVerdict): Promise<void> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < SYNTHETIC_ATTEMPTS; attempt += 1) {
+      try {
+        await deps.synthetic({
+          sessionID: rec.parentSessionID,
+          text: unheldVerdictText(rec.handle, rec.childSessionID, v),
+          description: "Model router verdict",
+          metadata: { router: { kind: "unheld-verdict", handle: rec.handle, child: rec.childSessionID } },
+          resume: true,
+        });
+        return;
+      } catch (error) {
+        lastError = error;
+        if (attempt < SYNTHETIC_ATTEMPTS - 1) await sleep(retryBase * 2 ** attempt);
+      }
+    }
+    warnSafe(deps.logger, "[router] verdict of a result that could not be held was not posted", {
+      handle: rec.handle,
+      error: errorText(lastError),
+    });
+  }
+
   /** Delivers one verdict for an entry; waits for an in-flight `hold` append first. Never throws. */
   async function deliver(entry: HoldEntry, v: HeldVerdict): Promise<void> {
     if (entry.ready !== undefined && !(await entry.ready)) {
-      warnSafe(deps.logger, "[router] held verdict dropped: the hold was never journaled", { handle: entry.handle });
+      // QA-2.1-24: the hold was never journaled, so nothing is held; the verdict that settled meanwhile still reaches the parent.
+      unheld.delete(entry.handle);
+      await postUnheld(entry, v);
       return;
     }
     if (!entry.active || entry.posting) return;
@@ -865,6 +905,7 @@ export function createHeldResults(deps: {
           settle = resolve;
         }),
       };
+      unheld.delete(rec.handle);
       insert(entry);
       try {
         await deps.journal.append(
@@ -884,8 +925,19 @@ export function createHeldResults(deps: {
       } catch (error) {
         entry.active = false;
         if (byHandle.get(rec.handle) === entry) remove(entry);
+        // QA-2.1-24: a verdict that settled during the append is posted by its `deliver` (it sees `false`); one queued before
+        // `hold` is posted here; one that settles later is posted by `verdict` (the handle is remembered as unheld).
+        unheld.delete(rec.handle);
+        unheld.set(rec.handle, { handle: rec.handle, parentSessionID: rec.parentSessionID, childSessionID: rec.childSessionID, callID: rec.callID });
+        trimMap(unheld, MAX_EARLY_VERDICTS, () => false);
         settle(false);
         entry.ready = undefined;
+        const queued = early.get(rec.handle);
+        if (queued !== undefined) {
+          early.delete(rec.handle);
+          unheld.delete(rec.handle);
+          if (now() - queued.at <= EARLY_END_TTL_MS) void postUnheld(rec, queued.v);
+        }
         throw error;
       }
       settle(true);
@@ -947,6 +999,13 @@ export function createHeldResults(deps: {
     async verdict(handle, v) {
       const entry = byHandle.get(handle);
       if (entry === undefined) {
+        // QA-2.1-24: its hold failed: the verdict that settles after the failure is posted as a plain notice too.
+        const failed = unheld.get(handle);
+        if (failed !== undefined) {
+          unheld.delete(handle);
+          await postUnheld(failed, v);
+          return;
+        }
         // QA-2.1-2: the verdict settled before `hold` inserted the entry; `hold` delivers it.
         early.delete(handle);
         early.set(handle, { v, at: now() });
@@ -973,6 +1032,7 @@ export function createHeldResults(deps: {
         remove(entry);
         early.delete(entry.handle);
       }
+      for (const [handle, rec] of unheld) if (rec.parentSessionID === sessionID) unheld.delete(handle);
       deps.journal.append({ v: 1, kind: "forget", session: sessionID, at: now() }).catch((error: unknown) => {
         warnSafe(deps.logger, "[router] held forget not journaled", { sessionID, error: errorText(error) });
       });
@@ -1621,8 +1681,11 @@ const TREE_POLL_MS = 5000;
 /** Bound of one host lookup (session kind / directory) made from inside a tool hook. */
 const LOOKUP_TIMEOUT_MS = 5000;
 const MAX_ACTOR_CACHE = 1000;
-/** QA-2.1-11: a failed session-directory lookup is not repeated for this long. */
-export const LEASE_LOOKUP_NEGATIVE_TTL_MS = 30_000;
+/**
+ * QA-2.1-11: a failed session-directory lookup is not repeated for this long. QA-2.1-25: short, because the failure means no
+ * lease check and no lease for the call (a child's write goes unguarded); the window only spares a burst of tool calls.
+ */
+export const LEASE_LOOKUP_NEGATIVE_TTL_MS = 2_000;
 /** QA-2.1-13: warn-once keys remembered. */
 const MAX_WARNED_KEYS = 1000;
 

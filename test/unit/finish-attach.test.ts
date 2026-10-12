@@ -10,6 +10,7 @@ import type { Hooks } from "@opencode-ai/plugin";
 import ModelRouterPlugin from "../../src/index";
 import { ROUTER_FINISH_ATTACH, type FinishApi, type FinishAttach, type HeldSink } from "../../src/compat/background";
 import { invalidateConfigCache } from "../../src/router/config";
+import { MAX_ENTRIES_PER_SESSION } from "../../src/verify/pending";
 import { removeDirWhenReleased } from "../helpers/remove-dir";
 
 vi.mock("../../src/verify/reference", async importOriginal => ({
@@ -81,7 +82,7 @@ describe("finish attach channel", () => {
   it("on v2 returns the finish API with every member the adapter uses", async () => {
     const api = attachOf(await load("v2"))({ host: "v2", held: sink });
     if (api === undefined) throw new Error("v2 attach returned no finish API");
-    for (const member of ["verificationFor", "canHold", "reserveHeld", "finish", "reload", "adopt"] as const) {
+    for (const member of ["verificationFor", "canHold", "reserveHeld", "releaseHeld", "finish", "reload", "adopt"] as const) {
       expect(typeof api[member], member).toBe("function");
     }
     expect(typeof api.journal.append).toBe("function");
@@ -95,6 +96,25 @@ describe("finish attach channel", () => {
     expect(api?.canHold("ses_parent")).toBe(true);
     const handle = api?.reserveHeld("ses_parent", "call-1");
     expect(handle).toMatch(/^vrf_[0-9a-f]{24}$/);
+  });
+
+  it("QA-2.1-14: on v2 releaseHeld gives a reservation back at once: the session's slots are free again", async () => {
+    const api = attachOf(await load("v2"))({ host: "v2", held: sink });
+    if (api === undefined) throw new Error("v2 attach returned no finish API");
+    const handles: string[] = [];
+    for (let i = 0; i < MAX_ENTRIES_PER_SESSION; i += 1) {
+      const handle = api.reserveHeld("ses_release", `call-${i}`);
+      if (handle === undefined) throw new Error(`reservation ${i} refused`);
+      handles.push(handle);
+    }
+    // Every slot of the session is reserved: no further hold until one is given back.
+    expect(api.canHold("ses_release")).toBe(false);
+    expect(api.reserveHeld("ses_release", "call-full")).toBeUndefined();
+    for (const handle of handles) api.releaseHeld(handle);
+    const first = handles[0];
+    if (first !== undefined) api.releaseHeld(first); // idempotent
+    expect(api.canHold("ses_release")).toBe(true);
+    expect(api.reserveHeld("ses_release", "call-again")).toMatch(/^vrf_[0-9a-f]{24}$/);
   });
 
   it("v1 is inert: one notice per process naming every configured v2-only key (QA-2.1-12), no finish channel, no journal file", async () => {

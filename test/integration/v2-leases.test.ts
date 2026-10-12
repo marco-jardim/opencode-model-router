@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireLeaseRegistry, createLeaseGuard, LEASE_LOOKUP_NEGATIVE_TTL_MS } from "../../src/compat/background";
 import { createLeaseRegistry } from "../../src/router/leases";
+import { SESSION_KIND_NEGATIVE_TTL_MS } from "../../src/compat/v2-hooks";
 import { bootBgHost, restoreEnv, type BgHost, type ToolEvent } from "../helpers/v2-bg-host";
 
 let host: BgHost | undefined;
@@ -391,6 +392,24 @@ describe("leases: a host lookup that never answers (memo 14.1)", () => {
     const unknown = await guardOf("unknown").before({ sessionID: "ses_kind", tool: "edit", args: { filePath: target }, callID: "call-u" });
     expect(unknown.refuse).toContain("Finish without that file");
     expect(unknown.refuse).not.toContain("Wait for that session to end.");
+  });
+
+  // QA-2.1-25: the fake host's `session.get` fails for A (kind and directory alike); only the fake Date moves (no sleeps).
+  it("QA-2.1-25: a failed kind lookup means no lease only for a short window; after it the child's write takes its lease", async () => {
+    expect(SESSION_KIND_NEGATIVE_TTL_MS).toBeLessThanOrEqual(2_000);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const h = await boot();
+    const early = file(h, "early.ts");
+    const later = file(h, "later.ts");
+    h.failingSessionLookups.add(A);
+    // The host lookups fail: whatever the call itself does, A is no known child and takes no lease (root semantics).
+    await Promise.allSettled([h.before(edit(A, early))]);
+    await expect(h.before(edit(B, early))).resolves.toBeDefined();
+    h.failingSessionLookups.delete(A);
+    vi.setSystemTime(Date.now() + SESSION_KIND_NEGATIVE_TTL_MS);
+    // The short window is over (with the old 30 s it was not): the lookup is made again, A is a child and takes its lease.
+    await h.before(edit(A, later));
+    await expect(h.before(edit(B, later))).rejects.toThrow(/Refused: .*later\.ts is being edited by session child-a/);
   });
 });
 

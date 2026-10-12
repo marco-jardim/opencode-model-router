@@ -382,7 +382,7 @@
 import { randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { appendFile, mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import type { DoD } from "./dod";
 import type { RiskAssessment, RiskLevel } from "./risk";
@@ -864,7 +864,8 @@ export const REFERENCE_UNRESTORED_REASON = "reference could not be restored afte
 export interface PendingFileJournal extends PendingJournal {
   /**
    * Every parseable record of the file, in order; a torn or invalid line and an unknown `v` are skipped. A file that is
-   * missing although this process saw it, wrote it or compacted it has vanished: `load` rejects (QA-2.1-8, fail closed).
+   * missing although this process saw it, wrote it or compacted it has vanished: `load` rejects (QA-2.1-8, fail closed) until
+   * `recreate` rewrites it (QA-2.1-16). Every journal of the same path in this process shares one read (QA-2.1-15).
    */
   load(): Promise<PendingRecord[]>;
   /** Resolves when every append so far has reached the file. Never rejects. */
@@ -874,8 +875,21 @@ export interface PendingFileJournal extends PendingJournal {
    * append so far. Afterwards the file exists, so a later missing file counts as vanished.
    */
   compact(records: readonly PendingRecord[]): Promise<void>;
+  /**
+   * QA-2.1-16: rewrites the journal from `records` (the caller's in-memory state: every record a later restore needs),
+   * the same way as `compact` (a temp file, fsync'd, renamed over the journal; the directory is created when missing),
+   * behind every append so far. It is the recovery of a vanished journal: once it resolves, the vanished state is
+   * reset, so later `load` and `append` calls succeed again. Rejects (and changes nothing) when the rewrite fails;
+   * the caller then stays fail closed and may retry.
+   */
+  recreate(records: readonly PendingRecord[]): Promise<void>;
   /** QA-2.1-8: why the compaction at start failed (the journal then stays as it was); undefined when it did not fail. */
   readonly compactionError: string | undefined;
+  /**
+   * QA-2.1-22: releases this journal object after its last append. When it is the last journal of the path in this
+   * process, the process's writer mark is removed. Never rejects; idempotent.
+   */
+  dispose(): Promise<void>;
 }
 
 export interface PendingFileJournalOptions {
@@ -883,7 +897,25 @@ export interface PendingFileJournalOptions {
   readonly compactAtStart?: boolean;
   /** QA-2.1-8: the compaction also drops unheld entries and `inflight` records older than this (default: no age limit). */
   readonly ttlMs?: number;
+  /** QA-2.1-22: told once when the compaction at start fails (`compactionError`); a throwing sink is ignored. */
+  readonly warn?: (message: string) => void;
+  /**
+   * QA-2.1-22: another live process's writer mark older than this is stale (pid reuse) and does not block the compaction
+   * at start; default WRITER_MARK_STALE_MS. A writer refreshes its mark at most every quarter of it while it appends.
+   */
+  readonly writerStaleMs?: number;
+  /** Injected clock for the writer marks; default Date.now. */
+  readonly now?: () => number;
 }
+
+/**
+ * QA-2.1-22: a writer mark of another live pid older than this does not block the compaction at start (a reused pid never
+ * re-stamps it). A live writer re-stamps its mark every quarter of it while it appends.
+ */
+export const WRITER_MARK_STALE_MS = 3600_000;
+
+/** QA-2.1-22: the warning of a failed compaction at start (once per journal path and process). */
+export const PENDING_COMPACTION_FAILED = "pending journal compaction failed";
 
 /** The message of a `load` that finds the journal gone after this process knew it (QA-2.1-8). */
 export const PENDING_JOURNAL_VANISHED = "pending journal vanished";
@@ -904,48 +936,78 @@ export function resolvePendingJournalDir(env: { readonly homedir: string; readon
 }
 
 /**
- * Phase 2.1 section 11: the append-only `pending.jsonl` (v2 only). One writer per process; appends are
- * serialized, and `fsync: true` appends reach the disk before they resolve. Appends never recreate a vanished
- * file: once this process knew the file, a missing one fails the append and the next `load` (QA-2.1-8).
+ * Phase 2.1 section 11: the append-only `pending.jsonl` (v2 only). One writer per process: every journal
+ * created for the same resolved path in this process shares one append queue, one compaction and one writer
+ * mark (QA-2.1-15), so two plugin instances can never drop each other's records. Appends are serialized, and
+ * `fsync: true` appends reach the disk before they resolve. Appends never recreate a vanished file: once this
+ * process knew the file, a missing one fails the append and the next `load` (QA-2.1-8) until `recreate`
+ * rewrites it from the caller's state (QA-2.1-16).
  */
 export function createPendingFileJournal(path: string, options: PendingFileJournalOptions = {}): PendingFileJournal {
-  let tail: Promise<unknown> = Promise.resolve();
-  let madeDir = false;
-  /** This process read, wrote or compacted the file: from now on a missing file has vanished. */
-  let known = false;
-  /** QA-2.1-8: the read in flight (shared) and the last read with the file's size and mtime (not read again while unchanged). */
-  let loading: Promise<readonly PendingRecord[]> | undefined;
-  let lastRead: { size: number; mtimeMs: number; records: readonly PendingRecord[] } | undefined;
-  let compactionScheduled = false;
-  let compactionError: string | undefined;
+  const key = sharedJournalKey(path);
+  let found = SHARED_JOURNALS.get(key);
+  if (found === undefined) {
+    found = {
+      path: resolve(path),
+      tail: Promise.resolve(),
+      madeDir: false,
+      known: false,
+      loading: undefined,
+      lastRead: undefined,
+      compactionScheduled: false,
+      compactionError: undefined,
+      compactionWarned: false,
+      markAt: undefined,
+      refs: 0,
+    };
+    SHARED_JOURNALS.set(key, found);
+  }
+  const state: SharedJournal = found;
+  state.refs += 1;
+  let disposed = false;
+  const file = state.path;
+  const now = options.now ?? Date.now;
+  const staleMs = options.writerStaleMs ?? WRITER_MARK_STALE_MS;
+  const writersDir = join(dirname(file), PENDING_WRITERS_DIRNAME);
+  const markName = `${process.pid}.${PROCESS_CLAIM_TOKEN}`;
+
   async function ensureFile(): Promise<void> {
-    if (!madeDir) {
-      await mkdir(dirname(path), { recursive: true });
-      madeDir = true;
+    if (!state.madeDir) {
+      await mkdir(dirname(file), { recursive: true });
+      state.madeDir = true;
     }
     // `wx` creates the file once; afterwards the append below must find it ("a" alone would recreate a vanished file).
-    if (!known) {
+    if (!state.known) {
       try {
-        await writeFile(path, "", { flag: "wx" });
+        await writeFile(file, "", { flag: "wx" });
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       }
-      known = true;
+      state.known = true;
       return;
     }
     try {
-      await stat(path);
+      await stat(file);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(PENDING_JOURNAL_VANISHED);
       throw error;
     }
   }
+  /** Queues `work` behind every append, compaction and rewrite of this path in this process; the queue survives a failure. */
+  function enqueue(work: () => Promise<void>): Promise<void> {
+    const write = state.tail.then(work);
+    state.tail = write.catch((error: unknown) => {
+      void error; // surfaced to this caller below; the chain keeps going for the next append
+    });
+    return write;
+  }
   function append(record: PendingRecord, opts?: { fsync?: boolean }): Promise<void> {
     const line = `${JSON.stringify(record)}\n`;
-    const write = tail.then(async () => {
+    return enqueue(async () => {
       await ensureFile();
+      await refreshMark();
       if (opts?.fsync === true) {
-        const handle = await open(path, "a");
+        const handle = await open(file, "a");
         try {
           await handle.appendFile(line, "utf8");
           await handle.sync();
@@ -953,36 +1015,57 @@ export function createPendingFileJournal(path: string, options: PendingFileJourn
           await handle.close();
         }
       } else {
-        await appendFile(path, line, "utf8");
+        await appendFile(file, line, "utf8");
       }
     });
-    tail = write.catch((error: unknown) => {
-      void error; // surfaced to this caller below; the chain keeps going for the next append
-    });
-    return write;
   }
   return {
     append,
     async flush() {
-      await tail;
+      await state.tail;
     },
     compact(records) {
       // `replaceFile` also forgets the last read: a rewrite with the same size and mtime must still be read again.
-      const write = tail.then(() => replaceFile(records));
-      tail = write.catch((error: unknown) => {
-        void error; // surfaced to this caller below; the chain keeps going for the next append
+      return enqueue(() => replaceFile(records));
+    },
+    recreate(records) {
+      // QA-2.1-16: the writers directory may have vanished with the journal, so the mark is written again right away.
+      return enqueue(async () => {
+        await replaceFile(records);
+        state.markAt = undefined;
+        await refreshMark();
       });
-      return write;
     },
     load() {
       // QA-2.1-8: concurrent loads share one read, and a file unchanged since the last read (size and mtime) is not read again.
-      loading ??= readRecords().finally(() => {
-        loading = undefined;
-      });
+      const loading = (state.loading ??= readRecords().finally(() => {
+        state.loading = undefined;
+      }));
       return loading.then((records) => [...records]);
     },
     get compactionError() {
-      return compactionError;
+      return state.compactionError;
+    },
+    dispose() {
+      if (disposed) return Promise.resolve();
+      disposed = true;
+      state.refs -= 1;
+      if (state.refs > 0) return Promise.resolve();
+      const done = state.tail
+        .then(async () => {
+          // Another journal of this path may have been created while the queue drained: it keeps the mark.
+          if (state.refs > 0) return;
+          state.markAt = undefined;
+          await rm(join(writersDir, markName), { force: true });
+        })
+        .catch((error: unknown) => {
+          void error; // a mark that cannot be removed dies with this pid (a dead pid's mark is stale) or ages out
+        })
+        .finally(() => {
+          if (state.refs === 0 && SHARED_JOURNALS.get(key) === state) SHARED_JOURNALS.delete(key);
+        });
+      state.tail = done;
+      return done;
     },
   };
 
@@ -990,89 +1073,190 @@ export function createPendingFileJournal(path: string, options: PendingFileJourn
     let info: { size: number; mtimeMs: number };
     let text: string;
     try {
-      info = await stat(path);
-      if (lastRead !== undefined && lastRead.size === info.size && lastRead.mtimeMs === info.mtimeMs) return lastRead.records;
-      text = await readFile(path, "utf8");
+      info = await stat(file);
+      const last = state.lastRead;
+      if (last !== undefined && last.size === info.size && last.mtimeMs === info.mtimeMs) {
+        scheduleCompaction();
+        return last.records;
+      }
+      text = await readFile(file, "utf8");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        if (known) throw new Error(PENDING_JOURNAL_VANISHED);
+        if (state.known) throw new Error(PENDING_JOURNAL_VANISHED);
         return [];
       }
       throw error;
     }
-    known = true;
+    state.known = true;
     const records = parsePendingText(text);
-    lastRead = { size: info.size, mtimeMs: info.mtimeMs, records };
-    if (!compactionScheduled && options.compactAtStart !== false) {
-      compactionScheduled = true;
-      void compactAtStart();
-    }
+    state.lastRead = { size: info.size, mtimeMs: info.mtimeMs, records };
+    scheduleCompaction();
     return records;
   }
 
+  function scheduleCompaction(): void {
+    if (state.compactionScheduled || options.compactAtStart === false) return;
+    state.compactionScheduled = true;
+    void compactAtStart();
+  }
+
   /**
-   * QA-2.1-8: the first successful load compacts the journal (`compactPendingRecords`), behind this process's appends, and only
-   * while no other live process writes the same journal (its `pending.writers` mark): another writer's append could land in the
-   * file the rename replaces. A failure keeps the journal as it was (`compactionError`).
+   * QA-2.1-8: the first successful load in this process compacts the journal (`compactPendingRecords`), behind every append of
+   * this process (one queue per path, QA-2.1-15), and only while no other live process holds a fresh writer mark on the same
+   * journal (`pending.writers`): another process's append could land in the file the rename replaces. A failure keeps the
+   * journal as it was (`compactionError`, told once to `warn`, QA-2.1-22).
    */
   function compactAtStart(): Promise<void> {
-    const write = tail.then(async () => {
+    const write = state.tail.then(async () => {
       if (await otherLiveWriter()) return;
       let text: string;
       try {
-        text = await readFile(path, "utf8");
+        text = await readFile(file, "utf8");
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
         throw error;
       }
       const records = parsePendingText(text);
-      const kept = compactPendingRecords(records, { now: Date.now(), ...(options.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }) });
+      const kept = compactPendingRecords(records, { now: now(), ...(options.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }) });
       if (kept.length >= records.length) return;
       await replaceFile(kept);
     });
-    tail = write.catch((error: unknown) => {
-      compactionError = error instanceof Error ? error.message : String(error);
+    const settled = write.catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      state.compactionError = message;
+      if (state.compactionWarned) return;
+      state.compactionWarned = true;
+      try {
+        options.warn?.(`${PENDING_COMPACTION_FAILED}: ${message}`);
+      } catch (warnError) {
+        void warnError; // a throwing warn sink is ignored
+      }
     });
-    return write.catch((error: unknown) => {
-      compactionError = error instanceof Error ? error.message : String(error);
-    });
+    state.tail = settled;
+    return settled;
   }
 
   async function replaceFile(records: readonly PendingRecord[]): Promise<void> {
     const body = records.map((record) => `${JSON.stringify(record)}\n`).join("");
-    await mkdir(dirname(path), { recursive: true });
-    madeDir = true;
-    const temp = `${path}.${process.pid}.compact`;
-    const handle = await open(temp, "w");
+    await mkdir(dirname(file), { recursive: true });
+    state.madeDir = true;
+    const temp = `${file}.${process.pid}.compact`;
     try {
-      await handle.writeFile(body, "utf8");
-      await handle.sync();
-    } finally {
-      await handle.close();
+      const handle = await open(temp, "w");
+      try {
+        await handle.writeFile(body, "utf8");
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      await rename(temp, file);
+    } catch (error) {
+      // QA-2.1-22: a failed write or rename leaves no temp file behind.
+      await rm(temp, { force: true }).catch((cleanupError: unknown) => {
+        void cleanupError; // the next rewrite opens the temp file with "w" and replaces it
+      });
+      throw error;
     }
-    await rename(temp, path);
-    known = true;
-    lastRead = undefined;
+    state.known = true;
+    state.lastRead = undefined;
   }
 
-  /** Marks this process as a writer of the journal (once) and reports whether another live process marked itself too. */
+  /** QA-2.1-22: writes this process's writer mark `{pid, token, at}` (`<pid>.<token>`, one per process and path). */
+  async function writeMark(): Promise<void> {
+    await mkdir(writersDir, { recursive: true });
+    const at = now();
+    await writeFile(join(writersDir, markName), `${JSON.stringify({ pid: process.pid, token: PROCESS_CLAIM_TOKEN, at })}\n`);
+    state.markAt = at;
+  }
+
+  /**
+   * QA-2.1-22: a writer re-stamps its mark while it appends (at most every quarter of `writerStaleMs`), so another process never
+   * takes a live writer's mark for a reused pid's. Best effort: a mark that cannot be written is tried again at the next append.
+   */
+  async function refreshMark(): Promise<void> {
+    if (state.markAt !== undefined && now() - state.markAt < staleMs / 4) return;
+    try {
+      await writeMark();
+    } catch (error) {
+      void error; // the append itself must not fail for its mark; the next append tries again
+    }
+  }
+
+  /**
+   * Marks this process as a writer of the journal and reports whether another live process holds a fresh mark too
+   * (QA-2.1-22): a dead pid's mark, and one of this pid from an earlier process (another token), is removed; a live pid's mark
+   * older than `writerStaleMs` (a reused pid: a live writer re-stamps its mark while it appends) does not block.
+   */
   async function otherLiveWriter(): Promise<boolean> {
-    const dir = join(dirname(path), "pending.writers");
-    await mkdir(dir, { recursive: true });
-    const mine = `${process.pid}.${PROCESS_CLAIM_TOKEN}`;
-    await writeFile(join(dir, mine), `${JSON.stringify({ pid: process.pid, at: Date.now() })}\n`);
+    await writeMark();
     let other = false;
-    for (const name of await readdir(dir)) {
-      if (name === mine) continue;
+    for (const name of await readdir(writersDir)) {
+      if (name === markName) continue;
       const pid = Number.parseInt(name.split(".")[0] ?? "", 10);
       if (Number.isInteger(pid) && pid > 0 && pid !== process.pid && isAlive(pid)) {
-        other = true;
+        const age = await markAge(join(writersDir, name));
+        if (age !== undefined && age <= staleMs) other = true;
         continue;
       }
-      // A dead writer's mark (or one of this pid from an earlier process) is stale.
-      await rm(join(dir, name), { force: true });
+      await rm(join(writersDir, name), { force: true });
     }
     return other;
+  }
+
+  /** The age of a writer mark (its `at`, else its mtime); undefined when it is gone. */
+  async function markAge(markPath: string): Promise<number | undefined> {
+    let text: string;
+    let mtimeMs: number;
+    try {
+      mtimeMs = (await stat(markPath)).mtimeMs;
+      text = await readFile(markPath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+    return now() - (parseMarkAt(text) ?? mtimeMs);
+  }
+}
+
+/** QA-2.1-15: the state every journal of one path in this process shares (one append queue, one compaction, one mark). */
+interface SharedJournal {
+  readonly path: string;
+  tail: Promise<unknown>;
+  madeDir: boolean;
+  /** This process read, wrote or compacted the file: from now on a missing file has vanished (until `recreate`). */
+  known: boolean;
+  /** QA-2.1-8: the read in flight (shared) and the last read with the file's size and mtime (not read again while unchanged). */
+  loading: Promise<readonly PendingRecord[]> | undefined;
+  lastRead: { size: number; mtimeMs: number; records: readonly PendingRecord[] } | undefined;
+  compactionScheduled: boolean;
+  compactionError: string | undefined;
+  compactionWarned: boolean;
+  /** When this process last wrote its writer mark; undefined: not written since the start, `recreate` or `dispose`. */
+  markAt: number | undefined;
+  /** Journal objects of this path in this process that are not disposed. */
+  refs: number;
+}
+
+/** QA-2.1-15: one shared journal state per resolved path in this process (case-insensitive on Windows). */
+const SHARED_JOURNALS = new Map<string, SharedJournal>();
+
+/** QA-2.1-22: the directory of the writer marks, next to `pending.jsonl`. */
+export const PENDING_WRITERS_DIRNAME = "pending.writers";
+
+function sharedJournalKey(path: string): string {
+  const full = resolve(path);
+  return process.platform === "win32" ? full.toLowerCase() : full;
+}
+
+function parseMarkAt(text: string): number | undefined {
+  try {
+    const rec: unknown = JSON.parse(text);
+    if (typeof rec !== "object" || rec === null) return undefined;
+    const at = (rec as Record<string, unknown>).at;
+    return typeof at === "number" && Number.isFinite(at) ? at : undefined;
+  } catch (error) {
+    void error; // a torn mark: its mtime decides
+    return undefined;
   }
 }
 

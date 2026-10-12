@@ -18,7 +18,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { PENDING_RELOAD_RETRY_MS } from "../../src/compat/v2-hooks";
+import { PENDING_RELOAD_RETRY_MS, reloadFailedResumeText } from "../../src/compat/v2-hooks";
 import { bootBgHost, restoreEnv, type BgHost, type ToolEvent } from "../helpers/v2-bg-host";
 
 let host: BgHost | undefined;
@@ -99,8 +99,14 @@ function ended(child: string, kind: "succeeded" | "failed" | "interrupted" = "su
   return { type: `session.execution.${kind}`, id: `ev-end-${child}-${kind}`, created: 2, data: { sessionID: child } };
 }
 
+/** QA-2.1-18: the child's last assistant message ended its step (a finish reason and a completed time): it is an end. */
 function childSays(h: BgHost, child: string, text: string): void {
-  h.childContext.set(child, [{ role: "assistant", content: [{ type: "text", text }] }]);
+  h.childContext.set(child, [{ role: "assistant", content: [{ type: "text", text }], finish: "stop", time: { created: 1, completed: 2 } }]);
+}
+
+/** QA-2.1-18: the child was cut mid-step: partial text, no finish reason, no completed time. */
+function childCutMidStep(h: BgHost, child: string, text: string): void {
+  h.childContext.set(child, [{ role: "assistant", content: [{ type: "text", text }], time: { created: 1 } }]);
 }
 
 function holdJournal(handle: string, child: string, callID: string): string {
@@ -217,6 +223,20 @@ describe("background dispatch: acknowledgement, in-flight list, completion annot
       expect(state).not.toContain("In flight (background)");
       expect(state).not.toContain("router guarantees pending");
     }, { timeout: 5000, interval: 50 });
+  });
+
+  it("QA-2.1-21: the processing an end event starts is tracked: settled() (and dispose) wait for it, no polling", async () => {
+    const h = await boot("auto");
+    h.emit(created(CHILD, ORCH));
+    const call = await h.before(dispatch({ background: true }));
+    await h.after({ ...call, status: "completed", result: structuredClone(RUNNING) });
+    await request(h, [user("continue")]); // the root request that teaches the adapter the parent is a root
+    h.childContext.set(CHILD, [{ type: "assistant", id: "m2", content: [{ type: "text", text: "tracked result" }] }]);
+    h.emit({ type: "session.execution.succeeded", id: "ev-end-tracked", created: 2, data: { sessionID: CHILD } });
+    await h.settled();
+    const state = tail(await request(h, [user("continue")]));
+    expect(state).not.toContain("In flight (background)");
+    expect(state).not.toContain("router guarantees pending");
   });
 
   it("a completion element with further attributes still completes a child whose context could not be read", async () => {
@@ -632,6 +652,77 @@ describe("the pending journal fails under a held dispatch (QA-2.1-3, QA-2.1-8)",
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("QA-2.1-20: while the journal is not reloaded, a Code Mode execute that resumes an unknown session is refused like a subagent resume", async () => {
+    const h = await boot("auto");
+    h.emit(created(CHILD, ORCH));
+    await h.drain();
+    const call = await h.before(dispatch({ background: true }));
+    await h.after({ ...call, status: "completed", result: structuredClone(RUNNING) });
+    rmSync(h.journalPath);
+    const second = "child-2";
+    h.sessions.set(second, { parentID: ORCH });
+    h.emit(created(second, ORCH));
+    await h.drain();
+    // The next journal write finds the journal gone: the process fails closed (reload failed).
+    const next = await h.before(dispatch({ background: true }));
+    await h.after({ ...next, status: "completed", result: { output: { sessionID: second, status: "running", output: "Working" }, content: "Working", metadata: { sessionID: second } } });
+    await h.settled();
+    const execute = (code: string): ToolEvent => ({ sessionID: ORCH, agent: "build", messageID: "m-exec", id: `call-exec-${code.length}`, tool: "execute", input: { code } });
+    await expect(h.before(execute(`await tools.subagent({ agent: "general", prompt: "continue", sessionID: "child-unknown" });`)))
+      .rejects.toThrow(reloadFailedResumeText("child-unknown"));
+    await expect(h.before(execute(`await tools.subagent({ agent: "general", prompt: "continue", "task_id": 'child-unknown' });`)))
+      .rejects.toThrow(reloadFailedResumeText("child-unknown"));
+    // The same check as for a subagent resume.
+    await expect(h.before({ ...dispatch({ background: true }), input: { agent: "general", description: "x", prompt: "continue", sessionID: "child-unknown" } }))
+      .rejects.toThrow(reloadFailedResumeText("child-unknown"));
+    // Code that resumes nothing goes through.
+    await expect(h.before(execute(`await tools.subagent({ agent: "general", prompt: "a fresh task" });`))).resolves.toBeDefined();
+  });
+});
+
+describe("a restored dispatch's child end needs a completion marker (QA-2.1-18)", () => {
+  const inflightRecord = (callID: string): string =>
+    `${JSON.stringify({ v: 1, kind: "inflight", key: `${CHILD}\u0000${callID}`, callID, parentSessionID: ORCH, childSessionID: CHILD, label: "fast \"x\"", agent: "fast", description: "x", verifying: false, verificationMode: "none", hold: null, at: Date.now() })}\n`;
+  const lostWakes = (h: BgHost) => h.synthetic.filter((s) => s.resume === true && s.sessionID === ORCH && s.text.includes("was lost in a restart"));
+
+  it("a child cut mid-step (partial text, no finish reason, no completed time) is lost, not gated on its partial text", async () => {
+    const h = await boot("auto", { journalText: inflightRecord("call-cut"), sessions: { "child-event": { parentID: ORCH } } });
+    childCutMidStep(h, CHILD, "Half of the ans");
+    h.emit(created("child-event", ORCH));
+    await h.settled();
+    await vi.waitFor(() => expect(lostWakes(h)).toHaveLength(1));
+  });
+
+  it("a child whose newest assistant message still has a running tool part is lost", async () => {
+    const h = await boot("auto", { journalText: inflightRecord("call-tool"), sessions: { "child-event": { parentID: ORCH } } });
+    h.childContext.set(CHILD, [{
+      type: "assistant", id: "m2", time: { created: 1, completed: 2 },
+      content: [{ type: "text", text: "Let me run the tests" }, { type: "tool", id: "t1", state: { status: "running" } }],
+    }]);
+    h.emit(created("child-event", ORCH));
+    await h.settled();
+    await vi.waitFor(() => expect(lostWakes(h)).toHaveLength(1));
+  });
+
+  it("a child whose newest step ended in tool calls (it meant to go on) is lost", async () => {
+    const h = await boot("auto", { journalText: inflightRecord("call-steps"), sessions: { "child-event": { parentID: ORCH } } });
+    h.childContext.set(CHILD, [{ type: "assistant", id: "m2", finish: "tool-calls", content: [{ type: "text", text: "Next I will edit" }] }]);
+    h.emit(created("child-event", ORCH));
+    await h.settled();
+    await vi.waitFor(() => expect(lostWakes(h)).toHaveLength(1));
+  });
+
+  it("a child whose newest assistant message completed its step succeeded: it is processed, never reported lost", async () => {
+    const h = await boot("auto", { journalText: inflightRecord("call-done"), sessions: { "child-event": { parentID: ORCH } } });
+    childSays(h, CHILD, "The whole answer.");
+    h.emit(created("child-event", ORCH));
+    await h.settled();
+    await vi.waitFor(async () => {
+      expect(tail(await request(h, [user("continue")]))).toContain("[router] Completed since your last turn:");
+    });
+    expect(lostWakes(h)).toEqual([]);
   });
 });
 

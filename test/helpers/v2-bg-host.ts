@@ -5,7 +5,7 @@
  * (`src/index.ts`, `routerHost: "v2"`) behind the REAL adapter (`registerV2Hooks`). The host owns:
  *  - the tool hooks (`execute.before` / `execute.after`) and session hooks (`context`, `prompt`, `compaction`) the adapter registers;
  *  - an event queue the adapter's event loop consumes (`emit`), with a `drain` that waits until the loop took everything;
- *  - a session table (parent, directory) and `session.context` results per child;
+ *  - a session table (parent, directory), sessions whose `session.get` fails, and `session.context` results per child;
  *  - every `session.synthetic` call, recorded.
  * Nothing sleeps: waits are microtask turns or an explicit fake clock of the test.
  */
@@ -58,6 +58,8 @@ export interface BgHost {
   /** QA-2.1-8: the pending journal of this host (the durable per-user state dir inside `home`). */
   journalPath: string;
   sessions: Map<string, SessionSpec>;
+  /** QA-2.1-25: sessions whose `session.get` lookup throws (a transient host failure) while they are in the set. */
+  failingSessionLookups: Set<string>;
   /** `session.context(child)` answers; `undefined` = an empty context. */
   childContext: Map<string, unknown[]>;
   synthetic: SyntheticCall[];
@@ -124,10 +126,10 @@ export async function bootBgHost(options: BootOptions = {}): Promise<BgHost> {
   mkdirSync(project, { recursive: true });
   mkdirSync(dirname(overridePath()), { recursive: true });
   // QA-2.1-8: pending.jsonl lives in the durable per-user state dir (`resolvePendingJournalDir`), here inside the test's home (a
-  // restart re-uses `options.home`). The outcome store is pointed at the same dir, so the journal is found there whether the
-  // plugin resolves it from the per-user dir or next to the outcome store.
+  // restart re-uses `options.home`). QA-2.1-26: the outcome store has its own dir, separate from the journal's, so a plugin that
+  // fell back to a journal next to the outcome store would miss `journalPath` and the tests would see it.
   const journalDir = resolvePendingJournalDir({ homedir: home, platform: process.platform, xdgStateHome: process.env.XDG_STATE_HOME });
-  const outcomes = journalDir;
+  const outcomes = join(home, "outcomes");
   const journalPath = join(journalDir, "pending.jsonl");
   const given = (options.overrides ?? {}) as { routing?: Record<string, unknown> };
   writeFileSync(overridePath(), JSON.stringify({ ...given, routing: { ...(given.routing ?? {}), outcomes: { path: outcomes } } }), "utf-8");
@@ -151,7 +153,9 @@ export async function bootBgHost(options: BootOptions = {}): Promise<BgHost> {
   };
   const noop = async () => register();
 
+  const failingSessionLookups = new Set<string>();
   const sessionGet = async ({ sessionID }: { sessionID: string }) => {
+    if (failingSessionLookups.has(sessionID)) throw new Error(`session ${sessionID} lookup failed (fake host)`);
     const spec = sessions.get(sessionID);
     return {
       id: sessionID,
@@ -277,6 +281,7 @@ export async function bootBgHost(options: BootOptions = {}): Promise<BgHost> {
     project,
     journalPath,
     sessions,
+    failingSessionLookups,
     childContext,
     synthetic,
     deliveries,

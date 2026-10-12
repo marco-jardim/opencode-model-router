@@ -823,7 +823,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     : undefined;
   const pendingFile = pendingDir === undefined
     ? undefined
-    : createPendingFileJournal(join(pendingDir, "pending.jsonl"), { ttlMs: DEFAULT_PENDING_TTL_MS });
+    : createPendingFileJournal(join(pendingDir, "pending.jsonl"), {
+        ttlMs: DEFAULT_PENDING_TTL_MS,
+        // QA-2.1-22: a failed start-up compaction is told once (the journal stays as it was).
+        warn: (message) => logger.warn(`[router] ${message}`),
+      });
   /** Section 11.3: the exclusive per-session claim files of the journal's sessions (v2 only). */
   const pendingClaimsDir = pendingDir === undefined ? undefined : join(pendingDir, "pending.claims");
   /** QA-2.1-13: the sessions whose claim this process took at adoption; re-stamped while held, released on delete and dispose. */
@@ -1502,6 +1506,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       await ingest?.dispose();
       await annotateRuntime?.dispose();
       await attemptRecorder?.dispose();
+      // QA-2.1-22 (v2 only): after the last append of this instance; the last journal of the path removes this process's writer mark.
+      await pendingFile?.dispose();
       await logger.flush();
     },
     tool: {
@@ -3581,9 +3587,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       if (pendingFile === undefined) return;
       // `inflight` and `hold` records are fsync'd (memo §11.2); the rest only when the caller asks.
       const fsync = opts?.fsync === true || record.kind === "inflight" || record.kind === "hold";
-      // The file journal makes its directory once; a directory removed since (a cleaned state directory) must not turn every
-      // later append (`processed`, `posting`, `posted`) into an ENOENT, so it is made again before each append.
-      if (pendingDir !== undefined && !existsSync(pendingDir)) mkdirSync(pendingDir, { recursive: true });
+      // QA-2.1-23: a vanished journal (or state directory) fails the append; it is never recreated behind the reload's back.
       await pendingFile.append(record, fsync ? { fsync: true } : undefined);
     },
     hasProcessed: (key) => processedKeys.has(key),
@@ -3644,6 +3648,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     },
     reserveHeld(parentSessionID, _callID) {
       return pending.reserveHandle(parentSessionID);
+    },
+    // QA-2.1-14: a held dispatch that ends without a registered entry (failed, interrupted, ack failed) frees its slot at once.
+    releaseHeld(handle) {
+      pending.releaseHandle(handle);
     },
     async finish(fin: FinishInput): Promise<FinishResult> {
       const args = taskArgsByCall.get(fin.callID) ?? {};

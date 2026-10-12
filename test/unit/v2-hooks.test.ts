@@ -3,7 +3,7 @@ import type { Context } from "@opencode/plugin/promise/plugin";
 import { Agent } from "@opencode/plugin";
 import type { Hooks } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
-import { registerV2Hooks, v2Instructions } from "../../src/compat/v2-hooks";
+import { registerV2Hooks, resumeTargetsOf, v2Instructions } from "../../src/compat/v2-hooks";
 import ModelRouterPlugin from "../../src/index";
 import { invalidateConfigCache, loadConfig, overridePath } from "../../src/router/config";
 import { getActiveTiers } from "../../src/router/protocol";
@@ -37,6 +37,32 @@ afterEach(async () => {
 // The two eviction tests drive the real execute.before 1000+ times (each call reloads the config from disk, ~4 ms): ~4-5 s on an
 // idle machine, so the default 5 s is flaky under load. The 1000 bound is the behaviour under test, so the loop cannot shrink.
 const BOUNDED_LIMIT_TIMEOUT_MS = 30_000;
+
+describe("QA-2.1-20: the sessions a call may resume (reload-failed refusal)", () => {
+  it("a subagent call names them by sessionID and task_id", () => {
+    expect(resumeTargetsOf("subagent", { sessionID: "ses_a", task_id: "ses_b", prompt: "go" }, "parent")).toEqual(["ses_a", "ses_b"]);
+    expect(resumeTargetsOf("subagent", { prompt: "go", sessionID: "" }, "parent")).toEqual([]);
+  });
+
+  it("Code Mode execute code names them by string literals given to sessionID / task_id", () => {
+    const code = [
+      `await tools.subagent({ agent: "general", prompt: "continue", sessionID: "ses_held" });`,
+      `await tools.subagent({ "task_id": 'ses_other', prompt: "more" });`,
+      "const task_id = `ses_third`;",
+      `await tools.subagent({ sessionID: "ses_held", prompt: "again" });`,
+    ].join("\n");
+    expect(resumeTargetsOf("execute", { code }, "parent")).toEqual(["ses_held", "ses_other", "ses_third"]);
+    // A computed template literal is no known session either: it is named as written, so the refusal fails closed on it.
+    expect(resumeTargetsOf("execute", { code: "await tools.subagent({ sessionID: `${previous}`, prompt: \"go\" });" }, "parent")).toEqual(["${previous}"]);
+  });
+
+  it("execute code without a resume, or naming only the caller, resumes nothing; other tools resume nothing", () => {
+    expect(resumeTargetsOf("execute", { code: `await tools.subagent({ agent: "general", prompt: "fresh" });` }, "parent")).toEqual([]);
+    expect(resumeTargetsOf("execute", { code: `await tools.read({ sessionID: "parent", filePath: "a.ts" });` }, "parent")).toEqual([]);
+    expect(resumeTargetsOf("execute", { code: 42 }, "parent")).toEqual([]);
+    expect(resumeTargetsOf("read", { sessionID: "ses_a" }, "parent")).toEqual([]);
+  });
+});
 
 describe("lease guard: glob/grep results as the v2 host delivers them (Phase 2.1 gap 4)", () => {
   async function fixtureGuard() {

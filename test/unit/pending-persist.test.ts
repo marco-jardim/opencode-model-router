@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -14,6 +14,9 @@ import {
   HELD_TTL_REASON,
   MAX_DORMANT_POSTED_HOLDS,
   PENDING_JOURNAL_VANISHED,
+  PENDING_COMPACTION_FAILED,
+  PENDING_WRITERS_DIRNAME,
+  WRITER_MARK_STALE_MS,
   processedKeyOf,
   REFERENCE_UNRESTORED_REASON,
   refreshPendingClaims,
@@ -328,6 +331,167 @@ describe("pending.jsonl journal (memo 11.1, 11.2)", () => {
     void journal.append(rec("inflight", { callID: "c1" }));
     await journal.compact([rec("inflight", { callID: "c9" })]);
     expect((await journal.load()).map((r) => r.callID)).toEqual(["c9"]);
+  });
+
+  it("QA-2.1-15: two journals of one path in one process share one queue: appends around the other's start-up compaction are kept", async () => {
+    const file = join(dir, "pending.jsonl");
+    const closed = [rec("inflight", { callID: "c0", parent: "p1", child: "k0", at: NOW }), rec("processed", { callID: "c0", child: "k0", at: NOW })];
+    writeFileSync(file, closed.map((r) => `${JSON.stringify(r)}\n`).join(""));
+    const first = createPendingFileJournal(file);
+    // Another plugin instance of the same process, with another spelling of the same path.
+    const second = createPendingFileJournal(join(dir, ".", "pending.jsonl"));
+    const open = (callID: string) => rec("inflight", { callID, parent: "p1", child: `k-${callID}`, at: NOW });
+    const before = Array.from({ length: 5 }, (_, i) => first.append(open(`a${i}`), { fsync: true }));
+    // The second instance's first load schedules the start-up compaction (closed records go) while the first keeps appending.
+    const loading = second.load();
+    const during = Array.from({ length: 5 }, (_, i) => first.append(open(`b${i}`), { fsync: i % 2 === 0 }));
+    await loading;
+    const after = Array.from({ length: 5 }, (_, i) => first.append(open(`c${i + 1}`), { fsync: true }));
+    await Promise.all([...before, ...during, ...after]);
+    // One queue: the first instance's flush also waits for the compaction the second one scheduled.
+    await first.flush();
+    expect(first.compactionError).toBeUndefined();
+    expect(second.compactionError).toBeUndefined();
+    const onDisk = readFileSync(file, "utf8").split("\n").filter((l) => l !== "").map((l) => (JSON.parse(l) as PendingRecord).callID);
+    const expected = [...["a", "b"].flatMap((p) => Array.from({ length: 5 }, (_, i) => `${p}${i}`)), ...Array.from({ length: 5 }, (_, i) => `c${i + 1}`)];
+    // Compacted (the closed c0 pair is gone) and nothing the first instance fsync'd or appended is lost.
+    expect(onDisk).not.toContain("c0");
+    expect([...onDisk].sort()).toEqual([...expected].sort());
+    expect((await first.load()).map((r) => r.callID).sort()).toEqual([...expected].sort());
+    // Exactly one writer mark for this process, whatever the number of journals.
+    expect(readdirSync(join(dir, PENDING_WRITERS_DIRNAME)).filter((name) => name.startsWith(`${process.pid}.`))).toHaveLength(1);
+  });
+
+  it("QA-2.1-16: recreate rewrites a vanished journal from the caller's records; later loads and appends succeed again", async () => {
+    const stateDir = join(dir, "state");
+    const file = join(stateDir, "pending.jsonl");
+    const journal = createPendingFileJournal(file, { compactAtStart: false });
+    await journal.append(rec("hold", { handle: "vrf_1" }), { fsync: true });
+    // The whole state directory is cleaned: the journal has vanished and stays fail closed.
+    rmSync(stateDir, { recursive: true, force: true });
+    await expect(journal.load()).rejects.toThrow(PENDING_JOURNAL_VANISHED);
+    await expect(journal.append(rec("posted", { handle: "vrf_0" }))).rejects.toThrow(PENDING_JOURNAL_VANISHED);
+    await expect(journal.load()).rejects.toThrow(PENDING_JOURNAL_VANISHED);
+    // The caller rewrites it from its in-memory state.
+    await journal.recreate([rec("hold", { handle: "vrf_1" }), rec("inflight", { callID: "c2" })]);
+    expect((await journal.load()).map((r) => r.kind)).toEqual(["hold", "inflight"]);
+    await journal.append(rec("posted", { handle: "vrf_1" }), { fsync: true });
+    expect((await journal.load()).map((r) => r.kind)).toEqual(["hold", "inflight", "posted"]);
+    // Another journal of the same path sees the recreated file, and this process is marked as its writer again.
+    expect((await createPendingFileJournal(file, { compactAtStart: false }).load()).map((r) => r.kind)).toEqual(["hold", "inflight", "posted"]);
+    expect(readdirSync(join(stateDir, PENDING_WRITERS_DIRNAME)).filter((name) => name.startsWith(`${process.pid}.`))).toHaveLength(1);
+    expect(readdirSync(stateDir).filter((name) => name.endsWith(".compact"))).toEqual([]);
+    // A later vanish is detected again (the journal is known).
+    rmSync(file);
+    await expect(journal.load()).rejects.toThrow(PENDING_JOURNAL_VANISHED);
+  });
+
+  it("QA-2.1-16: a recreate that cannot write rejects and keeps the journal fail closed", async () => {
+    const stateDir = join(dir, "state");
+    const file = join(stateDir, "pending.jsonl");
+    const journal = createPendingFileJournal(file, { compactAtStart: false });
+    await journal.append(rec("hold", { handle: "vrf_1" }));
+    rmSync(stateDir, { recursive: true, force: true });
+    writeFileSync(stateDir, "a file where the state directory was");
+    await expect(journal.recreate([rec("hold", { handle: "vrf_1" })])).rejects.toThrow();
+    await expect(journal.append(rec("posted", { handle: "vrf_1" }))).rejects.toThrow();
+    rmSync(stateDir);
+    await expect(journal.load()).rejects.toThrow(PENDING_JOURNAL_VANISHED);
+    await journal.recreate([rec("hold", { handle: "vrf_1" })]);
+    expect((await journal.load()).map((r) => r.handle)).toEqual(["vrf_1"]);
+  });
+
+  it("QA-2.1-22: a writer mark carries pid, token and time; it is removed when the last journal of the path is disposed", async () => {
+    const file = join(dir, "pending.jsonl");
+    const writers = join(dir, PENDING_WRITERS_DIRNAME);
+    const first = createPendingFileJournal(file, { compactAtStart: false });
+    const second = createPendingFileJournal(file, { compactAtStart: false });
+    await first.append(rec("inflight", { callID: "c1" }));
+    const marks = readdirSync(writers).filter((name) => name.startsWith(`${process.pid}.`));
+    expect(marks).toHaveLength(1);
+    const mark = JSON.parse(readFileSync(join(writers, marks[0] ?? ""), "utf8")) as { pid: unknown; token: unknown; at: unknown };
+    expect(mark.pid).toBe(process.pid);
+    expect(typeof mark.token).toBe("string");
+    expect(marks[0]).toBe(`${process.pid}.${String(mark.token)}`);
+    expect(typeof mark.at).toBe("number");
+    // The other instance still writes: the mark stays.
+    await first.dispose();
+    await first.dispose(); // idempotent: it never gives back the other instance's share
+    expect(readdirSync(writers).filter((name) => name.startsWith(`${process.pid}.`))).toHaveLength(1);
+    await second.append(rec("inflight", { callID: "c2" }));
+    await second.dispose();
+    expect(readdirSync(writers).filter((name) => name.startsWith(`${process.pid}.`))).toEqual([]);
+    expect(readFileSync(file, "utf8").split("\n").filter((l) => l !== "")).toHaveLength(2);
+  });
+
+  it("QA-2.1-22: stale writer marks do not block the start-up compaction; a fresh one of another live pid does", async () => {
+    const lines = [rec("inflight", { callID: "c1", parent: "p1", child: "k1", at: NOW }), rec("processed", { callID: "c1", child: "k1", at: NOW })];
+    const body = lines.map((r) => `${JSON.stringify(r)}\n`).join("");
+    const linesIn = (file: string) => readFileSync(file, "utf8").split("\n").filter((l) => l !== "").length;
+    const writers = join(dir, PENDING_WRITERS_DIRNAME);
+    mkdirSync(writers, { recursive: true });
+    const stale = Date.now() - WRITER_MARK_STALE_MS - 60_000;
+    // A dead pid's mark, this pid's mark from an earlier process (another token) and a live pid's mark past the stale age (pid reuse).
+    const deadPid = 2_147_483_646;
+    writeFileSync(join(writers, `${deadPid}.dead`), `${JSON.stringify({ pid: deadPid, token: "dead", at: Date.now() })}\n`);
+    writeFileSync(join(writers, `${process.pid}.earlier`), `${JSON.stringify({ pid: process.pid, token: "earlier", at: Date.now() })}\n`);
+    writeFileSync(join(writers, `${process.ppid}.reused`), `${JSON.stringify({ pid: process.ppid, token: "reused", at: stale })}\n`);
+    const file = join(dir, "pending.jsonl");
+    writeFileSync(file, body);
+    const journal = createPendingFileJournal(file);
+    await journal.load();
+    await journal.flush();
+    expect(journal.compactionError).toBeUndefined();
+    expect(linesIn(file)).toBe(0);
+    const names = readdirSync(writers);
+    expect(names).not.toContain(`${deadPid}.dead`);
+    expect(names).not.toContain(`${process.pid}.earlier`);
+    await journal.dispose();
+
+    // A live pid's fresh mark (by its `at`) still blocks: its append could land in the file the rename replaces.
+    const other = join(dir, "other");
+    const otherWriters = join(other, PENDING_WRITERS_DIRNAME);
+    mkdirSync(otherWriters, { recursive: true });
+    writeFileSync(join(otherWriters, `${process.ppid}.live`), `${JSON.stringify({ pid: process.ppid, token: "live", at: Date.now() })}\n`);
+    const otherFile = join(other, "pending.jsonl");
+    writeFileSync(otherFile, body);
+    const blocked = createPendingFileJournal(otherFile);
+    await blocked.load();
+    await blocked.flush();
+    expect(blocked.compactionError).toBeUndefined();
+    expect(linesIn(otherFile)).toBe(2);
+  });
+
+  it("QA-2.1-22: a failed start-up compaction is told once to the warn sink, for every journal of the path", async () => {
+    const file = join(dir, "pending.jsonl");
+    writeFileSync(file, `${JSON.stringify(rec("processed", { callID: "c1", child: "k1" }))}\n`);
+    // The writers directory cannot be made: the compaction fails and the journal stays as it was.
+    writeFileSync(join(dir, PENDING_WRITERS_DIRNAME), "a file, not a directory");
+    const warn = vi.fn();
+    const first = createPendingFileJournal(file, { warn });
+    const second = createPendingFileJournal(file, { warn });
+    await Promise.all([first.load(), second.load()]);
+    await first.flush();
+    await second.load();
+    await second.flush();
+    expect(first.compactionError).toBeDefined();
+    expect(second.compactionError).toBe(first.compactionError);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]?.[0])).toContain(PENDING_COMPACTION_FAILED);
+    expect(readFileSync(file, "utf8").split("\n").filter((l) => l !== "")).toHaveLength(1);
+    // An append never fails for its writer mark.
+    await first.append(rec("inflight", { callID: "c2" }));
+    expect(readFileSync(file, "utf8").split("\n").filter((l) => l !== "")).toHaveLength(2);
+  });
+
+  it("QA-2.1-22: a failed rename leaves no .compact temp file behind", async () => {
+    const file = join(dir, "pending.jsonl");
+    // The journal path is a directory: the temp file is written, and the rename over the journal fails.
+    mkdirSync(join(file, "occupied"), { recursive: true });
+    const journal = createPendingFileJournal(file, { compactAtStart: false });
+    await expect(journal.compact([rec("inflight", { callID: "c1" })])).rejects.toThrow();
+    expect(readdirSync(dir).filter((name) => name.endsWith(".compact"))).toEqual([]);
+    await journal.flush();
   });
 });
 

@@ -709,11 +709,72 @@ export function reloadFailedResumeText(child: string): string {
   return `[router] Refused: the router could not reload its pending journal, so session ${child} may be held for verification. Resume it after the router recovers (it retries on its own).`;
 }
 
+/** QA-2.1-20: a `sessionID` / `task_id` key given a string literal in Code Mode code (`sessionID: "x"`, `"task_id": 'x'`, `task_id = "x"`). */
+const CODE_RESUME_TARGET = /\b(?:sessionID|task_id)["']?\s*[:=]\s*(["'`])([^"'`\r\n]+)\1/g;
+
+/**
+ * QA-2.1-8 / QA-2.1-20: the sessions a tool call may resume: a `subagent` call's `sessionID` / `task_id`, and for Code Mode
+ * `execute` every string literal its code gives to those keys (the caller's own session excepted: it is not a resume). The
+ * reload-failed refusal reads the same calls `held.refusal` does (`subagent` args and `execute` code).
+ */
+export function resumeTargetsOf(tool: string, args: unknown, caller: string): string[] {
+  if (args === null || typeof args !== "object") return [];
+  if (tool === "subagent") {
+    return ["sessionID", "task_id"].flatMap((key) => {
+      const target: unknown = Reflect.get(args, key);
+      return typeof target === "string" && target !== "" ? [target] : [];
+    });
+  }
+  if (tool !== "execute") return [];
+  const code: unknown = Reflect.get(args, "code");
+  if (typeof code !== "string") return [];
+  const targets = new Set<string>();
+  for (const match of code.matchAll(CODE_RESUME_TARGET)) {
+    const target = match[2];
+    if (target !== undefined && target !== "" && target !== caller) targets.add(target);
+  }
+  return [...targets];
+}
+
 /** QA-2.1-6: what a persisted dispatch's child history says about its end. */
 type ChildEndState = { outcome: "succeeded" | "failed" | "interrupted"; text?: string } | { outcome: "lost"; text?: undefined };
 
-/** QA-2.1-11: a failed session-directory lookup is not repeated for this long (the lease guard calls it per tool call). */
-export const SESSION_DIR_NEGATIVE_TTL_MS = 30_000;
+/**
+ * QA-2.1-18: whether an assistant entry of a child's history ended its step (top level or under `info`): a finish reason other
+ * than a tool-call continuation, or a completed time; and no tool part still `pending` or `running`. A step cut mid-stream has
+ * none of these, and a `tool-calls` finish means the child meant to go on: neither is an end, whatever text it already has.
+ */
+function assistantStepCompleted(message: unknown): boolean {
+  if (message === null || typeof message !== "object") return false;
+  const m = message as Record<string, unknown>;
+  const info = m.info !== null && typeof m.info === "object" ? m.info as Record<string, unknown> : undefined;
+  const parts: readonly unknown[] = Array.isArray(m.content) ? m.content : Array.isArray(m.parts) ? m.parts : [];
+  const toolOpen = parts.some((part) => {
+    if (part === null || typeof part !== "object" || (part as Record<string, unknown>).type !== "tool") return false;
+    const state = (part as Record<string, unknown>).state;
+    const status = state !== null && typeof state === "object" ? (state as Record<string, unknown>).status : state ?? (part as Record<string, unknown>).status;
+    // The v2 tool state is `streaming` | `running` | `completed` | `error` (`pending` is the v1 name of the first).
+    return status === "streaming" || status === "pending" || status === "running";
+  });
+  if (toolOpen) return false;
+  const finish = m.finish ?? info?.finish;
+  if (typeof finish === "string" && finish !== "") return finish !== "tool-calls" && finish !== "unknown";
+  const time = m.time ?? info?.time;
+  // `time.completed` is set once the step ended: epoch millis on the wire, a DateTime once decoded; either counts.
+  const completed = time !== null && typeof time === "object" ? (time as Record<string, unknown>).completed : undefined;
+  return completed !== undefined && completed !== null && completed !== "" && completed !== false;
+}
+
+/**
+ * QA-2.1-11: a failed session-directory lookup is not repeated for this long (the lease guard calls it per tool call).
+ * QA-2.1-25: a failed directory means no lease check and no lease for that call, like a failed kind, so the window is as short.
+ */
+export const SESSION_DIR_NEGATIVE_TTL_MS = 2_000;
+/**
+ * QA-2.1-25: a failed session-kind lookup is not repeated for this long. Short on purpose: the failure answers `unknown` (root
+ * semantics, no lease), so a write in that window is unguarded; the window only spares a burst of tool calls a failing host call each.
+ */
+export const SESSION_KIND_NEGATIVE_TTL_MS = 2_000;
 /** QA-2.1-11: session directories cached (oldest first out). */
 const MAX_SESSION_DIRS = 1000;
 /** QA-2.1-13: parent sessions remembered as adopted (oldest first out). */
@@ -727,7 +788,8 @@ const BACKGROUND_DRAIN_MS = 5_000;
  * work is in flight (verdict posts, recoveries, reloads, including work they start). Lets integration tests await what an
  * adoption or a gate started instead of polling for it; nothing in the plugin reads it.
  */
-export const V2_BACKGROUND_SETTLED: unique symbol = Symbol.for("opencode-model-router.v2.background-settled");
+export const V2_BACKGROUND_SETTLED: unique symbol = Symbol("opencode-model-router.v2.background-settled");
+// QA-2.1-26: a module-private `Symbol()` (not the global registry `Symbol.for`): only code importing this module reaches the seam.
 
 /** The completion elements of a text part that STARTS with one (the host writes a completion as a whole message, C2). */
 function completionElementsOf(text: string): CompletionElement[] {
@@ -1209,16 +1271,18 @@ export async function registerV2Hooks(
     while (sessionKinds.size > 1000) sessionKinds.delete(sessionKinds.keys().next().value!);
   };
   /**
-   * QA-2.1-11: a failed kind lookup is remembered for SESSION_DIR_NEGATIVE_TTL_MS (bounded, like `sessionDirs`), so a tool hook
+   * QA-2.1-11: a failed kind lookup is remembered for SESSION_KIND_NEGATIVE_TTL_MS (bounded, like `sessionDirs`), so a tool hook
    * does not pay a failing host call per call, and it answers `unknown`: root semantics in the lease guard (memo §14.1), child
    * wording in what it says (a child misread as a root must not be told it is the orchestrator).
+   * QA-2.1-25: `unknown` means no lease, so the window is short (not the 30 s of a session directory): a transient host failure
+   * must not let a child write unleased for long; the next hook after the window asks the host again.
    */
   const failedKinds = new Map<string, number>();
   const sessionKindOf = async (sessionID: string): Promise<"root" | "child" | "unknown"> => {
     const known = sessionKinds.get(sessionID);
     if (known !== undefined) return known;
     const failedAt = failedKinds.get(sessionID);
-    if (failedAt !== undefined && Date.now() - failedAt < SESSION_DIR_NEGATIVE_TTL_MS) return "unknown";
+    if (failedAt !== undefined && Date.now() - failedAt < SESSION_KIND_NEGATIVE_TTL_MS) return "unknown";
     try {
       const session = await sessionOf(sessionID) as { parentID?: unknown } | undefined;
       const kind = typeof session?.parentID === "string" && session.parentID !== "" ? "child" : "root";
@@ -1975,7 +2039,7 @@ export async function registerV2Hooks(
               continue;
             }
             if (attempt.state === "acknowledged" || attempt.state === "child-ended") {
-              void processor.process(element.child, { kind: "completion", state: element.state, body: element.body, at: nowMs() });
+              trackBackground(processor.process(element.child, { kind: "completion", state: element.state, body: element.body, at: nowMs() }));
             }
             if (!attempt.waitedOnce && !waits.includes(element.child)) {
               attempt.waitedOnce = true;
@@ -2223,12 +2287,10 @@ export async function registerV2Hooks(
         if (heldRefusal !== undefined) throw refused(heldRefusal, callerRole);
         // QA-2.1-8: while the journal is not reloaded the restored holds are unknown, so a resume of a session this process has no
         // attempt for may be a resume of a held child: refused (fail closed) until a reload succeeds.
-        if (reloadFailed && event.tool === "subagent" && heldArgs !== null && typeof heldArgs === "object") {
-          for (const key of ["sessionID", "task_id"]) {
-            const target: unknown = Reflect.get(heldArgs, key);
-            if (typeof target === "string" && target !== "" && inflight.byChild(target) === undefined) {
-              throw refused(reloadFailedResumeText(target), callerRole);
-            }
+        // QA-2.1-20: Code Mode `execute` code is inspected too, as `held.refusal` does: a session it resumes by name is refused alike.
+        if (reloadFailed) {
+          for (const target of resumeTargetsOf(event.tool, heldArgs, String(event.sessionID))) {
+            if (inflight.byChild(target) === undefined) throw refused(reloadFailedResumeText(target), callerRole);
           }
         }
       }
@@ -2475,8 +2537,10 @@ export async function registerV2Hooks(
     };
     /**
      * QA-2.1-6: the end state of a persisted dispatch's child, from its own history. The newest non-synthetic entry decides: an
-     * assistant message with an error failed (or was interrupted, for an abort), one with text succeeded; anything else (no entry,
-     * a user or tool turn last) never finished, which after a restart means lost.
+     * assistant message with an error failed (or was interrupted, for an abort); one with text succeeded only when it carries a
+     * completion marker (QA-2.1-18, `assistantStepCompleted`: a finish reason other than `tool-calls` or a completed time, and no
+     * pending or running tool part); anything else (no entry, a user or tool turn last, a step cut mid-stream) never finished,
+     * which after a restart means lost.
      */
     const childEndState = async (child: string): Promise<ChildEndState> => {
       const history = await ctx.session.context({ sessionID: child } as Parameters<typeof ctx.session.context>[0]);
@@ -2491,6 +2555,8 @@ export async function registerV2Hooks(
           const described = typeof error === "string" ? error : JSON.stringify(error) ?? "";
           return { outcome: /abort|interrupt|cancel/i.test(described) ? "interrupted" : "failed", ...(text === undefined ? {} : { text }) };
         }
+        // QA-2.1-18: text alone is not an end: a child cut mid-step has partial text. Without a completion marker it is lost.
+        if (!assistantStepCompleted(message)) return { outcome: "lost" };
         return text === undefined ? { outcome: "lost" } : { outcome: "succeeded", text };
       }
       return { outcome: "lost" };
@@ -2913,7 +2979,8 @@ export async function registerV2Hooks(
               if (bgActive() && processor !== undefined) {
                 const attempt = inflight.byChild(sid);
                 if (attempt !== undefined) {
-                  if (attempt.state === "acknowledged") void processor.process(sid, { kind: "end-event", outcome, eventID: event.id, at });
+                  // QA-2.1-21: tracked, so `dispose` and the settled seam wait for the completion it starts.
+                  if (attempt.state === "acknowledged") trackBackground(processor.process(sid, { kind: "end-event", outcome, eventID: event.id, at }));
                   else ingestLogger.warn("[router] background: an end event met an attempt that is not awaiting one", { child: sid, state: attempt.state, outcome });
                 } else if (sessionKinds.get(sid) !== "root") {
                   // A session whose kind is not yet known may be a child whose acknowledgement is still to come (bounded, TTL).
