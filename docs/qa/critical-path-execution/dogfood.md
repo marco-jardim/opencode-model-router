@@ -218,6 +218,25 @@ pre-flight's scoped list includes every test that imports a changed module.
 Note: uncached input 4 (vs 2) marks the steps where the request carried the router-state tail (in flight or held);
 every plateau coincides with those steps.
 
+**DF-1-6 root cause (2026-10-12 ≈13:05).** Not the router's request shape: the new smoke scenario
+`DF-1-6 background tail` (`test\smoke\cpx-cache-prefix.smoke.test.ts` on `cpx/pdf1-1`, real 2.0.26 host, background
+dispatch in flight, held completion, verdict, release) passes — system and tools byte-identical, each request a
+byte-prefix of the next through its last real message, exactly one message breakpoint on the last real message, none on
+the tail. The live host also loads `D:\git\opencode-anthropic-fix`, which rewrites the Anthropic request body:
+`lib\mimicry\request-body.mjs` ≈489-522 strips every incoming message `cache_control` and puts the one message
+breakpoint on the last block of the **last user message** — the router's `<router-state>` tail whenever it is present.
+Each such request therefore writes a cache entry that ends in a tail that the next request no longer has; the next
+request can only read an older entry that ended on a tail-free request, inside the 20-block lookback (read frozen at
+71 976 / 99 359), or only the system breakpoint once that entry is out of reach (29 302). Steps without a tail grow
+normally. This is a cross-plugin interaction outside this repository (C5 assumed the host's breakpoint placement).
+Fix (owner go-ahead 2026-10-12: "you may change it, no regressions, keep v1 compatibility"): in
+`opencode-anthropic-fix`, branch `fix/router-state-breakpoint` (worktree `D:\git\opencode-anthropic-fix-cpx`), commit
+`8a7a3cb`, PR marco-jardim/opencode-anthropic-fix#42 — the message breakpoint skips a trailing `<router-state>` block and
+goes on the nearest earlier block (never thinking, redacted thinking or blank text); requests without the tail are
+unchanged on v1 and v2 (shared body transform). Three conformance tests; that repo's full suite 2098 passed / 2 skipped,
+eslint and prettier clean. The live host keeps loading `D:\git\opencode-anthropic-fix` (master) until the owner merges
+the PR there; DF-1-6 is re-measured on the next switch after that merge. Not a blocker (cost only).
+
 ### DF1.QA
 
 Round 1 (reviewer `ses_ecf4a6d14ffeI81Bz7erefp9TM`, heavy, at `30ff5b2`): 15 findings (1 critical, 8 major, 5 minor,
