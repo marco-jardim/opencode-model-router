@@ -64,6 +64,53 @@ Start now with Pre-flight 0.P (order: 0.P.1 → 0.P.3 → 0.P.6 → 0.P.2 → 0.
 
 ---
 
+## 0b. Resume kickoff for a fresh session (DF-1 onward, written 2026-10-12)
+
+Launch (new pwsh, NEW session — no `-s`):
+`$env:OPENCODE_CONFIG_DIR = "$env:LOCALAPPDATA\omr-cpx\opencode-config"; $env:OPENCODE_V2_BIN = "C:\Users\Marquinho\AppData\Local\omr-cpx\bin\opencode2-2.0.26\opencode.exe"; & $env:OPENCODE_V2_BIN --standalone D:\git\omr-cpx-main`
+
+Paste:
+```
+You are the orchestrator of D:\git\omr-cpx-main\docs\plans\critical-path-execution-plan.md (binding). Read
+D:\git\omr-cpx-main\docs\plans\critical-path-execution-handover.md first: §2 (operating rules), §4 (troubleshooting) and
+§7 (live state; the "NEXT ACTION" paragraph is authoritative). Then the plan's section "Dogfood switch DF-1" (≈line 2050)
+and, after DF-1, "Wave 3" (≈line 2819). Read later phases only when you reach them.
+
+Environment: working directory D:\git\omr-cpx-main (branch cpx/main). Platform win32, shell pwsh. Never read or write
+D:\git\opencode-model-router, D:\git\opencode-model-router-cross-repo or D:\git\omr-cpx-dogfood-* (dogfood worktrees:
+read-only script runs only). Talk to the owner in Portuguese; code, docs, commits, QA reports in English.
+
+State: Wave 2 (2.1-2.4) is done and merged. DF-1 switch prepared (tag cpx/df1 = 226d967, worktree
+D:\git\omr-cpx-dogfood-df1, config copy points at it, pendingTtlMs override set). This session was launched on the df1
+build. Start with DF1.4.a (run-scoped self-check: fresh nonce, run id, loading-plugin set, entrypoint
+file:///D:/git/omr-cpx-dogfood-df1/server.ts, 2.0.26 executable, one router_verify tool), then DF1.4.b-h, DF1.5
+(dogfood.md), DF1.QA (heavy), fixes, then Wave 3 (3.1 ∥ 3.2) with pre-flight, implementation, heavy QA per phase.
+If the self-check fails: revert per §7 and stop.
+
+Owner rules: iterate continuously; stop only for blocking/critical problems. Pre-flight before every phase (fix what it
+finds; document what the plan schedules later). QA is always heavy: rounds 1-2 fix every finding; after round 2 fix only
+blocking/critical/major; round 3 only when round 2 had majors, bounded to those fixes. Delegate through the model-router
+roles with atomic tasks; heavy coding may be pinned [tier:heavy]; lighter dispatches run tests. Take over briefly when the
+router keeps blocking (log it). Commit often, push, Conventional Commits, no AI attribution or Co-Authored-By anywhere.
+Progress goes to GitHub issue #109 (comment at each phase/wave boundary; `Refs #109` in commits). Linear is not used.
+
+Operational lessons (do not re-derive):
+- router_run cannot run vitest with file args: implementers write tests, the orchestrator runs them in its shell:
+  `npx vitest run --maxWorkers=14 <files>`. Never the full suite (only the 6.2 pre-flight). Coverage:
+  `npx vitest run --coverage --coverage.include=<file> <tests>`; uncovered-branch lister: %TEMP%\opencode\uncov.mjs.
+- Every dispatch says "alternate one read, one edit" and names its first 2-3 calls (read guard denies a 4th read).
+- Pass the file-ownership split explicitly when two implementers share a worktree; prefer one writer per worktree.
+- Smokes run only in the orchestrator shell: first `Remove-Item Env:OPENCODE_CONFIG_DIR -ErrorAction SilentlyContinue`,
+  then OPENCODE_V2_BIN=%LOCALAPPDATA%\omr-cpx\bin\opencode2-2.0.26\opencode.exe, OMR_SMOKE_EVIDENCE_DIR=$env:TEMP\omr-evidence,
+  RUN_OC_SMOKE_CPX=1, `npx vitest run --config vitest.smoke.config.ts test/smoke/<file>` (or the npm scripts). v1 smokes:
+  prepend %LOCALAPPDATA%\omr-cpx\bin\opencode-1.18.35 to PATH. scoop removed 2.0.26/1.18.35: never `scoop update opencode*`.
+- Real-host smokes are timing-sensitive: repeat a failing scenario isolated and at the pre-change commit (scratch
+  worktree with a node_modules junction) before blaming the product.
+- Kill stray vitest processes before a rerun that writes the same log file.
+- Subagent outputs can be recovered from %USERPROFILE%\.local\share\opencode\opencode.db (session/part tables, node:sqlite read-only).
+- Pre-existing: routing-engine smoke scenario 5-advisor (PF-4). Deferred minors: see each phase report.
+```
+
 ## 1. Where things are
 
 | What | Where |
