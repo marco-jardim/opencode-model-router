@@ -526,8 +526,9 @@ the real host, the owner's real subscriptions and this real plan. Both are requi
      the main checkout's `.git`) and is accessed only through `router_plan`, never by path: recovery adopts only ledgers
      whose `repo.toplevel` is the plugin session's toplevel (D16), and 6.2.3 removes this run's plans with
      `router_plan action=purge`;
-   - the outcome store directory (`routing.outcomes.path`, default `%TEMP%\opencode-model-router-trajectory`),
-     including `pending.jsonl`.
+   - the outcome store directory (`routing.outcomes.path`, default `%TEMP%\opencode-model-router-trajectory`);
+    - the per-user state directory (`~/.local/state/opencode-model-router`), which holds `pending.jsonl`
+      (*amended by A-2.1-1*).
 
    Nothing else is shared.
 6. **Delivery** is the PR `cpx/main` → `master` (6.2.4). This plan never updates the local `master` of the main checkout.
@@ -1771,13 +1772,14 @@ Phases 2.2–2.4 and 3.x build in parallel against this fixed contract, and `src
   - 2.1.3.a `decideBackground(input)` follows D1 exactly:
     - an estimate with `source: "prior"` never selects background by itself;
     - required verification may run in the background only if `holdingAvailable` (C4 and C15);
-    - `off` reproduces `nativeArgs` exactly.
+    - `off` reproduces `nativeArgs` exactly;
+    - *amended by A-2.1-1:* background is chosen only for root parents; the depth banner stays on the ack.
   - 2.1.3.b `InFlightRegistry`, keyed by call id and child session id. Live dispatches are capped at 1000. The per-session
     rendering state (held placeholders) is kept until `session.deleted`.
   - 2.1.3.c `CompletionProcessor.process(childSessionID, trigger)`:
     - runs once per child attempt; a resumed child is a new attempt;
     - calls the injected `finishDispatch`;
-    - records the timing outcome;
+    - does not record the timing outcome: the event loop does (2.1.5.c; *amended by A-2.1-1*);
     - releases the `until-complete` leases;
     - renders the annotations in the turn-state "completed" section for the parent's next turn (D2); for a foreground
       call, the in-result annotation of `execute.after` is kept and the end-event trigger is suppressed while that
@@ -1787,7 +1789,7 @@ Phases 2.2–2.4 and 3.x build in parallel against this fixed contract, and `src
     - the placeholder text is a pure function of the handle and never changes;
     - on the verdict, it posts one synthetic entry through the plugin API (`ctx.session.synthetic({sessionID, text,
       description, metadata, resume: true})`, ADR 0007 O6b; *Amended by A-0.1-2*) with the output and the verdict (PASS) or the
-      findings (FAIL);
+      findings (FAIL); *amended by A-2.1-1:* a FAIL verdict posts the foreground-equivalent text (output and findings);
     - it refuses a `subagent` resume of a held child until the verdict.
   [acceptance]
   cwd: D:\git\omr-cpx-p21
@@ -1811,7 +1813,8 @@ Phases 2.2–2.4 and 3.x build in parallel against this fixed contract, and `src
   - 2.1.4.c `D:\git\omr-cpx-main\src\verify\pending.ts`:
     - gains a `held` handle state and verdict callbacks;
     - persists entries (handle, session, DoD, change set, reference commit, risk, description, state, createdAt) to
-      `pending.jsonl` in the outcome store, append-only with tombstones;
+      `pending.jsonl` in the per-user state directory (`~/.local/state/opencode-model-router`; XDG on non-win32),
+      not the outcome store, append-only with tombstones; *amended by A-2.1-1*;
     - reloads them on start within `pendingTtlMs`;
     - turns an entry whose reference commit is gone into `unverifiable` with a reason;
     - persists only when `ctx.routerHost === "v2"` (v1 unchanged);
@@ -1821,7 +1824,15 @@ Phases 2.2–2.4 and 3.x build in parallel against this fixed contract, and `src
       reloaded pending entries: export `keepReferences(keys)` from `D:\git\omr-cpx-main\src\verify\reference.ts`, which
       marks reloaded references active before the start-time GC delay.
 
-    The orchestrator records an ADR 0007 amendment: DoD and description text are stored on disk in the outcome store.
+    - *Amended by A-2.1-1:* restart recovery journals the dispatch data (prompt, DoD, cwd/work root) with the `inflight`
+      and `hold` records, and passes it to the finish path after a restart; when it is missing the verdict is
+      UNVERIFIABLE ("verification data lost in restart");
+    - *amended by A-2.1-1:* in-flight persistence, the lost-child wake (R18) and `reserveHandle` at the ack are part of
+      2.1; each plugin instance claims its sessions with a per-instance token, refreshed every 60 s and stale after 5 min;
+    - *amended by A-2.1-1:* 2.1 restores the registry-level lease snapshot; 3.1 `LeaseService` rebuilds the plan leases.
+
+    The orchestrator records an ADR 0007 amendment: DoD and description text are stored on disk in the per-user state
+    directory (*amended by A-2.1-1*).
   - 2.1.4.d `D:\git\omr-cpx-main\src\verify\wiring.ts` defers a plugin verification run while another holder has
     a write lease in the same tree, until the lease ends or the verification deadline passes; then it runs with the
     existing contamination caveat.
@@ -1836,7 +1847,8 @@ Phases 2.2–2.4 and 3.x build in parallel against this fixed contract, and `src
   [/acceptance]
 - **2.1.5** [tier:medium] VERIFY:required v2 wiring (one writer task for both files).
   [route class=implement risk=high scope=multi needs=edit,shell d=deterministic root=D:\git\omr-cpx-p21 tier=medium pin]
-  Writes: `D:\git\omr-cpx-main\src\compat\v2-hooks.ts`, `D:\git\omr-cpx-main\src\routing\wire\dispatch.ts`.
+  Writes: `D:\git\omr-cpx-main\src\compat\v2-hooks.ts`, `D:\git\omr-cpx-main\src\routing\wire\dispatch.ts`,
+  `D:\git\omr-cpx-main\src\router\git-tools.ts`. *Amended by A-2.1-1.*
   Reads: `D:\git\omr-cpx-main\src\compat\background.ts`, `D:\git\omr-cpx-main\src\compat\turn-state.ts`,
   `D:\git\omr-cpx-main\src\routing\outcomes\timings.ts`, `D:\git\omr-cpx-main\src\routing\outcomes\durations.ts`,
   `D:\git\omr-cpx-main\src\router\tool-paths.ts`.
@@ -4544,5 +4556,6 @@ Node ≥ 22.18; DF-2 switch procedure and the 24 h pending TTL from DF-1; QA tas
 - **A-2.2-1** (Phase 2.2) — 2.2.2.a/b/e: the ledger state is kept in per-epoch files `ledger.<epoch>.json` (snapshot) and `events.<first>.<epoch>.jsonl` (journal), plus one beat file per holder (`writer.<token>.beat`), not in single snapshot and journal files. Recorded in `docs\qa\critical-path-execution\phase-2.2.md` "Plan amendments".
 - **A-2.3-1** (Phase 2.3, approved extensions) — 2.3.3.b: the ownership fallback is reported as `inferred` with an `ownership-assumed` diagnostic; 2.3.3.a: new files are also recognized under another worktree of the repository; 2.3.6.c: `addTasks` is synchronous. Recorded in `docs\qa\critical-path-execution\phase-2.3.md` "Plan amendments".
 - **A-2.4-1** (Phase 2.4 orchestrator decisions) — DV1–DV10 of the 2.4.1 design memo (§0 "Decisions that change the plan text" in `docs\qa\critical-path-execution\phase-2.4.md`) are binding where they change Phase 2.4 and are not copied into the plan (2.4.1); 2.4.6 Writes adds `package.json` (script `smoke:cpx:provision`); 2.4.3.a, 4.1.1.b and the Appendix C `routing.executor.slotsDir` row: the computed slots directory is `defaultSlotsDir(toplevel, planId)` = `<repo drive>:\.omr-slots\<planId>`, exported from `slots\pool.ts`, and the integration slot path is `ledger.integration.worktree`. Recorded in `docs\qa\critical-path-execution\phase-2.4.md` "Plan amendments".
+- **A-2.1-1** (Phase 2.1, memo §15 decisions and QA-2.1-8, -17, -19, -34) — the memo §15 decisions are binding: 2.1.5 Writes adds `src\router\git-tools.ts`; the event loop, not the completion processor, records timing outcomes (2.1.3.c, 2.1.5.c); 2.1 restores the registry-level lease snapshot and 3.1 `LeaseService` rebuilds the plan leases; FAIL verdicts post the foreground-equivalent text (output and findings; 2.1.3.d); the depth banner stays on the ack; background is chosen only for root parents (2.1.3.a); in-flight persistence, the lost-child wake (R18) and `reserveHandle` at the ack belong to 2.1 (2.1.4.c). Added by QA: the pending journal lives in the per-user state directory (`~/.local/state/opencode-model-router`, XDG on non-win32) instead of the outcome store (2.1.4.c and the shared-resources list that named `pending.jsonl`); restart recovery journals the dispatch data with `inflight`/`hold`; per-instance session claims are refreshed every 60 s and stale after 5 min. Recorded in `docs\qa\critical-path-execution\phase-2.1.md` "Plan amendments".
 
 **Owner execution rules for the implementation session** — §0.14 (continuous iteration, momentary takeover, atomic delegation with [tier:heavy] for complex coding and lighter test runs, bounded QA rounds, pre-flight fix-or-document, Linear not used, worktree reporting), the testing policy (§0.6-9: scoped, accelerated, full suite only in 6.2), the bounded executor QA loop (default 3 rounds), and the handover's kickoff prompt.
