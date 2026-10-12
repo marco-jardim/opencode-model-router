@@ -346,3 +346,31 @@ filed (the slot is shared by design), but the DF-1.1 re-probe drains them first.
 opencode-anthropic-fix PR #42 (DF-1-6): Codex review P1 (contract doc + `index.test.mjs` case) addressed in `56377cf`;
 P2 (string-content shorthand before a separate tail message left no breakpoint) addressed in the next commit (string
 normalized to one text block carrying the breakpoint). Suite 2100 passed / 2 skipped.
+
+## Window "after DF-1.1"
+
+Build `cpx/df1.1` = `9fa7607` (`D:\git\omr-cpx-dogfood-df1.1`), loaded since 2026-10-12 16:06:54 -03:00, server run
+`59ec52b7`, orchestrator session `ses_ecf5bd114ffe5QT3S5xVTAQcF4` (resumed with `-s`, as recorded).
+
+### DF-1.1 self-check and re-probes
+
+| Probe | Result | Evidence |
+|---|---|---|
+| a build loaded | **pass** | Marker `omr-selfcheck-df11-5be0c17d93` → run `59ec52b7`; `cli starting version=2.0.26`; per booted location `D:\git\omr-cpx-main`, `C:\Users\Marquinho`, `D:\git\opencode-model-router` one load each of `opencode-anthropic-fix` and `file:///D:/git/omr-cpx-dogfood-df1.1/server.ts`; processes 54964/73568 = the 2.0.26 copy, created 16:06:54; `rev-parse HEAD` of the worktree = `cpx/df1.1^{commit}` = `9fa7607c…`, clean; one `router_verify` tool. The `D:\git\opencode-model-router` location booted again although the session was resumed with `-s` (DF-1-1 trigger hypothesis disproved: host behaviour). In that location only the host's project probes ran (rev-parse, remote get-url, symbolic-ref); the router's `git worktree list` ran only in `D:\git\omr-cpx-main` (DF-1-1 hardening effective). |
+| c leases (re-probe) | **pass** | Child 1 `ses_ece7a4797ffebkoaJ4W1WPnKSm` wrote the probe file; child 2 `ses_ece7a11d4ffeG2rKoi2BDRAwai` read and write refused naming the holder; explorer `ses_ece7a0769ffetnUacOHGT1Eht4` read refused naming the holder; runner `ses_ece79fb3affeiB4PBw2xKDQe4P` (fresh dispatch, no refusal of its `root=`) **delivered** `[router] ran while implementer "DF1.1 lease child 1 […]" (session ses_ece7a4797ffebkoaJ4W1WPnKSm) edits 1 file(s); result may be contaminated`. |
+| d telemetry (re-probe) | **pass with deviations** | `routing-stats.ts --since 15:00 -03:00` (df1.1 script) prints dispatch durations and `Orchestrator cache-read share: p50 7.1%, p10 4.9% over 13 turns`; `turns.jsonl` exists; every row belongs to this orchestrator session. The first rows predate the restart (15:58Z onwards): df1, which has no DF-1-5 fix, wrote them while the host evicted and re-booted locations (`flush`/eviction close a turn). Rows repeat; see DF-1.1-2. |
+| e cache (re-probe) | **fail: p50 7.1 % < 0.5** | DF-1-6 is unfixed on the live host (the `opencode-anthropic-fix` PR #42 is not merged; the host loads its `master`). Expected to clear after the owner merges #42 and the next restart. |
+
+### Deviations
+
+- **DF-1.1-1 — the background grader is still denied on df1.1.** The three background `d=none` re-probe dispatches
+  (child 2, explorer, runner) and every background `d=none` dispatch since the restart came back `grader dispatch
+  failed: Tool.Error: Subagent denied: model-router-grader`, now correctly tagged `UNVERIFIABLE` (the tag half of
+  DF-1-3 is fixed; the launch half is not). Root cause under investigation (explorer `ses_ece750064ffegobZoH9D7QTZ7t`).
+  The binding workaround stays.
+- **DF-1.1-2 — duplicate and restarting turn rows.** `turns.jsonl` repeats identical rows 2-3 times at the same
+  instant (e.g. 16:04:40, 17:05:49, 18:07:02, 19:05:57 UTC) and restarts `turn=1` several times within one session: one
+  timing recorder per plugin module copy (one copy per booted location; three locations), each closing the same root
+  run (QA-DF1-24 predicted it). The cache-share statistic therefore over-counts. Fix: one recorder per process (shared
+  registry on `globalThis`, like the pending snapshot providers), or record turns only in the instance whose location
+  owns the session.
