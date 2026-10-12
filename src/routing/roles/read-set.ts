@@ -9,12 +9,14 @@
  * a file (linked worktree, submodule) whose `gitdir:` target holds a `HEAD` file. No link counts (F5): `.git` and `HEAD` are
  * checked with `lstat`, a `HEAD` is read from its opened descriptor only when `fstat` shows a regular file of at most 4 KiB, and a
  * `gitdir:` is followed only when neither its text nor its `realpath` is a UNC or device path (no filesystem call may reach a
- * remote host). Its branch is best effort from `HEAD`: `ref: refs/heads/<x>` → `x` when `x` is a git ref name ("(unknown)"
+ * remote host). A linked worktree is excluded with its main worktree (QA round 2 M1), found from the filesystem alone (I12: no git
+ * process): the gitdir's `commondir`, read and followed the same way; an unreadable or dangling one is no repository (fail closed).
+ * Its branch is best effort from `HEAD`: `ref: refs/heads/<x>` → `x` when `x` is a git ref name ("(unknown)"
  * otherwise, F2), anything else → null (detached). Probes are cached 5 s per directory. Without parents and without a working set
  * there is no predicate at all (I9: nothing beyond W).
  */
 import { closeSync, fstatSync, lstatSync, openSync, readSync, realpathSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { quoteGitPath } from "../../router/git-tools";
 import { permissionMatches } from "../../router/read-only";
 import type { RepoLocation } from "./admission";
@@ -111,6 +113,11 @@ export interface RepoProbeDeps {
 export interface RepoProbe {
   /** The repository whose top is `dir` (it holds `.git`), else undefined. Cached 5 s. */
   repositoryAt(dir: string): ReadSetRepository | undefined;
+  /**
+   * QA round 2 (Phase 3 lot 1, M1): the canonical main worktree of the repository whose top is `dir` (`dir` itself unless its git
+   * directory names a `commondir`), else undefined. Cached 5 s with {@link repositoryAt}.
+   */
+  mainWorktreeAt(dir: string): string | undefined;
   /** The canonical long form of a `routing.repoParents` entry, else undefined. Cached 5 s. */
   canonicalParent(parent: string): string | undefined;
 }
@@ -184,35 +191,68 @@ export function createRepoProbe(overrides: Partial<RepoProbeDeps> = {}): RepoPro
     while (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value!);
     return value;
   };
+  /** The first line of a small pointer file (`.git`, `commondir`), trimmed; undefined when unreadable (F5). */
+  const pointerLine = (path: string): string | undefined => deps.readSmall(path)?.split(/\r?\n/, 1)[0]?.trim();
+  /** `text` resolved against `base` and made canonical, never UNC or a device (no filesystem call may reach a remote host). */
+  const followed = (base: string, text: string): string | undefined => {
+    if (text === "" || remote(text)) return undefined;
+    const named = resolve(base, text);
+    if (remote(named)) return undefined;
+    const target = deps.realpath(named);
+    return target === undefined || remote(target) ? undefined : target;
+  };
+  /**
+   * QA round 2 (Phase 3 lot 1, M1): the main worktree of the checkout whose git directory is `gitDir`, from the filesystem alone
+   * (I12: no git process), as `mainWorktree()` (router/git-tools.ts) finds it: without a `commondir` file, `gitDir` is its own
+   * common directory; with one, the canonical directory it names. The main worktree is the directory holding that common
+   * directory when it is named `.git`, else the common directory itself (a bare repository, a submodule's git directory).
+   * Undefined (fail closed: not a repository of R) when the `commondir` is a link or unreadable, empty, remote, or names nothing.
+   */
+  const mainOf = (gitDir: string): string | undefined => {
+    const pointer = join(gitDir, "commondir");
+    const kind = deps.entry(pointer);
+    let common: string | undefined = gitDir;
+    if (kind !== undefined) {
+      const text = kind === "file" ? pointerLine(pointer) : undefined;
+      common = text === undefined ? undefined : followed(gitDir, text);
+      if (common === undefined || deps.entry(common) !== "directory") return undefined;
+    }
+    return basename(common).toLowerCase() === ".git" ? dirname(common) : common;
+  };
   /**
    * QA-1 F3/F5: the git directory of a repository whose top is `dir`, when its `.git` has git's shape and no link on the way — the
    * `.git` directory itself (a `HEAD` file and an `objects` directory or a `commondir` file), or the `gitdir:` target of a `.git`
-   * file (canonical, never UNC or a device, holding a `HEAD` file). Undefined: not a repository.
+   * file (canonical, never UNC or a device, holding a `HEAD` file) — and its main worktree (M1: `dir` itself for a `.git`
+   * directory without a `commondir`, else {@link mainOf}). Undefined: not a repository, or its main worktree is not found.
    */
-  const gitDirOf = (dir: string): string | undefined => {
+  const gitDirOf = (dir: string): { readonly gitDir: string; readonly main: string } | undefined => {
     const dotGit = join(dir, ".git");
     const kind = deps.entry(dotGit);
     if (kind === "directory") {
       if (deps.entry(join(dotGit, "HEAD")) !== "file") return undefined;
-      return deps.entry(join(dotGit, "objects")) === "directory" || deps.entry(join(dotGit, "commondir")) === "file" ? dotGit : undefined;
+      const linked = deps.entry(join(dotGit, "commondir")) !== undefined;
+      if (!linked) return deps.entry(join(dotGit, "objects")) === "directory" ? { gitDir: dotGit, main: dir } : undefined;
+      const main = mainOf(dotGit);
+      return main === undefined ? undefined : { gitDir: dotGit, main };
     }
     if (kind !== "file") return undefined; // none, or a link (F5)
-    const line = deps.readSmall(dotGit)?.split(/\r?\n/, 1)[0]?.trim();
+    const line = pointerLine(dotGit);
     const gitdir = line === undefined ? undefined : /^gitdir:\s*(.+)$/.exec(line)?.[1];
-    if (gitdir === undefined || remote(gitdir)) return undefined;
-    const named = resolve(dir, gitdir);
-    if (remote(named)) return undefined;
-    const target = deps.realpath(named);
-    if (target === undefined || remote(target)) return undefined;
-    return deps.entry(join(target, "HEAD")) === "file" ? target : undefined;
+    const target = gitdir === undefined ? undefined : followed(dir, gitdir);
+    if (target === undefined || deps.entry(join(target, "HEAD")) !== "file") return undefined;
+    const main = mainOf(target);
+    return main === undefined ? undefined : { gitDir: target, main };
   };
-  return {
-    repositoryAt: (dir) => cached(keyOf("repo", dir), () => {
+  const probed = (dir: string): { readonly repository: ReadSetRepository; readonly main: string } | undefined =>
+    cached(keyOf("repo", dir), () => {
       if (remote(dir)) return undefined;
-      const gitDir = gitDirOf(dir);
-      if (gitDir === undefined) return undefined;
-      return { repository: dir, name: basename(dir), branch: branchOf(deps.readSmall(join(gitDir, "HEAD"))) };
-    }),
+      const git = gitDirOf(dir);
+      if (git === undefined) return undefined;
+      return { repository: { repository: dir, name: basename(dir), branch: branchOf(deps.readSmall(join(git.gitDir, "HEAD"))) }, main: git.main };
+    });
+  return {
+    repositoryAt: (dir) => probed(dir)?.repository,
+    mainWorktreeAt: (dir) => probed(dir)?.main,
     canonicalParent: (parent) => cached(keyOf("parent", parent), () => (remote(parent) ? undefined : deps.realpath(parent))),
   };
 }
@@ -222,16 +262,33 @@ export function createRepoProbe(overrides: Partial<RepoProbeDeps> = {}): RepoPro
  * is in R when it lies inside a working-set worktree, or below a canonical parent inside a repository whose top is its nearest
  * ancestor 1..`depth` segments below that parent, and no directory between that parent and the target — the target included —
  * matches a `routing.repoExclude` glob (QA-1 F4: an excluded repository stays excluded through a repository nested in it; the
- * max policy's matcher: separators unified, win32 case folding).
+ * max policy's matcher: separators unified, win32 case folding), nor its main worktree or a directory between a parent and that
+ * main worktree (QA round 2 M1: a linked worktree of an excluded repository is not in R, as admission refuses it).
  */
 export function readSetPredicate(config: ReadSetConfig, workingSet: readonly RepoLocation[], probe: RepoProbe): InReadSet | undefined {
   if (config.parents.length === 0 && workingSet.length === 0) return undefined;
   const depth = Math.max(1, Math.floor(config.depth));
+  const matches = (dir: string): boolean => config.exclude.some((glob) => permissionMatches(dir, glob));
+  const below = (parent: string, path: string): string[] =>
+    path.slice(parent.replace(/[\\/]+$/, "").length).split(/[\\/]/).filter((segment) => segment !== "");
   const excluded = (parent: string, segments: readonly string[]): boolean => {
     if (config.exclude.length === 0) return false;
     for (let level = 1; level <= segments.length; level++) {
-      const dir = join(parent, ...segments.slice(0, level));
-      if (config.exclude.some((glob) => permissionMatches(dir, glob))) return true;
+      if (matches(join(parent, ...segments.slice(0, level)))) return true;
+    }
+    return false;
+  };
+  /**
+   * QA round 2 (Phase 3 lot 1, M1): a repository is excluded through its main worktree too — as admission refuses a work root in a
+   * linked worktree of an excluded repository (F3) — when a glob matches that main worktree, or a directory between a parent and
+   * it.
+   */
+  const mainExcluded = (main: string): boolean => {
+    if (config.exclude.length === 0) return false;
+    if (matches(main)) return true;
+    for (const text of config.parents) {
+      const parent = probe.canonicalParent(text);
+      if (parent !== undefined && insideWorkRoot(main, parent) && excluded(parent, below(parent, main))) return true;
     }
     return false;
   };
@@ -243,11 +300,15 @@ export function readSetPredicate(config: ReadSetConfig, workingSet: readonly Rep
     for (const text of config.parents) {
       const parent = probe.canonicalParent(text);
       if (parent === undefined || !insideWorkRoot(target, parent)) continue;
-      const segments = target.slice(parent.replace(/[\\/]+$/, "").length).split(/[\\/]/).filter((segment) => segment !== "");
+      const segments = below(parent, target);
       if (excluded(parent, segments)) continue;
       for (let level = Math.min(depth, segments.length); level >= 1; level--) {
-        const repository = probe.repositoryAt(join(parent, ...segments.slice(0, level)));
-        if (repository !== undefined) return repository;
+        const top = join(parent, ...segments.slice(0, level));
+        const repository = probe.repositoryAt(top);
+        if (repository === undefined) continue;
+        const main = probe.mainWorktreeAt(top);
+        if (main === undefined || mainExcluded(main)) break; // M1: fail closed; never the enclosing repository instead
+        return repository;
       }
     }
     return undefined;

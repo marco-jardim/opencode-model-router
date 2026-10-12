@@ -14,7 +14,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, win32 } from "node:path";
+import { dirname, join, resolve as resolvePath, win32 } from "node:path";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import type { Hooks } from "@opencode-ai/plugin";
 import ModelRouterPlugin from "../../src/index";
@@ -91,6 +91,30 @@ vi.mock("../../src/verify/gate", async (importOriginal) => {
     },
   };
 });
+// Cross-repo QA-2 M1: child processes started through `node:child_process` are counted (pass-through; nothing else changes) — the
+// read set R is filesystem-only (I12).
+const processes = vi.hoisted(() => ({ started: 0 }));
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  type Started = (...args: unknown[]) => unknown;
+  const counted = (fn: Started): Started => {
+    const wrapper: Started = (...args) => {
+      processes.started++;
+      return fn(...args);
+    };
+    // `util.promisify.custom` of exec/execFile: promisified calls are counted too.
+    for (const key of Object.getOwnPropertySymbols(fn)) {
+      const value = (fn as unknown as Record<symbol, unknown>)[key];
+      Object.defineProperty(wrapper, key, { value: typeof value === "function" ? counted(value as Started) : value });
+    }
+    return wrapper;
+  };
+  const names = ["spawn", "spawnSync", "exec", "execSync", "execFile", "execFileSync", "fork"] as const;
+  const wrapped = Object.fromEntries(names.map((name) => [name, counted(actual[name] as unknown as Started)]));
+  const original = (actual as unknown as { default?: object }).default ?? actual;
+  return { ...actual, ...wrapped, default: { ...original, ...wrapped } };
+});
+const childProcessCalls = (): number => processes.started;
 import type { RouterPluginInput } from "../../src/compat/child-session";
 import { invalidateConfigCache, loadConfig, overridePath, validateConfig, type RouterConfig } from "../../src/router/config";
 import { markRunnerDispatch, resetDispatchRegistry, runnerDescription } from "../../src/router/sessions";
@@ -1013,6 +1037,52 @@ describe("work roots (I3, P-13): the dispatch's own worktree only", () => {
     expect(replaced.effect).toBe("deny");
     expect(replaced.message).toMatch(/no longer a worktree/);
   }, 60_000);
+
+  it.skipIf(!hasGit())("cross-repo QA-2 M1: a linked worktree of a repoExclude'd repository is not in R (its main worktree or an ancestor of it excluded); a malformed pointer fails closed; no git runs", () => {
+    const parent = temp("omr-m1-parent-");
+    const repo = (dir: string): string => {
+      mkdirSync(dir, { recursive: true });
+      git(["init", "-q", "-b", "trunk"], dir);
+      git(["commit", "-q", "--allow-empty", "-m", "init"], dir);
+      return dir;
+    };
+    const secret = repo(join(parent, "secret"));
+    git(["worktree", "add", "-q", "-b", "feat", join(parent, "secret-feat")], secret);
+    const lib = repo(join(parent, "lib"));
+    git(["worktree", "add", "-q", "-b", "feat", join(parent, "lib-feat")], lib);
+    git(["worktree", "add", "-q", "-b", "feat2", join(parent, "lib-bent")], lib);
+    const inner = repo(join(parent, "vault", "inner"));
+    git(["worktree", "add", "-q", "-b", "feat", join(parent, "inner-feat")], inner);
+    // A `.git` file that is no pointer, and a linked worktree whose `commondir` names nothing.
+    mkdirSync(join(parent, "broken"));
+    writeFileSync(join(parent, "broken", ".git"), "not a gitdir pointer\n");
+    const bentGitDir = /^gitdir:[ \t]*(.+)$/m.exec(readFileSync(join(parent, "lib-bent", ".git"), "utf8"))![1]!.trim();
+    writeFileSync(join(resolvePath(join(parent, "lib-bent"), bentGitDir), "commondir"), "../../missing-common-dir\n");
+
+    const inR = (exclude: string[]) => readSetPredicate({ parents: [parent], depth: 2, exclude }, [], createRepoProbe())!;
+    const file = (dir: string): string => join(parent, dir, "src", "x.ts");
+    const linked = (name: string, branch: string) => ({ repository: join(parent, name), name, branch });
+    const spawned = childProcessCalls();
+    // The excluded repository's linked worktree: read, glob and grep targets alike (a file, its directory, the worktree top).
+    expect(inR([join(parent, "secret")])(file("secret-feat"))).toBeUndefined();
+    expect(inR([join(parent, "secret")])(join(parent, "secret-feat", "src"))).toBeUndefined();
+    expect(inR([join(parent, "secret")])(join(parent, "secret-feat"))).toBeUndefined();
+    expect(inR([join(parent, "secret")])(join(secret, "a.ts"))).toBeUndefined();
+    expect(inR([join(parent, "sec*")])(file("secret-feat"))).toBeUndefined();
+    // Not excluded: a linked worktree stays in R.
+    expect(inR([join(parent, "secret")])(file("lib-feat"))).toEqual(linked("lib-feat", "feat"));
+    expect(inR([])(file("secret-feat"))).toEqual(linked("secret-feat", "feat"));
+    // An exclude glob on an ANCESTOR of the main worktree (below the parent) excludes its linked worktree.
+    expect(inR([])(file("inner-feat"))).toEqual(linked("inner-feat", "feat"));
+    expect(inR([join(parent, "vault")])(file("inner-feat"))).toBeUndefined();
+    expect(inR([join(parent, "v*")])(join(parent, "inner-feat"))).toBeUndefined();
+    expect(inR([join(parent, "vault")])(file("lib-feat"))).toEqual(linked("lib-feat", "feat"));
+    // Malformed pointers fail closed.
+    expect(inR([])(file("broken"))).toBeUndefined();
+    expect(inR([])(file("lib-bent"))).toBeUndefined();
+    // R is filesystem-only (I12): no process ran while the predicate decided.
+    expect(childProcessCalls()).toBe(spawned);
+  });
 
   it.skipIf(!hasGit())("cross-repo P1.5: the read-set predicate (sync, real git) finds a repository below routing.repoParents; a plain directory is not in R", () => {
     const parent = temp("omr-p15-parent-");
