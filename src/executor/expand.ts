@@ -3,8 +3,11 @@
  *
  * Design memo: docs/qa/critical-path-execution/phase-3.1.md M36 and §8 "expand.ts (3.1.4)".
  * Pure except `loadExpansionEnv`, which reads the worktree list and `core.longpaths` through the `GitRunner` seam.
+ * The route line is re-serialized from whitelisted tokens; plan text never reaches it.
  */
 import * as path from "node:path";
+import { DETECTIONS, NEEDS, RISKS, SCOPES, TASK_CLASSES } from "../routing/classify/types";
+import { slotEnvFor } from "./slots/env";
 import {
   ABSOLUTE_PATH_PATTERN,
   ExecutorError,
@@ -177,7 +180,7 @@ export function rewriteAbsolutePaths(text: string, map: PathMap): string {
     const candidate = (isSeparator(c) || /[A-Za-z]/.test(c)) && atPathStart(text, i);
     const hit = candidate ? matchPrefix(text, i, mappable) : null;
     if (hit !== null) {
-      const end = Math.max(tokenEnd(text, i), i + hit.length);
+      const end = tokenEnd(text, i + hit.length);
       const sep = isSeparator(hit[hit.length - 1]) ? text[i + hit.length - 1] ?? "" : "";
       const rewritten = `${map.slot}${sep}${text.slice(i + hit.length, end)}`;
       if (winSlot && !map.longPaths && rewritten.length > MAX_PATH_CHARS) {
@@ -190,7 +193,10 @@ export function rewriteAbsolutePaths(text: string, map: PathMap): string {
       continue;
     }
     if (candidate && matchPrefix(text, i, inRepo) !== null) {
-      fail("absolute path in the repository cannot be mapped into the slot", { path: text.slice(i, tokenEnd(text, i)) });
+      const inRepoHit = matchPrefix(text, i, inRepo) ?? "";
+      fail("absolute path in the repository cannot be mapped into the slot", {
+        path: text.slice(i, tokenEnd(text, i + inRepoHit.length)),
+      });
     }
     out += c;
     i++;
@@ -243,6 +249,111 @@ const QUOTED_ROOT_RE = /\broot\s*=\s*"([^"]*)"/i;
 /** `needs=shell, edit`: whitespace after a needs comma is not a separator (as in the reference grammar). */
 const NEEDS_LIST_RE = /(\bneeds=[a-z_]*)((?:\s*,\s*[a-z_]+(?![a-z_]|\s*=))+)/gi;
 
+const ROUTE_CLASSES: readonly string[] = TASK_CLASSES;
+const ROUTE_RISKS: readonly string[] = RISKS;
+const ROUTE_SCOPES: readonly string[] = SCOPES;
+const ROUTE_NEEDS: readonly string[] = NEEDS;
+const ROUTE_DS: readonly string[] = DETECTIONS;
+const ROUTE_TIERS: readonly string[] = ["fast", "medium", "heavy"];
+/** A token value: lowercase letters, digits and `_` only (no whitespace, `]`, `[`, `"`, newline or separator). */
+const TOKEN_VALUE_RE = /^[a-z0-9_]+$/;
+/** The whole route line, brackets included: no nested bracket and no line break inside. */
+const ROUTE_LINE_SHAPE_RE = /^\[route(?:[ \t]+([^[\]\r\n]*))?\]$/i;
+/** A slot path usable as `root=`: drive-absolute or POSIX, no whitespace, brackets, quotes, commas, `..` or NUL. */
+const ROOT_VALUE_RE = /^(?:[A-Za-z]:[\\/]|\/(?![\\/]))[^\s[\]",;\0]*$/;
+
+function routeFail(reason: string, detail: Record<string, string | number | boolean | null> = {}): never {
+  return fail(`route line cannot be rendered: ${reason}`, detail);
+}
+
+function isMemberOf(values: readonly string[], v: string): boolean {
+  return values.includes(v);
+}
+
+/** The whitelisted fields of the task's own route line (the plan's `[route ...]`), never its raw text. */
+interface RouteFields {
+  cls: string | null;
+  risk: string | null;
+  scope: string | null;
+  needs: string[];
+  d: string | null;
+  tier: string | null;
+  pin: boolean | null;
+}
+
+function parseRouteFields(line: string): RouteFields {
+  const f: RouteFields = { cls: null, risk: null, scope: null, needs: [], d: null, tier: null, pin: null };
+  const trimmed = line.trim();
+  if (trimmed === "") return f;
+  const shape = ROUTE_LINE_SHAPE_RE.exec(trimmed);
+  if (shape === null) routeFail("the task's route line is not one well-formed [route ...] line", { line: trimmed.slice(0, 80) });
+  const body = (shape[1] ?? "")
+    .replace(QUOTED_ROOT_RE, " ")
+    .replace(/\s*=\s*/g, "=")
+    .replace(NEEDS_LIST_RE, (_whole: string, head: string, tail: string) => head + tail.replace(/\s+/g, ""));
+  const seen = new Set<string>();
+  for (const token of body.split(/\s+/).filter((t) => t !== "")) {
+    const eq = token.indexOf("=");
+    const key = (eq === -1 ? token : token.slice(0, eq)).toLowerCase();
+    const raw = eq === -1 ? null : token.slice(eq + 1).toLowerCase();
+    if (seen.has(key)) routeFail(`duplicate field ${key}`);
+    seen.add(key);
+    if (key === "root" || key === "budget") continue; // replaced by the slot / not carried
+    if (key === "pin") {
+      if (raw === null || raw === "true" || raw === "yes" || raw === "1") f.pin = true;
+      else if (raw === "false" || raw === "no" || raw === "0") f.pin = false;
+      else routeFail("value of pin is outside its token pattern", { value: raw.slice(0, 40) });
+      continue;
+    }
+    if (raw === null || (key !== "needs" && !TOKEN_VALUE_RE.test(raw))) {
+      routeFail(`value of ${key} is outside its token pattern`, { key });
+    }
+    const value = raw ?? "";
+    switch (key) {
+      case "class": if (!isMemberOf(ROUTE_CLASSES, value)) routeFail("unknown class", { value: value.slice(0, 40) }); f.cls = value; break;
+      case "risk": if (!isMemberOf(ROUTE_RISKS, value)) routeFail("unknown risk", { value: value.slice(0, 40) }); f.risk = value; break;
+      case "scope": if (!isMemberOf(ROUTE_SCOPES, value)) routeFail("unknown scope", { value: value.slice(0, 40) }); f.scope = value; break;
+      case "d": if (!isMemberOf(ROUTE_DS, value)) routeFail("unknown d", { value: value.slice(0, 40) }); f.d = value; break;
+      case "tier": if (!isMemberOf(ROUTE_TIERS, value)) routeFail("unknown tier", { value: value.slice(0, 40) }); f.tier = value; break;
+      case "needs":
+        for (const n of value.split(",")) {
+          if (!isMemberOf(ROUTE_NEEDS, n)) routeFail("unknown need", { value: n.slice(0, 40) });
+          if (!f.needs.includes(n)) f.needs.push(n);
+        }
+        break;
+      default: routeFail(`unknown field ${key.slice(0, 40)}`);
+    }
+  }
+  return f;
+}
+
+/**
+ * The route line sent with the attempt (M36): re-serialized from the whitelisted tokens class, risk, scope, needs, d,
+ * `root=<slotPath>`, tier and pin. `task.route.tier` and `task.route.pin` (`[tier:X]` gives `tier=X pin`) win over the
+ * line's own `tier=`/`pin`. A value outside its token pattern, or holding whitespace, `]` or a line break, fails with
+ * E_LAUNCH_TASK. The plan text (title, text, subtasks) is never read here.
+ */
+export function renderRouteLine(task: TaskNode, slotPath: string): string {
+  if (!ROOT_VALUE_RE.test(slotPath) || /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(slotPath)) {
+    routeFail("the slot path is not a usable root= value", { slotPath: slotPath.slice(0, 120) });
+  }
+  const f = parseRouteFields(task.route.line);
+  const tier = task.route.tier ?? f.tier;
+  if (tier !== null && !isMemberOf(ROUTE_TIERS, tier)) routeFail("unknown tier", { value: String(tier).slice(0, 40) });
+  const pin = task.route.pin || f.pin === true;
+  const parts: string[] = [];
+  if (f.cls !== null) parts.push(`class=${f.cls}`);
+  if (f.risk !== null) parts.push(`risk=${f.risk}`);
+  if (f.scope !== null) parts.push(`scope=${f.scope}`);
+  const needs = ROUTE_NEEDS.filter((n) => f.needs.includes(n));
+  if (needs.length > 0) parts.push(`needs=${needs.join(",")}`);
+  if (f.d !== null) parts.push(`d=${f.d}`);
+  parts.push(`root=${slotPath}`);
+  if (tier !== null) parts.push(`tier=${tier}`);
+  if (pin) parts.push("pin");
+  return `[route ${parts.join(" ")}]`;
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // Task block (M36 "taskBlock order")
 // ---------------------------------------------------------------------------------------------------------------
@@ -259,5 +370,104 @@ export const FINDINGS_INSTRUCTION =
   "End your final answer with exactly one ```json fenced block whose content matches this JSON schema:\n" +
   JSON.stringify(FINDINGS_FORMAT);
 
-void formatLaunchPrompt;
+/** Formatting rule of M36: line breaks become `\n` and trailing spaces/tabs are removed; nothing else changes. */
+function tidy(text: string): string {
+  return text.replace(/\r\n?/g, "\n").split("\n").map((l) => l.replace(/[ \t]+$/, "")).join("\n");
+}
+
+/** `ENVIRONMENT` entries of the slot (M36 item 4): `slotEnvFor` entries sorted by key, then the PATH prefix, then unset names. */
+function environmentLines(slot: SlotLease): string[] {
+  const out = [`Working directory: ${slot.path}`, `Base commit: ${slot.commit}`];
+  const env = slotEnvFor(slot.path);
+  if (env === null) return out;
+  for (const key of Object.keys(env.set).sort()) out.push(`${key}=${env.set[key] ?? ""}`);
+  for (const dir of env.prependPath) out.push(`PATH prepend: ${dir}`);
+  for (const name of [...env.unset].sort()) out.push(`unset: ${name}`);
+  return out;
+}
+
+/**
+ * The task block of one attempt (M36 "taskBlock order"). Plan text (title, text, subtasks, acceptance criteria) has
+ * every in-repo absolute path rewritten through `map` first. `\n` only, no trailing spaces.
+ */
+export function renderTaskBlock(ledger: Readonly<LedgerV1>, task: TaskNode, slot: SlotLease, map: PathMap): string {
+  void ledger;
+  const rw = (s: string): string => rewriteAbsolutePaths(s, map);
+  const out: string[] = [];
+  out.push(`TASK ${task.id}: ${rw(task.title)}`);
+  if (task.text.trim() !== "") out.push(rw(task.text));
+  if (task.subtasks.length > 0) {
+    out.push("", "SUBTASKS");
+    task.subtasks.forEach((s, i) => out.push(`${i + 1}. ${rw(s)}`));
+  }
+  const list = (paths: readonly string[]): string => (paths.length === 0 ? "(none)" : paths.join(", "));
+  out.push("", `Writes: ${list(task.footprint.writes)}`, `Reads: ${list(task.footprint.reads)}`);
+  out.push("", "ENVIRONMENT", ...environmentLines(slot));
+  if (task.acceptance !== null) {
+    const criteria = acceptanceCriteria(rw(task.acceptance));
+    if (criteria.length > 0) out.push("", "ACCEPTANCE", ...criteria.map((c) => `- ${c}`));
+  }
+  const latest = task.attempts[task.attempts.length - 1];
+  if (latest !== undefined && latest.context.trim() !== "") out.push("", "ATTEMPT CONTEXT", rw(latest.context));
+  out.push("", "MUST NOT DO", ...MUST_NOT_DO_RULES.map((r) => `- ${r}`));
+  if (task.kind === "qa") out.push("", "FINDINGS FORMAT", FINDINGS_INSTRUCTION);
+  return tidy(out.join("\n"));
+}
+
+/** The `criteria:` lines of an `[acceptance]` block as plain sentences (the machine checks are not shown to the child). */
+function acceptanceCriteria(block: string): string[] {
+  const out: string[] = [];
+  for (const raw of block.split(/\r\n|\n|\r/)) {
+    const m = /^\s*criteria\s*:\s*(.+?)\s*$/i.exec(raw);
+    if (m?.[1] !== undefined) out.push(m[1]);
+  }
+  return out;
+}
+
+/** The prefix maps of one expansion (M36 "Prefixes"). */
+function buildPathMap(ledger: Readonly<LedgerV1>, task: TaskNode, slot: SlotLease, env: ExpansionEnv): PathMap {
+  const own = declaredRoot(task.route.line);
+  const mappable = prefixList([...env.worktrees, ...(own === null ? [] : [own])]);
+  const planRoots: string[] = [];
+  for (const t of Object.values(ledger.tasks)) {
+    const r = declaredRoot(t.route.line);
+    if (r !== null) planRoots.push(r);
+  }
+  const inRepo = prefixList([...mappable, ledger.repo.toplevel, ...planRoots]);
+  return { mappable, inRepo, slot: slot.path, longPaths: env.longPaths };
+}
+
+/** The `root=` of a route line (quoted or bare), or null. Only used to build prefix sets; never re-emitted. */
+function declaredRoot(line: string): string | null {
+  const q = QUOTED_ROOT_RE.exec(line);
+  if (q?.[1] !== undefined) return q[1];
+  const m = /\broot\s*=\s*([^\s\]]+)/i.exec(line);
+  return m?.[1] === undefined ? null : m[1].replace(/[,;]+$/, "");
+}
+
+/**
+ * Expands attempt `attempt` of `taskId` (M36). Pure: the same input gives the same bytes; a different attempt gives a
+ * different header line. Throws ExecutorError E_LAUNCH_TASK for an unknown task, an unmappable or too long path, or a
+ * route line that cannot be re-serialized.
+ */
+export function expandTask(i: ExpandInput): ExpandedTask {
+  const task = Object.prototype.hasOwnProperty.call(i.ledger.tasks, i.taskId) ? i.ledger.tasks[i.taskId] : undefined;
+  if (task === undefined) fail("task is not in the ledger", { taskId: i.taskId });
+  const map = buildPathMap(i.ledger, task, i.slot, i.env);
+  const routeLine = renderRouteLine(task, i.slot.path);
+  const taskBlock = renderTaskBlock(i.ledger, task, i.slot, map);
+  const prompt = formatLaunchPrompt(
+    i.ledger.sharedContext,
+    { planId: i.ledger.planId, taskId: i.taskId, attempt: i.attempt, nonce: i.nonce },
+    taskBlock,
+  );
+  return {
+    prompt,
+    routeLine,
+    acceptance: task.acceptance === null ? null : rewriteAbsolutePaths(task.acceptance, map),
+    verify: task.verify === "none" ? null : task.verify,
+    workRoot: i.slot.path,
+  };
+}
+
 export type { LedgerV1, TaskId, TaskNode };
