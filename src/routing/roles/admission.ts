@@ -92,9 +92,20 @@ export interface AdmissionService {
   resolve(decl: Declaration, ctx: DeclarationContext): Promise<Admission>;
   /**
    * The `repo=` lookup `resolve` uses for a bare name (a repository name, or the directory name of a linked worktree below the
-   * parents), read-only. The name is not checked here: refuse a non-bare name with {@link repoNameProblem} first.
+   * parents), read-only. The name is not checked here: refuse a non-bare name with {@link repoNameProblem} first. `resolve` passes
+   * no options.
    */
-  find(name: string): Promise<AdmissionLookup>;
+  find(name: string, opts?: AdmissionFindOptions): Promise<AdmissionLookup>;
+}
+
+/** Options of {@link AdmissionService.find}. */
+export interface AdmissionFindOptions {
+  /**
+   * QA round 1 (Phase 3 lot 1, F4): asked for every candidate directory named X before anything else runs on it (no `.git` probe,
+   * no `realpath`, no git). A candidate it rejects, or for which it throws, is skipped and noted in `refused`. The caller's own
+   * admission test, for example the read set.
+   */
+  readonly eligible?: (candidatePath: string) => boolean;
 }
 
 /** What a `repo=X` lookup saw: the matches, the refusal notes, the places searched, and whether the scan was capped. */
@@ -319,6 +330,14 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
   /** {@link excludedBy} on the path as given and, on win32, with native separators (git prints `/`). */
   const excludedText = (path: string): string | undefined =>
     excludedBy(path) ?? (win && path.includes("/") ? excludedBy(path.replace(/\//g, "\\")) : undefined);
+  /**
+   * QA round 1 (Phase 3 lot 1, F3): why `shown` is refused when `routing.repoExclude` matches the repository it belongs to (its
+   * canonical main worktree `repository`, or git's text `listed` of it): a linked worktree never opens an excluded repository.
+   */
+  const repositoryExcluded = (shown: string, repository: string, listed: string = repository): string | undefined => {
+    const pattern = excludedText(listed) ?? excludedText(repository);
+    return pattern === undefined ? undefined : `root=${shown} is a worktree of ${repository}, which is excluded by routing.repoExclude (${pattern}): no work root.`;
+  };
   const unique = (items: readonly string[]): string[] => {
     const seen = new Set<string>();
     const out: string[] = [];
@@ -404,6 +423,9 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
     const main = entries[0];
     const repository = main === undefined ? null : canonical(main.path);
     if (main === undefined || repository === null) return refuse(`root=${shown}: the main worktree of its repository does not resolve: no work root.`);
+    // QA round 1 (Phase 3 lot 1, F3): every admission ends here, the `find` candidates included; an exclusion is final.
+    const excludedRepo = repositoryExcluded(shown, repository, main.path);
+    if (excludedRepo !== undefined) return refuseFinal(excludedRepo);
     const live = entries.filter((entry) => !entry.prunable);
     const matched = live.find((entry) => text(entry.path) === text(real)) ?? live.find((entry) => samePath(entry.path, real));
     if (matched === undefined) return refuse(`root=${shown} is not listed by git worktree list of ${repository}: no work root.`);
@@ -464,6 +486,9 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
       const main = entries[0];
       const repository = main === undefined ? null : canonical(main.path);
       if (repository === null) return refuse(`root=${shown}: the main worktree of the repository that lists it does not resolve: no work root.`);
+      // QA round 1 (Phase 3 lot 1, F3): a worktree of an excluded repository is refused before git runs in it.
+      const excludedRepo = repositoryExcluded(shown, repository, main?.path);
+      if (excludedRepo !== undefined) return refuseFinal(excludedRepo);
       const real = canonical(shown);
       if (real === null) return refuse(`root=${shown} is a worktree of ${repository} but does not resolve: no work root.`);
       let again: WorktreeEntry[];
@@ -496,6 +521,9 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
     const real = result.location.worktree;
     const excluded = excludedText(shown) ?? excludedText(real);
     if (excluded !== undefined) return refuse(`root=${shown} is excluded by routing.repoExclude (${excluded}): no work root.`);
+    // QA round 1 (Phase 3 lot 1, F3): `locate` already refuses this; the gate keeps it whatever produced the location.
+    const excludedRepo = repositoryExcluded(shown, result.location.repository);
+    if (excludedRepo !== undefined) return refuse(excludedRepo);
     const shownText = text(shown);
     const realText = text(real);
     for (const parent of parents) {
@@ -540,7 +568,17 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
    * `repo=X`: `<parent>\X`, then `<parent>\*\X` while the depth allows (one listing per level); admitted by rule 1, named X.
    * At most {@link LOOKUP_MAX_DIRS} directories are visited (`capped`).
    */
-  const lookup = async (name: string): Promise<AdmissionLookup> => {
+  const lookup = async (name: string, opts: AdmissionFindOptions = {}): Promise<AdmissionLookup> => {
+    const { eligible } = opts;
+    /** QA round 1 (Phase 3 lot 1, F4): the caller's test, asked before anything runs on the candidate; a throw rejects. */
+    const allowed = (candidate: string): boolean => {
+      if (eligible === undefined) return true;
+      try {
+        return eligible(candidate) === true;
+      } catch {
+        return false;
+      }
+    };
     const found: RepoLocation[] = [];
     const refused: string[] = [];
     const searched: string[] = [];
@@ -559,6 +597,10 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
           visited++;
           const candidate = paths.join(dir, name);
           if (!deps.isDirectory(candidate)) continue;
+          if (!allowed(candidate)) {
+            refused.push(`root=${candidate} is not eligible for this lookup: skipped before any git call.`);
+            continue;
+          }
           const result = await ruleOne(candidate);
           if (result === undefined) continue;
           if (!result.ok) {

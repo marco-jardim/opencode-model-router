@@ -229,6 +229,59 @@ describe("admission without git (fake deps)", () => {
     expect(stopped.ok ? "" : stopped.reason).toContain(`… and ${String(capped.refused.length - 10)} more. The search stopped after 2000 directories.`);
   });
 
+  it("QA-R1 F4 (Phase 3 lot 1): find(name, { eligible }) skips a rejected candidate before any git call and notes it", async () => {
+    // D:\git\x and D:\git\org\x are both repositories named x (each its own main worktree).
+    const world = (): { deps: AdmissionDeps; calls: string[] } => recording({
+      ...fakeWin({ t: 0 }),
+      listWorktrees: async (cwd) => `worktree ${cwd.replace(/\\/g, "/")}\nHEAD ${SHA}\nbranch refs/heads/main\n\n`,
+      showToplevel: async (cwd) => cwd,
+      commonDir: async (cwd) => `${cwd}\\.git`,
+      gitEntry: () => true,
+      realpath: (path) => path.replace(/\//g, "\\"),
+      isDirectory: (path) => /^d:\\git(\\org)?\\x$/i.test(path),
+      readdir: (path) => (/^d:\\git$/i.test(path) ? ["org", "x"] : []),
+    });
+    const config = { parents: ["D:\\git"], depth: 2, exclude: [] };
+    const rejected = "D:\\git\\org\\x";
+    const touching = (calls: readonly string[], path: string): string[] => calls.filter((call) => call.endsWith(` ${path}`));
+
+    const gated = world();
+    const asked: string[] = [];
+    const eligible = (path: string): boolean => {
+      asked.push(path);
+      return path !== rejected;
+    };
+    const filtered = await createAdmission(config, gated.deps).find("x", { eligible });
+    expect(asked).toEqual(["D:\\git\\x", rejected]);
+    expect(filtered.found.map((location) => location.worktree)).toEqual(["D:\\git\\x"]);
+    expect(filtered.refused).toEqual([`root=${rejected} is not eligible for this lookup: skipped before any git call.`]);
+    // Only the directory probe touched the rejected candidate: no gitEntry, realpath, show-toplevel, worktree list or common dir.
+    expect(touching(gated.calls, rejected)).toEqual([`isDirectory ${rejected}`]);
+    expect(gated.calls.filter((call) => /^(showToplevel|listWorktrees|commonDir) /.test(call)).every((call) => !call.includes("\\org\\"))).toBe(true);
+
+    // A predicate that throws refuses its candidate (fail closed): no git at all.
+    const thrown = world();
+    const closed = await createAdmission(config, thrown.deps).find("x", { eligible: () => { throw new Error("boom"); } });
+    expect(closed.found).toEqual([]);
+    expect(closed.refused).toEqual([
+      "root=D:\\git\\x is not eligible for this lookup: skipped before any git call.",
+      `root=${rejected} is not eligible for this lookup: skipped before any git call.`,
+    ]);
+    expect(thrown.calls.filter((call) => /^(showToplevel|listWorktrees|commonDir|gitEntry) /.test(call))).toEqual([]);
+
+    // Without eligible, unchanged: both candidates run git and are found; resolve() (which never passes eligible) sees both.
+    const open = world();
+    const admission = createAdmission(config, open.deps);
+    const all = await admission.find("x");
+    expect(all).toMatchObject({ refused: [], searched: ["D:\\git\\x", "D:\\git\\*\\x"], capped: false });
+    expect(all.found.map((location) => location.worktree)).toEqual(["D:\\git\\x", rejected]);
+    expect(open.calls).toContain(`showToplevel ${rejected}`);
+    expect(await admission.resolve({ repo: "x" }, { sessionRepository: "D:\\git\\x" })).toEqual({
+      ok: false,
+      reason: `repo=x matches 2 repositories: D:\\git\\x and ${rejected}: no work root. Name one with root="<path>".`,
+    });
+  });
+
   it("refuses when no root, repo or branch is declared", async () => {
     const admission = createAdmission({ parents: ["D:\\git"], depth: 2, exclude: [] }, untouchable("win32"));
     expect(await admission.resolve({}, { sessionRepository: "D:\\git\\app" })).toEqual({ ok: false, reason: expect.stringContaining("no root=, repo= or branch=") });
@@ -425,6 +478,11 @@ describe("Q10 (real git): repo= also matches the directory name of a linked work
     git(join(parent, "dt1"), "worktree", "add", "-q", "--detach", join(parent, "dtwin"));
     repo(join(parent, "dt2"));
     git(join(parent, "dt2"), "worktree", "add", "-q", "--detach", join(parent, "org", "dtwin"));
+    // QA round 1 (Phase 3 lot 1, F3): repository secret (excluded in that test only) with a linked worktree secret-feat below the
+    // parent (its directory name matches no exclusion) and secret-out outside the parents.
+    repo(join(parent, "secret"));
+    git(join(parent, "secret"), "worktree", "add", "-q", "-b", "secret-feat", join(parent, "secret-feat"));
+    git(join(parent, "secret"), "worktree", "add", "-q", "-b", "secret-out", join(outside, "secret-out"));
   }, 120_000);
 
   afterAll(() => {
@@ -529,6 +587,48 @@ describe("Q10 (real git): repo= also matches the directory name of a linked work
     const wt = await admission.find("lib-wt");
     expect(wt.found.map((location) => [location.name, location.worktree, location.branch])).toEqual([["lib-main", join(parent, "lib-wt"), "wt-branch"]]);
     expect((await admission.find("nowhere")).found).toEqual([]);
+  });
+
+  it("QA-R1 F3 (Phase 3 lot 1): a linked worktree of an excluded repository is refused by admit, resolve and find", async () => {
+    const secret = join(parent, "secret");
+    const feat = join(parent, "secret-feat");
+    const out = join(outside, "secret-out");
+    const admission = createAdmission({ parents: [parent], depth: 2, exclude: [secret] }, defaultAdmissionDeps());
+    const note = (root: string): string => `root=${root} is a worktree of ${secret}, which is excluded by routing.repoExclude (${secret}): no work root.`;
+
+    // admit: rule 1 (below the parent), with or without the excluded repository known; rule 2 (outside, listed by it).
+    expect(await admission.admit(feat)).toEqual({ ok: false, reason: note(feat) });
+    expect(await admission.admit(feat, [secret])).toEqual({ ok: false, reason: note(feat) });
+    expect(await admission.admit(out, [secret])).toEqual({ ok: false, reason: note(out) });
+
+    // resolve: repo=<worktree dir>, root=, and branch= alone in a session of the excluded repository.
+    expect(await admission.resolve({ repo: "secret-feat" }, session())).toEqual({
+      ok: false,
+      reason: `repo=secret-feat matches no repository below routing.repoParents (searched ${join(parent, "secret-feat")}, ${join(parent, "*", "secret-feat")}): no work root. ${note(feat)}`,
+    });
+    expect(await admission.resolve({ root: feat }, session())).toEqual({ ok: false, reason: note(feat) });
+    expect(await admission.resolve({ root: out }, { sessionRepository: secret })).toEqual({ ok: false, reason: note(out) });
+    // (pick admits git's text of the worktree path: `/` separators on win32)
+    expect(await admission.resolve({ branch: "secret-feat" }, { sessionRepository: secret })).toEqual({
+      ok: false,
+      reason: expect.stringContaining(`secret-feat is a worktree of ${secret}, which is excluded by routing.repoExclude (${secret}): no work root.`),
+    });
+
+    // find: no match, the refusal noted.
+    expect(await admission.find("secret-feat")).toEqual({
+      found: [],
+      refused: [note(feat)],
+      searched: [join(parent, "secret-feat"), join(parent, "*", "secret-feat")],
+      capped: false,
+    });
+
+    // A worktree of a repository that is not excluded is still admitted, by every path.
+    const cwt = join(parent, "c-wt");
+    expect(await admission.admit(cwt)).toMatchObject({ ok: true, location: { repository: join(parent, "c1"), name: "c1", worktree: cwt, branch: "c-branch" } });
+    expect(await admission.resolve({ repo: "c-wt" }, session())).toMatchObject({ ok: true, location: { repository: join(parent, "c1"), worktree: cwt } });
+    expect((await admission.find("c-wt")).found.map((location) => [location.name, location.worktree])).toEqual([["c1", cwt]]);
+    const other = join(outside, "lib-other");
+    expect(await admission.admit(other, [join(parent, "lib-main")])).toMatchObject({ ok: true, location: { name: "lib-main", worktree: other, branch: "feat/other" } });
   });
 });
 
