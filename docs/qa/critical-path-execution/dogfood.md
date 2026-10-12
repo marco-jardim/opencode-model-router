@@ -285,3 +285,31 @@ splat expanded to no file filter): 229 files passed, 2 failed — the H3 sentine
 `test\unit\exec.test.ts` "a deadline after the direct child exited kills what it left running within 3 s (QA-1.2-1,
 G4)", which passes isolated (`--maxWorkers=1`): a load-sensitive timing flake, recorded for the 6.2 pre-flight.
 `smoke:cpx` 57/57, `smoke:v2` 2/2, `smoke:v1` 27 passed / 11 skipped (1.18.35 on PATH).
+
+### DF1.QA round 2 (reviewer `ses_ecef46ce5ffecJAxfColEb3eMV`, heavy, at `cpx/pdf1-1` @ `51d3c51`)
+
+13 findings: 4 major, 8 minor, 1 nit; none blocking or critical. Reviewer runs at `51d3c51`: typecheck green;
+`test/integration` and `test/golden` (101) green; `test/unit` green except the known `exec.test.ts` deadline flake (42/42
+alone); DF test files 232 + 371 green; docs-drift 92. The review's own handle got `lost in restart` twice while it ran
+(DF-1-10 again; ignored per the workaround).
+
+| Finding | Severity | Disposition |
+|---|---|---|
+| QA-DF1-16 held entries still settled `method: "deterministic"`; held path untested | major | fix dispatch A (`src\index.ts`, `src\verify\*`) |
+| QA-DF1-17 DF-1-4 element check depends on timing (element seen while `processing`) | major | fix dispatch B (`src\compat\*`) |
+| QA-DF1-18 shared journal assumes one module copy per process (marks, compaction temp file) | major | fix dispatch C (`src\verify\pending.ts`) |
+| QA-DF1-19 roles-mode start-up `git worktree list` ignores `workRoots`; DF-1-1 claims overstated | major | fix dispatch C (`role-agents.ts`) + A (comment) + CHANGELOG/dogfood wording |
+| QA-DF1-20 content-matched elements (identical answers, lost seen set) | minor | dispatch B |
+| QA-DF1-21 evicted owner location → running child read as lost | minor | dispatch B |
+| QA-DF1-22 beat file robustness, stale beats, docs | minor | dispatch C |
+| QA-DF1-23 DF-1-9 tests and lookup timeout | minor | dispatch B |
+| QA-DF1-24 DF-1-5 prompt-boundary tests | minor | dispatch B |
+| QA-DF1-25 work-roots matcher semantics and realpath | minor | dispatch C |
+| QA-DF1-26 WORK_ROOT_RULE wording | minor | dispatch C |
+| QA-DF1-27 CHANGELOG / record overclaims; evidence commit | minor | orchestrator, with the round-2 fixes |
+| QA-DF1-28 tests that pass without the fix | nit | dispatch B (labelled as guards) |
+
+Correction (QA-DF1-19/-27): the DF-1-1 follow-up above relied on host log lines, which do not show the router's own git
+processes; in roles mode the router also ran `git worktree list --porcelain` at start in every booted location,
+`D:\git\opencode-model-router` included (read-only). The `51d3c51` claim "no start-up git outside `workRoots`" covered
+only the reference GC.
