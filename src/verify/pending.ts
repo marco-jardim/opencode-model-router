@@ -1356,10 +1356,9 @@ export function compactPendingRecords(records: readonly PendingRecord[], opts: {
         return;
       }
       case "tomb": {
-        if (handle !== undefined) {
-          dropEntry(handle);
-          dropHold(handle);
-        }
+        // QA-2.1-28: a tomb ends a pending ENTRY (TTL, eviction, session gone). A hold is the adapter's and ends only with
+        // `posted` (then an inactive placeholder) or `forget`: a tomb never takes the placeholder that hides the raw completion.
+        if (handle !== undefined) dropEntry(handle);
         if (callID !== undefined) {
           drop(inflight.get(callID)?.index);
           inflight.delete(callID);
@@ -1437,11 +1436,24 @@ export function compactPendingRecords(records: readonly PendingRecord[], opts: {
     }
   });
   for (const [handle, e] of entries) {
-    if (e.stateValue === "verified") dropEntry(handle);
-    else if (opts.ttlMs !== undefined && !e.held && opts.now - e.at >= opts.ttlMs) dropEntry(handle);
+    if (e.stateValue === "verified") {
+      // QA-2.1-17: the verdict of a hold that never started posting stays (its entry and `state`): the next start posts it.
+      const h = holds.get(handle);
+      if (h === undefined || h.posting !== undefined || h.posted !== undefined) dropEntry(handle);
+    } else if (opts.ttlMs !== undefined && !e.held && opts.now - e.at >= opts.ttlMs) dropEntry(handle);
   }
   if (opts.ttlMs !== undefined) {
     for (const v of inflight.values()) if (opts.now - v.at > opts.ttlMs) drop(v.index);
+  }
+  // QA-2.1-28: the cap `foldDormantRecords` applies at load applies here too: past MAX_DORMANT_POSTED_HOLDS posted
+  // placeholders, the oldest go (their `hold` and `posted` lines); an unposted hold is never dropped (no age, as at load).
+  let postedHolds = 0;
+  for (const h of holds.values()) if (h.posted !== undefined) postedHolds += 1;
+  for (const [handle, h] of [...holds]) {
+    if (postedHolds <= MAX_DORMANT_POSTED_HOLDS) break;
+    if (h.posted === undefined) continue;
+    dropHold(handle);
+    postedHolds -= 1;
   }
   return records.filter((_, index) => keep[index]);
 }
@@ -1468,8 +1480,8 @@ export function processedKeyOf(record: Readonly<Record<string, unknown>>): strin
 
 /**
  * Folds the parsed records of `pending.jsonl` (section 11.3): `forget` removes a session's earlier records, `processed` closes an
- * `inflight`, `posted` / `tomb` close a `hold` (and a tombstoned `callID` closes its `inflight`). Inflight records older than
- * `ttlMs` are dropped; hold records never expire. Pure.
+ * `inflight`, `posted` turns a `hold` into an inactive placeholder, and a tombstoned `callID` closes its `inflight` (QA-2.1-28: a
+ * `tomb` never closes a hold). Inflight records older than `ttlMs` are dropped; hold records never expire. Pure.
  */
 export function foldDormantRecords(
   records: readonly PendingRecord[],
@@ -1479,6 +1491,8 @@ export function foldDormantRecords(
   const inflight = new Map<string, PendingRecord>();
   /** handle -> the `hold` record, then its follow-ups (`hold-text`, the newest `posting`, `posted`). */
   const holds = new Map<string, { hold: PendingRecord; text?: PendingRecord; posting?: PendingRecord; posted?: PendingRecord }>();
+  /** QA-2.1-17: handle -> the newest `state` record that settled its entry `verified` with a verdict. */
+  const verdicts = new Map<string, PendingRecord>();
   const str = (value: unknown): string | undefined => (typeof value === "string" && value !== "" ? value : undefined);
   /** The adapter writes `parentSessionID` / `childSessionID` on `inflight`, `parent` / `child` on `hold`: both are read. */
   const parentOf = (rec: PendingRecord): string | undefined => str(rec.parent) ?? str(rec.parentSessionID);
@@ -1512,6 +1526,11 @@ export function foldDormantRecords(
         if (held !== undefined && held.posted === undefined) held.posting = rec;
         break;
       }
+      case "state": {
+        const handle = str(rec.handle);
+        if (handle !== undefined && rec.state === "verified" && rec.verdict !== null && typeof rec.verdict === "object") verdicts.set(handle, rec);
+        break;
+      }
       case "posted": {
         // QA-2.1-10: a posted hold survives as an inactive placeholder (the host history still holds the raw completion).
         const held = holds.get(str(rec.handle) ?? "");
@@ -1519,9 +1538,8 @@ export function foldDormantRecords(
         break;
       }
       case "tomb": {
-        const handle = str(rec.handle);
+        // QA-2.1-28: an entry tomb never closes a hold (its placeholder, or a hold still owed a verdict): see compaction.
         const callID = str(rec.callID);
-        if (handle !== undefined) holds.delete(handle);
         if (callID !== undefined) inflight.delete(callID);
         break;
       }
@@ -1559,12 +1577,16 @@ export function foldDormantRecords(
     if (opts.now - at > opts.ttlMs) continue;
     sessionOf(parentOf(rec) ?? "").inflight.push(rec);
   }
-  for (const value of holds.values()) {
+  for (const [handle, value] of holds) {
     const list = sessionOf(parentOf(value.hold) ?? "").holds;
     list.push(value.hold);
     if (value.text !== undefined) list.push(value.text);
     if (value.posting !== undefined) list.push(value.posting);
     if (value.posted !== undefined) list.push(value.posted);
+    // QA-2.1-17: a verdict the gate reached (its entry's `verified` state) but never started posting is handed over with the
+    // hold, so the adopter posts it instead of running the gate again.
+    const verdict = verdicts.get(handle);
+    if (verdict !== undefined && value.posting === undefined && value.posted === undefined) list.push(verdict);
   }
   return { sessions, processed };
 }

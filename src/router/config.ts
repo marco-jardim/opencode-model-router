@@ -1858,7 +1858,8 @@ function sanitizeLeases(value: unknown): TolerantBlock<LeasesConfig> {
  * The v2-only `routing` keys the raw config configures, as dotted paths in a fixed order.
  * `raw` is the config as written (its `routing` block is read) or the `routing` block
  * itself. A key counts when it is present and not `undefined`, whether or not its value is
- * valid. `index.ts` logs one notice per key on v1, where they are ignored.
+ * valid. On v1, where they are ignored, `index.ts` logs ONE notice per process that names
+ * every configured key (QA-2.1-32).
  */
 export function configuredV2OnlyKeys(raw: unknown): string[] {
   const routing = isPlainObject(raw) && isPlainObject(raw.routing) ? raw.routing : isPlainObject(raw) ? raw : undefined;

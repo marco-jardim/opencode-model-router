@@ -10,14 +10,15 @@
  * same matcher the live path uses.
  *
  * The defects found by 2.1.8 are fixed and pinned by plain tests named "Dn: ...": D2 early end processed at the ack, D3 a failed
- * held child's UNVERIFIABLE verdict posted (a journal that vanishes now fails closed instead, QA-2.1-8), D4 resume by `task_id` of a held child refused, D5 a lost
+ * held child's UNVERIFIABLE verdict posted (a journal that vanishes fails closed until it is recreated from memory, QA-2.1-8, QA-2.1-16), D4 resume by `task_id` of a held child refused, D5 a lost
  * child (empty history) annotated. Verdict posting through the real adapter to a busy and to an idle parent (PASS, FAIL: one
  * `synthetic` with `resume: true`) is tested in "held verdicts posted to the parent" below. Timing rows of the static engine feeding
  * the background decision ("static engine: timing rows…") and the route hint never carrying held output are tested here too.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { PENDING_RELOAD_RETRY_MS, reloadFailedResumeText } from "../../src/compat/v2-hooks";
 import { bootBgHost, restoreEnv, type BgHost, type ToolEvent } from "../helpers/v2-bg-host";
 
@@ -234,9 +235,12 @@ describe("background dispatch: acknowledgement, in-flight list, completion annot
     h.childContext.set(CHILD, [{ type: "assistant", id: "m2", content: [{ type: "text", text: "tracked result" }] }]);
     h.emit({ type: "session.execution.succeeded", id: "ev-end-tracked", created: 2, data: { sessionID: CHILD } });
     await h.settled();
-    const state = tail(await request(h, [user("continue")]));
-    expect(state).not.toContain("In flight (background)");
-    expect(state).not.toContain("router guarantees pending");
+    // Once the processing settled there is nothing left to report: the whole context is checked (no turn-state tail at all is
+    // the expected outcome, so `tail()` would throw).
+    const text = allText(await request(h, [user("continue")]));
+    expect(text).not.toContain("In flight (background)");
+    expect(text).not.toContain("router guarantees pending");
+    expect(text).not.toContain("verifying");
   });
 
   it("a completion element with further attributes still completes a child whose context could not be read", async () => {
@@ -614,60 +618,73 @@ describe("the pending journal fails under a held dispatch (QA-2.1-3, QA-2.1-8)",
     expect(tail(await request(h, [user("go on")]))).not.toContain("Held for verification");
   });
 
-  it("QA-2.1-8: a journal that vanishes under the process fails closed and is never recreated", async () => {
+  it("QA-2.1-16: a journal that vanishes under the process is recreated once from memory: held state survives, fail-closed ends", async () => {
+    const warn = vi.spyOn(console, "warn");
     const h = await boot("auto");
     h.emit(created(CHILD, ORCH));
     await h.drain();
     const call = await h.before(dispatch({ background: true }));
-    await h.after({ ...call, status: "completed", result: structuredClone(RUNNING) });
+    const first = await h.after({ ...call, status: "completed", result: structuredClone(RUNNING) });
+    expect(JSON.stringify(first.result)).toContain("held until verification finishes");
     expect(existsSync(h.journalPath)).toBe(true);
     rmSync(h.journalPath);
     const second = "child-2";
     h.sessions.set(second, { parentID: ORCH });
     h.emit(created(second, ORCH));
     await h.drain();
+    // The next journal write finds the journal gone: the journal is rewritten from the in-memory state and the write retried.
     const next = await h.before(dispatch({ background: true }));
-    await h.after({ ...next, status: "completed", result: { output: { sessionID: second, status: "running", output: "Working" }, content: "Working", metadata: { sessionID: second } } });
-    // Fail closed (memo 12): a completion this process cannot prove processed is redacted.
-    const event = await request(h, [user("go on"), completion("child-unknown", "SECRET unprocessed output")]);
-    expect(allText(event)).not.toContain("SECRET unprocessed output");
-    // The compaction hook fails closed the same way: a summary never carries it either.
-    const compaction = h.sessionHooks.compaction;
-    if (compaction === undefined) throw new Error("no compaction hook");
-    const messages = [{ id: "m1", role: "user", content: [{ type: "text", text: `<subagent sessionID="child-unknown" state="completed">SECRET unprocessed output</subagent>` }] }];
-    await compaction({ sessionID: ORCH, messages } as never);
-    expect(JSON.stringify(messages)).not.toContain("SECRET unprocessed output");
+    const nextDone = await h.after({ ...next, status: "completed", result: { output: { sessionID: second, status: "running", output: "Working" }, content: "Working", metadata: { sessionID: second } } });
+    await h.settled();
+    expect(existsSync(h.journalPath)).toBe(true);
+    const records = readFileSync(h.journalPath, "utf8").split("\n").filter((line) => line !== "").map((line) => JSON.parse(line) as Record<string, unknown>);
+    // The first dispatch came back from memory exactly once: its in-flight attempt (with its dispatch data) and its hold.
+    expect(records.filter((r) => r.kind === "inflight" && r.callID === call.id)).toHaveLength(1);
+    expect(records.find((r) => r.kind === "inflight" && r.callID === call.id)?.dispatch).toMatchObject({ prompt: expect.any(String) });
+    expect(records.filter((r) => r.kind === "hold" && r.child === CHILD)).toHaveLength(1);
+    // The retried write of the second dispatch landed, and it is held: holding is available again (the fail-closed state ended).
+    expect(records.filter((r) => r.kind === "inflight" && r.callID === next.id)).toHaveLength(1);
+    expect(records.filter((r) => r.kind === "hold" && r.child === second)).toHaveLength(1);
+    expect(JSON.stringify(nextDone.result)).toContain("held until verification finishes");
+    // No redaction any more: a completion of an unknown child is shown, and both children are still held.
+    const event = await request(h, [user("go on"), completion("child-other", "VISIBLE after the recreation")]);
+    expect(allText(event)).toContain("VISIBLE after the recreation");
+    expect(tail(event)).toContain("[router] Held for verification");
+    // Later appends and loads find the recreated journal: one more dispatch is journaled without another recreation.
+    const third = "child-3";
+    h.sessions.set(third, { parentID: ORCH });
+    h.emit(created(third, ORCH));
     await h.drain();
-    expect(existsSync(h.journalPath)).toBe(false);
-    // The failed state is not permanent: once the journal is back, a later hook retries the reload (at most every
-    // PENDING_RELOAD_RETRY_MS) and the fail-closed redaction ends.
-    writeFileSync(h.journalPath, "");
-    vi.useFakeTimers({ toFake: ["Date"] });
-    try {
-      vi.setSystemTime(Date.now() + PENDING_RELOAD_RETRY_MS + 1_000);
-      await vi.waitFor(async () => {
-        const again = await request(h, [user("later"), completion("child-other", "VISIBLE after the reload")]);
-        expect(allText(again)).toContain("VISIBLE after the reload");
-      });
-    } finally {
-      vi.useRealTimers();
-    }
+    const last = await h.before(dispatch({ background: true }));
+    await h.after({ ...last, status: "completed", result: { output: { sessionID: third, status: "running", output: "Working" }, content: "Working", metadata: { sessionID: third } } });
+    await h.settled();
+    const after = readFileSync(h.journalPath, "utf8").split("\n").filter((line) => line !== "").map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(after.filter((r) => r.kind === "inflight" && r.callID === last.id)).toHaveLength(1);
+    expect(after.filter((r) => r.kind === "hold" && r.child === CHILD)).toHaveLength(1);
+    // Warned once for the vanishing, once for the recovery; never a failed recreation.
+    const told = (part: string): number => warn.mock.calls.filter((args) => args.some((arg) => String(arg).includes(part))).length;
+    expect(told("the pending journal vanished")).toBe(1);
+    expect(told("the pending journal was recreated from memory")).toBe(1);
+    expect(told("could not be recreated")).toBe(0);
+    warn.mockRestore();
   });
 
   it("QA-2.1-20: while the journal is not reloaded, a Code Mode execute that resumes an unknown session is refused like a subagent resume", async () => {
-    const h = await boot("auto");
+    // QA-2.1-16 recreates a vanished journal, so the reload-failed state is made deterministic another way: a directory sits
+    // where pending.jsonl belongs. The reload at start fails (the file cannot be read), and so does every retry; nothing has
+    // vanished, so nothing is recreated.
+    const home = mkdtempSync(join(tmpdir(), "omr-v2-bg-"));
+    const blocker = join(home, ".local", "state", "opencode-model-router", "pending.jsonl");
+    mkdirSync(blocker, { recursive: true });
+    writeFileSync(join(blocker, "keep"), "not a journal");
+    const h = await boot("auto", { home });
+    expect(h.journalPath).toBe(blocker);
     h.emit(created(CHILD, ORCH));
     await h.drain();
     const call = await h.before(dispatch({ background: true }));
-    await h.after({ ...call, status: "completed", result: structuredClone(RUNNING) });
-    rmSync(h.journalPath);
-    const second = "child-2";
-    h.sessions.set(second, { parentID: ORCH });
-    h.emit(created(second, ORCH));
-    await h.drain();
-    // The next journal write finds the journal gone: the process fails closed (reload failed).
-    const next = await h.before(dispatch({ background: true }));
-    await h.after({ ...next, status: "completed", result: { output: { sessionID: second, status: "running", output: "Working" }, content: "Working", metadata: { sessionID: second } } });
+    const acked = await h.after({ ...call, status: "completed", result: structuredClone(RUNNING) });
+    // Holding is off while the journal is not reloaded.
+    expect(JSON.stringify(acked.result)).not.toContain("held until verification finishes");
     await h.settled();
     const execute = (code: string): ToolEvent => ({ sessionID: ORCH, agent: "build", messageID: "m-exec", id: `call-exec-${code.length}`, tool: "execute", input: { code } });
     await expect(h.before(execute(`await tools.subagent({ agent: "general", prompt: "continue", sessionID: "child-unknown" });`)))
@@ -679,6 +696,18 @@ describe("the pending journal fails under a held dispatch (QA-2.1-3, QA-2.1-8)",
       .rejects.toThrow(reloadFailedResumeText("child-unknown"));
     // Code that resumes nothing goes through.
     await expect(h.before(execute(`await tools.subagent({ agent: "general", prompt: "a fresh task" });`))).resolves.toBeDefined();
+    // A refused attempt past PENDING_RELOAD_RETRY_MS starts another reload; it fails again, so the refusal stands.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(Date.now() + PENDING_RELOAD_RETRY_MS + 1_000);
+      await expect(h.before(execute(`await tools.subagent({ agent: "general", prompt: "continue", sessionID: "child-unknown" });`)))
+        .rejects.toThrow(reloadFailedResumeText("child-unknown"));
+      await h.settled();
+      await expect(h.before(execute(`await tools.subagent({ agent: "general", prompt: "again", sessionID: "child-unknown" });`)))
+        .rejects.toThrow(reloadFailedResumeText("child-unknown"));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

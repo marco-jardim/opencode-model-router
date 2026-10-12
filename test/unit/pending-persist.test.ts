@@ -88,7 +88,7 @@ describe("foldDormantRecords (memo 11.3)", () => {
     expect(processed).toEqual(new Set(["k1\u0000c1", "explicit-key"]));
   });
 
-  it("posted turns a hold into an inactive placeholder (QA-2.1-10); tomb closes a hold and the inflight of its callID", () => {
+  it("posted turns a hold into an inactive placeholder (QA-2.1-10); a tomb closes the inflight of its callID but never the hold (QA-2.1-28)", () => {
     const { sessions } = foldDormantRecords(
       [
         rec("hold", { handle: "vrf_a", parent: "p1", child: "k1", callID: "c1" }),
@@ -103,9 +103,47 @@ describe("foldDormantRecords (memo 11.3)", () => {
       { now: NOW, ttlMs: TTL },
     );
     // One `hold` record per hold; the posted one is followed by its `posted` record only (its text and posting are gone).
-    expect(sessions.get("p1")?.holds.map((r) => `${r.kind}:${String(r.handle)}`)).toEqual(["hold:vrf_a", "posted:vrf_a", "hold:vrf_c"]);
-    expect(sessions.get("p1")?.holds.filter((r) => r.kind === "hold").map((r) => r.handle)).toEqual(["vrf_a", "vrf_c"]);
+    // QA-2.1-28: the entry tomb of vrf_b leaves its hold (it still owes a verdict); only its callID's inflight is closed.
+    expect(sessions.get("p1")?.holds.map((r) => `${r.kind}:${String(r.handle)}`)).toEqual(["hold:vrf_a", "posted:vrf_a", "hold:vrf_b", "hold:vrf_c"]);
+    expect(sessions.get("p1")?.holds.filter((r) => r.kind === "hold").map((r) => r.handle)).toEqual(["vrf_a", "vrf_b", "vrf_c"]);
     expect(sessions.get("p1")?.inflight).toEqual([]);
+  });
+
+  it("QA-2.1-28: a TTL tomb of a posted hold's entry keeps the placeholder, so the raw completion stays hidden after a restart", () => {
+    const { sessions } = foldDormantRecords(
+      [
+        rec("hold", { handle: "vrf_p", parent: "p1", child: "k1", callID: "c1" }),
+        rec("posted", { handle: "vrf_p", at: NOW }),
+        rec("tomb", { handle: "vrf_p", cause: "ttl", at: NOW }),
+      ],
+      { now: NOW, ttlMs: TTL },
+    );
+    expect(sessions.get("p1")?.holds.map((r) => `${r.kind}:${String(r.handle)}`)).toEqual(["hold:vrf_p", "posted:vrf_p"]);
+  });
+
+  it("QA-2.1-17: a verdict reached but never posting rides with its hold, through the fold and the compaction", () => {
+    const verdict = { pass: true, outcome: "pass", method: "deterministic", reasons: [], caveats: [] };
+    const label = (r: PendingRecord): string => `${r.kind}:${String(r.handle ?? r.callID ?? "")}`;
+    const records = [
+      rec("entry", { handle: "vrf_v", parent: "p1", state: "held", createdAt: NOW }),
+      rec("hold", { handle: "vrf_v", parent: "p1", child: "k1", callID: "c1" }),
+      rec("hold-text", { handle: "vrf_v", text: "done", status: "succeeded", at: NOW }),
+      rec("state", { handle: "vrf_v", state: "verifying", at: NOW }),
+      rec("state", { handle: "vrf_v", state: "verified", verdict, at: NOW }),
+      // A verdict already posting is re-posted from its `posting` record instead: no state record is handed over.
+      rec("entry", { handle: "vrf_w", parent: "p1", state: "held", createdAt: NOW }),
+      rec("hold", { handle: "vrf_w", parent: "p1", child: "k2", callID: "c2" }),
+      rec("state", { handle: "vrf_w", state: "verified", verdict, at: NOW }),
+      rec("posting", { handle: "vrf_w", text: "verdict text", at: NOW }),
+    ];
+    const labels = (input: PendingRecord[]) => foldDormantRecords(input, { now: NOW, ttlMs: TTL }).sessions.get("p1")?.holds.map((r) => `${r.kind}:${String(r.handle)}`);
+    expect(labels(records)).toEqual(["hold:vrf_v", "hold-text:vrf_v", "state:vrf_v", "hold:vrf_w", "posting:vrf_w"]);
+    const kept = compactPendingRecords(records, { now: NOW, ttlMs: TTL });
+    // The verified entry of the unposted hold stays (entry and state); the one already posting goes.
+    expect(kept.map(label)).toEqual(["entry:vrf_v", "hold:vrf_v", "hold-text:vrf_v", "state:vrf_v", "hold:vrf_w", "posting:vrf_w"]);
+    expect(labels(kept)).toEqual(labels(records));
+    // A second compaction keeps it too.
+    expect(compactPendingRecords(kept, { now: NOW, ttlMs: TTL }).map(label)).toEqual(kept.map(label));
   });
 
   it("an open hold carries its hold-text and only its newest posting record (QA-2.1-2, QA-2.1-6)", () => {
@@ -555,7 +593,7 @@ describe("compactPendingRecords (QA-2.1-8)", () => {
     ]);
   });
 
-  it("a tomb and a forget close their records (and go themselves); later records stay", () => {
+  it("a tomb closes its entry and inflight, a forget its session (both go themselves); a tomb keeps the hold (QA-2.1-28)", () => {
     const kept = compactPendingRecords(
       [
         rec("entry", { handle: "vrf_t", parent: "p1", state: "held", createdAt: NOW }),
@@ -563,12 +601,37 @@ describe("compactPendingRecords (QA-2.1-8)", () => {
         rec("inflight", { callID: "c1", parent: "p1", child: "k1", at: NOW }),
         rec("tomb", { handle: "vrf_t", callID: "c1" }),
         rec("entry", { handle: "vrf_f", parent: "p2", state: "unverified", createdAt: NOW }),
+        rec("hold", { handle: "vrf_f", parent: "p2", child: "k2", callID: "c2" }),
         rec("forget", { session: "p2" }),
         rec("entry", { handle: "vrf_after", parent: "p2", state: "unverified", createdAt: NOW }),
       ],
       { now: NOW },
     );
-    expect(kept.map(label)).toEqual(["entry:vrf_after"]);
+    expect(kept.map(label)).toEqual(["hold:vrf_t", "entry:vrf_after"]);
+  });
+
+  it("QA-2.1-28: compaction keeps a posted placeholder past its entry's tomb and caps posted placeholders like the load", () => {
+    const records: PendingRecord[] = [
+      rec("hold", { handle: "vrf_open", parent: "p1", child: "k0", callID: "c0" }),
+      rec("hold", { handle: "vrf_tombed", parent: "p1", child: "kt", callID: "ct" }),
+      rec("posted", { handle: "vrf_tombed" }),
+      rec("tomb", { handle: "vrf_tombed", cause: "ttl" }),
+    ];
+    for (let i = 0; i < MAX_DORMANT_POSTED_HOLDS + 1; i += 1) {
+      records.push(rec("hold", { handle: `vrf_${i}`, parent: "p1", child: `k${i}`, callID: `c${i}` }), rec("posted", { handle: `vrf_${i}` }));
+    }
+    const kept = compactPendingRecords(records, { now: NOW, ttlMs: TTL });
+    const keptHolds = kept.filter((r) => r.kind === "hold").map((r) => r.handle);
+    // MAX + 2 posted placeholders: the two oldest go (the tombed one first), the open hold always stays.
+    expect(keptHolds).toHaveLength(MAX_DORMANT_POSTED_HOLDS + 1);
+    expect(keptHolds[0]).toBe("vrf_open");
+    expect(keptHolds[1]).toBe("vrf_1");
+    expect(kept.filter((r) => r.kind === "posted")).toHaveLength(MAX_DORMANT_POSTED_HOLDS);
+    // The compacted journal folds to the same dormant holds as the full one.
+    expect(foldDormantRecords(kept, { now: NOW, ttlMs: TTL }).sessions).toEqual(foldDormantRecords(records, { now: NOW, ttlMs: TTL }).sessions);
+    // Below the cap, the tombed placeholder survives compaction.
+    const small = compactPendingRecords(records.slice(0, 4), { now: NOW, ttlMs: TTL });
+    expect(small.map(label)).toEqual(["hold:vrf_open", "hold:vrf_tombed", "posted:vrf_tombed"]);
   });
 
   it("with ttlMs, unheld entries and inflight records past it go; held entries stay", () => {

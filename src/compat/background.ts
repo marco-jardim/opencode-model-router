@@ -645,6 +645,26 @@ export interface RestoredHold {
   childText?: string;
   /** QA-2.1-17: the dispatch data journaled with the hold (empty fields when an older record had none). */
   dispatch: RestoredDispatch;
+  /** QA-2.1-17: a verdict the gate reached before the restart but never started posting: posted, never recomputed. */
+  verdict?: StoredVerdict;
+}
+
+/** QA-2.1-17: a gate verdict read back from a journaled `state` record. */
+export interface StoredVerdict {
+  verdict: "PASS" | "FAIL" | "UNVERIFIABLE";
+  reason?: string;
+}
+
+/** QA-2.1-17: the verdict of a `state` record's `verdict` field (a pending.ts `Verdict`); undefined when it holds none. Pure. */
+export function storedVerdictOf(value: unknown): StoredVerdict | undefined {
+  if (value === null || typeof value !== "object") return undefined;
+  const pass: unknown = Reflect.get(value, "pass");
+  const outcome: unknown = Reflect.get(value, "outcome");
+  const reasons: unknown = Reflect.get(value, "reasons");
+  if (typeof pass !== "boolean") return undefined;
+  const verdict = outcome === "unverifiable" ? "UNVERIFIABLE" : pass ? "PASS" : "FAIL";
+  const reason = Array.isArray(reasons) && typeof reasons[0] === "string" ? reasons[0] : undefined;
+  return { verdict, ...(reason === undefined ? {} : { reason }) };
 }
 
 /** What `HeldResults.restore` hands back to the adopter. */
@@ -1121,7 +1141,14 @@ export function createHeldResults(deps: {
       const restored: HoldEntry[] = [];
       const postingText = new Map<string, string>();
       const delivered = new Set<string>();
+      const stored = new Map<string, StoredVerdict>();
       for (const r of records) {
+        // QA-2.1-17: the verdict a gate reached before the restart (the entry's `verified` state), never posted.
+        if (r.kind === "state" && typeof r.handle === "string" && r.state === "verified") {
+          const verdict = storedVerdictOf(r.verdict);
+          if (verdict !== undefined) stored.set(r.handle, verdict);
+          continue;
+        }
         if (r.kind === "hold" && typeof r.handle === "string" && typeof r.parent === "string" && typeof r.child === "string") {
           // A hold this process already knows stays as it is (a second adoption never resets it).
           if (byHandle.has(r.handle)) continue;
@@ -1180,6 +1207,7 @@ export function createHeldResults(deps: {
             callID: e.callID,
             ...(e.childText === undefined ? {} : { childText: e.childText }),
             dispatch: e.dispatch ?? {},
+            ...(stored.has(e.handle) ? { verdict: stored.get(e.handle) } : {}),
           });
         }
       }

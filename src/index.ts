@@ -759,7 +759,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     const keys = [...configuredV2OnlyKeys(cfg)];
     if (keys.length > 0 && warnedV2OnlyKeys.size === 0) {
       for (const key of keys) warnedV2OnlyKeys.add(key);
-      logger.warn(`[router] background dispatch requires OpenCode v2; ignored: ${keys.join(", ")}`);
+      // QA-2.1-32: the notice names the features actually configured (leases alone are not "background dispatch").
+      const background = keys.some((key) => key.startsWith("routing.background."));
+      const leases = keys.some((key) => key.startsWith("routing.leases."));
+      const subject = background && leases ? "background dispatch and leases require" : leases ? "leases require" : "background dispatch requires";
+      logger.warn(`[router] ${subject} OpenCode v2; ignored: ${keys.join(", ")}`);
     }
   }
   const depthTracker = createDepthTracker({

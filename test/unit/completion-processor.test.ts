@@ -14,6 +14,7 @@ import {
   renderCompleted,
   renderHeld,
   renderInFlight,
+  storedVerdictOf,
   unheldVerdictText,
   verdictText,
   type Attempt,
@@ -489,6 +490,30 @@ describe("completion processor: outcomes", () => {
     await launch(r, "c1", "ses_c1");
     await r.proc.process("ses_c1", { kind: "end-event", outcome: "failed", eventID: "e", at: 5 });
     expect(r.finishCalls[0]).toMatchObject({ status: "failed", endedAt: 5 });
+  });
+
+  it("QA-2.1-17: a held child that failed or was interrupted journals no hold-text; a succeeded one does, with its status", async () => {
+    const r = rig();
+    await launch(r, "c1", "ses_c1", { handle: "h-failed" });
+    await r.proc.process("ses_c1", completion("error", "boom"));
+    await launch(r, "c2", "ses_c2", { handle: "h-cut" });
+    await r.proc.process("ses_c2", completion("cancelled", "partial"));
+    expect(r.records.filter((x) => x.kind === "hold-text")).toEqual([]);
+    await launch(r, "c3", "ses_c3", { handle: "h-ok" });
+    await r.proc.process("ses_c3", completion("completed", "all done"));
+    expect(r.records.filter((x) => x.kind === "hold-text")).toEqual([
+      expect.objectContaining({ handle: "h-ok", text: "all done", status: "succeeded" }),
+    ]);
+  });
+
+  it("QA-2.1-17: only a recovery after a restart finishes with `restored` (the journaled dispatch, or an empty record)", async () => {
+    const r = rig();
+    await launch(r, "c1", "ses_c1");
+    await r.proc.process("ses_c1", completion("completed", "live result"));
+    expect(r.finishCalls[0]?.restored).toBeUndefined();
+    await launch(r, "c2", "ses_c2");
+    await r.proc.process("ses_c2", { kind: "recovery", outcome: "succeeded", text: "recovered result", at: 7 });
+    expect(r.finishCalls[1]).toMatchObject({ status: "succeeded", outputText: "recovered result", restored: {} });
   });
 
   it("a runner trigger (3.1) finishes with its status and text", async () => {
@@ -1374,12 +1399,42 @@ describe("held results: placeholder, matcher, refusal, verdict delivery (memo 5,
     const r = await heldRig();
     await r.held.noteText(HANDLE, "the child said");
     const note = r.records.find((x) => x.kind === "hold-text");
-    expect(note).toMatchObject({ handle: HANDLE, text: "the child said" });
+    // QA-2.1-17: the line names the child's status (only a succeeded child's text is ever noted).
+    expect(note).toMatchObject({ handle: HANDLE, text: "the child said", status: "succeeded" });
     const next = rig();
     const restored = next.held.restore(r.records);
     expect(restored.reposts).toEqual([]);
-    expect(restored.unverified).toEqual([{ handle: HANDLE, parentSessionID: PARENT, childSessionID: CHILD, callID: "c1", childText: "the child said" }]);
+    expect(restored.unverified).toEqual([{ handle: HANDLE, parentSessionID: PARENT, childSessionID: CHILD, callID: "c1", childText: "the child said", dispatch: {} }]);
     expect(next.held.isHeld(CHILD)).toBe(true);
+  });
+
+  it("QA-2.1-17: restore never hands back the text of a child that did not succeed, and keeps the journaled dispatch data", () => {
+    const r = rig();
+    const dispatch = { prompt: "write src/a.ts", description: "write a", subagentType: "fast", cwd: "/repo", workRoot: "/repo/wt", ignored: 7 };
+    const restored = r.held.restore([
+      { v: 1, kind: "hold", handle: HANDLE, parent: PARENT, child: CHILD, callID: "c1", dispatch },
+      { v: 1, kind: "hold-text", handle: HANDLE, text: "partial text of a failed child", status: "failed" },
+    ]);
+    expect(restored.unverified).toEqual([{
+      handle: HANDLE, parentSessionID: PARENT, childSessionID: CHILD, callID: "c1",
+      dispatch: { prompt: "write src/a.ts", description: "write a", subagentType: "fast", cwd: "/repo", workRoot: "/repo/wt" },
+    }]);
+  });
+
+  it("QA-2.1-17: a verdict the gate reached before the restart (a `verified` state record) is handed back with the hold", () => {
+    const r = rig();
+    const restored = r.held.restore([
+      { v: 1, kind: "hold", handle: HANDLE, parent: PARENT, child: CHILD, callID: "c1" },
+      { v: 1, kind: "hold-text", handle: HANDLE, text: "the child said", status: "succeeded" },
+      { v: 1, kind: "state", handle: HANDLE, state: "verified", verdict: { pass: false, outcome: "fail", method: "deterministic", reasons: ["tests failed"], caveats: [] } },
+    ]);
+    expect(restored.unverified).toEqual([{
+      handle: HANDLE, parentSessionID: PARENT, childSessionID: CHILD, callID: "c1", childText: "the child said", dispatch: {},
+      verdict: { verdict: "FAIL", reason: "tests failed" },
+    }]);
+    expect(storedVerdictOf({ pass: true, outcome: "pass", reasons: [] })).toEqual({ verdict: "PASS" });
+    expect(storedVerdictOf({ pass: false, outcome: "unverifiable", reasons: ["gate timed out"] })).toEqual({ verdict: "UNVERIFIABLE", reason: "gate timed out" });
+    expect(storedVerdictOf(null)).toBeUndefined();
   });
 
   it("a restored posting without posted is handed back as a repost; settleRestored(true) records posted without posting (R21)", async () => {

@@ -629,7 +629,10 @@ describe("docs drift: defaults, ranges, ids and severities (QA-3.1-18)", () => {
       expect(cells, `row ${key}`).toBeDefined();
       expect(cells![3]!.replace(/[\\`]/g, "").split("|").map((v) => v.trim())).toEqual([...values]);
       expect(cells![4], `${key} v2 only`).toContain("OpenCode v2 only");
-      expect(cells![4], `${key} v1`).toContain("v1 ignores it and logs one notice per process (`background dispatch requires OpenCode v2; ignored: <keys>`) naming every configured key");
+      // QA-2.1-32: the v1 notice names the configured features (leases alone are not "background dispatch").
+      const notice = key.startsWith("leases.") ? "leases require OpenCode v2" : "background dispatch requires OpenCode v2";
+      expect(cells![4], `${key} v1`).toContain(`v1 ignores it and logs one notice per process (\`${notice}; ignored: <keys>\`) naming every configured key`);
+      expect(cells![4], `${key} v1 both`).toContain("`background dispatch and leases require OpenCode v2; ignored: <keys>`");
     }
     const ms = keyRow(doc, "background.minPredictedMs");
     expect(ms?.[1]).toBe("`integer`");

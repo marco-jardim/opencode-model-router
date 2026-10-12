@@ -11,6 +11,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **OpenCode v2: `/router stats` shows a "Dispatch durations" table and an "Orchestrator cache-read share" line** when
   timing logs exist. The logs are written once the router wires the timing recorder.
+- **OpenCode v2: background dispatch.** A subagent dispatch whose predicted duration is long runs in the background
+  (`routing.background.mode`: `auto` decides from the predicted duration, `model` lets the orchestrating model decide,
+  `off` keeps every dispatch in the foreground as before; `routing.background.minPredictedMs` sets the `auto` threshold).
+  The router state lists the dispatches in flight and those completed since the last turn, and the router guarantees
+  apply when a background child completes.
+- **OpenCode v2: held results with verdict delivery.** The result of a background dispatch that requires verification
+  is held: the orchestrator sees a placeholder until the verification gate settles, a resume of the held child is
+  refused, and the verdict is posted to the orchestrator's session. A held result whose gate gives no verdict (a
+  failed or interrupted child, no verification required, an error in the gate, a restart that lost the verification
+  data) is posted as `UNVERIFIABLE` with its reason, never as `PASS`. `router_verify` refuses a held handle: its own
+  gate posts the verdict.
+- **OpenCode v2: work leases** (`routing.leases.mode`, `routing.leases.run`). A child session holds a lease on the
+  repository area it edits; another child's edit there is refused until the lease is released, search results under
+  another holder's edit are omitted, and `router_run` annotates or refuses a run on a leased target.
+- **OpenCode v2: restart recovery.** In-flight dispatches, held results and pending verifications are journaled in
+  `pending.jsonl` in the per-user state directory (`~/.local/state/opencode-model-router`, or
+  `$XDG_STATE_HOME/opencode-model-router` when set, outside Windows), never in the temp directory. After a restart the
+  router recovers a dispatch whose child finished, re-posts a verdict that was reached but not delivered, and keeps
+  posted results hidden. A journal that vanishes under a running process is rewritten from memory. OpenCode v1 ignores
+  every `routing.background.*` and `routing.leases.*` key and logs one notice per process that names them.
 
 ### Changed
 

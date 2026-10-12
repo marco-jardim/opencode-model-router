@@ -9,7 +9,7 @@
  * Driven through the REAL plugin behind the REAL v2 adapter (test/helpers/v2-bg-host.ts). No sleeps: events are drained by
  * microtask turns and the adapter's background work is awaited with `settled()`.
  */
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { MAX_ENTRIES_PER_SESSION } from "../../src/verify/pending";
 import { bootBgHost, restoreEnv, type BgHost, type ToolEvent } from "../helpers/v2-bg-host";
 
@@ -88,12 +88,14 @@ describe("QA-2.1-14: a held dispatch that ends without a result frees its reserv
       h.emit(ended(child, i % 2 === 0 ? "failed" : "interrupted"));
       await h.settled();
       // The child produced nothing to verify: its UNVERIFIABLE verdict is posted and nothing stays reserved for it. The
-      // processor journals (file I/O) before it posts, which the drained turns alone do not cover (as in D3).
-      await vi.waitFor(() => expect(verdictPosts(h), `dispatch ${i + 1}`).toBe(i + 1));
+      // processor journals (file I/O) before it posts; QA-2.1-21: settled() covers the end handling and the processing it
+      // starts, so the verdict is posted by now (no polling).
+      expect(verdictPosts(h), `dispatch ${i + 1}`).toBe(i + 1);
     }
 
     // After 33 held dispatches that all ended without a result, the session still has every slot: a new one is held too.
     const last = await heldDispatch(h, childAt(count));
     expect(last).toEqual({ background: true, held: true });
-  });
+    // 34 dispatches, each with fsync'd journal writes (inflight, hold) on the real file system: slower than the 5 s default on Windows.
+  }, 30_000);
 });

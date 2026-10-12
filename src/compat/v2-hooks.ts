@@ -1336,6 +1336,10 @@ export async function registerV2Hooks(
         // rewrites it from the in-memory state; then this append is tried once more.
         noteVanished();
         if (!(await recreateJournal())) throw error;
+        // QA-2.1-16: the state behind this record is usually in memory already (an attempt is acknowledged, a hold text or a
+        // verdict text is kept, before its append), so the recreation wrote it: once per write, never twice.
+        const identity = recordIdentity(record);
+        if (identity !== undefined && recreatedIdentities.has(identity)) return;
         await shared.append(...args);
       }
     },
@@ -1499,6 +1503,13 @@ export async function registerV2Hooks(
     for (const records of dormantInflight.values()) out.push(...records);
     return out;
   };
+  /** QA-2.1-16: what identifies a record a recreation rewrites from memory: its kind and its attempt key or hold handle. */
+  const recordIdentity = (record: PersistedRecord): string | undefined => {
+    const id = typeof record.key === "string" ? record.key : typeof record.handle === "string" ? record.handle : undefined;
+    return id === undefined ? undefined : `${record.kind}\u0000${id}`;
+  };
+  /** QA-2.1-16: the identities the last successful recreation wrote; a retried append among them is not written again. */
+  let recreatedIdentities = new Set<string>();
   let recreating: Promise<boolean> | undefined;
   /**
    * QA-2.1-16: rewrites a vanished journal from the in-memory state (`FinishApi.recreateJournal`); concurrent callers share
@@ -1511,7 +1522,9 @@ export async function registerV2Hooks(
     lastReloadAt = nowMs();
     recreating = (async () => {
       try {
-        await api.recreateJournal(adapterRecords());
+        const records = adapterRecords();
+        await api.recreateJournal(records);
+        recreatedIdentities = new Set(records.map(recordIdentity).filter((id): id is string => id !== undefined));
         if (reloadFailed) ingestLogger.warn("[router] background: the pending journal was recreated from memory; holding is available again");
         reloadFailed = false;
         vanishedWarned = false;
@@ -1764,6 +1777,15 @@ export async function registerV2Hooks(
         new Promise<void>((resolve) => { timer = setTimeout(resolve, BACKGROUND_DRAIN_MS); }),
       ]);
       if (timer !== undefined) clearTimeout(timer);
+    }
+    // QA-2.1-21: the held gates the plugin runs behind `finish` (and the verdict posts they start here) end too, same bound.
+    if (finishApi !== undefined) {
+      let idleTimer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        settleBackground(),
+        new Promise<void>((resolve) => { idleTimer = setTimeout(resolve, BACKGROUND_DRAIN_MS); }),
+      ]);
+      if (idleTimer !== undefined) clearTimeout(idleTimer);
     }
     for (const dispose of bgDisposers.reverse()) {
       try {
@@ -2711,6 +2733,18 @@ export async function registerV2Hooks(
           settleEntry("UNVERIFIABLE", reason);
           api.releaseHeld(hold.handle);
         };
+        // QA-2.1-17: a verdict the gate reached before the restart (its `state` record) is posted as it was, never recomputed.
+        const stored = hold.verdict;
+        if (stored !== undefined) {
+          const line = `[router] ${stored.verdict}${stored.reason === undefined ? "" : ` — ${stored.reason}`}`;
+          await held.verdict(hold.handle, {
+            verdict: stored.verdict, text: hold.childText === undefined ? line : `${hold.childText}\n\n${line}`,
+            ...(stored.reason === undefined ? {} : { reason: stored.reason }),
+          });
+          settleEntry(stored.verdict, stored.reason);
+          api.releaseHeld(hold.handle);
+          return;
+        }
         // QA-2.1-17: `hold-text` is journaled for a succeeded child only, so a missing text is a child that did not
         // succeed, or one the restart cut before its text was kept.
         const childText = hold.childText;
@@ -3088,8 +3122,31 @@ export async function registerV2Hooks(
 
     // V2 events are immutable facts. A completed-text warning is a synthetic
     // transcript entry, instead of mutating an already-persisted text part.
+    /**
+     * QA-2.1-21: the handling of each event is background work from the moment the loop takes it until the loop asks for the
+     * next one (a `continue` and a `break` included), so the settled seam and `dispose` never miss what an event starts after
+     * an await (the timing store's file write before the processor starts). Only the events that start background work are
+     * tracked (a child's creation adopts, its end processes): a step event's handler may wait for the model catalog until
+     * `dispose` (QA-2.1-5), which the settled seam must never wait for.
+     */
+    const trackedEvents = async function* <T>(source: AsyncIterable<T>): AsyncGenerator<T> {
+      for await (const event of source) {
+        const type: unknown = event !== null && typeof event === "object" ? Reflect.get(event, "type") : undefined;
+        if (typeof type !== "string" || (type !== "session.created" && !type.startsWith("session.execution."))) {
+          yield event;
+          continue;
+        }
+        let handled: () => void = () => undefined;
+        trackBackground(new Promise<void>((resolve) => { handled = resolve; }));
+        try {
+          yield event;
+        } finally {
+          handled();
+        }
+      }
+    };
     eventTask = (async () => {
-      for await (const event of ctx.event.subscribe({ signal: abort.signal })) {
+      for await (const event of trackedEvents(ctx.event.subscribe({ signal: abort.signal }))) {
         if (abort.signal.aborted) break;
         try {
           const data = event.data as Record<string, any>;
@@ -3129,7 +3186,14 @@ export async function registerV2Hooks(
               const outcome = event.type === "session.execution.succeeded" ? "succeeded" : event.type === "session.execution.failed" ? "failed" : "interrupted";
               const created: unknown = (event as { created?: unknown }).created;
               const at = created instanceof Date ? created.getTime() : typeof created === "number" ? created : nowMs();
-              if (timings !== undefined) await timings.onExecutionOutcome(sid, event.id, outcome, at);
+              // QA-2.1-21: the end handling is background work from its first await on (the timing store writes to disk
+              // before the processor starts): tracked, so the settled seam and `dispose` never miss the processing it starts.
+              const timingDone = timings === undefined ? undefined : timings.onExecutionOutcome(sid, event.id, outcome, at);
+              if (timingDone !== undefined) {
+                const endHandled = Promise.resolve(timingDone).then(() => undefined);
+                trackBackground(endHandled);
+                await endHandled;
+              }
               leaseGuard?.releaseChild(sid);
               leaseHandle?.notifyReleased();
               // QA-2.1-6: an end event adopts the parent's records: the root itself, or (for a child this process has no attempt for)

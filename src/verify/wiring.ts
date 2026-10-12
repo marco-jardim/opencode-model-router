@@ -2193,9 +2193,10 @@ export function createVerificationWiring(deps: {
             continue;
           }
           // QA-2.1-9 (phase 2.1, v2 only): a held entry is verified by its background gate, which posts the verdict to the
-          // parent. Before that gate claims it, router_verify refuses it (never a second run, never a second post); once the
-          // gate runs, the claim below joins it, and a settled entry reports the cached verdict.
-          // A held entry starts in state "held" (pending.ts); "verifying" is the gate's claim, "verified" its verdict.
+          // parent. While it is "held", router_verify refuses it (never a second run, never a second post). QA-2.1-31: the live
+          // gate claims and settles the entry in one step when it ends, so a live held entry is never joined; only a gate
+          // re-run after a restart claims first (state "verifying"), and the claim below joins that run. A settled entry
+          // reports the cached verdict. A held entry starts in state "held" (pending.ts); "verified" is its verdict.
           const looked = pending.get(sessionID, t.handle);
           if (looked.kind === "found" && looked.entry.hold !== undefined && looked.entry.state !== "verifying" && looked.entry.state !== "verified") {
             slots.push({ kind: "held", handle: looked.entry.handle, description: looked.entry.description });
