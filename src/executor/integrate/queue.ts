@@ -1198,13 +1198,16 @@ class Queue implements IntegrationQueue {
         await this.suiteRefused(p, res.reason);
         return;
       }
+      // Only the call whose batch opened the gate notifies: a concurrent checkPhase finds the gate already open (empty batch).
+      let opened = false;
       const next = await this.append(lg => {
         const cur = lg.phases.find(x => x.id === p);
-        if (cur === undefined || cur.gate !== "pending") return [];
+        opened = cur !== undefined && cur.gate === "pending";
+        if (cur === undefined || !opened) return [];
         return [{ type: "gate-changed", phaseId: p, from: "pending", to: "awaiting-qa", trigger: "phase-integrated", qaRound: cur.qaRound },
           counterEvent("integration.suite", 0, { verdict: res.kind })];
       });
-      if (next.phases.find(x => x.id === p)?.gate === "awaiting-qa" && !this.disposed) this.safe(() => this.d.listener.onGate(p, "awaiting-qa"));
+      if (opened && next.phases.find(x => x.id === p)?.gate === "awaiting-qa" && !this.disposed) this.safe(() => this.d.listener.onGate(p, "awaiting-qa"));
       return;
     }
     if (ph.gate === "suite-running") {
