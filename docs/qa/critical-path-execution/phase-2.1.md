@@ -761,6 +761,17 @@ Round-1 verdicts: -1, -2, -5, -7, -9, -10, -11, -12, -13 fixed; -3, -4 partially
 - QA-2.1-25 (minor): a failed kind lookup answers `unknown` (root semantics, no lease) for 30 s (`v2-hooks.ts:1216-1234`). Fix: short TTL or retry on write.
 - QA-2.1-26 (nit): `V2_BACKGROUND_SETTLED` uses global `Symbol.for` on the production cleanup; the test host points `outcomes.path` at the journal dir, hiding a fallback regression. Fix: module-private `Symbol()`; separate outcomes dir in the helper.
 
+Round-2 cross-check (second heavy reviewer `ses_ed0039d1fffeYXYuY3nQR98Qgy`, same commit; findings -14..-19, -23, -24, -26, -27, -29 duplicate the list above). Additions, treated as round 2 (all fixed):
+- QA-2.1-17 extended: the restart re-run forces status `succeeded` while `hold-text` is journaled before the status check (`background.ts:1290` vs `:1302`), so a failed child can be gated after a restart; a verdict reached but not posted is recomputed instead of re-posted from the `state` record (`pending.ts:1590,2059`); the persisted DoD and changed files of the restored entry (`pending.ts:2093,2099`) are ignored. Fix: write `hold-text` only for succeeded children; rebuild from the restored entry; re-post a stored verdict.
+- QA-2.1-19 extended: `adopt` deletes dormant records before claiming (`index.ts:3617-3618`); keep them when the claim fails.
+- QA-2.1-22 extended: `replaceFile` renames once; retry EPERM/EACCES/EBUSY with backoff on Windows.
+- QA-2.1-27 (minor): journal compaction uses the hard-coded `DEFAULT_PENDING_TTL_MS` (`index.ts:826`) while the registry restores with `enforcement.verify.pendingTtlMs` (`wiring.ts:1109-1138`); a longer configured TTL loses entries at the second restart. Fix: pass the resolved TTL.
+- QA-2.1-28 (minor): a live TTL `tomb` closes the hold placeholder (`pending.ts:1779-1781`, fold and compaction), so the raw completion reappears after restart; `hold`/`posted` lines are capped at load but never compacted. Fix: keep placeholders separate from entry tombs; same cap/age in compaction.
+- QA-2.1-29 (minor): a restored hold whose `inflight` recovery is skipped (`decide` false, `background.ts:403-404`; `acknowledge` undefined, `v2-hooks.ts:2587-2590`) stays active until TTL. Fix: derive the "being recovered" set from acknowledged attempts, or settle skipped holds.
+- QA-2.1-30 (minor): every non-root child end without an attempt calls uncached `sessionOf` (`v2-hooks.ts:2904-2912`), re-introducing the -11 pattern. Fix: keep `parentID` from `session.created`, or skip when the parent is adopted.
+- QA-2.1-31 (minor): `router_verify` "joins a running gate" never happens (background gate claims and settles synchronously, `index.ts:3686-3702`); restored holds settled through the sink leave the pending entry `held`, so `router_verify` keeps saying the verdict will post. Fix: correct the comment and `VERIFICATION.md` step 3; settle the pending entry on direct verdicts.
+- QA-2.1-32 (nit): `config.ts:1861` still says "one notice per key"; the v1 notice says "background dispatch" when only `routing.leases.*` is set; CHANGELOG entry for the per-user journal location missing (phase end).
+
 ## Fixes
 ## Deferred findings
 
