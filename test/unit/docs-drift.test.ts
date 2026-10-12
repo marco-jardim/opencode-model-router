@@ -1268,7 +1268,7 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     expect(section).toContain(`\`${FOREIGN_REFERENCE_NONE}\``);
     // the user-facing syntax and the caveats of the section
     for (const text of ["check: testsPass cwd=\"D:\\git\\app-a\" scope=full", "`scope=affected|full`", "A relative `cwd=` stays inside `W`", "must be inside `W` or in the read set",
-      "unverifiable** and nothing runs", "unverifiable, never a fail", "gets no reference", "UNVERIFIED", "may be deferred like any other (`VERIFY:deferred`, the default)", "It is verified synchronously (reason `cross-repo`) only in the cases listed there.", "A `scope=` alone is ignored there",
+      "unverifiable** and nothing runs", "unverifiable, never a fail", "gets no reference", "UNVERIFIED", "may be deferred like any other (`VERIFY:deferred`, the default)", "It is verified at once, not deferred, only in the cases listed there.", "A `scope=` alone is ignored there",
       "On OpenCode v1 the keys are ignored", "(I2)", "(I3)", "gives no run signal",
       "a check whose repository top contains the change root", "(no check root)"]) expect(section, text).toContain(text);
     expect(read("docs/ROLES.md").replace(/\s+/g, " ")).toContain("(./VERIFICATION.md#checks-in-other-repositories)");
@@ -1282,9 +1282,11 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     for (const item of ["**Checks in other repositories (OpenCode v2, roles mode) (#107).**", "check: testsPass cwd=\"<repo>\" scope=full", "`is not covered by any check root`",
       "never a fail", "is a consumer", "UNVERIFIED", "(link pins)", "`a per-check cwd= is honoured only in roles mode`",
       "A dispatch with per-check keys may be deferred, see \"Deferred verification across repositories\" below.",
-      "**Deferred verification across repositories (OpenCode v2, roles mode) (#107).**", "stays synchronous (reason `cross-repo`)",
+      "**Deferred verification across repositories (OpenCode v2, roles mode) (#107).**", "The dispatch is verified at once, not deferred, when I4 already refuses at return",
       "link targets are observed again", "turns a pass UNVERIFIED with a caveat (a fail keeps it)",
-      "**A full-scope `testsPass`/`lintClean` is never the cheap no-change shortcut (OpenCode v2) (#107).**", "owner decision OD-P2e-2"]) {
+      "**A full-scope `testsPass` is no longer run synchronously when the producer changed nothing (OpenCode v2) (#107).**", "owner decision OD-P2e-2",
+      "such a dispatch (and one whose `testsPass` check has `scope=full`) now defers instead of blocking the return",
+      "Config `testScope` does not affect `lintClean` (only a per-check `scope=full` runs lint unscoped), so a `lintClean`-only dispatch with no change still passes without running anything"]) {
       expect(unreleased, item).toContain(item);
     }
     expect(unreleased).not.toContain("verified synchronously, never deferred");
@@ -1298,13 +1300,23 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
       [" changed since the producer returned; the checks ran against its new state", "S11 changed"],
       [" could not be observed again since the producer returned", "S11 unobserved"],
       [" no longer resolves to the same repository since the producer returned; nothing ran", "placement identity"],
-      ["a linked repository could not be observed within the deferral bound; verified synchronously", "cross-repo detail"],
     ];
     for (const [fragment, why] of pinned) {
       expect(wiring, why).toContain(fragment);
       expect(verificationFlat, why).toContain(fragment);
     }
-    expect(verificationFlat).toContain("a repository of the perimeter changed during the dispatch while an unattributable writer ran; verified synchronously");
+    // the cross-repo reason and its detail texts are internal (the after-hook reads only `branch-switched`): the docs describe the behaviour
+    expect(wiring, "cross-repo detail").toContain("a linked repository could not be observed within the deferral bound; verified synchronously");
+    expect(wiring, "cross-repo detail").toContain("a repository of the perimeter changed during the dispatch while an unattributable writer ran; verified synchronously");
+    for (const text of ["**Verified at once.** The dispatch is not deferred: it is verified before return (internally the reason `cross-repo`, which is not shown to anyone)",
+      "A refusal never reaches the deferred finish: the dispatch is verified at once, with its refusal.",
+      "a linked repository could not be observed within the deferral bound;",
+      "I4 already refuses at return (a repository of the perimeter changed during the dispatch while an unattributable writer ran)",
+      "**A placement whose directory did not exist at return** is reported at `router_verify` as `no longer resolves to the same repository since the producer returned`",
+      "**What S11 does not cover.** S11 observes the direct link targets of `W` again and notices a link retargeted or added after the return. It does not cover nested link targets, ignored files (for example `dist/`) or skip-worktree/assume-unchanged edits in the linked repository. The reference stays exact only through link pins.",
+      "**A full scope defers instead of blocking the return (OpenCode v2).** A dispatch with no changed files and a full-scope `testsPass` used to run the full suite synchronously before the return (it was never passed as \"no changed files\"); on OpenCode v2 it now defers instead, and for a `delegate` that also means no synchronous ladder.",
+      "Config `testScope` does not affect `lintClean`: only a per-check `scope=full` runs lint unscoped, so a `lintClean`-only dispatch with no change still passes without running anything.",
+      "On OpenCode v2 that exception does not apply when the `testsPass` is full scope (config `testScope: \"full\"` or a per-check `scope=full`): such a dispatch defers."]) expect(verificationFlat, text).toContain(text);
     expect(verificationFlat).toContain("### Deferred verification across repositories");
     expect(verificationFlat).not.toContain("never deferred");
     expect(verificationFlat).not.toContain("interim until deferred verification supports the perimeter");
@@ -1312,7 +1324,10 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     expect(roles).toContain("(./VERIFICATION.md#deferred-verification-across-repositories)");
     const config = read("docs/CONFIG_REFERENCE.md").replace(/\s+/g, " ");
     expect(config).toContain("A deferred dispatch with a perimeter.");
-    expect(config).toContain("(per-check, or config `testScope: \"full\"` on OpenCode v2 only)");
+    expect(config).toContain("(per-check `scope=full`, or config `testScope: \"full\"` on OpenCode v2 only) defers instead of blocking the return; config `testScope` does not affect `lintClean` (only a per-check `scope=full` runs lint unscoped), so a no-change `lintClean` still passes without running.");
+    expect(config).toContain("On OpenCode v2 this does not hold when the `testsPass` is full scope (config `testScope: \"full\"`, or a per-check `scope=full`): that dispatch defers instead of blocking the return");
+    expect(config).toContain("verified at once (nothing is shown to the user for this; a refusal never reaches the deferred finish)");
+    expect(roles).toContain("The dispatch is verified at once, not deferred, when I4 already refuses at return");
     const design = read("docs/design/cross-repo.md").replace(/\s+/g, " ");
     for (const text of ["| D18 |", "| D19 |", "### Phase 2 implemented (notes)", "LINK_DRIFT_CAVEAT"]) expect(design, text).toContain(text);
   });

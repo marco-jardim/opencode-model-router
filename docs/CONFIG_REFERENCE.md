@@ -553,15 +553,20 @@ All of these must hold:
 - on the `delegate` path, the producer did not error;
 - the producer changed files, **or** the DoD has any check besides `testsPass`, or a
   criterion. Only a `testsPass`-only DoD with an attributed, empty change set falls
-  back: the required gate passes it ("no changed files") without running a process. A
-  change set that cannot be attributed still defers, with risk `high`;
+  back: the required gate passes it ("no changed files") without running a process. On
+  OpenCode v2 this does not hold when the `testsPass` is full scope (config `testScope:
+  "full"`, or a per-check `scope=full`): that dispatch defers instead of blocking the
+  return (before, the full suite ran synchronously; for `delegate` there is no
+  synchronous ladder either). v1 is unchanged. A change set that cannot be attributed
+  still defers, with risk `high`;
 - the producer did not switch the work root's branch (a branch switch during the
   dispatch is gated synchronously, reason `branch-switched`);
 - a role dispatch with a perimeter, or with per-check `cwd=`/`scope=` keys (OpenCode v2,
   roles mode), is not an exception any more: it defers like any other, unless it is
-  gated synchronously with reason `cross-repo`: I4 already refuses at return, a linked
-  repository could not be observed within the deferral bound, a check placement is
-  refused, or a v2 tier dispatch carries a per-check `cwd=`. With `routing.repoParents`
+  verified at once (nothing is shown to the user for this; a refusal never reaches the
+  deferred finish): I4 already refuses at return, a linked repository could not be
+  observed within the deferral bound, a check placement is refused, or a v2 tier
+  dispatch carries a per-check `cwd=`. With `routing.repoParents`
   set, role dispatches therefore defer by default where they used to be synchronous.
 
 A DoD with a `testsPass` check defers **as a whole**: its build, lint, `run` and
@@ -583,10 +588,12 @@ placements and the link pins). At `router_verify` the I4 window is the dispatch 
 not decided again; consumers are discovered over the frozen working-set roots; link
 targets are observed again: one that changed since the producer returned, or cannot be
 observed again, turns a pass UNVERIFIED (a fail keeps it); a placement whose path or git
-top changed since the return runs nothing. A `testsPass` or `lintClean` check with
-`scope=full` (per-check, or config `testScope: "full"` on OpenCode v2 only) is never the
-cheap no-change shortcut: it runs. See `docs/VERIFICATION.md` → "Deferred verification
-across repositories".
+top changed since the return runs nothing. A no-change dispatch with a full-scope
+`testsPass` (per-check `scope=full`, or config `testScope: "full"` on OpenCode v2 only)
+defers instead of blocking the return; config `testScope` does not affect `lintClean`
+(only a per-check `scope=full` runs lint unscoped), so a no-change `lintClean` still
+passes without running. See `docs/VERIFICATION.md` → "Deferred verification across
+repositories".
 
 When registration fails (for example a handle collision), the delegation falls
 back to the required gate. It is never marked accepted or verified by that failure.
