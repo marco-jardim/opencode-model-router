@@ -75,7 +75,8 @@ import {
 } from "./dispatch";
 import { runArgv, runShell } from "./exec";
 import { snapshotTree } from "./tree";
-import { captureReference, DEFAULT_CAPTURE_TIMEOUT_MS, gcStaleReferences, nodeReferenceFs, type DispatchReference } from "./reference";
+import { captureReference, DEFAULT_CAPTURE_TIMEOUT_MS, gcStaleReferences, keepReferences, nodeReferenceFs, REF_DIR_PATTERN, serializedReferenceLinks, type DispatchReference } from "./reference";
+import type { PendingRecord } from "./pending";
 import type { PluginLogger } from "../router/logger";
 import { REFERENCE_NONE } from "./baseline";
 import { scrubText } from "../guard/scrub";
@@ -174,6 +175,11 @@ export interface PreparedVerification {
   concurrentDispatches?: number;
   /** QA-3.1-3: the tool whose call discarded the dispatch snapshot, which left the change set unavailable. */
   contaminatedBy?: string;
+  /**
+   * QA-2.1-11 (phase 2.1, v2 only): the producer's session. Its own tree leases are still held while its gate runs, so the
+   * gate's lease wait leaves them out. Absent or "": none known.
+   */
+  producerSessionID?: string;
 }
 
 /**
@@ -373,6 +379,20 @@ export const DRIFT_DIGEST_MAX_BYTES = 64 * 1024 * 1024;
 export const STATIC_SCOPING_UNFINISHED_REASON = "static scoping did not finish within the deferred-finish bound";
 /** Section 1.4 pendingTtlMs default, used when the config cannot be read at plugin start. */
 export const DEFAULT_PENDING_TTL_MS = 3_600_000;
+
+/**
+ * QA-2.1-27: the resolved `enforcement.verify.pendingTtlMs` at plugin start, as the pending registry reads it
+ * (`createVerificationWiring`); the section 1.4 default when the config cannot be read. The v2 pending journal
+ * compacts and reloads with it. Never throws.
+ */
+export function resolvePendingTtlMs(config: RouterConfig): number {
+  try {
+    return resolveVerifyBudget(config).pendingTtlMs;
+  } catch (err) {
+    void err; // plugin start never fails on config: the default bound, as the pending registry falls back
+    return DEFAULT_PENDING_TTL_MS;
+  }
+}
 /**
  * QA-2.4-9: the capture wait when the config cannot be read: section 1.4's captureWaitMs default
  * (5000 ms), clamped to the default baselineTimeoutMs (DEFAULT_CAPTURE_TIMEOUT_MS), as config.ts does.
@@ -410,6 +430,26 @@ export interface DeferredFinishInput {
    * the gate runs as before (I1).
    */
   readonly workRoot?: string;
+  /**
+   * Phase 2.1.4.b (v2 only): the change set captured at child end by `captureDelta`. A background completion
+   * registers THIS set, not the tree as it stands when the completion processor finally runs. Absent: the
+   * foreground path, which reads the store at return time as before.
+   */
+  readonly delta?: import("./dispatch").DispatchDelta;
+}
+
+/** Upper bound on the reload wait before the start-time reference GC scans (phase 2.1 section 2.4). */
+export const REFERENCE_RELOAD_WAIT_MS = 10_000;
+
+/** Phase 2.1.5: the live wirings of this process; each can abort its background-queue run (QA-2.4-5 path). */
+const liveWirings = new Set<{ preempt(): Promise<void> }>();
+
+/**
+ * Aborts the in-flight background-queue verification run of every live wiring and resolves once each has
+ * settled. Held required runs are not touched: a parent waits on them. Never rejects.
+ */
+export async function preemptBackgroundVerification(): Promise<void> {
+  await Promise.all([...liveWirings].map(w => w.preempt().then(() => undefined, () => undefined)));
 }
 
 /** Deferred budget snapshots kept for `router_verify` (by handle; oldest dropped first, like the pending registry's bound). */
@@ -534,7 +574,9 @@ export type HandleReport =
   | { readonly kind: "unknown"; readonly input: string }
   | { readonly kind: "expired"; readonly handle: string }
   /** Joined another call's run, which outlived this call's deadline (R8). */
-  | { readonly kind: "elsewhere"; readonly handle: string; readonly description: string };
+  | { readonly kind: "elsewhere"; readonly handle: string; readonly description: string }
+  /** QA-2.1-9 (phase 2.1): a held background result; its own gate posts the verdict to the session, so nothing ran here. */
+  | { readonly kind: "held"; readonly handle: string; readonly description: string };
 
 export interface VerifyReport {
   readonly items: readonly HandleReport[];
@@ -553,6 +595,9 @@ export const DRIFT_NOTICE = "tree drifted since delegation; verdict reflects cur
 export const DRIFT_UNCHECKED_NOTICE = "drift since delegation could not be checked; verdict reflects current state";
 export const ROUTER_VERIFY_CANCELLED_REASON = "router_verify was cancelled before a verdict";
 export const ROUTER_VERIFY_RELEASED_REASON = "the delegation's verification data was released";
+/** QA-2.1-9: the line of a held background result named to router_verify (refused; its gate posts the verdict). */
+export const HELD_RESULT_TEXT =
+  "held background result: its own verification gate posts the verdict to this session when it settles; nothing was run.";
 /** Drifted paths named per handle; the rest are counted. */
 export const DRIFT_MAX_PATHS = 10;
 
@@ -662,6 +707,10 @@ export function formatVerifyReport(
       blocks.push(`- ${item.handle} \u00b7 ${item.description} \u00b7 ${VERIFYING_ELSEWHERE_TEXT}`);
       continue;
     }
+    if (item.kind === "held") {
+      blocks.push(`- ${item.handle} \u00b7 ${item.description} \u00b7 ${HELD_RESULT_TEXT}`);
+      continue;
+    }
     const { result } = item;
     const verdict = result.verdict;
     const via = item.via === "joined" ? " (joined a run already in progress)" : item.via === "cached" ? " (cached verdict; nothing was run)" : "";
@@ -713,9 +762,50 @@ export function backgroundOutcomes(items: readonly HandleReport[]): BackgroundOu
         ? { kind: "judged", handle: item.handle, description: item.description, result: item.result }
         : { kind: "reported", handle: item.handle };
     }
-    if (item.kind === "elsewhere") return { kind: "reported", handle: item.handle };
+    if (item.kind === "elsewhere" || item.kind === "held") return { kind: "reported", handle: item.handle };
     return { kind: "gone", handle: item.kind === "unknown" ? item.input : item.handle };
   });
+}
+
+/** QA-2.1-11: how often a lease wait that ignores the producer's own holder probes the tree again. */
+const LEASE_WAIT_POLL_MS = 100;
+
+/**
+ * QA-2.1-11 (phase 2.1, v2 only): waits until no holder of `tree` other than the sessions in `exclude` edits it, or `deadlineMs`
+ * passes. The producer's own leases stay until its completion is processed, after this gate, so waiting for them only delays
+ * its own check. `waitTreeFree` waits for every other holder: with no excluded holder in the tree it is called as is (event
+ * driven); otherwise it is used as a probe (deadline 0) and polled. Returns the holders that remain, excluded ones left out.
+ */
+export async function waitTreeFreeExcept(
+  gate: Pick<import("../compat/background").LeaseGuard, "waitTreeFree">,
+  tree: string,
+  owner: { producer: string },
+  exclude: ReadonlySet<string>,
+  deadlineMs: number,
+  signal: AbortSignal,
+  now: () => number = Date.now,
+): Promise<{ waitedMs: number; holders: string[] }> {
+  const started = now();
+  for (;;) {
+    const probe = await gate.waitTreeFree(tree, owner, 0, signal);
+    const holders = probe.holders.filter(h => !exclude.has(h));
+    const left = deadlineMs - (now() - started);
+    if (holders.length === 0 || left <= 0 || signal.aborted) return { waitedMs: now() - started, holders };
+    if (holders.length === probe.holders.length) {
+      const wait = await gate.waitTreeFree(tree, owner, left, signal);
+      return { waitedMs: now() - started, holders: wait.holders.filter(h => !exclude.has(h)) };
+    }
+    await new Promise<void>(resolve => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const done = (): void => {
+        if (timer !== undefined) clearTimeout(timer);
+        signal.removeEventListener("abort", done);
+        resolve();
+      };
+      timer = setTimeout(done, Math.min(LEASE_WAIT_POLL_MS, left));
+      signal.addEventListener("abort", done, { once: true });
+    });
+  }
 }
 
 /** A never-rejecting wait for `promise` that ends with `fallback()` once `signal` aborts. */
@@ -834,6 +924,8 @@ export interface VerificationWiring {
    * check or a criterion stays deferred with that empty set.)
    */
   isDeferred(dod: DoD, directives: VerifyDirectives, trivial?: boolean): boolean;
+  /** Phase 2.1: the directives a dispatch text resolves to, without starting or consuming a dispatch. */
+  directivesFor(text: string): VerifyDirectives;
   /**
    * 2.4.2a: the deferred finish. No gate, no test command, no slot: a tree snapshot and the commit
    * diff (git only, as prepareVerification) under DEFERRED_FINISH_MS, the static scoping plan
@@ -991,7 +1083,17 @@ export function createVerificationWiring(deps: {
   /** Test seams of the S5 batch coordinator (clock, timers, platform, maximum window size). */
   batch?: Omit<BatchCoordinatorOptions, "logger">;
   /** Test seams of the pending registry (clock, random source). */
-  pending?: Pick<PendingRegistryOptions, "now" | "random">;
+  pending?: Pick<PendingRegistryOptions, "now" | "random" | "onVerdict" | "persist">;
+  /**
+   * Phase 2.1, v2 only: the records of pending.jsonl, loaded by the caller. They are folded into the registry
+   * and their reference dirs are kept (keepReferences) before the start-time reference GC scans.
+   */
+  pendingRestore?: Promise<readonly PendingRecord[]>;
+  /**
+   * Phase 2.1.5: the lease guard's wait (v2 only; absent on v1 and when `routing.leases.mode` is "off").
+   * Plugin verification runs in a tree wait for its holders first.
+   */
+  leaseGate?: Pick<import("../compat/background").LeaseGuard, "waitTreeFree">;
   /** Test seams of the 2.4.5 background queue; used only when `background` is true. */
   background?: Pick<BackgroundQueueOptions, "now" | "timers" | "settleMs" | "retryBaseMs" | "maxAttempts" | "platform">;
 }): VerificationWiring {
@@ -1025,11 +1127,41 @@ export function createVerificationWiring(deps: {
     onEvict: (entry, cause) => logger.debug?.("[verify] pending delegation evicted", { handle: entry.handle, cause }),
   });
   const pendingNow = deps.pending?.now ?? Date.now;
+  /** Phase 2.1 (v2 only): resolves once pending.jsonl is folded in and its reference dirs are kept; never rejects. */
+  const restoreDone: Promise<void> | undefined = deps.pendingRestore === undefined ? undefined : deps.pendingRestore.then(
+    records => {
+      const dirs = new Set<string>();
+      for (const record of records) {
+        if (record.kind !== "ref") continue;
+        for (const link of Object.keys(serializedReferenceLinks(record.reference))) {
+          // The link lives inside the materialized dir: walk up to the omr-ref-<pid>-<hex> segment.
+          let at = link.length;
+          while (at > 0) {
+            const cut = Math.max(link.lastIndexOf("/", at - 1), link.lastIndexOf("\\", at - 1));
+            const name = link.slice(cut + 1, at);
+            if (REF_DIR_PATTERN.test(name)) {
+              dirs.add(link.slice(0, at));
+              break;
+            }
+            if (cut <= 0) break;
+            at = cut;
+          }
+        }
+      }
+      keepReferences(dirs, { logger });
+      const report = pending.restore(records, { now: pendingNow() });
+      logger.debug?.("[verify] pending.jsonl restored", { ...report });
+    },
+  ).catch((err: unknown) => {
+    logger.warn("[verify] pending.jsonl could not be restored", { error: errorText(err) });
+  });
   /**
    * 2.4.5: assigned once verifyHandles exists, and only when `background` is true at plugin start
    * (pending.ts R14). With background off this stays undefined: no queue, no timer, no run.
    */
   let background: BackgroundQueue | undefined;
+  const liveWiring = { preempt: async (): Promise<void> => { await background?.preempt(); } };
+  liveWirings.add(liveWiring);
   /** QA-2.4-5: foreground testsPass requests in flight (the background queue's `busy`). */
   const foreground = { tests: 0 };
   /** 2.4.2b: native `task` dispatch starts, before hook -> after hook (bounded FIFO, swept). */
@@ -1408,6 +1540,27 @@ export function createVerificationWiring(deps: {
         foreground.tests += 1;
         try {
           void background?.preempt();
+          // Phase 2.1 (v2, leases on): wait for the holders of the tree, within a quarter of the gate budget; then run
+          // anyway, with the concurrent-dispatches caveat for the holders that remain.
+          if (deps.leaseGate !== undefined) {
+            try {
+              // QA-2.1-11: the producer's own leases never delay its own check.
+              const producer = prepared?.producerSessionID;
+              const wait = await waitTreeFreeExcept(
+                deps.leaseGate,
+                prepared?.snapshot?.root ?? directory,
+                { producer: parentSessionID ?? creatorSessionID ?? "router" },
+                new Set(producer !== undefined && producer !== "" ? [producer] : []),
+                Math.min(Math.floor(resolved.gateBudgetMs / 4), deadline?.remaining() ?? resolved.gateBudgetMs),
+                deadline?.signal ?? new AbortController().signal,
+              );
+              if (wait.holders.length > 0 && prepared !== undefined) {
+                prepared.concurrentDispatches = Math.max(prepared.concurrentDispatches ?? 0, wait.holders.length);
+              }
+            } catch (err) {
+              logger.warn("[verify] lease wait failed; verifying anyway", { error: errorText(err) });
+            }
+          }
           return await inner(request);
         } finally {
           foreground.tests -= 1;
@@ -1516,6 +1669,7 @@ export function createVerificationWiring(deps: {
       snapshot,
       concurrentDispatches: store.concurrentDispatches(id, snapshot?.root),
       ...(contaminatedBy !== undefined ? { contaminatedBy } : {}),
+      ...(childID !== "" ? { producerSessionID: childID } : {}),
     };
   };
 
@@ -1630,7 +1784,17 @@ export function createVerificationWiring(deps: {
     let risk: RiskAssessment = unattributedRisk();
     let deferred = false;
     try {
-      const change = await observeChange(store, input.dispatchID, input.producerSessionID, input.cwd, deadline);
+      const observed = await observeChange(store, input.dispatchID, input.producerSessionID, input.cwd, deadline);
+      // Phase 2.1.4.b / QA-2.1-7: the set frozen at child end holds only the child's tool-observed paths, a subset of the
+      // observed change set (which also holds the tree delta, shell edits and commits), so it never replaces it. A delta whose
+      // dispatch snapshot a foreign write contaminated makes the change set unavailable, as the foreground gate treats it.
+      const delta = input.delta;
+      const change = delta === undefined || delta.files !== "unavailable" ? observed : {
+        ...observed,
+        changeBaseline: "unavailable" as const,
+        changedFiles: [],
+        ...(delta.contaminatedBy !== undefined ? { contaminatedBy: delta.contaminatedBy } : {}),
+      };
       // QA-2.4-10: an attributed empty change set is passed by the required gate with no process
       // (section 1.5-6): nothing to defer. The caller runs that gate, with the same outcome.
       // QA-G-1: only for a testsPass-only DoD. Any other check (build, lint, run, fileExists,
@@ -1843,6 +2007,8 @@ export function createVerificationWiring(deps: {
         changeBaseline: changed === "unavailable" ? "unavailable" : "available",
         reference,
         snapshot: tree,
+        // QA-2.1-11: the producer's own retained leases never delay its own check.
+        ...(entry.producerSessionID !== "" ? { producerSessionID: entry.producerSessionID } : {}),
       },
       drift,
       root: entry.root ?? tree?.root,
@@ -2026,6 +2192,16 @@ export function createVerificationWiring(deps: {
             slots.push({ kind: "unknown", input: t.handle ?? t.input });
             continue;
           }
+          // QA-2.1-9 (phase 2.1, v2 only): a held entry is verified by its background gate, which posts the verdict to the
+          // parent. While it is "held", router_verify refuses it (never a second run, never a second post). QA-2.1-31: the live
+          // gate claims and settles the entry in one step when it ends, so a live held entry is never joined; only a gate
+          // re-run after a restart claims first (state "verifying"), and the claim below joins that run. A settled entry
+          // reports the cached verdict. A held entry starts in state "held" (pending.ts); "verified" is its verdict.
+          const looked = pending.get(sessionID, t.handle);
+          if (looked.kind === "found" && looked.entry.hold !== undefined && looked.entry.state !== "verifying" && looked.entry.state !== "verified") {
+            slots.push({ kind: "held", handle: looked.entry.handle, description: looked.entry.description });
+            continue;
+          }
           const c = pending.markVerifying(sessionID, t.handle);
           if (c.kind === "unknown") slots.push({ kind: "unknown", input: t.handle });
           else if (c.kind === "expired") slots.push({ kind: "expired", handle: c.handle });
@@ -2168,6 +2344,9 @@ export function createVerificationWiring(deps: {
       }
       return { directives: resolveDirectives(text), dispatchedAt: pendingNow() };
     },
+    directivesFor(text) {
+      return resolveDirectives(text);
+    },
     isDeferred(dod, directives, trivial = false) {
       if (directives.mode !== "deferred" || !hasTestsPass(dod)) return false;
       // QA-2.4-10: gate.ts skips exactly this case ("trivial dispatch; verification skipped").
@@ -2184,7 +2363,7 @@ export function createVerificationWiring(deps: {
     pending,
     background,
     beginVerificationBounded,
-    startReferenceGc(delayMs = REFERENCE_GC_START_DELAY_MS) {
+    startReferenceGc(delayMs = REFERENCE_GC_START_DELAY_MS, reloaded?: Promise<unknown>) {
       if (!directory) {
         logger.debug?.("[verify] reference GC skipped: plugin root unknown");
         return () => undefined;
@@ -2200,7 +2379,20 @@ export function createVerificationWiring(deps: {
             lowPriority: budget.lowPriority,
             signal: opts?.signal ? AbortSignal.any([opts.signal, stop.signal]) : stop.signal,
           });
-          gcStaleReferences(directory, { argv, fs: nodeReferenceFs, logger }).then(
+          // v2: pending.jsonl is reloaded (keepReferences) before the scan, bounded so a stuck reload never blocks GC.
+          const reloadedOrRestored = reloaded ?? restoreDone;
+          const reloadWait: Promise<unknown> = reloadedOrRestored === undefined
+            ? Promise.resolve()
+            : Promise.race([
+                reloadedOrRestored.then(() => undefined, () => undefined),
+                new Promise<void>(resolve => {
+                  const t = setTimeout(resolve, REFERENCE_RELOAD_WAIT_MS);
+                  t.unref?.();
+                }),
+              ]);
+          reloadWait.then(() => (stop.signal.aborted
+            ? { removed: [], kept: [], failed: [] }
+            : gcStaleReferences(directory, { argv, fs: nodeReferenceFs, logger }))).then(
             report => {
               if (report.removed.length > 0) logger.debug?.("[verify] reference GC removed stale dirs", { removed: report.removed.length });
             },
@@ -2245,6 +2437,7 @@ export function createVerificationWiring(deps: {
       deferredWorkRoots.clear();
       // 2.4.5: abort the background run first, so nothing re-queues while the coordinator stops.
       background?.dispose();
+      liveWirings.delete(liveWiring);
       return coordinator.dispose();
     },
   };

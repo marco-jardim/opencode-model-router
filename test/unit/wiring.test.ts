@@ -6,10 +6,34 @@ import {
   createSharedFlight,
   createVerificationWiring,
   extractAssistantText,
+  HELD_RESULT_TEXT,
 } from "../../src/verify/wiring";
-import { buildForcingNote } from "../../src/verify/dispatch";
+import { buildDelegationDoD, buildForcingNote, createChangedFileStore, type DispatchDelta } from "../../src/verify/dispatch";
+import type { DoD } from "../../src/verify/dod";
+import type { TestsPassRequest } from "../../src/verify/types";
+import { preemptBackgroundVerification } from "../../src/verify/wiring";
 import type { GateResult } from "../../src/verify/gate";
 import type { RouterConfig } from "../../src/router/config";
+import { unattributedRisk } from "../../src/verify/pending";
+
+// Phase 2.1: the reference GC test below records the order of keepReferences and gcStaleReferences; both pass through to the real
+// module except the GC scan itself (no git in this unit test).
+const refCalls = vi.hoisted(() => ({ order: [] as string[], kept: [] as string[][] }));
+vi.mock("../../src/verify/reference", async importOriginal => {
+  const real = await importOriginal<typeof import("../../src/verify/reference")>();
+  return {
+    ...real,
+    keepReferences: (keys: Iterable<string>, opts?: Parameters<typeof real.keepReferences>[1]) => {
+      refCalls.order.push("keep");
+      refCalls.kept.push([...keys]);
+      return real.keepReferences(keys, opts);
+    },
+    gcStaleReferences: async () => {
+      refCalls.order.push("gc");
+      return { removed: [], kept: [], failed: [] };
+    },
+  };
+});
 
 function cfg(over: Partial<RouterConfig> = {}): RouterConfig {
   return {
@@ -52,6 +76,180 @@ function respondToPrompt(client: ReturnType<typeof fakeClient>, response: any): 
     return response;
   };
 }
+
+describe("reference GC at start (Phase 2.1, pending.jsonl reload)", () => {
+  const refDir = "/tmp/omr-ref-4242-0123456789abcdef";
+  const refRecord = {
+    v: 1 as const,
+    kind: "ref",
+    handle: "vrf_0123456789abcdef01234567",
+    callID: "call-1",
+    reference: { root: "/d", head: "h", commit: "c", untracked: {}, tracked: {}, captureReasons: [], capturedAt: 1, links: { [`${refDir}/node_modules`]: "/d/node_modules" } },
+  };
+
+  it("keeps the reference dirs named by reloaded pending entries before the GC scans", async () => {
+    refCalls.order.length = 0;
+    refCalls.kept.length = 0;
+    const w = createVerificationWiring({ client: fakeClient(), directory: "/d", getConfig: () => cfg(), pendingRestore: Promise.resolve([refRecord]), logger: { warn: () => undefined } });
+    const cancel = w.startReferenceGc(0);
+    await vi.waitFor(() => expect(refCalls.order).toContain("gc"));
+    cancel();
+    expect(refCalls.order).toEqual(["keep", "gc"]);
+    expect(refCalls.kept).toEqual([[refDir]]);
+  });
+
+  it("scans anyway when the reload fails, and keeps nothing", async () => {
+    refCalls.order.length = 0;
+    refCalls.kept.length = 0;
+    const w = createVerificationWiring({ client: fakeClient(), directory: "/d", getConfig: () => cfg(), pendingRestore: Promise.reject(new Error("unreadable")), logger: { warn: () => undefined } });
+    const cancel = w.startReferenceGc(0);
+    await vi.waitFor(() => expect(refCalls.order).toContain("gc"));
+    cancel();
+    expect(refCalls.order).toEqual(["gc"]);
+  });
+});
+
+describe("leaseGate (Phase 2.1.5): a verification run waits for the tree's holders, then runs with the caveat", () => {
+  const request: TestsPassRequest = {
+    command: "pnpm test", cwd: process.cwd(), testScope: "affected", changedFiles: [], reference: { kind: "none", reason: "test" },
+    deadline: { budgetMs: 60_000, remaining: () => 60_000, bound: ms => Math.min(ms, 60_000), signal: new AbortController().signal },
+  };
+  const run = (w: ReturnType<typeof createVerificationWiring>, prepared: Awaited<ReturnType<ReturnType<typeof createVerificationWiring>["prepareVerification"]>>) => {
+    const hook = w.buildGateDeps("PARENT", undefined, prepared).deterministic.testsPass;
+    if (hook === undefined) throw new Error("the gate deps carry no testsPass hook");
+    return hook(request);
+  };
+
+  it("waits first, then runs the hook, and marks the dispatch with the holders that remain", async () => {
+    const order: string[] = [];
+    const waitTreeFree = vi.fn(async () => {
+      order.push("wait");
+      return { waitedMs: 5, holders: ["impl-1", "impl-2"], fileCount: 3 };
+    });
+    const w = createVerificationWiring({ client: fakeClient(), directory: process.cwd(), getConfig: () => cfg(), leaseGate: { waitTreeFree }, logger: { warn: () => undefined } });
+    const prepared = await w.prepareVerification(createChangedFileStore(), "lease-d", "child");
+    expect(prepared.producerSessionID).toBe("child");
+    await run(w, prepared);
+    // QA-2.1-11: a probe (deadline 0) first, to see whether the producer's own holder is in the tree; neither holder is the
+    // producer, so the event-driven wait then runs as before, with the time left, on the same tree and owner.
+    expect(waitTreeFree).toHaveBeenCalledTimes(2);
+    expect(order).toEqual(["wait", "wait"]);
+    const [probeTree, probeOwner, probeMs] = waitTreeFree.mock.calls[0] as unknown as [string, { producer: string }, number];
+    const [tree, owner, deadlineMs] = waitTreeFree.mock.calls[1] as unknown as [string, { producer: string }, number];
+    expect(typeof tree).toBe("string");
+    expect(probeTree).toBe(tree);
+    expect(probeOwner).toEqual({ producer: "PARENT" });
+    expect(owner).toEqual({ producer: "PARENT" });
+    expect(probeMs).toBe(0);
+    expect(deadlineMs).toBeGreaterThan(0);
+    // The caveat that applyDispatchCaveats turns into the "other delegations ran concurrently (2)" reason.
+    expect(prepared.concurrentDispatches).toBe(2);
+  });
+
+  it("QA-2.1-11: the producer's own holder never delays its check and is no caveat", async () => {
+    const waitTreeFree = vi.fn(async () => ({ waitedMs: 0, holders: ["child"], fileCount: 1 }));
+    const w = createVerificationWiring({ client: fakeClient(), directory: process.cwd(), getConfig: () => cfg(), leaseGate: { waitTreeFree }, logger: { warn: () => undefined } });
+    const prepared = await w.prepareVerification(createChangedFileStore(), "lease-own", "child");
+    await run(w, prepared);
+    // One probe and no wait: the only holder is the producer ("child").
+    expect(waitTreeFree).toHaveBeenCalledTimes(1);
+    expect((waitTreeFree.mock.calls[0] as unknown as [string, { producer: string }, number])[2]).toBe(0);
+    expect(prepared.concurrentDispatches ?? 0).toBe(0);
+  });
+
+  it("QA-2.1-11: with another holder next to the producer, it waits for that holder only, then counts no caveat", async () => {
+    const answers = [["child", "impl-1"], ["child"]];
+    let call = 0;
+    const waitTreeFree = vi.fn(async () => {
+      const holders = answers[Math.min(call, answers.length - 1)];
+      call += 1;
+      return { waitedMs: 0, holders, fileCount: holders.length };
+    });
+    const w = createVerificationWiring({ client: fakeClient(), directory: process.cwd(), getConfig: () => cfg(), leaseGate: { waitTreeFree }, logger: { warn: () => undefined } });
+    const prepared = await w.prepareVerification(createChangedFileStore(), "lease-mixed", "child");
+    await run(w, prepared);
+    // Polled with probes only (an event-driven wait would also wait for the producer, until the deadline).
+    expect(waitTreeFree.mock.calls.map(c => (c as unknown as [string, { producer: string }, number])[2])).toEqual([0, 0]);
+    expect(prepared.concurrentDispatches ?? 0).toBe(0);
+  });
+
+  it("adds no caveat when the tree is free", async () => {
+    const waitTreeFree = vi.fn(async () => ({ waitedMs: 0, holders: [], fileCount: 0 }));
+    const w = createVerificationWiring({ client: fakeClient(), directory: process.cwd(), getConfig: () => cfg(), leaseGate: { waitTreeFree }, logger: { warn: () => undefined } });
+    const prepared = await w.prepareVerification(createChangedFileStore(), "lease-free", "child");
+    await run(w, prepared);
+    expect(waitTreeFree).toHaveBeenCalledTimes(1);
+    expect(prepared.concurrentDispatches ?? 0).toBe(0);
+  });
+
+  it("still verifies when the wait throws", async () => {
+    const warn = vi.fn();
+    const waitTreeFree = vi.fn(async () => { throw new Error("registry gone"); });
+    const w = createVerificationWiring({ client: fakeClient(), directory: process.cwd(), getConfig: () => cfg(), leaseGate: { waitTreeFree }, logger: { warn } });
+    const prepared = await w.prepareVerification(createChangedFileStore(), "lease-err", "child");
+    expect(await run(w, prepared)).toBeDefined();
+    expect(warn).toHaveBeenCalledWith("[verify] lease wait failed; verifying anyway", expect.objectContaining({ error: expect.stringContaining("registry gone") }));
+  });
+});
+
+describe("router_verify and a held background result (QA-2.1-9)", () => {
+  const session = "ses_parent_held";
+  const passed = { verdict: { pass: true, outcome: "pass" as const, method: "deterministic" as const, reasons: [], caveats: [] }, retryable: false };
+
+  function registerHeld(w: ReturnType<typeof createVerificationWiring>, callID: string): string {
+    const handle = w.pending.reserveHandle(session);
+    if (handle === undefined) throw new Error("no handle reserved");
+    const reg = w.pending.register({
+      orchestratorSessionID: session,
+      dispatchID: callID,
+      producerSessionID: `ses_child_${callID}`,
+      producerTier: "fast",
+      description: "held dispatch",
+      cwd: process.cwd(),
+      root: undefined,
+      dispatchedAt: Date.now(),
+      dod: buildDelegationDoD({ prompt: "Refactor the parser.\n[acceptance]\ncheck: testsPass\n[/acceptance]" }),
+      reference: Promise.resolve({ kind: "none", reason: "held dispatch: the required gate captures its own reference" }),
+      changedFiles: [],
+      risk: unattributedRisk(),
+      handle,
+      hold: { childSessionID: `ses_child_${callID}`, callID },
+    });
+    if (!reg.ok) throw new Error(`held entry not registered: ${reg.code} ${reg.detail}`);
+    return handle;
+  }
+
+  it("refuses a held entry its gate has not claimed yet: nothing runs, nothing is claimed, the entry stays held", async () => {
+    const w = createVerificationWiring({ client: fakeClient(), directory: process.cwd(), getConfig: () => cfg(), logger: { warn: () => undefined } });
+    const handle = registerHeld(w, "call-held-1");
+    const before = w.pending.get(session, handle);
+    expect(before.kind === "found" ? before.entry.state : before.kind).toBe("held");
+    const report = await w.verifyHandles(session, { kind: "handles", handles: [handle] });
+    expect(report.items).toEqual([{ kind: "held", handle, description: "held dispatch" }]);
+    expect(report.text).toContain(`- ${handle} \u00b7 held dispatch \u00b7 ${HELD_RESULT_TEXT}`);
+    const looked = w.pending.get(session, handle);
+    expect(looked.kind === "found" ? looked.entry.state : looked.kind).toBe("held");
+    if (looked.kind === "found") expect(looked.entry.verifyingSince).toBeUndefined();
+    // The background gate can still claim it afterwards: router_verify left no claim behind.
+    expect(w.pending.markVerifying(session, handle).kind).toBe("claimed");
+  });
+
+  it("joins the held entry's gate once it claimed the entry, and replays the settled verdict afterwards", async () => {
+    const w = createVerificationWiring({ client: fakeClient(), directory: process.cwd(), getConfig: () => cfg(), logger: { warn: () => undefined } });
+    const handle = registerHeld(w, "call-held-2");
+    const claim = w.pending.markVerifying(session, handle);
+    if (claim.kind !== "claimed") throw new Error(`expected the gate's claim, got ${claim.kind}`);
+    const joined = w.verifyHandles(session, { kind: "handles", handles: [handle] });
+    // The gate settles later (a macrotask), after router_verify reached its claim and joined the run in flight.
+    const settled = new Promise<boolean>(done => setTimeout(() => done(claim.settle(passed)), 100));
+    const report = await joined;
+    expect(await settled).toBe(true);
+    expect(report.items).toHaveLength(1);
+    expect(report.items[0]).toMatchObject({ kind: "verdict", handle, via: "joined" });
+    const again = await w.verifyHandles(session, { kind: "handles", handles: [handle] });
+    expect(again.items[0]).toMatchObject({ kind: "verdict", handle, via: "cached" });
+  });
+});
 
 describe("extractAssistantText", () => {
   it("joins the text parts", () => {
@@ -360,6 +558,55 @@ describe("dispatchGrader", () => {
       text: "",
       model: null,
     });
+  });
+});
+
+describe("finishDeferred with the change set captured at child end (Phase 2.1.4.b)", () => {
+  const dod = { kind: "deterministic", source: "explicit", criteria: [], deliverable: null, checks: [{ kind: "testsPass", command: "npm test" }] } as unknown as DoD;
+
+  async function finish(delta: DispatchDelta | undefined) {
+    const w = createVerificationWiring({ client: fakeClient(), directory: process.cwd(), getConfig: () => cfg() });
+    const store = createChangedFileStore();
+    const result = await w.finishDeferred(store, {
+      dispatchID: "d1", orchestratorSessionID: "orch", producerSessionID: "child", producerTier: "fast", description: "background work",
+      cwd: process.cwd(), dod, dispatchedAt: 1, ...(delta === undefined ? {} : { delta }),
+    });
+    return { result, entry: w.pending.findByDispatch("d1") };
+  }
+
+  it("a delta whose files are unavailable registers an unavailable change set (never an empty one) and high risk", async () => {
+    const { result, entry } = await finish({ callID: "d1", childSessionID: "child", files: "unavailable", capturedAt: 1 });
+    expect(result.deferred).toBe(true);
+    expect(entry?.changedFiles).toBe("unavailable");
+    expect(entry?.risk.level).toBe("high");
+  });
+
+  it("a contaminated delta is unavailable too", async () => {
+    const { result, entry } = await finish({ callID: "d1", childSessionID: "child", files: "unavailable", contaminatedBy: "github_create_file", capturedAt: 1 });
+    expect(result.deferred).toBe(true);
+    expect(entry?.changedFiles).toBe("unavailable");
+  });
+
+  it("without a delta (the foreground path) nothing is read from it: the registration is the one the store implies", async () => {
+    const { entry } = await finish(undefined);
+    expect(entry === undefined || entry.changedFiles === "unavailable" || Array.isArray(entry.changedFiles)).toBe(true);
+  });
+});
+
+describe("preemptBackgroundVerification (Phase 2.1)", () => {
+  it("preempts the background queue of every live wiring, builds none when background is off, and never rejects", async () => {
+    const on = createVerificationWiring({ client: fakeClient(), directory: "/d", getConfig: () => cfg({ enforcement: { verify: { background: true } } } as Partial<RouterConfig>) });
+    const off = createVerificationWiring({ client: fakeClient(), directory: "/d", getConfig: () => cfg() });
+    expect(off.background).toBeUndefined();
+    const queue = on.background;
+    if (queue === undefined) throw new Error("background: true built no queue");
+    const spy = vi.spyOn(queue, "preempt").mockResolvedValue(undefined);
+    await preemptBackgroundVerification();
+    expect(spy).toHaveBeenCalledTimes(1);
+    spy.mockRejectedValueOnce(new Error("preempt failed"));
+    await expect(preemptBackgroundVerification()).resolves.toBeUndefined();
+    expect(spy).toHaveBeenCalledTimes(2);
+    spy.mockRestore();
   });
 });
 

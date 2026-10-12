@@ -18,6 +18,44 @@ import {
 } from "../../src/router/protocol";
 import { validateConfig } from "../../src/router/config";
 import type { RouterConfig } from "../../src/router/config";
+import { buildBackgroundDispatchesBlock } from "../../src/router/protocol";
+
+describe("assembleSystemPrompt host (background rules, v2 only)", () => {
+  const withRouting = (routing: Record<string, unknown>): RouterConfig => ({ ...minimal, routing }) as RouterConfig;
+
+  it("v1 (explicit or default) never carries the block, whatever the modes", () => {
+    const cfg = withRouting({ background: { mode: "auto" }, leases: { mode: "enforce" } });
+    expect(assembleSystemPrompt(cfg, undefined, false, "v1")).toBe(assembleSystemPrompt(cfg, undefined));
+    expect(assembleSystemPrompt(cfg, undefined)).toBe(buildDelegationProtocol(cfg));
+  });
+
+  it("v2 appends the block to the protocol; the Claude opener stays first", () => {
+    const cfg = withRouting({});
+    const block = buildBackgroundDispatchesBlock(cfg);
+    expect(block.split("\n")).toHaveLength(4);
+    expect(assembleSystemPrompt(cfg, undefined, false, "v2")).toBe(`${buildDelegationProtocol(cfg)}\n\n${block}`);
+    expect(assembleSystemPrompt(cfg, "anthropic/claude-sonnet-4-6", false, "v2").endsWith(`\n\n${block}`)).toBe(true);
+  });
+
+  it("emits nothing when background and leases are both off", () => {
+    const cfg = withRouting({ background: { mode: "off" }, leases: { mode: "off" } });
+    expect(buildBackgroundDispatchesBlock(cfg)).toBe("");
+    expect(assembleSystemPrompt(cfg, undefined, false, "v2")).toBe(buildDelegationProtocol(cfg));
+  });
+
+  it("QA-2.1-12: background off emits nothing even with leases enforced (no lease line)", () => {
+    const cfg = withRouting({ background: { mode: "off" }, leases: { mode: "enforce" } });
+    expect(buildBackgroundDispatchesBlock(cfg)).toBe("");
+    expect(assembleSystemPrompt(cfg, undefined, false, "v2")).toBe(buildDelegationProtocol(cfg));
+    expect(assembleSystemPrompt(cfg, undefined, false, "v2")).not.toContain("lease refusal");
+  });
+
+  it("a model-driven background mode still carries the background rules", () => {
+    const block = buildBackgroundDispatchesBlock(withRouting({ background: { mode: "model" }, leases: { mode: "off" } }));
+    expect(block).toContain("Never poll or sleep.");
+    expect(block).not.toContain("lease refusal");
+  });
+});
 
 function tier(model: string, extra: Record<string, unknown> = {}) {
   return { model, description: "d", whenToUse: [], ...extra };

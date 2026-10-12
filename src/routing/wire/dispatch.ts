@@ -224,6 +224,15 @@ const UNTOUCHED: RouteOutcome = Object.freeze({ mode: "static" });
  */
 const RUNNER_CHILD_TITLE = /^Router (?:.+ delegation|result verification)$/;
 
+/** Phase 2.1: the routing facts of one dispatch that the background and timing policy needs (`DispatchRouter.decisionOf`). */
+export interface DispatchDecisionInfo {
+  readonly role: string | undefined;
+  readonly class: string;
+  readonly scope: string;
+  readonly tier: string | undefined;
+  readonly model: string | undefined;
+}
+
 export interface DispatchRouter {
   /**
    * Decide one `subagent` call. Writes and registers nothing: `commit` writes its decision row and registers it. Never throws, except
@@ -247,6 +256,12 @@ export interface DispatchRouter {
    * row; nothing when the engine writes no rows or the dispatch is unknown. Never throws.
    */
   noteBinding(childSessionID: string, binding: Pick<Binding, "kind" | "decisionID">): void;
+  /**
+   * Phase 2.1: what `route()` decided for a call, for the background and timing policy. Valid from `route()` until the call's result
+   * (`onCallResult`) or end (`onCallFinished`). `role` is the role agent (absent for a tier dispatch); `class` and `scope` are
+   * `"unknown"` when the engine knows none (`engine: static`). Undefined for a call `route()` did not act on. Never throws.
+   */
+  decisionOf(callID: string): DispatchDecisionInfo | undefined;
   /** Dispatches still waiting to be claimed (diagnostics, tests). */
   pendingCount(): number;
   /** Children registered by a wrong heuristic claim and not yet taken over by their own dispatch (diagnostics, tests). */
@@ -365,7 +380,7 @@ function claimCall(key: string): boolean {
 }
 
 /** Bound on children with pending subagent-result annotations (oldest dropped first). */
-export const MAX_ANNOTATED_CHILDREN = 256;
+export const MAX_ANNOTATED_CHILDREN = 1024 /* >= MAX_LIVE_ATTEMPTS: background children collect annotations for hours */;
 /** Bound on annotations kept per child (oldest dropped first). */
 export const MAX_ANNOTATIONS_PER_CHILD = 8;
 
@@ -1168,6 +1183,13 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
   const instanceNonce = randomBytes(8).toString("hex");
   /** Between `route()` and `commit()`. */
   const decided = new Map<string, Decided>();
+  /** Phase 2.1: the routing facts of a routed call, until its result or end (`decisionOf`). Bounded like the other per-call maps. */
+  const decisionInfos = new Map<string, DispatchDecisionInfo>();
+  const noteDecision = (callID: string, info: DispatchDecisionInfo): void => {
+    decisionInfos.delete(callID);
+    decisionInfos.set(callID, info);
+    while (decisionInfos.size > MAX_HANDLED_CALLS) decisionInfos.delete(decisionInfos.keys().next().value as string);
+  };
   /** Committed dispatches, in insertion order, until their call ends. */
   const entries = new Map<string, Entry>();
   /**
@@ -1840,8 +1862,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     }
   };
 
-  return {
-    async route(call): Promise<RouteOutcome> {
+  const routeInner = async (call: RouteCall): Promise<RouteOutcome> => {
       try {
         const agent = str(call.args.agent);
         const callKey = `${call.sessionID}\u0000${call.callID}`;
@@ -1884,7 +1905,35 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         deps.logger.warn("[router] routing: the engine failed; the dispatch proceeds as the orchestrator chose", { error: describeError(error) });
         return UNTOUCHED;
       }
+  };
+
+  return {
+    async route(call): Promise<RouteOutcome> {
+      const outcome = await routeInner(call); // throws only RoleDispatchRefusal
+      try {
+        const routed = outcome.role;
+        const d = decided.get(call.callID);
+        if (routed !== undefined) {
+          noteDecision(call.callID, { role: routed.agent, class: routed.class ?? "unknown", scope: d?.facts.scope ?? "unknown", tier: routed.tier, model: routed.model });
+        } else if (d !== undefined) {
+          noteDecision(call.callID, {
+            role: undefined,
+            class: d.facts.class,
+            scope: d.facts.scope,
+            tier: d.final !== null && classifyAgentOrigin(d.final.agent, d.routerIds) === "router" ? d.final.agent : undefined,
+            model: d.final === null ? undefined : d.final.model,
+          });
+        } else {
+          noteDecision(call.callID, { role: undefined, class: "unknown", scope: "unknown", tier: undefined, model: undefined });
+        }
+      } catch (error) {
+        deps.logger.warn("[router] routing: the decision of a call could not be noted", { error: describeError(error) });
+      }
+      return outcome;
     },
+
+    // Valid until `onCallResult`/`onCallFinished` of the call: the adapter reads it in `execute.before` and, before `onCallResult`, in `execute.after`.
+    decisionOf: (callID) => decisionInfos.get(callID),
 
     commit(callID, input): void {
       try {
@@ -1994,6 +2043,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     onCallResult(callID, childSessionID): void {
       try {
         decided.delete(callID);
+        decisionInfos.delete(callID);
         const entry = entries.get(callID);
         entries.delete(callID);
         if (entry === undefined) return;
@@ -2020,6 +2070,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
 
     onCallFinished(callID): void {
       decided.delete(callID);
+      decisionInfos.delete(callID);
       const entry = entries.get(callID);
       entries.delete(callID);
       if (entry !== undefined) undoResume(entry);

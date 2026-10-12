@@ -267,8 +267,11 @@ describe("v1: the text-only roles line (A28, D1)", () => {
   });
 
   it("a v2 host never takes this path: the legacy hook builds the same prompt, and the agent list is not read", async () => {
+    // The v2 prompt carries v2-only blocks (Phase 2.1 background dispatch rules), so the baseline is the same v2 hook
+    // without the roles keys: the roles keys must change nothing on this path.
+    const v2Base = (await turn((await plugin(null, async () => ({ data: AGENTS }), "v2")).hooks))[0];
     const { hooks, agentsCall } = await plugin({ roles: { search: ["explore"] } }, async () => ({ data: AGENTS }), "v2");
-    expect((await turn(hooks))[0]).toBe(baseline());
+    expect((await turn(hooks))[0]).toBe(v2Base);
     expect(agentsCall).not.toHaveBeenCalled();
   });
 

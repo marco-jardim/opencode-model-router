@@ -309,7 +309,27 @@ export interface AdvisorConfig {
   notify?: boolean;
 }
 
+/** `routing.background.mode`: `auto` (router decides), `model` (the model decides), `off`. OpenCode v2 only. */
+export type BackgroundMode = "auto" | "model" | "off";
+/** `routing.leases.mode`: `enforce` or `off`. OpenCode v2 only. */
+export type LeasesMode = "enforce" | "off";
+/** `routing.leases.run`: how `router_run` treats a leased target. OpenCode v2 only. */
+export type LeasesRunPolicy = "annotate" | "refuse";
+
+export interface BackgroundConfig {
+  mode?: BackgroundMode;
+  /** Predicted duration (ms) from which `auto` runs a dispatch in the background. 0..3600000. */
+  minPredictedMs?: number;
+}
+
+export interface LeasesConfig {
+  mode?: LeasesMode;
+  run?: LeasesRunPolicy;
+}
+
 export interface RoutingConfig {
+  background?: BackgroundConfig;
+  leases?: LeasesConfig;
   engine?: RoutingEngine;
   profile?: RoutingProfile;
   margin?: number;
@@ -1759,6 +1779,106 @@ function validateRoles(routing: Record<string, unknown>): Record<string, string[
   return out;
 }
 
+const BACKGROUND_MODES: readonly BackgroundMode[] = ["auto", "model", "off"];
+const LEASES_MODES: readonly LeasesMode[] = ["enforce", "off"];
+const LEASES_RUN_POLICIES: readonly LeasesRunPolicy[] = ["annotate", "refuse"];
+const BACKGROUND_MIN_PREDICTED_MAX_MS = 3_600_000;
+
+interface TolerantBlock<T> {
+  readonly value: T | undefined;
+  readonly issues: string[];
+}
+
+function showTolerant(value: unknown): string {
+  const text = typeof value === "string" ? JSON.stringify(value) : (JSON.stringify(value) ?? String(value));
+  return text.length <= 60 ? text : `${text.slice(0, 59)}…`;
+}
+
+/** One tolerant enum key: an invalid value yields an issue and no value (the default applies). */
+function tolerantEnum<T extends string>(
+  block: Record<string, unknown>,
+  key: string,
+  path: string,
+  allowed: readonly T[],
+  fallback: T,
+  issues: string[],
+): T | undefined {
+  const raw = block[key];
+  if (raw === undefined) return undefined;
+  const hit = pickEnum(allowed, raw);
+  if (hit !== undefined) return hit;
+  issues.push(`${path}.${key} must be ${allowed.join("|")} (got ${showTolerant(raw)}); using ${fallback}`);
+  return undefined;
+}
+
+/**
+ * `routing.background` (OpenCode v2 only). Tolerant like the roles keys: an invalid
+ * entry never throws, it is reported in `issues` and the default applies.
+ */
+function sanitizeBackground(value: unknown): TolerantBlock<BackgroundConfig> {
+  const issues: string[] = [];
+  if (value === undefined) return { value: undefined, issues };
+  if (!isPlainObject(value)) {
+    issues.push(`routing.background must be an object (got ${showTolerant(value)}); ignored`);
+    return { value: undefined, issues };
+  }
+  const out: BackgroundConfig = {};
+  const mode = tolerantEnum(value, "mode", "routing.background", BACKGROUND_MODES, ROUTING_DEFAULTS.background.mode, issues);
+  if (mode !== undefined) out.mode = mode;
+  const ms = value.minPredictedMs;
+  if (ms !== undefined) {
+    if (typeof ms === "number" && Number.isInteger(ms) && ms >= 0 && ms <= BACKGROUND_MIN_PREDICTED_MAX_MS) {
+      out.minPredictedMs = ms;
+    } else {
+      issues.push(
+        `routing.background.minPredictedMs must be an integer from 0 to ${BACKGROUND_MIN_PREDICTED_MAX_MS} (got ${showTolerant(ms)}); using ${ROUTING_DEFAULTS.background.minPredictedMs}`,
+      );
+    }
+  }
+  return { value: out, issues };
+}
+
+/** `routing.leases` (OpenCode v2 only); tolerant, see {@link sanitizeBackground}. */
+function sanitizeLeases(value: unknown): TolerantBlock<LeasesConfig> {
+  const issues: string[] = [];
+  if (value === undefined) return { value: undefined, issues };
+  if (!isPlainObject(value)) {
+    issues.push(`routing.leases must be an object (got ${showTolerant(value)}); ignored`);
+    return { value: undefined, issues };
+  }
+  const out: LeasesConfig = {};
+  const mode = tolerantEnum(value, "mode", "routing.leases", LEASES_MODES, ROUTING_DEFAULTS.leases.mode, issues);
+  if (mode !== undefined) out.mode = mode;
+  const run = tolerantEnum(value, "run", "routing.leases", LEASES_RUN_POLICIES, ROUTING_DEFAULTS.leases.run, issues);
+  if (run !== undefined) out.run = run;
+  return { value: out, issues };
+}
+
+/**
+ * The v2-only `routing` keys the raw config configures, as dotted paths in a fixed order.
+ * `raw` is the config as written (its `routing` block is read) or the `routing` block
+ * itself. A key counts when it is present and not `undefined`, whether or not its value is
+ * valid. On v1, where they are ignored, `index.ts` logs ONE notice per process that names
+ * every configured key (QA-2.1-32).
+ */
+export function configuredV2OnlyKeys(raw: unknown): string[] {
+  const routing = isPlainObject(raw) && isPlainObject(raw.routing) ? raw.routing : isPlainObject(raw) ? raw : undefined;
+  if (routing === undefined) return [];
+  const keys: string[] = [];
+  const candidates: ReadonlyArray<readonly [string, readonly string[]]> = [
+    ["background", ["mode", "minPredictedMs"]],
+    ["leases", ["mode", "run"]],
+  ];
+  for (const [block, children] of candidates) {
+    const value = routing[block];
+    if (!isPlainObject(value)) continue;
+    for (const child of children) {
+      if (Object.hasOwn(value, child) && value[child] !== undefined) keys.push(`routing.${block}.${child}`);
+    }
+  }
+  return keys;
+}
+
 /**
  * Validate `routing` and return a snapshot of the validated values (or
  * `undefined` when absent). Defaults are NOT applied here; see resolveRouting.
@@ -1818,6 +1938,12 @@ function validateRouting(value: unknown): RoutingConfig | undefined {
   if (run !== undefined) out.run = run;
   const workRoots = sanitizeWorkRoots(routing.workRoots).value;
   if (workRoots !== undefined) out.workRoots = workRoots;
+
+  // Phase 2.1 keys (OpenCode v2 only): tolerant, issues surface as notices.
+  const background = sanitizeBackground(routing.background).value;
+  if (background !== undefined) out.background = background;
+  const leases = sanitizeLeases(routing.leases).value;
+  if (leases !== undefined) out.leases = leases;
 
   const outcomes = readBlock(routing, "outcomes", "routing");
   if (outcomes !== undefined) {
@@ -2512,7 +2638,11 @@ const ROUTING_KNOWN_KEYS: Readonly<Record<string, readonly string[]>> = {
     "exploration",
     "run",
     "workRoots",
+    "background",
+    "leases",
   ],
+  background: ["mode", "minPredictedMs"],
+  leases: ["mode", "run"],
   detection: ["deterministic", "grader", "none"],
   classifier: ["backend", "model", "baseUrl", "apiKeyEnv", "timeoutMs", "samples", "maxStateChars", "presets"],
   preset: ["backend", "model"],
@@ -2535,7 +2665,7 @@ export function findUnknownRoutingKeys(routing: unknown): string[] {
     }
   };
   check(routing, ROUTING_KNOWN_KEYS.routing!, "routing");
-  for (const block of ["detection", "classifier", "outcomes", "sessionReuse", "advisor"] as const) {
+  for (const block of ["detection", "classifier", "outcomes", "sessionReuse", "advisor", "background", "leases"] as const) {
     const value = routing[block];
     if (isPlainObject(value)) check(value, ROUTING_KNOWN_KEYS[block]!, `routing.${block}`);
   }
@@ -2569,6 +2699,9 @@ export function collectRoutingNotices(rawRouting: unknown, cfg: RouterConfig): s
   const unknown = findUnknownRoutingKeys(rawRouting);
   if (unknown.length > 0) {
     messages.push(`ignoring unknown routing key${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}`);
+  }
+  if (isPlainObject(rawRouting)) {
+    messages.push(...sanitizeBackground(rawRouting.background).issues, ...sanitizeLeases(rawRouting.leases).issues);
   }
   for (const [taskClass, agents] of Object.entries(cfg.routing?.roles ?? {})) {
     for (const agent of agents) {
@@ -3039,6 +3172,9 @@ export const ROUTING_DEFAULTS = Object.freeze({
   outcomes: Object.freeze({ path: null, halfLifeDays: 14, maxEffectiveSamples: 50 }),
   sessionReuse: Object.freeze({ maxContextFraction: 0.6 }),
   advisor: Object.freeze({ enabled: true, noticeIntervalHours: 24, notify: true }),
+  // OpenCode v2 only; v1 ignores both blocks (see configuredV2OnlyKeys).
+  background: Object.freeze({ mode: "auto" as BackgroundMode, minPredictedMs: 45_000 }),
+  leases: Object.freeze({ mode: "enforce" as LeasesMode, run: "annotate" as LeasesRunPolicy }),
 });
 
 export interface ResolvedClassifier {
@@ -3077,6 +3213,8 @@ export interface ResolvedRouting {
   readonly outcomes: Readonly<{ path: string | null; halfLifeDays: number; maxEffectiveSamples: number }>;
   readonly sessionReuse: Readonly<Required<SessionReuseConfig>>;
   readonly advisor: Readonly<Required<AdvisorConfig>>;
+  readonly background: Readonly<Required<BackgroundConfig>>;
+  readonly leases: Readonly<Required<LeasesConfig>>;
   readonly applied: RoutingApplied;
 }
 
@@ -3088,10 +3226,12 @@ function expandHomePath(value: string | null): string | null {
 }
 
 let warnedEngineIgnoredOnV1 = false;
+const warnedRoutingIssues = new Set<string>();
 
 /** Test-only: re-arm the once-per-process "engine ignored on v1" notice. */
 export function resetRoutingWarnings(): void {
   warnedEngineIgnoredOnV1 = false;
+  warnedRoutingIssues.clear();
   loggedNoticeTexts.clear();
 }
 
@@ -3130,6 +3270,18 @@ export function resolveRouting(
     warnedEngineIgnoredOnV1 = true;
     if (logger) logger.warn(ROUTING_ENGINE_IGNORED_ON_V1);
     else console.warn(`[model-router] ${ROUTING_ENGINE_IGNORED_ON_V1}`);
+  }
+
+  // routing.background / routing.leases: an invalid value warns once and the default applies.
+  const sanitizedBackground = sanitizeBackground(r.background);
+  const sanitizedLeases = sanitizeLeases(r.leases);
+  const background = sanitizedBackground.value;
+  const leases = sanitizedLeases.value;
+  for (const issue of [...sanitizedBackground.issues, ...sanitizedLeases.issues]) {
+    if (warnedRoutingIssues.has(issue)) continue;
+    warnedRoutingIssues.add(issue);
+    if (logger) logger.warn(issue);
+    else console.warn(`[model-router] ${issue}`);
   }
 
   const c: ClassifierConfig = r.classifier ?? {};
@@ -3175,6 +3327,14 @@ export function resolveRouting(
       enabled: r.advisor?.enabled ?? d.advisor.enabled,
       noticeIntervalHours: r.advisor?.noticeIntervalHours ?? d.advisor.noticeIntervalHours,
       notify: r.advisor?.notify ?? d.advisor.notify,
+    }),
+    background: Object.freeze({
+      mode: background?.mode ?? d.background.mode,
+      minPredictedMs: background?.minPredictedMs ?? d.background.minPredictedMs,
+    }),
+    leases: Object.freeze({
+      mode: leases?.mode ?? d.leases.mode,
+      run: leases?.run ?? d.leases.run,
     }),
     applied: Object.freeze({ host, requestedEngine, engineCoerced, rolesSource }),
   });

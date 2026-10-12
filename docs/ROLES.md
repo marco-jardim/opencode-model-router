@@ -27,6 +27,8 @@ with `routing.delegation: "tiers"` (the default) and on OpenCode v1 nothing on t
 - [Outcome signals](#outcome-signals)
 - [Exploration](#exploration)
 - [`router_run`](#router_run)
+- [Background dispatches](#background-dispatches)
+- [File leases](#file-leases)
 - [Roles mode is decided at plugin start](#roles-mode-is-decided-at-plugin-start)
 - [OpenCode v1 fallback](#opencode-v1-fallback)
 - [Migration from `subagentTiers` and `agents`](#migration-from-subagenttiers-and-agents)
@@ -398,6 +400,61 @@ code. It never spawns a shell itself (fixed argv, `shell: false`).
 - **Bounds.** Timeout `routing.run.timeoutMs` (default 600000 ms) with a process-tree kill; output bounded to 64 KiB
   with a notice; best-effort redaction of URL userinfo and credential-like query parameters (not a secret scanner).
 
+## Background dispatches
+
+On OpenCode v2 the roles protocol carries a `Background dispatches` block, the same one the tiers protocol gets,
+so a role orchestrator is told to:
+
+- continue any independent work after dispatching background work, and end the turn when none remains (the router
+  wakes it);
+- never poll or sleep;
+- treat a held result as unusable until its verdict, and never report a task done while dispatches are listed in
+  flight;
+- resolve a lease refusal by waiting for the holder, not by retrying.
+
+The whole block, the lease rule included, is left out when `routing.background.mode` is `off` (leases are still
+enforced; only the prompt line goes), and the lease rule alone when `routing.leases.mode` is `off`.
+
+Whether a `subagent` call to a role agent runs in the background is decided per call by `routing.background.mode`
+(`auto` by default, `model`, `off`) and `routing.background.minPredictedMs` (default `45000`); the rules, the held
+results and the per-turn lists are in [OPENCODE_V2.md](OPENCODE_V2.md#background-dispatches). A role call that
+needs required verification is backgrounded only where its result can be held. A role dispatch that `auto` does not
+select with a thin outcome store gets no `background` key, so the host default applies; with `off` it is sent as
+before (`background: false` for a role-routed call).
+
+## File leases
+
+On OpenCode v2 every child session (a role dispatch or a tier dispatch) takes a lease on the files it writes, for as
+long as it runs. Root orchestrator sessions take none: a root write is refused only while a child holds that file,
+and a root read, search or run is never refused. `routing.leases.mode` (`enforce`, the default, or `off`) switches
+the leases; `routing.leases.run` (`annotate`, the default, or `refuse`) sets what `router_run` does when its work root
+has files under edit by another session.
+
+What a child sees while another session holds a lease (`<holder>` is `<role> "<description>" (session <id>)`):
+
+| Access | Result |
+| --- | --- |
+| Write to a leased file | `[router] Refused: <path> is being edited by <holder>. Finish without that file, or return `NEED MORE: lease <path>`. Do not retry: the lease ends when that session ends.` |
+| Read of a file under edit | `[router] Refused: <path> is under edit by <holder>. Finish without it, or return `NEED MORE: lease <path>`.` |
+| Write whose target the router cannot name while a holder edits in that repository | `[router] Refused: this <tool> call names no file the router can check, and <holder> is editing files in this repository. Pass the file path explicitly, or return `NEED MORE: lease <tree>`.` |
+| More files leased than the limit | `[router] Refused: too many files are leased (<limit>). Return `NEED MORE: lease <path>`.` |
+| `glob` or `grep` listing files under edit | The listed files are removed and one line is added: `[router] <n> result(s) omitted: under edit by <holders>.` |
+| `router_run` in a tree with files under edit | `annotate`: the result gets `[router] ran while <holder> edits <n> file(s); result may be contaminated`. `refuse`: `[router] Refused: router_run in <tree> while <holder> edits <n> file(s) there. Wait for that session to end, or return `NEED MORE: lease <tree>`.` |
+| Root write to a file a child holds | `[router] Refused: <path> is being edited by <holder>. Wait for that session to end.` |
+
+A refusal is final for that attempt: the lease ends when the holder's execution ends, is interrupted or fails, when
+its session is deleted, or after the six-hour sweep, so a retry in the same turn fails the same way. The child either
+finishes without the file or returns `NEED MORE: lease <path>`, and the orchestrator re-dispatches once the holder
+is done. If the session kind cannot be determined the session is treated as a root, which never blocks the
+orchestrator and never overrides a child's lease. A required verification that would run in a tree where a child is
+editing waits for those leases to end (checked on release, with a five-second poll) up to its deadline, then runs
+with the usual caveat; the producer's own task never makes its own check wait. A lease table that cannot identify its
+holder makes writes fail closed and allows reads and runs with one warning.
+
+A lease protects a file only while its holder runs: once the leases end, the files the child wrote are readable (this
+is also why a held result's text is protected but the files behind it are not). On OpenCode v1 the leases are not
+registered.
+
 ## Roles mode is decided at plugin start
 
 Role agents, `router_run`, `router_request_authority` and the work-root resolver are registered only when the plugin
@@ -415,7 +472,8 @@ next start: restart OpenCode after either switch.
 On OpenCode v1, `routing.delegation: "roles"`, `roleAgents`, `routing.exploration`, `routing.run` and
 `routing.workRoots` are validated but **inert**, with one log line per process at plugin start:
 `roles delegation requires OpenCode v2; using tiers`. No role agent, tool, hook or prompt change is registered; v1
-keeps the tier model.
+keeps the tier model. `routing.background` and `routing.leases` are likewise OpenCode v2 only: v1 has no background
+policy, held results or leases, and its protocol has no `Background dispatches` block.
 
 ## Migration from `subagentTiers` and `agents`
 

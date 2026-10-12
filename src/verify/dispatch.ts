@@ -106,6 +106,20 @@ export interface ChangedFile {
   previousPath?: string;
 }
 
+/**
+ * Phase 2.1.4.b: the change set of a dispatch, computed when its child ends (captureDelta) so a background
+ * completion verifies what the child changed, not what the tree holds when the processor finally runs.
+ */
+export interface DispatchDelta {
+  readonly callID: string;
+  readonly childSessionID: string;
+  /** Files attributed to the dispatch; "unavailable" when attribution failed (never [] for a failure). */
+  readonly files: readonly ChangedFile[] | "unavailable";
+  /** Set when a foreign write contaminated the dispatch's snapshot (the change set is then unavailable). */
+  readonly contaminatedBy?: string;
+  readonly capturedAt: number;
+}
+
 /** Derive a {path,status} record from a write/edit tool call, or null. */
 export function extractChangedFile(tool: string, args: unknown): ChangedFile | null {
   if (!WRITE_TOOLS.has(tool)) return null;
@@ -469,6 +483,39 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
       const m = bySession.get(sessionID);
       if (!m) return [];
       return [...m.entries()].map(([path, status]) => ({ path, status }));
+    },
+    /**
+     * Phase 2.1.4.b: freezes the files the child changed so far (the tool calls observed in its session)
+     * at child end. A contaminated dispatch snapshot makes the set "unavailable", as the foreground gate
+     * treats it. Pure read: the child's record stays until clear(). QA-2.1-7: the dispatch record is keyed by its dispatch
+     * id (`task:<parent>:<callID>`), which the caller passes as `dispatchID`; it defaults to `callID`.
+     */
+    captureDelta(callID: string, childSessionID: string, dispatchID: string = callID): DispatchDelta {
+      const contaminatedBy = dispatches.get(dispatchID)?.snapshotContaminatedBy;
+      const files = contaminatedBy !== undefined ? "unavailable" : [...(bySession.get(childSessionID)?.entries() ?? [])].map(
+        ([path, status]): ChangedFile => ({ path, status }),
+      );
+      return {
+        callID,
+        childSessionID,
+        files,
+        ...(contaminatedBy !== undefined ? { contaminatedBy } : {}),
+        capturedAt: now(),
+      };
+    },
+    /**
+     * QA-2.1-17 (v2 only): a gate re-run after a restart has no observed tool calls for the child; the change set the
+     * restored pending entry persisted at child end is put back under the child's session, so the gate verifies what
+     * the child changed instead of a read-only delegation. Merges with anything recorded since.
+     */
+    seed(sessionID: string, files: readonly ChangedFile[]): void {
+      touch(sessionID);
+      let m = bySession.get(sessionID);
+      if (!m) {
+        m = new Map();
+        bySession.set(sessionID, m);
+      }
+      for (const file of files) if (!m.has(file.path)) m.set(file.path, file.status);
     },
     clear(sessionID: string): void {
       evict(sessionID);

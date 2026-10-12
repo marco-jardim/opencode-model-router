@@ -126,6 +126,110 @@ dispatch.
 **v1.** OpenCode v1 keeps the old delivery, unchanged: the pending list and the late
 notices (once) are system parts there, and there is no route hint (it is a v2 feature).
 
+## Background dispatches
+
+On v2 the orchestrator protocol carries a short `Background dispatches` block with these
+rules: after dispatching background work, continue any independent work; when none remains,
+end the turn, because the router wakes the orchestrator; never poll or sleep; a held result is
+not usable until its verdict; never report a task done while dispatches are listed in flight;
+a lease refusal is resolved by waiting for the holder, not by retrying. The whole block, the
+lease rule included, is left out when `routing.background.mode` is `off`; the lease rule
+alone when `routing.leases.mode` is `off`. Leases are still enforced under `off`; only the
+prompt line goes. The v1 protocol is unchanged.
+
+**When a call runs in the background.** `routing.background.mode` selects the policy (v2 only;
+v1 ignores it):
+
+- `off` keeps the previous behavior byte for byte: a verified or role-routed `subagent` call
+  runs in the foreground and every other call keeps whatever `background` argument the model
+  sent.
+- `model` backgrounds only what the model asks for with `background: true`; a call that does
+  not set it is left as under `off`.
+- `auto` also backgrounds, on its own, a call the router expects to be long: one whose
+  recorded duration estimate has at least the minimum number of real samples and a median at
+  or above `routing.background.minPredictedMs`, or one whose acceptance criteria include
+  `testsPass` or `buildPasses`. An estimate that is only the built-in prior never selects a
+  call. A call that is not selected keeps the old behavior (a verified call stays in the
+  foreground).
+
+`routing.background.mode` defaults to `auto` and `routing.background.minPredictedMs` to
+`45000` (an integer from 0 to 3600000). An invalid value warns once and the default applies.
+An explicit `background: false` is always honored. A child session never gets the router's
+background policy (only a root orchestrator session does), and neither does a call made while
+1000 attempts are already in flight; both keep the `off` behavior. When the call needs
+required verification but a held result cannot be offered (see below), the router does not
+background it: an `auto` selection falls back to the foreground, and an explicit
+`background: true` is turned into `background: false`.
+
+**Held results.** When a backgrounded call has `required` verification, its result is held:
+the orchestrator does not see the child's output until the verdict exists. While a result is
+held, every request (and every compaction) shows the orchestrator this in place of the
+completion text, whether the text is a whole message or sits inside a compaction record:
+
+```
+<subagent sessionID="<child>" state="held">held — verdict pending (vrf_…)</subagent>
+```
+
+Redaction is deterministic, so it does not move the prompt cache between requests. The
+placeholder stays in force for the rest of the session, after the verdict arrives too; the
+verdict is a separate entry. When the verdict is posted, the router adds a synthetic entry to
+the parent session and wakes it (an idle parent resumes; a busy parent receives it as a
+steer):
+
+```
+<router-verdict handle="vrf_…" sessionID="<child>" verdict="PASS|FAIL|UNVERIFIABLE">
+…the same text a foreground verified call returns…
+</router-verdict>
+```
+
+Resuming a held child with `subagent`, or naming its session id in a Code Mode `execute`, is
+refused: `[router] Refused: session <child> is held for verification (<handle>). Its result
+arrives with the verdict; resume it after that.` A failed delivery is retried three times
+with backoff and then stays pending for the next start. Holds are bounded (256 per parent
+session, 10000 in all); beyond that, or when the host cannot hold (no context and compaction
+hooks, or no `ctx.session.synthetic`), the call is not backgrounded as above.
+
+The guarantee covers the result text the orchestrator receives. The terminal UI and
+`session.export` still show the original to the human, and files the child wrote are readable
+as soon as its file leases end (see [ROLES.md](ROLES.md#file-leases)).
+
+**Child text that looks like a router line.** Under `auto` and `model`, every line of a
+child's text inside a `<subagent>` element that starts with `[router` (after blanks and
+markdown quote, list or emphasis marks; any case) is shown to the orchestrator as `(router`,
+so a child cannot pass its own text off as a router line, placeholder or verdict. Role
+dispatches get the same rewrite in every mode (see
+[ROLES.md](ROLES.md#observability)).
+
+**Calls a child session backgrounds.** The running notice, holds and completion guarantees
+apply to a root orchestrator's calls only. When the user backgrounds a call that a child
+session made, the router registers nothing and adds no notice: the child sees the host's
+running result as it is, and no hold or completion guarantee applies to that call.
+
+**Restarts.** The in-flight dispatches, the pending verification entries and the holds are
+written to `pending.jsonl` in a per-user state directory, so a held result is still held and
+its verdict is still delivered after the host restarts (see
+[VERIFICATION.md](VERIFICATION.md#pending-handles-survive-restarts)). If that file cannot be
+read, the router stops holding new results and redacts every `<subagent>` element it has not
+seen processed until a retry succeeds.
+
+**`off` and v1.** `routing.background.mode: "off"` reproduces the previous request, system
+prompt, running-ack text and results byte for byte, and renders none of the three sections.
+It does not turn off file leases (`routing.leases.mode`) or the restart persistence. OpenCode
+v1 is unchanged: none of this runs there, its protocol has no background block, and the
+`routing.background` and `routing.leases` keys have no effect (see
+[OpenCode v1 fallback](ROLES.md#opencode-v1-fallback)).
+
+**What the orchestrator is told.** Three sections join the per-turn router state above, after
+the late notices and the pending list and before the route hint: `Completed since your last
+turn` (background dispatches that finished, each with the verification annotations or
+`router guarantees pending`), `Held for verification — not usable until the verdict` (each
+held handle and whether it is verifying or waiting for a file lease), and `In flight
+(background)` (the count, each dispatch with its role, description, session and minutes
+running, and the line `Do not report the task done while dispatches are listed here.`). A
+section with nothing to list is left out, and under `routing.background.mode: "off"` none
+of the three is rendered. Like the rest of the state they exist only on a root orchestrator
+session and are never written to its history.
+
 ## Child sessions, cancellation and verification
 
 The v2 public session creation method cannot set `parentID`. Creating a standalone
@@ -154,15 +258,21 @@ history remains attached to its parent. V1 still aborts and deletes its temporar
 sessions. V2's immutable completed-text events require anti-narration warnings
 to appear as separate synthetic entries rather than mutating completed text.
 
-The adapter awaits native subagent completion only when the router verifies that
-dispatch, overriding `background: true` in that case. Otherwise background is
-preserved and its running result passes through unverified by design (not graded).
-The router's configured deferred and background verification operate on completed
-artifacts as before.
+The adapter awaits native subagent completion when the router verifies that dispatch
+and the call is not backgrounded under the background policy (see
+[Background dispatches](#background-dispatches)); with `routing.background.mode: "off"`
+it overrides `background: true` as it always did. A backgrounded call that is not
+verified passes through as before. The router's configured deferred and background
+verification operate on completed artifacts as before.
 
-If a user backgrounds an already-running verified native job, its pending response is
-explicitly marked unverified. It is never sent to the acceptance gate as if it
-were a completed artifact.
+If a user backgrounds an already-running verified native job, the router takes it over
+when it completes: it reads the child's final text, runs the same required-verification
+gate as a foreground call and, where the result can be held, holds it until the verdict
+and posts the verdict as above. Where it cannot hold (a child parent, or no holding
+available), the completion is visible, the gate still runs, and the verdict appears in
+the `Completed since your last turn` section and as a late notice. Under
+`routing.background.mode: "off"` the job is only marked unverified, as before; it is never
+sent to the acceptance gate as if it were a completed artifact.
 
 Router-annotated/verified `subagent` results now keep the host's
 `<subagent sessionID=…>` envelope part in `content`, preserving the resume handle,

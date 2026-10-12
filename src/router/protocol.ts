@@ -1,3 +1,4 @@
+import { resolveRouting } from "./config";
 import type { RouterConfig, Preset, ModeConfig } from "./config";
 import type { RoleKind, RoleSpec } from "./roles";
 import { ROLE_MENU_INTENT, ROUTER_BUDGET_NOTE_PREFIX } from "./prompts";
@@ -63,6 +64,7 @@ export function buildRolesProtocol(cfg: RouterConfig, roles: ReadonlyMap<string,
   const rawShell = enabled.some((spec) => spec.authority.allow.includes("router_run"))
     ? `Only when \`router_run\` refuses a command that is not on its allowlist, ask the user or dispatch a tier agent explicitly.`
     : `For a command, ask the user or dispatch a tier agent explicitly.`;
+  const background = buildBackgroundDispatchesBlock(cfg);
   return [
     ROLES_PROTOCOL_HEADING,
     ``,
@@ -85,6 +87,7 @@ export function buildRolesProtocol(cfg: RouterConfig, roles: ReadonlyMap<string,
     ``,
     `Dispatch prompt: the route line, then TASK, EXPECTED OUTCOME, TOOLS, MUST DO, MUST NOT DO, CONTEXT, ENVIRONMENT, with absolute paths.`,
     ``,
+    ...(background === "" ? [] : [background, ``]),
     `This protocol overrides any project guide (CLAUDE.md, AGENTS.md) that says to use direct tools first or to dispatch to tiers or models.`,
   ].join("\n");
 }
@@ -439,6 +442,28 @@ export function buildDoDProtocolSection(cfg: RouterConfig): string {
   ].join("\n");
 }
 
+/** Heading of {@link buildBackgroundDispatchesBlock}. */
+export const BACKGROUND_DISPATCHES_HEADING = "## Background dispatches";
+
+/**
+ * The "Background dispatches" block (OpenCode v2 only), rendered from the resolved `routing.background.mode` and
+ * `routing.leases.mode`: "" when background is `off` (QA-2.1-12: the whole block, the lease rule included, so `off`
+ * leaves the prompt as before phase 2.1); otherwise the heading and the first two rules, plus the lease rule when leases
+ * are `enforce`. Cache-stable: depends on those two modes only. Callers add it on v2 only.
+ */
+export function buildBackgroundDispatchesBlock(cfg: RouterConfig): string {
+  const routing = resolveRouting(cfg, "v2");
+  if (routing.background.mode === "off") return "";
+  const lines: string[] = [
+    `- After a background dispatch, continue any independent work; when none remains, end the turn — the router wakes you. Never poll or sleep.`,
+    `- A held result is not usable until its verdict arrives. Never report a task done while dispatches are listed in flight.`,
+  ];
+  if (routing.leases.mode === "enforce") {
+    lines.push(`- A lease refusal is resolved by waiting for the holder, not by retrying.`);
+  }
+  return [BACKGROUND_DISPATCHES_HEADING, ...lines].join("\n");
+}
+
 /**
  * Assembles the full system prompt injected by the experimental.chat.system.transform hook.
  * For Claude orchestrators: prepends CLAUDE_ORCHESTRATOR_PREFIX + CLAUDE_ANTI_NARRATION.
@@ -451,8 +476,10 @@ export function assembleSystemPrompt(
   cfg: RouterConfig,
   orchestratorModel: string | undefined,
   enforcementOn: boolean = false,
+  host: "v1" | "v2" = "v1",
 ): string {
-  const delegationProtocol = buildDelegationProtocol(cfg);
+  const background = host === "v2" ? buildBackgroundDispatchesBlock(cfg) : "";
+  const delegationProtocol = `${buildDelegationProtocol(cfg)}${background === "" ? "" : `\n\n${background}`}`;
   const dodSection = enforcementOn ? `\n\n---\n\n${buildDoDProtocolSection(cfg)}` : "";
   if (!isClaudeModel(orchestratorModel)) {
     return `${delegationProtocol}${dodSection}`;

@@ -380,9 +380,13 @@
 // ===============================================================================================
 
 import { randomBytes } from "node:crypto";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFile, mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import type { DoD } from "./dod";
 import type { RiskAssessment, RiskLevel } from "./risk";
+import { deserializeReference, serializeReference, type DispatchReference } from "./reference";
 import type { ChangedPath } from "./runner";
 import type { ReferenceState, Verdict } from "./types";
 
@@ -444,6 +448,10 @@ export const BACKGROUND_RETRY_BASE_MS = 30_000;
 export const BACKGROUND_MAX_ATTEMPTS = 3;
 /** R14: queued background requests; the oldest is dropped beyond it (it stays unverified). */
 export const BACKGROUND_QUEUE_MAX = MAX_ENTRIES_GLOBAL;
+/** Phase 2.1: the verdict of a held entry past pendingTtlMs. */
+export const HELD_TTL_REASON = "verification did not finish within pendingTtlMs";
+/** Phase 2.1: the verdict of a held entry whose runs kept ending retryable. */
+export const HELD_EXHAUSTED_REASON = `verification did not finish after ${BACKGROUND_MAX_ATTEMPTS} attempts`;
 /** R14: undelivered late notices per orchestrator session, and in total. */
 export const LATE_NOTICES_PER_SESSION = MAX_ENTRIES_PER_SESSION;
 export const LATE_NOTICES_MAX = MAX_ENTRIES_GLOBAL;
@@ -454,7 +462,7 @@ export const REPORTED_MEMO_MAX = TOMBSTONE_MAX;
 // Types
 // ---------------------------------------------------------------------------------------------
 
-export type PendingState = "unverified" | "verifying" | "verified";
+export type PendingState = "unverified" | "verifying" | "verified" | "held";
 
 /** Absolute path -> sha256 hex of the file bytes, or ABSENT_DIGEST for a missing path (R3). */
 export type FileDigests = ReadonlyMap<string, string>;
@@ -484,6 +492,29 @@ export interface PendingRegistration {
   readonly concurrentDispatches?: number;
   /** QA-3.1-3: the tool whose call discarded the dispatch snapshot (the change set is then unavailable). */
   readonly contaminatedBy?: string;
+  /**
+   * Phase 2.1 (v2 only): the handle reserved with `reserveHandle` at the background ack. The entry starts in
+   * state "held" and is excluded from listPending; `hold` names the child whose result is held.
+   */
+  readonly handle?: string;
+  readonly hold?: HoldRef;
+}
+
+/** The held child behind a "held" entry (phase 2.1 section 2.3). */
+export interface HoldRef {
+  readonly childSessionID: string;
+  readonly callID: string;
+}
+
+/** A record in pending.jsonl (phase 2.1 section 11.1); structurally the background journal's record. */
+export type PendingRecord = { v: 1; kind: string } & Record<string, unknown>;
+
+/** QA-2.1-33: the records one journal object's owner needs after a restart; called by every `recreate` of the shared path. */
+export type PendingSnapshotProvider = () => readonly PendingRecord[] | Promise<readonly PendingRecord[]>;
+
+/** The append-only journal seam; passed only when `ctx.routerHost === "v2"`. */
+export interface PendingJournal {
+  append(record: PendingRecord, opts?: { fsync?: boolean }): Promise<void>;
 }
 
 /** What a verification of one handle produced (2.4.3 builds it from the gate result). */
@@ -535,6 +566,8 @@ export interface PendingEntry {
   readonly concurrentDispatches?: number;
   /** PendingRegistration.contaminatedBy, as registered. */
   readonly contaminatedBy?: string;
+  /** Set while the child's result is held until the verdict (phase 2.1). */
+  readonly hold?: HoldRef;
   readonly createdAt: number;
   readonly state: PendingState;
   /** Set while state is "verifying". */
@@ -622,10 +655,42 @@ export interface PendingRegistryOptions {
   readonly maxWeight?: number;
   /** Logging hook; never throws into the registry (a throwing hook is ignored). */
   readonly onEvict?: (entry: PendingEntry, cause: EvictionCause) => void;
+  /** Phase 2.1: called once when an entry reaches its terminal "verified" state (a throwing hook is ignored). */
+  readonly onVerdict?: (entry: PendingEntry, result: SettledVerification) => void;
+  /** Phase 2.1, v2 only: persistence of entries and state changes. Absent on v1. */
+  readonly persist?: PendingJournal;
+  /** QA-2.1-4: lifetime of a reserved handle that is neither registered nor released; default HELD_RESERVATION_TTL_MS. */
+  readonly reservationTtlMs?: number;
+}
+
+/**
+ * QA-2.1-4: a reserved handle lives at most this long. Longer than the background sweep (ATTEMPT_SWEEP_AGE_MS, 6 h,
+ * background.ts), which releases the handle of every attempt it closes, so the TTL only catches a path that never ends.
+ */
+export const HELD_RESERVATION_TTL_MS = 7 * 3600_000;
+
+export interface RestoreReport {
+  readonly restored: number;
+  /** Held entries past pendingTtlMs, settled UNVERIFIABLE. */
+  readonly expiredHeld: number;
+  readonly dropped: number;
 }
 
 export interface PendingRegistry {
+  /** Idempotent on `dispatchID`: a second register returns the existing entry's handle. */
   register(reg: PendingRegistration): RegisterResult;
+  /** Draws a handle for a held dispatch before its entry exists; undefined when no slot is free. */
+  reserveHandle(sessionID: string): string | undefined;
+  /** Gives a reserved handle back (the ack failed, or the dispatch is not held after all). */
+  releaseHandle(handle: string): void;
+  /** The entry registered under `dispatchID` (callID), if still stored. */
+  findByDispatch(dispatchID: string): PendingEntry | undefined;
+  /** The session's "held" entries, newest first (they are never listed by listPending). */
+  listHeld(sessionID: string): readonly PendingEntry[];
+  /** True when a register for `sessionID` would find a slot (entry caps; held entries are never evicted). */
+  hasSlot(sessionID: string): boolean;
+  /** v2 only: rebuilds entries from pending.jsonl records (fold by key; stale ones dropped, held ones settled). */
+  restore(records: readonly PendingRecord[], options: { readonly now: number }): RestoreReport;
   get(sessionID: string, handle: string): Lookup;
   listUnverified(sessionID: string, limit?: number): readonly PendingEntry[];
   listOpen(sessionID: string): readonly PendingEntry[];
@@ -643,6 +708,8 @@ export interface PendingRegistry {
   recordRejection(record: RejectionRecord): void;
   findLineage(query: LineageQuery): LineageMatch | undefined;
   stats(): PendingRegistryStats;
+  /** QA-2.1-16 (v2 only): the `entry` and `state` records of every live entry (a vanished journal is rewritten from them). */
+  persistedRecords(): PendingRecord[];
   dispose(): void;
 }
 
@@ -748,6 +815,10 @@ interface EntryRecord {
   live: boolean;
   /** QA-2.4-3: router_verify reported the verdict to the session (markReplayed). */
   replayed: boolean;
+  /** Phase 2.1: the held child behind a "held" entry; undefined for every other entry. */
+  readonly hold: HoldRef | undefined;
+  /** Phase 2.1: retryable settles of a held entry so far (BACKGROUND_MAX_ATTEMPTS bound). */
+  holdAttempts: number;
 }
 
 type LookupMiss = Extract<Lookup, { readonly kind: "expired" | "unknown" }>;
@@ -769,6 +840,956 @@ function toHex(bytes: Uint8Array): string {
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
+}
+
+function isRiskAssessment(value: unknown): value is RiskAssessment {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    (v.level === "low" || v.level === "medium" || v.level === "high") &&
+    Array.isArray(v.reasons) &&
+    v.reasons.every((r) => typeof r === "string")
+  );
+}
+
+function isChangedFiles(value: unknown): value is readonly ChangedPath[] {
+  return (
+    Array.isArray(value) &&
+    value.every((p) => typeof p === "object" && p !== null && typeof (p as Record<string, unknown>).path === "string")
+  );
+}
+
+/** A persisted definition of done; the structure is trusted past this check (written by this module). */
+function isDoD(value: unknown): value is DoD {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export const REFERENCE_UNRESTORED_REASON = "reference could not be restored after a restart";
+
+export interface PendingFileJournal extends PendingJournal {
+  /**
+   * Every parseable record of the file, in order; a torn or invalid line and an unknown `v` are skipped. A file that is
+   * missing although this process saw it, wrote it or compacted it has vanished: `load` rejects (QA-2.1-8, fail closed) until
+   * `recreate` rewrites it (QA-2.1-16). Every journal of the same path in this process shares one read (QA-2.1-15).
+   */
+  load(): Promise<PendingRecord[]>;
+  /** Resolves when every append so far has reached the file. Never rejects. */
+  flush(): Promise<void>;
+  /**
+   * QA-2.1-8: rewrites the file with `records` only (a temp file, fsync'd, renamed over the journal), behind every
+   * append so far. Afterwards the file exists, so a later missing file counts as vanished.
+   */
+  compact(records: readonly PendingRecord[]): Promise<void>;
+  /**
+   * QA-2.1-16: rewrites the journal from `records` (the caller's in-memory state: every record a later restore needs),
+   * the same way as `compact` (a temp file, fsync'd, renamed over the journal; the directory is created when missing),
+   * behind every append so far. It is the recovery of a vanished journal: once it resolves, the vanished state is
+   * reset, so later `load` and `append` calls succeed again. Rejects (and changes nothing) when the rewrite fails;
+   * the caller then stays fail closed and may retry.
+   *
+   * QA-2.1-33: the rewrite is the union of `records` (the caller's own state: its own provider is not asked again) and
+   * the snapshot of every other journal object of the same path in this process that registered a provider
+   * (`setSnapshotProvider`), one record per identity (`mergePendingSnapshots`), so one instance's recreate never drops
+   * another instance's records. A provider that throws or rejects fails the recreate.
+   */
+  recreate(records: readonly PendingRecord[]): Promise<void>;
+  /**
+   * QA-2.1-33: registers (or, with undefined, removes) this journal object's snapshot provider: the records a later
+   * restore needs from this object's owner. Every `recreate` of the path in this process by ANOTHER journal object calls
+   * it inside the shared queue (this object's own `recreate` takes its state from `records`). Removed on `dispose`.
+   */
+  setSnapshotProvider(provider: PendingSnapshotProvider | undefined): void;
+  /** QA-2.1-8: why the compaction at start failed (the journal then stays as it was); undefined when it did not fail. */
+  readonly compactionError: string | undefined;
+  /**
+   * QA-2.1-22: releases this journal object after its last append. When it is the last journal of the path in this
+   * process, the process's writer mark is removed. Never rejects; idempotent.
+   */
+  dispose(): Promise<void>;
+}
+
+export interface PendingFileJournalOptions {
+  /** QA-2.1-8: compact the journal after the first successful load (default true). */
+  readonly compactAtStart?: boolean;
+  /** QA-2.1-8: the compaction also drops unheld entries and `inflight` records older than this (default: no age limit). */
+  readonly ttlMs?: number;
+  /** QA-2.1-22: told once when the compaction at start fails (`compactionError`); a throwing sink is ignored. */
+  readonly warn?: (message: string) => void;
+  /**
+   * QA-2.1-22: another live process's writer mark older than this is stale (pid reuse) and does not block the compaction
+   * at start; default WRITER_MARK_STALE_MS. A writer refreshes its mark at most every quarter of it while it appends.
+   */
+  readonly writerStaleMs?: number;
+  /** Injected clock for the writer marks; default Date.now. */
+  readonly now?: () => number;
+}
+
+/**
+ * QA-2.1-22: a writer mark of another live pid older than this does not block the compaction at start (a reused pid never
+ * re-stamps it). A live writer re-stamps its mark every quarter of it while it appends.
+ */
+export const WRITER_MARK_STALE_MS = 3600_000;
+
+/** QA-2.1-22: the warning of a failed compaction at start (once per journal path and process). */
+export const PENDING_COMPACTION_FAILED = "pending journal compaction failed";
+
+/** The message of a `load` that finds the journal gone after this process knew it (QA-2.1-8). */
+export const PENDING_JOURNAL_VANISHED = "pending journal vanished";
+
+/** QA-2.1-8: the per-user state directory name of the pending journal. */
+export const PENDING_STATE_DIRNAME = "opencode-model-router";
+
+/**
+ * QA-2.1-8: the durable per-user directory of `pending.jsonl`, `pending.claims` and `pending.writers`: never the temp directory
+ * (a temp sweep would delete held results and in-flight records). `$XDG_STATE_HOME/opencode-model-router` when that variable is
+ * an absolute path (not on Windows), else `<home>/.local/state/opencode-model-router` (next to the `~/.config/opencode` override
+ * file, on every platform). Pure.
+ */
+export function resolvePendingJournalDir(env: { readonly homedir: string; readonly platform: string; readonly xdgStateHome?: string | undefined }): string {
+  const xdg = env.xdgStateHome;
+  if (env.platform !== "win32" && xdg !== undefined && xdg !== "" && isAbsolute(xdg)) return join(xdg, PENDING_STATE_DIRNAME);
+  return join(env.homedir, ".local", "state", PENDING_STATE_DIRNAME);
+}
+
+/**
+ * Phase 2.1 section 11: the append-only `pending.jsonl` (v2 only). One writer per process: every journal
+ * created for the same resolved path in this process shares one append queue, one compaction and one writer
+ * mark (QA-2.1-15), so two plugin instances can never drop each other's records. Appends are serialized, and
+ * `fsync: true` appends reach the disk before they resolve. Appends never recreate a vanished file: once this
+ * process knew the file, a missing one fails the append and the next `load` (QA-2.1-8) until `recreate`
+ * rewrites it from the caller's state (QA-2.1-16).
+ */
+export function createPendingFileJournal(path: string, options: PendingFileJournalOptions = {}): PendingFileJournal {
+  const key = sharedJournalKey(path);
+  let found = SHARED_JOURNALS.get(key);
+  if (found === undefined) {
+    found = {
+      path: resolve(path),
+      tail: Promise.resolve(),
+      madeDir: false,
+      known: false,
+      loading: undefined,
+      lastRead: undefined,
+      compactionScheduled: false,
+      compactionError: undefined,
+      compactionWarned: false,
+      markAt: undefined,
+      refs: 0,
+      providers: new Map(),
+    };
+    SHARED_JOURNALS.set(key, found);
+  }
+  const state: SharedJournal = found;
+  state.refs += 1;
+  let disposed = false;
+  /** QA-2.1-33: this journal object's key in `state.providers`. */
+  const self = {};
+  const file = state.path;
+  const now = options.now ?? Date.now;
+  const staleMs = options.writerStaleMs ?? WRITER_MARK_STALE_MS;
+  const writersDir = join(dirname(file), PENDING_WRITERS_DIRNAME);
+  const markName = `${process.pid}.${PROCESS_CLAIM_TOKEN}`;
+
+  async function ensureFile(): Promise<void> {
+    if (!state.madeDir) {
+      await mkdir(dirname(file), { recursive: true });
+      state.madeDir = true;
+    }
+    // `wx` creates the file once; afterwards the append below must find it ("a" alone would recreate a vanished file).
+    if (!state.known) {
+      try {
+        await writeFile(file, "", { flag: "wx" });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+      state.known = true;
+      return;
+    }
+    try {
+      await stat(file);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(PENDING_JOURNAL_VANISHED);
+      throw error;
+    }
+  }
+  /** Queues `work` behind every append, compaction and rewrite of this path in this process; the queue survives a failure. */
+  function enqueue(work: () => Promise<void>): Promise<void> {
+    const write = state.tail.then(work);
+    state.tail = write.catch((error: unknown) => {
+      void error; // surfaced to this caller below; the chain keeps going for the next append
+    });
+    return write;
+  }
+  function append(record: PendingRecord, opts?: { fsync?: boolean }): Promise<void> {
+    const line = `${JSON.stringify(record)}\n`;
+    return enqueue(async () => {
+      await ensureFile();
+      await refreshMark();
+      if (opts?.fsync === true) {
+        const handle = await open(file, "a");
+        try {
+          await handle.appendFile(line, "utf8");
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+      } else {
+        await appendFile(file, line, "utf8");
+      }
+    });
+  }
+  return {
+    append,
+    async flush() {
+      await state.tail;
+    },
+    compact(records) {
+      // `replaceFile` also forgets the last read: a rewrite with the same size and mtime must still be read again.
+      return enqueue(() => replaceFile(records));
+    },
+    recreate(records) {
+      // QA-2.1-16: the writers directory may have vanished with the journal, so the mark is written again right away.
+      // QA-2.1-33: the snapshots are taken inside the queue, so every append queued before this rewrite is in them too.
+      return enqueue(async () => {
+        await replaceFile(await unionOfSnapshots(records));
+        state.markAt = undefined;
+        await refreshMark();
+      });
+    },
+    setSnapshotProvider(provider) {
+      if (provider === undefined || disposed) state.providers.delete(self);
+      else state.providers.set(self, provider);
+    },
+    load() {
+      // QA-2.1-8: concurrent loads share one read, and a file unchanged since the last read (size and mtime) is not read again.
+      const loading = (state.loading ??= readRecords().finally(() => {
+        state.loading = undefined;
+      }));
+      return loading.then((records) => [...records]);
+    },
+    get compactionError() {
+      return state.compactionError;
+    },
+    dispose() {
+      if (disposed) return Promise.resolve();
+      disposed = true;
+      state.providers.delete(self);
+      state.refs -= 1;
+      if (state.refs > 0) return Promise.resolve();
+      const done = state.tail
+        .then(async () => {
+          // Another journal of this path may have been created while the queue drained: it keeps the mark.
+          if (state.refs > 0) return;
+          state.markAt = undefined;
+          await rm(join(writersDir, markName), { force: true });
+        })
+        .catch((error: unknown) => {
+          void error; // a mark that cannot be removed dies with this pid (a dead pid's mark is stale) or ages out
+        })
+        .finally(() => {
+          if (state.refs === 0 && SHARED_JOURNALS.get(key) === state) SHARED_JOURNALS.delete(key);
+        });
+      state.tail = done;
+      return done;
+    },
+  };
+
+  async function readRecords(): Promise<readonly PendingRecord[]> {
+    let info: { size: number; mtimeMs: number };
+    let text: string;
+    try {
+      info = await stat(file);
+      const last = state.lastRead;
+      if (last !== undefined && last.size === info.size && last.mtimeMs === info.mtimeMs) {
+        scheduleCompaction();
+        return last.records;
+      }
+      text = await readFile(file, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        if (state.known) throw new Error(PENDING_JOURNAL_VANISHED);
+        return [];
+      }
+      throw error;
+    }
+    state.known = true;
+    const records = parsePendingText(text);
+    state.lastRead = { size: info.size, mtimeMs: info.mtimeMs, records };
+    scheduleCompaction();
+    return records;
+  }
+
+  function scheduleCompaction(): void {
+    if (state.compactionScheduled || options.compactAtStart === false) return;
+    state.compactionScheduled = true;
+    void compactAtStart();
+  }
+
+  /**
+   * QA-2.1-8: the first successful load in this process compacts the journal (`compactPendingRecords`), behind every append of
+   * this process (one queue per path, QA-2.1-15), and only while no other live process holds a fresh writer mark on the same
+   * journal (`pending.writers`): another process's append could land in the file the rename replaces. A failure keeps the
+   * journal as it was (`compactionError`, told once to `warn`, QA-2.1-22).
+   */
+  function compactAtStart(): Promise<void> {
+    const write = state.tail.then(async () => {
+      if (await otherLiveWriter()) return;
+      let text: string;
+      try {
+        text = await readFile(file, "utf8");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw error;
+      }
+      const records = parsePendingText(text);
+      const kept = compactPendingRecords(records, { now: now(), ...(options.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }) });
+      if (kept.length >= records.length) return;
+      await replaceFile(kept);
+    });
+    const settled = write.catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      state.compactionError = message;
+      if (state.compactionWarned) return;
+      state.compactionWarned = true;
+      try {
+        options.warn?.(`${PENDING_COMPACTION_FAILED}: ${message}`);
+      } catch (warnError) {
+        void warnError; // a throwing warn sink is ignored
+      }
+    });
+    state.tail = settled;
+    return settled;
+  }
+
+  /**
+   * QA-2.1-33: `records` (the caller's own state) plus the snapshot of every OTHER journal object of this path that
+   * registered a provider, in registration order: the caller's own provider is not asked again. One record per identity
+   * (`mergePendingSnapshots`): the same hold or attempt reaches the union from several sources with other field values.
+   * A throwing provider fails the recreate, which then changes nothing.
+   */
+  async function unionOfSnapshots(records: readonly PendingRecord[]): Promise<PendingRecord[]> {
+    const sources: (readonly PendingRecord[])[] = [records];
+    for (const [owner, provider] of [...state.providers]) {
+      if (owner !== self) sources.push(await provider());
+    }
+    return mergePendingSnapshots(sources);
+  }
+
+  async function replaceFile(records: readonly PendingRecord[]): Promise<void> {
+    const body = records.map((record) => `${JSON.stringify(record)}\n`).join("");
+    await mkdir(dirname(file), { recursive: true });
+    state.madeDir = true;
+    const temp = `${file}.${process.pid}.compact`;
+    try {
+      const handle = await open(temp, "w");
+      try {
+        await handle.writeFile(body, "utf8");
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      await rename(temp, file);
+    } catch (error) {
+      // QA-2.1-22: a failed write or rename leaves no temp file behind.
+      await rm(temp, { force: true }).catch((cleanupError: unknown) => {
+        void cleanupError; // the next rewrite opens the temp file with "w" and replaces it
+      });
+      throw error;
+    }
+    state.known = true;
+    state.lastRead = undefined;
+  }
+
+  /** QA-2.1-22: writes this process's writer mark `{pid, token, at}` (`<pid>.<token>`, one per process and path). */
+  async function writeMark(): Promise<void> {
+    await mkdir(writersDir, { recursive: true });
+    const at = now();
+    await writeFile(join(writersDir, markName), `${JSON.stringify({ pid: process.pid, token: PROCESS_CLAIM_TOKEN, at })}\n`);
+    state.markAt = at;
+  }
+
+  /**
+   * QA-2.1-22: a writer re-stamps its mark while it appends (at most every quarter of `writerStaleMs`), so another process never
+   * takes a live writer's mark for a reused pid's. Best effort: a mark that cannot be written is tried again at the next append.
+   */
+  async function refreshMark(): Promise<void> {
+    if (state.markAt !== undefined && now() - state.markAt < staleMs / 4) return;
+    try {
+      await writeMark();
+    } catch (error) {
+      void error; // the append itself must not fail for its mark; the next append tries again
+    }
+  }
+
+  /**
+   * Marks this process as a writer of the journal and reports whether another live process holds a fresh mark too
+   * (QA-2.1-22): a dead pid's mark, and one of this pid from an earlier process (another token), is removed; a live pid's mark
+   * older than `writerStaleMs` (a reused pid: a live writer re-stamps its mark while it appends) does not block.
+   */
+  async function otherLiveWriter(): Promise<boolean> {
+    await writeMark();
+    let other = false;
+    for (const name of await readdir(writersDir)) {
+      if (name === markName) continue;
+      const pid = Number.parseInt(name.split(".")[0] ?? "", 10);
+      if (Number.isInteger(pid) && pid > 0 && pid !== process.pid && isAlive(pid)) {
+        const age = await markAge(join(writersDir, name));
+        if (age !== undefined && age <= staleMs) other = true;
+        continue;
+      }
+      await rm(join(writersDir, name), { force: true });
+    }
+    return other;
+  }
+
+  /** The age of a writer mark (its `at`, else its mtime); undefined when it is gone. */
+  async function markAge(markPath: string): Promise<number | undefined> {
+    let text: string;
+    let mtimeMs: number;
+    try {
+      mtimeMs = (await stat(markPath)).mtimeMs;
+      text = await readFile(markPath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+    return now() - (parseMarkAt(text) ?? mtimeMs);
+  }
+}
+
+/** QA-2.1-15: the state every journal of one path in this process shares (one append queue, one compaction, one mark). */
+interface SharedJournal {
+  readonly path: string;
+  tail: Promise<unknown>;
+  madeDir: boolean;
+  /** This process read, wrote or compacted the file: from now on a missing file has vanished (until `recreate`). */
+  known: boolean;
+  /** QA-2.1-8: the read in flight (shared) and the last read with the file's size and mtime (not read again while unchanged). */
+  loading: Promise<readonly PendingRecord[]> | undefined;
+  lastRead: { size: number; mtimeMs: number; records: readonly PendingRecord[] } | undefined;
+  compactionScheduled: boolean;
+  compactionError: string | undefined;
+  compactionWarned: boolean;
+  /** When this process last wrote its writer mark; undefined: not written since the start, `recreate` or `dispose`. */
+  markAt: number | undefined;
+  /** Journal objects of this path in this process that are not disposed. */
+  refs: number;
+  /** QA-2.1-33: the snapshot provider of each journal object of this path that registered one (`setSnapshotProvider`). */
+  readonly providers: Map<object, PendingSnapshotProvider>;
+}
+
+/** QA-2.1-15: one shared journal state per resolved path in this process (case-insensitive on Windows). */
+const SHARED_JOURNALS = new Map<string, SharedJournal>();
+
+/**
+ * QA-2.1-16/-33: what identifies a record a recreation rewrites from memory: its kind and its attempt key, else its handle
+ * (`hold`, `hold-text`, `posting`, `posted`, entry and state records). Undefined for a record with neither. Pure.
+ */
+export function pendingRecordIdentity(record: { readonly kind: string; readonly [field: string]: unknown }): string | undefined {
+  const id = typeof record.key === "string" ? record.key : typeof record.handle === "string" ? record.handle : undefined;
+  return id === undefined ? undefined : `${record.kind}\u0000${id}`;
+}
+
+/**
+ * QA-2.1-33: merges record lists (the caller's state, then each other instance's snapshot) into one list with one record
+ * per identity (`pendingRecordIdentity`; a record without one is identified by its serialized form), whichever list or
+ * position it comes from: the same hold may arrive from the adapter, the plugin and another instance with other field
+ * values or field order. Of one identity the newest record (`at`) is kept, on a tie the most complete one (more fields),
+ * else the first; it takes the position of the first occurrence, so the order of the first list is kept. Pure.
+ */
+export function mergePendingSnapshots(lists: ReadonlyArray<readonly PendingRecord[]>): PendingRecord[] {
+  const positions = new Map<string, number>();
+  const union: PendingRecord[] = [];
+  for (const list of lists) {
+    for (const record of list) {
+      const id = pendingRecordIdentity(record) ?? `json\u0000${JSON.stringify(record)}`;
+      const position = positions.get(id);
+      if (position === undefined) {
+        positions.set(id, union.length);
+        union.push(record);
+        continue;
+      }
+      const kept = union[position];
+      if (kept === undefined || supersedes(record, kept)) union[position] = record;
+    }
+  }
+  return union;
+}
+
+/** QA-2.1-33: whether `candidate` replaces `kept` (same identity): a newer `at`, else (same or no `at`) more fields. */
+function supersedes(candidate: PendingRecord, kept: PendingRecord): boolean {
+  const next = typeof candidate.at === "number" && Number.isFinite(candidate.at) ? candidate.at : undefined;
+  const prev = typeof kept.at === "number" && Number.isFinite(kept.at) ? kept.at : undefined;
+  if (next !== undefined && prev !== undefined && next !== prev) return next > prev;
+  if (next !== undefined && prev === undefined) return true;
+  if (next === undefined && prev !== undefined) return false;
+  return Object.keys(candidate).length > Object.keys(kept).length;
+}
+
+/** QA-2.1-22: the directory of the writer marks, next to `pending.jsonl`. */
+export const PENDING_WRITERS_DIRNAME = "pending.writers";
+
+function sharedJournalKey(path: string): string {
+  const full = resolve(path);
+  return process.platform === "win32" ? full.toLowerCase() : full;
+}
+
+function parseMarkAt(text: string): number | undefined {
+  try {
+    const rec: unknown = JSON.parse(text);
+    if (typeof rec !== "object" || rec === null) return undefined;
+    const at = (rec as Record<string, unknown>).at;
+    return typeof at === "number" && Number.isFinite(at) ? at : undefined;
+  } catch (error) {
+    void error; // a torn mark: its mtime decides
+    return undefined;
+  }
+}
+
+/** Parses `pending.jsonl` text: a torn or invalid line and an unknown `v` are skipped. */
+function parsePendingText(text: string): PendingRecord[] {
+  const records: PendingRecord[] = [];
+  for (const line of text.split("\n")) {
+    if (line.trim() === "") continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch (error) {
+      void error; // a torn line (crash mid-write) is skipped
+      continue;
+    }
+    if (typeof parsed !== "object" || parsed === null) continue;
+    const rec = parsed as Record<string, unknown>;
+    if (rec.v !== 1 || typeof rec.kind !== "string") continue;
+    records.push({ ...rec, v: 1, kind: rec.kind });
+  }
+  return records;
+}
+
+/** `process.kill(pid, 0)`: alive, or alive but not ours (EPERM). */
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * QA-2.1-8: the records of `pending.jsonl` that still matter, in journal order. The pending registry's `restore` and
+ * `foldDormantRecords` read the result exactly as they read the full journal: superseded `entry`/`ref`/`state` records, entries
+ * that ended `verified`, everything a `tomb` or a `forget` closed (and those records themselves), `inflight` records closed by
+ * `processed` (and every `processed` record: no attempt of an earlier process survives to need its key), the `hold-text` and
+ * older `posting` records of a hold, the follow-ups of a posted hold (its `hold` and `posted` stay: an inactive placeholder,
+ * QA-2.1-10), and records that change nothing (a `state` or follow-up of an unknown handle) are dropped. With `ttlMs`, unheld
+ * entries and `inflight` records older than it go too (the readers drop them anyway). Unknown kinds are kept. Pure.
+ */
+export function compactPendingRecords(records: readonly PendingRecord[], opts: { now: number; ttlMs?: number }): PendingRecord[] {
+  const keep = records.map(() => true);
+  const str = (value: unknown): string | undefined => (typeof value === "string" && value !== "" ? value : undefined);
+  const parentOf = (rec: PendingRecord): string | undefined => str(rec.parent) ?? str(rec.parentSessionID);
+  const childOf = (rec: PendingRecord): string | undefined => str(rec.child) ?? str(rec.childSessionID);
+  const drop = (...indexes: Array<number | undefined>): void => {
+    for (const index of indexes) if (index !== undefined) keep[index] = false;
+  };
+  const entries = new Map<string, { entry: number; ref?: number; state?: number; stateValue: string; parent?: string; held: boolean; at: number }>();
+  const holds = new Map<string, { hold: number; text?: number; posting?: number; posted?: number; parent?: string }>();
+  const inflight = new Map<string, { index: number; parent?: string; at: number }>();
+  const dropEntry = (handle: string): void => {
+    const e = entries.get(handle);
+    if (e !== undefined) drop(e.entry, e.ref, e.state);
+    entries.delete(handle);
+  };
+  const dropHold = (handle: string): void => {
+    const h = holds.get(handle);
+    if (h !== undefined) drop(h.hold, h.text, h.posting, h.posted);
+    holds.delete(handle);
+  };
+  records.forEach((rec, index) => {
+    const handle = str(rec.handle);
+    const callID = str(rec.callID);
+    switch (rec.kind) {
+      case "entry": {
+        if (handle === undefined) return;
+        dropEntry(handle);
+        const at = typeof rec.createdAt === "number" ? rec.createdAt : opts.now;
+        const parent = str(rec.parent);
+        entries.set(handle, {
+          entry: index, stateValue: str(rec.state) ?? "unverified", held: rec.state === "held", at, ...(parent === undefined ? {} : { parent }),
+        });
+        return;
+      }
+      case "ref": {
+        const e = handle === undefined ? undefined : entries.get(handle);
+        // A ref with no stored entry of its handle applies by `callID` in `restore`: kept as it is.
+        if (e === undefined) return;
+        drop(e.ref);
+        e.ref = index;
+        return;
+      }
+      case "state": {
+        const e = handle === undefined ? undefined : entries.get(handle);
+        if (e === undefined || typeof rec.state !== "string" || rec.state === "") {
+          drop(index);
+          return;
+        }
+        drop(e.state);
+        e.state = index;
+        e.stateValue = rec.state;
+        return;
+      }
+      case "tomb": {
+        // QA-2.1-28: a tomb ends a pending ENTRY (TTL, eviction, session gone). A hold is the adapter's and ends only with
+        // `posted` (then an inactive placeholder) or `forget`: a tomb never takes the placeholder that hides the raw completion.
+        if (handle !== undefined) dropEntry(handle);
+        if (callID !== undefined) {
+          drop(inflight.get(callID)?.index);
+          inflight.delete(callID);
+        }
+        drop(index);
+        return;
+      }
+      case "forget": {
+        const session = str(rec.session);
+        if (session !== undefined) {
+          for (const [h, e] of [...entries]) if (e.parent === session) dropEntry(h);
+          for (const [h, v] of [...holds]) if (v.parent === session) dropHold(h);
+          for (const [c, v] of [...inflight]) {
+            if (v.parent !== session) continue;
+            drop(v.index);
+            inflight.delete(c);
+          }
+        }
+        drop(index);
+        return;
+      }
+      case "inflight": {
+        // `foldDormantRecords` takes an inflight record only with a call, a parent and a child; any other changes nothing.
+        if (callID === undefined || parentOf(rec) === undefined || childOf(rec) === undefined) return;
+        drop(inflight.get(callID)?.index);
+        const parent = parentOf(rec);
+        inflight.set(callID, { index, at: typeof rec.at === "number" ? rec.at : 0, ...(parent === undefined ? {} : { parent }) });
+        return;
+      }
+      case "processed": {
+        if (callID !== undefined) {
+          drop(inflight.get(callID)?.index);
+          inflight.delete(callID);
+        }
+        drop(index);
+        return;
+      }
+      case "hold": {
+        if (handle === undefined || parentOf(rec) === undefined || childOf(rec) === undefined) return;
+        dropHold(handle);
+        const parent = parentOf(rec);
+        holds.set(handle, { hold: index, ...(parent === undefined ? {} : { parent }) });
+        return;
+      }
+      case "hold-text":
+      case "posting": {
+        const h = handle === undefined ? undefined : holds.get(handle);
+        if (h === undefined || h.posted !== undefined) {
+          drop(index);
+          return;
+        }
+        if (rec.kind === "hold-text") {
+          drop(h.text);
+          h.text = index;
+        } else {
+          drop(h.posting);
+          h.posting = index;
+        }
+        return;
+      }
+      case "posted": {
+        const h = handle === undefined ? undefined : holds.get(handle);
+        if (h === undefined) {
+          drop(index);
+          return;
+        }
+        drop(h.text, h.posting, h.posted);
+        h.text = undefined;
+        h.posting = undefined;
+        h.posted = index;
+        return;
+      }
+      default:
+        return;
+    }
+  });
+  for (const [handle, e] of entries) {
+    if (e.stateValue === "verified") {
+      // QA-2.1-17: the verdict of a hold that never started posting stays (its entry and `state`): the next start posts it.
+      const h = holds.get(handle);
+      if (h === undefined || h.posting !== undefined || h.posted !== undefined) dropEntry(handle);
+    } else if (opts.ttlMs !== undefined && !e.held && opts.now - e.at >= opts.ttlMs) dropEntry(handle);
+  }
+  if (opts.ttlMs !== undefined) {
+    for (const v of inflight.values()) if (opts.now - v.at > opts.ttlMs) drop(v.index);
+  }
+  // QA-2.1-28: the cap `foldDormantRecords` applies at load applies here too: past MAX_DORMANT_POSTED_HOLDS posted
+  // placeholders, the oldest go (their `hold` and `posted` lines); an unposted hold is never dropped (no age, as at load).
+  let postedHolds = 0;
+  for (const h of holds.values()) if (h.posted !== undefined) postedHolds += 1;
+  for (const [handle, h] of [...holds]) {
+    if (postedHolds <= MAX_DORMANT_POSTED_HOLDS) break;
+    if (h.posted === undefined) continue;
+    dropHold(handle);
+    postedHolds -= 1;
+  }
+  return records.filter((_, index) => keep[index]);
+}
+
+// ---- Phase 2.1 section 11.3: reload of the in-flight / hold records (v2 only) -----------------------------------------
+
+/** The records of one parent session that survived a restart; dormant until the new process sees that session. */
+export interface DormantSession {
+  /**
+   * `hold` records not tombstoned or forgotten (no TTL, section 11.3), each followed by its `hold-text` and newest `posting`
+   * record, or, for a posted hold, by its `posted` record only (an inactive placeholder, QA-2.1-10). In journal order per hold.
+   */
+  holds: PendingRecord[];
+  /** `inflight` records without a `processed` record, younger than the TTL. */
+  inflight: PendingRecord[];
+}
+
+/** The idempotency key of a `processed` record: its `key`, else `child NUL callID` (section 10). */
+export function processedKeyOf(record: Readonly<Record<string, unknown>>): string | undefined {
+  if (typeof record.key === "string" && record.key !== "") return record.key;
+  if (typeof record.child === "string" && typeof record.callID === "string") return `${record.child}\u0000${record.callID}`;
+  return undefined;
+}
+
+/**
+ * Folds the parsed records of `pending.jsonl` (section 11.3): `forget` removes a session's earlier records, `processed` closes an
+ * `inflight`, `posted` turns a `hold` into an inactive placeholder, and a tombstoned `callID` closes its `inflight` (QA-2.1-28: a
+ * `tomb` never closes a hold). Inflight records older than `ttlMs` are dropped; hold records never expire. Pure.
+ */
+export function foldDormantRecords(
+  records: readonly PendingRecord[],
+  opts: { now: number; ttlMs: number },
+): { sessions: Map<string, DormantSession>; processed: Set<string> } {
+  const processed = new Set<string>();
+  const inflight = new Map<string, PendingRecord>();
+  /** handle -> the `hold` record, then its follow-ups (`hold-text`, the newest `posting`, `posted`). */
+  const holds = new Map<string, { hold: PendingRecord; text?: PendingRecord; posting?: PendingRecord; posted?: PendingRecord }>();
+  /** QA-2.1-17: handle -> the newest `state` record that settled its entry `verified` with a verdict. */
+  const verdicts = new Map<string, PendingRecord>();
+  const str = (value: unknown): string | undefined => (typeof value === "string" && value !== "" ? value : undefined);
+  /** The adapter writes `parentSessionID` / `childSessionID` on `inflight`, `parent` / `child` on `hold`: both are read. */
+  const parentOf = (rec: PendingRecord): string | undefined => str(rec.parent) ?? str(rec.parentSessionID);
+  const childOf = (rec: PendingRecord): string | undefined => str(rec.child) ?? str(rec.childSessionID);
+  for (const rec of records) {
+    switch (rec.kind) {
+      case "inflight": {
+        const callID = str(rec.callID);
+        if (callID !== undefined && parentOf(rec) !== undefined && childOf(rec) !== undefined) inflight.set(callID, rec);
+        break;
+      }
+      case "processed": {
+        const key = processedKeyOf(rec);
+        if (key !== undefined) processed.add(key);
+        const callID = str(rec.callID);
+        if (callID !== undefined) inflight.delete(callID);
+        break;
+      }
+      case "hold": {
+        const handle = str(rec.handle);
+        if (handle !== undefined && parentOf(rec) !== undefined && childOf(rec) !== undefined) holds.set(handle, { hold: rec });
+        break;
+      }
+      case "hold-text": {
+        const held = holds.get(str(rec.handle) ?? "");
+        if (held !== undefined && held.posted === undefined && typeof rec.text === "string") held.text = rec;
+        break;
+      }
+      case "posting": {
+        const held = holds.get(str(rec.handle) ?? "");
+        if (held !== undefined && held.posted === undefined) held.posting = rec;
+        break;
+      }
+      case "state": {
+        const handle = str(rec.handle);
+        if (handle !== undefined && rec.state === "verified" && rec.verdict !== null && typeof rec.verdict === "object") verdicts.set(handle, rec);
+        break;
+      }
+      case "posted": {
+        // QA-2.1-10: a posted hold survives as an inactive placeholder (the host history still holds the raw completion).
+        const held = holds.get(str(rec.handle) ?? "");
+        if (held !== undefined) holds.set(str(rec.handle) ?? "", { hold: held.hold, posted: rec });
+        break;
+      }
+      case "tomb": {
+        // QA-2.1-28: an entry tomb never closes a hold (its placeholder, or a hold still owed a verdict): see compaction.
+        const callID = str(rec.callID);
+        if (callID !== undefined) inflight.delete(callID);
+        break;
+      }
+      case "forget": {
+        const session = str(rec.session);
+        if (session === undefined) break;
+        for (const [key, value] of inflight) if (parentOf(value) === session) inflight.delete(key);
+        for (const [key, value] of holds) if (parentOf(value.hold) === session) holds.delete(key);
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  // Posted placeholders are bounded (newest kept); an unposted hold is never dropped here.
+  let posted = 0;
+  for (const value of holds.values()) if (value.posted !== undefined) posted += 1;
+  for (const [key, value] of holds) {
+    if (posted <= MAX_DORMANT_POSTED_HOLDS) break;
+    if (value.posted === undefined) continue;
+    holds.delete(key);
+    posted -= 1;
+  }
+  const sessions = new Map<string, DormantSession>();
+  const sessionOf = (parent: string): DormantSession => {
+    let session = sessions.get(parent);
+    if (session === undefined) {
+      session = { holds: [], inflight: [] };
+      sessions.set(parent, session);
+    }
+    return session;
+  };
+  for (const rec of inflight.values()) {
+    const at = typeof rec.at === "number" ? rec.at : 0;
+    if (opts.now - at > opts.ttlMs) continue;
+    sessionOf(parentOf(rec) ?? "").inflight.push(rec);
+  }
+  for (const [handle, value] of holds) {
+    const list = sessionOf(parentOf(value.hold) ?? "").holds;
+    list.push(value.hold);
+    if (value.text !== undefined) list.push(value.text);
+    if (value.posting !== undefined) list.push(value.posting);
+    if (value.posted !== undefined) list.push(value.posted);
+    // QA-2.1-17: a verdict the gate reached (its entry's `verified` state) but never started posting is handed over with the
+    // hold, so the adopter posts it instead of running the gate again.
+    const verdict = verdicts.get(handle);
+    if (verdict !== undefined && value.posting === undefined && value.posted === undefined) list.push(verdict);
+  }
+  return { sessions, processed };
+}
+
+/** Posted holds kept as inactive placeholders across a restart (QA-2.1-10); = MAX_HOLDS_GLOBAL (background.ts). */
+export const MAX_DORMANT_POSTED_HOLDS = 10_000;
+
+/**
+ * Section 11.3: the exclusive claim file `<claimsDir>\<id>` (`wx`, `{pid, at}`) that stops two host processes from verifying or
+ * posting for one session twice. A claim of a dead pid (or of this process) is stale and is taken over. True when this process owns it.
+ */
+export function claimPendingSession(
+  claimsDir: string,
+  sessionID: string,
+  seams: {
+    pid: number;
+    now: number;
+    isAlive(pid: number): boolean;
+    /** Identifies this process beyond its pid (QA-2.1-13, PID reuse); default: one random token per module load. */
+    token?: string;
+    /** A live pid's claim older than this is taken over (a reused pid never refreshes it); default `CLAIM_STALE_MS`. */
+    staleMs?: number;
+  },
+): boolean {
+  const file = join(claimsDir, encodeURIComponent(sessionID));
+  const token = seams.token ?? PROCESS_CLAIM_TOKEN;
+  const body = `${JSON.stringify({ pid: seams.pid, token, at: seams.now })}\n`;
+  mkdirSync(claimsDir, { recursive: true });
+  try {
+    writeFileSync(file, body, { flag: "wx" });
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  const owner = readClaim(file);
+  // QA-2.1-13: a claim of this pid is this process's own or that of a dead process whose pid this one reuses (its token
+  // differs): taken either way. Another pid refuses while it is alive and its claim is fresh; a live pid whose claim is older
+  // than `staleMs` is most likely a reused pid (a live owner re-stamps its claims, `refreshPendingClaims`). The token never
+  // makes another live pid's claim ours: two processes of one test share the module token.
+  const fresh = owner?.at !== undefined && seams.now - owner.at <= (seams.staleMs ?? CLAIM_STALE_MS);
+  if (owner?.pid !== undefined && owner.pid !== seams.pid && fresh && seams.isAlive(owner.pid)) return false;
+  // QA-2.1-19: a claim of this pid under the token of ANOTHER live plugin instance of this process is that instance's.
+  if (owner?.pid === seams.pid && owner.token !== undefined && owner.token !== token && LIVE_INSTANCE_TOKENS.has(owner.token)) return false;
+  writeFileSync(file, body);
+  return true;
+}
+
+/** QA-2.1-19: the claim tokens of the live plugin instances of this process (`createInstanceClaimToken`). */
+const LIVE_INSTANCE_TOKENS = new Set<string>();
+
+/**
+ * QA-2.1-19: a claim token for one plugin instance. While it is not released, a claim this process wrote under it is
+ * refused to every other instance of the process (`claimPendingSession`); once released (dispose), the claim is stale for
+ * them and is taken over. Idempotent release.
+ */
+export function createInstanceClaimToken(): { readonly token: string; release(): void } {
+  const token = `${PROCESS_CLAIM_TOKEN}.${toHex(randomBytes(4))}`;
+  LIVE_INSTANCE_TOKENS.add(token);
+  return { token, release: () => { LIVE_INSTANCE_TOKENS.delete(token); } };
+}
+
+/**
+ * QA-2.1-13/-34: a claim of another pid older than this no longer protects it, even while that pid is alive: a live owner
+ * re-stamps its claims every `CLAIM_REFRESH_MS` (`refreshPendingClaims`), so a claim this old belongs to a crashed process
+ * whose pid was reused.
+ */
+export const CLAIM_STALE_MS = 5 * 60_000;
+/** QA-2.1-34: how often a live owner re-stamps its claims; well within `CLAIM_STALE_MS`. */
+export const CLAIM_REFRESH_MS = 60_000;
+
+/** One token per module load: two processes that share a pid over time never share a token. */
+const PROCESS_CLAIM_TOKEN = toHex(randomBytes(8));
+
+function readClaim(file: string): { pid?: number; token?: string; at?: number } | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(file, "utf8"));
+  } catch (error) {
+    // An unreadable or vanished claim is stale; whoever claims next rewrites it.
+    void error;
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  const rec = parsed as Record<string, unknown>;
+  return {
+    ...(typeof rec.pid === "number" ? { pid: rec.pid } : {}),
+    ...(typeof rec.token === "string" ? { token: rec.token } : {}),
+    ...(typeof rec.at === "number" ? { at: rec.at } : {}),
+  };
+}
+
+/**
+ * QA-2.1-13: gives a session's claim back (session deleted, process disposing). Only this process's own claim (its token) is
+ * removed; a claim another process took over stays. Never throws.
+ */
+export function releasePendingClaim(claimsDir: string, sessionID: string, token: string = PROCESS_CLAIM_TOKEN): boolean {
+  const file = join(claimsDir, encodeURIComponent(sessionID));
+  if (readClaim(file)?.token !== token) return false;
+  try {
+    rmSync(file, { force: true });
+    return true;
+  } catch (error) {
+    void error; // a claim that cannot be removed goes stale after CLAIM_STALE_MS
+    return false;
+  }
+}
+
+/** QA-2.1-13: re-stamps this process's claims so a live owner never looks stale. Never throws. */
+export function refreshPendingClaims(claimsDir: string, sessionIDs: Iterable<string>, seams: { pid: number; now: number; token?: string }): void {
+  const token = seams.token ?? PROCESS_CLAIM_TOKEN;
+  for (const sessionID of sessionIDs) {
+    const file = join(claimsDir, encodeURIComponent(sessionID));
+    if (readClaim(file)?.token !== token) continue;
+    try {
+      writeFileSync(file, `${JSON.stringify({ pid: seams.pid, token, at: seams.now })}\n`);
+    } catch (error) {
+      void error; // a claim that cannot be refreshed goes stale; the next claim attempt decides again
+    }
+  }
 }
 
 /**
@@ -808,6 +1829,120 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
   const tombstones = new Map<string, string>();
   const ledger = new Map<string, LedgerRecord[]>();
   const counters = { seq: 0, weight: 0, hookFailures: 0 };
+  /** Phase 2.1: dispatchID -> the entry registered under it (idempotent register, findByDispatch). */
+  const byDispatch = new Map<string, EntryRecord>();
+  /** Phase 2.1: handles drawn by reserveHandle and neither registered nor released: handle -> session. */
+  const reserved = new Map<string, string>();
+  /** QA-2.1-4: when each reservation was drawn; `maintain` drops it after `reservationTtlMs`. */
+  const reservedAt = new Map<string, number>();
+  const reservationTtlMs = options.reservationTtlMs ?? HELD_RESERVATION_TTL_MS;
+  const persist = options.persist;
+
+  function reservedCount(sessionID: string | undefined, except: string | undefined): number {
+    let n = 0;
+    for (const [handle, sid] of reserved) {
+      if (handle !== except && (sessionID === undefined || sid === sessionID)) n += 1;
+    }
+    return n;
+  }
+
+  /** Appends to pending.jsonl (v2 only); a journal failure is counted, never thrown into the registry. */
+  function journal(record: PendingRecord, opts?: { fsync?: boolean }): void {
+    if (persist === undefined) return;
+    try {
+      void persist.append(record, opts).catch(() => {
+        counters.hookFailures += 1;
+      });
+    } catch {
+      counters.hookFailures += 1;
+    }
+  }
+
+  function persistEntry(rec: EntryRecord): void {
+    if (persist === undefined) return;
+    journal(entryRecord(rec), { fsync: rec.hold !== undefined });
+  }
+
+  function entryRecord(rec: EntryRecord): PendingRecord {
+    return {
+        v: 1,
+        kind: "entry",
+        handle: rec.handle,
+        parent: rec.orchestratorSessionID,
+        child: rec.hold?.childSessionID ?? rec.producerSessionID,
+        callID: rec.dispatchID,
+        producer: rec.producerSessionID,
+        tier: rec.producerTier,
+        dod: rec.dod ?? null,
+        changedFiles: rec.changedFiles,
+        changedFilesDropped: rec.changedFilesDropped,
+        reference: null,
+        risk: rec.risk,
+        description: rec.description,
+        root: rec.root ?? null,
+        cwd: rec.cwd,
+        state: rec.state,
+        createdAt: rec.createdAt,
+        dispatchedAt: rec.dispatchedAt,
+        ...(rec.concurrentDispatches !== undefined ? { concurrentDispatches: rec.concurrentDispatches } : {}),
+        ...(rec.contaminatedBy !== undefined ? { contaminatedBy: rec.contaminatedBy } : {}),
+    };
+  }
+
+  function persistReference(rec: EntryRecord, reference: DispatchReference): void {
+    if (persist === undefined) return;
+    journal({ v: 1, kind: "ref", handle: rec.handle, callID: rec.dispatchID, reference: serializeReference(reference) });
+  }
+
+  function persistState(rec: EntryRecord, at: number): void {
+    if (persist === undefined) return;
+    journal(stateRecord(rec, at));
+  }
+
+  function stateRecord(rec: EntryRecord, at: number): PendingRecord {
+    return {
+      v: 1,
+      kind: "state",
+      handle: rec.handle,
+      state: rec.state,
+      at,
+      ...(rec.state === "verified" && rec.result !== undefined ? { verdict: rec.result.verdict } : {}),
+    };
+  }
+
+  /** QA-2.1-16: the `entry` and `state` records of every live entry, for rewriting a vanished journal. */
+  function persistedRecords(): PendingRecord[] {
+    const at = now();
+    const out: PendingRecord[] = [];
+    for (const rec of byHandle.values()) {
+      if (!rec.live) continue;
+      out.push(entryRecord(rec), stateRecord(rec, at));
+    }
+    return out;
+  }
+
+  function hasSlot(sessionID: string): boolean {
+    maintain(now());
+    const session = sessions.get(sessionID);
+    const evictableHere = session === undefined ? 0 : evictionCandidates(session.values()).length;
+    if ((session?.size ?? 0) + reservedCount(sessionID, undefined) - evictableHere + 1 > maxPerSession) return false;
+    const evictable = evictionCandidates(byHandle.values()).length;
+    return byHandle.size + reservedCount(undefined, undefined) - evictable + 1 <= maxGlobal;
+  }
+
+  function reserveHandle(sessionID: string): string | undefined {
+    if (!isNonEmptyString(sessionID) || !hasSlot(sessionID)) return undefined;
+    const handle = drawHandle();
+    if (handle === undefined) return undefined;
+    reserved.set(handle, sessionID);
+    reservedAt.set(handle, now());
+    return handle;
+  }
+
+  function unreserve(handle: string): void {
+    reserved.delete(handle);
+    reservedAt.delete(handle);
+  }
 
   function snapshot(rec: EntryRecord): PendingEntry {
     return Object.freeze({
@@ -828,6 +1963,7 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       digests: rec.digests,
       ...(rec.concurrentDispatches !== undefined ? { concurrentDispatches: rec.concurrentDispatches } : {}),
       ...(rec.contaminatedBy !== undefined ? { contaminatedBy: rec.contaminatedBy } : {}),
+      ...(rec.hold !== undefined ? { hold: rec.hold } : {}),
       createdAt: rec.createdAt,
       state: rec.state,
       verifyingSince: rec.verifyingSince,
@@ -852,8 +1988,14 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
     session?.delete(rec.handle);
     if (session !== undefined && session.size === 0) sessions.delete(rec.orchestratorSessionID);
     byHandle.delete(rec.handle);
+    if (byDispatch.get(rec.dispatchID) === rec) byDispatch.delete(rec.dispatchID);
     counters.weight -= rec.pathWeight + rec.refWeight;
     addTombstone(rec.handle, rec.orchestratorSessionID);
+    // A disposed or forgotten entry is not dead on disk: dispose keeps held entries for the next start,
+    // and forget has its own record.
+    if (cause !== "disposed" && cause !== "session-gone") {
+      journal({ v: 1, kind: "tomb", handle: rec.handle, cause, at: now() });
+    }
     const hook = options.onEvict;
     if (hook === undefined) return;
     try {
@@ -900,23 +2042,47 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
   }
 
   /** Resolves a run and moves the entry out of "verifying" (settle, reap). */
-  function finishRun(rec: EntryRecord, settled: SettledVerification): void {
+  function finishRun(rec: EntryRecord, settledIn: SettledVerification): void {
     const run = rec.run;
+    let settled = settledIn;
+    if (settled.retryable && rec.hold !== undefined) {
+      // Phase 2.1: a held entry retries up to BACKGROUND_MAX_ATTEMPTS, then ends UNVERIFIABLE.
+      rec.holdAttempts += 1;
+      if (rec.holdAttempts >= BACKGROUND_MAX_ATTEMPTS) {
+        settled = Object.freeze({
+          verdict: syntheticVerdict(HELD_EXHAUSTED_REASON),
+          retryable: false,
+          handle: settled.handle,
+          settledAt: settled.settledAt,
+        });
+      }
+    }
     rec.run = undefined;
     rec.verifyingSince = undefined;
     rec.result = settled;
     if (settled.retryable) {
-      rec.state = "unverified";
+      rec.state = rec.hold !== undefined ? "held" : "unverified";
     } else {
       rec.state = "verified";
       release(rec);
     }
+    persistState(rec, settled.settledAt);
     run?.resolve(settled);
+    if (!settled.retryable && options.onVerdict !== undefined) {
+      try {
+        options.onVerdict(snapshot(rec), settled);
+      } catch {
+        // A verdict hook must never break the registry (PendingRegistryOptions.onVerdict).
+        counters.hookFailures += 1;
+      }
+    }
   }
 
   /** Reaping, TTL eviction and ledger expiry (R7). Returns the number of evicted entries. */
   function maintain(at: number): number {
     let evicted = 0;
+    // QA-2.1-4: a reservation nobody registered nor released (a lost ack, a crashed path) frees its slot after the TTL.
+    for (const [handle, since] of [...reservedAt]) if (at - since >= reservationTtlMs) unreserve(handle);
     for (const rec of [...byHandle.values()]) {
       if (rec.state === "verifying" && rec.verifyingSince !== undefined && rec.verifyingSince + maxVerifyingMs <= at) {
         finishRun(rec, {
@@ -927,6 +2093,16 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
         });
       }
       if (rec.state === "verifying") continue;
+      if (rec.state === "held" && !rec.doomed && isExpired(rec, at)) {
+        // A held entry is never evicted by a TTL: its verdict ends UNVERIFIABLE and is posted.
+        finishRun(rec, {
+          verdict: syntheticVerdict(HELD_TTL_REASON),
+          retryable: false,
+          handle: rec.handle,
+          settledAt: at,
+        });
+        continue;
+      }
       if (rec.doomed) {
         evict(rec, "session-gone");
         evicted += 1;
@@ -975,7 +2151,7 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
     for (let i = 0; i < HANDLE_MAX_DRAWS; i += 1) {
       const candidate = HANDLE_PREFIX + toHex(random(HANDLE_RANDOM_BYTES));
       if (!HANDLE_PATTERN.test(candidate)) continue;
-      if (byHandle.has(candidate) || tombstones.has(candidate)) continue;
+      if (byHandle.has(candidate) || tombstones.has(candidate) || reserved.has(candidate)) continue;
       return candidate;
     }
     return undefined;
@@ -996,6 +2172,24 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
     const at = now();
     maintain(at);
 
+    // Phase 2.1: idempotent on dispatchID (a replayed finish registers once).
+    const existing = byDispatch.get(reg.dispatchID);
+    if (existing !== undefined && existing.live && existing.orchestratorSessionID === reg.orchestratorSessionID) {
+      return { ok: true, handle: existing.handle, evicted: [] };
+    }
+    const ownReservation =
+      reg.handle !== undefined && reserved.get(reg.handle) === reg.orchestratorSessionID ? reg.handle : undefined;
+    if (reg.handle !== undefined && ownReservation === undefined) {
+      if (!HANDLE_PATTERN.test(reg.handle)) {
+        return { ok: false, code: "invalid-input", detail: "handle is not a router verification handle" };
+      }
+      if (byHandle.has(reg.handle) || tombstones.has(reg.handle) || reserved.has(reg.handle)) {
+        return { ok: false, code: "handle-collision", detail: "the requested handle is already in use" };
+      }
+    }
+    const reservedHere = reservedCount(reg.orchestratorSessionID, ownReservation);
+    const reservedAll = reservedCount(undefined, ownReservation);
+
     const incoming = reg.changedFiles;
     let changedFiles: readonly ChangedPath[] | "unavailable" = "unavailable";
     let changedFilesDropped = 0;
@@ -1010,7 +2204,7 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
     const victims: Array<{ rec: EntryRecord; cause: EvictionCause }> = [];
     const chosen = new Set<EntryRecord>();
     if (session !== undefined) {
-      let count = session.size;
+      let count = session.size + reservedHere;
       for (const rec of evictionCandidates(session.values())) {
         if (count + 1 <= maxPerSession) break;
         victims.push({ rec, cause: "session-cap" });
@@ -1020,10 +2214,10 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       if (count + 1 > maxPerSession) {
         return { ok: false, code: "registry-full", detail: `session holds ${count} unverified or verifying entries` };
       }
-    } else if (maxPerSession < 1) {
+    } else if (maxPerSession < 1 + reservedHere) {
       return { ok: false, code: "registry-full", detail: "per-session cap is 0" };
     }
-    let count = byHandle.size - victims.length;
+    let count = byHandle.size - victims.length + reservedAll;
     let weight = counters.weight - victims.reduce((sum, v) => sum + v.rec.pathWeight + v.rec.refWeight, 0);
     for (const rec of evictionCandidates(byHandle.values())) {
       if (count + 1 <= maxGlobal && weight + pathWeight <= maxWeight) break;
@@ -1037,11 +2231,12 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       return { ok: false, code: "registry-full", detail: "the pending registry cannot hold another entry" };
     }
 
-    const handle = drawHandle();
+    const handle = reg.handle ?? drawHandle();
     if (handle === undefined) {
       return { ok: false, code: "handle-collision", detail: `no free handle after ${HANDLE_MAX_DRAWS} draws` };
     }
     for (const v of victims) evict(v.rec, v.cause);
+    unreserve(handle);
 
     const reference = reg.reference.then(
       (state) => state,
@@ -1072,7 +2267,7 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       reference,
       changedFiles,
       digests,
-      state: "unverified",
+      state: reg.hold !== undefined ? "held" : "unverified",
       verifyingSince: undefined,
       result: undefined,
       run: undefined,
@@ -1082,18 +2277,23 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       doomed: false,
       live: true,
       replayed: false,
+      hold: reg.hold,
+      holdAttempts: 0,
     };
     const target = session ?? new Map<string, EntryRecord>();
     target.set(handle, rec);
     sessions.set(reg.orchestratorSessionID, target);
     byHandle.set(handle, rec);
+    byDispatch.set(reg.dispatchID, rec);
     counters.weight += pathWeight;
 
     // R7: the reference's weight is added when it resolves "captured" (a promise callback).
     void reference.then((state) => {
       if (!rec.live || rec.released || state.kind !== "captured") return;
       admitReferenceWeight(rec, state.reference.untracked.size + state.reference.tracked.size);
+      persistReference(rec, state.reference);
     });
+    persistEntry(rec);
 
     return { ok: true, handle, evicted: victims.map((v) => v.rec.handle) };
   }
@@ -1118,6 +2318,7 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
     rec.state = "verifying";
     rec.verifyingSince = at;
     rec.run = run;
+    persistState(rec, at);
     let used = false;
     const settle = (result: VerificationResult): boolean => {
       if (used || rec.run !== run || !rec.live) return false;
@@ -1150,6 +2351,117 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       .sort((a, b) => b.createdAt - a.createdAt || b.seq - a.seq);
   }
 
+  /**
+   * Phase 2.1 section 11.3 (v2 only): folds pending.jsonl records by key and rebuilds the live entries.
+   * Unverified entries past pendingTtlMs are dropped; held ones are settled UNVERIFIABLE (and reported
+   * through onVerdict) instead. Nothing is written back: the records are already on disk.
+   */
+  function restore(records: readonly PendingRecord[], opts: { readonly now: number }): RestoreReport {
+    const folded = new Map<string, { entry: PendingRecord; reference: unknown; state: string }>();
+    for (const r of records) {
+      const handle = isNonEmptyString(r.handle) ? r.handle : undefined;
+      if (r.kind === "entry" && handle !== undefined) {
+        folded.set(handle, { entry: r, reference: undefined, state: isNonEmptyString(r.state) ? r.state : "unverified" });
+      } else if (r.kind === "ref") {
+        const target = handle !== undefined ? folded.get(handle) : undefined;
+        if (target !== undefined) target.reference = r.reference;
+        else for (const f of folded.values()) if (f.entry.callID === r.callID) f.reference = r.reference;
+      } else if (r.kind === "state" && handle !== undefined) {
+        const target = folded.get(handle);
+        if (target !== undefined && isNonEmptyString(r.state)) target.state = r.state;
+      } else if (r.kind === "tomb" && handle !== undefined) {
+        folded.delete(handle);
+      } else if (r.kind === "forget") {
+        for (const [h, f] of [...folded]) if (f.entry.parent === r.session) folded.delete(h);
+      }
+    }
+    let restored = 0;
+    let expiredHeld = 0;
+    let dropped = 0;
+    for (const [handle, f] of folded) {
+      const e = f.entry;
+      const parent = isNonEmptyString(e.parent) ? e.parent : undefined;
+      const callID = isNonEmptyString(e.callID) ? e.callID : undefined;
+      const child = isNonEmptyString(e.child) ? e.child : undefined;
+      const producer = isNonEmptyString(e.producer) ? e.producer : child;
+      if (
+        parent === undefined || callID === undefined || producer === undefined || parent === producer ||
+        !HANDLE_PATTERN.test(handle) || f.state === "verified" || byHandle.has(handle) || byDispatch.has(callID)
+      ) {
+        dropped += 1;
+        continue;
+      }
+      const held = e.state === "held" && child !== undefined;
+      const createdAt = typeof e.createdAt === "number" && Number.isFinite(e.createdAt) ? e.createdAt : opts.now;
+      const expired = opts.now - createdAt >= ttlMs;
+      const session = sessions.get(parent);
+      if (!held && (expired || byHandle.size >= maxGlobal || (session?.size ?? 0) >= maxPerSession)) {
+        dropped += 1;
+        continue;
+      }
+      const changedFiles = isChangedFiles(e.changedFiles) ? e.changedFiles : "unavailable";
+      const restoredRef = deserializeReference(f.reference);
+      const pathWeight = changedFiles === "unavailable" ? 0 : changedFiles.length;
+      const refWeight = restoredRef === undefined ? 0 : restoredRef.untracked.size + restoredRef.tracked.size;
+      counters.seq += 1;
+      const rec: EntryRecord = {
+        handle,
+        seq: counters.seq,
+        orchestratorSessionID: parent,
+        dispatchID: callID,
+        producerSessionID: producer,
+        producerTier: typeof e.tier === "string" ? e.tier : "",
+        description: typeof e.description === "string" ? e.description : "",
+        cwd: typeof e.cwd === "string" ? e.cwd : "",
+        root: isNonEmptyString(e.root) ? e.root : undefined,
+        dispatchedAt: typeof e.dispatchedAt === "number" && Number.isFinite(e.dispatchedAt) ? e.dispatchedAt : createdAt,
+        createdAt,
+        risk: isRiskAssessment(e.risk) ? e.risk : unattributedRisk(),
+        changedFilesDropped: typeof e.changedFilesDropped === "number" ? e.changedFilesDropped : 0,
+        concurrentDispatches: typeof e.concurrentDispatches === "number" ? e.concurrentDispatches : undefined,
+        contaminatedBy: isNonEmptyString(e.contaminatedBy) ? e.contaminatedBy : undefined,
+        dod: isDoD(e.dod) ? e.dod : undefined,
+        reference: Promise.resolve<ReferenceState>(
+          restoredRef !== undefined
+            ? { kind: "captured", reference: restoredRef }
+            : { kind: "none", reason: REFERENCE_UNRESTORED_REASON },
+        ),
+        changedFiles,
+        digests: undefined,
+        state: held ? "held" : "unverified",
+        verifyingSince: undefined,
+        result: undefined,
+        run: undefined,
+        pathWeight,
+        refWeight,
+        released: false,
+        doomed: false,
+        live: true,
+        replayed: false,
+        hold: held && child !== undefined ? { childSessionID: child, callID } : undefined,
+        holdAttempts: 0,
+      };
+      const target = session ?? new Map<string, EntryRecord>();
+      target.set(handle, rec);
+      sessions.set(parent, target);
+      byHandle.set(handle, rec);
+      byDispatch.set(callID, rec);
+      counters.weight += pathWeight + refWeight;
+      if (held && expired) {
+        finishRun(rec, {
+          verdict: syntheticVerdict(HELD_TTL_REASON),
+          retryable: false,
+          handle,
+          settledAt: opts.now,
+        });
+        expiredHeld += 1;
+      } else {
+        restored += 1;
+      }
+    }
+    return { restored, expiredHeld, dropped };
+  }
+
   return {
     register,
     get(sessionID, handle) {
@@ -1168,9 +2480,24 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
     listPending(sessionID, options) {
       const states: PendingState[] = options?.verifying === true ? ["unverified", "verifying", "verified"] : ["unverified", "verified"];
       return listByState(sessionID, states)
-        .filter((r) => r.state !== "verified" || awaitsReplay(r))
+        .filter((r) => r.hold === undefined && (r.state !== "verified" || awaitsReplay(r)))
         .map(snapshot);
     },
+    reserveHandle,
+    releaseHandle(handle) {
+      unreserve(handle);
+    },
+    hasSlot,
+    findByDispatch(dispatchID) {
+      const rec = byDispatch.get(dispatchID);
+      return rec !== undefined && rec.live ? snapshot(rec) : undefined;
+    },
+    listHeld(sessionID) {
+      return listByState(sessionID, ["held", "verifying"])
+        .filter((r) => r.hold !== undefined)
+        .map(snapshot);
+    },
+    restore,
     markReplayed(sessionID, handles) {
       const session = sessions.get(sessionID);
       if (session === undefined) return;
@@ -1180,6 +2507,7 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       }
     },
     markVerifying,
+    persistedRecords,
     sweep(nowMs) {
       return maintain(nowMs ?? now());
     },
@@ -1193,6 +2521,10 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
         if (sid === sessionID) tombstones.delete(handle);
       }
       ledger.delete(sessionID);
+      for (const [handle, sid] of [...reserved]) {
+        if (sid === sessionID) unreserve(handle);
+      }
+      journal({ v: 1, kind: "forget", session: sessionID, at: now() });
     },
     recordRejection,
     findLineage(query) {

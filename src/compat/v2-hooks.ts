@@ -45,6 +45,29 @@ import { CONTEXT7_DOC_TOOLS, evaluatePermission, permissionMatches, permissionRu
 import { filterSensitiveGrep, isSensitivePath } from "../router/sensitive-paths";
 import { canonicalAuthorityPath, insideWorkRoot } from "../routing/roles/work-root";
 import { appliedEffort, appliedThinkingBudget, createEffortStore, registerEffortChannel } from "../tui/effort-channel";
+import {
+  acquireLeaseRegistry, ADOPTION_RETRY_MS, attemptLabel, COMPLETION_SETTLE_MS, createCompletionProcessor, createHeldResults, createInFlightRegistry,
+  createLeaseGuard, decideBackground, isAdoptionRefused, PENDING_GUARANTEES_TEXT, PROVIDER_ORDER, renderCompleted, renderHeld, renderInFlight,
+  restoredDispatchOf, ROUTER_FINISH_ATTACH,
+} from "./background";
+import { acquireTimingRecorder, classifyCapacity } from "../routing/outcomes/timings";
+import type { TimingRecorderHolder } from "../routing/outcomes/timings";
+import { createSideLogs, durationSeamsFor, nodePersistDeps, resolveOutcomesDir } from "../routing/outcomes/persist";
+import { homedir, tmpdir } from "node:os";
+import { installGitSearchFilter, nearestRepository, repositoryIdentity } from "../router/git-tools";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { resolveRouting } from "../router/config";
+
+/** 2.1.5.f: the plugin-root notice is logged once per process. */
+let pluginRootLogged = false;
+import { createDurationModel, DURATION_MIN_SAMPLES } from "../routing/outcomes/durations";
+import type { DurationModel } from "../routing/outcomes/durations";
+import type {
+  Attempt, CompletionProcessor, FinishApi, FinishAttach, HeldResults, InFlightRegistry, InflightJournal, LeaseGuard, PersistedRecord,
+  RestoredDispatch, RestoredHold, RestoredHolds,
+} from "./background";
+import { PENDING_JOURNAL_VANISHED, pendingRecordIdentity } from "../verify/pending";
 
 /** Translate the router's own v1 tool vocabulary at the v2 boundary. */
 export function v2Instructions(text: string): string {
@@ -77,14 +100,16 @@ function taskArgs(toolName: string, input: unknown): any {
 }
 
 /**
- * `foreground` (#84 P-5): a role dispatch is forced to the foreground whatever the verification settings, so the router can
- * annotate its result (budget, authority) in `execute.after`. A separate flag: it never marks the call as verifying.
+ * `background` (#84 P-5, Phase 2.1 D1): the `background` key the router sets on a `subagent` call, from `decideBackground`
+ * (`undefined` = no key). With `routing.background.mode: "off"` that is `verifying || roleRouted ? false : undefined`: a role
+ * dispatch or a verifying call is forced to the foreground, so the router can annotate its result (budget, authority) in
+ * `execute.after`. It never marks the call as verifying.
  */
-function nativeArgs(toolName: string, args: any, original: any, verifying: boolean, foreground = false): any {
+function nativeArgs(toolName: string, args: any, original: any, background: boolean | undefined): any {
   if (!args || typeof args !== "object") return args;
   if (toolName === "subagent") {
     const { subagent_type, task_id, ...rest } = args;
-    return { ...rest, agent: subagent_type, ...(task_id === undefined ? {} : { sessionID: task_id }), ...(verifying || foreground ? { background: false } : {}) };
+    return { ...rest, agent: subagent_type, ...(task_id === undefined ? {} : { sessionID: task_id }), ...(background === undefined ? {} : { background }) };
   }
   if (toolName === "shell") { const { cwd, ...rest } = args; return { ...rest, ...(cwd === undefined ? {} : { workdir: cwd }) }; }
   if (["read", "write", "edit"].includes(toolName)) {
@@ -121,6 +146,7 @@ function messageText(message: unknown): string | undefined {
   if (!message || typeof message !== "object") return undefined;
   const m = message as Record<string, unknown>;
   if (typeof m.text === "string") return m.text;
+  if (typeof m.content === "string") return m.content;
   const parts = Array.isArray(m.content) ? m.content : Array.isArray(m.parts) ? m.parts : undefined;
   if (parts === undefined) return undefined;
   const texts = parts.flatMap((part) => part && typeof part === "object" && (part as Record<string, unknown>).type === "text"
@@ -673,6 +699,136 @@ export function normalizeAgentOptions(options: Readonly<Record<string, unknown>>
 }
 
 /** Register the existing router engine on the public OpenCode 2 domain APIs. */
+/** One host completion element `<subagent sessionID="X" state="S">body</subagent>` in a message text (memo §4.4, C2). */
+interface CompletionElement { child: string; state: "completed" | "error" | "cancelled"; body: string }
+// Further attributes after `state` (the host may add some) are tolerated and kept.
+const COMPLETION_ELEMENT = /<subagent sessionID="([^"]+)" state="([^"]+)"[^>]*>([\s\S]*?)(?:<\/subagent>|$)/g;
+
+/** QA-2.1-8: the refusal of a resume while the pending journal is not reloaded (the session may be held). */
+export function reloadFailedResumeText(child: string): string {
+  // QA-2.1-16: the retry is real: each refused call (and each later hook or event) starts another reload, or rebuilds a
+  // vanished journal, at most every PENDING_RELOAD_RETRY_MS.
+  return `[router] Refused: the router could not reload its pending journal, so session ${child} may be held for verification. Try the resume again shortly: each attempt makes the router retry the reload (at most every ${PENDING_RELOAD_RETRY_MS / 1000} s).`;
+}
+
+/** QA-2.1-20: a `sessionID` / `task_id` key given a string literal in Code Mode code (`sessionID: "x"`, `"task_id": 'x'`, `task_id = "x"`). */
+const CODE_RESUME_TARGET = /\b(?:sessionID|task_id)["']?\s*[:=]\s*(["'`])([^"'`\r\n]+)\1/g;
+
+/**
+ * QA-2.1-8 / QA-2.1-20: the sessions a tool call may resume: a `subagent` call's `sessionID` / `task_id`, and for Code Mode
+ * `execute` every string literal its code gives to those keys (the caller's own session excepted: it is not a resume). The
+ * reload-failed refusal reads the same calls `held.refusal` does (`subagent` args and `execute` code).
+ */
+export function resumeTargetsOf(tool: string, args: unknown, caller: string): string[] {
+  if (args === null || typeof args !== "object") return [];
+  if (tool === "subagent") {
+    return ["sessionID", "task_id"].flatMap((key) => {
+      const target: unknown = Reflect.get(args, key);
+      return typeof target === "string" && target !== "" ? [target] : [];
+    });
+  }
+  if (tool !== "execute") return [];
+  const code: unknown = Reflect.get(args, "code");
+  if (typeof code !== "string") return [];
+  const targets = new Set<string>();
+  for (const match of code.matchAll(CODE_RESUME_TARGET)) {
+    const target = match[2];
+    if (target !== undefined && target !== "" && target !== caller) targets.add(target);
+  }
+  return [...targets];
+}
+
+/** QA-2.1-6: what a persisted dispatch's child history says about its end. */
+type ChildEndState = { outcome: "succeeded" | "failed" | "interrupted"; text?: string } | { outcome: "lost"; text?: undefined };
+
+/**
+ * QA-2.1-18: whether an assistant entry of a child's history ended its step (top level or under `info`): a finish reason other
+ * than a tool-call continuation, or a completed time; and no tool part still `pending` or `running`. A step cut mid-stream has
+ * none of these, and a `tool-calls` finish means the child meant to go on: neither is an end, whatever text it already has.
+ */
+function assistantStepCompleted(message: unknown): boolean {
+  if (message === null || typeof message !== "object") return false;
+  const m = message as Record<string, unknown>;
+  const info = m.info !== null && typeof m.info === "object" ? m.info as Record<string, unknown> : undefined;
+  const parts: readonly unknown[] = Array.isArray(m.content) ? m.content : Array.isArray(m.parts) ? m.parts : [];
+  const toolOpen = parts.some((part) => {
+    if (part === null || typeof part !== "object" || (part as Record<string, unknown>).type !== "tool") return false;
+    const state = (part as Record<string, unknown>).state;
+    const status = state !== null && typeof state === "object" ? (state as Record<string, unknown>).status : state ?? (part as Record<string, unknown>).status;
+    // The v2 tool state is `streaming` | `running` | `completed` | `error` (`pending` is the v1 name of the first).
+    return status === "streaming" || status === "pending" || status === "running";
+  });
+  if (toolOpen) return false;
+  const finish = m.finish ?? info?.finish;
+  if (typeof finish === "string" && finish !== "") return finish !== "tool-calls" && finish !== "unknown";
+  const time = m.time ?? info?.time;
+  // `time.completed` is set once the step ended: epoch millis on the wire, a DateTime once decoded; either counts.
+  const completed = time !== null && typeof time === "object" ? (time as Record<string, unknown>).completed : undefined;
+  return completed !== undefined && completed !== null && completed !== "" && completed !== false;
+}
+
+/**
+ * QA-2.1-11: a failed session-directory lookup is not repeated for this long (the lease guard calls it per tool call).
+ * QA-2.1-25: a failed directory means no lease check and no lease for that call, like a failed kind, so the window is as short.
+ */
+export const SESSION_DIR_NEGATIVE_TTL_MS = 2_000;
+/**
+ * QA-2.1-25: a failed session-kind lookup is not repeated for this long. Short on purpose: the failure answers `unknown` (root
+ * semantics, no lease), so a write in that window is unguarded; the window only spares a burst of tool calls a failing host call each.
+ */
+export const SESSION_KIND_NEGATIVE_TTL_MS = 2_000;
+/** QA-2.1-11: session directories cached (oldest first out). */
+const MAX_SESSION_DIRS = 1000;
+/** QA-2.1-13: parent sessions remembered as adopted (oldest first out). */
+const MAX_ADOPTED_SESSIONS = 5000;
+/** QA-2.1-8: a failed pending-journal reload is tried again at most this often (fail closed meanwhile). */
+export const PENDING_RELOAD_RETRY_MS = 30_000;
+/** QA-2.1-8: `dispose` waits at most this long for the background work in flight (verdict posts, recoveries). */
+const BACKGROUND_DRAIN_MS = 5_000;
+/**
+ * Non-enumerable slot on the cleanup function `registerV2Hooks` returns: `() => Promise<void>` that resolves once no background
+ * work is in flight (verdict posts, recoveries, reloads, including work they start). Lets integration tests await what an
+ * adoption or a gate started instead of polling for it; nothing in the plugin reads it.
+ */
+export const V2_BACKGROUND_SETTLED: unique symbol = Symbol("opencode-model-router.v2.background-settled");
+// QA-2.1-26: a module-private `Symbol()` (not the global registry `Symbol.for`): only code importing this module reaches the seam.
+
+/** The completion elements of a text part that STARTS with one (the host writes a completion as a whole message, C2). */
+function completionElementsOf(text: string): CompletionElement[] {
+  if (!text.trimStart().startsWith("<subagent sessionID=\"")) return [];
+  const found: CompletionElement[] = [];
+  for (const m of text.matchAll(COMPLETION_ELEMENT)) {
+    const state = m[2];
+    if (state !== "completed" && state !== "error" && state !== "cancelled") continue;
+    found.push({ child: m[1] ?? "", state, body: m[3] ?? "" });
+  }
+  return found;
+}
+
+/** Applies `defang` to the body of every `<subagent …>` element of a text (a pure rewrite; the element tags stay). */
+function defangSubagentBodies(text: string, defang: (body: string) => string): string {
+  if (!text.includes("<subagent sessionID=\"")) return text;
+  return text.replace(COMPLETION_ELEMENT, (whole: string, _child: string, _state: string, body: string) => {
+    const next = defang(body);
+    if (next === body) return whole;
+    const closed = whole.endsWith("</subagent>");
+    const open = whole.slice(0, whole.length - body.length - (closed ? "</subagent>".length : 0));
+    return `${open}${next}${closed ? "</subagent>" : ""}`;
+  });
+}
+
+/** Memo §12 (fail closed): replaces the body of every completion element whose child `isProcessed` rejects. Pure; the element tags stay. */
+function redactUnprocessedElements(text: string, isProcessed: (child: string) => boolean): string {
+  if (!text.includes("<subagent sessionID=\"")) return text;
+  return text.replace(COMPLETION_ELEMENT, (whole: string, child: string, _state: string, was: string) => {
+    if (isProcessed(child)) return whole;
+    const body = `[router] The result of session ${child} is withheld: the router could not restore its verification state.`;
+    const closed = whole.endsWith("</subagent>");
+    const open = whole.slice(0, whole.length - was.length - (closed ? "</subagent>".length : 0));
+    return `${open}${body}${closed ? "</subagent>" : ""}`;
+  });
+}
+
 export async function registerV2Hooks(
   ctx: Context,
   hooks: Hooks,
@@ -917,11 +1073,30 @@ export async function registerV2Hooks(
     if (typeof recorded === "string" && registeredRole(recorded)) return recorded;
     return currentBinding(sessionID, { maxOf: () => [] }) !== undefined ? "(bound role session)" : undefined;
   };
-  /** The directory the host resolves a session's relative paths against (its location), else the plugin's. */
-  const sessionDirectoryOf = async (sessionID: string): Promise<string> => {
-    const session = await ctx.session.get({ sessionID } as Parameters<typeof ctx.session.get>[0]) as unknown as { location?: { directory?: unknown } };
-    const directory = session?.location?.directory;
-    return typeof directory === "string" && directory !== "" ? directory : ctx.location.directory;
+  /**
+   * The directory the host resolves a session's relative paths against (its location), else the plugin's. QA-2.1-11: cached per
+   * session (a session's location does not move), concurrent lookups share one host call, and a failed lookup is remembered for
+   * SESSION_DIR_NEGATIVE_TTL_MS so a tool hook does not pay a failing `ctx.session.get` per call. Bounded; forgotten with the session.
+   */
+  const sessionDirs = new Map<string, { at: number; dir: Promise<string>; failed: boolean }>();
+  const sessionDirectoryOf = (sessionID: string): Promise<string> => {
+    const cached = sessionDirs.get(sessionID);
+    if (cached !== undefined && (!cached.failed || Date.now() - cached.at < SESSION_DIR_NEGATIVE_TTL_MS)) return cached.dir;
+    const entry: { at: number; failed: boolean; dir: Promise<string> } = { at: Date.now(), failed: false, dir: Promise.resolve<string>(ctx.location.directory) };
+    entry.dir = (async () => {
+      const session = await ctx.session.get({ sessionID } as Parameters<typeof ctx.session.get>[0]) as unknown as { location?: { directory?: unknown } };
+      const directory = session?.location?.directory;
+      return typeof directory === "string" && directory !== "" ? directory : ctx.location.directory;
+    })();
+    entry.dir.catch(() => {
+      // Negative cache: the rejection itself reaches every caller of this entry until the TTL passes.
+      entry.failed = true;
+      entry.at = Date.now();
+    });
+    sessionDirs.delete(sessionID);
+    sessionDirs.set(sessionID, entry);
+    while (sessionDirs.size > MAX_SESSION_DIRS) sessionDirs.delete(sessionDirs.keys().next().value!);
+    return entry.dir;
   };
   /**
    * §2.2: a sibling work root is re-checked against a fresh `git worktree list --porcelain` when `external_directory` is
@@ -1063,10 +1238,584 @@ export async function registerV2Hooks(
   const hookContext = (event: { sessionID: any; agent: any; messageID: any; id: any }): ToolContext => ({
     ...event, signal: abort.signal, progress: async () => {},
   });
+  // ---------------------------------------------------------------------------------------------------------------------
+  // Phase 2.1 startup (memo §4.1). Everything below is v2-only (this module is loaded by server.ts alone) and inert under
+  // `routing.background.mode: "off"` + `routing.leases.mode: "off"` except the timing rows (telemetry, not visible to the user).
+  // ---------------------------------------------------------------------------------------------------------------------
+  const startRouting = resolveRouting(loadConfig(ctx.location.directory), "v2", ingestLogger);
+  const outcomesDir = resolveOutcomesDir(startRouting.outcomes.path, { tmpdir: tmpdir(), homedir: homedir() });
+  const nowMs = (): number => Date.now();
+  /** Memo §4.1 step 3: the pending journal reload is awaited at most this long before the context hook registers (fail closed after, §12). */
+  const PENDING_RELOAD_BOUND_MS = 5_000;
+  /** Disposers run by `cleanup` (timers, shared registries, installed filters), in reverse order. */
+  const bgDisposers: Array<() => void | Promise<void>> = [];
+  /** 1.1: the timing recorder (whatever `routing.engine` is) and the duration model fed by its rows. */
+  let timings: TimingRecorderHolder | undefined;
+  let durations: DurationModel | undefined;
+  try {
+    const model = createDurationModel(durationSeamsFor(createSideLogs(outcomesDir, nodePersistDeps(ingestLogger)), nowMs));
+    durations = model;
+    void model.load(); // not awaited: until it loads, estimates are the prior (never selects a dispatch)
+    const holder = acquireTimingRecorder({
+      dir: outcomesDir, now: nowMs, logger: ingestLogger,
+      onRow: (row) => { if (row.kind === "dispatch-timing") model.observe(row); },
+    });
+    timings = holder;
+    bgDisposers.push(() => holder.release());
+  } catch (error) {
+    ingestLogger.warn("[router] timing: the recorder could not start; dispatch timings are not recorded", { error: String(error) });
+  }
+  /** Session kinds seen so far (bounded): `root` has no parent. A failed lookup is never cached (root semantics, memo §14.1). */
+  const sessionKinds = new Map<string, "root" | "child">();
+  const noteSessionKind = (sessionID: string, kind: "root" | "child"): void => {
+    sessionKinds.delete(sessionID);
+    sessionKinds.set(sessionID, kind);
+    while (sessionKinds.size > 1000) sessionKinds.delete(sessionKinds.keys().next().value!);
+  };
+  /**
+   * QA-2.1-11: a failed kind lookup is remembered for SESSION_KIND_NEGATIVE_TTL_MS (bounded, like `sessionDirs`), so a tool hook
+   * does not pay a failing host call per call, and it answers `unknown`: root semantics in the lease guard (memo §14.1), child
+   * wording in what it says (a child misread as a root must not be told it is the orchestrator).
+   * QA-2.1-25: `unknown` means no lease, so the window is short (not the 30 s of a session directory): a transient host failure
+   * must not let a child write unleased for long; the next hook after the window asks the host again.
+   */
+  const failedKinds = new Map<string, number>();
+  const sessionKindOf = async (sessionID: string): Promise<"root" | "child" | "unknown"> => {
+    const known = sessionKinds.get(sessionID);
+    if (known !== undefined) return known;
+    const failedAt = failedKinds.get(sessionID);
+    if (failedAt !== undefined && Date.now() - failedAt < SESSION_KIND_NEGATIVE_TTL_MS) return "unknown";
+    try {
+      const session = await sessionOf(sessionID) as { parentID?: unknown } | undefined;
+      const kind = typeof session?.parentID === "string" && session.parentID !== "" ? "child" : "root";
+      failedKinds.delete(sessionID);
+      noteSessionKind(sessionID, kind);
+      return kind;
+    } catch (error) {
+      failedKinds.delete(sessionID);
+      failedKinds.set(sessionID, Date.now());
+      while (failedKinds.size > MAX_SESSION_DIRS) failedKinds.delete(failedKinds.keys().next().value!);
+      ingestLogger.warn("[router] leases: the session kind could not be read; root semantics with child wording", { error: String(error) });
+      return "unknown";
+    }
+  };
+  /**
+   * The kind of a session WITHOUT a host call (`session.created` and the `prompt` hook record it): an unknown session is a root,
+   * as in the lease guard (memo §14.1). The dispatch path must not add host calls (a static session stays silent, §1.2).
+   */
+  const knownKindOf = (sessionID: string): "root" | "child" => sessionKinds.get(sessionID) ?? "root";
+  /** The in-flight registry and held results exist whatever the mode; they hold nothing until a background dispatch is acknowledged. */
+  const bgMode = startRouting.background.mode;
+  const inflight: InFlightRegistry = createInFlightRegistry({
+    now: nowMs, logger: ingestLogger,
+    onClosed: (attempt, cause) => { void closeAttempt?.(attempt, cause); },
+  });
+  // QA-2.1-13: the process-wide call claims of this instance go with it (a reload must not inherit them).
+  bgDisposers.push(() => inflight.dispose());
+  let closeAttempt: ((attempt: Attempt, cause: string) => Promise<void>) | undefined;
+  /**
+   * ONE journal (memo §11): the plugin's `pending.jsonl` file journal, reached through the finish API once it is attached. The
+   * in-memory set only answers `hasProcessed` before the attach (and when it fails: then nothing persists, fail-closed).
+   */
+  const processedKeys = new Set<string>();
+  const journal: InflightJournal = {
+    append: async (...args: Parameters<InflightJournal["append"]>): Promise<void> => {
+      const record: PersistedRecord = args[0];
+      if (record.kind === "processed") {
+        // The processor writes `{callID, child}` (the attempt key is `child NUL callID`, memo §10).
+        if (typeof record.key === "string") processedKeys.add(record.key);
+        else if (typeof record.child === "string" && typeof record.callID === "string") processedKeys.add(`${record.child}\u0000${record.callID}`);
+      }
+      const shared = finishApi?.journal;
+      if (shared === undefined) return;
+      try {
+        await shared.append(...args);
+      } catch (error) {
+        if (!(error instanceof Error && error.message === PENDING_JOURNAL_VANISHED)) throw error;
+        // QA-2.1-8: a journal that vanished under this process fails closed exactly like a failed reload, until QA-2.1-16
+        // rewrites it from the in-memory state; then this append is tried once more.
+        noteVanished();
+        if (!(await recreateJournal())) throw error;
+        // QA-2.1-16: the state behind this record is usually in memory already (an attempt is acknowledged, a hold text or a
+        // verdict text is kept, before its append), so the recreation wrote it: once per write, never twice.
+        const identity = recordIdentity(record);
+        if (identity !== undefined && recreatedIdentities.has(identity)) return;
+        await shared.append(...args);
+      }
+    },
+    hasProcessed: (key) => processedKeys.has(key) || finishApi?.journal?.hasProcessed(key) === true,
+  };
+  const syntheticRaw: unknown = Reflect.get(ctx.session, "synthetic");
+  const syntheticOk = typeof syntheticRaw === "function";
+  /** The held store, for the compaction hook registered before it exists. */
+  let heldRef: HeldResults | undefined;
+  /** Memo §4.4 step 5: the compaction hook runs the same matcher over the messages being summarised (C15). Registered only when mode ≠ off. */
+  let compactionRegistered = false;
+  if (bgMode !== "off") {
+    try {
+      registrations.push(await ctx.session.hook("compaction", async (event) => {
+        const messages = event.messages;
+        if (heldRef === undefined || !Array.isArray(messages)) return;
+        adoptSession(String(event.sessionID));
+        if (finishApi !== undefined && reloadFailed) {
+          // QA-2.1-8: fail closed exactly like the context hook (memo §12): a summary must not carry a completion this process
+          // cannot prove processed while the journal is not reloaded.
+          const isProcessed = (child: string): boolean => {
+            const attempt = inflight.byChild(child);
+            return attempt !== undefined && journal.hasProcessed(attempt.key);
+          };
+          messages.forEach((source, index) => {
+            const content: unknown = (source as { content?: unknown }).content;
+            if (!Array.isArray(content)) return;
+            let touched = false;
+            const next = content.map((part: unknown) => {
+              const text: unknown = part !== null && typeof part === "object" ? Reflect.get(part, "text") : undefined;
+              const type: unknown = part !== null && typeof part === "object" ? Reflect.get(part, "type") : undefined;
+              if (typeof text !== "string" || (type !== undefined && type !== "text")) return part;
+              const redacted = redactUnprocessedElements(text, isProcessed);
+              if (redacted === text) return part;
+              touched = true;
+              return { ...(part as object), text: redacted };
+            });
+            if (touched) messages[index] = Object.assign(Object.create(Object.getPrototypeOf(source)), source, { content: next });
+          });
+        }
+        const shaped = messages.map((source) => ({ source, parts: (source as { content?: unknown }).content }));
+        const result = heldRef.apply(String(event.sessionID), shaped);
+        if (result === undefined) return;
+        result.forEach((entry, index) => {
+          if (entry.parts !== (entry.source as { content?: unknown }).content) {
+            messages[index] = Object.assign(Object.create(Object.getPrototypeOf(entry.source)), entry.source, { content: entry.parts });
+          }
+        });
+      }));
+      compactionRegistered = true;
+    } catch (error) {
+      ingestLogger.warn("[router] background: the compaction hook could not be registered; held results are unavailable", { error: String(error) });
+    }
+  }
+  const held: HeldResults = createHeldResults({
+    synthetic: async (input) => { if (typeof syntheticRaw === "function") await Reflect.apply(syntheticRaw, ctx.session, [input]); },
+    journal, available: syntheticOk && compactionRegistered, logger: ingestLogger,
+  });
+  heldRef = held;
+  /** The legacy plugin's finish API (2.1.4). Absent (or `off`): no background processing, the guarantees behave as `off`. */
+  let finishApi: FinishApi | undefined;
+  /**
+   * Memo §12: the journal reload failed or timed out, or the journal vanished under this process (QA-2.1-8). Holding is off,
+   * every unprocessed `<subagent>` element is redacted (context and compaction hooks) and a resume of a session this process
+   * does not know is refused (it may be held). A failed reload is retried by `retryReload` (at most every
+   * PENDING_RELOAD_RETRY_MS); a vanished journal is recreated from this process's in-memory state by `recreateJournal`
+   * (QA-2.1-16), and a successful reload or recreation ends the state.
+   */
+  let reloadFailed = false;
+  let lastReloadAt = 0;
+  let reloading: Promise<boolean> | undefined;
+  /** QA-2.1-8: background work that outlives its hook (verdict posts, recoveries, reloads); `dispose` waits for it (bounded). */
+  const inFlightWork = new Set<Promise<unknown>>();
+  const trackBackground = (work: Promise<unknown>): void => {
+    const tracked = work.catch((error: unknown) => {
+      ingestLogger.warn("[router] background: a background task failed", { error: String(error) });
+    });
+    inFlightWork.add(tracked);
+    void tracked.finally(() => inFlightWork.delete(tracked));
+  };
+  /** V2_BACKGROUND_SETTLED: waits until the in-flight set is empty (work a settled task started is waited for too). Never rejects. */
+  const settleBackground = async (): Promise<void> => {
+    for (;;) {
+      while (inFlightWork.size > 0) await Promise.allSettled([...inFlightWork]);
+      // QA-2.1-21: the held gates the plugin runs behind `finish` (and the verdict posts they start here) count too.
+      const api = finishApi;
+      if (api === undefined) return;
+      try {
+        await api.idle();
+      } catch (error) {
+        ingestLogger.warn("[router] background: the plugin's held gates could not be awaited", { error: String(error) });
+        return;
+      }
+      if (inFlightWork.size === 0) return;
+    }
+  };
+  /** QA-2.1-8: one bounded reload of the pending journal (concurrent callers share it); success ends the fail-closed state. */
+  const reloadJournal = (): Promise<boolean> => {
+    if (reloading !== undefined) return reloading;
+    const api = finishApi;
+    if (api === undefined) return Promise.resolve(false);
+    lastReloadAt = nowMs();
+    reloading = (async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          api.reload(),
+          new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("pending journal reload timed out")), PENDING_RELOAD_BOUND_MS); }),
+        ]);
+        if (reloadFailed) ingestLogger.warn("[router] background: the pending journal was reloaded; holding is available again");
+        reloadFailed = false;
+        return true;
+      } catch (error) {
+        if (timer !== undefined) clearTimeout(timer);
+        // QA-2.1-16: a vanished journal is never found again by a reload: it is rewritten from the in-memory state.
+        if (error instanceof Error && error.message === PENDING_JOURNAL_VANISHED) {
+          noteVanished();
+          return await recreateJournal();
+        }
+        reloadFailed = true;
+        ingestLogger.warn("[router] background: the pending journal could not be reloaded; holding is off and unprocessed results are redacted", { error: String(error) });
+        return false;
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+        reloading = undefined;
+      }
+    })();
+    return reloading;
+  };
+  /** QA-2.1-16: told once per vanishing (until a recreation succeeds). */
+  let vanishedWarned = false;
+  /** QA-2.1-8: a journal that vanished under this process fails closed exactly like a failed reload (until it is recreated). */
+  const noteVanished = (): void => {
+    reloadFailed = true;
+    lastReloadAt = nowMs();
+    if (vanishedWarned) return;
+    vanishedWarned = true;
+    ingestLogger.warn("[router] background: the pending journal vanished; it is recreated from memory, and until then holding is off and unprocessed results are redacted");
+  };
+  /**
+   * QA-2.1-16: the records of this adapter's in-memory state a later restore needs: the live attempts not processed yet
+   * (`inflight`, with their dispatch data), every hold (`hold`, `hold-text`, `posting`, `posted`) and the dormant
+   * `inflight` records of sessions not seen yet. The plugin adds its pending entries and dormant records.
+   */
+  const adapterRecords = (): PersistedRecord[] => {
+    const out: PersistedRecord[] = [];
+    for (const attempt of inflight.list()) {
+      if (attempt.state !== "acknowledged" && attempt.state !== "child-ended" && attempt.state !== "processing") continue;
+      if (journal.hasProcessed(attempt.key)) continue;
+      const dispatch = restoredDispatches.get(attempt.callID) ?? finishApi?.dispatchOf(attempt.callID);
+      out.push({
+        v: 1, kind: "inflight", key: attempt.key, callID: attempt.callID, parentSessionID: attempt.parentSessionID,
+        childSessionID: attempt.childSessionID, label: attemptLabel(attempt), at: attempt.ackAt ?? attempt.at,
+        agent: attempt.agent, description: attempt.description, verifying: attempt.verifying, verificationMode: attempt.verificationMode,
+        ...(attempt.role === undefined ? {} : { role: attempt.role }),
+        ...(attempt.hold === undefined ? {} : { handle: attempt.hold.handle }), hold: attempt.hold?.handle ?? null,
+        ...(dispatch === undefined ? {} : { dispatch }),
+      });
+    }
+    out.push(...held.persisted());
+    for (const records of dormantInflight.values()) out.push(...records);
+    return out;
+  };
+  /**
+   * QA-2.1-16: what identifies a record a recreation rewrites from memory: its kind and its attempt key or hold handle. The
+   * same identity the recreation itself merges by (QA-2.1-33, `mergePendingSnapshots`).
+   */
+  const recordIdentity = (record: PersistedRecord): string | undefined => pendingRecordIdentity(record);
+  /** QA-2.1-16: the identities the last successful recreation wrote; a retried append among them is not written again. */
+  let recreatedIdentities = new Set<string>();
+  let recreating: Promise<boolean> | undefined;
+  /**
+   * QA-2.1-16: rewrites a vanished journal from the in-memory state (`FinishApi.recreateJournal`); concurrent callers share
+   * one rewrite. Success ends the fail-closed state; a failure keeps it, and the next append or `retryReload` tries again.
+   */
+  const recreateJournal = (): Promise<boolean> => {
+    if (recreating !== undefined) return recreating;
+    const api = finishApi;
+    if (api === undefined) return Promise.resolve(false);
+    lastReloadAt = nowMs();
+    recreating = (async () => {
+      try {
+        const records = adapterRecords();
+        await api.recreateJournal(records);
+        recreatedIdentities = new Set(records.map(recordIdentity).filter((id): id is string => id !== undefined));
+        if (reloadFailed) ingestLogger.warn("[router] background: the pending journal was recreated from memory; holding is available again");
+        reloadFailed = false;
+        vanishedWarned = false;
+        return true;
+      } catch (error) {
+        reloadFailed = true;
+        ingestLogger.warn("[router] background: the pending journal could not be recreated; holding stays off and it is tried again", { error: String(error) });
+        return false;
+      } finally {
+        recreating = undefined;
+      }
+    })();
+    return recreating;
+  };
+  /** QA-2.1-8: while the reload is failed, a hook or event starts another try (never awaited, at most every PENDING_RELOAD_RETRY_MS). */
+  const retryReload = (): void => {
+    if (!reloadFailed || reloading !== undefined || finishApi === undefined || nowMs() - lastReloadAt < PENDING_RELOAD_RETRY_MS) return;
+    trackBackground(reloadJournal());
+  };
+  /** Reloaded in-flight records (memo §11.3): dormant until this process sees the parent session. */
+  const dormantInflight = new Map<string, PersistedRecord[]>();
+  /**
+   * Set once the completion processor exists: recovers the adopted `inflight` records of a session. Returns the call ids
+   * of the attempts acknowledged for recovery (QA-2.1-29: their holds get their verdict from that recovery).
+   */
+  let recoverInflight: ((sessionID: string) => Set<string>) | undefined;
+  /** QA-2.1-17: the dispatch data journaled with the `inflight` records being recovered, by call id (bounded). */
+  const restoredDispatches = new Map<string, RestoredDispatch>();
+  /** QA-2.1-29: restored holds of sessions adopted before the processor existed, waiting for the start-up recovery. */
+  const deferredRestores = new Map<string, RestoredHolds>();
+  /** Background guarantees apply: mode ≠ off AND the finish API attached. Otherwise every code path below behaves as `off`. */
+  const bgActive = (): boolean => bgMode !== "off" && finishApi !== undefined;
+  /** `router_run` contamination notes from `execute.before`, appended in `execute.after` (bounded). */
+  const runNotes = new Map<string, string>();
+  /** 1.3: the process-wide lease registry and the guard over it (every v2 child; roots take none). */
+  let leaseHandle: ReturnType<typeof acquireLeaseRegistry> | undefined;
+  let leaseGuard: LeaseGuard | undefined;
+  const holderLabel = (holderID: string): string => {
+    const attempt = inflight.byChild(holderID);
+    return attempt === undefined ? `session ${holderID}` : `${attemptLabel(attempt)} (session ${holderID})`;
+  };
+  if (startRouting.leases.mode === "enforce") {
+    try {
+      const snapshotPath = join(outcomesDir, "leases.json");
+      const handle = acquireLeaseRegistry({
+        runMode: startRouting.leases.run,
+        seams: { realpath: (path) => realpathSync.native(path), repoKeyOf: repositoryIdentity, now: nowMs },
+        snapshotPath, logger: ingestLogger,
+      });
+      leaseHandle = handle;
+      bgDisposers.push(() => handle.release());
+      try {
+        handle.registry.restore(JSON.parse(readFileSync(snapshotPath, "utf8")) as unknown, { dropCompleteHolders: true });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") ingestLogger.warn("[router] leases: the snapshot could not be restored", { error: String(error) });
+      }
+      leaseGuard = createLeaseGuard({
+        registry: handle.registry, sessionKind: sessionKindOf, sessionDir: sessionDirectoryOf, gitRootOf: nearestRepository,
+        holderLabel, planTaskOf: () => undefined, events: { onRelease: (cb) => handle.onRelease(cb) }, logger: ingestLogger, now: nowMs,
+      });
+      // `router_git_ls_files` searches: child sessions see no entry under edit by another holder (memo §15.1).
+      bgDisposers.push(installGitSearchFilter(({ sessionID, root, paths }) => {
+        if (sessionKinds.get(sessionID) !== "child") return { kept: paths };
+        const tree = repositoryIdentity(root)?.tree ?? root;
+        const absolute = paths.map((path) => join(root, path));
+        const result = handle.registry.filterSearchResults({ holderID: sessionID, tree, isChild: true }, tree, absolute);
+        if (result.omitted === 0 && result.invalid === undefined) return { kept: paths };
+        const keptSet = new Set(result.kept);
+        return {
+          kept: paths.filter((_, index) => keptSet.has(absolute[index]!)),
+          note: `[router] ${result.omitted} result(s) omitted: under edit by ${result.holders.map((h) => holderLabel(h.holderID)).join(", ")}.`,
+        };
+      }));
+    } catch (error) {
+      leaseGuard = undefined;
+      ingestLogger.warn("[router] leases: the lease registry could not start; no lease checks", { error: String(error) });
+    }
+  }
+  // Memo §4.1 steps 3-4: the finish API is attached once (with the lease gate when leases are enforced), then the pending journal
+  // is reloaded, AWAITED with a 5 s bound before the context hook registers. A failure falls back to fail-closed redaction (§12).
+  if (bgMode !== "off") {
+    const attachFinish = (hooks as unknown as Record<PropertyKey, unknown>)[ROUTER_FINISH_ATTACH];
+    if (typeof attachFinish === "function") {
+      try {
+        // QA-2.1-8: a verdict the gate posts through the sink is background work `dispose` waits for (bounded), like a recovery.
+        const trackedHeld: HeldResults = {
+          ...held,
+          verdict: (handle, v) => {
+            const posting = held.verdict(handle, v);
+            trackBackground(posting);
+            return posting;
+          },
+        };
+        finishApi = (attachFinish as FinishAttach)({ host: "v2", held: trackedHeld, ...(leaseGuard === undefined ? {} : { leaseGate: leaseGuard }) });
+        // QA-2.1-33: a recreation of the shared journal by another plugin instance of this process writes these records too.
+        finishApi?.setAdapterSnapshot?.(adapterRecords);
+      } catch (error) {
+        ingestLogger.warn("[router] background: the plugin could not attach the finish API; no background processing", { error: String(error) });
+      }
+    }
+    if (finishApi !== undefined) await reloadJournal();
+  }
+  /**
+   * Memo §11.3: the first sight of a parent session adopts its dormant records (claim file); idempotent per session. Bounded
+   * (QA-2.1-13): a forgotten session leaves the set, and the oldest sightings go first past MAX_ADOPTED_SESSIONS (a second
+   * adoption of an evicted session finds no dormant records: `adopt` hands each session over once). QA-2.1-34: a refused
+   * adoption (another live instance holds the claim) leaves the session unmarked; a later sighting tries again, at most
+   * once per ADOPTION_RETRY_MS (`refusedAdoptions`).
+   */
+  const adoptedSessions = new Set<string>();
+  /**
+   * QA-2.1-34: when the adoption of a session was last refused (another live instance holds its claim). The session is not
+   * marked adopted; a later sighting tries again once ADOPTION_RETRY_MS has passed. Bounded like `adoptedSessions`.
+   */
+  const refusedAdoptions = new Map<string, number>();
+  const adoptSession = (sessionID: string): void => {
+    if (reloadFailed) retryReload();
+    if (finishApi === undefined || reloadFailed || adoptedSessions.has(sessionID)) return;
+    const refusedAt = refusedAdoptions.get(sessionID);
+    if (refusedAt !== undefined && nowMs() - refusedAt < ADOPTION_RETRY_MS) return;
+    adoptedSessions.add(sessionID);
+    for (const old of adoptedSessions) {
+      if (adoptedSessions.size <= MAX_ADOPTED_SESSIONS) break;
+      adoptedSessions.delete(old);
+    }
+    try {
+      const adopted = finishApi.adopt(sessionID);
+      if (isAdoptionRefused(adopted)) {
+        adoptedSessions.delete(sessionID);
+        refusedAdoptions.delete(sessionID);
+        refusedAdoptions.set(sessionID, nowMs());
+        for (const old of refusedAdoptions.keys()) {
+          if (refusedAdoptions.size <= MAX_ADOPTED_SESSIONS) break;
+          refusedAdoptions.delete(old);
+        }
+        return;
+      }
+      refusedAdoptions.delete(sessionID);
+      if (adopted === undefined) return;
+      const restored = adopted.holds.length > 0 ? held.restore(adopted.holds) : { reposts: [], unverified: [] };
+      let recovering = new Set<string>();
+      if (adopted.inflight.length > 0) {
+        dormantInflight.set(sessionID, [...adopted.inflight]);
+        if (recoverInflight === undefined) {
+          // Recovered once the processor exists (the start-up loop): their holds wait for that recovery.
+          for (const rec of adopted.inflight) if (typeof rec.callID === "string") recovering.add(rec.callID);
+          deferredRestores.set(sessionID, { reposts: [], unverified: restored.unverified.filter((h) => recovering.has(h.callID)) });
+        } else {
+          // QA-2.1-29: only the attempts actually acknowledged for recovery settle their holds; a record whose recovery is
+          // skipped (`decide` refused, `acknowledge` undefined) leaves its hold to `settleRestoredHolds` below.
+          recovering = recoverInflight(sessionID);
+        }
+      }
+      // R20/R21 (QA-2.1-2, QA-2.1-6): the restored holds still owe their verdict; a hold whose child is recovered above gets it there.
+      if (restored.reposts.length > 0 || restored.unverified.some((h) => !recovering.has(h.callID))) {
+        const pendingRestore = settleRestoredHolds(sessionID, restored, recovering);
+        trackBackground(pendingRestore);
+      }
+    } catch (error) {
+      ingestLogger.warn("[router] background: the persisted records of a session could not be adopted", { sessionID, error: String(error) });
+    }
+  };
+  /** R21 (QA-2.1-2): the handles among `handles` whose verdict already reached `parent` (`metadata.router.handle`, or its entry text). */
+  const postedVerdictHandles = async (parent: string, handles: ReadonlySet<string>): Promise<Set<string>> => {
+    const history: unknown = await ctx.session.context({ sessionID: parent } as Parameters<typeof ctx.session.context>[0]);
+    const found = new Set<string>();
+    const visit = (value: unknown, depth: number): void => {
+      if (typeof value === "string") {
+        const match = /^<router-verdict handle="([^"]+)"/.exec(value);
+        if (match !== null && handles.has(match[1]!)) found.add(match[1]!);
+        return;
+      }
+      if (depth > 8 || value === null || typeof value !== "object") return;
+      if (Array.isArray(value)) {
+        for (const item of value) visit(item, depth + 1);
+        return;
+      }
+      const router: unknown = Reflect.get(value, "router");
+      if (router !== null && typeof router === "object") {
+        const handle: unknown = Reflect.get(router, "handle");
+        if (typeof handle === "string" && handles.has(handle)) found.add(handle);
+      }
+      for (const key of Object.keys(value)) visit(Reflect.get(value, key), depth + 1);
+    };
+    visit(history, 0);
+    return found;
+  };
+  /** Set with the completion processor: runs the gate again for a restored hold that has its child text (R20, QA-2.1-6). */
+  let reverifyRestored: ((hold: RestoredHold) => Promise<void>) | undefined;
+  /**
+   * R20/R21 (QA-2.1-2, QA-2.1-6): settles the restored holds of an adopted parent. A verdict the parent already shows is recorded
+   * as posted; a journaled `posting` text is posted again; any other hold re-runs the gate on its persisted child text (or, with
+   * none, ends UNVERIFIABLE). A hold whose dispatch is recovered from its `inflight` record is left to that recovery.
+   */
+  const settleRestoredHolds = async (parent: string, restored: RestoredHolds, recovering: ReadonlySet<string>): Promise<void> => {
+    const owed = new Set<string>([
+      ...restored.reposts.map((r) => r.handle),
+      ...restored.unverified.filter((h) => !recovering.has(h.callID)).map((h) => h.handle),
+    ]);
+    let posted = new Set<string>();
+    try {
+      posted = await postedVerdictHandles(parent, owed);
+    } catch (error) {
+      // A duplicate verdict is visible and harmless; a missing one keeps the child held for good.
+      ingestLogger.warn("[router] background: the parent's history could not be read; restored verdicts are posted again", { parent, error: String(error) });
+    }
+    // QA-2.1-31: a verdict posted here (or found posted) bypasses the plugin's gate: its restored pending entry is settled
+    // with it, so `router_verify` stops saying that the verdict follows.
+    const settleEntry = (handle: string, verdict: "PASS" | "FAIL" | "UNVERIFIABLE", reason?: string): void => {
+      try {
+        finishApi?.settleHeldDirect(parent, handle, { verdict, ...(reason === undefined ? {} : { reason }) });
+      } catch (error) {
+        ingestLogger.warn("[router] background: the pending entry of a restored hold could not be settled", { handle, error: String(error) });
+      }
+    };
+    for (const r of restored.reposts) {
+      await held.settleRestored(r.handle, posted.has(r.handle));
+      settleEntry(r.handle, verdictOfText(r.text));
+    }
+    for (const h of restored.unverified) {
+      if (recovering.has(h.callID)) continue;
+      if (posted.has(h.handle)) {
+        await held.settleRestored(h.handle, true);
+        settleEntry(h.handle, "UNVERIFIABLE", "verdict posted before the restart");
+        continue;
+      }
+      if (reverifyRestored !== undefined) {
+        await reverifyRestored(h);
+        continue;
+      }
+      await held.verdict(h.handle, { verdict: "UNVERIFIABLE", text: "[router] not verified: lost in restart", reason: "lost in restart" });
+      settleEntry(h.handle, "UNVERIFIABLE", "lost in restart");
+      finishApi?.releaseHeld(h.handle);
+    }
+  };
+  /** QA-2.1-31: the verdict a journaled verdict text names (UNVERIFIABLE when it names none). */
+  const verdictOfText = (text: string): "PASS" | "FAIL" | "UNVERIFIABLE" => {
+    const match = /\b(PASS|FAIL|UNVERIFIABLE)\b/.exec(text);
+    return match === null ? "UNVERIFIABLE" : (match[1] as "PASS" | "FAIL" | "UNVERIFIABLE");
+  };
+  // Sweeps on an unref'd 5-minute interval (memo §4.1): the timing recorder, the in-flight registry and the leases.
+  const sweepTimer = setInterval(() => {
+    try {
+      if (timings !== undefined) void Promise.resolve(timings.sweep()).catch((error: unknown) => ingestLogger.warn("[router] timing: sweep failed", { error: String(error) }));
+      for (const attempt of inflight.sweep(nowMs())) void closeAttempt?.(attempt, "sweep");
+      leaseHandle?.registry.sweep();
+    } catch (error) {
+      ingestLogger.warn("[router] background: the periodic sweep failed", { error: String(error) });
+    }
+  }, 5 * 60_000);
+  sweepTimer.unref?.();
+  bgDisposers.push(() => clearInterval(sweepTimer));
+  // 2.1.5.f: where the plugin runs from (QA records the sink). Logged once per process.
+  if (!pluginRootLogged) {
+    pluginRootLogged = true;
+    try {
+      // Debug level: a static, no-routing session stays silent on warn/info (§1.2); QA reads the debug sink.
+      console.debug(`[router] plugin root ${realpathSync.native(join(fileURLToPath(new URL(".", import.meta.url)), "..", ".."))}`);
+    } catch (error) {
+      ingestLogger.warn("[router] plugin root could not be resolved", { error: String(error) });
+    }
+  }
   const cleanup = async () => {
     if (disposed) return;
     disposed = true;
     abort.abort();
+    // QA-2.1-8: verdict posts, recoveries and reloads in flight finish (bounded) before anything they write to is torn down.
+    if (inFlightWork.size > 0) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        Promise.allSettled([...inFlightWork]),
+        new Promise<void>((resolve) => { timer = setTimeout(resolve, BACKGROUND_DRAIN_MS); }),
+      ]);
+      if (timer !== undefined) clearTimeout(timer);
+    }
+    // QA-2.1-21: the held gates the plugin runs behind `finish` (and the verdict posts they start here) end too, same bound.
+    if (finishApi !== undefined) {
+      let idleTimer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        settleBackground(),
+        new Promise<void>((resolve) => { idleTimer = setTimeout(resolve, BACKGROUND_DRAIN_MS); }),
+      ]);
+      if (idleTimer !== undefined) clearTimeout(idleTimer);
+    }
+    for (const dispose of bgDisposers.reverse()) {
+      try {
+        await dispose();
+      } catch (error) {
+        ingestLogger.warn("[router] background: a disposer failed", { error: String(error) });
+      }
+    }
     await runtime?.dispose?.();
     // Before the event task: disposing releases a step handler that waits for the model catalog (QA-2.1-5).
     await ingest.dispose();
@@ -1349,6 +2098,9 @@ export async function registerV2Hooks(
           const directory = name.startsWith("router_git_")
             ? (await ctx.session.get({ sessionID: context.sessionID })).location?.directory ?? ctx.location.directory
             : ctx.location.directory;
+          // Memo §15.1: the `ls_files` filter is synchronous and reads the session-kind cache; resolve an unknown kind here, once
+          // (memoized by `sessionKindOf`), so the filter applies to EVERY child session. No other tool pays this lookup.
+          if (name === "router_git_ls_files" && leaseGuard !== undefined) await sessionKindOf(String(context.sessionID));
           const result = await definition.execute(args, {
             sessionID: context.sessionID, messageID: context.messageID, agent: context.agent,
             directory, worktree: name.startsWith("router_git_") ? "" : ctx.location.project.directory, // Session.Info.location has no project; discover from its directory, never the plugin's project.
@@ -1372,6 +2124,18 @@ export async function registerV2Hooks(
 
     registrations.push(await ctx.session.hook("prompt", async (event) => {
       const session = await ctx.session.get({ sessionID: event.sessionID });
+      // Phase 2.1 (memo §4.5): a session without a parent is a root: its turns are timed and its kind is known to the leases.
+      noteSessionKind(String(event.sessionID), session.parentID ? "child" : "root");
+      if (!session.parentID) adoptSession(String(event.sessionID));
+      if (!session.parentID && timings !== undefined) {
+        const rootTimings = timings;
+        try {
+          rootTimings.markRootSession(String(event.sessionID));
+          void rootTimings.onRootPrompt(String(event.sessionID), nowMs(), typeof event.messageID === "string" ? event.messageID : undefined).catch((error: unknown) => ingestLogger.warn("[router] timing: the turn boundary could not be recorded", { error: String(error) }));
+        } catch (error) {
+          ingestLogger.warn("[router] timing: the root prompt could not be recorded", { error: String(error) });
+        }
+      }
       const output = { message: { agent: session.agent }, parts: [{ type: "text", text: event.prompt.text }] };
       await legacy["chat.message"]?.({ sessionID: event.sessionID, agent: session.agent }, output);
       event.prompt.text = output.parts.map((part) => part.text).join("\n\n");
@@ -1385,8 +2149,98 @@ export async function registerV2Hooks(
         }
       }
     }));
+    // ---- Phase 2.1 message helpers (memo §4.4): `HeldResults.apply` reads `parts`; the host's context messages carry `content`. ----
+    const withContent = (source: ContextMessage, content: ContextMessage["content"]): ContextMessage =>
+      Object.assign(Object.create(Object.getPrototypeOf(source)), source, { content });
+    /** The held-result matcher over context messages (copies; `undefined` = unchanged). */
+    const applyHeldTo = (sid: string, messages: readonly ContextMessage[]): ContextMessage[] | undefined => {
+      const shaped = messages.map((source) => ({ source, parts: source.content }));
+      const result = held.apply(sid, shaped);
+      if (result === undefined) return undefined;
+      return result.map((entry) => (entry.parts === entry.source.content ? entry.source : withContent(entry.source, entry.parts)));
+    };
+    /** Auto/model: `[router` line starts in every `<subagent …>` element body are defanged (parity with `defangChildResult`). */
+    const defangMessages = (messages: readonly ContextMessage[]): ContextMessage[] | undefined => {
+      let changed = false;
+      const next = messages.map((message) => {
+        if (!Array.isArray(message.content)) return message;
+        let touched = false;
+        const content = message.content.map((part) => {
+          if (part.type !== "text") return part;
+          const text = defangSubagentBodies(part.text, defangRouterLines);
+          if (text === part.text) return part;
+          touched = true;
+          return { ...part, text };
+        });
+        if (!touched) return message;
+        changed = true;
+        return withContent(message, content);
+      });
+      return changed ? next : undefined;
+    };
+    /**
+     * A root session's request: every completion element of an acknowledged attempt starts its processing (not awaited), and the
+     * first request that sees an attempt waits for it at most COMPLETION_SETTLE_MS (one shared budget, never again for that attempt).
+     */
+    const scanCompletions = async (sid: string, messages: readonly ContextMessage[]): Promise<void> => {
+      if (processor === undefined) return;
+      const waits: string[] = [];
+      for (const message of messages) {
+        if (!Array.isArray(message.content)) continue;
+        for (const part of message.content) {
+          if (part.type !== "text") continue;
+          for (const element of completionElementsOf(part.text)) {
+            const attempt = inflight.byChild(element.child);
+            if (attempt === undefined || attempt.parentSessionID !== sid) {
+              ingestLogger.warn("[router] background: a completion element names a child with no attempt of this parent", {
+                parent: sid, child: element.child, state: element.state, attempt: attempt === undefined ? "none" : attempt.parentSessionID,
+              });
+              continue;
+            }
+            if (attempt.state === "acknowledged" || attempt.state === "child-ended") {
+              trackBackground(processor.process(element.child, { kind: "completion", state: element.state, body: element.body, at: nowMs() }));
+            }
+            if (!attempt.waitedOnce && !waits.includes(element.child)) {
+              attempt.waitedOnce = true;
+              waits.push(element.child);
+            }
+          }
+        }
+      }
+      if (waits.length > 0) await Promise.all(waits.map((child) => processor?.settled(child, COMPLETION_SETTLE_MS)));
+    };
     /** The context hook's body (QA-P23-B5: declared before the hook that calls it). */
     async function buildContext(event: SessionContext, role: string | undefined): Promise<void> {
+      // Phase 2.1 (memo §4.4 step 1-2): FIRST, before `chat.params` and before the augmenter reads `event.messages`: no held output
+      // reaches the request, and (auto/model) child text cannot pose as a router line. Mode `off`: no matcher, no defang.
+      const rawMessages = event.messages;
+      if (bgActive() && event.messages !== undefined) {
+        const sid = String(event.sessionID);
+        adoptSession(sid);
+        if (reloadFailed) {
+          // Memo §12: without a reloaded journal every completion not known as processed is redacted (fail closed).
+          const isProcessed = (child: string): boolean => {
+            const attempt = inflight.byChild(child);
+            return attempt !== undefined && journal.hasProcessed(attempt.key);
+          };
+          event.messages = event.messages.map((message) => {
+            if (!Array.isArray(message.content)) return message;
+            let touched = false;
+            const content = message.content.map((part) => {
+              if (part.type !== "text") return part;
+              const text = redactUnprocessedElements(part.text, isProcessed);
+              if (text === part.text) return part;
+              touched = true;
+              return { ...part, text };
+            });
+            return touched ? withContent(message, content) : message;
+          });
+        }
+        const hidden = applyHeldTo(sid, event.messages);
+        if (hidden !== undefined) event.messages = hidden;
+        const defanged = defangMessages(event.messages);
+        if (defanged !== undefined) event.messages = defanged;
+      }
       if (protectedAgent(event.agent)) {
         try {
           // Catalogs use merged session rules; remove widened tools from this
@@ -1499,6 +2353,14 @@ export async function registerV2Hooks(
       // Phase 1.2: a root session's turn state (pending list, late notices, route hint) rides in a trailing user message; the
       // system parts above are never changed for it. A failure here only loses the tail, never the request.
       if (output[TURN_STATE_ROOT] === true && event.messages !== undefined) {
+        if (bgActive() && rawMessages !== undefined) {
+          // The ORIGINAL completion text (before the matcher) feeds the processor; failures never cost the request.
+          try {
+            await scanCompletions(String(event.sessionID), rawMessages);
+          } catch (error) {
+            ingestLogger.warn("[router] background: completions could not be scanned", { error: String(error) });
+          }
+        }
         try {
           const placed = placeTurnState(event.messages, turnState.buildTurnState(String(event.sessionID)), tailMessage);
           if (placed !== undefined) event.messages = placed;
@@ -1571,6 +2433,39 @@ export async function registerV2Hooks(
           refusal = "the router could not check this dispatch's authority (fail closed)";
         }
         if (refusal !== undefined) throw refused(`[router] Refused for role agent ${callerRole} in this dispatch: ${refusal}`, callerRole);
+      }
+      // Phase 2.1 (memo §4.2): authority checks first, then the held refusal, then the leases (all before the legacy hook).
+      if (bgActive()) {
+        adoptSession(String(event.sessionID));
+        // `args` (scopedArgs) rewrites `task_id` from `sessionID`: a call that names the child by `task_id` must still be seen.
+        const rawInput = event.input !== null && typeof event.input === "object" ? event.input as Record<string, unknown> : undefined;
+        const heldArgs = rawInput === undefined || args === null || typeof args !== "object" || typeof rawInput.task_id !== "string"
+          ? args
+          : { ...args, task_id: rawInput.task_id };
+        const heldRefusal = held.refusal(String(event.sessionID), event.tool, heldArgs);
+        if (heldRefusal !== undefined) throw refused(heldRefusal, callerRole);
+        // QA-2.1-8: while the journal is not reloaded the restored holds are unknown, so a resume of a session this process has no
+        // attempt for may be a resume of a held child: refused (fail closed) until a reload succeeds.
+        // QA-2.1-20: Code Mode `execute` code is inspected too, as `held.refusal` does: a session it resumes by name is refused alike.
+        if (reloadFailed) {
+          // QA-2.1-16: the refusal promises a retry; each refused attempt starts one (bounded by PENDING_RELOAD_RETRY_MS).
+          retryReload();
+          for (const target of resumeTargetsOf(event.tool, heldArgs, String(event.sessionID))) {
+            if (inflight.byChild(target) === undefined) throw refused(reloadFailedResumeText(target), callerRole);
+          }
+        }
+      }
+      // Only the tools the guard checks (file tools, `router_git_*`, `router_run`) and the search tools (`glob`/`grep`, whose
+      // result the guard filters, so the actor must be resolved before them) reach it: no host call for any other tool.
+      const leaseClass = roleActionOf(event.tool);
+      if (leaseGuard !== undefined && (leaseClass === "read" || leaseClass === "edit" || event.tool === "glob" || event.tool === "grep" || event.tool.startsWith("router_git_") || event.tool === "router_run")) {
+        const lease = await leaseGuard.before({ sessionID: String(event.sessionID), tool: event.tool, args, callID: event.id });
+        if (lease.refuse !== undefined) throw refused(lease.refuse, callerRole);
+        if (lease.runNote !== undefined) {
+          runNotes.delete(event.id);
+          runNotes.set(event.id, lease.runNote);
+          while (runNotes.size > 1000) runNotes.delete(runNotes.keys().next().value!);
+        }
       }
       // #84 P-5: a routed role dispatch runs in the foreground (separate from `verifying`).
       let roleForeground = false;
@@ -1664,13 +2559,56 @@ export async function registerV2Hooks(
           const prompt = typeof original?.prompt === "string" ? original.prompt : typeof original?.description === "string" ? original.description : "";
           output.args.prompt = translateAdded(prompt, output.args.prompt);
         }
-        event.input = nativeArgs(event.tool, output.args, original, verifying, roleForeground);
+        // Phase 2.1 (memo §4.2 step 5, §6): under `off` (or without the finish API) this is today's `verifying || roleRouted ? false : undefined`.
+        let background: boolean | undefined = verifying || roleForeground ? false : undefined;
+        if (event.tool === "subagent" && bgActive() && finishApi !== undefined) {
+          const parent = String(event.sessionID);
+          const info = dispatchRouter.decisionOf(event.id);
+          const roleLabel = info?.role ?? "unknown";
+          const verification = finishApi.verificationFor(event.id);
+          const decision = decideBackground({
+            mode: startRouting.background.mode,
+            explicit: typeof output.args?.background === "boolean" ? output.args.background : undefined,
+            verifying, verificationMode: verification?.mode ?? "none", roleRouted: roleForeground,
+            estimate: info === undefined ? undefined : durations?.estimate({ role: roleLabel, class: info.class, scope: info.scope }),
+            minPredictedMs: startRouting.background.minPredictedMs, minSamples: DURATION_MIN_SAMPLES,
+            acceptance: verification?.acceptance ?? { testsPass: false, buildPasses: false },
+            planTask: false,
+            holdingAvailable: held.available && !reloadFailed && finishApi.canHold(parent),
+            parentIsRoot: knownKindOf(parent) === "root", liveCount: inflight.liveCount(),
+          });
+          background = decision.background;
+          inflight.decide({
+            callID: event.id, parentSessionID: parent, agent: String(output.args?.agent ?? ""), ...(info?.role === undefined ? {} : { role: info.role }),
+            description: typeof output.args?.description === "string" ? output.args.description : "", verifying,
+            verificationMode: verification?.mode ?? "none", decision,
+            ...(typeof output.args?.sessionID === "string" && output.args.sessionID !== "" ? { resumeOf: output.args.sessionID } : {}),
+            at: nowMs(),
+          });
+        }
+        event.input = nativeArgs(event.tool, output.args, original, background);
       } catch (error) {
         dispatchRouter.onCallFinished(event.id); // the hook chain rejected the call: it will never reach execute.after (2.2)
+        inflight.cancel(event.id);
         throw error;
       }
       // The input the host will execute (after the legacy hook): the dispatch is registered for ingestion from it, not from what the engine decided (2.2).
       dispatchRouter.commit(event.id, event.input);
+      // 1.1 handoff: the timing starts after `commit` (not inside it); a hook-chain rejection above makes no call.
+      if (event.tool === "subagent" && timings !== undefined) {
+        try {
+          const info = dispatchRouter.decisionOf(event.id);
+          const sent = event.input as { sessionID?: unknown; background?: unknown };
+          const resumed = sent.sessionID;
+          timings.recordDispatchStart({
+            callID: event.id, childSessionID: typeof resumed === "string" && resumed !== "" ? resumed : null, parentSessionID: String(event.sessionID),
+            role: info?.role ?? "unknown", class: info?.class ?? "unknown", scope: info?.scope ?? "unknown",
+            tier: info?.tier ?? "unknown", model: info?.model ?? "unknown", background: sent.background === true, at: nowMs(),
+          });
+        } catch (error) {
+          ingestLogger.warn("[router] timing: the dispatch start could not be recorded", { error: String(error) });
+        }
+      }
     }));
     /**
      * #84 P2.1 (T2.1.4; handoffs 28, 34, 37): the parent's `subagent` call of a role child ended. Computed BEFORE the legacy hook
@@ -1726,17 +2664,337 @@ export async function registerV2Hooks(
               rememberLastCall(child, end.id);
               if (!running) catalogFailures.delete(child); // P-3: the next attempt's catalog failure is annotated again
             }
-            evictCall(end.sessionID, end.id);
+            // Phase 2.1: a running ack under background guarantees keeps the pending binding: the processor evicts it at completion
+            // (otherwise an auto-backgrounded role child loses its binding before its first request).
+            if (!(running && bgActive() && inflight.byCall(end.id) !== undefined)) evictCall(end.sessionID, end.id);
           } catch (error) {
             ingestLogger.warn("[router] roles: the finished role dispatch could not be released", { error: String(error) });
           }
         },
       };
     };
+    // Phase 2.1 (memo §4.7): the completion processor. Only when the plugin attached its finish API; otherwise nothing is processed.
+    let processor: CompletionProcessor | undefined;
+    /** The child's last assistant message (`ctx.session.context`, C7/O1); also the recovery read of a persisted dispatch. */
+    const lastAssistantText = async (child: string): Promise<{ text: string } | undefined> => {
+      const history = await ctx.session.context({ sessionID: child } as Parameters<typeof ctx.session.context>[0]);
+      const messages: readonly unknown[] = Array.isArray(history) ? history : [];
+      for (let index = messages.length - 1; index >= 0; index--) {
+        // The host's context entries are discriminated by `type` ("user" | "assistant" | "synthetic", see the instruction filter in
+        // the system hook); the model-facing messages of the context hook use `role`. Both name the assistant the same way.
+        const message = messages[index] as { type?: unknown; role?: unknown } | undefined;
+        if (message?.type === "assistant" || message?.role === "assistant") {
+          const text = messageText(message);
+          if (text !== undefined) return { text };
+        }
+      }
+      ingestLogger.warn("[router] background: the child's context holds no assistant message", {
+        child,
+        shape: Array.isArray(history) ? `array(${messages.length})` : typeof history,
+        keys: history !== null && typeof history === "object" ? Object.keys(history).slice(0, 12).join(",") : "",
+        lastMessage: JSON.stringify(messages.at(-1) ?? null)?.slice(0, 300) ?? "",
+      });
+      return undefined;
+    };
+    /**
+     * QA-2.1-6: the end state of a persisted dispatch's child, from its own history. The newest non-synthetic entry decides: an
+     * assistant message with an error failed (or was interrupted, for an abort); one with text succeeded only when it carries a
+     * completion marker (QA-2.1-18, `assistantStepCompleted`: a finish reason other than `tool-calls` or a completed time, and no
+     * pending or running tool part); anything else (no entry, a user or tool turn last, a step cut mid-stream) never finished,
+     * which after a restart means lost.
+     */
+    const childEndState = async (child: string): Promise<ChildEndState> => {
+      const history = await ctx.session.context({ sessionID: child } as Parameters<typeof ctx.session.context>[0]);
+      const messages: readonly unknown[] = Array.isArray(history) ? history : [];
+      for (let index = messages.length - 1; index >= 0; index--) {
+        const message = messages[index] as { type?: unknown; role?: unknown; error?: unknown; info?: { error?: unknown } } | undefined;
+        if (message?.type === "synthetic") continue;
+        if (message?.type !== "assistant" && message?.role !== "assistant") return { outcome: "lost" };
+        const text = messageText(message);
+        const error = message.error ?? message.info?.error;
+        if (error !== undefined && error !== null && error !== false) {
+          const described = typeof error === "string" ? error : JSON.stringify(error) ?? "";
+          return { outcome: /abort|interrupt|cancel/i.test(described) ? "interrupted" : "failed", ...(text === undefined ? {} : { text }) };
+        }
+        // QA-2.1-18: text alone is not an end: a child cut mid-step has partial text. Without a completion marker it is lost.
+        if (!assistantStepCompleted(message)) return { outcome: "lost" };
+        return text === undefined ? { outcome: "lost" } : { outcome: "succeeded", text };
+      }
+      return { outcome: "lost" };
+    };
+    /** QA-2.1-6: one `resume: true` entry tells the parent that a background dispatch was lost in a restart. Never throws. */
+    const wakeParentLost = async (attempt: Attempt): Promise<void> => {
+      if (typeof syntheticRaw !== "function") return;
+      try {
+        await Reflect.apply(syntheticRaw, ctx.session, [{
+          sessionID: attempt.parentSessionID,
+          text: `[router] The background dispatch ${attemptLabel(attempt)} (${attempt.childSessionID}) was lost in a restart: its result never arrived. Dispatch it again if you still need it.`,
+          description: "Model router notice",
+          metadata: { router: { kind: "lost-dispatch", child: attempt.childSessionID, callID: attempt.callID } },
+          resume: true,
+        }]);
+      } catch (error) {
+        ingestLogger.warn("[router] background: the parent of a lost dispatch could not be told", { child: attempt.childSessionID, error: String(error) });
+      }
+    };
+    if (finishApi !== undefined) {
+      const api = finishApi;
+      const captureDeltaOf = api.captureDelta?.bind(api);
+      // R20 (QA-2.1-6): a restored hold with its child text runs the gate again; without one it ends UNVERIFIABLE.
+      reverifyRestored = async (hold) => {
+        // QA-2.1-31: every verdict posted here bypasses the plugin's gate; the restored pending entry is settled with it.
+        const settleEntry = (verdict: "PASS" | "FAIL" | "UNVERIFIABLE", reason?: string): void => {
+          try {
+            api.settleHeldDirect(hold.parentSessionID, hold.handle, { verdict, ...(reason === undefined ? {} : { reason }) });
+          } catch (error) {
+            ingestLogger.warn("[router] background: the pending entry of a restored hold could not be settled", { handle: hold.handle, error: String(error) });
+          }
+        };
+        const unverifiable = async (reason: string): Promise<void> => {
+          await held.verdict(hold.handle, { verdict: "UNVERIFIABLE", text: `${hold.childText === undefined ? "" : `${hold.childText}\n`}[router] not verified: ${reason}`, reason });
+          settleEntry("UNVERIFIABLE", reason);
+          api.releaseHeld(hold.handle);
+        };
+        // QA-2.1-17: a verdict the gate reached before the restart (its `state` record) is posted as it was, never recomputed.
+        const stored = hold.verdict;
+        if (stored !== undefined) {
+          const line = `[router] ${stored.verdict}${stored.reason === undefined ? "" : ` — ${stored.reason}`}`;
+          await held.verdict(hold.handle, {
+            verdict: stored.verdict, text: hold.childText === undefined ? line : `${hold.childText}\n\n${line}`,
+            ...(stored.reason === undefined ? {} : { reason: stored.reason }),
+          });
+          settleEntry(stored.verdict, stored.reason);
+          api.releaseHeld(hold.handle);
+          return;
+        }
+        // QA-2.1-17: `hold-text` is journaled for a succeeded child only, so a missing text is a child that did not
+        // succeed, or one the restart cut before its text was kept.
+        const childText = hold.childText;
+        if (childText === undefined) {
+          await unverifiable("lost in restart");
+          return;
+        }
+        try {
+          // QA-2.1-17: the plugin rebuilds the gate inputs from the journaled dispatch and the restored pending entry, and
+          // re-posts a verdict the entry already reached.
+          const result = await within(hookContext({ sessionID: hold.parentSessionID, agent: undefined, messageID: "", id: hold.callID }), () => api.finish({
+            callID: hold.callID, parentSessionID: hold.parentSessionID, childSessionID: hold.childSessionID, outputText: childText,
+            status: "succeeded", mode: "background", heldHandle: hold.handle, endedAt: nowMs(), restored: hold.dispatch,
+          }));
+          // The gate runs behind `finish`; it posts the verdict through the HeldSink when it settles.
+          if (result.verification.kind === "held") return;
+          api.releaseHeld(hold.handle);
+          const v = result.verification;
+          if (v.kind === "required") {
+            await held.verdict(hold.handle, { verdict: v.verdict, text: result.outputText });
+            settleEntry(v.verdict, v.verdict === "UNVERIFIABLE" ? "verification data lost in restart" : undefined);
+            return;
+          }
+          await held.verdict(hold.handle, { verdict: "UNVERIFIABLE", text: `${result.outputText}\n[router] not verified: no verification ran`, reason: "no verification ran" });
+          settleEntry("UNVERIFIABLE", "no verification ran");
+        } catch (error) {
+          await unverifiable(`verification after a restart failed: ${String(error)}`);
+        }
+      };
+      processor = createCompletionProcessor(inflight, {
+        finish: (input) => within(hookContext({ sessionID: input.parentSessionID, agent: inflight.byCall(input.callID)?.agent, messageID: "", id: input.callID }), () => api.finish(input)),
+        readChildResult: lastAssistantText,
+        // The `!running` half of `roleAfterCall`: budget and authority notices, plus its evictions (run through its own `finish`).
+        roleCompletion: async (attempt, text) => {
+          const completed = await roleAfterCall({
+            id: attempt.callID, sessionID: attempt.parentSessionID, status: "completed",
+            result: { output: { status: "completed", output: text, sessionID: attempt.childSessionID }, content: [{ type: "text", text }] },
+            input: { agent: attempt.agent },
+          });
+          if (completed === undefined) return [];
+          completed.finish();
+          evictCall(attempt.parentSessionID, attempt.callID);
+          return completed.notice === undefined ? [] : [completed.notice];
+        },
+        releaseLeases: (holderID) => { leaseGuard?.releaseChild(holderID); leaseHandle?.notifyReleased(); },
+        held, persist: journal, now: nowMs, logger: ingestLogger,
+        // 2.1.4.b: the change set at child end, so a background completion verifies what the child changed.
+        ...(captureDeltaOf === undefined ? {} : { captureDelta: captureDeltaOf }),
+        // QA-2.1-4: a held attempt that ends without a held register gives its reserved handle back.
+        releaseHeld: (handle) => api.releaseHeld(handle),
+        // QA-2.1-17: a recovery finishes with the dispatch data its `inflight` record journaled.
+        restoredDispatch: (attempt) => {
+          const dispatch = restoredDispatches.get(attempt.callID);
+          restoredDispatches.delete(attempt.callID);
+          return dispatch;
+        },
+      });
+      const closing = processor;
+      closeAttempt = (attempt, cause) => closing.closeUnknown(attempt, cause);
+      // Memo §11.3: an adopted `inflight` record without `processed` is recovered through the child's own history: finished ->
+      // process; otherwise lost. The attempt is re-registered first so the processor has its key; a failure leaves it to the sweep.
+      recoverInflight = (sessionID) => {
+        const records = dormantInflight.get(sessionID);
+        dormantInflight.delete(sessionID);
+        const recovering = new Set<string>();
+        for (const rec of records ?? []) {
+          const callID = typeof rec.callID === "string" ? rec.callID : undefined;
+          const child = typeof rec.childSessionID === "string" ? rec.childSessionID : typeof rec.child === "string" ? rec.child : undefined;
+          if (callID === undefined || child === undefined) continue;
+          const mode = rec.verificationMode === "required" || rec.verificationMode === "deferred" ? rec.verificationMode : "none";
+          const registered = inflight.decide({
+            callID, parentSessionID: sessionID, agent: typeof rec.agent === "string" ? rec.agent : "",
+            ...(typeof rec.role === "string" ? { role: rec.role } : {}),
+            description: typeof rec.description === "string" ? rec.description : "",
+            verifying: rec.verifying === true, verificationMode: mode,
+            decision: { background: true, hold: false, reason: "prior" }, at: typeof rec.at === "number" ? rec.at : nowMs(),
+          });
+          const handle = typeof rec.hold === "string" ? rec.hold : typeof rec.handle === "string" ? rec.handle : undefined;
+          // A held dispatch is recovered only while its hold is live here (restored or still journaled); otherwise it is a plain one.
+          const holdHandle = handle !== undefined && held.isHeld(child) ? handle : undefined;
+          const attempt = registered
+            ? inflight.acknowledge(callID, child, { userBackgrounded: true, ...(holdHandle === undefined ? {} : { hold: { handle: holdHandle } }) })
+            : undefined;
+          if (attempt === undefined) continue;
+          recovering.add(callID);
+          restoredDispatches.delete(callID);
+          restoredDispatches.set(callID, restoredDispatchOf(rec.dispatch));
+          while (restoredDispatches.size > MAX_ADOPTED_SESSIONS) restoredDispatches.delete(restoredDispatches.keys().next().value!);
+          trackBackground((async () => {
+            // QA-2.1-6: the child's END STATE decides (succeeded / failed / interrupted / never finished), not just "some text exists".
+            let end: ChildEndState = { outcome: "lost" };
+            try {
+              end = await childEndState(child);
+            } catch (error) {
+              ingestLogger.warn("[router] background: the child of a persisted dispatch could not be read; treated as lost", { child, error: String(error) });
+            }
+            await closing.process(child, end.outcome === "lost"
+              ? { kind: "recovery", outcome: "lost", text: undefined, at: nowMs() }
+              : { kind: "recovery", outcome: end.outcome, text: end.text ?? "", at: nowMs() });
+            // QA-2.1-6: a lost dispatch without a hold wakes its parent once (a held one is woken by its verdict post). Once per child:
+            // the processor runs once per attempt and journals `processed`, so the next start does not recover it again.
+            if (end.outcome === "lost" && holdHandle === undefined) await wakeParentLost(attempt);
+          })());
+        }
+        return recovering;
+      };
+      for (const sessionID of [...dormantInflight.keys()]) {
+        const recovered = recoverInflight(sessionID);
+        // QA-2.1-29: a hold adopted before the processor existed waited for this recovery; a skipped one is settled now.
+        const waiting = deferredRestores.get(sessionID);
+        deferredRestores.delete(sessionID);
+        if (waiting !== undefined && waiting.unverified.some((h) => !recovered.has(h.callID))) {
+          trackBackground(settleRestoredHolds(sessionID, waiting, recovered));
+        }
+      }
+    }
+    // Phase 2.1 (memo §13): the three turn-state providers. They render nothing (and are not registered) under `off`.
+    if (bgActive() && processor !== undefined) {
+      const completing = processor;
+      const LIVE_STATES: ReadonlySet<Attempt["state"]> = new Set<Attempt["state"]>(["acknowledged", "child-ended", "processing"]);
+      const unregisters = [
+          turnState.registerTurnStateProvider({
+            name: "completed", order: PROVIDER_ORDER.completed,
+            render: (sid) => renderCompleted(completing.completedFor(sid)),
+            active: (sid) => completing.completedFor(sid).length > 0,
+          }),
+          turnState.registerTurnStateProvider({
+            name: "held", order: PROVIDER_ORDER.held,
+            render: (sid) => renderHeld(held.heldFor(sid)),
+            active: (sid) => held.heldFor(sid).length > 0,
+          }),
+          turnState.registerTurnStateProvider({
+            name: "in-flight", order: PROVIDER_ORDER.inFlight,
+            render: (sid) => renderInFlight(inflight.listForParent(sid).filter((attempt) => LIVE_STATES.has(attempt.state)), nowMs()),
+            active: (sid) => inflight.listForParent(sid).some((attempt) => LIVE_STATES.has(attempt.state)),
+          }),
+      ];
+      registrations.push({ dispose: async () => { for (const unregister of unregisters) unregister(); } });
+    }
     registrations.push(await ctx.tool.hook("execute.after", async (event) => {
       // 2.2: the result names the child. A dispatch still waiting for it is registered under it, and a heuristic claim that picked
       // the wrong child is corrected here, before the legacy hook below records the verdict. A call without a result is just dropped.
-      dispatchRouter.onCallResult(event.id, event.status === "completed" ? childSessionOf(event.result) : null);
+      const resultChild = event.status === "completed" ? childSessionOf(event.result) : null;
+      dispatchRouter.onCallResult(event.id, resultChild);
+      const runNote = runNotes.get(event.id);
+      runNotes.delete(event.id);
+      // Phase 2.1 (memo §4.3 steps 1-2). Timing: a non-null child binds the open start; a null child drops it.
+      let ackText: string | undefined;
+      if (event.tool === "subagent") {
+        const running = resultChild !== null && ((event as { result?: { output?: { status?: unknown } } }).result)?.output?.status === "running";
+        if (timings !== undefined) {
+          try {
+            if (resultChild === null) timings.cancelStart(event.id);
+            else {
+              timings.bindChild(event.id, resultChild);
+              if (running) timings.setBackground(event.id, true);
+            }
+          } catch (error) {
+            ingestLogger.warn("[router] timing: the dispatch result could not be recorded", { error: String(error) });
+          }
+        }
+        if (resultChild === null) inflight.cancel(event.id);
+        // A running result under mode ≠ off with a root parent: register the attempt (and its hold) BEFORE anything can render a completion.
+        const parent = String(event.sessionID);
+        const rec = running && bgActive() && finishApi !== undefined ? inflight.byCall(event.id) : undefined;
+        if (rec !== undefined && resultChild !== null && knownKindOf(parent) === "root") {
+          try {
+            const hold = verifyingCalls.has(event.id) && rec.verificationMode === "required" && held.available && !reloadFailed && finishApi?.canHold(parent) === true;
+            const handle = hold ? finishApi?.reserveHeld(parent, event.id) : undefined;
+            const attempt = inflight.acknowledge(event.id, resultChild, {
+              userBackgrounded: rec.decision.background !== true, ...(handle === undefined ? {} : { hold: { handle } }),
+            });
+            if (attempt !== undefined) {
+              const notRunning = `[router] Running in the background (${resultChild}).`;
+              const unheldText = verifyingCalls.has(event.id) || handle !== undefined
+                ? `${notRunning} Its result will arrive unverified; the verdict follows in the router state.`
+                : `${notRunning} Router guarantees apply when it completes.`;
+              let journaled = true;
+              // QA-2.1-17: the prompt, cwd and work root go with the records, so a gate after a restart has its inputs.
+              let dispatch: RestoredDispatch | undefined;
+              try {
+                dispatch = finishApi?.dispatchOf(event.id);
+              } catch (error) {
+                ingestLogger.warn("[router] background: the dispatch data could not be read; a restart cannot verify it", { error: String(error) });
+              }
+              try {
+                await journal.append({
+                  v: 1, kind: "inflight", key: attempt.key, callID: event.id, parentSessionID: parent, childSessionID: resultChild,
+                  label: attemptLabel(attempt), ...(handle === undefined ? {} : { handle }), at: nowMs(),
+                  agent: rec.agent, description: rec.description, verifying: rec.verifying, verificationMode: rec.verificationMode,
+                  ...(rec.role === undefined ? {} : { role: rec.role }), hold: handle ?? null,
+                  ...(dispatch === undefined ? {} : { dispatch }),
+                }, { fsync: true });
+              } catch (error) {
+                journaled = false;
+                ingestLogger.warn("[router] background: the dispatch could not be journaled; its result is not held", { error: String(error) });
+              }
+              let holding = false;
+              if (handle !== undefined && journaled) {
+                try {
+                  await held.hold({
+                    handle, parentSessionID: parent, childSessionID: resultChild, callID: event.id, label: attemptLabel(attempt),
+                    ...(dispatch === undefined ? {} : { dispatch }),
+                  });
+                  holding = true;
+                } catch (error) {
+                  ingestLogger.warn("[router] background: the result could not be held; it arrives unverified", { error: String(error) });
+                }
+              }
+              if (handle !== undefined && !holding) {
+                // QA-2.1-3: no hold exists, so nothing may say "held": the attempt is a plain verifying one and the handle goes back.
+                delete attempt.hold;
+                try {
+                  finishApi?.releaseHeld?.(handle);
+                } catch (error) {
+                  ingestLogger.warn("[router] background: the reserved handle could not be released", { error: String(error) });
+                }
+              }
+              // QA-2.1-3: the acknowledgement text is chosen only after both writes settled.
+              ackText = holding ? `${notRunning} Its result is held until verification finishes.` : unheldText;
+              const early = inflight.takeEarlyEnd(resultChild);
+              if (early !== undefined && processor !== undefined) trackBackground(processor.process(resultChild, { kind: "early-end", end: early }));
+            }
+          } catch (error) {
+            ingestLogger.warn("[router] background: the dispatch could not be registered as running", { error: String(error) });
+          }
+        }
+      }
       const role = event.tool === "subagent" ? await roleAfterCall({
         id: event.id, sessionID: String(event.sessionID), status: event.status,
         result: (event as { result?: unknown }).result, input: (event as { input?: unknown }).input,
@@ -1753,7 +3011,21 @@ export async function registerV2Hooks(
         const agent = roleAgentName(event.agent) ?? (typeof event.agent === "string" && event.agent !== "" ? undefined : knownRoleSession(String(event.sessionID)));
         if (agent !== undefined) options.recordRefusal?.(String(event.sessionID), agent, event.tool, (event as { input?: unknown }).input);
       }
-      if (event.status !== "completed") return;
+      if (event.status !== "completed") {
+        if (event.tool === "subagent") inflight.cancel(event.id);
+        return;
+      }
+      // Phase 2.1: a completed (non-running) subagent result is terminal for the processor: the legacy path ran in-line.
+      if (event.tool === "subagent" && resultChild !== null && ackText === undefined
+        && (event.result as { output?: { status?: unknown } } | undefined)?.output?.status !== "running") {
+        inflight.foreground(event.id, resultChild);
+      }
+      // 1.3 (memo §14.3): a `router_run` result carries the contamination note the lease check produced in `execute.before`.
+      if (event.tool === "router_run" && runNote !== undefined) {
+        const base = Array.isArray(event.result.content) ? [...event.result.content]
+          : typeof event.result.content === "string" ? [{ type: "text" as const, text: event.result.content }] : [];
+        event.result = { ...event.result, content: [...base, { type: "text" as const, text: runNote }] };
+      }
       if (event.tool === "grep" && protectedAgent(event.agent)) {
         const content = event.result.content;
         event.result = {
@@ -1776,12 +3048,32 @@ export async function registerV2Hooks(
       if (role !== undefined && event.tool === "subagent" && event.result.output?.status !== "running") {
         event.result = defangChildResult(event.result);
       }
+      // 1.3 (memo §14.2): `glob`/`grep` of a child session: entries under edit by another holder are left out, plus one note line.
+      if (leaseGuard !== undefined && (event.tool === "glob" || event.tool === "grep")) {
+        try {
+          // The guard gets the host result exactly as received (`content` + `output`) and filters both forms by the same paths.
+          const searched = leaseGuard.afterSearch({ sessionID: String(event.sessionID), tool: event.tool, result: event.result });
+          if (searched !== undefined && searched.result !== null && typeof searched.result === "object" && !Array.isArray(searched.result)) {
+            const merged: typeof event.result = { ...event.result, ...searched.result };
+            const note = searched.note;
+            const body: unknown = merged.content;
+            event.result = note === undefined ? merged : {
+              ...merged,
+              content: Array.isArray(body) ? [...body, { type: "text" as const, text: note }]
+                : [{ type: "text" as const, text: typeof body === "string" ? `${body.trimEnd()}\n${note}` : note }],
+            };
+          }
+        } catch (error) {
+          ingestLogger.warn("[router] leases: a search result could not be filtered", { error: String(error) });
+        }
+      }
       const structured = event.result.output;
       // A user can background a foreground subagent while it is running. That
       // acknowledgement is not a final result and must never enter acceptance.
       if (event.tool === "subagent" && structured?.status === "running") {
         const notices = [
-          ...(verifying ? ["[router] This subagent is still running. Its result has not been verified; automatic acceptance requires a completed foreground return."] : []),
+          ...(ackText !== undefined ? [ackText]
+            : verifying ? ["[router] This subagent is still running. Its result has not been verified; automatic acceptance requires a completed foreground return."] : []),
           ...(banner === undefined ? [] : [banner]),
         ];
         if (!notices.length) return;
@@ -1852,8 +3144,31 @@ export async function registerV2Hooks(
 
     // V2 events are immutable facts. A completed-text warning is a synthetic
     // transcript entry, instead of mutating an already-persisted text part.
+    /**
+     * QA-2.1-21: the handling of each event is background work from the moment the loop takes it until the loop asks for the
+     * next one (a `continue` and a `break` included), so the settled seam and `dispose` never miss what an event starts after
+     * an await (the timing store's file write before the processor starts). Only the events that start background work are
+     * tracked (a child's creation adopts, its end processes): a step event's handler may wait for the model catalog until
+     * `dispose` (QA-2.1-5), which the settled seam must never wait for.
+     */
+    const trackedEvents = async function* <T>(source: AsyncIterable<T>): AsyncGenerator<T> {
+      for await (const event of source) {
+        const type: unknown = event !== null && typeof event === "object" ? Reflect.get(event, "type") : undefined;
+        if (typeof type !== "string" || (type !== "session.created" && !type.startsWith("session.execution."))) {
+          yield event;
+          continue;
+        }
+        let handled: () => void = () => undefined;
+        trackBackground(new Promise<void>((resolve) => { handled = resolve; }));
+        try {
+          yield event;
+        } finally {
+          handled();
+        }
+      }
+    };
     eventTask = (async () => {
-      for await (const event of ctx.event.subscribe({ signal: abort.signal })) {
+      for await (const event of trackedEvents(ctx.event.subscribe({ signal: abort.signal }))) {
         if (abort.signal.aborted) break;
         try {
           const data = event.data as Record<string, any>;
@@ -1861,6 +3176,77 @@ export async function registerV2Hooks(
           // QA-P23-2-A1 / QA-P23-3-1: the host names a tool result's saved full output on that session's tool-success event only.
           if (HOST_TOOL_SUCCESS_EVENT.test(event.type) && data && Array.isArray(data.outputPaths)) {
             rememberOutputs(data.sessionID, data.outputPaths.filter((path: unknown): path is string => typeof path === "string"));
+          }
+          // Phase 2.1 (memo §4.6): timing, leases and the completion processor, before any existing `continue` below.
+          if (typeof data?.sessionID === "string") {
+            const sid: string = data.sessionID;
+            if (event.type === "session.created") {
+              noteSessionKind(sid, data.parentID ? "child" : "root");
+              if (!data.parentID) timings?.markRootSession(sid);
+              // QA-2.1-6: the event loop adopts too, so a parent that only shows up through events still gets its records.
+              adoptSession(typeof data.parentID === "string" && data.parentID !== "" ? data.parentID : sid);
+            } else if (event.type === "session.step.ended") {
+              if (timings !== undefined) {
+                if (timings.isRootSession(sid)) {
+                  const tokens = typeof data.tokens === "object" && data.tokens !== null ? data.tokens as Record<string, any> : {};
+                  timings.onRootStep(sid, {
+                    input: Number(tokens.input) || 0, cacheRead: Number(tokens.cache?.read) || 0, cacheWrite: Number(tokens.cache?.write) || 0,
+                  }, event.id);
+                } else if (!sessionKinds.has(sid)) {
+                  const recorder = timings; // one lazy lookup per unregistered session (cached by sessionKindOf), not awaited
+                  void sessionKindOf(sid).then((kind) => { if (kind === "root") recorder.markRootSession(sid); });
+                }
+              }
+            } else if (event.type === "session.step.failed" || event.type === "session.retry.scheduled") {
+              const failure: unknown = data.error ?? data;
+              const detail = typeof failure === "object" && failure !== null ? failure as { type?: unknown; status?: unknown } : {};
+              const capacity = classifyCapacity({
+                type: typeof detail.type === "string" ? detail.type : null, status: typeof detail.status === "number" ? detail.status : null,
+              });
+              if (capacity !== null) timings?.onCapacitySignal(sid, capacity, nowMs());
+            } else if (event.type === "session.execution.succeeded" || event.type === "session.execution.failed" || event.type === "session.execution.interrupted") {
+              const outcome = event.type === "session.execution.succeeded" ? "succeeded" : event.type === "session.execution.failed" ? "failed" : "interrupted";
+              const created: unknown = (event as { created?: unknown }).created;
+              const at = created instanceof Date ? created.getTime() : typeof created === "number" ? created : nowMs();
+              // QA-2.1-21: the end handling is background work from its first await on (the timing store writes to disk
+              // before the processor starts): tracked, so the settled seam and `dispose` never miss the processing it starts.
+              const timingDone = timings === undefined ? undefined : timings.onExecutionOutcome(sid, event.id, outcome, at);
+              if (timingDone !== undefined) {
+                const endHandled = Promise.resolve(timingDone).then(() => undefined);
+                trackBackground(endHandled);
+                await endHandled;
+              }
+              leaseGuard?.releaseChild(sid);
+              leaseHandle?.notifyReleased();
+              // QA-2.1-6: an end event adopts the parent's records: the root itself, or (for a child this process has no attempt for)
+              // its parent, looked up once (`sessionOf`) and never awaited here.
+              if (sessionKinds.get(sid) === "root") adoptSession(sid);
+              else if (bgActive() && inflight.byChild(sid) === undefined && !sessionKinds.has(sid)) {
+                // QA-2.1-30: only a session of unknown kind is looked up: a child seen at `session.created` had its parent
+                // adopted there, and a looked-up child is remembered, so later ends never call `sessionOf` again.
+                trackBackground(sessionOf(sid).then((session) => {
+                  const parentID: unknown = session !== null && typeof session === "object" ? Reflect.get(session, "parentID") : undefined;
+                  if (typeof parentID === "string" && parentID !== "") {
+                    noteSessionKind(sid, "child");
+                    adoptSession(parentID);
+                  } else {
+                    adoptSession(sid);
+                  }
+                }));
+              }
+              if (bgActive() && processor !== undefined) {
+                const attempt = inflight.byChild(sid);
+                if (attempt !== undefined) {
+                  // QA-2.1-21: tracked, so `dispose` and the settled seam wait for the completion it starts.
+                  if (attempt.state === "acknowledged") trackBackground(processor.process(sid, { kind: "end-event", outcome, eventID: event.id, at }));
+                  else ingestLogger.warn("[router] background: an end event met an attempt that is not awaiting one", { child: sid, state: attempt.state, outcome });
+                } else if (sessionKinds.get(sid) !== "root") {
+                  // A session whose kind is not yet known may be a child whose acknowledgement is still to come (bounded, TTL).
+                  inflight.noteEarlyEnd(sid, { outcome, eventID: event.id, at });
+                }
+                if (sessionKinds.get(sid) === "root") processor.endTurn(sid);
+              }
+            }
           }
           if (event.type === "session.step.ended" || event.type === "session.step.failed") {
             // Cost and tokens of a registered child dispatch (ingest ignores every other session).
@@ -1881,6 +3267,18 @@ export async function registerV2Hooks(
               lastCallOfChild.delete(data.sessionID);
               hostBudget.forget(data.sessionID);
               effortStore.forget(data.sessionID); // #90 P1.2: a deleted session is no longer answered
+              // Phase 2.1 (memo §4.6): the session's attempts, holds, leases and cached kind go with it.
+              inflight.forgetSession(data.sessionID);
+              processor?.forgetSession(data.sessionID);
+              held.forgetSession(data.sessionID);
+              leaseGuard?.releaseChild(data.sessionID);
+              leaseHandle?.notifyReleased();
+              sessionKinds.delete(data.sessionID);
+              // QA-2.1-11 / QA-2.1-13: the cached directory, the failed kind lookup and the adoption mark go with the session.
+              sessionDirs.delete(data.sessionID);
+              failedKinds.delete(data.sessionID);
+              adoptedSessions.delete(data.sessionID);
+              refusedAdoptions.delete(data.sessionID);
             }
             await ingesting("session.deleted", () => ingest.onSessionGone(data.sessionID));
           } else if (FLUSH_EVENT_TYPES.has(event.type)) {
@@ -1914,6 +3312,7 @@ export async function registerV2Hooks(
     })().catch((error: unknown) => {
       if (!abort.signal.aborted) console.warn("[model-router] OpenCode 2 event subscription failed", error);
     });
+    Object.defineProperty(cleanup, V2_BACKGROUND_SETTLED, { value: settleBackground, enumerable: false });
     return cleanup;
   } catch (error) {
     await cleanup();

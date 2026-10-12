@@ -3,7 +3,7 @@ import type { Context } from "@opencode/plugin/promise/plugin";
 import { Agent } from "@opencode/plugin";
 import type { Hooks } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
-import { registerV2Hooks, v2Instructions } from "../../src/compat/v2-hooks";
+import { registerV2Hooks, resumeTargetsOf, v2Instructions } from "../../src/compat/v2-hooks";
 import ModelRouterPlugin from "../../src/index";
 import { invalidateConfigCache, loadConfig, overridePath } from "../../src/router/config";
 import { getActiveTiers } from "../../src/router/protocol";
@@ -22,6 +22,8 @@ import { V2_GRADER_AGENT } from "../../src/compat/v2-client";
 import { DEPTH_BANNER, TASK_VERIFICATION, type ChildSessionRequest, type RouterPluginInput } from "../../src/compat/child-session";
 import { depthAdvisoryBanner, depthLimitMessage } from "../../src/router/depth-guard";
 import { appendRouterFooter } from "../../src/verify/pending";
+import { createLeaseGuard } from "../../src/compat/background";
+import { createLeaseRegistry } from "../../src/router/leases";
 import { evaluatePermission, READ_ONLY_CANARIES, readOnlyPermissions } from "../../src/router/read-only";
 import type { PermissionEvaluation } from "@opencode/plugin/promise/permission";
 
@@ -35,6 +37,74 @@ afterEach(async () => {
 // The two eviction tests drive the real execute.before 1000+ times (each call reloads the config from disk, ~4 ms): ~4-5 s on an
 // idle machine, so the default 5 s is flaky under load. The 1000 bound is the behaviour under test, so the loop cannot shrink.
 const BOUNDED_LIMIT_TIMEOUT_MS = 30_000;
+
+describe("QA-2.1-20: the sessions a call may resume (reload-failed refusal)", () => {
+  it("a subagent call names them by sessionID and task_id", () => {
+    expect(resumeTargetsOf("subagent", { sessionID: "ses_a", task_id: "ses_b", prompt: "go" }, "parent")).toEqual(["ses_a", "ses_b"]);
+    expect(resumeTargetsOf("subagent", { prompt: "go", sessionID: "" }, "parent")).toEqual([]);
+  });
+
+  it("Code Mode execute code names them by string literals given to sessionID / task_id", () => {
+    const code = [
+      `await tools.subagent({ agent: "general", prompt: "continue", sessionID: "ses_held" });`,
+      `await tools.subagent({ "task_id": 'ses_other', prompt: "more" });`,
+      "const task_id = `ses_third`;",
+      `await tools.subagent({ sessionID: "ses_held", prompt: "again" });`,
+    ].join("\n");
+    expect(resumeTargetsOf("execute", { code }, "parent")).toEqual(["ses_held", "ses_other", "ses_third"]);
+    // A computed template literal is no known session either: it is named as written, so the refusal fails closed on it.
+    expect(resumeTargetsOf("execute", { code: "await tools.subagent({ sessionID: `${previous}`, prompt: \"go\" });" }, "parent")).toEqual(["${previous}"]);
+  });
+
+  it("execute code without a resume, or naming only the caller, resumes nothing; other tools resume nothing", () => {
+    expect(resumeTargetsOf("execute", { code: `await tools.subagent({ agent: "general", prompt: "fresh" });` }, "parent")).toEqual([]);
+    expect(resumeTargetsOf("execute", { code: `await tools.read({ sessionID: "parent", filePath: "a.ts" });` }, "parent")).toEqual([]);
+    expect(resumeTargetsOf("execute", { code: 42 }, "parent")).toEqual([]);
+    expect(resumeTargetsOf("read", { sessionID: "ses_a" }, "parent")).toEqual([]);
+  });
+});
+
+describe("lease guard: glob/grep results as the v2 host delivers them (Phase 2.1 gap 4)", () => {
+  async function fixtureGuard() {
+    const dir = join(tmpdir(), "omr-lease-search");
+    const leased = join(dir, "a.ts");
+    const free = join(dir, "b.ts");
+    const registry = createLeaseRegistry({ realpath: (path) => path, repoKeyOf: () => undefined, now: () => 1 }, { runMode: "annotate" });
+    registry.acquireWrite({ holderID: "holder", tree: dir, isChild: true, scope: "until-complete" }, leased);
+    const guard = createLeaseGuard({
+      registry, sessionKind: async () => "child", sessionDir: async () => dir, gitRootOf: () => undefined,
+      holderLabel: (id) => `session ${id}`, planTaskOf: () => undefined, events: { onRelease: () => () => {} },
+    });
+    await guard.before({ sessionID: "reader", tool: "read", args: { path: free }, callID: "c1" }); // resolves the reader's actor
+    return { guard, leased, free };
+  }
+
+  it("filters a grep result's text parts and its structured matches together, and adds one note", async () => {
+    const { guard, leased, free } = await fixtureGuard();
+    const result = {
+      content: [{ type: "text", text: `${leased}:3:needle\n${free}:5:needle` }],
+      output: [{ entry: { path: leased }, line: 3 }, { entry: { path: free }, line: 5 }],
+    };
+    const searched = guard.afterSearch({ sessionID: "reader", tool: "grep", result });
+    expect(searched?.result).toEqual({
+      content: [{ type: "text", text: `${free}:5:needle` }],
+      output: [{ entry: { path: free }, line: 5 }],
+    });
+    expect(searched?.note).toBe("[router] 1 result(s) omitted: under edit by session holder.");
+    expect(result.output).toHaveLength(2); // the host's object is never mutated
+  });
+
+  it("filters a glob result given as a text string with a list of paths", async () => {
+    const { guard, leased, free } = await fixtureGuard();
+    const searched = guard.afterSearch({ sessionID: "reader", tool: "glob", result: { content: `${leased}\n${free}`, output: [leased, free] } });
+    expect(searched?.result).toEqual({ content: free, output: [free] });
+  });
+
+  it("leaves a result without a leased entry alone", async () => {
+    const { guard, free } = await fixtureGuard();
+    expect(guard.afterSearch({ sessionID: "reader", tool: "glob", result: { content: [{ type: "text", text: free }], output: [free] } })).toBeUndefined();
+  });
+});
 
 function fixture() {
   const registrations: Array<{ dispose: ReturnType<typeof vi.fn> }> = [];
@@ -1113,6 +1183,8 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     const home = mkdtempSync(join(tmpdir(), "router-v2-ingest-"));
     const outcomes = join(home, "outcomes");
     vi.stubEnv("HOME", home); vi.stubEnv("USERPROFILE", home);
+    // QA-2.1-8: the per-user pending journal dir resolves inside this home on every platform, never in the runner's own state dir.
+    vi.stubEnv("XDG_STATE_HOME", join(home, ".local", "state"));
     // QA-2.1-4: every config, the static ones included, names an explicit empty outcomes directory, and the tests
     // assert it stays empty. A routing block without `engine` is static.
     mkdirSync(outcomes, { recursive: true });
@@ -1209,7 +1281,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     await barrier(f, forgetSession, "barrier-2");
     expect(lastStepContext("child-1")).toBe(1100);
     await cleanup();
-    expect(readdirSync(outcomes)).toEqual([]); // memory only: nothing was written
+    expect(readdirSync(outcomes).filter((name) => name !== "pending.jsonl")).toEqual([]); // v2 pending journal (2.1.4) is the one visible file // memory only: nothing was written
     rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 
@@ -1231,7 +1303,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     await barrier(f, forgetSession, "barrier-3");
     expect(lastStepContext("child-1")).toBe(1100);
     await cleanup();
-    expect(readdirSync(outcomes)).toEqual([]);
+    expect(readdirSync(outcomes).filter((name) => name !== "pending.jsonl")).toEqual([]); // v2 pending journal (2.1.4) is the one visible file
     rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });  it("ignores step events of sessions that are not registered children", async () => {
     const { home, outcomes } = routingHome({ engine: "shadow" });
@@ -1242,7 +1314,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     f.emit({ id: "e2", type: "session.step.ended", data: { assistantMessageID: "no-session" } });
     await barrier(f, forgetSession, "barrier");
     await cleanup();
-    expect(readdirSync(outcomes)).toEqual([]);
+    expect(readdirSync(outcomes).filter((name) => name !== "pending.jsonl")).toEqual([]); // v2 pending journal (2.1.4) is the one visible file
     expect(model.list).not.toHaveBeenCalled();
     rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
@@ -1261,7 +1333,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     f.emit({ id: "i1", type: "session.execution.succeeded", data: { sessionID: "child-1" } });
     await barrier(f, forgetSession, "barrier");
     await cleanup();
-    expect(readdirSync(outcomes)).toEqual([]);
+    expect(readdirSync(outcomes).filter((name) => name !== "pending.jsonl")).toEqual([]); // v2 pending journal (2.1.4) is the one visible file
     // tmpdir() is private to this file (QA-2.1-4), but earlier tests of the file leave scorecards in its default directory:
     // what must not appear there is an outcome store or a decision log.
     const defaultDir = join(tmpdir(), DEFAULT_OUTCOMES_DIRNAME);
@@ -1278,7 +1350,7 @@ describe("OpenCode 2 telemetry ingestion (M6, event loop)", () => {
     f.emit(stepEvent("e1", "child-low", { finish: "stop" }));
     await barrier(f, forgetSession, "barrier");
     await cleanup();
-    expect(readdirSync(outcomes)).toEqual([]);
+    expect(readdirSync(outcomes).filter((name) => name !== "pending.jsonl")).toEqual([]); // v2 pending journal (2.1.4) is the one visible file
     rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
   });
 

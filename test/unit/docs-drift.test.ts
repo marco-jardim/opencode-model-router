@@ -6,6 +6,8 @@ import {
   ROUTING_DEFAULTS,
   ROUTING_ENGINES,
   ROUTING_TASK_CLASSES,
+  configuredV2OnlyKeys,
+  resetRoutingWarnings,
   resolveRolesRouting,
   resolveRouting,
   validateConfig,
@@ -557,6 +559,10 @@ describe("docs drift: defaults, ranges, ids and severities (QA-3.1-18)", () => {
       "advisor.enabled": defaults.advisor.enabled,
       "advisor.noticeIntervalHours": defaults.advisor.noticeIntervalHours,
       "advisor.notify": defaults.advisor.notify,
+      "background.mode": defaults.background.mode,
+      "background.minPredictedMs": defaults.background.minPredictedMs,
+      "leases.mode": defaults.leases.mode,
+      "leases.run": defaults.leases.run,
     };
     const wrong: string[] = [];
     for (const [key, value] of Object.entries(expected)) {
@@ -609,6 +615,38 @@ describe("docs drift: defaults, ranges, ids and severities (QA-3.1-18)", () => {
     const half = lo + 0.5;
     expect(accepts(withValue(block, field, half)), `${key} = ${half}`).toBe(!integer);
     expect(cells![1], `${key} type`).toBe(integer ? "`integer`" : "`number`");
+  });
+
+  it("background.* and leases.* are documented as OpenCode v2 only, with the enum values and the range the code accepts (Phase 2.1)", () => {
+    const doc = read("docs/CONFIG_REFERENCE.md");
+    const rows = {
+      "background.mode": ["auto", "model", "off"],
+      "leases.mode": ["enforce", "off"],
+      "leases.run": ["annotate", "refuse"],
+    } as const;
+    for (const [key, values] of Object.entries(rows)) {
+      const cells = keyRow(doc, key);
+      expect(cells, `row ${key}`).toBeDefined();
+      expect(cells![3]!.replace(/[\\`]/g, "").split("|").map((v) => v.trim())).toEqual([...values]);
+      expect(cells![4], `${key} v2 only`).toContain("OpenCode v2 only");
+      // QA-2.1-32: the v1 notice names the configured features (leases alone are not "background dispatch").
+      const notice = key.startsWith("leases.") ? "leases require OpenCode v2" : "background dispatch requires OpenCode v2";
+      expect(cells![4], `${key} v1`).toContain(`v1 ignores it and logs one notice per process (\`${notice}; ignored: <keys>\`) naming every configured key`);
+      expect(cells![4], `${key} v1 both`).toContain("`background dispatch and leases require OpenCode v2; ignored: <keys>`");
+    }
+    const ms = keyRow(doc, "background.minPredictedMs");
+    expect(ms?.[1]).toBe("`integer`");
+    expect(parseRange(ms![3]!)).toEqual({ lo: 0, hi: 3_600_000, loExcluded: false });
+    expect(ms![4]).toContain("OpenCode v2 only");
+    expect(ms![4]).toContain("v1 ignores it and logs one notice per process (`background dispatch requires OpenCode v2; ignored: <keys>`) naming every configured key");
+    // the code takes the documented bounds and falls back to the default outside them
+    const minMs = (v: unknown) => resolveRouting(validateConfig({ ...bundled, routing: { background: { minPredictedMs: v } } }), "v2", { warn: () => {} }).background.minPredictedMs;
+    resetRoutingWarnings();
+    expect([minMs(0), minMs(3_600_000), minMs(3_600_001), minMs(-1), minMs(1.5)]).toEqual([0, 3_600_000, 45_000, 45_000, 45_000]);
+    expect(configuredV2OnlyKeys({ routing: { background: { mode: "off" }, leases: { run: "refuse" } } })).toEqual([
+      "routing.background.mode",
+      "routing.leases.run",
+    ]);
   });
 
   it("the three detection probabilities share the documented [0, 1] range and must not increase with a weaker check", () => {
@@ -1661,6 +1699,162 @@ describe("docs drift: the per-turn router state on OpenCode v2 (Phase 1.2.6)", (
     expect(flatVerification).toMatch(/On OpenCode v1 the notice is a one-time block in the orchestrator's system prompt/);
     expect(flatVerification).toContain("(OPENCODE_V2.md#Per-turn-router-state)");
     expect(anchorsOf(v2Doc).has("per-turn-router-state")).toBe(true);
+  });
+});
+
+describe("docs drift: background-first dispatch, held results, leases and pending persistence on OpenCode v2 (Phase 2.1.7)", () => {
+  const v2Doc = read("docs/OPENCODE_V2.md");
+  const rolesDoc = read("docs/ROLES.md");
+  const verification = read("docs/VERIFICATION.md");
+  const background = sectionOf(v2Doc, "## Background dispatches");
+  const flatBackground = background.replace(/\s+/g, " ");
+  const flatRoles = rolesDoc.replace(/\s+/g, " ");
+  const flatVerification = verification.replace(/\s+/g, " ");
+  const backgroundSource = read("src/compat/background.ts");
+  const hooksSource = read("src/compat/v2-hooks.ts");
+  const configSource = read("src/router/config.ts");
+
+  it("OPENCODE_V2.md documents the background policy, held results, the router state sections, restarts, off and v1", () => {
+    expect(background).not.toBe("");
+    expect(anchorsOf(v2Doc).has("background-dispatches")).toBe(true);
+    expect(flatBackground).toMatch(/`Background dispatches` block/);
+    expect(flatBackground).toMatch(/never poll or sleep/);
+    expect(flatBackground).toMatch(/a held result is not usable until its verdict/);
+    expect(flatBackground).toMatch(/never report a task done while dispatches are listed in flight/);
+    expect(flatBackground).toMatch(/a lease refusal is resolved by waiting for the holder, not by retrying/);
+    // QA-2.1-12: `routing.background.mode: "off"` renders no block at all, the lease rule included.
+    expect(flatBackground).toMatch(/The whole block, the lease rule included, is left out when `routing.background.mode` is `off`; the lease rule alone when `routing.leases.mode` is `off`/);
+    expect(read("src/router/protocol.ts")).toContain('if (routing.background.mode === "off") return "";');
+    expect(flatBackground).toMatch(/The v1 protocol is unchanged/);
+    expect(read("src/router/protocol.ts")).toContain('export const BACKGROUND_DISPATCHES_HEADING = "## Background dispatches";');
+    expect(flatBackground).toContain("`routing.background.mode`");
+    expect(flatBackground).toMatch(/defaults to `auto` and `routing.background.minPredictedMs` to `45000`/);
+    expect(flatBackground).toMatch(/An explicit `background: false` is always honored/);
+    expect(flatBackground).toMatch(/An estimate that is only the built-in prior never selects a call/);
+    expect(flatBackground).toMatch(/1000 attempts are already in flight/);
+    expect(flatBackground).toMatch(/an explicit `background: true` is turned into `background: false`/);
+    expect(flatBackground).toContain('<subagent sessionID="<child>" state="held">held — verdict pending (vrf_…)</subagent>');
+    expect(flatBackground).toContain('<router-verdict handle="vrf_…" sessionID="<child>" verdict="PASS|FAIL|UNVERIFIABLE">');
+    expect(flatBackground).toMatch(/placeholder stays in force for the rest of the session/);
+    expect(flatBackground).toContain(
+      "[router] Refused: session <child> is held for verification (<handle>). Its result arrives with the verdict; resume it after that.",
+    );
+    expect(flatBackground).toMatch(/retried three times with backoff and then stays pending for the next start/);
+    expect(flatBackground).toMatch(/256 per parent session, 10000 in all/);
+    expect(flatBackground).toMatch(/The terminal UI and `session.export` still show the original to the human/);
+    expect(flatBackground).toMatch(/`Completed since your last turn`/);
+    expect(flatBackground).toMatch(/`Held for verification — not usable until the verdict`/);
+    expect(flatBackground).toMatch(/`In flight \(background\)`/);
+    expect(flatBackground).toMatch(/`Do not report the task done while dispatches are listed here\.`/);
+    expect(flatBackground).toMatch(/under `routing.background.mode: "off"` none of the three is rendered/);
+    expect(flatBackground).toContain("`pending.jsonl`");
+    expect(flatBackground).toMatch(/redacts every `<subagent>` element it has not seen processed until a retry succeeds/);
+    expect(flatBackground).toMatch(/reproduces the previous request, system prompt, running-ack text and results byte for byte/);
+    expect(flatBackground).toMatch(/It does not turn off file leases \(`routing.leases.mode`\) or the restart persistence/);
+    expect(flatBackground).toMatch(/OpenCode v1 is unchanged: none of this runs there/);
+    expect(flatBackground).toContain("(VERIFICATION.md#pending-handles-survive-restarts)");
+    expect(flatBackground).toContain("(ROLES.md#file-leases)");
+    expect(longProseLines(background)).toEqual([]);
+  });
+
+  it("the policy, placeholder, verdict, refusal, caps and section headers in the guide are the code's", () => {
+    expect(configSource).toContain('background: Object.freeze({ mode: "auto" as BackgroundMode, minPredictedMs: 45_000 })');
+    expect(configSource).toContain('leases: Object.freeze({ mode: "enforce" as LeasesMode, run: "annotate" as LeasesRunPolicy })');
+    expect(backgroundSource).toContain("export const MAX_LIVE_ATTEMPTS = 1000;");
+    expect(backgroundSource).toContain("export const MAX_HOLDS_PER_PARENT = 256;");
+    expect(backgroundSource).toContain("export const MAX_HOLDS_GLOBAL = 10_000;");
+    expect(backgroundSource).toContain("const SYNTHETIC_ATTEMPTS = 3;");
+    expect(backgroundSource).toContain('<subagent sessionID="${child}" state="held">held — verdict pending (${handle})</subagent>');
+    expect(backgroundSource).toContain('<router-verdict handle="${handle}" sessionID="${child}" verdict="${v.verdict}">');
+    expect(backgroundSource).toContain(
+      "[router] Refused: session ${child} is held for verification (${handle}). Its result arrives with the verdict; resume it after that.",
+    );
+    expect(backgroundSource).toContain("[router] Completed since your last turn:");
+    expect(backgroundSource).toContain("[router] Held for verification — not usable until the verdict:");
+    expect(backgroundSource).toContain("[router] In flight (background): ${live.length}");
+    expect(backgroundSource).toContain("Do not report the task done while dispatches are listed here.");
+    expect(backgroundSource).toContain("export const PENDING_GUARANTEES_TEXT = \"router guarantees pending\";");
+  });
+
+  it("ROLES.md documents the background rules and the file leases, with the router's refusal texts", () => {
+    expect(anchorsOf(rolesDoc).has("background-dispatches")).toBe(true);
+    expect(anchorsOf(rolesDoc).has("file-leases")).toBe(true);
+    expect(flatRoles).toContain("(#background-dispatches)");
+    expect(flatRoles).toContain("(#file-leases)");
+    expect(flatRoles).toMatch(/the roles protocol carries a `Background dispatches` block, the same one the tiers protocol gets/);
+    expect(flatRoles).toMatch(/never poll or sleep/);
+    expect(flatRoles).toMatch(/resolve a lease refusal by waiting for the holder, not by retrying/);
+    expect(flatRoles).toContain("(OPENCODE_V2.md#background-dispatches)");
+    expect(flatRoles).toMatch(/gets no `background` key, so the host default applies/);
+    expect(flatRoles).toMatch(/every child session \(a role dispatch or a tier dispatch\) takes a lease on the files it writes, for as long as it runs/);
+    expect(flatRoles).toMatch(/Root orchestrator sessions take none: a root write is refused only while a child holds that file/);
+    expect(flatRoles).toMatch(/`routing.leases.mode` \(`enforce`, the default, or `off`\)/);
+    expect(flatRoles).toMatch(/`routing.leases.run` \(`annotate`, the default, or `refuse`\)/);
+    expect(flatRoles).toMatch(/Do not retry: the lease ends when that session ends\./);
+    expect(flatRoles).toMatch(/\[router\] <n> result\(s\) omitted: under edit by <holders>\./);
+    expect(flatRoles).toMatch(/result may be contaminated/);
+    expect(flatRoles).toMatch(/the six-hour sweep/);
+    expect(flatRoles).toMatch(/treated as a root, which never blocks the orchestrator and never overrides a child's lease/);
+    expect(flatRoles).toMatch(/`routing.background` and `routing.leases` are likewise OpenCode v2 only/);
+    const leasesSection = sectionOf(rolesDoc, "## File leases").replace(/\s+/g, " ");
+    for (const fragment of [
+      "Finish without that file, or return `NEED MORE: lease <path>`. Do not retry: the lease ends when that session ends.",
+      "Finish without it, or return `NEED MORE: lease <path>`.",
+      "Pass the file path explicitly, or return `NEED MORE: lease <tree>`.",
+      "Wait for that session to end.",
+    ]) {
+      expect(leasesSection, fragment).toContain(fragment);
+      expect(backgroundSource, fragment).toContain(fragment.replaceAll("`", "\\`").replace("<path>", "${r.path}").replace("<tree>", "${holder.tree}"));
+    }
+    expect(backgroundSource).toContain("result(s) omitted: under edit by");
+    expect(hooksSource).toContain("result(s) omitted: under edit by");
+    expect(read("src/router/leases.ts")).toContain("result may be contaminated");
+  });
+
+  it("VERIFICATION.md documents required verification in the background and the persisted pending handles", () => {
+    expect(anchorsOf(verification).has("required-verification-in-the-background")).toBe(true);
+    expect(anchorsOf(verification).has("pending-handles-survive-restarts")).toBe(true);
+    expect(flatVerification).toMatch(/a `VERIFY:required` delegation can run in the background/);
+    expect(flatVerification).toMatch(/keeps the guarantee of the required path at the time the child finishes, not at the time of dispatch/);
+    expect(flatVerification).toContain(
+      "[router] Running in the background (<child>). Its result is held until verification finishes.",
+    );
+    expect(flatVerification).toContain("Its result will arrive unverified; the verdict follows in the router state.");
+    expect(flatVerification).toMatch(/runs the same required gate as a foreground call/);
+    expect(flatVerification).toMatch(/gets an `UNVERIFIABLE` verdict with the child's text and `\[router\] not verified: <reason>`/);
+    expect(flatVerification).toMatch(/waits for those file leases to end, up to its deadline, then runs with the usual caveat/);
+    expect(flatVerification).toMatch(/With `routing.background.mode: "off"` none of this happens/);
+    expect(flatVerification).toMatch(/On OpenCode v2 they are also written to disk and survive a restart/);
+    expect(flatVerification).toContain("`pending.jsonl`");
+    expect(flatVerification).toContain("`routing.outcomes.path`");
+    // QA-2.1-8: the documented location is the one `resolvePendingJournalDir` returns.
+    expect(flatVerification).toContain("`$XDG_STATE_HOME/opencode-model-router` when that variable is an absolute path (not on Windows), else `~/.local/state/opencode-model-router`");
+    expect(flatVerification).toMatch(/append-only, one JSON object per line with `"v": 1`/);
+    expect(flatVerification).toMatch(/`inflight` and hold records are fsynced before the router acknowledges the dispatch/);
+    expect(flatVerification).toMatch(/A torn or invalid line, and a line of an unknown version, is skipped/);
+    expect(flatVerification).toMatch(/A held entry past that age becomes `UNVERIFIABLE`/);
+    expect(flatVerification).toMatch(/Hold records have no TTL/);
+    expect(flatVerification).toMatch(/stays dormant until the process sees its parent session/);
+    expect(flatVerification).toContain("`pending.claims`");
+    expect(flatVerification).toContain("`the dispatch was lost in a restart`");
+    expect(flatVerification).toContain("`not verified: lost in restart`");
+    expect(flatVerification).toMatch(/OpenCode v1 keeps its in-memory behavior and writes no `pending.jsonl`/);
+    expect(flatVerification).toContain("(#pending-handles-survive-restarts)");
+    expect(flatVerification).toContain("(OPENCODE_V2.md#background-dispatches)");
+  });
+
+  it("the persistence in the guide is the code's: file name, claims directory, fsync rule, lost-in-restart text, running acks", () => {
+    const index = read("src/index.ts");
+    expect(index).toContain('join(pendingDir, "pending.jsonl")');
+    expect(index).toContain('join(pendingDir, "pending.claims")');
+    expect(index).toContain('record.kind === "inflight" || record.kind === "hold"');
+    // QA-2.1-8: the journal lives in the durable per-user state directory, not next to the outcome store.
+    expect(index).toContain("resolvePendingJournalDir({ homedir: homedir(), platform: process.platform, xdgStateHome: process.env.XDG_STATE_HOME })");
+    expect(backgroundSource).toContain("[router] the dispatch was lost in a restart");
+    expect(backgroundSource).toContain("[router] not verified: lost in restart");
+    expect(hooksSource).toContain("Its result is held until verification finishes.");
+    expect(hooksSource).toContain("Its result will arrive unverified; the verdict follows in the router state.");
+    expect(hooksSource).toContain("Router guarantees apply when it completes.");
   });
 });
 

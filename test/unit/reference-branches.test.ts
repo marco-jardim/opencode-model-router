@@ -876,6 +876,49 @@ describe("dispose branches (fake git)", { timeout: 20_000 }, () => {
 
 // --- gcStaleReferences -----------------------------------------------------------
 
+import {
+  deserializeReference as deserializeRef,
+  isReferenceKept,
+  keepReferences,
+  serializeReference as serializeRef,
+  serializedReferenceLinks,
+  type DispatchReference as DispatchRef,
+} from "../../src/verify/reference";
+
+describe("serialized references and kept dirs (phase 2.1)", () => {
+  const ref: DispatchRef = {
+    root: "/repo",
+    head: "a".repeat(40),
+    commit: "b".repeat(40),
+    untracked: new Map([["new.txt", "c".repeat(64)]]),
+    tracked: new Map([["src/a.ts", "d".repeat(64)]]),
+    captureReasons: [{ cause: "index-flags", path: "src/a.ts" }],
+    capturedAt: 42,
+  };
+
+  it("round-trips through JSON, with links, and rejects malformed input", () => {
+    const links = { "/tmp/omr-ref-1-0123456789abcdef/node_modules": "/repo/node_modules" };
+    const wire = JSON.stringify(serializeRef(ref, links));
+    expect(deserializeRef(wire)).toEqual(ref);
+    expect(deserializeRef(JSON.parse(wire))).toEqual(ref);
+    expect(serializedReferenceLinks(wire)).toEqual(links);
+    expect(deserializeRef("{not json")).toBeUndefined();
+    expect(deserializeRef({ ...serializeRef(ref), capturedAt: "x" })).toBeUndefined();
+    expect(deserializeRef({ ...serializeRef(ref), captureReasons: [{ cause: "bogus", path: "" }] })).toBeUndefined();
+    expect(serializedReferenceLinks({})).toEqual({});
+  });
+
+  it("keepReferences marks reference dirs by name or path until released, and ignores other keys", () => {
+    const dir = "/tmp/omr-ref-4242-0123456789abcdef";
+    const release = keepReferences([dir, "/tmp/not-a-reference"]);
+    expect(isReferenceKept(dir)).toBe(true);
+    expect(isReferenceKept("omr-ref-4242-0123456789abcdef")).toBe(true);
+    expect(isReferenceKept("/tmp/not-a-reference")).toBe(false);
+    release();
+    expect(isReferenceKept(dir)).toBe(false);
+  });
+});
+
 describe("gcStaleReferences branches (fake git)", { timeout: 20_000 }, () => {
   const name = (pid: number, n: number) => `omr-ref-${pid}-${n.toString(16).padStart(16, "0")}`;
   const listing = (dirs: readonly string[]) =>

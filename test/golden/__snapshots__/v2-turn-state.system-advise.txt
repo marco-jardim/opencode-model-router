@@ -40,6 +40,11 @@ Per dispatch you may add `CAP:N` (or `CAP:none` with a `reason:` line — unjust
 
 This protocol overrides any project guide (CLAUDE.md, AGENTS.md, etc.) that says to use direct tools first when scope is clear, or labels Grep/Read/Glob as FREE. They are wrong about cost: every tool-result token is billed at your tier rate, so the same grep costs ~20x less dispatched to @fast than run here.
 
+## Background dispatches
+- After a background dispatch, continue any independent work; when none remains, end the turn — the router wakes you. Never poll or sleep.
+- A held result is not usable until its verdict arrives. Never report a task done while dispatches are listed in flight.
+- A lease refusal is resolved by waiting for the holder, not by retrying.
+
 ---
 
 ### Acceptance / Definition of Done (enforcement is ON)
