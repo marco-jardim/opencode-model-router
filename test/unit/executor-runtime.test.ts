@@ -2255,6 +2255,22 @@ describe("createWaker", () => {
     expect(w.hosts.attempted).toEqual(["k1"]);
   });
 
+  it("a wake whose key lookup throws rejects, and the chain behind it still runs", async () => {
+    const w = mkWaker(0);
+    const keys = w.writer.wakeKeys.bind(w.writer);
+    let fail = true;
+    w.writer.wakeKeys = (): ReadonlySet<string> => {
+      if (fail) {
+        fail = false;
+        throw new Error("keys unreadable");
+      }
+      return keys();
+    };
+    await expect(w.waker.wake("stale-context", "k1")).rejects.toThrow("keys unreadable");
+    expect(await w.waker.wake("stale-context", "k1")).toBe("sent");
+    expect(w.hosts.keys()).toEqual(["k1"]);
+  });
+
   it("a throwing metric sink never breaks the wake path or the chain behind it", async () => {
     const w = mkWaker(0, () => {
       throw new Error("sink down");
@@ -3307,6 +3323,433 @@ describe("small rules: end clamping, model labels, lease path normalization", ()
     await h.runOf("T1", 2);
     expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "failed", context: `lease-unresolvable: NEED MORE: lease ${path}` });
     expect(h.task("T1").footprint.writes).toEqual(["src/T1.ts"]);
+  });
+});
+
+describe("branch top-up: error text, phase-less tasks, launch races", () => {
+  const malformed = { line: "task: do it", role: "implementer", tier: "fast", pin: false } as const;
+
+  it("a thrown string is logged as that text", async () => {
+    const h = await mk(planOf([task("T1")]));
+    h.registry.acquireWrite = () => {
+      throw "registry offline";
+    };
+    await h.begin();
+    await until(() => h.logs.some((l) => l.startsWith("error: launch step failed")), "launch step failure logged");
+    expect(h.logs.find((l) => l.startsWith("error: launch step failed"))).toBe('error: launch step failed "registry offline"');
+    expect(h.state("T1")).toBe("ready");
+  });
+
+  it("a thrown non-Error object is logged as its JSON", async () => {
+    const h = await mk(planOf([task("T1", { footprint: { writes: [], reads: [], confidence: "explicit", sources: ["path"] } })]));
+    h.git.dirty = () => false;
+    h.slots.release = async () => {
+      throw { reason: "pool busy" };
+    };
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    run.complete("Nothing to change.");
+    await until(() => h.logs.some((l) => l.startsWith("warn: slot release failed")), "slot release warning");
+    expect(h.logs.find((l) => l.startsWith("warn: slot release failed"))).toBe(`warn: slot release failed ${JSON.stringify(JSON.stringify({ reason: "pool busy" }))}`);
+    expect(h.state("T1")).toBe("done");
+  });
+
+  it("a task outside any phase is never fed to the breaker: its counted failure is not recorded with the policy", async () => {
+    const h = await mk(planOf([task("T1", { phase: null })]));
+    h.verifier.queue.push({ verdict: "fail", findings: "lint failed" });
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    run.complete("Done.");
+    const second = await h.runOf("T1", 2);
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "succeeded", verdict: "fail", context: "lint failed" });
+    expect(h.parts().policy.counted).toEqual([]);
+    expect(second.req.prompt).toContain("lint failed");
+  });
+
+  it("a task that leaves ready while its slot is being reset is not launched (step 4 re-check) and the step frees what it took", async () => {
+    const h = await mk(planOf([task("T1")]));
+    let moved: Promise<unknown> | null = null;
+    h.slots.onAcquire = () => {
+      h.slots.onAcquire = null;
+      moved = h.parts().writer.append([tr("T1", "ready", "blocked", "dep-reverted")]);
+    };
+    const reset = h.slots.reset.bind(h.slots);
+    h.slots.reset = async (slot: string, commit: string): Promise<void> => {
+      if (moved !== null) await moved;
+      await reset(slot, commit);
+    };
+    await h.begin();
+    await until(() => h.slots.released.length === 1, "slot released by the abandoned step");
+    expect(h.state("T1")).toBe("blocked");
+    expect(h.task("T1").attempts).toEqual([]);
+    expect(h.launcher.runs).toHaveLength(0);
+    expect(h.registry.heldBy("plan-one:T1")).toEqual([]);
+  });
+
+  it("a task that leaves ready while the prompt is prepared makes row 4 write nothing; the step frees what it took", async () => {
+    const h = await mk(planOf([task("T1")]));
+    const run = h.git.run.bind(h.git);
+    let once = true;
+    h.git.run = async (args: readonly string[], o: ProcOpts): Promise<ProcessResult> => {
+      if (once && args[0] === "worktree") {
+        once = false;
+        await h.parts().writer.append([tr("T1", "ready", "blocked", "dep-reverted")]);
+      }
+      return run(args, o);
+    };
+    await h.begin();
+    await until(() => h.slots.released.length === 1, "slot released by the abandoned step");
+    expect(h.state("T1")).toBe("blocked");
+    expect(h.task("T1").attempts).toEqual([]);
+    expect(h.launcher.runs).toHaveLength(0);
+  });
+
+  it("row 4b with the launch gate closed meanwhile journals the failed attempt without a call id", async () => {
+    const h = await mk(planOf([task("T1", { route: malformed })], { config: { maxAttempts: 1 } }));
+    h.slots.onAcquire = () => {
+      h.slots.onAcquire = null;
+      h.launcher.gateValue = staleGate("stale-context:boot:1");
+    };
+    await h.begin();
+    await until(() => h.state("T1") === "parked", "T1 parked");
+    expect(h.task("T1").attempts[0]).toMatchObject({ n: 1, outcome: "failed", callID: null });
+    expect(h.launcher.runs).toHaveLength(0);
+  });
+
+  it("row 4b writes nothing when the task left ready during the prep: no attempt, nothing counted or parked", async () => {
+    const h = await mk(planOf([task("T1", { route: malformed })], { config: { maxAttempts: 1 } }));
+    const run = h.git.run.bind(h.git);
+    let once = true;
+    h.git.run = async (args: readonly string[], o: ProcOpts): Promise<ProcessResult> => {
+      if (once && args[0] === "worktree") {
+        once = false;
+        await h.parts().writer.append([tr("T1", "ready", "blocked", "dep-reverted")]);
+      }
+      return run(args, o);
+    };
+    await h.begin();
+    await until(async () => (await h.counters()).some((c) => c.key === "launch-failed" && c.labels.row === "L1"), "launch-failed L1");
+    expect(h.state("T1")).toBe("blocked");
+    expect(h.task("T1").attempts).toEqual([]);
+    expect(h.parts().policy.counted).toEqual([]);
+    expect(h.parts().policy.parks).toEqual([]);
+  });
+});
+
+describe("branch top-up: late children, ends, streaks, lease footprints", () => {
+  it("the late-child hook refuses while the attempt is still open, and after the runtime is disposed", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.runOf("T1", 1);
+    expect(await run.hooks.onLateChild("ses-early")).toBe("refuse"); // nothing was lost yet
+    h.launcher.gateValue = staleGate("stale-context:boot:1");
+    run.confirm({ kind: "unconfirmed", reason: "timeout", error: null });
+    await until(() => h.state("T1") === "ready", "T1 back to ready");
+    expect(await run.hooks.onLateChild("ses-late")).toBe("adopt");
+
+    await h.runtime.dispose();
+    expect(await run.hooks.onLateChild("ses-late")).toBe("refuse");
+    await expect(run.hooks.onChildCreated("ses-late")).rejects.toThrow();
+    expect(h.state("T1")).toBe("ready");
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "lost", childSessionID: null });
+  });
+
+  it("adopting a late qa child re-opens the qa gate (G1) with the adoption, and the report then finishes the task", async () => {
+    const qa = task("Q1", { kind: "qa", verify: "none", footprint: { writes: [], reads: [], confidence: "explicit", sources: ["path"] } });
+    const h = await mk(planOf([qa], { gate: "awaiting-qa" }));
+    await h.begin();
+    const run = await h.runOf("Q1", 1);
+    h.launcher.gateValue = staleGate("stale-context:boot:1");
+    run.confirm({ kind: "unconfirmed", reason: "timeout", error: null });
+    await until(() => h.state("Q1") === "ready", "Q1 back to ready");
+    expect(h.ledger().phases[0]?.gate).toBe("awaiting-qa");
+
+    expect(await run.hooks.onLateChild("ses-late")).toBe("adopt");
+    await run.hooks.onChildCreated("ses-late");
+    expect(h.state("Q1")).toBe("running");
+    expect(h.ledger().phases[0]?.gate).toBe("qa-running");
+    run.complete(QA_OK_TEXT);
+    await until(() => h.parts().qa.results.length === 1, "QaLoop.onQaResult");
+    expect(h.state("Q1")).toBe("done");
+  });
+
+  it("a 'failed' end of a launch whose child was never journaled is left to the confirmation", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.runOf("T1", 1);
+    run.end({ kind: "failed", childSessionID: "ses-ghost", error: { type: "provider.internal", status: 500, message: "boom" }, endedAt: h.clock.iso() });
+    await pause(30);
+    expect(h.state("T1")).toBe("dispatched");
+    expect(h.task("T1").attempts[0]?.outcome).toBeNull();
+    expect(h.parts().policy.counted).toEqual([]);
+  });
+
+  it("a third lost attempt while the plan is already paused raises nothing and keeps the plan paused", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    for (let n = 1; n <= 2; n++) {
+      const run = await h.running("T1", n, `ses-c${n}`);
+      run.end({ kind: "lost", childSessionID: `ses-c${n}`, reason: "unrequested-interrupt", endedAt: h.clock.iso() });
+      await h.runOf("T1", n + 1);
+    }
+    const third = await h.running("T1", 3, "ses-c3");
+    await h.runtime.pause(PLAN_ID, ORCH);
+    third.end({ kind: "lost", childSessionID: "ses-c3", reason: "unrequested-interrupt", endedAt: h.clock.iso() });
+    await until(() => h.state("T1") === "ready", "T1 back to ready");
+    await pause(30);
+    expect(h.ledger().status).toBe("paused");
+    expect(h.parts().policy.raised).toEqual([]);
+    expect(h.task("T1").attempts.map((a) => a.outcome)).toEqual(["lost", "lost", "lost"]);
+    expect((await h.counters()).some((c) => c.key === "lost-streak-pause")).toBe(false);
+  });
+
+  it("a lease request for a path the task already declares keeps the footprint and marks it learned only once", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const first = await h.running("T1", 1, "ses-c1");
+    h.registry.held.clear(); // the declared path is free again
+    first.complete("NEED MORE: lease src/T1.ts");
+    const second = await h.running("T1", 2, "ses-c2");
+    expect(h.task("T1").footprint.writes).toEqual(["src/T1.ts"]);
+    expect(h.task("T1").footprint.sources).toEqual(["path", "learned"]);
+
+    second.complete("NEED MORE: lease src/extra.ts");
+    await h.runOf("T1", 3);
+    expect(h.task("T1").footprint.writes).toEqual(["src/T1.ts", "src/extra.ts"]);
+    expect(h.task("T1").footprint.sources).toEqual(["path", "learned"]);
+  });
+});
+
+describe("branch top-up: verification racing an abort", () => {
+  /** Holds the verifier until `release` is called. */
+  const holdVerifier = (h: Harness): { release(): void } => {
+    const gate = deferred<void>();
+    const verify = h.verifier.verify.bind(h.verifier);
+    h.verifier.verify = async (t, slot, a) => {
+      await gate.promise;
+      return verify(t, slot, a);
+    };
+    return { release: () => gate.resolve() };
+  };
+
+  it("a pass verdict that lands while abort waits for the queue is journaled but not enqueued (latch)", async () => {
+    const h = await mk(planOf([task("T1")]));
+    const held = holdVerifier(h);
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    run.complete("Done.");
+    await until(() => h.state("T1") === "verifying", "T1 verifying");
+
+    const queueAbort = deferred<void>();
+    let abortCalled = false;
+    h.parts().queue.abort = async () => {
+      abortCalled = true;
+      await queueAbort.promise;
+    };
+    const aborting = h.runtime.abort(PLAN_ID, ORCH);
+    await until(() => abortCalled, "queue.abort called");
+    held.release();
+    await until(() => h.state("T1") === "verified", "T1 verified");
+    await until(() => h.parts().policy.counted.length === 1, "attempt counted");
+    await pause(20);
+    expect(h.parts().queue.enqueued).toEqual([]);
+
+    queueAbort.resolve();
+    await aborting;
+    expect(h.state("T1")).toBe("cancelled");
+    expect(h.parts().queue.enqueued).toEqual([]);
+  });
+
+  it.each([
+    ["with changes", true],
+    ["without changes", false],
+  ] as const)("an abort during the commit step (%s) leaves the cancelled task alone: no verifying, no done", async (_name, dirty) => {
+    const noWrites: TaskNode["footprint"] = { writes: [], reads: [], confidence: "explicit", sources: ["path"] };
+    const h = await mk(planOf([dirty ? task("T1") : task("T1", { footprint: noWrites })]));
+    h.git.dirty = () => dirty;
+    const run = h.git.run.bind(h.git);
+    let once = true;
+    h.git.run = async (args: readonly string[], o: ProcOpts): Promise<ProcessResult> => {
+      if (once && args[0] === "status") {
+        once = false;
+        await h.runtime.abort(PLAN_ID, ORCH);
+      }
+      return run(args, o);
+    };
+    await h.begin();
+    const child = await h.running("T1", 1, "ses-c1");
+    child.complete("Done.");
+    await until(() => h.state("T1") === "cancelled", "T1 cancelled");
+    await pause(30);
+    expect(h.state("T1")).toBe("cancelled");
+    expect(h.verifier.calls).toEqual([]);
+    expect(h.parts().queue.enqueued).toEqual([]);
+    expect(h.git.calls.some((c) => c.args[0] === "commit")).toBe(dirty);
+    const ev = await h.events();
+    expect(ev.some((e) => e.type === "task-transition" && (e.to === "verifying" || e.to === "done"))).toBe(false);
+  });
+
+  it.each(["pass", "fail"] as const)("a %s verdict that arrives after abort cancelled the task writes nothing", async (verdict) => {
+    const h = await mk(planOf([task("T1")]));
+    const held = holdVerifier(h);
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    run.complete("Done.");
+    await until(() => h.state("T1") === "verifying", "T1 verifying");
+    await h.runtime.abort(PLAN_ID, ORCH);
+    expect(h.state("T1")).toBe("cancelled");
+
+    h.verifier.queue.push({ verdict, findings: "late findings" });
+    held.release();
+    await until(() => h.verifier.calls.length === 1, "verifier answered");
+    await pause(30);
+    expect(h.state("T1")).toBe("cancelled");
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "succeeded", verdict: null, context: "" });
+    expect(h.parts().policy.counted).toEqual([]);
+    expect(h.parts().queue.enqueued).toEqual([]);
+  });
+});
+
+describe("branch top-up: board, manual kinds, abort leftovers, restart, host feeds", () => {
+  const noWrites = { writes: [], reads: [], confidence: "explicit", sources: ["path"] } as const;
+  const manualOnly = (id: TaskId, kind: "manual" | "preflight" = "manual"): TaskNode =>
+    task(id, { kind, verify: "none", footprint: { ...noWrites, writes: [], reads: [], sources: ["path"] } });
+
+  it("the manual-ready state key counts the task's incoming edges", async () => {
+    const h = await mk(planOf([task("T1", { state: "done" }), manualOnly("M1")], { edges: [edge("T1", "M1")] }));
+    await h.begin();
+    await until(() => h.hosts.delivered.length === 1, "manual-ready wake");
+    expect(h.hosts.keys()).toEqual(["manual-ready:M1:1"]);
+  });
+
+  it("a ready preflight task is waited on like a manual one and can be reported done", async () => {
+    const h = await mk(planOf([manualOnly("P1", "preflight")]));
+    await h.begin();
+    await until(() => h.runtime.manualReady(ORCH).length === 1, "P1 ready");
+    expect(h.runtime.manualReady(ORCH)).toEqual([{ taskId: "P1", kind: "preflight" }]);
+    expect(await h.runtime.status(PLAN_ID, ORCH)).toContain("  P1 manual (preflight) - waiting for router_plan action=done");
+    await h.runtime.done(PLAN_ID, "P1", ORCH);
+    expect(h.state("P1")).toBe("done");
+  });
+
+  it("ready() of an attached plan lists the launchable tasks the closed gate holds back", async () => {
+    const h = await mk(planOf([task("T1")]));
+    h.launcher.gateValue = staleGate("stale-context:boot:1");
+    await h.begin();
+    await until(() => h.hosts.delivered.length === 1, "stale-context wake");
+    expect(await h.runtime.ready(PLAN_ID)).toEqual({ launchable: ["T1"], manual: [] });
+  });
+
+  it("the board marks a paused phase", async () => {
+    const draft = planOf([task("T1")]);
+    need(draft.phases[0], "phase").paused = true;
+    const h = await mk(draft);
+    await h.begin();
+    await until(() => h.hosts.keys().includes("phase-paused:p1:none"), "phase-paused wake");
+    expect(await h.runtime.status(PLAN_ID, ORCH)).toContain("Phase p1: gate pending PAUSED - Phase 1");
+  });
+
+  it("abort leaves done tasks done and cancels the rest", async () => {
+    const h = await mk(planOf([task("T1", { state: "done" }), manualOnly("M1")]));
+    await h.begin();
+    await h.runtime.abort(PLAN_ID, ORCH);
+    expect(h.state("T1")).toBe("done");
+    expect(h.state("M1")).toBe("cancelled");
+    const cancels = (await h.events()).filter((e) => e.type === "task-transition" && e.trigger === "abort");
+    expect(cancels.map((e) => (e.type === "task-transition" ? e.taskId : ""))).toEqual(["M1"]);
+  });
+
+  it("Q results for an unknown task change nothing", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.runOf("T1", 1);
+    h.parts().listener.onFailed("T-missing");
+    h.parts().listener.onConflict("T-missing");
+    await pause(30);
+    expect(h.parts().policy.counted).toEqual([]);
+    expect(h.slots.resets.map((r) => r.slot)).toEqual(["slot-1"]); // only the launch's own reset
+    expect(h.logs.filter((l) => l.startsWith("error:"))).toEqual([]);
+    expect(h.state("T1")).toBe("dispatched");
+  });
+
+  it("after approval the plan's capacity controller journals its metrics", async () => {
+    const draft = planOf([manualOnly("M1")]);
+    draft.status = "awaiting-approval";
+    const h = await mk(draft);
+    await h.begin();
+    await h.runtime.approve(PLAN_ID, ORCH);
+    const at = h.clock.iso();
+    h.runtime.onHostEvent({ type: "step.started", sessionID: "ses-x", providerID: PROVIDER, modelID: "model-1", at });
+    h.runtime.onHostEvent({ type: "step.failed", sessionID: "ses-x", error: ERR_RATE_LIMIT, at });
+    await until(async () => (await h.metrics()).some((m) => m.name === "capacity" && m.change === "decrease"), "capacity decrease metric");
+    expect((await h.metrics()).filter((m) => m.name === "capacity")).toHaveLength(1);
+  });
+
+  it("after a restart abort does not cancel a launch this runtime never made; the task is cancelled and its slot freed", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.restart();
+    await h.runtime.abort(PLAN_ID, ORCH);
+    expect(h.state("T1")).toBe("cancelled");
+    expect(h.task("T1").slot).toBeNull();
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "interrupted" });
+    expect(h.slots.released).toEqual(["slot-1"]);
+    expect(h.log.some((l) => l.startsWith("launcher.cancel"))).toBe(false);
+  });
+
+  it("a slot record that is gone at restart rebuilds the task without a tree: no lease re-taken, nothing raised", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    h.slots.records.clear();
+    await h.restart();
+    expect(h.registry.heldBy("plan-one:T1")).toEqual([]);
+    expect(h.parts().policy.raised).toEqual([]);
+    await h.runtime.onChildEnd("T1", 1, { kind: "completed", childSessionID: "ses-c1", text: "Done.", endedAt: h.clock.iso() });
+    await h.runOf("T1", 2);
+    expect(h.task("T1").attempts[0]?.context).toBe("slot record missing");
+  });
+
+  it("an interrupted orchestrator opens the idle-with-ready window; a failed step of it does not", async () => {
+    const h = await mk(planOf([task("T1")]));
+    h.launcher.gateValue = staleGate("stale-context:boot:1");
+    await h.begin();
+    await until(() => h.hosts.delivered.length === 1, "stale-context wake");
+    h.runtime.onHostEvent({ type: "step.failed", sessionID: ORCH, error: { type: "provider.internal", status: 500, message: "x" }, at: h.clock.iso() });
+    await h.settled();
+    h.clock.advance(1000);
+    h.runtime.onHostEvent({ type: "execution.interrupted", sessionID: ORCH, at: h.clock.iso() });
+    await h.settled();
+    h.clock.advance(3000);
+    h.launcher.gateValue = OK_GATE;
+    h.runtime.onRouterToolCall(ORCH);
+    await h.runOf("T1", 1);
+    await until(async () => (await h.metrics()).some((m) => m.name === "idle-with-ready"), "idle-with-ready metric");
+    const idle = need((await h.metrics()).find((m) => m.name === "idle-with-ready"), "idle metric");
+    expect(idle).toMatchObject({ ms: 3000, readyTaskIds: ["T1"] });
+  });
+
+  it("while dispose waits for the launcher, host feeds skip the plan: a plan child's retry is not stopped and nothing is journaled", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    h.runtime.onHostEvent({ type: "step.started", sessionID: "ses-c1", providerID: PROVIDER, modelID: "model-1", at: h.clock.iso() });
+    expect(h.runtime.onRetryHook({ sessionID: "ses-c1", stepKey: "s1", error: ERR_RATE_LIMIT })).toEqual({ stop: false });
+
+    const launcherDisposed = deferred<void>();
+    h.launcher.dispose = async () => {
+      await launcherDisposed.promise;
+    };
+    const disposing = h.runtime.dispose();
+    h.clock.advance(11_000); // past the cooldown: an attached plan would stop this retry now
+    expect(h.runtime.onRetryHook({ sessionID: "ses-c1", stepKey: "s1", error: ERR_RATE_LIMIT })).toEqual({ stop: false });
+    h.runtime.onHostEvent({ type: "step.failed", sessionID: "ses-c1", error: ERR_RATE_LIMIT, at: h.clock.iso() });
+    launcherDisposed.resolve();
+    await disposing;
+
+    const capacity = (await h.metrics()).filter((m) => m.name === "capacity");
+    expect(capacity.map((m) => (m.name === "capacity" ? m.change : ""))).toEqual(["decrease"]);
   });
 });
 
