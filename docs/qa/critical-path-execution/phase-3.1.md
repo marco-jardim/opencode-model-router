@@ -541,3 +541,14 @@ Tests:
 6. QA.
 
 Inside 3.1.6, build in this order: lifecycle rows → launch step → liveness → metrics → the thin interface methods.
+
+## WIP notes (2026-10-12, interrupted by DF-1.1-3)
+
+Commit `7f375f3` holds untested partial work: `schedule.ts` + `executor-schedule.test.ts` (implementer ended by a host
+error), `capacity.ts` complete per M14-M18/M20 with a placeholder test only, `expand.ts` partial. Decisions the capacity
+implementer took (confirm in the next session, then write the memo §8 tests): inbox severity `info`; inbox `taskId`
+always `null` (the runtime fills the plan child's task); a signal at the floor (limit 1) still renews the hold and emits
+a `decrease` 1→1 metric so restore sees it, returning `decreased: false`; metric `until` = hold end for a decrease,
+pause end for a pause, `null` otherwise (`capacityRestoreFromEvents` relies on it); `capacityView` reads used counts via
+a module-level WeakMap and answers `canAcquire ? 1 : 0` for foreign controllers; `onMetric` errors propagate (metrics
+are emitted after the state change).
