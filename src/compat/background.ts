@@ -332,7 +332,14 @@ export type AttemptState =
 export interface CallRecord {
   callID: string;
   parentSessionID: string;
+  /** The DISPATCHED agent (`output.args.agent`). */
   agent: string;
+  /**
+   * DF-1.1-1: the CALLER (orchestrator) agent that made the `subagent` call. The completion finish (grader launch) runs
+   * as this agent: the host checks the caller's `subagent:<grader>` permission, never the dispatched child's.
+   * Absent for a record journaled before this field existed.
+   */
+  callerAgent?: string;
   role?: string;
   description: string;
   verifying: boolean;
@@ -399,8 +406,22 @@ const OPEN_STATES: ReadonlySet<AttemptState> = new Set<AttemptState>(["acknowled
 const TERMINAL_STATES: ReadonlySet<AttemptState> = new Set<AttemptState>(["released", "foreground", "cancelled", "closed-unknown"]);
 
 /** Process-wide call claims (`bg:<callID>`), shared by every plugin instance of the process; bounded. */
-const PROCESS_CLAIMS = new Set<string>();
 const MAX_CLAIMS = 1000;
+
+/**
+ * DF-1.1-1: the plugin can be loaded as several module copies in one process (one per booted host location), and a
+ * module-level set would then be one set per copy, so two copies would both claim a callID and complete it twice. The
+ * set lives on `globalThis` under a versioned registry key instead, so every copy shares it.
+ */
+const PROCESS_CLAIMS_KEY = Symbol.for("opencode-model-router.background-claims.v1");
+function processClaims(): Set<string> {
+  const registry = globalThis as unknown as Record<symbol, Set<string> | undefined>;
+  const existing = registry[PROCESS_CLAIMS_KEY];
+  if (existing instanceof Set) return existing;
+  const created = new Set<string>();
+  Object.defineProperty(globalThis, PROCESS_CLAIMS_KEY, { value: created, configurable: true, enumerable: false, writable: true });
+  return created;
+}
 
 /** The attempt key (memo §10). */
 export function attemptKey(childSessionID: string, callID: string): string {
@@ -434,7 +455,7 @@ export function createInFlightRegistry(deps: {
   claims?: Set<string>;
   onClosed?(attempt: Attempt, cause: CloseCause): void;
 }): InFlightRegistry {
-  const claims = deps.claims ?? PROCESS_CLAIMS;
+  const claims = deps.claims ?? processClaims();
   /** QA-2.1-13: the claims this instance added, so `forgetSession` and `dispose` give exactly those back. */
   const own = new Set<string>();
   function releaseClaim(callID: string): void {
@@ -655,6 +676,8 @@ export interface HeldRecord {
   childText?: string;
   /** QA-2.1-17: the dispatch data (`FinishApi.dispatchOf`), persisted with the hold so a restart can rebuild the gate inputs. */
   dispatch?: RestoredDispatch;
+  /** DF-1.1-1: the CALLER agent of the dispatch, persisted so a restored hold launches its grader as the caller. Absent in an old entry. */
+  callerAgent?: string;
 }
 
 /** A restored hold whose verdict was being posted (`posting` without `posted`): re-post after a parent check (R21). */
@@ -675,6 +698,8 @@ export interface RestoredHold {
   childText?: string;
   /** QA-2.1-17: the dispatch data journaled with the hold (empty fields when an older record had none). */
   dispatch: RestoredDispatch;
+  /** DF-1.1-1: the caller agent journaled with the hold; absent for an older record. */
+  callerAgent?: string;
   /** QA-2.1-17: a verdict the gate reached before the restart but never started posting: posted, never recomputed. */
   verdict?: StoredVerdict;
 }
@@ -1046,6 +1071,7 @@ export function createHeldResults(deps: {
             ...(rec.label === undefined ? {} : { label: rec.label }),
             ...(rec.childText === undefined ? {} : { text: rec.childText }),
             ...(rec.dispatch === undefined ? {} : { dispatch: rec.dispatch }),
+            ...(rec.callerAgent === undefined ? {} : { callerAgent: rec.callerAgent }),
             at: now(),
           },
           { fsync: true },
@@ -1190,6 +1216,7 @@ export function createHeldResults(deps: {
             ...(typeof r.label === "string" ? { label: r.label } : {}),
             ...(typeof r.text === "string" ? { childText: r.text, body: r.text } : {}),
             ...(r.dispatch === undefined ? {} : { dispatch: restoredDispatchOf(r.dispatch) }),
+            ...(typeof r.callerAgent === "string" && r.callerAgent !== "" ? { callerAgent: r.callerAgent } : {}),
             active: true,
             posting: false,
             status: "verifying",
@@ -1237,6 +1264,7 @@ export function createHeldResults(deps: {
             callID: e.callID,
             ...(e.childText === undefined ? {} : { childText: e.childText }),
             dispatch: e.dispatch ?? {},
+            ...(e.callerAgent === undefined ? {} : { callerAgent: e.callerAgent }),
             ...(stored.has(e.handle) ? { verdict: stored.get(e.handle) } : {}),
           });
         }
@@ -1281,6 +1309,7 @@ export function createHeldResults(deps: {
           v: 1, kind: "hold", handle: e.handle, parent: e.parentSessionID, child: e.childSessionID, callID: e.callID,
           ...(e.label === undefined ? {} : { label: e.label }),
           ...(e.dispatch === undefined ? {} : { dispatch: e.dispatch }),
+          ...(e.callerAgent === undefined ? {} : { callerAgent: e.callerAgent }),
           at,
         });
         if (!e.active) {

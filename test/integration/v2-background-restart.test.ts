@@ -265,6 +265,82 @@ describe("DF-1-10: a sibling plugin instance of this process (another booted loc
   });
 });
 
+describe("DF-1.1-1: the caller (orchestrator) agent survives the journal, so a completion's grader launches as it", () => {
+  const journalRecords = (h: BgHost): Array<Record<string, unknown>> =>
+    readFileSync(h.journalPath, "utf8").split("\n").filter((line) => line.trim() !== "").map((line) => JSON.parse(line) as Record<string, unknown>);
+
+  it("a background dispatch journals the CALLER agent next to the dispatched one, never in its place", async () => {
+    const h = await boot([]);
+    h.emit({ type: "session.created", id: `ev-created-${CHILD}`, created: 1, data: { sessionID: CHILD, parentID: ORCH } });
+    await h.drain();
+    const call = await h.before({
+      sessionID: ORCH, agent: "build", messageID: "m-df111", id: "call-df111-live", tool: "subagent",
+      input: { agent: "fast", description: "background work", prompt: "do the work", background: true },
+    });
+    const running = { output: { sessionID: CHILD, status: "running", output: "Working in the background" }, content: "Working in the background", metadata: { sessionID: CHILD } };
+    await h.after({ ...call, status: "completed", result: running });
+    await h.settled();
+    const inflight = journalRecords(h).filter((r) => r.kind === "inflight" && r.callID === "call-df111-live");
+    expect(inflight.length).toBeGreaterThan(0);
+    for (const record of inflight) {
+      expect(record.callerAgent).toBe("build");
+      expect(record.agent).toBe("fast");
+    }
+    for (const record of journalRecords(h).filter((r) => r.kind === "hold" && r.callID === "call-df111-live")) expect(record.callerAgent).toBe("build");
+  });
+
+  it("an old journal entry without the field (inflight and hold) still loads and settles once", async () => {
+    const handle = `vrf_${"c".repeat(24)}`;
+    const h = await boot([
+      {
+        v: 1, kind: "inflight", key: `${CHILD}\u0000call-df111-old`, callID: "call-df111-old", parentSessionID: ORCH, childSessionID: CHILD,
+        label: 'fast "old"', agent: "fast", description: "old", verifying: true, verificationMode: "required", handle, hold: handle, at: Date.now(),
+      },
+      { v: 1, kind: "hold", handle, parent: ORCH, child: CHILD, callID: "call-df111-old", label: 'fast "old"', dispatch: { prompt: "old work" }, at: Date.now() },
+      { v: 1, kind: "hold-text", handle, text: "old output", status: "succeeded", at: Date.now() },
+    ]);
+    adoptOrchestrator(h);
+    await h.settled();
+    expect(verdictPosts(h)).toHaveLength(1);
+  });
+
+  it("a hold journaled with its caller agent loads and settles once", async () => {
+    const handle = `vrf_${"e".repeat(24)}`;
+    const h = await boot([
+      { v: 1, kind: "hold", handle, parent: ORCH, child: CHILD, callID: "call-df111-new", callerAgent: "build", dispatch: { prompt: "new work" }, at: Date.now() },
+      { v: 1, kind: "hold-text", handle, text: "new output", status: "succeeded", at: Date.now() },
+    ]);
+    adoptOrchestrator(h);
+    await h.settled();
+    expect(verdictPosts(h)).toHaveLength(1);
+  });
+});
+
+describe("DF-1.1-1: the call claims are process-wide across module copies", () => {
+  it("a second module copy of the registry cannot claim a callID the first copy holds; it can after the first lets go", async () => {
+    const quiet = { debug: () => undefined, info: () => undefined, warn: () => undefined, error: () => undefined };
+    const record = {
+      callID: "call-df111-claim", parentSessionID: ORCH, agent: "fast", description: "d", verifying: false, verificationMode: "none" as const,
+      decision: { background: true, hold: false, reason: "prior" as const }, at: Date.now(),
+    };
+    const first = await import("../../src/compat/background");
+    vi.resetModules();
+    const second = await import("../../src/compat/background");
+    expect(second.createInFlightRegistry).not.toBe(first.createInFlightRegistry);
+    const a = first.createInFlightRegistry({ now: Date.now, logger: quiet });
+    const b = second.createInFlightRegistry({ now: Date.now, logger: quiet });
+    try {
+      expect(a.decide(record)).toBe(true);
+      expect(b.decide(record)).toBe(false);
+      a.dispose();
+      expect(b.decide(record)).toBe(true);
+    } finally {
+      a.dispose();
+      b.dispose();
+    }
+  });
+});
+
 describe("QA-DF1-21: an adopted dispatch of this very process whose child is still running", () => {
   // Each test its own call id: the in-flight registry's call claims are process-wide.
   const record = (process: string, callID: string): Record<string, unknown> => ({

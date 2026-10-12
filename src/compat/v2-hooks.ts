@@ -1553,6 +1553,7 @@ export async function registerV2Hooks(
         v: 1, kind: "inflight", key: attempt.key, callID: attempt.callID, parentSessionID: attempt.parentSessionID,
         childSessionID: attempt.childSessionID, label: attemptLabel(attempt), at: attempt.ackAt ?? attempt.at,
         agent: attempt.agent, description: attempt.description, verifying: attempt.verifying, verificationMode: attempt.verificationMode,
+        ...(attempt.callerAgent === undefined ? {} : { callerAgent: attempt.callerAgent }),
         ...(attempt.role === undefined ? {} : { role: attempt.role }),
         ...(attempt.hold === undefined ? {} : { handle: attempt.hold.handle }), hold: attempt.hold?.handle ?? null,
         ...(dispatch === undefined ? {} : { dispatch }), process: processToken(),
@@ -2725,7 +2726,9 @@ export async function registerV2Hooks(
           // QA-DF1-17: the earlier turns' completion elements of a resumed child are never the resume's, whatever their state.
           if (resumeOf !== undefined) rememberElementsOnResume(parent, resumeOf);
           inflight.decide({
-            callID: event.id, parentSessionID: parent, agent: String(output.args?.agent ?? ""), ...(info?.role === undefined ? {} : { role: info.role }),
+            callID: event.id, parentSessionID: parent, agent: String(output.args?.agent ?? ""),
+            ...(typeof event.agent === "string" && event.agent !== "" ? { callerAgent: event.agent } : {}),
+            ...(info?.role === undefined ? {} : { role: info.role }),
             description: typeof output.args?.description === "string" ? output.args.description : "", verifying,
             verificationMode: verification?.mode ?? "none", decision,
             ...(resumeOf === undefined ? {} : { resumeOf }),
@@ -2929,7 +2932,7 @@ export async function registerV2Hooks(
         try {
           // QA-2.1-17: the plugin rebuilds the gate inputs from the journaled dispatch and the restored pending entry, and
           // re-posts a verdict the entry already reached.
-          const result = await within(hookContext({ sessionID: hold.parentSessionID, agent: undefined, messageID: "", id: hold.callID }), () => api.finish({
+          const result = await within(hookContext({ sessionID: hold.parentSessionID, agent: hold.callerAgent, messageID: "", id: hold.callID }), () => api.finish({
             callID: hold.callID, parentSessionID: hold.parentSessionID, childSessionID: hold.childSessionID, outputText: childText,
             status: "succeeded", mode: "background", heldHandle: hold.handle, endedAt: nowMs(), restored: hold.dispatch,
           }));
@@ -2949,7 +2952,7 @@ export async function registerV2Hooks(
         }
       };
       processor = createCompletionProcessor(inflight, {
-        finish: (input) => within(hookContext({ sessionID: input.parentSessionID, agent: inflight.byCall(input.callID)?.agent, messageID: "", id: input.callID }), () => api.finish(input)),
+        finish: (input) => within(hookContext({ sessionID: input.parentSessionID, agent: inflight.byCall(input.callID)?.callerAgent, messageID: "", id: input.callID }), () => api.finish(input)),
         readChildResult: lastAssistantText,
         // The `!running` half of `roleAfterCall`: budget and authority notices, plus its evictions (run through its own `finish`).
         roleCompletion: async (attempt, text) => {
@@ -2993,6 +2996,7 @@ export async function registerV2Hooks(
           const mode = rec.verificationMode === "required" || rec.verificationMode === "deferred" ? rec.verificationMode : "none";
           const registered = inflight.decide({
             callID, parentSessionID: sessionID, agent: typeof rec.agent === "string" ? rec.agent : "",
+            ...(typeof rec.callerAgent === "string" && rec.callerAgent !== "" ? { callerAgent: rec.callerAgent } : {}),
             ...(typeof rec.role === "string" ? { role: rec.role } : {}),
             description: typeof rec.description === "string" ? rec.description : "",
             verifying: rec.verifying === true, verificationMode: mode,
@@ -3117,6 +3121,7 @@ export async function registerV2Hooks(
                   v: 1, kind: "inflight", key: attempt.key, callID: event.id, parentSessionID: parent, childSessionID: resultChild,
                   label: attemptLabel(attempt), ...(handle === undefined ? {} : { handle }), at: nowMs(),
                   agent: rec.agent, description: rec.description, verifying: rec.verifying, verificationMode: rec.verificationMode,
+                  ...(rec.callerAgent === undefined ? {} : { callerAgent: rec.callerAgent }),
                   ...(rec.role === undefined ? {} : { role: rec.role }), hold: handle ?? null,
                   ...(dispatch === undefined ? {} : { dispatch }), process: processToken(),
                 }, { fsync: true });
@@ -3129,6 +3134,7 @@ export async function registerV2Hooks(
                 try {
                   await held.hold({
                     handle, parentSessionID: parent, childSessionID: resultChild, callID: event.id, label: attemptLabel(attempt),
+                    ...(rec.callerAgent === undefined ? {} : { callerAgent: rec.callerAgent }),
                     ...(dispatch === undefined ? {} : { dispatch }),
                   });
                   holding = true;

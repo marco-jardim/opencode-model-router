@@ -172,9 +172,9 @@ describe("DF-1-3 a background completion without a deterministic check", () => {
   it("DF-1-3 the grader launches from the orchestrator (never the current context); an unverifiable result is tagged UNVERIFIABLE, never PASS", async () => {
     process.env.MODEL_ROUTER_ENFORCE = "1";
     execFileSync("git", ["init", "-q"], { cwd: home }); // a work tree the gate can prepare its verification in
-    const launched: Array<{ parentSessionID?: string }> = [];
+    const launched: Array<{ parentSessionID?: string; agent?: string }> = [];
     const runner = {
-      run: async (request: { parentSessionID?: string }) => {
+      run: async (request: { parentSessionID?: string; agent?: string }) => {
         launched.push(request);
         throw new Error("Tool.Error: Subagent denied: model-router-grader");
       },
@@ -197,6 +197,8 @@ describe("DF-1-3 a background completion without a deterministic check", () => {
     });
     expect(launched.length).toBeGreaterThan(0);
     for (const request of launched) expect(request.parentSessionID).toBe("ses_parent");
+    // DF-1.1-1: a grader request never names the dispatched child ("fast") as the agent the host checks `subagent:<grader>` for.
+    for (const request of launched) expect(request.agent).not.toBe("fast");
     expect(result.verification).toEqual({ kind: "required", verdict: "UNVERIFIABLE" });
     // Acceptance is unchanged: an unverifiable result is accepted (not strictUnverifiable), so no forcing note.
     expect(result.outputText.startsWith("The parser starts in parse().")).toBe(true);
