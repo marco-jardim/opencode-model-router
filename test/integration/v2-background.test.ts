@@ -540,7 +540,8 @@ describe("static engine: timing rows feed the background decision", () => {
     await oneSlowDispatch(h, 5, SLOW_MS);
     const next = await h.before(dispatch({ prompt: SLOW }));
     expect(inputOf(next).background).toBe(true);
-  });
+    // Six dispatches, each with fsync'd journal and timing writes: over the 5 s default under a 14-worker scoped run.
+  }, 30_000);
 });
 
 describe("a restart between the ack and the end (R18)", () => {
