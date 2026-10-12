@@ -1892,17 +1892,100 @@ export function createVerificationWiring(deps: {
   type FrozenPerimeter = NonNullable<PendingEntry["perimeter"]>;
 
   /**
+   * Cross-repo P3c.6 (D26): the dependency targets the producer added to W during the dispatch, frozen at return. W's targets
+   * are read again from `linkBase` through the union (`dependencyTargets`, fs only) with the dispatch's frozen admission; each
+   * admitted one that no root in `covering` holds (the perimeter's roots), and that is not W's own repository (`own`: W's
+   * directory and top level, as planPerimeter skips them), is snapshotted, hardened, within what remains of `deadline` (the
+   * deferral bound), and frozen as a link. `unobserved`: one could not be observed in time, or its top level is no longer
+   * admitted (X7: not deferred). An unadmitted target (no parent or worktree holds it, no git top level, a top the admission
+   * refuses, or an unadmitted edge) is not snapshotted: router_verify names it. Never a perimeter seed: P stays fixed at
+   * dispatch for writer attribution (I4, I13). Never throws.
+   */
+  const dependenciesAddedAtReturn = async (
+    linkBase: string,
+    admission: NonNullable<DispatchPerimeter["admission"]>,
+    covering: readonly string[],
+    own: readonly string[],
+    deadline: Deadline,
+  ): Promise<{ links: FrozenPerimeter["links"]; unobserved: boolean }> => {
+    const read = ((): { context: ReturnType<typeof admissionFromData>; dependencies: DependencyTargets } | undefined => {
+      try {
+        const context = admissionFromData(admission);
+        return { context, dependencies: dependencyTargets(linkBase, context) };
+      } catch {
+        return undefined; // Never expected (it skips what it cannot read).
+      }
+    })();
+    // Fail closed: W's dependencies at return are unknown, so a new one cannot be ruled out (not deferred).
+    if (read === undefined) return { links: [], unobserved: true };
+    const { context, dependencies } = read;
+    // Held by a perimeter root, or W's own repository (inside W, or W inside it): W's snapshot covers it.
+    const covered = (at: string): boolean =>
+      covering.some(root => depthBelow(at, root) >= 0) || own.some(dir => depthBelow(at, dir) >= 0 || depthBelow(dir, at) >= 0);
+    // The admitted top level of each new target, once per repository.
+    const added = new Map<string, string>();
+    for (const target of dependencies.targets) {
+      // An unadmitted edge target is text only: never observed (I11).
+      if ("fixed" in target || covered(target.at)) continue;
+      let top: string | undefined;
+      if (target.origin === "edge") {
+        top = target.at; // Already its admitted top level (resolveEdgeTarget).
+      } else {
+        // A package link target, admitted as at dispatch (SD-P3c-9, F8): its top level found without git below its parent (or
+        // above its working-set worktree), then admitted by the frozen admission.
+        const parent = context.parentOf(target.at);
+        const worktree = context.worktreeOf(target.at);
+        if (parent === undefined && worktree === undefined) continue;
+        top = gitTopOf(target.at, worktree !== undefined ? dirname(worktree.worktree) : parent);
+        if (top === undefined || !context.admitTop(top)) continue;
+      }
+      if (covered(top) || added.has(perimeterKey(top))) continue;
+      added.set(perimeterKey(top), top);
+    }
+    if (added.size === 0) return { links: [], unobserved: false };
+    const lowPriority = configuredLowPriority();
+    const observed = await Promise.all([...added.values()].map(async top => ({ top, now: await hardenedSnapshotFor(top, deadline, lowPriority) })));
+    const links: FrozenPerimeter["links"][number][] = [];
+    let unobserved = false;
+    for (const { top, now } of observed) {
+      // As a seed at return: no snapshot in time, or a top level the admission refuses, is not observed (X7).
+      if (now === undefined || now.root === undefined || !context.admitTop(now.root)) {
+        unobserved = true;
+        continue;
+      }
+      links.push({
+        at: top,
+        root: now.root,
+        name: basename(now.root),
+        head: now.head,
+        fingerprint: now.fingerprint,
+        admit: context.admitTop,
+      });
+    }
+    return { links, unobserved };
+  };
+
+  /**
    * Cross-repo P2e.5 (X4, X5): the perimeter frozen when a deferred producer returns. The observation is perimeterAtGate's in
    * return mode (no consumer discovery inside the deferral bound: router_verify discovers over the frozen working set). Next to
    * it: the working-set roots (origin "working-set", never W), and the link targets (origin "link" or `linked`, never fixed)
    * with the top level, head and fingerprint of their return-time snapshot and their admission. `linkUnobserved`: a link root
    * whose status is "unobserved" (no snapshot at either end, or a top it does not admit): X7, not deferred. Undefined when the
    * dispatch has no perimeter or none of it remains beyond W.
+   * Cross-repo P3c.6 (D26): W's dependency targets are read again at return through the union (`dependencyTargets`) with the
+   * frozen admission; an admitted target the producer added during the dispatch (a `node_modules` link, a declared edge) and
+   * no seed covers is snapshotted (hardened) within the remaining deferral bound and frozen with the links, so router_verify
+   * (S11) compares it with its return-time state; one not observed in time sets `linkUnobserved` (verified at once, X7). It is
+   * never a perimeter seed: P stays fixed at dispatch for writer attribution (I4, I13). An unadmitted new target is not
+   * snapshotted.
    */
   const perimeterAtReturn = async (
     planned: { name?: string; snapshots: PerimeterSnapshots; admission?: DispatchPerimeter["admission"] } | undefined,
     snapshot: TreeSnapshot | undefined,
     base: string,
+    // P3c.6 (D26): the deferral bound, what remains of it bounds the snapshots of the dependencies added during the dispatch.
+    // Absent: none is read (as before P3c.6).
+    deadline?: Deadline,
   ): Promise<{
     observation: PerimeterObservation;
     workingSet: FrozenPerimeter["workingSet"];
@@ -1954,6 +2037,23 @@ export function createVerificationWiring(deps: {
           fingerprint: now.fingerprint,
           ...(seed.admit !== undefined ? { admit: seed.admit } : {}),
         });
+      }
+    }
+    // P3c.6 (D26): a dependency target the producer added during the dispatch, frozen with the links so that router_verify (S11)
+    // compares it with its state at return; never a seed (I13: P stays the dispatch's for writer attribution, I4). Not read when
+    // the dispatch is verified at once anyway, without a frozen admission (an entry planned before P3c.4), or without a bound.
+    if (!linkUnobserved && planned.admission !== undefined && deadline !== undefined) {
+      // What covers a target at router_verify: the roots frozen here (the perimeter's, fixed ones where they were planned).
+      const covering = [
+        ...observation.roots.map(root => root.root),
+        ...planned.snapshots.map(({ entry }) => entry.seed.at),
+        ...[...links.values()].map(link => link.root),
+      ];
+      const added = await dependenciesAddedAtReturn(base, planned.admission, covering, [base, observation.w.root], deadline);
+      if (added.unobserved) linkUnobserved = true;
+      for (const link of added.links) {
+        const key = perimeterKey(link.root);
+        if (key !== wKey && !links.has(key)) links.set(key, link);
       }
     }
     return {
@@ -2277,7 +2377,8 @@ export function createVerificationWiring(deps: {
       let frozen: Awaited<ReturnType<typeof perimeterAtReturn>>;
       if (perimeterSnapshots !== undefined) {
         const base = resolve(directory, changeCwd || ".");
-        frozen = await perimeterAtReturn(await perimeterSnapshots, change.snapshot, base);
+        // P3c.6 (D26): a dependency added during the dispatch is snapshotted within what remains of this deadline.
+        frozen = await perimeterAtReturn(await perimeterSnapshots, change.snapshot, base, deadline);
         const writers = change.unattributedWriters ?? [];
         if (frozen !== undefined && perimeterChangeReasons({ perimeter: frozen.observation, unattributedWriters: [...writers] }, base).length > 0) {
           return {

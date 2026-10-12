@@ -11,6 +11,8 @@
  * - P2e: a deferred DoD with a perimeter and no I4 at return is deferred (a handle); router_verify gates it with the perimeter
  *   frozen at return (I4/I8 as at return, S11 link drift, the frozen pins). I4 at return, or a link not observed then, is not
  *   deferred: the required gate decides.
+ * - P3c.6 (D26): a dependency (a declared edge, a node_modules link) the producer adds during the dispatch is frozen at return
+ *   (S11 then compares it with its return-time state), never added to P (I13: no I4 for it); not observed in time: not deferred.
  * - Link discovery: a junction to an admitted repository is in P; a store-like link is not.
  * - P3c.3: a declared dependency edge of W outside node_modules (`file:`, tsconfig `references`) puts its repository in P as an
  *   "edge" seed (observed for I4/I8, never pinned); a link and an edge into one repository are one pinned "link" seed.
@@ -1193,6 +1195,108 @@ describe("deferred P (P2e)", () => {
       fs.rmSync(nestedLink, { recursive: false, force: true });
     }
   }, 90_000);
+
+  // P3c.6 (D26): a dependency target (a declared edge or a node_modules link) the producer adds during the dispatch is not in P
+  // (I13: P is fixed at dispatch), but it is frozen at return, so router_verify (S11) does not report it "changed" when it is not.
+  describe("a dependency added during the dispatch (P3c.6, D26)", () => {
+    let libC = "";
+    /** W (app-a) links lib-c at dispatch, so P is not empty beyond W; lib-b is in no seed (no link, no edge, no working set). */
+    async function withLibC(): Promise<any> {
+      watchPlugin();
+      libC = path.join(parent, "lib-c");
+      initRepo(libC, { "index.ts": "export const c = 0;\n" });
+      for (const dir of [repo, lib, libC]) execFileSync("git", ["config", "core.autocrlf", "false"], { cwd: dir, stdio: "ignore" });
+      routeAsRole(location(repo, "app-a"));
+      fs.mkdirSync(path.join(repo, "node_modules"), { recursive: true });
+      fs.symlinkSync(libC, path.join(repo, "node_modules", "lib-c"), "junction");
+      const realPlan = perimeterModule.planPerimeter;
+      vi.spyOn(perimeterModule, "planPerimeter").mockImplementation((id, cwd) => realPlan(id, cwd, () => ({ parents: [parent], depth: 1, exclude: [] })));
+      const hooks = await makePlugin();
+      await pin(repo);
+      await pinWithIgnored(libC);
+      await pin(lib);
+      return hooks;
+    }
+    /** The producer declares lib-b a `file:` dependency of W (no node_modules link): an edge P did not have. */
+    const declareLibB = async (): Promise<void> => {
+      fs.writeFileSync(
+        path.join(repo, "package.json"),
+        `{ "name": "app-a", "private": true, "scripts": { "test": "node --version" }, "dependencies": { "lib-b": "file:../lib-b" } }\n`,
+      );
+      await pin(repo);
+    };
+    /** The producer links lib-b through W's node_modules (ignored in W): a link P did not have. */
+    const linkLibB = (): void => {
+      fs.symlinkSync(lib, path.join(repo, "node_modules", "lib-b"), "junction");
+    };
+    // scope=full: the producer may change package.json, and scoping this fixture's `node --version` test script is unsupported (S6).
+    const DOD_FULL = DEFERRED_DOD.replace('command="npm test"', 'command="npm test" scope=full');
+    const NEW_LIB_B = /the linked repository lib-b /;
+    const frozenLinks = (handle: string): string[] | undefined => entryOf(handle).perimeter?.links.map(link => seam.key(link.root));
+
+    afterEach(() => {
+      // The junction is removed itself (never recursed through) before the temporary trees.
+      const junction = path.join(repo, "node_modules", "lib-c");
+      if (fs.existsSync(junction)) fs.rmSync(junction, { recursive: false, force: true });
+    });
+
+    it("an edge declared during the dispatch, lib-b unchanged after return → pass, no S11 (frozen at return)", async () => {
+      const hooks = await withLibC();
+      const handle = handleIn(await runTask(hooks, `Implement it.\n${DOD_FULL}`, async () => declareLibB()));
+      expect(frozenLinks(handle)).toContain(seam.key(lib));
+      const out = await verify(hooks, handle);
+      expect(out).not.toMatch(NEW_LIB_B);
+      expect(outcomeOf(out, handle), out).toBe("pass");
+    }, 90_000);
+
+    it("a node_modules link made during the dispatch, lib-b unchanged after return → pass, no S11 (frozen at return)", async () => {
+      const hooks = await withLibC();
+      const handle = handleIn(await runTask(hooks, `Implement it.\n${DOD_FULL}`, async () => linkLibB()));
+      expect(frozenLinks(handle)).toContain(seam.key(lib));
+      const out = await verify(hooks, handle);
+      expect(out).not.toMatch(NEW_LIB_B);
+      expect(outcomeOf(out, handle), out).toBe("pass");
+    }, 90_000);
+
+    it("lib-b changed after return → UNVERIFIED with S11 changed", async () => {
+      const hooks = await withLibC();
+      const handle = handleIn(await runTask(hooks, `Implement it.\n${DOD_FULL}`, async () => declareLibB()));
+      fs.writeFileSync(path.join(lib, "index.ts"), "export const b = 1;\n");
+      await pin(lib);
+      const out = await verify(hooks, handle);
+      expect(outcomeOf(out, handle), out).toBe("unverifiable");
+      expect(out).toMatch(S11_CHANGED);
+    }, 90_000);
+
+    it("the new target cannot be observed within the deferral bound → no handle (the required gate verifies at once)", async () => {
+      const hooks = await withLibC();
+      const out = await runTask(hooks, `Implement it.\n${DOD_FULL}`, async () => {
+        await declareLibB();
+        // From now on lib-b cannot be snapshotted (its return-time observation).
+        for (const key of [seam.key(lib), seam.key(fs.realpathSync.native(lib))]) seam.pins.set(key, Promise.resolve(undefined));
+      });
+      expect(HANDLE.exec(out)?.[0], out).toBeUndefined();
+      expect(artefacts()).toHaveLength(1);
+    }, 90_000);
+
+    it("writers during the dispatch → no I4 reason for the new target (I13: it was not in P); it is frozen as a link only", async () => {
+      const hooks = await withLibC();
+      const out = await runTask(hooks, `Implement it.\n${DOD_FULL}`, async (h, sid) => {
+        await runTool(h, sid, "bash", { command: "echo hi" });
+        await declareLibB();
+        fs.writeFileSync(path.join(lib, "index.ts"), "export const b = 1;\n");
+        await pin(lib);
+      });
+      expect(out).not.toMatch(ANY_I4);
+      const handle = handleIn(out);
+      const frozen = entryOf(handle).perimeter;
+      expect(frozen?.observation.roots.map(root => root.name)).toEqual(["lib-c"]);
+      expect(frozenLinks(handle)).toContain(seam.key(lib));
+      const verified = await verify(hooks, handle);
+      expect(verified).not.toMatch(ANY_I4);
+      expect(verified).not.toMatch(NEW_LIB_B);
+    }, 90_000);
+  });
 });
 
 describe("consumer discovery (§6)", () => {
