@@ -453,6 +453,18 @@ implementations, so the plan now runs on its own data/state dirs (owner decision
   leases collide across worktrees (keyed by repo-relative path, or by the common git dir, instead of the tree). Plan
   §0.6 assumes one worktree per phase is isolation enough. Workaround: serialize hub-file writers across worktrees.
   Fix candidate for `pdf1-2` round 2 or a later fix phase (lease key must include the work tree).
+  QA-PDF12 round 2 root cause: `repositoryIdentity` returns the common git dir as `repo`
+  (`src\router\git-tools.ts:960/:969`), `keyOfIn` keys writes `r:${repo}\0${rel}` (`src\router\leases.ts:474`); ADR
+  0007 D7 says "keyed by repository". Minimal fix: v2-hooks `repoKeyOf` seam (≈1678) returns `{repo: id.tree, tree:
+  id.tree}`; needs a D7 amendment (repository-wide keys only for plan-task holders), CHANGELOG wording, a v2 test with a
+  real `git worktree add` (`test\integration\v2-leases.test.ts:124-136` never used real git). **Deferred by decision to
+  its own fix phase after Wave 3** (touches 3.1's lease wiring). Until then: hub-file writers serialized across worktrees.
+- **Progress (19:30):** pdf1-2 QA r1 fixes `acc6728` + `a702885` (622/623 then 19/19 after a test-premise fix by the
+  orchestrator); QA r2 (`ses_ecdd4be53ffeRBnheWrUeEH1E3`): no blocking/critical, minors -10..-13, nits -14/-15, all
+  being fixed (`ses_ecdbda6feffe5Pznwl5j9WSNcp`). 3.1.7 `2330b88` (nullable executor; enablement belongs to 5.1;
+  open: retry stop has no writable host field, no sync RouteResolver, no executor decision-row writer, DispatchBookkeeping
+  lacks planId). 3.2.6 unit tests + `revertMessage` fix `d01ff2c` (163 green). Real-git test file uncommitted: 19/25
+  green, 5 queue-settle timeouts suspected from the `kick()` lost-wake gap (fix in flight) + 1 assertion.
 
 *(superseded)* **NEXT ACTION (2026-10-12 ≈16:30): DF-1.1 re-switch — waiting for the owner restart; then the DF-1.1 self-check and
 re-probes (DF1.4.a with `df1.1`, c runner criterion, d, e), then Wave 3.** `cpx/pdf1-1` merged into `cpx/main` as
