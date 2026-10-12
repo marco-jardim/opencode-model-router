@@ -781,8 +781,30 @@ Round-2 fixes: `80562d0` (part 1), `934ded5` + `1bfef5b` (part 2). At `1bfef5b`:
 - Minor leftovers recorded, not fixed (rule: after round 2 only blocking/critical/major): `background.ts:238` doc comment "Optional for compatibility"; `ref` records not rewritten by recreate; `restoredTaskArgs` ignores the journaled `workRoot`; test-only settled seam can hang on a gate whose settle throws.
 
 ## Fixes
+
+- Round 1 (13): `01d6f90` (all fixed; verified by round 2 except the leftovers it reopened as -14..-19).
+- Round 2 (19 incl. the cross-check): `80562d0` (-14, -15, -16 journal side, -18, -20, -21 adapter, -22..-26), `934ded5` + `1bfef5b` (-16 adapter, -17, -19, -21 plugin, -27..-32, CHANGELOG `[Unreleased]` entries).
+- Round 3 majors: `3fa6772` (-33 recreate writes the union of every instance's snapshot merged by record identity; -34 distinct adoption refusal retried after 30 s, claims refreshed every 60 s and stale after 5 min).
+- `610f36d`: real-host smoke `cpx-background` counted root requests from the child's observed end; the host's wake request could land first (failed ≈1 in 3 runs after `3fa6772`, timing-sensitive). Now counted from the dispatch's return; 8/8 isolated + 2/2 full-file runs green.
+- Orchestrator takeovers (§0.14-2): `test\integration\v1-roles-line.test.ts` v2 case (it compared the v2 prompt against the v1 assembly since `3c9c664` added the v2-only "## Background dispatches" block; now compared against the v2 hook without roles keys, v1 assertions untouched); the smoke race above.
+
+Evidence at `610f36d`: `npm run typecheck` green; 72 touched test files 2169 pass / 0 fail (`--maxWorkers=14`); `smoke:cpx` `cpx-background` 4/4 on OpenCode 2.0.26.
+
 ## Deferred findings
+
+Minor round-3 leftovers (rule: after round 2 only blocking/critical/major are fixed): `ref` records are not rewritten by a journal recreate (fails safe: those references cannot be restored); `restoredTaskArgs` ignores the journaled `workRoot` (same as the live background gate); the test-only settled seam can hang on a held gate whose settle throws before `claim.settle`.
 
 ## Handoffs
 
+- 3.1: `LeaseService` rebuilds plan leases (memo §15.3); the pending journal now lives in `resolvePendingJournalDir` (`~/.local/state/opencode-model-router`, XDG on non-win32) — the executor must not place its own state there.
+- 3.2 / 4.x: background holds are root-only (memo §15.6); executor-driven dispatches use the same `FinishApi` (`finish(..., restored)`, `idle`, `releaseHeld`).
+- PF-2 (from 0.P): applied in `docs\ROLES.md` by round 1.
+- `src\router\git-tools.ts` joined 2.1.5's writes (memo §15.1).
+
+## Plan amendments
+
+A-2.1-1: memo §15 decisions are binding: (1) `git-tools.ts` in 2.1.5 writes; (2) the event loop, not the processor, records timing outcomes; (3) registry-level lease restore in 2.1, plan leases rebuilt by 3.1; (4) FAIL verdicts post the foreground-equivalent text (output + findings); (5) the depth banner stays on the ack; (6) background only for root parents; (7) in-flight persistence, the lost-child wake (R18) and `reserveHandle` at the ack are part of 2.1. Added by QA: the pending journal moves to the per-user state directory (QA-2.1-8), restart recovery journals the dispatch data with `inflight`/`hold` (QA-2.1-17), and per-instance session claims with 60 s refresh / 5 min staleness (QA-2.1-19/-34).
+
 ## Verdict
+
+Done, pending merge into `cpx/main`. Three QA rounds (13 + 19 + 2 majors), all blocking/critical/major fixed; minors of round 3 deferred above.
