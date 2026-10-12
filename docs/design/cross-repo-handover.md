@@ -33,6 +33,16 @@ Last checks (HEAD after the round 2 fixes):
 - Goldens: all `test/golden/` pass; only the configured roles-protocol golden changed (OD5) and the new `dispatch-header.golden.test.ts` was added.
 - Full `npx vitest run`: 50 failures in 15 files, every time it ran next to a reviewer's own test runs. Every failing file passes when run alone or in small groups, except the known `test/unit/exec.test.ts` timing tests. New in the load-sensitive list: `test/integration/unattributed-writers.test.ts`, `test/integration/branch-switch.test.ts`, `test/integration/branch-switch-deferred.test.ts`, `test/unit/tree-kill.test.ts`, `test/integration/perimeter.test.ts`, `test/integration/roles-authority.test.ts`, `test/integration/failover-compose.test.ts`, `test/integration/layer2-wiring.test.ts`, `test/integration/modeB-e2e.test.ts` (possibly related to round 2 m8, the extra pin snapshots). A clean full run with nothing else running has not been done yet.
 
+## Start here (next session: Phase 3)
+
+Phase 2 is closed: code, docs, two QA rounds per lot, live dogfood, clean full-suite run, status comment posted on #107 (https://github.com/marco-jardim/opencode-model-router/issues/107#issuecomment-6123968003). Q7 decided: keep the catch-all `deny` (design §10). No owner decision is open.
+
+**Restart:** not needed. The dogfood instance loads the plugin from this worktree's `src/index.ts`, and `src/` changes applied live during this session. Open a new session in the same instance. After any server restart the working set (in memory) is empty until a dispatch binds a repository again.
+
+**Next: Phase 3** (design §7 "Phase 3", `docs/design/cross-repo.md` ~:478): (a) the `vitest related` cross-link spike; (b) a read-only `root` argument for `router_git_*` that names an admitted repository; (c) discovery of dependency edges that do not go through `node_modules`, with no per-repository configuration. The design gives no file-level plan for it: start with a pre-flight (architect) that writes a plan like `docs/design/cross-repo-phase2-plan.md`, ask the owner the real decisions, then implement test-first, QA twice, dogfood live.
+
+**Working rules that bit this session:** delegates hit a read guard after 3 consecutive reads (tell them to alternate read and edit, and paste file:line ranges); "Agent not found" on parallel implementer dispatches usually means the child still runs — check `git status`/`git diff --stat` and resume the same session; every edit must leave `src/` loadable (the live router loads it); run `router_run` calls one at a time; a full suite run only with nothing else running; the gate's `testsPass` cannot scope this repo ("attribution-unavailable"), so verify every change in the shell (typecheck plus the touched test files).
+
 ## Progress after resuming (2026-10-12)
 
 - Fan-out A, B, C, D done: the WIP was completed (`29abefc`), user docs corrected (`d8bd374`), design follow-ups recorded (`1c44f2f`), P2e QA round 2 run. Its one major (the deferred link re-check read the git top level instead of the W the dispatch read; W in a repository subfolder reported every link as changed) is fixed in `7dbb317`; its minors are recorded in design §9 (`99b31a1`).
