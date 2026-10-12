@@ -1834,12 +1834,141 @@ describe("planScopedRun — cross-link inputs (cross-repo P3a)", () => {
     expect(s.mode).toBe("related");
   });
 
-  it("Y2: a crossLink spec carries crossLinkRoot as given; an in-repo-only spec carries neither", async () => {
+  it("Y2, B1: every spec planned with a cross-link root carries crossLink and crossLinkRoot as given, an in-repo-only one too", async () => {
     const s = spec(await planScopedRun(xin(changed("/r/src/a.ts", "/w/src/math.ts"))));
     expect(s).toMatchObject({ crossLink: true, crossLinkRoot: "/w" });
+    // B1 (QA round 1), flipped on purpose: an in-repo-only spec planned with a cross-link root used to be
+    // plain, so a linked change taken for the consumer's own never reached the Y2 zero guard.
     const local = spec(await planScopedRun(xin(changed("/r/src/a.ts"))));
-    expect("crossLink" in local).toBe(false);
-    expect("crossLinkRoot" in local).toBe(false);
+    expect(local).toMatchObject({ crossLink: true, crossLinkRoot: "/w" });
+    const plain = spec(await planScopedRun(xin(changed("/r/src/a.ts"), { crossLinkRoot: undefined })));
+    expect("crossLink" in plain).toBe(false);
+    expect("crossLinkRoot" in plain).toBe(false);
+  });
+
+  describe("B1: W nested inside the consumer's git root (a submodule or a nested clone)", () => {
+    const NESTED: Record<string, string> = { "/r/lib/.git": "gitdir: ../.git/modules/lib", "/r/lib/src/math.ts": "export const x = 1;" };
+    const nested = (vitest = V5) => jsRepo({}, { "/r/node_modules/vitest/package.json": vitest, "/r/src/a.ts": "", ...NESTED });
+    const nin = (changedFiles: ChangedPath[], over: Partial<PlanScopedRunInput> = {}, files = nested()): PlanScopedRunInput =>
+      input({ changedFiles, fs: crossFs(files), crossLinkRoot: "/r/lib", ...over });
+
+    it("the deeper root wins: a W file is a linked input and the spec has crossLink and crossLinkRoot", async () => {
+      const s = spec(await planScopedRun(nin(changed("/r/lib/src/math.ts"))));
+      expect(s).toMatchObject({ runner: "vitest", mode: "related", crossLink: true, crossLinkRoot: "/r/lib" });
+      expect(s.inputs).toEqual(["/r/lib/src/math.ts"]);
+      const mixed = spec(await planScopedRun(nin(changed("/r/src/a.ts", "/r/lib/src/math.ts"))));
+      expect(mixed.inputs).toEqual(["/r/lib/src/math.ts", "/r/src/a.ts"]);
+      expect(mixed).toMatchObject({ crossLink: true, crossLinkRoot: "/r/lib" });
+      // W's own triggers are the linked repository's, relative to W.
+      expectS6(
+        await planScopedRun(nin(changed("/r/lib/src/math.ts", "/r/lib/package.json"))),
+        "config-changed",
+        "config file changed in the linked repository: package.json",
+      );
+    });
+
+    it("jest and pytest are S6 cross-link-unsupported for a nested W change and for any request with a cross-link root", async () => {
+      expectS6(await planScopedRun(nin(changed("/r/lib/src/math.ts"), { command: "jest" })), "cross-link-unsupported", unsupportedKind("jest"));
+      expectS6(await planStaticScoping(nin(changed("/r/lib/src/math.ts"), { command: "jest" })), "cross-link-unsupported", unsupportedKind("jest"));
+      expectS6(await planScopedRun(xin(changed("/r/src/a.ts"), { command: "jest" })), "cross-link-unsupported", unsupportedKind("jest"));
+      const py = xin(changed("/r/src/a.ts"), { command: "pytest" }, { ...pyRepo(), ...W });
+      expectS6(await planScopedRun(py), "cross-link-unsupported", unsupportedKind("pytest"));
+      const old = JSON.stringify({ name: "vitest", version: "4.1.11", bin: { vitest: "./vitest.mjs" } });
+      const reason = "a change in a linked repository needs vitest 5 to scope: the resolved vitest is 4.1.11";
+      expectS6(await planScopedRun(nin(changed("/r/lib/src/math.ts"), {}, nested(old))), "cross-link-unsupported", reason);
+      expectS6(await planScopedRun(xin(changed("/r/src/a.ts"), {}, repo(old))), "cross-link-unsupported", reason);
+      expectS6(await planStaticScoping(xin(changed("/r/src/a.ts"), {}, repo(old))), "cross-link-unsupported", reason);
+    });
+
+    it("Y2: a nested W related run that selects no test is incomplete", async () => {
+      const s = spec(await planScopedRun(nin(changed("/r/lib/src/math.ts"))));
+      expect(await read(s, { [s.reportPath]: jsonReport(0) }, 0)).toMatchObject({
+        total: 0,
+        complete: false,
+        note:
+          "vitest selected no test in /r for the change in /r/lib; the link may not be followed " +
+          "(resolve.preserveSymlinks, a built entry, or no test imports the changed files): use scope=full",
+      });
+    });
+  });
+
+  it("M1: a W file whose every spelling contains the text node_modules is S6 cross-link-unreachable (vitest's substring rule)", async () => {
+    const unreachable = (rel: string) => `the path of ${rel} in the linked repository contains node_modules, which vitest never follows`;
+    const scan = xin(changed("/w/src/node_modules_scan.js"), {}, { ...repo(), "/data/w/src/node_modules_scan.js": "" });
+    expectS6(await planScopedRun(scan), "cross-link-unreachable", unreachable("src/node_modules_scan.js"));
+    expectS6(await planStaticScoping(scan), "cross-link-unreachable", unreachable("src/node_modules_scan.js"));
+    // W's top contains node_modules as text, not as a segment, in its only spelling.
+    const LIB = "/opt/my_node_modules_lib";
+    const libFiles = { ...repo(), [`${LIB}/.git`]: "", [`${LIB}/src/math.ts`]: "", [`${LIB}/src/Node_Modules_scan.ts`]: "" };
+    const top = input({ changedFiles: changed(`${LIB}/src/math.ts`), fs: crossFs(libFiles), crossLinkRoot: LIB });
+    expectS6(await planScopedRun(top), "cross-link-unreachable", unreachable("src/math.ts"));
+    expectS6(await planStaticScoping(top), "cross-link-unreachable", unreachable("src/math.ts"));
+    // One spelling without the text is enough, and only it is passed; the rule is case-sensitive.
+    const linked = input({
+      changedFiles: changed("/lib/src/math.ts", "/lib/src/Node_Modules_scan.ts"),
+      fs: crossFs(libFiles, false, { "/lib": LIB }),
+      crossLinkRoot: "/lib",
+    });
+    const s = spec(await planScopedRun(linked));
+    expect(s.inputs).toEqual(["/lib/src/Node_Modules_scan.ts", "/lib/src/math.ts"]);
+    expect(related(s).some((a) => a.includes("node_modules"))).toBe(false);
+  });
+
+  it("M3: a W file the consumer's config names as globalSetup or setupFiles is S6 config-changed; configs are read only in the consumer", async () => {
+    const lib = { "/lib/.git": "", "/lib/setup.ts": "", "/lib/src/env.ts": "", "/lib/src/math.ts": "" };
+    const withConfig = (cfg: string) => ({ ...repo(), ...lib, "/r/vitest.config.ts": cfg });
+    const lin = (files: Record<string, string>, paths: string[], over: Partial<PlanScopedRunInput> = {}) =>
+      input({ changedFiles: changed(...paths), fs: crossFs(files), crossLinkRoot: "/lib", ...over });
+    const reason = (rel: string) => `config file changed in the linked repository: ${rel}`;
+    const global = withConfig('export default { test: { globalSetup: "../lib/setup.ts" } }');
+    const fs = crossFs(global);
+    const i = input({ changedFiles: changed("/lib/setup.ts"), fs, crossLinkRoot: "/lib" });
+    expectS6(await planScopedRun(i), "config-changed", reason("setup.ts"));
+    expectS6(await planStaticScoping(i), "config-changed", reason("setup.ts"));
+    expect(fs.reads).toContain("/r/vitest.config.ts");
+    expect(fs.reads.filter((p) => p === "/lib" || p.startsWith("/lib/"))).toEqual([]);
+    // setupFiles by stem, among other W changes.
+    const env = withConfig('export default { test: { setupFiles: ["../lib/src/env"] } }');
+    expectS6(await planScopedRun(lin(env, ["/lib/src/math.ts", "/lib/src/env.ts"])), "config-changed", reason("src/env.ts"));
+    // A reference through another spelling of W (a consumer link, crossLinkAliases) names it too.
+    const viaLink = withConfig('export default { test: { setupFiles: ["./node_modules/w/setup.ts"] } }');
+    expectS6(await planScopedRun(lin(viaLink, ["/lib/setup.ts"], { crossLinkAliases: ["/r/node_modules/w"] })), "config-changed", reason("setup.ts"));
+    // A W file no config names stays a related input.
+    expect(spec(await planScopedRun(lin(global, ["/lib/src/math.ts"]))).inputs).toEqual(["/lib/src/math.ts"]);
+  });
+
+  it("M4: an ignored module (status !!, D23) is never matched against the config trigger names", async () => {
+    const TS = "/data/w/vite.config.ts.timestamp-1700000000000.mjs";
+    const files = { ...repo(), "/data/w/dist/esm/package.json": "{}", [TS]: "", "/r/dist/esm/package.json": "{}" };
+    const ignored: ChangedPath[] = [
+      { path: "/w/dist/esm/package.json", status: "!!" },
+      { path: "/w/vite.config.ts.timestamp-1700000000000.mjs", status: "!!" },
+    ];
+    const i = xin([...changed("/w/src/math.ts"), ...ignored], {}, files);
+    const s = spec(await planScopedRun(i));
+    expect(s.inputs).toEqual(expect.arrayContaining([...MATH, "/w/vite.config.ts.timestamp-1700000000000.mjs"]));
+    expect(s.crossLink).toBe(true);
+    expect(await planStaticScoping(i)).toMatchObject({ scopable: true, runner: "vitest" });
+    // The same file as a tracked change is a config change.
+    expectS6(
+      await planScopedRun(xin(changed("/w/src/math.ts", "/w/dist/esm/package.json"), {}, files)),
+      "config-changed",
+      "config file changed in the linked repository: dist/esm/package.json",
+    );
+    // An ignored file of the consumer is not a config change either.
+    const own = await planScopedRun(xin([...changed("/w/src/math.ts"), { path: "/r/dist/esm/package.json", status: "!!" }], {}, files));
+    expect((own as Unverifiable).code).not.toBe("config-changed");
+  });
+
+  it("M4: W declaration files (.d.ts, .d.mts, .d.cts) are never related inputs: vite never loads them", async () => {
+    const files = { ...repo(), "/data/w/src/types.d.ts": "", "/data/w/src/esm.d.mts": "", "/data/w/src/cjs.d.cts": "" };
+    const decl = changed("/w/src/types.d.ts", "/w/src/esm.d.mts", "/w/src/cjs.d.cts");
+    const s = spec(await planScopedRun(xin([...changed("/w/src/math.ts"), ...decl], {}, files)));
+    expect(s.inputs).toEqual(MATH);
+    expect(isNoAffected(await planScopedRun(xin(decl, {}, files)))).toBe(true);
+    expect(isNoAffected(await planStaticScoping(xin(decl, {}, files)))).toBe(true);
+    // A deleted one is not S6 cross-link-gone either.
+    expect(isNoAffected(await planScopedRun(xin(changed("/w/src/gone.d.ts"))))).toBe(true);
   });
 
   it("a path outside both roots is dropped", async () => {
