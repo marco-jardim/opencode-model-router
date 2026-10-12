@@ -1690,6 +1690,239 @@ describe("planStaticScoping", () => {
 // I. readResult
 // ---------------------------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------------------------
+// G.4b: cross-link inputs (cross-repo P3a, vitest related across a link)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Cross-repo P3a: an in-memory fs with a native-like realpath. `links` maps a directory to its
+ * target (a symlink or junction). realpath returns a path as `files` spells it (the disk case on
+ * win32) and rejects a missing one; directories exist. `reads` logs readFile, `probes` fileExists.
+ */
+function crossFs(files: Record<string, string>, win = false, links: Record<string, string> = {}): PlannerFs & { reads: string[]; probes: string[] } {
+  const P = win ? path.win32 : path.posix;
+  const k = (p: string) => (win ? p.toLowerCase() : p);
+  const disk = new Map<string, string>();
+  for (const f of Object.keys(files)) {
+    for (let d = P.normalize(f); !disk.has(k(d)); d = P.dirname(d)) {
+      disk.set(k(d), d);
+      if (P.dirname(d) === d) break;
+    }
+  }
+  const contents = new Map(Object.entries(files).map(([p, c]) => [k(P.normalize(p)), c]));
+  const follow = (p: string) => {
+    let q = P.normalize(p);
+    for (const [from, to] of Object.entries(links)) {
+      if (k(q) === k(from) || k(q).startsWith(k(from) + P.sep)) q = to + q.slice(from.length);
+    }
+    return k(q);
+  };
+  const reads: string[] = [];
+  const probes: string[] = [];
+  return {
+    reads,
+    probes,
+    fileExists: async (p) => {
+      probes.push(p);
+      return disk.has(follow(p));
+    },
+    readFile: async (p) => {
+      reads.push(p);
+      const v = contents.get(follow(p));
+      if (v === undefined) throw new Error(`ENOENT ${p}`);
+      return v;
+    },
+    realpath: async (p) => {
+      const v = disk.get(follow(p));
+      if (v === undefined) throw new Error(`ENOENT ${p}`);
+      return v;
+    },
+  };
+}
+
+describe("planScopedRun — cross-link inputs (cross-repo P3a)", () => {
+  const V5 = JSON.stringify({ name: "vitest", version: "5.0.3", bin: { vitest: "./vitest.mjs" } });
+  /** W's real top is /data/w; /w (the gate's spelling) and /mnt/w (a consumer link's realpath) lead there. */
+  const W: Record<string, string> = {
+    "/data/w/.git": "",
+    "/data/w/package.json": JSON.stringify({ name: "w" }),
+    "/data/w/vitest.config.ts": "export default {}",
+    "/data/w/src/math.ts": "export const add = (a, b) => a + b;",
+    "/data/w/src/math.test.ts": "",
+    "/data/w/src/__tests__/util.ts": "",
+    "/data/w/README.md": "",
+    "/data/w/docs/guide.md": "",
+  };
+  const LINKS = { "/w": "/data/w", "/mnt/w": "/data/w" };
+  /** src/math.ts in every spelling: native real, crossLinkRoot + rel, the alias + rel. */
+  const MATH = ["/data/w/src/math.ts", "/mnt/w/src/math.ts", "/w/src/math.ts"];
+  const NO_PATH = "change attribution unavailable: no changed path lies inside the git root";
+  const repo = (vitest = V5): Record<string, string> => jsRepo({}, { "/r/node_modules/vitest/package.json": vitest, "/r/src/a.ts": "", ...W });
+  const xin = (changedFiles: ChangedPath[], over: Partial<PlanScopedRunInput> = {}, files = repo()): PlanScopedRunInput =>
+    input({ changedFiles, fs: crossFs(files, false, LINKS), crossLinkRoot: "/w", crossLinkAliases: ["/mnt/w"], ...over });
+  /** The related paths in the argv: between "related" and "--run". */
+  const related = (s: ScopedSpec) => s.args.slice(s.args.indexOf("related") + 1, s.args.indexOf("--run"));
+  const unsupportedKind = (kind: string) => `a change in a linked repository needs vitest 5 to scope: this check runs ${kind}`;
+
+  it("without crossLinkRoot an outside path is still dropped and an all-outside set is still S6 attribution-unavailable", async () => {
+    const base = input({ changedFiles: changed("/r/src/a.ts", "/w/src/math.ts"), fs: crossFs(repo(), false, LINKS) });
+    const s = spec(await planScopedRun(base));
+    expect(s.inputs).toEqual(["/r/src/a.ts"]);
+    expect(s.notes).toContain("dropped outside the git root: /w/src/math.ts");
+    expect("crossLink" in s).toBe(false);
+    // An explicit undefined root is the same input; aliases alone are inert.
+    expect(await planScopedRun({ ...base, crossLinkRoot: undefined })).toEqual(s);
+    expect(await planScopedRun({ ...base, crossLinkAliases: ["/mnt/w"] })).toEqual(s);
+
+    const outside = input({ changedFiles: changed("/w/src/math.ts"), fs: crossFs(repo(), false, LINKS) });
+    expectS6(await planScopedRun(outside), "attribution-unavailable", NO_PATH);
+    expectS6(await planStaticScoping(outside), "attribution-unavailable", NO_PATH);
+    expectS6(await planScopedRun({ ...outside, crossLinkAliases: ["/w"] }), "attribution-unavailable", NO_PATH);
+  });
+
+  it("a W path becomes a related input in every SD-P3a-2 spelling, deduplicated, never under node_modules", async () => {
+    const i = xin(changed("/w/src/math.ts", "/mnt/w/src/math.ts", "/data/w/src/math.ts"), {
+      crossLinkAliases: ["/mnt/w", "/w", "/r/node_modules/w"],
+    });
+    const s = spec(await planScopedRun(i));
+    expect(s.runner).toBe("vitest");
+    expect(s.mode).toBe("related");
+    expect(s.crossLink).toBe(true);
+    expect(s.inputs).toEqual(MATH);
+    expect(related(s)).toEqual(MATH);
+    expect(new Set(s.inputs).size).toBe(s.inputs.length);
+    expect(related(s).some((a) => a.split(/[\\/]/).includes("node_modules"))).toBe(false);
+    expect(s.inputsAreTests).toBe(false);
+    expect(s.gitRoot).toBe("/r");
+    expect(s.cwd).toBe("/r");
+    expect("lexicalPaths" in s).toBe(false);
+    expect(i.search.findByContent).not.toHaveBeenCalled();
+  });
+
+  it("win32: case-only variants of W's top stay separate inputs (exact-string dedup)", async () => {
+    const files = {
+      "C:\\app\\.git": "",
+      "C:\\app\\package.json": JSON.stringify({ name: "app" }),
+      "C:\\app\\node_modules\\vitest\\package.json": V5,
+      "C:\\app\\node_modules\\vitest\\vitest.mjs": "",
+      "D:\\Temp\\claude\\lib\\.git": "",
+      "D:\\Temp\\claude\\lib\\src\\math.ts": "",
+    };
+    const s = spec(
+      await planScopedRun(
+        input({
+          win: true,
+          cwd: "C:\\app",
+          fs: crossFs(files, true),
+          changedFiles: changed("D:\\temp\\CLAUDE\\lib\\src\\math.ts"),
+          crossLinkRoot: "D:\\TEMP\\CLAUDE\\LIB",
+          crossLinkAliases: ["D:\\Temp\\Claude\\lib", "D:\\TEMP\\CLAUDE\\LIB", "D:\\Temp\\claude\\lib"],
+        }),
+      ),
+    );
+    // Native real (disk case), the root as given, the alias as given: three ids to vitest.
+    expect(s.inputs).toEqual(["D:\\TEMP\\CLAUDE\\LIB\\src\\math.ts", "D:\\Temp\\Claude\\lib\\src\\math.ts", "D:\\Temp\\claude\\lib\\src\\math.ts"]);
+    expect(related(s)).toEqual(s.inputs);
+    expect(s.crossLink).toBe(true);
+  });
+
+  it("in-repo and W inputs together make one sorted related run with crossLink", async () => {
+    const s = spec(await planScopedRun(xin(changed("/r/src/a.ts", "/w/src/math.ts"))));
+    expect(s.inputs).toEqual(["/data/w/src/math.ts", "/mnt/w/src/math.ts", "/r/src/a.ts", "/w/src/math.ts"]);
+    expect(s.crossLink).toBe(true);
+    expect(s.mode).toBe("related");
+  });
+
+  it("a path outside both roots is dropped", async () => {
+    const s = spec(await planScopedRun(xin(changed("/w/src/math.ts", "/elsewhere/x.ts"))));
+    expect(s.inputs).toEqual(MATH);
+    expect(s.notes).toContain("dropped outside the git root: /elsewhere/x.ts");
+    expectS6(await planScopedRun(xin(changed("/elsewhere/x.ts"))), "attribution-unavailable", NO_PATH);
+  });
+
+  it("a W test file is dropped with a note", async () => {
+    const s = spec(await planScopedRun(xin(changed("/w/src/math.ts", "/w/src/math.test.ts", "/w/src/__tests__/util.ts"))));
+    expect(s.inputs).toEqual(MATH);
+    expect(s.notes).toEqual(
+      expect.arrayContaining(["linked repository test file not run: src/math.test.ts", "linked repository test file not run: src/__tests__/util.ts"]),
+    );
+    expect(isNoAffected(await planScopedRun(xin(changed("/w/src/math.test.ts"))))).toBe(true);
+  });
+
+  it("a gone W file (deleted, or a rename source) is S6 cross-link-gone", async () => {
+    const gone = (rel: string) => `changed file gone in the linked repository (deleted or renamed away): ${rel}`;
+    expectS6(await planScopedRun(xin(changed("/w/src/gone.ts"))), "cross-link-gone", gone("src/gone.ts"));
+    expectS6(await planScopedRun(xin([{ path: "/w/src/math.ts", previousPath: "/w/src/old.ts" }])), "cross-link-gone", gone("src/old.ts"));
+  });
+
+  it.each([
+    "package.json",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "bun.lockb",
+    "tsconfig.json",
+    "tsconfig.build.json",
+    "vitest.config.ts",
+    "vite.config.mjs",
+    "packages/core/package.json",
+  ])("a W %s is S6 config-changed", async (name) => {
+    expectS6(await planScopedRun(xin(changed("/w/src/math.ts", `/w/${name}`))), "config-changed", `config file changed in the linked repository: ${name}`);
+  });
+
+  it("jest and pytest checks are S6 cross-link-unsupported", async () => {
+    expectS6(await planScopedRun(xin(changed("/w/src/math.ts"), { command: "jest" })), "cross-link-unsupported", unsupportedKind("jest"));
+    const py = xin(changed("/w/src/math.ts"), { command: "pytest" }, { ...pyRepo(), ...W });
+    expectS6(await planScopedRun(py), "cross-link-unsupported", unsupportedKind("pytest"));
+  });
+
+  it.each(["4.1.11", "6.0.0"])("vitest %s (a major other than 5) is S6 cross-link-unsupported", async (version) => {
+    const pkg = JSON.stringify({ name: "vitest", version, bin: { vitest: "./vitest.mjs" } });
+    const i = xin(changed("/w/src/math.ts"), {}, repo(pkg));
+    const reason = `a change in a linked repository needs vitest 5 to scope: the resolved vitest is ${version}`;
+    expectS6(await planScopedRun(i), "cross-link-unsupported", reason);
+    expectS6(await planStaticScoping(i), "cross-link-unsupported", reason);
+  });
+
+  it("docs-only W changes are NoAffected (the in-repo non-input rule)", async () => {
+    const i = xin(changed("/w/README.md", "/w/docs/guide.md"));
+    expect(isNoAffected(await planScopedRun(i))).toBe(true);
+    expect(isNoAffected(await planStaticScoping(i))).toBe(true);
+  });
+
+  it("G.7a never reads or probes a config file under W", async () => {
+    const fs = crossFs(repo(), false, LINKS);
+    spec(await planScopedRun(xin(changed("/w/src/math.ts"), { fs })));
+    const underW = (p: string) => ["/data/w", "/w", "/mnt/w"].some((d) => p === d || p.startsWith(`${d}/`));
+    expect(fs.reads.filter(underW)).toEqual([]);
+    expect([...new Set(fs.probes.filter(underW))]).toEqual(["/data/w/src/math.ts"]);
+    // The seam does see the consumer's own config probe.
+    expect(fs.probes.some((p) => /^\/r\/vit(e|est)\.config\./.test(p))).toBe(true);
+  });
+
+  it("planStaticScoping returns the same S6 codes as planScopedRun", async () => {
+    const cases: PlanScopedRunInput[] = [
+      xin(changed("/w/src/gone.ts")),
+      xin(changed("/w/src/math.ts", "/w/package.json")),
+      xin(changed("/w/src/math.ts"), { command: "jest" }),
+      xin(changed("/w/src/math.ts"), {}, repo(VITEST_PKG)),
+      xin(changed("/elsewhere/x.ts")),
+    ];
+    const codes: string[] = [];
+    for (const i of cases) {
+      const run = await planScopedRun(i);
+      const st = await planStaticScoping(i);
+      expect(isUnverifiable(run), JSON.stringify(run)).toBe(true);
+      expect(isUnverifiable(st), JSON.stringify(st)).toBe(true);
+      expect((st as Unverifiable).code).toBe((run as Unverifiable).code);
+      expect((st as Unverifiable).reason).toBe((run as Unverifiable).reason);
+      codes.push((run as Unverifiable).code);
+    }
+    expect(codes).toEqual(["cross-link-gone", "config-changed", "cross-link-unsupported", "cross-link-unsupported", "attribution-unavailable"]);
+    expect(await planStaticScoping(xin(changed("/w/src/math.ts")))).toMatchObject({ scopable: true, runner: "vitest", pendingSearches: 0 });
+  });
+});
+
 const REPORTS = path.join(FIX, "reports");
 const RPT_JSON = `/tmp/omr-verify-${UUID}.json`;
 const RPT_XML = `/tmp/omr-verify-${UUID}.xml`;

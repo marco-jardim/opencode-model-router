@@ -466,6 +466,20 @@
 //        "packages/a/../b/x.ts" is inside -> kept as packages/b/x.ts (see O.9).
 //        win32 P.relative compares case-insensitively, so "c:\repo\a.ts" is inside a gitRoot of
 //        "C:\repo".
+//   4b. Cross-link inputs (cross-repo P3a, planScopedRun and planStaticScoping only; lint ignores
+//      them). With input.crossLinkRoot (W's git top, SD-P3a-5), a candidate outside gitRoot but
+//      inside realOf(crossLinkRoot) is kept as an external file (FileRef.external) instead of being
+//      dropped; outside both it is dropped as in 4. For external files: any one that is not a
+//      non-input (8) needs vitest -> S6 cross-link-unsupported otherwise (jest, pytest); a W
+//      package.json, lockfile, tsconfig*.json or vitest/vite config -> S6 config-changed; a W test
+//      file (JS_TEST_RE, __tests__) is dropped with a note; a gone one (deleted, rename source) ->
+//      S6 cross-link-gone; the resolved vitest's major must be CROSS_LINK_VITEST_MAJOR (checked
+//      after the entry, F) -> S6 cross-link-unsupported. G.7a reads only the in-repo files' dirs,
+//      never W. Each existing one is an input in every spelling of SD-P3a-2: its real path, then
+//      crossLinkRoot + rel and each crossLinkAliases entry + rel, deduplicated by exact string
+//      (vitest matches related ids exactly, so case-only variants are kept), never a spelling with
+//      a node_modules segment (vitest skips those ids). The spec then has crossLink: true.
+//      Without crossLinkRoot nothing here applies.
 //   5. canonical = P.join(gitRoot, rel), so drive-letter case and separators follow gitRoot.
 //      Deduplicate by key and sort by key. Spaces and unicode need nothing special: each path is
 //      one argv element.
@@ -927,6 +941,7 @@
 //     yarn-pnp                 yarn Plug'n'Play has no node_modules to resolve <pkg> from
 //     bad-bin                  invalid bin for <pkg>: <detail>
 //     config-changed           config file changed: <rel>
+//                              config file changed in the linked repository: <rel>   (G.4b)
 //     deleted-no-tests         deleted source <rel>: no test file references "<stem>"
 //     stem-too-common          deleted source <rel>: "<stem>" appears in <n> test files (limit 20)
 //     search-failed            test search failed for <rel>
@@ -947,6 +962,13 @@
 //                              its fixtures reach cannot be mapped
 //                              package structure changed: <rel> deleted; pytest import paths
 //                              may shift   (G.8, QA-G-22; <rel> ends in __init__.py)
+//     cross-link-unsupported   a change in a linked repository needs vitest 5 to scope: this
+//                              check runs <jest|pytest>
+//                              ... the resolved vitest is <version|of an unknown version>
+//                              every spelling of <rel> in the linked repository lies under
+//                              node_modules, which vitest related skips   (G.4b, cross-repo P3a)
+//     cross-link-gone          changed file gone in the linked repository (deleted or renamed
+//                              away): <rel>   (G.4b; <rel> is relative to the linked repository)
 //   M.2 NoAffected notes:
 //     "no changed files, no affected tests"                          (section 1.5-6, exactly)
 //     "no affected tests: no changed file is a test input"           (docs only, dropped paths,
@@ -1188,7 +1210,9 @@ export type S6Code =
   | "node-not-found"
   | "too-many-searches"
   | "config-too-large"
-  | "unmapped-module";
+  | "unmapped-module"
+  | "cross-link-unsupported"
+  | "cross-link-gone";
 
 /** S6: scoping is impossible. The reason names the construct (section M.1) and never triggers a full suite. */
 export interface Unverifiable {
@@ -1457,6 +1481,11 @@ export interface ScopedSpec {
    * reporting 0 tests as incomplete (I step 2a).
    */
   readonly lexicalPaths?: true;
+  /**
+   * Cross-repo P3a (G.4b): some inputs are files of another repository (crossLinkRoot) that the
+   * consumer reaches through a link. Always a vitest `related` spec.
+   */
+  readonly crossLink?: true;
 }
 
 /** An executable scoped eslint run (section K). Pass or fail comes from the exit code. */
@@ -1502,6 +1531,19 @@ export interface PlanScopedRunInput {
   readonly fs: PlannerFs;
   readonly search: TestSearchSeam;
   readonly host?: Partial<RunnerHost>;
+  /**
+   * Cross-repo P3a (G.4b): the git top of the repository W whose change this consumer check in `cwd`
+   * covers (SD-P3a-5). With it, a changed path inside W becomes a vitest `related` input, in every
+   * spelling of SD-P3a-2, instead of being dropped as outside the git root. planScopedLint ignores
+   * it (a foreign lint stays full-only). Unset by every caller today.
+   */
+  readonly crossLinkRoot?: string;
+  /**
+   * Other spellings of crossLinkRoot's directory, such as the JS fs.realpathSync of a consumer link
+   * into W (it keeps the link's stored target text, which vite uses). Each one + the relative path
+   * is an input too (SD-P3a-2). Used only with crossLinkRoot.
+   */
+  readonly crossLinkAliases?: readonly string[];
 }
 
 /** planScopedRun's input without the process-backed search. */
@@ -4187,6 +4229,8 @@ const NOTE_NO_LINT = "no changed lintable files";
 const NOTE_NO_RERUN = "no rerun: none of the test files exist in this tree";
 
 interface FileRef {
+  /** G.4b: a file of the cross-link repository W; abs is its real path and rel is relative to W's real top. */
+  readonly external?: true;
   readonly abs: string;
   readonly rel: string;
   /** The basename as the producer spelled it, before realpath (a trigger reached through a symlink). */
@@ -4280,6 +4324,87 @@ async function readBounded(fs: PlannerFs, abs: string): Promise<string | undefin
   }
 }
 
+/** G.4b (cross-repo P3a): the cross-link repository W as the planner sees it. */
+interface CrossLink {
+  /** realOf(crossLinkRoot): external FileRefs lie below it and are relative to it. */
+  readonly real: string;
+  /** W's top as given (crossLinkRoot), then each crossLinkAliases entry, absolute and in order. */
+  readonly spellings: readonly string[];
+}
+
+/** SD-P3a-4: the vitest major whose `related` run across a link is pinned (the Y5 integration test). */
+const CROSS_LINK_VITEST_MAJOR = 5;
+
+/** G.4b: W from the input, or undefined without a usable crossLinkRoot (then nothing of G.4b applies). */
+async function crossLinkOf(ctx: Ctx, fs: PlannerFs, cwd: string, input: StaticScopingInput): Promise<CrossLink | undefined> {
+  const usable = (p: string | undefined): p is string => p !== undefined && p !== "" && !p.includes("\0");
+  if (!usable(input.crossLinkRoot)) return undefined;
+  const abs = (p: string) => ctx.P.resolve(cwd, stripWinPrefix(ctx, p));
+  const given = abs(input.crossLinkRoot);
+  return { real: await realOf(ctx, fs, given), spellings: [given, ...(input.crossLinkAliases ?? []).filter(usable).map(abs)] };
+}
+
+/** True when a segment of `p` is node_modules: vitest's related graph skips such ids (X4). */
+function hasNodeModulesSegment(ctx: Ctx, p: string): boolean {
+  return p.split(/[\\/]/).some((s) => ctx.key(s) === "node_modules");
+}
+
+/**
+ * SD-P3a-2: every spelling of the external file `f` vitest may hold as a module id: its real path
+ * (as realOf produced it), then each of W's spellings + its relative path. Deduplicated by exact
+ * string (a case-only variant is another id to vitest); a spelling with a node_modules segment is
+ * never passed.
+ */
+function crossSpellings(ctx: Ctx, cross: CrossLink, f: FileRef): string[] {
+  const parts = f.rel.split("/");
+  const all = [f.abs, ...cross.spellings.map((d) => ctx.P.join(d, ...parts))];
+  return [...new Set(all)].filter((s) => !hasNodeModulesSegment(ctx, s));
+}
+
+/** G.4b: a W test file (classify's JS rule). The consumer's related run never runs W's own tests. */
+function isCrossTest(ctx: Ctx, f: FileRef): boolean {
+  return JS_TEST_RE.test(ctx.P.basename(f.abs)) || f.rel.split("/").includes("__tests__");
+}
+
+/**
+ * G.4b (SD-P3a-4, SD-P3a-7): the S6s the external files reach without a config read or a search,
+ * so planScopedRun and planStaticScoping agree. Non-input external files (G.8) are never looked
+ * at here; classify skips them. The vitest major is checked after the entry is resolved (classify).
+ */
+async function crossLinkChecks(
+  ctx: Ctx,
+  fs: PlannerFs,
+  det: Detected<RunnerKind>,
+  sorted: readonly FileRef[],
+  cross: CrossLink,
+): Promise<Unverifiable | undefined> {
+  const ext = sorted.filter((f) => f.external === true && !isNonInput(ctx, f));
+  if (ext.length === 0) return undefined;
+  if (det.kind !== "vitest") {
+    return s6("cross-link-unsupported", `a change in a linked repository needs vitest ${CROSS_LINK_VITEST_MAJOR} to scope: this check runs ${det.kind}`);
+  }
+  for (const f of ext) {
+    if (namesOf(ctx, f).some((b) => TRIGGERS.vitest.test(b))) return s6("config-changed", `config file changed in the linked repository: ${f.rel}`);
+  }
+  for (const f of ext) {
+    if (isCrossTest(ctx, f)) continue;
+    if (!(await existsCached(ctx, fs, f.abs))) {
+      return s6("cross-link-gone", `changed file gone in the linked repository (deleted or renamed away): ${f.rel}`);
+    }
+    if (crossSpellings(ctx, cross, f).length === 0) {
+      return s6("cross-link-unsupported", `every spelling of ${f.rel} in the linked repository lies under node_modules, which vitest related skips`);
+    }
+  }
+  return undefined;
+}
+
+/** SD-P3a-4: the resolved vitest's major must be CROSS_LINK_VITEST_MAJOR. */
+function crossLinkVersion(entry: ResolvedEntry): Unverifiable | undefined {
+  if (Number.parseInt(entry.version ?? "", 10) === CROSS_LINK_VITEST_MAJOR) return undefined;
+  const found = entry.version === undefined ? "of an unknown version" : entry.version;
+  return s6("cross-link-unsupported", `a change in a linked repository needs vitest ${CROSS_LINK_VITEST_MAJOR} to scope: the resolved vitest is ${found}`);
+}
+
 /** G.3-G.5 for one path: canonical absolute path inside gitRoot, or undefined. */
 function canonicalize(ctx: Ctx, cwd: string, gitRoot: string, p: string): FileRef | undefined {
   const abs = ctx.P.resolve(cwd, p);
@@ -4302,20 +4427,27 @@ async function plan(input: StaticScopingInput, search: TestSearchSeam | undefine
   const gitRoot = det.gitRoot;
   const cwd = await canonicalCwd(ctx, fs, input.cwd);
   const notes: string[] = [...det.notes];
-  const sorted = await collectChanged(ctx, fs, cwd, gitRoot, input.changedFiles, notes);
+  const cross = await crossLinkOf(ctx, fs, cwd, input);
+  const sorted = await collectChanged(ctx, fs, cwd, gitRoot, input.changedFiles, notes, cross);
   if (sorted.length === 0) return s6("attribution-unavailable", NO_PATH_KEPT);
+  if (cross) {
+    const bad = await crossLinkChecks(ctx, fs, det, sorted, cross);
+    if (bad) return bad;
+  }
+  // G.4b: G.7 and G.7a look at the in-repo files only, so no config read walks into W.
+  const local = cross ? sorted.filter((f) => f.external !== true) : sorted;
 
   // G.7: config triggers.
   const sourcePj = det.source.type === "script" ? ctx.key(det.source.packageJson) : undefined;
   const configKeys = new Set((det.configFiles ?? []).map((p) => ctx.key(p)));
   const js = det.kind === "vitest" || det.kind === "jest";
   if (js) {
-    const early = await jsCheapChecks(ctx, fs, sorted);
+    const early = await jsCheapChecks(ctx, fs, cross ? sorted.filter((f) => !(f.external === true && isCrossTest(ctx, f))) : sorted);
     if (early) return early;
   }
-  const facts = js ? await jsConfigFacts(ctx, fs, det, changedNames(ctx, sorted), sorted) : undefined;
+  const facts = js ? await jsConfigFacts(ctx, fs, det, changedNames(ctx, local), local) : undefined;
   if (facts && isS6(facts)) return facts;
-  for (const f of sorted) {
+  for (const f of local) {
     const names = namesOf(ctx, f);
     const segs = f.rel.split("/");
     // QA-1.3-29: a setup file by name (not a test file), a bare setup.* in a test directory, or a
@@ -4329,7 +4461,7 @@ async function plan(input: StaticScopingInput, search: TestSearchSeam | undefine
       return s6("config-changed", `config file changed: ${f.rel}`);
     }
   }
-  return classify(ctx, input, det, sorted, notes, search);
+  return classify(ctx, input, det, sorted, notes, search, cross);
 }
 
 /** G.8: docs, licences and .github files are never inputs. */
@@ -4399,6 +4531,7 @@ async function collectChanged(
   gitRoot: string,
   changed: readonly ChangedPath[],
   notes: string[],
+  cross?: CrossLink,
 ): Promise<FileRef[]> {
   const files = new Map<string, FileRef>();
   for (const c of changed) {
@@ -4409,7 +4542,11 @@ async function collectChanged(
         continue;
       }
       const lexical = ctx.P.resolve(cwd, lexicalSpelling(ctx, cand));
-      const ref = canonicalize(ctx, gitRoot, gitRoot, await realOf(ctx, fs, lexical));
+      const real = await realOf(ctx, fs, lexical);
+      const inRepo = canonicalize(ctx, gitRoot, gitRoot, real);
+      // G.4b: outside the git root but inside the cross-link repository W -> an external file.
+      const inW = inRepo || !cross ? undefined : canonicalize(ctx, cross.real, cross.real, real);
+      const ref: FileRef | undefined = inRepo ?? (inW ? { ...inW, external: true } : undefined);
       if (!ref) {
         notes.push(`dropped outside the git root: ${cand}`);
         continue;
@@ -4437,6 +4574,7 @@ async function classify(
   sorted: readonly FileRef[],
   notes: string[],
   search: TestSearchSeam | undefined,
+  cross?: CrossLink,
 ): Promise<ScopingPlan | StaticScoping> {
   const P = ctx.P;
   const fs = input.fs;
@@ -4444,6 +4582,8 @@ async function classify(
   // G.8: classification. A test file the runner's config excludes stays an input (G.8a, QA-1.3-38).
   const inputs = new Map<string, string>();
   const addInput = (abs: string) => inputs.set(ctx.key(abs), abs);
+  // G.4b: the external inputs, every spelling (SD-P3a-2), deduplicated by exact string, not by key.
+  const crossInputs = new Set<string>();
   const goneSources: FileRef[] = [];
   const modules: FileRef[] = [];
   const goneModules: FileRef[] = [];
@@ -4459,6 +4599,12 @@ async function classify(
     const base = P.basename(f.abs);
     if (isNonInput(ctx, f) || (det.kind === "pytest" && !base.endsWith(".py"))) {
       skipped++;
+      continue;
+    }
+    if (f.external === true && cross) {
+      // G.4b: crossLinkChecks already returned S6 for a gone or unspellable one, and for any runner but vitest.
+      if (isCrossTest(ctx, f)) notes.push(`linked repository test file not run: ${f.rel}`);
+      else for (const s of crossSpellings(ctx, cross, f)) crossInputs.add(s);
       continue;
     }
     const exists = await existsCached(ctx, fs, f.abs);
@@ -4496,9 +4642,11 @@ async function classify(
   }
 
   if (!search) {
-    if (inputs.size === 0 && pending === 0) return noAffected(NOTE_NO_INPUT);
+    if (inputs.size === 0 && pending === 0 && crossInputs.size === 0) return noAffected(NOTE_NO_INPUT);
     const pre = await preflight(ctx, det, fs);
     if (isS6(pre)) return pre;
+    const old = crossInputs.size > 0 ? crossLinkVersion(pre.entry) : undefined;
+    if (old) return old;
     const staticNotes = [...notes, ...pre.notes];
     // QA-1.3-27: the spec-time pytest config lookup needs only the fs. Run it over the test inputs
     // known without a search, so 1.6 sees the S6 planScopedRun would return for them.
@@ -4642,16 +4790,31 @@ async function classify(
   // Every pytest module and gone module above added an input or returned S6, so an empty set here
   // means no changed file was a test input or a module (docs, dropped paths, deleted test files
   // nothing imports).
-  if (inputs.size === 0) return noAffected(NOTE_NO_INPUT);
+  if (inputs.size === 0 && crossInputs.size === 0) return noAffected(NOTE_NO_INPUT);
   const pre = await preflight(ctx, det, fs);
   if (isS6(pre)) return pre;
-  const F = [...inputs.entries()].sort(byKey).map(([, v]) => v);
+  const old = crossInputs.size > 0 ? crossLinkVersion(pre.entry) : undefined;
+  if (old) return old;
+  const F = crossInputs.size === 0 ? [...inputs.entries()].sort(byKey).map(([, v]) => v) : withCrossInputs(ctx, inputs, crossInputs);
   const allNotes = [...notes, ...pre.notes];
   const long = pytestArgvFloor(ctx, det, pre.entry, F);
   if (long) return long;
   const py = await pytestAtInputs(ctx, fs, det, F, det.runnerCwd, allNotes);
   if (py !== undefined && isS6(py)) return py;
-  return buildSpec(ctx, det, pre.entry, F, input.budget, input.cores, allNotes, "related", det.runnerCwd, gitRoot, !fs.realpath, py);
+  return buildSpec(ctx, det, pre.entry, F, input.budget, input.cores, allNotes, "related", det.runnerCwd, gitRoot, !fs.realpath, py, crossInputs.size > 0);
+}
+
+/**
+ * G.4b: the in-repo inputs (deduplicated by key) and the external spellings (deduplicated by exact
+ * string, SD-P3a-2) as one sorted list: by key, then by the exact string, so case-only variants of
+ * one path stay distinct and the order is deterministic.
+ */
+function withCrossInputs(ctx: Ctx, inputs: ReadonlyMap<string, string>, crossInputs: ReadonlySet<string>): string[] {
+  const all = [...new Set([...inputs.values(), ...crossInputs])];
+  return all
+    .map((v) => [ctx.key(v), v] as const)
+    .sort((a, b) => byKey(a, b) || (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0))
+    .map(([, v]) => v);
 }
 
 /** H, N.4 (QA-1.3-11): the tmpdir must be absolute and must not be inside gitRoot, lexically or after realpath. */
@@ -4707,6 +4870,7 @@ function buildSpec(
   gitRoot: string,
   lexical: boolean,
   py: PytestEvidence | undefined,
+  crossLink = false,
 ): ScopedSpec | Unverifiable {
   const C = inputCores ?? ctx.host.cores;
   const xdist = py ? py.xdist : det.xdist;
@@ -4751,6 +4915,7 @@ function buildSpec(
     workers,
     notes,
     ...(lexical ? { lexicalPaths: true as const } : {}),
+    ...(crossLink ? { crossLink: true as const } : {}),
   };
 }
 
