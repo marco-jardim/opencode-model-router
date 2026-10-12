@@ -2197,11 +2197,13 @@ verifications are then exercised for real, by the plan's remaining phases.
   [route class=implement risk=high scope=single needs=edit,shell d=deterministic root=D:\git\omr-cpx-p22 tier=medium pin]
   Writes: `D:\git\omr-cpx-main\src\executor\ledger.ts`. Reads: `D:\git\omr-cpx-main\src\executor\types.ts`,
   `D:\git\omr-cpx-main\src\executor\paths.ts`, `D:\git\omr-cpx-main\src\routing\file-lock.ts`.
-  - 2.2.2.a **Journal.** `events.<firstSeq>.jsonl` holds one `ExecutorEvent` per line, with a strictly increasing `seq`.
+  - 2.2.2.a **Journal.** `events.<firstSeq>.<epoch>.jsonl` (*Amended by A-2.2-1*) holds one `ExecutorEvent` per line,
+    with a strictly increasing `seq`.
     An fsync runs after **every** transition into `dispatched`, `running`, `completed`, `integrating`, `integrated`,
     `reverted` or `cancelled`, after every Attempt write, gate change and inbox write, and before the step becomes
     visible outside the plugin (a launch, a prompt returned to the host, a git ref move).
-  - 2.2.2.b **Snapshot.** `ledger.json` is written to `ledger.json.tmp-<pid>-<rand>`, fsynced, then renamed. On Windows,
+  - 2.2.2.b **Snapshot.** `ledger.<epoch>.json` (*Amended by A-2.2-1*: per-epoch names, not a single snapshot or
+    journal file) is written to `ledger.<epoch>.json.tmp-<pid>-<rand>`, fsynced, then renamed. On Windows,
     EPERM and EBUSY are retried within a 2 s budget. A snapshot is taken every 200 events and on close. After a
     snapshot the journal is **rotated** to a new file and old journal files are deleted only after a successful
     snapshot. Readers retry when the snapshot `seq` and the first journal `seq` do not match.
@@ -2210,7 +2212,8 @@ verifications are then exercised for real, by the plan's remaining phases.
     - A `seq` gap, or an illegal transition (`canTransition`), fails the load and names the offending event.
   - 2.2.2.d **Schema.** A newer schema is refused. Older ones migrate through an explicit table (empty at v1; tested).
   - 2.2.2.e **Single writer.** A lock file holds `{pid, hostname, sessionID, startedAt, heartbeatAt}`, with a 10 s
-    heartbeat. The lock is stale when the pid is dead on this host or the heartbeat is older than 60 s. Takeover happens
+    heartbeat (*Amended by A-2.2-1*: each holder also stamps its heartbeat in its own beat file `writer.<token>.beat`).
+    The lock is stale when the pid is dead on this host or the heartbeat is older than 60 s. Takeover happens
     only through `takeover(reason)`, which is journaled. Readers never take the lock.
   - 2.2.2.f `remove(planId)` deletes the plan directory; only for completed or aborted plans.
   [acceptance]
@@ -2387,10 +2390,12 @@ The result is safe to run in parallel.
       other roots such as `D:\git\omr-<prefix>-<id>` are mapped through a repo-relative suffix that exists;
     - repo-relative paths that contain a separator;
     - backticked file names resolved through `git ls-files`, used only when the match is unique;
-    - new files marked `*(new)*` or introduced by a create verb, when their parent exists or is created earlier;
+    - new files marked `*(new)*` or introduced by a create verb, when their parent exists or is created earlier
+      (*Amended by A-2.3-1:* also when the new file is named under another worktree of the repository);
     - URLs, and paths outside the repository or on another drive, are ignored and reported.
   - 2.3.3.b Write versus read classification:
-    - `Writes:` lines and ownership-table rows count as writes (`explicit`, `ownership`);
+    - `Writes:` lines and ownership-table rows count as writes (`explicit`, `ownership`); *Amended by A-2.3-1:* the
+      ownership fallback is reported as `inferred`, with an `ownership-assumed` diagnostic;
     - write verbs also count as writes (`explicit`): "In `X`:", implement, create, add to, modify, update, replace,
       tests in, move, delete;
     - `Reads:` lines and other mentions count as reads (`inferred`);
@@ -2466,7 +2471,8 @@ The result is safe to run in parallel.
   - 2.3.6.c `compile(planPath, opts) → {draft, residueRequest?, summary}` implements `PlanCompiler`. `opts.phases` (ids)
     compiles only those phases; `opts.doneBefore` (a phase id) records every task of earlier phases as `done` with the
     evidence "merged before the run", so edges into them are satisfied. `doneBefore` also sets every earlier phase gate
-    to `passed`.
+    to `passed`. *Amended by A-2.3-1:* `addTasks(ledger, text)` is synchronous (lexical-only path normalization, no git
+    lookups).
   [acceptance]
   cwd: D:\git\omr-cpx-p23
   check: buildPasses
@@ -2594,7 +2600,9 @@ The result is safe to run in parallel.
 **Tasks**
 - **2.4.1** [tier:heavy] CAP:5 Design memo (returned; recorded by the orchestrator).
   [route class=design risk=high scope=multi d=none root=D:\git\omr-cpx-p24 tier=heavy pin]
-  Writes: none. Reads (pasted): the pre-flight excerpts and measurements.
+  Writes: none. Reads (pasted): the pre-flight excerpts and measurements. *Amended by A-2.4-1:* the decisions DV1–DV10
+  of the memo (§0 "Decisions that change the plan text" in `D:\git\omr-cpx-main\docs\qa\critical-path-execution\phase-2.4.md`)
+  are binding where they change 2.4.2–2.4.6; they are not copied into the plan.
   The memo covers:
   - slot layout, with markers kept in the executor home;
   - the lifecycle: absent → creating → provisioning → ready ⇄ leased → resetting → ready; broken; retired;
@@ -2639,8 +2647,10 @@ The result is safe to run in parallel.
   `D:\git\omr-cpx-main\src\executor\types.ts`, `D:\git\omr-cpx-main\src\executor\slots\provision.ts`,
   the design memo in `D:\git\omr-cpx-main\docs\qa\critical-path-execution\phase-2.4.md` (`## Implementation notes`).
   - 2.4.3.a Layout:
-    - `slotsDir` comes from `ExecutorConfig` (trusted and validated, D18);
-    - it contains `slot-<n>\`, `integration\` and `ci\`;
+    - `slotsDir` comes from `ExecutorConfig` (trusted and validated, D18); *Amended by A-2.4-1:* when it is `null`, it
+      is `defaultSlotsDir(toplevel, planId)` = `<repo drive>:\.omr-slots\<planId>`, exported from `slots\pool.ts`;
+    - it contains `slot-<n>\`, `integration\` and `ci\`; *Amended by A-2.4-1:* the integration slot path is
+      `ledger.integration.worktree`;
     - markers are `<markersDir>\<slot>.json` (planId, repo key, kind, state, provisioned manifest digests, createdAt),
       where `markersDir` is injected and is the executor home's `slots\`;
     - nothing is written into the repository's `info/exclude`.
@@ -2715,7 +2725,8 @@ The result is safe to run in parallel.
   `D:\git\omr-cpx-main\test\unit\executor-slots.test.ts`,
   `D:\git\omr-cpx-main\test\unit\executor-provision.test.ts`,
   `D:\git\omr-cpx-main\test\integration\executor-slots-git.test.ts`,
-  `D:\git\omr-cpx-main\test\smoke\cpx-provision.smoke.test.ts` and
+  `D:\git\omr-cpx-main\test\smoke\cpx-provision.smoke.test.ts`,
+  `D:\git\omr-cpx-main\package.json` (script `smoke:cpx:provision`; *Amended by A-2.4-1*) and
   `D:\git\omr-cpx-main\test\fixtures\cpx\repos\`:
   - `node-npm` and `node-pnpm`, with zero registry dependencies;
   - `py-pip`, with `requirements.txt` and no `-e .`, plus a `tests` package;
@@ -3309,7 +3320,8 @@ The result is safe to run in parallel.
     - the trusted keys are dropped from the project-local override, with the existing one-line notice;
     - `slotsDir` is validated: absolute, on the repository's drive, not a drive root, neither inside nor an ancestor of
       the repository, and free of `*`;
-    - `slotsDir` defaults to `null`, which means computed.
+    - `slotsDir` defaults to `null`, which means computed (*Amended by A-2.4-1:* `defaultSlotsDir(toplevel, planId)` from
+      `D:\git\omr-cpx-main\src\executor\slots\pool.ts`).
   - 4.1.1.c On v1, any `routing.executor.*` key logs one notice and is ignored.
   - 4.1.1.d The routing table rows have no `routing.` prefix, and object keys expand into leaf rows.
     `D:\git\omr-cpx-main\docs\CONFIG_REFERENCE.md` gets a "Trust" subsection.
@@ -4378,7 +4390,7 @@ All keys are v2 only. They are documented as rows of the routing table in
 | `routing.leases.mode` | string | `"enforce"` | `"enforce"`, `"off"` | no | 2.1 |
 | `routing.leases.run` | string | `"annotate"` | `"annotate"`, `"refuse"` | no | 2.1 |
 | `routing.executor.maxParallel` | integer | `4` | 1–8 (largest concurrency proven by C13 and C14; ADR 0007 D13) | no | 4.1 |
-| `routing.executor.slotsDir` | string or null | `null` (computed: `<repo parent>\.omr-slots\<repo>-<hash>`) | absolute; on the repository's drive; not a drive root; neither inside nor an ancestor of the repository; no `*` | **yes** | 4.1 |
+| `routing.executor.slotsDir` | string or null | `null` (computed: `<repo drive>:\.omr-slots\<planId>`, `defaultSlotsDir`; *Amended by A-2.4-1*) | absolute; on the repository's drive; not a drive root; neither inside nor an ancestor of the repository; no `*` | **yes** | 4.1 |
 | `routing.executor.approve` | string | `"ask"` | `"ask"`, `"auto"` | no | 4.1 |
 | `routing.executor.crossPhase` | string | `"gate"` | `"gate"`, `"inferred"` | no | 4.1 |
 | `routing.executor.land` | string | `"ff-when-clean"` | `"ff-when-clean"`, `"manual"` | no | 4.1 |
@@ -4529,5 +4541,8 @@ Node ≥ 22.18; DF-2 switch procedure and the 24 h pending TTL from DF-1; QA tas
 - **A-1.2-1** (QA-1.2-12, -16) — the D4 hint goes on the last non-blank text part of the last real message, else on its last `tool-result` or `media` part, else no hint, never an earlier message. Observed on v2.0.26: the `tool_result` block carries the marker. "Never on the tail" holds only while the host's four-marker budget is used. Changed in the D4 row, 1.2.1 memo, 1.2.5.a and the 1.2 test bullets.
 - **A-1.3-1** (Phase 1.3, ADR 0007 D7) — 1.3.3.b/c: read, search and run restrictions apply to another child session (root sessions are never refused); lease ownership is the task (`taskRef`); read/run conflicts are decided per owner; a run also conflicts with leases under the run directory; unkeyable spellings fail closed; `checkRun` costs the leases of the run tree plus those under the run directory, not O(1).
 - **A-1.4-1** (Phase 1.4 contract addenda A1–A3) — `docs\qa\critical-path-execution\phase-1.4.md` addenda are binding where they change Appendix A, 3.1.1 (lease seam, A3), 3.1.4 (`formatLaunchPrompt`), 3.1.5 (`bootID`, context pin), 3.2.3.c (`resume()`, A1-3/A2) and 4.2.2 (`qa-cap` answers). The addenda are not copied into the plan.
+- **A-2.2-1** (Phase 2.2) — 2.2.2.a/b/e: the ledger state is kept in per-epoch files `ledger.<epoch>.json` (snapshot) and `events.<first>.<epoch>.jsonl` (journal), plus one beat file per holder (`writer.<token>.beat`), not in single snapshot and journal files. Recorded in `docs\qa\critical-path-execution\phase-2.2.md` "Plan amendments".
+- **A-2.3-1** (Phase 2.3, approved extensions) — 2.3.3.b: the ownership fallback is reported as `inferred` with an `ownership-assumed` diagnostic; 2.3.3.a: new files are also recognized under another worktree of the repository; 2.3.6.c: `addTasks` is synchronous. Recorded in `docs\qa\critical-path-execution\phase-2.3.md` "Plan amendments".
+- **A-2.4-1** (Phase 2.4 orchestrator decisions) — DV1–DV10 of the 2.4.1 design memo (§0 "Decisions that change the plan text" in `docs\qa\critical-path-execution\phase-2.4.md`) are binding where they change Phase 2.4 and are not copied into the plan (2.4.1); 2.4.6 Writes adds `package.json` (script `smoke:cpx:provision`); 2.4.3.a, 4.1.1.b and the Appendix C `routing.executor.slotsDir` row: the computed slots directory is `defaultSlotsDir(toplevel, planId)` = `<repo drive>:\.omr-slots\<planId>`, exported from `slots\pool.ts`, and the integration slot path is `ledger.integration.worktree`. Recorded in `docs\qa\critical-path-execution\phase-2.4.md` "Plan amendments".
 
 **Owner execution rules for the implementation session** — §0.14 (continuous iteration, momentary takeover, atomic delegation with [tier:heavy] for complex coding and lighter test runs, bounded QA rounds, pre-flight fix-or-document, Linear not used, worktree reporting), the testing policy (§0.6-9: scoped, accelerated, full suite only in 6.2), the bounded executor QA loop (default 3 rounds), and the handover's kickoff prompt.
