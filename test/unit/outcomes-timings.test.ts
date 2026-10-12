@@ -1,8 +1,8 @@
 import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDurationModel } from "../../src/routing/outcomes/durations";
 import { createSideLogs, nodePersistDeps, nodePersistFs } from "../../src/routing/outcomes/persist";
 import {
@@ -1206,7 +1206,7 @@ describe("timing recorder: shared per directory (QA-1.1-3)", () => {
     expect(seen).toEqual(["dispatch-timing"]);
   });
 
-  it("a later acquirer with other settings is told once, at info; the first caller's settings apply (QA-1.1-24)", () => {
+  it("a later acquirer with another clock, logger or turnIdleMs is not reported: every plugin instance passes its own (QA-PDF12-8)", () => {
     const infos: Logged[] = [];
     const infoLogger: TimingLogger = {
       warn: () => undefined,
@@ -1214,35 +1214,14 @@ describe("timing recorder: shared per directory (QA-1.1-3)", () => {
         infos.push({ message, extra });
       },
     };
-    const first = acquireTimingRecorder({ dir, now, logger: infoLogger, turnIdleMs: 1_000 });
-    holders.push(first);
-    holders.push(acquireTimingRecorder({ dir, now, logger: infoLogger, turnIdleMs: 1_000 })); // identical: silent
-    expect(infos).toEqual([]);
+    holders.push(acquireTimingRecorder({ dir, now, logger: infoLogger, turnIdleMs: 1_000 }));
     holders.push(acquireTimingRecorder({ dir, now, logger: infoLogger, turnIdleMs: 5_000 }));
     holders.push(acquireTimingRecorder({ dir, now: () => NOW + 1, logger: infoLogger }));
-    expect(infos).toHaveLength(1);
-    expect(infos[0]?.extra).toEqual({ dir });
+    holders.push(acquireTimingRecorder({ dir, now, logger: { warn: () => undefined, info: (message, extra) => void infos.push({ message, extra }) } }));
+    expect(infos).toEqual([]);
   });
 
-  it("a later acquirer with a different clock or logger is told too, on that logger (QA-1.1-24)", () => {
-    const infos: Logged[] = [];
-    holders.push(acquire());
-    holders.push(
-      acquireTimingRecorder({
-        dir,
-        now,
-        logger: {
-          warn: () => undefined,
-          info: (message, extra) => {
-            infos.push({ message, extra });
-          },
-        },
-      }),
-    );
-    expect(infos).toHaveLength(1);
-  });
-
-  it("a later acquirer that passes nothing different, or whose logger has no info, is silent", () => {
+  it("a later acquirer whose logger has no info does not throw and stays silent", () => {
     holders.push(acquire());
     expect(() => holders.push(acquireTimingRecorder({ dir, now, logger: { warn: () => undefined }, turnIdleMs: 9 }))).not.toThrow();
     holders.push(acquireTimingRecorder({ dir, now }));
@@ -1262,6 +1241,130 @@ describe("timing recorder: shared per directory (QA-1.1-3)", () => {
     await rec.onExecutionOutcome("child-1", "evt-1", "succeeded", NOW + 1);
     expect(timingRows()).toHaveLength(1);
     expect(seen).toEqual(["dispatch-timing"]);
+  });
+});
+
+describe("timing recorder: shared across module copies (DF-1.1-2)", () => {
+  type TimingsModule = typeof import("../../src/routing/outcomes/timings");
+  const step = { input: 10, cacheRead: 20, cacheWrite: 30 };
+  const REGISTRY_KEY = Symbol.for("opencode-model-router.timings.registry.v2"); // the current TIMING_REGISTRY_VERSION (asserted below)
+  const holders: Array<{ release(): Promise<void> }> = [];
+
+  // The host loads the plugin once per booted location: each load is a distinct module instance in one process.
+  async function loadCopy(): Promise<TimingsModule> {
+    vi.resetModules();
+    return await import("../../src/routing/outcomes/timings");
+  }
+
+  afterEach(async () => {
+    for (const holder of holders.splice(0)) await holder.release();
+    delete (globalThis as unknown as Record<symbol, unknown>)[REGISTRY_KEY];
+  });
+
+  it("two module copies share one recorder per directory: one root run yields one turn row, numbering never restarts", async () => {
+    const copyA = await loadCopy();
+    const copyB = await loadCopy();
+    expect(copyB).not.toBe(copyA);
+    expect(copyB.acquireTimingRecorder).not.toBe(copyA.acquireTimingRecorder);
+    const a = copyA.acquireTimingRecorder({ dir, now, logger });
+    const b = copyB.acquireTimingRecorder({ dir, now, logger });
+    holders.push(a, b);
+
+    a.markRootSession("root-1");
+    expect(b.isRootSession("root-1")).toBe(true); // one recorder, not two
+    b.markRootSession("root-1");
+    a.onRootStep("root-1", step, "step-1");
+    b.onRootStep("root-1", step, "step-1"); // the same host event, delivered to both copies
+    await a.onRootPrompt("root-1", NOW, "prompt-1");
+    await b.onRootPrompt("root-1", NOW, "prompt-1");
+    expect(turnRows()).toHaveLength(1);
+    expect(turnRows()[0]).toMatchObject({ steps: 1, turn: 1 });
+
+    b.onRootStep("root-1", step, "step-2");
+    a.onRootStep("root-1", step, "step-2");
+    await b.onRootPrompt("root-1", NOW + 1, "prompt-2");
+    await a.onRootPrompt("root-1", NOW + 1, "prompt-2");
+    expect(turnRows().map(row => row.turn)).toEqual([1, 2]);
+  });
+
+  it("holders of different copies share one refcount: releasing one keeps the other working", async () => {
+    const copyA = await loadCopy();
+    const copyB = await loadCopy();
+    const a = copyA.acquireTimingRecorder({ dir, now, logger });
+    const b = copyB.acquireTimingRecorder({ dir, now, logger });
+    holders.push(a, b);
+    a.markRootSession("root-1");
+    a.onRootStep("root-1", step);
+    await a.release();
+    expect(turnRows()).toEqual([]); // not the last holder: no flush yet
+    expect(b.isRootSession("root-1")).toBe(true);
+    await b.release();
+    expect(turnRows()).toHaveLength(1);
+    const again = copyA.acquireTimingRecorder({ dir, now, logger });
+    holders.push(again);
+    expect(again.isRootSession("root-1")).toBe(false); // the registry entry is gone: a fresh recorder
+  });
+
+  it("replaces a foreign value in the process-wide slot", async () => {
+    (globalThis as unknown as Record<symbol, unknown>)[REGISTRY_KEY] = { not: "a map" };
+    const copy = await loadCopy();
+    const holder = copy.acquireTimingRecorder({ dir, now, logger });
+    holders.push(holder);
+    holder.markRootSession("root-1");
+    expect(holder.isRootSession("root-1")).toBe(true);
+    expect((globalThis as unknown as Record<symbol, unknown>)[REGISTRY_KEY]).toBeInstanceOf(Map);
+  });
+
+  describe("version guard (QA-PDF12-4)", () => {
+    // Another build's entry: same directory key, other version, a recorder of another shape (no methods at all).
+    function plantForeignEntry(version: unknown): { entry: Record<string, unknown>; registry: Map<string, unknown> } {
+      const registry = new Map<string, unknown>();
+      const entry: Record<string, unknown> = { version, recorder: { foreign: true }, observers: new Set(), refs: 1 };
+      const id = process.platform === "win32" ? resolve(dir).toLowerCase() : resolve(dir);
+      registry.set(id, entry);
+      (globalThis as unknown as Record<symbol, unknown>)[REGISTRY_KEY] = registry;
+      return { entry, registry };
+    }
+
+    it("exports the version the entries are stamped with", async () => {
+      const copy = await loadCopy();
+      expect(copy.TIMING_REGISTRY_VERSION).toBe(2);
+      expect(Symbol.keyFor(REGISTRY_KEY)).toBe(`opencode-model-router.timings.registry.v${copy.TIMING_REGISTRY_VERSION}`);
+    });
+
+    it.each([[999], ["1"], [undefined]])("an entry of version %s is not reused and not touched; two same-version copies still share one recorder (QA-PDF12-11)", async version => {
+      const { entry, registry } = plantForeignEntry(version);
+      const snapshot = { ...entry };
+      const copyA = await loadCopy();
+      const copyB = await loadCopy();
+      const a = copyA.acquireTimingRecorder({ dir, now, logger });
+      const b = copyB.acquireTimingRecorder({ dir, now, logger });
+      holders.push(a, b);
+      a.markRootSession("root-1");
+      expect(a.isRootSession("root-1")).toBe(true); // its own recorder, not the foreign `{ foreign: true }`
+      expect(b.isRootSession("root-1")).toBe(true); // one recorder for both copies, never a private one each
+      expect(registry.size).toBe(2); // the foreign entry and the one both copies share
+      expect([...registry.values()]).toContain(entry);
+      expect(entry).toEqual(snapshot);
+      expect(entry.refs).toBe(1);
+      await a.release();
+      await b.release();
+      expect(registry.size).toBe(1); // releasing the shared entry leaves the foreign one in place
+      expect(entry).toEqual(snapshot);
+    });
+
+    it("an entry of the current version is reused", async () => {
+      const copyA = await loadCopy();
+      const a = copyA.acquireTimingRecorder({ dir, now, logger });
+      holders.push(a);
+      const copyB = await loadCopy();
+      const b = copyB.acquireTimingRecorder({ dir, now, logger });
+      holders.push(b);
+      a.markRootSession("root-1");
+      expect(b.isRootSession("root-1")).toBe(true);
+      const registry = (globalThis as unknown as Record<symbol, Map<string, { version: number }>>)[REGISTRY_KEY];
+      expect([...(registry?.values() ?? [])].map(e => e.version)).toEqual([copyA.TIMING_REGISTRY_VERSION]);
+    });
   });
 });
 

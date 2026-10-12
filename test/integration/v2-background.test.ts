@@ -862,6 +862,33 @@ describe("the pending journal fails under a held dispatch (QA-2.1-3, QA-2.1-8)",
     warn.mockRestore();
   });
 
+  it("QA-PDF12-2: the rewrite of a vanished journal from memory keeps each dispatch's caller agent and message (inflight and hold)", async () => {
+    const h = await boot("auto");
+    h.emit(created(CHILD, ORCH));
+    await h.drain();
+    const call = await h.before(dispatch({ background: true }));
+    await h.after({ ...call, status: "completed", result: structuredClone(RUNNING) });
+    await h.settled();
+    rmSync(h.journalPath);
+    const second = "child-pdf122";
+    h.sessions.set(second, { parentID: ORCH });
+    h.emit(created(second, ORCH));
+    await h.drain();
+    // The next journal write finds the journal gone: it is rewritten from the in-memory state (the adapter's and the holds').
+    const next = await h.before(dispatch({ background: true }));
+    await h.after({ ...next, status: "completed", result: { output: { sessionID: second, status: "running", output: "Working" }, content: "Working", metadata: { sessionID: second } } });
+    await h.settled();
+    const records = readFileSync(h.journalPath, "utf8").split("\n").filter((line) => line !== "").map((line) => JSON.parse(line) as Record<string, unknown>);
+    const rewritten = records.filter((r) => (r.kind === "inflight" || r.kind === "hold") && r.callID === call.id);
+    expect(rewritten.map((r) => r.kind).sort()).toEqual(["hold", "inflight"]);
+    for (const record of rewritten) {
+      expect(record.callerAgent).toBe(call.agent);
+      expect(record.callerMessageID).toBe(call.messageID);
+    }
+    expect(call.agent).not.toBe("");
+    expect(call.messageID).not.toBe("");
+  });
+
   it("QA-2.1-20: while the journal is not reloaded, a Code Mode execute that resumes an unknown session is refused like a subagent resume", async () => {
     // QA-2.1-16 recreates a vanished journal, so the reload-failed state is made deterministic another way: a directory sits
     // where pending.jsonl belongs. The reload at start fails (the file cannot be read), and so does every retry; nothing has

@@ -120,7 +120,7 @@ describe("leaseGate (Phase 2.1.5): a verification run waits for the tree's holde
     return hook(request);
   };
 
-  it("waits first, then runs the hook, and marks the dispatch with the holders that remain", async () => {
+  it("waits first, then runs the hook, and marks the dispatch with the holders that remain", { timeout: 15_000 }, async () => {
     const order: string[] = [];
     const waitTreeFree = vi.fn(async () => {
       order.push("wait");

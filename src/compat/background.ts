@@ -182,6 +182,15 @@ export interface FinishInput {
 }
 
 /**
+ * QA-PDF12-9: the caller of the dispatch a completion finishes, from the attempt the completion processor holds (never a
+ * capped lookup by call id), so the finish seam runs the graders as that caller.
+ */
+export interface FinishCaller {
+  callerAgent?: string;
+  callerMessageID?: string;
+}
+
+/**
  * QA-2.1-17: the dispatch data journaled with an `inflight` and a `hold` record (field `dispatch`), from `FinishApi.dispatchOf`.
  * Any field may be missing (an older record, or a dispatch the plugin did not see).
  */
@@ -332,7 +341,19 @@ export type AttemptState =
 export interface CallRecord {
   callID: string;
   parentSessionID: string;
+  /** The DISPATCHED agent (`output.args.agent`). */
   agent: string;
+  /**
+   * DF-1.1-1: the CALLER (orchestrator) agent that made the `subagent` call. The completion finish (grader launch) runs
+   * as this agent: the host checks the caller's `subagent:<grader>` permission, never the dispatched child's.
+   * Absent for a record journaled before this field existed.
+   */
+  callerAgent?: string;
+  /**
+   * QA-PDF12-5: the id of the caller's message that made the `subagent` call, so the completion finish runs in a context with
+   * the call's real ids (never an empty message id). Absent for a record journaled before this field existed.
+   */
+  callerMessageID?: string;
   role?: string;
   description: string;
   verifying: boolean;
@@ -399,8 +420,24 @@ const OPEN_STATES: ReadonlySet<AttemptState> = new Set<AttemptState>(["acknowled
 const TERMINAL_STATES: ReadonlySet<AttemptState> = new Set<AttemptState>(["released", "foreground", "cancelled", "closed-unknown"]);
 
 /** Process-wide call claims (`bg:<callID>`), shared by every plugin instance of the process; bounded. */
-const PROCESS_CLAIMS = new Set<string>();
-const MAX_CLAIMS = 1000;
+export const MAX_CLAIMS = 1000;
+/** QA-PDF12-13: the bound of the whole shared set, whichever instances own its claims. */
+export const MAX_PROCESS_CLAIMS = 8 * MAX_CLAIMS;
+
+/**
+ * DF-1.1-1: the plugin can be loaded as several module copies in one process (one per booted host location), and a
+ * module-level set would then be one set per copy, so two copies would both claim a callID and complete it twice. The
+ * set lives on `globalThis` under a versioned registry key instead, so every copy shares it.
+ */
+const PROCESS_CLAIMS_KEY = Symbol.for("opencode-model-router.background-claims.v1");
+function processClaims(): Set<string> {
+  const registry = globalThis as unknown as Record<symbol, Set<string> | undefined>;
+  const existing = registry[PROCESS_CLAIMS_KEY];
+  if (existing instanceof Set) return existing;
+  const created = new Set<string>();
+  Object.defineProperty(globalThis, PROCESS_CLAIMS_KEY, { value: created, configurable: true, enumerable: false, writable: true });
+  return created;
+}
 
 /** The attempt key (memo §10). */
 export function attemptKey(childSessionID: string, callID: string): string {
@@ -434,7 +471,7 @@ export function createInFlightRegistry(deps: {
   claims?: Set<string>;
   onClosed?(attempt: Attempt, cause: CloseCause): void;
 }): InFlightRegistry {
-  const claims = deps.claims ?? PROCESS_CLAIMS;
+  const claims = deps.claims ?? processClaims();
   /** QA-2.1-13: the claims this instance added, so `forgetSession` and `dispose` give exactly those back. */
   const own = new Set<string>();
   function releaseClaim(callID: string): void {
@@ -491,12 +528,20 @@ export function createInFlightRegistry(deps: {
       const claim = `bg:${rec.callID}`;
       if (claims.has(claim)) return false;
       claims.add(claim);
-      addBounded(own, claim, MAX_CLAIMS);
-      if (claims.size > MAX_CLAIMS) {
-        for (const old of claims) {
-          if (claims.size <= MAX_CLAIMS) break;
-          claims.delete(old);
-        }
+      own.add(claim);
+      // QA-PDF12-6: the cap is per owner. An instance evicts only its own oldest claims, never a live claim of another copy
+      // sharing the process-wide set (which is then bounded by MAX_CLAIMS per live instance).
+      for (const old of own) {
+        if (own.size <= MAX_CLAIMS) break;
+        own.delete(old);
+        claims.delete(old);
+      }
+      // QA-PDF12-13: a process-wide backstop past the per-owner cap: the oldest claims of ANY owner go once the shared set
+      // outgrows MAX_PROCESS_CLAIMS (leaked claims of instances that never disposed cannot grow it without bound).
+      for (const old of claims) {
+        if (claims.size <= MAX_PROCESS_CLAIMS) break;
+        claims.delete(old);
+        own.delete(old);
       }
       calls.set(rec.callID, rec);
       enforceBounds();
@@ -655,6 +700,10 @@ export interface HeldRecord {
   childText?: string;
   /** QA-2.1-17: the dispatch data (`FinishApi.dispatchOf`), persisted with the hold so a restart can rebuild the gate inputs. */
   dispatch?: RestoredDispatch;
+  /** DF-1.1-1: the CALLER agent of the dispatch, persisted so a restored hold launches its grader as the caller. Absent in an old entry. */
+  callerAgent?: string;
+  /** QA-PDF12-5: the caller's message that made the dispatch, persisted with the hold. Absent in an old entry. */
+  callerMessageID?: string;
 }
 
 /** A restored hold whose verdict was being posted (`posting` without `posted`): re-post after a parent check (R21). */
@@ -675,6 +724,10 @@ export interface RestoredHold {
   childText?: string;
   /** QA-2.1-17: the dispatch data journaled with the hold (empty fields when an older record had none). */
   dispatch: RestoredDispatch;
+  /** DF-1.1-1: the caller agent journaled with the hold; absent for an older record. */
+  callerAgent?: string;
+  /** QA-PDF12-5: the caller's message id journaled with the hold; absent for an older record. */
+  callerMessageID?: string;
   /** QA-2.1-17: a verdict the gate reached before the restart but never started posting: posted, never recomputed. */
   verdict?: StoredVerdict;
 }
@@ -1046,6 +1099,8 @@ export function createHeldResults(deps: {
             ...(rec.label === undefined ? {} : { label: rec.label }),
             ...(rec.childText === undefined ? {} : { text: rec.childText }),
             ...(rec.dispatch === undefined ? {} : { dispatch: rec.dispatch }),
+            ...(rec.callerAgent === undefined ? {} : { callerAgent: rec.callerAgent }),
+            ...(rec.callerMessageID === undefined ? {} : { callerMessageID: rec.callerMessageID }),
             at: now(),
           },
           { fsync: true },
@@ -1190,6 +1245,8 @@ export function createHeldResults(deps: {
             ...(typeof r.label === "string" ? { label: r.label } : {}),
             ...(typeof r.text === "string" ? { childText: r.text, body: r.text } : {}),
             ...(r.dispatch === undefined ? {} : { dispatch: restoredDispatchOf(r.dispatch) }),
+            ...(typeof r.callerAgent === "string" && r.callerAgent !== "" ? { callerAgent: r.callerAgent } : {}),
+            ...(typeof r.callerMessageID === "string" && r.callerMessageID !== "" ? { callerMessageID: r.callerMessageID } : {}),
             active: true,
             posting: false,
             status: "verifying",
@@ -1237,6 +1294,8 @@ export function createHeldResults(deps: {
             callID: e.callID,
             ...(e.childText === undefined ? {} : { childText: e.childText }),
             dispatch: e.dispatch ?? {},
+            ...(e.callerAgent === undefined ? {} : { callerAgent: e.callerAgent }),
+            ...(e.callerMessageID === undefined ? {} : { callerMessageID: e.callerMessageID }),
             ...(stored.has(e.handle) ? { verdict: stored.get(e.handle) } : {}),
           });
         }
@@ -1281,6 +1340,8 @@ export function createHeldResults(deps: {
           v: 1, kind: "hold", handle: e.handle, parent: e.parentSessionID, child: e.childSessionID, callID: e.callID,
           ...(e.label === undefined ? {} : { label: e.label }),
           ...(e.dispatch === undefined ? {} : { dispatch: e.dispatch }),
+          ...(e.callerAgent === undefined ? {} : { callerAgent: e.callerAgent }),
+          ...(e.callerMessageID === undefined ? {} : { callerMessageID: e.callerMessageID }),
           at,
         });
         if (!e.active) {
@@ -1306,7 +1367,8 @@ export type Trigger =
   | { kind: "runner"; status: EndFact["outcome"]; text: string; at: number };
 
 export interface CompletionDeps {
-  finish: FinishApi["finish"];
+  /** `caller` (QA-PDF12-9): the caller journaled on the attempt being finished, for the context the finish runs in. */
+  finish(input: FinishInput, caller: FinishCaller): Promise<FinishResult>;
   /** The child's last assistant message (`ctx.session.context`, C7/O1). */
   readChildResult(child: string): Promise<{ outcome?: EndFact["outcome"]; text?: string } | undefined>;
   /** The `!running` half of `roleAfterCall` (§4.2): budget and authority notices, plus its evictions. */
@@ -1552,6 +1614,10 @@ export function createCompletionProcessor(reg: InFlightRegistry, deps: Completio
       ...(delta === undefined ? {} : { delta }),
       // QA-2.1-17: a recovery runs after a restart: the plugin rebuilds the gate inputs from the journaled dispatch.
       ...(trigger.kind === "recovery" ? { restored: restoredDispatchSafe(a) } : {}),
+    }, {
+      // QA-PDF12-9: the caller comes from the attempt itself, never from a capped call-id lookup a `forgetSession` may clear.
+      ...(a.callerAgent === undefined ? {} : { callerAgent: a.callerAgent }),
+      ...(a.callerMessageID === undefined ? {} : { callerMessageID: a.callerMessageID }),
     });
     releaseLeasesSafe(a.childSessionID);
     await markProcessed(a);

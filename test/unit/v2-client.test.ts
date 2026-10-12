@@ -231,6 +231,26 @@ describe("native v2 child runner", () => {
       .rejects.toThrow("matching its parent");
   });
 
+  it("QA-PDF12-7 a context run with `retain: false` serves its own operation but never becomes the parent's retained context", async () => {
+    const { runtime, toolContext, execute } = fixture();
+    const agents: unknown[] = [];
+    execute.mockImplementation(async (_input, context) => {
+      agents.push(context.agent);
+      await context.progress({ sessionID: "child", status: "running" });
+      return { output: { sessionID: "child", status: "completed", output: "verified result" } };
+    });
+    // The parent's real call, retained once it settles.
+    await runtime.withToolContext({ ...toolContext, agent: "build" as ToolContext["agent"] }, async () => {});
+    // A context the plugin rebuilt from journaled data: the grader of its own operation runs in it ...
+    await expect(runtime.withToolContext({ ...toolContext, agent: "rebuilt" as ToolContext["agent"] }, () => runtime.childRunner.run({
+      parentSessionID: "parent", prompt: "rebuilt grading", onCreated: async () => {},
+    }), { retain: false })).resolves.toEqual({ sessionID: "child", text: "verified result" });
+    // ... but a later grader of that parent, outside any scope, still gets the real retained context.
+    await expect(runtime.childRunner.run({ parentSessionID: "parent", prompt: "later grading", onCreated: async () => {} }))
+      .resolves.toEqual({ sessionID: "child", text: "verified result" });
+    expect(agents).toEqual(["rebuilt", "build"]);
+  });
+
   it("bounds retained contexts and refuses evicted or unknown parent identities", async () => {
     const { runtime, toolContext, execute } = fixture();
     for (let i = 0; i < 501; i++) {

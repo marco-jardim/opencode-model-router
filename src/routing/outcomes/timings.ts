@@ -703,21 +703,48 @@ export interface TimingRecorderHolder extends TimingRecorder {
   release(): Promise<void>;
 }
 
+/**
+ * Layout/behaviour version of a registry entry; bump it whenever `RegistryEntry` or the recorder it holds changes shape.
+ * An entry of another version in the process-wide map is foreign: it is neither reused nor touched (QA-PDF12-4).
+ */
+export const TIMING_REGISTRY_VERSION = 2;
+
 interface RegistryEntry {
+  readonly version: number;
   readonly recorder: TimingRecorder;
   readonly observers: Set<(row: DispatchTimingRow | OrchestratorTurnRow) => void>;
-  /** What the first acquirer asked for (the settings that apply). */
-  readonly first: { readonly now: Clock; readonly logger: TimingLogger; readonly turnIdleMs: number | undefined };
-  /** True once a later caller with other settings was told (once per recorder). */
-  noticedMismatch: boolean;
   refs: number;
 }
 
-const registry = new Map<string, RegistryEntry>();
+/**
+ * DF-1.1-2: the host boots the plugin once per location, i.e. several copies of this module in one process; a module-level
+ * map would give every copy its own recorder (duplicate turn rows, restarting turn numbers). The registry therefore lives on
+ * `globalThis` under a registered symbol, as in `verify/pending.ts`; a value that is not a map is replaced. A recorder made by
+ * one copy is used by another: all copies are the same build, so the recorder's shape is identical.
+ */
+const PROCESS_REGISTRY_KEY = Symbol.for(`opencode-model-router.timings.registry.v${TIMING_REGISTRY_VERSION}`);
 
+function processRegistry(): Map<string, RegistryEntry> {
+  const holder = globalThis as unknown as Record<symbol, unknown>;
+  let all = holder[PROCESS_REGISTRY_KEY];
+  if (!(all instanceof Map)) {
+    all = new Map<string, RegistryEntry>();
+    holder[PROCESS_REGISTRY_KEY] = all;
+  }
+  return all as Map<string, RegistryEntry>;
+}
+
+/** The entry of `id` in `registry` when it is of this build's version; a foreign entry (another layout) is not used (QA-PDF12-11). */
+function currentEntry(registry: Map<string, RegistryEntry>, id: string): RegistryEntry | undefined {
+  const existing: unknown = registry.get(id);
+  if (typeof existing !== "object" || existing === null) return undefined;
+  return (existing as Partial<RegistryEntry>).version === TIMING_REGISTRY_VERSION ? (existing as RegistryEntry) : undefined;
+}
+
+/** The directory's key in the shared map: versioned too, so an entry another layout left at the bare path is never seen. */
 function registryId(dir: string): string {
   const abs = resolve(dir);
-  return process.platform === "win32" ? abs.toLowerCase() : abs;
+  return `${process.platform === "win32" ? abs.toLowerCase() : abs}\u0000v${TIMING_REGISTRY_VERSION}`;
 }
 
 /**
@@ -727,7 +754,10 @@ function registryId(dir: string): string {
  */
 export function acquireTimingRecorder(options: AcquireTimingRecorderOptions): TimingRecorderHolder {
   const id = registryId(options.dir);
-  let entry = registry.get(id);
+  // The version is in the slot's key and in each entry's key, so every copy of this version shares one map and one entry per
+  // directory; a foreign entry is ignored (never reused, never touched), without a private fallback map (QA-PDF12-11).
+  const registry = processRegistry();
+  let entry = currentEntry(registry, id);
   if (entry === undefined) {
     const observers = new Set<(row: DispatchTimingRow | OrchestratorTurnRow) => void>();
     const logger = options.logger ?? NOOP_LOGGER;
@@ -747,21 +777,11 @@ export function acquireTimingRecorder(options: AcquireTimingRecorderOptions): Ti
         }
       },
     });
-    entry = { recorder, observers, refs: 0, first: { now: options.now, logger, turnIdleMs: options.turnIdleMs }, noticedMismatch: false };
+    entry = { version: TIMING_REGISTRY_VERSION, recorder, observers, refs: 0 };
     registry.set(id, entry);
-  } else if (!entry.noticedMismatch) {
-    // QA-1.1-24: the first acquirer's settings apply; a later caller that asked for others is told once.
-    const { first } = entry;
-    const differs = options.now !== first.now || options.turnIdleMs !== first.turnIdleMs || (options.logger !== undefined && options.logger !== first.logger);
-    if (differs) {
-      entry.noticedMismatch = true;
-      try {
-        (options.logger ?? first.logger).info?.("[router] timing recorder already acquired for this directory; the first caller's clock, logger and turnIdleMs apply", { dir: options.dir });
-      } catch {
-        entry.noticedMismatch = true; // a failing logger must not reach the caller; the notice is not repeated
-      }
-    }
   }
+  // QA-PDF12-8: the first acquirer's clock, logger and turnIdleMs apply; every plugin instance passes its own closures, so a
+  // later caller with other ones is the normal case and is not reported.
   const shared = entry;
   shared.refs += 1;
   const observer = options.onRow;

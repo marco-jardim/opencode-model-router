@@ -11,6 +11,8 @@ import {
   createHeldResults,
   createInFlightRegistry,
   heldPlaceholder,
+  MAX_CLAIMS,
+  MAX_PROCESS_CLAIMS,
   renderCompleted,
   renderHeld,
   renderInFlight,
@@ -22,6 +24,7 @@ import {
   type CallRecord,
   type CloseCause,
   type CompletionProcessor,
+  type FinishCaller,
   type FinishInput,
   type FinishResult,
   type HeldResults,
@@ -41,6 +44,8 @@ interface Rig {
   proc: CompletionProcessor;
   held: HeldResults;
   finishCalls: FinishInput[];
+  /** QA-PDF12-9: the caller each finish was handed (from the attempt). */
+  finishCallers: FinishCaller[];
   released: string[];
   records: PersistedRecord[];
   processedKeys: Set<string>;
@@ -86,6 +91,7 @@ function rig(opts: { withCapture?: boolean } = {}): Rig {
   };
   const posts: Array<Parameters<SyntheticFn>[0]> = [];
   const finishCalls: FinishInput[] = [];
+  const finishCallers: FinishCaller[] = [];
   const released: string[] = [];
   const releasedHandles: string[] = [];
   const behavior: Rig["behavior"] = {
@@ -108,8 +114,9 @@ function rig(opts: { withCapture?: boolean } = {}): Rig {
     sleep: async () => undefined,
   });
   const proc = createCompletionProcessor(reg, {
-    finish: async (input) => {
+    finish: async (input, caller) => {
       finishCalls.push(input);
+      finishCallers.push(caller);
       return behavior.finish(input);
     },
     readChildResult: (child) => behavior.read(child),
@@ -122,7 +129,7 @@ function rig(opts: { withCapture?: boolean } = {}): Rig {
     releaseHeld: (handle) => void releasedHandles.push(handle),
     ...(opts.withCapture === true ? { captureDelta: (callID: string, child: string) => (behavior.capture ?? (async () => undefined))(callID, child) } : {}),
   });
-  return { clock, reg, proc, held, finishCalls, released, records, processedKeys, posts, warns, closed, claims, releasedHandles, behavior };
+  return { clock, reg, proc, held, finishCalls, finishCallers, released, records, processedKeys, posts, warns, closed, claims, releasedHandles, behavior };
 }
 
 describe("DF-1-4 resumed background dispatch (registry)", () => {
@@ -749,6 +756,68 @@ describe("completion processor: finish, delta, notices", () => {
     });
     await launch(r, "c1", "ses_c1");
     await expect(proc.process("ses_c1", completion())).resolves.toBeUndefined();
+  });
+});
+
+describe("QA-PDF12-9: finish gets the caller from the attempt it processes", () => {
+  it("the caller agent and message reach finish from the attempt, even when the call map lost the call during the read", async () => {
+    const r = rig();
+    await launch(r, "call-pdf129", "ses_child_pdf129", { rec: { callerAgent: "build", callerMessageID: "m-pdf129" } });
+    r.behavior.read = async () => {
+      r.reg.forgetSession(PARENT); // the call map no longer knows the call: a `byCall` lookup would find no caller
+      return { text: "child text" };
+    };
+    await r.proc.process("ses_child_pdf129", endEvent());
+    await flushAll();
+    expect(r.reg.byCall("call-pdf129")).toBeUndefined();
+    expect(r.finishCalls).toHaveLength(1);
+    expect(r.finishCallers).toEqual([{ callerAgent: "build", callerMessageID: "m-pdf129" }]);
+  });
+
+  it("an attempt whose record predates the caller fields hands finish an empty caller (the adapter then asks the parent session)", async () => {
+    const r = rig();
+    await launch(r, "call-pdf129-old", "ses_child_pdf129_old");
+    await r.proc.process("ses_child_pdf129_old", endEvent());
+    await flushAll();
+    expect(r.finishCallers).toEqual([{}]);
+  });
+});
+
+describe("QA-PDF12-2: the in-memory rewrite of a hold keeps its caller", () => {
+  it("persisted() writes a hold with its caller agent and message, and a restore of that rewrite gives them back", async () => {
+    const r = rig();
+    const handle = `vrf_${"p".repeat(24)}`;
+    await r.held.hold({
+      handle, parentSessionID: PARENT, childSessionID: "ses_child_pdf122", callID: "call-pdf122", callerAgent: "build", callerMessageID: "m-pdf122",
+    });
+    const rewritten = r.held.persisted();
+    expect(rewritten.find((rec) => rec.kind === "hold" && rec.handle === handle)).toMatchObject({ callerAgent: "build", callerMessageID: "m-pdf122" });
+    const next = rig();
+    const { unverified } = next.held.restore(rewritten);
+    expect(unverified.find((h) => h.handle === handle)).toMatchObject({ callerAgent: "build", callerMessageID: "m-pdf122" });
+  });
+});
+
+describe("QA-PDF12-6: the process-wide claim cap is per owner", () => {
+  it("an instance at its cap evicts only its own oldest claims, never a live claim of another instance sharing the set", () => {
+    const shared = new Set<string>();
+    const quiet = { warn: () => undefined };
+    const other = createInFlightRegistry({ now: () => 1_000_000, logger: quiet, claims: shared });
+    const busy = createInFlightRegistry({ now: () => 1_000_000, logger: quiet, claims: shared });
+    try {
+      expect(other.decide(callRecord("call-other-live"))).toBe(true);
+      for (let i = 0; i <= 1_000; i += 1) expect(busy.decide(callRecord(`call-busy-${i}`))).toBe(true);
+      // The other instance's live claim stands: a third copy still cannot claim that call.
+      expect(shared.has("bg:call-other-live")).toBe(true);
+      expect(busy.decide(callRecord("call-other-live"))).toBe(false);
+      // The busy instance gave back its own oldest claim to stay at its cap.
+      expect(shared.has("bg:call-busy-0")).toBe(false);
+      expect(shared.has("bg:call-busy-1000")).toBe(true);
+    } finally {
+      other.dispose();
+      busy.dispose();
+    }
+    expect(shared.size).toBe(0);
   });
 });
 
@@ -1540,6 +1609,23 @@ describe("bookkeeping bounds (QA-2.1-13)", () => {
     // A reloaded instance can decide the same calls again.
     const next = createInFlightRegistry({ now: () => 1, logger, claims });
     expect(next.decide(callRecord("c1"))).toBe(true);
+  });
+
+  it("QA-PDF12-13 the shared claim set stays bounded: past MAX_PROCESS_CLAIMS the oldest claims of ANY owner go", () => {
+    expect(MAX_PROCESS_CLAIMS).toBe(8 * MAX_CLAIMS);
+    const logger = { warn: () => undefined };
+    const claims = new Set<string>();
+    // Claims of instances that never disposed (no longer owned by anyone alive) fill the shared set to its bound.
+    for (let i = 0; i < MAX_PROCESS_CLAIMS; i += 1) claims.add(`bg:leaked-${i}`);
+    const reg = createInFlightRegistry({ now: () => 1, logger, claims });
+    expect(reg.decide(callRecord("fresh-1"))).toBe(true);
+    expect(claims.size).toBe(MAX_PROCESS_CLAIMS);
+    expect(claims.has("bg:leaked-0")).toBe(false); // the oldest claim, owned by nobody here, was evicted
+    expect(claims.has("bg:leaked-1")).toBe(true);
+    expect(claims.has("bg:fresh-1")).toBe(true);
+    for (let i = 0; i < 50; i += 1) reg.decide(callRecord(`more-${i}`));
+    expect(claims.size).toBe(MAX_PROCESS_CLAIMS);
+    expect(claims.has("bg:more-49")).toBe(true);
   });
 
   it("forgetSession gives the session's claims back", () => {

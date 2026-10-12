@@ -246,13 +246,20 @@ export function createV2Runtime(ctx: Plugin.Context) {
   return {
     client,
     childRunner,
-    async withToolContext<T>(context: ToolContext, operation: () => Promise<T>): Promise<T> {
+    /**
+     * Runs `operation` with `context` as its tool context. `retain: false` (QA-PDF12-7) is for a context the plugin rebuilt
+     * from journaled data (a background finish, a restored hold): it is used for this operation only and never becomes the
+     * parent's retained context, so a later grader of that parent cannot inherit its caller agent.
+     */
+    async withToolContext<T>(context: ToolContext, operation: () => Promise<T>, options?: { retain?: boolean }): Promise<T> {
       lifetime.signal.throwIfAborted();
       const scope = { context, active: true };
-      retainedContexts.delete(context.sessionID);
-      retainedContexts.set(context.sessionID, scope);
-      while (retainedContexts.size > RETAINED_CONTEXT_LIMIT) {
-        retainedContexts.delete(retainedContexts.keys().next().value!);
+      if (options?.retain !== false) {
+        retainedContexts.delete(context.sessionID);
+        retainedContexts.set(context.sessionID, scope);
+        while (retainedContexts.size > RETAINED_CONTEXT_LIMIT) {
+          retainedContexts.delete(retainedContexts.keys().next().value!);
+        }
       }
       try {
         return await currentTool.run(scope, operation);

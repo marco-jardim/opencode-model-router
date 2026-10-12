@@ -16,6 +16,7 @@ import { vi } from "vitest";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import type { Hooks } from "@opencode-ai/plugin";
 import { ROUTER_FINISH_ATTACH, type HeldResults } from "../../src/compat/background";
+import { createV2Runtime } from "../../src/compat/v2-client";
 import { registerV2Hooks, V2_BACKGROUND_SETTLED } from "../../src/compat/v2-hooks";
 import ModelRouterPlugin from "../../src/index";
 import { invalidateConfigCache, overridePath } from "../../src/router/config";
@@ -99,6 +100,30 @@ export interface BootOptions {
   /** Re-use a home from an earlier boot (a restart). */
   home?: string;
   routerHost?: "v2" | "v1";
+  /**
+   * DF-1.1-1: opt-in native `subagent` tool. When set, `ctx.tool.list()` offers a stub `subagent` whose `execute` records
+   * its args and the agent of the tool context the host received (the agent the host checks `subagent:<target>` for), and
+   * the plugin gets the real v2 child runner (`createV2Runtime`) so graders launch through it. Off by default: every other
+   * user of `bootBgHost` sees the host exactly as before.
+   */
+  nativeSubagent?: NativeSubagentStub;
+}
+
+/** One call of the stub native `subagent` tool: its args and the agent of the tool context it ran in. */
+export interface NativeSubagentCall {
+  args: Record<string, unknown>;
+  agent: unknown;
+  sessionID: unknown;
+  /** QA-PDF12-5: the message and call ids of the tool context (what a host attaches a permission prompt to). */
+  messageID: unknown;
+  callID: unknown;
+}
+
+export interface NativeSubagentStub {
+  /** Every call, in order. */
+  calls: NativeSubagentCall[];
+  /** What a call answers; defaults to a host denial (the DF-1.1-1 symptom), so the gate ends UNVERIFIABLE without a child. */
+  respond?(call: NativeSubagentCall): Promise<unknown>;
 }
 
 const saved = {
@@ -185,11 +210,28 @@ export async function bootBgHost(options: BootOptions = {}): Promise<BgHost> {
     };
   }
 
+  // DF-1.1-1: the opt-in native `subagent` tool (absent unless `nativeSubagent` is given, so the host is unchanged by default).
+  const stub = options.nativeSubagent;
+  const nativeTools = stub === undefined ? {} : {
+    list: async () => [{
+      id: "subagent",
+      execute: async (args: Record<string, unknown>, toolContext: { agent?: unknown; sessionID?: unknown; messageID?: unknown; id?: unknown }) => {
+        const call: NativeSubagentCall = {
+          args, agent: toolContext.agent, sessionID: toolContext.sessionID, messageID: toolContext.messageID, callID: toolContext.id,
+        };
+        stub.calls.push(call);
+        if (stub.respond !== undefined) return stub.respond(call);
+        throw new Error(`Tool.Error: Subagent denied: ${String(args.agent)}`);
+      },
+    }],
+  };
+
   const ctx = {
     location: { directory: project, project: { directory: project } },
     agent: { reload: async () => undefined, list: async () => ({ data: [] }), transform: noop },
     command: { reload: async () => undefined, transform: noop },
     tool: {
+      ...nativeTools,
       transform: noop,
       hook: async (name: string, cb: (event: never) => Promise<void>) => {
         toolHooks[name] = cb;
@@ -226,6 +268,9 @@ export async function bootBgHost(options: BootOptions = {}): Promise<BgHost> {
     await previous.flush();
   }
 
+  // DF-1.1-1: with the native `subagent` stub, the real v2 runtime (as src/v2.ts builds it) runs the graders through it.
+  const runtime = stub === undefined ? undefined : createV2Runtime(ctx as unknown as Parameters<typeof createV2Runtime>[0]);
+
   const hooks = await ModelRouterPlugin({
     directory: project,
     worktree: project,
@@ -234,6 +279,7 @@ export async function bootBgHost(options: BootOptions = {}): Promise<BgHost> {
     $: () => undefined,
     ...(options.routerHost === "v1" ? {} : { routerHost: "v2" }),
     client: { session: { get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id } }) } },
+    ...(runtime === undefined ? {} : { routerChildRunner: runtime.childRunner }),
   } as unknown as Parameters<typeof ModelRouterPlugin>[0]);
 
   // The sink the adapter hands the plugin's finish API: the gate's verdicts reach the held store through it.
@@ -252,7 +298,9 @@ export async function bootBgHost(options: BootOptions = {}): Promise<BgHost> {
     });
   }
 
-  const cleanup = await registerV2Hooks(ctx as unknown as Context, seen);
+  const cleanup = runtime === undefined
+    ? await registerV2Hooks(ctx as unknown as Context, seen)
+    : await registerV2Hooks(ctx as unknown as Context, seen, runtime);
 
   const turns = async (n = 40): Promise<void> => {
     for (let i = 0; i < n; i += 1) await Promise.resolve();

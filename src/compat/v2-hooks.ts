@@ -1263,6 +1263,9 @@ export async function registerV2Hooks(
   let disposed = false;
   const within = <T>(context: ToolContext, operation: () => Promise<T>): Promise<T> =>
     runtime ? runtime.withToolContext(context, operation) : operation();
+  /** QA-PDF12-7: a context rebuilt from journaled data runs its operation but never becomes the parent's retained context. */
+  const withinRebuilt = <T>(context: ToolContext, operation: () => Promise<T>): Promise<T> =>
+    runtime ? runtime.withToolContext(context, operation, { retain: false }) : operation();
   const scopedArgs = async (event: { tool: string; input: unknown; sessionID: any }): Promise<any> => {
     const args = taskArgs(event.tool, event.input);
     if (["read", "write", "edit"].includes(event.tool) && typeof args?.filePath === "string" && !isAbsolute(args.filePath)) {
@@ -1274,6 +1277,97 @@ export async function registerV2Hooks(
   const hookContext = (event: { sessionID: any; agent: any; messageID: any; id: any }): ToolContext => ({
     ...event, signal: abort.signal, progress: async () => {},
   });
+  /** QA-PDF12-1: how long a rebuilt context waits for the parent session's current agent. */
+  const CALLER_AGENT_LOOKUP_MS = 2_000;
+  /**
+   * QA-PDF12-1: the caller agent of a rebuilt context: the journaled one, else (a record journaled before DF-1.1-1) the parent
+   * session's current agent, looked up within CALLER_AGENT_LOOKUP_MS; undefined when neither is known. Never throws.
+   */
+  /** Runs `work` (a host lookup) for at most CALLER_AGENT_LOOKUP_MS; undefined when it fails or is too slow. Never throws. */
+  const boundedLookup = async (work: () => Promise<string | undefined>): Promise<string | undefined> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const lookup = work().then((value) => value, () => undefined);
+      const timeout = new Promise<undefined>((resolveTimeout) => {
+        timer = setTimeout(() => resolveTimeout(undefined), CALLER_AGENT_LOOKUP_MS);
+        if (typeof timer === "object" && typeof timer.unref === "function") timer.unref();
+      });
+      return await Promise.race([lookup, timeout]);
+    } catch {
+      return undefined;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  /**
+   * QA-PDF12-14: the parent lookups made while at least one restore pass runs are shared per parent, so N restored holds of one
+   * parent cost one lookup each, not N. Dropped when the last running pass ends (a later pass looks again).
+   */
+  let restorePass: { passes: number; agents: Map<string, Promise<string | undefined>>; messages: Map<string, Promise<string | undefined>> } | undefined;
+  const sharedPerParent = (kind: "agents" | "messages", parent: string, work: () => Promise<string | undefined>): Promise<string | undefined> => {
+    const cache = restorePass?.[kind];
+    if (cache === undefined) return boundedLookup(work);
+    let pending = cache.get(parent);
+    if (pending === undefined) {
+      pending = boundedLookup(work);
+      cache.set(parent, pending);
+    }
+    return pending;
+  };
+  const duringRestorePass = async <T>(pass: () => Promise<T>): Promise<T> => {
+    restorePass ??= { passes: 0, agents: new Map(), messages: new Map() };
+    restorePass.passes += 1;
+    try {
+      return await pass();
+    } finally {
+      if (restorePass !== undefined && (restorePass.passes -= 1) <= 0) restorePass = undefined;
+    }
+  };
+  const callerAgentOf = (parentSessionID: string, journaled: string | undefined): Promise<string | undefined> => {
+    if (journaled !== undefined && journaled !== "") return Promise.resolve(journaled);
+    return sharedPerParent("agents", parentSessionID, async () => {
+      const session: unknown = await ctx.session.get({ sessionID: parentSessionID } as Parameters<typeof ctx.session.get>[0]);
+      const agent = (session as { agent?: unknown } | null | undefined)?.agent;
+      return typeof agent === "string" && agent !== "" ? agent : undefined;
+    });
+  };
+  /**
+   * QA-PDF12-12: the message id of a rebuilt context: the journaled one, else (a record journaled before QA-PDF12-5) the id of
+   * the parent's latest assistant message, read from its context within the same bound; undefined when that fails.
+   */
+  const callerMessageIDOf = (parentSessionID: string, journaled: string | undefined): Promise<string | undefined> => {
+    if (journaled !== undefined && journaled !== "") return Promise.resolve(journaled);
+    return sharedPerParent("messages", parentSessionID, async () => {
+      const history: unknown = await ctx.session.context({ sessionID: parentSessionID } as Parameters<typeof ctx.session.context>[0]);
+      const list: unknown = Array.isArray(history) ? history : Reflect.get(Object(history), "messages");
+      if (!Array.isArray(list)) return undefined;
+      for (let i = list.length - 1; i >= 0; i -= 1) {
+        const message: unknown = list[i];
+        if (message === null || typeof message !== "object") continue;
+        const role: unknown = Reflect.get(message, "role") ?? Reflect.get(message, "type");
+        const id: unknown = Reflect.get(message, "id");
+        if (role === "assistant" && typeof id === "string" && id !== "") return id;
+      }
+      return undefined;
+    });
+  };
+  /**
+   * QA-PDF12-1/-5/-7/-9: runs `operation` (a background finish, a restored hold's gate) in the context of the dispatch's caller,
+   * rebuilt from the data the dispatch journaled: its call, the message that made it and the caller agent (else the parent's
+   * current one). The context is never retained as the parent's context.
+   */
+  const withinCaller = async <T>(
+    caller: { parentSessionID: string; callID: string; callerAgent?: string; callerMessageID?: string },
+    operation: () => Promise<T>,
+    /** QA-PDF12-14: false when nothing in `operation` launches as the caller (a completion that did not succeed runs no grader). */
+    lookup = true,
+  ): Promise<T> => {
+    const [agent, messageID] = lookup ? await Promise.all([
+      callerAgentOf(caller.parentSessionID, caller.callerAgent),
+      callerMessageIDOf(caller.parentSessionID, caller.callerMessageID),
+    ]) : [caller.callerAgent, caller.callerMessageID];
+    return withinRebuilt(hookContext({ sessionID: caller.parentSessionID, agent, messageID: messageID ?? "", id: caller.callID }), operation);
+  };
   // ---------------------------------------------------------------------------------------------------------------------
   // Phase 2.1 startup (memo §4.1). Everything below is v2-only (this module is loaded by server.ts alone) and inert under
   // `routing.background.mode: "off"` + `routing.leases.mode: "off"` except the timing rows (telemetry, not visible to the user).
@@ -1553,6 +1647,8 @@ export async function registerV2Hooks(
         v: 1, kind: "inflight", key: attempt.key, callID: attempt.callID, parentSessionID: attempt.parentSessionID,
         childSessionID: attempt.childSessionID, label: attemptLabel(attempt), at: attempt.ackAt ?? attempt.at,
         agent: attempt.agent, description: attempt.description, verifying: attempt.verifying, verificationMode: attempt.verificationMode,
+        ...(attempt.callerAgent === undefined ? {} : { callerAgent: attempt.callerAgent }),
+        ...(attempt.callerMessageID === undefined ? {} : { callerMessageID: attempt.callerMessageID }),
         ...(attempt.role === undefined ? {} : { role: attempt.role }),
         ...(attempt.hold === undefined ? {} : { handle: attempt.hold.handle }), hold: attempt.hold?.handle ?? null,
         ...(dispatch === undefined ? {} : { dispatch }), process: processToken(),
@@ -1739,7 +1835,8 @@ export async function registerV2Hooks(
       }
       // R20/R21 (QA-2.1-2, QA-2.1-6): the restored holds still owe their verdict; a hold whose child is recovered above gets it there.
       if (restored.reposts.length > 0 || restored.unverified.some((h) => !recovering.has(h.callID))) {
-        const pendingRestore = settleRestoredHolds(sessionID, restored, recovering);
+        // QA-PDF12-14: the holds of one pass share their parent lookups.
+        const pendingRestore = duringRestorePass(() => settleRestoredHolds(sessionID, restored, recovering));
         trackBackground(pendingRestore);
       }
     } catch (error) {
@@ -2698,6 +2795,8 @@ export async function registerV2Hooks(
         }
         // Phase 2.1 (memo §4.2 step 5, §6): under `off` (or without the finish API) this is today's `verifying || roleRouted ? false : undefined`.
         let background: boolean | undefined = verifying || roleForeground ? false : undefined;
+        /** QA-PDF12-6: another copy of the plugin in this process claimed the call first; its background flag stands. */
+        let lostClaim = false;
         if (event.tool === "subagent" && bgActive() && finishApi !== undefined) {
           const parent = String(event.sessionID);
           // DF-1-9: a parent the plugin never recorded (a reload, past the bound) is resolved, never assumed a root: an
@@ -2720,19 +2819,30 @@ export async function registerV2Hooks(
             holdingAvailable: held.available && !reloadFailed && finishApi.canHold(parent),
             parentIsRoot: parentKind === "root", liveCount: inflight.liveCount(),
           });
-          background = decision.background;
           const resumeOf = typeof output.args?.sessionID === "string" && output.args.sessionID !== "" ? output.args.sessionID : undefined;
           // QA-DF1-17: the earlier turns' completion elements of a resumed child are never the resume's, whatever their state.
           if (resumeOf !== undefined) rememberElementsOnResume(parent, resumeOf);
-          inflight.decide({
-            callID: event.id, parentSessionID: parent, agent: String(output.args?.agent ?? ""), ...(info?.role === undefined ? {} : { role: info.role }),
+          const claimed = inflight.decide({
+            callID: event.id, parentSessionID: parent, agent: String(output.args?.agent ?? ""),
+            ...(typeof event.agent === "string" && event.agent !== "" ? { callerAgent: event.agent } : {}),
+            // QA-PDF12-5: the message that made the call, so a rebuilt caller context carries real ids, never an empty one.
+            ...(typeof event.messageID === "string" && event.messageID !== "" ? { callerMessageID: event.messageID } : {}),
+            ...(info?.role === undefined ? {} : { role: info.role }),
             description: typeof output.args?.description === "string" ? output.args.description : "", verifying,
             verificationMode: verification?.mode ?? "none", decision,
             ...(resumeOf === undefined ? {} : { resumeOf }),
             at: nowMs(),
           });
+          // QA-PDF12-6: a copy that lost the call's claim to another copy leaves the call's background flag as it found it.
+          if (claimed) background = decision.background;
+          else {
+            // QA-PDF12-10: the owner copy holds the verification and the result; this copy must not treat the call as verifying.
+            lostClaim = true;
+            verifyingCalls.delete(event.id);
+          }
         }
-        event.input = nativeArgs(event.tool, output.args, original, background);
+        // QA-PDF12-6: without the claim, `undefined` keeps the `background` key the input already has (set by the copy that claimed).
+        event.input = nativeArgs(event.tool, output.args, original, lostClaim ? undefined : background);
       } catch (error) {
         dispatchRouter.onCallFinished(event.id); // the hook chain rejected the call: it will never reach execute.after (2.2)
         inflight.cancel(event.id);
@@ -2929,7 +3039,7 @@ export async function registerV2Hooks(
         try {
           // QA-2.1-17: the plugin rebuilds the gate inputs from the journaled dispatch and the restored pending entry, and
           // re-posts a verdict the entry already reached.
-          const result = await within(hookContext({ sessionID: hold.parentSessionID, agent: undefined, messageID: "", id: hold.callID }), () => api.finish({
+          const result = await withinCaller(hold, () => api.finish({
             callID: hold.callID, parentSessionID: hold.parentSessionID, childSessionID: hold.childSessionID, outputText: childText,
             status: "succeeded", mode: "background", heldHandle: hold.handle, endedAt: nowMs(), restored: hold.dispatch,
           }));
@@ -2949,7 +3059,9 @@ export async function registerV2Hooks(
         }
       };
       processor = createCompletionProcessor(inflight, {
-        finish: (input) => within(hookContext({ sessionID: input.parentSessionID, agent: inflight.byCall(input.callID)?.agent, messageID: "", id: input.callID }), () => api.finish(input)),
+        // QA-PDF12-9: the caller is the one the processor's attempt carries (journaled at decide), not a capped call-id lookup.
+        // QA-PDF12-14: only a succeeded completion can launch a grader as the caller, so only it waits for the caller lookups.
+        finish: (input, caller) => withinCaller({ parentSessionID: input.parentSessionID, callID: input.callID, ...caller }, () => api.finish(input), input.status === "succeeded"),
         readChildResult: lastAssistantText,
         // The `!running` half of `roleAfterCall`: budget and authority notices, plus its evictions (run through its own `finish`).
         roleCompletion: async (attempt, text) => {
@@ -2993,6 +3105,8 @@ export async function registerV2Hooks(
           const mode = rec.verificationMode === "required" || rec.verificationMode === "deferred" ? rec.verificationMode : "none";
           const registered = inflight.decide({
             callID, parentSessionID: sessionID, agent: typeof rec.agent === "string" ? rec.agent : "",
+            ...(typeof rec.callerAgent === "string" && rec.callerAgent !== "" ? { callerAgent: rec.callerAgent } : {}),
+            ...(typeof rec.callerMessageID === "string" && rec.callerMessageID !== "" ? { callerMessageID: rec.callerMessageID } : {}),
             ...(typeof rec.role === "string" ? { role: rec.role } : {}),
             description: typeof rec.description === "string" ? rec.description : "",
             verifying: rec.verifying === true, verificationMode: mode,
@@ -3117,6 +3231,8 @@ export async function registerV2Hooks(
                   v: 1, kind: "inflight", key: attempt.key, callID: event.id, parentSessionID: parent, childSessionID: resultChild,
                   label: attemptLabel(attempt), ...(handle === undefined ? {} : { handle }), at: nowMs(),
                   agent: rec.agent, description: rec.description, verifying: rec.verifying, verificationMode: rec.verificationMode,
+                  ...(rec.callerAgent === undefined ? {} : { callerAgent: rec.callerAgent }),
+                  ...(rec.callerMessageID === undefined ? {} : { callerMessageID: rec.callerMessageID }),
                   ...(rec.role === undefined ? {} : { role: rec.role }), hold: handle ?? null,
                   ...(dispatch === undefined ? {} : { dispatch }), process: processToken(),
                 }, { fsync: true });
@@ -3129,6 +3245,8 @@ export async function registerV2Hooks(
                 try {
                   await held.hold({
                     handle, parentSessionID: parent, childSessionID: resultChild, callID: event.id, label: attemptLabel(attempt),
+                    ...(rec.callerAgent === undefined ? {} : { callerAgent: rec.callerAgent }),
+                    ...(rec.callerMessageID === undefined ? {} : { callerMessageID: rec.callerMessageID }),
                     ...(dispatch === undefined ? {} : { dispatch }),
                   });
                   holding = true;
