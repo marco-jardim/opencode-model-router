@@ -337,6 +337,9 @@ describe("QA-DF1-29 a held entry's stored pass/outcome match its posted tag", ()
     expect(text).toContain(" \u00b7 pass (cached verdict; nothing was run)");
     expect(text).not.toContain(" \u00b7 fail");
     expect(text).not.toContain("NOT ACCEPTED");
+    // QA-DF1-30 (QA-3.1-21): a skipped check is accepted unverified, never labelled verified.
+    expect(text).toContain("[router \u26a0 UNVERIFIED: none]");
+    expect(text).not.toContain("\u2713 verified");
   }, 30_000);
 
   // strictUnverifiable rejects a pass with caveats (gate.ts): the held dispatch posts FAIL. A restart between the store and the
