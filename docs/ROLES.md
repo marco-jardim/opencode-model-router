@@ -399,7 +399,8 @@ be deferred (`VERIFY:deferred`, the default; OpenCode v2). At return the router 
 I4 and I8, the working-set roots, the observed link and edge targets (those the producer added during the dispatch
 included), the check placements and the link pins). The I4 window is the dispatch and is never decided again;
 `router_verify` discovers consumers over the frozen working-set roots (through `node_modules` links and declared edges)
-and observes the link and edge targets again (a changed or unobservable one turns a pass UNVERIFIED; a dependency the
+and observes the link and edge targets again (a changed one turns a pass UNVERIFIED; an unobservable one leaves a
+would-be pass not judged and the handle open for another `router_verify`; a dependency the
 producer removed during the dispatch is skipped unless the work root declares it again). The dispatch is verified at
 once, not deferred, when I4 already refuses at return, when a linked repository could not be observed within the
 deferral bound, when a dependency added during the dispatch could not be observed or more were added than the perimeter

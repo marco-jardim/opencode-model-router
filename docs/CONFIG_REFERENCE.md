@@ -591,10 +591,12 @@ producer added during the dispatch included, the placements and the link pins; e
 targets are never pinned). At `router_verify` the I4 window is the dispatch and is not
 decided again; consumers are discovered over the frozen working-set roots, through
 `node_modules` links and declared edges; link and edge targets are observed again: one
-that changed since the producer returned, or cannot be observed again, turns a pass
-UNVERIFIED (a fail keeps it), and one the producer removed during the dispatch is skipped
+that changed since the producer returned turns a pass UNVERIFIED (a fail keeps it), one
+that cannot be observed again leaves a would-be pass not judged and the handle open for
+another `router_verify`, and one the producer removed during the dispatch is skipped
 unless the work root declares it again; a placement whose path or git top changed since
-the return runs nothing. No config key turns the edges on or off; see
+the return runs nothing, and one that cannot be checked now runs nothing and leaves the
+handle open. No config key turns the edges on or off; see
 `docs/VERIFICATION.md` → "Dependencies outside node_modules". A no-change dispatch with a full-scope
 `testsPass` (per-check `scope=full`, or config `testScope: "full"` on OpenCode v2 only)
 defers instead of blocking the return; config `testScope` does not affect `lintClean`
