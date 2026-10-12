@@ -14,13 +14,15 @@
  * - DF-1-10: a session a live sibling instance of this process owns (another booted location: another module copy, its fresh
  *   beat file in `pending.instances`) is never adopted nor settled `lost in restart`; a dead sibling (stale beat) still is.
  */
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ADOPTION_RETRY_MS } from "../../src/compat/background";
 import { processToken } from "../../src/compat/v2-hooks";
 import { CLAIM_STALE_MS, PENDING_INSTANCES_DIRNAME } from "../../src/verify/pending";
-import { bootBgHost, restoreEnv, type BgHost, type SyntheticCall } from "../helpers/v2-bg-host";
+import { bootBgHost, restoreEnv, type BgHost, type NativeSubagentStub, type SyntheticCall } from "../helpers/v2-bg-host";
 
 let host: BgHost | undefined;
 
@@ -314,6 +316,83 @@ describe("DF-1.1-1: the caller (orchestrator) agent survives the journal, so a c
     await h.settled();
     expect(verdictPosts(h)).toHaveLength(1);
   });
+});
+
+describe("DF-1.1-1: a restored held completion's grader launches as the journaled caller agent (real adapter, native subagent)", () => {
+  const CALL = "call-df111-restored";
+  const criteriaPrompt = ["Explain the parser.", "", "[acceptance]", "criteria: the explanation names the parser's entry point", "[/acceptance]"].join("\n");
+  const overrides = { routing: { background: { mode: "auto" }, leases: { mode: "off" } } };
+  const sessions = { [ORCH]: { agent: "build" }, [CHILD]: { parentID: ORCH }, [EVENT_CHILD]: { parentID: ORCH } };
+  const readJournal = (path: string): Array<Record<string, unknown>> =>
+    readFileSync(path, "utf8").split("\n").filter((line) => line.trim() !== "").map((line) => JSON.parse(line) as Record<string, unknown>);
+  const denied = (): Error => new Error("Tool.Error: Subagent denied: model-router-grader");
+
+  it("DF-1.1-1 a hold journaled with callerAgent `build` whose gate a restart cut: the re-run grader reaches the native subagent with agent `build`", async () => {
+    process.env.MODEL_ROUTER_ENFORCE = "1";
+    // Process A: a held background `fast` dispatch from `build`; its grader never answers, so the restart cuts the gate.
+    let released = false;
+    const waiting: Array<(error: Error) => void> = [];
+    const firstStub: NativeSubagentStub = {
+      calls: [],
+      respond: () => (released ? Promise.reject(denied()) : new Promise((_resolve, reject) => { waiting.push(reject); })),
+    };
+    const a = await bootBgHost({ overrides, sessions, nativeSubagent: firstStub });
+    host = a;
+    execFileSync("git", ["init", "-q"], { cwd: a.project }); // a work tree the gate can prepare its verification in
+    a.emit({ type: "session.created", id: `ev-created-${CHILD}`, created: 1, data: { sessionID: CHILD, parentID: ORCH } });
+    await a.drain();
+    const call = await a.before({
+      sessionID: ORCH, agent: "build", messageID: "m-df111-r", id: CALL, tool: "subagent",
+      input: { agent: "fast", description: "explain the parser", prompt: criteriaPrompt, background: true },
+    });
+    const running = { output: { sessionID: CHILD, status: "running", output: "Working in the background" }, content: "Working in the background", metadata: { sessionID: CHILD } };
+    await a.after({ ...call, status: "completed", result: running });
+    await a.settled();
+    a.childContext.set(CHILD, [{ role: "assistant", content: [{ type: "text", text: "The parser starts in parse()." }], finish: "stop", time: { created: 1, completed: 2 } }]);
+    a.emit({ type: "session.execution.succeeded", id: `ev-end-${CHILD}-succeeded`, created: 2, data: { sessionID: CHILD } });
+    await a.drain();
+    // The gate waits on A's grader: the hold, its child text and its pending entry are journaled; no verdict is.
+    let snapshot: Array<Record<string, unknown>> = [];
+    await vi.waitFor(() => {
+      expect(firstStub.calls.length).toBeGreaterThan(0);
+      snapshot = readJournal(a.journalPath);
+      const hold = snapshot.find((r) => r.kind === "hold" && r.callID === CALL);
+      expect(hold).toBeDefined();
+      expect(snapshot.some((r) => r.kind === "hold-text" && r.handle === hold?.handle)).toBe(true);
+      expect(snapshot.some((r) => r.kind === "entry" && r.callID === CALL)).toBe(true);
+    }, { timeout: 25_000 });
+    const hold = snapshot.find((r) => r.kind === "hold" && r.callID === CALL);
+    // The caller agent is journaled with the hold, next to the dispatched agent of the inflight record.
+    expect(hold?.callerAgent).toBe("build");
+    for (const launched of firstStub.calls) expect(launched.agent).toBe("build");
+    // A dies here: what it journaled until now is what the next process gets. Only the hold path recovers it (no `inflight`).
+    const kept = snapshot.filter((r) => r.kind !== "inflight" && r.kind !== "processed");
+    released = true;
+    for (const reject of waiting.splice(0)) reject(denied());
+    await a.settled();
+    // Every spelling of A's home a record may hold (as given, resolved, with forward slashes), longest first.
+    const homesA = [...new Set([a.home, realpathSync(a.home), realpathSync.native(a.home)].flatMap((p) => [p, p.replace(/\\/g, "/")]))]
+      .sort((x, y) => y.length - x.length);
+    await a.dispose();
+    host = undefined;
+    // Process B: a fresh home whose journal is A's cut one (A's paths moved to B's home).
+    const homeB = mkdtempSync(join(tmpdir(), "omr-df111-restart-"));
+    const escaped = (path: string): string => JSON.stringify(path).slice(1, -1);
+    const moved = (line: string): string => homesA.reduce((text, homeA) => text.split(escaped(homeA)).join(escaped(homeB)), line);
+    const journalText = kept.map((record) => `${moved(JSON.stringify(record))}\n`).join("");
+    const secondStub: NativeSubagentStub = { calls: [] }; // answers with the host's denial
+    const b = await bootBgHost({ home: homeB, overrides, sessions, journalText, nativeSubagent: secondStub });
+    host = b;
+    execFileSync("git", ["init", "-q"], { cwd: b.project });
+    adoptOrchestrator(b);
+    await b.settled();
+    await vi.waitFor(() => expect(secondStub.calls.length).toBeGreaterThan(0), { timeout: 25_000 });
+    await b.settled();
+    for (const launched of secondStub.calls) {
+      expect(launched.agent).toBe("build");
+      expect(launched.sessionID).toBe(ORCH);
+    }
+  }, 60_000);
 });
 
 describe("DF-1.1-1: the call claims are process-wide across module copies", () => {

@@ -20,6 +20,7 @@ import { ROUTER_FINISH_ATTACH, type FinishApi, type HeldSink } from "../../src/c
 import { invalidateConfigCache } from "../../src/router/config";
 import { backgroundOutcomes, formatVerifyReport, HELD_RESULT_TEXT, waitTreeFreeExcept } from "../../src/verify/wiring";
 import { removeDirWhenReleased } from "../helpers/remove-dir";
+import { bootBgHost, restoreEnv, type BgHost, type NativeSubagentStub } from "../helpers/v2-bg-host";
 
 const gate = vi.hoisted(() => ({ parsed: 0, passCaveat: undefined as string | undefined, trivialSessions: new Set<string>() }));
 
@@ -172,9 +173,9 @@ describe("DF-1-3 a background completion without a deterministic check", () => {
   it("DF-1-3 the grader launches from the orchestrator (never the current context); an unverifiable result is tagged UNVERIFIABLE, never PASS", async () => {
     process.env.MODEL_ROUTER_ENFORCE = "1";
     execFileSync("git", ["init", "-q"], { cwd: home }); // a work tree the gate can prepare its verification in
-    const launched: Array<{ parentSessionID?: string; agent?: string }> = [];
+    const launched: Array<{ parentSessionID?: string }> = [];
     const runner = {
-      run: async (request: { parentSessionID?: string; agent?: string }) => {
+      run: async (request: { parentSessionID?: string }) => {
         launched.push(request);
         throw new Error("Tool.Error: Subagent denied: model-router-grader");
       },
@@ -197,12 +198,59 @@ describe("DF-1-3 a background completion without a deterministic check", () => {
     });
     expect(launched.length).toBeGreaterThan(0);
     for (const request of launched) expect(request.parentSessionID).toBe("ses_parent");
-    // DF-1.1-1: a grader request never names the dispatched child ("fast") as the agent the host checks `subagent:<grader>` for.
-    for (const request of launched) expect(request.agent).not.toBe("fast");
     expect(result.verification).toEqual({ kind: "required", verdict: "UNVERIFIABLE" });
     // Acceptance is unchanged: an unverifiable result is accepted (not strictUnverifiable), so no forcing note.
     expect(result.outputText.startsWith("The parser starts in parse().")).toBe(true);
     expect(result.outputText).not.toContain("NEXT: address the above");
+  }, 30_000);
+});
+
+/**
+ * DF-1.1-1: the background completion through the REAL v2 adapter (its completion processor and finish wrapper) and the REAL v2
+ * child runner (`createV2Runtime`): the grader reaches the host's native `subagent` tool in the tool context of the CALLER
+ * (the orchestrator agent whose `subagent:<grader>` permission the host checks), never the dispatched child's.
+ */
+describe("DF-1.1-1 a background completion's grader launches as the caller agent", () => {
+  const ORCH = "ses_orch_df111";
+  const CHILD = "ses_child_df111";
+  const criteriaPrompt = ["Explain the parser.", "", "[acceptance]", "criteria: the explanation names the parser's entry point", "[/acceptance]"].join("\n");
+  let bg: BgHost | undefined;
+
+  afterEach(async () => {
+    await bg?.dispose();
+    bg = undefined;
+    restoreEnv();
+  });
+
+  it("DF-1.1-1 a background `fast` dispatch from `build`: the grader reaches the native subagent with agent `build` (never `fast`, never undefined)", async () => {
+    process.env.MODEL_ROUTER_ENFORCE = "1";
+    const stub: NativeSubagentStub = { calls: [] }; // answers every call with the host's denial (the DF-1.1-1 symptom)
+    const h = await bootBgHost({
+      overrides: { routing: { background: { mode: "auto" }, leases: { mode: "off" } } },
+      sessions: { [ORCH]: { agent: "build" }, [CHILD]: { parentID: ORCH } },
+      nativeSubagent: stub,
+    });
+    bg = h;
+    execFileSync("git", ["init", "-q"], { cwd: h.project }); // a work tree the gate can prepare its verification in
+    h.emit({ type: "session.created", id: `ev-created-${CHILD}`, created: 1, data: { sessionID: CHILD, parentID: ORCH } });
+    await h.drain();
+    const call = await h.before({
+      sessionID: ORCH, agent: "build", messageID: "m-df111", id: "call-df111-bg", tool: "subagent",
+      input: { agent: "fast", description: "explain the parser", prompt: criteriaPrompt, background: true },
+    });
+    const running = { output: { sessionID: CHILD, status: "running", output: "Working in the background" }, content: "Working in the background", metadata: { sessionID: CHILD } };
+    await h.after({ ...call, status: "completed", result: running });
+    await h.settled();
+    // The child ends: the completion processor reads its text and finishes it (the gate, then the grader).
+    h.childContext.set(CHILD, [{ role: "assistant", content: [{ type: "text", text: "The parser starts in parse()." }], finish: "stop", time: { created: 1, completed: 2 } }]);
+    h.emit({ type: "session.execution.succeeded", id: `ev-end-${CHILD}-succeeded`, created: 2, data: { sessionID: CHILD } });
+    await h.drain();
+    await vi.waitFor(() => expect(stub.calls.length).toBeGreaterThan(0), { timeout: 25_000 });
+    await h.settled();
+    for (const launched of stub.calls) {
+      expect(launched.agent).toBe("build");
+      expect(launched.sessionID).toBe(ORCH);
+    }
   }, 30_000);
 });
 
