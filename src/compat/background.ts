@@ -340,6 +340,11 @@ export interface CallRecord {
   decision: BackgroundDecision;
   resumeOf?: string;
   at: number;
+  /**
+   * 3.1.7 W5: an attempt the plan executor registered (`DispatchBookkeeping.registerInFlight`). It is excluded from the ordinary
+   * completion and verification path: its launch completion is its only settle point, submitted as a `runner` trigger.
+   */
+  owner?: "executor";
 }
 
 export interface Attempt extends CallRecord {
@@ -405,6 +410,11 @@ const MAX_CLAIMS = 1000;
 /** The attempt key (memo §10). */
 export function attemptKey(childSessionID: string, callID: string): string {
   return `${childSessionID}\u0000${callID}`;
+}
+
+/** 3.1.7 W5: the record belongs to the plan executor (excluded from the ordinary completion and verification path). */
+export function isExecutorOwned(rec: CallRecord | undefined): boolean {
+  return rec?.owner === "executor";
 }
 
 function isAttempt(rec: CallRecord | Attempt): rec is Attempt {
@@ -1618,6 +1628,18 @@ export function createCompletionProcessor(reg: InFlightRegistry, deps: Completio
       warnSafe(deps.logger, "[router] completion trigger ignored: already processed", { child, trigger: trigger.kind });
       return;
     }
+    if (isExecutorOwned(a)) {
+      // 3.1.7 W5: an executor-owned attempt settles only through its launch completion, submitted as a `runner` trigger. It is
+      // marked processed (D2), so a later `execution.*` trigger for it is a duplicate. No result post, verification or lease
+      // release here: the executor owns all three (plan-child leases end with `releaseTask` only).
+      if (trigger.kind !== "runner") return;
+      const end = endOf(trigger);
+      a.endedAt = end.at;
+      a.outcome = end.status;
+      await markProcessed(a);
+      a.state = "released";
+      return;
+    }
     a.state = "processing";
     let done: () => void = () => undefined;
     settling.set(
@@ -1700,6 +1722,8 @@ export function createCompletionProcessor(reg: InFlightRegistry, deps: Completio
     async closeUnknown(a, reason) {
       try {
         addBounded(processed, a.key, MAX_PROCESSED_KEYS);
+        // 3.1.7 W3/W5: a plan child's leases are `until-integrated`: the executor releases them (`releaseTask`), never its end.
+        if (isExecutorOwned(a)) return;
         a.annotations = [`[router] the dispatch ended without a result (${reason})`];
         releaseLeasesSafe(a.childSessionID);
         const handle = a.hold?.handle;
@@ -1739,7 +1763,8 @@ export function renderHeld(items: readonly HeldEntryView[]): string | undefined 
 
 /** `in-flight` (order 50): background dispatches that have not ended. `now` is epoch ms. */
 export function renderInFlight(attempts: readonly Attempt[], now: number): string | undefined {
-  const live = attempts.filter((a) => a.state === "acknowledged");
+  // 3.1.7 W5: plan children are the executor's (the `plan` provider shows them), not background dispatches of the orchestrator.
+  const live = attempts.filter((a) => a.state === "acknowledged" && !isExecutorOwned(a));
   if (live.length === 0) return undefined;
   return [
     `[router] In flight (background): ${live.length}`,
