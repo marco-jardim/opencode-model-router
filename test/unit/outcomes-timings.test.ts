@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } fro
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDurationModel } from "../../src/routing/outcomes/durations";
 import { createSideLogs, nodePersistDeps, nodePersistFs } from "../../src/routing/outcomes/persist";
 import {
@@ -1262,6 +1262,78 @@ describe("timing recorder: shared per directory (QA-1.1-3)", () => {
     await rec.onExecutionOutcome("child-1", "evt-1", "succeeded", NOW + 1);
     expect(timingRows()).toHaveLength(1);
     expect(seen).toEqual(["dispatch-timing"]);
+  });
+});
+
+describe("timing recorder: shared across module copies (DF-1.1-2)", () => {
+  type TimingsModule = typeof import("../../src/routing/outcomes/timings");
+  const step = { input: 10, cacheRead: 20, cacheWrite: 30 };
+  const REGISTRY_KEY = Symbol.for("opencode-model-router.timings.registry.v1");
+  const holders: Array<{ release(): Promise<void> }> = [];
+
+  // The host loads the plugin once per booted location: each load is a distinct module instance in one process.
+  async function loadCopy(): Promise<TimingsModule> {
+    vi.resetModules();
+    return await import("../../src/routing/outcomes/timings");
+  }
+
+  afterEach(async () => {
+    for (const holder of holders.splice(0)) await holder.release();
+    delete (globalThis as unknown as Record<symbol, unknown>)[REGISTRY_KEY];
+  });
+
+  it("two module copies share one recorder per directory: one root run yields one turn row, numbering never restarts", async () => {
+    const copyA = await loadCopy();
+    const copyB = await loadCopy();
+    expect(copyB).not.toBe(copyA);
+    expect(copyB.acquireTimingRecorder).not.toBe(copyA.acquireTimingRecorder);
+    const a = copyA.acquireTimingRecorder({ dir, now, logger });
+    const b = copyB.acquireTimingRecorder({ dir, now, logger });
+    holders.push(a, b);
+
+    a.markRootSession("root-1");
+    expect(b.isRootSession("root-1")).toBe(true); // one recorder, not two
+    b.markRootSession("root-1");
+    a.onRootStep("root-1", step, "step-1");
+    b.onRootStep("root-1", step, "step-1"); // the same host event, delivered to both copies
+    await a.onRootPrompt("root-1", NOW, "prompt-1");
+    await b.onRootPrompt("root-1", NOW, "prompt-1");
+    expect(turnRows()).toHaveLength(1);
+    expect(turnRows()[0]).toMatchObject({ steps: 1, turn: 1 });
+
+    b.onRootStep("root-1", step, "step-2");
+    a.onRootStep("root-1", step, "step-2");
+    await b.onRootPrompt("root-1", NOW + 1, "prompt-2");
+    await a.onRootPrompt("root-1", NOW + 1, "prompt-2");
+    expect(turnRows().map(row => row.turn)).toEqual([1, 2]);
+  });
+
+  it("holders of different copies share one refcount: releasing one keeps the other working", async () => {
+    const copyA = await loadCopy();
+    const copyB = await loadCopy();
+    const a = copyA.acquireTimingRecorder({ dir, now, logger });
+    const b = copyB.acquireTimingRecorder({ dir, now, logger });
+    holders.push(a, b);
+    a.markRootSession("root-1");
+    a.onRootStep("root-1", step);
+    await a.release();
+    expect(turnRows()).toEqual([]); // not the last holder: no flush yet
+    expect(b.isRootSession("root-1")).toBe(true);
+    await b.release();
+    expect(turnRows()).toHaveLength(1);
+    const again = copyA.acquireTimingRecorder({ dir, now, logger });
+    holders.push(again);
+    expect(again.isRootSession("root-1")).toBe(false); // the registry entry is gone: a fresh recorder
+  });
+
+  it("replaces a foreign value in the process-wide slot", async () => {
+    (globalThis as unknown as Record<symbol, unknown>)[REGISTRY_KEY] = { not: "a map" };
+    const copy = await loadCopy();
+    const holder = copy.acquireTimingRecorder({ dir, now, logger });
+    holders.push(holder);
+    holder.markRootSession("root-1");
+    expect(holder.isRootSession("root-1")).toBe(true);
+    expect((globalThis as unknown as Record<symbol, unknown>)[REGISTRY_KEY]).toBeInstanceOf(Map);
   });
 });
 

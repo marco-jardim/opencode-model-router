@@ -713,7 +713,23 @@ interface RegistryEntry {
   refs: number;
 }
 
-const registry = new Map<string, RegistryEntry>();
+/**
+ * DF-1.1-2: the host boots the plugin once per location, i.e. several copies of this module in one process; a module-level
+ * map would give every copy its own recorder (duplicate turn rows, restarting turn numbers). The registry therefore lives on
+ * `globalThis` under a registered symbol, as in `verify/pending.ts`; a value that is not a map is replaced. A recorder made by
+ * one copy is used by another: all copies are the same build, so the recorder's shape is identical.
+ */
+const PROCESS_REGISTRY_KEY = Symbol.for("opencode-model-router.timings.registry.v1");
+
+function processRegistry(): Map<string, RegistryEntry> {
+  const holder = globalThis as unknown as Record<symbol, unknown>;
+  let all = holder[PROCESS_REGISTRY_KEY];
+  if (!(all instanceof Map)) {
+    all = new Map<string, RegistryEntry>();
+    holder[PROCESS_REGISTRY_KEY] = all;
+  }
+  return all as Map<string, RegistryEntry>;
+}
 
 function registryId(dir: string): string {
   const abs = resolve(dir);
@@ -727,6 +743,7 @@ function registryId(dir: string): string {
  */
 export function acquireTimingRecorder(options: AcquireTimingRecorderOptions): TimingRecorderHolder {
   const id = registryId(options.dir);
+  const registry = processRegistry();
   let entry = registry.get(id);
   if (entry === undefined) {
     const observers = new Set<(row: DispatchTimingRow | OrchestratorTurnRow) => void>();
@@ -789,7 +806,8 @@ export function acquireTimingRecorder(options: AcquireTimingRecorderOptions): Ti
       if (observer !== undefined) shared.observers.delete(observer);
       shared.refs -= 1;
       if (shared.refs > 0) return;
-      if (registry.get(id) === shared) registry.delete(id);
+      const current = processRegistry();
+      if (current.get(id) === shared) current.delete(id);
       await shared.recorder.flush();
     },
   };
