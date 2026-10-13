@@ -29,7 +29,7 @@ Read this first in a new session. The design is `docs/design/cross-repo.md`, and
 | P3 lot 1: item (b), `router_git_*` `root` (plan `docs/design/cross-repo-phase3-plan.md`) | Done (`3b6aec8`..`bc9930c`). QA'd twice (round 1: 1 major + 5 minor + nits fixed; round 2: 1 major (M1, read set vs repoExclude) fixed in `219e5c5`, minors in design §9). Docs and CHANGELOG updated. Live dogfood done (see "Phase 3 lot 1 live dogfood"). |
 | P3 lot 2: item (a), `vitest related` across a link | Done (`830d5db`..`702c858`). QA'd twice (round 1: 1 blocking + 1 critical + 4 major fixed, owner decisions D23 amended and D27; round 2: 2 major fixed, minors in design §9). Docs and CHANGELOG updated. Live dogfood done (see "Phase 3 lot 2 live dogfood"). |
 | P3 lot 3: item (c), edges outside `node_modules` | Done (`234c5e2`..`987529e`). QA'd twice (round 1: 1 critical ReDoS + 5 major + minors fixed in `d151fbd`, `18a15a0`, `76dd864`; round 2: 3 major fixed in `3de411e`, `06c1502`, minors and nits in design §9). Docs and CHANGELOG (`340265c`), design (`987529e`). Live dogfood done (see "Phase 3 lot 3 live dogfood"). **Next:** the #107 status comment (ask the owner first), then Phase 4. |
-| P4 | Not started |
+| P4: first-use approval, lean form (plan `docs/design/cross-repo-phase4-plan.md`, D28, D29) | Done (`be30565`..HEAD). Spikes T1–T5 run live (design §3); the channel became a human-typed `/router approve|repos|revoke` (D29) instead of a permission ask. One heavy QA round (1 major + 5 minor fixed in `f722af5`) and a re-check (no major; minors in design §9). Live dogfood done (see "Phase 4 live dogfood"), T6 included: a reload applies new `external_directory` patterns to children created afterwards, no restart. **Next:** the #107 status comment (ask the owner), then push/PR (owner decision). |
 
 Last checks (HEAD after the round 2 fixes):
 - `npm run typecheck`: clean.
@@ -45,6 +45,25 @@ Phase 2 is closed: code, docs, two QA rounds per lot, live dogfood, clean full-s
 **Next: Phase 3** (design §7 "Phase 3", `docs/design/cross-repo.md` ~:478): (a) the `vitest related` cross-link spike; (b) a read-only `root` argument for `router_git_*` that names an admitted repository; (c) discovery of dependency edges that do not go through `node_modules`, with no per-repository configuration. The design gives no file-level plan for it: start with a pre-flight (architect) that writes a plan like `docs/design/cross-repo-phase2-plan.md`, ask the owner the real decisions, then implement test-first, QA twice, dogfood live.
 
 **Working rules that bit this session:** delegates hit a read guard after 3 consecutive reads (tell them to alternate read and edit, and paste file:line ranges); "Agent not found" on parallel implementer dispatches usually means the child still runs — check `git status`/`git diff --stat` and resume the same session; every edit must leave `src/` loadable (the live router loads it); run `router_run` calls one at a time; a full suite run only with nothing else running; the gate's `testsPass` cannot scope this repo ("attribution-unavailable"), so verify every change in the shell (typecheck plus the touched test files).
+
+## Phase 4 live dogfood (2026-10-12)
+
+Run live at HEAD `3a85e18`, no restart. Scratch repository `D:\omr-p4-ext` (outside `D:\git`, origin `https://u:tok@example.invalid/x.git`); a junction `D:\omr-p4-link`; a temporary `repoExclude` in the shared overrides (restored). All removed afterwards, including the store file.
+
+| # | Step | Result |
+|---|---|---|
+| 1 | Role dispatch `root=D:\omr-p4-ext` | Pass. Refused; note from git: `origin https://example.invalid/x.git, branch main at 2554b67 … ask the user to run /router approve D:\omr-p4-ext`. |
+| 2 | A child whose prompt is `/router approve D:\omr-p4-ext` | Pass. No approval; no store file. |
+| 3 | Owner typed `/router approve d:\omr-p4-ext` | Pass. Canonical path, origin without credentials, `main @ 2554b67640df`, 1 root commit, expiry 14 days / cap 2027-01-11; `Role agents reloaded`. |
+| 4 | **T6**: implementer `root=D:\omr-p4-ext` reads, writes notes.txt, `router_git_status` | Pass, `✓ verified`. A reload's new `external_directory` pattern applies to children created afterwards: no restart (`APPROVAL_RELOAD_APPLIES = true`). |
+| 8 | `root=D:\omr-p4-link` (junction to the approved repository) | Refused (fails closed), but without the note naming the approved path (SD-P4-5); recorded in design §9. |
+| 7 | Folder swapped for another repository at the same path | Pass. `… has other root commits than when it was approved …`. |
+| 6 | Store hand-edited to 15 days ago | Pass. Treated as unapproved, the approval note again. Resume of the step 4 child: `resume refused: approval for D:\omr-p4-ext was revoked or expired` (QA m2). |
+| 9 | `repoExclude: ["D:/omr-p4-ext"]` + `/router-reload` | Pass. `/router repos` marks it `[excluded by routing.repoExclude (D:/omr-p4-ext)]`; dispatch refused `is excluded by routing.repoExclude`. |
+| 10 | `/router approve` on `C:\`, the profile, `~\.config\opencode` | Pass. `is a drive or filesystem root`, `is the user profile`, `is the opencode config directory`; nothing stored. |
+| 11 | `/router revoke D:\omr-p4-ext` | Pass. Revoked, reloaded; a new dispatch is refused with the approval note; the store is empty. |
+
+Full `npx vitest run` with nothing else running (HEAD `3a85e18`): 19 failures in 12 files. Run alone, all pass except the 2 known `exec.test.ts` timing tests and `test/unit/roles.dispatch-path.test.ts` (2 tests expected `admit` with two arguments; updated for QA M1's session-repository argument, 37/37).
 
 ## Phase 3 lot 3 live dogfood (2026-10-12)
 
