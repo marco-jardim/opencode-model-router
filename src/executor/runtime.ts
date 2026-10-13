@@ -88,6 +88,7 @@ export interface LeaseRegistryPort {
     | { ok: false; reason: "held" | "unknown-target"; holders: Array<{ holderID: string; taskRef: string | null }> }
     | { ok: false; reason: "cap" | "invalid"; message: string };
   releaseTask(taskRef: string): void;
+  /** 5.1 wires this to `LeaseRegistry.planHolderOf(<plan toplevel>, path)`: write keys are per checkout (DF-1.1-4). */
   holderOf(path: string): { holderID: string; taskRef: string | null } | null;
 }
 

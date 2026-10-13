@@ -2136,7 +2136,9 @@ export async function registerV2Hooks(
       leaseHandle = handle;
       bgDisposers.push(() => handle.release());
       try {
-        handle.registry.restore(JSON.parse(readFileSync(snapshotPath, "utf8")) as unknown, { dropCompleteHolders: true });
+        const restored = handle.registry.restore(JSON.parse(readFileSync(snapshotPath, "utf8")) as unknown, { dropCompleteHolders: true });
+        if (!restored.ok) ingestLogger.warn("[router] leases: the snapshot was rejected", { error: restored.message });
+        else if (restored.skipped !== undefined) ingestLogger.warn("[router] leases: snapshot lines skipped on restore", { skipped: restored.skipped });
       } catch (error) {
         if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") ingestLogger.warn("[router] leases: the snapshot could not be restored", { error: String(error) });
       }
