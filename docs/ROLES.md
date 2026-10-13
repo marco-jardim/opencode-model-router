@@ -433,7 +433,9 @@ On OpenCode v2 every child session (a role dispatch or a tier dispatch) takes a 
 long as it runs. Root orchestrator sessions take none: a root write is refused only while a child holds that file,
 and a root read, search or run is never refused. `routing.leases.mode` (`enforce`, the default, or `off`) switches
 the leases; `routing.leases.run` (`annotate`, the default, or `refuse`) sets what `router_run` does when its work root
-has files under edit by another session.
+has files under edit by another session. A lease covers the file in its checkout: a child in another linked worktree
+of the repository may edit its own copy of the same path. A plan task's lease also refuses another plan task's edit of
+that path in any worktree of the repository.
 
 What a child sees while another session holds a lease (`<holder>` is `<role> "<description>" (session <id>)`):
 
@@ -441,7 +443,7 @@ What a child sees while another session holds a lease (`<holder>` is `<role> "<d
 | --- | --- |
 | Write to a leased file | `[router] Refused: <path> is being edited by <holder>. Finish without that file, or return `NEED MORE: lease <path>`. Do not retry: the lease ends when that session ends.` |
 | Read of a file under edit | `[router] Refused: <path> is under edit by <holder>. Finish without it, or return `NEED MORE: lease <path>`.` |
-| Write whose target the router cannot name while a holder edits in that repository | `[router] Refused: this <tool> call names no file the router can check, and <holder> is editing files in this repository. Pass the file path explicitly, or return `NEED MORE: lease <tree>`.` |
+| Write whose target the router cannot name while a holder edits in that checkout (for a plan task: in any worktree of that repository) | `[router] Refused: this <tool> call names no file the router can check, and <holder> is editing files in this checkout. Pass the file path explicitly, or return `NEED MORE: lease <tree>`.` (a plan task's refusal says `in this repository`) |
 | More files leased than the limit | `[router] Refused: too many files are leased (<limit>). Return `NEED MORE: lease <path>`.` |
 | `glob` or `grep` listing files under edit | The listed files are removed and one line is added: `[router] <n> result(s) omitted: under edit by <holders>.` |
 | `router_run` in a tree with files under edit | `annotate`: the result gets `[router] ran while <holder> edits <n> file(s); result may be contaminated`. `refuse`: `[router] Refused: router_run in <tree> while <holder> edits <n> file(s) there. Wait for that session to end, or return `NEED MORE: lease <tree>`.` |

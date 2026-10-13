@@ -366,7 +366,28 @@ such a dispatch is not a sample of its own work.
 **Decision.**
 
 - Only child (delegated) sessions take leases. On first write a child takes an exclusive lease on the file, keyed by
-  repository and normalized repo-relative path.
+  checkout (work tree) and normalized repo-relative path.
+- **Amendment (DF-1.1-4, 2026-10-13).** Repository-wide keys apply to plan-task holders only. A plan child (its
+  binding has `plan`; lease scope `until-integrated`) also conflicts with another plan task's lease on the same
+  repo-relative path in any linked worktree of the repository, because the tasks of a plan are integrated into one
+  branch. The rule is cross-plan on purpose: it refuses a task of ANY plan on that repository, not only of the same
+  plan, since plans on one repository may share a base branch and the runtime runs one active plan per process
+  anyway (A-3.1-1). Any other holder is keyed per checkout: two child sessions that edit the same repo-relative path
+  in two linked worktrees of one repository do not refuse each other. Within one checkout every writer still
+  conflicts, whatever its kind. A write whose target is unknown is refused while another owner holds a lease in the
+  same checkout and, for a plan child, also while another plan task holds a lease in any worktree of the repository.
+  The original key (repository and repo-relative path for every holder) refused an implementer in one worktree
+  because an implementer in another worktree of the same repository held its own copy of that file.
+- Consequence (QA-PDF13-5): a root session or a plain child in the plan's home checkout may edit a path that a plan
+  task holds in its slot; the old repository-wide key refused that edit. Integration stays safe because landing
+  refuses a dirty home checkout (`src/executor/integrate/land.ts` ≈100-104).
+- Implementation: the v2 adapter's `repoKeyOf` seam names the checkout as `repo` and the common git directory as
+  `shared` (`src/compat/v2-hooks.ts`, `leaseRepoKeyOf`). The registry keeps `shared` in its snapshot and re-keys a
+  line from an older snapshot (no `shared`) to its checkout on restore; a clash on a re-keyed key is merged (same
+  owner) or skipped (a holder that is dropped anyway), never fatal. 5.1 wires the executor's lease view
+  (`LeaseRegistryPort.holderOf`) to the repository-wide query `LeaseRegistry.planHolderOf(<plan toplevel>, path)`,
+  because the logical key alone matches one checkout. A refusal names the file under edit (the holder's copy) and
+  asks for the requester's own path in `NEED MORE: lease`, repo-relative for a plan task.
 - A root session takes no leases. Its writes are refused only while a child holds that file.
 - Lease ownership is the task (`taskRef`), not the session.
 - While a child holds a write lease in a working tree, another **child** session in the same tree is affected as

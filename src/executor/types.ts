@@ -1453,7 +1453,12 @@ export interface LeaseHolderInfo {
   /** Registry holderID: a child session id, or leaseHolderID(...). */
   holderID: string;
 }
-/** Who holds a path lease (2.1). `path` is repo-relative (Footprint rules); answered by logical key, so any worktree of the repo matches. */
+/**
+ * Which plan task holds a path lease (2.1). `path` is repo-relative (Footprint rules). Write keys are per checkout
+ * (DF-1.1-4): only plan-task (`until-integrated`) leases conflict across the worktrees of a repository, so the port behind
+ * this view must answer with the registry's repository-wide query (`LeaseRegistry.planHolderOf`), which matches a plan
+ * task's lease in any worktree of the repo; the logical key alone matches one checkout only.
+ */
 export interface LeaseView { holder(path: string): LeaseHolderInfo | null; }
 /**
  * Per-plan lease seam over the ONE process-wide Phase 1.3 registry (A2/A3, QA-1.4-22/-32/-33).

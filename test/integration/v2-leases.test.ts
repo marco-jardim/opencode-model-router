@@ -6,13 +6,15 @@
  * the orchestrator (a root session) takes none.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireLeaseRegistry, createLeaseGuard, LEASE_LOOKUP_NEGATIVE_TTL_MS } from "../../src/compat/background";
 import { createLeaseRegistry } from "../../src/router/leases";
-import { SESSION_KIND_NEGATIVE_TTL_MS } from "../../src/compat/v2-hooks";
+import { leaseRepoKeyOf, SESSION_KIND_NEGATIVE_TTL_MS } from "../../src/compat/v2-hooks";
 import { bootBgHost, restoreEnv, type BgHost, type ToolEvent } from "../helpers/v2-bg-host";
+import { removeDirWhenReleased } from "../helpers/remove-dir";
 
 let host: BgHost | undefined;
 
@@ -25,6 +27,7 @@ afterEach(async () => {
 const ROOT = "orch";
 const A = "child-a";
 const B = "child-b";
+const C = "child-c";
 
 async function boot(run: "annotate" | "refuse" = "annotate", extra: Record<string, unknown> = {}): Promise<BgHost> {
   host = await bootBgHost({
@@ -133,6 +136,120 @@ describe("leases: trees", () => {
     await h.before(edit(A, fa));
     await expect(h.before(edit(B, fb))).resolves.toBeDefined();
     await expect(h.before(read(B, fb))).resolves.toBeDefined();
+  });
+});
+
+describe("leases: linked worktrees of one repository (DF-1.1-4)", () => {
+  let scratch: string | undefined;
+
+  afterEach(async () => {
+    // This hook runs before the file's top-level one: the host is disposed here first, so nothing holds the repository.
+    await host?.dispose();
+    host = undefined;
+    const dir = scratch;
+    scratch = undefined;
+    if (dir !== undefined) await removeDirWhenReleased(dir);
+  }, 15_000);
+
+  /** A temp repository with one commit (`src/same.ts`) and a linked worktree made by a real `git worktree add`. */
+  function linkedWorktrees(): { main: string; linked: string } {
+    const base = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-df114-")));
+    scratch = base;
+    const main = join(base, "main");
+    const linked = join(base, "linked");
+    mkdirSync(join(main, "src"), { recursive: true });
+    writeFileSync(join(main, "src", "same.ts"), "x\n");
+    // Isolated from the caller's git environment and configuration (as test/integration/executor-integrate-git.test.ts).
+    const emptyGlobal = join(base, "empty.gitconfig");
+    writeFileSync(emptyGlobal, "");
+    const env: NodeJS.ProcessEnv = {};
+    for (const [k, v] of Object.entries(process.env)) if (!k.toUpperCase().startsWith("GIT_")) env[k] = v;
+    Object.assign(env, { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: emptyGlobal });
+    const git = (...args: string[]): void => {
+      execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", ...args], {
+        cwd: main,
+        env,
+        stdio: "pipe",
+        windowsHide: true,
+      });
+    };
+    git("init", "-q");
+    git("add", "-A");
+    git("commit", "-q", "-m", "init");
+    git("worktree", "add", "-q", "--detach", linked);
+    return { main, linked };
+  }
+
+  it("two children editing one repo-relative path in two linked worktrees are both allowed", async () => {
+    const { main, linked } = linkedWorktrees();
+    const h = await boot();
+    h.sessions.set(A, { parentID: ROOT, agent: "general", directory: main });
+    h.sessions.set(B, { parentID: ROOT, agent: "general", directory: linked });
+    h.sessions.set(C, { parentID: ROOT, agent: "general", directory: main });
+    const fa = join(main, "src", "same.ts");
+    const fb = join(linked, "src", "same.ts");
+    await h.before(edit(A, fa));
+    await expect(h.before(edit(B, fb))).resolves.toBeDefined();
+    await expect(h.before(edit(A, fa))).resolves.toBeDefined();
+    await expect(h.before(read(B, fb))).resolves.toBeDefined();
+    // Within one checkout the write key still collides.
+    await expect(h.before(edit(C, fa))).rejects.toThrow(/Refused: .*same\.ts is being edited by session child-a/);
+    await expect(h.before(edit(C, fb))).rejects.toThrow(/Refused: .*same\.ts is being edited by session child-b/);
+  });
+
+  // The guard and registry the v2 adapter builds (its `repoKeyOf` seam), with two plan tasks bound to two slots of one plan.
+  it("two plan tasks of one plan editing one repo-relative path in two slots: the second is refused", async () => {
+    const { main, linked } = linkedWorktrees();
+    const seams = { realpath: (path: string) => realpathSync.native(path), repoKeyOf: leaseRepoKeyOf, now: () => 1 };
+    const registry = createLeaseRegistry(seams, { runMode: "annotate" });
+    const slots: Record<string, { planId: string; taskId: string; slot: string }> = {
+      "plan-t1": { planId: "plan-x", taskId: "T1", slot: main },
+      "plan-t2": { planId: "plan-x", taskId: "T2", slot: linked },
+    };
+    const dirs: Record<string, string> = { "plan-t1": main, "plan-t2": linked, "plain-main": main, "plain-linked": linked };
+    const guard = createLeaseGuard({
+      registry, sessionKind: async () => "child", sessionDir: async (sid) => dirs[sid] ?? main, gitRootOf: (dir) => dir,
+      holderLabel: (id) => `session ${id}`, planTaskOf: (sid) => slots[sid], events: { onRelease: () => () => undefined },
+    });
+    const editIn = (sessionID: string, dir: string) =>
+      guard.before({ sessionID, tool: "edit", args: { filePath: join(dir, "src", "same.ts") }, callID: `call-${sessionID}` });
+    await expect(editIn("plan-t1", main)).resolves.toEqual({});
+    const second = await editIn("plan-t2", linked);
+    expect(second.refuse).toMatch(/Refused: .*same\.ts is being edited by session plan-t1/);
+    // QA-PDF13-7: the text names the holder's file (in its slot); the lease to ask for is the requester's, repo-relative.
+    expect(second.refuse).toContain(`Refused: ${join(main, "src", "same.ts")} is being edited by session plan-t1.`);
+    expect(second.refuse).toContain("return `NEED MORE: lease src/same.ts`.");
+    // An ordinary child is keyed by its checkout: free in the other worktree, refused in the plan task's own.
+    await expect(editIn("plain-linked", linked)).resolves.toEqual({});
+    expect((await editIn("plain-main", main)).refuse).toMatch(/Refused: .*same\.ts is being edited by session plan-t1/);
+    // The repository-wide key survives a restart (the snapshot keeps the shared repository of the plan task's lease).
+    const restarted = createLeaseRegistry(seams, { runMode: "annotate" });
+    expect(restarted.restore(registry.snapshot(), { dropCompleteHolders: true })).toEqual({ ok: true, leases: 1 });
+    const holder = { holderID: "plan-t2", tree: linked, isChild: true, taskRef: "plan-x:T2", scope: "until-integrated" } as const;
+    expect(restarted.acquireWrite(holder, join(linked, "src", "same.ts"))).toMatchObject({ ok: false, reason: "held" });
+  });
+
+  // QA-PDF13-5: the plan's home checkout is no slot, so its writers are keyed by it alone (landing refuses a dirty home
+  // checkout). The repository-wide query still finds the plan task's lease from there.
+  it("a root and a plain child in the home checkout may edit a path a plan task holds in its slot", async () => {
+    const { main, linked } = linkedWorktrees();
+    const seams = { realpath: (path: string) => realpathSync.native(path), repoKeyOf: leaseRepoKeyOf, now: () => 1 };
+    const registry = createLeaseRegistry(seams, { runMode: "annotate" });
+    const guard = createLeaseGuard({
+      registry,
+      sessionKind: async (sid) => (sid === "orch-main" ? "root" : "child"),
+      sessionDir: async (sid) => (sid === "plan-t2" ? linked : main),
+      gitRootOf: (dir) => dir,
+      holderLabel: (id) => `session ${id}`,
+      planTaskOf: (sid) => (sid === "plan-t2" ? { planId: "plan-x", taskId: "T2", slot: linked } : undefined),
+      events: { onRelease: () => () => undefined },
+    });
+    const editIn = (sessionID: string, dir: string) =>
+      guard.before({ sessionID, tool: "edit", args: { filePath: join(dir, "src", "same.ts") }, callID: `call-${sessionID}` });
+    await expect(editIn("plan-t2", linked)).resolves.toEqual({});
+    await expect(editIn("orch-main", main)).resolves.toEqual({});
+    await expect(editIn("plain-main", main)).resolves.toEqual({});
+    expect(registry.planHolderOf(main, "src/same.ts")?.holderID).toBe("plan-t2");
   });
 });
 
