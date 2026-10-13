@@ -527,7 +527,7 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     expect(brokenLinks(["docs/EXECUTOR.md", "docs/OPENCODE_V2.md"], readRepo)).toEqual([]);
   });
 
-  it("describes the 4.1 surface in the changelog as v2-only and not registered yet", () => {
+  it("describes the executor in the changelog as registered on v2 only, v1 maps unchanged (Phase 5.1.2)", () => {
     const changelog = read("CHANGELOG.md").replace(/\r\n/g, "\n");
     const start = changelog.indexOf("## [Unreleased]");
     const next = changelog.indexOf("\n## [", start + 1);
@@ -535,7 +535,9 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     expect(unreleased).toContain("routing.executor");
     expect(unreleased).toContain("router_plan");
     expect(unreleased).toContain("/plan");
-    expect(unreleased).toMatch(/not registered/);
+    expect(unreleased).toMatch(/OpenCode v2: plan executor registration/);
+    expect(unreleased).not.toMatch(/not registered yet/);
+    expect(unreleased).toMatch(/v1 tool,\s+command and help maps are unchanged/);
   });
 });
 

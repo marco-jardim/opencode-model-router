@@ -20,6 +20,10 @@ vi.mock("../../src/compat/v2-client", () => ({
 vi.mock("../../src/compat/v2-hooks", () => ({
   registerV2Hooks: vi.fn(async () => async () => undefined),
 }));
+vi.mock("../../src/executor/create", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../src/executor/create")>()),
+  prepareExecutor: vi.fn(async () => ({ ok: false, reason: "test repository unavailable" })),
+}));
 
 import v2Plugin from "../../src/v2";
 
@@ -34,6 +38,14 @@ function context(extra: Record<string, unknown> = {}) {
 }
 
 describe("src/v2.ts: the host objects the plugin receives", () => {
+  it("hands over the late executor access, plan annotate port and slot verifier port (Phase 5.1 D1)", async () => {
+    await v2Plugin.setup(context() as unknown as Plugin.Context);
+    expect(captured.input?.routerExecutor).toEqual(expect.objectContaining({
+      runtime: expect.any(Function), unavailable: expect.any(Function), set: expect.any(Function), clear: expect.any(Function),
+    }));
+    expect(captured.input?.routerOnPlanAnnotate).toEqual(expect.any(Function));
+    expect(captured.input?.routerOnSlotVerifier).toEqual(expect.any(Function));
+  });
   it("routerAgents lists the agents of this plugin instance's location (QA-2.4-16)", async () => {
     const ctx = context();
     await v2Plugin.setup(ctx as unknown as Plugin.Context);

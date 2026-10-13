@@ -39,14 +39,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `UNVERIFIABLE`, and a restored held result settles in place. A journal that vanishes under a running process is
   rewritten from memory. OpenCode v1 ignores every `routing.background.*` and `routing.leases.*` key and logs one
   notice per process that names them.
-- **OpenCode v2: plan executor groundwork (not registered yet).** The `routing.executor.*` keys (`slotsDir`,
-  `integrationChecks`, `phaseSuite`, `provision` and `python` are trusted keys: only the global override sets them), the
-  `router_plan` tool and `/plan` command factories, and the executor instructions are in the code, with a user guide
-  ([docs/EXECUTOR.md](docs/EXECUTOR.md)). A later release registers them, so nothing is visible on a host yet, except
-  that `/router approve` already refuses a repository's executor home (`<git common dir>\omr-executor`, with its plan
-  and slot-marker directories) and any repository inside it; that check runs git within one 15 s bound in all, and
+- **OpenCode v2: plan executor registration.** `/router` lists `/plan`, and `router_plan` resolves the executor at call
+  time. Tool actions and `/plan approve|adopt` require a proven root session, with an exception for bound plan
+  children; failed session lookups refuse. Active plans add executor instructions to router state after the plan
+  section. Assembly requires a git repository, roles delegation, enforced leases and a plan-task verifier with
+  verification enabled; otherwise the tool and command report why the executor is unavailable. The keys, tool and
+  command have a user guide ([docs/EXECUTOR.md](docs/EXECUTOR.md)); `slotsDir`, `integrationChecks`, `phaseSuite`,
+  `provision` and `python` are trusted keys that only the global override sets. `/router approve` refuses a repository's
+  executor home (`<git common dir>\omr-executor`, with its plan and slot-marker directories) and any repository inside
+  it; that check runs git within one 15 s bound in all, and
   refuses a candidate it could not finish in time. OpenCode v1 ignores every `routing.executor.*` key and logs one
-  notice per process that names them.
+  notice per process that names them; a best-effort `/plan` use shares that notice and adds no output. The v1 tool,
+  command and help maps are unchanged.
 
 ### Changed
 

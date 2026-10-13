@@ -51,6 +51,7 @@ import { createSystemAugmenter } from "../routing/wire/hint";
 import { createTurnStateRegistry, placeTurnState, ROUTER_TURN_STATE_ATTACH, TURN_STATE_ROOT, type TurnStateRegistry } from "./turn-state";
 // 3.1.7 W6: the `plan` provider after the background ones (completed 30, held 40, in-flight 50), before the route hint (90).
 import { PLAN_PROVIDER_NAME, PLAN_PROVIDER_ORDER } from "./turn-state";
+import { createExecutorInstructionsProvider, EXECUTOR_INSTRUCTIONS_ORDER } from "../executor/instructions";
 import { CONTEXT7_DOC_TOOLS, evaluatePermission, permissionMatches, permissionRules, publishReadOnlyPermissions } from "../router/read-only";
 import { filterSensitiveGrep, isSensitivePath } from "../router/sensitive-paths";
 import { canonicalAuthorityPath, insideWorkRoot } from "../routing/roles/work-root";
@@ -3986,7 +3987,10 @@ export async function registerV2Hooks(
           },
           active: (sid) => built.runtime.planLine(sid) !== null || built.runtime.manualReady(sid).length > 0,
         });
-        registrations.push({ dispose: async () => { unsubscribe(); unregisterPlan(); } });
+        const unregisterInstructions = turnState.registerTurnStateProvider({
+          ...createExecutorInstructionsProvider(built.runtime), order: EXECUTOR_INSTRUCTIONS_ORDER,
+        });
+        registrations.push({ dispose: async () => { unsubscribe(); unregisterPlan(); unregisterInstructions(); } });
         // W4 (3.1.7.c, ADR 0007 D13): the host's retry decision feeds the capacity signals; the executor stops the retry of a plan
         // child only. Registered only when an executor exists (M3); on any error the decision stays unchanged.
         registrations.push(await ctx.session.hook("retry", async (event) => {
