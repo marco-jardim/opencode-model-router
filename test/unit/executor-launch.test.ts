@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  MAX_TRACKED_SESSIONS,
   awaitRouterCallKey,
   createTaskLauncher,
   noContextKey,
@@ -519,14 +520,55 @@ describe("confirmation and staleness (guards 1-3)", () => {
     }
   });
 
-  it("a runner that throws before the child exists -> unconfirmed/threw, lost/runner-error, stale (L6)", async () => {
+  it("a context-related runner error before the child exists -> unconfirmed/threw, lost/runner-error, stale (L6)", async () => {
     const r = rig();
-    r.fr.state.script = () => Promise.reject(new Error("host unavailable"));
+    r.fr.state.script = () => Promise.reject(new Error("session not found: ses_x"));
     const handle = r.launcher.launch(r.req(), r.hooks);
-    expect(await handle.confirmation).toEqual({ kind: "unconfirmed", reason: "threw", error: "host unavailable" });
+    expect(await handle.confirmation).toEqual({ kind: "unconfirmed", reason: "threw", error: "session not found: ses_x" });
     expect(await handle.completion).toMatchObject({ kind: "lost", reason: "runner-error", childSessionID: null });
     expect(r.metrics.map((m) => m.result)).toEqual(["threw"]);
     expect(r.launcher.gate(ORCH)).toMatchObject({ ok: false, reason: "context-stale" });
+  });
+
+  it("QA-3.1-4: a deterministic runner error is lost/runner-error but leaves the context usable (not stale)", async () => {
+    for (const message of [
+      "[model-router] OpenCode v2's native subagent tool is unavailable",
+      "unknown agent frobnicator",
+      "validation failed: prompt is empty",
+      "host unavailable",
+    ]) {
+      const r = rig();
+      r.fr.state.script = () => Promise.reject(new Error(message));
+      const handle = r.launcher.launch(r.req(), r.hooks);
+      expect(await handle.confirmation, message).toEqual({ kind: "unconfirmed", reason: "threw", error: message });
+      expect(await handle.completion, message).toMatchObject({ kind: "lost", reason: "runner-error", childSessionID: null });
+      expect(r.launcher.gate(ORCH).ok, message).toBe(true);
+    }
+  });
+
+  it("QA-3.1-4: the context-related classes (host type/code context, expired or aborted context) mark the capture stale", async () => {
+    for (const error of [
+      Object.assign(new Error("boom"), { type: "context" }),
+      new Error("the retained context expired"),
+      new Error("context aborted by the host"),
+    ]) {
+      const r = rig();
+      r.fr.state.script = () => Promise.reject(error);
+      const handle = r.launcher.launch(r.req(), r.hooks);
+      await handle.completion;
+      expect(r.launcher.gate(ORCH), error.message).toMatchObject({ ok: false, reason: "context-stale" });
+    }
+  });
+
+  it("QA-3.1-15: the per-session epoch maps stay bounded (oldest sessions are dropped, recent ones kept)", () => {
+    const r = rig(undefined, { capture: false });
+    const total = MAX_TRACKED_SESSIONS + 10;
+    for (let i = 0; i < total; i++) {
+      r.fr.capture(`ses-${i}`);
+      r.fr.forget(`ses-${i}`);
+    }
+    expect(r.launcher.gate("ses-0")).toMatchObject({ ok: false, reason: "awaiting-first-router-call" });
+    expect(r.launcher.gate(`ses-${total - 1}`)).toMatchObject({ ok: false, reason: "no-context" });
   });
 
   it("a synchronous throw of the runner is handled like a rejection", async () => {
@@ -585,7 +627,7 @@ describe("confirmation and staleness (guards 1-3)", () => {
 
   it("never wakes, prompts or journals on its own: the gate only reports the wake", async () => {
     const r = rig();
-    r.fr.state.script = () => Promise.reject(new Error("x"));
+    r.fr.state.script = () => Promise.reject(new Error("session not found"));
     await r.launcher.launch(r.req(), r.hooks).completion;
     expect(r.launcher.gate(ORCH)).toMatchObject({ ok: false, wake: { reason: "stale-context" } });
     expect(r.fh.hosts.synthetic).not.toHaveBeenCalled();

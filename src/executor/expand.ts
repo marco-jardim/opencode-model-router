@@ -259,8 +259,13 @@ const ROUTE_TIERS: readonly string[] = ["fast", "medium", "heavy"];
 const TOKEN_VALUE_RE = /^[a-z0-9_]+$/;
 /** The whole route line, brackets included: no nested bracket and no line break inside. */
 const ROUTE_LINE_SHAPE_RE = /^\[route(?:[ \t]+([^[\]\r\n]*))?\]$/i;
-/** A slot path usable as `root=`: drive-absolute or POSIX, no whitespace, brackets, quotes, commas, `..` or NUL. */
-const ROOT_VALUE_RE = /^(?:[A-Za-z]:[\\/]|\/(?![\\/]))[^\s[\]",;\0]*$/;
+/**
+ * A slot path usable as `root=`: drive-absolute or POSIX, no brackets, quotes, commas, semicolons, `..`, NUL, control
+ * characters or line breaks. Plain spaces are allowed: such a path is sent quoted (`root="D:\my dir"`, QUOTED_ROOT_RE).
+ */
+const ROOT_VALUE_RE = /^(?:[A-Za-z]:[\\/]|\/(?![\\/]))[^\x00-\x1f\x7f[\]",;]*$/;
+/** Whitespace (only plain spaces get past ROOT_VALUE_RE) in a slot path: the value is quoted. */
+const ROOT_NEEDS_QUOTES_RE = /\s/;
 
 function routeFail(reason: string, detail: Record<string, string | number | boolean | null> = {}): never {
   return fail(`route line cannot be rendered: ${reason}`, detail);
@@ -329,7 +334,7 @@ function parseRouteFields(line: string): RouteFields {
 
 /**
  * The route line sent with the attempt (M36): re-serialized from the whitelisted tokens class, risk, scope, needs, d,
- * `root=<slotPath>`, tier and pin. `task.route.tier` and `task.route.pin` (`[tier:X]` gives `tier=X pin`) win over the
+ * `root=<slotPath>` (quoted when the path holds a space), tier and pin. `task.route.tier` and `task.route.pin` (`[tier:X]` gives `tier=X pin`) win over the
  * line's own `tier=`/`pin`. A value outside its token pattern, or holding whitespace, `]` or a line break, fails with
  * E_LAUNCH_TASK. The plan text (title, text, subtasks) is never read here.
  */
@@ -348,7 +353,7 @@ export function renderRouteLine(task: TaskNode, slotPath: string): string {
   const needs = ROUTE_NEEDS.filter((n) => f.needs.includes(n));
   if (needs.length > 0) parts.push(`needs=${needs.join(",")}`);
   if (f.d !== null) parts.push(`d=${f.d}`);
-  parts.push(`root=${slotPath}`);
+  parts.push(ROOT_NEEDS_QUOTES_RE.test(slotPath) ? `root="${slotPath}"` : `root=${slotPath}`);
   if (tier !== null) parts.push(`tier=${tier}`);
   if (pin) parts.push("pin");
   return `[route ${parts.join(" ")}]`;
@@ -446,8 +451,10 @@ function declaredRoot(line: string): string | null {
 }
 
 /**
- * Expands attempt `attempt` of `taskId` (M36). Pure: the same input gives the same bytes; a different attempt gives a
- * different header line. Throws ExecutorError E_LAUNCH_TASK for an unknown task, an unmappable or too long path, or a
+ * Expands attempt `attempt` of `taskId` (M36). Deterministic: the same input gives the same bytes; a different attempt
+ * gives a different header line. The one input outside `ExpandInput` is the ENVIRONMENT block, which reads the
+ * process-wide slot registry through `slotEnvFor(slot.path)` (it resolves real paths): the bytes are stable for a given
+ * slot registration, and change if the slot's environment registration does. Throws ExecutorError E_LAUNCH_TASK for an unknown task, an unmappable or too long path, or a
  * route line that cannot be re-serialized.
  */
 export function expandTask(i: ExpandInput): ExpandedTask {

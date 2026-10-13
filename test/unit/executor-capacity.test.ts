@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  MAX_TRACKED_STEPS,
   capacityRestoreFromEvents,
   capacityView,
   createCapacityController,
@@ -230,6 +231,30 @@ describe("capacity: recovery", () => {
     expect(c.limit("anthropic")).toBe(4);
     c.release(c.acquire("anthropic", false, "new", 1), "success");
     expect(c.limit("anthropic")).toBe(5);
+  });
+
+  it("QA-3.1-13: L concurrent successes raise the limit by exactly 1, the next generation by 1 more", () => {
+    const { c, clock, metrics } = setup();
+    c.onSignal(sig("s:1", RATE)); // 8 -> 4
+    clock.advance(COOLDOWN);
+    const batch = [1, 2, 3, 4].map((n) => c.acquire("anthropic", false, `t${n}`, 1));
+    for (const t of batch) c.release(t, "success");
+    expect(c.limit("anthropic")).toBe(5);
+    expect(changes(metrics)).toEqual([["decrease", 8, 4], ["increase", 4, 5]]);
+    const next = [5, 6, 7, 8, 9].map((n) => c.acquire("anthropic", false, `t${n}`, 1));
+    for (const t of next) c.release(t, "success");
+    expect(c.limit("anthropic")).toBe(6);
+  });
+
+  it("QA-3.1-15: the per-step maps stay bounded and an evicted step is counted as new", () => {
+    const { c, metrics } = setup({ maxParallel: 8 });
+    c.onSignal(sig("first:1", RATE)); // 8 -> 4
+    for (let i = 0; i < MAX_TRACKED_STEPS; i++) c.onSignal(sig(`other-${i}:1`, RATE));
+    const before = metrics.length;
+    c.onSignal(sig("first:1", RATE)); // evicted: a first signal again
+    expect(metrics.length).toBe(before + 1);
+    c.onSignal(sig("first:1", RATE)); // tracked again: deduped
+    expect(metrics.length).toBe(before + 1);
   });
 
   it("release is idempotent and ignores unknown ids", () => {

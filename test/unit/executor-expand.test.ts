@@ -378,9 +378,19 @@ describe("renderRouteLine: whitelist re-serialization", () => {
     }
   });
 
-  it("fails on a slot path with whitespace, a bracket, a quote, a newline, a relative or a .. path", () => {
+  it("quotes a slot path that holds a space (QA-3.1 nit 5) and the parser reads it back", () => {
+    const t = routeOf("[route class=debug]");
+    const line = renderRouteLine(t, "D:\\my slots\\s1");
+    expect(line).toBe(`[route class=debug root="D:\\my slots\\s1"]`);
+    // the same line is accepted as a task's own route line (its quoted root is replaced by the slot)
+    expect(renderRouteLine(routeOf(line), SLOT)).toBe(`[route class=debug root=${SLOT}]`);
+    // a path without whitespace stays bare
+    expect(renderRouteLine(t, "D:\\slots\\s1")).toBe(`[route class=debug root=D:\\slots\\s1]`);
+  });
+
+  it("fails on a slot path with a tab, a bracket, a quote, a newline, a relative or a .. path", () => {
     const t = routeOf("");
-    for (const bad of ["D:\\my slots\\s1", "D:\\s]1", "D:\\s\"1", "D:\\s\n1", "slots\\s1", "D:\\slots\\..\\x", "\\\\host\\share\\s"]) {
+    for (const bad of ["D:\\my\tslots\\s1", "D:\\s]1", "D:\\s\"1", "D:\\s\n1", "slots\\s1", "D:\\slots\\..\\x", "\\\\host\\share\\s"]) {
       expect(codeOf(() => renderRouteLine(t, bad)), bad).toBe("E_LAUNCH_TASK");
     }
   });

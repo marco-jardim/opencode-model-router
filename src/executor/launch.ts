@@ -85,6 +85,28 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** QA-3.1-15: per-session maps (`lastEpoch`, `staleEpoch`) keep at most this many sessions; the least recently touched go first. */
+export const MAX_TRACKED_SESSIONS = 256;
+
+const CONTEXT_ERROR_TEXT =
+  /session[ _-]?not[ _-]?found|(?:context|capture)[ _-]?(?:superseded|expired|aborted|stale|invalid|gone|missing|not[ _-]?found)|(?:expired|aborted|stale|superseded)[ _-]?(?:context|capture)/i;
+
+/**
+ * QA-3.1-4: whether a runner error before confirmation says the retained context itself is unusable (so the capture is
+ * marked stale), as opposed to a deterministic runner failure that a fresh capture would not change (native subagent tool
+ * unavailable, unknown agent, validation errors, ...). Context-related: `ContextSupersededError`, a host error whose
+ * `type`/`code` is `context` or whose name/type/code/message names a superseded, expired, aborted, stale or missing
+ * context/capture, or a "session not found" host error.
+ */
+export function isContextRelatedRunnerError(error: unknown): boolean {
+  if (isContextSupersededError(error)) return true;
+  if (typeof error !== "object" || error === null) return false;
+  const e = error as { name?: unknown; type?: unknown; code?: unknown; message?: unknown };
+  const tag = (v: unknown): string => (typeof v === "string" ? v : "");
+  if (tag(e.type).toLowerCase() === "context" || tag(e.code).toLowerCase() === "context") return true;
+  return CONTEXT_ERROR_TEXT.test(`${tag(e.name)} ${tag(e.type)} ${tag(e.code)} ${tag(e.message)}`);
+}
+
 /** One launch: the executor's view of a child from `launch()` until both its completion and its runner have settled. */
 interface Launch {
   readonly req: LaunchRequest;
@@ -131,14 +153,27 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
   const launchKey = (taskId: TaskId, attempt: number): string => `${taskId}#${attempt}`;
 
   const offCapture = d.runner.onContextCaptured((c) => {
-    lastEpoch.set(c.sessionID, Math.max(lastEpoch.get(c.sessionID) ?? 0, c.epoch));
+    setBounded(lastEpoch, c.sessionID, Math.max(lastEpoch.get(c.sessionID) ?? 0, c.epoch));
   });
   const offEvents = d.hosts.onEvent((e) => {
     if (isTerminal(e)) onTerminal(e);
   });
 
+  /** Sets `key` as the most recent entry and drops the oldest ones beyond {@link MAX_TRACKED_SESSIONS} (never a session with a live launch). */
+  const setBounded = (map: Map<string, number>, key: string, value: number): void => {
+    map.delete(key);
+    map.set(key, value);
+    if (map.size <= MAX_TRACKED_SESSIONS) return;
+    const live = new Set<string>();
+    for (const l of launches.values()) live.add(l.req.orchestratorSessionID);
+    for (const k of map.keys()) {
+      if (map.size <= MAX_TRACKED_SESSIONS) break;
+      if (k !== key && !live.has(k)) map.delete(k);
+    }
+  };
+
   const markStale = (sessionID: string, epoch: number): void => {
-    staleEpoch.set(sessionID, Math.max(staleEpoch.get(sessionID) ?? 0, epoch));
+    setBounded(staleEpoch, sessionID, Math.max(staleEpoch.get(sessionID) ?? 0, epoch));
   };
 
   const gate = (orchestratorSessionID: string): LaunchGate => {
@@ -157,7 +192,7 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
         wake: { reason: "stale-context", stateKey: awaitRouterCallKey(d.runner.bootID, orchestratorSessionID) },
       };
     }
-    lastEpoch.set(orchestratorSessionID, Math.max(lastEpoch.get(orchestratorSessionID) ?? 0, cap.epoch));
+    setBounded(lastEpoch, orchestratorSessionID, Math.max(lastEpoch.get(orchestratorSessionID) ?? 0, cap.epoch));
     if (cap.epoch <= (staleEpoch.get(orchestratorSessionID) ?? 0)) {
       return {
         ok: false, reason: "context-stale",
@@ -274,6 +309,7 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
     l.runnerDone = true;
     if (!l.confirmed) {
       if (!l.confirmSettled) {
+        // No error to classify: a runner that returns without ever creating the child leaves the context in doubt.
         markStale(l.req.orchestratorSessionID, l.req.context.epoch);
         unconfirm(l, "threw", "the runner returned without creating a confirmed child");
       }
@@ -306,7 +342,8 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
         // task-error / hook-failed / timeout: the child was never prompted.
         settleCompletion(l, { kind: "lost", childSessionID: l.childId, reason: "unconfirmed", endedAt: at });
       } else {
-        markStale(l.req.orchestratorSessionID, l.req.context.epoch);
+        // QA-3.1-4: a deterministic runner error leaves the retained context usable.
+        if (isContextRelatedRunnerError(error)) markStale(l.req.orchestratorSessionID, l.req.context.epoch);
         unconfirm(l, "threw", error);
         settleCompletion(l, { kind: "lost", childSessionID: l.childId, reason: "runner-error", endedAt: at });
       }

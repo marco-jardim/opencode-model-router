@@ -51,6 +51,8 @@ type InboxInput = Omit<InboxItem, "id" | "createdAt" | "answer">;
 interface ProviderRuntime extends CapacityProviderState {
   used: number;
   heavyUsed: number;
+  /** QA-3.1-13: token sequence number at the last increase; only tokens acquired after it may raise the limit again. */
+  lastIncreaseSeq: number;
 }
 
 interface TokenRecord {
@@ -59,9 +61,14 @@ interface TokenRecord {
   taskId: TaskId;
   attempt: number;
   acquiredAtMs: number;
+  seq: number;
 }
 
-/** M17: the first zoned ISO instant in `message` that is later than `nowMs`; zoneless and past instants are ignored. */
+/** QA-3.1-15: the controller sees step keys but no end-of-step signal, so its per-step maps are bounded (oldest dropped). */
+export const MAX_TRACKED_STEPS = 2048;
+
+/** M17: the first zoned ISO instant in `message` that is later than `nowMs`; zoneless and past instants are ignored
+ *  (a past instant would pause zero time; ADR 0007 words this as "the first ISO instant"). */
 const ISO_INSTANT = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})/g;
 
 export function pauseUntilFromMessage(message: string, nowMs: number): number | null {
@@ -93,6 +100,22 @@ export function createCapacityController(o: CapacityOptions): CapacityController
   const retryStopped = new Set<string>();
   let tokenSeq = 0;
 
+  /** Insertion order is recency order: re-adding moves a key to the end, overflow drops the first (oldest) key. */
+  const touchBounded = (map: Map<string, number> | Set<string>, key: string, value: number): void => {
+    if (map instanceof Map) {
+      map.delete(key);
+      map.set(key, value);
+    } else {
+      map.delete(key);
+      map.add(key);
+    }
+    while (map.size > MAX_TRACKED_STEPS) {
+      const oldest = map.keys().next();
+      if (oldest.done === true) break;
+      map.delete(oldest.value);
+    }
+  };
+
   for (const [p, s] of Object.entries(o.restore ?? {})) {
     providers.set(p, {
       limit: clampLimit(s.limit, maxParallel),
@@ -101,6 +124,7 @@ export function createCapacityController(o: CapacityOptions): CapacityController
       pausedUntilMs: s.pausedUntilMs,
       used: 0,
       heavyUsed: 0,
+      lastIncreaseSeq: 0,
     });
   }
 
@@ -112,7 +136,7 @@ export function createCapacityController(o: CapacityOptions): CapacityController
   const state = (provider: string): ProviderRuntime => {
     let s = providers.get(provider);
     if (s === undefined) {
-      s = { limit: maxParallel, holdUntilMs: 0, lastSignalAtMs: null, pausedUntilMs: null, used: 0, heavyUsed: 0 };
+      s = { limit: maxParallel, holdUntilMs: 0, lastSignalAtMs: null, pausedUntilMs: null, used: 0, heavyUsed: 0, lastIncreaseSeq: 0 };
       providers.set(provider, s);
     }
     return s;
@@ -158,7 +182,7 @@ export function createCapacityController(o: CapacityOptions): CapacityController
       }
       tokenSeq += 1;
       const id = `cap-${tokenSeq}`;
-      tokens.set(id, { provider, heavy, taskId, attempt, acquiredAtMs: now });
+      tokens.set(id, { provider, heavy, taskId, attempt, acquiredAtMs: now, seq: tokenSeq });
       s.used += 1;
       if (heavy) s.heavyUsed += 1;
       return { id };
@@ -176,8 +200,11 @@ export function createCapacityController(o: CapacityOptions): CapacityController
       // M16: grow by 1 only after a quiet cooldown, and only from a child started at or after the last signal.
       if (s.pausedUntilMs !== null || now < s.holdUntilMs) return;
       if (s.lastSignalAtMs !== null && (now - s.lastSignalAtMs < cooldownMs || t.acquiredAtMs < s.lastSignalAtMs)) return;
+      // QA-3.1-13: one increase per generation; a token acquired before the last increase no longer qualifies.
+      if (t.seq <= s.lastIncreaseSeq) return;
       const from = s.limit;
       s.limit = from + 1;
+      s.lastIncreaseSeq = tokenSeq;
       emit({ provider: t.provider, change: "increase", from, to: s.limit, until: null, errorType: null, status: null });
     },
 
@@ -190,10 +217,12 @@ export function createCapacityController(o: CapacityOptions): CapacityController
 
       if (cls === "rate-limit" || cls === "overload") {
         s.lastSignalAtMs = now;
-        if (firstSignalAt.has(sig.stepKey)) {
+        const seen = firstSignalAt.get(sig.stepKey);
+        if (seen !== undefined) {
+          touchBounded(firstSignalAt, sig.stepKey, seen);
           return { decreased: false, pausedUntil: isoOrNull(s.pausedUntilMs), inbox: null };
         }
-        firstSignalAt.set(sig.stepKey, now);
+        touchBounded(firstSignalAt, sig.stepKey, now);
         // A first signal at the floor (limit 1) still renews the hold and emits `decrease` 1 -> 1 (`decreased: false`).
         const from = s.limit;
         s.limit = Math.max(1, Math.floor(from / 2));
@@ -227,7 +256,7 @@ export function createCapacityController(o: CapacityOptions): CapacityController
       const first = firstSignalAt.get(i.stepKey);
       const stop = s.pausedUntilMs !== null || (first !== undefined && now - first > cooldownMs);
       if (stop && !retryStopped.has(i.stepKey)) {
-        retryStopped.add(i.stepKey);
+        touchBounded(retryStopped, i.stepKey, 0);
         emit({
           provider: i.provider, change: "retry-stop", from: s.limit, to: s.limit, until: null,
           errorType: null, status: null,
