@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createCapacityController } from "../../src/executor/capacity.js";
 import { createLedgerStore } from "../../src/executor/ledger.js";
+import { taskBranchName } from "../../src/executor/git.js";
 import { createRecoveryService, type RecoveryEngine } from "../../src/executor/recovery.js";
 import {
   attemptTrailer,
@@ -1093,6 +1094,173 @@ describe("same-process adopt (D12)", () => {
     await untilEnqueued(h, "T1");
     expect(endsOf(await h.events(), "T1")).toHaveLength(1);
     expect(h.verifier.calls).toEqual(["T1#1"]);
+  });
+});
+
+describe("same-process adopt: launch hooks resolve the live attachment", () => {
+  it("a child created after the adopt for an in-flight launch is bound and confirmed on the new attachment, processed once", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.runOf("T1", 1);
+    await until(() => h.state("T1") === "dispatched", "T1 dispatched");
+    const before = h.parts().writer;
+    h.engine();
+    await h.runtime.adopt(PLAN_ID, "ses-new");
+    await until(() => h.ledger().orchestrator.sessionID === "ses-new", "the new orchestrator");
+    await pause(20);
+    expect(h.parts().writer).not.toBe(before);
+    expect(h.state("T1")).toBe("dispatched");
+    expect(h.hosts.interrupts).toEqual([]);
+    // the child comes only now: onChildCreated must bind it through the live writer, not refuse it on the closed one
+    h.hosts.contexts.set("ses-c1", { messages: [{ role: "user", text: run.req.prompt, outcome: null }] });
+    await run.child("ses-c1");
+    await pause(20);
+    expect(h.state("T1")).toBe("running");
+    expect(h.task("T1").attempts[0]?.childSessionID).toBe("ses-c1");
+    run.complete("done");
+    await untilEnqueued(h, "T1");
+    await h.runtime.settled();
+    const ev = await h.events();
+    expect(ev.filter((e) => e.type === "attempt-child" && e.taskId === "T1")).toHaveLength(1);
+    expect(endsOf(ev, "T1")).toHaveLength(1);
+    expect(h.verifier.calls).toEqual(["T1#1"]);
+    expect(h.launcher.runs).toHaveLength(1);
+    expect(h.logs.filter((l) => /child refused|task vanished/.test(l))).toEqual([]);
+  });
+
+  it("a launch confirmation that fails after the adopt journals row 11 on the new attachment", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.runOf("T1", 1);
+    await until(() => h.state("T1") === "dispatched", "T1 dispatched");
+    h.engine();
+    await h.runtime.adopt(PLAN_ID, "ses-new");
+    await until(() => h.ledger().orchestrator.sessionID === "ses-new", "the new orchestrator");
+    await pause(20);
+    expect(h.state("T1")).toBe("dispatched");
+    h.launcher.gateValue = DISPOSED_GATE; // no relaunch: only the confirmation's row 11 is under test
+    // onConfirmation (L7) runs against the live writer; on the closed one row 11 would fail and T1 stay dispatched
+    run.confirmation.resolve({ kind: "unconfirmed", reason: "timeout", error: null });
+    await until(() => h.state("T1") === "ready", "T1 requeued by row 11");
+    await pause(20);
+    const a = need(h.task("T1").attempts[0], "attempt 1");
+    expect(a.outcome).toBe("lost");
+    expect(endsOf(await h.events(), "T1")).toHaveLength(1);
+    expect(h.logs.filter((l) => /row 11 failed/.test(l))).toEqual([]);
+  });
+});
+
+describe("R2: a completed/verifying/verified task whose slot lost its marker", () => {
+  const BRANCH = taskBranchName(PLAN_ID, "T1");
+  const verifyRef = `refs/heads/${BRANCH}^{commit}`;
+
+  /** The slot `name` carries no marker any more (missing): the pool forgets its owner. */
+  function dropMarker(h: Harness, name: string): void {
+    for (const [owner, l] of [...h.slots.byOwner]) if (l.slot === name) h.slots.byOwner.delete(owner);
+  }
+
+  /** The slot `name` now belongs to another task (foreign marker and pool record). */
+  function foreignMarker(h: Harness, name: string): void {
+    const rec = need(h.slots.records.get(name), `record of ${name}`);
+    const owner = `omr:${PLAN_ID}:T9`;
+    dropMarker(h, name);
+    h.slots.byOwner.set(owner, { slot: name, path: rec.path, planId: PLAN_ID, owner, commit: SHA });
+    h.slots.records.set(name, { ...rec, owner });
+  }
+
+  /** The task branch does not exist: `rev-parse --verify` of it fails. */
+  function noBranch(h: Harness): void {
+    const run = h.git.run.bind(h.git);
+    h.git.run = async (args, o) => {
+      if (args[0] === "rev-parse" && args.includes(verifyRef)) {
+        h.git.calls.push({ args: [...args], cwd: o.cwd });
+        return { code: 1, signal: null, stdout: "", stderr: "", truncated: false, durationMs: 0 };
+      }
+      return run(args, o);
+    };
+  }
+
+  const openFailures = (h: Harness): InboxItem[] => h.ledger().inbox.filter((i) => i.taskId === "T1" && i.kind === "failure" && i.answer === null);
+
+  it("completed, marker missing: re-provisioned from omr/<planId>/t/<taskId> (slot, checkout, leases), then committed and verified", async () => {
+    const h = await mk(planOf([task("T1")]));
+    const a = await completedThenCrash(h);
+    const old = need(h.task("T1").slot, "slot of T1");
+    h.git.dirty = () => false;
+    h.git.headBody = `T1: task (attempt 1)\n\n${attemptTrailer(PLAN_ID, "T1", 1, a.nonce)}\n`;
+    dropMarker(h, old);
+    const mark = h.git.calls.length;
+    const logMark = h.log.length;
+    await h.restart();
+    await untilEnqueued(h, "T1");
+
+    const t = h.task("T1");
+    expect(t.slot).not.toBeNull();
+    expect(t.slot).not.toBe(old);
+    expect(t.branch).toBe(BRANCH);
+    const fresh = need(t.slot, "new slot");
+    const calls = h.git.calls.slice(mark);
+    expect(calls.some((c) => c.args[0] === "rev-parse" && c.args.includes(verifyRef) && c.cwd === REPO)).toBe(true);
+    expect(calls.some((c) => c.args.join(" ") === `switch --detach ${HEAD_SHA}` && c.cwd === slotPathOf(fresh))).toBe(true);
+    expect(h.log.slice(logMark)).toContain(`slots.reset:${fresh}`);
+    expect(h.slots.released).toContain(old);
+    // its leases are taken again on the new tree
+    for (const w of t.footprint.writes) expect(h.parts().leases.holder(w)?.taskId).toBe("T1");
+    expect(calls.some((c) => c.args[0] === "commit")).toBe(false);
+    expect(h.verifier.calls).toEqual(["T1#1"]);
+    expect(openFailures(h)).toEqual([]);
+    // the new slot is journaled before row 21 commits on it (which journals the slot again with the branch)
+    const ev = await h.events();
+    const slotAt = ev.findIndex((e) => e.type === "task-slot" && e.taskId === "T1" && e.slot === fresh);
+    const committedAt = ev.findIndex((e) => e.type === "task-transition" && e.taskId === "T1" && e.to === "verifying");
+    expect(slotAt).toBeGreaterThanOrEqual(0);
+    expect(slotAt).toBeLessThan(committedAt);
+  });
+
+  it("verified, marker foreign: re-provisioned from the task branch (the foreign slot is not released) and re-enqueued", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    run.complete("Done.");
+    await untilEnqueued(h, "T1");
+    const old = need(h.task("T1").slot, "slot of T1");
+    foreignMarker(h, old);
+    const mark = h.git.calls.length;
+    await h.restart();
+    await untilEnqueued(h, "T1");
+
+    const t = h.task("T1");
+    expect(t.state).toBe("verified");
+    const fresh = need(t.slot, "new slot");
+    expect(fresh).not.toBe(old);
+    expect(h.slots.released).not.toContain(old);
+    expect(h.git.calls.slice(mark).some((c) => c.args.join(" ") === `switch --detach ${HEAD_SHA}` && c.cwd === slotPathOf(fresh))).toBe(true);
+    expect(openFailures(h)).toEqual([]);
+    expect(h.verifier.calls).toEqual(["T1#1"]);
+  });
+
+  it("completed, marker missing, no task branch: nothing is re-provisioned and one blocking item is raised", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await completedThenCrash(h);
+    const old = need(h.task("T1").slot, "slot of T1");
+    dropMarker(h, old);
+    noBranch(h);
+    const mark = h.git.calls.length;
+    const logMark = h.log.length;
+    await h.restart();
+    await until(() => openFailures(h).length > 0, "the blocking item");
+    await h.runtime.settled();
+
+    expect(h.state("T1")).toBe("completed");
+    expect(h.task("T1").slot).toBe(old);
+    expect(h.log.slice(logMark).filter((l) => l.startsWith("slots.acquire:"))).toEqual([]);
+    expect(h.git.calls.slice(mark).some((c) => c.args[0] === "switch" || c.args[0] === "commit")).toBe(false);
+    expect(h.verifier.calls).toEqual([]);
+    const items = openFailures(h);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ severity: "blocking", options: [] });
+    expect(items[0]?.text).toContain("marker");
+    expect(items[0]?.text).toContain(BRANCH);
   });
 });
 

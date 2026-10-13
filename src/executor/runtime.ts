@@ -1270,7 +1270,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       );
       void track(
         handle.confirmation.then(
-          (c) => onConfirmation(p, taskId, n, c),
+          (c) => onConfirmation(current(p), taskId, n, c),
           (e: unknown) => {
             d.log("warn", "confirmation rejected", errorText(e));
           },
@@ -1355,9 +1355,15 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     });
   }
 
-  function launchHooks(p: PlanRt, taskId: TaskId, n: number, route: TaskRoute): LaunchHooks {
+  /**
+   * The hooks resolve the plan's LIVE attachment at call time (`current(p0)`), as the launch-end path does: a same-process
+   * adopt replaces the attachment while a launch is in flight, and a child created afterwards must be bound against the
+   * new writer, not refused by the closed one.
+   */
+  function launchHooks(p0: PlanRt, taskId: TaskId, n: number, route: TaskRoute): LaunchHooks {
     return {
       async onLateChild(): Promise<"adopt" | "refuse"> {
+        const p = current(p0);
         const l = p.writer.ledger;
         const c = own(l, taskId);
         const a = c === null ? undefined : c.attempts[c.attempts.length - 1];
@@ -1367,7 +1373,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         return ok ? "adopt" : "refuse";
       },
       async onChildCreated(childSessionID: string): Promise<void> {
-        await withTask(p, taskId, async () => {
+        // The task mutex is keyed by plan and task, so it spans attachments; resolve again once it is held.
+        await withTask(current(p0), taskId, async () => {
+          const p = current(p0);
           const c = own(p.writer.ledger, taskId);
           if (c === null) throw new ExecutorError("E_PLAN_STATE", "task vanished", taskId);
           const adopting = c.state === "ready";
@@ -1408,13 +1416,16 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     };
   }
 
-  async function onConfirmation(p: PlanRt, taskId: TaskId, n: number, c: LaunchConfirmation): Promise<void> {
+  /** `p0` may be an attachment a same-process adopt closed since the launch: the live one is resolved at call time. */
+  async function onConfirmation(p0: PlanRt, taskId: TaskId, n: number, c: LaunchConfirmation): Promise<void> {
     if (c.kind === "confirmed") {
+      const p = current(p0);
       p.preConfirmLosses = 0;
       p.preConfirmCapture = null;
       return;
     }
-    await withTask(p, taskId, async () => {
+    await withTask(current(p0), taskId, async () => {
+      const p = current(p0);
       const t = own(p.writer.ledger, taskId);
       if (t === null || t.state !== "dispatched" || openAttempt(t, n) === null) return;
       counter(p, "launch-failed", { row: c.reason === "task-error" ? "L8" : c.reason === "timeout" ? "L7" : c.reason === "threw" ? "L6" : c.reason === "superseded" ? "L5" : "L9" });
@@ -2335,6 +2346,15 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       case "reverify":
         await withTask(p, t.id, () => reverify(p, t.id, f));
         return;
+      case "re-enqueue":
+        // R2: a verified task whose slot lost its marker gets its slot back before step 9 re-enqueues it.
+        if (f.slotValid === false && t.slot !== null) {
+          await withTask(p, t.id, async () => {
+            const x = own(p.writer.ledger, t.id);
+            if (x !== null && x.state === "verified") await reprovisionOrRaise(p, x);
+          });
+        }
+        return;
       default:
         // re-enqueue: step 9; resume-integration: step 4; interrupt-orphan: step 3; none.
         return;
@@ -2448,6 +2468,99 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     }
   }
 
+  /**
+   * R2: a `completed`/`verifying`/`verified` task whose slot marker is missing or foreign gets a slot again from its task
+   * branch `omr/<planId>/t/<taskId>`: the stale slot goes back to the pool (only if the pool still records it as ours), a
+   * slot is acquired, reset to the branch tip and checked out (detached) at it, the task's leases move to the new tree
+   * (released and re-taken, as `rebuild` does) and the slot is journaled (state re-checked, D2). False when the branch
+   * does not exist (nothing touched) or a later step fails (the new slot is returned); the caller raises the blocking item.
+   */
+  async function reprovisionSlot(p: PlanRt, taskId: TaskId): Promise<boolean> {
+    const t0 = own(p.writer.ledger, taskId);
+    if (t0 === null || (t0.state !== "completed" && t0.state !== "verifying" && t0.state !== "verified")) return false;
+    const from = t0.state;
+    const branch = taskBranchName(p.planId, taskId);
+    const o = { cwd: p.writer.ledger.repo.toplevel, timeoutMs: GIT_TIMEOUT_MS };
+    let tip = "";
+    try {
+      const r = await d.git.run(["rev-parse", "--verify", "--quiet", `refs/heads/${branch}^{commit}`], o);
+      tip = r.code === 0 ? r.stdout.trim() : "";
+    } catch (e) {
+      d.log("warn", `task branch of ${taskId} unreadable`, errorText(e));
+    }
+    if (tip === "") return false;
+    const stale = t0.slot;
+    p.slotLeases.delete(taskId);
+    if (stale !== null && (await slotHeldBy(p, taskId, stale))) {
+      try {
+        await d.slots.release(stale);
+      } catch (e) {
+        d.log("warn", "slot release failed", errorText(e));
+      }
+    }
+    let slot: SlotLease | null = null;
+    const undo = async (why: string, e?: unknown): Promise<false> => {
+      d.log("warn", `re-provisioning ${taskId} from ${branch}: ${why}`, e === undefined ? "" : errorText(e));
+      const s = slot;
+      p.slotLeases.delete(taskId);
+      if (s !== null) {
+        try {
+          await d.slots.release(s.slot);
+        } catch (e2) {
+          d.log("warn", "slot release failed", errorText(e2));
+        }
+      }
+      return false;
+    };
+    try {
+      slot = await d.slots.acquire(p.planId, leaseHolderID(p.planId, taskId), tip);
+      p.slotLeases.set(taskId, slot);
+      await d.slots.reset(slot.slot, tip);
+      // Detached at the tip: the branch may still be checked out in the stale worktree, and the ref itself stays put.
+      const r = await d.git.run(["switch", "--detach", tip], { cwd: slot.path, timeoutMs: GIT_TIMEOUT_MS });
+      if (r.code !== 0) return await undo("checkout failed", r.stderr.slice(0, 2000));
+    } catch (e) {
+      return await undo("slot unavailable", e);
+    }
+    const lease = slot;
+    releaseLeases(p, taskId);
+    try {
+      const got = p.leases.acquireTask({ taskId, tree: lease.path, writes: t0.footprint.writes });
+      if (!got.ok) return await undo("leases held elsewhere");
+    } catch (e) {
+      return await undo("lease error", e);
+    }
+    try {
+      await appendIf(p, (cur) => {
+        const c = own(cur, taskId);
+        if (c === null || c.state !== from) return [];
+        return c.slot === lease.slot && c.branch === branch ? [] : [ts(taskId, lease.slot, branch)];
+      });
+    } catch (e) {
+      return await undo("journal failed", e);
+    }
+    const now = own(p.writer.ledger, taskId);
+    if (now === null || now.slot !== lease.slot) return await undo("the task moved");
+    counter(p, "slot-reprovisioned", { taskId });
+    return true;
+  }
+
+  /**
+   * R2 for `completed`/`verifying`/`verified`: re-provision from the task branch; when that is impossible (no branch, a
+   * failed step) the slot is not this task's any more and its work cannot be trusted: one blocking item, a human decides.
+   */
+  async function reprovisionOrRaise(p: PlanRt, t: TaskNode): Promise<boolean> {
+    if (await reprovisionSlot(p, t.id)) return true;
+    await raiseSafe(p, {
+      kind: "failure",
+      severity: "blocking",
+      taskId: t.id,
+      text: `the slot of ${t.id} (${t.slot ?? "none"}) no longer carries its marker after a restart and it could not be re-provisioned from ${taskBranchName(p.planId, t.id)}; restore the task branch or abort the task`,
+      options: [],
+    });
+    return false;
+  }
+
   /** R4: `reset --hard HEAD` + `clean -fd` in the task's slot (ignored files kept); idempotent, never throws. */
   async function resetSlotContents(p: PlanRt, t: TaskNode): Promise<void> {
     try {
@@ -2462,20 +2575,13 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
   /** `completed` -> commit-and-verify (D11 finds a commit made before the crash); `verifying` -> the verifier again. */
   async function reverify(p: PlanRt, taskId: TaskId, f: ReconcileFeed): Promise<void> {
+    const t0 = own(p.writer.ledger, taskId);
+    const n = t0?.attempts[t0.attempts.length - 1]?.n;
+    if (t0 === null || n === undefined || t0.slot === null) return;
+    if (f.slotValid === false && !(await reprovisionOrRaise(p, t0))) return;
+    // Re-read: a re-provisioned task has a new slot.
     const t = own(p.writer.ledger, taskId);
-    const n = t?.attempts[t.attempts.length - 1]?.n;
-    if (t === null || n === undefined || t.slot === null) return;
-    if (f.slotValid === false) {
-      // R2: the slot is not this task's any more; its work cannot be trusted. A human decides.
-      await raiseSafe(p, {
-        kind: "failure",
-        severity: "blocking",
-        taskId,
-        text: `the slot of ${taskId} (${t.slot}) no longer carries its marker after a restart; re-provision it from ${t.branch ?? "the task branch"} or abort the task`,
-        options: [],
-      });
-      return;
-    }
+    if (t === null || t.slot === null) return;
     if (t.state === "completed") {
       await commitAndVerify(p, taskId, n);
       return;
