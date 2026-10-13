@@ -6,7 +6,9 @@ import { registerV2Hooks } from "./compat/v2-hooks";
 import type { Ingest } from "./routing/outcomes/ingest";
 import type { BudgetSnapshot } from "./guard/enforce";
 import type { PlanTaskVerifier } from "./executor/runtime";
-import { createExecutor, createExecutorAccess, prepareExecutor, type CreateExecutorOptions } from "./executor/create";
+import { createExecutor, createExecutorAccess, prepareExecutor, type CreateExecutorOptions, type PreparedExecutor } from "./executor/create";
+import { loadConfig, resolveRolesRouting, resolveRouting } from "./router/config";
+import { locationOutsideWorkRoots } from "./router/work-roots";
 
 /** Keep the routing engine shared; translate only the host API at this boundary. */
 export default {
@@ -16,7 +18,14 @@ export default {
     const runtime = createV2Runtime(ctx);
     const directory = ctx.location.directory;
     const access = createExecutorAccess();
-    const prep = prepareExecutor(directory);
+    const cfg = loadConfig(directory), routing = resolveRouting(cfg, "v2"), rolesRouting = resolveRolesRouting(cfg, "v2");
+    const discoveryDisabled = rolesRouting.delegation !== "roles" ? "routing.delegation must be roles at start"
+      : routing.leases.mode !== "enforce" ? "routing.leases.mode must be enforce"
+      : cfg.enforcement?.verify?.require === "never" ? "enforcement.verify.require is never"
+      : locationOutsideWorkRoots(directory, rolesRouting.workRoots) ? "the location is outside routing.workRoots"
+      : null;
+    const prep: Promise<PreparedExecutor> = discoveryDisabled === null ? prepareExecutor(directory)
+      : Promise.resolve({ ok: false, reason: discoveryDisabled });
     // The engine consumes directory/client only. V2 has no legacy HTTP server
     // URL or Bun shell context; do not invent either for the adapter.
     let ingest: Ingest | undefined;
@@ -66,6 +75,7 @@ export default {
     const hooks = await ModelRouterPlugin(input as unknown as PluginInput);
     const prepared = await prep;
     if (!prepared.ok) access.clear(prepared.reason);
+    if (runtime.childRunner === undefined) access.clear("the child runner is not available");
     return registerV2Hooks(ctx, hooks, runtime, {
       executor: (host) => createExecutor({ routerHost: "v2", directory }, { host, prepared, access, ...(annotate ? { annotate } : {}) }) ?? null,
       ...(ingest ? { ingest } : {}), ...(isBypassed ? { isBypassed } : {}), ...(budgetSnapshot ? { budgetSnapshot } : {}),

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -24,6 +25,7 @@ describe("plan registration (Phase 5.1.2)", () => {
   let home = "";
   let project = "";
   const plugins: Hooks[] = [];
+  const childSessionCreators = new WeakMap<Hooks, () => Promise<string>>();
 
   beforeEach(() => {
     vi.resetModules(); // Re-arm the process notice only between tests; plugin instances within a test still share it.
@@ -64,22 +66,36 @@ describe("plan registration (Phase 5.1.2)", () => {
 
   async function plugin(host: "v1" | "v2", access?: ExecutorAccess, failLookup = false, onAccess?: () => void) {
     const { default: ModelRouterPlugin } = await import("../../src/index");
+    const childSessions = new Map<string, { id: string; parentID: string }>();
+    const create = async ({ body }: { body: { parentID: string } }) => {
+      const session = { id: `plan-registration-child-${randomUUID()}`, parentID: body.parentID };
+      childSessions.set(session.id, session);
+      return { data: session };
+    };
     const get = vi.fn(async ({ path }: { path: { id: string } }) => {
       if (failLookup) throw new Error("session lookup unavailable");
-      return { data: { ...(path.id === "root" ? {} : { parentID: "root" }) } };
+      return { data: childSessions.get(path.id) ?? { ...(path.id === "root" ? {} : { parentID: "root" }) } };
     });
     const ctx = {
       directory: project, worktree: project, project: {}, serverUrl: new URL("http://localhost"), $: () => undefined,
       ...(host === "v2" ? { routerHost: "v2" as const } : {}),
       get routerExecutor() { onAccess?.(); return access; },
       client: { session: {
-        get, create: async () => ({ data: { id: "never" } }), prompt: async () => ({ data: { parts: [] } }),
+        get, create, prompt: async () => ({ data: { parts: [] } }),
         abort: async () => ({}), delete: async () => ({}),
       } },
     };
     const hooks = await ModelRouterPlugin(ctx as unknown as Parameters<typeof ModelRouterPlugin>[0]) as unknown as Hooks;
     plugins.push(hooks);
+    childSessionCreators.set(hooks, async () => (await ctx.client.session.create({ body: { parentID: "root" } })).data.id);
     return hooks;
+  }
+
+  async function createChildSession(hooks: Hooks): Promise<string> {
+    const create = childSessionCreators.get(hooks);
+    if (create === undefined) throw new Error("plugin fixture has no child session creator");
+    // Production creates a fresh host session before binding it; evicted IDs must never be reused.
+    return create();
   }
 
   async function command(hooks: Hooks, name: string, args = "", sessionID = "root") {
@@ -107,6 +123,41 @@ describe("plan registration (Phase 5.1.2)", () => {
     const hooks = await plugin("v2", access);
     expect(await call(hooks, { action: "status" })).toContain(access.unavailable());
     expect((await command(hooks, "plan", "status"))[0]?.text).toContain(access.unavailable());
+  });
+
+  it("v2 preserves a user-defined /plan, warns once, and keeps router_plan available", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { createExecutorAccess, lateRuntime } = await import("../../src/executor/create");
+    const access = createExecutorAccess();
+    access.set({ ...lateRuntime(createExecutorAccess()), status: async () => "tool still available" });
+    const hooks = await plugin("v2", access);
+    const userPlan = { template: "My own plan: $ARGUMENTS", description: "User plan" };
+    const output = { command: { plan: userPlan }, agent: {} };
+    await hooks.config(output);
+    await hooks.config(output);
+    expect(output.command.plan).toBe(userPlan);
+    expect(await command(hooks, "plan", "status")).toEqual([]);
+    expect(await call(hooks, { action: "status" })).toContain("tool still available");
+    const conflicts = warn.mock.calls.map(([message]) => String(message)).filter(message => message.includes("/plan command conflict"));
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0]).toContain("user-defined /plan");
+    expect(conflicts[0]).toContain("router_plan remains available");
+  });
+
+  it("v2 config reloads do not mistake the executor's /plan registration for a user command", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const { createExecutorAccess, lateRuntime } = await import("../../src/executor/create");
+    const access = createExecutorAccess();
+    access.set(lateRuntime(createExecutorAccess()));
+    const hooks = await plugin("v2", access);
+    const output = { command: {}, agent: {} };
+    await hooks.config(output);
+    await hooks.config(output);
+    const sibling = await plugin("v2", access);
+    await sibling.config(output);
+    expect((await command(sibling, "plan", "status"))[0]?.text).toContain('"action":"status"');
+    expect((await command(hooks, "plan", "status"))[0]?.text).toContain('"action":"status"');
+    expect(warn.mock.calls.map(([message]) => String(message)).filter(message => message.includes("/plan command conflict"))).toEqual([]);
   });
 
   it("reads routerExecutor lazily, never during plugin initialization", async () => {
@@ -167,22 +218,70 @@ describe("plan registration (Phase 5.1.2)", () => {
     expect((await command(hooks, "plan", "adopt p1"))[0]?.text).toContain("require a root orchestrator session");
   });
 
-  it("permits an exactly bound plan child, but not an unbound child", async () => {
+  it("a plan binding cannot authorize mutation when the parent lookup fails", async () => {
+    const { bindPlanChild, evict } = await import("../../src/routing/roles/binding");
+    const hooks = await plugin("v2", undefined, true);
+    const childSessionID = await createChildSession(hooks);
+    bindPlanChild({ childSessionID, role: "implement", agent: "implementer", workRoot: project,
+      grant: [], planId: "p1", taskId: "t1", attempt: 1 });
+    try {
+      expect(await call(hooks, { action: "approve", planId: "p1" }, childSessionID)).toContain("require a root orchestrator session");
+      expect((await command(hooks, "plan", "adopt p1", childSessionID))[0]?.text).toContain("require a root orchestrator session");
+    } finally { evict(childSessionID); }
+  });
+
+  it("permits only own-plan reads for an exactly bound plan child, never authority actions", async () => {
     const { createExecutorAccess, lateRuntime } = await import("../../src/executor/create");
     const { bindPlanChild, evict } = await import("../../src/routing/roles/binding");
     const access = createExecutorAccess();
-    const status = vi.fn(async () => "plan-child status");
-    access.set({ ...lateRuntime(createExecutorAccess()), status });
+    const status = vi.fn(async (_planId: string | null) => "plan-child status");
+    const ready = vi.fn(async () => ({ launchable: [], manual: [] }));
+    const exportPlan = vi.fn(async () => "plan-child export");
+    const approve = vi.fn(async () => undefined);
+    const adopt = vi.fn(async () => undefined);
+    const answer = vi.fn(async () => undefined);
+    const abort = vi.fn(async () => undefined);
+    access.set({ ...lateRuntime(createExecutorAccess()), status, ready, exportPlan, approve, adopt, answer, abort });
     const hooks = await plugin("v2", access);
-    bindPlanChild({ childSessionID: "plan-child", role: "implement", agent: "implementer", workRoot: project,
+    const childSessionID = await createChildSession(hooks);
+    bindPlanChild({ childSessionID, role: "implement", agent: "implementer", workRoot: project,
       grant: [], planId: "p1", taskId: "t1", attempt: 1 });
     try {
-      expect(await call(hooks, { action: "status" }, "plan-child")).toContain("plan-child status");
-      expect((await command(hooks, "plan", "approve p1", "plan-child"))[0]?.text).toContain('"action":"approve"');
-      expect((await command(hooks, "plan", "adopt p1", "plan-child"))[0]?.text).toContain('"action":"adopt"');
+      expect(await call(hooks, { action: "status", planId: "p1" }, childSessionID)).toContain("plan-child status");
+      for (const action of ROUTER_PLAN_ACTIONS.filter(action => !["status", "ready", "export"].includes(action))) {
+        const args: RouterPlanArgs = action === "compile" ? { action, path: "plan.md" }
+          : action === "gc" ? { action }
+            : action === "answer" ? { action, planId: "p1", inboxId: "Q-1", text: "answer" }
+              : action === "done" ? { action, planId: "p1", task: "t1" }
+                : action === "residue" || action === "add-tasks" ? { action, planId: "p1", text: "{}" }
+                  : { action, planId: "p1" };
+        expect(await call(hooks, args, childSessionID)).toContain("require a root orchestrator session");
+      }
+      for (const action of ["approve", "adopt", "answer", "abort", "pause", "resume", "land"] as const) {
+        const args = action === "answer" ? "answer --plan p1 item answer" : `${action} p1`;
+        expect((await command(hooks, "plan", args, childSessionID))[0]?.text).toContain("require a root orchestrator session");
+      }
+      expect((await command(hooks, "plan", "run plan.md", childSessionID))[0]?.text).toContain("require a root orchestrator session");
+      expect((await command(hooks, "plan", "status p1", childSessionID))[0]?.text).toContain('"action":"status","planId":"p1"');
+      expect((await command(hooks, "plan", "inbox --plan p1", childSessionID))[0]?.text).toContain('"inbox":true,"planId":"p1"');
+      expect(await call(hooks, { action: "status", planId: "p2" }, childSessionID)).toContain("require a root orchestrator session");
+      expect((await command(hooks, "plan", "status p2", childSessionID))[0]?.text).toContain("require a root orchestrator session");
+      expect((await command(hooks, "plan", "inbox --plan p2", childSessionID))[0]?.text).toContain("require a root orchestrator session");
+      for (const action of ["ready", "export"] as const) {
+        expect(await call(hooks, { action, planId: "p1" }, childSessionID)).toContain(action === "ready" ? "plan p1 ready:" : "plan-child export");
+        expect(await call(hooks, { action, planId: "p2" }, childSessionID)).toContain("require a root orchestrator session");
+      }
+      expect(await call(hooks, { action: "status", planId: "p1", inbox: true }, childSessionID)).not.toContain("require a root orchestrator session");
+      expect(await call(hooks, { action: "status", planId: "p2", inbox: true }, childSessionID)).toContain("require a root orchestrator session");
+      expect(await call(hooks, { action: "status" }, childSessionID)).toContain("require a root orchestrator session");
+      expect((await command(hooks, "plan", "inbox", childSessionID))[0]?.text).toContain("require a root orchestrator session");
       expect(await call(hooks, { action: "status" }, "other-child")).toContain("require a root orchestrator session");
-      expect(status).toHaveBeenCalledTimes(1);
-    } finally { evict("plan-child"); }
+      expect(status).toHaveBeenCalledTimes(3);
+      expect(status.mock.calls.every(([planId]) => planId === "p1")).toBe(true);
+      expect(ready).toHaveBeenCalledTimes(1);
+      expect(exportPlan).toHaveBeenCalledTimes(1);
+      for (const mutation of [approve, adopt, answer, abort]) expect(mutation).not.toHaveBeenCalled();
+    } finally { evict(childSessionID); }
   });
 
   it("v1 registers no plan tool or command, and configured keys plus /plan uses share one notice per process", async () => {
@@ -212,5 +311,17 @@ describe("plan registration (Phase 5.1.2)", () => {
     const notices = warn.mock.calls.map(([message]) => String(message)).filter(message => message.includes("the plan executor requires OpenCode v2"));
     expect(notices).toHaveLength(1);
     expect(notices[0]).toContain("ignored: /plan");
+  });
+
+  it("v1 preserves a user-defined /plan without claiming that it was ignored", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const hooks = await plugin("v1");
+    const userPlan = { template: "My own plan: $ARGUMENTS", description: "User plan" };
+    const output = { command: { plan: userPlan }, agent: {} };
+    await hooks.config(output);
+    expect(output.command.plan).toBe(userPlan);
+    expect(await command(hooks, "plan", "status")).toEqual([]);
+    expect(await command(hooks, "plan", "status")).toEqual([]);
+    expect(warn.mock.calls.map(([message]) => String(message)).filter(message => message.includes("ignored: /plan"))).toEqual([]);
   });
 });

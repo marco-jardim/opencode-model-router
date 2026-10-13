@@ -48,6 +48,9 @@ The tool and command are registered on **OpenCode v2 only**. The executor is ass
 - a plan-task verifier is available and `enforcement.verify.require` is **not** `"never"`;
 - the host supplies the lease registry and child runner, and no other executor owns the process.
 
+Repository discovery runs only when the executor preconditions hold and the location is inside
+`routing.workRoots` (when configured); an ineligible location does no executor discovery.
+
 When assembly is unavailable, `/plan` and `router_plan` show
 `the plan executor is not available: <reason>` rather than launching work. The exact reasons are:
 
@@ -77,19 +80,25 @@ collection.
 
 The v2 adapter starts the runtime; **recovery runs once at start**, not during assembly. Existing plans reconcile
 their durable state before the first scheduling tick (see [Recovery](#recovery)). Automatic slot garbage collection
-runs once a completed or aborted plan is **quiescent**: no live child or unsettled launch handle, no open integration
-entry, and every passed phase has its tag. A status change alone is not enough; paused plans keep their slots. Manual
-`router_plan action=gc` remains available for finished plans.
+runs once a completed or aborted plan is **finished and settled**: no live child or unsettled launch handle and no open
+integration entry. Aborted plans need no phase tags; a completed plan's passed phase is settled when it is tagged, its
+tag gave up, or the tag exists elsewhere. A status change alone is not enough; paused plans keep their slots. Manual
+`router_plan action=gc` works on a finished plan once nothing is live, without waiting for phase tags.
 
 Disposal clears tool/command access first, then disposes the runtime (unsubscribes host events, clears runtime timers
-and verifier observations, aborts launcher-owned children, settles work already running, disposes each integration
-queue before closing its ledger writer). It then closes all slot pools, clears settle timers and releases the process
-claim. The adapter disposes runtime then launcher before its background processor; launcher disposal is idempotent.
+and verifier observations, cancels running plan-task verifications, aborts launcher-owned children, settles work already
+running, disposes each integration queue before closing its ledger writer). It then closes all slot pools, clears settle
+timers and releases the process claim. The adapter disposes runtime then launcher before its background processor;
+launcher disposal is idempotent.
+A verification cut by disposal is re-verified at the next start, never treated as a pass.
 
-Plan control belongs to the **root orchestrator**, not an arbitrary child session. `router_plan` admits only a root
-orchestrator session or a bound plan child; unknown parent identity fails closed. `/plan approve` and `/plan adopt`
-are root-only guarded actions with the same bound-plan-child exception. Approval still requires the human's decision
-under `approve: "ask"`; root access is not approval.
+Plan control belongs to the **root orchestrator**: a session at depth 0, with no parent. All state-changing and authority
+actions — `compile`, `residue`, `approve`, `adopt`, `abort`, `purge`, `land`, `answer`, `pause`, `resume`, `add-tasks`,
+`done` and `gc` — are root-only, with **no bound-plan-child exception**; a failed parent lookup refuses. The read-only
+actions `status`, `ready`, `export` and `/plan inbox` (`status inbox=true`) allow a root session or an exactly bound
+plan child reading **only its own plan**, named explicitly by `planId` (or the command's plan id/`--plan`). A child
+bound to plan A cannot read plan B. The same rule guards `router_plan` and `/plan`; other actions remain root-only.
+Approval still requires the human's decision under `approve: "ask"`; root access is not approval.
 
 While a plan runs, the v2 adapter registers the executor instructions as a **per-turn state provider at order 61**,
 immediately after the plan provider at order 60. They are not inserted into the cached system prompt, and no executor
@@ -97,6 +106,9 @@ provider is registered on v1. The instructions tell the orchestrator to report m
 plan file, and never claim completion while the plan is running.
 
 ## `/plan` command
+
+An existing user-defined `/plan` command is preserved: on v2 the router logs one conflict warning and leaves
+`router_plan` available instead. On v1 that user command runs without an executor `/plan` notice.
 
 `/plan` turns what you type into an instruction for the orchestrator, which then calls `router_plan` with exact
 arguments. Input that does not parse prints the `/plan` help instead. Quote a path that holds spaces

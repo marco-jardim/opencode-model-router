@@ -40,8 +40,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rewritten from memory. OpenCode v1 ignores every `routing.background.*` and `routing.leases.*` key and logs one
   notice per process that names them.
 - **OpenCode v2: plan executor registration.** `/router` lists `/plan`, and `router_plan` resolves the executor at call
-  time. Tool actions and `/plan approve|adopt` require a proven root session, with an exception for bound plan
-  children; failed session lookups refuse. Active plans add executor instructions to router state after the plan
+  time. State-changing and authority actions (`compile`, `residue`, `approve`, `adopt`, `abort`, `purge`, `land`,
+  `answer`, `pause`, `resume`, `add-tasks`, `done`, `gc`, and any other state-changing action) require a proven
+  depth-0 session with no parent, with no bound-plan-child exception; failed parent lookups refuse. Read-only
+  `status`, `ready`, `export` and `/plan inbox` allow roots or exactly bound plan children reading only their own
+  explicitly named plan, never another plan. The same rule guards the tool and command. An existing user-defined
+  `/plan` is preserved: v2 logs one conflict warning and keeps `router_plan` available; v1 adds no `/plan` notice for
+  that user command. Active plans add executor instructions to router state after the plan
   section. Assembly requires a git repository, roles delegation, enforced leases and a plan-task verifier with
   verification enabled; otherwise the tool and command report why the executor is unavailable. The keys, tool and
   command have a user guide ([docs/EXECUTOR.md](docs/EXECUTOR.md)); `slotsDir`, `integrationChecks`, `phaseSuite`,
@@ -49,8 +54,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   executor home (`<git common dir>\omr-executor`, with its plan and slot-marker directories) and any repository inside
   it; that check runs git within one 15 s bound in all, and
   refuses a candidate it could not finish in time. OpenCode v1 ignores every `routing.executor.*` key and logs one
-  notice per process that names them; a best-effort `/plan` use shares that notice and adds no output. The v1 tool,
-  command and help maps are unchanged.
+  notice per process that names them; a best-effort `/plan` use without a user-defined command shares that notice and
+  adds no output. The v1 tool, command and help maps are unchanged. Breaker answers and QA-cap `accept`/`fix` answers
+  that unpause a phase re-enqueue its verified tasks and wake the integration lanes, without duplicating queued entries
+  or bypassing task leases. Foreign plans attach read-only: startup and failed-adopt recovery check the ledger's
+  repository before opening a writer, so viewing a foreign plan takes no writer lock and changes no writer epoch or
+  journal. Status remains available; mutation requires that repository.
 
 ### Changed
 
@@ -61,12 +70,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **OpenCode v2: answering a phase pause restarts queued integration.** Breaker answers and QA-cap `accept`/`fix`
-  answers that unpause a phase re-enqueue its verified tasks and wake the integration lanes, without duplicating
-  queued entries or bypassing task leases. Work already queued while the phase was paused no longer stays stuck.
-- **OpenCode v2: foreign plans attach read-only.** Executor startup and failed-adopt recovery check the ledger's
-  repository before opening a writer, so viewing a plan from another repository no longer takes its writer lock,
-  increments its writer epoch or rotates its journal. Status remains available; mutation requires that repository.
 - **OpenCode v2: work leases no longer collide across linked worktrees.** Two child sessions that edit the same
   repo-relative path in two worktrees of one repository (`git worktree add`) are both allowed: an ordinary write lease
   is keyed by its checkout, not by the repository, and a write whose target the router cannot read is refused only while

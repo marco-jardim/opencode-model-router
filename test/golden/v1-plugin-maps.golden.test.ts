@@ -14,6 +14,7 @@ type Hooks = {
   tool: Tools;
   config(input: { command: Record<string, unknown>; agent: Record<string, unknown> }): Promise<void>;
   "command.execute.before"(input: { command: string; sessionID: string; arguments: string }, output: { parts: { type: string; text: string }[] }): Promise<void>;
+  dispose?(): Promise<void>;
 };
 
 /** Keep argument key order, but sort the tool names so insertion order cannot obscure a map change. */
@@ -84,16 +85,21 @@ describe("v1 plugin maps golden (Phase 5.1.2)", () => {
       },
     };
     const hooks = await ModelRouterPlugin(ctx as unknown as Parameters<typeof ModelRouterPlugin>[0]) as unknown as Hooks;
-    const output = { command: {} as Record<string, unknown>, agent: {} as Record<string, unknown> };
-    await hooks.config(output);
-    const help = { parts: [] as { type: string; text: string }[] };
-    await hooks["command.execute.before"]({ command: "router", sessionID: "root", arguments: "" }, help);
-    return {
-      tools: `${JSON.stringify(shape(hooks.tool), null, 2)}\n`,
-      commands: `${JSON.stringify(Object.fromEntries(Object.entries(output.command).sort(([a], [b]) => a.localeCompare(b)).map(([name, entry]) => [name, JSON.stringify(entry)])), null, 2)}\n`,
-      // The build identity changes with each commit; preserve every other byte of the bare /router output.
-      help: help.parts.map(part => part.text).join("\n").replace(/^(router: engine=\S+ )build=\S+\+\S+$/gm, "$1build=<normalized>"),
-    };
+    try {
+      const output = { command: {} as Record<string, unknown>, agent: {} as Record<string, unknown> };
+      await hooks.config(output);
+      const help = { parts: [] as { type: string; text: string }[] };
+      await hooks["command.execute.before"]({ command: "router", sessionID: "root", arguments: "" }, help);
+      return {
+        tools: `${JSON.stringify(shape(hooks.tool), null, 2)}\n`,
+        commands: `${JSON.stringify(Object.fromEntries(Object.entries(output.command).sort(([a], [b]) => a.localeCompare(b)).map(([name, entry]) => [name, JSON.stringify(entry)])), null, 2)}\n`,
+        // The build identity changes with each commit; preserve every other byte of the bare /router output.
+        // "last checkpoint=DF4" comes from checked-in docs/qa/cost-aware-routing/dogfood.md, so it is checkout-deterministic.
+        help: help.parts.map(part => part.text).join("\n").replace(/^(router: engine=\S+ )build=\S+\+\S+$/gm, "$1build=<normalized>"),
+      };
+    } finally {
+      await hooks.dispose?.();
+    }
   }
 
   it("default and executor/roles configs are byte-identical to the pre-registration v1 maps", async () => {

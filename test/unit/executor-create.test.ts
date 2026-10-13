@@ -146,6 +146,7 @@ describe("PlanSlotPools lazy facades", () => {
   const roots: string[] = [], pools: PlanSlotPools[] = [];
   afterEach(async () => {
     for (const pool of pools.splice(0)) await pool.closeAll();
+    vi.restoreAllMocks();
     for (const root of roots.splice(0)) await removeDirWhenReleased(root);
   }, 30_000);
 
@@ -175,8 +176,9 @@ describe("PlanSlotPools lazy facades", () => {
       };
       made.set(ledger.planId, pool); return pool;
     }
-    const pool = new PlanSlotPools({ store, toplevel: "C:/repo", makePool }); pools.push(pool);
-    return { pool, made };
+    const factory = vi.fn(makePool), log = vi.fn<runtimeModule.RuntimeDeps["log"]>();
+    const pool = new PlanSlotPools({ store, toplevel: "C:/repo", makePool: factory, log }); pools.push(pool);
+    return { pool, made, store, factory, log };
   }
 
   it("memoizes one open across operations; facade routes plan-bearing calls and rejects ambiguous ones", async () => {
@@ -199,18 +201,50 @@ describe("PlanSlotPools lazy facades", () => {
     await expect(pool.facade.release("slot-1")).rejects.toMatchObject({ code: "E_PLAN_STATE" });
   }, 15_000);
 
-  it("collects same-repository plans only; closed facades never resurrect their pool", async () => {
+  it("collects same-repository plans only; closed facades fence slot operations but permit gc-only handles", async () => {
     const { pool, made } = await rig();
     const b = pool.of("plan-b");
+    await b.list();
     expect(await pool.facade.gc(async id => id === "plan-b")).toEqual({ removed: ["plan-b"], reported: [] });
     expect(made.has("foreign")).toBe(false);
-    expect(made.get("plan-a")?.close).not.toHaveBeenCalled();
+    expect(made.has("plan-a")).toBe(false);
     expect(made.get("plan-b")?.close).toHaveBeenCalledOnce();
     expect(await b.list()).toEqual([]); expect(await b.get("slot-1")).toBeNull();
     await b.release("slot-1"); expect(made.get("plan-b")?.release).not.toHaveBeenCalled();
-    expect(await b.gc(async () => true)).toEqual({ removed: [], reported: [] });
+    const previous = made.get("plan-b")!;
+    expect(await b.gc(async () => true)).toEqual({ removed: ["plan-b"], reported: [] });
+    expect(made.get("plan-b")).not.toBe(previous);
+    expect(made.get("plan-b")?.close).toHaveBeenCalledOnce();
     await expect(b.acquire("plan-b", "plan:plan-b:T1", "c".repeat(40))).rejects.toMatchObject({ code: "E_PLAN_STATE" });
     expect(made.get("plan-b")?.open).toHaveBeenCalledOnce();
+  }, 15_000);
+
+  it("gc opens only terminal plans or already-open pools and continues after an invalid slotsDir", async () => {
+    const { pool, made, store, factory, log } = await rig();
+    const invalid = buildDraft(0, "invalid"); invalid.status = "completed"; invalid.config.slotsDir = "C:/repo/slots";
+    invalid.integration.worktree = join(invalid.config.slotsDir, "integration");
+    const aborted = buildDraft(0, "aborted"); aborted.status = "aborted";
+    const awaiting = buildDraft(0, "awaiting"); awaiting.status = "awaiting-approval";
+    for (const draft of [invalid, aborted, awaiting]) {
+      const writer = await store.create(draft, holderOf("root", process.pid, "pool-test")); await writer.close();
+    }
+    const list = await store.list();
+    vi.spyOn(store, "list").mockResolvedValue([...list.filter(plan => plan.planId === "invalid"), ...list.filter(plan => plan.planId !== "invalid")]);
+    const make = factory.getMockImplementation()!;
+    factory.mockImplementation(ledger => {
+      if (ledger.planId === "invalid") throw new ExecutorError("E_INVALID_INPUT", "invalid slotsDir");
+      return make(ledger);
+    });
+    pool.of("plan-a"); // A facade alone is not an open pool.
+    pool.of("awaiting");
+    await pool.of("plan-b").list();
+    const result = await pool.gc(async () => true);
+    expect(result.removed.sort()).toEqual(["aborted", "finished", "plan-b"]);
+    expect(result.reported).toEqual([]);
+    expect(made.has("plan-a")).toBe(false);
+    expect(made.has("awaiting")).toBe(false);
+    expect(made.has("foreign")).toBe(false);
+    expect(log).toHaveBeenCalledExactlyOnceWith("warn", "slot gc failed", { planId: "invalid", error: "invalid slotsDir" });
   }, 15_000);
 
   it("recovery marker lookup requires exactly one leased matching owner in an active local plan", async () => {
@@ -682,6 +716,29 @@ describe("createExecutor assembly seams", () => {
     expect(access.unavailable()).toContain("not a git repository");
     expect(assemble()).not.toBeNull();
   });
+
+  it("shares the process claim across module copies and releases it for a later copy", async () => {
+    const first = capture().executor;
+    vi.resetModules();
+    const secondModule = await import("../../src/executor/create");
+    const secondConfig = await import("../../src/router/config");
+    vi.spyOn(secondConfig, "loadConfig").mockReturnValue(executorConfig());
+    const secondAccess = secondModule.createExecutorAccess();
+    const second = secondModule.createExecutor(context, { host: fakeHost(), prepared, access: secondAccess });
+    if (second != null) built.push(second);
+    expect(second).toBeNull();
+    expect(secondAccess.unavailable()).toBe("the plan executor is not available: another plan executor already owns this process");
+
+    await first.runtime.dispose();
+    vi.resetModules();
+    const thirdModule = await import("../../src/executor/create");
+    const thirdConfig = await import("../../src/router/config");
+    vi.spyOn(thirdConfig, "loadConfig").mockReturnValue(executorConfig());
+    const thirdAccess = thirdModule.createExecutorAccess();
+    const third = thirdModule.createExecutor(context, { host: fakeHost(), prepared, access: thirdAccess });
+    if (third != null) built.push(third);
+    expect(third, thirdAccess.unavailable()).not.toBeNull();
+  }, 15_000);
 
   it.each([
     ["leases", "the lease registry is not available"],

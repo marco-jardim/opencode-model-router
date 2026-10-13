@@ -1,11 +1,9 @@
 // Plan-task verification over the dispatch verification engine (Phase 5.1, D8-D11, A-5.1-4/-8/-9/-12/-13).
 import { realpathSync } from "node:fs";
 import { isAbsolute, posix, resolve, win32 } from "node:path";
-import type { PlanTaskVerifier } from "../executor/runtime";
-import { leaseHolderID, type Attempt, type LedgerStore, type SlotLease, type TaskNode, type Verdict as SlotVerdict } from "../executor/types";
+import type { PlanTaskContext, PlanTaskVerifier } from "../executor/runtime";
+import { leaseHolderID, type Attempt, type SlotLease, type TaskNode, type Verdict as SlotVerdict } from "../executor/types";
 import { createGitRunner } from "../executor/git";
-import { resolveExecutorHome } from "../executor/paths";
-import { createLedgerStore } from "../executor/ledger";
 import { hardeningArgs } from "../router/git-tools";
 import type { HeadState } from "./head";
 import { snapshotTree } from "./tree";
@@ -47,8 +45,6 @@ export interface PlanTaskVerifierDeps {
   abortSession(sessionID: string): Promise<void>;
   getConfig(): RouterConfig;
   git: PlanTaskGit;
-  /** The orchestrator session of a plan (the ledger's `orchestrator.sessionID`); null: unknown. */
-  orchestratorOf(planId: string): string | null | Promise<string | null>;
   exemptions: LeaseSelfExemptions;
   /** Restart fallback: whether a perimeter would be planned for this id in the slot (index.ts: perimeter.ts planPerimeter). */
   perimeterPlanned?(id: string, slotPath: string): boolean | Promise<boolean>;
@@ -181,32 +177,17 @@ export function planTaskGit(): PlanTaskGit {
   };
 }
 
-/**
- * The orchestrator session of a plan, read from its ledger on every call (an adopt moves a plan to another orchestrator). The
- * repository and executor home are discovered once, read-only (`prepareExecutor`); any failure reads as unknown.
- */
-export function ledgerOrchestratorOf(directory: string): (planId: string) => Promise<string | null> {
-  let store: Promise<LedgerStore | null> | null = null;
-  return async (planId) => {
-    store ??= (async () => {
-      // create.ts prepareExecutor's discovery, read-only: hardened `rev-parse --show-toplevel`, realpath, the executor home.
-      const run = (args: readonly string[], cwd: string) =>
-        createGitRunner({ mode: "hardened", toplevel: directory }).run([...hardeningArgs(), ...args], { cwd, timeoutMs: 5_000 });
-      const top = await run(["rev-parse", "--show-toplevel"], directory);
-      if (top.code !== 0 || top.stdout.trim() === "") return null;
-      const toplevel = realpathSync.native(top.stdout.trim());
-      const home = await resolveExecutorHome(toplevel, { git: run, realpath: async (path) => realpathSync.native(path) });
-      return createLedgerStore({ home });
-    })().catch(() => null);
-    const ledgers = await store;
-    if (ledgers === null) return null;
-    try {
-      const sessionID = (await ledgers.read(planId)).orchestrator.sessionID;
-      return typeof sessionID === "string" && sessionID !== "" ? sessionID : null;
-    } catch {
-      return null;
-    }
-  };
+/** QA-5.1-4: the reason of every verification cut by `dispose`. */
+export const PLAN_TASK_SHUTDOWN_REASON = "the plugin is shutting down";
+/** QA-5.1-4: how long `dispose` waits for the abort of one grader session. */
+export const PLAN_TASK_ABORT_MS = 5_000;
+
+/** QA-5.1-4: a wait cut by the verifier's `dispose`. */
+class PlanTaskShutdownError extends Error {
+  constructor() {
+    super(PLAN_TASK_SHUTDOWN_REASON);
+    this.name = "PlanTaskShutdownError";
+  }
 }
 
 /** A-5.1-9: the checks pass deadline. */
@@ -309,8 +290,28 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
     try { if (child !== null && child !== "") deps.changedFileStore.clear(child); } catch { /* best effort */ }
     try { deps.changedFileStore.clear(id); } catch { /* best effort */ }
   };
-  const orchestrator = async (planId: string): Promise<string> => {
-    try { return (await deps.orchestratorOf(planId)) ?? ""; } catch { return ""; }
+  /** QA-5.1-6/-14: the plan's orchestrator as the runtime read it from its ledger for this call; "" when unknown. */
+  const orchestrator = (ctx: PlanTaskContext | undefined): string => {
+    const id: unknown = ctx?.orchestratorSessionID;
+    return typeof id === "string" ? id : "";
+  };
+  // QA-5.1-4: dispose cuts every in-flight deadline (prepare and gate passes), grader session and backoff sleep.
+  let disposing = false;
+  const shutdown = new AbortController();
+  const live = new Set<{ deadline: ReturnType<typeof createDeadline>; graders: ReadonlySet<string> }>();
+  /** Races `work` against dispose: rejects with PlanTaskShutdownError once dispose is called (already called: at once). */
+  const untilShutdown = async <T>(work: Promise<T>): Promise<T> => {
+    let onAbort = (): void => {};
+    const stop = new Promise<never>((_resolve, reject) => {
+      onAbort = () => reject(new PlanTaskShutdownError());
+      if (shutdown.signal.aborted) onAbort();
+      else shutdown.signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      return await Promise.race([work, stop]);
+    } finally {
+      shutdown.signal.removeEventListener("abort", onAbort);
+    }
   };
   const unverifiable = (reason: string, dod?: DoD): { verdict: SlotVerdict; findings: string; ref: string } =>
     slotVerdictOf(unverifiableGateResult(reason, dod?.source ?? "inferred", false));
@@ -328,17 +329,21 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
 
   async function prepare(record: AttemptRecord, childID: string, restoredHead?: Parameters<VerificationWiring["prepareVerification"]>[6]): Promise<{ ok: true; prepared: PreparedVerification } | { ok: false; reason: string }> {
     const deadline = createDeadline(resolveVerifyBudget(deps.getConfig()).gateBudgetMs);
+    const entry = { deadline, graders: new Set<string>() };
+    live.add(entry);
+    if (disposing) deadline.abort(PLAN_TASK_SHUTDOWN_REASON);
     try {
       const prepared = await deps.prepareVerification(deps.changedFileStore, record.id, childID, record.slotPath, deadline, record.startedAt, restoredHead);
       return { ok: true, prepared };
     } catch (error) {
       return { ok: false, reason: `the change observation failed: ${scrubText(error instanceof Error ? error.message : String(error))}` };
     } finally {
+      live.delete(entry);
       deadline.dispose();
     }
   }
 
-  async function begin(task: TaskNode, slot: SlotLease, attempt: Attempt): Promise<void> {
+  async function begin(task: TaskNode, slot: SlotLease, attempt: Attempt, ctx?: PlanTaskContext): Promise<void> {
     const key = keyOf(slot.planId, task.id, attempt.n);
     const stale = records.get(key);
     if (stale !== undefined) clearIds(stale.id, null);
@@ -346,7 +351,8 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
     finalTexts.delete(key);
     // Never rejects: the runtime launches right after begin, and a missing record only means verify's fail-closed fallback.
     try {
-      const orchestratorSessionID = await orchestrator(slot.planId);
+      // The change-store and perimeter id of the attempt names the orchestrator at begin; verify reads the current one.
+      const orchestratorSessionID = orchestrator(ctx);
       const id = planTaskVerificationID(orchestratorSessionID, slot.planId, task.id, attempt.n);
       const dod = planTaskDoD(task);
       const base = (await revParse("HEAD", slot.path)) ?? slot.commit;
@@ -361,7 +367,7 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
     }
   }
 
-  async function observe(task: TaskNode, slot: SlotLease, attempt: Attempt, finalText?: string): Promise<void> {
+  async function observe(task: TaskNode, slot: SlotLease, attempt: Attempt, finalText?: string, _ctx?: PlanTaskContext): Promise<void> {
     const key = keyOf(slot.planId, task.id, attempt.n);
     // The child's claim is kept even without a begin record: verify's restart fallback grades it too.
     if (finalText !== undefined && finalText.trim() !== "") finalTexts.set(key, finalText);
@@ -369,7 +375,8 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
     // No begin record (a restart): verify takes the fail-closed fallback.
     if (record === undefined || record.observed !== undefined) return;
     record.observed = prepare(record, attempt.childSessionID ?? "");
-    await record.observed;
+    // QA-5.1-4: dispose never waits for an observation (its deadline is aborted; verify then cuts).
+    try { await untilShutdown(record.observed); } catch { /* cut by dispose */ }
   }
 
   async function forget(planId: string, taskId: string, n: number): Promise<void> {
@@ -401,9 +408,8 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
   }
 
   /** The restart fallback (no begin/observe record): fail closed, never a weaker gate. */
-  async function fallback(task: TaskNode, slot: SlotLease, attempt: Attempt): Promise<{ ok: true; record: AttemptRecord; prepared: PreparedVerification; trusted: false } | { ok: false; reason: string; dod: DoD }> {
+  async function fallback(task: TaskNode, slot: SlotLease, attempt: Attempt, orchestratorSessionID: string): Promise<{ ok: true; record: AttemptRecord; prepared: PreparedVerification; trusted: false } | { ok: false; reason: string; dod: DoD }> {
     const dod = planTaskDoD(task);
-    const orchestratorSessionID = await orchestrator(slot.planId);
     const id = planTaskVerificationID(orchestratorSessionID, slot.planId, task.id, attempt.n);
     const head = await revParse("HEAD", slot.path);
     if (head === null) return { ok: false, reason: `the slot ${slot.path} has no readable HEAD after a restart; nothing ran`, dod };
@@ -436,7 +442,7 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
 
   async function runPass(
     passDoD: DoD, budgetMs: number, record: AttemptRecord, task: TaskNode, slot: SlotLease, attempt: Attempt,
-    artefact: Artefact, prepared: PreparedVerification,
+    artefact: Artefact, prepared: PreparedVerification, parent: string,
   ): Promise<{ res: GateResult; cut: boolean }> {
     const cfg = deps.getConfig();
     const strict = cfg.enforcement?.verify?.strictUnverifiable;
@@ -444,13 +450,16 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
     const placement = resolveCheckPlacements(passDoD, scope, {});
     const deadline = createDeadline(budgetMs);
     const graders = new Set<string>();
+    const entry = { deadline, graders };
+    live.add(entry);
     const completedFailures: string[] = [];
     const child = attempt.childSessionID ?? "";
     const tree = prepared.snapshot?.root ?? slot.path;
     const releases = [tree, slot.path].map((root) => deps.exemptions.exempt(root, [child, leaseHolderID(record.planId, task.id)]));
     try {
-      // The grader is parented to the plan's orchestrator (verify refused an unknown one before any gate ran).
-      const gateDeps = deps.buildGateDeps(record.orchestratorSessionID, graders, prepared, deadline, false, record.orchestratorSessionID);
+      // QA-5.1-14: the grader is parented to the plan's CURRENT orchestrator, as the runtime read it for this verify (an
+      // adopt moves the plan; verify refused an unknown one before any gate ran).
+      const gateDeps = deps.buildGateDeps(parent, graders, prepared, deadline, false, parent);
       gateDeps.deterministic.onFailure = (reason) => completedFailures.push(reason);
       const delegation: Delegation = {
         dod: passDoD,
@@ -462,9 +471,15 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
         ...(placement.placements !== undefined ? { checkPlacements: placement.placements } : {}),
         ...(placement.refused !== undefined ? { refusedCheck: placement.refused } : {}),
       };
-      const res = await withTimeout(accept(delegation, artefact, gateDeps), deadline.remaining(), "verification gate");
+      if (disposing) throw new PlanTaskShutdownError();
+      const res = await untilShutdown(withTimeout(accept(delegation, artefact, gateDeps), deadline.remaining(), "verification gate"));
       return { res, cut: false };
     } catch (error) {
+      if (error instanceof PlanTaskShutdownError || disposing) {
+        // QA-5.1-4: dispose aborted the deadline and owns the grader aborts; the pass judged nothing and is never re-run.
+        deadline.abort(PLAN_TASK_SHUTDOWN_REASON);
+        return { res: unverifiableGateResult(PLAN_TASK_SHUTDOWN_REASON, passDoD.source, strict), cut: false };
+      }
       const timedOut = error instanceof RouterTimeoutError;
       deadline.abort(timedOut ? "verification gate timed out" : "verification gate failed");
       for (const sessionID of graders) {
@@ -478,12 +493,13 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
         cut: timedOut,
       };
     } finally {
+      live.delete(entry);
       deadline.dispose();
       for (const release of releases) release();
     }
   }
 
-  async function verify(task: TaskNode, slot: SlotLease, attempt: Attempt): Promise<{ verdict: SlotVerdict; findings: string; ref: string }> {
+  async function verifyNow(task: TaskNode, slot: SlotLease, attempt: Attempt, parent: string): Promise<{ verdict: SlotVerdict; findings: string; ref: string }> {
     const key = keyOf(slot.planId, task.id, attempt.n);
     let record = records.get(key);
     let prepared: PreparedVerification;
@@ -493,13 +509,14 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
         if (!observed.ok) return unverifiable(observed.reason, record.dod);
         prepared = observed.prepared;
       } else {
-        const restored = await fallback(task, slot, attempt);
+        const restored = await fallback(task, slot, attempt, parent);
         if (!restored.ok) return unverifiable(restored.reason, restored.dod);
         record = restored.record;
         prepared = restored.prepared;
       }
-      // Fail closed: without the plan's orchestrator the id names no working set, so the perimeter could not be planned.
-      if (record.orchestratorSessionID === "") return unverifiable(`the orchestrator of plan ${record.planId} could not be read; nothing ran`, record.dod);
+      // Fail closed: without the plan's orchestrator the id names no working set, so the perimeter could not be planned; and
+      // without its current orchestrator the grader has no parent.
+      if (record.orchestratorSessionID === "" || parent === "") return unverifiable(`the orchestrator of plan ${record.planId} could not be read; nothing ran`, record.dod);
       const checked = await candidateOf(task, slot.path, record.base);
       if (!checked.ok) return unverifiable(checked.reason, record.dod);
       const cfg = deps.getConfig();
@@ -535,6 +552,10 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
       };
       const child = attempt.childSessionID ?? "";
       const producerTier = planTaskProducerTier(task, cfg);
+      const childText = finalTexts.get(key);
+      // QA-5.1-3: the child's own final text is held to the return contract, as a role dispatch's is (a progress note is
+      // incomplete, never graded to a pass); the router's commit description is not a child return.
+      const fromChild = childText !== undefined && planTaskReturnText(childText, "") !== "";
       const artefact: Artefact = {
         changedFiles: gatePrepared.changedFiles,
         changeBaseline: gatePrepared.changeBaseline,
@@ -543,8 +564,9 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
         ...(prepared.unattributedWriters !== undefined && prepared.unattributedWriters.length > 0 ? { unattributedWriters: prepared.unattributedWriters } : {}),
         ...(prepared.perimeter !== undefined ? { perimeter: prepared.perimeter } : {}),
         // Phase 5.1 (a): the grader judges the child's own claim, as a dispatch grader does; the commit description otherwise.
-        finalReturnText: planTaskReturnText(finalTexts.get(key),
+        finalReturnText: planTaskReturnText(childText,
           `plan task ${task.id} attempt ${attempt.n}: the router committed the slot's change as ${checked.candidate} over ${record.base}`),
+        ...(fromChild ? { returnContract: true } : {}),
         declaredOutputs: record.dod.deliverable ? [record.dod.deliverable] : [],
         producerSessionID: child,
         producerTier,
@@ -556,9 +578,10 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
       const current = record;
       const withReruns = async (passDoD: DoD, budgetMs: number): Promise<GateResult> => {
         for (;;) {
-          const { res, cut } = await runPass(passDoD, budgetMs, current, task, slot, attempt, artefact, gatePrepared);
-          if (!isTransientPlanTaskResult(res, cut) || reruns >= PLAN_TASK_TRANSIENT_RERUNS) return res;
-          await sleep(PLAN_TASK_RERUN_BACKOFF_MS[reruns]);
+          const { res, cut } = await runPass(passDoD, budgetMs, current, task, slot, attempt, artefact, gatePrepared, parent);
+          if (disposing || !isTransientPlanTaskResult(res, cut) || reruns >= PLAN_TASK_TRANSIENT_RERUNS) return res;
+          // QA-5.1-4: dispose cancels the backoff (the transient result stands; verify already resolved as cut).
+          try { await untilShutdown(sleep(PLAN_TASK_RERUN_BACKOFF_MS[reruns])); } catch { return res; }
           reruns += 1;
         }
       };
@@ -575,6 +598,8 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
       } else {
         res = await withReruns(dod, planTaskGraderBudgetMs(budget.gateBudgetMs, graderTier, override));
       }
+      // QA-5.1-4: a gate cut by dispose judged nothing: no verdict reaches the outcome store.
+      if (disposing) return unverifiable(PLAN_TASK_SHUTDOWN_REASON, record.dod);
       // D10 (A-5.1-13): no R11 lineage. QA-3.1-2 / QA-3.1-3 caveats as on a dispatch.
       res = applyDispatchCaveats(res, gatePrepared);
       if (child !== "" && res.verdict.skipped !== true) {
@@ -590,5 +615,41 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
     }
   }
 
-  return { begin, observe, forget, verify };
+  /** QA-5.1-6/-14: the orchestrator is the one the runtime read for THIS call (the grader's parent after an adopt too). */
+  async function verify(task: TaskNode, slot: SlotLease, attempt: Attempt, ctx?: PlanTaskContext): Promise<{ verdict: SlotVerdict; findings: string; ref: string }> {
+    const cut = (): { verdict: SlotVerdict; findings: string; ref: string } =>
+      unverifiable(PLAN_TASK_SHUTDOWN_REASON, records.get(keyOf(slot.planId, task.id, attempt.n))?.dod);
+    if (disposing) return cut();
+    try {
+      return await untilShutdown(verifyNow(task, slot, attempt, orchestrator(ctx)));
+    } catch (error) {
+      if (error instanceof PlanTaskShutdownError) return cut();
+      throw error;
+    }
+  }
+
+  /**
+   * QA-5.1-4: cuts every in-flight verification at once (synchronously, before the first await): each pending `verify` and
+   * `observe` resolves, every gate and observation deadline is aborted and every backoff sleep cancelled; then the grader
+   * sessions of the cut gates are aborted, each bounded by PLAN_TASK_ABORT_MS. Idempotent.
+   */
+  async function dispose(): Promise<void> {
+    if (disposing) return;
+    disposing = true;
+    shutdown.abort();
+    const sessions = new Set<string>();
+    for (const entry of live) {
+      entry.deadline.abort(PLAN_TASK_SHUTDOWN_REASON);
+      for (const sessionID of entry.graders) sessions.add(sessionID);
+    }
+    await Promise.allSettled([...sessions].map((sessionID) =>
+      withTimeout(deps.abortSession(sessionID), PLAN_TASK_ABORT_MS, "grader abort").catch((error: unknown) => {
+        warn("grader abort on dispose failed", error);
+      })));
+  }
+
+  return {
+    begin, observe, forget, verify, dispose,
+    get disposing() { return disposing; },
+  };
 }

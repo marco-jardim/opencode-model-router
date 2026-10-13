@@ -11,9 +11,11 @@ import { invalidateConfigCache, loadConfig, localOverridePath, overridePath, res
 import { evaluatePermission, permissionMatches, permissionRules, type PermissionMap } from "../../src/router/read-only";
 import { registerRoleAgents, roleHasLocalActions, roleMaxPermission, type RoleRegistrationOptions } from "../../src/router/role-agents";
 import { SHIPPED_ROLE_SPECS } from "../../src/router/roles";
+import * as gitTools from "../../src/router/git-tools";
 
 const temps: string[] = [];
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const dir of temps.splice(0)) rmSync(dir, { recursive: true, force: true });
   vi.unstubAllEnvs();
   invalidateConfigCache();
@@ -49,6 +51,38 @@ const sep = process.platform === "win32" ? "\\" : "/";
 const slash = (path: string): string => path.replaceAll("\\", "/");
 
 describe("QA-DF1-19 role agent registration outside routing.workRoots", () => {
+  it.each([
+    ["tiers", "tiers", "enforce", "always"],
+    ["leases off", "roles", "off", "always"],
+    ["verification never", "roles", "enforce", "never"],
+  ] as const)("does no executor discovery git or slots grant with %s", async (_label, delegation, mode, require) => {
+    const base = temp(), main = join(base, "main"), slots = join(base, "slots");
+    const cfg = rolesConfig(undefined);
+    cfg.routing = { ...cfg.routing, delegation, leases: { mode }, executor: { slotsDir: slots } };
+    cfg.enforcement = { ...cfg.enforcement, verify: { require } };
+    const opts = { ...options(main, vi.fn(async () => [main])), realpath: (path: string) => path };
+    const spawn = vi.spyOn(gitTools, "spawnBounded").mockRejectedValue(new Error("unexpected executor git"));
+    const result = await registerRoleAgents({}, cfg, opts);
+    expect(result.failed).toBe(false);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(result.externalDirectory).not.toContain(join(slots, "*"));
+    expect(result.externalDirectoryDenied).toEqual([]);
+    expect(opts.warn).not.toHaveBeenCalled();
+  });
+
+  it.skipIf(process.platform === "win32")("silently skips the default slots root on POSIX", async () => {
+    const cfg = rolesConfig(undefined);
+    cfg.routing = { ...cfg.routing, leases: { mode: "enforce" } };
+    cfg.enforcement = { ...cfg.enforcement, verify: { require: "always" } };
+    const main = "/repo", home = "/repo/.git/omr-executor";
+    const opts = { ...options(main, vi.fn(async () => [main])), realpath: (path: string) => path,
+      executorHome: vi.fn(async () => home) };
+    const result = await registerRoleAgents({}, cfg, opts);
+    expect(result.externalDirectory).toEqual([join(main, "*")]);
+    expect(result.externalDirectoryDenied).toEqual([join(home, "*")]);
+    expect(opts.warn).not.toHaveBeenCalled();
+  });
+
   it("QA-DF1-19 a location outside routing.workRoots lists no worktrees and keeps only the workRoots patterns", async () => {
     const base = temp();
     const outside = temp("omr-roles-wr-elsewhere-");
@@ -56,9 +90,14 @@ describe("QA-DF1-19 role agent registration outside routing.workRoots", () => {
     mkdirSync(wt);
     const list = vi.fn(async () => [slash(wt)]);
     const opts = options(outside, list);
-    const result = await registerRoleAgents({}, rolesConfig([`${slash(base)}/omr-*`]), opts);
+    const cfg = rolesConfig([`${slash(base)}/omr-*`]);
+    cfg.routing = { ...cfg.routing, leases: { mode: "enforce" } };
+    cfg.enforcement = { ...cfg.enforcement, verify: { require: "always" } };
+    const spawn = vi.spyOn(gitTools, "spawnBounded").mockRejectedValue(new Error("unexpected start-up git"));
+    const result = await registerRoleAgents({}, cfg, opts);
     expect(result.failed).toBe(false);
     expect(list).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
     expect(result.externalDirectory).toEqual([`${base}${sep}omr-*`]);
     expect(opts.warn).not.toHaveBeenCalled();
   });
@@ -115,7 +154,8 @@ describe.skipIf(process.platform !== "win32")("Phase 5.1.3 D6 executor external_
     const baseConfig = rolesConfig(undefined);
     const cfg: RouterConfig = {
       ...baseConfig,
-      routing: { ...baseConfig.routing, executor: { slotsDir: slots } },
+      routing: { ...baseConfig.routing, leases: { mode: "enforce" }, executor: { slotsDir: slots } },
+      enforcement: { ...baseConfig.enforcement, verify: { require: "always" } },
     };
     const executorHome = vi.fn(async () => home);
     const opts = {
@@ -194,6 +234,32 @@ describe.skipIf(process.platform !== "win32")("Phase 5.1.3 D6 executor external_
     expect(result.externalDirectory).toEqual([join(f.main, "*"), join(defaultRoot, "*")]);
     expect(result.externalDirectory).not.toContain(join(untrusted, "*"));
     expect(result.externalDirectoryDenied).toEqual([join(f.home, "*")]);
+    expect(f.opts.warn).not.toHaveBeenCalled();
+  });
+
+  it("takes the default slots drive from the repository's first worktree, not the location alias", async () => {
+    const f = fixture();
+    const otherDrive = win32.parse(f.main).root[0]!.toUpperCase() === "E" ? "F" : "E";
+    f.opts.directory = `${otherDrive}:\\linked-repository`;
+    f.cfg.routing = { ...f.cfg.routing, executor: { slotsDir: null } };
+    const result = await registerRoleAgents(f.agents, f.cfg, f.opts);
+    const defaultRoot = win32.join(win32.parse(f.main).root, ".omr-slots");
+    expect(result.externalDirectory).toEqual([join(f.main, "*"), join(defaultRoot, "*")]);
+    expect(result.externalDirectory).not.toContain(join(`${otherDrive}:\\.omr-slots`, "*"));
+    expect(f.opts.warn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["leases off", "off", "always"],
+    ["verification never", "enforce", "never"],
+  ] as const)("does not grant a configured slots root without D7: %s", async (_label, mode, require) => {
+    const f = fixture();
+    f.cfg.routing = { ...f.cfg.routing, leases: { mode } };
+    f.cfg.enforcement = { ...f.cfg.enforcement, verify: { require } };
+    const result = await registerRoleAgents(f.agents, f.cfg, f.opts);
+    expect(result.externalDirectory).toEqual([join(f.main, "*")]);
+    expect(f.opts.executorHome).not.toHaveBeenCalled();
+    expect(result.externalDirectoryDenied).toEqual([]);
     expect(f.opts.warn).not.toHaveBeenCalled();
   });
 

@@ -552,6 +552,29 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     expect(section).not.toMatch(/not active yet|a later phase registers/);
   });
 
+  it("states the root-only authority rule and own-plan read exception (QA-5.1-2)", () => {
+    const assembly = sectionOf(doc, "## Assembly and lifecycle").replace(/\s+/g, " ");
+    expect(assembly).toContain("a session at depth 0, with no parent");
+    expect(assembly).toContain("are root-only, with **no bound-plan-child exception**; a failed parent lookup refuses");
+    expect(assembly).toContain("plan child reading **only its own plan**");
+    expect(assembly).toContain("A child bound to plan A cannot read plan B");
+    expect(assembly).toContain("The same rule guards `router_plan` and `/plan`");
+    const authority = assembly.slice(assembly.indexOf("All state-changing and authority"), assembly.indexOf("The read-only"));
+    const readOnly = assembly.slice(assembly.indexOf("The read-only"), assembly.indexOf("A child bound"));
+    const reads = ["status", "ready", "export"];
+    for (const action of ROUTER_PLAN_ACTIONS) {
+      expect(reads.includes(action) ? readOnly : authority, action).toContain(`\`${action}\``);
+    }
+    expect(readOnly).toContain("`/plan inbox` (`status inbox=true`)");
+  });
+
+  it("documents preservation of the user's /plan on both hosts (QA-5.1-13)", () => {
+    const command = sectionOf(doc, "## `/plan` command").replace(/\s+/g, " ");
+    expect(command).toContain("An existing user-defined `/plan` command is preserved");
+    expect(command).toContain("on v2 the router logs one conflict warning and leaves `router_plan` available");
+    expect(command).toContain("On v1 that user command runs without an executor `/plan` notice");
+  });
+
   it("quotes every assembly unavailable reason from create.ts", () => {
     const source = read("src/executor/create.ts");
     const reasons = [
@@ -616,17 +639,21 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     const source = read("src/verify/plan-task.ts");
     expect(source).toContain("let reruns = 0;");
     expect([...source.matchAll(/\blet reruns =/g)]).toHaveLength(1);
-    expect(source).toContain("if (!isTransientPlanTaskResult(res, cut) || reruns >= PLAN_TASK_TRANSIENT_RERUNS) return res;");
-    expect(source).toContain("await sleep(PLAN_TASK_RERUN_BACKOFF_MS[reruns]);");
+    // QA-5.1-4: a disposing verifier re-runs nothing, and dispose cuts the backoff sleep (the transient result stands).
+    expect(source).toContain("if (disposing || !isTransientPlanTaskResult(res, cut) || reruns >= PLAN_TASK_TRANSIENT_RERUNS) return res;");
+    expect(source).toContain("try { await untilShutdown(sleep(PLAN_TASK_RERUN_BACKOFF_MS[reruns])); } catch { return res; }");
     expect(source.indexOf("let reruns = 0;")).toBeLessThan(source.indexOf("const withReruns ="));
   });
 
   it("pins the never-deferred plan-task gate in both code and docs", () => {
     const source = read("src/verify/plan-task.ts");
     // Required dispatch-gate wiring: modeA/trivial:false cannot skip the gate; accept is awaited directly, not deferred.
-    expect(source).toContain("deps.buildGateDeps(record.orchestratorSessionID, graders, prepared, deadline, false, record.orchestratorSessionID)");
+    // QA-5.1-14: the grader's parent and creator are the orchestrator the runtime passes with this verify call.
+    expect(source).toContain("deps.buildGateDeps(parent, graders, prepared, deadline, false, parent)");
+    expect(source).toContain("verifyNow(task, slot, attempt, orchestrator(ctx))");
     expect(source).toMatch(/trivial: false,\s+mode: "modeA"/);
-    expect(source).toContain("await withTimeout(accept(delegation, artefact, gateDeps), deadline.remaining(), \"verification gate\")");
+    // QA-5.1-4: still awaited directly; only dispose (never a deferral) can cut the wait.
+    expect(source).toContain("await untilShutdown(withTimeout(accept(delegation, artefact, gateDeps), deadline.remaining(), \"verification gate\"))");
     expect(source).not.toMatch(/\b(?:deferVerification|deferDispatch|registerPending)\s*\(/);
     const verification = sectionOf(doc, "## Verification of plan tasks").replace(/\s+/g, " ");
     expect(verification).toContain("**Plan-task verification is never deferred**, even with `VERIFY:deferred`");

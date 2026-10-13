@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, stat, symlink, writeFile } from "node:fs/promises";
 import { realpathSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -498,6 +498,45 @@ describe("assembled executor through v2 registration", () => {
     expect(executor.deps.leaseRegistry.holderOf("README.md")).toBeNull();
   }, 30_000);
 
+  it("purge retries a partial gc through a closed pool before deleting the ledger", async () => {
+    const fixture = await repository();
+    await configure(fixture.root, fixture.slotsRoot);
+    await seed(fixture, plan(fixture, "plan-a", "paused"));
+    const plugin = await boot(fixture.repo), executor = built(plugin);
+    await vi.waitFor(() => expect(planInputs.has("plan-a")).toBe(true), { timeout: 10_000 });
+    const pool = executor.deps.slotsFor!("plan-a");
+    const first = await pool.acquire("plan-a", "plan:plan-a:T1", fixture.base);
+    const second = await pool.acquire("plan-a", "plan:plan-a:T2", fixture.base);
+    const poolDeps = vi.mocked(poolModule.createSlotPool).mock.calls[0]?.[0];
+    if (poolDeps === undefined) throw new Error("no slot pool was assembled");
+    const rm = poolDeps.fs.rm.bind(poolDeps.fs);
+    let blocked = true;
+    vi.spyOn(poolDeps.fs, "rm").mockImplementation(async (path, options) => {
+      if (blocked && path === first.path) throw new Error("blocked slot removal");
+      await rm(path, options);
+    });
+    const partial = await pool.gc(async id => id === "plan-a");
+    expect(partial.removed).toContain(second.path);
+    expect(partial.reported).toContain(`${first.path}: blocked slot removal`);
+    expect((await stat(first.path)).isDirectory()).toBe(true);
+    await expect(stat(second.path)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readdir(join(poolDeps.markersDir, "plan-a"))).toContain(`${first.slot}.json`);
+    await expect(pool.acquire("plan-a", "plan:plan-a:T3", fixture.base)).rejects.toMatchObject({ code: "E_PLAN_STATE" });
+
+    // The partial gc closed the facade; the abort's automatic collection retries through it while the slot is still blocked.
+    await executor.runtime.abort("plan-a", "root");
+    await executor.runtime.settled();
+    expect((await stat(first.path)).isDirectory()).toBe(true);
+    blocked = false;
+    await executor.runtime.purge("plan-a", "root");
+    await expect(stat(first.path)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await executor.deps.store.list()).toEqual([]);
+    const markers = join(poolDeps.markersDir, "plan-a");
+    await expect(stat(join(markers, `${first.slot}.json`))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readdir(markers).catch((error: NodeJS.ErrnoException) => error.code), "plan-a marker directory after purge").toBe("ENOENT");
+    await expect(stat(markers)).rejects.toMatchObject({ code: "ENOENT" });
+  }, 30_000);
+
   it("A7: per-plan roots isolate slot-1; aborting passive B releases B, not active A", async () => {
     const fixture = await repository();
     const tracked = await configure(fixture.root, fixture.slotsRoot);
@@ -546,9 +585,17 @@ describe("assembled executor through v2 registration", () => {
       await vi.waitFor(() => expect(input.writer.ledger.status).toBe("completed"), { timeout: 10_000 });
     }
     await executor.runtime.settled();
-    expect(collections.get("plan-a") ?? []).toEqual([]);
-    await input.writer.append([{ type: "phase-tagged", phaseId: "p1", tag: "omr/plan-a/phase/p1" }]);
-    await vi.waitFor(() => expect(collections.get("plan-a")).toEqual([{ live: 0, open: 0, untagged: 0 }]), { timeout: 10_000 });
+    if (status === "aborted") {
+      // QA-5.1-7 (planTagsSettled): an aborted plan tags nothing, so quiescence alone collects it, passed-untagged phase and all.
+      expect(collections.get("plan-a"), `plan-a status ${input.writer.ledger.status}`).toEqual([{ live: 0, open: 0, untagged: 1 }]);
+      // A late tag on the collected plan must not collect it again.
+      await input.writer.append([{ type: "phase-tagged", phaseId: "p1", tag: "omr/plan-a/phase/p1" }]);
+    } else {
+      // A completed plan's passed phase is not settled until tagged: no collection yet.
+      expect(collections.get("plan-a") ?? [], `plan-a status ${input.writer.ledger.status}`).toEqual([]);
+      await input.writer.append([{ type: "phase-tagged", phaseId: "p1", tag: "omr/plan-a/phase/p1" }]);
+      await vi.waitFor(() => expect(collections.get("plan-a")).toEqual([{ live: 0, open: 0, untagged: 0 }]), { timeout: 10_000 });
+    }
     for (let tick = 0; tick < 3; tick++) {
       executor.runtime.onRouterToolCall("root");
       await executor.runtime.settled();

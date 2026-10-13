@@ -51,10 +51,10 @@ function nodeSpawner(): Spawner {
 
 type OpenPool = SlotPool & { open(): Promise<void>; close(): void };
 
-/** Lazy pools are never resurrected after collection, even if a caller kept their facade. */
+/** Collection fences slot operations; a closed facade may still open a gc-only handle for purge. */
 export class PlanSlotPools {
   private readonly entries = new Map<PlanId, { view: SlotPool; pool: Promise<OpenPool> | null; closed: boolean }>();
-  constructor(private readonly deps: { store: LedgerStore; toplevel: string; makePool(ledger: Readonly<LedgerV1>): OpenPool }) {}
+  constructor(private readonly deps: { store: LedgerStore; toplevel: string; makePool(ledger: Readonly<LedgerV1>): OpenPool; log?: RuntimeDeps["log"] }) {}
 
   readonly facade: SlotPool = {
     acquire: (id, ...args) => this.of(id).acquire(id, ...args),
@@ -90,7 +90,11 @@ export class PlanSlotPools {
       get: async (...args) => entry.closed ? null : (await get()).get(...args),
       list: async (...args) => entry.closed ? [] : (await get()).list(...args),
       gc: async (finished) => {
-        if (entry.closed) return { removed: [], reported: [] };
+        if (entry.closed) {
+          const pool = this.deps.makePool(await this.deps.store.read(planId));
+          try { await pool.open(); return await pool.gc(finished); }
+          finally { pool.close(); }
+        }
         const pool = await get();
         const result = await pool.gc(finished);
         if (await finished(planId)) { entry.closed = true; pool.close(); }
@@ -107,8 +111,13 @@ export class PlanSlotPools {
     const removed: string[] = [], reported: string[] = [];
     for (const plan of await this.deps.store.list()) {
       if (!sameToplevel(plan.toplevel, this.deps.toplevel)) continue;
-      const result = await this.of(plan.planId).gc(finished);
-      removed.push(...result.removed); reported.push(...result.reported);
+      if (plan.status !== "completed" && plan.status !== "aborted" && this.entries.get(plan.planId)?.pool == null) continue;
+      try {
+        const result = await this.of(plan.planId).gc(finished);
+        removed.push(...result.removed); reported.push(...result.reported);
+      } catch (error) {
+        this.deps.log?.("warn", "slot gc failed", { planId: plan.planId, error: error instanceof Error ? error.message : String(error) });
+      }
     }
     return { removed, reported };
   }
@@ -160,7 +169,10 @@ function runResolver(directory: string): RunResolver {
   };
 }
 
-let processClaim: symbol | null = null;
+const processClaimKey = Symbol.for("omr.executor.claim.v1");
+const processClaims = globalThis as typeof globalThis & {
+  [processClaimKey]?: { token: symbol; toplevel: string };
+};
 
 /** No telemetry port: fixed tier priors, with the existing eight-minute prior as the middle tier. */
 function staticTierDurations(cfg: Parameters<typeof resolveRoles>[0]): DurationModel {
@@ -207,10 +219,10 @@ export function createExecutor(
   if (!prepared.ok) return absent(prepared.reason);
   if (host.leases === null) return absent("the lease registry is not available");
   if (host.runner === null) return absent("the child runner is not available");
-  if (processClaim !== null) return absent("another plan executor already owns this process");
+  if (processClaims[processClaimKey] !== undefined) return absent("another plan executor already owns this process");
   const claim = Symbol("plan executor");
-  processClaim = claim;
   const { toplevel, home } = prepared;
+  processClaims[processClaimKey] = { token: claim, toplevel };
   const clock = createNodeClock();
   const fs = createNodeFileSystem();
   const spawner = nodeSpawner();
@@ -228,7 +240,7 @@ export function createExecutor(
     const store = createLedgerStore({ home });
     const opsOf = (planId: PlanId) => createGitOps({ git, userGit, fs, planId, toplevel, executorHome: home });
     pools = new PlanSlotPools({
-      store, toplevel,
+      store, toplevel, log,
       makePool(ledger) {
         const slotsDir = ledger.config.slotsDir ?? slotsDirOf(ledger.planId, toplevel);
         checkSlotsDir(slotsDir, toplevel);
@@ -388,7 +400,7 @@ export function createExecutor(
         try { await innerRuntime.dispose(); }
         finally {
           try { await planPools.closeAll(); }
-          finally { for (const timer of timers) clock.clearTimer(timer); timers.clear(); if (processClaim === claim) processClaim = null; }
+          finally { for (const timer of timers) clock.clearTimer(timer); timers.clear(); if (processClaims[processClaimKey]?.token === claim) delete processClaims[processClaimKey]; }
         }
       })();
       return disposal;
@@ -399,7 +411,7 @@ export function createExecutor(
     void launcher?.dispose();
     void pools?.closeAll();
     for (const timer of timers) clock.clearTimer(timer);
-    if (processClaim === claim) processClaim = null;
+    if (processClaims[processClaimKey]?.token === claim) delete processClaims[processClaimKey];
     return absent(`assembly failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 }

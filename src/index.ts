@@ -145,7 +145,7 @@ import { scrubText } from "./guard/scrub";
 import { accept, unverifiableGateResult } from "./verify/gate";
 import { applyDispatchCaveats, createVerificationWiring, resolvePendingTtlMs, dispatchDirectiveText, extractAssistantText, parseRouterVerifyArgs, type DispatchStart, type HandleReport } from "./verify/wiring";
 import { waitTreeFreeExcept } from "./verify/wiring";
-import { createLeaseSelfExemptions, createPlanTaskVerifier, ledgerOrchestratorOf, planTaskGit, planTreeKey } from "./verify/plan-task";
+import { createLeaseSelfExemptions, createPlanTaskVerifier, planTaskGit, planTreeKey } from "./verify/plan-task";
 import { locationOutsideWorkRoots } from "./router/work-roots";
 import { CLAIM_REFRESH_MS, HEAD_LOST_REASON, PENDING_INSTANCES_DIRNAME, PERIMETER_LOST_REASON, type DispatchHeadState, claimPendingSession, createInstanceClaimToken, createPendingFileJournal, foldDormantRecords, refreshPendingClaims, releasePendingClaim, resolvePendingJournalDir, processedKeyOf, appendRouterFooter, buildLateNoticeBlock, buildPendingListBlock, unattributedRisk, type DormantSession, type LateNotice, type PendingEntry, type SettledVerification } from "./verify/pending";
 import { createDeadline } from "./verify/deterministic";
@@ -1010,22 +1010,36 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     }).mode,
     logger: routerWarn,
   });
-  // Executor actions are orchestrator-only. A proven, exactly bound plan child is the sole child exception.
-  const planCallerAllowed = async (sessionID: unknown): Promise<boolean> => {
+  // State-changing executor actions require depth 0, even for an exactly bound plan child.
+  const planRootCallerAllowed = async (sessionID: unknown): Promise<boolean> => {
     if (!isV2Host || typeof sessionID !== "string" || sessionID === "") return false;
     try {
-      const binding = currentBinding(sessionID, { maxOf: roleMaxOf });
-      if (binding?.kind === "exact" && binding.plan !== undefined) return true;
       return await depthTracker.depthOf(sessionID) === 0;
     } catch {
       return false;
     }
   };
-  const planCallerRefusal = "refused: plan actions require a root orchestrator session (or a bound plan child).";
+  const planReadCallerAllowed = (sessionID: unknown, planId: unknown): boolean => {
+    if (!isV2Host || typeof sessionID !== "string" || sessionID === "" || typeof planId !== "string") return false;
+    try {
+      const binding = currentBinding(sessionID, { maxOf: roleMaxOf });
+      return binding?.kind === "exact" && binding.plan !== undefined && binding.plan.planId === planId.trim();
+    } catch {
+      return false;
+    }
+  };
+  // Only this allowlist is read-only; new or unknown actions remain root-only. `/plan inbox` parses as status.
+  const planActionCallerAllowed = async (sessionID: unknown, action: unknown, planId: unknown): Promise<boolean> =>
+    await planRootCallerAllowed(sessionID) ||
+    ((action === "status" || action === "ready" || action === "export") && planReadCallerAllowed(sessionID, planId));
+  const planCallerRefusal = "refused: plan actions require a root orchestrator session; bound plan children may only read their own plan.";
   const routerPlan = executorRuntime === undefined ? undefined : createRouterPlanTool(executorRuntime, {
     approve: () => resolveRouting(loadConfig(projectDir), "v2").executor.approve,
   });
   const planCommand = executorRuntime === undefined ? undefined : createPlanCommand(executorRuntime);
+  const planCommandMarker = Symbol.for("opencode-model-router.plan-command");
+  let userPlanCommandDefined = false;
+  let warnedPlanCommandConflict = false;
   const effortOverrides = createEffortOverrideStore({ logger: routerWarn });
   let warnedGraderParams = false;
   const depthBanners = new Map<string, string>();
@@ -1224,7 +1238,6 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       abortSession: async (sessionID) => { await ctx.client.session.abort({ path: { id: sessionID } }); },
       getConfig: () => cfg,
       git: planTaskGit(),
-      orchestratorOf: ledgerOrchestratorOf(ctx.directory),
       exemptions: planTaskLeaseExemptions,
       log: (message, detail) => logger.warn(`[verify] ${message}`, detail === undefined ? undefined : { error: describeError(detail) }),
     });
@@ -1885,7 +1898,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     tool: {
       ...(isV2Host && routerPlan !== undefined ? { router_plan: {
         ...routerPlan,
-        execute: async (args, context) => await planCallerAllowed(context?.sessionID)
+        execute: async (args, context) => await planActionCallerAllowed(context?.sessionID, args?.action, args?.planId)
           ? routerPlan.execute(args, context)
           : `[router_plan] ${planCallerRefusal}`,
       } } : {}),
@@ -3311,6 +3324,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
       // Register commands
       opencodeConfig.command ??= {};
+      // Remember the host command the hook sees; our v2 registration is marked so reloads are not conflicts.
+      userPlanCommandDefined = opencodeConfig.command.plan !== undefined && opencodeConfig.command.plan?.[planCommandMarker] !== true;
       opencodeConfig.command["tiers"] = {
         template: "",
         description: "Show model delegation tiers and rules",
@@ -3379,7 +3394,14 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           "Model-router controls (e.g., /router enforce off|advisory|enforced, /router overrides, /router models)",
       };
       if (isV2Host && planCommand !== undefined) {
-        opencodeConfig.command.plan = { template: "$ARGUMENTS", description: planCommand.description };
+        if (userPlanCommandDefined) {
+          if (!warnedPlanCommandConflict) {
+            warnedPlanCommandConflict = true;
+            logger.warn("[router] /plan command conflict: preserving the user-defined /plan; router_plan remains available");
+          }
+        } else {
+          opencodeConfig.command.plan = { template: "$ARGUMENTS", description: planCommand.description, [planCommandMarker]: true };
+        }
       }
     },
 
@@ -3511,17 +3533,20 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       if (input.command === "plan") {
         if (!isV2Host) {
           // Best-effort on v1 (the command is deliberately unregistered); share the configured-key notice's process guard.
-          if (warnedV2OnlyKeys.size === 0) {
+          if (!userPlanCommandDefined && warnedV2OnlyKeys.size === 0) {
             warnedV2OnlyKeys.add("routing.executor");
             logger.warn("[router] the plan executor requires OpenCode v2; ignored: /plan");
           }
           return; // No model-visible part on v1.
         }
+        if (userPlanCommandDefined) return; // Let the host's /plan run without executor instructions.
         if (planCommand !== undefined) {
           const args: string = input.arguments ?? "";
           const parsed = parsePlanCommand(args);
-          const rootOnly = parsed.kind === "call" && (parsed.call.action === "approve" || parsed.call.action === "adopt");
-          const text = rootOnly && !await planCallerAllowed(input.sessionID)
+          const allowed = parsed.kind !== "call" || await planActionCallerAllowed(
+            input.sessionID, parsed.call.action, "planId" in parsed.call ? parsed.call.planId : undefined,
+          );
+          const text = !allowed
             ? `[router_plan] ${planCallerRefusal}`
             : executorAccess?.runtime() === null
               ? `[router_plan] ${executorAccess.unavailable()}`

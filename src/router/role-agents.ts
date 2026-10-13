@@ -450,7 +450,7 @@ export interface RoleRegistrationOptions {
   context7: boolean;
   /**
    * The project directory: its repository's worktrees are listed, unless `routing.workRoots` is set and the directory lies
-   * outside every entry (`locationOutsideWorkRoots`, QA-DF1-19): then no worktree listing runs; D6 still resolves the home.
+   * outside every entry (`locationOutsideWorkRoots`, QA-DF1-19): then no worktree listing or executor-home lookup runs.
    */
   directory: string;
   /** The host's own agents at setup (name → seed definition); a removed #81 entry falls back to it. */
@@ -514,7 +514,7 @@ export async function registerRoleAgents(
     const hasLocalActions = [...table.roles.values()].some(roleHasLocalActions);
     let worktrees: string[] = [];
     // QA-DF1-19: a location outside configured `routing.workRoots` gets no worktree listing or worktree rules.
-    // Unset or empty `workRoots`: the worktrees are listed as before. D6's executor-home lookup below is separate.
+    // Unset or empty `workRoots`: the worktrees are listed as before.
     const outside = locationOutsideWorkRoots(opts.directory, routing.workRoots, process.platform, opts.realpath ?? nativeRealpath);
     if (!outside && hasLocalActions) {
       try {
@@ -528,9 +528,11 @@ export async function registerRoleAgents(
     for (const problem of [...approved.problems, ...found.problems]) opts.warn(`roles:external:${problem}`, `${PREFIX}${problem}`);
     externalDirectory = found.patterns;
     // slotsDir is trusted here: the project-controlled value was stripped before the config merge (D18).
-    const slotsDir = resolveRouting(cfg, "v2").executor.slotsDir;
+    const executorRouting = resolveRouting(cfg, "v2");
+    const slotsDir = executorRouting.executor.slotsDir;
+    const executorEnabled = executorRouting.leases.mode === "enforce" && cfg.enforcement?.verify?.require !== "never";
     const executorProblems: Array<readonly [key: string, message: string]> = [];
-    if (table.roles.size > 0) {
+    if (!outside && executorEnabled && table.roles.size > 0) {
       const realpath = opts.realpath ?? nativeRealpath;
       const homeDirectory = worktrees[0] ?? opts.directory;
       let home: string | undefined;
@@ -560,11 +562,11 @@ export async function registerRoleAgents(
         }
       }
       // An unresolved home cannot be protected by a final deny: do not grant the slots root either (D6).
-      if (home !== undefined && hasLocalActions) {
-        const drive = /^([A-Za-z]):[\\/]/.exec(opts.directory);
+      if (home !== undefined && hasLocalActions && (slotsDir !== null || process.platform === "win32")) {
+        const drive = /^([A-Za-z]):[\\/]/.exec(worktrees[0] ?? "");
         const root = slotsDir ?? (drive === null ? undefined : `${drive[1]}:\\.omr-slots`);
         const slots = root === undefined
-          ? { problem: "the project directory is not on a drive-letter path" }
+          ? { problem: "the repository toplevel is not on a drive-letter path" }
           : executorSlotsRootPattern(root, worktrees, realpath);
         if (slots.pattern === undefined) {
           executorProblems.push(["roles:executor-slots", `${PREFIX}executor slots root ${root ?? "(default)"} ${slots.problem ?? "is not usable"}; not granted`]);

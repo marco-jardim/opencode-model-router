@@ -3,7 +3,12 @@ import { mkdtemp, readdir, stat } from "node:fs/promises";
 import { realpathSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
-import { createExecutorRuntime, realCollaborators, type ExecutorRuntimeHandle, type RuntimeDeps, type CollaboratorInput } from "../../src/executor/runtime";
+import {
+  COLLECT_RETRY_BASE_MS, COLLECT_RETRY_MAX_MS, createExecutorRuntime, nextCollectDelay, planTagsSettled, realCollaborators,
+  type ExecutorRuntimeHandle, type RuntimeDeps, type CollaboratorInput,
+} from "../../src/executor/runtime";
+import { phaseTagName } from "../../src/executor/git";
+import type { ReconcileFeed } from "../../src/executor/recovery";
 import { createLedgerStore, createNodeClock } from "../../src/executor/ledger";
 import { createCapacityController } from "../../src/executor/capacity";
 import { createScheduler } from "../../src/executor/schedule";
@@ -132,6 +137,131 @@ async function queuedAnswerRig(kind: "breaker" | "qa-cap") {
   queue.enqueue(["T1", "T2"]); queue.enqueue.mockClear();
   return { ...h, input, queue, inboxId, qaId };
 }
+
+describe("QA-5.1 runtime fixes", () => {
+  it("QA-5.1-9: an enqueue that throws after the answer is journaled still resolves the answer and schedules the plan", async () => {
+    const h = await queuedAnswerRig("breaker");
+    h.queue.enqueue.mockImplementation(() => { throw new ExecutorError("E_PLAN_STATE", "integration queue refused", { planId: "plan-a" }); });
+    const calls: string[] = [];
+    const scheduler = h.deps.scheduler as unknown as Record<string, unknown>;
+    for (const [key, fn] of Object.entries(scheduler)) {
+      if (typeof fn === "function") scheduler[key] = (...args: unknown[]) => { calls.push(key); return (fn as (...a: unknown[]) => unknown).apply(h.deps.scheduler, args); };
+    }
+    const gate = h.deps.launcher.gate;
+    h.deps.launcher.gate = (sessionID) => { calls.push("gate"); return gate(sessionID); };
+    await expect(h.runtime.answer("plan-a", h.inboxId, "continue", "owner-plan-a")).resolves.toBeUndefined();
+    expect(h.queue.enqueue).toHaveBeenCalledOnce();
+    expect(h.input.writer.ledger.inbox.find(item => item.id === h.inboxId)?.answer).toBe("continue");
+    await h.runtime.settled();
+    expect(calls.length).toBeGreaterThan(0);
+  }, 15_000);
+
+  it("QA-5.1-7: settled phase tags: an aborted plan needs none; a completed one counts tagged, exists-other and gave-up tags", () => {
+    const l = draft("plan-a", "completed");
+    expect(planTagsSettled(l)).toBe(true); // no passed phase: nothing to tag
+    l.phases[0]!.gate = "passed";
+    expect(planTagsSettled(l)).toBe(false);
+    expect(planTagsSettled({ ...l, status: "aborted" })).toBe(true);
+    expect(planTagsSettled({ ...l, phases: [{ ...l.phases[0]!, tag: "omr/plan-a/p1" }] })).toBe(true);
+    const name = phaseTagName("plan-a", l.phases[0]!.id);
+    const item = (text: string, taskId: string | null = null) => ({ id: "F-1", kind: "failure" as const, severity: "info" as const, taskId, text,
+      options: [], answer: null, createdAt: "2026-10-13T00:00:00.000Z" });
+    expect(planTagsSettled({ ...l, inbox: [item(`The phase tag ${name} already exists at ${SHA}, not at x; it is never moved.`)] })).toBe(true);
+    expect(planTagsSettled({ ...l, inbox: [item(`The phase tag ${name} could not be created after 4 rounds of 3 tries (boom). Create it by hand.`)] })).toBe(true);
+    // Another phase's tag, or a task's failure item, settles nothing.
+    expect(planTagsSettled({ ...l, inbox: [item(`The phase tag ${phaseTagName("plan-a", "other")} already exists at x`)] })).toBe(false);
+    expect(planTagsSettled({ ...l, inbox: [item(`The phase tag ${name} already exists at x`, "T1")] })).toBe(false);
+  });
+
+  it("QA-5.1-7: the collection re-check backs off from 100 ms, doubling, capped at 30 s", () => {
+    const seq: number[] = [];
+    let delay = COLLECT_RETRY_BASE_MS;
+    for (let i = 0; i < 12; i++) { seq.push(delay); delay = nextCollectDelay(delay); }
+    expect(seq.slice(0, 4)).toEqual([100, 200, 400, 800]);
+    expect(COLLECT_RETRY_MAX_MS).toBe(30_000);
+    expect(Math.max(...seq)).toBe(30_000);
+    expect(seq.slice(-3)).toEqual([30_000, 30_000, 30_000]);
+  });
+
+  it("QA-5.1-7: an aborted plan with an untagged passed phase is collected, and a manual gc collects it without tag quiescence", async () => {
+    const h = await rig(), value = draft("plan-b");
+    value.phases[0]!.gate = "passed";
+    await h.compile(value);
+    await h.runtime.abort("plan-b", "owner-plan-b");
+    await h.runtime.settled();
+    expect(h.pools.get("plan-b")?.gc).toHaveBeenCalledOnce();
+    await h.runtime.gc();
+    const predicate = h.facade.gc.mock.calls[0]?.[0];
+    if (predicate === undefined) throw new Error("missing manual gc predicate");
+    expect(await predicate("plan-b")).toBe(true);
+  }, 15_000);
+
+  it("QA-5.1-4: dispose cuts the verifier first, before the launcher and the wait for running work", async () => {
+    const h = await rig();
+    const order: string[] = [];
+    h.deps.verifier.dispose = async () => { order.push("verifier"); };
+    h.deps.launcher.dispose = async () => { order.push("launcher"); };
+    await h.runtime.dispose();
+    expect(order).toEqual(["verifier", "launcher"]);
+  }, 15_000);
+
+  it("QA-5.1-4: a verify cut by dispose leaves the task verifying, uses no attempt and no breaker sample; the next start re-verifies it", async () => {
+    const h = await rig();
+    const value = draft("plan-a", "running");
+    value.tasks.T1 = taskNode("T1", { state: "verifying", slot: "slot-1", branch: "omr/plan-a/t/T1",
+      attempts: [{ ...openAttempt(1), outcome: "succeeded", endedAt: "2026-10-11T00:00:01.000Z" }],
+      footprint: { writes: ["T1.ts"], reads: [], confidence: "explicit", sources: ["path"] } });
+    expect(ledgerViolations(value)).toEqual([]);
+    const created = await h.store.create(value, holderOf(value.orchestrator.sessionID, process.pid, hostname())); await created.close();
+    // The slot's marker (slotLeaseOf reads its slot, path and commit).
+    h.slotsFor("plan-a").get.mockResolvedValue({ slot: "slot-1", path: "C:/slots/plan-a/slot-1", commit: SHA } as unknown as NonNullable<Awaited<ReturnType<SlotPool["get"]>>>);
+    const recordAttempt = vi.fn(async () => ({ tripped: false }));
+    const collaborators = h.deps.collaborators;
+    h.deps.collaborators = (input) => { const c = collaborators(input); c.policy.recordAttempt = recordAttempt; return c; };
+    // A verifier whose gate hangs until dispose cuts it, as plan-task's does (unverifiable "the plugin is shutting down").
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    let cut: (() => void) | null = null;
+    const hanging = {
+      disposing: false,
+      verify: vi.fn(() => new Promise<{ verdict: "unverifiable"; findings: string; ref: string }>((resolve) => {
+        cut = () => resolve({ verdict: "unverifiable", findings: "the plugin is shutting down", ref: "none" });
+        entered();
+      })),
+      async dispose() { hanging.disposing = true; cut?.(); },
+    };
+    h.deps.verifier = hanging;
+    // R2: recovery classifies the `verifying` task for a re-verification at every start.
+    const feed = { taskId: "T1", from: "verifying", action: "reverify", n: 1, slotValid: true, orphans: [], probation: null, context: null } as unknown as ReconcileFeed;
+    // L2: only a plan recover() reports is reconciled; its report's feeds are the first activation's classification.
+    const reports = [{ planId: "plan-a", actions: [feed] }] as unknown as Awaited<ReturnType<NonNullable<RuntimeDeps["recovery"]>["recover"]>>;
+    h.deps.recovery = { recover: async () => reports, adopt: async () => {}, reconcile: async () => [feed] };
+    // start awaits the recovery, which awaits the hanging verify: only dispose can end it.
+    const starting = h.runtime.start();
+    await started;
+    const t0 = Date.now();
+    await h.runtime.dispose();
+    await starting.catch(() => {});
+    expect(Date.now() - t0).toBeLessThan(5_000);
+    expect(hanging.verify).toHaveBeenCalledOnce();
+    const after = await h.store.read("plan-a");
+    expect(after.tasks.T1?.state).toBe("verifying");
+    expect(after.tasks.T1?.attempts).toHaveLength(1);
+    expect(after.tasks.T1?.attempts[0]?.verdict).toBeNull();
+    expect((await h.store.exportPlan("plan-a")).events.some((e) => e.type === "attempt-verdict")).toBe(false);
+    expect(recordAttempt).not.toHaveBeenCalled();
+    // The next start re-verifies the task (R2) and its verdict is journaled then.
+    const verify = vi.fn(async () => ({ verdict: "pass" as const, findings: "", ref: "proof" }));
+    const next = createExecutorRuntime({ ...h.deps, verifier: { verify } }); runtimes.push(next);
+    await next.start();
+    await next.settled();
+    expect(verify).toHaveBeenCalledOnce();
+    const reverified = await h.store.read("plan-a");
+    expect(reverified.tasks.T1?.attempts[0]?.verdict).toBe("pass");
+    expect(reverified.tasks.T1?.state).not.toBe("verifying");
+    expect(reverified.tasks.T1?.state).not.toBe("failed");
+  }, 30_000);
+});
 
 describe("U1: runtime plan-scoped slots", () => {
   it("a breaker answer re-enqueues only the newly unpaused phase, after the answer is durable", async () => {

@@ -9,7 +9,7 @@ import {
   type CapacityProviderState,
 } from "./capacity";
 import { expandTask, loadExpansionEnv, type ExpandedTask } from "./expand";
-import { taskBranchName } from "./git";
+import { phaseTagName, taskBranchName } from "./git";
 import type { PlanRoleBindings } from "./launch";
 import { createQaLoop } from "./qa-loop";
 import {
@@ -381,12 +381,28 @@ export interface PlanCollaborators {
   qa: QaLoop;
 }
 
+/**
+ * QA-5.1-6/-14: what the runtime hands the plan-task verifier with each hook call: the plan's orchestrator session as its
+ * ledger names it at that call ("" when unknown). An adopt moves a plan to another orchestrator, so it is read per call.
+ */
+export interface PlanTaskContext {
+  orchestratorSessionID: string;
+}
+
 /** Optional attempt observations used by the dispatch-backed plan-task verifier. */
 export interface PlanTaskVerifier extends SlotVerifier {
-  begin?(task: TaskNode, slot: SlotLease, attempt: Attempt): void | Promise<void>;
+  begin?(task: TaskNode, slot: SlotLease, attempt: Attempt, ctx?: PlanTaskContext): void | Promise<void>;
   /** `finalText`: the child's final text when the runtime holds it (the row-15 result text, else the last assistant text). */
-  observe?(task: TaskNode, slot: SlotLease, attempt: Attempt, finalText?: string): void | Promise<void>;
+  observe?(task: TaskNode, slot: SlotLease, attempt: Attempt, finalText?: string, ctx?: PlanTaskContext): void | Promise<void>;
+  verify(task: TaskNode, slot: SlotLease, attempt: Attempt, ctx?: PlanTaskContext): ReturnType<SlotVerifier["verify"]>;
   forget?(planId: PlanId, taskId: TaskId, attempt: number): void | Promise<void>;
+  /**
+   * QA-5.1-4: called FIRST by `runtime.dispose`. Cuts every in-flight verification (gate deadlines, grader sessions, backoff
+   * sleeps); each pending `verify` resolves promptly as unverifiable. A verdict cut this way is never journaled.
+   */
+  dispose?(): Promise<void>;
+  /** QA-5.1-4: whether `dispose` has been called (a verdict returned after it is a cut, never journaled). */
+  readonly disposing?: boolean;
 }
 
 export interface RuntimeDeps {
@@ -619,6 +635,37 @@ const ATTEMPT_TRAILER = "Omr-Attempt";
 const LEASE_HELD_STATES: readonly TaskState[] = ["running", "completed", "verifying", "verified"];
 /** QA-4.2-3: how long closing a plan waits for its integration queue to dispose (a hung queue never blocks a close). */
 const QUEUE_DISPOSE_MS = 10_000;
+/** QA-5.1-7: the first re-check of a finished plan that is not quiescent yet; it doubles up to COLLECT_RETRY_MAX_MS. */
+export const COLLECT_RETRY_BASE_MS = 100;
+/** QA-5.1-7: the cap of the finished-plan collection backoff. */
+export const COLLECT_RETRY_MAX_MS = 30_000;
+
+/** QA-5.1-7: the delay of the re-check after one of `delay`: doubled, capped at COLLECT_RETRY_MAX_MS. */
+export function nextCollectDelay(delay: number): number {
+  return Math.min(Math.max(delay, COLLECT_RETRY_BASE_MS) * 2, COLLECT_RETRY_MAX_MS);
+}
+
+/**
+ * QA-5.1-7: whether a finished plan's phase tags are settled. An aborted plan tags nothing: settled. A completed plan's passed
+ * phase is settled once tagged, or once the queue settled its tag without one: the tag name exists at another commit
+ * (queue.ts finishTag `exists-other`), or the queue gave up after TAG_RETRY_LIMIT rounds (retryTagLater). Both leave a
+ * `failure` inbox item naming the phase's tag (`The phase tag <name> ...`), the only ledger record of either. The queue tags
+ * every passed phase (no setting turns tagging off), so there is no untagged-by-configuration case.
+ */
+export function planTagsSettled(l: Readonly<LedgerV1>): boolean {
+  if (l.status === "aborted") return true;
+  return l.phases.every((ph) => {
+    if (ph.gate !== "passed" || ph.tag !== null) return true;
+    let name: string;
+    try {
+      name = phaseTagName(l.planId, ph.id);
+    } catch {
+      return false;
+    }
+    return l.inbox.some((item) => item.kind === "failure" && item.taskId === null
+      && (item.text.startsWith(`The phase tag ${name} already exists at `) || item.text.startsWith(`The phase tag ${name} could not be created after `)));
+  });
+}
 /** QA-4.2-13: context of a `completed` task whose slot was lost before its commit (R2 re-provision failed). */
 const SLOT_LOST_BEFORE_COMMIT = "slot lost before commit";
 
@@ -710,6 +757,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   const finalTexts = new Map<string, string>();
   const collecting = new Set<PlanId>();
   const collectionTimers = new Map<PlanId, { readonly id: number }>();
+  /** QA-5.1-7: the next re-check delay of a finished plan that is not quiescent yet. */
+  const collectionDelays = new Map<PlanId, number>();
   /** The process-level activation reservation (QA-3.1-18): the plan whose activation is under way, and its holds. */
   let activating: { planId: PlanId; holds: number } | null = null;
   /** Unsubscribes `onHostEvent` from `hosts.onEvent` (subscribed in `start`, QA-3.1-1). */
@@ -791,10 +840,22 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     }
   }
 
+  /** QA-5.1-6/-14: the plan's orchestrator as its ledger names it now (an adopt moves it), handed to each verifier hook. */
+  function planTaskContext(p: PlanRt): PlanTaskContext {
+    return { orchestratorSessionID: p.writer.ledger.orchestrator.sessionID };
+  }
+
+  /** No live child, no task in flight and no open integration entry: nothing of the plan still writes its slots. */
+  function idle(p: PlanRt): boolean {
+    return p.inFlight.size === 0 && ![...p.handles.values()].some((h) => !h.settled) && p.writer.openIntegration().length === 0;
+  }
+
+  /**
+   * QA-5.1-7: idle, and every phase's tag is settled. An aborted plan tags nothing, so it waits for no tag. A completed plan's
+   * passed phase is settled once tagged, or once the queue settled its tag otherwise (`phaseTagSettled`).
+   */
   function quiescent(p: PlanRt): boolean {
-    return p.inFlight.size === 0 && ![...p.handles.values()].some((h) => !h.settled)
-      && p.writer.openIntegration().length === 0
-      && p.writer.ledger.phases.every((ph) => ph.gate !== "passed" || ph.tag !== null);
+    return idle(p) && planTagsSettled(p.writer.ledger);
   }
 
   /** Finished status is not sufficient: the queue must have closed its entries and phase tags. */
@@ -804,7 +865,11 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       || (status !== "completed" && status !== "aborted")) return;
     if (!quiescent(p)) {
       if (!collectionTimers.has(p.planId)) {
-        const timer = d.clock.setTimer(100, () => {
+        // QA-5.1-7: the re-check backs off (doubling from COLLECT_RETRY_BASE_MS, capped at COLLECT_RETRY_MAX_MS); it stops
+        // once the plan is collected or the runtime (or the plan) is disposed (the early return above, dispose's clear).
+        const delay = collectionDelays.get(p.planId) ?? COLLECT_RETRY_BASE_MS;
+        collectionDelays.set(p.planId, nextCollectDelay(delay));
+        const timer = d.clock.setTimer(delay, () => {
           collectionTimers.delete(p.planId);
           bg("finished slot collection", () => collectFinished(p));
         });
@@ -816,6 +881,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     try {
       await slotsFor(p.planId).gc(async (id) => id === p.planId);
       collected.add(p.planId);
+      collectionDelays.delete(p.planId);
     } finally { collecting.delete(p.planId); }
   }
 
@@ -1456,7 +1522,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       let handle: LaunchHandle;
       try {
         forgotten.delete(`${p.planId}/${taskId}#${n}`);
-        await d.verifier.begin?.(own(p.writer.ledger, taskId) ?? t1, slot, attemptOf(p.writer.ledger, taskId, n));
+        await d.verifier.begin?.(own(p.writer.ledger, taskId) ?? t1, slot, attemptOf(p.writer.ledger, taskId, n), planTaskContext(p));
         handle = d.launcher.launch(req, launchHooks(p, taskId, n, route));
       } catch (e) {
         const code = errorCode(e);
@@ -2059,7 +2125,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       lease = await slotLeaseOf(p, t);
       // D11: the attempt's trailer makes the commit idempotent across a crash between the commit and row 21.
       const att = t.attempts.find((x) => x.n === n);
-      if (att !== undefined && d.verifier.observe !== undefined) await d.verifier.observe(t, lease, att, await finalTextOf(p, taskId, att));
+      if (att !== undefined && d.verifier.observe !== undefined) await d.verifier.observe(t, lease, att, await finalTextOf(p, taskId, att), planTaskContext(p));
       r = await commitTaskInSlot(d.git, {
         slot: lease,
         branch,
@@ -2106,9 +2172,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       const att = cur === null ? undefined : cur.attempts.find((x) => x.n === n);
       if (cur === null || att === undefined) return;
       forgotten.delete(`${p.planId}/${taskId}#${n}`);
-      if (d.verifier.observe !== undefined) await d.verifier.observe(cur, lease, att, await finalTextOf(p, taskId, att));
+      if (d.verifier.observe !== undefined) await d.verifier.observe(cur, lease, att, await finalTextOf(p, taskId, att), planTaskContext(p));
       await slotsFor(p.planId).cleanForChecks(lease.slot);
-      const v = await d.verifier.verify(cur, lease, att);
+      const v = await d.verifier.verify(cur, lease, att, planTaskContext(p));
       verdict = v.verdict;
       findings = v.findings;
       ref = v.ref;
@@ -2118,6 +2184,12 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       ref = null;
     }
     finalTexts.delete(`${p.planId}/${taskId}#${n}`);
+    // QA-5.1-4: a verification cut by dispose judged nothing. Nothing is journaled: the task stays `verifying`, which recovery
+    // re-verifies (R2); no failed transition, no attempt used, no breaker sample.
+    if (disposed || p.disposed || d.verifier.disposing === true) {
+      d.log("info", `verification of ${p.planId}/${taskId}#${n} cut by dispose; recovery re-verifies it`);
+      return;
+    }
     if (verdict === "pass") {
       const ok = await appendIf(p, (cur) => {
         const c = own(cur, taskId);
@@ -3809,9 +3881,15 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       if (unpaused.size > 0 && !p.passive && !p.latch && ledger.status === "running") {
         // checkPhase can return before kicking when a phase still has verified work. enqueue dedupes its FIFO
         // but always kicks the lanes, including when the resumed phase has only pending integration entries.
-        p.collab.queue.enqueue(Object.values(ledger.tasks)
-          .filter((t) => t.state === "verified" && t.phase !== null && unpaused.has(t.phase) && !p.leaseHeld.has(t.id))
-          .map((t) => t.id));
+        // QA-5.1-9: the answer is journaled already; a queue that refuses the kick (E_PLAN_STATE, E_DISPOSED) never
+        // fails the answer nor skips the schedule below.
+        try {
+          p.collab.queue.enqueue(Object.values(ledger.tasks)
+            .filter((t) => t.state === "verified" && t.phase !== null && unpaused.has(t.phase) && !p.leaseHeld.has(t.id))
+            .map((t) => t.id));
+        } catch (e) {
+          d.log("warn", `integration kick after the answer to ${inboxId} failed`, errorText(e));
+        }
       }
       schedule(p);
     },
@@ -4042,7 +4120,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     async gc() {
       return d.slots.gc(async (planId) => {
         const known = plans.get(planId);
-        if (known !== undefined) return (known.writer.ledger.status === "completed" || known.writer.ledger.status === "aborted") && quiescent(known);
+        // QA-5.1-7 (EXECUTOR.md): a manual gc collects a finished plan once nothing writes its slots (no live child, no task
+        // in flight, no open integration entry); tag settlement is the automatic collection's wait, never the user's.
+        if (known !== undefined) return (known.writer.ledger.status === "completed" || known.writer.ledger.status === "aborted") && idle(known);
         try {
           const l = await d.store.read(planId);
           return l.status === "completed" || l.status === "aborted";
@@ -4063,6 +4143,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       requireStatus(p, ["completed", "aborted"]);
       const toplevel = p.writer.ledger.repo.toplevel;
       await closePlan(p);
+      // QA-5.1-11: the full gc runs before the ledger is removed; a pool that collection already closed still answers it
+      // through a gc-only handle (create.ts PlanSlotPools), so a slot a partial gc could not remove is retried here.
       await slotsFor(planId).gc(async (id) => (id === planId ? true : null));
       for (const ns of ["heads", "tags"]) {
         const prefix = `refs/${ns}/omr/${planId}/`;
@@ -4174,8 +4256,20 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
     async dispose() {
       disposed = true;
+      // QA-5.1-4: the verifier is cut FIRST (gate deadlines, grader sessions, backoff sleeps), so no pending verify keeps the
+      // wait for running work below (and the process claim) for the length of a gate. Its synchronous part runs now; it is
+      // awaited after the plans are detached. A cut verdict is never journaled (`verifyAttempt`).
+      let verifierCut: Promise<void> = Promise.resolve();
+      if (d.verifier.dispose !== undefined) {
+        try {
+          verifierCut = d.verifier.dispose().catch((e: unknown) => { d.log("warn", "verifier dispose failed", errorText(e)); });
+        } catch (e) {
+          d.log("warn", "verifier dispose failed", errorText(e));
+        }
+      }
       for (const timer of collectionTimers.values()) d.clock.clearTimer(timer);
       collectionTimers.clear();
+      collectionDelays.clear();
       finalTexts.clear();
       // QA-4.2-4: no waiter of a same-process adopt's window outlives the runtime (dispose waits for their work below).
       for (const planId of [...reattachOpeners.keys()]) openReattach(planId);
@@ -4198,6 +4292,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         // R1a: the probation poll timer was one of `p.timers`; no poll re-arms after dispose.
         p.probationTimer = null;
       }
+      await verifierCut;
       // Detach every plan from host feeds synchronously, before any optional verifier hook can yield.
       if (d.verifier.forget !== undefined) {
         for (const p of plans.values()) {

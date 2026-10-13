@@ -18,11 +18,12 @@ import { RouterTimeoutError } from "../../src/verify/timeout";
 import { PLAN_TASK_PERIMETER_ID, planPerimeter } from "../../src/verify/perimeter";
 import * as configModule from "../../src/router/config";
 import { leaseHolderID, type Attempt, type SlotLease, type TaskNode } from "../../src/executor/types";
+import type { PlanTaskContext, PlanTaskVerifier } from "../../src/executor/runtime";
 import {
   PLAN_TASK_CHECKS_MIN_MS, PLAN_TASK_FINDINGS_MAX, PLAN_TASK_GRADER_SLACK_MS, PLAN_TASK_RERUN_BACKOFF_MS, PLAN_TASK_RETURN_TEXT_MAX,
   PLAN_TASK_TRANSIENT_RERUNS, planTaskReturnText,
-  combineMixedPasses, createLeaseSelfExemptions, createPlanTaskVerifier, graderTierFor, isPlanTaskVerificationID, isTransientPlanTaskResult,
-  ledgerOrchestratorOf, planTaskChecksBudgetMs, planTaskDoD, planTaskGit, planTaskGraderBudgetMs, planTaskProducerTier, planTaskVerificationID,
+  combineMixedPasses, createLeaseSelfExemptions, createPlanTaskVerifier as createRawPlanTaskVerifier, graderTierFor, isPlanTaskVerificationID, isTransientPlanTaskResult,
+  planTaskChecksBudgetMs, planTaskDoD, planTaskGit, planTaskGraderBudgetMs, planTaskProducerTier, planTaskVerificationID,
   planTreeKey, slotVerdictOf, type PlanTaskVerifierDeps,
 } from "../../src/verify/plan-task";
 
@@ -132,15 +133,33 @@ function harness(opts: { prepared?: PreparedVerification | (() => PreparedVerifi
       if (a === "rev-parse --show-toplevel") return { code: 0, stdout: `${slotPath}\n`, stderr: "" };
       return { code: 128, stdout: "", stderr: `unexpected git ${a}` };
     },
-    orchestratorOf: () => opts.orchestrator === undefined ? "orch-1" : opts.orchestrator,
     exemptions,
     perimeterPlanned: () => opts.perimeterPlanned ?? false,
     sleep: async (ms) => { h.sleeps.push(ms); },
     now: () => 1_000,
     log: (message) => { h.logs.push(message); },
   };
+  // QA-5.1-6: the runtime hands the plan's orchestrator to every hook; the harness plays the runtime (null: unknown).
+  orchestrators.set(h.deps, { orchestratorSessionID: opts.orchestrator === undefined ? "orch-1" : opts.orchestrator ?? "" });
   // The harness never touches acceptMock: each test owns its implementations (persistent and `Once`), unaltered.
   return h;
+}
+
+/** The orchestrator the runtime would pass with each hook of a harness's verifier. */
+const orchestrators = new WeakMap<PlanTaskVerifierDeps, PlanTaskContext>();
+
+/** The verifier under test, called as the runtime calls it: each hook gets the harness's context unless the test passes one. */
+function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVerifier {
+  const v = createRawPlanTaskVerifier(deps);
+  const ctx = (given: PlanTaskContext | undefined): PlanTaskContext => given ?? orchestrators.get(deps) ?? { orchestratorSessionID: "orch-1" };
+  return {
+    begin: (t, s, a, c) => v.begin?.(t, s, a, ctx(c)),
+    observe: (t, s, a, f, c) => v.observe?.(t, s, a, f, ctx(c)),
+    verify: (t, s, a, c) => v.verify(t, s, a, ctx(c)),
+    forget: (planId, taskId, n) => v.forget?.(planId, taskId, n),
+    dispose: () => v.dispose?.() ?? Promise.resolve(),
+    get disposing() { return v.disposing; },
+  };
 }
 
 /** begin (after the reset), observe (before the router's commit), the router's commit and switch, observe again, verify. */
@@ -238,6 +257,59 @@ describe("plan-task verifier (D8)", () => {
     expect(planTaskChecksBudgetMs(900_000)).toBe(900_000);
     expect(planTaskGraderBudgetMs(0, "heavy", 300_000)).toBe(360_000);
     expect(planTaskGraderBudgetMs(1_000_000, "heavy", 300_000)).toBe(1_000_000);
+  });
+
+  it("QA-5.1-3: a progress-note final text of the child is incomplete under the REAL gate, never PASS", async () => {
+    const real = await vi.importActual<typeof import("../../src/verify/gate")>("../../src/verify/gate");
+    acceptMock.mockImplementation(real.accept);
+    const h = harness();
+    const graded: string[] = [];
+    // A grader that would pass anything: without the return contract the progress note is graded and passes.
+    h.deps.buildGateDeps = ((...args: unknown[]) => {
+      h.gateDepsCalls.push(args);
+      return {
+        deterministic: {},
+        checker: {
+          ladder: ["fast", "medium", "heavy"], minGraderTier: null,
+          budgetSnapshot: () => ({ tracked: false, stopped: false, usedUp: false }),
+          dispatchGrader: async (req: { tier: string }) => { graded.push(req.tier); return { sessionID: "grader-1", text: '{"pass": true, "reasons": ["looks done"]}' }; },
+        },
+      } as unknown as GateDeps;
+    }) as unknown as PlanTaskVerifierDeps["buildGateDeps"];
+    const t = task({ text: "Explain the thing.\n[acceptance]\ncriteria: the docs explain it\n[/acceptance]" });
+    const v = createPlanTaskVerifier(h.deps);
+    const a = attempt();
+    await v.begin?.(t, slot(), a);
+    h.git.head = CANDIDATE;
+    h.git.branch = t.branch ?? "";
+    // A progress note by the checker's definition (checker.ts isProgressNote: no contract marker, the final sentence a
+    // first-person announcement of finishing or continuing). The role-dispatch fixture of verify.criteria.test.ts.
+    const note = "Edited src/a.ts. I'll finish the tests next.";
+    const checker = await import("../../src/verify/checker");
+    expect(checker.isProgressNote(note)).toBe(true);
+    await v.observe?.(t, slot(), a, note);
+    const result = await v.verify(t, slot(), a);
+    expect(artefactOf(0).returnContract).toBe(true);
+    expect(artefactOf(0).finalReturnText).toBe(note);
+    expect(result.verdict).not.toBe("pass");
+    expect(result.verdict).toBe("unverifiable");
+    expect(result.findings).toMatch(/^incomplete: the delegate returned a progress note/);
+    // Incomplete before any grader ran.
+    expect(graded).toEqual([]);
+    // Parity with a role dispatch: the same gate on the same artefact, as index.ts builds it for a role (returnContract).
+    const dispatch = await real.accept({ dod: delegationOf(0).dod, trivial: false, mode: "modeA" }, artefactOf(0), h.deps.buildGateDeps(
+      "orch-1", new Set(), prepared(), { signal: new AbortController().signal } as never, false, "orch-1"));
+    expect(dispatch.verdict.reasons).toEqual([checker.INCOMPLETE_REASON]);
+    expect(graded).toEqual([]);
+    // "Now I'll run the tests" is no progress note for any producer (a dispatch grades it too): parity, not a plan-task gap.
+    expect(checker.isProgressNote("Now I'll run the tests")).toBe(false);
+    // The router's own commit description (no child text) is not a child return: no contract.
+    acceptMock.mockClear();
+    const v2 = createPlanTaskVerifier(h.deps);
+    await v2.begin?.(t, slot(), a);
+    await v2.observe?.(t, slot(), a);
+    await v2.verify(t, slot(), a);
+    expect(artefactOf(0).returnContract).toBeUndefined();
   });
 });
 
@@ -747,10 +819,111 @@ describe("verifier arms", () => {
     }
   });
 
-  it("an orchestrator lookup that throws reads as unknown (fail closed)", async () => {
+  it("QA-5.1-6: the orchestrator is the one the runtime passes; plan-task has no lookup or discovery of its own", async () => {
+    acceptMock.mockImplementation(async () => pass("checker"));
     const h = harness();
-    h.deps.orchestratorOf = () => { throw new Error("ledger locked"); };
-    expect((await runAttempt(h)).findings).toMatch(/orchestrator of plan p1 could not be read/);
+    const gitCalls: string[] = [];
+    const answer = h.deps.git;
+    h.deps.git = async (args, cwd, ms) => { gitCalls.push(args.join(" ")); return answer(args, cwd, ms); };
+    const t = task({ text: "x\n[acceptance]\ncriteria: works\n[/acceptance]" });
+    const ctx: PlanTaskContext = { orchestratorSessionID: "orch-passed" };
+    const v = createRawPlanTaskVerifier(h.deps);
+    await v.begin?.(t, slot(), attempt(), ctx);
+    h.git.head = CANDIDATE;
+    h.git.branch = t.branch ?? "";
+    await v.observe?.(t, slot(), attempt(), undefined, ctx);
+    expect((await v.verify(t, slot(), attempt(), ctx)).verdict).toBe("pass");
+    expect(h.gateDepsCalls[0]![0]).toBe("orch-passed");
+    expect(h.gateDepsCalls[0]![5]).toBe("orch-passed");
+    expect(h.deps.beginVerificationBounded).toHaveBeenCalledWith(h.deps.changedFileStore, planTaskVerificationID("orch-passed", "p1", "t1", 1), slotPath, expect.anything());
+    // No toplevel discovery of its own (the restart fallback's slot toplevel is not reached on this path).
+    expect(gitCalls.some((a) => a.includes("--show-toplevel"))).toBe(false);
+    // Without a passed orchestrator the verifier fails closed; it never looks one up.
+    const bare = createRawPlanTaskVerifier(h.deps);
+    await bare.begin?.(t, slot(), attempt());
+    await bare.observe?.(t, slot(), attempt());
+    expect((await bare.verify(t, slot(), attempt())).findings).toMatch(/orchestrator of plan p1 could not be read/);
+    // The module holds no orchestrator port, ledger store or executor-home discovery.
+    const source = readFileSync(fileURLToPath(new URL("../../src/verify/plan-task.ts", import.meta.url)), "utf8");
+    expect(source).not.toMatch(/createLedgerStore|resolveExecutorHome|executor\/ledger"|executor\/paths"|orchestratorOf|ledgerOrchestratorOf/);
+  });
+
+  it("QA-5.1-14: after an adopt the grader is parented to the NEW orchestrator; the attempt's id keeps the one of its begin", async () => {
+    acceptMock.mockImplementation(async () => pass("checker"));
+    const h = harness();
+    const t = task({ text: "x\n[acceptance]\ncriteria: works\n[/acceptance]" });
+    const v = createRawPlanTaskVerifier(h.deps);
+    const before: PlanTaskContext = { orchestratorSessionID: "orch-old" };
+    await v.begin?.(t, slot(), attempt(), before);
+    h.git.head = CANDIDATE;
+    h.git.branch = t.branch ?? "";
+    await v.observe?.(t, slot(), attempt(), "Done: implemented and documented.", before);
+    // The adopt: the runtime now reads the new orchestrator from its ledger and passes it with verify.
+    const result = await v.verify(t, slot(), attempt(), { orchestratorSessionID: "orch-new" });
+    expect(result.verdict).toBe("pass");
+    const [parent, , , , , creator] = h.gateDepsCalls[0]!;
+    expect(parent).toBe("orch-new");
+    expect(creator).toBe("orch-new");
+    expect(h.prepareCalls[0]![1]).toBe(planTaskVerificationID("orch-old", "p1", "t1", 1));
+  });
+
+  it("QA-5.1-4: dispose cuts a hanging verify at once: unverifiable, deadline and grader aborted, no verdict ingested", async () => {
+    let started!: () => void;
+    const running = new Promise<void>((resolve) => { started = resolve; });
+    acceptMock.mockImplementation(async () => {
+      const inFlight = h.gateDepsCalls[h.gateDepsCalls.length - 1]![1] as Set<string>;
+      inFlight.add("grader-hung");
+      started();
+      return new Promise<GateResult>(() => {});
+    });
+    const h = harness();
+    const t = task({ text: "x\n[acceptance]\ncriteria: works\n[/acceptance]" });
+    const v = createPlanTaskVerifier(h.deps);
+    await v.begin?.(t, slot(), attempt());
+    h.git.head = CANDIDATE;
+    h.git.branch = t.branch ?? "";
+    await v.observe?.(t, slot(), attempt());
+    const pending = v.verify(t, slot(), attempt());
+    await running;
+    expect(v.disposing).toBe(false);
+    const t0 = Date.now();
+    await v.dispose?.();
+    const result = await pending;
+    expect(Date.now() - t0).toBeLessThan(2_000);
+    expect(v.disposing).toBe(true);
+    expect(result.verdict).toBe("unverifiable");
+    expect(result.findings).toMatch(/the plugin is shutting down/);
+    expect(h.aborted).toEqual(["grader-hung"]);
+    expect((h.gateDepsCalls[0]![3] as { signal: AbortSignal }).signal.aborted).toBe(true);
+    expect(h.verdicts).toEqual([]);
+    // A verify after dispose is cut at once: nothing runs.
+    acceptMock.mockClear();
+    expect((await v.verify(t, slot(), attempt())).findings).toMatch(/shutting down/);
+    expect(acceptMock).not.toHaveBeenCalled();
+    await v.dispose?.();
+  });
+
+  it("QA-5.1-4: dispose cancels a backoff sleep; the transient result is never re-run nor ingested", async () => {
+    acceptMock.mockImplementation(async () => unverifiable("grader dispatch failed: 503"));
+    const h = harness();
+    let slept!: () => void;
+    const sleeping = new Promise<void>((resolve) => { slept = resolve; });
+    h.deps.sleep = (ms) => { h.sleeps.push(ms); slept(); return new Promise<void>(() => {}); };
+    const t = task({ text: "x\n[acceptance]\ncriteria: works\n[/acceptance]" });
+    const v = createPlanTaskVerifier(h.deps);
+    await v.begin?.(t, slot(), attempt());
+    h.git.head = CANDIDATE;
+    h.git.branch = t.branch ?? "";
+    await v.observe?.(t, slot(), attempt());
+    const pending = v.verify(t, slot(), attempt());
+    await sleeping;
+    await v.dispose?.();
+    const result = await pending;
+    expect(result.findings).toMatch(/the plugin is shutting down/);
+    expect(h.sleeps).toEqual([30_000]);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(acceptMock).toHaveBeenCalledTimes(1);
+    expect(h.verdicts).toEqual([]);
   });
 
   it("the default sleep and clock", async () => {
@@ -898,15 +1071,10 @@ describe("pure helpers", () => {
     expect(graderTierFor("fast", raised)).toBe("heavy");
   });
 
-  it("ledgerOrchestratorOf: no repository, and an unknown plan, read as unknown; planTaskGit runs hardened git", async () => {
-    expect(await ledgerOrchestratorOf(slotPath)("p1")).toBeNull();
-    const lookup = ledgerOrchestratorOf(slotPath);
-    expect(await lookup("p1")).toBeNull();
-    expect(await lookup("p2")).toBeNull();
+  it("planTaskGit runs hardened git", async () => {
     const repo = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-plan-task-repo-")));
     try {
       execFileSync("git", ["init", "-q"], { cwd: repo });
-      expect(await ledgerOrchestratorOf(repo)("p-unknown")).toBeNull();
       const inside = await planTaskGit()(["rev-parse", "--is-inside-work-tree"], repo, 10_000);
       expect(inside.code).toBe(0);
       expect(inside.stdout.trim()).toBe("true");
