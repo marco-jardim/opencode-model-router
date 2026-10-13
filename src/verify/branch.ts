@@ -33,12 +33,18 @@ export function describeBranch(state: BranchState): string {
   return `branch ${state.branch}`;
 }
 
+/**
+ * QA-SYNC1-17: the window of a gate re-run after a restart on the journaled dispatch-time head: it runs from the dispatch to the
+ * gate after the restart, not only the dispatch.
+ */
+export const AFTER_RESTART_WINDOW = "between the dispatch and the check after the restart";
+
 /** The gate's unverifiable reason for a switch (Artefact.branchSwitch); each side describes itself. */
 export function branchSwitchReason(
   root: string,
   before: BranchState,
   now: BranchState,
-  when: "during the dispatch" | "since the producer returned" | "since the attempt that introduced this acceptance",
+  when: "during the dispatch" | typeof AFTER_RESTART_WINDOW | "since the producer returned" | "since the attempt that introduced this acceptance",
 ): string {
   const verb = before.branch === null && now.branch === null ? "moved" : "switched";
   return `the working tree ${root} ${verb} from ${describeBranch(before)} to ${describeBranch(now)} ${when}; the checks would verify another branch`;
@@ -122,7 +128,7 @@ export function treeMoveReason(
   before: HeadState,
   now: HeadState,
   move: TreeMove,
-  when: "during the dispatch" | "since the producer returned",
+  when: "during the dispatch" | typeof AFTER_RESTART_WINDOW | "since the producer returned",
 ): string {
   switch (move.kind) {
     case "switched":

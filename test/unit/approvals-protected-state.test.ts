@@ -96,4 +96,30 @@ describe("protectedLocations: router state and executor directories", () => {
     const result = await inspectCandidate(lookalike, { executorHome: executorHomeOf(common) });
     expect(result).toEqual(expect.stringContaining("has no .git directory"));
   });
+
+  it("checks every ancestor named like the executor home within one shared deadline (QA-SYNC1-18)", async () => {
+    const base = tempBase();
+    const outer = mkdir(base, "a", EXECUTOR_HOME_DIRNAME);
+    const candidate = mkdir(outer, "b", EXECUTOR_HOME_DIRNAME, "repo");
+    // Each ancestor answers "no executor home" well within the bound; two of them in a row take longer than it.
+    const boundMs = 400;
+    const stepMs = 250;
+    const slowResolver = () =>
+      vi.fn((dir: string) => new Promise<string>((_resolve, reject) => {
+        setTimeout(() => reject(new Error(`no executor home for ${dir}`)), stepMs);
+      }));
+
+    // One such ancestor: its answer comes within the bound, and the .git check runs next.
+    const once = slowResolver();
+    expect(await inspectCandidate(outer, { executorHome: once, executorHomeBoundMs: boundMs }))
+      .toEqual(expect.stringContaining("has no .git directory"));
+    expect(once).toHaveBeenCalledTimes(1);
+
+    // Two: the second ancestor gets only what the first left of the same deadline, so the candidate is refused.
+    const twice = slowResolver();
+    expect(await inspectCandidate(candidate, { executorHome: twice, executorHomeBoundMs: boundMs }))
+      .toBe(`could not be checked against the executor home within ${String(boundMs)} ms (git did not answer in time)`);
+    expect(twice).toHaveBeenCalledTimes(2);
+    expect(twice.mock.calls.map(([dir]) => dir)).toEqual([path.dirname(path.dirname(candidate)), path.join(base, "a")]);
+  });
 });

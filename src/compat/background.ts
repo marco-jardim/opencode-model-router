@@ -202,13 +202,52 @@ export interface RestoredDispatch {
   cwd?: string;
   /** The work root the dispatch named (`root=`), when there was one. */
   workRoot?: string;
+  /**
+   * QA-SYNC1-13: the routed-role record of a role dispatch, as far as its gate needs it (the live record is in memory only).
+   * Absent on a tier dispatch, on an older record, and when the journaled snapshot is malformed.
+   */
+  routed?: RoutedRoleSnapshot;
+}
+
+/**
+ * QA-SYNC1-13: what a role dispatch's gate reads of its routed-role record (`RoleRouted`): the verification root, the parent
+ * (the role's read set), and whether the dispatch is a resume that carries an earlier attempt's acceptance, with the child.
+ */
+export interface RoutedRoleSnapshot {
+  readonly verifyRoot: string;
+  readonly parentSessionID: string;
+  readonly carried?: true;
+  readonly resumeID: string | null;
+}
+
+const ROUTED_SNAPSHOT_KEYS: ReadonlySet<string> = new Set(["verifyRoot", "parentSessionID", "carried", "resumeID"]);
+
+/**
+ * QA-SYNC1-13: the journaled routed-role snapshot, validated strictly: a plain object with only the known keys, a non-empty
+ * `verifyRoot`, a string `parentSessionID`, `resumeID` a non-empty string or null, `carried` absent or `true` (and only with a
+ * `resumeID`). Anything else is malformed: undefined, and the record is dropped (never a partial or a guessed snapshot).
+ * Pure; never throws.
+ */
+export function routedRoleSnapshotOf(value: unknown): RoutedRoleSnapshot | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  if (Object.keys(value).some((key) => !ROUTED_SNAPSHOT_KEYS.has(key))) return undefined;
+  const verifyRoot: unknown = Reflect.get(value, "verifyRoot");
+  const parentSessionID: unknown = Reflect.get(value, "parentSessionID");
+  const resumeID: unknown = Reflect.get(value, "resumeID");
+  const carried: unknown = Reflect.get(value, "carried");
+  if (typeof verifyRoot !== "string" || verifyRoot === "") return undefined;
+  // An empty parent is the dispatch module's own "no orchestrator" value (roleReadSetFor reads it as no read set).
+  if (typeof parentSessionID !== "string") return undefined;
+  if (resumeID !== null && (typeof resumeID !== "string" || resumeID === "")) return undefined;
+  if (carried !== undefined && (carried !== true || resumeID === null)) return undefined;
+  return { verifyRoot, parentSessionID, resumeID, ...(carried === true ? { carried: true as const } : {}) };
 }
 
 /** QA-2.1-17: the `dispatch` field of a journaled record, keeping only string fields. Pure; never throws. */
 export function restoredDispatchOf(value: unknown): RestoredDispatch {
   if (value === null || typeof value !== "object") return {};
   const out: RestoredDispatch = {};
-  const read = (key: keyof RestoredDispatch): void => {
+  const read = (key: "prompt" | "description" | "subagentType" | "cwd" | "workRoot"): void => {
     const field: unknown = Reflect.get(value, key);
     if (typeof field === "string") out[key] = field;
   };
@@ -217,6 +256,9 @@ export function restoredDispatchOf(value: unknown): RestoredDispatch {
   read("subagentType");
   read("cwd");
   read("workRoot");
+  // QA-SYNC1-13: a malformed routed-role snapshot is dropped (the gate then runs without it, as on an older record).
+  const routed = routedRoleSnapshotOf(Reflect.get(value, "routed"));
+  if (routed !== undefined) out.routed = routed;
   return out;
 }
 

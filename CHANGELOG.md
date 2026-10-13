@@ -28,19 +28,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   results under another holder's edit are omitted, and `router_run` annotates or refuses a run on a leased target.
 - **OpenCode v2: restart recovery.** In-flight dispatches, held results and pending verifications are journaled in
   `pending.jsonl` in the per-user state directory (`~/.local/state/opencode-model-router`, or
-  `$XDG_STATE_HOME/opencode-model-router` when set, outside Windows), never in the temp directory. After a restart the
-  router recovers a dispatch whose child finished, re-posts a verdict that was reached but not delivered, and keeps
-  posted results hidden. A restored pending verification keeps its cross-repo checks: the branch and HEAD recorded at
-  return, the unobservable writers and the check placements of a deferred dispatch are journaled and checked again, and
-  a record with a malformed one is dropped. A dispatch's perimeter is not journaled, so `router_verify` on a restored
-  handle whose dispatch had one reports `UNVERIFIABLE` (`perimeter lost in restart`), never `PASS`. A journal that
-  vanishes under a running process is rewritten from memory. OpenCode v1 ignores every `routing.background.*` and
-  `routing.leases.*` key and logs one notice per process that names them.
+  `$XDG_STATE_HOME/opencode-model-router` when set, outside Windows), never in the temp directory. `/router approve`
+  refuses that directory and any repository inside it (a protected location). After a restart the router recovers a
+  dispatch whose child finished, re-posts a verdict that was reached but not delivered, and keeps posted results
+  hidden. A restored pending verification keeps its cross-repo checks: the branch and HEAD recorded at return, the
+  unobservable writers and the check placements of a deferred dispatch are journaled and checked again, and a record
+  with a malformed one is dropped. A dispatch's perimeter is not journaled, so `router_verify` on a restored handle
+  whose dispatch had one reports `UNVERIFIABLE` (`perimeter lost in restart`), never `PASS`. A held result's
+  dispatch-time head is journaled and checked again: a held result whose head or perimeter was lost settles
+  `UNVERIFIABLE`, and a restored held result settles in place. A journal that vanishes under a running process is
+  rewritten from memory. OpenCode v1 ignores every `routing.background.*` and `routing.leases.*` key and logs one
+  notice per process that names them.
 - **OpenCode v2: plan executor groundwork (not registered yet).** The `routing.executor.*` keys (`slotsDir`,
   `integrationChecks`, `phaseSuite`, `provision` and `python` are trusted keys: only the global override sets them), the
   `router_plan` tool and `/plan` command factories, and the executor instructions are in the code, with a user guide
-  ([docs/EXECUTOR.md](docs/EXECUTOR.md)). A later release registers them, so nothing is visible on a host yet. OpenCode
-  v1 ignores every `routing.executor.*` key and logs one notice per process that names them.
+  ([docs/EXECUTOR.md](docs/EXECUTOR.md)). A later release registers them, so nothing is visible on a host yet, except
+  that `/router approve` already refuses a repository's executor home (`<git common dir>\omr-executor`, with its plan
+  and slot-marker directories) and any repository inside it; that check runs git within one 15 s bound in all, and
+  refuses a candidate it could not finish in time. OpenCode v1 ignores every `routing.executor.*` key and logs one
+  notice per process that names them.
 
 ### Changed
 
@@ -51,11 +57,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **OpenCode v2: `/router approve` refuses the router's and the executor's state.** The router state directory that
-  holds `pending.jsonl` (`~/.local/state/opencode-model-router`, or `$XDG_STATE_HOME/opencode-model-router` when set,
-  outside Windows) is a protected location, and so is a repository's executor home (`<git common dir>\omr-executor`,
-  with its plan and slot-marker directories): approving one of them, or a repository inside one, is refused. OpenCode
-  v1 is unchanged.
 - **OpenCode v2: work leases no longer collide across linked worktrees.** Two child sessions that edit the same
   repo-relative path in two worktrees of one repository (`git worktree add`) are both allowed: an ordinary write lease
   is keyed by its checkout, not by the repository, and a write whose target the router cannot read is refused only while

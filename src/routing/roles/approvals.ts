@@ -584,6 +584,15 @@ export function sanitizeOrigin(raw: string | undefined): string {
 /** {@link inspectCandidate} results are cached this long per path (SD-P4-8). */
 export const INSPECT_CACHE_MS = 5_000;
 
+/**
+ * QA-SYNC1-18: the one deadline of the executor-home check of {@link inspectCandidate}, shared by every ancestor it checks (it
+ * was the executor's 15 s git bound per ancestor). Past it the candidate is refused.
+ */
+export const EXECUTOR_HOME_BOUND_MS = 15_000;
+
+/** The value of the executor-home deadline when it wins the race against a resolver. */
+const EXECUTOR_HOME_TIMED_OUT: unique symbol = Symbol("executor home deadline");
+
 /** What git says about a candidate main worktree (SD-P4-4, -8, -9). */
 export interface CandidateIdentity {
   /** Canonical path of the main worktree. */
@@ -633,6 +642,8 @@ export interface IdentityDeps {
    * throws when `dir` has none.
    */
   readonly executorHome?: (dir: string) => Promise<string>;
+  /** {@link inspectCandidate} only: the one deadline of the executor-home check, all ancestors; default {@link EXECUTOR_HOME_BOUND_MS}. */
+  readonly executorHomeBoundMs?: number;
 }
 
 /** Injectable I/O and configuration of {@link inspectCandidate}. */
@@ -730,32 +741,54 @@ function gitDirectoryProblem(real: string, deps: IdentityDeps): string | undefin
  * the executor's plan directories and slot markers) or lies inside one. The home is per repository, so it is not a fixed
  * {@link protectedLocations} entry: every ancestor named {@link EXECUTOR_HOME_DIRNAME} is checked against the home that
  * `resolveExecutorHome` gives for its parent, exactly as the executor resolves it. Git runs only for such an ancestor.
+ * QA-SYNC1-18: all of these ancestors share one deadline ({@link EXECUTOR_HOME_BOUND_MS}, from the first git call; the
+ * default resolver gets what is left of it as its own git bound). Past the deadline the candidate is refused: an ancestor
+ * that could not be checked is never taken as "not the executor home".
  */
 async function executorHomeProblem(text: string, canonical: string, deps: IdentityDeps): Promise<string | undefined> {
-  const resolveHome = deps.executorHome ?? ((dir: string) => resolveExecutorHome(dir));
+  const bound = Math.max(1, deps.executorHomeBoundMs ?? EXECUTOR_HOME_BOUND_MS);
+  let deadlineAt = 0;
+  let expired: Promise<typeof EXECUTOR_HOME_TIMED_OUT> | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const resolveHome = deps.executorHome
+    ?? ((dir: string) => resolveExecutorHome(dir, { timeoutMs: Math.max(1, deadlineAt - Date.now()) }));
+  const timedOut = `could not be checked against the executor home within ${String(bound)} ms (git did not answer in time)`;
   const name = pathKey(EXECUTOR_HOME_DIRNAME);
   const checked = new Set<string>();
-  for (const candidate of [text, canonical]) {
-    if (candidate === "" || !path.isAbsolute(candidate)) continue;
-    const self = cmpForm(candidate);
-    for (let dir = path.resolve(candidate); ; dir = path.dirname(dir)) {
-      const form = cmpForm(dir);
-      if (pathKey(path.basename(dir)) === name && !checked.has(form)) {
-        checked.add(form);
-        let home: string | undefined;
-        try {
-          home = await resolveHome(path.dirname(dir));
-        } catch {
-          home = undefined;
+  try {
+    for (const candidate of [text, canonical]) {
+      if (candidate === "" || !path.isAbsolute(candidate)) continue;
+      const self = cmpForm(candidate);
+      for (let dir = path.resolve(candidate); ; dir = path.dirname(dir)) {
+        const form = cmpForm(dir);
+        if (pathKey(path.basename(dir)) === name && !checked.has(form)) {
+          checked.add(form);
+          if (expired === undefined) {
+            // The one deadline, started at the first git call and raced by every ancestor after it.
+            deadlineAt = Date.now() + bound;
+            expired = new Promise<typeof EXECUTOR_HOME_TIMED_OUT>((resolve) => {
+              timer = setTimeout(() => resolve(EXECUTOR_HOME_TIMED_OUT), bound);
+            });
+          }
+          let home: string | typeof EXECUTOR_HOME_TIMED_OUT | undefined;
+          try {
+            home = await Promise.race([resolveHome(path.dirname(dir)), expired]);
+          } catch {
+            // A resolver that failed at the deadline (the default one's git bound is what is left of it) did not answer.
+            home = Date.now() >= deadlineAt ? EXECUTOR_HOME_TIMED_OUT : undefined;
+          }
+          if (home === EXECUTOR_HOME_TIMED_OUT) return timedOut;
+          if (home !== undefined && [cmpForm(home), cmpForm(realOrSelf(home))].some((h) => h === form || h === cmpForm(realOrSelf(dir)))) {
+            return form === self ? `is the executor home (${home})` : `is inside the executor home (${home})`;
+          }
         }
-        if (home !== undefined && [cmpForm(home), cmpForm(realOrSelf(home))].some((h) => h === form || h === cmpForm(realOrSelf(dir)))) {
-          return form === self ? `is the executor home (${home})` : `is inside the executor home (${home})`;
-        }
+        if (path.dirname(dir) === dir) break;
       }
-      if (path.dirname(dir) === dir) break;
     }
+    return undefined;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
-  return undefined;
 }
 
 /** `routing.repoExclude` pattern matching `p` (as given and, on win32, with native separators), or undefined. */
@@ -807,10 +840,11 @@ async function inspectGit(real: string, deps: IdentityDeps, adm: AdmissionModule
 
 /**
  * What git says about the candidate `text` (SD-P4-4, -8, -9): a problem phrase (to follow the path, as in "D:\x <problem>"), or
- * the identity of its canonical main worktree. Before any git call: {@link rootTextProblem} (admission.ts) on the text and on
- * the canonical form, `routing.repoExclude` on both, {@link protectedProblem}, the executor home (`executorHomeProblem`, git only
- * for an ancestor named like the executor home), and `<canonical>\.git` must be a local directory
- * (`lstat`: not a link, not a gitfile). Then hardened, bounded git: the canonical form must be the top level, its canonical common
+ * the identity of its canonical main worktree. In this order: {@link rootTextProblem} (admission.ts) on the text and on the
+ * canonical form, `routing.repoExclude` on both and {@link protectedProblem}, all without git; then the executor home
+ * (`executorHomeProblem`), which runs git only for an ancestor named like the executor home, every such ancestor within one
+ * shared {@link EXECUTOR_HOME_BOUND_MS} deadline; then, without git, `<canonical>\.git` must be a local directory (`lstat`: not
+ * a link, not a gitfile). Then hardened, bounded git: the canonical form must be the top level, its canonical common
  * dir must be `<canonical>\.git`, and it must have at least one commit. The git part is cached {@link INSPECT_CACHE_MS} per
  * canonical path (`deps.fresh` skips the cached result); the checks before it run every time. Never throws.
  */

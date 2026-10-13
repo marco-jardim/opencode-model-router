@@ -2324,7 +2324,8 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
         ...(rec.unattributedWriters !== undefined ? { unattributedWriters: [...rec.unattributedWriters] } : {}),
         ...(rec.placements !== undefined ? { placements: rec.placements.map((p) => (p === undefined ? null : { ...p })) } : {}),
         ...(rec.perimeter !== undefined || rec.perimeterLost || rec.heldPerimeter ? { hadPerimeter: true } : {}),
-        // QA-SYNC1-3: a held gate's dispatch-time head is never journaled either: only the fact that it had one.
+        // QA-SYNC1-3: a held gate's dispatch-time head is journaled as plain data, with the fact that it had one; a record
+        // that had a head but carries no value restores as head-lost.
         ...(rec.heldHead || rec.headLost || rec.dispatchHead !== undefined ? { hadHead: true } : {}),
         ...(rec.dispatchHead !== undefined ? { dispatchHead: { ...rec.dispatchHead } } : {}),
     };

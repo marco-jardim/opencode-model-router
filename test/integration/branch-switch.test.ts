@@ -272,6 +272,14 @@ describe("a branch switch is decided from the head state, before the commit diff
       expect(await run(checkout, true)).toMatch(DURING);
     }, 60_000);
 
+    // QA-SYNC1-17 (live-path control): the live head keeps the "during the dispatch" wording; only a head restored after a
+    // restart names the window up to the check after the restart (test/integration/v2-background-restart.test.ts).
+    it("QA-SYNC1-17 control: a switch read against the live dispatch head keeps the live wording", async () => {
+      const out = await run(checkout);
+      expect(out).toMatch(DURING);
+      expect(out).not.toContain("between the dispatch and the check after the restart");
+    }, 60_000);
+
     // B5
     it("a round trip (checkout -b feat, commit, checkout back) during the dispatch: unverifiable, by the reflog", async () => {
       const out = await run(roundTrip);

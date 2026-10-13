@@ -13,6 +13,8 @@
  *   nobody re-stamps goes stale (a crashed owner whose pid was reused never blocks recovery).
  * - DF-1-10: a session a live sibling instance of this process owns (another booted location: another module copy, its fresh
  *   beat file in `pending.instances`) is never adopted nor settled `lost in restart`; a dead sibling (stale beat) still is.
+ * - QA-SYNC1-13: a restored held role dispatch gets its journaled routed-role snapshot back (placements, never the tier refusal).
+ * - QA-SYNC1-17: a branch switch seen on a restored head names the window up to the check after the restart.
  */
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
@@ -21,6 +23,7 @@ import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ADOPTION_RETRY_MS } from "../../src/compat/background";
 import { processToken } from "../../src/compat/v2-hooks";
+import { AFTER_RESTART_WINDOW } from "../../src/verify/branch";
 import { CLAIM_STALE_MS, HEAD_LOST_REASON, PENDING_INSTANCES_DIRNAME, PERIMETER_LOST_REASON, unattributedRisk } from "../../src/verify/pending";
 import { bootBgHost, restoreEnv, type BgHost, type NativeSubagentStub, type SyntheticCall } from "../helpers/v2-bg-host";
 
@@ -179,11 +182,77 @@ describe("QA-SYNC1-3: a restored held entry is never re-gated with fewer checks 
     expect(posts).toHaveLength(1);
     expect(posts[0]?.text).toContain("I wrote src/c.ts");
     // The branch check ran on the restored head (its reason), instead of being skipped or replaced by "lost in restart".
-    expect(posts[0]?.text).toContain("during the dispatch");
+    // QA-SYNC1-17: the window runs from the dispatch to the gate after the restart, and the reason says so.
+    expect(posts[0]?.text).toContain(AFTER_RESTART_WINDOW);
     // A restored held entry settles in place: never re-deferred (a new unattributed handle) by the restarted process.
     expect(posts[0]?.text).not.toContain("deferred to router_verify");
     expect(posts[0]?.text).not.toContain(HEAD_LOST_REASON);
     expect(posts[0]?.text).not.toContain("verification data lost in restart");
+    expect(posts[0]?.text).not.toContain("PASS");
+  }, 60_000);
+
+  it("QA-SYNC1-13: a restored held role dispatch with a per-check cwd= inside its root is placed there, never refused as a tier dispatch", async () => {
+    const handle = `vrf_${"7".repeat(24)}`;
+    const callID = "call-sync1-routed";
+    const workRoot = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-sync1-r-")));
+    execFileSync("git", ["init", "-q"], { cwd: workRoot }); // a work tree the gate can prepare its verification in
+    // The checked file exists only under the work root's `sub`: the check passes only when placed there.
+    mkdirSync(join(workRoot, "sub"), { recursive: true });
+    writeFileSync(join(workRoot, "sub", "inner.ts"), "export {};\n", "utf-8");
+    const rolePrompt = "write sub/inner.ts\n[acceptance]\ncheck: fileExists path=inner.ts cwd=sub\n[/acceptance]";
+    const h = await boot([
+      heldEntry(handle, callID, { cwd: workRoot, description: "write r" }),
+      {
+        v: 1, kind: "hold", handle, parent: ORCH, child: CHILD, callID, label: 'fast "write r"',
+        dispatch: {
+          prompt: rolePrompt, description: "write r", subagentType: "fast", cwd: workRoot, workRoot,
+          // The routed-role snapshot the dispatch journaled (the live record died with the old process).
+          routed: { verifyRoot: workRoot, parentSessionID: ORCH, resumeID: null },
+        },
+        at: Date.now(),
+      },
+      { v: 1, kind: "hold-text", handle, text: "I wrote sub/inner.ts", status: "succeeded", at: Date.now() },
+    ]);
+    adoptOrchestrator(h);
+    await h.settled();
+    const posts = verdictPosts(h);
+    expect(posts).toHaveLength(1);
+    expect(posts[0]?.text).toContain("I wrote sub/inner.ts");
+    // Without the snapshot the restored gate reads a tier dispatch and refuses the per-check cwd= (OD1=B).
+    expect(posts[0]?.text).not.toContain("honoured only in roles mode");
+    expect(posts[0]?.text).not.toContain("is outside the work root");
+    expect(posts[0]?.text).not.toContain("verification data lost in restart");
+    // Placed in the role's root: `sub/inner.ts` exists there, so the check passes.
+    expect(posts[0]?.text).toContain("PASS");
+    expect(posts[0]?.text).not.toContain("UNVERIFIABLE");
+  }, 60_000);
+
+  it("QA-SYNC1-13 control: a malformed routed-role snapshot is dropped; the restored gate refuses the per-check cwd= as before", async () => {
+    const handle = `vrf_${"6".repeat(24)}`;
+    const callID = "call-sync1-routed-malformed";
+    const workRoot = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-sync1-m-")));
+    execFileSync("git", ["init", "-q"], { cwd: workRoot });
+    mkdirSync(join(workRoot, "sub"), { recursive: true });
+    writeFileSync(join(workRoot, "sub", "inner.ts"), "export {};\n", "utf-8");
+    const rolePrompt = "write sub/inner.ts\n[acceptance]\ncheck: fileExists path=inner.ts cwd=sub\n[/acceptance]";
+    const h = await boot([
+      heldEntry(handle, callID, { cwd: workRoot, description: "write m" }),
+      {
+        v: 1, kind: "hold", handle, parent: ORCH, child: CHILD, callID, label: 'fast "write m"',
+        dispatch: {
+          prompt: rolePrompt, description: "write m", subagentType: "fast", cwd: workRoot, workRoot,
+          // `carried` without a resumed child is malformed (and so is an unknown key): the snapshot is dropped.
+          routed: { verifyRoot: workRoot, parentSessionID: ORCH, resumeID: null, carried: true },
+        },
+        at: Date.now(),
+      },
+      { v: 1, kind: "hold-text", handle, text: "I wrote sub/inner.ts", status: "succeeded", at: Date.now() },
+    ]);
+    adoptOrchestrator(h);
+    await h.settled();
+    const posts = verdictPosts(h);
+    expect(posts).toHaveLength(1);
+    expect(posts[0]?.text).toContain("honoured only in roles mode");
     expect(posts[0]?.text).not.toContain("PASS");
   }, 60_000);
 });

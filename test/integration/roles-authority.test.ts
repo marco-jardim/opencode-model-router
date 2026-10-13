@@ -197,10 +197,16 @@ function catalogOf(cfg: RouterConfig) {
   });
 }
 
-async function plugin(directory: string, onIngest?: (ingest: { onVerdict: (...a: any[]) => unknown }) => void): Promise<Record<string, any>> {
+async function plugin(
+  directory: string,
+  onIngest?: (ingest: { onVerdict: (...a: any[]) => unknown }) => void,
+  // QA-SYNC1-14: test seams on the plugin input (for example `routerTaskArgsBounds`).
+  extraInput: Record<string, unknown> = {},
+): Promise<Record<string, any>> {
   const hooks = await ModelRouterPlugin({
     directory, worktree: directory, routerHost: "v2",
     ...(onIngest === undefined ? {} : { routerOnIngest: onIngest }),
+    ...extraInput,
     client: {
       session: { get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id, ...(path.id === "root" ? {} : { parentID: "root" }) } }) },
       app: { log: vi.fn(async () => ({})) },
@@ -1347,7 +1353,7 @@ describe("work roots (I3, P-13): the dispatch's own worktree only", () => {
     /** Paths as one spelling (separators, case), sorted, for comparison. */
     const norm = (paths: readonly string[] | undefined): string[] => (paths ?? []).map((p) => p.replace(/\\/g, "/").toLowerCase()).sort();
     /** A repo with one worktree, the plugin (verdicts recorded) and a started v2 host. */
-    const setup = async () => {
+    const setup = async (extraInput: Record<string, unknown> = {}) => {
       wired.calls.length = 0;
       const base = temp("omr-g21-repo-");
       const main = join(base, "main");
@@ -1363,7 +1369,7 @@ describe("work roots (I3, P-13): the dispatch's own worktree only", () => {
       const hooks = await plugin(main, (ingest) => {
         const on = ingest.onVerdict.bind(ingest);
         ingest.onVerdict = (child: string, verdict: string, ...rest: unknown[]) => { verdicts.push([child, verdict]); return on(child, verdict, ...rest); };
-      });
+      }, extraInput);
       const sessions: Sessions = {};
       const v2 = host(main, cfg, sessions);
       await v2.start(hooks, { listWorktrees: gitWorktreeList });
@@ -1509,6 +1515,83 @@ describe("work roots (I3, P-13): the dispatch's own worktree only", () => {
       expect(api.verificationFor("ff1")?.mode).toBe("required");
       // Control: the same block without the per-check cwd= is deferred (testsPass without VERIFY).
       expect(api.verificationFor("ff2")?.mode).toBe("deferred");
+    }, 60_000);
+
+    it.skipIf(!hasGit())("(g) QA-SYNC1-12: verificationFor classifies a carried resume as required (held), never deferred", async () => {
+      const { wt1, sessions, v2, finish, resume, hooks } = await setup();
+      // testsPass without VERIFY: deferred by default.
+      const prompt = `[route class=implement risk=low scope=single needs=edit root=${wt1}]\nWrite the generator\n[acceptance]\ncheck: testsPass\n[/acceptance]`;
+      const first = await dispatch(v2, sessions, "fg1", "kg", "implementer", prompt, wt1, "generator");
+      expect(await catalog(v2, "kg", "implementer")).toContain("edit");
+      const api = finishApiOf(hooks);
+      // Control: a fresh role dispatch with the same block stays deferred.
+      expect(sync1RoutedRoleOf("fg1")?.carried).toBeUndefined();
+      expect(api.verificationFor("fg1")?.mode).toBe("deferred");
+      await finish("fg1", "kg", first, [join(wt1, "gen.ts")], "DONE: wrote gen.ts:1");
+      // The resume names no block of its own: it carries attempt 1's acceptance, so finishDispatch gates it at once.
+      await resume("fg2", "kg", "continue");
+      expect(sync1RoutedRoleOf("fg2")?.carried).toBe(true);
+      expect(api.verificationFor("fg2")?.mode).toBe("required");
+    }, 60_000);
+
+    /** QA-SYNC1-14: a tier `task` call whose arguments the legacy before-hook remembers (what it decides after that does not matter). */
+    const rememberTier = async (hooks: Record<string, any>, callID: string): Promise<void> => {
+      const args = { subagent_type: "fast", description: `tier ${callID}`, prompt: `Write file ${callID}` };
+      await Promise.resolve(hooks["tool.execute.before"]({ tool: "task", sessionID: "other", callID, args }, { args })).catch(() => undefined);
+    };
+
+    it.skipIf(!hasGit())("(h) QA-SYNC1-14: a settled finish forgets the call's routed copy; a held call survives the FIFO bound", async () => {
+      // The bounds are injected small (production: 1000 and 10 000), so a few calls pass the regular bound.
+      const { wt1, sessions, v2, finish, hooks } = await setup({ routerTaskArgsBounds: { max: 5, hard: 20 } });
+      const prompt = `[route class=implement risk=low scope=single needs=edit root=${wt1}]\nVERIFY: required\nWrite the generator\n[acceptance]\ncheck: testsPass\n[/acceptance]`;
+      const first = await dispatch(v2, sessions, "fh1", "kh", "implementer", prompt, wt1, "generator");
+      expect(await catalog(v2, "kh", "implementer")).toContain("edit");
+      const api = finishApiOf(hooks);
+      // A held call: its slot is reserved (as the adapter does at the background acknowledgement), then the adapter forgets its record.
+      const handle = api.reserveHeld("root", "fh1");
+      expect(handle).toBeDefined();
+      await acknowledge(v2, "fh1", "kh", first);
+      expect(sync1RoutedRoleOf("fh1")).toBeUndefined();
+      // 10 later task calls, twice the regular bound: the FIFO bound evicts the oldest, never the held call (the oldest of all).
+      for (let i = 0; i < 10; i++) await rememberTier(hooks, `fill-${i}`);
+      expect(api.verificationFor("fill-0")).toBeUndefined(); // the bound did evict
+      expect(api.verificationFor("fill-9")).toBeDefined();
+      expect(api.verificationFor("fh1")?.mode).toBe("required");
+      expect(api.dispatchOf("fh1")?.routed?.verifyRoot).toBe(wt1);
+      // A foreground role dispatch's finish settles: its arguments and routed copy are forgotten with it.
+      const fresh = `[route class=implement risk=low scope=single needs=edit root=${wt1}]\nWrite the parser\n[acceptance]\ncheck: testsPass\n[/acceptance]`;
+      const second = await dispatch(v2, sessions, "fh2", "kh2", "implementer", fresh, wt1, "parser");
+      expect(api.verificationFor("fh2")).toBeDefined();
+      await finish("fh2", "kh2", second, [join(wt1, "parse.ts")], "DONE: wrote parse.ts:1");
+      expect(sync1RoutedRoleOf("fh2")).toBeUndefined();
+      expect(api.verificationFor("fh2")).toBeUndefined();
+      expect(api.dispatchOf("fh2")).toBeUndefined();
+      // The held call's finish settles: its routed copy goes too.
+      const done = await api.finish({
+        callID: "fh1", parentSessionID: "root", childSessionID: "kh", outputText: "DONE: wrote gen.ts:1",
+        status: "succeeded", mode: "background", endedAt: Date.now(), heldHandle: handle!,
+      });
+      expect(done.verification).toEqual({ kind: "held", handle });
+      await api.idle();
+      expect(api.verificationFor("fh1")).toBeUndefined();
+      expect(api.dispatchOf("fh1")).toBeUndefined();
+    }, 60_000);
+
+    it.skipIf(!hasGit())("(i) QA-SYNC1-14: past the hard bound, the oldest background call is evicted too", async () => {
+      const { hooks } = await setup({ routerTaskArgsBounds: { max: 2, hard: 4 } });
+      const api = finishApiOf(hooks);
+      // Each call is an acknowledged background attempt: the adapter reads its dispatch (to journal it), which keeps it.
+      const background = async (callID: string): Promise<void> => {
+        await rememberTier(hooks, callID);
+        expect(api.dispatchOf(callID)).toBeDefined();
+      };
+      for (const callID of ["bg0", "bg1", "bg2", "bg3"]) await background(callID);
+      // Past the regular bound (4 > 2) but within the hard one: every background call is kept.
+      for (const callID of ["bg0", "bg1", "bg2", "bg3"]) expect(api.verificationFor(callID)).toBeDefined();
+      // The fifth passes the hard bound (5 > 4): the oldest background call goes, the rest stay.
+      await background("bg4");
+      expect(api.verificationFor("bg0")).toBeUndefined();
+      for (const callID of ["bg1", "bg2", "bg3", "bg4"]) expect(api.verificationFor(callID)).toBeDefined();
     }, 60_000);
   });
 });

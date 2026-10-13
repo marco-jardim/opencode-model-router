@@ -90,7 +90,7 @@ import { PERIMETER_MAX } from "./perimeter";
 import { defaultExternalLinks, pinTarget, type LinkPin } from "./pin";
 import { depthBelow, gitTopOf, perimeterKey } from "./git-top";
 import type { DispatchPerimeter, PerimeterEntry } from "./dispatch";
-import { branchSwitched, branchSwitchReason, branchUnconfirmedReason, treeMove, treeMoveReason } from "./branch";
+import { AFTER_RESTART_WINDOW, branchSwitched, branchSwitchReason, branchUnconfirmedReason, treeMove, treeMoveReason } from "./branch";
 import { readHead, readHeadState, readReflogWindow, type HeadState, type ReflogEntry } from "./head";
 import { captureReference, DEFAULT_CAPTURE_TIMEOUT_MS, gcStaleReferences, keepReferences, nodeReferenceFs, REF_DIR_PATTERN, serializedReferenceLinks, type DispatchReference } from "./reference";
 import { HEAD_LOST_REASON, PERIMETER_LOST_REASON, type PendingRecord } from "./pending";
@@ -2366,7 +2366,10 @@ export function createVerificationWiring(deps: {
     let headSwitch: string | undefined;
     let headRead = false;
     let gateHead: HeadState | undefined;
-    const baselineHead = store.baselineHead(id) ?? (restoredHead !== undefined ? Promise.resolve<HeadState>(restoredHead) : undefined);
+    const liveHead = store.baselineHead(id);
+    const baselineHead = liveHead ?? (restoredHead !== undefined ? Promise.resolve<HeadState>(restoredHead) : undefined);
+    // QA-SYNC1-17: a head restored from the journal spans the dispatch and the restart; the live wording stays unchanged.
+    const switchWindow = liveHead === undefined && restoredHead !== undefined ? AFTER_RESTART_WINDOW : "during the dispatch";
     if (baselineHead !== undefined) {
       const bound = deadline ? deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS) : GRADE_SNAPSHOT_TIMEOUT_MS;
       if (bound > 0 && deadline?.signal.aborted !== true) {
@@ -2406,7 +2409,7 @@ export function createVerificationWiring(deps: {
             const move = unreadWindow
               ? { kind: "rewritten" as const, detail: "the reflog entries could not be read" }
               : treeMove(startHead, nowHead, window);
-            if (move !== undefined) headSwitch = treeMoveReason(nowHead.root, startHead, nowHead, move, "during the dispatch");
+            if (move !== undefined) headSwitch = treeMoveReason(nowHead.root, startHead, nowHead, move, switchWindow);
           }
         }
       }

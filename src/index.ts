@@ -92,7 +92,7 @@ import { createPersister, nodePersistDeps, summarizeRoles } from "./routing/outc
 import { roleAgentSteps } from "./router/role-agents";
 import type { HostBudgetObservation } from "./compat/v2-hooks";
 import { ROUTER_TURN_STATE_ATTACH, TURN_STATE_ROOT, type TurnStateRegistry } from "./compat/turn-state";
-import { ADOPTION_REFUSED, ROUTER_FINISH_ATTACH, type AdoptedRecords, type AdoptionRefused, type FinishApi, type FinishAttach, type FinishInput, type FinishResult, type HeldSink, type InflightJournal, type LeaseGuard, type PersistedRecord, type RestoredDispatch } from "./compat/background";
+import { ADOPTION_REFUSED, ROUTER_FINISH_ATTACH, type AdoptedRecords, type AdoptionRefused, type FinishApi, type FinishAttach, type FinishInput, type FinishResult, type HeldSink, type InflightJournal, type LeaseGuard, type PersistedRecord, type RestoredDispatch, type RoutedRoleSnapshot } from "./compat/background";
 import type { DispatchDelta } from "./verify/dispatch";
 import { configAsWritten, configuredV2OnlyKeys, setConfigNoticeHost } from "./router/config";
 
@@ -2920,6 +2920,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       // we observe the finished task result and append a forcing note if it is not
       // accepted; we cannot retry a task call that already finished).
       await finishDispatch(input, output, unbannered);
+      // QA-SYNC1-14: a foreground finish settled here; a background call's arguments stay for its finish (child end).
+      if (input?.tool === "task" && typeof input.callID === "string" && !backgroundCalls.has(input.callID)) forgetTaskArgs(input.callID);
     },
 
     // -----------------------------------------------------------------------
@@ -2976,6 +2978,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             pending.forgetSession(id);
             // QA-2.1-13 (v2 only): its held texts go, and its adoption claim is given back.
             forgetHeldTexts(id);
+            // QA-SYNC1-14: its calls' arguments and routed-role copies go too.
+            forgetSessionTaskArgs(id);
             releasePendingClaimOf(id);
           }
         } catch {
@@ -3893,8 +3897,20 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     return outcome;
   }
 
-  /** Phase 2.1.4.a (v2 only): the `task` arguments of a call in flight, kept for FinishApi.verificationFor / finish. */
-  const MAX_TASK_ARGS = 1000;
+  /**
+   * Phase 2.1.4.a (v2 only): the `task` arguments of a call in flight, kept for FinishApi.verificationFor / finish. QA-SYNC1-14:
+   * forgotten when the call's finish settles (foreground, held, deferred or immediate) and with its parent session.
+   */
+  /**
+   * QA-SYNC1-14 (test seam): `routerTaskArgsBounds` overrides the two bounds below (positive integers, `hard` ≥ `max`); anything
+   * else keeps the production defaults.
+   */
+  const taskArgsBounds = (ctx as RouterPluginInput & { routerTaskArgsBounds?: { max?: number; hard?: number } }).routerTaskArgsBounds;
+  const boundOr = (value: number | undefined, fallback: number): number =>
+    typeof value === "number" && Number.isInteger(value) && value > 0 ? value : fallback;
+  const MAX_TASK_ARGS = boundOr(taskArgsBounds?.max, 1000);
+  /** QA-SYNC1-14: the bound past which even a call with a background record is evicted (= MAX_HOLDS_GLOBAL, background.ts). */
+  const MAX_TASK_ARGS_HARD = Math.max(MAX_TASK_ARGS, boundOr(taskArgsBounds?.hard, 10_000));
   const taskArgsByCall = new Map<string, Record<string, unknown>>();
   /** QA-2.1-7: the parent session of a call in flight (same keys and bound), so captureDelta finds the dispatch record. */
   const taskParentByCall = new Map<string, string>();
@@ -3902,19 +3918,24 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
    * QA-SYNC1-1/-2: the routed-role record of a call in flight (same keys and bound), copied when its arguments are remembered.
    * The adapter forgets its own record once a background acknowledgement returns; the finish (child end) still needs it.
    */
-  const routedRoleByCall = new Map<string, NonNullable<ReturnType<typeof routedRoleOf>>>();
-  /** QA-SYNC1-1: the routed-role record of `callID`: the dispatch module's while it keeps it, else the copy kept until the finish. */
-  function routedRoleFor(callID: string): ReturnType<typeof routedRoleOf> {
+  const routedRoleByCall = new Map<string, RoutedRoleSnapshot>();
+  /**
+   * QA-SYNC1-1: the routed-role record of `callID`: the dispatch module's while it keeps it, else the copy kept until the finish.
+   * QA-SYNC1-13: after a restart, the snapshot a restored held entry journaled (finishRestored puts it in `routedRoleByCall`).
+   */
+  function routedRoleFor(callID: string): RoutedRoleSnapshot | undefined {
     return routedRoleOf(callID) ?? routedRoleByCall.get(callID);
   }
   /**
    * QA-SYNC1-6: finishDispatch verifies this dispatch at once, never deferred: a cwd outside the role's verification root, a refused
    * check placement, or (v2) a tier dispatch's per-check `cwd=` (OD1=B). The same rules as there; a failed read counts as at once.
+   * QA-SYNC1-12: a carried resume too (finishDispatch never defers it; its resumeID is known at dispatch).
    */
   function verifiedAtOnce(callID: string, args: Record<string, unknown>, dod: ReturnType<typeof buildDelegationDoD>): boolean {
     try {
       const routed = routedRoleFor(callID);
       if (routed === undefined) return ctx.routerHost === "v2" && tierCheckCwdRefusal(dod) !== undefined;
+      if (routed.carried === true) return true;
       const scope = verificationScopeOf(callID, args, dod);
       if (scope.outside) return true;
       return resolveCheckPlacements(dod, scope, { inReadSet: roleReadSetFor(routed) }).refused !== undefined;
@@ -3933,18 +3954,40 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     const routed = routedRoleOf(input.callID);
     if (routed === undefined) routedRoleByCall.delete(input.callID);
     else routedRoleByCall.set(input.callID, routed);
+    // QA-SYNC1-14: oldest first, but never a call that still has a held or in-flight background record (its finish needs the
+    // arguments and the routed copy), nor the call just remembered; those are bounded by the background bounds instead.
     while (taskArgsByCall.size > MAX_TASK_ARGS) {
-      const oldest = taskArgsByCall.keys().next();
-      if (oldest.done === true) break;
-      taskArgsByCall.delete(oldest.value);
-      taskParentByCall.delete(oldest.value);
-      routedRoleByCall.delete(oldest.value);
+      let oldest: string | undefined;
+      for (const key of taskArgsByCall.keys()) {
+        if (key !== input.callID && !backgroundCalls.has(key)) { oldest = key; break; }
+      }
+      // A hard ceiling still holds (= MAX_HOLDS_GLOBAL): past it the oldest background call goes too, as before.
+      if (oldest === undefined && taskArgsByCall.size > MAX_TASK_ARGS_HARD) {
+        for (const key of taskArgsByCall.keys()) {
+          if (key !== input.callID) { oldest = key; break; }
+        }
+        if (oldest !== undefined) backgroundCalls.delete(oldest);
+      }
+      if (oldest === undefined) break;
+      taskArgsByCall.delete(oldest);
+      taskParentByCall.delete(oldest);
+      routedRoleByCall.delete(oldest);
     }
   }
+  /**
+   * QA-SYNC1-14: the calls with a held or in-flight background record (the adapter reserved a held slot for them, or read their
+   * dispatch to journal an acknowledged background attempt); the FIFO bound above skips them. Forgotten with the call's arguments.
+   */
+  const backgroundCalls = new Set<string>();
   function forgetTaskArgs(callID: string): void {
     taskArgsByCall.delete(callID);
     taskParentByCall.delete(callID);
     routedRoleByCall.delete(callID);
+    backgroundCalls.delete(callID);
+  }
+  /** QA-SYNC1-14: a deleted session's calls are never finished; their arguments and routed copies go with it. */
+  function forgetSessionTaskArgs(sessionID: string): void {
+    for (const [callID, parent] of [...taskParentByCall]) if (parent === sessionID) forgetTaskArgs(callID);
   }
 
   // ---- Phase 2.1.4.a (v2 only): the finish API ------------------------------------------------------
@@ -4159,6 +4202,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     preClaim: HeldClaim | undefined,
   ): void {
     const settleHeld = (outcome: FinishOutcome): Promise<void> | undefined => {
+      // QA-SYNC1-14: the held finish settled; its call's arguments and routed-role copy are no longer needed.
+      forgetTaskArgs(fin.callID);
       const claim = preClaim ?? pending.markVerifying(fin.parentSessionID, handle);
       // QA-2.1-1: only a gate verdict is a verdict; none/deferred/skipped/error post UNVERIFIABLE with their reason.
       const held = heldOutcomeOf(outcome);
@@ -4227,6 +4272,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     const gateArgs = typeof args.cwd === "string" || entry.cwd === ctx.directory ? args : { ...args, cwd: entry.cwd };
     // QA-SYNC1-2: the journaled work root stands in for the routed-role record the restart lost.
     const workRoot = fin.restored?.workRoot;
+    // QA-SYNC1-13: so does the journaled routed-role snapshot (routedRoleFor reads it until the held finish settles): the gate
+    // places the checks in the role's root and applies the carried-resume and lineage rules, never the tier `cwd=` refusal.
+    const routedSnapshot = fin.restored?.routed;
+    if (routedSnapshot !== undefined && routedRoleFor(fin.callID) === undefined) routedRoleByCall.set(fin.callID, routedSnapshot);
     const writers = entry.unattributedWriters;
     const restoredHead = entry.dispatchHead;
     runHeldGate(fin, handle, { tool: "task", sessionID: fin.parentSessionID, callID: fin.callID, args: gateArgs }, scratch, {
@@ -4289,7 +4338,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     canHold(parentSessionID) {
       return pending.hasSlot(parentSessionID);
     },
-    reserveHeld(parentSessionID, _callID) {
+    reserveHeld(parentSessionID, callID) {
+      // QA-SYNC1-14: a held call keeps its arguments and routed copy until its finish settles.
+      if (taskArgsByCall.has(callID)) backgroundCalls.add(callID);
       return pending.reserveHandle(parentSessionID);
     },
     // QA-2.1-14: a held dispatch that ends without a registered entry (failed, interrupted, ack failed) frees its slot at once.
@@ -4322,6 +4373,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     dispatchOf(callID) {
       const args = taskArgsByCall.get(callID);
       if (args === undefined) return undefined;
+      // QA-SYNC1-14: the adapter reads the dispatch of an acknowledged background attempt; it keeps its arguments until its finish.
+      backgroundCalls.add(callID);
       const text = (value: unknown): string | undefined => (typeof value === "string" ? value : undefined);
       const prompt = text(args.prompt);
       const description = text(args.description);
@@ -4332,12 +4385,19 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       } catch (error) {
         logger.warn("[router] the work root of a dispatch could not be read", { callID, error: describeError(error) });
       }
+      // QA-SYNC1-13: the routed-role facts the gate reads, journaled so a restored held gate verifies it as a role dispatch.
+      const routedRole = routedRoleFor(callID);
+      const routed: RoutedRoleSnapshot | undefined = routedRole === undefined ? undefined : {
+        verifyRoot: routedRole.verifyRoot, parentSessionID: routedRole.parentSessionID, resumeID: routedRole.resumeID,
+        ...(routedRole.carried === true ? { carried: true as const } : {}),
+      };
       return {
         ...(prompt === undefined ? {} : { prompt }),
         ...(description === undefined ? {} : { description }),
         ...(subagentType === undefined ? {} : { subagentType }),
         cwd: text(args.cwd) ?? ctx.directory,
         ...(workRoot === undefined ? {} : { workRoot }),
+        ...(routed === undefined ? {} : { routed }),
       };
     },
     async finish(fin: FinishInput): Promise<FinishResult> {
