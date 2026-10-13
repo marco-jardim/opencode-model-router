@@ -1,9 +1,10 @@
 import { parseRouteLine } from "../routing/classify/route-line";
+import { displaySafe } from "../routing/roles/read-set";
 
 /** First characters of every router dispatch header (index.ts never adds a second one). */
 export const DISPATCH_HEADER_PREFIX = "[router] You are @";
 
-/** What index.ts puts between the header and the orchestrator's prompt. */
+/** What index.ts (tiers) and the role dispatch path put between a header and the orchestrator's prompt. */
 export const DISPATCH_HEADER_SEPARATOR = "\n\n---\n\n";
 
 /** The header's last paragraph: the end of a header whose separator is missing. */
@@ -25,19 +26,31 @@ const FALSE_REFUSAL_PARAGRAPH = "A hand-back with zero tool calls is recorded as
  * `root` (plan §2.2, T1.5.3a): the dispatch's work root — the route line's `root=`
  * (`routeLineRoot`) — named by the working-directory paragraph instead of the
  * project directory. Absent or empty: the header is byte-identical to before.
+ *
+ * Cross-repo (`docs/design/cross-repo.md` §5, P1.7), all optional and inert when absent or empty:
+ * `location` names the working directory's repository, branch and head; `workingSet` and `readParents` add one paragraph
+ * listing the session's repositories and where a role may read.
  */
 export function buildDispatchHeader(input: {
   tier: string;
   cap: number | "none";
   projectDirectory: string | undefined;
   root?: string | null;
+  location?: { readonly name: string; readonly branch: string | null; readonly head: string | null };
+  workingSet?: readonly { readonly name: string; readonly branch: string | null }[];
+  readParents?: readonly string[];
 }): string {
   const paragraphs = [
     `${DISPATCH_HEADER_PREFIX}${input.tier}. Execute this dispatch yourself; do not route it to another tier, and do not ask to be re-dispatched.`,
   ];
   const directory = input.root || input.projectDirectory;
   if (directory) {
-    paragraphs.push(`Working directory: ${directory}. You are already there — do not ask permission to read or write inside it.`);
+    paragraphs.push(...locationParagraphs(directory, {
+      location: input.location,
+      workingSet: input.workingSet,
+      readParents: input.readParents,
+      verb: "read or write",
+    }));
   }
   paragraphs.push(
     'Tool names mentioned in this dispatch are descriptive and vary by provider; your own tool schema is the authority on what you can do. Never refuse or hand back work because a named tool looks unfamiliar or missing — attempt it, and if you cannot finish, name the specific step that failed.',
@@ -50,6 +63,86 @@ export function buildDispatchHeader(input: {
     FALSE_REFUSAL_PARAGRAPH,
   );
   return paragraphs.join("\n\n");
+}
+
+type HeaderLocation = { readonly name: string; readonly branch: string | null; readonly head: string | null };
+type HeaderRepository = { readonly name: string; readonly branch: string | null };
+
+/**
+ * The working-directory paragraph and, with a working set or read parents, the repositories paragraph. Shared by the tier
+ * header and the role header; `verb` completes "do not ask permission to <verb> inside it". Callers escape what they pass.
+ */
+function locationParagraphs(
+  directory: string,
+  input: {
+    location?: HeaderLocation;
+    workingSet?: readonly HeaderRepository[];
+    readParents?: readonly string[];
+    verb: string;
+    /** A read-only role: the repositories paragraph carries no edit clause. Absent: the tier wording, byte-identical. */
+    readOnly?: boolean;
+  },
+): string[] {
+  const where = input.location === undefined
+    ? ""
+    : ` (repository ${input.location.name}, branch ${input.location.branch ?? "detached"}${input.location.head ? ` at ${input.location.head.slice(0, 7)}` : ""})`;
+  const paragraphs = [`Working directory: ${directory}${where}. You are already there — do not ask permission to ${input.verb} inside it.`];
+  const set = input.workingSet ?? [];
+  const parents = input.readParents ?? [];
+  if (set.length > 0 || parents.length > 0) {
+    const listed = set.length > 0
+      ? `Repositories in this session: ${set.map((entry) => `${entry.name} (${entry.branch ?? "detached"})`).join(", ")}. `
+      : "";
+    const rest = input.readOnly === true
+      ? (parents.length > 0
+        ? `You may read any repository below ${parents.join(", ")}.`
+        : "You read only in your working directory.")
+      : parents.length > 0
+        ? `You may read any repository below ${parents.join(", ")}; you edit and run only in your working directory.`
+        : "You edit and run only in your working directory.";
+    paragraphs.push(`${listed}${rest}`.trimEnd());
+  }
+  return paragraphs;
+}
+
+/**
+ * The header of a role dispatch (OD6: a role delegate is told its work root). Ends with DISPATCH_HEADER_SEPARATOR so
+ * stripDispatchHeader removes it before DoD inference (E8). No cap, verify directive, route line or nonce: those belong to
+ * the tier header and the protocol. Every name, branch and path goes through displaySafe, so a newline, a bracket or a
+ * `\n\n---\n\n` in a directory, repository or branch name can neither end the header early nor forge a line.
+ * `edits` false (a read-only role): "do not ask permission to read inside it". `exactResume`: the head may be stale, so the
+ * head clause is left out (as for a null head). A read-only role's repositories paragraph carries no edit clause ("You may
+ * read any repository below <parents>."): it cannot edit or run anywhere, so telling it where it may is noise. A caller that
+ * wants only the work root (`dispatchHeader: false` with a `root=`/`repo=` work root) passes no `workingSet` / `readParents`.
+ */
+export function buildRoleDispatchHeader(input: {
+  agent: string;
+  workRoot: string;
+  edits: boolean;
+  location?: HeaderLocation;
+  workingSet?: readonly HeaderRepository[];
+  readParents?: readonly string[];
+  exactResume?: boolean;
+}): string {
+  const safeBranch = (branch: string | null): string | null => (branch === null ? null : displaySafe(branch));
+  const location = input.location === undefined
+    ? undefined
+    : {
+        name: displaySafe(input.location.name),
+        branch: safeBranch(input.location.branch),
+        head: input.exactResume || input.location.head === null ? null : displaySafe(input.location.head),
+      };
+  const paragraphs = [
+    `${DISPATCH_HEADER_PREFIX}${displaySafe(input.agent)}. Execute this dispatch yourself.`,
+    ...locationParagraphs(displaySafe(input.workRoot), {
+      location,
+      workingSet: input.workingSet?.map((entry) => ({ name: displaySafe(entry.name), branch: safeBranch(entry.branch) })),
+      readParents: input.readParents?.map((parent) => displaySafe(parent)),
+      verb: input.edits ? "read or write" : "read",
+      ...(input.edits ? {} : { readOnly: true }),
+    }),
+  ];
+  return `${paragraphs.join("\n\n")}${DISPATCH_HEADER_SEPARATOR}`;
 }
 
 /**

@@ -13,7 +13,9 @@ import {
 } from "../../src/router/config";
 import {
   AUTHORITY_ACTIONS,
+  DEFAULT_REPO_APPROVAL_DAYS,
   EXPLORATION_MAX_RATE,
+  REPO_APPROVAL_CAP_DAYS,
   ROLES_V1_NOTICE,
   RUN_TIMEOUT_BOUNDS,
   sanitizeExploration,
@@ -29,18 +31,33 @@ import { ROUTER_BUDGET_NOTE_PREFIX } from "../../src/router/prompts";
 import { authorityFloor, effectiveDetection, GRANT_NOTES } from "../../src/routing/roles/policy";
 import { REDISPATCH_WINDOW_MS, runSignal, SIGNAL_MASS_CAPS, SIGNAL_WEIGHTS } from "../../src/routing/outcomes/signals";
 import { CRITERIA_BUDGET_CHARS } from "../../src/verify/dod";
+import { FOREIGN_REFERENCE_NONE } from "../../src/verify/deterministic";
 import { RENDERED_REASONS_MAX } from "../../src/verify/dispatch";
 import { GRADER_REASONS_MAX } from "../../src/verify/checker";
 import { oneLineReason } from "../../src/routing/roles/authority";
 import { CREDENTIAL_ENV_RE } from "../../src/router/run-tools";
-import { ROLES_RESTART_NOTICE } from "../../src/compat/v2-hooks";
+import { APPROVAL_RELOAD_APPLIES, ROLES_RESTART_NOTICE } from "../../src/compat/v2-hooks";
+import { approvalReloadLine } from "../../src/commands/approvals";
+import { ROUTER_APPROVAL_HELP_LINES } from "../../src/commands/output";
+import { APPROVALS_FILE_NAME, APPROVE_MAIN_WORKTREE, MAX_APPROVALS, MAX_APPROVALS_BYTES, type inspectCandidate } from "../../src/routing/roles/approvals";
+import { buildRoleDispatchHeader } from "../../src/router/dispatch-header";
 import { parseJsonc } from "../../src/router/jsonc";
 import { FINDING_IDS } from "../../src/routing/advisor/findings";
 import { runAdvisor } from "../../src/routing/advisor";
 import { buildLadder, buildRoleLadder, resolveChosen } from "../../src/routing/engine/ladders";
-import { createDispatchRouter, resetDispatchRouting } from "../../src/routing/wire/dispatch";
+import { APPROVAL_NOTE_TIMEOUT_MS, approvalNote, createDispatchRouter, resetDispatchRouting } from "../../src/routing/wire/dispatch";
 import { createEngineRuntime } from "../../src/routing/wire/runtime";
 import { resetBindingRegistryForTests } from "../../src/routing/roles/binding";
+import {
+  GIT_ROOT_MAX_LENGTH, GIT_ROOT_OUTSIDE_PLACEHOLDER, GIT_ROOT_PROVENANCE_PREFIX, GIT_ROOT_PROVENANCE_SUFFIX, GIT_ROOT_TEXTS, GIT_ROOT_TOO_LONG, gitRootCappedNote,
+} from "../../src/routing/roles/git-root";
+import { LOOKUP_MAX_DIRS } from "../../src/routing/roles/admission";
+import {
+  EDGE_EXTENDS_DEPTH_MAX, EDGE_EXTENDS_ENTRIES_MAX, EDGE_FILE_BYTES_MAX, EDGE_FILES_MAX, EDGE_OVERRIDES_DEPTH_MAX, EDGE_SPEC_MAX, EDGE_TSCONFIG_VARIANTS_MAX,
+  EDGE_VIAS, EDGE_WORKSPACE_ENTRIES_MAX, EDGE_WORKSPACE_PATTERNS_MAX, EDGE_WORKSPACES_MAX, EDGES_MAX, PACKAGE_EDGE_FIELDS, PACKAGE_EDGE_PROTOCOLS,
+  SITE_PACKAGES_ENTRIES_MAX, SITE_PACKAGES_FILES_MAX, TSCONFIG_EDGE_KEYS,
+} from "../../src/verify/edges";
+import { EDGE_NAME_MAX, EDGE_UNADMITTED_NAMES_MAX, EDGE_WALK_MAX, PERIMETER_MAX } from "../../src/verify/perimeter";
 import { classifyTrivial, createSessionStore, DEFAULT_TIER_CAPS, resetDispatchRegistry } from "../../src/router/sessions";
 import { candidateKey, decide, MAX_EXPLORATION_RATE } from "../../src/routing/engine/kernel";
 import { createOutcomeStore } from "../../src/routing/outcomes/store";
@@ -87,6 +104,78 @@ vi.mock("@opentui/solid", () => ({ createElement: () => ({}), insert: () => unde
 
 const root = process.cwd();
 const read = (p: string) => readFileSync(join(root, p), "utf-8");
+
+describe("role dispatch header docs (P2g, OD6)", () => {
+  const flat = (path: string) => read(path).replace(/\s+/g, " ");
+
+  it("ROLES.md quotes the rendered location paragraph of the role header", () => {
+    const header = buildRoleDispatchHeader({
+      agent: "implementer", workRoot: "ROOT", edits: true, location: { name: "app-a", branch: "feat/login", head: "3f2c1a9deadbeef" },
+    });
+    const paragraph = header.split("\n\n")[1]!.replace("ROOT", "<root>");
+    expect(paragraph).toBe("Working directory: <root> (repository app-a, branch feat/login at 3f2c1a9). You are already there — do not ask permission to read or write inside it.");
+    expect(flat("docs/ROLES.md")).toContain(paragraph);
+    expect(flat("docs/ROLES.md")).toContain("`[router] You are @<role>. Execute this dispatch yourself.`");
+  });
+
+  it("no doc still says the header is built for tier dispatches only", () => {
+    const roles = flat("docs/ROLES.md");
+    expect(roles).not.toContain("built for tier dispatches only");
+    expect(roles).not.toContain("learns its location from refusals");
+    const design = flat("docs/design/cross-repo.md");
+    expect(design).not.toContain("Header only for tier dispatches");
+    expect(design).not.toContain("Role dispatches get no header");
+    expect(design).not.toContain("headers are built only for tier dispatches");
+  });
+
+  it("dispatchHeader: false also turns off the role header (CONFIG_REFERENCE and ROLES)", () => {
+    expect(flat("docs/CONFIG_REFERENCE.md")).toContain("`dispatchHeader: false` also turns off the role header");
+    expect(flat("docs/ROLES.md")).toContain("or `dispatchHeader: false`");
+  });
+
+  // Q8 (D14): the role header follows I9 — only when relevant.
+  it("the role header is emitted only when relevant (ROLES, CONFIG_REFERENCE, design, CHANGELOG)", () => {
+    expect(flat("docs/ROLES.md")).toContain(
+      "The header is emitted only when cross-repo is configured (`routing.repoParents` is set), the route line declares a target (`repo=`, `branch=` or `root=`), or the work root differs from the session directory; otherwise the dispatch prompt is byte-identical to what it was before the header existed (invariant I9).",
+    );
+    expect(flat("docs/CONFIG_REFERENCE.md")).toContain(
+      "The role header is emitted only when it is relevant (invariant I9): `routing.repoParents` is set, the route line declares `repo=`, `branch=` or `root=`, or the work root differs from the session directory; otherwise the dispatch prompt carries no header.",
+    );
+    const design = flat("docs/design/cross-repo.md");
+    expect(design).toContain("- **Q8.** Decided 2026-10-11: the role dispatch header (OD6) follows I9.");
+    expect(design).toContain("| D14 | 2026-10-11 | Q8 decided: the role dispatch header follows I9.");
+    expect(design).not.toContain("pending the owner's reading of I9");
+    expect(flat("CHANGELOG.md")).toContain("The header is emitted only when it is relevant (owner decision Q8, invariant I9)");
+  });
+
+  // Q9 (D15): a refused declared target refuses the dispatch.
+  it("a refused declared target refuses the role dispatch (ROLES, design, CHANGELOG)", () => {
+    const roles = flat("docs/ROLES.md");
+    expect(roles).toContain("a route line that declared `root=`, `repo=` or `branch=` and got none **refuses the dispatch**: the task call fails with `[router] role dispatch @<agent> refused: <note>`");
+    expect(roles).toContain("A dispatch that declared nothing is not refused (no declared target, no refusal);");
+    expect(roles).not.toContain("Anything else gives **no work root**: the dispatch keeps local reads");
+    expect(roles).not.toContain("gives no work root, and so refuses the dispatch with the note");
+    expect(roles).not.toContain("an invalid value gives no work root");
+    expect(roles).toContain("is an invalid declaration and refuses the dispatch with the note `<key>=<value> is not a valid repository name / branch name: no work root. Fix the route line.`");
+    // D17 (QA of D15): an invalid root= refuses; an exact resume cannot change its work root.
+    expect(roles).toContain("`root=<value> is not a valid absolute work root: no work root. Fix the route line.`");
+    expect(roles).toContain("A refused dispatch fails the `task` call with `[router] role dispatch @<agent> refused: <note>`.");
+    expect(roles).toContain("a resume cannot change its work root: dispatch a new child");
+    expect(roles).toContain("is always removed, and replaced only when the router adds its own");
+    expect(roles).toContain("`repo=<dir> branch=<b>` instead binds the worktree of that directory's repository that is on `<b>`, which may lie outside the parents");
+    expect(flat("docs/CONFIG_REFERENCE.md")).toContain("is always removed, and replaced only when the router adds its own");
+    const design = flat("docs/design/cross-repo.md");
+    expect(design).toContain("| D17 | 2026-10-11 | QA of D15.");
+    expect(design).toContain("a resume cannot change its work root: dispatch a new child");
+    expect(design).toContain("**Known follow-ups (Q8–Q10 QA), accepted for now:**");
+    expect(design).not.toContain("An invalid `branch=` or `repo=` gives no work root and a note.");
+    expect(flat("CHANGELOG.md")).not.toContain("now gives no work root and a note");
+    expect(flat("CHANGELOG.md")).toContain("a resume cannot change its work root: dispatch a new child");
+    expect(design).toContain("- **Q9.** Decided 2026-10-11: a role dispatch whose route line declared `repo=`, `branch=` or `root=`");
+    expect(design).toContain("| D15 | 2026-10-11 | Q9 decided: a declared target");
+    expect(flat("CHANGELOG.md")).toContain("a refused declared target refuses the dispatch.**");
+  });
+});
 const undocumentedKeys = (doc: string, keys: readonly string[]) =>
   keys.filter((key) => !doc.includes(`\`${key}\``));
 const nestedEnforcementKeys = [
@@ -769,6 +858,7 @@ describe("docs drift: roles delegation keys (#84)", () => {
     "routing.delegation", "roleAgents", "roleAgents.<name>.enabled", "roleAgents.<name>.description", "roleAgents.<name>.prompt",
     "roleAgents.<name>.tierRange", "roleAgents.<name>.budget", "roleAgents.<name>.deny", "routing.exploration.rate",
     "routing.exploration.requireDetection", "routing.run.scripts", "routing.run.commands", "routing.run.timeoutMs", "routing.workRoots",
+    "routing.repoParents", "routing.repoDepth", "routing.repoExclude", "routing.repoApprovalDays",
   ];
 
   it("documents every key, and a missing one is detected", () => {
@@ -787,6 +877,11 @@ describe("docs drift: roles delegation keys (#84)", () => {
     expect(cell("roleAgents")).toBe("`{}`");
     expect(cell("routing.workRoots")).toBe("`[]`");
     expect(defaults.workRoots).toEqual([]);
+    expect(cell("routing.repoParents")).toBe("`[]`");
+    expect(cell("routing.repoDepth")).toBe(defaultCell(defaults.repoDepth));
+    expect(cell("routing.repoExclude")).toBe("`[]`");
+    expect(cell("routing.repoApprovalDays")).toBe(defaultCell(defaults.repoApprovalDays));
+    expect([defaults.repoParents, defaults.repoDepth, defaults.repoExclude, defaults.repoApprovalDays]).toEqual([[], 2, [], 14]);
     expect(Object.keys(defaults.run.commands)).toEqual(["test-files"]);
   });
 
@@ -1074,6 +1169,8 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     expect(runSignal({ childSessionID: "c", runs: [], edits: [], editsObserved: true, acceptance: [] } as unknown as Parameters<typeof runSignal>[0])).toBeNull();
     expect(flat).toContain("**The `run` signal matches npm-script-form checks only.**");
     expect(flat).toContain("A dispatch with no check of that form gets no `run` signal.");
+    // P2c.2: any check with its own cwd= drops the run signal for the whole dispatch (acceptanceScriptsOf)
+    expect(flat).toContain("A dispatch where any acceptance check has its own `cwd=` (even a relative one inside the work root) gets no run signal at all: such a check may not run in the work root, so no check of that dispatch is credited.");
     // acceptance checks in the work root (DF2-F1 fixed)
     expect(flat).toContain("**Acceptance checks run in the work root.**");
     expect(flat).toContain("a `cwd:` outside that root is refused");
@@ -1124,7 +1221,40 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     const denied = `${ROLE_DENIED_ACTIONS.slice(0, -1).map(tick).join(", ")} and ${tick(ROLE_DENIED_ACTIONS[ROLE_DENIED_ACTIONS.length - 1]!)} denied explicitly`;
     expect(flat).toContain(denied);
     for (const key of ["routing.delegation", "roleAgents", "routing.exploration.rate", "routing.exploration.requireDetection", "routing.run.scripts",
-      "routing.run.commands", "routing.run.timeoutMs", "routing.workRoots"]) expect(guide, key).toContain(`\`${key}`);
+      "routing.run.commands", "routing.run.timeoutMs", "routing.workRoots", "routing.repoParents", "routing.repoDepth",
+      "routing.repoExclude", "routing.repoApprovalDays"]) expect(guide, key).toContain(`\`${key}`);
+  });
+
+  it("cross-repo Phase 4: quotes the /router approve help lines, the refusal note and the reload/restart lines the code emits", async () => {
+    for (const line of ROUTER_APPROVAL_HELP_LINES) expect(flat, line).toContain(line);
+    const identity = { path: "<path>", commonDir: "<path>\\.git", roots: ["0".repeat(40)], origin: "<origin>", branch: "<branch>", head: "<head7>" };
+    const note = await approvalNote("<path>", { inspect: async () => identity as unknown as Awaited<ReturnType<typeof inspectCandidate>> });
+    expect(note).toBe("<path> is a git repository outside routing.repoParents (origin <origin>, branch <branch> at <head7>). Only the user can approve it: ask the user to run /router approve <path>, then dispatch again.");
+    expect(flat).toContain(note);
+    const problem = await approvalNote("<path>", { inspect: async () => "<problem>" });
+    expect(flat).toContain(problem);
+    expect(flat).toContain(`within ${APPROVAL_NOTE_TIMEOUT_MS / 1000} seconds`);
+    // The guide says the approval applies after the reload (spike T6), with the restart line as the fallback.
+    expect(APPROVAL_RELOAD_APPLIES).toBe(true);
+    const approve = { kind: "approve", path: "<path>" } as const;
+    const revoke = { kind: "revoke", path: "<path>" } as const;
+    for (const line of [
+      approvalReloadLine(approve, APPROVAL_RELOAD_APPLIES),
+      approvalReloadLine(revoke, APPROVAL_RELOAD_APPLIES),
+      approvalReloadLine(approve, APPROVAL_RELOAD_APPLIES, "<error>"),
+      approvalReloadLine(revoke, APPROVAL_RELOAD_APPLIES, "<error>"),
+    ]) expect(flat, line).toContain(line);
+    expect(flat).toContain(`; ${APPROVE_MAIN_WORKTREE}`);
+    expect(flat).toContain(`(global only, 1–${REPO_APPROVAL_CAP_DAYS}, default ${DEFAULT_REPO_APPROVAL_DAYS})`);
+    expect(flat).toContain(`${REPO_APPROVAL_CAP_DAYS} days after it was approved at the latest`);
+    expect(flat).toContain(`At most ${MAX_APPROVALS} approvals and ${MAX_APPROVALS_BYTES / 1024} KiB`);
+    expect(flat).toContain(`\`${APPROVALS_FILE_NAME}\``);
+    expect(read("docs/CONFIG_REFERENCE.md")).toContain(`\`${APPROVALS_FILE_NAME}\``);
+    const unreleased = /## \[Unreleased\]([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
+    expect(unreleased).toContain("Approve repositories outside routing.repoParents with /router approve (OpenCode v2, roles mode; inert on v1) (#107).");
+    const design = read("docs/design/cross-repo.md").replace(/\s+/g, " ");
+    expect(design).toContain("| D29 | 2026-10-12 | Phase 4 channel: a human-typed `/router approve` command instead of a permission ask");
+    expect(design).not.toContain("A first-use approval was requested (Phase 4)");
   });
 
   it("ADR 0006 has D1–D13 in order, the evidence E1–E13 and only the literature L1–L14", () => {
@@ -1155,6 +1285,245 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     expect(unreleased).toContain("the `run` signal matches npm-script-form checks only");
     expect(unreleased).toContain("A role dispatch's acceptance checks run in its work root; a `cwd:` outside it is refused.");
     expect(unreleased).not.toContain("budgetUsed");
+  });
+
+  it("P2b.6: checks in other repositories — the texts of the code are in VERIFICATION.md, the protocol and the [Unreleased] entry", () => {
+    const verification = read("docs/VERIFICATION.md").replace(/\s+/g, " ");
+    const section = /## Checks in other repositories([\s\S]*?)\n## /.exec(read("docs/VERIFICATION.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
+    expect(section).not.toBe("");
+    const gate = read("src/verify/gate.ts");
+    const deterministic = read("src/verify/deterministic.ts");
+    // code-to-doc: each fragment is in the source that emits it AND in the section
+    const pinned: Array<[string, string]> = [
+      [gate, "a per-check cwd= is honoured only in roles mode; nothing ran"],
+      [gate, "is not affected or full; nothing ran"],
+      [gate, "and its read set; nothing ran"],
+      [gate, "is not covered by any check root ("],
+      [gate, "links this work root (node_modules/"],
+      [gate, "and no check ran there; add a check such as: check: testsPass cwd="],
+      [gate, "the change in the work root could not be observed and no check runs there ("],
+      [gate, "consumer discovery stopped before finishing "],
+      [gate, "; a repository there may link this work root unchecked; add a check such as: check: testsPass cwd="],
+      [gate, "no check root"],
+      [deterministic, "runs in another repository ("],
+      [deterministic, "and must use scope=full: affected tests cannot be attributed to a change in the work root"],
+      [deterministic, "failed; the change under verification is in the work root, so this failure can be neither excused nor attributed: "],
+    ];
+    for (const [source, fragment] of pinned) {
+      expect(source, fragment).toContain(fragment);
+      expect(section, fragment).toContain(fragment);
+    }
+    expect(section).toContain(`\`${FOREIGN_REFERENCE_NONE}\``);
+    // the user-facing syntax and the caveats of the section
+    for (const text of ["check: testsPass cwd=\"D:\\git\\app-a\" scope=full", "`scope=affected|full`", "A relative `cwd=` stays inside `W`", "must be inside `W` or in the read set",
+      "unverifiable** and nothing runs", "unverifiable, never a fail", "gets no reference", "UNVERIFIED", "may be deferred like any other (`VERIFY:deferred`, the default)", "It is verified at once, not deferred, only in the cases listed there.", "A `scope=` alone is ignored there",
+      "On OpenCode v1 the keys are ignored", "(I2)", "(I3)", "gives no run signal",
+      "a check whose repository top contains the change root", "(no check root)"]) expect(section, text).toContain(text);
+    expect(read("docs/ROLES.md").replace(/\s+/g, " ")).toContain("(./VERIFICATION.md#checks-in-other-repositories)");
+    expect(verification).toContain("link pins");
+    // the configured protocol teaches cwd= / scope=full; the default one does not
+    const protocol = read("src/router/protocol.ts");
+    expect(protocol).toContain("A check may run in another repository of the read set with cwd= and must then use scope=full");
+    expect(protocol).toContain("check: testsPass cwd=\"<repo>\" scope=full");
+    // the changelog entry
+    const unreleased = /## \[Unreleased\]([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
+    for (const item of ["**Checks in other repositories (OpenCode v2, roles mode) (#107).**", "check: testsPass cwd=\"<repo>\" scope=full", "`is not covered by any check root`",
+      "never a fail", "is a consumer", "UNVERIFIED", "(link pins)", "`a per-check cwd= is honoured only in roles mode`",
+      "A dispatch with per-check keys may be deferred, see \"Deferred verification across repositories\" below.",
+      "**Deferred verification across repositories (OpenCode v2, roles mode) (#107).**", "The dispatch is verified at once, not deferred, when I4 already refuses at return",
+      "link targets are observed again", "turns a pass UNVERIFIED with a caveat (a fail keeps it)",
+      "**A full-scope `testsPass` is no longer run synchronously when the producer changed nothing (OpenCode v2) (#107).**", "owner decision OD-P2e-2",
+      "such a dispatch (and one whose `testsPass` check has `scope=full`) now defers instead of blocking the return",
+      "Config `testScope` does not affect `lintClean` (only a per-check `scope=full` runs lint unscoped), so a `lintClean`-only dispatch with no change still passes without running anything"]) {
+      expect(unreleased, item).toContain(item);
+    }
+    expect(unreleased).not.toContain("verified synchronously, never deferred");
+  });
+
+  it("P3a: consumer testsPass scope=affected across a link — the cross-link reasons of runner.ts/deterministic.ts are in VERIFICATION.md", () => {
+    const runner = read("src/verify/runner.ts");
+    const deterministic = read("src/verify/deterministic.ts");
+    const verificationFlat = read("docs/VERIFICATION.md").replace(/\s+/g, " ");
+    // code-to-doc: the static parts of each S6 reason (a template's parts between its ${…}) are in the source AND in the guide
+    const reasons: ReadonlyArray<readonly [code: string, source: string, parts: readonly string[]]> = [
+      ["cross-link-unsupported", runner, ["a change in a linked repository needs vitest ", " to scope: this check runs ", " to scope: the resolved vitest is "]],
+      ["cross-link-gone", runner, ["changed file gone in the linked repository (deleted or renamed away): "]],
+      ["cross-link-unreachable", runner, ["the path of ", " in the linked repository contains node_modules, which vitest never follows"]],
+      ["cross-link-unchecked", runner, ["the consumer's vitest projects are not read; use scope=full",
+        "cannot check which consumer tests import the linked repository ", "; use scope=full"]],
+      ["cross-link-ignored-over-bounds", runner, ["too many ignored modules in the linked repository to pass as inputs: "]],
+      ["cross-link-ignored-unavailable", runner, ["the ignored modules of the linked repository could not be listed: "]],
+      ["cross-link-build-stale", deterministic, ["the build output in ", " is older than ", " changed in the linked repository; ",
+        "rebuild it (e.g. a buildPasses check in the linked repository before this one) or use scope=full"]],
+    ];
+    for (const [code, source, parts] of reasons) {
+      expect(source, code).toContain(`"${code}"`);
+      expect(verificationFlat, code).toContain(`\`${code}\``);
+      for (const part of parts) {
+        expect(source, `${code}: ${part}`).toContain(part);
+        expect(verificationFlat, `${code}: ${part}`).toContain(part);
+      }
+    }
+    // the zero-selection note (Y2) and the completeness note (QA-1 M2), static parts
+    for (const part of ["vitest selected no test in ", " for the change in ", "; the link may not be followed ",
+      "(resolve.preserveSymlinks, a built entry, or no test imports the changed files): use scope=full", "vitest did not run ", " consumer test file(s) that import the linked repository (", "); the link may not be followed: use scope=full"]) {
+      expect(runner, part).toContain(part);
+      expect(verificationFlat, part).toContain(part);
+    }
+    // the guide's statements: the section, its limits, and the refusal that still applies
+    for (const text of ["### A consumer check with scope=affected", "only static imports"]) expect(verificationFlat, text).toContain(text);
+    expect(read("docs/ROLES.md").replace(/\s+/g, " ")).toContain("(./VERIFICATION.md#a-consumer-check-with-scopeaffected)");
+    // the changelog entry
+    const unreleased = /## \[Unreleased\]([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
+    expect(unreleased).toContain("**A consumer `testsPass` with `scope=affected` runs `vitest related` across a link (OpenCode v2, roles mode; inert on v1) (#107).**");
+  });
+
+  it("P3b: router_git root — the texts of git-root.ts are in ROLES.md, the other docs and the [Unreleased] entries", () => {
+    const source = read("src/routing/roles/git-root.ts");
+    const roles = read("docs/ROLES.md").replace(/\s+/g, " ");
+    // code-to-doc: each fragment is a string literal of git-root.ts AND in the guide; a template pins its static parts in the source
+    const templates = new Map<string, readonly string[]>([[GIT_ROOT_TOO_LONG, ["`is longer than ", " characters`"]]]);
+    expect(GIT_ROOT_TEXTS.length).toBeGreaterThan(0);
+    for (const fragment of GIT_ROOT_TEXTS) {
+      for (const part of templates.get(fragment) ?? [JSON.stringify(fragment)]) expect(source, fragment).toContain(part);
+      expect(roles, fragment).toContain(fragment);
+    }
+    expect(GIT_ROOT_TOO_LONG).toBe(`is longer than ${GIT_ROOT_MAX_LENGTH} characters`);
+    // not in GIT_ROOT_TEXTS: the redaction placeholder (F6) and the cap note of the name lookup (N2, a template)
+    expect(source).toContain(JSON.stringify(GIT_ROOT_OUTSIDE_PLACEHOLDER));
+    expect(roles).toContain(`\`${GIT_ROOT_OUTSIDE_PLACEHOLDER}\``);
+    for (const part of ["`The search stopped after ", " directories`"]) expect(source, part).toContain(part);
+    expect(roles).toContain(gitRootCappedNote(LOOKUP_MAX_DIRS));
+    // the provenance line (its fixed parts are literals of the source) and the tool's refusal prefix
+    for (const part of [GIT_ROOT_PROVENANCE_PREFIX, GIT_ROOT_PROVENANCE_SUFFIX]) expect(source, part).toContain(JSON.stringify(part));
+    expect(roles).toContain(`\`${GIT_ROOT_PROVENANCE_PREFIX}<name> (<branch>) at <worktree>${GIT_ROOT_PROVENANCE_SUFFIX}\``);
+    expect(read("src/router/git-tools.ts")).toContain("[router_git] error: refused: ");
+    expect(roles).toContain("start with `[router_git] error: refused: ` and nothing runs");
+    // the guide's statements: who may pass root, when the argument exists, W as root, read-only, repoExclude worktrees
+    for (const text of ["role agents only", "a restart is needed after adding parents", "`root` equal to the work root behaves as no `root`",
+      "no branch argument", "never refreshes the index", "worktrees of a repository excluded by `routing.repoExclude`"]) expect(roles, text).toContain(text);
+    // the other docs
+    expect(read("docs/READ_ONLY_TIERS.md").replace(/\s+/g, " ")).toContain("`root` is a roles-mode feature: tier agents and the orchestrator are refused");
+    const config = read("docs/CONFIG_REFERENCE.md").replace(/\s+/g, " ");
+    expect(config).toContain("enables the `root` argument of `router_git_*`");
+    expect(config).toContain("also covers the linked worktrees of an excluded repository");
+    // the changelog entries
+    const unreleased = /## \[Unreleased\]([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
+    expect(unreleased).toContain("**`router_git_*` in other repositories (OpenCode v2, roles mode; inert on v1) (#107).**");
+    expect(unreleased).toContain("**Worktrees of an excluded repository are refused (OpenCode v2, roles mode) (#107).**");
+  });
+
+  it("P2e: deferred verification across repositories is documented as the code words it (S11 caveat, cross-repo reasons, placement identity)", () => {
+    const wiring = read("src/verify/wiring.ts");
+    const verificationFlat = read("docs/VERIFICATION.md").replace(/\s+/g, " ");
+    const pinned: Array<[string, string]> = [
+      ["the linked repository ", "S11 caveat prefix"],
+      [" changed since the producer returned; the checks ran against its new state", "S11 changed"],
+      [" could not be observed again since the producer returned", "S11 unobserved"],
+      [" no longer resolves to the same repository since the producer returned; nothing ran", "placement identity"],
+    ];
+    for (const [fragment, why] of pinned) {
+      expect(wiring, why).toContain(fragment);
+      expect(verificationFlat, why).toContain(fragment);
+    }
+    // the cross-repo reason and its detail texts are internal (the after-hook reads only `branch-switched`): the docs describe the behaviour
+    expect(wiring, "cross-repo detail").toContain("a linked repository could not be observed within the deferral bound; verified synchronously");
+    expect(wiring, "cross-repo detail").toContain("a repository of the perimeter changed during the dispatch while an unattributable writer ran; verified synchronously");
+    for (const text of ["**Verified at once.** The dispatch is not deferred: it is verified before return (internally the reason `cross-repo`, which is not shown to anyone)",
+      "A refusal never reaches the deferred finish: the dispatch is verified at once, with its refusal.",
+      "a linked repository could not be observed within the deferral bound;",
+      "I4 already refuses at return (a repository of the perimeter changed during the dispatch while an unattributable writer ran)",
+      "**A placement whose directory did not exist at return** is reported at `router_verify` as `no longer resolves to the same repository since the producer returned`",
+      "**What S11 does not cover.** S11 observes the direct link targets of `W` again and notices a link retargeted or added after the return. It does not cover nested link targets, ignored files (for example `dist/`) or skip-worktree/assume-unchanged edits in the linked repository. The reference stays exact only through link pins.",
+      "**A full scope defers instead of blocking the return (OpenCode v2).** A dispatch with no changed files and a full-scope `testsPass` used to run the full suite synchronously before the return (it was never passed as \"no changed files\"); on OpenCode v2 it now defers instead, and for a `delegate` that also means no synchronous ladder.",
+      "Config `testScope` does not affect `lintClean`: only a per-check `scope=full` runs lint unscoped, so a `lintClean`-only dispatch with no change still passes without running anything.",
+      "On OpenCode v2 that exception does not apply when the `testsPass` is full scope (config `testScope: \"full\"` or a per-check `scope=full`): such a dispatch defers."]) expect(verificationFlat, text).toContain(text);
+    expect(verificationFlat).toContain("### Deferred verification across repositories");
+    expect(verificationFlat).not.toContain("never deferred");
+    expect(verificationFlat).not.toContain("interim until deferred verification supports the perimeter");
+    const roles = read("docs/ROLES.md").replace(/\s+/g, " ");
+    expect(roles).toContain("(./VERIFICATION.md#deferred-verification-across-repositories)");
+    const config = read("docs/CONFIG_REFERENCE.md").replace(/\s+/g, " ");
+    expect(config).toContain("A deferred dispatch with a perimeter.");
+    expect(config).toContain("(per-check `scope=full`, or config `testScope: \"full\"` on OpenCode v2 only) defers instead of blocking the return; config `testScope` does not affect `lintClean` (only a per-check `scope=full` runs lint unscoped), so a no-change `lintClean` still passes without running.");
+    expect(config).toContain("On OpenCode v2 this does not hold when the `testsPass` is full scope (config `testScope: \"full\"`, or a per-check `scope=full`): that dispatch defers instead of blocking the return");
+    expect(config).toContain("verified at once (nothing is shown to the user for this; a refusal never reaches the deferred finish)");
+    expect(roles).toContain("The dispatch is verified at once, not deferred, when I4 already refuses at return");
+    const design = read("docs/design/cross-repo.md").replace(/\s+/g, " ");
+    for (const text of ["| D18 |", "| D19 |", "### Phase 2 implemented (notes)", "LINK_DRIFT_CAVEAT"]) expect(design, text).toContain(text);
+    // Phase 3 (b): the owner decisions and the QA follow-ups are recorded in the design.
+    for (const text of ["| D20 |", "| D21 |", "Known follow-ups (P3b QA)"]) expect(design, text).toContain(text);
+  });
+
+  it("P3c: dependency edges outside node_modules — the labels, bounds and texts of the code are in VERIFICATION.md and the [Unreleased] entries", () => {
+    const doc = read("docs/VERIFICATION.md");
+    const verificationFlat = doc.replace(/\s+/g, " ");
+    const section = /### Dependencies outside node_modules([\s\S]*?)\n### /.exec(doc)?.[1]?.replace(/\s+/g, " ") ?? "";
+    expect(section).not.toBe("");
+    const perimeter = read("src/verify/perimeter.ts");
+    const gate = read("src/verify/gate.ts");
+    const wiring = read("src/verify/wiring.ts");
+    // every `via` label of the fixed vocabulary (SD-P3c-5): the package.json template with each field and protocol, the others verbatim
+    expect(EDGE_VIAS.length).toBe(PACKAGE_EDGE_FIELDS.length * PACKAGE_EDGE_PROTOCOLS.length + TSCONFIG_EDGE_KEYS.length + 4);
+    expect(section).toContain("`package.json <field> (<protocol>)`");
+    for (const via of EDGE_VIAS) {
+      const pkg = /^package\.json (\S+) \((\S+)\)$/.exec(via);
+      if (pkg === null) expect(section, via).toContain(`\`${via}\``);
+      else for (const part of [pkg[1]!, pkg[2]!]) expect(section, via).toContain(`\`${part}\``);
+    }
+    // every bound, as the code sets it (SD-P3c-4; QA-1 M1, M2, M5; QA-1 m2)
+    const workspaceManifests = Number(/const WORKSPACE_MANIFESTS_MAX = (\d+);/.exec(perimeter)?.[1]);
+    expect(perimeter).toContain("files: Math.max(EDGE_LIMITS.files, 2 * WORKSPACE_MANIFESTS_MAX + 16)");
+    const consumerFiles = Math.max(EDGE_FILES_MAX, 2 * workspaceManifests + 16);
+    const scopeTextMax = Number(/export const SCOPE_TEXT_MAX = (\d+);/.exec(gate)?.[1]);
+    expect(Number(/export const LINK_CAVEAT_TEXT_MAX = (\d+);/.exec(wiring)?.[1])).toBe(scopeTextMax);
+    expect(wiring).toContain("const room = Math.max(0, PERIMETER_MAX - 1 - observedSeeds);");
+    for (const text of [
+      `a file over ${EDGE_FILE_BYTES_MAX / (1024 * 1024)} MiB is skipped`,
+      `at most ${EDGES_MAX} distinct targets, ${EDGE_FILES_MAX} files and ${EDGE_WORKSPACES_MAX} workspace packages (${consumerFiles} files and ${workspaceManifests} packages when the edges of a working-set worktree are read for consumers)`,
+      `from at most ${EDGE_WORKSPACE_PATTERNS_MAX} \`workspaces\` patterns whose listings read at most ${EDGE_WORKSPACE_ENTRIES_MAX} entries in total`,
+      `${EDGE_TSCONFIG_VARIANTS_MAX} root \`tsconfig.*.json\` files`,
+      `an \`extends\` chain at most ${EDGE_EXTENDS_DEPTH_MAX} deep, at most ${EDGE_EXTENDS_ENTRIES_MAX} entries of one \`extends\` array`,
+      `\`overrides\` at most ${EDGE_OVERRIDES_DEPTH_MAX} levels deep`,
+      `one site-packages listing of at most ${SITE_PACKAGES_ENTRIES_MAX} entries, and at most ${SITE_PACKAGES_FILES_MAX} \`.pth\`, finder and \`.egg-link\` files`,
+      `A spec longer than ${EDGE_SPEC_MAX} characters, or a target more than ${EDGE_WALK_MAX} directories below its parent, is not admitted, with no filesystem call.`,
+      `At most ${EDGE_UNADMITTED_NAMES_MAX} unadmitted targets are named; the others are counted only.`,
+      `is capped at ${scopeTextMax} characters, with a trailing \`…\` when cut, then escaped`,
+      `an unadmitted edge target's name is at most ${EDGE_NAME_MAX} characters`,
+      `it counts toward the perimeter's ${PERIMETER_MAX} roots`,
+      `more new dependencies than the perimeter's ${PERIMETER_MAX} roots leave room for, means the dispatch is verified at once (no handle)`,
+    ]) expect(section, text).toContain(text);
+    // code-to-doc: each fragment is in the source that emits it, and the section quotes it
+    const pinned: Array<[source: string, code: string, quoted: string]> = [
+      [gate, "links this work root (${displaySafe(consumer.via)})", "`links this work root (<via>)`"],
+      [perimeter, "`${edge.via} in ${edge.from}`", "followed by ` in <file>`"],
+      [gate, "${scopeText(root.name)} (not admitted)", "`<name> (not admitted)`"],
+      [wiring, "\"[verify] dispatch perimeter: declared dependency edges were cut by a bound\"", "`[verify] dispatch perimeter: declared dependency edges were cut by a bound`"],
+    ];
+    for (const [source, code, quoted] of pinned) {
+      expect(source, code).toContain(code);
+      expect(section, quoted).toContain(quoted);
+    }
+    // the guide's statements: v2 only, never pinned, the junction-spelled parent, the removed dependency, the consumer and PnP notes
+    for (const text of ["(OpenCode v2, roles mode; inert on v1, no config key)", "**In the perimeter, never pinned.**", "repository code is never evaluated",
+      "so a `file:` edge written through a junction-spelled parent is a consumer too",
+      "A dependency the producer removed during the dispatch is not observed again at `router_verify`, unless `W` declares it again; then it is \"changed\".",
+      "An edge never makes the reference approximate (a documented limit)."]) expect(section, text).toContain(text);
+    for (const text of ["So is one with no such link that declares a dependency edge into `W`'s repository",
+      "In roles mode on OpenCode v2, a `portal:`/`link:` spec in `package.json` is still read as a declared dependency edge",
+      `a dependency the producer added during the dispatch could not be observed within the deferral bound, or more were added than the perimeter's ${PERIMETER_MAX} roots leave room for`,
+      "**Declared dependency edges at S11.** S11 observes the admitted targets of `W`'s declared dependency edges again as it does link targets, with the same caveats, and notices an edge added or retargeted after the return; an edge target is never pinned."])
+      expect(verificationFlat, text).toContain(text);
+    // the other docs
+    const roles = read("docs/ROLES.md").replace(/\s+/g, " ");
+    for (const text of ["(./VERIFICATION.md#dependencies-outside-node_modules)", "A link or edge target that is not admitted is named `(not admitted)`"]) expect(roles, text).toContain(text);
+    expect(read("docs/CONFIG_REFERENCE.md").replace(/\s+/g, " ")).toContain("No config key turns the edges on or off; see `docs/VERIFICATION.md` → \"Dependencies outside node_modules\".");
+    // the changelog entries
+    const unreleased = /## \[Unreleased\]([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
+    for (const item of ["**Dependencies outside `node_modules` (OpenCode v2, roles mode; inert on v1) (#107).**", "`<name> (not admitted)`",
+      "`links this work root (<via>)`", "`[verify] dispatch perimeter: declared dependency edges were cut by a bound`",
+      "**A dependency the producer adds during a deferred dispatch is frozen at return (OpenCode v2, roles mode) (#107).**",
+      "verify the dispatch at once (no handle)", "unless the work root declares it again (then it is \"changed\")"]) expect(unreleased, item).toContain(item);
   });
 
   it("QA-P32-2: a missing d= is none, graders weigh half only when independent, run matching by entry name, R9(5), code map", () => {

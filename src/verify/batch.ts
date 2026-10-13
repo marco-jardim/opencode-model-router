@@ -52,6 +52,8 @@
 //   1. The coordinator is disposed -> { scoped: aborted BATCH_REASONS.disposed }.
 //   2. request.testScope === "full" -> runtime.direct(request). The resolved command runs as
 //      written (2.1-T2 P5f). It cannot be merged, and S6 forbids widening a scoped run into it.
+//   2a. request.crossLinkRoot set -> runtime.direct(request) (cross-repo P3a, SD-P3a-8). The
+//      coordinator plans with { command, cwd, changedFiles } only, so a union would drop W.
 //   3. runtime.batchWindowMs <= 0 -> runtime.direct(request). "batchWindowMs: 0 disables
 //      batching": every request runs alone, still scoped.
 //   4. plan = runtime.plan(request, request.deadline), that is, planScopedRun (B6). Then:
@@ -784,7 +786,7 @@ export type OpenBatchScope = (meta: Parameters<OpenVerificationScope>[0]) => Bat
 
 /** The seams and settings of one gate (deviation D6). The window opener's values apply to its batch. */
 export interface BatchRuntime {
-  /** 2.1's one-request hook, used for testScope "full" and batchWindowMs <= 0 (B2). */
+  /** 2.1's one-request hook, used for testScope "full", a crossLinkRoot request and batchWindowMs <= 0 (B2). */
   readonly direct: TestsPassHook;
   readonly plan: BatchPlanner;
   readonly openScope: OpenBatchScope;
@@ -1763,7 +1765,10 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
 
   async function submit(runtime: BatchRuntime, request: TestsPassRequest): Promise<TestsPassRun> {
     if (disposed) return abortedRun(BATCH_REASONS.disposed);
-    if (request.testScope === "full" || !(runtime.batchWindowMs > 0)) return await runtime.direct(request);
+    // B2 2a (cross-repo P3a, SD-P3a-8): a cross-link request is never batched; the union plan has no W.
+    if (request.testScope === "full" || request.crossLinkRoot !== undefined || !(runtime.batchWindowMs > 0)) {
+      return await runtime.direct(request);
+    }
     // QA-2.2-9: planning comes first, as in 2.1's direct hook, so an exhausted deadline still gets
     // the planning outcome (NoAffected, S6) the direct path gives, and aborted only for a spec.
     // W7: a request in planning may join an open window, so it keeps the windows open.

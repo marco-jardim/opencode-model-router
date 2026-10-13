@@ -14,6 +14,7 @@
 // child's own `NEED MORE: budget` / `ESCALATE: authority` claim is not an exemption, only the guard's state is.
 // ---------------------------------------------------------------------------
 
+import type { DoD } from "../../verify/dod";
 import type {
   DecisionFacts,
   DecisionRow,
@@ -331,6 +332,22 @@ export function runSignal(input: RunSignalInput): SignalObservation | null {
     if (latest === null || latestFailed) return null;
   }
   return observe("run", "pass", SIGNAL_WEIGHTS.run);
+}
+
+/** Exact npm forms of a deterministic check's command → the `routing.run` script it names (`npm test`, `npm run <name>`). */
+const NPM_SCRIPT_RE = /^npm(?:\.cmd)?\s+(?:(test|t)|run(?:-script)?\s+([A-Za-z0-9_][A-Za-z0-9_.:@+-]*))$/;
+
+/**
+ * The acceptance commands of a dispatch's DoD as `routing.run` names (handoff 13): only exact npm script forms count.
+ * P2c.2: a check with its own `cwd` does not run in the work root, so the dispatch gets no run signal at all (`[]`).
+ */
+export function acceptanceScriptsOf(dod: DoD): string[] {
+  if (dod.kind !== "deterministic") return [];
+  if (dod.checks.some((check) => check.cwd !== undefined)) return [];
+  return dod.checks.flatMap((check) => {
+    const match = typeof check.command === "string" ? NPM_SCRIPT_RE.exec(check.command.trim()) : null;
+    return match === null ? [] : [match[1] !== undefined ? "test" : (match[2] as string)];
+  });
 }
 
 // ---------------------------------------------------------------------------

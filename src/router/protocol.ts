@@ -63,6 +63,10 @@ export function buildRolesProtocol(cfg: RouterConfig, roles: ReadonlyMap<string,
   const rawShell = enabled.some((spec) => spec.authority.allow.includes("router_run"))
     ? `Only when \`router_run\` refuses a command that is not on its allowlist, ask the user or dispatch a tier agent explicitly.`
     : `For a command, ask the user or dispatch a tier agent explicitly.`;
+  // Cross-repo (P1.7): one sentence, only when `routing.repoParents` is configured; otherwise the text is unchanged.
+  const crossRepo = (cfg.routing?.repoParents?.length ?? 0) > 0
+    ? ` Cross-repo: name another repository with repo=<name> (and branch=<ref> when it has several worktrees) instead of root=; each dispatch edits one repository, and a role may read the others below routing.repoParents. A check may run in another repository of the read set with cwd= and must then use scope=full, e.g. \`check: testsPass cwd="<repo>" scope=full\`.`
+    : "";
   return [
     ROLES_PROTOCOL_HEADING,
     ``,
@@ -77,7 +81,7 @@ export function buildRolesProtocol(cfg: RouterConfig, roles: ReadonlyMap<string,
     // QA-P22-1-1: `tier`/`pin` are not in the template; only a plan's `[tier:X]` tag is transcribed.
     `Route line: when present it must be the FIRST line of the prompt (the router removes it; a malformed one is refused for a role): \`[route class=<c> risk=<r> scope=<s> needs=<n,..> d=<d> budget=<n> root=<path>]\`, every key optional. class=search|recon|mechanical|implement|debug|design|review|other; risk=low|medium|high; scope=single|multi|repo; needs=shell|web|edit|network|external_dir (\`edit\` unlocks editing, \`shell\` router_run, where the role allows); d=deterministic|grader|none (counts only when the prompt's \`[acceptance]\` block backs it); budget=tool calls (up to twice the role's); root=the absolute work root. Only when the plan step carries \`[tier:X]\`, add \`tier=X pin\`; never otherwise.`,
     ``,
-    `Work root: a role works only in the session directory or one git worktree of this repo; for a worktree put \`root=<absolute path>\` on the route line (quote a path with spaces) and in ENVIRONMENT.`,
+    `Work root: a role works only in the session directory or one git worktree of this repo; for a worktree put \`root=<absolute path>\` on the route line (quote a path with spaces) and in ENVIRONMENT.${crossRepo}`,
     ``,
     `No role holds the web together with read, run or edit authority.${compose} Raw shell is outside roles mode. ${rawShell}`,
     ``,

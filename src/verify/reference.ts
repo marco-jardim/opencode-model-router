@@ -731,6 +731,9 @@ import { tmpdir as osTmpdir } from "node:os";
 import { posix as pathPosix, win32 as pathWin32 } from "node:path";
 import type { ArgvSeam, ExecOptions, ExecResult } from "./types";
 import type { TreeSnapshot } from "./dispatch";
+import { gitTopOf, perimeterKey } from "./git-top";
+// Type-only: pin.ts imports perimeter.ts, which imports this module; samePin is loaded lazily in step 7.
+import type { LinkPin } from "./pin";
 import type { PluginLogger } from "../router/logger";
 
 // --- Seams --------------------------------------------------------------------
@@ -804,6 +807,11 @@ export interface ReferenceDeps extends CaptureDeps {
   randomSuffix?: () => string;
   /** Default HEARTBEAT_INTERVAL_MS: how often a materialized dir's mtime is refreshed while in use. */
   heartbeatMs?: number;
+  /**
+   * Cross-repo P2.6: the current pin of a link target's repository top, computed by the caller (pin.ts pinTarget). With
+   * DispatchReference.pins, a package link into a pinned repository unchanged since dispatch is exact instead of external-link.
+   */
+  pinNow?: (root: string) => Promise<LinkPin>;
 }
 
 // --- Data types ---------------------------------------------------------------
@@ -823,6 +831,8 @@ export interface DispatchReference {
   readonly captureReasons: readonly InexactReason[];
   /** now() when the capture resolved. */
   readonly capturedAt: number;
+  /** Cross-repo P2.6: the dispatch-time pins of linked repositories (pin.ts); see ReferenceDeps.pinNow. */
+  readonly pins?: readonly LinkPin[];
 }
 
 export type InexactCause =
@@ -834,6 +844,8 @@ export type InexactCause =
   | "untracked-unsafe-path"
   | "dependency-drift"
   | "workspace-link-drift"
+  | "external-link"
+  | "root-link"
   | "index-flags"
   | "checkout-conversion";
 
@@ -903,6 +915,20 @@ const ADD_LOCK_UNSUPPORTED = /unknown option\W+(?:reason|lock)\b/;
 export const STALE_REFERENCE_AGE_MS = 60 * 60 * 1000;
 /** A live reference dir's mtime is refreshed this often, far below STALE_REFERENCE_AGE_MS (QA-1.5-4). */
 export const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
+/**
+ * Package-store layouts (pnpm `.pnpm/x@1/node_modules/x`, a global virtual store, a custom virtualStoreDir) all place the
+ * package directly under a node_modules dir (or its @scope): a package link whose real path is such a directory is store-like
+ * (P0.4, step 7 below; cross-repo P1.8 link discovery, perimeter.ts).
+ */
+export function isStoreLikeLink(real: string, platform: string): boolean {
+  const p = platform === "win32" ? pathWin32 : pathPosix;
+  const fold = (s: string): string => (platform === "win32" ? s.toLowerCase() : s);
+  const parent = p.dirname(real);
+  const parentName = fold(p.basename(parent));
+  if (parentName === "node_modules") return true;
+  return parentName.startsWith("@") && fold(p.basename(p.dirname(parent))) === "node_modules";
+}
+
 /** Equals the baselineTimeoutMs default (§1.4); callers pass the configured value. */
 export const DEFAULT_CAPTURE_TIMEOUT_MS = 15_000;
 export const DEFAULT_MATERIALIZE_TIMEOUT_MS = 30_000;
@@ -1778,6 +1804,8 @@ export async function materialize(
     }
 
     // 5. Discovery of ignored entries; nothing ignored is ever copied.
+    //    A directory-only pattern (`node_modules/`) never matches a symlink, so a symlinked node_modules
+    //    it does not ignore is an untracked entry (inexact via its untracked reason), never a link candidate.
     const ignored = await git(["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"]);
     if (budget.spent()) return await abandon("aborted", "aborted during ignored-file discovery");
     if (!ignored || ignored.code !== 0) return await abandon("error", ignored?.stderr.trim() ?? "ignored-file discovery failed");
@@ -1790,7 +1818,9 @@ export async function materialize(
     }
 
     // 6. Link node_modules (section 5), parents before children (git's order).
-    const linkTargets: string[] = [];
+    // Each target keeps the root-relative path of the candidate node_modules it came from,
+    // so drift reasons never leak a path outside root (a node_modules that is itself a link).
+    const linkTargets: { readonly target: string; readonly label: string }[] = [];
     for (const entry of candidates) {
       if (budget.spent()) return await abandon("aborted", "aborted while linking node_modules");
       const rel = entry.replace(/\/$/, "");
@@ -1822,7 +1852,7 @@ export async function materialize(
       }
       links.push(linkPath);
       await fs.symlink(target, linkPath, platform === "win32" ? "junction" : "dir");
-      linkTargets.push(target);
+      linkTargets.push({ target, label: rel });
     }
 
     // 7. Drift checks (section 2 c and d). Porcelain `git diff` rewrites the index
@@ -1849,8 +1879,45 @@ export async function materialize(
     for (const rel of splitZ(diff.stdout)) changed.add(rel);
     for (const rel of splitZ(nowUntracked.stdout)) if (!ref.untracked.has(rel)) changed.add(rel);
     const realRoot = p.resolve(await fs.realpath(root));
+    const fold = (s: string) => (platform === "win32" ? s.toLowerCase() : s);
     const workspaceDirs = new Set<string>();
-    for (const target of linkTargets) {
+    // P0.4: package links whose real path is outside the repository (and not a store-like
+    // path under a node_modules segment) load code the reference cannot pin.
+    const externalLinks = new Set<string>();
+    // A package link to the root itself, or to an ancestor of it, would load the live tree.
+    const rootLinks = new Set<string>();
+    // Package-store layouts (pnpm `.pnpm/x@1/node_modules/x`, a global virtual store, a custom
+    // virtualStoreDir) all place the package directly under a node_modules dir (or its @scope).
+    const storeLike = (real: string): boolean => isStoreLikeLink(real, platform);
+    // Cross-repo P2.6 (OD3, fail closed): an outside link whose git top was pinned at dispatch (ref.pins) and has the same
+    // pin now (deps.pinNow) is exact. No pin, an unpinnable or changed pin, no pinNow, or a throw keeps external-link.
+    const pins = ref.pins ?? [];
+    const pinNow = deps.pinNow;
+    const usePins = pins.length > 0 && pinNow !== undefined;
+    const pinVerdicts = new Map<string, Promise<boolean>>();
+    const pinnedUnchanged = async (real: string): Promise<boolean> => {
+      try {
+        if (pinNow === undefined) return false;
+        const top = gitTopOf(real);
+        if (top === undefined) return false;
+        const key = perimeterKey(top);
+        const dispatchPin = pins.find((pin) => perimeterKey(pin.root) === key);
+        if (dispatchPin === undefined || dispatchPin.kind !== "pinned") return false;
+        let verdict = pinVerdicts.get(key);
+        if (verdict === undefined) {
+          verdict = (async () => {
+            // Lazy: a static import would close the cycle reference -> pin -> perimeter -> reference.
+            const { samePin } = await import("./pin");
+            return samePin(dispatchPin, await pinNow(dispatchPin.root));
+          })().catch(() => false);
+          pinVerdicts.set(key, verdict);
+        }
+        return await verdict;
+      } catch {
+        return false;
+      }
+    };
+    for (const { target, label } of linkTargets) {
       for (const entry of await packageEntries(fs, target, platform)) {
         const stats = await lstatOrMissing(fs, entry);
         if (!stats || !stats.isSymbolicLink()) continue;
@@ -1862,12 +1929,21 @@ export async function materialize(
           continue;
         }
         const base = [realRoot, root].find((candidateRoot) => isStrictlyInside(real, candidateRoot, platform));
-        if (!base) continue;
+        if (!base) {
+          // Dot-entries (`.cache`, `.bin`) are tool state, not packages.
+          if (!p.basename(entry).startsWith(".")) {
+            const entryLabel = [label, ...p.relative(target, entry).split(p.sep)].join("/");
+            if (insideOrEqual(realRoot, real, platform) || insideOrEqual(root, real, platform)) rootLinks.add(entryLabel);
+            else if (!storeLike(real) && !(usePins && (await pinnedUnchanged(real)))) externalLinks.add(entryLabel);
+          }
+          continue;
+        }
         const rel = p.relative(base, real).split(p.sep).join("/");
         if (!rel.split("/").includes("node_modules")) workspaceDirs.add(rel);
       }
     }
-    const fold = (s: string) => (platform === "win32" ? s.toLowerCase() : s);
+    for (const rel of [...rootLinks].sort(byCodeUnit)) reasons.push({ cause: "root-link", path: rel });
+    for (const rel of [...externalLinks].sort(byCodeUnit)) reasons.push({ cause: "external-link", path: rel });
     // Section 2 (c) and (d) over a set of drifted paths; run on the step-7 set and, in step 7b, on
     // the paths its re-diff adds (#88), so a late edit is judged like any other drift.
     const driftReasons = (paths: readonly string[]) => {

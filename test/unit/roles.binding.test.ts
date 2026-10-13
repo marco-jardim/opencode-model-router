@@ -30,6 +30,7 @@ import {
   type SessionLookup,
 } from "../../src/routing/roles/binding";
 import { grantFor, type DispatchGrant } from "../../src/routing/roles/policy";
+import type { RepoLocation } from "../../src/routing/roles/admission";
 
 const PARENT = "ses_parent";
 const ROOT = resolve("/git/omr-rta-p16");
@@ -67,6 +68,33 @@ function nz(id: string): string {
 function grant(actions: readonly AuthorityAction[], workRoot: string | null = ROOT, notes: string[] = []): DispatchGrant {
   return { actions: new Set(actions), notes, workRoot };
 }
+
+describe("cross-repo P1.4: the grant's repository location survives every copy", () => {
+  const LOC: RepoLocation = { repository: ROOT, name: "omr-rta-p16", worktree: ROOT, branch: "main", head: "abc1234def", worktrees: [] };
+  const lookupFor = (callID: string): SessionLookup => async () => ({
+    parentID: PARENT, agent: "implementer", title: `task${nonceTitleSuffix(nz(callID))}`, firstText: `${noncePromptLine(nz(callID))}\ndo it`,
+  });
+
+  it("registerPending, the bound view and widen keep the location of a grant with a work root", async () => {
+    registerPending(pending("c-loc", { grant: { ...grant(["read", "edit"]), location: LOC } }));
+    const bound = await bind("child-loc", lookupFor("c-loc"), OPTS);
+    expect(bound.kind).toBe("exact");
+    expect(bound.grant.location).toEqual(LOC);
+    expect(currentBinding("child-loc", OPTS)?.grant.location).toEqual(LOC);
+    const widened = widen("child-loc", ["router_run"], MAX.implementer ?? []);
+    expect([...widened.actions]).toContain("router_run");
+    expect(widened.location).toEqual(LOC);
+    expect(currentBinding("child-loc", OPTS)?.grant.location).toEqual(LOC);
+  });
+
+  it("a grant without a work root never carries one", async () => {
+    registerPending(pending("c-noroot", { grant: { ...grant(["read"], null), location: LOC } }));
+    const bound = await bind("child-noroot", lookupFor("c-noroot"), OPTS);
+    expect(bound.grant.workRoot).toBeNull();
+    expect(bound.grant.location).toBeUndefined();
+    expect(currentBinding("child-noroot", OPTS)?.grant.location).toBeUndefined();
+  });
+});
 
 function pending(callID: string, over: Partial<PendingDispatch> = {}): PendingDispatch {
   return {

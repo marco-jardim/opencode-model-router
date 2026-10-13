@@ -5,7 +5,9 @@ import { parseVerifyDirectives } from "../../src/verify/directives";
 import type { DoD } from "../../src/verify/dod";
 import type { RiskAssessment } from "../../src/verify/risk";
 import type { ChangedPath } from "../../src/verify/runner";
-import type { ReferenceState } from "../../src/verify/types";
+import type { PerimeterObservation } from "../../src/verify/gate";
+import type { LinkPin } from "../../src/verify/pin";
+import type { CheckPlacement, ReferenceState } from "../../src/verify/types";
 import {
   ABANDONED_REASON,
   BACKGROUND_MAX_ATTEMPTS,
@@ -52,6 +54,7 @@ import {
   sanitizeDescription,
   unattributedRisk,
   type ClaimResult,
+  type DeferredPerimeter,
   type EvictionCause,
   type PendingEntry,
   type PendingRegistration,
@@ -180,6 +183,198 @@ function stateOf(registry: ReturnType<typeof setup>["registry"], sid: string, ha
   const found = registry.get(sid, handle);
   return found.kind === "found" ? found.entry.state : found.kind;
 }
+
+// ---------------------------------------------------------------------------------------------
+// R3 cross-repo P2e: a deferred entry's perimeter and placements
+// ---------------------------------------------------------------------------------------------
+
+const P2E_OBSERVATION: PerimeterObservation = {
+  w: { root: "/repo", name: "repo" },
+  roots: [{ root: "/other", name: "other", status: "unchanged" }],
+};
+const P2E_PIN: LinkPin = {
+  kind: "pinned",
+  root: "/lib",
+  head: "c".repeat(40),
+  fingerprint: "f".repeat(16),
+  ignored: "",
+  nested: [],
+};
+const P2E_PLACEMENTS: readonly (CheckPlacement | undefined)[] = [
+  { cwd: "/repo", top: "/repo", foreign: false },
+  undefined,
+  { cwd: "/lib", top: "/lib", foreign: true, scope: "full" },
+];
+
+function p2ePerimeter(pins: Promise<readonly LinkPin[]> = Promise.resolve([P2E_PIN])): DeferredPerimeter {
+  return {
+    observation: P2E_OBSERVATION,
+    workingSet: [{ root: "/repo", name: "repo" }, { root: "/other" }],
+    links: [
+      {
+        at: "/repo/node_modules/lib",
+        root: "/lib",
+        name: "lib",
+        head: "c".repeat(40),
+        fingerprint: "f".repeat(16),
+        admit: () => true,
+      },
+    ],
+    pins,
+  };
+}
+
+function foundEntry(registry: ReturnType<typeof setup>["registry"], handle: string): PendingEntry {
+  const found = registry.get("orch", handle);
+  if (found.kind !== "found") throw new Error(`expected found, got ${found.kind}`);
+  return found.entry;
+}
+
+describe("R3 cross-repo P2e: perimeter and placements", () => {
+  it("#107: linkBase (the W the links were read from) is stored with the frozen perimeter", () => {
+    const { registry, add } = setup();
+    const handle = add({ perimeter: { ...p2ePerimeter(), linkBase: "/repo/packages/web" } });
+    const perimeter = foundEntry(registry, handle).perimeter;
+    expect(perimeter?.linkBase).toBe("/repo/packages/web");
+    expect(Object.isFrozen(perimeter)).toBe(true);
+    const without = add({ perimeter: p2ePerimeter() });
+    expect(foundEntry(registry, without).perimeter?.linkBase).toBeUndefined();
+  });
+
+  it("P3c.4: the admission (parents in both spellings, depth, exclude, working set) is stored as a frozen copy", () => {
+    const { registry, add } = setup();
+    const parents = ["/Parent", "/real/parent"];
+    const exclude = ["/real/parent/skip-*"];
+    const workingSet = [{ worktree: "/repo", name: "repo" }, { worktree: "/other" }];
+    const handle = add({ perimeter: { ...p2ePerimeter(), admission: { parents, depth: 2, exclude, workingSet } } });
+    const admission = foundEntry(registry, handle).perimeter?.admission;
+    expect(admission).toEqual({
+      parents: ["/Parent", "/real/parent"],
+      depth: 2,
+      exclude: ["/real/parent/skip-*"],
+      workingSet: [{ worktree: "/repo", name: "repo" }, { worktree: "/other" }],
+    });
+    if (admission === undefined) throw new Error("admission missing");
+    // Frozen at every level, and never aliasing the caller's arrays: a later change by the caller is not seen.
+    expect(Object.isFrozen(admission)).toBe(true);
+    expect(Object.isFrozen(admission.parents)).toBe(true);
+    expect(Object.isFrozen(admission.exclude)).toBe(true);
+    expect(Object.isFrozen(admission.workingSet)).toBe(true);
+    for (const entry of admission.workingSet) expect(Object.isFrozen(entry)).toBe(true);
+    parents.push("/late");
+    exclude.length = 0;
+    workingSet[0] = { worktree: "/late" };
+    expect(admission.parents).toEqual(["/Parent", "/real/parent"]);
+    expect(admission.exclude).toEqual(["/real/parent/skip-*"]);
+    expect(admission.workingSet[0]).toEqual({ worktree: "/repo", name: "repo" });
+    expect(registry.listPending("orch")[0]?.perimeter?.admission).toEqual(admission);
+    // Absent stays absent (exclude too): router_verify then reads W's package links only, as before P3c.
+    const without = add({ perimeter: p2ePerimeter() });
+    expect(foundEntry(registry, without).perimeter?.admission).toBeUndefined();
+    const noExclude = add({ perimeter: { ...p2ePerimeter(), admission: { parents, depth: 1, workingSet: [] } } });
+    expect(foundEntry(registry, noExclude).perimeter?.admission).not.toHaveProperty("exclude");
+  });
+
+  it("stored and frozen in get/list", () => {
+    const { registry, add } = setup();
+    const handle = add({ perimeter: p2ePerimeter(), placements: P2E_PLACEMENTS });
+    const lists = [
+      foundEntry(registry, handle),
+      registry.listUnverified("orch")[0],
+      registry.listOpen("orch")[0],
+      registry.listPending("orch")[0],
+    ];
+    for (const entry of lists) {
+      if (entry === undefined) throw new Error("entry missing from a list");
+      const perimeter = entry.perimeter;
+      if (perimeter === undefined) throw new Error("perimeter missing");
+      expect(perimeter.observation).toBe(P2E_OBSERVATION);
+      expect(perimeter.workingSet).toEqual([{ root: "/repo", name: "repo" }, { root: "/other" }]);
+      expect(perimeter.links.map((l) => [l.at, l.root, l.name, l.head, l.fingerprint])).toEqual([
+        ["/repo/node_modules/lib", "/lib", "lib", "c".repeat(40), "f".repeat(16)],
+      ]);
+      expect(perimeter.links[0]?.admit?.("/lib")).toBe(true);
+      expect(entry.placements).toEqual(P2E_PLACEMENTS);
+      expect(Object.isFrozen(entry)).toBe(true);
+      expect(Object.isFrozen(perimeter)).toBe(true);
+      expect(Object.isFrozen(perimeter.workingSet)).toBe(true);
+      expect(Object.isFrozen(perimeter.workingSet[0])).toBe(true);
+      expect(Object.isFrozen(perimeter.links)).toBe(true);
+      expect(Object.isFrozen(perimeter.links[0])).toBe(true);
+      expect(Object.isFrozen(entry.placements)).toBe(true);
+    }
+  });
+
+  it("an entry without them has neither key", () => {
+    const { registry, add } = setup();
+    const handle = add();
+    const entries = [foundEntry(registry, handle), ...registry.listUnverified("orch"), ...registry.listOpen("orch")];
+    expect(entries.length).toBe(3);
+    for (const entry of entries) {
+      expect("perimeter" in entry).toBe(false);
+      expect("placements" in entry).toBe(false);
+    }
+    expect(registry.stats().weight).toBe(2);
+  });
+
+  it("terminal settle releases them; retryable keeps them", () => {
+    const { registry, add } = setup();
+    const handle = add({ perimeter: p2ePerimeter(), placements: P2E_PLACEMENTS });
+    expect(registry.stats().weight).toBe(2 + 2 + 1 + 3);
+    claimed(registry.markVerifying("orch", handle)).settle(BUSY);
+    const kept = foundEntry(registry, handle);
+    expect(kept.state).toBe("unverified");
+    expect(kept.perimeter?.workingSet.length).toBe(2);
+    expect(kept.placements).toEqual(P2E_PLACEMENTS);
+    expect(registry.stats().weight).toBe(8);
+    claimed(registry.markVerifying("orch", handle)).settle(PASS);
+    const released = foundEntry(registry, handle);
+    expect(released.state).toBe("verified");
+    expect("perimeter" in released).toBe(false);
+    expect("placements" in released).toBe(false);
+    expect(registry.stats().weight).toBe(0);
+  });
+
+  it("eviction releases them", () => {
+    const { registry, add, c, evictions } = setup();
+    const handle = add({ perimeter: p2ePerimeter(), placements: P2E_PLACEMENTS });
+    expect(registry.stats().weight).toBe(8);
+    c.advance(TTL);
+    expect(registry.get("orch", handle)).toEqual({ kind: "expired", handle });
+    expect(evictions).toEqual([{ handle, cause: "ttl" }]);
+    expect(registry.stats().weight).toBe(0);
+    expect(registry.stats().entries).toBe(0);
+  });
+
+  it("pins stored by identity; a rejection normalises to []", async () => {
+    const { registry, add } = setup();
+    const pins: readonly LinkPin[] = [P2E_PIN];
+    const handle = add({ perimeter: p2ePerimeter(Promise.resolve(pins)) });
+    const first = foundEntry(registry, handle).perimeter?.pins;
+    const second = foundEntry(registry, handle).perimeter?.pins;
+    if (first === undefined) throw new Error("pins missing");
+    expect(second).toBe(first);
+    expect(await first).toBe(pins);
+
+    const rejected = add({ perimeter: p2ePerimeter(Promise.reject(new Error("pin failed"))) });
+    const normalised = foundEntry(registry, rejected).perimeter?.pins;
+    if (normalised === undefined) throw new Error("pins missing");
+    await expect(normalised).resolves.toEqual([]);
+  });
+
+  it("they count toward the weight", () => {
+    const { registry, add } = setup({ maxWeight: 10 });
+    add({ changedFiles: paths(2), perimeter: p2ePerimeter(), placements: P2E_PLACEMENTS });
+    expect(registry.stats().weight).toBe(8);
+    expect(
+      registry.register(reg({ changedFiles: paths(0), perimeter: p2ePerimeter(), placements: P2E_PLACEMENTS })),
+    ).toMatchObject({ ok: false, code: "registry-full" });
+    expect(
+      registry.register(reg({ changedFiles: paths(0), placements: P2E_PLACEMENTS.slice(0, 2) })),
+    ).toMatchObject({ ok: true });
+    expect(registry.stats().weight).toBe(10);
+  });
+});
 
 // ---------------------------------------------------------------------------------------------
 // R2 handles

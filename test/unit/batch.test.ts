@@ -999,6 +999,19 @@ describe("createBatchCoordinator: windows and the union run", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("a request with crossLinkRoot uses runtime.direct, never the coordinator's plan (cross-repo P3a)", async () => {
+    const { calls, runtime } = harness(MODEL, { runtime: { batchWindowMs: WINDOW } });
+    const c = createBatchCoordinator({ platform: "linux" });
+    const direct = { scoped: { kind: "no-affected", note: "direct" }, recheck: undefined };
+    const crossLinked = req(["src/a.ts"], { crossLinkRoot: "/lib", crossLinkAliases: [`${ROOT}/node_modules/lib`] });
+    expect(await c.hook(runtime)(crossLinked)).toEqual(direct);
+    expect(calls.direct).toEqual([crossLinked]);
+    expect(calls.plans).toHaveLength(0);
+    expect(calls.opens).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);
+    await c.dispose();
+  });
+
   it("planning outcomes and an exhausted deadline settle at once, without a window or the slot", async () => {
     const late = req(["src/b.ts"]);
     const { calls, runtime } = harness(MODEL, {

@@ -12,6 +12,7 @@ import {
 } from "../../src/verify/deterministic";
 import {
   createDeadline,
+  createDirectTestsPassHook,
   NO_TESTS_PASS_HOOK,
   SLOT_DEADLINE_REASON,
   type CommandOutcome,
@@ -19,7 +20,7 @@ import {
 } from "../../src/verify/deterministic";
 import { resolveVerifyBudget } from "../../src/router/config";
 import type { DoD, Check } from "../../src/verify/dod";
-import type { LintSpec } from "../../src/verify/runner";
+import type { LintSpec, PlannerFs, PlanScopedRunInput, ScopingPlan, TestSearchSeam } from "../../src/verify/runner";
 import type { Deadline, DeterministicDeps, ExecResult, TestsPassHook, TestsPassRequest, TestsPassRun } from "../../src/verify/types";
 
 // ---------------------------------------------------------------------------
@@ -922,5 +923,717 @@ describe("runDeterministic — secret scrubbing", () => {
     );
     expect(verdict.pass).toBe(false);
     expect(verdict.reasons.join(" ")).not.toContain(secret);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cross-repo P2.4: per-check placements
+// ---------------------------------------------------------------------------
+
+describe("runDeterministic — per-check placements (P2.4)", () => {
+  const OTHER = "/other/repo";
+  const here = { cwd: "/fake/cwd", top: "/fake/cwd", foreign: false } as const;
+  const home = { cwd: OTHER, top: OTHER, foreign: false } as const;
+  const foreign = { cwd: OTHER, top: OTHER, foreign: true } as const;
+  const norm = (p: string): string => p.replace(/\\/g, "/");
+  const ranWith = (code: number): CommandOutcome => ({ kind: "ran", exec: { code, stdout: "", stderr: "" }, notes: [] });
+
+  /** Records the cwd every exec / fileExists / readFile saw. */
+  function spies(code = 0) {
+    const execCwds: (string | undefined)[] = [];
+    const paths: string[] = [];
+    const deps: Partial<DeterministicDeps> = {
+      exec: async (_cmd, opts) => { execCwds.push(opts?.cwd); return { code, stdout: "", stderr: "" }; },
+      fs: {
+        fileExists: async p => { paths.push(norm(p)); return true; },
+        readFile: async p => { paths.push(norm(p)); return "{}"; },
+      },
+    };
+    return { execCwds, paths, deps };
+  }
+
+  it("without placements the verdict is the one it always was (absent, empty and all-undefined alike)", async () => {
+    const dod = makeDoD([
+      { kind: "fileExists", path: "a.txt" },
+      { kind: "run", command: "node check.js" },
+      { kind: "buildPasses", command: "npm run build" },
+      { kind: "testsPass", command: "npm test" },
+      { kind: "schemaMatch", path: "a.json", schema: "{}" },
+    ]);
+    const run = (placements?: readonly undefined[]) =>
+      runDeterministic(dod, makeDeps({ testsPass: testsPassHook().fn, ...(placements ? { placements } : {}) }));
+    const base = await run();
+    expect(base.outcome).toBe("pass");
+    expect(base.method).toBe("deterministic");
+    expect(base.reasons).toEqual(["all 5 deterministic checks passed"]);
+    expect(base.evidence).toBe("exists: a.txt\n---\nexit 0: node check.js\n---\nexit 0: npm run build\n---\ntestsPass: affected tests passed (full, 1 tests)");
+    expect(await run([])).toEqual(base);
+    expect(await run([undefined, undefined, undefined, undefined, undefined])).toEqual(base);
+
+    const failing = makeDoD([{ kind: "fileExists", path: "a.txt" }, { kind: "run", command: "node check.js" }]);
+    const failures: string[] = [];
+    const v = await runDeterministic(failing, makeDeps({ exec: failExec(3), onFailure: r => failures.push(r) }));
+    const w = await runDeterministic(failing, makeDeps({ exec: failExec(3), placements: [undefined, undefined] }));
+    expect(w).toEqual(v);
+    expect(v.outcome).toBe("fail");
+    expect(failures).toEqual(["command exited 3: node check.js"]);
+  });
+
+  it("the placement cwd is the cwd of the run, build and lint hooks, the mutex key and the base of fileExists / schemaMatch", async () => {
+    const s = spies();
+    const keys: string[] = [];
+    const mutex = { runExclusive: <T>(key: string, fn: () => Promise<T>): Promise<T> => { keys.push(key); return fn(); } };
+    const verdict = await runDeterministic(
+      makeDoD([
+        { kind: "run", command: "node check.js" },
+        { kind: "buildPasses", command: "npm run build" },
+        { kind: "lintClean", command: "npx eslint ." },
+        { kind: "fileExists", path: "a.txt" },
+        { kind: "schemaMatch", path: "a.json", schema: "{}" },
+        { kind: "run", command: "node unplaced.js" },
+      ]),
+      makeDeps({ ...s.deps, mutex, placements: [home, home, home, home, home, undefined] }),
+    );
+    expect(verdict.outcome).toBe("pass");
+    expect(s.execCwds).toEqual([OTHER, OTHER, OTHER, "/fake/cwd"]);
+    // Only buildPasses and lintClean take the per-cwd lock.
+    expect(keys).toEqual([OTHER, OTHER]);
+    const read = s.paths.filter(p => p.endsWith("/a.txt") || p.endsWith("/a.json"));
+    expect(read).toHaveLength(2);
+    expect(read.every(p => p.includes("other/repo/"))).toBe(true);
+  });
+
+  it("a missing file names the placement cwd", async () => {
+    const verdict = await runDeterministic(
+      makeDoD([{ kind: "fileExists", path: "gone.ts" }]),
+      makeDeps({ fs: { fileExists: async () => false, readFile: async () => "{}" }, placements: [home] }),
+    );
+    expect(verdict.reasons).toEqual([`file not found in ${OTHER}: gone.ts`]);
+  });
+
+  it("the placement cwd is the cwd of the scoped hooks too (openScope, runShell)", async () => {
+    const opened: string[] = [];
+    const shells: (string | undefined)[] = [];
+    const unused = async (): Promise<never> => { throw new Error("not used"); };
+    const openScope: OpenCheckScope = meta => {
+      opened.push(meta.cwd);
+      return {
+        execute: unused, rechecker: () => unused,
+        runShell: async (_c, cwd) => { shells.push(cwd); return ranWith(0); },
+        runLint: async () => ranWith(0),
+        close: async () => {},
+      };
+    };
+    await runDeterministic(
+      makeDoD([{ kind: "run", command: "node check.js" }]),
+      makeDeps({ openScope, placements: [home], exec: async () => { throw new Error("scoped"); } }),
+    );
+    expect(opened).toEqual([OTHER]);
+    expect(shells).toEqual([OTHER]);
+  });
+
+  it("testsPass runs in the placement cwd; scope=full requests testScope full, scope=affected keeps the budget's", async () => {
+    const hook = testsPassHook();
+    const budget = { ...resolveVerifyBudget(undefined, { cores: 8 }), testScope: "full" as const };
+    const dod = makeDoD([{ kind: "testsPass", command: "npm test" }, { kind: "testsPass", command: "npm test" }, { kind: "testsPass", command: "npm test" }]);
+    await runDeterministic(dod, makeDeps({
+      testsPass: hook.fn, budget,
+      placements: [{ ...home, scope: "affected" }, { ...home, scope: "full" }, undefined],
+    }));
+    expect(hook.requests.map(r => r.cwd)).toEqual([OTHER, OTHER, "/fake/cwd"]);
+    // "affected" in a placement is the check's own word; only an absent scope defers to the budget.
+    expect(hook.requests.map(r => r.testScope)).toEqual(["affected", "full", "full"]);
+
+    const plain = testsPassHook();
+    await runDeterministic(makeDoD([{ kind: "testsPass", command: "npm test" }, { kind: "testsPass", command: "npm test" }]), makeDeps({
+      testsPass: plain.fn, budget: { ...budget, testScope: "affected" }, placements: [home, { ...home, scope: "full" }],
+    }));
+    expect(plain.requests.map(r => r.testScope)).toEqual(["affected", "full"]);
+  });
+
+  it("lintClean with scope=full runs unscoped: planLint is not called; scope=affected still plans", async () => {
+    const planned: string[] = [];
+    const shells: string[] = [];
+    const unused = async (): Promise<never> => { throw new Error("not used"); };
+    const openScope: OpenCheckScope = meta => ({
+      execute: unused, rechecker: () => unused,
+      runShell: async c => { shells.push(c); return ranWith(0); },
+      runLint: async () => { shells.push(`lint ${meta.command}`); return ranWith(0); },
+      close: async () => {},
+    });
+    const planLint: DeterministicDeps["planLint"] = async input => { planned.push(input.cwd); return { unscoped: true, reason: "x" }; };
+    const verdict = await runDeterministic(
+      makeDoD([{ kind: "lintClean", command: "npx eslint ." }, { kind: "lintClean", command: "npx eslint ." }]),
+      makeDeps({ openScope, planLint, exec: async () => { throw new Error("scoped"); }, placements: [{ ...home, scope: "full" }, { ...home, scope: "affected" }] }),
+    );
+    expect(verdict.outcome).toBe("pass");
+    expect(planned).toEqual([OTHER]);
+    expect(shells).toEqual(["npx eslint .", "npx eslint ."]);
+  });
+
+  it("F6: a failure in a foreign check is unverifiable with the consumer reason, and onFailure is not called", async () => {
+    const failures: string[] = [];
+    const verdict = await runDeterministic(
+      makeDoD([{ kind: "run", command: "node check.js" }]),
+      makeDeps({ exec: failExec(2, "boom"), onFailure: r => failures.push(r), placements: [foreign] }),
+    );
+    const reason = `a check in another repository (${OTHER}) failed; the change under verification is in the work root, so this failure can be neither excused nor attributed: command exited 2: node check.js`;
+    expect(verdict.outcome).toBe("unverifiable");
+    expect(verdict.pass).toBe(false);
+    expect(verdict.reasons).toEqual([reason]);
+    expect(verdict.caveats).toEqual([reason]);
+    expect(verdict.evidence).toContain("boom");
+    expect(failures).toEqual([]);
+  });
+
+  it("a foreign failure beside a work-root failure: the work-root one still fails the gate and is recorded", async () => {
+    const failures: string[] = [];
+    const verdict = await runDeterministic(
+      makeDoD([{ kind: "run", command: "node a.js" }, { kind: "run", command: "node b.js" }]),
+      makeDeps({ exec: failExec(1), onFailure: r => failures.push(r), placements: [foreign, here] }),
+    );
+    expect(verdict.outcome).toBe("fail");
+    expect(failures).toEqual(["command exited 1: node b.js"]);
+  });
+
+  it("a foreign check gets reference none (also when failureRecheck is off); a work-root check keeps the default", async () => {
+    const hook = testsPassHook();
+    const off = { ...resolveVerifyBudget(undefined, { cores: 8 }), failureRecheck: false };
+    await runDeterministic(
+      makeDoD([{ kind: "testsPass", command: "npm test" }, { kind: "testsPass", command: "npm test" }]),
+      makeDeps({ testsPass: hook.fn, budget: off, reference: { kind: "disabled" }, placements: [{ ...foreign, scope: "full" }, here] }),
+    );
+    expect(hook.requests[0]?.reference.kind).toBe("none");
+    expect(hook.requests[1]?.reference).toEqual({ kind: "disabled" });
+    const refs = testsPassHook();
+    await runDeterministic(makeDoD([{ kind: "testsPass", command: "npm test" }]), makeDeps({ testsPass: refs.fn, placements: [{ ...foreign, scope: "full" }] }));
+    expect(refs.requests[0]?.reference).toMatchObject({ kind: "none" });
+  });
+
+  it("a foreign pass is a normal pass", async () => {
+    const failures: string[] = [];
+    const verdict = await runDeterministic(
+      makeDoD([{ kind: "run", command: "node check.js" }, { kind: "testsPass", command: "npm test" }]),
+      makeDeps({ testsPass: testsPassHook().fn, onFailure: r => failures.push(r), placements: [foreign, { ...foreign, scope: "full" }] }),
+    );
+    expect(verdict.outcome).toBe("pass");
+    expect(verdict.pass).toBe(true);
+    expect(verdict.reasons).toEqual(["all 2 deterministic checks passed"]);
+    expect(failures).toEqual([]);
+  });
+
+  describe("a foreign testsPass / lintClean must use scope=full (design cross-repo.md)", () => {
+    const reasonOf = (n: number, kind: string): string =>
+      `check ${n} (${kind}) runs in another repository (${OTHER}) and must use scope=full: affected tests cannot be attributed to a change in the work root`;
+
+    it("foreign testsPass without scope: unverifiable, the tests hook is not called, onFailure is not called", async () => {
+      const hook = testsPassHook();
+      const failures: string[] = [];
+      const verdict = await runDeterministic(
+        makeDoD([{ kind: "testsPass", command: "npm test" }]),
+        makeDeps({ testsPass: hook.fn, onFailure: r => failures.push(r), placements: [foreign] }),
+      );
+      expect(verdict.outcome).toBe("unverifiable");
+      expect(verdict.pass).toBe(false);
+      expect(verdict.reasons).toEqual([reasonOf(1, "testsPass")]);
+      expect(verdict.caveats).toEqual([reasonOf(1, "testsPass")]);
+      expect(hook.requests).toEqual([]);
+      expect(failures).toEqual([]);
+    });
+
+    it("foreign testsPass with scope=affected and no changeRoot: the same", async () => {
+      const hook = testsPassHook();
+      const verdict = await runDeterministic(
+        makeDoD([{ kind: "run", command: "node a.js" }, { kind: "testsPass", command: "npm test" }]),
+        makeDeps({ testsPass: hook.fn, placements: [undefined, { ...foreign, scope: "affected" }] }),
+      );
+      expect(verdict.outcome).toBe("unverifiable");
+      expect(verdict.reasons).toEqual([reasonOf(2, "testsPass")]);
+      expect(hook.requests).toEqual([]);
+    });
+
+    // Cross-repo P3a (Y5, SD-P3a-1, D22): flipped on purpose. With the gate's changeRoot, an explicit scope=affected runs related
+    // through the link into W instead of being refused; no scope= and lintClean keep the refusal above.
+    describe("foreign testsPass with scope=affected and a changeRoot (cross-repo P3a, Y5)", () => {
+      const W = "/work/w";
+
+      it("calls the hook with testScope affected, the placement cwd, crossLinkRoot = changeRoot and the consumer's aliases", async () => {
+        const hook = testsPassHook();
+        const aliasCalls: string[] = [];
+        const verdict = await runDeterministic(
+          makeDoD([{ kind: "run", command: "node a.js" }, { kind: "testsPass", command: "npm test" }]),
+          makeDeps({
+            testsPass: hook.fn,
+            placements: [undefined, { ...foreign, scope: "affected" }],
+            changeRoot: W,
+            crossLinkAliases: consumerCwd => {
+              aliasCalls.push(consumerCwd);
+              return ["/spelled/w"];
+            },
+          }),
+        );
+        expect(verdict.outcome).toBe("pass");
+        expect(hook.requests).toHaveLength(1);
+        expect(hook.requests[0]).toMatchObject({ cwd: OTHER, testScope: "affected", crossLinkRoot: W, crossLinkAliases: ["/spelled/w"] });
+        expect(hook.requests[0]?.reference.kind).toBe("none");
+        expect(aliasCalls).toEqual([OTHER]);
+      });
+
+      it("a failing cross-link run stays unverifiable, never fail, and never reaches onFailure", async () => {
+        const hook = testsPassHook({
+          scoped: {
+            kind: "ran",
+            exitCode: 1,
+            notes: [],
+            result: { failingIds: ["test/a.test.js > a"], failingFiles: [`${OTHER}/test/a.test.js`], collectionError: false, total: 1, complete: true, source: "report" },
+          },
+          recheck: undefined,
+        });
+        const failures: string[] = [];
+        const verdict = await runDeterministic(
+          makeDoD([{ kind: "testsPass", command: "npm test" }]),
+          makeDeps({ testsPass: hook.fn, onFailure: r => failures.push(r), placements: [{ ...foreign, scope: "affected" }], changeRoot: W }),
+        );
+        expect(hook.requests).toHaveLength(1);
+        expect(verdict.outcome).toBe("unverifiable");
+        expect(verdict.pass).toBe(false);
+        expect(failures).toEqual([]);
+      });
+
+      it("without an alias provider the request carries crossLinkRoot and no crossLinkAliases", async () => {
+        const hook = testsPassHook();
+        await runDeterministic(
+          makeDoD([{ kind: "testsPass", command: "npm test" }]),
+          makeDeps({ testsPass: hook.fn, placements: [{ ...foreign, scope: "affected" }], changeRoot: W }),
+        );
+        expect(hook.requests).toHaveLength(1);
+        expect(hook.requests[0]).toMatchObject({ cwd: OTHER, testScope: "affected", crossLinkRoot: W });
+        expect(hook.requests[0]).not.toHaveProperty("crossLinkAliases");
+      });
+
+      it("forwards the deps' dispatchStartedAt to a cross-link request only (D23 as amended, QA C1)", async () => {
+        const started = 1_760_000_000_000;
+        const hook = testsPassHook();
+        await runDeterministic(
+          makeDoD([{ kind: "testsPass", command: "npm test" }]),
+          makeDeps({ testsPass: hook.fn, placements: [{ ...foreign, scope: "affected" }], changeRoot: W, dispatchStartedAt: started }),
+        );
+        expect(hook.requests[0]).toMatchObject({ crossLinkRoot: W, dispatchStartedAt: started });
+        // Without it, a cross-link request carries no start (the hook then lists no ignored module).
+        const without = testsPassHook();
+        await runDeterministic(
+          makeDoD([{ kind: "testsPass", command: "npm test" }]),
+          makeDeps({ testsPass: without.fn, placements: [{ ...foreign, scope: "affected" }], changeRoot: W }),
+        );
+        expect(without.requests[0]).toMatchObject({ crossLinkRoot: W });
+        expect(without.requests[0]).not.toHaveProperty("dispatchStartedAt");
+        // A request that is not cross-link never carries it (its plan input is the pre-P3a one).
+        const home = testsPassHook();
+        await runDeterministic(makeDoD([{ kind: "testsPass", command: "npm test" }]), makeDeps({ testsPass: home.fn, dispatchStartedAt: started }));
+        expect(home.requests[0]).not.toHaveProperty("crossLinkRoot");
+        expect(home.requests[0]).not.toHaveProperty("dispatchStartedAt");
+      });
+
+      it("a throwing alias provider gives no aliases (fail-soft), the run still happens", async () => {
+        const hook = testsPassHook();
+        const verdict = await runDeterministic(
+          makeDoD([{ kind: "testsPass", command: "npm test" }]),
+          makeDeps({
+            testsPass: hook.fn,
+            placements: [{ ...foreign, scope: "affected" }],
+            changeRoot: W,
+            crossLinkAliases: () => {
+              throw new Error("boom");
+            },
+          }),
+        );
+        expect(verdict.outcome).toBe("pass");
+        expect(hook.requests[0]).toMatchObject({ crossLinkRoot: W });
+        expect(hook.requests[0]).not.toHaveProperty("crossLinkAliases");
+      });
+
+      it("no scope= and lintClean keep the refusal byte-identical with a changeRoot", async () => {
+        const hook = testsPassHook();
+        const execCwds: (string | undefined)[] = [];
+        const verdict = await runDeterministic(
+          makeDoD([{ kind: "testsPass", command: "npm test" }, { kind: "lintClean", command: "npx eslint ." }]),
+          makeDeps({
+            testsPass: hook.fn,
+            exec: async (_c, opts) => { execCwds.push(opts?.cwd); return { code: 0, stdout: "", stderr: "" }; },
+            placements: [foreign, { ...foreign, scope: "affected" }],
+            changeRoot: W,
+            crossLinkAliases: () => ["/spelled/w"],
+          }),
+        );
+        expect(verdict.outcome).toBe("unverifiable");
+        expect(verdict.reasons).toEqual([reasonOf(1, "testsPass"), reasonOf(2, "lintClean")]);
+        expect(hook.requests).toEqual([]);
+        expect(execCwds).toEqual([]);
+      });
+
+      it("an in-repo testsPass with scope=affected never carries the cross-link root", async () => {
+        const hook = testsPassHook();
+        await runDeterministic(
+          makeDoD([{ kind: "testsPass", command: "npm test" }]),
+          makeDeps({ testsPass: hook.fn, placements: [{ ...here, scope: "affected" }], changeRoot: W, crossLinkAliases: () => ["/spelled/w"] }),
+        );
+        expect(hook.requests).toHaveLength(1);
+        expect(hook.requests[0]).not.toHaveProperty("crossLinkRoot");
+        expect(hook.requests[0]).not.toHaveProperty("crossLinkAliases");
+      });
+    });
+
+    it("foreign lintClean without full: unverifiable, nothing runs", async () => {
+      const execCwds: (string | undefined)[] = [];
+      const verdict = await runDeterministic(
+        makeDoD([{ kind: "lintClean", command: "npx eslint ." }, { kind: "lintClean", command: "npx eslint ." }]),
+        makeDeps({
+          exec: async (_c, opts) => { execCwds.push(opts?.cwd); return { code: 0, stdout: "", stderr: "" }; },
+          placements: [foreign, { ...foreign, scope: "affected" }],
+        }),
+      );
+      expect(verdict.outcome).toBe("unverifiable");
+      expect(verdict.reasons).toEqual([reasonOf(1, "lintClean"), reasonOf(2, "lintClean")]);
+      expect(execCwds).toEqual([]);
+    });
+
+    it("foreign testsPass and lintClean with scope=full run", async () => {
+      const hook = testsPassHook();
+      const execCwds: (string | undefined)[] = [];
+      const verdict = await runDeterministic(
+        makeDoD([{ kind: "testsPass", command: "npm test" }, { kind: "lintClean", command: "npx eslint ." }]),
+        makeDeps({
+          testsPass: hook.fn,
+          exec: async (_c, opts) => { execCwds.push(opts?.cwd); return { code: 0, stdout: "", stderr: "" }; },
+          placements: [{ ...foreign, scope: "full" }, { ...foreign, scope: "full" }],
+        }),
+      );
+      expect(verdict.outcome).toBe("pass");
+      expect(hook.requests.map(r => r.cwd)).toEqual([OTHER]);
+      expect(execCwds).toEqual([OTHER]);
+    });
+
+    it("a non-foreign testsPass without scope runs as today", async () => {
+      const hook = testsPassHook();
+      const verdict = await runDeterministic(
+        makeDoD([{ kind: "testsPass", command: "npm test" }, { kind: "testsPass", command: "npm test" }, { kind: "testsPass", command: "npm test" }]),
+        makeDeps({ testsPass: hook.fn, placements: [here, home, undefined] }),
+      );
+      expect(verdict.outcome).toBe("pass");
+      expect(hook.requests).toHaveLength(3);
+    });
+
+    it("foreign buildPasses, run, fileExists without scope are unchanged", async () => {
+      const s = spies();
+      const verdict = await runDeterministic(
+        makeDoD([
+          { kind: "buildPasses", command: "npm run build" },
+          { kind: "run", command: "node check.js" },
+          { kind: "fileExists", path: "a.txt" },
+        ]),
+        makeDeps({ ...s.deps, placements: [foreign, foreign, foreign] }),
+      );
+      expect(verdict.outcome).toBe("pass");
+      expect(s.execCwds).toEqual([OTHER, OTHER]);
+    });
+  });
+
+  it("a non-foreign placement failure behaves as without a placement (onFailure called, outcome fail)", async () => {
+    const failures: string[] = [];
+    const verdict = await runDeterministic(
+      makeDoD([{ kind: "run", command: "node check.js" }]),
+      makeDeps({ exec: failExec(4), onFailure: r => failures.push(r), placements: [home] }),
+    );
+    expect(verdict.outcome).toBe("fail");
+    expect(verdict.reasons).toEqual(["command exited 4: node check.js"]);
+    expect(failures).toEqual(["command exited 4: node check.js"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// createDirectTestsPassHook — cross-link root plumbing (cross-repo P3a, Y3)
+// ---------------------------------------------------------------------------
+
+describe("createDirectTestsPassHook — cross-link root (cross-repo P3a)", () => {
+  const CWD = "/fake/consumer";
+  const W = "/fake/lib";
+  const CHANGED = [{ path: `${W}/src/a.ts`, status: "modified" as const }];
+
+  function setup() {
+    const inputs: PlanScopedRunInput[] = [];
+    const plan = async (input: PlanScopedRunInput): Promise<ScopingPlan> => {
+      inputs.push(input);
+      return { noAffected: true, note: "no affected tests" };
+    };
+    const openScope: OpenCheckScope = () => { throw new Error("planning outcomes open no scope"); };
+    const plannerFs: PlannerFs = { fileExists: async () => true, readFile: async () => "{}" };
+    const search: TestSearchSeam = { findByName: async () => [], findByContent: async () => [] };
+    const host = { platform: "linux" as const };
+    const hook = createDirectTestsPassHook({ openScope, plannerFs, search, plan, host, budget: { maxWorkers: 2, failureRecheck: true } });
+    const today = { command: "npx vitest run", cwd: CWD, changedFiles: CHANGED, budget: { maxWorkers: 2 }, fs: plannerFs, search, host };
+    return { hook, inputs, today };
+  }
+
+  function request(over: Partial<TestsPassRequest> = {}): TestsPassRequest {
+    const deadline: Deadline = { budgetMs: 60_000, remaining: () => 60_000, bound: ms => ms, signal: new AbortController().signal };
+    return { command: "npx vitest run", cwd: CWD, testScope: "affected", changedFiles: CHANGED, reference: { kind: "disabled" }, deadline, ...over };
+  }
+
+  it("without crossLinkRoot the plan input is the pre-P3a one, with no extra undefined keys", async () => {
+    const s = setup();
+    expect(await s.hook(request())).toEqual({ scoped: { kind: "no-affected", note: "no affected tests" }, recheck: undefined });
+    expect(s.inputs).toHaveLength(1);
+    expect(s.inputs[0]).toStrictEqual(s.today);
+    expect(Object.keys(s.inputs[0]!).sort()).toEqual(Object.keys(s.today).sort());
+  });
+
+  it("forwards crossLinkRoot and crossLinkAliases to the plan", async () => {
+    const s = setup();
+    const aliases = ["/fake/consumer/node_modules/lib", "/fake/LIB"];
+    await s.hook(request({ crossLinkRoot: W, crossLinkAliases: aliases }));
+    expect(s.inputs).toHaveLength(1);
+    expect(s.inputs[0]).toStrictEqual({ ...s.today, crossLinkRoot: W, crossLinkAliases: aliases });
+  });
+
+  it("forwards crossLinkRoot alone without adding a crossLinkAliases key", async () => {
+    const s = setup();
+    await s.hook(request({ crossLinkRoot: W }));
+    expect(s.inputs[0]).toStrictEqual({ ...s.today, crossLinkRoot: W });
+    expect("crossLinkAliases" in s.inputs[0]!).toBe(false);
+  });
+
+  // D23 (OD-P3a-2 b, finding X6): W's git-ignored modules (its build output) become cross-link inputs.
+  describe("the linked repository's ignored modules (D23)", () => {
+    type ListIgnored = NonNullable<Parameters<typeof createDirectTestsPassHook>[0]["listIgnored"]>;
+    type IgnoredModules = import("../../src/verify/tree").IgnoredModules;
+    /** D23 as amended (2026-10-12, QA C1): the dispatch start a cross-link request carries (ms epoch). */
+    const STARTED = 1_760_000_000_000;
+
+    /** QA round 2 M-A: the newest listed build output, after the dispatch start and after every source (SOURCE_MTIME). */
+    const BUILT = STARTED + 1_000;
+    /** QA round 2 M-A: the default mtime of every changed source of W: after the dispatch start, before the build. */
+    const SOURCE_MTIME = STARTED + 500;
+    /** A listing whose every file counts toward one ignored directory (`dist` unless named) built at `newest`. */
+    function listing(files: string[], newestMtimeByDir: Record<string, number> = { dist: BUILT }): IgnoredModules {
+      return { files, newestMtimeByDir };
+    }
+
+    function setupWith(
+      answer: IgnoredModules | (() => Promise<IgnoredModules>),
+      mtimeOf: ((path: string) => Promise<number | undefined>) | null = async () => SOURCE_MTIME,
+    ) {
+      const inputs: PlanScopedRunInput[] = [];
+      const plan = async (input: PlanScopedRunInput): Promise<ScopingPlan> => {
+        inputs.push(input);
+        return { noAffected: true, note: "no affected tests" };
+      };
+      const calls: { root: string; signal: AbortSignal; since: number }[] = [];
+      const listIgnored: ListIgnored = async (root, signal, since) => {
+        calls.push({ root, signal, since });
+        return typeof answer === "function" ? answer() : answer;
+      };
+      const stats: string[] = [];
+      const seam = mtimeOf === null
+        ? undefined
+        : ((fn: (path: string) => Promise<number | undefined>) => async (path: string) => { stats.push(path); return fn(path); })(mtimeOf);
+      const openScope: OpenCheckScope = () => { throw new Error("planning outcomes open no scope"); };
+      const plannerFs: PlannerFs = { fileExists: async () => true, readFile: async () => "{}" };
+      const search: TestSearchSeam = { findByName: async () => [], findByContent: async () => [] };
+      const host = { platform: "linux" as const };
+      const hook = createDirectTestsPassHook({
+        openScope, plannerFs, search, plan, host, budget: { maxWorkers: 2, failureRecheck: true }, listIgnored,
+        ...(seam !== undefined ? { mtimeOf: seam } : {}),
+      });
+      const today = { command: "npx vitest run", cwd: CWD, changedFiles: CHANGED, budget: { maxWorkers: 2 }, fs: plannerFs, search, host };
+      return { hook, inputs, calls, stats, today };
+    }
+
+    it("appends W's ignored modules to the plan's changed files, deduplicated, listing W once with the gate's signal", async () => {
+      const s = setupWith(listing([`${W}/dist/index.js`, `${W}/src/a.ts`, `${W}/dist/esm/index.mjs`], { dist: BUILT, src: BUILT }));
+      const req = request({ crossLinkRoot: W, dispatchStartedAt: STARTED });
+      expect(await s.hook(req)).toEqual({ scoped: { kind: "no-affected", note: "no affected tests" }, recheck: undefined });
+      expect(s.calls).toEqual([{ root: W, signal: req.deadline.signal, since: STARTED }]);
+      expect(s.inputs).toHaveLength(1);
+      expect(s.inputs[0]).toStrictEqual({
+        ...s.today,
+        changedFiles: [
+          ...CHANGED,
+          // `!!`: git porcelain's code for an ignored file (ChangedPath.status is informational only).
+          { path: `${W}/dist/index.js`, status: "!!" },
+          { path: `${W}/dist/esm/index.mjs`, status: "!!" },
+        ],
+        crossLinkRoot: W,
+      });
+    });
+
+    it("no ignored module: the plan input is the one without a lister", async () => {
+      const s = setupWith(listing([], {}));
+      await s.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED }));
+      expect(s.calls).toHaveLength(1);
+      expect(s.inputs[0]).toStrictEqual({ ...s.today, crossLinkRoot: W });
+      // QA round 2 M-A: nothing listed, nothing compared (zero selection guards it).
+      expect(s.stats).toEqual([]);
+    });
+
+    // QA round 2 M-A: a build written during the dispatch is still stale when a source of W changed again after it.
+    const STALE = {
+      scoped: {
+        kind: "unverifiable",
+        code: "cross-link-build-stale",
+        reason:
+          `the build output in ${W}/dist is older than src/a.ts changed in the linked repository; ` +
+          "rebuild it (e.g. a buildPasses check in the linked repository before this one) or use scope=full",
+      },
+      recheck: undefined,
+    };
+
+    it("a changed source of W newer than the newest fresh build in that directory → S6 cross-link-build-stale; the plan is never called (QA round 2 M-A)", async () => {
+      const s = setupWith(listing([`${W}/dist/index.js`, `${W}/dist/esm/index.mjs`]), async () => BUILT + 1);
+      expect(await s.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED }))).toEqual(STALE);
+      expect(s.stats).toEqual([`${W}/src/a.ts`]);
+      expect(s.inputs).toHaveLength(0);
+    });
+
+    it("a changed source of W older than (or as old as) the newest fresh build → the modules are appended as before (QA round 2 M-A)", async () => {
+      for (const mtime of [BUILT - 1, BUILT]) {
+        const s = setupWith(listing([`${W}/dist/index.js`]), async () => mtime);
+        await s.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED }));
+        expect(s.stats).toEqual([`${W}/src/a.ts`]);
+        expect(s.inputs[0]!.changedFiles).toEqual([...CHANGED, { path: `${W}/dist/index.js`, status: "!!" }]);
+      }
+    });
+
+    it("each ignored directory that contributed modules is compared on its own newest module (QA round 2 M-A)", async () => {
+      const s = setupWith(listing([`${W}/dist/index.js`, `${W}/types-gen/index.js`], { dist: BUILT + 10, "types-gen": BUILT }), async () => BUILT + 1);
+      const run = await s.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED }));
+      expect(run.scoped).toEqual({ ...STALE.scoped, reason: STALE.scoped.reason.replace(`${W}/dist`, `${W}/types-gen`) });
+      expect(s.inputs).toHaveLength(0);
+    });
+
+    it("a fresh tool-state file (`coverage/`, `.vitest/`, `node_modules/.vite`) is neither compared nor appended (QA round 2 M-A)", async () => {
+      const files = [`${W}/coverage/prettify.js`, `${W}/dist/index.js`, `${W}/.vitest/results.json`, `${W}/node_modules/.vite/deps.js`];
+      const newest = { coverage: SOURCE_MTIME - 1, dist: BUILT, ".vitest": SOURCE_MTIME - 1, "node_modules/.vite": SOURCE_MTIME - 1 };
+      const s = setupWith(listing(files, newest));
+      await s.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED }));
+      expect(s.inputs[0]!.changedFiles).toEqual([...CHANGED, { path: `${W}/dist/index.js`, status: "!!" }]);
+      // Only tool state fresh: nothing is appended and nothing compared.
+      const only = setupWith(listing([`${W}/coverage/prettify.js`], { coverage: SOURCE_MTIME - 1 }));
+      await only.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED }));
+      expect(only.stats).toEqual([]);
+      expect(only.inputs[0]).toStrictEqual({ ...only.today, crossLinkRoot: W });
+    });
+
+    it("only W's changed sources count: tests, declaration files, deleted, ignored (`!!`), gone and outside-W files never make the build stale (QA round 2 M-A)", async () => {
+      const changedFiles = [
+        { path: `${W}/test/a.test.ts`, status: "modified" },
+        { path: `${W}/src/a.spec.ts`, status: "modified" },
+        { path: `${W}/src/types.d.ts`, status: "modified" },
+        { path: `${W}/src/old.ts`, status: "deleted" },
+        { path: `${W}/src/older.ts`, status: " D" },
+        { path: `${W}/dist/extra.js`, status: "!!" },
+        { path: `${W}/src/gone.ts`, status: "modified" },
+        { path: `${CWD}/src/consumer.ts`, status: "modified" },
+      ];
+      const s = setupWith(listing([`${W}/dist/index.js`]), async path => (path === `${W}/src/gone.ts` ? undefined : BUILT + 1));
+      const run = await s.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED, changedFiles }));
+      expect(run.scoped.kind).toBe("no-affected");
+      expect(s.stats).toEqual([`${W}/src/gone.ts`]);
+      expect(s.inputs[0]!.changedFiles).toEqual([...changedFiles, { path: `${W}/dist/index.js`, status: "!!" }]);
+    });
+
+    it("a source whose mtime cannot be read, or no mtime seam at all, counts as newer than the build (fail closed, QA round 2 M-A)", async () => {
+      const thrown = setupWith(listing([`${W}/dist/index.js`]), async () => { throw new Error("EACCES"); });
+      expect(await thrown.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED }))).toEqual(STALE);
+      expect(thrown.inputs).toHaveLength(0);
+      const unseamed = setupWith(listing([`${W}/dist/index.js`]), null);
+      expect(await unseamed.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED }))).toEqual(STALE);
+      expect(unseamed.inputs).toHaveLength(0);
+    });
+
+    it("passes since = the request's dispatch start to the lister (D23 as amended, QA C1)", async () => {
+      const s = setupWith(listing([`${W}/dist/index.js`]));
+      await s.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED + 42 }));
+      expect(s.calls.map(call => call.since)).toEqual([STARTED + 42]);
+      expect(s.inputs[0]!.changedFiles).toEqual([...CHANGED, { path: `${W}/dist/index.js`, status: "!!" }]);
+    });
+
+    it("no dispatch start (absent or not finite) → the lister is never called and no ignored module is an input (QA C1)", async () => {
+      for (const over of [{}, { dispatchStartedAt: Number.NaN }, { dispatchStartedAt: Number.POSITIVE_INFINITY }]) {
+        // Even a lister that would answer over-bounds is never reached: fail toward zero selection, never toward stale inputs.
+        const s = setupWith({ overBounds: true });
+        expect(await s.hook(request({ crossLinkRoot: W, ...over })))
+          .toEqual({ scoped: { kind: "no-affected", note: "no affected tests" }, recheck: undefined });
+        expect(s.calls).toHaveLength(0);
+        expect(s.inputs).toHaveLength(1);
+        expect(s.inputs[0]).toStrictEqual({ ...s.today, crossLinkRoot: W });
+      }
+    });
+
+    it("an empty change set for W → the lister is never called and no ignored module is an input (QA M4)", async () => {
+      const s = setupWith(listing([`${W}/dist/index.js`]));
+      await s.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED, changedFiles: [] }));
+      expect(s.calls).toHaveLength(0);
+      expect(s.inputs).toHaveLength(1);
+      expect(s.inputs[0]!.changedFiles).toEqual([]);
+      expect(s.inputs[0]!.crossLinkRoot).toBe(W);
+    });
+
+    it("unavailable changed files → the lister is never called (the request's own changed files)", async () => {
+      const s = setupWith(listing([`${W}/dist/index.js`]));
+      await s.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED, changedFiles: "unavailable" }));
+      expect(s.calls).toHaveLength(0);
+    });
+
+    it("over bounds → unverifiable S6 cross-link-ignored-over-bounds naming W; the plan is never called", async () => {
+      const s = setupWith({ overBounds: true });
+      const run = await s.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED }));
+      expect(run).toEqual({
+        scoped: {
+          kind: "unverifiable",
+          code: "cross-link-ignored-over-bounds",
+          reason: `too many ignored modules in the linked repository to pass as inputs: ${W}`,
+        },
+        recheck: undefined,
+      });
+      expect(s.inputs).toHaveLength(0);
+    });
+
+    it("unavailable (or a lister that throws) → unverifiable S6 cross-link-ignored-unavailable; the plan is never called", async () => {
+      const unavailable = {
+        scoped: {
+          kind: "unverifiable",
+          code: "cross-link-ignored-unavailable",
+          reason: `the ignored modules of the linked repository could not be listed: ${W}`,
+        },
+        recheck: undefined,
+      };
+      const s = setupWith({ unavailable: true });
+      expect(await s.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED }))).toEqual(unavailable);
+      expect(s.inputs).toHaveLength(0);
+      const thrown = setupWith(async () => { throw new Error("boom"); });
+      expect(await thrown.hook(request({ crossLinkRoot: W, dispatchStartedAt: STARTED }))).toEqual(unavailable);
+      expect(thrown.inputs).toHaveLength(0);
+    });
+
+    it("without crossLinkRoot the lister is never called and the plan input is the pre-P3a one", async () => {
+      const s = setupWith(listing([`${W}/dist/index.js`]));
+      await s.hook(request({ dispatchStartedAt: STARTED }));
+      expect(s.calls).toHaveLength(0);
+      expect(s.inputs[0]).toStrictEqual(s.today);
+    });
+
+    it("testScope full never lists W's ignored modules", async () => {
+      const s = setupWith({ overBounds: true });
+      const openScope: OpenCheckScope = () => { throw new Error("full opens a scope"); };
+      const hook = createDirectTestsPassHook({
+        openScope, plannerFs: { fileExists: async () => true, readFile: async () => "{}" },
+        search: { findByName: async () => [], findByContent: async () => [] },
+        budget: { maxWorkers: 2, failureRecheck: true },
+        listIgnored: async (root, signal, since) => { s.calls.push({ root, signal, since }); return { overBounds: true }; },
+      });
+      const run = await hook(request({ crossLinkRoot: W, testScope: "full", dispatchStartedAt: STARTED }));
+      expect(run.scoped.kind).toBe("error");
+      expect(s.calls).toHaveLength(0);
+    });
   });
 });

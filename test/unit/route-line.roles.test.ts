@@ -52,6 +52,183 @@ describe("route line roles keys", () => {
   });
 });
 
+describe("route line cross-repo keys (repo, branch)", () => {
+  it("parses repo and keeps its case", () => {
+    expect(parse("[route repo=app-a]").line?.repo).toBe("app-a");
+    const { line } = parse("[route repo=App-A.v2_x]");
+    expect(line?.repo).toBe("App-A.v2_x");
+    expect(line?.ignored).toEqual([]);
+  });
+
+  it("accepts a 100-char repo and ignores a 101-char one", () => {
+    expect(parse(`[route repo=${"a".repeat(100)}]`).line?.repo).toBe("a".repeat(100));
+    const { line } = parse(`[route repo=${"a".repeat(101)}]`);
+    expect(line?.repo).toBeUndefined();
+    expect(line?.ignored).toContain("repo");
+  });
+
+  it.each([["../x"], ["a/b"], ["-x"], ["."], [".."], ["a\\b"], [".x"], [""]])("ignores the invalid repo %j", (value) => {
+    const { line } = parse(`[route repo=${value}]`);
+    expect(line?.repo).toBeUndefined();
+    expect(line?.ignored).toContain("repo");
+  });
+
+  it("ignores a bare repo key", () => {
+    const { line } = parse("[route repo]");
+    expect(line?.repo).toBeUndefined();
+    expect(line?.ignored).toContain("repo");
+  });
+
+  it("parses branch and keeps its case", () => {
+    const { line } = parse("[route branch=feat/Login-2]");
+    expect(line?.branch).toBe("feat/Login-2");
+    expect(line?.ignored).toEqual([]);
+    expect(parse("[route branch=release_1.2.x]").line?.branch).toBe("release_1.2.x");
+  });
+
+  it("accepts a 200-char branch and ignores a 201-char one", () => {
+    expect(parse(`[route branch=${"b".repeat(200)}]`).line?.branch).toBe("b".repeat(200));
+    const { line } = parse(`[route branch=${"b".repeat(201)}]`);
+    expect(line?.branch).toBeUndefined();
+    expect(line?.ignored).toContain("branch");
+  });
+
+  it.each([["-x"], ["/x"], ["x/"], ["a..b"], ["a//b"], ["x.lock"], ["x."], ["a~b"], ["a:b"], ["a\\b"], [""]])(
+    "ignores the invalid branch %j",
+    (value) => {
+      const { line } = parse(`[route branch=${value}]`);
+      expect(line?.branch).toBeUndefined();
+      expect(line?.ignored).toContain("branch");
+    },
+  );
+
+  it.each([["renovate/foo+bar"], ["feat/ação"], ["a@b"], ["release/1.2+build#5"], ["wip{x}"]])(
+    "accepts the git-valid branch %j",
+    (value) => {
+      const { line } = parse(`[route branch=${value}]`);
+      expect(line?.branch).toBe(value);
+      expect(line?.ignored).toEqual([]);
+      expect(line?.invalidCrossRepo).toBeUndefined();
+    },
+  );
+
+  it.each([["a..b"], ["x.lock"], ["@"], ["a@{b"], ["a\u0001b"], ["a/.hidden"], ["a.lock/b"], ["a?b"], ["a*b"], ["a[b"], ["a^b"], ["a\u007fb"]])(
+    "ignores the git-invalid branch %j and marks it declared-but-invalid",
+    (value) => {
+      const { line } = parse(`[route branch=${value}]`);
+      expect(line?.branch).toBeUndefined();
+      expect(line?.ignored).toContain("branch");
+      expect(line?.invalidCrossRepo).toEqual([{ key: "branch", value }]);
+    },
+  );
+
+  it("marks an invalid repo, a bare repo / branch key, and keeps the value as written", () => {
+    expect(parse("[route repo=.dotfiles branch=main]").line?.invalidCrossRepo).toEqual([{ key: "repo", value: ".dotfiles" }]);
+    expect(parse("[route repo]").line?.invalidCrossRepo).toEqual([{ key: "repo", value: "" }]);
+    expect(parse("[route branch]").line?.invalidCrossRepo).toEqual([{ key: "branch", value: "" }]);
+    expect(parse("[route branch=A..B,]").line?.invalidCrossRepo).toEqual([{ key: "branch", value: "A..B" }]);
+  });
+
+  it("marks a duplicate repo / branch key (the first value is still kept)", () => {
+    const { line } = parse("[route repo=a repo=b branch=x branch=y]");
+    expect(line?.repo).toBe("a");
+    expect(line?.invalidCrossRepo).toEqual([{ key: "repo", value: "b" }, { key: "branch", value: "y" }]);
+  });
+
+  it("marks a repo / branch the route lines contradict, so a conflict never binds the session directory", () => {
+    const byBranch = parse("[route repo=a branch=x]\n[route repo=a branch=y]", "any");
+    expect(byBranch.line?.invalidCrossRepo).toEqual([{ key: "branch", value: "x" }]);
+    const byRepo = parse("[route repo=a]\n[route repo=b]", "any");
+    expect(byRepo.line?.invalidCrossRepo).toEqual([{ key: "repo", value: "a" }]);
+    expect(parse("[route repo=a branch=x]\n[route repo=a branch=x]", "any").line?.invalidCrossRepo).toBeUndefined();
+    // QA round 3 (Q9): a `root=` the parser rejects is an invalid declaration too, never "no root declared".
+    const invalidRoots: ReadonlyArray<readonly [string, string]> = [
+      ["[route root=../app-b]", "../app-b"],
+      ["[route root=D:\\git\\x\\..\\y]", "D:\\git\\x\\..\\y"],
+      ["[route root=\\\\host\\share\\r]", "\\\\host\\share\\r"],
+      ["[route root=D:git\\r]", "D:git\\r"],
+      ["[route root]", ""],
+      ["[route root=\"D:\\My Work]", "\"D:\\My"],
+      ["[route root=relative/dir,]", "relative/dir"],
+    ];
+    for (const [text, value] of invalidRoots) {
+      const parsed = parse(text);
+      expect(parsed.line?.root, text).toBeUndefined();
+      expect(parsed.line?.invalidCrossRepo, text).toEqual([{ key: "root", value }]);
+      // tier dispatches read `ignored` only: unchanged (an invalid root is an ignored key, as before)
+      expect(parsed.line?.ignored, text).toContain("root");
+    }
+    // a second `root=` on the same line is a duplicate declaration (quoted or not)
+    const dupRoot = parse("[route root=D:\\a root=D:\\b]");
+    expect(dupRoot.line?.root).toBe("D:\\a");
+    expect(dupRoot.line?.invalidCrossRepo).toEqual([{ key: "root", value: "D:\\b" }]);
+    expect(parse("[route root=\"D:\\a b\" root=\"D:\\c d\"]").line?.invalidCrossRepo).toEqual([{ key: "root", value: "D:\\c d" }]);
+    expect(parse("[route root]\n").line?.invalidCrossRepo).toEqual([{ key: "root", value: "" }]);
+    // conflicting `root=` across lines: no root, the first line's declaration is invalid
+    const conflictRoot = parse("[route root=D:\\a]\n[route root=D:\\b]", "any");
+    expect(conflictRoot.conflict).toBe(true);
+    expect(conflictRoot.line?.root).toBeUndefined();
+    expect(conflictRoot.line?.invalidCrossRepo).toEqual([{ key: "root", value: "D:\\a" }]);
+    // lines that differ only in an invalid `root=`: no conflict (tier behaviour unchanged), every invalid root kept
+    const sameButRoot = parse("[route class=debug root=bad1]\n[route class=debug root=bad2]", "any");
+    expect(sameButRoot.conflict).toBe(false);
+    expect(sameButRoot.line?.class).toBe("debug");
+    expect(sameButRoot.line?.invalidCrossRepo).toEqual([{ key: "root", value: "bad1" }, { key: "root", value: "bad2" }]);
+    // a valid root is no invalid declaration
+    expect(parse("[route root=\"D:\\My Work\\Repo\"]").line?.invalidCrossRepo).toBeUndefined();
+    expect(parse("[route root=/srv/app]").line?.invalidCrossRepo).toBeUndefined();
+  });
+
+  it("splits a branch at whitespace: the first token is the value, the rest is an unknown key", () => {
+    const { line } = parse("[route branch=has space]");
+    expect(line?.branch).toBe("has");
+    expect(line?.ignored).toEqual(["space"]);
+  });
+
+  it("strips a trailing comma or semicolon from the values", () => {
+    const { line } = parse("[route repo=app-a, branch=feat/x;]");
+    expect(line?.repo).toBe("app-a");
+    expect(line?.branch).toBe("feat/x");
+  });
+
+  it("reports duplicates as dup:repo / dup:branch and keeps the first", () => {
+    const { line } = parse("[route repo=a repo=b branch=x branch=y]");
+    expect(line?.repo).toBe("a");
+    expect(line?.branch).toBe("x");
+    expect(line?.ignored).toEqual(["dup:repo", "dup:branch"]);
+  });
+
+  it("keeps root, repo and branch together", () => {
+    const { line } = parse("[route tier=medium root=D:\\git\\wt\\feat repo=App-A branch=feat/Login-2]");
+    expect(line?.root).toBe("D:\\git\\wt\\feat");
+    expect(line?.repo).toBe("App-A");
+    expect(line?.branch).toBe("feat/Login-2");
+    expect(line?.tier).toBe("medium");
+    expect(line?.ignored).toEqual([]);
+  });
+
+  it("treats route lines that differ only in repo or branch as a conflict", () => {
+    const byBranch = parse("[route repo=a branch=x]\n[route repo=a branch=y]", "any");
+    expect(byBranch.conflict).toBe(true);
+    expect(byBranch.line?.branch).toBeUndefined();
+    expect(byBranch.line?.repo).toBe("a");
+    expect(byBranch.line?.ignored).toContain("conflict:branch");
+    const byRepo = parse("[route repo=a]\n[route repo=b]", "any");
+    expect(byRepo.conflict).toBe(true);
+    expect(byRepo.line?.repo).toBeUndefined();
+    expect(byRepo.line?.ignored).toContain("conflict:repo");
+    expect(parse("[route repo=a branch=x]\n[route repo=a branch=x]", "any").conflict).toBe(false);
+  });
+
+  it("still applies the 500-char cap to a line carrying repo and branch", () => {
+    const text = `[route repo=app-a branch=${"b".repeat(480)}]\nbody`;
+    const r = parse(text);
+    expect(r.line).toBeNull();
+    expect(r.malformed).toBe(true);
+    expect(r.stripped).toBe(text);
+  });
+});
+
 describe("QA-P12-1-6: work roots are local paths; a malformed first route line is flagged", () => {
   it.each([
     ["UNC", "\\\\host\\share\\repo"],

@@ -228,8 +228,18 @@ export function buildRoleLines(roles: Iterable<RoleSpec>): string[] {
   return lines.length === 0 ? [] : ["Roles:", ...lines];
 }
 
+/**
+ * Cross-repo P4.7 (SD-P4-10): the help lines of `/router approve|repos|revoke`, listed only where they run (OpenCode v2, roles
+ * mode, `routing.repoParents` non-empty).
+ */
+export const ROUTER_APPROVAL_HELP_LINES: readonly string[] = Object.freeze([
+  "- `/router approve <path>` — approve a repository outside `routing.repoParents` for role dispatches with `root=<path>` (identity from git; quote a path with spaces)",
+  "- `/router repos` — list the approved repositories, their last use and expiry",
+  "- `/router revoke <path>` — remove an approval and drop the repository from every working set",
+]);
+
 /** Bare `/router`. */
-export function buildRouterHelp(current: string, options: { stats?: boolean; roles?: Iterable<RoleSpec> } = {}): string {
+export function buildRouterHelp(current: string, options: { stats?: boolean; roles?: Iterable<RoleSpec>; approvals?: boolean } = {}): string {
   const roleLines = options.roles === undefined ? [] : buildRoleLines(options.roles);
   return [
     `# Model Router`,
@@ -242,6 +252,7 @@ export function buildRouterHelp(current: string, options: { stats?: boolean; rol
     ...(options.stats === true
       ? ["- `/router stats [--since <ISO>]` — routing statistics from the decision log and outcome store (same table as `npm run routing:stats` (in a clone))"]
       : []),
+    ...(options.approvals === true ? ROUTER_APPROVAL_HELP_LINES : []),
     "- `/tiers`, `/preset`, `/budget`, `/bypass`, `/annotate-plan`",
     ...(roleLines.length > 0 ? ["", ...roleLines] : []),
   ].join("\n");

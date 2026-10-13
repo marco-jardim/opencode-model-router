@@ -8,6 +8,27 @@ import type { DispatchReference, InexactReason } from "./reference";
 
 export type VerifyMethod = "deterministic" | "checker" | "none";
 
+/**
+ * Cross-repo P2.2: where one check of a role dispatch runs. `cwd` is canonical; `top` is the git top level of `cwd` (undefined
+ * when unknown); `foreign` is set when that top differs from the top of the dispatch's work root; `scope` is the check's
+ * normalized `scope=` key.
+ */
+export interface CheckPlacement {
+  readonly cwd: string;
+  readonly top: string | undefined;
+  readonly foreign: boolean;
+  readonly scope?: "affected" | "full";
+}
+
+/**
+ * The placements of a DoD's checks, index-aligned with `dod.checks` (undefined for a check with neither `cwd=` nor `scope=`);
+ * absent when no check has a key. `refused` names the first check whose key is not accepted.
+ */
+export interface PlacementResolution {
+  readonly placements?: readonly (CheckPlacement | undefined)[];
+  readonly refused?: { readonly index: number; readonly kind: string; readonly text: string; readonly why: "outside" | "scope" };
+}
+
 export interface Verdict {
   pass: boolean;
   /** Absent on legacy verdicts: derive from pass. Unverifiable is not failure. */
@@ -102,6 +123,28 @@ export interface DeterministicDeps {
   deadline?: Deadline;
   /** Preserve completed failures if an outer gate budget expires later. */
   onFailure?: (reason: string) => void;
+  /**
+   * Cross-repo P2.4: per-check placements, index-aligned with `dod.checks` (undefined: the check runs in `cwd` with the budget's
+   * scope, as without this field). A foreign placement's failure is unverifiable, never "fail", and never reaches `onFailure`.
+   */
+  placements?: readonly (CheckPlacement | undefined)[];
+  /**
+   * Cross-repo P3a (SD-P3a-1, -5): W's git top (the gate's `artefact.changeRoot`, else its effective base dir). Set only with
+   * foreign placements (v2 roles). With it, a foreign testsPass whose placement says an explicit `scope=affected` runs scoped
+   * through the link (`TestsPassRequest.crossLinkRoot`) instead of being refused; absent: the refusal as before.
+   */
+  changeRoot?: string;
+  /**
+   * Cross-repo P3a (SD-P3a-2 amended): for a consumer cwd, other spellings of `changeRoot`'s directory (the JS fs.realpathSync of
+   * each consumer link into W). Called only for a cross-link testsPass; fail-soft (errors give no aliases).
+   */
+  crossLinkAliases?: (consumerCwd: string) => readonly string[];
+  /**
+   * Cross-repo P3a (D23 as amended 2026-10-12, QA C1): when the dispatch began (ms epoch; the original start for a deferred
+   * verification, never the router_verify time). Forwarded to a cross-link testsPass request (`TestsPassRequest.dispatchStartedAt`)
+   * so only W's ignored modules modified during the dispatch are inputs; absent: none are.
+   */
+  dispatchStartedAt?: number;
   /**
    * #84 QA-G-B-2-1: set for a CARRIED acceptance (a role resume re-checking the block of an earlier attempt): a testsPass or
    * lintClean check that ran no process (NoAffected: nothing of the change set maps to a test or a lintable file) is unverifiable
@@ -345,6 +388,20 @@ export interface TestsPassRequest {
   readonly changedFiles: readonly ChangedPath[] | "unavailable";
   readonly reference: ReferenceState;
   readonly deadline: Deadline;
+  /**
+   * Cross-repo P3a (runner.ts G.4b): the git top of the repository the change lies in when it is
+   * not cwd's (W, SD-P3a-5). Forwarded to planScopedRun only when set; a request with it is never
+   * batched (batch.ts submit).
+   */
+  readonly crossLinkRoot?: string;
+  /** Other spellings of crossLinkRoot's directory (runner.ts PlanScopedRunInput); used only with crossLinkRoot. */
+  readonly crossLinkAliases?: readonly string[];
+  /**
+   * Cross-repo P3a (D23 as amended 2026-10-12, QA C1): when the dispatch began (ms epoch), the original start even for a
+   * deferred verification. With crossLinkRoot, only W's ignored modules modified at or after it are added to the run's inputs;
+   * absent: none are (never a stale build output).
+   */
+  readonly dispatchStartedAt?: number;
 }
 
 /** What the S5 hook returns for one request; judgeScoped turns it into the check result. */

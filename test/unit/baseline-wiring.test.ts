@@ -88,7 +88,8 @@ const dod: DoD = { kind: "deterministic", source: "explicit", criteria: [], deli
 const REF: DispatchReference = { root: cwd, head: "HEAD", commit: "HEAD", untracked: new Map(), tracked: new Map(), captureReasons: [], capturedAt: 0 };
 beforeEach(() => Object.assign(state, {
   // Like snapshotTree, it digests its listed paths (QA-2.1-2).
-  snapshot: { cwd, head: "HEAD", fingerprint: "before", dirty: true, files: [{ path: resolve(cwd, "old.ts"), status: " M" }], digests: new Map([[resolve(cwd, "old.ts"), "file:old"]]) },
+  // A real snapshot always reads the branch (tree.ts: one rev-parse); an unknown branch with a moved head is a switch (I7).
+  snapshot: { cwd, head: "HEAD", branch: "main", fingerprint: "before", dirty: true, files: [{ path: resolve(cwd, "old.ts"), status: " M" }], digests: new Map([[resolve(cwd, "old.ts"), "file:old"]]) },
   commands: [], captures: [], captureResult: REF, held: false, finish: undefined,
   captureDelayMs: undefined, captureThrows: false, gcCalls: [], gcRejects: false,
   gcRemoved: [], gcArgv: false, snapshotImpl: undefined, argvImpl: undefined, execOpts: [], captureArgv: undefined, hookDeps: undefined, scopeDeps: undefined,
@@ -936,5 +937,25 @@ describe("child session disposal memo", () => {
     await wiring.disposeChildSession("s1");
     expect(abort).toHaveBeenCalledTimes(DISPOSED_MEMO_MAX + 3);
     expect(del).toHaveBeenCalledTimes(DISPOSED_MEMO_MAX + 3);
+  });
+});
+
+describe("deferred finish: branch switch during the dispatch (I7)", () => {
+  const finishInput = { dispatchID: "d", orchestratorSessionID: "orch", producerSessionID: "child", producerTier: "fast", description: "x", cwd: undefined, dod, dispatchedAt: 0 } as const;
+  const finishAfter = async (branchNow: string) => {
+    const { wiring, store } = harness();
+    state.snapshot = { ...state.snapshot!, root: cwd, branch: "main" };
+    await wiring.beginVerification(store, "d", undefined, dod);
+    state.snapshot = { ...state.snapshot!, branch: branchNow };
+    return wiring.finishDeferred(store, finishInput);
+  };
+
+  it("a tree switched from main to another branch during the dispatch is not deferred", async () => {
+    expect(await finishAfter("other")).toMatchObject({
+      deferred: false, reason: "branch-switched", detail: expect.stringContaining("switched from branch main to branch other during the dispatch"),
+    });
+  });
+  it("the same branch is not a switch", async () => {
+    expect(await finishAfter("main")).not.toMatchObject({ reason: "branch-switched" });
   });
 });

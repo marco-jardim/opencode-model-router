@@ -11,6 +11,7 @@
 import type { AuthorityAction, RoleKind, RoleSpec } from "../../router/roles";
 import { DETECTIONS } from "../classify/types";
 import type { ClassifyResult, ClassifyTrace, Detection, Need, Risk, RouteLine, Scope, TaskFacts } from "../classify/types";
+import type { RepoLocation } from "./admission";
 
 export interface DispatchGrant {
   actions: ReadonlySet<AuthorityAction>;
@@ -24,6 +25,11 @@ export interface DispatchGrant {
    * role max ∩ LOCAL — egress dropped too — and must never be granted through `grantFor(…, null)`.
    */
   workRoot: string | null;
+  /**
+   * Cross-repo (P1.4): where the work root lies — the repository, its name, the worktree and its branch — when admission bound it
+   * (`repo=` / `branch=`, or a `root=` below `routing.repoParents`). Absent when `workRoot` is null or the root was bound the old way.
+   */
+  readonly location?: RepoLocation;
 }
 
 /**
@@ -151,6 +157,7 @@ export function grantFor(
   widened: readonly AuthorityAction[],
   workRoot: string | null,
   routeLine?: Pick<RouteLine, "needs"> | null,
+  location?: RepoLocation,
 ): DispatchGrant {
   const denied = new Set<string>(role.authority.deny);
   const max = new Set<AuthorityAction>(role.authority.allow.filter((a) => KNOWN.has(a) && !denied.has(a)));
@@ -191,6 +198,8 @@ export function grantFor(
     actions: new Set(ACTION_ORDER.filter((a) => actions.has(a))),
     notes: [...notes, ...structural],
     workRoot,
+    // P1.4: the location travels only with a validated work root.
+    ...(workRoot !== null && location !== undefined ? { location } : {}),
   };
 }
 

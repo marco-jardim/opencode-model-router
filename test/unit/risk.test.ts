@@ -110,10 +110,18 @@ describe("assessRisk", () => {
       deletedOrRenamed: "files were deleted or renamed",
       configChanged: "config, lock or CI files changed",
       unverifiable: "scoping impossible (S6): the change cannot be verified by scoped tests",
+      fullScope: "the full suite runs (scope=full)",
       noAffected: "no affected tests found by static scoping",
       fastTier: "produced by the fast tier",
       noReference: "no reference captured: risk raised one step",
     });
+  });
+
+  it("P2e QA-1 #7: a full-scope plan is medium with the neutral reason, never the S6 one", () => {
+    const r = run({ changedFiles: files(1), scopingPlan: { fullScope: true } });
+    expect(r.level).toBe("medium");
+    expect(r.reasons).toContain(REASONS.fullScope);
+    expect(r.reasons).not.toContain(REASONS.unverifiable);
   });
 
   it("QA-1.6-9: absolute paths are classified repo-relative", () => {

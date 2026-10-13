@@ -73,7 +73,7 @@ falls back to its in-code default), so you only ever see them in an overrides fi
 | Key | Type | Default when absent | Notes |
 |---|---|---|---|
 | `delegateInstructions` | `"strip-global" \| "strip-all" \| "keep"` | `"strip-global"` | Instruction-file filtering for delegate sessions only; never changes the orchestrator. See below. |
-| `dispatchHeader` | `boolean` | `true` | Prepends mechanical guidance to tier-targeted `task` prompts. See below. |
+| `dispatchHeader` | `boolean` | `true` | Prepends mechanical guidance to tier-targeted `task` prompts, and a work-root header to routed role dispatches (v2). See below. |
 | `falseRefusalDetection` | `boolean` | `true` | Annotates capability-complaining hand-backs with zero recorded child tool calls. See below. |
 | `taskPromptRepair` | `boolean` | `true` | Fills a missing `task` prompt from its description, or refuses the call readably. See below. |
 | `tierPromptsGoalOriented` | `Record<string, string>` | built-in goal-oriented prompts in `src/router/prompts.ts` | Goal-oriented twin of `tierPrompts`; an entry replaces the built-in for that tier. See [Prompt styles](#prompt-styles-promptstyle). |
@@ -195,6 +195,18 @@ only when the tier belongs to the active preset. Other tools, missing or unknown
 tiers, non-string prompts, router bypass, and prompts already beginning with
 `[router] You are @` are unchanged. An absent or empty directory omits that paragraph.
 The cap follows `tierCaps[tier] ?? DEFAULT_TIER_CAPS[tier] ?? 5`.
+
+On Claude Code v2 in roles mode, a routed role dispatch with a work root and read access gets a shorter header (role name,
+work root, and the repository location when the grant has one; no cap or budget text), see
+[Roles mode](./ROLES.md#repositories-below-parent-directories-cross-repo). The router's header is always the one the
+delegate reads: a header the orchestrator copied from another dispatch is always removed, and replaced only when the router
+adds its own. A read-only role is told where it may read, without the edit clause. The role header is emitted only when it is
+relevant (invariant I9): `routing.repoParents` is set, the route line declares `repo=`, `branch=` or `root=`, or the work root
+differs from the session directory; otherwise the dispatch prompt carries no header. `dispatchHeader: false` also turns off the role header, with one exception: when the
+work root differs from the session directory (`root=`, `repo=`, `branch=`), the delegate is still told it, because the
+role agent's work-root rule points to ENVIRONMENT, which is the session directory. That minimal header holds the role name
+and the `Working directory:` paragraph only (no repositories paragraph); a work root equal to the session directory gets
+no header. Inert on Claude Code v1.
 
 Measured using the pure builder's string length: **1,031 characters** for `@fast`,
 cap `8`, and cwd `D:\git\opencode-model-router`, including LF paragraph separators
@@ -541,8 +553,23 @@ All of these must hold:
 - on the `delegate` path, the producer did not error;
 - the producer changed files, **or** the DoD has any check besides `testsPass`, or a
   criterion. Only a `testsPass`-only DoD with an attributed, empty change set falls
-  back: the required gate passes it ("no changed files") without running a process. A
-  change set that cannot be attributed still defers, with risk `high`.
+  back: the required gate passes it ("no changed files") without running a process. On
+  OpenCode v2 this does not hold when the `testsPass` is full scope (config `testScope:
+  "full"`, or a per-check `scope=full`): that dispatch defers instead of blocking the
+  return (before, the full suite ran synchronously; for `delegate` there is no
+  synchronous ladder either). v1 is unchanged. A change set that cannot be attributed
+  still defers, with risk `high`;
+- the producer did not switch the work root's branch (a branch switch during the
+  dispatch is gated synchronously, reason `branch-switched`);
+- a role dispatch with a perimeter, or with per-check `cwd=`/`scope=` keys (OpenCode v2,
+  roles mode), is not an exception any more: it defers like any other, unless it is
+  verified at once (nothing is shown to the user for this; a refusal never reaches the
+  deferred finish): I4 already refuses at return, a linked repository could not be
+  observed within the deferral bound, a dependency added during the dispatch could not
+  be observed in time or more were added than the perimeter has room for, a check
+  placement is refused, or a v2 tier
+  dispatch carries a per-check `cwd=`. With `routing.repoParents`
+  set, role dispatches therefore defer by default where they used to be synchronous.
 
 A DoD with a `testsPass` check defers **as a whole**: its build, lint, `run` and
 criteria checks are deferred too, and run only when the handle is verified. This holds
@@ -556,6 +583,26 @@ path, when the enforcement mode at dispatch time is `off`. In particular, a DoD
 **without** `testsPass` (for example `buildPasses` or `fileExists` only) is gated
 before return in either mode, and its checks run synchronously; `VERIFY:deferred`
 does not change that.
+
+**A deferred dispatch with a perimeter.** At return the router freezes the perimeter
+(the statuses for I4 and I8, the working-set roots, the observed link targets and the
+targets of the work root's dependency edges declared outside `node_modules`, those the
+producer added during the dispatch included, the placements and the link pins; edge
+targets are never pinned). At `router_verify` the I4 window is the dispatch and is not
+decided again; consumers are discovered over the frozen working-set roots, through
+`node_modules` links and declared edges; link and edge targets are observed again: one
+that changed since the producer returned turns a pass UNVERIFIED (a fail keeps it), one
+that cannot be observed again leaves a would-be pass not judged and the handle open for
+another `router_verify`, and one the producer removed during the dispatch is skipped
+unless the work root declares it again; a placement whose path or git top changed since
+the return runs nothing, and one that cannot be checked now runs nothing and leaves the
+handle open. No config key turns the edges on or off; see
+`docs/VERIFICATION.md` → "Dependencies outside node_modules". A no-change dispatch with a full-scope
+`testsPass` (per-check `scope=full`, or config `testScope: "full"` on OpenCode v2 only)
+defers instead of blocking the return; config `testScope` does not affect `lintClean`
+(only a per-check `scope=full` runs lint unscoped), so a no-change `lintClean` still
+passes without running. See `docs/VERIFICATION.md` → "Deferred verification across
+repositories".
 
 When registration fails (for example a handle collision), the delegation falls
 back to the required gate. It is never marked accepted or verified by that failure.
@@ -1023,10 +1070,16 @@ The seven shipped role agents (`explorer`, `researcher`, `runner`, `implementer`
 | `routing.run.commands` | `Record<string, { argv, args? }>` | `{ "test-files": … }` (below) | `argv`: non-empty array of non-empty strings; `args`: patterns for the caller's arguments | global only |
 | `routing.run.timeoutMs` | `integer` | `600000` | `[1000, 3600000]` | global only |
 | `routing.workRoots` | `string[]` | `[]` | absolute globs, see below | global only |
+| `routing.repoParents` | `string[]` | `[]` | literal absolute local directories (no glob, no network or device path, no `.`/`..`, no 8.3 segment) below which a git top level is an admissible work root (cross-repo, OpenCode v2 roles mode; inert on v1). Non-empty at start, it also enables the `root` argument of `router_git_*` for role agents (the tool map is fixed at start: restart after adding parents) | global only |
+| `routing.repoDepth` | `integer` | `2` | `[1, 4]`: how many levels below a parent a repository may sit | global only |
+| `routing.repoExclude` | `string[]` | `[]` | absolute globs never admitted below a parent; also covers the linked worktrees of an excluded repository, which are refused as work roots and kept out of the read set | global only |
+| `routing.repoApprovalDays` | `integer` | `14` | `[1, 90]`: days after its last use that an approval given with `/router approve` expires; an approval never lasts more than 90 days after it was given, whatever its use (OpenCode v2 roles mode with `routing.repoParents`; inert on v1) | global only |
 
 **`routing.run.commands`.** `package.json` scripts take no caller arguments, so a run with arguments needs a command entry. The shipped default (replaced as a whole when you set `commands`) is `"test-files": { "argv": ["npm", "run", "test", "--"], "args": ["test/*", "--maxWorkers=*"] }`: a scoped test run through `router_run`'s hardened npm path. `args` lists the arguments a caller may pass: each pattern is an exact string or a prefix ending in `*` (`test/*`); an argument starting with `-` only matches a pattern that itself starts with `-`; an entry without `args` takes none. Every argument must also match `^[A-Za-z0-9_./:=@+-]{1,200}$`. Confinement is enforced by `router_run` itself, whatever the patterns say: an argument with a `..` segment, an absolute, drive or UNC path is refused, and an option-like argument (leading `-`, `@` or `+`) only matches a pattern with the same leading character — so `test/*` admits `test/unit/x.test.ts` but never `test/../../x`. A single-dash argument (`-x…`) carrying any `/`, `\` or `..` is refused as well (a short-option cluster such as `-br../x` can hide a path). `routing.run` has no `envPassthrough` key (removed: it was never wired) and no other credential passthrough: credential-like environment variables (`PGPASSWORD` and `MYSQL_PWD` included) are always stripped from a run. npm pins, `.npmrc` refusals, the run environment and what stays reachable: [`ROLES.md`](./ROLES.md#router_run).
 
 **`routing.workRoots`.** Absolute globs naming where role dispatches may work besides the session directory and the worktrees git lists at registration (for example `D:/git/omr-rta-*`). Each entry needs an absolute static prefix with at least one real directory (`*`, `/**` and `D:/**` are refused), no `.` or `..` segment, and must be written in the **canonical long form**: a segment such as `PROGRA~1` is an 8.3 short name that can alias another directory and is refused, in every segment (`D:/git/OMR-RT~1*` and `D:/git/*/PROGRA~1/x` included). Never put `*` alone. **Over-match:** `*` crosses separators, so `D:/git/omr-rta-*` grants every directory that starts with `omr-rta-`; the registered policy cannot tell dispatches apart, and the router narrows each session to its own work root when it evaluates a permission.
+
+**Repository approvals store (`routing.repoApprovalDays`).** A repository outside `routing.repoParents` is approved by a human with `/router approve <path>` (OpenCode v2, roles mode, `routing.repoParents` non-empty; the flow, the checks and the limits are in [`ROLES.md`](./ROLES.md#repositories-outside-routingrepoparents)). Approvals are not a config key: only `/router approve` and `/router revoke` add or remove them (a binding through an approval only moves its `lastUsedAt`, at most once per hour), in `opencode-model-router.repo-approvals.json` next to the router state file (`~/.config/opencode/opencode-model-router.repo-approvals.json`). Format: `{ "version": 1, "approvals": [{ "path", "commonDir", "roots", "origin", "approvedAt", "lastUsedAt" }] }`, where `path` is the canonical path of the main worktree, `commonDir` its git common directory, `roots` its sorted root commits (hex SHAs), `origin` the origin URL without credentials (`none` when there is none), and the times are epoch milliseconds. At most 32 entries and 256 KiB. A file that is not valid as a whole (JSON, version, size, entry count) gives no approvals (fail closed) and one notice; an invalid entry is dropped when read. An approval expires `routing.repoApprovalDays` days after `lastUsedAt`, and 90 days after `approvedAt` at the latest. Writes go through a temporary file and a rename.
 
 Fully resolved defaults (parsed by a test and compared with `resolveRolesRouting`):
 
@@ -1040,7 +1093,11 @@ Fully resolved defaults (parsed by a test and compared with `resolveRolesRouting
     "commands": { "test-files": { "argv": ["npm", "run", "test", "--"], "args": ["test/*", "--maxWorkers=*"] } },
     "timeoutMs": 600000
   },
-  "workRoots": []
+  "workRoots": [],
+  "repoParents": [],
+  "repoDepth": 2,
+  "repoExclude": [],
+  "repoApprovalDays": 14
 }
 ```
 

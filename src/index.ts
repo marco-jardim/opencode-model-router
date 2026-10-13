@@ -23,13 +23,13 @@ import {
 } from "./router/config";
 import type { RouterConfig, TierConfig, Preset, ModeConfig, EffortLevel } from "./router/config";
 import { buildAgentOptions, warnAgentOptionsEffortOnce } from "./router/agent-options";
-import { gitTools } from "./router/git-tools";
+import { gitTools, nearestCheckout, type GitRootResolver } from "./router/git-tools";
 import { isReadOnlyTier, legacyReadOnlyTools, mergePermissions, readOnlyPermissions } from "./router/read-only";
 import { buildPluginAgentDefinition, mergeHostAgentEntry, pluginAgentMarker } from "./router/plugin-agents";
 import { filterSensitiveGrep } from "./router/sensitive-paths";
 import { selectTierPrompt, TOOL_AUTHORITY_CLAUSE } from "./router/prompts";
 import { stripDelegateInstructions } from "./router/instructions";
-import { buildDispatchHeader, DISPATCH_HEADER_PREFIX, DISPATCH_HEADER_SEPARATOR, routeLineRoot } from "./router/dispatch-header";
+import { buildDispatchHeader, DISPATCH_HEADER_PREFIX, DISPATCH_HEADER_SEPARATOR, routeLineRoot, stripDispatchHeader } from "./router/dispatch-header";
 import { detectFalseRefusal, parseTaskResult as parseRefusalTaskResult } from "./router/false-refusal";
 import {
   buildTiersOutput,
@@ -74,10 +74,11 @@ import { GUARD_CUMULATIVE_MULTIPLIER, roleGuardProfile, type GuardProfile } from
 import { currentBinding } from "./routing/roles/binding";
 import { authorityTool, requestedAuthority } from "./routing/roles/authority";
 import {
-  CARRIED_NO_PROCESS_REASON, roleAttemptVerification, roleEscalationAfterFail, roleMaxActions, routedRoleOf, strippedRouteRoot,
+  CARRIED_NO_PROCESS_REASON, lapsedApprovalReason, pruneLapsedApprovals, roleAttemptVerification, roleEscalationAfterFail, roleMaxActions,
+  routedRoleOf, strippedRouteRoot,
 } from "./routing/wire/dispatch";
 import { roleTierOrder } from "./routing/engine/ladders";
-import { detectRedispatch, returnSignal, runSignal, parseReturnPrefix, type DispatchText } from "./routing/outcomes/signals";
+import { acceptanceScriptsOf, detectRedispatch, returnSignal, runSignal, parseReturnPrefix, type DispatchText } from "./routing/outcomes/signals";
 import type { IngestSettings } from "./routing/outcomes/ingest";
 import { captureBudget } from "./guard/enforce";
 import { budgetClaimObserved, isIncompleteVerdict } from "./verify/checker";
@@ -96,6 +97,7 @@ import { applyV1Roles, hasExplicitV1Roles, v1AgentInfos } from "./routing/comman
 import type { HostAgentInfo } from "./routing/engine/types";
 import { createEngineRuntime } from "./routing/wire/runtime";
 import type { EngineRuntime } from "./routing/wire/runtime";
+import { forgetWorkingSet, workingSetOf } from "./routing/wire/working-set";
 import {
   advisorSettings,
   catalogFromProviders,
@@ -125,7 +127,7 @@ import { createTrajectoryStore } from "./telemetry/trajectory";
 import { createGuardStore } from "./guard/store";
 import { createIdleTtlSweeper } from "./router/idle-sweep";
 import { guardBeforeCall, guardAfterCall, guardRefusedCall, formatScorecard } from "./guard/enforce";
-import { mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync, realpathSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, isAbsolute } from "node:path";
 import { access, readFile as fsReadFile } from "node:fs/promises";
@@ -150,7 +152,14 @@ import {
   buildForcingNote,
   buildAcceptedSuffix,
 } from "./verify/dispatch";
-import { requestedVerificationCwd, requestedVerificationCwdSource, verificationScope, type VerificationScope } from "./routing/roles/work-root";
+import { canonicalAuthorityPath, captureRootOf, insideWorkRoot, requestedVerificationCwd, requestedVerificationCwdSource, verificationScope, type VerificationScope } from "./routing/roles/work-root";
+import { resolveCheckPlacements } from "./routing/roles/check-placement";
+// Static, not `await import`: dynamic imports made a bundle split src/router/config.ts into a chunk where its tiers.json
+// lookup fails (the e2e child bundle). Each module below is used only inside functions.
+import { createAdmission, type AdmissionConfig, type AdmissionService } from "./routing/roles/admission";
+import * as gitRoot from "./routing/roles/git-root";
+import * as approvalsCommands from "./commands/approvals";
+import { createRepoProbe, displaySafe, readSetEligible, readSetPredicate } from "./routing/roles/read-set";
 import { newLadderState, recordAttempt, nextAction, advance, buildEscalatePolicy, formatLadderScorecard, startCostRatio } from "./escalate/ladder";
 import { createCatalogLookup, planFirstAttempt, planNextAttempt } from "./escalate/resume";
 import type { AttemptPlan, CatalogLookup } from "./escalate/resume";
@@ -181,6 +190,16 @@ function describeError(error: unknown): string {
   } catch {
     return "unprintable error";
   }
+}
+
+/**
+ * Cross-repo P2b.7 (OD1=B, v2 only): a tier dispatch honours no per-check `cwd=`. The first check of the DoD that sets one (0-based
+ * index) is the refusal the gate reports (`why: "tier"`, nothing runs); undefined when none does. `scope=` alone is ignored.
+ */
+function tierCheckCwdRefusal(dod: Parameters<typeof resolveCheckPlacements>[0]): NonNullable<Parameters<typeof accept>[0]["refusedCheck"]> | undefined {
+  const index = dod.checks.findIndex((check) => check.cwd !== undefined);
+  const check = index < 0 ? undefined : dod.checks[index];
+  return check?.cwd === undefined ? undefined : { index, kind: check.kind, text: check.cwd, why: "tier" };
 }
 
 /**
@@ -247,7 +266,7 @@ function saveEnforcementMode(mode: "off" | "advisory" | "enforced"): void {
  * `/router` dispatch. Decides and persists here; rendering lives in
  * src/commands/output.ts.
  */
-function buildRouterOutput(cfg: RouterConfig, args: string, projectDir?: string, roles?: Iterable<RoleSpec>): string {
+function buildRouterOutput(cfg: RouterConfig, args: string, projectDir?: string, roles?: Iterable<RoleSpec>, approvals = false): string {
   const tokens = (args ?? "").trim().split(/\s+/).filter(Boolean);
   const sub = (tokens[0] ?? "").toLowerCase();
 
@@ -280,9 +299,13 @@ function buildRouterOutput(cfg: RouterConfig, args: string, projectDir?: string,
     resolveEnforcementMode({ config: cfg, env: process.env }).mode,
     // `/router stats` is listed only for a config that has a `routing` block: without one `/router` is what it was (QA-2.4-3).
     // #84 P2.2: the role lines, only when the caller hands roles (roles mode on v2); otherwise the help is what it was.
-    { stats: cfg.routing !== undefined, ...(roles === undefined ? {} : { roles }) },
+    // Cross-repo P4.7: `/router approve|repos|revoke`, only where they run (SD-P4-10); otherwise the help is what it was.
+    { stats: cfg.routing !== undefined, ...(roles === undefined ? {} : { roles }), ...(approvals ? { approvals: true } : {}) },
   );
 }
+
+/** Cross-repo P4.7: the `/router` subcommands of `commands/approvals.ts` (checked before that module is used). */
+const APPROVAL_SUBCOMMANDS: ReadonlySet<string> = new Set(["approve", "repos", "revoke"]);
 
 /** `/budget` dispatch. Persists the switch, then renders. */
 function buildBudgetOutput(cfg: RouterConfig, args: string, projectDir?: string): string {
@@ -508,6 +531,19 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // -------------------------------------------------------------------------
   const isV2Host = ctx.routerHost === "v2";
   /**
+   * Cross-repo P2e.6 (OD-P2e-2): a dispatch runs the full scope when the host is OpenCode v2 and the effective testScope is
+   * "full"; the deferred finish then never treats an empty change set as nothing to run. Always false on v1. Never throws (an
+   * unreadable verify block is not full).
+   */
+  const fullScopeOf = (cfg: Parameters<typeof resolveVerifyBudget>[0]): boolean => {
+    if (!isV2Host) return false;
+    try {
+      return resolveVerifyBudget(cfg).testScope === "full";
+    } catch {
+      return false;
+    }
+  };
+  /**
    * QA-P21-1-8 (plan R8): the role runtime exists only when the plugin STARTED in roles mode — its role tools are registered at
    * start and its role agents only then (the v2 adapter logs "restart OpenCode" when the config switches to roles at runtime).
    */
@@ -568,7 +604,160 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     const answer = resolveWorkRoot(sessionID);
     if (!answer.role) return answer;
     const grant = currentBinding(sessionID, { maxOf: roleMaxOf })?.grant;
-    return grant !== undefined && grant.actions.has(action) ? answer : { role: true, root: null };
+    if (grant === undefined || !grant.actions.has(action)) return { role: true, root: null };
+    // Phase 4 QA (m2): a binding backed by an approval holds only while the approval applies (store read, no git). The tools
+    // report a resolver's throw as their error, nothing runs.
+    const approval = grant.location?.approval;
+    if (approval !== undefined && answer.root !== null) {
+      const lapsed = lapsedApprovalReason(approval, resolveRolesRouting(cfg, "v2").repoApprovalDays);
+      if (lapsed !== undefined) throw new Error(`refused: ${lapsed}`);
+    }
+    // Cross-repo (P1.5): a binding that carries its repository makes it the repository `router_git_*` expects.
+    const repository = grant.location?.repository;
+    return repository !== undefined && answer.root !== null ? { ...answer, repository } : answer;
+  };
+  /**
+   * Cross-repo (P1.9, v2 only): the provenance line of a role's `read`, `glob` or `grep` whose target (the file, or the search root)
+   * canonicalises outside the session's work root but inside its read set (`routing/roles/read-set.ts`: the orchestrator's working
+   * set and the repositories below `routing.repoParents`). Undefined for a non-role session, an unbound or rootless one, a target in
+   * the work root, a target outside the read set, and whenever cross-repo is not in use (no parents and no working set: I9).
+   */
+  const repoProbe = createRepoProbe();
+  /** The read set R (P1.5) of the role dispatches of `orchestrator`: its working set plus `routing.repoParents`. Undefined when R adds nothing. */
+  const readSetMemberOf = (orchestrator: string | undefined): ReturnType<typeof readSetPredicate> => {
+    const routing = resolveRolesRouting(cfg, "v2");
+    const workingSet = orchestrator === undefined ? [] : workingSetOf(orchestrator);
+    return readSetPredicate({ parents: routing.repoParents, depth: routing.repoDepth, exclude: routing.repoExclude }, workingSet, repoProbe);
+  };
+  /**
+   * Cross-repo P2a.3 (v2 only): R as a yes/no test on a canonical absolute path, for the role dispatch `routed` (its orchestrator's
+   * working set). Undefined when no R applies.
+   */
+  const roleReadSetFor = (routed: { readonly parentSessionID: string }): ((absPath: string) => boolean) | undefined => {
+    if (ctx.routerHost !== "v2") return undefined;
+    const member = readSetMemberOf(routed.parentSessionID === "" ? undefined : routed.parentSessionID);
+    return member === undefined ? undefined : (absPath) => member(absPath) !== undefined;
+  };
+  /** F11: the orchestrator that dispatched role session `sid`: its dispatch record, else the session's parent (as the v2 adapter's readSetOf). */
+  const orchestratorOf = async (sid: string): Promise<string | undefined> => {
+    const recorded = lookupDispatch(sid)?.parentSessionID ?? undefined;
+    if (recorded !== undefined && recorded !== "") return recorded;
+    const res = await ctx.client.session.get({ path: { id: sid } });
+    const parentID = res?.data?.parentID;
+    return typeof parentID === "string" && parentID !== "" ? parentID : undefined;
+  };
+  /**
+   * Cross-repo P4.7 (SD-P4-10, S1): whether `/router approve|repos|revoke` run for the session `sessionID`. All of: the v2 host,
+   * roles mode (`rolesNow()` non-empty), `routing.repoParents` non-empty, and a top-level session typed in by the human: not a
+   * role session, not a known child (a dispatch record), and the host reports it without a parent. A failed lookup refuses.
+   */
+  const approvalsCommandsAvailable = async (sessionID: unknown): Promise<boolean> => {
+    if (ctx.routerHost !== "v2" || rolesNow().size === 0) return false;
+    if (resolveRolesRouting(cfg, "v2").repoParents.length === 0) return false;
+    if (typeof sessionID !== "string" || sessionID === "") return false;
+    if (roleOfSession(sessionID) !== undefined || lookupDispatch(sessionID) !== undefined) return false;
+    try {
+      const res = await ctx.client.session.get({ path: { id: sessionID } });
+      const data = res?.data;
+      if (data === undefined || data === null || typeof data !== "object") return false;
+      const parentID: unknown = Reflect.get(data, "parentID");
+      return !(typeof parentID === "string" && parentID !== "");
+    } catch {
+      return false;
+    }
+  };
+  /**
+   * Cross-repo 3b.4 (F10): one admission per resolved `{ repoParents, repoDepth, repoExclude }` for `router_git` `root` (it caches its
+   * git results for 5 s). Created on first use.
+   */
+  type GitRootAdmission = Pick<AdmissionService, "admit" | "find">;
+  let gitRootAdmissionMemo: { readonly key: string; readonly service: GitRootAdmission } | undefined;
+  const gitRootAdmissionFor = async (config: AdmissionConfig): Promise<GitRootAdmission> => {
+    const key = JSON.stringify([config.parents, config.depth, config.exclude, config.approvalDays ?? null]);
+    if (gitRootAdmissionMemo !== undefined && gitRootAdmissionMemo.key === key) return gitRootAdmissionMemo.service;
+    const service = createAdmission(config);
+    gitRootAdmissionMemo = { key, service };
+    return service;
+  };
+  /**
+   * Cross-repo 3b.4 (OpenCode v2, roles mode, `routing.repoParents` at start; SD-3b-1): the `root` resolver of `router_git_*`. Step 1
+   * here, no filesystem call and no spawn: a role session (D21), an exact binding with a work root and `router_git` in the grant (I9,
+   * F12), a local read action in the grant (SD-3b-5), parents still configured. Steps 2–10: `routing/roles/git-root.ts`.
+   */
+  const resolveGitRootFor: GitRootResolver = async (value, { sessionID, signal, deadlineAt }) => {
+    if (roleOfSession(sessionID) === undefined) return { ok: false, reason: gitRoot.GIT_ROOT_ROLE_ONLY };
+    const binding = currentBinding(sessionID, { maxOf: roleMaxOf });
+    const grant = binding?.kind === "exact" ? binding.grant : undefined;
+    const workRoot = grant?.workRoot;
+    if (grant === undefined || workRoot === null || workRoot === undefined || workRoot === "" || !grant.actions.has("router_git")) {
+      return { ok: false, reason: gitRoot.GIT_ROOT_NO_WORK_ROOT };
+    }
+    if (!grant.actions.has("read") && !grant.actions.has("glob") && !grant.actions.has("grep")) {
+      return { ok: false, reason: gitRoot.gitRootNeedsRead([...grant.actions].sort()) };
+    }
+    const routing = resolveRolesRouting(cfg, "v2");
+    if (routing.repoParents.length === 0) return { ok: false, reason: gitRoot.GIT_ROOT_NO_PARENTS };
+    // Phase 4 QA (m2): a binding backed by an approval that no longer applies (revoked, expired) inspects nothing (store read, no git).
+    const approval = grant.location?.approval;
+    const lapsed = approval === undefined ? undefined : lapsedApprovalReason(approval, routing.repoApprovalDays);
+    if (lapsed !== undefined) return { ok: false, reason: lapsed };
+    // QA round 1 (Phase 3 lot 1, F5): the session lookup is bounded by the call's deadline and signal (SD-3b-8).
+    const asked = await gitRoot.gitRootBounded(() => orchestratorOf(sessionID), { ...(signal === undefined ? {} : { signal }), deadlineAt });
+    if ("stop" in asked && asked.stop !== "failed") return { ok: false, reason: gitRoot.gitRootStopReason(value, asked.stop) };
+    // A failed lookup: no working set, R narrows to the parents (fail closed).
+    const orchestrator = "value" in asked ? asked.value : undefined;
+    // Phase 4 QA (M1): as for a dispatch (`crossRepoOf`), an entry whose approval lapsed is dropped before it can admit by rule 2;
+    // the drop reaches every working set, so the read set below shrinks with it.
+    const workingSet = (orchestrator === undefined ? [] : pruneLapsedApprovals(workingSetOf(orchestrator), routing.repoApprovalDays))
+      .map((location) => location.worktree);
+    const member = readSetMemberOf(orchestrator);
+    const admissionConfig = {
+      parents: routing.repoParents,
+      depth: routing.repoDepth,
+      exclude: routing.repoExclude,
+      approvalDays: routing.repoApprovalDays,
+    };
+    const known = [ctx.directory, ...(grant.location?.repository === undefined ? [] : [grant.location.repository]), ...workingSet];
+    return gitRoot.resolveGitRoot(value, { workRoot, parents: routing.repoParents, workingSet }, {
+      realpath: (path) => realpathSync.native(path),
+      isDirectory: (path) => statSync(path).isDirectory(),
+      nearestCheckout,
+      inReadSet: (path) => member !== undefined && member(path) !== undefined,
+      // Created on first use only: a text refusal never creates an admission.
+      admission: {
+        // Phase 4 QA (M1): the session repository is named, whatever order `known` reaches admission in.
+        admit: async (root, knownRepositories) => (await gitRootAdmissionFor(admissionConfig)).admit(root, knownRepositories, ctx.directory),
+        // QA round 1 (Phase 3 lot 1, F4): the resolver's `eligible` (the text gate and R) reaches the lookup.
+        find: async (name, opts) => (await gitRootAdmissionFor(admissionConfig)).find(name, opts),
+      },
+      known,
+      platform: process.platform,
+      ...(signal === undefined ? {} : { signal }),
+      deadlineAt,
+    });
+  };
+  const readProvenanceLine = async (input: any): Promise<string | undefined> => {
+    const sid: unknown = input?.sessionID;
+    if (ctx.routerHost !== "v2" || typeof sid !== "string" || !["read", "glob", "grep"].includes(input?.tool)) return undefined;
+    if (roleOfSession(sid) === undefined) return undefined;
+    const binding = currentBinding(sid, { maxOf: roleMaxOf });
+    const workRoot = binding?.kind === "exact" ? binding.grant.workRoot : null;
+    if (workRoot === null || workRoot === undefined) return undefined;
+    const args: Record<string, unknown> = input?.args && typeof input.args === "object" ? input.args : {};
+    const named = input.tool === "read" ? [args.filePath, args.path, args.file_path] : [args.path];
+    const target = named.find((value): value is string => typeof value === "string" && value !== "");
+    // No path (the session directory) or a relative one: the decision (v2-hooks `roleAuthorityDecision`) never lets it reach the
+    // read set (QA-1 F1) — it ran inside the work root or was refused — so there is no line. A fully qualified path canonicalises
+    // the same whatever the base, as in the decision; `.git` and below never reach R (F7).
+    if (target === undefined) return undefined;
+    const canonical = canonicalAuthorityPath(target, workRoot);
+    if (canonical === undefined || insideWorkRoot(canonical, workRoot) || !readSetEligible(target, canonical)) return undefined;
+    // The orchestrator that dispatched this role: its dispatch record, else the session's parent (as the v2 adapter's readSetOf).
+    const orchestrator = await orchestratorOf(sid);
+    const member = readSetMemberOf(orchestrator)?.(canonical);
+    if (member === undefined) return undefined;
+    // QA-1 F2: the name, branch and path come from the filesystem: display-safe.
+    return `[router: read from ${displaySafe(member.name)} (${displaySafe(member.branch ?? "detached")}) at ${displaySafe(member.repository)} — read-only in this dispatch]`;
   };
   /** What a routed role dispatch decided for its child's guard (QA-G-A3-3): the dispatched tier and the route line's `budget=`. */
   interface RoutedGuardInput { readonly agent: string; readonly tier: string; readonly routeBudget: number | null }
@@ -1104,6 +1293,18 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // directory resolution). Switching to roles mode registers them on the next start.
   const rolesAtStart = rolesNow().size > 0;
   const dynamicRolesAtStart = [...rolesNow().values()].some((spec) => spec.authority.mode === "dynamic");
+  /**
+   * Cross-repo 3b.4 (SD-3b-1): `router_git_*` declare `root` only on v2, in roles mode, with `routing.repoParents` non-empty at start
+   * (the tool map is fixed at start). Everywhere else, v1 included, schema and description stay byte-identical; no notice.
+   */
+  const crossRepoAtStart = ((): boolean => {
+    if (!isV2Host || !rolesAtStart) return false;
+    try {
+      return resolveRolesRouting(cfg, "v2").repoParents.length > 0;
+    } catch {
+      return false;
+    }
+  })();
   /** `router_request_authority` dependencies (P1.6): the role by child session; only the parent of `dispatchOf` is read. */
   const authorityDeps = {
     roleOf: (child: string) => roleOfSession(child),
@@ -1116,28 +1317,24 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     },
     bindingOf: (child: string) => currentBinding(child, { maxOf: roleMaxOf }),
   };
-  /** Exact npm forms of a deterministic check's command → the `routing.run` script it names (`npm test`, `npm run <name>`). */
-  const NPM_SCRIPT_RE = /^npm(?:\.cmd)?\s+(?:(test|t)|run(?:-script)?\s+([A-Za-z0-9_][A-Za-z0-9_.:@+-]*))$/;
-  /** The acceptance commands of a role dispatch as `routing.run` names (handoff 13): only exact npm script forms count. */
-  const acceptanceScripts = (prompt: unknown, description: unknown): string[] => {
-    const dod = buildDelegationDoD({
-      prompt: typeof prompt === "string" ? prompt : undefined,
-      description: typeof description === "string" ? description : undefined,
-    });
-    if (dod.kind !== "deterministic") return [];
-    return dod.checks.flatMap((check) => {
-      const match = typeof check.command === "string" ? NPM_SCRIPT_RE.exec(check.command.trim()) : null;
-      return match === null ? [] : [match[1] !== undefined ? "test" : (match[2] as string)];
-    });
-  };
+  /** The acceptance commands of a role dispatch as `routing.run` names (handoff 13); see `acceptanceScriptsOf`. */
+  const acceptanceScripts = (prompt: unknown, description: unknown): string[] =>
+    acceptanceScriptsOf(
+      buildDelegationDoD({
+        prompt: typeof prompt === "string" ? prompt : undefined,
+        description: typeof description === "string" ? description : undefined,
+      }),
+    );
   /**
    * QA-P21-2-3: the read-only cap a role dispatch asks for itself — `CAP:N`, or `CAP:none` with a `reason:` line (an unjustified
    * `CAP:none` is no cap, as for tier dispatches); `null` when it names none (then the child gets no read-only cap).
    */
   const roleDispatchCap = (prompt: unknown): Cap | null => {
     if (typeof prompt !== "string") return null;
-    const parsed = parseCapDirective(prompt);
-    return parsed === "none" && !/\breason:/i.test(prompt) ? null : parsed;
+    // P2g.3 (OD6): the orchestrator's own text — a router role header (a work root such as `.../CAP:9`) is never read as the cap.
+    const text = stripDispatchHeader(prompt);
+    const parsed = parseCapDirective(text);
+    return parsed === "none" && !/\breason:/i.test(text) ? null : parsed;
   };
   /** Caps of fresh role dispatches, by the parent's call, until the child binds (bounded, oldest out). */
   const pendingRoleCaps = new Map<string, { agent: string; cap: Cap }>();
@@ -1172,8 +1369,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
    */
   const verificationScopeOf = (callID: unknown, args: Record<string, unknown> | undefined, dod: { cwd?: string }): VerificationScope =>
     verificationScope(requestedVerificationCwd(args?.cwd, dod.cwd), typeof callID === "string" ? routedRoleOf(callID)?.verifyRoot : undefined);
-  /** The prompt as the orchestrator wrote it: without the router's nonce line (handoff 18; role dispatches carry no header). */
-  const withoutNonceLine = (prompt: string): string => prompt.replace(/\r?\n?OMR_NONCE=[A-Za-z0-9_-]+\s*$/, "");
+  /** The prompt as the orchestrator wrote it: without the router's role dispatch header (P2g.3, OD6) and its nonce line (handoff 18). */
+  const withoutNonceLine = (prompt: string): string => stripDispatchHeader(prompt).replace(/\r?\n?OMR_NONCE=[A-Za-z0-9_-]+\s*$/, "");
   /**
    * The parent's `task` call of a routed role dispatch (before it runs): a resume opens a new guard round for the child (its
    * budget and `budgetExhausted` are per round), and the re-dispatch signal (P1.4, handoff 16) compares the dispatch with the
@@ -1309,7 +1506,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     },
     tool: {
       // QA-G-A2-2: a role session's work root must belong to the repository its dispatch listed the worktrees in (this directory's).
-      ...gitTools(rolesAtStart ? { resolveWorkRoot: resolveWorkRootFor("router_git"), ...(ctx.directory ? { dispatchRepository: ctx.directory } : {}) } : {}),
+      ...gitTools(rolesAtStart ? {
+        resolveWorkRoot: resolveWorkRootFor("router_git"), ...(ctx.directory ? { dispatchRepository: ctx.directory } : {}),
+        ...(crossRepoAtStart ? { resolveRoot: resolveGitRootFor } : {}),
+      } : {}),
       // #84 P2.1 (handoffs 11, 13): roles mode only. `router_run` runs in the bound work root; each run feeds the `run` signal.
       ...(rolesAtStart ? {
         router_run: routerRunTool({
@@ -1399,6 +1599,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               acceptance: args.acceptance,
             });
             const effectiveCwd = typeof args.cwd === "string" && args.cwd.trim() ? args.cwd : dod.cwd;
+            // Cross-repo P2b.7 (OD1=B, v2 only): `delegate` is a tier dispatch; a per-check `cwd=` is unverifiable there. On v1 nothing changes.
+            const tierRefusal = ctx.routerHost === "v2" ? tierCheckCwdRefusal(dod) : undefined;
 
             // Phase 2.3 (D10/D11): on v2 with `variantSteps: auto` (A15: only with a `routing` block) and a catalog,
             // the ladder is session-aware: variant steps on the same model first, resume of the child session
@@ -1618,7 +1820,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               // 2.4.2c, section 1.5-16: a deferred delegation runs no gate and no ladder. A producer
               // that failed outright produced nothing to verify later; it keeps today's
               // failed-attempt path, which runs no verification process either.
-              const finish = dispatchStart !== undefined && producerError === null && isDeferred(dod, dispatchStart.directives) &&
+              const finish = dispatchStart !== undefined && producerError === null && tierRefusal === undefined && isDeferred(dod, dispatchStart.directives) &&
                 await isProvenRootCaller(toolCtx?.sessionID)
                 ? await finishDeferred(changedFileStore, {
                     dispatchID: baselineID,
@@ -1631,6 +1833,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                     dispatchedAt: dispatchStart.dispatchedAt,
                     // Handoff 24, R7 (I1/I8 exemption: the I7 budget-incomplete rule): router_verify judges the budget at return.
                     budget: captureBudget(producerSid, sessionStore.readCapReached(producerSid)),
+                    // Cross-repo P2e.6 (OD-P2e-2): the full scope on v2; a delegate dispatch has no per-check placements.
+                    ...(fullScopeOf(activeCfg) ? { fullScope: true } : {}),
                   })
                 : undefined;
               // QA-2.4-4 / QA-2.4-10: a finish that did not defer falls through to the required gate
@@ -1653,6 +1857,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 await disposeChildSession(producerSid);
                 return { sessionID: producerSid, text: producerText, deferredFooter: finish.footer };
               }
+              // B2: the finish saw the tree switch branch; the gate's own read below may not (it can fail), so the finish's
+              // reason is carried into the artefact.
+              const deferredSwitch = finish !== undefined && !finish.deferred && finish.reason === "branch-switched" ? finish.detail : undefined;
               // Once a delegation is gated, every later attempt of its ladder is gated too.
               if (finish !== undefined && dispatchStart !== undefined) {
                 dispatchStart = { ...dispatchStart, directives: { ...dispatchStart.directives, mode: "required" } };
@@ -1668,7 +1875,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               const gateDeadline = createDeadline(gateBudgetMs);
               let verification;
               try {
-                verification = await prepareVerification(changedFileStore, baselineID, producerSid, effectiveCwd, gateDeadline);
+                // Cross-repo P3a (D23 as amended, QA C1): the dispatch's own start, the `since` of W's ignored-module listing.
+                verification = await prepareVerification(changedFileStore, baselineID, producerSid, effectiveCwd, gateDeadline, dispatchStart?.dispatchedAt);
               } catch (error) {
                 gateDeadline.dispose();
                 throw error;
@@ -1676,6 +1884,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               const artefact = {
                 changedFiles: verification.changedFiles,
                 changeBaseline: verification.changeBaseline,
+                ...(verification.snapshot?.root !== undefined ? { changeRoot: verification.snapshot.root } : {}),
+                ...((verification.branchSwitch ?? deferredSwitch) !== undefined ? { branchSwitch: verification.branchSwitch ?? deferredSwitch } : {}),
+                ...(verification.unattributedWriters !== undefined && verification.unattributedWriters.length > 0
+                  ? { unattributedWriters: verification.unattributedWriters } : {}),
+                ...(verification.perimeter !== undefined ? { perimeter: verification.perimeter } : {}),
                 finalReturnText: producerText,
                 declaredOutputs: dod.deliverable ? [dod.deliverable] : [],
                 producerSessionID: producerSid,
@@ -1706,6 +1919,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                           trivial: false,
                           mode: "modeA",
                           ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
+                          ...(tierRefusal !== undefined ? { refusedCheck: tierRefusal } : {}),
                         },
                         artefact,
                         gateDeps,
@@ -2161,9 +2375,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           // 2.4.2b: the directives come from the orchestrator's own prompt, read here before the
           // dispatch header or any repair touches it, and are kept for the after hook. The capture
           // is awaited for at most VERIFY_WAIT (section 1.5-14) and continues in the background.
-          // DF2-F1: a role dispatch's capture is taken in its verification root (never in a refused cwd).
+          // DF2-F1 / I2 (P2.3): a role dispatch's capture is taken in its work root W (never in a refused cwd or a check
+          // subdirectory); a tier dispatch has no workRoot, so this is its explicit cwd, as before.
           await startDispatch(changedFileStore, `task:${input.sessionID}:${input.callID}`,
-            verificationScopeOf(input.callID, output?.args, dod).cwd,
+            captureRootOf(verificationScopeOf(input.callID, output?.args, dod)),
             dod,
             dispatchDirectiveText(prompt, description),
             true);
@@ -2224,8 +2439,15 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               // Handoff 30, R7 (I1/I8 exemption: T1.5.3a, the header names `root=`): on v2 shadow/advise/enforce the engine stripped the
               // route line already; its `root=` comes from the router. No root → the header is byte-identical to before.
               const root = routeLineRoot(args.prompt) ?? (typeof input.callID === "string" ? strippedRouteRoot(input.callID) : undefined);
-              const prompt = buildDispatchHeader({ tier, cap, projectDirectory: ctx.directory, root }) +
-                DISPATCH_HEADER_SEPARATOR + args.prompt;
+              // Cross-repo (P1.7, v2 only): the orchestrator's working set and the read parents (a tier call has no routed role,
+              // hence no location). All empty unless cross-repo is in use, so the header is then byte-identical to before.
+              const crossRepo = ctx.routerHost === "v2" ? resolveRolesRouting(cfg, "v2") : undefined;
+              const workingSet = ctx.routerHost === "v2" && typeof input.sessionID === "string" ? workingSetOf(input.sessionID) : [];
+              const prompt = buildDispatchHeader({
+                tier, cap, projectDirectory: ctx.directory, root,
+                ...(workingSet.length === 0 ? {} : { workingSet }),
+                ...(crossRepo === undefined || crossRepo.repoParents.length === 0 ? {} : { readParents: crossRepo.repoParents }),
+              }) + DISPATCH_HEADER_SEPARATOR + args.prompt;
               args.prompt = prompt;
               if (process.env.MODEL_ROUTER_DISPATCH_DEBUG === "1" && !dispatchDebugLogged) {
                 dispatchDebugLogged = true;
@@ -2251,7 +2473,13 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         }
       }
       const sid = input?.sessionID;
+      // F1: the unattributed-writer tally is also kept before the call runs: a call that ends in error never reaches the
+      // after-hook's record(). Reached only by calls the router did not refuse (a refusal throws below, before this runs).
+      const noteWriter = (): void => {
+        if (typeof sid === "string" && typeof input?.tool === "string") changedFileStore.noteWriter(sid, input.tool);
+      };
       if (!sid || !sessionStore.isSubagent(sid) || typeof input?.tool !== "string") {
+        noteWriter();
         return;
       }
       // Start-of-call refresh: the idle TTL must cover the tool's runtime, not
@@ -2274,6 +2502,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           ...(profile === undefined ? {} : { profile }),
         });
       } catch {
+        noteWriter(); // the call proceeds
         return; // never break a real session on a guard-internal error
       }
       if (res.block) {
@@ -2285,6 +2514,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         });
         throw new Error(res.message);
       }
+      noteWriter();
     },
 
     // -----------------------------------------------------------------------
@@ -2386,6 +2616,16 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         }
       }
 
+      // Cross-repo (P1.9): a role's read from outside its work root says where it came from. Last, after every router banner.
+      try {
+        const provenance = await readProvenanceLine(input);
+        if (provenance !== undefined && typeof output?.output === "string") {
+          output.output = `${output.output}${output.output.endsWith("\n") ? "" : "\n"}${provenance}`;
+        }
+      } catch {
+        // best-effort: a provenance line must never break a tool result
+      }
+
       // Option (i): verify-dispatch around the built-in `task` tool (advisory-grade —
       // we observe the finished task result and append a forcing note if it is not
       // accepted; we cannot retry a task call that already finished).
@@ -2420,6 +2660,14 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             // earlier attempt is gated at once (never deferred) on the child's cumulative change set (roleAttemptVerification).
             const routedRole = typeof input.callID === "string" ? routedRoleOf(input.callID) : undefined;
             const carriedRole = routedRole?.carried === true && childSessionID !== null && routedRole.resumeID === childSessionID;
+            // Cross-repo P2a.3 (v2 only): where each check of a routed role dispatch runs. Tier dispatches resolve nothing.
+            // P2e.6: valid per-check `cwd=`/`scope=` keys may be deferred (the placements travel with the handle, and router_verify
+            // runs each check where it was placed); only a refusal is verified at once, below.
+            const placement = routedRole === undefined ? undefined : resolveCheckPlacements(dod, scope, { inReadSet: roleReadSetFor(routedRole) });
+            // P2b.7 (OD1=B, v2 only): a tier dispatch with a per-check `cwd=` is unverifiable (the gate refuses it); it is never deferred.
+            const tierRefusal = routedRole === undefined && ctx.routerHost === "v2" ? tierCheckCwdRefusal(dod) : undefined;
+            // P2e.6: a refused placement or the OD1 tier refusal is certain now: verified at once, never deferred.
+            const placementRefused = tierRefusal !== undefined || placement?.refused !== undefined;
             const orchestratorSessionID = typeof input.sessionID === "string" ? input.sessionID : "";
             const taskPrompt = typeof input?.args?.prompt === "string" ? input.args.prompt : undefined;
             const taskDescription = typeof input?.args?.description === "string" ? input.args.description : undefined;
@@ -2430,7 +2678,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               : false;
             // QA-2.4-10: `trivial` as the gate sees it below; a dispatch the gate would skip is not
             // deferred (isDeferred). QA-2.4-2: only a proven root orchestrator defers.
-            if (!scope.outside && !carriedRole && isDeferred(dod, start.directives, trivial) && await isProvenRootCaller(orchestratorSessionID)) {
+            // B2: the reason a deferred finish refused for a branch switch, carried into the artefact below.
+            let deferredSwitch: string | undefined;
+            if (!scope.outside && !carriedRole && !placementRefused && isDeferred(dod, start.directives, trivial) && await isProvenRootCaller(orchestratorSessionID)) {
               // Section 1.5-16: no gate, no test process; the result goes back now with the
               // footer, which is appended last and never says accepted or verified.
               const finish = await finishDeferred(changedFileStore, {
@@ -2440,12 +2690,17 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 producerTier,
                 description: taskDescription?.trim() ? taskDescription : (taskPrompt ?? ""),
                 cwd: effectiveCwd,
+                // I2 (P2.3): the change observation stays in W; the registration's cwd above is the check base (F5).
+                ...(scope.workRoot !== undefined ? { captureRoot: captureRootOf(scope) } : {}),
                 // #84 P3.3 DF2-F1 (fix-1 review nit): router_verify's gate re-checks containment in the role's work root.
                 ...(scope.workRoot !== undefined ? { workRoot: scope.workRoot } : {}),
                 dod,
                 dispatchedAt: start.dispatchedAt,
                 // Handoff 24, R7 (I1/I8 exemption: the I7 budget-incomplete rule): router_verify judges the budget at return.
                 budget: captureBudget(childSessionID ?? "", childSessionID ? sessionStore.readCapReached(childSessionID) : undefined),
+                // Cross-repo P2e.6: the checks' placements (registered with the handle), and the full scope on v2 (OD-P2e-2).
+                ...(placement?.placements !== undefined ? { placements: placement.placements } : {}),
+                ...(fullScopeOf(cfg) ? { fullScope: true } : {}),
               });
               if (finish.deferred) {
                 output.output = appendRouterFooter(typeof output.output === "string" ? output.output : "", finish.footer);
@@ -2453,6 +2708,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 if (childSessionID) changedFileStore.clear(childSessionID);
                 return;
               }
+              if (finish.reason === "branch-switched") deferredSwitch = finish.detail;
               // QA-2.4-4 / QA-2.4-10: not deferred after all; today's required gate runs below.
             }
             // Same bound as the delegate gate: one deadline per invocation,
@@ -2464,10 +2720,17 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             const gateDeadline = createDeadline(gateBudgetMs);
             let verification;
             try {
-              verification = await prepareVerification(changedFileStore, dispatchID, childSessionID ?? "", effectiveCwd, gateDeadline);
+              // Cross-repo P3a (D23 as amended, QA C1): the dispatch's start (takeDispatch), the `since` of W's ignored-module
+              // listing. A start that was never remembered reads as now (the return), which lists nothing older: never stale inputs.
+              verification = await prepareVerification(changedFileStore, dispatchID, childSessionID ?? "", captureRootOf(scope), gateDeadline, start.dispatchedAt);
             } catch (error) {
               gateDeadline.dispose();
               throw error;
+            }
+            // QA2 F4: a switch the deferred finish saw (and this gate's own read missed) is part of this attempt before the role
+            // lineage records it; its change set may hold the other branch's commits, so it is unavailable.
+            if (deferredSwitch !== undefined && verification.branchSwitch === undefined) {
+              verification = { ...verification, branchSwitch: deferredSwitch, changeBaseline: "unavailable" as const };
             }
             // #84 QA-G-B-2-1: the role child's lineage — this attempt starts it (its own block) or is judged on everything the child
             // changed since the attempt that introduced the carried block, against that attempt's reference.
@@ -2477,6 +2740,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             const artefact = {
               changedFiles: verification.changedFiles,
               changeBaseline: verification.changeBaseline,
+              ...(verification.snapshot?.root !== undefined ? { changeRoot: verification.snapshot.root } : {}),
+              ...((verification.branchSwitch ?? deferredSwitch) !== undefined ? { branchSwitch: verification.branchSwitch ?? deferredSwitch } : {}),
+              ...(verification.unattributedWriters !== undefined && verification.unattributedWriters.length > 0
+                ? { unattributedWriters: verification.unattributedWriters } : {}),
+              ...(verification.perimeter !== undefined ? { perimeter: verification.perimeter } : {}),
               finalReturnText,
               declaredOutputs: dod.deliverable ? [dod.deliverable] : [],
               producerSessionID: childSessionID ?? "",
@@ -2526,6 +2794,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                     ...(scope.refused !== undefined ? { refusedCwd: scope.refused } : {}),
                     // Fix-1 review nit: a refusal names where the cwd came from (the call's `cwd`, else the block's `cwd:`).
                     ...(scope.workRoot !== undefined && cwdSource !== undefined ? { cwdSource } : {}),
+                    // Cross-repo P2b.5 (v2 only): where each check of a routed role dispatch runs, or the check the router refused.
+                    ...(placement?.placements !== undefined ? { checkPlacements: placement.placements } : {}),
+                    ...(placement?.refused !== undefined ? { refusedCheck: placement.refused } : tierRefusal !== undefined ? { refusedCheck: tierRefusal } : {}),
                   },
                   artefact,
                   gateDeps,
@@ -2652,6 +2923,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             }
             warnedNoCallID.delete(id);
             forgetRoleSession(id); // #84 P2.1 (the binding and authority registries are evicted by the v2 adapter)
+            forgetWorkingSet(id); // cross-repo P1.4: the orchestrator's bound repository locations
             // 2.4.2b: a deleted orchestrator's handles, tombstones and lineage records go with it.
             // 2.4.5: so do its background requests and late notices; its run in flight is aborted.
             background?.forgetSession(id);
@@ -3190,6 +3462,25 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         const parts = args.split(/\s+/).filter(Boolean);
         const sub = (parts[0] ?? "").toLowerCase();
         let text: string;
+        // Cross-repo P4.7 (SD-P4-10): `approve`, `repos`, `revoke` only on v2, in roles mode, with `routing.repoParents`, typed in a
+        // top-level session; otherwise they fall through to the help below, unchanged (S5). Nothing runs in tiers mode or on v1.
+        // The help lists them only where they run; `approvalsCommandsAvailable` returns before any session lookup unless v2 + roles
+        // + parents hold.
+        const approvalsAvailable = await approvalsCommandsAvailable(input.sessionID);
+        const approvalsCmd = approvalsAvailable && APPROVAL_SUBCOMMANDS.has(sub) ? approvalsCommands : undefined;
+        if (approvalsCmd !== undefined && approvalsCmd.isRouterApprovalSubcommand(sub)) {
+          const routing = resolveRolesRouting(cfg, "v2");
+          const result = await approvalsCmd.runRouterApprovals(sub, args.slice((parts[0] ?? "").length), {
+            parents: routing.repoParents,
+            exclude: routing.repoExclude,
+            days: routing.repoApprovalDays,
+            repoDepth: routing.repoDepth,
+          });
+          output.parts.push({ type: "text" as const, text: result.text });
+          // SD-P4-11: the v2 command adapter reloads the role agents before it sends this text on.
+          if (result.change !== undefined) approvalsCmd.markApprovalsChanged(output.parts, result.change);
+          return;
+        }
         if (sub === "models") {
           const catalog = await fetchCatalog();
           const orphans = catalog ? findOrphanedStrongPatterns(cfg, catalog) : [];
@@ -3204,7 +3495,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           }
         } else {
           // #84 P2.2: `/router` lists the roles in roles mode on v2 (`rolesNow()` is empty in tiers mode and on v1).
-          text = buildRouterOutput(cfg, args, projectDir, rolesNow().size > 0 ? rolesNow().values() : undefined);
+          text = buildRouterOutput(cfg, args, projectDir, rolesNow().size > 0 ? rolesNow().values() : undefined, approvalsAvailable);
           // On the bare status view, surface stale or missing models inline.
           if (sub === "") {
             text += "\n" + routerStatusLines(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger, projectDir).join("\n");

@@ -4,7 +4,10 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { observeTests, REFERENCE_NONE } from "../../src/verify/baseline";
-import { ABSENT_DIGEST, contaminatedReferenceReason, createChangedFileStore, buildAcceptedSuffix, type TreeSnapshot, type DispatchCaptureDeps } from "../../src/verify/dispatch";
+import { ABSENT_DIGEST, contaminatedReferenceReason, createChangedFileStore, buildAcceptedSuffix, extractChangedFile, isNonWritingTool, isUnattributedWriter, type TreeSnapshot, type DispatchCaptureDeps } from "../../src/verify/dispatch";
+import { GIT_TOOL_NAMES } from "../../src/router/git-tools";
+import { AUTHORITY_TOOL_NAME } from "../../src/routing/roles/authority";
+import { CONTEXT7_DOC_TOOLS } from "../../src/router/read-only";
 import { accept, type Artefact } from "../../src/verify/gate";
 import { buildGradingPrompt } from "../../src/verify/checker";
 import { validateConfig } from "../../src/router/config";
@@ -245,6 +248,105 @@ describe("dispatch reference capture in the changed-file store", () => {
       expect(await h.get("child")).toEqual(captured);
     },
   );
+  // P0.3 (invariant I5): a producer whose only writes go through tools the router cannot observe.
+  it.each([
+    "router_git_status", "router_request_authority", "context7_query-docs", "brave_web_search", "brave_brave_web_search",
+  ])("a read-only router or MCP tool (%s) mid-snapshot keeps the change baseline and the reference", async tool => {
+    const h = harness();
+    const snap = deferred<TreeSnapshot>();
+    const ref = deferred<DispatchReference | undefined>();
+    let signal: AbortSignal | undefined;
+    h.deps.snapshot = () => snap.promise;
+    h.capture.mockImplementationOnce(async (_c, s) => { signal = s; return ref.promise; });
+    const settled = h.start("child");
+    await vi.waitFor(() => expect(signal).toBeDefined());
+    h.store.observeEdit(tool);
+    expect(signal?.aborted).toBe(false);
+    snap.resolve(tree());
+    ref.resolve(REF);
+    await settled;
+    expect(h.store.delta("child", "child", tree()).changeBaseline).toBe("available");
+    expect(await h.get("child")).toEqual(captured);
+  });
+  it.each(["router_git_status", "router_request_authority", "context7_query-docs", "brave_web_search", "brave_brave_web_search", "read", "edit"])(
+    "%s is not an unattributable writer", tool => {
+      const h = harness();
+      h.store.record("s", tool, {});
+      expect(isUnattributedWriter(tool)).toBe(false);
+      expect(h.store.delta("none", "s").unattributedWriters).toEqual([]);
+    },
+  );
+  it.each(["bash", "router_run", "execute", "slack_post_message", "context7_some-future-tool"])("%s is an unattributable writer", tool => {
+    const h = harness();
+    h.store.record("s", tool, {});
+    expect(isUnattributedWriter(tool)).toBe(true);
+    expect(h.store.delta("none", "s").unattributedWriters).toEqual([tool]);
+  });
+  // F1: a call that ends in error never reaches the after-hook's record(); the before-hook notes the writer instead.
+  it("noteWriter() tallies an unattributable writer without any record()", () => {
+    const h = harness();
+    h.store.noteWriter("s", "Bash");
+    h.store.noteWriter("s", "bash");
+    h.store.noteWriter("s", "read");
+    h.store.noteWriter("s", "write");
+    expect(h.store.delta("none", "s").unattributedWriters).toEqual(["bash"]);
+    expect(h.store.delta("none", "other").unattributedWriters).toEqual([]);
+  });
+
+  it("noteWriter() reaches the dispatch lineage like record()", () => {
+    const h = harness();
+    h.store.noteWriter("retry", "execute");
+    expect(h.store.delta("none", "retry").unattributedWriters).toEqual(["execute"]);
+  });
+
+  // F2: a nested child's writes are not in the producer's lineage, so delegating tools are writers for the tally only.
+  it.each(["task", "delegate", "subagent", "Task"])("%s counts as an unattributed writer but still does not contaminate", (tool) => {
+    expect(isUnattributedWriter(tool)).toBe(true);
+    const h = harness();
+    h.store.record("s", tool, {});
+    expect(h.store.delta("none", "s").unattributedWriters).toEqual([tool.toLowerCase()]);
+  });
+
+  it("delta() returns the unattributable writers sorted, lowercased and de-duplicated", () => {
+    const h = harness();
+    for (const tool of ["execute", "Bash", "bash", "router_run", "execute", "read"]) h.store.record("s", tool, {});
+    expect(h.store.delta("none", "s").unattributedWriters).toEqual(["bash", "execute", "router_run"]);
+    expect(h.store.delta("none", "other").unattributedWriters).toEqual([]);
+    h.store.clear("s");
+    expect(h.store.delta("none", "s").unattributedWriters).toEqual([]);
+  });
+  it("writers are tracked per session and folded over the dispatch lineage, retries included", async () => {
+    const h = harness();
+    await h.start("d");
+    h.store.record("d", "bash", {});
+    h.store.record("retry", "execute", {});
+    h.store.record("unrelated", "slack_post_message", {});
+    expect(h.store.delta("d", "d", tree()).unattributedWriters).toEqual(["bash"]);
+    // The retry joins the lineage; the first attempt's writers stay.
+    expect(h.store.delta("d", "retry", tree()).unattributedWriters).toEqual(["bash", "execute"]);
+    // Clearing the retry's session keeps its writers in the lineage.
+    h.store.clear("retry");
+    expect(h.store.delta("d", "d", tree()).unattributedWriters).toEqual(["bash", "execute"]);
+  });
+  it("a tool name reported capitalised (Edit) is attributed as a changed file", () => {
+    expect(extractChangedFile("Edit", { filePath: "a.ts" })).toEqual({ path: "a.ts", status: "modified" });
+    expect(extractChangedFile("Write", { path: "b.ts" })).toEqual({ path: "b.ts", status: "written" });
+    const h = harness();
+    h.store.record("s", "Edit", { filePath: "a.ts" });
+    expect(h.store.get("s")).toEqual([{ path: "a.ts", status: "modified" }]);
+    expect(h.store.delta("none", "s").unattributedWriters).toEqual([]);
+  });
+  it("isNonWritingTool covers every read-only router tool the router itself defines (pin)", () => {
+    const hardCoded = [
+      "router_git_status", "router_git_log", "router_git_diff", "router_git_show", "router_git_blame", "router_git_ls_files",
+      "router_request_authority", "context7_resolve-library-id", "context7_query-docs", "context7_get-library-docs",
+    ];
+    for (const tool of [...hardCoded, ...GIT_TOOL_NAMES, AUTHORITY_TOOL_NAME, ...CONTEXT7_DOC_TOOLS]) {
+      expect(isNonWritingTool(tool), tool).toBe(true);
+    }
+    expect(isNonWritingTool("bash")).toBe(false);
+    expect(isNonWritingTool("context7_some-future-tool")).toBe(false);
+  });
   it("editing a different known directory does not contaminate capture", async () => {
     const h = harness(); const held = deferred<DispatchReference | undefined>();
     h.capture.mockImplementationOnce(() => held.promise);
@@ -415,7 +517,7 @@ describe("dispatch reference capture in the changed-file store", () => {
       const left = tree({ ...before, files: [{ path: gone, status: " M" }], digests: "unavailable" });
       expect((await gate(tree({ ...left, fingerprint: "f2", files: [] }), left)).changedFiles).toEqual([{ path: gone, status: " D" }]);
       const same = await gate({ ...before, digests: "unavailable" }, { ...before, digests: "unavailable" });
-      expect(same).toEqual({ changedFiles: [], changeBaseline: "available" });
+      expect(same).toEqual({ changedFiles: [], changeBaseline: "available", unattributedWriters: [] });
     });
   });
   it("tool-observed paths take the snapshot's status letters and rename source", async () => {
@@ -480,6 +582,25 @@ it("validateConfig validates both baseline settings without requiring either", (
   for (const baselineTimeoutMs of [0, -1, 1.5, "100", Infinity]) expect(() => validateConfig({ ...cfg, enforcement: { verify: { baselineTimeoutMs } } })).toThrow("baselineTimeoutMs must be an integer");
 });
 
+describe("Y2: a cross-link related run that selected no test", () => {
+  const CROSS_NOTE =
+    "vitest selected no test in /app for the change in /w; the link may not be followed " +
+    "(resolve.preserveSymlinks, a built entry, or no test imports the changed files): use scope=full";
+  const zeroRun = (complete: boolean, note?: string): RunResult => result([], { total: 0, complete, ...(note === undefined ? {} : { note }) });
+
+  it("is unverifiable as an incomplete scoped result, never a pass", () => {
+    expect(judgeScoped(scopedRun(zeroRun(false, CROSS_NOTE)), undefined)).toEqual({
+      ok: false,
+      unverifiable: true,
+      reason: `testsPass: the scoped result is incomplete: ${CROSS_NOTE} (exit 0)`,
+    });
+  });
+
+  it("a related run without crossLink and total 0 still passes with no affected tests ran", () => {
+    expect(judgeScoped(scopedRun(zeroRun(true)), undefined)).toMatchObject({ ok: true, unverifiable: false, note: "testsPass: no affected tests ran" });
+  });
+});
+
 describe("judgeScoped verdict algebra (deterministic.ts T5-T7)", () => {
   const ID = "a.test.ts > t1";
   const OBS = `; observed failures: ${ID}`;
@@ -524,6 +645,16 @@ describe("judgeScoped verdict algebra (deterministic.ts T5-T7)", () => {
     R3: { ...col("collection error"), "--": [false, true, `testsPass: collection error without failing test files: no details${OBS}`] },
   };
   const cells = Object.entries(table).flatMap(([row, byCol]) => Object.entries(byCol).map(([c, want]) => [row, c, ...want] as const));
+
+  it("an approximate reference with cause external-link is unverifiable, never no worse than before", () => {
+    const recheck: RecheckOutcome = { kind: "approximate", inexactReasons: [{ cause: "external-link", path: "node_modules/lib-b" }] };
+    const j = judgeScoped(rows.R2, recheck);
+    expect(j.ok).toBe(false);
+    expect(j.unverifiable).toBe(true);
+    expect(j.reason).toBe(`testsPass: cannot attribute failures: the dispatch reference is approximate (external-link node_modules/lib-b)${OBS}`);
+    expect(j.reason).toContain("external-link node_modules/lib-b");
+    expect(JSON.stringify(j)).not.toContain("no worse than before");
+  });
 
   it.each(cells)("%s x %s -> ok=%s unverifiable=%s", (row, c, ok, unv, reason) => {
     const j = judgeScoped(rows[row], cols[c]);

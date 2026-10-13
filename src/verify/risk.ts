@@ -33,7 +33,8 @@
  * | 7  | a test file (incl. snapshots) was modified (added, changed, renamed) | medium              |
  * | 8  | a non-test file was deleted or any file was renamed               | medium                 |
  * | 9  | config / lock / CI / test-setup file changed (see isConfigPath)   | medium                 |
- * | 10 | scoping impossible (Unverifiable, S6)                             | medium                 |
+ * | 10 | scoping impossible (Unverifiable, S6), or the full suite runs     | medium                 |
+ * |    | (FullScopePlan: REASONS.fullScope instead)                        |                        |
  * | 11 | producer tier "fast"                                              | medium                 |
  * | 12 | no reference captured                                             | +1 step (max high)     |
  *
@@ -50,12 +51,22 @@ import type { ChangedPath, StaticScoping } from "./runner";
 export type RiskLevel = "low" | "medium" | "high";
 export type ProducerTier = "fast" | "medium" | "heavy" | (string & {});
 
+/**
+ * Cross-repo P2e (QA-1 #6): the scoping "plan" of a DoD whose every testsPass check runs the full suite (`scope=full`, or the
+ * dispatch's full scope): nothing is planned, so it is neither scoped nor S6. Row 10 then rates it medium with the neutral
+ * REASONS.fullScope instead of REASONS.unverifiable.
+ */
+export interface FullScopePlan {
+  readonly fullScope: true;
+}
+export const FULL_SCOPE_PLAN: FullScopePlan = { fullScope: true };
+
 export interface RiskInput {
   readonly changedFiles: readonly ChangedPath[];
   /** Whether a reference (baseline) exists for this delegation. Only presence matters. */
   readonly reference: boolean;
   readonly producerTier: ProducerTier;
-  readonly scopingPlan: StaticScoping;
+  readonly scopingPlan: StaticScoping | FullScopePlan;
   /** Git root; absolute changed paths are made relative to it before classification. */
   readonly root?: string;
 }
@@ -79,6 +90,7 @@ export const REASONS = {
   deletedOrRenamed: "files were deleted or renamed",
   configChanged: "config, lock or CI files changed",
   unverifiable: "scoping impossible (S6): the change cannot be verified by scoped tests",
+  fullScope: "the full suite runs (scope=full)",
   noAffected: "no affected tests found by static scoping",
   fastTier: "produced by the fast tier",
   noReference: "no reference captured: risk raised one step",
@@ -257,7 +269,8 @@ export function assessRisk(input: RiskInput): RiskAssessment {
     hit("medium", REASONS.configChanged);
   }
 
-  if ("unverifiable" in scopingPlan && scopingPlan.unverifiable === true) hit("medium", REASONS.unverifiable);
+  if ("fullScope" in scopingPlan && scopingPlan.fullScope === true) hit("medium", REASONS.fullScope);
+  else if ("unverifiable" in scopingPlan && scopingPlan.unverifiable === true) hit("medium", REASONS.unverifiable);
   else if ("noAffected" in scopingPlan && scopingPlan.noAffected === true) reasons.push(REASONS.noAffected);
 
   if (producerTier === "fast") hit("medium", REASONS.fastTier);

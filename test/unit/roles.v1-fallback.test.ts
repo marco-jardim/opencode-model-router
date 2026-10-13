@@ -15,7 +15,7 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { tool as pluginTool } from "@opencode-ai/plugin";
@@ -23,6 +23,7 @@ import ModelRouterPlugin from "../../src/index";
 import type { RouterPluginInput } from "../../src/compat/child-session";
 import { invalidateConfigCache, overridePath, resetRolesWarnings } from "../../src/router/config";
 import { SHIPPED_ROLE_SPECS } from "../../src/router/roles";
+import { approvalsPath } from "../../src/routing/roles/approvals";
 import { ROLES_V1_NOTICE } from "../../src/router/roles-config";
 
 const temps: string[] = [];
@@ -165,5 +166,52 @@ describe("roles configuration on OpenCode v1 (T3.1.2, plan §2.7, I8)", () => {
     expect(hashes(roles)).toEqual(hashes(base));
     // Byte equality of the prompt too (the hash above would hide nothing, this names the difference if there is one).
     expect(roles.system).toEqual(base.system);
+  });
+});
+
+/** `/router <args>` on the v1 plugin (no `routerHost`) for `override`: the text and the log lines carrying the v1 roles notice. */
+async function v1RouterText(dir: string, override: Record<string, unknown>, args: string): Promise<{ text: string; notices: number }> {
+  mkdirSync(dirname(overridePath()), { recursive: true });
+  writeFileSync(overridePath(), JSON.stringify(override));
+  invalidateConfigCache();
+  resetRolesWarnings();
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  const log = vi.fn(async () => ({}));
+  const hooks = await ModelRouterPlugin({
+    directory: dir, worktree: dir,
+    client: { session: { get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id } }) }, app: { log } },
+  } as unknown as RouterPluginInput) as Record<string, any>;
+  try {
+    const output = { parts: [] as Array<{ type: string; text: string }> };
+    await hooks["command.execute.before"]({ command: "router", arguments: args, sessionID: "root" }, output);
+    await hooks.dispose?.();
+    const notices = [...log.mock.calls, ...warn.mock.calls].filter((call) => JSON.stringify(call).includes(ROLES_V1_NOTICE)).length;
+    return { text: output.parts.map((part) => part.text).join("\n\n"), notices };
+  } finally {
+    warn.mockRestore();
+  }
+}
+
+describe("cross-repo P4.7 on OpenCode v1 (S5, QA case 7)", () => {
+  it("/router approve|repos|revoke are the help text byte for byte, write no store file and add no notice", async () => {
+    const dir = home();
+    const parents = join(dir, "parents");
+    mkdirSync(parents, { recursive: true });
+    const override = (() => {
+      const roles = rolesOverride(dir);
+      return { ...roles, routing: { ...roles.routing, repoParents: [parents.replaceAll("\\", "/")], repoApprovalDays: 7 } };
+    })();
+    const ext = join(dir, "ext");
+    const help = await v1RouterText(dir, override, "help");
+    expect(help.text).not.toContain("/router approve");
+    for (const args of [`approve ${ext}`, `approve "${ext}"`, "repos", `revoke ${ext}`]) {
+      const got = await v1RouterText(dir, override, args);
+      expect(got.text, args).toBe(help.text);
+      expect(got.notices, args).toBeLessThanOrEqual(1);
+    }
+    expect(existsSync(approvalsPath())).toBe(false);
+    // And the same command with the base configuration gives the same help (roles keys inert on v1).
+    expect((await v1RouterText(dir, BASE, `approve ${ext}`)).text).toBe((await v1RouterText(dir, BASE, "help")).text);
+    expect(existsSync(approvalsPath())).toBe(false);
   });
 });

@@ -6,13 +6,14 @@
  * (bare model, next rung, refusal), the runner mark, deferred verification and detection, and the binding rows.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import ModelRouterPlugin from "../../src/index";
 import type { RouterPluginInput } from "../../src/compat/child-session";
 import { invalidateConfigCache, overridePath, validateConfig, type RouterConfig } from "../../src/router/config";
 import { resolveRoles } from "../../src/router/roles";
+import { DISPATCH_HEADER_PREFIX, stripDispatchHeader } from "../../src/router/dispatch-header";
 import { lookupDispatch, markRunnerDispatch, rememberDispatch, resetDispatchRegistry, resetRunnerTokens, runnerDescription } from "../../src/router/sessions";
 import { TASK_CLASSES } from "../../src/routing/classify/types";
 import { buildRoleLadder, roleTierOrder } from "../../src/routing/engine/ladders";
@@ -22,10 +23,16 @@ import { resetIngestState } from "../../src/routing/outcomes/ingest";
 import { bind, resetBindingRegistryForTests } from "../../src/routing/roles/binding";
 import {
   CARRIED_ACCEPTANCE_NOTE, PIN_OVER_CALLER_REASON, RoleDispatchRefusal, VARIANT_NO_CANDIDATE_REASON, createDispatchRouter, pendingResumeRaise, resetDispatchRouting,
-  roleAttemptVerification,
-  roleEscalationAfterFail, roleGateDeferred, roleMaxActions, routedRoleOf, type DispatchRouter, type RouteOutcome,
+  roleAttemptVerification, type RoleAttemptChanges,
+  roleEscalationAfterFail, roleGateDeferred, roleGateOutsideWorkRoot, roleMaxActions, routedRoleOf, type DispatchRouter, type RouteOutcome,
 } from "../../src/routing/wire/dispatch";
 import { createEngineRuntime, type EngineRuntime } from "../../src/routing/wire/runtime";
+import { execFileSync } from "node:child_process";
+import type { Admission, AdmissionConfig, AdmissionService, RepoLocation } from "../../src/routing/roles/admission";
+import { forgetWorkingSet, workingSetOf } from "../../src/routing/wire/working-set";
+import {
+  APPROVALS_FILE_NAME, inspectCandidate, readApprovals, resetApprovalsState, type ApprovalsEnv, type RepoApproval,
+} from "../../src/routing/roles/approvals";
 
 const bundled = JSON.parse(readFileSync(join(process.cwd(), "tiers.json"), "utf-8")) as Record<string, unknown>;
 const logger = { warn: vi.fn() };
@@ -76,7 +83,18 @@ function temp(prefix: string): string {
   return dir;
 }
 
-function makeWorld(cfg: RouterConfig, opts: { catalog?: Catalog; main?: string; routerVerifyEnabled?: () => boolean } = {}): World {
+function makeWorld(cfg: RouterConfig, opts: {
+  catalog?: Catalog; main?: string; routerVerifyEnabled?: () => boolean;
+  createAdmission?: (config: AdmissionConfig) => Pick<AdmissionService, "admit" | "resolve">;
+  /** The session directory's worktree top level (`git rev-parse --show-toplevel`); undefined: the real hardened git. */
+  showToplevel?: (cwd: string) => Promise<string | undefined>;
+  /** Real git for the worktree list, the admission and the toplevel (no fakes). */
+  realGit?: boolean;
+  /** Phase 4: the approvals store (an injected directory and clock) of the bind path and of the real admission's rule 3. */
+  approvalsEnv?: ApprovalsEnv;
+  /** Phase 4: `inspectCandidate` of the D15 approval note. */
+  inspectCandidate?: typeof inspectCandidate;
+} = {}): World {
   const main = opts.main ?? temp("omr-p21-int-main-");
   let captured: OutcomesBundle | null = null;
   const runtime = createEngineRuntime({
@@ -96,9 +114,13 @@ function makeWorld(cfg: RouterConfig, opts: { catalog?: Catalog; main?: string; 
     graderAgent: "router-grader",
     directory: main,
     logger,
-    listWorktrees: async () => `worktree ${main.replace(/\\/g, "/")}\nHEAD 0\nbranch refs/heads/main\n`,
+    ...(opts.realGit === true ? {} : { listWorktrees: async () => `worktree ${main.replace(/\\/g, "/")}\nHEAD 0\nbranch refs/heads/main\n` }),
+    ...(opts.showToplevel === undefined ? {} : { showToplevel: opts.showToplevel }),
     env: {},
     ...(opts.routerVerifyEnabled === undefined ? {} : { routerVerifyEnabled: opts.routerVerifyEnabled }),
+    ...(opts.createAdmission === undefined ? {} : { createAdmission: opts.createAdmission }),
+    ...(opts.approvalsEnv === undefined ? {} : { approvalsEnv: opts.approvalsEnv }),
+    ...(opts.inspectCandidate === undefined ? {} : { inspectCandidate: opts.inspectCandidate }),
   });
   cleanups.push(async () => { await runtime.dispose(); });
   return {
@@ -335,6 +357,63 @@ describe("detection and binding rows", () => {
   });
 });
 
+describe("detection with per-check check roots (P2.5)", () => {
+  const detectionOf = async (world: World, checks: string, opts: { verify?: boolean } = {}): Promise<string | undefined> => {
+    const verify = opts.verify === false ? "" : "VERIFY: required\n";
+    const prompt = `[route class=implement risk=low scope=single needs=edit root=${world.main}]\n${verify}change x\n[acceptance]\n${checks}\n[/acceptance]`;
+    return (await world.router.route(call(world, { agent: "implementer", prompt }))).role!.detection;
+  };
+
+  it("every check root in W → deterministic", async () => {
+    const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+    mkdirSync(join(world.main, "pkg"), { recursive: true });
+    expect(await detectionOf(world, "check: testsPass cwd=pkg\ncheck: fileExists path=x.txt scope=full")).toBe("deterministic");
+  });
+
+  it("a check cwd outside W and outside R → not deterministic", async () => {
+    const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+    const outside = temp("omr-p25-outside-");
+    expect(await detectionOf(world, `check: testsPass cwd=${outside}`)).not.toBe("deterministic");
+    expect(await detectionOf(world, "check: testsPass cwd=../escape")).not.toBe("deterministic");
+  });
+
+  it("an invalid scope= → not deterministic", async () => {
+    const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+    expect(await detectionOf(world, "check: testsPass scope=everything")).not.toBe("deterministic");
+  });
+
+  it("VERIFY:deferred (the default) with per-check keys → deferred, detection not deterministic", async () => {
+    const cfg = config({ delegation: "roles", engine: "static" });
+    const world = makeWorld(cfg);
+    mkdirSync(join(world.main, "pkg"), { recursive: true });
+    const keyed = "[acceptance]\ncheck: testsPass cwd=pkg\n[/acceptance]";
+    const plain = "[acceptance]\ncheck: testsPass\n[/acceptance]";
+    expect(roleGateDeferred(cfg, `change x\n${keyed}`, "")).toBe(true);
+    expect(roleGateDeferred(cfg, `change x\n[acceptance]\ncheck: testsPass scope=full\n[/acceptance]`, "")).toBe(true);
+    expect(roleGateDeferred(cfg, `change x\n${plain}`, "")).toBe(true);
+    expect(await detectionOf(world, "check: testsPass cwd=pkg", { verify: false })).not.toBe("deterministic");
+    expect(await detectionOf(world, "check: testsPass", { verify: false })).not.toBe("deterministic");
+  });
+
+  it("a refused cwd= is still not deterministic", async () => {
+    const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+    const outside = temp("omr-p25-refused-");
+    expect(roleGateOutsideWorkRoot(world.main, `change x\n[acceptance]\ncheck: testsPass cwd=${outside}\n[/acceptance]`, "")).toBe(true);
+    expect(await detectionOf(world, `check: testsPass cwd=${outside}`)).not.toBe("deterministic");
+    expect(await detectionOf(world, `check: testsPass cwd=${outside}`, { verify: false })).not.toBe("deterministic");
+  });
+
+  it("roleGateOutsideWorkRoot accepts a check root in the read set and refuses it without one", () => {
+    const root = temp("omr-p25-w-");
+    const elsewhere = temp("omr-p25-r-");
+    const prompt = `change x\n[acceptance]\ncheck: testsPass cwd=${elsewhere}\n[/acceptance]`;
+    expect(roleGateOutsideWorkRoot(root, prompt, "")).toBe(true);
+    expect(roleGateOutsideWorkRoot(root, prompt, "", undefined, () => false)).toBe(true);
+    expect(roleGateOutsideWorkRoot(root, prompt, "", undefined, () => true)).toBe(false);
+    expect(roleGateOutsideWorkRoot(root, "change x\n[acceptance]\ncheck: testsPass\n[/acceptance]", "")).toBe(false);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // QA round 2 of P2.1: the resume path
 // ---------------------------------------------------------------------------
@@ -464,11 +543,15 @@ describe("P3.3 global QA round 1: resumes keep the resumed dispatch's facts and 
     expect(resumed.role!.window.floor).toBe("medium"); // was heavy: write + exec without detection
     expect(resumed.role!.notes).toContain(CARRIED_ACCEPTANCE_NOTE);
     // The router's gate verifies the resume on the same acceptance: it is carried in the prompt the host runs.
-    expect(resumed.prompt).toBe(`continue and finish\nVERIFY: required\n${acceptance}`);
+    // Q8 (FLIPPED ON PURPOSE: an exactly bound resume used to carry the role header): the resume declares no target, there is no
+    // routing.repoParents and its work root is the session directory, so no header; the carried block stays last.
+    expect(resumed.prompt!.startsWith(DISPATCH_HEADER_PREFIX)).toBe(false);
+    expect(stripDispatchHeader(resumed.prompt!)).toBe(`continue and finish\nVERIFY: required\n${acceptance}`);
     world.router.commit(rc.callID, applied(resumeInput, resumed));
     expect(lookupDispatch("child-w")?.verification).toEqual({ block: acceptance, directives: ["VERIFY: required"] }); // a 2nd resume carries it too
     // A resume naming its own acceptance keeps its own (nothing carried).
     const own = await world.router.route(call(world, { agent: "implementer", sessionID: "child-w", prompt: "fix it\n[acceptance]\ncriteria: the generator runs\n[/acceptance]" }));
+    // Q8: no header and nothing carried: the router leaves the resume's prompt untouched (none is returned)
     expect(own.prompt).toBeUndefined();
     expect(own.role!.notes).not.toContain(CARRIED_ACCEPTANCE_NOTE);
   });
@@ -511,20 +594,165 @@ describe("P3.3 global QA round 1: resumes keep the resumed dispatch's facts and 
     expect(lookupDispatch("child-c")?.verification?.claim).toBe("grader");
   });
 
-  it("QA-G-B N-b: a child bound without a work root keeps none on a resume — never the resume's own root", async () => {
+  // Q9 (FLIPPED ON PURPOSE): this test dispatched with a root= outside the session's worktrees to get a child bound without a work
+  // root and resumed it. That fresh dispatch is now REFUSED. A child without a work root can still be created through the router
+  // when the session directory cannot be resolved (a dispatch that declares nothing then gets no work root, not a refusal); the
+  // resume rule (a resume of an exactly bound child keeps the child's grant, never the resume's own root) is covered by the
+  // QA-G-B-1 tests above and the exact-resume target tests below.
+  it("QA-G-B N-b / Q9: a fresh dispatch with a root= outside the session's worktrees is refused, so no child is bound without a work root", async () => {
     const world = makeWorld(config({ delegation: "roles", engine: "static" }));
     const other = temp("omr-g-noroot-");
-    const fresh = await freshChild(world, "child-n", {
+    const refusal = await world.router.route(call(world, {
       agent: "implementer", description: "no root", prompt: `[route class=implement risk=low scope=single needs=edit root=${other}]\nchange x`,
+    })).catch((error: unknown) => error);
+    expect(refusal).toBeInstanceOf(RoleDispatchRefusal);
+    expect((refusal as RoleDispatchRefusal).reason).toContain("neither the session directory nor a worktree");
+  });
+
+  describe("Q9 (QA round 3): an exact resume that declares a target", () => {
+    const RESUME = (fields: string): string => `[route class=implement risk=low scope=single needs=edit ${fields}]\ncontinue and finish`;
+    const refusalOfResume = async (world: World, child: string, prompt: string): Promise<RoleDispatchRefusal | undefined> => {
+      const result = await world.router.route(call(world, { agent: "implementer", sessionID: child, prompt })).then(() => undefined, (error: unknown) => error);
+      if (result === undefined) return undefined;
+      expect(result).toBeInstanceOf(RoleDispatchRefusal);
+      return result as RoleDispatchRefusal;
+    };
+
+    it("a child bound by root=: the same root proceeds; another root, repo=/branch= or an invalid root= is refused, admission never asked", async () => {
+      const resolve = vi.fn(async (): Promise<Admission> => ({ ok: false, reason: "never" }));
+      const admit = vi.fn(async (): Promise<Admission> => ({ ok: false, reason: "never" }));
+      const created = vi.fn(() => ({ admit, resolve }));
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }), { createAdmission: created });
+      await freshChild(world, "child-q9r", { agent: "implementer", description: "bound", prompt: RESUME(`root=${world.main}`) });
+      const refusal = `this child is bound to ${world.main}; a resume cannot change its work root: dispatch a new child`;
+
+      const same = await world.router.route(call(world, { agent: "implementer", sessionID: "child-q9r", prompt: RESUME(`root=${world.main}`) }));
+      expect(same.role!.workRoot).toBe(world.main);
+      expect(same.role!.grant.workRoot).toBe(world.main);
+      expect([...same.role!.grant.actions]).toContain("edit");
+
+      const other = temp("omr-q9-resume-other-");
+      expect((await refusalOfResume(world, "child-q9r", RESUME(`root=${other}`)))?.reason).toBe(refusal);
+      expect((await refusalOfResume(world, "child-q9r", RESUME("branch=main")))?.reason).toBe(refusal); // no location: cannot be shown to match
+      expect((await refusalOfResume(world, "child-q9r", RESUME("repo=app")))?.reason).toBe(refusal);
+      expect((await refusalOfResume(world, "child-q9r", RESUME("root=../elsewhere")))?.reason).toBe(refusal);
+      expect((await refusalOfResume(world, "child-q9r", RESUME("branch=a..b")))?.message)
+        .toBe(`[router] role dispatch @implementer refused: ${refusal}`);
+      // a resume that declares nothing is untouched
+      expect(await refusalOfResume(world, "child-q9r", "continue")).toBeUndefined();
+      // D17: a repo= / branch= the text fast path cannot match is resolved like a fresh dispatch's (here: refused by admission, so the
+      // resume is refused as before); a root= is not asked to admission without routing.repoParents. Nothing is ever adopted.
+      expect(resolve).toHaveBeenCalledTimes(2); // repo=app, branch=main
+      expect(admit).not.toHaveBeenCalled();
     });
-    expect(fresh.role!.workRoot).toBeNull();
-    const resumed = await world.router.route(call(world, {
-      agent: "implementer", sessionID: "child-n",
-      prompt: `continue\nVERIFY: required\n[acceptance]\ncheck: fileExists path=${join(world.main, "x.txt")}\n[/acceptance]`,
-    }));
-    expect(resumed.role!.grant.workRoot).toBeNull(); // was the session directory (the resume's own root)
-    expect(resumed.role!.detection).not.toBe("deterministic"); // no validated work root: the gate cannot back it
-    expect([...resumed.role!.grant.actions]).not.toContain("edit");
+
+    it("a child bound by branch= through admission: the same repo=/branch= proceeds without admission; another branch is refused", async () => {
+      const resolve = vi.fn(async (input: { repo?: string; branch?: string }): Promise<Admission> => (
+        input.branch === "dev" || input.repo === "other"
+          ? { ok: false, reason: "no such target" }
+          : { ok: true, location: { repository: world.main, name: "app", worktree: world.main, branch: "main", head: "abc1234", worktrees: [] } }
+      ));
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }), { createAdmission: () => ({ admit: vi.fn(), resolve }) });
+      await freshChild(world, "child-q9b", { agent: "implementer", description: "bound", prompt: RESUME("branch=main") });
+      expect(resolve).toHaveBeenCalledTimes(1);
+
+      const same = await world.router.route(call(world, { agent: "implementer", sessionID: "child-q9b", prompt: RESUME("repo=app branch=main") }));
+      expect(same.role!.workRoot).toBe(world.main);
+      expect(same.role!.grant.location).toMatchObject({ name: "app", branch: "main" });
+      const byRoot = await world.router.route(call(world, { agent: "implementer", sessionID: "child-q9b", prompt: RESUME(`root=${world.main} branch=main`) }));
+      expect(byRoot.role!.workRoot).toBe(world.main);
+      expect(resolve).toHaveBeenCalledTimes(1); // the resumes ran no admission
+
+      const refusal = `this child is bound to ${world.main} (repository app, branch main); a resume cannot change its work root: dispatch a new child`;
+      expect((await refusalOfResume(world, "child-q9b", RESUME("branch=dev")))?.reason).toBe(refusal);
+      expect((await refusalOfResume(world, "child-q9b", RESUME("repo=other")))?.reason).toBe(refusal);
+      expect(resolve).toHaveBeenCalledTimes(3); // D17: only the two declarations the text fast path could not match were resolved
+    });
+
+    // D17 (cross-repo QA, major): a resume that repeats the route line that bound the child is never refused, whatever the spelling.
+    describe("D17: a resume repeating its binding target", () => {
+      const locationFor = (name: string, worktree: string, branch: string): RepoLocation =>
+        ({ repository: worktree, name, worktree, branch, head: "abc1234", worktrees: [] });
+
+      it("repo=<worktree directory> (Q10: the location's name is the repository's) proceeds; another branch of it is refused", async () => {
+        const wt = temp("omr-d17-lib-wt-");
+        const other = temp("omr-d17-lib-other-");
+        const resolve = vi.fn(async (input: { branch?: string }): Promise<Admission> => ({
+          ok: true, location: locationFor("lib-main", input.branch === "dev" ? other : wt, input.branch ?? "feat"),
+        }));
+        const world = makeWorld(config({ delegation: "roles", engine: "static" }), { createAdmission: () => ({ admit: vi.fn(), resolve }) });
+        await freshChild(world, "child-d17q", { agent: "implementer", description: "bound", prompt: RESUME("repo=lib-wt") });
+        expect(resolve).toHaveBeenCalledTimes(1);
+
+        const same = await world.router.route(call(world, { agent: "implementer", sessionID: "child-d17q", prompt: RESUME("repo=lib-wt") }));
+        expect(same.role!.workRoot).toBe(wt);
+        expect(same.role!.grant.workRoot).toBe(wt); // the grant stays the bound one
+        expect(same.role!.grant.location).toMatchObject({ name: "lib-main", worktree: wt });
+        expect(resolve).toHaveBeenCalledTimes(2); // the text fast path failed: the declaration was resolved like a fresh dispatch's
+
+        const refusal = await refusalOfResume(world, "child-d17q", RESUME("repo=lib-wt branch=dev"));
+        expect(refusal?.reason).toBe(`this child is bound to ${wt} (repository lib-main, branch feat); a resume cannot change its work root: dispatch a new child`);
+        expect(resolve).toHaveBeenCalledTimes(3);
+      });
+
+      it("repo=<worktree directory> branch=<main branch> bound to the main checkout proceeds when repeated", async () => {
+        const resolve = vi.fn(async (): Promise<Admission> => ({ ok: true, location: locationFor("lib-main", world.main, "main") }));
+        const world = makeWorld(config({ delegation: "roles", engine: "static" }), { createAdmission: () => ({ admit: vi.fn(), resolve }) });
+        await freshChild(world, "child-d17m", { agent: "implementer", description: "bound", prompt: RESUME("repo=lib-wt branch=main") });
+        const same = await world.router.route(call(world, { agent: "implementer", sessionID: "child-d17m", prompt: RESUME("repo=lib-wt branch=main") }));
+        expect(same.role!.workRoot).toBe(world.main);
+        expect(same.role!.grant.workRoot).toBe(world.main);
+        expect(same.role!.grant.location).toMatchObject({ name: "lib-main", branch: "main" });
+      });
+
+      it("branch=refs/heads/<b> repeated proceeds on the text fast path: admission is not called again", async () => {
+        const resolve = vi.fn(async (): Promise<Admission> => ({ ok: true, location: locationFor("app", world.main, "main") }));
+        const world = makeWorld(config({ delegation: "roles", engine: "static" }), { createAdmission: () => ({ admit: vi.fn(), resolve }) });
+        await freshChild(world, "child-d17r", { agent: "implementer", description: "bound", prompt: RESUME("branch=refs/heads/main") });
+        expect(resolve).toHaveBeenCalledTimes(1);
+        const same = await world.router.route(call(world, { agent: "implementer", sessionID: "child-d17r", prompt: RESUME("branch=refs/heads/main") }));
+        expect(same.role!.workRoot).toBe(world.main);
+        const bare = await world.router.route(call(world, { agent: "implementer", sessionID: "child-d17r", prompt: RESUME("repo=app branch=main") }));
+        expect(bare.role!.workRoot).toBe(world.main);
+        expect(resolve).toHaveBeenCalledTimes(1);
+      });
+
+      it("a root= spelled through a junction proceeds; a root= that resolves elsewhere is refused; the grant stays the bound one", async () => {
+        const parent = temp("omr-d17-parent-");
+        const elsewhere = temp("omr-d17-elsewhere-");
+        const admit = vi.fn(async (root: string): Promise<Admission> => {
+          const real = realpathSync.native(root);
+          return { ok: true, location: locationFor("app", real, "main") };
+        });
+        const world = makeWorld(config({ delegation: "roles", engine: "static", repoParents: [parent] }), {
+          createAdmission: () => ({ admit, resolve: vi.fn() }),
+        });
+        const link = join(temp("omr-d17-link-"), "main-link");
+        symlinkSync(world.main, link, "junction");
+        await freshChild(world, "child-d17j", { agent: "implementer", description: "bound", prompt: RESUME(`root=${world.main}`) });
+        expect(admit).not.toHaveBeenCalled(); // the session directory itself binds by text
+
+        const same = await world.router.route(call(world, { agent: "implementer", sessionID: "child-d17j", prompt: RESUME(`root=${link}`) }));
+        expect(same.role!.workRoot).toBe(world.main);
+        expect(same.role!.grant.workRoot).toBe(world.main);
+        expect(admit).toHaveBeenCalledTimes(1);
+
+        const refusal = await refusalOfResume(world, "child-d17j", RESUME(`root=${elsewhere}`));
+        expect(refusal?.reason).toBe(`this child is bound to ${world.main}; a resume cannot change its work root: dispatch a new child`);
+      });
+
+      it("the text fast path runs no admission (root= equal to the bound work root)", async () => {
+        const parent = temp("omr-d17-parent-");
+        const admit = vi.fn(async (): Promise<Admission> => ({ ok: false, reason: "never" }));
+        const resolve = vi.fn(async (): Promise<Admission> => ({ ok: false, reason: "never" }));
+        const world = makeWorld(config({ delegation: "roles", engine: "static", repoParents: [parent] }), { createAdmission: () => ({ admit, resolve }) });
+        await freshChild(world, "child-d17t", { agent: "implementer", description: "bound", prompt: RESUME(`root=${world.main}`) });
+        const same = await world.router.route(call(world, { agent: "implementer", sessionID: "child-d17t", prompt: RESUME(`root=${world.main}`) }));
+        expect(same.role!.workRoot).toBe(world.main);
+        expect(admit).not.toHaveBeenCalled();
+        expect(resolve).not.toHaveBeenCalled();
+      });
+    });
   });
 
   it("QA-G-B-2-1: a carried testsPass is deterministic only once the attempt that introduced it was gated (its change baseline)", async () => {
@@ -546,11 +774,589 @@ describe("P3.3 global QA round 1: resumes keep the resumed dispatch's facts and 
     expect(resumed.carried).toBe(true);
     expect(resumed.detection).toBe("deterministic");
   });
+
+  describe("QA-G-B-2-1 / I7: a carried acceptance is judged on the tree its introducing attempt was gated on", () => {
+    const REF = { kind: "none" as const, reason: "test" };
+    const SWITCH = "the working tree X switched from branch main to branch feat/x during the dispatch; the checks would verify another branch";
+    const INHERITED = "the working tree X switched from branch main to branch inherited during the dispatch; the checks would verify another branch";
+    const snapOf = (world: World, head: string, branch?: string | null) => ({ cwd: world.main, root: world.main, head, ...(branch === undefined ? {} : { branch }) });
+    const acceptanceChild = (world: World, child: string) => freshChild(world, child, {
+      agent: "implementer", description: "tests",
+      prompt: `[route class=implement risk=low scope=single needs=edit root=${world.main}]\nVERIFY: required\nchange the generator\n[acceptance]\ncheck: testsPass\n[/acceptance]`,
+    });
+    /** Route and commit the "continue and finish" resume of `child`: it carries the acceptance (the baseline is re-registered). */
+    const attemptOf = (world: World, head: string, branch?: string | null, branchSwitch?: string): RoleAttemptChanges => ({
+      changedFiles: [], changeBaseline: "available", reference: REF, snapshot: snapOf(world, head, branch), ...(branchSwitch === undefined ? {} : { branchSwitch }),
+    });
+    async function resume(world: World, child: string): Promise<void> {
+      const input = { agent: "implementer", sessionID: child, prompt: "continue and finish" };
+      const rc = call(world, input);
+      const routed = await world.router.route(rc);
+      expect(routed.role!.carried).toBe(true);
+      world.router.commit(rc.callID, applied(input, routed));
+    }
+
+    it("carries the branch switch and the snapshot of the attempt through: own, carried without a baseline, carried with one", async () => {
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+      await acceptanceChild(world, "child-i1");
+      const snapshot = snapOf(world, "A", "main");
+      const prepared = attemptOf(world, "A", "main", SWITCH);
+      // Own path.
+      expect(roleAttemptVerification("child-i1", prepared, { carried: false })).toMatchObject({ branchSwitch: SWITCH, snapshot });
+      // Carried with a baseline, the current tree on another branch: the switch of this very dispatch takes precedence.
+      const onOther = attemptOf(world, "A", "other", SWITCH);
+      expect(roleAttemptVerification("child-i1", onOther, { carried: true })).toMatchObject({ branchSwitch: SWITCH, snapshot: onOther.snapshot });
+      // Carried without a baseline (the introducing attempt was never gated).
+      await acceptanceChild(world, "child-i2");
+      const noBaseline = roleAttemptVerification("child-i2", prepared, { carried: true });
+      expect(noBaseline).toMatchObject({ branchSwitch: SWITCH, snapshot, changeBaseline: "unavailable" });
+    });
+
+    it("a carried attempt on another branch than the introducing attempt's is a switch; staying on the branch is not", async () => {
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+      await acceptanceChild(world, "child-l1");
+      await acceptanceChild(world, "child-l2");
+      const own = (child: string) => roleAttemptVerification(child, attemptOf(world, "A", "main"), { carried: false });
+      own("child-l1"); own("child-l2");
+      await resume(world, "child-l1"); await resume(world, "child-l2"); // the baseline goes through frozenVerification
+      const carried = (child: string, branch: string) => roleAttemptVerification(child, attemptOf(world, "A", branch), { carried: true });
+      expect(carried("child-l1", "other").branchSwitch).toMatch(/switched from branch main to branch other since the attempt that introduced this acceptance/);
+      expect(carried("child-l2", "main").branchSwitch).toBeUndefined();
+    });
+
+    it("a switch found during the introducing attempt is inherited by the carried attempts, even on the branch the tree came back to", async () => {
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+      await acceptanceChild(world, "child-h");
+      roleAttemptVerification("child-h", attemptOf(world, "A", "main", INHERITED), { carried: false });
+      await resume(world, "child-h");
+      const carried = roleAttemptVerification("child-h", attemptOf(world, "A", "main"), { carried: true });
+      expect(carried.branchSwitch).toBe(`in an earlier attempt of this acceptance: ${INHERITED}`);
+    });
+
+    it("B3: a switch found by a carried attempt is recorded and inherited by the next carried attempt, even back on the branch", async () => {
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+      await acceptanceChild(world, "child-b3");
+      roleAttemptVerification("child-b3", attemptOf(world, "A", "main"), { carried: false });
+      await resume(world, "child-b3");
+      // Carried attempt 2 finds a switch of its own.
+      expect(roleAttemptVerification("child-b3", attemptOf(world, "A", "other", SWITCH), { carried: true }).branchSwitch).toBe(SWITCH);
+      await resume(world, "child-b3");
+      // Carried attempt 3: no switch of its own, the tree is back on main.
+      const third = roleAttemptVerification("child-b3", attemptOf(world, "A", "main"), { carried: true });
+      expect(third.branchSwitch).toBeDefined();
+      expect(third.branchSwitch).toContain(SWITCH);
+    });
+
+    it("B9: a carried attempt with a recorded tree but no current snapshot cannot confirm the branch, and names the recorded root", async () => {
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+      await acceptanceChild(world, "child-b9");
+      roleAttemptVerification("child-b9", attemptOf(world, "A", "main"), { carried: false });
+      await resume(world, "child-b9");
+      const blind: RoleAttemptChanges = { ...attemptOf(world, "A", "main"), snapshot: undefined };
+      expect(roleAttemptVerification("child-b9", blind, { carried: true }).branchSwitch).toBe(
+        `cannot confirm the branch of ${world.main}: the working tree could not be read for this carried attempt, so the checks could verify another branch. Send a fresh [acceptance] block, or re-dispatch.`);
+    });
+
+    it("B11: an inherited switch reason carries the 'earlier attempt' prefix exactly once across carried attempts", async () => {
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+      await acceptanceChild(world, "child-b11");
+      const PREFIX = "in an earlier attempt of this acceptance: ";
+      roleAttemptVerification("child-b11", attemptOf(world, "A", "main", INHERITED), { carried: false });
+      await resume(world, "child-b11");
+      expect(roleAttemptVerification("child-b11", attemptOf(world, "A", "main"), { carried: true }).branchSwitch).toBe(`${PREFIX}${INHERITED}`);
+      await resume(world, "child-b11");
+      const second = roleAttemptVerification("child-b11", attemptOf(world, "A", "main"), { carried: true }).branchSwitch;
+      expect(second).toBe(`${PREFIX}${INHERITED}`);
+      expect(second!.split(PREFIX)).toHaveLength(2);
+      // A switch found by the carried attempt itself is returned unprefixed.
+      await acceptanceChild(world, "child-b11b");
+      roleAttemptVerification("child-b11b", attemptOf(world, "A", "main"), { carried: false });
+      await resume(world, "child-b11b");
+      expect(roleAttemptVerification("child-b11b", attemptOf(world, "A", "other", SWITCH), { carried: true }).branchSwitch).toBe(SWITCH);
+    });
+
+    it("QA2 F3c: an own attempt that could not confirm its branch is not the lineage's switch; a later readable carried attempt on the branch has none", async () => {
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+      await acceptanceChild(world, "child-f3c");
+      const UNCONFIRMED = `cannot confirm the branch of ${world.main}: the working tree could not be read when the dispatch started, so the checks could verify another branch. Re-dispatch, or send a fresh [acceptance] block.`;
+      // The own attempt still reports its own reason to its own gate ...
+      expect(roleAttemptVerification("child-f3c", attemptOf(world, "A", "main", UNCONFIRMED), { carried: false }).branchSwitch).toBe(UNCONFIRMED);
+      await resume(world, "child-f3c");
+      // ... but it is not recorded: the carried attempt, readable and on the same branch, inherits nothing.
+      expect(roleAttemptVerification("child-f3c", attemptOf(world, "A", "main"), { carried: true }).branchSwitch).toBeUndefined();
+      // The same for a carried attempt that itself could not confirm: it is not recorded for the next one either.
+      await resume(world, "child-f3c");
+      expect(roleAttemptVerification("child-f3c", attemptOf(world, "A", "main", UNCONFIRMED), { carried: true }).branchSwitch).toBe(UNCONFIRMED);
+      await resume(world, "child-f3c");
+      expect(roleAttemptVerification("child-f3c", attemptOf(world, "A", "main"), { carried: true }).branchSwitch).toBeUndefined();
+    });
+
+    it("control: carried attempts on the same branch with snapshots record no switch", async () => {
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+      await acceptanceChild(world, "child-ctl");
+      roleAttemptVerification("child-ctl", attemptOf(world, "A", "main"), { carried: false });
+      await resume(world, "child-ctl");
+      expect(roleAttemptVerification("child-ctl", attemptOf(world, "A", "main"), { carried: true }).branchSwitch).toBeUndefined();
+      await resume(world, "child-ctl");
+      expect(roleAttemptVerification("child-ctl", attemptOf(world, "B", "main"), { carried: true }).branchSwitch).toBeUndefined();
+    });
+
+    it("the unattributed writers of the introducing attempt are unioned into the carried attempts (P0.3)", async () => {
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+      await acceptanceChild(world, "child-w1");
+      await acceptanceChild(world, "child-w2");
+      const withWriters = (...writers: string[]): RoleAttemptChanges => ({ ...attemptOf(world, "A", "main"), ...(writers.length > 0 ? { unattributedWriters: writers } : {}) });
+      // Own attempts: the writers of the attempt itself are returned.
+      expect(roleAttemptVerification("child-w1", withWriters("bash"), { carried: false }).unattributedWriters).toEqual(["bash"]);
+      roleAttemptVerification("child-w2", withWriters("bash"), { carried: false });
+      await resume(world, "child-w1"); await resume(world, "child-w2"); // the baseline goes through frozenVerification
+      // A carried attempt that ran nothing unobservable still reports the introducing attempt's writers.
+      expect(roleAttemptVerification("child-w1", withWriters(), { carried: true }).unattributedWriters).toEqual(["bash"]);
+      // A carried attempt with another tool: the union, sorted and without duplicates.
+      expect(roleAttemptVerification("child-w2", withWriters("router_run"), { carried: true }).unattributedWriters).toEqual(["bash", "router_run"]);
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
 // E6 / E7 through the plugin's hook shapes
 // ---------------------------------------------------------------------------
+
+describe("cross-repo P1.4: the work root bound through admission", () => {
+  beforeEach(() => forgetWorkingSet("root"));
+  afterEach(() => forgetWorkingSet("root"));
+
+  it("[route … repo=<name>] binds that repository below routing.repoParents: the location on the grant, the working set updated", async () => {
+    const parent = temp("omr-p14-parent-");
+    for (const name of ["alpha", "beta"]) {
+      mkdirSync(join(parent, name));
+      execFileSync("git", ["init", "-q", "-b", "main", join(parent, name)], { stdio: "ignore" });
+    }
+    const beta = realpathSync.native(join(parent, "beta"));
+    const world = makeWorld(config({ delegation: "roles", engine: "static", repoParents: [parent] }));
+    const outcome = await world.router.route(call(world, {
+      agent: "implementer", prompt: "[route class=implement risk=low scope=single needs=edit repo=beta]\nchange x",
+    }));
+    expect(outcome.role!.workRoot).toBe(beta);
+    expect(outcome.role!.grant.workRoot).toBe(beta);
+    expect(outcome.role!.grant.location).toMatchObject({ name: "beta", repository: beta, worktree: beta, branch: "main" });
+    expect([...outcome.role!.grant.actions]).toContain("edit");
+    expect(workingSetOf("root").map((location) => location.worktree)).toEqual([beta]);
+  });
+
+  it("I9: without routing.repoParents and without repo=/branch= no admission is built; branch= alone builds one (once per config) and asks it", async () => {
+    const created: AdmissionConfig[] = [];
+    const reason = "repo=main branch=feat: no worktree of main is on feat (main): no work root.";
+    const resolve = vi.fn(async (): Promise<Admission> => ({ ok: false, reason }));
+    const admit = vi.fn(async (): Promise<Admission> => ({ ok: false, reason: "never" }));
+    const world = makeWorld(config({ delegation: "roles", engine: "static" }), {
+      createAdmission: (admissionConfig) => {
+        created.push(admissionConfig);
+        return { admit, resolve };
+      },
+    });
+    const plain = await world.router.route(call(world, {
+      agent: "implementer", prompt: `[route class=implement risk=low scope=single needs=edit root=${world.main}]\nchange x`,
+    }));
+    expect(plain.role!.workRoot).toBe(world.main);
+    expect(plain.role!.grant.location).toBeUndefined();
+    expect(created).toEqual([]);
+
+    // Q9 (FLIPPED ON PURPOSE: the refused branch= used to give a null work root and no edit; the dispatch is now refused)
+    const branched = await world.router.route(call(world, { agent: "implementer", prompt: "[route class=implement risk=low scope=single needs=edit branch=feat]\nchange x" })).catch((error: unknown) => error);
+    expect(branched).toBeInstanceOf(RoleDispatchRefusal);
+    expect((branched as RoleDispatchRefusal).reason).toBe(reason);
+    expect((branched as RoleDispatchRefusal).message).toBe(`[router] role dispatch @implementer refused: ${reason}`);
+    expect(resolve).toHaveBeenCalledWith({ branch: "feat" }, { sessionRepository: world.main, known: [world.main] });
+    await world.router.route(call(world, { agent: "implementer", prompt: "[route class=implement risk=low scope=single needs=edit branch=feat]\nchange y" })).catch(() => undefined);
+    expect(resolve).toHaveBeenCalledTimes(2);
+    expect(created).toHaveLength(1);
+    expect(created[0]?.parents).toEqual([]);
+    expect(admit).not.toHaveBeenCalled();
+    expect(workingSetOf("root")).toEqual([]);
+  });
+
+  const locationOf = (worktree: string): RepoLocation => ({ repository: worktree, name: "app", worktree, branch: "main", head: "abc1234", worktrees: [] });
+  const EDIT_PROMPT = (fields: string): string => `[route class=implement risk=low scope=single needs=edit ${fields}]\nchange x`;
+
+  describe("QA round 1", () => {
+    /** Q9: the refusal a dispatch ends in (undefined when it was routed). */
+    const refusalOf = async (world: World, prompt: string): Promise<RoleDispatchRefusal | undefined> => {
+      const result = await world.router.route(call(world, { agent: "implementer", prompt })).then(() => undefined, (error: unknown) => error);
+      if (result === undefined) return undefined;
+      expect(result).toBeInstanceOf(RoleDispatchRefusal);
+      return result as RoleDispatchRefusal;
+    };
+
+    // Q9 (FLIPPED ON PURPOSE: an invalid branch= / repo= used to give a null work root and a note on the outcome; the dispatch
+    // is now refused with that note).
+    it("F3 / Q9: an invalid branch= / repo= refuses the dispatch with the note; admission is never asked", async () => {
+      const resolve = vi.fn(async (): Promise<Admission> => ({ ok: true, location: locationOf("never") }));
+      const admit = vi.fn(async (): Promise<Admission> => ({ ok: true, location: locationOf("never") }));
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }), { createAdmission: () => ({ admit, resolve }) });
+      const badBranch = await refusalOf(world, EDIT_PROMPT("branch=a..b"));
+      expect(badBranch?.reason).toBe("branch=a..b is not a valid branch name: no work root. Fix the route line.");
+      expect(badBranch?.message).toBe("[router] role dispatch @implementer refused: branch=a..b is not a valid branch name: no work root. Fix the route line.");
+      const badRepo = await refusalOf(world, EDIT_PROMPT("repo=.dotfiles branch=main"));
+      expect(badRepo?.reason).toContain("repo=.dotfiles is not a valid repository name: no work root. Fix the route line.");
+      const dup = await refusalOf(world, EDIT_PROMPT("branch=main branch=other"));
+      expect(dup?.reason).toContain("branch=other is not a valid branch name: no work root. Fix the route line.");
+      expect(resolve).not.toHaveBeenCalled();
+      expect(admit).not.toHaveBeenCalled();
+    });
+
+    // QA round 3 (Q9): an invalid root= used to be an ignored key: no declared target, so the dispatch ran in the session directory
+    // WITH edit. It is an invalid declaration now, refused like an invalid repo= / branch=.
+    it("Q9: an invalid, bare, duplicate or unbalanced root= refuses the dispatch with the note; admission is never asked", async () => {
+      const resolve = vi.fn(async (): Promise<Admission> => ({ ok: true, location: locationOf("never") }));
+      const admit = vi.fn(async (): Promise<Admission> => ({ ok: true, location: locationOf("never") }));
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }), { createAdmission: () => ({ admit, resolve }) });
+      const note = (value: string): string => `root=${value} is not a valid absolute work root: no work root. Fix the route line.`;
+      const cases: ReadonlyArray<readonly [string, string]> = [
+        ["root=../app-b", "../app-b"],
+        ["root=D:\\git\\x\\..\\y", "D:\\git\\x\\..\\y"],
+        ["root=\\\\host\\share\\r", "\\\\host\\share\\r"],
+        ["root=D:git\\r", "D:git\\r"],
+        ["root", ""],
+        ["root=\"D:\\My Work", "\"D:\\My"],
+        [`root=${world.main} root=D:\\b`, "D:\\b"],
+      ];
+      for (const [fields, value] of cases) {
+        const refusal = await refusalOf(world, EDIT_PROMPT(fields));
+        expect(refusal?.reason, fields).toBe(note(value));
+        expect(refusal?.message, fields).toBe(`[router] role dispatch @implementer refused: ${note(value)}`);
+      }
+      expect(resolve).not.toHaveBeenCalled();
+      expect(admit).not.toHaveBeenCalled();
+    });
+
+    it("Q9: the refusal note is escaped before it reaches the orchestrator (no bidi or control text)", async () => {
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }));
+      const refusal = await refusalOf(world, EDIT_PROMPT("root=rel\u202edir"));
+      expect(refusal).toBeInstanceOf(RoleDispatchRefusal);
+      expect(refusal?.reason).not.toContain("\u202e");
+      expect(refusal?.message).not.toContain("\u202e");
+      expect(refusal?.reason).toContain("is not a valid absolute work root: no work root. Fix the route line.");
+    });
+
+    it("Q9: an unknown repo= is refused with admission's note; a route line without repo=/branch=/root= is not refused", async () => {
+      const reason = "repo=ghost is not a repository below routing.repoParents: no work root.";
+      const resolve = vi.fn(async (): Promise<Admission> => ({ ok: false, reason }));
+      const admit = vi.fn(async (): Promise<Admission> => ({ ok: false, reason }));
+      const parent = temp("omr-q9-parent-");
+      const world = makeWorld(config({ delegation: "roles", engine: "static", repoParents: [parent] }), { createAdmission: () => ({ admit, resolve }) });
+      const unknown = await refusalOf(world, EDIT_PROMPT("repo=ghost"));
+      expect(unknown?.reason).toBe(reason);
+      expect(unknown?.message).toBe(`[router] role dispatch @implementer refused: ${reason}`);
+      expect(await refusalOf(world, "[route class=implement risk=low scope=single needs=edit]\nchange x")).toBeUndefined();
+      expect(await refusalOf(world, "change x")).toBeUndefined();
+    });
+
+    it("F3: a git-valid but unusual branch (renovate/foo+bar) is bound through admission", async () => {
+      const resolve = vi.fn(async (): Promise<Admission> => ({ ok: true, location: locationOf(world.main) }));
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }), { createAdmission: () => ({ admit: vi.fn(), resolve }) });
+      const outcome = await world.router.route(call(world, { agent: "implementer", prompt: EDIT_PROMPT("branch=renovate/foo+bar") }));
+      expect(resolve).toHaveBeenCalledWith({ branch: "renovate/foo+bar" }, expect.anything());
+      expect(outcome.role!.workRoot).toBe(world.main);
+    });
+
+    it("F9: without routing.repoParents a bound branch= does not grow the working set", async () => {
+      const world = makeWorld(config({ delegation: "roles", engine: "static" }), {
+        createAdmission: () => ({ admit: vi.fn(), resolve: async (): Promise<Admission> => ({ ok: true, location: locationOf(world.main) }) }),
+      });
+      const outcome = await world.router.route(call(world, { agent: "implementer", prompt: EDIT_PROMPT("branch=main") }));
+      expect(outcome.role!.workRoot).toBe(world.main);
+      expect(outcome.role!.grant.location).toBeDefined();
+      expect(workingSetOf("root")).toEqual([]);
+    });
+
+    it("F5: with routing.repoParents the working set gets the GRANT's location once the dispatch is accepted", async () => {
+      const parent = temp("omr-qa1-parent-");
+      const world = makeWorld(config({ delegation: "roles", engine: "static", repoParents: [parent] }), {
+        createAdmission: () => ({ admit: vi.fn(), resolve: async (): Promise<Admission> => ({ ok: true, location: locationOf(world.main) }) }),
+      });
+      const outcome = await world.router.route(call(world, { agent: "implementer", prompt: EDIT_PROMPT("branch=main") }));
+      expect(workingSetOf("root")).toEqual([outcome.role!.grant.location]);
+    });
+
+    describe("F6: the session started in a subdirectory", () => {
+      const subWorld = (): { world: World; top: string; sub: string; resolve: ReturnType<typeof vi.fn> } => {
+        const top = temp("omr-qa1-top-");
+        const sub = join(top, "sub");
+        mkdirSync(sub);
+        // the real admission refuses a `root=` that is not a worktree root; without `root=` it answers by branch
+        const resolve = vi.fn(async (decl: { root?: string }): Promise<Admission> => decl.root === undefined
+          ? { ok: true, location: locationOf(top) } : { ok: false, reason: `root=${decl.root} is not a worktree root: no work root.` });
+        const world = makeWorld(config({ delegation: "roles", engine: "static" }), { main: sub, showToplevel: async () => top, createAdmission: () => ({ admit: vi.fn(), resolve }) });
+        return { world, top, sub, resolve };
+      };
+
+      it("branch= alone keeps the session directory as the work root; the location is the worktree's", async () => {
+        const { world, top, sub } = subWorld();
+        const outcome = await world.router.route(call(world, { agent: "implementer", prompt: EDIT_PROMPT("branch=main") }));
+        expect(outcome.role!.workRoot).toBe(sub);
+        expect(outcome.role!.grant.location?.worktree).toBe(top);
+      });
+
+      it("root=<session directory> branch= is accepted when the worktree on that branch contains it", async () => {
+        const { world, top, sub, resolve } = subWorld();
+        const outcome = await world.router.route(call(world, { agent: "implementer", prompt: EDIT_PROMPT(`root="${sub}" branch=main`) }));
+        expect(outcome.role!.workRoot).toBe(sub);
+        expect(outcome.role!.requestedRoot).toBe(sub);
+        expect(outcome.role!.grant.location?.worktree).toBe(top);
+        expect(resolve).toHaveBeenCalledTimes(2);
+      });
+
+      it("root=<session directory> branch= is still refused when the branch's worktree does not contain it", async () => {
+        const { sub } = subWorld();
+        const elsewhere = temp("omr-qa1-else-");
+        const resolve = vi.fn(async (decl: { root?: string }): Promise<Admission> => decl.root === undefined
+          ? { ok: true, location: locationOf(elsewhere) } : { ok: false, reason: "root mismatch: no work root." });
+        const other = makeWorld(config({ delegation: "roles", engine: "static" }), { main: sub, createAdmission: () => ({ admit: vi.fn(), resolve }) });
+        // Q9 (FLIPPED ON PURPOSE: used to be a null work root with the note on the outcome; now the dispatch is refused with it)
+        const refusal = await refusalOf(other, EDIT_PROMPT(`root="${sub}" branch=main`));
+        expect(refusal?.reason).toBe("root mismatch: no work root.");
+      });
+    });
+
+    describe("QA round 2: the session directory must belong to the bound worktree (real git)", () => {
+      const git = (cwd: string, ...args: string[]): void => {
+        execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t.test", ...args], { cwd, stdio: "ignore" });
+      };
+      const repoWithFeatWorktree = (): { top: string; feat: string } => {
+        const top = temp("omr-qa2-top-");
+        git(top, "init", "-q", "-b", "main");
+        git(top, "commit", "--allow-empty", "-q", "-m", "init");
+        mkdirSync(join(top, ".wt"));
+        git(top, "worktree", "add", "-q", join(top, ".wt", "feat"), "-b", "feat");
+        return { top, feat: realpathSync.native(join(top, ".wt", "feat")) };
+      };
+
+      it("(a) a session in a worktree nested inside main's, with branch=main: never the nested worktree under main's location", async () => {
+        const { top, feat } = repoWithFeatWorktree();
+        const world = makeWorld(config({ delegation: "roles", engine: "static" }), { main: feat, realGit: true });
+        const outcome = await world.router.route(call(world, { agent: "implementer", prompt: EDIT_PROMPT("branch=main") }));
+        expect(outcome.role!.workRoot).not.toBe(feat);
+        expect(outcome.role!.grant.location?.worktree).toBe(top);
+        expect(outcome.role!.workRoot).toBe(top);
+      });
+
+      it("(b) root=<session directory> branch=main with the session in the nested worktree is refused", async () => {
+        const { feat } = repoWithFeatWorktree();
+        const world = makeWorld(config({ delegation: "roles", engine: "static" }), { main: feat, realGit: true });
+        // Q9 (FLIPPED ON PURPOSE: used to be a null work root without edit; now the dispatch is refused)
+        const refusal = await refusalOf(world, EDIT_PROMPT(`root="${feat}" branch=main`));
+        expect(refusal).toBeDefined();
+        expect(refusal?.reason).toContain("no work root");
+      });
+
+      it("(c) a plain subdirectory of main with branch=main keeps the session directory as the work root", async () => {
+        const { top } = repoWithFeatWorktree();
+        const sub = join(top, "sub");
+        mkdirSync(sub);
+        const world = makeWorld(config({ delegation: "roles", engine: "static" }), { main: sub, realGit: true });
+        const outcome = await world.router.route(call(world, { agent: "implementer", prompt: EDIT_PROMPT("branch=main") }));
+        expect(outcome.role!.workRoot).toBe(sub);
+        expect(outcome.role!.grant.location?.worktree).toBe(top);
+      });
+    });
+  });
+});
+
+describe("cross-repo P4.5: repositories approved with /router approve, on the dispatch bind path", () => {
+  const HOUR = 3_600_000;
+  const DAY = 24 * HOUR;
+  const git = (cwd: string, ...args: string[]): string =>
+    execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", ...args], {
+      cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+  const EDIT = (fields: string, rest = "change x"): string => `[route class=implement risk=low scope=single needs=edit ${fields}]\n${rest}`;
+  const refusalOf = async (world: World, prompt: string, description = "work item"): Promise<RoleDispatchRefusal | undefined> => {
+    try {
+      await world.router.route(call(world, { agent: "implementer", prompt, description }));
+      return undefined;
+    } catch (error) {
+      if (error instanceof RoleDispatchRefusal) return error;
+      throw error;
+    }
+  };
+
+  interface Setup { parent: string; ext: string; head: string; store: string; env: ApprovalsEnv; clock: { now: number } }
+  /** A parent (empty), a repository `ext` outside it with one commit, a store directory and a clock. */
+  const setup = (origin?: string): Setup => {
+    const parent = temp("omr-p45-parent-");
+    const dir = join(temp("omr-p45-ext-"), "ext");
+    mkdirSync(dir);
+    git(dir, "init", "-q", "-b", "main");
+    writeFileSync(join(dir, "README.md"), "x\n");
+    git(dir, "add", "README.md");
+    git(dir, "commit", "-q", "-m", "init");
+    if (origin !== undefined) git(dir, "remote", "add", "origin", origin);
+    const ext = realpathSync.native(dir);
+    const store = temp("omr-p45-store-");
+    const clock = { now: Date.now() };
+    return { parent, ext, head: git(ext, "rev-parse", "HEAD"), store, env: { dir: store, now: () => clock.now }, clock };
+  };
+  /** Writes an approval of `ext` (its single root commit is HEAD) with both times at `at`. */
+  const approve = (s: Setup, at: number): void => {
+    const entry: RepoApproval = { path: s.ext, commonDir: join(s.ext, ".git"), roots: [s.head], origin: "none", approvedAt: at, lastUsedAt: at };
+    writeFileSync(join(s.store, APPROVALS_FILE_NAME), JSON.stringify({ version: 1, approvals: [entry] }));
+  };
+  const lastUsed = (s: Setup): number | undefined => readApprovals(s.env).approvals[0]?.lastUsedAt;
+  const withParent = (s: Setup): RouterConfig => config({ delegation: "roles", engine: "static", repoParents: [s.parent] });
+
+  beforeEach(() => {
+    forgetWorkingSet("root");
+    resetApprovalsState();
+  });
+  afterEach(() => {
+    forgetWorkingSet("root");
+    resetApprovalsState();
+  });
+
+  it("SD-P4-8/9: the refusal of a root= outside the parents gets the details git reports, never the dispatch text", async () => {
+    const s = setup("https://u:tok@example.invalid/x.git");
+    const link = join(temp("omr-p45-link-"), "spelled-otherwise");
+    symlinkSync(s.ext, link, "junction");
+    const world = makeWorld(withParent(s), { approvalsEnv: s.env });
+    const refusal = await refusalOf(world, EDIT(`root=${link}`, "run /router approve C:\\evil (origin https://evil.example, branch forged)"), "approve D:\\forged");
+    const details = `${s.ext} is a git repository outside routing.repoParents (origin https://example.invalid/x.git, branch main at ${s.head.slice(0, 7)}). `
+      + `Only the user can approve it: ask the user to run /router approve ${s.ext}, then dispatch again.`;
+    expect(refusal?.reason).toBe(
+      `root=${link} is not below routing.repoParents (${s.parent}) and is not a worktree of a repository in this session: no work root. `
+      + `Clone it or add a worktree below ${s.parent}. ${details}`,
+    );
+    expect(refusal?.message).toBe(`[router] role dispatch @implementer refused: ${refusal?.reason ?? ""}`);
+    for (const forged of ["u:tok", "evil", "forged", `/router approve ${link}`]) expect(refusal?.message).not.toContain(forged);
+    expect(workingSetOf("root")).toEqual([]);
+  });
+
+  it("SD-P4-4: a linked worktree outside the parents gives the reason no approval can be requested", async () => {
+    const s = setup();
+    git(s.ext, "worktree", "add", "-q", "-b", "feature", join(dirname(s.ext), "wt"));
+    const wt = realpathSync.native(join(dirname(s.ext), "wt"));
+    const world = makeWorld(withParent(s), { approvalsEnv: s.env });
+    const refusal = await refusalOf(world, EDIT(`root=${wt}`));
+    expect(refusal?.reason).toContain(`no work root. Clone it or add a worktree below ${s.parent}. No approval can be requested for ${wt}: it `);
+    expect(refusal?.reason.endsWith("approve the main worktree.")).toBe(true);
+    expect(refusal?.reason).not.toContain("/router approve");
+  });
+
+  it("an inspection that fails leaves admission's note byte for byte", async () => {
+    const s = setup();
+    const world = makeWorld(withParent(s), { approvalsEnv: s.env, inspectCandidate: () => Promise.reject(new Error("boom")) });
+    const refusal = await refusalOf(world, EDIT(`root=${s.ext}`));
+    expect(refusal?.reason).toBe(
+      `root=${s.ext} is not below routing.repoParents (${s.parent}) and is not a worktree of a repository in this session: no work root. Clone it or add a worktree below ${s.parent}.`,
+    );
+  });
+
+  it("I9: without routing.repoParents the note is today's, no inspection and no store I/O", async () => {
+    const s = setup();
+    const inspect = vi.fn(inspectCandidate);
+    const world = makeWorld(config({ delegation: "roles", engine: "static" }), { approvalsEnv: s.env, inspectCandidate: inspect });
+    const refusal = await refusalOf(world, EDIT(`root=${s.ext}`));
+    expect(refusal?.reason).toBe(`root=${s.ext} is neither the session directory nor a worktree listed by \`git worktree list --porcelain\`: no work root`);
+    expect(inspect).not.toHaveBeenCalled();
+    expect(() => readFileSync(join(s.store, APPROVALS_FILE_NAME))).toThrow();
+  });
+
+  it("SD-P4-5/7: an approved repository binds by root=, joins the working set (P, R), and its use is touched at most once per hour", async () => {
+    const s = setup();
+    const t0 = s.clock.now;
+    approve(s, t0 - 2 * HOUR);
+    const world = makeWorld(withParent(s), { approvalsEnv: s.env });
+    const route = (): Promise<RouteOutcome> => world.router.route(call(world, { agent: "implementer", prompt: EDIT(`root=${s.ext}`) }));
+
+    const first = await route();
+    expect(first.role!.workRoot).toBe(s.ext);
+    expect(first.role!.grant.location).toMatchObject({ repository: s.ext, worktree: s.ext, branch: "main", approval: s.ext });
+    expect([...first.role!.grant.actions]).toContain("edit");
+    expect(workingSetOf("root").map((location) => [location.worktree, location.approval])).toEqual([[s.ext, s.ext]]);
+    await vi.waitFor(() => expect(lastUsed(s)).toBe(t0));
+
+    s.clock.now = t0 + 30 * 60_000;
+    expect((await route()).role!.workRoot).toBe(s.ext);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(lastUsed(s)).toBe(t0);
+
+    s.clock.now = t0 + HOUR + 1;
+    expect((await route()).role!.workRoot).toBe(s.ext);
+    await vi.waitFor(() => expect(lastUsed(s)).toBe(t0 + HOUR + 1));
+  });
+
+  it("SD-P4-12: an approval that expired drops from the working set at the next dispatch; root= is then refused with the note", async () => {
+    const s = setup();
+    const t0 = s.clock.now;
+    approve(s, t0 - 30 * 60_000);
+    const world = makeWorld(withParent(s), { approvalsEnv: s.env });
+    expect((await world.router.route(call(world, { agent: "implementer", prompt: EDIT(`root=${s.ext}`) }))).role!.workRoot).toBe(s.ext);
+    expect(workingSetOf("root").map((location) => location.worktree)).toEqual([s.ext]);
+
+    s.clock.now = t0 + 15 * DAY;
+    await world.router.route(call(world, { agent: "implementer", prompt: "[route class=implement risk=low scope=single needs=edit]\nchange x" }));
+    expect(workingSetOf("root")).toEqual([]);
+    const refusal = await refusalOf(world, EDIT(`root=${s.ext}`));
+    expect(refusal?.reason).toContain(`ask the user to run /router approve ${s.ext}, then dispatch again.`);
+  });
+
+  it("Phase 4 QA M1: a linked worktree of an approved repository binds marked, so expiry ends every binding through it", async () => {
+    const s = setup();
+    const t0 = s.clock.now;
+    approve(s, t0 - 30 * 60_000);
+    git(s.ext, "worktree", "add", "-q", "-b", "feat", join(dirname(s.ext), "feat"));
+    const feat = realpathSync.native(join(dirname(s.ext), "feat"));
+    const world = makeWorld(withParent(s), { approvalsEnv: s.env });
+    const route = (root: string): Promise<RouteOutcome> => world.router.route(call(world, { agent: "implementer", prompt: EDIT(`root=${root}`) }));
+    // root=X (rule 3), root=feat (rule 2 via X), root=X, root=feat again (rule 2 through the known feat entry first).
+    for (const root of [s.ext, feat, s.ext, feat]) {
+      const outcome = await route(root);
+      expect(outcome.role!.workRoot).toBe(root);
+      expect(outcome.role!.grant.location?.approval).toBe(s.ext);
+    }
+    expect(workingSetOf("root").map((location) => location.approval)).toEqual([s.ext, s.ext]);
+
+    // The approval expires: neither root= binds any more (no untagged entry admits X by rule 2 without the identity check).
+    s.clock.now = t0 + 15 * DAY;
+    for (const root of [s.ext, feat]) {
+      const refusal = await refusalOf(world, EDIT(`root=${root}`));
+      expect(refusal?.reason).toContain(`root=${root} is not below routing.repoParents`);
+    }
+    expect(workingSetOf("root")).toEqual([]);
+  });
+
+  it("Phase 4 QA m2: revoke ends the binding: an exact resume is refused and the location never rejoins the working set", async () => {
+    const s = setup();
+    approve(s, s.clock.now - 30 * 60_000);
+    const world = makeWorld(withParent(s), { approvalsEnv: s.env });
+    const input = { agent: "implementer", prompt: EDIT(`root=${s.ext}`), description: "approved work" };
+    const c = call(world, input);
+    const fresh = await world.router.route(c);
+    expect(fresh.role!.grant.location?.approval).toBe(s.ext);
+    world.router.commit(c.callID, applied(input, fresh));
+    world.router.onSessionCreated({ sessionID: "child-a", parentID: "root", agent: "implementer", title: fresh.description });
+    const binding = await bind("child-a", async () => ({ parentID: "root", agent: "implementer", title: fresh.description!, firstText: fresh.prompt! }), {
+      maxOf: (agent) => roleMaxActions(resolveRoles(world.cfg, "v2").get(agent)),
+    });
+    expect(binding.kind).toBe("exact");
+    const resume = (): Promise<RouteOutcome> => world.router.route(call(world, { agent: "implementer", sessionID: "child-a", prompt: "continue" }));
+    // While the approval applies, the resume keeps its bound location.
+    expect((await resume()).role!.grant.location?.approval).toBe(s.ext);
+
+    // `/router revoke`: the store no longer holds the entry; the working set is emptied as the next dispatch would prune it.
+    writeFileSync(join(s.store, APPROVALS_FILE_NAME), JSON.stringify({ version: 1, approvals: [] }));
+    forgetWorkingSet("root");
+    let refusal: RoleDispatchRefusal | undefined;
+    try {
+      await resume();
+    } catch (error) {
+      if (!(error instanceof RoleDispatchRefusal)) throw error;
+      refusal = error;
+    }
+    expect(refusal?.reason).toBe(`resume refused: approval for ${s.ext} was revoked or expired: no work root. Only the user can approve it again (/router approve ${s.ext}).`);
+    expect(workingSetOf("root")).toEqual([]);
+  });
+});
 
 describe("E6/E7 through the hook shapes", () => {
   async function rolesPlugin(): Promise<Record<string, any>> {

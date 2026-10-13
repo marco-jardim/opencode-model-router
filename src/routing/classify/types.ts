@@ -273,6 +273,13 @@ export type FetchLike = (
 /** Environment lookup (process.env in production, a plain object in tests). */
 export type EnvLike = Readonly<Record<string, string | undefined>>;
 
+/** A `repo=` / `branch=` / `root=` declaration of a route line that was not accepted (see {@link RouteLine.invalidCrossRepo}). */
+export interface InvalidCrossRepo {
+  readonly key: "repo" | "branch" | "root";
+  /** The value as written (empty for a bare key). */
+  readonly value: string;
+}
+
 /** Parsed `[route …]` line (D13). Absent fields were missing or invalid. */
 export interface RouteLine {
   readonly class?: TaskClass;
@@ -297,6 +304,25 @@ export interface RouteLine {
    *   `git worktree list --porcelain` BEFORE any filesystem call on it; no match → no work root.
    */
   readonly root?: string;
+  /**
+   * `repo=<name>`: cross-repo (Phase 1): a repository name below `routing.repoParents`, as written (case kept).
+   * One directory name, `[A-Za-z0-9][A-Za-z0-9._-]{0,99}`, not `.` / `..`; separators are rejected at parse.
+   * Parse and validation only: resolution against `routing.repoParents` happens later.
+   */
+  readonly repo?: string;
+  /**
+   * `branch=<ref>`: the branch whose worktree to bind; declare-then-check (the declared branch is verified against
+   * the worktree later). Case kept. 1..200 chars, git `check-ref-format` rules for a branch name: no ASCII control,
+   * space, `~ ^ : ? * [ \`; rejected at parse: `..`, `@{`, `@` alone, `//`, a leading `-` or `/`, a trailing `/` or
+   * `.`, a component starting with `.` or ending in `.lock`. The value is only ever compared with porcelain output.
+   */
+  readonly branch?: string;
+  /**
+   * `repo=` / `branch=` / `root=` the line declared but the parser could not accept (invalid value, bare key, duplicate or
+   * conflicting key), with the value as written (a quoted `root=` without its quotes). The route flow gives such a dispatch NO work root and a note: an
+   * invalid declaration never falls back to the session directory. Absent when every declaration was valid.
+   */
+  readonly invalidCrossRepo?: readonly InvalidCrossRepo[];
   /** Bare `pin` flag (or `pin=true|yes|1`). */
   readonly pin: boolean;
   /** Keys that were unknown or whose values were invalid (for logging only). */
