@@ -10,7 +10,7 @@ import type { ExecutorRuntime } from "./types.js";
 export type PlanCallArgs =
   | { action: "compile"; path: string; phases?: string[]; doneBefore?: string }
   | { action: "status"; planId?: string; inbox?: true }
-  | { action: "answer"; id: string; text: string }
+  | { action: "answer"; inboxId: string; text: string }
   | { action: "pause" | "resume" | "abort" | "land" | "adopt"; planId: string };
 
 export type ParsedPlanCommand =
@@ -124,7 +124,7 @@ export function parsePlanCommand(args: string): ParsedPlanCommand {
       const last = rest[rest.length - 1] as Token;
       // The text is kept as typed; a single quoted token is unwrapped.
       const text = rest.length === 2 && first.quoted ? first.value : args.slice(first.start, last.end);
-      return { kind: "call", call: { action: "answer", id: id.value, text } };
+      return { kind: "call", call: { action: "answer", inboxId: id.value, text } };
     }
     case "pause":
     case "resume":
