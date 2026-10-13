@@ -15,6 +15,7 @@ import { DEFER_MISSING_SUBAGENT_NOTICE, HOST_SEED_AGENTS, resolveSubagentOverrid
 import { warnAgentOptionsEffortOnce } from "../router/agent-options";
 import { pluginAgentMarker } from "../router/plugin-agents";
 import { registerRoleAgents, roleAgentAlias, roleAgentOf, roleAgentSteps } from "../router/role-agents";
+import { readApprovals, type RepoApproval } from "../routing/roles/approvals";
 import { stripDelegateInstructions } from "../router/instructions";
 import { createPluginLogger } from "../router/logger";
 import { budgetClaimObserved, GRADER_SYSTEM } from "../verify/checker";
@@ -803,6 +804,8 @@ export async function registerV2Hooks(
     listWorktrees?: (cwd: string) => Promise<string>;
     /** Role-agent registration (roles mode): the repository's worktree roots for the `external_directory` allow rules. Default: `listWorktrees` (role-agents.ts, a real `git worktree list`). */
     listRegistrationWorktrees?: (directory: string) => Promise<string[]>;
+    /** Cross-repo Phase 4 (SD-P4-15): directory of the repository approvals store read at role registration. Default: `dirname(statePath())` (approvals.ts). */
+    approvalsDir?: string;
     /**
      * QA-G-A3-2: the plugin's count of a role child's call refused outside its guard (index.ts `recordRoleRefusal`): the router's
      * role-authority refusal here in `execute.before`, a host permission denial in `execute.after`. Returns the guard's text to
@@ -1285,8 +1288,19 @@ export async function registerV2Hooks(
       const rolesRequested = routerConfig.routing?.delegation === "roles";
       rolesStarted ??= rolesRequested;
       if (rolesStarted) {
+        // Cross-repo Phase 4 (SD-P4-15): the approvals store, read without git and only in roles mode with parents (no store
+        // I/O otherwise, I9). An invalid store or a read failure gives no approved repository (fail closed).
+        let approvedRoots: readonly RepoApproval[] = [];
+        try {
+          if (rolesRequested && resolveRolesRouting(routerConfig, "v2").repoParents.length > 0) {
+            const read = readApprovals(options.approvalsDir !== undefined ? { dir: options.approvalsDir } : {});
+            approvedRoots = read.invalid === undefined ? read.approvals : [];
+          }
+        } catch (error) {
+          warnRoleOnce("roles:approvals", `roles mode (OpenCode v2 only): the repository approvals could not be read (${error instanceof Error ? error.message : String(error)}); no approved repository is granted`);
+        }
         const registration = await registerRoleAgents(next.agent, routerConfig, {
-          context7: Boolean(context7), directory: ctx.location.directory, seed: baseSeed, warn: warnRoleOnce,
+          context7: Boolean(context7), directory: ctx.location.directory, seed: baseSeed, warn: warnRoleOnce, approvedRoots,
           ...(options.listRegistrationWorktrees ? { listWorktrees: options.listRegistrationWorktrees } : {}),
         });
         // #84 P2.3 (T2.3.3, §2.5): the ladder tool is a plugin tool, advertised to a deny-by-default agent only with an explicit

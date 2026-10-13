@@ -4,7 +4,7 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Context } from "@opencode/plugin/promise/plugin";
@@ -17,11 +17,12 @@ import { REFUSAL_CAP, ROUTE_BUDGET_RAISE_MAX } from "../../src/router/guard-prof
 import { buildPluginAgentDefinition, pluginAgentMarker, type PluginAgentConfig } from "../../src/router/plugin-agents";
 import { CONTEXT7_DOC_TOOLS, evaluatePermission, permissionRules, type PermissionRule } from "../../src/router/read-only";
 import {
-  buildRoleAgentDefinition, externalDirectoryPatterns, listWorktrees, parseWorktreeList, registerRoleAgents, ROLE_DENIED_ACTIONS,
+  approvedRootPattern, approvedRootsInForce, type ApprovedRoot, buildRoleAgentDefinition, externalDirectoryPatterns, listWorktrees, parseWorktreeList, registerRoleAgents, ROLE_DENIED_ACTIONS,
   ROLE_STEPS_MARGIN, roleAgentAlias, roleAgentOf, roleAgentSteps, roleHostActions, roleMaxPermission, workRootPattern, worktreeRootPattern,
   type RoleRegistrationOptions,
 } from "../../src/router/role-agents";
 import { HOST_NATIVE_ROLE_NAMES, resolveRoleTable, SHIPPED_ROLE_SPECS, type RoleSpec } from "../../src/router/roles";
+import { APPROVALS_FILE_NAME } from "../../src/routing/roles/approvals";
 import { newDispatchNonce, nonceTitleSuffix, registerPending, resetBindingRegistryForTests } from "../../src/routing/roles/binding";
 import { roleMaxActions } from "../../src/routing/wire/dispatch";
 
@@ -242,6 +243,156 @@ describe("external_directory patterns (P-11, S11)", () => {
     expect(fromSibling).toEqual([main, wt]);
     await expect(listWorktrees(join(main, "..", "no-such-dir"))).rejects.toThrow();
   }, 60_000);
+});
+
+describe("cross-repo Phase 4: approved repositories (SD-P4-15)", () => {
+  const DAY = 86_400_000;
+  const NOW = Date.UTC(2026, 9, 12, 12);
+  const sep = process.platform === "win32" ? "\\" : "/";
+  /** A store entry approved and last used `ageDays` before NOW. */
+  const approval = (path: string, ageDays = 0): ApprovedRoot => ({ path, approvedAt: NOW - ageDays * DAY, lastUsedAt: NOW - ageDays * DAY });
+  const routing = (over: { repoParents?: string[]; repoExclude?: string[]; repoApprovalDays?: number } = {}) => ({
+    repoParents: ["/parents"], repoExclude: [], repoApprovalDays: 14, ...over,
+  });
+
+  it("approvedRootPattern: an existing canonical path becomes `<path><sep>*`", () => {
+    const ext = temp("omr-roles-ext-");
+    expect(approvedRootPattern(ext)).toEqual({ pattern: `${ext}${sep}*` });
+  });
+
+  it("approvedRootPattern fails closed: missing, moved (realpath differs), junction, relative and 8.3 paths give no pattern", () => {
+    const base = temp("omr-roles-ext-");
+    const target = join(base, "target");
+    mkdirSync(target);
+    const link = join(base, "link");
+    symlinkSync(target, link, "junction");
+    for (const [path, realpath] of [
+      [join(base, "missing"), undefined],
+      [target, () => join(base, "elsewhere")],
+      [link, undefined],
+      ["relative/repo", () => "relative/repo"],
+      [join(base, "PROGRA~1"), (p: string) => p],
+    ] as const) {
+      const result = approvedRootPattern(path, realpath);
+      expect([path, result.pattern]).toEqual([path, undefined]);
+      expect(result.problem).toBeTruthy();
+    }
+    expect(approvedRootPattern(target, () => "C:\\PROGRA~1\\repo").pattern).toBeUndefined();
+  });
+
+  it.skipIf(process.platform !== "win32")("approvedRootPattern compares the realpath case-insensitively on win32", () => {
+    expect(approvedRootPattern("C:\\Repos\\Ext", () => "c:\\repos\\ext")).toEqual({ pattern: "c:\\repos\\ext\\*" });
+    expect(approvedRootPattern("C:\\Repos\\Ext", () => "C:\\Repos\\Other").pattern).toBeUndefined();
+  });
+
+  it("approvedRootsInForce: no parents gives none; expired dropped silently; excluded reported; valid kept once", () => {
+    const valid = approval("/ext/repo", 1);
+    expect(approvedRootsInForce([valid], routing({ repoParents: [] }), NOW)).toEqual({ paths: [], problems: [] });
+    expect(approvedRootsInForce([valid, valid], routing(), NOW)).toEqual({ paths: ["/ext/repo"], problems: [] });
+    // Expiry: `lastUsedAt + repoApprovalDays`, exactly at the instant is expired; the 90-day cap wins over recent use.
+    expect(approvedRootsInForce([approval("/ext/old", 14)], routing(), NOW).paths).toEqual([]);
+    expect(approvedRootsInForce([{ path: "/ext/old", approvedAt: NOW - 14 * DAY, lastUsedAt: NOW - 14 * DAY + 1 }], routing(), NOW).paths).toEqual(["/ext/old"]);
+    expect(approvedRootsInForce([approval("/ext/old", 3)], routing({ repoApprovalDays: 2 }), NOW).paths).toEqual([]);
+    expect(approvedRootsInForce([{ path: "/ext/capped", approvedAt: NOW - 90 * DAY, lastUsedAt: NOW }], routing(), NOW).paths).toEqual([]);
+    // Exclusion wins over an approval, on the path text.
+    const excluded = approvedRootsInForce([valid, approval("/ext/other")], routing({ repoExclude: ["/ext/repo"] }), NOW);
+    expect(excluded.paths).toEqual(["/ext/other"]);
+    expect(excluded.problems).toHaveLength(1);
+    expect(excluded.problems[0]).toContain("routing.repoExclude");
+    expect(approvedRootsInForce([valid], routing({ repoExclude: ["/ext/*"] }), NOW).paths).toEqual([]);
+  });
+
+  it("externalDirectoryPatterns: approved paths give a pattern only with parents (I9)", () => {
+    const parent = temp("omr-roles-parent-");
+    const ext = temp("omr-roles-ext-");
+    expect(externalDirectoryPatterns([], [], undefined, [parent], [ext]).patterns).toEqual([`${parent}${sep}*`, `${ext}${sep}*`]);
+    expect(externalDirectoryPatterns([], [], undefined, [], [ext])).toEqual({ patterns: [], problems: [] });
+    const moved = externalDirectoryPatterns([], [], (p) => (p === ext ? join(parent, "x") : realpathSync.native(p)), [parent], [ext]);
+    expect(moved.patterns).toEqual([`${parent}${sep}*`]);
+    expect(moved.problems).toHaveLength(1);
+    expect(moved.problems[0]).toContain("approved repository");
+  });
+
+  /** Roles mode with `parents`, `exclude` and `days` set on the global layer's routing. */
+  function rolesWith(parents: string[], exclude: string[] = [], days?: number): RouterConfig {
+    const cfg = rolesMode(home(), {});
+    const r = cfg.routing as { repoParents?: string[]; repoExclude?: string[]; repoApprovalDays?: number };
+    r.repoParents = parents;
+    r.repoExclude = exclude;
+    if (days !== undefined) r.repoApprovalDays = days;
+    return cfg;
+  }
+  const externalOf = (agents: Record<string, Record<string, unknown>>, name: string): string[] =>
+    rules(agents[name]!).filter((rule) => rule.action === "external_directory").map((rule) => rule.resource);
+
+  it("registerRoleAgents: a valid approval adds `<path><sep>*` to the local roles only", async () => {
+    const parent = temp("omr-roles-parent-");
+    const ext = temp("omr-roles-ext-");
+    const agents: Record<string, Record<string, unknown>> = {};
+    const opts = options({ approvedRoots: [approval(ext, 1)], now: () => NOW });
+    const result = await registerRoleAgents(agents, rolesWith([parent]), opts);
+    expect(result.failed).toBe(false);
+    expect(result.externalDirectory).toEqual([`${parent}${sep}*`, `${ext}${sep}*`]);
+    expect(opts.warn).not.toHaveBeenCalled();
+    for (const spec of SHIPPED_ROLE_SPECS) {
+      expect([spec.agent, externalOf(agents, spec.agent)]).toEqual([spec.agent, spec.agent === "researcher" ? [] : [`${parent}${sep}*`, `${ext}${sep}*`]]);
+    }
+  });
+
+  it("registerRoleAgents: expired, excluded, moved and invalid approvals give no pattern", async () => {
+    const parent = temp("omr-roles-parent-");
+    const base = temp("omr-roles-ext-");
+    const expired = join(base, "expired");
+    const excluded = join(base, "excluded");
+    const target = join(base, "target");
+    const moved = join(base, "moved");
+    for (const dir of [expired, excluded, target]) mkdirSync(dir);
+    symlinkSync(target, moved, "junction");
+    const approvedRoots = [approval(expired, 15), approval(excluded), approval(moved), approval(join(base, "gone")), approval("relative/repo"), approval(join(base, "PROGRA~1"))];
+    const agents: Record<string, Record<string, unknown>> = {};
+    const opts = options({ approvedRoots, now: () => NOW });
+    const result = await registerRoleAgents(agents, rolesWith([parent], [excluded.replaceAll("\\", "/")]), opts);
+    expect(result.failed).toBe(false);
+    expect(result.externalDirectory).toEqual([`${parent}${sep}*`]);
+    expect(externalOf(agents, "implementer")).toEqual([`${parent}${sep}*`]);
+    const warned = opts.warn.mock.calls.map((call) => String(call[1]));
+    expect(warned.some((line) => line.includes(excluded) && line.includes("routing.repoExclude"))).toBe(true);
+    expect(warned.some((line) => line.includes(moved) && line.includes("not the approved path"))).toBe(true);
+    expect(warned.some((line) => line.includes(expired))).toBe(false); // expiry is silent
+  });
+
+  it("registerRoleAgents: repoApprovalDays lowered after approval drops the pattern", async () => {
+    const parent = temp("omr-roles-parent-");
+    const ext = temp("omr-roles-ext-");
+    const opts = options({ approvedRoots: [approval(ext, 3)], now: () => NOW });
+    expect((await registerRoleAgents({}, rolesWith([parent]), opts)).externalDirectory).toEqual([`${parent}${sep}*`, `${ext}${sep}*`]);
+    expect((await registerRoleAgents({}, rolesWith([parent], [], 2), opts)).externalDirectory).toEqual([`${parent}${sep}*`]);
+  });
+
+  it("registerRoleAgents: no parents gives no approved pattern (I9)", async () => {
+    const ext = temp("omr-roles-ext-");
+    const realpath = vi.fn((p: string) => realpathSync.native(p));
+    const opts = options({ approvedRoots: [approval(ext)], now: () => NOW, realpath });
+    const result = await registerRoleAgents({}, rolesWith([]), opts);
+    expect(result.failed).toBe(false);
+    expect(result.externalDirectory).toEqual([]);
+    expect(realpath).not.toHaveBeenCalled();
+    expect(opts.warn).not.toHaveBeenCalled();
+  });
+
+  it("registerRoleAgents: tiers mode ignores approvals and touches nothing (I1)", async () => {
+    const ext = temp("omr-roles-ext-");
+    const cfg = home({ routing: { repoParents: [temp("omr-roles-parent-")] } });
+    expect(cfg.routing?.delegation ?? "tiers").toBe("tiers");
+    const agents = { general: { mode: "subagent", model: "host/g" } };
+    const before = JSON.stringify(agents);
+    const realpath = vi.fn((p: string) => realpathSync.native(p));
+    const opts = options({ approvedRoots: [approval(ext)], now: () => NOW, realpath });
+    expect(await registerRoleAgents(agents, cfg, opts)).toMatchObject({ registered: [], externalDirectory: [], failed: false });
+    expect(JSON.stringify(agents)).toBe(before);
+    expect(realpath).not.toHaveBeenCalled();
+    expect(opts.warn).not.toHaveBeenCalled();
+  });
 });
 
 describe("registerRoleAgents", () => {
@@ -473,8 +624,8 @@ function fixture(directory: string, registrationWorktrees: (directory: string) =
   };
   return {
     ctx, agents, sessionHooks, toolHooks, permissionHooks,
-    async start(hooks: Record<string, any> = {}) {
-      const cleanup = await registerV2Hooks(ctx as unknown as Context, hooks as Hooks, undefined, { listRegistrationWorktrees: registrationWorktrees });
+    async start(hooks: Record<string, any> = {}, extra: Partial<NonNullable<Parameters<typeof registerV2Hooks>[3]>> = {}) {
+      const cleanup = await registerV2Hooks(ctx as unknown as Context, hooks as Hooks, undefined, { listRegistrationWorktrees: registrationWorktrees, ...extra });
       cleanups.push(cleanup);
     },
   };
@@ -576,5 +727,58 @@ describe("v2 adapter in roles mode", { timeout: 60_000 }, () => {
     const edit = evaluation("explore", "edit", ["src/a.ts"]);
     await f.permissionHooks.evaluate(edit);
     expect(edit.effect).toBe("allow");
+  });
+
+  /** A store directory holding `body` as the approvals file. */
+  function store(body: string): string {
+    const dir = temp("omr-roles-store-");
+    writeFileSync(join(dir, APPROVALS_FILE_NAME), body);
+    return dir;
+  }
+  const validStore = (path: string): string => {
+    const at = Date.now() - 60_000;
+    return store(JSON.stringify({ version: 1, approvals: [{ path, commonDir: join(path, ".git"), roots: ["a".repeat(40)], origin: "none", approvedAt: at, lastUsedAt: at }] }));
+  };
+  const posix = (path: string, ...rest: string[]): string => [path.replaceAll("\\", "/"), ...rest].join("/");
+
+  it("cross-repo P4.6: buildConfig reads the approvals store and grants an approved repository to the local roles", async () => {
+    const parent = temp("omr-roles-parent-");
+    const ext = temp("omr-roles-ext-");
+    const other = temp("omr-roles-ext-");
+    home({ routing: { delegation: "roles", repoParents: [parent] } });
+    const f = fixture(temp());
+    await f.start({}, { approvalsDir: validStore(ext) });
+    const implementer = f.agents.implementer.permissions as PermissionRule[];
+    expect(evaluatePermission(implementer, "external_directory", posix(ext, "src", "*"))).toBe("allow");
+    expect(evaluatePermission(implementer, "external_directory", posix(parent, "repo", "*"))).toBe("allow");
+    expect(evaluatePermission(implementer, "external_directory", posix(other, "*"))).toBe("deny");
+    expect(evaluatePermission(f.agents.researcher.permissions as PermissionRule[], "external_directory", posix(ext, "*"))).toBe("deny");
+  });
+
+  it("cross-repo P4.6: an invalid store grants nothing (fail closed); without parents the store is never read (I9)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const parent = temp("omr-roles-parent-");
+      const ext = temp("omr-roles-ext-");
+      home({ routing: { delegation: "roles", repoParents: [parent] } });
+      const invalid = fixture(temp());
+      await invalid.start({}, { approvalsDir: store("{not json") });
+      const implementer = invalid.agents.implementer.permissions as PermissionRule[];
+      expect(evaluatePermission(implementer, "external_directory", posix(parent, "repo", "*"))).toBe("allow");
+      expect(evaluatePermission(implementer, "external_directory", posix(ext, "*"))).toBe("deny");
+      expect(warn.mock.calls.some((call) => String(call[0]).includes("repository approvals file"))).toBe(true);
+
+      warn.mockClear();
+      home({ routing: { delegation: "roles" } });
+      const noParents = fixture(temp());
+      await noParents.start({}, { approvalsDir: store("{not json either") });
+      expect(noParents.agents.implementer).toBeDefined();
+      expect(warn.mock.calls.some((call) => String(call[0]).includes("repository approvals file"))).toBe(false);
+      const valid = fixture(temp());
+      await valid.start({}, { approvalsDir: validStore(ext) });
+      expect(evaluatePermission(valid.agents.implementer.permissions as PermissionRule[], "external_directory", posix(ext, "*"))).toBe("deny");
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
