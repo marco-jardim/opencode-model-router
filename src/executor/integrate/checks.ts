@@ -3,13 +3,14 @@
 // integration checks, runs them under the machine-wide verification slot and holds the extra git operations of the
 // integration queue. It journals nothing and registers nothing; 5.1 wires the resolver, the spawner and the guard.
 
-import { readdir, readFile, realpath, stat, unlink } from "node:fs/promises";
+import { lstat, readdir, readFile, realpath, stat, unlink } from "node:fs/promises";
 import * as nodePath from "node:path";
 import { hardeningArgs } from "../../router/git-tools";
 import {
   detectRunner, isNoAffected, isScopedSpec, isUnverifiable, planRerun, planScopedRun, readResult,
   type ChangedPath, type RunnerFs, type TestSearchSeam,
 } from "../../verify/runner";
+import { observeTests } from "../../verify/baseline";
 import { acquireSlot, type SlotHandle } from "../../verify/slot";
 import type { ExecResult } from "../../verify/types";
 import type { GitOps } from "../git";
@@ -64,6 +65,8 @@ export interface CheckRequest {
 export interface CommandRunRequest {
   slot: SlotLease; commit: string; commands: readonly ResolvedCommand[];
   mode: "full" | { rerun: readonly string[] }; priority: "foreground" | "background"; signal: AbortSignal; prepare: boolean;
+  /** M38: the preemption budget of the suite entry, shared by all of its runs (default: a fresh PREEMPT_BUDGET per run). */
+  preempt?: PreemptBudget;
 }
 export interface CommandRunResult {
   verdict: "pass" | "fail" | "error"; ids: string[]; files: string[]; idsUnparsed: boolean;
@@ -143,7 +146,10 @@ function splitNul(text: string): string[] {
   return text.split("\0").filter(part => part !== "");
 }
 
-export function createIntegrateGit(run: GitRunner, guard: WriteGuard): IntegrateGit {
+/** The `lstat` seam of `ignoredAt` (default: node:fs/promises). */
+export type LstatFn = (p: string) => Promise<{ isDirectory(): boolean }>;
+
+export function createIntegrateGit(run: GitRunner, guard: WriteGuard, lstatOf: LstatFn = lstat): IntegrateGit {
   const prefix = ["--no-optional-locks", ...hardeningArgs()];
   async function exec(cwd: string, args: readonly string[]) {
     return run.run([...prefix, ...args], { cwd, timeoutMs: GIT_READ_TIMEOUT_MS });
@@ -210,13 +216,25 @@ export function createIntegrateGit(run: GitRunner, guard: WriteGuard): Integrate
     },
     readRef,
     async ignoredAt(cwd, paths) {
+      // M29.5 (QA-3.2-12): only the exact changed paths are listed, file by file (no `--directory`, which would report
+      // every ignored file under a parent directory). A parent directory counts only when that path exists in the
+      // checkout as a non-directory (a file or a symlink git would replace by a directory).
       const specs = new Set<string>();
+      const parents = new Set<string>();
       for (const p of paths) {
         specs.add(`:(literal)${p}`);
-        for (let dir = nodePath.posix.dirname(p); dir !== "." && dir !== "/" && dir !== ""; dir = nodePath.posix.dirname(dir)) specs.add(`:(literal)${dir}`);
+        for (let dir = nodePath.posix.dirname(p); dir !== "." && dir !== "/" && dir !== ""; dir = nodePath.posix.dirname(dir)) parents.add(dir);
+      }
+      for (const dir of parents) {
+        if (specs.has(`:(literal)${dir}`)) continue;
+        try {
+          if (!(await lstatOf(nodePath.join(cwd, dir))).isDirectory()) specs.add(`:(literal)${dir}`);
+        } catch {
+          // Absent: nothing can be overwritten there.
+        }
       }
       if (specs.size === 0) return [];
-      return splitNul(await ok(cwd, "ls-files", ["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory", "--", ...specs]));
+      return splitNul(await ok(cwd, "ls-files", ["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", ...specs]));
     },
     async revertAbort(cwd) {
       await guard.assertWriteCwd(cwd, "slot");
@@ -266,18 +284,27 @@ export function selectFromFiles(
 // Background runs (M12)
 // ---------------------------------------------------------------------------------------------------------------
 
-/** In-process background (suite) runs that a foreground check may preempt, each at most `budget` times. */
+/** Preemptions a suite entry may still take (M38). Shared by every run of the entry, so the cap spans the entry. */
+export interface PreemptBudget { left: number }
+
+/** M38: preemptions per suite entry. */
+export const PREEMPT_BUDGET = 3;
+
+/**
+ * In-process background (suite) runs that a foreground check may preempt. A number budget is private to the run; a
+ * `PreemptBudget` object is shared, so a run registered after the entry's budget is spent is never preempted.
+ */
 export class BackgroundRuns {
-  private readonly runs = new Set<{ c: AbortController; left: number }>();
-  register(c: AbortController, budget: number): () => void {
-    const entry = { c, left: budget };
+  private readonly runs = new Set<{ c: AbortController; budget: PreemptBudget }>();
+  register(c: AbortController, budget: number | PreemptBudget): () => void {
+    const entry = { c, budget: typeof budget === "number" ? { left: budget } : budget };
     this.runs.add(entry);
     return () => { this.runs.delete(entry); };
   }
   preemptOne(): boolean {
     for (const entry of this.runs) {
-      if (entry.left > 0 && !entry.c.signal.aborted) {
-        entry.left -= 1;
+      if (entry.budget.left > 0 && !entry.c.signal.aborted) {
+        entry.budget.left -= 1;
         entry.c.abort();
         return true;
       }
@@ -343,11 +370,24 @@ function fileOfId(id: string): string {
   return cut.length === 0 ? id : id.slice(0, Math.min(...cut));
 }
 
+/**
+ * QA-3.2-1: the failing ids of a full run, read from its output (`observeTests`, verify/baseline.ts). `files` are the
+ * test files of the ids, resolved against `cwd` (the form `readResult` reports). Null when the output names no id.
+ */
+export function observeFull(o: CommandOutput, cwd: string): { ids: string[]; files: string[]; complete: boolean } | null {
+  const seen = observeTests({ code: o.exitCode ?? -1, stdout: o.stdout, stderr: o.stderr, timedOut: o.timedOut });
+  if (seen.failures.length === 0) return null;
+  const files = [...new Set(seen.failures.map(id => nodePath.resolve(cwd, fileOfId(id))))].sort();
+  return { ids: [...seen.failures], files, complete: seen.complete };
+}
+
 type Held<T> = { ok: true; value: T } | { ok: false; reason: CheckErrorReason; message: string };
+
+interface Failing { ids: string[]; files: string[]; output: string }
 
 interface TestOutcome {
   comp: ComponentResult;
-  failing: { ids: string[]; files: string[]; output: string } | null;
+  failing: Failing | null;
 }
 
 export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationChecks {
@@ -395,12 +435,13 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
 
   /** M12: holds one machine-wide verification slot around `body`, which gets a signal for abort, preemption and a lost slot. */
   async function underSlot<T>(
-    o: { signal: AbortSignal; priority: "foreground" | "background"; cwd: string; command: string },
+    o: { signal: AbortSignal; priority: "foreground" | "background"; cwd: string; command: string; budget?: PreemptBudget | undefined },
     body: (signal: AbortSignal) => Promise<T>,
   ): Promise<Held<T>> {
     const lost = new AbortController();
     const own = new AbortController();
-    const unregister = o.priority === "background" ? d.background.register(own, 3) : () => undefined;
+    // QA-3.2-8 (M38): a shared budget carries the preemptions of one suite entry across its runs.
+    const unregister = o.priority === "background" ? d.background.register(own, o.budget ?? PREEMPT_BUDGET) : () => undefined;
     const signal = AbortSignal.any([o.signal, lost.signal, own.signal]);
     let handle: SlotHandle | null = null;
     try {
@@ -417,20 +458,31 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
         if (!("busy" in r)) handle = r;
         else if (o.priority === "foreground") d.background.preemptOne();
       }
-      if (handle === null) return why(o.signal, own.signal, lost.signal, false);
-      const value = await body(signal);
-      return handle.lost || lost.signal.aborted ? why(o.signal, own.signal, lost.signal, true) : own.signal.aborted && !o.signal.aborted
-        ? why(o.signal, own.signal, lost.signal, true) : { ok: true, value };
+      if (handle === null) return why(o.signal, lost.signal.aborted, false);
+      let value: T;
+      try {
+        value = await body(signal);
+      } catch (e) {
+        // A child killed by the signal rejects: that is the signal's outcome, not a spawn error.
+        if (!signal.aborted && !handle.lost) throw e;
+        return why(o.signal, lost.signal.aborted || handle.lost, true);
+      }
+      // QA-3.2-13: whatever the body returned, a run whose signal fired (abort, preemption, lost slot) is no result.
+      return signal.aborted || handle.lost ? why(o.signal, lost.signal.aborted || handle.lost, true) : { ok: true, value };
     } finally {
       unregister();
       if (handle !== null) await handle.release();
     }
   }
 
-  function why(outer: AbortSignal, own: AbortSignal, lostSignal: AbortSignal, held: boolean): Held<never> {
-    if (lostSignal.aborted) return { ok: false, reason: "slot-lost", message: "the verification slot was reclaimed while held" };
-    if (own.aborted && !outer.aborted) return { ok: false, reason: "preempted", message: "a foreground check preempted this background run" };
-    return { ok: false, reason: "interrupted", message: held ? "the run was aborted" : "aborted while waiting for a verification slot" };
+  /**
+   * The outcome of a run some signal stopped. The outer signal (abort, dispose) wins: the caller asked for the stop, so
+   * it is `interrupted`, never a verdict. Then a lost slot; else only the preemption signal is left.
+   */
+  function why(outer: AbortSignal, lostSlot: boolean, held: boolean): Held<never> {
+    if (outer.aborted) return { ok: false, reason: "interrupted", message: held ? "the run was aborted" : "aborted while waiting for a verification slot" };
+    if (lostSlot) return { ok: false, reason: "slot-lost", message: "the verification slot was reclaimed while held" };
+    return { ok: false, reason: "preempted", message: "a foreground check preempted this background run" };
   }
 
   async function exec(c: ResolvedCommand, cwd: string, signal: AbortSignal, low: boolean): Promise<CommandOutput> {
@@ -485,42 +537,122 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
       const none: CommandOutput = { exitCode: 0, timedOut: false, stdout: "", stderr: "", durationMs: 0 };
       return { comp: component("tests", { ...t.full, label: "no affected tests" }, none, "no-affected"), failing: null };
     }
-    if (!isScopedSpec(plan)) {
-      // Unverifiable never counts as verified without a run: run the full command.
-      const out = await exec(t.full, cwd, signal, low);
-      const pass = out.exitCode === 0 && !out.timedOut;
-      return { comp: component("tests", t.full, out, "full"), failing: pass ? null : { ids: [], files: [], output: tail(out.stdout + out.stderr, OUTPUT_TAIL_BYTES) } };
-    }
+    // Unscoped or unverifiable: never counted as verified without a run, so the full command decides.
+    if (!isScopedSpec(plan)) return fullTests(t, command, cwd, signal, low);
     const spec: ResolvedCommand = { label: t.full.label, file: plan.file, args: plan.args, source: t.full.source, ref: t.full.ref, env: plan.env, cwd: plan.cwd };
     const out = await exec(spec, cwd, signal, low);
     const result = await readResult(plan, asExec(out), nodeFs);
-    const text = tail(out.stdout + out.stderr, OUTPUT_TAIL_BYTES);
-    if (out.exitCode === 0 && !out.timedOut && !result.collectionError && result.complete) {
-      return { comp: component("tests", spec, out, "spec"), failing: null };
-    }
-    const ids = [...result.failingIds];
-    if (out.timedOut || result.collectionError || ids.length === 0 || result.failingFiles.length === 0) {
-      return { comp: component("tests", spec, out, "spec"), failing: { ids, files: [...result.failingFiles], output: text } };
-    }
-    // M11: one confirmation rerun of the failing files.
+    const comp = component("tests", spec, out, "spec");
+    if (out.exitCode === 0 && !out.timedOut && !result.collectionError && result.complete) return { comp, failing: null };
+    const first: Failing = { ids: [...result.failingIds], files: [...result.failingFiles], output: tail(out.stdout + out.stderr, OUTPUT_TAIL_BYTES) };
+    // M10/M11: a timeout or a collection error is a final failure.
+    if (out.timedOut || result.collectionError) return { comp, failing: first };
+    // QA-3.2-7: an incomplete report (exit 0 or not), or a failure that names no id, is no evidence either way: the
+    // full command decides, the partial report never blames (and an id-less failure is never confirmed away).
+    if (!result.complete || first.ids.length === 0) return fullTests(t, command, cwd, signal, low);
+    return confirm(t, command, cwd, signal, low, comp, first);
+  }
+
+  /** The full test command: exit 0 without a timeout passes; a failure names the ids its output lists (QA-3.2-1). */
+  async function runFull(c: ResolvedCommand, cwd: string, signal: AbortSignal, low: boolean) {
+    const out = await exec(c, cwd, signal, low);
+    const pass = out.exitCode === 0 && !out.timedOut;
+    return { out, pass, seen: pass || out.timedOut ? null : observeFull(out, cwd), output: tail(out.stdout + out.stderr, OUTPUT_TAIL_BYTES) };
+  }
+
+  async function fullTests(t: TestComponent, command: string, cwd: string, signal: AbortSignal, low: boolean): Promise<TestOutcome> {
+    const f = await runFull(t.full, cwd, signal, low);
+    const comp = component("tests", t.full, f.out, "full");
+    if (f.pass) return { comp, failing: null };
+    // M11 calls an id flaky only against a complete id inventory.
+    if (f.seen === null || !f.seen.complete) return { comp, failing: { ids: f.seen?.ids ?? [], files: f.seen?.files ?? [], output: f.output } };
+    return confirm(t, command, cwd, signal, low, comp, { ids: f.seen.ids, files: f.seen.files, output: f.output });
+  }
+
+  /**
+   * M11: one confirmation rerun of the failing files. Only a passing run with a complete report clears an id
+   * (QA-3.2-7); an incomplete rerun clears nothing and the full command is the second observation instead.
+   */
+  async function confirm(t: TestComponent, command: string, cwd: string, signal: AbortSignal, low: boolean, comp: ComponentResult, first: Failing): Promise<TestOutcome> {
     const runner = await detectRunner(command, cwd, nodeFs);
-    if (isUnverifiable(runner)) return { comp: component("tests", spec, out, "spec"), failing: { ids, files: [...result.failingFiles], output: text } };
-    const again = await planRerun(runner, result.failingFiles, cwd, { maxWorkers: MAX_WORKERS }, { fs: nodeFs });
-    if (!isScopedSpec(again)) return { comp: component("tests", spec, out, "spec"), failing: { ids, files: [...result.failingFiles], output: text } };
+    if (isUnverifiable(runner)) return { comp, failing: first };
+    const again = await planRerun(runner, first.files, cwd, { maxWorkers: MAX_WORKERS }, { fs: nodeFs });
+    if (!isScopedSpec(again)) return { comp, failing: first };
     const rerunSpec: ResolvedCommand = { label: t.full.label, file: again.file, args: again.args, source: t.full.source, ref: t.full.ref, env: again.env, cwd: again.cwd };
-    const out2 = await exec(rerunSpec, cwd, signal, low);
-    const result2 = await readResult(again, asExec(out2), nodeFs);
-    const stillFailing = new Set(result2.failingIds);
-    const confirmed = out2.exitCode === 0 && !out2.timedOut && !result2.collectionError ? [] : ids.filter(id => stillFailing.has(id));
-    const unknown = confirmed.length === 0 && out2.exitCode !== 0;
-    const failingNow = unknown ? ids : confirmed;
-    const flaky = ids.filter(id => !failingNow.includes(id));
-    const comp = component("tests", rerunSpec, out2, "rerun", flaky);
-    if (failingNow.length === 0) return { comp, failing: null };
-    return {
-      comp,
-      failing: { ids: failingNow, files: [...new Set(failingNow.map(fileOfId))].length > 0 ? [...result2.failingFiles] : [...result.failingFiles], output: tail(out2.stdout + out2.stderr, OUTPUT_TAIL_BYTES) },
-    };
+    const out = await exec(rerunSpec, cwd, signal, low);
+    const result = await readResult(again, asExec(out), nodeFs);
+    const sure = !out.timedOut && !result.collectionError;
+    if (!sure || result.complete) {
+      const seen = sure ? { ids: result.failingIds, complete: true } : null;
+      return settle(component("tests", rerunSpec, out, "rerun"), first, confirmedOf(first.ids, sure && out.exitCode === 0, seen), tail(out.stdout + out.stderr, OUTPUT_TAIL_BYTES));
+    }
+    const f = await runFull(t.full, cwd, signal, low);
+    return settle(component("tests", t.full, f.out, "full"), first, confirmedOf(first.ids, f.pass, f.seen), f.output);
+  }
+
+  /** M11: the original ids a second observation confirms. Only a pass clears them; a second failure naming none keeps them all. */
+  function confirmedOf(ids: readonly string[], pass: boolean, seen: { ids: readonly string[]; complete: boolean } | null): string[] {
+    if (pass) return [];
+    const hit = seen !== null && seen.complete ? ids.filter(id => seen.ids.includes(id)) : [];
+    return hit.length > 0 ? hit : [...ids];
+  }
+
+  function settle(comp: ComponentResult, first: Failing, failingNow: string[], output: string): TestOutcome {
+    const judged: ComponentResult = { ...comp, flakyIds: first.ids.filter(id => !failingNow.includes(id)) };
+    return { comp: judged, failing: failingNow.length === 0 ? null : { ids: failingNow, files: first.files, output } };
+  }
+
+  /**
+   * QA-3.2-6: regression files come from the slot that observed them (the `ci` slot, absolute). Each is re-rooted under
+   * `cwd`: the part below the plan slot (or integration worktree) that holds it, else the path as given if relative.
+   * An absolute path under no known root is kept; the rerun then cannot map it and does not pass.
+   */
+  async function reroot(files: readonly string[], cwd: string): Promise<string[]> {
+    if (files.length === 0) return [];
+    const l = d.ledger();
+    const roots = [l.integration.worktree, ...(await d.pool.list(l.planId)).map(r => r.path)];
+    return files.map(f => {
+      if (!nodePath.isAbsolute(f)) return nodePath.join(cwd, f);
+      for (const root of roots) {
+        const rel = nodePath.relative(root, f);
+        if (rel !== "" && !rel.startsWith("..") && !nodePath.isAbsolute(rel)) return nodePath.join(cwd, rel);
+      }
+      return f;
+    });
+  }
+
+  /**
+   * QA-3.2-6: the regression of a revert, judged on its own ids. Only its files run, and only its ids decide: any other
+   * failure there is not the revert's to fix. A test command reruns the files; an unscoped run, a non-test command or
+   * an incomplete report falls back to the whole command, judged by the ids its output names (unparsed: fail closed).
+   */
+  async function regressionTests(
+    c: ResolvedCommand, ids: readonly string[], files: readonly string[], cwd: string, signal: AbortSignal, low: boolean,
+  ): Promise<TestOutcome> {
+    const wanted = new Set(ids);
+    const fail = (still: readonly string[], output: string): Failing | null => (still.length === 0 ? null : { ids: [...still], files: [...files], output });
+    if (c.source === "pytest" || c.ref?.script === "test") {
+      const runner = await detectRunner(c.source === "pytest" ? c.label : "npm test", cwd, nodeFs);
+      const plan = isUnverifiable(runner) ? runner : await planRerun(runner, files, cwd, { maxWorkers: MAX_WORKERS }, { fs: nodeFs });
+      if (isNoAffected(plan)) {
+        // The regression's test files are gone at this commit: nothing of it can fail here.
+        const none: CommandOutput = { exitCode: 0, timedOut: false, stdout: "", stderr: "", durationMs: 0 };
+        return { comp: component("regression", { ...c, label: "no affected tests" }, none, "no-affected"), failing: null };
+      }
+      if (isScopedSpec(plan)) {
+        const spec: ResolvedCommand = { ...c, file: plan.file, args: plan.args, env: plan.env, cwd: plan.cwd };
+        const out = await exec(spec, cwd, signal, low);
+        const result = await readResult(plan, asExec(out), nodeFs);
+        const comp = component("regression", spec, out, "rerun");
+        const output = tail(out.stdout + out.stderr, OUTPUT_TAIL_BYTES);
+        if (out.timedOut || result.collectionError) return { comp, failing: fail(ids, output) };
+        if (result.complete) return { comp, failing: fail(result.failingIds.filter(id => wanted.has(id)), output) };
+      }
+    }
+    const f = await runFull(c, cwd, signal, low);
+    const comp = component("regression", c, f.out, "full");
+    if (f.pass) return { comp, failing: null };
+    return { comp, failing: fail(f.seen !== null && f.seen.complete ? f.seen.ids.filter(id => wanted.has(id)) : ids, f.output) };
   }
 
   async function run(req: CheckRequest): Promise<CheckResult> {
@@ -536,14 +668,18 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     } catch (e) {
       return err("prepare", errText(e));
     }
+    let extraFiles: string[];
     try {
       selection = await select(cwd, req.candidate);
       changed = (await d.igit.diffNameStatus(cwd, req.base, req.candidate)).map(n => ({ path: nodePath.join(cwd, n.path), status: n.status }));
-      for (const f of req.extra?.files ?? []) changed.push({ path: nodePath.join(cwd, f) });
+      extraFiles = await reroot(req.extra?.files ?? [], cwd);
     } catch (e) {
       return err(e instanceof CheckResolveError ? "resolve" : "prepare", errText(e));
     }
-    const regression = req.extra?.commands ?? [];
+    const extraIds = req.extra?.ids ?? [];
+    // QA-3.2-6: regression ids need test commands to rerun them; without the suite's, this commit's tests serve.
+    const regression = extraIds.length > 0 && (req.extra?.commands ?? []).length === 0 ? selection.tests.map(t => t.full) : req.extra?.commands ?? [];
+    if (extraIds.length > 0 && regression.length === 0) return err("resolve", "the regression ids have no test command to rerun them");
     if (selection.typecheck === null && selection.tests.length === 0 && selection.extras.length === 0 && regression.length === 0) {
       return { verdict: "pass", components, flakyIds: [], note: "no-checks", durationMs: elapsed() };
     }
@@ -573,8 +709,17 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
         if (r !== null) return r;
       }
       for (const c of regression) {
-        const r = await simple("regression", c);
-        if (r !== null) return r;
+        // Without ids the regression is the whole command (an unattributed failure that passed at the phase base).
+        if (extraIds.length === 0) {
+          const r = await simple("regression", c);
+          if (r !== null) return r;
+          continue;
+        }
+        const o = await regressionTests(c, extraIds, extraFiles, cwd, signal, low);
+        components.push(o.comp);
+        if (o.failing !== null) {
+          return { verdict: "fail", components, failingIds: o.failing.ids, failingFiles: o.failing.files, flakyIds: [], output: o.failing.output, durationMs: elapsed() };
+        }
       }
       return null;
     }).catch((e: unknown): Held<CheckResult | null> => ({ ok: false, reason: "spawn", message: errText(e) }));
@@ -596,7 +741,7 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
       }
     }
     const low = req.priority === "background";
-    const held = await underSlot({ signal: req.signal, priority: req.priority, cwd, command: "integration commands" }, async (signal): Promise<CommandRunResult> => {
+    const held = await underSlot({ signal: req.signal, priority: req.priority, cwd, command: "integration commands", budget: req.preempt }, async (signal): Promise<CommandRunResult> => {
       const ids = new Set<string>();
       const files = new Set<string>();
       let output = "";
@@ -614,25 +759,38 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
             const spec: ResolvedCommand = { ...c, file: plan.file, args: plan.args, env: plan.env, cwd: plan.cwd };
             const out = await exec(spec, cwd, signal, low);
             const result = await readResult(plan, asExec(out), nodeFs);
-            if (out.exitCode !== 0 || out.timedOut) {
+            // QA-3.2-1 (3): a rerun passes only on a complete result; exit 0 alone is not evidence.
+            if (out.exitCode === 0 && !out.timedOut && result.complete && !result.collectionError) continue;
+            if (out.timedOut || (out.exitCode !== 0 && result.failingIds.length > 0)) {
               failed = true;
               output = tail(out.stdout + out.stderr, OUTPUT_TAIL_BYTES);
               for (const id of result.failingIds) ids.add(id);
               for (const f of result.failingFiles) files.add(f);
-              if (!result.complete) unparsed = true;
+              if (!result.complete || result.collectionError || out.timedOut) unparsed = true;
+              continue;
             }
-            continue;
+            // An incomplete result (or a failure without ids): fall back to the full command below.
           }
         }
         const out = await exec(c, cwd, signal, low);
         if (out.exitCode !== 0 || out.timedOut) {
           failed = true;
-          unparsed = true;
           output = tail(out.stdout + out.stderr, OUTPUT_TAIL_BYTES);
-          break;
+          // QA-3.2-1 (1): the failing ids of a full test run come from its output (vitest/jest `FAIL <file> > …`,
+          // pytest `FAILED <file>::…`, a jest JSON report). An incomplete inventory, a timeout or output without ids
+          // leaves the failure unattributable.
+          const seen = out.timedOut ? null : observeFull(out, cwd);
+          if (seen === null) {
+            unparsed = true;
+            break;
+          }
+          for (const id of seen.ids) ids.add(id);
+          for (const f of seen.files) files.add(f);
+          if (!seen.complete) unparsed = true;
         }
       }
-      return done({ verdict: failed ? "fail" : "pass", ids: [...ids].sort(), files: [...files].sort(), idsUnparsed: failed && (unparsed || ids.size === 0), output });
+      // Every failure path without ids sets `unparsed`, so a parsed failure always names at least one id.
+      return done({ verdict: failed ? "fail" : "pass", ids: [...ids].sort(), files: [...files].sort(), idsUnparsed: failed && unparsed, output });
     }).catch((e: unknown): Held<CommandRunResult> => ({ ok: false, reason: "spawn", message: errText(e) }));
     if (!held.ok) return done({ verdict: "error", error: { reason: held.reason, message: held.message } });
     return held.value;

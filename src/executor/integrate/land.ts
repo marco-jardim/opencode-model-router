@@ -3,6 +3,8 @@
 // (`repo.toplevel`): every probe runs with `-C <toplevel>`, never against another worktree of the same repository.
 // Never forces and never creates a non-fast-forward.
 
+import { hardeningArgs } from "../../router/git-tools";
+import { phaseTagName as gitPhaseTagName } from "../git";
 import type { GitOps } from "../git";
 import type { GitRunner, PhaseId, PlanId } from "../types";
 import type { IntegrateGit, WriteGuard } from "./checks";
@@ -10,9 +12,9 @@ import type { LandInspection, LandOutcome, LandRefusal, LandRequest, TagOutcome 
 
 const READ_TIMEOUT_MS = 60_000;
 
-/** `omr/<planId>/phase-<phaseId>` (3.2.5.a). */
+/** `omr/<planId>/phase/<encoded phaseId>` (3.2.5.a): the encoded, case-fold-safe name of git.ts. */
 export function phaseTagName(planId: PlanId, phaseId: PhaseId): string {
-  return `omr/${planId}/phase-${phaseId}`;
+  return gitPhaseTagName(planId, phaseId);
 }
 
 export interface LanderDeps {
@@ -60,7 +62,8 @@ function parseStatusPaths(stdout: string): string[] {
 
 export function createLander(d: LanderDeps): LanderApi {
   async function probe(toplevel: string, args: readonly string[]): Promise<{ code: number | null; stdout: string }> {
-    const r = await d.run.run(["-C", toplevel, ...args], { cwd: toplevel, timeoutMs: READ_TIMEOUT_MS });
+    // hardeningArgs() neutralises configured hooks/fsmonitor/pagers: `status` must not run a repo-configured program.
+    const r = await d.run.run(["-C", toplevel, "--no-optional-locks", ...hardeningArgs(), ...args], { cwd: toplevel, timeoutMs: READ_TIMEOUT_MS });
     return { code: r.code, stdout: r.stdout };
   }
 
@@ -97,10 +100,12 @@ export function createLander(d: LanderDeps): LanderApi {
     if (dirty.length > 0) return { ok: false, refusal: { reason: "dirty", paths: dirty }, baseTip };
 
     // 4. The base head is an ancestor of the integration head.
+    if (baseTip === candidate) return { ok: true, baseTip, noop: true };
     if (!(await d.igit.isAncestor(toplevel, baseTip, candidate))) {
+      // The owner moved on after landing: the base already contains the candidate, nothing to do.
+      if (await d.igit.isAncestor(toplevel, candidate, baseTip)) return { ok: true, baseTip, noop: true };
       return { ok: false, refusal: { reason: "diverged", baseTip }, baseTip };
     }
-    if (baseTip === candidate) return { ok: true, baseTip, noop: true };
 
     // 5. No ignored file sits where the fast-forward adds or changes a path (git overwrites ignored files silently).
     const changed = (await d.igit.diffNameStatus(toplevel, baseTip, candidate)).filter(e => e.status !== "D").map(e => e.path);

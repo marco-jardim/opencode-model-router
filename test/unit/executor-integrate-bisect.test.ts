@@ -1,7 +1,8 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  BackgroundRuns, CheckPrepareError, createIntegrateGit, createIntegrationChecks, createWriteGuard, isPlaceholderTestScript, selectFromFiles,
-  type CommandOutput,
+  BackgroundRuns, CheckPrepareError, createIntegrateGit, createIntegrationChecks, createWriteGuard, isPlaceholderTestScript, observeFull,
+  PREEMPT_BUDGET, selectFromFiles,
+  type CommandOutput, type PreemptBudget,
 } from "../../src/executor/integrate/checks";
 import type { SlotHandle, SlotOptions, SlotResult } from "../../src/verify/slot";
 import type {
@@ -11,7 +12,8 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as nodePath from "node:path";
 import { createLander, phaseTagName, samePath } from "../../src/executor/integrate/land";
-import type { GitOps } from "../../src/executor/git";
+import { phaseTagName as gitPhaseTagName, type GitOps } from "../../src/executor/git";
+import { hardeningArgs } from "../../src/router/git-tools";
 import { ExecutorError } from "../../src/executor/types";
 import type {
   Clock, ExecutorConfig, GitRunner, IntegrationStep, LedgerV1, RunCommandRef, SlotLease, SlotPool, SlotRecord,
@@ -23,7 +25,7 @@ import type {
 import type {
   LandRequest, RevertRequest, StepDetail, StepJournal, SuiteRunRequest,
 } from "../../src/executor/integrate/queue";
-import { classifyReruns, createPhaseSuiteRunner, revertMessage } from "../../src/executor/integrate/phase-suite";
+import { classifyReruns, createPhaseSuiteRunner, interruptedBy, revertMessage } from "../../src/executor/integrate/phase-suite";
 import { PREEMPT_LIMIT } from "../../src/executor/integrate/queue";
 import {
   bisectRanges,
@@ -331,8 +333,9 @@ describe("land path helpers", () => {
     expect(samePath("/a", "/b", "linux")).toBe(false);
   });
 
-  it("phaseTagName is omr/<plan>/phase-<phase>", () => {
-    expect(phaseTagName("plan1", "p2")).toBe("omr/plan1/phase-p2");
+  it("phaseTagName is omr/<plan>/phase/<encoded phase> (git.ts naming, QA-3.2-14)", () => {
+    expect(phaseTagName("plan1", "p2")).toBe("omr/plan1/phase/p2");
+    expect(phaseTagName("plan1", "p2")).toBe(gitPhaseTagName("plan1", "p2"));
   });
 });
 
@@ -346,14 +349,19 @@ function runResult(code: number | null, stdout = "", stderr = ""): RunResult {
   return { code, signal: null, stdout, stderr, truncated: false, durationMs: 0 };
 }
 
+// QA-3.2-14/-17/-20: every owner-checkout probe runs `-C <toplevel> --no-optional-locks ...hardeningArgs() <args>` through
+// the injected hardened runner (`run`); the doubles below match the git subcommand after that prefix.
 describe("createLander", () => {
   const req: LandRequest = { toplevel: "/repo", baseBranch: "main", candidate: "cand", integrationBranch: "omr/int" };
+  const probePrefix = (toplevel: string): string[] => ["-C", toplevel, "--no-optional-locks", ...hardeningArgs()];
+  const PROBE_PREFIX_LENGTH = probePrefix("/repo").length;
 
   interface World {
     probes: Record<string, RunResult>;
     seen: string[][];
     baseTip: string | null;
     ancestor: boolean;
+    behind: boolean;
     changed: NameStatus[];
     ignored: string[];
     merge: Awaited<ReturnType<GitOps["mergeFfOnly"]>>;
@@ -369,7 +377,7 @@ describe("createLander", () => {
         "symbolic-ref -q HEAD": runResult(0, "refs/heads/main\n"),
         status: runResult(0, ""),
       },
-      seen: [], baseTip: "base", ancestor: true, changed: [], ignored: [],
+      seen: [], baseTip: "base", ancestor: true, behind: false, changed: [], ignored: [],
       merge: { ok: true, head: "cand" },
       guardError: null, realpath: async p => p, createRef: async () => "created", ignoredCalls: [],
       ...over,
@@ -383,13 +391,16 @@ describe("createLander", () => {
     const run = stub<GitRunner>({
       run: async args => {
         w.seen.push([...args]);
-        const key = args[2] === "status" ? "status" : args.slice(2).join(" ");
+        // The probe prefix is `-C <toplevel> --no-optional-locks ...hardeningArgs()`; the key is the subcommand after it.
+        const sub = args.slice(PROBE_PREFIX_LENGTH);
+        const key = sub[0] === "status" ? "status" : sub.join(" ");
         return w.probes[key] ?? runResult(1);
       },
     });
     const igit = stub<IntegrateGit>({
       readRef: async () => w.baseTip,
-      isAncestor: async () => w.ancestor,
+      // isAncestor(base, candidate) answers `ancestor`; the reverse question (is the candidate already in the base?) `behind`.
+      isAncestor: async (_cwd, ancestor) => (ancestor === req.candidate ? w.behind : w.ancestor),
       diffNameStatus: async () => w.changed,
       ignoredAt: async (_cwd, paths) => { w.ignoredCalls.push([...paths]); return w.ignored; },
       createRef: (cwd, ref, commit) => w.createRef(cwd, ref, commit),
@@ -412,7 +423,17 @@ describe("createLander", () => {
   it("probes with -C <toplevel> and falls back to the raw paths when realpath fails", async () => {
     const { w, lander } = world({ realpath: async () => { throw new Error("ENOENT"); }, baseTip: null });
     expect(await lander.inspect(req)).toEqual({ ok: false, refusal: { reason: "base-missing" }, baseTip: null });
-    expect(w.seen[0]).toEqual(["-C", "/repo", "rev-parse", "--show-toplevel"]);
+    expect(w.seen[0]).toEqual([...probePrefix("/repo"), "rev-parse", "--show-toplevel"]);
+    expect(w.seen[0]?.slice(0, 3)).toEqual(["-C", "/repo", "--no-optional-locks"]);
+  });
+
+  it("every owner-checkout probe runs hardened with -C <toplevel>", async () => {
+    const { w, lander } = world();
+    expect(await lander.inspect(req)).toEqual({ ok: true, baseTip: "base", noop: false });
+    expect(w.seen.map(a => a.slice(0, PROBE_PREFIX_LENGTH))).toEqual([probePrefix("/repo"), probePrefix("/repo"), probePrefix("/repo")]);
+    expect(w.seen.map(a => a.slice(PROBE_PREFIX_LENGTH))).toEqual([
+      ["rev-parse", "--show-toplevel"], ["symbolic-ref", "-q", "HEAD"], ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"],
+    ]);
   });
 
   it("compares the realpaths of the reported and the recorded toplevel", async () => {
@@ -461,6 +482,13 @@ describe("createLander", () => {
     expect(w.ignoredCalls).toEqual([]);
   });
 
+  it("is a noop, not diverged, when the base already contains the candidate (the owner moved on after landing)", async () => {
+    const { lander, w } = world({ ancestor: false, behind: true });
+    expect(await lander.inspect(req)).toEqual({ ok: true, baseTip: "base", noop: true });
+    expect(w.ignoredCalls).toEqual([]);
+    expect(await world({ ancestor: false, behind: true }).lander.fastForward(req)).toEqual({ kind: "landed", from: "base", to: "cand" });
+  });
+
   it("refuses ignored-overwrite for added or changed paths only; deletions are not probed", async () => {
     const blocked = world({ changed: [{ status: "A", path: "a.txt" }, { status: "D", path: "gone.txt" }], ignored: ["a.txt"] });
     expect(await blocked.lander.inspect(req)).toEqual({ ok: false, refusal: { reason: "ignored-overwrite", paths: ["a.txt"] }, baseTip: "base" });
@@ -487,11 +515,11 @@ describe("createLander", () => {
   it("tag creates refs/tags/<name> and reports a thrown error as an outcome", async () => {
     const refs: string[] = [];
     const ok = world({ createRef: async (_cwd, ref, commit) => { refs.push(`${ref}@${commit}`); return "exists-same"; } });
-    expect(await ok.lander.tag({ cwd: "/slot", name: "omr/p/phase-1", commit: "abc" })).toBe("exists-same");
-    expect(refs).toEqual(["refs/tags/omr/p/phase-1@abc"]);
+    expect(await ok.lander.tag({ cwd: "/slot", name: "omr/plan1/phase/p2", commit: "abc" })).toBe("exists-same");
+    expect(refs).toEqual(["refs/tags/omr/plan1/phase/p2@abc"]);
     const bad = world({ createRef: async () => { throw new Error("boom"); } });
     expect(await bad.lander.tag({ cwd: "/slot", name: "n", commit: "abc" })).toEqual({ kind: "error", message: "boom" });
-    expect(ok.lander.tagName("p", "1")).toBe("omr/p/phase-1");
+    expect(ok.lander.tagName("plan1", "p2")).toBe("omr/plan1/phase/p2");
   });
 
   it("commands: one hint list per refusal, none when nothing can be done", () => {
@@ -574,9 +602,10 @@ describe("createWriteGuard (M30)", () => {
 
 describe("createIntegrateGit", () => {
   type Reply = RunResult | ((args: readonly string[]) => RunResult);
-  function gitEnv(replies: Reply[] = []) {
+  function gitEnv(replies: Reply[] = [], kinds: Record<string, "file" | "dir"> = {}) {
     const calls: Array<{ args: readonly string[]; cwd: string }> = [];
     const writes: string[] = [];
+    const lstats: string[] = [];
     let n = 0;
     const run = stub<GitRunner>({
       run: async (args, o) => {
@@ -586,7 +615,14 @@ describe("createIntegrateGit", () => {
       },
     });
     const guard: WriteGuard = { assertWriteCwd: async (cwd, purpose) => { writes.push(`${purpose}:${cwd}`); } };
-    return { igit: createIntegrateGit(run, guard), calls, writes };
+    const lstatOf = async (p: string) => {
+      const key = p.replace(/\\/g, "/");
+      lstats.push(key);
+      const kind = kinds[key];
+      if (kind === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      return { isDirectory: () => kind === "dir" };
+    };
+    return { igit: createIntegrateGit(run, guard, lstatOf), calls, writes, lstats };
   }
   /** The git arguments after the shared prefix (--no-optional-locks plus the hardening flags). */
   const rest = (args: readonly string[], first: string): string[] => args.slice(args.indexOf(first));
@@ -674,16 +710,28 @@ describe("createIntegrateGit", () => {
     expect(await igit.subject("/wt", "c1")).toBe("a\nb");
   });
 
-  it("ignoredAt asks about each path and its parent directories once, and skips the call for no paths", async () => {
+  it("ignoredAt lists the exact paths file by file and a parent only where it exists as a non-directory (QA-3.2-12)", async () => {
     const none = gitEnv();
     expect(await none.igit.ignoredAt("/wt", [])).toEqual([]);
     expect(none.calls).toEqual([]);
-    const { igit, calls } = gitEnv([runResult(0, "a/b\0x\0")]);
-    expect(await igit.ignoredAt("/wt", ["a/b/c.txt", "a/d.txt", "x", "/abs/y"])).toEqual(["a/b", "x"]);
-    const specs = (calls[0]?.args ?? []).slice((calls[0]?.args ?? []).lastIndexOf("--") + 1);
-    expect(specs).toEqual([
-      ":(literal)a/b/c.txt", ":(literal)a/b", ":(literal)a", ":(literal)a/d.txt", ":(literal)x", ":(literal)/abs/y", ":(literal)/abs",
+    // a/ is a real directory (its other ignored files must not refuse landing); a/b is an ignored FILE where the
+    // change needs a directory; p is itself a changed path (asked once, never lstat'ed); /abs and f do not exist.
+    const { igit, calls, lstats } = gitEnv([runResult(0, "a/b\0x\0")], { "/wt/a": "dir", "/wt/a/b": "file" });
+    expect(await igit.ignoredAt("/wt", ["a/b/c.txt", "a/d.txt", "x", "/abs/y", "p", "p/q.txt", "f/g.txt"])).toEqual(["a/b", "x"]);
+    const args = calls[0]?.args ?? [];
+    expect(args).not.toContain("--directory");
+    expect(rest(args, "ls-files").slice(0, 6)).toEqual(["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--"]);
+    expect(args.slice(args.lastIndexOf("--") + 1)).toEqual([
+      ":(literal)a/b/c.txt", ":(literal)a/d.txt", ":(literal)x", ":(literal)/abs/y", ":(literal)p", ":(literal)p/q.txt", ":(literal)f/g.txt",
+      ":(literal)a/b",
     ]);
+    expect(lstats).toEqual(["/wt/a/b", "/wt/a", "/wt/abs", "/wt/f"]);
+  });
+
+  it("ignoredAt with only directory parents passes no parent at all", async () => {
+    const { igit, calls } = gitEnv([runResult(0, "")], { "/wt/src": "dir" });
+    expect(await igit.ignoredAt("/wt", ["src/new.ts"])).toEqual([]);
+    expect((calls[0]?.args ?? []).slice(-2)).toEqual(["--", ":(literal)src/new.ts"]);
   });
 
   it("revertAbort does nothing without REVERT_HEAD and aborts otherwise, asserting the slot write cwd", async () => {
@@ -747,6 +795,8 @@ function checksEnv(o: ChecksOpts = {}) {
   const pool = stub<SlotPool>({
     reset: async (s, commit) => { resets.push(`reset:${s}@${commit}`); if (o.resetError !== undefined) throw o.resetError; },
     cleanForChecks: async s => { resets.push(`clean:${s}`); },
+    // The plan's slots: the ci slot that observed a suite failure, and this check's slot.
+    list: async () => [stub<SlotRecord>({ path: nodePath.resolve("/ci") }), stub<SlotRecord>({ path: nodePath.resolve("/slot") })],
   });
   const git = stub<GitOps>({ revParse: async () => o.head ?? "cand" });
   const igit = stub<IntegrateGit>({
@@ -759,7 +809,10 @@ function checksEnv(o: ChecksOpts = {}) {
     })))(ref),
   };
   const checks = createIntegrationChecks({
-    ledger: () => stub<LedgerV1>({ config: stub<LedgerV1["config"]>({ integrationChecks: "auto", python: "auto", ...o.config }) }),
+    ledger: () => stub<LedgerV1>({
+      planId: "plan", integration: stub<LedgerV1["integration"]>({ worktree: nodePath.resolve("/integration") }),
+      config: stub<LedgerV1["config"]>({ integrationChecks: "auto", python: "auto", ...o.config }),
+    }),
     pool, git, igit, resolver,
     spawn: async (c, opts) => {
       spawned.push({ c, cwd: opts.cwd, low: opts.lowPriority });
@@ -958,7 +1011,8 @@ describe("integration checks: run", () => {
     expect(acquired[0]).toMatchObject({ max: 2, waitMs: 2000, meta: { cwd: "/slot", command: "integration checks" } });
     const input = captured.input;
     expect(input).toMatchObject({ command: "npm test", cwd: "/slot", budget: { maxWorkers: 2 } });
-    expect(input?.changedFiles).toEqual([{ path: nodePath.join("/slot", "src/a.ts"), status: "M" }, { path: nodePath.join("/slot", "extra.test.ts") }]);
+    // QA-3.2-6: the regression files are judged by the regression component only, not added to the scoped tests.
+    expect(input?.changedFiles).toEqual([{ path: nodePath.join("/slot", "src/a.ts"), status: "M" }]);
   });
 
   it("a pytest component is planned under its own label", async () => {
@@ -996,6 +1050,100 @@ describe("integration checks: run", () => {
   });
 });
 
+describe("integration checks: revert regression (QA-3.2-6)", () => {
+  const X = "t.test.ts > x", OTHER = "t.test.ts > other";
+  const ciFile = nodePath.resolve("/ci", "t.test.ts");
+  // Re-rooted under the check's slot path ("/slot", joined as given).
+  const here = nodePath.join("/slot", "t.test.ts");
+  const extra = (o: Partial<NonNullable<CheckRequest["extra"]>> = {}) => ({ extra: { ids: [X], files: [ciFile], commands: [cmd], ...o } });
+
+  function regressionEnv(results: VerifyResult[], spawn?: ChecksOpts["spawn"]) {
+    const planned: Array<readonly string[]> = [];
+    let n = 0;
+    runnerHooks.detectRunner = async () => detected;
+    runnerHooks.planRerun = async (_r, files) => { planned.push(files); return scoped({ mode: "rerun", args: ["rr"] }); };
+    runnerHooks.readResult = async () => results[n++] ?? report();
+    return { ...checksEnv(spawn === undefined ? {} : { spawn }), planned };
+  }
+
+  it("reruns only the regression files, re-rooted from the ci slot, and ignores failures of other ids", async () => {
+    const env = regressionEnv([report({ failingIds: [OTHER], failingFiles: [here] })], () => noneOut(1));
+    const r = await env.checks.run(checkReq(extra()));
+    expect(r).toMatchObject({ verdict: "pass", components: [{ name: "regression", label: "npm test", scope: "rerun", exitCode: 1 }] });
+    expect(env.planned).toEqual([[here]]);
+    expect(env.spawned.map(s => s.c.args)).toEqual([["rr"]]);
+  });
+
+  it("a regression id that still fails makes the revert insufficient, naming only the regression ids", async () => {
+    const env = regressionEnv([report({ failingIds: [OTHER, X], failingFiles: [here] })], () => noneOut(1, { stdout: "still" }));
+    expect(await env.checks.run(checkReq(extra()))).toMatchObject({ verdict: "fail", failingIds: [X], failingFiles: [here], flakyIds: [], output: "still" });
+  });
+
+  it("a timeout or a collection error in the regression files fails with every regression id", async () => {
+    for (const [res, out] of [[report(), noneOut(null, { timedOut: true })], [report({ collectionError: true, failingIds: ["t.test.ts"] }), noneOut(1)]] as const) {
+      const env = regressionEnv([res], () => out);
+      expect(await env.checks.run(checkReq(extra()))).toMatchObject({ verdict: "fail", failingIds: [X] });
+    }
+  });
+
+  it("an incomplete rerun falls back to the whole command, judged by the ids its output names", async () => {
+    const cases: Array<{ full: CommandOutput; verdict: string; ids?: string[] }> = [
+      { full: noneOut(0), verdict: "pass" },
+      { full: noneOut(1, { stdout: ` FAIL  ${OTHER}\n Tests  1 failed (1)\n` }), verdict: "pass" },
+      { full: noneOut(1, { stdout: ` FAIL  ${X}\n Tests  1 failed (1)\n` }), verdict: "fail", ids: [X] },
+      { full: noneOut(1, { stdout: "unparsed" }), verdict: "fail", ids: [X] },
+    ];
+    for (const c of cases) {
+      const env = regressionEnv([report({ complete: false })], (_c, _o, k) => (k === 1 ? noneOut(0) : c.full));
+      const r = await env.checks.run(checkReq(extra()));
+      expect(r).toMatchObject(c.ids === undefined ? { verdict: c.verdict } : { verdict: c.verdict, failingIds: c.ids });
+      expect(env.spawned.map(s => s.c.args)).toEqual([["rr"], ["test"]]);
+      if (r.verdict !== "error") expect(r.components.at(-1)).toMatchObject({ name: "regression", scope: "full" });
+    }
+  });
+
+  it("regression files gone at the revert pass; an unverifiable runner or a non-test command runs the whole command", async () => {
+    const detectedFor: string[] = [];
+    runnerHooks.detectRunner = async command => { detectedFor.push(command); return detected; };
+    runnerHooks.planRerun = async () => noAffected;
+    const py: ResolvedCommand = { label: "python -m pytest", file: "python", args: ["-m", "pytest"], source: "pytest", ref: null };
+    const gone = checksEnv();
+    expect(await gone.checks.run(checkReq(extra({ commands: [cmd, py] })))).toMatchObject({
+      verdict: "pass", components: [{ name: "regression", label: "no affected tests", scope: "no-affected" }, { name: "regression", scope: "no-affected" }],
+    });
+    expect(gone.spawned).toHaveLength(0);
+    expect(detectedFor).toEqual(["npm test", "python -m pytest"]);
+    runnerHooks.detectRunner = async () => unverifiable;
+    const blind = checksEnv({ spawn: () => noneOut(1, { stdout: ` FAIL  ${OTHER}\n Tests  1 failed (1)\n` }) });
+    expect(await blind.checks.run(checkReq(extra()))).toMatchObject({ verdict: "pass", components: [{ name: "regression", scope: "full" }] });
+    runnerHooks.detectRunner = async () => { throw new Error("a non-test command is never planned"); };
+    const script: ResolvedCommand = { label: "suite", file: "npm", args: ["run", "suite"], source: "run-command", ref: { script: "suite", args: [] } };
+    const other = checksEnv({ spawn: () => noneOut(1, { stdout: ` FAIL  ${X}\n Tests  1 failed (1)\n` }) });
+    expect(await other.checks.run(checkReq(extra({ commands: [script] })))).toMatchObject({ verdict: "fail", failingIds: [X] });
+    expect(other.spawned.map(s => s.c.label)).toEqual(["suite"]);
+  });
+
+  it("re-roots ci-slot and integration-worktree paths, joins relative ones and keeps unknown absolute ones", async () => {
+    const env = regressionEnv([report()], () => noneOut(0));
+    const stray = nodePath.resolve("/elsewhere", "u.test.ts");
+    const files = [ciFile, nodePath.resolve("/integration", "sub", "i.test.ts"), "rel.test.ts", stray, nodePath.resolve("/ci")];
+    expect(await env.checks.run(checkReq(extra({ files })))).toMatchObject({ verdict: "pass" });
+    expect(env.planned).toEqual([[here, nodePath.join("/slot", "sub", "i.test.ts"), nodePath.join("/slot", "rel.test.ts"), stray, nodePath.resolve("/ci")]]);
+  });
+
+  it("regression ids without commands rerun with this commit's test commands, or fail closed without any", async () => {
+    const env = regressionEnv([report()], () => noneOut(0));
+    runnerHooks.planScopedRun = async () => noAffected;
+    const withTests = checksEnv({ files: { "package.json": JSON.stringify({ scripts: { test: "vitest run" } }) } });
+    const r = await withTests.checks.run(checkReq(extra({ commands: [] })));
+    expect(r).toMatchObject({ verdict: "pass" });
+    if (r.verdict === "pass") expect(r.components.map(c => `${c.name}:${c.label}`)).toEqual(["tests:no affected tests", "regression:test"]);
+    expect(await env.checks.run(checkReq(extra({ commands: [] })))).toMatchObject({
+      verdict: "error", reason: "resolve", message: "the regression ids have no test command to rerun them",
+    });
+  });
+});
+
 describe("integration checks: tests component", () => {
   const PKG_TEST = { "package.json": JSON.stringify({ scripts: { test: "vitest run" } }) };
   const f1 = "a.test.ts > s > one", f2 = "b.py::C::two";
@@ -1022,28 +1170,47 @@ describe("integration checks: tests component", () => {
     expect(spawned[0]).toMatchObject({ cwd: "/slot/pkg", c: { file: "node", args: ["vitest", "run"], env: { A: "1" }, cwd: "/slot/pkg" } });
   });
 
-  it("an incomplete, timed out, colliding or id-less failure fails without a confirmation rerun", async () => {
+  it("a timed out or colliding scoped failure is final: no confirmation rerun, no full run", async () => {
     let reruns = 0;
     runnerHooks.planScopedRun = async () => scoped();
     runnerHooks.detectRunner = async () => { reruns++; return detected; };
     const cases: Array<{ out: CommandOutput; res: VerifyResult; ids: string[]; files: string[] }> = [
-      { out: noneOut(0), res: report({ complete: false }), ids: [], files: [] },
       { out: noneOut(null, { timedOut: true }), res: report({ failingIds: ["a"], failingFiles: ["/slot/a"] }), ids: ["a"], files: ["/slot/a"] },
       { out: noneOut(1), res: report({ failingIds: ["a"], failingFiles: ["/slot/a"], collectionError: true }), ids: ["a"], files: ["/slot/a"] },
-      { out: noneOut(1), res: report(), ids: [], files: [] },
-      { out: noneOut(1), res: report({ failingIds: ["a"] }), ids: ["a"], files: [] },
     ];
     for (const c of cases) {
       runnerHooks.readResult = async () => c.res;
-      const { checks } = checksEnv({ files: PKG_TEST, spawn: () => ({ ...c.out, stdout: "so", stderr: "se" }) });
+      const { checks, spawned } = checksEnv({ files: PKG_TEST, spawn: () => ({ ...c.out, stdout: "so", stderr: "se" }) });
       const r = await checks.run(checkReq());
       expect(r).toMatchObject({ verdict: "fail", failingIds: c.ids, failingFiles: c.files, flakyIds: [], output: "sose" });
+      expect(spawned).toHaveLength(1);
     }
     expect(reruns).toBe(0);
   });
 
+  it("QA-3.2-7: an incomplete or id-less scoped report never blames: the full command decides", async () => {
+    runnerHooks.planScopedRun = async () => scoped();
+    runnerHooks.detectRunner = async () => { throw new Error("no confirmation rerun of an unparsed full failure"); };
+    // exit 0 with an incomplete report: the full command passes, so the check passes (it used to fail the task).
+    runnerHooks.readResult = async () => report({ complete: false, failingIds: ["partial"] });
+    const a = checksEnv({ files: PKG_TEST, spawn: (_c, _o, k) => (k === 1 ? noneOut(0) : noneOut(0, { stdout: "full ok" })) });
+    const ra = await a.checks.run(checkReq());
+    expect(ra).toMatchObject({ verdict: "pass", components: [{ name: "tests", label: "test", scope: "full", exitCode: 0 }] });
+    expect(a.spawned.map(s => s.c.args)).toEqual([["vitest", "run"], ["run", "test"]]);
+    // A failing scoped run whose report names no id (incomplete or not): the full command fails too, unparsed.
+    for (const res of [report({ complete: false }), report()]) {
+      runnerHooks.readResult = async () => res;
+      const b = checksEnv({ files: PKG_TEST, spawn: (_c, _o, k) => (k === 1 ? noneOut(1) : noneOut(1, { stdout: "so", stderr: "se" })) });
+      expect(await b.checks.run(checkReq())).toMatchObject({ verdict: "fail", failingIds: [], failingFiles: [], flakyIds: [], output: "sose" });
+      expect(b.spawned).toHaveLength(2);
+    }
+  });
+
   /** First run fails ids [f1, f2]; the rerun is scripted. */
-  function rerunEnv(second: { out: CommandOutput; res: VerifyResult }, o: { runner?: DetectedRunner | Unverifiable; rerun?: ScopedSpec | NoAffected | Unverifiable } = {}) {
+  function rerunEnv(
+    second: { out: CommandOutput; res: VerifyResult },
+    o: { runner?: DetectedRunner | Unverifiable; rerun?: ScopedSpec | NoAffected | Unverifiable; full?: CommandOutput } = {},
+  ) {
     const results = [report({ failingIds: [f1, f2], failingFiles: ["/slot/a.test.ts", "/slot/b.py"] }), second.res];
     let n = 0;
     const planned: Array<{ files: readonly string[]; command: string }> = [];
@@ -1052,7 +1219,8 @@ describe("integration checks: tests component", () => {
     runnerHooks.detectRunner = async command => { planned.push({ files: [], command }); return o.runner ?? detected; };
     runnerHooks.planRerun = async (_runner, files) => { planned.push({ files, command: "rerun" }); return o.rerun ?? scoped({ mode: "rerun", args: ["rerun"], env: { B: "2" }, cwd: "/slot/rr" }); };
     const env = checksEnv({
-      files: PKG_TEST, spawn: (_c, _o, k) => (k === 1 ? noneOut(1, { stdout: "first" }) : { ...second.out, stdout: "second" }),
+      files: PKG_TEST,
+      spawn: (_c, _o, k) => (k === 1 ? noneOut(1, { stdout: "first" }) : k === 2 ? { ...second.out, stdout: "second" } : (o.full ?? noneOut(0))),
     });
     return { ...env, planned };
   }
@@ -1070,7 +1238,8 @@ describe("integration checks: tests component", () => {
   it("only the ids that fail again are failing; the others are flaky", async () => {
     const { checks } = rerunEnv({ out: noneOut(1), res: report({ failingIds: [f1], failingFiles: ["/slot/a.test.ts"] }) });
     const r = await checks.run(checkReq());
-    expect(r).toMatchObject({ verdict: "fail", failingIds: [f1], failingFiles: ["/slot/a.test.ts"], flakyIds: [f2], output: "second" });
+    // failingFiles are the first failure's files (the dead conditional of round 1 is gone).
+    expect(r).toMatchObject({ verdict: "fail", failingIds: [f1], failingFiles: ["/slot/a.test.ts", "/slot/b.py"], flakyIds: [f2], output: "second" });
     if (r.verdict !== "fail") return;
     expect(r.components).toMatchObject([{ scope: "rerun", flakyIds: [f2] }]);
   });
@@ -1078,13 +1247,53 @@ describe("integration checks: tests component", () => {
   it("a rerun that fails without naming ids keeps every original id failing", async () => {
     const { checks } = rerunEnv({ out: noneOut(1), res: report() });
     const r = await checks.run(checkReq());
-    expect(r).toMatchObject({ verdict: "fail", failingIds: [f1, f2], failingFiles: [], flakyIds: [] });
+    expect(r).toMatchObject({ verdict: "fail", failingIds: [f1, f2], failingFiles: ["/slot/a.test.ts", "/slot/b.py"], flakyIds: [] });
   });
 
-  it("a rerun with a collection error is not a confirmation of a pass", async () => {
-    const { checks } = rerunEnv({ out: noneOut(0), res: report({ failingIds: [f2], failingFiles: ["/slot/b.py"], collectionError: true }) });
+  it("a rerun with a collection error or a timeout clears no id", async () => {
+    for (const out of [noneOut(0), noneOut(null, { timedOut: true })]) {
+      const collection = out.timedOut ? false : true;
+      const { checks } = rerunEnv({ out, res: report({ failingIds: [f2], failingFiles: ["/slot/b.py"], collectionError: collection }) });
+      const r = await checks.run(checkReq());
+      expect(r).toMatchObject({ verdict: "fail", failingIds: [f1, f2], flakyIds: [], output: "second" });
+    }
+  });
+
+  it("QA-3.2-7: an incomplete rerun with exit 0 is no pass; the full command is the second observation", async () => {
+    // Full command passes: every id is flaky.
+    const pass = rerunEnv({ out: noneOut(0), res: report({ complete: false }) });
+    const rp = await pass.checks.run(checkReq());
+    expect(rp).toMatchObject({ verdict: "pass", flakyIds: [f1, f2] });
+    if (rp.verdict === "pass") expect(rp.components).toMatchObject([{ name: "tests", scope: "full", flakyIds: [f1, f2] }]);
+    expect(pass.spawned.map(s => s.c.args)).toEqual([["vitest", "run"], ["rerun"], ["run", "test"]]);
+    // Full command fails naming f1 with a complete inventory: f1 is confirmed, f2 flaky.
+    const named = rerunEnv({ out: noneOut(0), res: report({ complete: false }) }, { full: noneOut(1, { stdout: ` FAIL  ${f1}\n Tests  1 failed | 3 passed (4)\n` }) });
+    const rn = await named.checks.run(checkReq());
+    expect(rn).toMatchObject({ verdict: "fail", failingIds: [f1], flakyIds: [f2], failingFiles: ["/slot/a.test.ts", "/slot/b.py"] });
+    // Full command fails without a usable inventory: nothing is cleared.
+    const blind = rerunEnv({ out: noneOut(0), res: report({ complete: false }) }, { full: noneOut(1, { stdout: "boom" }) });
+    expect(await blind.checks.run(checkReq())).toMatchObject({ verdict: "fail", failingIds: [f1, f2], flakyIds: [], output: "boom" });
+  });
+
+  it("QA-3.2-1/-7: a full run's failure names its ids from the output and gets the confirmation rerun", async () => {
+    runnerHooks.planScopedRun = async () => unverifiable;
+    runnerHooks.detectRunner = async () => detected;
+    const planned: Array<readonly string[]> = [];
+    runnerHooks.planRerun = async (_r, files) => { planned.push(files); return scoped({ mode: "rerun", args: ["rerun"] }); };
+    runnerHooks.readResult = async () => report({ failingIds: [f1], failingFiles: ["/slot/a.test.ts"] });
+    const out = ` FAIL  ${f1}\nFAILED ${f2} - assert 1 == 2\n Tests  2 failed | 9 passed (11)\n`;
+    const { checks, spawned } = checksEnv({ files: PKG_TEST, spawn: (_c, _o, k) => (k === 1 ? noneOut(1, { stdout: out }) : noneOut(1, { stdout: "again" })) });
     const r = await checks.run(checkReq());
-    expect(r).toMatchObject({ verdict: "fail", failingIds: [f2], failingFiles: ["/slot/b.py"], flakyIds: [f1] });
+    expect(r).toMatchObject({ verdict: "fail", failingIds: [f1], flakyIds: [f2], output: "again" });
+    expect(spawned.map(s => s.c.args)).toEqual([["run", "test"], ["rerun"]]);
+    expect(planned).toEqual([[nodePath.resolve("/slot", "a.test.ts"), nodePath.resolve("/slot", "b.py")]]);
+  });
+
+  it("QA-3.2-1: a full run's failure with an incomplete inventory is final, with the ids it names", async () => {
+    runnerHooks.planScopedRun = async () => unverifiable;
+    runnerHooks.detectRunner = async () => { throw new Error("no confirmation of a partial inventory"); };
+    const { checks } = checksEnv({ files: PKG_TEST, spawn: () => noneOut(1, { stdout: ` FAIL  ${f1}\n Tests  3 failed (3)\n` }) });
+    expect(await checks.run(checkReq())).toMatchObject({ verdict: "fail", failingIds: [f1], failingFiles: [nodePath.resolve("/slot", "a.test.ts")], flakyIds: [] });
   });
 
   it("without a rerunnable runner the first failure stands", async () => {
@@ -1096,7 +1305,7 @@ describe("integration checks: tests component", () => {
     }
   });
 
-  it("ids of every shape name their test file (the rerun fails with a mix of ids)", async () => {
+  it("ids of every shape stay failing with the first failure's files (the rerun fails with a mix of ids)", async () => {
     const ids = ["a.test.ts > s", "b.py::C::t", "bare.test.ts", "c.py::T > odd"];
     runnerHooks.planScopedRun = async () => scoped();
     runnerHooks.detectRunner = async () => detected;
@@ -1105,7 +1314,7 @@ describe("integration checks: tests component", () => {
     runnerHooks.readResult = async () => (n++ === 0 ? report({ failingIds: ids, failingFiles: ["/slot/x"] }) : report({ failingIds: ids, failingFiles: ["/slot/y"] }));
     const { checks } = checksEnv({ files: PKG_TEST, spawn: () => noneOut(1) });
     const r = await checks.run(checkReq());
-    expect(r).toMatchObject({ verdict: "fail", failingIds: ids, failingFiles: ["/slot/y"], flakyIds: [] });
+    expect(r).toMatchObject({ verdict: "fail", failingIds: ids, failingFiles: ["/slot/x"], flakyIds: [] });
   });
 });
 
@@ -1183,12 +1392,45 @@ describe("integration checks: verification slot (M12)", () => {
     expect(rel).toEqual(["h"]);
   });
 
-  it("a handle that reports itself lost without the callback is an interrupted run", async () => {
+  it("a handle that reports itself lost without the callback is a slot-lost run", async () => {
     const rel: string[] = [];
     const lost: SlotHandle = { lost: true, release: async () => { rel.push("l"); } };
     const { checks } = checksEnv({ config: lintCfg, acquire: () => lost });
-    expect(await checks.run(checkReq())).toMatchObject({ verdict: "error", reason: "interrupted", message: "the run was aborted" });
+    expect(await checks.run(checkReq())).toMatchObject({ verdict: "error", reason: "slot-lost", message: "the verification slot was reclaimed while held" });
     expect(rel).toEqual(["l"]);
+  });
+
+  it("QA-3.2-13: an abort during the checks is interrupted, never the verdict the killed run produced", async () => {
+    const ac = new AbortController();
+    const rel: string[] = [];
+    const failing = checksEnv({ config: lintCfg, acquire: () => okHandle(rel), spawn: () => { ac.abort(); return noneOut(1, { stdout: "killed" }); } });
+    expect(await failing.checks.run(checkReq({ signal: ac.signal }))).toMatchObject({ verdict: "error", reason: "interrupted", message: "the run was aborted" });
+    expect(rel).toEqual(["h"]);
+    // The outer abort wins over a lost slot and a preemption that fired with it.
+    const bc = new AbortController();
+    let onLost: (() => void) | undefined;
+    const both = checksEnv({ config: lintCfg, acquire: o => { onLost = o.onLost; return okHandle([]); }, spawn: () => { onLost?.(); bc.abort(); return noneOut(0); } });
+    expect(await both.checks.run(checkReq({ signal: bc.signal }))).toMatchObject({ verdict: "error", reason: "interrupted" });
+    // A passing run that was aborted is not a pass either (runCommands too).
+    const cc = new AbortController();
+    const passing = checksEnv({ spawn: () => { cc.abort(); return noneOut(0); } });
+    const r = await passing.checks.runCommands({ slot, commit: "c", commands: [cmd], mode: "full", priority: "background", signal: cc.signal, prepare: false });
+    expect(r).toMatchObject({ verdict: "error", error: { reason: "interrupted", message: "the run was aborted" } });
+  });
+
+  it("a child killed by a fired signal rejects: that is the signal's outcome, not a spawn error", async () => {
+    const ac = new AbortController();
+    const aborted = checksEnv({ config: lintCfg, spawn: () => { ac.abort(); throw new Error("killed"); } });
+    expect(await aborted.checks.run(checkReq({ signal: ac.signal }))).toMatchObject({ verdict: "error", reason: "interrupted" });
+    const bg = new BackgroundRuns();
+    const preempted = checksEnv({ config: lintCfg, background: bg, spawn: () => { bg.preemptOne(); throw new Error("killed"); } });
+    expect(await preempted.checks.run(checkReq({ priority: "background" }))).toMatchObject({ verdict: "error", reason: "preempted" });
+    let onLost: (() => void) | undefined;
+    const lost = checksEnv({ config: lintCfg, acquire: o => { onLost = o.onLost; return okHandle([]); }, spawn: () => { onLost?.(); throw new Error("killed"); } });
+    expect(await lost.checks.run(checkReq())).toMatchObject({ verdict: "error", reason: "slot-lost" });
+    const gone: SlotHandle = { lost: true, release: async () => undefined };
+    const lostHandle = checksEnv({ config: lintCfg, acquire: () => gone, spawn: () => { throw new Error("killed"); } });
+    expect(await lostHandle.checks.run(checkReq())).toMatchObject({ verdict: "error", reason: "slot-lost" });
   });
 
   it("a background run preempted by a foreground check reports preempted", async () => {
@@ -1379,11 +1621,49 @@ describe("integration checks: runCommands", () => {
     expect(await a.checks.runCommands(cmdReq({ mode: { rerun: ["t"] } }))).toMatchObject({ verdict: "fail", ids: [], idsUnparsed: true });
     runnerHooks.readResult = async () => report({ failingIds: ["a"], failingFiles: ["/slot/a"] });
     const b = checksEnv({ spawn: () => noneOut(0, { timedOut: true }) });
-    expect(await b.checks.runCommands(cmdReq({ mode: { rerun: ["t"] } }))).toMatchObject({ verdict: "fail", ids: ["a"], idsUnparsed: false });
+    // A timed out run's inventory is partial whatever its report says.
+    expect(await b.checks.runCommands(cmdReq({ mode: { rerun: ["t"] } }))).toMatchObject({ verdict: "fail", ids: ["a"], idsUnparsed: true });
     runnerHooks.planRerun = async () => noAffected;
     const c = checksEnv();
     expect(await c.checks.runCommands(cmdReq({ mode: { rerun: ["t"] } }))).toMatchObject({ verdict: "pass" });
     expect(c.spawned).toHaveLength(0);
+  });
+
+  it("QA-3.2-1 (3): a rerun with exit 0 but an incomplete report is no pass: the full command decides", async () => {
+    runnerHooks.detectRunner = async () => detected;
+    runnerHooks.planRerun = async () => scoped({ mode: "rerun", args: ["rr"] });
+    for (const res of [report({ complete: false }), report({ collectionError: true })]) {
+      runnerHooks.readResult = async () => res;
+      const pass = checksEnv({ spawn: () => noneOut(0) });
+      expect(await pass.checks.runCommands(cmdReq({ mode: { rerun: ["a.test.ts > x"] } }))).toMatchObject({ verdict: "pass", idsUnparsed: false });
+      expect(pass.spawned.map(s => s.c.args)).toEqual([["rr"], ["test"]]);
+    }
+    runnerHooks.readResult = async () => report({ complete: false });
+    const fail = checksEnv({ spawn: (_c, _o, k) => (k === 1 ? noneOut(0) : noneOut(1, { stdout: " FAIL  a.test.ts > x\n Tests  1 failed (1)\n" })) });
+    expect(await fail.checks.runCommands(cmdReq({ mode: { rerun: ["a.test.ts > x"] } }))).toMatchObject({
+      verdict: "fail", ids: ["a.test.ts > x"], files: [nodePath.resolve("/slot", "a.test.ts")], idsUnparsed: false,
+    });
+    // A failing rerun whose report names no id falls back too.
+    runnerHooks.readResult = async () => report();
+    const blind = checksEnv({ spawn: () => noneOut(1, { stdout: "x" }) });
+    expect(await blind.checks.runCommands(cmdReq({ mode: { rerun: ["a.test.ts > x"] } }))).toMatchObject({ verdict: "fail", ids: [], idsUnparsed: true });
+    expect(blind.spawned).toHaveLength(2);
+  });
+
+  it("QA-3.2-1 (1): a full run names its failing ids from the output of every failing test command", async () => {
+    const vitestOut = " FAIL  test/a.test.ts > s > one\n FAIL  test/a.test.ts > s > two\n Tests  2 failed | 5 passed (7)\n";
+    const pytestOut = "FAILED tests/test_b.py::T::t - assert 0\n===== 1 failed, 3 passed in 0.1s =====\n";
+    const { checks, spawned } = checksEnv({ spawn: c => (c.source === "pytest" ? noneOut(1, { stdout: pytestOut }) : noneOut(1, { stdout: vitestOut })) });
+    const r = await checks.runCommands(cmdReq({ commands: [testCmd, pyCmd], priority: "background" }));
+    expect(r).toMatchObject({
+      verdict: "fail", idsUnparsed: false, output: pytestOut,
+      ids: ["test/a.test.ts > s > one", "test/a.test.ts > s > two", "tests/test_b.py::T::t"],
+      files: [nodePath.resolve("/slot", "test/a.test.ts"), nodePath.resolve("/slot", "tests/test_b.py")].sort(),
+    });
+    expect(spawned).toHaveLength(2);
+    // An inventory that does not add up (3 failed, 1 named) is unparsed, with the ids it names.
+    const partial = checksEnv({ spawn: () => noneOut(1, { stdout: " FAIL  test/a.test.ts > s > one\n Tests  3 failed (3)\n" }) });
+    expect(await partial.checks.runCommands(cmdReq())).toMatchObject({ verdict: "fail", ids: ["test/a.test.ts > s > one"], idsUnparsed: true });
   });
 
   it("an unverifiable runner falls back to running the command as it is", async () => {
@@ -1458,18 +1738,40 @@ describe("phase suite runner: run", () => {
     expect(log.order.at(-1)).toBe("start:suite-rerun");
   });
 
-  it("an unparsed failure at the base is unattributed (no-base) with a memo step", async () => {
+  it("an unparsed failure at the base is unattributed (base-unparsed) with a memo step", async () => {
     const { runner } = suiteEnv({ runCommands: byCommit({ c3: failRes(["x"]), c0: runRes("fail", { idsUnparsed: true, output: "o" }) }) });
     const { j, log } = journalOf();
-    expect(await runner.run(suiteReq(), j)).toEqual({ kind: "unattributed", ids: ["x"], reason: "no-base" });
+    expect(await runner.run(suiteReq(), j)).toEqual({ kind: "unattributed", ids: ["x"], reason: "base-unparsed" });
     expect(log.ends.at(-1)).toMatchObject({ result: "failed", ids: ["x"] });
     expect(log.order.at(-1)).toBe("start:bisect");
   });
 
-  it("an unattributable failure that also fails at the base is pre-existing with no ids", async () => {
-    const { runner } = suiteEnv({ runCommands: () => runRes("fail", { idsUnparsed: true }) });
-    const { j } = journalOf();
-    expect(await runner.run(suiteReq(), j)).toEqual({ kind: "pre-existing", ids: [] });
+  it("QA-3.2-1 (2): an unattributable failure that also fails at the base fails closed: unattributed, never pre-existing", async () => {
+    const { runner, requests } = suiteEnv({ runCommands: () => runRes("fail", { idsUnparsed: true, output: "o" }) });
+    const { j, log } = journalOf();
+    // reason: the unattributed base label `base-unparsed` (queue.ts's SuiteVerdict).
+    expect(await runner.run(suiteReq(), j)).toEqual({ kind: "unattributed", ids: [], reason: "base-unparsed" });
+    expect(requests.map(r => `${r.commit}:${typeof r.mode === "string" ? r.mode : "rerun"}`)).toEqual(["c3:full", "c3:full", "c3:full", "c0:full"]);
+    expect(log.ends.at(-1)).toMatchObject({ result: "failed", ids: [], detail: { output: "o" } });
+    expect(log.order.slice(-2)).toEqual(["end:failed", "start:bisect"]);
+    expect(log.starts.at(-1)?.detail).toMatchObject({ probe: "memo" });
+  });
+
+  it("QA-3.2-1: a full run that names its ids is attributable end to end: reruns, base and bisect use the ids", async () => {
+    // The full run's ids now come from its output (checks.runCommands); the suite carries them to the culprit.
+    const { runner, requests } = suiteEnv({
+      runCommands: byCommit({ c3: failRes(["t > x"], { files: ["/ci/t.test.ts"] }), c2: failRes(["t > x"], { files: ["/ci/t.test.ts"] }) }),
+      igit: { revList: async () => ["c1", "c2", "c3"] },
+    });
+    const { j, log } = journalOf();
+    expect(await runner.run(suiteReq(), j)).toEqual({ kind: "culprit", range: { taskId: "T2", from: "c1", to: "c2" }, ids: ["t > x"], files: ["/ci/t.test.ts"] });
+    expect(log.ends[0]).toMatchObject({ result: "failed", ids: ["t > x"], detail: { idsUnparsed: false } });
+    expect(requests.slice(1).every(r => typeof r.mode !== "string" && r.mode.rerun[0] === "/ci/t.test.ts")).toBe(true);
+  });
+
+  it("a failing rerun that names none of the original ids clears none of them (fail closed)", async () => {
+    const { runner } = suiteEnv({ runCommands: (_r, n) => (n === 1 ? failRes(["a"]) : failRes(["other form of a"])) });
+    expect(await runner.run(suiteReq({ base: null }), journalOf().j)).toEqual({ kind: "unattributed", ids: ["a"], reason: "no-base" });
   });
 
   it("bisects to the culprit range, probing only the regression ids and never the known base", async () => {
@@ -1780,5 +2082,73 @@ describe("BackgroundRuns preemption budget (M12, M38)", () => {
 
   it("PREEMPT_LIMIT is 3", () => {
     expect(PREEMPT_LIMIT).toBe(3);
+    expect(PREEMPT_BUDGET).toBe(PREEMPT_LIMIT);
+  });
+
+  it("QA-3.2-8: a shared budget spans registrations, so a suite entry is preempted at most PREEMPT_BUDGET times", () => {
+    const runs = new BackgroundRuns();
+    const budget: PreemptBudget = { left: PREEMPT_BUDGET };
+    let preempted = 0;
+    // Each run of the entry (full, reruns, base, probes, retries after a preemption) registers anew with the budget.
+    for (let k = 0; k < 6; k++) {
+      const c = new AbortController();
+      const off = runs.register(c, budget);
+      if (runs.preemptOne()) preempted++;
+      expect(c.signal.aborted).toBe(k < PREEMPT_BUDGET);
+      off();
+    }
+    expect(preempted).toBe(PREEMPT_BUDGET);
+    expect(budget.left).toBe(0);
+  });
+
+  it("QA-3.2-8: runCommands registers with the request's budget; without one a run gets a fresh budget", async () => {
+    const bg = new BackgroundRuns();
+    const budget: PreemptBudget = { left: 1 };
+    const seen: boolean[] = [];
+    const { checks } = checksEnv({ background: bg, spawn: () => { seen.push(bg.preemptOne()); return noneOut(0); } });
+    const req: CommandRunRequest = { slot, commit: "c", commands: [cmd], mode: "full", priority: "background", signal: new AbortController().signal, prepare: false, preempt: budget };
+    expect(await checks.runCommands(req)).toMatchObject({ verdict: "error", error: { reason: "preempted" } });
+    // The budget is spent: the next run of the entry is not preempted and completes.
+    expect(await checks.runCommands(req)).toMatchObject({ verdict: "pass" });
+    expect(seen).toEqual([true, false]);
+    expect(budget.left).toBe(0);
+    const fresh: CommandRunRequest = { slot, commit: "c", commands: [cmd], mode: "full", priority: "background", signal: new AbortController().signal, prepare: false };
+    expect(await checks.runCommands(fresh)).toMatchObject({ verdict: "error", error: { reason: "preempted" } });
+  });
+
+  it("QA-3.2-8: every run of one suite entry carries the same budget; another entry gets its own", async () => {
+    const { runner, requests } = suiteEnv({ runCommands: (_r, n) => (n === 1 ? failRes(["a"]) : runRes("pass")) });
+    await runner.run(suiteReq(), journalOf().j);
+    const first = requests[0]?.preempt;
+    expect(first).toEqual({ left: PREEMPT_BUDGET });
+    expect(requests.length).toBeGreaterThan(1);
+    expect(requests.every(r => r.preempt === first)).toBe(true);
+    await runner.run(suiteReq(), journalOf().j);
+    expect(requests.at(-1)?.preempt).not.toBe(first);
+  });
+});
+
+describe("QA-3.2 round 1: suite helpers", () => {
+  it("observeFull reads vitest, pytest and jest ids, resolves their files and reports completeness", () => {
+    const out = (stdout: string, exitCode: number | null = 1): CommandOutput => ({ exitCode, timedOut: false, stdout, stderr: "", durationMs: 1 });
+    expect(observeFull(out("no ids here"), "/slot")).toBeNull();
+    expect(observeFull(out(" FAIL  a.test.ts > s > t\n Tests  1 failed (1)\n"), "/slot")).toEqual({
+      ids: ["a.test.ts > s > t"], files: [nodePath.resolve("/slot", "a.test.ts")], complete: true,
+    });
+    const py = observeFull({ ...out(""), exitCode: null, stderr: "FAILED t/b.py::C::x - e\nFAILED t/b.py::C::y\n= 3 failed =\n" }, "/slot");
+    expect(py).toEqual({ ids: ["t/b.py::C::x", "t/b.py::C::y"], files: [nodePath.resolve("/slot", "t/b.py")], complete: false });
+  });
+
+  it("interruptedBy reads dispose from the abort reason (string or E_DISPOSED), else abort", () => {
+    const by = (reason?: unknown) => {
+      const c = new AbortController();
+      c.abort(reason);
+      return interruptedBy({ signal: c.signal });
+    };
+    expect(by("dispose")).toBe("dispose");
+    expect(by(new ExecutorError("E_DISPOSED", "disposed"))).toBe("dispose");
+    expect(by("abort")).toBe("abort");
+    expect(by()).toBe("abort");
+    expect(by(new ExecutorError("E_PLAN_STATE", "x"))).toBe("abort");
   });
 });

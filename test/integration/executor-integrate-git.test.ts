@@ -16,12 +16,13 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
-  COMMIT_SUBJECT_PATTERN, createGitOps, createGitRunner, formatCommitMessage, integrationBranchName, taskBranchName, type GitOps,
+  COMMIT_SUBJECT_PATTERN, createGitOps, createGitRunner, formatCommitMessage, integrationBranchName, phaseTagName, taskBranchName, type GitOps,
 } from "../../src/executor/git";
 import {
   createIntegrateGit, createIntegrationChecks, createWriteGuard, BackgroundRuns,
   type CommandRunner, type IntegrateGit, type IntegrationChecks, type ResolvedCommand, type RunResolver, type WriteGuard,
 } from "../../src/executor/integrate/checks";
+import { hardeningArgs } from "../../src/router/git-tools";
 import { maxRangeProbes } from "../../src/executor/integrate/bisect";
 import { createLander } from "../../src/executor/integrate/land";
 import { createPhaseSuiteRunner, revertMessage } from "../../src/executor/integrate/phase-suite";
@@ -512,12 +513,58 @@ describe("landing on real git (3.2.5)", SLOW, () => {
     expect(git(s.repo, "rev-parse", "main")).toBe(s.c0);
   });
 
-  it("the phase tag omr/<planId>/phase-<id> is created once; a second create is exists-same, a different commit exists-other", async () => {
+  // QA-3.2-12: an ignored file in a PARENT directory of a changed path is no overwrite risk (git only overwrites the exact path).
+  it("an ignored __pycache__/x.pyc under a parent directory of a changed file does not refuse a clean landing", async () => {
+    const s = landSetup("pycache", { "pkg/mod.py": "x = 1\n" });
+    writeFileSync(join(s.repo, ".git", "info", "exclude"), "__pycache__/\n");
+    mkdirSync(join(s.repo, "pkg", "__pycache__"), { recursive: true });
+    writeFileSync(join(s.repo, "pkg", "__pycache__", "x.pyc"), "bytecode\n");
+    expect(git(s.repo, "status", "--porcelain=v1", "--untracked-files=all")).toBe("");
+    expect(git(s.repo, "status", "--porcelain=v1", "--ignored", "--untracked-files=all")).toContain("pkg/__pycache__/x.pyc");
+    expect(await s.lander.inspect(s.req)).toEqual({ ok: true, baseTip: s.c0, noop: false });
+    expect(await s.lander.fastForward(s.req)).toEqual({ kind: "landed", from: s.c0, to: s.cand });
+    expect(git(s.repo, "rev-parse", "main")).toBe(s.cand);
+    expect(read(join(s.repo, "pkg", "mod.py"))).toBe("x = 1\n");
+    expect(read(join(s.repo, "pkg", "__pycache__", "x.pyc"))).toBe("bytecode\n");
+  });
+
+  // QA-3.2-17: the owner moved on after the landing; the base contains the candidate, which is a landed no-op, not "diverged".
+  it("landing when the base branch already contains the candidate is a no-op success", async () => {
+    const s = landSetup("contains");
+    expect(await s.lander.fastForward(s.req)).toEqual({ kind: "landed", from: s.c0, to: s.cand });
+    const moved = commitFiles(s.repo, "owner moved on after landing", { "owner.txt": "owner work\n" });
+    const before = ownerState(s.repo, "owner.txt");
+    expect(await s.lander.inspect(s.req)).toEqual({ ok: true, baseTip: moved, noop: true });
+    expect(await s.lander.fastForward(s.req)).toEqual({ kind: "landed", from: moved, to: s.cand });
+    expect(git(s.repo, "rev-parse", "main")).toBe(moved);
+    expect(ownerState(s.repo, "owner.txt")).toEqual(before);
+  });
+
+  // QA-3.2-20: the read probes in the owner checkout carry the hardening args (a configured core.fsmonitor must not run).
+  it("every read probe in the owner checkout passes the hardening args", async () => {
+    const s = landSetup("hardened");
+    const marker = join(base, "fsmonitor-ran-hardened.txt");
+    const hook = join(base, "fsmonitor-hook-hardened.js");
+    writeFileSync(hook, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran");\n`);
+    git(s.repo, "config", "core.fsmonitor", `"${process.execPath.replace(/\\/g, "/")}" "${hook.replace(/\\/g, "/")}"`);
+    s.env.gitCalls.length = 0;
+    expect(await s.lander.fastForward(s.req)).toEqual({ kind: "landed", from: s.c0, to: s.cand });
+    const probes = s.env.gitCalls.filter((c) => c.args[0] === "-C" && c.args.some((a) => ["status", "symbolic-ref", "rev-parse"].includes(a)));
+    expect(probes.some((c) => c.args.includes("status"))).toBe(true);
+    for (const c of probes) for (const a of hardeningArgs()) expect(c.args, `probe ${c.args.join(" ")}`).toContain(a);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it("the phase tag omr/<planId>/phase/<id> is created once; a second create is exists-same, a different commit exists-other", async () => {
     const s = landSetup("tag");
     await s.env.pool.open();
     const integration = await s.env.pool.acquireSpecial(PLAN, "integration");
     const name = s.lander.tagName(PLAN, "p1");
-    expect(name).toBe(`omr/${PLAN}/phase-p1`);
+    // QA-3.2-14: the encoded, case-fold-safe name of git.ts (not a second, unencoded scheme).
+    expect(name).toBe(phaseTagName(PLAN, "p1"));
+    expect(name).toBe(`omr/${PLAN}/phase/p1`);
+    expect(s.lander.tagName(PLAN, "P1")).toBe(`omr/${PLAN}/phase/p1_u1`);
+    expect(s.lander.tagName(PLAN, "P1").toLowerCase()).not.toBe(name.toLowerCase());
     expect(await s.lander.tag({ cwd: integration.path, name, commit: s.c0 })).toBe("created");
     expect(git(s.repo, "rev-parse", `refs/tags/${name}`)).toBe(s.c0);
     expect(await s.lander.tag({ cwd: integration.path, name, commit: s.c0 })).toBe("exists-same");
@@ -938,6 +985,10 @@ describe("the integration queue with the real LedgerStore on real git (3.2.3)", 
       q.enqueue(["T1", "T2", "T3"]);
       await until(() => settled(writer.ledger) && writer.openIntegration().length === 0, "T1..T3 settled",
         () => describeQueue(writer.ledger, s.warnings, s.listened));
+      // The listener is told after the journal batch AND the entry's close-out (endDecide -> closed(): slot release on
+      // real git, queue.ts endDecide/culprit), so the ledger can read settled before onFailed(T3) has run: wait for it too.
+      await until(() => ["integrated T1", "conflict T2", "failed T3"].every((e) => s.listened.includes(e)), "the T1..T3 listener calls",
+        () => describeQueue(writer.ledger, s.warnings, s.listened));
       const l = writer.ledger;
       expect(l.tasks["T1"]?.state).toBe("integrated");
       expect(l.tasks["T2"]?.state).toBe("conflict");
@@ -947,7 +998,7 @@ describe("the integration queue with the real LedgerStore on real git (3.2.3)", 
       expect(l.tasks["T1"]?.integrated?.to).toBe(tip);
       expect(git(s.repo, "diff", "--name-only", s.c0, tip)).toBe("src/t1.txt");
       expect(await integratedCounts(s.store)).toEqual({ T1: 1 });
-      expect(s.listened).toEqual(expect.arrayContaining(["integrated T1", "conflict T2", "failed T3"]));
+      expect(s.listened, describeQueue(l, s.warnings, s.listened)).toEqual(expect.arrayContaining(["integrated T1", "conflict T2", "failed T3"]));
       expect(s.released).toContain("T1");
       checkInvariants(s.inv);
       expect(s.violations).toEqual([]);
@@ -1109,8 +1160,11 @@ const SUITE_COMMAND: ResolvedCommand = { label: "node suite.js", file: process.e
  * Six task commits on main after c0 (the phase base): task 3 edits only lib.txt, which use.txt expects, so the suite
  * breaks in a file the task does not touch (a transitive breakage). With `conflict`, task 5 edits the same line of lib.txt.
  */
-function suiteSetup(tag: string, o: { conflict?: boolean } = {}, extraEnv: Readonly<Record<string, string>> = {}) {
-  const { repo, c0 } = newRepo(`suite-${tag}`, "suite-6", { "lib.txt": "v1\n", "use.txt": "expects v1\n" });
+function suiteSetup(tag: string, o: { conflict?: boolean; redBase?: boolean } = {}, extraEnv: Readonly<Record<string, string>> = {}) {
+  // `redBase`: the phase base already fails one check (always.txt is not green) that no task fixes (QA-3.2-1).
+  const { repo, c0 } = o.redBase === true
+    ? newRepo(`suite-${tag}`, "suite-redbase", { "lib.txt": "v1\n", "use.txt": "expects v1\n", "always.txt": "red\n" })
+    : newRepo(`suite-${tag}`, "suite-6", { "lib.txt": "v1\n", "use.txt": "expects v1\n" });
   const ranges: TaskRange[] = [];
   let prev = c0;
   for (let n = 1; n <= 6; n++) {
@@ -1149,6 +1203,21 @@ describe("phase suite on real git (3.2.4)", SLOW, () => {
     expect(git(s.repo, "rev-parse", s.branch)).toBe(s.head);
     expect(git(s.repo, "rev-parse", "main")).toBe(s.head);
     expect(git(ci.path, "status", "--porcelain")).toBe("");
+  });
+
+  // QA-3.2-1: a red base must not hide a culprit. One check already fails at the phase base; task 3 breaks ANOTHER check.
+  // The suite must name task 3, or fail closed as `unattributed` (the queue pauses on it); `pre-existing` (pass) is wrong.
+  it("a base that already fails one check does not hide the task that breaks another: culprit T3 or unattributed, never pre-existing", async () => {
+    const s = suiteSetup("redbase", { redBase: true });
+    expect(runNode(s.repo, "suite.js")).not.toBe(0);
+    await s.env.pool.open();
+    const ci = await s.env.pool.acquireSpecial(PLAN, "ci");
+    const { j } = fakeJournal(s.env, "phase-suite");
+    const verdict = await s.runner.run({ planId: PLAN, phaseId: "p1", commit: s.head, base: s.c0, ranges: s.ranges, commands: [SUITE_COMMAND], slot: ci }, j);
+    expect(["culprit", "unattributed"], `verdict ${JSON.stringify(verdict)}`).toContain(verdict.kind);
+    if (verdict.kind === "culprit") expect(verdict.range.taskId).toBe("T3");
+    expect(git(s.repo, "rev-parse", s.branch)).toBe(s.head);
+    expect(git(s.repo, "rev-parse", "main")).toBe(s.head);
   });
 
   it("a suite that fails once and passes both reruns is flaky: no culprit, nothing reverted", async () => {

@@ -2,8 +2,8 @@
  * Phase suite runner (plan 3.2.4, memo 3.2.1 §4.4, M21-M27).
  */
 import {
-  CHECK_TRIES,
-  type BackgroundRuns, type CheckErrorReason, type CheckResult, type CommandRunRequest, type CommandRunResult, type IntegrateGit,
+  CHECK_TRIES, PREEMPT_BUDGET,
+  type BackgroundRuns, type CheckErrorReason, type PreemptBudget, type CheckResult, type CommandRunRequest, type CommandRunResult, type IntegrateGit,
   type IntegrationChecks, type Logger, type ResolvedCommand, type RunResolver,
 } from "./checks";
 import {
@@ -48,9 +48,20 @@ type Attempt<T> = { error: StepFailure; value?: undefined } | { error: null; val
 type Stepped<T> = { kind: "ok"; value: T } | { kind: "error"; reason: CheckErrorReason; message: string }
   | { kind: "interrupted"; by: "abort" | "dispose" };
 
-function interruptedBy(j: StepJournal): "abort" | "dispose" {
-  return j.signal.reason === "dispose" ? "dispose" : "abort";
+/**
+ * Who stopped the run, read from the journal signal's abort reason: `"dispose"` (or an `E_DISPOSED` ExecutorError)
+ * is dispose, anything else (`"abort"`, the default AbortError) is abort. The queue aborts with the matching reason.
+ */
+export function interruptedBy(j: Pick<StepJournal, "signal">): "abort" | "dispose" {
+  const r: unknown = j.signal.reason;
+  return r === "dispose" || (r instanceof ExecutorError && r.code === "E_DISPOSED") ? "dispose" : "abort";
 }
+
+/**
+ * The `unattributed` reason of a failure the phase base cannot split by ids. `SuiteVerdict` (queue.ts) names only
+ * `"outside" | "no-base"`; it becomes `"base-unparsed"` once queue.ts adds that reason.
+ */
+const BASE_UNPARSED: Extract<SuiteVerdict, { kind: "unattributed" }>["reason"] = "base-unparsed";
 
 function clip(s: string, max: number): string {
   return s.length <= max ? s : s.slice(0, max - 1) + "\u2026";
@@ -94,14 +105,18 @@ class ProbeStop extends Error {
 /** Failure ids of a run for classification: an unparsed failure counts as every id of `original`. */
 function failedIdsOf(r: CommandRunResult, original: readonly string[]): string[] {
   if (r.verdict !== "fail") return [];
-  return r.idsUnparsed || r.ids.length === 0 ? [...original] : r.ids;
+  // Fail closed: a failing rerun that names none of the original ids (other ids, another id form) clears none of them.
+  return r.idsUnparsed || !r.ids.some(id => original.includes(id)) ? [...original] : r.ids;
 }
 
 async function runSuite(d: PhaseSuiteDeps, req: SuiteRunRequest, j: StepJournal): Promise<SuiteVerdict> {
   const startDetail: StepDetail = { v: 1, commit: req.commit, base: req.base, commands: req.commands.map(c => ({ label: c.label, ref: c.ref })) };
+  // QA-3.2-8 (M38): one preemption budget for the whole suite entry, shared by every run below. Once spent, the
+  // entry's runs register with nothing left, so a foreground check waits instead of preempting again.
+  const preempt: PreemptBudget = { left: PREEMPT_BUDGET };
   const exec = async (commit: string, mode: CommandRunRequest["mode"]): Promise<Attempt<CommandRunResult>> => {
     await j.assertWriteCwd(req.slot.path, "slot");
-    const r = await d.checks.runCommands({ slot: req.slot, commit, commands: req.commands, mode, priority: "background", signal: j.signal, prepare: true });
+    const r = await d.checks.runCommands({ slot: req.slot, commit, commands: req.commands, mode, priority: "background", signal: j.signal, prepare: true, preempt });
     if (r.verdict === "error") return { error: r.error ?? { reason: "spawn", message: "the run failed without a reason" } };
     return { error: null, value: r };
   };
@@ -114,8 +129,9 @@ async function runSuite(d: PhaseSuiteDeps, req: SuiteRunRequest, j: StepJournal)
   if (first.kind !== "ok") return first;
   const full = first.value;
   if (full.verdict === "pass") return { kind: "passed" };
-  // ids = [] when the failure cannot be attributed to ids (collection error, unparsed output): then reruns and
-  // probes run the full commands (M22).
+  // The full run names its failing ids from the output (QA-3.2-1). ids = [] only when the failure cannot be
+  // attributed to ids (collection error, a timeout, an incomplete inventory): then reruns and probes run the full
+  // commands (M22), and a base that fails too pauses the phase (unattributed, fail closed).
   const attributable = !full.idsUnparsed && full.ids.length > 0 && full.files.length > 0;
   const ids = attributable ? full.ids : [];
   const files = attributable ? full.files : [];
@@ -154,20 +170,17 @@ async function runSuite(d: PhaseSuiteDeps, req: SuiteRunRequest, j: StepJournal)
   const atBase = await stepped(j, "suite-rerun", baseDetail, () => exec(base, mode));
   if (atBase.kind !== "ok") return atBase;
   const baseRun = atBase.value;
-  let regression: string[];
-  if (!attributable) {
-    if (baseRun.verdict === "fail") return { kind: "pre-existing", ids: [] };
-    regression = [];
-  } else {
-    if (baseRun.verdict === "fail" && baseRun.idsUnparsed) {
-      await j.end("failed", { v: 1, durationMs: baseRun.durationMs, output: baseRun.output }, reproduced);
-      await memoStep(req.ranges.map(r => r.taskId));
-      return { kind: "unattributed", ids: reproduced, reason: "no-base" };
-    }
-    const preexisting = new Set(baseRun.verdict === "fail" ? baseRun.ids : []);
-    regression = reproduced.filter(id => !preexisting.has(id));
-    if (regression.length === 0) return { kind: "pre-existing", ids: reproduced }; // the base step stays open
+  // QA-3.2-1 (2): fail closed. When the base failure cannot be split by ids (the suite's failure has none, or the base
+  // run's output names none), nothing can be shown pre-existing: the phase pauses (unattributed), it never passes.
+  if (baseRun.verdict === "fail" && (!attributable || baseRun.idsUnparsed)) {
+    await j.end("failed", { v: 1, durationMs: baseRun.durationMs, output: baseRun.output }, reproduced);
+    await memoStep(req.ranges.map(r => r.taskId));
+    return { kind: "unattributed", ids: reproduced, reason: BASE_UNPARSED };
   }
+  const preexisting = new Set(baseRun.verdict === "fail" ? baseRun.ids : []);
+  const regression = reproduced.filter(id => !preexisting.has(id));
+  // Without ids (`!attributable`, the base passed) the regression is the whole failure: bisect with the full commands.
+  if (attributable && regression.length === 0) return { kind: "pre-existing", ids: reproduced }; // the base step stays open
   await j.end(baseRun.verdict === "fail" ? "failed" : "ok", { v: 1, durationMs: baseRun.durationMs, output: baseRun.output }, baseRun.verdict === "fail" ? baseRun.ids : []);
 
   // 4. Bisect over the phase's ranges, running only the regression.

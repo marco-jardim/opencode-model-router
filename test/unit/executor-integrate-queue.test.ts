@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, unlinkSync } from "node:fs";
+import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -9,7 +9,9 @@ import { removeDirWhenReleased } from "../helpers/remove-dir.js";
 
 // The real ledger store fsyncs every durable batch; on Windows a long scenario takes seconds of wall time. Nothing below waits on
 // wall time for a decision (the queue sees only the FakeClock); the budget only bounds how long a hung test may run.
-vi.setConfig({ testTimeout: 120_000, hookTimeout: 120_000 });
+// 60 s per test and hook: a hang fails fast instead of blocking the file (an await that never settles; a microtask busy loop
+// would starve the timer too, so the idle-lane guard below bounds ledger reads directly).
+vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
 import { ExecutorError } from "../../src/executor/types";
 import { createRepoLockFactory } from "../../src/executor/integrate/queue";
 import { createPhaseSuiteRunner } from "../../src/executor/integrate/phase-suite";
@@ -61,6 +63,7 @@ import {
   latestStartDetail,
   parseDetail,
   phaseBase,
+  phaseHasOwnTasks,
   phaseIntegrated,
   pickBatch,
   tailBytes,
@@ -106,6 +109,46 @@ function stepEvent(e: IntegrationEntry, over: Partial<IntegrationStepEvent> = {}
     seq: seqCounter, at: T0, batch: seqCounter, last: true, ...over,
   };
 }
+
+/** A ledger with only the fields phaseIntegrated/phaseHasOwnTasks read (phases, tasks). */
+function miniLedger(phases: Array<{ id: string; dependsOn: string[] }>,
+  tasks: Array<{ id: string; phase: string | null; kind: string; state: TaskState }>): LedgerV1 {
+  return {
+    phases: phases.map(p => ({ ...p, title: p.id, wave: "w1", gate: "pending" as GateState, qaRound: 1, paused: false, tag: null })),
+    tasks: Object.fromEntries(tasks.map(t => [t.id, t])),
+  } as unknown as LedgerV1;
+}
+
+describe("QA-3.2-19: a phase with no task of its own", () => {
+  it("phaseHasOwnTasks is false for a qa-only or empty phase and true with a non-qa task", () => {
+    const l = miniLedger([{ id: "P1", dependsOn: [] }, { id: "P2", dependsOn: ["P1"] }, { id: "P3", dependsOn: [] }],
+      [{ id: "t1", phase: "P1", kind: "task", state: "verified" }, { id: "q2", phase: "P2", kind: "qa", state: "pending" }]);
+    expect(phaseHasOwnTasks(l, "P1")).toBe(true);
+    expect(phaseHasOwnTasks(l, "P2")).toBe(false);
+    expect(phaseHasOwnTasks(l, "P3")).toBe(false);
+  });
+
+  it("phaseIntegrated of a qa-only phase waits for every phase it depends on (not true at plan start)", () => {
+    const tasks = [{ id: "t1", phase: "P1", kind: "task", state: "verified" as TaskState },
+      { id: "t3", phase: "P3", kind: "task", state: "integrated" as TaskState },
+      { id: "q2", phase: "P2", kind: "qa", state: "pending" as TaskState }];
+    const phases = [{ id: "P1", dependsOn: [] }, { id: "P3", dependsOn: [] }, { id: "P2", dependsOn: ["P1", "P3"] }];
+    expect(phaseIntegrated(miniLedger(phases, tasks), "P2")).toBe(false);
+    const done = tasks.map(t => t.id === "t1" ? { ...t, state: "integrated" as TaskState } : t);
+    expect(phaseIntegrated(miniLedger(phases, done), "P2")).toBe(true);
+    // No dependency and no task: integrated (nothing to wait for); an unknown phase never is.
+    expect(phaseIntegrated(miniLedger([{ id: "P9", dependsOn: [] }], []), "P9")).toBe(true);
+    expect(phaseIntegrated(miniLedger([], []), "P9")).toBe(false);
+  });
+
+  it("phaseIntegrated follows chains of task-less phases and is cycle-safe", () => {
+    const phases = [{ id: "A", dependsOn: ["B"] }, { id: "B", dependsOn: ["C"] }, { id: "C", dependsOn: [] }];
+    expect(phaseIntegrated(miniLedger(phases, [{ id: "c", phase: "C", kind: "task", state: "running" }]), "A")).toBe(false);
+    expect(phaseIntegrated(miniLedger(phases, [{ id: "c", phase: "C", kind: "task", state: "done" }]), "A")).toBe(true);
+    const cyc = [{ id: "A", dependsOn: ["B"] }, { id: "B", dependsOn: ["A"] }];
+    expect(phaseIntegrated(miniLedger(cyc, []), "A")).toBe(false);
+  });
+});
 
 describe("queue pure helpers", () => {
   it("PREEMPT_LIMIT is 3 (M38)", () => {
@@ -426,28 +469,127 @@ describe("createRepoLockFactory (M5, I3)", () => {
     await l2.release();
   });
 
-  it("takes over a lock file of a dead pid on the same host (counter reason dead-pid)", async () => {
+  /** Acquires while firing the poll timer: a takeover needs the same verdict at two polls (QA-3.2-4). Returns the polls fired. */
+  async function acquirePolling(f: RepoLockFactory, key: string, clock: FakeClock, h = holder()): Promise<{ lock: RepoLock; fired: number }> {
+    let done = false;
+    let fired = 0;
+    const p = f.acquire(key, h, new AbortController().signal).finally(() => { done = true; });
+    const deadline = Date.now() + 20_000;
+    while (!done && Date.now() < deadline) {
+      await realPause(5);
+      if (!done && clock.heldCount() > 0) {
+        fired++;
+        clock.fire();
+      }
+    }
+    return { lock: await p, fired };
+  }
+
+  it("takes over a lock file of a dead pid on the same host (counter reason dead-pid) after a second poll", async () => {
     const env = await lockEnv();
     const file = env.file("repo-C");
     await mkdir(dirname(file), { recursive: true });
     await writeFile(file, JSON.stringify({ pid: 99, hostname: "h", planId: "other", entryId: null, heartbeatAt: new FakeClock().now() }), "utf8");
-    const factory = createRepoLockFactory({ stateRoot: env.root, clock: new FakeClock(), pid: 10, hostname: "h", isPidAlive: pid => pid !== 99 });
-    const lock = await factory.acquire("repo-C", holder(), new AbortController().signal);
+    const clock = new FakeClock();
+    const factory = createRepoLockFactory({ stateRoot: env.root, clock, pid: 10, hostname: "h", isPidAlive: pid => pid !== 99 });
+    const { lock, fired } = await acquirePolling(factory, "repo-C", clock);
+    expect(fired).toBeGreaterThanOrEqual(1);
     expect((lock as { takeover?: string | null }).takeover).toBe("dead-pid");
     const content = JSON.parse(await readFile(file, "utf8")) as { pid: number };
     expect(content.pid).toBe(10);
     await lock.release();
   });
 
-  it("takes over a stale lock of a live foreign holder (counter reason stale)", async () => {
+  it("takes over a stale lock of a live holder on another host (counter reason stale) after a second poll", async () => {
     const env = await lockEnv();
     const file = env.file("repo-D");
     await mkdir(dirname(file), { recursive: true });
     await writeFile(file, JSON.stringify({ pid: 99, hostname: "elsewhere", planId: "other", entryId: null, heartbeatAt: new FakeClock().now() }), "utf8");
-    const factory = createRepoLockFactory({ stateRoot: env.root, clock: new FakeClock(), pid: 10, hostname: "h", isPidAlive: () => true, staleMs: -1 });
-    const lock = await factory.acquire("repo-D", holder(), new AbortController().signal);
+    const clock = new FakeClock();
+    const factory = createRepoLockFactory({ stateRoot: env.root, clock, pid: 10, hostname: "h", isPidAlive: () => true, staleMs: -1 });
+    const { lock } = await acquirePolling(factory, "repo-D", clock);
     expect((lock as { takeover?: string | null }).takeover).toBe("stale");
     await lock.release();
+  });
+
+  it("QA-3.2-4: a live holder on the same host is never taken over, however old its heartbeat", async () => {
+    const env = await lockEnv();
+    const clock = new FakeClock();
+    await foreignLock(env, "repo-live", JSON.stringify({ pid: 99, hostname: "h", planId: "other", entryId: null, heartbeatAt: clock.now() - 10_000_000 }));
+    const f = createRepoLockFactory({ stateRoot: env.root, clock, pid: 10, hostname: "h", isPidAlive: () => true, staleMs: 1 });
+    const ctl = new AbortController();
+    let settled = false;
+    const waiting = f.acquire("repo-live", holder(), ctl.signal);
+    void waiting.then(() => { settled = true; }, () => { settled = true; });
+    for (let i = 0; i < 4; i++) {
+      await realPause(20);
+      clock.advance(1_000);
+      clock.fire();
+    }
+    await realPause(20);
+    expect(settled).toBe(false);
+    ctl.abort();
+    await expect(waiting).rejects.toMatchObject({ code: "E_DISPOSED" });
+    expect(JSON.parse(await readFile(env.file("repo-live"), "utf8"))).toMatchObject({ pid: 99 });
+  });
+
+  it("QA-3.2-4: our own pid in a leftover file (this process holds the mutex) is a dead holder", async () => {
+    const env = await lockEnv();
+    const clock = new FakeClock();
+    await foreignLock(env, "repo-own", JSON.stringify({ pid: 10, hostname: "h", planId: "old", entryId: null, heartbeatAt: clock.now() }));
+    const f = createRepoLockFactory({ stateRoot: env.root, clock, pid: 10, hostname: "h", isPidAlive: () => true });
+    const { lock } = await acquirePolling(f, "repo-own", clock);
+    expect((lock as { takeover?: string | null }).takeover).toBe("dead-pid");
+    await lock.release();
+  });
+
+  it("QA-3.2-4: a stale holder that heartbeats between the two polls is not taken over", async () => {
+    const env = await lockEnv();
+    const clock = new FakeClock();
+    const file = await foreignLock(env, "repo-beat", JSON.stringify({ pid: 99, hostname: "elsewhere", planId: "o", entryId: null, heartbeatAt: 1 }));
+    const f = createRepoLockFactory({ stateRoot: env.root, clock, pid: 10, hostname: "h", isPidAlive: () => true, staleMs: 1 });
+    const ctl = new AbortController();
+    let settled = false;
+    const waiting = f.acquire("repo-beat", holder(), ctl.signal);
+    void waiting.then(() => { settled = true; }, () => { settled = true; });
+    await realPause(30);
+    // The holder beats (new bytes): the first poll's verdict does not carry over, the next poll starts again.
+    await writeFile(file, JSON.stringify({ pid: 99, hostname: "elsewhere", planId: "o", entryId: null, heartbeatAt: 2 }), "utf8");
+    clock.fire();
+    await realPause(30);
+    expect(settled).toBe(false);
+    expect(JSON.parse(await readFile(file, "utf8"))).toMatchObject({ heartbeatAt: 2 });
+    ctl.abort();
+    await expect(waiting).rejects.toMatchObject({ code: "E_DISPOSED" });
+  });
+
+  it("QA-3.2-4: a taker never removes a lock another taker created after its judgement (compare-and-delete)", async () => {
+    const env = await lockEnv();
+    const clock = new FakeClock();
+    const file = await foreignLock(env, "repo-race", JSON.stringify({ pid: 99, hostname: "h", planId: "o", entryId: null, heartbeatAt: 1 }));
+    const winner = JSON.stringify({ pid: 55, hostname: "h", planId: "w", entryId: "i-w", heartbeatAt: 2 });
+    let asked = 0;
+    const f = createRepoLockFactory({ stateRoot: env.root, clock, pid: 10, hostname: "h", isPidAlive: pid => {
+      if (pid !== 99) return true;
+      // Second judgement of the dead holder: another process takes the lock over right now (new bytes, live pid 55).
+      if (++asked === 2) writeFileSync(file, winner, "utf8");
+      return false;
+    } });
+    const ctl = new AbortController();
+    let settled = false;
+    const waiting = f.acquire("repo-race", holder(), ctl.signal);
+    void waiting.then(() => { settled = true; }, () => { settled = true; });
+    for (let i = 0; i < 3; i++) {
+      await realPause(30);
+      clock.fire();
+    }
+    await realPause(30);
+    expect(asked).toBeGreaterThanOrEqual(2);
+    expect(settled).toBe(false);
+    expect(await readFile(file, "utf8")).toBe(winner);
+    ctl.abort();
+    await expect(waiting).rejects.toMatchObject({ code: "E_DISPOSED" });
+    expect(await readFile(file, "utf8")).toBe(winner);
   });
 
   it("an aborted wait rejects with E_DISPOSED and leaves the holder alone", async () => {
@@ -507,21 +649,49 @@ describe("createRepoLockFactory (M5, I3)", () => {
     await lock.release();
   });
 
-  it("an unparsable lock file counts as infinitely old and is taken over as stale", async () => {
+  it("QA-3.2-4: one unparsable read is never a takeover; a file that stays unparsable across two polls is taken over as stale", async () => {
     const env = await lockEnv();
-    await foreignLock(env, "repo-H", "{{ not json");
-    const f = createRepoLockFactory({ stateRoot: env.root, clock: new FakeClock(), pid: 10, hostname: "h", isPidAlive: () => true });
-    const lock = await f.acquire("repo-H", holder(), new AbortController().signal);
+    const clock = new FakeClock();
+    const file = await foreignLock(env, "repo-H", "{{ not json");
+    const f = createRepoLockFactory({ stateRoot: env.root, clock, pid: 10, hostname: "h", isPidAlive: () => true });
+    let settled = false;
+    const waiting = f.acquire("repo-H", holder(), new AbortController().signal);
+    void waiting.then(() => { settled = true; }, () => { settled = true; });
+    await realPause(30);
+    expect(settled).toBe(false); // the first poll only notes it
+    expect(await readFile(file, "utf8")).toBe("{{ not json");
+    clock.fire();
+    const lock = await waiting;
     expect((lock as { takeover?: string | null }).takeover).toBe("stale");
     await lock.release();
   });
 
-  it("lock files that parse to the wrong shape are taken over as stale", async () => {
+  it("QA-3.2-4: an unparsable read that a writer completes before the next poll is waited for, not taken over", async () => {
     const env = await lockEnv();
-    const f = createRepoLockFactory({ stateRoot: env.root, clock: new FakeClock(), pid: 10, hostname: "h", isPidAlive: () => true });
+    const clock = new FakeClock();
+    const file = await foreignLock(env, "repo-H2", "");
+    const f = createRepoLockFactory({ stateRoot: env.root, clock, pid: 10, hostname: "h", isPidAlive: () => true });
+    const ctl = new AbortController();
+    let settled = false;
+    const waiting = f.acquire("repo-H2", holder(), ctl.signal);
+    void waiting.then(() => { settled = true; }, () => { settled = true; });
+    await realPause(30);
+    await writeFile(file, JSON.stringify({ pid: 99, hostname: "h", planId: "o", entryId: null, heartbeatAt: clock.now() }), "utf8");
+    clock.fire();
+    await realPause(30);
+    expect(settled).toBe(false);
+    ctl.abort();
+    await expect(waiting).rejects.toMatchObject({ code: "E_DISPOSED" });
+    expect(JSON.parse(await readFile(file, "utf8"))).toMatchObject({ pid: 99 });
+  });
+
+  it("lock files that parse to the wrong shape are taken over as stale once they stay so at the next poll", async () => {
+    const env = await lockEnv();
+    const clock = new FakeClock();
+    const f = createRepoLockFactory({ stateRoot: env.root, clock, pid: 10, hostname: "h", isPidAlive: () => true });
     for (const [i, text] of ["null", JSON.stringify({ pid: "x", hostname: "h", heartbeatAt: 1 }), JSON.stringify({ pid: 1, hostname: 2, heartbeatAt: 1 })].entries()) {
       await foreignLock(env, `repo-shape-${i}`, text);
-      const lock = await f.acquire(`repo-shape-${i}`, holder(), new AbortController().signal);
+      const { lock } = await acquirePolling(f, `repo-shape-${i}`, clock);
       expect((lock as { takeover?: string | null }).takeover).toBe("stale");
       await lock.release();
     }
@@ -670,7 +840,7 @@ describe("createRepoLockFactory (M5, I3)", () => {
     expect(clock.heldCount()).toBe(0);
   });
 
-  it("a holder file that vanishes between the read and the takeover unlink is tolerated", async () => {
+  it("a dead holder's file removed by someone else between the two polls: acquired without a takeover", async () => {
     const env = await lockEnv();
     const clock = new FakeClock();
     const file = await foreignLock(env, "repo-Q", JSON.stringify({ pid: 99, hostname: "h", planId: "x", entryId: null, heartbeatAt: clock.now() }));
@@ -680,24 +850,43 @@ describe("createRepoLockFactory (M5, I3)", () => {
       if (pid === 99 && asked === 1) unlinkSync(file); // the dead holder's file is removed by someone else first
       return pid !== 99;
     } });
-    const lock = await f.acquire("repo-Q", holder("i-2"), new AbortController().signal);
-    expect((lock as { takeover?: string | null }).takeover).toBe("dead-pid");
+    const { lock } = await acquirePolling(f, "repo-Q", clock, holder("i-2"));
+    expect((lock as { takeover?: string | null }).takeover).toBeNull();
     expect(JSON.parse(await readFile(file, "utf8"))).toMatchObject({ pid: 10, entryId: "i-2" });
     await lock.release();
   });
 
-  it("a takeover unlink that fails for another reason rejects, and a lock path that is a directory rejects the next acquire", async () => {
+  it("the takeover's file vanishing between the second judgement and the rename is tolerated (no takeover counted)", async () => {
+    const env = await lockEnv();
+    const clock = new FakeClock();
+    const file = await foreignLock(env, "repo-Q2", JSON.stringify({ pid: 99, hostname: "h", planId: "x", entryId: null, heartbeatAt: clock.now() }));
+    let asked = 0;
+    const f = createRepoLockFactory({ stateRoot: env.root, clock, pid: 10, hostname: "h", isPidAlive: pid => {
+      if (pid === 99 && ++asked === 2) unlinkSync(file);
+      return pid !== 99;
+    } });
+    const { lock } = await acquirePolling(f, "repo-Q2", clock, holder("i-3"));
+    expect((lock as { takeover?: string | null }).takeover).toBeNull();
+    expect(JSON.parse(await readFile(file, "utf8"))).toMatchObject({ pid: 10, entryId: "i-3" });
+    await lock.release();
+  });
+
+  it("a takeover rename that fails for another reason rejects, and a lock path that is a directory rejects the next acquire", async () => {
     const env = await lockEnv();
     const clock = new FakeClock();
     const file = await foreignLock(env, "repo-T", JSON.stringify({ pid: 99, hostname: "h", planId: "x", entryId: null, heartbeatAt: clock.now() }));
+    let asked = 0;
     const f = createRepoLockFactory({ stateRoot: env.root, clock, pid: 10, hostname: "h", isPidAlive: pid => {
-      if (pid === 99) {
+      if (pid === 99 && ++asked === 2) {
         unlinkSync(file);
-        mkdirSync(file); // unlink of a directory: EPERM / EISDIR, never ENOENT
+        mkdirSync(file); // the path is now a directory: the takeover cannot move or read it, never ENOENT
       }
       return pid !== 99;
     } });
-    const err = await f.acquire("repo-T", holder(), new AbortController().signal).then(() => null, (e: unknown) => e as { code?: string });
+    const errP = f.acquire("repo-T", holder(), new AbortController().signal).then(() => null, (e: unknown) => e as { code?: string });
+    await realPause(30);
+    clock.fire();
+    const err = await errP;
     expect(err?.code).toBeDefined();
     expect(err?.code).not.toBe("ENOENT");
     // the mutex was freed: the next acquire reaches the file, finds a directory it cannot read, and rejects too
@@ -1100,7 +1289,10 @@ class CrashWriter implements LedgerWriter {
   rejectOn: ((n: number) => Error | null) | null = null;
   constructor(readonly inner: LedgerWriter, private readonly w: World) {}
   get planId(): string { return this.inner.planId; }
+  /** Reads of `ledger` by the queue (the tests read `inner.ledger`): an idle lane must not keep reading. */
+  reads = 0;
   get ledger(): Readonly<LedgerV1> {
+    this.reads++;
     const hook = this.onNextRead;
     if (hook !== null) {
       this.onNextRead = null;
@@ -1179,6 +1371,10 @@ class Env {
   readonly guard = new GuardSpy();
   /** Task ids the queue handed to `settle` (live tasks released by a revert). */
   readonly settled: string[] = [];
+  /** A real lock factory instead of the LockDouble (takes effect at the next open/restart). */
+  locksOverride: RepoLockFactory | null = null;
+  /** Integration-step events of an earlier history, served before the store's (read at the queue's first load). */
+  historyExtra: IntegrationStepEvent[] = [];
   store!: ReturnType<typeof createLedgerStore>;
   writer!: CrashWriter;
   queue!: IntegrationQueue;
@@ -1190,9 +1386,9 @@ class Env {
     this.w.openStep = () => this.writer.openIntegration().some(o => o.edge === "start");
     this.queue = createIntegrationQueue({
       planId: PLAN_ID, writer: this.writer, git: this.git, igit: this.igit, pool: this.pool, leases: this.leases, checks: this.checks,
-      suite: this.suite, lander: this.lander, listener: this.listener, locks: this.locks, guard: this.guard, clock: this.clock, logger: this.logger,
+      suite: this.suite, lander: this.lander, listener: this.listener, locks: this.locksOverride ?? this.locks, guard: this.guard, clock: this.clock, logger: this.logger,
       settle: (id, release) => { this.settled.push(id); void release(); },
-      history: { steps: async () => (await this.store.exportPlan(PLAN_ID)).events.filter(isStep) },
+      history: { steps: async () => [...this.historyExtra, ...(await this.store.exportPlan(PLAN_ID)).events.filter(isStep)] },
     });
   }
 
@@ -1231,7 +1427,7 @@ class Env {
    * awaits doubles (microtasks), so "no append in flight for 3 turns" means the post-batch work (listener calls, releases,
    * the next kick) has run. The wall-clock deadline only bounds a hung test; the real ledger fsyncs are slow on Windows.
    */
-  async until(pred: () => boolean, what = "condition", deadlineMs = 90_000): Promise<void> {
+  async until(pred: () => boolean, what = "condition", deadlineMs = 50_000): Promise<void> {
     const deadline = Date.now() + deadlineMs;
     for (;;) {
       let stable = pred() && this.writer.inflight === 0;
@@ -1476,6 +1672,26 @@ describe("task entry (rows 28-32)", () => {
     await env.queue.dispose();
   });
 
+  it("an idle lane (only paused-phase work queued) exits and makes a bounded number of ledger reads until a state change", async () => {
+    const env = await setup({ tasks: 2, batchMax: 1, mutate: l => { const p = l.phases[0]; if (p !== undefined) p.paused = true; } });
+    const r0 = env.writer.reads;
+    env.queue.enqueue(["T1", "T2"]);
+    env.queue.enqueue(["T1"]); // a kick while the lanes run sets `wanted`: at most one more pass per lane
+    // Microtask turns only: a lane re-kick loop (QA-3.2 round 2 hang) would keep reading here instead of starving the test.
+    for (let i = 0; i < 500; i++) await Promise.resolve();
+    expect(env.writer.reads - r0).toBeLessThan(40);
+    await env.settle();
+    const r1 = env.writer.reads;
+    await env.settle();
+    expect(env.writer.reads).toBe(r1); // idle: no reads at all
+    expect(env.queue.queued()).toEqual(["T1", "T2"]);
+    // A state change plus a kick wakes it: the unpaused phase's tasks integrate.
+    await env.writer.append([{ type: "phase-paused", phaseId: "p1", paused: false, reason: "unpause" }]);
+    env.queue.enqueue([]);
+    await env.until(() => env.state("T2") === "integrated" && env.quiet(), "both integrated after the unpause");
+    env.assertInvariants();
+  });
+
   it("enqueue and checkPhase after dispose reject with E_DISPOSED, and no journal line is written afterwards", async () => {
     const env = await setup({ tasks: 1 });
     await env.queue.dispose();
@@ -1496,6 +1712,122 @@ describe("task entry (rows 28-32)", () => {
     await env.queue.dispose(); // idempotent
   });
 });
+
+// ---------------------------------------------------------------------------------------------------------------
+// QA-3.2 round 1 regressions (task entries, resume step 0, abort, illegal transitions)
+// ---------------------------------------------------------------------------------------------------------------
+
+describe("QA-3.2 round 1: task entries and resume", () => {
+  it("QA-3.2-13: a check that fails while abort() fires is interrupted: no failed transition, no onFailed, task cancelled", async () => {
+    const env = await setup({ tasks: 1 });
+    env.w.bad.add("T1");
+    let aborting: Promise<void> | null = null;
+    env.w.afterCheck = () => {
+      env.w.afterCheck = null;
+      aborting = env.queue.abort();
+    };
+    env.queue.enqueue(["T1"]);
+    await env.until(() => aborting !== null, "abort fired");
+    await aborting;
+    expect(env.state("T1")).toBe("cancelled");
+    expect(env.listener.calls.filter(c => c.startsWith("failed:"))).toEqual([]);
+    expect(env.w.journal.some(e => e.type === "task-transition" && e.to === "failed")).toBe(false);
+    expect(env.writer.openIntegration()).toEqual([]);
+    env.assertInvariants();
+  });
+
+  it("QA-3.2-18: an illegal transition pauses with a text that asks for a restart (resume() of this queue is latched)", async () => {
+    const env = await setup({ tasks: 1 });
+    const at = env.writer.attempts + 1;
+    env.writer.rejectOn = n => n === at ? new ExecutorError("E_ILLEGAL_TRANSITION", "scripted rejection", null) : null;
+    env.queue.enqueue(["T1"]);
+    await env.until(() => env.ledger.status === "paused", "paused");
+    const item = env.ledger.inbox[env.ledger.inbox.length - 1];
+    expect(item?.severity).toBe("critical");
+    expect(item?.text).toContain("restart the executor");
+    expect(item?.text).not.toContain("The plan is paused; resume() reconciles.");
+    expect(env.state("T1")).toBe("verified");
+  });
+
+  it("QA-3.2-9: resume() step 0 with git unable to run is an infrastructure halt, never 'moved'; a later resume() goes on", async () => {
+    const env = await setup({ tasks: 1, resume: false });
+    const real = env.igit.readRef.bind(env.igit);
+    let calls = 0;
+    env.igit.readRef = async (cwd, ref) => {
+      calls++;
+      throw new Error(`spawn git ENOENT (${cwd} ${ref})`);
+    };
+    const r = await env.queue.resume();
+    expect(r.halted).toBe(true);
+    expect(calls).toBe(3); // CHECK_TRIES reads before it gives up
+    expect(env.ledger.status).toBe("paused");
+    const item = env.ledger.inbox[env.ledger.inbox.length - 1];
+    expect(item?.severity).toBe("critical");
+    expect(item?.text).toContain("infrastructure");
+    expect(item?.text).not.toContain("no journaled fast-forward explains it");
+    env.igit.readRef = real;
+    const again = await env.queue.resume();
+    expect(again.halted).toBe(false);
+    env.assertInvariants();
+  });
+
+  it("QA-3.2-9: resume() step 0 with the integration branch missing halts naming the ref and the 5.1 handoff", async () => {
+    const env = await setup({ tasks: 1, resume: false });
+    env.w.branches.delete(INT_REF);
+    const r = await env.queue.resume();
+    expect(r.halted).toBe(true);
+    const item = env.ledger.inbox[env.ledger.inbox.length - 1];
+    expect(item?.text).toContain(INT_REF);
+    expect(item?.text).toContain("5.1");
+    expect(item?.text).toContain("does not exist");
+  });
+
+  it("QA-3.2-9: the integration branch is read in repo.toplevel, not in the integration worktree", async () => {
+    const env = await setup({ tasks: 1, resume: false });
+    const cwds: string[] = [];
+    const real = env.igit.readRef.bind(env.igit);
+    env.igit.readRef = async (cwd, ref) => { cwds.push(`${cwd}|${ref}`); return real(cwd, ref); };
+    await env.queue.resume();
+    env.queue.enqueue(["T1"]);
+    await env.until(() => env.state("T1") === "integrated" && env.quiet());
+    expect(cwds.length).toBeGreaterThan(0);
+    expect(cwds.every(c => c.startsWith(`${TOPLEVEL}|`))).toBe(true);
+    env.assertInvariants();
+  });
+
+  it("QA-3.2-9: a task branch git cannot read pauses the plan (infrastructure) and keeps the task queued; a missing branch drops it", async () => {
+    const env = await setup({ tasks: 2, batchMax: 1 });
+    const real = env.igit.readRef.bind(env.igit);
+    env.igit.readRef = async (cwd, ref) => {
+      if (ref.endsWith("/t/T1")) throw new Error("git died");
+      return real(cwd, ref);
+    };
+    env.queue.enqueue(["T1"]);
+    await env.until(() => env.ledger.status === "paused", "paused");
+    expect(env.state("T1")).toBe("verified");
+    expect(env.queue.queued()).toEqual(["T1"]);
+    const item = env.ledger.inbox[env.ledger.inbox.length - 1];
+    expect(item?.severity).toBe("critical");
+    expect(item?.text).toContain("could not read its branches");
+    // The missing-branch case (ref absent, git fine) is a blocking item and drops the task.
+    env.igit.readRef = real;
+    env.w.branches.delete(`refs/heads/omr/${PLAN_ID}/t/T2`);
+    await unpause(env);
+    env.queue.enqueue(["T2"]);
+    await env.until(() => env.state("T1") === "integrated" && env.ledger.inbox.some(i => i.severity === "blocking"), "T1 integrated, T2 dropped");
+    expect(env.queue.queued()).toEqual([]);
+    expect(env.ledger.inbox.find(i => i.severity === "blocking")?.text).toContain("does not exist");
+    env.assertInvariants();
+  });
+
+});
+
+/** The owner unpauses the plan; the stalled poll (M36) notices it at its next 5 s tick or at the next enqueue/checkPhase. */
+async function unpause(env: Env): Promise<void> {
+  await env.writer.append([{ type: "status-changed", from: "paused", to: "running", reason: "unpause" }]);
+  env.clock.advance(5_000);
+  env.clock.fire();
+}
 
 // ---------------------------------------------------------------------------------------------------------------
 // Batches (M16-M18)
@@ -1623,6 +1955,128 @@ describe("infrastructure (M13a, M13b, M36)", () => {
     expect(JSON.parse(rb?.detail ?? "{}")).toMatchObject({ reason: "stalled" });
     env.assertInvariants();
     await env.queue.dispose();
+  });
+
+  it("QA-3.2-3: a pause (M13a) or a halt (M13b) releases the repo lock", async () => {
+    const env = await setup({ tasks: 2, batchMax: 1 });
+    env.w.checkScript.push(errorResult("spawn"), errorResult("spawn"), errorResult("spawn"));
+    env.queue.enqueue(["T1"]);
+    await env.until(() => env.ledger.status === "paused", "paused");
+    expect(env.locks.held).toBe(false);
+    await unpause(env);
+    await env.until(() => env.state("T1") === "integrated" && env.quiet(), "T1 integrated after the unpause");
+    expect(env.locks.held).toBe(false);
+    env.w.casFails = true;
+    env.queue.enqueue(["T2"]);
+    await env.until(() => env.ledger.status === "paused", "halted");
+    expect(env.locks.held).toBe(false);
+    expect(env.w.violations).toEqual([]);
+  });
+
+  it("QA-3.2-3: two plans on one repository: a paused plan does not block the other plan's lane (real lock factory)", async () => {
+    const env = await setup({ tasks: 1, resume: false });
+    const root = await mkdtemp(join(tmpdir(), "omr-integrate-lock2-"));
+    lockRoots.push(root);
+    const factory = createRepoLockFactory({ stateRoot: root, clock: env.clock, pid: 100, hostname: "host-a", isPidAlive: () => true });
+    env.locksOverride = factory;
+    await env.restart();
+    await env.queue.resume();
+    env.w.checkScript.push(errorResult("spawn"), errorResult("spawn"), errorResult("spawn"));
+    env.queue.enqueue(["T1"]);
+    await env.until(() => env.ledger.status === "paused", "paused");
+    // The second plan's queue on the same repo.key takes the lock for its own entry while this plan is paused.
+    const other = await Promise.race([
+      factory.acquire(env.ledger.repo.key, { planId: "plan-two", entryId: null }, new AbortController().signal),
+      realPause(10_000).then(() => null),
+    ]);
+    expect(other).not.toBeNull();
+    await other?.release();
+    await unpause(env);
+    await env.until(() => env.state("T1") === "integrated" && env.quiet(), "T1 integrated after the unpause");
+    env.assertInvariants();
+  });
+
+  it("QA-3.2-3: abort() while the lane waits for the repo lock ends the wait (the lane's wait is cancellable)", async () => {
+    const env = await setup({ tasks: 1 });
+    let release!: () => void;
+    const blocked = new Promise<RepoLock>((_resolve, reject) => {
+      release = () => reject(new ExecutorError("E_DISPOSED", "wait aborted", null));
+    });
+    const waits: AbortSignal[] = [];
+    const locks: RepoLockFactory = env.locks;
+    locks.acquire = async (_key, _holder, signal) => {
+      waits.push(signal);
+      if (waits.length === 1) {
+        signal.addEventListener("abort", () => release(), { once: true });
+        return blocked;
+      }
+      return { lost: new AbortController().signal, release: async () => undefined };
+    };
+    env.queue.enqueue(["T1"]);
+    await env.until(() => waits.length === 1, "lane waiting");
+    await env.queue.abort();
+    expect(waits[0]?.aborted).toBe(true);
+    expect(env.state("T1")).toBe("verified");
+    expect(env.writer.openIntegration()).toEqual([]);
+  });
+
+  it("QA-3.2-4: a lost repo lock halts before the next git write (no merge, no CAS)", async () => {
+    const env = await setup({ tasks: 1 });
+    const lost = new AbortController();
+    env.locks.acquire = async () => ({ lost: lost.signal, release: async () => undefined });
+    env.w.afterCheck = () => { lost.abort(); };
+    env.queue.enqueue(["T1"]);
+    await env.until(() => env.ledger.status === "paused", "halted");
+    expect(env.w.writes.some(w => w.op === "mergeFfOnly" || w.op === "branchForce")).toBe(false);
+    expect(env.w.tip()).toBe(env.w.base);
+    expect(env.ledger.inbox[env.ledger.inbox.length - 1]?.text).toContain("lock");
+    expect(env.state("T1")).toBe("integrating");
+    env.assertInvariants();
+  });
+
+  it("QA-3.2-5: both lanes stalled at once: each lane's entry is kept and rolled back after the unpause", async () => {
+    const env = await setup({ tasks: 2, batchMax: 1, mutate: l => {
+      l.phases.push({ id: "p2", title: "Phase 2", wave: "w1", dependsOn: [], gate: "pending", qaRound: 1, paused: false, tag: null });
+      l.waves[0]?.phases.push("p2"); // a phase must be listed by its wave (valid draft)
+      const t2 = l.tasks.T2;
+      if (t2 !== undefined) t2.phase = "p2";
+    } });
+    let openGate!: () => void;
+    env.suite.runGate = new Promise<void>(r => { openGate = r; });
+    env.suite.resolution = { kind: "runs", commands: [] };
+    let suiteErr = true;
+    env.suite.onRun = () => suiteErr ? { kind: "error", reason: "spawn", message: "suite spawn failed" } : { kind: "passed" };
+    env.queue.enqueue(["T1"]);
+    await env.until(() => env.state("T1") === "integrated" && env.suite.runs.length === 1, "suite running");
+    env.w.checkScript.push(errorResult("spawn"), errorResult("spawn"), errorResult("spawn"));
+    env.queue.enqueue(["T2"]);
+    await env.until(() => env.ledger.status === "paused", "serial paused");
+    openGate();
+    await env.until(() => env.writer.openIntegration().length === 2 && env.ledger.inbox.filter(i => i.severity === "critical").length === 2, "both stalled");
+    suiteErr = false;
+    env.suite.runGate = null;
+    await unpause(env);
+    await env.until(() => env.state("T2") === "integrated" && env.phase("p1").gate === "awaiting-qa" && env.quiet(), "both rolled back and redone");
+    const rbs = (await env.events()).filter(isStep).filter(e => e.step === "rollback" && e.edge === "start").map(e => e.entry.kind);
+    expect(rbs.sort()).toEqual(["phase-suite", "task"]);
+    env.assertInvariants();
+  });
+
+  it("QA-3.2-21: a stalled sub-batch is rolled back to the tip of the task owning the slot, not the batch's last task", async () => {
+    const env = await setup({ tasks: 3, batchMax: 4 });
+    env.w.conflictOnMate.add("T2");
+    env.w.checkScript.push(PASS, errorResult("spawn"), errorResult("spawn"), errorResult("spawn"));
+    env.queue.enqueue(["T1", "T2", "T3"]);
+    await env.until(() => env.ledger.status === "paused", "paused on T2's checks");
+    expect([env.state("T1"), env.state("T2"), env.state("T3")]).toEqual(["integrated", "integrating", "integrated"]);
+    const t2Tip = env.w.branches.get(`refs/heads/omr/${PLAN_ID}/t/T2`);
+    const t3Tip = env.w.branches.get(`refs/heads/omr/${PLAN_ID}/t/T3`);
+    const before = env.pool.resets.length;
+    await unpause(env);
+    await env.until(() => env.state("T2") === "integrated" && env.quiet(), "T2 integrated");
+    expect(env.pool.resets[before]).toEqual({ slot: "slot-2", commit: t2Tip });
+    expect(env.pool.resets.slice(before).some(r => r.slot === "slot-2" && r.commit === t3Tip)).toBe(false);
+    env.assertInvariants();
   });
 
   it("a preempted check does not count toward the 3 tries", async () => {
@@ -1790,6 +2244,17 @@ describe("phase suite and revert", () => {
     env.assertInvariants();
     await env.queue.dispose();
   });
+
+  for (const [reason, says] of [["base-unparsed", "could not be parsed"], ["outside", "outside the phase's task ranges"], ["no-base", "no recorded base"]] as const) {
+    it(`an unattributed verdict (${reason}) names its reason in the critical item and pauses the phase`, async () => {
+      const env = await suiteEnv(1, () => ({ kind: "unattributed", ids: ["test:x"], reason }));
+      await env.until(() => env.phase().paused && env.quiet());
+      expect(env.ledger.inbox[0]?.text).toContain(says);
+      expect(env.ledger.inbox[0]?.text).toContain(`(${reason})`);
+      expect(env.phase().gate).toBe("suite-running");
+      env.assertInvariants();
+    });
+  }
 
   it("a suite that cannot run (error) pauses the plan (M13a) and leaves the entry open", async () => {
     const env = await suiteEnv(1, () => ({ kind: "error", reason: "spawn", message: "no node" }));
@@ -2071,7 +2536,8 @@ describe("resume (A1-3, A2-5, M31)", () => {
     env.w.branches.delete(INT_REF);
     const report = await env.queue.resume();
     expect(report.halted).toBe(true);
-    expect(env.ledger.inbox[0]?.text).toContain("(missing)");
+    // QA-3.2-9 wording: the missing ref is named precisely, with the 5.1 handoff.
+    expect(env.ledger.inbox[0]?.text).toContain(`The integration branch ref ${INT_REF} does not exist`);
     await env.queue.dispose();
   });
 
@@ -2250,8 +2716,10 @@ describe("lanes (M4): no lost wake-up", () => {
 
   it("background: a suite queued after the loop found no suite, before it cleared its running flag, still runs", async () => {
     const env = await setup({ tasks: 0, resume: false, mutate: l => {
-      // p1 has no tasks, so it is integrated and resume starts its suite. p2 is `suite-running` with no open entry (the A2-1
-      // recovery row) but paused, so resume leaves it alone until the test unpauses it.
+      // p1's only task is settled (cancelled), so it is integrated and resume starts its suite (a phase with no task of its
+      // own skips the suite, QA-3.2-19). p2 is `suite-running` with no open entry (the A2-1 recovery row) but paused, so
+      // resume leaves it alone until the test unpauses it.
+      l.tasks.D = taskNode("D", { state: "cancelled" });
       l.phases.push({ id: "p2", title: "Phase 2", wave: "w1", dependsOn: [], gate: "suite-running", qaRound: 1, paused: true, tag: null });
       l.waves[0]?.phases.push("p2");
     } });
@@ -2930,7 +3398,8 @@ describe("resume of open tag, land and suite entries", () => {
     await expect(env.queue.land()).rejects.toThrow("crash after append");
     await env.restart();
     const real = env.igit.readRef.bind(env.igit);
-    env.igit.readRef = async (cwd, ref) => cwd === TOPLEVEL ? Promise.reject(new Error("no ref")) : real(cwd, ref); // base unreadable
+    // Base unreadable (git error on the base ref only; the integration branch is read in the toplevel too since QA-3.2-9).
+    env.igit.readRef = async (cwd, ref) => ref === MAIN_REF ? Promise.reject(new Error("no ref")) : real(cwd, ref);
     const report = await env.queue.resume();
     expect(report.entries).toEqual([expect.objectContaining({ kind: "land", action: "rerun" })]);
     await env.settle();
@@ -3186,9 +3655,22 @@ describe("land failure modes", () => {
     const env = await setup({ tasks: 0, mutate: completed });
     await env.queue.land();
     const real = env.igit.readRef.bind(env.igit);
-    env.igit.readRef = async (cwd, ref) => cwd === TOPLEVEL ? Promise.reject(new Error("no ref")) : real(cwd, ref);
+    // Only the base branch read fails (git error). The integration branch is read in the toplevel too since QA-3.2-9, so a
+    // cwd-wide failure would now hit that read as well (covered by the next test).
+    env.igit.readRef = async (cwd, ref) => ref === MAIN_REF ? Promise.reject(new Error("no ref")) : real(cwd, ref);
     await env.queue.land();
     expect(env.lander.landCalls).toHaveLength(2);
+  });
+
+  it("QA-3.2-9: a land whose integration branch git cannot read ends refused with an item; nothing escapes, nothing lands", async () => {
+    const env = await setup({ tasks: 0, mutate: completed });
+    env.igit.readRef = async () => { throw new Error("spawn git EAGAIN"); };
+    const r = await env.queue.land();
+    expect(r.landed).toBe(false);
+    expect(r.inbox?.text).toContain("could not read");
+    expect(env.lander.landCalls).toHaveLength(0);
+    expect(await env.steps("land")).toEqual(["land:land:start", "land:land:end/refused"]);
+    env.assertInvariants();
   });
 });
 
@@ -3434,12 +3916,13 @@ describe("serial lane: rare arms", () => {
     env.assertInvariants();
   });
 
-  it("an integration branch deleted during the checks halts with `(missing)` and moves nothing", async () => {
+  it("an integration branch deleted during the checks halts naming the missing ref and moves nothing", async () => {
     const env = await setup({ tasks: 1 });
     env.w.afterCheck = () => { env.w.branches.delete(INT_REF); };
     env.queue.enqueue(["T1"]);
     await env.until(() => env.ledger.status === "paused", "the halt");
-    expect(env.ledger.inbox[0]?.text).toContain("(missing)");
+    // QA-3.2-9 wording: the missing ref is named precisely.
+    expect(env.ledger.inbox[0]?.text).toContain(`The integration branch ref ${INT_REF} does not exist`);
     expect(env.w.writes.some(x => x.op === "branchForce" || x.op === "mergeFfOnly")).toBe(false);
     expect((await env.steps("task")).slice(-1)).toEqual(["task:fast-forward:end/refused"]);
     // (no assertInvariants: the world's I1 check reads a missing branch as the tip "", which this test deleted on purpose)
@@ -3764,7 +4247,8 @@ describe("concurrent checkPhase calls", () => {
   });
 
   it("two calls on an integrated phase with a suite queue it twice; the second run is skipped by the gate guard", async () => {
-    const env = await setup({ tasks: 0, resume: false });
+    // The phase needs a task of its own (settled), or it skips the suite (QA-3.2-19).
+    const env = await setup({ tasks: 0, resume: false, mutate: l => { l.tasks.D = taskNode("D", { state: "cancelled" }); } });
     env.suite.resolution = RUNS;
     await Promise.all([env.queue.checkPhase("p1"), env.queue.checkPhase("p1")]);
     await env.queue.resume();
@@ -3803,6 +4287,164 @@ describe("concurrent checkPhase calls", () => {
     expect(env.w.integratedCount()).toEqual({});
     env.assertInvariants();
   });
+});
+
+describe("QA-3.2-15 / QA-3.2-16: tags after completion, row-34 batch with an in-flight qa dependent", () => {
+  const passed = (l: LedgerV1): void => { const p = l.phases[0]; if (p !== undefined) p.gate = "passed"; };
+
+  it("QA-3.2-15: a phase that passed but is untagged when the plan completed is still tagged", async () => {
+    const env = await setup({ tasks: 0, resume: false, mutate: l => { passed(l); l.status = "completed"; } });
+    await env.queue.resume();
+    await env.until(() => env.phase().tag !== null && env.quiet(), "tagged");
+    expect(env.phase().tag).toBe(`omr/${PLAN_ID}/phase/p1`);
+    expect(env.ledger.status).toBe("completed");
+    env.assertInvariants();
+  });
+
+  it("QA-3.2-15: a tag entry rolled back by the stalled poll comes due again and is tagged", async () => {
+    const env = await setup({ tasks: 0, resume: false, mutate: passed });
+    env.lander.tagOutcome = { kind: "error", message: "git tag failed" };
+    await env.queue.resume();
+    await env.until(() => env.ledger.status === "paused" && env.quiet() === false, "tag stalled");
+    env.lander.tagOutcome = null;
+    await unpause(env);
+    await env.until(() => env.phase().tag !== null && env.quiet(), "tagged after the unpause");
+    expect((await env.steps("tag")).filter(s => s === "tag:rollback:start")).toHaveLength(1);
+    env.assertInvariants();
+  });
+
+  it("QA-3.2-16: the row-34 batch ends an in-flight qa dependent at max(now, startedAt) and writes its G2 gate event", async () => {
+    const future = "2026-12-31T00:00:00.000Z" as IsoTime;
+    // A valid draft (Q pending, p2 pending and listed by its wave); Q gets in flight through journaled batches while the p1
+    // suite is held, as the dependents test does. p2 has no task of its own, so resume opens its QA gate (QA-3.2-19).
+    const env = await setup({ tasks: 1, batchMax: 1, mutate: l => {
+      l.phases.push({ id: "p2", title: "Phase 2", wave: "w1", dependsOn: [], gate: "pending", qaRound: 1, paused: false, tag: null });
+      l.waves[0]?.phases.push("p2");
+      l.tasks.Q = taskNode("Q", { kind: "qa", phase: "p2" });
+      l.edges.push({ from: "T1", to: "Q", kind: "structural", confidence: "high", evidence: "order" });
+    } });
+    expect(env.phase("p2").gate).toBe("awaiting-qa");
+    env.suite.resolution = RUNS;
+    env.suite.onRun = culpritOf("T1");
+    let release!: () => void;
+    env.suite.runGate = new Promise<void>(resolve => { release = resolve; });
+    env.queue.enqueue(["T1"]);
+    await env.until(() => env.suite.runs.length === 1, "the held suite");
+    await env.writer.append([{ type: "task-transition", taskId: "Q", from: "pending", to: "ready", trigger: "deps-satisfied", detail: null }]);
+    // The attempt starts in the future of the queue's clock: endedAt must not precede it (A2-6).
+    await env.writer.append([
+      { type: "attempt-started", taskId: "Q", attempt: { ...openAttempt(1), startedAt: future } },
+      { type: "task-transition", taskId: "Q", from: "ready", to: "dispatched", trigger: "launch", detail: null },
+      { type: "task-slot", taskId: "Q", slot: "slot-q", branch: `omr/${PLAN_ID}/t/Q` },
+      { type: "gate-changed", phaseId: "p2", from: "awaiting-qa", to: "qa-running", trigger: "qa-dispatched", qaRound: 1 },
+    ]);
+    await env.writer.append([
+      { type: "attempt-child", taskId: "Q", n: 1, childSessionID: "ses-child-q" },
+      { type: "task-transition", taskId: "Q", from: "dispatched", to: "running", trigger: "child-created", detail: null },
+    ]);
+    expect(env.state("Q")).toBe("running");
+    expect(env.phase("p2").gate).toBe("qa-running");
+    release();
+    await env.until(() => env.state("T1") === "reverted" && env.phase().gate === "pending" && env.quiet(), "revert completion");
+    expect(env.ledger.status).toBe("running"); // the row-34 batch was accepted (no illegal-transition pause)
+    expect(env.state("Q")).toBe("blocked");
+    expect(env.phase("p2").gate).toBe("awaiting-qa");
+    expect(env.ledger.tasks.Q?.attempts[0]?.endedAt).toBe(future);
+    const g2 = env.w.journal.find(e => e.type === "gate-changed" && e.phaseId === "p2" && e.trigger === "qa-requeued");
+    expect(g2).toMatchObject({ from: "qa-running", to: "awaiting-qa" });
+    expect(env.settled).toEqual(["Q"]);
+    env.assertInvariants();
+  });
+});
+
+describe("QA-3.2-10: re-integrating a reverted task", () => {
+  it("a reverted task whose commit lies below the merge base (ff without rebase) is rebased from its reverted range's from", async () => {
+    let F = "";
+    let C1 = "";
+    let R = "";
+    const env = await setup({ tasks: 1, resume: false, mutate: (l, w) => {
+      F = w.base;
+      C1 = w.branches.get(`refs/heads/omr/${PLAN_ID}/t/T1`) ?? ""; // fast-forwarded as is: the task commit is on the branch
+      R = w.commit(C1, null, "T1").sha; // the revert commit is the integration head
+      const X = w.commit(C1, "T1").sha; // the retry branch: the old task branch plus a fix
+      w.branches.set(`refs/heads/omr/${PLAN_ID}/t/T1`, X);
+      w.slotCommit.set("slot-1", X);
+      w.branches.set(INT_REF, R);
+      w.passed.add(R);
+      l.integration.head = R;
+    } });
+    const rv: IntegrationEntry = { id: "i-900", kind: "revert", phaseId: "p1", taskIds: ["T1"], slot: "integration", baseHead: C1, candidate: R };
+    env.historyExtra = [
+      stepEvent(rv, { step: "revert-fast-forward", edge: "start", detail: JSON.stringify({ v: 1, from: C1, to: R, culprit: { taskId: "T1", from: F, to: C1 }, suiteCommit: C1 }) }),
+      stepEvent(rv, { step: "revert-fast-forward", edge: "end", result: "ok", closes: true, detail: JSON.stringify({ v: 1, from: C1, to: R }) }),
+    ];
+    const upstreams: string[] = [];
+    const g: GitOps = env.git;
+    const real = env.git.rebaseOnto.bind(env.git);
+    g.rebaseOnto = async (cwd, onto, upstream) => { upstreams.push(upstream); return real(cwd, onto); };
+    env.igit.mergeBase = async () => C1; // merge-base(R, X) = C1: rebasing from it would replay only the fix
+    await env.queue.resume();
+    env.queue.enqueue(["T1"]);
+    await env.until(() => env.state("T1") === "integrated" && env.quiet(), "T1 re-integrated");
+    expect(upstreams).toEqual([F]);
+    env.assertInvariants();
+  });
+
+  it("a retry branch built on the reverted head (it contains the revert) keeps the merge base", async () => {
+    let C1 = "";
+    let R = "";
+    const env = await setup({ tasks: 1, resume: false, mutate: (l, w) => {
+      C1 = w.branches.get(`refs/heads/omr/${PLAN_ID}/t/T1`) ?? "";
+      R = w.commit(C1, null, "T1").sha;
+      const X = w.commit(R, "T1").sha; // rebuilt from the current head: the original change is redone in X
+      w.branches.set(`refs/heads/omr/${PLAN_ID}/t/T1`, X);
+      w.slotCommit.set("slot-1", X);
+      w.branches.set(INT_REF, R);
+      w.passed.add(R);
+      l.integration.head = R;
+    } });
+    const rv: IntegrationEntry = { id: "i-901", kind: "revert", phaseId: "p1", taskIds: ["T1"], slot: "integration", baseHead: C1, candidate: R };
+    env.historyExtra = [
+      stepEvent(rv, { step: "revert-fast-forward", edge: "start", detail: JSON.stringify({ v: 1, from: C1, to: R, culprit: { taskId: "T1", from: env.w.base, to: C1 }, suiteCommit: C1 }) }),
+      stepEvent(rv, { step: "revert-fast-forward", edge: "end", result: "ok", closes: true, detail: JSON.stringify({ v: 1, from: C1, to: R }) }),
+    ];
+    const upstreams: string[] = [];
+    const g: GitOps = env.git;
+    const real = env.git.rebaseOnto.bind(env.git);
+    g.rebaseOnto = async (cwd, onto, upstream) => { upstreams.push(upstream); return real(cwd, onto); };
+    env.igit.mergeBase = async () => R;
+    await env.queue.resume();
+    env.queue.enqueue(["T1"]);
+    await env.until(() => env.state("T1") === "integrated" && env.quiet(), "T1 re-integrated");
+    expect(upstreams).toEqual([R]);
+    env.assertInvariants();
+  });
+});
+
+describe("QA-3.2-2: a suite state is never left without a run", () => {
+  for (const gate of ["suite-running", "suite-failed"] as const) {
+    it(`gate ${gate} while the suite resolves to none: phase paused, critical item, gate unchanged; restored tests + unpause run it`, async () => {
+      const env = await setup({ tasks: 0, resume: false, mutate: l => { const p = l.phases[0]; if (p !== undefined) p.gate = gate; } });
+      env.suite.resolution = { kind: "none" };
+      await env.queue.resume();
+      await env.until(() => env.phase().paused && env.quiet(), "phase paused");
+      await env.settle();
+      expect(env.phase().gate).toBe(gate);
+      const item = env.ledger.inbox[env.ledger.inbox.length - 1];
+      expect(item?.severity).toBe("critical");
+      expect(item?.text).toContain('"none"');
+      expect(item?.text).toContain(env.ledger.integration.head);
+      expect(item?.text).toContain(gate);
+      expect((await env.events()).some(e => e.type === "gate-changed")).toBe(false);
+      expect(env.suite.runs).toHaveLength(0);
+      env.suite.resolution = RUNS;
+      await env.writer.append([{ type: "phase-paused", phaseId: "p1", paused: false, reason: "unpause" }]);
+      await env.queue.checkPhase("p1");
+      await env.until(() => env.phase().gate === "awaiting-qa" && env.quiet(), "the suite ran");
+      expect(env.suite.runs).toHaveLength(1);
+      env.assertInvariants();
+    });
+  }
 });
 
 describe("tag and land: rare arms", () => {
