@@ -554,3 +554,84 @@ a `decrease` 1→1 metric so restore sees it, returning `decreased: false`; metr
 pause end for a pause, `null` otherwise (`capacityRestoreFromEvents` relies on it); `capacityView` reads used counts via
 a module-level WeakMap and answers `canAcquire ? 1 : 0` for foreign controllers; `onMetric` errors propagate (metrics
 are emitted after the state change).
+
+## Findings
+
+Three QA rounds, all [tier:heavy] reviewers:
+
+| Round | Reviewer session | Commit | Findings | Status |
+|---|---|---|---|---|
+| 1 | `ses_ecd85bfcaffeh1jG4NqEcg5Bkb` | `630189e` | 22: 1 blocking (QA-3.1-1), 1 critical (-2), 6 major (-3..-8), 7 minor (-9..-15), 7 nits | fixed in `adebd69`, `badd716` |
+| 2 | `ses_ecd5a78a8ffeVCMcfhfa7u7WUg` | `badd716` | 13: 2 major (QA-3.1-16, -17), 6 minor (-18..-23), 5 nits (-24..-28) | fixed in `49a8526` |
+| 3 (bounded, §0.7) | `ses_ecd2a02f9ffedIwjEU31z244i3` | `49a8526` | QA-3.1-16 and -17 confirmed fixed; no new blocking/critical/major; 4 minor | minors deferred |
+
+## Fixes
+
+- Round 1, `adebd69` (capacity, launch, expand): one capacity increase per generation (-13); bounded step and session
+  maps (-15); stale context only for context-related runner errors (-4, launcher part); quoted slot roots with
+  whitespace (nit 5); `expandTask` documented as deterministic per slot registration (nit 3).
+- Round 1, `badd716` (runtime, adapter): the runtime subscribes host events in `start()` (-1); plan-child grant
+  computed with `grantFor` (-2); the retry stop is applied as `event.decision = {retry:false}` (-3); pre-confirmation
+  loss streak pauses after 3 (-4); waker re-arm floor and no journaled `debounced` wakes (-5); backoff tick after a
+  skipped launch, provisioning inbox item, `onLeaseReleased()` (-6); one active plan per process (-7, A-3.1-1);
+  adapter-owned step keys and a `step.ended` event (-8); M41 anchored grammar and a shared in-flight check (-9);
+  executor-owned attempts not journaled (-10); capacity view per tick, resolver errors handled per task (-11);
+  row-4b append leak fixes (-12); ticks start launch steps without awaiting them (-14); unpin and forget (-15); nits 1,
+  2, 4, 7; CHANGELOG Security entry.
+- Round 2, `49a8526`: M41 accepts the v2 host preamble line (-16, security regression of round 1); the loss streak
+  counts once per capture (-17); synchronous single-plan reservation (-18); passive attach of a refused plan, running
+  plans preferred at start, single-plan check before `recovery.adopt` (-19); memo amendments (-20); early step key in
+  the retry hook (-21); resolver failures uncounted with backoff (-22); token taken before the task mutex (-23);
+  runner status from the settled end (-24); L17 counted at dispose (-25); backoff cleared on resume (-26); fallback
+  step counter closes on `step.ended` (-27); U+2028/U+2029 refused in slot roots (-28).
+- Defects found while writing tests (fixed): `runtime.dispose` waited forever on a live child (`e9699c3`); a
+  debounced plan-completed wake was never re-sent (`630189e`).
+
+## Coverage
+
+Orchestrator run on 2026-10-12 at `49a8526` (`schedule`, `capacity`, `expand`, `launch`, `runtime` unit
+tests plus `v2-executor-launch`): 419 passed.
+
+| File | Statements | Branches | Functions | Lines |
+|---|---|---|---|---|
+| `src/executor/schedule.ts` | 100 | 99.18 | 100 | 100 |
+| `src/executor/capacity.ts` | 98.84 | 93.75 | 100 | 100 |
+| `src/executor/expand.ts` | 100 | 95.57 | 100 | 100 |
+| `src/executor/launch.ts` | 97.95 | 96.17 | 95.45 | 100 |
+| `src/executor/runtime.ts` | 96.25 | 90.91 | 100 | 98.27 |
+
+Scoped regression set (13 files: executor units, `v2-hooks`, `v2-executor-launch`, `v2-client`,
+`roles.binding`, `completion-processor`, `v2-background`, `v2-background-restart`, `docs-drift`): 916/916,
+`tsc --noEmit` clean.
+
+## Deferred findings
+
+Round-3 minors (bounded round, §0.7):
+- Tiers mode: a launcher prompt hand-dispatched through the `task` tool gets the router's tier header first, so M41
+  treats it as ordinary (by design; roles mode is covered).
+- Interleaved captures C1, C2, C1 recount the loss streak (only the last capture is remembered).
+- The capture key is `callID` only, not boot id or epoch.
+- Test gaps: the streak's ignore branch; the parallel test's second-round count; an M41 fallback test with the
+  recorded `{type:"user", text}` shape.
+Other: `WakeReason` has no `plan-refused` (the refusal wake uses `inbox` with key `plan-refused:<plan>:<active>`).
+
+## Handoffs
+
+- 5.1 (executor construction and `router_plan`): build the executor through `options.executor` in
+  `registerV2Hooks`; supply a synchronous `RouteResolver` (`dispatchRouter.route` is async); an executor
+  decision-row writer tagged `source: "executor"`; `DispatchBookkeeping` and `onChildEnd` have no planId (safe
+  under A-3.1-1); the adapter already calls `onLeaseReleased()`.
+- 3.2/5.1: reverted culprits must retry on their old branch (QA-3.2-10).
+- DF-1.1-4 (leases keyed by repository) is a separate fix phase.
+
+## Plan amendments
+
+- A-3.1-1 (QA-3.1-7): the runtime runs one active plan per process; memo M20 and risk 3 amended.
+- QA-3.1-9 (a) / QA-3.1-16: M41 recognises the launcher prompt at offset 0 or after the host preamble line only.
+- QA-3.1-21: memo M19 notes the early step key.
+- ADR 0007 wording: the quota pause uses the first *future* ISO instant (nit 6).
+- QA-3.1-3: the C10 retry stop is applied through `SessionRetry.decision`; no ADR change.
+
+## Verdict
+
+Done at `49a8526`. `npm run smoke:cpx` on 2026-10-12 at `49a8526` with OpenCode 2.0.26: 5 files, 57/57 passed (561 s). Merged into `cpx/main`.
