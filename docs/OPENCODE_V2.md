@@ -284,6 +284,15 @@ Missing host text or a non-suffix rewrite instead uses the full router output as
 one text part, retaining non-text attachments without duplicating the child text.
 See [CHANGELOG](../CHANGELOG.md).
 
+## Plan executor
+
+The plan executor compiles a written plan into a ledger and runs its tasks in parallel in isolated worktree slots,
+integrating them one at a time into an always-green integration branch. It is **v2 only**: OpenCode v1 ignores the
+`routing.executor.*` keys (one notice per process). **It is not active yet**: the `router_plan` tool, the `/plan`
+command and the executor instructions exist in the code, but a later phase registers them, so a v2 host does not see
+them today. See [EXECUTOR.md](EXECUTOR.md) for the concepts, the `/plan` commands, the `router_plan` actions, the
+`routing.executor.*` configuration and the trust rules.
+
 ## Validation
 
 Focused tests cover the exact module schema failure, preservation of the callable

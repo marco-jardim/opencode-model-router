@@ -34,6 +34,8 @@ import { CRITERIA_BUDGET_CHARS } from "../../src/verify/dod";
 import { RENDERED_REASONS_MAX } from "../../src/verify/dispatch";
 import { GRADER_REASONS_MAX } from "../../src/verify/checker";
 import { oneLineReason } from "../../src/routing/roles/authority";
+import { PLAN_HELP_LINES } from "../../src/commands/output";
+import { ROUTER_PLAN_ACTIONS } from "../../src/executor/tool";
 import { CREDENTIAL_ENV_RE } from "../../src/router/run-tools";
 import { ROLES_RESTART_NOTICE } from "../../src/compat/v2-hooks";
 import { parseJsonc } from "../../src/router/jsonc";
@@ -294,6 +296,107 @@ function readRepo(path: string): string | undefined {
     return code === "EISDIR" ? "" : undefined;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Plan executor (OpenCode v2 only, not registered yet): docs/EXECUTOR.md names every `/plan` subcommand, every
+// `router_plan` action and every `routing.executor` leaf key. Removing one from the doc fails these pins.
+// ---------------------------------------------------------------------------
+
+/** The `/plan` subcommands of the help lines: "- `/plan pause|resume|abort <planId>` — ..." gives pause, resume, abort. */
+function planSubcommands(lines: readonly string[]): string[] {
+  const subs: string[] = [];
+  for (const line of lines) {
+    const match = /^- `\/plan ([a-z|-]+)/.exec(line);
+    if (match !== null) subs.push(...match[1]!.split("|").filter((s) => s.length > 0));
+  }
+  return subs;
+}
+
+/** Dotted leaf paths of `routing.executor` defaults (`slotsDir` is a leaf although its default is null). */
+function executorLeafKeys(defaults: Record<string, unknown>, prefix = ""): string[] {
+  const keys: string[] = [];
+  for (const [name, value] of Object.entries(defaults)) {
+    if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+      keys.push(...executorLeafKeys(value as Record<string, unknown>, `${prefix}${name}.`));
+    } else {
+      keys.push(`${prefix}${name}`);
+    }
+  }
+  return keys;
+}
+
+/** What `doc` lacks of the plan executor surface: one entry per missing command, action or config key. */
+function executorDocProblems(doc: string): string[] {
+  const problems: string[] = [];
+  for (const sub of planSubcommands(PLAN_HELP_LINES)) {
+    if (!doc.includes(`| \`/plan ${sub}`)) problems.push(`/plan ${sub}`);
+  }
+  for (const action of ROUTER_PLAN_ACTIONS) {
+    if (!doc.includes(`| \`${action}\` |`)) problems.push(`router_plan action ${action}`);
+  }
+  for (const key of executorLeafKeys(ROUTING_DEFAULTS.executor as unknown as Record<string, unknown>)) {
+    if (!doc.includes(`\`routing.executor.${key}\``)) problems.push(`routing.executor.${key}`);
+  }
+  return problems;
+}
+
+describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
+  const doc = read("docs/EXECUTOR.md");
+
+  it("sees the surface it pins", () => {
+    expect(planSubcommands(PLAN_HELP_LINES).sort()).toEqual(
+      ["abort", "adopt", "answer", "inbox", "land", "pause", "resume", "run", "status"],
+    );
+    expect(ROUTER_PLAN_ACTIONS.length).toBeGreaterThanOrEqual(16);
+    expect(executorLeafKeys(ROUTING_DEFAULTS.executor as unknown as Record<string, unknown>)).toContain("circuitBreaker.minAttempts");
+  });
+
+  it("names every /plan subcommand, router_plan action and routing.executor key", () => {
+    expect(executorDocProblems(doc)).toEqual([]);
+  });
+
+  it("fails when a command, an action or a key is removed", () => {
+    const leaf = executorLeafKeys(ROUTING_DEFAULTS.executor as unknown as Record<string, unknown>)[0]!;
+    expect(executorDocProblems(doc.replaceAll("| `/plan adopt", "| `/plan x"))).toContain("/plan adopt");
+    expect(executorDocProblems(doc.replaceAll("| `purge` |", "| `purged` |"))).toContain("router_plan action purge");
+    expect(executorDocProblems(doc.replaceAll(`\`routing.executor.${leaf}\``, "`routing.executor.x`"))).toContain(`routing.executor.${leaf}`);
+    expect(executorDocProblems(doc.replaceAll("`routing.executor.circuitBreaker.minAttempts`", "`x`"))).toContain(
+      "routing.executor.circuitBreaker.minAttempts",
+    );
+  });
+
+  it("keeps the Unattended operation, QA loop and Recovery placeholders until Phase 4.2/5.1", () => {
+    for (const heading of ["## Unattended operation", "## QA loop", "## Recovery"]) {
+      const section = sectionOf(doc, heading);
+      expect(section, heading).not.toBe("");
+      expect(section, heading).toContain("Phase 4.2/5.1");
+      expect(section, heading).toContain("4.2.6.a");
+    }
+  });
+
+  it("says the executor is v2 only and not registered yet, and OPENCODE_V2.md links to it", () => {
+    expect(doc).toMatch(/not active yet/);
+    expect(doc).toMatch(/\*\*v2 only\*\*/);
+    const v2 = read("docs/OPENCODE_V2.md");
+    expect(v2).toContain("(EXECUTOR.md)");
+    expect(sectionOf(v2, "## Plan executor")).toMatch(/not active yet/);
+  });
+
+  it("has links that resolve", () => {
+    expect(brokenLinks(["docs/EXECUTOR.md", "docs/OPENCODE_V2.md"], readRepo)).toEqual([]);
+  });
+
+  it("describes the 4.1 surface in the changelog as v2-only and not registered yet", () => {
+    const changelog = read("CHANGELOG.md").replace(/\r\n/g, "\n");
+    const start = changelog.indexOf("## [Unreleased]");
+    const next = changelog.indexOf("\n## [", start + 1);
+    const unreleased = changelog.slice(start, next === -1 ? undefined : next);
+    expect(unreleased).toContain("routing.executor");
+    expect(unreleased).toContain("router_plan");
+    expect(unreleased).toContain("/plan");
+    expect(unreleased).toMatch(/not registered/);
+  });
+});
 
 /** Dotted paths of the leaves of a nested defaults object. */
 function leafPaths(value: Record<string, unknown>, prefix = ""): string[] {
