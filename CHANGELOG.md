@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.8.0] - 2026-10-13
+
 ### Added
 
 - **Approve repositories outside routing.repoParents with /router approve (OpenCode v2, roles mode; inert on v1)
