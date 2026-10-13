@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, parse } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -6,6 +6,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vites
 import {
   ROUTING_DEFAULTS,
   collectRoutingNotices,
+  configAsWritten,
   configuredV2OnlyKeys,
   findUnknownRoutingKeys,
   getConfigNotices,
@@ -20,6 +21,13 @@ import {
   type RouterConfig,
 } from "../../src/router/config";
 import { EXECUTOR_LIMITS } from "../../src/executor/types";
+import { removeDirWhenReleased } from "../helpers/remove-dir";
+
+// The plugin booted by the QA-4.1-9 test must not sweep reference directories (as in finish-attach.test.ts).
+vi.mock("../../src/verify/reference", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../src/verify/reference")>()),
+  gcStaleReferences: async () => ({ removed: [], kept: [], failed: [] }),
+}));
 
 const bundled = JSON.parse(readFileSync(fileURLToPath(new URL("../../tiers.json", import.meta.url)), "utf-8")) as Record<
   string,
@@ -224,7 +232,8 @@ describe("validateSlotsDir — repository-relative rules", () => {
   afterAll(() => rmSync(sandbox, { recursive: true, force: true }));
 
   const isWin = process.platform === "win32";
-  const real = realpathSync(sandbox);
+  // Native: a temporary directory under an 8.3 short name (`MARQUI~1`) is spelled out, which slotsDirProblem requires.
+  const real = realpathSync.native(sandbox);
 
   it.runIf(isWin)("accepts a sibling directory, existing or not", () => {
     expect(validateSlotsDir(join(real, "slots"), join(real, "repo"))).toEqual({ ok: true });
@@ -259,6 +268,61 @@ describe("validateSlotsDir — repository-relative rules", () => {
     expect(validateSlotsDir("C:\\", repo).ok).toBe(false);
     expect(validateSlotsDir("C:\\a\\*", repo).ok).toBe(false);
     expect(validateSlotsDir("rel", repo).ok).toBe(false);
+  });
+
+  it.runIf(isWin)("QA-4.1-4: refuses a path that reaches into the repository through a junction", () => {
+    const top = join(real, "repo");
+    const link = join(real, "junction-to-repo");
+    symlinkSync(top, link, "junction");
+    for (const inside of [link, join(link, "sub"), join(link, "new", "dir")]) {
+      const verdict = validateSlotsDir(inside, top);
+      expect(verdict.ok, inside).toBe(false);
+      expect(verdict.ok ? "" : verdict.reason).toContain("inside");
+    }
+    // The repository reached through the junction: the sibling is still fine, its inside still is not.
+    expect(validateSlotsDir(join(real, "slots"), link)).toEqual({ ok: true });
+    expect(validateSlotsDir(join(top, "sub"), link)).toEqual({ ok: false, reason: "must not be inside the repository" });
+  });
+
+  it.runIf(isWin)("QA-4.1-4: accepts a sibling worktree whose name extends the repository's", () => {
+    const top = join(real, "repo");
+    mkdirSync(join(real, "repo-wt"), { recursive: true });
+    expect(validateSlotsDir(join(real, "repo-wt"), top)).toEqual({ ok: true });
+    expect(validateSlotsDir(join(real, "repo-wt", "slots"), top)).toEqual({ ok: true });
+    expect(validateSlotsDir(join(real, "repo.wt", "slots"), top)).toEqual({ ok: true });
+  });
+
+  it("QA-4.1-4: compares forward-slash drive paths with the host's path rules, on every OS", () => {
+    // On win32 these are paths on the working directory's drive; on posix the posix branch compares them as relative names.
+    const drive = isWin ? parse(process.cwd()).root.slice(0, 2) : "C:";
+    const top = `${drive}/omr-qa-4-1-4-missing/repo`;
+    expect(validateSlotsDir(`${top}/slots`, top)).toEqual({ ok: false, reason: "must not be inside the repository" });
+    expect(validateSlotsDir(`${drive}/omr-qa-4-1-4-missing`, top)).toEqual({ ok: false, reason: "must not be an ancestor of the repository" });
+    expect(validateSlotsDir(`${drive}/omr-qa-4-1-4-missing/repo-wt`, top)).toEqual({ ok: true });
+  });
+
+  it.each([
+    ["a trailing dot", "C:\\work\\slots."],
+    ["a segment ending in a dot", "C:\\work.\\slots"],
+    ["a dot segment", "C:\\work\\.\\slots"],
+    ["a trailing space", "C:\\work\\slots "],
+    ["a segment ending in a space", "C:\\work \\slots"],
+    ["an 8.3 short name", "C:\\PROGRA~1\\slots"],
+    ["an 8.3 short name with an extension", "C:\\work\\SLOTS~12.DIR"],
+    ["a forward-slash short name", "C:/work/REPO~2/slots"],
+  ])("QA-4.1-4: refuses %s, in slotsDirProblem, the config and validateSlotsDir alike", (_label, bad) => {
+    expect(slotsDirProblem(bad), bad).toBeDefined();
+    expect(executorOf({ slotsDir: bad }).slotsDir, bad).toBeNull();
+    expect(validateSlotsDir(bad, repo).ok, bad).toBe(false);
+  });
+
+  it("QA-4.1-4: names the trailing-character and short-name rules, and keeps a plain '~' or dot", () => {
+    expect(slotsDirProblem("C:\\work\\slots.")).toContain("ending in '.' or a space");
+    expect(slotsDirProblem("C:\\work\\slots ")).toContain("ending in '.' or a space");
+    expect(slotsDirProblem("C:\\PROGRA~1\\slots")).toContain("8.3 short name");
+    for (const ok of ["C:\\work\\a~b", "C:\\work\\~slots", "C:\\work\\.omr-slots", "C:\\work\\slots.d", "C:\\work\\slots\\"]) {
+      expect(slotsDirProblem(ok), ok).toBeUndefined();
+    }
   });
 });
 
@@ -458,12 +522,13 @@ describe("routing.executor — trust (D18): project-local override", () => {
   });
 
   it("drops the five trusted keys from the project layer, keeps the others, and says so in one notice", () => {
-    writeProject({ routing: { executor: { ...TRUSTED, maxParallel: 2, circuitBreaker: { minAttempts: 7 } } } });
+    // A-4.1-2: the project layer may only tighten, so the kept keys are tighter than the defaults.
+    writeProject({ routing: { executor: { ...TRUSTED, maxParallel: 2, circuitBreaker: { minAttempts: 2 } } } });
     const executor = resolveRouting(loadConfig(project), "v2").executor;
     expect(executor).toEqual({
       ...APPENDIX_C_DEFAULTS,
       maxParallel: 2,
-      circuitBreaker: { failureRatio: 0.4, minAttempts: 7, consecutiveFailures: 3 },
+      circuitBreaker: { failureRatio: 0.4, minAttempts: 2, consecutiveFailures: 3 },
     });
     const notices = getConfigNotices(project).map((n) => n.message);
     expect(notices).toHaveLength(1);
@@ -498,7 +563,7 @@ describe("routing.executor — trust (D18): project-local override", () => {
         },
       },
     });
-    writeProject({ routing: { executor: { ...TRUSTED, approve: "auto" } } });
+    writeProject({ routing: { executor: { ...TRUSTED, land: "manual" } } });
     const executor = resolveRouting(loadConfig(project), "v2").executor;
     expect(executor).toMatchObject({
       slotsDir: "D:\\global-slots",
@@ -506,7 +571,191 @@ describe("routing.executor — trust (D18): project-local override", () => {
       phaseSuite: "off",
       provision: { npm: [["npm", "ci"]] },
       python,
-      approve: "auto", // an untrusted key still applies from the project layer
+      land: "manual", // an untrusted key still applies from the project layer when it tightens (A-4.1-2)
     });
+  });
+
+  /** The notices about `routing.executor` (other routing notices are not under test here). */
+  const messages = (): string[] => getConfigNotices(project).map((n) => n.message).filter((m) => m.includes("routing.executor"));
+  const executorNow = () => resolveRouting(loadConfig(project), "v2").executor;
+  const tightenNotice = (key: string): string =>
+    `A18: ignoring routing.executor.${key} from ${projectFile()}: project overrides may only tighten the lower-layer value (A-4.1-2)`;
+
+  it.each([
+    ["null", null],
+    ["an empty array", []],
+    ["a string", "x"],
+    ["zero", 0],
+  ])("QA-4.1-2: a project executor that is %s cannot reset the global trusted keys", (_label, bad) => {
+    const python = TRUSTED.python;
+    writeGlobal({ routing: { executor: { phaseSuite: "off", python } } });
+    writeProject({ routing: { executor: bad } });
+    const executor = executorNow();
+    expect(executor.phaseSuite).toBe("off");
+    expect(executor.python).toBe(python);
+    expect(messages()).toEqual([`ignoring routing.executor from ${projectFile()}: only the global override may set it`]);
+  });
+
+  it("QA-4.1-2: a non-object classifier or outcomes block in the project layer is dropped the same way", () => {
+    writeProject({ routing: { classifier: null, outcomes: [], margin: 0.1 } });
+    expect(loadConfig(project).routing?.margin).toBe(0.1);
+    expect(getConfigNotices(project).map((n) => n.message)).toContain(
+      `ignoring routing.classifier, routing.outcomes from ${projectFile()}: only the global override may set it`,
+    );
+  });
+
+  it.each([
+    ["approve", "auto", "ask"],
+    ["land", "ff-when-clean", "manual"],
+    ["crossPhase", "inferred", "gate"],
+  ] as const)("A-4.1-2: the project may set %s only to its tightest value", (key, loose, tight) => {
+    writeGlobal({ routing: { executor: { [key]: tight } } });
+    writeProject({ routing: { executor: { [key]: loose } } });
+    expect(executorNow()[key]).toBe(tight);
+    expect(messages()).toEqual([tightenNotice(key)]);
+
+    // An invalid project value would mean the default; it cannot loosen the lower value either.
+    writeProject({ routing: { executor: { [key]: "bogus" } } });
+    expect(executorNow()[key]).toBe(tight);
+
+    writeGlobal({ routing: { executor: { [key]: loose } } });
+    writeProject({ routing: { executor: { [key]: tight } } });
+    expect(executorNow()[key]).toBe(tight);
+    expect(messages()).toEqual([]);
+
+    // Restating the lower value is not a loosening.
+    writeProject({ routing: { executor: { [key]: loose } } });
+    expect(executorNow()[key]).toBe(loose);
+    expect(messages()).toEqual([]);
+  });
+
+  it.each([
+    ["approve", "auto"],
+    ["crossPhase", "inferred"],
+  ] as const)("A-4.1-2: without a global value the project cannot loosen %s past its default", (key, loose) => {
+    writeProject({ routing: { executor: { [key]: loose } } });
+    expect(executorNow()[key]).toBe(APPENDIX_C_DEFAULTS[key]);
+    expect(messages()).toEqual([tightenNotice(key)]);
+  });
+
+  it.each(["maxParallel", "batchMax", "maxAttempts", "qaMaxRounds", "sharedContextChars"] as const)(
+    "A-4.1-2: %s from the project is min(lower layer, project value)",
+    (key) => {
+      const [min, max] = EXECUTOR_LIMITS[key];
+      const lower = min + 1;
+      writeGlobal({ routing: { executor: { [key]: lower } } });
+      writeProject({ routing: { executor: { [key]: max } } });
+      expect(executorNow()[key]).toBe(lower);
+      expect(messages()).toEqual([tightenNotice(key)]);
+
+      writeProject({ routing: { executor: { [key]: min } } });
+      expect(executorNow()[key]).toBe(min);
+      expect(messages()).toEqual([]);
+
+      // An invalid project value would mean the (higher) default.
+      writeProject({ routing: { executor: { [key]: "many" } } });
+      expect(executorNow()[key]).toBe(lower);
+      expect(messages()).toEqual([tightenNotice(key)]);
+
+      // Without a global value the default is the ceiling.
+      writeGlobal({});
+      writeProject({ routing: { executor: { [key]: max } } });
+      expect(executorNow()[key]).toBe(APPENDIX_C_DEFAULTS[key]);
+      expect(messages()).toEqual([tightenNotice(key)]);
+    },
+  );
+
+  it("A-4.1-2: the timing keys are not budgets, the project may raise them", () => {
+    writeProject({ routing: { executor: { capacityCooldownMs: 600000, wakeDebounceMs: 10000 } } });
+    expect(executorNow()).toMatchObject({ capacityCooldownMs: 600000, wakeDebounceMs: 10000 });
+    expect(messages()).toEqual([]);
+  });
+
+  it.each([
+    ["failureRatio", 0.3, 0.9, 0.2],
+    ["minAttempts", 3, 20, 2],
+    ["consecutiveFailures", 2, 10, 1],
+  ] as const)("A-4.1-2: circuitBreaker.%s from the project may only be lowered", (key, lower, looser, tighter) => {
+    writeGlobal({ routing: { executor: { circuitBreaker: { [key]: lower } } } });
+    writeProject({ routing: { executor: { circuitBreaker: { [key]: looser } } } });
+    expect(executorNow().circuitBreaker[key]).toBe(lower);
+    expect(messages()).toEqual([tightenNotice(`circuitBreaker.${key}`)]);
+
+    writeProject({ routing: { executor: { circuitBreaker: { [key]: tighter } } } });
+    expect(executorNow().circuitBreaker[key]).toBe(tighter);
+    expect(messages()).toEqual([]);
+
+    writeGlobal({});
+    writeProject({ routing: { executor: { circuitBreaker: { [key]: looser } } } });
+    expect(executorNow().circuitBreaker[key]).toBe(APPENDIX_C_DEFAULTS.circuitBreaker[key]);
+    expect(messages()).toEqual([tightenNotice(`circuitBreaker.${key}`)]);
+  });
+
+  it("A-4.1-2: a project circuitBreaker that is not an object cannot reset the lower values", () => {
+    const tight = { failureRatio: 0.2, minAttempts: 2, consecutiveFailures: 1 };
+    writeGlobal({ routing: { executor: { circuitBreaker: tight } } });
+    writeProject({ routing: { executor: { circuitBreaker: null } } });
+    expect(executorNow().circuitBreaker).toEqual(tight);
+    expect(messages()).toEqual([tightenNotice("circuitBreaker")]);
+  });
+
+  it("QA-4.1-9: an invalid executor value is a v2-only notice, and configAsWritten still names its key", () => {
+    writeGlobal({ routing: { executor: { maxParallel: 99 } } });
+    const cfg = loadConfig(project);
+    expect(cfg.routing?.executor?.maxParallel).toBeUndefined();
+    const executorKeys = (raw: unknown): string[] => configuredV2OnlyKeys(raw).filter((k) => k.startsWith("routing.executor."));
+    expect(executorKeys(cfg)).toEqual([]);
+    expect(executorKeys(configAsWritten(cfg))).toEqual(["routing.executor.maxParallel"]);
+    expect(getConfigNotices(project)).toContainEqual({
+      message: "routing.executor.maxParallel must be an integer from 1 to 8 (got 99); using 4",
+      v2Only: true,
+    });
+  });
+});
+
+describe("routing.executor — the OpenCode v1 notice through the plugin (QA-4.1-9)", () => {
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+  let home = "";
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "omr-v1-executor-notice-"));
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+  });
+
+  afterEach(async () => {
+    for (const key of ["HOME", "USERPROFILE"] as const) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+    await removeDirWhenReleased(home);
+  });
+
+  it("names the invalid keys in the one v1 notice and logs no executor validation issue", async () => {
+    vi.resetModules();
+    const config = await import("../../src/router/config");
+    const fresh = await import("../../src/index");
+    mkdirSync(dirname(config.overridePath()), { recursive: true });
+    writeFileSync(config.overridePath(), JSON.stringify({ routing: { executor: { maxParallel: 99, approve: "x" } } }), "utf-8");
+    config.invalidateConfigCache();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await fresh.default({
+        directory: home, worktree: home, project: {}, serverUrl: new URL("http://localhost"), $: () => undefined,
+        client: { session: { get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id } }) } },
+      } as unknown as Parameters<typeof fresh.default>[0]);
+      const lines = warn.mock.calls.map((c) => c.join(" "));
+      const notices = lines.filter((line) => line.includes("OpenCode v2; ignored"));
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toContain("[router] the plan executor requires OpenCode v2; ignored: ");
+      expect(notices[0]).toContain("routing.executor.maxParallel");
+      expect(notices[0]).toContain("routing.executor.approve");
+      expect(lines.filter((line) => line.includes("routing.executor.") && line.includes("must be"))).toEqual([]);
+      expect(lines.filter((line) => line.includes("using 4"))).toEqual([]);
+      expect(config.getConfigNotices(home).filter((n) => n.message.includes("routing.executor"))).toEqual([]);
+    } finally {
+      warn.mockRestore();
+      config.setConfigNoticeHost(undefined);
+    }
   });
 });

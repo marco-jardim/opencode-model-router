@@ -536,6 +536,16 @@ function normalizeProjectDir(dir?: string): string {
 export interface ConfigNotice {
   source?: string;
   message: string;
+  /** About a key OpenCode v2 alone reads (QA-4.1-9): a v1 host does not log it, see {@link setConfigNoticeHost}. */
+  v2Only?: boolean;
+}
+
+/** The host whose plugin logs the config notices; `undefined` until index.ts sets it (logs them all). */
+let configNoticeHost: RouterHost | undefined;
+
+/** Set by index.ts at startup: on `v1` the `v2Only` notices are not logged (QA-4.1-9). */
+export function setConfigNoticeHost(host: RouterHost | undefined): void {
+  configNoticeHost = host;
 }
 
 /**
@@ -544,7 +554,8 @@ export interface ConfigNotice {
  * the like. Empty when there are none. `/router` lists them.
  */
 export function getConfigNotices(dir?: string): readonly ConfigNotice[] {
-  return _configCaches.get(normalizeProjectDir(dir))?.notices ?? [];
+  const notices = _configCaches.get(normalizeProjectDir(dir))?.notices ?? [];
+  return configNoticeHost === "v1" ? notices.filter((notice) => notice.v2Only !== true) : notices;
 }
 
 /**
@@ -1912,16 +1923,24 @@ export function slotsDirProblem(value: string): string | undefined {
   if (/^[\\/]{2}/.test(value)) return "must not be a UNC or device path";
   if (!/^[A-Za-z]:[\\/]/.test(value)) return "must be an absolute path on a drive (like C:\\.omr-slots)";
   if (/^[A-Za-z]:[\\/]*$/.test(win32.normalize(value))) return "must not be a drive root";
+  // QA-4.1-4: Win32 strips a trailing dot or space from a segment and expands an 8.3 short name,
+  // so such a spelling can name another directory than the one the repository rules compared.
+  const segments = value.slice(2).split(/[\\/]+/).filter((s) => s !== "");
+  if (segments.some((s) => s.endsWith(".") || s.endsWith(" "))) return "must not have a path segment ending in '.' or a space";
+  if (segments.some((s) => /~[0-9]+(\.[^.]*)?$/.test(s))) return "must not use an 8.3 short name (a '~N' segment)";
   return undefined;
 }
 
-/** Resolve symlinks of the longest existing prefix of `p`; the missing tail is appended unchanged. */
+/**
+ * Resolve links of the longest existing prefix of `p`; the missing tail is appended unchanged.
+ * `realpathSync.native` (QA-4.1-4): on win32 it also resolves junctions and 8.3 short names.
+ */
 function realpathOfExistingPrefix(p: string): string {
   const tail: string[] = [];
   let current = p;
   for (;;) {
     try {
-      return tail.length === 0 ? realpathSync(current) : join(realpathSync(current), ...tail.reverse());
+      return tail.length === 0 ? realpathSync.native(current) : join(realpathSync.native(current), ...tail.reverse());
     } catch {
       const parent = dirname(current);
       if (parent === current) return p;
@@ -1934,10 +1953,11 @@ function realpathOfExistingPrefix(p: string): string {
 export type SlotsDirCheck = { readonly ok: true } | { readonly ok: false; readonly reason: string };
 
 /**
- * The repository-relative rules for `routing.executor.slotsDir` (D18), applied at approval, where
- * the repository is known: `slotsDir` must pass {@link slotsDirProblem}, sit on the repository's
- * drive, and be neither inside nor an ancestor of `toplevel` (the repository's top-level
- * directory). Realpaths are compared, case-insensitively on win32.
+ * The repository-relative rules for `routing.executor.slotsDir` (D18), for approval, where the
+ * repository is known (the approve-time call comes with the release that registers the executor,
+ * Phase 5.1): `slotsDir` must pass {@link slotsDirProblem}, sit on the repository's drive, and be
+ * neither inside nor an ancestor of `toplevel` (the repository's top-level directory). Native
+ * realpaths (junctions, 8.3 names resolved) are compared, case-insensitively on win32.
  */
 export function validateSlotsDir(slotsDir: string, toplevel: string): SlotsDirCheck {
   const base = slotsDirProblem(slotsDir);
@@ -2589,12 +2609,24 @@ function stripGlobalOnlyRolesKeys(data: Record<string, unknown>): string[] {
   return dropped;
 }
 
-/** Remove the global-only `routing` keys from a project layer; returns what was dropped. */
+/**
+ * Remove the global-only `routing` keys from a project layer, and any block holding them that is not
+ * a plain object (QA-4.1-2); returns what was dropped.
+ */
 function stripGlobalOnlyRoutingKeys(data: Record<string, unknown>): string[] {
   const routing = data.routing;
   if (!isPlainObject(routing)) return [];
   const dropped: string[] = [];
   const touched = new Set<string>();
+  // QA-4.1-2: a block that holds global-only keys but is not a plain object (`null`, `[]`, a
+  // scalar) would replace the lower layer's block wholesale in deepMerge and so reset every
+  // trusted key in it to its default. The project layer may not do that; the block goes.
+  for (const block of new Set(GLOBAL_ONLY_ROUTING_KEYS.map(([b]) => b))) {
+    if (Object.hasOwn(routing, block) && routing[block] !== undefined && !isPlainObject(routing[block])) {
+      delete routing[block];
+      dropped.push(`routing.${block}`);
+    }
+  }
   for (const [block, key] of GLOBAL_ONLY_ROUTING_KEYS) {
     const target = routing[block];
     if (isPlainObject(target) && Object.hasOwn(target, key)) {
@@ -2665,6 +2697,18 @@ function collectOverrideLayers(
 /** The notices of the build that produced each config object (the cache hands the same object back until a reload). */
 const noticesByConfig = new WeakMap<RouterConfig, readonly ConfigNotice[]>();
 
+/** The merged config as written (before validation) behind each built config object; see {@link configAsWritten}. */
+const rawByConfig = new WeakMap<RouterConfig, unknown>();
+
+/**
+ * The config `cfg` was validated from, as written: tiers.json with the override layers merged
+ * (after the project-layer trust rules), or `cfg` itself when it was not built by loadConfig.
+ * Validation drops an invalid tolerant entry from `cfg`; this still has it (QA-4.1-9).
+ */
+export function configAsWritten(cfg: RouterConfig): unknown {
+  return rawByConfig.has(cfg) ? rawByConfig.get(cfg) : cfg; // not built here (a test's literal): as validated
+}
+
 /** Notice texts already logged in this process (bounded); see {@link warnConfigNotices}. */
 const loggedNoticeTexts = new Set<string>();
 
@@ -2682,6 +2726,7 @@ export function warnConfigNotices(
 ): void {
   if (cfg === undefined) return;
   for (const notice of noticesByConfig.get(cfg) ?? []) {
+    if (configNoticeHost === "v1" && notice.v2Only === true) continue; // QA-4.1-9: the v1 notice names the key instead
     if (loggedNoticeTexts.has(notice.message)) continue;
     if (loggedNoticeTexts.size >= 256) loggedNoticeTexts.clear();
     loggedNoticeTexts.add(notice.message);
@@ -3014,10 +3059,113 @@ function replaceRolesWholesale(merged: unknown, layers: readonly OverrideLayer[]
   return merged;
 }
 
-/** Merge an override while keeping project classifier budgets within the lower layers' bounds. */
+/** An inclusive-range number as {@link tolerantRange} accepts it. */
+function inRange(value: unknown, range: readonly [number, number], integer: boolean): value is number {
+  return typeof value === "number" && Number.isFinite(value) && (!integer || Number.isInteger(value))
+    && value >= range[0] && value <= range[1];
+}
+
+/** The tightest value of each `routing.executor` mode key: the only one a project layer may pick (A-4.1-2). */
+const EXECUTOR_TIGHTEST_MODES = [
+  ["approve", EXECUTOR_APPROVE_MODES, "ask"],
+  ["land", EXECUTOR_LAND_MODES, "manual"],
+  ["crossPhase", EXECUTOR_CROSS_PHASE_MODES, "gate"],
+] as const;
+
+/** The `routing.executor` budgets a project layer may only lower (A-4.1-2); the timing keys are not budgets. */
+const EXECUTOR_BUDGET_KEYS = ["maxParallel", "batchMax", "maxAttempts", "qaMaxRounds", "sharedContextChars"] as const;
+
+/**
+ * A-4.1-2 (the A35 precedent of the classifier budgets): a project layer may tighten the plan
+ * executor's approval, landing, cross-phase, budget and circuit-breaker keys, never loosen them.
+ * `merged` is the executor block after deepMerge, `requested` the project layer's block,
+ * `inherited` the lower layers' block. A value counts as what sanitizeExecutor makes of it (an
+ * invalid one is the default); a loosening one is dropped, so the lower-layer value stays, and
+ * reported once per key. Returns a copy: deepMerge can share an override-only block.
+ */
+function boundProjectExecutor(
+  merged: Record<string, unknown>,
+  requested: Record<string, unknown>,
+  inherited: unknown,
+  path: string,
+  notices: ConfigNotice[],
+): Record<string, unknown> {
+  const lower = isPlainObject(inherited) ? inherited : {};
+  const out: Record<string, unknown> = { ...merged };
+  const d = ROUTING_DEFAULTS.executor;
+  const drop = (target: Record<string, unknown>, source: Record<string, unknown>, key: string, name: string): void => {
+    if (Object.hasOwn(source, key) && source[key] !== undefined) target[key] = source[key];
+    else delete target[key];
+    notices.push({
+      source: path,
+      message: `A18: ignoring routing.executor.${name} from ${path}: project overrides may only tighten the lower-layer value (A-4.1-2)`,
+      v2Only: true,
+    });
+  };
+  // Every budget and breaker value is tighter when lower: min(lower layer, project value).
+  const bound = (
+    target: Record<string, unknown>,
+    source: Record<string, unknown>,
+    block: Record<string, unknown>,
+    key: string,
+    name: string,
+    range: readonly [number, number],
+    integer: boolean,
+    fallback: number,
+  ): void => {
+    const value = block[key];
+    if (value === undefined) return;
+    const ceiling = inRange(source[key], range, integer) ? source[key] : fallback;
+    const effective = inRange(value, range, integer) ? value : fallback;
+    if (effective > ceiling) drop(target, source, key, name);
+  };
+
+  for (const key of EXECUTOR_BUDGET_KEYS) bound(out, lower, requested, key, key, EXECUTOR_LIMITS[key], true, d[key]);
+  for (const [key, modes, tightest] of EXECUTOR_TIGHTEST_MODES) {
+    const value = requested[key];
+    if (value === undefined) continue;
+    const valid = (v: unknown): v is string => typeof v === "string" && (modes as readonly string[]).includes(v);
+    const ceiling = valid(lower[key]) ? lower[key] : d[key];
+    const effective = valid(value) ? value : d[key];
+    if (effective !== tightest && effective !== ceiling) drop(out, lower, key, key);
+  }
+
+  const breaker = requested.circuitBreaker;
+  if (breaker !== undefined) {
+    if (!isPlainObject(breaker)) {
+      // sanitizeExecutor would ignore the block, so the defaults would replace the lower values.
+      if (lower.circuitBreaker !== undefined) drop(out, lower, "circuitBreaker", "circuitBreaker");
+    } else {
+      const lowerBreaker = isPlainObject(lower.circuitBreaker) ? lower.circuitBreaker : {};
+      const b: Record<string, unknown> = isPlainObject(out.circuitBreaker) ? { ...out.circuitBreaker } : {};
+      const db = d.circuitBreaker;
+      bound(b, lowerBreaker, breaker, "failureRatio", "circuitBreaker.failureRatio", EXECUTOR_LIMITS.failureRatio, false, db.failureRatio);
+      for (const key of EXECUTOR_BREAKER_INTEGER_KEYS) {
+        bound(b, lowerBreaker, breaker, key, `circuitBreaker.${key}`, EXECUTOR_LIMITS[key], true, db[key]);
+      }
+      out.circuitBreaker = b;
+    }
+  }
+  return out;
+}
+
+/** Merge an override while keeping project classifier budgets and executor keys within the lower layers' bounds. */
 function mergeOverrideLayer(lower: unknown, layer: OverrideLayer, notices: ConfigNotice[]): unknown {
   const merged = deepMerge(lower, layer.data);
   if (!layer.project || !isPlainObject(merged) || !isPlainObject(merged.routing)) return merged;
+  const projectRouting = layer.data.routing;
+  const lowerRouting = isPlainObject(lower) ? lower.routing : undefined;
+  const projectExecutor = isPlainObject(projectRouting) ? projectRouting.executor : undefined;
+  const mergedExecutor = merged.routing.executor;
+  const executorBounded = isPlainObject(mergedExecutor) && isPlainObject(projectExecutor)
+    ? { ...merged, routing: { ...merged.routing, executor: boundProjectExecutor(mergedExecutor, projectExecutor, isPlainObject(lowerRouting) ? lowerRouting.executor : undefined, layer.path, notices) } }
+    : merged;
+  return boundProjectClassifier(executorBounded, lower, layer, notices);
+}
+
+/** Keep the project classifier budgets within the lower layers' bounds (A35); `merged` already holds the project layer. */
+function boundProjectClassifier(merged: Record<string, unknown>, lower: unknown, layer: OverrideLayer, notices: ConfigNotice[]): unknown {
+  if (!isPlainObject(merged.routing)) return merged;
   const classifier = merged.routing.classifier;
   const projectRouting = layer.data.routing;
   const projectClassifier = isPlainObject(projectRouting) ? projectRouting.classifier : undefined;
@@ -3154,12 +3302,17 @@ function buildConfig(
 
   applyTierDefaults(cfg);
   const rawRouting = isPlainObject(rawUsed) ? rawUsed.routing : undefined;
-  for (const message of collectRoutingNotices(rawRouting, cfg)) notices.push({ message });
+  // QA-4.1-9: an executor issue is about a v2-only block; a v1 host does not log it (warnConfigNotices).
+  const executorIssues = new Set(isPlainObject(rawRouting) ? sanitizeExecutor(rawRouting.executor).issues : []);
+  for (const message of collectRoutingNotices(rawRouting, cfg)) {
+    notices.push(executorIssues.has(message) ? { message, v2Only: true } : { message });
+  }
   const rawRoleAgents = isPlainObject(rawUsed) ? rawUsed.roleAgents : undefined;
   for (const issue of collectRolesIssues(rawRouting, rawRoleAgents)) notices.push({ message: issue.message });
   dropIgnoredCandidates(cfg);
   applyPluginAgents(cfg, layers, notices);
   applyRoleNotices(cfg, notices);
+  rawByConfig.set(cfg, rawUsed);
   return cfg;
 }
 
