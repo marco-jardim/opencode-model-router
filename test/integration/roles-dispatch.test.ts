@@ -1299,6 +1299,63 @@ describe("cross-repo P4.5: repositories approved with /router approve, on the di
     const refusal = await refusalOf(world, EDIT(`root=${s.ext}`));
     expect(refusal?.reason).toContain(`ask the user to run /router approve ${s.ext}, then dispatch again.`);
   });
+
+  it("Phase 4 QA M1: a linked worktree of an approved repository binds marked, so expiry ends every binding through it", async () => {
+    const s = setup();
+    const t0 = s.clock.now;
+    approve(s, t0 - 30 * 60_000);
+    git(s.ext, "worktree", "add", "-q", "-b", "feat", join(dirname(s.ext), "feat"));
+    const feat = realpathSync.native(join(dirname(s.ext), "feat"));
+    const world = makeWorld(withParent(s), { approvalsEnv: s.env });
+    const route = (root: string): Promise<RouteOutcome> => world.router.route(call(world, { agent: "implementer", prompt: EDIT(`root=${root}`) }));
+    // root=X (rule 3), root=feat (rule 2 via X), root=X, root=feat again (rule 2 through the known feat entry first).
+    for (const root of [s.ext, feat, s.ext, feat]) {
+      const outcome = await route(root);
+      expect(outcome.role!.workRoot).toBe(root);
+      expect(outcome.role!.grant.location?.approval).toBe(s.ext);
+    }
+    expect(workingSetOf("root").map((location) => location.approval)).toEqual([s.ext, s.ext]);
+
+    // The approval expires: neither root= binds any more (no untagged entry admits X by rule 2 without the identity check).
+    s.clock.now = t0 + 15 * DAY;
+    for (const root of [s.ext, feat]) {
+      const refusal = await refusalOf(world, EDIT(`root=${root}`));
+      expect(refusal?.reason).toContain(`root=${root} is not below routing.repoParents`);
+    }
+    expect(workingSetOf("root")).toEqual([]);
+  });
+
+  it("Phase 4 QA m2: revoke ends the binding: an exact resume is refused and the location never rejoins the working set", async () => {
+    const s = setup();
+    approve(s, s.clock.now - 30 * 60_000);
+    const world = makeWorld(withParent(s), { approvalsEnv: s.env });
+    const input = { agent: "implementer", prompt: EDIT(`root=${s.ext}`), description: "approved work" };
+    const c = call(world, input);
+    const fresh = await world.router.route(c);
+    expect(fresh.role!.grant.location?.approval).toBe(s.ext);
+    world.router.commit(c.callID, applied(input, fresh));
+    world.router.onSessionCreated({ sessionID: "child-a", parentID: "root", agent: "implementer", title: fresh.description });
+    const binding = await bind("child-a", async () => ({ parentID: "root", agent: "implementer", title: fresh.description!, firstText: fresh.prompt! }), {
+      maxOf: (agent) => roleMaxActions(resolveRoles(world.cfg, "v2").get(agent)),
+    });
+    expect(binding.kind).toBe("exact");
+    const resume = (): Promise<RouteOutcome> => world.router.route(call(world, { agent: "implementer", sessionID: "child-a", prompt: "continue" }));
+    // While the approval applies, the resume keeps its bound location.
+    expect((await resume()).role!.grant.location?.approval).toBe(s.ext);
+
+    // `/router revoke`: the store no longer holds the entry; the working set is emptied as the next dispatch would prune it.
+    writeFileSync(join(s.store, APPROVALS_FILE_NAME), JSON.stringify({ version: 1, approvals: [] }));
+    forgetWorkingSet("root");
+    let refusal: RoleDispatchRefusal | undefined;
+    try {
+      await resume();
+    } catch (error) {
+      if (!(error instanceof RoleDispatchRefusal)) throw error;
+      refusal = error;
+    }
+    expect(refusal?.reason).toBe(`resume refused: approval for ${s.ext} was revoked or expired: no work root. Only the user can approve it again (/router approve ${s.ext}).`);
+    expect(workingSetOf("root")).toEqual([]);
+  });
 });
 
 describe("E6/E7 through the hook shapes", () => {

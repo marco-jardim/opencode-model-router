@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   createAdmission,
@@ -875,10 +875,54 @@ describe("rule 3 (Phase 4, real git): repositories outside the parents approved 
       reason: expect.stringContaining("is not below routing.repoParents"),
       approvable: wt,
     });
-    // Without an approval the known repository works as before, unmarked.
+    // Phase 4 QA (M1): without an approval in force a known repository outside the parents admits nothing (it used to admit its
+    // worktrees, unmarked: the binding then outlived the approval).
     const plain = await createAdmission(config(), deps({ approvals: () => [] })).admit(wt, [ext]);
-    expect(plain).toMatchObject({ ok: true, location: { worktree: wt } });
-    expect(plain.ok && plain.location.approval).toBeUndefined();
+    expect(plain).toEqual({ ok: false, reason: expect.stringContaining("is not below routing.repoParents"), approvable: wt });
+    // The session repository is the exception: its worktrees need neither a parent nor an approval, and stay unmarked.
+    const session = await createAdmission(config(), deps({ approvals: () => [] })).admit(wt, [ext], ext);
+    expect(session).toMatchObject({ ok: true, location: { worktree: wt } });
+    expect(session.ok && session.location.approval).toBeUndefined();
+  });
+
+  it("M1: approval-backing follows the listed repository, not the known entry (a linked worktree of the approved one)", async () => {
+    await approve(ext);
+    const feat = join(base, "ext-feat");
+    git(ext, "worktree", "add", "-q", "-b", "feat", feat);
+    // root=feat through the known linked worktree feat itself (its list names ext): marked with ext's approval.
+    expect(await createAdmission(config(), deps()).admit(feat, [feat])).toMatchObject({
+      ok: true,
+      location: { repository: ext, worktree: feat, branch: "feat", approval: ext },
+    });
+    // root=ext through the known linked worktree feat: marked too.
+    expect(await createAdmission(config(), deps()).admit(ext, [feat])).toMatchObject({ ok: true, location: { worktree: ext, approval: ext } });
+    // The approval lapses: the known linked worktree no longer admits ext (no rule 2 without the identity check) nor feat.
+    clock.t += 14 * DAY;
+    resetApprovalsState();
+    const lapsed = createAdmission(config(), deps());
+    expect(await lapsed.admit(ext, [feat])).toEqual({ ok: false, reason: expect.stringContaining("is not below routing.repoParents"), approvable: ext });
+    expect(await lapsed.admit(feat, [feat, ext])).toMatchObject({ ok: false, approvable: feat });
+    // An identity failure skips the known entry the same way.
+    await approve(ext);
+    const forged = await createAdmission(config(), deps({ rootCommits: async () => [FORGED_ROOT] })).admit(feat, [feat]);
+    expect(forged).toMatchObject({ ok: false, approvable: feat });
+  });
+
+  it("M1: without parents, a known repository other than the session repository admits nothing", async () => {
+    const wt = join(base, "ext-noparents");
+    git(ext, "worktree", "add", "-q", "-b", "noparents", wt);
+    const admission = createAdmission({ parents: [], depth: 2, exclude: [] }, deps());
+    expect(await admission.admit(wt, [ext])).toEqual({ ok: false, reason: expect.stringContaining("is not below routing.repoParents (none configured)") });
+    expect(await admission.admit(wt, [wt])).toMatchObject({ ok: false });
+    expect(await admission.admit(wt, [ext], ext)).toMatchObject({ ok: true, location: { worktree: wt } });
+  });
+
+  it.runIf(isWin)("m1: rule 3 binds exactly the directory it verified (a case variant that resolves to itself is refused)", async () => {
+    await approve(ext);
+    // A case-sensitive NTFS folder: the variant is another directory, and realpath returns it as typed.
+    const variant = join(dirname(ext), basename(ext).toUpperCase());
+    const result = await createAdmission(config(), deps({ realpath: (path) => (path === variant ? variant : realpathSync.native(path)) })).admit(variant);
+    expect(result).toEqual({ ok: false, reason: `root=${variant} is the approved repository ${ext}, but it now resolves to ${variant}: no work root.` });
   });
 
   it("sets approvable only for a candidate outside every parent that passes the text checks", async () => {

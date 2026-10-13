@@ -302,6 +302,49 @@ describe("cross-repo Phase 4: approved repositories (SD-P4-15)", () => {
     expect(approvedRootsInForce([valid], routing({ repoExclude: ["/ext/*"] }), NOW).paths).toEqual([]);
   });
 
+  it("approvedRootsInForce skips an approval that is or contains a parent, with a problem line (Phase 4 QA m3)", () => {
+    const result = approvedRootsInForce(
+      [approval("/parents"), approval("/parents/"), approval("/"), approval("/parentsX"), approval("/ext/repo"), approval("/parents/repo")],
+      routing(),
+      NOW,
+    );
+    expect(result.paths).toEqual(["/parentsX", "/ext/repo", "/parents/repo"]);
+    expect(result.problems).toHaveLength(3);
+    for (const problem of result.problems) expect(problem).toContain("is or contains routing.repoParents entry /parents; not granted");
+    // Containing a deeper parent is refused too; the other parents do not matter.
+    const deeper = approvedRootsInForce([approval("/ext")], routing({ repoParents: ["/other", "/ext/repo/sub"] }), NOW);
+    expect(deeper.paths).toEqual([]);
+    expect(deeper.problems).toEqual(["approved repository /ext is or contains routing.repoParents entry /ext/repo/sub; not granted"]);
+  });
+
+  it.skipIf(process.platform !== "win32")("approvedRootsInForce compares with a parent case-insensitively and across separators on win32", () => {
+    const parents = { repoParents: ["C:\\Git\\Parents"] };
+    expect(approvedRootsInForce([approval("c:\\git")], routing(parents), NOW).paths).toEqual([]);
+    expect(approvedRootsInForce([approval("C:/GIT/parents")], routing(parents), NOW).paths).toEqual([]);
+    expect(approvedRootsInForce([approval("C:\\Git\\Parents\\repo")], routing(parents), NOW).paths).toEqual(["C:\\Git\\Parents\\repo"]);
+  });
+
+  it("externalDirectoryPatterns grants no approved repository that is or contains a parent, text or canonical form (Phase 4 QA m3)", () => {
+    const base = temp("omr-roles-holds-");
+    const ext = join(base, "ext");
+    const inner = join(ext, "inner");
+    mkdirSync(inner, { recursive: true });
+    // Text: the approved directory contains the parent as typed.
+    const byText = externalDirectoryPatterns([], [], undefined, [inner], [ext]);
+    expect(byText.patterns).toEqual([`${inner}${sep}*`]);
+    expect(byText.problems).toEqual([`approved repository ${ext} is or contains routing.repoParents entry ${inner}; not granted`]);
+    // Canonical: the parent is a junction whose target lies inside the approved directory.
+    const link = join(base, "link");
+    symlinkSync(inner, link, "junction");
+    const byReal = externalDirectoryPatterns([], [], undefined, [link], [ext]);
+    expect(byReal.patterns).toEqual([`${inner}${sep}*`]);
+    expect(byReal.problems).toHaveLength(1);
+    expect(byReal.problems[0]).toContain(`approved repository ${ext} is or contains routing.repoParents entry`);
+    // Equal to a parent.
+    expect(externalDirectoryPatterns([], [], undefined, [ext], [ext]).patterns).toEqual([`${ext}${sep}*`]);
+    expect(externalDirectoryPatterns([], [], undefined, [ext], [ext]).problems).toHaveLength(1);
+  });
+
   it("externalDirectoryPatterns: approved paths give a pattern only with parents (I9)", () => {
     const parent = temp("omr-roles-parent-");
     const ext = temp("omr-roles-ext-");

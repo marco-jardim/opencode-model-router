@@ -151,9 +151,18 @@ export function gitEnvironment(extra: Record<string, string> = {}): NodeJS.Proce
     GIT_TERMINAL_PROMPT: "0", GIT_PAGER: "cat", PAGER: "cat", GIT_NO_LAZY_FETCH: "1", ...extra };
 }
 
+/**
+ * Every transport refused on the command line. A repository's `protocol.<name>.allow=always` beats a
+ * generic `protocol.allow=never`, and GIT_NO_LAZY_FETCH is honoured only from git 2.44, so a partial
+ * clone's promisor (an `ext::` command, say) could otherwise run on a lazy fetch. Command-line `-c`
+ * overrides repository config; no router git call needs a transport.
+ */
+export const PROTOCOL_HARDENING: readonly string[] = Object.freeze(["ext", "file", "ssh", "git", "http", "https"]
+  .flatMap(name => ["-c", `protocol.${name}.allow=never`]).concat(["-c", "protocol.allow=never"]));
+
 export function hardeningArgs(): string[] {
   return ["--no-optional-locks", "--no-pager", "-c", "core.pager=cat", "-c", "core.fsmonitor=false", "-c", "diff.external=",
-    "-c", `core.hooksPath=${NULL_DEVICE}`, "-c", "protocol.allow=never",
+    "-c", `core.hooksPath=${NULL_DEVICE}`, ...PROTOCOL_HARDENING,
     "-c", "maintenance.auto=false", "-c", "gc.auto=0", "-c", "color.ui=false",
     // G2: signature display would run gpg.program; blank every signing program too.
     "-c", "log.showSignature=false", "-c", "gpg.program=", "-c", "gpg.ssh.program=", "-c", "gpg.x509.program=",

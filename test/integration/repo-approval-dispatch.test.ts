@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { APPROVALS_FILE_NAME, readApprovals, resetApprovalsState, type ApprovalsEnv, type RepoApproval } from "../../src/routing/roles/approvals";
 import type { RepoLocation } from "../../src/routing/roles/admission";
-import { approvalNote, pruneLapsedApprovals, touchApproval } from "../../src/routing/wire/dispatch";
+import { approvalNote, lapsedApprovalReason, pruneLapsedApprovals, touchApproval } from "../../src/routing/wire/dispatch";
 import { addToWorkingSet, forgetWorkingSet, workingSetOf } from "../../src/routing/wire/working-set";
 
 const HOUR = 60 * 60_000;
@@ -195,5 +195,29 @@ describe("pruneLapsedApprovals (SD-P4-12): the working set without lapsed approv
     fs.writeFileSync(path.join(store, APPROVALS_FILE_NAME), "{not json");
     const repo = path.join(store, "r");
     expect(pruneLapsedApprovals([locationOf(repo, repo)], 14, { dir: store, warn: () => undefined })).toEqual([]);
+  });
+});
+
+describe("lapsedApprovalReason (Phase 4 QA m2): an approval-backed binding holds only while its approval applies", () => {
+  it("undefined while the approval applies; the revoked-or-expired refusal once it is revoked, expired or unreadable", () => {
+    const store = tempDir("omr-p4qa-store-");
+    const base = tempDir("omr-p4qa-ext-");
+    const live = makeRepo(path.join(base, "live"));
+    const expired = makeRepo(path.join(base, "expired"));
+    const revoked = path.join(base, "revoked");
+    const now = Date.now();
+    writeStore(store, [entryFor(live, now - DAY, now - DAY), entryFor(expired, now - 20 * DAY, now - 15 * DAY)]);
+    const env: ApprovalsEnv = { dir: store, now: () => now };
+    expect(lapsedApprovalReason(live, 14, env)).toBeUndefined();
+    if (process.platform === "win32") expect(lapsedApprovalReason(live.toUpperCase(), 14, env)).toBeUndefined();
+    expect(lapsedApprovalReason(expired, 14, env)).toBe(
+      `approval for ${expired} was revoked or expired: no work root. Only the user can approve it again (/router approve ${expired}).`,
+    );
+    expect(lapsedApprovalReason(revoked, 14, env)).toContain(`approval for ${revoked} was revoked or expired`);
+    // A shorter repoApprovalDays lapses it too (1 day: last used exactly a day ago).
+    expect(lapsedApprovalReason(live, 1, env)).toContain("was revoked or expired");
+    // An unreadable store fails closed.
+    fs.writeFileSync(path.join(store, APPROVALS_FILE_NAME), "{not json");
+    expect(lapsedApprovalReason(live, 14, { ...env, warn: () => undefined })).toContain(`approval for ${live} was revoked or expired`);
   });
 });

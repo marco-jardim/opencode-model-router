@@ -409,7 +409,7 @@ describe("applyApproval (SD-P4-3)", () => {
 
 describe("protectedProblem (SD-P4-8)", () => {
   beforeEach(() => {
-    for (const v of ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "OPENCODE_CONFIG_DIR"]) vi.stubEnv(v, "");
+    for (const v of ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG"]) vi.stubEnv(v, "");
   });
 
   const config = () => join(homedir(), ".config", "opencode");
@@ -433,6 +433,8 @@ describe("protectedProblem (SD-P4-8)", () => {
     ["cache", () => join(homedir(), ".cache", "opencode")],
     ["plugin install", () => dirname(configPath())],
     ["store", () => dir],
+    // Phase 4 QA (m4).
+    ["~/.opencode", () => join(homedir(), ".opencode")],
   ])("the %s directory is refused equal, as an ancestor and inside", (_name, target) => {
     const t = target();
     expect(protectedProblem(t, t, env())).toMatch(/^is /);
@@ -450,6 +452,30 @@ describe("protectedProblem (SD-P4-8)", () => {
     expect(protectedProblem(join(custom, "x"), join(custom, "x"), other)).toContain("is inside OPENCODE_CONFIG_DIR");
     expect(protectedProblem(join(xdgData, "opencode"), join(xdgData, "opencode"), other)).toContain("data directory");
     expect(protectedProblem(xdgData, xdgData, other)).toContain("contains the opencode data directory");
+  });
+
+  it("the directory of the OPENCODE_CONFIG file is protected (equal, ancestor, inside) when set (Phase 4 QA m4)", () => {
+    const cfgDir = join(dir, "cfgfile");
+    const other = { ...env(), dir: join(dir, "store") };
+    expect(protectedLocations(other).some((l) => l.label === "the directory of OPENCODE_CONFIG")).toBe(false);
+    vi.stubEnv("OPENCODE_CONFIG", join(cfgDir, "opencode.json"));
+    expect(protectedLocations(other).find((l) => l.label === "the directory of OPENCODE_CONFIG")).toMatchObject({ dir: cfgDir, mode: "any" });
+    expect(protectedProblem(cfgDir, cfgDir, other)).toContain("is the directory of OPENCODE_CONFIG");
+    expect(protectedProblem(join(cfgDir, "x"), join(cfgDir, "x"), other)).toContain("is inside the directory of OPENCODE_CONFIG");
+    expect(protectedProblem(dir, dir, other)).toMatch(/^contains /);
+    // The canonical form alone is enough (a link to it).
+    const unrelated = join(parse(process.cwd()).root, "omr-p4-unrelated-candidate");
+    expect(protectedProblem(unrelated, cfgDir, other)).toContain("is the directory of OPENCODE_CONFIG");
+    // A relative file name resolves against the working directory, as opencode reads it.
+    vi.stubEnv("OPENCODE_CONFIG", "opencode.json");
+    expect(protectedLocations(other).find((l) => l.label === "the directory of OPENCODE_CONFIG")?.dir).toBe(resolve(process.cwd()));
+  });
+
+  it("~/.opencode is protected in mode any (Phase 4 QA m4)", () => {
+    const dotOpencode = join(homedir(), ".opencode");
+    expect(protectedLocations(env()).find((l) => l.label === "the ~/.opencode directory")).toMatchObject({ dir: dotOpencode, mode: "any" });
+    expect(protectedProblem(dotOpencode, dotOpencode, env())).toContain("is the ~/.opencode directory");
+    expect(protectedProblem(join(dotOpencode, "plugin"), join(dotOpencode, "plugin"), env())).toContain("is inside the ~/.opencode directory");
   });
 
   it("the user profile is refused equal or as an ancestor, but not inside", () => {

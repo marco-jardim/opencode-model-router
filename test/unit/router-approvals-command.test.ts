@@ -23,7 +23,7 @@ import type { RouterPluginInput } from "../../src/compat/child-session";
 import ModelRouterPlugin from "../../src/index";
 import { invalidateConfigCache, overridePath, resetRolesWarnings } from "../../src/router/config";
 import type { RepoLocation } from "../../src/routing/roles/admission";
-import { approvalsPath, readApprovals, resetApprovalsState } from "../../src/routing/roles/approvals";
+import { approvalsPath, inspectCandidate, readApprovals, resetApprovalsState } from "../../src/routing/roles/approvals";
 import { addToWorkingSet, forgetWorkingSet, workingSetOf } from "../../src/routing/wire/working-set";
 
 const DAY = 86_400_000;
@@ -186,6 +186,69 @@ describe("/router approve", () => {
     expect(result.text).toMatch(/^Usage: \/router approve <path>/);
     expect(storeBytes()).toBeUndefined();
   });
+
+  it("refuses a repository that is or contains a parent (text or canonical form), and stores nothing (Phase 4 QA m3)", async () => {
+    const is = await runRouterApprovals("approve", ext, opts({ parents: [ext] }));
+    expect(is.change).toBeUndefined();
+    expect(is.text).toBe(`Not approved: ${ext} is routing.repoParents entry ${ext}; a repository that is or contains a parent cannot be approved.\nNothing was stored.`);
+
+    const sub = path.join(ext, "sub");
+    const contains = await runRouterApprovals("approve", ext, opts({ parents: [parent, sub] }));
+    expect(contains.change).toBeUndefined();
+    expect(contains.text).toContain(`Not approved: ${ext} contains routing.repoParents entry ${sub}`);
+    expect(contains.text).toContain("Nothing was stored.");
+
+    // The parent as typed lies elsewhere; its canonical form (a junction target) lies inside the candidate.
+    const target = path.join(ext, "linked-parent");
+    fs.mkdirSync(target, { recursive: true });
+    const link = path.join(base, "parent-link");
+    if (!fs.existsSync(link)) fs.symlinkSync(target, link, "junction");
+    const byReal = await runRouterApprovals("approve", ext, opts({ parents: [link] }));
+    expect(byReal.change).toBeUndefined();
+    expect(byReal.text).toContain(`Not approved: ${ext} contains routing.repoParents entry ${link}`);
+
+    if (process.platform === "win32") {
+      const folded = await runRouterApprovals("approve", ext, opts({ parents: [sub.toUpperCase()] }));
+      expect(folded.text).toContain("contains routing.repoParents entry");
+    }
+    expect(storeBytes()).toBeUndefined();
+  }, 30_000);
+
+  it("below a parent but deeper than routing.repoDepth: no approval applies, nothing is stored (Phase 4 QA m3)", async () => {
+    const deep = path.join(parent, "org", "deep");
+    if (!fs.existsSync(deep)) initRepo(deep);
+    const tooDeep = await runRouterApprovals("approve", deep, opts({ repoDepth: 1 }));
+    expect(tooDeep.change).toBeUndefined();
+    expect(tooDeep.text).toBe(`No approval applies: ${deep} is below ${parent} but deeper than routing.repoDepth (1); `
+      + "the router refuses it with or without an approval.\nNothing was stored.");
+    const within = await runRouterApprovals("approve", deep, opts({ repoDepth: 2 }));
+    expect(within.text).toContain(`No approval needed: ${deep} is inside routing.repoParents`);
+    // A direct child is within any depth.
+    expect((await runRouterApprovals("approve", inner, opts({ repoDepth: 1 }))).text).toContain("No approval needed");
+    expect(storeBytes()).toBeUndefined();
+  }, 30_000);
+
+  it("asks git at approve time, never a cached inspection (S2)", async () => {
+    const repo = path.join(base, "fresh");
+    if (!fs.existsSync(repo)) initRepo(repo);
+    const before = git(repo, "rev-parse", "HEAD");
+    // A cached inspection of the old HEAD (the 5 s cache of inspectCandidate).
+    const cached = await inspectCandidate(repo, { platform: process.platform });
+    expect(typeof cached === "string" ? cached : cached.head).toBe(before);
+    git(repo, "commit", "-q", "--allow-empty", "-m", "second");
+    const after = git(repo, "rev-parse", "HEAD");
+    expect(after).not.toBe(before);
+    // The cache still answers with the old HEAD; `fresh` asks git and replaces the cached result.
+    const stale = await inspectCandidate(repo, { platform: process.platform });
+    expect(typeof stale === "string" ? stale : stale.head).toBe(before);
+    const result = await runRouterApprovals("approve", repo, opts());
+    expect(result.change).toEqual({ kind: "approve", path: repo });
+    expect(result.text).toContain(`branch:  main @ ${after.slice(0, 12)}`);
+    const again = await inspectCandidate(repo, { platform: process.platform });
+    expect(typeof again === "string" ? again : again.head).toBe(after);
+    const fresh = await inspectCandidate(repo, { platform: process.platform, fresh: true });
+    expect(typeof fresh === "string" ? fresh : fresh.head).toBe(after);
+  }, 30_000);
 });
 
 describe("/router repos", () => {

@@ -285,21 +285,45 @@ export function externalDirectoryPatterns(
     else add(result.pattern);
   }
   // P1.6: one `<parent><sep>*` per `routing.repoParents` entry; the host's `*` crosses separators, so it covers every depth.
+  const parentDirs: string[] = [...parents];
   for (const parent of parents) {
     const result = workRootPattern(`${parent.replace(/[\\/]+$/, "")}/*`, realpath);
     if (result.pattern === undefined) problems.push(`routing.repoParents entry ${parent} ${result.problem ?? "is not usable"}; not granted`);
-    else add(result.pattern);
+    else {
+      add(result.pattern);
+      parentDirs.push(result.pattern.replace(/[\\/]?\*$/, ""));
+    }
   }
   // Cross-repo Phase 4 (SD-P4-15): one `<path><sep>*` per approved repository, only with parents (I9); the caller passes
-  // approvals already checked for expiry and exclusion ({@link approvedRootsInForce}).
+  // approvals already checked for expiry and exclusion ({@link approvedRootsInForce}). Phase 4 QA (m3): never one that is or
+  // contains a parent (text or canonical form): its rule would be wider than the parents, and admission refuses it anyway.
   if (parents.length > 0) {
     for (const path of approved) {
       const result = approvedRootPattern(path, realpath);
-      if (result.pattern === undefined) problems.push(`approved repository ${path} ${result.problem ?? "is not usable"}; not granted`);
+      if (result.pattern === undefined) {
+        problems.push(`approved repository ${path} ${result.problem ?? "is not usable"}; not granted`);
+        continue;
+      }
+      const approvedDir = result.pattern.replace(/[\\/]?\*$/, "");
+      const held = parentDirs.find((dir) => dir.trim() !== "" && (isOrContains(path, dir) || isOrContains(approvedDir, dir)));
+      if (held !== undefined) problems.push(`approved repository ${path} is or contains routing.repoParents entry ${held}; not granted`);
       else add(result.pattern);
     }
   }
   return { patterns, problems };
+}
+
+/** Comparison form of a directory for the parent checks: `/` separators, no trailing one, case-folded on win32. Text only. */
+function dirKey(p: string): string {
+  const unified = p.replace(/\\/g, "/").replace(/\/+$/, "");
+  return process.platform === "win32" ? unified.toLowerCase() : unified;
+}
+
+/** Whether directory `outer` is directory `inner` or contains it ({@link dirKey} forms; a filesystem root contains all). */
+function isOrContains(outer: string, inner: string): boolean {
+  const o = dirKey(outer);
+  const i = dirKey(inner);
+  return o === "" || o === i || i.startsWith(`${o}/`);
 }
 
 /** One store entry as registration sees it (cross-repo Phase 4): read without git. */
@@ -308,8 +332,10 @@ export type ApprovedRoot = Pick<RepoApproval, "path" | "approvedAt" | "lastUsedA
 /**
  * The approved repository paths registration may grant (SD-P4-15): none without `routing.repoParents` (I9); otherwise each
  * approval that has not expired ({@link isApprovalValid} with `routing.repoApprovalDays`) and whose path text no
- * `routing.repoExclude` glob matches (exclusion wins over an approval). Excluded ones are reported in `problems`; expired
- * ones are dropped silently. No filesystem access, no git.
+ * `routing.repoExclude` glob matches (exclusion wins over an approval) and that is not, and does not contain, a
+ * `routing.repoParents` entry (Phase 4 QA m3: text, case-insensitive on win32; such an approval would be granted wider than
+ * the parents). Excluded and parent-holding ones are reported in `problems`; expired ones are dropped silently. No filesystem
+ * access, no git.
  */
 export function approvedRootsInForce(
   approved: readonly ApprovedRoot[],
@@ -322,6 +348,11 @@ export function approvedRootsInForce(
   for (const entry of approved) {
     if (typeof entry.path !== "string" || entry.path === "") continue;
     if (!isApprovalValid(entry, routing.repoApprovalDays, now)) continue;
+    const held = routing.repoParents.find((parent) => parent.trim() !== "" && isOrContains(entry.path, parent));
+    if (held !== undefined) {
+      problems.push(`approved repository ${entry.path} is or contains routing.repoParents entry ${held}; not granted`);
+      continue;
+    }
     const forms = process.platform === "win32" && entry.path.includes("/") ? [entry.path, entry.path.replace(/\//g, "\\")] : [entry.path];
     const excluded = routing.repoExclude.find((glob) => glob.trim() !== "" && forms.some((form) => permissionMatches(form, glob)));
     if (excluded !== undefined) problems.push(`approved repository ${entry.path} is excluded by routing.repoExclude (${excluded}); not granted`);

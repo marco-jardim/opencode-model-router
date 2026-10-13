@@ -172,6 +172,28 @@ export function touchApproval(approvalPath: string, days: number, env: Approvals
 }
 
 /**
+ * Phase 4 QA (m2): why a binding backed by the approved path `approval` no longer binds, or undefined while that approval applies:
+ * read from the store without git (`readApprovals` + `isApprovalValid` with `days`); revoked, expired and an unreadable store
+ * (fail closed) all lapse.
+ */
+export function lapsedApprovalReason(
+  approval: string,
+  days: number,
+  env: ApprovalsEnv = {},
+  platform: NodeJS.Platform = process.platform,
+): string | undefined {
+  let valid = false;
+  try {
+    const now = (env.now ?? Date.now)();
+    const key = normalizeRootText(approval, platform);
+    valid = readApprovals(env).approvals.some((entry) => normalizeRootText(entry.path, platform) === key && isApprovalValid(entry, days, now));
+  } catch {
+    valid = false;
+  }
+  return valid ? undefined : `approval for ${approval} was revoked or expired: no work root. Only the user can approve it again (/router approve ${approval}).`;
+}
+
+/**
  * Cross-repo Phase 4 (SD-P4-12): `locations` (a working set) without the entries backed by an approval that no longer applies
  * (revoked, expired, or an unreadable store: fail closed), read from the store without git. The lapsed approvals are dropped from
  * every working set too (`dropFromWorkingSets`), so the read set shrinks with them. No store I/O when no entry is backed by an
@@ -775,7 +797,7 @@ export async function resolveRoleWorkRoot(
   // (routing.repoExclude, links, parents); the session directory itself keeps today's match (I9).
   if (admission !== undefined && match !== input.sessionDirectory) {
     const root = input.root;
-    return admitted(() => admission.admit(root, known));
+    return admitted(() => admission.admit(root, known, sessionRepository));
   }
   if (match === undefined) return { workRoot: null, requested: input.root, note: none };
   const resolved = canonical(match);
@@ -1785,9 +1807,11 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       approvalDays: routing.repoApprovalDays,
     });
     // Phase 4 (SD-P4-12): a working-set entry whose approval lapsed (revoked, expired) is dropped before it can admit by rule 2;
-    // a store read without git, only with parents (I9) and only when an entry is backed by an approval.
+    // a store read without git, only with parents (I9) and only when an entry is backed by an approval. Phase 4 QA (M1): with the
+    // parents emptied at runtime no approval applies (the store is not read), so an approval-backed entry is left out; admission's
+    // rule 2 then admits only worktrees of the session repository.
     const workingSet = routing.repoParents.length === 0
-      ? workingSetOf(orchestratorSessionID)
+      ? workingSetOf(orchestratorSessionID).filter((location) => location.approval === undefined)
       : pruneLapsedApprovals(workingSetOf(orchestratorSessionID), routing.repoApprovalDays, deps.approvalsEnv, workRootDeps.platform);
     const known = [...new Set([sessionDirectory, ...workingSet.map((location) => location.worktree)])];
     return { repo, branch, admission, sessionRepository: sessionDirectory, known };
@@ -2001,6 +2025,12 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     // A resume of an exactly bound child keeps the child's bound root: a target it declares must name that root — by text first (no
     // admission), else by the same resolution a fresh dispatch uses (D17) — else the resume is refused: a resume cannot move a child.
     const exactBound = bound?.kind === "exact" ? bound.grant : undefined;
+    // Phase 4 QA (m2): a child bound through an approval resumes only while that approval applies (store read, no git): a revoked or
+    // expired approval ends the binding, so the resume is refused and the lapsed location never rejoins the working set.
+    const boundApproval = exactBound?.location?.approval;
+    const lapsedApproval = boundApproval === undefined ? undefined
+      : lapsedApprovalReason(boundApproval, resolveRolesRouting(rp.cfg, "v2").repoApprovalDays, deps.approvalsEnv, workRootDeps.platform);
+    if (lapsedApproval !== undefined) throw new RoleDispatchRefusal(agent, displaySafe(`resume refused: ${lapsedApproval}`));
     if (declaredTarget && exactBound !== undefined && !await declaresBoundTarget(rp.cfg, call.sessionID, sessionDirectory, declaredLine, exactBound)) {
       throw new RoleDispatchRefusal(agent, boundRootRefusal(exactBound));
     }

@@ -20,8 +20,11 @@
  * Cross-repo Phase 4 (`docs/design/cross-repo-phase4-plan.md`, SD-P4-5, -6), only with parents configured:
  * 3. its TEXT equals the path of a repository a human approved with `/router approve` (a valid entry of the approvals store), it
  *    is not a protected location, and its identity still holds (`verifyIdentity`: realpath, `.git` directory, top level, common
- *    dir, root commits). Rule 3 runs before rule 2 and its refusal is final; `locate` and the gate follow. Rule 2 skips a known
- *    repository that is an approved one whose identity fails. The final "not below routing.repoParents" refusal resolves the
+ *    dir, root commits). Rule 3 runs before rule 2 and its refusal is final; `locate` and the gate follow. Rule 3 binds exactly the
+ *    directory it verified (Phase 4 QA, m1). Rule 2 judges the repository that LISTS the candidate (git's main worktree), not the
+ *    known entry's text (Phase 4 QA, M1): unless it is the session repository, it must be an approved path whose identity holds
+ *    (the binding is then marked with the approval) or lie below a parent; otherwise the known entry is skipped (with no parents,
+ *    only the session repository's worktrees). The final "not below routing.repoParents" refusal resolves the
  *    candidate (realpath, no git): another spelling of an approved path is refused naming it; otherwise `approvable` carries the
  *    canonical candidate when it lies outside every parent and passes the text checks.
  *
@@ -124,8 +127,12 @@ export interface Declaration { readonly repo?: string; readonly branch?: string;
 export interface DeclarationContext { readonly sessionRepository: string; readonly known?: readonly string[] }
 
 export interface AdmissionService {
-  /** Rule 1 (below a parent), then rule 2 (a worktree that a repository in `known` lists); every admission passes the final gate. */
-  admit(root: string, known?: readonly string[]): Promise<Admission>;
+  /**
+   * Rule 1 (below a parent), then rule 3 (an approved path), then rule 2 (a worktree that a repository in `known` lists); every
+   * admission passes the final gate. `sessionRepository` is the repository whose worktrees rule 2 admits without a parent or an
+   * approval (Phase 4 QA, M1); without it, every repository that lists `root` must lie below a parent or be approved.
+   */
+  admit(root: string, known?: readonly string[], sessionRepository?: string): Promise<Admission>;
   /** Resolve `root=` / `repo=` / `branch=`; every declaration must agree. */
   resolve(decl: Declaration, ctx: DeclarationContext): Promise<Admission>;
   /**
@@ -640,8 +647,10 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
     if (problem !== undefined) {
       return refuseFinal(`root=${shown} is the approved repository ${entry.path}, but it ${problem}: no work root. Only the user can approve it again (/router approve ${entry.path}).`);
     }
-    if (text(real) !== text(entry.path)) return refuseFinal(`root=${shown} is the approved repository ${entry.path}, but it now resolves to ${real}: no work root.`);
-    const located = await locate(shown, real, real);
+    // Phase 4 QA (m1): both are `realpath` outputs; the directory verified above is the one bound below, byte for byte (a case
+    // variant on a case-sensitive NTFS folder is another directory).
+    if (real !== entry.path) return refuseFinal(`root=${shown} is the approved repository ${entry.path}, but it now resolves to ${real}: no work root.`);
+    const located = await locate(shown, entry.path, entry.path);
     if (!located.ok) return located;
     return { ok: true, location: { ...located.location, approval: entry.path } };
   };
@@ -680,10 +689,37 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
     return first;
   };
 
-  /** Rule 2: undefined when no repository in `known` lists `shown` as text. */
-  const ruleTwo = async (shown: string, known: readonly string[]): Promise<Admission | undefined> => {
+  /**
+   * Phase 4 QA (M1): whether the canonical `repository` lies 1..depth segments below a parent (the parent's text or its canonical
+   * form). False with no parents.
+   */
+  const insideParents = (repository: string): boolean => {
+    const repoText = text(repository);
+    return parents.some((parent) => {
+      const realParent = canonical(parent);
+      const forms = realParent === null ? [text(parent)] : [text(parent), text(realParent)];
+      return forms.some((form) => {
+        const levels = levelsBelow(repoText, form);
+        return levels !== undefined && levels >= 1 && levels <= depth;
+      });
+    });
+  };
+
+  /**
+   * Rule 2: undefined when no repository in `known` lists `shown` as text (or none that may: see below).
+   *
+   * Phase 4 QA (M1): what backs the admission is the repository that LISTS `shown` (git's main worktree, canonical), never the
+   * known entry's text: a known linked worktree of an approved repository lists that repository. Unless that repository is the
+   * session repository (`session`, or the known entry is the session repository itself), it must be an approved path whose
+   * approval applies now and whose identity holds (`verifyIdentity`), and the binding is then tagged with it; or it must lie
+   * below a parent. Anything else skips the known entry: with no parents, only the session repository lists admissible worktrees.
+   */
+  const ruleTwo = async (shown: string, known: readonly string[], session: string | undefined): Promise<Admission | undefined> => {
     const rootText = text(shown);
     const approvals = approvedNow();
+    const sessionForms = session === undefined || rootTextProblem(session, platform) !== undefined
+      ? []
+      : [...new Set([text(session), text(canonical(session) ?? session)])];
     for (const repo of unique(known)) {
       if (rootTextProblem(repo, platform) !== undefined) continue;
       let entries: WorktreeEntry[];
@@ -694,13 +730,20 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
       }
       const hit = entries.find((entry) => !entry.prunable && !entry.bare && text(entry.path) === rootText);
       if (hit === undefined) continue;
-      // Phase 4 (SD-P4-6): a known repository that is an approved one lists worktrees only while its identity holds. (A lapsed
-      // approval is pruned from the working set before admission: SD-P4-12, `crossRepoOf`.)
-      const approved = approvalFor(repo, approvals);
-      if (approved !== undefined && (await identityProblem(approved)) !== undefined) continue;
-      if (approved !== undefined) {
-        const backed = await ruleTwoAt(shown, rootText, entries);
-        return backed.ok ? { ok: true, location: { ...backed.location, approval: approved.path } } : backed;
+      const main = entries[0];
+      const repository = main === undefined ? null : canonical(main.path);
+      // `ruleTwoAt` refuses a main worktree that does not resolve.
+      if (repository === null) return ruleTwoAt(shown, rootText, entries);
+      const ofSession = sessionForms.includes(text(repo)) || sessionForms.includes(text(repository));
+      if (!ofSession) {
+        // Phase 4 (SD-P4-6, -12): an approved repository lists worktrees only while its approval applies and its identity holds.
+        const approved = approvalFor(repository, approvals);
+        if (approved !== undefined) {
+          if ((await identityProblem(approved)) !== undefined) continue;
+          const backed = await ruleTwoAt(shown, rootText, entries);
+          return backed.ok ? { ok: true, location: { ...backed.location, approval: approved.path } } : backed;
+        }
+        if (!insideParents(repository)) continue;
       }
       return ruleTwoAt(shown, rootText, entries);
     }
@@ -766,7 +809,7 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
     return result;
   };
 
-  const admit = async (root: string, known: readonly string[] = []): Promise<Admission> => {
+  const admit = async (root: string, known: readonly string[] = [], sessionRepository?: string): Promise<Admission> => {
     const shown = root.trim();
     const problem = rootTextProblem(shown, platform);
     if (problem !== undefined) return refuse(`root=${shown} ${problem}: no work root.`);
@@ -778,7 +821,7 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
     // Phase 4 (SD-P4-5): rule 3 runs before rule 2 for an approved path, so a replaced folder always meets the identity check.
     const three = await ruleThree(shown);
     if (three !== undefined) return gate(shown, three);
-    const two = await ruleTwo(shown, known);
+    const two = await ruleTwo(shown, known, sessionRepository);
     if (two !== undefined) return gate(shown, two);
     if (one !== undefined) return one;
     const hint = parents[0] === undefined ? "" : ` Clone it or add a worktree below ${parents[0]}.`;
@@ -878,7 +921,7 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
   };
 
   /** The worktree of a repository (`worktrees`, git's order) for `branch`, or the only one; admitted (and gated) by `admit`. */
-  const pick = async (label: string, view: { readonly repository: string; readonly name: string; readonly worktrees: readonly WorktreeEntry[] }, branch: string | undefined, known: readonly string[]): Promise<Admission> => {
+  const pick = async (label: string, view: { readonly repository: string; readonly name: string; readonly worktrees: readonly WorktreeEntry[] }, branch: string | undefined, known: readonly string[], session: string): Promise<Admission> => {
     const usable = view.worktrees.filter((entry) => !entry.bare && !entry.prunable);
     const knownHere = unique([...known, view.repository]);
     if (branch !== undefined) {
@@ -886,13 +929,13 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
       if (on === undefined) {
         return refuse(`${label} branch=${branch}: no worktree of ${view.name} is on ${branch} (${listing(usable)}): no work root. Add a worktree on ${branch}, or name one with root="<path>".`);
       }
-      return admit(on.path, knownHere);
+      return admit(on.path, knownHere, session);
     }
     if (usable.length === 0) return refuse(`${label}: ${view.name} has no worktree: no work root.`);
     if (usable.length > 1) {
       return refuse(`${label} has ${String(usable.length)} worktrees: ${listing(usable)}: no work root. Add branch=<name>, or name one with root="<path>".`);
     }
-    return admit(usable[0]?.path ?? view.repository, knownHere);
+    return admit(usable[0]?.path ?? view.repository, knownHere, session);
   };
 
   const branchMismatch = (shown: string, location: RepoLocation, branch: string): string => {
@@ -924,7 +967,7 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
     if (root !== undefined) {
       // The named repository joins the known ones, so a worktree of it outside the parents is admitted (rule 2).
       const named = repo === undefined ? [] : (await lookup(repo)).found;
-      const admitted = await admit(root, unique([...known, ...named.map((location) => location.repository)]));
+      const admitted = await admit(root, unique([...known, ...named.map((location) => location.repository)]), ctx.sessionRepository);
       if (!admitted.ok) return admitted;
       const location = admitted.location;
       // Q10: repo= agrees with the repository's name or with the directory name of this very worktree.
@@ -963,8 +1006,8 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
       if (location === undefined) return refuse(`repo=${repo}: no work root.`);
       // Q10: repo=X matched the directory of a linked worktree, not a repository name. Without branch= that worktree is the work root;
       // with branch= the repository it belongs to decides (`pick`): the worktree on that branch, whatever its directory is called.
-      if (branch === undefined && !sameName(location.name, repo)) return admit(location.worktree, unique([...known, location.repository]));
-      return pick(`repo=${repo}`, location, branch, known);
+      if (branch === undefined && !sameName(location.name, repo)) return admit(location.worktree, unique([...known, location.repository]), ctx.sessionRepository);
+      return pick(`repo=${repo}`, location, branch, known, ctx.sessionRepository);
     }
 
     // branch= alone: the session repository's worktree on that branch.
@@ -978,7 +1021,7 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
     const repository = main === undefined ? null : canonical(main.path);
     if (repository === null) return refuse(`branch=${branch ?? ""}: the session repository ${ctx.sessionRepository} does not resolve: no work root.`);
     const view = { repository, name: paths.basename(repository), worktrees: entries.filter((entry) => !entry.prunable) };
-    return pick(`repo=${view.name}`, view, branch, known);
+    return pick(`repo=${view.name}`, view, branch, known, ctx.sessionRepository);
   };
 
   return { admit, resolve, find: lookup };

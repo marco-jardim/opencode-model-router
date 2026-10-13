@@ -32,6 +32,7 @@ import { buildRoleLadder, roleTierOrder } from "../../src/routing/engine/ladders
 import { resetIngestState, type Ingest } from "../../src/routing/outcomes/ingest";
 import { bind, currentBinding, noncePromptLine, registerPending, resetBindingRegistryForTests } from "../../src/routing/roles/binding";
 import { addToWorkingSet, forgetWorkingSet } from "../../src/routing/wire/working-set";
+import { approvalsPath } from "../../src/routing/roles/approvals";
 import {
   AUTHORITY_TEXT, markAnnotated, previewAuthority, requestAuthority, requestedAuthority, resetAuthorityForTests,
 } from "../../src/routing/roles/authority";
@@ -961,7 +962,7 @@ describe("router_git root (cross-repo P3b)", () => {
     expect(gitSpawns()).toEqual([]);
   });
 
-  it("a working-set worktree outside the parents is allowed", async () => {
+  it("a working-set worktree outside the parents is allowed while its approval applies; an unapproved one is refused (Phase 4 QA M1)", async () => {
     const { work, parent } = await fixture();
     const other = await gitRepo(temp("omr-p3b-ws-"));
     const { dir } = home({ routing: { delegation: "roles", repoParents: [parent] } }, ENF0);
@@ -969,6 +970,14 @@ describe("router_git root (cross-repo P3b)", () => {
     addToWorkingSet("root", locationOf(other));
     cleanups.push(async () => { forgetWorkingSet("root"); });
     await bindExact(hooks, dir, work);
+    // Neither approved nor the session repository: rule 2 no longer admits it through its own (untagged) entry.
+    expect(await call(hooks, "router_git_log", { root: other, limit: 1 })).toMatch(/^\[router_git\] error: refused: root=/);
+    // Approved (a store entry in force), as a dispatch through it records it: admitted.
+    const roots = childProcess.execFileSync("git", ["rev-list", "--max-parents=0", "HEAD"], { cwd: other, encoding: "utf8" }).split(/\r?\n/).filter((line) => line !== "").sort();
+    const now = Date.now();
+    mkdirSync(dirname(approvalsPath()), { recursive: true });
+    writeFileSync(approvalsPath(), JSON.stringify({ version: 1, approvals: [{ path: other, commonDir: join(other, ".git"), roots, origin: "none", approvedAt: now, lastUsedAt: now }] }));
+    addToWorkingSet("root", { ...locationOf(other), approval: other });
     const log = await call(hooks, "router_git_log", { root: other, limit: 1 });
     expect(log).not.toContain("[router_git] error");
     const line = provenanceOf(log);

@@ -74,7 +74,8 @@ import { GUARD_CUMULATIVE_MULTIPLIER, roleGuardProfile, type GuardProfile } from
 import { currentBinding } from "./routing/roles/binding";
 import { authorityTool, requestedAuthority } from "./routing/roles/authority";
 import {
-  CARRIED_NO_PROCESS_REASON, roleAttemptVerification, roleEscalationAfterFail, roleMaxActions, routedRoleOf, strippedRouteRoot,
+  CARRIED_NO_PROCESS_REASON, lapsedApprovalReason, pruneLapsedApprovals, roleAttemptVerification, roleEscalationAfterFail, roleMaxActions,
+  routedRoleOf, strippedRouteRoot,
 } from "./routing/wire/dispatch";
 import { roleTierOrder } from "./routing/engine/ladders";
 import { acceptanceScriptsOf, detectRedispatch, returnSignal, runSignal, parseReturnPrefix, type DispatchText } from "./routing/outcomes/signals";
@@ -599,6 +600,13 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     if (!answer.role) return answer;
     const grant = currentBinding(sessionID, { maxOf: roleMaxOf })?.grant;
     if (grant === undefined || !grant.actions.has(action)) return { role: true, root: null };
+    // Phase 4 QA (m2): a binding backed by an approval holds only while the approval applies (store read, no git). The tools
+    // report a resolver's throw as their error, nothing runs.
+    const approval = grant.location?.approval;
+    if (approval !== undefined && answer.root !== null) {
+      const lapsed = lapsedApprovalReason(approval, resolveRolesRouting(cfg, "v2").repoApprovalDays);
+      if (lapsed !== undefined) throw new Error(`refused: ${lapsed}`);
+    }
     // Cross-repo (P1.5): a binding that carries its repository makes it the repository `router_git_*` expects.
     const repository = grant.location?.repository;
     return repository !== undefined && answer.root !== null ? { ...answer, repository } : answer;
@@ -685,12 +693,19 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     }
     const routing = resolveRolesRouting(cfg, "v2");
     if (routing.repoParents.length === 0) return { ok: false, reason: gitRoot.GIT_ROOT_NO_PARENTS };
+    // Phase 4 QA (m2): a binding backed by an approval that no longer applies (revoked, expired) inspects nothing (store read, no git).
+    const approval = grant.location?.approval;
+    const lapsed = approval === undefined ? undefined : lapsedApprovalReason(approval, routing.repoApprovalDays);
+    if (lapsed !== undefined) return { ok: false, reason: lapsed };
     // QA round 1 (Phase 3 lot 1, F5): the session lookup is bounded by the call's deadline and signal (SD-3b-8).
     const asked = await gitRoot.gitRootBounded(() => orchestratorOf(sessionID), { ...(signal === undefined ? {} : { signal }), deadlineAt });
     if ("stop" in asked && asked.stop !== "failed") return { ok: false, reason: gitRoot.gitRootStopReason(value, asked.stop) };
     // A failed lookup: no working set, R narrows to the parents (fail closed).
     const orchestrator = "value" in asked ? asked.value : undefined;
-    const workingSet = (orchestrator === undefined ? [] : workingSetOf(orchestrator)).map((location) => location.worktree);
+    // Phase 4 QA (M1): as for a dispatch (`crossRepoOf`), an entry whose approval lapsed is dropped before it can admit by rule 2;
+    // the drop reaches every working set, so the read set below shrinks with it.
+    const workingSet = (orchestrator === undefined ? [] : pruneLapsedApprovals(workingSetOf(orchestrator), routing.repoApprovalDays))
+      .map((location) => location.worktree);
     const member = readSetMemberOf(orchestrator);
     const admissionConfig = {
       parents: routing.repoParents,
@@ -706,7 +721,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       inReadSet: (path) => member !== undefined && member(path) !== undefined,
       // Created on first use only: a text refusal never loads admission.
       admission: {
-        admit: async (root, knownRepositories) => (await gitRootAdmissionFor(admissionConfig)).admit(root, knownRepositories),
+        // Phase 4 QA (M1): the session repository is named, whatever order `known` reaches admission in.
+        admit: async (root, knownRepositories) => (await gitRootAdmissionFor(admissionConfig)).admit(root, knownRepositories, ctx.directory),
         // QA round 1 (Phase 3 lot 1, F4): the resolver's `eligible` (the text gate and R) reaches the lookup.
         find: async (name, opts) => (await gitRootAdmissionFor(admissionConfig)).find(name, opts),
       },
@@ -3454,6 +3470,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             parents: routing.repoParents,
             exclude: routing.repoExclude,
             days: routing.repoApprovalDays,
+            repoDepth: routing.repoDepth,
           });
           output.parts.push({ type: "text" as const, text: result.text });
           // SD-P4-11: the v2 command adapter reloads the role agents before it sends this text on.

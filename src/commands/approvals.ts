@@ -89,6 +89,11 @@ export interface RouterApprovalsOptions {
   readonly exclude: readonly string[];
   /** `routing.repoApprovalDays` (resolved). */
   readonly days: number;
+  /**
+   * `routing.repoDepth` (resolved): a candidate below a parent but deeper than this is reported as one no approval applies to.
+   * Undefined: no depth check (every candidate inside a parent needs no approval).
+   */
+  readonly repoDepth?: number;
   /** Store environment (tests: the store directory and the clock). */
   readonly env?: ApprovalsEnv;
   /** Git and filesystem of the candidate inspection (tests). */
@@ -141,21 +146,47 @@ function realpathOf(opts: RouterApprovalsOptions): (p: string) => string {
   return opts.identity?.realpath ?? ((p: string) => fs.realpathSync.native(p));
 }
 
-/** The `routing.repoParents` entry that `canonical` is inside (text and canonical form of the parent), or undefined. No git. */
-function parentHolding(canonical: string, opts: RouterApprovalsOptions, platform: NodeJS.Platform): string | undefined {
+/** `form` with one trailing separator (comparison forms keep one only at a filesystem root). */
+function withSep(form: string): string {
+  return form.endsWith(path.sep) || form.endsWith("/") ? form : `${form}${path.sep}`;
+}
+
+/** Whether comparison form `child` is strictly inside comparison form `parent`. */
+function strictlyInside(child: string, parent: string): boolean {
+  return child !== parent && child.startsWith(withSep(parent));
+}
+
+/** How a candidate relates to `routing.repoParents`: it is a parent, contains one, or is `depth` levels below one. */
+type ParentRelation =
+  | { readonly kind: "is" | "contains"; readonly parent: string }
+  | { readonly kind: "inside"; readonly parent: string; readonly depth: number };
+
+/**
+ * How `canonical` relates to the `routing.repoParents` entries (each in its text and canonical form, case-insensitive on
+ * win32), or undefined when it is outside all of them. Being or containing a parent wins over being inside another one;
+ * among the parents holding it, the nearest (smallest depth) is reported. No git.
+ */
+function parentRelation(canonical: string, opts: RouterApprovalsOptions, platform: NodeJS.Platform): ParentRelation | undefined {
   const candidate = cmpForm(canonical, platform);
   const realpath = realpathOf(opts);
+  let nearest: { parent: string; depth: number } | undefined;
+  let holder: ParentRelation | undefined;
   for (const parent of opts.parents) {
     if (parent.trim() === "" || !path.isAbsolute(parent)) continue;
     const forms = new Set([cmpForm(parent, platform)]);
     const real = realOrUndefined(parent, realpath);
     if (real !== undefined) forms.add(cmpForm(real, platform));
     for (const form of forms) {
-      const prefix = form.endsWith(path.sep) || form.endsWith("/") ? form : `${form}${path.sep}`;
-      if (candidate !== form && candidate.startsWith(prefix)) return parent;
+      if (candidate === form) return { kind: "is", parent };
+      if (strictlyInside(form, candidate)) holder ??= { kind: "contains", parent };
+      else if (strictlyInside(candidate, form)) {
+        const depth = candidate.slice(withSep(form).length).split(/[\\/]/).filter((part) => part !== "").length;
+        if (nearest === undefined || depth < nearest.depth) nearest = { parent, depth };
+      }
     }
   }
-  return undefined;
+  if (holder !== undefined) return holder;
+  return nearest === undefined ? undefined : { kind: "inside", ...nearest };
 }
 
 /** A time for the human: `YYYY-MM-DD HH:MM UTC`. */
@@ -183,15 +214,32 @@ async function approve(rest: string, opts: RouterApprovalsOptions, platform: Nod
     exclude: opts.exclude,
     platform,
     ...(opts.env === undefined ? {} : { env: opts.env }),
+    // S2: what is shown and stored comes from git now, never from a cached inspection.
+    fresh: true,
   };
   const found = await inspectCandidate(typed, deps);
   if (typeof found === "string") return { text: `Not approved: ${shown} ${displaySafe(found)}.\nNothing was stored.` };
 
   const repo = displaySafe(found.path);
-  const parent = parentHolding(found.path, opts, platform);
-  if (parent !== undefined) {
+  const relation = parentRelation(found.path, opts, platform);
+  if (relation !== undefined) {
+    const parent = displaySafe(relation.parent);
+    if (relation.kind !== "inside") {
+      // The router refuses a root that is or contains a parent, and its approval would be registered wider than the parents.
+      return {
+        text: `Not approved: ${repo} ${relation.kind === "is" ? "is" : "contains"} routing.repoParents entry ${parent}; `
+          + `a repository that is or contains a parent cannot be approved.\nNothing was stored.`,
+      };
+    }
+    const depth = opts.repoDepth;
+    if (depth !== undefined && relation.depth > depth) {
+      return {
+        text: `No approval applies: ${repo} is below ${parent} but deeper than routing.repoDepth (${String(depth)}); `
+          + `the router refuses it with or without an approval.\nNothing was stored.`,
+      };
+    }
     return {
-      text: `No approval needed: ${repo} is inside routing.repoParents (${displaySafe(parent)}); dispatch with root=${repo}.\nNothing was stored.`,
+      text: `No approval needed: ${repo} is inside routing.repoParents (${parent}); dispatch with root=${repo}.\nNothing was stored.`,
     };
   }
 

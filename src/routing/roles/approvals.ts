@@ -454,10 +454,20 @@ function opencodeDirs(xdgVar: string, ...fallback: string[]): string[] {
 }
 
 /**
+ * The directory of the config file named by `OPENCODE_CONFIG` (resolved against the working directory,
+ * as opencode reads it), or undefined when the variable is unset or empty.
+ */
+function opencodeConfigFileDir(): string | undefined {
+  const v = process.env.OPENCODE_CONFIG;
+  return v !== undefined && v.trim() !== "" ? path.dirname(path.resolve(v)) : undefined;
+}
+
+/**
  * The protected locations: the opencode config dir (the router's `dirname(overridePath())`, plus
- * `$XDG_CONFIG_HOME/opencode`) and `OPENCODE_CONFIG_DIR`, the opencode data, state and cache dirs, this
- * plugin's install dir (`dirname(configPath())`) and the store's dir (equal, ancestor or inside), and
- * the user profile (equal or ancestor). Filesystem roots are checked separately by {@link protectedProblem}.
+ * `$XDG_CONFIG_HOME/opencode`), `OPENCODE_CONFIG_DIR`, the directory of the `OPENCODE_CONFIG` file and
+ * `~/.opencode`, the opencode data, state and cache dirs, this plugin's install dir
+ * (`dirname(configPath())`) and the store's dir (equal, ancestor or inside), and the user profile
+ * (equal or ancestor). Filesystem roots are checked separately by {@link protectedProblem}.
  */
 export function protectedLocations(env: ApprovalsEnv = {}): ProtectedLocation[] {
   const out: ProtectedLocation[] = [];
@@ -468,6 +478,9 @@ export function protectedLocations(env: ApprovalsEnv = {}): ProtectedLocation[] 
   for (const d of opencodeDirs("XDG_CONFIG_HOME", ".config")) add("the opencode config directory", d);
   const custom = envDir("OPENCODE_CONFIG_DIR");
   if (custom !== undefined) add("OPENCODE_CONFIG_DIR", custom);
+  const configFileDir = opencodeConfigFileDir();
+  if (configFileDir !== undefined) add("the directory of OPENCODE_CONFIG", configFileDir);
+  add("the ~/.opencode directory", path.join(os.homedir(), ".opencode"));
   for (const d of opencodeDirs("XDG_DATA_HOME", ".local", "share")) add("the opencode data directory", d);
   for (const d of opencodeDirs("XDG_STATE_HOME", ".local", "state")) add("the opencode state directory", d);
   for (const d of opencodeDirs("XDG_CACHE_HOME", ".cache")) add("the opencode cache directory", d);
@@ -613,6 +626,11 @@ export interface InspectDeps extends IdentityDeps {
   readonly exclude?: readonly string[];
   /** Store environment: the store's directory is a protected location. */
   readonly env?: ApprovalsEnv;
+  /**
+   * Ask git now, never a cached result (`/router approve`, S2: what is stored comes from git at approve time). The fresh
+   * result still replaces the cached one.
+   */
+  readonly fresh?: boolean;
 }
 
 /** The end of every refusal of a candidate that is not a main worktree (SD-P4-4). */
@@ -745,7 +763,7 @@ async function inspectGit(real: string, deps: IdentityDeps, adm: AdmissionModule
  * the canonical form, `routing.repoExclude` on both, {@link protectedProblem}, and `<canonical>\.git` must be a local directory
  * (`lstat`: not a link, not a gitfile). Then hardened, bounded git: the canonical form must be the top level, its canonical common
  * dir must be `<canonical>\.git`, and it must have at least one commit. The git part is cached {@link INSPECT_CACHE_MS} per
- * canonical path; the checks before it run every time. Never throws.
+ * canonical path (`deps.fresh` skips the cached result); the checks before it run every time. Never throws.
  */
 export async function inspectCandidate(text: string, deps: InspectDeps = {}): Promise<string | CandidateIdentity> {
   try {
@@ -777,7 +795,7 @@ export async function inspectCandidate(text: string, deps: InspectDeps = {}): Pr
 
     const now = (deps.now ?? Date.now)();
     const key = cmpForm(real);
-    const hit = inspected.get(key);
+    const hit = deps.fresh === true ? undefined : inspected.get(key);
     if (hit !== undefined && now >= hit.at && now - hit.at < INSPECT_CACHE_MS) return await hit.value;
     const value = inspectGit(real, deps, adm);
     remember(inspected, key, { at: now, value });
