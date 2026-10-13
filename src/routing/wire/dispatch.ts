@@ -65,7 +65,11 @@ import {
 } from "../roles/binding";
 import { realpathSync } from "node:fs";
 import { dirname } from "node:path";
-import type { Admission, AdmissionConfig, AdmissionService, RepoLocation } from "../roles/admission";
+// Static, not `await import`: dynamic imports made a bundle split src/router/config.ts into a chunk where its tiers.json lookup
+// fails. admission.ts imports this module back; both sides use the other only inside functions.
+import {
+  createAdmission, defaultAdmissionDeps, gitShowToplevel, type Admission, type AdmissionConfig, type AdmissionService, type RepoLocation,
+} from "../roles/admission";
 import { buildRoleDispatchHeader, stripDispatchHeader } from "../../router/dispatch-header";
 import { addToWorkingSet, dropFromWorkingSets, workingSetOf } from "./working-set";
 import {
@@ -1743,9 +1747,9 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     platform: deps.platform ?? process.platform,
   };
 
-  // QA round 2: the hardened `git rev-parse --show-toplevel` of admission (loaded lazily, see `admissionFor`); tests inject a fake.
+  // QA round 2: the hardened `git rev-parse --show-toplevel` of admission; tests inject a fake.
   const showToplevel = async (cwd: string): Promise<string | undefined> =>
-    deps.showToplevel !== undefined ? deps.showToplevel(cwd) : (await import("../roles/admission")).gitShowToplevel(cwd);
+    deps.showToplevel !== undefined ? deps.showToplevel(cwd) : gitShowToplevel(cwd);
 
   // Cross-repo P2.5: the read set R of this dispatch's role session beyond its work root, for the per-check `cwd=` roots the gate
   // places (the same inputs as the read guard: the dispatching session's working set, `routing.repoParents/Depth/Exclude`, one
@@ -1765,7 +1769,6 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
 
   /** The real admission; with an injected {@link DispatchRouterDeps.approvalsEnv}, its rule 3 reads that store (Phase 4). */
   const defaultAdmission = async (config: AdmissionConfig): Promise<Pick<AdmissionService, "admit" | "resolve">> => {
-    const { createAdmission, defaultAdmissionDeps } = await import("../roles/admission");
     const env = deps.approvalsEnv;
     if (env === undefined) return createAdmission(config);
     const days = config.approvalDays ?? DEFAULT_REPO_APPROVAL_DAYS;
@@ -1778,7 +1781,6 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
   const admissionFor = async (config: AdmissionConfig): Promise<Pick<AdmissionService, "admit" | "resolve">> => {
     const key = JSON.stringify([config.parents, config.depth, config.exclude, config.approvalDays ?? null]);
     if (admissionMemo !== undefined && admissionMemo.key === key) return admissionMemo.service;
-    // Loaded lazily: admission.ts imports this module, so no import cycle is evaluated at load time.
     const service = deps.createAdmission !== undefined ? deps.createAdmission(config) : await defaultAdmission(config);
     admissionMemo = { key, service };
     return service;

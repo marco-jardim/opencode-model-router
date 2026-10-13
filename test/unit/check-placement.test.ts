@@ -70,6 +70,32 @@ describe("resolveCheckPlacements (cross-repo P2.2)", () => {
     expect(inReadSet).toHaveBeenCalledWith(sub);
   });
 
+  it("compares tops like the old `/\\/+$/` normalisation on short inputs (CodeQL js/polynomial-redos)", () => {
+    const oldKey = (top: string): string => {
+      const normalized = top.replace(/\\/g, "/").replace(/\/+$/, "");
+      return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+    };
+    const sub = join(other, "sub");
+    const variants = [w, `${w}/`, `${w}///`, `${w}\\\\`, `${w}/x`, `/${w}`, other, `${other}//`];
+    for (const variant of variants) {
+      const topOf = (dir: string): string | undefined => (dir === w ? w : variant);
+      const result = resolveCheckPlacements(dodOf([{ kind: "testsPass", cwd: sub }]), verificationScope(undefined, w), { inReadSet: insideOther, topOf });
+      expect(result, variant).toEqual({ placements: [{ cwd: sub, top: variant, foreign: oldKey(variant) !== oldKey(w) }] });
+    }
+  });
+
+  it("compares a top with 100 000 trailing '/' fast (no polynomial backtracking)", () => {
+    const sub = join(other, "sub");
+    const run = "/".repeat(100_000);
+    const started = performance.now();
+    for (const top of [`${w}${run}`, `${w}${run}x`]) {
+      const topOf = (dir: string): string | undefined => (dir === w ? w : top);
+      const result = resolveCheckPlacements(dodOf([{ kind: "testsPass", cwd: sub }]), verificationScope(undefined, w), { inReadSet: insideOther, topOf });
+      expect(result.placements?.[0]?.foreign).toBe(top.endsWith("x"));
+    }
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+
   it("refuses an absolute cwd outside W and outside the read set", () => {
     const inReadSet = vi.fn(insideOther);
     const result = resolveCheckPlacements(dodOf([{ kind: "buildPasses", cwd: outside }]), verificationScope(undefined, w), { inReadSet });

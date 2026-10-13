@@ -14,6 +14,10 @@ import * as path from "node:path";
 
 import { configPath, overridePath, statePath } from "../../router/config";
 import { REPO_APPROVAL_CAP_DAYS } from "../../router/roles-config";
+import { permissionMatches } from "../../router/read-only";
+// Static, not `await import`: dynamic imports made a bundle split src/router/config.ts into a chunk where its tiers.json
+// lookup fails. The cycle with admission.ts is safe: each side uses the other only inside functions.
+import * as admission from "./admission";
 import { displaySafe } from "./read-set";
 
 export const APPROVALS_FILE_NAME = "opencode-model-router.repo-approvals.json";
@@ -636,7 +640,7 @@ export interface InspectDeps extends IdentityDeps {
 /** The end of every refusal of a candidate that is not a main worktree (SD-P4-4). */
 export const APPROVE_MAIN_WORKTREE = "approve the main worktree";
 
-type AdmissionModule = typeof import("./admission");
+type AdmissionModule = typeof admission;
 
 interface TimedResult<T> { readonly at: number; readonly value: Promise<T> }
 const IDENTITY_CACHE_MAX = 64;
@@ -767,8 +771,7 @@ async function inspectGit(real: string, deps: IdentityDeps, adm: AdmissionModule
  */
 export async function inspectCandidate(text: string, deps: InspectDeps = {}): Promise<string | CandidateIdentity> {
   try {
-    const adm = await import("./admission");
-    const { permissionMatches } = await import("../../router/read-only");
+    const adm: AdmissionModule = admission;
     const platform = deps.platform ?? process.platform;
     const win = platform === "win32";
     const exclude = deps.exclude ?? [];
@@ -814,7 +817,7 @@ export async function inspectCandidate(text: string, deps: InspectDeps = {}): Pr
  */
 export async function verifyIdentity(entry: Pick<RepoApproval, "path" | "commonDir" | "roots">, deps: IdentityDeps = {}): Promise<string | undefined> {
   try {
-    const adm = await import("./admission");
+    const adm: AdmissionModule = admission;
     const platform = deps.platform ?? process.platform;
     const textProblem = adm.rootTextProblem(entry.path, platform);
     if (textProblem !== undefined) return `has a path that ${textProblem}`;

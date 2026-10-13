@@ -16,6 +16,9 @@ import { warnAgentOptionsEffortOnce } from "../router/agent-options";
 import { pluginAgentMarker } from "../router/plugin-agents";
 import { registerRoleAgents, roleAgentAlias, roleAgentOf, roleAgentSteps } from "../router/role-agents";
 import { readApprovals, type RepoApproval } from "../routing/roles/approvals";
+// Static, not `await import`: a dynamic import made a bundle split src/router/config.ts into a chunk where its tiers.json
+// lookup fails.
+import { approvalReloadLine, approvalsChangedOf } from "../commands/approvals";
 import { stripDelegateInstructions } from "../router/instructions";
 import { createPluginLogger } from "../router/logger";
 import { budgetClaimObserved, GRADER_SYSTEM } from "../verify/checker";
@@ -1477,8 +1480,7 @@ export async function registerV2Hooks(
             // Cross-repo P4.7 (SD-P4-11): after `/router approve|revoke` wrote the store, reload the role agents (their
             // `external_directory` patterns come from the store), then say whether the change is usable now. The text still goes
             // through `session.prompt` below, so the orchestrator sees it and dispatches again.
-            const approvals = await import("../commands/approvals");
-            const change = approvals.approvalsChangedOf(output.parts);
+            const change = approvalsChangedOf(output.parts);
             if (change !== undefined) {
               let reloadError: string | undefined;
               try {
@@ -1486,7 +1488,7 @@ export async function registerV2Hooks(
               } catch (error) {
                 reloadError = error instanceof Error ? error.message : String(error);
               }
-              output.parts.push({ type: "text", text: approvals.approvalReloadLine(change, APPROVAL_RELOAD_APPLIES, reloadError) });
+              output.parts.push({ type: "text", text: approvalReloadLine(change, APPROVAL_RELOAD_APPLIES, reloadError) });
             }
           }
           await ctx.session.prompt({

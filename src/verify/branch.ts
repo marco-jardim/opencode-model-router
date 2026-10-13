@@ -7,6 +7,7 @@
  */
 import type { TreeSnapshot } from "./dispatch";
 import type { HeadState, ReflogEntry } from "./head";
+import { isSlash, trimEndWhile } from "../util/linear-trim";
 
 /** The part of a snapshot (or of a deferred registration) the branch rule reads. */
 export type BranchState = Pick<TreeSnapshot, "head" | "branch">;
@@ -53,7 +54,7 @@ export type TreeMove = { readonly kind: "switched" | "rewritten" | "relocated"; 
 
 function sameRoot(a: string, b: string, platform: NodeJS.Platform): boolean {
   const norm = (p: string) => {
-    const slashed = p.replace(/\\/g, "/").replace(/\/+$/, "");
+    const slashed = trimEndWhile(p.replace(/\\/g, "/"), isSlash); // linear: no `/\/+$/` (polynomial on a run of "/")
     return platform === "win32" ? slashed.toLowerCase() : slashed;
   };
   return norm(a) === norm(b);

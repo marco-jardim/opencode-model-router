@@ -95,6 +95,30 @@ describe("treeMove", () => {
     expect(treeMove(H(A, "main", "/Work/Repo"), H(A, "main", "/work/repo"), [], "linux")).toEqual({ kind: "relocated" });
   });
 
+  it("trailing separators are trimmed like the old `/\\/+$/` regex (CodeQL js/polynomial-redos)", () => {
+    const oldNorm = (p: string): string => p.replace(/\\/g, "/").replace(/\/+$/, "");
+    const pairs: [string, string][] = [
+      ["/repo", "/repo///"],
+      ["/repo", "/repo/x"],
+      ["/", "///"],
+      ["/repo\\\\", "/repo"],
+      ["//repo//", "//repo"],
+      ["/repo/", "/repo//x/"],
+    ];
+    for (const [a, b] of pairs) {
+      const expected = oldNorm(a) === oldNorm(b) ? undefined : { kind: "relocated" };
+      expect(treeMove(H(A, "main", a), H(A, "main", b), [], "linux"), `${a} vs ${b}`).toEqual(expected);
+    }
+  });
+
+  it("100 000 repeated '/' in a root compare fast (no polynomial backtracking)", () => {
+    const run = "/".repeat(100_000);
+    const started = performance.now();
+    expect(treeMove(H(A, "main", `${run}x`), H(A, "main", `${run}y`), [], "linux")).toEqual({ kind: "relocated" });
+    expect(treeMove(H(A, "main", `/repo${run}`), H(A, "main", "/repo"), [], "win32")).toBeUndefined();
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+
   it("names that differ are a switch, even with a window of commits only", () => {
     expect(treeMove(H(A, "main"), H(A, "feat"), [E(A, "commit: x"), E(A, "commit: y")])).toEqual({ kind: "switched" });
     expect(treeMove(H(A, "main"), H(A, null), undefined)).toEqual({ kind: "switched" });

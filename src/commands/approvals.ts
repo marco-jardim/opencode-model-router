@@ -22,6 +22,7 @@ import {
   type RepoApproval,
 } from "../routing/roles/approvals";
 import { displaySafe } from "../routing/roles/read-set";
+import { permissionMatches } from "../router/read-only";
 import { REPO_APPROVAL_CAP_DAYS } from "../router/roles-config";
 import { dropFromWorkingSets } from "../routing/wire/working-set";
 
@@ -285,7 +286,6 @@ async function repos(opts: RouterApprovalsOptions, platform: NodeJS.Platform): P
   if (read.invalid !== undefined) {
     return { text: `The approvals file ${file} is invalid (${displaySafe(read.invalid)}); no approvals apply until it is fixed or removed.` };
   }
-  const { permissionMatches } = await import("../router/read-only");
   const now = (opts.env?.now ?? Date.now)();
   const lines: string[] = [];
   if (read.approvals.length === 0) lines.push(`No approved repositories (${file}).`);

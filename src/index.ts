@@ -154,6 +154,11 @@ import {
 } from "./verify/dispatch";
 import { canonicalAuthorityPath, captureRootOf, insideWorkRoot, requestedVerificationCwd, requestedVerificationCwdSource, verificationScope, type VerificationScope } from "./routing/roles/work-root";
 import { resolveCheckPlacements } from "./routing/roles/check-placement";
+// Static, not `await import`: dynamic imports made a bundle split src/router/config.ts into a chunk where its tiers.json
+// lookup fails (the e2e child bundle). Each module below is used only inside functions.
+import { createAdmission, type AdmissionConfig, type AdmissionService } from "./routing/roles/admission";
+import * as gitRoot from "./routing/roles/git-root";
+import * as approvalsCommands from "./commands/approvals";
 import { createRepoProbe, displaySafe, readSetEligible, readSetPredicate } from "./routing/roles/read-set";
 import { newLadderState, recordAttempt, nextAction, advance, buildEscalatePolicy, formatLadderScorecard, startCostRatio } from "./escalate/ladder";
 import { createCatalogLookup, planFirstAttempt, planNextAttempt } from "./escalate/resume";
@@ -299,7 +304,7 @@ function buildRouterOutput(cfg: RouterConfig, args: string, projectDir?: string,
   );
 }
 
-/** Cross-repo P4.7: the `/router` subcommands of `commands/approvals.ts` (checked before that module is loaded). */
+/** Cross-repo P4.7: the `/router` subcommands of `commands/approvals.ts` (checked before that module is used). */
 const APPROVAL_SUBCOMMANDS: ReadonlySet<string> = new Set(["approve", "repos", "revoke"]);
 
 /** `/budget` dispatch. Persists the switch, then renders. */
@@ -663,24 +668,23 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   };
   /**
    * Cross-repo 3b.4 (F10): one admission per resolved `{ repoParents, repoDepth, repoExclude }` for `router_git` `root` (it caches its
-   * git results for 5 s). Loaded lazily, as `routing/wire/dispatch.ts` does: admission imports the wire layer.
+   * git results for 5 s). Created on first use.
    */
-  type GitRootAdmission = Pick<import("./routing/roles/admission").AdmissionService, "admit" | "find">;
+  type GitRootAdmission = Pick<AdmissionService, "admit" | "find">;
   let gitRootAdmissionMemo: { readonly key: string; readonly service: GitRootAdmission } | undefined;
-  const gitRootAdmissionFor = async (config: import("./routing/roles/admission").AdmissionConfig): Promise<GitRootAdmission> => {
+  const gitRootAdmissionFor = async (config: AdmissionConfig): Promise<GitRootAdmission> => {
     const key = JSON.stringify([config.parents, config.depth, config.exclude, config.approvalDays ?? null]);
     if (gitRootAdmissionMemo !== undefined && gitRootAdmissionMemo.key === key) return gitRootAdmissionMemo.service;
-    const service = (await import("./routing/roles/admission")).createAdmission(config);
+    const service = createAdmission(config);
     gitRootAdmissionMemo = { key, service };
     return service;
   };
   /**
    * Cross-repo 3b.4 (OpenCode v2, roles mode, `routing.repoParents` at start; SD-3b-1): the `root` resolver of `router_git_*`. Step 1
    * here, no filesystem call and no spawn: a role session (D21), an exact binding with a work root and `router_git` in the grant (I9,
-   * F12), a local read action in the grant (SD-3b-5), parents still configured. Steps 2–10: `routing/roles/git-root.ts` (lazy).
+   * F12), a local read action in the grant (SD-3b-5), parents still configured. Steps 2–10: `routing/roles/git-root.ts`.
    */
   const resolveGitRootFor: GitRootResolver = async (value, { sessionID, signal, deadlineAt }) => {
-    const gitRoot = await import("./routing/roles/git-root");
     if (roleOfSession(sessionID) === undefined) return { ok: false, reason: gitRoot.GIT_ROOT_ROLE_ONLY };
     const binding = currentBinding(sessionID, { maxOf: roleMaxOf });
     const grant = binding?.kind === "exact" ? binding.grant : undefined;
@@ -719,7 +723,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       isDirectory: (path) => statSync(path).isDirectory(),
       nearestCheckout,
       inReadSet: (path) => member !== undefined && member(path) !== undefined,
-      // Created on first use only: a text refusal never loads admission.
+      // Created on first use only: a text refusal never creates an admission.
       admission: {
         // Phase 4 QA (M1): the session repository is named, whatever order `known` reaches admission in.
         admit: async (root, knownRepositories) => (await gitRootAdmissionFor(admissionConfig)).admit(root, knownRepositories, ctx.directory),
@@ -3459,11 +3463,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         const sub = (parts[0] ?? "").toLowerCase();
         let text: string;
         // Cross-repo P4.7 (SD-P4-10): `approve`, `repos`, `revoke` only on v2, in roles mode, with `routing.repoParents`, typed in a
-        // top-level session; otherwise they fall through to the help below, unchanged (S5). Loaded lazily: no cost in tiers mode or on v1.
+        // top-level session; otherwise they fall through to the help below, unchanged (S5). Nothing runs in tiers mode or on v1.
         // The help lists them only where they run; `approvalsCommandsAvailable` returns before any session lookup unless v2 + roles
         // + parents hold.
         const approvalsAvailable = await approvalsCommandsAvailable(input.sessionID);
-        const approvalsCmd = approvalsAvailable && APPROVAL_SUBCOMMANDS.has(sub) ? await import("./commands/approvals") : undefined;
+        const approvalsCmd = approvalsAvailable && APPROVAL_SUBCOMMANDS.has(sub) ? approvalsCommands : undefined;
         if (approvalsCmd !== undefined && approvalsCmd.isRouterApprovalSubcommand(sub)) {
           const routing = resolveRolesRouting(cfg, "v2");
           const result = await approvalsCmd.runRouterApprovals(sub, args.slice((parts[0] ?? "").length), {

@@ -21,6 +21,7 @@ import { quoteGitPath } from "../../router/git-tools";
 import { permissionMatches } from "../../router/read-only";
 import type { RepoLocation } from "./admission";
 import { insideWorkRoot } from "./work-root";
+import { trimEndWhile } from "../../util/linear-trim";
 
 /**
  * QA-G-A2-2: a path segment that names git's metadata entry `.git` — compared case-insensitively (win32, and stricter
@@ -28,7 +29,15 @@ import { insideWorkRoot } from "./work-root";
  * `.git::$INDEX_ALLOCATION` all name `.git` there).
  */
 export function gitMetadataSegment(segment: string): boolean {
-  return segment.replace(/:.*$/s, "").replace(/[. ]+$/, "").toLowerCase() === ".git";
+  // Linear on purpose (CodeQL js/polynomial-redos): no `/[. ]+$/`, which is polynomial on a long run of " " or ".".
+  const colon = segment.indexOf(":");
+  const name = colon === -1 ? segment : segment.slice(0, colon);
+  return trimEndWhile(name, isDotOrSpace).toLowerCase() === ".git";
+}
+
+/** A trailing character win32 drops from a path segment: "." or " ". */
+function isDotOrSpace(char: string): boolean {
+  return char === "." || char === " ";
 }
 
 /** A path written fully qualified: `X:\…` / `X:/…` on win32 (never drive- or root-relative), `/…` elsewhere. */

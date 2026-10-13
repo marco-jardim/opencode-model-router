@@ -6,10 +6,11 @@
  */
 import { lstatSync } from "node:fs";
 import * as path from "node:path";
+import { isSlash, trimEndWhile } from "../util/linear-trim";
 
 /** A comparison key: absolute, "/" separators, no trailing separator, case-folded on win32. */
 export function perimeterKey(at: string): string {
-  const normalized = path.resolve(at).replace(/\\/g, "/").replace(/\/+$/, "");
+  const normalized = trimEndWhile(path.resolve(at).replace(/\\/g, "/"), isSlash); // linear: no `/\/+$/` (polynomial on a run of "/")
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 

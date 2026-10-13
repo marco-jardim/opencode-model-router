@@ -36,6 +36,7 @@
  */
 import { lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, posix, win32 } from "node:path";
+import { gitEnvironment, gitExecutable, hardeningArgs, inheritedSafeDirectoryArgs, spawnBounded, workRootGuards } from "../../router/git-tools";
 import { permissionMatches } from "../../router/read-only";
 import { DEFAULT_REPO_APPROVAL_DAYS } from "../../router/roles-config";
 import { gitWorktreeList, normalizeRootText } from "../wire/dispatch";
@@ -247,7 +248,6 @@ const GIT_BOUND_GRACE_MS = 500;
 /** One hardened git run ({@link gitBounded}), without the outer deadline. Never rejects. */
 async function runGitBounded(cwd: string, args: readonly string[], bound: number, maxBytes: number, spawn: GitSpawn | undefined): Promise<GitBoundedResult> {
   try {
-    const { gitEnvironment, gitExecutable, hardeningArgs, inheritedSafeDirectoryArgs, spawnBounded, workRootGuards } = await import("../../router/git-tools");
     const run: GitSpawn = spawn ?? spawnBounded;
     const started = performance.now();
     const executable = gitExecutable(workRootGuards(cwd));

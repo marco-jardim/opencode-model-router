@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { lstat, readdir, readFile, readlink, realpath, stat } from "node:fs/promises";
 import { constants as osConstants, setPriority } from "node:os";
 import { extname, join, resolve } from "node:path";
+import * as tools from "../router/git-tools";
 import { ABSENT_DIGEST, FILE_DIGEST_PREFIX, LINK_DIGEST_PREFIX, type TreeSnapshot, type ChangedFile } from "./dispatch";
 
 /** Each git process of a snapshot. */
@@ -428,8 +429,6 @@ export async function fileMtimeMs(path: string): Promise<number | undefined> {
 
 /** QA-1 F4: the argument prefix and process options of a hardened snapshot of `cwd` (SnapshotOptions.hardened). */
 async function hardenedGit(cwd: string): Promise<{ prefix: string[]; env: NodeJS.ProcessEnv; executable: string }> {
-  // Loaded only when asked for, so a plain snapshot's module graph and processes stay as they were.
-  const tools = await import("../router/git-tools");
   const executable = tools.gitExecutable(tools.workRootGuards(cwd));
   const trusted = await tools.inheritedSafeDirectoryArgs(executable);
   const base = [...tools.hardeningArgs(), ...trusted];

@@ -21,6 +21,7 @@ import { isAbsolute } from "node:path";
 import type { DoD } from "../../verify/dod";
 import { gitTopOf } from "../../verify/git-top";
 import type { CheckPlacement, PlacementResolution } from "../../verify/types";
+import { isSlash, trimEndWhile } from "../../util/linear-trim";
 import { canonicalAuthorityPath, insideWorkRoot, SHORT_NAME_SEGMENT, type VerificationScope } from "./work-root";
 
 /** What the resolver needs beyond the DoD and the scope; every member is a seam for tests. */
@@ -44,7 +45,7 @@ function lexicallyRefused(text: string): boolean {
 
 /** A comparison key for a top level: "/" separators, no trailing separator, case-folded on win32. */
 function topKey(top: string): string {
-  const normalized = top.replace(/\\/g, "/").replace(/\/+$/, "");
+  const normalized = trimEndWhile(top.replace(/\\/g, "/"), isSlash); // linear: no `/\/+$/` (polynomial on a run of "/")
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
