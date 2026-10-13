@@ -3972,7 +3972,8 @@ documentation. The dogfood comparison (§0.12-5) is written in 6.2.0.
 - **6.1.1** [tier:medium] VERIFY:required Scripted-provider additions, with unit tests.
   [route class=implement risk=medium scope=multi needs=edit,shell d=deterministic root=D:\git\omr-cpx-p61 tier=medium pin]
   Writes: `D:\git\omr-cpx-main\test\smoke\helpers\cpx-scripted-provider.ts`, `D:\git\omr-cpx-main\test\smoke\helpers\cpx-scripted-provider.test.ts`
-  (amendment A-0.1-1: the v1-frozen `scripted-provider.ts` and its test stay byte-identical).
+  (amendment A-0.1-1: the v1-frozen base scripted provider and its unit test stay byte-identical; A-DF2-1: named
+  without a path so the compiler does not read it as a write).
   Reads: the pre-flight list in `D:\git\omr-cpx-main\docs\qa\critical-path-execution\phase-6.1.md`.
   [acceptance]
   cwd: D:\git\omr-cpx-p61

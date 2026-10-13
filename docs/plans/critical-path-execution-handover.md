@@ -384,6 +384,27 @@ Everything else is work: resolve it, record it, continue.
 rounds, fast-forwarded into `cpx/main` at `a7889e2` (report `docs\qa\critical-path-execution\sync-1.md`). The p51
 worktree created before the sync is recreated from the synced `cpx/main`; the 5.1 pre-flight is redone.
 
+**DF-2 pre-flight record (2026-10-13):**
+- Smokes on `cpx/main` `39067ce`: `smoke:cpx` 57/57, `smoke:cpx:provision` 4/4, `smoke:v2` 2/2.
+- `origin/master` still `6ec3faa`: the owner's `tiers.json` change is not on master; nothing to sync. DF-2 runs on the
+  current tiers.
+- Config facts: `routing.leases.mode` defaults to `enforce`; `enforcement.verify.require` is not `never`; the bundled
+  `tiers.json` sets `graderTimeoutMs: 60000` for every tier, so the project layer raises it to 600000 for this repo.
+  `capacityCooldownMs` is a timing key, allowed in the project layer.
+- DF-1 faults: QA-DF1-1..-15 fixed (dogfood.md table); QA-DF1-16..-28 were dispatched in the pdf1 phases (confirm
+  closure before the switch).
+- Hand count for DF2.4.c (human rules): 147 tasks (88 routed, 19 QA, 19 FIX, 21 manual) + 52 pre-flight items; 31
+  depends-on edges, 112 order edges. Compiler rules (dry run, live repo view): 180 nodes = 77 task + 15 tests + 17 manual
+  + 19 qa + 52 preflight; FIX templates are not nodes; 0.P.1, 0.P.3, 0.1.3, 1.2.3 (no route, no "Orchestrator:") are
+  routed tasks; 369 edges (order + depends-on + stage + conflict). DF2.4.c passes when the compile reproduces these
+  compiler-rule numbers, zero cycles, footprints equal to the `Writes:` lines (6.1.2 ⊤ by A-DF2-2) and the manual set.
+- Amendments A-DF2-1 (6.1.1 note without a path) and A-DF2-2 (6.1.2 writes ⊤) in `phase-6.1.md`.
+- Freeze rule: from DF2.5 until the 6.1 landing, `cpx/main` is frozen (no commit, merge, master sync or pdf merge in
+  `D:\git\omr-cpx-main`); handover updates go to `%LOCALAPPDATA%\omr-cpx\handover-df2.md` and are committed right after
+  the landing; plan-scoped config lives under `D:\git\omr-cpx-main\.opencode\` (gitignored).
+- Pending owner OK: global override `routing.executor.slotsDir = D:/git/.omr-cpx-slots` and
+  `routing.executor.phaseSuite = [{"script":"test-files","args":["--maxWorkers=14"]}]` (QA-0.P-15 notice given).
+
 **NEXT ACTION (2026-10-13): DF-2 pre-flight.** Phase 5.1 merged into `cpx/main` (p51 head `2025224`; report
 `docs\qa\critical-path-execution\phase-5.1.md`): three heavy QA rounds + bounded re-check, ready for DF-2. Owner
 decisions in 5.1: slot verifier over the dispatch engine (option 2), mixed blocks graded in two passes, R11 lineage
