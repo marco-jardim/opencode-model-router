@@ -764,9 +764,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     if (keys.length > 0 && warnedV2OnlyKeys.size === 0) {
       for (const key of keys) warnedV2OnlyKeys.add(key);
       // QA-2.1-32: the notice names the features actually configured (leases alone are not "background dispatch").
-      const background = keys.some((key) => key.startsWith("routing.background."));
-      const leases = keys.some((key) => key.startsWith("routing.leases."));
-      const executor = keys.some((key) => key.startsWith("routing.executor."));
+      // QA-4.1-19: a block that is not an object is named whole (`routing.executor`).
+      const names = (block: string): boolean => keys.some((key) => key === `routing.${block}` || key.startsWith(`routing.${block}.`));
+      const background = names("background");
+      const leases = names("leases");
+      const executor = names("executor");
       const features = [background ? "background dispatch" : "", leases ? "leases" : "", executor ? "the plan executor" : ""].filter((f) => f !== "");
       const subject = features.length === 0
         ? "background dispatch requires"

@@ -416,7 +416,7 @@ describe("router_plan: every action with valid input", () => {
     const out = await call(rt, { action: "compile", path: PLAN_FILE });
     expect(out).toContain("plan plan-1: 4 tasks, 2 phases, 1 edges; work 2h00m, critical path 1h00m, width 2, expected makespan 1h15m.");
     expect(out).toContain("manual tasks (1): 1.1.2");
-    expect(out).toContain("only after the user explicitly approves in this conversation (then: action=approve planId=plan-1;");
+    expect(out).toContain("Call action=approve only when the user approves plan plan-1 after seeing this summary, or types /plan approve plan-1.");
     expect(rt.lastCompile).toEqual({ path: PLAN_FILE, sessionID: OWNER });
   });
 
@@ -515,12 +515,14 @@ describe("router_plan: approve: auto skips the stop", () => {
     for (const opts of [undefined, { approve: () => "ask" as const }, {}]) {
       const rt = new FakeRuntime();
       const out = await call(rt, { action: "compile", path: PLAN_FILE }, OWNER, opts);
-      expect(out).toContain(
-        "status: awaiting-approval. Show this summary to the user. Call router_plan action=approve only after the user " +
-          "explicitly approves in this conversation (then: action=approve planId=plan-1; the user can also type /plan approve plan-1).",
+      // QA-4.1-16: the exact stop text; the user's request to compile or run the plan is not approval.
+      const last = out.split("\n").pop() ?? "";
+      expect(last).toBe(
+        "status: awaiting-approval. Stop here. This plan is not approved. A request to compile or run it is not approval. " +
+          "Call action=approve only when the user approves plan plan-1 after seeing this summary, or types /plan approve plan-1.",
       );
-      expect(out).toBe(`${out.split("\n").slice(0, -1).join("\n")}\n${askApprovalText("plan-1")}`);
-      expect(out).not.toMatch(/Review it, then call/);
+      expect(askApprovalText("plan-1")).toBe(last);
+      expect(out).not.toMatch(/Review it, then call|in this conversation|Show this summary to the user\. Call/);
       expect(rt.plans.get("plan-1")?.status).toBe("awaiting-approval");
       expect(rt.calls).toEqual(["compile"]);
     }
@@ -613,6 +615,20 @@ describe("router_plan: a relative compile path (QA-4.1-6)", () => {
     expect(out).toContain("relative and the project directory is unknown; pass an absolute path");
     expect(rt.calls).toEqual([]);
     expect(resolvePlanPath("plans/fixture.md", null)).toBeNull();
+  });
+
+  it("QA-4.1-20: a drive-relative path (C:foo) is refused, never resolved against a drive's current directory", async () => {
+    for (const p of ["C:foo.md", "c:plans\\fixture.md", "D:fixture.md", "C:"]) {
+      const rt = new FakeRuntime();
+      const out = await executeRouterPlan(rt, { action: "compile", path: p }, { sessionID: OWNER, directory: "D:\\proj" });
+      expect(out, p).toContain("action=compile refused");
+      expect(out, p).toContain("is relative to a drive's current directory, not to the project; pass an absolute path.");
+      expect(rt.calls, p).toEqual([]);
+      expect(resolvePlanPath(p, "D:\\proj"), p).toBeNull();
+    }
+    // A drive path with a separator stays absolute.
+    expect(resolvePlanPath("C:\\plans\\fixture.md", "D:\\proj")).toBe("C:\\plans\\fixture.md");
+    expect(resolvePlanPath("C:/plans/fixture.md", "D:\\proj")).toBe("C:/plans/fixture.md");
   });
 });
 
@@ -1207,7 +1223,9 @@ describe("createRouterPlanTool", () => {
 
   it("describes path, approval and ownership as QA-4.1 fixed them", () => {
     const def = createRouterPlanTool(new FakeRuntime());
-    expect(def.description).toContain("only after the user approves, unless executor.approve is auto");
+    // QA-4.1-16: no "unless … auto" clause the model could satisfy with its own belief about the setting.
+    expect(def.description).toContain("approve (planId; only after the user approves; with approve: auto, compile approves by itself)");
+    expect(def.description).not.toMatch(/unless/);
     expect(def.description).toContain("A plan owned by another session is refused.");
     expect(def.description).not.toContain("another live session");
   });

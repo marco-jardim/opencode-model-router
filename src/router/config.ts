@@ -2090,7 +2090,8 @@ function sanitizeExecutor(value: unknown): TolerantBlock<ExecutorOverrides> {
  * `raw` is the config as written (its `routing` block is read) or the `routing` block
  * itself. A key counts when it is present and not `undefined`, whether or not its value is
  * valid. On v1, where they are ignored, `index.ts` logs ONE notice per process that names
- * every configured key (QA-2.1-32).
+ * every configured key (QA-2.1-32). A `routing.executor` that is not an object is named as
+ * `routing.executor` (QA-4.1-19): v1 does not log its validation issue.
  */
 export function configuredV2OnlyKeys(raw: unknown): string[] {
   const routing = isPlainObject(raw) && isPlainObject(raw.routing) ? raw.routing : isPlainObject(raw) ? raw : undefined;
@@ -2108,7 +2109,10 @@ export function configuredV2OnlyKeys(raw: unknown): string[] {
     }
   }
   const executor = routing.executor;
-  if (isPlainObject(executor)) {
+  if (!isPlainObject(executor)) {
+    // QA-4.1-19: an executor that is not an object is named whole; its validation issue is v2-only.
+    if (Object.hasOwn(routing, "executor") && executor !== undefined) keys.push("routing.executor");
+  } else {
     for (const child of ROUTING_KNOWN_KEYS.executor!) {
       if (!Object.hasOwn(executor, child) || executor[child] === undefined) continue;
       const nested = executor[child];
@@ -2610,7 +2614,7 @@ function stripGlobalOnlyRolesKeys(data: Record<string, unknown>): string[] {
 }
 
 /**
- * Remove the global-only `routing` keys from a project layer, and any block holding them that is not
+ * Remove the global-only `routing` keys from a project layer, and a `routing.executor` that is not
  * a plain object (QA-4.1-2); returns what was dropped.
  */
 function stripGlobalOnlyRoutingKeys(data: Record<string, unknown>): string[] {
@@ -2618,14 +2622,14 @@ function stripGlobalOnlyRoutingKeys(data: Record<string, unknown>): string[] {
   if (!isPlainObject(routing)) return [];
   const dropped: string[] = [];
   const touched = new Set<string>();
-  // QA-4.1-2: a block that holds global-only keys but is not a plain object (`null`, `[]`, a
-  // scalar) would replace the lower layer's block wholesale in deepMerge and so reset every
-  // trusted key in it to its default. The project layer may not do that; the block goes.
-  for (const block of new Set(GLOBAL_ONLY_ROUTING_KEYS.map(([b]) => b))) {
-    if (Object.hasOwn(routing, block) && routing[block] !== undefined && !isPlainObject(routing[block])) {
-      delete routing[block];
-      dropped.push(`routing.${block}`);
-    }
+  // QA-4.1-2: an `executor` that is not a plain object (`null`, `[]`, a scalar) would replace the
+  // lower layer's block wholesale in deepMerge, and tolerant validation would then reset every
+  // trusted executor key to its default. The project layer may not do that; the block goes.
+  // QA-4.1-18: `executor` only. A non-object `classifier` or `outcomes` still fails validation,
+  // which drops the project layer (fail closed, the v1 behaviour).
+  if (Object.hasOwn(routing, "executor") && routing.executor !== undefined && !isPlainObject(routing.executor)) {
+    delete routing.executor;
+    dropped.push("routing.executor");
   }
   for (const [block, key] of GLOBAL_ONLY_ROUTING_KEYS) {
     const target = routing[block];
@@ -2664,11 +2668,12 @@ function collectOverrideLayers(
     if (!data) continue;
     if (project) {
       const dropped = stripGlobalOnlyRoutingKeys(data);
-      if (dropped.length > 0) {
-        notices?.push({
-          source: p,
-          message: `ignoring ${dropped.join(", ")} from ${p}: only the global override may set it`,
-        });
+      // QA-4.1-19: the executor keys get their own notice, flagged v2-only (a v1 host ignores the block).
+      const isExecutorKey = (key: string): boolean => key === "routing.executor" || key.startsWith("routing.executor.");
+      for (const [keys, v2Only] of [[dropped.filter((k) => !isExecutorKey(k)), false], [dropped.filter(isExecutorKey), true]] as const) {
+        if (keys.length === 0) continue;
+        const message = `ignoring ${keys.join(", ")} from ${p}: only the global override may set it`;
+        notices?.push(v2Only ? { source: p, message, v2Only } : { source: p, message });
       }
       // #84: a repository may pick `routing.delegation`, but not customise role agents, grant
       // exploration, define `router_run` commands or widen the work roots.
@@ -3002,17 +3007,35 @@ export const ROUTING_RESERVED_AGENTS = ["build", "plan", "title", "summary", "co
  * validated config.
  */
 export function collectRoutingNotices(rawRouting: unknown, cfg: RouterConfig): string[] {
+  return collectTaggedRoutingNotices(rawRouting, cfg).map((notice) => notice.message);
+}
+
+/** The v2-only `routing` blocks: a v1 host ignores them, and logs one notice naming their keys instead. */
+const V2_ONLY_ROUTING_BLOCKS = ["background", "leases", "executor"] as const;
+
+/**
+ * {@link collectRoutingNotices}, each message tagged `v2Only` when it is about a v2-only block
+ * (QA-4.1-9, QA-4.1-19): its validation issues and its unknown keys, which get their own message.
+ */
+function collectTaggedRoutingNotices(rawRouting: unknown, cfg: RouterConfig): Array<{ message: string; v2Only: boolean }> {
+  const tagged: Array<{ message: string; v2Only: boolean }> = [];
   const messages: string[] = [];
+  const unknownMessage = (keys: readonly string[]): string =>
+    `ignoring unknown routing key${keys.length === 1 ? "" : "s"}: ${keys.join(", ")}`;
+  const inV2OnlyBlock = (key: string): boolean => V2_ONLY_ROUTING_BLOCKS.some((block) => key.startsWith(`routing.${block}.`));
   const unknown = findUnknownRoutingKeys(rawRouting);
-  if (unknown.length > 0) {
-    messages.push(`ignoring unknown routing key${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}`);
-  }
+  const unknownShared = unknown.filter((key) => !inV2OnlyBlock(key));
+  const unknownV2Only = unknown.filter(inV2OnlyBlock);
+  if (unknownShared.length > 0) tagged.push({ message: unknownMessage(unknownShared), v2Only: false });
+  if (unknownV2Only.length > 0) tagged.push({ message: unknownMessage(unknownV2Only), v2Only: true });
   if (isPlainObject(rawRouting)) {
-    messages.push(
+    for (const message of [
       ...sanitizeBackground(rawRouting.background).issues,
       ...sanitizeLeases(rawRouting.leases).issues,
       ...sanitizeExecutor(rawRouting.executor).issues,
-    );
+    ]) {
+      tagged.push({ message, v2Only: true });
+    }
   }
   for (const [taskClass, agents] of Object.entries(cfg.routing?.roles ?? {})) {
     for (const agent of agents) {
@@ -3040,7 +3063,7 @@ export function collectRoutingNotices(rawRouting: unknown, cfg: RouterConfig): s
       );
     }
   }
-  return messages;
+  return [...tagged, ...messages.map((message) => ({ message, v2Only: false }))];
 }
 /**
  * `routing.roles` is replaced wholesale by the highest-priority layer that sets
@@ -3210,21 +3233,27 @@ function buildConfig(
   let rawUsed: unknown = base;
 
   if (layers.length > 0) {
-    const merge = (ls: OverrideLayer[]): unknown =>
+    // The merge notices (A18 clamps) of one attempt; only the attempt whose result is used
+    // reports them, so a fallback merge does not push them twice (QA-4.1-21).
+    const merge = (ls: OverrideLayer[], attemptNotices: ConfigNotice[]): unknown =>
       replaceRolesWholesale(
-        ls.reduce<unknown>((acc, l) => mergeOverrideLayer(acc, l, notices), base),
+        ls.reduce<unknown>((acc, l) => mergeOverrideLayer(acc, l, attemptNotices), base),
         ls,
       );
 
     try {
-      const merged = merge(layers);
+      const attemptNotices: ConfigNotice[] = [];
+      const merged = merge(layers, attemptNotices);
       cfg = validateConfig(merged);
       rawUsed = merged;
+      notices.push(...attemptNotices);
     } catch (err) {
       // A bad override must never brick startup, and one broken file must not
-      // discard a good one. Fall back to the highest-priority layer that
-      // validates on its own (so a broken personal/global file still lets a
-      // shared project file apply), else the bundled defaults.
+      // discard a good one. Fall back to one layer that validates on its own,
+      // else the bundled defaults. QA-4.1-21: the global layer is tried first, so
+      // a project file cannot force a conflict with a value valid on its own and
+      // so drop the user's whole global layer; a broken global file still lets a
+      // project file apply.
       console.warn(
         `[model-router] combined overrides are invalid (${(err as Error).message}); dropping conflicting layer(s)`,
       );
@@ -3233,11 +3262,17 @@ function buildConfig(
         source: layerPaths,
         message: `${layerPaths}: combined overrides are invalid — ${(err as Error).message}`,
       });
-      for (let i = layers.length - 1; i >= 0; i--) {
+      const order = [
+        ...layers.map((_, i) => i).filter((i) => !layers[i]!.project).reverse(),
+        ...layers.map((_, i) => i).filter((i) => layers[i]!.project === true).reverse(),
+      ];
+      for (const i of order) {
         try {
-          const single = merge([layers[i]!]);
+          const attemptNotices: ConfigNotice[] = [];
+          const single = merge([layers[i]!], attemptNotices);
           cfg = validateConfig(single);
           rawUsed = single;
+          notices.push(...attemptNotices);
           for (let j = 0; j < layers.length; j++) {
             if (j !== i) {
               console.warn(`[model-router] dropped override layer ${layers[j]!.path}`);
@@ -3302,10 +3337,10 @@ function buildConfig(
 
   applyTierDefaults(cfg);
   const rawRouting = isPlainObject(rawUsed) ? rawUsed.routing : undefined;
-  // QA-4.1-9: an executor issue is about a v2-only block; a v1 host does not log it (warnConfigNotices).
-  const executorIssues = new Set(isPlainObject(rawRouting) ? sanitizeExecutor(rawRouting.executor).issues : []);
-  for (const message of collectRoutingNotices(rawRouting, cfg)) {
-    notices.push(executorIssues.has(message) ? { message, v2Only: true } : { message });
+  // QA-4.1-9, QA-4.1-19: a notice about a v2-only block (background, leases, executor) is not logged on v1
+  // (warnConfigNotices); index.ts names the configured keys in its one notice instead.
+  for (const { message, v2Only } of collectTaggedRoutingNotices(rawRouting, cfg)) {
+    notices.push(v2Only ? { message, v2Only } : { message });
   }
   const rawRoleAgents = isPlainObject(rawUsed) ? rawUsed.roleAgents : undefined;
   for (const issue of collectRolesIssues(rawRouting, rawRoleAgents)) notices.push({ message: issue.message });

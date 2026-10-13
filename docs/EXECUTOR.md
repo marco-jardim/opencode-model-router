@@ -48,9 +48,9 @@ answer text of `/plan answer` is taken as typed, apostrophes included.
 | Command | What it does | `router_plan` call |
 |---|---|---|
 | `/plan run <path> [--phases <ids>] [--done-before <id>]` | Compiles the plan file and shows its summary; it does not start the plan. `<path>` is absolute, or relative to the project directory. When the compiler asks for a residue step, the orchestrator dispatches the residue prompt to an architect and passes its JSON back (`action=residue`). The plan then waits for your approval (`/plan approve`), unless `approve` is `auto`. `--phases` limits the run to the listed phase ids, comma separated without spaces (`--phases 1.1,1.2`); `--done-before` treats every phase before the given id as done. | `action=compile` |
-| `/plan approve <planId>` | Approves a compiled plan and starts it. With `approve: "ask"` (the default) a plan starts only this way or after you approve it in the conversation; the model never approves on its own. | `action=approve` |
+| `/plan approve <planId>` | Approves a compiled plan and starts it. With `approve: "ask"` (the default) a plan starts only this way or when you approve that plan after seeing its summary; your request to compile or run it is not approval, and the model never approves on its own. | `action=approve` |
 | `/plan status [planId]` | Shows the plan board: status, tasks, inbox and metrics. Without an id: the running or paused plan of this session, else the plan the runtime finds for this session. | `action=status` |
-| `/plan inbox [--plan <planId>]` | Shows only the open inbox items, and how to answer them. Without `--plan`: the running or paused plan of this session. | `action=status inbox=true` |
+| `/plan inbox [--plan <planId>]` | Shows only the open inbox items, and how to answer them. Without `--plan`: the running or paused plan of this session; when the session has none, the plan the runtime finds for this session (which may be a finished one, so its answer hint names `--plan`). `--plan=<planId>` and `--plan="<planId>"` work too. | `action=status inbox=true` |
 | `/plan answer [--plan <planId>] <id> <text>` | Answers inbox item `<id>`. Without `--plan` the plan is the running or paused plan of this session; when the session runs none, the answer is refused and asks for `--plan`. | `action=answer` |
 | `/plan pause <planId>` | No new task starts; running ones finish. | `action=pause` |
 | `/plan resume <planId>` | Resumes a paused plan. | `action=resume` |
@@ -65,9 +65,9 @@ answer text of `/plan answer` is taken as typed, apostrophes included.
 
 | Action | Arguments | What it does |
 |---|---|---|
-| `compile` | `path`; optional `phases`, `doneBefore` | Compiles the plan file; a relative `path` is resolved against the project directory. Returns the summary, or the residue prompt to dispatch. With `routing.executor.approve = "auto"` a finished draft is approved at once; with `"ask"` the answer tells the model to show the summary to the user and to call `approve` only after the user explicitly approves. |
+| `compile` | `path`; optional `phases`, `doneBefore` | Compiles the plan file; a relative `path` is resolved against the project directory. Returns the summary, or the residue prompt to dispatch. With `routing.executor.approve = "auto"` a finished draft is approved at once; with `"ask"` the answer tells the model to stop: the plan is not approved, a request to compile or run it is not approval, and `approve` is called only when the user approves that plan after seeing the summary, or types `/plan approve <planId>`. |
 | `residue` | `planId`, `text` | Merges the architect's JSON reply to the residue prompt; then the same approval rule as `compile` applies. |
-| `approve` | `planId` | Approves a draft and starts running it. With `approve: "ask"` it is called only after the user's explicit approval (or `/plan approve`). |
+| `approve` | `planId` | Approves a draft and starts running it. With `approve: "ask"` it is called only when the user approves this plan after seeing its summary, or types `/plan approve <planId>`; a request to compile or run the plan is not approval. |
 | `status` | optional `planId`, `inbox` | Shows the board. `inbox=true` shows only the inbox section. Without `planId`: the running or paused plan of the calling session, else the plan the runtime finds for that session. |
 | `ready` | `planId` | Lists the tasks that can launch now and the manual ones. |
 | `add-tasks` | `planId`, `text` | Adds tasks to a plan (reopening finished ones when needed). |
@@ -92,7 +92,7 @@ or not in the listed values logs one warning, and the default applies.
 |---|---|---|
 | `routing.executor.maxParallel` | `4` | Tasks that run at once. |
 | `routing.executor.slotsDir` | `null` | Where the slot worktrees live; `null` is computed as `<repo drive>:\.omr-slots\<planId>`. A configured path is used verbatim and shared by every plan (see below). Global override only. |
-| `routing.executor.approve` | `"ask"` | `ask`: a compiled plan starts only after you approve it, by `/plan approve <planId>` or explicitly in the conversation; the model never approves on its own. `auto` starts the plan on its own. |
+| `routing.executor.approve` | `"ask"` | `ask`: a compiled plan starts only after you approve it, by `/plan approve <planId>` or by approving that plan after seeing its summary; the model never approves on its own. `auto` starts the plan on its own; only the bundled `tiers.json` or the global override can choose it, a project-local override can only set `ask` (see [Trust](#trust)). |
 | `routing.executor.crossPhase` | `"gate"` | `gate`: a phase starts after the previous phase's gate passed; `inferred`: later tasks may start once their own dependencies are met. |
 | `routing.executor.land` | `"ff-when-clean"` | Fast-forward when the checkout is clean, or `manual`. |
 | `routing.executor.batchMax` | `4` | Most tasks dispatched in one batch. |
@@ -123,8 +123,10 @@ Five keys decide where the executor writes and which commands, argument lists an
 `routing.executor.provision` and `routing.executor.python`. They are honoured from the bundled `tiers.json` and the
 **global** override only. In a project-local override they are dropped with a one-line notice
 (`ignoring routing.executor.slotsDir from <path>: only the global override may set it`), because a repository you open
-must not be able to make the plugin run its commands. The other `routing.executor.*` keys only tune limits and modes and
-may be set in either file. The rule is spelled out in
+must not be able to make the plugin run its commands. The other `routing.executor.*` keys tune limits and modes and may
+be set in either file, but a project-local override may only tighten them (amendment A-4.1-2): `approve` only to `ask`,
+`land` only to `manual`, `crossPhase` only to `gate`, and the numeric budgets and circuit-breaker values only lower; a
+looser value from a project file does not apply. The rule is spelled out in
 [Trust: which file may set what](CONFIG_REFERENCE.md#trust-which-file-may-set-what).
 
 ## Unattended operation

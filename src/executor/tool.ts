@@ -295,8 +295,9 @@ export interface RouterPlanToolOptions {
 
 /** The `ask` answer once a draft is complete: approval is the user's decision, never the model's (QA-4.1-1). */
 export function askApprovalText(planId: string): string {
-  return "status: awaiting-approval. Show this summary to the user. Call router_plan action=approve only after the user " +
-    `explicitly approves in this conversation (then: action=approve planId=${planId}; the user can also type /plan approve ${planId}).`;
+  // QA-4.1-16: the user's "run this plan" is already in the conversation, so it must not read as approval.
+  return "status: awaiting-approval. Stop here. This plan is not approved. A request to compile or run it is not approval. " +
+    `Call action=approve only when the user approves plan ${planId} after seeing this summary, or types /plan approve ${planId}.`;
 }
 
 /** After a draft is complete: `approve: auto` approves it at once (no stop), otherwise the user is asked to approve it. */
@@ -312,17 +313,21 @@ async function approveStep(runtime: ExecutorRuntime, planId: string, sessionID: 
 
 /**
  * The plan path as the compiler needs it (absolute): a relative `path` is resolved against the project directory of the
- * calling session (QA-4.1-6). Null when it is relative and no project directory is known.
+ * calling session (QA-4.1-6). Null when it is relative and no project directory is known, and for a drive-relative path
+ * (`C:foo`), which Windows resolves against drive C's current directory, outside the project (QA-4.1-20).
  */
 export function resolvePlanPath(p: string, baseDir: string | null): string | null {
   if (isAbsolutePlanPath(p)) return p;
-  if (baseDir === null) return null;
+  if (baseDir === null || DRIVE_RELATIVE.test(p)) return null;
   // The form of the base decides the path flavour, so the result does not depend on the platform the tests run on.
   return WINDOWS_ABSOLUTE.test(baseDir) ? win32.resolve(baseDir, p) : posix.resolve(baseDir, p);
 }
 
 // What the compiler takes as absolute (compile/index.ts isAbsolutePlanPath): a drive path, a UNC path or a POSIX path.
 const WINDOWS_ABSOLUTE = /^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+)/;
+
+/** A drive letter without a separator after it: `C:foo`, `C:` (QA-4.1-20). Never resolved against the project. */
+const DRIVE_RELATIVE = /^[A-Za-z]:(?![\\/])/;
 
 function isAbsolutePlanPath(p: string): boolean {
   return WINDOWS_ABSOLUTE.test(p) || p.startsWith("/");
@@ -350,7 +355,10 @@ async function run(runtime: ExecutorRuntime, a: RouterPlanArgs, rc: RunContext):
     case "compile": {
       const path = resolvePlanPath(a.path ?? "", rc.baseDir);
       if (path === null) {
-        return `${PREFIX} action=compile refused: path "${oneLine(a.path ?? "", 200)}" is relative and the project directory is unknown; pass an absolute path.`;
+        const why = DRIVE_RELATIVE.test(a.path ?? "")
+          ? "is relative to a drive's current directory, not to the project"
+          : "is relative and the project directory is unknown";
+        return `${PREFIX} action=compile refused: path "${oneLine(a.path ?? "", 200)}" ${why}; pass an absolute path.`;
       }
       const auto = rc.auto();
       const r = await runtime.compile({
@@ -465,7 +473,7 @@ export function createRouterPlanTool(runtime: ExecutorRuntime, options?: RouterP
   return tool({
     description:
       "Drive the plan executor. Actions: compile (path, phases?, doneBefore?) -> summary or a residue prompt to dispatch; " +
-      "residue (planId, text = architect JSON); approve (planId; only after the user approves, unless executor.approve is auto); " +
+      "residue (planId, text = architect JSON); approve (planId; only after the user approves; with approve: auto, compile approves by itself); " +
       "status (planId?, inbox?); ready (planId); add-tasks (planId, text); " +
       "answer (planId?, inboxId, text; without planId: this session's running plan); done (planId, task; manual/preflight tasks only); pause|resume|abort|land|adopt (planId); " +
       "gc; export (planId); purge (planId; completed or aborted only). A plan owned by another session is refused.",

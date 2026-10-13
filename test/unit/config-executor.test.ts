@@ -457,7 +457,10 @@ describe("routing.executor — OpenCode v1", () => {
     expect(configuredV2OnlyKeys({ routing: { executor: { maxParallel: "many" } } })).toEqual(["routing.executor.maxParallel"]);
     expect(configuredV2OnlyKeys({ routing: { executor: {} } })).toEqual([]);
     expect(configuredV2OnlyKeys({ routing: {} })).toEqual([]);
-    expect(configuredV2OnlyKeys({ routing: { executor: 3 } })).toEqual([]);
+    // QA-4.1-19: an executor that is not an object is named whole, so the v1 notice still mentions it.
+    expect(configuredV2OnlyKeys({ routing: { executor: 3 } })).toEqual(["routing.executor"]);
+    expect(configuredV2OnlyKeys({ routing: { executor: null } })).toEqual(["routing.executor"]);
+    expect(configuredV2OnlyKeys({ routing: { leases: { mode: "off" }, executor: [] } })).toEqual(["routing.leases.mode", "routing.executor"]);
   });
 
   it("lists the executor keys after the background and leases keys, in a fixed order", () => {
@@ -596,12 +599,23 @@ describe("routing.executor — trust (D18): project-local override", () => {
     expect(messages()).toEqual([`ignoring routing.executor from ${projectFile()}: only the global override may set it`]);
   });
 
-  it("QA-4.1-2: a non-object classifier or outcomes block in the project layer is dropped the same way", () => {
-    writeProject({ routing: { classifier: null, outcomes: [], margin: 0.1 } });
-    expect(loadConfig(project).routing?.margin).toBe(0.1);
-    expect(getConfigNotices(project).map((n) => n.message)).toContain(
-      `ignoring routing.classifier, routing.outcomes from ${projectFile()}: only the global override may set it`,
-    );
+  it.each([
+    ["a null classifier", { classifier: null }],
+    ["a string classifier", { classifier: "host" }],
+    ["an array outcomes", { outcomes: [] }],
+  ])("QA-4.1-18: %s is not stripped: validation fails and the whole project layer is dropped (fail closed)", (_label, bad) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      writeGlobal({ routing: { executor: { phaseSuite: "off" } } });
+      writeProject({ routing: { ...bad, margin: 0.1 } });
+      const cfg = loadConfig(project);
+      expect(cfg.routing?.margin).toBeUndefined(); // the project layer did not apply
+      expect(resolveRouting(cfg, "v2").executor.phaseSuite).toBe("off"); // the global layer did
+      expect(getConfigNotices(project).map((n) => n.message).filter((m) => m.includes("only the global override"))).toEqual([]);
+      expect(warn.mock.calls.map((call) => String(call[0]))).toContainEqual(expect.stringContaining("combined overrides are invalid"));
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it.each([
@@ -691,6 +705,27 @@ describe("routing.executor — trust (D18): project-local override", () => {
     expect(messages()).toEqual([tightenNotice(`circuitBreaker.${key}`)]);
   });
 
+  it("QA-4.1-21: a fallback merge reports the A18 notices of the layer it uses once, and none of a dropped layer", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      // A broken global file: the combined merge fails, the project layer alone applies; its notice appears once.
+      writeGlobal({ presets: { anthropic: { fast: { model: 123 } } } });
+      writeProject({ routing: { executor: { approve: "auto" } } });
+      expect(executorNow().approve).toBe("ask");
+      expect(messages()).toEqual([tightenNotice("approve")]);
+
+      // A project value that conflicts with a valid global file: the project layer is dropped, so is its notice.
+      writeGlobal({ routing: { detection: { grader: 0.5 }, executor: { phaseSuite: "off" } } });
+      writeProject({ routing: { detection: { none: 0.6 }, executor: { approve: "auto" } } });
+      const executor = executorNow();
+      expect(executor.phaseSuite).toBe("off");
+      expect(executor.approve).toBe("ask");
+      expect(messages()).toEqual([]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("A-4.1-2: a project circuitBreaker that is not an object cannot reset the lower values", () => {
     const tight = { failureRatio: 0.2, minAttempts: 2, consecutiveFailures: 1 };
     writeGlobal({ routing: { executor: { circuitBreaker: tight } } });
@@ -731,31 +766,83 @@ describe("routing.executor — the OpenCode v1 notice through the plugin (QA-4.1
     await removeDirWhenReleased(home);
   });
 
-  it("names the invalid keys in the one v1 notice and logs no executor validation issue", async () => {
+  /**
+   * Boot a fresh v1 plugin (fresh modules) with `global` as the global override and, when given,
+   * `projectData` as the project-local override of a new project directory. Returns every
+   * console.warn line, the v1 notices among them and the project directory's config notices.
+   */
+  async function bootV1(global: unknown, projectData?: unknown) {
     vi.resetModules();
     const config = await import("../../src/router/config");
     const fresh = await import("../../src/index");
     mkdirSync(dirname(config.overridePath()), { recursive: true });
-    writeFileSync(config.overridePath(), JSON.stringify({ routing: { executor: { maxParallel: 99, approve: "x" } } }), "utf-8");
+    writeFileSync(config.overridePath(), JSON.stringify(global), "utf-8");
+    let directory = home;
+    if (projectData !== undefined) {
+      directory = join(home, "project");
+      mkdirSync(join(directory, ".git"), { recursive: true });
+      mkdirSync(join(directory, ".opencode"), { recursive: true });
+      writeFileSync(join(directory, ".opencode", "opencode-model-router.overrides.jsonc"), JSON.stringify(projectData), "utf-8");
+    }
     config.invalidateConfigCache();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
       await fresh.default({
-        directory: home, worktree: home, project: {}, serverUrl: new URL("http://localhost"), $: () => undefined,
+        directory, worktree: directory, project: {}, serverUrl: new URL("http://localhost"), $: () => undefined,
         client: { session: { get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id } }) } },
       } as unknown as Parameters<typeof fresh.default>[0]);
       const lines = warn.mock.calls.map((c) => c.join(" "));
-      const notices = lines.filter((line) => line.includes("OpenCode v2; ignored"));
-      expect(notices).toHaveLength(1);
-      expect(notices[0]).toContain("[router] the plan executor requires OpenCode v2; ignored: ");
-      expect(notices[0]).toContain("routing.executor.maxParallel");
-      expect(notices[0]).toContain("routing.executor.approve");
-      expect(lines.filter((line) => line.includes("routing.executor.") && line.includes("must be"))).toEqual([]);
-      expect(lines.filter((line) => line.includes("using 4"))).toEqual([]);
-      expect(config.getConfigNotices(home).filter((n) => n.message.includes("routing.executor"))).toEqual([]);
+      return {
+        lines,
+        v1Notices: lines.filter((line) => line.includes("OpenCode v2; ignored")),
+        configNotices: config.getConfigNotices(directory).map((n) => n.message),
+      };
     } finally {
       warn.mockRestore();
       config.setConfigNoticeHost(undefined);
     }
+  }
+
+  it("names the invalid keys in the one v1 notice and logs no executor validation issue", async () => {
+    const { lines, v1Notices, configNotices } = await bootV1({ routing: { executor: { maxParallel: 99, approve: "x" } } });
+    expect(v1Notices).toHaveLength(1);
+    expect(v1Notices[0]).toContain("[router] the plan executor requires OpenCode v2; ignored: ");
+    expect(v1Notices[0]).toContain("routing.executor.maxParallel");
+    expect(v1Notices[0]).toContain("routing.executor.approve");
+    expect(lines.filter((line) => line.includes("routing.executor.") && line.includes("must be"))).toEqual([]);
+    expect(lines.filter((line) => line.includes("using 4"))).toEqual([]);
+    expect(configNotices.filter((m) => m.includes("routing.executor"))).toEqual([]);
+  });
+
+  it("QA-4.1-19: logs no background, leases or executor issue and no unknown executor key on v1, only the one notice", async () => {
+    const { lines, v1Notices, configNotices } = await bootV1({
+      routing: {
+        background: { mode: "sometimes", minPredictedMs: -1 },
+        leases: { run: "maybe" },
+        executor: { maxParallel: 99, maxParalel: 2 },
+      },
+    });
+    expect(v1Notices).toHaveLength(1);
+    for (const key of ["routing.background.mode", "routing.background.minPredictedMs", "routing.leases.run", "routing.executor.maxParallel"]) {
+      expect(v1Notices[0]).toContain(key);
+    }
+    const v2Only = (line: string): boolean => /routing\.(background|leases|executor)\b/.test(line) && !line.includes("OpenCode v2; ignored");
+    expect(lines.filter(v2Only)).toEqual([]);
+    expect(configNotices.filter(v2Only)).toEqual([]);
+  });
+
+  it("QA-4.1-19: names an executor that is not an object in the one v1 notice, and logs nothing else about it", async () => {
+    const { lines, v1Notices } = await bootV1({ routing: { executor: "fast" } });
+    expect(v1Notices).toEqual([expect.stringContaining("[router] the plan executor requires OpenCode v2; ignored: routing.executor")]);
+    expect(lines.filter((line) => line.includes("routing.executor must be an object"))).toEqual([]);
+  });
+
+  it("QA-4.1-19: logs no project-layer executor strip or tighten notice on v1", async () => {
+    const { lines, configNotices } = await bootV1({}, { routing: { margn: 1, executor: { slotsDir: "D:\\project-slots", approve: "auto" } } });
+    // The project file was read: its shared notice is logged on v1 as before.
+    expect(lines).toContainEqual(expect.stringContaining("ignoring unknown routing key: routing.margn"));
+    const executorLine = (line: string): boolean => line.includes("routing.executor");
+    expect(lines.filter(executorLine)).toEqual([]);
+    expect(configNotices.filter(executorLine)).toEqual([]);
   });
 });

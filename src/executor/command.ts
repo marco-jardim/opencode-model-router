@@ -25,6 +25,8 @@ interface Token {
   quoted: boolean;
   /** A quote in it has no closing quote: the token then runs to the end of the input (QA-4.1-11). */
   unterminated: boolean;
+  /** The bare text before the token's first quote (all of it when unquoted): `--plan=` for `--plan="p2"`. */
+  prefix: string;
 }
 
 /**
@@ -44,9 +46,11 @@ function tokenize(input: string): Token[] {
     let value = "";
     let quoted = false;
     let unterminated = false;
+    let prefix: string | null = null;
     while (i < input.length && !/\s/.test(input[i] ?? "")) {
       const ch = input[i] as string;
       if (ch === '"' || ch === "'") {
+        if (!quoted) prefix = value;
         quoted = true;
         const close = input.indexOf(ch, i + 1);
         if (close === -1) unterminated = true;
@@ -58,7 +62,7 @@ function tokenize(input: string): Token[] {
         i++;
       }
     }
-    out.push({ value, start, end: i, quoted, unterminated });
+    out.push({ value, start, end: i, quoted, unterminated, prefix: prefix ?? value });
   }
   return out;
 }
@@ -130,9 +134,13 @@ function parseRun(tokens: Token[]): ParsedPlanCommand {
  */
 function planFlag(rest: readonly Token[]): { planId?: string; used: number } | ParsedPlanCommand {
   const t = rest[0];
-  const m = t === undefined || t.quoted ? null : /^--plan(?:=(.*))?$/.exec(t.value);
-  if (m === null) return { used: 0 };
-  if (m[1] !== undefined) return m[1].length > 0 ? { planId: m[1], used: 1 } : help("--plan needs a plan id");
+  if (t === undefined) return { used: 0 };
+  // The flag is typed bare; only its `=<id>` may be quoted (`--plan="p2"`, `--plan='p2'`). A quoted `"--plan"` is text.
+  if (t.prefix.startsWith("--plan=")) {
+    const id = t.value.slice("--plan=".length);
+    return id.length > 0 ? { planId: id, used: 1 } : help("--plan needs a plan id");
+  }
+  if (t.quoted || t.value !== "--plan") return { used: 0 };
   const next = rest[1];
   if (next === undefined || next.value.length === 0) return help("--plan needs a plan id");
   return { planId: next.value, used: 2 };
@@ -173,6 +181,8 @@ export function parsePlanCommand(args: string): ParsedPlanCommand {
       const id = rest[f.used];
       const first = rest[f.used + 1];
       if (id === undefined || first === undefined) return help("/plan answer needs an id and the answer text");
+      // Only --plan is an option here; any other bare `--x` before the text is refused, never taken as the item id.
+      if (!id.quoted && id.value.startsWith("--")) return help(`unknown option ${id.value}`);
       const last = rest[rest.length - 1] as Token;
       // The text is kept as typed; a single, properly quoted token is unwrapped.
       const unwrap = rest.length === f.used + 2 && first.quoted && !first.unterminated;
@@ -205,17 +215,20 @@ const COMPILE_FOLLOW_UP: readonly string[] = [
   "- `awaiting-residue`: dispatch the residue prompt of the result, unchanged, to an architect subagent (architect role, " +
     "or heavy tier); then call `router_plan` with `action=residue`, the `planId` of the result and `text=<its complete " +
     "JSON reply>`, and act on that result's `status:` line the same way.",
-  "- `awaiting-approval`: show the summary to the user and wait for their approval. Call `router_plan action=approve` " +
-    "only after the user explicitly approves in this conversation, or when the user types `/plan approve <planId>`.",
+  // QA-4.1-16: this `/plan run` request is in the conversation and must not read as approval.
+  "- `awaiting-approval`: show the summary to the user and stop. This plan is not approved, and this `/plan run` " +
+    "request is not approval. Call `router_plan action=approve` only when the user approves this plan after seeing the " +
+    "summary, or types `/plan approve <planId>`.",
   "- anything else (approved and running, or a refusal): report the tool result to the user verbatim.",
   "Do nothing else for this command.",
 ];
 
 /** The orchestrator instruction for one parsed call. */
 export function planInstructions(call: PlanCallArgs): string {
+  // A compile can take a residue call after it (the follow-up), so its intro does not say "once".
   const intro =
     call.action === "compile"
-      ? "Call the `router_plan` tool once with exactly these arguments to compile the plan:"
+      ? "Call the `router_plan` tool with exactly these arguments to compile the plan; then follow the instructions below:"
       : "Call the `router_plan` tool once with exactly these arguments:";
   return [
     intro,

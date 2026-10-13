@@ -391,6 +391,23 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     expect(helpText).toContain("adopt a plan whose owning session is gone");
   });
 
+  it("pins QA-4.1 round 2: a run request is not approval, project files only tighten, the inbox fallback", () => {
+    const flat = doc.replace(/\s+/g, " ");
+    // QA-4.1-16: no wording that lets the model read the user's run request as approval.
+    expect(flat).toContain("a request to compile or run it is not approval");
+    expect(flat).toContain("your request to compile or run it is not approval");
+    expect(flat).not.toMatch(/explicitly in the conversation|after you approve it in the conversation/);
+    // QA-4.1-17 (amendment A-4.1-2): a project-local override may only tighten the other executor keys.
+    expect(flat).toContain(
+      "but a project-local override may only tighten them (amendment A-4.1-2): `approve` only to `ask`, `land` only to " +
+        "`manual`, `crossPhase` only to `gate`, and the numeric budgets and circuit-breaker values only lower",
+    );
+    expect(flat).toContain("a project-local override can only set `ask`");
+    expect(flat).not.toMatch(/only tune limits and modes and may be set in either file/);
+    // QA-4.1-20 nit: /plan inbox without --plan falls back to the runtime's pick.
+    expect(flat).toContain("when the session has none, the plan the runtime finds for this session");
+  });
+
   it("keeps the Unattended operation, QA loop and Recovery placeholders until Phase 4.2/5.1", () => {
     for (const heading of ["## Unattended operation", "## QA loop", "## Recovery"]) {
       const section = sectionOf(doc, heading);

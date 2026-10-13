@@ -48,16 +48,21 @@ describe("/plan command", () => {
 
   it("QA-4.1-1, QA-4.1-7: the /plan run instruction compiles only, routes a residue step and leaves approval to the user", () => {
     const text = command.execute("run p.md");
-    expect(text).toContain("to compile the plan:");
+    // QA-4.1-20 nit: compile is not "once": a residue call may follow.
+    expect(text).toContain("Call the `router_plan` tool with exactly these arguments to compile the plan; then follow the instructions below:");
+    expect(text).not.toContain("tool once with exactly these arguments to compile");
     expect(text).not.toMatch(/and start/);
     // A residue step is not a dead end: the prompt goes to an architect and its JSON back through action=residue.
     expect(text).toContain("`awaiting-residue`");
     expect(text).toMatch(/to an architect subagent/);
     expect(text).toContain("`action=residue`");
-    // Approval is the user's: shown to them, approved only on their explicit word or /plan approve.
-    expect(text).toContain("`awaiting-approval`: show the summary to the user and wait for their approval.");
-    expect(text).toContain("only after the user explicitly approves in this conversation");
-    expect(text).toContain("`/plan approve <planId>`");
+    // Approval is the user's (QA-4.1-16): this /plan run request is not approval.
+    expect(text).toContain(
+      "- `awaiting-approval`: show the summary to the user and stop. This plan is not approved, and this `/plan run` " +
+        "request is not approval. Call `router_plan action=approve` only when the user approves this plan after seeing " +
+        "the summary, or types `/plan approve <planId>`.",
+    );
+    expect(text).not.toMatch(/in this conversation/);
     // The other subcommands keep the plain report instruction.
     expect(command.execute("status")).toContain("Then report the tool result to the user verbatim. Do nothing else for this command.");
     expect(command.execute("status")).not.toContain("awaiting-residue");
@@ -71,6 +76,22 @@ describe("/plan command", () => {
     // Without --plan nothing changes.
     expect(callOf("answer q1 --plan is a word here")).toEqual({ action: "answer", inboxId: "q1", text: "--plan is a word here" });
     for (const args of ["inbox --plan", "inbox --plan=", "inbox --plan p2 extra", "inbox p2", "answer --plan", "answer --plan p2 q1"]) {
+      expect(parsePlanCommand(args).kind, args).toBe("help");
+    }
+  });
+
+  it("QA-4.1 round 2 nit: --plan=<id> takes a quoted id; unknown flags stay refused", () => {
+    expect(callOf('inbox --plan="p2"')).toEqual({ action: "status", inbox: true, planId: "p2" });
+    expect(callOf("inbox --plan='p2'")).toEqual({ action: "status", inbox: true, planId: "p2" });
+    expect(callOf('answer --plan="p2" q1 yes')).toEqual({ action: "answer", planId: "p2", inboxId: "q1", text: "yes" });
+    expect(callOf('answer --plan "p2" q1 yes')).toEqual({ action: "answer", planId: "p2", inboxId: "q1", text: "yes" });
+    // An empty quoted id is no id.
+    expect(parsePlanCommand('inbox --plan=""')).toEqual({ kind: "help", reason: "--plan needs a plan id" });
+    // Unknown flags: refused, never read as --plan or as the item id.
+    expect(parsePlanCommand("answer --foo q1 yes")).toEqual({ kind: "help", reason: "unknown option --foo" });
+    expect(parsePlanCommand("answer --planx q1 yes")).toEqual({ kind: "help", reason: "unknown option --planx" });
+    expect(parsePlanCommand("answer --plan p2 --foo yes")).toEqual({ kind: "help", reason: "unknown option --foo" });
+    for (const args of ["inbox --foo", 'inbox "--plan" p2', "inbox --planx=p2", 'inbox --pl"an"=p2']) {
       expect(parsePlanCommand(args).kind, args).toBe("help");
     }
   });
@@ -335,8 +356,10 @@ describe("/plan argument blocks pass router_plan validation", () => {
     const { rt, calls } = recordingRuntime();
     const out = await executeRouterPlan(rt, jsonOf(command.execute("run p.md")), CTX, { approve: () => "ask" });
     expect(calls).toEqual(["compile"]);
-    expect(out).toContain("Show this summary to the user.");
-    expect(out).toContain("Call router_plan action=approve only after the user explicitly approves in this conversation");
+    // QA-4.1-16: the /plan run request in the conversation is not approval.
+    expect(out).toContain("status: awaiting-approval. Stop here. This plan is not approved. A request to compile or run it is not approval.");
+    expect(out).toContain("Call action=approve only when the user approves plan p1 after seeing this summary, or types /plan approve p1.");
+    expect(out).not.toMatch(/in this conversation/);
     expect(out).not.toMatch(/Review it, then call/);
   });
 
