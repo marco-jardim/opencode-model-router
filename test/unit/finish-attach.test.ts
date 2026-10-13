@@ -380,6 +380,56 @@ describe("finish attach channel", () => {
     }
   });
 
+  it("on v1 with only routing.executor.* set, the one notice names the plan executor, not background dispatch", async () => {
+    vi.resetModules();
+    const config = await import("../../src/router/config");
+    const fresh = await import("../../src/index");
+    mkdirSync(dirname(config.overridePath()), { recursive: true });
+    writeFileSync(config.overridePath(), JSON.stringify({ routing: { executor: { approve: "auto" } } }), "utf-8");
+    config.invalidateConfigCache();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const boot = () => fresh.default({
+        directory: home, worktree: home, project: {}, serverUrl: new URL("http://localhost"), $: () => undefined,
+        client: { session: { get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id } }) } },
+      } as unknown as Parameters<typeof ModelRouterPlugin>[0]);
+      await boot();
+      await boot();
+      const notices = warn.mock.calls.map((c) => c.join(" ")).filter((line) => line.includes("OpenCode v2; ignored"));
+      expect(notices).toEqual([expect.stringContaining("[router] the plan executor requires OpenCode v2; ignored: routing.executor.approve")]);
+      expect(notices[0]).not.toContain("background dispatch");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("on v1 with executor and background keys, the one notice names both features and lists every key", async () => {
+    vi.resetModules();
+    const config = await import("../../src/router/config");
+    const fresh = await import("../../src/index");
+    mkdirSync(dirname(config.overridePath()), { recursive: true });
+    writeFileSync(
+      config.overridePath(),
+      JSON.stringify({ routing: { background: { mode: "auto" }, executor: { approve: "auto" } } }),
+      "utf-8",
+    );
+    config.invalidateConfigCache();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await fresh.default({
+        directory: home, worktree: home, project: {}, serverUrl: new URL("http://localhost"), $: () => undefined,
+        client: { session: { get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id } }) } },
+      } as unknown as Parameters<typeof ModelRouterPlugin>[0]);
+      const notices = warn.mock.calls.map((c) => c.join(" ")).filter((line) => line.includes("OpenCode v2; ignored"));
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toContain("[router] background dispatch and the plan executor require OpenCode v2; ignored: ");
+      expect(notices[0]).toContain("routing.background.mode");
+      expect(notices[0]).toContain("routing.executor.approve");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("on v2 the journal accepts appends and has processed nothing yet", async () => {
     const api = attachOf(await load("v2"))({ host: "v2", held: sink });
     if (api === undefined) throw new Error("no finish API");

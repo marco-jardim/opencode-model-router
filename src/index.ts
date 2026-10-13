@@ -763,7 +763,13 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       // QA-2.1-32: the notice names the features actually configured (leases alone are not "background dispatch").
       const background = keys.some((key) => key.startsWith("routing.background."));
       const leases = keys.some((key) => key.startsWith("routing.leases."));
-      const subject = background && leases ? "background dispatch and leases require" : leases ? "leases require" : "background dispatch requires";
+      const executor = keys.some((key) => key.startsWith("routing.executor."));
+      const features = [background ? "background dispatch" : "", leases ? "leases" : "", executor ? "the plan executor" : ""].filter((f) => f !== "");
+      const subject = features.length === 0
+        ? "background dispatch requires"
+        : features.length === 1
+          ? `${features[0]} ${leases && !background && !executor ? "require" : "requires"}`
+          : `${features.slice(0, -1).join(", ")} and ${features[features.length - 1]} require`;
       logger.warn(`[router] ${subject} OpenCode v2; ignored: ${keys.join(", ")}`);
     }
   }

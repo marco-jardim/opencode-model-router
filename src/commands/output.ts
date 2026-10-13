@@ -229,7 +229,10 @@ export function buildRoleLines(roles: Iterable<RoleSpec>): string[] {
 }
 
 /** Bare `/router`. */
-export function buildRouterHelp(current: string, options: { stats?: boolean; roles?: Iterable<RoleSpec> } = {}): string {
+export function buildRouterHelp(
+  current: string,
+  options: { stats?: boolean; roles?: Iterable<RoleSpec>; plan?: boolean } = {},
+): string {
   const roleLines = options.roles === undefined ? [] : buildRoleLines(options.roles);
   return [
     `# Model Router`,
@@ -243,8 +246,26 @@ export function buildRouterHelp(current: string, options: { stats?: boolean; rol
       ? ["- `/router stats [--since <ISO>]` — routing statistics from the decision log and outcome store (same table as `npm run routing:stats` (in a clone))"]
       : []),
     "- `/tiers`, `/preset`, `/budget`, `/bypass`, `/annotate-plan`",
+    ...(options.plan === true ? ["", ...PLAN_HELP_LINES] : []),
     ...(roleLines.length > 0 ? ["", ...roleLines] : []),
   ].join("\n");
+}
+
+/** `/plan` usage lines (v2 only): appended to `/router` help when `plan` is set and printed for an unknown `/plan` subcommand. */
+export const PLAN_HELP_LINES: readonly string[] = [
+  "Plan executor (`/plan`):",
+  "- `/plan run <path> [--phases <ids>] [--done-before <id>]` — compile a plan file and start executing it",
+  "- `/plan status [planId]` — show plan progress",
+  "- `/plan inbox` — show the questions waiting for an answer",
+  "- `/plan answer <id> <text>` — answer an inbox question",
+  "- `/plan pause|resume|abort <planId>` — pause, resume or abort a plan",
+  "- `/plan land <planId>` — land a finished plan",
+  "- `/plan adopt <planId>` — adopt a plan started elsewhere",
+];
+
+/** `/plan` with no or an unknown subcommand. */
+export function buildPlanHelp(): string {
+  return ["# Plan executor", "", ...PLAN_HELP_LINES].join("\n");
 }
 
 /**
