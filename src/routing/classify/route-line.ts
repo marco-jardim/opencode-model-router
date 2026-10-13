@@ -19,6 +19,7 @@ import {
   SCOPES,
   TASK_CLASSES,
   type Detection,
+  type InvalidCrossRepo,
   type Need,
   type Risk,
   type RouteLine,
@@ -61,6 +62,28 @@ function isWorkRootPath(value: string): boolean {
   return WORK_ROOT_RE.test(value) && !PARENT_SEGMENT_RE.test(value) && !value.includes("\0");
 }
 
+const REPO_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
+/** Never in a git branch name (`git check-ref-format`): ASCII control, DEL, space, `~ ^ : ? * [ \`. */
+const BRANCH_FORBIDDEN_RE = /[\u0000-\u001f\u007f ~^:?*[\\]/;
+const BRANCH_MAX_CHARS = 200;
+
+/** `repo=` value: a single directory name (no separators), not `.` / `..`. Case is kept. */
+function isRepoName(value: string): boolean {
+  return REPO_NAME_RE.test(value) && value !== "." && value !== "..";
+}
+
+/**
+ * `branch=` value: a name `git check-ref-format --branch` accepts (QA round 1, F3). Case is kept; declare-then-check happens
+ * later. The value is only compared with `git worktree list --porcelain` output, never passed to git as an argument.
+ */
+function isBranchRef(value: string): boolean {
+  if (value.length < 1 || value.length > BRANCH_MAX_CHARS) return false;
+  if (BRANCH_FORBIDDEN_RE.test(value)) return false;
+  if (value === "@" || value.includes("@{") || value.includes("..") || value.includes("//")) return false;
+  if (value.startsWith("-") || value.startsWith("/") || value.endsWith("/") || value.endsWith(".")) return false;
+  return value.split("/").every((component) => !component.startsWith(".") && !component.endsWith(".lock"));
+}
+
 function isMember<T extends string>(values: readonly T[], value: string): value is T {
   return (values as readonly string[]).includes(value);
 }
@@ -87,6 +110,13 @@ function parseNeeds(value: string): readonly Need[] | undefined {
   return NEEDS.filter((need) => found.has(need));
 }
 
+/** The `root=` value as written: a quoted path from `quotedRoots`, else the token's value; undefined for a bare `root`. */
+function rootCandidate(rawValue: string | null, quotedRoots: readonly string[]): string | undefined {
+  if (rawValue === null) return undefined;
+  const q = QUOTED_PLACEHOLDER_RE.exec(stripTail(rawValue.toLowerCase()));
+  return q ? quotedRoots[Number(q[1])] : stripTail(rawValue);
+}
+
 /** L2: the fields of one route line body. */
 function parseFields(body: string): RouteLine {
   let taskClass: TaskClass | undefined;
@@ -98,7 +128,10 @@ function parseFields(body: string): RouteLine {
   let tier: string | undefined;
   let budget: number | undefined;
   let root: string | undefined;
+  let repo: string | undefined;
+  let branch: string | undefined;
   const ignored: string[] = [];
+  const invalidCrossRepo: InvalidCrossRepo[] = [];
   const seen = new Set<string>();
 
   const quotedRoots: string[] = [];
@@ -119,6 +152,8 @@ function parseFields(body: string): RouteLine {
     }
     if (seen.has(key)) {
       ignored.push(`dup:${key}`);
+      if (key === "repo" || key === "branch") invalidCrossRepo.push({ key, value: rawValue === null ? "" : stripTail(rawValue) });
+      else if (key === "root") invalidCrossRepo.push({ key, value: rootCandidate(rawValue, quotedRoots) ?? "" });
       continue;
     }
     seen.add(key);
@@ -162,10 +197,31 @@ function parseFields(body: string): RouteLine {
         break;
       }
       case "root": {
-        const q = value === null ? null : QUOTED_PLACEHOLDER_RE.exec(value);
-        const candidate = q ? quotedRoots[Number(q[1])] : rawValue === null ? undefined : stripTail(rawValue);
+        const candidate = rootCandidate(rawValue, quotedRoots);
         if (candidate !== undefined && isWorkRootPath(candidate)) root = candidate;
-        else ignored.push(key);
+        else {
+          // A declared work root that cannot be accepted is an invalid declaration, never "nothing declared".
+          ignored.push(key);
+          invalidCrossRepo.push({ key, value: candidate ?? "" });
+        }
+        break;
+      }
+      case "repo": {
+        const candidate = rawValue === null ? undefined : stripTail(rawValue);
+        if (candidate !== undefined && isRepoName(candidate)) repo = candidate;
+        else {
+          ignored.push(key);
+          invalidCrossRepo.push({ key, value: candidate ?? "" });
+        }
+        break;
+      }
+      case "branch": {
+        const candidate = rawValue === null ? undefined : stripTail(rawValue);
+        if (candidate !== undefined && isBranchRef(candidate)) branch = candidate;
+        else {
+          ignored.push(key);
+          invalidCrossRepo.push({ key, value: candidate ?? "" });
+        }
         break;
       }
       default:
@@ -182,6 +238,9 @@ function parseFields(body: string): RouteLine {
     ...(tier ? { tier } : {}),
     ...(budget !== undefined ? { budget } : {}),
     ...(root ? { root } : {}),
+    ...(repo ? { repo } : {}),
+    ...(branch ? { branch } : {}),
+    ...(invalidCrossRepo.length > 0 ? { invalidCrossRepo } : {}),
     pin,
     ignored,
   };
@@ -207,7 +266,25 @@ function isRecognisable(line: string, inFence: boolean): boolean {
 }
 
 function canonical(line: RouteLine): string {
-  return JSON.stringify([line.class, line.risk, line.scope, line.needs, line.detection, line.pin, line.tier, line.budget, line.root]);
+  // Invalid `root=` entries are not compared: a tier dispatch's conflict detection stays what it was before they were
+  // recorded (an invalid root was only an `ignored` key). They are merged into the effective line instead (mergeInvalidRoots).
+  const invalid = line.invalidCrossRepo?.filter((entry) => entry.key !== "root");
+  return JSON.stringify([line.class, line.risk, line.scope, line.needs, line.detection, line.pin, line.tier, line.budget, line.root, line.repo, line.branch, invalid !== undefined && invalid.length > 0 ? invalid : undefined]);
+}
+
+/**
+ * Several route lines that agree on every compared field: the first line, with the invalid `root=` declarations of
+ * every line (a declared-but-invalid work root on any line is never silently dropped).
+ */
+function mergeInvalidRoots(lines: readonly RouteLine[]): RouteLine {
+  const first = lines[0]!;
+  const merged: InvalidCrossRepo[] = [...(first.invalidCrossRepo ?? [])];
+  for (const l of lines.slice(1)) {
+    for (const entry of l.invalidCrossRepo ?? []) {
+      if (!merged.some((seenEntry) => seenEntry.key === entry.key && seenEntry.value === entry.value)) merged.push(entry);
+    }
+  }
+  return merged.length === (first.invalidCrossRepo?.length ?? 0) ? first : { ...first, invalidCrossRepo: merged };
 }
 
 /**
@@ -242,7 +319,18 @@ function resolveConflict(lines: readonly RouteLine[]): RouteLine {
   const tier = keep("tier", first.tier, (l) => l.tier);
   const budget = keep("budget", first.budget, (l) => l.budget);
   const root = keep("root", first.root, (l) => l.root);
+  const repo = keep("repo", first.repo, (l) => l.repo);
+  const branch = keep("branch", first.branch, (l) => l.branch);
   if (lines.some((l) => l.detection !== undefined)) ignored.push("conflict:d");
+  // QA round 1 (F3): a declaration that no line can carry is declared-but-invalid, never a silent fallback to the session directory.
+  const invalidCrossRepo: InvalidCrossRepo[] = [];
+  const mark = (entry: InvalidCrossRepo): void => {
+    if (!invalidCrossRepo.some((seenEntry) => seenEntry.key === entry.key && seenEntry.value === entry.value)) invalidCrossRepo.push(entry);
+  };
+  for (const l of lines) for (const entry of l.invalidCrossRepo ?? []) mark(entry);
+  if (first.repo !== undefined && repo === undefined) mark({ key: "repo", value: first.repo });
+  if (first.branch !== undefined && branch === undefined) mark({ key: "branch", value: first.branch });
+  if (first.root !== undefined && root === undefined) mark({ key: "root", value: first.root });
   return {
     ...(taskClass ? { class: taskClass } : {}),
     ...(risk ? { risk } : {}),
@@ -251,6 +339,9 @@ function resolveConflict(lines: readonly RouteLine[]): RouteLine {
     ...(tier ? { tier } : {}),
     ...(budget !== undefined ? { budget } : {}),
     ...(root ? { root } : {}),
+    ...(repo ? { repo } : {}),
+    ...(branch ? { branch } : {}),
+    ...(invalidCrossRepo.length > 0 ? { invalidCrossRepo } : {}),
     // The first line is the directive; a later line cannot take its pin away or add one (A22).
     pin: first.pin,
     ignored,
@@ -326,7 +417,7 @@ export function parseRouteLine(text: string, options: RouteLineOptions = {}): Ro
   const conflict = new Set(parsed.map(canonical)).size > 1;
   return {
     // QA-P12-2-2: the flag lives on the parse result only; the line's `ignored` list is the tier-mode one.
-    line: conflict ? resolveConflict(parsed) : parsed[0]!,
+    line: conflict ? resolveConflict(parsed) : mergeInvalidRoots(parsed),
     count: parsed.length,
     stripped: kept.join(""),
     conflict,

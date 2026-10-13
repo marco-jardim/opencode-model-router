@@ -206,6 +206,24 @@ describe("router and bypass renderers", () => {
     expect(buildRouterHelp("off")).toContain("Enforcement: **off**");
     expect(buildRouterHelp("off")).toContain("/router overrides");
   });
+
+  it("cross-repo P4.7 (SD-P4-10): lists /router approve, repos and revoke only when they are available", () => {
+    const plain = buildRouterHelp("off", { stats: true });
+    expect(plain).not.toContain("/router approve");
+    expect(plain).not.toContain("/router repos");
+    expect(plain).not.toContain("/router revoke");
+    expect(buildRouterHelp("off", { stats: true, approvals: false })).toBe(plain);
+    const listed = buildRouterHelp("off", { stats: true, approvals: true });
+    expect(listed).toContain("- `/router approve <path>` — approve a repository outside `routing.repoParents`");
+    expect(listed).toContain("- `/router repos` — list the approved repositories");
+    expect(listed).toContain("- `/router revoke <path>` — remove an approval");
+    // The three lines follow `/router stats` and precede the other commands; nothing else changes.
+    const lines = listed.split("\n");
+    const at = lines.findIndex((line) => line.startsWith("- `/router approve"));
+    expect(lines[at - 1]).toMatch(/^- `\/router stats/);
+    expect(lines[at + 3]).toMatch(/^- `\/tiers`/);
+    expect(lines.filter((line) => !/^- `\/router (approve|repos|revoke)/.test(line)).join("\n")).toBe(plain);
+  });
 });
 
 describe("buildOverridesOutput", () => {

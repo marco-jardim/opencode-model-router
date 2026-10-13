@@ -181,8 +181,11 @@ directory.
 
 - **Resolution.** The `root=` text is normalised and compared with the session directory and with every entry of
   `git worktree list --porcelain` before any filesystem call on it; a match becomes its canonical long form. Anything
-  else gives **no work root**: the dispatch keeps local reads in the session directory, and `edit` and `router_run` are
-  withheld (note "no valid work root: write and run withheld").
+  else gives **no work root**, and a route line that declared `root=`, `repo=` or `branch=` and got none **refuses the
+  dispatch**: the task call fails with `[router] role dispatch @<agent> refused: <note>` and the child never runs in the
+  session directory instead. A dispatch that declared nothing is not refused (no declared target, no refusal); if it still has no work root, it keeps
+  local reads in the session directory, and `edit` and `router_run` are withheld (note "no valid work root: write and
+  run withheld").
 - **`edit` and `router_run` need a validated work root.** On a fresh dispatch, on a resume and through the
   [ladder](#dynamic-authority-and-the-ladder) alike, a dispatch without one gets neither; `edit` never falls back to
   the session or plugin directory (only the local reads do).
@@ -208,12 +211,361 @@ directory.
 - `router_git_*` run in the bound work root, never in the session location, and are limited to it: for a work root
   below the repository's top level every path and listing is limited to that subdirectory (a pathspec). They are
   refused when the work root belongs to another repository than the one the dispatch listed its worktrees in, or when
-  a `.git` pointer (or a directory git reports) names a network or device path.
+  a `.git` pointer (or a directory git reports) names a network or device path. With cross-repo configured, a role
+  agent may pass `root` to read another repository of its read set instead (see **`router_git_*` in other
+  repositories** below); the work root's limits above still apply to every call without it.
 - The `git worktree list` runs that validate work roots inherit the user's system and global `safe.directory` values
   (only those), so a repository trusted that way does not fail with "dubious ownership".
 - **Acceptance checks run in the work root.** The deterministic checks of a role dispatch's `[acceptance]` block run in
   its routed work root by default; a `cwd:` outside that root is refused. When the checks cannot run in the work root,
   the dispatch's detection is not `deterministic`, so the [floor](#tier-floor) is computed without the router's gate.
+
+### Repositories below parent directories (cross-repo)
+
+`routing.repoParents`, `routing.repoDepth` (1–4, default 2) and `routing.repoExclude` are global-only keys (OpenCode v2
+roles mode, inert on v1). They name the directories whose repositories role dispatches may work in besides the session
+repository, without a per-repository list:
+
+```jsonc
+{ "routing": { "delegation": "roles", "repoParents": ["D:/git"] } }
+```
+
+Registration adds a `<parent>/*` `external_directory` allow pattern to the local roles, so a repository cloned later
+needs no restart. Changing `repoParents` does need one, and a parent must exist when the agents are registered.
+
+**Naming the work root.** A dispatch still has one work root and edits only there. The route line names it with
+`root=`, or by repository name and branch, which the router checks against git (values keep their case; an invalid
+value refuses the dispatch, see below):
+
+```text
+[route class=implement needs=edit repo=app-a branch=feat/login]
+```
+
+`repo=` looks up `<parent>\<name>`, then `<parent>\*\<name>`; `<name>` is a repository name, or the directory name of
+one of its linked worktrees below the parents (that worktree is the work root; with `branch=`, the worktree of its
+repository on that branch). A name that matches several repositories or worktree directories (each listed as
+`<worktree path> (repository <name>, branch <branch>)`), or a repository
+with several worktrees and no `branch=`, refuses the dispatch and the candidates are listed. `root=<dir> branch=<b>` must
+agree: the worktree at `<dir>` must be on `<b>`. `repo=<dir> branch=<b>` instead binds the worktree of that directory's
+repository that is on `<b>`, which may lie outside the parents (admission rule 2 below). `root`, `repo` and `branch` must
+agree when given together. With parents set, the protocol tells the orchestrator: name another repository with
+`repo=<name>` (and `branch=<ref>` when it has several worktrees) instead of `root=`; each dispatch edits one
+repository, and a role may read the others below `routing.repoParents`. A routed role dispatch that has a work root and
+read access starts with a role header (`[router] You are @<role>. Execute this dispatch yourself.`), so the delegate is
+told where it works. The header is emitted only when cross-repo is configured (`routing.repoParents` is set), the route
+line declares a target (`repo=`, `branch=` or `root=`), or the work root differs from the session directory; otherwise the
+dispatch prompt is byte-identical to what it was before the header existed (invariant I9). A fresh dispatch gets the header, the work root, and, when the grant is located, the repository,
+branch and head: `Working directory: <root> (repository app-a, branch feat/login at 3f2c1a9). You are already there —
+do not ask permission to read or write inside it.` A read-only role is told `read` instead of `read or write`. With
+parents set, a second paragraph lists the session's repositories and where the role may read. The nonce line (or the
+carried `[acceptance]` block of a resume) stays the last line of the prompt. A resume gets the header only when its
+binding is exact, and without the head clause, which may be stale. A header the orchestrator copied from another dispatch
+is always removed, and replaced only when the router adds its own (so a dispatch that gets no header keeps no copied one
+either). A read-only role's repositories paragraph says only where it may read. No
+header: no work root, no `read`/`glob`/`grep` (`researcher`), a delegate's dispatch, a non-exact resume, a dispatch for
+which the header is not relevant (see above), or `dispatchHeader: false` (which still sends the role name and the `Working directory:` paragraph when the work root is not
+the session directory).
+
+**Admission.** On a v2 roles dispatch, when parents are set or `repo=`/`branch=` is given, the work root is bound
+through admission. It is admitted when either:
+
+1. it is a git top level 1 to `repoDepth` levels below a parent (never the parent itself), its canonical path stays
+   below that parent, and it is not excluded by `repoExclude`; or
+2. it is a worktree that a known repository lists: the session repository, or a repository in the session's working
+   set. Its `git rev-parse --git-common-dir` must match that repository's, and it must still resolve to itself. What
+   backs the admission is the repository that lists the worktree (git's main worktree, canonical), never the known
+   entry's text: it must be the session repository, a repository with an approval that applies now and whose identity
+   holds (the binding is then tagged with that approval), or a repository 1 to `repoDepth` levels below a parent. Any
+   other known entry is skipped.
+
+Text checks come before any git call: UNC, device, 8.3 and `..` paths are refused, and the refusal ends the dispatch
+(`[router] role dispatch @<agent> refused: <note>`). A final gate runs on every
+admission: `repoExclude` applies to both the shown and the canonical path, a candidate is never a configured parent or
+an ancestor of one, and a path whose text lies below a parent must also lie below it canonically. An excluded or
+link-escaping candidate is refused outright, with no fallback to rule 2. The linked worktrees of a repository excluded
+by `routing.repoExclude` are excluded with it: a `repo=`, `branch=` or `root=` route line that names one is refused, and
+they are kept out of the read set. When admission is in use, a `root=` other than
+the session directory binds only through admission. The `repo=` lookup needs a `.git` entry before it runs git, skips
+dot-directories, `node_modules` and excluded directories, visits at most 2000 directories and lists at most 10 notes.
+The grant carries the repository, branch and worktree. The orchestrator session keeps a working set of up to 16 bound
+roots, forgotten when the session is deleted. It grows only when `routing.repoParents` is set, from the accepted
+grant's location and after the dispatch is registered; `branch=` alone still binds through declare-then-check but does
+not grow it.
+
+**Invalid route fields.** An invalid or duplicated `repo=` or `branch=`, or one that conflicts between route lines,
+is an invalid declaration and refuses the dispatch with the note `<key>=<value> is not a valid repository name / branch
+name: no work root. Fix the route line.` The same holds for a `root=` the route-line parser rejected (an invalid value, a
+bare `root`, a duplicate or a conflicting one): the dispatch is refused with `root=<value> is not a valid absolute work root: no work root. Fix the route line.`
+A refused dispatch fails the `task` call with `[router] role dispatch @<agent> refused: <note>`.
+
+**Resume and the work root.** A resume of an exactly bound child keeps that child's work root. If its route line declares
+another target (a `root=` that is neither the bound work root nor its worktree, another `repo=` name, another `branch=`,
+or an invalid declaration), the resume is refused: `this child is bound to <work root> (repository <name>, branch
+<branch>); a resume cannot change its work root: dispatch a new child`. A resume that declares nothing, or the bound
+target, is unchanged. A route line is read from the first line of the prompt only: one placed after a copied header is
+ignored (the copied header is stripped).
+
+Branch names follow `git check-ref-format`, so `renovate/foo+bar` and `feat/ação` are valid. Names,
+branches and paths echoed in refusals are quoted when they contain unsafe characters; an invalid branch shows as
+`(unknown)`.
+
+**Session in a subdirectory.** The work root stays the session directory when the bound worktree contains it and no
+other git top level lies between them. A session in a worktree nested inside another (for example `.wt/feat` inside
+main) is not kept.
+
+**Read set.** A role may read, `glob` and `grep` in the work root, in the worktrees of the working set, and in
+directories inside an admissible repository below the parents (checked with a synchronous `.git` probe, cached for 5
+seconds). `external_directory` access to those directories is allowed in addition when the action is a read. Only paths
+written fully qualified, or explicit search roots, reach the read set. A relative path, in any argument (`filePath`,
+`path`, `file_path`, patch paths), or a pathless search is judged against the work root only and keeps the earlier
+refusal. A repository in the read set needs a real `.git` (`HEAD` plus `objects` or `commondir`, or a gitdir file whose
+target has `HEAD`); links are refused, a gitdir target is checked for network paths after realpath, and `HEAD` is read
+only from a regular file of at most 4 KiB. `repoExclude` applies to every ancestor, and `.git` internals are never read
+outside the work root: `read`, `glob` and `grep` still never open `.git` files there, while `router_git_*` read history
+through hardened git, now also in another repository of the read set with `root` (see below). A read outside the work
+root but inside the read set is annotated:
+
+```text
+[router: read from lib-b (main) at D:\git\lib-b — read-only in this dispatch]
+```
+
+**Edit refusals.** Edits stay in the work root. An edit elsewhere in the read set is refused with a message that says
+where the path lives and what to do:
+
+- same repository, other worktree: `edit: <path> is in worktree <wt> (repository <name>, branch <b>); this dispatch
+  edits only in <W> (branch <wb>). The same file in your work root is <W>\<rel>.`
+- another admitted repository: `edit: <path> is in repository <name> (branch <b>), which this dispatch may read but
+  not edit. Finish the <W name> part and return NEED MORE: naming the <name> change; it needs a dispatch with
+  repo=<name>.`
+
+Any other path outside the read set keeps the earlier text (`read: <path> is outside this dispatch's work root <root>
+(use an absolute path inside it)`). The worktree re-checks and `router_git_*` check against the binding's repository;
+a `router_git_*` call with `root` checks against the repository it names.
+A host `ask` for `external_directory` inside the work root or the read set is lifted to `allow` for an exactly bound
+session when cross-repo is in use; a deny is never changed, and the session's own tool-output directory is never
+lifted.
+
+**`router_git_*` in other repositories.** A role agent reads the history of another repository of its read set by
+passing `root` to a `router_git_*` tool: the absolute top-level path of a repository in the read set, or its name below
+`routing.repoParents`. A name has the `repo=` semantics (a repository name, or the directory name of one of its linked
+worktrees), with no branch argument: a name that matches several repositories, or a repository with several worktrees,
+is refused and the paths to pass are listed. `root` is for role agents only, with an exact binding and `read`, `glob` or
+`grep` in the grant. The argument is registered only on OpenCode v2 in roles mode when `routing.repoParents` is
+non-empty at start; the tool map is fixed at start, so a restart is needed after adding parents. `root` equal to the
+work root behaves as no `root`. Otherwise the tool runs in the admitted worktree with the same hardened git, read-only
+(it never refreshes the index), and its output starts with the provenance line
+`[router: read from <name> (<branch>) at <worktree> — read-only in this dispatch]`. Refusals start with
+`[router_git] error: refused: ` and nothing runs; the reason names the value as `root=<value>`:
+
+- not a role session (a tier agent or the orchestrator): `root is only for role agents (roles mode); this session
+  inspects its own repository: omit root`; no exact binding: the I9 refusal of the tool; `router_git` without a local
+  read action: `root reads another repository and needs read, glob or grep in this dispatch's grant (<actions>);
+  router_git alone stays in the work root`; parents emptied by a reload after start: `root needs routing.repoParents
+  (cross-repo is not configured); nothing ran`.
+- the text, before any filesystem call: `has leading or trailing whitespace`, `is longer than 4096 characters`, an
+  invalid path or name, or `names a .git directory`, each followed by `; pass the absolute top level of a repository or
+  its name`.
+- inside the work root: `root=<value> is inside your work root <W>; omit root and pass path=<rel>`.
+- outside the read set, on the text alone (a junction from outside the parents is refused without being resolved):
+  `root=<value> is outside this dispatch's read set (the work root, the session's repositories and the repositories
+  below <parents>); nothing ran`; after `realpath`: `root=<value> resolves to <path>, outside this dispatch's read set;
+  nothing ran`, or `root=<value> is not a directory; nothing ran`.
+- below a repository's top level: `root=<value> is inside the repository at <top>; pass root=<top> and path=<rel>`.
+- admission (depth, `repoExclude`, working set) refuses: its reason, with `; nothing ran.` in place of `: no work
+  root.`; an absolute path in it outside the read set is shown as `<outside the read set>`. A worktree that admits
+  as another path: `root=<value>: the admitted worktree <worktree> resolves to <path>; nothing ran`.
+- a name: `root=<name> matches no repository below routing.repoParents (searched <parents>); nothing ran` (followed by
+  `. The search stopped after 2000 directories` when the lookup was capped); `root=<name> matches <n> repositories:
+  <paths>; nothing ran. Pass root as one of these absolute paths`; `root=<name> has <n> worktrees: <path> → <branch>;
+  …; nothing ran. Pass root as one of these absolute paths`.
+- the call's deadline or abort: `resolving the repository timed out; nothing ran`, `resolving the repository was
+  aborted; nothing ran`; an unexpected failure fails closed with `resolving the repository failed; nothing ran`.
+
+On OpenCode v1, in tiers mode or without parents at start the argument does not exist.
+
+**Verification perimeter.** The perimeter is planned for every routed role dispatch with a work root when
+`routing.repoParents` is set, even without `repo=`, and also when the grant has a cross-repo location or the session
+working set holds other roots. It is the work root's repository, the working-set worktrees, and the admitted
+repositories the work root links to through `node_modules` (store links excluded) or declares a dependency on outside
+`node_modules` (a `file:` spec, tsconfig `references`, a Python editable install, a Go `replace`; read as text and never
+pinned, see [Dependencies outside node_modules](./VERIFICATION.md#dependencies-outside-node_modules)), at most 16 (roots
+past the cap are kept as unobserved), snapshotted at dispatch and at the gate. Links are de-duplicated by repository top level, found by
+walking up to `.git` with no git call. Repositories are admitted (depth, `repoExclude`, working set) before any git
+runs, and snapshotted with hardened git that keeps the inherited core settings (`autocrlf`, `eol`, `safecrlf`,
+`longpaths`, `quotepath`) unless the repository sets them. A link or edge target that is not admitted is named `(not
+admitted)` (at most 8 edge targets), never refused; one that could not be snapshotted is named `(not observed)`. A pending snapshot of another repository is
+discarded when an unattributable writer runs, not only when it writes an overlapping directory, and that repository is
+then "could not be observed". A planning failure fails closed, with a placeholder root "the verification perimeter
+could not be planned…". When a root in the perimeter changed, or could not be observed, while the producer ran a tool
+that can write anywhere, the result is unverifiable (for a sibling worktree of the work root's own repository the
+reason suggests `branch=` instead of `repo=`): `the repository <name> at <root> also changed during the dispatch, and the
+producer ran <tools>; a write there cannot be attributed, so the checks in <W> do not cover it. Dispatch that work with
+repo=<name>, or verify it there.` (`could not be observed during the dispatch` for a missing snapshot). A pass with
+more than one root shows its scope as a note, `verified scope: <W> (<branch> @ <head7>); also observed: …`; a changed
+repository without writers is marked `changed during the dispatch`. A dispatch whose I4 already refuses at return (the
+unattributable-writer case above) is not deferred: it is verified at once, before the return.
+
+**Deferred verification across repositories.** A role dispatch with a perimeter, or with per-check `cwd=`/`scope=`, may
+be deferred (`VERIFY:deferred`, the default; OpenCode v2). At return the router freezes the perimeter (the statuses for
+I4 and I8, the working-set roots, the observed link and edge targets (those the producer added during the dispatch
+included), the check placements and the link pins). The I4 window is the dispatch and is never decided again;
+`router_verify` discovers consumers over the frozen working-set roots (through `node_modules` links and declared edges)
+and observes the link and edge targets again (a changed one turns a pass UNVERIFIED; an unobservable one leaves a
+would-be pass not judged and the handle open for another `router_verify`; a dependency the
+producer removed during the dispatch is skipped unless the work root declares it again). The dispatch is verified at
+once, not deferred, when I4 already refuses at return, when a linked repository could not be observed within the
+deferral bound, when a dependency added during the dispatch could not be observed or more were added than the perimeter
+has room for, and when a placement or a v2 tier per-check `cwd=` is refused (a refusal never reaches the deferred finish). Details are in
+[Deferred verification across repositories](./VERIFICATION.md#deferred-verification-across-repositories).
+
+- **With `routing.repoParents` set**, role dispatches are deferred by default where they used to be synchronous. A
+  "continue and finish" resume of a deferred attempt therefore finds an attempt that was never gated (see "What a resume
+  keeps"), and the detection is no longer `deterministic` for its change-set checks.
+
+- **Checks in other repositories.** A check may run in another repository of the read set with `cwd=` and `scope=full`
+  (`check: testsPass cwd="D:\git\app-a" scope=full`); the change is still captured in the work root. Syntax, refusals
+  and the consumer caveat are in [Checks in other repositories](./VERIFICATION.md#checks-in-other-repositories). A
+  `testsPass` in a consumer of the work root may use `scope=affected` instead: it runs `vitest related` (vitest 5 only)
+  across the link, and any doubt is unverifiable; see
+  [A consumer check with scope=affected](./VERIFICATION.md#a-consumer-check-with-scopeaffected).
+
+**Limits.**
+
+- A worktree outside the parents (for example under `%TEMP%`) is admitted by rule 2, but the registered policy ends in
+  a catch-all `deny` that the hook-level allow cannot override, so it still needs a `routing.workRoots` glob in long
+  form or a restart; the same holds for a worktree of the session repository created after registration. Creating
+  worktrees below a parent avoids this.
+- Changing `routing.repoParents` needs a restart.
+- The role header is built only for a routed role dispatch (not for a delegate's) and names the work root and location
+  the router bound; a role still cannot read or write outside its grant.
+
+The rest of the design is in [the cross-repo design](./design/cross-repo.md).
+
+### Repositories outside routing.repoParents
+
+A repository outside `routing.repoParents` becomes a work root for role dispatches only after a human approved it with
+`/router approve` (OpenCode v2, roles mode, owner decision D29). The flow:
+
+1. A role dispatch names the repository with `root=<path>` and admission refuses it. When the refused candidate is one
+   a human could approve, the router asks git about it (never the dispatch text) and appends to the refusal:
+   `<path> is a git repository outside routing.repoParents (origin <origin>, branch <branch> at <head7>). Only the user
+   can approve it: ask the user to run /router approve <path>, then dispatch again.` A detached HEAD reads `detached at
+   <head7>`, and a path with spaces is quoted in the command. When the candidate cannot be approved, the note says why
+   instead: `No approval can be requested for <path>: it <problem>.` When git does not answer within 8 seconds, the
+   refusal stays as it is.
+2. The human types `/router approve <path>` (quote a path with spaces: `/router approve "D:\my repo"`). The router
+   inspects the path again, from git, and shows the identity it stored:
+
+   ```text
+   Approved repository D:\other\lib-c
+     origin:  https://github.com/acme/lib-c.git
+     branch:  main @ 3f2c1a9b4d5e
+     roots:   1 root commit
+     expires: 2026-10-26 (14 days after its last use; at the latest 2027-01-10)
+   Stored in C:\Users\me\.config\opencode\opencode-model-router.repo-approvals.json.
+   ```
+
+3. The router reloads the role agents, so that their directory permission covers the repository, and adds
+   `Role agents reloaded; dispatch again with root=<path>.`
+4. The orchestrator dispatches again with `root=<path>`.
+
+An approved repository works through `root=` only (scope OD-P4-2 (a)): the `root=` text must equal the approved path
+before any filesystem call, and a different spelling that resolves to it is refused with a note that names the approved
+path. `repo=<name>` does not look outside the parents. Once bound, the repository joins the working set and the read
+set, `router_git_* root` works on it, and its linked worktrees are admitted by rule 2 through the working set (see
+Limits below for the host's side). Registration gives each approved repository a `<path>\*` `external_directory` allow
+pattern on the local roles, only while `routing.repoParents` is non-empty, the approval has not expired and is not
+excluded by its text, the path still resolves to itself, and it passes the work-root checks.
+
+**What is checked.** What the human sees and what gets stored come from git at approve time, never from the dispatch
+text or the refusal note. `/router approve` refuses with `Not approved: <path> <reason>.` and `Nothing was stored.`
+(the first three checks run before any git call):
+
+- a path that fails the work-root text checks, or does not resolve to an existing directory;
+- a path excluded by `routing.repoExclude`, as typed or resolved: `repoExclude` wins over an approval;
+- a protected location, as typed or resolved: a drive or filesystem root, the user profile or an ancestor of it, and
+  the OpenCode config directory (also `$XDG_CONFIG_HOME/opencode` and `OPENCODE_CONFIG_DIR`), the directory of the
+  config file named by `OPENCODE_CONFIG`, `~/.opencode`, the OpenCode data, state and cache directories, the plugin
+  install directory and the approvals store directory (each equal, an ancestor, or inside);
+- anything but the main worktree of a repository: `<path>\.git` must be a local directory (not a link, not a `.git`
+  file of a linked worktree, a submodule or a separate git dir), the path must be the git top level, and the git common
+  directory must be its own `.git`. These refusals end with `; approve the main worktree`.
+
+A repository below `routing.repoParents` needs no approval: `No approval needed: <path> is inside routing.repoParents
+(<parent>); dispatch with root=<path>.` A repository that is or contains a parent is refused: `Not approved: <path>
+is routing.repoParents entry <parent>; a repository that is or contains a parent cannot be approved.` (or `contains
+routing.repoParents entry <parent>`); registration also skips a stored approval that is or contains a parent (text or
+canonical form). One below a parent but deeper than `routing.repoDepth` is refused too: `No approval applies: <path>
+is below <parent> but deeper than routing.repoDepth (<n>); the router refuses it with or without an approval.` Each of
+these ends with `Nothing was stored.` The stored identity is the canonical path, the git common directory and the
+root commits (`git rev-list --max-parents=0 HEAD`); the origin (credentials stripped) and the branch are shown but are
+not part of the identity. The identity is checked again with git at every use: an entry whose path no longer resolves
+to itself, whose common directory changed, or whose root commits differ no longer admits anything.
+
+**The commands.** `/router` lists them only where they run:
+
+```text
+- `/router approve <path>` — approve a repository outside `routing.repoParents` for role dispatches with `root=<path>` (identity from git; quote a path with spaces)
+- `/router repos` — list the approved repositories, their last use and expiry
+- `/router revoke <path>` — remove an approval and drop the repository from every working set
+```
+
+They run only on OpenCode v2, in roles mode, with `routing.repoParents` non-empty, and only when typed by the human in a
+top-level session: not a role session, not a known child of a dispatch, and a session the host reports without a
+parent (a failed lookup refuses). Anywhere else `approve`, `repos` and `revoke` are not commands, and `/router` shows its
+usual output. Only `approve` and `revoke` add or remove approvals (a binding through one only moves its last use); no
+tool call, route-line field, dispatch text or project-layer key can create, extend or widen one.
+
+- `/router repos` reads the store only (no git) and lists each entry with its origin, `approved:`, `last used:` and
+  `expires:` times, marked `[expired]` or `[excluded by routing.repoExclude (<pattern>)]` where that applies.
+- `/router revoke <path>` removes the entry (named by its text or its realpath), drops the repository from every
+  working set and says so: `Revoked the approval of <path>.`, then `It was not in any working set.` or `Removed from the
+  working sets (<n> bindings).`, then `A new dispatch with root=<path> is refused.` The role agents are then reloaded:
+  `Role agents reloaded; root=<path> is no longer allowed.`
+
+**Reload and restart.** After an `approve` or `revoke` that wrote the store, the v2 command adapter reloads the role
+agents before it sends the text on, so the host's directory permission follows the store. When the reload fails, the
+added line names the error and falls back to a restart: `The role agents could not be reloaded (<error>). Restart
+OpenCode to use it.` after an approval, and `The role agents could not be reloaded (<error>). The router refuses
+root=<path> now; restart OpenCode to remove its directory permission from the role agents.` after a revocation.
+After a revocation or expiry, a child bound through the approval stops working in it (a store read, no git): an exact
+resume, `router_run` and `router_git_*` refuse with `approval for <path> was revoked or expired: no work root. Only the
+user can approve it again (/router approve <path>).` (a resume's note starts `resume refused: `).
+
+**Expiry.** An approval expires `routing.repoApprovalDays` days (global only, 1–90, default 14) after its last use, and
+90 days after it was approved at the latest, whatever its use. Each binding through an approval records the use (at
+most one write per hour per repository). An expired entry admits nothing; approve it again to renew it. Expiry or a
+lost identity takes effect at the next binding, when the stale entry is also dropped from the working set.
+
+**The store.** The approvals live in `opencode-model-router.repo-approvals.json` next to the router state file
+(`~/.config/opencode/`); its format is in [the configuration reference](./CONFIG_REFERENCE.md#roles-delegation-84). A file
+that is not valid as a whole means no approvals (fail closed) and one notice; `/router repos` then says `The approvals
+file <file> is invalid (<reason>); no approvals apply until it is fixed or removed.`, and `approve` and `revoke` refuse.
+
+**Limits.**
+
+- Worktrees of an approved repository outside its main tree are admitted by rule 2 once the repository is bound, but
+  the host's directory permission covers only `<path>\*`, so they still need a `routing.workRoots` glob or a restart
+  (Q7), as for any worktree outside the parents.
+- The root commits change on an orphan-branch checkout, a deepened shallow clone or rewritten history; the approval is
+  then lost and must be given again.
+- At most 32 approvals and 256 KiB. Two OpenCode instances writing the store at the same time can lose one write; the
+  command reads the file back and reports it.
+- An approval that expires mid-session can still be read through the working set until the next dispatch of that
+  session.
+
+**Accepted residuals.**
+
+- Code with host API access (`session.command`) or with a shell can approve: `router_run` in the work root runs
+  repository code, so it can write the store.
+- A human can approve a hostile clone; the command shows the origin, branch and root commits so the human can check.
+- The host's `<path>\*` pattern is wider than admission and lingers after an expiry until the next reload of the role
+  agents or a restart; the router's hook still narrows access in the meantime, as for `routing.workRoots`.
+
+**OpenCode v1, tiers mode, no parents.** The feature is inert on OpenCode v1, in tiers mode and in roles mode without
+`routing.repoParents`: `/router approve <path>` shows the usual `/router` output byte for byte, there is no store I/O
+and no git call for approvals, and no approval admits anything. On v1, `routing.repoApprovalDays` gets at most the
+existing one-time notice (see [OpenCode v1 fallback](#opencode-v1-fallback)).
 
 ## Tier floor
 
@@ -337,7 +689,9 @@ further arguments. It is matched by **`router_run` entry name**: the check `npm 
 entry of the same name (a command named `test` counts for `npm test`; one named `test-files` never does). A dispatch
 with no check of that form gets no `run` signal. A check of any other form (a file check, another command) is never
 matched to a run, so a `run` signal never shows that such a check passed: that is the deterministic gate's `verdict`.
-The child's edits must also have been observed.
+The child's edits must also have been observed. A dispatch where any acceptance check has its own `cwd=` (even a relative
+one inside the work root) gets no run signal at all: such a check may not run in the work root, so no check of that
+dispatch is credited.
 
 **Graders weigh half, and only when independent.** When an LLM grader (not the deterministic checks) judges a role
 dispatch, there is never a weight-1 `verdict` signal. An independent grader's pass or fail writes a verdict row that

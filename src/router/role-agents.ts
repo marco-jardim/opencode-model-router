@@ -20,7 +20,8 @@ import { resolveActiveTiers, resolveRolesRouting, type RouterConfig, type TierCo
 import { GIT_TOOL_NAMES, gitEnvironment, gitExecutable, hardeningArgs, inheritedSafeDirectoryArgs, spawnBounded } from "./git-tools";
 import { positiveBudget, REFUSAL_CAP, ROUTE_BUDGET_RAISE_MAX, TIER_GUARD_BUDGET } from "./guard-profile";
 import { PLUGIN_AGENT, pluginAgentMarker, pluginAgentPolicy, type PluginAgentMarker } from "./plugin-agents";
-import { CONTEXT7_DOC_TOOLS, type PermissionMap } from "./read-only";
+import { CONTEXT7_DOC_TOOLS, permissionMatches, type PermissionMap } from "./read-only";
+import { isApprovalValid, type RepoApproval } from "../routing/roles/approvals";
 import { ACTION_CLASS, HOST_NATIVE_ROLE_NAMES, resolveRoleTable, SHIPPED_ROLE_SPECS, type AuthorityAction, type RoleSpec, type RoleTable } from "./roles";
 import { workRootGlobIndex, workRootProblem } from "./roles-config";
 import { locationOutsideWorkRoots } from "./work-roots";
@@ -207,6 +208,28 @@ export function worktreeRootPattern(root: string, realpath: Realpath = nativeRea
 }
 
 /**
+ * The `external_directory` allow pattern of one approved repository (cross-repo Phase 4, SD-P4-15):
+ * `<path><sep>*` built like {@link worktreeRootPattern}, but only when the stored path still is its
+ * own canonical long form (`realpathSync.native(path)` equals `path` as text, case-insensitive on
+ * win32: a moved, replaced or junctioned folder gets no pattern) and both forms pass the P1.1 rules
+ * ({@link workRootProblem}). Undefined, with the reason, otherwise: fail closed. No git.
+ */
+export function approvedRootPattern(path: string, realpath: Realpath = nativeRealpath): { pattern?: string; problem?: string } {
+  const problem = workRootProblem(path);
+  if (problem !== undefined) return { problem };
+  let canonical: string;
+  try {
+    canonical = realpath(path);
+  } catch {
+    return { problem: "does not resolve to a directory" };
+  }
+  const same = process.platform === "win32" ? canonical.toLowerCase() === path.toLowerCase() : canonical === path;
+  if (!same) return { problem: `resolves to ${canonical}, not the approved path` };
+  const after = workRootProblem(canonical);
+  return after === undefined ? { pattern: join(canonical, "*") } : { problem: `canonical form ${canonical} ${after}` };
+}
+
+/**
  * The `external_directory` allow pattern of one `routing.workRoots` entry (P-11): the static
  * directory before the first wildcard in its canonical long form, then the glob tail verbatim
  * (`D:/git/omr-rta-*` → `D:\git\omr-rta-*`); an entry without a wildcard is a root (`<root>\*`).
@@ -244,6 +267,8 @@ export function externalDirectoryPatterns(
   worktrees: readonly string[],
   workRoots: readonly string[],
   realpath: Realpath = nativeRealpath,
+  parents: readonly string[] = [],
+  approved: readonly string[] = [],
 ): { patterns: string[]; problems: string[] } {
   const patterns: string[] = [];
   const problems: string[] = [];
@@ -260,7 +285,81 @@ export function externalDirectoryPatterns(
     if (result.pattern === undefined) problems.push(`routing.workRoots entry ${entry} ${result.problem ?? "is not usable"}; not granted`);
     else add(result.pattern);
   }
+  // P1.6: one `<parent><sep>*` per `routing.repoParents` entry; the host's `*` crosses separators, so it covers every depth.
+  const parentDirs: string[] = [...parents];
+  for (const parent of parents) {
+    const result = workRootPattern(`${parent.replace(/[\\/]+$/, "")}/*`, realpath);
+    if (result.pattern === undefined) problems.push(`routing.repoParents entry ${parent} ${result.problem ?? "is not usable"}; not granted`);
+    else {
+      add(result.pattern);
+      parentDirs.push(result.pattern.replace(/[\\/]?\*$/, ""));
+    }
+  }
+  // Cross-repo Phase 4 (SD-P4-15): one `<path><sep>*` per approved repository, only with parents (I9); the caller passes
+  // approvals already checked for expiry and exclusion ({@link approvedRootsInForce}). Phase 4 QA (m3): never one that is or
+  // contains a parent (text or canonical form): its rule would be wider than the parents, and admission refuses it anyway.
+  if (parents.length > 0) {
+    for (const path of approved) {
+      const result = approvedRootPattern(path, realpath);
+      if (result.pattern === undefined) {
+        problems.push(`approved repository ${path} ${result.problem ?? "is not usable"}; not granted`);
+        continue;
+      }
+      const approvedDir = result.pattern.replace(/[\\/]?\*$/, "");
+      const held = parentDirs.find((dir) => dir.trim() !== "" && (isOrContains(path, dir) || isOrContains(approvedDir, dir)));
+      if (held !== undefined) problems.push(`approved repository ${path} is or contains routing.repoParents entry ${held}; not granted`);
+      else add(result.pattern);
+    }
+  }
   return { patterns, problems };
+}
+
+/** Comparison form of a directory for the parent checks: `/` separators, no trailing one, case-folded on win32. Text only. */
+function dirKey(p: string): string {
+  const unified = p.replace(/\\/g, "/").replace(/\/+$/, "");
+  return process.platform === "win32" ? unified.toLowerCase() : unified;
+}
+
+/** Whether directory `outer` is directory `inner` or contains it ({@link dirKey} forms; a filesystem root contains all). */
+function isOrContains(outer: string, inner: string): boolean {
+  const o = dirKey(outer);
+  const i = dirKey(inner);
+  return o === "" || o === i || i.startsWith(`${o}/`);
+}
+
+/** One store entry as registration sees it (cross-repo Phase 4): read without git. */
+export type ApprovedRoot = Pick<RepoApproval, "path" | "approvedAt" | "lastUsedAt">;
+
+/**
+ * The approved repository paths registration may grant (SD-P4-15): none without `routing.repoParents` (I9); otherwise each
+ * approval that has not expired ({@link isApprovalValid} with `routing.repoApprovalDays`) and whose path text no
+ * `routing.repoExclude` glob matches (exclusion wins over an approval) and that is not, and does not contain, a
+ * `routing.repoParents` entry (Phase 4 QA m3: text, case-insensitive on win32; such an approval would be granted wider than
+ * the parents). Excluded and parent-holding ones are reported in `problems`; expired ones are dropped silently. No filesystem
+ * access, no git.
+ */
+export function approvedRootsInForce(
+  approved: readonly ApprovedRoot[],
+  routing: { readonly repoParents: readonly string[]; readonly repoExclude: readonly string[]; readonly repoApprovalDays: number },
+  now: number,
+): { paths: string[]; problems: string[] } {
+  const paths: string[] = [];
+  const problems: string[] = [];
+  if (routing.repoParents.length === 0) return { paths, problems };
+  for (const entry of approved) {
+    if (typeof entry.path !== "string" || entry.path === "") continue;
+    if (!isApprovalValid(entry, routing.repoApprovalDays, now)) continue;
+    const held = routing.repoParents.find((parent) => parent.trim() !== "" && isOrContains(entry.path, parent));
+    if (held !== undefined) {
+      problems.push(`approved repository ${entry.path} is or contains routing.repoParents entry ${held}; not granted`);
+      continue;
+    }
+    const forms = process.platform === "win32" && entry.path.includes("/") ? [entry.path, entry.path.replace(/\//g, "\\")] : [entry.path];
+    const excluded = routing.repoExclude.find((glob) => glob.trim() !== "" && forms.some((form) => permissionMatches(form, glob)));
+    if (excluded !== undefined) problems.push(`approved repository ${entry.path} is excluded by routing.repoExclude (${excluded}); not granted`);
+    else if (!paths.includes(entry.path)) paths.push(entry.path);
+  }
+  return { paths, problems };
 }
 
 // ---------------------------------------------------------------------------
@@ -296,10 +395,17 @@ export interface RoleRegistrationOptions {
   seed: Readonly<Record<string, Record<string, unknown>>>;
   /** Logs `message` once per `key`. */
   warn: (key: string, message: string) => void;
+  /**
+   * Cross-repo Phase 4 (SD-P4-15): the entries of the repository approvals store, read without git. Each one in force
+   * ({@link approvedRootsInForce}) whose path is still its own canonical form gets a `<path><sep>*` rule. Absent: none.
+   */
+  approvedRoots?: readonly ApprovedRoot[];
   /** Injection points (tests). */
   listWorktrees?: (directory: string) => Promise<string[]>;
   resolveTable?: (cfg: RouterConfig, host: "v1" | "v2", opts: { context7?: boolean }) => RoleTable;
   realpath?: Realpath;
+  /** Clock in epoch ms for the approval expiry; default `Date.now`. */
+  now?: () => number;
 }
 
 const PREFIX = "roles mode (OpenCode v2 only): ";
@@ -351,8 +457,9 @@ export async function registerRoleAgents(
         opts.warn("roles:worktrees", `${PREFIX}the repository's worktrees could not be listed (${errorText(error)}); role agents get no worktree external_directory rule`);
       }
     }
-    const found = externalDirectoryPatterns(worktrees, routing.workRoots, opts.realpath ?? nativeRealpath);
-    for (const problem of found.problems) opts.warn(`roles:external:${problem}`, `${PREFIX}${problem}`);
+    const approved = approvedRootsInForce(opts.approvedRoots ?? [], routing, (opts.now ?? Date.now)());
+    const found = externalDirectoryPatterns(worktrees, routing.workRoots, opts.realpath ?? nativeRealpath, routing.repoParents, approved.paths);
+    for (const problem of [...approved.problems, ...found.problems]) opts.warn(`roles:external:${problem}`, `${PREFIX}${problem}`);
     externalDirectory = found.patterns;
     built = new Map();
     for (const [name, spec] of table.roles) {

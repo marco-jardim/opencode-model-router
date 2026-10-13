@@ -47,6 +47,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OpenCode v2: a pending verification restored after a restart keeps its cross-repo checks.** The branch and HEAD
+  recorded at return, the unobservable writers and the check placements of a deferred dispatch are written to
+  `pending.jsonl` and checked again when the router restarts; a record with a malformed one is dropped. A dispatch's
+  perimeter cannot be written, so `router_verify` on a restored handle whose dispatch had one reports `UNVERIFIABLE`
+  (`perimeter lost in restart`), never `PASS`. Records written by earlier builds restore as before. OpenCode v1 is
+  unchanged.
 - **OpenCode v2: work leases no longer collide across linked worktrees.** Two child sessions that edit the same
   repo-relative path in two worktrees of one repository (`git worktree add`) are both allowed: an ordinary write lease
   is keyed by its checkout, not by the repository, and a write whose target the router cannot read is refused only while
@@ -123,6 +129,225 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or right after the one preamble line the host puts before a subagent's first message ("You are a subagent spawned by
   another session."); any other leading text makes it an ordinary prompt. Parallel tool calls of such a session all
   wait for the same check, and an ordinary prompt is never refused, even when the session's kind cannot be looked up.
+
+## [2.8.0] - 2026-10-13
+
+### Added
+
+- **Approve repositories outside routing.repoParents with /router approve (OpenCode v2, roles mode; inert on v1)
+  (#107).** A role dispatch with `root=<path>` outside `routing.repoParents` is refused with a note composed from git
+  that names the repository and ends `Only the user can approve it: ask the user to run /router approve <path>, then
+  dispatch again.` The human types `/router approve <path>` in a top-level session: the router reads the repository's
+  identity from git (path, git common directory, root commits; origin and branch are shown), stores it and reloads the
+  role agents (`Role agents reloaded; dispatch again with root=<path>.`; if the reload fails, `Restart OpenCode to use
+  it.`); dispatch again with `root=<path>`. Only the main worktree of a repository can be approved, never a protected
+  location (a filesystem root, the user profile, the OpenCode config, data, state or cache directories, the directory
+  of the `OPENCODE_CONFIG` file, `~/.opencode`, the plugin install directory, the approvals store directory), nor a
+  repository that is or contains a `routing.repoParents` entry; `routing.repoExclude` wins, and the identity is checked
+  again at every use. After a revocation or expiry, an exact resume, `router_run` and `router_git_*` of a child bound
+  through the approval are refused. The approvals are stored in `opencode-model-router.repo-approvals.json` next to the router state file.
+  `/router repos` lists the approvals, their last use and expiry; `/router revoke <path>` removes one and drops the
+  repository from every working set. An approval expires `routing.repoApprovalDays` (new key, global only, 1–90, default
+  14) days after its last use, and 90 days after approval at the latest. Worktrees of an approved repository outside its
+  main tree still need `routing.workRoots` or a restart. See
+  [Repositories outside routing.repoParents](docs/ROLES.md#repositories-outside-routingrepoparents).
+- **Dependencies outside `node_modules` (OpenCode v2, roles mode; inert on v1) (#107).** A role dispatch's perimeter
+  also holds the repositories the work root declares a dependency on outside `node_modules` (owner decision D24, Tier
+  A): `file:`, `link:` and `portal:` specs in `package.json` (root and workspace manifests, `overrides`, `resolutions`,
+  `pnpm.overrides`); tsconfig/jsconfig `extends`, `references`, `paths`, `baseUrl`, `rootDirs`, `typeRoots`, `include`
+  and `files`; Python editable installs in a venv inside the work root (`.pth`, `.egg-link`, setuptools editable
+  finders); Go `replace` and `go.work use`. They are read as text, never evaluated, and bounded; no config key. An
+  admitted target is observed for I4, named in the verified-scope line and observed again at `router_verify` (S11), but
+  never pinned, so the reference does not cover it. A target that is not admitted is named `<name> (not admitted)`,
+  never refused. A working-set worktree that declares an edge into the work root is a consumer:
+  `links this work root (<via>)`, never the raw spec. A bound that cuts the reading at dispatch is logged:
+  `[verify] dispatch perimeter: declared dependency edges were cut by a bound`. See
+  [Dependencies outside node_modules](docs/VERIFICATION.md#dependencies-outside-node_modules).
+- **Roles mode (OpenCode v2; cross-repo, #107, owner decision Q10): `repo=` also matches a worktree directory name.** A
+  route line's `repo=<name>` also matches a linked worktree whose directory name is `<name>` below `routing.repoParents`,
+  and binds that worktree (with `branch=`, the worktree of its repository on that branch). A repository and a worktree
+  directory sharing the name, or two such worktree directories of different repositories, are refused as ambiguous, each
+  candidate listed as `<worktree path> (repository <name>, branch <branch>)`.
+- **Role dispatch header (OpenCode v2 roles mode; inert on v1) (#107).** A routed role dispatch with a work root and
+  read access now starts with a short header naming the role, the work root and, when known, the repository, branch and
+  head, so a role delegate is told where it works; the nonce line or carried acceptance block stays last. A header the
+  orchestrator copied from another dispatch is always stripped, and replaced only when the router adds its own. The
+  header is emitted only when it is relevant (owner decision Q8, invariant I9): `routing.repoParents` is set, the route
+  line declares `repo=`, `branch=` or `root=`, or the work root differs from the session directory; otherwise the
+  dispatch prompt is unchanged. No
+  header for a delegate's dispatch or a non-exact resume; with `dispatchHeader: false` there is no header either, except that a work root other
+  than the session directory still gets a minimal header (the identity and `Working directory:` paragraphs). The role
+  work-root rule now points to the `Working directory:` line. A read-only role is told "You read only in your working
+  directory." in the header wording, although its read set can also include the working set.
+- **Checks in other repositories (OpenCode v2, roles mode) (#107).** A check of the `[acceptance]` block can run in
+  another repository of the read set: `check: testsPass cwd="<repo>" scope=full`. A relative `cwd=` stays inside the
+  work root; an absolute one must be in the read set; one outside it, or a `scope=` that is neither `affected` nor
+  `full`, is unverifiable and nothing runs. Changes are always captured in the work root; a change that no check root
+  covers is unverifiable (`is not covered by any check root`). A `testsPass` or `lintClean` check in another repository
+  must use `scope=full`; its failure there is unverifiable, never a fail, and it gets no reference. A working-set
+  worktree whose `node_modules` links into the work root is a consumer: a pass with a change and no tests, build, lint
+  or run check placed in it is UNVERIFIED, with the suggested check line. Consumers are discovered by package name
+  (a `node_modules` link into the work root) in the working set only; when discovery stops on its budget before
+  finishing a worktree, a pass with a change is UNVERIFIED (`consumer discovery stopped before finishing …`), so a
+  consumer may remain undiscovered. The link scan is bounded, and consumer discovery runs under the gate deadline. A
+  check placed in a consumer clears that incomplete-discovery caveat. When the change of the work root could not be
+  observed and no check covers it, the result is refused. A link target pinned at dispatch and
+  unchanged since keeps the reference exact (link pins). A tier dispatch on v2 refuses a per-check `cwd=`
+  (`a per-check cwd= is honoured only in roles mode`); `scope=` alone is ignored; v1 ignores both keys. A dispatch with
+  per-check keys may be deferred, see "Deferred verification across repositories" below. The configured roles protocol
+  (`routing.repoParents`) teaches the syntax.
+- **Deferred verification across repositories (OpenCode v2, roles mode) (#107).** A role dispatch with a perimeter or
+  with per-check `cwd=`/`scope=` keys may now be deferred (`VERIFY:deferred`, the default). At return the router freezes
+  the perimeter (the statuses for I4 and I8, the working-set roots, the observed link targets, the placements and the
+  link pins). The dispatch is verified at once, not deferred, when I4 already refuses at return, when a linked
+  repository could not be observed within the deferral bound, and when a placement or a v2 tier per-check `cwd=` is
+  refused (the refusal reaches the verification, never the deferred finish). At
+  `router_verify` the I4 window is the dispatch (never decided again), consumers are discovered over the frozen
+  working-set roots, and link targets are observed again: one that changed since the producer returned, or cannot be
+  observed again, turns a pass UNVERIFIED with a caveat (a fail keeps it). Correction since P2e QA round 1: a pass held
+  back only by links that cannot be observed again is retryable instead: the handle is reported as not judged and stays
+  open, so call `router_verify` again (see `docs/VERIFICATION.md`, "Deferred verification across repositories"). A
+  placement whose path or git top changed since return runs nothing; one that cannot be checked now (an error other
+  than a missing directory) runs nothing and also stays open. Link pins kept for the deferred entry keep the reference
+  exact. With `routing.repoParents`
+  set, role dispatches are now deferred by default where they used to be synchronous; a "continue and finish" resume of
+  a deferred attempt cannot back a `deterministic` detection (see `docs/ROLES.md`).
+- **Cross-repo work in roles mode (OpenCode v2; inert on v1) (#107).** New global-only keys `routing.repoParents`,
+  `routing.repoDepth` (1–4, default 2) and `routing.repoExclude` name the directories whose repositories role
+  dispatches may work in; registration adds `<parent>/*` `external_directory` allow patterns, so new clones need no
+  restart. The route line accepts `repo=<name>` and `branch=<ref>` (case kept), and the work root is bound through
+  admission (a git top level below a parent, or a worktree of a known repository). A role may read, glob and grep the
+  work root, the session's working set and the admissible repositories below the parents (reads outside the work root
+  are annotated `[router: read from <name> (<branch>) …]`) but edits only in its work root; edit refusals name the
+  other worktree or repository and the `repo=` dispatch needed. The verification perimeter snapshots the repository,
+  the working set and `node_modules`-linked repositories; an unattributable write there makes the result
+  unverifiable. The protocol and the tier dispatch header gain a cross-repo sentence. Limit: a worktree outside the
+  parents still needs a `routing.workRoots` glob or a restart.
+- **Cross-repo hardening after two QA rounds.** Only fully qualified paths and explicit search roots reach the read set;
+  a relative path stays judged against the work root. A final admission gate checks `repoExclude` on the shown and the
+  canonical path and refuses a candidate that is a parent, an ancestor of one, or a link out of it, with no fallback to
+  the worktree rule. An invalid, duplicated or conflicting `repo=`/`branch=` is no longer ignored: it is an invalid
+  declaration, and the dispatch is refused with the note
+  (`<key>=<value> is not a valid repository name / branch name: no work root. Fix the route line.`, see the owner
+  decision Q9 entry under Changed). The verification perimeter is planned for every routed role dispatch with a work root whenever
+  `routing.repoParents` is set, even without `repo=`; a pass shows `verified scope: …` and link targets are named
+  `(not admitted)` or `(not observed)`.
+- **`router_git_*` in other repositories (OpenCode v2, roles mode; inert on v1) (#107).** A role agent with an exact
+  binding and `read`, `glob` or `grep` in its grant may pass `root` to a `router_git_*` tool to read the history of
+  another repository of its read set, by absolute top-level path or by name below `routing.repoParents` (`repo=`
+  semantics, no branch). The output starts with the read-provenance line; git stays read-only. The argument exists only
+  when `routing.repoParents` is non-empty at start (restart after adding parents); tier agents and the orchestrator are
+  refused, and every refusal runs nothing (see `docs/ROLES.md`).
+- **A consumer `testsPass` with `scope=affected` runs `vitest related` across a link (OpenCode v2, roles mode; inert on
+  v1) (#107).** An explicit `scope=affected` on a `testsPass` in another repository runs the consumer's tests related
+  to the change in the work root (vitest 5 only; jest, pytest and other vitest majors are unverifiable). A run that
+  selects no test, or misses a consumer test file that imports a package of the work root, is unverifiable; so is a
+  failure. A `testsPass` without `scope=` and a `lintClean` there still must use `scope=full` (see `docs/VERIFICATION.md`).
+
+### Changed
+
+- **Worktrees of an excluded repository are refused (OpenCode v2, roles mode) (#107).** The linked worktrees of a
+  repository excluded by `routing.repoExclude` are now excluded with it: a `repo=`, `branch=` or `root=` route line that
+  names one is refused, and they are kept out of the read set.
+
+- **A full-scope `testsPass` is no longer run synchronously when the producer changed nothing (OpenCode v2) (#107).**
+  Before, a dispatch with no changed files and config `testScope: "full"` ran the full suite synchronously before the
+  return. On OpenCode v2 such a dispatch (and one whose `testsPass` check has `scope=full`) now defers instead of
+  blocking the return; for a `delegate` this also means no synchronous ladder. Config `testScope` does not affect
+  `lintClean` (only a per-check `scope=full` runs lint unscoped), so a `lintClean`-only dispatch with no change still
+  passes without running anything. v1 is unchanged (owner decision OD-P2e-2).
+- **Roles mode (OpenCode v2; cross-repo, #107, owner decision Q9): a refused declared target refuses the dispatch.** When
+  a role dispatch's route line declares `repo=`, `branch=` or `root=` (or an invalid `repo=`, `branch=` or `root=`: a
+  rejected, bare, duplicate or conflicting value, noted `root=<value> is not a valid absolute work root: no work root.
+  Fix the route line.`) and the router cannot bind a work root for it, the `task` call now fails with
+  `[router] role dispatch @<agent> refused: <note>` instead of running with no work root in the session directory. An
+  exact resume whose route line names a different target than the child's bound root is refused too (`this child is
+  bound to <work root>; a resume cannot change its work root: dispatch a new child`). A dispatch that declares nothing,
+  a delegate's dispatch and a resume that declares nothing or the bound target are unchanged.
+
+### Fixed
+
+- **A dependency the producer adds during a deferred dispatch is frozen at return (OpenCode v2, roles mode) (#107).**
+  `router_verify` reported a dependency of the work root added during the dispatch as changed (`the linked repository
+  <name> at <root> changed since the producer returned; …`) every time. The work root's package links and declared
+  edges are now read again when the producer returns (owner decision D26): a new admitted dependency is observed then,
+  and `router_verify` compares it with that state; one that cannot be observed within the deferral bound, or more new
+  dependencies than the perimeter has room for, verify the dispatch at once (no handle); a new one that is not admitted
+  is named `<name> (not admitted)` in the verified-scope line. A dependency the producer removed during the dispatch is
+  no longer observed again at `router_verify`, unless the work root declares it again (then it is "changed").
+- **A change set that mixes paths inside and outside the observed repository is no longer verified as a pass on the
+  inside paths alone.** The runner dropped the outside paths with a note and ran the scoped checks on the rest, and a
+  grader, which checks against and runs in the working directory, could not inspect them. The gate now reports
+  `unverifiable` ("the producer also changed files outside `<root>`: …", at most five paths named) on both the
+  deterministic and the grader path, where `<root>` is the git top-level the change set was observed in (for a deferred
+  `router_verify`, the one recorded at registration), so edits in sibling packages of one monorepo are not flagged. Any absolute changed path outside the repository, for example a
+  scratch file in the temp directory written by a write tool, mixed with repository edits, now makes the result
+  unverifiable; there is no temp-directory exemption (fail closed). A relative path that climbs out of the root
+  (`../x.ts`, resolved against the base) counts as outside. A change set that is entirely outside keeps its existing
+  message, and that all-outside safety net now also applies on the grader path (it used to run on the deterministic
+  path only).
+- **`verify`: the pre-existing-failure reference is now approximate (cause `external-link`) when a package in a linked
+  `node_modules` is a link to a directory outside the repository**, for example an npm `file:` dependency or
+  `npm link`, a yarn/pnpm `link:`/`portal:` package, or a workspace link. Previously the rerun loaded that directory's
+  live code, so a failure caused by a change there was also reproduced at the reference and excused as pre-existing.
+  An approximate reference never excuses a failure, so such a run is now unverifiable.
+- **`verify`: a package link to the repository root or to an ancestor of it is now an approximate reference too (cause
+  `root-link`).** The label is root-relative even when the linked `node_modules` itself lives outside the repository.
+  Only a real path whose parent directory is `node_modules` (or `node_modules/@scope`) counts as a package store and is
+  exempt from `external-link`; dot-entries such as `node_modules/.cache` are ignored. Residual limits: nested links
+  (`node_modules/<pkg>/node_modules/<dep>`, `.pnpm/*/node_modules/<dep>` for a transitive `link:`) and yarn PnP
+  `portal:`/`link:` are not detected. Cost: in a worktree whose `node_modules` is a junction to another checkout, every
+  package link into that checkout is an `external-link`, so failing tests there are unverifiable.
+- **A branch switch of the verified working tree now makes the result unverifiable instead of passing on the other
+  branch.** Previously the diff between the two heads became the change set, so the checks verified another branch.
+  The dispatch reads a cheap head state (top-level, HEAD, branch name and the reflog entry count; one
+  `git rev-parse` and one `git rev-list --walk-reflogs --count HEAD`), kept even when the full snapshot is contaminated
+  or unavailable, and the gate reads it again. The gate reports `unverifiable` ("the working tree `<root>` switched
+  from `<A>` to `<B>` during the dispatch; the checks would verify another branch") for another branch name, and
+  "moved or was rewritten … (reflog: "<detail>")" for a same-branch history rewrite: a reflog that shrank, a HEAD
+  that moved without a reflog entry, a reflog window that does not start at the dispatch head and end at the current
+  head, or a reflog entry that moved HEAD for any reason other than a commit (including amend, initial and merge),
+  `merge`, `cherry-pick`, `revert`, `am` or `pull` without rebase (so checkout, reset, rebase, `pull --rebase` and an
+  unnamed `update-ref` count). Entries that left HEAD where it was (`git stash`, an unstaging `git reset`, a checkout
+  of the current branch, `merge --abort`, `cherry-pick --abort`) are ignored, and commits alone, also on a detached
+  HEAD, are not a move. A reflog count of 0 (reflogs disabled) leaves the decision to the branch-name rule. A
+  relocated top-level is reported too. The same checks with "since
+  the producer returned" cover a checkout between the producer's return and `router_verify`. `router_verify` now reads
+  the head state itself and no longer depends on the full snapshot for this check. Detached to detached at another
+  commit counts as a switch (reported as "moved"), and so does a new branch created at the same commit (fail closed).
+  Nothing is compared when there was no repository, or HEAD was unborn, at dispatch start (a producer that runs
+  `git init` or makes the first commit). If the dispatch head read failed, the dispatch snapshot's head and branch
+  stand in; only when both are unknown does the gate refuse ("cannot confirm the branch of `<root>`"). The dispatch
+  head read gets the whole `baselineTimeoutMs` per git process. `router_verify` gives the retryable form of that
+  message, and reports the handle as not judged, only when the head state cannot be read at all. On a move the commit diff is not run, so no path from the
+  other branch enters the change set. A switch the deferred finish already detected is carried to the required gate.
+- **A pass on an empty change set is no longer reported as verified when the producer ran a tool whose writes the
+  router cannot observe** (`bash`, `router_run`, Code Mode `execute`, MCP and unknown tools). The result is
+  `unverifiable` with the caveat `no change was observed in <root> but the producer ran <tools>; a write those tools
+  made cannot be seen, so this is not a verified pass`, on the deterministic and the grader path, and at
+  `router_verify`. Read-only router tools (`router_git_*`, `router_request_authority`) and the context7 and Brave
+  documentation and search tools count as non-writing, matched by exact name; they also no longer discard an
+  in-flight change capture. The delegating tools `task`, `delegate` and `subagent` always count as writers (a nested
+  child's writes are not in the producer's lineage) but still do not contaminate captures. A writer is counted in the
+  before-hook once the guard allows the call, so a call that errors still counts. Tool names are matched
+  case-insensitively and sanitised in the caveat. Known limit: a user MCP server named `router`, `context7` or `brave`
+  that exposes those exact tool names would be treated as non-writing.
+- **Roles mode: a carried role attempt now inherits the lineage's branch check and its unobservable-writer tally.** A
+  carried attempt is a resume that re-checks an earlier attempt's acceptance block. A branch switch since the attempt
+  that introduced the block (`... since the attempt that introduced this acceptance; ...`), or a switch any earlier
+  attempt already found (stored in the lineage; an inherited reason is prefixed "in an earlier attempt of this
+  acceptance: "), now makes it unverifiable. A carried attempt whose tree cannot be read, while the introducing attempt
+  recorded a branch, is unverifiable too. A "cannot confirm" reason is not recorded as the lineage's switch, and a
+  switch the deferred finish saw is folded into the attempt before the lineage records it. Carried attempts compare
+  names and heads only. Previously only the current dispatch's own window was checked.
+- **OpenCode v2: a tier `subagent` call now passes the child session ID (from `result.output.sessionID`) to
+  verification**, so the child's edits and unobservable writers join the producer's lineage. Visible effects on
+  OpenCode v2 tier calls: a child's shell writes now count as unobservable writers; a child's edits reach the change
+  set; `VERIFY:deferred` tier calls now really defer and return a `vrf_` handle; and the trivial-dispatch skip,
+  outcome ingestion and false-refusal detection now run for tier children.
+- **These verification fixes also change verdicts on OpenCode v1.** v1 shares the verification engine, and the v1
+  freeze allows integrity fixes; the changes only make verdicts stricter (a pass can become `unverifiable`, never the
+  reverse).
 
 ## [2.7.0] - 2026-10-10
 

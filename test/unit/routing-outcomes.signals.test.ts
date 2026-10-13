@@ -22,6 +22,7 @@ import {
   SAME_TASK_LINE_SHARE,
   SIGNAL_MASS_CAPS,
   SIGNAL_WEIGHTS,
+  acceptanceScriptsOf,
   detectRedispatch,
   graderSignal,
   isSignalObservation,
@@ -44,6 +45,7 @@ import {
   type RunRecord,
   type SignalObservation,
 } from "../../src/routing/outcomes/signals";
+import type { Check, DoD } from "../../src/verify/dod";
 import { renderMarkdown, summarize, summarizeRoles } from "../../src/routing/outcomes/stats";
 import { createOutcomeStore } from "../../src/routing/outcomes/store";
 import { parseLogLine } from "../../src/routing/outcomes/persist";
@@ -348,6 +350,48 @@ const PROMPT_B = sevenSection(
 function d(id: string, prompt: string, tier: string | null, at: number, over: Partial<DispatchText> = {}): DispatchText {
   return { decisionID: id, parentSessionID: "p1", childSessionID: `c-${id}`, class: "implement", prompt, tier, at, budgetExhausted: false, authorityRequested: false, ...over };
 }
+
+describe("acceptanceScriptsOf", () => {
+  const dodOf = (checks: Check[], kind: DoD["kind"] = "deterministic"): DoD => ({
+    kind,
+    checks,
+    criteria: [],
+    deliverable: null,
+    source: "explicit",
+  });
+  const run = (command: string, extra: Partial<Check> = {}): Check => ({ kind: "testsPass", command, ...extra });
+
+  it("recognises the npm script forms", () => {
+    expect(acceptanceScriptsOf(dodOf([run("npm test")]))).toEqual(["test"]);
+    expect(acceptanceScriptsOf(dodOf([run("npm t")]))).toEqual(["test"]);
+    expect(acceptanceScriptsOf(dodOf([run("npm.cmd test")]))).toEqual(["test"]);
+    expect(acceptanceScriptsOf(dodOf([run("  npm test  ")]))).toEqual(["test"]);
+    expect(acceptanceScriptsOf(dodOf([run("npm run typecheck")]))).toEqual(["typecheck"]);
+    expect(acceptanceScriptsOf(dodOf([run("npm run-script lint:fix")]))).toEqual(["lint:fix"]);
+    expect(acceptanceScriptsOf(dodOf([run("npm.cmd run build")]))).toEqual(["build"]);
+  });
+
+  it("keeps the order of several checks and skips non-npm commands", () => {
+    expect(acceptanceScriptsOf(dodOf([run("npm run typecheck"), run("node build.js"), run("npm test")]))).toEqual(["typecheck", "test"]);
+    expect(acceptanceScriptsOf(dodOf([run("npm test -- foo"), run("npm run a b"), run("pnpm test")]))).toEqual([]);
+    expect(acceptanceScriptsOf(dodOf([{ kind: "fileExists", path: "a.txt" }]))).toEqual([]);
+  });
+
+  it("gives nothing for a DoD that is not deterministic", () => {
+    expect(acceptanceScriptsOf(dodOf([run("npm test")], "checker"))).toEqual([]);
+    expect(acceptanceScriptsOf(dodOf([], "none"))).toEqual([]);
+  });
+
+  it("P2c.2: any check with its own cwd gives no run signal at all", () => {
+    expect(acceptanceScriptsOf(dodOf([run("npm test", { cwd: "../other" })]))).toEqual([]);
+    expect(acceptanceScriptsOf(dodOf([run("npm test"), run("npm run build", { cwd: "pkg" })]))).toEqual([]);
+    expect(acceptanceScriptsOf(dodOf([run("npm test", { cwd: "." }), run("npm run build")]))).toEqual([]);
+  });
+
+  it("a check with only scope= keeps today's result", () => {
+    expect(acceptanceScriptsOf(dodOf([run("npm test", { scope: "src/a" }), run("npm run build")]))).toEqual(["test", "build"]);
+  });
+});
 
 describe("taskSection / sharedLines / taskSimilarity", () => {
   it("extracts the TASK section only", () => {

@@ -9,7 +9,7 @@ import { join, posix, win32 } from "node:path";
 import { permissionMatches } from "../../router/read-only";
 
 /** A win32 8.3 short-name segment (`PROGRA~1`, `MARQUI~1.TXT`): refused, never expanded (S11, P-11: fail closed). */
-const SHORT_NAME_SEGMENT = /(?:^|[\\/])[^\\/~]{1,8}~\d+(?:\.[^\\/.]{0,3})?(?=[\\/]|$)/;
+export const SHORT_NAME_SEGMENT = /(?:^|[\\/])[^\\/~]{1,8}~\d+(?:\.[^\\/.]{0,3})?(?=[\\/]|$)/;
 
 /**
  * The canonical long form of a path a role session names (T2.3.1). The RAW path (a relative one joined to `base` as text) goes to
@@ -109,6 +109,14 @@ export interface VerificationScope {
   readonly outside: boolean;
   /** The refused cwd as written (the gate's `Delegation.refusedCwd`); only when `outside`. */
   readonly refused?: string;
+}
+
+/**
+ * Cross-repo P2.2 (SD2): the root the change capture of a dispatch observes — a role dispatch's work root W (even when the
+ * block's `cwd:` names a subdirectory of it, or was refused), else (a tier dispatch) the verification cwd, as before.
+ */
+export function captureRootOf(scope: VerificationScope): string | undefined {
+  return scope.workRoot ?? scope.cwd;
 }
 
 /**

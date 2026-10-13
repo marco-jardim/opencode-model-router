@@ -1,0 +1,291 @@
+# Cross-repo work — session handover
+
+Read this first in a new session. The design is `docs/design/cross-repo.md`, and the issue is
+[#107](https://github.com/marco-jardim/opencode-model-router/issues/107). Each phase has a status comment on the issue.
+
+## Environment
+
+- **Worktree:** `D:\git\opencode-model-router-cross-repo`, branch `feat/cross-repo`. All work happens here; nothing is pushed.
+- **Base:** `71dcfab` on `master` (the design commit). Every commit after it on the branch belongs to this work.
+- **Do not touch:**
+  - `D:\git\opencode-model-router`, the main tree on `master`. The owner works there in another session (`docs/plans/critical-path-execution-plan.md` is theirs).
+  - `D:\git\omr-cpx-*` and `%LOCALAPPDATA%\omr-cpx\`, which belong to the owner's other implementation.
+- **Dogfood instance:** this branch's plugin runs in a standalone OpenCode with its own config dir. `opencode.json` there points its plugin entry at the worktree.
+  ```powershell
+  $env:OPENCODE_CONFIG_DIR = "$env:LOCALAPPDATA\omr-cross-repo\opencode-config"; opencode --standalone -s <session> D:\git\opencode-model-router-cross-repo
+  ```
+  The plugin entry is `src/index.ts`, and on 2026-10-11 changes to `src/` took effect in the running instance without a restart (Q9 and Q10 worked live right after their commit). A half-applied edit therefore breaks live dispatches. Ask the owner for a restart only when a change is not picked up.
+- **Router overrides:** `~\.config\opencode\opencode-model-router.overrides.jsonc` is read from a fixed path, shared by every instance. It now has `"repoParents": ["D:/git"]` (added for the Phase 1 dogfood) and the owner's existing `workRoots`.
+- **Platform:** win32, pwsh 7, git 2.51.0.windows.1, OpenCode v2.0.26. No OpenCode 1.x is on PATH, so `smoke:v1` cannot run.
+
+## Status
+
+| Phase | State |
+|---|---|
+| P0: integrity fixes in the shared verification engine (both hosts) | Done. QA'd twice. Live check: the unobservable-writers caveat appeared on a real dispatch. |
+| P1: v2 roles cross-repo (P1.1–P1.10) | Done. QA'd twice. Docs updated. Live dogfood done (see "Phase 1 live dogfood"). |
+| P2 lot 1: P2a–P2d + P2g (plan `docs/design/cross-repo-phase2-plan.md`) | Done. QA'd twice (round 1: 4 major + 9 minor fixed; round 2: 3 major fixed, minors recorded in design §9). Docs and CHANGELOG updated. Live dogfood done (see "Phase 2 live dogfood"); findings F-D1, F-D2 resolved (F-D1 by Q9/D15, F-D2 by Q10/D16, 2026-10-11). |
+| P2 lot 2: P2e (deferred P), owner decision OD4 | Implemented (`3037ab8`..`722c5db`, docs after): a role dispatch with a perimeter or per-check keys defers; P frozen at return; S11 caveat (OD-P2e-1 = UNVERIFIED); F13 v2-only (OD-P2e-2). QA'd twice (round 1: 1 major + 5 minor fixed; round 2: 1 major fixed, minors in design §9). Live dogfood done (see "Progress after resuming"). |
+| P3 lot 1: item (b), `router_git_*` `root` (plan `docs/design/cross-repo-phase3-plan.md`) | Done (`3b6aec8`..`bc9930c`). QA'd twice (round 1: 1 major + 5 minor + nits fixed; round 2: 1 major (M1, read set vs repoExclude) fixed in `219e5c5`, minors in design §9). Docs and CHANGELOG updated. Live dogfood done (see "Phase 3 lot 1 live dogfood"). |
+| P3 lot 2: item (a), `vitest related` across a link | Done (`830d5db`..`702c858`). QA'd twice (round 1: 1 blocking + 1 critical + 4 major fixed, owner decisions D23 amended and D27; round 2: 2 major fixed, minors in design §9). Docs and CHANGELOG updated. Live dogfood done (see "Phase 3 lot 2 live dogfood"). |
+| P3 lot 3: item (c), edges outside `node_modules` | Done (`234c5e2`..`987529e`). QA'd twice (round 1: 1 critical ReDoS + 5 major + minors fixed in `d151fbd`, `18a15a0`, `76dd864`; round 2: 3 major fixed in `3de411e`, `06c1502`, minors and nits in design §9). Docs and CHANGELOG (`340265c`), design (`987529e`). Live dogfood done (see "Phase 3 lot 3 live dogfood"). **Next:** the #107 status comment (ask the owner first), then Phase 4. |
+| P4: first-use approval, lean form (plan `docs/design/cross-repo-phase4-plan.md`, D28, D29) | Done (`be30565`..HEAD). Spikes T1–T5 run live (design §3); the channel became a human-typed `/router approve|repos|revoke` (D29) instead of a permission ask. One heavy QA round (1 major + 5 minor fixed in `f722af5`) and a re-check (no major; minors in design §9). Live dogfood done (see "Phase 4 live dogfood"), T6 included: a reload applies new `external_directory` patterns to children created afterwards, no restart. **Next:** the #107 status comment (ask the owner), then push/PR (owner decision). |
+
+Last checks (HEAD after the round 2 fixes):
+- `npm run typecheck`: clean.
+- Goldens: all `test/golden/` pass; only the configured roles-protocol golden changed (OD5) and the new `dispatch-header.golden.test.ts` was added.
+- Full `npx vitest run`: 50 failures in 15 files, every time it ran next to a reviewer's own test runs. Every failing file passes when run alone or in small groups, except the known `test/unit/exec.test.ts` timing tests. New in the load-sensitive list: `test/integration/unattributed-writers.test.ts`, `test/integration/branch-switch.test.ts`, `test/integration/branch-switch-deferred.test.ts`, `test/unit/tree-kill.test.ts`, `test/integration/perimeter.test.ts`, `test/integration/roles-authority.test.ts`, `test/integration/failover-compose.test.ts`, `test/integration/layer2-wiring.test.ts`, `test/integration/modeB-e2e.test.ts` (possibly related to round 2 m8, the extra pin snapshots). A clean full run with nothing else running has not been done yet.
+
+## Start here (next session: Phase 3)
+
+Phase 2 is closed: code, docs, two QA rounds per lot, live dogfood, clean full-suite run, status comment posted on #107 (https://github.com/marco-jardim/opencode-model-router/issues/107#issuecomment-6123968003). Q7 decided: keep the catch-all `deny` (design §10). No owner decision is open.
+
+**Restart:** not needed. The dogfood instance loads the plugin from this worktree's `src/index.ts`, and `src/` changes applied live during this session. Open a new session in the same instance. After any server restart the working set (in memory) is empty until a dispatch binds a repository again.
+
+**Next: Phase 3** (design §7 "Phase 3", `docs/design/cross-repo.md` ~:478): (a) the `vitest related` cross-link spike; (b) a read-only `root` argument for `router_git_*` that names an admitted repository; (c) discovery of dependency edges that do not go through `node_modules`, with no per-repository configuration. The design gives no file-level plan for it: start with a pre-flight (architect) that writes a plan like `docs/design/cross-repo-phase2-plan.md`, ask the owner the real decisions, then implement test-first, QA twice, dogfood live.
+
+**Working rules that bit this session:** delegates hit a read guard after 3 consecutive reads (tell them to alternate read and edit, and paste file:line ranges); "Agent not found" on parallel implementer dispatches usually means the child still runs — check `git status`/`git diff --stat` and resume the same session; every edit must leave `src/` loadable (the live router loads it); run `router_run` calls one at a time; a full suite run only with nothing else running; the gate's `testsPass` cannot scope this repo ("attribution-unavailable"), so verify every change in the shell (typecheck plus the touched test files).
+
+## Phase 4 live dogfood (2026-10-12)
+
+Run live at HEAD `3a85e18`, no restart. Scratch repository `D:\omr-p4-ext` (outside `D:\git`, origin `https://u:tok@example.invalid/x.git`); a junction `D:\omr-p4-link`; a temporary `repoExclude` in the shared overrides (restored). All removed afterwards, including the store file.
+
+| # | Step | Result |
+|---|---|---|
+| 1 | Role dispatch `root=D:\omr-p4-ext` | Pass. Refused; note from git: `origin https://example.invalid/x.git, branch main at 2554b67 … ask the user to run /router approve D:\omr-p4-ext`. |
+| 2 | A child whose prompt is `/router approve D:\omr-p4-ext` | Pass. No approval; no store file. |
+| 3 | Owner typed `/router approve d:\omr-p4-ext` | Pass. Canonical path, origin without credentials, `main @ 2554b67640df`, 1 root commit, expiry 14 days / cap 2027-01-11; `Role agents reloaded`. |
+| 4 | **T6**: implementer `root=D:\omr-p4-ext` reads, writes notes.txt, `router_git_status` | Pass, `✓ verified`. A reload's new `external_directory` pattern applies to children created afterwards: no restart (`APPROVAL_RELOAD_APPLIES = true`). |
+| 8 | `root=D:\omr-p4-link` (junction to the approved repository) | Refused (fails closed), but without the note naming the approved path (SD-P4-5); recorded in design §9. |
+| 7 | Folder swapped for another repository at the same path | Pass. `… has other root commits than when it was approved …`. |
+| 6 | Store hand-edited to 15 days ago | Pass. Treated as unapproved, the approval note again. Resume of the step 4 child: `resume refused: approval for D:\omr-p4-ext was revoked or expired` (QA m2). |
+| 9 | `repoExclude: ["D:/omr-p4-ext"]` + `/router-reload` | Pass. `/router repos` marks it `[excluded by routing.repoExclude (D:/omr-p4-ext)]`; dispatch refused `is excluded by routing.repoExclude`. |
+| 10 | `/router approve` on `C:\`, the profile, `~\.config\opencode` | Pass. `is a drive or filesystem root`, `is the user profile`, `is the opencode config directory`; nothing stored. |
+| 11 | `/router revoke D:\omr-p4-ext` | Pass. Revoked, reloaded; a new dispatch is refused with the approval note; the store is empty. |
+
+Full `npx vitest run` with nothing else running (HEAD `3a85e18`): 19 failures in 12 files. Run alone, all pass except the 2 known `exec.test.ts` timing tests and `test/unit/roles.dispatch-path.test.ts` (2 tests expected `admit` with two arguments; updated for QA M1's session-repository argument, 37/37).
+
+## Phase 3 lot 3 live dogfood (2026-10-12)
+
+Run live at HEAD `987529e`, no restart. Scratch app `D:\git\omr-xr-dogfood-app` (plan "Live dogfood (lot 3)" setup; no `node_modules`), plus a scratch repository `D:\git\omr-xr-dogfood-d7` for D7b. Both removed afterwards; the lib and this worktree are clean. `D:\git\mcp-reader` was only observed (its 8 dirty files unchanged).
+
+| # | Dispatch | Result |
+|---|---|---|
+| D1 | `implementer repo=omr-xr-dogfood-app`, notes.txt, `fileExists`, `VERIFY:required` | Pass. `✓ verified`, `also observed: omr-xr-dogfood-lib (main @ 2d133c4)` through the `file:`/`references` edges (no link). Timing vs control (F9) not measured. |
+| D2 | Same repo, `router_run test` (the plan's `touch-lib` is not on the run allowlist; renamed `test`), writes `touched.txt` into the lib | Pass. UNVERIFIED with the I4 reason naming the lib. |
+| D3 | `repo=omr-xr-dogfood-lib`, lib.txt, `fileExists` | Pass. `omr-xr-dogfood-app at D:\git\omr-xr-dogfood-app links this work root (package.json dependencies (file:)) and no check ran there; …`. |
+| D3b | Same + `check: run command="node --version" expect=v cwd="<app>"` | Pass. `✓ verified`, `also observed: omr-xr-dogfood-app (main @ b6a5b09)`. |
+| D4a | This worktree, untracked `tsconfig.dogfood.json` → the lib, deferred, `testsPass … scope=full` | Pass. Handle; `router_verify` → `✓ verified`, lib observed, no S11. |
+| D4b | Same, `s11.txt` added to the lib before `router_verify` | Pass. UNVERIFIED: `the linked repository omr-xr-dogfood-lib … changed since the producer returned`. |
+| D4c | tsconfig deleted, deferred dispatch, recreated after return | `✓ verified` (the plan's alternative): the lib was already a working-set root of P (D3 bound it) and unchanged, so the re-added edge is covered by its observation. |
+| D5 | App: edges dropped; `.venv\pyvenv.cfg` + `.venv\Lib\site-packages\_omr_xr_lib.pth` → `D:\git\mcp-reader` (outside the working set, so it discriminates) | Pass. `also observed: …, mcp-reader (main @ fe7d775)` through the Python edge; `.venv` removed and repeated: no mcp-reader. |
+| D6 | App tsconfig `references` → `C:/omr-xr-not-admitted` | Pass. `also observed: …, omr-xr-not-admitted (not admitted)`. |
+| D7 | Deferred dispatch whose producer creates `tsconfig.dogfood.json` → `../mcp-reader` | Pass. `✓ verified`, no S11 (P3c.6, D26: frozen at return). |
+| D7b | Control: same → `../omr-xr-dogfood-d7` (new scratch repository), `drift.txt` added there before `router_verify` | Pass. UNVERIFIED S11 `the linked repository omr-xr-dogfood-d7 … changed since the producer returned`: frozen at return, then observed again. |
+
+Observation: a dependency frozen at return (D7, D7b) is not listed in the verified-scope line; the line shows the dispatch-time observation only.
+
+Full `npx vitest run` with nothing else running (HEAD `987529e`): 10 failures in 5 files (`depth-guard-wiring`, `modeA-e2e`, `modeB-e2e`, `routing-ladder-resume`, `exec`); each passes alone except the 2 known `exec.test.ts` timing tests. `test/golden` 95/95.
+
+## Phase 3 lot 2 live dogfood (2026-10-12)
+
+Run live at HEAD `702c858`, no restart. Scratch consumer `D:\git\omr-xr-dogfood-app` (git, `"type":"module"`, two tests; `node_modules\vitest` a junction to this worktree's vitest plus `.bin` shims, `node_modules\omr-xr-dogfood-lib` a junction to the lib); untracked `math.mjs` and `unused.mjs` in the lib. All removed afterwards (junctions with `cmd /c rmdir`); the lib is clean.
+
+| # | Dispatch (`implementer repo=omr-xr-dogfood-lib`, `VERIFY:required`) | Result |
+|---|---|---|
+| 1 | Comment added to `math.mjs`; `fileExists` + `testsPass command="npx vitest run" cwd="<app>" scope=affected` | Pass. `✓ verified: deterministic`. |
+| 2 | `math.mjs` broken (`a - b`) | Pass. UNVERIFIED, never FAIL: `no reference … observed failures: test/uses-lib.test.js > adds through the link` (only the importing test ran). |
+| 3 | `unused.mjs` changed (no test imports it) | Pass. UNVERIFIED: `vitest selected no test in D:\git\omr-xr-dogfood-app for the change in D:\git\omr-xr-dogfood-lib; the link may not be followed (…): use scope=full`. |
+| 4 | Same, `testsPass` without `scope=` | Pass. The unchanged refusal: `check 2 (testsPass) runs in another repository (…) and must use scope=full: …`. |
+
+Setup note: the consumer needs `node_modules\.bin\vitest(.cmd)` shims for `npx vitest`; a junction to the vitest package alone is not enough.
+
+## Phase 3 lot 1 live dogfood (2026-10-12)
+
+Run live in the dogfood instance at HEAD `bc9930c`, no restart (the `root` argument was registered without one). Scratch: a second worktree `D:\git\omr-xr-dogfood-lib-p3b` (branch `dogfood-p3b`), a repository `%LOCALAPPDATA%\omr-cross-repo\p3b-outside` and a junction `D:\git\omr-xr-p3b-junction` to it; all removed afterwards.
+
+| # | Call | Result |
+|---|---|---|
+| 0 | Before 3b.3, `router_git_log {root, limit}` | The host stripped the unknown key and ran in this worktree (F3 settled: `root` must be a declared key). |
+| 1 | Explorer, `root:"D:\\git\\omr-xr-dogfood-lib"` (log) and `root:"omr-xr-dogfood-lib"` (status) | Pass. Provenance first line, the lib's `2d133c4`, empty status. The lib's `.git\index` mtime unchanged. |
+| 2 | `root:"mcp-reader"` | Pass. Provenance `mcp-reader (main) at D:\git\mcp-reader`, then its status. |
+| 3 | `root` = this worktree | Pass. Identical to no `root`, no provenance line. |
+| 4 | Name with two worktrees; the worktree directory name | Pass. `root=omr-xr-dogfood-lib has 2 worktrees: … → main; … → dogfood-p3b; nothing ran. Pass root as one of these absolute paths`; `omr-xr-dogfood-lib-p3b` → provenance `(dogfood-p3b)`. |
+| 5 | `C:\Windows`, `D:\git`, `..\mcp-reader`, `\\localhost\c$\x`, `…\.git`, `D:\git\mcp-reader\docs` | Pass. Steps 3, 3, 2, 2, 2, 6 texts (the last: `pass root=D:\git\mcp-reader and path=docs`). |
+| 6 | The junction leading out of the parents | Pass. `resolves to C:\Users\…\p3b-outside, outside this dispatch's read set; nothing ran`. |
+| 7 | The orchestrator, and an explicit `fast` tier | Pass. `refused: root is only for role agents (roles mode); …`. |
+| 8 | Implementer, `VERIFY:required`, a probe file plus `router_git_status {root}` | Pass. `✓ verified: deterministic`, no I4/I5 caveat. |
+
+Observation: in the delegate results relayed to the orchestrator, the provenance line reads `(router: read from …]`; the refusals keep `[router_git]`. The router code has no such rewrite and the unit tests pin `[router: read from`, so it is a substitution in the host's prompt pipeline (like the `Claude`/`opencode` path substitution noted in the Phase 1 dogfood).
+
+## Progress after resuming (2026-10-12)
+
+- Fan-out A, B, C, D done: the WIP was completed (`29abefc`), user docs corrected (`d8bd374`), design follow-ups recorded (`1c44f2f`), P2e QA round 2 run. Its one major (the deferred link re-check read the git top level instead of the W the dispatch read; W in a repository subfolder reported every link as changed) is fixed in `7dbb317`; its minors are recorded in design §9 (`99b31a1`).
+- Checks at `7dbb317`: typecheck clean; `deferred-perimeter` 26/26, `perimeter` 54/54, `deferred-verification` 72/72, `pending` 90/90, `docs-drift` 90/90.
+- Full `npx vitest run` with nothing else running (HEAD `5b14d31`): **2 failures in 2 files** (`test/integration/routing-ladder-resume.test.ts`, 28/28 alone; `test/unit/exec.test.ts`, the known timing tests). `test/golden`: 9 files, 92/92.
+- **P2e live dogfood (2026-10-12)**, junction `node_modules\omr-xr-dogfood-lib` (removed afterwards; scratch repository clean):
+  1. S11 control, deferred role dispatch in this worktree with `testsPass … scope=full`: handle; `router_verify` → `✓ verified`, `verified scope: opencode-model-router-cross-repo (feat/cross-repo @ 5b14d31); also observed: omr-xr-dogfood-lib (main @ 2d133c4)`.
+  2. S11: same, then a file added to the lib before `router_verify` → UNVERIFIED `the linked repository omr-xr-dogfood-lib at D:\git\omr-xr-dogfood-lib changed since the producer returned; the checks ran against its new state`.
+  3. Deferred consumer check (`repo=omr-xr-dogfood-lib`, `testsPass … cwd="<this worktree>" scope=full`): handle; `router_verify` → pass. A DoD without `testsPass` is verified at once (only testsPass DoDs defer).
+  4. I4 at return (`router_run` writing into the lib through the junction, `VERIFY:deferred`): no handle, the I4 UNVERIFIED reason.
+  5. Refused placement with `VERIFY:deferred` (`cwd="C:\Windows"`): no handle, `check 2 (testsPass) cwd=C:\Windows is outside the work root … nothing ran`.
+  - Not shown live: the D6 consumer caveat at `router_verify` (the lib has no test runner, so a deferrable `testsPass` there cannot pass; covered by `deferred-perimeter.test.ts`). After an OpenCode server restart the working set is empty (in memory), so a lib dispatch has no consumer until a dispatch binds the consumer again.
+- Remaining: the P2 status comment on #107 (owner). Still open: Q7. Phase 3/4 not started. (Superseded: Q7 was decided 2026-10-12, keep the catch-all `deny`; see design §10.)
+- The OpenCode server restarted several times during this session; a dispatch interrupted by a restart leaves its edits in the tree. Check `git status` and `git diff --stat` before re-dispatching.
+
+## Resume here (2026-10-11, session paused by the owner) — superseded by the section above
+
+HEAD was a **WIP commit** (`fix(verify): [WIP] P2e QA round 1 fixes …`): the P2e QA round 1 fixes are half done. `src/` loads and typechecks; the tests do not all pass yet. Finish it, then squash or follow it with a fixing commit (local branch, nothing pushed).
+
+State of the WIP (verified at save time):
+- `npm run typecheck`: one error, in a test file only: `test/integration/deferred-verification.test.ts(72,31)`: `FullScopePlan | StaticScoping` is not assignable to `StaticScoping` (a test mock of `planStaticScoping` must accept the new full-scope plan type).
+- `test/integration/deferred-perimeter.test.ts` 23/23 and `test/integration/deferred-verification.test.ts` 72/72 pass.
+- Failing: `test/integration/perimeter.test.ts` › "deferred P (P2e) › P2e QA-1 #1: a working-set consumer past the cap is still discovered at router_verify (D6)"; `test/unit/risk.test.ts` › "assessRisk › reasons are stable strings" (a new risk reason was added for full scope; the stable-strings list must be updated on purpose).
+- No junction or probe file is left (`node_modules\omr-xr-dogfood-lib` absent; the scratch repository is clean).
+
+P2e QA round 1 findings (reviewer, `src/verify/wiring.ts` unless noted). Fix all; it is round 1:
+1. MAJOR: past `PERIMETER_MAX`, `perimeterAtReturn` skips fixed seeds before collecting working-set roots and links, so a capped consumer is never discovered at router_verify and a capped link target neither sets `linkUnobserved` nor enters `frozen.links`. Fix: mirror `perimeterAtGate` (collect working-set roots before the fixed skip; a fixed "unobserved" link seed sets `linkUnobserved`). *(WIP: code started; its test fails.)*
+2. minor: S11 does not notice a link in W retargeted after return; re-run `linkedTargets(W)` (fs only) at router_verify; a changed real path or a new outside link → S11 "changed".
+3. minor: `prepareClaim` replaces the dispatch's pin admission set (with nested targets) by the frozen links only → nested pins unusable; set it only when `!pinAdmissions.has(pins)`.
+4. minor (I12): `observeLink` runs git before re-checking `realpath(link.at)` against the frozen root and `admit`; check first, else "unobserved" without git.
+5. minor: an "unobserved" link drift and a non-ENOENT `realpath` error in `placementDriftOf` give a final UNVERIFIED; make them retryable.
+6. minor (docs): F13 is described wrongly (`CHANGELOG.md` ~:96, `VERIFICATION.md` ~:480, `CONFIG_REFERENCE.md` ~:554-557, ~:586-588): before, a no-change dispatch with `testScope:"full"` ran the full suite synchronously; now on v2 it defers; config `testScope` does not affect `lintClean`.
+7. nit: all-full-scope DoDs got "scoping impossible (S6)"; a neutral full-scope reason (WIP: added in `src/verify/risk.ts`).
+8. nit (docs): the `cross-repo` reason/details are never shown to anyone (only `branch-switched` is read, `index.ts` ~:2585); a refused placement or v2 tier `cwd=` never reaches `finishDeferred`. Reword the docs (VERIFICATION ~:468-471, CONFIG_REFERENCE ~:560-564, ROLES, design ~:500) or surface the reason.
+9. nit: a placement whose directory did not exist at return says "since the producer returned"; document.
+10. nit: discovery not shared across claimed entries; link snapshots digest every dirty file; a certain I3 refusal still defers; `branch-switched` early return leaves perimeter snapshots running. Record in design §9.
+
+Fan-out to resume (disjoint files; dispatch A first, then B and C in parallel, then D):
+- **A, implementer (sessionID `ses_ed50bd3fcffer1kfpPvJZ14k64` if it still exists, else fresh):** finish findings 1–5 and 7 in `src/verify/wiring.ts`, `src/verify/risk.ts`, `test/integration/{perimeter,deferred-perimeter,deferred-verification}.test.ts`, `test/unit/risk.test.ts`; fix the typecheck error and the two failing tests; then commit (follow-up to the WIP, `Refs #107`). Tell it: at most 3 reads in a row before an edit; every edit must leave `src/` loadable; router_run one call at a time.
+- **B, implementer:** docs for findings 6, 8, 9, plus the limits of finding 2 (nested links, ignored files, skip-worktree not covered by S11) in `docs/VERIFICATION.md`, `docs/CONFIG_REFERENCE.md`, `docs/ROLES.md`, `CHANGELOG.md`, `test/unit/docs-drift.test.ts`. Work file by file (read one, edit it).
+- **C, implementer:** design `docs/design/cross-repo.md` §9 "Known follow-ups (P2e QA round 1)" for findings 9 and 10; fix the design's §7 notes if A changes behaviour.
+- **D, reviewer (heavy):** P2e QA round 2 on the fix commits (after round 2 fix only blocking/critical/major). Do not run the full suite next to it.
+- Then: full `npx vitest run` with nothing else running; run each failing file alone; `test/golden`.
+- Then: live P2e dogfood (script in `docs/design/cross-repo-phase2-plan.md` pre-flight section; the junction is created with `New-Item -ItemType Junction`, removed with `cmd /c rmdir`). `src/` changes apply live, no restart needed.
+- Then: update this handover, and the P2 status comment on #107.
+
+Owner decisions taken this session: OD1–OD6 (Phase 2 plan), Q8 (D14), Q9 (D15), Q10 (D16), D17 (QA of D15), OD-P2e-1 (D18), OD-P2e-2 (D19). Still open: Q7. (Superseded: Q7 was decided 2026-10-12, keep the catch-all `deny`; see design §10.)
+
+## Next steps
+
+1. ~~Phase 2 live dogfood~~: done (see "Phase 2 live dogfood").
+2. ~~Owner decisions Q8, Q9, Q10~~: decided 2026-10-11 (design D14–D16) and implemented in `a594039` and `7c0301b`: the role header only when relevant; a refused declared target refuses the dispatch; `repo=` also matches a worktree directory name. Both Q9 and Q10 were confirmed live (`[router] role dispatch @explorer refused: repo=no-such-repo-xyz matches no repository below routing.repoParents (…): no work root.`).
+   QA of Q8–Q10: round 1 (2 major, 4 minor, nits) fixed in `4479872`, `13eec96`, `f5fa222` (D17: an invalid `root=` and a resume that changes its target are refused). Round 2 major fixed in `34e2db1` (a resume repeating its target resolves and is accepted); minors recorded in design §9.
+   Full `npx vitest run` with nothing else running (HEAD `f5fa222`): 17 failures in 10 files; every file except `test/unit/exec.test.ts` passes when run alone (`depth-guard-wiring`, `routing-ladder-resume`, `modeB-e2e`, `modeA-e2e`, `layer2-wiring`, `failover-compose`, `roles.runtime`, `perimeter`, `roles-authority`). The P1 baseline was 9 failures in 6 files, so load sensitivity grew; not compared against a base checkout.
+3. **Open owner decision Q7:** role agents are registered from a catch-all `*: deny`, so D13 cannot open worktrees outside the parents. The fix would turn the generated catch-all into `ask`; the risk is a background child waiting on a prompt. Do not change this without the owner. (Superseded: decided 2026-10-12, keep the catch-all `deny`; a worktree outside the parents is reached by adding its parent to `routing.repoParents`. See design §10.)
+4. **Phase 2 lot 2 (P2e)**, plan `docs/design/cross-repo-phase2-plan.md`: store P and placements in the pending registration, observe P in the deferred finish, `prepareClaim` sets `prepared.perimeter`, S11 drift caveat, lift the interim rule; fix `noChangeGateSpawnsNothing` with `testScope:"full"` (F13). Own heavy QA after it.
+5. **Accepted minors** from the P0, P1 and P2 QA rounds are listed in design §9 ("Known follow-ups"). Revisit them only if they become relevant.
+
+## Phase 2 live dogfood script
+
+Run in the restarted dogfood instance, from an orchestrator session in this worktree.
+- Setup: `New-Item -ItemType Junction -Path D:\git\opencode-model-router-cross-repo\node_modules\omr-xr-dogfood-lib -Target D:\git\omr-xr-dogfood-lib`. The scratch repository `D:\git\omr-xr-dogfood-lib` (branch `main`) must be clean.
+- Remove the junction with `cmd /c rmdir <path>`, never `Remove-Item -Recurse` (it follows the junction).
+- Dispatches (expected result in parentheses):
+  1. Any role in this worktree: the delegate's prompt starts with `[router] You are @<role>` and a `Working directory:` line naming this worktree, branch and head.
+  2. `implementer` `repo=omr-xr-dogfood-lib`, edit a file there, `check: fileExists`: UNVERIFIED by the consumer caveat naming this worktree (it links the lib), with the suggested check line.
+  3. Same, plus a `check: run command="node -e ..."` or `testsPass ... cwd="D:\git\opencode-model-router-cross-repo" scope=full`: ✓ verified, no caveat.
+  4. A consumer check that fails: UNVERIFIED, never FAIL.
+  5. A consumer `testsPass` without `scope=full`: unverifiable ("must use scope=full").
+  6. Only a consumer check, no check in the lib: unverifiable ("is not covered by any check root").
+  7. `cwd="C:\Windows"`: refused, nothing ran. `scope=everything`: refused.
+  8. `VERIFY:deferred` with per-check keys: verified at once, no handle.
+  9. Tier `medium` with a per-check `cwd=`: unverifiable, "honoured only in roles mode".
+  10. A role in this worktree with an untracked failing test and `testsPass ... scope=full`, lib unchanged: the reference has no `external-link` cause (pin exact); "no worse than before" only if `core.autocrlf` is false.
+
+## Phase 2 live dogfood (2026-10-11)
+
+Run in the restarted dogfood instance at HEAD `97fa7fb`..`eb9c78d`, `repoParents: ["D:/git"]`, `core.autocrlf=input`, with the junction `node_modules\omr-xr-dogfood-lib` → `D:\git\omr-xr-dogfood-lib` (removed afterwards with `cmd /c rmdir`; the scratch repository was cleaned).
+
+| # | Dispatch | Result |
+|---|---|---|
+| 1 | `explorer` `repo=opencode-model-router branch=feat/cross-repo` | Pass. The child's prompt starts with `[router] You are @explorer…`, `Working directory: D:\git\opencode-model-router-cross-repo (repository opencode-model-router, branch feat/cross-repo at eb9c78d)…`, `Repositories in this session: opencode-model-router (feat/cross-repo). You may read any repository below D:/git.`, then the separator; nonce last. |
+| 2 | `implementer` `repo=omr-xr-dogfood-lib`, `fileExists` only | Pass. UNVERIFIED: `opencode-model-router at D:\git\opencode-model-router-cross-repo links this work root (node_modules/omr-xr-dogfood-lib) and no check ran there; add a check such as: check: testsPass cwd="D:\git\opencode-model-router-cross-repo" scope=full`. |
+| 3 | Same + `check: run command="node .dogfood-consumer.cjs" expect=value=1 cwd="<this worktree>"` | Pass. `✓ verified`, `verified scope: omr-xr-dogfood-lib (main @ 2d133c4); also observed: opencode-model-router (feat/cross-repo @ eb9c78d)`. (`node -p` is refused by the allowlist; an unquoted `command=` stops at the first space.) |
+| 4 | A failing consumer check | Pass. UNVERIFIED, never FAIL: `a check in another repository (…) failed; … can be neither excused nor attributed: expected substring not found: "1"`. |
+| 5 | Consumer `testsPass` without `scope=full` | Pass. `check 2 (testsPass) runs in another repository (…) and must use scope=full: …`. |
+| 6 | Only a consumer check | Pass. `the change in D:\git\omr-xr-dogfood-lib\index.js is not covered by any check root (D:\git\opencode-model-router-cross-repo); nothing ran`. |
+| 7 | `cwd="C:\Windows"`; `scope=everything` | Pass. `check 2 (fileExists) cwd=C:\Windows is outside the work root D:\git\omr-xr-dogfood-lib and its read set; nothing ran`; `check 1 (fileExists) scope=everything is not affected or full; nothing ran`. |
+| 8 | `VERIFY:deferred` with per-check keys | Pass. Verified at once, no handle. |
+| 9 | Tier `medium` with a per-check `cwd=` | Pass. `check 2 (fileExists) cwd=D:\git\omr-xr-dogfood-lib: a per-check cwd= is honoured only in roles mode; nothing ran`. |
+| 10 | Role in this worktree, an untracked failing test that requires the lib, `testsPass command="npx vitest run <file>" scope=full`, lib untouched | Partial, as planned for autocrlf on: `the dispatch reference is approximate (checkout-conversion)`. The causes list every reason (`baseline.ts:163`), and `external-link` is absent, so the pinned link stayed exact. |
+
+Findings:
+- **F-D1 (medium, owner decision Q9).** A role dispatch whose declared `repo=`/`branch=`/`root=` is refused at admission runs anyway with no work root, and nobody is told: the note is stored on the routed decision (`dispatch.ts:1883`, `:1987`) and the decision row only. The child gets no header, keeps read access in the plugin's directory (`v2-hooks.ts:706` fallback), and its refusals call that fallback "this dispatch's work root". No write is possible (`policy.ts:184-189`), so it is a silent wrong-repository read, not a false pass. Reproduced with `repo=opencode-model-router-cross-repo` (the worktree directory, not the repository name). Options: refuse the dispatch with the note (preferred; flips `roles-dispatch.test.ts:817-830`, `:898` and ROLES.md:179, :268-269), or keep it running and add the note to the result notices and the child's header. (Superseded: resolved 2026-10-11 by Q9/D15, the dispatch is refused with the note; see design §10.)
+- **F-D2 (owner decision Q10).** `repo=` takes the repository name only. A delegate fix that also matched a linked worktree's directory name was reverted as a design change; a regression test for the correct form (`repo=<repository> branch=<branch>`, with the session in a linked worktree) was added (`eb9c78d`). (Superseded: resolved 2026-10-11 by Q10/D16, `repo=` also matches a linked worktree's directory name; see design §10.)
+
+## Phase 2 lot 1 session notes (2026-10-11)
+
+- **The live router loads this worktree's `src/`.** Every edit by a delegate must leave `src/` loadable. A half-applied edit once broke a dispatch with `captureRootOf is not defined`. Put this rule in every implementer dispatch.
+- **"Agent not found" on parallel implementer dispatches** usually means the child did start: its edits appear in the tree. Check `git status`, then resume the same `sessionID` with "continue and finish". Fresh dispatches of one at a time fail less.
+- **Delegates often skip "tests first"** under the read-budget guard. They say so in their reports; the tests exist and were reviewed.
+- **The gate's `testsPass` cannot scope this repo's changes** ("attribution-unavailable"), so every implementer result came back UNVERIFIED. Every change was verified in the shell: typecheck plus the touched test files.
+- **`subagent` no longer contaminates captures or pins** (round 2 M3), like `task` and `delegate`.
+
+## Phase 1 live dogfood (2026-10-10)
+
+Run in the dogfood instance at HEAD `7ecbfda`, with `repoParents: ["D:/git"]`.
+
+| Check | Dispatch | Result |
+|---|---|---|
+| Work root and cross-repo read | `explorer`, `[route class=recon repo=mcp-reader]` | Pass. The work root resolved to `D:\git\mcp-reader` (`router_git_log` ran there). Reading this worktree returned `[router: read from opencode-model-router-cross-repo (feat/cross-repo) at D:\git\opencode-model-router-cross-repo — read-only in this dispatch]`. |
+| Located refusal | `implementer`, `repo=mcp-reader needs=edit`, writes a new file in this worktree | Pass. `[router] Refused for role agent implementer in this dispatch: write: …\.dogfood-wrong-repo-probe.txt is in repository opencode-model-router-cross-repo (branch feat/cross-repo), which this dispatch may read but not edit. Finish the mcp-reader part and return NEED MORE: naming the opencode-model-router-cross-repo change; it needs a dispatch with repo=opencode-model-router-cross-repo.` |
+| Scope note on a pass | `implementer` in this worktree, `VERIFY:required`, `fileExists` | Pass. `verified scope: opencode-model-router-cross-repo (feat/cross-repo @ 7ecbfda); also observed: mcp-reader (main @ fe7d775)`. mcp-reader comes from the working set (the parallel `repo=` dispatch). |
+| I4, tier with `bash` | `medium`, writes through `node_modules\omr-xr-dogfood-lib` (a junction to the scratch repository `D:\git\omr-xr-dogfood-lib`) | `✓ verified` with no note. As designed: tier dispatches plan no perimeter (`perimeter.ts:167`; design S3, Q1). |
+| I4, role with `router_run` | `implementer`, `router_run test-files` running a scratch test that writes through the same junction | Pass. UNVERIFIED: `the repository omr-xr-dogfood-lib at D:\git\omr-xr-dogfood-lib also changed during the dispatch, and the producer ran router_run; a write there cannot be attributed, so the checks in D:\git\opencode-model-router-cross-repo do not cover it. Dispatch that work with repo=omr-xr-dogfood-lib, or verify it there.` |
+
+Observations:
+- Role delegates are never told their work root: role dispatches get no header (the known "location line is dead code" follow-up). With `repo=`, every role delegate had to infer its work root from the prompt's ENVIRONMENT text. Fixed in Phase 2 (P2g, role dispatch header).
+- In this instance the host's `<env>` block names `D:\git\Claude-model-router-cross-repo`, which does not exist. The AGENTS.md path in the system prompt is rewritten the same way (`omr-cross-repo\Claude-config`), so this is a text substitution in the prompt pipeline, not the router. It still misleads delegates.
+- `fast` has no write or shell tool in this config; a write dispatched to it escalates to `medium`.
+- The scratch repository `D:\git\omr-xr-dogfood-lib` (one commit, branch `main`) is kept for the Phase 2 dogfood. The junction and the scratch test were removed.
+
+## Owner's working rules (from the session)
+
+- Answer in Portuguese. Write code, docs and commits in English.
+- Delegate through the model-router to subagents, with atomic tasks. QA is always heavy-tier and adversarial, and runs after every phase.
+- Pre-flight before each phase. Fix every finding, or document it if a later phase covers it.
+- QA rounds: after the second round on the same implementation, fix only blocking, critical and major findings.
+- Commit often: Conventional Commits with a `Refs #107` trailer. **Never** add `Co-Authored-By` or "Generated with" lines.
+- Test only what a change touches, in parallel. Run the full suite only at the end of a phase.
+- Stop and ask the owner when an OpenCode restart is needed, or on anything blocking or critical.
+- The owner approved Q4 (D13 hook-level allow) and every decision D1–D13 in the design.
+
+## Practical lessons from this session
+
+- **Delegate budgets:** the router stops every delegate at about 25 tool calls even with `CAP:none` and a `reason:`, and many dispatches end partway through. What worked:
+  - give delegates exact file:line locations from a recon pass;
+  - resume the same `sessionID` with "continue and finish";
+  - for small edits that stall repeatedly, take over directly (the owner allowed this).
+- **Agent names:** they are sometimes "not found" (`heavy`/`medium`) on a fresh dispatch; retrying, or resuming the session, worked.
+- **Running tests:** `router_run` refuses outside role sessions, so run tests with `npx vitest run <files>` and `npm run typecheck` in the shell.
+- **Probe files:** QA delegates left probe files (`test/unit/__qa*`) behind several times. Check `git status --short` after every QA and delete them.
+- **Parallel agents:** they share this one worktree. Give each one a disjoint file list, and stage only explicit paths (`git add -- <paths>`).
+- **Flaky under full-suite load, green alone:**
+  - `test/unit/exec.test.ts`
+  - `test/integration/depth-guard-wiring.test.ts`
+  - `test/integration/ladder-effort-wiring.test.ts`
+  - `test/integration/ladder-wiring.test.ts`
+  - `test/integration/routing-ladder-resume.test.ts`
+  - `test/unit/v2-hooks.test.ts`
+  - `test/unit/roles.runtime.test.ts`
+  - `test/unit/run-tools.test.ts`
+  - `test/integration/modeA-e2e.test.ts`
+
+## Map of the change
+
+- **P0, verification engine:**
+  - `src/verify/{gate,dispatch,wiring,pending,tree,head,branch,reference}.ts`
+  - `src/index.ts` (artefact threading, `noteWriter`, deferred switch)
+  - `src/compat/v2-hooks.ts` (tier `subagent` child ID)
+  - `src/routing/wire/dispatch.ts` and `src/router/sessions.ts` (roles lineage)
+- **P1:**
+  - `src/router/{config,roles-config,role-agents,git-tools,dispatch-header,protocol}.ts`
+  - `src/routing/classify/{route-line,types}.ts`
+  - `src/routing/roles/{admission,read-set,policy,binding}.ts`
+  - `src/routing/wire/{dispatch,working-set}.ts`
+  - `src/compat/v2-hooks.ts` (read set, refusals, D13 lift)
+  - `src/verify/perimeter.ts` (perimeter)
+- **Main tests:**
+  - `test/integration/{branch-switch,branch-switch-deferred,unattributed-writers,change-root-threading,perimeter,roles-dispatch,roles-authority,v2-tier-child}.test.ts`
+  - `test/unit/{admission,head,branch,gate,baseline,reference,working-set,route-line.roles,roles.runtime}.test.ts`

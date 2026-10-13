@@ -50,23 +50,34 @@ import { decideRole } from "../engine/kernel";
 import type { Candidate, ChosenDispatch, Decision, HostAgentInfo, Ladder, RoleLadder } from "../engine/types";
 import { CLASS_IMPLIED_NEEDS, FACT_SOURCES, NEEDS, RISKS, SCOPES, TASK_CLASSES, classify, classifyNeedMatches } from "../classify";
 import type { ClassifyResult, Detection, Need, RouteLine, TaskFacts } from "../classify/types";
-import { resolveVerifyBudget, type RouterConfig } from "../../router/config";
+import { resolveRolesRouting, resolveVerifyBudget, type RouterConfig } from "../../router/config";
 import { resolveEnforcementMode } from "../../router/enforcement";
 import { roleGuardProfile } from "../../router/guard-profile";
 import { resolveRoles, type AuthorityAction, type RoleSpec } from "../../router/roles";
 import { parseVerifyDirectives } from "../../verify/directives";
 import { buildDelegationDoD } from "../../verify/dispatch";
 import { requestedVerificationCwd, verificationScope } from "../roles/work-root";
+import { resolveCheckPlacements } from "../roles/check-placement";
+import { createRepoProbe, displaySafe, readSetPredicate } from "../roles/read-set";
 import { effectiveDetection, effectiveFactsOf, grantFor, tierBounds, type DispatchGrant, type EffectiveDetection } from "../roles/policy";
 import {
   BINDING_NOTES, LOCAL_ACTIONS, currentBinding, evictCall, newDispatchNonce, noncePromptLine, nonceTitleSuffix, registerPending, type Binding,
 } from "../roles/binding";
 import { realpathSync } from "node:fs";
+import { dirname } from "node:path";
+// Static, not `await import`: dynamic imports made a bundle split src/router/config.ts into a chunk where its tiers.json lookup
+// fails. admission.ts imports this module back; both sides use the other only inside functions.
+import {
+  createAdmission, defaultAdmissionDeps, gitShowToplevel, type Admission, type AdmissionConfig, type AdmissionService, type RepoLocation,
+} from "../roles/admission";
+import { buildRoleDispatchHeader, stripDispatchHeader } from "../../router/dispatch-header";
+import { addToWorkingSet, dropFromWorkingSets, workingSetOf } from "./working-set";
 import {
   consumeRunnerDispatch, consumeRunnerDispatchLoose, forgetDispatch, lookupDispatch, rememberDispatch, runnerDescription,
   updateDispatchVerification, type CarriedVerification, type DetectionDepth, type DispatchInput, type DispatchRecord,
 } from "../../router/sessions";
-import type { ChangedFile } from "../../verify/dispatch";
+import type { ChangedFile, TreeSnapshot } from "../../verify/dispatch";
+import { branchSwitchReason, branchSwitched } from "../../verify/branch";
 import type { ReferenceState } from "../../verify/types";
 import { randomBytes } from "node:crypto";
 import {
@@ -89,6 +100,138 @@ import {
 } from "../outcomes/types";
 import { agentModelRef, type AgentView } from "./host-info";
 import { sessionRulesOf, type EngineRuntime, type Prepared, type RolePrepared, type WireLogger } from "./runtime";
+import {
+  applyApproval, inspectCandidate, isApprovalValid, readApprovals, validApprovals, type ApprovalsEnv, type CandidateIdentity,
+} from "../roles/approvals";
+import { DEFAULT_REPO_APPROVAL_DAYS } from "../../router/roles-config";
+
+// ── Cross-repo Phase 4: repositories approved with `/router approve` (docs/design/cross-repo-phase4-plan.md) ────────────────
+
+/** The approval part of a D15 refusal waits at most this long for `inspectCandidate`; then the note stays as it is (SD-P4-8). */
+export const APPROVAL_NOTE_TIMEOUT_MS = 8_000;
+
+export interface ApprovalNoteOptions {
+  /** `routing.repoExclude`. */
+  readonly exclude?: readonly string[];
+  /** The approvals store environment (tests: an injected directory). */
+  readonly env?: ApprovalsEnv;
+  /** Default {@link inspectCandidate}; tests inject a fake. */
+  readonly inspect?: typeof inspectCandidate;
+  /** Default {@link APPROVAL_NOTE_TIMEOUT_MS}. */
+  readonly timeoutMs?: number;
+}
+
+/** The details of an approvable candidate, every field from git (`inspectCandidate`) and through `displaySafe` (SD-P4-8, -9). */
+function approvalDetails(identity: CandidateIdentity): string {
+  const where = displaySafe(identity.path);
+  const head = displaySafe(identity.head).slice(0, 7) || "unknown";
+  const at = identity.branch === "(detached)" ? `detached at ${head}` : `branch ${displaySafe(identity.branch)} at ${head}`;
+  const command = /\s/.test(where) ? `/router approve "${where}"` : `/router approve ${where}`;
+  return `${where} is a git repository outside routing.repoParents (origin ${displaySafe(identity.origin)}, ${at}). `
+    + `Only the user can approve it: ask the user to run ${command}, then dispatch again.`;
+}
+
+/**
+ * Cross-repo Phase 4 (SD-P4-8, -9): the text appended to the D15 refusal of a dispatch whose admission refusal carries
+ * `approvable` (admission's canonical candidate). Built only from what `inspectCandidate` reports about that candidate — never
+ * from the dispatch text: its path, origin (credentials stripped), branch (or detached) at the short head, and the command the
+ * user types; or, when `inspectCandidate` names a problem, why no approval can be requested. Undefined — the note stays as it
+ * is — when the inspection throws or takes longer than {@link APPROVAL_NOTE_TIMEOUT_MS}. Never throws.
+ */
+export async function approvalNote(approvable: string, opts: ApprovalNoteOptions = {}): Promise<string | undefined> {
+  const inspect = opts.inspect ?? inspectCandidate;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const timedOut = new Promise<undefined>((resolve) => {
+      timer = setTimeout(() => resolve(undefined), opts.timeoutMs ?? APPROVAL_NOTE_TIMEOUT_MS);
+    });
+    const inspected = inspect(approvable, { exclude: opts.exclude ?? [], ...(opts.env === undefined ? {} : { env: opts.env }) });
+    const found = await Promise.race([inspected, timedOut]);
+    if (found === undefined) return undefined;
+    if (typeof found === "string") {
+      const problem = found.trim().replace(/\.+$/, "");
+      return problem === "" ? undefined : `No approval can be requested for ${displaySafe(approvable)}: it ${displaySafe(problem)}.`;
+    }
+    return approvalDetails(found);
+  } catch {
+    return undefined;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
+ * Cross-repo Phase 4 (SD-P4-7): records the use of the approval `approvalPath` after a binding it backs — fire and forget: the
+ * entry's roots come from the store (read without git), `applyApproval` `touch` writes at most once per hour per path, only while
+ * the entry still has those roots and is valid, and never throws. Nothing here can fail the dispatch.
+ */
+export function touchApproval(approvalPath: string, days: number, env: ApprovalsEnv = {}): void {
+  try {
+    const entry = readApprovals(env).approvals.find((candidate) => candidate.path === approvalPath);
+    if (entry === undefined) return;
+    void applyApproval({ kind: "touch", path: entry.path, roots: entry.roots, days }, env).catch(() => undefined);
+  } catch {
+    // a failed touch never fails the dispatch
+  }
+}
+
+/**
+ * Phase 4 QA (m2): why a binding backed by the approved path `approval` no longer binds, or undefined while that approval applies:
+ * read from the store without git (`readApprovals` + `isApprovalValid` with `days`); revoked, expired and an unreadable store
+ * (fail closed) all lapse.
+ */
+export function lapsedApprovalReason(
+  approval: string,
+  days: number,
+  env: ApprovalsEnv = {},
+  platform: NodeJS.Platform = process.platform,
+): string | undefined {
+  let valid = false;
+  try {
+    const now = (env.now ?? Date.now)();
+    const key = normalizeRootText(approval, platform);
+    valid = readApprovals(env).approvals.some((entry) => normalizeRootText(entry.path, platform) === key && isApprovalValid(entry, days, now));
+  } catch {
+    valid = false;
+  }
+  return valid ? undefined : `approval for ${approval} was revoked or expired: no work root. Only the user can approve it again (/router approve ${approval}).`;
+}
+
+/**
+ * Cross-repo Phase 4 (SD-P4-12): `locations` (a working set) without the entries backed by an approval that no longer applies
+ * (revoked, expired, or an unreadable store: fail closed), read from the store without git. The lapsed approvals are dropped from
+ * every working set too (`dropFromWorkingSets`), so the read set shrinks with them. No store I/O when no entry is backed by an
+ * approval.
+ */
+export function pruneLapsedApprovals(
+  locations: readonly RepoLocation[],
+  days: number,
+  env: ApprovalsEnv = {},
+  platform: NodeJS.Platform = process.platform,
+): readonly RepoLocation[] {
+  if (!locations.some((location) => location.approval !== undefined)) return locations;
+  let valid: ReadonlySet<string>;
+  try {
+    const now = (env.now ?? Date.now)();
+    valid = new Set(readApprovals(env).approvals.filter((entry) => isApprovalValid(entry, days, now)).map((entry) => normalizeRootText(entry.path, platform)));
+  } catch {
+    valid = new Set();
+  }
+  const lapsed = new Set<string>();
+  const kept = locations.filter((location) => {
+    if (location.approval === undefined || valid.has(normalizeRootText(location.approval, platform))) return true;
+    lapsed.add(location.approval);
+    return false;
+  });
+  for (const approval of lapsed) {
+    try {
+      dropFromWorkingSets(approval, platform);
+    } catch {
+      // the entries are left out of `known` above in any case
+    }
+  }
+  return kept;
+}
 
 /** A fresh dispatch can be claimed by a `session.created` event for at most this long. */
 export const PENDING_TTL_MS = 120_000;
@@ -159,7 +302,7 @@ export interface RoleRouted {
   readonly verifyRoot: string;
   /** The route line's `root=` as written, or null. */
   readonly requestedRoot: string | null;
-  /** Work-root, grant and catalog notes (for the dispatch header / parent result). */
+  /** Grant and catalog notes (decision-row / diagnostic text; they are not shown in the dispatch header or the parent result). */
   readonly notes: readonly string[];
   readonly detection: EffectiveDetection;
   /** The dispatch's total call budget (`roleGuardProfile(spec, tier, routeLine.budget).budget`). */
@@ -191,7 +334,7 @@ export interface RoleRouted {
 
 /**
  * #84 P2.1: a role dispatch the router refuses (malformed first route line, no candidate inside the tier window, the router could not
- * route it). `route()` THROWS it — the one exception to "never throws" — so the adapter's `execute.before` fails the call with this
+ * route it, or a declared `repo=` / `branch=` / `root=` target the router refused — Q9). `route()` THROWS it — the one exception to "never throws" — so the adapter's `execute.before` fails the call with this
  * message and the host never runs the child. It never falls back to a tier agent (QA-P12-1-5).
  */
 export class RoleDispatchRefusal extends Error {
@@ -271,6 +414,19 @@ export interface DispatchRouter {
 }
 
 export interface DispatchRouterDeps {
+  /**
+   * Cross-repo (P1.4): builds the admission of a resolved `{ repoParents, repoDepth, repoExclude }` (once per triple); default
+   * `createAdmission` (`roles/admission.ts`). Tests inject a fake.
+   */
+  readonly createAdmission?: (config: AdmissionConfig) => Pick<AdmissionService, "admit" | "resolve">;
+  /**
+   * Cross-repo Phase 4: the approvals store environment of the dispatch bind path (the D15 approval note, `touch` after an
+   * approval-backed binding, pruning lapsed approvals from the working set). Default: the real store. Tests inject a directory
+   * and a clock.
+   */
+  readonly approvalsEnv?: ApprovalsEnv;
+  /** Cross-repo Phase 4 (SD-P4-8): `inspectCandidate` for the D15 approval note; tests inject a fake. */
+  readonly inspectCandidate?: typeof inspectCandidate;
   readonly runtime: EngineRuntime;
   /** `ctx.session.get({ sessionID })`. */
   readonly getSession: (sessionID: string) => Promise<unknown>;
@@ -285,6 +441,11 @@ export interface DispatchRouterDeps {
    * {@link gitWorktreeList} (the hardened spawn, 5 s timeout). Injected by tests.
    */
   readonly listWorktrees?: (cwd: string) => Promise<string>;
+  /**
+   * Cross-repo QA round 2: hardened `git rev-parse --show-toplevel` in `cwd` (default `gitShowToplevel`, `roles/admission.ts`), used
+   * to check that the session directory belongs to the bound worktree before it stays the work root. Injected by tests.
+   */
+  readonly showToplevel?: (cwd: string) => Promise<string | undefined>;
   /** #84 P2.1: canonical long form of an existing path (default `realpathSync.native`). Only called on an already matched root. */
   readonly realpath?: (path: string) => string;
   /** #84 P2.1: path rules of the work-root comparison (default `process.platform`). */
@@ -521,8 +682,31 @@ export interface WorkRootResolution {
   readonly workRoot: string | null;
   /** The route line's `root=` as written, or null. */
   readonly requested: string | null;
-  /** Why there is no work root (for the grant notes and the dispatch header); null when resolved. */
+  /** Why there is no work root; null when resolved. A dispatch that declared `repo=`/`branch=`/`root=` is refused with this note (Q9). */
   readonly note: string | null;
+  /** Cross-repo (P1.4): where the work root lies, when admission bound it. */
+  readonly location?: RepoLocation;
+  /**
+   * Cross-repo Phase 4 (SD-P4-8): the canonical candidate of an admission refusal that a human could approve with
+   * `/router approve` (admission's `approvable`). Set only with `workRoot: null`; the dispatch bind path turns it into a note.
+   */
+  readonly approvable?: string;
+}
+
+/**
+ * Cross-repo (P1.4): what admission needs to bind a role dispatch's work root. Without `admission`, `resolveRoleWorkRoot` is
+ * today's text match (invariant I9).
+ */
+export interface WorkRootAdmissionInput {
+  /** The route line's `repo=`, as written. */
+  readonly repo?: string | null | undefined;
+  /** The route line's `branch=`, as written. */
+  readonly branch?: string | null | undefined;
+  readonly admission?: Pick<AdmissionService, "admit" | "resolve"> | undefined;
+  /** The session repository; the session directory when absent. */
+  readonly sessionRepository?: string | undefined;
+  /** Repositories whose worktrees are admissible by rule 2 (the session directory, the working set). */
+  readonly known?: readonly string[] | undefined;
 }
 
 export interface WorkRootDeps {
@@ -559,12 +743,15 @@ export async function gitWorktreeList(cwd: string): Promise<string> {
  * - no `root=` → the session directory (canonical long form);
  * - `root=` → its normalised TEXT is compared with the session directory and with every worktree of `git worktree list --porcelain`
  *   (run in the session directory) BEFORE any filesystem call on it; a match → the canonical long form of the matched entry;
+ *   with an admission (cross-repo), any `root=` other than the session directory binds only through `admission.admit`
+ *   (QA round 1, F1), and an admitted worktree binds only while its `realpath` still equals it (F8);
  * - anything else (no match, git unavailable, an entry that does not resolve) → `workRoot: null` with a note.
  * Never throws.
  */
 export async function resolveRoleWorkRoot(
   input: { readonly root: string | null; readonly sessionDirectory: string },
   deps: WorkRootDeps,
+  cross?: WorkRootAdmissionInput,
 ): Promise<WorkRootResolution> {
   const canonical = (path: string): string | null => {
     try {
@@ -574,6 +761,39 @@ export async function resolveRoleWorkRoot(
       return null;
     }
   };
+  // Cross-repo (P1.4): admission binds `repo=` / `branch=` (with or without `root=`), and a `root=` the text match below did not find.
+  const admission = cross?.admission;
+  const sessionRepository = cross?.sessionRepository ?? input.sessionDirectory;
+  const known = [...new Set([sessionRepository, ...(cross?.known ?? [])])];
+  const admitted = async (run: () => Promise<Admission>): Promise<WorkRootResolution> => {
+    let result: Admission;
+    try {
+      result = await run();
+    } catch (error) {
+      result = { ok: false, reason: `admission failed: ${describeError(error)}: no work root.` };
+    }
+    if (!result.ok) {
+      const approvable = result.approvable;
+      return approvable === undefined
+        ? { workRoot: null, requested: input.root, note: result.reason }
+        : { workRoot: null, requested: input.root, note: result.reason, approvable };
+    }
+    const resolved = canonical(result.location.worktree);
+    if (resolved === null) return { workRoot: null, requested: input.root, note: `${result.location.worktree} does not resolve on disk: no work root` };
+    // QA round 1 (F8): the admitted worktree is canonical; one that now resolves elsewhere (a link swapped in since) binds nothing.
+    if (normalizeRootText(resolved, deps.platform) !== normalizeRootText(result.location.worktree, deps.platform)) {
+      return { workRoot: null, requested: input.root, note: `the admitted work root ${result.location.worktree} now resolves to ${resolved}: no work root` };
+    }
+    return { workRoot: resolved, requested: input.root, note: null, location: result.location };
+  };
+  const repo = cross?.repo?.trim() || undefined;
+  const branch = cross?.branch?.trim() || undefined;
+  if (admission !== undefined && (repo !== undefined || branch !== undefined)) {
+    return admitted(() => admission.resolve(
+      { ...(input.root === null ? {} : { root: input.root }), ...(repo === undefined ? {} : { repo }), ...(branch === undefined ? {} : { branch }) },
+      { sessionRepository, known },
+    ));
+  }
   if (input.root === null) {
     const dir = canonical(input.sessionDirectory);
     return dir === null
@@ -592,6 +812,12 @@ export async function resolveRoleWorkRoot(
     match = listed.find((path) => normalizeRootText(path, deps.platform) === want);
   }
   const none = `root=${input.root} is neither the session directory nor a worktree listed by \`git worktree list --porcelain\`: no work root`;
+  // QA round 1 (F1): with an admission, a worktree the session repository lists is a work root only if admission admits it too
+  // (routing.repoExclude, links, parents); the session directory itself keeps today's match (I9).
+  if (admission !== undefined && match !== input.sessionDirectory) {
+    const root = input.root;
+    return admitted(() => admission.admit(root, known, sessionRepository));
+  }
   if (match === undefined) return { workRoot: null, requested: input.root, note: none };
   const resolved = canonical(match);
   return resolved === null
@@ -651,7 +877,8 @@ export function roleVerificationRuns(input: {
 /**
  * QA-P21-1-2: the dispatch's verification would be deferred, exactly as the native path decides it (index.ts `isDeferred` →
  * verify/wiring.ts `isDeferred`): its `VERIFY:` directives resolve to `deferred` (the configured `defaultVerify` when the text has
- * none; the text is `dispatchDirectiveText(prompt, description)`) AND its DoD carries a `testsPass` check. A deferred dispatch
+ * none; the text is `dispatchDirectiveText(prompt, description)`) AND its DoD carries a `testsPass` check (with or without
+ * per-check `cwd=`/`scope=` keys: the classification does not depend on where a check runs). A deferred dispatch
  * returns without the gate (`router_verify` runs it later), so the router's gate cannot back a `deterministic` detection.
  * Fails toward "deferred" on any error (a weaker detection, never a stronger one). QA-P21-2 nit 3: nothing is deferred when
  * `router_verify` is not registered (`verifyEnabled: false`, index.ts `routerVerifyEnabled`): the gate then runs at the return.
@@ -683,10 +910,17 @@ export function roleGateDeferred(cfg: RouterConfig, prompt: string, description:
  * only the return shows (every change outside the work root, a timeout, a verifier error) does not rewrite the row — its verdict
  * carries the caveat (`[router ⚠ UNVERIFIED …]`) and is never accepted as verified.
  */
-export function roleGateOutsideWorkRoot(workRoot: string | null, prompt: string, description: string, argsCwd?: unknown): boolean {
+export function roleGateOutsideWorkRoot(
+  workRoot: string | null, prompt: string, description: string, argsCwd?: unknown, inReadSet?: (absPath: string) => boolean,
+): boolean {
   if (workRoot === null) return true;
   try {
-    return verificationScope(requestedVerificationCwd(argsCwd, buildDelegationDoD({ prompt, description }).cwd), workRoot).outside;
+    const dod = buildDelegationDoD({ prompt, description });
+    const scope = verificationScope(requestedVerificationCwd(argsCwd, dod.cwd), workRoot);
+    if (scope.outside) return true;
+    // P2.5 (SD4): a check's own `cwd=` / `scope=` must resolve too (inside W, or an absolute path in the read set R `inReadSet`);
+    // one that is refused makes the gate refuse the delegation, so the router's gate cannot back `deterministic`.
+    return resolveCheckPlacements(dod, scope, inReadSet === undefined ? {} : { inReadSet }).refused !== undefined;
   } catch {
     return true;
   }
@@ -852,7 +1086,7 @@ function higherTier(order: readonly string[], a: string | null, b: string | null
  * cannot touch it: binding.ts holds its enforced grant), so the verification root, the outside-root check and the classification
  * never use it.
  */
-function resumedGrant(boundGrant: DispatchGrant, widened: readonly AuthorityAction[]): DispatchGrant {
+export function resumedGrant(boundGrant: DispatchGrant, widened: readonly AuthorityAction[]): DispatchGrant {
   const root = boundGrant.workRoot;
   const actions = new Set<AuthorityAction>([...boundGrant.actions, ...widened]);
   if (boundGrant.workRoot === null) {
@@ -861,7 +1095,9 @@ function resumedGrant(boundGrant: DispatchGrant, widened: readonly AuthorityActi
     actions.delete("router_run");
     actions.delete("edit");
   }
-  return { actions, notes: [...boundGrant.notes], workRoot: root };
+  // QA round 1 (F10): the location travels only with a validated work root, the bound one (binding.ts `locationOf`).
+  const location = root !== null && root === boundGrant.workRoot && boundGrant.location !== undefined ? { location: boundGrant.location } : {};
+  return { actions, notes: [...boundGrant.notes], workRoot: root, ...location };
 }
 
 /** verify/dod.ts `OPEN_TAG_RE` / `CLOSE_TAG_RE`: the lines that open and close an `[acceptance]` block. */
@@ -910,6 +1146,19 @@ export interface RoleAttemptChanges {
   readonly changedFiles: ChangedFile[];
   readonly changeBaseline: "available" | "unavailable";
   readonly reference: ReferenceState;
+  readonly snapshot?: Pick<TreeSnapshot, "cwd" | "root" | "head" | "branch"> | undefined;
+  readonly branchSwitch?: string | undefined;
+  readonly unattributedWriters?: string[] | undefined;
+}
+
+/** QA2 F3c: a "cannot confirm the branch" reason (an unreadable tree), as opposed to an observed switch. */
+function isUnconfirmedBranch(reason: string): boolean {
+  return reason.startsWith("cannot confirm the branch of ");
+}
+
+/** I5 (P0.3): the sorted union of two writer lists. */
+function unionWriters(older: readonly string[] | undefined, newer: readonly string[] | undefined): string[] {
+  return [...new Set([...(older ?? []), ...(newer ?? [])])].sort();
 }
 
 /** The union of two change sets, keyed by path (separators unified, case folded on win32); `newer` wins. */
@@ -936,19 +1185,50 @@ export function roleAttemptVerification<T extends RoleAttemptChanges>(childSessi
   const verification = lookupDispatch(childSessionID)?.verification;
   if (verification === undefined) return prepared;
   const own: readonly ChangedFile[] | "unavailable" = prepared.changeBaseline === "available" ? prepared.changedFiles : "unavailable";
+  const now = prepared.snapshot;
   if (!opts.carried) {
-    updateDispatchVerification(childSessionID, { ...verification, baseline: { reference: prepared.reference, changed: own } });
+    const tree = now === undefined ? {} : { tree: { head: now.head, ...(now.branch === undefined ? {} : { branch: now.branch }), root: now.root ?? now.cwd } };
+    // QA2 F3c: an attempt that only could not confirm its branch is not a switch of the lineage (a later attempt with a
+    // readable tree is judged on its own); only a real switch is recorded and inherited.
+    const switched = prepared.branchSwitch === undefined || isUnconfirmedBranch(prepared.branchSwitch) ? {} : { switched: prepared.branchSwitch };
+    const ownWriters = unionWriters(undefined, prepared.unattributedWriters);
+    const writers = ownWriters.length === 0 ? {} : { writers: ownWriters };
+    updateDispatchVerification(childSessionID, { ...verification, baseline: { reference: prepared.reference, changed: own, ...tree, ...switched, ...writers } });
     return prepared;
   }
   const baseline = verification.baseline;
   if (baseline === undefined) return { ...prepared, changeBaseline: "unavailable", reference: CARRIED_NO_REFERENCE };
   const changed = unionChanges(baseline.changed, own);
-  updateDispatchVerification(childSessionID, { ...verification, baseline: { reference: baseline.reference, changed } });
+  // I5 (P0.3): a write an earlier attempt made through a tool the router cannot observe is part of the carried change too.
+  const lineageWriters = unionWriters(baseline.writers, prepared.unattributedWriters);
+  // I7 across attempts. Precedence: a switch seen during this dispatch, then one inherited from an earlier attempt,
+  // then a switch between the introducing attempt's tree and this one.
+  const computedSwitch = prepared.branchSwitch !== undefined || baseline.switched !== undefined ? undefined
+    : baseline.tree !== undefined && now !== undefined && branchSwitched(baseline.tree, now)
+      ? branchSwitchReason(now.root ?? now.cwd, baseline.tree, now, "since the attempt that introduced this acceptance") : undefined;
+  // B3: the first switch the lineage finds is recorded, so every later carried attempt inherits it.
+  const ownSwitch = prepared.branchSwitch !== undefined && !isUnconfirmedBranch(prepared.branchSwitch) ? prepared.branchSwitch : undefined;
+  const recordedSwitch = baseline.switched ?? ownSwitch ?? computedSwitch;
+  updateDispatchVerification(childSessionID, { ...verification, baseline: { reference: baseline.reference, changed,
+    ...(baseline.tree === undefined ? {} : { tree: baseline.tree }),
+    ...(recordedSwitch === undefined ? {} : { switched: recordedSwitch }),
+    ...(lineageWriters.length === 0 ? {} : { writers: lineageWriters }) } });
+  const INHERITED_PREFIX = "in an earlier attempt of this acceptance: ";
+  // B11: a switch inherited from an earlier attempt says so (once); one found by this attempt is returned as it is.
+  const lineageSwitch = prepared.branchSwitch !== undefined ? undefined
+    : baseline.switched !== undefined ? (baseline.switched.startsWith(INHERITED_PREFIX) ? baseline.switched : `${INHERITED_PREFIX}${baseline.switched}`)
+    : computedSwitch !== undefined ? computedSwitch
+    // B9: a recorded branch but no current snapshot: this attempt cannot be confirmed to be on it.
+    : baseline.tree?.branch !== undefined && now === undefined
+      ? `cannot confirm the branch of ${baseline.tree.root ?? "the work root"}: the working tree could not be read for this carried attempt, so the checks could verify another branch. Send a fresh [acceptance] block, or re-dispatch.`
+      : undefined;
   return {
     ...prepared,
     changedFiles: changed === "unavailable" ? prepared.changedFiles : changed,
     changeBaseline: changed === "unavailable" ? "unavailable" : "available",
     reference: baseline.reference,
+    ...(lineageSwitch === undefined ? {} : { branchSwitch: lineageSwitch }),
+    ...(lineageWriters.length === 0 ? {} : { unattributedWriters: lineageWriters }),
   };
 }
 
@@ -1489,6 +1769,228 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     platform: deps.platform ?? process.platform,
   };
 
+  // QA round 2: the hardened `git rev-parse --show-toplevel` of admission; tests inject a fake.
+  const showToplevel = async (cwd: string): Promise<string | undefined> =>
+    deps.showToplevel !== undefined ? deps.showToplevel(cwd) : gitShowToplevel(cwd);
+
+  // Cross-repo P2.5: the read set R of this dispatch's role session beyond its work root, for the per-check `cwd=` roots the gate
+  // places (the same inputs as the read guard: the dispatching session's working set, `routing.repoParents/Depth/Exclude`, one
+  // cached probe). Undefined when R adds nothing, or on any error: only roots inside W are valid (fail closed).
+  const readSetProbe = createRepoProbe();
+  const readSetFor = (cfg: RouterConfig, orchestratorSessionID: string): ((absPath: string) => boolean) | undefined => {
+    try {
+      const routing = resolveRolesRouting(cfg, "v2");
+      const inSet = readSetPredicate(
+        { parents: routing.repoParents, depth: routing.repoDepth, exclude: routing.repoExclude }, workingSetOf(orchestratorSessionID), readSetProbe,
+      );
+      return inSet === undefined ? undefined : (absPath) => inSet(absPath) !== undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  /** The real admission; with an injected {@link DispatchRouterDeps.approvalsEnv}, its rule 3 reads that store (Phase 4). */
+  const defaultAdmission = async (config: AdmissionConfig): Promise<Pick<AdmissionService, "admit" | "resolve">> => {
+    const env = deps.approvalsEnv;
+    if (env === undefined) return createAdmission(config);
+    const days = config.approvalDays ?? DEFAULT_REPO_APPROVAL_DAYS;
+    return createAdmission(config, { ...defaultAdmissionDeps({ approvalDays: days }), approvals: () => validApprovals(days, env) });
+  };
+
+  // Cross-repo (P1.4): one admission per resolved `{ repoParents, repoDepth, repoExclude, repoApprovalDays }` (it caches its git
+  // results for 5 s).
+  let admissionMemo: { readonly key: string; readonly service: Pick<AdmissionService, "admit" | "resolve"> } | undefined;
+  const admissionFor = async (config: AdmissionConfig): Promise<Pick<AdmissionService, "admit" | "resolve">> => {
+    const key = JSON.stringify([config.parents, config.depth, config.exclude, config.approvalDays ?? null]);
+    if (admissionMemo !== undefined && admissionMemo.key === key) return admissionMemo.service;
+    const service = deps.createAdmission !== undefined ? deps.createAdmission(config) : await defaultAdmission(config);
+    admissionMemo = { key, service };
+    return service;
+  };
+
+  /**
+   * Cross-repo (P1.4): the admission input of a role dispatch. Undefined — today's text match, nothing else (I9) — unless roles mode
+   * is active on v2 and `routing.repoParents` is set or the route line declares `repo=` / `branch=` (`branch=` alone needs no parent:
+   * the session repository answers it). `known`: the session directory and the worktrees of the orchestrator's working set.
+   */
+  const crossRepoOf = async (
+    cfg: RouterConfig,
+    orchestratorSessionID: string,
+    sessionDirectory: string,
+    line: Pick<RouteLine, "repo" | "branch"> | null | undefined,
+  ): Promise<WorkRootAdmissionInput | undefined> => {
+    const routing = resolveRolesRouting(cfg, "v2");
+    const repo = line?.repo ?? undefined;
+    const branch = line?.branch ?? undefined;
+    if (routing.delegation !== "roles") return undefined;
+    if (routing.repoParents.length === 0 && repo === undefined && branch === undefined) return undefined;
+    const admission = await admissionFor({
+      parents: routing.repoParents,
+      depth: routing.repoDepth,
+      exclude: routing.repoExclude,
+      approvalDays: routing.repoApprovalDays,
+    });
+    // Phase 4 (SD-P4-12): a working-set entry whose approval lapsed (revoked, expired) is dropped before it can admit by rule 2;
+    // a store read without git, only with parents (I9) and only when an entry is backed by an approval. Phase 4 QA (M1): with the
+    // parents emptied at runtime no approval applies (the store is not read), so an approval-backed entry is left out; admission's
+    // rule 2 then admits only worktrees of the session repository.
+    const workingSet = routing.repoParents.length === 0
+      ? workingSetOf(orchestratorSessionID).filter((location) => location.approval === undefined)
+      : pruneLapsedApprovals(workingSetOf(orchestratorSessionID), routing.repoApprovalDays, deps.approvalsEnv, workRootDeps.platform);
+    const known = [...new Set([sessionDirectory, ...workingSet.map((location) => location.worktree)])];
+    return { repo, branch, admission, sessionRepository: sessionDirectory, known };
+  };
+
+  /** `child` lies strictly below `parent` (text comparison, no filesystem call). */
+  const strictlyWithin = (parent: string, child: string): boolean => {
+    const platform = workRootDeps.platform;
+    const p = normalizeRootText(parent, platform);
+    const c = normalizeRootText(child, platform);
+    const sep = platform === "win32" ? "\\" : "/";
+    return c.length > p.length && c.startsWith(p.endsWith(sep) ? p : p + sep);
+  };
+
+  /**
+   * The work root of a role dispatch: {@link resolveRoleWorkRoot} plus the route-flow rules of the cross-repo QA (round 1).
+   * - F3: a `repo=` / `branch=` / `root=` the route line declared but the parser rejected (invalid value, bare key, duplicate or
+   *   conflicting key) gives NO work root and a note, never the session directory (design §5).
+   * - F6: a `root=` that is the session directory, with `branch=`, is accepted when the worktree on that branch contains it (the
+   *   session may have started in a subdirectory); and a worktree bound without `root=` that contains the session directory keeps
+   *   the session directory as the work root (the write root does not grow to the worktree's top level).
+   */
+  const bindWorkRoot = async (
+    cfg: RouterConfig,
+    orchestratorSessionID: string,
+    sessionDirectory: string,
+    line: RouteLine | null | undefined,
+  ): Promise<WorkRootResolution> => {
+    const declaredRoot = line?.root ?? null;
+    const invalid = line?.invalidCrossRepo ?? [];
+    if (invalid.length > 0) {
+      const note = invalid
+        .map(({ key, value }) => `${key}=${value} is not a valid ${key === "repo" ? "repository name" : key === "branch" ? "branch name" : "absolute work root"}: no work root. Fix the route line.`)
+        .join(" ");
+      return { workRoot: null, requested: declaredRoot, note };
+    }
+    const cross = await crossRepoOf(cfg, orchestratorSessionID, sessionDirectory, line);
+    const first = await resolveRoleWorkRoot({ root: declaredRoot, sessionDirectory }, workRootDeps, cross);
+    const canonicalSession = (): string | null => {
+      try {
+        const resolved = workRootDeps.realpath(sessionDirectory);
+        return typeof resolved === "string" && resolved !== "" ? resolved : null;
+      } catch {
+        return null;
+      }
+    };
+    const platform = workRootDeps.platform;
+    /**
+     * QA round 2: `worktree` holds the session directory — not merely by text: a worktree or repository NESTED inside `worktree`
+     * (`.worktrees/`, `.claude/worktrees/`) lies below it too. Walking up from the canonical session directory to `worktree`, the
+     * first directory that is itself a git top level (hardened `rev-parse --show-toplevel`, whose ceiling is the directory's parent,
+     * so a plain subdirectory answers nothing) must be `worktree`; any other top level on the way, or anything unreadable, is "no".
+     */
+    const sessionBelongsTo = async (worktree: string): Promise<boolean> => {
+      if (!strictlyWithin(worktree, sessionDirectory)) return false;
+      const start = canonicalSession();
+      if (start === null) return false;
+      try {
+        const bound = normalizeRootText(workRootDeps.realpath(worktree), platform);
+        let dir = start;
+        for (let depth = 0; depth < 64; depth++) {
+          const here = normalizeRootText(dir, platform);
+          if (here === bound) return true;
+          if (!strictlyWithin(bound, here)) return false;
+          const top = await showToplevel(dir);
+          if (top !== undefined && top !== "" && normalizeRootText(workRootDeps.realpath(top), platform) === here) return false;
+          const parent = dirname(dir);
+          if (parent === dir) return false;
+          dir = parent;
+        }
+        return false;
+      } catch {
+        return false;
+      }
+    };
+    const atSession = declaredRoot !== null && line?.branch !== undefined && cross?.admission !== undefined
+      && normalizeRootText(declaredRoot, platform) === normalizeRootText(sessionDirectory, platform);
+    if (atSession && first.workRoot === null) {
+      // The session directory may be inside a worktree rather than its top level: bind by branch, then check it holds the session.
+      const retry = await resolveRoleWorkRoot({ root: null, sessionDirectory }, workRootDeps, cross);
+      const inside = retry.location !== undefined && retry.workRoot !== null && await sessionBelongsTo(retry.location.worktree);
+      const dir = inside ? canonicalSession() : null;
+      return dir === null ? first : { ...retry, workRoot: dir, requested: declaredRoot };
+    }
+    if (declaredRoot === null && first.workRoot !== null && first.location !== undefined && await sessionBelongsTo(first.location.worktree)) {
+      const dir = canonicalSession();
+      if (dir !== null) return { ...first, workRoot: dir };
+    }
+    return first;
+  };
+
+  /**
+   * Q9 (QA round 3): the target the route line of an EXACT resume declares is the child's bound root — by text only, no admission
+   * and no filesystem call: a `root=` equal (normalised) to the bound work root or its worktree, a `repo=` equal to the bound
+   * repository's name, a `branch=` equal to the bound branch. An invalid declaration, or a bound grant without a work root, never is.
+   */
+  const declaresBoundRoot = (line: RouteLine | null | undefined, grant: DispatchGrant): boolean => {
+    if (line === null || line === undefined) return true;
+    if ((line.invalidCrossRepo?.length ?? 0) > 0 || grant.workRoot === null) return false;
+    const platform = workRootDeps.platform;
+    const location = grant.location;
+    if (line.root !== undefined) {
+      const declared = normalizeRootText(line.root, platform);
+      const candidates = location === undefined ? [grant.workRoot] : [grant.workRoot, location.worktree];
+      if (!candidates.some((candidate) => normalizeRootText(candidate, platform) === declared)) return false;
+    }
+    const sameName = (a: string, b: string): boolean => (platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b);
+    if (line.repo !== undefined && (location === undefined || !sameName(location.name, line.repo))) return false;
+    if (line.branch !== undefined && (location === undefined || location.branch !== line.branch.replace(/^refs\/heads\//, ""))) return false;
+    return true;
+  };
+
+  /**
+   * D17 (cross-repo QA): the target an exact resume declares is the child's bound root. The text fast path ({@link declaresBoundRoot})
+   * runs no admission and no filesystem call. When it does not match — `repo=<worktree directory>` (Q10: the location's name is the
+   * repository's), a `root=` spelled through a junction / symlink / subst drive — the declaration is resolved exactly as a fresh
+   * dispatch resolves it ({@link bindWorkRoot}) and accepted when the work root it binds is the child's bound work root or its
+   * worktree (`normalizeRootText` of the realpath on both sides). So admission may now run on a resume, but only when the fast path
+   * fails. Whatever the answer, the resume keeps the BOUND grant: the resolution is only compared, never adopted (no widening).
+   */
+  const declaresBoundTarget = async (
+    cfg: RouterConfig,
+    orchestratorSessionID: string,
+    sessionDirectory: string,
+    line: RouteLine | null | undefined,
+    grant: DispatchGrant,
+  ): Promise<boolean> => {
+    if (declaresBoundRoot(line, grant)) return true;
+    if (line === null || line === undefined || (line.invalidCrossRepo?.length ?? 0) > 0 || grant.workRoot === null) return false;
+    const platform = workRootDeps.platform;
+    const canonicalText = (path: string): string => {
+      try {
+        const real = workRootDeps.realpath(path);
+        return normalizeRootText(typeof real === "string" && real !== "" ? real : path, platform);
+      } catch {
+        return normalizeRootText(path, platform);
+      }
+    };
+    const resolved = await bindWorkRoot(cfg, orchestratorSessionID, sessionDirectory, line);
+    if (resolved.workRoot === null) return false;
+    const got = canonicalText(resolved.workRoot);
+    const bound = grant.location === undefined ? [grant.workRoot] : [grant.workRoot, grant.location.worktree];
+    return bound.some((candidate) => canonicalText(candidate) === got);
+  };
+
+  /** Q9 (QA round 3): the refusal of an exact resume whose route line declares another target than the child's bound root. */
+  const boundRootRefusal = (grant: DispatchGrant): string => {
+    const where = grant.workRoot === null ? "no work root" : displaySafe(grant.workRoot);
+    const location = grant.location;
+    const detail = location === undefined
+      ? ""
+      : ` (repository ${displaySafe(location.name)}, branch ${location.branch === null ? "(detached)" : displaySafe(location.branch)})`;
+    return `this child is bound to ${where}${detail}; a resume cannot change its work root: dispatch a new child`;
+  };
+
   /**
    * The rung a resumed child runs on: the dispatch registry's record (its `tier` is the role tier the router registered), else the
    * child session's own model; unknown → a model off every ladder, which the kernel lifts to the window ceiling (never below).
@@ -1536,13 +2038,53 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     if (lined.trace.routeLines.malformed === true) throw new RoleDispatchRefusal(agent, ROLE_REFUSALS.malformed);
 
     // 2. work root: `root=` from the trace only, text-compared with `git worktree list --porcelain` before any filesystem call.
-    const root = await resolveRoleWorkRoot({ root: lined.trace.routeLine?.root ?? null, sessionDirectory }, workRootDeps);
+    // Cross-repo (P1.4): `repo=` / `branch=`, and a `root=` the text match does not find, are bound through admission.
+    const declaredLine = lined.trace.routeLine;
     const bound = resumeID === null ? undefined : currentBinding(resumeID, { maxOf: (name) => roleMaxActions(rp.roles.get(name)) });
+    // Q9: a dispatch that DECLARED a target (`repo=` / `branch=` / `root=`, or an invalid `repo=` / `branch=` / `root=`) whose
+    // binding was refused is refused with the note — it never runs in the session directory instead. A dispatch that declared
+    // nothing is untouched.
+    const declaredTarget = declaredLine !== null && declaredLine !== undefined
+      && (declaredLine.repo !== undefined || declaredLine.branch !== undefined || declaredLine.root !== undefined || (declaredLine.invalidCrossRepo?.length ?? 0) > 0);
+    // A resume of an exactly bound child keeps the child's bound root: a target it declares must name that root — by text first (no
+    // admission), else by the same resolution a fresh dispatch uses (D17) — else the resume is refused: a resume cannot move a child.
+    const exactBound = bound?.kind === "exact" ? bound.grant : undefined;
+    // Phase 4 QA (m2): a child bound through an approval resumes only while that approval applies (store read, no git): a revoked or
+    // expired approval ends the binding, so the resume is refused and the lapsed location never rejoins the working set.
+    const boundApproval = exactBound?.location?.approval;
+    const lapsedApproval = boundApproval === undefined ? undefined
+      : lapsedApprovalReason(boundApproval, resolveRolesRouting(rp.cfg, "v2").repoApprovalDays, deps.approvalsEnv, workRootDeps.platform);
+    if (lapsedApproval !== undefined) throw new RoleDispatchRefusal(agent, displaySafe(`resume refused: ${lapsedApproval}`));
+    if (declaredTarget && exactBound !== undefined && !await declaresBoundTarget(rp.cfg, call.sessionID, sessionDirectory, declaredLine, exactBound)) {
+      throw new RoleDispatchRefusal(agent, boundRootRefusal(exactBound));
+    }
+    const root: WorkRootResolution = declaredTarget && exactBound !== undefined
+      ? {
+          workRoot: exactBound.workRoot,
+          requested: declaredLine?.root ?? null,
+          note: null,
+          ...(exactBound.location === undefined ? {} : { location: exactBound.location }),
+        }
+      : await bindWorkRoot(rp.cfg, call.sessionID, sessionDirectory, declaredLine);
+    // The note may echo route-line text and filesystem names: escaped before it reaches the orchestrator.
+    if (declaredTarget && root.workRoot === null && root.note !== null && bound?.kind !== "exact") {
+      // Phase 4 (SD-P4-8): a candidate a human could approve gets the details git reports about it (never the dispatch text).
+      // Only here, on the dispatch bind path: `declaresBoundTarget` also runs `bindWorkRoot` but only compares, so no git there.
+      const approval = root.approvable === undefined ? undefined : await approvalNote(root.approvable, {
+        exclude: resolveRolesRouting(rp.cfg, "v2").repoExclude,
+        ...(deps.approvalsEnv === undefined ? {} : { env: deps.approvalsEnv }),
+        ...(deps.inspectCandidate === undefined ? {} : { inspect: deps.inspectCandidate }),
+      });
+      throw new RoleDispatchRefusal(agent, displaySafe(approval === undefined ? root.note : `${root.note} ${approval}`));
+    }
+    // Phase 4 (SD-P4-7): a fresh binding backed by an approval records its use (fire and forget, at most once per hour).
+    const approvedBy = declaredTarget && exactBound !== undefined ? undefined : root.location?.approval;
+    if (root.workRoot !== null && approvedBy !== undefined) touchApproval(approvedBy, resolveRolesRouting(rp.cfg, "v2").repoApprovalDays, deps.approvalsEnv);
 
     // 3. classify in the dispatch's own root (QA-G-B-3 (1)): an absolute path inside it is no `external_dir`. A resume of an exactly
     // bound child is classified in its bound root (QA-P33F1-1-1); without a `root=` (the work root is the session directory) or a
     // validated one, in the session directory as the host names it.
-    const requestedRoot = root.requested !== null ? root.workRoot : null;
+    const requestedRoot = root.requested !== null || root.location !== undefined ? root.workRoot : null;
     const classifyCwd = (bound?.kind === "exact" ? bound.grant.workRoot : null) ?? requestedRoot ?? sessionDirectory;
     const result = await classify({ description, prompt, cwd: classifyCwd }, rp.classifyDeps);
     if (result.trace.routeLines.malformed === true) throw new RoleDispatchRefusal(agent, ROLE_REFUSALS.malformed);
@@ -1566,7 +2108,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     // 4. grant (widened actions of a resume recompute the floor, handoff 36). QA-P21-2-1: a resume of an EXACTLY bound child keeps
     // what that child holds (its bound grant) plus the widened actions — the resume prompt alone ("continue") would lose them.
     const grant: DispatchGrant = bound?.kind === "exact" ? resumedGrant(bound.grant, call.widened ?? [])
-      : grantFor(rp.spec, taskFacts, call.widened ?? [], root.workRoot, routeLine);
+      : grantFor(rp.spec, taskFacts, call.widened ?? [], root.workRoot, routeLine, root.location);
 
     // 5. effective detection (S10/P-9, A34; handoff 5): never `result.detection` as is. QA-G-B-1: a resume that names no
     // `[acceptance]` block of its own carries the one of the dispatch it resumes (and its `VERIFY:` lines, when it names none), so
@@ -1589,6 +2131,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     const bypassed = deps.isBypassed?.(call.sessionID) === true;
     const env = deps.env === undefined ? {} : { env: deps.env };
     const verifyRoot = verifyRootOf(grant, sessionDirectory, workRootDeps.realpath);
+    const inReadSet = readSetFor(rp.cfg, call.sessionID);
     const routerGate = roleRouterGate({
       cfg: rp.cfg, bypassed, acceptance, ...env,
       // QA-P21-1-2, QA-P21-2 nit 3. QA-G-B-2-1: a carried acceptance is never deferred (its gate runs at the return); its change-set
@@ -1597,12 +2140,12 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       deferred: carried === null
         ? roleGateDeferred(rp.cfg, verifyPrompt, description, { verifyEnabled: deps.routerVerifyEnabled?.() !== false })
         : (carried.baseline === undefined || carried.baseline.changed === "unavailable") && carriedChecksChangeSet(carried.block),
-      outsideWorkRoot: roleGateOutsideWorkRoot(grant.workRoot, verifyPrompt, description, args.cwd), // DF2-F1, QA-P33F1-1-1, nit 3
+      outsideWorkRoot: roleGateOutsideWorkRoot(grant.workRoot, verifyPrompt, description, args.cwd, inReadSet), // DF2-F1, QA-P33F1-1-1, nit 3
     });
     // QA-G-B-7: the gate verifies nothing at all (enforcement off, /bypass, `require: never`, a cwd outside the root it verifies in)
     // → detection `none`.
     const verifies = roleVerificationRuns({
-      cfg: rp.cfg, bypassed, ...env, outsideWorkRoot: roleGateOutsideWorkRoot(verifyRoot, verifyPrompt, description, args.cwd),
+      cfg: rp.cfg, bypassed, ...env, outsideWorkRoot: roleGateOutsideWorkRoot(verifyRoot, verifyPrompt, description, args.cwd, inReadSet),
     });
     const detection = effectiveDetection({ routerGate, claim, acceptance, verifies });
 
@@ -1749,7 +2292,57 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       ...(carried !== null ? { carried: true as const } : {}), // QA-G-B-2-1
     };
     rememberRoutedRole(routed);
+    // Cross-repo (P1.4, QA round 1 F5/F9): the dispatch is accepted. The location the GRANT holds (a resume keeps its bound one)
+    // joins the orchestrator's working set (rule 2 for its later dispatches), and only when `routing.repoParents` is set: a
+    // `branch=` / `repo=` alone binds through declare-then-check but does not grow the working set.
+    if (grant.location !== undefined && grant.workRoot !== null && resolveRolesRouting(rp.cfg, "v2").repoParents.length > 0) addToWorkingSet(call.sessionID, grant.location);
     if (raised !== null && resumeID !== null) resumeRaises.delete(resumeID); // QA-P21-2-2: consumed once, by a routed resume
+    // P2g (OD6): a role delegate is told its work root. The header goes FIRST; the nonce line / carried block stay last. Only a
+    // grant with a work root and read access gets one; a resume only when its binding is exact (the bound grant is what it holds).
+    const exactResume = resumed && bound?.kind === "exact";
+    // QA round 1 #11: the router's header is always the one the delegate reads. A header the orchestrator copied from another
+    // dispatch (it names that dispatch's work root) is stripped first and replaced, never kept in place of ours.
+    // QA round 1 #12: `dispatchHeader: false` turns the header off, except that a work root other than the session directory is
+    // still told (the work-root rule points to ENVIRONMENT, which is the session directory): then a MINIMAL header, the identity
+    // paragraph (so stripDispatchHeader still removes it before DoD inference) and the `Working directory:` paragraph, no
+    // repositories paragraph.
+    const headerEligible = grant.workRoot !== null
+      && (grant.actions.has("read") || grant.actions.has("glob") || grant.actions.has("grep"))
+      && (!resumed || exactResume);
+    const headerOn = rp.cfg.dispatchHeader !== false;
+    const tellsOtherRoot = (root: string): boolean => {
+      const platform = workRootDeps.platform;
+      const same = (candidate: string): boolean => normalizeRootText(root, platform) === normalizeRootText(candidate, platform);
+      if (same(sessionDirectory)) return false;
+      try {
+        const real = workRootDeps.realpath(sessionDirectory);
+        return !(typeof real === "string" && real !== "" && same(real));
+      } catch {
+        return true;
+      }
+    };
+    // Q8 (invariant I9): the header is emitted only when it is relevant — cross-repo is configured (`routing.repoParents`), the route
+    // line declared `repo=` / `branch=` / `root=`, or the work root differs from the session directory. Otherwise the role prompt
+    // is byte-identical to what it was before the header existed (route-stripped text + nonce / carried block).
+    const headerRelevant = (root: string): boolean =>
+      resolveRolesRouting(rp.cfg, "v2").repoParents.length > 0
+      || declaredLine?.repo !== undefined || declaredLine?.branch !== undefined || declaredLine?.root !== undefined
+      || tellsOtherRoot(root);
+    const headerWanted = headerEligible && grant.workRoot !== null && headerRelevant(grant.workRoot) && (headerOn || tellsOtherRoot(grant.workRoot));
+    const finalPrompt = headerWanted && grant.workRoot !== null
+      ? `${buildRoleDispatchHeader({
+        agent,
+        workRoot: grant.workRoot,
+        edits: grant.actions.has("edit"),
+        ...(grant.location === undefined ? {} : { location: grant.location }),
+        ...(headerOn
+          ? { workingSet: workingSetOf(call.sessionID), readParents: resolveRolesRouting(rp.cfg, "v2").repoParents }
+          : {}),
+        ...(exactResume ? { exactResume: true } : {}),
+      })}${stripDispatchHeader(outPrompt)}`
+      // QA round 3: a header the orchestrator copied (it names another dispatch's root and verb) is stripped even when the router
+      // adds none; a prompt without one is returned unchanged (Q8: byte-identical).
+      : stripDispatchHeader(outPrompt);
 
     decided.set(call.callID, {
       parentSessionID: call.sessionID,
@@ -1775,7 +2368,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     trim(decided, MAX_PENDING);
     return {
       mode,
-      ...(outPrompt !== prompt ? { prompt: outPrompt } : {}),
+      ...(finalPrompt !== prompt ? { prompt: finalPrompt } : {}),
       model,
       ...(logged === null ? {} : { decisionID: logged }),
       ...(outDescription === null ? {} : { description: outDescription }),

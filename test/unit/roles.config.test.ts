@@ -16,14 +16,22 @@ import {
 } from "../../src/router/config";
 import { inspect } from "node:util";
 import {
+  collectRolesIssues,
   narrowRoleSpec,
   sanitizeDelegation,
   sanitizeExploration,
   sanitizeRoleAgents,
+  sanitizeRepoApprovalDays,
+  sanitizeRepoDepth,
+  sanitizeRepoExclude,
+  sanitizeRepoParents,
   sanitizeRun,
   sanitizeWorkRoots,
+  repoParentProblem,
   workRootProblem,
+  DEFAULT_REPO_APPROVAL_DAYS,
   DEFAULT_RUN_COMMANDS,
+  REPO_APPROVAL_CAP_DAYS,
 } from "../../src/router/roles-config";
 import {
   SHIPPED_ROLE_SPECS,
@@ -143,6 +151,96 @@ describe("routing.workRoots", () => {
   });
 });
 
+describe("routing.repoParents / repoDepth / repoExclude (cross-repo, P1.1)", () => {
+  it.each(["D:/git", "/home/u/src", "D:\\git\\work"])("accepts the parent %j", (entry) => {
+    expect(repoParentProblem(entry)).toBeUndefined();
+  });
+  it.each([
+    ["D:/git/*", "glob character"],
+    ["D:/git/{a,b}", "glob character"],
+    ["/home/u/s?c", "glob character"],
+    ["\\\\host\\share", "network or device path"],
+    ["//host/share", "network or device path"],
+    ["\\\\?\\C:\\x", "network or device path"],
+    ["\\\\.\\C:\\x", "network or device path"],
+    ["relative/dir", "absolute"],
+    ["..", "absolute"],
+    ["D:/a/../b", ".."],
+    ["C:/PROGRA~1", "8.3"],
+    ["", "empty"],
+  ])("refuses the parent %j", (entry, why) => {
+    expect(repoParentProblem(entry)).toContain(why);
+  });
+  it("sanitizeRepoParents drops bad entries with a path, dedupes, and ignores a non-array", () => {
+    const r = sanitizeRepoParents(["D:/git", "D:/git/*", 4, "/home/u/src", "D:/git"]);
+    expect(r.value).toEqual(["D:/git", "/home/u/src"]);
+    expect(r.issues.map((i) => i.path)).toEqual(["routing.repoParents[1]", "routing.repoParents[2]"]);
+    expect(sanitizeRepoParents(undefined).value).toBeUndefined();
+    const bad = sanitizeRepoParents("D:/git");
+    expect(bad.value).toBeUndefined();
+    expect(bad.issues.map((i) => i.path)).toEqual(["routing.repoParents"]);
+  });
+  it("sanitizeRepoExclude accepts globs under its own path", () => {
+    const r = sanitizeRepoExclude(["D:/git/secret*", "/home/u/**/vendor", "*", "D:/git/secret*"]);
+    expect(r.value).toEqual(["D:/git/secret*", "/home/u/**/vendor"]);
+    expect(r.issues.map((i) => i.path)).toEqual(["routing.repoExclude[2]"]);
+    expect(sanitizeRepoExclude(undefined).value).toBeUndefined();
+    expect(sanitizeRepoExclude("D:/x").issues.map((i) => i.path)).toEqual(["routing.repoExclude"]);
+  });
+  it.each([1, 2, 3, 4])("sanitizeRepoDepth accepts %j", (n) => {
+    expect(sanitizeRepoDepth(n)).toEqual({ value: n, issues: [] });
+  });
+  it.each([0, 5, 2.5, "2", null, Number.NaN])("sanitizeRepoDepth refuses %j", (n) => {
+    const r = sanitizeRepoDepth(n);
+    expect(r.value).toBeUndefined();
+    expect(r.issues).toHaveLength(1);
+    expect(r.issues[0]!.path).toBe("routing.repoDepth");
+    expect(r.issues[0]!.message).toContain("routing.repoDepth must be an integer from 1 to 4");
+    expect(r.issues[0]!.message).toContain("ignored");
+  });
+  it("sanitizeRepoDepth leaves an absent value alone", () => {
+    expect(sanitizeRepoDepth(undefined)).toEqual({ value: undefined, issues: [] });
+  });
+  it("validateConfig keeps the good values and drops the bad ones", () => {
+    const cfg = validateConfig(validRaw({ routing: { repoParents: ["D:/git", "rel"], repoDepth: 9, repoExclude: ["D:/git/x*"] } }));
+    expect(cfg.routing?.repoParents).toEqual(["D:/git"]);
+    expect(cfg.routing?.repoDepth).toBeUndefined();
+    expect(cfg.routing?.repoExclude).toEqual(["D:/git/x*"]);
+  });
+});
+
+describe("routing.repoApprovalDays (cross-repo, P4.1)", () => {
+  it("has a default of 14 and a cap of 90", () => {
+    expect([DEFAULT_REPO_APPROVAL_DAYS, REPO_APPROVAL_CAP_DAYS]).toEqual([14, 90]);
+  });
+  it.each([1, 14, 90])("sanitizeRepoApprovalDays accepts %j", (n) => {
+    expect(sanitizeRepoApprovalDays(n)).toEqual({ value: n, issues: [] });
+  });
+  it.each([0, 91, 1.5, "14", null, -1, Number.NaN, Number.POSITIVE_INFINITY])("sanitizeRepoApprovalDays refuses %j", (n) => {
+    const r = sanitizeRepoApprovalDays(n);
+    expect(r.value).toBeUndefined();
+    expect(r.issues).toHaveLength(1);
+    expect(r.issues[0]!.path).toBe("routing.repoApprovalDays");
+    expect(r.issues[0]!.message).toContain("routing.repoApprovalDays must be an integer from 1 to 90");
+    expect(r.issues[0]!.message).toContain("ignored");
+  });
+  it("sanitizeRepoApprovalDays leaves an absent value alone", () => {
+    expect(sanitizeRepoApprovalDays(undefined)).toEqual({ value: undefined, issues: [] });
+  });
+  it("validateConfig keeps a good value, drops a bad one, and collectRolesIssues reports it", () => {
+    expect(validateConfig(validRaw({ routing: { repoApprovalDays: 30 } })).routing?.repoApprovalDays).toBe(30);
+    expect(validateConfig(validRaw({ routing: { repoApprovalDays: 91 } })).routing?.repoApprovalDays).toBeUndefined();
+    expect(validateConfig(validRaw({ routing: { repoApprovalDays: "7" } })).routing?.repoApprovalDays).toBeUndefined();
+    expect(collectRolesIssues({ repoApprovalDays: 0 }, undefined).map((i) => i.path)).toEqual(["routing.repoApprovalDays"]);
+    expect(collectRolesIssues({ repoApprovalDays: 1 }, undefined)).toEqual([]);
+  });
+  it("resolveRolesRouting applies the default and keeps a set value", () => {
+    expect(resolveRolesRouting(validateConfig(validRaw()), "v2").repoApprovalDays).toBe(14);
+    expect(resolveRolesRouting(validateConfig(validRaw({ routing: { repoApprovalDays: 1 } })), "v2").repoApprovalDays).toBe(1);
+    expect(resolveRolesRouting(validateConfig(validRaw({ routing: { repoApprovalDays: 90 } })), "v2").repoApprovalDays).toBe(90);
+  });
+});
+
 describe("roleAgents", () => {
   it("keeps good fields and drops bad ones per field and per entry", () => {
     const r = sanitizeRoleAgents({
@@ -203,7 +301,29 @@ describe("resolveRolesRouting", () => {
     expect(r.run.scripts).toEqual(["test", "typecheck", "lint", "build"]);
     expect(r.run.timeoutMs).toBe(600000);
     expect(r.workRoots).toEqual([]);
+    expect([r.repoParents, r.repoDepth, r.repoExclude]).toEqual([[], 2, []]);
+    expect(Object.isFrozen(r.repoParents) && Object.isFrozen(r.repoExclude)).toBe(true);
     expect(r.inert).toBe(false);
+  });
+  it("resolves the cross-repo keys on v2", () => {
+    const cfg = validateConfig(validRaw({ routing: { repoParents: ["D:/git"], repoDepth: 3, repoExclude: ["D:/git/x*"] } }));
+    const r = resolveRolesRouting(cfg, "v2");
+    expect([r.repoParents, r.repoDepth, r.repoExclude]).toEqual([["D:/git"], 3, ["D:/git/x*"]]);
+    expect(r.inert).toBe(false);
+  });
+  it.each([
+    ["repoParents", { repoParents: ["D:/git"] }],
+    ["repoDepth", { repoDepth: 3 }],
+    ["repoExclude", { repoExclude: ["D:/git/x*"] }],
+    ["repoApprovalDays", { repoApprovalDays: 30 }],
+  ])("is inert on v1 with one notice when only %s is set", (_name, routing) => {
+    const warn = vi.fn();
+    const cfg = validateConfig(validRaw({ routing }));
+    const a = resolveRolesRouting(cfg, "v1", { warn });
+    resolveRolesRouting(cfg, "v1", { warn });
+    expect(a.inert).toBe(true);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith("roles delegation requires OpenCode v2; using tiers");
   });
   it("honours roles on v2", () => {
     const cfg = validateConfig(validRaw({ routing: { delegation: "roles", exploration: { rate: 0.1 } } }));
@@ -343,6 +463,64 @@ describe("layers (loadConfig)", () => {
     expect(cfg.routing?.workRoots).toBeUndefined();
     const text = getConfigNotices(project).map((n) => n.message).join("\n");
     expect(text).toContain("roleAgents, routing.exploration, routing.run, routing.workRoots");
+  });
+
+  it("strips project repoParents/repoDepth/repoExclude with a notice", () => {
+    const project = setup(undefined, {
+      defaultTier: "fast",
+      routing: { repoParents: ["D:/git"], repoDepth: 3, repoExclude: ["D:/git/x*"], margin: 0.2 },
+    });
+    const cfg = loadConfig(project);
+    expect(cfg.routing?.repoParents).toBeUndefined();
+    expect(cfg.routing?.repoDepth).toBeUndefined();
+    expect(cfg.routing?.repoExclude).toBeUndefined();
+    expect(cfg.routing?.margin).toBe(0.2);
+    const text = getConfigNotices(project).map((n) => n.message).join("\n");
+    expect(text).toContain("routing.repoParents, routing.repoDepth, routing.repoExclude");
+  });
+
+  it("global layer keeps the cross-repo keys, notices the bad entries and reports no unknown key", () => {
+    const project = setup(
+      { defaultTier: "fast", routing: { repoParents: ["D:/git", "D:/g/*"], repoDepth: 7, repoExclude: ["D:/git/x*"] } },
+      undefined,
+    );
+    const cfg = loadConfig(project);
+    expect(cfg.routing?.repoParents).toEqual(["D:/git"]);
+    expect(cfg.routing?.repoDepth).toBeUndefined();
+    expect(cfg.routing?.repoExclude).toEqual(["D:/git/x*"]);
+    const text = getConfigNotices(project).map((n) => n.message).join("\n");
+    expect(text).toContain("routing.repoParents[1]");
+    expect(text).toContain("routing.repoDepth must be an integer from 1 to 4");
+    expect(text).not.toContain("unknown routing key");
+  });
+
+  it("strips project repoApprovalDays with a notice; the global value stays (P4.1)", () => {
+    const project = setup(
+      { defaultTier: "fast", routing: { repoApprovalDays: 30 } },
+      { defaultTier: "fast", routing: { repoApprovalDays: 90, margin: 0.2 } },
+    );
+    const cfg = loadConfig(project);
+    expect(cfg.routing?.repoApprovalDays).toBe(30);
+    expect(cfg.routing?.margin).toBe(0.2);
+    const text = getConfigNotices(project).map((n) => n.message).join("\n");
+    expect(text).toContain("routing.repoApprovalDays");
+    expect(text).not.toContain("unknown routing key");
+  });
+
+  it("drops a project-only repoApprovalDays: the default applies", () => {
+    const project = setup(undefined, { defaultTier: "fast", routing: { repoApprovalDays: 1 } });
+    const cfg = loadConfig(project);
+    expect(cfg.routing?.repoApprovalDays).toBeUndefined();
+    expect(resolveRolesRouting(cfg, "v2").repoApprovalDays).toBe(14);
+  });
+
+  it("global layer notices a bad repoApprovalDays and keeps no value", () => {
+    const project = setup({ defaultTier: "fast", routing: { repoApprovalDays: 91 } }, undefined);
+    const cfg = loadConfig(project);
+    expect(cfg.routing?.repoApprovalDays).toBeUndefined();
+    const text = getConfigNotices(project).map((n) => n.message).join("\n");
+    expect(text).toContain("routing.repoApprovalDays must be an integer from 1 to 90");
+    expect(text).not.toContain("unknown routing key");
   });
 
   it("global layer keeps valid entries when others are invalid, and notices the bad ones", () => {

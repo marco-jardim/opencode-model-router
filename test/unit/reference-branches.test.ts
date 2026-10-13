@@ -588,7 +588,10 @@ describe("materialize branches (fake git)", { timeout: 20_000 }, () => {
     const reference = await ok(await run(g));
     expect(reference.links).toEqual([join(reference.dir, "node_modules")]);
     expect(reference.unreproduced).toEqual(["a/node_modules/", "b/node_modules/", "c/node_modules/"]);
-    expect(reference.exact).toBe(true);
+    // P0.4 (I6): pkg-out loads code from outside the repository that the reference cannot pin, so the reference is
+    // approximate; the in-repo workspace link, the store-like link into a node_modules and the dangling link add nothing.
+    expect(reference.exact).toBe(false);
+    expect(reference.inexactReasons).toEqual([{ cause: "external-link", path: "node_modules/pkg-out" }]);
     await reference.dispose();
     expect(await refDirs()).toEqual([]);
     expect(await exists(join(nm, "@scope"))).toBe(true);

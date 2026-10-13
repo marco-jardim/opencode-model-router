@@ -7,6 +7,7 @@ import {
   createVerificationWiring,
   extractAssistantText,
   HELD_RESULT_TEXT,
+  noChangeGateSpawnsNothing,
 } from "../../src/verify/wiring";
 import { buildDelegationDoD, buildForcingNote, createChangedFileStore, type DispatchDelta } from "../../src/verify/dispatch";
 import type { DoD } from "../../src/verify/dod";
@@ -15,6 +16,7 @@ import { preemptBackgroundVerification } from "../../src/verify/wiring";
 import type { GateResult } from "../../src/verify/gate";
 import type { RouterConfig } from "../../src/router/config";
 import { unattributedRisk } from "../../src/verify/pending";
+import type { CheckPlacement } from "../../src/verify/types";
 
 // Phase 2.1: the reference GC test below records the order of keepReferences and gcStaleReferences; both pass through to the real
 // module except the GC scan itself (no git in this unit test).
@@ -248,6 +250,87 @@ describe("router_verify and a held background result (QA-2.1-9)", () => {
     expect(report.items[0]).toMatchObject({ kind: "verdict", handle, via: "joined" });
     const again = await w.verifyHandles(session, { kind: "handles", handles: [handle] });
     expect(again.items[0]).toMatchObject({ kind: "verdict", handle, via: "cached" });
+  });
+});
+
+describe("router_verify on a restored entry whose perimeter was not journaled (hadPerimeter)", () => {
+  const session = "ses_parent_perimeter_lost";
+  const handle = "vrf_0123456789abcdef0123abcd";
+  const entryRecord = (over: Record<string, unknown> = {}) => ({
+    v: 1 as const,
+    kind: "entry",
+    handle,
+    parent: session,
+    child: "ses_child_perimeter_lost",
+    callID: "call-perimeter-lost",
+    producer: "ses_child_perimeter_lost",
+    tier: "fast",
+    dod: buildDelegationDoD({ prompt: "Refactor the parser.\n[acceptance]\ncheck: testsPass\n[/acceptance]" }),
+    // No change and a testsPass-only DoD: the gate would pass it without a process, so only the flag makes it unverifiable.
+    changedFiles: [],
+    changedFilesDropped: 0,
+    reference: null,
+    risk: unattributedRisk(),
+    description: "cross-repo dispatch",
+    root: null,
+    cwd: process.cwd(),
+    state: "unverified",
+    createdAt: Date.now(),
+    dispatchedAt: Date.now(),
+    ...over,
+  });
+
+  it("settles UNVERIFIABLE with 'perimeter lost in restart', never a pass", async () => {
+    const w = createVerificationWiring({ client: fakeClient(), directory: process.cwd(), getConfig: () => cfg(), logger: { warn: () => undefined } });
+    expect(w.pending.restore([entryRecord({ hadPerimeter: true })], { now: Date.now() }).restored).toBe(1);
+    const report = await w.verifyHandles(session, { kind: "handles", handles: [handle] });
+    expect(report.items).toHaveLength(1);
+    expect(report.items[0]).toMatchObject({
+      kind: "verdict", handle, via: "run",
+      result: { retryable: false, verdict: { pass: false, outcome: "unverifiable", reasons: ["perimeter lost in restart"] } },
+    });
+    expect(report.text).toContain("perimeter lost in restart");
+  });
+
+  it("an old record without the flag is judged as before (control)", async () => {
+    const w = createVerificationWiring({ client: fakeClient(), directory: process.cwd(), getConfig: () => cfg(), logger: { warn: () => undefined } });
+    expect(w.pending.restore([entryRecord()], { now: Date.now() }).restored).toBe(1);
+    const report = await w.verifyHandles(session, { kind: "handles", handles: [handle] });
+    expect(report.text).not.toContain("perimeter lost in restart");
+  });
+});
+
+describe("noChangeGateSpawnsNothing (F13)", () => {
+  const testsOnly: DoD = { kind: "deterministic", checks: [{ kind: "testsPass" }], criteria: [], deliverable: null, source: "explicit" };
+  const placed = (scope?: "affected" | "full"): CheckPlacement => ({
+    cwd: "/repo/pkg",
+    top: "/repo",
+    foreign: false,
+    ...(scope !== undefined ? { scope } : {}),
+  });
+
+  it("false with a placed scope=full", () => {
+    expect(noChangeGateSpawnsNothing(testsOnly, { placements: [placed("full")] })).toBe(false);
+    const two: DoD = { ...testsOnly, checks: [{ kind: "testsPass" }, { kind: "testsPass" }] };
+    expect(noChangeGateSpawnsNothing(two, { placements: [undefined, placed("full")] })).toBe(false);
+  });
+
+  it("false with fullScope", () => {
+    expect(noChangeGateSpawnsNothing(testsOnly, { fullScope: true })).toBe(false);
+    expect(noChangeGateSpawnsNothing(testsOnly, { fullScope: true, placements: [placed("affected")] })).toBe(false);
+  });
+
+  it("true otherwise (unchanged)", () => {
+    expect(noChangeGateSpawnsNothing(testsOnly)).toBe(true);
+    expect(noChangeGateSpawnsNothing(testsOnly, {})).toBe(true);
+    expect(noChangeGateSpawnsNothing(testsOnly, { fullScope: false })).toBe(true);
+    expect(noChangeGateSpawnsNothing(testsOnly, { placements: [placed("affected")] })).toBe(true);
+    expect(noChangeGateSpawnsNothing(testsOnly, { placements: [placed()] })).toBe(true);
+    expect(noChangeGateSpawnsNothing(testsOnly, { placements: [undefined] })).toBe(true);
+    // The rest of the rule is as before: any other check or a criterion still means a process or a grader.
+    expect(noChangeGateSpawnsNothing({ ...testsOnly, checks: [] })).toBe(false);
+    expect(noChangeGateSpawnsNothing({ ...testsOnly, criteria: ["x"] })).toBe(false);
+    expect(noChangeGateSpawnsNothing({ ...testsOnly, checks: [{ kind: "testsPass" }, { kind: "lintClean" }] })).toBe(false);
   });
 });
 

@@ -37,6 +37,7 @@ import type {
   RunnerHost,
   RunResult,
   TestSearchSeam,
+  Unverifiable,
 } from "./runner";
 import type { DispatchReference, MaterializedReference, ReferenceDeps } from "./reference";
 import type { TreeSnapshot } from "./dispatch";
@@ -47,6 +48,7 @@ import { resolveAgainst } from "./paths";
 import { isAbsolute, posix as pathPosix, win32 as pathWin32 } from "node:path";
 import { judgeScoped, observeTests, REFERENCE_NONE } from "./baseline";
 import {
+  crossLinkIgnoredS6,
   detectRunner,
   isNoAffected,
   isUnscoped,
@@ -58,6 +60,7 @@ import {
   resolveEntry,
 } from "./runner";
 import { fileKeyOfId } from "./baseline";
+import { isTestPath } from "./risk";
 import { DEFAULT_MATERIALIZE_TIMEOUT_MS, gcStaleReferences, materialize, nodeReferenceFs } from "./reference";
 import { acquireSlot, type SlotHandle } from "./slot";
 
@@ -1238,6 +1241,19 @@ export interface DirectTestsPassHookDeps {
   currentTree?: TreeSnapshot;
   /** Planner seam; default planScopedRun. */
   plan?: typeof planScopedRun;
+  /**
+   * Cross-repo P3a (D23, OD-P3a-2 b): lists the linked repository's git-ignored modules (tree.ts listIgnoredModules), added to a
+   * cross-link request's changed files so a consumer that loads W's build output (`dist/`) is selected. Called only for a request
+   * with `crossLinkRoot`, a `dispatchStartedAt` (`since`: only the files modified at or after it, D23 as amended 2026-10-12)
+   * and a non-empty change set; absent: nothing is added (as before).
+   */
+  listIgnored?: (root: string, signal: AbortSignal, since: number) => Promise<import("./tree").IgnoredModules>;
+  /**
+   * Cross-repo P3a (D23, QA round 2 M-A): a changed source's mtime in ms (tree.ts fileMtimeMs), undefined when the file does not
+   * exist. Compared with the newest listed ignored module of each ignored directory; absent, or a throw, counts as newer than
+   * any build (fail closed: S6 cross-link-build-stale).
+   */
+  mtimeOf?: (path: string) => Promise<number | undefined>;
   logger?: Pick<PluginLogger, "warn">;
 }
 
@@ -1274,6 +1290,78 @@ async function synthesizeFullResult(
   };
 }
 
+/** Cross-repo P3a (D23, QA round 2 M-A): declaration files are never build inputs whose edit leaves the build output stale. */
+const DECLARATION_SOURCE = /\.d\.[cm]?ts$/i;
+
+/**
+ * Cross-repo P3a (D23, QA round 2 M-A): mirrors tree.ts IGNORED_TOOL_STATE_DIRS (not imported: this module stays pure). A path
+ * relative to W with a `node_modules` (so `node_modules/.vite`) or tool-state segment, any case for the latter.
+ */
+const TOOL_STATE_DIRS: readonly string[] = ["coverage", ".nyc_output", ".vitest", ".cache"];
+function isToolStatePath(relative: string): boolean {
+  return relative.split(/[\\/]/).some(segment => segment === "node_modules" || TOOL_STATE_DIRS.includes(segment.toLowerCase()));
+}
+
+/** A deleted status: a porcelain XY code with D in either column, else (`D`, `deleted`) its first letter (as risk.ts). */
+function isDeletedStatus(status: string | undefined): boolean {
+  if (status === undefined) return false;
+  return /^[ MADRCU?!]{2}$/.test(status) ? status.includes("D") : /^d/i.test(status);
+}
+
+/**
+ * Cross-repo P3a (D23, QA round 2 M-A): S6 `cross-link-build-stale` when a changed source of W is newer than the newest listed
+ * ignored module of an ignored directory (`newestByDir`, tree.ts newestMtimeByDir), else undefined. The sources: the request's
+ * changed files under `root` that are not tests (risk.ts isTestPath, on the W-relative path), not declaration files, not
+ * deleted and not ignored (`!!`). A source that no longer exists (`mtimeOf` undefined) is skipped; a source whose mtime cannot
+ * be read (a throw, or no `mtimeOf`) counts as newer than any build (fail closed). The newest source names the S6; the
+ * directories are compared in sorted order.
+ */
+async function buildStaleness(
+  req: TestsPassRequest,
+  root: string,
+  newestByDir: Readonly<Record<string, number>>,
+  mtimeOf: ((path: string) => Promise<number | undefined>) | undefined,
+  host: Partial<RunnerHost> | undefined,
+): Promise<Unverifiable | undefined> {
+  if (req.changedFiles === "unavailable") return undefined;
+  const P = (host?.platform ?? process.platform) === "win32" ? pathWin32 : pathPosix;
+  let newestSource: { rel: string; mtime: number } | undefined;
+  const sources = req.changedFiles
+    .filter(f => f.status !== "!!" && !isDeletedStatus(f.status))
+    .map(f => {
+      const absolute = P.isAbsolute(f.path) ? f.path : P.resolve(req.cwd, f.path);
+      return { absolute, rel: P.relative(root, absolute).replace(/\\/g, "/") };
+    })
+    .filter(s => s.rel !== "" && s.rel !== ".." && !s.rel.startsWith("../") && !P.isAbsolute(s.rel))
+    .filter(s => !isTestPath(s.rel) && !DECLARATION_SOURCE.test(s.rel))
+    .sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
+  for (const source of sources) {
+    let mtime: number | undefined;
+    try {
+      mtime = mtimeOf === undefined ? Infinity : await mtimeOf(source.absolute);
+    } catch {
+      mtime = Infinity;
+    }
+    if (mtime === undefined) continue; // Gone: no content of it can be newer than the build.
+    if (Number.isNaN(mtime)) mtime = Infinity; // Unreadable: fail closed.
+    if (newestSource === undefined || mtime > newestSource.mtime) newestSource = { rel: source.rel, mtime };
+  }
+  if (newestSource === undefined) return undefined;
+  for (const dir of Object.keys(newestByDir).sort()) {
+    if (newestSource.mtime > newestByDir[dir]) {
+      const where = dir === "." ? root : `${root}/${dir}`;
+      return {
+        unverifiable: true,
+        code: "cross-link-build-stale",
+        reason:
+          `the build output in ${where} is older than ${newestSource.rel} changed in the linked repository; ` +
+          "rebuild it (e.g. a buildPasses check in the linked repository before this one) or use scope=full",
+      };
+    }
+  }
+  return undefined;
+}
+
 /**
  * S5 as a direct call (2.1.2.4; 2.2 swaps in the batch coordinator): plan, run under ONE scope,
  * recheck the failing files at the dispatch reference, close the scope. Never rejects.
@@ -1300,6 +1388,55 @@ export function createDirectTestsPassHook(deps: DirectTestsPassHookDeps): TestsP
     return scope.rechecker(req.command, req.cwd, deps.currentTree)(ref.reference, scoped.result.failingFiles, req.deadline);
   };
 
+  /**
+   * Cross-repo P3a (D23, OD-P3a-2 b, finding X6): with `crossLinkRoot` and a lister, W's git-ignored modules are appended to the
+   * changed files (exact-path duplicates dropped; status `!!`, git's code for an ignored file), so a consumer that loads W's
+   * build output (`dist/`) is selected. Over the bounds, unlisted or a throwing lister → S6 (fail closed), before any plan.
+   * Otherwise (no cross-link root, no lister, unavailable changed files, nothing ignored) the request's own changed files.
+   *
+   * D23 as amended (2026-10-12, QA C1/M4): only the modules whose own mtime is at or after the dispatch start are listed (lister
+   * `since` = the request's `dispatchStartedAt`, the original start of a deferred one; tool-state directories such as
+   * `coverage/` never), so a build output older than the dispatch is never a run input. A module written during the dispatch
+   * is still stale when W's source changed again after it (QA round 2 M-A): when any changed source of W (buildStaleness) is
+   * newer than the newest listed module of an ignored directory that contributed modules (`dist/`), the request is S6
+   * `cross-link-build-stale` (fail closed), before any plan. No start time, or no change of W's in the request: the lister is
+   * not called and nothing is added; nothing listed: nothing is added and nothing is compared (toward zero selection, never
+   * toward stale inputs).
+   */
+  const withIgnoredModules = async (req: TestsPassRequest): Promise<{ files: TestsPassRequest["changedFiles"] } | Unverifiable> => {
+    if (req.crossLinkRoot === undefined || deps.listIgnored === undefined || req.changedFiles === "unavailable") {
+      return { files: req.changedFiles };
+    }
+    const since = req.dispatchStartedAt;
+    if (since === undefined || !Number.isFinite(since) || req.changedFiles.length === 0) return { files: req.changedFiles };
+    const root = req.crossLinkRoot;
+    let listed: import("./tree").IgnoredModules;
+    try {
+      listed = await deps.listIgnored(root, req.deadline.signal, since);
+    } catch {
+      listed = { unavailable: true };
+    }
+    if ("overBounds" in listed) return crossLinkIgnoredS6("over-bounds", root);
+    if (!("files" in listed)) return crossLinkIgnoredS6("unavailable", root);
+    // QA round 2 M-A: tool-state files (`coverage/`, ...) are neither inputs nor build output, whatever the lister answers.
+    const P = (deps.host?.platform ?? process.platform) === "win32" ? pathWin32 : pathPosix;
+    const modules = listed.files.filter(path => !isToolStatePath(P.relative(root, path)));
+    if (modules.length > 0) {
+      const newestByDir: Record<string, number> = {};
+      for (const [dir, mtime] of Object.entries(listed.newestMtimeByDir)) if (!isToolStatePath(dir)) newestByDir[dir] = mtime;
+      const stale = await buildStaleness(req, root, newestByDir, deps.mtimeOf, deps.host);
+      if (stale !== undefined) return stale;
+    }
+    const seen = new Set(req.changedFiles.map(f => f.path));
+    const added: { path: string; status: string }[] = [];
+    for (const path of modules) {
+      if (seen.has(path)) continue;
+      seen.add(path);
+      added.push({ path, status: "!!" });
+    }
+    return { files: added.length === 0 ? req.changedFiles : [...req.changedFiles, ...added] };
+  };
+
   return async (req): Promise<TestsPassRun> => {
     let scope: CheckScope | undefined;
     let scoped: ScopedOutcome | undefined;
@@ -1308,15 +1445,23 @@ export function createDirectTestsPassHook(deps: DirectTestsPassHookDeps): TestsP
         scope = deps.openScope({ cwd: req.cwd, command: req.command });
         scoped = await runFull(req, scope);
       } else {
+        // Cross-repo P3a (D23): a cross-link request also passes W's ignored modules (its build output), or is S6 without them.
+        const changedFiles = await withIgnoredModules(req);
+        if ("unverifiable" in changedFiles) {
+          return { scoped: { kind: "unverifiable", code: changedFiles.code, reason: changedFiles.reason }, recheck: undefined };
+        }
         // P2/P3: planning outcomes take no slot and spawn nothing.
         const planned = await plan({
           command: req.command,
           cwd: req.cwd,
-          changedFiles: req.changedFiles,
+          changedFiles: changedFiles.files,
           budget: { maxWorkers: deps.budget.maxWorkers },
           fs: deps.plannerFs,
           search: deps.search,
           ...(deps.host !== undefined ? { host: deps.host } : {}),
+          // Cross-repo P3a (runner.ts G.4b): only when set, so a request without them plans as before.
+          ...(req.crossLinkRoot !== undefined ? { crossLinkRoot: req.crossLinkRoot } : {}),
+          ...(req.crossLinkAliases !== undefined ? { crossLinkAliases: req.crossLinkAliases } : {}),
         });
         if (isNoAffected(planned)) return { scoped: { kind: "no-affected", note: planned.note }, recheck: undefined };
         if (isUnverifiable(planned)) {
@@ -1486,12 +1631,44 @@ function fromJudgement(j: TestsPassJudgement): CheckResult {
   };
 }
 
+/** Cross-repo P2.4: the reference of a check placed in another repository (the dispatch captured the work root only). */
+export const FOREIGN_REFERENCE_NONE = "the check runs in another repository; the dispatch reference covers the work root only";
+
 function defaultReference(deps: DeterministicDeps): ReferenceState {
   return deps.budget?.failureRecheck === false ? { kind: "disabled" } : { kind: "none", reason: REFERENCE_NONE.untracked };
 }
 
+/**
+ * Cross-repo P3a (SD-P3a-1, -2, -5): the cross-link inputs of a foreign testsPass with an explicit scope=affected: W's git top
+ * and the other spellings of it seen from the consumer (`DeterministicDeps.crossLinkAliases`).
+ */
+interface CrossLinkTarget {
+  readonly root: string;
+  readonly aliases?: readonly string[];
+}
+
+/** The cross-link target for a consumer cwd; the alias provider is fail-soft (an error or a non-array gives no aliases). */
+function crossLinkTarget(deps: DeterministicDeps, root: string, consumerCwd: string): CrossLinkTarget {
+  let aliases: readonly string[] | undefined;
+  if (deps.crossLinkAliases !== undefined) {
+    try {
+      const given = deps.crossLinkAliases(consumerCwd);
+      if (Array.isArray(given)) aliases = given.filter((alias): alias is string => typeof alias === "string" && alias !== "");
+    } catch {
+      aliases = undefined;
+    }
+  }
+  return { root, ...(aliases !== undefined ? { aliases } : {}) };
+}
+
 /** P0-P8 for one testsPass check whose command already passed the allowlist (P1). Never rejects. */
-async function runTestsPass(command: string, deps: DeterministicDeps, timeoutMs: number): Promise<CheckResult> {
+async function runTestsPass(
+  command: string,
+  deps: DeterministicDeps,
+  timeoutMs: number,
+  scope?: "affected" | "full",
+  crossLink?: CrossLinkTarget,
+): Promise<CheckResult> {
   if (!deps.testsPass) return { ok: false, unverifiable: true, reason: `${NO_TESTS_PASS_HOOK}: ${command}` };
   if (!deps.cwd || !isAbsolute(deps.cwd)) {
     return { ok: false, unverifiable: true, reason: `testsPass cannot run without an absolute working directory: ${command}` };
@@ -1503,10 +1680,14 @@ async function runTestsPass(command: string, deps: DeterministicDeps, timeoutMs:
       const run = await hook({
         command,
         cwd,
-        testScope: deps.budget?.testScope ?? "affected",
+        testScope: scope ?? deps.budget?.testScope ?? "affected",
         changedFiles: deps.changedFiles ?? "unavailable",
         reference: deps.reference ?? defaultReference(deps),
         deadline,
+        ...(crossLink !== undefined ? { crossLinkRoot: crossLink.root } : {}),
+        ...(crossLink?.aliases !== undefined ? { crossLinkAliases: crossLink.aliases } : {}),
+        // D23 as amended (QA C1): the dispatch start, so only W's ignored modules modified during the dispatch are inputs.
+        ...(crossLink !== undefined && deps.dispatchStartedAt !== undefined ? { dispatchStartedAt: deps.dispatchStartedAt } : {}),
       });
       // QA-G-B-2-1: a carried acceptance never passes on a run that never happened.
       if (deps.noAffectedUnverifiable !== undefined && run.scoped.kind === "no-affected") {
@@ -1525,6 +1706,8 @@ async function runCommandCheck(
   deps: DeterministicDeps,
   allowlist: string[],
   timeoutMs: number,
+  scope?: "affected" | "full",
+  crossLink?: CrossLinkTarget,
 ): Promise<CheckResult> {
   let command = resolveRepoCommand(check, kind, deps.defaults);
   if (kind === "buildPasses" && !check.command && !deps.defaults?.buildCommand) {
@@ -1552,7 +1735,7 @@ async function runCommandCheck(
     if (!isCommandAllowed(command, allowlist)) {
       return { ok: false, unverifiable: true, reason: `command not allowlisted: ${command}` };
     }
-    return runTestsPass(command, deps, timeoutMs);
+    return runTestsPass(command, deps, timeoutMs, scope, crossLink);
   }
 
   const fn = async (): Promise<CheckResult> => {
@@ -1562,7 +1745,8 @@ async function runCommandCheck(
       }
       let launch: Launch = (scope, deadline) => scope.runShell(command, deps.cwd, deadline);
       let scopedTo: number | undefined;
-      if (kind === "lintClean" && deps.openScope) {
+      // Cross-repo P2.4: scope=full runs the lint unscoped.
+      if (kind === "lintClean" && deps.openScope && scope !== "full") {
         // T8: NoAffected passes with its note and takes no slot; Unscoped runs the command as today.
         const plan = await planLint(command, deps);
         if (isNoAffected(plan)) {
@@ -1666,23 +1850,48 @@ export async function runDeterministic(dod: DoD, deps: DeterministicDeps): Promi
   const results: CheckResult[] = [];
 
   // Sequential for deterministic mutex semantics and stable evidence order.
-  for (const check of checks) {
+  for (const [index, check] of checks.entries()) {
     let result: CheckResult;
+    // Cross-repo P2.4: a placed check runs with its own cwd (also the mutex key and the base of relative paths); a foreign one
+    // has no dispatch reference. Without a placement `cd` is `deps` itself.
+    const placement = deps.placements?.[index];
+    const cd: DeterministicDeps = placement
+      ? { ...deps, cwd: placement.cwd, ...(placement.foreign ? { reference: { kind: "none", reason: FOREIGN_REFERENCE_NONE } satisfies ReferenceState } : {}) }
+      : deps;
+
+    // Cross-repo P3a (SD-P3a-1, D22): a consumer testsPass with an explicit scope=affected runs `related` through the link into
+    // W (deps.changeRoot, set by the gate only with foreign placements); without changeRoot it keeps the refusal below.
+    const crossLink =
+      placement?.foreign === true && check.kind === "testsPass" && placement.scope === "affected" && deps.changeRoot !== undefined
+        ? crossLinkTarget(deps, deps.changeRoot, placement.cwd)
+        : undefined;
+
+    // A test or lint check in a consumer repository must use scope=full (except the cross-link testsPass above): the change under
+    // verification is in the work root, so an affected-only run cannot be attributed to it. Unverifiable without running; never a
+    // recorded failure.
+    if (placement?.foreign === true && (check.kind === "testsPass" || check.kind === "lintClean") && placement.scope !== "full" && crossLink === undefined) {
+      results.push({
+        ok: false,
+        unverifiable: true,
+        reason: `check ${index + 1} (${check.kind}) runs in another repository (${placement.cwd}) and must use scope=full: affected tests cannot be attributed to a change in the work root`,
+      });
+      continue;
+    }
 
     switch (check.kind) {
       case "fileExists":
-        result = await runFileExists(check, deps);
+        result = await runFileExists(check, cd);
         break;
       case "run":
-        result = await runRun(check, deps, allowlist, timeoutMs);
+        result = await runRun(check, cd, allowlist, timeoutMs);
         break;
       case "testsPass":
       case "buildPasses":
       case "lintClean":
-        result = await runCommandCheck(check, check.kind, deps, allowlist, timeoutMs);
+        result = await runCommandCheck(check, check.kind, cd, allowlist, timeoutMs, placement?.scope, crossLink);
         break;
       case "schemaMatch":
-        result = await runSchemaMatch(check, deps);
+        result = await runSchemaMatch(check, cd);
         break;
       default: {
         // Defensive: TypeScript proves this is unreachable; guards runtime extensions.
@@ -1690,6 +1899,19 @@ export async function runDeterministic(dod: DoD, deps: DeterministicDeps): Promi
         result = { ok: false, reason: `unknown check kind: ${exhaustive}` };
         break;
       }
+    }
+
+    // F6: the change under verification is in the work root, so a failure in a foreign repository is the consumer's:
+    // unverifiable, never recorded as a failure (gate.ts turns a recorded failure into "fail").
+    if (placement?.foreign === true && !result.ok && !result.unverifiable) {
+      // The failing ids are dropped with the verdict: nothing in the work root's reference says whom they belong to.
+      result = {
+        ok: false,
+        unverifiable: true,
+        ...(result.note !== undefined ? { note: result.note } : {}),
+        ...(result.evidence !== undefined ? { evidence: result.evidence } : {}),
+        reason: `a check in another repository (${placement.cwd}) failed; the change under verification is in the work root, so this failure can be neither excused nor attributed: ${result.reason ?? "check failed"}`,
+      };
     }
 
     results.push(result);

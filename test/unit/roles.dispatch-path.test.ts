@@ -6,6 +6,7 @@ import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { validateConfig, type RouterConfig } from "../../src/router/config";
+import { buildRoleDispatchHeader, DISPATCH_HEADER_PREFIX, DISPATCH_HEADER_SEPARATOR, stripDispatchHeader } from "../../src/router/dispatch-header";
 import { rememberDispatch, resetDispatchRegistry } from "../../src/router/sessions";
 import { buildRoleLadder } from "../../src/routing/engine/ladders";
 import { acquireOutcomes } from "../../src/routing/outcomes";
@@ -27,10 +28,14 @@ import {
   routedRoleOf,
   routedWorkRoot,
   type DispatchRouter,
+  type DispatchRouterDeps,
   type RouteOutcome,
 } from "../../src/routing/wire/dispatch";
 import { createEngineRuntime, type EngineRuntime } from "../../src/routing/wire/runtime";
+import { forgetWorkingSet } from "../../src/routing/wire/working-set";
+import type { Admission, RepoLocation } from "../../src/routing/roles/admission";
 import { resolveRoles } from "../../src/router/roles";
+import { resumedGrant } from "../../src/routing/wire/dispatch";
 
 const bundled = JSON.parse(readFileSync(join(process.cwd(), "tiers.json"), "utf-8")) as Record<string, unknown>;
 const logger = { warn: vi.fn() };
@@ -81,7 +86,10 @@ interface World {
 const cleanups: Array<() => Promise<void>> = [];
 let seq = 0;
 
-function makeWorld(routing: Record<string, unknown>, opts: { extra?: Record<string, unknown>; variants?: boolean; bypassed?: boolean; env?: Record<string, string> } = {}): World {
+function makeWorld(routing: Record<string, unknown>, opts: {
+  extra?: Record<string, unknown>; variants?: boolean; bypassed?: boolean; env?: Record<string, string>;
+  createAdmission?: DispatchRouterDeps["createAdmission"];
+} = {}): World {
   const main = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-p21b-main-")));
   const worktree = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-p21b-wt-")));
   const outside = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-p21b-out-")));
@@ -116,6 +124,7 @@ function makeWorld(routing: Record<string, unknown>, opts: { extra?: Record<stri
     realpath,
     isBypassed: () => opts.bypassed === true,
     env: opts.env ?? {},
+    ...(opts.createAdmission === undefined ? {} : { createAdmission: opts.createAdmission }),
   });
   cleanups.push(async () => {
     await runtime.dispose();
@@ -201,7 +210,8 @@ describe("role dispatch path", () => {
     expect(role.nonce).toMatch(/^[A-Za-z0-9_-]{16,128}$/);
     const lines = outcome.prompt!.split("\n");
     expect(lines[lines.length - 1]).toBe(`OMR_NONCE=${role.nonce}`);
-    expect(outcome.prompt!.startsWith("find where the config is loaded\nreport file:line\n")).toBe(true);
+    // P2g (OD6): the role header comes first; the prompt itself is compared without it
+    expect(stripDispatchHeader(outcome.prompt!).startsWith("find where the config is loaded\nreport file:line\n")).toBe(true);
     expect(outcome.description).toBe(`find loader [nonce ${role.nonce}]`);
     // the work root without root= is the session directory (canonical long form)
     expect(role.workRoot).toBe(world.main);
@@ -253,15 +263,15 @@ describe("role dispatch path", () => {
     expect(row.chosen.origin).toBe("role");
   });
 
-  it("root= outside the session's worktrees: no work root, a note, write withheld — and no filesystem call on it", async () => {
+  // Q9: FLIPPED ON PURPOSE — the dispatch used to run with no work root, a note and write withheld; a declared target that was
+  // refused now refuses the dispatch with the note.
+  it("root= outside the session's worktrees: the dispatch is refused with the note — and no filesystem call on it", async () => {
     const world = makeWorld({ delegation: "roles", engine: "static" });
     const input = { agent: "implementer", prompt: `[route class=implement risk=low scope=single needs=edit root=${world.outside}]\nchange x` };
-    const outcome = await world.router.route(call(world, input));
-    const role = outcome.role!;
-    expect(role.workRoot).toBeNull();
-    expect(role.requestedRoot).toBe(world.outside);
-    expect(role.notes.some((note) => note.includes("neither the session directory nor a worktree"))).toBe(true);
-    expect([...role.grant.actions]).not.toContain("edit");
+    const refusal = await world.router.route(call(world, input)).catch((error: unknown) => error);
+    expect(refusal).toBeInstanceOf(RoleDispatchRefusal);
+    expect((refusal as RoleDispatchRefusal).reason).toContain("neither the session directory nor a worktree");
+    expect((refusal as RoleDispatchRefusal).message).toMatch(/^\[router\] role dispatch @implementer refused: /);
     expect(world.realpath).not.toHaveBeenCalledWith(world.outside);
   });
 
@@ -451,6 +461,129 @@ describe("exported helpers for the adapter (P2.1-C)", () => {
     expect((await resolveRoleWorkRoot({ root: null, sessionDirectory: "D:\\git\\main" }, deps)).workRoot).toBe("CANON(D:\\git\\main)");
   });
 
+  describe("cross-repo P1.4: resolveRoleWorkRoot binds through admission", () => {
+    // Admission returns the canonical worktree (RepoLocation.worktree); the fake realpath is idempotent on canonical paths.
+    const located = (worktree: string, over: Partial<RepoLocation> = {}): RepoLocation => ({
+      repository: worktree, name: worktree.split("\\").pop() ?? worktree, worktree: `CANON(${worktree})`, branch: "main", head: "abc1234def", worktrees: [], ...over,
+    });
+    const fakeDeps = () => ({
+      listWorktrees: vi.fn(async () => "worktree D:/git/main\n"),
+      realpath: vi.fn((path: string) => (path.startsWith("CANON(") ? path : `CANON(${path})`)),
+      platform: "win32" as const,
+    });
+    const fakeAdmission = (result: Admission) => ({ admit: vi.fn(async () => result), resolve: vi.fn(async () => result) });
+
+    it("I9: without an admission, or with nothing for it to bind, today's text match is unchanged and admission is never asked", async () => {
+      const deps = fakeDeps();
+      const admission = fakeAdmission({ ok: false, reason: "never" });
+      expect(await resolveRoleWorkRoot({ root: null, sessionDirectory: "D:\\git\\main" }, deps, { admission }))
+        .toEqual({ workRoot: "CANON(D:\\git\\main)", requested: null, note: null });
+      expect(await resolveRoleWorkRoot({ root: "d:\\GIT\\main", sessionDirectory: "D:\\git\\main" }, deps, { admission }))
+        .toEqual({ workRoot: "CANON(D:\\git\\main)", requested: "d:\\GIT\\main", note: null });
+      // repo= without an admission: the old path, the old note
+      expect(await resolveRoleWorkRoot({ root: "D:\\git\\api", sessionDirectory: "D:\\git\\main" }, deps, { repo: "api" })).toEqual({
+        workRoot: null, requested: "D:\\git\\api",
+        note: "root=D:\\git\\api is neither the session directory nor a worktree listed by `git worktree list --porcelain`: no work root",
+      });
+      expect(admission.admit).not.toHaveBeenCalled();
+      expect(admission.resolve).not.toHaveBeenCalled();
+    });
+
+    it("repo= with an admission: resolve() binds the canonical worktree, the location is returned, no note", async () => {
+      const deps = fakeDeps();
+      const bound = located("D:\\src\\api");
+      const admission = fakeAdmission({ ok: true, location: bound });
+      expect(await resolveRoleWorkRoot({ root: null, sessionDirectory: "D:\\git\\main" }, deps, { repo: "api", admission, known: ["D:\\git\\main", "D:\\git\\wt"] }))
+        .toEqual({ workRoot: "CANON(D:\\src\\api)", requested: null, note: null, location: bound });
+      expect(admission.resolve).toHaveBeenCalledWith({ repo: "api" }, { sessionRepository: "D:\\git\\main", known: ["D:\\git\\main", "D:\\git\\wt"] });
+      expect(admission.admit).not.toHaveBeenCalled();
+      expect(deps.listWorktrees).not.toHaveBeenCalled(); // declared names never go through the text match
+    });
+
+    it("a refusal: no work root, and the note is the refusal's reason", async () => {
+      const reason = "repo=api matches no repository below routing.repoParents (searched D:\\src): no work root.";
+      expect(await resolveRoleWorkRoot({ root: null, sessionDirectory: "D:\\git\\main" }, fakeDeps(), { repo: "api", admission: fakeAdmission({ ok: false, reason }) }))
+        .toEqual({ workRoot: null, requested: null, note: reason });
+      const thrown = { admit: vi.fn(async (): Promise<Admission> => { throw new Error("boom"); }), resolve: vi.fn(async (): Promise<Admission> => { throw new Error("boom"); }) };
+      const failed = await resolveRoleWorkRoot({ root: null, sessionDirectory: "D:\\git\\main" }, fakeDeps(), { repo: "api", admission: thrown });
+      expect(failed.workRoot).toBeNull();
+      expect(failed.note).toContain("boom");
+    });
+
+    it("a root= the session repository does not list: the text match runs first, then admit(); admitted → bound, refused → the reason", async () => {
+      const deps = fakeDeps();
+      const bound = located("D:\\src\\lib");
+      const admission = fakeAdmission({ ok: true, location: bound });
+      expect(await resolveRoleWorkRoot({ root: "D:\\src\\lib", sessionDirectory: "D:\\git\\main" }, deps, { admission, known: ["D:\\git\\wt"] }))
+        .toEqual({ workRoot: "CANON(D:\\src\\lib)", requested: "D:\\src\\lib", note: null, location: bound });
+      expect(deps.listWorktrees).toHaveBeenCalledTimes(1);
+      // Phase 4 QA M1: the session repository is passed for rule 2's session exemption.
+      expect(admission.admit).toHaveBeenCalledWith("D:\\src\\lib", ["D:\\git\\main", "D:\\git\\wt"], "D:\\git\\main");
+      expect(admission.resolve).not.toHaveBeenCalled();
+      const reason = "root=D:\\src\\lib is not below routing.repoParents and no known repository lists it: no work root.";
+      expect(await resolveRoleWorkRoot({ root: "D:\\src\\lib", sessionDirectory: "D:\\git\\main" }, deps, { admission: fakeAdmission({ ok: false, reason }) }))
+        .toEqual({ workRoot: null, requested: "D:\\src\\lib", note: reason });
+    });
+
+    it("branch= alone goes through resolve() against the session repository; root= with branch= too, so the branch must agree", async () => {
+      const deps = fakeDeps();
+      const bound = located("D:\\git\\main-feat", { repository: "D:\\git\\main", name: "main", branch: "feat" });
+      const admission = fakeAdmission({ ok: true, location: bound });
+      expect(await resolveRoleWorkRoot({ root: null, sessionDirectory: "D:\\git\\main" }, deps, { branch: "feat", admission }))
+        .toEqual({ workRoot: "CANON(D:\\git\\main-feat)", requested: null, note: null, location: bound });
+      expect(admission.resolve).toHaveBeenCalledWith({ branch: "feat" }, { sessionRepository: "D:\\git\\main", known: ["D:\\git\\main"] });
+      const mismatch = "root=D:\\git\\main declares branch=feat, but that worktree is on main (HEAD abc1234): no work root.";
+      const refusing = fakeAdmission({ ok: false, reason: mismatch });
+      // the session directory matches root= as text, but the declared branch still has to agree
+      expect(await resolveRoleWorkRoot({ root: "D:\\git\\main", sessionDirectory: "D:\\git\\main" }, deps, { branch: "feat", admission: refusing }))
+        .toEqual({ workRoot: null, requested: "D:\\git\\main", note: mismatch });
+      expect(refusing.resolve).toHaveBeenCalledWith({ root: "D:\\git\\main", branch: "feat" }, { sessionRepository: "D:\\git\\main", known: ["D:\\git\\main"] });
+      expect(deps.listWorktrees).not.toHaveBeenCalled();
+    });
+
+    it("QA-R1 F1: with an admission, a root= the session repository lists binds only if admit() admits it", async () => {
+      const deps = { ...fakeDeps(), listWorktrees: vi.fn(async () => "worktree D:/git/main\n\nworktree D:/git/secret-wt\n") };
+      const reason = "root=D:\\git\\secret-wt is excluded by routing.repoExclude (D:\\git\\secret*): no work root.";
+      const refusing = fakeAdmission({ ok: false, reason });
+      expect(await resolveRoleWorkRoot({ root: "D:\\git\\secret-wt", sessionDirectory: "D:\\git\\main" }, deps, { admission: refusing }))
+        .toEqual({ workRoot: null, requested: "D:\\git\\secret-wt", note: reason });
+      expect(refusing.admit).toHaveBeenCalledWith("D:\\git\\secret-wt", ["D:\\git\\main"], "D:\\git\\main");
+      // I9: without an admission the text match is unchanged
+      expect((await resolveRoleWorkRoot({ root: "D:\\git\\secret-wt", sessionDirectory: "D:\\git\\main" }, deps)).workRoot).toBe("CANON(D:/git/secret-wt)");
+    });
+
+    it("QA-R1 F8: an admitted worktree that now resolves elsewhere binds nothing; a case-only difference is the same path", async () => {
+      const bound = { ...located("D:\\src\\api"), worktree: "D:\\src\\api" };
+      const moved = { ...fakeDeps(), realpath: vi.fn((path: string) => (path === "D:\\src\\api" ? "D:\\elsewhere\\victim" : path)) };
+      const refused = await resolveRoleWorkRoot({ root: null, sessionDirectory: "D:\\git\\main" }, moved, { repo: "api", admission: fakeAdmission({ ok: true, location: bound }) });
+      expect(refused).toMatchObject({ workRoot: null, requested: null });
+      expect(refused.note).toContain("D:\\elsewhere\\victim");
+      expect(refused.location).toBeUndefined();
+      const cased = { ...fakeDeps(), realpath: vi.fn(() => "d:\\SRC\\api") };
+      expect(await resolveRoleWorkRoot({ root: null, sessionDirectory: "D:\\git\\main" }, cased, { repo: "api", admission: fakeAdmission({ ok: true, location: bound }) }))
+        .toEqual({ workRoot: "d:\\SRC\\api", requested: null, note: null, location: bound });
+    });
+
+    it("QA-R1 F10: a resumed grant keeps the location only with its validated work root", () => {
+      type Grant = Parameters<typeof resumedGrant>[0];
+      type Action = Parameters<typeof resumedGrant>[1][number];
+      const bound = located("D:\\src\\api");
+      const without: Grant = { actions: new Set<Action>(), notes: [], workRoot: null, location: bound };
+      expect(resumedGrant(without, []).location).toBeUndefined();
+      expect("location" in resumedGrant(without, [])).toBe(false);
+      const withRoot: Grant = { actions: new Set<Action>(), notes: [], workRoot: "CANON(D:\\src\\api)", location: bound };
+      expect(resumedGrant(withRoot, []).location).toBe(bound);
+      // QA round 3: a child bound with a null work root (the session directory could not be resolved) keeps none on a resume: edit
+      // and router_run are removed, from the bound grant and from the widened actions alike; the rest is kept.
+      const nullRoot = { actions: new Set(["read", "glob", "edit", "router_run"] as const), notes: ["bound without a work root"], workRoot: null };
+      const resumedNull = resumedGrant(nullRoot, ["edit", "router_run", "grep"]);
+      expect(resumedNull.workRoot).toBeNull();
+      expect([...resumedNull.actions].sort()).toEqual(["glob", "grep", "read"]);
+      expect(resumedNull.notes).toEqual(["bound without a work root"]);
+      expect("location" in resumedNull).toBe(false);
+    });
+  });
+
   it("the role-aware escalation hint resumes the same task id on the next tier (P-8)", () => {
     expect(nextRoleTier(["fast", "medium", "heavy"], "medium", "fast")).toBe("medium");
     expect(nextRoleTier(["fast", "medium", "heavy"], "medium", "medium")).toBeNull();
@@ -470,5 +603,226 @@ describe("exported helpers for the adapter (P2.1-C)", () => {
     });
     expect(roleEscalationHintFor(cfg, "ses_2")).toContain("raises it to medium");
     expect(roleEscalationHintFor(config({ delegation: "tiers" }), "ses_2")).toBeNull();
+  });
+});
+
+// P2g (OD6): the role dispatch header. A routed role dispatch with a work root and read access is told its work root; the nonce line
+// (fresh) or the carried acceptance block (resume) stays the LAST thing of the prompt.
+describe("role dispatch header (P2g, OD6)", () => {
+  beforeEach(() => forgetWorkingSet("root"));
+  afterEach(() => forgetWorkingSet("root"));
+
+  /** The header of an outgoing prompt, separator included ("" without one). */
+  const headerOf = (prompt: string): string => {
+    const end = prompt.indexOf(DISPATCH_HEADER_SEPARATOR);
+    return end === -1 ? "" : prompt.slice(0, end + DISPATCH_HEADER_SEPARATOR.length);
+  };
+  const bindsExact = async (world: World, child: string, outcome: RouteOutcome, agent: string) =>
+    bind(child, async () => ({ parentID: "root", agent, title: outcome.description!, firstText: outcome.prompt! }), {
+      maxOf: (name) => roleMaxActions(resolveRoles(world.cfg, "v2").get(name)),
+    });
+
+  // Q8 (I9): the header is emitted only when relevant. No repoParents, no repo=/branch=/root= and a work root equal to the session
+  // directory: the prompt is the route-stripped text + the nonce line, byte for byte (no header).
+  it("Q8: nothing declared, no repoParents, work root = session directory: no header, child binds exact", async () => {
+    const world = makeWorld({ delegation: "roles", engine: "static" });
+    const input = { agent: "explorer", prompt: "[route class=search risk=low scope=single]\nfind where the config is loaded", description: "find loader" };
+    const c = call(world, input);
+    const outcome = await world.router.route(c);
+    const role = outcome.role!;
+    expect(role.workRoot).toBe(world.main);
+    expect(outcome.prompt!.startsWith(DISPATCH_HEADER_PREFIX)).toBe(false);
+    expect(outcome.prompt).toBe(`find where the config is loaded\nOMR_NONCE=${role.nonce}`);
+    world.router.commit(c.callID, applied(input, outcome));
+    expect((await bindsExact(world, "child-h0", outcome, "explorer")).kind).toBe("exact");
+  });
+
+  it("Q8: routing.repoParents set: the header is emitted even when the route line declares nothing", async () => {
+    const parent = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-q8-parent-")));
+    cleanups.push(async () => rmSync(parent, { recursive: true, force: true }));
+    const world = makeWorld({ delegation: "roles", engine: "static", repoParents: [parent] });
+    const outcome = await world.router.route(call(world, { agent: "explorer", prompt: "[route class=search risk=low scope=single]\nfind x" }));
+    expect(outcome.prompt!.startsWith(`${DISPATCH_HEADER_PREFIX}explorer. Execute this dispatch yourself.\n\n`)).toBe(true);
+    expect(stripDispatchHeader(outcome.prompt!)).toBe(`find x\nOMR_NONCE=${outcome.role!.nonce}`);
+  });
+
+  it("fresh: canonical work root, route line gone, nonce last, child binds exact (root= declared)", async () => {
+    const world = makeWorld({ delegation: "roles", engine: "static" });
+    const input = { agent: "explorer", prompt: `[route class=search risk=low scope=single root=${world.main}]\nfind where the config is loaded`, description: "find loader" };
+    const c = call(world, input);
+    const outcome = await world.router.route(c);
+    const role = outcome.role!;
+    const prompt = outcome.prompt!;
+    expect(prompt.startsWith(`${DISPATCH_HEADER_PREFIX}explorer. Execute this dispatch yourself.\n\n`)).toBe(true);
+    expect(headerOf(prompt)).toContain(`Working directory: ${world.main}. You are already there — do not ask permission to read inside it.`);
+    expect(headerOf(prompt)).not.toContain("Repositories in this session");
+    expect(stripDispatchHeader(prompt)).toBe(`find where the config is loaded\nOMR_NONCE=${role.nonce}`);
+    expect(prompt).not.toContain("[route class");
+    expect(prompt.split("\n").pop()).toBe(`OMR_NONCE=${role.nonce}`);
+    world.router.commit(c.callID, applied(input, outcome));
+    expect((await bindsExact(world, "child-h1", outcome, "explorer")).kind).toBe("exact");
+  });
+
+  it("worktree implementer: read or write", async () => {
+    const world = makeWorld({ delegation: "roles", engine: "static" });
+    const outcome = await world.router.route(call(world, {
+      agent: "implementer", prompt: `[route class=implement risk=low scope=single needs=edit root=${world.worktree}]\nadd a guard`,
+    }));
+    const header = headerOf(outcome.prompt!);
+    expect(header.startsWith(`${DISPATCH_HEADER_PREFIX}implementer. Execute this dispatch yourself.\n\n`)).toBe(true);
+    expect(header).toContain(`Working directory: ${world.worktree}. You are already there — do not ask permission to read or write inside it.`);
+    expect(stripDispatchHeader(outcome.prompt!)).toBe(`add a guard\nOMR_NONCE=${outcome.role!.nonce}`);
+  });
+
+  it("located grant (stubbed admission): repository, branch, head; repositories paragraph with repoParents", async () => {
+    const parent = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-p2g-parent-")));
+    cleanups.push(async () => rmSync(parent, { recursive: true, force: true }));
+    const worlds: World[] = [];
+    const located = (): RepoLocation => ({
+      repository: worlds[0]!.main, name: "app-a", worktree: worlds[0]!.worktree, branch: "feat/login", head: "3f2c1a9deadbeef", worktrees: [],
+    });
+    const world = makeWorld({ delegation: "roles", engine: "static", repoParents: [parent] }, {
+      createAdmission: () => ({
+        admit: async (): Promise<Admission> => ({ ok: true, location: located() }),
+        resolve: async (): Promise<Admission> => ({ ok: true, location: located() }),
+      }),
+    });
+    worlds.push(world);
+    const outcome = await world.router.route(call(world, {
+      agent: "implementer", prompt: "[route class=implement risk=low scope=single needs=edit repo=app-a]\nadd a guard",
+    }));
+    expect(outcome.role!.grant.location).toBeDefined();
+    const header = headerOf(outcome.prompt!);
+    expect(header).toContain(
+      `Working directory: ${world.worktree} (repository app-a, branch feat/login at 3f2c1a9). You are already there — do not ask permission to read or write inside it.`,
+    );
+    expect(header).toContain("Repositories in this session: app-a (feat/login). You may read any repository below ");
+    expect(header).toContain("; you edit and run only in your working directory.");
+    expect(outcome.prompt!.split("\n").pop()).toBe(`OMR_NONCE=${outcome.role!.nonce}`);
+  });
+
+  it("none: null work root, researcher, delegate, non-exact resume, dispatchHeader:false", async () => {
+    const hasHeader = (prompt: string | undefined): boolean => prompt !== undefined && prompt.startsWith(DISPATCH_HEADER_PREFIX);
+    // Q9 (FLIPPED ON PURPOSE: a root= outside the session's worktrees used to give a null work root and no header; the dispatch is
+    // now REFUSED with the note, see "root= outside the session's worktrees" above)
+    const world = makeWorld({ delegation: "roles", engine: "static" });
+    await expect(world.router.route(call(world, { agent: "implementer", prompt: `[route class=implement risk=low scope=single needs=edit root=${world.outside}]\nchange x` })))
+      .rejects.toBeInstanceOf(RoleDispatchRefusal);
+    // a role without read, glob or grep
+    const researcher = await world.router.route(call(world, { agent: "researcher", prompt: "[route class=research risk=low scope=single]\nlook up x" }));
+    expect(["read", "glob", "grep"].some((action) => researcher.role!.grant.actions.has(action as never))).toBe(false);
+    expect(hasHeader(researcher.prompt)).toBe(false);
+    // a non-exact resume
+    const [model, variant] = tierRef(world.cfg, "medium").split("#") as [string, string | undefined];
+    rememberDispatch("child-n", {
+      facts: { class: "search", risk: "low", scope: "single", needs: [], confidence: 1, source: "rules" },
+      agent: "explorer", model, variant: variant ?? null, tier: "medium", parentSessionID: "root", decisionID: "d0", step: "dispatch", picked: "explorer",
+    });
+    const resumed = await world.router.route(call(world, { agent: "explorer", prompt: "find the rest", sessionID: "child-n" }));
+    expect(resumed.role!.nonce).toBeNull();
+    expect(hasHeader(resumed.prompt)).toBe(false);
+    // a delegate (a session with a parent)
+    world.session.parentID = "grand-parent";
+    const delegate = await world.router.route(call(world, { agent: "explorer", prompt: "find x" }));
+    expect(hasHeader(delegate.prompt)).toBe(false);
+    // dispatchHeader:false
+    const off = makeWorld({ delegation: "roles", engine: "static" }, { extra: { dispatchHeader: false } });
+    const plain = await off.router.route(call(off, { agent: "explorer", prompt: "[route class=search risk=low scope=single]\nfind x" }));
+    expect(plain.prompt).toBe(`find x\nOMR_NONCE=${plain.role!.nonce}`);
+  });
+
+  it("realpath throws for the session directory: a dispatch that declares nothing gets no work root, is not refused, holds no write/run, gets no header (QA round 3)", async () => {
+    const world = makeWorld({ delegation: "roles", engine: "static" });
+    world.realpath.mockImplementation((path: string) => {
+      if (path === world.main) throw new Error("EACCES: permission denied");
+      return realpathSync.native(path);
+    });
+    const outcome = await world.router.route(call(world, { agent: "implementer", prompt: "[route class=implement risk=low scope=single needs=edit,shell]\nchange x" }));
+    expect(outcome.role!.workRoot).toBeNull();
+    expect(outcome.role!.grant.workRoot).toBeNull();
+    expect(outcome.role!.grant.actions.has("edit")).toBe(false);
+    expect(outcome.role!.grant.actions.has("router_run")).toBe(false);
+    expect(outcome.prompt).toBe(`change x\nOMR_NONCE=${outcome.role!.nonce}`);
+    expect(outcome.prompt!.startsWith(DISPATCH_HEADER_PREFIX)).toBe(false);
+  });
+
+  it("a header the orchestrator copied from another dispatch is removed even when the router adds none (QA round 1 #11)", async () => {
+    // no repoParents, nothing declared, the work root is the session directory: no header is relevant (Q8), yet the copied one
+    // (another dispatch's root, "read or write") never reaches the delegate.
+    const world = makeWorld({ delegation: "roles", engine: "static" });
+    const copied = buildRoleDispatchHeader({ agent: "implementer", workRoot: world.outside, edits: true });
+    const outcome = await world.router.route(call(world, { agent: "explorer", prompt: `${copied}find where the config is loaded` }));
+    expect(outcome.role!.workRoot).toBe(world.main);
+    expect(outcome.prompt).toBe(`find where the config is loaded\nOMR_NONCE=${outcome.role!.nonce}`);
+    expect(outcome.prompt).not.toContain(DISPATCH_HEADER_PREFIX);
+    expect(outcome.prompt).not.toContain(world.outside);
+    // a role without read, glob or grep (no header is eligible at all): the copied header is removed too
+    const researcher = await world.router.route(call(world, { agent: "researcher", prompt: `${copied}look up x` }));
+    expect(researcher.prompt).toBe(`look up x\nOMR_NONCE=${researcher.role!.nonce}`);
+  });
+
+  it("a header the orchestrator copied from another dispatch is replaced by the router's (QA round 1 #11, repoParents)", async () => {
+    const parent = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-q8-copied-")));
+    cleanups.push(async () => rmSync(parent, { recursive: true, force: true }));
+    const world = makeWorld({ delegation: "roles", engine: "static", repoParents: [parent] }); // Q8: a header is emitted only when relevant
+    const copied = buildRoleDispatchHeader({ agent: "implementer", workRoot: world.outside, edits: true });
+    const outcome = await world.router.route(call(world, { agent: "explorer", prompt: `${copied}find where the config is loaded` }));
+    const prompt = outcome.prompt!;
+    expect(outcome.role!.workRoot).toBe(world.main);
+    expect(prompt.split(DISPATCH_HEADER_PREFIX)).toHaveLength(2); // exactly one router header
+    expect(prompt.startsWith(`${DISPATCH_HEADER_PREFIX}explorer. Execute this dispatch yourself.\n\n`)).toBe(true);
+    expect(headerOf(prompt)).toContain(`Working directory: ${world.main}. You are already there`);
+    expect(prompt).not.toContain(world.outside);
+    expect(prompt).not.toContain("@implementer");
+    expect(stripDispatchHeader(prompt)).toBe(`find where the config is loaded\nOMR_NONCE=${outcome.role!.nonce}`);
+  });
+
+  it("dispatchHeader:false still tells a work root other than the session directory, with the work-root line only (QA round 1 #12)", async () => {
+    const off = makeWorld({ delegation: "roles", engine: "static" }, { extra: { dispatchHeader: false } });
+    const outcome = await off.router.route(call(off, {
+      agent: "implementer", prompt: `[route class=implement risk=low scope=single needs=edit root=${off.worktree}]\nadd a guard`,
+    }));
+    expect(outcome.role!.workRoot).toBe(off.worktree);
+    const header = headerOf(outcome.prompt!);
+    expect(header).toBe(
+      `${DISPATCH_HEADER_PREFIX}implementer. Execute this dispatch yourself.\n\nWorking directory: ${off.worktree}. You are already there — do not ask permission to read or write inside it.${DISPATCH_HEADER_SEPARATOR}`,
+    );
+    expect(header).not.toContain("Repositories in this session");
+    expect(header).not.toContain("You may read any repository");
+    expect(stripDispatchHeader(outcome.prompt!)).toBe(`add a guard\nOMR_NONCE=${outcome.role!.nonce}`);
+    // the session directory itself is not announced
+    const same = await off.router.route(call(off, { agent: "explorer", prompt: "[route class=search risk=low scope=single]\nfind x" }));
+    expect(same.prompt).toBe(`find x\nOMR_NONCE=${same.role!.nonce}`);
+  });
+
+  it("exact resume: header without head; carried block last", async () => {
+    const parent = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-p2g-parent-")));
+    cleanups.push(async () => rmSync(parent, { recursive: true, force: true }));
+    const worlds: World[] = [];
+    const located = (): RepoLocation => ({
+      repository: worlds[0]!.main, name: "app-a", worktree: worlds[0]!.worktree, branch: "feat/login", head: "3f2c1a9deadbeef", worktrees: [],
+    });
+    const world = makeWorld({ delegation: "roles", engine: "static", repoParents: [parent] }, {
+      createAdmission: () => ({
+        admit: async (): Promise<Admission> => ({ ok: true, location: located() }),
+        resolve: async (): Promise<Admission> => ({ ok: true, location: located() }),
+      }),
+    });
+    worlds.push(world);
+    const block = `[acceptance]\ncheck: fileExists path=${PACKAGE_JSON}\n[/acceptance]`;
+    const input = { agent: "implementer", prompt: `[route class=implement risk=low scope=single needs=edit repo=app-a]\nadd a guard\n${block}`, description: "guard" };
+    const c = call(world, input);
+    const fresh = await world.router.route(c);
+    world.router.commit(c.callID, applied(input, fresh));
+    world.router.onSessionCreated({ sessionID: "child-x1", parentID: "root", agent: "implementer", title: fresh.description });
+    expect((await bindsExact(world, "child-x1", fresh, "implementer")).kind).toBe("exact");
+    const resume = await world.router.route(call(world, { agent: "implementer", prompt: "continue with the guard", sessionID: "child-x1" }));
+    expect(resume.role!.nonce).toBeNull();
+    const prompt = resume.prompt!;
+    expect(prompt.startsWith(`${DISPATCH_HEADER_PREFIX}implementer. Execute this dispatch yourself.\n\n`)).toBe(true);
+    expect(headerOf(prompt)).toContain(`Working directory: ${world.worktree} (repository app-a, branch feat/login). You are already there`);
+    expect(headerOf(prompt)).not.toContain("3f2c1a9");
+    expect(stripDispatchHeader(prompt).startsWith("continue with the guard")).toBe(true);
+    expect(prompt.endsWith(block)).toBe(true);
   });
 });

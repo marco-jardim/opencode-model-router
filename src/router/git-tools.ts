@@ -27,6 +27,8 @@ export interface GitInspectOptions {
    * filter fails the call closed (nothing is listed).
    */
   filterSearch?: (root: string, paths: readonly string[]) => { kept: readonly string[]; note?: string };
+  /** Absolute `Date.now()` deadline shared with the caller (a `root` resolution, SD-3b-8); without it a fresh 15 s budget starts. */
+  deadlineAt?: number;
 }
 
 const MAX_BYTES = 64 * 1024;
@@ -156,9 +158,18 @@ export function gitEnvironment(extra: Record<string, string> = {}): NodeJS.Proce
     GIT_TERMINAL_PROMPT: "0", GIT_PAGER: "cat", PAGER: "cat", GIT_NO_LAZY_FETCH: "1", ...extra };
 }
 
+/**
+ * Every transport refused on the command line. A repository's `protocol.<name>.allow=always` beats a
+ * generic `protocol.allow=never`, and GIT_NO_LAZY_FETCH is honoured only from git 2.44, so a partial
+ * clone's promisor (an `ext::` command, say) could otherwise run on a lazy fetch. Command-line `-c`
+ * overrides repository config; no router git call needs a transport.
+ */
+export const PROTOCOL_HARDENING: readonly string[] = Object.freeze(["ext", "file", "ssh", "git", "http", "https"]
+  .flatMap(name => ["-c", `protocol.${name}.allow=never`]).concat(["-c", "protocol.allow=never"]));
+
 export function hardeningArgs(): string[] {
   return ["--no-optional-locks", "--no-pager", "-c", "core.pager=cat", "-c", "core.fsmonitor=false", "-c", "diff.external=",
-    "-c", `core.hooksPath=${NULL_DEVICE}`, "-c", "protocol.allow=never",
+    "-c", `core.hooksPath=${NULL_DEVICE}`, ...PROTOCOL_HARDENING,
     "-c", "maintenance.auto=false", "-c", "gc.auto=0", "-c", "color.ui=false",
     // G2: signature display would run gpg.program; blank every signing program too.
     "-c", "log.showSignature=false", "-c", "gpg.program=", "-c", "gpg.ssh.program=", "-c", "gpg.x509.program=",
@@ -807,6 +818,31 @@ export async function inheritedSafeDirectoryArgs(executable: string, timeoutMs: 
 }
 
 /**
+ * Cross-repo QA round 2: the user's inherited non-executing settings (`core.autocrlf`, `core.eol`, `core.safecrlf`,
+ * `core.longpaths`, `core.quotepath`; not `safe.directory`, see {@link inheritedSafeDirectoryArgs}) as `-c key=value` pairs for a
+ * hardened git run in `root`, whose environment hides the system and global config (`gitEnvironment()`). Without them a CRLF
+ * checkout made under `core.autocrlf=true` reads as modified. Exactly what `inspectGit` passes: a key the repository's own
+ * configuration sets is left out (a `-c` value would override it). `base` is the hardening (and trusted `safe.directory`)
+ * prefix the repository query runs with. Any failure yields no pairs (the previous behaviour, never a wider setting).
+ */
+export async function inheritedConfigArgs(executable: string, root: string, base: readonly string[], timeoutMs: number = DEADLINE_MS): Promise<string[]> {
+  const deadline = performance.now() + timeoutMs;
+  const budget: Budget = { timeoutMs: () => {
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) throw new Error("Git configuration query timed out");
+    return remaining;
+  } };
+  try {
+    const pairs = (await inheritedConfig(executable, budget)).filter(pair => !pair.startsWith("safe.directory="));
+    if (pairs.length === 0) return [];
+    const repository = await repositoryConfig(executable, root, gitEnvironment(), [...base], budget);
+    return pairs.filter(pair => !repository.overridden.has(pair.slice(0, pair.indexOf("=")))).flatMap(pair => ["-c", pair]);
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Repository-level (local, worktree, included) driver programs and line-ending
  * settings. Every configured filter/diff program is blanked with `-c key=` (G1);
  * filters also become optional so a blank one is not a hard failure.
@@ -1034,8 +1070,8 @@ async function verifyRoleRepository(executable: string, base: string[], session:
 }
 
 export async function inspectGit(operation: GitOperation, input: GitInput, directory: string, signal?: AbortSignal, options: GitInspectOptions = {}): Promise<string> {
-  // Discovery and inspection share one tool-call deadline, not two 15 s waits.
-  const deadline = performance.now() + DEADLINE_MS;
+  // Discovery and inspection share one tool-call deadline, not two 15 s waits (SD-3b-8: with a `root`, resolution shares it too).
+  const deadline = performance.now() + (options.deadlineAt === undefined ? DEADLINE_MS : options.deadlineAt - Date.now());
   const budget: Budget = { signal, timeoutMs: () => {
     const remaining = deadline - performance.now();
     if (remaining <= 0) throw new Error("Git inspection timed out");
@@ -1129,7 +1165,7 @@ export async function inspectGit(operation: GitOperation, input: GitInput, direc
  *   checkout rather than a sibling worktree (S11, P-10).
  * Any other answer, or a throwing resolver, is reported as a tool error; nothing is spawned.
  */
-export type WorkRootAnswer = { role: false } | { role: true; root: string | null };
+export type WorkRootAnswer = { role: false } | { role: true; root: string | null; repository?: string };
 /**
  * P1.3 injects, P2.1 wires it to the dispatch binding. Shared by router_git_* and
  * router_run (QA-P13-2-8); router_run refuses `{ role: false }` (it exists for role
@@ -1143,6 +1179,55 @@ export interface GitToolsOptions {
    * bound work root's common git directory must be that repository's. Absent: only the work root's own pointers are checked.
    */
   dispatchRepository?: string;
+  /**
+   * Cross-repo (3b.3, OpenCode v2 roles mode only): resolves a `root` argument against the session's read set and admission.
+   * Only when set do the tools declare `root` and the longer description (SD-3b-1); absent, schema and behaviour are unchanged.
+   */
+  resolveRoot?: GitRootResolver;
+}
+
+/**
+ * A `root` resolver's answer (structurally `GitRootResolution` of `routing/roles/git-root.ts`, not imported: no cycle):
+ * - `{ ok: false, reason }`: refused; the tool reports `refused: <reason>` and spawns nothing.
+ * - `{ ok: true, inWorkRoot: true }`: `root` names the work root; the tool behaves exactly as without `root` (SD-3b-4).
+ * - `{ ok: true, inWorkRoot: false, … }`: an admitted repository; the tool inspects `root` (the git cwd only) with the role
+ *   hardening against `repository`, guards for `root` and `workRoot`, and `provenance` as its first line (SD-3b-6, SD-3b-7).
+ */
+export type GitRootAnswer =
+  | { readonly ok: false; readonly reason: string }
+  | { readonly ok: true; readonly inWorkRoot: true }
+  | {
+    readonly ok: true;
+    readonly inWorkRoot: false;
+    readonly root: string;
+    readonly repository: string;
+    readonly name: string;
+    readonly branch: string | null;
+    readonly workRoot: string;
+    readonly provenance: string;
+  };
+/** Resolves `root` for one call; `deadlineAt` (a `Date.now()` value) is the call's single 15 s deadline (SD-3b-8). */
+export type GitRootResolver = (value: string, ctx: { sessionID: string; signal?: AbortSignal; deadlineAt: number }) => Promise<GitRootAnswer>;
+
+/** The refusal for a resolver answer that is not a {@link GitRootAnswer} (fail closed, SD-3b-11). */
+const INVALID_ROOT_ANSWER = "the root resolver returned an invalid answer; nothing ran";
+
+/** Validate a `root` resolver answer; anything malformed becomes a refusal (never an inspection). */
+export function checkGitRootAnswer(answer: unknown): GitRootAnswer {
+  const refused: GitRootAnswer = { ok: false, reason: INVALID_ROOT_ANSWER };
+  if (typeof answer !== "object" || answer === null) return refused;
+  const a = answer as Record<string, unknown>;
+  if (a.ok === false) return typeof a.reason === "string" && a.reason.trim() !== "" ? { ok: false, reason: a.reason } : refused;
+  if (a.ok !== true) return refused;
+  if (a.inWorkRoot === true) return { ok: true, inWorkRoot: true };
+  if (a.inWorkRoot !== false) return refused;
+  const { root, repository, name, branch, workRoot, provenance } = a;
+  const fullPath = (value: unknown): value is string => typeof value === "string" && isFullPath(value) && !isNetworkOrDevicePath(value);
+  if (!fullPath(root) || !fullPath(repository) || !fullPath(workRoot)) return refused;
+  if (typeof name !== "string" || name === "" || (branch !== null && typeof branch !== "string")) return refused;
+  // The provenance is the output's first line: one non-empty line.
+  if (typeof provenance !== "string" || provenance.trim() === "" || /[\r\n]/.test(provenance)) return refused;
+  return { ok: true, inWorkRoot: false, root, repository, name, branch, workRoot, provenance };
 }
 
 /** Validate a resolver answer; throws for anything that is not a WorkRootAnswer. */
@@ -1153,7 +1238,13 @@ export function checkWorkRootAnswer(answer: unknown): WorkRootAnswer {
     if (role === true && "root" in answer) {
       const { root } = answer as { root: unknown };
       if (root === null) return { role: true, root: null };
-      if (typeof root === "string" && isFullPath(root)) return { role: true, root };
+      if (typeof root === "string" && isFullPath(root)) {
+        // Cross-repo (P1.5): the binding's repository, when the dispatch recorded one, replaces the session directory's.
+        const { repository } = answer as { repository?: unknown };
+        if (repository === undefined) return { role: true, root };
+        if (typeof repository === "string" && isFullPath(repository)) return { role: true, root, repository };
+        throw new Error("Bound repository is not an absolute path");
+      }
       throw new Error("Bound work root is not an absolute path");
     }
   }
@@ -1169,40 +1260,107 @@ export function installGitSearchFilter(filter: GitSearchFilter): () => void {
   return () => { if (installedSearchFilter === filter) installedSearchFilter = undefined; };
 }
 
+/** SD-3b-1: appended to every router_git_* description only when a `root` resolver is configured. */
+const GIT_ROOT_DESCRIPTION_SUFFIX = " Role agents may set root to inspect another repository they may read (its absolute top-level path, or its name below routing.repoParents).";
+const GIT_ROOT_ARG_DESCRIPTION = "Another repository to inspect, read-only: its absolute top-level path, or its name below routing.repoParents; path is then relative to it";
+const UNSAFE_DISPLAY = /[\p{Cc}\p{Cf}\p{Cn}\p{Co}\p{Cs}\u2028\u2029[\]]/u;
+
+/** A `root` value as echoed into an error: `displaySafe` of `routing/roles/read-set.ts` (not imported: read-set imports this module). */
+function displayRoot(text: string): string {
+  if (!UNSAFE_DISPLAY.test(text)) return text;
+  const quoted = quoteGitPath(text, true);
+  return (quoted.startsWith('"') ? quoted : `"${quoted}"`).replaceAll("[", "\\133").replaceAll("]", "\\135");
+}
+
+/**
+ * 3b.3: one call with `root` (SD-3b-4, SD-3b-6 to SD-3b-8). Undefined: `root` names the work root, inspect as without it.
+ * `root` is only the git cwd, never a git argument; a refusal or a malformed answer spawns nothing. `filtering` (leases, Phase 2.1)
+ * applies to the other repository's listing as to the work root's.
+ */
+async function inspectRoot(operation: GitOperation, input: GitInput, value: unknown, resolveRoot: GitRootResolver,
+  executables: readonly string[], sessionID: string, signal: AbortSignal, deadlineAt: number,
+  filtering: Pick<GitInspectOptions, "filterSearch"> = {}): Promise<string | undefined> {
+  if (typeof value !== "string") return "[router_git] error: refused: root must be a string; nothing ran";
+  try {
+    const answer = checkGitRootAnswer(await resolveRoot(value, { sessionID, signal, deadlineAt }));
+    if (!answer.ok) return `[router_git] error: refused: ${stripUrlUserinfo(answer.reason)}`;
+    if (answer.inWorkRoot) return undefined;
+    // F2, before anything is spawned: `root` is still the real path the resolver answered (no junction or link swapped in since
+    // resolution), and a main worktree's `.git` is its own git directory (no gitdir file, link or junction naming another
+    // repository): for a main worktree the dispatch check below compares `root` with itself.
+    let real: string | undefined;
+    try { real = realpath(answer.root); } catch { real = undefined; }
+    if (real === undefined || foldCase(real) !== foldCase(answer.root)) {
+      return `[router_git] error: refused: root=${displayRoot(value)}: ${displayRoot(answer.root)} changed since it was resolved; nothing ran`;
+    }
+    if (sameOnDisk(answer.repository, answer.root)) {
+      const dotGit = join(answer.root, ".git");
+      let own = false;
+      try { const stats = lstatSync(dotGit); own = stats.isDirectory() && !stats.isSymbolicLink(); } catch { own = false; }
+      if (!own) return `[router_git] error: refused: root=${displayRoot(value)}: ${displayRoot(dotGit)} is not the repository's own git directory; nothing ran`;
+    }
+    const output = await inspectGit(operation, input, answer.root, signal, {
+      executables, guards: [...workRootGuards(answer.root), ...workRootGuards(answer.workRoot)],
+      role: { dispatchRepository: answer.repository }, deadlineAt, ...filtering,
+    });
+    return `${answer.provenance}\n${output}`;
+  } catch (error) {
+    return `[router_git] error: root=${displayRoot(value)}: ${stripUrlUserinfo(errorMessage(error))}`;
+  }
+}
+
 export function gitTools(opts: GitToolsOptions = {}) {
   // G4: resolve the git executable once, at plugin load.
   const executables = defaultCandidates();
+  const resolveRoot = opts.resolveRoot;
   const inputSchema = tool.schema.object({
     path: tool.schema.string().optional(), ref: tool.schema.string().optional(),
     limit: tool.schema.number().int().min(1).max(50).optional(),
     mode: tool.schema.enum(["patch", "stat", "name-only", "cached"]).optional(),
   }).strict();
   return Object.fromEntries(GIT_OPERATIONS.map(operation => [`router_git_${operation}`, tool({
-    description: `Read-only git ${operation.replaceAll("_", "-")} in the session repository. No shell, helpers, arbitrary options or writes. Output is bounded to 64 KiB and 15 seconds. Paths are literal and repository-relative.`,
+    description: `Read-only git ${operation.replaceAll("_", "-")} in the session repository. No shell, helpers, arbitrary options or writes. Output is bounded to 64 KiB and 15 seconds. Paths are literal and repository-relative.${resolveRoot === undefined ? "" : GIT_ROOT_DESCRIPTION_SUFFIX}`,
     args: {
       path: tool.schema.string().optional().describe("Literal repository-relative path; required for blame"),
       ...(operation === "log" || operation === "diff" || operation === "show" || operation === "blame"
         ? { ref: tool.schema.string().optional().describe(operation === "show" ? "One commit or annotated tag pointing to a commit; ranges require log or diff" : "Ref or diff range, at most 200 characters; never an option") } : {}),
       ...(operation === "log" ? { limit: tool.schema.number().int().min(1).max(50).optional() } : {}),
       ...(operation === "diff" ? { mode: tool.schema.enum(["patch", "stat", "name-only", "cached"]).optional() } : {}),
+      ...(resolveRoot === undefined ? {} : { root: tool.schema.string().optional().describe(GIT_ROOT_ARG_DESCRIPTION) }),
     },
     async execute(input, context) {
       try {
         const searchFilter = installedSearchFilter;
         const filtering: Pick<GitInspectOptions, "filterSearch"> = searchFilter === undefined ? {}
           : { filterSearch: (root, paths) => searchFilter({ sessionID: context.sessionID, root, paths }) };
+        // 3b.3: `root` is stripped before the strict parse; without a resolver the input is parsed as given (unchanged, I9).
+        let args: unknown = input;
+        let deadline: { deadlineAt?: number } = {};
+        if (resolveRoot !== undefined && typeof input === "object" && input !== null && "root" in input) {
+          const { root, ...rest } = input as GitInput & { root?: unknown };
+          args = rest;
+          if (root !== undefined) {
+            // SD-3b-8: one 15 s deadline covers resolution and inspection.
+            const deadlineAt = Date.now() + DEADLINE_MS;
+            deadline = { deadlineAt };
+            const other = await inspectRoot(operation, inputSchema.parse(rest), root, resolveRoot, executables, context.sessionID, context.abort, deadlineAt, filtering);
+            if (other !== undefined) return other;
+          }
+        }
         if (opts.resolveWorkRoot) {
           const answer = checkWorkRootAnswer(opts.resolveWorkRoot(context.sessionID));
           if (answer.role) {
             if (answer.root === null) return "[router_git] error: refused: this role session has no bound work root (I9)";
-            return await inspectGit(operation, inputSchema.parse(input), answer.root, context.abort, {
+            // Cross-repo (P1.5): a binding's repository is the expected one; without it, the plugin's directory.
+            const expected = answer.repository ?? opts.dispatchRepository;
+            return await inspectGit(operation, inputSchema.parse(args), answer.root, context.abort, {
               executables, guards: workRootGuards(answer.root),
-              role: opts.dispatchRepository ? { dispatchRepository: opts.dispatchRepository } : {},
+              role: expected ? { dispatchRepository: expected } : {}, ...deadline,
               ...filtering,
             });
           }
         }
-        return await inspectGit(operation, inputSchema.parse(input), context.directory, context.abort, { worktree: context.worktree, executables, ...filtering });
+        return await inspectGit(operation, inputSchema.parse(args), context.directory, context.abort, { worktree: context.worktree, executables, ...deadline, ...filtering });
       } catch (error) {
         // G12: report, never throw into the session; messages are credential-redacted.
         return `[router_git] error: ${stripUrlUserinfo(errorMessage(error))}`;

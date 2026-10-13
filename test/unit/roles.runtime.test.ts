@@ -5,9 +5,16 @@
  * mode unchanged except for the phase 2.1 "Background dispatches" block (v2 only).
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
+import * as childProcess from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+
+// Cross-repo 3b.4: git spawns are counted (pass-through spies; nothing else changes).
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, spawn: vi.fn(actual.spawn), execFile: vi.fn(actual.execFile) };
+});
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import type { Hooks } from "@opencode-ai/plugin";
 import ModelRouterPlugin from "../../src/index";
@@ -24,7 +31,9 @@ import { resolveRoles } from "../../src/router/roles";
 import { resetDispatchRegistry } from "../../src/router/sessions";
 import { buildRoleLadder, roleTierOrder } from "../../src/routing/engine/ladders";
 import { resetIngestState, type Ingest } from "../../src/routing/outcomes/ingest";
-import { bind, currentBinding, resetBindingRegistryForTests } from "../../src/routing/roles/binding";
+import { bind, currentBinding, noncePromptLine, registerPending, resetBindingRegistryForTests } from "../../src/routing/roles/binding";
+import { addToWorkingSet, forgetWorkingSet } from "../../src/routing/wire/working-set";
+import { approvalsPath } from "../../src/routing/roles/approvals";
 import {
   AUTHORITY_TEXT, markAnnotated, previewAuthority, requestAuthority, requestedAuthority, resetAuthorityForTests,
 } from "../../src/routing/roles/authority";
@@ -41,7 +50,7 @@ import {
   AUTHORITY_BINDING_UNKNOWN_DROP, createHostBudgetObserver, HOST_CONTEXT_OVERFLOW_ERROR, ROLES_RESTART_NOTICE, type HostBudgetObserver,
 } from "../../src/compat/v2-hooks";
 import { roleAgentSteps } from "../../src/router/role-agents";
-import { buildDispatchHeader, DISPATCH_HEADER_SEPARATOR } from "../../src/router/dispatch-header";
+import { buildDispatchHeader, buildRoleDispatchHeader, DISPATCH_HEADER_SEPARATOR } from "../../src/router/dispatch-header";
 import { DEFAULT_TIER_CAPS } from "../../src/router/sessions";
 import { buildForcingNote, createChangedFileStore } from "../../src/verify/dispatch";
 import { buildEscalatePolicy, newLadderState, nextAction } from "../../src/escalate/ladder";
@@ -458,6 +467,135 @@ describe("role dispatch through the adapter (P2.1-C, P-5)", () => {
     expect(Object.hasOwn(tier.input, "background")).toBe(false);
   });
 
+  // Q8 (I9): FLIPPED ON PURPOSE — without routing.repoParents, a declared repo=/branch=/root= or a work root other than the session
+  // directory, the role prompt carries NO header (it used to start with `[router] You are @explorer.`).
+  it("Q8: no repoParents, no route target, work root = session directory: no header, the nonce line last (v2)", async () => {
+    const { dir, cfg } = home(ROLES, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    const v2 = host(dir, cfg);
+    await v2.start(hooks, { isBypassed: () => false });
+    // Fresh dispatches of one orchestrator session: no route line, a recon/single/small-budget line, a debug/multi line.
+    const prefixes = ["", "[route class=recon risk=low scope=single budget=6]\n", "[route class=debug risk=medium scope=multi budget=25]\n"];
+    for (const [i, prefix] of prefixes.entries()) {
+      const role = { sessionID: "root", agent: "build", messageID: `m${i}`, id: `p2g-c${i}`, tool: "subagent", input: { agent: "explorer", description: "find parser", prompt: `${prefix}Find the parser entry point` } as Record<string, unknown> };
+      await v2.toolHooks["execute.before"](role);
+      const prompt = String(role.input.prompt);
+      expect(prompt, `case ${i}`).not.toMatch(/^\[router\] You are @/);
+      expect(prompt, `case ${i}`).not.toContain("Working directory: ");
+      expect(prompt, `case ${i}`).toMatch(/^Find the parser entry point\n[\s\S]*OMR_NONCE=[A-Za-z0-9_-]{16,128}$/);
+    }
+  });
+
+  it("Q8: routing.repoParents set: the header reaches the child with and without a route line (v2)", async () => {
+    const { dir, cfg } = home({ ...ROLES, routing: { delegation: "roles", repoParents: [temp("omr-q8-parent-")] } }, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    const v2 = host(dir, cfg);
+    await v2.start(hooks, { isBypassed: () => false });
+    const prefixes = ["", "[route class=recon risk=low scope=single budget=6]\n", "[route class=debug risk=medium scope=multi budget=25]\n"];
+    for (const [i, prefix] of prefixes.entries()) {
+      const role = { sessionID: "root", agent: "build", messageID: `m${i}`, id: `q8-rp${i}`, tool: "subagent", input: { agent: "explorer", description: "find parser", prompt: `${prefix}Find the parser entry point` } as Record<string, unknown> };
+      await v2.toolHooks["execute.before"](role);
+      const prompt = String(role.input.prompt);
+      expect(prompt, `case ${i}`).toMatch(/^\[router\] You are @explorer\. Execute this dispatch yourself\.\n\nWorking directory: /);
+      expect(prompt, `case ${i}`).toContain("Find the parser entry point");
+      expect(prompt, `case ${i}`).toMatch(/\nOMR_NONCE=[A-Za-z0-9_-]{16,128}$/);
+    }
+  });
+
+  it("Q8: a route line declaring root= gets the header even without repoParents (v2)", async () => {
+    const { dir, cfg } = home(ROLES, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    const v2 = host(dir, cfg);
+    await v2.start(hooks, { isBypassed: () => false });
+    const root = dir.replace(/\\/g, "/");
+    const role = { sessionID: "root", agent: "build", messageID: "m-root", id: "q8-root", tool: "subagent", input: { agent: "explorer", description: "find parser", prompt: `[route class=recon risk=low scope=single root=${root}]\nFind the parser entry point` } as Record<string, unknown> };
+    await v2.toolHooks["execute.before"](role);
+    const prompt = String(role.input.prompt);
+    expect(prompt).toMatch(/^\[router\] You are @explorer\. Execute this dispatch yourself\.\n\nWorking directory: /);
+    expect(prompt).toMatch(/\nOMR_NONCE=[A-Za-z0-9_-]{16,128}$/);
+  });
+
+  it("P2g: a repo=/branch= route line on a repository below routing.repoParents still gets the header (v2)", async () => {
+    const parent = temp("omr-p2g-parent-");
+    // A REAL repository (admission asks git): `lib-b` on branch main with one commit, below the parent.
+    const { execFileSync } = await import("node:child_process");
+    const repo = join(parent, "lib-b");
+    mkdirSync(repo, { recursive: true });
+    const git = (...args: string[]): void => { execFileSync("git", args, { cwd: repo, stdio: "ignore" }); };
+    git("init", "-q", "-b", "main");
+    writeFileSync(join(repo, "a.ts"), "x");
+    git("add", "a.ts");
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init");
+    const { dir, cfg } = home({ routing: { delegation: "roles", repoParents: [parent] } }, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    const v2 = host(dir, cfg);
+    await v2.start(hooks, { isBypassed: () => false });
+    const role = {
+      sessionID: "root", agent: "build", messageID: "m-repo", id: "p2g-repo", tool: "subagent",
+      input: { agent: "explorer", description: "find parser", prompt: "[route class=recon risk=low scope=single repo=lib-b branch=main budget=6]\nFind the parser entry point" } as Record<string, unknown>,
+    };
+    await v2.toolHooks["execute.before"](role);
+    const prompt = String(role.input.prompt);
+    expect(prompt).toMatch(/^\[router\] You are @explorer\. Execute this dispatch yourself\.\n\nWorking directory: /);
+    expect(prompt).toMatch(/\nOMR_NONCE=[A-Za-z0-9_-]{16,128}$/);
+  });
+
+  it("P2g: repo=<repository> branch=<the session worktree's branch> gets the header when the session is a linked worktree (v2)", async () => {
+    const parent = temp("omr-p2g-wt-");
+    const { execFileSync } = await import("node:child_process");
+    const main = join(parent, "lib-main");
+    mkdirSync(main, { recursive: true });
+    const git = (cwd: string, ...args: string[]): void => { execFileSync("git", args, { cwd, stdio: "ignore" }); };
+    git(main, "init", "-q", "-b", "master");
+    writeFileSync(join(main, "a.ts"), "x");
+    git(main, "add", "a.ts");
+    git(main, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init");
+    // Live shape: the session directory is itself a linked worktree (branch feat/x) of a repository on master, and both live below
+    // routing.repoParents; the route line names the repository (`repo=lib-main`) and the worktree's branch (`branch=feat/x`).
+    const worktree = join(parent, "lib-wt");
+    git(main, "worktree", "add", "-q", "-b", "feat/x", worktree);
+    const { cfg } = home({ routing: { delegation: "roles", repoParents: [parent] } }, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(worktree); // the session directory is the linked worktree itself
+    const v2 = host(worktree, cfg);
+    await v2.start(hooks, { isBypassed: () => false });
+    const role = {
+      sessionID: "root", agent: "build", messageID: "m-wt", id: "p2g-wt", tool: "subagent",
+      input: { agent: "explorer", description: "find parser", prompt: "[route class=recon risk=low scope=single repo=lib-main branch=feat/x budget=6]\nFind the parser entry point" } as Record<string, unknown>,
+    };
+    await v2.toolHooks["execute.before"](role);
+    const prompt = String(role.input.prompt);
+    expect(prompt).toMatch(/^\[router\] You are @explorer\. Execute this dispatch yourself\.\n\nWorking directory: /);
+    expect(prompt).toMatch(/\nOMR_NONCE=[A-Za-z0-9_-]{16,128}$/);
+  });
+
+  it("Q10: repo=<directory name of the session's linked worktree> branch=<its branch> gets the header of the owning repository (v2)", async () => {
+    const parent = temp("omr-q10-wt-");
+    const { execFileSync } = await import("node:child_process");
+    const main = join(parent, "lib-main");
+    mkdirSync(main, { recursive: true });
+    const git = (cwd: string, ...args: string[]): void => { execFileSync("git", args, { cwd, stdio: "ignore" }); };
+    git(main, "init", "-q", "-b", "master");
+    writeFileSync(join(main, "a.ts"), "x");
+    git(main, "add", "a.ts");
+    git(main, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init");
+    // The session directory is the linked worktree `lib-wt` (branch feat/x) of repository `lib-main`; the route line names the
+    // worktree by its directory name (`repo=lib-wt`), which resolves to the repository it belongs to.
+    const worktree = join(parent, "lib-wt");
+    git(main, "worktree", "add", "-q", "-b", "feat/x", worktree);
+    const { cfg } = home({ routing: { delegation: "roles", repoParents: [parent] } }, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(worktree);
+    const v2 = host(worktree, cfg);
+    await v2.start(hooks, { isBypassed: () => false });
+    const role = {
+      sessionID: "root", agent: "build", messageID: "m-q10", id: "q10-wt", tool: "subagent",
+      input: { agent: "explorer", description: "find parser", prompt: "[route class=recon risk=low scope=single repo=lib-wt branch=feat/x budget=6]\nFind the parser entry point" } as Record<string, unknown>,
+    };
+    await v2.toolHooks["execute.before"](role);
+    const prompt = String(role.input.prompt);
+    expect(prompt).toMatch(/^\[router\] You are @explorer\. Execute this dispatch yourself\.\n\nWorking directory: .*lib-wt.* \(repository lib-main, branch feat\/x at [0-9a-f]{7}\)/);
+    expect(prompt).toMatch(/\nOMR_NONCE=[A-Za-z0-9_-]{16,128}$/);
+  });
+
   it("handoff 30: a stripped route line's root reaches the tier dispatch header (v2 shadow)", async () => {
     const { dir, cfg } = home({ routing: { engine: "shadow" } });
     const { hooks } = await plugin(dir);
@@ -498,6 +636,436 @@ describe("signals with the real guard state (handoffs 15, 23)", () => {
     const output = { title: "", output: "ESCALATE: blocked", metadata: { sessionId: "x3" } };
     await hooks["tool.execute.after"]({ tool: "task", sessionID: "root", agent: "build", callID: "p1", args: { subagent_type: "explorer", prompt: "Find" } }, output);
     expect(onSignal.mock.calls.filter(([child, observation]) => child === "x3" && observation.kind === "incomplete")).toEqual([]);
+  });
+});
+
+describe("read provenance of a role read outside its work root (cross-repo P1.9)", () => {
+  const CHILD = "prov-child";
+
+  /** A work root W, a parent P holding the repository `lib-b` (branch main) and the plain directory `plain`. */
+  function fixture() {
+    const work = temp("omr-p19-work-");
+    writeFileSync(join(work, "in.ts"), "x");
+    const parent = temp("omr-p19-parent-");
+    // QA-1 F3: a repository's shape — `.git` with HEAD and `objects` (HEAD alone is no longer a repository of R)
+    mkdirSync(join(parent, "lib-b", ".git", "objects"), { recursive: true });
+    writeFileSync(join(parent, "lib-b", ".git", "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(join(parent, "lib-b", "a.ts"), "x");
+    mkdirSync(join(parent, "plain"), { recursive: true });
+    writeFileSync(join(parent, "plain", "x.ts"), "x");
+    return { work, parent, repo: join(parent, "lib-b") };
+  }
+
+  /** Binds `CHILD` exactly to a dispatch of `root` with the local actions and a work root `workRoot`, and lets the plugin know it. */
+  async function bindRole(hooks: Record<string, any>, workRoot: string, dir: string): Promise<void> {
+    const nonce = "nonce-prov-child-0000000000";
+    registerPending({
+      parentSessionID: "root", callID: "call_prov", agent: "explorer", description: "task", nonce,
+      grant: { actions: new Set(["read", "glob", "grep"]), notes: [], workRoot }, budget: 80, decisionID: null, registeredAt: Date.now(),
+    });
+    const bound = await bind(CHILD, async () => ({ parentID: "root", agent: "explorer", title: "task", firstText: noncePromptLine(nonce) }),
+      { maxOf: () => ["read", "glob", "grep", "router_git"] });
+    expect(bound.kind).toBe("exact");
+    await hooks["tool.execute.before"]({ tool: "read", sessionID: CHILD, agent: "explorer", callID: "prov-0" }, { args: { filePath: join(dir, "a.ts") } });
+  }
+
+  async function after(hooks: Record<string, any>, sessionID: string, agent: string, tool: string, args: Record<string, unknown>): Promise<string> {
+    const output = { title: "", output: "found", metadata: {} };
+    await hooks["tool.execute.after"]({ tool, sessionID, agent, callID: `prov-${tool}`, args }, output);
+    return output.output;
+  }
+
+  const lineOf = (name: string, branch: string, repository: string): string =>
+    `[router: read from ${name} (${branch}) at ${repository} — read-only in this dispatch]`;
+
+  it("a read, glob and grep in a repository of the read set get the line; a read inside W, a plain directory and a non-role session do not", async () => {
+    const { work, parent, repo } = fixture();
+    const { dir } = home({ routing: { delegation: "roles", repoParents: [parent] } }, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    await bindRole(hooks, work, dir);
+    const line = lineOf("lib-b", "main", repo);
+
+    expect((await after(hooks, CHILD, "explorer", "read", { filePath: join(repo, "a.ts") })).endsWith(line)).toBe(true);
+    expect((await after(hooks, CHILD, "explorer", "glob", { pattern: "*.ts", path: repo })).endsWith(line)).toBe(true);
+    expect((await after(hooks, CHILD, "explorer", "grep", { pattern: "x", path: repo })).endsWith(line)).toBe(true);
+
+    expect(await after(hooks, CHILD, "explorer", "read", { filePath: join(work, "in.ts") })).not.toContain("[router: read from");
+    expect(await after(hooks, CHILD, "explorer", "glob", { pattern: "*.ts" })).not.toContain("[router: read from");
+    expect(await after(hooks, CHILD, "explorer", "read", { filePath: join(parent, "plain", "x.ts") })).not.toContain("[router: read from");
+    expect(await after(hooks, CHILD, "explorer", "read", { filePath: join(repo, "missing.ts") })).toContain(line);
+    // Not a read tool: untouched.
+    expect(await after(hooks, CHILD, "explorer", "webfetch", { filePath: join(repo, "a.ts") })).not.toContain("[router: read from");
+    // A non-role session (the orchestrator): never.
+    expect(await after(hooks, "root", "build", "read", { filePath: join(repo, "a.ts") })).not.toContain("[router: read from");
+  });
+
+  it("a detached head reads as detached", async () => {
+    const { work, parent, repo } = fixture();
+    writeFileSync(join(repo, ".git", "HEAD"), "3f2c1a9d5e7b00000000000000000000000000aa\n");
+    const { dir } = home({ routing: { delegation: "roles", repoParents: [parent] } }, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    await bindRole(hooks, work, dir);
+    expect((await after(hooks, CHILD, "explorer", "read", { filePath: join(repo, "a.ts") })).endsWith(lineOf("lib-b", "detached", repo))).toBe(true);
+  });
+
+  it("without routing.repoParents and without a working set there is no line (I9: inert)", async () => {
+    const { work, parent, repo } = fixture();
+    const { dir } = home(ROLES, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    await bindRole(hooks, work, dir);
+    expect(await after(hooks, CHILD, "explorer", "read", { filePath: join(repo, "a.ts") })).not.toContain("[router: read from");
+    expect(parent).toBeDefined();
+  });
+
+  it("QA-1 F1/F7: the line follows the decision — a relative path or `.git` never gets it, whatever it resolves to", async () => {
+    const { work, parent, repo } = fixture();
+    const { dir } = home({ routing: { delegation: "roles", repoParents: [parent] } }, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    await bindRole(hooks, work, dir);
+    // The decision refuses a relative path outside W (it never reaches R): no line, even where it would resolve into R from W.
+    const fromWork = relative(work, join(repo, "a.ts"));
+    expect(isAbsolute(fromWork)).toBe(false);
+    expect(await after(hooks, CHILD, "explorer", "read", { filePath: fromWork })).not.toContain("[router: read from");
+    expect(await after(hooks, CHILD, "explorer", "grep", { pattern: "x", path: relative(work, repo) })).not.toContain("[router: read from");
+    // `.git` below a repository of R is refused by the decision: no line either
+    expect(await after(hooks, CHILD, "explorer", "read", { filePath: join(repo, ".git", "HEAD") })).not.toContain("[router: read from");
+    // the same file named absolute: the decision allows it from R, and the line names it
+    expect((await after(hooks, CHILD, "explorer", "read", { filePath: join(repo, "a.ts") })).endsWith(lineOf("lib-b", "main", repo))).toBe(true);
+  });
+
+  it("QA-1 F2: a branch that is not a git ref name reads (unknown); a repository name with unsafe characters is escaped", async () => {
+    const { work, parent, repo } = fixture();
+    writeFileSync(join(repo, ".git", "HEAD"), "ref: refs/heads/evil\u001b]0;pwned\u0007\n");
+    const odd = join(parent, "lib\u202Eb");
+    mkdirSync(join(odd, ".git", "objects"), { recursive: true });
+    writeFileSync(join(odd, ".git", "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(join(odd, "a.ts"), "x");
+    const { dir } = home({ routing: { delegation: "roles", repoParents: [parent] } }, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    await bindRole(hooks, work, dir);
+    const evil = await after(hooks, CHILD, "explorer", "read", { filePath: join(repo, "a.ts") });
+    expect(evil.endsWith(lineOf("lib-b", "(unknown)", repo))).toBe(true);
+    expect(evil).not.toMatch(/[\u001b\u0007]/);
+    const named = await after(hooks, CHILD, "explorer", "read", { filePath: join(odd, "a.ts") });
+    expect(named).not.toContain("\u202E");
+    expect(named).toContain('[router: read from "lib\\342\\200\\256b" (main) at "');
+  });
+
+  it("a working-set repository is in the read set without any parent", async () => {
+    const { work, repo } = fixture();
+    const { dir } = home(ROLES, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    addToWorkingSet("root", { repository: repo, name: "lib-b", worktree: repo, branch: "main", head: null, worktrees: [] });
+    cleanups.push(async () => { forgetWorkingSet("root"); });
+    await bindRole(hooks, work, dir);
+    expect((await after(hooks, CHILD, "explorer", "read", { filePath: join(repo, "a.ts") })).endsWith(lineOf("lib-b", "main", repo))).toBe(true);
+  });
+});
+
+// Real git in temporary repositories: slow on Windows CI runners, so bounded by an explicit timeout (as #88 did).
+describe("router_git root (cross-repo P3b)", { timeout: 60_000 }, () => {
+  type GitTool = { description: string; args: Record<string, unknown>; execute: (args: unknown, ctx: unknown) => Promise<string> };
+  const GIT_TOOLS = ["router_git_status", "router_git_diff", "router_git_log", "router_git_show", "router_git_blame", "router_git_ls_files"];
+  const SUFFIX = " Role agents may set root to inspect another repository they may read (its absolute top-level path, or its name below routing.repoParents).";
+  const toolsOf = (hooks: Record<string, any>) => hooks.tool as Record<string, GitTool>;
+  const gitToolNames = (hooks: Record<string, any>) => Object.keys(hooks.tool ?? {}).filter((name) => name.startsWith("router_git_"));
+
+  it("registration: v2 roles with repoParents declares root on every router_git_* tool; without parents and on v1 nothing changes (SD-3b-1)", async () => {
+    const parent = temp("omr-p3b-parent-");
+    const configured = home({ routing: { delegation: "roles", repoParents: [parent] } }, { MODEL_ROUTER_ENFORCE: "0" });
+    const withRoot = toolsOf((await plugin(configured.dir)).hooks);
+    const names = gitToolNames({ tool: withRoot });
+    expect(names.length).toBeGreaterThan(0);
+    for (const name of names) {
+      expect(Object.keys(withRoot[name]!.args)).toContain("root");
+      expect(withRoot[name]!.description.endsWith(SUFFIX)).toBe(true);
+    }
+
+    const plain = home(ROLES, { MODEL_ROUTER_ENFORCE: "0" });
+    const noParents = toolsOf((await plugin(plain.dir)).hooks);
+    const v1 = home({ routing: { delegation: "roles", repoParents: [parent] } }, { MODEL_ROUTER_ENFORCE: "0" });
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const onV1 = toolsOf((await plugin(v1.dir, "v1")).hooks);
+    for (const tools of [noParents, onV1]) {
+      const these = gitToolNames({ tool: tools });
+      expect(these.sort()).toEqual([...names].sort());
+      for (const name of these) {
+        expect(Object.keys(tools[name]!.args)).not.toContain("root");
+        expect(tools[name]!.description).not.toContain("Role agents may set root");
+        expect(tools[name]!.description).toBe(withRoot[name]!.description.slice(0, -SUFFIX.length));
+      }
+    }
+    expect([...names].sort()).toEqual([...GIT_TOOLS].sort());
+  });
+
+  // No intersection-binding case: binding.ts never produces `kind: "intersection"` under R7 (ambiguity binds unknown, covered below).
+  const CHILD = "git-root-child";
+  const ENF0 = { MODEL_ROUTER_ENFORCE: "0" };
+  const ROLE_ONLY = "[router_git] error: refused: root is only for role agents (roles mode); this session inspects its own repository: omit root";
+  const NO_WORK_ROOT = "[router_git] error: refused: this role session has no bound work root (I9)";
+
+  /** A real repository at `dir` (branch main, one commit). */
+  async function gitRepo(dir: string): Promise<string> {
+    const { execFileSync } = await import("node:child_process");
+    mkdirSync(dir, { recursive: true });
+    const git = (...args: string[]): void => {
+      execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", ...args], { cwd: dir, stdio: "ignore" });
+    };
+    git("init", "-q", "-b", "main");
+    writeFileSync(join(dir, "a.ts"), "x\n");
+    git("add", "a.ts");
+    git("commit", "-q", "-m", "init lib");
+    return dir;
+  }
+
+  /** The P1.9 fixture with real repositories: a work root W (a repository) and a parent P holding the repository `lib-b`. */
+  async function fixture() {
+    const work = await gitRepo(temp("omr-p3b-work-"));
+    const parent = temp("omr-p3b-parent-");
+    const repo = await gitRepo(join(parent, "lib-b"));
+    mkdirSync(join(parent, "plain"), { recursive: true });
+    return { work, parent, repo };
+  }
+
+  const locationOf = (path: string) => ({ repository: path, name: basename(path), worktree: path, branch: "main", head: null, worktrees: [] });
+
+  /** Binds `child` exactly to a dispatch from `root` with `actions` and `workRoot` (the grant's repository W), and lets the plugin know it. */
+  async function bindExact(hooks: Record<string, any>, dir: string, workRoot: string | null,
+    actions: readonly string[] = ["read", "glob", "grep", "router_git"], child = CHILD): Promise<void> {
+    const nonce = `nonce-${child}-000000000000`;
+    registerPending({
+      parentSessionID: "root", callID: `call_${child}`, agent: "explorer", description: "task", nonce,
+      grant: { actions: new Set(actions as any), notes: [], workRoot, ...(workRoot === null ? {} : { location: locationOf(workRoot) }) },
+      budget: 80, decisionID: null, registeredAt: Date.now(),
+    } as any);
+    const bound = await bind(child, async () => ({ parentID: "root", agent: "explorer", title: "task", firstText: noncePromptLine(nonce) }),
+      { maxOf: () => ["read", "glob", "grep", "router_git"] });
+    expect(bound.kind).toBe("exact");
+    await hooks["tool.execute.before"]({ tool: "read", sessionID: child, agent: "explorer", callID: `${child}-0` }, { args: { filePath: join(dir, "a.ts") } });
+  }
+
+  const call = (hooks: Record<string, any>, tool: string, args: Record<string, unknown>, sessionID = CHILD): Promise<string> =>
+    toolsOf(hooks)[tool]!.execute(args, toolCtx(sessionID));
+  /** git processes started through `node:child_process` (spawn, execFile) since the last reset. */
+  const gitSpawns = (): unknown[][] => [...vi.mocked(childProcess.spawn).mock.calls, ...vi.mocked(childProcess.execFile).mock.calls]
+    .filter((args) => /git/i.test(String(args[0])));
+  const resetSpawns = (): void => { vi.mocked(childProcess.spawn).mockClear(); vi.mocked(childProcess.execFile).mockClear(); };
+  const PROVENANCE = /^\[router: read from (.+) \((.+)\) at (.+) — read-only in this dispatch\]$/;
+  const samePath = (a: string, b: string): boolean =>
+    process.platform === "win32" ? a.replace(/\//g, "\\").toLowerCase() === b.replace(/\//g, "\\").toLowerCase() : a === b;
+  /** The provenance of an output's first line: name, branch, worktree. */
+  const provenanceOf = (output: string): { name: string; branch: string; worktree: string } | undefined => {
+    const match = PROVENANCE.exec(output.split("\n")[0] ?? "");
+    return match === null ? undefined : { name: match[1]!, branch: match[2]!, worktree: match[3]! };
+  };
+
+  it("the orchestrator and a tier-agent session are refused (D21), nothing spawned", async () => {
+    const { parent, repo } = await fixture();
+    const { dir } = home({ routing: { delegation: "roles", repoParents: [parent] } }, ENF0);
+    const { hooks } = await plugin(dir);
+    resetSpawns();
+    expect(await call(hooks, "router_git_status", { root: repo }, "root")).toBe(ROLE_ONLY);
+    expect(await call(hooks, "router_git_log", { root: "lib-b", limit: 1 }, "root")).toBe(ROLE_ONLY);
+    // A tier agent's session is not a role session.
+    expect(await toolsOf(hooks).router_git_status!.execute({ root: repo }, { ...toolCtx("tier-child"), agent: "fast" })).toBe(ROLE_ONLY);
+    expect(gitSpawns()).toEqual([]);
+  });
+
+  it("an unbound role session, an unknown binding, a grant without router_git and a rootless grant get the I9 text, nothing spawned", async () => {
+    const { work, parent, repo } = await fixture();
+    const { dir } = home({ routing: { delegation: "roles", repoParents: [parent] } }, ENF0);
+    const { hooks } = await plugin(dir);
+    // Unbound: its tool hooks named its role, no binding.
+    await hooks["tool.execute.before"]({ tool: "read", sessionID: "unbound", agent: "explorer", callID: "u-0" }, { args: { filePath: join(dir, "a.ts") } });
+    // Unknown: no nonce marker matches (the contract's intersection is never produced, R7: ambiguity binds unknown).
+    const unknown = await bind("unknown-child", async () => ({ parentID: "root", agent: "explorer", title: "task", firstText: "no marker" }),
+      { maxOf: () => ["read", "glob", "grep", "router_git"] });
+    expect(unknown.kind).not.toBe("exact");
+    await hooks["tool.execute.before"]({ tool: "read", sessionID: "unknown-child", agent: "explorer", callID: "k-0" }, { args: { filePath: join(dir, "a.ts") } });
+    await bindExact(hooks, dir, work, ["read", "glob", "grep"], "no-git-child");
+    await bindExact(hooks, dir, null, ["read", "glob", "grep", "router_git"], "rootless-child");
+    resetSpawns();
+    for (const sid of ["unbound", "unknown-child", "no-git-child", "rootless-child"]) {
+      expect(await call(hooks, "router_git_status", { root: repo }, sid)).toBe(NO_WORK_ROOT);
+      expect(await call(hooks, "router_git_status", { root: "lib-b" }, sid)).toBe(NO_WORK_ROOT);
+    }
+    expect(gitSpawns()).toEqual([]);
+  });
+
+  it("a grant with router_git but no read, glob or grep is refused (SD-3b-5), nothing spawned", async () => {
+    const { work, parent, repo } = await fixture();
+    const { dir } = home({ routing: { delegation: "roles", repoParents: [parent] } }, ENF0);
+    const { hooks } = await plugin(dir);
+    await bindExact(hooks, dir, work, ["router_git"]);
+    resetSpawns();
+    expect(await call(hooks, "router_git_status", { root: repo })).toBe(
+      "[router_git] error: refused: root reads another repository and needs read, glob or grep in this dispatch's grant (router_git); router_git alone stays in the work root",
+    );
+    expect(gitSpawns()).toEqual([]);
+  });
+
+  it("routing.repoParents emptied by a hot reload: root stays declared (fixed at start) but is refused, nothing spawned", async () => {
+    const { work, parent, repo } = await fixture();
+    const { dir } = home({ routing: { delegation: "roles", repoParents: [parent] } }, ENF0);
+    const { hooks } = await plugin(dir);
+    expect(Object.keys(toolsOf(hooks).router_git_status!.args)).toContain("root");
+    await bindExact(hooks, dir, work);
+    // Hot reload (as QA-P21-1-8): the override changes on disk, the cache is dropped, the next hook reads the new config.
+    writeFileSync(overridePath(), JSON.stringify({ routing: { delegation: "roles", repoParents: [] } }));
+    invalidateConfigCache();
+    await hooks["experimental.chat.system.transform"]({ sessionID: "root", model: { providerID: "openai", modelID: "gpt-x" } }, { system: [] as string[] });
+    expect(Object.keys(toolsOf(hooks).router_git_status!.args)).toContain("root");
+    resetSpawns();
+    for (const root of [repo, "lib-b"]) {
+      expect(await call(hooks, "router_git_status", { root })).toBe(
+        "[router_git] error: refused: root needs routing.repoParents (cross-repo is not configured); nothing ran",
+      );
+    }
+    expect(gitSpawns()).toEqual([]);
+  });
+
+  it("an exact binding inspects a repository below the parents by absolute path or by name; the provenance line comes first", async () => {
+    const { work, parent, repo } = await fixture();
+    const { dir } = home({ routing: { delegation: "roles", repoParents: [parent] } }, ENF0);
+    const { hooks } = await plugin(dir);
+    await bindExact(hooks, dir, work);
+    for (const root of [repo, "lib-b"]) {
+      const status = await call(hooks, "router_git_status", { root });
+      expect(status).not.toContain("[router_git] error");
+      const line = provenanceOf(status);
+      expect(line).toMatchObject({ name: "lib-b", branch: "main" });
+      expect(samePath(line!.worktree, repo)).toBe(true);
+      const log = await call(hooks, "router_git_log", { root, limit: 1 });
+      expect(provenanceOf(log)).toEqual(line);
+      expect(log).toContain("init lib");
+      const files = await call(hooks, "router_git_ls_files", { root });
+      expect(files.split("\n").slice(1)).toContain("a.ts");
+    }
+  });
+
+  it("root equal to the work root behaves exactly as without root (SD-3b-4)", async () => {
+    const { work, parent } = await fixture();
+    const { dir } = home({ routing: { delegation: "roles", repoParents: [parent] } }, ENF0);
+    const { hooks } = await plugin(dir);
+    await bindExact(hooks, dir, work);
+    const without = await call(hooks, "router_git_log", { limit: 1 });
+    expect(without).not.toContain("[router_git] error");
+    expect(without).toContain("init lib");
+    expect(await call(hooks, "router_git_log", { root: work, limit: 1 })).toBe(without);
+    expect(await call(hooks, "router_git_status", { root: work })).toBe(await call(hooks, "router_git_status", {}));
+    expect(await call(hooks, "router_git_ls_files", { root: work })).toBe(await call(hooks, "router_git_ls_files", {}));
+  });
+
+  it("a repoExclude'd repository and a path outside the read set are refused, nothing spawned", async () => {
+    const { work, parent, repo } = await fixture();
+    const { dir } = home({ routing: { delegation: "roles", repoParents: [parent], repoExclude: [repo] } }, ENF0);
+    const { hooks } = await plugin(dir);
+    await bindExact(hooks, dir, work);
+    const outside = temp("omr-p3b-outside-");
+    resetSpawns();
+    for (const root of [repo, outside, join(parent, "plain"), join(work, "sub")]) {
+      expect(await call(hooks, "router_git_status", { root })).toMatch(/^\[router_git\] error: refused: root=/);
+    }
+    expect(await call(hooks, "router_git_status", { root: outside })).toContain("is outside this dispatch's read set");
+    expect(await call(hooks, "router_git_status", { root: join(work, "sub") })).toContain("is inside your work root");
+    expect(gitSpawns()).toEqual([]);
+  });
+
+  it("a working-set worktree outside the parents is allowed while its approval applies; an unapproved one is refused (Phase 4 QA M1)", async () => {
+    const { work, parent } = await fixture();
+    const other = await gitRepo(temp("omr-p3b-ws-"));
+    const { dir } = home({ routing: { delegation: "roles", repoParents: [parent] } }, ENF0);
+    const { hooks } = await plugin(dir);
+    addToWorkingSet("root", locationOf(other));
+    cleanups.push(async () => { forgetWorkingSet("root"); });
+    await bindExact(hooks, dir, work);
+    // Neither approved nor the session repository: rule 2 no longer admits it through its own (untagged) entry.
+    expect(await call(hooks, "router_git_log", { root: other, limit: 1 })).toMatch(/^\[router_git\] error: refused: root=/);
+    // Approved (a store entry in force), as a dispatch through it records it: admitted.
+    const roots = childProcess.execFileSync("git", ["rev-list", "--max-parents=0", "HEAD"], { cwd: other, encoding: "utf8" }).split(/\r?\n/).filter((line) => line !== "").sort();
+    const now = Date.now();
+    mkdirSync(dirname(approvalsPath()), { recursive: true });
+    writeFileSync(approvalsPath(), JSON.stringify({ version: 1, approvals: [{ path: other, commonDir: join(other, ".git"), roots, origin: "none", approvedAt: now, lastUsedAt: now }] }));
+    addToWorkingSet("root", { ...locationOf(other), approval: other });
+    const log = await call(hooks, "router_git_log", { root: other, limit: 1 });
+    expect(log).not.toContain("[router_git] error");
+    const line = provenanceOf(log);
+    expect(line).toMatchObject({ name: basename(other), branch: "main" });
+    expect(samePath(line!.worktree, other)).toBe(true);
+    expect(log).toContain("init lib");
+  });
+
+  it("tool.execute.after adds no second provenance line to router_git output (F7)", async () => {
+    const { work, parent, repo } = await fixture();
+    const { dir } = home({ routing: { delegation: "roles", repoParents: [parent] } }, ENF0);
+    const { hooks } = await plugin(dir);
+    await bindExact(hooks, dir, work);
+    const text = await call(hooks, "router_git_status", { root: repo });
+    expect(provenanceOf(text)).toBeDefined();
+    const output = { title: "", output: text, metadata: {} };
+    await hooks["tool.execute.after"]({ tool: "router_git_status", sessionID: CHILD, agent: "explorer", callID: "g-after", args: { root: repo } }, output);
+    expect(output.output.split("[router: read from").length - 1).toBe(1);
+  });
+
+  /** The git commands of the tools themselves among the spawns since the last reset (admission's probes are rev-parse and worktree). */
+  const TOOL_COMMANDS = new Set(["status", "log", "diff", "show", "blame", "ls-files"]);
+  const toolCommands = (): string[] => gitSpawns()
+    .flatMap((args) => (Array.isArray(args[1]) ? (args[1] as unknown[]).map(String) : []).filter((arg) => TOOL_COMMANDS.has(arg)));
+
+  it("name refusals spawn no git command of the tool: no match (nothing at all), several repositories, several worktrees (QA N6)", async () => {
+    const { work, parent } = await fixture();
+    await gitRepo(join(parent, "lib"));
+    await gitRepo(join(parent, "team", "lib"));
+    const multi = await gitRepo(join(parent, "lib-w"));
+    const { execFileSync } = await import("node:child_process");
+    execFileSync("git", ["worktree", "add", "-q", "-b", "feat", join(parent, "lib-w-feat")], { cwd: multi, stdio: "ignore" });
+    const { dir } = home({ routing: { delegation: "roles", repoParents: [parent], repoDepth: 2 } }, ENF0);
+    const { hooks } = await plugin(dir);
+    await bindExact(hooks, dir, work);
+
+    resetSpawns();
+    expect(await call(hooks, "router_git_status", { root: "nope" }))
+      .toMatch(/^\[router_git\] error: refused: root=nope matches no repository below routing\.repoParents \(searched .+\); nothing ran$/);
+    expect(gitSpawns()).toEqual([]);
+
+    resetSpawns();
+    expect(await call(hooks, "router_git_log", { root: "lib", limit: 1 }))
+      .toMatch(/^\[router_git\] error: refused: root=lib matches 2 repositories: .+; nothing ran\. Pass root as one of these absolute paths$/);
+    expect(await call(hooks, "router_git_status", { root: "lib-w" }))
+      .toMatch(/^\[router_git\] error: refused: root=lib-w has 2 worktrees: .+; nothing ran\. Pass root as one of these absolute paths$/);
+    // The lookup's read-only probes may run; no git command of the tool does.
+    expect(toolCommands()).toEqual([]);
+
+    // The filter is not vacuous: an admitted name runs the tool's command.
+    resetSpawns();
+    expect(provenanceOf(await call(hooks, "router_git_status", { root: "lib-b" }))).toMatchObject({ name: "lib-b", branch: "main" });
+    expect(toolCommands()).toContain("status");
+  });
+
+  it("the orchestrator lookup is bounded by the call's signal: a hanging session lookup ends in the aborted refusal (QA F5)", async () => {
+    const { work, parent, repo } = await fixture();
+    const { dir } = home({ routing: { delegation: "roles", repoParents: [parent] } }, ENF0);
+    let hang = false;
+    const hooks = await ModelRouterPlugin({
+      directory: dir, worktree: dir, routerHost: "v2",
+      client: {
+        session: {
+          get: async ({ path }: { path: { id: string } }) => hang
+            ? new Promise<never>(() => undefined)
+            : { data: { id: path.id, ...(path.id === "root" ? {} : { parentID: "root" }) } },
+        },
+        app: { log: vi.fn(async () => ({})) },
+      },
+    } as unknown as RouterPluginInput) as Record<string, any>;
+    cleanups.push(async () => { await hooks.dispose?.(); });
+    await bindExact(hooks, dir, work);
+    hang = true;
+    resetSpawns();
+    const controller = new AbortController();
+    const pending = toolsOf(hooks).router_git_status!.execute({ root: repo }, { ...toolCtx(CHILD), abort: controller.signal });
+    setTimeout(() => controller.abort(), 20);
+    expect(await pending).toBe(`[router_git] error: refused: root=${repo}: resolving the repository was aborted; nothing ran`);
+    expect(gitSpawns()).toEqual([]);
   });
 });
 
@@ -840,11 +1408,11 @@ describe("QA round 1 (P2.1)", () => {
     expect(routedRoleOf("df1a")!.verifyRoot).toBe(root);
     expect(await route("df1b", `[route class=implement risk=low scope=single]\n${block("sub")}`)).toBe("deterministic");
     expect(await route("df1c", `[route class=implement risk=low scope=single]\n${block(join(root, ".."))}`)).not.toBe("deterministic");
-    // root= naming no worktree of this repository: no work root, so the gate cannot back a deterministic detection; it is
-    // verified in the canonical session directory (QA-P33F1-1-3).
-    expect(await route("df1d", `[route class=implement risk=low scope=single root=${join(root, "..")}]\n${block()}`)).not.toBe("deterministic");
-    expect(routedRoleOf("df1d")!.workRoot).toBeNull();
-    expect(routedRoleOf("df1d")!.verifyRoot).toBe(root);
+    // Q9 (FLIPPED ON PURPOSE: this dispatch used to run with no work root, verified in the canonical session directory,
+    // QA-P33F1-1-3): a root= naming no worktree of this repository is a declared target that was refused — the dispatch is refused.
+    await expect(route("df1d", `[route class=implement risk=low scope=single root=${join(root, "..")}]\n${block()}`))
+      .rejects.toThrow(/role dispatch @implementer refused: root=.*neither the session directory nor a worktree/);
+    expect(routedRoleOf("df1d")).toBeUndefined();
     // QA-P33F1-1 nit 3: the call's own cwd argument wins over the block's cwd:, exactly as in the after-hook.
     expect(roleGateOutsideWorkRoot(root, block(), "", join(root, ".."))).toBe(true);
     expect(roleGateOutsideWorkRoot(root, block(join(root, "..")), "", root)).toBe(false);
@@ -1246,6 +1814,97 @@ describe("QA round 1 (P2.1)", () => {
   it("P2.2: the budget note starts with the protocol's prefix", () => {
     expect(roleBudgetNotice("explorer", "x").startsWith(`${ROUTER_BUDGET_NOTE_PREFIX} `)).toBe(true);
     expect(roleBudgetNotice("explorer", "x", "host").startsWith(`${ROUTER_BUDGET_NOTE_PREFIX} `)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P2g.3 (OD6): the consumers of a role dispatch header
+// ---------------------------------------------------------------------------
+
+describe("role dispatch header consumers (P2g.3, OD6)", () => {
+  // Built from strings only: the work root names a `CAP:9` directory and never touches the filesystem.
+  const header = (workRoot = "/work/CAP:9/repo"): string => buildRoleDispatchHeader({ agent: "explorer", workRoot, edits: false });
+
+  it("the read cap is the orchestrator's CAP:, never one inside the header", async () => {
+    let snapshot: ((child: string) => ReturnType<typeof captureBudget>) | undefined;
+    const { dir, cfg } = home(ROLES, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir, "v2", { routerOnBudgetSnapshot: (read: typeof snapshot) => { snapshot = read; } });
+    const sessions: Record<string, Record<string, unknown>> = {};
+    const v2 = host(dir, cfg, sessions);
+    await v2.start(hooks, { budgetSnapshot: snapshot! });
+    expect(header()).toContain("CAP:9");
+    const fresh = async (callID: string, child: string, prompt: string) => {
+      const event = { sessionID: "root", agent: "build", messageID: "m", id: callID, tool: "subagent", input: { agent: "explorer", description: "find", prompt } as Record<string, unknown> };
+      await v2.toolHooks["execute.before"](event);
+      sessions[child] = { id: child, parentID: "root", agent: "explorer", title: event.input.description, location: { directory: dir } };
+    };
+    const read = async (child: string, i: number): Promise<string> => {
+      const args = { path: join(dir, `${child}-${i}.ts`) };
+      await v2.toolHooks["execute.before"]({ sessionID: child, agent: "explorer", messageID: "m", id: `${child}-${i}`, tool: "read", input: { ...args } });
+      const output = { title: "", output: `content ${i}`, metadata: {} };
+      await hooks["tool.execute.after"]({ tool: "read", sessionID: child, agent: "explorer", callID: `${child}-${i}`, args: { filePath: args.path } }, output);
+      return output.output;
+    };
+    // The orchestrator's CAP:3 wins over the header's CAP:9.
+    await fresh("h1", "hcapped", `${header()}CAP:3\nFind the loader`);
+    expect(await read("hcapped", 1)).toContain("[cap: 1/3]");
+    expect(await read("hcapped", 2)).toContain("[cap: 2/3]");
+    expect(await read("hcapped", 3)).toContain("CAP REACHED (3/3)");
+    // No CAP: of its own: no cap at all, not 9.
+    await fresh("h2", "huncapped", `${header()}Find the loader`);
+    expect(await read("huncapped", 1)).not.toContain("[cap:");
+    expect(snapshot!("huncapped").readCapReached).toBe(false);
+  });
+
+  it("the re-dispatch signal compares the orchestrator's text: the same task under different headers is the same task", async () => {
+    // A live engine (shadow) gives each routed dispatch a decision id: without one the re-dispatch signal has no row to land on.
+    const outcomes = temp("omr-p2g3-out-");
+    const { dir, cfg } = home({ routing: { delegation: "roles", engine: "shadow", outcomes: { path: outcomes } } }, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks, ingest } = await plugin(dir, "v2");
+    const sessions: Record<string, Record<string, unknown>> = {};
+    const v2 = host(dir, cfg, sessions);
+    await v2.start(hooks);
+    const onSignal = vi.spyOn(ingest!, "onSignal");
+    const kinds = (child: string) => onSignal.mock.calls.filter(([c]) => c === child).map(([, observation]) => observation.kind);
+    const task = "Locate the configuration loader in the repository, list its entry points with file and line, and report which modules import it.";
+    const run = async (callID: string, child: string, prompt: string) => {
+      const event = { sessionID: "root", agent: "build", messageID: "m", id: callID, tool: "subagent", input: { agent: "explorer", description: "find", prompt } as Record<string, unknown> };
+      await v2.toolHooks["execute.before"](event);
+      sessions[child] = { id: child, parentID: "root", agent: "explorer", title: "find", location: { directory: dir } };
+      await v2.toolHooks["execute.after"](parentCall(callID, child, "explorer", "DONE: loader.ts:1 loadConfig"));
+    };
+    // Control: no header at all.
+    await run("rd1", "rd-first", `[route tier=fast]\n${task}`);
+    await run("rd2", "rd-second", `[route tier=medium]\n${task}`);
+    expect(kinds("rd-first")).toContain("redispatch");
+    // The same orchestrator text under a header: still that task. The router puts the header on after routing (the route line is
+    // read from the first line), so the headered prompt is noted by a second pass over the already routed call.
+    const other = "Summarise the release notes of the last three versions and list every breaking change they mention, grouped by package.";
+    const noted = async (callID: string, prompt: string) => hooks["tool.execute.before"](
+      { tool: "task", sessionID: "root", callID },
+      { args: { subagent_type: "explorer", description: "find", prompt } },
+    );
+    // The first attempt names a ticket id (P1.5); the retry does not, but the header's work root carries another one (p1.4): read
+    // as part of the retry's text, the header would make the two ids differ and the retry a different task.
+    await run("rd3", "rd-third", `[route tier=fast]\n${other} (P1.5)`);
+    // The retry is routed (tier=medium) and still running: the router keeps its routed role until its result is delivered.
+    await v2.toolHooks["execute.before"]({
+      sessionID: "root", agent: "build", messageID: "m", id: "rd4", tool: "subagent",
+      input: { agent: "explorer", description: "find", prompt: "[route tier=medium]\nCount the lines of every test file under the unit directory and report the five longest." },
+    });
+    expect(kinds("rd-third")).toEqual([]); // unrelated task: no signal yet
+    await new Promise((resolve) => setTimeout(resolve, 5)); // the retry is strictly later than the first attempt
+    await noted("rd4", `${header("/work/p1.4/repo")}${other}`);
+    expect(kinds("rd-third")).toContain("redispatch");
+  });
+
+  it("a tier dispatch keeps the tier header byte-identical", async () => {
+    const { dir, cfg } = home({}, { MODEL_ROUTER_ENFORCE: "0" });
+    const { hooks } = await plugin(dir);
+    const output = { args: { subagent_type: "fast", description: "look", prompt: "Look around" } as Record<string, unknown> };
+    await hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID: "th1" }, output);
+    const cap = cfg.tierCaps?.fast ?? DEFAULT_TIER_CAPS.fast ?? 5;
+    expect(output.args.prompt).toBe(buildDispatchHeader({ tier: "fast", cap, projectDirectory: dir }) + DISPATCH_HEADER_SEPARATOR + "Look around");
   });
 });
 

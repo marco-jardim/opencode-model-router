@@ -233,7 +233,14 @@ describe("shell-free git inspection", () => {
     expect(args.slice(0, hardeningArgs().length)).toEqual(hardeningArgs());
     for (const flag of ["--no-optional-locks", "--no-pager", "core.pager=cat", "core.fsmonitor=false", "diff.external=", "protocol.allow=never",
       "log.showSignature=false", "gpg.program=", "gpg.ssh.program=", "diff.autoRefreshIndex=false", "core.splitIndex=false", "index.threads=1",
-      "gc.auto=0", "maintenance.auto=false"]) expect(args).toContain(flag);
+      "gc.auto=0", "maintenance.auto=false",
+      // Phase 4 QA (m5): every transport refused on the command line, so a repository's protocol.<name>.allow cannot re-enable one.
+      "protocol.ext.allow=never", "protocol.file.allow=never", "protocol.ssh.allow=never", "protocol.git.allow=never",
+      "protocol.http.allow=never", "protocol.https.allow=never"]) expect(args).toContain(flag);
+    // Each refusal is a `-c` value.
+    for (const name of ["ext", "file", "ssh", "git", "http", "https"]) {
+      expect(args[args.indexOf(`protocol.${name}.allow=never`) - 1]).toBe("-c");
+    }
     expect(args.some(a => a.startsWith("core.hooksPath="))).toBe(true);
     if (["diff", "show", "log"].includes(operation)) {
       expect(args).toContain("--no-ext-diff"); expect(args).toContain("--no-textconv");

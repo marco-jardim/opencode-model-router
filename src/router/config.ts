@@ -21,11 +21,17 @@ import { resolveRoleTable, type ExplorationConfig, type RunConfig } from "./role
 import {
   DEFAULT_RUN_COMMANDS,
   DEFAULT_RUN_SCRIPTS,
+  DEFAULT_REPO_APPROVAL_DAYS,
+  DEFAULT_REPO_DEPTH,
   DEFAULT_RUN_TIMEOUT_MS,
   ROLES_V1_NOTICE,
   collectRolesIssues,
   sanitizeDelegation,
   sanitizeExploration,
+  sanitizeRepoApprovalDays,
+  sanitizeRepoDepth,
+  sanitizeRepoExclude,
+  sanitizeRepoParents,
   sanitizeRoleAgents,
   sanitizeRun,
   sanitizeWorkRoots,
@@ -360,6 +366,14 @@ export interface RoutingConfig {
   run?: Partial<RunConfig>;
   /** Global only. Absolute globs with a static long-form prefix; default none. */
   workRoots?: string[];
+  /** Global only. Literal absolute directories below which a git top level is an admissible work root (cross-repo, Phase 1). Inert on v1. */
+  repoParents?: string[];
+  /** Global only. Levels below a parent, 1–4; default 2. */
+  repoDepth?: number;
+  /** Global only. Absolute globs never admitted below a parent. */
+  repoExclude?: string[];
+  /** Global only. Days an approved repository outside the parents stays approved after its last use, 1–90; default 14. Inert on v1. */
+  repoApprovalDays?: number;
 }
 
 export interface RouterConfig {
@@ -2187,6 +2201,14 @@ function validateRouting(value: unknown): RoutingConfig | undefined {
   if (run !== undefined) out.run = run;
   const workRoots = sanitizeWorkRoots(routing.workRoots).value;
   if (workRoots !== undefined) out.workRoots = workRoots;
+  const repoParents = sanitizeRepoParents(routing.repoParents).value;
+  if (repoParents !== undefined) out.repoParents = repoParents;
+  const repoDepth = sanitizeRepoDepth(routing.repoDepth).value;
+  if (repoDepth !== undefined) out.repoDepth = repoDepth;
+  const repoExclude = sanitizeRepoExclude(routing.repoExclude).value;
+  if (repoExclude !== undefined) out.repoExclude = repoExclude;
+  const repoApprovalDays = sanitizeRepoApprovalDays(routing.repoApprovalDays).value;
+  if (repoApprovalDays !== undefined) out.repoApprovalDays = repoApprovalDays;
 
   // Phase 2.1 keys (OpenCode v2 only): tolerant, issues surface as notices.
   const background = sanitizeBackground(routing.background).value;
@@ -2592,7 +2614,15 @@ const GLOBAL_ONLY_ROUTING_KEYS: ReadonlyArray<readonly [block: string, key: stri
 ];
 
 /** Roles keys (#84) a project layer must not carry; `routing.delegation` is allowed there. */
-const GLOBAL_ONLY_ROLES_ROUTING_KEYS = ["exploration", "run", "workRoots"] as const;
+const GLOBAL_ONLY_ROLES_ROUTING_KEYS = [
+  "exploration",
+  "run",
+  "workRoots",
+  "repoParents",
+  "repoDepth",
+  "repoExclude",
+  "repoApprovalDays",
+] as const;
 
 function stripGlobalOnlyRolesKeys(data: Record<string, unknown>): string[] {
   const dropped: string[] = [];
@@ -2922,6 +2952,10 @@ const ROUTING_KNOWN_KEYS: Readonly<Record<string, readonly string[]>> = {
     "exploration",
     "run",
     "workRoots",
+    "repoParents",
+    "repoDepth",
+    "repoExclude",
+    "repoApprovalDays",
     "background",
     "leases",
     "executor",
@@ -3883,6 +3917,12 @@ export interface ResolvedRolesRouting {
   readonly exploration: Readonly<ExplorationConfig>;
   readonly run: Readonly<RunConfig>;
   readonly workRoots: readonly string[];
+  /** Cross-repo (Phase 1): admissible repositories lie 1..repoDepth levels below these directories. */
+  readonly repoParents: readonly string[];
+  readonly repoDepth: number;
+  readonly repoExclude: readonly string[];
+  /** Cross-repo (Phase 4): days an approval outside the parents lasts after its last use (1–90, default 14). */
+  readonly repoApprovalDays: number;
   /** True on v1 when roles keys were set: they are validated but have no effect. */
   readonly inert: boolean;
 }
@@ -3910,7 +3950,9 @@ export function resolveRolesRouting(
   const r: RoutingConfig = cfg?.routing ?? {};
   const requested = r.delegation ?? "tiers";
   const touched = requested === "roles" || cfg?.roleAgents !== undefined || r.exploration !== undefined
-    || r.run !== undefined || r.workRoots !== undefined;
+    || r.run !== undefined || r.workRoots !== undefined
+    || r.repoParents !== undefined || r.repoDepth !== undefined || r.repoExclude !== undefined
+    || r.repoApprovalDays !== undefined;
   const inert = host === "v1" && touched;
   if (inert && !warnedRolesInertOnV1) {
     warnedRolesInertOnV1 = true;
@@ -3930,6 +3972,10 @@ export function resolveRolesRouting(
       timeoutMs: r.run?.timeoutMs ?? DEFAULT_RUN_TIMEOUT_MS,
     }),
     workRoots: Object.freeze([...(r.workRoots ?? [])]),
+    repoParents: Object.freeze([...(r.repoParents ?? [])]),
+    repoDepth: r.repoDepth ?? DEFAULT_REPO_DEPTH,
+    repoExclude: Object.freeze([...(r.repoExclude ?? [])]),
+    repoApprovalDays: r.repoApprovalDays ?? DEFAULT_REPO_APPROVAL_DAYS,
     inert,
   });
 }

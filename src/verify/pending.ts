@@ -385,10 +385,12 @@ import { appendFile, mkdir, open, readdir, readFile, rename, rm, stat, writeFile
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import type { DoD } from "./dod";
+import type { PerimeterObservation } from "./gate";
+import type { LinkPin } from "./pin";
 import type { RiskAssessment, RiskLevel } from "./risk";
 import { deserializeReference, serializeReference, type DispatchReference } from "./reference";
 import type { ChangedPath } from "./runner";
-import type { ReferenceState, Verdict } from "./types";
+import type { CheckPlacement, ReferenceState, Verdict } from "./types";
 
 // ---------------------------------------------------------------------------------------------
 // Constants (R2, R7, R9)
@@ -464,6 +466,60 @@ export const REPORTED_MEMO_MAX = TOMBSTONE_MAX;
 
 export type PendingState = "unverified" | "verifying" | "verified" | "held";
 
+/**
+ * R3 cross-repo P2e: the frozen perimeter of a deferred entry (data only; the registry stores it, nothing here
+ * interprets it). `pins` is kept by identity (pinNow admission is keyed by the array's identity); a rejection
+ * normalises to [] for readers.
+ */
+export interface DeferredPerimeter {
+  readonly observation: PerimeterObservation;
+  readonly workingSet: readonly { readonly root: string; readonly name?: string }[];
+  readonly links: readonly {
+    readonly at: string;
+    readonly root: string;
+    readonly name?: string;
+    readonly head: string;
+    readonly fingerprint: string;
+    readonly admit?: (root: string) => boolean;
+    /**
+     * Cross-repo P3 QA-1 M3: a dispatch-time dependency W no longer declared at return (the producer removed or retargeted
+     * it): not an input of the change, so router_verify skips it entirely (neither "no longer links" nor re-observed).
+     */
+    readonly removedAtReturn?: true;
+  }[];
+  /**
+   * Cross-repo P3 QA-1 M4: the dependency targets the producer added during the dispatch that were not admitted (an unadmitted
+   * edge's text, a link outside every parent and worktree, no or a refused top level), as read at return. Covering only, never
+   * seeds (I13) nor observed (I11): router_verify does not name them new, as it does not the dispatch-time unadmitted ones.
+   */
+  readonly unadmittedAtReturn?: readonly string[];
+  readonly pins: Promise<readonly LinkPin[]>;
+  /**
+   * The W directory `planPerimeter` read package links from at dispatch (<W>/node_modules): the bound worktree, else
+   * the canonical session folder. It can be a subfolder of the git top level. Absent: fall back to observation.w.root.
+   */
+  readonly linkBase?: string;
+  /**
+   * Cross-repo P3c.4 (SD-P3c-9): the admission W's dependencies were read with at dispatch, as data. At router_verify W's
+   * dependency targets are read again through it (`dependencyTargets`), so that a target outside the parents is named from its
+   * text and a new target's top level is found below its parent (the `gitTopOf` ceiling). Absent: an entry registered without
+   * one; then only W's package links are read again, admitted by nothing (as before P3c).
+   */
+  readonly admission?: DeferredAdmission;
+}
+
+/** Cross-repo P3c.4: the frozen admission of a deferred perimeter (data only, `admissionContext`'s inputs and parents). */
+export interface DeferredAdmission {
+  /** Both spellings of each parent (as configured, and canonical), as `admissionContext` computed them at dispatch. */
+  readonly parents: readonly string[];
+  /** `routing.repoDepth` at dispatch. */
+  readonly depth: number;
+  /** `routing.repoExclude` at dispatch. Absent: none. */
+  readonly exclude?: readonly string[];
+  /** The working set at dispatch (the orchestrator's, W's own entry included). */
+  readonly workingSet: readonly { readonly worktree: string; readonly name?: string }[];
+}
+
 /** Absolute path -> sha256 hex of the file bytes, or ABSENT_DIGEST for a missing path (R3). */
 export type FileDigests = ReadonlyMap<string, string>;
 export const ABSENT_DIGEST = "absent";
@@ -498,6 +554,30 @@ export interface PendingRegistration {
    */
   readonly handle?: string;
   readonly hold?: HoldRef;
+  /**
+   * I7 (P0.2, S12): the checkout the producer returned on (the deferred finish's tree snapshot). router_verify refuses a tree
+   * on another branch by then, or one it cannot read while a branch was recorded. Absent: no snapshot then, and no check.
+   */
+  readonly returnedTree?: ReturnedTree;
+  /**
+   * I5 (P0.3): tools the producer lineage ran whose writes the router cannot observe (sorted). With an empty change set,
+   * router_verify's pass carries a caveat. Absent: none.
+   */
+  readonly unattributedWriters?: readonly string[];
+  /** R3 cross-repo P2e: the frozen perimeter of a deferred entry. Absent: none (the entry has no such key). */
+  readonly perimeter?: DeferredPerimeter;
+  /** R3 cross-repo P2e: the check placements of a deferred entry (an `undefined` slot: no placement). Absent: none. */
+  readonly placements?: readonly (CheckPlacement | undefined)[];
+}
+
+/** I7 (P0.2): HEAD and branch at return (TreeSnapshot.head / .branch: a short name, null when detached, absent when unknown). */
+export interface ReturnedTree {
+  readonly head: string;
+  readonly branch?: string | null;
+  /** HeadState.root at return (realpath of the toplevel); absent on an entry registered without a head state. */
+  readonly root?: string;
+  /** HeadState.reflog at return: the HEAD reflog entry count; absent when it could not be counted. */
+  readonly reflog?: number;
 }
 
 /** The held child behind a "held" entry (phase 2.1 section 2.3). */
@@ -568,6 +648,19 @@ export interface PendingEntry {
   readonly contaminatedBy?: string;
   /** Set while the child's result is held until the verdict (phase 2.1). */
   readonly hold?: HoldRef;
+  /** PendingRegistration.returnedTree, as registered. */
+  readonly returnedTree?: ReturnedTree;
+  /** PendingRegistration.unattributedWriters, as registered. */
+  readonly unattributedWriters?: readonly string[];
+  /** PendingRegistration.perimeter, frozen; `pins` never rejects. Absent when not provided or released. */
+  readonly perimeter?: DeferredPerimeter;
+  /** PendingRegistration.placements, frozen. Absent when not provided or released. */
+  readonly placements?: readonly (CheckPlacement | undefined)[];
+  /**
+   * Restored after a restart from a registration that had a perimeter, which is not journaled: router_verify settles the entry
+   * unverifiable with {@link PERIMETER_LOST_REASON}, never a pass. Absent otherwise.
+   */
+  readonly perimeterLost?: true;
   readonly createdAt: number;
   readonly state: PendingState;
   /** Set while state is "verifying". */
@@ -800,6 +893,15 @@ interface EntryRecord {
   readonly changedFilesDropped: number;
   readonly concurrentDispatches: number | undefined;
   readonly contaminatedBy: string | undefined;
+  readonly returnedTree: ReturnedTree | undefined;
+  readonly unattributedWriters: readonly string[] | undefined;
+  perimeter: DeferredPerimeter | undefined;
+  placements: readonly (CheckPlacement | undefined)[] | undefined;
+  /**
+   * Restored from a journal record whose registration had a perimeter (`hadPerimeter`), which is never journaled: the entry
+   * is unverifiable ({@link PERIMETER_LOST_REASON}). False for a live registration and for records without the flag.
+   */
+  readonly perimeterLost: boolean;
   dod: DoD | undefined;
   reference: Promise<ReferenceState>;
   changedFiles: readonly ChangedPath[] | "unavailable";
@@ -826,6 +928,39 @@ type LookupMiss = Extract<Lookup, { readonly kind: "expired" | "unknown" }>;
 interface LedgerRecord {
   readonly record: RejectionRecord;
   readonly recordedAt: number;
+}
+
+/**
+ * P2e: a frozen copy of a deferred perimeter. `pins` is kept by identity (the resolved array is never copied):
+ * only a rejection is normalised, to [] (so readers never see one and none goes unhandled).
+ */
+function freezePerimeter(perimeter: DeferredPerimeter | undefined): DeferredPerimeter | undefined {
+  if (perimeter === undefined) return undefined;
+  return Object.freeze({
+    observation: perimeter.observation,
+    // Kept as given (a path string); absent stays absent (router_verify then falls back to observation.w.root).
+    ...(perimeter.linkBase === undefined ? {} : { linkBase: perimeter.linkBase }),
+    // P3c.4: copied and frozen (the caller's arrays never alias it); absent stays absent (links only at router_verify).
+    ...(perimeter.admission === undefined ? {} : { admission: freezeAdmission(perimeter.admission) }),
+    workingSet: Object.freeze(perimeter.workingSet.map((w) => Object.freeze({ ...w }))),
+    links: Object.freeze(perimeter.links.map((l) => Object.freeze({ ...l }))),
+    // P3 QA-1 M4: copied and frozen; absent stays absent.
+    ...(perimeter.unadmittedAtReturn === undefined ? {} : { unadmittedAtReturn: Object.freeze([...perimeter.unadmittedAtReturn]) }),
+    pins: perimeter.pins.then(
+      (pins) => pins,
+      (): readonly LinkPin[] => [],
+    ),
+  });
+}
+
+/** P3c.4: a frozen copy of a deferred perimeter's admission data. */
+function freezeAdmission(admission: DeferredAdmission): DeferredAdmission {
+  return Object.freeze({
+    parents: Object.freeze([...admission.parents]),
+    depth: admission.depth,
+    ...(admission.exclude === undefined ? {} : { exclude: Object.freeze([...admission.exclude]) }),
+    workingSet: Object.freeze(admission.workingSet.map((entry) => Object.freeze({ ...entry }))),
+  });
 }
 
 function defaultRandom(bytes: number): Uint8Array {
@@ -863,6 +998,63 @@ function isChangedFiles(value: unknown): value is readonly ChangedPath[] {
 function isDoD(value: unknown): value is DoD {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+
+/** A journaled `returnedTree` (entryRecord): `head` a string, `branch` a string or null, `root` non-empty, `reflog` a count. */
+function isReturnedTree(value: unknown): value is ReturnedTree {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const v = value as Record<string, unknown>;
+  if (typeof v.head !== "string") return false;
+  if (v.branch !== undefined && v.branch !== null && typeof v.branch !== "string") return false;
+  if (v.root !== undefined && !isNonEmptyString(v.root)) return false;
+  if (v.reflog !== undefined && !(typeof v.reflog === "number" && Number.isSafeInteger(v.reflog) && v.reflog >= 0)) return false;
+  return true;
+}
+
+/** A journaled `unattributedWriters` (entryRecord): tool names, each a non-empty string. */
+function isUnattributedWriters(value: unknown): value is readonly string[] {
+  return Array.isArray(value) && value.every(isNonEmptyString);
+}
+
+/** One journaled placement slot (entryRecord): null for a check without one, else a {@link CheckPlacement}. */
+function isPlacementSlot(value: unknown): value is CheckPlacement | null {
+  if (value === null) return true;
+  if (typeof value !== "object" || Array.isArray(value)) return false;
+  const v = value as Record<string, unknown>;
+  if (!isNonEmptyString(v.cwd) || typeof v.foreign !== "boolean") return false;
+  if (v.top !== undefined && !isNonEmptyString(v.top)) return false;
+  return v.scope === undefined || v.scope === "affected" || v.scope === "full";
+}
+
+/** A journaled `placements` (entryRecord): index-aligned slots, each valid ({@link isPlacementSlot}). */
+function isPlacements(value: unknown): value is readonly (CheckPlacement | null)[] {
+  return Array.isArray(value) && value.every(isPlacementSlot);
+}
+
+/** The known fields of a journaled returned tree, copied (nothing else is restored). */
+function restoredReturnedTree(tree: ReturnedTree): ReturnedTree {
+  return Object.freeze({
+    head: tree.head,
+    ...(tree.branch !== undefined ? { branch: tree.branch } : {}),
+    ...(tree.root !== undefined ? { root: tree.root } : {}),
+    ...(tree.reflog !== undefined ? { reflog: tree.reflog } : {}),
+  });
+}
+
+/** The known fields of journaled placements, copied; a null slot is a check without a placement. */
+function restoredPlacements(placements: readonly (CheckPlacement | null)[]): readonly (CheckPlacement | undefined)[] {
+  return Object.freeze(placements.map((p) => (p === null ? undefined : Object.freeze({
+    cwd: p.cwd,
+    top: p.top,
+    foreign: p.foreign,
+    ...(p.scope !== undefined ? { scope: p.scope } : {}),
+  }))));
+}
+
+/**
+ * The reason `router_verify` gives a restored entry whose registration had a perimeter: the perimeter (link pins, observed
+ * statuses) is not journaled, so the entry can no longer be verified as registered (never a pass).
+ */
+export const PERIMETER_LOST_REASON = "perimeter lost in restart";
 
 export const REFERENCE_UNRESTORED_REASON = "reference could not be restored after a restart";
 
@@ -2071,6 +2263,12 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
         dispatchedAt: rec.dispatchedAt,
         ...(rec.concurrentDispatches !== undefined ? { concurrentDispatches: rec.concurrentDispatches } : {}),
         ...(rec.contaminatedBy !== undefined ? { contaminatedBy: rec.contaminatedBy } : {}),
+        // Cross-repo (2.8.0): the plain-data registration fields, validated again by restore(). The perimeter holds promises and
+        // is never journaled: only the fact that the entry had one, so a restored entry is unverifiable instead of passing.
+        ...(rec.returnedTree !== undefined ? { returnedTree: { ...rec.returnedTree } } : {}),
+        ...(rec.unattributedWriters !== undefined ? { unattributedWriters: [...rec.unattributedWriters] } : {}),
+        ...(rec.placements !== undefined ? { placements: rec.placements.map((p) => (p === undefined ? null : { ...p })) } : {}),
+        ...(rec.perimeter !== undefined || rec.perimeterLost ? { hadPerimeter: true } : {}),
     };
   }
 
@@ -2149,6 +2347,11 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       ...(rec.concurrentDispatches !== undefined ? { concurrentDispatches: rec.concurrentDispatches } : {}),
       ...(rec.contaminatedBy !== undefined ? { contaminatedBy: rec.contaminatedBy } : {}),
       ...(rec.hold !== undefined ? { hold: rec.hold } : {}),
+      ...(rec.returnedTree !== undefined ? { returnedTree: rec.returnedTree } : {}),
+      ...(rec.unattributedWriters !== undefined ? { unattributedWriters: rec.unattributedWriters } : {}),
+      ...(rec.perimeter !== undefined ? { perimeter: rec.perimeter } : {}),
+      ...(rec.placements !== undefined ? { placements: rec.placements } : {}),
+      ...(rec.perimeterLost ? { perimeterLost: true as const } : {}),
       createdAt: rec.createdAt,
       state: rec.state,
       verifyingSince: rec.verifyingSince,
@@ -2181,13 +2384,19 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
     if (cause !== "disposed" && cause !== "session-gone") {
       journal({ v: 1, kind: "tomb", handle: rec.handle, cause, at: now() });
     }
-    const hook = options.onEvict;
-    if (hook === undefined) return;
     try {
-      hook(snapshot(rec), cause);
-    } catch {
-      // A logging hook must never break the registry (PendingRegistryOptions.onEvict).
-      counters.hookFailures += 1;
+      const hook = options.onEvict;
+      if (hook === undefined) return;
+      try {
+        hook(snapshot(rec), cause);
+      } catch {
+        // A logging hook must never break the registry (PendingRegistryOptions.onEvict).
+        counters.hookFailures += 1;
+      }
+    } finally {
+      // P2e: an evicted entry is gone; it keeps neither its perimeter nor its placements.
+      rec.perimeter = undefined;
+      rec.placements = undefined;
     }
   }
 
@@ -2196,6 +2405,8 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
     rec.pathWeight = 0;
     rec.refWeight = 0;
     rec.released = true;
+    rec.perimeter = undefined;
+    rec.placements = undefined;
     rec.dod = undefined;
     rec.digests = undefined;
     rec.changedFiles = "unavailable";
@@ -2382,7 +2593,12 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       if (incoming.length > MAX_STORED_CHANGED_FILES) changedFilesDropped = incoming.length;
       else changedFiles = Object.freeze([...incoming]);
     }
-    const pathWeight = changedFiles === "unavailable" ? 0 : changedFiles.length;
+    const perimeter = freezePerimeter(reg.perimeter);
+    const placements = reg.placements !== undefined ? Object.freeze([...reg.placements]) : undefined;
+    const pathWeight =
+      (changedFiles === "unavailable" ? 0 : changedFiles.length) +
+      (perimeter !== undefined ? perimeter.workingSet.length + perimeter.links.length + (perimeter.unadmittedAtReturn?.length ?? 0) : 0) +
+      (placements !== undefined ? placements.length : 0);
 
     // Plan the evictions first: a registration that cannot fit evicts nothing.
     const session = sessions.get(reg.orchestratorSessionID);
@@ -2448,6 +2664,12 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       changedFilesDropped,
       concurrentDispatches: reg.concurrentDispatches,
       contaminatedBy: reg.contaminatedBy,
+      returnedTree: reg.returnedTree !== undefined ? Object.freeze({ ...reg.returnedTree }) : undefined,
+      unattributedWriters: reg.unattributedWriters !== undefined && reg.unattributedWriters.length > 0
+        ? Object.freeze([...reg.unattributedWriters]) : undefined,
+      perimeter,
+      placements,
+      perimeterLost: false,
       dod: reg.dod,
       reference,
       changedFiles,
@@ -2569,9 +2791,15 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       const callID = isNonEmptyString(e.callID) ? e.callID : undefined;
       const child = isNonEmptyString(e.child) ? e.child : undefined;
       const producer = isNonEmptyString(e.producer) ? e.producer : child;
+      // Cross-repo (2.8.0) fields: absent on records written before they were journaled (restored without them, as those
+      // entries never had the checks); present but malformed drops the record, like any other invalid record.
+      const crossRepoInvalid = (e.returnedTree !== undefined && !isReturnedTree(e.returnedTree))
+        || (e.unattributedWriters !== undefined && !isUnattributedWriters(e.unattributedWriters))
+        || (e.placements !== undefined && !isPlacements(e.placements))
+        || (e.hadPerimeter !== undefined && e.hadPerimeter !== true);
       if (
         parent === undefined || callID === undefined || producer === undefined || parent === producer ||
-        !HANDLE_PATTERN.test(handle) || f.state === "verified" || byHandle.has(handle) || byDispatch.has(callID)
+        !HANDLE_PATTERN.test(handle) || f.state === "verified" || byHandle.has(handle) || byDispatch.has(callID) || crossRepoInvalid
       ) {
         dropped += 1;
         continue;
@@ -2624,6 +2852,13 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
         live: true,
         replayed: false,
         hold: held && child !== undefined ? { childSessionID: child, callID } : undefined,
+        // Cross-repo (2.8.0): validated above; the perimeter itself is never journaled, only `hadPerimeter`.
+        returnedTree: isReturnedTree(e.returnedTree) ? restoredReturnedTree(e.returnedTree) : undefined,
+        unattributedWriters: isUnattributedWriters(e.unattributedWriters) && e.unattributedWriters.length > 0
+          ? Object.freeze([...e.unattributedWriters]) : undefined,
+        perimeter: undefined,
+        placements: isPlacements(e.placements) ? restoredPlacements(e.placements) : undefined,
+        perimeterLost: e.hadPerimeter === true,
         holdAttempts: 0,
       };
       const target = session ?? new Map<string, EntryRecord>();

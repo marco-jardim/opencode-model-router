@@ -16,7 +16,7 @@
 import { createHash } from "node:crypto";
 import type { ChildSessionRunner } from "../compat/child-session";
 import { access, readdir, readFile as fsReadFile, realpath, stat, unlink } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { createBatchCoordinator, type BatchCoordinatorOptions, type BatchPlanner } from "./batch";
 import {
   createDeadline,
@@ -59,13 +59,14 @@ import {
   type SettledVerification,
   type VerificationResult,
 } from "./pending";
-import { assessRisk, type RiskAssessment } from "./risk";
+import { assessRisk, FULL_SCOPE_PLAN, type FullScopePlan, type RiskAssessment } from "./risk";
 import { resolveBaseDir } from "./paths";
 import { DEFAULT_IDLE_TTL_MS } from "../router/idle-sweep";
 import {
   buildAcceptedSuffix,
   buildForcingNote,
   canonicalPath,
+  isUnattributedWriter,
   tierModel,
   toolLabel,
   type ChangedFile,
@@ -74,23 +75,40 @@ import {
   type TreeSnapshot,
 } from "./dispatch";
 import { runArgv, runShell } from "./exec";
-import { snapshotTree } from "./tree";
+import { fileMtimeMs, listIgnoredModules, snapshotTree } from "./tree";
+import {
+  admissionFromData,
+  crossLinkAliases,
+  dependencyTargets,
+  discoverConsumers,
+  linkedTargets,
+  planPerimeter,
+  type ConsumerDiscovery,
+  type DependencyTargets,
+} from "./perimeter";
+import { PERIMETER_MAX } from "./perimeter";
+import { defaultExternalLinks, pinTarget, type LinkPin } from "./pin";
+import { depthBelow, gitTopOf, perimeterKey } from "./git-top";
+import type { DispatchPerimeter, PerimeterEntry } from "./dispatch";
+import { branchSwitched, branchSwitchReason, branchUnconfirmedReason, treeMove, treeMoveReason } from "./branch";
+import { readHead, readHeadState, readReflogWindow, type HeadState, type ReflogEntry } from "./head";
 import { captureReference, DEFAULT_CAPTURE_TIMEOUT_MS, gcStaleReferences, keepReferences, nodeReferenceFs, REF_DIR_PATTERN, serializedReferenceLinks, type DispatchReference } from "./reference";
-import type { PendingRecord } from "./pending";
+import { PERIMETER_LOST_REASON, type PendingRecord } from "./pending";
 import type { PluginLogger } from "../router/logger";
 import { REFERENCE_NONE } from "./baseline";
 import { scrubText } from "../guard/scrub";
+import { displaySafe } from "../routing/roles/read-set";
 import type { DoD } from "./dod";
-import type { ArgvSeam, Deadline, ExecOptions, ExecResult as SeamResult, ExecSeam, ReferenceState, TestsPassHook, Verdict } from "./types";
-import { planScopedRun, planStaticScoping, type ChangedPath, type RunnerFs, type StaticScoping, type TestSearchSeam } from "./runner";
+import type { ArgvSeam, CheckPlacement, Deadline, ExecOptions, ExecResult as SeamResult, ExecSeam, ReferenceState, TestsPassHook, Verdict } from "./types";
+import { planScopedRun, planStaticScoping, type ChangedPath, type RunnerFs, type StaticScoping, type StaticScopingInput, type TestSearchSeam } from "./runner";
 import {
   DEFAULT_GATE_BUDGET_MS,
   graderTimeoutMs,
   RouterTimeoutError,
   withTimeout,
 } from "./timeout";
-import { resolveVerifyBudget, type RouterConfig, type VerifyBudget } from "../router/config";
-import { accept, gateResult, unverifiableGateResult, type GateDeps, type GateResult } from "./gate";
+import { resolveRolesRouting, resolveVerifyBudget, type RouterConfig, type VerifyBudget } from "../router/config";
+import { accept, gateResult, PERIMETER_UNPLANNED, perimeterChangeReasons, unverifiableGateResult, type GateDeps, type GateResult, type PerimeterObservation, type PerimeterRoot } from "./gate";
 // The grader request shape is owned by checker.ts, which builds it. Re-exported
 // here because this module is where it is consumed, and because keeping a
 // second local copy is exactly how `cwd` got dropped: the checker set it, the
@@ -180,6 +198,29 @@ export interface PreparedVerification {
    * gate's lease wait leaves them out. Absent or "": none known.
    */
   producerSessionID?: string;
+  /**
+   * I7 (P0.2, S9/S12): the gate's unverifiable reason when the working tree switched branch (branch.ts); absent: no switch
+   * seen. The artefact builders hand it to the gate (Artefact.branchSwitch), which then refuses on either verifier.
+   */
+  branchSwitch?: string;
+  /** The cheap head state read at the gate (observeChange); absent when it was not read. The deferred finish registers it. */
+  head?: HeadState;
+  /**
+   * I5 (P0.3, S1/S3/S10): tools the producer lineage ran whose writes the router cannot observe (store.delta); the artefact
+   * builders hand them to the gate (Artefact.unattributedWriters). Absent or empty: none.
+   */
+  unattributedWriters?: string[];
+  /**
+   * Cross-repo P1.8 (I4, I8): the perimeter P observed at the gate (observeChange); the artefact builders hand it to the gate
+   * (Artefact.perimeter). Absent: the dispatch has no perimeter.
+   */
+  perimeter?: PerimeterObservation;
+  /**
+   * Cross-repo P3a (D23 as amended 2026-10-12, QA C1): when the dispatch began (DispatchStart.dispatchedAt; for a deferred
+   * verification, the entry's original dispatchedAt, never the router_verify time). buildGateDeps hands it to the gate
+   * (DeterministicDeps.dispatchStartedAt): only W's ignored modules modified since are cross-link inputs. Absent: none are.
+   */
+  dispatchStartedAt?: number;
 }
 
 /**
@@ -402,7 +443,11 @@ export const FALLBACK_CAPTURE_WAIT_MS = Math.min(5_000, DEFAULT_CAPTURE_TIMEOUT_
 /** What the orchestrator asked for at dispatch (directives.ts, parsed from its own prompt only). */
 export interface DispatchStart {
   readonly directives: VerifyDirectives;
-  /** Clock value when the dispatch started (pending.ts R3 dispatchedAt, R11 lineage). */
+  /**
+   * Clock value when the dispatch started (pending.ts R3 dispatchedAt, R11 lineage). Cross-repo P3a (D23 as amended 2026-10-12,
+   * QA C1): also the gate's `DeterministicDeps.dispatchStartedAt`, the `since` of W's ignored-module listing, on the synchronous
+   * and the deferred path alike (the deferred entry keeps this value, never the router_verify time).
+   */
   readonly dispatchedAt: number;
 }
 
@@ -436,6 +481,18 @@ export interface DeferredFinishInput {
    * foreground path, which reads the store at return time as before.
    */
   readonly delta?: import("./dispatch").DispatchDelta;
+  /**
+   * Cross-repo I2 (P2.3): where the change capture observes a role dispatch (its work root W). Absent: `cwd`, as before.
+   * Only the observation uses it; the registration keeps `cwd`, the base the checks run in (F5).
+   */
+  readonly captureRoot?: string;
+  /**
+   * Cross-repo P2e: the DoD's per-check placements (index-aligned with `dod.checks`), as the dispatch resolved them. Only the
+   * static scoping plan and the no-change shortcut read them. Absent: every check runs at `cwd` and in its default scope.
+   */
+  readonly placements?: readonly (CheckPlacement | undefined)[];
+  /** Cross-repo P2e: the dispatch runs the full scope (the whole suite), so an empty change set still spawns the suite. */
+  readonly fullScope?: boolean;
 }
 
 /** Upper bound on the reload wait before the start-time reference GC scans (phase 2.1 section 2.4). */
@@ -474,9 +531,14 @@ export type DeferredFinish =
        * "unregistered": the registry refused the entry (registry-full, handle-collision,
        * invalid-input); "no-change": an attributed empty change set of a testsPass-only DoD, which
        * the required gate passes with no process (section 1.5-6; QA-G-1: any other DoD is deferred
-       * with the empty set instead, noChangeGateSpawnsNothing); "error": the finish itself failed.
+       * with the empty set instead, noChangeGateSpawnsNothing); "error": the finish itself failed;
+       * "branch-switched" (I7, P0.2): the working tree switched branch during the dispatch, so no handle is issued that could
+       * verify the other branch later; the required gate refuses it at once (its observeChange sees the same switch);
+       * "cross-repo" (P1.8, P2e.5 X7): the dispatch's perimeter, observed at return, cannot be frozen for a later handle: a
+       * repository of it changed while an unattributable writer ran (I4), or a linked repository could not be observed within
+       * the deferral bound; the required gate verifies it at once.
        */
-      readonly reason: "unregistered" | "no-change" | "error";
+      readonly reason: "unregistered" | "no-change" | "error" | "branch-switched" | "cross-repo";
       readonly detail: string;
     };
 
@@ -517,8 +579,19 @@ export function hasTestsPass(dod: DoD): boolean {
  * there is no criterion. Only such a delegation takes finishDeferred's "no-change" answer
  * (QA-2.4-10); any other deferred DoD is registered with the empty change set instead, so its
  * build, lint, run, file and criteria checks run on router_verify, never synchronously.
+ *
+ * Cross-repo P2e (F13): a full scope runs the whole suite even with no changed file
+ * (deterministic.ts), so the gate spawns it: false when `fullScope` is set and the DoD has a
+ * testsPass or lintClean check, or when such a check's placement has `scope === "full"`. Without
+ * `opts`: as before.
  */
-export function noChangeGateSpawnsNothing(dod: DoD): boolean {
+export function noChangeGateSpawnsNothing(
+  dod: DoD,
+  opts?: { readonly placements?: readonly (CheckPlacement | undefined)[] | undefined; readonly fullScope?: boolean | undefined },
+): boolean {
+  const scoped = (kind: DoD["checks"][number]["kind"]): boolean => kind === "testsPass" || kind === "lintClean";
+  if (opts?.fullScope === true && dod.checks.some(c => scoped(c.kind))) return false;
+  if (opts?.placements !== undefined && dod.checks.some((c, i) => scoped(c.kind) && opts.placements?.[i]?.scope === "full")) return false;
   return dod.checks.length > 0 && dod.checks.every(c => c.kind === "testsPass") && dod.criteria.length === 0;
 }
 
@@ -593,6 +666,32 @@ export const ROUTER_VERIFY_NO_RETRY_TEXT = "[router] Nothing was retried or esca
 export const DRIFT_NOTICE = "tree drifted since delegation; verdict reflects current state";
 /** No per-file proof either way (no stored or current digests): a pass is never kept then. */
 export const DRIFT_UNCHECKED_NOTICE = "drift since delegation could not be checked; verdict reflects current state";
+/**
+ * Cross-repo P2e.4a (S11, OD-P2e-1 = UNVERIFIED): the caveat of a frozen link target that router_verify found changed, or could
+ * not observe again, since the producer returned. A would-be pass then is unverifiable; a fail stays a fail with the caveat.
+ */
+export const LINK_DRIFT_CAVEAT = {
+  changed: (name: string, root: string): string =>
+    `the linked repository ${linkCaveatText(name)} at ${linkCaveatText(root)} changed since the producer returned; the checks ran against its new state`,
+  unobserved: (name: string, root: string): string =>
+    `the linked repository ${linkCaveatText(name)} at ${linkCaveatText(root)} could not be observed again since the producer returned`,
+} as const;
+/** Cross-repo P3 QA-1 M5: the longest repository text (a link's name or root) a router line quotes; past it, cut with "…". */
+export const LINK_CAVEAT_TEXT_MAX = 256;
+/**
+ * Cross-repo P3 QA-1 M5: repository text (a link's name or root, read from a manifest or the file system) as a router line
+ * quotes it: capped at LINK_CAVEAT_TEXT_MAX characters (never splitting a surrogate pair), then escaped.
+ */
+function linkCaveatText(text: string): string {
+  let shown = text;
+  if (shown.length > LINK_CAVEAT_TEXT_MAX) {
+    let end = LINK_CAVEAT_TEXT_MAX - 1;
+    const last = shown.charCodeAt(end - 1);
+    if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+    shown = `${shown.slice(0, end)}…`;
+  }
+  return displaySafe(shown);
+}
 export const ROUTER_VERIFY_CANCELLED_REASON = "router_verify was cancelled before a verdict";
 export const ROUTER_VERIFY_RELEASED_REASON = "the delegation's verification data was released";
 /** QA-2.1-9: the line of a held background result named to router_verify (refused; its gate posts the verdict). */
@@ -649,6 +748,9 @@ const TRANSIENT_REASON = new RegExp(
       escapeRegExp(ABANDONED_REASON),
       escapeRegExp(DISPOSED_REASON),
       "router_verify was cancelled",
+      // branch.ts branchUnconfirmedReason: the head state could not be read at router_verify; reading it again can settle it.
+      // Not the "when the dispatch started" variant, nor a "switched"/"checked out or reset" reason: those are terminal.
+      "cannot confirm the branch of [^\\r\\n]*?: the working tree could not be read at router_verify",
     ].join("|") +
     ")",
   "i",
@@ -993,13 +1095,18 @@ export interface VerificationWiring {
    * clears a pending timer and aborts the git calls of a GC in flight. Never throws.
    */
   startReferenceGc(delayMs?: number): () => void;
-  /** P0: the snapshot, the changed files and the settled reference, each bounded by `deadline` when given. */
+  /**
+   * P0: the snapshot, the changed files and the settled reference, each bounded by `deadline` when given.
+   * Cross-repo P3a (D23 as amended 2026-10-12, QA C1): `dispatchStartedAt` is the dispatch's start (DispatchStart.dispatchedAt),
+   * carried as PreparedVerification.dispatchStartedAt; absent: W's ignored modules are never cross-link inputs.
+   */
   prepareVerification(
     store: ReturnType<typeof createChangedFileStore>,
     id: string,
     childID: string,
     cwd?: string,
     deadline?: Deadline,
+    dispatchStartedAt?: number,
   ): Promise<PreparedVerification>;
   /** Session ids currently running a grader prompt, so hooks can skip them. */
   graderSessions: Set<string>;
@@ -1466,6 +1573,10 @@ export function createVerificationWiring(deps: {
       // QA-3.1-8: the snapshot's git processes run at the configured priority, as the capture's do.
       snapshot: (at: string, signal: AbortSignal) =>
         sharedSnapshots(flightKey(at), shared => snapshotTree(at, shared, { lowPriority: budget.lowPriority }), signal),
+      // The branch-switch baseline: independent of the snapshot, so it survives a discarded or failed one.
+      // QA2 F3b: each git process gets the whole baseline budget (a loaded runner outlasts readHead's 5 s default).
+      headState: (at: string, signal: AbortSignal) =>
+        readHead(at, { signal, timeoutMs: budget.baselineTimeoutMs, lowPriority: budget.lowPriority }),
       timeoutMs: budget.baselineTimeoutMs,
     };
     if (!judgedByTests) return { ...base, uncaptured: { kind: "none", reason: REFERENCE_NONE.notRequested } };
@@ -1495,9 +1606,12 @@ export function createVerificationWiring(deps: {
     // QA-2.1-5: the recheck's git processes (GC, materialize, dispose) run at the configured
     // priority too, like the capture and the start-up GC (QA-1.2-13).
     const referenceArgv: ArgvSeam = (file, args, opts) => argvSeam(file, args, { ...opts, lowPriority: budget.lowPriority });
+    // QA-2 nit: materialize pins a link target as this gate's dispatch admitted it (its pins' admission); without pins, none.
+    const gatePins = prepared?.reference?.kind === "captured" ? prepared.reference.reference.pins : undefined;
+    const pinNow = pinNowFor(gatePins !== undefined ? pinAdmissions.get(gatePins) : undefined);
     const openScope = createScopeOpener({
       argv: argvSeam, exec: execSeam, fs: fsSeam, budget, checkTimeoutMs: CHECK_TIMEOUT_MS,
-      reference: { argv: referenceArgv },
+      reference: { argv: referenceArgv, pinNow },
     });
     const currentTree = prepared?.snapshot !== undefined ? { currentTree: prepared.snapshot } : {};
     const direct = createDirectTestsPassHook({
@@ -1506,6 +1620,11 @@ export function createVerificationWiring(deps: {
       search: testSearch(budget, deadline),
       budget,
       ...currentTree,
+      // Cross-repo P3a (D23): the linked repository's ignored modules, hardened and bounded; called only with crossLinkRoot and
+      // the dispatch start (D23 as amended 2026-10-12: only the modules modified since, never a stale build output).
+      listIgnored: (root, signal, since) => listIgnoredModules(root, { signal, since, lowPriority: budget.lowPriority }),
+      // QA round 2 M-A: a changed source of W newer than the newest listed build output makes the request S6 build-stale.
+      mtimeOf: (path) => fileMtimeMs(path),
     });
     // 2.2.3 (S5): with a batch window, concurrent testsPass checks of this plugin instance meet in
     // the coordinator; the direct hook stays behind it for "full" scope and single requests (B2).
@@ -1582,6 +1701,8 @@ export function createVerificationWiring(deps: {
         changedFiles: prepared?.changeBaseline === "available" ? prepared.changedFiles : "unavailable",
         ...(prepared !== undefined ? { reference: prepared.reference } : {}),
         ...(deadline !== undefined ? { deadline } : {}),
+        // Cross-repo P3a (D23 as amended, QA C1): the dispatch start, the `since` of W's ignored-module listing; absent: none listed.
+        ...(prepared?.dispatchStartedAt !== undefined ? { dispatchStartedAt: prepared.dispatchStartedAt } : {}),
       },
       checker: {
         dispatchGrader: (req: GraderRequest) =>
@@ -1595,6 +1716,84 @@ export function createVerificationWiring(deps: {
     };
   };
 
+  /**
+   * Cross-repo P2d.3 (P2.6): the dispatch-time pins of a dispatch's admitted link targets, by dispatch id then by the seed's
+   * root (`PerimeterSeed.at`). Each `pin` settles once and never rejects. QA-2 #9c: an unattributable writer that runs while a
+   * pin (its root or a nested target) is still computed marks it `contaminatedBy`, and linkPinsAtGate drops it. QA-2 nit:
+   * freed once the dispatch's gate took them, or with a reference that was not captured (freeLinkPins); bounded otherwise.
+   */
+  interface DispatchLinkPin {
+    readonly pin: Promise<LinkPin>;
+    pending: boolean;
+    contaminatedBy?: string;
+  }
+  const linkPins = new Map<string, Map<string, DispatchLinkPin>>();
+  const LINK_PINS_MAX = 256;
+  /** QA-2 nit: per dispatch, the link roots (perimeterKey) its admission accepted; bounded, oldest out. */
+  const admittedLinks = new Map<string, Set<string>>();
+  /** The admitted link roots behind the pins a gate took (keyed by that pins array): pinNow admits as the dispatch did. */
+  const pinAdmissions = new WeakMap<readonly LinkPin[], ReadonlySet<string>>();
+  const rememberAdmittedLink = (id: string, dir: string): void => {
+    let admitted = admittedLinks.get(id);
+    if (admitted === undefined) {
+      admitted = new Set();
+      admittedLinks.set(id, admitted);
+    }
+    admitted.add(perimeterKey(dir));
+    while (admitted.size > 1024) {
+      const oldest = admitted.values().next();
+      if (oldest.done === true) break;
+      admitted.delete(oldest.value);
+    }
+  };
+  /** QA-2 nit: forgets a dispatch's pins and admitted roots; the pins its gate took keep that admission for pinNow. */
+  const freeLinkPins = (id: string, taken: readonly LinkPin[]): void => {
+    const admitted = admittedLinks.get(id);
+    if (admitted !== undefined && taken.length > 0) pinAdmissions.set(taken, admitted);
+    linkPins.delete(id);
+    admittedLinks.delete(id);
+  };
+  /**
+   * QA-2 #9c: an unattributable writer (any session: its directory says nothing about where it writes) discards every pin still
+   * being computed, as it discards an in-flight perimeter snapshot (dispatch.ts contaminateCaptures). M3: the store only signals
+   * the writers that contaminate captures by the same predicate, so a delegating tool (task, delegate, subagent), which keeps
+   * the perimeter snapshot, keeps the pins too; parallel role dispatches no longer drop each other's pins.
+   */
+  const contaminateLinkPins = (tool: string): void => {
+    if (!isUnattributedWriter(tool)) return;
+    for (const forDispatch of linkPins.values()) {
+      for (const pin of forDispatch.values()) if (pin.pending) pin.contaminatedBy ??= tool;
+    }
+  };
+  /**
+   * QA-2 #9c: the store's own writer signal (store.onUnattributedWriter: observeEdit before a call, record after it, the calls
+   * that contaminate an in-flight perimeter snapshot) also reaches the pins. Subscribed once per store, by the first dispatch
+   * that pins a link target; the subscription is bounded by the store's own lifetime (it holds the pins map only).
+   */
+  const watchedStores = new WeakSet<object>();
+  const watchWritersFor = (store: ReturnType<typeof createChangedFileStore>): void => {
+    if (watchedStores.has(store)) return;
+    watchedStores.add(store);
+    store.onUnattributedWriter(tool => contaminateLinkPins(tool));
+  };
+  /**
+   * Cross-repo P2d.3 (P2.6): the current pin of a link target at materialize time (hardened, ignored files digested), admitted
+   * as the dispatch admitted it (QA-2 nit: the gate's own pins' admission, never another dispatch's). Never throws (pinTarget).
+   */
+  const pinNowFor = (admitted: ReadonlySet<string> | undefined) => (root: string): Promise<LinkPin> =>
+    pinTarget(root, {
+      snapshot: dir => {
+        const controller = new AbortController();
+        return withTimeout(
+          snapshotTree(dir, controller.signal, { lowPriority: configuredLowPriority(), hardened: true, ignoredDigest: true }),
+          GRADE_SNAPSHOT_TIMEOUT_MS,
+          "link pin fingerprint",
+        ).catch(() => undefined).finally(() => controller.abort());
+      },
+      admitted: dir => admitted?.has(perimeterKey(dir)) === true,
+      externalLinks: defaultExternalLinks,
+    });
+
   const beginVerification: VerificationWiring["beginVerification"] = async (store, id, cwd, dod) => {
     let deps: DispatchCaptureDeps;
     try {
@@ -1604,15 +1803,504 @@ export function createVerificationWiring(deps: {
       // QA-3.1-8), and no reference.
       deps = {
         snapshot: (at, signal) => snapshotTree(at, signal, { lowPriority: true }),
+        headState: (at, signal) => readHead(at, { signal, lowPriority: true }),
         timeoutMs: DEFAULT_CAPTURE_TIMEOUT_MS,
         uncaptured: { kind: "none", reason: `${REFERENCE_NONE.failed} (${errorText(err)})` },
       };
     }
-    const begun = store.beginDispatch(id, resolve(directory, cwd || "."), deps);
+    const at = resolve(directory, cwd || ".");
+    // Cross-repo P1.8 (I13): a role dispatch's perimeter is fixed now; every other dispatch plans none (I9). QA-1 F9: a ladder
+    // retry keeps the dispatch's perimeter (beginDispatch keeps the original), so it is not planned again.
+    let perimeter: DispatchPerimeter | undefined;
+    if (store.perimeterOf(id) === undefined) {
+      try {
+        const plannedPerimeter = planPerimeter(id, at, () => {
+          const routing = resolveRolesRouting(getConfig(), "v2");
+          return { parents: routing.repoParents, depth: routing.repoDepth, exclude: routing.repoExclude };
+        });
+        perimeter = plannedPerimeter;
+        // P3 QA-1 m4 (SD-P3c-4): a forward bound cut W's declared edges; logged, the cut targets are not in P.
+        if (plannedPerimeter?.edgesIncomplete === true || (plannedPerimeter?.unadmittedMore ?? 0) > 0) {
+          logger.warn("[verify] dispatch perimeter: declared dependency edges were cut by a bound", {
+            id,
+            incomplete: plannedPerimeter?.edgesIncomplete === true,
+            unadmittedMore: plannedPerimeter?.unadmittedMore ?? 0,
+          });
+        }
+      } catch (err) {
+        logger.warn("[verify] dispatch perimeter could not be planned", { id, error: errorText(err) });
+        // QA-1 F10: fail closed. A placeholder root that is never observed: a dispatch whose producer ran an unattributable
+        // writer is unverifiable (I4), since a write in another repository cannot be ruled out.
+        perimeter = { roots: [{ at, name: PERIMETER_UNPLANNED, fixed: "unobserved" }] };
+      }
+    }
+    const lowPriority = configuredLowPriority();
+    // Cross-repo P2d.3 (P2.6): an admitted link target is pinned at dispatch (bounded by the capture timeout; the nested targets
+    // are snapshotted hardened, one level deep, by pinTarget). QA-2 #4: the perimeter snapshot stays the plain hardened one; the
+    // pin takes its own snapshots (ignored files digested), started once that snapshot settled, and neither dispatch start nor
+    // the perimeter entry waits for it.
+    const perimeterRootSnapshot = (root: string, signal: AbortSignal): Promise<TreeSnapshot | undefined> => {
+      const plain = snapshotTree(root, signal, { lowPriority, hardened: true });
+      const seed = perimeter?.roots.find(candidate => candidate.at === root);
+      // QA-1 #9a: a working-set root that is also a link target of W (`linked`) is pinned too. Cross-repo P3c.3 (F3): a declared
+      // dependency edge's root (origin "edge", or a working-set root marked `edged`) is observed but never pinned.
+      if (seed === undefined || (seed.origin !== "link" && seed.linked !== true) || seed.fixed !== undefined) return plain;
+      watchWritersFor(store);
+      const seedAdmit = seed.admit ?? ((): boolean => false);
+      // The roots the dispatch's admission accepted: the materialize-time pin (pinNow) is admitted by the same set.
+      const admit = (dir: string): boolean => {
+        const admitted = seedAdmit(dir);
+        if (admitted) rememberAdmittedLink(id, dir);
+        return admitted;
+      };
+      const pinSnapshot = async (dir: string): Promise<TreeSnapshot | undefined> => {
+        const controller = new AbortController();
+        try {
+          return await withTimeout(
+            snapshotTree(dir, controller.signal, { lowPriority, hardened: true, ignoredDigest: true }),
+            deps.timeoutMs,
+            "link pin fingerprint",
+          );
+        } catch {
+          return undefined;
+        } finally {
+          controller.abort();
+        }
+      };
+      const entry: DispatchLinkPin = {
+        pending: true,
+        pin: plain.then(() => undefined, () => undefined)
+          .then(() => withTimeout(
+            pinTarget(root, { snapshot: pinSnapshot, admitted: admit, externalLinks: defaultExternalLinks }),
+            deps.timeoutMs,
+            "link pin",
+          ))
+          .catch((): LinkPin => ({ kind: "unpinnable", root, why: "not-observed" }))
+          .finally(() => {
+            entry.pending = false;
+          }),
+      };
+      let forDispatch = linkPins.get(id);
+      if (forDispatch === undefined) {
+        forDispatch = new Map();
+        linkPins.set(id, forDispatch);
+        // Bounded: a dispatch whose gate never ran is evicted by newer ones (oldest first), with its admitted roots.
+        while (linkPins.size > LINK_PINS_MAX) {
+          const oldest = linkPins.keys().next();
+          if (oldest.done === true) break;
+          linkPins.delete(oldest.value);
+          admittedLinks.delete(oldest.value);
+        }
+      }
+      forDispatch.set(root, entry);
+      return plain;
+    };
+    const begun = store.beginDispatch(id, at, perimeter === undefined ? deps : {
+      ...deps,
+      perimeter,
+      // QA-1 F4 (I11): git runs hardened in a repository other than W.
+      perimeterSnapshot: perimeterRootSnapshot,
+    });
     // pending.ts R10: remember the reference's settled value (the store hands out one promise).
     const reference = store.reference(id);
     if (!settledReferences.has(reference)) void reference.then(state => settledReferences.set(reference, state));
     await begun;
+  };
+
+  /**
+   * Cross-repo P2d.3 (P2.6): the dispatch's link pins that are ready within the gate deadline. A pin whose root's dispatch
+   * snapshot was discarded (contaminated), a fixed root and a pin not ready in time are omitted. Never throws.
+   */
+  const linkPinsAtGate = async (
+    store: ReturnType<typeof createChangedFileStore>,
+    id: string,
+    deadline: Deadline | undefined,
+  ): Promise<LinkPin[]> => {
+    const forDispatch = linkPins.get(id);
+    const planned = store.perimeterOf(id);
+    if (forDispatch === undefined || planned === undefined) return [];
+    const ready = await Promise.all([...forDispatch].map(async ([root, pinned]): Promise<LinkPin | undefined> => {
+      const entry = planned.entries.get(root);
+      if (entry === undefined || entry.seed.fixed !== undefined || entry.contaminatedBy !== undefined) return undefined;
+      const ms = deadline ? deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS) : GRADE_SNAPSHOT_TIMEOUT_MS;
+      if (ms <= 0 || deadline?.signal.aborted === true) return undefined;
+      try {
+        const pin = await withTimeout(pinned.pin, ms, "link pin");
+        // QA-2 #9c: an unattributable writer ran while it (or a nested target's snapshot) was computed: dropped.
+        return pinned.contaminatedBy === undefined ? pin : undefined;
+      } catch {
+        return undefined;
+      }
+    }));
+    return ready.filter((pin): pin is LinkPin => pin !== undefined);
+  };
+
+  /** The two snapshots of each extra root of a perimeter (perimeterSnapshotsAtGate); `fixed` roots have neither. */
+  type PerimeterSnapshots = readonly { entry: PerimeterEntry; before: TreeSnapshot | undefined; now: TreeSnapshot | undefined }[];
+
+  /**
+   * Cross-repo P1.8 (I4, I13): each extra root of the dispatch's perimeter snapshotted again, hardened (QA-1 F4) and bounded by
+   * `deadline`, next to its dispatch snapshot. QA-1 F9: the roots are snapshotted concurrently with each other, and the caller
+   * starts this before W's own gate snapshot so both run at once. A fixed root (never observed) is not snapshotted. Undefined
+   * when the dispatch has no perimeter.
+   */
+  const perimeterSnapshotsAtGate = async (
+    store: ReturnType<typeof createChangedFileStore>,
+    id: string,
+    deadline: Deadline | undefined,
+  ): Promise<{ name?: string; snapshots: PerimeterSnapshots; admission?: DispatchPerimeter["admission"] } | undefined> => {
+    const planned = store.perimeterOf(id);
+    if (planned === undefined || planned.entries.size === 0) return undefined;
+    const bound = (): number => (deadline ? deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS) : GRADE_SNAPSHOT_TIMEOUT_MS);
+    const lowPriority = configuredLowPriority();
+    const snapshots = await Promise.all([...planned.entries.values()].map(async entry => {
+      if (entry.seed.fixed !== undefined) return { entry, before: undefined, now: undefined };
+      const before = withTimeout(entry.snapshot, Math.max(1, bound()), "perimeter fingerprint").catch(() => undefined);
+      const now = (async (): Promise<TreeSnapshot | undefined> => {
+        const ms = bound();
+        if (ms <= 0 || deadline?.signal.aborted === true) return undefined;
+        const controller = new AbortController();
+        const onAbort = (): void => controller.abort();
+        deadline?.signal.addEventListener("abort", onAbort, { once: true });
+        try {
+          return await withTimeout(snapshotTree(entry.seed.at, controller.signal, { lowPriority, hardened: true }), ms, "perimeter fingerprint");
+        } catch {
+          return undefined;
+        } finally {
+          deadline?.signal.removeEventListener("abort", onAbort);
+          controller.abort();
+        }
+      })();
+      return { entry, before: await before, now: await now };
+    }));
+    return {
+      ...(planned.name !== undefined ? { name: planned.name } : {}),
+      snapshots,
+      // P3c.4 (SD-P3c-9): the dispatch's admission, for the perimeter frozen at return (perimeterAtReturn).
+      ...(planned.admission !== undefined ? { admission: planned.admission } : {}),
+    };
+  };
+
+  /**
+   * Cross-repo P1.8 (I4, I8): each extra root of the dispatch's perimeter compared with its dispatch snapshot: "changed" when
+   * the fingerprint, HEAD or top level differs, "unobserved" when either snapshot is unavailable (fail closed), a fixed root with
+   * its own status. QA-1 F4: a root whose git top level is not admitted at the gate is reported unobserved, never dropped (I12).
+   * Roots are de-duplicated by top level, W's own excluded. Undefined when the dispatch has no perimeter or none remains.
+   * Cross-repo P2b.3 (D6): the working-set roots (never W, never a link target) whose `node_modules` link into W are its
+   * consumers (perimeter.ts discoverConsumers: fs only, bounded, never throws).
+   */
+  const perimeterAtGate = async (
+    planned: { name?: string; snapshots: PerimeterSnapshots; admission?: { readonly parents: readonly string[] } } | undefined,
+    snapshot: TreeSnapshot | undefined,
+    base: string,
+    deadline?: Deadline,
+    // Cross-repo P2e.5 (return mode): `discover: false` skips consumer discovery (router_verify discovers over the frozen
+    // working set instead); nothing else differs.
+    options: { readonly discover?: boolean } = {},
+  ): Promise<PerimeterObservation | undefined> => {
+    if (planned === undefined) return undefined;
+    const key = (at: string): string => {
+      const normalized = resolve(at).replace(/\\/g, "/");
+      return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+    };
+    const wRoot = snapshot?.root ?? base;
+    const rank = { unchanged: 0, unadmitted: 1, unobserved: 2, changed: 3 } as const;
+    const roots = new Map<string, PerimeterRoot>();
+    const workingSet = new Map<string, { root: string; name?: string }>();
+    for (const { entry, before, now } of planned.snapshots) {
+      const fixed = entry.seed.fixed;
+      const known = fixed === undefined ? now?.root ?? before?.root : undefined;
+      const refused = known !== undefined && entry.seed.admit !== undefined && !entry.seed.admit(known);
+      const root = known !== undefined && !refused ? known : entry.seed.at;
+      // W's own repository is W's snapshot (a fixed placeholder may stand at W's path: it is kept).
+      if (fixed === undefined && key(root) === key(wRoot)) continue;
+      if (entry.seed.origin === "working-set" && !workingSet.has(key(root))) {
+        workingSet.set(key(root), { root, ...(entry.seed.name !== undefined ? { name: entry.seed.name } : {}) });
+      }
+      const status: PerimeterRoot["status"] = fixed ?? (refused || before === undefined || now === undefined
+        ? "unobserved"
+        : before.fingerprint !== now.fingerprint || before.head !== now.head || before.root !== now.root ? "changed" : "unchanged");
+      // Only an admitted, observed root is described by its git state.
+      const shown = fixed !== undefined || refused ? undefined : now ?? before;
+      const next: PerimeterRoot = {
+        root,
+        name: entry.seed.name ?? basename(root),
+        status,
+        ...(typeof shown?.branch === "string" ? { branch: shown.branch } : {}),
+        ...(shown?.head ? { head: shown.head } : {}),
+        ...(entry.seed.sameRepository === true ? { sameRepository: true } : {}),
+      };
+      const previous = roots.get(key(root));
+      if (previous === undefined || rank[next.status] > rank[previous.status]) roots.set(key(root), next);
+    }
+    if (roots.size === 0) return undefined;
+    // QA-1 #13: the discovery is bounded by the gate deadline (and the grade snapshot bound); the roots it has not finished
+    // then are incomplete. QA-1 #2: so is a root whose scan stopped on its entry bound without finding a consumer.
+    const discover = async (): Promise<ConsumerDiscovery> => {
+      const candidates = [...workingSet.values()];
+      const controller = new AbortController();
+      const ms = deadline ? deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS) : GRADE_SNAPSHOT_TIMEOUT_MS;
+      const onAbort = (): void => controller.abort();
+      if (ms <= 0 || deadline?.signal.aborted === true) controller.abort();
+      deadline?.signal.addEventListener("abort", onAbort, { once: true });
+      const timer = setTimeout(onAbort, Math.max(0, ms));
+      try {
+        // P3 QA-1 m5: both spellings of each parent, so an edge spelled through a junction-spelled parent is matched.
+        const parents = planned.admission?.parents;
+        return await discoverConsumers(wRoot, candidates, { signal: controller.signal, ...(parents !== undefined ? { parents } : {}) });
+      } catch {
+        return { consumers: [], incomplete: candidates }; // Never expected (it never throws): fail closed.
+      } finally {
+        clearTimeout(timer);
+        deadline?.signal.removeEventListener("abort", onAbort);
+      }
+    };
+    const { consumers, incomplete } = workingSet.size === 0 || options.discover === false
+      ? { consumers: [], incomplete: [] }
+      : await discover();
+    return {
+      w: {
+        root: wRoot,
+        name: planned.name ?? basename(wRoot),
+        ...(typeof snapshot?.branch === "string" ? { branch: snapshot.branch } : {}),
+        ...(snapshot?.head ? { head: snapshot.head } : {}),
+      },
+      roots: [...roots.values()],
+      ...(consumers.length > 0 ? { consumers } : {}),
+      ...(incomplete.length > 0 ? { consumersIncomplete: incomplete } : {}),
+    };
+  };
+
+  /** Cross-repo P2e.5: what a deferred entry freezes of its dispatch's perimeter (pending.ts DeferredPerimeter, without the pins). */
+  type FrozenPerimeter = NonNullable<PendingEntry["perimeter"]>;
+
+  /**
+   * Cross-repo P3c.6 (D26): the dependency targets the producer added to W during the dispatch, frozen at return. W's targets
+   * are read again from `linkBase` through the union (`dependencyTargets`, fs only) with the dispatch's frozen admission; each
+   * admitted one that no root in `covering` holds (the perimeter's roots), and that is not W's own repository (`own`: W's
+   * directory and top level, as planPerimeter skips them), is snapshotted, hardened, within what remains of `deadline` (the
+   * deferral bound), and frozen as a link. `unobserved`: one could not be observed in time, or its top level is no longer
+   * admitted (X7: not deferred). An unadmitted target (no parent or worktree holds it, no git top level, a top the admission
+   * refuses, or an unadmitted edge) is not snapshotted: it is returned in `unadmitted` (P3 QA-1 M4), frozen as covering only so
+   * that router_verify does not name it new. Never a perimeter seed: P stays fixed at dispatch for writer attribution (I4, I13).
+   * `targets`: what W depends on at return, so that a dispatch-time dependency the producer removed is frozen as such (P3 QA-1
+   * M3); every target's path, an unadmitted one's included (P3 QA-2 F-2: a spelling the admission refuses still declares the
+   * dependency), and absent when the read was cut (`incomplete`, or unadmitted targets past the names bound). More new targets than `room` (P3 QA-1 m2: PERIMETER_MAX) are not snapshotted: `unobserved`. Never throws.
+   */
+  const dependenciesAddedAtReturn = async (
+    linkBase: string,
+    admission: NonNullable<DispatchPerimeter["admission"]>,
+    covering: readonly string[],
+    own: readonly string[],
+    deadline: Deadline,
+    // P3 QA-1 m2: how many new targets P may still take (PERIMETER_MAX, W and the dispatch's observed roots counted); past it
+    // none is snapshotted and `unobserved` is set (fail closed: verified at once).
+    room = Number.POSITIVE_INFINITY,
+  ): Promise<{
+    links: FrozenPerimeter["links"];
+    unobserved: boolean;
+    /**
+     * P3 QA-1 M3: what W depends on at return (every target's path, an unadmitted one's included: P3 QA-2 F-2). Absent: not
+     * read, cut by a bound, or unadmitted targets past the names bound.
+     */
+    targets?: readonly string[];
+    /** P3 QA-1 M4: the new targets not admitted, as router_verify names them (covering only, never seeds: I13). */
+    unadmitted?: readonly string[];
+  }> => {
+    const read = ((): { context: ReturnType<typeof admissionFromData>; dependencies: DependencyTargets } | undefined => {
+      try {
+        const context = admissionFromData(admission);
+        return { context, dependencies: dependencyTargets(linkBase, context) };
+      } catch {
+        return undefined; // Never expected (it skips what it cannot read).
+      }
+    })();
+    // Fail closed: W's dependencies at return are unknown, so a new one cannot be ruled out (not deferred).
+    if (read === undefined) return { links: [], unobserved: true };
+    const { context, dependencies } = read;
+    // P3 QA-2 F-2: every target, an unadmitted one included (its path: a spelling into a dispatch-time dependency still declares it).
+    const targets = dependencies.targets.map(target => target.at);
+    // Held by a perimeter root, or W's own repository (inside W, or W inside it): W's snapshot covers it.
+    const covered = (at: string): boolean =>
+      covering.some(root => depthBelow(at, root) >= 0) || own.some(dir => depthBelow(at, dir) >= 0 || depthBelow(dir, at) >= 0);
+    // The admitted top level of each new target, once per repository.
+    const added = new Map<string, string>();
+    // P3 QA-1 M4: a new target not admitted, by the path router_verify reads it at (its text for an unadmitted edge).
+    const unadmitted = new Map<string, string>();
+    for (const target of dependencies.targets) {
+      if (covered(target.at)) continue;
+      // An unadmitted edge target is text only: never observed (I11).
+      if ("fixed" in target) {
+        unadmitted.set(perimeterKey(target.at), target.at);
+        continue;
+      }
+      let top: string | undefined;
+      if (target.origin === "edge") {
+        top = target.at; // Already its admitted top level (resolveEdgeTarget).
+      } else {
+        // A package link target, admitted as at dispatch (SD-P3c-9, F8): its top level found without git below its parent (or
+        // above its working-set worktree), then admitted by the frozen admission.
+        const parent = context.parentOf(target.at);
+        const worktree = context.worktreeOf(target.at);
+        if (parent === undefined && worktree === undefined) {
+          unadmitted.set(perimeterKey(target.at), target.at);
+          continue;
+        }
+        top = gitTopOf(target.at, worktree !== undefined ? dirname(worktree.worktree) : parent);
+        if (top === undefined || !context.admitTop(top)) {
+          unadmitted.set(perimeterKey(target.at), target.at);
+          continue;
+        }
+      }
+      if (covered(top) || added.has(perimeterKey(top))) continue;
+      added.set(perimeterKey(top), top);
+    }
+    // M3: only a complete read rules a dependency out (an unread manifest could still declare it: none is frozen as removed). P3
+    // QA-2 F-2: nor one whose unadmitted targets the bound cut (one of them could lie in a dispatch-time dependency).
+    const atReturn = {
+      ...(dependencies.incomplete || dependencies.unadmittedMore > 0 ? {} : { targets }),
+      ...(unadmitted.size > 0 ? { unadmitted: [...unadmitted.values()] } : {}),
+    };
+    if (added.size === 0) return { links: [], unobserved: false, ...atReturn };
+    // P3 QA-1 m2: more new targets than P may take: none is snapshotted (not deferred, X7).
+    if (added.size > room) return { links: [], unobserved: true, ...atReturn };
+    const lowPriority = configuredLowPriority();
+    const observed = await Promise.all([...added.values()].map(async top => ({ top, now: await hardenedSnapshotFor(top, deadline, lowPriority) })));
+    const links: FrozenPerimeter["links"][number][] = [];
+    let unobserved = false;
+    for (const { top, now } of observed) {
+      // As a seed at return: no snapshot in time, or a top level the admission refuses, is not observed (X7).
+      if (now === undefined || now.root === undefined || !context.admitTop(now.root)) {
+        unobserved = true;
+        continue;
+      }
+      links.push({
+        at: top,
+        root: now.root,
+        name: basename(now.root),
+        head: now.head,
+        fingerprint: now.fingerprint,
+        admit: context.admitTop,
+      });
+    }
+    return { links, unobserved, ...atReturn };
+  };
+
+  /**
+   * Cross-repo P2e.5 (X4, X5): the perimeter frozen when a deferred producer returns. The observation is perimeterAtGate's in
+   * return mode (no consumer discovery inside the deferral bound: router_verify discovers over the frozen working set). Next to
+   * it: the working-set roots (origin "working-set", never W), and the link targets (origin "link" or `linked`, never fixed)
+   * with the top level, head and fingerprint of their return-time snapshot and their admission. `linkUnobserved`: a link root
+   * whose status is "unobserved" (no snapshot at either end, or a top it does not admit): X7, not deferred. Undefined when the
+   * dispatch has no perimeter or none of it remains beyond W.
+   * Cross-repo P3c.6 (D26): W's dependency targets are read again at return through the union (`dependencyTargets`) with the
+   * frozen admission; an admitted target the producer added during the dispatch (a `node_modules` link, a declared edge) and
+   * no seed covers is snapshotted (hardened) within the remaining deferral bound and frozen with the links, so router_verify
+   * (S11) compares it with its return-time state; one not observed in time sets `linkUnobserved` (verified at once, X7). It is
+   * never a perimeter seed: P stays fixed at dispatch for writer attribution (I4, I13). An unadmitted new target is not
+   * snapshotted.
+   */
+  const perimeterAtReturn = async (
+    planned: { name?: string; snapshots: PerimeterSnapshots; admission?: DispatchPerimeter["admission"] } | undefined,
+    snapshot: TreeSnapshot | undefined,
+    base: string,
+    // P3c.6 (D26): the deferral bound, what remains of it bounds the snapshots of the dependencies added during the dispatch.
+    // Absent: none is read (as before P3c.6).
+    deadline?: Deadline,
+  ): Promise<{
+    observation: PerimeterObservation;
+    workingSet: FrozenPerimeter["workingSet"];
+    links: FrozenPerimeter["links"];
+    linkUnobserved: boolean;
+    /** P3c.4 (SD-P3c-9): the dispatch's admission (planPerimeter), frozen with the perimeter. Absent: none recorded. */
+    admission?: DispatchPerimeter["admission"];
+    /** P3 QA-1 M4: the unadmitted dependency targets the producer added during the dispatch (covering only). Absent: none. */
+    unadmitted?: readonly string[];
+  } | undefined> => {
+    const observation = await perimeterAtGate(planned, snapshot, base, undefined, { discover: false });
+    if (planned === undefined || observation === undefined) return undefined;
+    const wKey = perimeterKey(observation.w.root);
+    const workingSet = new Map<string, FrozenPerimeter["workingSet"][number]>();
+    const links = new Map<string, FrozenPerimeter["links"][number]>();
+    let linkUnobserved = false;
+    let unadmitted: readonly string[] = [];
+    for (const { entry, before, now } of planned.snapshots) {
+      const seed = entry.seed;
+      const fixed = seed.fixed;
+      // As perimeterAtGate names the root: its known top level when admitted, else where it was planned (a fixed root: there).
+      const known = fixed === undefined ? now?.root ?? before?.root : undefined;
+      const refused = known !== undefined && seed.admit !== undefined && !seed.admit(known);
+      const root = known !== undefined && !refused ? known : seed.at;
+      const key = perimeterKey(root);
+      // W's own repository is W's snapshot (a fixed placeholder at W's path is kept, as perimeterAtGate keeps it).
+      if (fixed === undefined && key === wKey) continue;
+      // P2e QA-1 #1: a working-set root past the cap (fixed) is still a consumer candidate, as perimeterAtGate scans it.
+      if (seed.origin === "working-set" && !workingSet.has(key)) {
+        workingSet.set(key, { root, ...(seed.name !== undefined ? { name: seed.name } : {}) });
+      }
+      // P3c.4 (SD-P3c-2, S11): a dependency of W, a package link target or a declared edge's repository (origin "link" or
+      // "edge", or a working-set root `linked` or `edged`), is frozen and observed again at router_verify, where W's
+      // dependency targets are read through the same union (`dependencyTargets`, F1).
+      const isDependency = seed.origin === "link" || seed.linked === true || seed.origin === "edge" || seed.edged === true;
+      if (fixed !== undefined) {
+        // P2e QA-1 #1: a dependency past the cap was never observed: not deferred (X7). An unadmitted one is never observed.
+        if (fixed === "unobserved" && isDependency) linkUnobserved = true;
+        continue;
+      }
+      if (!isDependency) continue;
+      if (refused || before === undefined || now === undefined || now.root === undefined) {
+        linkUnobserved = true;
+        continue;
+      }
+      if (!links.has(key)) {
+        links.set(key, {
+          at: seed.at,
+          root,
+          name: seed.name ?? basename(root),
+          head: now.head,
+          fingerprint: now.fingerprint,
+          ...(seed.admit !== undefined ? { admit: seed.admit } : {}),
+        });
+      }
+    }
+    // P3c.6 (D26): a dependency target the producer added during the dispatch, frozen with the links so that router_verify (S11)
+    // compares it with its state at return; never a seed (I13: P stays the dispatch's for writer attribution, I4). Not read when
+    // the dispatch is verified at once anyway, without a frozen admission (an entry planned before P3c.4), or without a bound.
+    // The same read freezes which dispatch-time dependencies W no longer declares (M3) and the unadmitted new targets (M4).
+    if (!linkUnobserved && planned.admission !== undefined && deadline !== undefined) {
+      // What covers a target at router_verify: the roots frozen here (the perimeter's, fixed ones where they were planned).
+      const covering = [
+        ...observation.roots.map(root => root.root),
+        ...planned.snapshots.map(({ entry }) => entry.seed.at),
+        ...[...links.values()].map(link => link.root),
+      ];
+      // P3 QA-1 m2: P holds at most PERIMETER_MAX snapshotted roots, W and the dispatch's observed roots included.
+      const observedSeeds = planned.snapshots.filter(({ entry }) => entry.seed.fixed === undefined).length;
+      const room = Math.max(0, PERIMETER_MAX - 1 - observedSeeds);
+      const added = await dependenciesAddedAtReturn(base, planned.admission, covering, [base, observation.w.root], deadline, room);
+      if (added.unobserved) linkUnobserved = true;
+      // P3 QA-1 M3: a dispatch-time dependency W no longer declares at return (the producer removed or retargeted it) is not an
+      // input of the change: frozen as removed, router_verify skips it (no "no longer links", no re-observation).
+      const atReturn = added.targets;
+      if (atReturn !== undefined) {
+        for (const [key, link] of links) {
+          if (!atReturn.some(target => depthBelow(target, link.root) >= 0)) links.set(key, { ...link, removedAtReturn: true });
+        }
+      }
+      for (const link of added.links) {
+        const key = perimeterKey(link.root);
+        if (key !== wKey && !links.has(key)) links.set(key, link);
+      }
+      if (added.unadmitted !== undefined) unadmitted = added.unadmitted;
+    }
+    return {
+      observation,
+      workingSet: [...workingSet.values()],
+      links: [...links.values()],
+      linkUnobserved,
+      ...(planned.admission !== undefined ? { admission: planned.admission } : {}),
+      ...(unadmitted.length > 0 ? { unadmitted } : {}),
+    };
   };
 
   /**
@@ -1626,8 +2314,13 @@ export function createVerificationWiring(deps: {
     childID: string,
     cwd: string | undefined,
     deadline: Deadline | undefined,
+    observePerimeter = true,
   ): Promise<Omit<PreparedVerification, "reference">> => {
     const base = resolve(directory, cwd || ".");
+    // QA-1 F9: the perimeter's gate snapshots start now, concurrently with W's own (never rejects).
+    const perimeterSnapshots = observePerimeter
+      ? perimeterSnapshotsAtGate(store, id, deadline).catch(() => undefined)
+      : Promise.resolve(undefined);
     const controller = new AbortController();
     const onAbort = (): void => controller.abort();
     deadline?.signal.addEventListener("abort", onAbort, { once: true });
@@ -1663,14 +2356,75 @@ export function createVerificationWiring(deps: {
       deadline?.signal.removeEventListener("abort", onAbort);
       controller.abort();
     }
-    const committed = await committedSinceDispatch(store.baselineSnapshot(id), snapshot, deadline);
+    const before = store.baselineSnapshot(id);
+    // I7 (P0.2, S9): did the tree switch branch since the dispatch? Decided from the cheap head state, before the commit diff:
+    // a diff across branches would be the other branch's net change, verified as the producer's, and must never reach the store.
+    let headSwitch: string | undefined;
+    let headRead = false;
+    let gateHead: HeadState | undefined;
+    const baselineHead = store.baselineHead(id);
+    if (baselineHead !== undefined) {
+      const bound = deadline ? deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS) : GRADE_SNAPSHOT_TIMEOUT_MS;
+      if (bound > 0 && deadline?.signal.aborted !== true) {
+        const signalOpt = deadline ? { signal: deadline.signal } : {};
+        const startRead = await withTimeout(baselineHead, bound, "dispatch head").catch(() => undefined);
+        // QA2 F3: "none" = no repository or an unborn HEAD at dispatch (e.g. the producer ran git init or made the first
+        // commit): there was no branch to switch from. Unknown (a failed or late read): the dispatch snapshot's head and branch
+        // stand in when it recorded them (no root or reflog then: the name rule decides).
+        const startHead: HeadState | "none" | undefined = startRead === "none" || startRead !== undefined
+          ? startRead
+          : before !== undefined && before.branch !== undefined
+            ? { root: before.root ?? base, head: before.head, branch: before.branch }
+            : undefined;
+        const nowHead = await withTimeout(
+          readHeadState(base, { ...signalOpt, timeoutMs: bound, lowPriority: configuredLowPriority() }),
+          bound,
+          "gate head",
+        ).catch(() => undefined);
+        if (nowHead !== undefined) {
+          headRead = true;
+          gateHead = nowHead;
+          if (startHead === "none") {
+            // No branch existed at dispatch: nothing to compare.
+          } else if (startHead === undefined) {
+            // The dispatch-time head is unknown (an unreadable or late read, and no snapshot head): fail closed.
+            headSwitch = `cannot confirm the branch of ${nowHead.root}: the working tree could not be read when the dispatch started, so the checks could verify another branch. Re-dispatch, or send a fresh [acceptance] block.`;
+          } else {
+            let window: ReflogEntry[] | undefined;
+            if (startHead.reflog !== undefined && nowHead.reflog !== undefined && nowHead.reflog >= startHead.reflog) {
+              window = await readReflogWindow(nowHead.root, nowHead.reflog - startHead.reflog, {
+                ...signalOpt, timeoutMs: bound, lowPriority: configuredLowPriority(),
+              });
+            }
+            // The reflog grew but its entries cannot be read: a checkout or reset cannot be ruled out (fail closed).
+            const unreadWindow = window === undefined && startHead.reflog !== undefined && nowHead.reflog !== undefined
+              && nowHead.reflog > startHead.reflog;
+            const move = unreadWindow
+              ? { kind: "rewritten" as const, detail: "the reflog entries could not be read" }
+              : treeMove(startHead, nowHead, window);
+            if (move !== undefined) headSwitch = treeMoveReason(nowHead.root, startHead, nowHead, move, "during the dispatch");
+          }
+        }
+      }
+    }
+    // Head state unavailable at the gate (or no head reader for this dispatch): the snapshot comparison, when both exist.
+    const snapshotSwitch = !headRead && before !== undefined && snapshot !== undefined && branchSwitched(before, snapshot)
+      ? branchSwitchReason(snapshot.root ?? base, before, snapshot, "during the dispatch")
+      : undefined;
+    const branchSwitch = headSwitch ?? snapshotSwitch;
+    // B8: on a switch the commit diff is not run; "unavailable" keeps the whole change set unavailable (the gate refuses anyway).
+    const committed = branchSwitch !== undefined ? "unavailable" as const : await committedSinceDispatch(before, snapshot, deadline);
     const contaminatedBy = store.snapshotContaminatedBy(id);
+    const perimeter = await perimeterAtGate(await perimeterSnapshots, snapshot, base, deadline);
     return {
       ...store.delta(id, childID, snapshot, base, committed),
       snapshot,
       concurrentDispatches: store.concurrentDispatches(id, snapshot?.root),
       ...(contaminatedBy !== undefined ? { contaminatedBy } : {}),
       ...(childID !== "" ? { producerSessionID: childID } : {}),
+      ...(branchSwitch !== undefined ? { branchSwitch } : {}),
+      ...(gateHead !== undefined ? { head: gateHead } : {}),
+      ...(perimeter !== undefined ? { perimeter } : {}),
     };
   };
 
@@ -1735,39 +2489,100 @@ export function createVerificationWiring(deps: {
    * for each testsPass check, with the command and cwd the gate would use. The first S6 result wins;
    * a command outside the allowlist is S6 too (the gate reports it unverifiable). Bounded by the
    * deferred-finish deadline; an unfinished plan counts as impossible (raises the risk, never lowers it).
+   *
+   * Cross-repo P2e: with `placements` (index-aligned with `dod.checks`), each testsPass check is planned at its placement's
+   * cwd; a placement with `scope === "full"` is not planned (it runs in full); a foreign placement is S6
+   * (attribution-unavailable), unless it is a cross-link plan (Y6, below). A check without a placement, or no placements at
+   * all: the base dir, as before.
+   *
+   * P2e QA-1 #6: with `fullScope` (OD-P2e-2) no testsPass check is planned as affected (each runs in full); when every testsPass
+   * check runs in full, the result is the neutral FULL_SCOPE plan, never the unfinished S6 one.
+   *
+   * Cross-repo P3a (Y6): a foreign testsPass with an explicit scope=affected is planned as the gate runs it (deterministic.ts):
+   * at its placement's cwd, with `crossLinkRoot` = W's root (`changeRoot`, else the base dir, as the gate falls back) and the
+   * consumer link spellings of it (perimeter.ts crossLinkAliases), the changed paths made absolute against that root (F7).
+   * A scopable cross-link plan then raises no S6; a runner the link does not reach (jest, pytest, another vitest major) still
+   * does. Any other foreign placement stays S6 (attribution-unavailable).
    */
   const staticScoping = async (
     dod: DoD,
     cwd: string | undefined,
     changedFiles: readonly ChangedPath[],
     deadline: Deadline,
-  ): Promise<StaticScoping> => {
+    placements?: readonly (CheckPlacement | undefined)[],
+    fullScope?: boolean,
+    changeRoot?: string,
+  ): Promise<StaticScoping | FullScopePlan> => {
     const unfinished: StaticScoping = { unverifiable: true, code: "search-failed", reason: STATIC_SCOPING_UNFINISHED_REASON };
     const budget = resolveVerifyBudget(getConfig());
-    const at = resolveBaseDir(cwd, directory);
+    const base = resolveBaseDir(cwd, directory);
+    // Y6: W's root as the gate takes it (gate.ts: artefact.changeRoot ?? effectiveBaseDir), and (F7) the changed paths absolute
+    // against it, computed once and only for a cross-link plan.
+    const linkRoot = changeRoot ?? base;
+    let absoluteChanged: readonly ChangedPath[] | undefined;
+    const linkChangedFiles = (): readonly ChangedPath[] => (absoluteChanged ??= changedFiles.map(file => ({
+      ...file,
+      path: isAbsolute(file.path) ? file.path : resolve(linkRoot, file.path),
+      ...(file.previousPath !== undefined
+        ? { previousPath: isAbsolute(file.previousPath) ? file.previousPath : resolve(linkRoot, file.previousPath) }
+        : {}),
+    })));
     const plans: StaticScoping[] = [];
-    for (const check of dod.checks) {
+    let ranFull = false;
+    for (const [index, check] of dod.checks.entries()) {
       if (check.kind !== "testsPass") continue;
       const command = resolveRepoCommand(check, "testsPass", undefined);
       if (!isCommandAllowed(command, DEFAULT_ALLOWLIST)) {
         plans.push({ unverifiable: true, code: "unsupported-command", reason: `command not allowlisted: ${scrubText(command)}` });
         continue;
       }
+      const placement = placements?.[index];
+      if (fullScope === true || placement?.scope === "full") {
+        ranFull = true;
+        continue;
+      }
+      // Y6: only an explicit scope=affected crosses the link (deterministic.ts runDeterministic); any other foreign check is S6.
+      const crossLink = placement?.foreign === true && placement.scope === "affected";
+      if (placement?.foreign === true && !crossLink) {
+        plans.push({
+          unverifiable: true,
+          code: "attribution-unavailable",
+          reason: "the check runs in another repository, whose changes are not attributed to this dispatch",
+        });
+        continue;
+      }
+      const at = placement?.cwd ?? base;
       const ms = deadline.remaining();
       if (ms <= 0) {
         plans.push(unfinished);
         continue;
       }
       try {
-        plans.push(await withTimeout(
-          planStaticScoping({ command, cwd: at, changedFiles, budget: { maxWorkers: budget.maxWorkers }, fs: fsSeam }),
-          ms,
-          "static scoping",
-        ));
+        const input: StaticScopingInput = crossLink
+          ? {
+            command,
+            cwd: at,
+            changedFiles: linkChangedFiles(),
+            budget: { maxWorkers: budget.maxWorkers },
+            fs: fsSeam,
+            crossLinkRoot: linkRoot,
+            // Fail-soft, as the gate's alias provider (deterministic.ts crossLinkTarget): an error gives no aliases.
+            ...(() => {
+              try {
+                return { crossLinkAliases: crossLinkAliases(at, linkRoot) };
+              } catch {
+                return {};
+              }
+            })(),
+          }
+          : { command, cwd: at, changedFiles, budget: { maxWorkers: budget.maxWorkers }, fs: fsSeam };
+        plans.push(await withTimeout(planStaticScoping(input), ms, "static scoping"));
       } catch {
         plans.push(unfinished);
       }
     }
+    // P2e QA-1 #6: every testsPass check runs in full: the neutral plan (never the unfinished S6 one).
+    if (plans.length === 0 && ranFull) return FULL_SCOPE_PLAN;
     return plans.find(p => "unverifiable" in p) ?? plans[0] ?? unfinished;
   };
 
@@ -1785,7 +2600,13 @@ export function createVerificationWiring(deps: {
     let risk: RiskAssessment = unattributedRisk();
     let deferred = false;
     try {
-      const observed = await observeChange(store, input.dispatchID, input.producerSessionID, input.cwd, deadline);
+      // Cross-repo P2e.5 (X4): a dispatch with a perimeter has it observed in return mode, its snapshots started now so they run
+      // concurrently with W's own (never rejects; bounded by the same DEFERRED_FINISH_MS deadline). Without one: nothing extra.
+      const changeCwd = input.captureRoot ?? input.cwd;
+      const perimeterSnapshots = store.perimeterOf(input.dispatchID) !== undefined
+        ? perimeterSnapshotsAtGate(store, input.dispatchID, deadline).catch(() => undefined)
+        : undefined;
+      const observed = await observeChange(store, input.dispatchID, input.producerSessionID, changeCwd, deadline, false);
       // Phase 2.1.4.b / QA-2.1-7: the set frozen at child end holds only the child's tool-observed paths, a subset of the
       // observed change set (which also holds the tree delta, shell edits and commits), so it never replaces it. A delta whose
       // dispatch snapshot a foreign write contaminated makes the change set unavailable, as the foreground gate treats it.
@@ -1796,6 +2617,36 @@ export function createVerificationWiring(deps: {
         changedFiles: [],
         ...(delta.contaminatedBy !== undefined ? { contaminatedBy: delta.contaminatedBy } : {}),
       };
+      // I7 (P0.2): a branch switch during the dispatch is never deferred: a handle could verify the other branch later. The
+      // caller's required gate refuses it now (its own observeChange sees the switch). Before the no-change shortcut below.
+      if (change.branchSwitch !== undefined) return { deferred: false, reason: "branch-switched", detail: change.branchSwitch };
+      // Cross-repo P2e.5 (X5, X7): the perimeter as it was at return is frozen for router_verify, unless it cannot be: I4 already
+      // holds (a root changed while an unattributable writer ran), or a link target was not observed. The caller's required
+      // gate then verifies the dispatch now. Before the no-change shortcut below.
+      let frozen: Awaited<ReturnType<typeof perimeterAtReturn>>;
+      if (perimeterSnapshots !== undefined) {
+        const base = resolve(directory, changeCwd || ".");
+        // P3c.6 (D26): a dependency added during the dispatch is snapshotted within what remains of this deadline.
+        frozen = await perimeterAtReturn(await perimeterSnapshots, change.snapshot, base, deadline);
+        const writers = change.unattributedWriters ?? [];
+        if (frozen !== undefined && perimeterChangeReasons({ perimeter: frozen.observation, unattributedWriters: [...writers] }, base).length > 0) {
+          return {
+            deferred: false,
+            reason: "cross-repo",
+            detail: "a repository of the perimeter changed during the dispatch while an unattributable writer ran; verified synchronously",
+          };
+        }
+        if (frozen?.linkUnobserved === true) {
+          return { deferred: false, reason: "cross-repo", detail: "a linked repository could not be observed within the deferral bound; verified synchronously" };
+        }
+      }
+      // P2e.5 (X3): the frozen pins settle only once the registration succeeded (below); never rejects.
+      let settlePins: (pins: readonly LinkPin[]) => void = () => undefined;
+      const frozenPins = frozen !== undefined
+        ? new Promise<readonly LinkPin[]>(settle => {
+          settlePins = settle;
+        })
+        : undefined;
       // QA-2.4-10: an attributed empty change set is passed by the required gate with no process
       // (section 1.5-6): nothing to defer. The caller runs that gate, with the same outcome.
       // QA-G-1: only for a testsPass-only DoD. Any other check (build, lint, run, fileExists,
@@ -1803,7 +2654,7 @@ export function createVerificationWiring(deps: {
       // DoD stays deferred as a whole, with the attributed empty change set (risk low).
       if (
         change.changeBaseline === "available" && change.changedFiles.length === 0 && !deadline.signal.aborted &&
-        noChangeGateSpawnsNothing(input.dod)
+        noChangeGateSpawnsNothing(input.dod, { placements: input.placements, fullScope: input.fullScope })
       ) {
         return { deferred: false, reason: "no-change", detail: "the producer changed no file" };
       }
@@ -1817,7 +2668,10 @@ export function createVerificationWiring(deps: {
           ...(f.previousPath !== undefined ? { previousPath: f.previousPath } : {}),
         }));
         changedFiles = paths;
-        const scopingPlan = await staticScoping(input.dod, input.cwd, paths, deadline);
+        // Y6: W's root (the snapshot's git top) is the cross-link root of a foreign scope=affected testsPass.
+        const scopingPlan = await staticScoping(
+          input.dod, input.cwd, paths, deadline, input.placements, input.fullScope, change.snapshot?.root,
+        );
         risk = assessRisk({ changedFiles: paths, reference: referenceCaptured, producerTier, scopingPlan, root: change.snapshot?.root });
         // QA-2.4-8: the drift baseline is taken BEFORE the result is released (fs reads only, under
         // the same DEFERRED_FINISH_MS bound). An edit that lands right after the return is then
@@ -1834,6 +2688,20 @@ export function createVerificationWiring(deps: {
         description: input.description,
         cwd: resolveBaseDir(input.cwd, directory),
         root: change.snapshot?.root,
+        // I7 (P0.2, S12): the checkout the producer returned on; router_verify refuses a tree on another branch by then.
+        // B4/B12: from the cheap head state the gate read (root and reflog count too); the snapshot's only without one.
+        ...(change.head !== undefined
+          ? {
+            returnedTree: {
+              root: change.head.root,
+              head: change.head.head,
+              branch: change.head.branch,
+              ...(change.head.reflog !== undefined ? { reflog: change.head.reflog } : {}),
+            },
+          }
+          : change.snapshot !== undefined
+            ? { returnedTree: { head: change.snapshot.head, branch: change.snapshot.branch } }
+            : {}),
         dispatchedAt: input.dispatchedAt,
         dod: input.dod,
         reference,
@@ -1844,11 +2712,51 @@ export function createVerificationWiring(deps: {
         // adds the caveats to its verdict.
         ...(change.concurrentDispatches !== undefined && change.concurrentDispatches > 0 ? { concurrentDispatches: change.concurrentDispatches } : {}),
         ...(change.contaminatedBy !== undefined ? { contaminatedBy: change.contaminatedBy } : {}),
+        // I5 (P0.3): router_verify's gate adds the caveat to a pass on an empty change set.
+        ...(change.unattributedWriters !== undefined && change.unattributedWriters.length > 0 ? { unattributedWriters: change.unattributedWriters } : {}),
+        // Cross-repo P2e.5: the perimeter frozen at return (router_verify gates with it) and the dispatch's placements.
+        ...(frozen !== undefined && frozenPins !== undefined
+          ? {
+            perimeter: {
+              observation: frozen.observation,
+              // The W directory the dispatch's planPerimeter read <W>/node_modules from (the cwd observeChange ran at, as `base` below; beginDispatch planned with the same captureRootOf).
+              linkBase: resolve(directory, changeCwd || "."),
+              workingSet: frozen.workingSet,
+              links: frozen.links,
+              pins: frozenPins,
+              // P3c.4 (SD-P3c-9): the admission the dispatch's planPerimeter read W's links and edges with; router_verify reads
+              // W's dependency targets again through it (the registry freezes a copy).
+              ...(frozen.admission !== undefined ? { admission: frozen.admission } : {}),
+              ...(frozen.unadmitted !== undefined ? { unadmittedAtReturn: frozen.unadmitted } : {}),
+            },
+          }
+          : {}),
+        ...(input.placements !== undefined ? { placements: input.placements } : {}),
       });
       if (!reg.ok) {
+        // P2e.5 (X3): nothing reads it; the dispatch's own pins are left untouched for the required gate.
+        settlePins([]);
         // QA-2.4-4: never a delegation without a verdict path: the caller runs the required gate.
         logger.warn("[verify] deferred delegation not registered; verifying synchronously", { code: reg.code, detail: reg.detail });
         return { deferred: false, reason: "unregistered", detail: `${reg.code}: ${reg.detail}` };
+      }
+      if (frozen !== undefined) {
+        // P2e.5 (X3): the dispatch's link pins are taken now, before store.clear (below), then freed; the entry keeps the SAME
+        // array (pinNow admission is keyed by its identity). Never rejects: a failure is [].
+        const dispatchID = input.dispatchID;
+        void linkPinsAtGate(store, dispatchID, undefined).then(
+          pins => {
+            freeLinkPins(dispatchID, pins);
+            settlePins(pins);
+          },
+          () => {
+            freeLinkPins(dispatchID, []);
+            settlePins([]);
+          },
+        );
+      } else if (perimeterSnapshots !== undefined) {
+        // A perimeter with nothing to freeze beyond W: no gate takes this dispatch's pins any more.
+        freeLinkPins(input.dispatchID, []);
       }
       deferred = true;
       // #84 P2.1 (handoff 24, R7): the budget captured at return travels with the handle to `router_verify`.
@@ -1953,6 +2861,66 @@ export function createVerificationWiring(deps: {
   };
 
   /**
+   * Cross-repo P2e.4a (S11): a frozen link target observed again at router_verify, hardened as the perimeter snapshots it
+   * (perimeterSnapshotsAtGate), bounded by the claim deadline. Undefined when it cannot be taken in time. Never throws.
+   */
+  const hardenedSnapshotFor = async (at: string, deadline: Deadline, lowPriority: boolean): Promise<TreeSnapshot | undefined> => {
+    const controller = new AbortController();
+    const onAbort = (): void => controller.abort();
+    deadline.signal.addEventListener("abort", onAbort, { once: true });
+    try {
+      const bound = deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS);
+      if (bound <= 0 || controller.signal.aborted) return undefined;
+      return await withTimeout(snapshotTree(at, controller.signal, { lowPriority, hardened: true }), bound, "router_verify link fingerprint");
+    } catch {
+      return undefined;
+    } finally {
+      deadline.signal.removeEventListener("abort", onAbort);
+      controller.abort();
+    }
+  };
+
+  /**
+   * Cross-repo P2e.4b: the first frozen check placement whose cwd no longer resolves to the same repository since the producer
+   * returned: its real path is not its (canonical) cwd any more (a junction swapped under it, or gone), or its git top level is
+   * not the frozen `top`. The reason names it ("nothing ran"); undefined when every placement still resolves as it did.
+   */
+  const placementDriftOf = async (entry: PendingEntry): Promise<{ readonly kind: "drift" | "unchecked"; readonly reason: string } | undefined> => {
+    const placements = entry.placements;
+    if (placements === undefined) return undefined;
+    // Per placement: "same", "drift", or the code of a transient error (P2e QA-1 #5b: EPERM, EBUSY, EACCES…: not a drift).
+    const states = await Promise.all(placements.map(async (placement): Promise<string> => {
+      if (placement === undefined) return "same";
+      let real: string;
+      try {
+        real = await realpath(placement.cwd);
+      } catch (err) {
+        const code = typeof err === "object" && err !== null && "code" in err ? String((err as { code: unknown }).code) : "unknown";
+        // The directory is gone (or a file now stands in its path): it no longer resolves.
+        return code === "ENOENT" || code === "ENOTDIR" ? "drift" : code;
+      }
+      if (perimeterKey(real) !== perimeterKey(placement.cwd)) return "drift";
+      const top = gitTopOf(placement.cwd);
+      const moved = top === undefined || placement.top === undefined
+        ? top !== placement.top
+        : perimeterKey(top) !== perimeterKey(placement.top);
+      return moved ? "drift" : "same";
+    }));
+    const label = (index: number): string =>
+      `check ${index + 1} (${entry.dod?.checks?.[index]?.kind ?? "check"}) cwd=${placements[index]?.cwd ?? ""}`;
+    const drifted = states.indexOf("drift");
+    if (drifted >= 0) {
+      return { kind: "drift", reason: `${label(drifted)} no longer resolves to the same repository since the producer returned; nothing ran` };
+    }
+    const unchecked = states.findIndex(state => state !== "same");
+    if (unchecked < 0) return undefined;
+    return {
+      kind: "unchecked",
+      reason: `${label(unchecked)} could not be checked since the producer returned (${states[unchecked]}); nothing ran`,
+    };
+  };
+
+  /**
    * 2.4.3a, section 1.5-18: the producer's files now against their digests right after it returned.
    * "unchecked" whenever either side is missing (no change set, no stored digests, a digest that
    * could not be taken, or the deadline): never a claim of "no drift" without proof.
@@ -1972,6 +2940,21 @@ export function createVerificationWiring(deps: {
     readonly drift: DriftCheck;
     /** R11 root: the registered one, else the current tree's. */
     readonly root: string | undefined;
+    /**
+     * Cross-repo P2e.4a (S11): the frozen link targets that changed, or could not be observed again, since the producer
+     * returned. Absent: no frozen perimeter, or every link is as it was at return.
+     */
+    readonly linkDrift?: readonly { readonly name: string; readonly root: string; readonly why: "changed" | "unobserved" }[];
+    /**
+     * Cross-repo P2e.4b: the first frozen check placement whose cwd no longer resolves to the same repository (the gate then
+     * runs nothing). Absent: no placements, or all still resolve as at return.
+     */
+    readonly placementDrift?: string;
+    /**
+     * P2e QA-1 #5b: the first frozen check placement whose cwd could not be checked now (a transient filesystem error, not a
+     * missing directory): nothing runs, and the handle stays open (retryable). Absent: every placement could be checked.
+     */
+    readonly placementUnchecked?: string;
   }
 
   /** One claimed entry after its gate: a final result, or the raw gate result still to be judged. */
@@ -1979,26 +2962,271 @@ export function createVerificationWiring(deps: {
     | { readonly kind: "final"; readonly result: VerificationResult }
     | { readonly kind: "gate"; readonly res: GateResult; readonly retryable: boolean; readonly strict: boolean };
 
+  /**
+   * Cross-repo P3c.4 (SD-P3c-8): W's dependency targets (`dependencyTargets`) read at one router_verify call, keyed by W's
+   * comparison key and the frozen admission it was read with: the call's entries of one W read them once.
+   */
+  type DependencyMemo = Map<string, DependencyTargets | undefined>;
+
   /** 2.4.3a P0 from the pending entry: stored change set and reference, current tree, drift. */
   const prepareClaim = async (
     entry: PendingEntry,
     deadline: Deadline,
     snapshots: Map<string, Promise<TreeSnapshot | undefined>>,
     lowPriority: boolean,
+    dependencies: DependencyMemo = new Map(),
   ): Promise<ClaimPreparation> => {
     let snapshot = snapshots.get(entry.cwd);
     if (snapshot === undefined) {
       snapshot = snapshotFor(entry.cwd, deadline, lowPriority);
       snapshots.set(entry.cwd, snapshot);
     }
-    const [reference, drift, tree] = await Promise.all([
+    const atReturn = entry.returnedTree;
+    // B4: the branch check reads the cheap head state, not the full tree snapshot (slow, and unavailable for large dirty
+    // trees and submodules). Read in parallel with the rest, bounded by the deadline.
+    const readNowHead = async (): Promise<HeadState | undefined> => {
+      if (atReturn === undefined) return undefined;
+      const bound = deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS);
+      if (bound <= 0 || deadline.signal.aborted) return undefined;
+      return withTimeout(
+        readHeadState(entry.cwd, { signal: deadline.signal, timeoutMs: bound, lowPriority }),
+        bound,
+        "router_verify head",
+      ).catch(() => undefined);
+    };
+    const [reference, drift, tree, nowHead, placementDrift] = await Promise.all([
       // The same bound as the store's reference(id, signal): a capture still pending at the deadline
       // is "no reference (gate budget)".
       untilAborted<ReferenceState>(entry.reference, deadline.signal, () => ({ kind: "none", reason: REFERENCE_NONE.gateBudget })),
       checkDrift(entry, deadline),
       snapshot,
+      readNowHead(),
+      // Cross-repo P2e.4b: no placements, no work (resolves undefined at once).
+      placementDriftOf(entry),
     ]);
     const changed = entry.changedFiles;
+    const root = entry.root ?? tree?.root;
+    // I7 (P0.2, S12): the tree must still be on the checkout the producer returned on. A branch recorded at return with no
+    // current head state to compare is refused too ("cannot confirm": retryable); nothing recorded: no check.
+    let branchSwitch: string | undefined;
+    if (atReturn !== undefined) {
+      if (nowHead === undefined) {
+        if (atReturn.branch !== undefined) branchSwitch = branchUnconfirmedReason(atReturn.root ?? root ?? entry.cwd);
+      } else if (atReturn.branch === undefined) {
+        // Registered without a branch (an unknown one): any HEAD move is a switch (branch.ts branchSwitched).
+        if (branchSwitched(atReturn, nowHead)) {
+          branchSwitch = branchSwitchReason(nowHead.root, atReturn, nowHead, "since the producer returned");
+        }
+      } else {
+        const before: HeadState = {
+          root: atReturn.root ?? nowHead.root,
+          head: atReturn.head,
+          branch: atReturn.branch,
+          ...(atReturn.reflog !== undefined ? { reflog: atReturn.reflog } : {}),
+        };
+        let window: ReflogEntry[] | undefined;
+        const comparable = before.reflog !== undefined && nowHead.reflog !== undefined && nowHead.reflog >= before.reflog;
+        if (comparable) {
+          const bound = deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS);
+          window = bound > 0 && !deadline.signal.aborted
+            ? await withTimeout(
+              readReflogWindow(nowHead.root, (nowHead.reflog ?? 0) - (before.reflog ?? 0), {
+                signal: deadline.signal, timeoutMs: bound, lowPriority,
+              }),
+              bound,
+              "router_verify reflog",
+            ).catch(() => undefined)
+            : undefined;
+        }
+        // The reflog grew but its entries cannot be read: a checkout or reset cannot be ruled out (fail closed).
+        const unreadWindow = window === undefined && before.reflog !== undefined && nowHead.reflog !== undefined
+          && nowHead.reflog > before.reflog;
+        const move = unreadWindow
+          ? { kind: "rewritten" as const, detail: "the reflog entries could not be read" }
+          : treeMove(before, nowHead, window);
+        if (move !== undefined) branchSwitch = treeMoveReason(nowHead.root, before, nowHead, move, "since the producer returned");
+      }
+    }
+    // Cross-repo P2e.3: a frozen perimeter (registered at return) is judged as it was then (I4, I8: its roots' statuses are
+    // never re-snapshotted); the consumers (D6) are discovered now over its frozen working set, bounded by the claim deadline.
+    let perimeter: PerimeterObservation | undefined;
+    let gateReference: ReferenceState = reference;
+    let linkDrift: ClaimPreparation["linkDrift"];
+    const frozen = entry.perimeter;
+    if (frozen !== undefined) {
+      const discoverFrozen = async (): Promise<ConsumerDiscovery> => {
+        const candidates = [...frozen.workingSet];
+        if (candidates.length === 0) return { consumers: [], incomplete: [] };
+        const controller = new AbortController();
+        const ms = deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS);
+        const onAbort = (): void => controller.abort();
+        if (ms <= 0 || deadline.signal.aborted) controller.abort();
+        deadline.signal.addEventListener("abort", onAbort, { once: true });
+        const timer = setTimeout(onAbort, Math.max(0, ms));
+        try {
+          const parents = frozen.admission?.parents;
+          return await discoverConsumers(frozen.observation.w.root, candidates, { signal: controller.signal, ...(parents !== undefined ? { parents } : {}) });
+        } catch {
+          return { consumers: [], incomplete: candidates }; // Never expected (it never throws): fail closed.
+        } finally {
+          clearTimeout(timer);
+          deadline.signal.removeEventListener("abort", onAbort);
+        }
+      };
+      const awaitPins = async (): Promise<readonly LinkPin[]> => {
+        const bound = deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS);
+        if (bound <= 0 || deadline.signal.aborted) return [];
+        return withTimeout(frozen.pins, bound, "router_verify link pins").catch(() => []);
+      };
+      // Cross-repo P2e.4a (S11): each frozen link target observed again (one hardened snapshot per root per call, shared by
+      // the call's entries through `snapshots`). Working-set roots are not: the I4 window ended at return.
+      type FrozenLink = NonNullable<PendingEntry["perimeter"]>["links"][number];
+      type Drift = { readonly name: string; readonly root: string; readonly why: "changed" | "unobserved" };
+      // `real`: where link.at resolves now (fs only); `targets`: what W depends on now, its package link targets and its admitted
+      // declared edges' top levels (P3c.4, SD-P3c-1: `dependencyTargets`, fs only, no git run); `every`: those and its unadmitted
+      // edge targets' paths (P3 QA-2 F-2).
+      const observeLink = async (
+        link: FrozenLink,
+        real: string | undefined,
+        targets: readonly string[],
+        every: readonly string[],
+      ): Promise<Drift | undefined> => {
+        const name = link.name ?? basename(link.root);
+        // P3 QA-1 M3: a dependency the producer removed (or retargeted) during the dispatch is not an input of the change: skipped
+        // entirely while W still does not depend on it; W depending on it again since the return is a new dependency: "changed".
+        // P3 QA-2 F-2: an unadmitted spelling into it still declares it (frozen removed only when no target of any kind lay in it).
+        if (link.removedAtReturn === true) {
+          return every.some(target => depthBelow(target, link.root) >= 0) ? { name, root: link.root, why: "changed" } : undefined;
+        }
+        // P2e QA-1 #4 (I12): no git where the link no longer resolves inside its frozen root, or where its admission refuses.
+        if (real === undefined || depthBelow(real, link.root) < 0 || link.admit?.(link.root) === false) {
+          return { name, root: link.root, why: "unobserved" };
+        }
+        // P2e QA-1 #2: W no longer links into it (retargeted or removed): the checks ran against another link target.
+        if (!targets.some(target => depthBelow(target, link.root) >= 0)) return { name, root: link.root, why: "changed" };
+        const key = `link\0${perimeterKey(link.at)}`;
+        let pending = snapshots.get(key);
+        if (pending === undefined) {
+          pending = hardenedSnapshotFor(link.at, deadline, lowPriority);
+          snapshots.set(key, pending);
+        }
+        const now = await pending;
+        const top = now?.root;
+        if (now === undefined) return { name, root: link.root, why: "unobserved" };
+        if (top !== undefined && link.admit !== undefined && !link.admit(top)) return { name, root: link.root, why: "unobserved" };
+        if (top === undefined || perimeterKey(top) !== perimeterKey(link.root) || now.fingerprint !== link.fingerprint || now.head !== link.head) {
+          return { name, root: link.root, why: "changed" };
+        }
+        return undefined;
+      };
+      const observeLinks = async (): Promise<Drift[]> => {
+        const reals = await Promise.all(frozen.links.map(link => realpath(link.at).catch(() => undefined)));
+        // The W directory planPerimeter read links from at dispatch (it can be a subfolder of the git top level); an entry
+        // registered without one falls back to the snapshot root.
+        const wRoot = frozen.linkBase ?? frozen.observation.w.root;
+        // P3c.4 (SD-P3c-1, F1): W's dependency targets now, the union of its package links and its declared edges, read through
+        // the admission frozen at dispatch (SD-P3c-9) and once per W for this call's entries (SD-P3c-8). An entry registered
+        // without a frozen admission reads W's package links only, as before P3c.
+        const admission = frozen.admission;
+        const context = admission !== undefined ? admissionFromData(admission) : undefined;
+        const memoKey = `${perimeterKey(wRoot)}\0${admission !== undefined ? JSON.stringify(admission) : ""}`;
+        if (!dependencies.has(memoKey)) {
+          let read: DependencyTargets | undefined;
+          try {
+            read = context !== undefined
+              ? dependencyTargets(wRoot, context)
+              : { targets: linkedTargets(wRoot).map(at => ({ origin: "link" as const, at })), unadmittedMore: 0, incomplete: false };
+          } catch {
+            read = undefined; // Never expected (both skip what they cannot read): every frozen dependency is then "changed".
+          }
+          dependencies.set(memoKey, read);
+        }
+        const current = dependencies.get(memoKey)?.targets ?? [];
+        // What W still depends on: its link targets (admitted or not, as before) and its admitted edges' top levels. An
+        // unadmitted edge target is text only (never observed): it only names a new dependency below.
+        const targets = current.filter(target => !("fixed" in target)).map(target => target.at);
+        // P3 QA-2 F-2: a link removed at return is judged against every target, unadmitted ones included (as frozen at return).
+        const every = current.map(target => target.at);
+        const drifts = await Promise.all(frozen.links.map((link, index) => observeLink(link, reals[index], targets, every)));
+        // P2e QA-1 #2: a dependency target of W now that none of the perimeter frozen at return covers (its links and edges'
+        // roots, frozen at return, and its observed roots) is new: "changed". W's own repository is W's snapshot, as at
+        // dispatch (planPerimeter); W's dependencies are read from `wRoot` (the dispatch's W), never from the snapshot root
+        // (which is the git top level).
+        // P3 QA-1 M3: a link removed at return covers nothing (observeLink names it when W depends on it again).
+        const covering = [
+          ...frozen.links.filter(link => link.removedAtReturn !== true).map(link => link.root),
+          ...reals.filter((real, index): real is string => real !== undefined && frozen.links[index]?.removedAtReturn !== true),
+          ...frozen.observation.roots.map(root => root.root),
+        ];
+        // P3 QA-1 M4: an unadmitted target the producer added during the dispatch covers itself, as a dispatch-time one does
+        // through its unadmitted root. P3 QA-2 F-3: itself only (same key), and only while it is still unadmitted: an admitted
+        // target at or below it is a new dependency ("changed").
+        const unadmittedAtReturn = new Set((frozen.unadmittedAtReturn ?? []).map(at => perimeterKey(at)));
+        // Not admitted now, as dependenciesAddedAtReturn judged it at return: an unadmitted edge, or a link target outside every
+        // parent and worktree, without a git top level, or whose top level the frozen admission refuses.
+        const unadmittedNow = (target: DependencyTargets["targets"][number]): boolean => {
+          if ("fixed" in target) return true;
+          if (target.origin === "edge" || context === undefined) return false;
+          const parent = context.parentOf(target.at);
+          const worktree = context.worktreeOf(target.at);
+          if (parent === undefined && worktree === undefined) return true;
+          const top = gitTopOf(target.at, worktree !== undefined ? dirname(worktree.worktree) : parent);
+          return top === undefined || !context.admitTop(top);
+        };
+        // A new link target is named by its top level, found without git: below its parent (or above its working-set worktree)
+        // as at dispatch (SD-P3c-9, F8). Outside every parent and worktree, it is named by its text: nothing runs there (I11).
+        // Without a frozen admission: its top level, as before P3c.
+        const linkTop = (target: string): string => {
+          if (context === undefined) return gitTopOf(target) ?? target;
+          const parent = context.parentOf(target);
+          const worktree = context.worktreeOf(target);
+          if (parent === undefined && worktree === undefined) return target;
+          return gitTopOf(target, worktree !== undefined ? dirname(worktree.worktree) : parent) ?? target;
+        };
+        const fresh = new Map<string, Drift>();
+        for (const target of current) {
+          if (covering.some(root => depthBelow(target.at, root) >= 0)) continue;
+          if (unadmittedAtReturn.has(perimeterKey(target.at)) && unadmittedNow(target)) continue;
+          // An edge target is already its top level (admitted, found below its parent by `resolveEdgeTarget`) or text (not
+          // admitted: named from its text, with no filesystem call, I11).
+          const top = target.origin === "edge" ? target.at : linkTop(target.at);
+          if (depthBelow(top, wRoot) >= 0 || depthBelow(wRoot, top) >= 0) continue;
+          const name = "fixed" in target ? target.name : basename(top);
+          if (!fresh.has(perimeterKey(top))) fresh.set(perimeterKey(top), { name, root: top, why: "changed" });
+        }
+        return [...drifts.filter((drift): drift is Drift => drift !== undefined), ...fresh.values()];
+      };
+      const [found, pins, drifted] = await Promise.all([discoverFrozen(), awaitPins(), observeLinks()]);
+      if (drifted.length > 0) linkDrift = drifted;
+      // P3 QA-2 F-3 (I8): an unadmitted dependency the producer added during the dispatch is named as a dispatch-time one is, a
+      // root "unadmitted" (`<name> (not admitted)` in the verified-scope line, never refused), once per root already named.
+      const named = new Set([frozen.observation.w.root, ...frozen.observation.roots.map(root => root.root)].map(at => perimeterKey(at)));
+      const unadmittedRoots: PerimeterObservation["roots"][number][] = [];
+      for (const at of frozen.unadmittedAtReturn ?? []) {
+        if (named.has(perimeterKey(at))) continue;
+        named.add(perimeterKey(at));
+        unadmittedRoots.push({ root: at, name: basename(at), status: "unadmitted" });
+      }
+      perimeter = {
+        ...frozen.observation,
+        ...(unadmittedRoots.length > 0 ? { roots: [...frozen.observation.roots, ...unadmittedRoots] } : {}),
+        ...(found.consumers.length > 0 ? { consumers: found.consumers } : {}),
+        ...(found.incomplete.length > 0 ? { consumersIncomplete: found.incomplete } : {}),
+      };
+      if (reference.kind === "captured" && pins.length > 0) {
+        // pinNow admits as the dispatch admitted, keyed by this pins array (buildGateDeps). P2e QA-1 #3: the deferred finish
+        // registered the dispatch's own admission for it (freeLinkPins: nested link targets included); it is kept. Only without
+        // one (an entry registered directly) the frozen links' roots stand in.
+        if (!pinAdmissions.has(pins)) {
+          const admitted = new Set<string>();
+          for (const link of frozen.links) {
+            if (link.admit === undefined || link.admit(link.root)) admitted.add(perimeterKey(link.root));
+          }
+          pinAdmissions.set(pins, admitted);
+        }
+        gateReference = { ...reference, reference: { ...reference.reference, pins } };
+      }
+    }
     return {
       prepared: {
         changedFiles: changed === "unavailable"
@@ -2006,13 +3234,21 @@ export function createVerificationWiring(deps: {
           : changed.map(c => ({ path: c.path, status: c.status ?? "", ...(c.previousPath !== undefined ? { previousPath: c.previousPath } : {}) })),
         // Section 1.5-6: an unattributed change set stays unattributed (never []).
         changeBaseline: changed === "unavailable" ? "unavailable" : "available",
-        reference,
+        reference: gateReference,
         snapshot: tree,
         // QA-2.1-11: the producer's own retained leases never delay its own check.
         ...(entry.producerSessionID !== "" ? { producerSessionID: entry.producerSessionID } : {}),
+        ...(branchSwitch !== undefined ? { branchSwitch } : {}),
+        ...(entry.unattributedWriters !== undefined ? { unattributedWriters: [...entry.unattributedWriters] } : {}),
+        ...(perimeter !== undefined ? { perimeter } : {}),
+        // Cross-repo P3a (D23 as amended, QA C1): the ORIGINAL dispatch start (the entry's), never the router_verify time.
+        ...(Number.isFinite(entry.dispatchedAt) ? { dispatchStartedAt: entry.dispatchedAt } : {}),
       },
       drift,
-      root: entry.root ?? tree?.root,
+      root,
+      ...(linkDrift !== undefined ? { linkDrift } : {}),
+      ...(placementDrift?.kind === "drift" ? { placementDrift: placementDrift.reason } : {}),
+      ...(placementDrift?.kind === "unchecked" ? { placementUnchecked: placementDrift.reason } : {}),
     };
   };
 
@@ -2035,6 +3271,14 @@ export function createVerificationWiring(deps: {
     const dod = entry.dod;
     // A claimed entry is never released (release happens on a terminal settle only).
     if (dod === undefined) return { kind: "final", result: { verdict: unverifiableVerdict(ROUTER_VERIFY_RELEASED_REASON), retryable: false } };
+    // A restored entry whose registration had a perimeter (never journaled) cannot be judged as registered: never a pass.
+    if (entry.perimeterLost === true) return { kind: "final", result: { verdict: unverifiableVerdict(PERIMETER_LOST_REASON), retryable: false } };
+    // Cross-repo P2e.4b: a placed check whose cwd no longer resolves to the same repository would run elsewhere: nothing runs.
+    if (prep.placementDrift !== undefined) return { kind: "final", result: { verdict: unverifiableVerdict(prep.placementDrift), retryable: false } };
+    // P2e QA-1 #5b: a placement that could not be checked now: nothing runs; another router_verify may check it.
+    if (prep.placementUnchecked !== undefined) {
+      return { kind: "final", result: { verdict: unverifiableVerdict(prep.placementUnchecked), retryable: true } };
+    }
     const strict = cfg.enforcement?.verify?.strictUnverifiable ?? false;
     const inFlight = new Set<string>();
     const completedFailures: string[] = [];
@@ -2043,6 +3287,11 @@ export function createVerificationWiring(deps: {
     const artefact = {
       changedFiles: prep.prepared.changedFiles,
       changeBaseline: prep.prepared.changeBaseline,
+      ...(prep.root !== undefined ? { changeRoot: prep.root } : {}),
+      ...(prep.prepared.branchSwitch !== undefined ? { branchSwitch: prep.prepared.branchSwitch } : {}),
+      ...(prep.prepared.unattributedWriters !== undefined && prep.prepared.unattributedWriters.length > 0
+        ? { unattributedWriters: prep.prepared.unattributedWriters } : {}),
+      ...(prep.prepared.perimeter !== undefined ? { perimeter: prep.prepared.perimeter } : {}),
       // Not stored (R3): a testsPass DoD is deterministic, and no deterministic check reads it.
       finalReturnText: "",
       declaredOutputs: dod.deliverable ? [dod.deliverable] : [],
@@ -2057,7 +3306,12 @@ export function createVerificationWiring(deps: {
     const workRoot = deferredWorkRoots.get(entry.handle);
     try {
       res = await withTimeout(
-        accept({ dod, trivial: false, mode: "modeA", cwd: entry.cwd, ...(workRoot !== undefined ? { workRoot } : {}) }, artefact, gateDeps),
+        accept({
+          dod, trivial: false, mode: "modeA", cwd: entry.cwd,
+          ...(workRoot !== undefined ? { workRoot } : {}),
+          // Cross-repo P2e.4b: the placements frozen at return (each still resolves as it did: prepareClaim).
+          ...(entry.placements !== undefined ? { checkPlacements: entry.placements } : {}),
+        }, artefact, gateDeps),
         deadline.remaining(),
         "verification gate",
       );
@@ -2100,7 +3354,8 @@ export function createVerificationWiring(deps: {
    */
   const judgeVerdict = (entry: PendingEntry, prep: ClaimPreparation, gate: ClaimGate, cfg: RouterConfig): VerificationResult => {
     if (gate.kind === "final") return gate.result;
-    const { strict, retryable } = gate;
+    const { strict } = gate;
+    let retryable = gate.retryable;
     // QA-3.1-2 / QA-3.1-3: the dispatch's own context, recorded when the producer returned.
     const res = applyDispatchCaveats(
       lineageDowngrade(gate.res, { orchestratorSessionID: entry.orchestratorSessionID, root: prep.root, dispatchedAt: entry.dispatchedAt, strictUnverifiable: strict }),
@@ -2117,6 +3372,27 @@ export function createVerificationWiring(deps: {
           ...verdict,
           ...(outcome === "pass" ? { pass: false, outcome: "unverifiable" as const } : {}),
           caveats: [...(verdict.caveats ?? []), notice],
+        },
+        res.dodSource,
+        strict,
+      ).verdict;
+    }
+    if (prep.linkDrift !== undefined && prep.linkDrift.length > 0) {
+      // Cross-repo P2e.4a (S11, OD-P2e-1): a linked repository not as it was at return never lets a pass stand; it is
+      // unverifiable with one caveat per link. A fail stays a fail and carries the caveats too. They are reasons as well, so the
+      // report (formatVerifyReport: a verdict not accepted shows its reasons) names them.
+      const caveats = prep.linkDrift.map(link => LINK_DRIFT_CAVEAT[link.why](link.name, link.root));
+      const outcome = verdict.outcome ?? (verdict.pass ? "pass" : "fail");
+      // P2e QA-1 #5a: a would-be pass held back only by links that could not be observed (a snapshot not in time, a link that
+      // cannot be resolved now) is transient: retryable, so the handle stays open for another router_verify. A changed link
+      // is certain: final. A fail stays final.
+      if (outcome === "pass" && prep.linkDrift.every(link => link.why === "unobserved")) retryable = true;
+      verdict = gateResult(
+        {
+          ...verdict,
+          ...(outcome === "pass" ? { pass: false, outcome: "unverifiable" as const } : {}),
+          reasons: [...verdict.reasons, ...caveats],
+          caveats: [...(verdict.caveats ?? []), ...caveats],
         },
         res.dodSource,
         strict,
@@ -2233,8 +3509,10 @@ export function createVerificationWiring(deps: {
       // 4. Every preparation first, then every gate at once: the testsPass requests share the
       //    deadline and reach the S5 coordinator together (one window, one batch).
       const snapshots = new Map<string, Promise<TreeSnapshot | undefined>>();
+      // P3c.4 (SD-P3c-8): W's dependency targets, read once per W for this call's entries.
+      const dependencies: DependencyMemo = new Map();
       // QA-3.1-8: the current-tree snapshot at the configured priority; a background run's always low.
-      const preparations = claims.map(c => prepareClaim(c.entry, owned, snapshots, budget.lowPriority || options.background === true));
+      const preparations = claims.map(c => prepareClaim(c.entry, owned, snapshots, budget.lowPriority || options.background === true, dependencies));
       const allPrepared = Promise.allSettled(preparations);
       const gates = claims.map(async (c, i): Promise<{ readonly prep: ClaimPreparation | undefined; readonly gate: ClaimGate }> => {
         let prep: ClaimPreparation | undefined;
@@ -2410,10 +3688,23 @@ export function createVerificationWiring(deps: {
         stop.abort();
       };
     },
-    async prepareVerification(store, id, childID, cwd, deadline) {
+    async prepareVerification(store, id, childID, cwd, deadline, dispatchStartedAt?: number) {
       const change = await observeChange(store, id, childID, cwd, deadline);
-      const reference = await store.reference(id, deadline?.signal);
-      return { ...change, reference };
+      const captured = await store.reference(id, deadline?.signal);
+      // Cross-repo P2d.3 (P2.6): the pins of the admitted link targets travel with a captured reference (required gate only).
+      const pins = captured.kind === "captured" ? await linkPinsAtGate(store, id, deadline) : [];
+      // QA-2 nit: the gate took the dispatch's pins (or its reference was discarded): free them.
+      freeLinkPins(id, pins);
+      const reference: ReferenceState = pins.length > 0 && captured.kind === "captured"
+        ? { kind: "captured", reference: { ...captured.reference, pins } }
+        : captured;
+      // Cross-repo P3a (D23 as amended, QA C1): the dispatch start the caller holds (DispatchStart.dispatchedAt), the `since` of
+      // W's ignored-module listing. Unknown: none listed (toward zero selection, never toward a stale build output).
+      return {
+        ...change,
+        reference,
+        ...(dispatchStartedAt !== undefined && Number.isFinite(dispatchStartedAt) ? { dispatchStartedAt } : {}),
+      };
     },
     graderSessions,
     disposeChildSession,

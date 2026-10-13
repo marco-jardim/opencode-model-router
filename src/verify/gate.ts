@@ -18,19 +18,105 @@
  *    deps; this module imports no fs/network/SDK.
  */
 import type { Verdict } from "./types";
-import type { DeterministicDeps } from "./types";
+import type { CheckPlacement, DeterministicDeps } from "./types";
 import type { DoD } from "./dod";
 import { isCheckable } from "./dod";
 import { runDeterministic } from "./deterministic";
 import { incompleteVerdict, isIncompleteVerdict, runChecker } from "./checker";
 import type { ArtefactView, CheckerDeps } from "./checker";
 import type { BudgetSnapshot } from "../guard/enforce";
-import { isAbsolute } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { isWithinDir, resolveBaseDir } from "./paths";
+import { toolLabel } from "./dispatch";
+import { perimeterKey } from "./git-top";
+import { crossLinkAliases } from "./perimeter";
+import { displaySafe } from "../routing/roles/read-set";
+
+/** Cross-repo P3 QA-1 M5: the longest repository text (a name or a root) the verified-scope line quotes; past it, cut with "…". */
+export const SCOPE_TEXT_MAX = 256;
+
+/**
+ * Cross-repo P3 QA-1 M5: repository text (a perimeter root's name or path, read from a manifest or the file system) as the
+ * verified-scope line quotes it: capped at SCOPE_TEXT_MAX characters (never splitting a surrogate pair), then escaped.
+ */
+function scopeText(text: string): string {
+  let shown = text;
+  if (shown.length > SCOPE_TEXT_MAX) {
+    let end = SCOPE_TEXT_MAX - 1;
+    const last = shown.charCodeAt(end - 1);
+    if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+    shown = `${shown.slice(0, end)}…`;
+  }
+  return displaySafe(shown);
+}
+
+/** How many outside paths the mixed-change-set reason names before "and N more". */
+const MAX_OUTSIDE_LISTED = 5;
+
+/** Cross-repo P1.8: one repository of a perimeter, as the gate names it. */
+export interface PerimeterRepo {
+  readonly root: string;
+  readonly name: string;
+  readonly branch?: string;
+  readonly head?: string;
+}
+
+/**
+ * Cross-repo P1.8: an extra root of P and its change since the dispatch. "unobserved": no snapshot at either end, past the cap,
+ * or a perimeter that could not be planned (I4 refuses it when writers ran). "unadmitted" (QA-1 F4): a linked directory whose
+ * repository is not admitted, or that is not a git repository; never snapshotted, and only named in I8.
+ */
+export interface PerimeterRoot extends PerimeterRepo {
+  readonly status: "changed" | "unchanged" | "unobserved" | "unadmitted";
+  /** QA-1 F11: a worktree of W's own repository; I4 suggests `branch=<branch>` rather than `repo=<name>`. */
+  readonly sameRepository?: boolean;
+}
+
+/** QA-1 F10: the name of the placeholder root a perimeter that could not be planned holds (fail closed). */
+export const PERIMETER_UNPLANNED = "perimeter could not be planned";
+
+/** Cross-repo P1.8 (I8): the perimeter P of a dispatch: W, then its other roots (at least one). */
+export interface PerimeterObservation {
+  readonly w: PerimeterRepo;
+  readonly roots: readonly PerimeterRoot[];
+  /**
+   * Cross-repo P2b.3 (D6): working-set worktrees other than W whose `node_modules` link into W, found by `discoverConsumers`.
+   * Absent or empty: none known, no consumer caveat. Cross-repo P3c.5 (SD-P3c-5, F6): a `node_modules` consumer carries its
+   * link `entry`; one whose declared dependency edge leads into W carries `via` instead (the declaring file and its fixed label).
+   */
+  readonly consumers?: readonly { readonly root: string; readonly name?: string; readonly entry?: string; readonly via?: string }[];
+  /**
+   * Cross-repo QA-2 #2: working-set worktrees whose consumer discovery stopped on its entry budget before it finished. A
+   * repository there may link W unchecked, so a would-be pass with a change carries a caveat per entry.
+   */
+  readonly consumersIncomplete?: readonly { readonly root: string; readonly name?: string }[];
+}
 
 /** The concrete, inspectable result of a delegation (artefact contract §3.3). */
 export interface Artefact {
   changeBaseline?: "available" | "unavailable";
+  /**
+   * The git top-level the change set was observed in (snapshot.root). Paths outside it (absolute, or relative ones that climb
+   * out with `..`), mixed with paths inside, make the verdict unverifiable (S4/F3). Absent: the effective base directory stands
+   * in for it.
+   */
+  changeRoot?: string;
+  /**
+   * I7 (P0.2, S9/S12): the working tree switched branch during the dispatch or since the producer returned; the reason, worded
+   * by the wiring (branch.ts branchSwitchReason / branchUnconfirmedReason). Present: the verdict is unverifiable with it on
+   * either verifier and nothing runs, since the change set and the checks would describe another branch.
+   */
+  branchSwitch?: string;
+  /**
+   * I5 (P0.3, S1/S3/S10): tools the producer lineage ran that can write files the router cannot observe (dispatch.ts
+   * isUnattributedWriter), sorted. With an empty, available change set, a pass carries a caveat and is never a verified pass.
+   */
+  unattributedWriters?: string[];
+  /**
+   * Cross-repo P1.8 (I4, I8): the perimeter P the wiring observed (wiring.ts observeChange): W, then each extra root with its
+   * change status since the dispatch. Absent: the dispatch has no perimeter (one repository), and nothing below changes.
+   */
+  perimeter?: PerimeterObservation;
   changedFiles: { path: string; status: string }[];
   finalReturnText: string;
   declaredOutputs: string[];
@@ -79,6 +165,16 @@ export interface Delegation {
    * the refusal names neither.
    */
   cwdSource?: "argument" | "acceptance";
+  /**
+   * Cross-repo P2.4: where each check of `dod.checks` runs, index-aligned (undefined: no `cwd=`/`scope=` key). Absent: every
+   * check runs in the base directory, and nothing below changes.
+   */
+  checkPlacements?: readonly (CheckPlacement | undefined)[];
+  /**
+   * Cross-repo P2.4 (SD4): the first check whose `cwd=` is outside the work root and its read set (`why: "outside"`) or whose
+   * `scope=` is not affected/full (`why: "scope"`); `index` is 0-based. With it the gate refuses (unverifiable, nothing runs).
+   */
+  refusedCheck?: { readonly index: number; readonly kind: string; readonly text: string; readonly why: "outside" | "scope" | "tier" };
 }
 
 export interface GateDeps {
@@ -243,37 +339,165 @@ export async function accept(
   // QA-P33F1-1-2: the caller decided containment with P2.3's rule (routing/roles/work-root.ts verificationScope); a refused cwd
   // is never resolved here (a UNC/device path reaches no filesystem call).
   if (workRoot !== undefined && delegation.refusedCwd !== undefined) return refuseCwd(delegation.refusedCwd);
+  // Cross-repo P2.4 (SD4): a check's `cwd=` outside the work root and its read set, or a `scope=` that is neither affected nor
+  // full: nothing runs, whichever verifier the DoD names.
+  if (delegation.refusedCheck !== undefined) {
+    const { index, kind, text, why } = delegation.refusedCheck;
+    // OD1=B: a tier dispatch (no routed role) honours no per-check `cwd=`; `text` is the cwd as written.
+    const reason = why === "outside"
+      ? `check ${index + 1} (${kind}) cwd=${text} is outside the work root ${workRoot ?? deps.deterministic.cwd} and its read set; nothing ran`
+      : why === "tier"
+        ? `check ${index + 1} (${kind}) cwd=${text}: a per-check cwd= is honoured only in roles mode; nothing ran`
+        : `check ${index + 1} (${kind}) scope=${text} is not affected or full; nothing ran`;
+    return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] }, dodSource, deps.strictUnverifiable);
+  }
   const effectiveBaseDir = resolveBaseDir(
     delegation.cwd,
     workRoot ?? deps.deterministic.cwd,
   );
   // Backstop for a caller that did not check its cwd: lexical only (no filesystem call); a checked canonical cwd always passes.
   if (workRoot !== undefined && !isWithinDir(effectiveBaseDir, workRoot)) return refuseCwd(effectiveBaseDir);
+  // I7 (P0.2, S9/S12): the verified tree switched branch. The change set and either verifier would describe another branch, so
+  // nothing runs; before the all-outside and mixed checks, whose reasons would then be about the wrong change set.
+  if (artefact.branchSwitch !== undefined) {
+    const reason = artefact.branchSwitch;
+    return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] }, dodSource, deps.strictUnverifiable);
+  }
+  // I4 (cross-repo P1.8): another repository of the perimeter changed during the dispatch (or could not be observed: fail
+  // closed), and the producer ran a tool whose writes cannot be attributed. The checks here cannot cover a write there.
+  const perimeterRefusal = perimeterChangeReasons(artefact, artefact.perimeter?.w.root ?? artefact.changeRoot ?? effectiveBaseDir);
+  if (perimeterRefusal.length > 0) {
+    return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: perimeterRefusal, caveats: perimeterRefusal }, dodSource, deps.strictUnverifiable);
+  }
   const canonical = deps.canonicalPath ?? ((path: string) => path);
+  // S4/F3: some changes inside the change root and some absolute ones outside it. Neither verifier can see the outside ones
+  // (the runner drops them with a note; the grader checks against, and runs in, the working directory), so the change set
+  // cannot be verified as a whole. A relative path is root-relative, hence inside unless it climbs out (`../x`). The root is
+  // the observed git top-level, else the base directory.
+  const refuseMixedOutside = (): GateResult | undefined => {
+    // No absolute path and no `..` segment: nothing can be outside, and no canonicalisation (a filesystem call) is needed.
+    if (!artefact.changedFiles.some(({ path }) => isAbsolute(path) || path.split(/[\\/]/).includes(".."))) return undefined;
+    const root = artefact.changeRoot ?? effectiveBaseDir;
+    const canonicalRoot = canonical(root);
+    const outsideRoot = artefact.changedFiles
+      .map(({ path }) => path)
+      .filter(path => !isWithinDir(canonical(isAbsolute(path) ? path : resolve(root, path)), canonicalRoot));
+    if (outsideRoot.length === 0 || outsideRoot.length === artefact.changedFiles.length) return undefined;
+    const listed = outsideRoot.slice(0, MAX_OUTSIDE_LISTED).join(", ")
+      + (outsideRoot.length > MAX_OUTSIDE_LISTED ? ` and ${outsideRoot.length - MAX_OUTSIDE_LISTED} more` : "");
+    const reason = `the producer also changed files outside ${root}: ${listed}; checks scoped to ${root} cannot see them, so the change set cannot be verified as a whole. Verify those paths in their own repository, or dispatch that work separately.`;
+    return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] }, dodSource, deps.strictUnverifiable);
+  };
+
+  // Every change is outside the base directory (neither verifier can see any of them): an absolute path outside the canonical
+  // base, or a relative one that climbs out of it (`../x`, resolved against the base). Same refusal for both verifiers (C1).
+  const refuseAllOutside = (): GateResult | undefined => {
+    if (artefact.changedFiles.length === 0) return undefined;
+    // No absolute path and no `..` segment: nothing can be outside, and no canonicalisation (a filesystem call) is needed.
+    if (!artefact.changedFiles.some(({ path }) => isAbsolute(path) || path.split(/[\\/]/).includes(".."))) return undefined;
+    const canonicalBase = canonical(effectiveBaseDir);
+    const isOutside = (path: string): boolean => {
+      if (isAbsolute(path)) return !isWithinDir(canonical(path), canonicalBase);
+      // A relative path without a `..` segment cannot leave the base: no canonicalisation (a filesystem call) is needed.
+      if (!path.split(/[\\/]/).includes("..")) return false;
+      return !isWithinDir(canonical(resolve(effectiveBaseDir, path)), canonicalBase);
+    };
+    if (!artefact.changedFiles.every(({ path }) => isOutside(path))) return undefined;
+    // QA-P33F1-1 nit 1: a cwd: narrower than the work root, with work elsewhere in the root → widen (or drop) the cwd:.
+    const narrowed = workRoot !== undefined && !isWithinDir(canonical(workRoot), canonicalBase)
+      && artefact.changedFiles.some(({ path }) => isAbsolute(path) && isWithinDir(canonical(path), canonical(workRoot)));
+    const hint = workRoot === undefined
+      ? `Add "cwd: <dir>" to the [acceptance] block to verify where the work landed.`
+      : narrowed
+        ? `The [acceptance] block's "cwd:" narrows verification to ${effectiveBaseDir} inside the work root ${workRoot}: widen "cwd:" to where the work landed, or remove it (the checks then run in the work root).`
+        : `A role dispatch is verified only inside its work root ${workRoot}: the work belongs there.`;
+    const reason = `the producer changed files only outside ${effectiveBaseDir} (e.g. ${artefact.changedFiles[0].path}); checks run there cannot see them. ${hint}`;
+    return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] }, dodSource, deps.strictUnverifiable);
+  };
+
+  // Cross-repo P2.4 (I3, SD7): with placed checks, every changed path must lie inside some check root: the top of a placed check,
+  // or the change root for an unplaced one (an undefined top covers nothing). Otherwise part of the change is seen by no check.
+  const refuseUncoveredByCheckRoots = (): GateResult | undefined => {
+    const placements = delegation.checkPlacements;
+    if (placements === undefined || !placements.some(placement => placement !== undefined)) return undefined;
+    // QA-3 #1: an unavailable change baseline leaves the change list unknown (often []), not empty.
+    const baselineUnavailable = artefact.changeBaseline === "unavailable";
+    if (artefact.changedFiles.length === 0 && !baselineUnavailable) return undefined;
+    const changeRoot = artefact.changeRoot ?? effectiveBaseDir;
+    const tops: string[] = [];
+    for (let index = 0; index < (dod.checks ?? []).length; index++) {
+      const placement = placements[index];
+      // QA-3 #5: an unplaced check, or a non-foreign placement without a top, runs in (covers) the change root.
+      const top = placement === undefined || (placement.foreign !== true && placement.top === undefined) ? changeRoot : placement.top;
+      if (top !== undefined && !tops.includes(top)) tops.push(top);
+    }
+    // QA round 2 M1: coverage is decided by tops. A placement inside W whose top is a nested repository (submodule, vendored)
+    // does not run in the change root, so it does not cover it (the same placement is refused by I3 when the baseline is known).
+    const canonicalChangeRoot = canonical(changeRoot);
+    const coversChangeRoot = tops.some(top => isWithinDir(canonicalChangeRoot, canonical(top)));
+    if (baselineUnavailable && !coversChangeRoot) {
+      const reason = `the change in the work root could not be observed and no check runs there (${tops.length > 0 ? tops.join(", ") : "no check root"}); nothing ran`;
+      return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] }, dodSource, deps.strictUnverifiable);
+    }
+    if (artefact.changedFiles.length === 0) return undefined;
+    const canonicalTops = tops.map(top => canonical(top));
+    const uncovered = artefact.changedFiles
+      .map(({ path }) => path)
+      .filter(path => {
+        const absolute = canonical(isAbsolute(path) ? path : resolve(changeRoot, path));
+        return !canonicalTops.some(top => isWithinDir(absolute, top));
+      });
+    if (uncovered.length === 0) return undefined;
+    const listed = uncovered.slice(0, MAX_OUTSIDE_LISTED).join(", ")
+      + (uncovered.length > MAX_OUTSIDE_LISTED ? ` and ${uncovered.length - MAX_OUTSIDE_LISTED} more` : "");
+    const reason = `the change in ${listed} is not covered by any check root (${tops.length > 0 ? tops.join(", ") : "no check root"}); nothing ran`;
+    return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] }, dodSource, deps.strictUnverifiable);
+  };
 
   let verdict: Verdict;
   if (dod.kind === "deterministic") {
-    const canonicalBase = canonical(effectiveBaseDir);
-    if (artefact.changedFiles.length > 0 && artefact.changedFiles.every(
-      ({ path }) => isAbsolute(path) && !isWithinDir(canonical(path), canonicalBase),
-    )) {
-      // QA-P33F1-1 nit 1: a cwd: narrower than the work root, with work elsewhere in the root → widen (or drop) the cwd:.
-      const narrowed = workRoot !== undefined && !isWithinDir(canonical(workRoot), canonicalBase)
-        && artefact.changedFiles.some(({ path }) => isWithinDir(canonical(path), canonical(workRoot)));
-      const hint = workRoot === undefined
-        ? `Add "cwd: <dir>" to the [acceptance] block to verify where the work landed.`
-        : narrowed
-          ? `The [acceptance] block's "cwd:" narrows verification to ${effectiveBaseDir} inside the work root ${workRoot}: widen "cwd:" to where the work landed, or remove it (the checks then run in the work root).`
-          : `A role dispatch is verified only inside its work root ${workRoot}: the work belongs there.`;
-      const reason = `the producer changed files only outside ${effectiveBaseDir} (e.g. ${artefact.changedFiles[0].path}); checks run there cannot see them. ${hint}`;
-      return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] }, dodSource, deps.strictUnverifiable);
-    }
+    const allOutside = refuseAllOutside();
+    if (allOutside) return allOutside;
+    const mixed = refuseMixedOutside();
+    if (mixed) return mixed;
+    const uncovered = refuseUncoveredByCheckRoots();
+    if (uncovered) return uncovered;
+    const placements = delegation.checkPlacements;
+    // F7: a check placed in another repository resolves relative changed paths against its own cwd, which is not where they were
+    // observed: with such a check, hand the runner absolute paths (against the change root).
+    const changed = deps.deterministic.changedFiles;
+    const hasForeign = placements?.some(placement => placement?.foreign === true) === true;
+    const changeRoot = artefact.changeRoot ?? effectiveBaseDir;
     verdict = await runDeterministic(dod, {
       ...deps.deterministic,
       cwd: effectiveBaseDir,
+      ...(hasForeign && changed !== undefined && changed !== "unavailable"
+        ? {
+          changedFiles: changed.map(file => ({
+            ...file,
+            path: isAbsolute(file.path) ? file.path : resolve(changeRoot, file.path),
+            ...(file.previousPath !== undefined
+              ? { previousPath: isAbsolute(file.previousPath) ? file.previousPath : resolve(changeRoot, file.previousPath) }
+              : {}),
+          })),
+        }
+        : {}),
+      ...(placements !== undefined ? { placements } : {}),
+      // Cross-repo P3a (SD-P3a-5, -10): with a foreign placement (v2 roles only), W's git top and the consumer link spellings of
+      // it, for a consumer testsPass with an explicit scope=affected (deterministic.ts). Never set without a foreign placement.
+      ...(hasForeign
+        ? {
+          changeRoot,
+          crossLinkAliases: deps.deterministic.crossLinkAliases ?? ((consumerCwd: string) => crossLinkAliases(consumerCwd, changeRoot)),
+        }
+        : {}),
     });
   } else {
     // "checker" is the only remaining checkable kind.
+    const allOutside = refuseAllOutside();
+    if (allOutside) return allOutside;
+    const mixed = refuseMixedOutside();
+    if (mixed) return mixed;
     verdict = await runChecker(
       {
         criteria: dod.criteria,
@@ -291,5 +515,114 @@ export async function accept(
     );
   }
 
+  // I5 (P0.3): nothing observed changed, but the producer ran a tool whose writes the router cannot see. The checks passed on
+  // a tree that may not hold the producer's work, so the pass is not a verified pass.
+  const writers = artefact.unattributedWriters ?? [];
+  if (writers.length > 0 && artefact.changeBaseline === "available" && artefact.changedFiles.length === 0
+    && (verdict.outcome ?? (verdict.pass ? "pass" : "fail")) === "pass") {
+    const caveat = unattributedWritersCaveat(artefact.changeRoot ?? effectiveBaseDir, writers);
+    verdict = { ...verdict, pass: false, outcome: "unverifiable", reasons: [...verdict.reasons, caveat], caveats: [...(verdict.caveats ?? []), caveat] };
+  }
+  // D6 (cross-repo P2b.4, OD2): a would-be pass with a change, where a working-set worktree links this work root (a consumer) and
+  // no testsPass/buildPasses/lintClean/run check is placed in it: nothing ran there, so the pass is not a verified pass.
+  const consumerCaveats = unverifiedConsumerCaveats(artefact, dod, delegation.checkPlacements);
+  if (consumerCaveats.length > 0 && (verdict.outcome ?? (verdict.pass ? "pass" : "fail")) === "pass") {
+    verdict = { ...verdict, pass: false, outcome: "unverifiable", reasons: [...verdict.reasons, ...consumerCaveats], caveats: [...(verdict.caveats ?? []), ...consumerCaveats] };
+  }
+  // I8 (cross-repo P1.8): a pass names the perimeter it was scoped to. Evidence only: the outcome is unchanged. QA-1 F6: a pass
+  // renders its notes, not its reasons (buildAcceptedSuffix), so the line is a note too; a note never makes the pass unverified.
+  if (artefact.perimeter !== undefined && artefact.perimeter.roots.length > 0
+    && (verdict.outcome ?? (verdict.pass ? "pass" : "fail")) === "pass") {
+    const scope = verifiedScopeLine(artefact.perimeter);
+    verdict = { ...verdict, reasons: [...verdict.reasons, scope], notes: [...(verdict.notes ?? []), scope] };
+  }
+
   return gateResult(verdict, dodSource, deps.strictUnverifiable);
+}
+
+/** OD2: the check kinds that exercise a consumer; `fileExists` and `schemaMatch` do not. */
+const CONSUMER_CHECK_KINDS: ReadonlySet<string> = new Set(["testsPass", "buildPasses", "lintClean", "run"]);
+
+/**
+ * D6 (cross-repo P2b.4, OD2): one caveat per consumer of W (artefact.perimeter.consumers) that no consumer check is placed in
+ * (placement.top equals the consumer root, `perimeterKey` normalisation). [] when there is no perimeter, no consumer, or the
+ * change set is empty.
+ */
+function unverifiedConsumerCaveats(
+  artefact: Artefact,
+  dod: DoD,
+  placements: readonly (CheckPlacement | undefined)[] | undefined,
+): string[] {
+  // QA-3 #1: an unavailable change baseline counts as a non-empty change set (the change is unknown, not absent).
+  if (artefact.changedFiles.length === 0 && artefact.changeBaseline !== "unavailable") return [];
+  const consumers = artefact.perimeter?.consumers ?? [];
+  const checks = dod.kind === "deterministic" ? dod.checks ?? [] : [];
+  const covered = new Set<string>();
+  checks.forEach((check, index) => {
+    const top = placements?.[index]?.top;
+    if (top !== undefined && CONSUMER_CHECK_KINDS.has(check.kind)) covered.add(perimeterKey(top));
+  });
+  // Cross-repo P3c.5 (SD-P3c-5, F6): a `node_modules` consumer keeps its pinned `(node_modules/<entry>)` literal; an edge consumer
+  // reads `(<via>)`, the declaring file and its fixed label through `displaySafe` (the raw spec is never echoed).
+  const linkOf = (consumer: { readonly entry?: string; readonly via?: string }): string =>
+    consumer.entry !== undefined || consumer.via === undefined
+      ? `links this work root (node_modules/${consumer.entry})`
+      : `links this work root (${displaySafe(consumer.via)})`;
+  const unchecked = consumers
+    .filter(consumer => !covered.has(perimeterKey(consumer.root)))
+    .map(consumer => `${consumer.name ?? consumer.root} at ${consumer.root} ${linkOf(consumer)} and no check ran there; add a check such as: check: testsPass cwd="${consumer.root}" scope=full`);
+  // QA-2 #2: discovery stopped on its budget; a repository there may link this work root unchecked.
+  // QA round 2 M2: cleared by the same coverage as a consumer (a consumer check placed with its top equal to that root).
+  const incomplete = (artefact.perimeter?.consumersIncomplete ?? [])
+    .filter(entry => !covered.has(perimeterKey(entry.root)))
+    .map(entry => `consumer discovery stopped before finishing ${entry.name ?? entry.root} at ${entry.root}; a repository there may link this work root unchecked; add a check such as: check: testsPass cwd="${entry.root}" scope=full`);
+  return [...unchecked, ...incomplete];
+}
+
+/** I5 (P0.3): the caveat for an empty change set when the producer ran tools whose writes the router cannot observe. */
+export function unattributedWritersCaveat(root: string, writers: readonly string[]): string {
+  return `no change was observed in ${root} but the producer ran ${listedTools(writers)}; a write those tools made cannot be seen, so this is not a verified pass`;
+}
+
+/** At most MAX_OUTSIDE_LISTED tool names, sanitised (toolLabel), then "and N more". */
+function listedTools(writers: readonly string[]): string {
+  return writers.slice(0, MAX_OUTSIDE_LISTED).map(toolLabel).join(", ")
+    + (writers.length > MAX_OUTSIDE_LISTED ? ` and ${writers.length - MAX_OUTSIDE_LISTED} more` : "");
+}
+
+/**
+ * I4 (cross-repo P1.8): one unverifiable reason per extra root of the perimeter that changed during the dispatch, or whose
+ * snapshot was unavailable at either end (fail closed), when the producer lineage ran an unattributable writer; [] otherwise.
+ * `w` names where the checks run.
+ */
+export function perimeterChangeReasons(artefact: Pick<Artefact, "perimeter" | "unattributedWriters">, w: string): string[] {
+  const writers = artefact.unattributedWriters ?? [];
+  if (artefact.perimeter === undefined || writers.length === 0) return [];
+  const tools = listedTools(writers);
+  return artefact.perimeter.roots.filter(root => root.status === "changed" || root.status === "unobserved").map(root => {
+    if (root.name === PERIMETER_UNPLANNED) {
+      return `the verification ${PERIMETER_UNPLANNED} when the dispatch started, and the producer ran ${tools}; a write in another repository cannot be ruled out, so the checks in ${w} do not cover it. Re-dispatch, or verify it there.`;
+    }
+    const what = root.status === "changed" ? "also changed during the dispatch" : "could not be observed during the dispatch";
+    // QA-1 F11: another worktree of W's own repository is reached by its branch, not by the repository's name.
+    const target = root.sameRepository === true && root.branch !== undefined ? `branch=${root.branch}` : `repo=${root.name}`;
+    return `the repository ${root.name} at ${root.root} ${what}, and the producer ran ${tools}; a write there cannot be attributed, so the checks in ${w} do not cover it. Dispatch that work with ${target}, or verify it there.`;
+  });
+}
+
+/**
+ * I8 (cross-repo P1.8): the evidence line of a pass whose perimeter holds more than W. QA-1 F6 (I4 "otherwise → a note"): a root
+ * that changed without an unattributable writer is shown as changed.
+ */
+export function verifiedScopeLine(perimeter: PerimeterObservation): string {
+  // P3 QA-1 M5: a name, a branch and a head come from the repositories (a manifest, a file system): escaped and capped.
+  const show = (repo: PerimeterRepo, suffix = ""): string =>
+    `${scopeText(repo.name)} (${scopeText(repo.branch ?? "detached")} @ ${repo.head !== undefined && repo.head !== "" ? scopeText(repo.head.slice(0, 7)) : "unknown"}${suffix})`;
+  const others = perimeter.roots.map(root => {
+    if (root.name === PERIMETER_UNPLANNED) return PERIMETER_UNPLANNED;
+    if (root.status === "unadmitted") return `${scopeText(root.name)} (not admitted)`;
+    if (root.status === "unobserved") return `${scopeText(root.name)} (not observed)`;
+    return root.status === "changed" ? show(root, ", changed during the dispatch") : show(root);
+  });
+  return `verified scope: ${show(perimeter.w)}; also observed: ${others.join(", ")}`;
 }

@@ -25,6 +25,7 @@ import {
   refreshPendingClaims,
   releasePendingClaim,
   resolvePendingJournalDir,
+  type PendingEntry,
   type PendingRecord,
   type PendingRegistration,
   type PendingRegistryOptions,
@@ -842,6 +843,98 @@ function registration(n: number, session = "p1", over: Partial<PendingRegistrati
 async function flushMicrotasks(): Promise<void> {
   for (let i = 0; i < 10; i += 1) await Promise.resolve();
 }
+
+describe("pending registry: the cross-repo registration fields survive a restart", () => {
+  const tree = { head: "0123456789abcdef0123456789abcdef01234567", branch: "feat/x", root: "/repo", reflog: 7 };
+  const placements = [undefined, { cwd: "/repo/pkg", top: "/repo", foreign: false, scope: "full" as const }];
+
+  /** Registers one entry (with `extra`) on a journaled registry, restores its records into a fresh one, returns that entry. */
+  async function roundTrip(extra: Partial<PendingRegistration>): Promise<PendingEntry> {
+    const mem = memoryJournal();
+    const first = registry({ now: () => NOW, persist: mem.journal });
+    const r = first.register(registration(1, "p1", extra));
+    if (!r.ok) throw new Error(r.detail);
+    await flushMicrotasks();
+    const second = registry({ now: () => NOW });
+    expect(second.restore(mem.records, { now: NOW })).toEqual({ restored: 1, expiredHeld: 0, dropped: 0 });
+    const found = second.get("p1", r.handle);
+    if (found.kind !== "found") throw new Error("not restored");
+    return found.entry;
+  }
+
+  it("returnedTree round-trips through pending.jsonl", async () => {
+    expect((await roundTrip({ returnedTree: tree })).returnedTree).toEqual(tree);
+    const detached = { head: "0123456789abcdef0123456789abcdef01234567", branch: null };
+    expect((await roundTrip({ returnedTree: detached })).returnedTree).toEqual(detached);
+  });
+
+  it("unattributedWriters round-trips through pending.jsonl", async () => {
+    expect((await roundTrip({ unattributedWriters: ["bash", "router_run"] })).unattributedWriters).toEqual(["bash", "router_run"]);
+  });
+
+  it("placements round-trip through pending.jsonl, an empty slot included", async () => {
+    expect((await roundTrip({ placements })).placements).toEqual(placements);
+  });
+
+  it.each([
+    ["returnedTree", { returnedTree: { head: 7 } }],
+    ["returnedTree", { returnedTree: { head: "h", branch: 3 } }],
+    ["returnedTree", { returnedTree: { head: "h", reflog: -1 } }],
+    ["unattributedWriters", { unattributedWriters: ["bash", ""] }],
+    ["unattributedWriters", { unattributedWriters: "bash" }],
+    ["placements", { placements: [{ cwd: "/repo", foreign: "no" }] }],
+    ["placements", { placements: [{ cwd: "/repo", top: "/repo", foreign: false, scope: "some" }] }],
+    ["hadPerimeter", { hadPerimeter: "yes" }],
+  ])("an entry record with an invalid %s is dropped at restore", async (_field, patch) => {
+    const mem = memoryJournal();
+    const first = registry({ now: () => NOW, persist: mem.journal });
+    const r = first.register(registration(1));
+    if (!r.ok) throw new Error(r.detail);
+    await flushMicrotasks();
+    const records = mem.records.map((record) => (record.kind === "entry" ? { ...record, ...patch } : record));
+    const second = registry({ now: () => NOW });
+    expect(second.restore(records, { now: NOW })).toEqual({ restored: 0, expiredHeld: 0, dropped: 1 });
+    expect(second.listUnverified("p1")).toEqual([]);
+  });
+
+  it("an entry record with hadPerimeter restores as perimeterLost, and a compaction keeps the flag", async () => {
+    const mem = memoryJournal();
+    const first = registry({ now: () => NOW, persist: mem.journal });
+    const r = first.register(registration(1));
+    if (!r.ok) throw new Error(r.detail);
+    await flushMicrotasks();
+    const records = mem.records.map((record) => (record.kind === "entry" ? { ...record, hadPerimeter: true } : record));
+    const again = memoryJournal();
+    const second = registry({ now: () => NOW, persist: again.journal });
+    expect(second.restore(records, { now: NOW }).restored).toBe(1);
+    const found = second.get("p1", r.handle);
+    if (found.kind !== "found") throw new Error("not restored");
+    expect(found.entry.perimeterLost).toBe(true);
+    expect(found.entry.perimeter).toBeUndefined();
+    const third = registry({ now: () => NOW });
+    third.restore(second.persistedRecords(), { now: NOW });
+    const kept = third.get("p1", r.handle);
+    expect(kept.kind === "found" ? kept.entry.perimeterLost : kept.kind).toBe(true);
+  });
+
+  it("an entry record written before these fields were journaled restores without them", async () => {
+    const mem = memoryJournal();
+    const first = registry({ now: () => NOW, persist: mem.journal });
+    const r = first.register(registration(1));
+    if (!r.ok) throw new Error(r.detail);
+    await flushMicrotasks();
+    const entry = mem.records.find((record) => record.kind === "entry");
+    for (const key of ["returnedTree", "unattributedWriters", "placements", "hadPerimeter"]) expect(entry).not.toHaveProperty(key);
+    const second = registry({ now: () => NOW });
+    expect(second.restore(mem.records, { now: NOW })).toEqual({ restored: 1, expiredHeld: 0, dropped: 0 });
+    const found = second.get("p1", r.handle);
+    if (found.kind !== "found") throw new Error("not restored");
+    expect(found.entry.returnedTree).toBeUndefined();
+    expect(found.entry.unattributedWriters).toBeUndefined();
+    expect(found.entry.placements).toBeUndefined();
+    expect(found.entry.perimeterLost).toBeUndefined();
+  });
+});
 
 describe("pending registry: restart restores what the journal wrote (R19, R20)", () => {
   it("a restart with 3 open handles reloads them, verifiable through markVerifying", async () => {

@@ -643,6 +643,12 @@ export interface VerificationBaseline {
   readonly reference: ReferenceState;
   /** Every file the child changed in that attempt and every later one under the block; "unavailable" once any set was unknown. */
   readonly changed: readonly ChangedFile[] | "unavailable";
+  /** The tree the introducing attempt was gated on (`branch` absent: unknown; null: detached). Absent: no snapshot at that gate. */
+  readonly tree?: { readonly head: string; readonly branch?: string | null; readonly root?: string };
+  /** A branch-switch reason already found in an earlier attempt of this lineage; carried attempts inherit it. */
+  readonly switched?: string;
+  /** I5 (P0.3): tools the lineage ran whose writes the router cannot observe (sorted); carried attempts are judged with them. */
+  readonly writers?: readonly string[];
 }
 
 export interface DispatchInput {
@@ -810,6 +816,11 @@ function frozenVerification(v: CarriedVerification): CarriedVerification {
       baseline: Object.freeze({
         reference: v.baseline.reference,
         changed: v.baseline.changed === "unavailable" ? "unavailable" as const : Object.freeze(v.baseline.changed.map((f) => Object.freeze({ ...f }))),
+        ...(v.baseline.tree === undefined ? {} : { tree: Object.freeze({ head: v.baseline.tree.head,
+          ...(v.baseline.tree.branch === undefined ? {} : { branch: v.baseline.tree.branch }),
+          ...(v.baseline.tree.root === undefined ? {} : { root: v.baseline.tree.root }) }) }),
+        ...(v.baseline.switched === undefined ? {} : { switched: v.baseline.switched }),
+        ...(v.baseline.writers === undefined ? {} : { writers: Object.freeze([...v.baseline.writers]) }),
       }),
     }),
   });

@@ -290,8 +290,19 @@ function restrict(
   return { actions: kept, notes: [...new Set([...notes, ...extra])], workRoot: root };
 }
 
+/** Cross-repo (P1.4): a grant's repository location travels with its work root, and only with a validated (non-null) one. */
+function locationOf(from: Pick<DispatchGrant, "workRoot" | "location">, workRoot: string | null): Pick<DispatchGrant, "location"> {
+  return workRoot !== null && workRoot === from.workRoot && from.location !== undefined ? { location: from.location } : {};
+}
+
+/** {@link restrict} of a stored grant, keeping its location (P1.4). */
+function withLocation(grant: DispatchGrant, from: DispatchGrant): DispatchGrant {
+  const kept = locationOf(from, grant.workRoot);
+  return kept.location === undefined ? grant : { ...grant, ...kept };
+}
+
 function copyGrant(grant: DispatchGrant): DispatchGrant {
-  return { actions: ordered(grant.actions), notes: [...grant.notes], workRoot: grant.workRoot };
+  return { actions: ordered(grant.actions), notes: [...grant.notes], workRoot: grant.workRoot, ...locationOf(grant, grant.workRoot) };
 }
 
 /**
@@ -303,7 +314,7 @@ function view(binding: Binding, max: ReadonlySet<AuthorityAction>): Binding {
   const { actions, notes, workRoot } = binding.grant;
   return {
     ...binding,
-    grant: restrict(actions, notes, workRoot, max, binding.kind !== "unknown"),
+    grant: withLocation(restrict(actions, notes, workRoot, max, binding.kind !== "unknown"), binding.grant),
     candidates: [...binding.candidates],
   };
 }
@@ -419,7 +430,9 @@ export function registerPending(entry: PendingDispatch): void {
   }
   const keepClaim = previous !== undefined && previous.entry.nonce === entry.nonce;
   if (previous !== undefined && !keepClaim) remember(reg.retired, previous.entry.nonce, now, RETIRED_MAX);
-  const grant: DispatchGrant = { ...copyGrant(entry.grant), workRoot: rootOrNull(entry.grant.workRoot) };
+  const { actions: copiedActions, notes: copiedNotes } = copyGrant(entry.grant);
+  const enteredRoot = rootOrNull(entry.grant.workRoot);
+  const grant: DispatchGrant = { actions: copiedActions, notes: copiedNotes, workRoot: enteredRoot, ...locationOf(entry.grant, enteredRoot) };
   const stored: PendingDispatch = Object.freeze({ ...entry, grant });
   remember(reg.pending, key, { entry: stored, start, claimedBy: keepClaim ? previous.claimedBy : undefined }, Infinity);
   for (const [oldestKey, oldest] of reg.pending) {
@@ -559,7 +572,7 @@ export function widen(
     added.push(action);
   }
   if (added.length > 0) notes.push(BINDING_NOTES.widened(added));
-  const grant: DispatchGrant = { actions: ordered(next), notes: [...new Set(notes)], workRoot: before.workRoot };
+  const grant: DispatchGrant = { actions: ordered(next), notes: [...new Set(notes)], workRoot: before.workRoot, ...locationOf(slot.binding.grant, before.workRoot) };
   remember(reg.bound, childSessionID, { ...slot, binding: { ...slot.binding, grant } }, BOUND_MAX);
   return copyGrant(grant);
 }

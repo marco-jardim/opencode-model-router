@@ -153,6 +153,36 @@ describe("QA-G-A2-2: the repository inspected is the one listed at dispatch", ()
   }, SPAWN_TIMEOUT);
 });
 
+describe("cross-repo P1.5: the binding's repository is the expected one", () => {
+  const callBound = (root: string, repository: string | undefined, dispatchRepository?: string, name = "router_git_ls_files") => {
+    const answer: WorkRootAnswer = repository === undefined ? bind(root) : { role: true, root, repository };
+    const tools = gitTools({ resolveWorkRoot: () => answer, ...(dispatchRepository === undefined ? {} : { dispatchRepository }) });
+    return (tools[name]!.execute as unknown as Execute)({}, context(plain));
+  };
+
+  it("allows a work root of the binding's repository although the dispatch directory is another repository", async () => {
+    expect(await callBound(other, other, bound)).toContain("other.txt");
+    const sibling = join(plain, "sibling");
+    git(other, "worktree", "add", "-q", "--detach", sibling);
+    expect(await callBound(realpathSync.native(sibling), other, bound)).toContain("other.txt");
+  }, SPAWN_TIMEOUT);
+
+  it("without a binding repository, the dispatch directory's repository is still the expected one", async () => {
+    expect(await callBound(other, undefined, bound)).toMatch(/^\[router_git\] error: refused: .*not the repository listed at dispatch/);
+  }, SPAWN_TIMEOUT);
+
+  it("refuses a work root that is not of the binding's repository, and a .git redirected to a third repository", async () => {
+    expect(await callBound(bound, other, bound)).toMatch(/^\[router_git\] error: refused: .*not the repository listed at dispatch/);
+    const sibling = join(plain, "sibling");
+    git(other, "worktree", "add", "-q", "--detach", sibling);
+    const real = realpathSync.native(sibling);
+    rewrite(join(real, ".git"), `gitdir: ${join(bound, ".git")}\n`);
+    const redirected = await callBound(real, other, bound);
+    expect(redirected).toMatch(/^\[router_git\] error: refused: /);
+    expect(redirected).not.toContain("bound.txt");
+  }, SPAWN_TIMEOUT);
+});
+
 describe("QA-G-A2-4: a work root below its checkout's top level", () => {
   it("lists, shows and accepts paths inside the work root only; the checkout's top level and a worktree root work as before", async () => {
     const sub = join(bound, "sub");

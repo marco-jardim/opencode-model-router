@@ -22,12 +22,18 @@ import { REFERENCE_NONE } from "./baseline";
 import { neutralizeDirectives } from "./pending";
 import { withTimeout } from "./timeout";
 import { applyPatchHeaderPaths } from "../router/tool-paths";
+import type { HeadRead } from "./head";
 
 export interface TreeSnapshot {
   cwd: string;
   /** Real path of `git rev-parse --show-toplevel` at capture time. */
   root?: string;
   head: string;
+  /**
+   * I7 (P0.2): the branch checked out at capture (`git symbolic-ref -q HEAD`): its short name (`feat/x`), or null for a
+   * detached HEAD. Absent or undefined: unknown (the command failed, timed out or was aborted). branch.ts compares two.
+   */
+  branch?: string | null;
   fingerprint: string;
   dirty: boolean;
   files: ChangedFile[];
@@ -38,6 +44,12 @@ export interface TreeSnapshot {
    * "unavailable" (over the digest bounds, or unreadable) and absent both mean no per-file proof.
    */
   digests?: ReadonlyMap<string, string> | "unavailable";
+  /**
+   * Cross-repo P2.6 (SD11): a content digest of the repository's ignored files (path, size and content; nothing under a
+   * `node_modules` segment), so a linked package's ignored `dist/` can be pinned. "over-bounds": more files or bytes than the
+   * bounds allow. Absent: not requested (SnapshotOptions.ignoredDigest) or unavailable (any error).
+   */
+  ignored?: string | "over-bounds";
 }
 
 /** QA-2.1-2: the digest of a path that does not exist. */
@@ -56,8 +68,86 @@ export interface DispatchCaptureDeps {
   capture?: (cwd: string, signal: AbortSignal) => Promise<DispatchReference | undefined>;
   /** The reference when `capture` is absent. Default: none (REFERENCE_NONE.notRequested). */
   uncaptured?: ReferenceState;
-  /** Bounds the snapshot and the capture, each (baselineTimeoutMs). */
+  /**
+   * The cheap head-state read (src/verify/head.ts readHead; "none": no repository or an unborn HEAD) the branch-switch rule
+ * compares at the gate. Independent of
+   * the snapshot: a snapshot that failed, timed out or was discarded does not lose it. Absent: no head baseline.
+   */
+  headState?: (cwd: string, signal: AbortSignal) => Promise<HeadRead>;
+  /**
+   * Cross-repo P1.8 (I13): the extra roots of the dispatch's perimeter P, each snapshotted with `snapshot` next to the change
+   * baseline and bounded by `timeoutMs`. Absent: no perimeter, and nothing else is snapshotted (I9).
+   */
+  perimeter?: DispatchPerimeter;
+  /** Cross-repo QA-1 F4 (I11): how an extra root of the perimeter is snapshotted (hardened git). Absent: `snapshot`. */
+  perimeterSnapshot?: (cwd: string, signal: AbortSignal) => Promise<TreeSnapshot | undefined>;
+  /** Bounds the snapshot, the head read and the capture, each (baselineTimeoutMs). */
   timeoutMs: number;
+}
+
+/** Cross-repo P1.8: one extra root of a perimeter, as planned at dispatch (perimeter.ts planPerimeter). */
+export interface PerimeterSeed {
+  /** Where it is snapshotted: a working-set worktree, or the real path of a package link of W. */
+  readonly at: string;
+  /** The repository's name when known (the working-set location's); else the basename of its git top level. */
+  readonly name?: string;
+  /** Link targets only: whether the git top level the snapshot names is admitted (checked at the gate). */
+  readonly admit?: (root: string) => boolean;
+  /**
+   * Cross-repo QA-1: a root that is never snapshotted, and the status the gate reports for it. "unobserved": past PERIMETER_MAX
+   * (F2), or the placeholder of a perimeter that could not be planned (F10); I4 refuses it when writers ran. "unadmitted" (F4):
+   * a linked directory whose repository is not admitted (`routing.repoParents` / `repoDepth` / `repoExclude`) or that is not a
+   * git repository; git never runs there (I11, I12), and I8 names it as not observed.
+   */
+  readonly fixed?: "unobserved" | "unadmitted";
+  /** QA-1 F11: a worktree of W's own repository (the same git common directory): I4 suggests `branch=`, not `repo=`. */
+  readonly sameRepository?: boolean;
+  /**
+   * Cross-repo P2b.3: where the root came from, set by `planPerimeter`: "working-set" (a working-set worktree other than W),
+   * "link" (a package link target of W), "edge" (cross-repo P3c.3, SD-P3c-2: the repository of a declared dependency edge of W
+   * outside `node_modules`, edges.ts; a link and an edge into one repository are one "link" seed). Consumer discovery scans only
+   * the working-set roots. An "edge" seed is observed like a link target (I4, I8) but never pinned (F3).
+   */
+  readonly origin?: "w" | "working-set" | "link" | "edge";
+  /**
+   * Cross-repo QA-1 #9a: a working-set root that is also a package link target of W (the link was de-duplicated into it). It
+   * keeps its working-set semantics (consumer discovery, I13) and is pinned at dispatch like a link target.
+   */
+  readonly linked?: boolean;
+  /**
+   * Cross-repo P3c.3 (SD-P3c-2): a working-set root that a declared dependency edge of W leads into (the edge was de-duplicated
+   * into it). It keeps its working-set semantics; unlike `linked`, it is not pinned (F3).
+   */
+  readonly edged?: true;
+}
+
+/** Cross-repo P1.8: the perimeter P of a dispatch beyond W. */
+export interface DispatchPerimeter {
+  /** W's repository name when the grant's location names it. */
+  readonly name?: string;
+  readonly roots: readonly PerimeterSeed[];
+  /**
+   * Cross-repo P3c.4 (SD-P3c-9): the admission W's package links and declared edges were read with (perimeter.ts
+   * `AdmissionData`: the parents in both spellings, depth, excludes, working set). A deferred perimeter freezes it so that
+   * `router_verify` reads W's dependency targets again as the dispatch did. Absent: none recorded (links only at router_verify).
+   */
+  readonly admission?: {
+    readonly parents: readonly string[];
+    readonly depth: number;
+    readonly exclude?: readonly string[];
+    readonly workingSet: readonly { readonly worktree: string; readonly name?: string }[];
+  };
+}
+
+/** Cross-repo P1.8: the dispatch-time state of one extra root of the perimeter. */
+export interface PerimeterEntry {
+  readonly seed: PerimeterSeed;
+  /** Its dispatch snapshot is in flight. */
+  pending: boolean;
+  /** The first tool whose call may have written into this root while its snapshot was in flight: the snapshot is discarded. */
+  contaminatedBy?: string;
+  /** Settles once, never rejects; undefined when unavailable, timed out or discarded. */
+  snapshot: Promise<TreeSnapshot | undefined>;
 }
 
 function none(reason: string): ReferenceState {
@@ -98,6 +188,54 @@ const NON_WRITING_TOOLS = new Set([
   "list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource",
   "delegate", "router_verify",
 ]);
+/**
+ * P0.3: router tools that only read (copied, not imported: this module takes no plugin SDK; a pin
+ * test compares them with the sources). Exact names: a `context7_*` prefix would also admit a
+ * future write tool.
+ */
+const READ_ONLY_ROUTER_TOOLS = new Set([
+  "router_git_status", "router_git_log", "router_git_diff", "router_git_show", "router_git_blame", "router_git_ls_files",
+  "router_request_authority",
+]);
+const BRAVE_TOOLS = ["web_search", "local_search", "news_search", "image_search", "video_search", "summarizer", "llm_context"]
+  .map(t => `brave_${t}`);
+const READ_ONLY_MCP_TOOLS = new Set([
+  "context7_resolve-library-id", "context7_query-docs", "context7_get-library-docs",
+  // The server may be mounted as `brave` with tools already named `brave_*`.
+  ...BRAVE_TOOLS, ...BRAVE_TOOLS.map(t => `brave_${t}`),
+]);
+
+/** Whether `tool` is known never to write the workspace (case-insensitive). */
+export function isNonWritingTool(tool: string): boolean {
+  const n = tool.toLowerCase();
+  return NON_WRITING_TOOLS.has(n) || READ_ONLY_ROUTER_TOOLS.has(n) || READ_ONLY_MCP_TOOLS.has(n);
+}
+
+/**
+ * P0.3 (invariant I5): a tool that may write but whose writes the router cannot attribute to files
+ * (shells, `router_run`, `execute`, MCP and custom tools). An empty change set from a producer
+ * that ran one of these is not proof that nothing changed.
+ */
+export function isUnattributedWriter(tool: string): boolean {
+  const n = tool.toLowerCase();
+  // F2: a nested child's own writes are attributed to the child's session, not to this producer's lineage, so delegating
+  // tools count as writers here. They stay non-writing for observeEdit (they do not contaminate captures).
+  if (DELEGATING_TOOLS.has(n)) return true;
+  return !WRITE_TOOLS.has(n) && !isNonWritingTool(n);
+}
+
+/** F2: tools that start a child session whose writes are not in the caller's lineage. */
+const DELEGATING_TOOLS = new Set(["task", "delegate", "subagent"]);
+
+/**
+ * Whether a call to `tool` may write the workspace behind the router's back, so that it discards every in-flight snapshot,
+ * capture and link pin. The one rule for both contaminateCaptures and the onUnattributedWriter signal (M3: they must not drift).
+ * A delegating tool never does: its child session is observed on its own, and it writes nothing itself (it is only an
+ * unattributed writer for the producer's empty-change-set caveat, isUnattributedWriter).
+ */
+function mayContaminate(tool: string): boolean {
+  return !isNonWritingTool(tool) && !DELEGATING_TOOLS.has(tool.toLowerCase());
+}
 
 export interface ChangedFile {
   path: string;
@@ -122,7 +260,8 @@ export interface DispatchDelta {
 
 /** Derive a {path,status} record from a write/edit tool call, or null. */
 export function extractChangedFile(tool: string, args: unknown): ChangedFile | null {
-  if (!WRITE_TOOLS.has(tool)) return null;
+  const name = tool.toLowerCase();
+  if (!WRITE_TOOLS.has(name)) return null;
   const a = (args ?? {}) as Record<string, unknown>;
   const path =
     typeof a.filePath === "string"
@@ -133,7 +272,7 @@ export function extractChangedFile(tool: string, args: unknown): ChangedFile | n
           ? a.file
           : "";
   if (!path) return null;
-  const status = tool === "write" ? "written" : "modified";
+  const status = name === "write" ? "written" : "modified";
   return { path, status };
 }
 
@@ -178,6 +317,11 @@ interface DispatchRecord {
   /** QA-3.1-2: this dispatch's lifetime, for concurrentDispatches. */
   window: DispatchWindow;
   snapshot?: TreeSnapshot;
+  /**
+   * The head state read when the dispatch began (branch-switch baseline). Never discarded on contamination: a write does not
+   * change what HEAD was. Resolves undefined when the read failed or timed out; never rejects.
+   */
+  head?: Promise<HeadRead>;
   capturePending: boolean;
   /** An overlapping edit was observed while the capture was in flight: the reference is none. */
   captureContaminated: boolean;
@@ -198,6 +342,15 @@ interface DispatchRecord {
    * gate judges the cumulative change since the reference, not only its own attempt's edits.
    */
   observed: Map<string, ChangedFile>;
+  /** P0.3: the unattributable writers (isUnattributedWriter) of every session in `producers`. */
+  writers: Set<string>;
+  /** Cross-repo P1.8 (I13): the extra roots of the dispatch's perimeter, by snapshot directory; absent: no perimeter. */
+  perimeter?: {
+    readonly name?: string;
+    readonly entries: Map<string, PerimeterEntry>;
+    /** Cross-repo P3c.4: the admission the perimeter was planned with (DispatchPerimeter.admission). */
+    readonly admission?: DispatchPerimeter["admission"];
+  };
 }
 
 /**
@@ -208,16 +361,49 @@ interface DispatchRecord {
 export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
   const now = options.now ?? Date.now;
   const bySession = new Map<string, Map<string, string>>();
+  /** P0.3: per session, the lowercased names of the unattributable writers it ran. */
+  const writersBySession = new Map<string, Set<string>>();
   const lastTouch = new Map<string, number>();
   const dispatches = new Map<string, DispatchRecord>();
 
+  /** Cross-repo QA-2 #9c: subscribers told when a call by an unattributable writer (isUnattributedWriter) is seen. */
+  const unattributedWriterListeners = new Set<(tool: string, sessionID?: string) => void>();
+  function onUnattributedWriter(listener: (tool: string, sessionID?: string) => void): () => void {
+    unattributedWriterListeners.add(listener);
+    return () => {
+      unattributedWriterListeners.delete(listener);
+    };
+  }
+  function notifyUnattributedWriter(tool: string, sessionID?: string): void {
+    // M3: the same rule as contaminateCaptures; a delegating tool counts as a writer for the tally, not for in-flight pins.
+    if (!isUnattributedWriter(tool) || !mayContaminate(tool)) return;
+    for (const listener of [...unattributedWriterListeners]) {
+      try {
+        listener(tool, sessionID);
+      } catch {
+        // a subscriber never breaks the store
+      }
+    }
+  }
+
   function observeEdit(tool: string, cwd?: string): void {
+    notifyUnattributedWriter(tool);
+    contaminateCaptures(tool, cwd);
+  }
+
+  function contaminateCaptures(tool: string, cwd?: string): void {
     // E2E-3: fail closed. Only a tool known not to write leaves an in-flight snapshot or capture alone.
-    if (NON_WRITING_TOOLS.has(tool.toLowerCase())) return;
+    if (!mayContaminate(tool)) return;
     // Unknown directory is conservatively treated as overlapping every capture.
     const overlaps = (other: string) => !cwd || pathKey(cwd) === pathKey(other)
       || pathKey(cwd).startsWith(pathKey(other) + "/") || pathKey(other).startsWith(pathKey(cwd) + "/");
     for (const d of dispatches.values()) {
+      // Cross-repo P1.8: a write that may land in an extra root of the perimeter discards that root's in-flight snapshot.
+      // QA-1 F1: an unattributable writer's directory says nothing about where it writes (router_run's cwd is always W), so it
+      // discards every in-flight perimeter snapshot, whatever its cwd.
+      for (const entry of d.perimeter?.entries.values() ?? []) {
+        if (entry.pending && (isUnattributedWriter(tool) || overlaps(entry.seed.at))) entry.contaminatedBy ??= tool;
+      }
       if (!overlaps(d.cwd)) continue;
       if (d.snapshotPending) {
         d.snapshotContaminated = true;
@@ -248,6 +434,17 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
     lastTouch.set(sessionID, now());
   }
 
+  /**
+   * F1: notes, before a call runs, that `sessionID` is about to run a tool whose writes the router cannot attribute. A call
+   * that ends in error (or is bypassed) never reaches the after-hook's record(), so the tally is also kept here (a Set: idempotent).
+   */
+  function noteWriter(sessionID: string, tool: string): void {
+    if (!isUnattributedWriter(tool)) return;
+    const w = writersBySession.get(sessionID) ?? new Set<string>();
+    w.add(tool.toLowerCase());
+    writersBySession.set(sessionID, w);
+  }
+
   /** QA-2.1-1: folds one producer session's tool-observed files into its dispatch's lineage. */
   function fold(d: DispatchRecord, sessionID: string): void {
     for (const [path, status] of bySession.get(sessionID) ?? []) {
@@ -257,12 +454,14 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
       const prev = d.observed.get(key);
       d.observed.set(key, { path: absolute, status: prev?.status === "written" ? "written" : status });
     }
+    for (const tool of writersBySession.get(sessionID) ?? []) d.writers.add(tool);
   }
 
   function evict(sessionID: string): void {
     // A retry's session is cleared after its gate: keep its edits in every lineage it belongs to.
     for (const d of dispatches.values()) if (d.producers.has(sessionID)) fold(d, sessionID);
     bySession.delete(sessionID);
+    writersBySession.delete(sessionID);
     lastTouch.delete(sessionID);
     const d = dispatches.get(sessionID);
     d?.captureController.abort();
@@ -284,6 +483,7 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
       const existing = dispatches.get(id);
       if (existing) return existing.settled;
       bySession.delete(id);
+      writersBySession.delete(id);
       const window: DispatchWindow = { cwd, overlapping: new Set() };
       // QA-3.1-2: every live dispatch overlaps this one's window, and this one overlaps theirs.
       for (const other of dispatches.values()) {
@@ -297,7 +497,7 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
         reference: Promise.resolve(deps.uncaptured ?? none(REFERENCE_NONE.notRequested)),
         ready: Promise.resolve(), settled: Promise.resolve(),
         // The delegate ladder's dispatch id is its first producer session.
-        producers: new Set([id]), observed: new Map(),
+        producers: new Set([id]), observed: new Map(), writers: new Set(),
         window,
       };
       dispatches.set(id, d);
@@ -316,6 +516,51 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
         if (snapshot?.root !== undefined) window.root = snapshot.root;
         if (snapshot && !d.snapshotContaminated && dispatches.get(id) === d) d.snapshot = snapshot;
       })();
+      // Cross-repo P1.8 (I13): P is fixed now; each extra root is snapshotted like the change baseline, with the same bound.
+      if (deps.perimeter !== undefined && deps.perimeter.roots.length > 0) {
+        const entries = new Map<string, PerimeterEntry>();
+        const snapshotRoot = deps.perimeterSnapshot ?? deps.snapshot;
+        for (const seed of deps.perimeter.roots) {
+          // QA-1 F2, F4, F10: a fixed root is kept (the gate reports it) but never snapshotted.
+          if (seed.fixed !== undefined) {
+            entries.set(seed.at, { seed, pending: false, snapshot: Promise.resolve(undefined) });
+            continue;
+          }
+          const entry: PerimeterEntry = { seed, pending: true, snapshot: Promise.resolve(undefined) };
+          entry.snapshot = (async (): Promise<TreeSnapshot | undefined> => {
+            const controller = new AbortController();
+            let snapshot: TreeSnapshot | undefined;
+            try {
+              snapshot = await withTimeout(snapshotRoot(seed.at, controller.signal), deps.timeoutMs, "perimeter fingerprint");
+            } catch {
+              snapshot = undefined; // Unavailable: the gate reports the root as not observed.
+            } finally {
+              entry.pending = false;
+              controller.abort();
+            }
+            return entry.contaminatedBy === undefined ? snapshot : undefined;
+          })();
+          entries.set(seed.at, entry);
+        }
+        d.perimeter = {
+          ...(deps.perimeter.name !== undefined ? { name: deps.perimeter.name } : {}),
+          entries,
+          ...(deps.perimeter.admission !== undefined ? { admission: deps.perimeter.admission } : {}),
+        };
+      }
+      const readHead = deps.headState;
+      if (readHead !== undefined) {
+        d.head = (async (): Promise<HeadRead> => {
+          const controller = new AbortController();
+          try {
+            return await withTimeout(readHead(cwd, controller.signal), deps.timeoutMs, "dispatch head");
+          } catch {
+            return undefined; // Unreadable at dispatch: the gate fails closed when the head is readable then.
+          } finally {
+            controller.abort();
+          }
+        })();
+      }
       const capture = deps.capture;
       if (capture !== undefined) {
         d.reference = (async (): Promise<ReferenceState> => {
@@ -334,10 +579,17 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
           return captured ? { kind: "captured", reference: captured } : none(REFERENCE_NONE.failed);
         })();
       }
-      d.settled = Promise.all([d.ready, d.reference]).then(() => undefined);
+      const perimeterSnapshots = [...(d.perimeter?.entries.values() ?? [])].map(entry => entry.snapshot);
+      d.settled = Promise.all([d.ready, d.reference, d.head, ...perimeterSnapshots]).then(() => undefined);
       return d.settled;
     },
     observeEdit,
+    /**
+     * Cross-repo QA-2 #9c: subscribes `listener` to the calls of an unattributable writer (isUnattributedWriter): observeEdit
+     * (before a call, no session) and record (after it, with its session). Returns the unsubscribe function.
+     */
+    onUnattributedWriter,
+    noteWriter,
     /**
      * The dispatch's ReferenceState. An untracked (or swept) dispatch has none. `signal` bounds the
      * wait for a capture still in flight: once it aborts, the reference is none (gate budget).
@@ -372,7 +624,7 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
       current?: TreeSnapshot,
       fallbackCwd?: string,
       committed?: readonly ChangedFile[] | "unavailable",
-    ): { changedFiles: ChangedFile[]; changeBaseline: "available" | "unavailable" } {
+    ): { changedFiles: ChangedFile[]; changeBaseline: "available" | "unavailable"; unattributedWriters: string[] } {
       const d = dispatches.get(id);
       const snapshot = d?.snapshot;
       const files = new Map<string, ChangedFile>();
@@ -437,11 +689,20 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
           else if (prev.previousPath === undefined && file.previousPath !== undefined) files.set(key, { ...prev, previousPath: file.previousPath });
         }
       }
-      return { changedFiles: [...files.values()], changeBaseline: available ? "available" : "unavailable" };
+      const writers = d ? d.writers : (writersBySession.get(childID) ?? new Set<string>());
+      return {
+        changedFiles: [...files.values()],
+        changeBaseline: available ? "available" : "unavailable",
+        unattributedWriters: [...writers].sort(),
+      };
     },
     /** The dispatch-time snapshot (QA-2.1-2: the gate digests its listed paths); undefined until settled. */
     baselineSnapshot(id: string): TreeSnapshot | undefined {
       return dispatches.get(id)?.snapshot;
+    },
+    /** The head state read when the dispatch began; undefined when untracked or no head reader was given. */
+    baselineHead(id: string): Promise<HeadRead> | undefined {
+      return dispatches.get(id)?.head;
     },
     /**
      * QA-3.1-2: how many other dispatches were live at some moment of this one's window so far and
@@ -460,9 +721,23 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
     snapshotContaminatedBy(id: string): string | undefined {
       return dispatches.get(id)?.snapshotContaminatedBy;
     },
+    /** Cross-repo P1.8: the dispatch's perimeter beyond W, planned at dispatch; undefined when it has none or is untracked. */
+    perimeterOf(id: string): {
+      readonly name?: string;
+      readonly entries: ReadonlyMap<string, PerimeterEntry>;
+      readonly admission?: DispatchPerimeter["admission"];
+    } | undefined {
+      return dispatches.get(id)?.perimeter;
+    },
     record(sessionID: string, tool: string, args: unknown): void {
+      notifyUnattributedWriter(tool, sessionID);
       touch(sessionID);
-      observeEdit(tool, dispatches.get(sessionID)?.cwd);
+      contaminateCaptures(tool, dispatches.get(sessionID)?.cwd);
+      if (isUnattributedWriter(tool)) {
+        const w = writersBySession.get(sessionID) ?? new Set<string>();
+        w.add(tool.toLowerCase());
+        writersBySession.set(sessionID, w);
+      }
       if (tool.toLowerCase() === "apply_patch") {
         const files = bySession.get(sessionID) ?? new Map<string, string>();
         for (const p of applyPatchHeaderPaths(args)) files.set(p, "modified");

@@ -33,6 +33,64 @@ describe("acceptance cwd", () => {
   });
 });
 
+describe("parseAcceptanceBlock — per-check cwd= and scope= (cross-repo P2.1)", () => {
+  const parseCheck = (checkLine: string) => parseAcceptanceBlock(`[acceptance]\n${checkLine}\n[/acceptance]`)?.checks[0];
+
+  it("reads a quoted absolute cwd with spaces and backslashes verbatim", () => {
+    expect(parseCheck('check: testsPass cwd="D:\\git\\my app" scope=full')).toEqual({
+      kind: "testsPass",
+      cwd: "D:\\git\\my app",
+      scope: "full",
+    });
+  });
+
+  it("reads an unquoted relative cwd", () => {
+    expect(parseCheck("check: testsPass cwd=packages/a")).toEqual({ kind: "testsPass", cwd: "packages/a" });
+  });
+
+  it("keeps the raw text of scope (validation is a later task)", () => {
+    expect(parseCheck("check: testsPass scope=FULL")?.scope).toBe("FULL");
+  });
+
+  it.each(["cwd=", 'cwd=""', "scope=", 'scope=""', "cwd= scope="])("treats an empty value as absent (%s)", (keys) => {
+    const check = parseCheck(`check: testsPass ${keys}`);
+    expect(check).toEqual({ kind: "testsPass" });
+    expect(check).not.toHaveProperty("cwd");
+    expect(check).not.toHaveProperty("scope");
+  });
+
+  it("does not read --cwd=x or --scope=full inside an unquoted command as keys", () => {
+    expect(parseCheck("check: run command=yarn --cwd=x expect=OK")).toEqual({
+      kind: "run",
+      command: "yarn",
+      expect: "OK",
+    });
+    expect(parseCheck("check: run command=yarn --scope=full")).toEqual({ kind: "run", command: "yarn" });
+  });
+
+  it("does not read key-like text inside a quoted command", () => {
+    expect(parseCheck('check: run command="npm --cwd=x test"')).toEqual({ kind: "run", command: "npm --cwd=x test" });
+    expect(parseCheck('check: run command="npm cwd=x test" scope=full')).toEqual({
+      kind: "run",
+      command: "npm cwd=x test",
+      scope: "full",
+    });
+  });
+
+  it("gives a check without the keys no cwd/scope property at all", () => {
+    const check = parseCheck('check: run command="npm test" expect=OK');
+    expect(check).toStrictEqual({ kind: "run", command: "npm test", expect: "OK" });
+    expect(check).not.toHaveProperty("cwd");
+    expect(check).not.toHaveProperty("scope");
+  });
+
+  it("keeps the block-level cwd: line working and independent of the per-check cwd=", () => {
+    const dod = parseAcceptanceBlock('[acceptance]\ncwd: /work/tree\ncheck: testsPass cwd="/other"\ncheck: buildPasses\n[/acceptance]');
+    expect(dod?.cwd).toBe("/work/tree");
+    expect(dod?.checks).toStrictEqual([{ kind: "testsPass", cwd: "/other" }, { kind: "buildPasses" }]);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // summarizeDispatch
 // ---------------------------------------------------------------------------

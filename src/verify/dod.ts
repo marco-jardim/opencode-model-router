@@ -14,6 +14,8 @@ export interface Check {
   expect?: string;    // run: expected substring in output (optional)
   path?: string;      // fileExists/schemaMatch
   schema?: string;    // schemaMatch: inline JSON or a path
+  cwd?: string;       // per-check working directory, raw trimmed text (absent when empty)
+  scope?: string;     // per-check scope, raw trimmed text; validated by a later task
 }
 
 export type DoDKind = "deterministic" | "checker" | "none";
@@ -217,6 +219,47 @@ function parseKvPairs(s: string): Record<string, string> {
   return result;
 }
 
+/**
+ * Per-check `cwd=` / `scope=` keys (cross-repo P2.1). Unlike parseKvPairs, a key
+ * counts only at a token boundary (start of the text or after whitespace) and
+ * outside any double-quoted span, so `--cwd=x` or `command="npm --cwd=x test"`
+ * are never read as keys. The last occurrence wins; an empty value is absent.
+ */
+function parseCheckScopeKeys(s: string): { cwd?: string; scope?: string } {
+  const found: { cwd?: string; scope?: string } = {};
+  let inQuote = false;
+  let i = 0;
+  while (i < s.length) {
+    if (s[i] === '"') {
+      inQuote = !inQuote;
+      i++;
+      continue;
+    }
+    const m = !inQuote && (i === 0 || /\s/.test(s[i - 1]!)) ? /^(cwd|scope)=/.exec(s.slice(i)) : null;
+    if (!m) {
+      i++;
+      continue;
+    }
+    const key = m[1] as "cwd" | "scope";
+    i += m[0].length;
+    let value: string;
+    const close = s[i] === '"' ? s.indexOf('"', i + 1) : -1;
+    if (close !== -1) {
+      value = s.slice(i + 1, close);
+      i = close + 1;
+    } else {
+      let end = i;
+      while (end < s.length && !/\s/.test(s[end]!)) end++;
+      value = s.slice(i, end);
+      i = end;
+    }
+    value = value.trim();
+    if (value) found[key] = value;
+    else delete found[key];
+  }
+  return found;
+}
+
 // ---------------------------------------------------------------------------
 // parseAcceptanceBlock
 // ---------------------------------------------------------------------------
@@ -272,6 +315,9 @@ export function parseAcceptanceBlock(text: string, source: DoDSource = "explicit
       if (kvPairs["expect"] !== undefined) check.expect = kvPairs["expect"];
       if (kvPairs["path"] !== undefined) check.path = kvPairs["path"];
       if (kvPairs["schema"] !== undefined) check.schema = kvPairs["schema"];
+      const scoped = parseCheckScopeKeys(remainder);
+      if (scoped.cwd !== undefined) check.cwd = scoped.cwd;
+      if (scoped.scope !== undefined) check.scope = scoped.scope;
       checks.push(check);
     } else if (lline.startsWith("cwd:")) {
       const rest = line.slice("cwd:".length).trim().replace(/^(["'])(.*)\1$/, "$2").trim();
