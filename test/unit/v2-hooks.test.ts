@@ -3,7 +3,8 @@ import type { Context } from "@opencode/plugin/promise/plugin";
 import { Agent } from "@opencode/plugin";
 import type { Hooks } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
-import { registerV2Hooks, v2Instructions } from "../../src/compat/v2-hooks";
+import { APPROVAL_RELOAD_APPLIES, registerV2Hooks, v2Instructions } from "../../src/compat/v2-hooks";
+import { approvalReloadLine, markApprovalsChanged, type ApprovalsChange } from "../../src/commands/approvals";
 import ModelRouterPlugin from "../../src/index";
 import { invalidateConfigCache, loadConfig, overridePath } from "../../src/router/config";
 import { getActiveTiers } from "../../src/router/protocol";
@@ -546,6 +547,69 @@ describe("OpenCode 2 hook adapter", () => {
     await f.commands.preset.execute({ sessionID: "root", prompt: { text: "openai" }, delivery: "steer" });
     expect(f.ctx.agent.reload).toHaveBeenCalledTimes(1);
     expect(f.ctx.session.prompt).toHaveBeenCalledTimes(1);
+  });
+
+  describe("cross-repo P4.7: /router approve|revoke reload the role agents (SD-P4-11)", () => {
+    const routerCommand = async (config: any) => { config.command.router = { template: "$ARGUMENTS", description: "Router" }; };
+    /** A legacy `/router` handler: it "writes the store" (recorded), pushes its text and marks the change. */
+    const legacyRouter = (order: string[], change?: ApprovalsChange) => async (_: any, output: any) => {
+      order.push("store");
+      output.parts.push({ type: "text", text: change === undefined ? "help" : `${change.kind}d ${change.path}` });
+      if (change !== undefined) markApprovalsChanged(output.parts, change);
+    };
+    /** The `text` of the first `session.prompt` call. */
+    const promptedText = (prompt: { mock: { calls: readonly unknown[][] } }): string => {
+      const arg: unknown = prompt.mock.calls[0]?.[0];
+      const text: unknown = typeof arg === "object" && arg !== null ? Reflect.get(arg, "text") : undefined;
+      return typeof text === "string" ? text : "";
+    };
+
+    it("approve: store → reload → prompt, the reload line appended to the prompted text", async () => {
+      const order: string[] = [];
+      const f = fixture();
+      const change: ApprovalsChange = { kind: "approve", path: "D:\\ext\\app" };
+      await f.start({ config: routerCommand, "command.execute.before": legacyRouter(order, change) });
+      f.ctx.agent.reload.mockImplementation(async () => { order.push("reload"); });
+      f.ctx.session.prompt.mockImplementation(async () => { order.push("prompt"); });
+      await f.commands.router.execute({ sessionID: "root", prompt: { text: "approve D:\\ext\\app" }, delivery: "steer" });
+      expect(order).toEqual(["store", "reload", "prompt"]);
+      expect(APPROVAL_RELOAD_APPLIES).toBe(true);
+      expect(f.ctx.session.prompt).toHaveBeenCalledWith({
+        sessionID: "root",
+        delivery: "steer",
+        text: "approve D:\\ext\\app\n\napproved D:\\ext\\app\n\nRole agents reloaded; dispatch again with root=D:\\ext\\app.",
+      });
+    });
+
+    it("a failed reload gives the restart line, and the text is still prompted", async () => {
+      const f = fixture();
+      const change: ApprovalsChange = { kind: "approve", path: "/ext/app" };
+      await f.start({ config: routerCommand, "command.execute.before": legacyRouter([], change) });
+      f.ctx.agent.reload.mockRejectedValueOnce(new Error("reload down"));
+      await f.commands.router.execute({ sessionID: "root", prompt: { text: "approve /ext/app" }, delivery: "steer" });
+      expect(f.ctx.session.prompt).toHaveBeenCalledTimes(1);
+      const text = promptedText(f.ctx.session.prompt);
+      expect(text).toContain("The role agents could not be reloaded (reload down). Restart OpenCode to use it.");
+      expect(text).not.toContain("dispatch again");
+    });
+
+    it("with APPROVAL_RELOAD_APPLIES off, the line is the restart line", () => {
+      expect(approvalReloadLine({ kind: "approve", path: "/ext/app" }, false)).toBe("Restart OpenCode to use it.");
+    });
+
+    it("revoke reloads too; an unmarked /router output reloads nothing", async () => {
+      const f = fixture();
+      await f.start({ config: routerCommand, "command.execute.before": legacyRouter([], { kind: "revoke", path: "/ext/app" }) });
+      await f.commands.router.execute({ sessionID: "root", prompt: { text: "revoke /ext/app" }, delivery: "steer" });
+      expect(f.ctx.agent.reload).toHaveBeenCalledTimes(1);
+      expect(promptedText(f.ctx.session.prompt)).toContain("Role agents reloaded; root=/ext/app is no longer allowed.");
+
+      const g = fixture();
+      await g.start({ config: routerCommand, "command.execute.before": legacyRouter([]) });
+      await g.commands.router.execute({ sessionID: "root", prompt: { text: "approve /ext/app" }, delivery: "steer" });
+      expect(g.ctx.agent.reload).not.toHaveBeenCalled();
+      expect(g.ctx.session.prompt).toHaveBeenCalledWith({ sessionID: "root", delivery: "steer", text: "approve /ext/app\n\nhelp" });
+    });
   });
 
   it("rebuilds from the setup-time base seed instead of re-listing router-modified agents", async () => {

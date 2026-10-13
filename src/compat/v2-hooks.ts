@@ -255,6 +255,13 @@ export function isPermissionRefusal(error: unknown): boolean {
 export const AUTHORITY_BINDING_UNKNOWN_DROP = `${AUTHORITY_TEXT.dropped.bindingUnknown}.`;
 
 /** QA-P21-1-8: logged once when `routing.delegation` becomes `roles` while OpenCode runs in tiers mode. */
+/**
+ * Cross-repo P4.7 (SD-P4-11, spike T6): whether reloading the role agents after `/router approve` makes the host allow the
+ * approved directory at once. True: the adapter says "Role agents reloaded; dispatch again with root=<path>."; false: "Restart
+ * OpenCode to use it." (as after a failed reload).
+ */
+export const APPROVAL_RELOAD_APPLIES: boolean = true;
+
 export const ROLES_RESTART_NOTICE =
   "roles mode (OpenCode v2 only): routing.delegation is now `roles`, but this OpenCode instance started in tiers mode; restart OpenCode to register the role agents and tools (tiers mode stays active until then)";
 
@@ -1466,6 +1473,22 @@ export async function registerV2Hooks(
             return;
           }
           if (name === "preset") await refresh();
+          if (name === "router") {
+            // Cross-repo P4.7 (SD-P4-11): after `/router approve|revoke` wrote the store, reload the role agents (their
+            // `external_directory` patterns come from the store), then say whether the change is usable now. The text still goes
+            // through `session.prompt` below, so the orchestrator sees it and dispatches again.
+            const approvals = await import("../commands/approvals");
+            const change = approvals.approvalsChangedOf(output.parts);
+            if (change !== undefined) {
+              let reloadError: string | undefined;
+              try {
+                await refresh();
+              } catch (error) {
+                reloadError = error instanceof Error ? error.message : String(error);
+              }
+              output.parts.push({ type: "text", text: approvals.approvalReloadLine(change, APPROVAL_RELOAD_APPLIES, reloadError) });
+            }
+          }
           await ctx.session.prompt({
             ...invocation.prompt,
             sessionID: invocation.sessionID,

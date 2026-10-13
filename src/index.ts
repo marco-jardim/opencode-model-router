@@ -260,7 +260,7 @@ function saveEnforcementMode(mode: "off" | "advisory" | "enforced"): void {
  * `/router` dispatch. Decides and persists here; rendering lives in
  * src/commands/output.ts.
  */
-function buildRouterOutput(cfg: RouterConfig, args: string, projectDir?: string, roles?: Iterable<RoleSpec>): string {
+function buildRouterOutput(cfg: RouterConfig, args: string, projectDir?: string, roles?: Iterable<RoleSpec>, approvals = false): string {
   const tokens = (args ?? "").trim().split(/\s+/).filter(Boolean);
   const sub = (tokens[0] ?? "").toLowerCase();
 
@@ -293,9 +293,13 @@ function buildRouterOutput(cfg: RouterConfig, args: string, projectDir?: string,
     resolveEnforcementMode({ config: cfg, env: process.env }).mode,
     // `/router stats` is listed only for a config that has a `routing` block: without one `/router` is what it was (QA-2.4-3).
     // #84 P2.2: the role lines, only when the caller hands roles (roles mode on v2); otherwise the help is what it was.
-    { stats: cfg.routing !== undefined, ...(roles === undefined ? {} : { roles }) },
+    // Cross-repo P4.7: `/router approve|repos|revoke`, only where they run (SD-P4-10); otherwise the help is what it was.
+    { stats: cfg.routing !== undefined, ...(roles === undefined ? {} : { roles }), ...(approvals ? { approvals: true } : {}) },
   );
 }
+
+/** Cross-repo P4.7: the `/router` subcommands of `commands/approvals.ts` (checked before that module is loaded). */
+const APPROVAL_SUBCOMMANDS: ReadonlySet<string> = new Set(["approve", "repos", "revoke"]);
 
 /** `/budget` dispatch. Persists the switch, then renders. */
 function buildBudgetOutput(cfg: RouterConfig, args: string, projectDir?: string): string {
@@ -630,13 +634,33 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     return typeof parentID === "string" && parentID !== "" ? parentID : undefined;
   };
   /**
+   * Cross-repo P4.7 (SD-P4-10, S1): whether `/router approve|repos|revoke` run for the session `sessionID`. All of: the v2 host,
+   * roles mode (`rolesNow()` non-empty), `routing.repoParents` non-empty, and a top-level session typed in by the human: not a
+   * role session, not a known child (a dispatch record), and the host reports it without a parent. A failed lookup refuses.
+   */
+  const approvalsCommandsAvailable = async (sessionID: unknown): Promise<boolean> => {
+    if (ctx.routerHost !== "v2" || rolesNow().size === 0) return false;
+    if (resolveRolesRouting(cfg, "v2").repoParents.length === 0) return false;
+    if (typeof sessionID !== "string" || sessionID === "") return false;
+    if (roleOfSession(sessionID) !== undefined || lookupDispatch(sessionID) !== undefined) return false;
+    try {
+      const res = await ctx.client.session.get({ path: { id: sessionID } });
+      const data = res?.data;
+      if (data === undefined || data === null || typeof data !== "object") return false;
+      const parentID: unknown = Reflect.get(data, "parentID");
+      return !(typeof parentID === "string" && parentID !== "");
+    } catch {
+      return false;
+    }
+  };
+  /**
    * Cross-repo 3b.4 (F10): one admission per resolved `{ repoParents, repoDepth, repoExclude }` for `router_git` `root` (it caches its
    * git results for 5 s). Loaded lazily, as `routing/wire/dispatch.ts` does: admission imports the wire layer.
    */
   type GitRootAdmission = Pick<import("./routing/roles/admission").AdmissionService, "admit" | "find">;
   let gitRootAdmissionMemo: { readonly key: string; readonly service: GitRootAdmission } | undefined;
   const gitRootAdmissionFor = async (config: import("./routing/roles/admission").AdmissionConfig): Promise<GitRootAdmission> => {
-    const key = JSON.stringify([config.parents, config.depth, config.exclude]);
+    const key = JSON.stringify([config.parents, config.depth, config.exclude, config.approvalDays ?? null]);
     if (gitRootAdmissionMemo !== undefined && gitRootAdmissionMemo.key === key) return gitRootAdmissionMemo.service;
     const service = (await import("./routing/roles/admission")).createAdmission(config);
     gitRootAdmissionMemo = { key, service };
@@ -668,7 +692,12 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     const orchestrator = "value" in asked ? asked.value : undefined;
     const workingSet = (orchestrator === undefined ? [] : workingSetOf(orchestrator)).map((location) => location.worktree);
     const member = readSetMemberOf(orchestrator);
-    const admissionConfig = { parents: routing.repoParents, depth: routing.repoDepth, exclude: routing.repoExclude };
+    const admissionConfig = {
+      parents: routing.repoParents,
+      depth: routing.repoDepth,
+      exclude: routing.repoExclude,
+      approvalDays: routing.repoApprovalDays,
+    };
     const known = [ctx.directory, ...(grant.location?.repository === undefined ? [] : [grant.location.repository]), ...workingSet];
     return gitRoot.resolveGitRoot(value, { workRoot, parents: routing.repoParents, workingSet }, {
       realpath: (path) => realpathSync.native(path),
@@ -3413,6 +3442,24 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         const parts = args.split(/\s+/).filter(Boolean);
         const sub = (parts[0] ?? "").toLowerCase();
         let text: string;
+        // Cross-repo P4.7 (SD-P4-10): `approve`, `repos`, `revoke` only on v2, in roles mode, with `routing.repoParents`, typed in a
+        // top-level session; otherwise they fall through to the help below, unchanged (S5). Loaded lazily: no cost in tiers mode or on v1.
+        // The help lists them only where they run; `approvalsCommandsAvailable` returns before any session lookup unless v2 + roles
+        // + parents hold.
+        const approvalsAvailable = await approvalsCommandsAvailable(input.sessionID);
+        const approvalsCmd = approvalsAvailable && APPROVAL_SUBCOMMANDS.has(sub) ? await import("./commands/approvals") : undefined;
+        if (approvalsCmd !== undefined && approvalsCmd.isRouterApprovalSubcommand(sub)) {
+          const routing = resolveRolesRouting(cfg, "v2");
+          const result = await approvalsCmd.runRouterApprovals(sub, args.slice((parts[0] ?? "").length), {
+            parents: routing.repoParents,
+            exclude: routing.repoExclude,
+            days: routing.repoApprovalDays,
+          });
+          output.parts.push({ type: "text" as const, text: result.text });
+          // SD-P4-11: the v2 command adapter reloads the role agents before it sends this text on.
+          if (result.change !== undefined) approvalsCmd.markApprovalsChanged(output.parts, result.change);
+          return;
+        }
         if (sub === "models") {
           const catalog = await fetchCatalog();
           const orphans = catalog ? findOrphanedStrongPatterns(cfg, catalog) : [];
@@ -3427,7 +3474,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           }
         } else {
           // #84 P2.2: `/router` lists the roles in roles mode on v2 (`rolesNow()` is empty in tiers mode and on v1).
-          text = buildRouterOutput(cfg, args, projectDir, rolesNow().size > 0 ? rolesNow().values() : undefined);
+          text = buildRouterOutput(cfg, args, projectDir, rolesNow().size > 0 ? rolesNow().values() : undefined, approvalsAvailable);
           // On the bare status view, surface stale or missing models inline.
           if (sub === "") {
             text += "\n" + routerStatusLines(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger, projectDir).join("\n");
