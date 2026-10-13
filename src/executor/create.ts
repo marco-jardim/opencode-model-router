@@ -2,7 +2,7 @@
 import { realpathSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import { hostname } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { V2Executor, V2ExecutorHost } from "../compat/v2-hooks";
 import { loadConfig, parseModelRef, resolveActiveTiers, resolveRolesRouting, resolveRouting, validateSlotsDir, type RouterHost } from "../router/config";
 import { resolveRoles } from "../router/roles";
@@ -192,6 +192,17 @@ function checkSlotsDir(slotsDir: string, toplevel: string): void {
   if (!result.ok) throw new ExecutorError("E_INVALID_INPUT", result.reason);
 }
 
+/** Approval must still target the branch tip captured by compile, before any integration worktree is created. */
+async function checkBase(git: RuntimeDeps["git"], repo: LedgerV1["repo"]): Promise<void> {
+  const result = await git.run(["rev-parse", "--verify", `refs/heads/${repo.baseBranch}^{commit}`], { cwd: repo.toplevel, timeoutMs: 5_000 });
+  if (result.code !== 0) throw new ExecutorError("E_GIT", `could not read base branch ${repo.baseBranch}`);
+  const head = result.stdout.trim();
+  if (head !== repo.baseCommit) {
+    throw new ExecutorError("E_STALE_BASE", `base branch ${repo.baseBranch} moved ${repo.baseCommit}→${head} since compile; recompile`,
+      { baseBranch: repo.baseBranch, old: repo.baseCommit, new: head });
+  }
+}
+
 function runResolver(directory: string): RunResolver {
   return {
     async resolve(ref, cwd) {
@@ -368,6 +379,7 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
         return createSlotPool({ planId: ledger.planId, repoKey: ledger.repo.key, toplevel, slotsDir,
           markersDir: join(home, "slots"), executorHome: home, maxParallel: ledger.config.maxParallel,
           git: opsOf(ledger.planId), fs, clock,
+          integrationHead: async () => (await store.read(ledger.planId)).integration.head,
           provisioner: createProvisioner({ spawner, fs, clock, config: ledger.config,
             host: { platform: process.platform, env: process.env, guards: workRootGuards(slotsDir) } }),
           logger: { warn: (message) => log("warn", message) },
@@ -478,7 +490,7 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
         async resume() {
           const ledger = input.writer.ledger, ref = `refs/heads/${ledger.integration.branch}`;
           if (await igit.readRef(toplevel, ref) === null) {
-            const result = await git.run(["update-ref", ref, ledger.repo.baseCommit, "0".repeat(ledger.repo.baseCommit.length)], { cwd: toplevel, timeoutMs: 5_000 });
+            const result = await git.run(["update-ref", ref, ledger.integration.head, "0".repeat(ledger.integration.head.length)], { cwd: toplevel, timeoutMs: 5_000 });
             if (result.code !== 0 && await igit.readRef(toplevel, ref) === null) throw new ExecutorError("E_GIT", "could not create the integration branch");
           }
           await pool.acquireSpecial(planId, "integration");
@@ -511,7 +523,13 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
       recovery: createRecoveryService({ store, host: host.hosts, toplevel, holder, slotMarker: (slot) => planPools.markerOf(slot), clock, log }),
       holder, capacity: createCapacityController, collaborators: realCollaborators({ queue: buildQueue, clock, log }),
       pinOrchestrator: host.pinOrchestrator, log,
-      config: () => ({ ...resolveRouting(loadConfig(directory), "v2").executor, slotsDir: null }), toplevel, checkSlotsDir,
+      config: () => ({ ...resolveRouting(loadConfig(directory), "v2").executor, slotsDir: null }), toplevel,
+      async checkSlotsDir(slotsDir, repoToplevel) {
+        checkSlotsDir(slotsDir, repoToplevel);
+        // slotsDir is the per-plan directory (including for a trusted custom root).
+        const ledger = await store.read(basename(slotsDir.replace(/\\/g, "/")));
+        await checkBase(git, ledger.repo);
+      },
     });
     const innerRuntime = runtime;
     let disposal: Promise<void> | null = null;

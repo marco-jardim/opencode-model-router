@@ -67,7 +67,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   assembled at start (plan state, executor instructions, host events, retry stop, ordered disposal). Plan-task
   verification is cancelled first at disposal, a verdict decided before disposal is still journaled, manual `gc` of a
   completed plan waits for pending phase tags, and `purge` creates no directories, removes the empty plan directory and
-  skips collection for an invalid `slotsDir` when the plan holds no slot markers.
+  skips collection for an invalid `slotsDir` when the plan holds no slot markers. A `NEED MORE: budget` end resumes
+  the same child session up to three times, then parks as `budget-cap`; interrupted, parked or lost attempts keep
+  their uncommitted work on `omr/<plan>/wip/<task>` for the next attempt. Criteria marked `(orchestrator shell)` stay
+  with the orchestrator, not the child or grader, and executor launches carry a read cap. Compilation takes the base
+  branch tip from the repository toplevel (detached HEAD is refused); approval refuses a moved base with
+  `E_STALE_BASE`, and integration/CI worktrees start from the ledger's integration head.
 
 ### Changed
 

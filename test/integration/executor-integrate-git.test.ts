@@ -318,10 +318,15 @@ function makeEnv(tag: string, toplevel: string, baseBranch: string, c0: string, 
   const pool = createSlotPool({
     planId: PLAN, repoKey: `key-${tag}`, toplevel, slotsDir, markersDir: join(home, "markers"), executorHome: home,
     maxParallel, git: ops, fs, clock: instantClock(), provisioner: noProvisioner(),
+    // Special slots start at the ledger's integration head, read when they are acquired (a test may replace env.ledger).
+    integrationHead: () => (box.env?.ledger ?? ledger).integration.head,
   });
+  const box: { env?: Env } = {};
   const guard = createWriteGuard({ ledger: () => ledger, pool, realpath: (p) => fsp.realpath(p), platform: process.platform });
   const igit = createIntegrateGit(run, guard);
-  return { repo: toplevel, ledger, home, slotsDir, ops, run, igit, guard, pool, gitCalls };
+  const env: Env = { repo: toplevel, ledger, home, slotsDir, ops, run, igit, guard, pool, gitCalls };
+  box.env = env;
+  return env;
 }
 
 /*@@HARNESS@@*/
@@ -1299,6 +1304,8 @@ function suiteSetup(
   const branch = integrationBranchName(PLAN);
   git(repo, "branch", branch, head);
   const env = makeEnv(`suite-${tag}`, repo, "main", c0);
+  // The ledger's integration head is the integration branch tip, where the ci slot starts.
+  env.ledger.integration.head = head;
   const calls: Calls = { commands: [] };
   const checks = makeChecks(env, calls, extraEnv);
   const runner = createPhaseSuiteRunner({

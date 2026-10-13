@@ -2,14 +2,28 @@
 // Plan task 4.2.5: restart recovery (`recoverPlan`), R1a probation watch, integration resume per activation, D11 trailer.
 import { rm } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
+import { ROUTER_BUDGET_NOTE_PREFIX } from "../router/prompts";
 import {
   capacityRestoreFromEvents,
   capacityView,
   type CapacityOptions,
   type CapacityProviderState,
 } from "./capacity";
+import { gitPointers } from "../router/git-tools";
 import { expandTask, loadExpansionEnv, type ExpandedTask } from "./expand";
-import { phaseTagName, taskBranchName } from "./git";
+import {
+  deleteSlotRef,
+  listSlotRefs,
+  orphanRefName,
+  phaseTagName,
+  planRefPrefix,
+  restoreSlotWork,
+  snapshotSlotWork,
+  taskBranchName,
+  wipRefName,
+  wipTrailer,
+  type WipRestore,
+} from "./git";
 import type { PlanRoleBindings } from "./launch";
 import { createQaLoop } from "./qa-loop";
 import {
@@ -23,7 +37,9 @@ import { defaultSlotsDir } from "./slots/pool";
 import { BREAKER_FED, breakerSamples, createUnattendedPolicy, isCommitFailure } from "./unattended";
 import {
   ABSOLUTE_PATH_PATTERN,
+  BUDGET_RESUMES,
   ExecutorError,
+  WIP_TRAILER,
   QA_UNPARSABLE_CONTEXT_PREFIX,
   canonicalFindingsJson,
   executionFailureOutcome,
@@ -254,17 +270,19 @@ function firstLine(text: string): string {
   return (cut < 0 ? t : t.slice(0, cut)).trim();
 }
 
-type ChildTextClass =
+export type ChildTextClass =
   | { kind: "lease"; path: string | null }
+  | { kind: "budget" }
   | { kind: "escalate" }
   | { kind: "ambiguity" }
   | { kind: "ordinary" };
 
-/** Child text classification (first line, §6 of the memo). */
-function classifyChildText(text: string): ChildTextClass {
+/** Child text classification (first line, §6 of the memo). pdf2-1 (a): `NEED MORE: budget` and the router budget note resume. */
+export function classifyChildText(text: string): ChildTextClass {
   const line = firstLine(text);
   const lease = /^NEED MORE:\s*lease\s+(.+)$/i.exec(line);
   if (lease !== null && lease[1] !== undefined) return { kind: "lease", path: normalizeLeasePath(lease[1]) };
+  if (/^NEED MORE:\s*budget\b/i.test(line) || line.startsWith(ROUTER_BUDGET_NOTE_PREFIX)) return { kind: "budget" };
   if (/^ESCALATE:/i.test(line)) return { kind: "escalate" };
   if (/^(?:NEED CONTEXT|SCOPE GROWTH|NEED MORE):/i.test(line)) return { kind: "ambiguity" };
   return { kind: "ordinary" };
@@ -445,6 +463,8 @@ export interface RuntimeDeps {
     leases: LeaseService;
     waker: Waker;
     listener: IntegrationListener;
+    /** pdf2-1 (b): the policy's park calls it before clearing a slot the task still holds (saves the slot's work). */
+    beforeSlotRelease?: (taskId: TaskId, slot: string, cause: Parameters<UnattendedPolicy["park"]>[1]) => Promise<void>;
   }): PlanCollaborators;
   pinOrchestrator(sessionID: string): () => void;
   log(level: "info" | "warn" | "error", msg: string, detail?: JsonValue): void;
@@ -484,7 +504,10 @@ export interface RealCollaboratorDeps {
 export function realCollaborators(r: RealCollaboratorDeps): RuntimeDeps["collaborators"] {
   return (i) => {
     const qa = createQaLoop({ writer: i.writer, waker: i.waker, clock: r.clock, log: { warn: (msg) => r.log("warn", msg) } });
-    const policy = createUnattendedPolicy({ writer: i.writer, leases: i.leases, waker: i.waker, qa, clock: r.clock, log: r.log });
+    const policy = createUnattendedPolicy({
+      writer: i.writer, leases: i.leases, waker: i.waker, qa, clock: r.clock, log: r.log,
+      ...(i.beforeSlotRelease === undefined ? {} : { beforeSlotRelease: i.beforeSlotRelease }),
+    });
     return { queue: r.queue({ ...i, policy, qa }), policy, qa };
   };
 }
@@ -643,6 +666,8 @@ interface ProbationWatch {
 const PROBATION_INTERRUPT_FAILS = 5;
 /** D11: the trailer every task commit carries: `Omr-Attempt: <planId>/<taskId>/<n>/<nonce>`. */
 const ATTEMPT_TRAILER = "Omr-Attempt";
+/** pdf2-1 (a): the prompt of a budget resume of the same child session. */
+export const RESUME_PROMPT = "continue and finish";
 /** QA-4.2-16: states a failed lease rebuild holds (no commit, verify or enqueue until the leases are back). */
 const LEASE_HELD_STATES: readonly TaskState[] = ["running", "completed", "verifying", "verified"];
 /** QA-4.2-3: how long closing a plan waits for its integration queue to dispose (a hung queue never blocks a close). */
@@ -893,6 +918,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     }
     collecting.add(p.planId);
     try {
+      // pdf2-1 (b): the WIP refs of integrated, done and cancelled tasks go before the slots.
+      await sweepWip(p);
       await slotsFor(p.planId).gc(async (id) => id === p.planId);
       collected.add(p.planId);
       collectionDelays.delete(p.planId);
@@ -1133,10 +1160,19 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
    * Parks through the policy (P1). After the fsync the policy released the leases (P3); the runtime returns the slot the
    * park batch cleared to the pool (4.2.5) and forgets its lease. A park that wrote nothing keeps the slot.
    */
-  async function parkTask(p: PlanRt, taskId: TaskId, cause: "escalate" | "ambiguity" | "qa-unparsable" | "exhausted", text: string): Promise<void> {
+  async function parkTask(p: PlanRt, taskId: TaskId, cause: Parameters<UnattendedPolicy["park"]>[1], text: string): Promise<void> {
     const before = own(p.writer.ledger, taskId);
     const slotName = before?.slot ?? null;
-    await p.collab.policy.park(taskId, cause, text);
+    // pdf2-1 (b): the slot's work is saved at the task's WIP ref before the park releases it (the policy's own hook,
+    // `beforeSlotRelease`, skips a park this saved already).
+    const key = `${p.planId}/${taskId}`;
+    if (slotName !== null) await snapshotTaskSlot(p, taskId, slotName, cause);
+    parkSaved.add(key);
+    try {
+      await p.collab.policy.park(taskId, cause, text);
+    } finally {
+      parkSaved.delete(key);
+    }
     const after = own(p.writer.ledger, taskId);
     if (slotName === null || after === null || after.state !== "parked" || after.slot !== null) return;
     p.slotLeases.delete(taskId);
@@ -1157,6 +1193,193 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     } catch {
       return true;
     }
+  }
+
+  // ---------- pdf2-1 (b): no lost work
+
+  /** Plans whose repository is a git checkout on disk (WIP refs live in its common directory), by plan id. */
+  const wipRepos = new Map<PlanId, boolean>();
+  /** `<plan>/<task>` of the parks `parkTask` is running: their slot's work is saved already. */
+  const parkSaved = new Set<string>();
+  /** pdf2-1 (a): the launch request of each open attempt, by `<plan>/<task>#<n>`; a budget resume reuses it. */
+  const launchRequests = new Map<string, LaunchRequest>();
+
+  /** Whether the plan's toplevel is a git checkout on disk; WIP refs are never written or read otherwise. */
+  function wipCapable(p: PlanRt): boolean {
+    const known = wipRepos.get(p.planId);
+    if (known !== undefined) return known;
+    let capable = false;
+    try {
+      capable = gitPointers(p.writer.ledger.repo.toplevel) !== undefined;
+    } catch {
+      capable = false;
+    }
+    wipRepos.set(p.planId, capable);
+    return capable;
+  }
+
+  /**
+   * Saves the uncommitted work in `slot` at `ref` (a WIP commit with the `Omr-Wip` trailer, never `Omr-Attempt`), then
+   * resets the slot to its HEAD. Never throws: a failure is logged and counted, and false is returned.
+   */
+  async function saveSlotWork(p: PlanRt, slot: { slot: string; path: string }, ref: string, message: string, trailer: string, taskId: TaskId | null): Promise<boolean> {
+    if (!wipCapable(p)) return false;
+    try {
+      const r = await snapshotSlotWork(d.git, { cwd: slot.path, ref, message, trailer, timeoutMs: GIT_TIMEOUT_MS });
+      if (r.saved) counter(p, "wip-saved", taskId === null ? { slot: slot.slot, ref } : { taskId, slot: slot.slot, ref });
+      return r.saved;
+    } catch (e) {
+      d.log("error", `saving the work in slot ${slot.slot} failed`, errorText(e));
+      counter(p, "wip-failed", taskId === null ? { slot: slot.slot } : { taskId, slot: slot.slot });
+      return false;
+    }
+  }
+
+  /** pdf2-1 (b): `snapshotWip(slot, plan, task, n, nonce, outcome)` at `refs/heads/omr/<plan>/wip/<task>`. */
+  async function snapshotWip(p: PlanRt, slot: { slot: string; path: string }, taskId: TaskId, n: number, nonce: string, outcome: string): Promise<boolean> {
+    return saveSlotWork(p, slot, wipRefName(p.planId, taskId), `wip(${taskId}): attempt ${n} ${outcome}`, wipTrailer(p.planId, taskId, n, nonce), taskId);
+  }
+
+  /** pdf2-1 (b): a dirty slot no task of the plan holds any more goes to `omr/<plan>/orphan/<slot>-<ts>`, never restored. */
+  async function snapshotOrphan(p: PlanRt, slot: { slot: string; path: string }): Promise<boolean> {
+    const ms = d.clock.now();
+    return saveSlotWork(p, slot, orphanRefName(p.planId, slot.slot, ms), `wip(orphan): slot ${slot.slot}`, `${WIP_TRAILER}: ${p.planId}/orphan/0/${ms}`, null);
+  }
+
+  /** The path of `slotName`: the task's cached lease, else the pool's record; null when neither knows it. */
+  async function slotPathOf(p: PlanRt, taskId: TaskId, slotName: string): Promise<string | null> {
+    const cached = p.slotLeases.get(taskId);
+    if (cached !== undefined && cached.slot === slotName) return cached.path;
+    try {
+      return (await slotsFor(p.planId).get(slotName))?.path ?? null;
+    } catch (e) {
+      d.log("warn", `slot lookup of ${slotName} failed`, errorText(e));
+      return null;
+    }
+  }
+
+  /**
+   * pdf2-1 (b): before a reset or a release of `slotName`, which `taskId` still holds: its latest attempt's work goes to the
+   * task's WIP ref. A slot the pool no longer leases to the task is saved as an orphan instead. Never throws.
+   */
+  async function snapshotTaskSlot(p: PlanRt, taskId: TaskId, slotName: string, outcome: string): Promise<void> {
+    if (!wipCapable(p)) return;
+    const path = await slotPathOf(p, taskId, slotName);
+    if (path === null) return;
+    const t = own(p.writer.ledger, taskId);
+    const a = t?.attempts[t.attempts.length - 1];
+    if (t === null || a === undefined || !(await slotHeldBy(p, taskId, slotName))) {
+      await snapshotOrphan(p, { slot: slotName, path });
+      return;
+    }
+    await snapshotWip(p, { slot: slotName, path }, taskId, a.n, a.nonce, outcome);
+  }
+
+  /** pdf2-1 (b): drops the WIP refs of the plan's integrated, done and cancelled tasks. Never throws. */
+  async function sweepWip(p: PlanRt): Promise<void> {
+    if (!wipCapable(p)) return;
+    let names: string[];
+    try {
+      names = await listSlotRefs(d.git, { cwd: p.writer.ledger.repo.toplevel, prefix: `${planRefPrefix(p.planId)}wip/`, timeoutMs: GIT_TIMEOUT_MS });
+    } catch (e) {
+      d.log("warn", "listing the WIP refs failed", errorText(e));
+      return;
+    }
+    if (names.length === 0) return;
+    const present = new Set(names);
+    for (const t of Object.values(p.writer.ledger.tasks)) {
+      if (t.state !== "integrated" && t.state !== "done" && t.state !== "cancelled") continue;
+      let ref: string;
+      try {
+        ref = wipRefName(p.planId, t.id);
+      } catch {
+        continue;
+      }
+      if (present.has(ref)) await dropWip(p, t.id);
+    }
+  }
+
+  /** pdf2-1 (b): drops the task's WIP ref once its own commit is integrated or it is cancelled. Never throws. */
+  async function dropWip(p: PlanRt, taskId: TaskId): Promise<void> {
+    if (!wipCapable(p)) return;
+    try {
+      if (await deleteSlotRef(d.git, { cwd: p.writer.ledger.repo.toplevel, ref: wipRefName(p.planId, taskId), timeoutMs: GIT_TIMEOUT_MS })) {
+        counter(p, "wip-dropped", { taskId });
+      }
+    } catch (e) {
+      d.log("warn", `dropping the WIP ref of ${taskId} failed`, errorText(e));
+    }
+  }
+
+  /**
+   * pdf2-1 (b): restores the task's WIP ref into its freshly reset slot (`cherry-pick --no-commit`, HEAD stays the
+   * integration head). Never throws: a git error is returned as `error` (the slot is reset again by the caller).
+   */
+  async function restoreWip(p: PlanRt, slot: SlotLease, taskId: TaskId): Promise<WipRestore | { kind: "error"; text: string }> {
+    if (!wipCapable(p)) return { kind: "none" };
+    try {
+      const r = await restoreSlotWork(d.git, { cwd: slot.path, ref: wipRefName(p.planId, taskId), timeoutMs: GIT_TIMEOUT_MS });
+      if (r.kind === "restored") counter(p, "wip-restored", { taskId, slot: slot.slot, files: String(r.files) });
+      else if (r.kind === "conflict") counter(p, "wip-conflict", { taskId, slot: slot.slot });
+      return r;
+    } catch (e) {
+      d.log("error", `restoring the work of ${taskId} in ${slot.slot} failed`, errorText(e));
+      return { kind: "error", text: errorText(e) };
+    }
+  }
+
+  /**
+   * pdf2-1 (b): before `launchStep` resets the slot it acquired. The slot this task held (`acquire` gives it back
+   * unreset): its latest attempt's work goes to the task's WIP ref. Any other dirty slot: an orphan ref, never restored.
+   */
+  async function saveBeforeLaunchReset(p: PlanRt, t: TaskNode, slot: SlotLease): Promise<void> {
+    if (!wipCapable(p)) return;
+    const a = t.attempts[t.attempts.length - 1];
+    if (t.slot === slot.slot && a !== undefined) await snapshotWip(p, slot, t.id, a.n, a.nonce, a.outcome ?? "interrupted");
+    else await snapshotOrphan(p, slot);
+  }
+
+  /**
+   * pdf2-1 (b): the saved work does not apply on the integration head. The slot is reset again, the attempt is journaled
+   * as dispatched and failed in one batch (row 4b's shape), then the task parks; the WIP ref is kept.
+   */
+  async function restoreConflicted(p: PlanRt, t: TaskNode, n: number, slot: SlotLease, why: string, abandon: () => Promise<void>): Promise<void> {
+    const head = p.writer.ledger.integration.head;
+    try {
+      await slotsFor(p.planId).reset(slot.slot, head);
+    } catch (e) {
+      d.log("warn", `slot reset after a restore conflict failed`, errorText(e));
+    }
+    const msg = `previous work conflicts with ${head}; wip ref kept (${wipRefName(p.planId, t.id)}): ${why}`;
+    const gate = d.launcher.gate(p.writer.ledger.orchestrator.sessionID);
+    const callID = gate.ok ? gate.context.callID : null;
+    const nonce = d.clock.randomHex(16);
+    const at = d.clock.iso();
+    let applied = false;
+    try {
+      applied = await appendIf(p, (cur) => {
+        const c = own(cur, t.id);
+        if (c === null || c.state !== "ready" || c.attempts.length + 1 !== n || cur.status !== "running") return [];
+        const ev: ExecutorEventInput[] = [];
+        if (c.slot !== slot.slot) ev.push(ts(t.id, slot.slot, null));
+        ev.push({
+          type: "attempt-started",
+          taskId: t.id,
+          attempt: { n, nonce, callID, childSessionID: null, startedAt: at, endedAt: null, outcome: null, verdict: null, context: "" },
+        });
+        ev.push(tt(t.id, "ready", "dispatched", "launch"));
+        ev.push(ae(t.id, n, "failed", at, msg), ax(t.id, n, msg), tt(t.id, "dispatched", "failed", "launch-task-error", msg));
+        return ev;
+      });
+    } catch (e) {
+      d.log("error", "restore conflict batch failed", errorText(e));
+    }
+    releaseToken(p, t.id, n, "other");
+    if (!applied) {
+      await abandon();
+      return;
+    }
+    await parkTask(p, t.id, "exhausted", msg);
   }
 
   /** Raises one inbox item through the policy; never throws. */
@@ -1429,6 +1652,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       try {
         slot = await slotsFor(p.planId).acquire(p.planId, leaseHolderID(p.planId, taskId), l.integration.head);
         p.slotLeases.set(taskId, slot);
+        // pdf2-1 (b): the work left in the slot is saved before the reset (this task's -> its WIP ref, else an orphan ref).
+        await saveBeforeLaunchReset(p, t0, slot);
         await slotsFor(p.planId).reset(slot.slot, l.integration.head);
       } catch (e) {
         const unavailable = errorCode(e) === "E_SLOT_UNAVAILABLE";
@@ -1459,11 +1684,19 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         await abandon();
         return "skipped";
       }
+      // pdf2-1 (b): the work of an earlier attempt (the task's WIP ref) comes back as uncommitted changes on the
+      // integration head; a conflict resets the slot again and parks the task with the ref kept.
+      const back = await restoreWip(p, slot, taskId);
+      if (back.kind === "conflict" || back.kind === "error") {
+        await restoreConflicted(p, t1, n, slot, back.kind === "conflict" ? back.conflicts.slice(0, 20).join(", ") : back.text, abandon);
+        return "skipped";
+      }
+      const restored = back.kind === "restored" && back.files > 0 ? { attempt: back.attempt, files: back.files } : null;
       const nonce = d.clock.randomHex(16);
       let expanded: ExpandedTask;
       try {
         const env = await loadExpansionEnv(d.git, { toplevel: l.repo.toplevel, slotPath: slot.path, timeoutMs: GIT_TIMEOUT_MS });
-        expanded = expandTask({ ledger: p.writer.ledger, taskId, attempt: n, nonce, slot, env });
+        expanded = expandTask({ ledger: p.writer.ledger, taskId, attempt: n, nonce, slot, env, ...(restored === null ? {} : { restored }) });
       } catch (e) {
         if (errorCode(e) === "E_LAUNCH_TASK") {
           await launchPrepFailed(p, t1, n, nonce, slot, e, abandon);
@@ -1546,24 +1779,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         else await rowLost(p, taskId, n, code === "E_NO_CONTEXT" ? "no-context" : "launch-error");
         return "skipped";
       }
-      const ref: HandleRef = { n, settled: false, completion: handle.completion };
-      p.handles.set(taskId, ref);
-      // The wait for the child is a child wait (dispose never waits for it); processing its end, once it came, is ordinary work.
-      void trackChild(
-        handle.completion.then((end) => {
-          ref.settled = true;
-          // QA-4.2-4: an end inside a same-process adopt's window waits for the new attachment.
-          return track(live(p).then((q) => processEnd(q, taskId, n, end)));
-        }),
-      );
-      void track(
-        handle.confirmation.then(
-          (c) => live(p).then((q) => onConfirmation(q, taskId, n, c)),
-          (e: unknown) => {
-            d.log("warn", "confirmation rejected", errorText(e));
-          },
-        ),
-      );
+      launchRequests.set(requestKey(p, taskId, n), req);
+      wireLaunch(p, taskId, n, handle, (q, c) => onConfirmation(q, taskId, n, c));
       p.counters.launches += 1;
       metric(p, {
         name: "launch",
@@ -1576,6 +1793,36 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       });
       return "launched";
     });
+  }
+
+  /**
+   * The end and confirmation wiring of a launch (and of a budget resume, pdf2-1 (a)): the wait for the child is a child
+   * wait (dispose never waits for it); processing its end, once it came, is ordinary work.
+   */
+  function wireLaunch(
+    p: PlanRt,
+    taskId: TaskId,
+    n: number,
+    handle: LaunchHandle,
+    confirm: (q: PlanRt, c: LaunchConfirmation) => Promise<void>,
+  ): void {
+    const ref: HandleRef = { n, settled: false, completion: handle.completion };
+    p.handles.set(taskId, ref);
+    void trackChild(
+      handle.completion.then((end) => {
+        ref.settled = true;
+        // QA-4.2-4: an end inside a same-process adopt's window waits for the new attachment.
+        return track(live(p).then((q) => processEnd(q, taskId, n, end)));
+      }),
+    );
+    void track(
+      handle.confirmation.then(
+        (c) => live(p).then((q) => confirm(q, c)),
+        (e: unknown) => {
+          d.log("warn", "confirmation rejected", errorText(e));
+        },
+      ),
+    );
   }
 
   /**
@@ -1869,16 +2116,19 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
   function processEnd(p: PlanRt, taskId: TaskId, n: number, end: ChildEnd): Promise<void> {
     return withTask(p, taskId, async () => {
+      // pdf2-1 (a): a budget end that resumed the same attempt keeps its capacity token, slot and leases.
+      let resumed = false;
       try {
-        await handleEnd(p, taskId, n, end);
+        resumed = await handleEnd(p, taskId, n, end);
       } catch (e) {
         d.log("error", "child end processing failed", errorText(e));
       } finally {
-        releaseToken(p, taskId, n, "other");
+        if (!resumed) releaseToken(p, taskId, n, "other");
         const still = own(p.writer.ledger, taskId);
         const closed = still === null || openAttempt(still, n) === null;
         // QA-4.2-23: the binding of an adopted child goes with its attempt.
         if (closed) evictRebound(p, taskId, n);
+        if (closed) launchRequests.delete(requestKey(p, taskId, n));
         if (closed) await forgetClosed(p);
         if (end.childSessionID !== null && closed) {
           p.capacityStopped.delete(end.childSessionID);
@@ -1889,18 +2139,19 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     });
   }
 
-  async function handleEnd(p: PlanRt, taskId: TaskId, n: number, end: ChildEnd): Promise<void> {
+  /** Processes one child end; true when a budget end resumed the same attempt (pdf2-1 (a): token, slot and leases kept). */
+  async function handleEnd(p: PlanRt, taskId: TaskId, n: number, end: ChildEnd): Promise<boolean> {
     // Nit 7: rows L16 (cancel) and L17 (dispose) are journaled before the cancel or by recovery; only counted. L17 is
     // counted by `dispose` for each live launch BEFORE the plan is marked disposed (QA-3.1-25): the dispose ends arrive
     // after that mark, so counting them here never happened.
     if (end.kind === "interrupted") {
       if (!p.disposed && end.reason !== "dispose") counter(p, "launch-failed", { row: "L16" });
-      return;
+      return false;
     }
     const t = own(p.writer.ledger, taskId);
-    if (t === null) return;
+    if (t === null) return false;
     const a = openAttempt(t, n);
-    if (a === null) return; // ignores closed attempts
+    if (a === null) return false; // ignores closed attempts
     // Nit 7: rows L13 (runner error), L14 (unrequested interrupt) and L15 (execution failed) of a running child.
     if (t.state === "running") {
       const row =
@@ -1916,16 +2167,16 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     const stopped = end.childSessionID !== null && p.capacityStopped.has(end.childSessionID);
     switch (end.kind) {
       case "completed":
-        if (t.state === "running") await onCompleted(p, t, a, end.text, end.endedAt);
-        return;
+        if (t.state === "running") return onCompleted(p, t, a, end.text, end.endedAt);
+        return false;
       case "failed":
-        if (t.state !== "running") return;
+        if (t.state !== "running") return false;
         if (stopped) await rowChildLost(p, t, a, "capacity", "capacity-stop", end.endedAt, end.error.message);
         else await rowChildFailed(p, t, a, `${end.error.type}: ${end.error.message}`, end.endedAt, "child-failed");
-        return;
+        return false;
       case "capacity":
         if (t.state === "running") await rowChildLost(p, t, a, "capacity", "capacity-stop", end.endedAt, end.error.message);
-        return;
+        return false;
       case "lost":
         if (t.state === "dispatched") {
           await rowLost(p, taskId, n, end.reason);
@@ -1933,8 +2184,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
           await rowChildLost(p, t, a, "lost", "child-lost", end.endedAt, end.reason);
           await lostStreakCheck(p, taskId, end.reason);
         }
-        return;
+        return false;
     }
+    return false;
   }
 
   /** Row 18: running -> ready, uncounted; slot and leases kept. */
@@ -1995,27 +2247,30 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     await retryDecision(p, t.id);
   }
 
-  async function onCompleted(p: PlanRt, t: TaskNode, a: Attempt, text: string, at: IsoTime): Promise<void> {
+  /** Row 15 and its alternatives; true when a budget end resumed the same attempt (pdf2-1 (a)). */
+  async function onCompleted(p: PlanRt, t: TaskNode, a: Attempt, text: string, at: IsoTime): Promise<boolean> {
     const cls = classifyChildText(text);
     if (t.kind === "qa") {
       const parsed = p.collab.qa.parse(text);
       if (parsed.ok) {
         await qaSuccess(p, t, a, parsed.report, at);
-        return;
+        return false;
       }
       if (cls.kind === "ordinary") {
         await qaUnparsable(p, t, a, parsed.error, at);
-        return;
+        return false;
       }
     }
     if (cls.kind === "lease") {
       await leaseNeeded(p, t, a, cls.path, text, at);
-      return;
+      return false;
     }
+    // pdf2-1 (a): decided before the end releases the token or the slot (processEnd's `finally`, parkTask).
+    if (cls.kind === "budget") return budgetEnd(p, t, a, text);
     if (cls.kind === "escalate" || cls.kind === "ambiguity") {
       await parkTask(p, t.id, cls.kind, text);
       releaseToken(p, t.id, a.n, "other");
-      return;
+      return false;
     }
     // row 15
     const applied = await appendIf(p, (cur) => {
@@ -2023,11 +2278,158 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       if (c === null || c.state !== "running" || openAttempt(c, a.n) === null) return [];
       return [ae(t.id, a.n, "succeeded", clampEnd(a, at), null), tt(t.id, "running", "completed", "child-ended")];
     });
-    if (!applied) return;
+    if (!applied) return false;
     // Phase 5.1 (a): the child's claim, as a dispatch grader judges it; kept only while a verifier observes attempts.
     if (d.verifier.observe !== undefined && text !== "") finalTexts.set(`${p.planId}/${t.id}#${a.n}`, text);
     releaseToken(p, t.id, a.n, "success");
     await commitAndVerify(p, t.id, a.n);
+    return false;
+  }
+
+  // ---------- pdf2-1 (a): budget resume
+
+  /**
+   * A budget end resumes the same child session while the attempt has resumes left (`BUDGET_RESUMES`), its child is
+   * known, the plan runs unlatched and a QA task's gate is still `qa-running`. Otherwise, and when the resume cannot go
+   * out, the task parks with `budget-cap`; the slot's work is kept at the task's WIP ref and restored on the next attempt.
+   * Runs inside the end's task mutex, before the end releases the token or the slot.
+   */
+  async function budgetEnd(p: PlanRt, t: TaskNode, a: Attempt, text: string): Promise<boolean> {
+    const l = p.writer.ledger;
+    const resumes = a.resumes ?? 0;
+    const ph = phaseOf(l, t);
+    const gateSame = t.kind !== "qa" || (ph !== null && ph.gate === "qa-running");
+    const child = a.childSessionID;
+    const kept = `the work of attempt ${a.n} is kept and restored on the next attempt`;
+    if (resumes < BUDGET_RESUMES && child !== null && l.status === "running" && !p.latch && !p.disposed && gateSame) {
+      const r = await resumeAttempt(p, t, a, child, resumes + 1);
+      if (r === "resumed") return true;
+      if (r === "gone") return false;
+      await parkBudget(p, t.id, a.n, `${firstLine(text)}: the resume of attempt ${a.n} failed (${r.why}); ${kept}`);
+      return false;
+    }
+    const why = resumes >= BUDGET_RESUMES
+      ? `budget cap reached after ${resumes} resume(s)`
+      : child === null ? "no child session to resume" : "the plan or the phase gate changed";
+    await parkBudget(p, t.id, a.n, `${firstLine(text)}: ${why}; ${kept}`);
+    return false;
+  }
+
+  async function parkBudget(p: PlanRt, taskId: TaskId, n: number, text: string): Promise<void> {
+    counter(p, "budget-park", { taskId });
+    await parkTask(p, taskId, "budget-cap", text);
+    releaseToken(p, taskId, n, "other");
+  }
+
+  function requestKey(p: PlanRt, taskId: TaskId, n: number): string {
+    return `${p.planId}/${taskId}#${n}`;
+  }
+
+  /** The launch request of attempt `n` (kept since its launch, else rebuilt with the attempt's nonce after a restart). */
+  async function requestOf(p: PlanRt, t: TaskNode, a: Attempt): Promise<LaunchRequest> {
+    const kept = launchRequests.get(requestKey(p, t.id, a.n));
+    if (kept !== undefined) return kept;
+    const l = p.writer.ledger;
+    const slot = await slotLeaseOf(p, t);
+    const env = await loadExpansionEnv(d.git, { toplevel: l.repo.toplevel, slotPath: slot.path, timeoutMs: GIT_TIMEOUT_MS });
+    const expanded = expandTask({ ledger: l, taskId: t.id, attempt: a.n, nonce: a.nonce, slot, env });
+    const route = viewOf(p, null).routeOf(t);
+    if (route.provider === UNROUTABLE) throw new ExecutorError("E_PLAN_STATE", "the task has no route", t.id);
+    return {
+      planId: p.planId,
+      taskId: t.id,
+      attempt: a.n,
+      nonce: a.nonce,
+      orchestratorSessionID: l.orchestrator.sessionID,
+      context: { bootID: "", epoch: 0, callID: a.callID ?? "" },
+      route,
+      role: t.route.role,
+      grant: needsOf(expanded.routeLine),
+      workRoot: expanded.workRoot,
+      prompt: expanded.prompt,
+    };
+  }
+
+  /**
+   * `resumeAttempt` (inside the task mutex): slot, leases and branch are kept, the capacity token too (re-taken forced
+   * when it is gone, as `onChildCreated` does), `attempt-resumed` is journaled in one batch, then the launcher resumes the
+   * same child with "continue and finish" under the same attempt and nonce. No `verifier.begin`. "gone": the task left
+   * the attempt meanwhile; `{why}`: the resume did not go out (the caller parks).
+   */
+  async function resumeAttempt(p: PlanRt, t: TaskNode, a: Attempt, childSessionID: string, resumes: number): Promise<"resumed" | "gone" | { why: string }> {
+    const taskId = t.id;
+    const n = a.n;
+    const l = p.writer.ledger;
+    const gate = d.launcher.gate(l.orchestrator.sessionID);
+    if (!gate.ok) return { why: "no launch context (E_NO_CONTEXT)" };
+    let base: LaunchRequest;
+    try {
+      base = await requestOf(p, t, a);
+    } catch (e) {
+      return { why: errorText(e) };
+    }
+    const k = tokenKey(taskId, n);
+    if (!p.tokens.has(k)) {
+      try {
+        p.tokens.set(k, p.capacity.acquire(base.route.provider, base.route.heavy, taskId, n, { force: true }));
+      } catch (e) {
+        return { why: `capacity: ${errorText(e)}` };
+      }
+    }
+    let applied = false;
+    try {
+      applied = await appendIf(p, (cur) => {
+        const c = own(cur, taskId);
+        const o = c === null ? null : openAttempt(c, n);
+        if (c === null || o === null || c.state !== "running" || cur.status !== "running" || p.latch) return [];
+        if ((o.resumes ?? 0) + 1 !== resumes) return [];
+        return [{ type: "attempt-resumed", taskId, n, resumes }];
+      });
+    } catch (e) {
+      d.log("error", "attempt-resumed batch failed", errorText(e));
+      return { why: errorText(e) };
+    }
+    if (!applied) {
+      const c = own(p.writer.ledger, taskId);
+      return c !== null && c.state === "running" && openAttempt(c, n) !== null ? { why: "the plan stopped running" } : "gone";
+    }
+    const ctx = gate.context;
+    const req: LaunchRequest = {
+      ...base,
+      orchestratorSessionID: l.orchestrator.sessionID,
+      context: { bootID: ctx.bootID, epoch: ctx.epoch, callID: ctx.callID },
+      prompt: RESUME_PROMPT,
+      resume: { childSessionID },
+    };
+    let handle: LaunchHandle;
+    try {
+      handle = d.launcher.launch(req, launchHooks(p, taskId, n, req.route));
+    } catch (e) {
+      const code = errorCode(e);
+      counter(p, "resume-failed", { taskId, reason: code ?? "error" });
+      return { why: code === "E_NO_CONTEXT" ? "no launch context (E_NO_CONTEXT)" : errorText(e) };
+    }
+    wireLaunch(p, taskId, n, handle, (q, c) => onResumeConfirmation(q, taskId, n, resumes, c));
+    counter(p, "attempt-resumed", { taskId, n: String(n), resumes: String(resumes) });
+    return "resumed";
+  }
+
+  /** An unconfirmed resume parks the task (`budget-cap`); its work is kept at the WIP ref. */
+  async function onResumeConfirmation(p0: PlanRt, taskId: TaskId, n: number, resumes: number, c: LaunchConfirmation): Promise<void> {
+    if (c.kind === "confirmed") return;
+    await withTask(current(p0), taskId, async () => {
+      const p = current(p0);
+      const t = own(p.writer.ledger, taskId);
+      const a = t === null ? null : openAttempt(t, n);
+      if (t === null || a === null || t.state !== "running" || (a.resumes ?? 0) !== resumes) return;
+      counter(p, "resume-failed", { taskId, reason: c.reason });
+      try {
+        await d.launcher.cancel(taskId, n, "superseded");
+      } catch (e) {
+        d.log("warn", "cancel of an unconfirmed resume failed", errorText(e));
+      }
+      await parkBudget(p, taskId, n, `NEED MORE: budget: the resume of attempt ${n} was not confirmed (${c.reason}${c.error === null ? "" : `: ${c.error}`}); the work of attempt ${n} is kept and restored on the next attempt`);
+    });
   }
 
   /** QA5: the report is the attempt context; the qa task is done and its resources are released. */
@@ -2112,6 +2514,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     });
     releaseToken(p, t.id, a.n, "other");
     if (!applied) return;
+    // pdf2-1 (b): the interrupted attempt's work is saved before the slot goes back to the pool.
+    if (slotName !== null) await snapshotTaskSlot(p, t.id, slotName, "lease-needed");
     await releaseResources(p, t.id, slotName);
   }
 
@@ -2274,12 +2678,18 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       await retryDecision(p, id);
     };
     return {
-      onIntegrated: () => run("onIntegrated", async (p) => schedule(p)),
+      onIntegrated: () =>
+        run("onIntegrated", async (p) => {
+          schedule(p);
+          // pdf2-1 (b): an integrated (or finished) task's WIP ref is dropped: its own commit holds that work now.
+          await sweepWip(p);
+        }),
       onConflict: (id) =>
         run("onConflict", (p) =>
           withTask(p, id, async () => {
             const t = own(p.writer.ledger, id);
             if (t !== null && t.slot !== null) {
+              await snapshotTaskSlot(p, id, t.slot, "conflict");
               try {
                 await slotsFor(p.planId).reset(t.slot, p.writer.ledger.integration.head);
               } catch (e) {
@@ -2505,7 +2915,18 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         if (m.result === "sent" || m.result === "failed") metric(p, m);
       },
     });
-    const collab = d.collaborators({ writer, leases, waker, listener: makeListener(ref) });
+    const collab = d.collaborators({
+      writer,
+      leases,
+      waker,
+      listener: makeListener(ref),
+      // pdf2-1 (b): a park the runtime did not start (the queue's, the QA loop's) saves the slot's work too.
+      beforeSlotRelease: async (taskId, slot, cause) => {
+        const p = ref.p;
+        if (p === null || p.disposed || parkSaved.has(`${planId}/${taskId}`)) return;
+        await snapshotTaskSlot(p, taskId, slot, cause);
+      },
+    });
     // QA-4.2-29: one history export per attachment, shared by the capacity restore and the breaker step.
     const history = await exportHistory(planId, "capacity restore failed");
     const capacity = makeCapacity(null, writer, planId, history);
@@ -3148,6 +3569,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
   /** R4: `reset --hard HEAD` + `clean -fd` in the task's slot (ignored files kept); idempotent, never throws. */
   async function resetSlotContents(p: PlanRt, t: TaskNode): Promise<void> {
+    // pdf2-1 (b): the slot's work is saved at the task's WIP ref before the reset.
+    if (t.slot !== null) await snapshotTaskSlot(p, t.id, t.slot, "restart");
     try {
       const lease = await slotLeaseOf(p, t);
       const o = { cwd: lease.path, timeoutMs: GIT_TIMEOUT_MS };

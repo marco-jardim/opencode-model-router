@@ -10,7 +10,7 @@ import {
   workRootGuards,
 } from "../router/git-tools";
 import {
-  ExecutorError, GIT_ID_PATTERN, PLAN_ID_PATTERN,
+  ExecutorError, GIT_ID_PATTERN, PLAN_ID_PATTERN, WIP_TRAILER,
   type FileSystem, type GitRunner, type JsonValue, type PhaseId, type PlanId, type ProcessResult, type ProcOpts,
   type TaskId, type TaskNode,
 } from "./types";
@@ -328,6 +328,158 @@ export function integrationBranchName(planId: PlanId): string {
 /** `omr/<planId>/phase/<encoded phaseId>`. */
 export function phaseTagName(planId: PlanId, phaseId: PhaseId): string {
   return `${planRefPrefix(planId)}phase/${encodeRefId(phaseId)}`;
+}
+/** pdf2-1 (b): `omr/<planId>/wip/<encoded taskId>`, the saved work of the task's interrupted attempts. */
+export function wipRefName(planId: PlanId, taskId: TaskId): string {
+  return `${planRefPrefix(planId)}wip/${encodeRefId(taskId)}`;
+}
+/** pdf2-1 (b): `omr/<planId>/orphan/<encoded slot>-<ms>`, a dirty slot no task of the plan holds any more. */
+export function orphanRefName(planId: PlanId, slot: string, ms: number): string {
+  let name: string;
+  try {
+    name = encodeRefId(slot);
+  } catch {
+    name = "slot";
+  }
+  return `${planRefPrefix(planId)}orphan/${name}-${Math.max(0, Math.floor(ms))}`;
+}
+/** pdf2-1 (b): `Omr-Wip: <planId>/<taskId>/<n>/<nonce>`; a WIP commit never carries `Omr-Attempt`. */
+export function wipTrailer(planId: PlanId, taskId: TaskId, n: number, nonce: string): string {
+  return `${WIP_TRAILER}: ${planId}/${taskId}/${n}/${nonce}`;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// pdf2-1 (b) Work-in-progress snapshot and restore (slot cwd, the runtime's hardened runner)
+// ---------------------------------------------------------------------------------------------------------------
+
+export type WipSnapshot =
+  | { saved: false; reason: "clean" | "unchanged" }
+  | { saved: true; commit: string; ref: string; files: number };
+
+export type WipRestore =
+  | { kind: "none" }
+  | { kind: "restored"; commit: string; attempt: number; files: number }
+  | { kind: "conflict"; commit: string; conflicts: string[] };
+
+interface SlotCall { cwd: string; timeoutMs: number }
+
+async function slotRun(git: GitRunner, o: SlotCall, op: string, args: readonly string[]): Promise<ProcessResult> {
+  try {
+    return await git.run(args, { cwd: o.cwd, timeoutMs: o.timeoutMs, maxOutputBytes: GIT_MAX_OUTPUT_BYTES });
+  } catch (error) {
+    if (error instanceof ExecutorError) throw error;
+    throw new ExecutorError("E_GIT", `git ${op} could not run: ${stripUrlUserinfo(errorText(error)).slice(0, 300)}`,
+      { op, code: errorCode(error) ?? null, stderr: "" });
+  }
+}
+
+async function slotMust(git: GitRunner, o: SlotCall, op: string, args: readonly string[]): Promise<string> {
+  const r = await slotRun(git, o, op, args);
+  if (r.code !== 0) throw gitFailure(op, r);
+  return r.stdout;
+}
+
+/** The commit `refs/heads/<ref>` names, or null when it does not exist. */
+async function refCommit(git: GitRunner, o: SlotCall, ref: string): Promise<string | null> {
+  const r = await slotRun(git, o, "rev-parse", ["rev-parse", "--verify", "--quiet", `refs/heads/${ref}^{commit}`]);
+  const oid = r.stdout.trim();
+  return r.code === 0 && GIT_ID_PATTERN.test(oid) ? oid : null;
+}
+
+/**
+ * pdf2-1 (b): saves the slot's uncommitted work (tracked changes and untracked, non-ignored files) at `refs/heads/<ref>`
+ * without leaving a trace on the slot's HEAD: `add -A`, `write-tree`, `commit-tree -p <HEAD>` (message, then the
+ * trailer as its own paragraph), a compare-and-swap `update-ref`, then `reset --hard <HEAD>`. A clean tree saves
+ * nothing; a tree equal to the ref's tree saves nothing (the slot is still reset to HEAD). Throws `E_GIT`.
+ */
+export async function snapshotSlotWork(
+  git: GitRunner,
+  i: { cwd: string; ref: string; message: string; trailer: string; timeoutMs: number },
+): Promise<WipSnapshot> {
+  const o: SlotCall = { cwd: i.cwd, timeoutMs: i.timeoutMs };
+  const status = await slotMust(git, o, "status", ["status", "--porcelain", "--untracked-files=all"]);
+  if (status.trim() === "") return { saved: false, reason: "clean" };
+  const head = (await slotMust(git, o, "rev-parse", ["rev-parse", "--verify", "HEAD^{commit}"])).trim();
+  requireCommit(head, "HEAD");
+  await slotMust(git, o, "add", ["add", "-A"]);
+  const tree = (await slotMust(git, o, "write-tree", ["write-tree"])).trim();
+  const old = await refCommit(git, o, i.ref);
+  if (old !== null) {
+    const oldTree = (await slotMust(git, o, "rev-parse", ["rev-parse", "--verify", `${old}^{tree}`])).trim();
+    if (oldTree === tree) {
+      await slotMust(git, o, "reset", ["reset", "--hard", "--quiet", head]);
+      return { saved: false, reason: "unchanged" };
+    }
+  }
+  const files = splitNul(await slotMust(git, o, "diff", ["diff", "--cached", "--name-only", "-z", "--no-renames", head])).length;
+  const commit = (await slotMust(git, o, "commit-tree", ["commit-tree", tree, "-p", head, "-m", i.message, "-m", i.trailer])).trim();
+  requireCommit(commit, "WIP commit");
+  await slotMust(git, o, "update-ref", ["update-ref", "--no-deref", `refs/heads/${i.ref}`, commit, old ?? "0".repeat(commit.length)]);
+  await slotMust(git, o, "reset", ["reset", "--hard", "--quiet", head]);
+  return { saved: true, commit, ref: i.ref, files };
+}
+
+/** The attempt number of an `Omr-Wip:` trailer in `body`, or null. */
+function wipAttemptOf(body: string): number | null {
+  for (const line of body.split(/\r?\n/)) {
+    const m = new RegExp(`^${WIP_TRAILER}:\\s*[^/\\s]+/[^/\\s]+/(\\d+)/\\S+$`).exec(line.trim());
+    if (m !== null && m[1] !== undefined) return Number(m[1]);
+  }
+  return null;
+}
+
+/**
+ * pdf2-1 (b): restores `refs/heads/<ref>` into a freshly reset slot with `cherry-pick --no-commit`: HEAD stays where it is
+ * and the saved work becomes uncommitted changes. `none` when the ref does not exist or adds nothing to HEAD. A conflict
+ * aborts the pick and resets the slot to HEAD again; the ref is kept. Throws `E_GIT`.
+ */
+export async function restoreSlotWork(git: GitRunner, i: { cwd: string; ref: string; timeoutMs: number }): Promise<WipRestore> {
+  const o: SlotCall = { cwd: i.cwd, timeoutMs: i.timeoutMs };
+  const commit = await refCommit(git, o, i.ref);
+  if (commit === null) return { kind: "none" };
+  const head = (await slotMust(git, o, "rev-parse", ["rev-parse", "--verify", "HEAD^{commit}"])).trim();
+  const [wipTree, headTree] = [
+    (await slotMust(git, o, "rev-parse", ["rev-parse", "--verify", `${commit}^{tree}`])).trim(),
+    (await slotMust(git, o, "rev-parse", ["rev-parse", "--verify", `${head}^{tree}`])).trim(),
+  ];
+  if (wipTree === headTree) return { kind: "none" };
+  const picked = await slotRun(git, o, "cherry-pick", ["cherry-pick", "--no-commit", commit]);
+  if (picked.code !== 0) {
+    const listed = await slotRun(git, o, "diff", ["diff", "--name-only", "--diff-filter=U", "-z"]);
+    const conflicts = listed.code === 0 ? [...new Set(splitNul(listed.stdout))] : [];
+    await slotRun(git, o, "cherry-pick --abort", ["cherry-pick", "--abort"]);
+    await slotMust(git, o, "reset", ["reset", "--hard", "--quiet", head]);
+    return { kind: "conflict", commit, conflicts };
+  }
+  const files = splitNul(await slotMust(git, o, "diff", ["diff", "--cached", "--name-only", "-z", "--no-renames", head])).length;
+  const body = await slotRun(git, o, "log", ["log", "-1", "--format=%B", commit]);
+  const attempt = body.code === 0 ? (wipAttemptOf(body.stdout) ?? 0) : 0;
+  return { kind: "restored", commit, attempt, files };
+}
+
+/** pdf2-1 (b): deletes `refs/heads/<ref>`; a missing ref is a no-op. Throws `E_GIT`. */
+export async function deleteSlotRef(git: GitRunner, i: { cwd: string; ref: string; timeoutMs: number }): Promise<boolean> {
+  const o: SlotCall = { cwd: i.cwd, timeoutMs: i.timeoutMs };
+  const old = await refCommit(git, o, i.ref);
+  if (old === null) return false;
+  await slotMust(git, o, "update-ref -d", ["update-ref", "-d", "--no-deref", `refs/heads/${i.ref}`, old]);
+  return true;
+}
+
+/** pdf2-1 (b): the branch names under `refs/heads/<prefix>` (`prefix` ends in "/"), without `refs/heads/`. Throws `E_GIT`. */
+export async function listSlotRefs(git: GitRunner, i: { cwd: string; prefix: string; timeoutMs: number }): Promise<string[]> {
+  const out = await slotMust(git, { cwd: i.cwd, timeoutMs: i.timeoutMs }, "for-each-ref", ["for-each-ref", "--format=%(refname)", `refs/heads/${i.prefix}`]);
+  const names: string[] = [];
+  for (const raw of out.split("\n")) {
+    const line = raw.replace(/\r$/, "");
+    if (line.startsWith(`refs/heads/${i.prefix}`)) names.push(line.slice("refs/heads/".length));
+  }
+  return names;
+}
+
+/** pdf2-1 (b): whether `refs/heads/<ref>` exists. Throws `E_GIT` when git cannot run. */
+export async function slotRefExists(git: GitRunner, i: { cwd: string; ref: string; timeoutMs: number }): Promise<boolean> {
+  return (await refCommit(git, { cwd: i.cwd, timeoutMs: i.timeoutMs }, i.ref)) !== null;
 }
 
 // ---------------------------------------------------------------------------------------------------------------

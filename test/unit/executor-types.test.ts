@@ -436,7 +436,7 @@ describe("constants and enumerations", () => {
 const ALL_TRIGGERS: readonly TransitionTrigger[] = [
   "deps-satisfied", "dep-parked", "dep-blocked", "abort", "launch", "dep-reverted", "adopt", "reported-done", "dep-added",
   "child-created", "launch-lost", "launch-task-error", "child-ended", "child-failed", "lease-unresolvable", "qa-unparsable",
-  "escalate", "ambiguity", "child-lost", "capacity-stop", "lease-needed", "committed", "no-changes", "commit-failed",
+  "escalate", "ambiguity", "budget-cap", "child-lost", "capacity-stop", "lease-needed", "committed", "no-changes", "commit-failed",
   "verify-pass", "verify-fail", "dequeued", "fast-forwarded", "rebase-conflict", "checks-failed", "suite-culprit", "retry",
   "exhausted", "answered", "dep-recovered",
 ];

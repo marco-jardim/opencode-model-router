@@ -28,6 +28,7 @@ import { buildDraft, holderOf, taskNode } from "../fixtures/cpx/ledger/builders"
 import { removeDirWhenReleased } from "../helpers/remove-dir";
 
 const bundled = JSON.parse(readFileSync(fileURLToPath(new URL("../../tiers.json", import.meta.url)), "utf8")) as Record<string, unknown>;
+const realCreateRuntime = runtimeModule.createExecutorRuntime;
 function executorConfig(overrides: { roles?: boolean; enforce?: boolean; never?: boolean } = {}): configModule.RouterConfig {
   return configModule.validateConfig({ ...bundled,
     activePreset: "fixture", defaultTier: "medium",
@@ -396,7 +397,7 @@ describe("createExecutor assembly seams", () => {
     return { executor, host, deps: captured.runtime, compiler: captured.compiler, inner: captured.inner };
   }
 
-  async function queueRig() {
+  async function queueRig(awaitingApproval = false, integrationHead?: string) {
     const timers = new Map<number, () => void>(); let serial = 0;
     const clock: Clock = { now: () => 1000, iso: () => "2026-10-11T00:00:00.000Z", randomHex: bytes => "a".repeat(bytes * 2),
       setTimer: (_ms, callback) => { const id = ++serial; timers.set(id, callback); return { id }; },
@@ -416,6 +417,9 @@ describe("createExecutor assembly seams", () => {
     const h = capture();
     const home = realpathSync.native(await mkdtemp(join(tmpdir(), "omr-assembly-queue-"))); roots.push(home);
     const store = ledgerModule.createLedgerStore({ home }), value = buildDraft(0, "plan-a");
+    if (awaitingApproval) value.status = "awaiting-approval";
+    // The writer journals a copy of the draft, so a moved integration head must be set before the ledger is created.
+    if (integrationHead !== undefined) value.integration.head = integrationHead;
     value.repo.toplevel = prepared.toplevel;
     value.config.slotsDir = "D:/slots/plan-a";
     value.integration.worktree = join(value.config.slotsDir, "integration");
@@ -426,7 +430,7 @@ describe("createExecutor assembly seams", () => {
     const collab = h.deps.collaborators({ writer, leases: runtimeModule.createLeaseService(value.planId, h.deps.leaseRegistry),
       waker: { wake: async () => "sent" }, listener: { onIntegrated() {}, onConflict() {}, onFailed() {}, onReverted() {}, onGate() {}, onInbox() {} } });
     if (captured.queue === undefined || captured.checks === undefined) throw new Error("queue was not assembled");
-    return { ...h, value, writer, pool, poolFactory, provisioner, raw, queue, collab, queueDeps: captured.queue, checksDeps: captured.checks, timers,
+    return { ...h, value, writer, store, pool, poolFactory, provisioner, raw, queue, collab, queueDeps: captured.queue, checksDeps: captured.checks, timers,
       fireTimer() { const entry = timers.entries().next().value; if (entry === undefined) throw new Error("no timer"); timers.delete(entry[0]); entry[1](); } };
   }
 
@@ -512,7 +516,7 @@ describe("createExecutor assembly seams", () => {
     value.integration.worktree = join(expected, "integration");
     validate.mockReturnValue({ ok: false, reason: "slots point into repo" });
     await expect(h.deps.compiler.compile("PLAN.md", options)).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
-    expect(() => h.deps.checkSlotsDir?.(expected, prepared.toplevel)).toThrow("slots point into repo");
+    await expect(h.deps.checkSlotsDir?.(expected, prepared.toplevel)).rejects.toThrow("slots point into repo");
   }, 15_000);
 
   it("compiler git is hardened and bounded; missing exit codes fail closed", async () => {
@@ -523,6 +527,45 @@ describe("createExecutor assembly seams", () => {
     expect(run).toHaveBeenCalledWith([...gitToolsModule.hardeningArgs(), "rev-parse", "HEAD"], { cwd: prepared.toplevel, timeoutMs: 5_000 });
     run.mockResolvedValue({ code: null, signal: "SIGTERM", stdout: "", stderr: "", truncated: false, durationMs: 0 });
     expect(await h.compiler.git.run(["status"], prepared.toplevel)).toEqual({ code: -1, stdout: "" });
+  }, 15_000);
+
+  it("approval validation re-reads the base branch tip before any integration worktree is created", async () => {
+    const h = await queueRig();
+    const old = h.value.repo.baseCommit, moved = "d".repeat(40);
+    h.raw.mockResolvedValue({ code: 0, signal: null, stdout: `${moved}\n`, stderr: "", truncated: false, durationMs: 0 });
+    await expect(h.deps.checkSlotsDir?.(h.value.config.slotsDir!, prepared.toplevel)).rejects.toMatchObject({
+      code: "E_STALE_BASE",
+      message: `base branch ${h.value.repo.baseBranch} moved ${old}→${moved} since compile; recompile`,
+    });
+    expect(h.raw).toHaveBeenCalledWith([...gitToolsModule.hardeningArgs(), "rev-parse", "--verify", `refs/heads/${h.value.repo.baseBranch}^{commit}`],
+      { cwd: prepared.toplevel, timeoutMs: 5_000 });
+    expect(h.raw.mock.calls.some(([args]) => args.includes("update-ref"))).toBe(false);
+    expect(h.poolFactory).not.toHaveBeenCalled();
+    expect(h.pool.acquireSpecial).not.toHaveBeenCalled();
+    h.raw.mockResolvedValue({ code: 0, signal: null, stdout: `${old}\n`, stderr: "", truncated: false, durationMs: 0 });
+    await expect(h.deps.checkSlotsDir?.(h.value.config.slotsDir!, prepared.toplevel)).resolves.toBeUndefined();
+    h.raw.mockResolvedValue({ code: 1, signal: null, stdout: "", stderr: "missing branch", truncated: false, durationMs: 0 });
+    await expect(h.deps.checkSlotsDir?.(h.value.config.slotsDir!, prepared.toplevel)).rejects.toMatchObject({ code: "E_GIT" });
+  }, 15_000);
+
+  it("approve refuses a branch moved since compile with E_STALE_BASE, leaving the draft and integration branch untouched", async () => {
+    const h = await queueRig(true);
+    // The runtime under test opens its own writer; the rig's writer is closed here, not again by the teardown.
+    writers.splice(writers.indexOf(h.writer), 1);
+    await h.writer.close();
+    const moved = "d".repeat(40);
+    h.raw.mockResolvedValue({ code: 0, signal: null, stdout: `${moved}\n`, stderr: "", truncated: false, durationMs: 0 });
+    const runtime = realCreateRuntime({ ...h.deps, store: h.store, recovery: null,
+      hosts: { ...h.deps.hosts, get: async id => ({ id, parentID: null }) } });
+    try {
+      await expect(runtime.approve(h.value.planId, h.value.orchestrator.sessionID)).rejects.toMatchObject({ code: "E_STALE_BASE" });
+      expect((await h.store.read(h.value.planId)).status).toBe("awaiting-approval");
+      expect((await h.store.exportPlan(h.value.planId)).events.filter(event => event.type === "plan-approved")).toEqual([]);
+      expect(h.raw.mock.calls.some(([args]) => args.includes("update-ref"))).toBe(false);
+      expect(h.pool.acquireSpecial).not.toHaveBeenCalled();
+      expect(h.poolFactory).not.toHaveBeenCalled();
+      expect(h.queue.resume).not.toHaveBeenCalled();
+    } finally { await runtime.dispose(); }
   }, 15_000);
 
   it("default annotation uses rules, while role selection clamps QA and falls back to general", async () => {
@@ -614,6 +657,18 @@ describe("createExecutor assembly seams", () => {
     expect(warn).toHaveBeenCalledWith("[model-router] executor: queue: queue warning");
   }, 15_000);
 
+  it("ensureIntegration creates a missing branch at the ledger's integration head, not its original base", async () => {
+    const h = await queueRig(false, "d".repeat(40));
+    expect(h.writer.ledger.integration.head).toBe("d".repeat(40));
+    expect(h.writer.ledger.integration.head).not.toBe(h.writer.ledger.repo.baseCommit);
+    h.raw.mockImplementation(async args => ({ code: args.includes("rev-parse") ? 1 : 0, signal: null,
+      stdout: "", stderr: "", truncated: false, durationMs: 0 }));
+    await h.collab.queue.resume();
+    expect(h.raw).toHaveBeenCalledWith([...gitToolsModule.hardeningArgs(), "update-ref", `refs/heads/${h.value.integration.branch}`,
+      h.value.integration.head, "0".repeat(40)], { cwd: prepared.toplevel, timeoutMs: 5_000 });
+    expect(await h.poolFactory.mock.calls[0]?.[0].integrationHead?.()).toBe(h.value.integration.head);
+  }, 15_000);
+
   it("run resolver preserves argv/cwd, distinguishes scripts and commands, filters undefined env and reports refusals", async () => {
     const h = await queueRig(), resolver = h.checksDeps.resolver;
     const planRun = vi.spyOn(runToolsModule, "planRun");
@@ -669,6 +724,11 @@ describe("createExecutor assembly seams", () => {
     expect(isLedgerV1(h.value)).toBe(true);
     await h.deps.slotsFor!("plan-a").list();
     expect(h.poolFactory.mock.calls[0]?.[0].slotsDir).toBe(slotsDirOf("plan-a", prepared.toplevel));
+    const poolDeps = h.poolFactory.mock.calls[0]?.[0];
+    if (poolDeps === undefined) throw new Error("no pool");
+    expect(await poolDeps.integrationHead?.()).toBe(h.value.integration.head);
+    h.value.integration.head = "d".repeat(40);
+    expect(await poolDeps.integrationHead?.()).toBe(h.value.integration.head);
     const provision = h.provisioner.mock.calls[0]?.[0];
     if (provision === undefined) throw new Error("no provisioner");
     const spawner = provision.spawner, signal = new AbortController().signal;

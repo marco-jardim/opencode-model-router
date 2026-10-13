@@ -339,6 +339,7 @@ interface Harness {
   pool: ReturnType<typeof createSlotPool>;
   fs: MemFs; git: FakeGit; clock: ReturnType<typeof autoClock>; prov: FakeProvisioner;
   provisioned: string[]; warnings: string[];
+  integrationHead: string;
   states(slot: string): string[];
   marker(slot: string): SlotRecord;
 }
@@ -350,9 +351,11 @@ function harness(o: { maxParallel?: number; fs?: MemFs; config?: Pick<ExecutorCo
   const prov = fakeProvisioner(fs, o.config);
   const provisioned: string[] = [];
   const warnings: string[] = [];
+  const current = { integrationHead: C1 };
   const pool = createSlotPool({
     planId: PLAN, repoKey: "repo-key", toplevel: TOP, slotsDir: SLOTS, markersDir: MARKERS, executorHome: HOME,
     maxParallel: o.maxParallel ?? 4, git, fs, clock, provisioner: prov, platform: "win32",
+    integrationHead: () => current.integrationHead,
     logger: { warn: (m) => { warnings.push(m); } }, onProvision: (slot, managers) => { provisioned.push(`${slot}:${managers.join(",")}`); },
   });
   const read = (slot: string): SlotRecord => {
@@ -362,6 +365,8 @@ function harness(o: { maxParallel?: number; fs?: MemFs; config?: Pick<ExecutorCo
   };
   return {
     pool, fs, git, clock, prov, provisioned, warnings, marker: read,
+    get integrationHead() { return current.integrationHead; },
+    set integrationHead(head: string) { current.integrationHead = head; },
     states: (slot) => fs.markerWrites.map(t => JSON.parse(t) as SlotRecord).filter(r => r.slot === slot).map(r => r.state),
   };
 }
@@ -617,6 +622,7 @@ describe("QA-5.1-22: gc-only handle and the purge's empty plan directory", () =>
     const pool = createSlotPool({
       planId: PLAN, repoKey: "repo-key", toplevel: TOP, slotsDir: SLOTS, markersDir: MARKERS, executorHome: HOME,
       maxParallel: 4, git: live.git, fs: live.fs, clock: live.clock, provisioner: live.prov, platform: "win32",
+      integrationHead: () => live.integrationHead,
     });
     await pool.open({ create: false });
     expect(await live.fs.lstat(SLOTS)).not.toBeNull();
@@ -679,15 +685,19 @@ describe("SlotPool concurrency", () => {
 });
 
 describe("SlotPool special slots", () => {
-  it("leases integration and ci slots at the toplevel HEAD and reuses them through reset", async () => {
+  it("leases integration and ci slots at the given ledger head, not the toplevel HEAD, and reuses them through reset", async () => {
     const h = harness({ maxParallel: 1 });
     await h.pool.open();
-    h.git.topHead = C2;
+    h.integrationHead = C2;
+    h.git.topHead = C3;
     const integration = await h.pool.acquireSpecial(PLAN, "integration");
     expect(integration).toEqual({ slot: "integration", path: slotPath("integration"), planId: PLAN, owner: "integration", commit: C2 });
     expect(await h.pool.acquireSpecial(PLAN, "integration")).toEqual(integration);
     const ci = await h.pool.acquireSpecial(PLAN, "ci");
     expect(ci.slot).toBe("ci");
+    expect(ci.commit).toBe(C2);
+    expect(h.git.heads.get(key(integration.path))).toBe(C2);
+    expect(h.git.heads.get(key(ci.path))).toBe(C2);
     expect(h.marker("integration").kind).toBe("integration");
     expect(h.marker("ci").kind).toBe("ci");
     await h.pool.acquire(PLAN, "task", C1);
@@ -695,6 +705,18 @@ describe("SlotPool special slots", () => {
     await h.pool.acquireSpecial(PLAN, "integration");
     // A special slot is claimed as `resetting`, then re-saved at its current HEAD before the reset runs.
     expect(h.states("integration")).toEqual(["creating", "provisioning", "leased", "ready", "resetting", "resetting", "leased"]);
+    // A reused special slot is leased at its own current HEAD (pool.ts work(): "the queue resets it afterwards"), never at
+    // the toplevel HEAD and not moved by a changed ledger head; the queue's pool.reset then brings it to the ledger head
+    // (integration fast-forward and revert recovery in integrate/queue.ts), modelled by the reset below.
+    await h.pool.release("integration");
+    h.integrationHead = C1;
+    const reused = await h.pool.acquireSpecial(PLAN, "integration");
+    expect(reused.commit).not.toBe(h.git.topHead);
+    expect(reused.commit).toBe(C2);
+    expect(h.git.heads.get(key(reused.path))).toBe(C2);
+    await h.pool.reset(reused.slot, C1);
+    expect(h.git.heads.get(key(reused.path))).toBe(C1);
+    expect(h.marker("integration")).toMatchObject({ state: "leased", commit: C1 });
   });
 
   it("recreates a broken special slot", async () => {
@@ -708,6 +730,15 @@ describe("SlotPool special slots", () => {
     expect(lease.slot).toBe("ci");
     expect(h.marker("ci")).toMatchObject({ state: "leased", owner: "ci" });
     expect(h.git.log).toContain(`remove ${key(slotPath("ci"))}`);
+  });
+
+  it("refuses an invalid integration head instead of falling back to the live HEAD", async () => {
+    const h = harness();
+    await h.pool.open();
+    h.integrationHead = "HEAD";
+    await expect(h.pool.acquireSpecial(PLAN, "integration")).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
+    expect(h.git.log).toEqual([]);
+    expect(await h.pool.list()).toEqual([]);
   });
 
   it("a broken special slot whose marker changed on disk is not retired", async () => {
@@ -747,6 +778,7 @@ describe("SlotPool input validation and open()", () => {
     return createSlotPool({
       planId: PLAN, repoKey: "repo-key", toplevel: over.toplevel ?? TOP, slotsDir, markersDir: MARKERS, executorHome: HOME,
       maxParallel: over.maxParallel ?? 4, git: fakeGit(fs), fs, clock: autoClock(), provisioner: fakeProvisioner(fs), platform: "win32",
+      integrationHead: () => C1,
     });
   }
 

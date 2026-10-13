@@ -112,7 +112,7 @@ describe("compile selection", () => {
 describe("compile git and repo seams", () => {
   it("fails with E_GIT when a git command fails", async () => {
     const h = makeHarness({ inline: { "twophase.md": TWO_PHASES } });
-    const git = { run: async (args: readonly string[], cwd: string): Promise<{ code: number; stdout: string }> => (args.join(" ") === "rev-parse HEAD" ? { code: 128, stdout: "" } : h.deps.git.run(args, cwd)) };
+    const git = { run: async (args: readonly string[], cwd: string): Promise<{ code: number; stdout: string }> => (args.join(" ") === `rev-parse --verify refs/heads/${h.view.branch}^{commit}` ? { code: 128, stdout: "" } : h.deps.git.run(args, cwd)) };
     const c = createPlanCompiler({ ...h.deps, git });
     const e = await rejection(c.compile(planPathOf("twophase.md"), compileOpts(h)));
     expect(e.code).toBe("E_GIT");
@@ -127,18 +127,18 @@ describe("compile git and repo seams", () => {
     expect(seen).toHaveLength(1);
   });
 
-  it("resolves a relative common git dir against the plan directory", async () => {
+  it("resolves a relative common git dir against the repository toplevel", async () => {
     const h = makeHarness({ inline: { "twophase.md": TWO_PHASES }, view: { commonDir: ".git" } });
     const r = await h.compiler.compile(planPathOf("twophase.md"), compileOpts(h));
-    expect(r.draft.repo.key.endsWith(".git")).toBe(true);
-    expect(r.draft.repo.key).not.toBe(".git");
+    expect(r.draft.repo.key.replace(/\\/g, "/")).toBe(`${h.view.toplevel.replace(/\\/g, "/")}/.git`);
   });
 
   it("resolves a relative common git dir on a posix cwd", async () => {
-    const h = makeHarness({ view: { commonDir: ".git" } });
+    const h = makeHarness({ view: { commonDir: ".git", toplevel: "/repo" } });
     const c = createPlanCompiler({ ...h.deps, fs: { readText: async () => TWO_PHASES } });
     const r = await c.compile("/plans/twophase.md", compileOpts(h));
-    expect(r.draft.repo.key.replace(/\\/g, "/")).toMatch(/\/plans\/\.git$/);
+    expect(r.draft.repo.toplevel).toBe("/repo");
+    expect(r.draft.repo.key).toBe("/repo/.git");
   });
 });
 
@@ -525,7 +525,7 @@ describe("compile routing fields", () => {
 describe("compile self-check", () => {
   it("refuses a draft that breaks the ledger schema and names the ledger violation", async () => {
     const h = makeHarness({ inline: { "twophase.md": TWO_PHASES } });
-    const git = { run: async (args: readonly string[], cwd: string): Promise<{ code: number; stdout: string }> => (args.join(" ") === "rev-parse HEAD" ? { code: 0, stdout: "not-a-commit\n" } : h.deps.git.run(args, cwd)) };
+    const git = { run: async (args: readonly string[], cwd: string): Promise<{ code: number; stdout: string }> => (args.join(" ") === `rev-parse --verify refs/heads/${h.view.branch}^{commit}` ? { code: 0, stdout: "not-a-commit\n" } : h.deps.git.run(args, cwd)) };
     const c = createPlanCompiler({ ...h.deps, git });
     const e = await rejection(c.compile(planPathOf("twophase.md"), compileOpts(h)));
     expect(e.code).toBe("E_COMPILE");

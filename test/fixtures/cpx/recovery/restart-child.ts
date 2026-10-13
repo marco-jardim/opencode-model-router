@@ -312,6 +312,11 @@ async function main(): Promise<void> {
     git: ops,
     fs: fsys,
     clock,
+    // As create.ts wires it: special slots start at the durable ledger's integration head. Run 0 creates the integration
+    // slot before the compile writes that ledger, so until then it is the head of the draft the compile will store.
+    integrationHead: async () => (await store.list()).some((p) => p.planId === c.planId)
+      ? (await store.read(c.planId)).integration.head
+      : draft.integration.head,
     provisioner: noProvisioner(),
   });
   await pool.open();

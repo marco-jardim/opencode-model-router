@@ -377,7 +377,7 @@ export const TRANSITION_TRIGGERS: Readonly<Partial<Record<TransitionKey, readonl
   "dispatched>cancelled": ["abort"],
   "running>completed": ["child-ended"],
   "running>failed": ["child-failed", "lease-unresolvable", "qa-unparsable"],
-  "running>parked": ["escalate", "ambiguity", "qa-unparsable"],
+  "running>parked": ["escalate", "ambiguity", "qa-unparsable", "budget-cap"],
   "running>ready": ["child-lost", "capacity-stop", "lease-needed"],
   "running>blocked": ["dep-reverted"],
   "running>cancelled": ["abort"],

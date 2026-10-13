@@ -2,7 +2,7 @@
 import { realpathSync } from "node:fs";
 import { isAbsolute, posix, resolve, win32 } from "node:path";
 import type { PlanTaskContext, PlanTaskVerdict, PlanTaskVerifier } from "../executor/runtime";
-import { leaseHolderID, type Attempt, type SlotLease, type TaskNode, type Verdict as SlotVerdict } from "../executor/types";
+import { ORCHESTRATOR_SHELL_RE, leaseHolderID, type Attempt, type SlotLease, type TaskNode, type Verdict as SlotVerdict } from "../executor/types";
 import { createGitRunner } from "../executor/git";
 import { hardeningArgs } from "../router/git-tools";
 import type { HeadState } from "./head";
@@ -166,7 +166,8 @@ export function planTaskDoD(task: Pick<TaskNode, "text" | "acceptance" | "title"
   const acceptance = task.acceptance !== null && task.acceptance.trim() !== ""
     ? (/\[acceptance\]/i.test(task.acceptance) ? task.acceptance : `[acceptance]\n${task.acceptance}\n[/acceptance]`)
     : undefined;
-  return buildDelegationDoD({ prompt: task.text, description: task.title, ...(acceptance !== undefined ? { acceptance } : {}) });
+  const dod = buildDelegationDoD({ prompt: task.text, description: task.title, ...(acceptance !== undefined ? { acceptance } : {}) });
+  return normalizeDoD({ ...dod, criteria: dod.criteria.filter((line) => !ORCHESTRATOR_SHELL_RE.test(line)) });
 }
 
 /** The router's hardened git argv (no hooks, no user config side effects), run in `cwd`. */

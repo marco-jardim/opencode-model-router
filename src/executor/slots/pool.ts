@@ -33,11 +33,13 @@ const PYTHON_MANAGER_NAMES: readonly string[] = ["pip", "poetry", "uv"];
 export interface SlotPoolDeps {
   planId: PlanId; repoKey: string; toplevel: string; slotsDir: string; markersDir: string; executorHome: string;
   maxParallel: number; git: GitOps; fs: FileSystem; clock: Clock; provisioner: Provisioner;
+  /** The ledger's current integration head; required for acquireSpecial, omitted only by task-only/gc handles. */
+  integrationHead?(): string | Promise<string>;
   platform?: NodeJS.Platform; logger?: { warn(m: string): void };
   onProvision?: (slot: string, managers: readonly string[]) => void; // test and smoke hook
 }
 
-type GcDeps = Omit<SlotPoolDeps, "planId" | "maxParallel" | "provisioner" | "onProvision">;
+type GcDeps = Omit<SlotPoolDeps, "planId" | "maxParallel" | "provisioner" | "onProvision" | "integrationHead">;
 
 export interface SlotPoolOpenOptions {
   /**
@@ -1397,7 +1399,11 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
       if (planId !== d.planId) throw new ExecutorError("E_INVALID_INPUT", "plan id differs from the pool's plan", { planId: String(planId).slice(0, 80) });
       if (kind !== "integration" && kind !== "ci") throw new ExecutorError("E_INVALID_INPUT", "kind must be integration or ci", { kind: String(kind).slice(0, 40) });
       assertLive();
-      const base = await d.git.revParse(d.toplevel, "HEAD");
+      const head = await d.integrationHead?.();
+      if (typeof head !== "string" || !GIT_ID_PATTERN.test(head)) {
+        throw new ExecutorError("E_INVALID_INPUT", "integration head must be a full git object id", null);
+      }
+      const base = await d.git.revParse(d.toplevel, head);
       return acquireSlot(() => claimSpecial(kind, base), { kind, owner: kind, base });
     },
     reset,

@@ -272,6 +272,22 @@ transitively `dep-blocked`); unrelated tasks may still run. Answering the task's
 passes the answer into its next attempt's context. Dependents become ready only once their dependency edges are
 satisfied, not merely because someone answered a question.
 
+### Interrupted attempts
+
+A `NEED MORE: budget` end resumes the same child session and attempt up to **3 times**, keeping its slot, leases and
+branch. After those resumes it parks as `budget-cap`, rather than starting the work over in another session.
+An interrupted, parked or lost attempt's uncommitted work is kept on `omr/<plan>/wip/<task>` and restored into the
+next attempt on top of the integration head. If restoration conflicts, the task parks and the WIP ref is kept.
+
+Criteria marked `(orchestrator shell)` are run by the orchestrator; they are not sent to the child or the grader.
+Executor launches carry a read cap: a task's explicit `CAP:` is kept, otherwise editing tasks get `CAP:12`.
+
+The plan base is the base branch tip at compile, resolved in the repository toplevel, not the plan directory's HEAD.
+A detached toplevel HEAD is refused: check out the base branch before compiling. Approval re-reads that branch tip
+and refuses a moved base with `E_STALE_BASE` (`base branch <b> moved <old>→<new> since compile; recompile`), before
+creating the integration branch or worktree. Integration and CI worktrees start at the ledger's integration head;
+`ff-when-clean` landing is unchanged.
+
 Use `/plan inbox` to see open items and `/plan answer <id> <text>` to answer them (or add `--plan <planId>`). Inbox ids
 have a prefix and a plan-wide increasing number, for example `Q-1`:
 

@@ -7,11 +7,14 @@
  */
 import * as path from "node:path";
 import { DETECTIONS, NEEDS, RISKS, SCOPES, TASK_CLASSES } from "../routing/classify/types";
+import { ROUTE_BUDGET_MAX } from "../routing/classify/route-line";
+import { neutralizeDirectives } from "../verify/pending";
 import { slotEnvFor } from "./slots/env";
 import {
   ABSOLUTE_PATH_PATTERN,
   ExecutorError,
   FINDINGS_FORMAT,
+  ORCHESTRATOR_SHELL_RE,
   formatLaunchPrompt,
   type GitRunner,
   type LedgerV1,
@@ -45,6 +48,8 @@ export interface ExpandInput {
   nonce: string;
   slot: SlotLease;
   env: ExpansionEnv;
+  /** The previous attempt's work restored as uncommitted changes. */
+  restored?: { attempt: number; files: number };
 }
 
 /** The expansion: the full launch prompt, the re-serialized route line and the slot-relative check inputs. */
@@ -285,10 +290,11 @@ interface RouteFields {
   d: string | null;
   tier: string | null;
   pin: boolean | null;
+  budget: number | null;
 }
 
 function parseRouteFields(line: string): RouteFields {
-  const f: RouteFields = { cls: null, risk: null, scope: null, needs: [], d: null, tier: null, pin: null };
+  const f: RouteFields = { cls: null, risk: null, scope: null, needs: [], d: null, tier: null, pin: null, budget: null };
   const trimmed = line.trim();
   if (trimmed === "") return f;
   const shape = ROUTE_LINE_SHAPE_RE.exec(trimmed);
@@ -304,7 +310,7 @@ function parseRouteFields(line: string): RouteFields {
     const raw = eq === -1 ? null : token.slice(eq + 1).toLowerCase();
     if (seen.has(key)) routeFail(`duplicate field ${key}`);
     seen.add(key);
-    if (key === "root" || key === "budget") continue; // replaced by the slot / not carried
+    if (key === "root") continue; // replaced by the slot
     if (key === "pin") {
       if (raw === null || raw === "true" || raw === "yes" || raw === "1") f.pin = true;
       else if (raw === "false" || raw === "no" || raw === "0") f.pin = false;
@@ -321,6 +327,12 @@ function parseRouteFields(line: string): RouteFields {
       case "scope": if (!isMemberOf(ROUTE_SCOPES, value)) routeFail("unknown scope", { value: value.slice(0, 40) }); f.scope = value; break;
       case "d": if (!isMemberOf(ROUTE_DS, value)) routeFail("unknown d", { value: value.slice(0, 40) }); f.d = value; break;
       case "tier": if (!isMemberOf(ROUTE_TIERS, value)) routeFail("unknown tier", { value: value.slice(0, 40) }); f.tier = value; break;
+      case "budget":
+        if (!/^\d+$/.test(value) || Number(value) < 1 || Number(value) > ROUTE_BUDGET_MAX) {
+          routeFail("budget is outside its range", { value: value.slice(0, 40) });
+        }
+        f.budget = Number(value);
+        break;
       case "needs":
         for (const n of value.split(",")) {
           if (!isMemberOf(ROUTE_NEEDS, n)) routeFail("unknown need", { value: n.slice(0, 40) });
@@ -335,7 +347,7 @@ function parseRouteFields(line: string): RouteFields {
 
 /**
  * The route line sent with the attempt (M36): re-serialized from the whitelisted tokens class, risk, scope, needs, d,
- * `root=<slotPath>` (quoted when the path holds a space), tier and pin. `task.route.tier` and `task.route.pin` (`[tier:X]` gives `tier=X pin`) win over the
+ * `root=<slotPath>` (quoted when the path holds a space), tier, pin and budget. `task.route.tier` and `task.route.pin` (`[tier:X]` gives `tier=X pin`) win over the
  * line's own `tier=`/`pin`. A value outside its token pattern, or holding whitespace, `]` or a line break, fails with
  * E_LAUNCH_TASK. The plan text (title, text, subtasks) is never read here.
  */
@@ -357,6 +369,7 @@ export function renderRouteLine(task: TaskNode, slotPath: string): string {
   parts.push(ROOT_NEEDS_QUOTES_RE.test(slotPath) ? `root="${slotPath}"` : `root=${slotPath}`);
   if (tier !== null) parts.push(`tier=${tier}`);
   if (pin) parts.push("pin");
+  if (f.budget !== null) parts.push(`budget=${f.budget}`);
   return `[route ${parts.join(" ")}]`;
 }
 
@@ -396,23 +409,40 @@ function environmentLines(slot: SlotLease): string[] {
  * The task block of one attempt (M36 "taskBlock order"). Plan text (title, text, subtasks, acceptance criteria) has
  * every in-repo absolute path rewritten through `map` first. `\n` only, no trailing spaces.
  */
-export function renderTaskBlock(ledger: Readonly<LedgerV1>, task: TaskNode, slot: SlotLease, map: PathMap): string {
+export function renderTaskBlock(
+  ledger: Readonly<LedgerV1>, task: TaskNode, slot: SlotLease, map: PathMap, restored?: ExpandInput["restored"],
+): string {
   void ledger;
   const rw = (s: string): string => rewriteAbsolutePaths(s, map);
+  let skipped = false;
+  const childText = (text: string): string => text.split(/\r\n|\n|\r/).filter((line) => {
+    if (/^\s*criteria\s*:/i.test(line) && ORCHESTRATOR_SHELL_RE.test(line)) {
+      skipped = true;
+      return false;
+    }
+    return true;
+  }).join("\n");
   const out: string[] = [];
   out.push(`TASK ${task.id}: ${rw(task.title)}`);
-  if (task.text.trim() !== "") out.push(rw(task.text));
-  if (task.subtasks.length > 0) {
+  const text = childText(task.text);
+  if (text.trim() !== "") out.push(rw(text));
+  if (restored !== undefined) {
+    out.push("", `Your previous attempt's work (attempt ${restored.attempt}, ${restored.files} files) is already in your work root as uncommitted changes. Continue it; do not start over.`);
+  }
+  const subtasks = task.subtasks.map(childText).filter((s) => s.trim() !== "");
+  if (subtasks.length > 0) {
     out.push("", "SUBTASKS");
-    task.subtasks.forEach((s, i) => out.push(`${i + 1}. ${rw(s)}`));
+    subtasks.forEach((s, i) => out.push(`${i + 1}. ${rw(s)}`));
   }
   const list = (paths: readonly string[]): string => (paths.length === 0 ? "(none)" : paths.join(", "));
   out.push("", `Writes: ${list(task.footprint.writes)}`, `Reads: ${list(task.footprint.reads)}`);
   out.push("", "ENVIRONMENT", ...environmentLines(slot));
   if (task.acceptance !== null) {
-    const criteria = acceptanceCriteria(rw(task.acceptance));
+    const { criteria, skipped: skippedAcceptance } = acceptanceCriteria(rw(task.acceptance));
+    skipped ||= skippedAcceptance;
     if (criteria.length > 0) out.push("", "ACCEPTANCE", ...criteria.map((c) => `- ${c}`));
   }
+  if (skipped) out.push("", "Checks marked (orchestrator shell) are run by the orchestrator after you return; do not run or request them.");
   const latest = task.attempts[task.attempts.length - 1];
   if (latest !== undefined && latest.context.trim() !== "") out.push("", "ATTEMPT CONTEXT", rw(latest.context));
   out.push("", "MUST NOT DO", ...MUST_NOT_DO_RULES.map((r) => `- ${r}`));
@@ -421,13 +451,16 @@ export function renderTaskBlock(ledger: Readonly<LedgerV1>, task: TaskNode, slot
 }
 
 /** The `criteria:` lines of an `[acceptance]` block as plain sentences (the machine checks are not shown to the child). */
-function acceptanceCriteria(block: string): string[] {
+function acceptanceCriteria(block: string): { criteria: string[]; skipped: boolean } {
   const out: string[] = [];
+  let skipped = false;
   for (const raw of block.split(/\r\n|\n|\r/)) {
     const m = /^\s*criteria\s*:\s*(.+?)\s*$/i.exec(raw);
-    if (m?.[1] !== undefined) out.push(m[1]);
+    if (m?.[1] === undefined) continue;
+    if (ORCHESTRATOR_SHELL_RE.test(m[1])) skipped = true;
+    else out.push(m[1]);
   }
-  return out;
+  return { criteria: out, skipped };
 }
 
 /** The prefix maps of one expansion (M36 "Prefixes"). */
@@ -463,12 +496,14 @@ export function expandTask(i: ExpandInput): ExpandedTask {
   if (task === undefined) fail("task is not in the ledger", { taskId: i.taskId });
   const map = buildPathMap(i.ledger, task, i.slot, i.env);
   const routeLine = renderRouteLine(task, i.slot.path);
-  const taskBlock = renderTaskBlock(i.ledger, task, i.slot, map);
-  const prompt = formatLaunchPrompt(
-    i.ledger.sharedContext,
+  const taskBlock = renderTaskBlock(i.ledger, task, i.slot, map, i.restored);
+  const planPrompt = formatLaunchPrompt(
+    i.ledger.sharedContext, // The fixed launch/recovery prefix must match the ledger byte for byte.
     { planId: i.ledger.planId, taskId: i.taskId, attempt: i.attempt, nonce: i.nonce },
-    taskBlock,
+    neutralizeDirectives(taskBlock),
   );
+  // TaskNode carries no parsed CAP. Add the router directive only after neutralizing the task's plan text.
+  const prompt = parseRouteFields(task.route.line).needs.includes("edit") ? `${planPrompt}\n\nCAP:12` : planPrompt;
   return {
     prompt,
     routeLine,

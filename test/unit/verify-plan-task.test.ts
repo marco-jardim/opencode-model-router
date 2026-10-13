@@ -314,7 +314,7 @@ describe("plan-task verifier (D8)", () => {
 });
 
 describe("mixed blocks (D9, A-5.1-8)", () => {
-  const mixed = task({ text: "x\n[acceptance]\ncheck: testsPass\ncriteria: the change is documented\n[/acceptance]" });
+  const mixed = task({ text: "x\n[acceptance]\ncheck: testsPass\ncriteria: the change is documented\ncriteria: smoke passes (orchestrator shell)\n[/acceptance]" });
 
   it("V5: checks first, then the grader on the criteria alone; PASS only if both pass", async () => {
     acceptMock.mockImplementationOnce(async () => pass()).mockImplementationOnce(async () => pass("checker"));
@@ -325,7 +325,7 @@ describe("mixed blocks (D9, A-5.1-8)", () => {
     expect(delegationOf(0).dod.kind).toBe("deterministic");
     expect(delegationOf(1).dod.kind).toBe("checker");
     expect(delegationOf(1).dod.checks).toEqual([]);
-    expect(delegationOf(1).dod.criteria.length).toBeGreaterThan(0);
+    expect(delegationOf(1).dod.criteria).toEqual(["the change is documented"]);
   });
 
   it("V5: a check fail dispatches no grader", async () => {
@@ -333,6 +333,16 @@ describe("mixed blocks (D9, A-5.1-8)", () => {
     const h = harness();
     expect((await runAttempt(h, mixed)).verdict).toBe("fail");
     expect(acceptMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not run a grader pass when all criteria are orchestrator-shell checks", async () => {
+    acceptMock.mockImplementation(async () => pass());
+    const h = harness();
+    const t = task({ acceptance: "[acceptance]\ncheck: testsPass\ncriteria: smoke passes (orchestrator shell)\n[/acceptance]" });
+    expect((await runAttempt(h, t)).verdict).toBe("pass");
+    expect(acceptMock).toHaveBeenCalledTimes(1);
+    expect(delegationOf(0).dod.kind).toBe("deterministic");
+    expect(delegationOf(0).dod.criteria).toEqual([]);
   });
 
   it("V5: checks pass and the grader fails or is unverifiable", async () => {
@@ -452,6 +462,29 @@ describe("perimeter (A-5.1-12, I4)", () => {
 });
 
 describe("DoD and scope", () => {
+  it.each([true, false])("drops orchestrator-shell criteria from the DoD (separate acceptance: %s)", (separate) => {
+    const block = "[acceptance]\ncriteria: the feature works\ncriteria: smoke passes (Orchestrator Shell)\ncriteria: integration passes (orchestrator shell)\n[/acceptance]";
+    const t = task({ text: separate ? "Implement the feature." : `Implement the feature.\n${block}`, acceptance: separate ? block : null });
+    expect(planTaskDoD(t)).toMatchObject({ kind: "checker", source: "explicit", checks: [], criteria: ["the feature works"] });
+  });
+
+  it("dispatches no grader for a block containing only orchestrator-shell criteria", async () => {
+    const real = await vi.importActual<typeof import("../../src/verify/gate")>("../../src/verify/gate");
+    acceptMock.mockImplementation(real.accept);
+    const h = harness();
+    const grader = vi.fn(async () => ({ sessionID: "grader-1", text: '{"pass": true, "reasons": ["done"]}' }));
+    const build = h.deps.buildGateDeps;
+    h.deps.buildGateDeps = (...args) => {
+      const deps = build(...args);
+      deps.checker.dispatchGrader = grader;
+      return deps;
+    };
+    const t = task({ text: "Implement the feature.", acceptance: "[acceptance]\ncriteria: smoke passes (orchestrator shell)\n[/acceptance]" });
+    expect(planTaskDoD(t)).toMatchObject({ kind: "none", source: "explicit", criteria: [], checks: [] });
+    expect((await runAttempt(h, t)).verdict).toBe("unverifiable");
+    expect(grader).not.toHaveBeenCalled();
+  });
+
   it("V10: a cwd outside the slot is refused by the gate", async () => {
     acceptMock.mockImplementation(async (d: Delegation) => d.refusedCwd !== undefined ? unverifiable(`cwd ${d.refusedCwd} outside`) : pass());
     const h = harness();

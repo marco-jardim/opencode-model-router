@@ -580,6 +580,11 @@ describe("assembled executor through v2 registration", () => {
       expected = git(fixture.repo, "rev-parse", "HEAD");
       git(fixture.repo, "update-ref", `refs/heads/${value.integration.branch}`, expected);
       value.integration.head = expected; // A previously known integration tip, not a request to move it.
+      // Only the integration branch is ahead: the base branch stays at the compiled base, so approve does not refuse a
+      // stale base (E_STALE_BASE), and a setup that reset the branch to the base would still be caught (base ≠ expected).
+      git(fixture.repo, "reset", "-q", "--hard", fixture.base);
+      expect(git(fixture.repo, "rev-parse", "HEAD")).toBe(value.repo.baseCommit);
+      expect(expected).not.toBe(value.repo.baseCommit);
     }
     await seed(fixture, value);
     let releaseWork = () => {};

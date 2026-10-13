@@ -118,7 +118,7 @@ interface Launch {
   readonly startedAt: IsoTime;
   childId: string | null;
   cancelReason: CancelReason | null;
-  /** `onCreated` was entered before the confirmation deadline. */
+  /** `onCreated` (fresh child) or the first step (resume) entered before the confirmation deadline. */
   hookEntered: boolean;
   timedOut: boolean;
   confirmSettled: boolean;
@@ -135,6 +135,7 @@ interface Launch {
   confirmTimer: { readonly id: number } | null;
   graceTimer: { readonly id: number } | null;
   resolveConfirmation(c: LaunchConfirmation): void;
+  rejectConfirmation(error: unknown): void;
   resolveCompletion(e: ChildEnd): void;
 }
 
@@ -156,6 +157,17 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
     setBounded(lastEpoch, c.sessionID, Math.max(lastEpoch.get(c.sessionID) ?? 0, c.epoch));
   });
   const offEvents = d.hosts.onEvent((e) => {
+    if (e.type === "step.started") {
+      const l = byChild.get(e.sessionID);
+      if (l !== undefined && l.req.resume !== undefined && !l.confirmSettled && l.cancelReason === null && !disposed) {
+        l.hookEntered = true;
+        if (l.confirmTimer !== null) d.clock.clearTimer(l.confirmTimer);
+        l.confirmTimer = null;
+        settleConfirmation(l, {
+          kind: "confirmed", childSessionID: e.sessionID, latencyMs: Math.max(0, d.clock.now() - Date.parse(l.startedAt)),
+        }, "confirmed");
+      }
+    }
     if (isTerminal(e)) onTerminal(e);
   });
 
@@ -236,7 +248,7 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
     forget(l);
   };
 
-  const settleConfirmation = (l: Launch, c: LaunchConfirmation, result: ContextAgeResult): void => {
+  const settleConfirmation = (l: Launch, c: LaunchConfirmation, result: ContextAgeResult, rejection?: unknown): void => {
     if (l.confirmSettled) return;
     l.confirmSettled = true;
     if (c.kind === "confirmed") l.confirmed = true;
@@ -249,7 +261,8 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
         capturedAt: l.contextInfo.capturedAt, ageMs: l.ageMs, result,
       });
     } catch { /* a metric sink never fails a launch */ }
-    l.resolveConfirmation(c);
+    if (rejection !== undefined) l.rejectConfirmation(rejection);
+    else l.resolveConfirmation(c);
   };
 
   const unconfirm = (
@@ -312,7 +325,9 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
       if (!l.confirmSettled) {
         // No error to classify: a runner that returns without ever creating the child leaves the context in doubt.
         markStale(l.req.orchestratorSessionID, l.req.context.epoch);
-        unconfirm(l, "threw", "the runner returned without creating a confirmed child");
+        unconfirm(l, "threw", l.req.resume !== undefined
+          ? "the runner returned without a first step from the resumed child"
+          : "the runner returned without creating a confirmed child");
       }
       settleCompletion(l, { kind: "lost", childSessionID: l.childId, reason: "runner-error", endedAt: d.clock.iso() });
       release(l);
@@ -333,9 +348,17 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
     }
     const at = d.clock.iso();
     if (!l.confirmed) {
-      if (l.cancelReason !== null && l.childId === null) {
+      if (l.req.resume !== undefined && !l.confirmSettled && l.cancelReason === null
+        && typeof error === "object" && error !== null && "code" in error && error.code === "E_NO_CONTEXT") {
+        // A missing resume session is not a stale orchestrator capture. Keep the typed error for Rt to park this attempt.
+        settleConfirmation(l, { kind: "unconfirmed", reason: "threw", error: messageOf(error) }, "threw", error);
+        settleCompletion(l, { kind: "lost", childSessionID: l.childId, reason: "runner-error", endedAt: at });
+        forget(l);
+        return;
+      }
+      if (l.cancelReason !== null && (l.childId === null || l.req.resume !== undefined)) {
         unconfirm(l, "threw", error);
-        settleCompletion(l, { kind: "interrupted", childSessionID: null, reason: l.cancelReason, endedAt: at });
+        settleCompletion(l, { kind: "interrupted", childSessionID: l.childId, reason: l.cancelReason, endedAt: at });
       } else if (isContextSupersededError(error)) {
         unconfirm(l, "superseded", error);
         settleCompletion(l, { kind: "lost", childSessionID: null, reason: "context-superseded", endedAt: at });
@@ -383,6 +406,12 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
   /** The runner's hook: awaited before the child is moved and prompted. */
   const onCreated = async (l: Launch, child: string): Promise<void> => {
     if (disposed || l.cancelReason !== null) throw new Error("[model-router] launch cancelled before the child was prompted");
+    if (l.req.resume !== undefined) {
+      // The runner registers a resumed session through this hook too, but it creates no child and journals no AC/AA.
+      if (child !== l.req.resume.childSessionID) throw new ExecutorError("E_NO_CONTEXT", "the runner did not resume the requested child");
+      if (l.confirmSettled && !l.confirmed) throw new Error("[model-router] resume was not confirmed in time");
+      return;
+    }
     if (!l.timedOut) {
       // In time (guard 1): from here the confirmation waits for this hook, however long it takes.
       l.hookEntered = true;
@@ -448,8 +477,9 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
     }
 
     let resolveConfirmation: (c: LaunchConfirmation) => void = () => undefined;
+    let rejectConfirmation: (error: unknown) => void = () => undefined;
     let resolveCompletion: (e: ChildEnd) => void = () => undefined;
-    const confirmation = new Promise<LaunchConfirmation>((resolve) => { resolveConfirmation = resolve; });
+    const confirmation = new Promise<LaunchConfirmation>((resolve, reject) => { resolveConfirmation = resolve; rejectConfirmation = reject; });
     const completion = new Promise<ChildEnd>((resolve) => { resolveCompletion = resolve; });
     const startedAt = d.clock.iso();
     const l: Launch = {
@@ -457,30 +487,36 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
       childId: null, cancelReason: null, hookEntered: false, timedOut: false, confirmSettled: false, confirmed: false,
       unconfirmed: null, completionSettled: false, runnerDone: false, runnerFailed: false, terminal: null,
       inFlightRegistered: false, bound: false, confirmTimer: null, graceTimer: null,
-      resolveConfirmation, resolveCompletion,
+      resolveConfirmation, rejectConfirmation, resolveCompletion,
     };
 
     // A retained launch fires no `subagent` hook, so the executor writes the dispatch-time rows itself.
     d.bookkeeping.decisionRow(req);
     d.bookkeeping.recordDispatchStart(req, startedAt);
-    d.bookkeeping.registerInFlight(req.taskId, req.attempt, null);
+    d.bookkeeping.registerInFlight(req.taskId, req.attempt, req.resume?.childSessionID ?? null);
     l.inFlightRegistered = true;
     launches.set(key, l);
 
     l.confirmTimer = d.clock.setTimer(confirmTimeoutMs, () => {
       l.confirmTimer = null;
-      if (l.hookEntered || l.confirmSettled) return; // 30 s bounds the host's creation of the child, not our own hook
+      if (l.hookEntered || l.confirmSettled) return; // 30 s bounds child creation / the resumed child's first step, not our own hook
       l.timedOut = true;
       markStale(req.orchestratorSessionID, req.context.epoch);
       unconfirm(l, "timeout", null);
-      settleCompletion(l, { kind: "lost", childSessionID: null, reason: "unconfirmed", endedAt: d.clock.iso() });
+      settleCompletion(l, { kind: "lost", childSessionID: req.resume?.childSessionID ?? null, reason: "unconfirmed", endedAt: d.clock.iso() });
+      if (req.resume !== undefined) l.controller.abort(); // There is no late child to adopt on a resume.
     });
 
     const signal = AbortSignal.any([l.controller.signal, d.lifetime]);
     let running: Promise<{ sessionID: string; text: string }>;
     try {
+      if (req.resume !== undefined) {
+        adopt(l, req.resume.childSessionID);
+        bindChild(l, req.resume.childSessionID);
+      }
       running = d.runner.run({
         parentSessionID: req.orchestratorSessionID,
+        ...(req.resume !== undefined ? { resumeSessionID: req.resume.childSessionID } : {}),
         prompt: req.prompt,
         agent: req.route.agent,
         model: req.route.model,

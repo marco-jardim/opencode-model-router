@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import { INTEGRATION_ESTIMATE_MS, formatSummary, planEstimate, taskEstimate } from "../../src/executor/compile/estimate";
-import { planIdOf } from "../../src/executor/compile/index";
+import { createPlanCompiler, planIdOf } from "../../src/executor/compile/index";
 import { parsePlan } from "../../src/executor/compile/parse";
 import { VALIDATION_CODES, isStrictRepoPath, validateLedger } from "../../src/executor/compile/validate";
 import { ExecutorError, PLAN_ID_PATTERN, executorDefaults, isLedgerV1, type LedgerV1 } from "../../src/executor/types";
@@ -108,6 +108,51 @@ describe("executor compile: pins", () => {
 });
 
 describe("executor compile: drafts (2.3.6)", () => {
+  it("takes the toplevel's base branch tip, not the plan checkout HEAD, and never caches it across compiles", async () => {
+    const h = makeHarness();
+    const old = "1".repeat(40);
+    let tip = "2".repeat(40);
+    const calls: Array<{ args: readonly string[]; cwd: string }> = [];
+    const compiler = createPlanCompiler({ ...h.deps, git: {
+      async run(args, cwd) {
+        calls.push({ args, cwd });
+        if (args.join(" ") === "symbolic-ref --short HEAD") return { code: 0, stdout: "cpx/main\n" };
+        if (args.join(" ") === "rev-parse --verify refs/heads/cpx/main^{commit}") return { code: 0, stdout: `${tip}\n` };
+        if (args.join(" ") === "rev-parse HEAD") return { code: 0, stdout: `${old}\n` };
+        return h.deps.git.run(args, cwd);
+      },
+    } });
+    const path = planPathOf("synthetic/contract-first.md");
+    const first = await compiler.compile(path, compileOpts(h));
+    expect(first.draft.repo.baseBranch).toBe("cpx/main");
+    expect(first.draft.repo.baseCommit).toBe(tip);
+    expect(first.draft.integration.head).toBe(tip);
+    expect(calls.filter(call => call.args[0] === "symbolic-ref" || call.args.includes("--verify"))
+      .every(call => call.cwd === h.view.toplevel)).toBe(true);
+    expect(calls.some(call => call.args.join(" ") === "rev-parse HEAD")).toBe(false);
+    tip = "3".repeat(40);
+    const second = await compiler.compile(path, compileOpts(h));
+    expect(second.draft.repo.baseCommit).toBe(tip);
+    expect(second.draft.integration.head).toBe(tip);
+    expect(first.draft.repo.baseCommit).toBe("2".repeat(40));
+  });
+
+  it("refuses a detached toplevel HEAD and asks for the base branch", async () => {
+    const h = makeHarness();
+    const compiler = createPlanCompiler({ ...h.deps, git: {
+      async run(args, cwd) {
+        if (args[0] === "symbolic-ref") {
+          expect(cwd).toBe(h.view.toplevel);
+          return { code: 128, stdout: "" };
+        }
+        return h.deps.git.run(args, cwd);
+      },
+    } });
+    await expect(compiler.compile(planPathOf("synthetic/contract-first.md"), compileOpts(h))).rejects.toMatchObject({
+      code: "E_INVALID_INPUT", message: expect.stringContaining("check out the base branch"),
+    });
+  });
+
   it.each(SYNTHETIC_OK)("%s compiles to a valid, closed, seq 1 draft", async (name) => {
     const { h, draft } = await compileName(`synthetic/${name}.md`);
     expect(isLedgerV1(draft)).toBe(true);

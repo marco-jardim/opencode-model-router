@@ -314,6 +314,106 @@ describe("launch: what the runner receives", () => {
   });
 });
 
+describe("launch: resume the same attempt", () => {
+  const step = (r: Rig, sessionID = "child-1"): HostSessionEvent => ({
+    type: "step.started", sessionID, providerID: "p", modelID: "m", at: r.clock.clock.iso(),
+  });
+
+  it("passes resumeSessionID, fires no child-created hook, and confirms only on the resumed session's first step", async () => {
+    const r = rig();
+    const done = deferred<{ sessionID: string; text: string }>();
+    // The production runner registers a resume with onCreated before the host starts it.
+    r.fr.state.script = async (req) => { await req.onCreated("child-1"); return done.promise; };
+    const req = r.req({ resume: { childSessionID: "child-1" } });
+    const handle = r.launcher.launch(req, r.hooks);
+    expect(vi.mocked(r.fr.runner.run).mock.calls[0]?.[0]).toMatchObject({ resumeSessionID: "child-1", context: req.context });
+    let confirmation: LaunchConfirmation | null = null;
+    void handle.confirmation.then((c) => { confirmation = c; });
+    await flush();
+    expect(confirmation).toBeNull();
+    expect(r.onChildCreated).not.toHaveBeenCalled();
+    expect(r.onLateChild).not.toHaveBeenCalled();
+    expect(r.binds).toHaveLength(1);
+    expect(r.binds[0]).toMatchObject({ childSessionID: "child-1", workRoot: ROOT, attempt: 1 });
+    expect(r.log).toContain("registerInFlight:child-1");
+    r.fh.emit(step(r, "another-child"));
+    await flush();
+    expect(confirmation).toBeNull();
+    await r.clock.advance(50);
+    r.fh.emit(step(r));
+    expect(await handle.confirmation).toEqual({ kind: "confirmed", childSessionID: "child-1", latencyMs: 50 });
+    r.fh.emit(step(r));
+    expect(r.metrics.map((m) => m.result)).toEqual(["confirmed"]);
+    expect(r.clock.pending()).toBe(0);
+    done.resolve({ sessionID: "child-1", text: "DONE: continued work" });
+    expect(await handle.completion).toMatchObject({ kind: "completed", childSessionID: "child-1", text: "DONE: continued work" });
+    expect(r.onChildCreated).not.toHaveBeenCalled();
+    expect(r.onLateChild).not.toHaveBeenCalled();
+    expect(r.evicted).toEqual(["child-1"]);
+  });
+
+  it("a resumed step or registration after the deadline never calls onLateChild or onChildCreated", async () => {
+    const r = rig();
+    const start = deferred<void>();
+    const done = deferred<{ sessionID: string; text: string }>();
+    r.fr.state.script = async (req) => { await start.promise; await req.onCreated("child-1"); return done.promise; };
+    const handle = r.launcher.launch(r.req({ resume: { childSessionID: "child-1" } }), r.hooks);
+    await r.clock.advance(30_000);
+    expect(await handle.confirmation).toMatchObject({ kind: "unconfirmed", reason: "timeout" });
+    expect(await handle.completion).toMatchObject({ kind: "lost", reason: "unconfirmed", childSessionID: "child-1" });
+    expect(vi.mocked(r.fr.runner.run).mock.calls[0]?.[0].signal.aborted).toBe(true);
+    r.fh.emit(step(r));
+    start.resolve();
+    await flush();
+    expect(r.onLateChild).not.toHaveBeenCalled();
+    expect(r.onChildCreated).not.toHaveBeenCalled();
+    expect(r.metrics.map((m) => m.result)).toEqual(["timeout"]);
+    expect(r.launcher.inFlight()).toEqual([]);
+  });
+
+  it("cancels a resumed session even before its first step without marking the capture stale", async () => {
+    const r = rig();
+    const done = deferred<{ sessionID: string; text: string }>();
+    r.fr.state.script = async (req) => { await req.onCreated("child-1"); return done.promise; };
+    const handle = r.launcher.launch(r.req({ resume: { childSessionID: "child-1" } }), r.hooks);
+    await r.launcher.cancel("T1", 1, "abort");
+    expect(r.fh.hosts.interrupt).toHaveBeenCalledWith("child-1");
+    r.fh.emit(step(r));
+    done.reject(new Error("aborted"));
+    expect(await handle.confirmation).toMatchObject({ kind: "unconfirmed", reason: "threw" });
+    expect(await handle.completion).toMatchObject({ kind: "interrupted", reason: "abort", childSessionID: "child-1" });
+    expect(r.launcher.gate(ORCH).ok).toBe(true);
+    expect(r.onChildCreated).not.toHaveBeenCalled();
+    expect(r.onLateChild).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("surfaces the runner's E_NO_CONTEXT to the runtime (synchronous: %s)", async (synchronous) => {
+    const r = rig();
+    const error = new ExecutorError("E_NO_CONTEXT", "the resumed child session is missing");
+    r.fr.state.script = () => {
+      if (synchronous) throw error;
+      return Promise.reject(error);
+    };
+    const handle = r.launcher.launch(r.req({ resume: { childSessionID: "child-1" } }), r.hooks);
+    await expect(handle.confirmation).rejects.toBe(error);
+    expect(await handle.completion).toMatchObject({ kind: "lost", reason: "runner-error", childSessionID: "child-1" });
+    expect(r.launcher.gate(ORCH).ok).toBe(true);
+    expect(r.onChildCreated).not.toHaveBeenCalled();
+    expect(r.onLateChild).not.toHaveBeenCalled();
+    expect(r.launcher.inFlight()).toEqual([]);
+  });
+
+  it("still re-reads the gated capture before calling the runner for a resume", () => {
+    const r = rig();
+    const req = r.req({ resume: { childSessionID: "child-1" } });
+    const context = r.fr.runner.retainedContext(ORCH);
+    vi.spyOn(r.fr.runner, "retainedContext").mockReturnValueOnce(context).mockReturnValueOnce(null);
+    expect(() => r.launcher.launch(req, r.hooks)).toThrow(expect.objectContaining({ code: "E_NO_CONTEXT" }));
+    expect(r.fr.runner.run).not.toHaveBeenCalled();
+    expect(r.log).toEqual([]);
+  });
+});
+
 describe("completion", () => {
   it("runner result -> completed; settles in-flight and evicts the binding; age metric 'confirmed'", async () => {
     const r = rig();
