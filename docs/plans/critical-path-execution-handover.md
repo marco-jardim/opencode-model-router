@@ -479,6 +479,22 @@ implementations, so the plan now runs on its own data/state dirs (owner decision
   414 green. p31 coverage below gate (runtime 64.7 branches, launch 88.2, expand 86.6): top-ups in flight
   `ses_ecda3f914ffecrInDmoj6twQ26` (runtime test), `ses_ecda3de14ffeip6TaGO8Wk009l` (launch/expand tests). p32: `kick()`
   fix `9b81022` (165 unit green); real-git file still 19/25.
+- **Progress (21:45):** p31: coverage at gate (`3e4a412`, `630189e` runtime defect fix: debounced plan-completed wake
+  retried, `fa97973`): schedule 99.2, capacity 94.3, expand 95.5, launch 96.9, runtime 92.7 branches; 250 green. p32:
+  real-git 25/25 `0f3b831` (harness never created the integration worktree before `resume()`; 5.1 must create it
+  first), `c5260dd` checks/land/suite tests, `d555303` + `2a1a3f6` queue defects (repo lock released on lost ledger
+  lock; live dependent's attempt ended before `dep-reverted`; gate notified once on overlapping `checkPhase`); queue
+  89.47 branches (remaining arms mostly unreachable — left to QA), others >= 92.4; 367 green.
+  **QA-3.1 round 1** (`ses_ecd85bfcaffeh1jG4NqEcg5Bkb`, at `630189e`): 1 blocking (QA-3.1-1 runtime never subscribes
+  host events — confirmed by grep), 1 critical (-2 plan-child grant uses route needs, not authority actions), 6 major
+  (-3 retry stop never applied — `SessionRetry.decision` IS assignable, session.d.ts:127; -4 endless wake loop on
+  pre-confirmation errors; -5 failed wake spins the tick; -6 skipped launch never re-ticks; -7 plan-unscoped keys;
+  -8 step keys), 7 minor, 7 nits. Router verdict FAIL only because its grader ran out of budget confirming evidence.
+  **Decision A-3.1-1 (orchestrator):** the runtime is single-plan per process (QA-3.1-7); approve/start refuse a
+  second running plan; memo M20 amended accordingly. Fixes in flight, split by file: A1 runtime
+  `ses_ecd6e1db8ffeVziFDBa63Yfp0B` [tier:heavy], A2 capacity/launch/expand `ses_ecd6debafffe3IzhScn9aBBYk3`, B v2
+  adapter + types (additive) + CHANGELOG `ses_ecd6da1a2fferr7fsFuGqCsShJ` [tier:heavy]. QA-3.2 round 1
+  `ses_ecd78b6bdffe3dZy0K0H5o91Ed` at `2a1a3f6` running.
 
 *(superseded)* **NEXT ACTION (2026-10-12 ≈16:30): DF-1.1 re-switch — waiting for the owner restart; then the DF-1.1 self-check and
 re-probes (DF1.4.a with `df1.1`, c runner criterion, d, e), then Wave 3.** `cpx/pdf1-1` merged into `cpx/main` as
