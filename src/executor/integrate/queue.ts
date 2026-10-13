@@ -376,6 +376,11 @@ export function createRepoLockFactory(o: {
 
   async function sleep(ms: number, signal: AbortSignal): Promise<void> {
     await new Promise<void>(resolve => {
+      // An abort that fired during the caller's file-system awaits must not leave this wait to the clock alone.
+      if (signal.aborted) {
+        resolve();
+        return;
+      }
       const onAbort = (): void => { o.clock.clearTimer(h); resolve(); };
       const h = o.clock.setTimer(ms, () => { signal.removeEventListener("abort", onAbort); resolve(); });
       signal.addEventListener("abort", onAbort, { once: true });
