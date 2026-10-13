@@ -163,6 +163,25 @@ const V2_DEFAULTS = {
   advisor: { enabled: true, noticeIntervalHours: 24, notify: true },
   background: { mode: "auto", minPredictedMs: 45_000 },
   leases: { mode: "enforce", run: "annotate" },
+  executor: {
+    maxParallel: 4,
+    slotsDir: null,
+    approve: "ask",
+    crossPhase: "gate",
+    land: "ff-when-clean",
+    batchMax: 4,
+    maxAttempts: 3,
+    qaMaxRounds: 3,
+    integrationChecks: "auto",
+    phaseSuite: "auto",
+    provision: "auto",
+    python: "auto",
+    sharedContextChars: 12000,
+    capacityCooldownMs: 120000,
+    capacityPauseMs: 900000,
+    wakeDebounceMs: 5000,
+    circuitBreaker: { failureRatio: 0.4, minAttempts: 5, consecutiveFailures: 3 },
+  },
   applied: { host: "v2", requestedEngine: "static", engineCoerced: false, rolesSource: "default" },
 };
 
@@ -422,6 +441,7 @@ describe("resolveRouting — configured values", () => {
       advisor: { enabled: false, noticeIntervalHours: 24, notify: true },
       background: { mode: "auto", minPredictedMs: 45_000 },
       leases: { mode: "enforce", run: "annotate" },
+      executor: V2_DEFAULTS.executor,
       applied: { host: "v2", requestedEngine: "enforce", engineCoerced: false, rolesSource: "default" },
     });
   });

@@ -315,6 +315,28 @@ describe("docs drift: cost-aware routing engine", () => {
     expect(missing).toEqual([]);
   });
 
+  it("documents every routing.executor leaf as a prefix-less routing-table row with its default, and its trust", () => {
+    const doc = read("docs/CONFIG_REFERENCE.md").replace(/\r\n/g, "\n");
+    const table = doc.slice(doc.indexOf("\n### Keys\n"), doc.indexOf("\n### Trust: which file may set what\n"));
+    const trust = doc.slice(doc.indexOf("\n### Trust: which file may set what\n"), doc.indexOf("\n### Engine modes\n"));
+    expect(table.length).toBeGreaterThan(0);
+    expect(trust.length).toBeGreaterThan(0);
+    const leaves = leafPaths({ executor: ROUTING_DEFAULTS.executor });
+    expect(leaves.length).toBe(19);
+    const rows = table.split("\n").filter((line) => line.startsWith("| `executor."));
+    expect(rows.map((line) => /^\| `([^`]+)` \|/.exec(line)?.[1])).toEqual(leaves);
+    for (const row of rows) expect(row, row).not.toContain("| `routing.");
+    for (const leaf of leaves) {
+      const key = leaf.split(".").reduce<unknown>((node, part) => (node as Record<string, unknown>)[part], ROUTING_DEFAULTS);
+      const row = rows.find((line) => line.startsWith(`| \`${leaf}\` |`))!;
+      expect(row, leaf).toContain(`| \`${JSON.stringify(key)}\` |`);
+    }
+    for (const trusted of ["slotsDir", "integrationChecks", "phaseSuite", "provision", "python"]) {
+      expect(trust, trusted).toContain(trusted);
+      expect(rows.find((line) => line.startsWith(`| \`executor.${trusted}\` |`)), trusted).toContain("Only the global override may set it");
+    }
+  });
+
   it("names every engine mode, task class and cost-doctor finding in ROUTING_ENGINE.md", () => {
     const doc = read("docs/ROUTING_ENGINE.md");
     const names = [...ROUTING_ENGINES, ...ROUTING_TASK_CLASSES, ...FINDING_IDS];
@@ -564,6 +586,10 @@ describe("docs drift: defaults, ranges, ids and severities (QA-3.1-18)", () => {
       "leases.mode": defaults.leases.mode,
       "leases.run": defaults.leases.run,
     };
+    for (const key of leafPaths(defaults.executor as unknown as Record<string, unknown>)) {
+      const value = key.split(".").reduce<unknown>((node, part) => (node as Record<string, unknown>)[part], defaults.executor);
+      expected[`executor.${key}`] = value;
+    }
     const wrong: string[] = [];
     for (const [key, value] of Object.entries(expected)) {
       const cells = keyRow(doc, key);

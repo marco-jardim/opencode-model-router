@@ -854,6 +854,25 @@ Every key is optional. Types and ranges are enforced by `validateConfig`; defaul
 | `background.minPredictedMs` | `integer` | `45000` | `[0, 3600000]` | With `background.mode: "auto"`, the predicted duration (milliseconds) from which a dispatch runs in the background. **OpenCode v2 only**: v1 ignores it and logs one notice per process (`background dispatch requires OpenCode v2; ignored: <keys>`) naming every configured key. A value outside the range or not an integer logs one warning and the default applies. |
 | `leases.mode` | `string` | `"enforce"` | `enforce \| off` | Work leases: one holder per repository area at a time. `off` takes no lease and refuses nothing. **OpenCode v2 only**: v1 ignores it and logs one notice per process (`leases require OpenCode v2; ignored: <keys>`) naming every configured key (`background dispatch and leases require OpenCode v2; ignored: <keys>` when `background.*` keys are configured too). An invalid value logs one warning and the default applies. |
 | `leases.run` | `string` | `"annotate"` | `annotate \| refuse` | What `router_run` does when its target is leased by another holder: `annotate` runs it and notes the lease in the result; `refuse` refuses the run. **OpenCode v2 only**: v1 ignores it and logs one notice per process (`leases require OpenCode v2; ignored: <keys>`) naming every configured key (`background dispatch and leases require OpenCode v2; ignored: <keys>` when `background.*` keys are configured too). An invalid value logs one warning and the default applies. |
+| `executor.maxParallel` | `integer` | `4` | `[1, 8]` | Plan executor: tasks run at once. **OpenCode v2 only** (every `executor.*` key): v1 ignores it and logs one notice per process naming every configured key. A value outside its range, of the wrong type or not in the listed values logs one warning and the default applies. |
+| `executor.slotsDir` | `string \| null` | `null` | absolute path | Where the executor's slot worktrees live. `null` = computed: `<repository drive>:\.omr-slots\<planId>`. Must be an absolute drive path (`C:\…`), not a drive root, not UNC, free of `*`, on the repository's drive, and neither inside nor an ancestor of the repository (`validateSlotsDir`, checked at approval, where the repository is known; realpaths compared case-insensitively on Windows). Only the global override may set it (see Trust). |
+| `executor.approve` | `string` | `"ask"` | `ask \| auto` | Whether a plan run waits for the user's approval (`ask`) or starts on its own (`auto`). |
+| `executor.crossPhase` | `string` | `"gate"` | `gate \| inferred` | `gate`: a phase starts only after the previous phase's gate passed; `inferred`: tasks of later phases may start once their own dependencies are met. |
+| `executor.land` | `string` | `"ff-when-clean"` | `ff-when-clean \| manual` | How a finished plan lands on the branch: fast-forward when the checkout is clean, or leave it to the user. |
+| `executor.batchMax` | `integer` | `4` | `[1, 8]` | Most tasks dispatched in one batch. |
+| `executor.maxAttempts` | `integer` | `3` | `[1, 6]` | Attempts per task before it is marked failed. |
+| `executor.qaMaxRounds` | `integer` | `3` | `[1, 8]` | Most QA rounds of a phase gate. |
+| `executor.integrationChecks` | `string \| array` | `"auto"` | `"auto"` or `[{ script, args }]` | Checks run after each integration. An entry resolves like `router_run`: a `routing.run.commands` entry, or an allowlisted `package.json` script with no `args`. Only the global override may set it (see Trust). |
+| `executor.phaseSuite` | `string \| array` | `"auto"` | `"auto"`, `"off"` or `[{ script, args }]` | The suite run at a phase gate; entries resolve like `executor.integrationChecks`. `off` skips it. Only the global override may set it (see Trust). |
+| `executor.provision` | `string \| object` | `"auto"` | `"auto"` or `{ <manager>: string[][] }` | How a slot worktree is provisioned: `auto`, or per package manager a list of argv arrays (no shell). Only the global override may set it (see Trust). |
+| `executor.python` | `string` | `"auto"` | `"auto"` or an absolute path | The Python interpreter the executor's helpers use. Only the global override may set it (see Trust). |
+| `executor.sharedContextChars` | `integer` | `12000` | `[0, 60000]` | Characters of shared plan context given to each task. |
+| `executor.capacityCooldownMs` | `integer` | `120000` | `[10000, 3600000]` | Cooldown (milliseconds) of a model after a capacity error. |
+| `executor.capacityPauseMs` | `integer` | `900000` | `[60000, 86400000]` | How long (milliseconds) the executor pauses when every model is out of capacity. |
+| `executor.wakeDebounceMs` | `integer` | `5000` | `[1000, 60000]` | Debounce (milliseconds) of the executor's wake-ups. |
+| `executor.circuitBreaker.failureRatio` | `number` | `0.4` | `[0.1, 1]` | Failure ratio from which the circuit breaker opens, once `minAttempts` attempts were made. |
+| `executor.circuitBreaker.minAttempts` | `integer` | `5` | `[1, 50]` | Attempts needed before the failure ratio counts. |
+| `executor.circuitBreaker.consecutiveFailures` | `integer` | `3` | `[1, 50]` | Consecutive failures that open the circuit breaker on their own. |
 
 Fully resolved defaults on **OpenCode v2** (this block is parsed by a test and compared with `resolveRouting`, so it cannot drift from the code; on v1 only `roles` differs: `{}`):
 
@@ -880,15 +899,36 @@ Fully resolved defaults on **OpenCode v2** (this block is parsed by a test and c
   "sessionReuse": { "maxContextFraction": 0.6 },
   "advisor": { "enabled": true, "noticeIntervalHours": 24, "notify": true },
   "background": { "mode": "auto", "minPredictedMs": 45000 },
-  "leases": { "mode": "enforce", "run": "annotate" }
+  "leases": { "mode": "enforce", "run": "annotate" },
+  "executor": {
+    "maxParallel": 4,
+    "slotsDir": null,
+    "approve": "ask",
+    "crossPhase": "gate",
+    "land": "ff-when-clean",
+    "batchMax": 4,
+    "maxAttempts": 3,
+    "qaMaxRounds": 3,
+    "integrationChecks": "auto",
+    "phaseSuite": "auto",
+    "provision": "auto",
+    "python": "auto",
+    "sharedContextChars": 12000,
+    "capacityCooldownMs": 120000,
+    "capacityPauseMs": 900000,
+    "wakeDebounceMs": 5000,
+    "circuitBreaker": { "failureRatio": 0.4, "minAttempts": 5, "consecutiveFailures": 3 }
+  }
 }
 ```
 
-**Unknown keys** inside `routing` (and its blocks) are ignored, not rejected, like every other block of this file, so a config written for a newer release still loads. They are not silent, though: the path of each one (`routing.margn`, `routing.classifier.bakend`, …) is logged once per process (per message text) through the plugin logger as `ignoring unknown routing keys: …` and listed under the marker in the bare `/router` view as `router: config notice: …`. Only the prototype-reparenting keys `__proto__`, `constructor` and `prototype` are refused. A value of the wrong type or outside its range throws; in an overrides file that drops the layer with a warning, and a reload that turns invalid keeps serving the last valid config and logs why.
+**Unknown keys** inside `routing` (and its blocks) are ignored, not rejected, like every other block of this file, so a config written for a newer release still loads. They are not silent, though: the path of each one (`routing.margn`, `routing.classifier.bakend`, …) is logged once per process (per message text) through the plugin logger as `ignoring unknown routing keys: …` and listed under the marker in the bare `/router` view as `router: config notice: …`. Only the prototype-reparenting keys `__proto__`, `constructor` and `prototype` are refused. A value of the wrong type or outside its range throws for the classic keys (`engine` through `advisor`); in an overrides file that drops the layer with a warning, and a reload that turns invalid keeps serving the last valid config and logs why. The v2-only blocks `background`, `leases` and `executor` (and the roles keys) are tolerant instead: an invalid entry logs one warning and its default applies.
 
 ### Trust: which file may set what
 
 `routing.classifier.{backend, model, baseUrl, apiKeyEnv, presets}` and `routing.outcomes.path` decide where task text is sent and where outcome data is written, so a file that arrives with a repository must not be able to set them. They are honoured from the bundled `tiers.json` and from the **global** override file only. In the **project-local** override (`<repo>/.opencode/opencode-model-router.overrides.jsonc`) they are dropped before the layers are merged (a `classifier` or `outcomes` block, or a `routing` block, left empty by that is removed too, so a project file whose only `routing` content was forbidden does not switch variant steps on), with one log line per process and text, e.g. `ignoring routing.classifier.baseUrl from <path>: only the global override may set it`; `/router` lists the notice. The HTTP classifier backends additionally refuse to send an API key over plain `http:` to a non-loopback host.
+
+**Executor keys (D18):** `routing.executor.{slotsDir, integrationChecks, phaseSuite, provision, python}` decide where the plan executor writes and which commands, argv arrays and interpreter it runs in the user's checkout, so they follow the same rule: honoured from the bundled `tiers.json` and the **global** override only, dropped from the project-local override with the same one-line notice (`ignoring routing.executor.slotsDir from <path>: only the global override may set it`). The other `routing.executor.*` keys only tune limits and modes and may be set in either file. `slotsDir` is further checked against the repository when a plan is approved (`validateSlotsDir`): same drive as the repository, neither inside nor an ancestor of it.
 
 **A35 (A18 budget protection):** a project override may only tighten `routing.classifier.maxStateChars`, `routing.classifier.samples` and `routing.classifier.timeoutMs`. Each effective value is `min(lower-layer value or default, project value)`, with an A18 notice when clamped. A project may still set `routing.engine`, `routing.profile` and `routing.margin`: they choose among the user's configured tiers, and the D9 never-down guards hold in every mode. Other allowed keys still apply normally.
 

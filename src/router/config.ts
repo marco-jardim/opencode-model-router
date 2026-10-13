@@ -8,8 +8,9 @@ import {
   writeFileSync,
 } from "node:fs";
 import { availableParallelism, homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
+import { dirname, isAbsolute, join, posix, resolve as resolvePath, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
+import { EXECUTOR_LIMITS, type ExecutorConfig, type RunCommandRef } from "../executor/types";
 import { formatRouterLine } from "./build-info";
 import { parseJsonc } from "./jsonc";
 import type { DelegateInstructionsPolicy } from "./instructions";
@@ -327,9 +328,19 @@ export interface LeasesConfig {
   run?: LeasesRunPolicy;
 }
 
+/**
+ * `routing.executor` (OpenCode v2 only), as written: every field optional. The trusted keys
+ * (`slotsDir`, `integrationChecks`, `phaseSuite`, `provision`, `python`) are global only (D18).
+ */
+export type ExecutorOverrides = Partial<Omit<ExecutorConfig, "circuitBreaker">> & {
+  circuitBreaker?: Partial<ExecutorConfig["circuitBreaker"]>;
+};
+
 export interface RoutingConfig {
   background?: BackgroundConfig;
   leases?: LeasesConfig;
+  /** OpenCode v2 only; v1 ignores the block (see configuredV2OnlyKeys). */
+  executor?: ExecutorOverrides;
   engine?: RoutingEngine;
   profile?: RoutingProfile;
   margin?: number;
@@ -1854,6 +1865,206 @@ function sanitizeLeases(value: unknown): TolerantBlock<LeasesConfig> {
   return { value: out, issues };
 }
 
+const EXECUTOR_APPROVE_MODES = ["ask", "auto"] as const;
+const EXECUTOR_CROSS_PHASE_MODES = ["gate", "inferred"] as const;
+const EXECUTOR_LAND_MODES = ["ff-when-clean", "manual"] as const;
+const EXECUTOR_INTEGER_KEYS = [
+  "maxParallel",
+  "batchMax",
+  "maxAttempts",
+  "qaMaxRounds",
+  "sharedContextChars",
+  "capacityCooldownMs",
+  "capacityPauseMs",
+  "wakeDebounceMs",
+] as const;
+const EXECUTOR_BREAKER_INTEGER_KEYS = ["minAttempts", "consecutiveFailures"] as const;
+const UNSAFE_OBJECT_KEYS: readonly string[] = ["__proto__", "constructor", "prototype"];
+
+/** An inclusive-range number key; an invalid value yields an issue and no value (the default applies). */
+function tolerantRange(
+  block: Record<string, unknown>,
+  key: string,
+  path: string,
+  range: readonly [number, number],
+  fallback: number,
+  integer: boolean,
+  issues: string[],
+): number | undefined {
+  const raw = block[key];
+  if (raw === undefined) return undefined;
+  if (typeof raw === "number" && Number.isFinite(raw) && (!integer || Number.isInteger(raw)) && raw >= range[0] && raw <= range[1]) {
+    return raw;
+  }
+  issues.push(
+    `${path}.${key} must be ${integer ? "an integer" : "a number"} from ${range[0]} to ${range[1]} (got ${showTolerant(raw)}); using ${fallback}`,
+  );
+  return undefined;
+}
+
+/**
+ * Repo-independent rules for `routing.executor.slotsDir`: an absolute drive path (`C:\…`), not a
+ * drive root, not UNC / device, and free of `*`. Returns the problem, or `undefined` when valid.
+ * The repository-relative rules are {@link validateSlotsDir}.
+ */
+export function slotsDirProblem(value: string): string | undefined {
+  if (value.includes("*")) return "must not contain '*'";
+  if (/^[\\/]{2}/.test(value)) return "must not be a UNC or device path";
+  if (!/^[A-Za-z]:[\\/]/.test(value)) return "must be an absolute path on a drive (like C:\\.omr-slots)";
+  if (/^[A-Za-z]:[\\/]*$/.test(win32.normalize(value))) return "must not be a drive root";
+  return undefined;
+}
+
+/** Resolve symlinks of the longest existing prefix of `p`; the missing tail is appended unchanged. */
+function realpathOfExistingPrefix(p: string): string {
+  const tail: string[] = [];
+  let current = p;
+  for (;;) {
+    try {
+      return tail.length === 0 ? realpathSync(current) : join(realpathSync(current), ...tail.reverse());
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) return p;
+      tail.push(current.slice(parent.length).replace(/^[\\/]+/, ""));
+      current = parent;
+    }
+  }
+}
+
+export type SlotsDirCheck = { readonly ok: true } | { readonly ok: false; readonly reason: string };
+
+/**
+ * The repository-relative rules for `routing.executor.slotsDir` (D18), applied at approval, where
+ * the repository is known: `slotsDir` must pass {@link slotsDirProblem}, sit on the repository's
+ * drive, and be neither inside nor an ancestor of `toplevel` (the repository's top-level
+ * directory). Realpaths are compared, case-insensitively on win32.
+ */
+export function validateSlotsDir(slotsDir: string, toplevel: string): SlotsDirCheck {
+  const base = slotsDirProblem(slotsDir);
+  if (base !== undefined) return { ok: false, reason: base };
+  const fold = (p: string): string => (process.platform === "win32" ? p.toLowerCase() : p);
+  const pathApi = process.platform === "win32" ? win32 : posix;
+  const slots = fold(pathApi.resolve(realpathOfExistingPrefix(slotsDir)));
+  const repo = fold(pathApi.resolve(realpathOfExistingPrefix(toplevel)));
+  if (fold(pathApi.parse(slots).root) !== fold(pathApi.parse(repo).root)) {
+    return { ok: false, reason: "must be on the repository's drive" };
+  }
+  const within = (outer: string, inner: string): boolean => {
+    const rel = pathApi.relative(outer, inner);
+    return rel === "" || !(rel === ".." || rel.startsWith(`..${pathApi.sep}`) || pathApi.isAbsolute(rel));
+  };
+  if (within(repo, slots)) return { ok: false, reason: "must not be inside the repository" };
+  if (within(slots, repo)) return { ok: false, reason: "must not be an ancestor of the repository" };
+  return { ok: true };
+}
+
+/** A `[{script, args}]` list (a `router_run`-style reference); `undefined` when any entry is malformed. */
+function parseRunRefs(value: unknown): RunCommandRef[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out: RunCommandRef[] = [];
+  for (const entry of value as unknown[]) {
+    if (!isPlainObject(entry) || typeof entry.script !== "string" || entry.script.trim() === "") return undefined;
+    const args = entry.args === undefined ? [] : entry.args;
+    if (!Array.isArray(args) || !(args as unknown[]).every((a) => typeof a === "string")) return undefined;
+    out.push({ script: entry.script, args: [...(args as string[])] });
+  }
+  return out;
+}
+
+/** `{ <manager>: string[][] }` (argv arrays); `undefined` when malformed. */
+function parseProvision(value: unknown): Record<string, string[][]> | undefined {
+  if (!isPlainObject(value)) return undefined;
+  const out: Record<string, string[][]> = {};
+  for (const [manager, argvs] of Object.entries(value)) {
+    if (manager === "" || UNSAFE_OBJECT_KEYS.includes(manager) || !Array.isArray(argvs)) return undefined;
+    const list: string[][] = [];
+    for (const argv of argvs as unknown[]) {
+      if (!Array.isArray(argv) || argv.length === 0) return undefined;
+      if (!(argv as unknown[]).every((a) => typeof a === "string") || (argv as string[])[0] === "") return undefined;
+      list.push([...(argv as string[])]);
+    }
+    out[manager] = list;
+  }
+  return out;
+}
+
+/**
+ * `routing.executor` (OpenCode v2 only), tolerant like {@link sanitizeBackground}: an invalid entry
+ * never throws, it is reported in `issues` and the default applies. The trusted keys are dropped
+ * from a project layer before this runs (`GLOBAL_ONLY_ROUTING_KEYS`).
+ */
+function sanitizeExecutor(value: unknown): TolerantBlock<ExecutorOverrides> {
+  const issues: string[] = [];
+  if (value === undefined) return { value: undefined, issues };
+  if (!isPlainObject(value)) {
+    issues.push(`routing.executor must be an object (got ${showTolerant(value)}); ignored`);
+    return { value: undefined, issues };
+  }
+  const p = "routing.executor";
+  const d = ROUTING_DEFAULTS.executor;
+  const out: ExecutorOverrides = {};
+
+  for (const key of EXECUTOR_INTEGER_KEYS) {
+    const v = tolerantRange(value, key, p, EXECUTOR_LIMITS[key], d[key], true, issues);
+    if (v !== undefined) out[key] = v;
+  }
+  const approve = tolerantEnum(value, "approve", p, EXECUTOR_APPROVE_MODES, d.approve, issues);
+  if (approve !== undefined) out.approve = approve;
+  const crossPhase = tolerantEnum(value, "crossPhase", p, EXECUTOR_CROSS_PHASE_MODES, d.crossPhase, issues);
+  if (crossPhase !== undefined) out.crossPhase = crossPhase;
+  const land = tolerantEnum(value, "land", p, EXECUTOR_LAND_MODES, d.land, issues);
+  if (land !== undefined) out.land = land;
+
+  const slotsDir = value.slotsDir;
+  if (slotsDir !== undefined) {
+    const problem = slotsDir === null ? undefined : typeof slotsDir !== "string" ? "must be a string or null" : slotsDirProblem(slotsDir);
+    if (problem === undefined) out.slotsDir = slotsDir as string | null;
+    else issues.push(`${p}.slotsDir ${problem} (got ${showTolerant(slotsDir)}); using ${d.slotsDir}`);
+  }
+
+  const checks = value.integrationChecks;
+  if (checks !== undefined) {
+    const refs = checks === "auto" ? "auto" : parseRunRefs(checks);
+    if (refs !== undefined) out.integrationChecks = refs;
+    else issues.push(`${p}.integrationChecks must be "auto" or an array of {script, args} (got ${showTolerant(checks)}); using ${d.integrationChecks}`);
+  }
+  const suite = value.phaseSuite;
+  if (suite !== undefined) {
+    const refs = suite === "auto" || suite === "off" ? suite : parseRunRefs(suite);
+    if (refs !== undefined) out.phaseSuite = refs;
+    else issues.push(`${p}.phaseSuite must be "auto", "off" or an array of {script, args} (got ${showTolerant(suite)}); using ${d.phaseSuite}`);
+  }
+  const provision = value.provision;
+  if (provision !== undefined) {
+    const parsed = provision === "auto" ? "auto" : parseProvision(provision);
+    if (parsed !== undefined) out.provision = parsed;
+    else issues.push(`${p}.provision must be "auto" or an object of argv arrays per manager (got ${showTolerant(provision)}); using ${d.provision}`);
+  }
+  const python = value.python;
+  if (python !== undefined) {
+    if (typeof python === "string" && (python === "auto" || (isAbsolute(python) && !python.includes("\0")))) out.python = python;
+    else issues.push(`${p}.python must be "auto" or an absolute path (got ${showTolerant(python)}); using ${d.python}`);
+  }
+
+  const breaker = value.circuitBreaker;
+  if (breaker !== undefined) {
+    if (!isPlainObject(breaker)) {
+      issues.push(`${p}.circuitBreaker must be an object (got ${showTolerant(breaker)}); ignored`);
+    } else {
+      const bp = `${p}.circuitBreaker`;
+      const b: Partial<ExecutorConfig["circuitBreaker"]> = {};
+      const ratio = tolerantRange(breaker, "failureRatio", bp, EXECUTOR_LIMITS.failureRatio, d.circuitBreaker.failureRatio, false, issues);
+      if (ratio !== undefined) b.failureRatio = ratio;
+      for (const key of EXECUTOR_BREAKER_INTEGER_KEYS) {
+        const v = tolerantRange(breaker, key, bp, EXECUTOR_LIMITS[key], d.circuitBreaker[key], true, issues);
+        if (v !== undefined) b[key] = v;
+      }
+      out.circuitBreaker = b;
+    }
+  }
+  return { value: out, issues };
+}
+
 /**
  * The v2-only `routing` keys the raw config configures, as dotted paths in a fixed order.
  * `raw` is the config as written (its `routing` block is read) or the `routing` block
@@ -1874,6 +2085,20 @@ export function configuredV2OnlyKeys(raw: unknown): string[] {
     if (!isPlainObject(value)) continue;
     for (const child of children) {
       if (Object.hasOwn(value, child) && value[child] !== undefined) keys.push(`routing.${block}.${child}`);
+    }
+  }
+  const executor = routing.executor;
+  if (isPlainObject(executor)) {
+    for (const child of ROUTING_KNOWN_KEYS.executor!) {
+      if (!Object.hasOwn(executor, child) || executor[child] === undefined) continue;
+      const nested = executor[child];
+      if (child === "circuitBreaker" && isPlainObject(nested)) {
+        for (const leaf of ROUTING_KNOWN_KEYS.circuitBreaker!) {
+          if (Object.hasOwn(nested, leaf) && nested[leaf] !== undefined) keys.push(`routing.executor.circuitBreaker.${leaf}`);
+        }
+      } else {
+        keys.push(`routing.executor.${child}`);
+      }
     }
   }
   return keys;
@@ -1944,6 +2169,8 @@ function validateRouting(value: unknown): RoutingConfig | undefined {
   if (background !== undefined) out.background = background;
   const leases = sanitizeLeases(routing.leases).value;
   if (leases !== undefined) out.leases = leases;
+  const executor = sanitizeExecutor(routing.executor).value;
+  if (executor !== undefined) out.executor = executor;
 
   const outcomes = readBlock(routing, "outcomes", "routing");
   if (outcomes !== undefined) {
@@ -2331,6 +2558,13 @@ const GLOBAL_ONLY_ROUTING_KEYS: ReadonlyArray<readonly [block: string, key: stri
   ["classifier", "apiKeyEnv"],
   ["classifier", "presets"],
   ["outcomes", "path"],
+  // D18: the plan executor runs these in the user's checkout and on its drive; a repository
+  // must not choose its own slot directory, check commands, provisioning argv or interpreter.
+  ["executor", "slotsDir"],
+  ["executor", "integrationChecks"],
+  ["executor", "phaseSuite"],
+  ["executor", "provision"],
+  ["executor", "python"],
 ];
 
 /** Roles keys (#84) a project layer must not carry; `routing.delegation` is allowed there. */
@@ -2640,9 +2874,30 @@ const ROUTING_KNOWN_KEYS: Readonly<Record<string, readonly string[]>> = {
     "workRoots",
     "background",
     "leases",
+    "executor",
   ],
   background: ["mode", "minPredictedMs"],
   leases: ["mode", "run"],
+  executor: [
+    "maxParallel",
+    "slotsDir",
+    "approve",
+    "crossPhase",
+    "land",
+    "batchMax",
+    "maxAttempts",
+    "qaMaxRounds",
+    "integrationChecks",
+    "phaseSuite",
+    "provision",
+    "python",
+    "sharedContextChars",
+    "capacityCooldownMs",
+    "capacityPauseMs",
+    "wakeDebounceMs",
+    "circuitBreaker",
+  ],
+  circuitBreaker: ["failureRatio", "minAttempts", "consecutiveFailures"],
   detection: ["deterministic", "grader", "none"],
   classifier: ["backend", "model", "baseUrl", "apiKeyEnv", "timeoutMs", "samples", "maxStateChars", "presets"],
   preset: ["backend", "model"],
@@ -2668,6 +2923,13 @@ export function findUnknownRoutingKeys(routing: unknown): string[] {
   for (const block of ["detection", "classifier", "outcomes", "sessionReuse", "advisor", "background", "leases"] as const) {
     const value = routing[block];
     if (isPlainObject(value)) check(value, ROUTING_KNOWN_KEYS[block]!, `routing.${block}`);
+  }
+  const executor = routing.executor;
+  if (isPlainObject(executor)) {
+    check(executor, ROUTING_KNOWN_KEYS.executor!, "routing.executor");
+    if (isPlainObject(executor.circuitBreaker)) {
+      check(executor.circuitBreaker, ROUTING_KNOWN_KEYS.circuitBreaker!, "routing.executor.circuitBreaker");
+    }
   }
   const classifier = routing.classifier;
   const presets = isPlainObject(classifier) ? classifier.presets : undefined;
@@ -2701,7 +2963,11 @@ export function collectRoutingNotices(rawRouting: unknown, cfg: RouterConfig): s
     messages.push(`ignoring unknown routing key${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}`);
   }
   if (isPlainObject(rawRouting)) {
-    messages.push(...sanitizeBackground(rawRouting.background).issues, ...sanitizeLeases(rawRouting.leases).issues);
+    messages.push(
+      ...sanitizeBackground(rawRouting.background).issues,
+      ...sanitizeLeases(rawRouting.leases).issues,
+      ...sanitizeExecutor(rawRouting.executor).issues,
+    );
   }
   for (const [taskClass, agents] of Object.entries(cfg.routing?.roles ?? {})) {
     for (const agent of agents) {
@@ -3175,6 +3441,26 @@ export const ROUTING_DEFAULTS = Object.freeze({
   // OpenCode v2 only; v1 ignores both blocks (see configuredV2OnlyKeys).
   background: Object.freeze({ mode: "auto" as BackgroundMode, minPredictedMs: 45_000 }),
   leases: Object.freeze({ mode: "enforce" as LeasesMode, run: "annotate" as LeasesRunPolicy }),
+  // OpenCode v2 only (plan executor); v1 ignores the block (see configuredV2OnlyKeys). Ranges: EXECUTOR_LIMITS.
+  executor: Object.freeze({
+    maxParallel: 4,
+    slotsDir: null as string | null,
+    approve: "ask" as ExecutorConfig["approve"],
+    crossPhase: "gate" as ExecutorConfig["crossPhase"],
+    land: "ff-when-clean" as ExecutorConfig["land"],
+    batchMax: 4,
+    maxAttempts: 3,
+    qaMaxRounds: 3,
+    integrationChecks: "auto" as ExecutorConfig["integrationChecks"],
+    phaseSuite: "auto" as ExecutorConfig["phaseSuite"],
+    provision: "auto" as ExecutorConfig["provision"],
+    python: "auto",
+    sharedContextChars: 12_000,
+    capacityCooldownMs: 120_000,
+    capacityPauseMs: 900_000,
+    wakeDebounceMs: 5_000,
+    circuitBreaker: Object.freeze({ failureRatio: 0.4, minAttempts: 5, consecutiveFailures: 3 }),
+  }),
 });
 
 export interface ResolvedClassifier {
@@ -3215,6 +3501,8 @@ export interface ResolvedRouting {
   readonly advisor: Readonly<Required<AdvisorConfig>>;
   readonly background: Readonly<Required<BackgroundConfig>>;
   readonly leases: Readonly<Required<LeasesConfig>>;
+  /** Plan executor (v2 only); the defaults on v1, where the block is ignored. */
+  readonly executor: Readonly<ExecutorConfig>;
   readonly applied: RoutingApplied;
 }
 
@@ -3233,6 +3521,63 @@ export function resetRoutingWarnings(): void {
   warnedEngineIgnoredOnV1 = false;
   warnedRoutingIssues.clear();
   loggedNoticeTexts.clear();
+}
+
+const freezeRunRefs = (refs: ExecutorConfig["integrationChecks"]): ExecutorConfig["integrationChecks"] =>
+  refs === "auto" ? refs : (Object.freeze(refs.map((ref) => Object.freeze({ script: ref.script, args: Object.freeze([...ref.args]) }))) as unknown as RunCommandRef[]);
+
+/**
+ * `routing.executor` with the defaults applied: deeply frozen, never aliasing the config. An invalid
+ * value warns once per process (like `background`) and its default applies. `undefined` = all defaults.
+ */
+function resolveExecutor(
+  raw: ExecutorOverrides | undefined,
+  logger: Pick<PluginLogger, "warn"> | undefined,
+): Readonly<ExecutorConfig> {
+  const d = ROUTING_DEFAULTS.executor;
+  const sanitized = sanitizeExecutor(raw);
+  for (const issue of sanitized.issues) {
+    if (warnedRoutingIssues.has(issue)) continue;
+    warnedRoutingIssues.add(issue);
+    if (logger) logger.warn(issue);
+    else console.warn(`[model-router] ${issue}`);
+  }
+  const e = sanitized.value ?? {};
+  const provision = e.provision ?? d.provision;
+  const phaseSuite = e.phaseSuite ?? d.phaseSuite;
+  return Object.freeze({
+    maxParallel: e.maxParallel ?? d.maxParallel,
+    slotsDir: e.slotsDir ?? d.slotsDir,
+    approve: e.approve ?? d.approve,
+    crossPhase: e.crossPhase ?? d.crossPhase,
+    land: e.land ?? d.land,
+    batchMax: e.batchMax ?? d.batchMax,
+    maxAttempts: e.maxAttempts ?? d.maxAttempts,
+    qaMaxRounds: e.qaMaxRounds ?? d.qaMaxRounds,
+    integrationChecks: freezeRunRefs(e.integrationChecks ?? d.integrationChecks),
+    phaseSuite: phaseSuite === "off" ? phaseSuite : freezeRunRefs(phaseSuite),
+    provision:
+      provision === "auto"
+        ? provision
+        : (Object.freeze(
+            Object.fromEntries(
+              Object.entries(provision).map(([manager, argvs]) => [
+                manager,
+                Object.freeze(argvs.map((argv) => Object.freeze([...argv]))),
+              ]),
+            ),
+          ) as unknown as Record<string, string[][]>),
+    python: e.python ?? d.python,
+    sharedContextChars: e.sharedContextChars ?? d.sharedContextChars,
+    capacityCooldownMs: e.capacityCooldownMs ?? d.capacityCooldownMs,
+    capacityPauseMs: e.capacityPauseMs ?? d.capacityPauseMs,
+    wakeDebounceMs: e.wakeDebounceMs ?? d.wakeDebounceMs,
+    circuitBreaker: Object.freeze({
+      failureRatio: e.circuitBreaker?.failureRatio ?? d.circuitBreaker.failureRatio,
+      minAttempts: e.circuitBreaker?.minAttempts ?? d.circuitBreaker.minAttempts,
+      consecutiveFailures: e.circuitBreaker?.consecutiveFailures ?? d.circuitBreaker.consecutiveFailures,
+    }),
+  });
 }
 
 /** Roles as fresh, de-duplicated, frozen arrays; never aliases the config. */
@@ -3283,6 +3628,9 @@ export function resolveRouting(
     if (logger) logger.warn(issue);
     else console.warn(`[model-router] ${issue}`);
   }
+
+  // routing.executor: v2 only. On v1 the block is ignored (one notice names the configured keys).
+  const executor = resolveExecutor(host === "v2" ? r.executor : undefined, host === "v2" ? logger : undefined);
 
   const c: ClassifierConfig = r.classifier ?? {};
   const presets: Record<string, Readonly<ClassifierPresetOverride>> = {};
@@ -3336,6 +3684,7 @@ export function resolveRouting(
       mode: leases?.mode ?? d.leases.mode,
       run: leases?.run ?? d.leases.run,
     }),
+    executor,
     applied: Object.freeze({ host, requestedEngine, engineCoerced, rolesSource }),
   });
 }
