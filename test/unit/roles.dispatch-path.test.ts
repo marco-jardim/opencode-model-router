@@ -517,7 +517,8 @@ describe("exported helpers for the adapter (P2.1-C)", () => {
       expect(await resolveRoleWorkRoot({ root: "D:\\src\\lib", sessionDirectory: "D:\\git\\main" }, deps, { admission, known: ["D:\\git\\wt"] }))
         .toEqual({ workRoot: "CANON(D:\\src\\lib)", requested: "D:\\src\\lib", note: null, location: bound });
       expect(deps.listWorktrees).toHaveBeenCalledTimes(1);
-      expect(admission.admit).toHaveBeenCalledWith("D:\\src\\lib", ["D:\\git\\main", "D:\\git\\wt"]);
+      // Phase 4 QA M1: the session repository is passed for rule 2's session exemption.
+      expect(admission.admit).toHaveBeenCalledWith("D:\\src\\lib", ["D:\\git\\main", "D:\\git\\wt"], "D:\\git\\main");
       expect(admission.resolve).not.toHaveBeenCalled();
       const reason = "root=D:\\src\\lib is not below routing.repoParents and no known repository lists it: no work root.";
       expect(await resolveRoleWorkRoot({ root: "D:\\src\\lib", sessionDirectory: "D:\\git\\main" }, deps, { admission: fakeAdmission({ ok: false, reason }) }))
@@ -546,7 +547,7 @@ describe("exported helpers for the adapter (P2.1-C)", () => {
       const refusing = fakeAdmission({ ok: false, reason });
       expect(await resolveRoleWorkRoot({ root: "D:\\git\\secret-wt", sessionDirectory: "D:\\git\\main" }, deps, { admission: refusing }))
         .toEqual({ workRoot: null, requested: "D:\\git\\secret-wt", note: reason });
-      expect(refusing.admit).toHaveBeenCalledWith("D:\\git\\secret-wt", ["D:\\git\\main"]);
+      expect(refusing.admit).toHaveBeenCalledWith("D:\\git\\secret-wt", ["D:\\git\\main"], "D:\\git\\main");
       // I9: without an admission the text match is unchanged
       expect((await resolveRoleWorkRoot({ root: "D:\\git\\secret-wt", sessionDirectory: "D:\\git\\main" }, deps)).workRoot).toBe("CANON(D:/git/secret-wt)");
     });
