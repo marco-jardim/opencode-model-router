@@ -59,6 +59,8 @@ function fakeHost(): V2ExecutorHost {
     runner: { bootID: "0".repeat(16), run: async () => ({ sessionID: "child", text: "DONE:" }), dispose: async () => {},
       retainedContext: () => null, onContextCaptured: () => () => {} },
     pinOrchestrator: () => () => {}, onLauncherMetric: vi.fn(), knownAgent: () => true, lifetime: new AbortController().signal,
+    // QA-5.1-26: adopts a handed-over executor as the adapter does (starts it; the adapter's W7 dispose owns it).
+    onExecutor: vi.fn((built: V2Executor) => { void built.runtime.start().catch(() => {}); return true; }),
   };
 }
 
@@ -855,6 +857,26 @@ describe("createExecutor assembly seams", () => {
     const waiters: unknown = Reflect.get(globalThis, Symbol.for("omr.executor.claim.waiters.v1"));
     if (waiters instanceof Set) waiters.clear();
     await retried?.dispose();
+    expect(assemble()).not.toBeNull();
+  });
+
+  it("hands a claim winner to its adapter; one the adapter refuses is disposed and frees the claim (QA-5.1-26)", async () => {
+    vi.spyOn(configModule, "loadConfig").mockReturnValue(executorConfig());
+    const firstAccess = createExecutorAccess(), first = assemble(fakeHost(), firstAccess);
+    if (first == null) throw new Error(firstAccess.unavailable());
+    // The waiter's adapter began to dispose before the claim came free: it refuses the handover.
+    const host = fakeHost(), secondAccess = createExecutorAccess();
+    const onExecutor = vi.fn((_built: V2Executor) => false);
+    host.onExecutor = onExecutor;
+    expect(assemble(host, secondAccess)).toBeNull();
+    await first.runtime.dispose();
+    expect(onExecutor).toHaveBeenCalledOnce();
+    const handed = onExecutor.mock.calls[0]?.[0];
+    if (handed === undefined) throw new Error("no executor was handed over");
+    await handed.runtime.dispose(); // memoised: the safety dispose already under way
+    expect(secondAccess.runtime()).toBeNull();
+    expect(secondAccess.unavailable()).toBe("the plan executor is not available: disposed");
+    // The safety dispose released the claim: a fresh copy assembles.
     expect(assemble()).not.toBeNull();
   });
 

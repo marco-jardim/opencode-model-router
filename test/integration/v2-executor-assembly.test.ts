@@ -14,10 +14,11 @@ import * as ledgerModule from "../../src/executor/ledger";
 import * as provisionModule from "../../src/executor/slots/provision";
 import * as poolModule from "../../src/executor/slots/pool";
 import * as execModule from "../../src/verify/exec";
-import { executorDefaults, isLedgerV1, ledgerViolations, type ChildRunner, type ChildRunRequest, type Clock, type LedgerV1, type RetainedContextInfo, type TaskNode } from "../../src/executor/types";
+import { executorDefaults, isLedgerV1, ledgerViolations, type ChildRunner, type ChildRunRequest, type Clock, type HostSessionEvent, type LedgerV1, type MetricPayload, type RetainedContextInfo, type TaskNode } from "../../src/executor/types";
 import * as runtimeModule from "../../src/executor/runtime";
 import * as recoveryModule from "../../src/executor/recovery";
 import * as turnStateModule from "../../src/compat/turn-state";
+import * as backgroundModule from "../../src/compat/background";
 import { planDir } from "../../src/executor/paths";
 import { invalidateConfigCache, validateConfig } from "../../src/router/config";
 import * as configModule from "../../src/router/config";
@@ -157,6 +158,9 @@ async function boot(repo: string, runner?: ChildRunner) {
   const sessionHooks: Record<string, (event: never) => Promise<void>> = {};
   const reg = async () => ({ dispose: async () => {} });
   const editors = { agent: { update() {} }, command: { add() {} }, tool: { add() {} } };
+  // Host events a test emits (`emit`), yielded in order by the adapter's subscription until it aborts.
+  const queued: Array<{ type: string; data: Record<string, unknown> }> = [];
+  let wake = () => {};
   const ctx = {
     location: { directory: repo, project: { directory: repo } },
     agent: { reload: async () => {}, list: async () => ({ data: [] }), transform: async (cb: (editor: unknown) => void) => { cb(editors.agent); return reg(); } },
@@ -170,9 +174,17 @@ async function boot(repo: string, runner?: ChildRunner) {
     },
     permission: { hook: reg },
     event: { subscribe: async function* ({ signal }: { signal: AbortSignal }) {
-      await new Promise<void>(resolve => { if (signal.aborted) resolve(); else signal.addEventListener("abort", () => resolve(), { once: true }); });
+      while (!signal.aborted) {
+        const next = queued.shift();
+        if (next !== undefined) { yield next; continue; }
+        await new Promise<void>(resolve => {
+          wake = resolve;
+          if (signal.aborted) resolve(); else signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      }
     } },
   };
+  const emit = (event: { type: string; data: Record<string, unknown> }): void => { queued.push(event); wake(); };
   const v2 = createV2Runtime(ctx as unknown as Parameters<typeof createV2Runtime>[0], { bootID: "0123456789abcdef" });
   const hooks = await ModelRouterPlugin({ directory: repo, worktree: repo, routerHost: "v2", client: v2.client,
     routerExecutor: access } as unknown as Parameters<typeof ModelRouterPlugin>[0]);
@@ -192,7 +204,7 @@ async function boot(repo: string, runner?: ChildRunner) {
   let disposal: Promise<void> | null = null;
   const cleanup = () => disposal ??= dispose();
   plugins.push(cleanup);
-  return { access, prepared, surface, state, sessionHooks, dispose: cleanup,
+  return { access, prepared, surface, state, sessionHooks, emit, dispose: cleanup,
     deps: state.executor === null ? null : assembledDeps[assembledDeps.length - 1] ?? null,
     turnState: registries[registries.length - 1],
     call: (args: RouterPlanArgs, sessionID = "root") => surface.tool.router_plan!.execute(args, { sessionID, directory: repo }),
@@ -357,37 +369,110 @@ describe("assembled executor through v2 registration", () => {
     expect(await store.exportPlan("foreign")).toEqual(before);
   }, 30_000);
 
-  it("QA-5.1-20: a copy refused by the claim assembles once the holder disposes, starts (recovers) once; a third copy is still refused", async () => {
+  it("QA-5.1-20/26: a copy refused by the claim assembles once the holder disposes, is wired and disposed as one built at start, recovers once; a third copy is still refused", async () => {
     const fixture = await repository();
-    await configure(fixture.root, fixture.slotsRoot);
-    await seed(fixture, plan(fixture));
+    const tracked = await configure(fixture.root, fixture.slotsRoot);
+    const value = plan(fixture);
+    value.tasks.T1 = assemblyTask("T1");
+    await seed(fixture, value);
     const recover = vi.fn<ReturnType<typeof recoveryModule.createRecoveryService>["recover"]>();
     const realRecovery = recoveryModule.createRecoveryService;
     vi.spyOn(recoveryModule, "createRecoveryService").mockImplementation(deps => {
       const service = realRecovery(deps);
       return { ...service, recover: (...args) => { recover(...args); return service.recover(...args); } };
     });
+    // QA-5.1-26: what reaches each assembled runtime through its adapter (host events, launcher metrics, retry decisions), and
+    // when its dispose ends relative to the adapter's lease-registry release (W7).
+    const order: string[] = [];
+    const reached: Array<{ events: HostSessionEvent[]; metrics: Array<{ planId: string; metric: MetricPayload }>;
+      retries: Array<{ sessionID: string; stop: boolean }> }> = [];
+    const configured = vi.mocked(runtimeModule.createExecutorRuntime).getMockImplementation();
+    if (configured === undefined) throw new Error("configure() mocks createExecutorRuntime");
+    vi.mocked(runtimeModule.createExecutorRuntime).mockImplementation(deps => {
+      const seen: (typeof reached)[number] = { events: [], metrics: [], retries: [] };
+      const index = reached.push(seen) - 1;
+      const inner = configured({ ...deps,
+        hosts: { ...deps.hosts, onEvent: listener => deps.hosts.onEvent(e => { seen.events.push(e); listener(e); }) },
+        // A provider at capacity: the runtime stops the host's retry of any child it owns (and only of those).
+        capacity: (...args) => ({ ...deps.capacity(...args), shouldStopRetry: i => i.planChild }) });
+      return { ...inner,
+        recordMetric: (planId, m) => { seen.metrics.push({ planId, metric: m }); inner.recordMetric(planId, m); },
+        onRetryHook: i => { const decision = inner.onRetryHook(i); seen.retries.push({ sessionID: i.sessionID, stop: decision.stop }); return decision; },
+        dispose: async () => { try { await inner.dispose(); } finally { order.push(`runtime ${index} disposed`); } },
+      };
+    });
+    const claimHeld = () => Reflect.get(globalThis, Symbol.for("omr.executor.claim.v1")) !== undefined;
     const a = await boot(fixture.repo);
     expect(a.state.executor).not.toBeNull();
     await vi.waitFor(() => expect(recover).toHaveBeenCalledOnce(), { timeout: 10_000 });
+    // Each later plugin's lease-registry handle reports its release (the adapter's background disposers, after W7).
+    let booting = "";
+    const realAcquire = backgroundModule.acquireLeaseRegistry;
+    vi.spyOn(backgroundModule, "acquireLeaseRegistry").mockImplementation(input => {
+      // A delegate per acquire: the label stays this plugin's even if the registry hands every plugin one shared handle.
+      const handle = realAcquire(input), label = booting;
+      return Object.assign(Object.create(handle) as typeof handle, { release: () => {
+        order.push(`leases ${label} released (claim ${claimHeld() ? "held" : "free"})`);
+        return handle.release();
+      } });
+    });
+    booting = "b";
     // The hot reload: B starts while A still holds the claim.
-    const b = await boot(fixture.repo);
+    const child = scriptedRunner(tracked.clock);
+    const children: string[] = [];
+    const run = child.runner.run;
+    child.runner.run = request => run({ ...request, onCreated: async id => { children.push(id); await request.onCreated(id); } });
+    const b = await boot(fixture.repo, child.runner);
     expect(b.state.executor).toBeNull();
     expect(b.access.unavailable()).toContain("another plan executor already owns this process");
     expect(b.access.runtime()).toBeNull(); // the claim is still held: B keeps waiting
+    expect(b.sessionHooks.retry).toBeUndefined(); // no executor yet: no retry hook (M3)
     const assembled = assembledDeps.length;
     // A disposes: the release hands the claim to B, which assembles and starts without a user action.
     await a.dispose();
     expect(assembledDeps).toHaveLength(assembled + 1);
     await vi.waitFor(() => expect(recover).toHaveBeenCalledTimes(2), { timeout: 10_000 });
     const runtime = b.access.runtime();
-    expect(runtime).not.toBeNull();
+    if (runtime === null) throw new Error(b.access.unavailable());
+    const deps = assembledDeps[assembled]!, seenByB = reached[reached.length - 1]!;
     expect(await b.call({ action: "status", planId: "plan-a" })).toContain("Plan plan-a [awaiting-approval]");
-    await runtime?.start(); // a late port's start never recovers again
+    await runtime.start(); // a late port's start never recovers again
     await new Promise(resolve => setTimeout(resolve, 50));
     expect(recover).toHaveBeenCalledTimes(2);
     expect(assembledDeps).toHaveLength(assembled + 1);
+    // QA-5.1-26: B's adapter adopted the handed-over executor. An active plan: its instructions render at order 61, after the plan line.
+    child.capture();
+    await runtime.approve("plan-a", "root");
+    runtime.onRouterToolCall("root");
+    await vi.waitFor(() => expect(children).toHaveLength(1), { timeout: 10_000 });
+    const planChild = children[0]!;
+    await vi.waitFor(() => expect(deps.launcher.inFlight().map(flight => flight.childSessionID)).toContain(planChild), { timeout: 10_000 });
+    const turnState = b.turnState;
+    if (turnState === undefined) throw new Error("no v2 turn-state registry");
+    const instructions = turnState.providers.find(provider => provider.order === 61);
+    expect(instructions?.name, "B's executor instructions provider").toBe("plan-instructions");
+    expect(instructions?.render("root")).toBeTruthy();
+    const tail = turnState.registry.buildTurnState("root") ?? "";
+    expect(tail).toContain("plan plan-a:");
+    expect(tail.indexOf(instructions?.render("root") ?? "missing")).toBeGreaterThan(tail.indexOf("plan plan-a:"));
+    // A host event of the plan child reaches B's runtime.
+    b.emit({ type: "session.step.started", data: { sessionID: planChild, model: { providerID: "fixture", id: "fast" } } });
+    await vi.waitFor(() => expect(seenByB.events).toContainEqual(expect.objectContaining({ type: "step.started", sessionID: planChild })), { timeout: 5_000 });
+    // The retry hook stops the host's retry of the plan child (D13).
+    await vi.waitFor(() => expect(b.sessionHooks.retry).toBeDefined(), { timeout: 5_000 });
+    const retryEvent = { sessionID: planChild, error: { type: "APIError", status: 429, message: "rate limited" }, decision: { retry: true } };
+    await b.sessionHooks.retry!(retryEvent as never);
+    expect(seenByB.retries).toContainEqual({ sessionID: planChild, stop: true });
+    expect(retryEvent.decision).toEqual({ retry: false });
+    const otherRetry = { ...retryEvent, sessionID: "owner-other", decision: { retry: true } };
+    await b.sessionHooks.retry!(otherRetry as never);
+    expect(otherRetry.decision).toEqual({ retry: true });
+    // A launcher metric reaches B's runtime.
+    const metric: MetricPayload = { name: "counter", key: "qa-5.1-26", value: 1, labels: {} };
+    b.state.host!.onLauncherMetric("plan-a", metric);
+    expect(seenByB.metrics).toContainEqual({ planId: "plan-a", metric });
     // C comes while B holds the claim: refused, as B was.
+    booting = "c";
     const c = await boot(fixture.repo);
     expect(c.state.executor).toBeNull();
     expect(c.access.unavailable()).toContain("another plan executor already owns this process");
@@ -395,9 +480,15 @@ describe("assembled executor through v2 registration", () => {
     expect(assembledDeps).toHaveLength(assembled + 1);
     // C ends while waiting (its lifetime aborts): B's release assembles nothing for it.
     await c.dispose();
-    await runtime?.dispose();
+    // B's plugin disposes: W7 disposes B's runtime (releasing the claim) before the adapter's lease registry goes.
+    const before = order.length;
+    await b.dispose();
+    expect(order.slice(before)).toEqual([`runtime ${reached.indexOf(seenByB)} disposed`, "leases b released (claim free)"]);
+    expect(claimHeld()).toBe(false);
+    expect(deps.launcher.inFlight()).toEqual([]);
     expect(assembledDeps).toHaveLength(assembled + 1);
     expect(c.access.runtime()).toBeNull();
+    expect(recover).toHaveBeenCalledTimes(2);
   }, 45_000);
 
   it("A3: tools and /plan explain a non-repository, without creating an executor home", async () => {

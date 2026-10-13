@@ -1378,6 +1378,62 @@ describe("plan executor wiring in the v2 adapter (3.1.7: W2, W4, W5, W6, M41)", 
     expect(x.launcher.dispose).toHaveBeenCalled();
   });
 
+  it("a handed-over executor is adopted once through the startup path; another, or any after dispose, is refused (QA-5.1-26)", async () => {
+    const x = fakeExecutor();
+    // The factory is refused by the claim (null); the executor comes later through `host.onExecutor`.
+    const factory: V2ExecutorFactory = (host) => { x.factory(host); return null; };
+    const w = await startWired({ executor: factory });
+    const host = x.state.host;
+    if (host === undefined) throw new Error("the factory was not called");
+    const before = w.providers.length;
+    expect(w.listeners.size).toBe(0);
+    w.f.emit({ id: "h0", type: "session.step.started", data: { sessionID: PLAN_CHILD, model: { providerID: "anthropic", id: "claude-x" } } });
+    await w.tick();
+    expect(x.emitted).toEqual([]); // no executor yet: the emitter is a no-op
+    expect(w.f.sessionHooks.retry).toBeUndefined(); // and no retry hook (M3)
+    const retryHooks = () => w.f.ctx.session.hook.mock.calls.filter(([name]) => name === "retry").length;
+    const handed = { runtime: x.runtime as unknown as V2Executor["runtime"], launcher: x.launcher };
+    expect(host.onExecutor(handed)).toBe(true);
+    await w.tick();
+    expect(w.listeners.size).toBe(1);
+    expect(w.providers.length).toBe(before + 2); // the plan line and the executor instructions
+    expect(x.runtime.start).toHaveBeenCalledTimes(1);
+    // Idempotent: the same executor again registers nothing and starts nothing.
+    expect(host.onExecutor(handed)).toBe(true);
+    await w.tick();
+    expect(w.listeners.size).toBe(1);
+    expect(w.providers.length).toBe(before + 2);
+    expect(x.runtime.start).toHaveBeenCalledTimes(1);
+    expect(retryHooks()).toBe(1);
+    // The retry hook stops the host's retry of a plan child only (D13).
+    const stopped = { sessionID: PLAN_CHILD, error: { type: "APIError", message: "rate limited", status: 429 }, decision: { retry: true } };
+    await w.f.sessionHooks.retry!(stopped);
+    expect(stopped.decision).toEqual({ retry: false });
+    const kept = { ...stopped, sessionID: "root-other", decision: { retry: true } };
+    await w.f.sessionHooks.retry!(kept);
+    expect(kept.decision).toEqual({ retry: true });
+    // Another executor while one is adopted: refused, left to its owner.
+    const other = { runtime: { ...x.runtime, start: vi.fn(async () => undefined), dispose: vi.fn(async () => undefined) }, launcher: { dispose: vi.fn(async () => undefined) } };
+    expect(host.onExecutor(other as unknown as V2Executor)).toBe(false);
+    expect(other.runtime.start).not.toHaveBeenCalled();
+    // Wired like one built at start: host events, the router-tool-call feed and the launcher metrics reach it.
+    w.f.emit({ id: "h1", type: "session.step.started", data: { sessionID: PLAN_CHILD, model: { providerID: "anthropic", id: "claude-x" } } });
+    await w.tick();
+    expect(x.emitted).toContainEqual(expect.objectContaining({ type: "step.started", sessionID: PLAN_CHILD }));
+    for (const listener of w.listeners) listener({ sessionID: "root" });
+    expect(x.runtime.onRouterToolCall).toHaveBeenCalledWith("root");
+    host.onLauncherMetric("plan-a", { name: "counter", key: "k", value: 1, labels: {} });
+    expect(x.runtime.recordMetric).toHaveBeenCalledWith("plan-a", { name: "counter", key: "k", value: 1, labels: {} });
+    // W7 disposes the adopted executor (runtime, then launcher) once; after dispose nothing is adopted.
+    await w.cleanup();
+    expect(x.runtime.dispose).toHaveBeenCalledTimes(1);
+    expect(x.launcher.dispose).toHaveBeenCalledTimes(1);
+    expect(x.runtime.dispose.mock.invocationCallOrder[0]).toBeLessThan(x.launcher.dispose.mock.invocationCallOrder[0]!);
+    expect(w.listeners.size).toBe(0);
+    expect(host.onExecutor(other as unknown as V2Executor)).toBe(false);
+    expect(other.runtime.dispose).not.toHaveBeenCalled();
+  });
+
   it("session.step.started carries the provider to the emitter; the adapter's stepKey follows the C10 recorded sequence (W4, QA-3.1-8)", async () => {
     const x = fakeExecutor();
     const w = await startWired({ executor: x.factory });

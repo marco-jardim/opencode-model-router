@@ -273,8 +273,10 @@ export function createExecutor(
 /**
  * QA-5.1-20: a copy refused only by the process claim keeps its inputs and retries the assembly once the claim is free: at
  * the release (the holder's dispose calls every waiter) or, failing that, the first time its `lateRuntime` is used. The
- * waiters race for the claim through the same token check, so one wins; the others stay waiters. The winner's runtime is
- * started once here, as the adapter starts a fresh one (its recovery runs once).
+ * waiters race for the claim through the same token check, so one wins; the others stay waiters.
+ * QA-5.1-26: the winner is handed to its adapter (`host.onExecutor`), which adopts it through the same path as an executor
+ * built at start: it registers the executor's providers and hooks, starts it once (its recovery runs once) and disposes it in
+ * the W7 order. A winner its adapter does not adopt (the adapter is already disposing) gets the safety dispose here.
  */
 function waitForClaim(context: { directory: string }, options: CreateExecutorOptions): void {
   const { access, host } = options;
@@ -294,15 +296,31 @@ function waitForClaim(context: { directory: string }, options: CreateExecutorOpt
     forget();
     const built = assembleExecutor(context, options);
     if (built === null) return;
-    // The adapter disposes only the executor it was handed; this one ends with the copy's lifetime (releasing the claim).
-    lifetime.addEventListener("abort", () => { void built.runtime.dispose(); }, { once: true });
-    void built.runtime.start().catch((error: unknown) => {
-      console.warn("[model-router] executor: it could not start", String(error));
-    });
+    let adopted = false;
+    try {
+      adopted = host.onExecutor(built);
+    } catch (error) {
+      console.warn("[model-router] executor: the adapter could not adopt it", String(error));
+    }
+    if (!adopted) void disposeUnadopted(built);
   }
   lifetime.addEventListener("abort", forget, { once: true });
   waiters.add(retry);
   access.deferRetry(retry);
+}
+
+/**
+ * QA-5.1-26: the safety dispose of a handed-over executor its adapter did not adopt (it assembled after the adapter began to
+ * dispose): the runtime, then its launcher, as W7 orders them. The runtime's dispose releases the claim, whatever fails.
+ */
+async function disposeUnadopted(built: V2Executor): Promise<void> {
+  for (const [what, run] of [["runtime", () => built.runtime.dispose()], ["launcher", () => built.launcher.dispose()]] as const) {
+    try {
+      await run();
+    } catch (error) {
+      console.warn(`[model-router] executor: the ${what} could not be disposed`, String(error));
+    }
+  }
 }
 
 function assembleExecutor(context: { directory: string }, options: CreateExecutorOptions): V2Executor | null {

@@ -15,7 +15,7 @@
  * anything (I1/I8). A failure while resolving or building the roles registers no role agent at
  * all (fail closed); tier agents are never touched.
  */
-import { realpathSync, statSync } from "node:fs";
+import { lstatSync, realpathSync, statSync } from "node:fs";
 import { join, posix, win32 } from "node:path";
 import { resolveExecutorHome } from "../executor/paths";
 import { resolveActiveTiers, resolveRolesRouting, resolveRouting, slotsDirProblem, type RouterConfig, type TierConfig } from "./config";
@@ -279,6 +279,15 @@ function executorSlotsRootPattern(path: string, worktrees: readonly string[], re
     try {
       root = realpath(worktree);
     } catch {
+      // Git can retain deleted (even locked) linked worktrees. Only a missing entry is harmless;
+      // an existing path without a canonical form, and the main checkout, must still fail closed.
+      if (index > 0) {
+        try {
+          lstatSync(worktree);
+        } catch (error) {
+          if (error instanceof Error && "code" in error && error.code === "ENOENT") continue;
+        }
+      }
       return { problem: `worktree ${worktree} has no canonical long form` };
     }
     // Executor worktrees live at <root>/<plan>/slot-N, integration or ci.
@@ -573,8 +582,12 @@ export async function registerRoleAgents(
         let toplevel: string | undefined;
         try {
           const directory = realpath(opts.directory);
-          toplevel = worktrees.map((tree) => realpath(tree)).filter((tree) => isOrContains(tree, directory))
-            .sort((a, b) => b.length - a.length)[0];
+          for (const worktree of worktrees) {
+            try {
+              const tree = realpath(worktree);
+              if (isOrContains(tree, directory) && tree.length > (toplevel?.length ?? 0)) toplevel = tree;
+            } catch { /* Unresolved entries cannot select a drive; the slots overlap check still fails closed. */ }
+          }
         } catch { /* A missing canonical location cannot select a default drive. */ }
         const drive = /^([A-Za-z]):[\\/]/.exec(toplevel ?? "");
         const root = slotsDir ?? (drive === null ? undefined : `${drive[1]}:\\.omr-slots`);

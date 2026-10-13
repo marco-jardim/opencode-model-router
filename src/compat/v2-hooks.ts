@@ -1136,6 +1136,12 @@ export interface V2ExecutorHost {
   knownAgent(agent: string): boolean;
   /** Plugin lifetime (`TaskLauncherDeps.lifetime`); aborted on dispose. */
   lifetime: AbortSignal;
+  /**
+   * QA-5.1-26: hands the adapter an executor assembled after the factory returned (a claim handover). The adapter adopts it
+   * through the path it adopts the factory's executor by (its providers and hooks, `start()`, the W7 dispose) and answers
+   * true. False: not adopted (the adapter is disposing, or it already holds another executor); the caller disposes it.
+   */
+  onExecutor(built: V2Executor): boolean;
 }
 
 /** The composed executor: the runtime plus the launcher it drives (W7 disposes both, runtime first). */
@@ -1259,7 +1265,8 @@ export async function registerV2Hooks(
   };
   // ---------------------------------------------------------------------------------------------------------------
   // Plan task 3.1.7 (memo 3.1.1 §8): the plan executor's seams. `executor` stays null unless `options.executor` builds one
-  // (M3: then nothing below changes behaviour); the fail-closed check of plan children (M41) is on either way.
+  // (M3: then nothing below changes behaviour); the fail-closed check of plan children (M41) is on either way. QA-5.1-26: it
+  // is set only by `adopt`, for the factory's executor at start or one a claim handover assembles later (`host.onExecutor`).
   // ---------------------------------------------------------------------------------------------------------------
   let executor: V2Executor | null = null;
   /** W1: the plugin lifetime the launcher combines with each launch's own controller; aborted on dispose (W7). */
@@ -2604,6 +2611,16 @@ export async function registerV2Hooks(
       ingestLogger.warn("[router] plugin root could not be resolved", { error: String(error) });
     }
   }
+  /** W7: an executor's runtime, then its launcher (which aborts the signals it owns); a failure is logged and the next goes on. */
+  const disposeExecutor = async (owned: V2Executor): Promise<void> => {
+    for (const [what, run] of [["runtime", () => owned.runtime.dispose()], ["launcher", () => owned.launcher.dispose()]] as const) {
+      try {
+        await run();
+      } catch (error) {
+        ingestLogger.warn(`[router] executor: the ${what} could not be disposed`, { error: String(error) });
+      }
+    }
+  };
   const cleanup = async () => {
     if (disposed) return;
     disposed = true;
@@ -2628,18 +2645,11 @@ export async function registerV2Hooks(
     }
     // 3.1.7 W7: the executor first (runtime, then its launcher, which aborts the signals it owns), before the background
     // registry and the child runner it drives go away. Nothing reaches it after this: the emitter is a no-op without it.
+    // QA-5.1-26: the executor `adopt` took, whether the factory's at start or a claim handover's; none is adopted from here on.
     const ownedExecutor = executor;
     executor = null;
     hostEventListeners.clear();
-    if (ownedExecutor !== null) {
-      for (const [what, run] of [["runtime", () => ownedExecutor.runtime.dispose()], ["launcher", () => ownedExecutor.launcher.dispose()]] as const) {
-        try {
-          await run();
-        } catch (error) {
-          ingestLogger.warn(`[router] executor: the ${what} could not be disposed`, { error: String(error) });
-        }
-      }
-    }
+    if (ownedExecutor !== null) await disposeExecutor(ownedExecutor);
     executorLifetime.abort();
     for (const dispose of bgDisposers.reverse()) {
       try {
@@ -3967,25 +3977,47 @@ export async function registerV2Hooks(
         onLauncherMetric: (planId, m) => executor?.runtime.recordMetric(planId, m),
         knownAgent: (agent) => config.agent[agent] !== undefined,
         lifetime: executorLifetime.signal,
+        // QA-5.1-26: a claim handover's executor goes through `adopt`, as the factory's does at start.
+        onExecutor: (handed) => {
+          let adopted: boolean;
+          try {
+            adopted = adopt(handed);
+          } catch (error) {
+            ingestLogger.warn("[router] executor: the handed-over executor could not be wired", { error: String(error) });
+            // Adopted before the failure: W7 disposes it, so the caller must not.
+            return executor === handed;
+          }
+          if (adopted) trackBackground(retryHookWiring);
+          return adopted;
+        },
       };
-      try {
-        executor = options.executor(host);
-      } catch (error) {
-        executor = null;
-        ingestLogger.warn("[router] executor: it could not be built; plans are not executed", { error: String(error) });
-      }
-      const built = executor;
-      if (built !== null) {
+      /** Settles once the retry hook of the adopted executor is registered (`adopt`). */
+      let retryHookWiring: Promise<void> = Promise.resolve();
+      /**
+       * QA-5.1-26: the one path an executor is adopted by: the factory's at start, or the one a claim handover assembles later
+       * (`host.onExecutor`). It sets `executor`, which the host events, the step tracking, the launcher metrics and the
+       * lease-release tick read and W7 disposes; it registers the router-tool-call feed, the plan-line and manual-ready
+       * provider, the executor instructions and the retry hook, and starts the runtime (`start()` is memoised: recovery runs
+       * once). Idempotent: the executor already adopted answers true and registers nothing again. Refused (false): another
+       * executor while one is adopted, or any once dispose began (its owner disposes it). The retry hook's registration is
+       * asynchronous: `retryHookWiring` settles with it.
+       */
+      const adopt = (built: V2Executor): boolean => {
+        if (executor === built) return true;
+        if (disposed || executor !== null) return false;
+        executor = built;
+        const unregisters: Array<() => void> = [];
+        registrations.push({ dispose: async () => { for (const unregister of unregisters.splice(0)) unregister(); } });
         // W2 (3.1.7.a): every router tool call of a bound orchestrator refreshes the executor (guard 6, the ready set).
-        const unsubscribe = childRunner.onContextCaptured((c) => {
+        unregisters.push(childRunner.onContextCaptured((c) => {
           try {
             built.runtime.onRouterToolCall(c.sessionID);
           } catch (error) {
             ingestLogger.warn("[router] executor: a router tool call could not be fed", { error: String(error) });
           }
-        });
+        }));
         // W6 (3.1.7.e): the plan line and the manual tasks ready for the orchestrator.
-        const unregisterPlan = turnState.registerTurnStateProvider({
+        unregisters.push(turnState.registerTurnStateProvider({
           name: PLAN_PROVIDER_NAME, order: PLAN_PROVIDER_ORDER,
           render: (sid) => {
             const line = built.runtime.planLine(sid);
@@ -3997,14 +4029,13 @@ export async function registerV2Hooks(
             return lines.length === 0 ? undefined : lines.join("\n");
           },
           active: (sid) => built.runtime.planLine(sid) !== null || built.runtime.manualReady(sid).length > 0,
-        });
-        const unregisterInstructions = turnState.registerTurnStateProvider({
+        }));
+        unregisters.push(turnState.registerTurnStateProvider({
           ...createExecutorInstructionsProvider(built.runtime), order: EXECUTOR_INSTRUCTIONS_ORDER,
-        });
-        registrations.push({ dispose: async () => { unsubscribe(); unregisterPlan(); unregisterInstructions(); } });
+        }));
         // W4 (3.1.7.c, ADR 0007 D13): the host's retry decision feeds the capacity signals; the executor stops the retry of a plan
         // child only. Registered only when an executor exists (M3); on any error the decision stays unchanged.
-        registrations.push(await ctx.session.hook("retry", async (event) => {
+        retryHookWiring = ctx.session.hook("retry", async (event) => {
           try {
             const sessionID = String(event.sessionID);
             // QA-3.1-21: the step's `step.started` may still wait in the event loop: the key must name this step, not the last one
@@ -4023,10 +4054,28 @@ export async function registerV2Hooks(
           } catch (error) {
             ingestLogger.warn("[router] executor: the retry signal could not be fed", { error: String(error) });
           }
-        }));
+        }).then(async (registration) => {
+          // Registered once dispose collected the registrations (a handover racing dispose): nothing else would remove it.
+          if (disposed) await registration.dispose();
+          else registrations.push(registration);
+        });
         trackBackground(built.runtime.start().catch((error: unknown) => {
           ingestLogger.warn("[router] executor: it could not start", { error: String(error) });
         }));
+        return true;
+      };
+      let built: V2Executor | null = null;
+      try {
+        built = options.executor(host);
+      } catch (error) {
+        ingestLogger.warn("[router] executor: it could not be built; plans are not executed", { error: String(error) });
+      }
+      if (built !== null) {
+        if (adopt(built)) await retryHookWiring;
+        else {
+          ingestLogger.warn("[router] executor: the built executor was not adopted; it is disposed", {});
+          await disposeExecutor(built);
+        }
       }
     }
     registrations.push(await ctx.tool.hook("execute.after", async (event) => {

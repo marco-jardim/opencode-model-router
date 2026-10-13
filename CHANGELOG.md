@@ -61,8 +61,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repository before opening a writer, so viewing a foreign plan takes no writer lock and changes no writer epoch or
   journal. Status remains available; mutation requires that repository. The trusted slots root stays allowed after a
   restart or `/router-reload` while slot and integration worktrees exist; roots inside or above a non-slot checkout are
-  refused, and the default slots drive comes from the location's repository toplevel. One executor runs per process: a
-  plugin copy refused by the process claim waits and assembles once the holder disposes, running recovery once. Plan-task
+  refused, and the default slots drive comes from the location's repository toplevel; a registered worktree whose folder
+  is gone never blocks that allow. One executor runs per process: a plugin copy refused by the process claim waits and
+  assembles once the holder disposes, running recovery once, and is wired into the host exactly like an executor
+  assembled at start (plan state, executor instructions, host events, retry stop, ordered disposal). Plan-task
   verification is cancelled first at disposal, a verdict decided before disposal is still journaled, manual `gc` of a
   completed plan waits for pending phase tags, and `purge` creates no directories, removes the empty plan directory and
   skips collection for an invalid `slotsDir` when the plan holds no slot markers.

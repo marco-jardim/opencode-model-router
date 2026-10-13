@@ -431,6 +431,73 @@ describe.skipIf(process.platform !== "win32")("Phase 5.1.3 D6 executor external_
     expect(f.opts.warn).not.toHaveBeenCalled();
   });
 
+  it("QA-5.1-27 a missing linked worktree outside the slots root does not block its allow", async () => {
+    const f = fixture();
+    const missing = join(f.base, "deleted-linked");
+    f.opts.listWorktrees = vi.fn(async () => [f.main, missing]);
+    f.opts.realpath = (path) => {
+      if (path === missing) throw Object.assign(new Error("deleted worktree"), { code: "ENOENT" });
+      return win32.normalize(path);
+    };
+    const result = await registerRoleAgents(f.agents, f.cfg, f.opts);
+    expect(result.externalDirectory).toEqual([join(f.main, "*"), join(f.slots, "*")]);
+    expect(result.externalDirectoryDenied).toEqual([join(f.home, "*")]);
+    expect(evaluatePermission(rules(f.agents.implementer!), "external_directory", join(f.slots, "plan", "slot-2", "x"))).toBe("allow");
+    expect(f.opts.warn).not.toHaveBeenCalledWith("roles:executor-slots", expect.any(String));
+  });
+
+  it("QA-5.1-27 a missing registered slot-3 does not block future slots", async () => {
+    const f = fixture();
+    const missing = join(f.slots, "plan", "slot-3");
+    f.opts.listWorktrees = vi.fn(async () => [f.main, missing]);
+    f.opts.realpath = (path) => {
+      if (path === missing) throw Object.assign(new Error("retired slot"), { code: "ENOENT" });
+      return win32.normalize(path);
+    };
+    const result = await registerRoleAgents(f.agents, f.cfg, f.opts);
+    expect(result.externalDirectory).toEqual([join(f.main, "*"), join(f.slots, "*")]);
+    expect(result.externalDirectoryDenied).toEqual([join(f.home, "*")]);
+    expect(evaluatePermission(rules(f.agents.implementer!), "external_directory", join(f.slots, "plan", "slot-4", "x"))).toBe("allow");
+    expect(f.opts.warn).not.toHaveBeenCalledWith("roles:executor-slots", expect.any(String));
+  });
+
+  it("QA-5.1-27 a missing registration does not hide an existing worktree's EACCES refusal", async () => {
+    const f = fixture();
+    const missing = join(f.base, "deleted-linked");
+    const denied = join(f.base, "inaccessible-linked");
+    mkdirSync(denied);
+    f.opts.listWorktrees = vi.fn(async () => [f.main, missing, denied]);
+    f.opts.realpath = (path) => {
+      if (path === missing) throw Object.assign(new Error("deleted worktree"), { code: "ENOENT" });
+      if (path === denied) throw Object.assign(new Error("access denied"), { code: "EACCES" });
+      return win32.normalize(path);
+    };
+    const result = await registerRoleAgents(f.agents, f.cfg, f.opts);
+    expect(result.externalDirectory).toEqual([join(f.main, "*")]);
+    expect(result.externalDirectoryDenied).toEqual([join(f.home, "*")]);
+    expect(evaluatePermission(rules(f.agents.implementer!), "external_directory", join(f.slots, "plan", "slot-2", "x"))).toBe("deny");
+    // The old code refuses the missing registration first, never checking the existing worktree.
+    expect(f.opts.warn).toHaveBeenCalledWith("roles:executor-slots", expect.stringContaining(`worktree ${denied} has no canonical long form`));
+  });
+
+  it("QA-5.1-27 a missing unrelated worktree does not lose the canonical location's default drive", async () => {
+    const f = fixture();
+    const missing = join(f.base, "deleted-linked");
+    const otherDrive = win32.parse(f.main).root[0]!.toUpperCase() === "E" ? "F" : "E";
+    const current = `${otherDrive}:\\current-worktree`;
+    f.opts.directory = join(f.base, "linked-repository");
+    f.opts.listWorktrees = vi.fn(async () => [f.main, missing, current]);
+    f.opts.realpath = (path) => {
+      if (path === missing) throw Object.assign(new Error("deleted worktree"), { code: "ENOENT" });
+      return path === f.opts.directory ? join(current, "src") : win32.normalize(path);
+    };
+    f.cfg.routing = { ...f.cfg.routing, executor: { slotsDir: null } };
+    const result = await registerRoleAgents(f.agents, f.cfg, f.opts);
+    expect(result.externalDirectory).toEqual([join(f.main, "*"), join(current, "*"), join(`${otherDrive}:\\.omr-slots`, "*")]);
+    expect(result.externalDirectoryDenied).toEqual([join(f.home, "*")]);
+    expect(f.opts.warn).not.toHaveBeenCalledWith("roles:executor-slots", expect.any(String));
+  });
+
   it("keeps the home deny last even when its exact key was also supplied as an allow", () => {
     const f = fixture();
     const spec = SHIPPED_ROLE_SPECS.find((role) => role.agent === "implementer")!;

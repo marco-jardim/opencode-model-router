@@ -74,7 +74,12 @@ process-wide claim and that location owns the executor until it disposes. A copy
 starts the new copy before the old one has disposed) waits: when the holder's disposal releases the claim, the waiting
 copy assembles its executor and starts it once (its recovery runs once), or, failing that, retries the first time one of
 its plan tools is used. If several copies wait, one takes the claim and the others keep waiting; a copy disposed while
-it waits never assembles.
+it waits never assembles. The handed-over executor is wired exactly like one assembled at start: the copy's adapter
+adopts it through the same path, so it gets the plan state and manual-ready line, the executor instructions, the host
+events of its plan children, the retry stop for those children and the launcher metrics. The adapter disposes it in the
+same order as one assembled at start (runtime, then launcher, before the lease registry and the child runner go), which
+releases the claim. An executor that finishes assembling after its copy began to dispose is not adopted: it is disposed
+at once, and that also releases the claim.
 An earlier configuration or repository-discovery reason is preserved when the child runner is also missing.
 
 The executor home is **`<git common dir>\omr-executor`** (`EXECUTOR_HOME_DIRNAME = "omr-executor"`), shared by the
