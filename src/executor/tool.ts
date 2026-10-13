@@ -2,6 +2,7 @@
  * `router_plan` (4.1.2): the orchestrator's tool for the plan executor. `createRouterPlanTool(runtime)` returns the tool
  * definition; Phase 5.1 registers it (v2 only). Every failure is a text answer: `execute` never throws.
  */
+import { posix, win32 } from "node:path";
 import { tool } from "@opencode-ai/plugin";
 import { ExecutorError, type CompileSummary, type ExecutorRuntime } from "./types.js";
 
@@ -30,6 +31,9 @@ export interface RouterPlanArgs {
 /** The part of the host tool context this tool reads. */
 export interface RouterPlanContext {
   sessionID?: string;
+  /** The project directory of the session; a relative compile `path` is resolved against it (else `worktree`). */
+  directory?: string;
+  worktree?: string;
 }
 
 type ArgKey = Exclude<keyof RouterPlanArgs, "action">;
@@ -47,7 +51,8 @@ const ACTION_SPECS: Readonly<Record<RouterPlanAction, ActionSpec>> = {
   status: { required: [], optional: ["planId", "inbox"] },
   ready: { required: ["planId"], optional: [] },
   "add-tasks": { required: ["planId", "text"], optional: [] },
-  // Without planId: the plan of the calling session (as `status` picks it); `/plan answer <id> <text>` names no plan.
+  // Without planId: the running or paused plan of the calling session (`runtime.planLine`); `/plan answer <id> <text>`
+  // names no plan unless `--plan <id>` is given.
   answer: { required: ["inboxId", "text"], optional: ["planId"] },
   done: { required: ["planId", "task"], optional: [] },
   pause: { required: ["planId"], optional: [] },
@@ -180,13 +185,32 @@ function parseArgs(raw: unknown): Parsed {
 const BOARD_HEAD = /^Plan (\S+) \[[^\]]*\]/;
 
 /** The plan id of a board's first line, or null when the board does not start with one. */
-function boardPlanId(board: string): string | null {
+export function boardPlanId(board: string): string | null {
   const id = BOARD_HEAD.exec(board.split("\n", 1)[0] ?? "")?.[1];
   return id !== undefined && validId(id) ? id : null;
 }
 
-/** The board's first line plus its inbox section, with how to answer an item. */
-function inboxSection(board: string): string {
+// `runtime.planLine` (runtime.ts) is `plan <planId>: <done>/<total> done, ...` for the session's running or paused plan, and
+// null when it has none. It is the one runtime view that skips completed and aborted plans (QA-4.1-5).
+const PLAN_LINE_HEAD = /^plan (\S+): \d+\/\d+ done, /;
+
+/** The plan id of a `planLine`, or null when there is none (no running or paused plan in the session). */
+export function planLinePlanId(line: string | null): string | null {
+  if (line === null) return null;
+  const id = PLAN_LINE_HEAD.exec(line)?.[1];
+  return id !== undefined && validId(id) ? id : null;
+}
+
+/** The plan this session runs now (running or paused), or null. Never the oldest plan of the session (QA-4.1-5). */
+function sessionPlanId(runtime: ExecutorRuntime, sessionID: string): string | null {
+  return planLinePlanId(runtime.planLine(sessionID));
+}
+
+/**
+ * The board's first line plus its inbox section, with how to answer an item. `--plan` appears in the `/plan answer` hint
+ * unless the board is the session's running plan, the one `/plan answer` without `--plan` picks.
+ */
+function inboxSection(board: string, sessionPlan: string | null): string {
   const lines = board.split("\n");
   const head = lines[0] ?? "";
   const start = lines.indexOf("Inbox:");
@@ -196,11 +220,13 @@ function inboxSection(board: string): string {
   const section = lines.slice(start + 1, end === -1 ? lines.length : end);
   const count = section.filter(l => l.startsWith("  ")).length;
   const planId = boardPlanId(board);
+  const flag = planId !== null && planId !== sessionPlan ? `--plan ${planId} ` : "";
   return [
     head,
     `Inbox (${count}):`,
     ...section,
-    `Answer: router_plan action=answer${planId === null ? "" : ` planId=${planId}`} inboxId=<id> text=<answer>.`,
+    `Answer: /plan answer ${flag}<id> <text>` +
+      ` (tool: router_plan action=answer${planId === null ? "" : ` planId=${planId}`} inboxId=<id> text=<answer>).`,
   ].join("\n");
 }
 
@@ -236,7 +262,7 @@ function fmtSummary(planId: string, s: CompileSummary): string {
 /** What to do next after a refusal, by error code. */
 function hint(code: string): string {
   switch (code) {
-    case "E_NOT_OWNER": return "That plan belongs to another live session; do not act on it. If that session is gone, action=adopt planId=<id> takes it over.";
+    case "E_NOT_OWNER": return "That plan belongs to another session; do not act on it. If that session is gone, action=adopt planId=<id> takes it over.";
     case "E_PLAN_STATE": return "The plan is not in a state that allows this; action=status shows its status.";
     case "E_LEDGER_NOT_FOUND": return "No such plan; action=status (without planId) shows the plan of this session.";
     case "E_INVALID_INPUT": return "Fix the input and call again.";
@@ -259,14 +285,23 @@ function describeError(action: string, error: unknown): string {
   return `${PREFIX} ${action} failed: ${oneLine(msg, MAX_ERROR)}`;
 }
 
-/** Options of the factory. `approve` reads the effective `executor.approve` setting each call (config can change; default "ask"). */
+/**
+ * Options of the factory. `approve` reads the effective `executor.approve` setting (config can change; default "ask"); it is
+ * read only by compile and residue, the two actions that can finish a draft, so a failing getter breaks nothing else.
+ */
 export interface RouterPlanToolOptions {
   approve?: () => "ask" | "auto";
 }
 
-/** After a draft is complete: `approve: auto` approves it at once (no stop), otherwise the orchestrator is told to review and approve. */
+/** The `ask` answer once a draft is complete: approval is the user's decision, never the model's (QA-4.1-1). */
+export function askApprovalText(planId: string): string {
+  return "status: awaiting-approval. Show this summary to the user. Call router_plan action=approve only after the user " +
+    `explicitly approves in this conversation (then: action=approve planId=${planId}; the user can also type /plan approve ${planId}).`;
+}
+
+/** After a draft is complete: `approve: auto` approves it at once (no stop), otherwise the user is asked to approve it. */
 async function approveStep(runtime: ExecutorRuntime, planId: string, sessionID: string, auto: boolean): Promise<string> {
-  if (!auto) return `status: awaiting-approval. Review it, then call router_plan action=approve planId=${planId}.`;
+  if (!auto) return askApprovalText(planId);
   try {
     await runtime.approve(planId, sessionID);
   } catch (error) {
@@ -275,14 +310,51 @@ async function approveStep(runtime: ExecutorRuntime, planId: string, sessionID: 
   return `status: approved and running (approve: auto). Next: router_plan action=status planId=${planId}; run manual tasks as they appear.`;
 }
 
-async function run(runtime: ExecutorRuntime, a: RouterPlanArgs, sessionID: string, auto: boolean): Promise<string> {
+/**
+ * The plan path as the compiler needs it (absolute): a relative `path` is resolved against the project directory of the
+ * calling session (QA-4.1-6). Null when it is relative and no project directory is known.
+ */
+export function resolvePlanPath(p: string, baseDir: string | null): string | null {
+  if (isAbsolutePlanPath(p)) return p;
+  if (baseDir === null) return null;
+  // The form of the base decides the path flavour, so the result does not depend on the platform the tests run on.
+  return WINDOWS_ABSOLUTE.test(baseDir) ? win32.resolve(baseDir, p) : posix.resolve(baseDir, p);
+}
+
+// What the compiler takes as absolute (compile/index.ts isAbsolutePlanPath): a drive path, a UNC path or a POSIX path.
+const WINDOWS_ABSOLUTE = /^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+)/;
+
+function isAbsolutePlanPath(p: string): boolean {
+  return WINDOWS_ABSOLUTE.test(p) || p.startsWith("/");
+}
+
+/** The project directory of the tool context: `directory`, else `worktree`; only an absolute one counts. */
+function projectDir(ctx: RouterPlanContext | undefined): string | null {
+  for (const v of [ctx?.directory, ctx?.worktree]) if (isString(v) && isAbsolutePlanPath(v)) return v;
+  return null;
+}
+
+interface RunContext {
+  sessionID: string;
+  baseDir: string | null;
+  /** Reads `executor.approve`; called only where a draft can complete (compile, residue). */
+  auto: () => boolean;
+}
+
+async function run(runtime: ExecutorRuntime, a: RouterPlanArgs, rc: RunContext): Promise<string> {
   // `planId` is present for every action that requires it (parseArgs); the empty fallbacks only satisfy the types.
   const planId = a.planId ?? "";
   const text = a.text ?? "";
+  const sessionID = rc.sessionID;
   switch (a.action) {
     case "compile": {
+      const path = resolvePlanPath(a.path ?? "", rc.baseDir);
+      if (path === null) {
+        return `${PREFIX} action=compile refused: path "${oneLine(a.path ?? "", 200)}" is relative and the project directory is unknown; pass an absolute path.`;
+      }
+      const auto = rc.auto();
       const r = await runtime.compile({
-        path: a.path ?? "",
+        path,
         ...(a.phases !== undefined ? { phases: a.phases } : {}),
         ...(a.doneBefore !== undefined ? { doneBefore: a.doneBefore } : {}),
         sessionID,
@@ -299,6 +371,7 @@ async function run(runtime: ExecutorRuntime, a: RouterPlanArgs, sessionID: strin
       return `${fmtSummary(r.planId, r.summary)}\n${await approveStep(runtime, r.planId, sessionID, auto)}`;
     }
     case "residue": {
+      const auto = rc.auto();
       const s = await runtime.residue(planId, text, sessionID);
       return `${fmtSummary(planId, s)}\nresidue merged. ${await approveStep(runtime, planId, sessionID, auto)}`;
     }
@@ -306,8 +379,10 @@ async function run(runtime: ExecutorRuntime, a: RouterPlanArgs, sessionID: strin
       await runtime.approve(planId, sessionID);
       return `plan ${planId} approved and running. Next: router_plan action=status planId=${planId}; run manual tasks as they appear.`;
     case "status": {
-      const board = await runtime.status(a.planId ?? null, sessionID);
-      const out = a.inbox === true ? inboxSection(board) : board;
+      // Without planId: the session's running or paused plan; with none, the runtime's pick (a finished plan of the session).
+      const current = sessionPlanId(runtime, sessionID);
+      const board = await runtime.status(a.planId ?? current, sessionID);
+      const out = a.inbox === true ? inboxSection(board, current) : board;
       return out.length > MAX_STATUS ? `${out.slice(0, MAX_STATUS)}\n... (status truncated at ${MAX_STATUS} chars)` : out;
     }
     case "ready": {
@@ -323,9 +398,9 @@ async function run(runtime: ExecutorRuntime, a: RouterPlanArgs, sessionID: strin
       return `${parts.join("; ")}.`;
     }
     case "answer": {
-      const target = a.planId ?? boardPlanId(await runtime.status(null, sessionID));
+      const target = a.planId ?? sessionPlanId(runtime, sessionID);
       if (target === null) {
-        return `${PREFIX} action=answer refused: cannot tell which plan this session runs; call again with planId.`;
+        return `${PREFIX} action=answer refused: this session runs no plan now; pass planId (the user: /plan answer --plan <planId> <id> <text>).`;
       }
       await runtime.answer(target, a.inboxId ?? "", text, sessionID);
       return `plan ${target}: inbox ${a.inboxId ?? ""} answered.`;
@@ -378,7 +453,9 @@ export async function executeRouterPlan(
     action = `action=${parsed.action}`;
     const sessionID = isString(ctx?.sessionID) ? ctx.sessionID : "";
     if (sessionID.length === 0) return `${PREFIX} ${action} refused: no calling session; plans are owned by the session that runs them.`;
-    return await run(runtime, parsed.a, sessionID, opts?.approve?.() === "auto");
+    // QA-4.1-10: the approve getter is read lazily, inside compile and residue only.
+    const auto = (): boolean => opts?.approve?.() === "auto";
+    return await run(runtime, parsed.a, { sessionID, baseDir: projectDir(ctx), auto });
   } catch (error) {
     return describeError(action, error);
   }
@@ -388,13 +465,14 @@ export function createRouterPlanTool(runtime: ExecutorRuntime, options?: RouterP
   return tool({
     description:
       "Drive the plan executor. Actions: compile (path, phases?, doneBefore?) -> summary or a residue prompt to dispatch; " +
-      "residue (planId, text = architect JSON); approve (planId); status (planId?, inbox?); ready (planId); add-tasks (planId, text); " +
-      "answer (planId?, inboxId, text; without planId: this session's plan); done (planId, task; manual/preflight tasks only); pause|resume|abort|land|adopt (planId); " +
-      "gc; export (planId); purge (planId; completed or aborted only). A plan owned by another live session is refused.",
+      "residue (planId, text = architect JSON); approve (planId; only after the user approves, unless executor.approve is auto); " +
+      "status (planId?, inbox?); ready (planId); add-tasks (planId, text); " +
+      "answer (planId?, inboxId, text; without planId: this session's running plan); done (planId, task; manual/preflight tasks only); pause|resume|abort|land|adopt (planId); " +
+      "gc; export (planId); purge (planId; completed or aborted only). A plan owned by another session is refused.",
     args: {
       action: tool.schema.enum(ROUTER_PLAN_ACTIONS).describe("What to do."),
       planId: tool.schema.string().optional().describe("The plan id (printed by compile)."),
-      path: tool.schema.string().optional().describe("compile: absolute path of the plan file."),
+      path: tool.schema.string().optional().describe("compile: path of the plan file, absolute or relative to the project directory."),
       phases: tool.schema.array(tool.schema.string()).optional().describe("compile: only these phase ids."),
       doneBefore: tool.schema.string().optional().describe("compile: treat every phase before this id as done."),
       text: tool.schema.string().optional().describe("residue / add-tasks / answer: the JSON or answer text."),

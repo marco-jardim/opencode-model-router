@@ -1,4 +1,4 @@
-import type { TurnStateProvider } from "../compat/turn-state";
+import { PLAN_PROVIDER_ORDER, type TurnStateProvider } from "../compat/turn-state";
 
 /**
  * Executor instructions (plan task 4.1.6, v2 only): a turn-state provider section, never system-prompt text. It renders
@@ -9,8 +9,8 @@ import type { TurnStateProvider } from "../compat/turn-state";
 /** Provider name; sorts right after the "plan" provider (`PLAN_PROVIDER_NAME`). */
 export const EXECUTOR_INSTRUCTIONS_PROVIDER_NAME = "plan-instructions";
 
-/** Right after the plan section, which the v2 adapter registers at order 60 (`PLAN_PROVIDER_ORDER` in v2-hooks.ts). */
-export const EXECUTOR_INSTRUCTIONS_ORDER = 61;
+/** Right after the plan section, which the v2 adapter registers at `PLAN_PROVIDER_ORDER` (turn-state.ts). */
+export const EXECUTOR_INSTRUCTIONS_ORDER = PLAN_PROVIDER_ORDER + 1;
 
 /** The exact text rendered while a plan runs. */
 export const EXECUTOR_INSTRUCTIONS_TEXT = [

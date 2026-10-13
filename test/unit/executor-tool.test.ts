@@ -2,11 +2,17 @@
 // The runtime is a typed, stateful double that enforces what the real runtime enforces at its boundary (E_NOT_OWNER,
 // E_PLAN_STATE, E_LEDGER_NOT_FOUND, E_INVALID_INPUT, E_CYCLE), so the tool is exercised end to end: validation,
 // ownership refusal mapped to text, and the compile -> residue -> approve round trip. Nothing here touches disk or time.
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   ROUTER_PLAN_ACTIONS,
+  askApprovalText,
+  boardPlanId,
   createRouterPlanTool,
   executeRouterPlan,
+  planLinePlanId,
+  resolvePlanPath,
   type RouterPlanAction,
   type RouterPlanToolOptions,
 } from "../../src/executor/tool.js";
@@ -297,7 +303,17 @@ class FakeRuntime implements ExecutorRuntime {
     return { stop: false };
   }
   async onChildEnd(): Promise<void> {}
-  planLine(): string | null {
+  /** The shape of runtime.ts planLine: the session's first running or paused plan, finished ones skipped. */
+  planLine(sessionID: string): string | null {
+    this.calls.push("planLine");
+    if (this.throwOn.has("planLine")) throw this.throwOn.get("planLine");
+    for (const p of this.plans.values()) {
+      if (p.owner !== sessionID || (p.status !== "running" && p.status !== "paused")) continue;
+      const done = [...p.tasks.values()].filter(t => t.state === "done").length;
+      const running = [...p.tasks.values()].filter(t => t.state === "running").length;
+      const ready = [...p.tasks.values()].filter(t => t.state === "ready").length;
+      return `plan ${p.id}: ${done}/${p.tasks.size} done, ${running} running, ${ready} ready${p.status === "paused" ? ", paused" : ""}`;
+    }
     return null;
   }
   async start(): Promise<void> {}
@@ -400,7 +416,7 @@ describe("router_plan: every action with valid input", () => {
     const out = await call(rt, { action: "compile", path: PLAN_FILE });
     expect(out).toContain("plan plan-1: 4 tasks, 2 phases, 1 edges; work 2h00m, critical path 1h00m, width 2, expected makespan 1h15m.");
     expect(out).toContain("manual tasks (1): 1.1.2");
-    expect(out).toContain("router_plan action=approve planId=plan-1");
+    expect(out).toContain("only after the user explicitly approves in this conversation (then: action=approve planId=plan-1;");
     expect(rt.lastCompile).toEqual({ path: PLAN_FILE, sessionID: OWNER });
   });
 
@@ -452,7 +468,7 @@ describe("router_plan: round trip compile -> residue -> approve", () => {
 
     const merged = await call(rt, { action: "residue", planId, text: "{\"edges\":[]}" });
     expect(merged).toContain("residue merged");
-    expect(merged).toContain("router_plan action=approve planId=plan-1");
+    expect(merged).toContain(askApprovalText("plan-1"));
     expect(rt.plans.get("plan-1")?.status).toBe("awaiting-approval");
 
     const approved = await call(rt, { action: "approve", planId });
@@ -495,14 +511,28 @@ describe("router_plan: approve: auto skips the stop", () => {
     expect(rt.plans.get("plan-1")?.status).toBe("running");
   });
 
-  it("ask (and no option) stops for the operator", async () => {
+  it("ask (and no option) stops for the user: the model is never told to approve on its own (QA-4.1-1)", async () => {
     for (const opts of [undefined, { approve: () => "ask" as const }, {}]) {
       const rt = new FakeRuntime();
       const out = await call(rt, { action: "compile", path: PLAN_FILE }, OWNER, opts);
-      expect(out).toContain("status: awaiting-approval. Review it, then call router_plan action=approve planId=plan-1");
+      expect(out).toContain(
+        "status: awaiting-approval. Show this summary to the user. Call router_plan action=approve only after the user " +
+          "explicitly approves in this conversation (then: action=approve planId=plan-1; the user can also type /plan approve plan-1).",
+      );
+      expect(out).toBe(`${out.split("\n").slice(0, -1).join("\n")}\n${askApprovalText("plan-1")}`);
+      expect(out).not.toMatch(/Review it, then call/);
       expect(rt.plans.get("plan-1")?.status).toBe("awaiting-approval");
       expect(rt.calls).toEqual(["compile"]);
     }
+  });
+
+  it("ask after a merged residue asks the user too (QA-4.1-1)", async () => {
+    const rt = new FakeRuntime();
+    await call(rt, { action: "compile", path: RESIDUE_FILE }, OWNER, { approve: () => "ask" });
+    const merged = await call(rt, { action: "residue", planId: "plan-1", text: "{}" }, OWNER, { approve: () => "ask" });
+    expect(merged).toContain(`residue merged. ${askApprovalText("plan-1")}`);
+    expect(rt.plans.get("plan-1")?.status).toBe("awaiting-approval");
+    expect(rt.calls).toEqual(["compile", "residue"]);
   });
 
   it("a failing automatic approve is reported and the plan stays awaiting-approval", async () => {
@@ -519,6 +549,70 @@ describe("router_plan: approve: auto skips the stop", () => {
     const rt = new FakeRuntime();
     const out = await call(rt, { action: "compile", path: PLAN_FILE }, OWNER, { approve: () => { throw new Error("config gone"); } });
     expect(out).toContain("failed: config gone");
+  });
+
+  it("QA-4.1-10: the getter is read only by compile and residue; a throwing one breaks no other action", async () => {
+    let reads = 0;
+    const throwing: RouterPlanToolOptions = {
+      approve: () => {
+        reads++;
+        throw new Error("config gone");
+      },
+    };
+    const rt = new FakeRuntime();
+    seedFor(rt, "running");
+    expect(await call(rt, { action: "status" }, OWNER, throwing)).toContain("Plan p1 [running]");
+    expect(await call(rt, { action: "status", inbox: true }, OWNER, throwing)).toContain("Q-1");
+    expect(await call(rt, { action: "answer", inboxId: "Q-1", text: "b" }, OWNER, throwing)).toBe("plan p1: inbox Q-1 answered.");
+    expect(await call(rt, { action: "ready", planId: "p1" }, OWNER, throwing)).toContain("launchable 1");
+    expect(await call(rt, { action: "pause", planId: "p1" }, OWNER, throwing)).toContain("paused");
+    expect(await call(rt, { action: "resume", planId: "p1" }, OWNER, throwing)).toContain("resumed");
+    expect(await call(rt, { action: "abort", planId: "p1" }, OWNER, throwing)).toContain("aborted");
+    expect(await call(rt, { action: "gc" }, OWNER, throwing)).toContain("gc: removed");
+    expect(reads).toBe(0);
+    // compile and residue read it (and report the failure as text).
+    expect(await call(rt, { action: "compile", path: PLAN_FILE }, OWNER, throwing)).toContain("action=compile failed: config gone");
+    expect(await call(rt, { action: "residue", planId: "p1", text: "{}" }, OWNER, throwing)).toContain("action=residue failed: config gone");
+    expect(reads).toBe(2);
+  });
+});
+
+describe("router_plan: a relative compile path (QA-4.1-6)", () => {
+  it("is resolved against the project directory of the tool context", async () => {
+    const rt = new FakeRuntime();
+    const out = await executeRouterPlan(rt, { action: "compile", path: "docs\\plans\\fixture.md" }, { sessionID: OWNER, directory: "D:\\work" });
+    expect(out).toContain("plan plan-1: 4 tasks");
+    expect(rt.lastCompile?.path).toBe("D:\\work\\docs\\plans\\fixture.md");
+    await executeRouterPlan(rt, { action: "compile", path: "./plans/../plans/fixture.md" }, { sessionID: OWNER, directory: "D:/work" });
+    expect(rt.lastCompile?.path).toBe("D:\\work\\plans\\fixture.md");
+    await executeRouterPlan(rt, { action: "compile", path: "plans/fixture.md" }, { sessionID: OWNER, directory: "/home/u/repo" });
+    expect(rt.lastCompile?.path).toBe("/home/u/repo/plans/fixture.md");
+  });
+
+  it("falls back to the worktree, and ignores a relative directory", async () => {
+    const rt = new FakeRuntime();
+    await executeRouterPlan(rt, { action: "compile", path: "fixture.md" }, { sessionID: OWNER, worktree: "D:\\wt" });
+    expect(rt.lastCompile?.path).toBe("D:\\wt\\fixture.md");
+    await executeRouterPlan(rt, { action: "compile", path: "fixture.md" }, { sessionID: OWNER, directory: "rel\\dir", worktree: "D:\\wt2" });
+    expect(rt.lastCompile?.path).toBe("D:\\wt2\\fixture.md");
+  });
+
+  it("passes an absolute path through unchanged (drive, UNC, POSIX)", async () => {
+    for (const p of [PLAN_FILE, "D:/work/plans/fixture.md", "\\\\server\\share\\fixture.md", "/srv/plans/fixture.md"]) {
+      const rt = new FakeRuntime();
+      await executeRouterPlan(rt, { action: "compile", path: p }, { sessionID: OWNER, directory: "C:\\elsewhere" });
+      expect(rt.lastCompile?.path, p).toBe(p);
+    }
+    expect(resolvePlanPath(PLAN_FILE, null)).toBe(PLAN_FILE);
+  });
+
+  it("is refused before the runtime when no project directory is known", async () => {
+    const rt = new FakeRuntime();
+    const out = await call(rt, { action: "compile", path: "plans/fixture.md" });
+    expect(out).toContain("action=compile refused");
+    expect(out).toContain("relative and the project directory is unknown; pass an absolute path");
+    expect(rt.calls).toEqual([]);
+    expect(resolvePlanPath("plans/fixture.md", null)).toBeNull();
   });
 });
 
@@ -676,7 +770,9 @@ describe("router_plan: a plan owned by another live session", () => {
       const before = JSON.stringify([...rt.plans.values()].map(p => [p.status, [...p.tasks], [...p.inbox]]));
       const out = await call(rt, { action, ...c.args }, OTHER);
       expect(out).toContain(`action=${action} refused (E_NOT_OWNER)`);
-      expect(out).toContain("another live session");
+      // QA-4.1-15: "another session", not "another live session".
+      expect(out).toContain("That plan belongs to another session; do not act on it.");
+      expect(out).not.toContain("another live session");
       expect(out).toContain("action=adopt");
       expect(JSON.stringify([...rt.plans.values()].map(p => [p.status, [...p.tasks], [...p.inbox]]))).toBe(before);
       expect(rt.deletedRefs).toEqual([]);
@@ -710,11 +806,14 @@ describe("router_plan: a plan owned by another live session", () => {
     const rt = new FakeRuntime();
     seedFor(rt, "running");
     const out = await call(rt, { action: "answer", inboxId: "Q-1", text: "x" }, OTHER);
-    expect(out).toContain("action=answer refused (E_LEDGER_NOT_FOUND)");
+    expect(out).toBe(NO_PLAN_REFUSAL);
     expect(rt.plans.get("p1")?.inbox.get("Q-1")?.open).toBe(true);
-    expect(rt.calls).toEqual(["status"]);
+    expect(rt.calls).toEqual(["planLine"]);
   });
 });
+
+const NO_PLAN_REFUSAL =
+  "[router_plan] action=answer refused: this session runs no plan now; pass planId (the user: /plan answer --plan <planId> <id> <text>).";
 
 describe("router_plan: answer without planId and the inbox view", () => {
   it("answer without planId answers on the calling session's plan", async () => {
@@ -723,22 +822,44 @@ describe("router_plan: answer without planId and the inbox view", () => {
     const out = await call(rt, { action: "answer", inboxId: "Q-1", text: "go with b" });
     expect(out).toBe("plan p1: inbox Q-1 answered.");
     expect(rt.plans.get("p1")?.inbox.get("Q-1")?.answer).toBe("go with b");
-    expect(rt.calls).toEqual(["status", "answer"]);
+    expect(rt.calls).toEqual(["planLine", "answer"]);
   });
 
   it("answer without planId and no plan of the session is refused", async () => {
     const rt = new FakeRuntime();
-    expect(await call(rt, { action: "answer", inboxId: "Q-1", text: "x" })).toContain("E_LEDGER_NOT_FOUND");
-    expect(rt.calls).toEqual(["status"]);
+    expect(await call(rt, { action: "answer", inboxId: "Q-1", text: "x" })).toBe(NO_PLAN_REFUSAL);
+    expect(rt.calls).toEqual(["planLine"]);
   });
 
-  it("answer without planId refuses when the board names no plan", async () => {
+  it("answer without planId refuses when the plan line names no plan", async () => {
     const rt = new FakeRuntime();
     seedFor(rt, "running");
-    rt.statusText = "something else";
+    rt.planLine = () => "something else";
     const out = await call(rt, { action: "answer", inboxId: "Q-1", text: "x" });
-    expect(out).toBe("[router_plan] action=answer refused: cannot tell which plan this session runs; call again with planId.");
-    expect(rt.calls).toEqual(["status"]);
+    expect(out).toBe(NO_PLAN_REFUSAL);
+    expect(rt.calls).toEqual([]);
+  });
+
+  it("QA-4.1-5: without planId the session's RUNNING plan is used, never its oldest finished one", async () => {
+    const rt = new FakeRuntime();
+    // Insertion order makes the finished plans first, as `runtime.status(null)` would pick them.
+    for (const [id, status] of [["old-done", "completed"], ["old-abort", "aborted"]] as const) {
+      rt.seed(id, OWNER, status).inbox.set("Q-1", { open: true, answer: null });
+    }
+    const current = rt.seed("cur", OWNER, "paused");
+    current.inbox.set("Q-1", { open: true, answer: null });
+    expect(await call(rt, { action: "answer", inboxId: "Q-1", text: "go" })).toBe("plan cur: inbox Q-1 answered.");
+    expect(current.inbox.get("Q-1")?.answer).toBe("go");
+    expect(rt.plans.get("old-done")?.inbox.get("Q-1")?.open).toBe(true);
+    expect(rt.plans.get("old-abort")?.inbox.get("Q-1")?.open).toBe(true);
+    expect((await call(rt, { action: "status" })).split("\n")[0]).toBe(`Plan cur [paused] ${PLAN_FILE}`);
+    expect((await call(rt, { action: "status", inbox: true })).split("\n")[0]).toBe(`Plan cur [paused] ${PLAN_FILE}`);
+    // With only finished plans left, answer asks for planId; status falls back to the runtime's pick.
+    current.status = "aborted";
+    expect(await call(rt, { action: "answer", inboxId: "Q-1", text: "x" })).toBe(NO_PLAN_REFUSAL);
+    expect((await call(rt, { action: "status" })).split("\n")[0]).toBe(`Plan old-done [completed] ${PLAN_FILE}`);
+    // An explicit planId always wins.
+    expect(await call(rt, { action: "answer", planId: "old-done", inboxId: "Q-1", text: "late" })).toBe("plan old-done: inbox Q-1 answered.");
   });
 
   it("status inbox:true shows only the head line and the open inbox items", async () => {
@@ -751,7 +872,8 @@ describe("router_plan: answer without planId and the inbox view", () => {
       "Inbox (2):",
       "  Q-1 question/blocking: pick an option",
       "  Q-2 question/blocking: pick an option",
-      "Answer: router_plan action=answer planId=p1 inboxId=<id> text=<answer>.",
+      // QA-4.1-15: the user's form first; this is the session's running plan, so no --plan.
+      "Answer: /plan answer <id> <text> (tool: router_plan action=answer planId=p1 inboxId=<id> text=<answer>).",
     ].join("\n"));
     expect(out).not.toContain("Metrics:");
     expect(out).not.toContain("Ready:");
@@ -773,8 +895,20 @@ describe("router_plan: answer without planId and the inbox view", () => {
       "  Q-1 question/blocking: first line",
       "second line",
       "  Q-2 info/minor: ok",
-      "Answer: router_plan action=answer planId=p7 inboxId=<id> text=<answer>.",
+      // p7 is not the session's running plan (planLine is null here), so the user's form names it.
+      "Answer: /plan answer --plan p7 <id> <text> (tool: router_plan action=answer planId=p7 inboxId=<id> text=<answer>).",
     ].join("\n"));
+  });
+
+  it("status inbox:true of another plan than the running one names --plan in the user's form", async () => {
+    const rt = new FakeRuntime();
+    seedFor(rt, "running");
+    rt.seed("p2", OWNER, "completed").inbox.set("Q-5", { open: true, answer: null });
+    const out = await call(rt, { action: "status", planId: "p2", inbox: true });
+    const lines = out.split("\n");
+    expect(lines[lines.length - 1]).toBe(
+      "Answer: /plan answer --plan p2 <id> <text> (tool: router_plan action=answer planId=p2 inboxId=<id> text=<answer>).",
+    );
   });
 
   it("status inbox:false is the full board", async () => {
@@ -1069,5 +1203,47 @@ describe("createRouterPlanTool", () => {
       "compile", "residue", "approve", "status", "ready", "add-tasks", "answer", "done",
       "pause", "resume", "abort", "land", "adopt", "gc", "export", "purge",
     ]);
+  });
+
+  it("describes path, approval and ownership as QA-4.1 fixed them", () => {
+    const def = createRouterPlanTool(new FakeRuntime());
+    expect(def.description).toContain("only after the user approves, unless executor.approve is auto");
+    expect(def.description).toContain("A plan owned by another session is refused.");
+    expect(def.description).not.toContain("another live session");
+  });
+});
+
+// QA-4.1-5 contract: the tool reads two runtime.ts renderings, `planLine` (which plan the session runs now) and the
+// board head of `renderBoard`. These pins break when runtime.ts changes either template, and the parsers are run on lines
+// built exactly like those templates.
+describe("router_plan: contract with runtime.ts planLine and renderBoard (QA-4.1-5)", () => {
+  const src = readFileSync(join(process.cwd(), "src", "executor", "runtime.ts"), "utf8");
+
+  it("runtime.ts still renders the shapes the tool parses", () => {
+    expect(src).toContain(
+      'let line = `plan ${l.planId}: ${done}/${ts2.length} done, ${running} running, ${ready} ready${l.status === "paused" ? ", paused" : ""}`;',
+    );
+    expect(src).toContain('if (!g.ok && g.reason !== "disposed") line += ` (launch blocked: ${g.reason})`;');
+    // planLine skips every plan that is not running or paused: the finished ones never answer "the session's plan".
+    expect(src).toContain('if (l.orchestrator.sessionID !== sessionID || (l.status !== "running" && l.status !== "paused")) continue;');
+    expect(src).toContain("const out: string[] = [`Plan ${l.planId} [${l.status}] ${l.planPath}`];");
+    expect(src).toContain('out.push("Inbox:");');
+    expect(src).toContain("out.push(`Metrics: launches ${p.counters.launches}");
+  });
+
+  it("parses lines built like those templates", () => {
+    const planLine = (planId: string, status: string, done: number, total: number, running: number, ready: number, blocked?: string): string => {
+      let line = `plan ${planId}: ${done}/${total} done, ${running} running, ${ready} ready${status === "paused" ? ", paused" : ""}`;
+      if (blocked !== undefined) line += ` (launch blocked: ${blocked})`;
+      return line;
+    };
+    for (const id of ["p1", "cpx-p41-executor", "plan-2026-10-13", "a:b"]) {
+      expect(planLinePlanId(planLine(id, "running", 0, 12, 2, 3)), id).toBe(id);
+      expect(planLinePlanId(planLine(id, "paused", 11, 12, 0, 0, "capacity")), id).toBe(id);
+      expect(boardPlanId(`Plan ${id} [completed] D:\\My Plans\\p.md\nTasks: done 12`), id).toBe(id);
+    }
+    expect(planLinePlanId(null)).toBeNull();
+    expect(planLinePlanId("Plan p1 [running] D:\\p.md")).toBeNull();
+    expect(boardPlanId("plan p1: 0/1 done, 0 running, 1 ready")).toBeNull();
   });
 });

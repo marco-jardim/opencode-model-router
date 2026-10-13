@@ -345,7 +345,7 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
 
   it("sees the surface it pins", () => {
     expect(planSubcommands(PLAN_HELP_LINES).sort()).toEqual(
-      ["abort", "adopt", "answer", "inbox", "land", "pause", "resume", "run", "status"],
+      ["abort", "adopt", "answer", "approve", "inbox", "land", "pause", "resume", "run", "status"],
     );
     expect(ROUTER_PLAN_ACTIONS.length).toBeGreaterThanOrEqual(16);
     expect(executorLeafKeys(ROUTING_DEFAULTS.executor as unknown as Record<string, unknown>)).toContain("circuitBreaker.minAttempts");
@@ -363,6 +363,32 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     expect(executorDocProblems(doc.replaceAll("`routing.executor.circuitBreaker.minAttempts`", "`x`"))).toContain(
       "routing.executor.circuitBreaker.minAttempts",
     );
+  });
+
+  it("pins the QA-4.1 operator surface: human approval, path rule, --phases format, --plan, attempts, checks, slotsDir", () => {
+    const flat = doc.replace(/\s+/g, " ");
+    // QA-4.1-1: compiling never starts a plan; with `ask` the user approves, never the model.
+    expect(flat).toContain("it does not start the plan");
+    expect(flat).toContain("the model never approves on its own");
+    expect(flat).not.toMatch(/Compiles the plan file and starts it/);
+    // QA-4.1-6, QA-4.1-15: the path rule and the comma-only --phases format.
+    expect(flat).toContain("absolute, or relative to the project directory");
+    expect(flat).toContain("comma separated without spaces (`--phases 1.1,1.2`)");
+    expect(flat).not.toMatch(/comma or space separated/);
+    // QA-4.1-5: --plan of inbox and answer.
+    expect(flat).toContain("| `/plan inbox [--plan <planId>]`");
+    expect(flat).toContain("| `/plan answer [--plan <planId>] <id> <text>`");
+    // QA-4.1-15, QA-4.1-8, QA-4.1-12.
+    expect(flat).toContain("at most `routing.executor.maxAttempts` attempts per task");
+    expect(flat).not.toMatch(/retried up to/);
+    expect(flat).toContain("a list of commands is added to them, it never replaces them");
+    expect(flat).toContain("A configured `slotsDir` is used verbatim");
+    expect(flat).not.toMatch(/another live session/);
+    // The help lines say the same.
+    const helpText = PLAN_HELP_LINES.join("\n");
+    expect(helpText).not.toMatch(/start executing it/);
+    expect(helpText).toContain("relative to the project directory");
+    expect(helpText).toContain("adopt a plan whose owning session is gone");
   });
 
   it("keeps the Unattended operation, QA loop and Recovery placeholders until Phase 4.2/5.1", () => {

@@ -41,9 +41,8 @@ import { parseReturnPrefix } from "../routing/outcomes/signals";
 import { lookupDispatch } from "../router/sessions";
 import { createSystemAugmenter } from "../routing/wire/hint";
 import { createTurnStateRegistry, placeTurnState, ROUTER_TURN_STATE_ATTACH, TURN_STATE_ROOT, type TurnStateRegistry } from "./turn-state";
-import { PLAN_PROVIDER_NAME } from "./turn-state";
-/** 3.1.7 W6: the `plan` provider after the background ones (completed 30, held 40, in-flight 50), before the route hint (90). */
-const PLAN_PROVIDER_ORDER = 60;
+// 3.1.7 W6: the `plan` provider after the background ones (completed 30, held 40, in-flight 50), before the route hint (90).
+import { PLAN_PROVIDER_NAME, PLAN_PROVIDER_ORDER } from "./turn-state";
 import { CONTEXT7_DOC_TOOLS, evaluatePermission, permissionMatches, permissionRules, publishReadOnlyPermissions } from "../router/read-only";
 import { filterSensitiveGrep, isSensitivePath } from "../router/sensitive-paths";
 import { canonicalAuthorityPath, insideWorkRoot } from "../routing/roles/work-root";

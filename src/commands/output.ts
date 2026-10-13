@@ -254,13 +254,14 @@ export function buildRouterHelp(
 /** `/plan` usage lines (v2 only): appended to `/router` help when `plan` is set and printed for an unknown `/plan` subcommand. */
 export const PLAN_HELP_LINES: readonly string[] = [
   "Plan executor (`/plan`):",
-  "- `/plan run <path> [--phases <ids>] [--done-before <id>]` — compile a plan file and start executing it",
+  "- `/plan run <path> [--phases <id,id,...>] [--done-before <id>]` — compile a plan file (path absolute, or relative to the project directory) and show its summary; it does not start until approved",
+  "- `/plan approve <planId>` — approve a compiled plan and start it (not needed with `executor.approve: \"auto\"`)",
   "- `/plan status [planId]` — show plan progress",
-  "- `/plan inbox` — show the questions waiting for an answer",
-  "- `/plan answer <id> <text>` — answer an inbox question",
+  "- `/plan inbox [--plan <planId>]` — show the questions waiting for an answer",
+  "- `/plan answer [--plan <planId>] <id> <text>` — answer an inbox question (without `--plan`: this session's running plan)",
   "- `/plan pause|resume|abort <planId>` — pause, resume or abort a plan",
   "- `/plan land <planId>` — land a finished plan",
-  "- `/plan adopt <planId>` — adopt a plan started elsewhere",
+  "- `/plan adopt <planId>` — adopt a plan whose owning session is gone",
 ];
 
 /** `/plan` with no or an unknown subcommand. */
