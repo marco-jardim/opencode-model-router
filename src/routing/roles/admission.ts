@@ -167,30 +167,89 @@ export function parseWorktreeEntries(porcelain: string): WorktreeEntry[] {
   return out;
 }
 
+/** The spawn {@link gitBounded} runs git with: `spawnBounded` (git-tools.ts) unless a test injects another. */
+export type GitSpawn = (
+  executable: string,
+  args: readonly string[],
+  cwd: string,
+  options: { readonly env: NodeJS.ProcessEnv; readonly timeoutMs: number; readonly maxBytes: number; readonly settleOnFailure: true },
+) => Promise<{ readonly code: number | null; readonly output: Buffer; readonly truncated: boolean; readonly failure?: string }>;
+
+/** Options of {@link gitBounded}. */
+export interface GitBoundedOptions {
+  /** Total bound in ms, the `safe.directory` probe included (default {@link GIT_BOUND_MS}). */
+  readonly timeoutMs?: number;
+  /** Output cap in bytes (default 64 KiB); a longer answer is a failure (`truncated`). */
+  readonly maxBytes?: number;
+  /** Tests only: replaces `spawnBounded`. The hardening (executable, arguments, environment) is computed as without it. */
+  readonly spawn?: GitSpawn;
+}
+
+/** What {@link gitBounded} returns: git's raw stdout, or why there is none. */
+export type GitBoundedResult =
+  | { readonly ok: true; readonly stdout: string }
+  | { readonly ok: false; readonly failure: "timeout" | "exit" | "truncated" | "spawn"; readonly code?: number | null; readonly detail?: string };
+
+/** Default bound of {@link gitBounded}: 5 s, the `safe.directory` probe included. */
+export const GIT_BOUND_MS = 5_000;
+
 /**
- * Hardened `git rev-parse <args>` in `cwd`, as `gitWorktreeList` (dispatch.ts) spawns git: the absolute executable selected
- * outside `workRootGuards(cwd)`, `hardeningArgs()`, the user's `safe.directory` values, `gitEnvironment()`, no shell, bounded to
- * 5 s and 64 KiB. `GIT_CEILING_DIRECTORIES` stops discovery at `cwd`'s parent, so a directory inside a repository never reports
- * that repository. Undefined on any failure.
+ * How long past its bound {@link gitBounded} waits before it gives up on its own: `spawnBounded` normally stops git at the bound
+ * and kills its process tree first; this deadline only covers a spawn that never settles.
  */
-async function gitRevParse(cwd: string, args: readonly string[]): Promise<string | undefined> {
+const GIT_BOUND_GRACE_MS = 500;
+
+/** One hardened git run ({@link gitBounded}), without the outer deadline. Never rejects. */
+async function runGitBounded(cwd: string, args: readonly string[], bound: number, maxBytes: number, spawn: GitSpawn | undefined): Promise<GitBoundedResult> {
   try {
     const { gitEnvironment, gitExecutable, hardeningArgs, inheritedSafeDirectoryArgs, spawnBounded, workRootGuards } = await import("../../router/git-tools");
+    const run: GitSpawn = spawn ?? spawnBounded;
     const started = performance.now();
     const executable = gitExecutable(workRootGuards(cwd));
-    const trusted = await inheritedSafeDirectoryArgs(executable, 5_000);
+    const trusted = await inheritedSafeDirectoryArgs(executable, bound);
     const above = dirname(cwd);
-    const result = await spawnBounded(executable, [...hardeningArgs(), ...trusted, "rev-parse", ...args], cwd, {
+    const result = await run(executable, [...hardeningArgs(), ...trusted, ...args], cwd, {
       env: gitEnvironment(above === cwd ? {} : { GIT_CEILING_DIRECTORIES: above }),
-      timeoutMs: Math.max(1, 5_000 - (performance.now() - started)),
-      maxBytes: 64 * 1024,
+      timeoutMs: Math.max(1, bound - (performance.now() - started)),
+      maxBytes,
+      settleOnFailure: true,
     });
-    if (result.code !== 0 || result.truncated) return undefined;
-    const out = result.output.toString("utf8").trim();
-    return out === "" ? undefined : out;
-  } catch {
-    return undefined;
+    if (result.failure !== undefined) return { ok: false, failure: "timeout", code: result.code, detail: result.failure };
+    if (result.truncated) return { ok: false, failure: "truncated", code: result.code };
+    if (result.code !== 0) return { ok: false, failure: "exit", code: result.code };
+    return { ok: true, stdout: result.output.toString("utf8") };
+  } catch (error) {
+    return { ok: false, failure: "spawn", detail: error instanceof Error ? error.message : String(error) };
   }
+}
+
+/**
+ * Hardened `git <args>` in `cwd`, as `gitWorktreeList` (dispatch.ts) spawns git: the absolute executable selected outside
+ * `workRootGuards(cwd)`, `hardeningArgs()`, the user's `safe.directory` values, `gitEnvironment()`, no shell, bounded to
+ * {@link GIT_BOUND_MS} (the `safe.directory` probe included) and 64 KiB. `GIT_CEILING_DIRECTORIES` stops discovery at `cwd`'s
+ * parent, so a directory inside a repository never reports that repository. Never rejects: git's raw stdout, or a typed failure
+ * (`timeout`, `exit` = a non-zero exit code, `truncated` = more than `maxBytes`, `spawn` = git could not run, `cwd` included).
+ */
+export async function gitBounded(cwd: string, args: readonly string[], opts: GitBoundedOptions = {}): Promise<GitBoundedResult> {
+  const bound = opts.timeoutMs ?? GIT_BOUND_MS;
+  const maxBytes = opts.maxBytes ?? 64 * 1024;
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<GitBoundedResult>((resolve) => {
+    timer = setTimeout(() => resolve({ ok: false, failure: "timeout", detail: `git did not settle within ${String(bound + GIT_BOUND_GRACE_MS)} ms` }), bound + GIT_BOUND_GRACE_MS);
+  });
+  try {
+    return await Promise.race([runGitBounded(cwd, args, bound, maxBytes, opts.spawn), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Hardened `git rev-parse <args>` in `cwd` ({@link gitBounded}), trimmed. Undefined on any failure or an empty answer. */
+async function gitRevParse(cwd: string, args: readonly string[]): Promise<string | undefined> {
+  const result = await gitBounded(cwd, ["rev-parse", ...args]);
+  if (!result.ok) return undefined;
+  const out = result.stdout.trim();
+  return out === "" ? undefined : out;
 }
 
 /** Hardened `git rev-parse --show-toplevel` in `cwd` ({@link gitRevParse}). Undefined on any failure. */
@@ -202,6 +261,62 @@ export function gitShowToplevel(cwd: string): Promise<string | undefined> {
 export async function gitCommonDir(cwd: string): Promise<string | undefined> {
   const dir = await gitRevParse(cwd, ["--git-common-dir"]);
   return dir === undefined ? undefined : isAbsolute(dir) ? dir : join(cwd, dir);
+}
+
+/** A full object name as git prints it: 40 (SHA-1) or 64 (SHA-256) lower-case hex digits. */
+const FULL_OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+/**
+ * The root commits reachable from `HEAD` in `cwd`, sorted and unique: hardened `git --no-replace-objects rev-list
+ * --max-parents=0 HEAD --` ({@link gitBounded}; replace refs cannot stand in for history, `--` keeps a file named `HEAD` from
+ * making the revision ambiguous). Undefined on any failure, for a repository without commits, and when a line is not a full
+ * object name.
+ */
+export async function gitRootCommits(cwd: string, opts?: GitBoundedOptions): Promise<string[] | undefined> {
+  const result = await gitBounded(cwd, ["--no-replace-objects", "rev-list", "--max-parents=0", "HEAD", "--"], opts);
+  if (!result.ok) return undefined;
+  const lines = result.stdout.split("\n").map((line) => line.trim()).filter((line) => line !== "");
+  if (lines.length === 0 || !lines.every((line) => FULL_OID.test(line))) return undefined;
+  return [...new Set(lines)].sort();
+}
+
+/**
+ * `remote.origin.url` in `cwd`: hardened `git config --get remote.origin.url` ({@link gitBounded}; system and global config are
+ * off), raw apart from git's line end. Not sanitised: a caller that shows it sanitises it. Undefined when it is unset or empty,
+ * and on any failure.
+ */
+export async function gitOrigin(cwd: string, opts?: GitBoundedOptions): Promise<string | undefined> {
+  const result = await gitBounded(cwd, ["config", "--get", "remote.origin.url"], opts);
+  if (!result.ok) return undefined;
+  const url = result.stdout.replace(/\r?\n$/, "");
+  return url === "" ? undefined : url;
+}
+
+/** What {@link gitHeadInfo} reports about `HEAD`. */
+export interface GitHeadInfo {
+  /** Short branch name (`refs/heads/` stripped); undefined when `HEAD` is detached. */
+  readonly branch: string | undefined;
+  /** Full object name of the commit `HEAD` names. */
+  readonly head: string;
+}
+
+/**
+ * `HEAD` in `cwd`: hardened `git rev-parse --verify --quiet HEAD` and `git symbolic-ref --quiet HEAD` ({@link gitBounded}, run
+ * together). A `symbolic-ref` exit code 1 means detached. Undefined on any other failure, for a repository without commits, and
+ * when `HEAD` names something other than a branch.
+ */
+export async function gitHeadInfo(cwd: string, opts?: GitBoundedOptions): Promise<GitHeadInfo | undefined> {
+  const [commit, ref] = await Promise.all([
+    gitBounded(cwd, ["rev-parse", "--verify", "--quiet", "HEAD"], opts),
+    gitBounded(cwd, ["symbolic-ref", "--quiet", "HEAD"], opts),
+  ]);
+  if (!commit.ok) return undefined;
+  const head = commit.stdout.trim();
+  if (!FULL_OID.test(head)) return undefined;
+  if (!ref.ok) return ref.failure === "exit" && ref.code === 1 ? { branch: undefined, head } : undefined;
+  const name = ref.stdout.trim();
+  if (!name.startsWith("refs/heads/") || name.length === "refs/heads/".length) return undefined;
+  return { branch: name.slice("refs/heads/".length), head };
 }
 
 export function defaultAdmissionDeps(): AdmissionDeps {
