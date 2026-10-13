@@ -162,9 +162,10 @@ Design memo 3.1.1 (architect `ses_eced86d60ffe46SH1dJUW45YSf`, heavy), binding:
   - It never throws (`types.ts:1732`); on error it returns `{stop: false}`.
 - **M19. stepKey (3.1.7).** `"<sessionID>:<k>"`. k advances on `session.step.started` only after the previous step of the session ended (finished or failed without a pending retry). A host retry resend keeps k, and the retry hook and `session.retry.scheduled` of one step share it.
   - 3.1.7 reuses the per-session step counting of `v2-hooks.ts` countStep (≈300-307) if it already satisfies this.
+  - *Amended (QA-3.1-21):* the retry hook can run before the event loop processed the step's `session.step.started`. When the session has no open step, the hook opens it first (the same advance), so the key it reads names this step; that `step.started`, processed later, is then a no-op (no second advance, the pending retry kept).
   - The provider comes from the session's last `step.started` `model.providerID` (3.1.7.c).
 - **M20. Scope and restore.**
-  - **One controller per plan**, fed by every session's signals. Each plan respects its own `maxParallel`; two live plans in one process can together exceed one plan's limit (R4).
+  - **One controller per plan**, fed by every session's signals. Each plan respects its own `maxParallel`. *Amended by A-3.1-1:* one active plan per process (amendment A-3.1-1, QA-3.1-7), so two live plans in one process can no longer together exceed one plan's limit (the earlier R4 text).
   - **Restore after a restart.** At open, Rt calls `store.exportPlan` (lock-free) and seeds each provider with `capacityRestoreFromEvents`, which replays the history's `capacity` metrics: the last `to`, and a still-future hold or pause. This prevents "capacity drift after restarts".
 
 #### 4. Launcher A
@@ -504,6 +505,7 @@ Tests (`executor-runtime.test.ts`, plan:3092-3094, with typed doubles for `Integ
 - **M41 (3.1.7.a, always on).** The fail-closed check.
   - **Where:** in the first context hook where v2-hooks sees a session's first user message.
   - **Refused when:** `looksLikePlanPrompt(text)` is true and either `currentBinding(sid)` is null, or the header's planId/taskId differs from `binding.plan`.
+    *Amended (QA-3.1-16):* the check is prefix-anchored, not `looksLikePlanPrompt` (QA-3.1-9 (a)). The text is a launcher prompt only when the §7 grammar (`"PLAN CONTEXT\n"`, the shared context, the launch header read by `parseLaunchHeader` at its grammar position) starts at offset 0, or right after exactly the one preamble line the v2 host puts before a native subagent's first user message (`You are a subagent spawned by another session.`, ending in `\n` or `\r\n`). Any other leading text makes it an ordinary prompt, never refused.
   - **Effect:** the session joins `refusedPlanChildren`, and `tool.execute.before` throws for every tool of it.
   - **Fallback:** if a session's first tool call arrives before that hook ran, `tool.execute.before` performs the same check first.
 - **W3 (3.1.7.b).** The 2.1 guard: for a session whose binding has `plan`, it acquires with the holderID = child, `taskRef`, `scope: "until-integrated"` and tree = slot. It never releases at child end; release is `releaseTask` only.
@@ -522,7 +524,7 @@ Tests:
 **Risks**
 1. **stepKey semantics (M19).** If the host emits `step.started` per retry resend, a naive count compounds decreases. Mitigation: the "advance only after an end" rule, and a test with a recorded host sequence.
 2. **Rows 13/19 release ownership (M8).** This needs 3.2 to agree. Until then, both releases are idempotent.
-3. **Per-plan capacity (M20).** Two plans in one process can exceed one plan's limit. Accepted and documented.
+3. **Per-plan capacity (M20).** Two plans in one process can exceed one plan's limit. Accepted and documented. *Amended by A-3.1-1:* one active plan per process (amendment A-3.1-1, QA-3.1-7), so this risk no longer arises.
 4. **Eviction (M23).** If pinning is not wired, it degrades to wakes, not a stall.
 5. **Gate-to-launch races (M29).** Mitigated; the residual is the fsync window only (L3/L5, uncounted).
 6. **A hook outliving the 30 s guard (M24).** A deliberate refinement of "settles within".

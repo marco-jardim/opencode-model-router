@@ -694,8 +694,18 @@ class LauncherDouble implements TaskLauncher {
       .filter((r) => !r.settled)
       .map((r) => ({ taskId: r.req.taskId, attempt: r.req.attempt, childSessionID: r.childSessionID, startedAt: T0 }));
   }
+  /**
+   * When set, `dispose` aborts every owned child as the real launcher does (QA-3.1-25): each unsettled run ends
+   * `interrupted/dispose`, AFTER the runtime marked its plans disposed. Off by default: most tests keep the child alive.
+   */
+  abortOnDispose = false;
   async dispose(): Promise<void> {
     this.disposed += 1;
+    if (!this.abortOnDispose) return;
+    for (const r of this.runs) {
+      if (r.settled) continue;
+      r.end({ kind: "interrupted", childSessionID: r.childSessionID, reason: "dispose", endedAt: this.clock.iso() });
+    }
   }
   runOf(taskId: TaskId, attempt: number): RunDouble | undefined {
     return this.runs.find((r) => r.req.taskId === taskId && r.req.attempt === attempt);
@@ -2691,6 +2701,28 @@ describe("residue, approval, completion and recovery wiring", () => {
     expect(h.runtime.planLine(ORCH)).toContain(`plan ${PLAN_ID}:`);
   });
 
+  it("QA-3.1-19: adopt checks the single-plan rule BEFORE recovery.adopt: a refused adopt leaves the other plan untouched", async () => {
+    const h = await mk(planOf([manualOnly("M1")]));
+    await h.begin();
+    const d2 = planOf([task("T9")]);
+    d2.planId = "plan-two";
+    const w = await h.store.create(d2, h.deps.holder("ses-9"));
+    await w.close();
+    const calls: string[] = [];
+    h.deps.recovery = {
+      async recover() {
+        return [];
+      },
+      async adopt(planId) {
+        calls.push(String(planId));
+      },
+    };
+    await expect(h.runtime.adopt("plan-two", ORCH)).rejects.toMatchObject({ code: "E_PLAN_STATE" });
+    expect(calls).toEqual([]);
+    expect((await h.store.read("plan-two")).status).toBe("running");
+    expect(h.runtime.planLine(ORCH)).toContain(`plan ${PLAN_ID}:`);
+  });
+
   it("adopt takes the lock over when the plan is still locked, and rethrows any other open failure", async () => {
     const h = await mk(planOf([manualOnly("M1")]));
     await h.begin();
@@ -3017,6 +3049,31 @@ describe("QA-3.1 round 1 regressions (runtime)", () => {
     expect(h.parts().policy.counted).toEqual([]);
   });
 
+  it("QA-3.1-17: three parallel launches lost under ONE capture count once: the plan keeps running and relaunches them", async () => {
+    const h = await mk(planOf([task("T1"), task("T2"), task("T3")]));
+    await h.begin();
+    const first = [await h.runOf("T1", 1), await h.runOf("T2", 1), await h.runOf("T3", 1)];
+    expect(first.map((r) => r.req.context.callID)).toEqual(["call-1", "call-1", "call-1"]);
+    for (const run of first) run.confirm({ kind: "unconfirmed", reason: "threw", error: "runner crashed" });
+    for (const id of ["T1", "T2", "T3"]) await h.runOf(id, 2);
+    expect(h.ledger().status).toBe("running");
+    expect(h.parts().policy.raised).toEqual([]);
+  });
+
+  it("QA-3.1-17: three losses under three distinct captures still pause the plan (one blocking item)", async () => {
+    const h = await mk(planOf([task("T1")]));
+    const capture = (n: number): LaunchGate => ({ ok: true, context: { ...GATE_CONTEXT, callID: `call-${n}` }, ageMs: 0 });
+    await h.begin();
+    for (let n = 1; n <= 3; n++) {
+      const run = await h.runOf("T1", n);
+      h.launcher.gateValue = capture(n + 1);
+      run.confirm({ kind: "unconfirmed", reason: "threw", error: "runner crashed" });
+    }
+    await until(() => h.ledger().status === "paused", "plan paused");
+    await until(() => h.parts().policy.raised.length === 1, "one blocking item");
+    expect(h.task("T1").attempts.map((a) => a.callID)).toEqual(["call-1", "call-2", "call-3"]);
+  });
+
   it("QA-3.1-5: a debounced wake after a failed delivery re-arms for the end of the window and journals no 'debounced' metric", async () => {
     const h = await mk(planOf([task("T1")]));
     h.launcher.gateValue = staleGate("stale-context:boot:1");
@@ -3059,7 +3116,64 @@ describe("QA-3.1 round 1 regressions (runtime)", () => {
     expect(h.parts().policy.raised).toHaveLength(1);
   });
 
-  it("QA-3.1-7: one active plan per process: approving or attaching a second plan is E_PLAN_STATE with an inbox item on it", async () => {
+  it("QA-3.1-26: resume drops a backoff armed before the pause: the next skip backs off from 1 s again", async () => {
+    const h = await mk(planOf([task("T1")]));
+    let calls = 0;
+    let failing = true;
+    const acquire = h.slots.acquire.bind(h.slots);
+    h.slots.acquire = async (planId, owner, base) => {
+      calls += 1;
+      if (failing) throw new Error("install failed");
+      return acquire(planId, owner, base);
+    };
+    await h.begin();
+    for (let k = 0; k < 3; k++) {
+      await until(() => calls === k + 1, `provisioning failure ${k + 1}`);
+      await h.settled();
+      h.clock.advance(1000 * 2 ** k);
+    }
+    await until(() => calls === 4, "fourth provisioning failure");
+    await h.settled(); // the backoff is now armed for 8 s
+    await h.runtime.pause(PLAN_ID, ORCH);
+    await h.runtime.resume(PLAN_ID, ORCH);
+    await until(() => calls === 5, "the resume tick retries at once");
+    await h.settled(); // that skip armed a fresh 1 s backoff: the 8 s timer was cleared, not kept
+    failing = false;
+    h.clock.advance(1000);
+    await h.runOf("T1", 1);
+    expect(calls).toBe(6);
+  });
+
+  it("QA-3.1-23: a step queued behind its task mutex already holds its token: the next tick schedules nothing over capacity (no capacity-race)", async () => {
+    const manual = task("M1", { kind: "manual", verify: "none", footprint: { writes: [], reads: [], confidence: "explicit", sources: ["path"] } });
+    const h = await mk(planOf([task("T1"), manual, task("T2")], { edges: [edge("M1", "T2")], config: { maxParallel: 1 } }));
+    await h.begin();
+    const r1 = await h.running("T1", 1, "ses-c1");
+    // The lease-needed end (18b') frees T1's token and sends it back to ready, then holds T1's mutex in the slot release.
+    const hold = deferred<void>();
+    let entered = false;
+    const release = h.slots.release.bind(h.slots);
+    h.slots.release = async (slot) => {
+      entered = true;
+      await hold.promise;
+      return release(slot);
+    };
+    r1.complete("NEED MORE: lease src/extra.ts");
+    await until(() => entered && h.state("T1") === "ready", "T1 ready, its mutex held by the slot release");
+    h.runtime.onRouterToolCall(ORCH); // tick A: T1's step queues behind the mutex
+    await pause(30);
+    await h.runtime.done(PLAN_ID, "M1", ORCH); // tick B, back to back: T2 becomes ready
+    await until(() => h.state("T2") === "ready", "T2 ready");
+    await pause(30);
+    expect(h.launcher.runOf("T2", 1)).toBeUndefined();
+    hold.resolve();
+    await h.runOf("T1", 2);
+    expect(h.launcher.runOf("T2", 1)).toBeUndefined();
+    const races = (await h.counters()).filter((c) => c.key === "launch-skipped" && c.labels.reason === "capacity-race");
+    expect(races).toEqual([]);
+  });
+
+  it("QA-3.1-7 / QA-3.1-19: one active plan per process: approving a second plan is E_PLAN_STATE; a second running plan attaches passively (inbox item, one wake) and can still be paused", async () => {
     const h = await mk(planOf([task("T1")]));
     await h.begin();
     await h.runOf("T1", 1);
@@ -3074,31 +3188,124 @@ describe("QA-3.1 round 1 regressions (runtime)", () => {
       await w.close();
     }
     await expect(h.runtime.approve("plan-two", ORCH)).rejects.toMatchObject({ code: "E_PLAN_STATE" });
-    await expect(h.runtime.pause("plan-three", ORCH)).rejects.toMatchObject({ code: "E_PLAN_STATE" });
+    // QA-3.1-19: the refused plan is attached passively, so pause (the escape hatch) reaches it instead of E_PLAN_STATE.
+    await h.runtime.pause("plan-three", ORCH);
+    expect((await h.store.read("plan-three")).status).toBe("paused");
     for (const id of ["plan-two", "plan-three"]) {
       const l = await h.store.read(id);
       expect(l.inbox.filter((i) => i.severity === "blocking" && i.text.includes(`plan ${PLAN_ID} is already running`))).toHaveLength(1);
     }
     expect((await h.store.read("plan-two")).status).toBe("awaiting-approval");
+    expect(h.hosts.keys().filter((k) => k === `plan-refused:plan-three:${PLAN_ID}`)).toHaveLength(1);
+    // Never activated, pinned or ticked: one pin (plan one), one launch (T1), and T9 is not launched.
+    expect(h.pins).toEqual([ORCH]);
+    h.runtime.onRouterToolCall(ORCH);
+    await pause(30);
     expect(h.launcher.runs).toHaveLength(1);
   });
 
-  it("QA-3.1-11: a RouteResolver error fails that task's attempt (row 4b) without breaking the tick, status or ready", async () => {
+  const storedPlan = async (h: Harness, planId: string, status: LedgerV1["status"]): Promise<void> => {
+    const d2 = planOf([task("T9")]);
+    d2.planId = planId;
+    d2.status = status;
+    const w = await h.store.create(d2, h.deps.holder(ORCH));
+    await w.close();
+  };
+
+  it("QA-3.1-18: two concurrent approves never both start: the activation reservation is taken before the first await", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await storedPlan(h, "plan-a", "awaiting-approval");
+    await storedPlan(h, "plan-b", "awaiting-approval");
+    const results = await Promise.allSettled([h.runtime.approve("plan-a", ORCH), h.runtime.approve("plan-b", ORCH)]);
+    expect(results.map((r) => r.status).sort()).toEqual(["fulfilled", "rejected"]);
+    const refused = need(results.find((r): r is PromiseRejectedResult => r.status === "rejected"), "refused approve");
+    expect(refused.reason).toMatchObject({ code: "E_PLAN_STATE" });
+    const statuses = [(await h.store.read("plan-a")).status, (await h.store.read("plan-b")).status].sort();
+    expect(statuses).toEqual(["awaiting-approval", "running"]);
+    expect(h.pins).toEqual([ORCH]);
+  });
+
+  it("QA-3.1-19: start() prefers a running plan over a paused one; the paused one attaches passively (woken once) and keeps abort, answer, status and gc", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await storedPlan(h, "plan-a", "paused");
+    await storedPlan(h, "plan-b", "running");
+    await h.runtime.start();
+    expect(h.pins).toEqual([ORCH]);
+    await h.runOf("T9", 1); // plan-b (running) is the active plan, although plan-a sorts first by id
+    const refusal = (await h.store.read("plan-a")).inbox.filter((i) => i.text.includes("plan plan-b is already running"));
+    expect(refusal).toHaveLength(1);
+    expect((await h.store.read("plan-b")).inbox).toEqual([]);
+    await expect(h.runtime.status("plan-a", ORCH)).resolves.toContain("Plan plan-a [paused]");
+    await expect(h.runtime.status("plan-a", ORCH)).resolves.toContain("Refused: another plan holds this process's active slot");
+    await expect(h.runtime.status("plan-b", ORCH)).resolves.not.toContain("Refused:");
+    expect(h.hosts.keys().filter((k) => k === "plan-refused:plan-a:plan-b")).toHaveLength(1);
+    // A resume would make it a second active plan: refused; an answer reaches it.
+    await expect(h.runtime.resume("plan-a", ORCH)).rejects.toMatchObject({ code: "E_PLAN_STATE" });
+    await h.runtime.answer("plan-a", need(refusal[0], "refusal item").id, "ok", ORCH);
+    // gc keeps the refused plan's slots until it is aborted.
+    await h.runtime.gc();
+    const isDone = need(h.slots.gcPredicate, "gc predicate");
+    await expect(isDone("plan-a")).resolves.toBe(false);
+    await h.runtime.abort("plan-a", ORCH);
+    expect((await h.store.read("plan-a")).status).toBe("aborted");
+    await expect(isDone("plan-a")).resolves.toBe(true);
+    expect(h.launcher.runs).toHaveLength(1);
+  });
+
+  it("QA-3.1-11 / QA-3.1-22: a RouteResolver error is uncounted and retried by the backoff tick (never a broken tick, status or ready); five failing rounds raise one item", async () => {
     const h = await mk(planOf([task("T1"), task("T2")], { config: { maxAttempts: 1 } }));
+    let failing = true;
     h.deps.routes = {
       route: (t) => {
-        if (t.id === "T2") throw new Error("no model for T2");
+        if (t.id === "T2" && failing) throw new Error("no model for T2");
         return routes.route(t);
       },
     };
+    const routeSkips = async (): Promise<number> =>
+      (await h.counters()).filter((c) => c.key === "launch-skipped" && c.labels.reason === "route" && c.labels.taskId === "T2").length;
+    // Backoff arms (the ledger heartbeat timer is hours long and never counted here).
+    const arms: number[] = [];
+    const setTimer = h.clock.setTimer.bind(h.clock);
+    h.clock.setTimer = (ms, fn) => {
+      if (ms <= 60_000) arms.push(ms);
+      return setTimer(ms, fn);
+    };
     await h.begin();
+    // Right after compile the first tick may not have promoted T1/T2 to ready yet: status and ready only must not throw.
     await expect(h.runtime.status(PLAN_ID, ORCH)).resolves.toContain(`Plan ${PLAN_ID}`);
     await expect(h.runtime.ready(PLAN_ID)).resolves.toMatchObject({ manual: [] });
-    await h.runOf("T1", 1);
-    await until(() => h.state("T2") === "parked", "T2 parked after row 4b");
-    expect(h.task("T2").attempts[0]).toMatchObject({ outcome: "failed" });
-    expect(h.task("T2").attempts[0]?.context).toContain("no model for T2");
-    expect(await counted(h, "launch-failed", "L1")).toBe(true);
+    const r1 = await h.running("T1", 1, "ses-c1");
+    r1.complete("Done.");
+    await untilEnqueued(h, "T1");
+    await until(async () => (await routeSkips()) >= 1, "route skip counted");
+    // T2 is ready now: the board lists it as unroutable with the resolver's message (QA-3.1-11), and ready() still answers.
+    expect(h.state("T2")).toBe("ready");
+    await expect(h.runtime.status(PLAN_ID, ORCH)).resolves.toContain("T2 unroutable - no model for T2");
+    await expect(h.runtime.ready(PLAN_ID)).resolves.toMatchObject({ launchable: [], manual: [] });
+    // Round 1 (the first tick) armed the backoff once; the ticks behind it inside the round armed nothing more. Nothing
+    // was journaled for T2 and nothing counted.
+    expect(arms).toHaveLength(1);
+    expect(h.task("T2").attempts).toEqual([]);
+    expect(h.state("T2")).toBe("ready");
+    expect(await counted(h, "launch-failed", "L1")).toBe(false);
+    for (let round = 2; round <= 5; round++) {
+      expect(h.parts().policy.raised).toEqual([]);
+      h.clock.advance(60_000);
+      await until(() => arms.length === round, `round ${round} re-armed the backoff`);
+    }
+    await until(() => h.parts().policy.raised.length === 1, "one route-streak item");
+    expect(h.parts().policy.raised[0]).toMatchObject({ kind: "failure", severity: "blocking", taskId: "T2" });
+    expect(h.parts().policy.raised[0]?.text).toContain("no model for T2");
+    h.clock.advance(60_000);
+    await until(() => arms.length === 6, "round 6 re-armed the backoff");
+    await h.settled();
+    expect(h.parts().policy.raised).toHaveLength(1);
+    expect(h.task("T2").attempts).toEqual([]);
+    // The resolver recovers: the next backoff tick launches T2's FIRST attempt (no attempt was burnt).
+    failing = false;
+    h.clock.advance(60_000);
+    await h.runOf("T2", 1);
+    expect(h.parts().policy.counted.filter((c) => c.n !== 1 || c.outcome !== "succeeded")).toEqual([]);
   });
 
   it("QA-3.1-12: a row 4b batch that writes nothing frees the fresh slot and its leases", async () => {
@@ -3153,10 +3360,16 @@ describe("QA-3.1 round 1 regressions (runtime)", () => {
     const r3 = await h.running("T1", 3, "ses-c3");
     r3.end({ kind: "lost", childSessionID: "ses-c3", reason: "unrequested-interrupt", endedAt: h.clock.iso() });
     const r4 = await h.running("T1", 4, "ses-c4");
-    r4.end({ kind: "interrupted", childSessionID: "ses-c4", reason: "dispose", endedAt: h.clock.iso() });
-    for (const row of ["L6", "L16", "L13", "L14", "L17"]) {
+    for (const row of ["L6", "L16", "L13", "L14"]) {
       await until(() => counted(h, "launch-failed", row), `launch-failed ${row}`);
     }
+    // QA-3.1-25: a real dispose. The launcher aborts the live child only after the runtime marked the plan disposed, so
+    // L17 is counted by dispose itself for each live launch (once), never by the end that follows.
+    h.launcher.abortOnDispose = true;
+    await h.runtime.dispose();
+    expect(r4.settled).toBe(true);
+    const l17 = (await h.counters()).filter((c) => c.key === "launch-failed" && c.labels.row === "L17");
+    expect(l17).toHaveLength(1);
     expect(h.ledger().status).toBe("running");
   });
 
@@ -3383,6 +3596,31 @@ describe("capacity, metric, dispose and restart failure paths", () => {
     await h.settled();
     const decreases = (await h.metrics()).filter((m) => m.name === "capacity" && m.change === "decrease");
     expect(decreases).toHaveLength(2);
+  });
+
+  it("QA-3.1-27: a step that ended (step.ended) closes the fallback step: the next step.started opens a new step key", async () => {
+    const seen: string[] = [];
+    const h = await mk(planOf([manualOnly("M1")]));
+    h.deps.capacity = (o) => {
+      const c = createCapacityController(o);
+      const onSignal = c.onSignal.bind(c);
+      c.onSignal = (s) => {
+        seen.push(`${s.source}:${s.stepKey}`);
+        return onSignal(s);
+      };
+      return c;
+    };
+    await h.begin();
+    const at = h.clock.iso();
+    const E500 = { type: "provider.internal", status: 500, message: "x" };
+    h.runtime.onHostEvent({ type: "step.started", sessionID: "ses-x", providerID: PROVIDER, modelID: "model-1", at });
+    h.runtime.onHostEvent({ type: "step.ended", sessionID: "ses-x", at });
+    h.runtime.onHostEvent({ type: "step.started", sessionID: "ses-x", providerID: PROVIDER, modelID: "model-1", at });
+    h.runtime.onHostEvent({ type: "step.failed", sessionID: "ses-x", error: E500, at });
+    h.runtime.onHostEvent({ type: "step.started", sessionID: "ses-x", providerID: PROVIDER, modelID: "model-1", at });
+    h.runtime.onHostEvent({ type: "step.failed", sessionID: "ses-x", error: E500, at });
+    expect(seen).toEqual(["step-failed:ses-x:2", "step-failed:ses-x:3"]);
+    await h.settled();
   });
 
   it("a metric that cannot be journaled is a warning, and the metrics after it still land", async () => {

@@ -92,8 +92,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **OpenCode v2 (v1 unchanged): an unbound plan child is refused every tool call.** A child session whose first message
   is a plan launcher prompt (`PLAN CONTEXT` followed by the launch header at its grammar position) but that has no
-  matching plan binding is refused every tool call (fail closed). Parallel tool calls of such a session all wait for the
-  same check, and an ordinary prompt is never refused, even when the session's kind cannot be looked up.
+  matching plan binding is refused every tool call (fail closed). The prompt is recognized at the start of the message
+  or right after the one preamble line the host puts before a subagent's first message ("You are a subagent spawned by
+  another session."); any other leading text makes it an ordinary prompt. Parallel tool calls of such a session all
+  wait for the same check, and an ordinary prompt is never refused, even when the session's kind cannot be looked up.
 
 ## [2.7.0] - 2026-10-10
 

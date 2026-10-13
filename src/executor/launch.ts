@@ -209,10 +209,11 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
     l.graceTimer = null;
   };
 
-  const release = (l: Launch): void => {
+  const release = (l: Launch, status?: ChildEnd["kind"]): void => {
     if (l.inFlightRegistered) {
       l.inFlightRegistered = false;
-      try { d.bookkeeping.unregisterInFlight(l.req.taskId, l.req.attempt); } catch { /* bookkeeping never fails a launch */ }
+      // QA-3.1-24: the settled end kind, when known, so the bookkeeping does not guess it
+      try { d.bookkeeping.unregisterInFlight(l.req.taskId, l.req.attempt, status); } catch { /* bookkeeping never fails a launch */ }
     }
     if (l.bound && l.childId !== null) {
       l.bound = false;
@@ -230,7 +231,7 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
     if (l.completionSettled) return;
     l.completionSettled = true;
     clearTimers(l);
-    release(l);
+    release(l, end.kind);
     l.resolveCompletion(end);
     forget(l);
   };

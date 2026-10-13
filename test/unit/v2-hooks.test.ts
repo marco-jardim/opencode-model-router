@@ -4,7 +4,7 @@ import { Agent } from "@opencode/plugin";
 import type { Hooks } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import {
-  registerV2Hooks, resumeTargetsOf, v2Instructions, V2_BACKGROUND_SETTLED,
+  executorRunnerStatus, registerV2Hooks, resumeTargetsOf, v2Instructions, V2_BACKGROUND_SETTLED,
   type V2Executor, type V2ExecutorFactory, type V2ExecutorHost,
 } from "../../src/compat/v2-hooks";
 import { PLAN_PROVIDER_NAME, ROUTER_TURN_STATE_ATTACH } from "../../src/compat/turn-state";
@@ -1357,6 +1357,42 @@ describe("plan executor wiring in the v2 adapter (3.1.7: W2, W4, W5, W6, M41)", 
     expect(x.emitted.filter((e) => e.type === "step.started").map((e) => (e as { stepKey?: string }).stepKey)).toEqual([`${PLAN_CHILD}:1`, `${PLAN_CHILD}:2`]);
   });
 
+  it("a retry hook that runs before its step's step.started was processed opens that step; the late step.started does not advance it again (QA-3.1-21)", async () => {
+    const x = fakeExecutor();
+    const w = await startWired({ executor: x.factory });
+    const S = "lagging-child";
+    const rate = { type: "APIError", message: "rate limited", status: 429 };
+    const started = (id: string): void => {
+      w.f.emit({ id, type: "session.step.started", data: { sessionID: S, model: { providerID: "anthropic", id: "claude-x" } } });
+    };
+    const keys = (type: string): Array<string | undefined> =>
+      x.emitted.filter((e) => e.type === type).map((e) => (e as { stepKey?: string }).stepKey);
+    // step 1 starts and ends, both processed
+    started("l1");
+    w.f.emit({ id: "l2", type: "session.step.ended", data: { sessionID: S } });
+    await vi.waitFor(() => expect(keys("step.ended")).toHaveLength(1));
+    // step 2 started on the host, but the event loop has not processed its step.started yet: the retry hook runs first
+    await w.f.sessionHooks.retry({ sessionID: S, error: rate, attempt: 2, decision: { retry: true, delay: 2000 } });
+    expect(x.runtime.onRetryHook).toHaveBeenLastCalledWith(expect.objectContaining({ sessionID: S, stepKey: `${S}:2` }));
+    // the late step.started (a no-op: the pending retry stays), the failure the host retries, the retried step: one key
+    started("l3");
+    w.f.emit({ id: "l4", type: "session.step.failed", data: { sessionID: S, error: rate } });
+    started("l5");
+    w.f.emit({ id: "l6", type: "session.step.ended", data: { sessionID: S } });
+    await vi.waitFor(() => expect(keys("step.ended")).toHaveLength(2));
+    expect(keys("step.started")).toEqual([`${S}:1`, `${S}:2`, `${S}:2`]);
+    expect(keys("step.failed")).toEqual([`${S}:2`]);
+    expect(keys("step.ended")).toEqual([`${S}:1`, `${S}:2`]);
+    // a hook on a step whose step.started was processed reads its key and opens nothing
+    started("l7");
+    await vi.waitFor(() => expect(keys("step.started")).toHaveLength(4));
+    await w.f.sessionHooks.retry({ sessionID: S, error: rate, attempt: 2, decision: { retry: true, delay: 2000 } });
+    expect(x.runtime.onRetryHook).toHaveBeenLastCalledWith(expect.objectContaining({ sessionID: S, stepKey: `${S}:3` }));
+    started("l8");
+    await vi.waitFor(() => expect(keys("step.started")).toHaveLength(5));
+    expect(keys("step.started")).toEqual([`${S}:1`, `${S}:2`, `${S}:2`, `${S}:3`, `${S}:3`]);
+  });
+
   it("the orchestrator's own idle events reach the emitter (W6, M34)", async () => {
     const x = fakeExecutor();
     const w = await startWired({ executor: x.factory });
@@ -1463,6 +1499,43 @@ describe("plan executor wiring in the v2 adapter (3.1.7: W2, W4, W5, W6, M41)", 
       // an empty shared context is still the grammar
       await firstContext("m41-empty-shared", `PLAN CONTEXT\n\n\n${header}\n\nTASK do it`);
       expect(await refusal(w, "m41-empty-shared")).toMatch(/no matching plan binding/);
+    });
+
+    it("the real v2 host shape: a launcher prompt after the host's one subagent preamble line is checked (QA-3.1-16)", async () => {
+      const w = await startWired();
+      const preamble = "You are a subagent spawned by another session.";
+      // refused: an unbound child, the prompt right after the preamble line ("\n", or "\r\n")
+      await w.f.sessionHooks.context(w.contextEvent("m41-host-unbound", `${preamble}\n${planPrompt("plan-one", "T1")}`));
+      expect(await refusal(w, "m41-host-unbound")).toMatch(/no matching plan binding/);
+      await w.f.sessionHooks.context(w.contextEvent("m41-host-crlf", `${preamble}\r\n${planPrompt("plan-one", "T1")}`));
+      expect(await refusal(w, "m41-host-crlf")).toMatch(/no matching plan binding/);
+      // the execute.before fallback reads the same shape
+      w.messagesBySession.set("m41-host-fallback", userMessage(`${preamble}\n${planPrompt("plan-one", "T1")}`));
+      expect(await refusal(w, "m41-host-fallback")).toMatch(/no matching plan binding/);
+      w.messagesBySession.set("m41-host-fallback-crlf", userMessage(`${preamble}\r\n${planPrompt("plan-one", "T1")}`));
+      expect(await refusal(w, "m41-host-fallback-crlf")).toMatch(/no matching plan binding/);
+      bind("m41-host-fallback-bound", "plan-one", "T1");
+      w.messagesBySession.set("m41-host-fallback-bound", userMessage(`${preamble}\n${planPrompt("plan-one", "T1")}`));
+      expect(await refusal(w, "m41-host-fallback-bound")).not.toMatch(/no matching plan binding/);
+      // allowed: the bound child, same shape
+      bind("m41-host-bound", "plan-one", "T1");
+      await w.f.sessionHooks.context(w.contextEvent("m41-host-bound", `${preamble}\n${planPrompt("plan-one", "T1")}`));
+      expect(await refusal(w, "m41-host-bound")).not.toMatch(/no matching plan binding/);
+      // refused: a bound child whose header (after the preamble) names another task
+      bind("m41-host-mismatch", "plan-one", "T1");
+      await w.f.sessionHooks.context(w.contextEvent("m41-host-mismatch", `${preamble}\n${planPrompt("plan-one", "T2")}`));
+      expect(await refusal(w, "m41-host-mismatch")).toMatch(/no matching plan binding/);
+      // never re-opened: other leading text, a changed preamble line, two preambles or a blank line after it is no launcher prompt
+      for (const [id, text] of [
+        ["m41-host-notes", `${preamble}\nSome notes first.\n${planPrompt("plan-one", "T1")}`],
+        ["m41-host-altered", `${preamble} Really.\n${planPrompt("plan-one", "T1")}`],
+        ["m41-host-twice", `${preamble}\n${preamble}\n${planPrompt("plan-one", "T1")}`],
+        ["m41-host-blank", `${preamble}\n\n${planPrompt("plan-one", "T1")}`],
+        ["m41-host-indented", ` ${preamble}\n${planPrompt("plan-one", "T1")}`],
+      ] as const) {
+        await w.f.sessionHooks.context(w.contextEvent(id, text));
+        expect(await refusal(w, id), id).not.toMatch(/no matching plan binding/);
+      }
     });
 
     it("parallel first tool calls on the fallback path all wait for the same check: none slips through (QA-3.1-9 b)", async () => {
@@ -1659,7 +1732,9 @@ describe("plan executor wiring in the v2 adapter (3.1.7: W2, W4, W5, W6, M41)", 
     host.bookkeeping.registerInFlight("T1", 1, null);
     host.bookkeeping.registerInFlight("T1", 1, PLAN_CHILD);
     w.f.emit({ id: "s1", type: "session.created", data: { sessionID: PLAN_CHILD, parentID: "root" } });
-    host.bookkeeping.unregisterInFlight("T1", 1); // the launcher's settle point: the runner trigger
+    // the launcher's settle point: the runner trigger, with the launch's settled end (QA-3.1-24: the runner result settled
+    // before the child's `execution.succeeded` was seen)
+    host.bookkeeping.unregisterInFlight("T1", 1, "completed");
     w.f.emit({ id: "s2", type: "session.execution.succeeded", data: { sessionID: PLAN_CHILD } }); // a later execution.* trigger
     host.bookkeeping.unregisterInFlight("T1", 1); // idempotent
     await w.tick();
@@ -1671,6 +1746,25 @@ describe("plan executor wiring in the v2 adapter (3.1.7: W2, W4, W5, W6, M41)", 
     // the executor still sees the child's end through its one event path
     expect(x.emitted.some((e) => e.type === "execution.completed" && e.sessionID === PLAN_CHILD)).toBe(true);
     expect(x.runtime.onHostEvent).not.toHaveBeenCalled();
+    // QA-3.1-24: the runner trigger of that settle point carried "succeeded": no observed end yet, the launch settled "completed"
+    expect(executorRunnerStatus(undefined, "completed", undefined)).toBe("succeeded");
+  });
+
+  it("the runner trigger status: the child's observed end, else the launch's settled end kind, else the registry, else interrupted (QA-3.1-24)", () => {
+    // the runner result settled before the child's execution.succeeded was seen: the settled kind decides, never "interrupted"
+    expect(executorRunnerStatus(undefined, "completed", undefined)).toBe("succeeded");
+    expect(executorRunnerStatus(undefined, "completed", "unknown")).toBe("succeeded");
+    expect(executorRunnerStatus(undefined, "failed", undefined)).toBe("failed");
+    expect(executorRunnerStatus(undefined, "capacity", undefined)).toBe("failed");
+    expect(executorRunnerStatus(undefined, "interrupted", undefined)).toBe("interrupted");
+    // the child's own end wins over the launch's view
+    expect(executorRunnerStatus("failed", "completed", undefined)).toBe("failed");
+    expect(executorRunnerStatus("succeeded", "lost", undefined)).toBe("succeeded");
+    // a lost launch, or none passed (a release after the settle): the registry's outcome, else interrupted
+    expect(executorRunnerStatus(undefined, "lost", "succeeded")).toBe("succeeded");
+    expect(executorRunnerStatus(undefined, undefined, "failed")).toBe("failed");
+    expect(executorRunnerStatus(undefined, "lost", "unknown")).toBe("interrupted");
+    expect(executorRunnerStatus(undefined, undefined, undefined)).toBe("interrupted");
   });
 });
 

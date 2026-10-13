@@ -367,6 +367,8 @@ const STREAK_DETAILS: readonly string[] = ["unrequested-interrupt", "runner-erro
 const PRECONFIRM_STREAK = 3;
 /** Consecutive provisioning failures that raise one inbox item (QA-3.1-6). */
 const PROVISION_STREAK = 5;
+/** Consecutive RouteResolver failures (backoff rounds) that raise one inbox item (QA-3.1-22). */
+const ROUTE_STREAK = 5;
 const BACKOFF_BASE_MS = 1000;
 const BACKOFF_MAX_MS = 60_000;
 /** Bound of the per-session maps (provider of the last step, fallback step counter); oldest entries go first. */
@@ -434,7 +436,26 @@ interface PlanRt {
   provisionRaised: boolean;
   /** Consecutive pre-confirmation losses (row 11, QA-3.1-4); reset on a confirmed launch and on resume. */
   preConfirmLosses: number;
+  /**
+   * Capture (router call) of the last counted pre-confirmation loss and the tasks lost under it (QA-3.1-17): parallel
+   * launches lost under one capture count once; a task relaunched and lost again under the same capture counts again.
+   */
+  preConfirmCapture: { key: string; tasks: Set<TaskId> } | null;
+  /** Consecutive RouteResolver failures (QA-3.1-22); one inbox item at ROUTE_STREAK, reset by a tick that resolved cleanly. */
+  routeFails: number;
+  routeRaised: boolean;
+  /**
+   * Attached while another plan held the active slot (QA-3.1-19): never activated, pinned or ticked and fed no host
+   * event; abort, answer, status, pause and purge reach it, a resume promotes it once the slot is free.
+   */
+  passive: boolean;
 }
+
+/**
+ * Wake reason of the refused plan's one wake (QA-3.1-19). `WakeReason` (types.ts, owned elsewhere) has no `plan-refused`
+ * member yet; the wake goes out as an inbox wake under the state key `plan-refused:<planId>:<active>` until it does.
+ */
+const PLAN_REFUSED_WAKE: WakeReason = "inbox";
 
 function own(l: Readonly<LedgerV1>, id: TaskId): TaskNode | null {
   return Object.hasOwn(l.tasks, id) ? (l.tasks[id] ?? null) : null;
@@ -504,6 +525,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   /** Fallback step counter per session (QA-3.1-8: `e.stepKey` wins); bounded, and dropped when the session ends. */
   const stepState = new Map<string, { k: number; open: boolean }>();
   let disposed = false;
+  /** The process-level activation reservation (QA-3.1-18): the plan whose activation is under way, and its holds. */
+  let activating: { planId: PlanId; holds: number } | null = null;
   /** Unsubscribes `onHostEvent` from `hosts.onEvent` (subscribed in `start`, QA-3.1-1). */
   let offEvents: (() => void) | null = null;
 
@@ -670,6 +693,39 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     p.backoff = h;
   }
 
+  /** Drops an armed backoff tick (QA-3.1-26). */
+  function clearBackoff(p: PlanRt): void {
+    const h = p.backoff;
+    if (h === null) return;
+    p.backoff = null;
+    p.timers.delete(h);
+    d.clock.clearTimer(h);
+  }
+
+  /**
+   * QA-3.1-22: a RouteResolver error is the resolver's, not the task's: uncounted, nothing journaled, retried by the
+   * backoff tick. One failure is counted per backoff round (the round that arms the timer), so a burst of ticks inside
+   * one round counts once; ROUTE_STREAK consecutive rounds raise ONE blocking inbox item (reset by a clean resolve).
+   */
+  async function routeFailures(p: PlanRt, failed: ReadonlyMap<TaskId, string>): Promise<void> {
+    for (const taskId of failed.keys()) counter(p, "launch-skipped", { reason: "route", taskId });
+    if (p.backoff !== null) return;
+    armBackoff(p);
+    p.routeFails += 1;
+    if (p.routeFails < ROUTE_STREAK || p.routeRaised) return;
+    p.routeRaised = true;
+    const [first] = failed;
+    const taskId = first?.[0] ?? null;
+    counter(p, "route-streak", taskId === null ? {} : { taskId });
+    await raiseSafe(p, {
+      kind: "failure",
+      severity: "blocking",
+      taskId,
+      text: `${ROUTE_STREAK} consecutive ticks could not resolve a route (last: ${first?.[0] ?? "?"}: ${first?.[1] ?? "unknown error"}); fix the route resolver, then answer`,
+      options: [],
+    });
+  }
+
   /** A launch went out: the skip backoff and the provisioning streak start over. */
   function launchSucceeded(p: PlanRt): void {
     p.skipStreak = 0;
@@ -778,7 +834,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   // ---------- tick
 
   function schedule(p: PlanRt): void {
-    if (p.disposed || disposed) return;
+    // A passively attached (refused) plan never ticks (QA-3.1-19).
+    if (p.disposed || disposed || p.passive) return;
     if (p.ticking) {
       p.again = true;
       return;
@@ -839,8 +896,12 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     }
     const unroutable = new Map<TaskId, string>();
     const ready = readyOf(p, l, unroutable);
-    for (const [taskId, msg] of unroutable) {
-      if (!p.inFlight.has(taskId)) void startStep(p, taskId, () => routeFailed(p, taskId, msg));
+    for (const taskId of [...unroutable.keys()]) if (p.inFlight.has(taskId)) unroutable.delete(taskId);
+    // Synchronous up to the raise (counting and the backoff arm happen before its first await): the ready set stays fresh.
+    if (unroutable.size > 0) void track(routeFailures(p, unroutable));
+    else if (ready.length > 0) {
+      p.routeFails = 0;
+      p.routeRaised = false;
     }
     const gate = d.launcher.gate(l.orchestrator.sessionID);
     if (ready.length === 0 || !gate.ok) {
@@ -849,8 +910,22 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       return;
     }
     // The steps run on their own (a slot acquire may run an install): the tick never awaits them (QA-3.1-14); `inFlight`
-    // keeps a second tick off a task whose step is running, and `settled()` tracks every step.
-    const steps = ready.map((item) => startStep(p, item.taskId, () => launchStep(p, item)));
+    // keeps a second tick off a task whose step is running, and `settled()` tracks every step. Each step's capacity token
+    // is taken here, synchronously, before the step queues on its task mutex (QA-3.1-23): the next tick's ready set
+    // already sees it, so two ticks back to back never schedule more launches than the capacity allows.
+    l = p.writer.ledger;
+    const steps: Array<Promise<"launched" | "skipped">> = [];
+    for (const item of ready) {
+      const n = (own(l, item.taskId)?.attempts.length ?? 0) + 1;
+      try {
+        p.tokens.set(tokenKey(item.taskId, n), p.capacity.acquire(item.route.provider, item.route.heavy, item.taskId, n));
+      } catch {
+        counter(p, "launch-skipped", { reason: "capacity-race" });
+        armBackoff(p);
+        continue;
+      }
+      steps.push(startStep(p, item.taskId, () => launchStep(p, item, n), n));
+    }
     void track(
       Promise.all(steps).then((results) => {
         updateIdle(p, ready, results.filter((r) => r === "launched").length);
@@ -862,9 +937,10 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
    * Starts one launch step under the `inFlight` guard; a launch resets the skip backoff (QA-3.1-6). A step that journaled
    * an attempt without launching (rows 4b, 11, 12: L1-L4) re-ticks once its guard is gone: the tick its own row asked for
    * ran while the task was still in `inFlight` and so could not relaunch it. A step that journaled nothing is a skip and
-   * arms the backoff tick instead, so skips never re-tick each other.
+   * arms the backoff tick instead, so skips never re-tick each other. The capacity token the tick took for attempt `n`
+   * (QA-3.1-23) is released by every step that did not launch, also one that threw (release is idempotent).
    */
-  function startStep(p: PlanRt, taskId: TaskId, fn: () => Promise<"launched" | "skipped">): Promise<"launched" | "skipped"> {
+  function startStep(p: PlanRt, taskId: TaskId, fn: () => Promise<"launched" | "skipped">, n: number): Promise<"launched" | "skipped"> {
     p.inFlight.add(taskId);
     const attemptsOf = (): number => own(p.writer.ledger, taskId)?.attempts.length ?? 0;
     const before = attemptsOf();
@@ -875,6 +951,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       } catch (e) {
         d.log("error", "launch step failed", errorText(e));
       } finally {
+        if (r !== "launched") releaseToken(p, taskId, n, "other");
         p.inFlight.delete(taskId);
       }
       if (r === "launched") launchSucceeded(p);
@@ -897,37 +974,19 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     }
   }
 
-  /** QA-3.1-11: a RouteResolver error is row 4b for that task (a failed, counted attempt), never a broken tick. */
-  async function routeFailed(p: PlanRt, taskId: TaskId, msg: string): Promise<"launched" | "skipped"> {
-    return withTask(p, taskId, async (): Promise<"launched" | "skipped"> => {
-      const t = own(p.writer.ledger, taskId);
-      if (t === null || t.state !== "ready" || p.writer.ledger.status !== "running" || p.latch) return "skipped";
-      const n = t.attempts.length + 1;
-      await launchPrepFailed(p, t, n, d.clock.randomHex(16), null, new ExecutorError("E_LAUNCH_TASK", `route: ${msg}`, taskId), async () => undefined);
-      return "skipped";
-    });
-  }
-
   // ---------- launch step (M37)
 
-  async function launchStep(p: PlanRt, item: ScheduledTask): Promise<"launched" | "skipped"> {
+  /** Step 1 (capacity) ran in the tick: the token of attempt `n` is held (QA-3.1-23); `startStep` frees it on a skip. */
+  async function launchStep(p: PlanRt, item: ScheduledTask, n: number): Promise<"launched" | "skipped"> {
     return withTask(p, item.taskId, async () => {
       const taskId = item.taskId;
       let l = p.writer.ledger;
       const t0 = own(l, taskId);
       if (t0 === null || t0.state !== "ready" || l.status !== "running" || p.latch) return "skipped";
-      const n = t0.attempts.length + 1;
+      // The task moved on while the step queued (an adopted late child, a retry): the token is not this attempt's.
+      if (t0.attempts.length + 1 !== n) return "skipped";
       const fresh = t0.slot === null;
       const route = item.route;
-      // 1. capacity
-      let token: TokenRef;
-      try {
-        token = p.capacity.acquire(route.provider, route.heavy, taskId, n);
-      } catch {
-        counter(p, "launch-skipped", { reason: "capacity-race" });
-        return "skipped";
-      }
-      p.tokens.set(tokenKey(taskId, n), token);
       let slot: SlotLease | null = null;
       const abandon = async (): Promise<void> => {
         releaseToken(p, taskId, n, "other");
@@ -1207,6 +1266,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   async function onConfirmation(p: PlanRt, taskId: TaskId, n: number, c: LaunchConfirmation): Promise<void> {
     if (c.kind === "confirmed") {
       p.preConfirmLosses = 0;
+      p.preConfirmCapture = null;
       return;
     }
     await withTask(p, taskId, async () => {
@@ -1237,20 +1297,47 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       d.log("error", "row 11 failed", errorText(e));
     }
     releaseToken(p, taskId, n, "other");
-    if (applied) await preConfirmLost(p, taskId, reason);
+    if (applied) await preConfirmLost(p, taskId, n, reason);
     schedule(p);
+  }
+
+  /**
+   * QA-3.1-17: whether a row 11 counts toward the pre-confirmation streak. A loss counts once per capture (the attempt's
+   * `callID`): N parallel launches lost under one capture change (E_NO_CONTEXT, superseded: the expected uncounted L3/L5
+   * race) are one loss, not N. A `superseded`/`no-context` loss is ignored outright when a newer capture is already
+   * current (the relaunch goes out under it). Within one capture a task lost AGAIN (a relaunch that failed the same way)
+   * counts again, so a failure that repeats on each relaunch still pauses (QA-3.1-4).
+   */
+  function preConfirmCounts(p: PlanRt, taskId: TaskId, n: number, reason: string): boolean {
+    const l = p.writer.ledger;
+    const callID = own(l, taskId)?.attempts.find((a) => a.n === n)?.callID ?? null;
+    if ((reason === "superseded" || reason === "no-context") && callID !== null) {
+      const g = d.launcher.gate(l.orchestrator.sessionID);
+      if (g.ok && g.context.callID !== callID) return false;
+    }
+    const key = callID ?? `\u0000${taskId}#${n}`;
+    const cap = p.preConfirmCapture;
+    if (cap === null || cap.key !== key) {
+      p.preConfirmCapture = { key, tasks: new Set([taskId]) };
+      return true;
+    }
+    if (cap.tasks.has(taskId)) return true;
+    cap.tasks.add(taskId);
+    return false;
   }
 
   /**
    * QA-3.1-4: every row 11 is a loss before the launch was confirmed; it is uncounted, so a failure that repeats on each
    * relaunch (or on each new capture: tick -> wake -> new router call -> same failure) would loop forever. At
-   * PRECONFIRM_STREAK consecutive losses the plan pauses (no more launches, so no more stale-context wakes) and ONE
-   * blocking item is raised. A confirmed launch, and a resume, reset the count.
+   * PRECONFIRM_STREAK consecutive counted losses (`preConfirmCounts`, QA-3.1-17) the plan pauses (no more launches, so
+   * no more stale-context wakes) and ONE blocking item is raised. A confirmed launch, and a resume, reset the count.
    */
-  async function preConfirmLost(p: PlanRt, taskId: TaskId, reason: string): Promise<void> {
+  async function preConfirmLost(p: PlanRt, taskId: TaskId, n: number, reason: string): Promise<void> {
+    if (!preConfirmCounts(p, taskId, n, reason)) return;
     p.preConfirmLosses += 1;
     if (p.preConfirmLosses < PRECONFIRM_STREAK) return;
     p.preConfirmLosses = 0;
+    p.preConfirmCapture = null;
     let paused = false;
     try {
       paused = await appendIf(p, (cur) =>
@@ -1350,9 +1437,11 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   }
 
   async function handleEnd(p: PlanRt, taskId: TaskId, n: number, end: ChildEnd): Promise<void> {
-    // Nit 7: rows L16 (cancel) and L17 (dispose) are journaled before the cancel or by recovery; only counted here.
+    // Nit 7: rows L16 (cancel) and L17 (dispose) are journaled before the cancel or by recovery; only counted. L17 is
+    // counted by `dispose` for each live launch BEFORE the plan is marked disposed (QA-3.1-25): the dispose ends arrive
+    // after that mark, so counting them here never happened.
     if (end.kind === "interrupted") {
-      if (!p.disposed) counter(p, "launch-failed", { row: end.reason === "dispose" ? "L17" : "L16" });
+      if (!p.disposed && end.reason !== "dispose") counter(p, "launch-failed", { row: "L16" });
       return;
     }
     const t = own(p.writer.ledger, taskId);
@@ -1751,22 +1840,65 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   /**
    * Single plan per process (memo M20, amendment A-3.1-1): at most one attached plan is running or paused. The capacity
    * controller, the orchestrator pin, the per-session maps and the host-event feed are process-wide, so a second active
-   * plan would share (and starve) them. The plan that holds the slot, if any, other than `planId`.
+   * plan would share (and starve) them. The plan that holds the slot, if any, other than `planId`: an attached active
+   * plan (a passive one never holds it, QA-3.1-19) or the plan whose activation is under way (QA-3.1-18).
    */
-  function activePlanOtherThan(planId: PlanId): PlanRt | null {
+  function activePlanOtherThan(planId: PlanId): PlanId | null {
+    if (activating !== null && activating.planId !== planId) return activating.planId;
     for (const q of plans.values()) {
-      if (q.planId === planId || q.disposed) continue;
+      if (q.planId === planId || q.disposed || q.passive) continue;
       const s = q.writer.ledger.status;
-      if (s === "running" || s === "paused") return q;
+      if (s === "running" || s === "paused") return q.planId;
     }
     return null;
   }
 
+  /**
+   * QA-3.1-18: takes the process-level activation reservation for `planId` synchronously (check and act in one step,
+   * before the activation's first await). Returns the plan that holds the slot instead, if any. Every successful
+   * reservation is paired with `unreserve`, also on failure; once the activation landed the plan itself holds the slot.
+   */
+  function reserve(planId: PlanId): PlanId | null {
+    const other = activePlanOtherThan(planId);
+    if (other !== null) return other;
+    if (activating === null) activating = { planId, holds: 0 };
+    activating.holds += 1;
+    return null;
+  }
+
+  function unreserve(planId: PlanId): void {
+    if (activating === null || activating.planId !== planId) return;
+    activating.holds -= 1;
+    if (activating.holds <= 0) activating = null;
+  }
+
+  function refusalText(planId: PlanId, other: PlanId): string {
+    return (
+      `plan ${planId} cannot run: plan ${other} is already running or paused in this process ` +
+      `(one active plan per process, memo M20 / A-3.1-1); complete or abort ${other} first`
+    );
+  }
+
+  /** QA-3.1-19: actions that would run a passively attached (refused) plan are refused; abort, answer, status, pause and purge are not. */
+  function activeOnly(p: PlanRt): void {
+    if (!p.passive) return;
+    const other = activePlanOtherThan(p.planId);
+    throw new ExecutorError(
+      "E_PLAN_STATE",
+      `plan ${p.planId} is attached passively (refused: ${other ?? "another plan"} held the active slot); only abort, answer, status, pause, resume and purge apply`,
+      { planId: p.planId, active: other },
+    );
+  }
+
   /** Refuses `writer`'s plan (A-3.1-1): one blocking inbox item on it (deduplicated), then E_PLAN_STATE. */
-  async function refuseSecondPlan(writer: LedgerWriter, other: PlanId, closeWriter: boolean): Promise<never> {
-    const text =
-      `plan ${writer.planId} cannot run: plan ${other} is already running or paused in this process ` +
-      `(one active plan per process, memo M20 / A-3.1-1); complete or abort ${other} first`;
+  async function refuseSecondPlan(writer: LedgerWriter, other: PlanId): Promise<never> {
+    const text = refusalText(writer.planId, other);
+    await journalRefusal(writer, text);
+    throw new ExecutorError("E_PLAN_STATE", text, { planId: writer.planId, active: other });
+  }
+
+  /** The refusal's blocking inbox item on the refused plan, deduplicated on its open items; never throws. */
+  async function journalRefusal(writer: LedgerWriter, text: string): Promise<void> {
     try {
       await writer.append((l) => {
         if (l.inbox.some((i) => i.answer === null && i.text === text)) return [];
@@ -1785,25 +1917,49 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     } catch (e) {
       d.log("warn", "refused plan inbox failed", errorText(e));
     }
-    if (closeWriter) {
-      try {
-        await writer.close();
-      } catch (e) {
-        d.log("warn", "refused plan close failed", errorText(e));
-      }
-    }
-    throw new ExecutorError("E_PLAN_STATE", text, { planId: writer.planId, active: other });
   }
 
+  /**
+   * Attaches `writer`'s plan. A running or paused plan takes the activation reservation before the first await
+   * (QA-3.1-18); when another plan holds the active slot it is attached PASSIVELY (QA-3.1-19): never activated, pinned
+   * or ticked, its refusal journaled (one inbox item) and its orchestrator woken once, so abort, answer, status, pause,
+   * purge (and resume, once the slot is free) still reach it.
+   */
   async function attach(writer: LedgerWriter): Promise<PlanRt> {
     const existing = plans.get(writer.planId);
     if (existing !== undefined) return existing;
     const planId = writer.planId;
     const st0 = writer.ledger.status;
-    if (st0 === "running" || st0 === "paused") {
-      const other = activePlanOtherThan(planId);
-      if (other !== null) await refuseSecondPlan(writer, other.planId, true);
+    const refusedBy = st0 === "running" || st0 === "paused" ? reserve(planId) : null;
+    const reserved = (st0 === "running" || st0 === "paused") && refusedBy === null;
+    try {
+      const p = await build(writer, refusedBy !== null);
+      if (refusedBy !== null) {
+        await refusePassive(p, refusedBy);
+        return p;
+      }
+      const st = writer.ledger.status;
+      if (st === "running" || st === "paused") await activate(p);
+      return p;
+    } finally {
+      if (reserved) unreserve(planId);
     }
+  }
+
+  /** QA-3.1-19: the refused plan's inbox item and ONE wake of its orchestrator (state key per refusing plan). */
+  async function refusePassive(p: PlanRt, other: PlanId): Promise<void> {
+    await journalRefusal(p.writer, refusalText(p.planId, other));
+    counter(p, "plan-refused", { active: other });
+    try {
+      await wakeOnce(p, PLAN_REFUSED_WAKE, `plan-refused:${p.planId}:${other}`);
+    } catch (e) {
+      d.log("warn", "refused plan wake failed", errorText(e));
+    }
+  }
+
+  /** Builds and registers the plan's runtime state (no activation). */
+  async function build(writer: LedgerWriter, passive: boolean): Promise<PlanRt> {
+    const planId = writer.planId;
     const ref: { p: PlanRt | null } = { p: null };
     const leases = createLeaseService(planId, d.leaseRegistry);
     const waker = createWaker({
@@ -1856,11 +2012,13 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       provisionFails: 0,
       provisionRaised: false,
       preConfirmLosses: 0,
+      preConfirmCapture: null,
+      routeFails: 0,
+      routeRaised: false,
+      passive,
     };
     ref.p = p;
     plans.set(planId, p);
-    const st = writer.ledger.status;
-    if (st === "running" || st === "paused") await activate(p);
     return p;
   }
 
@@ -2042,7 +2200,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         }
       }
       for (const p of plans.values()) {
-        if (p.disposed) continue;
+        if (p.disposed || p.passive) continue;
         const isOrch = p.writer.ledger.orchestrator.sessionID === sid;
         if (isOrch) {
           if (e.type === "step.started") p.orchIdle = false;
@@ -2059,7 +2217,14 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         }
         lateChildEnd(p, e);
       }
-      if (e.type === "step.failed" || e.type === "execution.failed" || e.type === "execution.completed" || e.type === "execution.interrupted") {
+      // QA-3.1-27: a step that ended (successfully, `step.ended`) closes too, so the next `step.started` opens a new key.
+      if (
+        e.type === "step.ended" ||
+        e.type === "step.failed" ||
+        e.type === "execution.failed" ||
+        e.type === "execution.completed" ||
+        e.type === "execution.interrupted"
+      ) {
         const st = stepState.get(sid);
         if (st !== undefined) st.open = false;
       }
@@ -2077,7 +2242,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       const provider = providerBySession.get(i.sessionID) ?? "unknown";
       let stop = false;
       for (const p of plans.values()) {
-        if (p.disposed) continue;
+        if (p.disposed || p.passive) continue;
         feedSignal(p, { source: "retry-hook", sessionID: i.sessionID, stepKey: i.stepKey, provider, error: i.error, at: d.clock.iso() });
         if (ownsChild(p, i.sessionID) && p.capacity.shouldStopRetry({ sessionID: i.sessionID, stepKey: i.stepKey, provider, planChild: true })) {
           p.capacityStopped.add(i.sessionID);
@@ -2101,6 +2266,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     const by = new Map<TaskState, number>();
     for (const t of Object.values(l.tasks)) by.set(t.state, (by.get(t.state) ?? 0) + 1);
     const out: string[] = [`Plan ${l.planId} [${l.status}] ${l.planPath}`];
+    // QA-3.1-19: a passively attached (refused) plan says why nothing launches.
+    if (p !== null && p.passive) out.push("Refused: another plan holds this process's active slot; only abort, answer, status, pause, resume and purge apply");
     out.push(`Tasks: ${[...by.entries()].map(([s, c]) => `${s} ${c}`).join(", ") || "none"}`);
     for (const ph of l.phases) out.push(`Phase ${ph.id}: gate ${ph.gate}${ph.paused ? " PAUSED" : ""} - ${ph.title}`);
     // A RouteResolver error never breaks the board (QA-3.1-11): that task is listed as unroutable instead.
@@ -2167,18 +2334,23 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     async approve(planId, sessionID) {
       const p = await mine(planId, sessionID);
       requireStatus(p, ["awaiting-approval"]);
-      // Single plan per process (memo M20, amendment A-3.1-1): never a second running or paused plan.
-      const other = activePlanOtherThan(planId);
-      if (other !== null) await refuseSecondPlan(p.writer, other.planId, false);
-      const l = p.writer.ledger;
-      const config: ExecutorConfig = { ...l.config, slotsDir: l.config.slotsDir ?? defaultSlotsDir(l.repo.toplevel, planId) };
-      await p.writer.append([
-        { type: "plan-approved", config, by: sessionID },
-        { type: "status-changed", from: "awaiting-approval", to: "running", reason: "approved" },
-      ]);
-      // The capacity view is built per tick from `p.capacity` (QA-3.1-11), so replacing the controller is enough.
-      p.capacity = await makeCapacity(p, p.writer, planId, false);
-      await activate(p);
+      // Single plan per process (memo M20, amendment A-3.1-1): never a second running or paused plan. The check and the
+      // reservation are one synchronous step before the first await (QA-3.1-18): two concurrent approves never both pass.
+      const other = reserve(planId);
+      if (other !== null) await refuseSecondPlan(p.writer, other);
+      try {
+        const l = p.writer.ledger;
+        const config: ExecutorConfig = { ...l.config, slotsDir: l.config.slotsDir ?? defaultSlotsDir(l.repo.toplevel, planId) };
+        await p.writer.append([
+          { type: "plan-approved", config, by: sessionID },
+          { type: "status-changed", from: "awaiting-approval", to: "running", reason: "approved" },
+        ]);
+        // The capacity view is built per tick from `p.capacity` (QA-3.1-11), so replacing the controller is enough.
+        p.capacity = await makeCapacity(p, p.writer, planId, false);
+        await activate(p);
+      } finally {
+        unreserve(planId);
+      }
     },
 
     async status(planId, sessionID) {
@@ -2202,6 +2374,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     async addTasks(planId, text, sessionID) {
       const p = await mine(planId, sessionID);
       requireStatus(p, ["running", "paused"]);
+      activeOnly(p);
       const added = d.compiler.addTasks(p.writer.ledger, text);
       const slots = new Map<TaskId, string>();
       await p.writer.append((cur) => {
@@ -2233,6 +2406,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
     async done(planId, taskId, sessionID) {
       const p = await mine(planId, sessionID);
+      activeOnly(p);
       const ok = await appendIf(p, (cur) => {
         const t = own(cur, taskId);
         if (t === null || t.state !== "ready" || (t.kind !== "manual" && t.kind !== "preflight")) return [];
@@ -2249,12 +2423,31 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
     async resume(planId, sessionID) {
       const p = await mine(planId, sessionID);
-      await setStatus(p, "paused", "running", "user-resume");
-      // A resume is the user's answer to the streak pauses: they start over (QA-3.1-4, QA-3.1-6).
+      // QA-3.1-19: a passively attached (refused) plan is promoted by a resume once the active slot is free.
+      const promote = p.passive;
+      if (promote) {
+        const other = reserve(planId);
+        if (other !== null) await refuseSecondPlan(p.writer, other);
+      }
+      try {
+        await setStatus(p, "paused", "running", "user-resume");
+        if (promote) {
+          p.passive = false;
+          await activate(p);
+        }
+      } finally {
+        if (promote) unreserve(planId);
+      }
+      // A resume is the user's answer to the streak pauses: they start over (QA-3.1-4, QA-3.1-6, QA-3.1-22).
       p.preConfirmLosses = 0;
+      p.preConfirmCapture = null;
       p.skipStreak = 0;
       p.provisionFails = 0;
       p.provisionRaised = false;
+      p.routeFails = 0;
+      p.routeRaised = false;
+      // QA-3.1-26: a backoff armed before the pause would tick at the old (long) delay; the tick below replaces it.
+      clearBackoff(p);
       for (const ph of p.writer.ledger.phases) {
         try {
           await p.collab.queue.checkPhase(ph.id);
@@ -2318,22 +2511,41 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
     async land(planId, sessionID) {
       const p = await mine(planId, sessionID);
+      activeOnly(p);
       await p.collab.queue.land();
     },
 
     async adopt(planId, sessionID) {
-      if (d.recovery === null) throw new ExecutorError("E_PLAN_STATE", "recovery is not available", planId);
-      const old = plans.get(planId);
-      if (old !== undefined) await closePlan(old);
-      await d.recovery.adopt(planId, sessionID);
-      let writer: LedgerWriter;
+      const recovery = d.recovery;
+      if (recovery === null) throw new ExecutorError("E_PLAN_STATE", "recovery is not available", planId);
+      // QA-3.1-19: the single-plan rule is checked (and the slot reserved, QA-3.1-18) BEFORE `recovery.adopt` rewrites
+      // the plan: a refused adopt leaves the plan untouched. An unreadable ledger is left to recovery (and to attach).
+      let st: LedgerStatus | null = null;
       try {
-        writer = await d.store.open(planId, d.holder(sessionID));
+        st = (await d.store.read(planId)).status;
       } catch (e) {
-        if (errorCode(e) !== "E_LOCK_HELD") throw e;
-        writer = await d.store.takeover(planId, d.holder(sessionID), "adopt");
+        d.log("warn", `adopt: ledger of ${planId} not readable before recovery`, errorText(e));
       }
-      await attach(writer);
+      const reserved = st === "running" || st === "paused";
+      if (reserved) {
+        const other = reserve(planId);
+        if (other !== null) throw new ExecutorError("E_PLAN_STATE", refusalText(planId, other), { planId, active: other });
+      }
+      try {
+        const old = plans.get(planId);
+        if (old !== undefined) await closePlan(old);
+        await recovery.adopt(planId, sessionID);
+        let writer: LedgerWriter;
+        try {
+          writer = await d.store.open(planId, d.holder(sessionID));
+        } catch (e) {
+          if (errorCode(e) !== "E_LOCK_HELD") throw e;
+          writer = await d.store.takeover(planId, d.holder(sessionID), "adopt");
+        }
+        await attach(writer);
+      } finally {
+        if (reserved) unreserve(planId);
+      }
     },
 
     async gc() {
@@ -2424,8 +2636,14 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
           d.log("error", "recovery failed", errorText(e));
         }
       }
-      for (const e of await d.store.list()) {
-        if ((e.status !== "running" && e.status !== "paused") || plans.has(e.planId)) continue;
+      // QA-3.1-19: deterministic single-plan pick: a running plan before a paused one, then by plan id; the others attach
+      // passively (refused, woken once) instead of not at all.
+      const rank = (s: LedgerStatus): number => (s === "running" ? 0 : 1);
+      const entries = (await d.store.list())
+        .filter((e) => e.status === "running" || e.status === "paused")
+        .sort((a, b) => rank(a.status) - rank(b.status) || (a.planId < b.planId ? -1 : a.planId > b.planId ? 1 : 0));
+      for (const e of entries) {
+        if (plans.has(e.planId)) continue;
         try {
           await attach(await d.store.open(e.planId, d.holder(e.orchestratorSessionID)));
         } catch (err) {
@@ -2446,6 +2664,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         }
       }
       for (const p of plans.values()) {
+        // QA-3.1-25: L17 for every live launch the launcher is about to abort, counted while the plan is still live.
+        if (!p.disposed) for (const h of p.handles.values()) if (!h.settled) counter(p, "launch-failed", { row: "L17" });
         p.disposed = true;
         for (const h of p.timers) d.clock.clearTimer(h);
         p.timers.clear();

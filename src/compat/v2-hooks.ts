@@ -74,7 +74,7 @@ import type {
 import { PENDING_JOURNAL_VANISHED, pendingRecordIdentity } from "../verify/pending";
 import type { ExecutorRuntimeHandle, LeaseRegistryPort } from "../executor/runtime";
 import type {
-  ChildRunner, DispatchBookkeeping, HostError, HostSessionEvent, HostSessions, IsoTime, LaunchRequest, MetricPayload, PlanId, RouteResolver,
+  ChildEnd, ChildRunner, DispatchBookkeeping, HostError, HostSessionEvent, HostSessions, IsoTime, LaunchRequest, MetricPayload, PlanId, RouteResolver,
   SlotVerifier, TaskLauncher,
 } from "../executor/types";
 import type { PlanRoleBindings } from "../executor/launch";
@@ -84,6 +84,38 @@ import { NEEDS, UNKNOWN_FACTS, type Need } from "../routing/classify/types";
 
 /** §7 grammar (`formatLaunchPrompt`): every launcher prompt starts with this line. */
 const PLAN_CONTEXT_PREFIX = "PLAN CONTEXT\n";
+/**
+ * QA-3.1-16: the v2 host puts this exact line (ending in "\n", or "\r\n") before the first user message of every native-subagent
+ * child (recorded in docs/qa/role-tier/evidence/roots-handoffs.json, ladder.json), so a launcher prompt reaches the child either
+ * at offset 0 or right after this one line; no other leading text counts.
+ */
+const HOST_SUBAGENT_PREAMBLE = "You are a subagent spawned by another session.";
+
+/**
+ * The status of an executor launch's `runner` trigger. QA-3.1 nit 4: the child's observed end (`execution.*`) decides;
+ * QA-3.1-24: else the launch's settled end kind the launcher passes (its runner result can settle before the child's
+ * `execution.succeeded` is seen); else the registry's outcome. A child that settled with none of them (lost, cancelled, a
+ * runner error) did not succeed: interrupted.
+ */
+export function executorRunnerStatus(
+  observed: "succeeded" | "failed" | "interrupted" | undefined,
+  settled: ChildEnd["kind"] | undefined,
+  registry: string | undefined,
+): "succeeded" | "failed" | "interrupted" {
+  if (observed !== undefined) return observed;
+  if (settled === "completed") return "succeeded";
+  if (settled === "failed" || settled === "capacity") return "failed";
+  if (settled === "interrupted") return "interrupted";
+  return registry === "succeeded" || registry === "failed" || registry === "interrupted" ? registry : "interrupted";
+}
+
+/** The text after the host's one preamble line when it starts with exactly that line, else the text unchanged (QA-3.1-16). */
+function withoutHostPreamble(text: string): string {
+  for (const eol of ["\n", "\r\n"]) {
+    if (text.startsWith(HOST_SUBAGENT_PREAMBLE + eol)) return text.slice(HOST_SUBAGENT_PREAMBLE.length + eol.length);
+  }
+  return text;
+}
 
 /** Translate the router's own v1 tool vocabulary at the v2 boundary. */
 export function v2Instructions(text: string): string {
@@ -1067,9 +1099,11 @@ export async function registerV2Hooks(
    * `EXECUTOR_STEPS_CAP` that evicts ended sessions first.
    */
   const EXECUTOR_STEPS_CAP = 1000;
-  const executorSteps = new Map<string, { k: number; open: boolean; retryPending: boolean; ended: boolean }>();
-  const touchExecutorStep = (sessionID: string): { k: number; open: boolean; retryPending: boolean; ended: boolean } => {
-    const st = executorSteps.get(sessionID) ?? { k: 0, open: false, retryPending: false, ended: false };
+  /** `early`: the step was opened by the retry hook before its `step.started` was processed (QA-3.1-21). */
+  type ExecutorStep = { k: number; open: boolean; retryPending: boolean; ended: boolean; early: boolean };
+  const executorSteps = new Map<string, ExecutorStep>();
+  const touchExecutorStep = (sessionID: string): ExecutorStep => {
+    const st = executorSteps.get(sessionID) ?? { k: 0, open: false, retryPending: false, ended: false, early: false };
     executorSteps.delete(sessionID); // LRU: the latest use goes last
     executorSteps.set(sessionID, st);
     while (executorSteps.size > EXECUTOR_STEPS_CAP) {
@@ -1091,6 +1125,11 @@ export async function registerV2Hooks(
     if (executor === null) return;
     const st = touchExecutorStep(sessionID);
     if (edge === "started") {
+      if (st.early) {
+        // QA-3.1-21: the `step.started` of a step the retry hook already opened: a no-op (no second advance, the retry mark kept)
+        st.early = false;
+        return;
+      }
       st.ended = false;
       st.retryPending = false;
       if (!st.open) {
@@ -1101,18 +1140,31 @@ export async function registerV2Hooks(
       // a scheduled retry, or a retry-hook call that let the host retry, is pending; a hook that stopped it leaves none
       st.retryPending = edge === "retry";
     } else if (edge === "failed") {
+      st.early = false;
       if (!st.retryPending) st.open = false;
     } else {
+      st.early = false;
       st.open = false;
       st.retryPending = false;
       if (edge === "execution") st.ended = true;
     }
   };
+  /**
+   * QA-3.1-21: the retry hook can run before the event loop processed the step's `session.step.started` (the loop can wait on an
+   * ingest). A step that is not open is opened here, so the key the hook reads names this step; its `step.started`, processed
+   * later, is then a no-op (`early`).
+   */
+  const openExecutorStepForHook = (sessionID: string): void => {
+    if (executor === null || executorSteps.get(sessionID)?.open === true) return;
+    noteExecutorStep(sessionID, "started");
+    touchExecutorStep(sessionID).early = true;
+  };
   const executorStepKey = (sessionID: string): string => `${sessionID}:${executorSteps.get(sessionID)?.k ?? 0}`;
   /**
    * 3.1.7 M41 (always on, memo §8): plan children are bound (`bindPlanChild`) before their first tool call. A child session whose
-   * first user message is a launcher prompt (QA-3.1-9: it starts with "PLAN CONTEXT\n" and its launch header sits at the §7
-   * grammar position, `planPromptHeader`) and that has no plan binding, or one naming another plan task, joins
+   * first user message is a launcher prompt (QA-3.1-9: it starts with "PLAN CONTEXT\n", at offset 0 or right after the host's one
+   * exact preamble line (QA-3.1-16), and its launch header sits at the §7 grammar position, `planPromptHeader`) and that has no
+   * plan binding, or one naming another plan task, joins
    * `refusedPlanChildren` and is refused every tool call (fail closed). The check runs in the context hook; a first tool call
    * that comes before it (a restart) runs it in `execute.before`. Every caller awaits the same in-flight check (QA-3.1-9 b).
    */
@@ -1128,7 +1180,9 @@ export async function registerV2Hooks(
    * position, or null. The shared context has no header-shaped line (the launcher refuses one), so the first header-shaped line
    * is the header and the text between the prefix and it is the shared context.
    */
-  const planPromptHeader = (text: string): LaunchHeaderFields | null => {
+  const planPromptHeader = (firstText: string): LaunchHeaderFields | null => {
+    // QA-3.1-16: the grammar is checked at offset 0, or right after the host's one exact preamble line, never elsewhere
+    const text = withoutHostPreamble(firstText);
     if (!text.startsWith(PLAN_CONTEXT_PREFIX)) return null;
     const m = LAUNCH_HEADER_PATTERN.exec(text);
     if (m === null || m.index - 2 < PLAN_CONTEXT_PREFIX.length) return null;
@@ -1651,7 +1705,7 @@ export async function registerV2Hooks(
    * 3.1.7 W1/W5: the executor's in-flight entries (`owner: "executor"`), one call record per task attempt. The launcher calls
    * `decisionRow`, `recordDispatchStart`, `registerInFlight(.., null)`, then `registerInFlight(.., child)` once the child exists,
    * and `unregisterInFlight` when its launch completion settles (the only settle point): that submits the `runner` trigger (with
-   * the child's own end status, `noteEnd`), so
+   * the child's own end status, `noteEnd`, else the launch's settled end kind the launcher passes, QA-3.1-24), so
    * the processor's D2 dedupe makes a later `execution.*` trigger a duplicate. Excluded from the ordinary completion and
    * verification path (background.ts `isExecutorOwned`). Keyed by task attempt (the bookkeeping port carries no plan id).
    */
@@ -1691,7 +1745,7 @@ export async function registerV2Hooks(
         inflight.acknowledge(entry.callID, child, { userBackgrounded: false });
       }
     },
-    unregister(taskId: string, attempt: number): void {
+    unregister(taskId: string, attempt: number, settled?: ChildEnd["kind"]): void {
       const key = executorAttemptKey(taskId, attempt);
       const entry = executorLaunches.get(key);
       executorLaunches.delete(key);
@@ -1700,10 +1754,8 @@ export async function registerV2Hooks(
         inflight.cancel(entry.callID);
         return;
       }
-      // QA-3.1 nit 4: the child's observed end (`execution.*`) decides, else the registry's outcome; a child that settled with
-      // neither (lost, cancelled, a runner error) did not succeed: interrupted.
-      const seen = inflight.byChild(entry.child)?.outcome;
-      const status = entry.end ?? (seen === "succeeded" || seen === "failed" || seen === "interrupted" ? seen : "interrupted");
+      // QA-3.1 nit 4, QA-3.1-24: the observed end, else the launch's settled end kind, else the registry's outcome
+      const status = executorRunnerStatus(entry.end, settled, inflight.byChild(entry.child)?.outcome);
       const sink = executorProcessor;
       if (sink !== undefined) trackBackground(sink.process(entry.child, { kind: "runner", status, text: "", at: nowMs() }));
       else inflight.foreground(entry.callID, entry.child);
@@ -3500,7 +3552,7 @@ export async function registerV2Hooks(
           });
         },
         registerInFlight: (taskId, attempt, child) => executorInFlight.register(taskId, attempt, child),
-        unregisterInFlight: (taskId, attempt) => executorInFlight.unregister(taskId, attempt),
+        unregisterInFlight: (taskId, attempt, status) => executorInFlight.unregister(taskId, attempt, status),
       };
       /**
        * QA-3.1-2: a plan child's grant, computed as the role dispatch path computes one (`grantFor`): the role's base actions
@@ -3570,6 +3622,8 @@ export async function registerV2Hooks(
         registrations.push(await ctx.session.hook("retry", async (event) => {
           try {
             const sessionID = String(event.sessionID);
+            // QA-3.1-21: the step's `step.started` may still wait in the event loop: the key must name this step, not the last one
+            openExecutorStepForHook(sessionID);
             const { stop } = built.runtime.onRetryHook({ sessionID, stepKey: executorStepKey(sessionID), error: toHostError(event.error) });
             // QA-3.1-8: a retry is pending only when neither the executor nor the host's own decision (`{retry: false}` for a
             // usage limit, C10) stops it; a stopped one no longer keeps the step open.

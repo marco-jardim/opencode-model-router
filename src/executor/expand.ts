@@ -261,9 +261,10 @@ const TOKEN_VALUE_RE = /^[a-z0-9_]+$/;
 const ROUTE_LINE_SHAPE_RE = /^\[route(?:[ \t]+([^[\]\r\n]*))?\]$/i;
 /**
  * A slot path usable as `root=`: drive-absolute or POSIX, no brackets, quotes, commas, semicolons, `..`, NUL, control
- * characters or line breaks. Plain spaces are allowed: such a path is sent quoted (`root="D:\my dir"`, QUOTED_ROOT_RE).
+ * characters or line breaks (U+2028/U+2029 included, QA-3.1-28). Plain spaces are allowed: such a path is sent quoted
+ * (`root="D:\my dir"`, QUOTED_ROOT_RE).
  */
-const ROOT_VALUE_RE = /^(?:[A-Za-z]:[\\/]|\/(?![\\/]))[^\x00-\x1f\x7f[\]",;]*$/;
+const ROOT_VALUE_RE = /^(?:[A-Za-z]:[\\/]|\/(?![\\/]))[^\x00-\x1f\x7f\u2028\u2029[\]",;]*$/;
 /** Whitespace (only plain spaces get past ROOT_VALUE_RE) in a slot path: the value is quoted. */
 const ROOT_NEEDS_QUOTES_RE = /\s/;
 

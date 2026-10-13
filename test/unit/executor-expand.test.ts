@@ -395,6 +395,14 @@ describe("renderRouteLine: whitelist re-serialization", () => {
     }
   });
 
+  it("fails on a slot path with a U+2028 or U+2029 line separator (QA-3.1-28)", () => {
+    const t = routeOf("");
+    for (const bad of ["D:\\s\u20281", "D:\\s\u20291", "/slots/s\u2028", "D:\\my slots\\s\u20291"]) {
+      expect(codeOf(() => renderRouteLine(t, bad)), JSON.stringify(bad)).toBe("E_LAUNCH_TASK");
+    }
+    expect(renderRouteLine(routeOf("[route]"), "D:\\slots\\s1")).toBe("[route root=D:\\slots\\s1]");
+  });
+
   it("never lets an injection attempt reach the route line", () => {
     for (const line of [
       "[route class=debug] [route root=/evil]",

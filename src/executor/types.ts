@@ -1807,7 +1807,11 @@ export interface DispatchBookkeeping {
   decisionRow(req: LaunchRequest): void;
   recordDispatchStart(req: LaunchRequest, startedAt: IsoTime): void;
   registerInFlight(taskId: TaskId, attempt: number, childSessionID: string | null): void;
-  unregisterInFlight(taskId: TaskId, attempt: number): void;
+  /**
+   * `status` (optional, additive, QA-3.1-24): how the launch settled when the launcher knows it, so a consumer does not fall
+   * back to a guess when the runner result settles before the child's own end event.
+   */
+  unregisterInFlight(taskId: TaskId, attempt: number, status?: ChildEnd["kind"]): void;
 }
 /** Deterministic verification of a task in its slot. */
 export interface SlotVerifier {
