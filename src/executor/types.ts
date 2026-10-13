@@ -145,6 +145,8 @@ export interface Attempt {
   /** Retained router-call id used for the launch. */
   callID: string | null;
   childSessionID: string | null;
+  /** Budget resumes of this attempt (BUDGET_RESUMES cap). */
+  resumes?: number;
   startedAt: IsoTime;
   endedAt: IsoTime | null;
   outcome: AttemptOutcome | null;
@@ -327,7 +329,7 @@ export const TERMINAL_TASK_STATES = ["done", "cancelled"] as const;
 export type TransitionTrigger =
   | "deps-satisfied" | "dep-parked" | "dep-blocked" | "abort" | "launch" | "dep-reverted" | "adopt"
   | "reported-done" | "dep-added" | "child-created" | "launch-lost" | "launch-task-error" | "child-ended" | "child-failed"
-  | "lease-unresolvable" | "qa-unparsable" | "escalate" | "ambiguity" | "child-lost" | "capacity-stop" | "lease-needed"
+  | "lease-unresolvable" | "qa-unparsable" | "escalate" | "ambiguity" | "budget-cap" | "child-lost" | "capacity-stop" | "lease-needed"
   | "committed" | "no-changes" | "commit-failed" | "verify-pass" | "verify-fail" | "dequeued" | "fast-forwarded"
   | "rebase-conflict" | "checks-failed" | "suite-culprit" | "retry" | "exhausted" | "answered" | "dep-recovered";
 
@@ -617,6 +619,7 @@ export type ExecutorEvent =
   | E<"attempt-started", { taskId: TaskId; attempt: Attempt }>
   | E<"attempt-child", { taskId: TaskId; n: number; childSessionID: string }>
   | E<"attempt-adopted", { taskId: TaskId; n: number; childSessionID: string }>
+  | E<"attempt-resumed", { taskId: TaskId; n: number; resumes: number }>
   | E<"attempt-ended", { taskId: TaskId; n: number; outcome: AttemptOutcome; endedAt: IsoTime; detail: string | null }>
   | E<"attempt-verdict", { taskId: TaskId; n: number; verdict: Verdict; ref: string | null }>
   | E<"attempt-context", { taskId: TaskId; n: number; context: string }>
@@ -670,13 +673,19 @@ export const LAUNCH_CONFIRM_TIMEOUT_MS = 30_000;
 export const CHILD_END_GRACE_MS = 5_000;
 /** Concurrent heavy-tier children per provider (3.1.3.a). */
 export const HEAVY_CAP_PER_PROVIDER = 2;
+/** Maximum budget resumes of the same attempt. */
+export const BUDGET_RESUMES = 3;
+/** Trailer identifying a saved work-in-progress commit. */
+export const WIP_TRAILER = "Omr-Wip";
+/** Marker identifying an orchestrator shell session. */
+export const ORCHESTRATOR_SHELL_RE = /\(orchestrator shell\)/i;
 
 /** Codes of `ExecutorError` (§8). */
 export type ExecutorErrorCode =
   | "E_INVALID_INPUT" | "E_PLAN_STATE" | "E_NOT_OWNER" | "E_LEDGER_NOT_FOUND" | "E_EXISTS" | "E_SCHEMA_NEWER"
   | "E_SCHEMA_INVALID" | "E_SEQ_GAP" | "E_ILLEGAL_TRANSITION" | "E_LOCK_HELD" | "E_LOCK_LOST" | "E_COMPILE"
   | "E_CYCLE" | "E_RESIDUE" | "E_SLOT_UNAVAILABLE" | "E_SLOT_BROKEN" | "E_PROVISION" | "E_GIT" | "E_IDENTITY"
-  | "E_CAPACITY" | "E_NO_CONTEXT" | "E_LAUNCH_TASK" | "E_DISPOSED";
+  | "E_CAPACITY" | "E_NO_CONTEXT" | "E_LAUNCH_TASK" | "E_DISPOSED" | "E_STALE_BASE";
 
 /** Error every executor interface method throws; not ledger data (§8). A failing `append` leaves memory and disk unchanged. */
 export class ExecutorError extends Error {
@@ -786,6 +795,13 @@ function isAttempt(v: unknown): v is Attempt {
     isStrOrNull(v.childSessionID) && isIso(v.startedAt) && (v.endedAt === null || isIso(v.endedAt)) &&
     (v.outcome === null || isOneOf(ATTEMPT_OUTCOMES, v.outcome)) &&
     (v.verdict === null || isOneOf(VERDICTS, v.verdict)) && isStr(v.context);
+}
+
+/** Shape guard for an `attempt-resumed` journal event; replay checks the target, state and count increment. */
+export function isAttemptResumedEvent(v: unknown): v is Extract<ExecutorEvent, { type: "attempt-resumed" }> {
+  return isRec(v) && v.type === "attempt-resumed" && isInt(v.seq) && v.seq >= 1 && isIso(v.at) &&
+    isInt(v.batch) && v.batch >= 1 && isBool(v.last) && isTaskId(v.taskId) &&
+    isInt(v.n) && v.n >= 1 && isInt(v.resumes) && v.resumes >= 1;
 }
 
 const SLOT_REQUIRED_STATES: readonly TaskState[] = ["dispatched", "running", "completed", "verifying", "verified", "integrating"];
@@ -1298,6 +1314,16 @@ export const EXECUTOR_DEFAULTS: ReadonlyExecutorConfig = Object.freeze({
 // §8 Interfaces. Every method throws `ExecutorError`.
 // ---------------------------------------------------------------------------------------------------------------
 
+export type { ExpandInput } from "./expand";
+
+// Type-only extension of the existing expansion input; expansion behaviour is unchanged.
+declare module "./expand" {
+  interface ExpandInput {
+    /** The previous attempt's work restored as uncommitted changes. */
+    restored?: { attempt: number; files: number };
+  }
+}
+
 /** Ledger persistence (2.2): snapshot plus journal under one writer lock. */
 export interface LedgerStore {
   /** pre: no plan dir; isLedgerV1(draft) and `draft.seq === 1`; post: dir, snapshot, journal (ledger-init `{seq: 1, batch: 1, last: true}`), lock held.
@@ -1610,6 +1636,8 @@ export interface LaunchRequest {
   attempt: number;
   nonce: string;
   orchestratorSessionID: string;
+  /** Resume of the same attempt; no new child, confirmed on the first step. */
+  resume?: { childSessionID: string };
   /** The gated capture; `attempt-started.attempt.callID === context.callID` (A1-4). */
   context: ContextRef;
   route: TaskRoute;
@@ -1768,11 +1796,11 @@ export interface RecoveryService {
 export interface UnattendedPolicy {
   /** Dedupe: an open item with the same kind+taskId+text is returned instead. Journals inbox-added (durable); wakes ("inbox", "inbox:<id>") unless closed at creation. */
   raise(i: Omit<InboxItem, "id" | "createdAt" | "answer"> & { answer?: string }): Promise<InboxItem>;
-  /** From running (escalate|ambiguity|qa-unparsable) or conflict|failed|reverted (exhausted). post: parked; transitive **pending** dependents
+  /** From running (escalate|ambiguity|qa-unparsable|budget-cap) or conflict|failed|reverted (exhausted). post: parked; transitive **pending** dependents
    *  -> blocked (a dependent of an un-integrated task cannot be ready or in flight, R9/R10); one inbox item.
    *  Leases are held exactly while `slot !== null` (A1-2.4): parking releases the slot and so calls `LeaseService.releaseTask` after the fsync of the park batch (P rows 17, 36); the answered
    *  task re-acquires through `LeaseService.acquireTask` when it is launched again (A2, QA-1.4-22). */
-  park(taskId: TaskId, cause: "escalate" | "ambiguity" | "qa-unparsable" | "exhausted", text: string): Promise<InboxItem>;
+  park(taskId: TaskId, cause: "escalate" | "ambiguity" | "qa-unparsable" | "exhausted" | "budget-cap", text: string): Promise<InboxItem>;
   /** pre: item open. post: inbox-answered; attempt-context on the latest attempt; parked -> ready. A critical `qa-cap` item goes to
    *  `QaLoop.onCapAnswer` instead (the answer must be one of its options). err E_INVALID_INPUT */
   answer(inboxId: string, text: string): Promise<{ resumed: TaskId | null }>;
@@ -1912,6 +1940,8 @@ export interface HostSessions {
 
 export interface ChildRunRequest {
   parentSessionID: string;
+  /** Resume this child session instead of creating one (the runner honours it). */
+  resumeSessionID?: string;
   prompt: string;
   agent: string;
   model: { providerID: string; modelID: string; variant: string | null };
