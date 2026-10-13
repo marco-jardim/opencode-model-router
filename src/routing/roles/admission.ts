@@ -17,16 +17,26 @@
  * entry, and a `repo=` lookup skips dot-directories, `node_modules` and excluded directories and stops after
  * {@link LOOKUP_MAX_DIRS} directories.
  *
+ * Cross-repo Phase 4 (`docs/design/cross-repo-phase4-plan.md`, SD-P4-5, -6), only with parents configured:
+ * 3. its TEXT equals the path of a repository a human approved with `/router approve` (a valid entry of the approvals store), it
+ *    is not a protected location, and its identity still holds (`verifyIdentity`: realpath, `.git` directory, top level, common
+ *    dir, root commits). Rule 3 runs before rule 2 and its refusal is final; `locate` and the gate follow. Rule 2 skips a known
+ *    repository that is an approved one whose identity fails. The final "not below routing.repoParents" refusal resolves the
+ *    candidate (realpath, no git): another spelling of an approved path is refused naming it; otherwise `approvable` carries the
+ *    canonical candidate when it lies outside every parent and passes the text checks.
+ *
  * Text is compared before any filesystem call on a path outside the parents: git never runs in a directory that the text did
- * not place below a parent and that no known repository lists. Network and device paths (`\\host`, `//host`, `\\?\`, `\\.\`),
- * 8.3 short-name segments, `..` segments and relative paths are refused before any call at all.
+ * not place below a parent, that no known repository lists and that is not an approved path. Network and device paths (`\\host`,
+ * `//host`, `\\?\`, `\\.\`), 8.3 short-name segments, `..` segments and relative paths are refused before any call at all.
  *
  * All I/O goes through {@link AdmissionDeps}; git results are cached for 5 s per normalised path.
  */
 import { lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, posix, win32 } from "node:path";
 import { permissionMatches } from "../../router/read-only";
+import { DEFAULT_REPO_APPROVAL_DAYS } from "../../router/roles-config";
 import { gitWorktreeList, normalizeRootText } from "../wire/dispatch";
+import { protectedProblem, validApprovals, verifyIdentity, type EntryStat, type IdentityDeps, type RepoApproval } from "./approvals";
 
 /** One entry of `git worktree list --porcelain`, as git prints it. */
 export interface WorktreeEntry {
@@ -51,9 +61,24 @@ export interface RepoLocation {
   readonly head: string | null;
   /** Non-prunable entries, in git's order (the main worktree first). */
   readonly worktrees: readonly WorktreeEntry[];
+  /**
+   * Cross-repo Phase 4: the approved path (`/router approve`) when an approval backs this binding: rule 3, or rule 2 through a
+   * known repository that is an approved one. Absent otherwise.
+   */
+  readonly approval?: string;
 }
 
-export type Admission = { readonly ok: true; readonly location: RepoLocation } | { readonly ok: false; readonly reason: string };
+export type Admission =
+  | { readonly ok: true; readonly location: RepoLocation }
+  | {
+    readonly ok: false;
+    readonly reason: string;
+    /**
+     * Cross-repo Phase 4: the canonical candidate, set only on the final "not below routing.repoParents" refusal, with parents
+     * configured, when the candidate lies outside every parent and passes the text checks (it could be approved).
+     */
+    readonly approvable?: string;
+  };
 
 export interface AdmissionConfig {
   /** `routing.repoParents`: literal, absolute, canonical long-form directories. */
@@ -62,6 +87,8 @@ export interface AdmissionConfig {
   readonly depth: number;
   /** `routing.repoExclude`: absolute globs matched against the text and the canonical path of a candidate. */
   readonly exclude: readonly string[];
+  /** `routing.repoApprovalDays` for the default {@link AdmissionDeps.approvals} (default 14). */
+  readonly approvalDays?: number;
 }
 
 export interface AdmissionDeps {
@@ -80,6 +107,17 @@ export interface AdmissionDeps {
   readdir(path: string): string[];
   platform: NodeJS.Platform;
   now(): number;
+  /**
+   * Cross-repo Phase 4 (SD-P4-5): the approvals that apply now (a valid store, entries not expired; no git). Asked only with
+   * parents configured. Absent: no approvals (rule 3 is inert).
+   */
+  approvals?(): readonly RepoApproval[];
+  /** Phase 4 (SD-P4-6): hardened sorted root commits of `HEAD` in `cwd`; undefined on failure. Absent: `gitRootCommits`. */
+  rootCommits?(cwd: string): Promise<string[] | undefined>;
+  /** Phase 4 (SD-P4-6): hardened `HEAD` commit and branch in `cwd`; undefined on failure. Absent: `gitHeadInfo`. */
+  headInfo?(cwd: string): Promise<GitHeadInfo | undefined>;
+  /** Phase 4 (SD-P4-4): `lstat` (links not followed); throws when the entry is absent. Absent: `lstatSync`. */
+  lstat?(path: string): EntryStat;
 }
 
 export interface Declaration { readonly repo?: string; readonly branch?: string; readonly root?: string }
@@ -245,21 +283,21 @@ export async function gitBounded(cwd: string, args: readonly string[], opts: Git
 }
 
 /** Hardened `git rev-parse <args>` in `cwd` ({@link gitBounded}), trimmed. Undefined on any failure or an empty answer. */
-async function gitRevParse(cwd: string, args: readonly string[]): Promise<string | undefined> {
-  const result = await gitBounded(cwd, ["rev-parse", ...args]);
+async function gitRevParse(cwd: string, args: readonly string[], opts?: GitBoundedOptions): Promise<string | undefined> {
+  const result = await gitBounded(cwd, ["rev-parse", ...args], opts);
   if (!result.ok) return undefined;
   const out = result.stdout.trim();
   return out === "" ? undefined : out;
 }
 
 /** Hardened `git rev-parse --show-toplevel` in `cwd` ({@link gitRevParse}). Undefined on any failure. */
-export function gitShowToplevel(cwd: string): Promise<string | undefined> {
-  return gitRevParse(cwd, ["--show-toplevel"]);
+export function gitShowToplevel(cwd: string, opts?: GitBoundedOptions): Promise<string | undefined> {
+  return gitRevParse(cwd, ["--show-toplevel"], opts);
 }
 
 /** Hardened `git rev-parse --git-common-dir` in `cwd` ({@link gitRevParse}); a relative answer is joined to `cwd`. */
-export async function gitCommonDir(cwd: string): Promise<string | undefined> {
-  const dir = await gitRevParse(cwd, ["--git-common-dir"]);
+export async function gitCommonDir(cwd: string, opts?: GitBoundedOptions): Promise<string | undefined> {
+  const dir = await gitRevParse(cwd, ["--git-common-dir"], opts);
   return dir === undefined ? undefined : isAbsolute(dir) ? dir : join(cwd, dir);
 }
 
@@ -319,8 +357,13 @@ export async function gitHeadInfo(cwd: string, opts?: GitBoundedOptions): Promis
   return { branch: name.slice("refs/heads/".length), head };
 }
 
-export function defaultAdmissionDeps(): AdmissionDeps {
+/** The real I/O of {@link createAdmission}; `approvalDays` is `routing.repoApprovalDays` for {@link AdmissionDeps.approvals}. */
+export function defaultAdmissionDeps(opts: { readonly approvalDays?: number | undefined } = {}): AdmissionDeps {
   return {
+    approvals: () => validApprovals(opts.approvalDays ?? DEFAULT_REPO_APPROVAL_DAYS),
+    rootCommits: (cwd) => gitRootCommits(cwd),
+    headInfo: (cwd) => gitHeadInfo(cwd),
+    lstat: (path) => lstatSync(path),
     listWorktrees: gitWorktreeList,
     showToplevel: gitShowToplevel,
     commonDir: gitCommonDir,
@@ -387,7 +430,7 @@ export function repoNameProblem(name: string): string | undefined {
 
 interface CacheEntry<T> { readonly at: number; readonly value: Promise<T> }
 
-export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defaultAdmissionDeps()): AdmissionService {
+export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defaultAdmissionDeps({ approvalDays: cfg.approvalDays })): AdmissionService {
   const platform = deps.platform;
   const win = platform === "win32";
   const sep = win ? "\\" : "/";
@@ -550,6 +593,59 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
     };
   };
 
+  // ── Cross-repo Phase 4: repositories outside the parents that a human approved (SD-P4-5, -6) ───────────────────────────
+  /** The approvals that apply now: [] with no parents (I9: the store is not read), without `deps.approvals`, or when it throws. */
+  const approvedNow = (): readonly RepoApproval[] => {
+    if (parents.length === 0 || deps.approvals === undefined) return [];
+    try {
+      const list = deps.approvals();
+      return Array.isArray(list) ? list : [];
+    } catch {
+      return [];
+    }
+  };
+  /** The approval whose path equals `path` as text (case-insensitive on win32, separators normalised); no filesystem call (I11). */
+  const approvalFor = (path: string, approvals: readonly RepoApproval[]): RepoApproval | undefined => {
+    if (approvals.length === 0) return undefined;
+    const key = text(path);
+    return approvals.find((entry) => text(entry.path) === key);
+  };
+  /** The identity check's I/O: these deps, the show-toplevel and common-dir answers through the 5 s caches. */
+  const identityDeps: IdentityDeps = {
+    realpath: (path) => deps.realpath(path),
+    showToplevel: (cwd) => toplevel(cwd),
+    commonDir: (cwd) => commonDirOf(cwd),
+    ...(deps.lstat !== undefined ? { lstat: deps.lstat.bind(deps) } : {}),
+    ...(deps.rootCommits !== undefined ? { rootCommits: deps.rootCommits.bind(deps) } : {}),
+    ...(deps.headInfo !== undefined ? { headInfo: deps.headInfo.bind(deps) } : {}),
+    platform,
+    now: () => deps.now(),
+  };
+  /** SD-P4-6: why `entry` no longer names the approved repository (a phrase after "it"), or undefined. */
+  const identityProblem = (entry: RepoApproval): Promise<string | undefined> => verifyIdentity(entry, identityDeps);
+
+  /**
+   * Rule 3 (SD-P4-5, -6): undefined unless parents are configured and the text equals an approved path; nothing else is looked
+   * at before that text match. Then, without git, the protected locations; then the identity check; then `locate`. `admit` runs
+   * the gate on an admission (exclusion and the parent rules win); a refusal here ends admission (rule 2 never overturns it).
+   */
+  const ruleThree = async (shown: string): Promise<Admission | undefined> => {
+    const entry = approvalFor(shown, approvedNow());
+    if (entry === undefined) return undefined;
+    const real = canonical(shown);
+    if (real === null) return refuseFinal(`root=${shown} is the approved repository ${entry.path}, but it no longer resolves: no work root.`);
+    const placed = protectedProblem(shown, real);
+    if (placed !== undefined) return refuseFinal(`root=${shown} is the approved repository ${entry.path}, but it ${placed}: no work root.`);
+    const problem = await identityProblem(entry);
+    if (problem !== undefined) {
+      return refuseFinal(`root=${shown} is the approved repository ${entry.path}, but it ${problem}: no work root. Only the user can approve it again (/router approve ${entry.path}).`);
+    }
+    if (text(real) !== text(entry.path)) return refuseFinal(`root=${shown} is the approved repository ${entry.path}, but it now resolves to ${real}: no work root.`);
+    const located = await locate(shown, real, real);
+    if (!located.ok) return located;
+    return { ok: true, location: { ...located.location, approval: entry.path } };
+  };
+
   /** Rule 1 for `shown`, already placed 1..depth below `parent` by its text. */
   const belowParent = async (shown: string, parent: string): Promise<Admission> => {
     const textExcluded = excludedText(shown);
@@ -587,6 +683,7 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
   /** Rule 2: undefined when no repository in `known` lists `shown` as text. */
   const ruleTwo = async (shown: string, known: readonly string[]): Promise<Admission | undefined> => {
     const rootText = text(shown);
+    const approvals = approvedNow();
     for (const repo of unique(known)) {
       if (rootTextProblem(repo, platform) !== undefined) continue;
       let entries: WorktreeEntry[];
@@ -597,33 +694,46 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
       }
       const hit = entries.find((entry) => !entry.prunable && !entry.bare && text(entry.path) === rootText);
       if (hit === undefined) continue;
-      // Only now, on a text match: the filesystem, then git.
-      const main = entries[0];
-      const repository = main === undefined ? null : canonical(main.path);
-      if (repository === null) return refuse(`root=${shown}: the main worktree of the repository that lists it does not resolve: no work root.`);
-      // QA round 1 (Phase 3 lot 1, F3): a worktree of an excluded repository is refused before git runs in it.
-      const excludedRepo = repositoryExcluded(shown, repository, main?.path);
-      if (excludedRepo !== undefined) return refuseFinal(excludedRepo);
-      const real = canonical(shown);
-      if (real === null) return refuse(`root=${shown} is a worktree of ${repository} but does not resolve: no work root.`);
-      let again: WorktreeEntry[];
-      try {
-        again = await worktrees(repository);
-      } catch {
-        return refuse(`root=${shown}: git worktree list failed in ${repository}: no work root.`);
+      // Phase 4 (SD-P4-6): a known repository that is an approved one lists worktrees only while its identity holds. (A lapsed
+      // approval is pruned from the working set before admission: SD-P4-12, `crossRepoOf`.)
+      const approved = approvalFor(repo, approvals);
+      if (approved !== undefined && (await identityProblem(approved)) !== undefined) continue;
+      if (approved !== undefined) {
+        const backed = await ruleTwoAt(shown, rootText, entries);
+        return backed.ok ? { ok: true, location: { ...backed.location, approval: approved.path } } : backed;
       }
-      if (!again.some((entry) => !entry.prunable && !entry.bare && samePath(entry.path, real))) {
-        return refuse(`root=${shown} is no longer a worktree of ${repository}: no work root.`);
-      }
-      if (!(await isToplevel(real))) return refuse(`root=${shown} is not the top level of a git repository: no work root.`);
-      // QA round 1 (F2): the re-check above resolves the listed path through the same link; confirm from the worktree side.
-      if (!(await sameRepository(real, repository))) {
-        const where = text(real) === rootText ? "but the directory there" : `but it leads through a link to ${real}, which`;
-        return refuseFinal(`root=${shown} is listed by git worktree list of ${repository}, ${where} belongs to another repository (git rev-parse --git-common-dir differs): no work root.`);
-      }
-      return locate(shown, real, repository);
+      return ruleTwoAt(shown, rootText, entries);
     }
     return undefined;
+  };
+
+  /** Rule 2 once a known repository's worktree list (`entries`) lists `shown` as text. */
+  const ruleTwoAt = async (shown: string, rootText: string, entries: readonly WorktreeEntry[]): Promise<Admission> => {
+    // Only now, on a text match: the filesystem, then git.
+    const main = entries[0];
+    const repository = main === undefined ? null : canonical(main.path);
+    if (repository === null) return refuse(`root=${shown}: the main worktree of the repository that lists it does not resolve: no work root.`);
+    // QA round 1 (Phase 3 lot 1, F3): a worktree of an excluded repository is refused before git runs in it.
+    const excludedRepo = repositoryExcluded(shown, repository, main?.path);
+    if (excludedRepo !== undefined) return refuseFinal(excludedRepo);
+    const real = canonical(shown);
+    if (real === null) return refuse(`root=${shown} is a worktree of ${repository} but does not resolve: no work root.`);
+    let again: WorktreeEntry[];
+    try {
+      again = await worktrees(repository);
+    } catch {
+      return refuse(`root=${shown}: git worktree list failed in ${repository}: no work root.`);
+    }
+    if (!again.some((entry) => !entry.prunable && !entry.bare && samePath(entry.path, real))) {
+      return refuse(`root=${shown} is no longer a worktree of ${repository}: no work root.`);
+    }
+    if (!(await isToplevel(real))) return refuse(`root=${shown} is not the top level of a git repository: no work root.`);
+    // QA round 1 (F2): the re-check above resolves the listed path through the same link; confirm from the worktree side.
+    if (!(await sameRepository(real, repository))) {
+      const where = text(real) === rootText ? "but the directory there" : `but it leads through a link to ${real}, which`;
+      return refuseFinal(`root=${shown} is listed by git worktree list of ${repository}, ${where} belongs to another repository (git rev-parse --git-common-dir differs): no work root.`);
+    }
+    return locate(shown, real, repository);
   };
 
   /**
@@ -665,11 +775,39 @@ export function createAdmission(cfg: AdmissionConfig, deps: AdmissionDeps = defa
     if (textExcluded !== undefined) return refuse(`root=${shown} is excluded by routing.repoExclude (${textExcluded}): no work root.`);
     const one = await ruleOne(shown);
     if (one !== undefined && (one.ok || finals.has(one))) return gate(shown, one);
+    // Phase 4 (SD-P4-5): rule 3 runs before rule 2 for an approved path, so a replaced folder always meets the identity check.
+    const three = await ruleThree(shown);
+    if (three !== undefined) return gate(shown, three);
     const two = await ruleTwo(shown, known);
     if (two !== undefined) return gate(shown, two);
     if (one !== undefined) return one;
     const hint = parents[0] === undefined ? "" : ` Clone it or add a worktree below ${parents[0]}.`;
-    return refuse(`root=${shown} is not below routing.repoParents (${parentList}) and is not a worktree of a repository in this session: no work root.${hint}`);
+    return refuseOutside(shown, `root=${shown} is not below routing.repoParents (${parentList}) and is not a worktree of a repository in this session: no work root.${hint}`);
+  };
+
+  /**
+   * Phase 4: the final refusal of a text that no rule admitted and that lies below no parent. Only with parents configured, and
+   * only now, the canonical form is looked at (no git): another spelling of an approved path is refused naming that path, and a
+   * candidate outside every parent that passes the text checks carries `approvable`. With no parents, `reason` alone (I9).
+   */
+  const refuseOutside = (shown: string, reason: string): Admission => {
+    if (parents.length === 0) return refuse(reason);
+    const real = canonical(shown);
+    if (real === null || !deps.isDirectory(real)) return refuse(reason);
+    const approved = approvalFor(real, approvedNow());
+    if (approved !== undefined) {
+      return refuse(`root=${shown} resolves to the approved repository ${approved.path}, but only its approved path admits it: use root=${approved.path}: no work root.`);
+    }
+    if (rootTextProblem(real, platform) !== undefined || excludedText(real) !== undefined) return refuse(reason);
+    const forms = [text(shown), text(real)];
+    for (const parent of parents) {
+      const realParent = canonical(parent);
+      const parentForms = realParent === null ? [text(parent)] : [text(parent), text(realParent)];
+      for (const form of parentForms) {
+        if (forms.some((candidate) => levelsBelow(candidate, form) !== undefined || levelsBelow(form, candidate) !== undefined)) return refuse(reason);
+      }
+    }
+    return { ok: false, reason, approvable: real };
   };
 
   /** The directories a `repo=` scan descends into below `dir`: no dot-directories, no `node_modules`, nothing excluded (F7). */

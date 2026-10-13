@@ -102,10 +102,11 @@ const warned = new Set<string>();
 const lastTouched = new Map<string, number>();
 const queues = new Map<string, Promise<unknown>>();
 
-/** Test only: re-arm the invalid-file notice and forget the in-memory touch throttle. */
+/** Test only: re-arm the invalid-file notice and forget the in-memory touch throttle and the identity caches. */
 export function resetApprovalsState(): void {
   warned.clear();
   lastTouched.clear();
+  resetIdentityCaches();
 }
 
 /** The store file: `dirname(statePath())/opencode-model-router.repo-approvals.json`. */
@@ -552,4 +553,303 @@ export function sanitizeOrigin(raw: string | undefined): string {
   if (shown.trim() === "") return NO_ORIGIN;
   if (shown.length > MAX_ORIGIN_CHARS) shown = `${shown.slice(0, MAX_ORIGIN_CHARS - 1)}…`;
   return shown;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Candidate inspection and identity check (SD-P4-4, -6, -8)
+
+/** {@link inspectCandidate} results are cached this long per path (SD-P4-8). */
+export const INSPECT_CACHE_MS = 5_000;
+
+/** What git says about a candidate main worktree (SD-P4-4, -8, -9). */
+export interface CandidateIdentity {
+  /** Canonical path of the main worktree. */
+  readonly path: string;
+  /** Canonical git common dir (`<path>\.git`). */
+  readonly commonDir: string;
+  /** Sorted root commits (`git rev-list --max-parents=0 HEAD`). */
+  readonly roots: readonly string[];
+  /** Sanitized origin ({@link sanitizeOrigin}); `none` when absent. */
+  readonly origin: string;
+  /** Current branch, display-safe; `(detached)` when `HEAD` is detached. */
+  readonly branch: string;
+  /** HEAD commit, display-safe. */
+  readonly head: string;
+}
+
+/** The parts of `fs.Stats` that {@link inspectCandidate} and {@link verifyIdentity} use. */
+export interface EntryStat {
+  isDirectory(): boolean;
+  isSymbolicLink(): boolean;
+}
+
+/** Injectable I/O of {@link verifyIdentity} (and {@link inspectCandidate}); every member defaults to the real one. */
+export interface IdentityDeps {
+  /** `realpathSync.native`; throws when the path does not resolve. */
+  readonly realpath?: (p: string) => string;
+  /** `lstatSync` (links are not followed); throws when the entry is absent. */
+  readonly lstat?: (p: string) => EntryStat;
+  /** Hardened `git rev-parse --show-toplevel` in `cwd`; undefined on failure. */
+  readonly showToplevel?: (cwd: string) => Promise<string | undefined>;
+  /** Hardened `git rev-parse --git-common-dir` in `cwd`, absolute; undefined on failure. */
+  readonly commonDir?: (cwd: string) => Promise<string | undefined>;
+  /** Hardened sorted root commits of `HEAD`; undefined on failure and without commits. */
+  readonly rootCommits?: (cwd: string) => Promise<string[] | undefined>;
+  /** Hardened raw `remote.origin.url`; undefined when unset and on failure. */
+  readonly origin?: (cwd: string) => Promise<string | undefined>;
+  /** Hardened `HEAD` commit and branch; undefined on failure and without commits. */
+  readonly headInfo?: (cwd: string) => Promise<import("./admission").GitHeadInfo | undefined>;
+  /** Options of the default git helpers (tests: an injected spawn or a shorter bound). */
+  readonly git?: import("./admission").GitBoundedOptions;
+  /** Clock of the caches; default `Date.now`. */
+  readonly now?: () => number;
+  /** Default `process.platform`. */
+  readonly platform?: NodeJS.Platform;
+}
+
+/** Injectable I/O and configuration of {@link inspectCandidate}. */
+export interface InspectDeps extends IdentityDeps {
+  /** `routing.repoExclude`: absolute globs matched against the text and the canonical form of the candidate. */
+  readonly exclude?: readonly string[];
+  /** Store environment: the store's directory is a protected location. */
+  readonly env?: ApprovalsEnv;
+}
+
+/** The end of every refusal of a candidate that is not a main worktree (SD-P4-4). */
+export const APPROVE_MAIN_WORKTREE = "approve the main worktree";
+
+type AdmissionModule = typeof import("./admission");
+
+interface TimedResult<T> { readonly at: number; readonly value: Promise<T> }
+const IDENTITY_CACHE_MAX = 64;
+const inspected = new Map<string, TimedResult<string | CandidateIdentity>>();
+const rootsByHead = new Map<string, Promise<string[] | undefined>>();
+
+/** Test only: forget the {@link inspectCandidate} results and the root commits cached per (common dir, HEAD). */
+export function resetIdentityCaches(): void {
+  inspected.clear();
+  rootsByHead.clear();
+}
+
+function remember<V>(cache: Map<string, V>, key: string, value: V): void {
+  cache.delete(key);
+  cache.set(key, value);
+  while (cache.size > IDENTITY_CACHE_MAX) {
+    const oldest = cache.keys().next().value;
+    if (oldest === undefined) break;
+    cache.delete(oldest);
+  }
+}
+
+async function settle<T>(run: () => Promise<T | undefined>): Promise<T | undefined> {
+  try {
+    return await run();
+  } catch {
+    return undefined;
+  }
+}
+
+function realpathOf(deps: IdentityDeps): (p: string) => string {
+  return deps.realpath ?? ((p: string) => fs.realpathSync.native(p));
+}
+
+/** The git helpers: the injected ones, else the hardened ones of `admission.ts` (bounded, `deps.git` options). */
+function gitIo(deps: IdentityDeps, adm: AdmissionModule): Required<Pick<IdentityDeps, "showToplevel" | "commonDir" | "rootCommits" | "origin" | "headInfo">> {
+  const git = deps.git;
+  return {
+    showToplevel: deps.showToplevel ?? ((cwd: string) => adm.gitShowToplevel(cwd, git)),
+    commonDir: deps.commonDir ?? ((cwd: string) => adm.gitCommonDir(cwd, git)),
+    rootCommits: deps.rootCommits ?? ((cwd: string) => adm.gitRootCommits(cwd, git)),
+    origin: deps.origin ?? ((cwd: string) => adm.gitOrigin(cwd, git)),
+    headInfo: deps.headInfo ?? ((cwd: string) => adm.gitHeadInfo(cwd, git)),
+  };
+}
+
+/** Whether git's absolute `listed` path names `real` (canonical): text first, `realpath` only when the text differs. */
+function samePlace(listed: string, real: string, realpath: (p: string) => string): boolean {
+  if (!path.isAbsolute(listed)) return false;
+  if (cmpForm(listed) === cmpForm(real)) return true;
+  try {
+    return cmpForm(realpath(listed)) === cmpForm(real);
+  } catch {
+    return false;
+  }
+}
+
+/** SD-P4-4: `<real>\.git` must be a local directory (`lstat`: not a link, not a gitfile). No git. */
+function gitDirectoryProblem(real: string, deps: IdentityDeps): string | undefined {
+  const lstat = deps.lstat ?? ((p: string) => fs.lstatSync(p));
+  let stat: EntryStat;
+  try {
+    stat = lstat(path.join(real, ".git"));
+  } catch {
+    return `has no .git directory (it is not the main worktree of a git repository); ${APPROVE_MAIN_WORKTREE}`;
+  }
+  if (stat.isSymbolicLink()) return `has a .git link instead of a .git directory; ${APPROVE_MAIN_WORKTREE}`;
+  if (!stat.isDirectory()) {
+    return `has a .git file (a linked worktree, a submodule or a separate git dir) instead of a .git directory; ${APPROVE_MAIN_WORKTREE}`;
+  }
+  return undefined;
+}
+
+/** `routing.repoExclude` pattern matching `p` (as given and, on win32, with native separators), or undefined. */
+function excludedBy(p: string, exclude: readonly string[], win: boolean, matches: (input: string, pattern: string) => boolean): string | undefined {
+  const forms = win && p.includes("/") ? [p, p.replace(/\//g, "\\")] : [p];
+  for (const form of forms) {
+    const input = win ? form.toLowerCase() : form;
+    const hit = exclude.find((pattern) => pattern.trim() !== "" && matches(input, win ? pattern.toLowerCase() : pattern));
+    if (hit !== undefined) return hit;
+  }
+  return undefined;
+}
+
+/** The git part of {@link inspectCandidate}, in the canonical main worktree `real` whose `.git` directory was checked. */
+async function inspectGit(real: string, deps: IdentityDeps, adm: AdmissionModule): Promise<string | CandidateIdentity> {
+  const realpath = realpathOf(deps);
+  const io = gitIo(deps, adm);
+  // All five are hardened and bounded; run together, the whole inspection stays within one bound.
+  const [top, common, roots, origin, head] = await Promise.all([
+    settle(() => io.showToplevel(real)),
+    settle(() => io.commonDir(real)),
+    settle(() => io.rootCommits(real)),
+    settle(() => io.origin(real)),
+    settle(() => io.headInfo(real)),
+  ]);
+  if (top === undefined) return "is not a repository git can read (git rev-parse --show-toplevel failed or timed out)";
+  if (!samePlace(top, real, realpath)) return `is not the top level of its git repository (git names ${displaySafe(top)}); ${APPROVE_MAIN_WORKTREE}`;
+  if (common === undefined) return "is not a repository git can read (git rev-parse --git-common-dir failed or timed out)";
+  let commonReal: string;
+  try {
+    commonReal = realpath(common);
+  } catch {
+    return `has a git common dir that does not resolve (${displaySafe(common)}); ${APPROVE_MAIN_WORKTREE}`;
+  }
+  if (cmpForm(commonReal) !== cmpForm(path.join(real, ".git"))) {
+    return `uses the git directory ${displaySafe(commonReal)}, not its own .git directory; ${APPROVE_MAIN_WORKTREE}`;
+  }
+  if (roots === undefined || roots.length === 0) return "has no commits yet, or git rev-list --max-parents=0 HEAD failed or timed out";
+  if (head === undefined) return "has no HEAD commit git can report (git rev-parse HEAD failed or timed out)";
+  return Object.freeze({
+    path: real,
+    commonDir: commonReal,
+    roots: Object.freeze([...new Set(roots)].sort()),
+    origin: sanitizeOrigin(origin),
+    branch: head.branch === undefined ? "(detached)" : displaySafe(head.branch),
+    head: displaySafe(head.head),
+  });
+}
+
+/**
+ * What git says about the candidate `text` (SD-P4-4, -8, -9): a problem phrase (to follow the path, as in "D:\x <problem>"), or
+ * the identity of its canonical main worktree. Before any git call: {@link rootTextProblem} (admission.ts) on the text and on
+ * the canonical form, `routing.repoExclude` on both, {@link protectedProblem}, and `<canonical>\.git` must be a local directory
+ * (`lstat`: not a link, not a gitfile). Then hardened, bounded git: the canonical form must be the top level, its canonical common
+ * dir must be `<canonical>\.git`, and it must have at least one commit. The git part is cached {@link INSPECT_CACHE_MS} per
+ * canonical path; the checks before it run every time. Never throws.
+ */
+export async function inspectCandidate(text: string, deps: InspectDeps = {}): Promise<string | CandidateIdentity> {
+  try {
+    const adm = await import("./admission");
+    const { permissionMatches } = await import("../../router/read-only");
+    const platform = deps.platform ?? process.platform;
+    const win = platform === "win32";
+    const exclude = deps.exclude ?? [];
+    const shown = text.trim();
+    const textProblem = adm.rootTextProblem(shown, platform);
+    if (textProblem !== undefined) return textProblem;
+    const byText = excludedBy(shown, exclude, win, permissionMatches);
+    if (byText !== undefined) return `is excluded by routing.repoExclude (${byText})`;
+    let real: string;
+    try {
+      real = realpathOf(deps)(shown);
+    } catch {
+      return "does not resolve to an existing directory";
+    }
+    if (typeof real !== "string" || real === "") return "does not resolve to an existing directory";
+    const realProblem = adm.rootTextProblem(real, platform);
+    if (realProblem !== undefined) return `resolves to ${displaySafe(real)}, which ${realProblem}`;
+    const byReal = excludedBy(real, exclude, win, permissionMatches);
+    if (byReal !== undefined) return `resolves to ${displaySafe(real)}, which is excluded by routing.repoExclude (${byReal})`;
+    const placed = protectedProblem(shown, real, deps.env);
+    if (placed !== undefined) return placed;
+    const gitDir = gitDirectoryProblem(real, deps);
+    if (gitDir !== undefined) return gitDir;
+
+    const now = (deps.now ?? Date.now)();
+    const key = cmpForm(real);
+    const hit = inspected.get(key);
+    if (hit !== undefined && now >= hit.at && now - hit.at < INSPECT_CACHE_MS) return await hit.value;
+    const value = inspectGit(real, deps, adm);
+    remember(inspected, key, { at: now, value });
+    return await value;
+  } catch (e) {
+    return `could not be inspected (${e instanceof Error ? e.message : String(e)})`;
+  }
+}
+
+/**
+ * SD-P4-6: why `entry` no longer names the approved repository, as a phrase (to follow "the approved repository <path>"), or
+ * undefined when it still does: `realpath(path)` is `path` (comparison form), `<path>\.git` is a local directory, git names
+ * `path` as the top level, the canonical common dir is the stored one and the sorted root commits of `HEAD` are the stored ones.
+ * The root commits are cached per (common dir, HEAD commit); pass cached `showToplevel` / `commonDir` for the 5 s caches. Never
+ * throws.
+ */
+export async function verifyIdentity(entry: Pick<RepoApproval, "path" | "commonDir" | "roots">, deps: IdentityDeps = {}): Promise<string | undefined> {
+  try {
+    const adm = await import("./admission");
+    const platform = deps.platform ?? process.platform;
+    const textProblem = adm.rootTextProblem(entry.path, platform);
+    if (textProblem !== undefined) return `has a path that ${textProblem}`;
+    const realpath = realpathOf(deps);
+    let real: string;
+    try {
+      real = realpath(entry.path);
+    } catch {
+      return "no longer resolves";
+    }
+    if (typeof real !== "string" || cmpForm(real) !== cmpForm(entry.path)) return `now resolves to ${displaySafe(String(real))}`;
+    const gitDir = gitDirectoryProblem(entry.path, deps);
+    if (gitDir !== undefined) return gitDir;
+    const io = gitIo(deps, adm);
+    const [top, common, head] = await Promise.all([
+      settle(() => io.showToplevel(entry.path)),
+      settle(() => io.commonDir(entry.path)),
+      settle(() => io.headInfo(entry.path)),
+    ]);
+    if (top === undefined || !samePlace(top, entry.path, realpath)) return "is no longer the top level of a git repository (or git failed)";
+    if (common === undefined) return "has no git common dir git can report (git failed or timed out)";
+    let commonReal: string;
+    try {
+      commonReal = realpath(common);
+    } catch {
+      return "has a git common dir that does not resolve";
+    }
+    if (cmpForm(commonReal) !== cmpForm(entry.commonDir)) return `now uses the git directory ${displaySafe(commonReal)}, not ${entry.commonDir}`;
+    if (head === undefined) return "has no HEAD commit git can report (git failed or timed out)";
+    const key = `${cmpForm(commonReal)}\u0000${head.head}`;
+    let roots = rootsByHead.get(key);
+    if (roots === undefined) {
+      const loaded = settle(() => io.rootCommits(entry.path));
+      roots = loaded;
+      remember(rootsByHead, key, loaded);
+      // A failure is not reused.
+      void loaded.then((value) => {
+        if (value === undefined && rootsByHead.get(key) === loaded) rootsByHead.delete(key);
+      });
+    }
+    const current = await roots;
+    if (current === undefined) return "has root commits git cannot list (git rev-list --max-parents=0 HEAD failed or timed out)";
+    if (!sameRoots(current, entry.roots)) {
+      return "has other root commits than when it was approved (another repository at the same path, an orphan branch, a deepened clone or rewritten history)";
+    }
+    return undefined;
+  } catch (e) {
+    return `could not be verified (${e instanceof Error ? e.message : String(e)})`;
+  }
+}
+
+/** The approvals that apply now (no git): a valid store's entries with `now < expiresAt(entry, days)`. */
+export function validApprovals(days: number, env: ApprovalsEnv = {}): readonly RepoApproval[] {
+  const now = clock(env);
+  return readApprovals(env).approvals.filter((entry) => isApprovalValid(entry, days, now));
 }

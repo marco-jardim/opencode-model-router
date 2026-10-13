@@ -1,15 +1,17 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   createAdmission,
   defaultAdmissionDeps,
   parseWorktreeEntries,
+  type AdmissionConfig,
   type AdmissionDeps,
   type AdmissionLookup,
 } from "../../src/routing/roles/admission";
+import { applyApproval, inspectCandidate, resetApprovalsState, validApprovals, type RepoApproval } from "../../src/routing/roles/approvals";
 import { gitWorktreeList, resolveRoleWorkRoot } from "../../src/routing/wire/dispatch";
 
 const isWin = process.platform === "win32";
@@ -121,8 +123,11 @@ describe("admission without git (fake deps)", () => {
     expect(result).toEqual({
       ok: false,
       reason: "root=E:\\work\\x is not below routing.repoParents (D:\\git) and is not a worktree of a repository in this session: no work root. Clone it or add a worktree below D:\\git.",
+      // Phase 4: the final refusal names the canonical candidate (realpath, never git) so the dispatch can offer an approval.
+      approvable: "E:\\work\\x",
     });
-    expect(calls).toEqual(["listWorktrees D:\\git\\app"]);
+    expect(calls).toEqual(["listWorktrees D:\\git\\app", "realpath E:\\work\\x", "isDirectory E:\\work\\x", "realpath D:\\git"]);
+    expect(calls.filter((call) => /^(showToplevel|commonDir|gitEntry|listWorktrees E:)/.test(call))).toEqual([]);
   });
 
   it("compares case-insensitively on win32 (fake win32 host)", async () => {
@@ -373,7 +378,7 @@ describe("admission with real git", { timeout: 60_000 }, () => {
   it("admits a linked worktree outside the parents only through a known repository", async () => {
     const admission = createAdmission(config(), defaultAdmissionDeps());
     const login = join(outside, "alpha-login");
-    expect(await admission.admit(login)).toEqual({ ok: false, reason: expect.stringContaining("is not below routing.repoParents") });
+    expect(await admission.admit(login)).toEqual({ ok: false, reason: expect.stringContaining("is not below routing.repoParents"), approvable: login });
     const known = await admission.admit(login, [join(parent, "alpha")]);
     expect(known).toMatchObject({ ok: true, location: { repository: join(parent, "alpha"), name: "alpha", worktree: login, branch: "feat/login", head: mainSha } });
   });
@@ -708,5 +713,191 @@ describe("QA round 1 (real git): every admission passes the final gates", { time
     const admission = createAdmission({ parents: [parent, org], depth: 2, exclude: [] }, defaultAdmissionDeps());
     expect(await admission.admit(org)).toEqual({ ok: false, reason: expect.stringContaining("routing.repoParents entry") });
     expect(await admission.admit(app())).toMatchObject({ ok: true, location: { worktree: app() } });
+  });
+});
+
+describe("rule 3 (Phase 4, real git): repositories outside the parents approved with /router approve", { timeout: 60_000 }, () => {
+  const DAY = 86_400_000;
+  const FORGED_ROOT = "f".repeat(40);
+  const linkType = isWin ? "junction" : "dir";
+  let base = "";
+  let parent = "";
+  let ext = "";
+  const env: NodeJS.ProcessEnv = {};
+  /** The store's clock; it only moves forward (a time in the future invalidates a stored entry). */
+  const clock = { t: Date.UTC(2026, 9, 12) };
+
+  const git = (cwd: string, ...args: string[]): string =>
+    execFileSync("git", args, { cwd, env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  const repo = (dir: string, message = "init"): string => {
+    mkdirSync(dir, { recursive: true });
+    git(dir, "init", "-q", "-b", "main");
+    git(dir, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", message);
+    return dir;
+  };
+  const store = () => ({ dir: join(base, "store"), now: () => clock.t });
+  const config = (over: Partial<AdmissionConfig> = {}): AdmissionConfig => ({ parents: [parent], depth: 2, exclude: [], ...over });
+  /** Real deps whose approvals are the test store's valid entries (14 days, the store's clock). */
+  const deps = (over: Partial<AdmissionDeps> = {}): AdmissionDeps => ({ ...defaultAdmissionDeps(), approvals: () => validApprovals(14, store()), ...over });
+  /** What `/router approve <dir>` stores (P4.7): the identity from git, then a `put`. */
+  const approve = async (dir: string): Promise<void> => {
+    const identity = await inspectCandidate(dir, { env: store() });
+    if (typeof identity === "string") throw new Error(`${dir} ${identity}`);
+    expect((await applyApproval({ kind: "put", approval: identity, days: 14 }, store())).status).toBe("written");
+  };
+  const reasonOf = (result: { ok: boolean; reason?: string }): string => (result.ok ? "" : result.reason ?? "");
+
+  beforeAll(() => {
+    base = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-rule3-")));
+    for (const [key, value] of Object.entries(process.env)) if (!key.toUpperCase().startsWith("GIT_")) env[key] = value;
+    writeFileSync(join(base, "gitconfig"), "");
+    env.GIT_CONFIG_GLOBAL = join(base, "gitconfig");
+    env.GIT_CONFIG_NOSYSTEM = "1";
+    parent = join(base, "parent");
+    repo(join(parent, "alpha"));
+    ext = repo(join(base, "ext"));
+    mkdirSync(join(base, "store"));
+  }, 120_000);
+
+  afterAll(() => {
+    if (base !== "") rmSync(base, { recursive: true, force: true });
+  });
+
+  beforeEach(() => {
+    resetApprovalsState();
+    clock.t += 1_000;
+  });
+
+  it("admits an approved repository outside the parents and marks the binding with the approval", async () => {
+    // Not yet approved: the final refusal names the canonical candidate.
+    expect(await createAdmission(config(), deps()).admit(ext)).toEqual({ ok: false, reason: expect.stringContaining("is not below routing.repoParents"), approvable: ext });
+    await approve(ext);
+    expect(await createAdmission(config(), deps()).admit(ext)).toMatchObject({
+      ok: true,
+      location: { repository: ext, name: "ext", worktree: ext, branch: "main", approval: ext },
+    });
+    const resolved = await createAdmission(config(), deps()).resolve({ root: ext, branch: "main" }, { sessionRepository: join(parent, "alpha") });
+    expect(resolved).toMatchObject({ ok: true, location: { worktree: ext, approval: ext } });
+    if (isWin) {
+      // I11: the text match is case-insensitive and separator-normalised on win32.
+      const variant = ext.toUpperCase().replace(/\\/g, "/");
+      expect(await createAdmission(config(), deps()).admit(variant)).toMatchObject({ ok: true, location: { worktree: ext, approval: ext } });
+    }
+  });
+
+  it("refuses once the approval has expired, and offers the candidate again", async () => {
+    await approve(ext);
+    expect(await createAdmission(config(), deps()).admit(ext)).toMatchObject({ ok: true });
+    clock.t += 14 * DAY;
+    expect(await createAdmission(config(), deps()).admit(ext)).toEqual({ ok: false, reason: expect.stringContaining("is not below routing.repoParents"), approvable: ext });
+  });
+
+  it("refuses, finally, when the identity no longer holds: another repository in the folder, forged roots", async () => {
+    const swap = repo(join(base, "swap"), "first");
+    await approve(swap);
+    expect(await createAdmission(config(), deps()).admit(swap)).toMatchObject({ ok: true, location: { approval: swap } });
+    renameSync(swap, join(base, "swap-old"));
+    repo(swap, "second");
+    // A known repository listing the path does not overturn the rule-3 refusal.
+    const replaced = await createAdmission(config(), deps()).admit(swap, [swap]);
+    expect(replaced.ok).toBe(false);
+    expect(reasonOf(replaced)).toContain(`root=${swap} is the approved repository ${swap}, but it has other root commits`);
+    expect(replaced).not.toHaveProperty("approvable");
+
+    await approve(ext);
+    const forged = await createAdmission(config(), deps({ rootCommits: async () => [FORGED_ROOT] })).admit(ext);
+    expect(reasonOf(forged)).toContain("but it has other root commits");
+  });
+
+  it("lets repoExclude win over an approval", async () => {
+    await approve(ext);
+    expect(await createAdmission(config({ exclude: [ext] }), deps()).admit(ext)).toEqual({
+      ok: false,
+      reason: expect.stringContaining("is excluded by routing.repoExclude"),
+    });
+  });
+
+  it("refuses an approval of a protected location (a hand-edited store) before any git call", async () => {
+    const home = realpathSync.native(homedir());
+    const forged: RepoApproval = { path: home, commonDir: join(home, ".git"), roots: [FORGED_ROOT], origin: "none", approvedAt: clock.t, lastUsedAt: clock.t };
+    const calls: string[] = [];
+    const result = await createAdmission(config(), deps({
+      approvals: () => [forged],
+      showToplevel: async (cwd) => {
+        calls.push(cwd);
+        return undefined;
+      },
+      rootCommits: async (cwd) => {
+        calls.push(cwd);
+        return undefined;
+      },
+    })).admit(home);
+    expect(reasonOf(result)).toContain("is the user profile");
+    expect(calls).toEqual([]);
+  });
+
+  it("is inert without parents: the store is not read and nothing is approvable", async () => {
+    await approve(ext);
+    let reads = 0;
+    const admission = createAdmission({ parents: [], depth: 2, exclude: [] }, deps({
+      approvals: () => {
+        reads++;
+        return validApprovals(14, store());
+      },
+    }));
+    const result = await admission.admit(ext);
+    expect(result).toEqual({ ok: false, reason: expect.stringContaining("is not below routing.repoParents (none configured)") });
+    expect(result).not.toHaveProperty("approvable");
+    expect(reads).toBe(0);
+  });
+
+  it("refuses another spelling that resolves to an approved path, naming the approved path", async () => {
+    await approve(ext);
+    const link = join(base, "ext-link");
+    symlinkSync(ext, link, linkType);
+    expect(await createAdmission(config(), deps()).admit(link)).toEqual({
+      ok: false,
+      reason: `root=${link} resolves to the approved repository ${ext}, but only its approved path admits it: use root=${ext}: no work root.`,
+    });
+  });
+
+  it("rule 2 through an approved repository is marked, and skips it once its identity fails", async () => {
+    await approve(ext);
+    const wt = join(base, "ext-wt");
+    git(ext, "worktree", "add", "-q", "-b", "wt", wt);
+    expect(await createAdmission(config(), deps()).admit(wt, [ext])).toMatchObject({
+      ok: true,
+      location: { repository: ext, worktree: wt, branch: "wt", approval: ext },
+    });
+    resetApprovalsState();
+    expect(await createAdmission(config(), deps({ rootCommits: async () => [FORGED_ROOT] })).admit(wt, [ext])).toEqual({
+      ok: false,
+      reason: expect.stringContaining("is not below routing.repoParents"),
+      approvable: wt,
+    });
+    // Without an approval the known repository works as before, unmarked.
+    const plain = await createAdmission(config(), deps({ approvals: () => [] })).admit(wt, [ext]);
+    expect(plain).toMatchObject({ ok: true, location: { worktree: wt } });
+    expect(plain.ok && plain.location.approval).toBeUndefined();
+  });
+
+  it("sets approvable only for a candidate outside every parent that passes the text checks", async () => {
+    const admission = createAdmission(config({ exclude: [join(base, "excluded-target")] }), deps());
+    const other = repo(join(base, "other"));
+    expect(await admission.admit(other)).toMatchObject({ ok: false, approvable: other });
+    const deep = repo(join(parent, "a", "b", "deep"));
+    const tooDeep = await admission.admit(deep);
+    expect(reasonOf(tooDeep)).toContain("3 levels below");
+    expect(tooDeep).not.toHaveProperty("approvable");
+    // It contains a parent.
+    expect(await admission.admit(base)).not.toHaveProperty("approvable");
+    expect(await admission.admit(join(base, "missing"))).not.toHaveProperty("approvable");
+    // Its canonical form is excluded.
+    const target = repo(join(base, "excluded-target"));
+    symlinkSync(target, join(base, "excluded-link"), linkType);
+    expect(await admission.admit(join(base, "excluded-link"))).not.toHaveProperty("approvable");
+    // Its canonical form lies below a parent.
+    symlinkSync(join(parent, "alpha"), join(base, "into-parent"), linkType);
+    expect(await admission.admit(join(base, "into-parent"))).not.toHaveProperty("approvable");
   });
 });
