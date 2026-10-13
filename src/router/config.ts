@@ -20,12 +20,14 @@ import { resolveRoleTable, type ExplorationConfig, type RunConfig } from "./role
 import {
   DEFAULT_RUN_COMMANDS,
   DEFAULT_RUN_SCRIPTS,
+  DEFAULT_REPO_APPROVAL_DAYS,
   DEFAULT_REPO_DEPTH,
   DEFAULT_RUN_TIMEOUT_MS,
   ROLES_V1_NOTICE,
   collectRolesIssues,
   sanitizeDelegation,
   sanitizeExploration,
+  sanitizeRepoApprovalDays,
   sanitizeRepoDepth,
   sanitizeRepoExclude,
   sanitizeRepoParents,
@@ -339,6 +341,8 @@ export interface RoutingConfig {
   repoDepth?: number;
   /** Global only. Absolute globs never admitted below a parent. */
   repoExclude?: string[];
+  /** Global only. Days an approved repository outside the parents stays approved after its last use, 1–90; default 14. Inert on v1. */
+  repoApprovalDays?: number;
 }
 
 export interface RouterConfig {
@@ -1834,6 +1838,8 @@ function validateRouting(value: unknown): RoutingConfig | undefined {
   if (repoDepth !== undefined) out.repoDepth = repoDepth;
   const repoExclude = sanitizeRepoExclude(routing.repoExclude).value;
   if (repoExclude !== undefined) out.repoExclude = repoExclude;
+  const repoApprovalDays = sanitizeRepoApprovalDays(routing.repoApprovalDays).value;
+  if (repoApprovalDays !== undefined) out.repoApprovalDays = repoApprovalDays;
 
   const outcomes = readBlock(routing, "outcomes", "routing");
   if (outcomes !== undefined) {
@@ -2224,7 +2230,15 @@ const GLOBAL_ONLY_ROUTING_KEYS: ReadonlyArray<readonly [block: string, key: stri
 ];
 
 /** Roles keys (#84) a project layer must not carry; `routing.delegation` is allowed there. */
-const GLOBAL_ONLY_ROLES_ROUTING_KEYS = ["exploration", "run", "workRoots", "repoParents", "repoDepth", "repoExclude"] as const;
+const GLOBAL_ONLY_ROLES_ROUTING_KEYS = [
+  "exploration",
+  "run",
+  "workRoots",
+  "repoParents",
+  "repoDepth",
+  "repoExclude",
+  "repoApprovalDays",
+] as const;
 
 function stripGlobalOnlyRolesKeys(data: Record<string, unknown>): string[] {
   const dropped: string[] = [];
@@ -2531,6 +2545,7 @@ const ROUTING_KNOWN_KEYS: Readonly<Record<string, readonly string[]>> = {
     "repoParents",
     "repoDepth",
     "repoExclude",
+    "repoApprovalDays",
   ],
   detection: ["deterministic", "grader", "none"],
   classifier: ["backend", "model", "baseUrl", "apiKeyEnv", "timeoutMs", "samples", "maxStateChars", "presets"],
@@ -3209,6 +3224,8 @@ export interface ResolvedRolesRouting {
   readonly repoParents: readonly string[];
   readonly repoDepth: number;
   readonly repoExclude: readonly string[];
+  /** Cross-repo (Phase 4): days an approval outside the parents lasts after its last use (1–90, default 14). */
+  readonly repoApprovalDays: number;
   /** True on v1 when roles keys were set: they are validated but have no effect. */
   readonly inert: boolean;
 }
@@ -3237,7 +3254,8 @@ export function resolveRolesRouting(
   const requested = r.delegation ?? "tiers";
   const touched = requested === "roles" || cfg?.roleAgents !== undefined || r.exploration !== undefined
     || r.run !== undefined || r.workRoots !== undefined
-    || r.repoParents !== undefined || r.repoDepth !== undefined || r.repoExclude !== undefined;
+    || r.repoParents !== undefined || r.repoDepth !== undefined || r.repoExclude !== undefined
+    || r.repoApprovalDays !== undefined;
   const inert = host === "v1" && touched;
   if (inert && !warnedRolesInertOnV1) {
     warnedRolesInertOnV1 = true;
@@ -3260,6 +3278,7 @@ export function resolveRolesRouting(
     repoParents: Object.freeze([...(r.repoParents ?? [])]),
     repoDepth: r.repoDepth ?? DEFAULT_REPO_DEPTH,
     repoExclude: Object.freeze([...(r.repoExclude ?? [])]),
+    repoApprovalDays: r.repoApprovalDays ?? DEFAULT_REPO_APPROVAL_DAYS,
     inert,
   });
 }

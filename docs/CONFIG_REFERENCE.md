@@ -1093,7 +1093,8 @@ Fully resolved defaults (parsed by a test and compared with `resolveRolesRouting
   "workRoots": [],
   "repoParents": [],
   "repoDepth": 2,
-  "repoExclude": []
+  "repoExclude": [],
+  "repoApprovalDays": 14
 }
 ```
 

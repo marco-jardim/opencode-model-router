@@ -303,6 +303,25 @@ export function sanitizeRepoDepth(value: unknown): Sanitized<number> {
   };
 }
 
+/** Days an approval of a repository outside the parents lasts after its last use (global only). */
+export const DEFAULT_REPO_APPROVAL_DAYS = 14;
+/** Hard cap: an approval never lasts longer than this many days after it was given, used or not. */
+export const REPO_APPROVAL_CAP_DAYS = 90;
+
+export function sanitizeRepoApprovalDays(value: unknown): Sanitized<number> {
+  if (value === undefined) return { value: undefined, issues: [] };
+  if (typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= REPO_APPROVAL_CAP_DAYS) {
+    return { value, issues: [] };
+  }
+  return {
+    value: undefined,
+    issues: [{
+      path: "routing.repoApprovalDays",
+      message: `routing.repoApprovalDays must be an integer from 1 to ${REPO_APPROVAL_CAP_DAYS} (got ${show(value)}); ignored`,
+    }],
+  };
+}
+
 export function sanitizeRoleAgents(value: unknown): Sanitized<Record<string, RoleAgentCustomisation>> {
   const issues: RolesIssue[] = [];
   if (value === undefined) return { value: undefined, issues };
@@ -487,6 +506,7 @@ export function collectRolesIssues(rawRouting: unknown, rawRoleAgents: unknown):
     ...sanitizeRepoParents(r.repoParents).issues,
     ...sanitizeRepoDepth(r.repoDepth).issues,
     ...sanitizeRepoExclude(r.repoExclude).issues,
+    ...sanitizeRepoApprovalDays(r.repoApprovalDays).issues,
     ...sanitizeRoleAgents(rawRoleAgents).issues,
   ];
 }

@@ -16,10 +16,12 @@ import {
 } from "../../src/router/config";
 import { inspect } from "node:util";
 import {
+  collectRolesIssues,
   narrowRoleSpec,
   sanitizeDelegation,
   sanitizeExploration,
   sanitizeRoleAgents,
+  sanitizeRepoApprovalDays,
   sanitizeRepoDepth,
   sanitizeRepoExclude,
   sanitizeRepoParents,
@@ -27,7 +29,9 @@ import {
   sanitizeWorkRoots,
   repoParentProblem,
   workRootProblem,
+  DEFAULT_REPO_APPROVAL_DAYS,
   DEFAULT_RUN_COMMANDS,
+  REPO_APPROVAL_CAP_DAYS,
 } from "../../src/router/roles-config";
 import {
   SHIPPED_ROLE_SPECS,
@@ -205,6 +209,38 @@ describe("routing.repoParents / repoDepth / repoExclude (cross-repo, P1.1)", () 
   });
 });
 
+describe("routing.repoApprovalDays (cross-repo, P4.1)", () => {
+  it("has a default of 14 and a cap of 90", () => {
+    expect([DEFAULT_REPO_APPROVAL_DAYS, REPO_APPROVAL_CAP_DAYS]).toEqual([14, 90]);
+  });
+  it.each([1, 14, 90])("sanitizeRepoApprovalDays accepts %j", (n) => {
+    expect(sanitizeRepoApprovalDays(n)).toEqual({ value: n, issues: [] });
+  });
+  it.each([0, 91, 1.5, "14", null, -1, Number.NaN, Number.POSITIVE_INFINITY])("sanitizeRepoApprovalDays refuses %j", (n) => {
+    const r = sanitizeRepoApprovalDays(n);
+    expect(r.value).toBeUndefined();
+    expect(r.issues).toHaveLength(1);
+    expect(r.issues[0]!.path).toBe("routing.repoApprovalDays");
+    expect(r.issues[0]!.message).toContain("routing.repoApprovalDays must be an integer from 1 to 90");
+    expect(r.issues[0]!.message).toContain("ignored");
+  });
+  it("sanitizeRepoApprovalDays leaves an absent value alone", () => {
+    expect(sanitizeRepoApprovalDays(undefined)).toEqual({ value: undefined, issues: [] });
+  });
+  it("validateConfig keeps a good value, drops a bad one, and collectRolesIssues reports it", () => {
+    expect(validateConfig(validRaw({ routing: { repoApprovalDays: 30 } })).routing?.repoApprovalDays).toBe(30);
+    expect(validateConfig(validRaw({ routing: { repoApprovalDays: 91 } })).routing?.repoApprovalDays).toBeUndefined();
+    expect(validateConfig(validRaw({ routing: { repoApprovalDays: "7" } })).routing?.repoApprovalDays).toBeUndefined();
+    expect(collectRolesIssues({ repoApprovalDays: 0 }, undefined).map((i) => i.path)).toEqual(["routing.repoApprovalDays"]);
+    expect(collectRolesIssues({ repoApprovalDays: 1 }, undefined)).toEqual([]);
+  });
+  it("resolveRolesRouting applies the default and keeps a set value", () => {
+    expect(resolveRolesRouting(validateConfig(validRaw()), "v2").repoApprovalDays).toBe(14);
+    expect(resolveRolesRouting(validateConfig(validRaw({ routing: { repoApprovalDays: 1 } })), "v2").repoApprovalDays).toBe(1);
+    expect(resolveRolesRouting(validateConfig(validRaw({ routing: { repoApprovalDays: 90 } })), "v2").repoApprovalDays).toBe(90);
+  });
+});
+
 describe("roleAgents", () => {
   it("keeps good fields and drops bad ones per field and per entry", () => {
     const r = sanitizeRoleAgents({
@@ -279,6 +315,7 @@ describe("resolveRolesRouting", () => {
     ["repoParents", { repoParents: ["D:/git"] }],
     ["repoDepth", { repoDepth: 3 }],
     ["repoExclude", { repoExclude: ["D:/git/x*"] }],
+    ["repoApprovalDays", { repoApprovalDays: 30 }],
   ])("is inert on v1 with one notice when only %s is set", (_name, routing) => {
     const warn = vi.fn();
     const cfg = validateConfig(validRaw({ routing }));
@@ -454,6 +491,35 @@ describe("layers (loadConfig)", () => {
     const text = getConfigNotices(project).map((n) => n.message).join("\n");
     expect(text).toContain("routing.repoParents[1]");
     expect(text).toContain("routing.repoDepth must be an integer from 1 to 4");
+    expect(text).not.toContain("unknown routing key");
+  });
+
+  it("strips project repoApprovalDays with a notice; the global value stays (P4.1)", () => {
+    const project = setup(
+      { defaultTier: "fast", routing: { repoApprovalDays: 30 } },
+      { defaultTier: "fast", routing: { repoApprovalDays: 90, margin: 0.2 } },
+    );
+    const cfg = loadConfig(project);
+    expect(cfg.routing?.repoApprovalDays).toBe(30);
+    expect(cfg.routing?.margin).toBe(0.2);
+    const text = getConfigNotices(project).map((n) => n.message).join("\n");
+    expect(text).toContain("routing.repoApprovalDays");
+    expect(text).not.toContain("unknown routing key");
+  });
+
+  it("drops a project-only repoApprovalDays: the default applies", () => {
+    const project = setup(undefined, { defaultTier: "fast", routing: { repoApprovalDays: 1 } });
+    const cfg = loadConfig(project);
+    expect(cfg.routing?.repoApprovalDays).toBeUndefined();
+    expect(resolveRolesRouting(cfg, "v2").repoApprovalDays).toBe(14);
+  });
+
+  it("global layer notices a bad repoApprovalDays and keeps no value", () => {
+    const project = setup({ defaultTier: "fast", routing: { repoApprovalDays: 91 } }, undefined);
+    const cfg = loadConfig(project);
+    expect(cfg.routing?.repoApprovalDays).toBeUndefined();
+    const text = getConfigNotices(project).map((n) => n.message).join("\n");
+    expect(text).toContain("routing.repoApprovalDays must be an integer from 1 to 90");
     expect(text).not.toContain("unknown routing key");
   });
 
