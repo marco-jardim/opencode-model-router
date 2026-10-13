@@ -39,6 +39,17 @@ import { GRADER_REASONS_MAX } from "../../src/verify/checker";
 import { oneLineReason } from "../../src/routing/roles/authority";
 import { PLAN_HELP_LINES } from "../../src/commands/output";
 import { ROUTER_PLAN_ACTIONS } from "../../src/executor/tool";
+import { EXECUTOR_HOME_DIRNAME } from "../../src/executor/paths";
+import { defaultSlotsDir } from "../../src/executor/slots/pool";
+import { EXECUTOR_INSTRUCTIONS_ORDER } from "../../src/executor/instructions";
+import { PLAN_PROVIDER_ORDER } from "../../src/compat/turn-state";
+import { EXECUTOR_DEFAULTS, EXECUTOR_LIMITS, INBOX_ID_PREFIX, QA_ROUND_LIMIT } from "../../src/executor/types";
+import { breakerTrips, INBOX_TEXT_MAX } from "../../src/executor/unattended";
+import { RECOVERY_LIVENESS_MS, RECOVERY_POLL_MS } from "../../src/executor/recovery";
+import {
+  PLAN_TASK_CHECKS_MIN_MS, PLAN_TASK_GRADER_SLACK_MS, PLAN_TASK_TRANSIENT_RERUNS, PLAN_TASK_RERUN_BACKOFF_MS,
+  planTaskChecksBudgetMs, planTaskGraderBudgetMs,
+} from "../../src/verify/plan-task";
 import { CREDENTIAL_ENV_RE } from "../../src/router/run-tools";
 import { APPROVAL_RELOAD_APPLIES, ROLES_RESTART_NOTICE } from "../../src/compat/v2-hooks";
 import { approvalReloadLine } from "../../src/commands/approvals";
@@ -396,7 +407,7 @@ function readRepo(path: string): string | undefined {
 }
 
 // ---------------------------------------------------------------------------
-// Plan executor (OpenCode v2 only, not registered yet): docs/EXECUTOR.md names every `/plan` subcommand, every
+// Plan executor (assembled and registered on OpenCode v2 only): docs/EXECUTOR.md names every `/plan` subcommand, every
 // `router_plan` action and every `routing.executor` leaf key. Removing one from the doc fails these pins.
 // ---------------------------------------------------------------------------
 
@@ -480,7 +491,9 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     expect(flat).toContain("at most `routing.executor.maxAttempts` attempts per task");
     expect(flat).not.toMatch(/retried up to/);
     expect(flat).toContain("a list of commands is added to them, it never replaces them");
-    expect(flat).toContain("A configured `slotsDir` is used verbatim");
+    expect(flat).toContain("A configured `slotsDir` is a root: the executor appends `<planId>`");
+    expect(flat).not.toContain("no `<planId>` is appended");
+    expect(read("src/executor/create.ts")).toMatch(/return root === null \? defaultSlotsDir\(toplevel, planId\) : join\(root, planId\)/);
     expect(flat).not.toMatch(/another live session/);
     // The help lines say the same.
     const helpText = PLAN_HELP_LINES.join("\n");
@@ -506,21 +519,151 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     expect(flat).toContain("when the session has none, the plan the runtime finds for this session");
   });
 
-  it("keeps the Unattended operation, QA loop and Recovery placeholders until Phase 4.2/5.1", () => {
+  it("documents implemented unattended operation, QA and recovery, not placeholders", () => {
     for (const heading of ["## Unattended operation", "## QA loop", "## Recovery"]) {
       const section = sectionOf(doc, heading);
       expect(section, heading).not.toBe("");
-      expect(section, heading).toContain("Phase 4.2/5.1");
-      expect(section, heading).toContain("4.2.6.a");
+      expect(section, heading).not.toMatch(/Placeholder|text for this section arrives/);
     }
+    expect(sectionOf(doc, "## Unattended operation")).toContain("**`F > ratio·N`**");
+    expect(sectionOf(doc, "## QA loop")).toContain("`<phaseId>.FIX<round>-<index>`");
+    expect(sectionOf(doc, "## Recovery")).toContain("**60 s**");
   });
 
-  it("says the executor is v2 only and not registered yet, and OPENCODE_V2.md links to it", () => {
-    expect(doc).toMatch(/not active yet/);
-    expect(doc).toMatch(/\*\*v2 only\*\*/);
+  it("pins v2 registration, unchanged v1 maps, and the OPENCODE_V2.md handoff", () => {
+    const flat = doc.replace(/\s+/g, " ");
+    expect(flat).toContain("assembled and registered on OpenCode v2 only");
+    expect(flat).toContain("OpenCode v1 is unchanged: no executor tool, command or instructions are registered there");
+    expect(doc).not.toMatch(/not active yet|not registered.*yet/);
+    const entry = read("src/index.ts");
+    expect(entry).toContain("...(isV2Host && routerPlan !== undefined ? { router_plan:");
+    expect(entry).toContain("if (isV2Host && planCommand !== undefined)");
+    expect(entry).toContain("opencodeConfig.command.plan =");
+    expect(read("src/executor/create.ts")).toContain('if (context.routerHost === "v1") return undefined;');
+    expect(read("src/v2.ts")).toContain('executor: (host) => createExecutor({ routerHost: "v2", directory }');
+    const v1Golden = read("test/golden/v1-plugin-maps.golden.test.ts");
+    expect(v1Golden).toContain("default and executor/roles configs are byte-identical to the pre-registration v1 maps");
+    expect(v1Golden).toContain("expect(configured).toEqual(defaults)");
+    for (const surface of ["tools.json", "commands.json", "router-help.txt"]) expect(v1Golden).toContain(`v1-plugin-maps.${surface}`);
     const v2 = read("docs/OPENCODE_V2.md");
     expect(v2).toContain("(EXECUTOR.md)");
-    expect(sectionOf(v2, "## Plan executor")).toMatch(/not active yet/);
+    const section = sectionOf(v2, "## Plan executor").replace(/\s+/g, " ");
+    expect(section).toContain("The `router_plan` tool, the `/plan` command and the executor instructions are registered on OpenCode v2 only; OpenCode v1's tool, command and help maps are unchanged.");
+    expect(section).not.toMatch(/not active yet|a later phase registers/);
+  });
+
+  it("quotes every assembly unavailable reason from create.ts", () => {
+    const source = read("src/executor/create.ts");
+    const reasons = [
+      ...[...source.matchAll(/\babsent\("([^"\n]+)"\)/g)].map((m) => m[1]!),
+      // prepareExecutor's absences only: the lease port's acquire results also say `ok: false, reason:` but carry a message.
+      ...[...source.matchAll(/ok: false, reason: "([^"\n]+)" \}/g)].map((m) => m[1]!),
+    ];
+    expect(reasons).toEqual([
+      "routing.delegation must be roles at start", "routing.leases.mode must be enforce", "no plan-task verifier",
+      "enforcement.verify.require is never", "the lease registry is not available", "the child runner is not available",
+      "another plan executor already owns this process", "not a git repository",
+    ]);
+    const assembly = sectionOf(doc, "## Assembly and lifecycle");
+    for (const reason of reasons) expect(assembly, reason).toContain(`\`${reason}\``);
+    const prefixes = [...source.matchAll(/(?:absent\(|reason: )`((?:assembly|repository discovery) failed: )\$\{/g)].map((m) => m[1]!);
+    expect(prefixes).toEqual(["assembly failed: ", "repository discovery failed: "]);
+    for (const prefix of prefixes) expect(assembly).toContain(`\`${prefix}<error>\``);
+    expect(source).toContain("reason = `the plan executor is not available: ${why}`");
+    expect(assembly).toContain("`the plan executor is not available: <reason>`");
+    expect(source).toContain('let reason = "the plan executor is not available: not initialized"');
+    expect(source).toContain('access.clear("disposed")');
+    expect(assembly).toContain("the reason is `not initialized`; after disposal it is `disposed`");
+  });
+
+  it("pins the executor home, default slots path and instructions provider registration/order", () => {
+    expect(EXECUTOR_HOME_DIRNAME).toBe("omr-executor");
+    expect(defaultSlotsDir("D:\\repo", "p-test")).toBe("D:\\.omr-slots\\p-test");
+    expect(doc).toContain("`<git common dir>\\omr-executor`");
+    expect(doc).toContain('`EXECUTOR_HOME_DIRNAME = "omr-executor"`');
+    expect(doc).toContain("`<drive>:\\.omr-slots\\<planId>`");
+    expect(PLAN_PROVIDER_ORDER).toBe(60);
+    expect(EXECUTOR_INSTRUCTIONS_ORDER).toBe(61);
+    expect(read("src/compat/v2-hooks.ts")).toContain("...createExecutorInstructionsProvider(built.runtime), order: EXECUTOR_INSTRUCTIONS_ORDER");
+    expect(sectionOf(doc, "## Assembly and lifecycle").replace(/\s+/g, " ")).toContain("per-turn state provider at order 61");
+  });
+
+  it("documents the trusted slots-root work allowance without widening a role dispatch", () => {
+    const workRoots = sectionOf(read("docs/ROLES.md"), "## Work roots").replace(/\s+/g, " ");
+    expect(workRoots).toContain("role agents with local actions may work under the trusted slots root");
+    expect(workRoots).toContain("`routing.workRoots` is not needed for it, including slots created after registration");
+    expect(workRoots).toContain("each child still works only in its own validated work root");
+    expect(workRoots).toContain("The executor home (`<git common dir>\\omr-executor`) is denied");
+    expect(workRoots).toContain("A project-local `slotsDir` is ignored");
+    expect(workRoots).toContain("no slots-root allowance is added (fail closed)");
+  });
+
+  it("pins plan-task deadline constants, formulae, shared transient re-runs and backoffs", () => {
+    expect({ PLAN_TASK_CHECKS_MIN_MS, PLAN_TASK_GRADER_SLACK_MS, PLAN_TASK_TRANSIENT_RERUNS, PLAN_TASK_RERUN_BACKOFF_MS }).toEqual({
+      PLAN_TASK_CHECKS_MIN_MS: 600_000, PLAN_TASK_GRADER_SLACK_MS: 60_000,
+      PLAN_TASK_TRANSIENT_RERUNS: 2, PLAN_TASK_RERUN_BACKOFF_MS: [30_000, 60_000],
+    });
+    expect(planTaskChecksBudgetMs(1)).toBe(600_000);
+    expect(planTaskChecksBudgetMs(900_000)).toBe(900_000);
+    expect(planTaskGraderBudgetMs(1, "heavy", 300_000)).toBe(360_000);
+    expect(planTaskGraderBudgetMs(900_000, "heavy", 300_000)).toBe(900_000);
+    const verification = sectionOf(doc, "## Verification of plan tasks").replace(/\s+/g, " ");
+    expect(verification).toContain("`max(gateBudgetMs, 600000)`");
+    expect(verification).toContain("`max(gateBudgetMs, graderTimeoutMs(tier, override) + 60000)`");
+    expect(verification).toContain("`PLAN_TASK_TRANSIENT_RERUNS`: 2");
+    expect(verification).toContain("`PLAN_TASK_RERUN_BACKOFF_MS`: `[30000, 60000]`");
+    expect(verification).toContain("This allowance is shared across both passes of a mixed block");
+    const source = read("src/verify/plan-task.ts");
+    expect(source).toContain("let reruns = 0;");
+    expect([...source.matchAll(/\blet reruns =/g)]).toHaveLength(1);
+    expect(source).toContain("if (!isTransientPlanTaskResult(res, cut) || reruns >= PLAN_TASK_TRANSIENT_RERUNS) return res;");
+    expect(source).toContain("await sleep(PLAN_TASK_RERUN_BACKOFF_MS[reruns]);");
+    expect(source.indexOf("let reruns = 0;")).toBeLessThan(source.indexOf("const withReruns ="));
+  });
+
+  it("pins the never-deferred plan-task gate in both code and docs", () => {
+    const source = read("src/verify/plan-task.ts");
+    // Required dispatch-gate wiring: modeA/trivial:false cannot skip the gate; accept is awaited directly, not deferred.
+    expect(source).toContain("deps.buildGateDeps(record.orchestratorSessionID, graders, prepared, deadline, false, record.orchestratorSessionID)");
+    expect(source).toMatch(/trivial: false,\s+mode: "modeA"/);
+    expect(source).toContain("await withTimeout(accept(delegation, artefact, gateDeps), deadline.remaining(), \"verification gate\")");
+    expect(source).not.toMatch(/\b(?:deferVerification|deferDispatch|registerPending)\s*\(/);
+    const verification = sectionOf(doc, "## Verification of plan tasks").replace(/\s+/g, " ");
+    expect(verification).toContain("**Plan-task verification is never deferred**, even with `VERIFY:deferred`");
+    expect(verification).toContain("with no pending handle or deferred footer");
+    expect(verification).toContain("**unverifiable result costs an attempt and is a breaker sample**");
+  });
+
+  it("pins the 4.2 thresholds, ranges and X11 breaker equality boundary", () => {
+    expect(INBOX_ID_PREFIX).toEqual({ question: "Q", failure: "F", "usage-limit": "U", landing: "L", flaky: "K", "qa-cap": "R", breaker: "B" });
+    for (const prefix of Object.values(INBOX_ID_PREFIX)) expect(sectionOf(doc, "## Unattended operation")).toContain(`\`${prefix}-\``);
+    expect(INBOX_TEXT_MAX).toBe(4000);
+    expect(EXECUTOR_DEFAULTS.maxAttempts).toBe(3);
+    expect(EXECUTOR_LIMITS.maxAttempts).toEqual([1, 6]);
+    expect(EXECUTOR_DEFAULTS.qaMaxRounds).toBe(3);
+    expect(EXECUTOR_LIMITS.qaMaxRounds).toEqual([1, 8]);
+    expect(EXECUTOR_DEFAULTS.circuitBreaker).toEqual({ failureRatio: 0.4, minAttempts: 5, consecutiveFailures: 3 });
+    expect(EXECUTOR_LIMITS.failureRatio).toEqual([0.1, 1]);
+    expect(EXECUTOR_LIMITS.minAttempts).toEqual([1, 50]);
+    expect(EXECUTOR_LIMITS.consecutiveFailures).toEqual([1, 50]);
+    expect(QA_ROUND_LIMIT).toBe(999);
+    expect({ RECOVERY_LIVENESS_MS, RECOVERY_POLL_MS }).toEqual({ RECOVERY_LIVENESS_MS: 60_000, RECOVERY_POLL_MS: 10_000 });
+    expect(read("src/executor/runtime.ts")).toContain("const PROBATION_INTERRUPT_FAILS = 5;");
+    const recovery = sectionOf(doc, "## Recovery");
+    for (const threshold of ["**60 s**", "**10 s**", "**5 tries**"]) expect(recovery).toContain(threshold);
+    expect(sectionOf(doc, "## Unattended operation")).toContain("**4000 characters plus an ellipsis**");
+    const unattended = sectionOf(doc, "## Unattended operation").replace(/\s+/g, " ");
+    expect(unattended).toContain("default **3**, integer range **1–6**");
+    expect(unattended).toContain("`failureRatio = 0.4` (range **0.1–1**), `minAttempts = 5` and `consecutiveFailures = 3` (both integer ranges **1–50**)");
+    expect(unattended).toContain("**`C ≥ n`**");
+    expect(sectionOf(doc, "## QA loop")).toContain("defaults to **3** (integer range **1–8**)");
+    expect(sectionOf(doc, "## QA loop")).toContain("round **999** offers only `accept`");
+    const sample = (failure: boolean, index: number) => ({ taskId: "1.1", n: index + 1, endedAt: "2026-10-13T00:00:00.000Z", failure });
+    const equality = [true, false, true, false, false].map(sample);
+    expect(breakerTrips(equality, EXECUTOR_DEFAULTS.circuitBreaker).tripped).toBe(false);
+    expect(breakerTrips(Array.from({ length: 15 }, (_, i) => i < 12 && i % 2 === 0).map(sample), EXECUTOR_DEFAULTS.circuitBreaker).tripped).toBe(false);
+    expect(breakerTrips([true, false, true, false, true].map(sample), EXECUTOR_DEFAULTS.circuitBreaker).reason).toBe("ratio");
+    expect(breakerTrips([true, true, true].map(sample), EXECUTOR_DEFAULTS.circuitBreaker).reason).toBe("consecutive");
   });
 
   it("has links that resolve", () => {

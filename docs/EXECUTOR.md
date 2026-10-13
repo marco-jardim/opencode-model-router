@@ -1,8 +1,8 @@
 # Plan executor
 
-> **Status: groundwork, not active yet.** The plan executor is OpenCode **v2 only**. The `router_plan` tool, the `/plan`
-> command and the executor instructions exist in the code, but they are **not registered** yet; a later release wires
-> them. Until then neither the tool nor the command is visible to the model or to the user. On OpenCode v1 the
+> **Status: assembled and registered on OpenCode v2 only.** The `router_plan` tool, the `/plan` command and the executor
+> instructions are registered on v2; running a plan requires the [assembly preconditions](#assembly-and-lifecycle).
+> OpenCode v1 is unchanged: no executor tool, command or instructions are registered there, and the
 > `routing.executor.*` keys are ignored with one notice per process (see
 > [OpenCode v1 fallback](ROLES.md#opencode-v1-fallback) for how v2-only features behave there).
 
@@ -28,7 +28,8 @@ letting a half-finished task touch your checkout. This page describes what it do
   branch stays **always green**: a change that breaks the checks is not kept.
 - **Phase suites with culprit bisection.** When a phase ends, its suite runs (`routing.executor.phaseSuite`). If the
   suite fails, the executor bisects the integrated tasks to find the culprit instead of blaming the whole phase.
-- **QA rounds.** A phase gate can run QA rounds (at most `routing.executor.qaMaxRounds`). See [QA loop](#qa-loop).
+- **QA rounds.** A phase gate runs automatic QA rounds up to `routing.executor.qaMaxRounds`; at the cap the human
+  may accept or request another fix round. See [QA loop](#qa-loop).
 - **Inbox.** When the executor needs a decision from you, it puts an item in the plan's inbox. `/plan inbox` lists the
   open items and `/plan answer <id> <text>` answers one; both use the running (or paused) plan of the session, and
   `--plan <planId>` names another plan.
@@ -36,6 +37,64 @@ letting a half-finished task touch your checkout. This page describes what it do
   only when the checkout is clean (`routing.executor.land`: `ff-when-clean`, or `manual` to leave it to you).
 - **One active plan per process.** A process runs one plan at a time. A plan is owned by the session that runs it; a
   plan owned by another session is refused, and `adopt` takes over a running or paused plan whose session is gone (a plan awaiting approval is never adopted: the user approves it in its own session, or it is compiled again).
+
+## Assembly and lifecycle
+
+The tool and command are registered on **OpenCode v2 only**. The executor is assembled at plugin start only when:
+
+- the project is a git repository;
+- `routing.delegation: "roles"` was selected **at start** (switching from tiers later needs a restart);
+- `routing.leases.mode: "enforce"` is set;
+- a plan-task verifier is available and `enforcement.verify.require` is **not** `"never"`;
+- the host supplies the lease registry and child runner, and no other executor owns the process.
+
+When assembly is unavailable, `/plan` and `router_plan` show
+`the plan executor is not available: <reason>` rather than launching work. The exact reasons are:
+
+| Reason | What to check |
+|---|---|
+| `routing.delegation must be roles at start` | Select roles mode and restart OpenCode. |
+| `routing.leases.mode must be enforce` | Enable enforced file leases. |
+| `no plan-task verifier` | The host must supply the plan-task verification engine. |
+| `enforcement.verify.require is never` | Choose a verification requirement other than `never`. |
+| `not a git repository` | Start in a git repository. |
+| `the lease registry is not available` | The host's lease adapter is missing. |
+| `the child runner is not available` | The host's child runner is missing. |
+| `another plan executor already owns this process` | One executor already holds the process claim. |
+| `repository discovery failed: <error>` | Git common-directory/path discovery failed; the error follows the prefix. |
+| `assembly failed: <error>` | Assembly failed; the error follows the prefix. |
+
+Before initialization the reason is `not initialized`; after disposal it is `disposed`. There is **one executor per
+process**, across plugin instances, and one active plan at a time. Its process claim is released on disposal.
+
+The executor home is **`<git common dir>\omr-executor`** (`EXECUTOR_HOME_DIRNAME = "omr-executor"`), shared by the
+main checkout and linked worktrees. It holds ledgers, slot markers and locks; it is not a task work root. Repository
+discovery creates nothing; state is created when a plan is opened. The slots root is separate: a configured
+`routing.executor.slotsDir` is a **root**, and each plan uses **`<root>\<planId>`**, fixed in its draft at compile.
+The default is **`<drive>:\.omr-slots\<planId>`** on the repository's drive. A repository without a drive-letter
+path has no computed default and must configure `slotsDir`. Slot pools open lazily per plan and do not reopen after
+collection.
+
+The v2 adapter starts the runtime; **recovery runs once at start**, not during assembly. Existing plans reconcile
+their durable state before the first scheduling tick (see [Recovery](#recovery)). Automatic slot garbage collection
+runs once a completed or aborted plan is **quiescent**: no live child or unsettled launch handle, no open integration
+entry, and every passed phase has its tag. A status change alone is not enough; paused plans keep their slots. Manual
+`router_plan action=gc` remains available for finished plans.
+
+Disposal clears tool/command access first, then disposes the runtime (unsubscribes host events, clears runtime timers
+and verifier observations, aborts launcher-owned children, settles work already running, disposes each integration
+queue before closing its ledger writer). It then closes all slot pools, clears settle timers and releases the process
+claim. The adapter disposes runtime then launcher before its background processor; launcher disposal is idempotent.
+
+Plan control belongs to the **root orchestrator**, not an arbitrary child session. `router_plan` admits only a root
+orchestrator session or a bound plan child; unknown parent identity fails closed. `/plan approve` and `/plan adopt`
+are root-only guarded actions with the same bound-plan-child exception. Approval still requires the human's decision
+under `approve: "ask"`; root access is not approval.
+
+While a plan runs, the v2 adapter registers the executor instructions as a **per-turn state provider at order 61**,
+immediately after the plan provider at order 60. They are not inserted into the cached system prompt, and no executor
+provider is registered on v1. The instructions tell the orchestrator to report manual tasks, never edit slots or the
+plan file, and never claim completion while the plan is running.
 
 ## `/plan` command
 
@@ -82,6 +141,54 @@ answer text of `/plan answer` is taken as typed, apostrophes included.
 | `export` | `planId` | Returns the plan's ledger as text. |
 | `purge` | `planId` | Removes a completed or aborted plan: slots, `omr/<planId>/` refs and ledger. |
 
+## Verification of plan tasks
+
+Plan tasks use the same dispatch verification engine as `router_verify`: the definition of done (DoD), scope and check
+placements, change observation, deterministic checks, independent grader, timeouts and caveats. A task's
+`[acceptance]` block supplies its DoD; a task without an `[acceptance]` block gets the inferred DoD from its text and
+title, not an unchecked pass.
+
+The **base is the slot reset commit** captured before launch; the **candidate is the slot HEAD** after the router
+commits the child's changes. Before the gate, HEAD must be on the task branch and the base must be an ancestor of the
+candidate. Checks see a fresh snapshot after `cleanForChecks`. The changed-file set is the union of observed files and
+the committed diff from base to candidate (including renames), not just the files the child reports.
+
+**Plan-task verification is never deferred**, even with `VERIFY:deferred`: the required gate runs synchronously in
+the slot before integration, with no pending handle or deferred footer. A mixed acceptance block is graded in two
+passes: deterministic checks first, then, only after a check pass, the grader judges the criteria. Both must pass; a
+check failure dispatches no grader.
+
+The independent grader judges the **child's final text**, trimmed, scrubbed and capped at 32000 characters; if it is
+empty or unavailable, it judges the router's fixed commit description instead. The producer is identified by its
+**role agent**, not the task's routed fast/medium/heavy tier. A role name is unknown on the grader's tier ladder, so
+it selects the top tier (`heavy` on the shipped ladder), never a cheaper grader based on the task's routed tier. The
+grader is a child of the plan's orchestrator and runs in the verification scope. R11 lineage is skipped: each attempt
+starts from a fresh slot reset rather than reusing an earlier attempt's verdict.
+
+The gate deadlines are:
+
+| Pass | Deadline in milliseconds |
+|---|---|
+| Checks | `max(gateBudgetMs, 600000)` (`PLAN_TASK_CHECKS_MIN_MS`: 600000, ten minutes) |
+| Grader | `max(gateBudgetMs, graderTimeoutMs(tier, override) + 60000)` (`PLAN_TASK_GRADER_SLACK_MS`: 60000, one minute of slack) |
+
+Here `gateBudgetMs` is the resolved verification gate budget and `override` is
+`enforcement.verify.graderTimeoutMs`. A timeout aborts the gate and interrupts its graders. A transient unverifiable
+result (a retryable verdict, or `grader dispatch failed:`) gets at most **two internal re-runs**
+(`PLAN_TASK_TRANSIENT_RERUNS`: 2), with **30 s then 60 s** backoff (`PLAN_TASK_RERUN_BACKOFF_MS`: `[30000, 60000]`).
+This allowance is shared across both passes of a mixed block; a real fail is not internally re-run. Once returned to
+the runtime, an **unverifiable result costs an attempt and is a breaker sample**, just like a failed verification.
+Non-strict acceptance of an unverifiable dispatch does not turn a plan task into a pass.
+
+Restart fallbacks **fail closed**. Without the pre-launch observation, the fallback accepts only a readable reset
+commit with no child commits (the router's own commit, identified by its attempt trailer, may sit directly on that
+base). Extra commits or a planned verification perimeter make the result unverifiable: missing observations of other
+repositories are not guessed. An unreadable orchestrator, branch, diff or fresh snapshot likewise cannot pass.
+
+During a task's gate, its own lease holders — the child and `plan:<planId>:<taskId>` — are exempt from the `testsPass`
+lease wait **for that slot tree only**. Other holders, and all holders of any other tree, are still waited for; this
+self-exemption is released when the pass ends.
+
 ## Configuration
 
 The keys live under `routing.executor` in `tiers.json` or an override file. Their types, defaults and ranges are in the
@@ -91,13 +198,13 @@ or not in the listed values logs one warning, and the default applies.
 | Key | Default | Meaning |
 |---|---|---|
 | `routing.executor.maxParallel` | `4` | Tasks that run at once. |
-| `routing.executor.slotsDir` | `null` | Where the slot worktrees live; `null` is computed as `<repo drive>:\.omr-slots\<planId>`. A configured path is used verbatim and shared by every plan (see below). Global override only. |
+| `routing.executor.slotsDir` | `null` | Root for slot worktrees; each plan uses `<root>\<planId>`. `null` is computed as `<repo drive>:\.omr-slots\<planId>`. Global override only. |
 | `routing.executor.approve` | `"ask"` | `ask`: a compiled plan starts only after you approve it, by `/plan approve <planId>` or by approving that plan after seeing its summary; the model never approves on its own. `auto` starts the plan on its own; only the bundled `tiers.json` or the global override can choose it, a project-local override can only set `ask` (see [Trust](#trust)). |
 | `routing.executor.crossPhase` | `"gate"` | `gate`: a phase starts after the previous phase's gate passed; `inferred`: later tasks may start once their own dependencies are met. |
 | `routing.executor.land` | `"ff-when-clean"` | Fast-forward when the checkout is clean, or `manual`. |
 | `routing.executor.batchMax` | `4` | Most tasks dispatched in one batch. |
-| `routing.executor.maxAttempts` | `3` | Attempts per task before it is marked failed. |
-| `routing.executor.qaMaxRounds` | `3` | Most QA rounds of a phase gate. |
+| `routing.executor.maxAttempts` | `3` | Counted attempts per task before exhausted work is parked. |
+| `routing.executor.qaMaxRounds` | `3` | Automatic QA-round cap of a phase gate; further fixes need an inbox answer. |
 | `routing.executor.integrationChecks` | `"auto"` | Extra checks run after each integration. The auto-detected checks always run (the `typecheck` and `test` scripts of `package.json`, and pytest when the project configures it); a list of commands is added to them, it never replaces them. `"auto"` adds nothing. Global override only. |
 | `routing.executor.phaseSuite` | `"auto"` | Suite run at a phase gate (`off` skips it). Global override only. |
 | `routing.executor.provision` | `"auto"` | How a slot worktree is provisioned. Global override only. |
@@ -106,15 +213,14 @@ or not in the listed values logs one warning, and the default applies.
 | `routing.executor.capacityCooldownMs` | `120000` | Cooldown of a model after a capacity error. |
 | `routing.executor.capacityPauseMs` | `900000` | How long the executor pauses when every model is out of capacity. |
 | `routing.executor.wakeDebounceMs` | `5000` | Debounce of the executor's wake-ups. |
-| `routing.executor.circuitBreaker.failureRatio` | `0.4` | Failure ratio from which the circuit breaker opens, once `minAttempts` attempts were made. |
+| `routing.executor.circuitBreaker.failureRatio` | `0.4` | Failure ratio above which the circuit breaker opens, once `minAttempts` attempts were made (strictly `F > ratio·N`). |
 | `routing.executor.circuitBreaker.minAttempts` | `5` | Attempts needed before the failure ratio counts. |
 | `routing.executor.circuitBreaker.consecutiveFailures` | `3` | Consecutive failures that open the circuit breaker on their own. |
 
-`slotsDir` is checked against the repository when a plan is approved: an absolute drive path, on the repository's drive,
-neither inside nor an ancestor of the repository. A configured `slotsDir` is used verbatim: no `<planId>` is appended,
-so every plan uses the same directory. A second plan is refused there while the slot markers of an earlier plan still
-exist in it: plans that share a configured `slotsDir` run one after another, each once the earlier plan's slots are
-cleaned up. Leave `slotsDir` at `null` to give each plan its own directory.
+The resolved plan slots directory is checked when the plan is compiled and approved: an absolute drive path, on the
+repository's drive, neither inside nor an ancestor of the repository. A configured `slotsDir` is a root: the executor
+appends `<planId>`, so plans never share the same plan directory. Leave `slotsDir` at `null` to use
+`<repo drive>:\.omr-slots\<planId>`.
 
 ## Trust
 
@@ -131,12 +237,103 @@ looser value from a project file does not apply. The rule is spelled out in
 
 ## Unattended operation
 
-_Placeholder._ The text for this section arrives with Phase 4.2/5.1 (handoff 4.2.6.a).
+The executor keeps independent work moving when one task needs help. `ESCALATE:` or an ambiguous child result parks
+that task with a blocking question; exhausted retries or repeatedly unparsable QA output park it with a blocking
+failure. Parking releases its slot and file leases. Pending dependents become blocked (directly `dep-parked`,
+transitively `dep-blocked`); unrelated tasks may still run. Answering the task's park item makes it ready again and
+passes the answer into its next attempt's context. Dependents become ready only once their dependency edges are
+satisfied, not merely because someone answered a question.
+
+Use `/plan inbox` to see open items and `/plan answer <id> <text>` to answer them (or add `--plan <planId>`). Inbox ids
+have a prefix and a plan-wide increasing number, for example `Q-1`:
+
+| Kind | Prefix | Meaning |
+|---|---|---|
+| Question | `Q-` | A decision or clarification is needed. |
+| Failure | `F-` | A task or executor operation needs intervention. |
+| Usage limit | `U-` | Capacity/usage-limit intervention. |
+| Landing | `L-` | Landing needs attention. |
+| Flaky | `K-` | A flaky check, excluded from breaker samples. |
+| QA cap | `R-` | QA hit its cap, or a finding was explicitly deferred. |
+| Breaker | `B-` | A phase's circuit breaker opened. |
+
+Raised inbox text is bounded to **4000 characters plus an ellipsis** when truncated. An identical open item (same
+kind, task and bounded text) is not raised twice. The orchestrator answers only with the human's answer or with text
+the plan already states; it must not invent approval or a decision.
+
+Only `succeeded` and `failed` attempts consume `maxAttempts` (default **3**, integer range **1–6**). Capacity, lost
+and interrupted outcomes do not. A fail or unverifiable verification verdict is a failure sample, as is a systemic
+post-child commit failure (including missing git identity or no changes when writes were declared). Flaky attempts
+are excluded from the breaker. Samples are rebuilt from the ledger, per phase, using only attempts ended after its
+newest breaker item; answering that item does not reopen the old sample window.
+
+The breaker has two independent rules (X11), where `N` is the sample count, `F` the number of failures and `C` the
+trailing consecutive failures:
+
+- Ratio: once `N ≥ minAttempts`, open only when **`F > ratio·N`**, not at equality (a floating-point epsilon protects
+  the equality boundary).
+- Consecutive: open when **`C ≥ n`**, where `n = consecutiveFailures`, regardless of `minAttempts`.
+
+Defaults are `failureRatio = 0.4` (range **0.1–1**), `minAttempts = 5` and `consecutiveFailures = 3` (both integer
+ranges **1–50**). Opening pauses that phase and creates one critical `B-` item; other independent phases are not
+paused by that item. Answering it unpauses the phase only when no other open critical item belongs to that phase.
 
 ## QA loop
 
-_Placeholder._ The text for this section arrives with Phase 4.2/5.1 (handoff 4.2.6.a).
+A phase QA task returns a JSON report. The parser uses the **last fenced `json` block** of the final answer, or the
+whole answer if none exists. The top-level object has only `findings`; each finding has exactly `id`, `severity`,
+`files`, `problem` and `fix` (no additional fields):
+
+```json
+{"findings":[{"id":"QA-1","severity":"major","files":["src/example.ts"],"problem":"Describe the defect","fix":"Describe the correction"}]}
+```
+
+An empty `findings` array is clean. Ids are 1–64 characters, start with a letter or digit, and otherwise contain only
+letters, digits, `.`, `_` or `-`. `problem` is non-empty, `fix` may be empty, and `files` is an array of non-empty
+strings (the array may be empty). Severities are `blocking`, `critical`, `major`, `minor` and `nit`.
+
+`qaMaxRounds` defaults to **3** (integer range **1–8**). With another round available, rounds 1–2 fix every finding;
+from round 3 only `blocking`, `critical` and `major` are fixed. Minor/nit findings then become closed informational
+`R-` items with answer `deferred`. At the configured cap, minor/nit findings alone pass and are deferred; any blocking
+severity instead pauses the phase with a critical `R-` item. `/plan answer <id> accept` accepts and records the
+remaining findings as deferred, passing the gate; `fix` creates another fix/re-review round. Human-authorised `fix`
+can extend beyond the configured cap, but round **999** offers only `accept`.
+
+Findings with overlapping normalised repository-relative file paths are grouped into one fix task with the union of
+those paths as its Writes. Absolute paths, empty paths and `..` segments are not usable file targets. Findings without
+a usable file form a separate file-less group, which runs after the file-backed fixes and must request any lease it
+needs. A round has at most **999** fix groups (overflow merges into the last file-backed group). Fix ids are
+`<phaseId>.FIX<round>-<index>`; the next review is `<phaseId>.QA<round+1>` and depends on all fixes. A phase's
+`<phaseId>.FIX` template supplies the fix route, verification and acceptance when present; otherwise fixes use
+`implementer`, pinned `medium`, with required verification. Re-reviews retain the original review instructions and
+previous findings without recursively duplicating prior review text.
+
+The first unparsable QA result fails the attempt and counts toward retries; the second parks the task with a blocking
+`F-` item. It never silently passes the gate.
 
 ## Recovery
 
-_Placeholder._ The text for this section arrives with Phase 4.2/5.1 (handoff 4.2.6.a).
+At start the recovery service scans running and paused plans for this repository, then the runtime reconciles their
+durable ledgers before scheduling. A plan from another repository is passive: this process does not recover, resume
+or tick it. A live writer lock is not taken over. When several plans could run, a running plan is chosen before a
+paused one, then by plan id; the others stay passive rather than launching a second plan.
+
+Recovery uses evidence, not a guess that an old child stopped. A recorded child must carry the matching launch header
+(plan, task, attempt and nonce), and a slot marker must name that plan and task. A child is finished only when its
+context ends with an explicit terminal `idle` entry **with an outcome**; `idle` alone is not completion. A live child
+is adopted and rebound to its role, grant and slot work root. A missing or mismatching child is lost; orphans still
+running for this plan are interrupted. A dispatched attempt with no child is requeued immediately.
+
+Unknown liveness enters a **60 s** probation window, polled every **10 s**. A host event or changed context proves
+life; an explicit terminal entry is processed as a result. A silent child past the deadline is interrupted before its
+slot is reset and its attempt requeued as lost. If interruption fails **5 tries**, one blocking failure item is raised
+and the task keeps waiting; the executor does not reset a slot a child might still be writing.
+
+Completed or verifying tasks are reverified; verified tasks are re-enqueued; an integrating task resumes the serial
+integration queue. The router's attempt trailer prevents recovery from making a duplicate commit. Gates, capacity
+state, leases, blocked dependencies and missed breaker failures are rebuilt from durable state before the first tick.
+The verification fallback after a restart remains [fail closed](#verification-of-plan-tasks), so a lost observation
+can cost a counted attempt rather than grant an unchecked pass.
+
+`/plan adopt <planId>` explicitly transfers a running or paused plan when its owning session is gone. It never adopts
+a plan awaiting approval. Recovery and adoption do not turn a compile/run request into approval.

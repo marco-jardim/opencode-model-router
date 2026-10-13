@@ -66,7 +66,7 @@ In the global override file `~/.config/opencode/opencode-model-router.overrides.
 {
   "routing": {
     "delegation": "roles",
-    // only when role dispatches work in git worktrees created after OpenCode started (see Work roots)
+    // only for later-created worktrees outside the trusted executor slots root (see Work roots)
     "workRoots": ["D:/git/my-repo-wt-*"]
   }
 }
@@ -195,10 +195,20 @@ parent's directory.
   trailing dots and spaces and an NTFS `:stream` suffix; a link or junction into `.git` counts).
 - **Registration.** The role agents' max policy allows `external_directory` for the worktree roots git lists when the
   agents are registered, plus the `routing.workRoots` globs (global layer only, default `[]`), never `*`. A worktree
-  created after the plugin started is covered only by a matching `routing.workRoots` glob (or a restart). Roles
-  without local actions (`researcher`) get no `external_directory` rule. When `routing.workRoots` is set and the
+  created after the plugin started outside the trusted executor slots root is covered only by a matching
+  `routing.workRoots` glob (or a restart). Roles without local actions (`researcher`) get no `external_directory`
+  rule. When `routing.workRoots` is set and the
   directory OpenCode started in lies outside every entry (compared in its canonical form), the router runs no
-  `git worktree list` at start. The role agents then get only the `routing.workRoots` globs.
+  `git worktree list` at start. The role agents then get the `routing.workRoots` globs and, when safely resolved, the
+  trusted executor slots-root allowance below.
+- **Executor slots root.** On v2, role agents with local actions may work under the trusted slots root:
+  `routing.executor.slotsDir` from the bundled configuration or global override, or `<repo drive>:\.omr-slots` by
+  default. Each plan uses `<root>\<planId>`. `routing.workRoots` is not needed for it, including slots created after
+  registration. This registered allowance does not widen a dispatch: each child still works only in its own validated
+  work root. The executor home (`<git common dir>\omr-executor`) is denied, even if another directory allowance would
+  cover it. A project-local `slotsDir` is ignored; a repository cannot grant itself an external slots root. If the
+  executor home cannot be resolved, no slots-root allowance is added (fail closed). See
+  [Assembly and lifecycle](./EXECUTOR.md#assembly-and-lifecycle).
 - **Canonical long form.** Write `routing.workRoots` entries in their canonical long spelling: an 8.3 short segment
   (`PROGRA~1`) is refused, because the host compares spellings and a short name can alias another directory.
 - **Over-match.** `*` crosses separators: `D:/git/omr-rta-*` allows every directory starting with `omr-rta-`, nested
@@ -431,10 +441,11 @@ has room for, and when a placement or a v2 tier per-check `cwd=` is refused (a r
 
 **Limits.**
 
-- A worktree outside the parents (for example under `%TEMP%`) is admitted by rule 2, but the registered policy ends in
+- A worktree outside the parents and the trusted executor slots root (for example under `%TEMP%`) is admitted by rule
+  2, but the registered policy ends in
   a catch-all `deny` that the hook-level allow cannot override, so it still needs a `routing.workRoots` glob in long
-  form or a restart; the same holds for a worktree of the session repository created after registration. Creating
-  worktrees below a parent avoids this.
+  form or a restart; the same holds for a worktree of the session repository created after registration outside the
+  trusted slots root. Creating worktrees below a parent or using executor slots avoids this.
 - Changing `routing.repoParents` needs a restart.
 - The role header is built only for a routed role dispatch (not for a delegate's) and names the work root and location
   the router bound; a role still cannot read or write outside its grant.
@@ -546,7 +557,7 @@ file <file> is invalid (<reason>); no approvals apply until it is fixed or remov
 
 - Worktrees of an approved repository outside its main tree are admitted by rule 2 once the repository is bound, but
   the host's directory permission covers only `<path>\*`, so they still need a `routing.workRoots` glob or a restart
-  (Q7), as for any worktree outside the parents.
+   (Q7), as for any worktree outside the parents and the trusted executor slots root.
 - The root commits change on an orphan-branch checkout, a deepened shallow clone or rewritten history; the approval is
   then lost and must be given again.
 - At most 32 approvals and 256 KiB. Two OpenCode instances writing the store at the same time can lose one write; the

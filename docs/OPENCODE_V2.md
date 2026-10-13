@@ -288,9 +288,8 @@ See [CHANGELOG](../CHANGELOG.md).
 
 The plan executor compiles a written plan into a ledger and runs its tasks in parallel in isolated worktree slots,
 integrating them one at a time into an always-green integration branch. It is **v2 only**: OpenCode v1 ignores the
-`routing.executor.*` keys (one notice per process). **It is not active yet**: the `router_plan` tool, the `/plan`
-command and the executor instructions exist in the code, but a later phase registers them, so a v2 host does not see
-them today. See [EXECUTOR.md](EXECUTOR.md) for the concepts, the `/plan` commands, the `router_plan` actions, the
+`routing.executor.*` keys (one notice per process). The `router_plan` tool, the `/plan` command and the executor instructions are registered on OpenCode v2 only; OpenCode v1's tool, command and help maps are unchanged.
+See [EXECUTOR.md](EXECUTOR.md) for the concepts, the `/plan` commands, the `router_plan` actions, the
 `routing.executor.*` configuration and the trust rules.
 
 ## Validation
