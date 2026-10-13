@@ -25,13 +25,16 @@ const INFO = { id: "ses-c", parentID: "ses-0" };
 function promptFor(h: { planId: string; taskId: string; attempt: number; nonce: string }, shared: string = SHARED): string {
   return formatLaunchPrompt(shared, h, "TASK T1\ndo it");
 }
+/** The v2 adapter's context shape (QA-4.2-2): a terminal `idle` entry carries the host's end outcome. */
 function ctxOf(prompt: string | null, tail: Array<"assistant" | "idle"> = []): HostSessionContext {
   const messages: HostSessionContext["messages"] = [];
   if (prompt !== null) messages.push({ role: "user", text: prompt, outcome: null });
-  for (const r of tail) messages.push({ role: r, text: r === "assistant" ? "done" : null, outcome: null });
+  for (const r of tail) messages.push({ role: r, text: r === "assistant" ? "done" : null, outcome: r === "idle" ? "succeeded" : null });
   return { messages };
 }
 const GOOD = promptFor({ planId: PLAN, taskId: "T1", attempt: 1, nonce: NONCE });
+/** QA-4.2-1: the v2 host's one line before every native subagent's first user message. */
+const HOST_PREAMBLE = "You are a subagent spawned by another session.";
 
 describe("classifyChild (R1 rules 3-6)", () => {
   it("get null is lost", () => {
@@ -74,6 +77,39 @@ describe("classifyChild (R1 rules 3-6)", () => {
     const p = promptFor({ planId: PLAN, taskId: "T1", attempt: 1, nonce: NONCE }, "other");
     expect(classifyChild(INFO, ctxOf(p), "active", EXPECT, SHARED)).toBe("mismatch");
     expect(classifyChild(INFO, ctxOf(p), "active", EXPECT, "other")).toBe("alive");
+  });
+
+  it.each([["LF", "\n"], ["CRLF", "\r\n"]])("QA-4.2-1: the header after the v2 host preamble line (%s) is matched", (_n, eol) => {
+    const p = `${HOST_PREAMBLE}${eol}${GOOD}`;
+    for (const shared of [SHARED, undefined]) {
+      expect(classifyChild(INFO, ctxOf(p, ["assistant"]), "active", EXPECT, shared)).toBe("alive");
+      expect(classifyChild(INFO, ctxOf(p, ["assistant"]), "unknown", EXPECT, shared)).toBe("unknown");
+      expect(classifyChild(INFO, ctxOf(p, ["assistant", "idle"]), "unknown", EXPECT, shared)).toBe("finished");
+    }
+  });
+
+  it("QA-4.2-1: only that exact one line is stripped", () => {
+    for (const p of [
+      `${HOST_PREAMBLE}\n\n${GOOD}`, `${HOST_PREAMBLE}\r\n\r\n${GOOD}`, `${HOST_PREAMBLE} ${GOOD}`, `x${HOST_PREAMBLE}\n${GOOD}`,
+      `${HOST_PREAMBLE}\n${HOST_PREAMBLE}\n${GOOD}`, `note\n${GOOD}`,
+    ]) {
+      expect(classifyChild(INFO, ctxOf(p, ["assistant"]), "active", EXPECT, SHARED)).toBe("mismatch");
+      expect(classifyChild(INFO, ctxOf(p, ["assistant"]), "active", EXPECT)).toBe("mismatch");
+    }
+  });
+
+  it("QA-4.2-2: a last idle without an end outcome is not finished (defensive)", () => {
+    const c: HostSessionContext = { messages: [...ctxOf(GOOD, ["assistant"]).messages, { role: "idle", text: null, outcome: null }] };
+    expect(classifyChild(INFO, c, "unknown", EXPECT)).toBe("unknown");
+    expect(classifyChild(INFO, c, "active", EXPECT)).toBe("alive");
+    expect(classifyChild(INFO, c, "inactive", EXPECT)).toBe("lost");
+  });
+
+  it("QA-4.2-2: a terminal idle is finished whatever its outcome", () => {
+    for (const outcome of ["succeeded", "failed", "interrupted"]) {
+      const c: HostSessionContext = { messages: [...ctxOf(GOOD, ["assistant"]).messages, { role: "idle", text: null, outcome }] };
+      expect(classifyChild(INFO, c, "active", EXPECT)).toBe("finished");
+    }
   });
 });
 
@@ -304,6 +340,28 @@ describe("reconcile: states that can have a child (matrix)", () => {
       expect(await feedOf(r, t)).toMatchObject({ evidence: "alive", action: "adopt", probation: PROBATION });
       expect(r.logs.some((m) => m.startsWith("warn:"))).toBe(true);
     });
+
+    it.each([["LF", "\n"], ["CRLF", "\r\n"]])("QA-4.2-1: a running child behind the v2 host preamble (%s) is adopted, not a mismatch", async (_n, eol) => {
+      for (const [activity, want] of [
+        ["active", { evidence: "alive", action: "adopt", probation: null }],
+        ["unknown", { evidence: "alive", action: "adopt", probation: PROBATION }],
+      ] as const) {
+        const r = rig();
+        r.host.add("ses-T1-1", { ctx: ctxOf(`${HOST_PREAMBLE}${eol}${childPrompt("T1", 1)}`, ["assistant"]), activity });
+        const t = taskNode("T1", { state: "running", slot: "slot-T1", attempts: [attempt(1, { child: "ses-T1-1" })] });
+        const f = await feedOf(r, t);
+        expect(f).toMatchObject({ ...want, mismatch: false, orphans: [] });
+      }
+    });
+
+    it("QA-4.2-2: a child whose context ends in an idle without an outcome is not processed as finished", async () => {
+      const r = rig();
+      const ctx = ctxOf(`${HOST_PREAMBLE}\n${childPrompt("T1", 1)}`, ["assistant"]);
+      ctx.messages.push({ role: "idle", text: null, outcome: null });
+      r.host.add("ses-T1-1", { ctx, activity: "unknown" });
+      const t = taskNode("T1", { state: "running", slot: "slot-T1", attempts: [attempt(1, { child: "ses-T1-1" })] });
+      expect(await feedOf(r, t)).toMatchObject({ evidence: "alive", action: "adopt", probation: PROBATION, mismatch: false });
+    });
   });
 });
 
@@ -428,6 +486,15 @@ describe("reconcile: orphans", () => {
     const r = rig();
     child(r.host, "T1", 1, "alive");
     expect((await feedOf(r, twoAttempts(o))).orphans).toEqual(["ses-T1-1"]);
+  });
+
+  it.each([["LF", "\n"], ["CRLF", "\r\n"]])("QA-4.2-1: a still-running child behind the v2 host preamble (%s) is an orphan", async (_n, eol) => {
+    const r = rig();
+    r.host.add("ses-T1-1", { ctx: ctxOf(`${HOST_PREAMBLE}${eol}${childPrompt("T1", 1)}`, ["assistant"]), activity: "active" });
+    expect((await feedOf(r, twoAttempts("lost"))).orphans).toEqual(["ses-T1-1"]);
+    const ended = rig();
+    ended.host.add("ses-T1-1", { ctx: ctxOf(`${HOST_PREAMBLE}${eol}${childPrompt("T1", 1)}`, ["assistant", "idle"]), activity: "inactive" });
+    expect((await feedOf(ended, twoAttempts("lost"))).orphans).toEqual([]);
   });
 
   it.each(["succeeded", "failed"] as const)("a closed %s attempt's child is not an orphan", async (o) => {

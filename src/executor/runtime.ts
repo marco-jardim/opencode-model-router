@@ -10,6 +10,7 @@ import {
 } from "./capacity";
 import { expandTask, loadExpansionEnv, type ExpandedTask } from "./expand";
 import { taskBranchName } from "./git";
+import type { PlanRoleBindings } from "./launch";
 import { createQaLoop } from "./qa-loop";
 import {
   RECOVER_TAKEOVER_REASON,
@@ -27,6 +28,7 @@ import {
   executionFailureOutcome,
   formatInboxId,
   hasAttemptsLeft,
+  isBreakerFailure,
   leaseHolderID,
   nextInboxNumber,
   leaseTaskRef,
@@ -404,6 +406,12 @@ export interface RuntimeDeps {
   log(level: "info" | "warn" | "error", msg: string, detail?: JsonValue): void;
   /** Resolved executor configuration used by `compile` (the memo's RuntimeDeps left its source open). */
   config(): ExecutorConfig;
+  /**
+   * QA-4.2-18: the launcher's binding port (the same `PlanRoleBindings` the launcher binds its children through). A child
+   * adopted by recovery is re-bound through it with its task's role, grant and work root; without it (tests that do not
+   * look at bindings) adopted children are not re-bound.
+   */
+  bindings?: PlanRoleBindings;
 }
 
 /** What `RuntimeDeps.collaborators` receives for one plan. */
@@ -542,6 +550,16 @@ interface PlanRt {
   probation: Map<string, ProbationWatch>;
   /** R1a: the poll timer of the probation watch (one per plan), null when no child is on probation. */
   probationTimer: { readonly id: number } | null;
+  /**
+   * QA-4.2-15: child sessions the runtime itself is interrupting (probation deadline, the live child of a lease-held
+   * task); their end is a `lost "restart"` end with the slot reset, never an `unrequested-interrupt` nor a proof of life.
+   */
+  interrupting: Set<string>;
+  /**
+   * QA-4.2-16: tasks whose lease rebuild failed; held (no adopt, commit, verify or enqueue) until a rebuild retry on a
+   * tick or a lease release re-acquires their leases.
+   */
+  leaseHeld: Set<TaskId>;
 }
 
 /** R1a: one child adopted on probation (unknown liveness after a restart). */
@@ -564,6 +582,14 @@ interface ProbationWatch {
 const PROBATION_INTERRUPT_FAILS = 5;
 /** D11: the trailer every task commit carries: `Omr-Attempt: <planId>/<taskId>/<n>/<nonce>`. */
 const ATTEMPT_TRAILER = "Omr-Attempt";
+/** QA-4.2-16: states a failed lease rebuild holds (no commit, verify or enqueue until the leases are back). */
+const LEASE_HELD_STATES: readonly TaskState[] = ["running", "completed", "verifying", "verified"];
+/** QA-4.2-3: how long closing a plan waits for its integration queue to dispose (a hung queue never blocks a close). */
+const QUEUE_DISPOSE_MS = 10_000;
+/** QA-4.2-14: counter key journaled for each breaker failure fed to `recordAttempt` (labels phaseId, taskId, n). */
+const BREAKER_FED = "breaker-fed";
+/** QA-4.2-13: context of a `completed` task whose slot was lost before its commit (R2 re-provision failed). */
+const SLOT_LOST_BEFORE_COMMIT = "slot lost before commit";
 
 /**
  * Wake reason of the refused plan's one wake (QA-3.1-19). `WakeReason` (types.ts, owned elsewhere) has no `plan-refused`
@@ -745,6 +771,61 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     } catch (e) {
       d.log("warn", "lease release failed", errorText(e));
     }
+  }
+
+  /**
+   * QA-4.2-16: retries the lease rebuild of the tasks a failed rebuild holds (each tick, each lease release). A task whose
+   * leases are back leaves the hold and its held recovery step runs (commit-and-verify, re-verify or enqueue); a task that
+   * left its held states (or its slot) leaves the hold without one.
+   */
+  async function retryHeldLeases(p: PlanRt): Promise<void> {
+    if (p.leaseHeld.size === 0 || p.disposed || p.passive) return;
+    const l = p.writer.ledger;
+    const tasks: Array<{ id: TaskId; slot: string | null; tree: string | null; footprint: Footprint }> = [];
+    for (const id of [...p.leaseHeld].sort()) {
+      const t = own(l, id);
+      if (t === null || t.slot === null || !LEASE_HELD_STATES.includes(t.state)) {
+        p.leaseHeld.delete(id);
+        continue;
+      }
+      let tree: string | null = null;
+      try {
+        tree = (await slotLeaseOf(p, t)).path;
+      } catch {
+        tree = null;
+      }
+      tasks.push({ id, slot: t.slot, tree, footprint: t.footprint });
+    }
+    if (tasks.length === 0) return;
+    let failed: ReadonlyArray<{ taskId: TaskId }>;
+    try {
+      failed = p.leases.rebuild(tasks);
+    } catch (e) {
+      d.log("warn", "lease rebuild retry failed", errorText(e));
+      return;
+    }
+    const still = new Set(failed.map((f) => f.taskId));
+    for (const t of tasks) {
+      if (still.has(t.id) || t.tree === null) continue;
+      p.leaseHeld.delete(t.id);
+      counter(p, "lease-rebuilt", { taskId: t.id });
+      resumeHeldTask(p, t.id);
+    }
+  }
+
+  /** QA-4.2-16: the step a lease hold deferred: commit-and-verify, the verifier again, or the queue. */
+  function resumeHeldTask(p: PlanRt, taskId: TaskId): void {
+    bg("held task resume", () =>
+      withTask(p, taskId, async () => {
+        if (p.disposed || p.leaseHeld.has(taskId)) return;
+        const t = own(p.writer.ledger, taskId);
+        const n = t === null ? undefined : t.attempts[t.attempts.length - 1]?.n;
+        if (t === null || n === undefined || t.slot === null) return;
+        if (t.state === "completed") await commitAndVerify(p, taskId, n);
+        else if (t.state === "verifying") await verifyAttempt(p, taskId, n, await slotLeaseOf(p, t));
+        else if (t.state === "verified" && !p.latch) p.collab.queue.enqueue([taskId]);
+      }),
+    );
   }
 
   async function slotLeaseOf(p: PlanRt, t: TaskNode): Promise<SlotLease> {
@@ -1000,6 +1081,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
   async function tickOnce(p: PlanRt): Promise<void> {
     if (p.latch || p.disposed) return;
+    // QA-4.2-16: each tick (and so each lease release, which ticks every plan) retries a failed lease rebuild.
+    if (p.leaseHeld.size > 0) await retryHeldLeases(p);
     let l = p.writer.ledger;
     if (l.status === "running") {
       const prom = d.scheduler.promotable(l);
@@ -1265,12 +1348,13 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       void trackChild(
         handle.completion.then((end) => {
           ref.settled = true;
-          return track(processEnd(current(p), taskId, n, end));
+          // QA-4.2-4: an end inside a same-process adopt's window waits for the new attachment.
+          return track(live(p).then((q) => processEnd(q, taskId, n, end)));
         }),
       );
       void track(
         handle.confirmation.then(
-          (c) => onConfirmation(current(p), taskId, n, c),
+          (c) => live(p).then((q) => onConfirmation(q, taskId, n, c)),
           (e: unknown) => {
             d.log("warn", "confirmation rejected", errorText(e));
           },
@@ -1363,7 +1447,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   function launchHooks(p0: PlanRt, taskId: TaskId, n: number, route: TaskRoute): LaunchHooks {
     return {
       async onLateChild(): Promise<"adopt" | "refuse"> {
-        const p = current(p0);
+        const p = await live(p0);
         const l = p.writer.ledger;
         const c = own(l, taskId);
         const a = c === null ? undefined : c.attempts[c.attempts.length - 1];
@@ -1373,8 +1457,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         return ok ? "adopt" : "refuse";
       },
       async onChildCreated(childSessionID: string): Promise<void> {
-        // The task mutex is keyed by plan and task, so it spans attachments; resolve again once it is held.
-        await withTask(current(p0), taskId, async () => {
+        // The task mutex is keyed by plan and task, so it spans attachments; resolve again once it is held. A creation
+        // inside a same-process adopt's window waits for the new attachment first (QA-4.2-4).
+        await withTask(await live(p0), taskId, async () => {
           const p = current(p0);
           const c = own(p.writer.ledger, taskId);
           if (c === null) throw new ExecutorError("E_PLAN_STATE", "task vanished", taskId);
@@ -1548,6 +1633,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     if (a === undefined) return;
     try {
       await p.collab.policy.recordAttempt(t.phase, a);
+      // QA-4.2-14: this failure is evaluated; an activation never feeds it again.
+      if (isBreakerFailure(a)) markFed(p, t.phase, taskId, n);
     } catch (e) {
       d.log("warn", "recordAttempt failed", errorText(e));
     }
@@ -1820,6 +1907,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   async function commitAndVerify(p: PlanRt, taskId: TaskId, n: number): Promise<void> {
     const t = own(p.writer.ledger, taskId);
     if (t === null || t.state !== "completed" || t.slot === null) return;
+    // QA-4.2-16: held until the leases are back (`retryHeldLeases` resumes it).
+    if (p.leaseHeld.has(taskId)) return;
     const slotName = t.slot;
     const commitFailed = async (msg: string): Promise<void> => {
       const applied = await appendIf(p, (cur) => {
@@ -1874,6 +1963,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
    * it for a task left `verifying` (the verdict batch re-checks the state, so the verdict is written once).
    */
   async function verifyAttempt(p: PlanRt, taskId: TaskId, n: number, lease: SlotLease): Promise<void> {
+    // QA-4.2-16: held until the leases are back (`retryHeldLeases` resumes it).
+    if (p.leaseHeld.has(taskId)) return;
     let verdict: Verdict;
     let findings: string;
     let ref: string | null;
@@ -1899,7 +1990,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       });
       if (!ok) return;
       await countAttempt(p, taskId, n);
-      if (!p.latch) p.collab.queue.enqueue([taskId]);
+      if (!p.latch && !p.leaseHeld.has(taskId)) p.collab.queue.enqueue([taskId]);
       return;
     }
     const failed = await appendIf(p, (cur) => {
@@ -2092,15 +2183,32 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
    * or ticked, its refusal journaled (one inbox item) and its orchestrator woken once, so abort, answer, status, pause,
    * purge (and resume, once the slot is free) still reach it.
    */
-  async function attach(writer: LedgerWriter, existingLedger = true): Promise<PlanRt> {
+  async function attach(
+    writer: LedgerWriter,
+    existingLedger = true,
+    onRegistered: () => void = () => undefined,
+    o: { foreign?: boolean } = {},
+  ): Promise<PlanRt> {
     const existing = plans.get(writer.planId);
-    if (existing !== undefined) return existing;
+    if (existing !== undefined) {
+      onRegistered();
+      return existing;
+    }
     const planId = writer.planId;
+    // QA-4.2-17: a plan of another toplevel (not reported eligible by `recover()`) is attached passively: no recovery, no
+    // integration resume, no tick, no refusal item (it is not refused, it is not this process's to run, A-3.1-1).
+    if (o.foreign === true) {
+      const p = await build(writer, true);
+      foreignPlans.add(planId);
+      onRegistered();
+      return p;
+    }
     const st0 = writer.ledger.status;
     const refusedBy = st0 === "running" || st0 === "paused" ? reserve(planId) : null;
     const reserved = (st0 === "running" || st0 === "paused") && refusedBy === null;
     try {
       const p = await build(writer, refusedBy !== null);
+      onRegistered();
       if (refusedBy !== null) {
         await refusePassive(p, refusedBy);
         return p;
@@ -2188,9 +2296,13 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       integrationResumed: false,
       probation: new Map(),
       probationTimer: null,
+      interrupting: new Set(),
+      leaseHeld: new Set(),
     };
-    // Same-process adopt: the launches of the closed attachment stay this plan's (D12; their ends reach `current`).
-    for (const [taskId, h] of carriedHandles.get(planId) ?? []) p.handles.set(taskId, h);
+    // Same-process adopt: the launches of the closed attachment stay this plan's (D12; their ends reach `current`). A
+    // handle that settled in the re-attach window is not carried (QA-4.2-4): its end is processed after the re-attach,
+    // and `reconcile` classifies its task like any other, so it is never counted as tracked.
+    for (const [taskId, h] of carriedHandles.get(planId) ?? []) if (!h.settled) p.handles.set(taskId, h);
     carriedHandles.delete(planId);
     ref.p = p;
     plans.set(planId, p);
@@ -2230,19 +2342,89 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     } catch (e) {
       d.log("warn", "integration resume failed", errorText(e));
       p.integrationResumed = false;
+      await integrationResumeFailed(p, e);
       return;
     }
     p.integrationResumed = report?.halted !== true;
   }
 
+  /**
+   * QA-4.2-6: a rejected `queue.resume()` leaves the lanes latched, so integration would be silently off. As a halt does,
+   * the plan is paused and ONE critical item raised (deduplicated on its text); a user `resume` retries the queue resume.
+   */
+  async function integrationResumeFailed(p: PlanRt, e: unknown): Promise<void> {
+    let paused = false;
+    try {
+      paused = await appendIf(p, (cur) =>
+        cur.status === "running" ? [{ type: "status-changed", from: "running", to: "paused", reason: "integration-resume-failed" }] : [],
+      );
+    } catch (e2) {
+      d.log("error", "integration resume pause failed", errorText(e2));
+    }
+    if (paused) closeIdle(p);
+    counter(p, "integration-resume-failed");
+    await raiseSafe(p, {
+      kind: "failure",
+      severity: "critical",
+      taskId: null,
+      text: `the integration queue of plan ${p.planId} could not resume (${errorText(e).slice(0, 500)}); the plan is paused, resume it once the cause is fixed`,
+      options: [],
+    });
+  }
+
   /** Plans whose ledger `reconcile` may classify: `recover()` reported them eligible (same toplevel), or adopted here. */
   const recoverable = new Set<PlanId>();
+  /** QA-4.2-17: plans of another toplevel `start()` attached passively; never recovered, resumed or ticked here. */
+  const foreignPlans = new Set<PlanId>();
+  /**
+   * Nit (QA-4.2): the `recover()` report of an eligible plan, when it carries the engine's full feeds; its first
+   * `recoverPlan` (in `start`) consumes it instead of reconciling the same ledger a second time.
+   */
+  const recoverReports = new Map<PlanId, ReconcileFeed[]>();
+
+  /** A `recover()` action that is a full engine feed (`createRecoveryService` reports `ReconcileFeed`s). */
+  function isFeed(a: unknown): a is ReconcileFeed {
+    if (typeof a !== "object" || a === null) return false;
+    const x = a as Partial<Record<keyof ReconcileFeed, unknown>>;
+    return typeof x.taskId === "string" && typeof x.action === "string" && Array.isArray(x.orphans) && "probation" in x && "slotValid" in x && "evidence" in x;
+  }
   /** Same-process adopt: the unsettled launch handles of the closed attachment, handed to the new one (D12). */
   const carriedHandles = new Map<PlanId, Array<[TaskId, HandleRef]>>();
 
   /** The live attachment of `p`'s plan: a launch made before a same-process adopt reports to the new one. */
   function current(p: PlanRt): PlanRt {
     return p.disposed ? (plans.get(p.planId) ?? p) : p;
+  }
+
+  /**
+   * QA-4.2-4: a same-process adopt between `closePlan(old)` and the new attachment. The promise settles once the new
+   * attachment is registered (or the adopt failed); child ends, creations and confirmations wait on it, so none goes
+   * through the closed writer.
+   */
+  const reattaching = new Map<PlanId, Promise<void>>();
+  /** The opener of each waiting point in `reattaching`; `dispose` opens them all, so no waiter outlives the runtime. */
+  const reattachOpeners = new Map<PlanId, () => void>();
+
+  /** Opens (and forgets) the re-attach waiting point of `planId`, if any; idempotent. */
+  function openReattach(planId: PlanId): void {
+    const open = reattachOpeners.get(planId);
+    reattachOpeners.delete(planId);
+    reattaching.delete(planId);
+    open?.();
+  }
+
+  /** The live attachment of `p0`'s plan once no re-attach is under way (QA-4.2-4). */
+  async function live(p0: PlanRt): Promise<PlanRt> {
+    let seen: Promise<void> | undefined;
+    for (let r = reattaching.get(p0.planId); r !== undefined && r !== seen; r = reattaching.get(p0.planId)) {
+      seen = r;
+      try {
+        await r;
+      } catch {
+        // the adopt's own caller sees its error; the waiter only needs it settled
+      }
+    }
+    return current(p0);
   }
 
   /**
@@ -2277,8 +2459,10 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     // (7) gates, (8) the breaker of a phase whose failure feed may have been missed
     await recoverGates(p);
     await evaluateBreakers(p);
-    // (9) verified tasks go back to the queue (it dedupes)
-    const verified = Object.values(p.writer.ledger.tasks).filter((t) => t.state === "verified").map((t) => t.id);
+    // (9) verified tasks go back to the queue (it dedupes); a task held by a failed lease rebuild waits for its leases
+    const verified = Object.values(p.writer.ledger.tasks)
+      .filter((t) => t.state === "verified" && !p.leaseHeld.has(t.id))
+      .map((t) => t.id);
     if (verified.length > 0 && !p.latch) p.collab.queue.enqueue(verified);
     // (10)
     try {
@@ -2302,6 +2486,13 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       tracked.add(a.nonce);
       // A launch carried over a same-process adopt keeps its capacity token on the new controller.
       if (!h.settled) forceToken(p, own(l, taskId), h.n);
+    }
+    // Nit (QA-4.2): `start` already reconciled this ledger in `recover()` (no launch of this process was tracked then);
+    // that report is used once instead of a second classification. Any tracked launch makes it stale.
+    const reported = recoverReports.get(p.planId);
+    recoverReports.delete(p.planId);
+    if (reported !== undefined && tracked.size === 0 && recoverable.has(p.planId)) {
+      return [...reported].sort((a, b) => (a.taskId < b.taskId ? -1 : a.taskId > b.taskId ? 1 : 0));
     }
     if (rec === null || rec.reconcile === undefined || !recoverable.has(p.planId)) return [];
     try {
@@ -2370,6 +2561,10 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     const n = f.n;
     const child = f.childSessionID;
     if (n === null || child === null) return;
+    const live = f.evidence !== "finished";
+    // QA-4.2-16: a task whose leases could not be re-taken never adopts a live child (it would write without leases):
+    // the child is interrupted and the task requeued. Only an interrupt that fails keeps it (adopted, still held).
+    if (live && p.leaseHeld.has(t.id) && (await refuseHeldChild(p, t, f, child))) return;
     forceToken(p, t, n);
     if (t.state === "ready") {
       let applied = false;
@@ -2386,9 +2581,16 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       } finally {
         if (!applied) releaseToken(p, t.id, n, "other");
       }
-      if (!applied) return;
+      if (!applied) {
+        // Nit (QA-4.2): row 7 refused: a live (or unknown) child must not keep writing in the slot while the task
+        // relaunches; it is interrupted as an orphan.
+        if (live) await interruptQuiet(child);
+        return;
+      }
     }
     restoreHandle(p, t.id, n, child);
+    // QA-4.2-18: a fresh plugin instance has no binding for the adopted child; re-bind it as the launcher did.
+    await rebindChild(p, t.id, n, child);
     if (f.evidence === "finished") {
       await processEnd(p, t.id, n, endFromContext(child, f.context));
       return;
@@ -2402,6 +2604,66 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     if (have !== undefined && have.n === n && !have.settled) return;
     const gone: ChildEnd = { kind: "lost", childSessionID, reason: "restart", endedAt: d.clock.iso() };
     p.handles.set(taskId, { n, settled: true, completion: Promise.resolve(gone) });
+  }
+
+  /**
+   * QA-4.2-16: the live child of a task held by a failed lease rebuild is interrupted instead of adopted; then the slot's
+   * contents are reset (R4) and a `running` task is requeued (row 18, `lost "restart"`, uncounted), a `ready` one stays
+   * ready. Its relaunch re-takes the leases (launch step 3), so the hold ends. False when the interrupt failed: the child
+   * may still run, so the caller adopts it after all (the task stays held: no commit, verify or enqueue).
+   */
+  async function refuseHeldChild(p: PlanRt, t: TaskNode, f: ReconcileFeed, child: string): Promise<boolean> {
+    p.interrupting.add(child);
+    try {
+      try {
+        await d.hosts.interrupt(child);
+      } catch (e) {
+        if (!interruptSettled(e)) {
+          d.log("warn", `interrupt of the lease-held child ${child} of ${t.id} failed; adopted, still held`, errorText(e));
+          return false;
+        }
+      }
+      counter(p, "lease-held-interrupt", { taskId: t.id });
+      await withTask(p, t.id, async () => {
+        const x = own(p.writer.ledger, t.id);
+        if (x === null || x.state !== t.state) return;
+        if (x.state === "running") await requeueLost(p, x, f);
+        else if (x.slot !== null && f.slotValid !== false) await resetSlotContents(p, x);
+      });
+      if (own(p.writer.ledger, t.id)?.state === "ready") p.leaseHeld.delete(t.id);
+      return true;
+    } finally {
+      p.interrupting.delete(child);
+    }
+  }
+
+  /** QA-4.2-18: binds an adopted child through the launcher's binding port, with its task's role, grant and work root. */
+  async function rebindChild(p: PlanRt, taskId: TaskId, n: number, childSessionID: string): Promise<void> {
+    const b = d.bindings;
+    if (b === undefined) return;
+    try {
+      const l = p.writer.ledger;
+      const t = own(l, taskId);
+      const a = t === null ? undefined : t.attempts.find((x) => x.n === n);
+      if (t === null || a === undefined) return;
+      const slot = await slotLeaseOf(p, t);
+      const env = await loadExpansionEnv(d.git, { toplevel: l.repo.toplevel, slotPath: slot.path, timeoutMs: GIT_TIMEOUT_MS });
+      const x = expandTask({ ledger: p.writer.ledger, taskId, attempt: n, nonce: a.nonce, slot, env });
+      const route = viewOf(p, null).routeOf(t);
+      b.bind({
+        planId: p.planId,
+        taskId,
+        attempt: n,
+        childSessionID,
+        role: t.route.role,
+        agent: route.agent,
+        workRoot: x.workRoot,
+        grant: needsOf(x.routeLine),
+      });
+      counter(p, "child-rebound", { taskId });
+    } catch (e) {
+      d.log("warn", `re-binding the adopted child of ${taskId} failed`, errorText(e));
+    }
   }
 
   /** R1 rule 5: the end of a child whose last message is `idle`; the result is its last assistant message. */
@@ -2527,6 +2789,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     try {
       const got = p.leases.acquireTask({ taskId, tree: lease.path, writes: t0.footprint.writes });
       if (!got.ok) return await undo("leases held elsewhere");
+      // QA-4.2-16: the leases are back on the new tree; a hold from the failed rebuild ends here.
+      p.leaseHeld.delete(taskId);
     } catch (e) {
       return await undo("lease error", e);
     }
@@ -2551,6 +2815,53 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
    */
   async function reprovisionOrRaise(p: PlanRt, t: TaskNode): Promise<boolean> {
     if (await reprovisionSlot(p, t.id)) return true;
+    await raiseSlotLost(p, t);
+    return false;
+  }
+
+  /**
+   * QA-4.2-13: whether a commit of the repository carries attempt `n`'s trailer (D11); null when git cannot tell. On
+   * attempt 1 the task branch is created by the commit itself, so a missing branch usually means "never committed".
+   */
+  async function attemptCommitted(p: PlanRt, taskId: TaskId, n: number): Promise<boolean | null> {
+    const a = own(p.writer.ledger, taskId)?.attempts.find((x) => x.n === n);
+    if (a === undefined) return null;
+    const trailer = attemptTrailer(p.planId, taskId, n, a.nonce);
+    try {
+      const r = await d.git.run(["log", "--all", "--fixed-strings", `--grep=${trailer}`, "--format=%H", "-n", "1"], {
+        cwd: p.writer.ledger.repo.toplevel,
+        timeoutMs: GIT_TIMEOUT_MS,
+      });
+      return r.code === 0 ? r.stdout.trim() !== "" : null;
+    } catch (e) {
+      d.log("warn", `trailer search for ${taskId} failed`, errorText(e));
+      return null;
+    }
+  }
+
+  /**
+   * QA-4.2-13: a `completed` task whose slot was lost before its commit (R2 re-provisioning impossible, no commit with
+   * this attempt's trailer): its work is gone. `completed -> failed` (`commit-failed`, context "slot lost before commit")
+   * and the retry decision, as for any commit failure. Counted: the attempt already closed `succeeded` at row 15, so it
+   * counts toward maxAttempts whatever happens next (an attempt outcome is never rewritten); it is not a breaker failure
+   * (succeeded, no verdict, B1). The stale slot is then given up (R2, as for a ready task).
+   */
+  async function slotLostBeforeCommit(p: PlanRt, taskId: TaskId, n: number): Promise<void> {
+    const applied = await appendIf(p, (cur) => {
+      const c = own(cur, taskId);
+      if (c === null || c.state !== "completed") return [];
+      return [ax(taskId, n, SLOT_LOST_BEFORE_COMMIT), tt(taskId, "completed", "failed", "commit-failed", SLOT_LOST_BEFORE_COMMIT)];
+    });
+    if (!applied) return;
+    p.leaseHeld.delete(taskId);
+    counter(p, "slot-lost-before-commit", { taskId });
+    await countAttempt(p, taskId, n);
+    await retryDecision(p, taskId);
+    await clearBadSlot(p, taskId);
+  }
+
+  /** R2: the blocking item of a task whose slot cannot be re-provisioned and whose work may exist (a human decides). */
+  async function raiseSlotLost(p: PlanRt, t: TaskNode): Promise<void> {
     await raiseSafe(p, {
       kind: "failure",
       severity: "blocking",
@@ -2558,7 +2869,6 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       text: `the slot of ${t.id} (${t.slot ?? "none"}) no longer carries its marker after a restart and it could not be re-provisioned from ${taskBranchName(p.planId, t.id)}; restore the task branch or abort the task`,
       options: [],
     });
-    return false;
   }
 
   /** R4: `reset --hard HEAD` + `clean -fd` in the task's slot (ignored files kept); idempotent, never throws. */
@@ -2578,7 +2888,12 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     const t0 = own(p.writer.ledger, taskId);
     const n = t0?.attempts[t0.attempts.length - 1]?.n;
     if (t0 === null || n === undefined || t0.slot === null) return;
-    if (f.slotValid === false && !(await reprovisionOrRaise(p, t0))) return;
+    if (f.slotValid === false && !(await reprovisionSlot(p, taskId))) {
+      // QA-4.2-13: a completed task whose attempt never committed lost its work with its slot: failed, then retried.
+      if (t0.state === "completed" && (await attemptCommitted(p, taskId, n)) === false) await slotLostBeforeCommit(p, taskId, n);
+      else await raiseSlotLost(p, t0);
+      return;
+    }
     // Re-read: a re-provisioned task has a new slot.
     const t = own(p.writer.ledger, taskId);
     if (t === null || t.slot === null) return;
@@ -2626,28 +2941,61 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     }
   }
 
-  /** Step 8 (B5): each unpaused phase with a failure in its breaker window is evaluated once, by its latest failure. */
+  /**
+   * Step 8 (B5): each unpaused phase with a NEW failure in its breaker window is evaluated once, by its latest failure.
+   * QA-4.2-14: only failures no feed has evaluated yet are new: every feed (`countAttempt`, and this step) journals a
+   * BREAKER_FED counter per failure it fed. A failure that settled while the phase was paused was fed live and could not
+   * trip (B4); evaluating it again after the unpause would trip at a restart with no new failure. A failure whose batch
+   * landed but whose feed a crash missed carries no marker and is fed here. The marker is a metric because the exported
+   * journal keeps only history events (`isHistoryEvent`: metric, integration-step, attempt-verdict, wake) across
+   * snapshots; `attempt-ended` and `phase-paused` are gone once the main journal rotates (the first fix read those).
+   */
   async function evaluateBreakers(p: PlanRt): Promise<void> {
     const l = p.writer.ledger;
+    if (!l.phases.some((ph) => !ph.paused)) return;
+    const fed = new Set<string>();
+    try {
+      for (const e of (await d.store.exportPlan(p.planId)).events) {
+        if (e.type !== "metric" || e.metric.name !== "counter" || e.metric.key !== BREAKER_FED) continue;
+        const { taskId, n } = e.metric.labels;
+        if (taskId !== undefined && n !== undefined) fed.add(`${taskId}#${n}`);
+      }
+    } catch (e) {
+      // Without the journal a failure cannot be told new or already fed: no phase is fed (a missed trip is caught by the
+      // next live failure feed, which evaluates the whole window; a spurious trip would pause the phase for nothing).
+      d.log("warn", "breaker journal read failed; no breaker evaluated at activation", errorText(e));
+      return;
+    }
     for (const ph of l.phases) {
       if (ph.paused) continue;
-      let last: { taskId: TaskId; n: number } | null = null;
+      let fresh: Array<{ taskId: TaskId; n: number }>;
       try {
-        for (const s of breakerSamples(l, ph.id)) if (s.failure) last = s;
+        fresh = breakerSamples(l, ph.id).filter((s) => s.failure && !fed.has(`${s.taskId}#${s.n}`));
       } catch (e) {
         d.log("warn", `breaker samples of ${ph.id} failed`, errorText(e));
         continue;
       }
-      const hit = last;
-      if (hit === null) continue;
+      const hit = fresh[fresh.length - 1];
+      if (hit === undefined) continue;
       const a = own(l, hit.taskId)?.attempts.find((x) => x.n === hit.n);
       if (a === undefined) continue;
       try {
         await p.collab.policy.recordAttempt(ph.id, a);
       } catch (e) {
         d.log("warn", "recordAttempt failed", errorText(e));
+        continue;
       }
+      // One evaluation covers the phase's whole window: every failure it read is fed now.
+      for (const s of fresh) markFed(p, ph.id, s.taskId, s.n);
     }
+  }
+
+  /**
+   * QA-4.2-14: journals that attempt `n` of `taskId` (a breaker failure) was fed to `recordAttempt`. A `counter` metric
+   * is a history event (`isHistoryEvent`), so it survives snapshots, unlike the `attempt-ended`/`phase-paused` events.
+   */
+  function markFed(p: PlanRt, phaseId: string, taskId: TaskId, n: number): void {
+    counter(p, BREAKER_FED, { phaseId, taskId, n: String(n) });
   }
 
   // ---------- R1a probation watch
@@ -2744,10 +3092,14 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       w.lastSig = sig;
     }
     if (d.clock.now() < w.deadlineAt) return;
+    // QA-4.2-15: the interrupt's own `execution.interrupted` is neither a proof of life nor an unrequested interrupt; this
+    // poll step maps it to `lost "restart"` with the slot reset below.
+    p.interrupting.add(sid);
     try {
       await d.hosts.interrupt(sid);
     } catch (e) {
       if (!interruptSettled(e)) {
+        p.interrupting.delete(sid);
         w.interruptFails += 1;
         d.log("warn", `probation interrupt of ${sid} failed (${w.interruptFails})`, errorText(e));
         if (w.interruptFails >= PROBATION_INTERRUPT_FAILS && !w.raised) {
@@ -2763,11 +3115,20 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         return;
       }
     }
-    if (p.probation.get(sid) !== w) return;
+    if (p.probation.get(sid) !== w) {
+      p.interrupting.delete(sid);
+      return;
+    }
     p.probation.delete(sid);
-    const cur = own(p.writer.ledger, w.taskId);
-    if (cur !== null) await resetSlotContents(p, cur);
-    await processEnd(p, w.taskId, w.n, { kind: "lost", childSessionID: sid, reason: "restart", endedAt: d.clock.iso() });
+    try {
+      await withTask(p, w.taskId, async () => {
+        const cur = own(p.writer.ledger, w.taskId);
+        if (cur !== null && cur.state === "running" && openAttempt(cur, w.n)?.childSessionID === sid) await resetSlotContents(p, cur);
+      });
+      await processEnd(p, w.taskId, w.n, { kind: "lost", childSessionID: sid, reason: "restart", endedAt: d.clock.iso() });
+    } finally {
+      p.interrupting.delete(sid);
+    }
   }
 
   /** Step 1 (A3): every task's leases re-taken from its slot; one blocking item per task that cannot get them back. */
@@ -2787,6 +3148,11 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     }
     for (const f of p.leases.rebuild(rows)) {
       counter(p, "lease-rebuild-failed", { taskId: f.taskId });
+      // QA-4.2-16: the task is held (no adopt, commit, verify or enqueue) until a retry gets its leases back.
+      // A ready task is held only for the recovery's adopt decision (its relaunch re-takes the leases itself); the first
+      // retry drops it.
+      const st = own(l, f.taskId)?.state;
+      if (st !== undefined && (st === "ready" || LEASE_HELD_STATES.includes(st))) p.leaseHeld.add(f.taskId);
       try {
         await p.collab.policy.raise({
           kind: "failure",
@@ -2826,7 +3192,29 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     p.lostStreak.clear();
     p.capacityStopped.clear();
     p.wakeRetry.clear();
+    p.interrupting.clear();
+    p.leaseHeld.clear();
+    // QA-4.2-3: the queue's lanes stop and its repo lock goes before the writer closes (adopt, dispose, purge).
+    await disposeQueue(p);
     await p.writer.close();
+  }
+
+  /** QA-4.2-3: `queue.dispose()`, bounded by QUEUE_DISPOSE_MS (a hung queue is logged, never blocks the close). */
+  async function disposeQueue(p: PlanRt): Promise<void> {
+    const box: { h: { readonly id: number } | null } = { h: null };
+    const timeout = new Promise<"timeout">((resolve) => {
+      box.h = d.clock.setTimer(QUEUE_DISPOSE_MS, () => resolve("timeout"));
+    });
+    try {
+      const done = Promise.resolve()
+        .then(() => p.collab.queue.dispose())
+        .then(() => "disposed" as const);
+      if ((await Promise.race([done, timeout])) === "timeout") d.log("warn", `integration queue of ${p.planId} did not dispose in ${QUEUE_DISPOSE_MS} ms`);
+    } catch (e) {
+      d.log("warn", "integration queue dispose failed", errorText(e));
+    } finally {
+      if (box.h !== null) d.clock.clearTimer(box.h);
+    }
   }
 
   async function planFor(planId: PlanId, sessionID: string): Promise<PlanRt> {
@@ -2915,6 +3303,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   /** Terminal event of a child whose launch completion already settled (late adopt): synthesize its end. */
   function lateChildEnd(p: PlanRt, e: HostSessionEvent): void {
     if (e.type !== "execution.completed" && e.type !== "execution.failed" && e.type !== "execution.interrupted") return;
+    // QA-4.2-15: a child the runtime is interrupting ends through the step that interrupted it (`lost "restart"`, slot
+    // reset), never as an `unrequested-interrupt` that would skip the reset and feed the lost streak.
+    if (p.interrupting.has(e.sessionID)) return;
     for (const t of Object.values(p.writer.ledger.tasks)) {
       const a = t.attempts[t.attempts.length - 1];
       if (a === undefined || a.outcome !== null || a.childSessionID !== e.sessionID) continue;
@@ -2953,8 +3344,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       }
       for (const p of plans.values()) {
         if (p.disposed || p.passive) continue;
-        // R1a: any host event of a child on probation proves it alive.
-        if (p.probation.has(sid)) provedAlive(p, sid);
+        // R1a: any host event of a child on probation proves it alive, except the events of an interrupt the runtime sent
+        // itself (QA-4.2-15).
+        if (p.probation.has(sid) && !p.interrupting.has(sid)) provedAlive(p, sid);
         const isOrch = p.writer.ledger.orchestrator.sessionID === sid;
         if (isOrch) {
           if (e.type === "step.started") p.orchIdle = false;
@@ -3021,7 +3413,12 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     for (const t of Object.values(l.tasks)) by.set(t.state, (by.get(t.state) ?? 0) + 1);
     const out: string[] = [`Plan ${l.planId} [${l.status}] ${l.planPath}`];
     // QA-3.1-19: a passively attached (refused) plan says why nothing launches.
-    if (p !== null && p.passive) out.push("Refused: another plan holds this process's active slot; only abort, answer, status, pause, resume and purge apply");
+    if (p !== null && p.passive && foreignPlans.has(p.planId)) {
+      // QA-4.2-17: a plan of another toplevel is attached passively, never run by this process.
+      out.push(`Foreign: this plan belongs to ${l.repo.toplevel}; only abort, answer, status, pause and purge apply here`);
+    } else if (p !== null && p.passive) {
+      out.push("Refused: another plan holds this process's active slot; only abort, answer, status, pause, resume and purge apply");
+    }
     out.push(`Tasks: ${[...by.entries()].map(([s, c]) => `${s} ${c}`).join(", ") || "none"}`);
     for (const ph of l.phases) out.push(`Phase ${ph.id}: gate ${ph.gate}${ph.paused ? " PAUSED" : ""} - ${ph.title}`);
     // A RouteResolver error never breaks the board (QA-3.1-11): that task is listed as unroutable instead.
@@ -3180,12 +3577,22 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       const p = await mine(planId, sessionID);
       // QA-3.1-19: a passively attached (refused) plan is promoted by a resume once the active slot is free.
       const promote = p.passive;
+      if (promote && foreignPlans.has(planId)) {
+        // QA-4.2-17: a plan of another toplevel is never recovered or run by this process.
+        throw new ExecutorError(
+          "E_PLAN_STATE",
+          `plan ${planId} belongs to another repository (${p.writer.ledger.repo.toplevel}); resume it from a session in that repository`,
+          { planId },
+        );
+      }
       if (promote) {
         const other = reserve(planId);
         if (other !== null) await refuseSecondPlan(p.writer, other);
       }
+      // QA-4.2-6: a running plan whose integration resume failed (or halted) is resumed again by the user's `resume`.
+      const retryOnly = !promote && p.writer.ledger.status === "running" && !p.integrationResumed;
       try {
-        await setStatus(p, "paused", "running", "user-resume");
+        if (!retryOnly) await setStatus(p, "paused", "running", "user-resume");
         if (promote) {
           p.passive = false;
           await activate(p, true);
@@ -3213,7 +3620,10 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
           d.log("warn", `checkPhase ${ph.id} failed`, errorText(e));
         }
       }
-      const verified = Object.values(p.writer.ledger.tasks).filter((t) => t.state === "verified").map((t) => t.id);
+      // QA-4.2-16: a task held by a failed lease rebuild is enqueued once its leases are back, not here.
+      const verified = Object.values(p.writer.ledger.tasks)
+        .filter((t) => t.state === "verified" && !p.leaseHeld.has(t.id))
+        .map((t) => t.id);
       if (verified.length > 0) p.collab.queue.enqueue(verified);
       schedule(p);
     },
@@ -3278,23 +3688,44 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       if (recovery === null) throw new ExecutorError("E_PLAN_STATE", "recovery is not available", planId);
       // QA-3.1-19: the single-plan rule is checked (and the slot reserved, QA-3.1-18) BEFORE `recovery.adopt` rewrites
       // the plan: a refused adopt leaves the plan untouched. An unreadable ledger is left to recovery (and to attach).
-      let st: LedgerStatus | null = null;
-      try {
-        st = (await d.store.read(planId)).status;
-      } catch (e) {
-        d.log("warn", `adopt: ledger of ${planId} not readable before recovery`, errorText(e));
+      let st: LedgerStatus | null = plans.get(planId)?.writer.ledger.status ?? null;
+      if (st === null) {
+        try {
+          st = (await d.store.read(planId)).status;
+        } catch (e) {
+          d.log("warn", `adopt: ledger of ${planId} not readable before recovery`, errorText(e));
+        }
+      }
+      // QA-4.2-7 (amendment A-4.2-1): a plan awaiting residue or approval is never adopted.
+      if (st === "awaiting-residue" || st === "awaiting-approval") {
+        throw new ExecutorError(
+          "E_PLAN_STATE",
+          `plan ${planId} is ${st}: a plan awaiting approval is never adopted; the user approves it in its own session or compiles it again`,
+          st,
+        );
       }
       const reserved = st === "running" || st === "paused";
       if (reserved) {
         const other = reserve(planId);
         if (other !== null) throw new ExecutorError("E_PLAN_STATE", refusalText(planId, other), { planId, active: other });
       }
+      // QA-4.2-4: from the close of the old attachment until the new one is attached, child ends, creations and
+      // confirmations wait on this gate instead of reaching the closed writer.
+      // `dispose` opens it too (`reattachOpeners`), so a stuck adopt never keeps a waiter (or `dispose`) waiting.
+      let gated = false;
       try {
         const old = plans.get(planId);
         if (old !== undefined) {
-          // D12: launches this process tracks stay untouched; the new attachment takes their handles over.
-          const live = [...old.handles].filter(([, h]) => !h.settled);
-          if (live.length > 0) carriedHandles.set(planId, live);
+          if (!reattaching.has(planId)) {
+            const gate: { open: () => void } = { open: () => undefined };
+            reattaching.set(planId, new Promise<void>((resolve) => (gate.open = resolve)));
+            reattachOpeners.set(planId, gate.open);
+            gated = true;
+          }
+          // D12: launches this process tracks stay untouched; the new attachment takes their handles over (only the ones
+          // still unsettled when it is built, see `build`).
+          const carried = [...old.handles].filter(([, h]) => !h.settled);
+          if (carried.length > 0) carriedHandles.set(planId, carried);
           await closePlan(old);
         }
         await recovery.adopt(planId, sessionID);
@@ -3307,8 +3738,14 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
           if (errorCode(e) !== "E_LOCK_HELD") throw e;
           writer = await d.store.takeover(planId, d.holder(sessionID), "adopt");
         }
-        await attach(writer);
+        // The gate opens once the new attachment is registered (before its recovery runs: recovery takes task mutexes).
+        await attach(writer, true, () => {
+          if (!gated) return;
+          gated = false;
+          openReattach(planId);
+        });
       } finally {
+        if (gated) openReattach(planId);
         if (reserved) unreserve(planId);
       }
     },
@@ -3361,6 +3798,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     onRetryHook,
 
     async onChildEnd(taskId, attempt, end) {
+      // QA-4.2-4: an end that arrives inside a same-process adopt's window waits for the new attachment.
+      await Promise.allSettled([...reattaching.values()]);
       let target: PlanRt | null = null;
       for (const p of plans.values()) {
         const t = own(p.writer.ledger, taskId);
@@ -3394,10 +3833,21 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       // QA-3.1-1 (memo M46): the runtime feeds itself from the host's session events: provider of each step, capacity
       // signals, the orchestrator's idle flag and the end of a late-adopted child (L12) all come from here.
       if (offEvents === null && !disposed) offEvents = d.hosts.onEvent(onHostEvent);
+      // QA-4.2-17: once `recover()` answered, a running or paused plan it did not report is another toplevel's (or not
+      // eligible): it is attached passively. Without a recovery service (or when `recover()` failed) every plan attaches
+      // as in 3.1.
+      let reported = false;
       if (d.recovery !== null) {
         try {
           // L2: only the plans recover() reports (same toplevel, running or paused) may be taken over and reconciled.
-          for (const r of await d.recovery.recover()) recoverable.add(r.planId);
+          for (const r of await d.recovery.recover()) {
+            recoverable.add(r.planId);
+            // Nit: the engine's report carries full feeds; the plan's first recoverPlan reuses it (one reconcile, not two).
+            const feeds: ReconcileFeed[] = [];
+            for (const a of r.actions) if (isFeed(a)) feeds.push(a);
+            if (d.recovery.reconcile !== undefined && feeds.length === r.actions.length) recoverReports.set(r.planId, feeds);
+          }
+          reported = true;
         } catch (e) {
           d.log("error", "recovery failed", errorText(e));
         }
@@ -3421,15 +3871,19 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
             if (errorCode(err) !== "E_LOCK_HELD" || !recoverable.has(e.planId)) throw err;
             writer = await d.store.takeover(e.planId, holder, RECOVER_TAKEOVER_REASON);
           }
-          await attach(writer);
+          await attach(writer, true, undefined, { foreign: reported && !recoverable.has(e.planId) });
         } catch (err) {
           d.log("warn", `plan ${e.planId} not attached`, errorText(err));
         }
       }
+      // A report no activation consumed (a refused or failed attach) is stale for any later activation.
+      recoverReports.clear();
     },
 
     async dispose() {
       disposed = true;
+      // QA-4.2-4: no waiter of a same-process adopt's window outlives the runtime (dispose waits for their work below).
+      for (const planId of [...reattachOpeners.keys()]) openReattach(planId);
       const off = offEvents;
       offEvents = null;
       if (off !== null) {

@@ -297,13 +297,15 @@ describe("breakerTrips (B2)", () => {
     [...pattern].map((c, i) => ({ taskId: `T${i}`, n: 1, endedAt: at(i), failure: c === "F" }));
 
   it.each([
-    ["SSSFF", true, "ratio"],
+    ["SSSFF", false, null], // 2/5 = 0.4 exactly: the ratio rule is strict (X11)
+    ["FSFSF", true, "ratio"], // 3/5
     ["FSSSS", false, null],
     ["SSFF", false, null],
     ["FFF", true, "consecutive"],
     ["FFSFF", false, null],
     ["FFSFFF", true, "ratio"],
-    ["FSSFSSFSSFSSFSF", true, "ratio"],
+    ["FSSFSSFSSFSSFSF", false, null], // 6/15 = 0.4 exactly
+    ["FSSFSSFSSFSFFSF", true, "ratio"], // 7/15
     ["FSSFSSFSSFSSF", false, null],
   ])("%s -> tripped %s (%s)", (pattern, tripped, reason) => {
     const r = breakerTrips(samples(pattern), pattern === "FFSFF" ? { ...cfg, minAttempts: 50 } : cfg);
@@ -318,9 +320,16 @@ describe("breakerTrips (B2)", () => {
     expect(breakerTrips([], cfg)).toEqual({ tripped: false, reason: null, failures: 0, attempts: 0, consecutive: 0 });
   });
 
-  it("6/15 trips exactly at the ratio (the epsilon guards against float products just above an integer)", () => {
-    expect(breakerTrips(samples("FSSFSSFSSFSSFSF"), cfg).failures).toBe(6);
-    expect(breakerTrips(samples("FSSFSSFSSFSSFSF"), cfg).tripped).toBe(true);
+  it("the ratio rule is strict: 6/15 at exactly 0.4 does not trip (the epsilon absorbs float noise), 7/15 does", () => {
+    expect(breakerTrips(samples("FSSFSSFSSFSSFSF"), cfg)).toMatchObject({ failures: 6, attempts: 15, tripped: false, reason: null });
+    expect(breakerTrips(samples("FSSFSSFSSFSFFSF"), cfg)).toMatchObject({ failures: 7, attempts: 15, tripped: true, reason: "ratio" });
+    expect(breakerTrips(samples("SSSFF"), cfg).tripped).toBe(false);
+    expect(breakerTrips(samples("SSFFF"), cfg)).toMatchObject({ tripped: true, reason: "ratio" });
+  });
+
+  it("the consecutive rule stays C >= consecutiveFailures", () => {
+    expect(breakerTrips(samples("SFF"), cfg).tripped).toBe(false);
+    expect(breakerTrips(samples("SFFF"), cfg)).toMatchObject({ tripped: true, reason: "consecutive", consecutive: 3 });
   });
 });
 
@@ -463,7 +472,7 @@ describe("park", () => {
     const t = T(env, "T1");
     expect(t.state).toBe("parked");
     expect(t.slot).toBeNull();
-    expect(lastAttempt(t)).toEqual(attempt);
+    expect(lastAttempt(t)).toEqual({ ...attempt, context: "3 attempts used" }); // the park marker (QA-4.2-5)
     expect(it1).toMatchObject({ kind: "failure", severity: "blocking", taskId: "T1", text: "3 attempts used" });
     expect(env.released).toEqual(withSlot ? ["T1"] : []);
   });
@@ -712,6 +721,58 @@ describe("answer", () => {
     expect(itemOf(env, "B-1").answer).toBe("go");
   });
 
+  it("QA-4.2-5: answering an unrelated item of a parked task only answers it; the park item still resumes", async () => {
+    const env = await setup({ tasks: [running("T1")] });
+    const before = await env.policy.raise({ kind: "failure", severity: "blocking", taskId: "T1", text: "route failed", options: [] });
+    const q = await env.policy.park("T1", "escalate", "which db?");
+    const after = await env.policy.raise({ kind: "failure", severity: "blocking", taskId: "T1", text: "lease rebuild failed", options: [] });
+    const landing = await env.policy.raise({ kind: "landing", severity: "blocking", taskId: "T1", text: "landing paused", options: [] });
+    for (const other of [after, before, landing]) {
+      expect(await env.policy.answer(other.id, "noted")).toEqual({ resumed: null });
+      expect(env.state("T1")).toBe("parked");
+      expect(lastAttempt(T(env, "T1")).context).toBe("which db?");
+      expect(itemOf(env, other.id).answer).toBe("noted");
+    }
+    expect(await env.policy.answer(q.id, "use postgres")).toEqual({ resumed: "T1" });
+    expect(env.state("T1")).toBe("ready");
+    expect(lastAttempt(T(env, "T1")).context).toBe("use postgres");
+  });
+
+  it("QA-4.2-5: an exhausted park is found by the same marker among later failure items", async () => {
+    const env = await setup({ tasks: [task("T1", "failed", { attempts: [failed(1, 3), failed(2, 4)] })] });
+    const park = await env.policy.park("T1", "exhausted", "2 attempts failed");
+    expect(lastAttempt(T(env, "T1")).context).toBe("2 attempts failed");
+    const later = await env.policy.raise({ kind: "failure", severity: "blocking", taskId: "T1", text: "probation interrupted", options: [] });
+    expect(await env.policy.answer(later.id, "ack")).toEqual({ resumed: null });
+    expect(env.state("T1")).toBe("parked");
+    expect(lastAttempt(T(env, "T1")).context).toBe("2 attempts failed");
+    expect(await env.policy.answer(park.id, "retry")).toEqual({ resumed: "T1" });
+    expect(env.state("T1")).toBe("ready");
+  });
+
+  it("QA-4.2-5: when no item matches the context the oldest open question or failure item is the park item", async () => {
+    const env = await setup({
+      tasks: [task("PK", "parked", { attempts: [failed(1, 5, { context: "rewritten by someone" })] })],
+      inbox: [
+        item("Q-1", { taskId: "PK", text: "original question" }),
+        item("F-2", { kind: "failure", taskId: "PK", text: "later failure" }),
+        item("L-3", { kind: "landing", taskId: "PK", text: "landing" }),
+      ],
+    });
+    expect(await env.policy.answer("F-2", "x")).toEqual({ resumed: null });
+    expect(await env.policy.answer("L-3", "x")).toEqual({ resumed: null });
+    expect(env.state("PK")).toBe("parked");
+    expect(await env.policy.answer("Q-1", "go")).toEqual({ resumed: "PK" });
+    expect(env.state("PK")).toBe("ready");
+    expect(lastAttempt(T(env, "PK")).context).toBe("go");
+  });
+
+  it("QA-4.2-5: a parked task without attempts resumes from its only open item", async () => {
+    const env = await setup({ tasks: [task("PK", "parked")], inbox: [item("Q-1", { taskId: "PK" })] });
+    expect(await env.policy.answer("Q-1", "go")).toEqual({ resumed: "PK" });
+    expect(env.state("PK")).toBe("ready");
+  });
+
   it("writes nothing when the append fails", async () => {
     const env = await setup({ tasks: [running("T1")] });
     const q = await env.policy.park("T1", "escalate", "q");
@@ -741,9 +802,18 @@ describe("unblock", () => {
     expect(["B1", "B2", "B3", "B4", "B5"].map((id) => env.state(id))).toEqual(["ready", "ready", "ready", "blocked", "blocked"]);
   });
 
-  it("a blocked task with no unsatisfied edges (gate edges aside) becomes ready", async () => {
-    const env = await setup({ tasks: [task("B1", "blocked")], edges: [["gate:p1", "B1"]] });
-    expect(await env.policy.unblock()).toEqual(["B1"]);
+  it("a gate edge is judged like the scheduler does (edgeSatisfied): only a passed gate frees the task", async () => {
+    const closedGate = await setup({ tasks: [task("B1", "blocked")], edges: [["gate:p1", "B1"]], gate: "awaiting-qa" });
+    const seq = closedGate.l().seq;
+    expect(await closedGate.policy.unblock()).toEqual([]);
+    expect(closedGate.l().seq).toBe(seq);
+    expect(closedGate.state("B1")).toBe("blocked");
+    const passed = await setup({ tasks: [task("B1", "blocked")], edges: [["gate:p1", "B1"]], gate: "passed" });
+    expect(await passed.policy.unblock()).toEqual(["B1"]);
+    const mixed = await setup({
+      tasks: [task("D1", "done"), task("B1", "blocked")], edges: [["gate:p1", "B1"], ["D1", "B1"]], gate: "passed",
+    });
+    expect(await mixed.policy.unblock()).toEqual(["B1"]);
   });
 
   it("writes nothing when there is nothing to unblock", async () => {
@@ -796,7 +866,8 @@ async function feed(env: Env, idx: number): Promise<{ tripped: boolean }> {
 describe("recordAttempt: when the breaker trips", () => {
   it.each([
     ["FSSSS", 0, false], // 1/5
-    ["SSSFF", 4, true], // 2/5
+    ["SSSFF", 4, false], // 2/5: no trip (strict ratio, X11)
+    ["SFSFF", 4, true], // 3/5
     ["SSFF", 3, false], // 2/4: below minAttempts, run of 2
     ["SFSS", 1, false], // 1/4
     ["FFF", 2, true], // three in a row at N = 3
@@ -821,10 +892,13 @@ describe("recordAttempt: when the breaker trips", () => {
     expect(itemOf(env2, "B-1").text).toContain("3 consecutive");
   });
 
-  it("6/15 trips and 5/13 does not (epsilon, no run of three)", async () => {
+  it("7/15 trips; 6/15 and 5/13 do not (strict ratio, no run of three)", async () => {
+    const seven = await setup({ tasks: breakerTasks("FSSFSSFSSFSFFSF") });
+    expect(breakerSamples(seven.l(), "p1").filter((s) => s.failure)).toHaveLength(7);
+    expect((await feed(seven, 14)).tripped).toBe(true);
     const six = await setup({ tasks: breakerTasks("FSSFSSFSSFSSFSF") });
     expect(breakerSamples(six.l(), "p1").filter((s) => s.failure)).toHaveLength(6);
-    expect((await feed(six, 14)).tripped).toBe(true);
+    expect((await feed(six, 14)).tripped).toBe(false);
     const five = await setup({ tasks: breakerTasks("FSSFSSFSSFSSF") });
     expect((await feed(five, 12)).tripped).toBe(false);
     expect(phaseOf(five).paused).toBe(false);
@@ -836,13 +910,42 @@ describe("recordAttempt: when the breaker trips", () => {
     expect((await feed(env, 2)).tripped).toBe(true);
   });
 
-  it("verification pending, no-changes, lost and interrupted attempts are not samples; a done task with no verdict is a success", async () => {
-    const env = await setup({ tasks: breakerTasks("PNLI") });
+  it("verification pending, lost and interrupted attempts are not samples; a done task with no verdict is a success", async () => {
+    const env = await setup({ tasks: breakerTasks("PLI") });
     expect(breakerSamples(env.l(), "p1")).toEqual([]);
     const done = task("B9", "done", { attempts: [closed(1, { endSec: 20, verdict: null })] });
     const first = task("B8", "failed", { attempts: [closed(1, { endSec: 10, verdict: null }), failed(2, 11)] });
     const env2 = await setup({ tasks: [done, first] });
-    expect(breakerSamples(env2.l(), "p1").map((s) => `${s.taskId}#${s.n}:${s.failure}`)).toEqual(["B8#2:true", "B9#1:false"]);
+    // A-4.2-2: the earlier succeeded attempt without a verdict was followed by a retry, so its commit had failed
+    expect(breakerSamples(env2.l(), "p1").map((s) => `${s.taskId}#${s.n}:${s.failure}`)).toEqual(["B8#1:true", "B8#2:true", "B9#1:false"]);
+  });
+
+  it("A-4.2-2: a succeeded attempt whose task went completed -> failed (commit failure, no changes) is a breaker failure", async () => {
+    const env = await setup({ tasks: breakerTasks("NNN") });
+    expect(breakerSamples(env.l(), "p1").map((s) => s.failure)).toEqual([true, true, true]);
+    expect(breakerTrips(breakerSamples(env.l(), "p1"), env.l().config.circuitBreaker)).toMatchObject({ tripped: true, reason: "consecutive" });
+    expect((await feed(env, 2)).tripped).toBe(true);
+    expect(phaseOf(env).paused).toBe(true);
+    expect(env.l().inbox.filter((x) => x.kind === "breaker")).toHaveLength(1);
+  });
+
+  it("A-4.2-2: a missing git identity costs at most the breaker's threshold, not maxAttempts x tasks", async () => {
+    // every task commit-fails once (maxAttempts x tasks would be many more); two do not trip, the third pauses the phase
+    const two = await setup({ tasks: breakerTasks("NN") });
+    expect((await feed(two, 1)).tripped).toBe(false);
+    expect(phaseOf(two).paused).toBe(false);
+    const three = await setup({ tasks: breakerTasks("NNN") });
+    expect((await feed(three, 2)).tripped).toBe(true);
+    expect(phaseOf(three).paused).toBe(true);
+    expect(three.l().inbox.filter((x) => x.kind === "breaker")).toHaveLength(1);
+    expect(three.l().inbox[0]?.text).toContain("3/3 failed");
+  });
+
+  it("A-4.2-2: a succeeded no-verdict attempt of a task that is not failed (verification pending, done) is not a failure", async () => {
+    const env = await setup({ tasks: [...breakerTasks("PS"), task("B2", "failed", { attempts: [closed(1, { endSec: 3, verdict: null })] })] });
+    expect(breakerSamples(env.l(), "p1").map((s) => `${s.taskId}:${s.failure}`)).toEqual(["B1:false", "B2:true"]);
+    const p = T(env, "B0");
+    expect((await env.policy.recordAttempt("p1", lastAttempt(p))).tripped).toBe(false);
   });
 
   it("a flaky item between the attempt and the next one excludes the attempt", async () => {

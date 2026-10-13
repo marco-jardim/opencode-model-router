@@ -2,9 +2,48 @@
 // (restart-child.ts). Sessions live as one JSON file each, so they survive a killed executor process.
 import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { executorHostContext } from "../../../../src/compat/v2-hooks.js";
 import type { HostSessionContext } from "../../../../src/executor/types.js";
 
-export type StoredMessage = HostSessionContext["messages"][number];
+/** QA-4.2-1: the v2 host's one line before every native subagent's first user message. */
+export const HOST_SUBAGENT_PREAMBLE_LINE = "You are a subagent spawned by another session.\n";
+
+/**
+ * QA-4.2-2: one entry of the v2 host's own session history (`ctx.session.context`), the shape the executor's
+ * `HostSessions.context` adapter reads: entries discriminated by `type`; an assistant step that ended carries `finish` and
+ * `time.completed`, a failed one `error`; a tool turn is its own entry.
+ */
+export interface StoredMessage {
+  type: "user" | "assistant" | "tool" | "synthetic";
+  text?: string;
+  finish?: string;
+  time?: { created: number; completed?: number };
+  error?: { name: string; message?: string };
+  parts?: Array<{ type: "tool"; tool: string; state: { status: "running" | "completed" } }>;
+}
+
+/** The launch prompt as the v2 host stores a native subagent's first user message (with its preamble line). */
+export function userPromptMessage(prompt: string): StoredMessage {
+  return { type: "user", text: `${HOST_SUBAGENT_PREAMBLE_LINE}${prompt}` };
+}
+
+/** A child's answer step that ended (the v2 host's completion markers). */
+export function finishedAnswer(text: string, at: number): StoredMessage {
+  return { type: "assistant", text, finish: "stop", time: { created: at, completed: at } };
+}
+
+/** What the v2 host records when it interrupts a busy child: the step ends with an abort error. */
+export function interruptedStep(at: number): StoredMessage {
+  return { type: "assistant", error: { name: "MessageAbortedError", message: "aborted" }, time: { created: at, completed: at } };
+}
+
+/** A child cut mid-tool-call: its step asked for a tool (`tool-calls`), the tool turn still runs. */
+export function midToolCall(at: number): StoredMessage[] {
+  return [
+    { type: "assistant", text: "", finish: "tool-calls", time: { created: at }, parts: [{ type: "tool", tool: "bash", state: { status: "running" } }] },
+    { type: "tool" },
+  ];
+}
 
 /** How a simulated child behaves (the test's scenario table). */
 export type ChildScript = "normal" | "alive" | "dead" | "finish-while-down";
@@ -120,9 +159,9 @@ export function eventLine(e: unknown): string {
   return `EVENT ${JSON.stringify(e)}`;
 }
 
-/** The host's view of a stored session (`HostSessions.context`). */
+/** The host's view of a stored session (`HostSessions.context`): the v2 adapter's real mapping of the stored history. */
 export function contextOf(s: StoredSession): HostSessionContext {
-  return { messages: s.messages.map((m) => ({ ...m })) };
+  return executorHostContext(s.messages.map((m) => ({ ...m })));
 }
 
 export async function listSessions(root: string): Promise<StoredSession[]> {

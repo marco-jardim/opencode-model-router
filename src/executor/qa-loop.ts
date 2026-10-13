@@ -6,6 +6,7 @@ import {
   type LedgerWriter, type PhaseId, type PhaseRecord, type QaCapChoice, type QaLoop, type TaskId, type TaskNode,
   type Waker,
 } from "./types.js";
+import { pathsOverlap } from "./schedule.js";
 
 /** The part of the executor logger this module uses. */
 export interface QaLoopLog { warn(message: string): void }
@@ -79,7 +80,7 @@ export function createQaLoop(d: QaLoopDeps): QaLoop {
       const fileless = g.writes.length === 0;
       (fileless ? filelessIds : fixIds).push(id);
       const line = template !== null ? template.route.line : `${DEFAULT_FIX_ROUTE_LINE} ${phaseRootToken(l, phase.id)}`;
-      const route = template !== null ? { ...template.route } : { line, role: "implement", tier: "medium" as const, pin: true };
+      const route = template !== null ? { ...template.route } : { line, role: FIX_ROLE_AGENT, tier: "medium" as const, pin: true };
       out.push({
         type: "task-created",
         task: {
@@ -99,7 +100,7 @@ export function createQaLoop(d: QaLoopDeps): QaLoop {
       type: "task-created",
       task: {
         id: reviewId, title: `QA round ${round + 1}`, phase: phase.id, kind: "qa",
-        text: `TASK ${reviewId}: re-review phase ${phase.id} after the round ${round} fixes. Previous findings:\n${bodyJson(previous)}\n${qaTask.text}`,
+        text: `TASK ${reviewId}: re-review phase ${phase.id} after the round ${round} fixes. Previous findings:\n${bodyJson(previous)}\n${REVIEW_INSTRUCTION_MARKER}\n${originalReviewText(qaTask.text)}`,
         subtasks: [], route: { ...qaTask.route }, verify: qaTask.verify, acceptance: qaTask.acceptance,
         footprint: { writes: [], reads: [], confidence: "explicit", sources: ["writes-line"] },
         estimate: { ...qaTask.estimate }, state: "pending", attempts: [], slot: null, branch: null, integrated: null,
@@ -276,6 +277,11 @@ export function decideRound(r: FindingsReport, round: number, qaMaxRounds: numbe
 /** U3: at most this many characters of an inbox text, then an ellipsis. */
 const INBOX_TEXT_LIMIT = 4000;
 const DEFAULT_FIX_ROUTE_LINE = "class=implement d=deterministic tier=medium pin";
+/**
+ * The role agent a default fix task runs as (QA-4.2-11): class `implement` maps to the role KIND `implement`
+ * (CLASS_ROLE_KIND) whose agent is `implementer` (ROLES.md), the one holding edit grants. Not the kind name.
+ */
+export const FIX_ROLE_AGENT = "implementer";
 
 function boundText(s: string): string {
   return s.length > INBOX_TEXT_LIMIT ? `${s.slice(0, INBOX_TEXT_LIMIT)}…` : s;
@@ -321,6 +327,21 @@ function phaseRootToken(l: Readonly<LedgerV1>, phaseId: PhaseId): string {
   }
   const top = l.repo.toplevel;
   return /\s/.test(top) ? `root="${top}"` : `root=${top}`;
+}
+
+/** Separates the previous findings from the original phase review instruction in a re-review task text. */
+export const REVIEW_INSTRUCTION_MARKER = "--- original phase review instruction ---";
+const REREVIEW_HEAD_RE = /^TASK [^\n]*: re-review phase [^\n]* after the round \d+ fixes\. Previous findings:\n/;
+
+/**
+ * The original phase review instruction of a qa task text. A re-review text built by `roundTasks` carries it after
+ * `REVIEW_INSTRUCTION_MARKER`; that part is reused so a later round embeds the instruction once, not the whole
+ * previous task text (which would grow every round). Any other text is the original instruction itself.
+ */
+export function originalReviewText(text: string): string {
+  if (!REREVIEW_HEAD_RE.test(text)) return text;
+  const at = text.indexOf(`\n${REVIEW_INSTRUCTION_MARKER}\n`);
+  return at < 0 ? text : text.slice(at + REVIEW_INSTRUCTION_MARKER.length + 2);
 }
 
 function bodyJson(findings: readonly Finding[]): string {
@@ -395,6 +416,13 @@ export function groupFindings(f: readonly Finding[]): Array<{ writes: string[]; 
     withFiles.push({ finding: x, files });
     for (const p of files) if (!parent.has(p)) parent.set(p, p);
     for (let i = 1; i < files.length; i++) union(files[0] as string, files[i] as string);
+  }
+  // The scheduler serialises tasks whose footprints overlap (case-insensitive, directory prefix): one group, not two.
+  const known = [...parent.keys()].sort();
+  for (let i = 0; i < known.length; i++) {
+    for (let j = i + 1; j < known.length; j++) {
+      if (pathsOverlap(known[i] as string, known[j] as string)) union(known[i] as string, known[j] as string);
+    }
   }
   const comps = new Map<string, { writes: Set<string>; findings: Finding[] }>();
   for (const { finding, files } of withFiles) {

@@ -47,7 +47,10 @@ import {
   type TaskLauncher,
 } from "../../../../src/executor/types.js";
 import { buildDraft, holderOf, taskNode } from "../ledger/builders.js";
-import { activityOf, appendMessages, contextOf, readSession, writeSession, type ChildConfig, type KillPoint } from "./host-store.js";
+import {
+  activityOf, appendMessages, contextOf, finishedAnswer, interruptedStep, midToolCall, readSession, userPromptMessage, writeSession, type ChildConfig,
+  type KillPoint,
+} from "./host-store.js";
 
 /** What `realCollaborators`' queue factory receives (writer, leases, waker, listener; plus the policy and QA loop). */
 export type QueueInput = CollaboratorInput;
@@ -80,7 +83,7 @@ export function diskHosts(root: string, activity: ChildConfig["activity"], orche
           ...s,
           status: "idle",
           interrupted: s.interrupted + 1,
-          messages: [...s.messages, { role: "idle", text: null, outcome: "interrupted" }],
+          messages: [...s.messages, interruptedStep(Date.now())],
         });
       } else {
         await writeSession(root, { ...s, interrupted: s.interrupted + 1 });
@@ -163,7 +166,7 @@ export function scriptedLauncher(c: ChildConfig, clock: Clock): TaskLauncher {
           id: sid,
           parentID: c.orchestrator,
           status: "busy",
-          messages: [{ role: "user", text: req.prompt, outcome: null }],
+          messages: [userPromptMessage(req.prompt)],
           script,
           slotPath: req.workRoot,
           file: work.file,
@@ -183,6 +186,8 @@ export function scriptedLauncher(c: ChildConfig, clock: Clock): TaskLauncher {
         resolveConf({ kind: "confirmed", childSessionID: sid, latencyMs: 1 });
         say(`LAUNCH ${req.taskId} ${req.attempt} ${sid} ${script}`);
         if (script !== "normal") {
+          // QA-4.2-2: a scripted child is mid-tool-call when this process is killed (a busy v2 child's real shape): never an end.
+          await appendMessages(c.hostRoot, sid, midToolCall(Date.now()));
           launchedScripted.add(req.taskId);
           releaseHoldIfReady();
           return;
@@ -190,10 +195,7 @@ export function scriptedLauncher(c: ChildConfig, clock: Clock): TaskLauncher {
         await hold;
         if (run.settled) return;
         await writeWork(req.workRoot, work.file, work.content);
-        await appendMessages(c.hostRoot, sid, [
-          { role: "assistant", text: answer, outcome: null },
-          { role: "idle", text: null, outcome: "completed" },
-        ], "idle");
+        await appendMessages(c.hostRoot, sid, [finishedAnswer(answer, Date.now())], "idle");
         run.end({ kind: "completed", childSessionID: sid, text: answer, endedAt: clock.iso() });
       })().catch((e: unknown) => {
         say(`ERROR launch ${req.taskId}#${req.attempt}: ${e instanceof Error ? e.message : String(e)}`);
@@ -208,7 +210,7 @@ export function scriptedLauncher(c: ChildConfig, clock: Clock): TaskLauncher {
       if (run.sessionID !== null) {
         const s = await readSession(c.hostRoot, run.sessionID);
         if (s !== null && s.status === "busy") {
-          await writeSession(c.hostRoot, { ...s, status: "idle", interrupted: s.interrupted + 1, messages: [...s.messages, { role: "idle", text: null, outcome: "interrupted" }] });
+          await writeSession(c.hostRoot, { ...s, status: "idle", interrupted: s.interrupted + 1, messages: [...s.messages, interruptedStep(Date.now())] });
         }
       }
       run.end({ kind: "interrupted", childSessionID: run.sessionID, reason, endedAt: clock.iso() });

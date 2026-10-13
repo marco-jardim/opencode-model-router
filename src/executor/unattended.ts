@@ -6,6 +6,7 @@ import type {
 import {
   ExecutorError, QA_CAP_OPTIONS, countsTowardMaxAttempts, formatInboxId, isBreakerFailure, nextInboxNumber,
 } from "./types.js";
+import { edgeSatisfied } from "./schedule.js";
 
 /** Diagnostics sink with the shape of `RuntimeDeps.log`. */
 export type UnattendedLog = (level: "info" | "warn" | "error", msg: string, detail?: JsonValue) => void;
@@ -86,6 +87,18 @@ function breakerWindowStart(l: Readonly<LedgerV1>, phaseId: PhaseId): number | n
 }
 
 /**
+ * A2 (amendment A-4.2-2 to B1): a systemic post-child failure is a breaker FAILURE. The child succeeded without a
+ * verdict, yet its task went `completed -> failed` (trigger `commit-failed`: E_IDENTITY / E_GIT, or "no changes" while
+ * writes were declared). The ledger keeps no transition list, so the fact is derived: a succeeded attempt with no
+ * verdict can only leave `completed` for `failed` when the commit failed, so it counts when its task is `failed` and it
+ * is the latest attempt, or when a later attempt exists (the task was retried after that failure).
+ */
+export function isCommitFailure(t: Readonly<LedgerV1["tasks"][string]>, a: Attempt): boolean {
+  if (a.outcome !== "succeeded" || a.verdict !== null) return false;
+  return a !== t.attempts[t.attempts.length - 1] || t.state === "failed";
+}
+
+/**
  * B1: the counted samples of a phase since its newest breaker item, ordered by endedAt, then (taskId, n).
  * Pure function of the ledger, so a restart rebuilds it exactly.
  */
@@ -108,7 +121,7 @@ export function breakerSamples(
         return at >= lo && at < hi;
       });
       if (flaky) return;
-      const failure = isBreakerFailure(a);
+      const failure = isBreakerFailure(a) || isCommitFailure(t, a);
       const latest = i === t.attempts.length - 1;
       const success = !failure && a.outcome === "succeeded" &&
         (a.verdict === "pass" || (a.verdict === null && latest && SUCCESS_STATES.includes(t.state)));
@@ -125,7 +138,10 @@ export function breakerSamples(
   return out;
 }
 
-/** B2: N samples, F failures, C trailing run of failures. The epsilon makes 6/15 trip at ratio 0.4. */
+/**
+ * B2 (amendment X11): N samples, F failures, C trailing run of failures. The ratio rule is STRICT: F > failureRatio * N
+ * (the epsilon keeps 6/15 at ratio 0.4 from tripping on float noise); the consecutive rule is C >= consecutiveFailures.
+ */
 export function breakerTrips(
   s: ReturnType<typeof breakerSamples>, c: ExecutorConfig["circuitBreaker"],
 ): { tripped: boolean; reason: "ratio" | "consecutive" | null; failures: number; attempts: number; consecutive: number } {
@@ -135,7 +151,7 @@ export function breakerTrips(
   for (const x of s) {
     if (x.failure) { failures += 1; consecutive += 1; } else consecutive = 0;
   }
-  const ratio = attempts >= c.minAttempts && failures >= c.failureRatio * attempts - 1e-9;
+  const ratio = attempts >= c.minAttempts && failures > c.failureRatio * attempts + 1e-9;
   const run = consecutive >= c.consecutiveFailures;
   const reason = ratio ? "ratio" : run ? "consecutive" : null;
   return { tripped: reason !== null, reason, failures, attempts, consecutive };
@@ -157,6 +173,23 @@ function openItemOf(l: Readonly<LedgerV1>, taskId: TaskId): InboxItem | undefine
     if (it !== undefined && it.taskId === taskId && it.answer === null) return it;
   }
   return undefined;
+}
+
+/**
+ * QA-4.2-5: the item the park batch of a parked task created. `park` writes the item text and the latest attempt's
+ * context from the same bounded string, so the park item is the newest open question/failure item of the task whose
+ * text equals that context. If no item matches (a later writer changed the context), the oldest open question/failure
+ * item of the task is used: the park item is older than anything raised after the park.
+ */
+export function parkItemOf(l: Readonly<LedgerV1>, t: Readonly<LedgerV1["tasks"][string]>): InboxItem | undefined {
+  const last = t.attempts[t.attempts.length - 1];
+  const cands = l.inbox.filter((x) => x.taskId === t.id && x.answer === null && (x.kind === "question" || x.kind === "failure"));
+  if (last !== undefined) {
+    for (const c of [...cands].reverse()) {
+      if (c.text === last.context) return c;
+    }
+  }
+  return cands[0];
 }
 
 const RUNNING_CAUSES: readonly ParkCause[] = ["escalate", "ambiguity", "qa-unparsable"];
@@ -243,6 +276,9 @@ export function createUnattendedPolicy(d: UnattendedDeps): UnattendedPolicy {
         }
         events.push({ type: "task-transition", taskId, from: "running", to: "parked", trigger: cause, detail: null });
       } else {
+        // QA-4.2-5: the same marker as the running causes, so `answer` can tell the park item from any other item.
+        const last = t.attempts[t.attempts.length - 1];
+        if (last !== undefined) events.push({ type: "attempt-context", taskId, n: last.n, context: bounded });
         events.push({ type: "task-transition", taskId, from: t.state, to: "parked", trigger: "exhausted", detail: null });
       }
       if (t.slot !== null) {
@@ -317,7 +353,7 @@ export function createUnattendedPolicy(d: UnattendedDeps): UnattendedPolicy {
             x.id !== inboxId && x.answer === null && x.severity === "critical" && itemPhase(l, x) === ph.id);
           if (!other) events.push({ type: "phase-paused", phaseId: ph.id, paused: false, reason: "breaker answered" });
         }
-      } else if (t !== undefined && t.state === "parked") {
+      } else if (t !== undefined && t.state === "parked" && parkItemOf(l, t)?.id === item.id) {
         const last = t.attempts[t.attempts.length - 1];
         if (last !== undefined) events.push({ type: "attempt-context", taskId: t.id, n: last.n, context: text });
         events.push({ type: "task-transition", taskId: t.id, from: "parked", to: "ready", trigger: "answered", detail: inboxId });
@@ -335,11 +371,7 @@ export function createUnattendedPolicy(d: UnattendedDeps): UnattendedPolicy {
       const events: ExecutorEventInput[] = [];
       for (const t of Object.values(l.tasks)) {
         if (t.state !== "blocked") continue;
-        const ok = l.edges.every((e) => {
-          if (e.to !== t.id || e.from.startsWith("gate:")) return true;
-          const from = taskOf(l, e.from);
-          return from !== undefined && (from.state === "integrated" || from.state === "done");
-        });
+        const ok = l.edges.every((e) => e.to !== t.id || edgeSatisfied(l, e));
         if (!ok) continue;
         ids.push(t.id);
         events.push({ type: "task-transition", taskId: t.id, from: "blocked", to: "ready", trigger: "dep-recovered", detail: null });
@@ -354,7 +386,7 @@ export function createUnattendedPolicy(d: UnattendedDeps): UnattendedPolicy {
     const owner = Object.values(l0.tasks).find((t) => t.attempts.some((x) => x.nonce === a.nonce));
     if (owner === undefined) return { tripped: false };
     const att: Attempt = owner.attempts.find((x) => x.nonce === a.nonce) ?? a;
-    if (!isBreakerFailure(att)) return { tripped: false };
+    if (!isBreakerFailure(att) && !isCommitFailure(owner, att)) return { tripped: false };
     const out: { item: InboxItem | null } = { item: null };
     await d.writer.append((l) => {
       out.item = null;

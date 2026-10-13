@@ -16,6 +16,7 @@ import type { LedgerV1 } from "../../src/executor/types.js";
 import {
   appendMessages,
   eventLine,
+  finishedAnswer,
   listSessions,
   readSession,
   type ChildConfig,
@@ -509,8 +510,8 @@ async function finishChild(w: World, sid: string): Promise<void> {
   mkdirSync(dirname(p), { recursive: true });
   writeFileSync(p, s.content);
   await appendMessages(w.hostRoot, sid, [
-    { role: "assistant", text: s.answer, outcome: null },
-    { role: "idle", text: null, outcome: "completed" },
+    // QA-4.2-2: the v2 host's real shape (an ended answer step); the adapter derives the terminal entry from it.
+    finishedAnswer(s.answer, Date.now()),
   ], "idle");
 }
 
@@ -532,6 +533,9 @@ interface RestartResult {
  * Run 0 is killed at `point` with T1 at the point and T2 (alive), T3 (dead) and T4 (finishes during the downtime) in flight;
  * run 1 restarts on the same home, repo and host sessions. The alive child sends host events from the restart on, past the
  * probation deadline, and then finishes (its end arrives as an `execution.completed` host event).
+ * QA-4.2-1/-2: every child's first message carries the v2 host preamble line and the scripted children are left mid-tool-call
+ * (host-store.ts), read through the real v2 adapter mapping: the alive child must be adopted (not a header mismatch) and the
+ * dead one must not be processed as finished.
  */
 async function restartRun(point: KillPoint, activity: ChildConfig["activity"]): Promise<RestartResult> {
   const w = await makeWorld(`${point.toLowerCase()}-${activity}`);

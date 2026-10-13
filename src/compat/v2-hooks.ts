@@ -74,22 +74,17 @@ import type {
 import { PENDING_JOURNAL_VANISHED, pendingRecordIdentity } from "../verify/pending";
 import type { ExecutorRuntimeHandle, LeaseRegistryPort } from "../executor/runtime";
 import type {
-  ChildEnd, ChildRunner, DispatchBookkeeping, HostError, HostSessionEvent, HostSessions, IsoTime, LaunchRequest, MetricPayload, PlanId, RouteResolver,
+  ChildEnd, ChildRunner, DispatchBookkeeping, HostError, HostSessionContext, HostSessionEvent, HostSessions, IsoTime, LaunchRequest, MetricPayload, PlanId, RouteResolver,
   SlotVerifier, TaskLauncher,
 } from "../executor/types";
 import type { PlanRoleBindings } from "../executor/launch";
 import { LAUNCH_HEADER_PATTERN, parseLaunchHeader, type LaunchHeaderFields } from "../executor/types";
+import { withoutHostPreamble } from "../executor/host-preamble";
 import { grantFor } from "../routing/roles/policy";
 import { NEEDS, UNKNOWN_FACTS, type Need } from "../routing/classify/types";
 
 /** §7 grammar (`formatLaunchPrompt`): every launcher prompt starts with this line. */
 const PLAN_CONTEXT_PREFIX = "PLAN CONTEXT\n";
-/**
- * QA-3.1-16: the v2 host puts this exact line (ending in "\n", or "\r\n") before the first user message of every native-subagent
- * child (recorded in docs/qa/role-tier/evidence/roots-handoffs.json, ladder.json), so a launcher prompt reaches the child either
- * at offset 0 or right after this one line; no other leading text counts.
- */
-const HOST_SUBAGENT_PREAMBLE = "You are a subagent spawned by another session.";
 
 /**
  * The status of an executor launch's `runner` trigger. QA-3.1 nit 4: the child's observed end (`execution.*`) decides;
@@ -109,12 +104,47 @@ export function executorRunnerStatus(
   return registry === "succeeded" || registry === "failed" || registry === "interrupted" ? registry : "interrupted";
 }
 
-/** The text after the host's one preamble line when it starts with exactly that line, else the text unchanged (QA-3.1-16). */
-function withoutHostPreamble(text: string): string {
-  for (const eol of ["\n", "\r\n"]) {
-    if (text.startsWith(HOST_SUBAGENT_PREAMBLE + eol)) return text.slice(HOST_SUBAGENT_PREAMBLE.length + eol.length);
+/**
+ * QA-4.2-2: the executor child's end from its own history, by the background `childEndState` rules (QA-2.1-6, QA-2.1-18,
+ * QA-DF1-21): synthetic entries are skipped; the newest other entry decides. An assistant message with an error failed (or was
+ * interrupted, for an abort); one with a completion marker (`assistantStepCompleted`) and text succeeded. Anything else (no
+ * entry, a user or tool turn last, a step cut mid-stream or mid-tool-call, a completed step without text, which background
+ * calls lost) is not an end: null.
+ */
+function executorChildEnd(entries: readonly unknown[]): "succeeded" | "failed" | "interrupted" | null {
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const message = entries[index] as { type?: unknown; role?: unknown; error?: unknown; info?: { error?: unknown } } | undefined;
+    if (message?.type === "synthetic") continue;
+    if (message?.type !== "assistant" && message?.role !== "assistant") return null;
+    const error = message.error ?? message.info?.error;
+    if (error !== undefined && error !== null && error !== false) {
+      const described = typeof error === "string" ? error : JSON.stringify(error) ?? "";
+      return /abort|interrupt|cancel/i.test(described) ? "interrupted" : "failed";
+    }
+    if (!assistantStepCompleted(message)) return null;
+    return messageText(message) === undefined ? null : "succeeded";
   }
-  return text;
+  return null;
+}
+
+/**
+ * QA-4.2-2: the executor's `HostSessions.context` over the host's history (amendment to memo R1 rule 5). User and assistant
+ * entries keep their role and text; every other entry (synthetic, tool turns) is a non-terminal `assistant` entry without text,
+ * never `idle`. One explicit terminal entry `{ role: "idle", text: null, outcome }` is appended ONLY when the host's history
+ * shows the child ended (`executorChildEnd`), with that end's real outcome.
+ */
+export function executorHostContext(history: unknown): HostSessionContext {
+  const entries: readonly unknown[] = Array.isArray(history) ? history : [];
+  const messages: HostSessionContext["messages"] = entries.map((m) => {
+    const record = typeof m === "object" && m !== null ? m as Record<string, unknown> : {};
+    const kind = record.type ?? record.role;
+    if (kind === "user") return { role: "user" as const, text: messageText(m) ?? null, outcome: null };
+    if (kind === "assistant") return { role: "assistant" as const, text: messageText(m) ?? null, outcome: null };
+    return { role: "assistant" as const, text: null, outcome: null };
+  });
+  const end = executorChildEnd(entries);
+  if (end !== null) messages.push({ role: "idle", text: null, outcome: end });
+  return { messages };
 }
 
 /** Translate the router's own v1 tool vocabulary at the v2 boundary. */
@@ -3630,17 +3660,7 @@ export async function registerV2Hooks(
           if (session === null || session === undefined) return null;
           return { id: typeof session.id === "string" ? session.id : sessionID, parentID: typeof session.parentID === "string" && session.parentID !== "" ? session.parentID : null };
         },
-        context: async (sessionID) => {
-          const history: unknown = await ctx.session.context({ sessionID } as Parameters<typeof ctx.session.context>[0]);
-          const messages = Array.isArray(history) ? history : [];
-          return {
-            messages: messages.map((m: unknown) => {
-              const record = typeof m === "object" && m !== null ? m as Record<string, unknown> : {};
-              const kind = record.role ?? record.type;
-              return { role: kind === "assistant" ? "assistant" as const : kind === "user" ? "user" as const : "idle" as const, text: messageText(m) ?? null, outcome: null };
-            }),
-          };
-        },
+        context: async (sessionID) => executorHostContext(await ctx.session.context({ sessionID } as Parameters<typeof ctx.session.context>[0])),
         activity: async () => "unknown",
         interrupt: async (sessionID) => { await ctx.session.interrupt({ sessionID }); },
         synthetic: async (i) => {

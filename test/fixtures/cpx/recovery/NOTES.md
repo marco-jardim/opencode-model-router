@@ -26,6 +26,12 @@ Fixtures for `test/integration/executor-recovery-restart.test.ts`.
   is the session's last assistant message), a child on probation leaves it on any event (`onHostEvent` →
   `provedAlive`). A repeated `execution.completed` is harmless: ends are processed only for open attempts (D3).
 - `host-store.ts`: the disk-backed session store both processes use (one JSON file per session).
+- Sessions store the v2 host's real history shape (QA-4.2-1, QA-4.2-2): the first user message is the launch prompt
+  after the host's preamble line (`You are a subagent spawned by another session.`); entries are discriminated by
+  `type`; an ended answer step carries `finish` and `time.completed`, an interrupted one an abort `error`; a scripted
+  child (`alive`, `dead`, `finish-while-down`) is left mid-tool-call (`tool-calls` step plus a running tool turn).
+  `HostSessions.context` is the v2 adapter's real mapping (`executorHostContext` in `src/compat/v2-hooks.ts`), so the
+  terminal `idle` entry with the end outcome exists only when that history shows the child ended.
 - The queue is the real `createIntegrationQueue` over real `GitOps`/`IntegrateGit`/`SlotPool`, the real checks (the
   `node-basic` fixture's `check.js`), the real lander, the phase suite off; it is built per plan by
   `realCollaborators({queue})`.

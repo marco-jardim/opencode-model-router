@@ -6,9 +6,12 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createLedgerStore } from "../../src/executor/ledger.js";
 import {
-  createQaLoop, decideRound, extractFindingsText, groupFindings, normalizeFindingPath, parseFindings,
+  createQaLoop, decideRound, extractFindingsText, FIX_ROLE_AGENT, groupFindings, normalizeFindingPath, originalReviewText,
+  parseFindings, REVIEW_INSTRUCTION_MARKER,
   type QaDecision,
 } from "../../src/executor/qa-loop.js";
+import { pathsOverlap } from "../../src/executor/schedule.js";
+import { CLASS_ROLE_KIND } from "../../src/routing/engine/roles-taxonomy.js";
 import {
   canonicalFindingsJson, ExecutorError, fixTaskId, FINDINGS_FORMAT, FIX_TASKS_PER_ROUND_LIMIT, QA_ROUND_LIMIT, reviewTaskId,
   type ExecutorEventInput, type Finding, type FindingsReport, type LedgerV1, type LedgerWriter, type PhaseRecord, type TaskNode,
@@ -150,6 +153,53 @@ describe("grouping", () => {
       }
       expect(groups.flatMap((g) => g.findings.map((x) => x.id)).sort()).toEqual(findings.map((x) => x.id).sort());
       expect(groupFindings(findings)).toEqual(groups);
+    }
+  });
+
+  it("QA-4.2-12: paths that differ only by case are one group (the scheduler folds case)", () => {
+    const g = groupFindings([f("A", "major", ["A.ts"]), f("B", "major", ["a.ts"]), f("C", "major", ["z.ts"])]);
+    expect(g.map((x) => x.writes)).toEqual([["A.ts", "a.ts"], ["z.ts"]]);
+    expect(g[0]?.findings.map((x) => x.id)).toEqual(["A", "B"]);
+    expect(groupFindings([f("B", "major", ["a.ts"]), f("A", "major", ["A.ts"])]).map((x) => x.writes)).toEqual([["A.ts", "a.ts"]]);
+  });
+
+  it("QA-4.2-12: a directory and a file under it are one group; a sibling prefix is not", () => {
+    const g = groupFindings([
+      f("A", "major", ["src/"]), f("B", "major", ["src/x.ts"]), f("C", "major", ["src/deep/y.ts"]),
+      f("D", "major", ["srcx/z.ts"]), f("E", "major", ["Src/Other.ts"]),
+    ]);
+    expect(g.map((x) => x.writes)).toEqual([["Src/Other.ts", "src", "src/deep/y.ts", "src/x.ts"], ["srcx/z.ts"]]);
+    expect(g[0]?.findings.map((x) => x.id)).toEqual(["A", "B", "C", "E"]);
+    const reversed = groupFindings([
+      f("E", "major", ["Src/Other.ts"]), f("D", "major", ["srcx/z.ts"]), f("C", "major", ["src/deep/y.ts"]),
+      f("B", "major", ["src/x.ts"]), f("A", "major", ["src/"]),
+    ]);
+    expect(reversed.map((x) => x.writes)).toEqual(g.map((x) => x.writes));
+  });
+
+  it("QA-4.2-12: group writes never overlap by the scheduler's rule (fuzz with case and directories)", () => {
+    let seed = 777;
+    const rnd = (n: number): number => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed % n;
+    };
+    const parts = ["src", "SRC", "lib", "a.ts", "A.ts", "b.ts"];
+    for (let round = 0; round < 200; round++) {
+      const findings: Finding[] = [];
+      for (let i = 0, n = 1 + rnd(15); i < n; i++) {
+        const files: string[] = [];
+        for (let j = rnd(3); j > 0; j--) files.push(Array.from({ length: 1 + rnd(3) }, () => parts[rnd(parts.length)]).join("/"));
+        findings.push(f(`F${i}`, "major", files));
+      }
+      const groups = groupFindings(findings);
+      for (let a = 0; a < groups.length; a++) {
+        for (let b = a + 1; b < groups.length; b++) {
+          for (const x of groups[a]?.writes ?? []) for (const y of groups[b]?.writes ?? []) {
+            expect(pathsOverlap(x, y), `${x} vs ${y}`).toBe(false);
+          }
+        }
+      }
+      expect(groupFindings([...findings].reverse()).map((g) => g.writes)).toEqual(groups.map((g) => g.writes));
     }
   });
 
@@ -488,6 +538,43 @@ describe("onQaResult: next round", () => {
     expect(t.route.line).toBe("class=implement d=deterministic tier=medium pin root=C:/repo");
     expect(t.route).toMatchObject({ tier: "medium", pin: true });
     expect(t.acceptance).toBeNull();
+  });
+
+  it("QA-4.2-11: the default fix task runs as the role agent `implementer` (edit grants), not the kind `implement`", async () => {
+    expect(CLASS_ROLE_KIND.implement).toBe("implement");
+    expect(FIX_ROLE_AGENT).toBe("implementer");
+    const env = await setup();
+    await env.loop.onQaResult(env.qaId, report(f("A1", "major", ["a.ts"]), f("B1", "major", [])));
+    expect(env.task(fixTaskId(PHASE, 1, 1)).route.role).toBe("implementer");
+    expect(env.task(fixTaskId(PHASE, 1, 2)).route.role).toBe("implementer");
+  });
+
+  it("nit: a re-review task embeds the previous round's findings and the original instruction once, so it does not grow", async () => {
+    const env = await setup({ max: 5 });
+    await env.loop.onQaResult(env.qaId, report(f("A1", "major", ["a.ts"])));
+    const r2 = env.task("p1.QA2").text;
+    expect(r2).toBe(
+      `TASK p1.QA2: re-review phase p1 after the round 1 fixes. Previous findings:\n${canonicalFindingsJson(report(f("A1", "major", ["a.ts"])))}\n` +
+      `${REVIEW_INSTRUCTION_MARKER}\nreview the phase`,
+    );
+    await runQa(env, "p1.QA2", canonicalFindingsJson(report(f("B1", "major", ["b.ts"]))));
+    await env.loop.onQaResult("p1.QA2", report(f("B1", "major", ["b.ts"])));
+    const r3 = env.task("p1.QA3").text;
+    expect(r3).toBe(
+      `TASK p1.QA3: re-review phase p1 after the round 2 fixes. Previous findings:\n${canonicalFindingsJson(report(f("B1", "major", ["b.ts"])))}\n` +
+      `${REVIEW_INSTRUCTION_MARKER}\nreview the phase`,
+    );
+    expect(r3).not.toContain("A1");
+    expect(r3.split("review the phase")).toHaveLength(2);
+    expect(r3.length - r2.length).toBeLessThan(10);
+  });
+
+  it("originalReviewText: a re-review text yields its instruction, anything else is returned as is", () => {
+    const rereview = `TASK p1.QA3: re-review phase p1 after the round 2 fixes. Previous findings:\n{"findings":[]}\n${REVIEW_INSTRUCTION_MARKER}\nreview\nmore`;
+    expect(originalReviewText(rereview)).toBe("review\nmore");
+    expect(originalReviewText("review the phase")).toBe("review the phase");
+    const noMarker = "TASK p1.QA2: re-review phase p1 after the round 1 fixes. Previous findings:\n{}\nold style";
+    expect(originalReviewText(noMarker)).toBe(noMarker);
   });
 
   const noRoot = { line: "class=review d=none tier=heavy pin", role: "review", tier: "heavy" as const, pin: true };

@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createCapacityController } from "../../src/executor/capacity.js";
 import { createLedgerStore } from "../../src/executor/ledger.js";
 import { taskBranchName } from "../../src/executor/git.js";
+import type { PlanBindInput } from "../../src/executor/launch.js";
 import { createRecoveryService, type RecoveryEngine } from "../../src/executor/recovery.js";
 import {
   attemptTrailer,
@@ -156,12 +157,24 @@ async function pause(ms: number): Promise<void> {
   await new Promise<void>((r) => setTimeout(r, ms));
 }
 
-async function until(pred: () => boolean | Promise<boolean>, what: string): Promise<void> {
-  for (let i = 0; i < 2400; i++) {
+/** Wall-clock bound of `until`, below the 30 s test timeout so a wait that never ends fails with its state. */
+const UNTIL_MS = 20_000;
+
+async function until(pred: () => boolean | Promise<boolean>, what: string, state?: () => unknown): Promise<void> {
+  const deadline = Date.now() + UNTIL_MS;
+  while (Date.now() < deadline) {
     if (await pred()) return;
     await pause(2);
   }
-  throw new Error(`timed out waiting for ${what}`);
+  let seen = "";
+  if (state !== undefined) {
+    try {
+      seen = `; state: ${JSON.stringify(state())}`;
+    } catch (e) {
+      seen = `; state unreadable: ${e instanceof Error ? e.message : String(e)}`;
+    }
+  }
+  throw new Error(`timed out waiting for ${what}${seen}`);
 }
 
 const slotPathOf = (slot: string): string => `${SLOT_ROOT}/slots/${slot}`;
@@ -302,19 +315,26 @@ class RegistryDouble implements LeaseRegistryPort {
 class QueueDouble implements IntegrationQueue {
   readonly enqueued: TaskId[][] = [];
   resumes = 0;
+  /** QA-4.2-3: `dispose` calls; a disposed queue's lanes stop (no enqueue is recorded any more). */
+  disposed = 0;
   constructor(
     private readonly log: CallLog,
     private readonly writer: LedgerWriter,
-    private readonly cfg: { halt: boolean },
+    private readonly cfg: QueueCfg,
     private readonly clock: Clock,
   ) {}
   enqueue(ids: readonly TaskId[]): void {
+    if (this.disposed > 0) {
+      this.log.push(`queue.enqueue-after-dispose:${ids.join(",")}`);
+      return;
+    }
     this.enqueued.push([...ids]);
     this.log.push(`queue.enqueue:${ids.join(",")}`);
   }
   async resume(): Promise<ResumeReport> {
     this.resumes += 1;
     this.log.push(`queue.resume:${this.resumes}`);
+    if (this.cfg.reject) throw new Error("integration slot unavailable");
     if (!this.cfg.halt) return { completed: [], rolledBack: [], halted: false, entries: [] };
     await this.writer.append((l) => {
       const ev: ExecutorEventInput[] = [];
@@ -344,7 +364,19 @@ class QueueDouble implements IntegrationQueue {
   queued(): readonly TaskId[] {
     return this.enqueued.flat();
   }
-  async dispose(): Promise<void> {}
+  /** When set, `dispose` waits for it (a same-process adopt's re-attach window stays open meanwhile). */
+  disposeGate: Promise<void> | null = null;
+  async dispose(): Promise<void> {
+    this.disposed += 1;
+    this.log.push("queue.dispose");
+    if (this.disposeGate !== null) await this.disposeGate;
+  }
+}
+
+/** Queue double switches: `halt` halts `resume` (A2-5), `reject` makes it reject (QA-4.2-6). */
+interface QueueCfg {
+  halt: boolean;
+  reject: boolean;
 }
 
 /** UnattendedPolicy over the real writer (as in executor-runtime.test.ts): park journals the P rows. */
@@ -383,7 +415,15 @@ class PolicyDouble implements UnattendedPolicy {
   async unblock(): Promise<TaskId[]> {
     return [];
   }
+  /** The runtime call site of each `recordAttempt` (its runtime.ts frames), for assertion messages. */
+  readonly sites: string[] = [];
   async recordAttempt(phaseId: PhaseId, a: Attempt): Promise<{ tripped: boolean }> {
+    const frames = (new Error("site").stack ?? "")
+      .split("\n")
+      .slice(1)
+      .map((s) => s.trim())
+      .filter((s) => s.includes("runtime.ts"));
+    this.sites.push(frames.slice(0, 3).join(" <- ") || "unknown");
     const owner = Object.values(this.writer.ledger.tasks).find((t) => t.attempts.some((x) => x.nonce === a.nonce));
     this.counted.push({ phaseId, taskId: owner?.id ?? null, n: a.n, outcome: a.outcome });
     return { tripped: false };
@@ -414,6 +454,8 @@ class GitDouble implements GitRunner {
   dirty: (cwd: string) => boolean = () => true;
   headBody = "base\n";
   head = HEAD_SHA;
+  /** QA-4.2-13: what `git log --all --grep=<trailer>` finds (a commit id, or "" for none). */
+  trailerCommit = "";
   async run(args: readonly string[], o: ProcOpts): Promise<ProcessResult> {
     this.calls.push({ args: [...args], cwd: o.cwd });
     const verb = args[0] ?? "";
@@ -421,6 +463,7 @@ class GitDouble implements GitRunner {
     if (verb === "worktree") return ok(`worktree ${REPO}\nHEAD ${SHA}\nbranch refs/heads/main\n`);
     if (verb === "config") return { ...ok(), code: 1 };
     if (verb === "status") return ok(this.dirty(o.cwd) ? " M src/a.ts\n" : "");
+    if (verb === "log" && args.includes("--all")) return ok(this.trailerCommit === "" ? "" : `${this.trailerCommit}\n`);
     if (verb === "log") return ok(this.headBody);
     if (verb === "rev-parse") return ok(`${this.head}\n`);
     if (verb === "commit") this.headBody = `${args.filter((_, i) => args[i - 1] === "-m").join("\n\n")}\n`;
@@ -600,7 +643,7 @@ interface Harness {
   verifier: VerifierDouble;
   git: GitDouble;
   hosts: HostsDouble;
-  queueCfg: { halt: boolean };
+  queueCfg: QueueCfg;
   deps: RuntimeDeps;
   runtime: ExecutorRuntimeHandle;
   parts(): PlanParts;
@@ -657,7 +700,7 @@ async function mk(draft: LedgerV1): Promise<Harness> {
   const git = new GitDouble();
   const hosts = new HostsDouble();
   const verifier = new VerifierDouble();
-  const queueCfg = { halt: false };
+  const queueCfg: QueueCfg = { halt: false, reject: false };
   const others: LedgerWriter[] = [];
   const holder = (sessionID: string): ReturnType<RuntimeDeps["holder"]> => holderOf(sessionID, proc.pid, proc.hostname, clock.iso());
   const deps: RuntimeDeps = {
@@ -712,7 +755,21 @@ async function mk(draft: LedgerV1): Promise<Harness> {
       await h.runtime.compile({ path: `${REPO}/PLAN.md`, sessionID: ORCH });
     },
     async runOf(id, n) {
-      await until(() => h.launcher.runOf(id, n) !== undefined, `launch of ${id}#${n}`);
+      await until(
+        () => h.launcher.runOf(id, n) !== undefined,
+        `launch of ${id}#${n}`,
+        () => {
+          const t = st.parts === null ? undefined : st.parts.writer.ledger.tasks[id];
+          return {
+            status: st.parts?.writer.ledger.status ?? null,
+            state: t?.state ?? null,
+            slot: t?.slot ?? null,
+            attempts: t?.attempts.map((a) => `${a.n}:${a.outcome ?? "open"}:${a.context}`) ?? [],
+            runs: h.launcher.runs.map((r) => `${r.req.taskId}#${r.req.attempt}`),
+            inbox: st.parts?.writer.ledger.inbox.filter((i) => i.answer === null).map((i) => i.text) ?? [],
+          };
+        },
+      );
       return need(h.launcher.runOf(id, n), `run ${id}#${n}`);
     },
     async running(id, n, sessionID) {
@@ -1239,12 +1296,40 @@ describe("R2: a completed/verifying/verified task whose slot lost its marker", (
     expect(h.verifier.calls).toEqual(["T1#1"]);
   });
 
-  it("completed, marker missing, no task branch: nothing is re-provisioned and one blocking item is raised", async () => {
+  it("QA-4.2-13: completed, marker missing, no task branch, no commit with the attempt's trailer: failed ('slot lost before commit'), counted, retried on a fresh slot", async () => {
     const h = await mk(planOf([task("T1")]));
     await completedThenCrash(h);
     const old = need(h.task("T1").slot, "slot of T1");
     dropMarker(h, old);
     noBranch(h);
+    h.git.trailerCommit = "";
+    const mark = h.git.calls.length;
+    await h.restart();
+    // T1#2 is a live child of this process: `settled()` would wait for its end, so the test stops at its launch.
+    await h.runOf("T1", 2);
+
+    const a1 = need(h.task("T1").attempts[0], "attempt 1");
+    expect(a1).toMatchObject({ outcome: "succeeded", context: "slot lost before commit" });
+    const ev = await h.events();
+    const moved = ev.filter((e) => e.type === "task-transition" && e.taskId === "T1" && e.from === "completed" && e.to === "failed");
+    expect(moved).toHaveLength(1);
+    expect(JSON.stringify(moved[0])).toContain("slot lost before commit");
+    // the search for this attempt's trailer ran in the repository
+    expect(h.git.calls.slice(mark).some((c) => c.args[0] === "log" && c.args.includes("--all") && c.cwd === REPO)).toBe(true);
+    expect(h.parts().policy.counted.map((c) => c.n)).toContain(1);
+    expect(openFailures(h)).toEqual([]);
+    expect(h.slots.released).toContain(old);
+    expect(h.git.calls.slice(mark).some((c) => c.args[0] === "commit")).toBe(false);
+    expect(h.verifier.calls).toEqual([]);
+  });
+
+  it("completed, marker missing, no task branch, but a commit carries the attempt's trailer: nothing is re-provisioned and one blocking item is raised", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await completedThenCrash(h);
+    const old = need(h.task("T1").slot, "slot of T1");
+    dropMarker(h, old);
+    noBranch(h);
+    h.git.trailerCommit = "f".repeat(40);
     const mark = h.git.calls.length;
     const logMark = h.log.length;
     await h.restart();
@@ -1280,6 +1365,435 @@ describe("breaker at activation (B5)", () => {
     await until(() => h.parts().policy.counted.length > 0, "the breaker feed");
     expect(h.parts().policy.counted).toEqual([expect.objectContaining({ taskId: "T1", n: 1, outcome: "failed" })]);
     await h.runOf("T1", 2); // step 6: the retry decision left behind
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// QA-4.2 round 1 (runtime findings)
+// ---------------------------------------------------------------------------------------------------------------
+
+/** The plan's T1 write path is held by another plan in the shared registry (a failed lease rebuild, QA-4.2-16). */
+function foreignLease(h: Harness): RegistryDouble {
+  const reg = h.deps.leaseRegistry;
+  if (!(reg instanceof RegistryDouble)) throw new Error("registry double expected");
+  reg.held.set("src/T1.ts", { holderID: "omr:other-plan:T9", taskRef: "other-plan:T9" });
+  return reg;
+}
+
+describe("QA-4.2-3: the integration queue is disposed with its attachment", () => {
+  it("a same-process adopt disposes the old queue before the new one resumes; the old one gets nothing after", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    const oldQueue = h.parts().queue;
+    h.hosts.activityValue = "active";
+    h.engine();
+    await h.runtime.adopt(PLAN_ID, "ses-new");
+    await until(() => h.ledger().orchestrator.sessionID === "ses-new", "the new orchestrator");
+    expect(oldQueue.disposed).toBe(1);
+    expect(h.parts().queue).not.toBe(oldQueue);
+    expect(h.parts().queue.disposed).toBe(0);
+    expect(h.log.indexOf("queue.dispose")).toBeLessThan(h.log.lastIndexOf("queue.resume:1"));
+
+    run.complete("Done. Implemented it.");
+    await untilEnqueued(h, "T1");
+    expect(oldQueue.enqueued).toEqual([]);
+    expect(h.log.filter((l) => l.startsWith("queue.enqueue-after-dispose"))).toEqual([]);
+  });
+
+  it("dispose disposes the queue of every attached plan (its lanes and repo lock go)", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const q = h.parts().queue;
+    // `settled()` waits for live children too (their completion is tracked), so it is never called while T1 runs; the
+    // child is created first so its launch confirmation settled (dispose waits for every non-child wait).
+    await h.running("T1", 1, "ses-c1");
+    await h.runtime.dispose();
+    expect(q.disposed).toBe(1);
+    expect(h.log.filter((l) => l === "queue.dispose")).toHaveLength(1);
+  });
+});
+
+describe("QA-4.2-4: a child that ends inside a same-process adopt's window", () => {
+  it("waits for the new attachment: the end is processed once, through the live writer, never stranded", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    h.hosts.activityValue = "active";
+    const e = h.engine();
+    // The window: the old attachment is closed (writer too) and recovery.adopt has not returned yet.
+    const inWindow = deferred<void>();
+    const gate = deferred<void>();
+    const adopt0 = e.adopt.bind(e);
+    e.adopt = async (planId, sessionID) => {
+      inWindow.resolve();
+      await gate.promise;
+      await adopt0(planId, sessionID);
+    };
+    const adopting = h.runtime.adopt(PLAN_ID, "ses-new");
+    await inWindow.promise;
+    run.complete("Done. Implemented it.");
+    await pause(30);
+    gate.resolve();
+    await adopting;
+    await untilEnqueued(h, "T1");
+    await h.runtime.settled();
+
+    expect(h.ledger().orchestrator.sessionID).toBe("ses-new");
+    expect(endsOf(await h.events(), "T1")).toHaveLength(1);
+    expect(h.verifier.calls).toEqual(["T1#1"]);
+    expect(h.logs.filter((l) => /child end processing failed|E_DISPOSED/.test(l))).toEqual([]);
+  });
+});
+
+describe("QA-4.2-6: a rejected queue.resume()", () => {
+  function awaitingApproval(): LedgerV1 {
+    const d = planOf([task("T1")]);
+    d.status = "awaiting-approval";
+    return d;
+  }
+
+  it("pauses the plan with one critical item and launches nothing; the user's resume retries it", async () => {
+    const h = await mk(awaitingApproval());
+    h.queueCfg.reject = true;
+    await h.begin();
+    await h.runtime.approve(PLAN_ID, ORCH);
+    await h.runtime.settled();
+    expect(h.ledger().status).toBe("paused");
+    const critical = h.ledger().inbox.filter((i) => i.answer === null && i.severity === "critical");
+    expect(critical).toHaveLength(1);
+    expect(critical[0]?.text).toContain("could not resume");
+    expect(h.launcher.runs).toEqual([]);
+
+    h.queueCfg.reject = false;
+    await h.runtime.resume(PLAN_ID, ORCH);
+    expect(h.parts().queue.resumes).toBe(2);
+    await h.runOf("T1", 1);
+  });
+
+  it("a running plan whose integration resume failed is resumed again by the user's resume (no E_PLAN_STATE)", async () => {
+    const h = await mk(awaitingApproval());
+    h.queueCfg.reject = true;
+    await h.begin();
+    await h.runtime.approve(PLAN_ID, ORCH);
+    await h.runtime.settled();
+    // The plan runs again by another path while the queue is still not resumed.
+    await h.parts().writer.append([{ type: "status-changed", from: "paused", to: "running", reason: "test" }]);
+    h.queueCfg.reject = false;
+    await h.runtime.resume(PLAN_ID, ORCH);
+    expect(h.parts().queue.resumes).toBe(2);
+    expect(h.ledger().status).toBe("running");
+    await h.runOf("T1", 1);
+    // Once it resumed, a resume of the running plan is refused as before.
+    await expect(h.runtime.resume(PLAN_ID, ORCH)).rejects.toThrow(/is running/);
+  });
+});
+
+describe("QA-4.2-7: adopt never takes a plan awaiting residue or approval", () => {
+  it("refuses a plan awaiting approval with E_PLAN_STATE before recovery runs, and writes nothing", async () => {
+    const d = planOf([task("T1")]);
+    d.status = "awaiting-approval";
+    const h = await mk(d);
+    await h.begin();
+    const e = h.engine();
+    const adopted: string[] = [];
+    const adopt0 = e.adopt.bind(e);
+    e.adopt = async (planId, sessionID) => {
+      adopted.push(sessionID);
+      await adopt0(planId, sessionID);
+    };
+    const before = (await h.events()).length;
+    await expect(h.runtime.adopt(PLAN_ID, "ses-new")).rejects.toMatchObject({ code: "E_PLAN_STATE" });
+    await expect(h.runtime.adopt(PLAN_ID, "ses-new")).rejects.toThrow(/never adopted/);
+    expect(adopted).toEqual([]);
+    expect(h.ledger().orchestrator.sessionID).toBe(ORCH);
+    expect(h.ledger().status).toBe("awaiting-approval");
+    expect((await h.events()).length).toBe(before);
+    // the plan stays its session's to approve
+    await h.runtime.approve(PLAN_ID, ORCH);
+    await h.runOf("T1", 1);
+  });
+});
+
+describe("QA-4.2-14: the breaker at activation reads only failures it has not evaluated", () => {
+  it("a failure fed live while the phase was paused is not fed again at a restart after the unpause", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    const phaseId = need(h.task("T1").phase, "phase of T1");
+    await h.parts().writer.append([{ type: "phase-paused", phaseId, paused: true, reason: "breaker" }]);
+    // Row 16 while the phase is paused: fed live (B4: it cannot trip a paused phase), retried, not relaunched (paused).
+    // (The first version of this test journaled the failure directly, i.e. a feed missed by a crash: B5 feeds that one.)
+    run.end({ kind: "failed", childSessionID: "ses-c1", error: { type: "execution.failed", status: null, message: "boom" }, endedAt: h.clock.iso() });
+    const livePolicy = h.parts().policy;
+    await until(
+      () => livePolicy.counted.length === 1 && h.state("T1") === "ready",
+      "the live feed of T1#1",
+      () => ({ counted: livePolicy.counted, state: h.state("T1") }),
+    );
+    h.launcher.gateValue = DISPOSED_GATE; // nothing relaunches in this process once the phase runs again
+    await h.parts().writer.append([{ type: "phase-paused", phaseId, paused: false, reason: "answered" }]);
+    await h.restart();
+    // The relaunch comes after the activation (breakers at step 8, the first tick last); T1#2 stays live, so no `settled()`.
+    await h.runOf("T1", 2);
+    const pol = h.parts().policy;
+    const evidence = JSON.stringify({
+      counted: pol.counted,
+      sites: pol.sites,
+      logs: h.logs.filter((l) => /breaker|journal|recordAttempt|capacity restore/.test(l)),
+      journal: (await h.events())
+        .filter((e) => e.type === "phase-paused" || e.type === "attempt-ended" || (e.type === "metric" && e.metric.name === "counter" && e.metric.key === "breaker-fed"))
+        .map((e) => `${e.seq}:${e.type}${e.type === "phase-paused" ? `:${String(e.paused)}` : ""}${e.type === "metric" ? `:${JSON.stringify(e.metric)}` : ""}`),
+    });
+    expect(pol.counted, evidence).toEqual([]);
+  });
+
+  it("a failure whose live feed a crash missed is fed once at the next activation, never again at a later one", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    // Row 16 landed, the process died before `recordAttempt` (no breaker-fed marker).
+    await h.parts().writer.append([
+      { type: "attempt-ended", taskId: "T1", n: 1, outcome: "failed", endedAt: h.clock.iso(), detail: "boom" },
+      { type: "attempt-context", taskId: "T1", n: 1, context: "boom" },
+      tr("T1", "running", "failed", "child-failed", "boom"),
+    ]);
+    await h.restart();
+    expect(h.parts().policy.counted).toEqual([expect.objectContaining({ taskId: "T1", n: 1, outcome: "failed" })]);
+    // T1#2 gets a child so the next crash's dispose has no unconfirmed launch to wait for.
+    await h.running("T1", 2, "ses-c2");
+    await h.restart();
+    const pol = h.parts().policy;
+    expect(pol.counted, JSON.stringify({ counted: pol.counted, sites: pol.sites })).toEqual([]);
+  });
+});
+
+describe("QA-4.2-15: the probation interrupt's own end", () => {
+  it("is not a proof of life nor an unrequested interrupt: lost 'restart', slot reset, no streak", async () => {
+    const h = await onProbation();
+    h.hosts.interruptImpl = async (sid) => {
+      h.hosts.emit({ type: "execution.interrupted", sessionID: sid, at: h.clock.iso() });
+    };
+    const mark = h.git.calls.length;
+    // `advance` settles after each step, which waits for live children: the step at the deadline relaunches T1, so it is
+    // taken by the clock alone (as in the deadline test above).
+    await advance(h, LIVENESS_MS - POLL_MS);
+    expect(h.hosts.interrupts).toEqual([]);
+    h.clock.advance(POLL_MS);
+    await h.runOf("T1", 2);
+    const ends = endsOf(await h.events(), "T1");
+    expect(ends).toHaveLength(1);
+    expect(JSON.stringify(ends[0])).toContain('"restart"');
+    expect(JSON.stringify(ends[0])).not.toContain("unrequested-interrupt");
+    expect(h.hosts.interrupts).toEqual(["ses-c1"]);
+    expect(h.git.verbsSince(mark)).toContain("reset --hard HEAD");
+    expect(h.parts().policy.counted).toEqual([]);
+  });
+});
+
+describe("QA-4.2-16: a failed lease rebuild holds the task until its leases are back", () => {
+  it("a live child of a task without its leases is interrupted and requeued, not adopted; the relaunch waits for the lease", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.crash();
+    const reg = foreignLease(h);
+    h.hosts.activityValue = "active";
+    h.engine();
+    await h.runtime.start();
+    await h.runtime.settled();
+
+    expect(h.parts().policy.raised.filter((i) => i.text.includes("could not re-take the leases of T1"))).toHaveLength(1);
+    expect(h.hosts.interrupts).toEqual(["ses-c1"]);
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "lost" });
+    expect(JSON.stringify(endsOf(await h.events(), "T1")[0])).toContain('"restart"');
+    expect(h.state("T1")).toBe("ready");
+    expect(h.launcher.runs).toEqual([]);
+
+    reg.held.delete("src/T1.ts");
+    h.runtime.onLeaseReleased();
+    await h.runOf("T1", 2);
+  });
+
+  it("a verified task without its leases is not enqueued until a lease release lets the rebuild retry succeed", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    run.complete("Done.");
+    await untilEnqueued(h, "T1");
+    await h.crash();
+    const reg = foreignLease(h);
+    h.engine();
+    await h.runtime.start();
+    await h.runtime.settled();
+    expect(h.state("T1")).toBe("verified");
+    expect(h.parts().queue.enqueued).toEqual([]);
+
+    reg.held.delete("src/T1.ts");
+    h.runtime.onLeaseReleased();
+    await until(() => h.parts().queue.enqueued.some((ids) => ids.includes("T1")), "T1 enqueued once its leases are back");
+    expect(h.parts().leases.holder("src/T1.ts")?.taskId).toBe("T1");
+  });
+});
+
+describe("QA-4.2-17: a plan of another toplevel that start() can open", () => {
+  it("is attached passively: no reconcile, no integration resume, no tick, and resume never promotes it", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.crash();
+    h.hosts.activityValue = "inactive"; // a reconcile would requeue T1
+    h.engine("C:/elsewhere");
+    const logMark = h.log.length;
+    await h.runtime.start();
+    await h.runtime.settled();
+
+    expect(h.state("T1")).toBe("running");
+    expect(h.hosts.interrupts).toEqual([]);
+    expect(h.log.slice(logMark).filter((l) => l.startsWith("queue.resume"))).toEqual([]);
+    expect(h.launcher.runs).toEqual([]);
+    expect(endsOf(await h.events(), "T1")).toHaveLength(0);
+    await expect(h.runtime.resume(PLAN_ID, ORCH)).rejects.toThrow(/another repository/);
+  });
+});
+
+describe("QA-4.2-18: an adopted child is bound again", () => {
+  it("recovery re-binds it through the launcher's binding port with its task's role, grant and work root", async () => {
+    const h = await mk(planOf([task("T1")]));
+    const binds: PlanBindInput[] = [];
+    h.deps.bindings = {
+      bind: (i) => {
+        binds.push(i);
+      },
+      evict: () => undefined,
+    };
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    h.hosts.activityValue = "active";
+    await h.restart();
+    await h.runtime.settled();
+    expect(h.state("T1")).toBe("running");
+    expect(binds).toEqual([
+      expect.objectContaining({
+        planId: PLAN_ID,
+        taskId: "T1",
+        attempt: 1,
+        childSessionID: "ses-c1",
+        role: "implementer",
+        agent: "implementer",
+        workRoot: run.req.workRoot,
+        grant: run.req.grant,
+      }),
+    ]);
+  });
+});
+
+describe("nit: one reconcile per plan at start", () => {
+  it("recoverPlan reuses the recover() report instead of reconciling the ledger a second time", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.crash();
+    h.hosts.activityValue = "active";
+    const e = h.engine();
+    const st = { inRecover: false, outside: 0 };
+    const recover0 = e.recover.bind(e);
+    const reconcile0 = e.reconcile.bind(e);
+    e.recover = async () => {
+      st.inRecover = true;
+      try {
+        return await recover0();
+      } finally {
+        st.inRecover = false;
+      }
+    };
+    e.reconcile = async (l, tracked) => {
+      if (!st.inRecover) st.outside += 1;
+      return reconcile0(l, tracked);
+    };
+    await h.runtime.start();
+    await h.runtime.settled();
+    expect(st.outside).toBe(0);
+    expect(h.state("T1")).toBe("running");
+  });
+});
+
+describe("nit: a refused row 7", () => {
+  it("interrupts the live child as an orphan instead of leaving it running while the task relaunches", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    h.launcher.gateValue = DISPOSED_GATE; // no relaunch in this process
+    // Row 18 (lost): ready, latest attempt lost, slot kept, child recorded; the child itself still runs.
+    await h.parts().writer.append([
+      { type: "attempt-ended", taskId: "T1", n: 1, outcome: "lost", endedAt: h.clock.iso(), detail: "runner-error" },
+      tr("T1", "running", "ready", "child-lost", "runner-error"),
+    ]);
+    await h.crash();
+    h.hosts.activityValue = "active";
+    const e = h.engine();
+    const recover0 = e.recover.bind(e);
+    e.recover = async () => {
+      const r = await recover0();
+      // Between the report (adopt: row 7) and the activation the task loses its slot, so row 7 is refused.
+      const w = await h.store.open(PLAN_ID, h.deps.holder(ORCH));
+      await w.append([{ type: "task-slot", taskId: "T1", slot: null, branch: null }]);
+      await w.close();
+      return r;
+    };
+    await h.runtime.start();
+    // T1#2 is live: no `settled()` (it would wait for the child's end).
+    await h.runOf("T1", 2);
+    expect(h.hosts.interrupts).toContain("ses-c1");
+    expect((await h.events()).some((x) => x.type === "attempt-adopted")).toBe(false);
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "lost" });
+  });
+});
+
+describe("QA-4.2-8: a commit failure is fed to the breaker after its batch", () => {
+  /** Records T1's state each time the attachment's policy is fed an attempt. */
+  function feedStates(h: Harness): TaskState[] {
+    const pol = h.parts().policy;
+    const states: TaskState[] = [];
+    const record0 = pol.recordAttempt.bind(pol);
+    pol.recordAttempt = async (phaseId, a) => {
+      states.push(h.state("T1"));
+      return record0(phaseId, a);
+    };
+    return states;
+  }
+
+  it("'no changes' (completed -> failed, commit-failed) calls recordAttempt with the attempt once the batch landed", async () => {
+    const h = await mk(planOf([task("T1", { verify: "required" })]));
+    await h.begin();
+    const states = feedStates(h);
+    h.git.dirty = () => false;
+    const run = await h.running("T1", 1, "ses-c1");
+    run.complete("Done.");
+    await h.runOf("T1", 2);
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "succeeded", context: "no changes" });
+    expect(h.parts().policy.counted).toEqual([expect.objectContaining({ taskId: "T1", n: 1, outcome: "succeeded" })]);
+    expect(states).toEqual(["failed"]);
+    const ev = await h.events();
+    expect(ev.some((e) => e.type === "task-transition" && e.taskId === "T1" && e.trigger === "commit-failed")).toBe(true);
+  });
+
+  it("a failing git commit (completed -> failed, commit-failed) calls recordAttempt once the batch landed", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const states = feedStates(h);
+    const run0 = h.git.run.bind(h.git);
+    h.git.run = async (args, o) => {
+      if (args[0] !== "commit") return run0(args, o);
+      h.git.calls.push({ args: [...args], cwd: o.cwd });
+      return { code: 1, signal: null, stdout: "", stderr: "fatal: unable to write new index file", truncated: false, durationMs: 0 };
+    };
+    const run = await h.running("T1", 1, "ses-c1");
+    run.complete("Done.");
+    await h.runOf("T1", 2);
+    expect(h.task("T1").attempts[0]?.context).toContain("git commit failed");
+    expect(h.parts().policy.counted).toEqual([expect.objectContaining({ taskId: "T1", n: 1, outcome: "succeeded" })]);
+    expect(states).toEqual(["failed"]);
   });
 });
 

@@ -5,6 +5,7 @@
 // applies the feeds (interrupts orphans, requeues, adopts, runs the probation watch) while it holds the plan's lock.
 
 import { realpathSync } from "node:fs";
+import { withoutHostPreamble } from "./host-preamble.js";
 import { ADOPT_TAKEOVER_REASON } from "./ledger.js";
 import { ExecutorError, LAUNCH_HEADER_PATTERN, parseLaunchHeader } from "./types.js";
 import type {
@@ -57,8 +58,10 @@ export interface RecoveryDeps {
 
 /**
  * R1 rules 3-6 for one recorded child. `info` is `HostSessions.get`, `ctx` is `context`, `activity` is `activity`.
- * The first user message is parsed strictly as a launch header; `sharedContext` is the ledger's (when omitted it is read
- * off the message itself: everything between "PLAN CONTEXT\n" and the blank line before the header line).
+ * The first user message, after the v2 host's one preamble line when it carries it (QA-4.2-1), is parsed strictly as a
+ * launch header; `sharedContext` is the ledger's (when omitted it is read off the message itself: everything between
+ * "PLAN CONTEXT\n" and the blank line before the header line). Rule 5 (amended, QA-4.2-2): the child is finished only when
+ * its context ends with the host's explicit terminal entry (`idle` with an outcome); an `idle` without one is not an end.
  */
 export function classifyChild(
   info: { id: string; parentID: string | null } | null,
@@ -72,17 +75,27 @@ export function classifyChild(
   if (h === null || h.planId !== expect.planId || h.taskId !== expect.taskId || h.attempt !== expect.n || h.nonce !== expect.nonce) {
     return "mismatch";
   }
-  const last = ctx === null ? undefined : ctx.messages[ctx.messages.length - 1];
-  if (last !== undefined && last.role === "idle") return "finished";
+  if (endedOf(ctx)) return "finished";
   if (activity === "active") return "alive";
   if (activity === "inactive") return "lost";
   return "unknown";
 }
 
+/**
+ * QA-4.2-2: an explicit terminal entry (the host reported the child ended, with its outcome). A last `idle` without an
+ * outcome is not evidence of an end (defensive), so it is never read as finished.
+ */
+function endedOf(ctx: HostSessionContext | null): boolean {
+  const last = ctx === null ? undefined : ctx.messages[ctx.messages.length - 1];
+  return last !== undefined && last.role === "idle" && last.outcome !== null;
+}
+
 function headerOf(ctx: HostSessionContext | null, sharedContext: string | undefined): ReturnType<typeof parseLaunchHeader> {
   const first = ctx === null ? undefined : ctx.messages.find((m) => m.role === "user");
-  const prompt = first?.text ?? null;
-  if (prompt === null) return null;
+  const raw = first?.text ?? null;
+  if (raw === null) return null;
+  // QA-4.2-1: on v2 the host prefixes every native subagent's first user message with its one preamble line.
+  const prompt = withoutHostPreamble(raw);
   const shared = sharedContext ?? inferSharedContext(prompt);
   return shared === null ? null : parseLaunchHeader(prompt, shared);
 }
@@ -160,8 +173,7 @@ export function createRecoveryService(d: RecoveryDeps): RecoveryEngine {
       const info = await d.host.get(sessionID);
       if (info === null) return false;
       const ctx = await d.host.context(sessionID);
-      const last = ctx.messages[ctx.messages.length - 1];
-      if (last !== undefined && last.role === "idle") return false;
+      if (endedOf(ctx)) return false;
       const h = headerOf(ctx, l.sharedContext);
       return h !== null && h.planId === l.planId;
     } catch (e) {
