@@ -6,7 +6,7 @@
  * before and after its git writes (I4).
  */
 import { createHash, randomBytes } from "node:crypto";
-import { link, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
+import { link, mkdir, open, readdir, readFile, rename, unlink } from "node:fs/promises";
 import * as nodePath from "node:path";
 import {
   AX_MAX_CHARS,
@@ -59,6 +59,10 @@ import {
 } from "../types";
 
 export const PREEMPT_LIMIT = 3, LOCK_HEARTBEAT_MS = 30_000, LOCK_STALE_MS = 600_000, STALLED_POLL_MS = 5_000;
+/** QA-3.2-33: a repo-lock wait is reported once after this long. */
+export const LOCK_WAIT_REPORT_MS = 300_000;
+/** QA-3.2-30: retries of a tag entry of a completed plan (after its 3 tries), with doubling delays from TAG_RETRY_BASE_MS. */
+export const TAG_RETRY_LIMIT = 3, TAG_RETRY_BASE_MS = 60_000;
 
 export interface TaskRange { taskId: TaskId; from: string; to: string }
 
@@ -70,7 +74,7 @@ export interface SuiteRunRequest {
 }
 export type SuiteVerdict = { kind: "passed" } | { kind: "flaky"; ids: string[] } | { kind: "pre-existing"; ids: string[] }
   | { kind: "culprit"; range: TaskRange; ids: string[]; files: string[] }
-  | { kind: "unattributed"; ids: string[]; reason: "outside" | "no-base" | "base-unparsed" }
+  | { kind: "unattributed"; ids: string[]; reason: "outside" | "no-base" | "base-unparsed" | "base-overlap" }
   | { kind: "error"; reason: CheckErrorReason; message: string } | { kind: "interrupted"; by: "abort" | "dispose" };
 export interface RevertRequest {
   planId: PlanId; phaseId: PhaseId; culprit: TaskRange; suiteCommit: string; head: string;
@@ -112,7 +116,7 @@ export interface StepDetailMap {
   "batch-checks": { v: 1; base: string; candidate: string; tasks: TaskId[]; probe?: "memo" } | CheckDetail | RefusedDetail;
   bisect: { v: 1; base: string; candidate: string; tasks: TaskId[]; probe?: "memo" } | CheckDetail
     | { v: 1; candidate: string; taskId: TaskId; probe: "to" | "from" }
-    | { v: 1; verdict: "pass" | "fail"; probes: number; culprit?: RangeDetail; outside?: "from-fails" | "last-passes" }
+    | { v: 1; verdict: "pass" | "fail"; probes: number; culprit?: RangeDetail; outside?: "from-fails" | "last-passes"; files?: string[] }
     | RefusedDetail;
   "fast-forward": { v: 1; from: string; to: string; ranges: RangeDetail[] } | { v: 1; from: string; to: string } | RefusedDetail;
   "phase-suite": { v: 1; commit: string; base: string | null; commands: Array<{ label: string; ref: RunCommandRef | null }> }
@@ -134,7 +138,11 @@ export type StepDetail = StepDetailMap[IntegrationStep];
 export type IntegrationMetricKey =
   | "integration.entry" | "integration.step" | "integration.checks" | "integration.checks.none" | "integration.flaky"
   | "integration.batch" | "integration.bisect.probes" | "integration.suite" | "integration.revert" | "integration.preempt"
-  | "integration.slot.wait" | "integration.tag" | "integration.land" | "integration.resume" | "integration.lock.takeover";
+  | "integration.slot.wait" | "integration.tag" | "integration.land" | "integration.resume" | "integration.lock.takeover"
+  /** A dequeued task that was no longer `verified` when its entry's first batch was built (dropped, no transition). */
+  | "integration.dequeue.skipped"
+  /** A repo-lock wait that outlasted LOCK_WAIT_REPORT_MS (one inbox item per wait). */
+  | "integration.lock.wait";
 
 /** M34: JSON detail capped at 16 KiB; an `output` field keeps its last 4 KiB. */
 export function encodeDetail(detail: StepDetail | Record<string, unknown>): string {
@@ -210,9 +218,20 @@ export interface Lander {
 export interface IntegrationHistory {
   steps(): Promise<readonly IntegrationStepEvent[]>;
 }
-export interface RepoLock { readonly lost: AbortSignal; release(): Promise<void> }
+export interface RepoLock {
+  readonly lost: AbortSignal;
+  release(): Promise<void>;
+  /** Re-reads the lock file: true while it is still ours (QA-3.2-28, checked right before the CAS). Optional for doubles. */
+  verify?(): Promise<boolean>;
+}
+/** What a long repo-lock wait is waiting for (QA-3.2-33). */
+export interface LockWaitInfo {
+  file: string; pid: number | null; hostname: string | null; planId: string | null; heartbeatAgeMs: number | null; waitedMs: number;
+}
 export interface RepoLockFactory {
-  acquire(repoKey: string, holder: { planId: PlanId; entryId: string | null }, signal: AbortSignal): Promise<RepoLock>;
+  /** `onWait` is called at most once per wait, after it outlasted the factory's report delay. */
+  acquire(repoKey: string, holder: { planId: PlanId; entryId: string | null }, signal: AbortSignal,
+    onWait?: (info: LockWaitInfo) => void): Promise<RepoLock>;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -327,10 +346,11 @@ export interface RepoLockWithTakeover extends RepoLock { readonly takeover: "dea
 
 export function createRepoLockFactory(o: {
   stateRoot: string; clock: Clock; pid: number; hostname: string;
-  isPidAlive: (pid: number) => boolean; heartbeatMs?: number; staleMs?: number;
+  isPidAlive: (pid: number) => boolean; heartbeatMs?: number; staleMs?: number; waitReportMs?: number;
 }): RepoLockFactory {
   const heartbeatMs = o.heartbeatMs ?? LOCK_HEARTBEAT_MS;
   const staleMs = o.staleMs ?? LOCK_STALE_MS;
+  const waitReportMs = o.waitReportMs ?? LOCK_WAIT_REPORT_MS;
 
   function lockPath(repoKey: string): string {
     const digest = createHash("sha256").update(repoKey, "utf8").digest("hex");
@@ -441,20 +461,51 @@ export function createRepoLockFactory(o: {
     return o.clock.now() - current.heartbeatAt > staleMs ? "stale" : null;
   }
 
+  /**
+   * Nit (QA-3.2 round 2): removes side files a crashed writer left next to the lock (`<lock>.<pid>.<n>.<hex>.tmp|stale`).
+   * Only ours (this process holds the repo mutex, so none of ours is in flight) or a dead same-host pid's are removed.
+   */
+  async function cleanSides(file: string): Promise<void> {
+    const dir = nodePath.dirname(file);
+    const base = nodePath.basename(file) + ".";
+    let names: string[];
+    try {
+      names = await readdir(dir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      if (!name.startsWith(base) || !(name.endsWith(".tmp") || name.endsWith(".stale"))) continue;
+      const pid = Number(name.slice(base.length).split(".")[0]);
+      if (!Number.isInteger(pid)) continue;
+      if (pid !== o.pid && o.isPidAlive(pid)) continue;
+      await unlink(nodePath.join(dir, name)).catch(() => undefined);
+    }
+  }
+
   return {
-    async acquire(repoKey, holder, signal) {
+    async acquire(repoKey, holder, signal, onWait) {
       const freeMutex = await takeMutex(repoKey, signal);
       const file = lockPath(repoKey);
       const token = randomBytes(8).toString("hex");
       let takeover: "dead-pid" | "stale" | null = null;
+      const startedAt = o.clock.now();
+      let reported = false;
       try {
         await mkdir(nodePath.dirname(file), { recursive: true });
+        await cleanSides(file);
         let suspect: { raw: string; reason: "dead-pid" | "stale" } | null = null;
+        /** Set by a successful compare-and-delete; counted only if our very next create wins (nit: takeover counter). */
+        let removed: "dead-pid" | "stale" | null = null;
         for (;;) {
           if (signal.aborted) throw new ExecutorError("E_DISPOSED", "repo lock wait aborted", { repoKey: repoKey.slice(0, 200) });
           const content: LockFileContent = { pid: o.pid, hostname: o.hostname, planId: holder.planId, entryId: holder.entryId,
             heartbeatAt: o.clock.now(), token };
-          if (await create(file, content)) break;
+          if (await create(file, content)) {
+            takeover = removed;
+            break;
+          }
+          removed = null;
           const raw = await readRaw(file);
           if (raw === null) {
             suspect = null;
@@ -463,10 +514,21 @@ export function createRepoLockFactory(o: {
           const reason = judge(raw);
           if (reason !== null && suspect !== null && suspect.raw === raw && suspect.reason === reason) {
             suspect = null;
-            if (await removeIfSame(file, raw)) takeover = reason;
+            if (await removeIfSame(file, raw)) removed = reason;
             continue;
           }
           suspect = reason === null ? null : { raw, reason };
+          // QA-3.2-33: one report per wait once it outlasted waitReportMs (the holder, its heartbeat age, the file).
+          if (!reported && onWait !== undefined && o.clock.now() - startedAt >= waitReportMs) {
+            reported = true;
+            const cur = parseLockFile(raw);
+            try {
+              onWait({ file, pid: cur?.pid ?? null, hostname: cur?.hostname ?? null, planId: cur?.planId ?? null,
+                heartbeatAgeMs: cur === null ? null : o.clock.now() - cur.heartbeatAt, waitedMs: o.clock.now() - startedAt });
+            } catch {
+              // A reporting failure never breaks the wait.
+            }
+          }
           await sleep(Math.min(heartbeatMs, 1000), signal);
         }
       } catch (e) {
@@ -475,14 +537,17 @@ export function createRepoLockFactory(o: {
       }
       const lost = new AbortController();
       let released = false;
+      /** QA-3.2-27: the beat in flight; release() waits for it before its compare-and-delete. */
+      let beating: Promise<void> | null = null;
       const ours = (raw: string | null): boolean => {
         const current = raw === null ? null : parseLockFile(raw);
         return current !== null && current.pid === o.pid && current.hostname === o.hostname && current.token === token;
       };
-      const beat = async (): Promise<void> => {
+      const beatOnce = async (): Promise<void> => {
         if (released || lost.signal.aborted) return;
         try {
           const raw = await readRaw(file);
+          if (released) return;
           const current = raw === null ? null : parseLockFile(raw);
           if (current === null || !ours(raw)) {
             lost.abort();
@@ -490,6 +555,10 @@ export function createRepoLockFactory(o: {
           }
           // A full side file renamed over the lock: the lock file is never empty or partial (QA-3.2-4).
           const tmp = await writeSide(file, { ...current, heartbeatAt: o.clock.now() });
+          if (released) {
+            await unlink(tmp).catch(() => undefined);
+            return;
+          }
           try {
             await rename(tmp, file);
           } catch (e) {
@@ -499,17 +568,33 @@ export function createRepoLockFactory(o: {
         } catch {
           // A transient read or rename failure is retried at the next beat; only a missing or foreign lock file is a loss.
         }
-        if (!released && !lost.signal.aborted) timer = o.clock.setTimer(heartbeatMs, () => { void beat(); });
+        if (!released && !lost.signal.aborted) timer = o.clock.setTimer(heartbeatMs, beat);
       };
-      let timer = o.clock.setTimer(heartbeatMs, () => { void beat(); });
+      const beat = (): void => {
+        const p = beatOnce();
+        beating = p;
+        void p.finally(() => { if (beating === p) beating = null; });
+      };
+      let timer = o.clock.setTimer(heartbeatMs, beat);
       const lock: RepoLockWithTakeover = {
         lost: lost.signal,
         takeover,
+        async verify() {
+          if (released || lost.signal.aborted) return false;
+          try {
+            if (ours(await readRaw(file))) return true;
+          } catch {
+            return true; // unreadable now: not proof of a loss; the heartbeat decides
+          }
+          lost.abort();
+          return false;
+        },
         async release() {
           if (released) return;
           released = true;
           o.clock.clearTimer(timer);
           try {
+            if (beating !== null) await beating;
             const raw = await readRaw(file);
             if (raw !== null && ours(raw)) await removeIfSame(file, raw);
           } catch {
@@ -556,6 +641,10 @@ class Queue implements IntegrationQueue {
   private readonly stalled = new Map<LiveEntry["lane"], LiveEntry>();
   /** Queued work that waits behind an infrastructure pause with no entry open (QA-3.2-9): the poll kicks it. */
   private pausedWork = false;
+  /** QA-3.2-28: latched at the first lost-lock halt; every later git write stops until a lock is taken again. */
+  private lockLost = false;
+  /** QA-3.2-30: retries so far of a completed plan's tag entry, per phase. */
+  private readonly tagRetries = new Map<PhaseId, number>();
   private stalledTimer: { readonly id: number } | null = null;
   private lock: RepoLock | null = null;
   private integrationLease: SlotLease | null = null;
@@ -663,6 +752,11 @@ class Queue implements IntegrationQueue {
         this.d.logger.warn(`integration queue: could not pause after an illegal transition: ${message(inner)}`);
       }
     }
+    // QA-3.2-34: a stopped queue makes no further git write: it must not keep the repo lock (nor the process's repo mutex)
+    // or its 5 s poll until dispose(). resume() and abort() release the lock in their own `finally`.
+    this.pausedWork = false;
+    this.clearStalled();
+    if (!this.holdLock) await this.releaseLock();
   }
 
   private pauseEvents(l: Readonly<LedgerV1>, reason: string): ExecutorEventInput[] {
@@ -781,14 +875,42 @@ class Queue implements IntegrationQueue {
     }
     let lock: RepoLock;
     try {
-      lock = await this.d.locks.acquire(this.ledger.repo.key, { planId: this.d.planId, entryId }, signal);
+      lock = await this.d.locks.acquire(this.ledger.repo.key, { planId: this.d.planId, entryId }, signal,
+        info => { void this.lockWaitItem(info); });
+    } catch (e) {
+      if (errCode(e) === "E_DISPOSED" || signal.aborted) throw e;
+      // A plan that is not running (land() of a completed plan, resume() of a paused one) has no pause to take and no
+      // poll to retry: the error goes to the caller (land() rejects; the runtime logs it), as before.
+      if (this.ledger.status !== "running") throw e;
+      // QA-3.2-33: a running lane's lock that cannot be taken (filesystem error) is an infrastructure pause with an item,
+      // never a silent lane stop. Work stays queued; the poll retries once the plan runs again.
+      await this.infraPauseQueued(`The repository lock for ${this.ledger.repo.key} could not be taken (${clipText(message(e), 500)}).`);
+      throw new LaneStop(`repo lock unavailable: ${clipText(message(e), 300)}`);
     } finally {
       for (const c of cleanup) c();
     }
     this.lock = lock;
+    this.lockLost = false;
     const takeover = (lock as Partial<RepoLockWithTakeover>).takeover;
     if (takeover === "dead-pid" || takeover === "stale") {
       this.counters.push(counterEvent("integration.lock.takeover", 1, { reason: takeover }));
+    }
+  }
+
+  /** QA-3.2-33: one inbox item for a repo-lock wait that outlasted the factory's report delay. */
+  private async lockWaitItem(info: LockWaitInfo): Promise<void> {
+    if (this.disposed || this.stopped) return;
+    const holder = info.pid === null ? "an unreadable lock file" : `pid ${info.pid} on ${info.hostname ?? "?"} (plan ${info.planId ?? "?"})`;
+    const age = info.heartbeatAgeMs === null ? "unknown" : `${Math.round(info.heartbeatAgeMs / 1000)} s`;
+    const now = this.d.clock.iso();
+    try {
+      const before = this.ledger.inbox.length;
+      const next = await this.append(l => [this.inboxEvent(l, "failure", "blocking", null,
+        `Integration has waited ${Math.round(info.waitedMs / 60_000)} min for the repository lock ${info.file}, held by ${holder}; last heartbeat ${age} ago. If that process is gone or stuck, stop it or remove the lock file.`, now),
+        counterEvent("integration.lock.wait", info.waitedMs, {})]);
+      this.notifyInbox(this.newInbox(next, before));
+    } catch (e) {
+      this.laneError(e);
     }
   }
 
@@ -839,9 +961,15 @@ class Queue implements IntegrationQueue {
   }
 
   /** QA-3.2-4: a lost repo lock means another holder may write; no git write starts after it fired (halt instead). */
-  private async assertLock(live: LiveEntry | null): Promise<void> {
+  private async assertLock(live: LiveEntry | null, verify = false): Promise<void> {
+    // QA-3.2-28: once lost, every later write stops too (resume and abort loops included) until a lock is taken again.
+    if (this.lockLost) throw new LaneStop("integration-lock-lost");
     const lock = this.lock;
-    if (lock === null || !lock.lost.aborted) return;
+    if (lock === null) return;
+    // Right before the CAS the file itself is re-read (token compare): `lost` is only as fresh as the last heartbeat.
+    const gone = lock.lost.aborted || (verify && lock.verify !== undefined && !(await lock.verify()));
+    if (!gone) return;
+    this.lockLost = true;
     this.lock = null;
     await lock.release().catch(() => undefined);
     await this.halt(live, "integration-lock-lost",
@@ -888,7 +1016,14 @@ class Queue implements IntegrationQueue {
    * oldest first), then requeue or rerun as resume() would.
    */
   private async pokeStalled(): Promise<void> {
-    if (this.disposed || this.stopped || this.aborting || this.ledger.status !== "running") return;
+    if (this.disposed || this.stopped || this.aborting) {
+      // QA-3.2-34: a stopped or aborting queue never rolls back in process; its 5 s poll must not re-arm forever.
+      this.pausedWork = false;
+      if (this.stalledTimer !== null) this.d.clock.clearTimer(this.stalledTimer);
+      this.stalledTimer = null;
+      return;
+    }
+    if (this.ledger.status !== "running") return;
     const wake = this.pausedWork;
     this.pausedWork = false;
     if (this.stalled.size === 0) {
@@ -914,6 +1049,12 @@ class Queue implements IntegrationQueue {
       for (const p of phases) await this.checkPhaseSafe(p);
     } catch (e) {
       this.laneError(e);
+      // QA-3.2-29: an entry whose rollback failed is still open in the ledger: keep it stalled for the next poll.
+      if (!this.disposed && !this.stopped) {
+        const open = new Set(this.d.writer.openIntegration().map(o => o.entry.id));
+        for (const live of lives) if (open.has(live.entry.id) && !this.stalled.has(live.lane)) this.markStalled(live);
+      }
+      if (this.serial !== null && this.stalled.get("serial") === this.serial && !this.holdLock) await this.releaseLock();
     }
     this.kick();
   }
@@ -1014,25 +1155,51 @@ class Queue implements IntegrationQueue {
       let upstream: string;
       try {
         upstream = await this.d.igit.mergeBase(top, head, tip);
-        // QA-3.2-10: a reverted task whose original commits are already below the merge base (fast-forwarded without a
-        // rebase, then reverted on the branch) would replay only its fix; rebase from the reverted range's `from` instead.
-        const rv = await this.revertedRange(id);
-        if (rv !== null && rv.to !== rv.from && await this.d.igit.isAncestor(top, rv.to, upstream)
-          && !(rv.revertHead !== null && await this.d.igit.isAncestor(top, rv.revertHead, tip))) {
-          upstream = rv.from;
-        }
       } catch (e) {
+        // Nit (QA-3.2 round 2): `git merge-base` exit 1 = no common ancestor: the task's branch is unrelated (owner repair,
+        // a blocking item), not an infrastructure failure.
+        const detail = e instanceof ExecutorError ? e.detail : null;
+        if (detail !== null && typeof detail === "object" && !Array.isArray(detail) && detail.code === 1) {
+          throw new ExecutorError("E_GIT", `task branch tip ${tip} has no common ancestor with the integration head ${head}`, { taskId: id });
+        }
         throw new GitReadError(`merge-base ${head} ${tip}`, e);
+      }
+      try {
+        upstream = await this.reintegrationUpstream(id, tip, upstream);
+      } catch (e) {
+        throw new GitReadError(`ancestry of ${tip}`, e);
       }
       out.push({ taskId: id, tip, upstream });
     }
     return out;
   }
 
-  /** The range of the latest revert of `id` that reached the branch (closing `revert-fast-forward` ok), from history. */
-  private async revertedRange(id: TaskId): Promise<{ from: string; to: string; revertHead: string | null } | null> {
+  /**
+   * QA-3.2-10 / QA-3.2-25: the rebase upstream of a task that was reverted. A retry built on the old task branch whose
+   * original change lies below the merge base (fast-forwarded as is, then reverted) would replay only its fixes. Unless the
+   * tip already contains the latest revert (a retry rebuilt on the head keeps the merge base), the upstream is the one
+   * journaled in the task's first rebase step (its original base, ancestor of the tip), else the `from` of the OLDEST revert
+   * whose `to` is below the merge base. Any number of reverts keeps the original change.
+   */
+  private async reintegrationUpstream(id: TaskId, tip: string, mergeBase: string): Promise<string> {
+    const reverts = await this.revertedRanges(id);
+    const latest = reverts[reverts.length - 1];
+    if (latest === undefined) return mergeBase;
+    const top = this.ledger.repo.toplevel;
+    if (latest.revertHead !== null && await this.d.igit.isAncestor(top, latest.revertHead, tip)) return mergeBase;
+    const first = await this.firstUpstream(id);
+    if (first !== null && first !== mergeBase && await this.d.igit.isAncestor(top, first, tip)) return first;
+    for (const rv of reverts) {
+      if (rv.to !== rv.from && await this.d.igit.isAncestor(top, rv.to, mergeBase)) return rv.from;
+    }
+    return mergeBase;
+  }
+
+  /** Every revert of `id` that reached the branch (closing `revert-fast-forward` ok), oldest first, from history. */
+  private async revertedRanges(id: TaskId): Promise<Array<{ from: string; to: string; revertHead: string | null }>> {
     const steps = await this.loadSteps();
-    for (let i = steps.length - 1; i >= 0; i--) {
+    const out: Array<{ from: string; to: string; revertHead: string | null }> = [];
+    for (let i = 0; i < steps.length; i++) {
       const ev = steps[i];
       if (ev === undefined || ev.entry.kind !== "revert" || ev.step !== "revert-fast-forward" || !ev.closes || ev.result !== "ok") continue;
       if (ev.entry.taskIds[0] !== id) continue;
@@ -1042,8 +1209,22 @@ class Queue implements IntegrationQueue {
         if (s !== undefined && s.entry.id === ev.entry.id && s.edge === "start" && s.step === "revert-fast-forward") start = parseDetail(s.detail);
       }
       const c = start?.culprit as Partial<RangeDetail> | undefined;
-      if (c === undefined || c.taskId !== id || typeof c.from !== "string" || typeof c.to !== "string") return null;
-      return { from: c.from, to: c.to, revertHead: ev.entry.candidate };
+      if (c === undefined || c.taskId !== id || typeof c.from !== "string" || typeof c.to !== "string") continue;
+      out.push({ from: c.from, to: c.to, revertHead: ev.entry.candidate });
+    }
+    return out;
+  }
+
+  /** The `upstream` journaled for `id` in the first rebase step that planned it (its original base), or null. */
+  private async firstUpstream(id: TaskId): Promise<string | null> {
+    for (const ev of await this.loadSteps()) {
+      if (ev.step !== "rebase" || ev.edge !== "start" || (ev.entry.kind !== "task" && ev.entry.kind !== "batch")) continue;
+      const tasks = parseDetail(ev.detail)?.tasks;
+      if (!Array.isArray(tasks)) continue;
+      for (const t of tasks as unknown[]) {
+        const x = t as { taskId?: unknown; upstream?: unknown } | null;
+        if (x !== null && typeof x === "object" && x.taskId === id && typeof x.upstream === "string") return x.upstream;
+      }
     }
     return null;
   }
@@ -1080,28 +1261,51 @@ class Queue implements IntegrationQueue {
       await this.infraPauseQueued(`Integration of ${ids.join(", ")} could not read its branches ${CHECK_TRIES} times (${clipText(infra ?? "", 500)}).`);
       return;
     }
-    await this.takeLock(null, true);
+    try {
+      await this.takeLock(null, true);
+    } catch (e) {
+      // The requeued group was taken off the list by pickSerial: put it back for the next pass.
+      if (requeue) this.requeued.unshift({ taskIds: [...ids], phaseId: l0.tasks[ids[0] ?? ""]?.phase ?? null, startSeq: 0 });
+      throw e;
+    }
+    // QA-3.2-32: a task cancelled (or otherwise moved on) while this lane read its branches or waited for the repo lock is
+    // dropped here, before any journal line; the rest is integrated.
+    const l1 = this.ledger;
+    const want: TaskState = requeue ? "integrating" : "verified";
+    const keep = ids.filter(id => l1.tasks[id]?.state === want);
+    const dropped = ids.filter(id => !keep.includes(id));
     for (const id of ids) this.dropQueued(id);
-    const phaseId = l0.tasks[ids[0] ?? ""]?.phase ?? null;
+    if (dropped.length > 0) {
+      this.d.logger.warn(`integration queue: ${dropped.join(", ")} no longer ${want} after the repo-lock wait; dropped without an entry`);
+      this.counters.push(counterEvent("integration.dequeue.skipped", dropped.length, { reason: "state-changed" }));
+    }
+    const keptLast = keep[keep.length - 1];
+    const keptSlot = keptLast === undefined ? null : l1.tasks[keptLast]?.slot ?? null;
+    if (keptLast === undefined || keptSlot === null) {
+      if (this.serial === null && !this.holdLock) await this.releaseLock();
+      return;
+    }
+    const keptPlan = plan.filter(p => keep.includes(p.taskId));
+    const phaseId = l1.tasks[keep[0] ?? ""]?.phase ?? null;
     const live = await this.openEntry("serial",
-      { kind: ids.length > 1 ? "batch" : "task", phaseId, taskIds: ids, slot, baseHead: head, candidate: null },
-      "rebase", { v: 1, onto: head, tasks: plan },
+      { kind: keep.length > 1 ? "batch" : "task", phaseId, taskIds: keep, slot: keptSlot, baseHead: head, candidate: null },
+      "rebase", { v: 1, onto: head, tasks: keptPlan },
       // Row 28: verified->integrating per task, then ISS(rebase); requeued tasks are already integrating (ISS only).
       l => {
         if (requeue) return [];
         const out: ExecutorEventInput[] = [];
-        for (const id of ids) {
+        for (const id of keep) {
           if (l.tasks[id]?.state === "verified") {
             out.push(...this.tt(l, id, "integrating", "dequeued"));
             continue;
           }
           // Nit (QA-3.2): never drop a row-28 transition silently; the ledger then judges the entry.
           this.d.logger.warn(`integration queue: ${id} is ${l.tasks[id]?.state ?? "unknown"}, not verified, at dequeue; no verified->integrating transition`);
-          out.push(counterEvent("integration.entry", 1, { kind: "task", outcome: "not-verified" }));
+          out.push(counterEvent("integration.dequeue.skipped", 1, { reason: "not-verified-at-batch" }));
         }
         return out;
       });
-    await this.integrateStack(live, ids, plan);
+    await this.integrateStack(live, keep, keptPlan);
   }
 
   /** M13a with no entry open: [status-changed running->paused "integration-infrastructure", IA critical]; work stays queued. */
@@ -1161,6 +1365,7 @@ class Queue implements IntegrationQueue {
         prev = r.head;
         continue;
       }
+      await this.assertLock(live); // QA-3.2-28: rebaseAbort is a write too
       await this.d.git.rebaseAbort(lease.path);
       if (prev !== head) {
         deferred.push(p.taskId);
@@ -1252,6 +1457,7 @@ class Queue implements IntegrationQueue {
     let n = 0;
     for (;;) {
       await this.start(live, step, { v: 1, base: head, candidate, tasks }, { candidate });
+      await this.assertLock(live); // QA-3.2-28: the checks prepare (reset + clean) the slot first
       const r = await this.d.checks.run({ slot: lease, base: head, candidate, priority: "foreground", extra: null, signal: this.ctl.signal });
       // QA-3.2-13: once the outer signal fired the run is interrupted whatever it returned: no failed/onFailed during abort.
       if (this.ctl.signal.aborted) throw new LaneStop("checks interrupted");
@@ -1367,6 +1573,8 @@ class Queue implements IntegrationQueue {
       this.safe(() => this.d.listener.onIntegrated(id));
     }
     for (const p of phases) await this.checkPhaseSafe(p);
+    // QA-3.2-31: a phase with no task of its own integrates when the phases it depends on do: wake those dependents.
+    for (const q of dependentPhases(this.ledger, phases)) await this.checkPhaseSafe(q);
   }
 
   /**
@@ -1406,12 +1614,16 @@ class Queue implements IntegrationQueue {
     }
     const dirty = at === head ? (await this.d.git.statusPorcelain(wt)).length > 0 : true;
     if (at !== head || dirty) await this.d.pool.reset(lease.slot, head);
+    // QA-3.2-36: abort() fired: no merge and no CAS; the step stays open and abort() rolls the entry back.
+    if (this.ctl.signal.aborted) throw new LaneStop("aborted before the merge");
     const merged = await this.d.git.mergeFfOnly(wt, candidate);
     if (!merged.ok || merged.head !== candidate) {
       await this.halt(live, "ff-refused",
         `git merge --ff-only ${candidate} was refused in the integration worktree (head ${head}). The plan is paused; resume() rolls the entry back.`);
     }
-    await this.assertLock(live);
+    if (this.ctl.signal.aborted) throw new LaneStop("aborted before the CAS");
+    // QA-3.2-28: the lock file is re-read (token compare) right before the CAS, not only the last heartbeat's verdict.
+    await this.assertLock(live, true);
     try {
       await this.d.git.branchForce(l.integration.branch, candidate, head);
     } catch (e) {
@@ -1757,7 +1969,11 @@ class Queue implements IntegrationQueue {
     if (res.kind !== "runs" && gate !== "start") {
       // QA-3.2-2: a suite state (suite-running with no entry, or suite-failed on a rerun) is never left without a run:
       // no gate event; the phase pauses with a critical item (M21 "never skipped silently", A2-1 "never stuck silently").
-      await this.suiteRefused(p, `the suite resolves to "${res.kind}" at head ${head} while the gate is ${ph.gate}, so it cannot run and the gate stays ${ph.gate}. Restore the phase's tests, then unpause phase ${p} to run the suite`);
+      // Nit A-3.2-1: `off` comes from the plan's approved `phaseSuite` setting, not from missing tests.
+      const remedy = res.kind === "off"
+        ? "The plan's approved phaseSuite setting is \"off\": set phaseSuite (re-approve the plan's config) or move the gate on by hand"
+        : "Restore the phase's tests";
+      await this.suiteRefused(p, `the suite resolves to "${res.kind}" at head ${head} while the gate is ${ph.gate}, so it cannot run and the gate stays ${ph.gate}. ${remedy}, then unpause phase ${p} to run the suite`);
       return;
     }
     if (res.kind !== "runs") {
@@ -1792,6 +2008,8 @@ class Queue implements IntegrationQueue {
   private async closeSuite(live: LiveEntry, p: PhaseId, commit: string, v: SuiteVerdict, startedAt: number,
     commands: readonly ResolvedCommand[]): Promise<void> {
     if (v.kind === "interrupted") throw new LaneStop(`suite interrupted by ${v.by}`);
+    // QA-3.2-36: abort()/dispose() fired while the run returned: no gate, pause or inbox event; abort() closes the entry.
+    if (this.bgCtl.signal.aborted || this.aborting) throw new LaneStop("suite closed after abort");
     if (v.kind === "error") {
       if (live.open !== null) await this.end(live, "refused", { v: 1, reason: v.reason, message: clipText(v.message, 1000) }, false);
       return this.infraPause(live, `The phase suite of ${p} could not run (${v.reason}: ${clipText(v.message, 500)}).`);
@@ -1818,7 +2036,9 @@ class Queue implements IntegrationQueue {
           ...(flaky ? [counterEvent("integration.flaky", v.ids.length, { where: "suite" })] : [])]);
     } else if (v.kind === "culprit") {
       gate = "suite-failed";
-      next = await this.end(live, "failed", { v: 1, verdict: "fail", probes: 0, culprit: { taskId: v.range.taskId, from: v.range.from, to: v.range.to } },
+      // QA-3.2-24: the failing files ride in the closing detail, so a revert rebuilt from history (restart) still has them.
+      next = await this.end(live, "failed", { v: 1, verdict: "fail", probes: 0, culprit: { taskId: v.range.taskId, from: v.range.from, to: v.range.to },
+        files: [...v.files] },
         true, v.ids, l => [...this.gateEvent(l, p, "suite-running", "suite-failed", "suite-culprit-found"),
           counterEvent("integration.suite", ms, { verdict: "culprit" })]);
       const resolved = await this.d.suite.resolve(this.ledger, p, commit).catch(() => null);
@@ -1827,6 +2047,7 @@ class Queue implements IntegrationQueue {
     } else {
       const why = v.reason === "outside" ? "the failure lies outside the phase's task ranges (outside)"
         : v.reason === "no-base" ? "the phase has no recorded base to compare against (no-base)"
+        : v.reason === "base-overlap" ? "every failing file also fails at the phase base, so the regression cannot be probed apart from the pre-existing failures (base-overlap)"
         : "the base check's output could not be parsed into test ids, so pre-existing failures cannot be told apart (base-unparsed)";
       next = await this.end(live, "failed", { v: 1, verdict: "fail", probes: 0, outside: v.reason === "outside" ? "last-passes" : undefined }, true, v.ids,
         l => [{ type: "phase-paused", phaseId: p, paused: true, reason: "suite-unattributed" },
@@ -1856,7 +2077,9 @@ class Queue implements IntegrationQueue {
     if (c === undefined || typeof c.taskId !== "string" || typeof c.from !== "string" || typeof c.to !== "string") return null;
     const commit = suite.entry.candidate ?? suite.entry.baseHead;
     const resolved = await this.d.suite.resolve(this.ledger, p, commit).catch(() => null);
-    return { phaseId: p, culprit: { taskId: c.taskId, from: c.from, to: c.to }, suiteCommit: commit, ids: [...suite.failingIds], files: [],
+    // QA-3.2-24: ids from the closing end's failingIds, files from its detail (written since round 2).
+    const files = Array.isArray(detail?.files) ? (detail.files as unknown[]).filter((f): f is string => typeof f === "string") : [];
+    return { phaseId: p, culprit: { taskId: c.taskId, from: c.from, to: c.to }, suiteCommit: commit, ids: [...suite.failingIds], files,
       commands: resolved !== null && resolved.kind === "runs" ? resolved.commands : [], rerun: null };
   }
 
@@ -1870,7 +2093,12 @@ class Queue implements IntegrationQueue {
     if (culprit === undefined || culprit.state !== "integrated") {
       if (rv.rerun === null) return;
     }
-    await this.takeLock(rv.rerun?.entry.id ?? null, true);
+    try {
+      await this.takeLock(rv.rerun?.entry.id ?? null, true);
+    } catch (e) {
+      this.reverts.unshift(rv); // taken off by pickSerial: keep it pending
+      throw e;
+    }
     const head = l.integration.head;
     const live = rv.rerun ?? await this.openEntry("serial",
       { kind: "revert", phaseId: rv.phaseId, taskIds: [rv.culprit.taskId], slot: "integration", baseHead: head, candidate: null },
@@ -1982,7 +2210,12 @@ class Queue implements IntegrationQueue {
     const l = this.ledger;
     const ph = l.phases.find(x => x.id === p);
     if (ph === undefined || ph.gate !== "passed" || ph.tag !== null) return;
-    await this.takeLock(null, true);
+    try {
+      await this.takeLock(null, true);
+    } catch (e) {
+      if (!this.tags.includes(p)) this.tags.unshift(p); // taken off by pickSerial: keep it due
+      throw e;
+    }
     const head = l.integration.head;
     const name = this.d.lander.tagName(this.d.planId, p);
     const live = await this.openEntry("serial", { kind: "tag", phaseId: p, taskIds: [], slot: null, baseHead: head, candidate: head },
@@ -2020,8 +2253,35 @@ class Queue implements IntegrationQueue {
         return "none";
       }
       await this.end(live, "refused", { v: 1, reason: "error", n, message: clipText(r.message, 1000) }, false);
-      if (n >= CHECK_TRIES) await this.infraPause(live, `The phase tag ${name} could not be created (${clipText(r.message, 500)}).`);
+      if (n >= CHECK_TRIES) {
+        if (this.ledger.status === "running") await this.infraPause(live, `The phase tag ${name} could not be created (${clipText(r.message, 500)}).`);
+        // QA-3.2-30: a completed plan has no pause to lift: roll the entry back and retry later (bounded), then give up.
+        await this.retryTagLater(live, p, name, commit, r.message);
+        return "none";
+      }
     }
+  }
+
+  /** QA-3.2-30: rolls a completed plan's failing tag entry back; retries after TAG_RETRY_BASE_MS * 2^k, at most TAG_RETRY_LIMIT times. */
+  private async retryTagLater(live: LiveEntry, p: PhaseId, name: string, commit: string, why: string): Promise<void> {
+    await this.rollbackEntry(this.toOpen(live), "stalled");
+    const k = (this.tagRetries.get(p) ?? 0) + 1;
+    this.tagRetries.set(p, k);
+    if (k > TAG_RETRY_LIMIT) {
+      const now = this.d.clock.iso();
+      const before = this.ledger.inbox.length;
+      const top = this.ledger.repo.toplevel;
+      const next = await this.append(l => [this.inboxEvent(l, "failure", "blocking", null,
+        `The phase tag ${name} could not be created after ${k} rounds of ${CHECK_TRIES} tries (${clipText(why, 500)}). The plan is complete, so integration stops retrying it. Create it by hand: git -C "${top}" tag ${name} ${commit}`, now),
+        counterEvent("integration.tag", 1, { outcome: "gave-up" })]);
+      this.notifyInbox(this.newInbox(next, before));
+      return;
+    }
+    this.d.clock.setTimer(TAG_RETRY_BASE_MS * 2 ** (k - 1), () => {
+      if (this.disposed || this.aborting || this.tags.includes(p)) return;
+      this.tags.push(p);
+      this.kick();
+    });
   }
 
   // -------------------------------------------------------------------------------------------------------------
@@ -2037,7 +2297,8 @@ class Queue implements IntegrationQueue {
     for (const ev of steps) if (ev.entry.kind === "land" && ev.closes) lastLand = ev;
     if (lastLand !== null && lastLand.result === "ok" && lastLand.entry.candidate === head) {
       const base = await this.d.igit.readRef(l0.repo.toplevel, `refs/heads/${l0.repo.baseBranch}`).catch(() => null);
-      if (base === head) return { landed: true, inbox: null };
+      // QA-3.2-35: a base branch that already contains the landed head (the owner committed on top) is landed too.
+      if (base !== null && await this.baseContains(base, head)) return { landed: true, inbox: null };
     }
     return this.withSerial(async () => {
       await this.takeLock(null);
@@ -2289,14 +2550,23 @@ class Queue implements IntegrationQueue {
     const base = await this.d.igit.readRef(l.repo.toplevel, `refs/heads/${l.repo.baseBranch}`).catch(() => null);
     if (live.open !== null && live.open !== "land") await this.end(live, "rolled-back", { v: 1, reason: "resume" }, false);
     if (live.open === null) await this.start(live, "land", { v: 1, mode: l.config.land, toplevel: l.repo.toplevel, baseBranch: l.repo.baseBranch });
-    if (base === candidate) {
-      await this.end(live, "ok", { v: 1, to: candidate }, true, [], () => [counterEvent("integration.land", 1, { mode: l.config.land, outcome: "landed" })]);
+    // QA-3.2-35: landed when the base branch is at the candidate or already contains it (owner commits on top), the same
+    // rule as land.ts's no-op inspection.
+    if (base !== null && await this.baseContains(base, candidate)) {
+      // One no-op convention with land.ts: from = to = the candidate (every landed outcome's `to` is the candidate).
+      await this.end(live, "ok", { v: 1, from: candidate, to: candidate }, true, [], () => [counterEvent("integration.land", 1, { mode: l.config.land, outcome: "landed" })]);
       report.entries.push({ id: o.entry.id, kind: o.entry.kind, action: "completed" });
       return false;
     }
     await this.end(live, "rolled-back", { v: 1, reason: "resume" }, true);
     report.entries.push({ id: o.entry.id, kind: o.entry.kind, action: "rerun" });
     return true;
+  }
+
+  /** QA-3.2-35: the base tip is the candidate or a descendant of it (read-only; a git failure counts as "not landed"). */
+  private async baseContains(base: string, candidate: string): Promise<boolean> {
+    if (base === candidate) return true;
+    return this.d.igit.isAncestor(this.ledger.repo.toplevel, candidate, base).catch(() => false);
   }
 
   /** §4.8 step 0 (c): [status-changed running->paused (only if running), IA critical]; halted, without the latch. */
@@ -2320,7 +2590,14 @@ class Queue implements IntegrationQueue {
     let landAgain = false;
     const phases = new Set<PhaseId>();
     const halted = await this.withSerial(async () => {
-      await this.takeLock(null);
+      try {
+        await this.takeLock(null);
+      } catch (e) {
+        // QA-3.2-33: the lock could not be taken; takeLock already paused with an item. Halted without the latch.
+        if (!(e instanceof LaneStop)) throw e;
+        report.halted = true;
+        return true;
+      }
       this.holdLock = true;
       try {
         // Step 0: reconcile the branch tip with integration.head.
@@ -2340,7 +2617,15 @@ class Queue implements IntegrationQueue {
           return true;
         }
         if (tip !== head) {
-          const ahead = await this.d.igit.isAncestor(this.ledger.repo.toplevel, head, tip).catch(() => false);
+          let ahead: boolean;
+          try {
+            ahead = await this.d.igit.isAncestor(this.ledger.repo.toplevel, head, tip);
+          } catch (e) {
+            // Nit: a git failure is infrastructure, never "moved".
+            await this.resumeHalt(report, "integration-infrastructure",
+              `resume() could not compare ${head} with the branch tip ${tip} (${clipText(message(e), 500)}); this is an infrastructure failure, the branch was not judged. Integration is halted; nothing was changed. Fix git access, unpause and resume.`);
+            return true;
+          }
           const o = ahead
             ? this.d.writer.openIntegration().find(x => (x.step === "fast-forward" || x.step === "revert-fast-forward") && x.edge === "start" && x.entry.candidate === tip)
             : undefined;
@@ -2367,6 +2652,11 @@ class Queue implements IntegrationQueue {
           } catch (e) {
             if (!(e instanceof LaneStop)) throw e;
             report.entries.push({ id: o.entry.id, kind: o.entry.kind, action: "none" });
+            // QA-3.2-28: after a lost-lock halt no later entry is rolled back without the lock: stop, halted, no latch.
+            if (this.lockLost) {
+              report.halted = true;
+              return true;
+            }
           }
         }
         // Step 2: orphans (integrating, in no open entry, exempt), after the step-1 requeues, in plan order.
@@ -2408,6 +2698,8 @@ class Queue implements IntegrationQueue {
 
   private async doAbort(): Promise<void> {
     this.aborting = true;
+    // QA-3.2-34: queued work behind an infrastructure pause would otherwise keep the 5 s poll armed forever.
+    this.pausedWork = false;
     this.clearStalled();
     this.ctl.abort();
     this.bgCtl.abort();
@@ -2446,6 +2738,9 @@ class Queue implements IntegrationQueue {
         const all = [...lives, ...synth];
         const resets = new Map<string, string | null>();
         for (const live of all) {
+          // QA-3.2-28: after a lost-lock halt no further rollback git runs; the entries stay open (rollback started) for
+          // the next writer's resume(), and abort() rejects (A1-8: the runtime logs it).
+          if (this.lockLost) throw new LaneStop("repo lock lost during abort");
           try {
             resets.set(live.entry.id, await this.rollbackGit(live.entry));
           } catch (e) {
@@ -2526,6 +2821,22 @@ export function phaseIntegrated(l: Readonly<LedgerV1>, p: PhaseId, path: readonl
   const ph = l.phases.find(x => x.id === p);
   if (ph === undefined || path.includes(p)) return false;
   return ph.dependsOn.every(dep => phaseIntegrated(l, dep, [...path, p]));
+}
+
+/** QA-3.2-31: the phases that depend on any of `ps`, transitively (each once, in plan order), excluding `ps` themselves. */
+export function dependentPhases(l: Readonly<LedgerV1>, ps: Iterable<PhaseId>): PhaseId[] {
+  const seen = new Set<PhaseId>(ps);
+  const out: PhaseId[] = [];
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const ph of l.phases) {
+      if (seen.has(ph.id) || !ph.dependsOn.some(d => seen.has(d))) continue;
+      seen.add(ph.id);
+      out.push(ph.id);
+      grew = true;
+    }
+  }
+  return out;
 }
 
 /** True when phase `p` has at least one non-qa task of its own (a suite has something to attribute). */

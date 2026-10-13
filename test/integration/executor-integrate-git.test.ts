@@ -535,9 +535,35 @@ describe("landing on real git (3.2.5)", SLOW, () => {
     const moved = commitFiles(s.repo, "owner moved on after landing", { "owner.txt": "owner work\n" });
     const before = ownerState(s.repo, "owner.txt");
     expect(await s.lander.inspect(s.req)).toEqual({ ok: true, baseTip: moved, noop: true });
-    expect(await s.lander.fastForward(s.req)).toEqual({ kind: "landed", from: moved, to: s.cand });
+    // The no-op lands the empty range candidate..candidate (land.ts fastForward).
+    expect(await s.lander.fastForward(s.req)).toEqual({ kind: "landed", from: s.cand, to: s.cand });
     expect(git(s.repo, "rev-parse", "main")).toBe(moved);
     expect(ownerState(s.repo, "owner.txt")).toEqual(before);
+  });
+
+  // QA-3.2-35: the no-op is decided before the checked-out and clean checks: an owner who moved on to another branch with a
+  // dirty tree, while the base already contains the candidate, gets a no-op success and nothing in the checkout is touched.
+  it("an owner on another branch with a dirty tree whose base already contains the candidate: no-op success, nothing touched", async () => {
+    const s = landSetup("contains-dirty");
+    expect(await s.lander.fastForward(s.req)).toEqual({ kind: "landed", from: s.c0, to: s.cand });
+    const moved = commitFiles(s.repo, "owner moved on after landing", { "owner.txt": "owner work\n" });
+    git(s.repo, "checkout", "-q", "-b", "elsewhere");
+    writeFileSync(join(s.repo, "owner.txt"), "edited, not committed\n");
+    writeFileSync(join(s.repo, "scratch.txt"), "untracked\n");
+    const before = ownerState(s.repo, "owner.txt");
+    const indexBefore = statSync(join(s.repo, ".git", "index")).mtimeMs;
+    expect(before.ref).toBe("refs/heads/elsewhere");
+    expect(before.status).not.toBe("");
+    expect(await s.lander.inspect(s.req)).toEqual({ ok: true, baseTip: moved, noop: true });
+    expect(await s.lander.fastForward(s.req)).toEqual({ kind: "landed", from: s.cand, to: s.cand });
+    // Also when the base tip is the candidate itself.
+    git(s.repo, "branch", "-f", "main", s.cand);
+    expect(await s.lander.fastForward(s.req)).toEqual({ kind: "landed", from: s.cand, to: s.cand });
+    // The index first (the git status of ownerState may refresh it), then HEAD, status and the files.
+    expect(statSync(join(s.repo, ".git", "index")).mtimeMs).toBe(indexBefore);
+    expect(ownerState(s.repo, "owner.txt")).toEqual(before);
+    expect(read(join(s.repo, "scratch.txt"))).toBe("untracked\n");
+    expect(git(s.repo, "rev-parse", "main")).toBe(s.cand);
   });
 
   // QA-3.2-20: the read probes in the owner checkout carry the hardening args (a configured core.fsmonitor must not run).
@@ -939,15 +965,17 @@ async function queueSetup(spec: QueueSpec) {
   const warnings: string[] = [];
   const lockRoot = join(base, `locks-${spec.tag}`);
   mkdirSync(lockRoot, { recursive: true });
+  // Earlier integration steps of the plan that the test built in git by hand (older than the journal's own).
+  const historyExtra: IntegrationStepEvent[] = [];
   const newQueue = (writer: LedgerWriter) => createIntegrationQueue({
-    planId: PLAN, writer, history: { steps: () => historySteps(store, PLAN) }, git: env.ops, igit: env.igit, pool: env.pool,
+    planId: PLAN, writer, history: { steps: async () => [...historyExtra, ...(await historySteps(store, PLAN))] }, git: env.ops, igit: env.igit, pool: env.pool,
     leases: recordingLeases(released), checks, suite, lander, listener, settle: (_id, release) => { void release(); },
     locks: createRepoLockFactory({ stateRoot: lockRoot, clock: realClock(), pid: process.pid, hostname: hostname(), isPidAlive: (pid) => nodeSpawner().isAlive(pid) }),
     guard: env.guard, clock: realClock(), logger: { warn: (m) => { warnings.push(m); } },
   });
   return {
     repo, c0, env, store, holder, inv, violations, afterBatch, calls, checkRuns, listened, released, warnings, integrationBranch, newQueue,
-    draft,
+    draft, historyExtra, branches,
   };
 }
 
@@ -1104,7 +1132,10 @@ describe("the integration queue with the real LedgerStore on real git (3.2.3)", 
       expectNotHalted(await q.resume(), writer.ledger, s.warnings, s.listened);
       q.enqueue(["T1"]);
       const gate = (): string | undefined => writer.ledger.phases.find((p) => p.id === "p1")?.gate;
-      await until(() => settled(writer.ledger) && gate() !== "pending" && gate() !== "suite-running" && writer.openIntegration().length === 0,
+      // The ledger shows the closing batch while the instrumented writer still runs its after-batch invariant checks (real
+      // git), i.e. before append() resolves and the queue calls onGate: wait for the listener call as well.
+      await until(() => settled(writer.ledger) && gate() !== "pending" && gate() !== "suite-running" && writer.openIntegration().length === 0
+        && s.listened.includes(`gate p1 ${gate() ?? ""}`),
         "the phase suite", () => describeQueue(writer.ledger, s.warnings, s.listened));
       expect(writer.ledger.tasks["T1"]?.state).toBe("integrated");
       expect(gate()).toBe("awaiting-qa");
@@ -1117,6 +1148,88 @@ describe("the integration queue with the real LedgerStore on real git (3.2.3)", 
       const steps = await historySteps(s.store, PLAN);
       const suiteStart = steps.find((e) => e.step === "phase-suite" && e.edge === "start");
       expect(suiteStart?.detail).toContain("test-files");
+      checkInvariants(s.inv);
+      expect(s.violations).toEqual([]);
+    } finally {
+      await q.dispose();
+      await writer.close();
+    }
+  });
+
+  // QA-3.2-25: a task the phase suite reverted twice keeps its original change when its second retry integrates. The two
+  // earlier rounds are built in git by hand, as the queue builds them (F = c0, each retry adds a fix on the old task branch):
+  //   integration: F - C1 - R1 (reverts C1) - C1' - fix1' - R2 (reverts fix1', then C1')
+  //   task branch: F - C1 - fix1 - fix2
+  // Rebasing the retry from the last revert's `from` (R1) or from merge-base(R2, branch) = C1 replays only the fixes, and a
+  // rebase that skips the commits whose patches are already upstream (C1', fix1') drops C1 and fix1: C1 must come back.
+  it("a task reverted twice keeps its original change after its second retry integrates", async () => {
+    const s = await queueSetup({
+      tag: "double-revert", fixture: "node-basic", base: { "src/value.txt": "base\n" }, ownerFile: "src/value.txt", batchMax: 1,
+      phaseSuite: "off", tasks: [{ id: "T1", files: { "src/t1.txt": "T1 original\n" } }],
+    });
+    const F = s.c0;
+    const taskRef = `refs/heads/${taskBranchName(PLAN, "T1")}`;
+    const intRef = `refs/heads/${s.integrationBranch}`;
+    const C1 = git(s.repo, "rev-parse", taskRef);
+    const as = ["-c", "user.name=Setup", "-c", "user.email=setup@example.test", "-c", "commit.gpgSign=false"];
+    const revert = (sha: string): string => {
+      git(s.repo, ...as, "revert", "--no-edit", sha);
+      return git(s.repo, "rev-parse", "HEAD");
+    };
+    // Round 1: C1 integrated as is (fast-forward), then reverted.
+    git(s.repo, "checkout", "-q", "--detach", C1);
+    const R1 = revert(C1);
+    // Retry 1: the old task branch plus a fix, rebased from F onto R1 (C1', fix1'), integrated, then reverted newest first.
+    git(s.repo, "checkout", "-q", "--detach", C1);
+    const X1 = commitFiles(s.repo, "T1 fix 1", { "src/t1-fix1.txt": "fix 1\n" });
+    git(s.repo, "checkout", "-q", "--detach", R1);
+    git(s.repo, ...as, "cherry-pick", C1, X1);
+    const I2 = git(s.repo, "rev-parse", "HEAD");
+    revert(I2);
+    const R2 = revert(`${I2}~1`);
+    expect(spawnSync("git", ["cat-file", "-e", `${R2}:src/t1.txt`], { cwd: s.repo, env: isolatedEnv() }).status).not.toBe(0);
+    // Retry 2: the old task branch plus a second fix; verified in its slot.
+    git(s.repo, "checkout", "-q", "--detach", X1);
+    const X2 = commitFiles(s.repo, "T1 fix 2", { "src/t1-fix2.txt": "fix 2\n" });
+    git(s.repo, "checkout", "-q", "main");
+    git(s.repo, "update-ref", taskRef, X2, C1);
+    const slot = s.draft.tasks["T1"]?.slot;
+    if (slot === null || slot === undefined) throw new Error("T1 has no slot");
+    await s.env.pool.reset(slot, X2);
+    // The integration branch, its worktree and the ledger head are at R2.
+    git(s.draft.integration.worktree, "checkout", "-q", "--detach", R2);
+    git(s.repo, "update-ref", intRef, R2, s.c0);
+    s.draft.integration.head = R2;
+    s.inv.passed.add(R2);
+    s.inv.tips.push(R2);
+    const revertStep = (e: IntegrationEntry, edge: "start" | "end", detail: object, seq: number): IntegrationStepEvent => ({
+      type: "integration-step", edge, entry: e, step: "revert-fast-forward", result: edge === "end" ? "ok" : null,
+      detail: JSON.stringify(detail), failingIds: [], closes: edge === "end", seq, at: T0, batch: seq, last: true,
+    });
+    const rv1: IntegrationEntry = { id: "i-901", kind: "revert", phaseId: "p1", taskIds: ["T1"], slot: "integration", baseHead: C1, candidate: R1 };
+    const rv2: IntegrationEntry = { id: "i-902", kind: "revert", phaseId: "p1", taskIds: ["T1"], slot: "integration", baseHead: I2, candidate: R2 };
+    s.historyExtra.push(
+      revertStep(rv1, "start", { v: 1, from: C1, to: R1, culprit: { taskId: "T1", from: F, to: C1 }, suiteCommit: C1 }, 1),
+      revertStep(rv1, "end", { v: 1, from: C1, to: R1 }, 2),
+      revertStep(rv2, "start", { v: 1, from: I2, to: R2, culprit: { taskId: "T1", from: R1, to: I2 }, suiteCommit: I2 }, 3),
+      revertStep(rv2, "end", { v: 1, from: I2, to: R2 }, 4),
+    );
+    const inner = await s.store.create(s.draft, s.holder);
+    const writer = instrumentedWriter(inner, s.afterBatch, null);
+    const q = s.newQueue(writer);
+    try {
+      expectNotHalted(await q.resume(), writer.ledger, s.warnings, s.listened);
+      q.enqueue(["T1"]);
+      await until(() => settled(writer.ledger) && writer.openIntegration().length === 0, "T1 settled",
+        () => describeQueue(writer.ledger, s.warnings, s.listened));
+      const why = describeQueue(writer.ledger, s.warnings, s.listened);
+      expect(writer.ledger.tasks["T1"]?.state, why).toBe("integrated");
+      const tip = git(s.repo, "rev-parse", intRef);
+      expect(writer.ledger.integration.head).toBe(tip);
+      expect(await s.env.ops.isAncestor(R2, tip)).toBe(true);
+      expect(git(s.repo, "show", `${tip}:src/t1.txt`), "the original change of T1").toBe("T1 original");
+      expect(git(s.repo, "show", `${tip}:src/t1-fix1.txt`)).toBe("fix 1");
+      expect(git(s.repo, "show", `${tip}:src/t1-fix2.txt`)).toBe("fix 2");
       checkInvariants(s.inv);
       expect(s.violations).toEqual([]);
     } finally {
@@ -1160,15 +1273,24 @@ const SUITE_COMMAND: ResolvedCommand = { label: "node suite.js", file: process.e
  * Six task commits on main after c0 (the phase base): task 3 edits only lib.txt, which use.txt expects, so the suite
  * breaks in a file the task does not touch (a transitive breakage). With `conflict`, task 5 edits the same line of lib.txt.
  */
-function suiteSetup(tag: string, o: { conflict?: boolean; redBase?: boolean } = {}, extraEnv: Readonly<Record<string, string>> = {}) {
+function suiteSetup(
+  tag: string, o: { conflict?: boolean; redBase?: boolean; vitestProj?: boolean; collect?: boolean } = {}, extraEnv: Readonly<Record<string, string>> = {},
+) {
   // `redBase`: the phase base already fails one check (always.txt is not green) that no task fixes (QA-3.2-1).
+  // `vitestProj`: the suite prints vitest workspace output, every failing id prefixed with `|proj|` (QA-3.2-22).
+  // `collect`: a red base (always.txt) and task 3 adds mods/b.mod.js, which cannot load: a collection error (QA-3.2-23).
   const { repo, c0 } = o.redBase === true
     ? newRepo(`suite-${tag}`, "suite-redbase", { "lib.txt": "v1\n", "use.txt": "expects v1\n", "always.txt": "red\n" })
-    : newRepo(`suite-${tag}`, "suite-6", { "lib.txt": "v1\n", "use.txt": "expects v1\n" });
+    : o.vitestProj === true
+      ? newRepo(`suite-${tag}`, "suite-vitest-proj", { "lib.txt": "v1\n", "use.txt": "expects v1\n", "test/a.test.ts": "// the test file of the ids\n" })
+      : o.collect === true
+        ? newRepo(`suite-${tag}`, "suite-collect", { "lib.txt": "v1\n", "always.txt": "red\n", "mods/a.mod.js": "module.exports = 1;\n" })
+        : newRepo(`suite-${tag}`, "suite-6", { "lib.txt": "v1\n", "use.txt": "expects v1\n" });
+  const task3: Record<string, string> = o.collect === true ? { "mods/b.mod.js": "module.exports = require(\"./missing-dep\");\n" } : { "lib.txt": "v2\n" };
   const ranges: TaskRange[] = [];
   let prev = c0;
   for (let n = 1; n <= 6; n++) {
-    const files = n === 3 ? { "lib.txt": "v2\n" } : n === 5 && o.conflict === true ? { "lib.txt": "v3\n" } : { [`t${n}.txt`]: `task ${n}\n` };
+    const files = n === 3 ? task3 : n === 5 && o.conflict === true ? { "lib.txt": "v3\n" } : { [`t${n}.txt`]: `task ${n}\n` };
     const sha = commitFiles(repo, `task ${n}`, files);
     ranges.push({ taskId: `T${n}`, from: prev, to: sha });
     prev = sha;
@@ -1204,6 +1326,44 @@ describe("phase suite on real git (3.2.4)", SLOW, () => {
     expect(git(s.repo, "rev-parse", "main")).toBe(s.head);
     expect(git(ci.path, "status", "--porcelain")).toBe("");
   });
+
+  // QA-3.2-22: vitest prints the ids of a workspace project as `|proj| test/a.test.ts > …`. As the `npm test` command, a
+  // rerun asks the runner for the files of the ids; `|proj| test/a.test.ts` is no file, so a rerun that drops it runs
+  // nothing and exits clean. That is no evidence: the reproduced failure must not turn flaky (nor pass).
+  it("a |proj|-prefixed vitest id whose rerun runs nothing is not flaky: culprit T3 or unattributed", async () => {
+    const s = suiteSetup("vitest-proj", { vitestProj: true });
+    expect(runNode(s.repo, "suite.js")).not.toBe(0);
+    await s.env.pool.open();
+    const ci = await s.env.pool.acquireSpecial(PLAN, "ci");
+    const { j } = fakeJournal(s.env, "phase-suite");
+    const npmTest: ResolvedCommand = {
+      label: "npm test", file: process.execPath, args: ["suite.js"], source: "package-script", ref: { script: "test", args: [] },
+    };
+    const verdict = await s.runner.run({ planId: PLAN, phaseId: "p1", commit: s.head, base: s.c0, ranges: s.ranges, commands: [npmTest], slot: ci }, j);
+    expect(["culprit", "unattributed"], `verdict ${JSON.stringify(verdict)}`).toContain(verdict.kind);
+    if (verdict.kind === "culprit") expect(verdict.range.taskId).toBe("T3");
+    expect(git(s.repo, "rev-parse", s.branch)).toBe(s.head);
+  });
+
+  // QA-3.2-23: the base already fails (always.txt) and task 3 adds a module that cannot load: a collection error that names
+  // no test id. The ids at the head are the base's, but the collection error is new: never `pre-existing`. With a summary
+  // the inventory looks complete (the summary counts tests only); without one it is incomplete.
+  const collectVariants: Array<{ tag: string; env: Readonly<Record<string, string>> }> = [
+    { tag: "summary", env: {} }, { tag: "no-summary", env: { OMR_FIXTURE_NO_SUMMARY: "1" } },
+  ];
+  for (const variant of collectVariants) {
+    it(`a red base plus a collection error in the phase is not pre-existing (${variant.tag}): culprit T3 or unattributed`, async () => {
+      const s = suiteSetup(`collect-${variant.tag}`, { collect: true }, variant.env);
+      expect(runNode(s.repo, "suite.js")).not.toBe(0);
+      await s.env.pool.open();
+      const ci = await s.env.pool.acquireSpecial(PLAN, "ci");
+      const { j } = fakeJournal(s.env, "phase-suite");
+      const verdict = await s.runner.run({ planId: PLAN, phaseId: "p1", commit: s.head, base: s.c0, ranges: s.ranges, commands: [SUITE_COMMAND], slot: ci }, j);
+      expect(["culprit", "unattributed"], `verdict ${JSON.stringify(verdict)}`).toContain(verdict.kind);
+      if (verdict.kind === "culprit") expect(verdict.range.taskId).toBe("T3");
+      expect(git(s.repo, "rev-parse", s.branch)).toBe(s.head);
+    });
+  }
 
   // QA-3.2-1: a red base must not hide a culprit. One check already fails at the phase base; task 3 breaks ANOTHER check.
   // The suite must name task 3, or fail closed as `unattributed` (the queue pauses on it); `pre-existing` (pass) is wrong.

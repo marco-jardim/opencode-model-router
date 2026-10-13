@@ -58,8 +58,8 @@ export function interruptedBy(j: Pick<StepJournal, "signal">): "abort" | "dispos
 }
 
 /**
- * The `unattributed` reason of a failure the phase base cannot split by ids. `SuiteVerdict` (queue.ts) names only
- * `"outside" | "no-base"`; it becomes `"base-unparsed"` once queue.ts adds that reason.
+ * The `unattributed` reason of a failure the phase base cannot split by ids (QA-3.2-1): the suite's failure names no
+ * id, or the base run's output names none. Distinct from `no-base` (the phase has no base at all).
  */
 const BASE_UNPARSED: Extract<SuiteVerdict, { kind: "unattributed" }>["reason"] = "base-unparsed";
 
@@ -114,9 +114,11 @@ async function runSuite(d: PhaseSuiteDeps, req: SuiteRunRequest, j: StepJournal)
   // QA-3.2-8 (M38): one preemption budget for the whole suite entry, shared by every run below. Once spent, the
   // entry's runs register with nothing left, so a foreground check waits instead of preempting again.
   const preempt: PreemptBudget = { left: PREEMPT_BUDGET };
-  const exec = async (commit: string, mode: CommandRunRequest["mode"]): Promise<Attempt<CommandRunResult>> => {
+  const exec = async (commit: string, mode: CommandRunRequest["mode"], requireRun = false): Promise<Attempt<CommandRunResult>> => {
     await j.assertWriteCwd(req.slot.path, "slot");
-    const r = await d.checks.runCommands({ slot: req.slot, commit, commands: req.commands, mode, priority: "background", signal: j.signal, prepare: true, preempt });
+    const r = await d.checks.runCommands({
+      slot: req.slot, commit, commands: req.commands, mode, priority: "background", signal: j.signal, prepare: true, preempt, requireRun,
+    });
     if (r.verdict === "error") return { error: r.error ?? { reason: "spawn", message: "the run failed without a reason" } };
     return { error: null, value: r };
   };
@@ -138,13 +140,15 @@ async function runSuite(d: PhaseSuiteDeps, req: SuiteRunRequest, j: StepJournal)
   const mode: CommandRunRequest["mode"] = attributable ? { rerun: files } : "full";
   await j.end("failed", { v: 1, files: full.files, idsUnparsed: full.idsUnparsed, durationMs: full.durationMs, output: full.output }, ids);
 
-  // 2. Two reruns at the suite commit.
+  // 2. Two reruns at the suite commit. QA-3.2-22: they must run the failing files there; a rerun that ran nothing
+  // is a failure (unparsed), never a pass.
   const rerunFailed: string[][] = [];
   let anyRerunFailed = false;
+  let reproduced: string[] = [];
   for (const n of [1, 2] as const) {
     const detail: StepDetail = { v: 1, n, files };
     await j.start("suite-rerun", detail);
-    const s = await stepped(j, "suite-rerun", detail, () => exec(req.commit, mode));
+    const s = await stepped(j, "suite-rerun", detail, () => exec(req.commit, mode, true));
     if (s.kind !== "ok") return s;
     rerunFailed.push(failedIdsOf(s.value, ids));
     if (s.value.verdict === "fail") anyRerunFailed = true;
@@ -153,13 +157,24 @@ async function runSuite(d: PhaseSuiteDeps, req: SuiteRunRequest, j: StepJournal)
       continue;
     }
     const classified = classifyReruns(ids, [rerunFailed[0] ?? [], rerunFailed[1] ?? []]);
-    const flaky = attributable ? classified.reproduced.length === 0 : !anyRerunFailed;
+    let last = s.value;
+    reproduced = classified.reproduced;
+    if (attributable && reproduced.length === 0) {
+      // QA-3.2-23: reruns of the failing files alone never clear the failure: one green run of the full commands
+      // (in the same open step) must agree before it is flaky. A red one reproduces the original ids it names (all
+      // of them when it names none).
+      const whole = await stepped(j, "suite-rerun", detail, () => exec(req.commit, "full"));
+      if (whole.kind !== "ok") return whole;
+      last = whole.value;
+      reproduced = classifyReruns(ids, [failedIdsOf(last, ids), []]).reproduced;
+    }
+    const flaky = attributable ? reproduced.length === 0 : !anyRerunFailed;
     if (flaky) return { kind: "flaky", ids: classified.flaky }; // the second rerun stays open: the queue closes the entry with it
-    await j.end("failed", { v: 1, reproduced: classified.reproduced, durationMs: s.value.durationMs, output: s.value.output }, classified.reproduced);
+    await j.end("failed", { v: 1, reproduced, durationMs: last.durationMs, output: last.output }, reproduced);
   }
-  const reproduced = attributable ? classifyReruns(ids, [rerunFailed[0] ?? [], rerunFailed[1] ?? []]).reproduced : [];
 
-  // 3. The phase base (M23): failures that also fail there are pre-existing and not bisected.
+  // 3. The phase base (M23): failures that also fail there are pre-existing and not bisected. QA-3.2-23: the base runs
+  // the full commands, so pre-existing rests on a complete inventory of the whole base run, not of the failing files.
   if (req.base === null) {
     await memoStep(req.ranges.map(r => r.taskId));
     return { kind: "unattributed", ids: reproduced, reason: "no-base" };
@@ -167,7 +182,7 @@ async function runSuite(d: PhaseSuiteDeps, req: SuiteRunRequest, j: StepJournal)
   const base = req.base;
   const baseDetail: StepDetail = { v: 1, at: "base", commit: base, files };
   await j.start("suite-rerun", baseDetail);
-  const atBase = await stepped(j, "suite-rerun", baseDetail, () => exec(base, mode));
+  const atBase = await stepped(j, "suite-rerun", baseDetail, () => exec(base, "full"));
   if (atBase.kind !== "ok") return atBase;
   const baseRun = atBase.value;
   // QA-3.2-1 (2): fail closed. When the base failure cannot be split by ids (the suite's failure has none, or the base
@@ -182,6 +197,18 @@ async function runSuite(d: PhaseSuiteDeps, req: SuiteRunRequest, j: StepJournal)
   // Without ids (`!attributable`, the base passed) the regression is the whole failure: bisect with the full commands.
   if (attributable && regression.length === 0) return { kind: "pre-existing", ids: reproduced }; // the base step stays open
   await j.end(baseRun.verdict === "fail" ? "failed" : "ok", { v: 1, durationMs: baseRun.durationMs, output: baseRun.output }, baseRun.verdict === "fail" ? baseRun.ids : []);
+
+  // M22 "bisect using only regression.files": the probes run only the failing files that do not already fail at the base.
+  // With QA-3.2-26 (a failing probe fails, whatever ids it names) a pre-existing failure in a probed file would fail
+  // every probe and blame the first range. When every failing file also fails at the base (a regression sharing a file
+  // with a pre-existing failure), the regression cannot be isolated: fail closed, unattributed, nobody blamed.
+  const baseFiles = new Set(baseRun.verdict === "fail" ? baseRun.files : []);
+  const probeFiles = attributable ? files.filter(f => !baseFiles.has(f)) : [];
+  if (attributable && probeFiles.length === 0) {
+    await memoStep(req.ranges.map(r => r.taskId));
+    return { kind: "unattributed", ids: regression, reason: "base-overlap" };
+  }
+  const probeMode: CommandRunRequest["mode"] = attributable ? { rerun: probeFiles } : "full";
 
   // 4. Bisect over the phase's ranges, running only the regression.
   let ordered: TaskRange[];
@@ -199,17 +226,17 @@ async function runSuite(d: PhaseSuiteDeps, req: SuiteRunRequest, j: StepJournal)
     if (!labels.has(r.from)) labels.set(r.from, { taskId: r.taskId, probe: "from" });
     labels.set(r.to, { taskId: r.taskId, probe: "to" });
   }
-  const wanted = new Set(regression);
   let probes = 0;
   const probe = async (commit: string): Promise<ProbeVerdict> => {
     const label = labels.get(commit) ?? { taskId: ordered[0]?.taskId ?? "", probe: "to" as const };
     const detail: StepDetail = { v: 1, candidate: commit, taskId: label.taskId, probe: label.probe };
     await j.start("bisect", detail);
-    const s = await stepped(j, "bisect", detail, () => exec(commit, mode));
+    const s = await stepped(j, "bisect", detail, () => exec(commit, probeMode));
     if (s.kind !== "ok") throw new ProbeStop(s);
     probes++;
-    const r = s.value;
-    const failed = r.verdict === "fail" && (!attributable || r.idsUnparsed || r.ids.some(id => wanted.has(id)));
+    // QA-3.2-26: fail closed. A failing probe fails, whichever ids it names: a run of the regression files that names
+    // none of the regression ids (another id form, or another failure masking them) is no evidence of a pass.
+    const failed = s.value.verdict === "fail";
     await j.end(failed ? "failed" : "ok", { v: 1, verdict: failed ? "fail" : "pass", probes }, failed ? regression : []);
     return failed ? "fail" : "pass";
   };
@@ -223,7 +250,8 @@ async function runSuite(d: PhaseSuiteDeps, req: SuiteRunRequest, j: StepJournal)
   j.counter("integration.bisect.probes", probes, { kind: "suite" });
   await memoStep(ordered.map(r => r.taskId));
   if (found.kind === "outside") return { kind: "unattributed", ids: regression, reason: "outside" };
-  return { kind: "culprit", range: found.range, ids: regression, files };
+  // The revert's regression checks run the files the bisect ran (the regression's own files).
+  return { kind: "culprit", range: found.range, ids: regression, files: attributable ? probeFiles : files };
 }
 
 type BuiltRevert = { kind: "built"; head: string; reverted: string[] } | { kind: "conflict"; at: string; paths: string[] };

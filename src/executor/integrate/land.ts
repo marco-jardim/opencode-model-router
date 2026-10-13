@@ -86,6 +86,10 @@ export function createLander(d: LanderDeps): LanderApi {
     const baseTip = await d.igit.readRef(toplevel, `refs/heads/${baseBranch}`);
     if (baseTip === null) return { ok: false, refusal: { reason: "base-missing" }, baseTip: null };
 
+    // QA-3.2-35: the base already contains the candidate (landed before, or the owner moved on after landing): a no-op that
+    // touches nothing, so neither the checked-out branch nor the cleanliness of the owner checkout matters.
+    if (baseTip === candidate || await d.igit.isAncestor(toplevel, candidate, baseTip)) return { ok: true, baseTip, noop: true };
+
     // 2. The base branch is checked out in the owner checkout.
     const head = await probe(toplevel, ["symbolic-ref", "-q", "HEAD"]);
     const headRef = head.code === 0 ? head.stdout.trim() : null;
@@ -99,11 +103,8 @@ export function createLander(d: LanderDeps): LanderApi {
     const dirty = parseStatusPaths(status.stdout);
     if (dirty.length > 0) return { ok: false, refusal: { reason: "dirty", paths: dirty }, baseTip };
 
-    // 4. The base head is an ancestor of the integration head.
-    if (baseTip === candidate) return { ok: true, baseTip, noop: true };
+    // 4. The base head is an ancestor of the integration head (the base containing the candidate returned above).
     if (!(await d.igit.isAncestor(toplevel, baseTip, candidate))) {
-      // The owner moved on after landing: the base already contains the candidate, nothing to do.
-      if (await d.igit.isAncestor(toplevel, candidate, baseTip)) return { ok: true, baseTip, noop: true };
       return { ok: false, refusal: { reason: "diverged", baseTip }, baseTip };
     }
 
@@ -121,7 +122,9 @@ export function createLander(d: LanderDeps): LanderApi {
       await d.guard.assertWriteCwd(req.toplevel, "land");
       const i = await inspect(req);
       if (!i.ok) return { kind: "refused", refusal: i.refusal };
-      if (i.noop) return { kind: "landed", from: i.baseTip, to: req.candidate };
+      // A no-op lands the empty range candidate..candidate: `to` is the candidate on every landed outcome, and `from` never
+      // names a base tip that is a descendant of `to` (the owner moved on after landing).
+      if (i.noop) return { kind: "landed", from: req.candidate, to: req.candidate };
       const merged = await d.git.mergeFfOnly(req.toplevel, req.candidate);
       if (!merged.ok) return { kind: "refused", refusal: { reason: "diverged", baseTip: merged.head } };
       if (merged.head !== req.candidate) {

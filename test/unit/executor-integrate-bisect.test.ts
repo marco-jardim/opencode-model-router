@@ -486,7 +486,8 @@ describe("createLander", () => {
     const { lander, w } = world({ ancestor: false, behind: true });
     expect(await lander.inspect(req)).toEqual({ ok: true, baseTip: "base", noop: true });
     expect(w.ignoredCalls).toEqual([]);
-    expect(await world({ ancestor: false, behind: true }).lander.fastForward(req)).toEqual({ kind: "landed", from: "base", to: "cand" });
+    // One no-op convention (land.ts and queue.ts): nothing moved here, so from = to = the candidate.
+    expect(await world({ ancestor: false, behind: true }).lander.fastForward(req)).toEqual({ kind: "landed", from: "cand", to: "cand" });
   });
 
   it("refuses ignored-overwrite for added or changed paths only; deletions are not probed", async () => {
@@ -781,6 +782,8 @@ interface ChecksOpts {
   allowCommand?: (command: string) => boolean;
   slotMax?: number;
   background?: BackgroundRuns;
+  /** Which test files exist (default: every one). */
+  exists?: (p: string) => boolean;
 }
 const PKG_BOTH = JSON.stringify({ scripts: { typecheck: "tsc", test: "vitest run" } });
 
@@ -793,12 +796,14 @@ function checksEnv(o: ChecksOpts = {}) {
   let tick = 0;
   const background = o.background ?? new BackgroundRuns();
   const pool = stub<SlotPool>({
-    reset: async (s, commit) => { resets.push(`reset:${s}@${commit}`); if (o.resetError !== undefined) throw o.resetError; },
+    reset: async (s, commit) => { resets.push(`reset:${s}@${commit}`); current = commit; if (o.resetError !== undefined) throw o.resetError; },
     cleanForChecks: async s => { resets.push(`clean:${s}`); },
     // The plan's slots: the ci slot that observed a suite failure, and this check's slot.
     list: async () => [stub<SlotRecord>({ path: nodePath.resolve("/ci") }), stub<SlotRecord>({ path: nodePath.resolve("/slot") })],
   });
-  const git = stub<GitOps>({ revParse: async () => o.head ?? "cand" });
+  // The slot follows its last reset (default "cand"), unless the test pins its head.
+  let current = "cand";
+  const git = stub<GitOps>({ revParse: async () => o.head ?? current });
   const igit = stub<IntegrateGit>({
     showFile: async (_cwd, _commit, path) => (o.files ?? { "package.json": null })[path] ?? null,
     diffNameStatus: async () => { if (o.diffError !== undefined) throw o.diffError; return o.diff ?? []; },
@@ -827,8 +832,9 @@ function checksEnv(o: ChecksOpts = {}) {
     },
     ...(o.slotMax === undefined ? {} : { slotMax: o.slotMax }),
     ...(o.allowCommand === undefined ? {} : { allowCommand: o.allowCommand }),
+    fileExists: async p => (o.exists ?? (() => true))(p),
   });
-  return { checks, spawned, released, acquired, preempts, resets, background };
+  return { checks, spawned, released, acquired, preempts, resets, background, at: () => current };
 }
 
 function checkReq(o: Partial<CheckRequest> = {}): CheckRequest {
@@ -1066,12 +1072,20 @@ describe("integration checks: revert regression (QA-3.2-6)", () => {
     return { ...checksEnv(spawn === undefined ? {} : { spawn }), planned };
   }
 
-  it("reruns only the regression files, re-rooted from the ci slot, and ignores failures of other ids", async () => {
-    const env = regressionEnv([report({ failingIds: [OTHER], failingFiles: [here] })], () => noneOut(1));
+  it("reruns only the regression files, re-rooted from the ci slot; a complete passing rerun passes", async () => {
+    const env = regressionEnv([report()], () => noneOut(0));
     const r = await env.checks.run(checkReq(extra()));
-    expect(r).toMatchObject({ verdict: "pass", components: [{ name: "regression", label: "npm test", scope: "rerun", exitCode: 1 }] });
+    expect(r).toMatchObject({ verdict: "pass", components: [{ name: "regression", label: "npm test", scope: "rerun", exitCode: 0 }] });
     expect(env.planned).toEqual([[here]]);
     expect(env.spawned.map(s => s.c.args)).toEqual([["rr"]]);
+  });
+
+  it("QA-3.2-26: a failing rerun that names none of the regression ids fails closed with every regression id", async () => {
+    // Another id form (jest JSON `<abs> > <fullName>`) or another failure: neither clears the regression.
+    for (const named of [[OTHER], [`${here} > x`]]) {
+      const env = regressionEnv([report({ failingIds: named, failingFiles: [here] })], () => noneOut(1, { stdout: "red" }));
+      expect(await env.checks.run(checkReq(extra()))).toMatchObject({ verdict: "fail", failingIds: [X], failingFiles: [here], output: "red" });
+    }
   });
 
   it("a regression id that still fails makes the revert insufficient, naming only the regression ids", async () => {
@@ -1086,11 +1100,11 @@ describe("integration checks: revert regression (QA-3.2-6)", () => {
     }
   });
 
-  it("an incomplete rerun falls back to the whole command, judged by the ids its output names", async () => {
+  it("an incomplete rerun falls back to the whole command, judged by the ids its output names (none named: fail closed)", async () => {
     const cases: Array<{ full: CommandOutput; verdict: string; ids?: string[] }> = [
       { full: noneOut(0), verdict: "pass" },
-      { full: noneOut(1, { stdout: ` FAIL  ${OTHER}\n Tests  1 failed (1)\n` }), verdict: "pass" },
-      { full: noneOut(1, { stdout: ` FAIL  ${X}\n Tests  1 failed (1)\n` }), verdict: "fail", ids: [X] },
+      { full: noneOut(1, { stdout: ` FAIL  ${OTHER}\n Tests  1 failed (1)\n` }), verdict: "fail", ids: [X] },
+      { full: noneOut(1, { stdout: ` FAIL  ${X}\n FAIL  ${OTHER}\n Tests  2 failed (2)\n` }), verdict: "fail", ids: [X] },
       { full: noneOut(1, { stdout: "unparsed" }), verdict: "fail", ids: [X] },
     ];
     for (const c of cases) {
@@ -1102,20 +1116,31 @@ describe("integration checks: revert regression (QA-3.2-6)", () => {
     }
   });
 
-  it("regression files gone at the revert pass; an unverifiable runner or a non-test command runs the whole command", async () => {
+  it("QA-3.2-24: no regression file present here, or none the planner maps, runs the whole command judged by the ids", async () => {
     const detectedFor: string[] = [];
     runnerHooks.detectRunner = async command => { detectedFor.push(command); return detected; };
     runnerHooks.planRerun = async () => noAffected;
     const py: ResolvedCommand = { label: "python -m pytest", file: "python", args: ["-m", "pytest"], source: "pytest", ref: null };
-    const gone = checksEnv();
+    // The files are gone (reverted away, or not re-rootable): nothing is planned, the whole commands run and pass.
+    const gone = checksEnv({ exists: () => false });
     expect(await gone.checks.run(checkReq(extra({ commands: [cmd, py] })))).toMatchObject({
-      verdict: "pass", components: [{ name: "regression", label: "no affected tests", scope: "no-affected" }, { name: "regression", scope: "no-affected" }],
+      verdict: "pass", components: [{ name: "regression", label: "npm test", scope: "full" }, { name: "regression", label: "python -m pytest", scope: "full" }],
     });
-    expect(gone.spawned).toHaveLength(0);
-    expect(detectedFor).toEqual(["npm test", "python -m pytest"]);
+    expect(gone.spawned.map(s => s.c.label)).toEqual(["npm test", "python -m pytest"]);
+    expect(detectedFor).toEqual([]);
+    // No file at all: the whole command, failing with a regression id, fails.
+    const none = checksEnv({ spawn: () => noneOut(1, { stdout: ` FAIL  ${X}\n Tests  1 failed (1)\n` }) });
+    expect(await none.checks.run(checkReq(extra({ files: [] })))).toMatchObject({ verdict: "fail", failingIds: [X], failingFiles: [] });
+    const green = checksEnv();
+    expect(await green.checks.run(checkReq(extra({ files: [] })))).toMatchObject({ verdict: "pass", components: [{ name: "regression", scope: "full" }] });
+    // Present files the planner maps to no test: the whole command too (never "no affected tests" -> pass).
+    const unmapped = checksEnv({ spawn: () => noneOut(1, { stdout: "boom" }) });
+    expect(await unmapped.checks.run(checkReq(extra({ commands: [py, cmd] })))).toMatchObject({ verdict: "fail", failingIds: [X] });
+    expect(detectedFor).toEqual(["python -m pytest"]);
+    expect(unmapped.spawned.map(s => s.c.label)).toEqual(["python -m pytest"]);
     runnerHooks.detectRunner = async () => unverifiable;
     const blind = checksEnv({ spawn: () => noneOut(1, { stdout: ` FAIL  ${OTHER}\n Tests  1 failed (1)\n` }) });
-    expect(await blind.checks.run(checkReq(extra()))).toMatchObject({ verdict: "pass", components: [{ name: "regression", scope: "full" }] });
+    expect(await blind.checks.run(checkReq(extra()))).toMatchObject({ verdict: "fail", failingIds: [X], components: [{ name: "regression", scope: "full" }] });
     runnerHooks.detectRunner = async () => { throw new Error("a non-test command is never planned"); };
     const script: ResolvedCommand = { label: "suite", file: "npm", args: ["run", "suite"], source: "run-command", ref: { script: "suite", args: [] } };
     const other = checksEnv({ spawn: () => noneOut(1, { stdout: ` FAIL  ${X}\n Tests  1 failed (1)\n` }) });
@@ -1705,13 +1730,32 @@ describe("phase suite runner: run", () => {
     expect(log.order).toEqual(["end:failed", "start:suite-rerun", "end:ok", "start:suite-rerun"]);
   });
 
-  it("an attributable failure reruns only the failing files; reruns without the ids make them flaky", async () => {
+  it("an attributable failure reruns only the failing files; reruns without the ids plus a green full run make them flaky", async () => {
     const { runner, requests } = suiteEnv({ runCommands: (_r, n) => (n === 1 ? failRes(["a", "b"]) : runRes("pass")) });
     const { j, log } = journalOf();
     expect(await runner.run(suiteReq(), j)).toEqual({ kind: "flaky", ids: ["a", "b"] });
-    expect(requests.slice(1).map(r => r.mode)).toEqual([{ rerun: ["f.test.ts"] }, { rerun: ["f.test.ts"] }]);
+    // QA-3.2-23: the reruns of the files, then one full-command run in the still open second rerun step.
+    expect(requests.slice(1).map(r => r.mode)).toEqual([{ rerun: ["f.test.ts"] }, { rerun: ["f.test.ts"] }, "full"]);
+    // QA-3.2-22: the reruns at the suite commit must run something; the full runs need not.
+    expect(requests.map(r => r.requireRun)).toEqual([false, true, true, false]);
     expect(log.ends[0]).toMatchObject({ result: "failed", ids: ["a", "b"] });
     expect(log.ends[1]).toMatchObject({ result: "ok", ids: [] });
+    expect(log.order).toEqual(["end:failed", "start:suite-rerun", "end:ok", "start:suite-rerun"]);
+  });
+
+  it("QA-3.2-23: a red full run after green reruns of the files is no flake: its named ids are reproduced", async () => {
+    const { runner, requests } = suiteEnv({
+      runCommands: (r, n) => (n === 1 ? failRes(["a", "b"]) : r.mode === "full" && r.commit === "c3" ? failRes(["b"], { output: "whole" }) : runRes("pass")),
+      igit: { revList: async () => ["c1", "c2", "c3"] },
+    });
+    const { j, log } = journalOf();
+    const verdict = await runner.run(suiteReq(), j);
+    expect(verdict).toMatchObject({ kind: "culprit", ids: ["b"] });
+    expect(log.ends[2]).toMatchObject({ result: "failed", ids: ["b"], detail: { reproduced: ["b"], output: "whole" } });
+    expect(requests[4]).toMatchObject({ commit: "c0", mode: "full" });
+    // A red full run naming none of the original ids reproduces all of them (fail closed).
+    const blind = suiteEnv({ runCommands: (r, n) => (n === 1 ? failRes(["a"]) : r.mode === "full" ? runRes("fail", { idsUnparsed: true }) : runRes("pass")) });
+    expect(await blind.runner.run(suiteReq({ base: null }), journalOf().j)).toEqual({ kind: "unattributed", ids: ["a"], reason: "no-base" });
   });
 
   it("a rerun that fails without parsed ids counts as every original id", async () => {
@@ -1766,7 +1810,11 @@ describe("phase suite runner: run", () => {
     const { j, log } = journalOf();
     expect(await runner.run(suiteReq(), j)).toEqual({ kind: "culprit", range: { taskId: "T2", from: "c1", to: "c2" }, ids: ["t > x"], files: ["/ci/t.test.ts"] });
     expect(log.ends[0]).toMatchObject({ result: "failed", ids: ["t > x"], detail: { idsUnparsed: false } });
-    expect(requests.slice(1).every(r => typeof r.mode !== "string" && r.mode.rerun[0] === "/ci/t.test.ts")).toBe(true);
+    // Reruns and probes run the failing file; the base runs the full commands (QA-3.2-23).
+    expect(requests.map(r => `${r.commit}:${typeof r.mode === "string" ? r.mode : r.mode.rerun.join(",")}`)).toEqual([
+      "c3:full", "c3:/ci/t.test.ts", "c3:/ci/t.test.ts", "c0:full", ...requests.slice(4).map(r => `${r.commit}:/ci/t.test.ts`),
+    ]);
+    expect(requests.length).toBeGreaterThan(4);
   });
 
   it("a failing rerun that names none of the original ids clears none of them (fail closed)", async () => {
@@ -1774,9 +1822,21 @@ describe("phase suite runner: run", () => {
     expect(await runner.run(suiteReq({ base: null }), journalOf().j)).toEqual({ kind: "unattributed", ids: ["a"], reason: "no-base" });
   });
 
+  it("QA-3.2-26: a probe that fails naming none of the regression ids is a failing probe (fail closed)", async () => {
+    // c1 fails with another id (or the same failure in another id form): it can no longer read as a pass, so the
+    // culprit is the range that ends there, never a later innocent one.
+    const { runner } = suiteEnv({
+      runCommands: byCommit({ c3: failRes(["x"]), c2: failRes(["x"]), c1: failRes(["/abs/f.test.ts > x"]) }),
+      igit: { revList: async () => ["c1", "c2", "c3"] },
+    });
+    const { j, log } = journalOf();
+    expect(await runner.run(suiteReq(), j)).toEqual({ kind: "culprit", range: { taskId: "T1", from: "c0", to: "c1" }, ids: ["x"], files: ["f.test.ts"] });
+    expect(log.ends.filter(e => e.result === "failed" && "probes" in e.detail).length).toBeGreaterThan(0);
+  });
+
   it("bisects to the culprit range, probing only the regression ids and never the known base", async () => {
     const { runner, requests } = suiteEnv({
-      runCommands: byCommit({ c3: failRes(["x"]), c2: failRes(["x", "other"]), c1: failRes(["other"]) }),
+      runCommands: byCommit({ c3: failRes(["x"]), c2: failRes(["x", "other"]) }),
       igit: { revList: async () => ["c1", "c2", "c3"] },
     });
     const { j, log } = journalOf();
@@ -2150,5 +2210,130 @@ describe("QA-3.2 round 1: suite helpers", () => {
     expect(by("abort")).toBe("abort");
     expect(by()).toBe("abort");
     expect(by(new ExecutorError("E_PLAN_STATE", "x"))).toBe("abort");
+  });
+});
+
+describe("QA-3.2 round 2: ids, completeness and runs that ran nothing", () => {
+  const cwd = nodePath.resolve("/slot");
+  const out = (stdout: string, stderr = ""): CommandOutput => ({ exitCode: 1, timedOut: false, stdout, stderr, durationMs: 1 });
+  const PKG_TEST = { "package.json": JSON.stringify({ scripts: { test: "vitest run" } }) };
+
+  it("QA-3.2-22/-26: observeFull drops a vitest project prefix and rewrites jest JSON ids to the readResult form", () => {
+    expect(observeFull(out(" FAIL  |web| test/a.test.ts > s > t\n Tests  1 failed (1)\n"), cwd)).toEqual({
+      ids: ["test/a.test.ts > s > t"], files: [nodePath.resolve(cwd, "test/a.test.ts")], complete: true,
+    });
+    const json = JSON.stringify({
+      numFailedTests: 2, numRuntimeErrorTestSuites: 0, testResults: [
+        { name: nodePath.join(cwd, "src", "a.test.ts"), status: "failed", assertionResults: [
+          { status: "failed", fullName: "s t", ancestorTitles: ["s"], title: "t" },
+          { status: "passed", fullName: "s ok", ancestorTitles: ["s"], title: "ok" },
+        ] },
+        { name: "rel/b.test.ts", status: "failed", assertionResults: [{ status: "failed", fullName: "only" }] },
+        { name: nodePath.join(cwd, "c.test.ts"), status: "passed" },
+      ],
+    });
+    // Not `<absolute suite> > s t` (observeTests' JSON form): the same form readResult gives the reruns.
+    expect(observeFull(out(json), cwd)).toEqual({
+      ids: ["rel/b.test.ts > only", "src/a.test.ts > s > t"],
+      files: [nodePath.resolve(cwd, "rel/b.test.ts"), nodePath.resolve(cwd, "src/a.test.ts")].sort(),
+      complete: true,
+    });
+  });
+
+  it("QA-3.2-23: observeFull calls an inventory incomplete when the output reports errors outside the tests", () => {
+    const ok = " FAIL  a.test.ts > s > t\n Tests  1 failed (1)\n";
+    const cases = [
+      ` FAIL  b.test.ts [ b.test.ts ]\n${ok}`,
+      `${ok} Errors  1 error\n`,
+      "FAILED t/a.py::x - e\nERROR t/b.py - ImportError\n= 1 failed in 0.1s =\n",
+      "FAILED t/a.py::x - e\n===== 1 failed, 2 errors in 0.3s =====\n",
+      "FAILED t/a.py::x - e\n= 1 failed in 0.1s =\nInterrupted: 1 error during collection\n",
+    ];
+    for (const stdout of cases) expect(observeFull(out(stdout), cwd)?.complete).toBe(false);
+    expect(observeFull(out(ok), cwd)?.complete).toBe(true);
+    const runtime = JSON.stringify({
+      numFailedTests: 1, numRuntimeErrorTestSuites: 1,
+      testResults: [{ name: "a.test.ts", status: "failed", assertionResults: [{ status: "failed", fullName: "t", title: "t" }] }],
+    });
+    expect(observeFull(out(runtime), cwd)).toMatchObject({ ids: ["a.test.ts > t"], complete: false });
+    const brokenSuite = JSON.stringify({
+      numFailedTests: 1, testResults: [
+        { name: "a.test.ts", status: "failed", assertionResults: [{ status: "failed", fullName: "t", title: "t" }] },
+        { name: "broken.test.ts", status: "failed", assertionResults: [] },
+      ],
+    });
+    expect(observeFull(out(brokenSuite), cwd)).toMatchObject({ ids: ["a.test.ts > t"], complete: false });
+    // A failed assertion without names still counts (and the inventory, one id short for observeTests, is incomplete).
+    const nameless = JSON.stringify({ numFailedTests: 1, testResults: [{ name: "x.test.ts", status: "failed", assertionResults: [{ status: "failed", ancestorTitles: ["d"] }] }] });
+    expect(observeFull(out(nameless), cwd)).toMatchObject({ ids: ["x.test.ts > d > "], complete: false });
+    expect(observeFull(out("{}"), cwd)).toBeNull();
+    expect(observeFull(out("42"), cwd)).toBeNull();
+  });
+
+  it("QA-3.2-23: an error in the confirming full run is returned as is", async () => {
+    const { runner } = suiteEnv({ runCommands: (r, n) => (n === 1 ? failRes(["a"]) : r.mode === "full" ? errRes("slot-lost", "lost") : runRes("pass")) });
+    expect(await runner.run(suiteReq(), journalOf().j)).toEqual({ kind: "error", reason: "slot-lost", message: "lost" });
+  });
+
+  it("QA-3.2-22: at the suite commit a rerun that maps to no test fails unparsed; ids whose files are missing are unparsed", async () => {
+    runnerHooks.detectRunner = async () => detected;
+    runnerHooks.planRerun = async () => noAffected;
+    const req = (o: Partial<CommandRunRequest> = {}): CommandRunRequest => ({
+      slot, commit: "cand", commands: [cmd], mode: { rerun: ["a.test.ts > x"] }, priority: "background", signal: new AbortController().signal, prepare: false, ...o,
+    });
+    const a = checksEnv();
+    expect(await a.checks.runCommands(req({ requireRun: true }))).toMatchObject({
+      verdict: "fail", ids: [], idsUnparsed: true, output: "the rerun ran no test: 1 failing file(s) map to no test file",
+    });
+    expect(await a.checks.runCommands(req())).toMatchObject({ verdict: "pass" });
+    expect(a.spawned).toHaveLength(0);
+    const missing = checksEnv({ exists: () => false, spawn: () => noneOut(1, { stdout: " FAIL  sub/a.test.ts > x\n Tests  1 failed (1)\n" }) });
+    expect(await missing.checks.runCommands(req({ mode: "full" }))).toMatchObject({ verdict: "fail", ids: ["sub/a.test.ts > x"], idsUnparsed: true });
+  });
+
+  it("QA-3.2-22: a full tests failure whose files are missing here is final: no confirmation rerun", async () => {
+    runnerHooks.planScopedRun = async () => unverifiable;
+    runnerHooks.detectRunner = async () => { throw new Error("no rerun of missing files"); };
+    const { checks } = checksEnv({
+      files: PKG_TEST, exists: () => false, spawn: () => noneOut(1, { stdout: " FAIL  sub/a.test.ts > x\n Tests  1 failed (1)\n" }),
+    });
+    expect(await checks.run(checkReq())).toMatchObject({ verdict: "fail", failingIds: ["sub/a.test.ts > x"], flakyIds: [] });
+  });
+
+  it("QA-3.2-22: a `|proj|` id whose rerun runs nothing at the suite commit is reproduced, never flaky", async () => {
+    runnerHooks.detectRunner = async () => detected;
+    runnerHooks.planRerun = async () => noAffected; // the planner drops a file it cannot find
+    const env = checksEnv({ spawn: () => noneOut(1, { stdout: " FAIL  |proj| test/a.test.ts > s > t\n Tests  1 failed (1)\n" }) });
+    const { runner } = suiteEnv({ checks: env.checks });
+    const { j, log } = journalOf();
+    expect(await runner.run(suiteReq({ base: null }), j)).toEqual({ kind: "unattributed", ids: ["test/a.test.ts > s > t"], reason: "no-base" });
+    expect(log.ends[0]).toMatchObject({ result: "failed", ids: ["test/a.test.ts > s > t"] });
+    expect(log.ends.slice(1, 3).map(e => e.result)).toEqual(["failed", "failed"]);
+    expect(env.spawned).toHaveLength(1);
+  });
+
+  it("QA-3.2-23: a red base plus a new collection error at the suite commit is never pre-existing", async () => {
+    const variants: Array<{ base: string; suite: string }> = [
+      { base: " FAIL  a.test.ts > s > x\n Tests  1 failed (1)\n", suite: " FAIL  b.test.ts [ b.test.ts ]\n FAIL  a.test.ts > s > x\n Tests  1 failed (1)\n" },
+      { base: "FAILED t/a.py::x - e\n= 1 failed in 0.1s =\n", suite: "ERROR t/b.py - ImportError\nFAILED t/a.py::x - e\n= 1 failed, 1 error in 0.1s =\n" },
+    ];
+    for (const v of variants) {
+      const box: { at?: () => string } = {};
+      const env = checksEnv({ spawn: () => noneOut(1, { stdout: box.at?.() === "c0" ? v.base : v.suite }) });
+      box.at = env.at;
+      const { runner } = suiteEnv({ checks: env.checks, igit: { revList: async () => ["c1", "c2", "c3"] } });
+      expect(await runner.run(suiteReq(), journalOf().j)).toEqual({ kind: "unattributed", ids: [], reason: "base-unparsed" });
+    }
+  });
+
+  it("QA-3.2-36: an abort that fires while the slot is released turns the result into interrupted", async () => {
+    const ac = new AbortController();
+    const handle: SlotHandle = { lost: false, release: async () => { ac.abort(); } };
+    const env = checksEnv({ config: lintCfg, acquire: () => handle });
+    expect(await env.checks.run(checkReq({ signal: ac.signal }))).toMatchObject({ verdict: "error", reason: "interrupted", message: "the run was aborted" });
+    const bc = new AbortController();
+    const late = checksEnv({ acquire: () => ({ lost: false, release: async () => { bc.abort(); } }) });
+    const r = await late.checks.runCommands({ slot, commit: "c", commands: [cmd], mode: "full", priority: "background", signal: bc.signal, prepare: false });
+    expect(r).toMatchObject({ verdict: "error", error: { reason: "interrupted" } });
   });
 });

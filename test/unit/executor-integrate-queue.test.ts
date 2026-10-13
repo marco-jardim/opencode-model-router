@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -46,6 +46,7 @@ import {
   type LandRequest,
   type Lander,
   type PhaseSuiteRunner,
+  type LockWaitInfo,
   type RepoLock,
   type RepoLockFactory,
   type RepoLockWithTakeover,
@@ -744,7 +745,10 @@ describe("createRepoLockFactory (M5, I3)", () => {
     await again.release();
   });
 
-  /** The heartbeat rewrites the file in place; a read can land between truncate and write, so retry until it parses. */
+  /**
+   * Reads the lock file's heartbeatAt. The heartbeat renames a complete side file over the lock (QA-3.2-4), so a read never
+   * sees it partial; the retry only rides out a transient sharing error of the rename on Windows.
+   */
   async function heartbeatOf(file: string): Promise<number> {
     for (let i = 0; i < 400; i++) {
       try {
@@ -893,6 +897,55 @@ describe("createRepoLockFactory (M5, I3)", () => {
     const again = await f.acquire("repo-T", holder(), new AbortController().signal).then(() => null, (e: unknown) => e as { code?: string });
     expect(again?.code).toBeDefined();
     expect(again?.code).not.toBe("ENOENT");
+  });
+
+  it("QA-3.2-27: a heartbeat interleaved with release() leaves no lock file (nor side file) behind", async () => {
+    const env = await lockEnv();
+    const clock = new FakeClock();
+    const f = createRepoLockFactory({ stateRoot: env.root, clock, pid: 10, hostname: "h", isPidAlive: () => true });
+    const file = env.file("repo-beat-release");
+    for (let i = 0; i < 6; i++) {
+      const lock = await f.acquire("repo-beat-release", holder(), new AbortController().signal);
+      clock.fire(); // a beat starts: read, side file, rename
+      for (let k = 0; k < i; k++) await Promise.resolve(); // release lands at a different point of the beat each round
+      await lock.release(); // waits for that beat, then compare-and-delete
+      await expect(readFile(file, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      expect((await readdir(dirname(file))).filter(n => n.endsWith(".tmp") || n.endsWith(".stale"))).toEqual([]);
+    }
+  });
+
+  it("QA-3.2-33: a long wait is reported once with the holder's pid, host, plan, heartbeat age and the file", async () => {
+    const env = await lockEnv();
+    const clock = new FakeClock();
+    const file = await foreignLock(env, "repo-wait", JSON.stringify({ pid: 99, hostname: "elsewhere", planId: "other", entryId: null, heartbeatAt: clock.now() }));
+    const f = createRepoLockFactory({ stateRoot: env.root, clock, pid: 10, hostname: "h", isPidAlive: () => true, waitReportMs: 2_000 });
+    const reports: LockWaitInfo[] = [];
+    const ctl = new AbortController();
+    const waiting = f.acquire("repo-wait", holder(), ctl.signal, info => { reports.push(info); });
+    void waiting.catch(() => undefined);
+    for (let i = 0; i < 6; i++) {
+      await realPause(20);
+      clock.advance(1_000);
+      clock.fire();
+    }
+    await realPause(20);
+    expect(reports).toHaveLength(1);
+    expect(reports[0]).toMatchObject({ file, pid: 99, hostname: "elsewhere", planId: "other" });
+    expect(reports[0]?.heartbeatAgeMs ?? 0).toBeGreaterThanOrEqual(2_000);
+    ctl.abort();
+    await expect(waiting).rejects.toMatchObject({ code: "E_DISPOSED" });
+  });
+
+  it("nit: crash-leftover side files of this pid or a dead pid are removed at acquire; a live pid's are kept", async () => {
+    const env = await lockEnv();
+    const file = env.file("repo-sides");
+    await mkdir(dirname(file), { recursive: true });
+    for (const side of [".10.1.aa.tmp", ".99.2.bb.stale", ".55.3.cc.tmp"]) await writeFile(file + side, "x", "utf8");
+    const f = createRepoLockFactory({ stateRoot: env.root, clock: new FakeClock(), pid: 10, hostname: "h", isPidAlive: pid => pid === 55 });
+    const lock = await f.acquire("repo-sides", holder(), new AbortController().signal);
+    const left = (await readdir(dirname(file))).filter(n => n !== "integration.lock").sort();
+    expect(left).toEqual(["integration.lock.55.3.cc.tmp"]);
+    await lock.release();
   });
 
   it("release disarms the pending heartbeat timer", async () => {
@@ -2245,7 +2298,8 @@ describe("phase suite and revert", () => {
     await env.queue.dispose();
   });
 
-  for (const [reason, says] of [["base-unparsed", "could not be parsed"], ["outside", "outside the phase's task ranges"], ["no-base", "no recorded base"]] as const) {
+  for (const [reason, says] of [["base-unparsed", "could not be parsed"], ["outside", "outside the phase's task ranges"], ["no-base", "no recorded base"],
+    ["base-overlap", "cannot be probed apart"]] as const) {
     it(`an unattributed verdict (${reason}) names its reason in the critical item and pauses the phase`, async () => {
       const env = await suiteEnv(1, () => ({ kind: "unattributed", ids: ["test:x"], reason }));
       await env.until(() => env.phase().paused && env.quiet());
@@ -3545,7 +3599,8 @@ describe("checkPhase and suite gates", () => {
     expect(env.suite.reverts).toHaveLength(1);
     expect(env.suite.reverts[0]).toMatchObject({ suiteCommit: suiteTip, head: suiteTip });
     expect(env.suite.reverts[0]?.culprit.taskId).toBe("T2");
-    expect(env.suite.reverts[0]?.regression).toMatchObject({ ids: ["test:T2"], files: [], commands: [] });
+    // QA-3.2-24: the failing files come back from the closing suite step's detail; the commands stay empty (resolver down).
+    expect(env.suite.reverts[0]?.regression).toMatchObject({ ids: ["test:T2"], files: ["t/T2.test.ts"], commands: [] });
     expect(env.w.tasksAt(env.w.tip())).toEqual(["T1"]);
     env.assertInvariants();
   });
@@ -4357,6 +4412,302 @@ describe("QA-3.2-15 / QA-3.2-16: tags after completion, row-34 batch with an in-
   });
 });
 
+describe("QA-3.2 round 2", () => {
+  const okLock = (): RepoLock => ({ lost: new AbortController().signal, release: async () => undefined });
+
+  it("QA-3.2-24: a revert rebuilt from history after a restart carries the failing files", async () => {
+    const env = await setup({ tasks: 1, batchMax: 1 });
+    env.suite.resolution = RUNS;
+    const culprit = culpritOf("T1");
+    // The process dies right after the culprit batch, before the revert entry opens.
+    env.suite.onRun = req => { env.writer.crashAfter = env.writer.appends + 1; return culprit(req); };
+    env.queue.enqueue(["T1"]);
+    await env.until(() => env.w.dead, "the crash after the culprit batch");
+    expect(env.phase().gate).toBe("suite-failed");
+    expect(env.suite.reverts).toHaveLength(0);
+    env.suite.onRun = null;
+    await env.restart();
+    await env.queue.resume();
+    await env.until(() => env.state("T1") === "reverted" && env.quiet(), "the revert rebuilt from history");
+    expect(env.suite.reverts[0]?.regression).toMatchObject({ ids: ["test:T1"], files: ["t/T1.test.ts"] });
+    env.assertInvariants();
+  });
+
+  it("QA-3.2-25: after two reverts the retry still replays the original change (journaled first upstream)", async () => {
+    let F = "";
+    let C1 = "";
+    let R1 = "";
+    let C1b = "";
+    let R2 = "";
+    const env = await setup({ tasks: 1, resume: false, mutate: (l, w) => {
+      F = w.base;
+      C1 = w.branches.get(`refs/heads/omr/${PLAN_ID}/t/T1`) ?? ""; // integrated as is (no rebase)
+      R1 = w.commit(C1, null, "T1").sha; // first revert
+      C1b = w.commit(R1, "T1").sha; // the first retry landed as C1''+fix1'
+      R2 = w.commit(C1b, null, "T1").sha; // second revert = head
+      const X1 = w.commit(C1, "T1").sha; // retry branches built on the old task branch
+      const X2 = w.commit(X1, "T1").sha;
+      w.branches.set(`refs/heads/omr/${PLAN_ID}/t/T1`, X2);
+      w.slotCommit.set("slot-1", X2);
+      w.branches.set(INT_REF, R2);
+      w.passed.add(R2);
+      l.integration.head = R2;
+    } });
+    const t1: IntegrationEntry = { id: "i-800", kind: "task", phaseId: "p1", taskIds: ["T1"], slot: "slot-1", baseHead: F, candidate: null };
+    const t2: IntegrationEntry = { id: "i-820", kind: "task", phaseId: "p1", taskIds: ["T1"], slot: "slot-1", baseHead: R1, candidate: null };
+    const rv1: IntegrationEntry = { id: "i-810", kind: "revert", phaseId: "p1", taskIds: ["T1"], slot: "integration", baseHead: C1, candidate: R1 };
+    const rv2: IntegrationEntry = { id: "i-830", kind: "revert", phaseId: "p1", taskIds: ["T1"], slot: "integration", baseHead: C1b, candidate: R2 };
+    const revertFf = (e: IntegrationEntry, from: string, to: string): IntegrationStepEvent[] => [
+      stepEvent(e, { step: "revert-fast-forward", edge: "start", detail: JSON.stringify({ v: 1, from: e.baseHead, to: e.candidate, culprit: { taskId: "T1", from, to }, suiteCommit: e.baseHead }) }),
+      stepEvent(e, { step: "revert-fast-forward", edge: "end", result: "ok", closes: true, detail: "{}" }),
+    ];
+    env.historyExtra = [
+      stepEvent(t1, { step: "rebase", edge: "start", detail: JSON.stringify({ v: 1, onto: F, tasks: [{ taskId: "T1", tip: C1, upstream: F }] }) }),
+      ...revertFf(rv1, F, C1),
+      stepEvent(t2, { step: "rebase", edge: "start", detail: JSON.stringify({ v: 1, onto: R1, tasks: [{ taskId: "T1", tip: C1, upstream: F }] }) }),
+      ...revertFf(rv2, R1, C1b),
+    ];
+    const upstreams: string[] = [];
+    const g: GitOps = env.git;
+    const real = env.git.rebaseOnto.bind(env.git);
+    g.rebaseOnto = async (cwd, onto, upstream) => { upstreams.push(upstream); return real(cwd, onto); };
+    env.igit.mergeBase = async () => C1; // merge-base(R2, X2) = C1: the latest revert's range alone would keep C1 and drop it
+    await env.queue.resume();
+    env.queue.enqueue(["T1"]);
+    await env.until(() => env.state("T1") === "integrated" && env.quiet(), "T1 re-integrated");
+    expect(upstreams).toEqual([F]);
+    env.assertInvariants();
+  });
+
+  it("QA-3.2-28: a lock lost before the checks stops before their slot prepare", async () => {
+    const env = await setup({ tasks: 1 });
+    const lost = new AbortController();
+    env.locks.acquire = async () => ({ lost: lost.signal, release: async () => undefined });
+    const g: GitOps = env.git;
+    const real = env.git.rebaseOnto.bind(env.git);
+    g.rebaseOnto = async (cwd, onto, upstream) => { const r = await real(cwd, onto); lost.abort(); void upstream; return r; };
+    env.queue.enqueue(["T1"]);
+    await env.until(() => env.ledger.status === "paused", "halted");
+    expect(env.w.checkLog).toEqual([]);
+    expect(env.ledger.inbox[env.ledger.inbox.length - 1]?.text).toContain("lock");
+    env.assertInvariants();
+  });
+
+  it("QA-3.2-28: right before the CAS the lock file is re-read; a replaced file halts with no branchForce", async () => {
+    const env = await setup({ tasks: 1 });
+    let verified = 0;
+    env.locks.acquire = async () => ({ lost: new AbortController().signal, release: async () => undefined,
+      verify: async () => { verified++; return false; } });
+    env.queue.enqueue(["T1"]);
+    await env.until(() => env.ledger.status === "paused", "halted");
+    expect(verified).toBe(1);
+    expect(env.w.writes.some(w => w.op === "branchForce")).toBe(false);
+    expect(env.w.tip()).toBe(env.w.base);
+    env.assertInvariants();
+  });
+
+  it("QA-3.2-29: a stalled entry whose rollback fails stays stalled and is rolled back at the next poll", async () => {
+    const env = await setup({ tasks: 1 });
+    env.w.checkScript.push(errorResult("spawn"), errorResult("spawn"), errorResult("spawn"));
+    env.queue.enqueue(["T1"]);
+    await env.until(() => env.ledger.status === "paused", "paused");
+    const realReset = env.pool.reset.bind(env.pool);
+    let fail = true;
+    env.pool.reset = async (slot, commit) => {
+      if (fail) {
+        fail = false;
+        throw new Error("reset failed");
+      }
+      return realReset(slot, commit);
+    };
+    await unpause(env);
+    await env.until(() => !fail && env.writer.inflight === 0, "the failed rollback");
+    await env.settle();
+    expect(env.state("T1")).toBe("integrating");
+    env.clock.advance(5_000);
+    env.clock.fire(); // the next poll
+    await env.until(() => env.state("T1") === "integrated" && env.quiet(), "rolled back and integrated");
+    env.assertInvariants();
+  });
+
+  it("QA-3.2-30: a completed plan's failing tag is rolled back, retried with backoff, then given up with one item", async () => {
+    const env = await setup({ tasks: 0, resume: false, mutate: l => { l.status = "completed"; const p = l.phases[0]; if (p !== undefined) p.gate = "passed"; } });
+    env.lander.tagOutcome = { kind: "error", message: "git tag failed" };
+    const tagStarts = (): number => env.w.journal.filter(e => e.type === "integration-step" && e.step === "tag" && e.edge === "start").length;
+    await env.queue.resume();
+    // Round 1 runs at resume; rounds 2-4 are the backoff retries (TAG_RETRY_LIMIT = 3), each fired by the clock.
+    for (let round = 1; round <= 4; round++) {
+      await env.until(() => tagStarts() === 3 * round && env.quiet(), `tag round ${round}`);
+      await env.settle();
+      env.clock.advance(1_000_000);
+      env.clock.fire();
+    }
+    await env.until(() => env.quiet() && env.ledger.inbox.length > 0, "given up");
+    await env.settle();
+    expect((await env.steps("tag")).filter(s => s === "tag:tag:start")).toHaveLength(4 * 3);
+    expect(env.ledger.inbox).toHaveLength(1);
+    expect(env.ledger.inbox[0]?.text).toContain("stops retrying");
+    expect(env.ledger.inbox[0]?.text).not.toContain("unpause");
+    expect(env.ledger.status).toBe("completed");
+    expect(env.phase().tag).toBeNull();
+  });
+
+  it("QA-3.2-31: a phase with no task of its own is woken when the phase it depends on integrates", async () => {
+    const env = await setup({ tasks: 1, mutate: l => {
+      l.phases.push({ id: "p2", title: "Phase 2", wave: "w1", dependsOn: ["p1"], gate: "pending", qaRound: 1, paused: false, tag: null });
+      l.waves[0]?.phases.push("p2");
+    } });
+    expect(env.phase("p2").gate).toBe("pending");
+    env.queue.enqueue(["T1"]);
+    await env.until(() => env.phase("p2").gate === "awaiting-qa" && env.quiet(), "p2 woken");
+    expect(env.phase("p1").gate).toBe("awaiting-qa");
+    env.assertInvariants();
+  });
+
+  it("QA-3.2-32: a task cancelled while its entry waits for the repo lock is dropped, never integrated", async () => {
+    const env = await setup({ tasks: 2, batchMax: 1 });
+    let open!: () => void;
+    const gate = new Promise<void>(resolve => { open = resolve; });
+    let waiting = false;
+    env.locks.acquire = async () => {
+      if (!waiting) {
+        waiting = true;
+        await gate;
+      }
+      return okLock();
+    };
+    env.queue.enqueue(["T1", "T2"]);
+    await env.until(() => waiting, "the lane waits for the lock");
+    await env.writer.append([
+      { type: "task-transition", taskId: "T1", from: "verified", to: "cancelled", trigger: "abort", detail: null },
+      { type: "task-slot", taskId: "T1", slot: null, branch: `omr/${PLAN_ID}/t/T1` },
+    ]);
+    open();
+    await env.until(() => env.state("T2") === "integrated" && env.quiet(), "T2 integrated");
+    expect(env.state("T1")).toBe("cancelled");
+    expect(env.w.integratedCount()).toEqual({ T2: 1 });
+    expect(env.w.journal.some(e => JSON.stringify(e).includes("integration.dequeue.skipped"))).toBe(true);
+    env.assertInvariants();
+  });
+
+  it("QA-3.2-33: a long lock wait posts one blocking item; an acquire error pauses with an item and keeps the task", async () => {
+    const env = await setup({ tasks: 2, batchMax: 1 });
+    const realAcquire = env.locks.acquire.bind(env.locks);
+    const locks: RepoLockFactory = env.locks;
+    locks.acquire = async (_k, _h, _s, onWait) => {
+      onWait?.({ file: "C:/state/repos/x/integration.lock", pid: 7, hostname: "hx", planId: "p9", heartbeatAgeMs: 120_000, waitedMs: 300_000 });
+      return okLock();
+    };
+    env.queue.enqueue(["T1"]);
+    await env.until(() => env.state("T1") === "integrated" && env.quiet(), "T1 integrated");
+    const waitItem = env.ledger.inbox.find(i => i.text.includes("C:/state/repos/x/integration.lock"));
+    expect(waitItem?.severity).toBe("blocking");
+    expect(waitItem?.text).toContain("pid 7");
+    locks.acquire = async () => { throw new Error("EACCES on the lock directory"); };
+    env.queue.enqueue(["T2"]);
+    await env.until(() => env.ledger.status === "paused", "paused");
+    expect(env.ledger.inbox[env.ledger.inbox.length - 1]?.text).toContain("could not be taken");
+    expect(env.queue.queued()).toEqual(["T2"]);
+    locks.acquire = async () => realAcquire();
+    await unpause(env);
+    await env.until(() => env.state("T2") === "integrated" && env.quiet(), "T2 integrated after the unpause");
+    env.assertInvariants();
+  });
+
+  it("QA-3.2-34: a rejected append releases the repo lock; abort() clears a poll armed by an infrastructure pause", async () => {
+    const env = await setup({ tasks: 2, batchMax: 1 });
+    const at = env.writer.attempts + 1;
+    env.writer.rejectOn = n => n === at ? new ExecutorError("E_ILLEGAL_TRANSITION", "scripted", null) : null;
+    env.queue.enqueue(["T1"]);
+    await env.until(() => env.ledger.status === "paused", "paused");
+    expect(env.locks.held).toBe(false);
+
+    const env2 = await setup({ tasks: 1 });
+    const real = env2.igit.readRef.bind(env2.igit);
+    env2.igit.readRef = async (cwd, ref) => { if (ref.endsWith("/t/T1")) throw new Error("git died"); return real(cwd, ref); };
+    env2.queue.enqueue(["T1"]);
+    await env2.until(() => env2.ledger.status === "paused", "infrastructure pause");
+    const armed = env2.clock.heldCount();
+    await env2.queue.abort();
+    expect(env2.clock.heldCount()).toBeLessThan(armed);
+  });
+
+  it("QA-3.2-35: a base branch that already contains the landed head counts as landed (no second land)", async () => {
+    const env = await setup({ tasks: 0, mutate: l => { l.status = "completed"; l.config.land = "ff-when-clean"; } });
+    expect(await env.queue.land()).toEqual({ landed: true, inbox: null });
+    env.w.branches.set(MAIN_REF, env.w.commit(env.ledger.integration.head, null).sha); // the owner committed on top
+    expect(await env.queue.land()).toEqual({ landed: true, inbox: null });
+    expect(env.lander.landCalls).toHaveLength(1);
+    expect(await env.steps("land")).toHaveLength(2);
+  });
+
+  it("QA-3.2-36: abort() between the checks and the merge: no merge, no CAS, the task is cancelled", async () => {
+    const env = await setup({ tasks: 1 });
+    let armed = false;
+    let aborting: Promise<void> | null = null;
+    env.w.afterCheck = () => { armed = true; };
+    const real = env.igit.readRef.bind(env.igit);
+    env.igit.readRef = async (cwd, ref) => {
+      if (armed && ref === INT_REF && aborting === null) aborting = env.queue.abort();
+      return real(cwd, ref);
+    };
+    env.queue.enqueue(["T1"]);
+    await env.until(() => aborting !== null, "abort fired");
+    await aborting;
+    expect(env.w.writes.some(w => w.op === "mergeFfOnly" || w.op === "branchForce")).toBe(false);
+    expect(env.state("T1")).toBe("cancelled");
+    expect(env.w.tip()).toBe(env.w.base);
+    env.assertInvariants();
+  });
+
+  it("QA-3.2-36: a suite verdict returned after abort() writes no gate, pause or inbox event", async () => {
+    const env = await setup({ tasks: 1, batchMax: 1 });
+    env.suite.resolution = RUNS;
+    const culprit = culpritOf("T1");
+    let aborting: Promise<void> | null = null;
+    env.suite.onRun = req => { aborting = env.queue.abort(); return culprit(req); };
+    env.queue.enqueue(["T1"]);
+    await env.until(() => aborting !== null, "abort fired");
+    await aborting;
+    expect(env.phase().gate).toBe("suite-running");
+    expect(env.listener.calls).not.toContain("gate:p1:suite-failed");
+    expect(env.suite.reverts).toHaveLength(0);
+    expect(env.ledger.inbox).toEqual([]);
+    expect(env.writer.openIntegration()).toEqual([]);
+  });
+
+  it("nit: a suite that is off on a suite-running gate points to phaseSuite", async () => {
+    const env = await setup({ tasks: 0, resume: false, mutate: l => { const p = l.phases[0]; if (p !== undefined) p.gate = "suite-running"; } });
+    env.suite.resolution = { kind: "off" };
+    await env.queue.resume();
+    await env.until(() => env.phase().paused && env.quiet(), "phase paused");
+    expect(env.ledger.inbox[env.ledger.inbox.length - 1]?.text).toContain("phaseSuite");
+  });
+
+  it("nit: resume() step 0 whose ancestry check cannot run halts as infrastructure, not as moved", async () => {
+    const env = await setup({ tasks: 0, resume: false });
+    env.w.branches.set(INT_REF, env.w.commit(env.w.base, null).sha);
+    env.igit.isAncestor = async () => { throw new Error("git died"); };
+    const r = await env.queue.resume();
+    expect(r.halted).toBe(true);
+    const text = env.ledger.inbox[env.ledger.inbox.length - 1]?.text ?? "";
+    expect(text).toContain("infrastructure");
+    expect(text).not.toContain("no journaled fast-forward explains it");
+  });
+
+  it("nit: a task branch with no common ancestor (merge-base exit 1) is a blocking item, not an infrastructure pause", async () => {
+    const env = await setup({ tasks: 1 });
+    env.igit.mergeBase = async () => { throw new ExecutorError("E_GIT", "git merge-base failed (exit 1)", { op: "merge-base", code: 1, stderr: "" }); };
+    env.queue.enqueue(["T1"]);
+    await env.until(() => env.ledger.inbox.length > 0, "the item");
+    await env.settle();
+    expect(env.ledger.status).toBe("running");
+    expect(env.ledger.inbox[0]).toMatchObject({ severity: "blocking" });
+    expect(env.ledger.inbox[0]?.text).toContain("no common ancestor");
+    expect(env.queue.queued()).toEqual([]);
+  });
+});
+
 describe("QA-3.2-10: re-integrating a reverted task", () => {
   it("a reverted task whose commit lies below the merge base (ff without rebase) is rebased from its reverted range's from", async () => {
     let F = "";
@@ -4635,6 +4986,9 @@ describe("resume: rare arms (4.8)", () => {
     const report = await env.queue.resume();
     expect(report.entries).toEqual([expect.objectContaining({ kind: "land", action: "rerun" })]);
     await env.until(() => env.logger.warnings.some(w => w.includes("land after resume failed: lock dir gone")), "the warning");
+    // A completed plan has no pause to take: the acquire error goes to land()'s caller, no infrastructure item (QA-3.2-33
+    // applies to a running lane only).
+    expect(env.ledger.inbox).toEqual([]);
     expect(env.lander.landCalls).toEqual([]);
     expect(await env.steps("land")).toEqual(["land:land:start", "land:land:end/rolled-back"]);
   });
@@ -4822,9 +5176,11 @@ describe("phase-suite runner: run (M21-M24)", () => {
       expect(v.range).toEqual(c.ranges[pos - 1]);
       const probes = e.checks.calls.filter(x => x.commit !== c.tip && x.commit !== e.w.base);
       expect(probes.length).toBeLessThanOrEqual(5); // maxRangeProbes(6)
-      expect(e.checks.calls.filter(x => x.commit === c.tip)).toHaveLength(3); // full + 2 reruns
-      expect(e.checks.calls.filter(x => x.commit === e.w.base)).toHaveLength(1);
-      expect(e.checks.calls.slice(1).every(x => Array.isArray(x.mode) && x.mode[0] === `t/${culprit}.test.ts`)).toBe(true);
+      expect(e.checks.calls.filter(x => x.commit === c.tip)).toHaveLength(3); // full + 2 reruns (no green full: they failed)
+      // QA-3.2-23: the base runs the FULL commands once; reruns and probes run the regression's files only.
+      expect(e.checks.calls.filter(x => x.commit === e.w.base).map(x => x.mode)).toEqual(["full"]);
+      expect(e.checks.calls.slice(1).filter(x => x.commit !== e.w.base)
+        .every(x => Array.isArray(x.mode) && x.mode.length === 1 && x.mode[0] === `t/${culprit}.test.ts`)).toBe(true);
       expect(j.log.filter(x => x === "start:bisect")).toHaveLength(probes.length + 1); // + the memo step
       expect(j.open).toBe("bisect");
       expect(j.counters).toEqual([{ key: "integration.bisect.probes", value: probes.length }]);
@@ -4833,14 +5189,16 @@ describe("phase-suite runner: run (M21-M24)", () => {
     });
   }
 
-  it("flaky: the two reruns pass -> flaky ids, no base run, no bisect; the second rerun stays open for the queue", async () => {
+  it("flaky: the two reruns pass and a green full run agrees -> flaky ids, no base run, no bisect; the second rerun stays open", async () => {
     const e = runnerEnv();
     const c = e.chain(3);
     e.checks.script = (_commit, _mode, n) => n === 1 ? failRes(["test:T2"], ["t/T2.test.ts"]) : passRes;
     const j = new JournalSpy("phase-suite");
     e.checks.journal = j;
     expect(await e.runner.run(e.request(c), j)).toEqual({ kind: "flaky", ids: ["test:T2"] });
-    expect(e.checks.calls).toHaveLength(3);
+    // QA-3.2-23: full, rerun 1, rerun 2, then one green FULL run at the suite commit (in the second rerun's step).
+    expect(e.checks.calls.map(x => `${x.commit === c.tip ? "tip" : x.commit}:${x.mode === "full" ? "full" : "rerun"}`))
+      .toEqual(["tip:full", "tip:rerun", "tip:rerun", "tip:full"]);
     expect(j.log.some(x => x.includes("bisect"))).toBe(false);
     expect(j.open).toBe("suite-rerun");
   });
@@ -4872,15 +5230,37 @@ describe("phase-suite runner: run (M21-M24)", () => {
   it("mixed: only the ids that do not fail at the base are blamed and bisected", async () => {
     const e = runnerEnv();
     const c = e.chain(4);
-    e.checks.script = commit => {
+    // A rerun runs only the files it names (as the real runner does): `test:old` fails wherever its file runs.
+    e.checks.script = (commit, mode) => {
       const ids = ["test:old"];
       if (e.w.tasksAt(commit).includes("T3")) ids.push("test:new");
-      return failRes(ids, ids.map(i => `t/${i}.ts`));
+      const ran = mode === "full" ? ids : ids.filter(i => mode.includes(`t/${i}.ts`));
+      return ran.length === 0 ? passRes : failRes(ran, ran.map(i => `t/${i}.ts`));
     };
     const j = new JournalSpy("phase-suite");
     e.checks.journal = j;
     const v = await e.runner.run(e.request(c), j);
-    expect(v).toMatchObject({ kind: "culprit", range: { taskId: "T3" }, ids: ["test:new"] });
+    // Probes run only the regression's own files: a pre-existing failure never makes a probe fail (QA-3.2-26 fail closed
+    // would otherwise blame the first range).
+    expect(v).toEqual({ kind: "culprit", range: c.ranges[2], ids: ["test:new"], files: ["t/test:new.ts"] });
+    const probes = e.checks.calls.filter(x => x.commit !== c.tip && x.commit !== e.w.base);
+    expect(probes.every(x => Array.isArray(x.mode) && x.mode.join() === "t/test:new.ts")).toBe(true);
+  });
+
+  it("mixed in one file: a regression whose only file also fails at the base cannot be isolated -> unattributed, nobody blamed", async () => {
+    const e = runnerEnv();
+    const c = e.chain(4);
+    // test:old and test:new live in the same file, which already fails at the base.
+    e.checks.script = commit => {
+      const ids = ["test:old"];
+      if (e.w.tasksAt(commit).includes("T3")) ids.push("test:new");
+      return failRes(ids, ["t/shared.test.ts"]);
+    };
+    const j = new JournalSpy("phase-suite");
+    e.checks.journal = j;
+    expect(await e.runner.run(e.request(c), j)).toEqual({ kind: "unattributed", ids: ["test:new"], reason: "base-overlap" });
+    expect(e.checks.calls.filter(x => x.commit !== c.tip && x.commit !== e.w.base)).toEqual([]); // no probe
+    expect(j.open).toBe("bisect"); // the memo step
   });
 
   it("no phase base: unattributed (no-base) with the reproduced ids, nothing bisected", async () => {

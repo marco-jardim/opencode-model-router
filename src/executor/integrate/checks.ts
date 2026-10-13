@@ -67,6 +67,11 @@ export interface CommandRunRequest {
   mode: "full" | { rerun: readonly string[] }; priority: "foreground" | "background"; signal: AbortSignal; prepare: boolean;
   /** M38: the preemption budget of the suite entry, shared by all of its runs (default: a fresh PREEMPT_BUDGET per run). */
   preempt?: PreemptBudget;
+  /**
+   * QA-3.2-22: a rerun that runs nothing (its files map to no test) is a failure, unparsed, never a pass. Set for the
+   * reruns at the commit where the failure was observed: its failing files must exist there.
+   */
+  requireRun?: boolean;
 }
 export interface CommandRunResult {
   verdict: "pass" | "fail" | "error"; ids: string[]; files: string[]; idsUnparsed: boolean;
@@ -331,12 +336,16 @@ export interface IntegrationChecksDeps {
   slotMax?: number;
   /** `isCommandAllowed` for the pytest command (default: allowed). */
   allowCommand?: (command: string) => boolean;
+  /** Whether a test file exists (default: node:fs). A failing id names a rerunnable file only when it does (QA-3.2-22/-24). */
+  fileExists?: (p: string) => Promise<boolean>;
+}
+
+async function fileExistsOnDisk(p: string): Promise<boolean> {
+  try { await stat(p); return true; } catch { return false; }
 }
 
 const nodeFs: RunnerFs = {
-  async fileExists(p) {
-    try { await stat(p); return true; } catch { return false; }
-  },
+  fileExists: fileExistsOnDisk,
   readFile: p => readFile(p, "utf8"),
   realpath: p => realpath(p),
   async stat(p) {
@@ -370,15 +379,84 @@ function fileOfId(id: string): string {
   return cut.length === 0 ? id : id.slice(0, Math.min(...cut));
 }
 
+/** A vitest workspace line names its project first (` FAIL  |proj| test/a.test.ts > …`): the id is what follows. */
+function stripProject(id: string): string {
+  return id.replace(/^\|[^|]*\|\s+/, "");
+}
+
+function field(o: unknown, key: string): unknown {
+  return typeof o === "object" && o !== null ? Reflect.get(o, key) : undefined;
+}
+
 /**
- * QA-3.2-1: the failing ids of a full run, read from its output (`observeTests`, verify/baseline.ts). `files` are the
- * test files of the ids, resolved against `cwd` (the form `readResult` reports). Null when the output names no id.
+ * QA-3.2-26: a jest/vitest JSON report on stdout, with its failing ids in `readResult`'s form
+ * (`<cwd-relative file> > <ancestor titles> > <title>`). `raw` are the same failures in `observeTests`' form
+ * (`<absolute suite name> > <fullName>`), to drop. `errors`: a runtime-error suite or a failed suite without a failed
+ * test (an import or collection error, QA-3.2-23).
+ */
+function jsonReport(stdout: string, cwd: string): { ids: string[]; raw: string[]; errors: boolean } | null {
+  let json: unknown;
+  try {
+    json = JSON.parse(stdout);
+  } catch {
+    return null;
+  }
+  const results = field(json, "testResults");
+  if (!Array.isArray(results)) return null;
+  const suites: unknown[] = results;
+  const ids: string[] = [];
+  const raw: string[] = [];
+  let errors = Number(field(json, "numRuntimeErrorTestSuites") ?? 0) > 0;
+  for (const suite of suites) {
+    const name = String(field(suite, "name") ?? "");
+    const rel = (nodePath.isAbsolute(name) ? nodePath.relative(cwd, name) : name).replace(/\\/g, "/");
+    const asserts = field(suite, "assertionResults");
+    let failed = 0;
+    for (const a of Array.isArray(asserts) ? (asserts as unknown[]) : []) {
+      if (field(a, "status") !== "failed") continue;
+      failed++;
+      const fullName = field(a, "fullName");
+      if (typeof fullName === "string") raw.push(`${name} > ${fullName}`);
+      const ancestors = field(a, "ancestorTitles");
+      const title = field(a, "title");
+      const parts = [...(Array.isArray(ancestors) ? (ancestors as unknown[]).map(String) : []), String(title ?? fullName ?? "")];
+      ids.push(`${rel} > ${parts.join(" > ")}`);
+    }
+    if (field(suite, "status") === "failed" && failed === 0) errors = true;
+  }
+  return { ids, raw, errors };
+}
+
+/**
+ * QA-3.2-23: output that reports errors outside the test inventory, so its failing ids cannot be the whole failure:
+ * a file-level FAIL (vitest's failed suite ` FAIL  f.ts [ f.ts ]`, jest's file header), vitest's `Errors  N error`,
+ * pytest's `ERROR …` lines, an `N error` count in pytest's summary, or an error during collection.
+ */
+function reportsErrors(text: string): boolean {
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.replace(/\x1b\[[0-9;]*m/g, "").trim();
+    if (/^FAIL\s/.test(line) && !/\s>\s/.test(line)) return true;
+    if (/^Errors?\s+\d+\s+errors?\b/i.test(line) || /^ERROR\b/.test(line)) return true;
+    if (/^=+\s.*\b\d+\s+errors?\b/.test(line) || /\berrors? during collection\b/i.test(line)) return true;
+  }
+  return false;
+}
+
+/**
+ * QA-3.2-1: the failing ids of a full run, read from its output (`observeTests`, verify/baseline.ts), in one form
+ * (QA-3.2-26: `readResult`'s; no vitest project prefix, no absolute jest-JSON ids). `files` are the test files of the
+ * ids resolved against `cwd`. `complete` is false when the output also reports errors outside the tests (QA-3.2-23).
+ * Null when the output names no id.
  */
 export function observeFull(o: CommandOutput, cwd: string): { ids: string[]; files: string[]; complete: boolean } | null {
   const seen = observeTests({ code: o.exitCode ?? -1, stdout: o.stdout, stderr: o.stderr, timedOut: o.timedOut });
-  if (seen.failures.length === 0) return null;
-  const files = [...new Set(seen.failures.map(id => nodePath.resolve(cwd, fileOfId(id))))].sort();
-  return { ids: [...seen.failures], files, complete: seen.complete };
+  const json = jsonReport(o.stdout, cwd);
+  const raw = new Set(json?.raw ?? []);
+  const ids = [...new Set([...seen.failures.filter(id => !raw.has(id)).map(stripProject), ...(json?.ids ?? [])])].sort();
+  if (ids.length === 0) return null;
+  const files = [...new Set(ids.map(id => nodePath.resolve(cwd, fileOfId(id))))].sort();
+  const complete = seen.complete && !(json?.errors ?? false) && !reportsErrors(`${o.stdout}\n${o.stderr}`);
+  return { ids, files, complete };
 }
 
 type Held<T> = { ok: true; value: T } | { ok: false; reason: CheckErrorReason; message: string };
@@ -444,6 +522,7 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     const unregister = o.priority === "background" ? d.background.register(own, o.budget ?? PREEMPT_BUDGET) : () => undefined;
     const signal = AbortSignal.any([o.signal, lost.signal, own.signal]);
     let handle: SlotHandle | null = null;
+    let held: Held<T>;
     try {
       if (o.priority === "foreground") {
         const preempt = d.preemptForeground ?? (async () => { await (await import("../../verify/wiring")).preemptBackgroundVerification(); });
@@ -459,20 +538,21 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
         else if (o.priority === "foreground") d.background.preemptOne();
       }
       if (handle === null) return why(o.signal, lost.signal.aborted, false);
-      let value: T;
       try {
-        value = await body(signal);
+        const value = await body(signal);
+        // QA-3.2-13: whatever the body returned, a run whose signal fired (abort, preemption, lost slot) is no result.
+        held = signal.aborted || handle.lost ? why(o.signal, lost.signal.aborted || handle.lost, true) : { ok: true, value };
       } catch (e) {
         // A child killed by the signal rejects: that is the signal's outcome, not a spawn error.
         if (!signal.aborted && !handle.lost) throw e;
-        return why(o.signal, lost.signal.aborted || handle.lost, true);
+        held = why(o.signal, lost.signal.aborted || handle.lost, true);
       }
-      // QA-3.2-13: whatever the body returned, a run whose signal fired (abort, preemption, lost slot) is no result.
-      return signal.aborted || handle.lost ? why(o.signal, lost.signal.aborted || handle.lost, true) : { ok: true, value };
     } finally {
       unregister();
       if (handle !== null) await handle.release();
     }
+    // QA-3.2-36: an abort that fired while the slot was being released still wins over the result.
+    return held.ok && o.signal.aborted ? why(o.signal, false, true) : held;
   }
 
   /**
@@ -553,6 +633,14 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     return confirm(t, command, cwd, signal, low, comp, first);
   }
 
+  /** QA-3.2-22/-24: the files of `files` that exist; a test id names a rerunnable file only then. */
+  async function existing(files: readonly string[]): Promise<string[]> {
+    const exists = d.fileExists ?? fileExistsOnDisk;
+    const out: string[] = [];
+    for (const f of files) if (await exists(f)) out.push(f);
+    return out;
+  }
+
   /** The full test command: exit 0 without a timeout passes; a failure names the ids its output lists (QA-3.2-1). */
   async function runFull(c: ResolvedCommand, cwd: string, signal: AbortSignal, low: boolean) {
     const out = await exec(c, cwd, signal, low);
@@ -564,9 +652,12 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     const f = await runFull(t.full, cwd, signal, low);
     const comp = component("tests", t.full, f.out, "full");
     if (f.pass) return { comp, failing: null };
-    // M11 calls an id flaky only against a complete id inventory.
-    if (f.seen === null || !f.seen.complete) return { comp, failing: { ids: f.seen?.ids ?? [], files: f.seen?.files ?? [], output: f.output } };
-    return confirm(t, command, cwd, signal, low, comp, { ids: f.seen.ids, files: f.seen.files, output: f.output });
+    // M11 calls an id flaky only against a complete id inventory whose files all exist (QA-3.2-22: a file the rerun
+    // planner drops would leave its ids unrun, and an unrun id must never read as flaky).
+    const seen = f.seen;
+    const failing: Failing = { ids: seen?.ids ?? [], files: seen?.files ?? [], output: f.output };
+    if (seen === null || !seen.complete || (await existing(seen.files)).length < seen.files.length) return { comp, failing };
+    return confirm(t, command, cwd, signal, low, comp, failing);
   }
 
   /**
@@ -622,37 +713,36 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
   }
 
   /**
-   * QA-3.2-6: the regression of a revert, judged on its own ids. Only its files run, and only its ids decide: any other
-   * failure there is not the revert's to fix. A test command reruns the files; an unscoped run, a non-test command or
-   * an incomplete report falls back to the whole command, judged by the ids its output names (unparsed: fail closed).
+   * QA-3.2-6/-24/-26: the regression of a revert, judged on its own ids. A test command reruns the regression files
+   * that exist here. With none (no file given, a file `reroot` could not map, the culprit's own test file reverted
+   * away), an unscoped run, a non-test command or an incomplete report, the whole command runs instead: a run that
+   * ran nothing never passes the regression. A passing run passes. A failing run fails with the regression ids it
+   * names, and with every regression id when it names none of them (fail closed: another id form, or another failure
+   * hiding them, cannot clear the regression).
    */
   async function regressionTests(
     c: ResolvedCommand, ids: readonly string[], files: readonly string[], cwd: string, signal: AbortSignal, low: boolean,
   ): Promise<TestOutcome> {
-    const wanted = new Set(ids);
-    const fail = (still: readonly string[], output: string): Failing | null => (still.length === 0 ? null : { ids: [...still], files: [...files], output });
-    if (c.source === "pytest" || c.ref?.script === "test") {
+    const fail = (named: readonly string[], output: string): Failing => {
+      const still = ids.filter(id => named.includes(id));
+      return { ids: still.length > 0 ? still : [...ids], files: [...files], output };
+    };
+    const present = await existing(files);
+    if (present.length > 0 && (c.source === "pytest" || c.ref?.script === "test")) {
       const runner = await detectRunner(c.source === "pytest" ? c.label : "npm test", cwd, nodeFs);
-      const plan = isUnverifiable(runner) ? runner : await planRerun(runner, files, cwd, { maxWorkers: MAX_WORKERS }, { fs: nodeFs });
-      if (isNoAffected(plan)) {
-        // The regression's test files are gone at this commit: nothing of it can fail here.
-        const none: CommandOutput = { exitCode: 0, timedOut: false, stdout: "", stderr: "", durationMs: 0 };
-        return { comp: component("regression", { ...c, label: "no affected tests" }, none, "no-affected"), failing: null };
-      }
+      const plan = isUnverifiable(runner) ? runner : await planRerun(runner, present, cwd, { maxWorkers: MAX_WORKERS }, { fs: nodeFs });
       if (isScopedSpec(plan)) {
         const spec: ResolvedCommand = { ...c, file: plan.file, args: plan.args, env: plan.env, cwd: plan.cwd };
         const out = await exec(spec, cwd, signal, low);
         const result = await readResult(plan, asExec(out), nodeFs);
         const comp = component("regression", spec, out, "rerun");
         const output = tail(out.stdout + out.stderr, OUTPUT_TAIL_BYTES);
-        if (out.timedOut || result.collectionError) return { comp, failing: fail(ids, output) };
-        if (result.complete) return { comp, failing: fail(result.failingIds.filter(id => wanted.has(id)), output) };
+        if (out.timedOut || result.collectionError) return { comp, failing: fail([], output) };
+        if (result.complete) return { comp, failing: out.exitCode === 0 ? null : fail(result.failingIds, output) };
       }
     }
     const f = await runFull(c, cwd, signal, low);
-    const comp = component("regression", c, f.out, "full");
-    if (f.pass) return { comp, failing: null };
-    return { comp, failing: fail(f.seen !== null && f.seen.complete ? f.seen.ids.filter(id => wanted.has(id)) : ids, f.output) };
+    return { comp: component("regression", c, f.out, "full"), failing: f.pass ? null : fail(f.seen?.ids ?? [], f.output) };
   }
 
   async function run(req: CheckRequest): Promise<CheckResult> {
@@ -754,7 +844,15 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
           const command = c.source === "pytest" ? c.label : "npm test";
           const runner = await detectRunner(command, cwd, nodeFs);
           const plan = isUnverifiable(runner) ? runner : await planRerun(runner, wanted, cwd, { maxWorkers: MAX_WORKERS }, { fs: nodeFs });
-          if (isNoAffected(plan)) continue;
+          if (isNoAffected(plan)) {
+            // QA-3.2-22: where the failure was observed, a rerun that maps to no test ran nothing: a failure, never a pass.
+            if (req.requireRun === true) {
+              failed = true;
+              unparsed = true;
+              output = `the rerun ran no test: ${wanted.length} failing file(s) map to no test file`;
+            }
+            continue;
+          }
           if (isScopedSpec(plan)) {
             const spec: ResolvedCommand = { ...c, file: plan.file, args: plan.args, env: plan.env, cwd: plan.cwd };
             const out = await exec(spec, cwd, signal, low);
@@ -786,7 +884,9 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
           }
           for (const id of seen.ids) ids.add(id);
           for (const f of seen.files) files.add(f);
-          if (!seen.complete) unparsed = true;
+          // QA-3.2-22: ids whose files do not exist here (a vitest root or a delegating script elsewhere) cannot be rerun
+          // by file: the failure is unattributable, so reruns and probes run the full commands.
+          if (!seen.complete || (await existing(seen.files)).length < seen.files.length) unparsed = true;
         }
       }
       // Every failure path without ids sets `unparsed`, so a parsed failure always names at least one id.
