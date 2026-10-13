@@ -8,7 +8,7 @@ import {
   type V2Executor, type V2ExecutorFactory, type V2ExecutorHost,
 } from "../../src/compat/v2-hooks";
 import { PLAN_PROVIDER_NAME, ROUTER_TURN_STATE_ATTACH } from "../../src/compat/turn-state";
-import { bindPlanChild, evict as evictBinding } from "../../src/routing/roles/binding";
+import { bindPlanChild, currentBinding, evict as evictBinding } from "../../src/routing/roles/binding";
 import type { HostSessionEvent } from "../../src/executor/types";
 import ModelRouterPlugin from "../../src/index";
 import { invalidateConfigCache, loadConfig, overridePath } from "../../src/router/config";
@@ -16,7 +16,7 @@ import { getActiveTiers } from "../../src/router/protocol";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync, rmSync } from "node:fs";
 import v2Plugin from "../../src/v2";
 import type { Plugin } from "@opencode/plugin";
 import { lastStepContext, rememberDispatch, resetDispatchRegistry } from "../../src/router/sessions";
@@ -28,7 +28,7 @@ import { V2_GRADER_AGENT } from "../../src/compat/v2-client";
 import { DEPTH_BANNER, TASK_VERIFICATION, type ChildSessionRequest, type RouterPluginInput } from "../../src/compat/child-session";
 import { depthAdvisoryBanner, depthLimitMessage } from "../../src/router/depth-guard";
 import { appendRouterFooter } from "../../src/verify/pending";
-import { createLeaseGuard } from "../../src/compat/background";
+import { createLeaseGuard, ROUTER_FINISH_ATTACH } from "../../src/compat/background";
 import { createLeaseRegistry } from "../../src/router/leases";
 import { evaluatePermission, READ_ONLY_CANARIES, readOnlyPermissions } from "../../src/router/read-only";
 import type { PermissionEvaluation } from "@opencode/plugin/promise/permission";
@@ -1259,48 +1259,102 @@ describe("plan executor wiring in the v2 adapter (3.1.7: W2, W4, W5, W6, M41)", 
     expect(x.launcher.dispose).toHaveBeenCalled();
   });
 
-  it("session.step.started carries the provider to the emitter; retry and step-failure share one stepKey per step (W4)", async () => {
+  it("session.step.started carries the provider to the emitter; the adapter's stepKey follows the C10 recorded sequence (W4, QA-3.1-8)", async () => {
     const x = fakeExecutor();
     const w = await startWired({ executor: x.factory });
     const rate = { type: "APIError", message: "rate limited", status: 429 };
+    const key = (k: number): string => `${PLAN_CHILD}:${k}`;
+    // C10 (ADR 0007): step.started, retry.scheduled, the retried step's step.started, another retry, then step.ended.
     w.f.emit({ id: "e1", type: "session.step.started", data: { sessionID: PLAN_CHILD, model: { providerID: "anthropic", id: "claude-x" } } });
     w.f.emit({ id: "e2", type: "session.retry.scheduled", data: { sessionID: PLAN_CHILD, error: rate } });
-    w.f.emit({ id: "e3", type: "session.step.failed", data: { sessionID: PLAN_CHILD, error: rate } });
-    w.f.emit({ id: "e4", type: "session.step.started", data: { sessionID: PLAN_CHILD, model: { providerID: "openai", id: "gpt-x" } } });
-    w.f.emit({ id: "e5", type: "session.retry.scheduled", data: { sessionID: PLAN_CHILD, error: rate } });
-    await vi.waitFor(() => expect(x.emitted.filter((e) => e.type === "retry")).toHaveLength(2));
-    const started = x.emitted.filter((e) => e.type === "step.started");
-    expect(started).toMatchObject([
-      { sessionID: PLAN_CHILD, providerID: "anthropic", modelID: "claude-x" },
-      { sessionID: PLAN_CHILD, providerID: "openai", modelID: "gpt-x" },
+    w.f.emit({ id: "e3", type: "session.step.started", data: { sessionID: PLAN_CHILD, model: { providerID: "anthropic", id: "claude-x" } } });
+    w.f.emit({ id: "e4", type: "session.retry.scheduled", data: { sessionID: PLAN_CHILD, error: rate } });
+    w.f.emit({ id: "e5", type: "session.step.ended", data: { sessionID: PLAN_CHILD } });
+    // the next step: a step.failed while a retry is pending keeps the step open (memo :163); one without closes it
+    w.f.emit({ id: "e6", type: "session.step.started", data: { sessionID: PLAN_CHILD, model: { providerID: "openai", id: "gpt-x" } } });
+    w.f.emit({ id: "e7", type: "session.retry.scheduled", data: { sessionID: PLAN_CHILD, error: rate } });
+    w.f.emit({ id: "e8", type: "session.step.failed", data: { sessionID: PLAN_CHILD, error: rate } });
+    w.f.emit({ id: "e9", type: "session.step.started", data: { sessionID: PLAN_CHILD, model: { providerID: "openai", id: "gpt-x" } } });
+    w.f.emit({ id: "e10", type: "session.step.failed", data: { sessionID: PLAN_CHILD, error: rate } });
+    w.f.emit({ id: "e11", type: "session.step.started", data: { sessionID: PLAN_CHILD, model: { providerID: "openai", id: "gpt-x" } } });
+    await vi.waitFor(() => expect(x.emitted.filter((e) => e.type === "step.started")).toHaveLength(5));
+    expect(x.emitted.filter((e) => e.type === "step.started")).toMatchObject([
+      { sessionID: PLAN_CHILD, providerID: "anthropic", modelID: "claude-x", stepKey: key(1) },
+      { stepKey: key(1) },
+      { sessionID: PLAN_CHILD, providerID: "openai", modelID: "gpt-x", stepKey: key(2) },
+      { stepKey: key(2) },
+      { stepKey: key(3) },
     ]);
     expect(x.emitted.filter((e) => e.type === "retry")).toMatchObject([
-      { sessionID: PLAN_CHILD, stepKey: `${PLAN_CHILD}:1`, source: "scheduled", error: { type: "APIError", status: 429, message: "rate limited" } },
-      { sessionID: PLAN_CHILD, stepKey: `${PLAN_CHILD}:2`, source: "scheduled" },
+      { sessionID: PLAN_CHILD, stepKey: key(1), source: "scheduled", error: { type: "APIError", status: 429, message: "rate limited" } },
+      { sessionID: PLAN_CHILD, stepKey: key(1), source: "scheduled" },
+      { sessionID: PLAN_CHILD, stepKey: key(2), source: "scheduled" },
     ]);
-    expect(x.emitted.find((e) => e.type === "step.failed")).toMatchObject({ sessionID: PLAN_CHILD, error: { type: "APIError", status: 429 } });
+    expect(x.emitted.filter((e) => e.type === "step.ended")).toEqual([expect.objectContaining({ sessionID: PLAN_CHILD, stepKey: key(1) })]);
+    expect(x.emitted.filter((e) => e.type === "step.failed")).toMatchObject([
+      { sessionID: PLAN_CHILD, stepKey: key(2), error: { type: "APIError", status: 429 } },
+      { sessionID: PLAN_CHILD, stepKey: key(2) },
+    ]);
     // M46: the adapter only emits; it never calls the runtime's host-event entry itself
     expect(x.runtime.onHostEvent).not.toHaveBeenCalled();
   });
 
-  it("the retry hook asks the runtime with the step's key; a stop is requested only for a plan child; errors leave the decision alone (W4)", async () => {
+  it("the step counter map is bounded at 1000 and evicts ended sessions before live ones (QA-3.1-8)", async () => {
+    const x = fakeExecutor();
+    const w = await startWired({ executor: x.factory });
+    const rate = { type: "APIError", message: "rate limited", status: 429 };
+    w.f.emit({ id: "k1", type: "session.step.started", data: { sessionID: "keep-live", model: { providerID: "p", id: "m" } } });
+    for (let i = 0; i < 1000; i += 1) {
+      w.f.emit({ id: `s${i}`, type: "session.step.started", data: { sessionID: `ended-${i}`, model: { providerID: "p", id: "m" } } });
+      w.f.emit({ id: `x${i}`, type: "session.execution.succeeded", data: { sessionID: `ended-${i}` } });
+    }
+    w.f.emit({ id: "k2", type: "session.retry.scheduled", data: { sessionID: "keep-live", error: rate } });
+    w.f.emit({ id: "k3", type: "session.retry.scheduled", data: { sessionID: "ended-0", error: rate } });
+    await vi.waitFor(() => expect(x.emitted.filter((e) => e.type === "retry")).toHaveLength(2), { timeout: 10_000 });
+    // the least recently used session is the live one: it keeps its count; the oldest ENDED session was evicted instead
+    expect(x.emitted.filter((e) => e.type === "retry")).toMatchObject([
+      { sessionID: "keep-live", stepKey: "keep-live:1" },
+      { sessionID: "ended-0", stepKey: "ended-0:0" },
+    ]);
+  });
+
+  it("the retry hook asks the runtime with the step's key; a plan child's retry decision becomes {retry:false}; others and errors leave it alone (W4, QA-3.1-3)", async () => {
     const x = fakeExecutor();
     const w = await startWired({ executor: x.factory });
     w.f.emit({ id: "e1", type: "session.step.started", data: { sessionID: PLAN_CHILD, model: { providerID: "anthropic", id: "claude-x" } } });
     await vi.waitFor(() => expect(x.emitted.some((e) => e.type === "step.started")).toBe(true));
     const error = { type: "APIError", message: "overloaded", status: 529 };
-    const planDecision = { sessionID: PLAN_CHILD, error };
-    const otherDecision = { sessionID: "ordinary-session", error };
+    // C10: the host's `SessionRetry` carries a writable `decision` (`{retry: true, delay}` for a 429/529)
+    const planDecision = { sessionID: PLAN_CHILD, error, attempt: 2, decision: { retry: true, delay: 2000 } as { retry: boolean; delay?: number } };
+    const otherDecision = { sessionID: "ordinary-session", error, attempt: 2, decision: { retry: true, delay: 2000 } };
     await expect(w.f.sessionHooks.retry(planDecision)).resolves.toBeUndefined();
     await expect(w.f.sessionHooks.retry(otherDecision)).resolves.toBeUndefined();
     expect(x.runtime.onRetryHook).toHaveBeenNthCalledWith(1, { sessionID: PLAN_CHILD, stepKey: `${PLAN_CHILD}:1`, error: { type: "APIError", status: 529, message: "overloaded" } });
     expect(x.runtime.onRetryHook).toHaveBeenNthCalledWith(2, expect.objectContaining({ sessionID: "ordinary-session" }));
     expect(x.runtime.onRetryHook.mock.results.map((r) => r.value)).toEqual([{ stop: true }, { stop: false }]);
-    // the host event has no writable retry field: the decision objects are left untouched
-    expect(planDecision).toEqual({ sessionID: PLAN_CHILD, error });
-    expect(otherDecision).toEqual({ sessionID: "ordinary-session", error });
+    // the stop is written into the host's decision for the plan child only
+    expect(planDecision.decision).toEqual({ retry: false });
+    expect(otherDecision).toEqual({ sessionID: "ordinary-session", error, attempt: 2, decision: { retry: true, delay: 2000 } });
+    const failing = { sessionID: PLAN_CHILD, error, attempt: 3, decision: { retry: true, delay: 2000 } };
     x.runtime.onRetryHook.mockImplementationOnce(() => { throw new Error("runtime failed"); });
-    await expect(w.f.sessionHooks.retry(planDecision)).resolves.toBeUndefined();
+    await expect(w.f.sessionHooks.retry(failing)).resolves.toBeUndefined();
+    expect(failing.decision).toEqual({ retry: true, delay: 2000 });
+  });
+
+  it("a retry the hook stopped no longer keeps the step open: the following step.failed closes it (QA-3.1-8)", async () => {
+    const x = fakeExecutor();
+    const w = await startWired({ executor: x.factory });
+    const rate = { type: "APIError", message: "rate limited", status: 429 };
+    w.f.emit({ id: "e1", type: "session.step.started", data: { sessionID: PLAN_CHILD, model: { providerID: "anthropic", id: "claude-x" } } });
+    w.f.emit({ id: "e2", type: "session.retry.scheduled", data: { sessionID: PLAN_CHILD, error: rate } });
+    await vi.waitFor(() => expect(x.emitted.filter((e) => e.type === "retry")).toHaveLength(1));
+    await w.f.sessionHooks.retry({ sessionID: PLAN_CHILD, error: rate, attempt: 3, decision: { retry: true, delay: 2000 } });
+    w.f.emit({ id: "e3", type: "session.step.failed", data: { sessionID: PLAN_CHILD, error: rate } });
+    w.f.emit({ id: "e4", type: "session.step.started", data: { sessionID: PLAN_CHILD, model: { providerID: "anthropic", id: "claude-x" } } });
+    await vi.waitFor(() => expect(x.emitted.filter((e) => e.type === "step.started")).toHaveLength(2));
+    expect(x.runtime.onRetryHook).toHaveBeenCalledWith(expect.objectContaining({ sessionID: PLAN_CHILD, stepKey: `${PLAN_CHILD}:1` }));
+    expect(x.emitted.filter((e) => e.type === "step.failed")).toMatchObject([{ stepKey: `${PLAN_CHILD}:1` }]);
+    expect(x.emitted.filter((e) => e.type === "step.started").map((e) => (e as { stepKey?: string }).stepKey)).toEqual([`${PLAN_CHILD}:1`, `${PLAN_CHILD}:2`]);
   });
 
   it("the orchestrator's own idle events reach the emitter (W6, M34)", async () => {
@@ -1385,6 +1439,209 @@ describe("plan executor wiring in the v2 adapter (3.1.7: W2, W4, W5, W6, M41)", 
       await w.f.sessionHooks.context(w.contextEvent("m41-ordinary", "Please read the file and report."));
       expect(await refusal(w, "m41-ordinary")).not.toMatch(/no matching plan binding/);
     });
+
+    it("only a launcher prompt is checked: a quoted header, or one off its grammar position, never refuses; a failed kind lookup refuses only a plan prompt (QA-3.1-9 a)", async () => {
+      const w = await startWired();
+      const header = `[plan plan-one:T1#1] nonce=${NONCE}`;
+      // the session kind cannot be looked up for any of these sessions (the rest of the context hook may fail on that too:
+      // the M41 check runs first)
+      Object.assign(w.f.ctx.session, { get: vi.fn(async () => { throw new Error("session lookup failed"); }) });
+      const firstContext = async (sessionID: string, text: string): Promise<void> => {
+        await w.f.sessionHooks.context(w.contextEvent(sessionID, text)).catch(() => undefined);
+      };
+      await firstContext("m41-quoted", `Explain this log line:\n${header}\nWhat does it mean?`);
+      await firstContext("m41-late", `Some notes first.\nPLAN CONTEXT\nshared\n\n${header}\n\nTASK do it`);
+      await firstContext("m41-off-position", `PLAN CONTEXT\nshared\nmore\n${header}\n\nTASK do it`);
+      await firstContext("m41-no-gap", `PLAN CONTEXT\nshared\n\n${header}\nTASK do it`);
+      expect(await refusal(w, "m41-quoted")).not.toMatch(/no matching plan binding/);
+      expect(await refusal(w, "m41-late")).not.toMatch(/no matching plan binding/);
+      expect(await refusal(w, "m41-off-position")).not.toMatch(/no matching plan binding/);
+      expect(await refusal(w, "m41-no-gap")).not.toMatch(/no matching plan binding/);
+      // a launcher prompt in a session of unknown kind is still checked as a child (fail closed)
+      await firstContext("m41-unknown-kind", planPrompt("plan-one", "T1"));
+      expect(await refusal(w, "m41-unknown-kind")).toMatch(/no matching plan binding/);
+      // an empty shared context is still the grammar
+      await firstContext("m41-empty-shared", `PLAN CONTEXT\n\n\n${header}\n\nTASK do it`);
+      expect(await refusal(w, "m41-empty-shared")).toMatch(/no matching plan binding/);
+    });
+
+    it("parallel first tool calls on the fallback path all wait for the same check: none slips through (QA-3.1-9 b)", async () => {
+      const w = await startWired();
+      let release: () => void = () => undefined;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const contextOf = vi.fn(async ({ sessionID }: { sessionID: string }) => {
+        if (sessionID !== "m41-race") return [];
+        await gate;
+        return userMessage(planPrompt("plan-one", "T1"));
+      });
+      Object.assign(w.f.ctx.session, { context: contextOf });
+      const call = async (n: number): Promise<string> => {
+        try {
+          await w.f.toolHooks["execute.before"]({ ...w.toolEvent("m41-race"), id: `call-m41-race-${n}` });
+          return "";
+        } catch (error) {
+          return String(error instanceof Error ? error.message : error);
+        }
+      };
+      const calls = [call(1), call(2), call(3)];
+      await w.tick();
+      release();
+      const results = await Promise.all(calls);
+      for (const result of results) expect(result).toMatch(/no matching plan binding/);
+      expect(await refusal(w, "m41-race")).toMatch(/no matching plan binding/);
+    });
+
+    it("a fallback check that could not read the first message is retried by the next call", async () => {
+      const w = await startWired();
+      let fail = true;
+      Object.assign(w.f.ctx.session, {
+        context: vi.fn(async () => {
+          if (fail) throw new Error("context unavailable");
+          return userMessage(planPrompt("plan-one", "T1"));
+        }),
+      });
+      expect(await refusal(w, "m41-retry")).not.toMatch(/no matching plan binding/);
+      fail = false;
+      expect(await refusal(w, "m41-retry")).toMatch(/no matching plan binding/);
+    });
+  });
+
+  it("tiers mode: a plan child's binding carries the plan identity; its agent is no role agent, so it gets no role action (QA-3.1-2)", async () => {
+    const x = fakeExecutor();
+    await startWired({ executor: x.factory });
+    const host = x.state.host;
+    if (host === undefined) throw new Error("the factory was not called");
+    const child = "qa312-plan-child";
+    host.bindings.bind({ childSessionID: child, role: "implementer", agent: "implementer", workRoot: ABS_ROOT, grant: ["edit"], planId: "plan-one", taskId: "T1", attempt: 1 });
+    try {
+      const binding = currentBinding(child, { maxOf: () => [] });
+      expect(binding?.plan).toMatchObject({ planId: "plan-one", taskId: "T1" });
+    } finally {
+      evictBinding(child);
+    }
+  });
+
+  it("roles mode: a plan child with needs=edit can read, glob, grep and edit; without shell it is refused router_run (QA-3.1-2)", async () => {
+    const dir = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-qa312-")));
+    vi.stubEnv("HOME", dir); vi.stubEnv("USERPROFILE", dir); vi.stubEnv("MODEL_ROUTER_ENFORCE", "");
+    mkdirSync(dirname(overridePath()), { recursive: true });
+    writeFileSync(overridePath(), JSON.stringify({ routing: { delegation: "roles" } }));
+    invalidateConfigCache();
+    const slot = join(dir, "slot-1");
+    mkdirSync(slot, { recursive: true });
+    const file = join(slot, "a.ts");
+    writeFileSync(file, "export const a = 1;\n");
+    const pluginHooks: unknown = await ModelRouterPlugin({
+      directory: dir, worktree: dir, routerHost: "v2",
+      client: {
+        session: { get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id, ...(path.id === "root" ? {} : { parentID: "root" }) } }) },
+        app: { log: async () => ({}) },
+      },
+    } as unknown as Parameters<typeof ModelRouterPlugin>[0]);
+    const toolHooks: Record<string, (event: unknown) => Promise<void>> = {};
+    const register = () => ({ dispose: async () => undefined });
+    let wake = (): void => undefined;
+    const ctx = {
+      location: { directory: dir, project: { directory: dir } },
+      agent: { reload: async () => undefined, list: async () => ({ data: [] }), transform: async (cb: (e: unknown) => void) => { cb({ update: () => undefined }); return register(); } },
+      command: { reload: async () => undefined, transform: async (cb: (e: unknown) => void) => { cb({ add: () => undefined }); return register(); } },
+      model: { list: async () => ({ data: [] }) },
+      tool: {
+        transform: async (cb: (e: unknown) => void) => { cb({ add: () => undefined, update: () => undefined }); return register(); },
+        hook: async (name: string, cb: (event: unknown) => Promise<void>) => { toolHooks[name] = cb; return register(); },
+      },
+      session: {
+        get: async ({ sessionID }: { sessionID: string }) => (sessionID === "root"
+          ? { id: sessionID, agent: "build", location: { directory: dir } }
+          : { id: sessionID, parentID: "root", agent: "implementer", location: { directory: dir } }),
+        context: async () => [] as unknown[],
+        update: async () => undefined, prompt: async () => undefined, synthetic: async () => undefined, interrupt: async () => undefined,
+        hook: async () => register(),
+      },
+      permission: { hook: async () => register() },
+      event: {
+        subscribe: async function* ({ signal }: { signal: AbortSignal }): AsyncGenerator<never> {
+          signal.addEventListener("abort", () => wake(), { once: true });
+          while (!signal.aborted) await new Promise<void>((resolve) => { wake = resolve; });
+        },
+      },
+    };
+    const childRunner = {
+      bootID: "0123456789abcdef", retainedContext: () => null, onContextCaptured: () => () => undefined,
+      run: async () => ({ sessionID: "unused", text: "" }), pin: () => () => undefined,
+    };
+    const v2 = { withToolContext: async <T>(_context: unknown, operation: () => Promise<T>) => operation(), applyChildSystem: () => undefined, childRunner };
+    const x = fakeExecutor();
+    cleanups.push(await registerV2Hooks(ctx as unknown as Context, pluginHooks as Hooks, v2 as unknown as Parameters<typeof registerV2Hooks>[2], {
+      executor: x.factory, hostSettleMs: 0, listRegistrationWorktrees: async () => [],
+    }));
+    const children = ["qa312-edit", "qa312-shell"];
+    cleanups.push(async () => {
+      for (const child of children) evictBinding(child);
+      const dispose: unknown = typeof pluginHooks === "object" && pluginHooks !== null ? Reflect.get(pluginHooks, "dispose") : undefined;
+      if (typeof dispose === "function") await Reflect.apply(dispose, pluginHooks, []);
+      vi.unstubAllEnvs();
+      invalidateConfigCache();
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+    });
+    const host = x.state.host;
+    if (host === undefined) throw new Error("the factory was not called");
+    // the launcher hands the route `needs` in `grant`; the binding holds the role grant they map to (`grantFor`)
+    host.bindings.bind({ childSessionID: "qa312-edit", role: "implementer", agent: "implementer", workRoot: slot, grant: ["edit"], planId: "plan-one", taskId: "T1", attempt: 1 });
+    host.bindings.bind({ childSessionID: "qa312-shell", role: "implementer", agent: "implementer", workRoot: slot, grant: ["edit", "shell"], planId: "plan-one", taskId: "T2", attempt: 1 });
+    let n = 0;
+    const outcome = async (sessionID: string, tool: string, input: Record<string, unknown>): Promise<string> => {
+      n += 1;
+      try {
+        await toolHooks["execute.before"]!({ sessionID, agent: "implementer", messageID: "m", id: `qa312-call-${n}`, tool, input });
+        return "";
+      } catch (error) {
+        return error instanceof Error ? error.message : String(error);
+      }
+    };
+    const refusedForRole = /Refused for role agent implementer/;
+    // each outcome is its own assertion message: a refusal names the tool and its reason
+    // the v2 host's read/write/edit input names the file `path` (taskArgs maps it to `filePath`; a `filePath` key is dropped)
+    const read = await outcome("qa312-edit", "read", { path: file });
+    expect(read, `read: ${read}`).not.toMatch(refusedForRole);
+    const glob = await outcome("qa312-edit", "glob", { pattern: "*.ts", path: slot });
+    expect(glob, `glob: ${glob}`).not.toMatch(refusedForRole);
+    const grep = await outcome("qa312-edit", "grep", { pattern: "const", path: slot });
+    expect(grep, `grep: ${grep}`).not.toMatch(refusedForRole);
+    const edit = await outcome("qa312-edit", "edit", { path: file, oldString: "1", newString: "2" });
+    expect(edit, `edit: ${edit}`).not.toMatch(refusedForRole);
+    // no `shell` need: no router_run
+    const noShell = await outcome("qa312-edit", "router_run", { script: "test", cwd: slot });
+    expect(noShell, `router_run without shell: ${noShell}`).toMatch(refusedForRole);
+    // `shell` maps to router_run
+    const shell = await outcome("qa312-shell", "router_run", { script: "test", cwd: slot });
+    expect(shell, `router_run with shell: ${shell}`).not.toMatch(refusedForRole);
+  });
+
+  it("an executor-owned in-flight attempt is left out of the adapter's journal snapshot: a restart never recovers it as a dispatch (QA-3.1-10)", async () => {
+    const x = fakeExecutor();
+    let snapshot: (() => readonly unknown[]) | undefined;
+    const attach = () => ({
+      reload: async () => undefined, dispatchOf: () => undefined,
+      setAdapterSnapshot: (provider: () => readonly unknown[]) => { snapshot = provider; },
+    });
+    await startWired({ executor: x.factory, hooks: { [ROUTER_FINISH_ATTACH]: attach } });
+    const host = x.state.host;
+    if (host === undefined) throw new Error("the factory was not called");
+    if (snapshot === undefined) throw new Error("the adapter registered no snapshot provider");
+    const req = {
+      planId: "plan-one", taskId: "T9", attempt: 1, nonce: NONCE, orchestratorSessionID: "root", role: "implementer", grant: ["read"],
+      workRoot: ABS_ROOT, prompt: planPrompt("plan-one", "T9"), context: { bootID: "0123456789abcdef", epoch: 1, callID: "c9" },
+      route: { agent: "fast", model: { providerID: "p", modelID: "m", variant: null }, provider: "p", heavy: false },
+    } as unknown as Parameters<typeof host.bookkeeping.decisionRow>[0];
+    host.bookkeeping.decisionRow(req);
+    host.bookkeeping.registerInFlight("T9", 1, null);
+    host.bookkeeping.registerInFlight("T9", 1, "qa3110-child");
+    const inflightOf = (records: readonly unknown[]) => records.filter((r) => {
+      const record = r as { kind?: unknown; childSessionID?: unknown; callID?: unknown };
+      return record.kind === "inflight" && (record.childSessionID === "qa3110-child" || String(record.callID).startsWith("executor:"));
+    });
+    expect(inflightOf(snapshot())).toEqual([]);
   });
 
   it("an executor-owned completion is not processed a second time: the runner trigger settles it, execution.* is a duplicate (W5)", async () => {

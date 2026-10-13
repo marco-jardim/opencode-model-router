@@ -1876,10 +1876,16 @@ export interface FileSystem {
 export interface HostSessionContext {
   messages: Array<{ role: "user" | "assistant" | "idle"; text: string | null; outcome: string | null }>;
 }
+/**
+ * QA-3.1-8: the v2 adapter owns the step key `<sessionID>:<k>` and sets the optional `stepKey` on every step/retry event it
+ * forwards (`step.started`, `retry`, `step.failed`); a consumer prefers `e.stepKey` over its own count.
+ */
 export type HostSessionEvent =
-  | { type: "step.started"; sessionID: string; providerID: string; modelID: string; at: IsoTime }
+  | { type: "step.started"; sessionID: string; providerID: string; modelID: string; stepKey?: string; at: IsoTime }
   | { type: "retry"; sessionID: string; stepKey: string; source: "hook" | "scheduled"; error: HostError; at: IsoTime }
-  | { type: "step.failed" | "execution.failed"; sessionID: string; error: HostError; at: IsoTime }
+  | { type: "step.failed" | "execution.failed"; sessionID: string; error: HostError; stepKey?: string; at: IsoTime }
+  /** QA-3.1-8: the host's `session.step.ended`; it closes the step `stepKey` names. */
+  | { type: "step.ended"; sessionID: string; stepKey?: string; at: IsoTime }
   | { type: "execution.interrupted" | "execution.completed"; sessionID: string; at: IsoTime };
 
 /** O6b/C7: context, interrupt, synthetic; `move` and `get` as used in v2-client.ts:129,198. */

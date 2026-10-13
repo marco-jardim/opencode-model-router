@@ -14,8 +14,10 @@ import {
   QA_UNPARSABLE_CONTEXT_PREFIX,
   canonicalFindingsJson,
   executionFailureOutcome,
+  formatInboxId,
   hasAttemptsLeft,
   leaseHolderID,
+  nextInboxNumber,
   leaseTaskRef,
   qaUnparsableCount,
   type Attempt,
@@ -35,6 +37,7 @@ import {
   type HostError,
   type HostSessionEvent,
   type HostSessions,
+  type InboxItem,
   type IntegrationListener,
   type IntegrationQueue,
   type IsoTime,
@@ -153,8 +156,14 @@ export interface WakerDeps {
   onMetric(m: Extract<MetricPayload, { name: "wake" }>): void;
 }
 
+/** The runtime's waker: a `Waker` that also exposes the time of its last journaled attempt (QA-3.1-5). */
+export interface RuntimeWaker extends Waker {
+  /** Clock time of the last attempt that passed the debounce (journaled, then sent or failed); null before the first. */
+  lastAttemptMs(): number | null;
+}
+
 /** One waker per plan (M32): journal `wake` (durable), then a synthetic message to the orchestrator. */
-export function createWaker(d: WakerDeps): Waker {
+export function createWaker(d: WakerDeps): RuntimeWaker {
   let lastSentMs: number | null = null;
   let chain: Promise<unknown> = Promise.resolve();
   const run = async (reason: WakeReason, stateKey: string): Promise<"sent" | "debounced" | "duplicate" | "failed"> => {
@@ -192,6 +201,9 @@ export function createWaker(d: WakerDeps): Waker {
       });
       chain = next.catch(() => undefined);
       return next;
+    },
+    lastAttemptMs() {
+      return lastSentMs;
     },
   };
 }
@@ -341,11 +353,43 @@ export interface ExecutorRuntimeHandle extends ExecutorRuntime {
   isPlanChild(sessionID: string): boolean;
   /** Journals a metric the launcher emitted through `TaskLauncherDeps.onMetric` (the launcher never journals). */
   recordMetric(planId: PlanId, m: MetricPayload): void;
+  /**
+   * The adapter calls this when the process-wide lease registry released a lease (QA-3.1-6): a launch step skipped on a
+   * held lease is retried by a tick of every attached plan, not only by the backoff tick.
+   */
+  onLeaseReleased(): void;
 }
 
 const GIT_TIMEOUT_MS = 60_000;
 const LOST_STREAK = 3;
 const STREAK_DETAILS: readonly string[] = ["unrequested-interrupt", "runner-error"];
+/** Consecutive pre-confirmation losses (distinct router calls) that pause the plan (QA-3.1-4). */
+const PRECONFIRM_STREAK = 3;
+/** Consecutive provisioning failures that raise one inbox item (QA-3.1-6). */
+const PROVISION_STREAK = 5;
+const BACKOFF_BASE_MS = 1000;
+const BACKOFF_MAX_MS = 60_000;
+/** Bound of the per-session maps (provider of the last step, fallback step counter); oldest entries go first. */
+const SESSION_MAP_CAP = 1024;
+/** Provider of the placeholder route of a task the RouteResolver throws on; it never has free capacity (QA-3.1-11). */
+const UNROUTABLE = "\u0000unroutable";
+
+/** The step key the adapter put on a retry/step event (QA-3.1-8), when it did. */
+function eventStepKey(e: HostSessionEvent): string | null {
+  const k: unknown = "stepKey" in e ? e.stepKey : undefined;
+  return typeof k === "string" && k !== "" ? k : null;
+}
+
+/** Inserts into a map bounded at SESSION_MAP_CAP entries (insertion order; the oldest entry is evicted). */
+function boundedSet<V>(m: Map<string, V>, k: string, v: V): void {
+  m.delete(k);
+  m.set(k, v);
+  while (m.size > SESSION_MAP_CAP) {
+    const first = m.keys().next();
+    if (first.done === true) break;
+    m.delete(first.value);
+  }
+}
 
 interface TokenRef {
   id: string;
@@ -361,10 +405,9 @@ interface PlanRt {
   readonly planId: PlanId;
   writer: LedgerWriter;
   leases: LeaseService;
-  waker: Waker;
+  waker: RuntimeWaker;
   collab: PlanCollaborators;
   capacity: CapacityController;
-  capView: CapacityView;
   tokens: Map<string, TokenRef>;
   inFlight: Set<TaskId>;
   handles: Map<TaskId, HandleRef>;
@@ -383,6 +426,14 @@ interface PlanRt {
   orchIdle: boolean;
   unpin: (() => void) | null;
   counters: { launches: number; wakes: number; idleMs: number };
+  /** Consecutive skipped launch steps; drives the backoff tick (QA-3.1-6), reset on a launch. */
+  skipStreak: number;
+  backoff: { readonly id: number } | null;
+  /** Consecutive provisioning failures; one inbox item at PROVISION_STREAK (QA-3.1-6), reset on a launch. */
+  provisionFails: number;
+  provisionRaised: boolean;
+  /** Consecutive pre-confirmation losses (row 11, QA-3.1-4); reset on a confirmed launch and on resume. */
+  preConfirmLosses: number;
 }
 
 function own(l: Readonly<LedgerV1>, id: TaskId): TaskNode | null {
@@ -450,8 +501,11 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   const mutex = new KeyedMutex();
   const pending = new Set<Promise<unknown>>();
   const providerBySession = new Map<string, string>();
+  /** Fallback step counter per session (QA-3.1-8: `e.stepKey` wins); bounded, and dropped when the session ends. */
   const stepState = new Map<string, { k: number; open: boolean }>();
   let disposed = false;
+  /** Unsubscribes `onHostEvent` from `hosts.onEvent` (subscribed in `start`, QA-3.1-1). */
+  let offEvents: (() => void) | null = null;
 
   // ---------- plumbing
 
@@ -535,7 +589,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
   /** Called by the module that wrote TS(null), after the fsync of that batch (A3). */
   async function releaseResources(p: PlanRt, taskId: TaskId, slotName: string | null): Promise<void> {
-    p.leases.releaseTask(taskId);
+    releaseLeases(p, taskId);
     const s = slotName ?? p.slotLeases.get(taskId)?.slot ?? null;
     p.slotLeases.delete(taskId);
     if (s !== null) {
@@ -544,6 +598,15 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       } catch (e) {
         d.log("warn", "slot release failed", errorText(e));
       }
+    }
+  }
+
+  /** Releases the task's leases; a throwing registry is logged so the slot release behind it still runs (QA-3.1-12). */
+  function releaseLeases(p: PlanRt, taskId: TaskId): void {
+    try {
+      p.leases.releaseTask(taskId);
+    } catch (e) {
+      d.log("warn", "lease release failed", errorText(e));
     }
   }
 
@@ -566,6 +629,61 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
   function withTask<T>(p: PlanRt, taskId: TaskId, fn: () => Promise<T>): Promise<T> {
     return mutex.run(`${p.planId}/${taskId}`, fn);
+  }
+
+  /**
+   * Capacity view built per tick over the current controller (QA-3.1-11). A task the RouteResolver throws on gets a
+   * placeholder route without free capacity (never scheduled) and its error is recorded in `failed` (row 4b).
+   */
+  function viewOf(p: PlanRt, failed: Map<TaskId, string> | null): CapacityView {
+    const base = capacityView(p.capacity, d.routes);
+    return {
+      routeOf(task: TaskNode): TaskRoute {
+        try {
+          return base.routeOf(task);
+        } catch (e) {
+          failed?.set(task.id, errorText(e));
+          return { agent: task.route.role, model: { providerID: UNROUTABLE, modelID: UNROUTABLE, variant: null }, provider: UNROUTABLE, heavy: false };
+        }
+      },
+      free(provider: string, heavy: boolean): number {
+        return provider === UNROUTABLE ? 0 : base.free(provider, heavy);
+      },
+    };
+  }
+
+  function readyOf(p: PlanRt, l: Readonly<LedgerV1>, failed: Map<TaskId, string> | null): ScheduledTask[] {
+    return d.scheduler.readySet(l, p.inFlight, p.leases, viewOf(p, failed));
+  }
+
+  /** One backoff tick after a skipped launch step (QA-3.1-6): min(2^k * 1 s, 60 s), one timer per plan. */
+  function armBackoff(p: PlanRt): void {
+    if (p.backoff !== null || p.disposed || disposed) return;
+    const ms = Math.min(BACKOFF_BASE_MS * 2 ** p.skipStreak, BACKOFF_MAX_MS);
+    p.skipStreak = Math.min(p.skipStreak + 1, 16);
+    const h = d.clock.setTimer(ms, () => {
+      p.timers.delete(h);
+      if (p.backoff === h) p.backoff = null;
+      schedule(p);
+    });
+    p.timers.add(h);
+    p.backoff = h;
+  }
+
+  /** A launch went out: the skip backoff and the provisioning streak start over. */
+  function launchSucceeded(p: PlanRt): void {
+    p.skipStreak = 0;
+    p.provisionFails = 0;
+    p.provisionRaised = false;
+  }
+
+  /** Raises one inbox item through the policy; never throws. */
+  async function raiseSafe(p: PlanRt, item: Omit<InboxItem, "id" | "createdAt" | "answer">): Promise<void> {
+    try {
+      await p.collab.policy.raise(item);
+    } catch (e) {
+      d.log("warn", "inbox raise failed", errorText(e));
+    }
   }
 
   // ---------- liveness (D15)
@@ -591,7 +709,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     if (st === undefined && p.writer.wakeKeys().has(baseKey)) return;
     const r = await p.waker.wake(reason, key);
     if (r === "debounced") {
-      if (p.lastWakeMs !== null) arm(p, p.lastWakeMs + p.writer.ledger.config.wakeDebounceMs - d.clock.now());
+      // Armed from the waker's own last attempt (sent or failed), never below 1 ms: no re-tick spin (QA-3.1-5).
+      const last = p.waker.lastAttemptMs() ?? p.lastWakeMs ?? d.clock.now();
+      arm(p, Math.max(1, last + p.writer.ledger.config.wakeDebounceMs - d.clock.now()));
       return;
     }
     if (r === "failed") {
@@ -640,7 +760,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     const hold = p.orchIdle && l.status === "running" && ready.length > 0 && launched === 0;
     if (hold && p.idle === null) {
       let free = 0;
-      for (const prov of new Set(ready.map((r) => r.route.provider))) free += p.capacity.limit(prov) > 0 ? p.capView.free(prov, false) : 0;
+      const view = viewOf(p, null);
+      for (const prov of new Set(ready.map((r) => r.route.provider))) free += p.capacity.limit(prov) > 0 ? view.free(prov, false) : 0;
       p.idle = { fromMs: d.clock.now(), fromAt: d.clock.iso(), ids: ready.map((r) => r.taskId), free };
     } else if (!hold && p.idle !== null) closeIdle(p);
   }
@@ -702,6 +823,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       );
       if (done) {
         closeIdle(p);
+        unpinPlan(p);
         await wakeOnce(p, "plan-completed", `plan-completed:${p.planId}`);
         if (p.writer.ledger.config.land === "ff-when-clean") await p.collab.queue.land();
         return;
@@ -710,34 +832,80 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     l = p.writer.ledger;
     if (l.status !== "running") {
       closeIdle(p);
+      if (l.status === "completed" || l.status === "aborted") unpinPlan(p);
       // A plan-completed wake that was debounced or failed is retried by the tick wakeOnce re-armed (M32); idempotent per key.
       if (l.status === "completed") await wakeOnce(p, "plan-completed", `plan-completed:${p.planId}`);
       return;
     }
-    const ready = d.scheduler.readySet(l, p.inFlight, p.leases, p.capView);
-    const gate = d.launcher.gate(l.orchestrator.sessionID);
-    let launched = 0;
-    if (ready.length > 0) {
-      if (!gate.ok) {
-        if (gate.wake !== null) await wakeOnce(p, gate.wake.reason, gate.wake.stateKey);
-      } else {
-        for (const item of ready) p.inFlight.add(item.taskId);
-        const results = await Promise.all(
-          ready.map((item) =>
-            launchStep(p, item)
-              .catch((e: unknown) => {
-                d.log("error", "launch step failed", errorText(e));
-                return "skipped" as const;
-              })
-              .finally(() => {
-                p.inFlight.delete(item.taskId);
-              }),
-          ),
-        );
-        launched = results.filter((r) => r === "launched").length;
-      }
+    const unroutable = new Map<TaskId, string>();
+    const ready = readyOf(p, l, unroutable);
+    for (const [taskId, msg] of unroutable) {
+      if (!p.inFlight.has(taskId)) void startStep(p, taskId, () => routeFailed(p, taskId, msg));
     }
-    updateIdle(p, ready, launched);
+    const gate = d.launcher.gate(l.orchestrator.sessionID);
+    if (ready.length === 0 || !gate.ok) {
+      if (ready.length > 0 && !gate.ok && gate.wake !== null) await wakeOnce(p, gate.wake.reason, gate.wake.stateKey);
+      updateIdle(p, ready, 0);
+      return;
+    }
+    // The steps run on their own (a slot acquire may run an install): the tick never awaits them (QA-3.1-14); `inFlight`
+    // keeps a second tick off a task whose step is running, and `settled()` tracks every step.
+    const steps = ready.map((item) => startStep(p, item.taskId, () => launchStep(p, item)));
+    void track(
+      Promise.all(steps).then((results) => {
+        updateIdle(p, ready, results.filter((r) => r === "launched").length);
+      }),
+    );
+  }
+
+  /**
+   * Starts one launch step under the `inFlight` guard; a launch resets the skip backoff (QA-3.1-6). A step that journaled
+   * an attempt without launching (rows 4b, 11, 12: L1-L4) re-ticks once its guard is gone: the tick its own row asked for
+   * ran while the task was still in `inFlight` and so could not relaunch it. A step that journaled nothing is a skip and
+   * arms the backoff tick instead, so skips never re-tick each other.
+   */
+  function startStep(p: PlanRt, taskId: TaskId, fn: () => Promise<"launched" | "skipped">): Promise<"launched" | "skipped"> {
+    p.inFlight.add(taskId);
+    const attemptsOf = (): number => own(p.writer.ledger, taskId)?.attempts.length ?? 0;
+    const before = attemptsOf();
+    const run = async (): Promise<"launched" | "skipped"> => {
+      let r: "launched" | "skipped" = "skipped";
+      try {
+        r = await fn();
+      } catch (e) {
+        d.log("error", "launch step failed", errorText(e));
+      } finally {
+        p.inFlight.delete(taskId);
+      }
+      if (r === "launched") launchSucceeded(p);
+      else if (attemptsOf() !== before) schedule(p);
+      else armBackoff(p);
+      return r;
+    };
+    return track(run());
+  }
+
+  /** QA-3.1-15: the orchestrator is pinned only while its plan runs or is paused. */
+  function unpinPlan(p: PlanRt): void {
+    const u = p.unpin;
+    p.unpin = null;
+    if (u === null) return;
+    try {
+      u();
+    } catch (e) {
+      d.log("warn", "orchestrator unpin failed", errorText(e));
+    }
+  }
+
+  /** QA-3.1-11: a RouteResolver error is row 4b for that task (a failed, counted attempt), never a broken tick. */
+  async function routeFailed(p: PlanRt, taskId: TaskId, msg: string): Promise<"launched" | "skipped"> {
+    return withTask(p, taskId, async (): Promise<"launched" | "skipped"> => {
+      const t = own(p.writer.ledger, taskId);
+      if (t === null || t.state !== "ready" || p.writer.ledger.status !== "running" || p.latch) return "skipped";
+      const n = t.attempts.length + 1;
+      await launchPrepFailed(p, t, n, d.clock.randomHex(16), null, new ExecutorError("E_LAUNCH_TASK", `route: ${msg}`, taskId), async () => undefined);
+      return "skipped";
+    });
   }
 
   // ---------- launch step (M37)
@@ -764,7 +932,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       const abandon = async (): Promise<void> => {
         releaseToken(p, taskId, n, "other");
         if (fresh) {
-          p.leases.releaseTask(taskId);
+          releaseLeases(p, taskId);
           if (slot !== null) await releaseResources(p, taskId, slot.slot);
         }
       };
@@ -774,12 +942,22 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         p.slotLeases.set(taskId, slot);
         await d.slots.reset(slot.slot, l.integration.head);
       } catch (e) {
-        counter(p, "launch-skipped", { reason: errorCode(e) === "E_SLOT_UNAVAILABLE" ? "slot-unavailable" : "provision" });
+        const unavailable = errorCode(e) === "E_SLOT_UNAVAILABLE";
+        counter(p, "launch-skipped", { reason: unavailable ? "slot-unavailable" : "provision" });
+        await abandon();
+        if (!unavailable) await provisionFailed(p, taskId, e);
+        return "skipped";
+      }
+      // 3. leases (a throwing registry must not leak the token and the fresh slot, QA-3.1-12)
+      let got: ReturnType<LeaseService["acquireTask"]>;
+      try {
+        got = p.leases.acquireTask({ taskId, tree: slot.path, writes: t0.footprint.writes });
+      } catch (e) {
+        d.log("error", "launch step failed", errorText(e));
+        counter(p, "launch-skipped", { reason: "lease-error" });
         await abandon();
         return "skipped";
       }
-      // 3. leases
-      const got = p.leases.acquireTask({ taskId, tree: slot.path, writes: t0.footprint.writes });
       if (!got.ok) {
         counter(p, "launch-skipped", { reason: "lease-race" });
         await abandon();
@@ -799,11 +977,12 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         expanded = expandTask({ ledger: p.writer.ledger, taskId, attempt: n, nonce, slot, env });
       } catch (e) {
         if (errorCode(e) === "E_LAUNCH_TASK") {
-          await launchPrepFailed(p, t1, n, nonce, slot, e);
+          await launchPrepFailed(p, t1, n, nonce, slot, e, abandon);
           return "skipped";
         }
         counter(p, "launch-skipped", { reason: "provision" });
         await abandon();
+        await provisionFailed(p, taskId, e);
         return "skipped";
       }
       // 5. gate re-read (M29)
@@ -907,37 +1086,69 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     });
   }
 
-  /** Row 4b: a task-class prep error journals the dispatch and the failure in one batch. */
-  async function launchPrepFailed(p: PlanRt, t: TaskNode, n: number, nonce: string, slot: SlotLease, e: unknown): Promise<void> {
+  /**
+   * Row 4b: a task-class prep error journals the dispatch and the failure in one batch. The token is always released;
+   * when the batch is not applied (or throws) `abandon` frees a fresh slot and its leases too (QA-3.1-12).
+   */
+  async function launchPrepFailed(
+    p: PlanRt,
+    t: TaskNode,
+    n: number,
+    nonce: string,
+    slot: SlotLease | null,
+    e: unknown,
+    abandon: () => Promise<void>,
+  ): Promise<void> {
     const msg = errorText(e);
     const gate = d.launcher.gate(p.writer.ledger.orchestrator.sessionID);
     const callID = gate.ok ? gate.context.callID : null;
     const at = d.clock.iso();
     counter(p, "launch-failed", { row: "L1" });
-    const applied = await appendIf(p, (cur) => {
-      const c = own(cur, t.id);
-      if (c === null || c.state !== "ready" || c.attempts.length + 1 !== n || cur.status !== "running") return [];
-      const ev: ExecutorEventInput[] = [];
-      if (c.slot !== slot.slot) ev.push(ts(t.id, slot.slot, null));
-      ev.push({
-        type: "attempt-started",
-        taskId: t.id,
-        attempt: { n, nonce, callID, childSessionID: null, startedAt: at, endedAt: null, outcome: null, verdict: null, context: "" },
+    let applied = false;
+    try {
+      applied = await appendIf(p, (cur) => {
+        const c = own(cur, t.id);
+        if (c === null || c.state !== "ready" || c.attempts.length + 1 !== n || cur.status !== "running") return [];
+        const ev: ExecutorEventInput[] = [];
+        if (slot !== null && c.slot !== slot.slot) ev.push(ts(t.id, slot.slot, null));
+        ev.push({
+          type: "attempt-started",
+          taskId: t.id,
+          attempt: { n, nonce, callID, childSessionID: null, startedAt: at, endedAt: null, outcome: null, verdict: null, context: "" },
+        });
+        ev.push(tt(t.id, "ready", "dispatched", "launch"));
+        const g1 = gateOpen(cur, c);
+        ev.push(...g1);
+        ev.push(ae(t.id, n, "failed", at, msg), ax(t.id, n, msg), tt(t.id, "dispatched", "failed", "launch-task-error", msg));
+        const ph = phaseOf(cur, c);
+        if (g1.length > 0 && ph !== null) {
+          ev.push({ type: "gate-changed", phaseId: ph.id, from: "qa-running", to: "awaiting-qa", trigger: "qa-requeued", qaRound: ph.qaRound });
+        }
+        return ev;
       });
-      ev.push(tt(t.id, "ready", "dispatched", "launch"));
-      const g1 = gateOpen(cur, c);
-      ev.push(...g1);
-      ev.push(ae(t.id, n, "failed", at, msg), ax(t.id, n, msg), tt(t.id, "dispatched", "failed", "launch-task-error", msg));
-      const ph = phaseOf(cur, c);
-      if (g1.length > 0 && ph !== null) {
-        ev.push({ type: "gate-changed", phaseId: ph.id, from: "qa-running", to: "awaiting-qa", trigger: "qa-requeued", qaRound: ph.qaRound });
-      }
-      return ev;
-    });
-    releaseToken(p, t.id, n, "other");
+    } finally {
+      releaseToken(p, t.id, n, "other");
+      // Not applied (task left ready) or the append threw: the slot and leases this step took are not the task's.
+      if (!applied) await abandon();
+    }
     if (!applied) return;
     await countAttempt(p, t.id, n);
     await retryDecision(p, t.id);
+  }
+
+  /** QA-3.1-6: PROVISION_STREAK consecutive provisioning failures raise one blocking inbox item (reset on a launch). */
+  async function provisionFailed(p: PlanRt, taskId: TaskId, e: unknown): Promise<void> {
+    p.provisionFails += 1;
+    if (p.provisionFails < PROVISION_STREAK || p.provisionRaised) return;
+    p.provisionRaised = true;
+    counter(p, "provision-streak", { taskId });
+    await raiseSafe(p, {
+      kind: "failure",
+      severity: "blocking",
+      taskId,
+      text: `${PROVISION_STREAK} consecutive launches could not provision a slot (last: ${errorText(e)}); fix the slot environment, then answer`,
+      options: [],
+    });
   }
 
   function launchHooks(p: PlanRt, taskId: TaskId, n: number, route: TaskRoute): LaunchHooks {
@@ -948,6 +1159,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         const a = c === null ? undefined : c.attempts[c.attempts.length - 1];
         const ok =
           c !== null && a !== undefined && a.n === n && a.outcome === "lost" && c.state === "ready" && c.slot !== null && l.status !== "aborted" && !p.latch;
+        if (!ok) counter(p, "launch-failed", { row: "L11" });
         return ok ? "adopt" : "refuse";
       },
       async onChildCreated(childSessionID: string): Promise<void> {
@@ -985,6 +1197,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
           } finally {
             if (!applied && adopting) releaseToken(p, taskId, n, "other");
           }
+          if (adopting) counter(p, "launch-failed", { row: applied ? "L12" : "L11" });
           if (!applied) throw new ExecutorError("E_PLAN_STATE", "child refused", { taskId, n });
         });
       },
@@ -992,7 +1205,10 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   }
 
   async function onConfirmation(p: PlanRt, taskId: TaskId, n: number, c: LaunchConfirmation): Promise<void> {
-    if (c.kind === "confirmed") return;
+    if (c.kind === "confirmed") {
+      p.preConfirmLosses = 0;
+      return;
+    }
     await withTask(p, taskId, async () => {
       const t = own(p.writer.ledger, taskId);
       if (t === null || t.state !== "dispatched" || openAttempt(t, n) === null) return;
@@ -1005,8 +1221,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   /** Row 11: dispatched -> ready, uncounted; slot and leases are kept (R4). */
   async function rowLost(p: PlanRt, taskId: TaskId, n: number, reason: string): Promise<void> {
     const at = d.clock.iso();
+    let applied = false;
     try {
-      await appendIf(p, (cur) => {
+      applied = await appendIf(p, (cur) => {
         const c = own(cur, taskId);
         if (c === null || c.state !== "dispatched" || openAttempt(c, n) === null) return [];
         const a = openAttempt(c, n);
@@ -1020,7 +1237,38 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       d.log("error", "row 11 failed", errorText(e));
     }
     releaseToken(p, taskId, n, "other");
+    if (applied) await preConfirmLost(p, taskId, reason);
     schedule(p);
+  }
+
+  /**
+   * QA-3.1-4: every row 11 is a loss before the launch was confirmed; it is uncounted, so a failure that repeats on each
+   * relaunch (or on each new capture: tick -> wake -> new router call -> same failure) would loop forever. At
+   * PRECONFIRM_STREAK consecutive losses the plan pauses (no more launches, so no more stale-context wakes) and ONE
+   * blocking item is raised. A confirmed launch, and a resume, reset the count.
+   */
+  async function preConfirmLost(p: PlanRt, taskId: TaskId, reason: string): Promise<void> {
+    p.preConfirmLosses += 1;
+    if (p.preConfirmLosses < PRECONFIRM_STREAK) return;
+    p.preConfirmLosses = 0;
+    let paused = false;
+    try {
+      paused = await appendIf(p, (cur) =>
+        cur.status === "running" ? [{ type: "status-changed", from: "running", to: "paused", reason: `launch-lost-streak:${taskId}` }] : [],
+      );
+    } catch (e) {
+      d.log("error", "launch-lost pause failed", errorText(e));
+    }
+    if (!paused) return;
+    closeIdle(p);
+    counter(p, "launch-lost-pause", { taskId, reason });
+    await raiseSafe(p, {
+      kind: "failure",
+      severity: "blocking",
+      taskId,
+      text: `${PRECONFIRM_STREAK} consecutive launches were lost before their child started (last: ${taskId}, ${reason}); the plan is paused, resume it once the cause is fixed`,
+      options: [],
+    });
   }
 
   /** Row 12: dispatched -> failed (counts), then the retry decision. */
@@ -1091,17 +1339,39 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         d.log("error", "child end processing failed", errorText(e));
       } finally {
         releaseToken(p, taskId, n, "other");
+        const still = own(p.writer.ledger, taskId);
+        if (end.childSessionID !== null && (still === null || openAttempt(still, n) === null)) {
+          p.capacityStopped.delete(end.childSessionID);
+          forgetSession(end.childSessionID);
+        }
         schedule(p);
       }
     });
   }
 
   async function handleEnd(p: PlanRt, taskId: TaskId, n: number, end: ChildEnd): Promise<void> {
+    // Nit 7: rows L16 (cancel) and L17 (dispose) are journaled before the cancel or by recovery; only counted here.
+    if (end.kind === "interrupted") {
+      if (!p.disposed) counter(p, "launch-failed", { row: end.reason === "dispose" ? "L17" : "L16" });
+      return;
+    }
     const t = own(p.writer.ledger, taskId);
     if (t === null) return;
     const a = openAttempt(t, n);
     if (a === null) return; // ignores closed attempts
-    const stopped = end.kind !== "interrupted" && end.childSessionID !== null && p.capacityStopped.has(end.childSessionID);
+    // Nit 7: rows L13 (runner error), L14 (unrequested interrupt) and L15 (execution failed) of a running child.
+    if (t.state === "running") {
+      const row =
+        end.kind === "failed" || end.kind === "capacity"
+          ? "L15"
+          : end.kind === "lost" && end.reason === "runner-error"
+            ? "L13"
+            : end.kind === "lost" && end.reason === "unrequested-interrupt"
+              ? "L14"
+              : null;
+      if (row !== null) counter(p, "launch-failed", { row });
+    }
+    const stopped = end.childSessionID !== null && p.capacityStopped.has(end.childSessionID);
     switch (end.kind) {
       case "completed":
         if (t.state === "running") await onCompleted(p, t, a, end.text, end.endedAt);
@@ -1114,8 +1384,6 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       case "capacity":
         if (t.state === "running") await rowChildLost(p, t, a, "capacity", "capacity-stop", end.endedAt, end.error.message);
         return;
-      case "interrupted":
-        return; // journaled before the cancel (L16)
       case "lost":
         if (t.state === "dispatched") {
           await rowLost(p, taskId, n, end.reason);
@@ -1480,10 +1748,62 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     });
   }
 
+  /**
+   * Single plan per process (memo M20, amendment A-3.1-1): at most one attached plan is running or paused. The capacity
+   * controller, the orchestrator pin, the per-session maps and the host-event feed are process-wide, so a second active
+   * plan would share (and starve) them. The plan that holds the slot, if any, other than `planId`.
+   */
+  function activePlanOtherThan(planId: PlanId): PlanRt | null {
+    for (const q of plans.values()) {
+      if (q.planId === planId || q.disposed) continue;
+      const s = q.writer.ledger.status;
+      if (s === "running" || s === "paused") return q;
+    }
+    return null;
+  }
+
+  /** Refuses `writer`'s plan (A-3.1-1): one blocking inbox item on it (deduplicated), then E_PLAN_STATE. */
+  async function refuseSecondPlan(writer: LedgerWriter, other: PlanId, closeWriter: boolean): Promise<never> {
+    const text =
+      `plan ${writer.planId} cannot run: plan ${other} is already running or paused in this process ` +
+      `(one active plan per process, memo M20 / A-3.1-1); complete or abort ${other} first`;
+    try {
+      await writer.append((l) => {
+        if (l.inbox.some((i) => i.answer === null && i.text === text)) return [];
+        const item: InboxItem = {
+          id: formatInboxId("failure", nextInboxNumber(l)),
+          kind: "failure",
+          severity: "blocking",
+          taskId: null,
+          text,
+          options: [],
+          answer: null,
+          createdAt: d.clock.iso(),
+        };
+        return [{ type: "inbox-added", item }];
+      });
+    } catch (e) {
+      d.log("warn", "refused plan inbox failed", errorText(e));
+    }
+    if (closeWriter) {
+      try {
+        await writer.close();
+      } catch (e) {
+        d.log("warn", "refused plan close failed", errorText(e));
+      }
+    }
+    throw new ExecutorError("E_PLAN_STATE", text, { planId: writer.planId, active: other });
+  }
+
   async function attach(writer: LedgerWriter): Promise<PlanRt> {
     const existing = plans.get(writer.planId);
     if (existing !== undefined) return existing;
     const planId = writer.planId;
+    const st0 = writer.ledger.status;
+    if (st0 === "running" || st0 === "paused") {
+      const other = activePlanOtherThan(planId);
+      if (other !== null) await refuseSecondPlan(writer, other.planId, true);
+    }
     const ref: { p: PlanRt | null } = { p: null };
     const leases = createLeaseService(planId, d.leaseRegistry);
     const waker = createWaker({
@@ -1499,7 +1819,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
           p.lastWakeMs = d.clock.now();
           p.counters.wakes += 1;
         }
-        metric(p, m);
+        // Only attempts are journaled (QA-3.1-5): a debounced or duplicate wake is not an event, and journaling it made
+        // every re-tick inside the debounce window append a metric.
+        if (m.result === "sent" || m.result === "failed") metric(p, m);
       },
     });
     const collab = d.collaborators({ writer, leases, waker, listener: makeListener(ref) });
@@ -1511,7 +1833,6 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       waker,
       collab,
       capacity,
-      capView: capacityView(capacity, d.routes),
       tokens: new Map(),
       inFlight: new Set(),
       handles: new Map(),
@@ -1530,6 +1851,11 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       orchIdle: false,
       unpin: null,
       counters: { launches: 0, wakes: 0, idleMs: 0 },
+      skipStreak: 0,
+      backoff: null,
+      provisionFails: 0,
+      provisionRaised: false,
+      preConfirmLosses: 0,
     };
     ref.p = p;
     plans.set(planId, p);
@@ -1577,11 +1903,19 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     p.latch = true;
     for (const h of p.timers) d.clock.clearTimer(h);
     p.timers.clear();
-    p.unpin?.();
-    p.unpin = null;
+    p.backoff = null;
+    unpinPlan(p);
     closeIdle(p);
     await p.metricChain;
     plans.delete(p.planId);
+    // QA-3.1-15: the plan detaches, so do the per-session entries of its orchestrator and children.
+    const l = p.writer.ledger;
+    forgetSession(l.orchestrator.sessionID);
+    for (const t of Object.values(l.tasks)) for (const a of t.attempts) if (a.childSessionID !== null) forgetSession(a.childSessionID);
+    p.handles.clear();
+    p.lostStreak.clear();
+    p.capacityStopped.clear();
+    p.wakeRetry.clear();
     await p.writer.close();
   }
 
@@ -1618,19 +1952,41 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
   // ---------- host feeds
 
+  /** The task whose latest attempt runs in `sessionID`, if that session is a child of this plan. */
+  function childTaskOf(p: PlanRt, sessionID: string): TaskId | null {
+    for (const t of Object.values(p.writer.ledger.tasks)) {
+      const a = t.attempts[t.attempts.length - 1];
+      if (a !== undefined && a.childSessionID === sessionID) return t.id;
+    }
+    return null;
+  }
+
   function feedSignal(p: PlanRt, s: ProviderSignal): void {
     const r = p.capacity.onSignal(s);
     if (r.inbox !== null) {
-      const item = r.inbox;
+      // M15 (nit 2): the usage-limit item names the plan child's task when the signal came from one.
+      const item = { ...r.inbox, taskId: r.inbox.taskId ?? childTaskOf(p, s.sessionID) };
       bg("usage-limit inbox", async () => {
         await p.collab.policy.raise(item);
       });
     }
-    if (r.pausedUntil !== null) arm(p, Date.parse(r.pausedUntil) - d.clock.now());
+    if (r.pausedUntil !== null) arm(p, Math.max(1, Date.parse(r.pausedUntil) - d.clock.now()));
   }
 
-  function stepKeyOf(sessionID: string): string {
-    return `${sessionID}:${stepState.get(sessionID)?.k ?? 0}`;
+  /** QA-3.1-8: the adapter owns step keys (`e.stepKey`); the own per-session counter is only the fallback. */
+  function stepKeyOf(e: HostSessionEvent): string {
+    return eventStepKey(e) ?? `${e.sessionID}:${stepState.get(e.sessionID)?.k ?? 0}`;
+  }
+
+  /** QA-3.1-15: drops the per-session entries of a session that ended or whose plan detached. */
+  function forgetSession(sessionID: string): void {
+    providerBySession.delete(sessionID);
+    stepState.delete(sessionID);
+  }
+
+  function isOrchestrator(sessionID: string): boolean {
+    for (const p of plans.values()) if (p.writer.ledger.orchestrator.sessionID === sessionID) return true;
+    return false;
   }
 
   async function lastAssistantText(sessionID: string): Promise<string> {
@@ -1677,9 +2033,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     try {
       const sid = e.sessionID;
       if (e.type === "step.started") {
-        providerBySession.set(sid, e.providerID);
+        boundedSet(providerBySession, sid, e.providerID);
         const st = stepState.get(sid);
-        if (st === undefined) stepState.set(sid, { k: 1, open: true });
+        if (st === undefined) boundedSet(stepState, sid, { k: 1, open: true });
         else if (!st.open) {
           st.k += 1;
           st.open = true;
@@ -1697,15 +2053,19 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         if (e.type === "retry" && e.source === "scheduled") {
           feedSignal(p, { source: "retry-scheduled", sessionID: sid, stepKey: e.stepKey, provider, error: e.error, at: e.at });
         } else if (e.type === "step.failed") {
-          feedSignal(p, { source: "step-failed", sessionID: sid, stepKey: stepKeyOf(sid), provider, error: e.error, at: e.at });
+          feedSignal(p, { source: "step-failed", sessionID: sid, stepKey: stepKeyOf(e), provider, error: e.error, at: e.at });
         } else if (e.type === "execution.failed") {
-          feedSignal(p, { source: "execution-failed", sessionID: sid, stepKey: stepKeyOf(sid), provider, error: e.error, at: e.at });
+          feedSignal(p, { source: "execution-failed", sessionID: sid, stepKey: stepKeyOf(e), provider, error: e.error, at: e.at });
         }
         lateChildEnd(p, e);
       }
       if (e.type === "step.failed" || e.type === "execution.failed" || e.type === "execution.completed" || e.type === "execution.interrupted") {
         const st = stepState.get(sid);
         if (st !== undefined) st.open = false;
+      }
+      // QA-3.1-15: a session that is not an orchestrator ends with its execution; its signals were fed above.
+      if (e.type === "execution.failed" || e.type === "execution.completed" || e.type === "execution.interrupted") {
+        if (!isOrchestrator(sid)) forgetSession(sid);
       }
     } catch (err) {
       d.log("error", "host event handling failed", errorText(err));
@@ -1743,8 +2103,11 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     const out: string[] = [`Plan ${l.planId} [${l.status}] ${l.planPath}`];
     out.push(`Tasks: ${[...by.entries()].map(([s, c]) => `${s} ${c}`).join(", ") || "none"}`);
     for (const ph of l.phases) out.push(`Phase ${ph.id}: gate ${ph.gate}${ph.paused ? " PAUSED" : ""} - ${ph.title}`);
-    const launchable = p === null ? [] : d.scheduler.readySet(l, p.inFlight, p.leases, p.capView).map((r) => r.taskId);
+    // A RouteResolver error never breaks the board (QA-3.1-11): that task is listed as unroutable instead.
+    const unroutable = new Map<TaskId, string>();
+    const launchable = p === null ? [] : readyOf(p, l, unroutable).map((r) => r.taskId);
     out.push("Ready:");
+    for (const [id, msg] of unroutable) out.push(`  ${id} unroutable - ${msg}`);
     for (const id of launchable) out.push(`  ${id}`);
     for (const t of Object.values(l.tasks)) {
       if (t.state === "ready" && (t.kind === "manual" || t.kind === "preflight")) {
@@ -1804,14 +2167,17 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     async approve(planId, sessionID) {
       const p = await mine(planId, sessionID);
       requireStatus(p, ["awaiting-approval"]);
+      // Single plan per process (memo M20, amendment A-3.1-1): never a second running or paused plan.
+      const other = activePlanOtherThan(planId);
+      if (other !== null) await refuseSecondPlan(p.writer, other.planId, false);
       const l = p.writer.ledger;
       const config: ExecutorConfig = { ...l.config, slotsDir: l.config.slotsDir ?? defaultSlotsDir(l.repo.toplevel, planId) };
       await p.writer.append([
         { type: "plan-approved", config, by: sessionID },
         { type: "status-changed", from: "awaiting-approval", to: "running", reason: "approved" },
       ]);
+      // The capacity view is built per tick from `p.capacity` (QA-3.1-11), so replacing the controller is enough.
       p.capacity = await makeCapacity(p, p.writer, planId, false);
-      p.capView = capacityView(p.capacity, d.routes);
       await activate(p);
     },
 
@@ -1829,7 +2195,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     async ready(planId) {
       const p = plans.get(planId) ?? null;
       const l = p === null ? await d.store.read(planId) : p.writer.ledger;
-      const launchable = p === null ? [] : d.scheduler.readySet(l, p.inFlight, p.leases, p.capView).map((r) => r.taskId);
+      const launchable = p === null ? [] : readyOf(p, l, null).map((r) => r.taskId);
       return { launchable, manual: d.scheduler.manualReady(l) };
     },
 
@@ -1884,6 +2250,11 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     async resume(planId, sessionID) {
       const p = await mine(planId, sessionID);
       await setStatus(p, "paused", "running", "user-resume");
+      // A resume is the user's answer to the streak pauses: they start over (QA-3.1-4, QA-3.1-6).
+      p.preConfirmLosses = 0;
+      p.skipStreak = 0;
+      p.provisionFails = 0;
+      p.provisionRaised = false;
       for (const ph of p.writer.ledger.phases) {
         try {
           await p.collab.queue.checkPhase(ph.id);
@@ -1924,8 +2295,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         return ev;
       });
       closeIdle(p);
-      p.unpin?.();
-      p.unpin = null;
+      unpinPlan(p);
       const live = new Set<TaskId>();
       for (const f of d.launcher.inFlight()) {
         const h = p.handles.get(f.taskId);
@@ -2044,6 +2414,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     },
 
     async start() {
+      // QA-3.1-1 (memo M46): the runtime feeds itself from the host's session events: provider of each step, capacity
+      // signals, the orchestrator's idle flag and the end of a late-adopted child (L12) all come from here.
+      if (offEvents === null && !disposed) offEvents = d.hosts.onEvent(onHostEvent);
       if (d.recovery !== null) {
         try {
           await d.recovery.recover();
@@ -2063,10 +2436,20 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
     async dispose() {
       disposed = true;
+      const off = offEvents;
+      offEvents = null;
+      if (off !== null) {
+        try {
+          off();
+        } catch (e) {
+          d.log("warn", "host event unsubscribe failed", errorText(e));
+        }
+      }
       for (const p of plans.values()) {
         p.disposed = true;
         for (const h of p.timers) d.clock.clearTimer(h);
         p.timers.clear();
+        p.backoff = null;
       }
       // A live child's completion settles only when the child ends, so dispose never waits for it: the launcher aborts every
       // owned child first (journals nothing; recovery closes those attempts as lost), then only the work already running is
@@ -2112,6 +2495,14 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     recordMetric(planId, m) {
       const p = plans.get(planId);
       if (p !== undefined) metric(p, m);
+    },
+
+    onLeaseReleased() {
+      try {
+        for (const p of plans.values()) schedule(p);
+      } catch (e) {
+        d.log("error", "lease release feed failed", errorText(e));
+      }
     },
   };
 

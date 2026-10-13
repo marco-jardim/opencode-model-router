@@ -88,6 +88,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **OpenCode v2: the background decision's parent lookup is bounded.** An unrecorded parent is looked up at most once
   and for at most 1 s; on timeout the dispatch stays in the foreground.
 
+### Security
+
+- **OpenCode v2 (v1 unchanged): an unbound plan child is refused every tool call.** A child session whose first message
+  is a plan launcher prompt (`PLAN CONTEXT` followed by the launch header at its grammar position) but that has no
+  matching plan binding is refused every tool call (fail closed). Parallel tool calls of such a session all wait for the
+  same check, and an ordinary prompt is never refused, even when the session's kind cannot be looked up.
+
 ## [2.7.0] - 2026-10-10
 
 ### Added
