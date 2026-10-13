@@ -588,7 +588,8 @@ implementation's worktree `D:\git\opencode-model-router-cross-repo` (branch `fea
 | 2.2 | **done** 2026-10-12 | 3 (r1 14, r2 9, r3 1 major — fixed) | merged `ded2e88`; ledger.ts 96.01 branches after top-up `fe3a178` |
 | 2.3 | **done** 2026-10-12 | 3 (r1 17, r2 15, r3 1 major — fixed) | merged `9b44413`; estimate 97.5 / index 92.46 branches after top-up `ca5cb81` |
 | 2.4 | **done** 2026-10-12 | 3 (r1 21, r2 9, r3 1 major — fixed) | merged `6eaf7f0`; M1-M10 measured (all constants kept); `smoke:cpx:provision` 4/4 |
-| 3.1 · 3.2 | waiting | — | |
+| 3.1 | **done** 2026-10-12 | 3 (r1 22, r2 13, r3 bounded: 2 majors confirmed fixed, 4 minors deferred) | merged `4623f8d` (conflicts in `v2-client.ts`/`v2-hooks.ts` with pdf1-2 resolved by the orchestrator: rebuilt contexts `retain:false` neither retained nor captured; executor processor keeps `withinCaller`); 18 files 1213 green, tsc clean; `smoke:cpx` 57/57 at `49a8526`; report `phase-3.1.md` |
+| 3.2 | QA round 2 | r1 21 + nits (fixed `47de105`) | 479 green (real-git 29/29), queue.ts 89.27 branches (left to QA); r2 `ses_ecd1975afffeB5Ln022YbofC82` |
 | 4.1 · 4.2 | waiting | — | |
 | 5.1 | waiting | — | |
 | DF-2 | waiting | — | |
