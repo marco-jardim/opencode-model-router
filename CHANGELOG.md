@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Approve repositories outside routing.repoParents with /router approve (OpenCode v2, roles mode; inert on v1)
+  (#107).** A role dispatch with `root=<path>` outside `routing.repoParents` is refused with a note composed from git
+  that names the repository and ends `Only the user can approve it: ask the user to run /router approve <path>, then
+  dispatch again.` The human types `/router approve <path>` in a top-level session: the router reads the repository's
+  identity from git (path, git common directory, root commits; origin and branch are shown), stores it and reloads the
+  role agents (`Role agents reloaded; dispatch again with root=<path>.`; if the reload fails, `Restart OpenCode to use
+  it.`); dispatch again with `root=<path>`. Only the main worktree of a repository can be approved, never a protected
+  location (a filesystem root, the user profile, the OpenCode config, data, state or cache directories, the plugin
+  install directory, the approvals store directory); `routing.repoExclude` wins, and the identity is checked again at
+  every use. The approvals are stored in `opencode-model-router.repo-approvals.json` next to the router state file.
+  `/router repos` lists the approvals, their last use and expiry; `/router revoke <path>` removes one and drops the
+  repository from every working set. An approval expires `routing.repoApprovalDays` (new key, global only, 1–90, default
+  14) days after its last use, and 90 days after approval at the latest. Worktrees of an approved repository outside its
+  main tree still need `routing.workRoots` or a restart. See
+  [Repositories outside routing.repoParents](docs/ROLES.md#repositories-outside-routingrepoparents).
 - **Dependencies outside `node_modules` (OpenCode v2, roles mode; inert on v1) (#107).** A role dispatch's perimeter
   also holds the repositories the work root declares a dependency on outside `node_modules` (owner decision D24, Tier
   A): `file:`, `link:` and `portal:` specs in `package.json` (root and workspace manifests, `overrides`, `resolutions`,

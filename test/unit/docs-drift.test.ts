@@ -13,7 +13,9 @@ import {
 } from "../../src/router/config";
 import {
   AUTHORITY_ACTIONS,
+  DEFAULT_REPO_APPROVAL_DAYS,
   EXPLORATION_MAX_RATE,
+  REPO_APPROVAL_CAP_DAYS,
   ROLES_V1_NOTICE,
   RUN_TIMEOUT_BOUNDS,
   sanitizeExploration,
@@ -34,13 +36,16 @@ import { RENDERED_REASONS_MAX } from "../../src/verify/dispatch";
 import { GRADER_REASONS_MAX } from "../../src/verify/checker";
 import { oneLineReason } from "../../src/routing/roles/authority";
 import { CREDENTIAL_ENV_RE } from "../../src/router/run-tools";
-import { ROLES_RESTART_NOTICE } from "../../src/compat/v2-hooks";
+import { APPROVAL_RELOAD_APPLIES, ROLES_RESTART_NOTICE } from "../../src/compat/v2-hooks";
+import { approvalReloadLine } from "../../src/commands/approvals";
+import { ROUTER_APPROVAL_HELP_LINES } from "../../src/commands/output";
+import { APPROVALS_FILE_NAME, APPROVE_MAIN_WORKTREE, MAX_APPROVALS, MAX_APPROVALS_BYTES, type inspectCandidate } from "../../src/routing/roles/approvals";
 import { buildRoleDispatchHeader } from "../../src/router/dispatch-header";
 import { parseJsonc } from "../../src/router/jsonc";
 import { FINDING_IDS } from "../../src/routing/advisor/findings";
 import { runAdvisor } from "../../src/routing/advisor";
 import { buildLadder, buildRoleLadder, resolveChosen } from "../../src/routing/engine/ladders";
-import { createDispatchRouter, resetDispatchRouting } from "../../src/routing/wire/dispatch";
+import { APPROVAL_NOTE_TIMEOUT_MS, approvalNote, createDispatchRouter, resetDispatchRouting } from "../../src/routing/wire/dispatch";
 import { createEngineRuntime } from "../../src/routing/wire/runtime";
 import { resetBindingRegistryForTests } from "../../src/routing/roles/binding";
 import {
@@ -853,7 +858,7 @@ describe("docs drift: roles delegation keys (#84)", () => {
     "routing.delegation", "roleAgents", "roleAgents.<name>.enabled", "roleAgents.<name>.description", "roleAgents.<name>.prompt",
     "roleAgents.<name>.tierRange", "roleAgents.<name>.budget", "roleAgents.<name>.deny", "routing.exploration.rate",
     "routing.exploration.requireDetection", "routing.run.scripts", "routing.run.commands", "routing.run.timeoutMs", "routing.workRoots",
-    "routing.repoParents", "routing.repoDepth", "routing.repoExclude",
+    "routing.repoParents", "routing.repoDepth", "routing.repoExclude", "routing.repoApprovalDays",
   ];
 
   it("documents every key, and a missing one is detected", () => {
@@ -875,7 +880,8 @@ describe("docs drift: roles delegation keys (#84)", () => {
     expect(cell("routing.repoParents")).toBe("`[]`");
     expect(cell("routing.repoDepth")).toBe(defaultCell(defaults.repoDepth));
     expect(cell("routing.repoExclude")).toBe("`[]`");
-    expect([defaults.repoParents, defaults.repoDepth, defaults.repoExclude]).toEqual([[], 2, []]);
+    expect(cell("routing.repoApprovalDays")).toBe(defaultCell(defaults.repoApprovalDays));
+    expect([defaults.repoParents, defaults.repoDepth, defaults.repoExclude, defaults.repoApprovalDays]).toEqual([[], 2, [], 14]);
     expect(Object.keys(defaults.run.commands)).toEqual(["test-files"]);
   });
 
@@ -1216,7 +1222,39 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     expect(flat).toContain(denied);
     for (const key of ["routing.delegation", "roleAgents", "routing.exploration.rate", "routing.exploration.requireDetection", "routing.run.scripts",
       "routing.run.commands", "routing.run.timeoutMs", "routing.workRoots", "routing.repoParents", "routing.repoDepth",
-      "routing.repoExclude"]) expect(guide, key).toContain(`\`${key}`);
+      "routing.repoExclude", "routing.repoApprovalDays"]) expect(guide, key).toContain(`\`${key}`);
+  });
+
+  it("cross-repo Phase 4: quotes the /router approve help lines, the refusal note and the reload/restart lines the code emits", async () => {
+    for (const line of ROUTER_APPROVAL_HELP_LINES) expect(flat, line).toContain(line);
+    const identity = { path: "<path>", commonDir: "<path>\\.git", roots: ["0".repeat(40)], origin: "<origin>", branch: "<branch>", head: "<head7>" };
+    const note = await approvalNote("<path>", { inspect: async () => identity as unknown as Awaited<ReturnType<typeof inspectCandidate>> });
+    expect(note).toBe("<path> is a git repository outside routing.repoParents (origin <origin>, branch <branch> at <head7>). Only the user can approve it: ask the user to run /router approve <path>, then dispatch again.");
+    expect(flat).toContain(note);
+    const problem = await approvalNote("<path>", { inspect: async () => "<problem>" });
+    expect(flat).toContain(problem);
+    expect(flat).toContain(`within ${APPROVAL_NOTE_TIMEOUT_MS / 1000} seconds`);
+    // The guide says the approval applies after the reload (spike T6), with the restart line as the fallback.
+    expect(APPROVAL_RELOAD_APPLIES).toBe(true);
+    const approve = { kind: "approve", path: "<path>" } as const;
+    const revoke = { kind: "revoke", path: "<path>" } as const;
+    for (const line of [
+      approvalReloadLine(approve, APPROVAL_RELOAD_APPLIES),
+      approvalReloadLine(revoke, APPROVAL_RELOAD_APPLIES),
+      approvalReloadLine(approve, APPROVAL_RELOAD_APPLIES, "<error>"),
+      approvalReloadLine(revoke, APPROVAL_RELOAD_APPLIES, "<error>"),
+    ]) expect(flat, line).toContain(line);
+    expect(flat).toContain(`; ${APPROVE_MAIN_WORKTREE}`);
+    expect(flat).toContain(`(global only, 1–${REPO_APPROVAL_CAP_DAYS}, default ${DEFAULT_REPO_APPROVAL_DAYS})`);
+    expect(flat).toContain(`${REPO_APPROVAL_CAP_DAYS} days after it was approved at the latest`);
+    expect(flat).toContain(`At most ${MAX_APPROVALS} approvals and ${MAX_APPROVALS_BYTES / 1024} KiB`);
+    expect(flat).toContain(`\`${APPROVALS_FILE_NAME}\``);
+    expect(read("docs/CONFIG_REFERENCE.md")).toContain(`\`${APPROVALS_FILE_NAME}\``);
+    const unreleased = /## \[Unreleased\]([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
+    expect(unreleased).toContain("Approve repositories outside routing.repoParents with /router approve (OpenCode v2, roles mode; inert on v1) (#107).");
+    const design = read("docs/design/cross-repo.md").replace(/\s+/g, " ");
+    expect(design).toContain("| D29 | 2026-10-12 | Phase 4 channel: a human-typed `/router approve` command instead of a permission ask");
+    expect(design).not.toContain("A first-use approval was requested (Phase 4)");
   });
 
   it("ADR 0006 has D1–D13 in order, the evidence E1–E13 and only the literature L1–L14", () => {

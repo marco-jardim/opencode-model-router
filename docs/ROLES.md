@@ -430,6 +430,124 @@ has room for, and when a placement or a v2 tier per-check `cwd=` is refused (a r
 
 The rest of the design is in [the cross-repo design](./design/cross-repo.md).
 
+### Repositories outside routing.repoParents
+
+A repository outside `routing.repoParents` becomes a work root for role dispatches only after a human approved it with
+`/router approve` (OpenCode v2, roles mode, owner decision D29). The flow:
+
+1. A role dispatch names the repository with `root=<path>` and admission refuses it. When the refused candidate is one
+   a human could approve, the router asks git about it (never the dispatch text) and appends to the refusal:
+   `<path> is a git repository outside routing.repoParents (origin <origin>, branch <branch> at <head7>). Only the user
+   can approve it: ask the user to run /router approve <path>, then dispatch again.` A detached HEAD reads `detached at
+   <head7>`, and a path with spaces is quoted in the command. When the candidate cannot be approved, the note says why
+   instead: `No approval can be requested for <path>: it <problem>.` When git does not answer within 8 seconds, the
+   refusal stays as it is.
+2. The human types `/router approve <path>` (quote a path with spaces: `/router approve "D:\my repo"`). The router
+   inspects the path again, from git, and shows the identity it stored:
+
+   ```text
+   Approved repository D:\other\lib-c
+     origin:  https://github.com/acme/lib-c.git
+     branch:  main @ 3f2c1a9b4d5e
+     roots:   1 root commit
+     expires: 2026-10-26 (14 days after its last use; at the latest 2027-01-10)
+   Stored in C:\Users\me\.config\opencode\opencode-model-router.repo-approvals.json.
+   ```
+
+3. The router reloads the role agents, so that their directory permission covers the repository, and adds
+   `Role agents reloaded; dispatch again with root=<path>.`
+4. The orchestrator dispatches again with `root=<path>`.
+
+An approved repository works through `root=` only (scope OD-P4-2 (a)): the `root=` text must equal the approved path
+before any filesystem call, and a different spelling that resolves to it is refused with a note that names the approved
+path. `repo=<name>` does not look outside the parents. Once bound, the repository joins the working set and the read
+set, `router_git_* root` works on it, and its linked worktrees are admitted by rule 2 through the working set (see
+Limits below for the host's side). Registration gives each approved repository a `<path>\*` `external_directory` allow
+pattern on the local roles, only while `routing.repoParents` is non-empty, the approval has not expired and is not
+excluded by its text, the path still resolves to itself, and it passes the work-root checks.
+
+**What is checked.** What the human sees and what gets stored come from git at approve time, never from the dispatch
+text or the refusal note. `/router approve` refuses with `Not approved: <path> <reason>.` and `Nothing was stored.`
+(the first three checks run before any git call):
+
+- a path that fails the work-root text checks, or does not resolve to an existing directory;
+- a path excluded by `routing.repoExclude`, as typed or resolved: `repoExclude` wins over an approval;
+- a protected location, as typed or resolved: a drive or filesystem root, the user profile or an ancestor of it, and
+  the OpenCode config directory (also `$XDG_CONFIG_HOME/opencode` and `OPENCODE_CONFIG_DIR`), the OpenCode data, state
+  and cache directories, the plugin install directory and the approvals store directory (each equal, an ancestor, or
+  inside);
+- anything but the main worktree of a repository: `<path>\.git` must be a local directory (not a link, not a `.git`
+  file of a linked worktree, a submodule or a separate git dir), the path must be the git top level, and the git common
+  directory must be its own `.git`. These refusals end with `; approve the main worktree`.
+
+A repository below `routing.repoParents` needs no approval: `No approval needed: <path> is inside routing.repoParents
+(<parent>); dispatch with root=<path>.` The stored identity is the canonical path, the git common directory and the
+root commits (`git rev-list --max-parents=0 HEAD`); the origin (credentials stripped) and the branch are shown but are
+not part of the identity. The identity is checked again with git at every use: an entry whose path no longer resolves
+to itself, whose common directory changed, or whose root commits differ no longer admits anything.
+
+**The commands.** `/router` lists them only where they run:
+
+```text
+- `/router approve <path>` — approve a repository outside `routing.repoParents` for role dispatches with `root=<path>` (identity from git; quote a path with spaces)
+- `/router repos` — list the approved repositories, their last use and expiry
+- `/router revoke <path>` — remove an approval and drop the repository from every working set
+```
+
+They run only on OpenCode v2, in roles mode, with `routing.repoParents` non-empty, and only when typed by the human in a
+top-level session: not a role session, not a known child of a dispatch, and a session the host reports without a
+parent (a failed lookup refuses). Anywhere else `approve`, `repos` and `revoke` are not commands, and `/router` shows its
+usual output. Only `approve` and `revoke` add or remove approvals (a binding through one only moves its last use); no
+tool call, route-line field, dispatch text or project-layer key can create, extend or widen one.
+
+- `/router repos` reads the store only (no git) and lists each entry with its origin, `approved:`, `last used:` and
+  `expires:` times, marked `[expired]` or `[excluded by routing.repoExclude (<pattern>)]` where that applies.
+- `/router revoke <path>` removes the entry (named by its text or its realpath), drops the repository from every
+  working set and says so: `Revoked the approval of <path>.`, then `It was not in any working set.` or `Removed from the
+  working sets (<n> bindings).`, then `A new dispatch with root=<path> is refused.` The role agents are then reloaded:
+  `Role agents reloaded; root=<path> is no longer allowed.`
+
+**Reload and restart.** After an `approve` or `revoke` that wrote the store, the v2 command adapter reloads the role
+agents before it sends the text on, so the host's directory permission follows the store. When the reload fails, the
+added line names the error and falls back to a restart: `The role agents could not be reloaded (<error>). Restart
+OpenCode to use it.` after an approval, and `The role agents could not be reloaded (<error>). The router refuses
+root=<path> now; restart OpenCode to remove its directory permission from the role agents.` after a revocation.
+
+**Expiry.** An approval expires `routing.repoApprovalDays` days (global only, 1–90, default 14) after its last use, and
+90 days after it was approved at the latest, whatever its use. Each binding through an approval records the use (at
+most one write per hour per repository). An expired entry admits nothing; approve it again to renew it. Expiry or a
+lost identity takes effect at the next binding, when the stale entry is also dropped from the working set.
+
+**The store.** The approvals live in `opencode-model-router.repo-approvals.json` next to the router state file
+(`~/.config/opencode/`); its format is in [the configuration reference](./CONFIG_REFERENCE.md#roles-delegation-84). A file
+that is not valid as a whole means no approvals (fail closed) and one notice; `/router repos` then says `The approvals
+file <file> is invalid (<reason>); no approvals apply until it is fixed or removed.`, and `approve` and `revoke` refuse.
+
+**Limits.**
+
+- Worktrees of an approved repository outside its main tree are admitted by rule 2 once the repository is bound, but
+  the host's directory permission covers only `<path>\*`, so they still need a `routing.workRoots` glob or a restart
+  (Q7), as for any worktree outside the parents.
+- The root commits change on an orphan-branch checkout, a deepened shallow clone or rewritten history; the approval is
+  then lost and must be given again.
+- At most 32 approvals and 256 KiB. Two OpenCode instances writing the store at the same time can lose one write; the
+  command reads the file back and reports it.
+- An approval that expires mid-session can still be read through the working set until the next dispatch of that
+  session.
+
+**Accepted residuals.**
+
+- Code with host API access (`session.command`) or with a shell can approve: `router_run` in the work root runs
+  repository code, so it can write the store.
+- A human can approve a hostile clone; the command shows the origin, branch and root commits so the human can check.
+- The host's `<path>\*` pattern is wider than admission and lingers after an expiry until the next reload of the role
+  agents or a restart; the router's hook still narrows access in the meantime, as for `routing.workRoots`.
+
+**OpenCode v1, tiers mode, no parents.** The feature is inert on OpenCode v1, in tiers mode and in roles mode without
+`routing.repoParents`: `/router approve <path>` shows the usual `/router` output byte for byte, there is no store I/O
+and no git call for approvals, and no approval admits anything. On v1, `routing.repoApprovalDays` gets at most the
+existing one-time notice (see [OpenCode v1 fallback](#opencode-v1-fallback)).
+
 ## Tier floor
 
 The window of a role dispatch is `[floor, ceiling]`:

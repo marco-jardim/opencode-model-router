@@ -2,7 +2,7 @@
 
 **Status:** Accepted 2026-10-10 (owner). Phase 0 and Phase 1 implemented, two QA rounds each; dogfooding pending.
 **Scope:** roles mode on OpenCode v2 (`routing.delegation: "roles"`). Phase 0 changes the shared verification engine and applies to both hosts.
-**Configuration keys** marked *proposed (not implemented)* do not exist yet (as of 2026-10-12 only `routing.repoApprovalDays`, Phase 4; `repoParents`, `repoDepth` and `repoExclude` are implemented).
+**Configuration keys:** as of 2026-10-12 all are implemented: `repoParents`, `repoDepth` and `repoExclude`, and `routing.repoApprovalDays` (Phase 4, D29).
 **File references** are `path:line` as of 2026-10-10. Line numbers drift; the function names are the stable reference.
 
 ## 1. Context
@@ -49,7 +49,7 @@
 | `routing.repoParents` | global only | `[]` | implemented (Phase 1; `sanitizeRepoParents`, `src/router/roles-config.ts`) |
 | `routing.repoDepth` | global only | `2` (allowed `1`–`4`) | implemented (Phase 1; `sanitizeRepoDepth`, `src/router/roles-config.ts`) |
 | `routing.repoExclude` | global only | `[]` | implemented (Phase 1; `sanitizeRepoExclude`, `src/router/roles-config.ts`) |
-| `routing.repoApprovalDays` | global only | `14` (allowed `1`–`90`) | proposed (not implemented), Phase 4 |
+| `routing.repoApprovalDays` | global only | `14` (allowed `1`–`90`) | implemented, Phase 4 (D29) |
 
 Example:
 
@@ -103,7 +103,7 @@ A directory D is **admitted** when any rule holds:
   - Recommendation: create worktrees under a parent (for example `D:\git\app-a-login`).
 - **Changing `routing.repoParents`** changes the registered patterns and takes effect after a restart. Whether a config hot reload re-registers the role agents has not been verified.
 
-### First-use approval (Phase 4, proposed)
+### First-use approval (Phase 4, implemented)
 
 Purpose: admit a repository outside `routing.repoParents` without editing configuration, after a human approves it once. The approval expires when the repository is not used.
 
@@ -126,54 +126,48 @@ Purpose: admit a repository outside `routing.repoParents` without editing config
 - **T5.** Does the `tool.execute.after` hook of the `question` tool see the human's answer, unmodified?
   - Result: answered. `tool.execute.after` of `question` receives `result.output.answers` (for example `[["B"]]`) and `result.metadata.answers`: the human's selection, structured. The fallback channel is viable.
 
-Outcome: channel 1 (ask on the orchestrator's `subagent` evaluation) is viable; channel 2 stays the fallback.
+Outcome: channel 1 (ask on the orchestrator's `subagent` evaluation) is viable; channel 2 stays the fallback. Superseded
+by D29: the implemented channel is a command typed by a human, so no ask is raised and no event is correlated (live check
+2026-10-12: a subagent whose prompt is `/router` did not invoke the command).
 
-**Trigger.** A dispatch names `root=` for a git top level outside every parent that:
-- passes the sanitising rules (no UNC or device path, no 8.3 segment, no `.` or `..`);
-- is not excluded by `routing.repoExclude`;
-- is not a protected location: a drive root, the user profile root, `~/.config/opencode`, the OpenCode data directories, or the plugin's install directory;
-- has no valid approval.
+**Implemented flow (D29; plan and self-decisions in [cross-repo-phase4-plan.md](./cross-repo-phase4-plan.md); user guide
+in [ROLES.md](../ROLES.md#repositories-outside-routingrepoparents)).**
+- A role dispatch with `root=<path>` outside every parent is refused (D15). When admission's refusal names a candidate a
+  human could approve, the bind path appends a note built only from git about that candidate (bounded at 8 s; on a
+  timeout the note stays as it is): `<path> is a git repository outside routing.repoParents (origin <origin>, branch
+  <branch> at <head7>). Only the user can approve it: ask the user to run /router approve <path>, then dispatch again.`
+- The human types `/router approve <path>` in a top-level session (OpenCode v2, roles mode, `routing.repoParents`
+  non-empty; otherwise the subcommand falls through to the `/router` help, unchanged). The command inspects the path
+  again from git (main worktree only: a local `.git` directory that is its own common dir; not a protected location;
+  `routing.repoExclude` wins), shows the identity and stores `{path, commonDir, roots[], origin, approvedAt,
+  lastUsedAt}` in `~/.config/opencode/opencode-model-router.repo-approvals.json` (at most 32 entries, 256 KiB; tmp file
+  and rename). Only `/router approve` and `/router revoke` add or remove approvals (S1).
+- The v2 command adapter then reloads the role agents (`APPROVAL_RELOAD_APPLIES`, spike T6), whose registration adds a
+  `<path>\*` `external_directory` allow pattern per valid approval, and appends `Role agents reloaded; dispatch again with
+  root=<path>.`; a failed reload gives the restart line `Restart OpenCode to use it.` The orchestrator dispatches again.
+- Rule 3 of admission: the `root=` text must equal an approved path; the identity (realpath, canonical common dir,
+  root-commit set) is checked again at every use, with the expiry (`routing.repoApprovalDays`, 1–90, default 14, after
+  the last use; 90-day cap after `approvedAt`). `lastUsedAt` is touched at most once per hour. Scope OD-P4-2 (a): the
+  approved repository works through `root=`, joins R and P, and its worktrees are admitted by rule 2 through the working
+  set; worktrees outside its main tree still need `routing.workRoots` or a restart (Q7).
+- `/router repos` lists the store (no git); `/router revoke <path>` deletes the entry, drops it from every working set and
+  reloads the role agents.
+- v1, tiers mode and roles mode without parents: inert (S5).
 
-Without an approval the dispatch gets no work root, as today, and the router requests one.
+**Host permission for approved repositories.** The registered `external_directory` policy ends in a catch-all `*: deny`,
+a static deny that no hook overrides. Two mechanisms apply:
+- **Hook-level allow (D13, implemented).** In a role session with an exact binding, the router lifts the host's `ask` to
+  `allow` for `external_directory` resources inside the grant's W or R. A configured `deny` stays final, and only an
+  `ask` is lifted.
+- **Re-registration after approval (D29).** Registration adds a `<path>\*` allow pattern per valid approval (parents
+  non-empty, not expired, not excluded by its text, realpath equal to the stored path, `workRootProblem` passes), and
+  `/router approve` and `/router revoke` reload the role agents at once; a restart is the fallback. The pattern is wider
+  than admission and stays until the next reload after an expiry; the router hook still narrows meanwhile. A directory the
+  patterns do not cover, such as a worktree of an approved repository outside its main tree, still needs a
+  `routing.workRoots` glob or a restart (Q7).
 
-**The prompt is composed by the router from git, never from the dispatch text:**
-
-```text
-Allow role agents to read, edit and run in this repository?
-  path:    E:\clients\acme-api            (main worktree; its worktrees are included)
-  origin:  git@github.com:acme/acme-api.git
-  branch:  main at 3f2c1a9
-  expires: 14 days after the last use, at most 90 days (2027-01-08)
-Allow once = this dispatch only. Allow always = until it expires. Reject = no work root.
-```
-
-**Where the human is asked**, in order of preference:
-1. **The orchestrator session**, by setting `effect = "ask"` on the evaluation of the orchestrator's `subagent` call (needs T1, T3). The orchestrator session is the one the human is watching.
-2. **A router-issued challenge through the orchestrator's `question` tool** (needs T5). The refusal note gives the exact question text, including a one-time code. The router accepts the approval only if the `question` input equals the issued text byte for byte and the human's answer is the approve option. The agent controls the question it sends, not the human's answer, and the code is single-use and expires with the dispatch.
-3. **Not in a child session** until T2 shows that the prompt reaches the human and a waiting child does not hang.
-
-**Replies.** `once` admits the repository for this dispatch only. `always` stores an approval. `reject` gives no work root and a note, and the declared `root=` refuses the dispatch (D15). No reply, or a non-interactive run (`opencode run`), gives no work root and refuses it the same way. An approval is never created automatically.
-
-**Store.** A separate file next to the state file: `~/.config/opencode/opencode-model-router.repo-approvals.json` (proposed), written through a tmp file and rename like `writeState`. One entry per repository:
-- canonical path of the main worktree and of the git common directory;
-- identity: the sorted root-commit set (`git rev-list --max-parents=0 HEAD`);
-- `origin` URL at approval (shown, not used as identity);
-- `approvedAt`, `lastUsedAt`.
-
-**Validity.**
-- The path and the root-commit set must still match. A folder replaced by another repository loses its approval and is asked again.
-- An approval expires `routing.repoApprovalDays` after its last use, and at most 90 days after it was given. Each binding refreshes `lastUsedAt`.
-- `routing.repoExclude` wins over an approval.
-
-**Effect.** An approved repository and its worktrees are admitted exactly as a repository below a parent: they join R, can be W, and follow the same P rules.
-
-**Host permission for approved repositories.** An approved repository outside the parents has no registered `external_directory` allow pattern. Two ways to grant it; the second is chosen (D13):
-- Re-register the role agents (a restart, or a verified hot reload). This breaks "no restart".
-- **Hook-level allow (approved, D13).** In a role session with an exact binding, the router lifts the host's `ask` to `allow` for `external_directory` resources inside the grant's W or R. A configured `deny` stays final. This changes the current rule that the router only ever narrows a role's decision (`v2-hooks.ts:1257`). It does not remove the restart or the `%TEMP%` gap for worktrees outside the parents (above): the registered catch-all is `*: deny`, a static deny, which the lift never overrides. Only an `ask` is lifted, so a directory the registered patterns do not cover still needs a `routing.workRoots` glob or a restart (Q7).
-
-**Revocation and listing.** Delete the entry or the file. A listing command (proposed: `/router repos`) shows approvals, last use and expiry.
-
-**v1.** Inert, with the one-time notice (I9).
+The proposed ask-based flow (a router-composed `ask` on the orchestrator's `subagent` evaluation, or a `question`
+challenge as the fallback, with `once` / `always` / `reject` replies) was replaced by D29 before it was built.
 
 ## 4. Invariants
 
@@ -205,7 +199,7 @@ Allow once = this dispatch only. Allow always = until it expires. Reject = no wo
 - **I13 — P is fixed at dispatch.** P is the working set at dispatch start, plus W, plus the admitted link targets of W. A repository bound later is not observed by an earlier dispatch. For a deferred dispatch P is frozen at return (statuses for I4 and I8, working-set roots, observed link targets, placements, link pins); the consumers of W are discovered over the frozen working-set roots at the gate that runs the checks, not at return. The perimeter is planned for every routed role dispatch with a work root whenever `routing.repoParents` is set, even without `repo=`; it is also planned when the grant has a location or the working set holds other roots.
 - **I14 — Names are resolved, never guessed.** An ambiguous name or worktree is refused with the candidates listed.
 - **I15 — Hosts.** Phase 0 applies to both hosts. Phase 1 and later are v2-only.
-- **I16 — Approvals come from a human.** An approval is created only by a human reply to a prompt the router composed from git. No agent tool call, route-line field, dispatch text or project-layer configuration can create, extend or widen one.
+- **I16 — Approvals come from a human.** An approval is created only by a human typing `/router approve <path>` in a top-level session; what is shown and stored comes from git (D29). No agent tool call, route-line field, dispatch text or project-layer configuration can create, extend or widen one.
 - **I17 — Approvals are bound and expire.** An approval is bound to the repository identity (canonical path and root-commit set) and expires after `routing.repoApprovalDays` without use, and at most 90 days after it was given.
 - **I18 — Lift only inside the grant.** The router lifts a host `ask` to `allow` only for `external_directory` resources inside the W or R of an exact binding (D13). It never lifts another action, never overrides a configured `deny`, and never lifts for an unknown binding.
 
@@ -250,7 +244,9 @@ repo=app-a has 3 worktrees: D:\git\app-a → main; D:\git\app-a-login → feat/l
 C:\Temp\app-a-hotfix → detached at 3f2c1a9: no work root. Add branch=<name>, or name one with root="<path>".
 
 root=E:\work\x is not below routing.repoParents (D:\git) and is not a worktree of a repository in this session:
-no work root. A first-use approval was requested (Phase 4); or clone it or add a worktree below D:\git.
+no work root. Clone it or add a worktree below D:\git.
+E:\work\x is a git repository outside routing.repoParents (origin https://github.com/acme/x.git, branch main at
+3f2c1a9). Only the user can approve it: ask the user to run /router approve E:\work\x, then dispatch again.
 
 root=D:\git\a\b\c is 3 levels below D:\git; repositories are admitted 1 to 2 levels below a parent (routing.repoDepth).
 ```
@@ -510,6 +506,12 @@ After QA rounds 1 and 2 (facts checked at HEAD effcdb3):
 
 ### Phase 4 — first-use approval (v2 only, after spikes T1–T5)
 
+**Implemented** (`78f9aa0..3d10c47`, lean plan and QA in [cross-repo-phase4-plan.md](cross-repo-phase4-plan.md), its
+tasks P4.1–P4.9; decision D29). The channel is the human-typed `/router approve <path>` (with `/router repos` and
+`/router revoke <path>`), not the ask of P4.4 below; the role agents are reloaded after an approval, with a restart as the
+fallback; scope OD-P4-2 (a), through `root=`. P4.5 (the D13 lift) was already implemented before Phase 4
+(`v2-hooks.ts:1126-1131`, `:1414-1420`). The table below is the original proposal, kept for the record.
+
 | Step | File:function | Change |
 |---|---|---|
 | P4.0 | spikes | T1–T5 (section 3). The results decide between "ask on the orchestrator's `subagent` evaluation" and "router-issued `question` challenge". |
@@ -704,7 +706,9 @@ After QA rounds 1 and 2 (facts checked at HEAD effcdb3):
 
 **To verify during implementation**
 - That the host's `*` matches across separators on the installed version.
-- Whether a config hot reload re-registers role agents.
+- Whether a config hot reload re-registers role agents. (Phase 4: `/router approve` and `/router revoke` reload the role
+  agents; whether the host then allows the approved directory at once, spike T6, is checked in the Phase 4 dogfood, with
+  `APPROVAL_RELOAD_APPLIES` and the restart line as the fallback, D29.)
 - The `git symbolic-ref` exit codes (settled: the snapshot no longer uses `symbolic-ref`; head and branch come from one `rev-parse`).
 - Snapshot time for a working set of 5–10 repositories within `baselineTimeoutMs`.
 - Which agent grader sessions run as (`wiring.ts:1299-1306` passes none).
@@ -742,6 +746,7 @@ After QA rounds 1 and 2 (facts checked at HEAD effcdb3):
 | D26 | 2026-10-12 | OD-P3c-3 = (b): W's dependency targets are read again at return, and the new admitted ones are frozen, so a dependency added during the dispatch is not "changed" at `router_verify`. Decided, not yet implemented. |
 | D27 | 2026-10-12 | QA-1 M2, owner decision: a post-run completeness check for the cross-link run: every consumer test file that names a W package in an import/require specifier must have run, else the result is incomplete. Implemented (Phase 3 (a), `830d5db..9ccabd0`). |
 | D28 | 2026-10-12 | Phase 4 goes ahead after spikes T1–T5 (all viable; T2 partly): the ask is raised on the orchestrator's `subagent` evaluation, correlated by tool call id; Q5 decided (14/90 days, no read-only variant). One lot, one heavy QA round plus a re-check of its fixes, batched dogfood. |
+| D29 | 2026-10-12 | Phase 4 channel: a human-typed `/router approve` command instead of a permission ask (simpler; no event correlation); reload role agents after approval, restart as fallback; scope OD-P4-2 (a). Replaces the channel part of D28. Implemented (`78f9aa0..3d10c47`, [cross-repo-phase4-plan.md](cross-repo-phase4-plan.md)). |
 
 ## 12. Alternatives considered
 
