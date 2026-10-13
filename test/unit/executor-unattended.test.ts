@@ -6,11 +6,13 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createLedgerStore } from "../../src/executor/ledger.js";
 import {
+  BREAKER_FED,
   breakerSamples,
   breakerTrips,
   boundInboxText,
   createUnattendedPolicy,
   INBOX_TEXT_MAX,
+  isCommitFailure,
   parkItemKind,
   pendingDependentsClosure,
 } from "../../src/executor/unattended.js";
@@ -97,7 +99,15 @@ class TestWriter implements LedgerWriter {
   }
   get planId(): string { return this.inner.planId; }
   get ledger(): Readonly<LedgerV1> { return this.inner.ledger; }
+  /** Fails every append whose batch (an event array) matches. */
+  failOn: ((batch: unknown) => boolean) | null = null;
+  /** Every event-array batch handed to append, in order. */
+  readonly batches: unknown[] = [];
   async append(batch: Parameters<LedgerWriter["append"]>[0]): Promise<Readonly<LedgerV1>> {
+    if (typeof batch !== "function") {
+      this.batches.push(batch);
+      if (this.failOn?.(batch) === true) throw new ExecutorError("E_LOCK_LOST", "injected append failure");
+    }
     const pre = this.beforeNext;
     if (pre !== null) {
       this.beforeNext = null;
@@ -141,6 +151,7 @@ interface Setup {
   paused?: boolean;
   qaRound?: number;
   config?: Partial<LedgerV1["config"]["circuitBreaker"]>;
+  maxAttempts?: number;
   /** Start the clock at this many seconds after the fixture epoch. */
   nowSec?: number;
 }
@@ -163,6 +174,7 @@ async function setup(o: Setup = {}): Promise<Env> {
   ph.paused = o.paused ?? false;
   ph.qaRound = o.qaRound ?? 1;
   draft.config.circuitBreaker = { ...draft.config.circuitBreaker, ...o.config };
+  if (o.maxAttempts !== undefined) draft.config.maxAttempts = o.maxAttempts;
   const inner = await store.create(draft, holderOf("s1", proc.pid, proc.hostname, clock.iso()));
   openWriters.push(inner);
   const journal: string[] = [];
@@ -454,8 +466,10 @@ describe("park", () => {
     expect(env.l().inbox).toEqual([it1]);
     expect(env.released).toEqual(["T1"]);
     expect(env.waker.calls).toEqual([{ reason: "inbox", key: `inbox:${it1.id}` }]);
-    // P3: released only after the park batch is durable, then the wake.
-    expect(env.journal).toEqual(["append", "release:T1", `wake:inbox:${it1.id}`]);
+    // P3: released only after the park batch is durable, then the wake; qa-unparsable then feeds the breaker and marks it.
+    expect(env.journal).toEqual([
+      "append", "release:T1", `wake:inbox:${it1.id}`, ...(cause === "qa-unparsable" ? ["append"] : []),
+    ]);
   });
 
   it.each([
@@ -767,6 +781,23 @@ describe("answer", () => {
     expect(lastAttempt(T(env, "PK")).context).toBe("go");
   });
 
+  it("QA-4.2-5 nit: a legacy context longer than 4000 characters still finds its (bounded) park item, not the oldest item", async () => {
+    const long = "q".repeat(INBOX_TEXT_MAX + 500);
+    const env = await setup({
+      tasks: [task("PK", "parked", { attempts: [failed(1, 5, { context: long })] })],
+      inbox: [
+        item("F-1", { kind: "failure", taskId: "PK", text: "route failed" }),
+        item("Q-2", { taskId: "PK", text: boundInboxText(long) }),
+        item("F-3", { kind: "failure", taskId: "PK", text: "lease rebuild failed" }),
+      ],
+    });
+    expect(await env.policy.answer("F-1", "x")).toEqual({ resumed: null });
+    expect(await env.policy.answer("F-3", "x")).toEqual({ resumed: null });
+    expect(env.state("PK")).toBe("parked");
+    expect(await env.policy.answer("Q-2", "go")).toEqual({ resumed: "PK" });
+    expect(env.state("PK")).toBe("ready");
+  });
+
   it("QA-4.2-5: a parked task without attempts resumes from its only open item", async () => {
     const env = await setup({ tasks: [task("PK", "parked")], inbox: [item("Q-1", { taskId: "PK" })] });
     expect(await env.policy.answer("Q-1", "go")).toEqual({ resumed: "PK" });
@@ -948,6 +979,64 @@ describe("recordAttempt: when the breaker trips", () => {
     expect((await env.policy.recordAttempt("p1", lastAttempt(p))).tripped).toBe(false);
   });
 
+  /** A task whose only attempt succeeded without a verdict and whose commit then failed (`completed -> failed`). */
+  const commitFailed = (id: string, endSec: number): TaskNode =>
+    task(id, "failed", { attempts: [closed(1, { endSec, verdict: null })] });
+
+  it("QA-4.2-19: the latest verdict-less success counts once the task left completed through failure, in any state", () => {
+    const a = closed(1, { endSec: 1, verdict: null });
+    const counted: TaskState[] = ["failed", "ready", "parked", "blocked", "pending"];
+    const notCounted: TaskState[] = [
+      "completed", "verifying", "verified", "integrating", "integrated", "done", "cancelled", "conflict", "reverted",
+    ];
+    for (const s of counted) expect(isCommitFailure(task("X", s, { attempts: [a] }), a), s).toBe(true);
+    for (const s of notCounted) expect(isCommitFailure(task("X", s, { attempts: [a] }), a), s).toBe(false);
+    // a non-latest one was followed by a retry, whatever the state is now
+    expect(isCommitFailure(task("X", "done", { attempts: [a, closed(2, { endSec: 3 })] }), a)).toBe(true);
+    const pass = closed(1, { endSec: 1 });
+    const lost = closed(1, { endSec: 1, outcome: "lost", verdict: null });
+    expect(isCommitFailure(task("X", "ready", { attempts: [pass] }), pass)).toBe(false);
+    expect(isCommitFailure(task("X", "ready", { attempts: [lost] }), lost)).toBe(false);
+  });
+
+  it("QA-4.2-19: a commit failure stays a sample after the retry decision moves the task (failed -> ready, failed -> parked)", async () => {
+    const env = await setup({ tasks: [commitFailed("C0", 1), commitFailed("C1", 2), commitFailed("C2", 3)], config: { minAttempts: 50 } });
+    const before = breakerSamples(env.l(), "p1");
+    expect(before.map((s) => `${s.taskId}:${s.failure}`)).toEqual(["C0:true", "C1:true", "C2:true"]);
+    await env.writer.append([{ type: "task-transition", taskId: "C0", from: "failed", to: "ready", trigger: "retry", detail: null }]);
+    await env.policy.park("C1", "exhausted", "commit failed: no git identity");
+    expect([env.state("C0"), env.state("C1"), env.state("C2")]).toEqual(["ready", "parked", "failed"]);
+    expect(breakerSamples(env.l(), "p1")).toEqual(before);
+    expect(breakerSamples(await env.reopen(), "p1")).toEqual(before);
+  });
+
+  it("QA-4.2-19: maxAttempts = 1 and three tasks failing their commit trip the breaker (consecutive 3)", async () => {
+    // Only C0's commit has failed yet; C1 and C2 are `completed` (verification pending: not samples). The breaker reads
+    // the whole ledger (B1), so a ledger with all three failures already settled would trip at the first feed.
+    const pending = (id: string, endSec: number): TaskNode =>
+      task(id, "completed", { slot: `slot-${id}`, attempts: [closed(1, { endSec, verdict: null })] });
+    const env = await setup({ tasks: [commitFailed("C0", 1), pending("C1", 2), pending("C2", 3)], maxAttempts: 1 });
+    expect(env.l().config.maxAttempts).toBe(1);
+    const commitFails = async (id: string): Promise<void> => {
+      await env.writer.append([
+        { type: "task-transition", taskId: id, from: "completed", to: "failed", trigger: "commit-failed", detail: "commit failed: no git identity" },
+      ]);
+    };
+    // the runtime order: the commit-failure batch, the feed, then the retry decision parks the task (no attempt left)
+    expect((await env.policy.recordAttempt("p1", lastAttempt(T(env, "C0")))).tripped).toBe(false);
+    await env.policy.park("C0", "exhausted", "commit failed: no git identity");
+    await commitFails("C1");
+    expect((await env.policy.recordAttempt("p1", lastAttempt(T(env, "C1")))).tripped).toBe(false);
+    await env.policy.park("C1", "exhausted", "commit failed: no git identity");
+    await commitFails("C2");
+    expect((await env.policy.recordAttempt("p1", lastAttempt(T(env, "C2")))).tripped).toBe(true);
+    expect(phaseOf(env).paused).toBe(true);
+    const brk = env.l().inbox.filter((x) => x.kind === "breaker");
+    expect(brk).toHaveLength(1);
+    expect(brk[0]?.text).toContain("3/3 failed");
+    expect(brk[0]?.text).toContain("3 consecutive");
+  });
+
   it("a flaky item between the attempt and the next one excludes the attempt", async () => {
     const tasks = breakerTasks("FFF");
     const flaky = item("K-1", { kind: "flaky", taskId: "B2", createdAt: at(3), answer: "seen" });
@@ -1071,6 +1160,34 @@ describe("recordAttempt: when the breaker trips", () => {
     await calm.policy.park("T9", "escalate", "q");
     expect(phaseOf(calm).paused).toBe(false);
     expect(calm.l().inbox.filter((x) => x.kind === "breaker")).toEqual([]);
+  });
+
+  it("QA-4.2-22: park(qa-unparsable) journals the runtime's breaker-fed marker after the feed; escalate writes none", async () => {
+    expect(BREAKER_FED).toBe("breaker-fed");
+    const env = await setup({
+      tasks: [...breakerTasks("FF"), running("Q1", { kind: "qa" })], gate: "qa-running",
+      config: { consecutiveFailures: 3, minAttempts: 50 },
+    });
+    await env.policy.park("Q1", "qa-unparsable", "no json");
+    const marker = {
+      type: "metric", metric: { name: "counter", key: "breaker-fed", value: 1, labels: { phaseId: "p1", taskId: "Q1", n: "1" } },
+    };
+    expect(env.writer.batches).toEqual([[marker]]);
+    // park batch, release, wake; the feed trips (one batch, one wake); then the marker
+    expect(env.journal).toEqual(["append", "release:Q1", "wake:inbox:F-1", "append", "wake:inbox:B-2", "append"]);
+
+    const calm = await setup({ tasks: [running("T9")] });
+    await calm.policy.park("T9", "escalate", "q");
+    expect(calm.writer.batches).toEqual([]);
+  });
+
+  it("QA-4.2-22: a marker append that fails is logged and does not fail the park", async () => {
+    const env = await setup({ tasks: [running("Q1", { kind: "qa" })], gate: "qa-running" });
+    env.writer.failOn = (b) => JSON.stringify(b).includes(BREAKER_FED);
+    const got = await env.policy.park("Q1", "qa-unparsable", "no json");
+    expect(got).toMatchObject({ kind: "failure", taskId: "Q1" });
+    expect(env.state("Q1")).toBe("parked");
+    expect(env.logs).toEqual(["breaker-fed marker append failed"]);
   });
 
   it("a breaker trip then its answer round-trips through the policy", async () => {

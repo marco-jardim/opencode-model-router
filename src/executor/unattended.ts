@@ -24,6 +24,9 @@ export interface UnattendedDeps {
 
 export const INBOX_TEXT_MAX = 4000; // U3
 
+/** Counter key of the "attempt fed to the breaker" marker; the runtime's `BREAKER_FED` (runtime.ts) uses the same key. */
+export const BREAKER_FED = "breaker-fed";
+
 export function boundInboxText(s: string): string {
   return s.length <= INBOX_TEXT_MAX ? s : `${s.slice(0, INBOX_TEXT_MAX)}…`;
 }
@@ -87,15 +90,23 @@ function breakerWindowStart(l: Readonly<LedgerV1>, phaseId: PhaseId): number | n
 }
 
 /**
+ * QA-4.2-19: states a task with a succeeded, verdict-less latest attempt can hold without a commit failure: still
+ * committing, verifying, landing or finished, and `conflict`/`reverted`, which only follow a landed commit.
+ */
+const NOT_COMMIT_FAILED_STATES: readonly TaskState[] =
+  ["completed", "verifying", "verified", "integrating", "integrated", "done", "cancelled", "conflict", "reverted"];
+
+/**
  * A2 (amendment A-4.2-2 to B1): a systemic post-child failure is a breaker FAILURE. The child succeeded without a
  * verdict, yet its task went `completed -> failed` (trigger `commit-failed`: E_IDENTITY / E_GIT, or "no changes" while
- * writes were declared). The ledger keeps no transition list, so the fact is derived: a succeeded attempt with no
- * verdict can only leave `completed` for `failed` when the commit failed, so it counts when its task is `failed` and it
- * is the latest attempt, or when a later attempt exists (the task was retried after that failure).
+ * writes were declared). The ledger keeps no transition list, so the fact is derived. A non-latest succeeded attempt
+ * with no verdict was followed by a retry, which only `commit-failed` allows (`completed` leaves for `failed` only
+ * that way). The latest one counts whenever the task is outside `NOT_COMMIT_FAILED_STATES` (QA-4.2-19): `failed`, or
+ * the `ready`/`parked`/`blocked` the retry decision moves it to right after the feed, so the sample outlives the move.
  */
 export function isCommitFailure(t: Readonly<LedgerV1["tasks"][string]>, a: Attempt): boolean {
   if (a.outcome !== "succeeded" || a.verdict !== null) return false;
-  return a !== t.attempts[t.attempts.length - 1] || t.state === "failed";
+  return a !== t.attempts[t.attempts.length - 1] || !NOT_COMMIT_FAILED_STATES.includes(t.state);
 }
 
 /**
@@ -185,8 +196,10 @@ export function parkItemOf(l: Readonly<LedgerV1>, t: Readonly<LedgerV1["tasks"][
   const last = t.attempts[t.attempts.length - 1];
   const cands = l.inbox.filter((x) => x.taskId === t.id && x.answer === null && (x.kind === "question" || x.kind === "failure"));
   if (last !== undefined) {
+    // Both sides bounded: a legacy context longer than INBOX_TEXT_MAX still matches its (bounded) park item.
+    const marker = boundInboxText(last.context);
     for (const c of [...cands].reverse()) {
-      if (c.text === last.context) return c;
+      if (boundInboxText(c.text) === marker) return c;
     }
   }
   return cands[0];
@@ -208,6 +221,21 @@ export function createUnattendedPolicy(d: UnattendedDeps): UnattendedPolicy {
       d.leases.releaseTask(taskId);
     } catch (e) {
       d.log("warn", "lease release failed", e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  /**
+   * QA-4.2-22: journals that attempt `n` of `taskId` was fed to `recordAttempt`, with the exact shape of the runtime's
+   * `markFed` (a `counter` metric, a history event), so the runtime's breaker re-feed does not feed it again.
+   * A failed append is logged: the worst case is one duplicate evaluation, which trips at most once per window.
+   */
+  const markFed = async (phaseId: PhaseId, taskId: TaskId, n: number): Promise<void> => {
+    try {
+      await d.writer.append([{
+        type: "metric", metric: { name: "counter", key: BREAKER_FED, value: 1, labels: { phaseId, taskId, n: String(n) } },
+      }]);
+    } catch (e) {
+      d.log("warn", "breaker-fed marker append failed", e instanceof Error ? e.message : String(e));
     }
   };
 
@@ -317,7 +345,10 @@ export function createUnattendedPolicy(d: UnattendedDeps): UnattendedPolicy {
     if (out.feed !== null && out.feed.phaseId !== "") {
       const t = taskOf(d.writer.ledger, taskId);
       const a = t?.attempts.find((x) => x.nonce === out.feed?.nonce);
-      if (a !== undefined) await recordAttempt(out.feed.phaseId, a);
+      if (a !== undefined) {
+        await recordAttempt(out.feed.phaseId, a);
+        await markFed(out.feed.phaseId, taskId, a.n);
+      }
     }
     return item;
   };

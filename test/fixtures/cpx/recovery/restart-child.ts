@@ -401,6 +401,7 @@ async function main(): Promise<void> {
     slots: pool,
     scheduler: createScheduler(),
     launcher: scriptedLauncher(c, clock),
+    bindings: { bind() {}, evict() {} },
     routes,
     verifier,
     git,

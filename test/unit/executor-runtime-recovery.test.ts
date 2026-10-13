@@ -10,7 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createCapacityController } from "../../src/executor/capacity.js";
 import { createLedgerStore } from "../../src/executor/ledger.js";
 import { taskBranchName } from "../../src/executor/git.js";
-import type { PlanBindInput } from "../../src/executor/launch.js";
+import type { PlanBindInput, PlanRoleBindings } from "../../src/executor/launch.js";
 import { createRecoveryService, type RecoveryEngine } from "../../src/executor/recovery.js";
 import {
   attemptTrailer,
@@ -56,6 +56,7 @@ import {
   type ProcOpts,
   type ProcessResult,
   type QaLoop,
+  type ReconcileAction,
   type ResumeReport,
   type RetainedContextInfo,
   type RouteResolver,
@@ -512,6 +513,18 @@ class HostsDouble implements HostSessions {
   }
 }
 
+/** PlanRoleBindings: records binds and evictions (QA-4.2-18/-23). */
+class BindingsDouble implements PlanRoleBindings {
+  readonly binds: PlanBindInput[] = [];
+  readonly evicted: string[] = [];
+  bind(i: PlanBindInput): void {
+    this.binds.push(i);
+  }
+  evict(childSessionID: string): void {
+    this.evicted.push(childSessionID);
+  }
+}
+
 class VerifierDouble implements SlotVerifier {
   readonly calls: string[] = [];
   readonly queue: Array<{ verdict: Verdict; findings: string }> = [];
@@ -644,6 +657,8 @@ interface Harness {
   git: GitDouble;
   hosts: HostsDouble;
   queueCfg: QueueCfg;
+  /** The launcher's binding port (QA-4.2-18/-23): every bind and evict the runtime made. */
+  bindings: BindingsDouble;
   deps: RuntimeDeps;
   runtime: ExecutorRuntimeHandle;
   parts(): PlanParts;
@@ -701,6 +716,7 @@ async function mk(draft: LedgerV1): Promise<Harness> {
   const hosts = new HostsDouble();
   const verifier = new VerifierDouble();
   const queueCfg: QueueCfg = { halt: false, reject: false };
+  const bindings = new BindingsDouble();
   const others: LedgerWriter[] = [];
   const holder = (sessionID: string): ReturnType<RuntimeDeps["holder"]> => holderOf(sessionID, proc.pid, proc.hostname, clock.iso());
   const deps: RuntimeDeps = {
@@ -725,6 +741,8 @@ async function mk(draft: LedgerV1): Promise<Harness> {
       const c: PlanCollaborators = { queue, policy, qa: new QaDouble() };
       return c;
     },
+    bindings,
+    toplevel: REPO,
     pinOrchestrator: () => () => undefined,
     log: (level, msg, detail) => {
       logs.push(`${level}: ${msg}${detail === undefined ? "" : ` ${JSON.stringify(detail)}`}`);
@@ -745,6 +763,7 @@ async function mk(draft: LedgerV1): Promise<Harness> {
     git,
     hosts,
     queueCfg,
+    bindings,
     deps,
     runtime: createExecutorRuntime(deps),
     parts: () => need(st.parts, "plan collaborators"),
@@ -796,6 +815,8 @@ async function mk(draft: LedgerV1): Promise<Harness> {
         pollMs: POLL_MS,
       });
       deps.recovery = e;
+      // QA-4.2-21: the process's toplevel is the engine's (a foreign-plan test passes another one).
+      deps.toplevel = toplevel;
       return e;
     },
     async crash() {
@@ -1245,6 +1266,8 @@ describe("R2: a completed/verifying/verified task whose slot lost its marker", (
     const old = need(h.task("T1").slot, "slot of T1");
     h.git.dirty = () => false;
     h.git.headBody = `T1: task (attempt 1)\n\n${attemptTrailer(PLAN_ID, "T1", 1, a.nonce)}\n`;
+    // QA-4.2-20: the attempt's commit is found by its trailer before the slot is re-provisioned from the branch.
+    h.git.trailerCommit = HEAD_SHA;
     dropMarker(h, old);
     const mark = h.git.calls.length;
     const logMark = h.log.length;
@@ -1660,19 +1683,14 @@ describe("QA-4.2-17: a plan of another toplevel that start() can open", () => {
 describe("QA-4.2-18: an adopted child is bound again", () => {
   it("recovery re-binds it through the launcher's binding port with its task's role, grant and work root", async () => {
     const h = await mk(planOf([task("T1")]));
-    const binds: PlanBindInput[] = [];
-    h.deps.bindings = {
-      bind: (i) => {
-        binds.push(i);
-      },
-      evict: () => undefined,
-    };
+    const binds = h.bindings.binds;
     await h.begin();
     const run = await h.running("T1", 1, "ses-c1");
     h.hosts.activityValue = "active";
     await h.restart();
     await h.runtime.settled();
     expect(h.state("T1")).toBe("running");
+    expect(h.bindings.evicted).toEqual([]);
     expect(binds).toEqual([
       expect.objectContaining({
         planId: PLAN_ID,
@@ -1685,6 +1703,13 @@ describe("QA-4.2-18: an adopted child is bound again", () => {
         grant: run.req.grant,
       }),
     ]);
+
+    // QA-4.2-23: the re-bound child's binding is evicted once its attempt closes.
+    h.hosts.say("ses-c1", { role: "assistant", text: "Done. Implemented it.", outcome: null });
+    h.hosts.emit({ type: "execution.completed", sessionID: "ses-c1", at: h.clock.iso() });
+    await untilEnqueued(h, "T1");
+    await h.runtime.settled();
+    expect(h.bindings.evicted).toEqual(["ses-c1"]);
   });
 });
 
@@ -1794,6 +1819,485 @@ describe("QA-4.2-8: a commit failure is fed to the breaker after its batch", () 
     expect(h.task("T1").attempts[0]?.context).toContain("git commit failed");
     expect(h.parts().policy.counted).toEqual([expect.objectContaining({ taskId: "T1", n: 1, outcome: "succeeded" })]);
     expect(states).toEqual(["failed"]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// QA-4.2 round 2 (runtime findings)
+// ---------------------------------------------------------------------------------------------------------------
+
+/** The slot `name` vanished from the pool (no marker: R2 sees it invalid). */
+function dropSlotMarker(h: Harness, name: string): void {
+  for (const [owner, l] of [...h.slots.byOwner]) if (l.slot === name) h.slots.byOwner.delete(owner);
+}
+
+/** `git log --all --grep=<trailer>` fails (git cannot tell whether the attempt committed). */
+function trailerSearchFails(h: Harness): void {
+  const run0 = h.git.run.bind(h.git);
+  h.git.run = async (args, o) => {
+    if (args[0] !== "log" || !args.includes("--all")) return run0(args, o);
+    h.git.calls.push({ args: [...args], cwd: o.cwd });
+    return { code: 128, signal: null, stdout: "", stderr: "fatal: bad object", truncated: false, durationMs: 0 };
+  };
+}
+
+/** The breaker-fed markers in the journal, as `<taskId>#<n>`. */
+async function fedMarkers(h: Harness): Promise<string[]> {
+  const out: string[] = [];
+  for (const e of await h.events()) {
+    if (e.type === "metric" && e.metric.name === "counter" && e.metric.key === "breaker-fed") out.push(`${e.metric.labels["taskId"] ?? "?"}#${e.metric.labels["n"] ?? "?"}`);
+  }
+  return out;
+}
+
+describe("QA-4.2-20: R2 of a completed attempt n > 1 whose task branch holds an earlier attempt's commit", () => {
+  it("checks this attempt's trailer first: none -> failed 'slot lost before commit' and retried, never re-provisioned from the old tip", async () => {
+    const plan = planOf([task("T1")]);
+    plan.config = { ...plan.config, maxAttempts: 5 };
+    const h = await mk(plan);
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    // Attempt 1 failed after its commit landed on the task branch (the branch tip is attempt 1's), then retried.
+    await h.parts().writer.append([
+      { type: "attempt-ended", taskId: "T1", n: 1, outcome: "failed", endedAt: h.clock.iso(), detail: "boom" },
+      tr("T1", "running", "failed", "child-failed", "boom"),
+      tr("T1", "failed", "ready", "retry"),
+    ]);
+    h.runtime.onRouterToolCall(ORCH);
+    await h.running("T1", 2, "ses-c2");
+    // Attempt 2 completed (row 15), the process died before its commit; then its slot lost the marker.
+    await h.parts().writer.append([
+      { type: "attempt-ended", taskId: "T1", n: 2, outcome: "succeeded", endedAt: h.clock.iso(), detail: null },
+      tr("T1", "running", "completed", "child-ended"),
+    ]);
+    dropSlotMarker(h, need(h.task("T1").slot, "slot of T1"));
+    h.git.dirty = () => false; // a slot re-provisioned at the branch tip would be clean: "no changes"
+    h.git.trailerCommit = ""; // no commit carries attempt 2's trailer
+    const mark = h.git.calls.length;
+    await h.restart();
+    await h.runOf("T1", 3);
+    expect(h.task("T1").attempts[1]).toMatchObject({ n: 2, outcome: "succeeded", context: "slot lost before commit" });
+    expect(h.git.calls.slice(mark).some((c) => c.args[0] === "switch")).toBe(false);
+    const ev = await h.events();
+    expect(ev.some((e) => e.type === "task-transition" && e.taskId === "T1" && e.to === "done")).toBe(false);
+    expect(ev.filter((e) => e.type === "task-transition" && e.taskId === "T1" && e.from === "completed" && e.to === "failed")).toHaveLength(1);
+  });
+
+  it("git cannot tell whether the attempt committed: one blocking item, nothing moves or is re-provisioned", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await completedThenCrash(h);
+    const old = need(h.task("T1").slot, "slot of T1");
+    dropSlotMarker(h, old);
+    trailerSearchFails(h);
+    const mark = h.git.calls.length;
+    await h.restart();
+    await until(() => h.ledger().inbox.some((i) => i.taskId === "T1" && i.answer === null), "the blocking item");
+    expect(h.state("T1")).toBe("completed");
+    expect(h.task("T1").slot).toBe(old);
+    expect(h.git.calls.slice(mark).some((c) => c.args[0] === "switch" || c.args[0] === "commit")).toBe(false);
+  });
+});
+
+describe("QA-4.2-21: foreignness is the plan's own toplevel", () => {
+  it("a same-repo plan the recover() report missed (a transient error) attaches actively and is reconciled", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.crash();
+    h.hosts.activityValue = "inactive"; // reconciled: lost -> requeued -> relaunched
+    const e = h.engine();
+    e.recover = async () => [];
+    await h.runtime.start();
+    await h.runOf("T1", 2);
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "lost" });
+    expect(await h.runtime.status(PLAN_ID, ORCH)).not.toContain("Foreign:");
+  });
+
+  it("an action that opens a plan of another repository attaches it passively (no queue resume, no tick)", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.crash();
+    h.deps.toplevel = "C:/elsewhere";
+    const logMark = h.log.length;
+    await h.runtime.pause(PLAN_ID, ORCH);
+    await h.runtime.settled();
+    expect(h.log.slice(logMark).filter((l) => l.startsWith("queue.resume"))).toEqual([]);
+    expect(h.launcher.runs).toEqual([]);
+    expect(h.ledger().status).toBe("paused");
+    expect(await h.runtime.status(PLAN_ID, ORCH)).toContain("Foreign:");
+  });
+
+  it("adopt refuses a plan of another repository before closing its passive attachment", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.crash();
+    h.engine("C:/elsewhere");
+    await h.runtime.start();
+    const logMark = h.log.length;
+    await expect(h.runtime.adopt(PLAN_ID, "ses-new")).rejects.toThrow(/another repository/);
+    expect(h.log.slice(logMark)).not.toContain("queue.dispose");
+    expect(await h.runtime.status(PLAN_ID, ORCH)).toContain("Foreign:");
+    expect(h.ledger().orchestrator.sessionID).toBe(ORCH);
+  });
+});
+
+describe("QA-4.2-22: a commit failure carries the breaker-fed marker", () => {
+  it("'no changes' journals breaker-fed for the attempt, so a restart never feeds it again", async () => {
+    const h = await mk(planOf([task("T1", { verify: "required" })]));
+    await h.begin();
+    h.git.dirty = () => false;
+    const run = await h.running("T1", 1, "ses-c1");
+    run.complete("Done.");
+    await h.running("T1", 2, "ses-c2");
+    await until(async () => (await fedMarkers(h)).includes("T1#1"), "the breaker-fed marker of T1#1");
+    await h.restart();
+    const pol = h.parts().policy;
+    expect(pol.counted, JSON.stringify({ counted: pol.counted, sites: pol.sites })).toEqual([]);
+  });
+});
+
+describe("QA-4.2-24: a real completion that races the probation interrupt", () => {
+  it("is processed as completed (no slot reset, no lost end, no relaunch)", async () => {
+    const h = await onProbation();
+    h.hosts.interruptImpl = async (sid) => {
+      h.hosts.say(sid, { role: "assistant", text: "Done. Implemented it.", outcome: null });
+      h.hosts.emit({ type: "execution.completed", sessionID: sid, at: h.clock.iso() });
+    };
+    const mark = h.git.calls.length;
+    await advance(h, LIVENESS_MS - POLL_MS);
+    h.clock.advance(POLL_MS);
+    await untilEnqueued(h, "T1");
+    await h.runtime.settled();
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "succeeded" });
+    expect(endsOf(await h.events(), "T1")).toHaveLength(1);
+    expect(h.git.verbsSince(mark)).not.toContain("reset --hard HEAD");
+    expect(h.launcher.runs).toEqual([]);
+  });
+});
+
+describe("QA-4.2-25: an adopt that fails after the old attachment closed", () => {
+  it("attaches the plan again under its orchestrator; a child ending meanwhile is processed once", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    const e = h.engine();
+    e.adopt = async () => {
+      throw new ExecutorError("E_LOCK_HELD", "held by a live process");
+    };
+    await expect(h.runtime.adopt(PLAN_ID, "ses-new")).rejects.toMatchObject({ code: "E_LOCK_HELD" });
+    expect(h.runtime.planLine(ORCH)).toContain(`plan ${PLAN_ID}:`);
+    expect(h.ledger().orchestrator.sessionID).toBe(ORCH);
+    run.complete("Done. Implemented it.");
+    await untilEnqueued(h, "T1");
+    await h.runtime.settled();
+    expect(endsOf(await h.events(), "T1")).toHaveLength(1);
+    expect(h.logs.filter((l) => /child end processing failed/.test(l))).toEqual([]);
+  });
+});
+
+describe("QA-4.2-26: a held task never waits on a vanished slot", () => {
+  it("the lease item says the task is held and what ends it; a held verified task whose slot record vanished is re-provisioned (R2) and enqueued", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    run.complete("Done.");
+    await untilEnqueued(h, "T1");
+    await h.crash();
+    const reg = foreignLease(h);
+    h.engine();
+    await h.runtime.start();
+    await h.runtime.settled();
+    const item = need(h.parts().policy.raised.find((i) => i.text.includes("could not re-take the leases of T1")), "the lease item");
+    expect(item.text).toContain("T1 is held");
+    expect(item.text).toContain("released");
+    const old = need(h.task("T1").slot, "slot of T1");
+    h.slots.records.delete(old);
+    dropSlotMarker(h, old);
+    reg.held.delete("src/T1.ts");
+    h.runtime.onLeaseReleased();
+    await until(
+      () => h.parts().queue.enqueued.some((ids) => ids.includes("T1")),
+      "T1 re-provisioned and enqueued",
+      () => ({ slot: h.task("T1").slot, raised: h.parts().policy.raised.map((i) => i.text), logs: h.logs }),
+    );
+    expect(h.task("T1").slot).not.toBe(old);
+    expect(h.state("T1")).toBe("verified");
+  });
+});
+
+describe("QA-4.2-28: an idle entry without an outcome is not an end", () => {
+  it("the probation poll does not process it (the context change proves the child alive instead)", async () => {
+    const h = await onProbation();
+    h.hosts.say("ses-c1", { role: "idle", text: null, outcome: null });
+    await advance(h, POLL_MS);
+    expect(h.state("T1")).toBe("running");
+    expect(endsOf(await h.events(), "T1")).toHaveLength(0);
+    expect(h.verifier.calls).toEqual([]);
+  });
+});
+
+describe("QA-4.2 round 2: reachable arms (held tasks)", () => {
+  it("a held completed task commits and verifies once its leases are back (resumeHeldTask, completed)", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await completedThenCrash(h);
+    await h.crash();
+    const reg = foreignLease(h);
+    h.engine();
+    await h.runtime.start();
+    await h.runtime.settled();
+    expect(h.state("T1")).toBe("completed");
+    expect(h.git.calls.some((c) => c.args[0] === "commit")).toBe(false);
+    reg.held.delete("src/T1.ts");
+    h.runtime.onLeaseReleased();
+    await untilEnqueued(h, "T1");
+    expect(h.verifier.calls).toEqual(["T1#1"]);
+  });
+
+  it("a held verifying task is verified once its leases are back (resumeHeldTask, verifying)", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await completedThenCrash(h);
+    // Row 21 landed (the commit's batch), the process died before the verdict.
+    const slot = need(h.task("T1").slot, "slot of T1");
+    await h.parts().writer.append([
+      { type: "task-slot", taskId: "T1", slot, branch: taskBranchName(PLAN_ID, "T1") },
+      tr("T1", "completed", "verifying", "committed"),
+    ]);
+    await h.crash();
+    const reg = foreignLease(h);
+    h.engine();
+    await h.runtime.start();
+    await h.runtime.settled();
+    expect(h.state("T1")).toBe("verifying");
+    expect(h.verifier.calls).toEqual([]);
+    reg.held.delete("src/T1.ts");
+    h.runtime.onLeaseReleased();
+    await untilEnqueued(h, "T1");
+    expect(h.verifier.calls).toEqual(["T1#1"]);
+  });
+
+  it("an interrupt of a held task's child that fails adopts it after all, still held: its end commits only once the leases are back", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.crash();
+    const reg = foreignLease(h);
+    h.hosts.activityValue = "active";
+    h.hosts.interruptImpl = async () => {
+      throw new Error("server unreachable");
+    };
+    h.engine();
+    await h.runtime.start();
+    await h.runtime.settled();
+    expect(h.hosts.interrupts).toEqual(["ses-c1"]);
+    expect(h.state("T1")).toBe("running");
+    expect(endsOf(await h.events(), "T1")).toHaveLength(0);
+    h.hosts.say("ses-c1", { role: "assistant", text: "Done. Implemented it.", outcome: null });
+    h.hosts.emit({ type: "execution.completed", sessionID: "ses-c1", at: h.clock.iso() });
+    await until(() => h.state("T1") === "completed", "T1 completed");
+    await h.runtime.settled();
+    expect(h.git.calls.some((c) => c.args[0] === "commit")).toBe(false);
+    reg.held.delete("src/T1.ts");
+    h.runtime.onLeaseReleased();
+    await untilEnqueued(h, "T1");
+  });
+
+  it("a held ready task (latest lost) does not adopt its live child: interrupted, slot reset, relaunched once the lease is free", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    h.launcher.gateValue = DISPOSED_GATE;
+    await h.parts().writer.append([
+      { type: "attempt-ended", taskId: "T1", n: 1, outcome: "lost", endedAt: h.clock.iso(), detail: "runner-error" },
+      tr("T1", "running", "ready", "child-lost", "runner-error"),
+    ]);
+    await h.crash();
+    const reg = foreignLease(h);
+    h.hosts.activityValue = "active";
+    h.engine();
+    const mark = h.git.calls.length;
+    await h.runtime.start();
+    await h.runtime.settled();
+    expect(h.hosts.interrupts).toContain("ses-c1");
+    expect((await h.events()).some((x) => x.type === "attempt-adopted")).toBe(false);
+    expect(h.git.verbsSince(mark)).toContain("reset --hard HEAD");
+    expect(h.state("T1")).toBe("ready");
+    expect(h.launcher.runs).toEqual([]);
+    reg.held.delete("src/T1.ts");
+    h.runtime.onLeaseReleased();
+    await h.runOf("T1", 2);
+  });
+
+  it("a held ready task without a live child leaves the hold at the first retry (not a held state) and relaunches once the lease is free", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    h.launcher.gateValue = DISPOSED_GATE;
+    await h.parts().writer.append([
+      { type: "attempt-ended", taskId: "T1", n: 1, outcome: "lost", endedAt: h.clock.iso(), detail: "runner-error" },
+      tr("T1", "running", "ready", "child-lost", "runner-error"),
+    ]);
+    await h.crash();
+    const reg = foreignLease(h);
+    h.hosts.activityValue = "inactive"; // the child is gone: nothing to adopt, the scheduler relaunches
+    h.engine();
+    await h.runtime.start();
+    await h.runtime.settled();
+    expect(h.state("T1")).toBe("ready");
+    expect(h.launcher.runs).toEqual([]);
+    reg.held.delete("src/T1.ts");
+    h.runtime.onLeaseReleased();
+    await h.runOf("T1", 2);
+    expect((await h.events()).some((x) => x.type === "attempt-adopted")).toBe(false);
+  });
+
+  it("a throwing lease rebuild retry is logged, the task stays held and the next retry succeeds", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    run.complete("Done.");
+    await untilEnqueued(h, "T1");
+    await h.crash();
+    const reg = foreignLease(h);
+    h.engine();
+    await h.runtime.start();
+    await h.runtime.settled();
+    const acquire0 = reg.acquireWrite.bind(reg);
+    reg.acquireWrite = () => {
+      throw new Error("registry down");
+    };
+    h.runtime.onLeaseReleased();
+    await until(() => h.logs.some((l) => l.includes("lease rebuild retry failed")), "the logged rebuild failure");
+    expect(h.parts().queue.enqueued).toEqual([]);
+    reg.acquireWrite = acquire0;
+    reg.held.delete("src/T1.ts");
+    h.runtime.onLeaseReleased();
+    await until(() => h.parts().queue.enqueued.some((ids) => ids.includes("T1")), "T1 enqueued");
+  });
+});
+
+describe("QA-4.2 round 2: reachable arms (close, resume, breaker, adopt, start)", () => {
+  it("disposeQueue: a throwing queue dispose is logged and the plan still closes", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    h.parts().queue.dispose = async () => {
+      throw new Error("lanes stuck");
+    };
+    await h.runtime.dispose();
+    expect(h.logs.some((l) => l.includes("integration queue dispose failed") && l.includes("lanes stuck"))).toBe(true);
+  });
+
+  it("disposeQueue: a queue that never disposes is abandoned after QUEUE_DISPOSE_MS on the injected clock", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    h.parts().queue.disposeGate = new Promise<void>(() => undefined);
+    const disposing = h.runtime.dispose();
+    await until(() => h.log.includes("queue.dispose"), "the queue dispose call");
+    h.clock.advance(10_000);
+    await disposing;
+    expect(h.logs.some((l) => l.includes("did not dispose in 10000 ms"))).toBe(true);
+  });
+
+  it("a rejected queue.resume() on an already-paused plan raises the critical item (the plan stays paused)", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.runtime.pause(PLAN_ID, ORCH);
+    h.queueCfg.reject = true;
+    await h.restart();
+    expect(h.ledger().status).toBe("paused");
+    expect(h.ledger().inbox.filter((i) => i.answer === null && i.severity === "critical" && i.text.includes("could not resume"))).toHaveLength(1);
+  });
+
+  it("the breaker step feeds nothing when the history export fails, nor when every phase is paused", async () => {
+    for (const variant of ["export-fails", "all-paused"] as const) {
+      const h = await mk(planOf([task("T1")]));
+      await h.begin();
+      await h.running("T1", 1, "ses-c1");
+      if (variant === "all-paused") {
+        const phaseId = need(h.task("T1").phase, "phase of T1");
+        await h.parts().writer.append([{ type: "phase-paused", phaseId, paused: true, reason: "breaker" }]);
+      }
+      // Row 16 landed, the process died before `recordAttempt` (B5 would feed it at the next activation).
+      await h.parts().writer.append([
+        { type: "attempt-ended", taskId: "T1", n: 1, outcome: "failed", endedAt: h.clock.iso(), detail: "boom" },
+        { type: "attempt-context", taskId: "T1", n: 1, context: "boom" },
+        tr("T1", "running", "failed", "child-failed", "boom"),
+      ]);
+      const export0 = h.store.exportPlan.bind(h.store);
+      if (variant === "export-fails") {
+        h.store.exportPlan = async () => {
+          throw new Error("journal unreadable");
+        };
+      }
+      await h.restart();
+      h.store.exportPlan = export0;
+      expect(h.parts().policy.counted, variant).toEqual([]);
+      if (variant === "export-fails") expect(h.logs.some((l) => l.includes("breaker journal read failed"))).toBe(true);
+    }
+  });
+
+  it("adopt: an unreadable ledger is left to recovery (logged), and a plan awaiting residue is refused", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.crash();
+    h.engine();
+    const read0 = h.store.read.bind(h.store);
+    h.store.read = async (id) => ({ ...(await read0(id)), status: "awaiting-residue" as const });
+    await expect(h.runtime.adopt(PLAN_ID, "ses-new")).rejects.toThrow(/never adopted/);
+    const st = { fail: true };
+    h.store.read = async (id) => {
+      if (st.fail) {
+        st.fail = false;
+        throw new Error("disk busy");
+      }
+      return read0(id);
+    };
+    await h.runtime.adopt(PLAN_ID, "ses-new");
+    h.store.read = read0;
+    expect(h.logs.some((l) => l.includes("not readable before recovery"))).toBe(true);
+    expect(h.runtime.planLine("ses-new")).toContain(`plan ${PLAN_ID}:`);
+  });
+
+  it("start: a recover() report without full feeds is not reused (the runtime reconciles), nor is one from a service without reconcile", async () => {
+    const strip = (a: ReconcileAction): ReconcileAction => {
+      if (!("orphans" in a)) return a;
+      const { orphans, ...rest } = a;
+      void orphans;
+      return rest;
+    };
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.crash();
+    h.hosts.activityValue = "active";
+    const e = h.engine();
+    const recover0 = e.recover.bind(e);
+    const reconcile0 = e.reconcile.bind(e);
+    const calls = { reconcile: 0 };
+    e.recover = async () => (await recover0()).map((r) => ({ planId: r.planId, actions: r.actions.map(strip) }));
+    e.reconcile = async (l, tracked) => {
+      calls.reconcile += 1;
+      return reconcile0(l, tracked);
+    };
+    await h.runtime.start();
+    await h.runtime.settled();
+    expect(calls.reconcile).toBe(1);
+    expect(h.state("T1")).toBe("running");
+
+    await h.crash();
+    h.deps.recovery = {
+      recover: async () => [{ planId: PLAN_ID, actions: [] }],
+      adopt: async () => undefined,
+    };
+    await h.runtime.start();
+    await h.runtime.settled();
+    expect(h.runtime.planLine(ORCH)).toContain(`plan ${PLAN_ID}:`);
+    expect(h.state("T1")).toBe("running");
   });
 });
 

@@ -259,6 +259,8 @@ async function boot(): Promise<Rig> {
       pinOrchestrator: (sessionID) => host.pinOrchestrator(sessionID),
       log: (level, msg) => { rig.log.push(`${level}: ${msg}`); },
       config: () => executorDefaults(),
+      // QA-4.2-23: the same binding port as the launcher's (recovery re-binds adopted children through it).
+      bindings: host.bindings,
     });
     const built = { runtime, launcher };
     rig.executor.value = built;

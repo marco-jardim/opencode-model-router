@@ -1,10 +1,10 @@
 // QA-4.2-2: the executor's `HostSessions.context` adapter over the v2 host's real history shape (memo R1 rule 5, amended):
 // an explicit terminal `idle` entry exists only when the host's history shows the child ended, with the real end outcome.
+// QA-4.2-27: that end comes from `childHistoryEnd`, the one end rule background's recovery (`childEndState`) also uses.
 import { describe, expect, it } from "vitest";
-import { executorHostContext } from "../../src/compat/v2-hooks";
+import { childHistoryEnd, executorHostContext, historyEntryKind } from "../../src/compat/v2-hooks";
 import { classifyChild } from "../../src/executor/recovery";
 import { formatLaunchPrompt } from "../../src/executor/types";
-
 import { PLAN_ID, nonceFor } from "../fixtures/cpx/ledger/builders.js";
 
 const PREAMBLE = "You are a subagent spawned by another session.";
@@ -58,6 +58,65 @@ describe("executorHostContext (QA-4.2-2)", () => {
     expect(executorHostContext(undefined)).toEqual({ messages: [] });
   });
 
+  it("QA-4.2-27: a completed step without text is an end (succeeded), as the live launcher treats it", () => {
+    for (const step of [
+      { type: "assistant", finish: "stop", time: { created: 1, completed: 2 } },
+      { type: "assistant", time: { created: 1, completed: 2 }, parts: [{ type: "tool", tool: "bash", state: { status: "completed" } }] },
+      { type: "assistant", info: { finish: "stop" } },
+    ]) {
+      const c = executorHostContext([user(prompt()), step]);
+      expect(c.messages.at(-2)).toEqual({ role: "assistant", text: null, outcome: null });
+      expect(c.messages.at(-1)).toEqual({ role: "idle", text: null, outcome: "succeeded" });
+    }
+  });
+
+  it("QA-4.2-27: one entry-kind precedence for the mapping and the end rule", () => {
+    // `type: "synthetic"` wins over a `role`; assistant (either field) over user; a model-facing `role` entry counts.
+    expect(historyEntryKind({ type: "synthetic", role: "user" })).toBe("synthetic");
+    expect(historyEntryKind({ type: "synthetic", role: "assistant" })).toBe("synthetic");
+    expect(historyEntryKind({ role: "assistant" })).toBe("assistant");
+    expect(historyEntryKind({ type: "user", role: "assistant" })).toBe("assistant");
+    expect(historyEntryKind({ role: "user" })).toBe("user");
+    expect(historyEntryKind({ type: "tool" })).toBe("other");
+    expect(historyEntryKind(null)).toBe("other");
+    const c = executorHostContext([
+      { role: "user", content: [{ type: "text", text: prompt() }] },
+      { role: "assistant", content: [{ type: "text", text: "REPORT" }], finish: "stop" },
+      { type: "synthetic", role: "user", text: "[router] notice" },
+    ]);
+    expect(c.messages.map((m) => [m.role, m.text, m.outcome])).toEqual([
+      ["user", prompt(), null], ["assistant", "REPORT", null], ["assistant", null, null], ["idle", null, "succeeded"],
+    ]);
+  });
+});
+
+describe("childHistoryEnd (QA-4.2-27: the one end rule of background and the executor)", () => {
+  it("no entry but synthetic ones is none", () => {
+    expect(childHistoryEnd([])).toEqual({ kind: "none" });
+    expect(childHistoryEnd(undefined)).toEqual({ kind: "none" });
+    expect(childHistoryEnd([synthetic("x")])).toEqual({ kind: "none" });
+  });
+
+  it("a user or tool turn last, or a step without its end, is open", () => {
+    expect(childHistoryEnd([user(prompt())])).toEqual({ kind: "open" });
+    expect(childHistoryEnd([user(prompt()), midTool()])).toEqual({ kind: "open" });
+    expect(childHistoryEnd([user(prompt()), midTool(), tool()])).toEqual({ kind: "open" });
+    expect(childHistoryEnd([user(prompt()), { type: "assistant", text: "partial", finish: "tool-calls" }])).toEqual({ kind: "open" });
+    expect(childHistoryEnd([user(prompt()), finished("REPORT"), user("again")])).toEqual({ kind: "open" });
+  });
+
+  it("an ended step reports its outcome and its text (absent when it has none)", () => {
+    expect(childHistoryEnd([user(prompt()), finished("REPORT"), synthetic("n")])).toEqual({ kind: "ended", outcome: "succeeded", text: "REPORT" });
+    expect(childHistoryEnd([user(prompt()), { type: "assistant", finish: "stop" }])).toEqual({ kind: "ended", outcome: "succeeded", text: undefined });
+    expect(childHistoryEnd([user(prompt()), { type: "assistant", text: "half", error: "boom" }])).toEqual({ kind: "ended", outcome: "failed", text: "half" });
+    expect(childHistoryEnd([user(prompt()), { type: "assistant", error: { name: "MessageAbortedError" } }]))
+      .toEqual({ kind: "ended", outcome: "interrupted", text: undefined });
+    expect(childHistoryEnd([user(prompt()), { type: "assistant", info: { error: "request cancelled" } }]))
+      .toEqual({ kind: "ended", outcome: "interrupted", text: undefined });
+  });
+});
+
+describe("recovery over the adapter (QA-4.2-1, QA-4.2-2)", () => {
   it("recovery over the adapter: a running child with the host preamble is alive, a killed-mid-tool one is never finished", () => {
     const expectHdr = { planId: HEADER.planId, taskId: HEADER.taskId, n: HEADER.attempt, nonce: HEADER.nonce };
     const info = { id: "child", parentID: "parent" };
