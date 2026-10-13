@@ -829,6 +829,16 @@ export const SESSION_DIR_NEGATIVE_TTL_MS = 2_000;
  */
 export const SESSION_KIND_NEGATIVE_TTL_MS = 2_000;
 /**
+ * DF-1.1-4: the lease registry's `repoKeyOf` seam. Write keys are per checkout (`repo` = the work tree), so ordinary writers
+ * of one repo-relative path in two linked worktrees of a repository never refuse each other. `shared` (the common git
+ * directory every linked worktree has) keeps the leases of plan tasks (`until-integrated`) repository-wide: the tasks of a
+ * plan are integrated into one branch.
+ */
+export function leaseRepoKeyOf(dir: string): { repo: string; tree: string; shared: string } | undefined {
+  const id = repositoryIdentity(dir);
+  return id === undefined ? undefined : { repo: id.tree, tree: id.tree, shared: id.repo };
+}
+/**
  * QA-DF1-23 (DF-1-9): the background decision waits at most this long for the kind of an unrecorded parent; past it the parent
  * is no root (the dispatch stays foreground). Short: the dispatch's `execute.before` waits for it.
  */
@@ -2121,7 +2131,7 @@ export async function registerV2Hooks(
       const snapshotPath = join(outcomesDir, "leases.json");
       const handle = acquireLeaseRegistry({
         runMode: startRouting.leases.run,
-        seams: { realpath: (path) => realpathSync.native(path), repoKeyOf: repositoryIdentity, now: nowMs },
+        seams: { realpath: (path) => realpathSync.native(path), repoKeyOf: leaseRepoKeyOf, now: nowMs },
         snapshotPath, logger: ingestLogger,
       });
       leaseHandle = handle;

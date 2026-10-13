@@ -108,6 +108,26 @@ const child = (holderID: string, tree: string, extra: Partial<HolderInput> = {})
 });
 const A = child("A", "/w1");
 const B = child("B", "/w1");
+
+/**
+ * DF-1.1-4: a rig whose seam answers like the v2 adapter's: the write key is scoped by the checkout (`repo` = the tree)
+ * and `shared` names the repository the checkouts belong to (`/w1` and `/w2` are two worktrees of `R`).
+ */
+function checkoutRig(): Rig {
+  const fs = fakeFs(VIRTUAL_DIRS);
+  const clock = { now: 1_000 };
+  const byTree = repoMap(VIRTUAL_TREES);
+  const seams: LeaseSeams = {
+    realpath: (p) => fs.realpath(p),
+    repoKeyOf: (dir) => {
+      const id = byTree(dir);
+      return id === undefined ? undefined : { repo: id.tree, tree: id.tree, shared: id.repo };
+    },
+    now: () => clock.now,
+  };
+  const reg = createLeaseRegistry(seams, { runMode: "annotate", platform: "linux" });
+  return { reg, fs, clock, seams };
+}
 const C = child("C", "/w2");
 const ROOT: HolderInput = { holderID: "root", tree: "/w1", isChild: false, scope: "until-complete" };
 const actor = (h: HolderInput) => ({ holderID: h.holderID, tree: h.tree, isChild: h.isChild });
@@ -2272,6 +2292,85 @@ describe("QA-1.3-34: units whose upper case is longer", () => {
     const { reg } = winRig();
     expect(reg.acquireWrite(WA, "C:\\Repo\\src\\a\u1fb3.ts")).toMatchObject({ ok: true });
     expect(reg.acquireWrite(WB, "C:\\Repo\\src\\A\u1fbc.TS")).toMatchObject({ ok: false, reason: "held" });
+  });
+});
+
+describe("DF-1.1-4: write keys per checkout, plan tasks repository-wide", () => {
+  const P1 = child("P1", "/w1", { taskRef: "T1", scope: "until-integrated" });
+  const P2 = child("P2", "/w2", { taskRef: "T2", scope: "until-integrated" });
+  const heldBy = (result: unknown): string | undefined =>
+    (result as { holders?: Holder[] }).holders?.[0]?.holderID;
+
+  it("two ordinary children editing one repo-relative path in two worktrees are both allowed", () => {
+    const { reg } = checkoutRig();
+    expect(reg.acquireWrite(child("A", "/w1"), "/w1/src/x.ts")).toMatchObject({ ok: true, leased: ["/w1/src/x.ts"] });
+    expect(reg.acquireWrite(child("B", "/w2"), "/w2/src/x.ts")).toMatchObject({ ok: true, leased: ["/w2/src/x.ts"] });
+    expect(reg.checkRead({ holderID: "B", tree: "/w2", isChild: true }, "/w2/src/x.ts")).toEqual({ ok: true });
+    expect(reg.acquireWrite(child("A", "/w1"), null)).toMatchObject({ ok: true });
+  });
+
+  it("keeps every conflict within one checkout", () => {
+    const { reg } = checkoutRig();
+    expect(reg.acquireWrite(child("A", "/w1"), "/w1/src/x.ts")).toMatchObject({ ok: true });
+    expect(reg.acquireWrite(child("B", "/w1"), "/w1/src/x.ts")).toMatchObject({ ok: false, reason: "held", key: `r:/w1${NUL}src/x.ts` });
+    expect(reg.acquireWrite({ holderID: "root", tree: "/w1", isChild: false, scope: "until-complete" }, "/w1/src/x.ts")).toMatchObject({ ok: false, reason: "held" });
+    expect(reg.checkRead({ holderID: "B", tree: "/w1", isChild: true }, "/w1/src/x.ts")).toMatchObject({ ok: false, reason: "underEdit" });
+    expect(reg.acquireWrite(child("B", "/w1"), null)).toMatchObject({ ok: false, reason: "unknown-target" });
+  });
+
+  it("refuses a plan task the path another plan task holds in another worktree of the repository", () => {
+    const { reg } = checkoutRig();
+    expect(reg.acquireWrite(P1, "/w1/src/x.ts")).toMatchObject({ ok: true });
+    const second = reg.acquireWrite(P2, "/w2/src/x.ts");
+    expect(second).toMatchObject({ ok: false, reason: "held", path: "/w2/src/x.ts", key: `r:/w1${NUL}src/x.ts` });
+    expect(heldBy(second)).toBe("P1");
+    expect(reg.acquireWrite(P2, null)).toMatchObject({ ok: false, reason: "unknown-target" });
+    expect(reg.acquireWrite(P2, "/w2/src/other.ts")).toMatchObject({ ok: true });
+    expect(reg.releaseTask("T1").holders).toEqual(["P1"]);
+    expect(reg.acquireWrite(P2, "/w2/src/x.ts")).toMatchObject({ ok: true });
+  });
+
+  it("a plan task and an ordinary child meet only in one checkout", () => {
+    const { reg } = checkoutRig();
+    expect(reg.acquireWrite(P1, "/w1/src/x.ts")).toMatchObject({ ok: true });
+    expect(reg.acquireWrite(child("B", "/w2"), "/w2/src/x.ts")).toMatchObject({ ok: true });
+    expect(heldBy(reg.acquireWrite(child("C", "/w1"), "/w1/src/x.ts"))).toBe("P1");
+    expect(heldBy(reg.acquireWrite(P2, "/w2/src/x.ts"))).toBe("P1");
+    expect(reg.acquireWrite(child("B", "/w2"), null)).toMatchObject({ ok: true });
+  });
+
+  it("the sessions of one plan task, and plan tasks of another repository, do not conflict", () => {
+    const { reg } = checkoutRig();
+    expect(reg.acquireWrite(P1, "/w1/src/x.ts")).toMatchObject({ ok: true });
+    expect(reg.acquireWrite(child("P1-retry", "/w2", { taskRef: "T1", scope: "until-integrated" }), "/w2/src/x.ts")).toMatchObject({ ok: true });
+    expect(reg.acquireWrite(child("PS", "/s1", { taskRef: "TS", scope: "until-integrated" }), "/s1/src/x.ts")).toMatchObject({ ok: true });
+  });
+
+  it("the snapshot keeps the shared repository, and restore validates it", () => {
+    const { reg } = checkoutRig();
+    expect(reg.acquireWrite(P1, "/w1/src/x.ts")).toMatchObject({ ok: true });
+    const snap = reg.snapshot();
+    expect(snap.leases).toEqual([
+      { logical: `r:/w1${NUL}src/x.ts`, physical: "/w1/src/x.ts", tree: "/w1", holderID: "P1", display: "/w1/src/x.ts", shared: "R" },
+    ]);
+    const next = checkoutRig().reg;
+    expect(next.restore(snap, { dropCompleteHolders: true })).toEqual({ ok: true, leases: 1 });
+    expect(heldBy(next.acquireWrite(P2, "/w2/src/x.ts"))).toBe("P1");
+    const line = pick(snap.leases, 0);
+    for (const shared of [5, "", "r\\x"]) {
+      expect(next.restore({ ...snap, leases: [{ ...line, shared }] })).toMatchObject({ ok: false, reason: "invalid-snapshot" });
+    }
+    expect(next.restore({ ...snap, leases: [{ logical: `x:/out/src/x.ts`, physical: "/out/src/x.ts", tree: null, holderID: "P1", display: "/out/src/x.ts", shared: "R" }] })).toMatchObject({
+      ok: false,
+      reason: "invalid-snapshot",
+      message: expect.stringContaining("invalid shared repository"),
+    });
+    const twoShared = { ...snap, holders: [...snap.holders, { ...pick(snap.holders, 0), holderID: "P1b" }] };
+    expect(next.restore({ ...twoShared, leases: [line, { ...line, holderID: "P1b", shared: "Q" }] })).toMatchObject({
+      ok: false,
+      reason: "invalid-snapshot",
+      message: expect.stringContaining("two shared repositories"),
+    });
   });
 });
 
