@@ -384,6 +384,25 @@ Everything else is work: resolve it, record it, continue.
 rounds, fast-forwarded into `cpx/main` at `a7889e2` (report `docs\qa\critical-path-execution\sync-1.md`). The p51
 worktree created before the sync is recreated from the synced `cpx/main`; the 5.1 pre-flight is redone.
 
+**DF-2 switch (2026-10-13), next action "DF-2 self-check":**
+- Owner approved the global override (written; backup `opencode-model-router.overrides.jsonc.bak-df2-*`). Project
+  override (`D:\git\omr-cpx-main\.opencode\`, gitignored; backup `.bak-df2`): `pendingTtlMs` 86400000 (DF1.2, removed by
+  DF2.4.a), `graderTimeoutMs` 600000, `routing.executor.capacityCooldownMs` 600000.
+- Tag `cpx/df2` = `f3af7c7` (pushed). Dogfood worktree `D:\git\omr-cpx-dogfood-df2` at `cpx/df2`, `npm ci` done.
+- DF2.1.b: scratch `D:\git\omr-cpx-scratch` recreated detached at `cpx/main` (the old DF-1.1 scratch, with an untracked
+  `docs/dogfood-probe.md` probe leftover, was removed). Runner `ses_ec935cbc0ffeweHZssJjXOOQ4S` returned unverified with
+  handle **`vrf_3f3b162e6a59c7d5dc6b7668`** (not verified; DF2.4.a verifies it after the restart).
+- Plugin entry: `%LOCALAPPDATA%\omr-cpx\opencode-config\opencode.json` now points at `D:\git\omr-cpx-dogfood-df2`
+  (copy saved as `opencode.json.df1.3.bak`).
+- **Revert:** `Copy-Item "$env:LOCALAPPDATA\omr-cpx\opencode-config\opencode.json.df1.3.bak" "$env:LOCALAPPDATA\omr-cpx\opencode-config\opencode.json" -Force`, then restart with the command below.
+- **Restart (DF2.3), same session `ses_ece022575ffeHA4667snTmxoLu`:** close the plan's OpenCode window, then in a new pwsh:
+  `$env:OPENCODE_CONFIG_DIR = "$env:LOCALAPPDATA\omr-cpx\opencode-config"; $env:XDG_DATA_HOME = "$env:LOCALAPPDATA\omr-cpx\xdg-data"; $env:XDG_STATE_HOME = "$env:LOCALAPPDATA\omr-cpx\xdg-state"; $env:OPENCODE_V2_BIN = "C:\Users\Marquinho\AppData\Local\omr-cpx\bin\opencode2-2.0.26\opencode.exe"; & $env:OPENCODE_V2_BIN --standalone D:\git\omr-cpx-main -s ses_ece022575ffeHA4667snTmxoLu`
+  and type `continue`.
+- After the restart: DF2.4.0 (run-scoped self-check: entrypoint `file:///D:/git/omr-cpx-dogfood-df2/server.ts`, HEAD
+  `f3af7c7`, one `router_verify`), DF2.4.a (`router_verify` on the handle above, then drop `pendingTtlMs`), DF2.4.b
+  (`router_plan` and `/plan` exist, recovery ran once with no ledgers), DF2.4.c (compile the whole plan, compare with
+  the numbers below, abort the draft, remove the scratch worktree), then DF2.5.
+
 **DF-2 pre-flight record (2026-10-13):**
 - Smokes on `cpx/main` `39067ce`: `smoke:cpx` 57/57, `smoke:cpx:provision` 4/4, `smoke:v2` 2/2.
 - `origin/master` still `6ec3faa`: the owner's `tiers.json` change is not on master; nothing to sync. DF-2 runs on the
