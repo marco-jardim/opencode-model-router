@@ -1,9 +1,40 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { randomBytes } from "node:crypto";
 import type { Plugin } from "@opencode/plugin";
 import type { ToolContext } from "@opencode/plugin/promise/tool";
 import type { SessionContext } from "@opencode/plugin/promise/session";
-import { ResumeRejectedError, type ChildSessionRunner } from "./child-session";
+import { ResumeRejectedError, type ChildSessionRequest, type ChildSessionRunner } from "./child-session";
 import { markRunnerDispatch, runnerDescription } from "../router/sessions";
+import {
+  ContextSupersededError,
+  type ChildRunner,
+  type ContextRef,
+  type RetainedContextInfo,
+} from "../executor/types";
+
+/**
+ * A detached run (3.1.5, memo M30): pinned to a context the executor captured earlier (`context`), owned by the
+ * executor's own `signal`, and never forwarding progress to the parent call. With `detached` absent the request is
+ * the plain one. `model.variant` also accepts `null`, the executor's spelling of "no variant".
+ */
+export type V2RunRequest = Omit<ChildSessionRequest, "model"> & {
+  model?: { providerID: string; modelID: string; variant?: string | null };
+  detached?: true;
+  context?: ContextRef;
+};
+
+/** The v2 runner: the legacy child-session surface, the executor's `ChildRunner`, and pinning of retained contexts. */
+export type V2ChildRunner = ChildSessionRunner & ChildRunner & {
+  /** Keeps the session's retained context out of the LRU until the returned function is called. Nests. */
+  pin(sessionID: string): () => void;
+};
+
+export interface V2RuntimeOptions {
+  /** Tests only: fixes the process identity (16 lowercase hex). */
+  bootID?: string;
+  /** Tests only: the clock behind `RetainedContextInfo.capturedAt`. */
+  now?: () => number;
+}
 
 export const V2_GRADER_AGENT = "model-router-grader";
 const RETAINED_CONTEXT_LIMIT = 500;
@@ -11,13 +42,22 @@ const RETAINED_CONTEXT_LIMIT = 500;
 export const STRAY_CLEANUP_TIMEOUT_MS = 2_000;
 
 /** The small v1 client surface still used by the shared hooks. */
-export function createV2Runtime(ctx: Plugin.Context) {
-  type ToolScope = { context: ToolContext; active: boolean };
+export function createV2Runtime(ctx: Plugin.Context, options: V2RuntimeOptions = {}) {
+  type ToolScope = { context: ToolContext; active: boolean; info: RetainedContextInfo };
+  const refOf = (info: RetainedContextInfo): ContextRef => ({ bootID: info.bootID, epoch: info.epoch, callID: info.callID });
+  const nowMs = options.now ?? Date.now;
   const currentTool = new AsyncLocalStorage<ToolScope>();
   const retainedContexts = new Map<string, ToolScope>();
   const lifetime = new AbortController();
   const childSystems = new Map<string, string>();
   const activeChildren = new Map<string, AbortController>();
+  /** Identifies this runtime instance; part of every captured context identity (memo 3.1.1 M21). */
+  const bootID = options.bootID ?? randomBytes(8).toString("hex");
+  /** One counter per instance, shared by all sessions, so `<bootID>:<epoch>` is unique. */
+  let captureEpoch = 0;
+  /** Sessions whose retained context the LRU must not evict (M23); a count per session so pins nest. */
+  const pinned = new Map<string, number>();
+  const captureListeners = new Set<(info: RetainedContextInfo) => void>();
 
   const interrupt = async (sessionID: string, signal?: AbortSignal) => {
     activeChildren.get(sessionID)?.abort();
@@ -93,16 +133,49 @@ export function createV2Runtime(ctx: Plugin.Context) {
     }
   };
 
-  const childRunner: ChildSessionRunner = {
-    async run(request) {
+  const childRunner: V2ChildRunner = {
+    bootID,
+    retainedContext(sessionID) {
+      return retainedContexts.get(sessionID)?.info ?? null;
+    },
+    onContextCaptured(listener) {
+      captureListeners.add(listener);
+      return () => { captureListeners.delete(listener); };
+    },
+    pin(sessionID) {
+      pinned.set(sessionID, (pinned.get(sessionID) ?? 0) + 1);
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        const left = (pinned.get(sessionID) ?? 1) - 1;
+        if (left > 0) pinned.set(sessionID, left);
+        else pinned.delete(sessionID);
+      };
+    },
+    async run(request: V2RunRequest) {
       lifetime.signal.throwIfAborted();
+      const detached = request.detached === true;
+      let detachedScope: ToolScope | undefined;
+      if (detached) {
+        // The executor's pinned capture, checked before any host call (memo M30.3): it is the retained entry or nothing.
+        const wanted = request.context;
+        if (!wanted || !request.signal || !request.parentSessionID) {
+          throw new Error("[model-router] a detached child run requires a parent session, a pinned context and a signal");
+        }
+        const entry = retainedContexts.get(request.parentSessionID);
+        if (!entry || entry.info.bootID !== wanted.bootID || entry.info.epoch !== wanted.epoch || entry.info.callID !== wanted.callID) {
+          throw new ContextSupersededError(wanted, entry ? refOf(entry.info) : null);
+        }
+        detachedScope = entry;
+      }
       const current = currentTool.getStore();
       // A shared background worker can run in a different caller's async
       // scope. Only a real context previously observed for the requested
       // parent may authorize that dispatch; never manufacture call/message IDs.
-      const scope = request.parentSessionID && request.parentSessionID !== current?.context.sessionID
+      const scope = detachedScope ?? (request.parentSessionID && request.parentSessionID !== current?.context.sessionID
         ? retainedContexts.get(request.parentSessionID)
-        : current;
+        : current);
       if (!scope) throw new Error("[model-router] v2 child dispatch requires an active tool context or a retained context matching its parent");
       const toolContext = scope.context;
       // Retained-scope permission prompts remain attributed to the originating
@@ -114,7 +187,7 @@ export function createV2Runtime(ctx: Plugin.Context) {
       // deadline and plugin lifetime govern cancellation once that call ends.
       const signal = AbortSignal.any([
         lifetime.signal, controller.signal,
-        ...(scope.active ? [toolContext.signal] : []),
+        ...(scope.active && !detached ? [toolContext.signal] : []),
         ...(request.signal ? [request.signal] : []),
       ]);
       signal.throwIfAborted();
@@ -201,7 +274,7 @@ export function createV2Runtime(ctx: Plugin.Context) {
             if (typeof sessionID === "string" && sessionID === childID) await confirmChild(sessionID);
             // V2 rejects progress outside a running call. Deferred/queued graders
             // retain settled parent contexts; also tolerate settlement during progress.
-            if (scope.active) {
+            if (scope.active && !detached) {
               try { await toolContext.progress(metadata); }
               catch (error) { if (scope.active) throw error; }
             }
@@ -253,12 +326,31 @@ export function createV2Runtime(ctx: Plugin.Context) {
      */
     async withToolContext<T>(context: ToolContext, operation: () => Promise<T>, options?: { retain?: boolean }): Promise<T> {
       lifetime.signal.throwIfAborted();
-      const scope = { context, active: true };
-      if (options?.retain !== false) {
+      const retain = options?.retain !== false;
+      const info: RetainedContextInfo = {
+        sessionID: context.sessionID,
+        callID: context.id,
+        messageID: context.messageID,
+        agent: context.agent,
+        capturedAt: new Date(nowMs()).toISOString() as RetainedContextInfo["capturedAt"],
+        bootID,
+        // A rebuilt context (retain: false) is not a capture: it neither advances the epoch nor notifies listeners.
+        epoch: retain ? ++captureEpoch : captureEpoch,
+      };
+      const scope: ToolScope = { context, active: true, info };
+      if (retain) {
         retainedContexts.delete(context.sessionID);
         retainedContexts.set(context.sessionID, scope);
-        while (retainedContexts.size > RETAINED_CONTEXT_LIMIT) {
-          retainedContexts.delete(retainedContexts.keys().next().value!);
+        // The least recently captured unpinned session goes first (M23); pinned sessions are skipped, so a pinned
+        // orchestrator can let the map exceed the limit by the number of pins.
+        if (retainedContexts.size > RETAINED_CONTEXT_LIMIT) {
+          for (const sessionID of retainedContexts.keys()) {
+            if (retainedContexts.size <= RETAINED_CONTEXT_LIMIT) break;
+            if (!pinned.has(sessionID)) retainedContexts.delete(sessionID);
+          }
+        }
+        for (const listener of [...captureListeners]) {
+          try { listener(info); } catch { /* a listener never breaks the tool call */ }
         }
       }
       try {
@@ -278,6 +370,8 @@ export function createV2Runtime(ctx: Plugin.Context) {
     },
     async dispose(): Promise<void> {
       lifetime.abort();
+      captureListeners.clear();
+      pinned.clear();
       const sessions = [...activeChildren.keys()];
       retainedContexts.clear();
       childSystems.clear();

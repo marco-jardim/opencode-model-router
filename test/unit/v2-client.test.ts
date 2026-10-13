@@ -40,6 +40,124 @@ function fixture() {
   return { context, runtime, toolContext, execute };
 }
 
+describe("v2 runner: retained context identity and detached runs (3.1.5)", () => {
+  const withCall = (runtime: ReturnType<typeof createV2Runtime>, base: ToolContext, over: Record<string, unknown> = {}) =>
+    runtime.withToolContext({ ...base, ...over } as unknown as ToolContext, async () => undefined);
+  const detachedRequest = (context: { bootID: string; epoch: number; callID: string }, over: Record<string, unknown> = {}) => ({
+    parentSessionID: "parent", prompt: "do it", agent: "coder",
+    model: { providerID: "p", modelID: "m", variant: null },
+    cwd: "/work/slot", signal: new AbortController().signal, detached: true as const, context,
+    onCreated: vi.fn(async () => {}),
+    ...over,
+  });
+
+  it("records epoch, capturedAt and bootID per capture and notifies listeners synchronously", async () => {
+    const { context, toolContext } = fixture();
+    const runtime = createV2Runtime(context as unknown as Plugin.Context, { bootID: "0123456789abcdef", now: () => Date.parse("2026-02-03T04:05:06.000Z") });
+    const seen: unknown[] = [];
+    const off = runtime.childRunner.onContextCaptured((info) => { seen.push(info); });
+    runtime.childRunner.onContextCaptured(() => { throw new Error("a listener never breaks the call"); });
+    await withCall(runtime, toolContext);
+    await withCall(runtime, toolContext, { id: "call-2" });
+    expect(runtime.childRunner.bootID).toBe("0123456789abcdef");
+    expect(seen).toEqual([
+      { sessionID: "parent", callID: "call", messageID: "message", agent: "build", capturedAt: "2026-02-03T04:05:06.000Z", bootID: "0123456789abcdef", epoch: 1 },
+      { sessionID: "parent", callID: "call-2", messageID: "message", agent: "build", capturedAt: "2026-02-03T04:05:06.000Z", bootID: "0123456789abcdef", epoch: 2 },
+    ]);
+    expect(runtime.childRunner.retainedContext("parent")).toEqual(seen[1]);
+    expect(runtime.childRunner.retainedContext("nobody")).toBeNull();
+    off();
+    await withCall(runtime, toolContext);
+    expect(seen).toHaveLength(2);
+  });
+
+  it("uses a random 16-hex bootID per instance, and one epoch counter for all sessions", async () => {
+    const a = fixture();
+    const b = fixture();
+    expect(a.runtime.childRunner.bootID).toMatch(/^[0-9a-f]{16}$/);
+    expect(a.runtime.childRunner.bootID).not.toBe(b.runtime.childRunner.bootID);
+    await withCall(a.runtime, a.toolContext, { sessionID: "one" });
+    await withCall(a.runtime, a.toolContext, { sessionID: "two" });
+    expect(a.runtime.childRunner.retainedContext("one")?.epoch).toBe(1);
+    expect(a.runtime.childRunner.retainedContext("two")?.epoch).toBe(2);
+  });
+
+  it("throws ContextSupersededError before any host call when the pinned capture is gone or not current", async () => {
+    const { runtime, context, toolContext, execute } = fixture();
+    const boot = runtime.childRunner.bootID;
+    const pinned = { bootID: boot, epoch: 1, callID: "call" };
+    await expect(runtime.childRunner.run(detachedRequest(pinned))).rejects.toMatchObject({ name: "ContextSupersededError", current: null, requested: pinned });
+    await withCall(runtime, toolContext);
+    await withCall(runtime, toolContext, { id: "newer" });
+    const error = await runtime.childRunner.run(detachedRequest(pinned)).catch((e: unknown) => e);
+    expect(error).toMatchObject({ name: "ContextSupersededError", requested: pinned, current: { bootID: boot, epoch: 2, callID: "newer" } });
+    await expect(runtime.childRunner.run(detachedRequest({ ...pinned, epoch: 2, bootID: "ffffffffffffffff", callID: "newer" })))
+      .rejects.toMatchObject({ name: "ContextSupersededError" });
+    expect(context.tool.list).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("a detached run needs a pinned context and a signal", async () => {
+    const { runtime, context, toolContext } = fixture();
+    await withCall(runtime, toolContext);
+    const { context: _ignored, ...noContext } = detachedRequest({ bootID: runtime.childRunner.bootID, epoch: 1, callID: "call" });
+    await expect(runtime.childRunner.run(noContext as never)).rejects.toThrow(/pinned context/);
+    expect(context.tool.list).not.toHaveBeenCalled();
+  });
+
+  it("a detached run ignores an aborted retained toolContext.signal and never forwards progress to the parent call", async () => {
+    const { runtime, execute, toolContext } = fixture();
+    const callAbort = new AbortController();
+    const call = { ...toolContext, signal: callAbort.signal, progress: vi.fn(async () => {}) } as unknown as ToolContext;
+    let nativeSignal: AbortSignal | undefined;
+    execute.mockImplementation(async (_input: unknown, native: ToolContext) => {
+      nativeSignal = native.signal;
+      callAbort.abort(); // the parent call is cancelled while the detached child runs
+      await native.progress({ sessionID: "child", status: "running" });
+      return { output: { sessionID: "child", status: "completed", output: "detached result" } };
+    });
+    const onCreated = vi.fn(async () => {});
+    const result = await runtime.withToolContext(call, async () => {
+      const info = runtime.childRunner.retainedContext("parent")!;
+      return runtime.childRunner.run(detachedRequest({ bootID: info.bootID, epoch: info.epoch, callID: info.callID }, { onCreated }));
+    });
+    expect(result).toEqual({ sessionID: "child", text: "detached result" });
+    expect(onCreated).toHaveBeenCalledWith("child");
+    expect(nativeSignal?.aborted).toBe(false);
+    expect(call.progress).not.toHaveBeenCalled();
+  });
+
+  it("a non-detached run is unchanged: it still forwards progress and follows the call's signal", async () => {
+    const { runtime, execute, toolContext } = fixture();
+    const call = { ...toolContext, progress: vi.fn(async () => {}) } as unknown as ToolContext;
+    const result = await runtime.withToolContext(call, () => runtime.childRunner.run({
+      parentSessionID: "parent", prompt: "grade", onCreated: async () => {},
+    }));
+    expect(result.text).toBe("verified result");
+    expect(call.progress).toHaveBeenCalled();
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it("pinned sessions survive the LRU until released", async () => {
+    const { runtime, toolContext } = fixture();
+    await withCall(runtime, toolContext, { sessionID: "s0" });
+    const unpin = runtime.childRunner.pin("s0");
+    const unpinAgain = runtime.childRunner.pin("s0"); // pins nest
+    for (let i = 1; i <= 500; i++) await withCall(runtime, toolContext, { sessionID: `s${i}` });
+    expect(runtime.childRunner.retainedContext("s0")).not.toBeNull();
+    expect(runtime.childRunner.retainedContext("s1")).toBeNull(); // the oldest unpinned went instead
+    expect(runtime.childRunner.retainedContext("s500")).not.toBeNull();
+    unpin();
+    unpin(); // idempotent
+    await withCall(runtime, toolContext, { sessionID: "s501" });
+    expect(runtime.childRunner.retainedContext("s0")).not.toBeNull();
+    unpinAgain();
+    await withCall(runtime, toolContext, { sessionID: "s502" });
+    expect(runtime.childRunner.retainedContext("s0")).toBeNull();
+    expect(runtime.childRunner.retainedContext("s502")).not.toBeNull();
+  });
+});
+
 describe("v2 client compatibility", () => {
   it("wraps session data and forwards identifiers, signals, and bound method receivers", async () => {
     const { runtime, context } = fixture();

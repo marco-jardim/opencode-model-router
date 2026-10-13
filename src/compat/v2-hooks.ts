@@ -28,7 +28,7 @@ import {
 import type { RouterConfig } from "../router/config";
 import { resolveRoles, type AuthorityAction, type RoleSpec } from "../router/roles";
 import {
-  BINDING_NOTES, bind, currentBinding, evict as evictBinding, evictCall, type Binding, type SessionLookup,
+  BINDING_NOTES, bind, bindPlanChild, currentBinding, evict as evictBinding, evictCall, type Binding, type SessionLookup,
 } from "../routing/roles/binding";
 import type { DispatchGrant } from "../routing/roles/policy";
 import {
@@ -41,12 +41,16 @@ import { parseReturnPrefix } from "../routing/outcomes/signals";
 import { lookupDispatch } from "../router/sessions";
 import { createSystemAugmenter } from "../routing/wire/hint";
 import { createTurnStateRegistry, placeTurnState, ROUTER_TURN_STATE_ATTACH, TURN_STATE_ROOT, type TurnStateRegistry } from "./turn-state";
+import { PLAN_PROVIDER_NAME } from "./turn-state";
+/** 3.1.7 W6: the `plan` provider after the background ones (completed 30, held 40, in-flight 50), before the route hint (90). */
+const PLAN_PROVIDER_ORDER = 60;
 import { CONTEXT7_DOC_TOOLS, evaluatePermission, permissionMatches, permissionRules, publishReadOnlyPermissions } from "../router/read-only";
 import { filterSensitiveGrep, isSensitivePath } from "../router/sensitive-paths";
 import { canonicalAuthorityPath, insideWorkRoot } from "../routing/roles/work-root";
 import { appliedEffort, appliedThinkingBudget, createEffortStore, registerEffortChannel } from "../tui/effort-channel";
 import {
   acquireLeaseRegistry, ADOPTION_RETRY_MS, attemptLabel, COMPLETION_SETTLE_MS, createCompletionProcessor, createHeldResults, createInFlightRegistry,
+  isExecutorOwned,
   createLeaseGuard, decideBackground, isAdoptionRefused, PENDING_GUARANTEES_TEXT, PROVIDER_ORDER, renderCompleted, renderHeld, renderInFlight,
   restoredDispatchOf, ROUTER_FINISH_ATTACH,
 } from "./background";
@@ -68,6 +72,50 @@ import type {
   RestoredDispatch, RestoredHold, RestoredHolds,
 } from "./background";
 import { PENDING_JOURNAL_VANISHED, pendingRecordIdentity } from "../verify/pending";
+import type { ExecutorRuntimeHandle, LeaseRegistryPort } from "../executor/runtime";
+import type {
+  ChildEnd, ChildRunner, DispatchBookkeeping, HostError, HostSessionEvent, HostSessions, IsoTime, LaunchRequest, MetricPayload, PlanId, RouteResolver,
+  SlotVerifier, TaskLauncher,
+} from "../executor/types";
+import type { PlanRoleBindings } from "../executor/launch";
+import { LAUNCH_HEADER_PATTERN, parseLaunchHeader, type LaunchHeaderFields } from "../executor/types";
+import { grantFor } from "../routing/roles/policy";
+import { NEEDS, UNKNOWN_FACTS, type Need } from "../routing/classify/types";
+
+/** §7 grammar (`formatLaunchPrompt`): every launcher prompt starts with this line. */
+const PLAN_CONTEXT_PREFIX = "PLAN CONTEXT\n";
+/**
+ * QA-3.1-16: the v2 host puts this exact line (ending in "\n", or "\r\n") before the first user message of every native-subagent
+ * child (recorded in docs/qa/role-tier/evidence/roots-handoffs.json, ladder.json), so a launcher prompt reaches the child either
+ * at offset 0 or right after this one line; no other leading text counts.
+ */
+const HOST_SUBAGENT_PREAMBLE = "You are a subagent spawned by another session.";
+
+/**
+ * The status of an executor launch's `runner` trigger. QA-3.1 nit 4: the child's observed end (`execution.*`) decides;
+ * QA-3.1-24: else the launch's settled end kind the launcher passes (its runner result can settle before the child's
+ * `execution.succeeded` is seen); else the registry's outcome. A child that settled with none of them (lost, cancelled, a
+ * runner error) did not succeed: interrupted.
+ */
+export function executorRunnerStatus(
+  observed: "succeeded" | "failed" | "interrupted" | undefined,
+  settled: ChildEnd["kind"] | undefined,
+  registry: string | undefined,
+): "succeeded" | "failed" | "interrupted" {
+  if (observed !== undefined) return observed;
+  if (settled === "completed") return "succeeded";
+  if (settled === "failed" || settled === "capacity") return "failed";
+  if (settled === "interrupted") return "interrupted";
+  return registry === "succeeded" || registry === "failed" || registry === "interrupted" ? registry : "interrupted";
+}
+
+/** The text after the host's one preamble line when it starts with exactly that line, else the text unchanged (QA-3.1-16). */
+function withoutHostPreamble(text: string): string {
+  for (const eol of ["\n", "\r\n"]) {
+    if (text.startsWith(HOST_SUBAGENT_PREAMBLE + eol)) return text.slice(HOST_SUBAGENT_PREAMBLE.length + eol.length);
+  }
+  return text;
+}
 
 /** Translate the router's own v1 tool vocabulary at the v2 boundary. */
 export function v2Instructions(text: string): string {
@@ -865,10 +913,60 @@ function redactUnprocessedElements(text: string, isProcessed: (child: string) =>
   });
 }
 
+/** 3.1.7 W4: a v2 event error (`type`, `message`, an optional HTTP status) as the executor's `HostError`. */
+function toHostError(error: unknown): HostError {
+  const record = typeof error === "object" && error !== null ? (error as Record<string, unknown>) : {};
+  const type = typeof record.type === "string" ? record.type : typeof record.name === "string" ? record.name : "unknown";
+  const message = typeof record.message === "string" ? record.message : typeof error === "string" ? error : "";
+  const raw = record.status ?? record.statusCode;
+  return { type, status: typeof raw === "number" && Number.isFinite(raw) ? raw : null, message };
+}
+
+/**
+ * Host adapters v2-hooks builds for the plan executor (3.1.7 W1, memo 3.1.1 §8). The executor factory composes the
+ * launcher and the runtime over them; v2-hooks never constructs the runtime itself (its collaborators arrive later).
+ */
+export interface V2ExecutorHost {
+  /** `HostSessions` over `ctx.session` plus the one host-event emitter (M46). */
+  hosts: HostSessions;
+  /**
+   * The routing kernel with the tier pin and the agent/model. null here: `dispatchRouter.route` is asynchronous and the port is
+   * synchronous, so the factory supplies the resolver (open for 3.1.8 / 5.1).
+   */
+  routes: RouteResolver | null;
+  /** `bindPlanChild` / binding.ts `evict`. */
+  bindings: PlanRoleBindings;
+  /** Decision row, dispatch start and the background in-flight registry; rows tagged `source: "executor"`. */
+  bookkeeping: DispatchBookkeeping;
+  /** The verification engine as a slot verifier; null when this host has none. */
+  verifier: SlotVerifier | null;
+  /** The Phase 1.3 lease registry; null when this host has none. */
+  leaseRegistry: LeaseRegistryPort | null;
+  /** The child runner the launcher drives (v2-client); null when the runtime passed to v2-hooks has none. */
+  runner: ChildRunner | null;
+  /** `childRunner.pin`: keeps the orchestrator's retained context alive while its plan runs. */
+  pinOrchestrator(sessionID: string): () => void;
+  /** `TaskLauncherDeps.onMetric`: forwards to `ExecutorRuntimeHandle.recordMetric` once the executor exists. */
+  onLauncherMetric(planId: PlanId, m: MetricPayload): void;
+  /** `TaskLauncherDeps.knownAgent`. */
+  knownAgent(agent: string): boolean;
+  /** Plugin lifetime (`TaskLauncherDeps.lifetime`); aborted on dispose. */
+  lifetime: AbortSignal;
+}
+
+/** The composed executor: the runtime plus the launcher it drives (W7 disposes both, runtime first). */
+export interface V2Executor {
+  runtime: ExecutorRuntimeHandle;
+  launcher: Pick<TaskLauncher, "dispose">;
+}
+
+/** Builds the executor over the host adapters, or null when the executor is not enabled (M3: then nothing changes). */
+export type V2ExecutorFactory = (host: V2ExecutorHost) => V2Executor | null;
+
 export async function registerV2Hooks(
   ctx: Context,
   hooks: Hooks,
-  runtime?: Pick<V2Runtime, "withToolContext" | "applyChildSystem"> & Partial<Pick<V2Runtime, "dispose" | "forgetSession">>,
+  runtime?: Pick<V2Runtime, "withToolContext" | "applyChildSystem"> & Partial<Pick<V2Runtime, "dispose" | "forgetSession" | "childRunner">>,
   /**
    * `ingest`: the plugin instance's telemetry ingest (M6, QA-2.1-7); without one the adapter ingests nothing.
    * `isBypassed`: the plugin's `/bypass` state (#84 P2.1: the role path's router-gate condition, S10/P-9).
@@ -901,6 +999,15 @@ export async function registerV2Hooks(
      * add to the refusal (its denied_cap stop or advisory banner), or undefined. Absent: refusals are not counted.
      */
     recordRefusal?: (sessionID: string, agent: string | undefined, tool: string, args: unknown) => string | undefined;
+    /**
+     * Plan task 3.1.7: builds the plan executor over the host adapters (W1). Absent, or returning null: no executor, and nothing
+     * changes (M3). The fail-closed check of plan children (M41) is on either way.
+     */
+    executor?: V2ExecutorFactory;
+    /** W1: the Phase 1.3 lease registry the executor's leases go through; absent: the executor gets none. */
+    leaseRegistry?: LeaseRegistryPort;
+    /** W1: the verification engine as a slot verifier; absent: the executor gets none. */
+    slotVerifier?: SlotVerifier;
   } = {},
 ): Promise<() => Promise<void>> {
   // The old plugin surface uses separate mutable input/output bags. Keep those
@@ -962,6 +1069,229 @@ export async function registerV2Hooks(
       await run();
     } catch (error) {
       if (!abort.signal.aborted) ingestLogger.warn(`[router] telemetry ingestion: ${what} failed`, { error: error instanceof Error ? error.message : String(error) });
+    }
+  };
+  // ---------------------------------------------------------------------------------------------------------------
+  // Plan task 3.1.7 (memo 3.1.1 §8): the plan executor's seams. `executor` stays null unless `options.executor` builds one
+  // (M3: then nothing below changes behaviour); the fail-closed check of plan children (M41) is on either way.
+  // ---------------------------------------------------------------------------------------------------------------
+  let executor: V2Executor | null = null;
+  /** W1: the plugin lifetime the launcher combines with each launch's own controller; aborted on dispose (W7). */
+  const executorLifetime = new AbortController();
+  /** M46: the one host-event path. v2-hooks only emits; the runtime and the launcher subscribe through `hosts.onEvent`. */
+  const hostEventListeners = new Set<(e: HostSessionEvent) => void>();
+  const emitHostEvent = (e: HostSessionEvent): void => {
+    if (executor === null || hostEventListeners.size === 0) return;
+    for (const listener of [...hostEventListeners]) {
+      try {
+        listener(e);
+      } catch (error) {
+        ingestLogger.warn("[router] executor: a host-event listener failed", { error: String(error) });
+      }
+    }
+  };
+  /**
+   * W4 (M19), QA-3.1-8: the adapter is the single owner of the step key `<sessionID>:<k>`; it sets the key on every forwarded
+   * retry/step event and on the retry-hook call (the runtime prefers `e.stepKey`). k counts `step.started` after a closed step;
+   * `step.ended` closes the step, `step.failed` closes it only when no retry is pending (memo :163; the retry's own
+   * `step.started` clears the pending mark), `execution.*` closes it and ends the session. So the retries of one step (C10:
+   * `step.started`, `retry.scheduled`…, `step.ended`) carry one key. Only kept while an executor exists; an LRU map capped at
+   * `EXECUTOR_STEPS_CAP` that evicts ended sessions first.
+   */
+  const EXECUTOR_STEPS_CAP = 1000;
+  /** `early`: the step was opened by the retry hook before its `step.started` was processed (QA-3.1-21). */
+  type ExecutorStep = { k: number; open: boolean; retryPending: boolean; ended: boolean; early: boolean };
+  const executorSteps = new Map<string, ExecutorStep>();
+  const touchExecutorStep = (sessionID: string): ExecutorStep => {
+    const st = executorSteps.get(sessionID) ?? { k: 0, open: false, retryPending: false, ended: false, early: false };
+    executorSteps.delete(sessionID); // LRU: the latest use goes last
+    executorSteps.set(sessionID, st);
+    while (executorSteps.size > EXECUTOR_STEPS_CAP) {
+      let victim: string | undefined;
+      for (const [id, s] of executorSteps) {
+        if (s.ended && id !== sessionID) {
+          victim = id;
+          break;
+        }
+      }
+      victim ??= executorSteps.keys().next().value!;
+      executorSteps.delete(victim);
+    }
+    return st;
+  };
+  const noteExecutorStep = (
+    sessionID: string, edge: "started" | "ended" | "failed" | "retry" | "retry-stop" | "execution",
+  ): void => {
+    if (executor === null) return;
+    const st = touchExecutorStep(sessionID);
+    if (edge === "started") {
+      if (st.early) {
+        // QA-3.1-21: the `step.started` of a step the retry hook already opened: a no-op (no second advance, the retry mark kept)
+        st.early = false;
+        return;
+      }
+      st.ended = false;
+      st.retryPending = false;
+      if (!st.open) {
+        st.k += 1;
+        st.open = true;
+      }
+    } else if (edge === "retry" || edge === "retry-stop") {
+      // a scheduled retry, or a retry-hook call that let the host retry, is pending; a hook that stopped it leaves none
+      st.retryPending = edge === "retry";
+    } else if (edge === "failed") {
+      st.early = false;
+      if (!st.retryPending) st.open = false;
+    } else {
+      st.early = false;
+      st.open = false;
+      st.retryPending = false;
+      if (edge === "execution") st.ended = true;
+    }
+  };
+  /**
+   * QA-3.1-21: the retry hook can run before the event loop processed the step's `session.step.started` (the loop can wait on an
+   * ingest). A step that is not open is opened here, so the key the hook reads names this step; its `step.started`, processed
+   * later, is then a no-op (`early`).
+   */
+  const openExecutorStepForHook = (sessionID: string): void => {
+    if (executor === null || executorSteps.get(sessionID)?.open === true) return;
+    noteExecutorStep(sessionID, "started");
+    touchExecutorStep(sessionID).early = true;
+  };
+  const executorStepKey = (sessionID: string): string => `${sessionID}:${executorSteps.get(sessionID)?.k ?? 0}`;
+  /**
+   * 3.1.7 M41 (always on, memo §8): plan children are bound (`bindPlanChild`) before their first tool call. A child session whose
+   * first user message is a launcher prompt (QA-3.1-9: it starts with "PLAN CONTEXT\n", at offset 0 or right after the host's one
+   * exact preamble line (QA-3.1-16), and its launch header sits at the §7 grammar position, `planPromptHeader`) and that has no
+   * plan binding, or one naming another plan task, joins
+   * `refusedPlanChildren` and is refused every tool call (fail closed). The check runs in the context hook; a first tool call
+   * that comes before it (a restart) runs it in `execute.before`. Every caller awaits the same in-flight check (QA-3.1-9 b).
+   */
+  const refusedPlanChildren = new Set<string>();
+  /** Per session, the (in-flight or settled) check of its first user message (bounded). */
+  const planChildChecks = new Map<string, Promise<void>>();
+  const rememberPlanChildCheck = (sessionID: string, check: Promise<void>): void => {
+    planChildChecks.set(sessionID, check);
+    while (planChildChecks.size > 5000) planChildChecks.delete(planChildChecks.keys().next().value!);
+  };
+  /**
+   * QA-3.1-9 (a): the launch header of a launcher prompt (`formatLaunchPrompt`), read by `parseLaunchHeader` at its grammar
+   * position, or null. The shared context has no header-shaped line (the launcher refuses one), so the first header-shaped line
+   * is the header and the text between the prefix and it is the shared context.
+   */
+  const planPromptHeader = (firstText: string): LaunchHeaderFields | null => {
+    // QA-3.1-16: the grammar is checked at offset 0, or right after the host's one exact preamble line, never elsewhere
+    const text = withoutHostPreamble(firstText);
+    if (!text.startsWith(PLAN_CONTEXT_PREFIX)) return null;
+    const m = LAUNCH_HEADER_PATTERN.exec(text);
+    if (m === null || m.index - 2 < PLAN_CONTEXT_PREFIX.length) return null;
+    return parseLaunchHeader(text, text.slice(PLAN_CONTEXT_PREFIX.length, m.index - 2));
+  };
+  /** M41: the session has a plan binding and the prompt's header names that plan task. */
+  const planBindingMatches = (sessionID: string, header: LaunchHeaderFields): boolean => {
+    const plan = currentBinding(sessionID, { maxOf: () => [] })?.plan;
+    return plan !== undefined && header.planId === plan.planId && header.taskId === plan.taskId;
+  };
+  /** The verdict on one session's first user message text: a plan prompt in a non-root session without its binding is refused. */
+  const planChildVerdict = async (sessionID: string, firstText: string): Promise<void> => {
+    const header = planPromptHeader(firstText);
+    if (header === null) return; // not a launcher prompt: never refused, the session kind is not even looked up
+    let kind: Awaited<ReturnType<typeof sessionKindOf>>;
+    try {
+      kind = await sessionKindOf(sessionID);
+    } catch {
+      kind = "unknown"; // a plan prompt in a session of unknown kind: checked as a child (fail closed)
+    }
+    if (kind === "root") return;
+    let matches: boolean;
+    try {
+      matches = planBindingMatches(sessionID, header);
+    } catch {
+      matches = false; // the binding could not be read: fail closed, with the refusal's own message
+    }
+    if (matches) return;
+    refusedPlanChildren.add(sessionID);
+    while (refusedPlanChildren.size > 5000) refusedPlanChildren.delete(refusedPlanChildren.values().next().value!);
+    ingestLogger.warn("[router] executor: a plan child without its plan binding is refused every tool call", { sessionID });
+  };
+  const planChildGuard = {
+    /** The check on the first user message text of a session; once per session, shared by every caller while in flight. */
+    check(sessionID: string, firstText: string | undefined): Promise<void> {
+      if (sessionID === "" || firstText === undefined) return Promise.resolve();
+      const known = planChildChecks.get(sessionID);
+      if (known !== undefined) return known;
+      const check = planChildVerdict(sessionID, firstText);
+      rememberPlanChildCheck(sessionID, check);
+      return check;
+    },
+    /** `execute.before`: the fallback check (or the in-flight one), then the refusal. */
+    async assertToolAllowed(sessionID: string): Promise<void> {
+      if (sessionID !== "" && sessionKinds.get(sessionID) !== "root") {
+        let check = planChildChecks.get(sessionID);
+        if (check === undefined) {
+          /** True when a verdict was reached; false when the first message could not be read. */
+          const verdict = (async (): Promise<boolean> => {
+            let firstText: string | undefined;
+            try {
+              firstText = firstMessageText(await ctx.session.context({ sessionID } as Parameters<typeof ctx.session.context>[0]));
+            } catch {
+              firstText = undefined;
+            }
+            if (firstText === undefined) return false;
+            await planChildVerdict(sessionID, firstText);
+            return true;
+          })();
+          const fallback: Promise<void> = verdict.then((checked) => {
+            // not checked yet: the next call (or the context hook) tries again
+            if (!checked && planChildChecks.get(sessionID) === fallback) planChildChecks.delete(sessionID);
+          });
+          check = fallback;
+          rememberPlanChildCheck(sessionID, fallback);
+        }
+        await check;
+      }
+      if (refusedPlanChildren.has(sessionID)) {
+        throw new Error(`[router] Refused for session ${sessionID}: its prompt carries a plan task header but the session has no matching plan binding (fail closed)`);
+      }
+    },
+  };
+  /**
+   * W4/W6 (M34, M46): a v2 session event as the executor's `HostSessionEvent`, emitted on the one path (the orchestrator's
+   * events included, so the runtime sees root idleness). `session.step.started` carries the provider (`model.providerID`).
+   */
+  const forwardHostEvent = (type: string, sessionID: string, data: Record<string, unknown>, created: unknown): void => {
+    if (executor === null) return;
+    const ms = created instanceof Date ? created.getTime() : typeof created === "number" && Number.isFinite(created) ? created : Date.now();
+    const at: IsoTime = new Date(ms).toISOString();
+    const text = (value: unknown): string => (typeof value === "string" ? value : "");
+    const error = (): HostError => toHostError(data.error ?? data);
+    // QA-3.1-8: every step/retry event carries the adapter's step key, read after the edge that opens a step and before the
+    // edge that closes it.
+    if (type === "session.step.started") {
+      noteExecutorStep(sessionID, "started");
+      const model = typeof data.model === "object" && data.model !== null ? (data.model as Record<string, unknown>) : {};
+      emitHostEvent({
+        type: "step.started", sessionID, providerID: text(model.providerID), modelID: text(model.id ?? model.modelID),
+        stepKey: executorStepKey(sessionID), at,
+      });
+    } else if (type === "session.retry.scheduled") {
+      noteExecutorStep(sessionID, "retry");
+      emitHostEvent({ type: "retry", sessionID, stepKey: executorStepKey(sessionID), source: "scheduled", error: error(), at });
+    } else if (type === "session.step.ended") {
+      emitHostEvent({ type: "step.ended", sessionID, stepKey: executorStepKey(sessionID), at });
+      noteExecutorStep(sessionID, "ended");
+    } else if (type === "session.step.failed") {
+      emitHostEvent({ type: "step.failed", sessionID, error: error(), stepKey: executorStepKey(sessionID), at });
+      noteExecutorStep(sessionID, "failed");
+    } else if (type === "session.execution.failed") {
+      executorInFlight.noteEnd(sessionID, "failed");
+      emitHostEvent({ type: "execution.failed", sessionID, error: error(), stepKey: executorStepKey(sessionID), at });
+      noteExecutorStep(sessionID, "execution");
+    } else if (type === "session.execution.succeeded" || type === "session.execution.interrupted") {
+      executorInFlight.noteEnd(sessionID, type === "session.execution.succeeded" ? "succeeded" : "interrupted");
+      emitHostEvent({ type: type === "session.execution.succeeded" ? "execution.completed" : "execution.interrupted", sessionID, at });
+      noteExecutorStep(sessionID, "execution");
     }
   };
   // M7 (2.2): dispatch routing and the protocol/hint adaptation share one runtime; it touches nothing (no host call, no
@@ -1465,6 +1795,68 @@ export async function registerV2Hooks(
   });
   // QA-2.1-13: the process-wide call claims of this instance go with it (a reload must not inherit them).
   bgDisposers.push(() => inflight.dispose());
+  /**
+   * 3.1.7 W1/W5: the executor's in-flight entries (`owner: "executor"`), one call record per task attempt. The launcher calls
+   * `decisionRow`, `recordDispatchStart`, `registerInFlight(.., null)`, then `registerInFlight(.., child)` once the child exists,
+   * and `unregisterInFlight` when its launch completion settles (the only settle point): that submits the `runner` trigger (with
+   * the child's own end status, `noteEnd`, else the launch's settled end kind the launcher passes, QA-3.1-24), so
+   * the processor's D2 dedupe makes a later `execution.*` trigger a duplicate. Excluded from the ordinary completion and
+   * verification path (background.ts `isExecutorOwned`). Keyed by task attempt (the bookkeeping port carries no plan id).
+   */
+  const executorLaunches = new Map<string, {
+    req: LaunchRequest; callID: string; child: string | null; end?: "succeeded" | "failed" | "interrupted";
+  }>();
+  const executorAttemptKey = (taskId: string, attempt: number): string => `${taskId}#${attempt}`;
+  const executorInFlight = {
+    /**
+     * QA-3.1 nit 4: the child's own end (its `execution.*` event), carried into the `runner` trigger `unregister` submits.
+     * The latest end wins; a child of no executor launch is ignored.
+     */
+    noteEnd(child: string, status: "succeeded" | "failed" | "interrupted"): void {
+      for (const entry of executorLaunches.values()) {
+        if (entry.child === child) entry.end = status;
+      }
+    },
+    remember(req: LaunchRequest): void {
+      const key = executorAttemptKey(req.taskId, req.attempt);
+      executorLaunches.delete(key);
+      executorLaunches.set(key, { req, callID: `executor:${req.planId}:${req.taskId}#${req.attempt}:${req.nonce}`, child: null });
+      while (executorLaunches.size > 1000) executorLaunches.delete(executorLaunches.keys().next().value!);
+    },
+    register(taskId: string, attempt: number, child: string | null): void {
+      const entry = executorLaunches.get(executorAttemptKey(taskId, attempt));
+      if (entry === undefined) return;
+      if (inflight.byCall(entry.callID) === undefined) {
+        inflight.decide({
+          callID: entry.callID, parentSessionID: entry.req.orchestratorSessionID, agent: entry.req.route.agent, role: entry.req.role,
+          description: `plan ${entry.req.planId} task ${taskId}#${attempt}`, verifying: false, verificationMode: "none",
+          decision: { background: true, hold: false, reason: "plan-task" }, at: nowMs(), owner: "executor",
+        });
+      }
+      if (child !== null && entry.child === null) {
+        entry.child = child;
+        noteSessionKind(child, "child");
+        inflight.acknowledge(entry.callID, child, { userBackgrounded: false });
+      }
+    },
+    unregister(taskId: string, attempt: number, settled?: ChildEnd["kind"]): void {
+      const key = executorAttemptKey(taskId, attempt);
+      const entry = executorLaunches.get(key);
+      executorLaunches.delete(key);
+      if (entry === undefined) return;
+      if (entry.child === null) {
+        inflight.cancel(entry.callID);
+        return;
+      }
+      // QA-3.1 nit 4, QA-3.1-24: the observed end, else the launch's settled end kind, else the registry's outcome
+      const status = executorRunnerStatus(entry.end, settled, inflight.byChild(entry.child)?.outcome);
+      const sink = executorProcessor;
+      if (sink !== undefined) trackBackground(sink.process(entry.child, { kind: "runner", status, text: "", at: nowMs() }));
+      else inflight.foreground(entry.callID, entry.child);
+    },
+  };
+  /** W5: the completion processor once the hooks created it (it lives in the hook block below); undefined before and without one. */
+  let executorProcessor: CompletionProcessor | undefined;
   let closeAttempt: ((attempt: Attempt, cause: string) => Promise<void>) | undefined;
   /**
    * ONE journal (memo §11): the plugin's `pending.jsonl` file journal, reached through the finish API once it is attached. The
@@ -1642,6 +2034,9 @@ export async function registerV2Hooks(
     for (const attempt of inflight.list()) {
       if (attempt.state !== "acknowledged" && attempt.state !== "child-ended" && attempt.state !== "processing") continue;
       if (journal.hasProcessed(attempt.key)) continue;
+      // QA-3.1-10: an executor-owned attempt is the plan ledger's to recover; journaled here (without its owner) a restart's
+      // `recoverInflight` would take it for an ordinary dispatch.
+      if (isExecutorOwned(attempt)) continue;
       const dispatch = restoredDispatches.get(attempt.callID) ?? finishApi?.dispatchOf(attempt.callID);
       out.push({
         v: 1, kind: "inflight", key: attempt.key, callID: attempt.callID, parentSessionID: attempt.parentSessionID,
@@ -1738,8 +2133,32 @@ export async function registerV2Hooks(
       }
       leaseGuard = createLeaseGuard({
         registry: handle.registry, sessionKind: sessionKindOf, sessionDir: sessionDirectoryOf, gitRootOf: nearestRepository,
-        holderLabel, planTaskOf: () => undefined, events: { onRelease: (cb) => handle.onRelease(cb) }, logger: ingestLogger, now: nowMs,
+        holderLabel,
+        // 3.1.7 W3: a plan child (its binding has `plan`) acquires as holder = child, `taskRef`, `until-integrated`, tree = slot;
+        // nothing releases it at child end (`releaseChild` keeps until-integrated leases): only the executor's `releaseTask`.
+        planTaskOf: (sid) => {
+          const binding = currentBinding(sid, { maxOf: () => [] });
+          const slot = binding?.grant.workRoot;
+          return binding?.plan === undefined || typeof slot !== "string" || slot === ""
+            ? undefined
+            : { planId: binding.plan.planId, taskId: binding.plan.taskId, slot };
+        },
+        events: { onRelease: (cb) => handle.onRelease(cb) }, logger: ingestLogger, now: nowMs,
       });
+      // QA-3.1-6: a lease release can unblock a plan task waiting on a lease, so the executor runtime gets its tick
+      // (`onLeaseReleased`, called only when the runtime offers it). Never throws into the registry.
+      const offLeaseTick = handle.onRelease(() => {
+        const runtime: unknown = executor?.runtime;
+        if (typeof runtime !== "object" || runtime === null) return;
+        const tick: unknown = Reflect.get(runtime, "onLeaseReleased");
+        if (typeof tick !== "function") return;
+        try {
+          Reflect.apply(tick, runtime, []);
+        } catch (error) {
+          ingestLogger.warn("[router] executor: the lease-release tick failed", { error: String(error) });
+        }
+      });
+      bgDisposers.push(() => offLeaseTick());
       // `router_git_ls_files` searches: child sessions see no entry under edit by another holder (memo §15.1).
       bgDisposers.push(installGitSearchFilter(({ sessionID, root, paths }) => {
         if (sessionKinds.get(sessionID) !== "child") return { kept: paths };
@@ -1965,6 +2384,21 @@ export async function registerV2Hooks(
       ]);
       if (idleTimer !== undefined) clearTimeout(idleTimer);
     }
+    // 3.1.7 W7: the executor first (runtime, then its launcher, which aborts the signals it owns), before the background
+    // registry and the child runner it drives go away. Nothing reaches it after this: the emitter is a no-op without it.
+    const ownedExecutor = executor;
+    executor = null;
+    hostEventListeners.clear();
+    if (ownedExecutor !== null) {
+      for (const [what, run] of [["runtime", () => ownedExecutor.runtime.dispose()], ["launcher", () => ownedExecutor.launcher.dispose()]] as const) {
+        try {
+          await run();
+        } catch (error) {
+          ingestLogger.warn(`[router] executor: the ${what} could not be disposed`, { error: String(error) });
+        }
+      }
+    }
+    executorLifetime.abort();
     for (const dispose of bgDisposers.reverse()) {
       try {
         await dispose();
@@ -2605,6 +3039,8 @@ export async function registerV2Hooks(
       // #84 P2.3 (P-3, I9): a role session's context hook never fails the child. ANY error below empties its catalog (the
       // strictest outcome) and is annotated for the parent's `subagent` result; every other agent keeps today's behaviour.
       const role = roleAgentName(event.agent);
+      // 3.1.7 M41 (always on): the first user message of the session decides whether it is an unbound plan child (fail closed).
+      if (typeof event.sessionID === "string") await planChildGuard.check(event.sessionID, firstMessageText(event.messages));
       try {
         await buildContext(event, role);
       } catch (error) {
@@ -2625,7 +3061,11 @@ export async function registerV2Hooks(
       }
     }));
 
+    // 3.1.7 W4: the host's retry hook is registered with the executor below (W1), only when the factory built one (M3).
     registrations.push(await ctx.tool.hook("execute.before", async (event) => {
+      // 3.1.7 M41 (always on): a plan child without its plan binding is refused every tool call (fail closed). The context hook
+      // checks a session's first user message; a first tool call that comes before that hook performs the same check here.
+      await planChildGuard.assertToolAllowed(String(event.sessionID));
       const args = await scopedArgs(event);
       // #84 P2.1 (P-2, handoffs 11/32/33): a role child binds to its dispatch before its tool runs, so `router_run` and
       // `router_git_*` resolve the bound work root and the guard reads the dispatch budget. Tiers mode: no role table, no call.
@@ -3058,7 +3498,7 @@ export async function registerV2Hooks(
           await unverifiable(`verification after a restart failed: ${String(error)}`);
         }
       };
-      processor = createCompletionProcessor(inflight, {
+      processor = executorProcessor = createCompletionProcessor(inflight, { // 3.1.7 W5: also the executor's runner-trigger sink
         // QA-PDF12-9: the caller is the one the processor's attempt carries (journaled at decide), not a capped call-id lookup.
         // QA-PDF12-14: only a succeeded completion can launch a grader as the caller, so only it waits for the caller lookups.
         finish: (input, caller) => withinCaller({ parentSessionID: input.parentSessionID, callID: input.callID, ...caller }, () => api.finish(input), input.status === "succeeded"),
@@ -3179,6 +3619,144 @@ export async function registerV2Hooks(
           }),
       ];
       registrations.push({ dispose: async () => { for (const unregister of unregisters) unregister(); } });
+    }
+    // 3.1.7 W1: the executor's host adapters and its (nullable, M3) construction. Without `options.executor`, or when it answers
+    // null, nothing below registers anything and every seam above stays a no-op.
+    const childRunner = runtime?.childRunner;
+    if (options.executor !== undefined && childRunner !== undefined) {
+      const hosts: HostSessions = {
+        get: async (sessionID) => {
+          const session = await sessionOf(sessionID) as { id?: unknown; parentID?: unknown } | null | undefined;
+          if (session === null || session === undefined) return null;
+          return { id: typeof session.id === "string" ? session.id : sessionID, parentID: typeof session.parentID === "string" && session.parentID !== "" ? session.parentID : null };
+        },
+        context: async (sessionID) => {
+          const history: unknown = await ctx.session.context({ sessionID } as Parameters<typeof ctx.session.context>[0]);
+          const messages = Array.isArray(history) ? history : [];
+          return {
+            messages: messages.map((m: unknown) => {
+              const record = typeof m === "object" && m !== null ? m as Record<string, unknown> : {};
+              const kind = record.role ?? record.type;
+              return { role: kind === "assistant" ? "assistant" as const : kind === "user" ? "user" as const : "idle" as const, text: messageText(m) ?? null, outcome: null };
+            }),
+          };
+        },
+        activity: async () => "unknown",
+        interrupt: async (sessionID) => { await ctx.session.interrupt({ sessionID }); },
+        synthetic: async (i) => {
+          // QA-3.1 nit 1: the metadata goes through to the host.
+          await ctx.session.synthetic({ sessionID: i.sessionID, text: i.text, description: i.description, metadata: i.metadata, resume: i.resume });
+        },
+        move: async (sessionID, directory) => { await ctx.session.move({ sessionID, directory }); },
+        onEvent: (listener) => {
+          hostEventListeners.add(listener);
+          return () => { hostEventListeners.delete(listener); };
+        },
+      };
+      const bookkeeping: DispatchBookkeeping = {
+        decisionRow: (req) => executorInFlight.remember(req),
+        recordDispatchStart: (req, startedAt) => {
+          const entry = executorLaunches.get(executorAttemptKey(req.taskId, req.attempt));
+          const at = Date.parse(startedAt);
+          timings?.recordDispatchStart({
+            callID: entry?.callID ?? `executor:${req.planId}:${req.taskId}#${req.attempt}:${req.nonce}`, childSessionID: null,
+            parentSessionID: req.orchestratorSessionID, role: req.role, class: "unknown", scope: "unknown",
+            tier: req.route.heavy ? "heavy" : "unknown", model: `${req.route.model.providerID}/${req.route.model.modelID}`,
+            background: true, at: Number.isFinite(at) ? at : nowMs(),
+          });
+        },
+        registerInFlight: (taskId, attempt, child) => executorInFlight.register(taskId, attempt, child),
+        unregisterInFlight: (taskId, attempt, status) => executorInFlight.unregister(taskId, attempt, status),
+      };
+      /**
+       * QA-3.1-2: a plan child's grant, computed as the role dispatch path computes one (`grantFor`): the role's base actions
+       * (the local read actions every role gets; an implementer also edits) plus the route `needs` mapped to actions (`edit` →
+       * edit, `shell`/`network` → router_run; `web` and `external_dir` add none, the work root satisfies `external_dir`), all
+       * within the role's maximum and the separation rule. An unknown role gets nothing (fail closed).
+       */
+      const planChildGrant = (agent: string, needs: readonly string[], workRoot: string): string[] => {
+        const spec = rolesOf(loadConfig(ctx.location.directory)).get(agent);
+        if (spec === undefined) {
+          if (rolesStarted === true) ingestLogger.warn("[router] executor: a plan child's agent is no live role agent; it is bound with no action", { agent });
+          return [];
+        }
+        const routeNeeds = needs.filter((n): n is Need => (NEEDS as readonly string[]).includes(n));
+        return [...grantFor(spec, { ...UNKNOWN_FACTS, needs: routeNeeds }, [], workRoot).actions];
+      };
+      const host: V2ExecutorHost = {
+        hosts,
+        routes: null,
+        bindings: {
+          // QA-3.1-2: the launch request's grant holds the route `needs`; the binding gets the role grant they map to.
+          bind: (i) => bindPlanChild({ ...i, grant: planChildGrant(i.agent, i.grant, i.workRoot) }),
+          evict: (childSessionID) => evictBinding(childSessionID),
+        },
+        bookkeeping,
+        verifier: options.slotVerifier ?? null,
+        leaseRegistry: options.leaseRegistry ?? null,
+        runner: childRunner,
+        pinOrchestrator: (sessionID) => childRunner.pin(sessionID),
+        onLauncherMetric: (planId, m) => executor?.runtime.recordMetric(planId, m),
+        knownAgent: (agent) => config.agent[agent] !== undefined,
+        lifetime: executorLifetime.signal,
+      };
+      try {
+        executor = options.executor(host);
+      } catch (error) {
+        executor = null;
+        ingestLogger.warn("[router] executor: it could not be built; plans are not executed", { error: String(error) });
+      }
+      const built = executor;
+      if (built !== null) {
+        // W2 (3.1.7.a): every router tool call of a bound orchestrator refreshes the executor (guard 6, the ready set).
+        const unsubscribe = childRunner.onContextCaptured((c) => {
+          try {
+            built.runtime.onRouterToolCall(c.sessionID);
+          } catch (error) {
+            ingestLogger.warn("[router] executor: a router tool call could not be fed", { error: String(error) });
+          }
+        });
+        // W6 (3.1.7.e): the plan line and the manual tasks ready for the orchestrator.
+        const unregisterPlan = turnState.registerTurnStateProvider({
+          name: PLAN_PROVIDER_NAME, order: PLAN_PROVIDER_ORDER,
+          render: (sid) => {
+            const line = built.runtime.planLine(sid);
+            const manual = built.runtime.manualReady(sid);
+            const lines = [
+              ...(line === null ? [] : [line]),
+              ...(manual.length === 0 ? [] : ["[router] Ready for you:", ...manual.map((t) => `- ${t.taskId}: manual (${t.kind})`)]),
+            ];
+            return lines.length === 0 ? undefined : lines.join("\n");
+          },
+          active: (sid) => built.runtime.planLine(sid) !== null || built.runtime.manualReady(sid).length > 0,
+        });
+        registrations.push({ dispose: async () => { unsubscribe(); unregisterPlan(); } });
+        // W4 (3.1.7.c, ADR 0007 D13): the host's retry decision feeds the capacity signals; the executor stops the retry of a plan
+        // child only. Registered only when an executor exists (M3); on any error the decision stays unchanged.
+        registrations.push(await ctx.session.hook("retry", async (event) => {
+          try {
+            const sessionID = String(event.sessionID);
+            // QA-3.1-21: the step's `step.started` may still wait in the event loop: the key must name this step, not the last one
+            openExecutorStepForHook(sessionID);
+            const { stop } = built.runtime.onRetryHook({ sessionID, stepKey: executorStepKey(sessionID), error: toHostError(event.error) });
+            // QA-3.1-8: a retry is pending only when neither the executor nor the host's own decision (`{retry: false}` for a
+            // usage limit, C10) stops it; a stopped one no longer keeps the step open.
+            const hostRetries = (event.decision as { retry?: unknown } | undefined)?.retry !== false;
+            noteExecutorStep(sessionID, !stop && hostRetries ? "retry" : "retry-stop");
+            // QA-3.1-3: the memo's `decision.retry = false`. The host's `SessionRetry` carries a writable `decision` (C10 probe), so
+            // a plan child's retry stops; the runtime records the stop (`capacityStopped`) either way.
+            if (stop) {
+              if (event.decision !== undefined && event.decision !== null) event.decision = { retry: false };
+              else ingestLogger.warn("[router] executor: a plan child's retry should stop; this host offered no retry decision", { sessionID });
+            }
+          } catch (error) {
+            ingestLogger.warn("[router] executor: the retry signal could not be fed", { error: String(error) });
+          }
+        }));
+        trackBackground(built.runtime.start().catch((error: unknown) => {
+          ingestLogger.warn("[router] executor: it could not start", { error: String(error) });
+        }));
+      }
     }
     registrations.push(await ctx.tool.hook("execute.after", async (event) => {
       // 2.2: the result names the child. A dispatch still waiting for it is registered under it, and a heuristic claim that picked
@@ -3458,6 +4036,8 @@ export async function registerV2Hooks(
           // Phase 2.1 (memo §4.6): timing, leases and the completion processor, before any existing `continue` below.
           if (typeof data?.sessionID === "string") {
             const sid: string = data.sessionID;
+            // 3.1.7 W4/W6 (M46): the executor's one host-event path; a no-op without an executor.
+            forwardHostEvent(event.type, sid, data, (event as { created?: unknown }).created);
             if (event.type === "session.created") {
               noteSessionKind(sid, data.parentID ? "child" : "root");
               if (!data.parentID) timings?.markRootSession(sid);
