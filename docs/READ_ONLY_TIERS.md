@@ -164,8 +164,15 @@ Windows), `--no-optional-locks`, and these overrides:
 ```text
 -c core.pager=cat -c core.fsmonitor=false -c diff.external=
 -c core.hooksPath=NUL (Windows; /dev/null elsewhere)
+-c protocol.ext.allow=never -c protocol.file.allow=never -c protocol.ssh.allow=never
+-c protocol.git.allow=never -c protocol.http.allow=never -c protocol.https.allow=never
 -c protocol.allow=never -c maintenance.auto=false -c gc.auto=0 -c color.ui=false
 ```
+
+Each transport is refused by name as well: a repository's `protocol.<name>.allow=always` beats the generic
+`protocol.allow=never`, and `GIT_NO_LAZY_FETCH` is honoured only from git 2.44, so a partial clone's promisor (an
+`ext::` command, say) could otherwise run on a lazy fetch. Command-line `-c` overrides repository config; no router git
+call needs a transport.
 
 Diff/show/log disable external diffs and textconv; blame disables textconv too.
 Submodule diff helpers are disabled. Inherited `GIT_*` variables are stripped

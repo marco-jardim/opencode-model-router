@@ -16,9 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identity from git (path, git common directory, root commits; origin and branch are shown), stores it and reloads the
   role agents (`Role agents reloaded; dispatch again with root=<path>.`; if the reload fails, `Restart OpenCode to use
   it.`); dispatch again with `root=<path>`. Only the main worktree of a repository can be approved, never a protected
-  location (a filesystem root, the user profile, the OpenCode config, data, state or cache directories, the plugin
-  install directory, the approvals store directory); `routing.repoExclude` wins, and the identity is checked again at
-  every use. The approvals are stored in `opencode-model-router.repo-approvals.json` next to the router state file.
+  location (a filesystem root, the user profile, the OpenCode config, data, state or cache directories, the directory
+  of the `OPENCODE_CONFIG` file, `~/.opencode`, the plugin install directory, the approvals store directory), nor a
+  repository that is or contains a `routing.repoParents` entry; `routing.repoExclude` wins, and the identity is checked
+  again at every use. After a revocation or expiry, an exact resume, `router_run` and `router_git_*` of a child bound
+  through the approval are refused. The approvals are stored in `opencode-model-router.repo-approvals.json` next to the router state file.
   `/router repos` lists the approvals, their last use and expiry; `/router revoke <path>` removes one and drops the
   repository from every working set. An approval expires `routing.repoApprovalDays` (new key, global only, 1–90, default
   14) days after its last use, and 90 days after approval at the latest. Worktrees of an approved repository outside its

@@ -265,7 +265,11 @@ through admission. It is admitted when either:
 1. it is a git top level 1 to `repoDepth` levels below a parent (never the parent itself), its canonical path stays
    below that parent, and it is not excluded by `repoExclude`; or
 2. it is a worktree that a known repository lists: the session repository, or a repository in the session's working
-   set. Its `git rev-parse --git-common-dir` must match that repository's, and it must still resolve to itself.
+   set. Its `git rev-parse --git-common-dir` must match that repository's, and it must still resolve to itself. What
+   backs the admission is the repository that lists the worktree (git's main worktree, canonical), never the known
+   entry's text: it must be the session repository, a repository with an approval that applies now and whose identity
+   holds (the binding is then tagged with that approval), or a repository 1 to `repoDepth` levels below a parent. Any
+   other known entry is skipped.
 
 Text checks come before any git call: UNC, device, 8.3 and `..` paths are refused, and the refusal ends the dispatch
 (`[router] role dispatch @<agent> refused: <note>`). A final gate runs on every
@@ -473,15 +477,20 @@ text or the refusal note. `/router approve` refuses with `Not approved: <path> <
 - a path that fails the work-root text checks, or does not resolve to an existing directory;
 - a path excluded by `routing.repoExclude`, as typed or resolved: `repoExclude` wins over an approval;
 - a protected location, as typed or resolved: a drive or filesystem root, the user profile or an ancestor of it, and
-  the OpenCode config directory (also `$XDG_CONFIG_HOME/opencode` and `OPENCODE_CONFIG_DIR`), the OpenCode data, state
-  and cache directories, the plugin install directory and the approvals store directory (each equal, an ancestor, or
-  inside);
+  the OpenCode config directory (also `$XDG_CONFIG_HOME/opencode` and `OPENCODE_CONFIG_DIR`), the directory of the
+  config file named by `OPENCODE_CONFIG`, `~/.opencode`, the OpenCode data, state and cache directories, the plugin
+  install directory and the approvals store directory (each equal, an ancestor, or inside);
 - anything but the main worktree of a repository: `<path>\.git` must be a local directory (not a link, not a `.git`
   file of a linked worktree, a submodule or a separate git dir), the path must be the git top level, and the git common
   directory must be its own `.git`. These refusals end with `; approve the main worktree`.
 
 A repository below `routing.repoParents` needs no approval: `No approval needed: <path> is inside routing.repoParents
-(<parent>); dispatch with root=<path>.` The stored identity is the canonical path, the git common directory and the
+(<parent>); dispatch with root=<path>.` A repository that is or contains a parent is refused: `Not approved: <path>
+is routing.repoParents entry <parent>; a repository that is or contains a parent cannot be approved.` (or `contains
+routing.repoParents entry <parent>`); registration also skips a stored approval that is or contains a parent (text or
+canonical form). One below a parent but deeper than `routing.repoDepth` is refused too: `No approval applies: <path>
+is below <parent> but deeper than routing.repoDepth (<n>); the router refuses it with or without an approval.` Each of
+these ends with `Nothing was stored.` The stored identity is the canonical path, the git common directory and the
 root commits (`git rev-list --max-parents=0 HEAD`); the origin (credentials stripped) and the branch are shown but are
 not part of the identity. The identity is checked again with git at every use: an entry whose path no longer resolves
 to itself, whose common directory changed, or whose root commits differ no longer admits anything.
@@ -512,6 +521,9 @@ agents before it sends the text on, so the host's directory permission follows t
 added line names the error and falls back to a restart: `The role agents could not be reloaded (<error>). Restart
 OpenCode to use it.` after an approval, and `The role agents could not be reloaded (<error>). The router refuses
 root=<path> now; restart OpenCode to remove its directory permission from the role agents.` after a revocation.
+After a revocation or expiry, a child bound through the approval stops working in it (a store read, no git): an exact
+resume, `router_run` and `router_git_*` refuse with `approval for <path> was revoked or expired: no work root. Only the
+user can approve it again (/router approve <path>).` (a resume's note starts `resume refused: `).
 
 **Expiry.** An approval expires `routing.repoApprovalDays` days (global only, 1–90, default 14) after its last use, and
 90 days after it was approved at the latest, whatever its use. Each binding through an approval records the use (at
