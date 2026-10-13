@@ -380,6 +380,10 @@ Everything else is work: resolve it, record it, continue.
 
 ## 7. Live state (§0.11 — keep current)
 
+**origin/master sync state (2026-10-13):** synced with v2.8.0 (`6ec3faa`) — sync phase `cpx/sync1`, two heavy QA
+rounds, fast-forwarded into `cpx/main` at `a7889e2` (report `docs\qa\critical-path-execution\sync-1.md`). The p51
+worktree created before the sync is recreated from the synced `cpx/main`; the 5.1 pre-flight is redone.
+
 **NEXT ACTION (2026-10-13): Wave 5 — Phase 5.1 (assembly and registration) in `D:\git\omr-cpx-p51`.** Wave 4 closed:
 4.1 and 4.2 merged into `cpx/main`. Owed to 5.1: the 4.1 and 4.2 handoffs (`phase-4.1.md`, `phase-4.2.md` `## Handoffs`),
 including the EXECUTOR.md "Unattended operation" / "QA loop" / "Recovery" sections (5.1.4.a) and QA-4.2-36 (one toplevel
