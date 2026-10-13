@@ -495,6 +495,21 @@ implementations, so the plan now runs on its own data/state dirs (owner decision
   `ses_ecd6e1db8ffeVziFDBa63Yfp0B` [tier:heavy], A2 capacity/launch/expand `ses_ecd6debafffe3IzhScn9aBBYk3`, B v2
   adapter + types (additive) + CHANGELOG `ses_ecd6da1a2fferr7fsFuGqCsShJ` [tier:heavy]. QA-3.2 round 1
   `ses_ecd78b6bdffe3dZy0K0H5o91Ed` at `2a1a3f6` running.
+- **Progress (22:05):** A2 fixes `adebd69` (167 green; tsc failed only in A1/B's in-progress files). ADR 0007 owes a
+  wording amendment: "first ISO instant" -> "first future ISO instant" (capacity pause, nit 6).
+  **QA-3.2 round 1** (`ses_ecd78b6bdffe3dZy0K0H5o91Ed`, at `2a1a3f6`, router PASS): 1 critical (QA-3.2-1 the phase
+  suite never gets failing ids, so a red base turns every failure into "pre-existing" and passes the gate), 11 major
+  (-2 stuck gate, -3 repo lock held through a pause, -4 cross-process lock double holder / `lost` ignored, -5 single
+  stalled slot, -6 revert checks run the full suite with broken paths, -7 incomplete rerun counts as pass, -8 uncapped
+  suite preemption, -9 integration worktree/branch must pre-exist, -10 reverted culprit loses its change on retry,
+  -11 queue coverage 89.47, -12 ignored-file landing check too broad), 9 minor, 6 nits. Decisions: **A-3.2-1** (QA-3.2-2)
+  a `suite-running`/`suite-failed` gate whose suite now resolves to none/off pauses the phase with a critical item, no
+  gate event; **A-3.2-2** (QA-3.2-14) phase tags use the git.ts `phase/<encoded id>` helper (amend plan 3.2.5.a, memo
+  §6); memo M6 (ff refusal halts) and M26 (revert message) amended as accepted deviations. **Handoff to 5.1
+  (QA-3.2-9):** create `omr/<plan>/integration` at `baseCommit` and acquire the integration slot before the queue's
+  first `resume()`; build a reverted culprit's retry branch from its reverted range (QA-3.2-10). Fixes in flight: C1
+  queue `ses_ecd624e77ffeoIQZtM9EeozNfu` [heavy], C2 checks+suite `ses_ecd6212cbffeigzx9yS7CISdyq` [heavy], C3 land +
+  real-git `ses_ecd61e810ffewwphrgzcYbShcL`.
 
 *(superseded)* **NEXT ACTION (2026-10-12 ≈16:30): DF-1.1 re-switch — waiting for the owner restart; then the DF-1.1 self-check and
 re-probes (DF1.4.a with `df1.1`, c runner criterion, d, e), then Wave 3.** `cpx/pdf1-1` merged into `cpx/main` as
