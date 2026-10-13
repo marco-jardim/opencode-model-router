@@ -23,6 +23,8 @@
  * names the checkout (work tree), so writers of one repo-relative path in two linked worktrees do not conflict
  * (DF-1.1-4). An `until-integrated` write (a plan task) also conflicts with another owner's `until-integrated` lease on
  * the same repo-relative path in any checkout of the answer's `shared` repository: plan tasks integrate into one branch.
+ * Such a conflict names the holder's own file. {@link LeaseRegistry.planHolderOf} is the matching repository-wide query
+ * (a plan scheduler's "who holds this path"); the logical key alone names one checkout.
  *
  * A path no key can be derived for is unkeyable. A spelling that may name any file (a device form, a drive-relative
  * path, an 8.3 name) fails CLOSED: a child's read or write of it is refused while any other owner holds any lease.
@@ -234,6 +236,13 @@ export interface LeaseRegistry {
   checkRun(runner: LeaseActor, tree: string): RunCheck;
   /** Drops the entries of `paths` (relative ones against `tree`) a child reader may not see. */
   filterSearchResults(reader: LeaseActor, tree: string, paths: readonly string[]): FilterResult;
+  /**
+   * DF-1.1-4: the repository-wide lookup. The first `until-integrated` (plan-task) holder of the repo-relative path of
+   * `path` (a relative one against `tree`) in ANY checkout of the repository `tree` belongs to (the key's `shared`
+   * repository), or null: the holder another plan task's write of that path would conflict with. The logical key alone
+   * names one checkout. Never throws.
+   */
+  planHolderOf(tree: string, path: string): Holder | null;
   /** Ends the `until-complete` leases of a holder (idempotent); `until-integrated` leases are kept. */
   release(holderID: string): ReleaseResult;
   /** Ends every lease of the holders working on `taskRef`, whatever their scope. */
@@ -244,7 +253,8 @@ export interface LeaseRegistry {
   snapshot(): LeaseSnapshot;
   /**
    * Replaces the state with a snapshot after validating all of it (shapes and consistency; stamps in the future are
-   * clamped to `now()`); a rejected snapshot leaves the state unchanged.
+   * clamped to `now()`); a rejected snapshot leaves the state unchanged. A line without `shared` whose tree `repoKeyOf`
+   * now keys per checkout, with the line's repository as `shared` (a snapshot from before DF-1.1-4), is re-keyed.
    */
   restore(snapshot: unknown, opts?: RestoreOptions): RestoreResult;
 }
@@ -795,8 +805,11 @@ function isUnder(physical: string, dir: string): boolean {
 /**
  * A lease registry over `seams`. Throws a TypeError only for an invalid `runMode` or `cap`; every other input, however
  * malformed, gets a result.
- * Indexes: `leases` by logical key, `holders` by id, `repoHolders` by repository, `tasks` by taskRef, `owners` by owner.
- * A write check is O(1) in the registry (plus the O(depth) realpath calls of the key derivation); a run check reads
+ * Indexes: `leases` by logical key, `holders` by id, `repoHolders` by repository, `tasks` by taskRef, `owners` by owner,
+ * `byShared` by repository-wide identity (`<shared>\0<rel>`).
+ * A write check is O(1) in the registry (plus the O(depth) realpath calls of the key derivation); an `until-integrated`
+ * write also reads the leases of its path in every checkout (`byShared`, one per checkout that leases it), and its
+ * unknown-target check scans the keys of the `until-integrated` holders. A run check reads
  * the leases of the run tree (`byTree`) and of the directories under the run directory (`byDir`, every ancestor of a
  * leased physical path), not all of them; only an unkeyable run directory of a child scans all leases (at most `cap`).
  * Every public method that takes caller input answers a hostile input (throwing getter, revoked Proxy) with
@@ -907,19 +920,24 @@ export function createLeaseRegistry(seams: LeaseSeams, opts: LeaseOptions): Leas
   };
 
   /**
-   * DF-1.1-4: the lease and `until-integrated` holder of another owner on the repo-relative path of `key` in another
-   * checkout of its shared repository, if any. Asked only for an `until-integrated` write: an `until-integrated` holder
-   * is never stale, so nothing is swept.
+   * DF-1.1-4: the first lease held by an `until-integrated` holder on the repo-relative path of `key` in any checkout of
+   * its shared repository, with that holder. Leases of `selfOwner` are skipped, and with `otherCheckouts` the key's own
+   * lease too (a write checks its own checkout through the logical key). An `until-integrated` holder is never stale, so
+   * nothing is swept.
    */
-  const integratedConflict = (key: PathKey, selfOwner: string): { logical: string; record: HolderRecord } | undefined => {
+  const integratedLease = (
+    key: PathKey,
+    selfOwner: string | null,
+    otherCheckouts: boolean,
+  ): { logical: string; entry: LeaseEntry; record: HolderRecord } | undefined => {
     const wide = wideKey(key.logical, key.shared);
     if (wide === null) return undefined;
     for (const logical of state.byShared.get(wide) ?? []) {
       const entry = state.leases.get(logical);
-      if (logical === key.logical || entry === undefined || entry.owner === selfOwner) continue;
+      if (entry === undefined || entry.owner === selfOwner || (otherCheckouts && logical === key.logical)) continue;
       for (const id of entry.holders) {
         const record = state.holders.get(id);
-        if (record !== undefined && record.holder.scope === "until-integrated") return { logical, record };
+        if (record !== undefined && record.holder.scope === "until-integrated") return { logical, entry, record };
       }
     }
     return undefined;
@@ -989,7 +1007,9 @@ export function createLeaseRegistry(seams: LeaseSeams, opts: LeaseOptions): Leas
         if (first === undefined) {
           keys.set(key.logical, key);
         } else if (first.physical !== key.physical || first.tree !== key.tree) {
-          // The same repo-relative file in another worktree: one more (physical, tree) pair of the same lease.
+          // Another spelling of the same logical key: one more (physical, tree) pair of the same lease. With the per-checkout
+          // keys of the v2 adapter (DF-1.1-4) a key names one checkout; with a repository-wide `repo` (as `repoKeyOf`
+          // may answer) it is the same repo-relative file in another worktree.
           const more = extras.get(key.logical) ?? [];
           more.push({ physical: key.physical, tree: key.tree });
           extras.set(key.logical, more);
@@ -1017,9 +1037,10 @@ export function createLeaseRegistry(seams: LeaseSeams, opts: LeaseOptions): Leas
       const joined: { logical: string; entry: LeaseEntry; pairs: Pair[] }[] = [];
       for (const [logical, key] of keys) {
         if (holder.scope === "until-integrated") {
-          const wide = integratedConflict(key, owner);
+          // The conflict names the holder's own file (in its checkout), not the requester's copy.
+          const wide = integratedLease(key, owner, true);
           if (wide !== undefined) {
-            return { ok: false, reason: "held", holders: [copyHolder(wide.record.holder)], path: key.display, key: wide.logical };
+            return { ok: false, reason: "held", holders: [copyHolder(wide.record.holder)], path: wide.entry.display, key: wide.logical };
           }
         }
         const lease = state.leases.get(logical);
@@ -1191,6 +1212,13 @@ export function createLeaseRegistry(seams: LeaseSeams, opts: LeaseOptions): Leas
     return { kept, omitted, holders: [...holders.values()] };
   };
 
+  const planHolderOf = (tree: string, path: string): Holder | null => {
+    const key = keyOfIn(path, tree, seams, platform, false);
+    if ("unkeyable" in key) return null;
+    const found = integratedLease(key, null, false);
+    return found === undefined ? null : copyHolder(found.record.holder);
+  };
+
   const release = (holderID: string): ReleaseResult => {
     const record = state.holders.get(holderID);
     if (record === undefined) return { released: 0, retained: 0 };
@@ -1235,6 +1263,19 @@ export function createLeaseRegistry(seams: LeaseSeams, opts: LeaseOptions): Leas
     const api = platform === "win32" ? win32 : posix;
     const now = seams.now();
     const next = emptyState();
+    const sm = memoize(seams);
+    /** The seam's current answer for a tree (folded) when it names a `shared` repository, else undefined. */
+    const currentIdOf = (dir: string): { repo: string; tree: string; shared: string } | undefined => {
+      try {
+        const answer: unknown = sm.repoKeyOf(dir);
+        if (!isRecord(answer) || typeof answer.repo !== "string" || typeof answer.tree !== "string") return undefined;
+        if (typeof answer.shared !== "string" || answer.shared === "") return undefined;
+        const fold = (text: string): string => foldKeyPath(text, platform);
+        return { repo: fold(answer.repo), tree: fold(answer.tree), shared: fold(answer.shared) };
+      } catch {
+        return undefined;
+      }
+    };
     /** Every holder of the snapshot, and whether it is kept. */
     const listed = new Map<string, boolean>();
     /** holderID → owner, for every holder of the snapshot. */
@@ -1297,28 +1338,40 @@ export function createLeaseRegistry(seams: LeaseSeams, opts: LeaseOptions): Leas
         }
         shared = named;
       }
+      // QA-PDF13-2: a line written before DF-1.1-4 carries no `shared` and its key names the repository every checkout
+      // shares. When the seam now keys its tree per checkout and names that repository as `shared`, the line is re-keyed
+      // (`r:<checkout>\0<rel>`), so the writers and readers of that checkout meet it again.
+      let key = logical;
+      if (value.shared === undefined && repo !== null && typeof tree === "string") {
+        const current = currentIdOf(tree);
+        if (current !== undefined && current.tree === tree && current.shared === repo && current.repo !== repo) {
+          key = `r:${current.repo}${logical.slice(logical.indexOf("\0"))}`;
+          shared = repo;
+          repo = current.repo;
+        }
+      }
       const pair: Pair = { physical, tree };
       // Duplicates are found in any order of the lines and whether or not the holder is kept.
-      const line = JSON.stringify([logical, holderID, tree, physical]);
-      if (lines.has(line)) return bad(`duplicate lease ${logical}`);
+      const line = JSON.stringify([key, holderID, tree, physical]);
+      if (lines.has(line)) return bad(`duplicate lease ${key}`);
       lines.add(line);
       const owner = owners.get(holderID) ?? "";
-      const seenOwner = leaseOwners.get(logical);
-      if (seenOwner !== undefined && seenOwner !== owner) return bad(`duplicate lease ${logical}: held by holders of different owners`);
-      leaseOwners.set(logical, owner);
+      const seenOwner = leaseOwners.get(key);
+      if (seenOwner !== undefined && seenOwner !== owner) return bad(`duplicate lease ${key}: held by holders of different owners`);
+      leaseOwners.set(key, owner);
       if (!keep) continue;
       const record = next.holders.get(holderID);
-      if (record === undefined) return bad(`lease ${logical} names an unknown holder ${holderID}`);
-      const existing = next.leases.get(logical);
+      if (record === undefined) return bad(`lease ${key} names an unknown holder ${holderID}`);
+      const existing = next.leases.get(key);
       if (existing === undefined) {
-        link(next, record, logical, { holders: new Set(), owner, display, repo, shared, pairs: new Map([[pairKey(pair), pair]]) });
+        link(next, record, key, { holders: new Set(), owner, display, repo, shared, pairs: new Map([[pairKey(pair), pair]]) });
         continue;
       }
-      if (existing.shared !== shared) return bad(`lease ${logical} names two shared repositories`);
-      join(next, record, logical, existing);
+      if (existing.shared !== shared) return bad(`lease ${key} names two shared repositories`);
+      join(next, record, key, existing);
       if (!existing.pairs.has(pairKey(pair))) {
         existing.pairs.set(pairKey(pair), pair);
-        indexPair(next, logical, pair);
+        indexPair(next, key, pair);
       }
     }
     if (next.leases.size > cap) return bad(`${next.leases.size} leases exceed the cap of ${cap}`);
@@ -1348,6 +1401,7 @@ export function createLeaseRegistry(seams: LeaseSeams, opts: LeaseOptions): Leas
       filterSearchResults,
       (message): FilterResult => ({ kept: [], omitted: 0, holders: [], invalid: message }),
     ),
+    planHolderOf: safe(planHolderOf, (): Holder | null => null),
     release: safe(release, (): ReleaseResult => ({ released: 0, retained: 0 })),
     releaseTask: safe(releaseTask, (): HoldersReleased => ({ released: 0, holders: [] })),
     sweep,

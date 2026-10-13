@@ -24,8 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gate posts the verdict.
 - **OpenCode v2: work leases** (`routing.leases.mode`, `routing.leases.run`). A child session holds a lease on each
   file it edits in its checkout; another child's edit of that file in the same checkout is refused until the lease is
-  released (a plan task's lease also covers that file in every linked worktree of the repository), search results
-  under another holder's edit are omitted, and `router_run` annotates or refuses a run on a leased target.
+  released (a plan task's lease also refuses another plan task's edit of that path in any linked worktree), search
+  results under another holder's edit are omitted, and `router_run` annotates or refuses a run on a leased target.
 - **OpenCode v2: restart recovery.** In-flight dispatches, held results and pending verifications are journaled in
   `pending.jsonl` in the per-user state directory (`~/.local/state/opencode-model-router`, or
   `$XDG_STATE_HOME/opencode-model-router` when set, outside Windows), never in the temp directory. After a restart the
@@ -45,9 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **OpenCode v2: work leases no longer collide across linked worktrees.** Two child sessions that edit the same
   repo-relative path in two worktrees of one repository (`git worktree add`) are both allowed: an ordinary write lease
   is keyed by its checkout, not by the repository, and a write whose target the router cannot read is refused only while
-  another child holds a lease in the same checkout. The leases of plan tasks stay repository-wide, so two tasks of a
-  plan that edit one path in two slots still refuse each other. Reads were already keyed by the file on disk. OpenCode
-  v1 is unchanged.
+  another child holds a lease in the same checkout. The leases of plan tasks stay repository-wide among plan tasks, so
+  two plan tasks that edit one path in two slots still refuse each other, and a plan child's write whose target the
+  router cannot read is checked against the plan-task leases in the whole repository. Reads were already keyed by the
+  file on disk. OpenCode v1 is unchanged.
 - **OpenCode v2: a resumed background dispatch delivers its own answer.** It no longer takes an earlier turn's
   completion as its own result, even when the earlier turn was still being processed when the parent saw it, nor the
   child's earlier answer. Completions are told apart by the message that carries them rather than by their text, so two

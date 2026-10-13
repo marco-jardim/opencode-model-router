@@ -225,6 +225,29 @@ describe("leases: linked worktrees of one repository (DF-1.1-4)", () => {
     const holder = { holderID: "plan-t2", tree: linked, isChild: true, taskRef: "plan-x:T2", scope: "until-integrated" } as const;
     expect(restarted.acquireWrite(holder, join(linked, "src", "same.ts"))).toMatchObject({ ok: false, reason: "held" });
   });
+
+  // QA-PDF13-5: the plan's home checkout is no slot, so its writers are keyed by it alone (landing refuses a dirty home
+  // checkout). The repository-wide query still finds the plan task's lease from there.
+  it("a root and a plain child in the home checkout may edit a path a plan task holds in its slot", async () => {
+    const { main, linked } = linkedWorktrees();
+    const seams = { realpath: (path: string) => realpathSync.native(path), repoKeyOf: leaseRepoKeyOf, now: () => 1 };
+    const registry = createLeaseRegistry(seams, { runMode: "annotate" });
+    const guard = createLeaseGuard({
+      registry,
+      sessionKind: async (sid) => (sid === "orch-main" ? "root" : "child"),
+      sessionDir: async (sid) => (sid === "plan-t2" ? linked : main),
+      gitRootOf: (dir) => dir,
+      holderLabel: (id) => `session ${id}`,
+      planTaskOf: (sid) => (sid === "plan-t2" ? { planId: "plan-x", taskId: "T2", slot: linked } : undefined),
+      events: { onRelease: () => () => undefined },
+    });
+    const editIn = (sessionID: string, dir: string) =>
+      guard.before({ sessionID, tool: "edit", args: { filePath: join(dir, "src", "same.ts") }, callID: `call-${sessionID}` });
+    await expect(editIn("plan-t2", linked)).resolves.toEqual({});
+    await expect(editIn("orch-main", main)).resolves.toEqual({});
+    await expect(editIn("plain-main", main)).resolves.toEqual({});
+    expect(registry.planHolderOf(main, "src/same.ts")?.holderID).toBe("plan-t2");
+  });
 });
 
 describe("leases: the orchestrator", () => {

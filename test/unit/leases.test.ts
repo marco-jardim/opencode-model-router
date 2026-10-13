@@ -2322,7 +2322,8 @@ describe("DF-1.1-4: write keys per checkout, plan tasks repository-wide", () => 
     const { reg } = checkoutRig();
     expect(reg.acquireWrite(P1, "/w1/src/x.ts")).toMatchObject({ ok: true });
     const second = reg.acquireWrite(P2, "/w2/src/x.ts");
-    expect(second).toMatchObject({ ok: false, reason: "held", path: "/w2/src/x.ts", key: `r:/w1${NUL}src/x.ts` });
+    // QA-PDF13-1: the conflict names the holder's own file (in its checkout), not the requester's copy.
+    expect(second).toMatchObject({ ok: false, reason: "held", path: "/w1/src/x.ts", key: `r:/w1${NUL}src/x.ts` });
     expect(heldBy(second)).toBe("P1");
     expect(reg.acquireWrite(P2, null)).toMatchObject({ ok: false, reason: "unknown-target" });
     expect(reg.acquireWrite(P2, "/w2/src/other.ts")).toMatchObject({ ok: true });
@@ -2371,6 +2372,53 @@ describe("DF-1.1-4: write keys per checkout, plan tasks repository-wide", () => 
       reason: "invalid-snapshot",
       message: expect.stringContaining("two shared repositories"),
     });
+  });
+
+  it("QA-PDF13-1: planHolderOf answers the plan-task holder of a repo-relative path in any checkout", () => {
+    const { reg } = checkoutRig();
+    expect(reg.acquireWrite(P1, "/w1/src/x.ts")).toMatchObject({ ok: true });
+    expect(reg.acquireWrite(child("B", "/w2"), "/w2/src/y.ts")).toMatchObject({ ok: true });
+    expect(reg.planHolderOf("/w2", "src/x.ts")?.holderID).toBe("P1");
+    expect(reg.planHolderOf("/w1", "/w1/src/x.ts")?.holderID).toBe("P1");
+    expect(reg.planHolderOf("/w1", "src/y.ts")).toBeNull(); // only an ordinary child holds it, in /w2
+    expect(reg.planHolderOf("/s1", "src/x.ts")).toBeNull(); // another repository
+    expect(reg.planHolderOf("/w1", "")).toBeNull();
+    expect(reg.planHolderOf("relative", "src/x.ts")).toBeNull();
+    expect(reg.releaseTask("T1").holders).toEqual(["P1"]);
+    expect(reg.planHolderOf("/w2", "src/x.ts")).toBeNull();
+    // A seam without `shared` (one key for the repository) answers the same way.
+    const plain = rig().reg;
+    expect(plain.acquireWrite(P1, "/w1/src/x.ts")).toMatchObject({ ok: true });
+    expect(plain.planHolderOf("/w2", "src/x.ts")?.holderID).toBe("P1");
+  });
+
+  it("QA-PDF13-2: a snapshot from before the fix (no `shared`) is re-keyed to the checkout on restore", () => {
+    const old = rig();
+    expect(old.reg.acquireWrite(A, "/w1/src/x.ts")).toMatchObject({ ok: true });
+    expect(old.reg.acquireWrite(P2, "/w2/src/y.ts")).toMatchObject({ ok: true });
+    const snap = old.reg.snapshot();
+    expect(snap.leases.every((lease) => lease.shared === undefined && lease.logical.startsWith(`r:R${NUL}`))).toBe(true);
+    const { reg } = checkoutRig();
+    expect(reg.restore(snap)).toEqual({ ok: true, leases: 2 });
+    expect(heldBy(reg.acquireWrite(child("B", "/w1"), "/w1/src/x.ts"))).toBe("A");
+    expect(reg.checkRead({ holderID: "C", tree: "/w1", isChild: true }, "/w1/src/x.ts")).toMatchObject({ ok: false, reason: "underEdit" });
+    expect(reg.acquireWrite(child("B", "/w2"), "/w2/src/x.ts")).toMatchObject({ ok: true });
+    expect(heldBy(reg.acquireWrite(P1, "/w1/src/y.ts"))).toBe("P2");
+    const lines = reg.snapshot().leases;
+    expect(lines.find((lease) => lease.holderID === "A")).toMatchObject({ logical: `r:/w1${NUL}src/x.ts`, shared: "R" });
+    expect(lines.find((lease) => lease.holderID === "P2")).toMatchObject({ logical: `r:/w2${NUL}src/y.ts`, shared: "R" });
+    // The same snapshot restored under a seam without `shared` keeps its keys.
+    const same = rig().reg;
+    expect(same.restore(snap)).toEqual({ ok: true, leases: 2 });
+    expect(same.snapshot().leases.map((lease) => lease.logical)).toEqual(snap.leases.map((lease) => lease.logical));
+  });
+
+  it("QA-PDF13-5: a root or a plain child in the home checkout may edit a path a plan task holds in its slot", () => {
+    const { reg } = checkoutRig();
+    expect(reg.acquireWrite(P2, "/w2/src/x.ts")).toMatchObject({ ok: true });
+    const root = { holderID: "root", tree: "/w1", isChild: false, scope: "until-complete" } as const;
+    expect(reg.acquireWrite(root, "/w1/src/x.ts")).toMatchObject({ ok: true });
+    expect(reg.acquireWrite(child("B", "/w1"), "/w1/src/x.ts")).toMatchObject({ ok: true, leased: ["/w1/src/x.ts"] });
   });
 });
 

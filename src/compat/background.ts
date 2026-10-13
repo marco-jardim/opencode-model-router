@@ -2111,7 +2111,8 @@ export function createLeaseGuard(deps: LeaseGuardDeps): LeaseGuard {
           }
           if (r.reason === "unknown-target") {
             return {
-              refuse: `[router] Refused: this ${e.tool} call names no file the router can check, and ${holderLabels(deps, r.holders)} is editing files in this repository. Pass the file path explicitly, or return \`NEED MORE: lease ${holder.tree}\`.`,
+              // DF-1.1-4: an unknown target is checked in the writer's checkout; a plan task's, across the repository.
+              refuse: `[router] Refused: this ${e.tool} call names no file the router can check, and ${holderLabels(deps, r.holders)} is editing files in this ${holder.scope === "until-integrated" ? "repository" : "checkout"}. Pass the file path explicitly, or return \`NEED MORE: lease ${holder.tree}\`.`,
             };
           }
           if (r.reason === "cap") {
