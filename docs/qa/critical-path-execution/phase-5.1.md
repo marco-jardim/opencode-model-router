@@ -155,3 +155,100 @@ Order: **5.1.1 → 5.1.1b → 5.1.2 → (5.1.3 ∥ 5.1.4) → 5.1.5 → QA**.
 5. Inferred DoDs for 6.1 tasks without a block → DF-2 pre-flight lists them; add blocks before approve.
 6. Restart fallbacks fail closed and cost an attempt → no planned restart during the 6.1 run.
 7. Long verifications (≈11 min per pass) slow integration → recorded as a DF-2 metric caveat.
+
+## Tasks
+
+- 5.1.1 `8a4fb46`: `src\executor\create.ts` (access, late runtime, `prepareExecutor`, assembly, process claim, per-plan
+  pools, `buildQueue` with `ensureIntegration`, route resolver, lease port, recovery over one toplevel); runtime
+  `slotsFor`, quiescent slot gc, approve-time `checkSlotsDir`, ownership before attach, verifier hooks.
+- 5.1.1b `2270ebc`: `src\verify\plan-task.ts` over the dispatch engine (D8–D11); `perimeter.ts` plans `plan:` ids;
+  the runtime passes the child's final text to `observe`.
+- 5.1.2 `a513976` (v1 golden, committed alone before registration) and `7ed1f2b` (v2-only registration, root-only
+  actions, provider order 61).
+- 5.1.3 `f91e4f7`: role-agent slots-root allow and executor-home deny.
+- 5.1.4 `443f308`: EXECUTOR.md (4.2 sections written from the code, Assembly and lifecycle, Verification of plan
+  tasks), ROLES.md work roots, OPENCODE_V2.md, docs-drift pins.
+- 5.1.5 `16614a9`: `v2-executor-assembly` A1–A12, `executor-runtime-slots` U1, `executor-create` coverage. Product
+  fixes the tests found: foreign ledgers opened with a writer at start (A2) and queued verified work not restarted after
+  a breaker or QA-cap answer (A12).
+
+## Findings
+
+| Round | Reviewer | Commit | Findings | Status |
+|---|---|---|---|---|
+| 1 | `ses_ec9ebbc96ffeUM4fvmerxD5oon` | `16614a9` | 1 critical (QA-5.1-1 per-module claim: one executor per module copy), 6 major (-2 bound plan child could approve/adopt; -3 plan tasks skipped the return contract; -4 dispose waited on uncancellable gates; -5 start-up git outside workRoots, regression of QA-DF1-19; -6 a failed orchestrator lookup cached for life; -7 automatic gc could wait forever at 100 ms), 7 minor (-8..-14), 2 nits (-15, -16) | fixed in `31a5867` |
+| 2 | same | `31a5867` | -7, -11, -13 partial; 1 major (-17 existing slot worktrees refused the slots-root allow after a restart), 6 minor (-18..-23), 2 nits (-24, -25) | fixed in `93765cb3` |
+| 3 (bounded, §0.7) | same | `93765cb3` | -17, -20, -24 partial; 2 major (-26 a handed-over executor was not wired into the v2 adapter; -27 a missing registered worktree refused the slots-root allow); minors -28..-31 | fixed in `ed39fbb` |
+| 3 re-check | same | `ed39fbb` | -26, -27 fixed; no new blocking/critical/major; minors -32..-34 | closed; ready for DF-2 |
+
+## Fixes
+
+- Round 1 `31a5867`: process-wide claim on `globalThis` with token release (-1); mutating plan actions root-only, bound
+  children read only their own plan (-2); `returnContract` for the child's text (-3); verifier `dispose()` first, a cut
+  verify leaves the task `verifying` (-4); discovery and the slots grant only under D7 inside workRoots (-5, -8); the
+  orchestrator passed per call (-6, -14); `planTagsSettled`, capped backoff, manual gc without tag waits (-7);
+  enqueue failure after an answer still schedules (-9); terminal-only pool gc (-10); purge through a gc-only handle
+  (-11); the child-runner reason (-12); user `/plan` preserved (-13); golden disposal (-15); CHANGELOG (-16); the node
+  `rm` adapter removes an empty directory non-recursively (marker dirs were left behind).
+- Round 2 `93765cb3`: slot worktrees inside the slots root skipped in the overlap check (-17); the adapter keeps a
+  host-defined `/plan` (-18); manual gc waits for pending tags (-19); claim handover to a waiting copy, recovery once
+  (-20); only cut verifications discarded (-21); `open({create:false})`, empty plan dir removed, invalid slotsDir
+  without markers tolerated (-22); earlier reasons kept and documented (-23); drive from the toplevel (-24); golden
+  checkpoint line normalised (-25).
+- Round 3 `ed39fbb`: one idempotent `adopt` path for start and handover, W7 disposal for either (-26, -31); missing
+  registered worktrees skipped only on ENOENT, per-worktree drive resolution (-27).
+
+## Coverage
+
+Orchestrator runs on 2026-10-13 at `ed39fbb`: `tsc --noEmit` clean; 80 affected files (executor, v2, golden,
+docs-drift, roles, plan-registration, verify-plan-task, verify.criteria, gate) 4346 passed / 4 skipped; real-restart
+integration 4/4. Branches: `create.ts` 95.1, `runtime.ts` 92.6, `slots\pool.ts` 94.8, `plan-task.ts` 96.3 (gate 90).
+
+- Deviations:
+  - The orchestrator ran the full suite once by mistake (`vitest run -u <file>` parsed the path as the `-u` value;
+    19370 tests, 31 load timeouts, no snapshot changed).
+  - Hand-applied by the orchestrator when delegates had exhausted their budgets or write scopes: the `queuedAnswerRig`
+    fixture edits, the `ledger.ts` `rm` fallback, two dead `index.ts` lines, the docs-drift re-anchors, the
+    OPENCODE_V2.md sentence, the golden snapshot EOF, the recovery test rewrite for read-only foreign plans, the
+    EXECUTOR.md handover paragraph and CHANGELOG entries.
+  - The EXECUTOR.md 4.2 sections were written from the code, not compared with the architect's draft (the draft file is
+    outside the repository).
+  - Provider outages during the phase (Anthropic OAuth revoked twice, an invalid OpenAI key once) were resumed in the
+    same sessions after the owner fixed them.
+
+## Deferred findings
+
+- QA-5.1-28: `purge` ignores `reported` slots (EBUSY, lock mismatch) and still removes refs and the ledger.
+- QA-5.1-29: a hot-reload copy that starts while the old copy still has `/plan` registered reads it as a user command.
+- QA-5.1-30: a verdict in the dispose micro-window, or a check failure recorded before a cut, is re-verified, not
+  journaled.
+- QA-5.1-32: an `adopt` that throws partway leaves the executor adopted but not started.
+- QA-5.1-33: start begins before the retry hook is awaited; `runtime.start()` does not check `disposed` (pre-existing).
+- QA-5.1-34: a narrow window where one early host retry of a plan child is not stopped.
+- Shared with dispatches, not a plan-task gap: "Now I'll run the tests" is not a progress note (`checker.ts:85`).
+
+## Handoffs
+
+- 6.1 README tool-list entries (5.1.4.c):
+  - `| router_plan | OpenCode v2 only: compile, approve, inspect and control written plans executed in isolated worktree slots, with verification before serial integration. See [Plan executor](docs/EXECUTOR.md). |`
+  - `| /plan <run|approve|status|inbox|answer|pause|resume|abort|land|adopt> … | OpenCode v2 only: control the plan executor; run compiles the plan and, by default, approve starts it. See [Plan executor](docs/EXECUTOR.md#plan-command). |`
+- Follow-up (not DF-2 blockers): real v2 `activity` and refusing adopt of a live bound session; a reverted culprit
+  retrying on its old branch (QA-3.2-10); the deferred minors above.
+- DF-2 pre-flight: `enforcement.verify.graderTimeoutMs` unset or ≥ 300000; list the 6.1 tasks without an
+  `[acceptance]` block; `routing.delegation: roles` and `routing.leases.mode: enforce` in the dogfood config; slots
+  under `D:\git\.omr-cpx-slots\<planId>`.
+
+## Amendments (added during the phase)
+
+- **A-5.1-14** (5.1.5 A2): a plan of another repository is never opened with a writer. Start, `planFor`, the failed-adopt
+  re-attach and compile decide foreignness from a read-only snapshot; foreign status stays available and every
+  mutation is refused (stricter than the 4.2 passive attach, which accepted a pause).
+- **A-5.1-15** (QA-5.1-2): plan authority is root-only for every state-changing action; a bound plan child reads only its
+  own plan. Supersedes the 5.1.2 bound-child exception.
+- **A-5.1-16** (QA-5.1-20, -26): one executor per process with a claim handover to a waiting copy, wired through the
+  same adapter path as at start.
+
+## Verdict
+
+Done at `ed39fbb`: three heavy QA rounds plus a bounded round-3 re-check; every blocking, critical and major finding
+fixed, minors deferred. Merged into `cpx/main`.
