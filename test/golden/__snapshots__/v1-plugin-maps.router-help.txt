@@ -8,4 +8,4 @@ Commands:
 - `/router stats [--since <ISO>]` — routing statistics from the decision log and outcome store (same table as `npm run routing:stats` (in a clone))
 - `/tiers`, `/preset`, `/budget`, `/bypass`, `/annotate-plan`
 router: engine=static build=<normalized>
-router: last checkpoint=DF4
+router: last checkpoint=<normalized>

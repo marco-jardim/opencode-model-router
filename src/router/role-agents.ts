@@ -266,7 +266,7 @@ function executorDirectoryRoot(path: string, realpath: Realpath, requireSame = t
   return { root: canonical };
 }
 
-/** D6: a trusted slots root grants no worktree ancestor/descendant, including canonical aliases. */
+/** D6: reject overlap with non-slot worktrees, but existing executor worktrees must not block future slots. */
 function executorSlotsRootPattern(path: string, worktrees: readonly string[], realpath: Realpath): { pattern?: string; problem?: string } {
   const problem = slotsDirProblem(path);
   if (problem !== undefined) return { problem };
@@ -274,13 +274,17 @@ function executorSlotsRootPattern(path: string, worktrees: readonly string[], re
   if (canonical.root === undefined) return { problem: canonical.problem };
   const after = slotsDirProblem(canonical.root);
   if (after !== undefined) return { problem: `canonical form ${canonical.root} ${after}` };
-  for (const worktree of worktrees) {
+  for (const [index, worktree] of worktrees.entries()) {
     let root: string;
     try {
       root = realpath(worktree);
     } catch {
       return { problem: `worktree ${worktree} has no canonical long form` };
     }
+    // Executor worktrees live at <root>/<plan>/slot-N, integration or ci.
+    // Never exempt the first (main) checkout, or ordinary non-slot descendants.
+    const relative = dirKey(root).slice(dirKey(canonical.root).length + 1);
+    if (index > 0 && isOrContains(canonical.root, root) && /^[^/]+\/(?:slot-[1-9]\d{0,2}|integration|ci)$/.test(relative)) continue;
     if ([path, canonical.root].some((slots) => [worktree, root].some((tree) => isOrContains(slots, tree) || isOrContains(tree, slots)))) {
       return { problem: `is inside or an ancestor of worktree ${worktree}` };
     }
@@ -513,6 +517,7 @@ export async function registerRoleAgents(
     const tiers = resolveActiveTiers(cfg);
     const hasLocalActions = [...table.roles.values()].some(roleHasLocalActions);
     let worktrees: string[] = [];
+    let worktreeListingProblem: string | undefined;
     // QA-DF1-19: a location outside configured `routing.workRoots` gets no worktree listing or worktree rules.
     // Unset or empty `workRoots`: the worktrees are listed as before.
     const outside = locationOutsideWorkRoots(opts.directory, routing.workRoots, process.platform, opts.realpath ?? nativeRealpath);
@@ -520,6 +525,7 @@ export async function registerRoleAgents(
       try {
         worktrees = await (opts.listWorktrees ?? listWorktrees)(opts.directory);
       } catch (error) {
+        worktreeListingProblem = errorText(error);
         opts.warn("roles:worktrees", `${PREFIX}the repository's worktrees could not be listed (${errorText(error)}); role agents get no worktree external_directory rule`);
       }
     }
@@ -563,9 +569,18 @@ export async function registerRoleAgents(
       }
       // An unresolved home cannot be protected by a final deny: do not grant the slots root either (D6).
       if (home !== undefined && hasLocalActions && (slotsDir !== null || process.platform === "win32")) {
-        const drive = /^([A-Za-z]):[\\/]/.exec(worktrees[0] ?? "");
+        // Match create.ts's location toplevel, not Git's first (main) worktree on another drive.
+        let toplevel: string | undefined;
+        try {
+          const directory = realpath(opts.directory);
+          toplevel = worktrees.map((tree) => realpath(tree)).filter((tree) => isOrContains(tree, directory))
+            .sort((a, b) => b.length - a.length)[0];
+        } catch { /* A missing canonical location cannot select a default drive. */ }
+        const drive = /^([A-Za-z]):[\\/]/.exec(toplevel ?? "");
         const root = slotsDir ?? (drive === null ? undefined : `${drive[1]}:\\.omr-slots`);
-        const slots = root === undefined
+        const slots = worktreeListingProblem !== undefined
+          ? { problem: `the worktree listing failed (${worktreeListingProblem})` }
+          : root === undefined
           ? { problem: "the repository toplevel is not on a drive-letter path" }
           : executorSlotsRootPattern(root, worktrees, realpath);
         if (slots.pattern === undefined) {

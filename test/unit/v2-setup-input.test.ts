@@ -80,6 +80,21 @@ describe("src/v2.ts: the host objects the plugin receives", () => {
     expect(access.unavailable()).toBe("the plan executor is not available: the child runner is not available");
   });
 
+  it.each([
+    ["configuration gate", "tiers", "routing.delegation must be roles at start"],
+    ["repository discovery", "roles", "the repository toplevel could not be resolved"],
+    ["workRoots gate", "roles", "the location is outside routing.workRoots"],
+  ])("QA-5.1-23 a missing child runner does not overwrite the earlier %s reason", async (label, delegation, reason) => {
+    const workRoots = label === "workRoots gate" ? [process.platform === "win32" ? "E:/allowed" : "/allowed"] : [];
+    vi.mocked(configModule.loadConfig).mockReturnValue(configuration(delegation, "enforce", "always", workRoots));
+    vi.spyOn(executorModule, "prepareExecutor").mockResolvedValue({ ok: false, reason });
+    vi.mocked(createV2Runtime).mockReturnValueOnce({ client: {} } as unknown as ReturnType<typeof createV2Runtime>);
+    await v2Plugin.setup(context() as unknown as Plugin.Context);
+    const access = captured.input?.routerExecutor as executorModule.ExecutorAccess;
+    expect(access.runtime()).toBeNull();
+    expect(access.unavailable()).toBe(`the plan executor is not available: ${reason}`);
+  });
+
   it("hands over the late executor access, plan annotate port and slot verifier port (Phase 5.1 D1)", async () => {
     await v2Plugin.setup(context() as unknown as Plugin.Context);
     expect(captured.input?.routerExecutor).toEqual(expect.objectContaining({

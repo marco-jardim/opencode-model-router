@@ -75,7 +75,7 @@ export default {
     const hooks = await ModelRouterPlugin(input as unknown as PluginInput);
     const prepared = await prep;
     if (!prepared.ok) access.clear(prepared.reason);
-    if (runtime.childRunner === undefined) access.clear("the child runner is not available");
+    if (prepared.ok && runtime.childRunner === undefined) access.clear("the child runner is not available");
     return registerV2Hooks(ctx, hooks, runtime, {
       executor: (host) => createExecutor({ routerHost: "v2", directory }, { host, prepared, access, ...(annotate ? { annotate } : {}) }) ?? null,
       ...(ingest ? { ingest } : {}), ...(isBypassed ? { isBypassed } : {}), ...(budgetSnapshot ? { budgetSnapshot } : {}),

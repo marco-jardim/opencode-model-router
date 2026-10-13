@@ -1,7 +1,7 @@
 // Plan-task verification over the dispatch verification engine (Phase 5.1, D8-D11, A-5.1-4/-8/-9/-12/-13).
 import { realpathSync } from "node:fs";
 import { isAbsolute, posix, resolve, win32 } from "node:path";
-import type { PlanTaskContext, PlanTaskVerifier } from "../executor/runtime";
+import type { PlanTaskContext, PlanTaskVerdict, PlanTaskVerifier } from "../executor/runtime";
 import { leaseHolderID, type Attempt, type SlotLease, type TaskNode, type Verdict as SlotVerdict } from "../executor/types";
 import { createGitRunner } from "../executor/git";
 import { hardeningArgs } from "../router/git-tools";
@@ -315,6 +315,8 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
   };
   const unverifiable = (reason: string, dod?: DoD): { verdict: SlotVerdict; findings: string; ref: string } =>
     slotVerdictOf(unverifiableGateResult(reason, dod?.source ?? "inferred", false));
+  /** QA-5.1-21: a verification dispose cut before it decided anything; the runtime discards it (never journaled). */
+  const cutVerdict = (dod?: DoD): PlanTaskVerdict => ({ ...unverifiable(PLAN_TASK_SHUTDOWN_REASON, dod), cut: true });
   /** The wiring's own planning rule (A-5.1-12) under the current config; a planning error counts as planned (fail closed). */
   const perimeterWouldBePlanned = (id: string, slotPath: string): boolean => {
     try {
@@ -499,7 +501,8 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
     }
   }
 
-  async function verifyNow(task: TaskNode, slot: SlotLease, attempt: Attempt, parent: string): Promise<{ verdict: SlotVerdict; findings: string; ref: string }> {
+  async function verifyNow(task: TaskNode, slot: SlotLease, attempt: Attempt, parent: string,
+    onDecided: (decided: PlanTaskVerdict) => void): Promise<PlanTaskVerdict> {
     const key = keyOf(slot.planId, task.id, attempt.n);
     let record = records.get(key);
     let prepared: PreparedVerification;
@@ -599,13 +602,17 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
         res = await withReruns(dod, planTaskGraderBudgetMs(budget.gateBudgetMs, graderTier, override));
       }
       // QA-5.1-4: a gate cut by dispose judged nothing: no verdict reaches the outcome store.
-      if (disposing) return unverifiable(PLAN_TASK_SHUTDOWN_REASON, record.dod);
+      // QA-5.1-21: it is marked as a cut, which the runtime discards; nothing below runs for it (no `onVerdict`).
+      if (disposing) return cutVerdict(record.dod);
       // D10 (A-5.1-13): no R11 lineage. QA-3.1-2 / QA-3.1-3 caveats as on a dispatch.
       res = applyDispatchCaveats(res, gatePrepared);
+      // QA-5.1-21: from here the verdict is decided: `verify` returns it even when dispose cuts its wait afterwards.
+      const decided = slotVerdictOf(res);
+      onDecided(decided);
       if (child !== "" && res.verdict.skipped !== true) {
         try { deps.onVerdict?.(child, res.verdict); } catch (error) { warn("plan-task verdict not ingested", error); }
       }
-      return slotVerdictOf(res);
+      return decided;
     } catch (error) {
       return unverifiable(`verification unavailable: ${scrubText(error instanceof Error ? error.message : String(error))}`, record?.dod);
     } finally {
@@ -616,14 +623,15 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
   }
 
   /** QA-5.1-6/-14: the orchestrator is the one the runtime read for THIS call (the grader's parent after an adopt too). */
-  async function verify(task: TaskNode, slot: SlotLease, attempt: Attempt, ctx?: PlanTaskContext): Promise<{ verdict: SlotVerdict; findings: string; ref: string }> {
-    const cut = (): { verdict: SlotVerdict; findings: string; ref: string } =>
-      unverifiable(PLAN_TASK_SHUTDOWN_REASON, records.get(keyOf(slot.planId, task.id, attempt.n))?.dod);
+  async function verify(task: TaskNode, slot: SlotLease, attempt: Attempt, ctx?: PlanTaskContext): Promise<PlanTaskVerdict> {
+    const cut = (): PlanTaskVerdict => cutVerdict(records.get(keyOf(slot.planId, task.id, attempt.n))?.dod);
     if (disposing) return cut();
+    // QA-5.1-21: a verdict decided before dispose cut the wait (and already handed to `onVerdict`) is returned, never a cut.
+    let decided: PlanTaskVerdict | null = null;
     try {
-      return await untilShutdown(verifyNow(task, slot, attempt, orchestrator(ctx)));
+      return await untilShutdown(verifyNow(task, slot, attempt, orchestrator(ctx), (v) => { decided = v; }));
     } catch (error) {
-      if (error instanceof PlanTaskShutdownError) return cut();
+      if (error instanceof PlanTaskShutdownError) return decided ?? cut();
       throw error;
     }
   }

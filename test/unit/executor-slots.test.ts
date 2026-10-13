@@ -594,6 +594,48 @@ describe("SlotPool lifecycle", () => {
 // Concurrency, special slots, input validation, open()
 // ---------------------------------------------------------------------------------------------------------------
 
+describe("QA-5.1-22: gc-only handle and the purge's empty plan directory", () => {
+  it("open({ create: false }) creates no directory, never leases, and gcs a missing slotsDir to nothing", async () => {
+    const h = harness();
+    await h.pool.open({ create: false });
+    expect(await h.fs.lstat(SLOTS)).toBeNull();
+    await expect(h.pool.acquire(PLAN, "task-1", C1)).rejects.toMatchObject({ code: "E_PLAN_STATE" });
+    expect(await h.pool.gc(async () => true)).toEqual({ removed: [], reported: [] });
+    expect(await h.fs.lstat(SLOTS)).toBeNull();
+    expect(await h.pool.removeEmptyDir()).toBe(true);
+    expect(await h.fs.lstat(SLOTS)).toBeNull();
+  });
+
+  it("a gc-only handle collects a finished plan's slots; removeEmptyDir then removes the empty slotsDir", async () => {
+    const live = harness();
+    await live.pool.open();
+    const lease = await live.pool.acquire(PLAN, "task-1", C1);
+    await live.pool.release(lease.slot);
+    live.pool.close();
+    // The gc-only handle works on the same repository: the same files AND the same git, whose worktree list names the
+    // slot as locked by the executor (retireSlot deletes nothing git does not list that way).
+    const pool = createSlotPool({
+      planId: PLAN, repoKey: "repo-key", toplevel: TOP, slotsDir: SLOTS, markersDir: MARKERS, executorHome: HOME,
+      maxParallel: 4, git: live.git, fs: live.fs, clock: live.clock, provisioner: live.prov, platform: "win32",
+    });
+    await pool.open({ create: false });
+    expect(await live.fs.lstat(SLOTS)).not.toBeNull();
+    const out = await pool.gc(async (id) => id === PLAN);
+    expect(out).toEqual({ removed: [slotPath("slot-1")], reported: [] });
+    expect(await pool.list()).toEqual([]);
+    expect(await pool.removeEmptyDir()).toBe(true);
+    expect(await live.fs.lstat(SLOTS)).toBeNull();
+  });
+
+  it("removeEmptyDir keeps a slotsDir that still holds a slot of the plan", async () => {
+    const h = harness();
+    await h.pool.open();
+    await h.pool.acquire(PLAN, "task-1", C1);
+    expect(await h.pool.removeEmptyDir()).toBe(false);
+    expect(await h.fs.lstat(SLOTS)).not.toBeNull();
+  });
+});
+
 describe("SlotPool concurrency", () => {
   it("8 acquires on 4 slots: 4 succeed with distinct slots, 4 are refused as unavailable", async () => {
     const h = harness({ maxParallel: 4 });

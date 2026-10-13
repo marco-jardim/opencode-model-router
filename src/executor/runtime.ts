@@ -389,12 +389,19 @@ export interface PlanTaskContext {
   orchestratorSessionID: string;
 }
 
+/**
+ * QA-5.1-21: a plan-task verdict. `cut: true` marks a verification dispose cut before it decided anything (it judged
+ * nothing: the runtime discards it, and the verifier never hands it to `onVerdict`). Any other result is a real verdict,
+ * journaled even when it resolves after dispose began.
+ */
+export type PlanTaskVerdict = Awaited<ReturnType<SlotVerifier["verify"]>> & { readonly cut?: true };
+
 /** Optional attempt observations used by the dispatch-backed plan-task verifier. */
 export interface PlanTaskVerifier extends SlotVerifier {
   begin?(task: TaskNode, slot: SlotLease, attempt: Attempt, ctx?: PlanTaskContext): void | Promise<void>;
   /** `finalText`: the child's final text when the runtime holds it (the row-15 result text, else the last assistant text). */
   observe?(task: TaskNode, slot: SlotLease, attempt: Attempt, finalText?: string, ctx?: PlanTaskContext): void | Promise<void>;
-  verify(task: TaskNode, slot: SlotLease, attempt: Attempt, ctx?: PlanTaskContext): ReturnType<SlotVerifier["verify"]>;
+  verify(task: TaskNode, slot: SlotLease, attempt: Attempt, ctx?: PlanTaskContext): Promise<PlanTaskVerdict>;
   forget?(planId: PlanId, taskId: TaskId, attempt: number): void | Promise<void>;
   /**
    * QA-5.1-4: called FIRST by `runtime.dispose`. Cuts every in-flight verification (gate deadlines, grader sessions, backoff
@@ -411,6 +418,11 @@ export interface RuntimeDeps {
   slots: SlotPool;
   /** Per-plan pools; legacy callers keep using `slots`. */
   slotsFor?(planId: PlanId): SlotPool;
+  /**
+   * QA-5.1-22: the purge's full gc of a finished plan (create.ts `PlanSlotPools.purge`: a gc-only handle that creates no
+   * directory and removes the plan's empty slots directory). Without it, purge runs `slotsFor(planId).gc`.
+   */
+  purgeSlots?(planId: PlanId, finished: Parameters<SlotPool["gc"]>[0]): ReturnType<SlotPool["gc"]>;
   /** Revalidate the fixed slots directory before approval has any side effects. */
   checkSlotsDir?(slotsDir: string, toplevel: string): void | Promise<void>;
   scheduler: Scheduler;
@@ -639,6 +651,8 @@ const QUEUE_DISPOSE_MS = 10_000;
 export const COLLECT_RETRY_BASE_MS = 100;
 /** QA-5.1-7: the cap of the finished-plan collection backoff. */
 export const COLLECT_RETRY_MAX_MS = 30_000;
+/** QA-5.1-19: what a manual gc reports for a completed plan whose phase tag is still pending (its slots are kept). */
+export const GC_TAG_PENDING = "a phase tag is still pending; retry later";
 
 /** QA-5.1-7: the delay of the re-check after one of `delay`: doubled, capped at COLLECT_RETRY_MAX_MS. */
 export function nextCollectDelay(delay: number): number {
@@ -2161,12 +2175,19 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
    * M38, second half: the verifier on a `verifying` task; PASS enqueues, FAIL goes to the retry decision. Recovery reruns
    * it for a task left `verifying` (the verdict batch re-checks the state, so the verdict is written once).
    */
-  async function verifyAttempt(p: PlanRt, taskId: TaskId, n: number, lease: SlotLease): Promise<void> {
+  function verifyAttempt(p: PlanRt, taskId: TaskId, n: number, lease: SlotLease): Promise<void> {
+    // QA-5.1-21: tracked on every path (a recovery re-verify too, not only an end's processing), so dispose's wait for running
+    // work covers the journaling of a verdict that settles after the verifier was cut; `closePlan` runs after that wait.
+    return track(verifyAttemptNow(p, taskId, n, lease));
+  }
+
+  async function verifyAttemptNow(p: PlanRt, taskId: TaskId, n: number, lease: SlotLease): Promise<void> {
     // QA-4.2-16: held until the leases are back (`retryHeldLeases` resumes it).
     if (p.leaseHeld.has(taskId)) return;
     let verdict: Verdict;
     let findings: string;
     let ref: string | null;
+    let cut: boolean;
     try {
       const cur = own(p.writer.ledger, taskId);
       const att = cur === null ? undefined : cur.attempts.find((x) => x.n === n);
@@ -2178,15 +2199,21 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       verdict = v.verdict;
       findings = v.findings;
       ref = v.ref;
+      cut = v.cut === true;
     } catch (e) {
       verdict = "unverifiable";
       findings = errorText(e);
       ref = null;
+      // A throw decided no verdict either: under dispose (a closed pool, a cut check) it is a cut.
+      cut = disposed || p.disposed || d.verifier.disposing === true;
     }
     finalTexts.delete(`${p.planId}/${taskId}#${n}`);
     // QA-5.1-4: a verification cut by dispose judged nothing. Nothing is journaled: the task stays `verifying`, which recovery
     // re-verifies (R2); no failed transition, no attempt used, no breaker sample.
-    if (disposed || p.disposed || d.verifier.disposing === true) {
+    // QA-5.1-21: only an explicit cut (`cut: true`) is discarded. A real verdict decided before dispose began, and already
+    // handed to the verifier's `onVerdict`, is journaled: the writer stays open until `closePlan`, which dispose runs after
+    // the wait for this work.
+    if (cut) {
       d.log("info", `verification of ${p.planId}/${taskId}#${n} cut by dispose; recovery re-verifies it`);
       return;
     }
@@ -4118,11 +4145,24 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     },
 
     async gc() {
-      return d.slots.gc(async (planId) => {
+      // A plan's answer may be asked more than once in one gc (the pool, then its facade): reported once.
+      const tagPending = new Set<PlanId>();
+      const report = await d.slots.gc(async (planId) => {
         const known = plans.get(planId);
         // QA-5.1-7 (EXECUTOR.md): a manual gc collects a finished plan once nothing writes its slots (no live child, no task
-        // in flight, no open integration entry); tag settlement is the automatic collection's wait, never the user's.
-        if (known !== undefined) return (known.writer.ledger.status === "completed" || known.writer.ledger.status === "aborted") && idle(known);
+        // in flight, no open integration entry). QA-5.1-19: a completed plan also waits for its phase tags: between tag
+        // retries the integration entry is rolled back (it reads as idle) while the retry still tags in the integration
+        // worktree. An aborted plan tags nothing (planTagsSettled).
+        if (known !== undefined) {
+          const st = known.writer.ledger.status;
+          if (st !== "completed" && st !== "aborted") return false;
+          if (!idle(known)) return false;
+          if (!planTagsSettled(known.writer.ledger)) {
+            tagPending.add(planId);
+            return false;
+          }
+          return true;
+        }
         try {
           const l = await d.store.read(planId);
           return l.status === "completed" || l.status === "aborted";
@@ -4131,6 +4171,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
           throw e;
         }
       });
+      if (tagPending.size === 0) return report;
+      // QA-5.1-19: the refusal is reported, not silent: the user retries once the queue settled the tag.
+      return { ...report, reported: [...report.reported, ...[...tagPending].map((id) => `plan ${id}: ${GC_TAG_PENDING}`)] };
     },
 
     async exportPlan(planId) {
@@ -4145,7 +4188,10 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       await closePlan(p);
       // QA-5.1-11: the full gc runs before the ledger is removed; a pool that collection already closed still answers it
       // through a gc-only handle (create.ts PlanSlotPools), so a slot a partial gc could not remove is retried here.
-      await slotsFor(planId).gc(async (id) => (id === planId ? true : null));
+      const purged = async (id: PlanId): Promise<boolean | null> => (id === planId ? true : null);
+      // QA-5.1-22: an invalid slotsDir with slot markers refuses here, before any ref or the ledger is removed.
+      if (d.purgeSlots !== undefined) await d.purgeSlots(planId, purged);
+      else await slotsFor(planId).gc(purged);
       for (const ns of ["heads", "tags"]) {
         const prefix = `refs/${ns}/omr/${planId}/`;
         const r = await d.git.run(["for-each-ref", "--format=%(refname)", prefix], { cwd: toplevel, timeoutMs: GIT_TIMEOUT_MS });
@@ -4258,7 +4304,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       disposed = true;
       // QA-5.1-4: the verifier is cut FIRST (gate deadlines, grader sessions, backoff sleeps), so no pending verify keeps the
       // wait for running work below (and the process claim) for the length of a gate. Its synchronous part runs now; it is
-      // awaited after the plans are detached. A cut verdict is never journaled (`verifyAttempt`).
+      // awaited after the plans are detached. A cut verdict is never journaled (`verifyAttempt`); QA-5.1-21: a real verdict
+      // that settles now is, before `closePlan` below.
       let verifierCut: Promise<void> = Promise.resolve();
       if (d.verifier.dispose !== undefined) {
         try {

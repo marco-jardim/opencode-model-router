@@ -136,7 +136,7 @@ function fixture() {
   const ctx = {
     location: { directory: "/project", project: { directory: "/project" } },
     agent: { reload: vi.fn(async () => {}), list: vi.fn(async () => ({ data: Object.values(agents) })), transform: vi.fn(async (cb: any) => { transforms.agent = cb; cb(editors.agent); return register(); }) },
-    command: { reload: vi.fn(async () => {}), transform: vi.fn(async (cb: any) => { transforms.command = cb; cb(editors.command); return register(); }) },
+    command: { list: vi.fn(async () => ({ data: Object.values(commands) })), reload: vi.fn(async () => {}), transform: vi.fn(async (cb: any) => { transforms.command = cb; cb(editors.command); return register(); }) },
     tool: {
       transform: vi.fn(async (cb: any) => { transforms.tool = cb; cb(editors.tool); return register(); }),
       hook: vi.fn(async (name: string, cb: any) => { toolHooks[name] = cb; return register(); }),
@@ -171,6 +171,32 @@ function fixture() {
 const call = { sessionID: "child", agent: "fast", messageID: "message", id: "call" };
 
 describe("OpenCode 2 hook adapter", () => {
+  it("QA-5.1-18 preserves a host /plan through registerV2Hooks and warns only once across registry rebuilds", async () => {
+    const f = fixture();
+    const userPlan = { name: "plan", description: "User planning command", execute: vi.fn(async () => {}) };
+    f.commands.plan = userPlan;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await f.start({ config: async (cfg: { command: Record<string, unknown> }) => {
+        cfg.command.plan = { description: "Executor plan", template: "executor" };
+        cfg.command.router = { template: "router" };
+      } });
+      f.transforms.command(f.editors.command);
+      expect(f.ctx.command.list).toHaveBeenCalledOnce();
+      expect(f.commands.plan).toBe(userPlan);
+      expect(f.commands.router).toBeDefined();
+      expect(warn.mock.calls.filter(([message]) => String(message).includes("/plan command conflict"))).toHaveLength(1);
+    } finally { warn.mockRestore(); }
+  });
+
+  it("QA-5.1-18 still registers the executor /plan when the host has none", async () => {
+    const f = fixture();
+    await f.start({ config: async (cfg: { command: Record<string, unknown> }) => {
+      cfg.command.plan = { description: "Executor plan", template: "executor" };
+    } });
+    expect(f.commands.plan.description).toBe("Executor plan");
+  });
+
   it.each([false, true])("filters v2 grep model content and raw structured matches (parts=%s)", async parts => {
     const f = fixture();
     await f.start({ config: async (cfg: { agent: Record<string, unknown> }) => { cfg.agent.fast = { permission: readOnlyPermissions() }; } });

@@ -893,14 +893,36 @@ describe("verifier arms", () => {
     expect(v.disposing).toBe(true);
     expect(result.verdict).toBe("unverifiable");
     expect(result.findings).toMatch(/the plugin is shutting down/);
+    expect(result.cut).toBe(true); // QA-5.1-21: marked, so the runtime discards it
     expect(h.aborted).toEqual(["grader-hung"]);
     expect((h.gateDepsCalls[0]![3] as { signal: AbortSignal }).signal.aborted).toBe(true);
     expect(h.verdicts).toEqual([]);
     // A verify after dispose is cut at once: nothing runs.
     acceptMock.mockClear();
-    expect((await v.verify(t, slot(), attempt())).findings).toMatch(/shutting down/);
+    const after = await v.verify(t, slot(), attempt());
+    expect(after.findings).toMatch(/shutting down/);
+    expect(after.cut).toBe(true);
     expect(acceptMock).not.toHaveBeenCalled();
     await v.dispose?.();
+  });
+
+  it("QA-5.1-21: a verdict decided before dispose cut the wait is returned as decided (not a cut) and was ingested once", async () => {
+    acceptMock.mockImplementation(async () => pass());
+    const h = harness();
+    const t = task({ text: "x\n[acceptance]\ncriteria: works\n[/acceptance]" });
+    const v = createPlanTaskVerifier(h.deps);
+    // Dispose starts right after the verdict was decided and handed to onVerdict, before verify's own wait settled.
+    h.deps.onVerdict = (_child, verdict) => { h.verdicts.push(verdict.outcome ?? ""); void v.dispose?.(); };
+    await v.begin?.(t, slot(), attempt());
+    h.git.head = CANDIDATE;
+    h.git.branch = t.branch ?? "";
+    await v.observe?.(t, slot(), attempt());
+    const result = await v.verify(t, slot(), attempt());
+    expect(v.disposing).toBe(true);
+    expect(h.verdicts).toEqual(["pass"]);
+    expect(result.verdict).toBe("pass");
+    expect(result.cut).toBeUndefined();
+    expect(result.findings).not.toMatch(/shutting down/);
   });
 
   it("QA-5.1-4: dispose cancels a backoff sleep; the transient result is never re-run nor ingested", async () => {

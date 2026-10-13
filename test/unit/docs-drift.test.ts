@@ -575,7 +575,7 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     expect(command).toContain("On v1 that user command runs without an executor `/plan` notice");
   });
 
-  it("quotes every assembly unavailable reason from create.ts", () => {
+  it("quotes every assembly unavailable reason from create.ts and v2.ts (QA-5.1-23)", () => {
     const source = read("src/executor/create.ts");
     const reasons = [
       ...[...source.matchAll(/\babsent\("([^"\n]+)"\)/g)].map((m) => m[1]!),
@@ -587,8 +587,14 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
       "enforcement.verify.require is never", "the lease registry is not available", "the child runner is not available",
       "another plan executor already owns this process", "not a git repository",
     ]);
+    const setup = read("src/v2.ts");
+    const setupReasons = [...setup.matchAll(/\?\s*"([^"\n]+)"|access\.clear\("([^"\n]+)"\)/g)].map((m) => (m[1] ?? m[2])!);
+    expect(setupReasons).toEqual([
+      "routing.delegation must be roles at start", "routing.leases.mode must be enforce", "enforcement.verify.require is never",
+      "the location is outside routing.workRoots", "the child runner is not available",
+    ]);
     const assembly = sectionOf(doc, "## Assembly and lifecycle");
-    for (const reason of reasons) expect(assembly, reason).toContain(`\`${reason}\``);
+    for (const reason of [...reasons, ...setupReasons]) expect(assembly, reason).toContain(`| \`${reason}\` |`);
     const prefixes = [...source.matchAll(/(?:absent\(|reason: )`((?:assembly|repository discovery) failed: )\$\{/g)].map((m) => m[1]!);
     expect(prefixes).toEqual(["assembly failed: ", "repository discovery failed: "]);
     for (const prefix of prefixes) expect(assembly).toContain(`\`${prefix}<error>\``);
@@ -650,7 +656,7 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     // Required dispatch-gate wiring: modeA/trivial:false cannot skip the gate; accept is awaited directly, not deferred.
     // QA-5.1-14: the grader's parent and creator are the orchestrator the runtime passes with this verify call.
     expect(source).toContain("deps.buildGateDeps(parent, graders, prepared, deadline, false, parent)");
-    expect(source).toContain("verifyNow(task, slot, attempt, orchestrator(ctx))");
+    expect(source).toContain("verifyNow(task, slot, attempt, orchestrator(ctx), (v) => { decided = v; })");
     expect(source).toMatch(/trivial: false,\s+mode: "modeA"/);
     // QA-5.1-4: still awaited directly; only dispose (never a deferral) can cut the wait.
     expect(source).toContain("await untilShutdown(withTimeout(accept(delegation, artefact, gateDeps), deadline.remaining(), \"verification gate\"))");

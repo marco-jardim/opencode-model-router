@@ -217,6 +217,48 @@ describe("PlanSlotPools lazy facades", () => {
     expect(made.get("plan-b")?.close).toHaveBeenCalledOnce();
     await expect(b.acquire("plan-b", "plan:plan-b:T1", "c".repeat(40))).rejects.toMatchObject({ code: "E_PLAN_STATE" });
     expect(made.get("plan-b")?.open).toHaveBeenCalledOnce();
+    // QA-5.1-22: the gc-only handle creates no directory.
+    expect(made.get("plan-b")?.open).toHaveBeenCalledWith({ create: false });
+  }, 15_000);
+
+  it("QA-5.1-22: purge closes the live pool, collects through a gc-only handle and removes the empty plan directory", async () => {
+    const { store, factory, made, log } = await rig();
+    const removeEmptyDir = vi.fn(async () => true);
+    const make = factory.getMockImplementation()!;
+    factory.mockImplementation(ledger => Object.assign(make(ledger), { removeEmptyDir }));
+    const markers = vi.fn(async () => 0);
+    const pool = new PlanSlotPools({ store, toplevel: "C:/repo", makePool: factory, log, markers }); pools.push(pool);
+    await pool.of("finished").list();
+    const live = made.get("finished")!;
+    const order: string[] = [];
+    removeEmptyDir.mockImplementation(async () => { order.push("rmdir"); return true; });
+    const result = await pool.purge("finished", async id => { order.push(`gc:${id}`); return id === "finished" ? true : null; });
+    expect(result).toEqual({ removed: ["finished"], reported: [] });
+    expect(live.close).toHaveBeenCalled();
+    const handle = made.get("finished")!;
+    expect(handle).not.toBe(live);
+    expect(handle.open).toHaveBeenCalledExactlyOnceWith({ create: false });
+    expect(handle.close).toHaveBeenCalledOnce();
+    expect(order).toEqual(["gc:finished", "rmdir"]);
+    expect(markers).not.toHaveBeenCalled();
+    await expect(pool.of("finished").acquire("finished", "plan:finished:T1", "c".repeat(40))).rejects.toMatchObject({ code: "E_PLAN_STATE" });
+  }, 15_000);
+
+  it("QA-5.1-22: purge with an invalid slotsDir skips the gc when the plan has no slot marker and refuses when it has some", async () => {
+    const { store, factory, log } = await rig();
+    factory.mockImplementation(() => { throw new ExecutorError("E_INVALID_INPUT", "invalid slotsDir C:/repo/slots: overlaps the repository"); });
+    let count = 0;
+    const markers = vi.fn(async () => count);
+    const pool = new PlanSlotPools({ store, toplevel: "C:/repo", makePool: factory, log, markers }); pools.push(pool);
+    expect(await pool.purge("finished", async () => true)).toEqual({ removed: [], reported: [] });
+    expect(markers).toHaveBeenCalledWith("finished");
+    count = 2;
+    const refused = pool.purge("finished", async () => true);
+    await expect(refused).rejects.toMatchObject({ code: "E_PLAN_STATE" });
+    await expect(pool.purge("finished", async () => true)).rejects.toThrow(/still has 2 slot marker\(s\) but its slotsDir is invalid/);
+    // Any other failure is not an invalid slotsDir: it propagates.
+    factory.mockImplementation(() => { throw new Error("disk gone"); });
+    await expect(pool.purge("finished", async () => true)).rejects.toThrow("disk gone");
   }, 15_000);
 
   it("gc opens only terminal plans or already-open pools and continues after an invalid slotsDir", async () => {
@@ -297,6 +339,13 @@ describe("createExecutor assembly seams", () => {
     for (const root of roots.splice(0)) await removeDirWhenReleased(root);
   }, 30_000);
 
+  // QA-5.1-20: a copy refused by the claim waits on a process-wide set. Registered after this describe's other hooks, so it
+  // runs first: no waiter of one test assembles an executor when the next hook (or test) releases the claim.
+  afterEach(() => {
+    const waiters: unknown = Reflect.get(globalThis, Symbol.for("omr.executor.claim.waiters.v1"));
+    if (waiters instanceof Set) waiters.clear();
+  });
+
   function slotsDouble() {
     return {
       open: vi.fn(async () => {}), close: vi.fn(),
@@ -305,6 +354,7 @@ describe("createExecutor assembly seams", () => {
       reset: vi.fn<SlotPool["reset"]>(async () => {}), cleanForChecks: vi.fn<SlotPool["cleanForChecks"]>(async () => {}),
       release: vi.fn<SlotPool["release"]>(async () => {}), get: vi.fn<SlotPool["get"]>(async () => null),
       list: vi.fn<SlotPool["list"]>(async () => []), gc: vi.fn<SlotPool["gc"]>(async () => ({ removed: [], reported: [] })),
+      removeEmptyDir: vi.fn(async () => true),
     };
   }
 
@@ -730,6 +780,10 @@ describe("createExecutor assembly seams", () => {
     expect(secondAccess.unavailable()).toBe("the plan executor is not available: another plan executor already owns this process");
 
     await first.runtime.dispose();
+    // QA-5.1-20: the waiting copy (another module copy) took the released claim; its release frees it for a later copy.
+    const retried = secondAccess.runtime();
+    expect(retried, secondAccess.unavailable()).not.toBeNull();
+    await retried?.dispose();
     vi.resetModules();
     const thirdModule = await import("../../src/executor/create");
     const thirdConfig = await import("../../src/router/config");
@@ -789,7 +843,18 @@ describe("createExecutor assembly seams", () => {
     const secondAccess = createExecutorAccess();
     expect(assemble(fakeHost(), secondAccess)).toBeNull();
     expect(secondAccess.unavailable()).toBe("the plan executor is not available: another plan executor already owns this process");
+    expect(secondAccess.runtime()).toBeNull(); // still held: the refused copy keeps waiting
     await first.runtime.dispose();
+    // QA-5.1-20: the release handed the claim to the waiting copy; a third copy is refused while it holds it.
+    const retried = secondAccess.runtime();
+    expect(retried, secondAccess.unavailable()).not.toBeNull();
+    const thirdAccess = createExecutorAccess();
+    expect(assemble(fakeHost(), thirdAccess)).toBeNull();
+    expect(thirdAccess.unavailable()).toBe("the plan executor is not available: another plan executor already owns this process");
+    // Once the third copy stops waiting, the retried runtime's release leaves the claim free for a fresh assembly.
+    const waiters: unknown = Reflect.get(globalThis, Symbol.for("omr.executor.claim.waiters.v1"));
+    if (waiters instanceof Set) waiters.clear();
+    await retried?.dispose();
     expect(assemble()).not.toBeNull();
   });
 
@@ -803,17 +868,21 @@ describe("createExecutor assembly seams", () => {
       gate: () => ({ ok: false, reason: "disposed", wake: null }), launch: () => { throw new Error("unused"); },
       cancel: async () => {}, inFlight: () => [], dispose: disposeLauncher,
     } satisfies TaskLauncher));
+    // QA-5.1-20: a probe copy refused by the claim would wait for it and take it at the release. The probes stand for copies
+    // that have already ended (their lifetime is aborted), so they never wait; the claim stays free for the last assembly.
+    const probe = (): V2Executor | null | undefined =>
+      createExecutor(context, { host: { ...fakeHost(), lifetime: AbortSignal.abort() }, prepared, access: createExecutorAccess() });
     vi.spyOn(runtimeModule, "createExecutorRuntime").mockImplementation((deps) => ({
       ...lateRuntime(createExecutorAccess()), start, settled: async () => {}, manualReady: () => [], isPlanChild: () => false,
       recordMetric() {}, onLeaseReleased() {}, async dispose() {
         order.push("runtime"); expect(access.runtime()).toBeNull();
-        expect(createExecutor(context, { host: fakeHost(), prepared, access: createExecutorAccess() })).toBeNull();
+        expect(probe()).toBeNull();
         await deps.launcher.dispose();
       },
     }));
     vi.spyOn(PlanSlotPools.prototype, "closeAll").mockImplementation(async () => {
       order.push("pools");
-      expect(createExecutor(context, { host: fakeHost(), prepared, access: createExecutorAccess() })).toBeNull();
+      expect(probe()).toBeNull();
     });
     const first = assemble(fakeHost(), access);
     if (first == null) throw new Error(access.unavailable());

@@ -4,7 +4,7 @@ import { realpathSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  COLLECT_RETRY_BASE_MS, COLLECT_RETRY_MAX_MS, createExecutorRuntime, nextCollectDelay, planTagsSettled, realCollaborators,
+  COLLECT_RETRY_BASE_MS, COLLECT_RETRY_MAX_MS, GC_TAG_PENDING, createExecutorRuntime, nextCollectDelay, planTagsSettled, realCollaborators,
   type ExecutorRuntimeHandle, type RuntimeDeps, type CollaboratorInput,
 } from "../../src/executor/runtime";
 import { phaseTagName } from "../../src/executor/git";
@@ -196,6 +196,32 @@ describe("QA-5.1 runtime fixes", () => {
     expect(await predicate("plan-b")).toBe(true);
   }, 15_000);
 
+  it("QA-5.1-19: a manual gc keeps an idle completed plan's slots while a phase tag is pending, and says so", async () => {
+    const h = await rig(), value = draft("plan-c");
+    // No task and a passed phase: approval completes the plan at once, with its phase tag still to be created.
+    value.phases[0]!.gate = "passed";
+    await h.compile(value);
+    await h.runtime.approve("plan-c", "owner-plan-c");
+    await h.runtime.settled();
+    const writer = h.parts.get("plan-c")?.writer;
+    if (writer === undefined) throw new Error("missing writer");
+    expect(writer.ledger.status).toBe("completed");
+    expect(writer.ledger.phases[0]?.tag).toBeNull();
+    expect(writer.openIntegration()).toEqual([]); // idle: between tag retries the queue rolled its entry back
+    h.facade.gc.mockImplementation(async (isFinished) =>
+      ((await isFinished("plan-c")) === true ? { removed: ["C:/slots/plan-c/integration"], reported: [] } : { removed: [], reported: [] }));
+    const refused = await h.runtime.gc();
+    expect(refused.removed).toEqual([]);
+    expect(refused.reported).toEqual([`plan plan-c: ${GC_TAG_PENDING}`]);
+    // Once the queue settled the tag (here: it gave up, which leaves its failure item), the manual gc collects the plan.
+    const name = phaseTagName("plan-c", value.phases[0]!.id);
+    await writer.append([{ type: "inbox-added", item: { id: "F-1", kind: "failure", severity: "info", taskId: null,
+      text: `The phase tag ${name} could not be created after 4 rounds of 3 tries (boom). Create it by hand.`, options: [], answer: null,
+      createdAt: h.deps.clock.iso() } }]);
+    const collected = await h.runtime.gc();
+    expect(collected).toEqual({ removed: ["C:/slots/plan-c/integration"], reported: [] });
+  }, 15_000);
+
   it("QA-5.1-4: dispose cuts the verifier first, before the launcher and the wait for running work", async () => {
     const h = await rig();
     const order: string[] = [];
@@ -224,8 +250,8 @@ describe("QA-5.1 runtime fixes", () => {
     let cut: (() => void) | null = null;
     const hanging = {
       disposing: false,
-      verify: vi.fn(() => new Promise<{ verdict: "unverifiable"; findings: string; ref: string }>((resolve) => {
-        cut = () => resolve({ verdict: "unverifiable", findings: "the plugin is shutting down", ref: "none" });
+      verify: vi.fn(() => new Promise<{ verdict: "unverifiable"; findings: string; ref: string; cut: true }>((resolve) => {
+        cut = () => resolve({ verdict: "unverifiable", findings: "the plugin is shutting down", ref: "none", cut: true });
         entered();
       })),
       async dispose() { hanging.disposing = true; cut?.(); },
@@ -260,6 +286,41 @@ describe("QA-5.1 runtime fixes", () => {
     expect(reverified.tasks.T1?.attempts[0]?.verdict).toBe("pass");
     expect(reverified.tasks.T1?.state).not.toBe("verifying");
     expect(reverified.tasks.T1?.state).not.toBe("failed");
+  }, 30_000);
+
+  it("QA-5.1-21: a real verdict that resolves after dispose began (decided before it) is journaled; only a cut is discarded", async () => {
+    const h = await rig();
+    const value = draft("plan-a", "running");
+    value.tasks.T1 = taskNode("T1", { state: "verifying", slot: "slot-1", branch: "omr/plan-a/t/T1",
+      attempts: [{ ...openAttempt(1), outcome: "succeeded", endedAt: "2026-10-11T00:00:01.000Z" }],
+      footprint: { writes: ["T1.ts"], reads: [], confidence: "explicit", sources: ["path"] } });
+    const created = await h.store.create(value, holderOf(value.orchestrator.sessionID, process.pid, hostname())); await created.close();
+    h.slotsFor("plan-a").get.mockResolvedValue({ slot: "slot-1", path: "C:/slots/plan-a/slot-1", commit: SHA } as unknown as NonNullable<Awaited<ReturnType<SlotPool["get"]>>>);
+    // The verdict was decided (and handed to onVerdict) before dispose; its promise settles only after dispose began.
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    let settle: (() => void) | null = null;
+    const late = {
+      disposing: false,
+      verify: vi.fn(() => new Promise<{ verdict: "pass"; findings: string; ref: string }>((resolve) => {
+        settle = () => resolve({ verdict: "pass", findings: "", ref: "proof" });
+        entered();
+      })),
+      async dispose() { late.disposing = true; settle?.(); },
+    };
+    h.deps.verifier = late;
+    const feed = { taskId: "T1", from: "verifying", action: "reverify", n: 1, slotValid: true, orphans: [], probation: null, context: null } as unknown as ReconcileFeed;
+    const reports = [{ planId: "plan-a", actions: [feed] }] as unknown as Awaited<ReturnType<NonNullable<RuntimeDeps["recovery"]>["recover"]>>;
+    h.deps.recovery = { recover: async () => reports, adopt: async () => {}, reconcile: async () => [feed] };
+    const starting = h.runtime.start();
+    await started;
+    await h.runtime.dispose();
+    await starting.catch(() => {});
+    expect(late.verify).toHaveBeenCalledOnce();
+    const after = await h.store.read("plan-a");
+    expect(after.tasks.T1?.attempts[0]?.verdict).toBe("pass");
+    expect(after.tasks.T1?.state).toBe("verified");
+    expect((await h.store.exportPlan("plan-a")).events.filter((e) => e.type === "attempt-verdict")).toHaveLength(1);
   }, 30_000);
 });
 

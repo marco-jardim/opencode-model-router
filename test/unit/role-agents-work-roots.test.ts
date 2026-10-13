@@ -237,16 +237,29 @@ describe.skipIf(process.platform !== "win32")("Phase 5.1.3 D6 executor external_
     expect(f.opts.warn).not.toHaveBeenCalled();
   });
 
-  it("takes the default slots drive from the repository's first worktree, not the location alias", async () => {
+  it("QA-5.1-24 takes the default slots drive from the worktree containing the canonical location", async () => {
     const f = fixture();
     const otherDrive = win32.parse(f.main).root[0]!.toUpperCase() === "E" ? "F" : "E";
-    f.opts.directory = `${otherDrive}:\\linked-repository`;
+    const current = `${otherDrive}:\\current-worktree`;
+    f.opts.directory = join(f.base, "linked-repository");
+    f.opts.listWorktrees = vi.fn(async () => [f.main, current]);
+    f.opts.realpath = (path) => path === f.opts.directory ? join(current, "src") : win32.normalize(path);
     f.cfg.routing = { ...f.cfg.routing, executor: { slotsDir: null } };
     const result = await registerRoleAgents(f.agents, f.cfg, f.opts);
-    const defaultRoot = win32.join(win32.parse(f.main).root, ".omr-slots");
-    expect(result.externalDirectory).toEqual([join(f.main, "*"), join(defaultRoot, "*")]);
-    expect(result.externalDirectory).not.toContain(join(`${otherDrive}:\\.omr-slots`, "*"));
+    expect(result.externalDirectory).toEqual([join(f.main, "*"), join(current, "*"), join(`${otherDrive}:\\.omr-slots`, "*")]);
+    expect(result.externalDirectory).not.toContain(join(win32.parse(f.main).root, ".omr-slots", "*"));
     expect(f.opts.warn).not.toHaveBeenCalled();
+  });
+
+  it("QA-5.1-24 names a failed worktree listing instead of diagnosing the toplevel drive", async () => {
+    const f = fixture();
+    f.cfg.routing = { ...f.cfg.routing, executor: { slotsDir: null } };
+    f.opts.listWorktrees = vi.fn(async () => { throw new Error("git worktree list failed (exit 128): unavailable"); });
+    const result = await registerRoleAgents(f.agents, f.cfg, f.opts);
+    expect(result.externalDirectory).toEqual([]);
+    expect(result.externalDirectoryDenied).toEqual([join(f.home, "*")]);
+    expect(f.opts.warn).toHaveBeenCalledWith("roles:executor-slots", expect.stringContaining("worktree listing failed"));
+    expect(f.opts.warn).not.toHaveBeenCalledWith("roles:executor-slots", expect.stringContaining("not on a drive-letter path"));
   });
 
   it.each([
@@ -345,6 +358,15 @@ describe.skipIf(process.platform !== "win32")("Phase 5.1.3 D6 executor external_
     expect(f.opts.warn).toHaveBeenCalledWith("roles:executor-slots", expect.stringContaining("inside or an ancestor"));
   });
 
+  it("R5 a main checkout's canonical root is never exempted as an executor slot", async () => {
+    const f = fixture();
+    const canonicalMain = join(f.slots, "plan", "slot-1");
+    f.opts.realpath = (path) => path === f.main ? canonicalMain : win32.normalize(path);
+    const result = await registerRoleAgents(f.agents, f.cfg, f.opts);
+    expect(result.externalDirectory).toEqual([join(canonicalMain, "*")]);
+    expect(f.opts.warn).toHaveBeenCalledWith("roles:executor-slots", expect.stringContaining("inside or an ancestor"));
+  });
+
   it("canonicalizes a not-yet-created root and home through their existing parents", async () => {
     const f = fixture();
     const parent = f.base.toUpperCase();
@@ -394,16 +416,19 @@ describe.skipIf(process.platform !== "win32")("Phase 5.1.3 D6 executor external_
     }
   });
 
-  it("R5 compares every listed worktree's canonical root, not just its supplied path or the first worktree", async () => {
+  it("R5 existing slot and integration worktrees do not prevent granting future slots after a reload", async () => {
     const f = fixture();
     const alias = join(f.base, "linked");
-    const canonical = join(f.slots, "linked");
-    f.opts.listWorktrees = vi.fn(async () => [f.main, alias]);
+    const canonical = join(f.slots, "plan", "slot-1");
+    const integration = join(f.slots, "plan", "integration");
+    const ci = join(f.slots, "plan", "ci");
+    f.opts.listWorktrees = vi.fn(async () => [f.main, canonical, integration, ci, alias]);
     f.opts.realpath = (path) => path === alias ? canonical : win32.normalize(path);
     const result = await registerRoleAgents(f.agents, f.cfg, f.opts);
-    expect(result.externalDirectory).toEqual([join(f.main, "*"), join(canonical, "*")]);
+    expect(result.externalDirectory).toEqual([join(f.main, "*"), join(canonical, "*"), join(integration, "*"), join(ci, "*"), join(f.slots, "*")]);
     expect(result.externalDirectoryDenied).toEqual([join(f.home, "*")]);
-    expect(f.opts.warn).toHaveBeenCalledTimes(1);
+    expect(evaluatePermission(rules(f.agents.implementer!), "external_directory", join(f.slots, "plan", "slot-2", "x"))).toBe("allow");
+    expect(f.opts.warn).not.toHaveBeenCalled();
   });
 
   it("keeps the home deny last even when its exact key was also supplied as an allow", () => {

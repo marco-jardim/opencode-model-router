@@ -60,6 +60,7 @@ When assembly is unavailable, `/plan` and `router_plan` show
 | `routing.leases.mode must be enforce` | Enable enforced file leases. |
 | `no plan-task verifier` | The host must supply the plan-task verification engine. |
 | `enforcement.verify.require is never` | Choose a verification requirement other than `never`. |
+| `the location is outside routing.workRoots` | Start inside a configured work root, or adjust the global `routing.workRoots`. |
 | `not a git repository` | Start in a git repository. |
 | `the lease registry is not available` | The host's lease adapter is missing. |
 | `the child runner is not available` | The host's child runner is missing. |
@@ -68,13 +69,21 @@ When assembly is unavailable, `/plan` and `router_plan` show
 | `assembly failed: <error>` | Assembly failed; the error follows the prefix. |
 
 Before initialization the reason is `not initialized`; after disposal it is `disposed`. There is **one executor per
-process**, across plugin instances, and one active plan at a time. Its process claim is released on disposal.
+process**, across plugin instances, and one active plan at a time. The first plugin copy to assemble takes a
+process-wide claim and that location owns the executor until it disposes. A copy refused only by the claim (a hot reload
+starts the new copy before the old one has disposed) waits: when the holder's disposal releases the claim, the waiting
+copy assembles its executor and starts it once (its recovery runs once), or, failing that, retries the first time one of
+its plan tools is used. If several copies wait, one takes the claim and the others keep waiting; a copy disposed while
+it waits never assembles.
+An earlier configuration or repository-discovery reason is preserved when the child runner is also missing.
 
 The executor home is **`<git common dir>\omr-executor`** (`EXECUTOR_HOME_DIRNAME = "omr-executor"`), shared by the
 main checkout and linked worktrees. It holds ledgers, slot markers and locks; it is not a task work root. Repository
 discovery creates nothing; state is created when a plan is opened. The slots root is separate: a configured
 `routing.executor.slotsDir` is a **root**, and each plan uses **`<root>\<planId>`**, fixed in its draft at compile.
-The default is **`<drive>:\.omr-slots\<planId>`** on the repository's drive. A repository without a drive-letter
+The default is **`<drive>:\.omr-slots\<planId>`** on the location's repository-toplevel drive, not the first listed
+worktree's drive. Existing slot and integration worktrees do not block the slots-root allowance after a restart or
+`/router-reload`; a root inside or above a non-slot worktree is still refused. A repository without a drive-letter
 path has no computed default and must configure `slotsDir`. Slot pools open lazily per plan and do not reopen after
 collection.
 
@@ -109,6 +118,8 @@ plan file, and never claim completion while the plan is running.
 
 An existing user-defined `/plan` command is preserved: on v2 the router logs one conflict warning and leaves
 `router_plan` available instead. On v1 that user command runs without an executor `/plan` notice.
+The v2 adapter checks the host's command registry before registering the executor command; registry rebuilds do not
+repeat the warning or replace the user's command.
 
 `/plan` turns what you type into an instruction for the orchestrator, which then calls `router_plan` with exact
 arguments. Input that does not parse prints the `/plan` help instead. Quote a path that holds spaces

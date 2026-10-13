@@ -357,6 +357,49 @@ describe("assembled executor through v2 registration", () => {
     expect(await store.exportPlan("foreign")).toEqual(before);
   }, 30_000);
 
+  it("QA-5.1-20: a copy refused by the claim assembles once the holder disposes, starts (recovers) once; a third copy is still refused", async () => {
+    const fixture = await repository();
+    await configure(fixture.root, fixture.slotsRoot);
+    await seed(fixture, plan(fixture));
+    const recover = vi.fn<ReturnType<typeof recoveryModule.createRecoveryService>["recover"]>();
+    const realRecovery = recoveryModule.createRecoveryService;
+    vi.spyOn(recoveryModule, "createRecoveryService").mockImplementation(deps => {
+      const service = realRecovery(deps);
+      return { ...service, recover: (...args) => { recover(...args); return service.recover(...args); } };
+    });
+    const a = await boot(fixture.repo);
+    expect(a.state.executor).not.toBeNull();
+    await vi.waitFor(() => expect(recover).toHaveBeenCalledOnce(), { timeout: 10_000 });
+    // The hot reload: B starts while A still holds the claim.
+    const b = await boot(fixture.repo);
+    expect(b.state.executor).toBeNull();
+    expect(b.access.unavailable()).toContain("another plan executor already owns this process");
+    expect(b.access.runtime()).toBeNull(); // the claim is still held: B keeps waiting
+    const assembled = assembledDeps.length;
+    // A disposes: the release hands the claim to B, which assembles and starts without a user action.
+    await a.dispose();
+    expect(assembledDeps).toHaveLength(assembled + 1);
+    await vi.waitFor(() => expect(recover).toHaveBeenCalledTimes(2), { timeout: 10_000 });
+    const runtime = b.access.runtime();
+    expect(runtime).not.toBeNull();
+    expect(await b.call({ action: "status", planId: "plan-a" })).toContain("Plan plan-a [awaiting-approval]");
+    await runtime?.start(); // a late port's start never recovers again
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(recover).toHaveBeenCalledTimes(2);
+    expect(assembledDeps).toHaveLength(assembled + 1);
+    // C comes while B holds the claim: refused, as B was.
+    const c = await boot(fixture.repo);
+    expect(c.state.executor).toBeNull();
+    expect(c.access.unavailable()).toContain("another plan executor already owns this process");
+    expect(c.access.runtime()).toBeNull();
+    expect(assembledDeps).toHaveLength(assembled + 1);
+    // C ends while waiting (its lifetime aborts): B's release assembles nothing for it.
+    await c.dispose();
+    await runtime?.dispose();
+    expect(assembledDeps).toHaveLength(assembled + 1);
+    expect(c.access.runtime()).toBeNull();
+  }, 45_000);
+
   it("A3: tools and /plan explain a non-repository, without creating an executor home", async () => {
     const fixture = await repository(false);
     await configure(fixture.root, fixture.slotsRoot);
@@ -535,6 +578,20 @@ describe("assembled executor through v2 registration", () => {
     await expect(stat(join(markers, `${first.slot}.json`))).rejects.toMatchObject({ code: "ENOENT" });
     expect(await readdir(markers).catch((error: NodeJS.ErrnoException) => error.code), "plan-a marker directory after purge").toBe("ENOENT");
     await expect(stat(markers)).rejects.toMatchObject({ code: "ENOENT" });
+    // QA-5.1-22: the complete gc of the purged plan leaves no empty `<root>\<planId>` behind.
+    await expect(stat(join(fixture.slotsRoot, "plan-a"))).rejects.toMatchObject({ code: "ENOENT" });
+  }, 30_000);
+
+  it("QA-5.1-22: purging an aborted plan that never had a slot creates no slots directory", async () => {
+    const fixture = await repository();
+    await configure(fixture.root, fixture.slotsRoot);
+    await seed(fixture, plan(fixture, "plan-a", "awaiting-approval"));
+    const plugin = await boot(fixture.repo), executor = built(plugin);
+    await executor.runtime.abort("plan-a", "root");
+    await executor.runtime.settled();
+    await executor.runtime.purge("plan-a", "root");
+    expect(await executor.deps.store.list()).toEqual([]);
+    await expect(stat(join(fixture.slotsRoot, "plan-a"))).rejects.toMatchObject({ code: "ENOENT" });
   }, 30_000);
 
   it("A7: per-plan roots isolate slot-1; aborting passive B releases B, not active A", async () => {

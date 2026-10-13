@@ -27,7 +27,7 @@ import { resolveExecutorHome } from "./paths";
 import { createRecoveryService, sameToplevel } from "./recovery";
 import { createExecutorRuntime, realCollaborators, type ExecutorRuntimeHandle, type RuntimeDeps } from "./runtime";
 import { createScheduler } from "./schedule";
-import { createSlotPool, defaultSlotsDir } from "./slots/pool";
+import { countPlanMarkers, createSlotPool, defaultSlotsDir, type SlotPoolOpenOptions } from "./slots/pool";
 import { createProvisioner } from "./slots/provision";
 import { ExecutorError, type ExecutorRuntime, type LedgerStore, type LedgerV1, type PlanId, type SlotPool, type Spawner } from "./types";
 
@@ -49,12 +49,16 @@ function nodeSpawner(): Spawner {
   };
 }
 
-type OpenPool = SlotPool & { open(): Promise<void>; close(): void };
+type OpenPool = SlotPool & { open(opts?: SlotPoolOpenOptions): Promise<void>; close(): void; removeEmptyDir?(): Promise<boolean> };
 
 /** Collection fences slot operations; a closed facade may still open a gc-only handle for purge. */
 export class PlanSlotPools {
   private readonly entries = new Map<PlanId, { view: SlotPool; pool: Promise<OpenPool> | null; closed: boolean }>();
-  constructor(private readonly deps: { store: LedgerStore; toplevel: string; makePool(ledger: Readonly<LedgerV1>): OpenPool; log?: RuntimeDeps["log"] }) {}
+  constructor(private readonly deps: {
+    store: LedgerStore; toplevel: string; makePool(ledger: Readonly<LedgerV1>): OpenPool; log?: RuntimeDeps["log"];
+    /** QA-5.1-22: how many slot markers the plan still has (read only); a purge asks it when the plan's slotsDir is invalid. */
+    markers?(planId: PlanId): Promise<number>;
+  }) {}
 
   readonly facade: SlotPool = {
     acquire: (id, ...args) => this.of(id).acquire(id, ...args),
@@ -91,8 +95,9 @@ export class PlanSlotPools {
       list: async (...args) => entry.closed ? [] : (await get()).list(...args),
       gc: async (finished) => {
         if (entry.closed) {
+          // QA-5.1-22: the gc-only handle creates no directory.
           const pool = this.deps.makePool(await this.deps.store.read(planId));
-          try { await pool.open(); return await pool.gc(finished); }
+          try { await pool.open({ create: false }); return await pool.gc(finished); }
           finally { pool.close(); }
         }
         const pool = await get();
@@ -120,6 +125,40 @@ export class PlanSlotPools {
       }
     }
     return { removed, reported };
+  }
+
+  /**
+   * QA-5.1-22: the purge's full gc of a finished plan. The live pool (if any) is closed first; the gc runs through a gc-only
+   * handle, which creates no directory, and a complete gc (no slot of the plan left) removes `<root>\<planId>` if it is
+   * empty. An invalid slotsDir with no slot marker of the plan skips the gc (nothing to collect); with markers it refuses.
+   */
+  async purge(planId: PlanId, finished: Parameters<SlotPool["gc"]>[0]): ReturnType<SlotPool["gc"]> {
+    const entry = this.entries.get(planId);
+    if (entry !== undefined && !entry.closed) {
+      entry.closed = true;
+      try { (await entry.pool)?.close(); } catch { /* A failed open owns no live pool. */ }
+    }
+    const ledger = await this.deps.store.read(planId);
+    let pool: OpenPool | null = null;
+    try {
+      pool = this.deps.makePool(ledger);
+      await pool.open({ create: false });
+    } catch (error) {
+      pool?.close();
+      if (!(error instanceof ExecutorError) || error.code !== "E_INVALID_INPUT") throw error;
+      const markers = this.deps.markers === undefined ? 1 : await this.deps.markers(planId);
+      if (markers > 0) {
+        throw new ExecutorError("E_PLAN_STATE", `plan ${planId} still has ${markers} slot marker(s) but its slotsDir is invalid (${error.message}); `
+          + "fix the slotsDir or remove those slots by hand, then purge again", { planId });
+      }
+      this.deps.log?.("warn", "purge: invalid slotsDir and no slot marker; nothing to collect", { planId, error: error.message });
+      return { removed: [], reported: [] };
+    }
+    try {
+      const result = await pool.gc(finished);
+      await pool.removeEmptyDir?.();
+      return result;
+    } finally { pool.close(); }
   }
 
   async markerOf(slotName: string): Promise<{ planId: PlanId; taskId: string } | null> {
@@ -170,9 +209,29 @@ function runResolver(directory: string): RunResolver {
 }
 
 const processClaimKey = Symbol.for("omr.executor.claim.v1");
+/**
+ * QA-5.1-20: the retry callbacks of copies refused by the claim (a hot reload starts the new copy before the old one has
+ * disposed). Kept beside the claim on the same global record, under its own key, so the claim's shape stays what every
+ * loaded copy reads; a release calls each waiter once, and the waiters race for the claim through the same token check.
+ */
+const processClaimWaitersKey = Symbol.for("omr.executor.claim.waiters.v1");
 const processClaims = globalThis as typeof globalThis & {
   [processClaimKey]?: { token: symbol; toplevel: string };
+  [processClaimWaitersKey]?: Set<() => void>;
 };
+
+function claimWaiters(): Set<() => void> {
+  return processClaims[processClaimWaitersKey] ??= new Set();
+}
+
+/** Frees the claim `token` holds (no-op for another holder's), then tells every refused copy that it may retry. */
+function releaseClaim(token: symbol): void {
+  if (processClaims[processClaimKey]?.token !== token) return;
+  delete processClaims[processClaimKey];
+  for (const retry of [...claimWaiters()]) {
+    try { retry(); } catch { /* A waiter's failure is its own (it logs and clears its access). */ }
+  }
+}
 
 /** No telemetry port: fixed tier priors, with the existing eight-minute prior as the middle tier. */
 function staticTierDurations(cfg: Parameters<typeof resolveRoles>[0]): DurationModel {
@@ -208,6 +267,45 @@ export function createExecutor(
   options: CreateExecutorOptions,
 ): V2Executor | null | undefined {
   if (context.routerHost === "v1") return undefined;
+  return assembleExecutor(context, options);
+}
+
+/**
+ * QA-5.1-20: a copy refused only by the process claim keeps its inputs and retries the assembly once the claim is free: at
+ * the release (the holder's dispose calls every waiter) or, failing that, the first time its `lateRuntime` is used. The
+ * waiters race for the claim through the same token check, so one wins; the others stay waiters. The winner's runtime is
+ * started once here, as the adapter starts a fresh one (its recovery runs once).
+ */
+function waitForClaim(context: { directory: string }, options: CreateExecutorOptions): void {
+  const { access, host } = options;
+  const lifetime = host.lifetime;
+  if (access.deferRetry === undefined || lifetime.aborted) return;
+  const waiters = claimWaiters();
+  let spent = false;
+  // A copy that ends while it waits stops waiting: no executor is ever assembled for a disposed copy.
+  function forget(): void {
+    spent = true;
+    waiters.delete(retry);
+    access.deferRetry?.(null);
+  }
+  function retry(): void {
+    if (spent || lifetime.aborted || processClaims[processClaimKey] !== undefined) return;
+    lifetime.removeEventListener("abort", forget);
+    forget();
+    const built = assembleExecutor(context, options);
+    if (built === null) return;
+    // The adapter disposes only the executor it was handed; this one ends with the copy's lifetime (releasing the claim).
+    lifetime.addEventListener("abort", () => { void built.runtime.dispose(); }, { once: true });
+    void built.runtime.start().catch((error: unknown) => {
+      console.warn("[model-router] executor: it could not start", String(error));
+    });
+  }
+  lifetime.addEventListener("abort", forget, { once: true });
+  waiters.add(retry);
+  access.deferRetry(retry);
+}
+
+function assembleExecutor(context: { directory: string }, options: CreateExecutorOptions): V2Executor | null {
   const { directory } = context;
   const { host, prepared, access } = options;
   const absent = (reason: string): null => { access.clear(reason); return null; };
@@ -219,7 +317,11 @@ export function createExecutor(
   if (!prepared.ok) return absent(prepared.reason);
   if (host.leases === null) return absent("the lease registry is not available");
   if (host.runner === null) return absent("the child runner is not available");
-  if (processClaims[processClaimKey] !== undefined) return absent("another plan executor already owns this process");
+  if (processClaims[processClaimKey] !== undefined) {
+    // QA-5.1-20: refused only by the claim (a hot reload's new copy, while the old one disposes): wait for its release.
+    waitForClaim(context, options);
+    return absent("another plan executor already owns this process");
+  }
   const claim = Symbol("plan executor");
   const { toplevel, home } = prepared;
   processClaims[processClaimKey] = { token: claim, toplevel };
@@ -241,6 +343,7 @@ export function createExecutor(
     const opsOf = (planId: PlanId) => createGitOps({ git, userGit, fs, planId, toplevel, executorHome: home });
     pools = new PlanSlotPools({
       store, toplevel, log,
+      markers: (planId) => countPlanMarkers({ fs, markersDir: join(home, "slots") }, planId),
       makePool(ledger) {
         const slotsDir = ledger.config.slotsDir ?? slotsDirOf(ledger.planId, toplevel);
         checkSlotsDir(slotsDir, toplevel);
@@ -371,7 +474,7 @@ export function createExecutor(
       return { sessionID, pid: spawner.pid, hostname: spawner.hostname, startedAt: now, heartbeatAt: now };
     };
     runtime = createExecutorRuntime({ store, compiler,
-      slots: planPools.facade, slotsFor: (id) => planPools.of(id),
+      slots: planPools.facade, slotsFor: (id) => planPools.of(id), purgeSlots: (id, finished) => planPools.purge(id, finished),
       scheduler: createScheduler(), launcher: taskLauncher, routes, verifier: host.verifier, git, hosts: host.hosts, bindings: host.bindings, clock,
       leaseRegistry: { acquireWrite: (owner, writes) => {
           const result = leases.registry.acquireWrite(owner, writes);
@@ -394,25 +497,33 @@ export function createExecutor(
     });
     const innerRuntime = runtime;
     let disposal: Promise<void> | null = null;
-    const wrapped: ExecutorRuntimeHandle = { ...innerRuntime, dispose() {
-      disposal ??= (async () => {
-        access.clear("disposed");
-        try { await innerRuntime.dispose(); }
-        finally {
-          try { await planPools.closeAll(); }
-          finally { for (const timer of timers) clock.clearTimer(timer); timers.clear(); if (processClaims[processClaimKey]?.token === claim) delete processClaims[processClaimKey]; }
-        }
-      })();
-      return disposal;
-    } };
+    let starting: Promise<void> | null = null;
+    const wrapped: ExecutorRuntimeHandle = { ...innerRuntime,
+      // QA-5.1-20: recovery runs once per runtime, whoever starts it (the adapter, a claim retry or a late port).
+      start() {
+        starting ??= innerRuntime.start();
+        return starting;
+      },
+      dispose() {
+        disposal ??= (async () => {
+          access.clear("disposed");
+          try { await innerRuntime.dispose(); }
+          finally {
+            try { await planPools.closeAll(); }
+            finally { for (const timer of timers) clock.clearTimer(timer); timers.clear(); releaseClaim(claim); }
+          }
+        })();
+        return disposal;
+      } };
     access.set(wrapped);
     return { runtime: wrapped, launcher: taskLauncher };
   } catch (error) {
     void launcher?.dispose();
     void pools?.closeAll();
     for (const timer of timers) clock.clearTimer(timer);
-    if (processClaims[processClaimKey]?.token === claim) delete processClaims[processClaimKey];
-    return absent(`assembly failed: ${error instanceof Error ? error.message : String(error)}`);
+    const failed = absent(`assembly failed: ${error instanceof Error ? error.message : String(error)}`);
+    releaseClaim(claim);
+    return failed;
   }
 }
 
@@ -438,6 +549,11 @@ export interface ExecutorAccess {
   unavailable(): string;
   set(runtime: ExecutorRuntime): void;
   clear(reason: string): void;
+  /**
+   * QA-5.1-20: the assembly retry of a copy refused only by the process claim (null: none). `runtime()` runs it, at most
+   * once per claim release, when it finds no runtime; `createExecutor` sets it.
+   */
+  deferRetry?(retry: (() => void) | null): void;
 }
 
 /** Tool/command ports resolve the current executor at call time, not plugin initialization. */
@@ -477,13 +593,19 @@ export function lateRuntime(access: ExecutorAccess): ExecutorRuntime {
 export function createExecutorAccess(): ExecutorAccess {
   let current: ExecutorRuntime | null = null;
   let reason = "the plan executor is not available: not initialized";
+  let retry: (() => void) | null = null;
   return {
-    runtime: () => current,
+    runtime: () => {
+      // QA-5.1-20: no runtime yet, and refused by the claim: retry the assembly now if the claim is free (else it waits).
+      if (current === null && retry !== null) retry();
+      return current;
+    },
     unavailable: () => reason,
     set(runtime) { current = runtime; },
     clear(why) {
       current = null;
       reason = `the plan executor is not available: ${why}`;
     },
+    deferRetry(next) { retry = next; },
   };
 }

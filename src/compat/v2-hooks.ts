@@ -2662,6 +2662,9 @@ export async function registerV2Hooks(
     // Captured once: after our own transform, ctx.agent.list() returns
     // router-modified agents, which would defeat the originals diff on refresh.
     const agents = await ctx.agent.list();
+    // The legacy config bridge has no host commands. Capture the real registry before our transform owns /plan.
+    const userPlanCommandDefined = (await ctx.command.list?.())?.data.some((command) => command.name === "plan") ?? false;
+    let warnedPlanCommand = false;
     const baseSeed: Record<string, LegacyAgent> = {};
     for (const agent of agents.data) baseSeed[agent.id] = {
       mode: agent.mode,
@@ -2902,7 +2905,15 @@ export async function registerV2Hooks(
     }));
 
     registrations.push(await ctx.command.transform((editor) => {
-      for (const [name, definition] of Object.entries(config.command)) editor.add({
+      const commands = Object.entries(config.command).filter(([name]) => {
+        if (name !== "plan" || !userPlanCommandDefined) return true;
+        if (!warnedPlanCommand) {
+          warnedPlanCommand = true;
+          ingestLogger.warn("[router] /plan command conflict: preserving the user-defined /plan; router_plan remains available");
+        }
+        return false;
+      });
+      for (const [name, definition] of commands) editor.add({
         name,
         description: definition.description,
         execute: async (invocation) => {

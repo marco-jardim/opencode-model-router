@@ -26,6 +26,12 @@ function shape(tools: Tools) {
   }]));
 }
 
+/** Build identity and the checkout's latest dogfood checkpoint are not frozen v1 behavior. */
+function normalizeHelp(text: string): string {
+  return text.replace(/^(router: engine=\S+ )build=\S+\+\S+$/gm, "$1build=<normalized>")
+    .replace(/^(router: last checkpoint=)DF\d+$/gm, "$1<normalized>");
+}
+
 describe("v1 plugin maps golden (Phase 5.1.2)", () => {
   const homes: string[] = [];
   const tempRoot = tmpdir();
@@ -93,14 +99,18 @@ describe("v1 plugin maps golden (Phase 5.1.2)", () => {
       return {
         tools: `${JSON.stringify(shape(hooks.tool), null, 2)}\n`,
         commands: `${JSON.stringify(Object.fromEntries(Object.entries(output.command).sort(([a], [b]) => a.localeCompare(b)).map(([name, entry]) => [name, JSON.stringify(entry)])), null, 2)}\n`,
-        // The build identity changes with each commit; preserve every other byte of the bare /router output.
-        // "last checkpoint=DF4" comes from checked-in docs/qa/cost-aware-routing/dogfood.md, so it is checkout-deterministic.
-        help: help.parts.map(part => part.text).join("\n").replace(/^(router: engine=\S+ )build=\S+\+\S+$/gm, "$1build=<normalized>"),
+        // Preserve every byte except the build identity and the checkpoint read from dogfood.md.
+        help: normalizeHelp(help.parts.map(part => part.text).join("\n")),
       };
     } finally {
       await hooks.dispose?.();
     }
   }
+
+  it.each(["DF4", "DF5", "DF123"])("QA-5.1-25 normalizes checkpoint %s without changing other help bytes", (checkpoint) => {
+    const text = `# Model Router\nrouter: engine=static build=2.8.0+abcdef\nrouter: last checkpoint=${checkpoint}\nKeep ${checkpoint} in ordinary prose.\n`;
+    expect(normalizeHelp(text)).toBe(`# Model Router\nrouter: engine=static build=<normalized>\nrouter: last checkpoint=<normalized>\nKeep ${checkpoint} in ordinary prose.\n`);
+  });
 
   it("default and executor/roles configs are byte-identical to the pre-registration v1 maps", async () => {
     // An empty routing block resolves to the defaults. Use it in both captures because existing v1 help
