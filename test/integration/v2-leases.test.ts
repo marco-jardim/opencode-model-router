@@ -216,6 +216,9 @@ describe("leases: linked worktrees of one repository (DF-1.1-4)", () => {
     await expect(editIn("plan-t1", main)).resolves.toEqual({});
     const second = await editIn("plan-t2", linked);
     expect(second.refuse).toMatch(/Refused: .*same\.ts is being edited by session plan-t1/);
+    // QA-PDF13-7: the text names the holder's file (in its slot); the lease to ask for is the requester's, repo-relative.
+    expect(second.refuse).toContain(`Refused: ${join(main, "src", "same.ts")} is being edited by session plan-t1.`);
+    expect(second.refuse).toContain("return `NEED MORE: lease src/same.ts`.");
     // An ordinary child is keyed by its checkout: free in the other worktree, refused in the plan task's own.
     await expect(editIn("plain-linked", linked)).resolves.toEqual({});
     expect((await editIn("plain-main", main)).refuse).toMatch(/Refused: .*same\.ts is being edited by session plan-t1/);

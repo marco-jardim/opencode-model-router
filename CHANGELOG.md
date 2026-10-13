@@ -47,8 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is keyed by its checkout, not by the repository, and a write whose target the router cannot read is refused only while
   another child holds a lease in the same checkout. The leases of plan tasks stay repository-wide among plan tasks, so
   two plan tasks that edit one path in two slots still refuse each other, and a plan child's write whose target the
-  router cannot read is checked against the plan-task leases in the whole repository. Reads were already keyed by the
-  file on disk. OpenCode v1 is unchanged.
+  router cannot read is checked against the plan-task leases in the whole repository. A path spelling that may name
+  any file (a device path, an 8.3 short name, a drive-relative path) still fails closed against every holder anywhere.
+  A refusal names the file under edit and asks for the requester's own path in `NEED MORE: lease` (repo-relative for a
+  plan task). Reads were already keyed by the file on disk. OpenCode v1 is unchanged.
 - **OpenCode v2: a resumed background dispatch delivers its own answer.** It no longer takes an earlier turn's
   completion as its own result, even when the earlier turn was still being processed when the parent saw it, nor the
   child's earlier answer. Completions are told apart by the message that carries them rather than by their text, so two

@@ -470,6 +470,7 @@ describe("conflict matrix (child A holds /w1/src/x.ts)", () => {
         reason: "held",
         holders: [holderA],
         path: X,
+        heldPath: X,
         key: REL_X_KEY,
       });
     });
@@ -524,8 +525,8 @@ describe("conflict matrix (child A holds /w1/src/x.ts)", () => {
   describe("write with an unknown target", () => {
     it("is refused while another holder leases a file in the tree", () => {
       const { reg } = holdingX();
-      expect(reg.acquireWrite(B, null)).toEqual({ ok: false, reason: "unknown-target", holders: [holderA] });
-      expect(reg.acquireWrite(B, [])).toEqual({ ok: false, reason: "unknown-target", holders: [holderA] });
+      expect(reg.acquireWrite(B, null)).toEqual({ ok: false, reason: "unknown-target", holders: [holderA], where: "checkout" });
+      expect(reg.acquireWrite(B, [])).toEqual({ ok: false, reason: "unknown-target", holders: [holderA], where: "checkout" });
     });
 
     it("is refused for an unkeyable path, and for a mix where the keyable part is free", () => {
@@ -549,7 +550,7 @@ describe("conflict matrix (child A holds /w1/src/x.ts)", () => {
 
     it("is refused for another worktree of the repository that another owner leases in (QA-1.3-17)", () => {
       const { reg } = holdingX();
-      expect(reg.acquireWrite(C, null)).toEqual({ ok: false, reason: "unknown-target", holders: [holderA] });
+      expect(reg.acquireWrite(C, null)).toEqual({ ok: false, reason: "unknown-target", holders: [holderA], where: "checkout" });
       expect(reg.acquireWrite(C, ["", "/w2/src/z.ts"])).toMatchObject({ ok: false, reason: "unknown-target" });
       expect(reg.acquireWrite(C, "/w2/src/z.ts")).toMatchObject({ ok: true });
     });
@@ -1401,7 +1402,7 @@ describe("QA-1.3-5: device spellings and fail-closed unkeyable paths", () => {
 describe("QA-1.3-6: inputs outside the declared types", () => {
   it("treats a path value that is not null, a string or an array as an unknown target, without throwing", () => {
     const { reg } = holdingX();
-    const refused = { ok: false, reason: "unknown-target", holders: [holderA] };
+    const refused = { ok: false, reason: "unknown-target", holders: [holderA], where: "checkout" };
     for (const value of [5, undefined, {}, true, new Set<string>(), new Set([Y]), () => Y]) {
       expect(reg.acquireWrite(B, value as unknown as string), String(value)).toEqual(refused);
     }
@@ -1910,6 +1911,7 @@ describe("QA-1.3-17: an unknown-target write is refused per repository", () => {
       ok: false,
       reason: "unknown-target",
       holders: [expect.objectContaining({ holderID: "C" })],
+      where: "checkout",
     });
     expect(reg.acquireWrite(B, [""])).toMatchObject({ ok: false, reason: "unknown-target" });
   });
@@ -2322,8 +2324,9 @@ describe("DF-1.1-4: write keys per checkout, plan tasks repository-wide", () => 
     const { reg } = checkoutRig();
     expect(reg.acquireWrite(P1, "/w1/src/x.ts")).toMatchObject({ ok: true });
     const second = reg.acquireWrite(P2, "/w2/src/x.ts");
-    // QA-PDF13-1: the conflict names the holder's own file (in its checkout), not the requester's copy.
-    expect(second).toMatchObject({ ok: false, reason: "held", path: "/w1/src/x.ts", key: `r:/w1${NUL}src/x.ts` });
+    // QA-PDF13-1/-7: the file under edit is the holder's own copy (in its checkout); the path to ask a lease for is the
+    // requester's own, repo-relative for a plan task.
+    expect(second).toMatchObject({ ok: false, reason: "held", path: "src/x.ts", heldPath: "/w1/src/x.ts", key: `r:/w1${NUL}src/x.ts` });
     expect(heldBy(second)).toBe("P1");
     expect(reg.acquireWrite(P2, null)).toMatchObject({ ok: false, reason: "unknown-target" });
     expect(reg.acquireWrite(P2, "/w2/src/other.ts")).toMatchObject({ ok: true });
@@ -2419,6 +2422,82 @@ describe("DF-1.1-4: write keys per checkout, plan tasks repository-wide", () => 
     const root = { holderID: "root", tree: "/w1", isChild: false, scope: "until-complete" } as const;
     expect(reg.acquireWrite(root, "/w1/src/x.ts")).toMatchObject({ ok: true });
     expect(reg.acquireWrite(child("B", "/w1"), "/w1/src/x.ts")).toMatchObject({ ok: true, leased: ["/w1/src/x.ts"] });
+  });
+
+  it("QA-PDF13-7: a refusal asks for the requester's own path (repo-relative for a plan task) and names the held file", () => {
+    const { reg } = checkoutRig();
+    expect(reg.acquireWrite(child("B", "/w2"), "/w2/src/x.ts")).toMatchObject({ ok: true });
+    // A plan task refused in its own checkout: repo-relative, as the plan runtime resolves `NEED MORE: lease` paths.
+    expect(reg.acquireWrite(P2, "/w2/src/x.ts")).toMatchObject({ reason: "held", path: "src/x.ts", heldPath: "/w2/src/x.ts" });
+    // An ordinary child is asked for its own path, absolute (a relative one resolved against its tree).
+    expect(reg.acquireWrite(child("C", "/w2"), "src/x.ts")).toMatchObject({ reason: "held", path: "/w2/src/x.ts", heldPath: "/w2/src/x.ts" });
+    const root = { holderID: "root", tree: "/w2", isChild: false, scope: "until-complete" } as const;
+    expect(reg.acquireWrite(root, "/w2/src/x.ts")).toMatchObject({ reason: "held", path: "/w2/src/x.ts", heldPath: "/w2/src/x.ts" });
+  });
+
+  it("QA-PDF13-10: an unknown-target refusal says where the holders edit", () => {
+    const { reg } = checkoutRig();
+    expect(reg.acquireWrite(child("B", "/w1"), "/w1/src/x.ts")).toMatchObject({ ok: true });
+    expect(reg.acquireWrite(child("C", "/w1"), null)).toMatchObject({ reason: "unknown-target", where: "checkout" });
+    expect(reg.acquireWrite(P1, "/w1/src/y.ts")).toMatchObject({ ok: true });
+    expect(reg.acquireWrite(P2, null)).toMatchObject({ reason: "unknown-target", where: "repository" });
+    const win = winRig();
+    expect(win.reg.acquireWrite(WA, WX)).toMatchObject({ ok: true });
+    expect(win.reg.acquireWrite(WB, "C:relative.ts")).toMatchObject({ reason: "unknown-target", where: "anywhere" });
+  });
+
+  describe("QA-PDF13-8: a clash on a re-keyed key is merged or skipped", () => {
+    const hold = (h: HolderInput): Holder => ({ ...h, acquiredAt: 1, lastSeenAt: 1 });
+    const OLD_X = `r:R${NUL}src/x.ts`;
+    const NEW_X = `r:/w1${NUL}src/x.ts`;
+    const oldLine = (holderID: string) => ({ logical: OLD_X, physical: "/w1/src/x.ts", tree: "/w1", holderID, display: "/w1/src/x.ts" });
+    const newLine = (holderID: string) => ({ ...oldLine(holderID), logical: NEW_X, shared: "R" });
+    const snapshotOf = (holders: Holder[], leases: object[]) => ({ version: 1, takenAt: 1, holders, leases });
+    const P1b = child("P1b", "/w1", { taskRef: "T1", scope: "until-integrated" });
+
+    it("merges the old and the new line of one lease (one holder, or two of one owner)", () => {
+      const { reg } = checkoutRig();
+      expect(reg.restore(snapshotOf([hold(P1)], [oldLine("P1"), newLine("P1")]))).toEqual({ ok: true, leases: 1 });
+      expect(heldBy(reg.acquireWrite(P2, "/w2/src/x.ts"))).toBe("P1");
+      const two = checkoutRig().reg;
+      expect(two.restore(snapshotOf([hold(P1), hold(P1b)], [newLine("P1b"), oldLine("P1")]))).toEqual({ ok: true, leases: 1 });
+      expect(two.snapshot().leases.map((lease) => lease.holderID).sort()).toEqual(["P1", "P1b"]);
+    });
+
+    it("skips the line of a holder that is dropped anyway, in either order, and reports it", () => {
+      for (const order of ["dropped first", "dropped last"] as const) {
+        const { reg } = checkoutRig();
+        const lines = order === "dropped first" ? [oldLine("A"), newLine("P1")] : [newLine("P1"), oldLine("A")];
+        const result = reg.restore(snapshotOf([hold(A), hold(P1)], lines), { dropCompleteHolders: true });
+        expect(result).toMatchObject({ ok: true, leases: 1 });
+        expect(result.ok && result.skipped?.length).toBe(1);
+        expect(heldBy(reg.acquireWrite(child("B", "/w1"), "/w1/src/x.ts"))).toBe("P1");
+      }
+      // The new line of a dropped holder before the re-keyed line of a kept one: the kept one takes the key.
+      const { reg } = checkoutRig();
+      const result = reg.restore(snapshotOf([hold(A), hold(P1)], [newLine("A"), oldLine("P1")]), { dropCompleteHolders: true });
+      expect(result).toMatchObject({ ok: true, leases: 1 });
+      expect(heldBy(reg.acquireWrite(child("B", "/w1"), "/w1/src/x.ts"))).toBe("P1");
+    });
+
+    it("still rejects two kept holders of different owners on one key, and any clash without a re-key", () => {
+      const { reg } = checkoutRig();
+      expect(reg.restore(snapshotOf([hold(A), hold(P1)], [oldLine("A"), newLine("P1")]))).toMatchObject({ ok: false, reason: "invalid-snapshot" });
+      expect(reg.restore(snapshotOf([hold(P1)], [newLine("P1"), newLine("P1")]))).toMatchObject({ ok: false, reason: "invalid-snapshot" });
+      expect(reg.restore(snapshotOf([hold(A), hold(P1)], [newLine("A"), newLine("P1")]), { dropCompleteHolders: true })).toMatchObject({
+        ok: false,
+        reason: "invalid-snapshot",
+      });
+    });
+
+    it("splits an old entry with pairs in two checkouts, each part naming its own file", () => {
+      const { reg } = checkoutRig();
+      const second = { ...oldLine("P1"), physical: "/w2/src/x.ts", tree: "/w2" }; // display still names the /w1 file
+      expect(reg.restore(snapshotOf([hold(P1)], [oldLine("P1"), second]))).toEqual({ ok: true, leases: 2 });
+      const lines = reg.snapshot().leases;
+      expect(lines.find((lease) => lease.tree === "/w1")).toMatchObject({ logical: NEW_X, display: "/w1/src/x.ts", shared: "R" });
+      expect(lines.find((lease) => lease.tree === "/w2")).toMatchObject({ logical: `r:/w2${NUL}src/x.ts`, display: "/w2/src/x.ts", shared: "R" });
+    });
   });
 });
 

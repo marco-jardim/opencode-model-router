@@ -2104,15 +2104,19 @@ export function createLeaseGuard(deps: LeaseGuardDeps): LeaseGuard {
           if (r.ok) return {};
           if (r.reason === "held") {
             const who = holderLabels(deps, r.holders);
-            if (!holder.isChild && !a.childWording) return { refuse: `[router] Refused: ${r.path} is being edited by ${who}. Wait for that session to end.` };
+            // QA-PDF13-7: the text names the file under edit (`heldPath`, the holder's copy); the `NEED MORE: lease` names the
+            // requester's own path (`path`, repo-relative for a plan task, as the plan runtime resolves it).
+            if (!holder.isChild && !a.childWording) return { refuse: `[router] Refused: ${r.heldPath} is being edited by ${who}. Wait for that session to end.` };
             return {
-              refuse: `[router] Refused: ${r.path} is being edited by ${who}. Finish without that file, or return \`NEED MORE: lease ${r.path}\`. Do not retry: the lease ends when that session ends.`,
+              refuse: `[router] Refused: ${r.heldPath} is being edited by ${who}. Finish without that file, or return \`NEED MORE: lease ${r.path}\`. Do not retry: the lease ends when that session ends.`,
             };
           }
           if (r.reason === "unknown-target") {
+            // DF-1.1-4: an unknown target is checked in the writer's checkout, a plan task's across the repository; a spelling
+            // that may name any file fails closed against every holder (QA-PDF13-10).
+            const place = r.where === "anywhere" ? "anywhere (this path may name any file)" : `in this ${r.where}`;
             return {
-              // DF-1.1-4: an unknown target is checked in the writer's checkout; a plan task's, across the repository.
-              refuse: `[router] Refused: this ${e.tool} call names no file the router can check, and ${holderLabels(deps, r.holders)} is editing files in this ${holder.scope === "until-integrated" ? "repository" : "checkout"}. Pass the file path explicitly, or return \`NEED MORE: lease ${holder.tree}\`.`,
+              refuse: `[router] Refused: this ${e.tool} call names no file the router can check, and ${holderLabels(deps, r.holders)} is editing files ${place}. Pass the file path explicitly, or return \`NEED MORE: lease ${holder.tree}\`.`,
             };
           }
           if (r.reason === "cap") {

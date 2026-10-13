@@ -383,8 +383,11 @@ such a dispatch is not a sample of its own work.
   refuses a dirty home checkout (`src/executor/integrate/land.ts` ≈100-104).
 - Implementation: the v2 adapter's `repoKeyOf` seam names the checkout as `repo` and the common git directory as
   `shared` (`src/compat/v2-hooks.ts`, `leaseRepoKeyOf`). The registry keeps `shared` in its snapshot and re-keys a
-  line from an older snapshot (no `shared`) to its checkout on restore. The executor's lease view asks the
-  repository-wide query `LeaseRegistry.planHolderOf(tree, path)`, because the logical key alone matches one checkout.
+  line from an older snapshot (no `shared`) to its checkout on restore; a clash on a re-keyed key is merged (same
+  owner) or skipped (a holder that is dropped anyway), never fatal. 5.1 wires the executor's lease view
+  (`LeaseRegistryPort.holderOf`) to the repository-wide query `LeaseRegistry.planHolderOf(<plan toplevel>, path)`,
+  because the logical key alone matches one checkout. A refusal names the file under edit (the holder's copy) and
+  asks for the requester's own path in `NEED MORE: lease`, repo-relative for a plan task.
 - A root session takes no leases. Its writes are refused only while a child holds that file.
 - Lease ownership is the task (`taskRef`), not the session.
 - While a child holds a write lease in a working tree, another **child** session in the same tree is affected as
