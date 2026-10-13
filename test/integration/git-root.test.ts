@@ -152,7 +152,8 @@ const provenanceOf = (output: string): { name: string; branch: string; worktree:
 };
 const REFUSED = "[router_git] error: refused: ";
 
-describe("router_git root through junctions and worktrees (3b.5)", () => {
+// Real git in temporary repositories: slow on Windows CI runners, so bounded by an explicit timeout (as #88 did).
+describe("router_git root through junctions and worktrees (3b.5)", { timeout: 60_000 }, () => {
   it("a link below a parent that leads out of the parents is refused at step 5 (resolves outside the read set), nothing spawned", async () => {
     const { work, parent } = fixture();
     const outside = gitRepo(temp("omr-3b5-outside-"), "outside");

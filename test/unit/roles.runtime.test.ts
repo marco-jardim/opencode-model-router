@@ -754,7 +754,8 @@ describe("read provenance of a role read outside its work root (cross-repo P1.9)
   });
 });
 
-describe("router_git root (cross-repo P3b)", () => {
+// Real git in temporary repositories: slow on Windows CI runners, so bounded by an explicit timeout (as #88 did).
+describe("router_git root (cross-repo P3b)", { timeout: 60_000 }, () => {
   type GitTool = { description: string; args: Record<string, unknown>; execute: (args: unknown, ctx: unknown) => Promise<string> };
   const GIT_TOOLS = ["router_git_status", "router_git_diff", "router_git_log", "router_git_show", "router_git_blame", "router_git_ls_files"];
   const SUFFIX = " Role agents may set root to inspect another repository they may read (its absolute top-level path, or its name below routing.repoParents).";
