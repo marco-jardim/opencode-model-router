@@ -384,6 +384,25 @@ Everything else is work: resolve it, record it, continue.
 rounds, fast-forwarded into `cpx/main` at `a7889e2` (report `docs\qa\critical-path-execution\sync-1.md`). The p51
 worktree created before the sync is recreated from the synced `cpx/main`; the 5.1 pre-flight is redone.
 
+**DF-2 self-check (2026-10-13 ≈19:50Z, run `79d6febf`), next action DF2.5:**
+- DF2.4.0 pass: `cli starting version=2.0.26`; `loading plugin` = `D:\git\opencode-anthropic-fix` and
+  `D:\git\omr-cpx-dogfood-df2` (`file:///D:/git/omr-cpx-dogfood-df2/server.ts`), once per booted location
+  (`D:\git\omr-cpx-main`, `C:\Users\Marquinho`: known deviation QA-DF1-13); dogfood HEAD = `cpx/df2` = `f3af7c7`; one
+  `router_verify` tool in the orchestrator's tool list.
+- DF2.4.a pass: `router_verify vrf_3f3b162e6a59c7d5dc6b7668` after the restart returned a verdict (`unverifiable`: drift
+  since delegation not checkable, no changed files), not "unknown handle". `pendingTtlMs` override removed.
+- DF2.4.b pass: `router_plan` is registered (status answers `E_LEDGER_NOT_FOUND`, not "not available", so the executor
+  was assembled); no ledgers before the compile (the executor home had none). `/plan` is not observable from the
+  orchestrator's tools (owner can type `/plan status`).
+- DF2.4.c: whole-plan compile = 180 tasks, 20 phases, 368 edges (dry run 369: the repository view gained
+  `phase-6.1.md` between the two), 69 manual (preflight + manual, as the dry run), zero cycles, `awaiting-residue` with
+  one residue task `6.1.2` (A-DF2-2) and the graph-node/ownership notes; draft aborted and purged; scratch worktree
+  removed. Pass with the one-edge delta recorded as DF-2-1 (minor).
+- DF-1 faults: QA-DF1-16..-28 fixed in `7180ac8` (in `cpx/main`); QA-DF1-1..-15 fixed (dogfood.md).
+- DF-2-2 (note): the executor home is `<git common dir>\omr-executor` = `D:\git\opencode-model-router\.git\omr-executor`,
+  because every `omr-cpx-*` worktree shares that repository's git directory (as their refs and objects already do).
+  Only `locks\repos\<key>` exists there after the purge. Owner told.
+
 **DF-2 switch (2026-10-13), next action "DF-2 self-check":**
 - Owner approved the global override (written; backup `opencode-model-router.overrides.jsonc.bak-df2-*`). Project
   override (`D:\git\omr-cpx-main\.opencode\`, gitignored; backup `.bak-df2`): `pendingTtlMs` 86400000 (DF1.2, removed by
