@@ -967,6 +967,28 @@ describe("adoptChild", () => {
     expect(h.task("T1").attempts.map((a) => a.outcome)).toEqual(["succeeded"]);
   });
 
+  it("Phase 5.1 (a): observe receives the child's final text (row 15) before the commit and again before verify", async () => {
+    const h = await mk(planOf([task("T1")]));
+    const seen: Array<string | undefined> = [];
+    Object.assign(h.verifier, { observe: (_t: unknown, _s: unknown, _a: unknown, finalText?: string) => { seen.push(finalText); } });
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    run.complete("DONE: implemented T1 (src/t1.ts:1)");
+    await until(() => h.state("T1") === "verified", "T1 verified");
+    expect(seen).toEqual(["DONE: implemented T1 (src/t1.ts:1)", "DONE: implemented T1 (src/t1.ts:1)"]);
+    expect(h.verifier.calls).toEqual(["T1#1"]);
+  });
+
+  it("Phase 5.1 (a): without a verifier observe hook no final text is kept or read", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    run.complete("DONE: ok");
+    await until(() => h.state("T1") === "verified", "T1 verified");
+    expect("observe" in h.verifier).toBe(false);
+    expect(h.verifier.calls).toEqual(["T1#1"]);
+  });
+
   it("a finished child whose context is unknown ends with an empty result (lines 2673, 2759, 2760)", async () => {
     const h = await mk(planOf([task("T1")]));
     await h.begin();
@@ -1139,6 +1161,34 @@ describe("reprovisionSlot", () => {
     await until(async () => counters((await h.events()).slice(before), "slot-reprovisioned").length === 1, "slot-reprovisioned counted");
     const after = (await h.events()).slice(before);
     expect(after.filter((e) => e.type === "task-slot")).toEqual([]);
+  });
+
+  it("Phase 5.1 (a): after a restart observe receives the child's last assistant text, read through hosts.context", async () => {
+    const h = await mk(planOf([task("T1")]));
+    const seen: Array<string | undefined> = [];
+    Object.assign(h.verifier, { observe: (_t: unknown, _s: unknown, _a: unknown, finalText?: string) => { seen.push(finalText); } });
+    const stale = await verifyingAfterCrash(h);
+    h.slots.records.delete(stale);
+    const context: HostSessionContext = { messages: [
+      { role: "assistant", text: "DONE: implemented T1 before the restart", outcome: null },
+      { role: "idle", text: null, outcome: null },
+    ] };
+    h.hosts.contexts.set("ses-c1", context);
+    await h.reattach();
+    await until(() => h.state("T1") === "verified", "T1 verified");
+    expect(seen).toEqual(["DONE: implemented T1 before the restart"]);
+    expect(h.verifier.calls).toEqual(["T1#1"]);
+  });
+
+  it("Phase 5.1 (a): after a restart a child without assistant text gives observe no final text", async () => {
+    const h = await mk(planOf([task("T1")]));
+    const seen: Array<string | undefined> = [];
+    Object.assign(h.verifier, { observe: (_t: unknown, _s: unknown, _a: unknown, finalText?: string) => { seen.push(finalText); } });
+    const stale = await verifyingAfterCrash(h);
+    h.slots.records.delete(stale);
+    await h.reattach();
+    await until(() => h.state("T1") === "verified", "T1 verified");
+    expect(seen).toEqual([undefined]);
   });
 });
 

@@ -142,6 +142,8 @@ import { tool } from "@opencode-ai/plugin";
 import { scrubText } from "./guard/scrub";
 import { accept, unverifiableGateResult } from "./verify/gate";
 import { applyDispatchCaveats, createVerificationWiring, resolvePendingTtlMs, dispatchDirectiveText, extractAssistantText, parseRouterVerifyArgs, type DispatchStart, type HandleReport } from "./verify/wiring";
+import { waitTreeFreeExcept } from "./verify/wiring";
+import { createLeaseSelfExemptions, createPlanTaskVerifier, ledgerOrchestratorOf, planTaskGit, planTreeKey } from "./verify/plan-task";
 import { locationOutsideWorkRoots } from "./router/work-roots";
 import { CLAIM_REFRESH_MS, HEAD_LOST_REASON, PENDING_INSTANCES_DIRNAME, PERIMETER_LOST_REASON, type DispatchHeadState, claimPendingSession, createInstanceClaimToken, createPendingFileJournal, foldDormantRecords, refreshPendingClaims, releasePendingClaim, resolvePendingJournalDir, processedKeyOf, appendRouterFooter, buildLateNoticeBlock, buildPendingListBlock, unattributedRisk, type DormantSession, type LateNotice, type PendingEntry, type SettledVerification } from "./verify/pending";
 import { createDeadline } from "./verify/deterministic";
@@ -1128,9 +1130,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   }
   /** Late-bound: the lease guard exists only once the v2 adapter attaches (FinishAttach `leaseGate`); the wiring reads it per use. */
   let leaseGateRef: Pick<LeaseGuard, "waitTreeFree"> | undefined;
+  /** Phase 5.1 D11 (v2 only): the plan-task gates' own holders, exempt from the lease wait in their own slot tree. */
+  const planTaskLeaseExemptions = createLeaseSelfExemptions((root) => planTreeKey(root));
   const {
     graderSessions, dispatchGrader, buildGateDeps, disposeChildSession,
-    prepareVerification, startReferenceGc,
+    prepareVerification, startReferenceGc, beginVerificationBounded,
     sweepVerification, disposeVerification,
     startDispatch, takeDispatch, isDeferred: wiringIsDeferred, directivesFor, finishDeferred, applyLineage, pending,
     verifyHandles,
@@ -1148,8 +1152,19 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       pendingRestore: pendingFile.load(),
       // v2 only. Delegating: the guard arrives with the adapter's attach; until then (or without `leases: enforce`) nothing waits.
       leaseGate: {
-        waitTreeFree: async (tree, owner, deadlineMs, signal) =>
-          leaseGateRef === undefined ? { waitedMs: 0, holders: [], fileCount: 0 } : leaseGateRef.waitTreeFree(tree, owner, deadlineMs, signal),
+        waitTreeFree: async (tree, owner, deadlineMs, signal) => {
+          if (leaseGateRef === undefined) return { waitedMs: 0, holders: [], fileCount: 0 };
+          // Phase 5.1 D11: a plan-task gate does not wait for its own task's holders in its own slot tree.
+          const exempt = planTaskLeaseExemptions.exemptFor(tree);
+          if (exempt.size === 0) return leaseGateRef.waitTreeFree(tree, owner, deadlineMs, signal);
+          const gate = leaseGateRef;
+          let fileCount = 0;
+          const probe: Pick<LeaseGuard, "waitTreeFree"> = {
+            waitTreeFree: async (...args) => { const r = await gate.waitTreeFree(...args); fileCount = r.fileCount; return r; },
+          };
+          const wait = await waitTreeFreeExcept(probe, tree, owner, exempt, deadlineMs, signal);
+          return { waitedMs: wait.waitedMs, holders: wait.holders, fileCount: wait.holders.length === 0 ? 0 : fileCount };
+        },
       },
     }),
   });
@@ -1161,6 +1176,26 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   const outsideWorkRoots = isV2Host && locationOutsideWorkRoots(ctx.directory, cfg.routing?.workRoots);
   if (outsideWorkRoots) logger.info?.(`[router] ${ctx.directory} is outside routing.workRoots: the start-up reference GC is skipped`);
   const stopReferenceGc = outsideWorkRoots ? (): void => undefined : startReferenceGc();
+  // Phase 5.1 D8 (v2 only): plan tasks are verified by this instance's dispatch verification engine; v2.ts hands the verifier to
+  // the adapter's executor seam. Nothing is built or handed over on v1.
+  if (isV2Host) {
+    const planTaskVerifier = createPlanTaskVerifier({
+      changedFileStore,
+      beginVerificationBounded,
+      prepareVerification,
+      buildGateDeps,
+      captureBudget: (childSessionID, capReached) => captureBudget(childSessionID, capReached),
+      readCapReached: (childSessionID) => sessionStore.readCapReached(childSessionID),
+      onVerdict: (childSessionID, verdict) => ingest?.onVerdict(childSessionID, verdictOf(verdict), verdictGraderOf(verdict)),
+      abortSession: async (sessionID) => { await ctx.client.session.abort({ path: { id: sessionID } }); },
+      getConfig: () => cfg,
+      git: planTaskGit(),
+      orchestratorOf: ledgerOrchestratorOf(ctx.directory),
+      exemptions: planTaskLeaseExemptions,
+      log: (message, detail) => logger.warn(`[verify] ${message}`, detail === undefined ? undefined : { error: describeError(detail) }),
+    });
+    (ctx as RouterPluginInput & { routerOnSlotVerifier?: (verifier: typeof planTaskVerifier) => void }).routerOnSlotVerifier?.(planTaskVerifier);
+  }
 
   // Phase 1.2 (v2 only): the turn-state registry the adapter injects. Without it (v1, or a v2 host that injects none) nothing
   // below is registered or buffered, and the system transform keeps pushing the pending list and the late notices.

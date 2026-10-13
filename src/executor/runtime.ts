@@ -384,7 +384,8 @@ export interface PlanCollaborators {
 /** Optional attempt observations used by the dispatch-backed plan-task verifier. */
 export interface PlanTaskVerifier extends SlotVerifier {
   begin?(task: TaskNode, slot: SlotLease, attempt: Attempt): void | Promise<void>;
-  observe?(task: TaskNode, slot: SlotLease, attempt: Attempt): void | Promise<void>;
+  /** `finalText`: the child's final text when the runtime holds it (the row-15 result text, else the last assistant text). */
+  observe?(task: TaskNode, slot: SlotLease, attempt: Attempt, finalText?: string): void | Promise<void>;
   forget?(planId: PlanId, taskId: TaskId, attempt: number): void | Promise<void>;
 }
 
@@ -475,6 +476,8 @@ export interface ExecutorRuntimeHandle extends ExecutorRuntime {
 }
 
 const GIT_TIMEOUT_MS = 60_000;
+/** Phase 5.1 (a): the bound on reading a child's final text when the runtime no longer holds it (after a restart). */
+export const FINAL_TEXT_READ_MS = 5_000;
 const LOST_STREAK = 3;
 const STREAK_DETAILS: readonly string[] = ["unrequested-interrupt", "runner-error"];
 /** Consecutive pre-confirmation losses (distinct router calls) that pause the plan (QA-3.1-4). */
@@ -703,6 +706,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   let disposed = false;
   const collected = new Set<PlanId>();
   const forgotten = new Set<string>();
+  /** The child's final text of a completed attempt (row 15), by `<plan>/<task>#<n>`, for the plan-task verifier's `observe`. */
+  const finalTexts = new Map<string, string>();
   const collecting = new Set<PlanId>();
   const collectionTimers = new Map<PlanId, { readonly id: number }>();
   /** The process-level activation reservation (QA-3.1-18): the plan whose activation is under way, and its holds. */
@@ -769,6 +774,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
   async function forgetAttempt(p: PlanRt, taskId: TaskId, n: number): Promise<void> {
     const key = `${p.planId}/${taskId}#${n}`;
+    finalTexts.delete(key);
     if (forgotten.has(key)) return;
     try { await d.verifier.forget?.(p.planId, taskId, n); }
     catch (e) { d.log("warn", "verifier forget failed", errorText(e)); }
@@ -1938,6 +1944,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       return [ae(t.id, a.n, "succeeded", clampEnd(a, at), null), tt(t.id, "running", "completed", "child-ended")];
     });
     if (!applied) return;
+    // Phase 5.1 (a): the child's claim, as a dispatch grader judges it; kept only while a verifier observes attempts.
+    if (d.verifier.observe !== undefined && text !== "") finalTexts.set(`${p.planId}/${t.id}#${a.n}`, text);
     releaseToken(p, t.id, a.n, "success");
     await commitAndVerify(p, t.id, a.n);
   }
@@ -2051,7 +2059,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       lease = await slotLeaseOf(p, t);
       // D11: the attempt's trailer makes the commit idempotent across a crash between the commit and row 21.
       const att = t.attempts.find((x) => x.n === n);
-      if (att !== undefined) await d.verifier.observe?.(t, lease, att);
+      if (att !== undefined && d.verifier.observe !== undefined) await d.verifier.observe(t, lease, att, await finalTextOf(p, taskId, att));
       r = await commitTaskInSlot(d.git, {
         slot: lease,
         branch,
@@ -2098,7 +2106,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       const att = cur === null ? undefined : cur.attempts.find((x) => x.n === n);
       if (cur === null || att === undefined) return;
       forgotten.delete(`${p.planId}/${taskId}#${n}`);
-      await d.verifier.observe?.(cur, lease, att);
+      if (d.verifier.observe !== undefined) await d.verifier.observe(cur, lease, att, await finalTextOf(p, taskId, att));
       await slotsFor(p.planId).cleanForChecks(lease.slot);
       const v = await d.verifier.verify(cur, lease, att);
       verdict = v.verdict;
@@ -2109,6 +2117,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       findings = errorText(e);
       ref = null;
     }
+    finalTexts.delete(`${p.planId}/${taskId}#${n}`);
     if (verdict === "pass") {
       const ok = await appendIf(p, (cur) => {
         const c = own(cur, taskId);
@@ -3482,6 +3491,24 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     return false;
   }
 
+  /**
+   * Phase 5.1 (a): the child's final text for the plan-task verifier's `observe`: the row-15 result text this process
+   * holds, else (e.g. a task left `completed`/`verifying` across a restart) the child's last assistant text, read once
+   * through the existing `hosts.context` read and bounded by FINAL_TEXT_READ_MS; undefined when neither has any.
+   */
+  async function finalTextOf(p: PlanRt, taskId: TaskId, att: Attempt): Promise<string | undefined> {
+    const held = finalTexts.get(`${p.planId}/${taskId}#${att.n}`);
+    if (held !== undefined) return held;
+    if (att.childSessionID === null) return undefined;
+    const timer: { h: { readonly id: number } | null } = { h: null };
+    const text = await Promise.race([
+      lastAssistantText(att.childSessionID),
+      new Promise<string>((resolve) => { timer.h = d.clock.setTimer(FINAL_TEXT_READ_MS, () => resolve("")); }),
+    ]);
+    if (timer.h !== null) d.clock.clearTimer(timer.h);
+    return text === "" ? undefined : text;
+  }
+
   async function lastAssistantText(sessionID: string): Promise<string> {
     try {
       const ctx = await d.hosts.context(sessionID);
@@ -4107,6 +4134,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       disposed = true;
       for (const timer of collectionTimers.values()) d.clock.clearTimer(timer);
       collectionTimers.clear();
+      finalTexts.clear();
       // QA-4.2-4: no waiter of a same-process adopt's window outlives the runtime (dispose waits for their work below).
       for (const planId of [...reattachOpeners.keys()]) openReattach(planId);
       const off = offEvents;

@@ -5,6 +5,7 @@ import { createV2Runtime } from "./compat/v2-client";
 import { registerV2Hooks } from "./compat/v2-hooks";
 import type { Ingest } from "./routing/outcomes/ingest";
 import type { BudgetSnapshot } from "./guard/enforce";
+import type { PlanTaskVerifier } from "./executor/runtime";
 
 /** Keep the routing engine shared; translate only the host API at this boundary. */
 export default {
@@ -25,6 +26,8 @@ export default {
     let verifyEnabled: (() => boolean) | undefined;
     // QA-G-A3-2: the plugin's count of a role child's call refused outside its guard (role-authority refusals, permission denials).
     let recordRefusal: ((sessionID: string, agent: string | undefined, tool: string, args: unknown) => string | undefined) | undefined;
+    // Phase 5.1 D8: the plan-task verifier built over this plugin instance's dispatch verification engine.
+    let slotVerifier: PlanTaskVerifier | undefined;
     const input = {
       directory: ctx.location.directory,
       worktree: ctx.location.project.directory,
@@ -51,12 +54,14 @@ export default {
       routerRoleLive: (agent: string) => roleLive?.(agent),
       routerOnVerifyEnabled: (read: () => boolean) => { verifyEnabled = read; },
       routerOnRefusal: (record: NonNullable<typeof recordRefusal>) => { recordRefusal = record; },
+      routerOnSlotVerifier: (verifier: PlanTaskVerifier) => { slotVerifier = verifier; },
     };
     const hooks = await ModelRouterPlugin(input as unknown as PluginInput);
     return registerV2Hooks(ctx, hooks, runtime, {
       ...(ingest ? { ingest } : {}), ...(isBypassed ? { isBypassed } : {}), ...(budgetSnapshot ? { budgetSnapshot } : {}),
       ...(verifyEnabled ? { routerVerifyEnabled: verifyEnabled } : {}),
       ...(recordRefusal ? { recordRefusal } : {}),
+      ...(slotVerifier ? { slotVerifier } : {}),
       onHostBudget: (observe) => { observeHostBudget = observe; },
       onRoleLive: (isLive) => { roleLive = isLive; },
     });
