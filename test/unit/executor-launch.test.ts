@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { ResumeRejectedError } from "../../src/compat/child-session";
+import { RESUME_PROMPT } from "../../src/executor/runtime";
 import {
   MAX_TRACKED_SESSIONS,
   awaitRouterCallKey,
@@ -176,7 +178,7 @@ function rig(over: Partial<TaskLauncherDeps> = {}, opts: { capture?: boolean } =
         context: ctx ? { bootID: ctx.bootID, epoch: ctx.epoch, callID: ctx.callID } : { bootID: "x", epoch: 0, callID: "none" },
         route: { agent: "coder", model: { providerID: "p", modelID: "m", variant: null }, provider: "p", heavy: false },
         role: "implementer", grant: ["read", "edit"], workRoot: ROOT,
-        prompt: `PLAN CONTEXT\nshared\n\n[plan plan-one:T1#1] nonce=${NONCE}\n\nTASK\ndo it`,
+        prompt: o.resume === undefined ? `PLAN CONTEXT\nshared\n\n[plan plan-one:T1#1] nonce=${NONCE}\n\nTASK\ndo it` : RESUME_PROMPT,
         ...o,
       };
     },
@@ -319,14 +321,24 @@ describe("launch: resume the same attempt", () => {
     type: "step.started", sessionID, providerID: "p", modelID: "m", at: r.clock.clock.iso(),
   });
 
-  it("passes resumeSessionID, fires no child-created hook, and confirms only on the resumed session's first step", async () => {
+  it("accepts the runtime's exact resume request through the real launcher and confirms only on the resumed session's first step", async () => {
     const r = rig();
     const done = deferred<{ sessionID: string; text: string }>();
     // The production runner registers a resume with onCreated before the host starts it.
     r.fr.state.script = async (req) => { await req.onCreated("child-1"); return done.promise; };
-    const req = r.req({ resume: { childSessionID: "child-1" } });
+    const base = r.req();
+    const gate = r.launcher.gate(ORCH);
+    if (!gate.ok) throw new Error("expected retained context");
+    const req: LaunchRequest = {
+      ...base,
+      orchestratorSessionID: ORCH,
+      context: { bootID: gate.context.bootID, epoch: gate.context.epoch, callID: gate.context.callID },
+      prompt: RESUME_PROMPT,
+      resume: { childSessionID: "child-1" },
+    };
     const handle = r.launcher.launch(req, r.hooks);
-    expect(vi.mocked(r.fr.runner.run).mock.calls[0]?.[0]).toMatchObject({ resumeSessionID: "child-1", context: req.context });
+    expect(req.prompt).toBe("continue and finish");
+    expect(vi.mocked(r.fr.runner.run).mock.calls[0]?.[0]).toMatchObject({ resumeSessionID: "child-1", context: req.context, prompt: RESUME_PROMPT });
     let confirmation: LaunchConfirmation | null = null;
     void handle.confirmation.then((c) => { confirmation = c; });
     await flush();
@@ -350,6 +362,42 @@ describe("launch: resume the same attempt", () => {
     expect(r.onChildCreated).not.toHaveBeenCalled();
     expect(r.onLateChild).not.toHaveBeenCalled();
     expect(r.evicted).toEqual(["child-1"]);
+  });
+
+  it.each<Partial<LaunchRequest>>([
+    { prompt: `PLAN CONTEXT\nshared\n\n[plan plan-one:T1#1] nonce=${NONCE}\n\nTASK` },
+    { prompt: `${RESUME_PROMPT}\n` },
+    { planId: "bad plan" },
+    { planId: 123 as unknown as string },
+    { taskId: "123" },
+    { taskId: "constructor" },
+    { attempt: 0 },
+    { attempt: 1.5 },
+    { attempt: 10_000 },
+    { nonce: "invalid" },
+    { nonce: null as unknown as string },
+    { resume: { childSessionID: " " } },
+  ])("rejects malformed resume requests before bookkeeping or run: %j", (over) => {
+    const r = rig();
+    const req = r.req({ resume: { childSessionID: "child-1" }, ...over });
+    expect(() => r.launcher.launch(req, r.hooks)).toThrow(expect.objectContaining({ code: "E_LAUNCH_TASK" }));
+    expect(r.log).toEqual([]);
+    expect(r.fr.runner.run).not.toHaveBeenCalled();
+  });
+
+  it("rejects a resume while the task already has a launch in flight", async () => {
+    const r = rig();
+    const done = deferred<{ sessionID: string; text: string }>();
+    r.fr.state.script = creating(r, "child-1", done.promise);
+    const first = r.launcher.launch(r.req(), r.hooks);
+    await first.confirmation;
+    expect(() => r.launcher.launch(r.req({ resume: { childSessionID: "child-1" } }), r.hooks))
+      .toThrow(expect.objectContaining({ code: "E_LAUNCH_TASK" }));
+    expect(() => r.launcher.launch(r.req({ resume: { childSessionID: "child-1" }, attempt: 2 }), r.hooks))
+      .toThrow(expect.objectContaining({ code: "E_LAUNCH_TASK" }));
+    expect(r.fr.runner.run).toHaveBeenCalledTimes(1);
+    done.resolve({ sessionID: "child-1", text: "DONE: finished" });
+    await first.completion;
   });
 
   it("a resumed step or registration after the deadline never calls onLateChild or onChildCreated", async () => {
@@ -401,6 +449,22 @@ describe("launch: resume the same attempt", () => {
     expect(r.onChildCreated).not.toHaveBeenCalled();
     expect(r.onLateChild).not.toHaveBeenCalled();
     expect(r.launcher.inFlight()).toEqual([]);
+  });
+
+  it.each([false, true])("maps the real ResumeRejectedError to E_NO_CONTEXT without staling the capture (synchronous: %s)", async (synchronous) => {
+    const r = rig();
+    const error = new ResumeRejectedError("child-1", "session lookup failed (session not found: child-1)");
+    r.fr.state.script = () => {
+      if (synchronous) throw error;
+      return Promise.reject(error);
+    };
+    const handle = r.launcher.launch(r.req({ resume: { childSessionID: "child-1" } }), r.hooks);
+    await expect(handle.confirmation).rejects.toMatchObject({ code: "E_NO_CONTEXT", message: error.message });
+    expect(await handle.completion).toMatchObject({ kind: "lost", reason: "runner-error", childSessionID: "child-1" });
+    expect(r.launcher.gate(ORCH).ok).toBe(true);
+    expect(r.launcher.inFlight()).toEqual([]);
+    expect(r.onChildCreated).not.toHaveBeenCalled();
+    expect(r.onLateChild).not.toHaveBeenCalled();
   });
 
   it("still re-reads the gated capture before calling the runner for a resume", () => {

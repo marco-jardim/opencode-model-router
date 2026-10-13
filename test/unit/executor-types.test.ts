@@ -1712,7 +1712,8 @@ function oracleTaskCodes(t: TaskNode): Set<string> {
   if (A.some((a, i) => a.n !== i + 1)) out.add("attempt-n");
   if (flying ? !(openAt.length === 1 && openAt[0] === A.length - 1) : openAt.length > 0) out.add("open-attempt");
   const holdsSlot = ["dispatched", "running", "completed", "verifying", "verified", "integrating"];
-  const noSlot = ["pending", "blocked", "parked", "done", "cancelled", "integrated", "reverted"];
+  // QA-PDF21-3 amends A1-7: a parked task may keep the slot whose work could not be saved.
+  const noSlot = ["pending", "blocked", "done", "cancelled", "integrated", "reverted"];
   if (holdsSlot.includes(t.state) && t.slot === null) out.add("slot-required");
   if (noSlot.includes(t.state) && t.slot !== null) out.add("slot-forbidden");
   if (["verifying", "verified", "integrating"].includes(t.state) && t.branch === null) out.add("branch-required");

@@ -116,7 +116,7 @@ describe("executor compile: drafts (2.3.6)", () => {
     const compiler = createPlanCompiler({ ...h.deps, git: {
       async run(args, cwd) {
         calls.push({ args, cwd });
-        if (args.join(" ") === "symbolic-ref --short HEAD") return { code: 0, stdout: "cpx/main\n" };
+        if (args.join(" ") === "symbolic-ref HEAD") return { code: 0, stdout: "refs/heads/cpx/main\n" };
         if (args.join(" ") === "rev-parse --verify refs/heads/cpx/main^{commit}") return { code: 0, stdout: `${tip}\n` };
         if (args.join(" ") === "rev-parse HEAD") return { code: 0, stdout: `${old}\n` };
         return h.deps.git.run(args, cwd);
@@ -151,6 +151,35 @@ describe("executor compile: drafts (2.3.6)", () => {
     await expect(compiler.compile(planPathOf("synthetic/contract-first.md"), compileOpts(h))).rejects.toMatchObject({
       code: "E_INVALID_INPUT", message: expect.stringContaining("check out the base branch"),
     });
+  });
+  it("QA-PDF21-10: reads the full branch ref when a tag has the same name", async () => {
+    const h = makeHarness();
+    const calls: string[] = [];
+    const compiler = createPlanCompiler({ ...h.deps, git: {
+      async run(args, cwd) {
+        const command = args.join(" ");
+        calls.push(command);
+        if (command === "symbolic-ref --short HEAD") return { code: 0, stdout: "heads/release\n" };
+        if (command === "symbolic-ref HEAD") return { code: 0, stdout: "refs/heads/release\n" };
+        if (command === "rev-parse --verify refs/heads/release^{commit}") return { code: 0, stdout: `${h.view.head}\n` };
+        if (command === "rev-parse --verify refs/heads/heads/release^{commit}") return { code: 128, stdout: "" };
+        return h.deps.git.run(args, cwd);
+      },
+    } });
+    const { draft } = await compiler.compile(planPathOf("synthetic/contract-first.md"), compileOpts(h));
+    expect(draft.repo.baseBranch).toBe("release");
+    expect(draft.repo.baseCommit).toBe(h.view.head);
+    expect(calls).toContain("symbolic-ref HEAD");
+    expect(calls).not.toContain("symbolic-ref --short HEAD");
+  });
+  it.each(["refs/tags/release", "release", "refs/heads/"])("QA-PDF21-10: refuses a non-branch symbolic HEAD %s", async (ref) => {
+    const h = makeHarness();
+    const compiler = createPlanCompiler({ ...h.deps, git: {
+      run: (args, cwd) => args[0] === "symbolic-ref"
+        ? Promise.resolve({ code: 0, stdout: `${ref}\n` })
+        : h.deps.git.run(args, cwd),
+    } });
+    await expect(compiler.compile(planPathOf("synthetic/contract-first.md"), compileOpts(h))).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
   });
 
   it.each(SYNTHETIC_OK)("%s compiles to a valid, closed, seq 1 draft", async (name) => {

@@ -64,8 +64,8 @@ export function stubGit(v: RepoViewFixture): { run(args: readonly string[], cwd:
       if (a === "rev-parse --path-format=absolute --git-common-dir") return { code: 0, stdout: `${v.commonDir}\n` };
       if (a === "rev-parse HEAD") return { code: 0, stdout: `${v.head}\n` };
       if (a === "rev-parse --abbrev-ref HEAD") return { code: 0, stdout: `${v.branch}\n` };
-      // The compile reads the base from the toplevel: its checked-out branch, then that branch's tip.
-      if (a === "symbolic-ref --short HEAD") return { code: 0, stdout: `${v.branch}\n` };
+      // The compile reads the base from the toplevel: its checked-out branch (the full ref), then that branch's tip.
+      if (a === "symbolic-ref HEAD") return { code: 0, stdout: `refs/heads/${v.branch}\n` };
       if (a === `rev-parse --verify refs/heads/${v.branch}^{commit}`) return { code: 0, stdout: `${v.head}\n` };
       return { code: 1, stdout: "" };
     },

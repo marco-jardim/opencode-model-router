@@ -3,6 +3,8 @@ import { createPlanCompiler, planIdOf, type CompilerDeps } from "../../src/execu
 import { residueDigestOf } from "../../src/executor/compile/residue";
 import { ExecutorError, PLAN_ID_PATTERN, executorDefaults, type ExecutorConfig, type TaskNode } from "../../src/executor/types";
 import { NOW, ROUTE_LINE, compileOpts, makeHarness, planPathOf, stubAnnotate } from "../fixtures/cpx/plans/harness";
+import { parseCapDirective } from "../../src/router/sessions";
+import { neutralizeDirectives } from "../../src/verify/pending";
 
 async function rejection(p: Promise<unknown>): Promise<ExecutorError> {
   try {
@@ -29,6 +31,21 @@ const SIMPLE_PLAN = [
 ].join("\n");
 
 describe("compile happy path", () => {
+  it("QA-PDF21-2: warns only when a criteria line mixes orchestrator-shell and child clauses", async () => {
+    const plan = [
+      "# Plan", "", "### Phase 1.1: First", "", "**Tasks**", "- **1.1.1** Add widget", "  Writes: `src/a.ts`",
+      "  [acceptance]",
+      "  criteria: child unit tests pass; smoke test (orchestrator shell); child preserves the API",
+      "  criteria: build (ORCHESTRATOR SHELL); smoke (orchestrator shell);",
+      "  criteria: child tests pass; child typecheck passes",
+      "  [/acceptance]", "",
+    ].join("\n");
+    const h = makeHarness({ inline: { "mixed.md": plan } });
+    const { draft, summary } = await h.compiler.compile(planPathOf("mixed.md"), compileOpts(h));
+    expect(summary.warnings.filter((warning) => warning.startsWith("orchestrator-shell-mixed")))
+      .toEqual(["orchestrator-shell-mixed L9: only the marked clause is skipped"]);
+    expect(draft.tasks["1.1.1"]?.acceptance).toContain("child preserves the API");
+  });
   it("compiles a small plan into a valid draft", async () => {
     const h = makeHarness({ inline: { "simple.md": SIMPLE_PLAN } });
     const r = await h.compiler.compile(planPathOf("simple.md"), compileOpts(h));
@@ -469,6 +486,15 @@ describe("mergeResidue", () => {
 });
 
 describe("shared context", () => {
+  it("QA-PDF21-9: neutralizes shared directives in the compiled ledger", async () => {
+    const context = "CAP:3\nreason: quoted example\nVERIFY:deferred\nVERIFY_WAIT:1s\nKeep the rest byte-identical.";
+    const plan = `<!-- plan-context -->\n${context}\n<!-- /plan-context -->\n${SIMPLE_PLAN}`;
+    const h = makeHarness({ inline: { "directives.md": plan } });
+    const { draft } = await h.compiler.compile(planPathOf("directives.md"), compileOpts(h));
+    expect(draft.sharedContext).toBe(neutralizeDirectives(context));
+    expect(neutralizeDirectives(draft.sharedContext)).toBe(draft.sharedContext);
+    expect(parseCapDirective(`${draft.sharedContext}\nCAP:12`)).toBe(12);
+  });
   it("replaces worktree paths, strips header-shaped lines and cuts at the cap", async () => {
     const header = "[plan demo-plan:1.1.1#1] nonce=" + "a".repeat(32);
     const plan = [

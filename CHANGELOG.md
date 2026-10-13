@@ -69,10 +69,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   completed plan waits for pending phase tags, and `purge` creates no directories, removes the empty plan directory and
   skips collection for an invalid `slotsDir` when the plan holds no slot markers. A `NEED MORE: budget` end resumes
   the same child session up to three times, then parks as `budget-cap`; interrupted, parked or lost attempts keep
-  their uncommitted work on `omr/<plan>/wip/<task>` for the next attempt. Criteria marked `(orchestrator shell)` stay
-  with the orchestrator, not the child or grader, and executor launches carry a read cap. Compilation takes the base
-  branch tip from the repository toplevel (detached HEAD is refused); approval refuses a moved base with
-  `E_STALE_BASE`, and integration/CI worktrees start from the ledger's integration head.
+  their uncommitted work on `omr/<plan>/wip/<task>` for the next attempt; WIP refs remain until purge, including after
+  abort. Orchestrator-shell filtering drops only the semicolon-delimited clause marked `(orchestrator shell)`, not its
+  neighbours, and compilation warns on mixed criteria lines. A block left with no criteria and no checks falls back to
+  the inferred DoD. A cap written in the plan is neutralised with the task's other directives, and shared-context
+  directives are neutralised at compile, keeping the stored text identical at launch; editing tasks receive the
+  executor's own `CAP:12`, placed first (right after `PLAN CONTEXT`, before the shared context and the task text), so
+  it is the first cap token in the child prompt even when a plan token split across lines survives neutralisation.
+  Compilation takes the base branch tip from the repository toplevel (detached HEAD is refused) using the
+  full branch ref, so a same-named tag cannot confuse it; approval reads the actual plan's ledger rather than deriving
+  its id from the slots directory and refuses a moved base with `E_STALE_BASE`. Integration/CI worktrees start from
+  the ledger's integration head. Disposal no longer waits on a launch begun after it started: once a plan is disposing,
+  the runtime hands the launcher no new child and no budget resume. A park whose slot work could not be saved keeps
+  the slot on the parked task (the ledger accepts a slot on a parked task for this), so the slot is never reset or
+  released while that work is unsaved.
 
 ### Changed
 

@@ -442,7 +442,8 @@ export interface RuntimeDeps {
    */
   purgeSlots?(planId: PlanId, finished: Parameters<SlotPool["gc"]>[0]): ReturnType<SlotPool["gc"]>;
   /** Revalidate the fixed slots directory before approval has any side effects. */
-  checkSlotsDir?(slotsDir: string, toplevel: string): void | Promise<void>;
+  /** Approve-time validation of the resolved slots root; `planId` names the plan being approved (its ledger, its base). */
+  checkSlotsDir?(slotsDir: string, toplevel: string, planId: PlanId): void | Promise<void>;
   scheduler: Scheduler;
   launcher: TaskLauncher;
   routes: RouteResolver;
@@ -463,8 +464,13 @@ export interface RuntimeDeps {
     leases: LeaseService;
     waker: Waker;
     listener: IntegrationListener;
-    /** pdf2-1 (b): the policy's park calls it before clearing a slot the task still holds (saves the slot's work). */
-    beforeSlotRelease?: (taskId: TaskId, slot: string, cause: Parameters<UnattendedPolicy["park"]>[1]) => Promise<void>;
+    /**
+     * pdf2-1 (b): the policy's park calls it before clearing a slot the task still holds (saves the slot's work).
+     * QA-PDF21-3: `false` when the work could not be saved; the park then keeps the slot on the task.
+     */
+    beforeSlotRelease?: (taskId: TaskId, slot: string, cause: Parameters<UnattendedPolicy["park"]>[1]) => Promise<boolean | void>;
+    /** QA-PDF21-7: the options of a park item (`discard-wip`/`keep-wip` after a restore conflict). */
+    parkOptions?: (taskId: TaskId, cause: Parameters<UnattendedPolicy["park"]>[1]) => readonly string[];
   }): PlanCollaborators;
   pinOrchestrator(sessionID: string): () => void;
   log(level: "info" | "warn" | "error", msg: string, detail?: JsonValue): void;
@@ -507,6 +513,7 @@ export function realCollaborators(r: RealCollaboratorDeps): RuntimeDeps["collabo
     const policy = createUnattendedPolicy({
       writer: i.writer, leases: i.leases, waker: i.waker, qa, clock: r.clock, log: r.log,
       ...(i.beforeSlotRelease === undefined ? {} : { beforeSlotRelease: i.beforeSlotRelease }),
+      ...(i.parkOptions === undefined ? {} : { parkOptions: i.parkOptions }),
     });
     return { queue: r.queue({ ...i, policy, qa }), policy, qa };
   };
@@ -535,6 +542,18 @@ const STREAK_DETAILS: readonly string[] = ["unrequested-interrupt", "runner-erro
 const PRECONFIRM_STREAK = 3;
 /** Consecutive provisioning failures that raise one inbox item (QA-3.1-6). */
 const PROVISION_STREAK = 5;
+/**
+ * QA-PDF21-7: the options of the park item a restore conflict raises. `discard-wip` deletes the task's WIP ref before it
+ * relaunches clean; `keep-wip` (or any other answer) keeps the ref and the next attempt restores it again.
+ */
+export const WIP_PARK_OPTIONS: readonly string[] = ["discard-wip", "keep-wip"];
+
+/** QA-PDF21-10: a process-wide sequence; with the pid it keeps orphan ref names of one slot in one millisecond apart. */
+let orphanSeq = 0;
+function orphanTag(): string {
+  orphanSeq += 1;
+  return `${process.pid.toString(36)}${orphanSeq.toString(36)}`;
+}
 /** Consecutive RouteResolver failures (backoff rounds) that raise one inbox item (QA-3.1-22). */
 const ROUTE_STREAK = 5;
 const BACKOFF_BASE_MS = 1000;
@@ -845,8 +864,10 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     void track(next);
   }
 
-  function counter(p: PlanRt, key: string, labels: Record<string, string> = {}): void {
-    metric(p, { name: "counter", key, value: 1, labels });
+  function counter(p: PlanRt, key: string, labels: Record<string, string> = {}, deferred?: MetricPayload[]): void {
+    const m: MetricPayload = { name: "counter", key, value: 1, labels };
+    if (deferred === undefined) metric(p, m);
+    else deferred.push(m);
   }
 
   async function appendIf(p: PlanRt, build: BatchBuilder): Promise<boolean> {
@@ -918,8 +939,13 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     }
     collecting.add(p.planId);
     try {
-      // pdf2-1 (b): the WIP refs of integrated, done and cancelled tasks go before the slots.
+      // pdf2-1 (b): the WIP refs of integrated and done tasks go before the slots (QA-PDF21-4: a cancelled task's stays).
       await sweepWip(p);
+      // QA-PDF21-3: a slot whose work could not be saved is never collected; its item is open, the next collection retries.
+      if ([...wipFailRaised].some((k) => k.startsWith(`${p.planId}/`))) {
+        d.log("warn", `plan ${p.planId}: a slot holds unsaved work; its slots are not collected`);
+        return;
+      }
       await slotsFor(p.planId).gc(async (id) => id === p.planId);
       collected.add(p.planId);
       collectionDelays.delete(p.planId);
@@ -950,18 +976,45 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     }
   }
 
-  /** Called by the module that wrote TS(null), after the fsync of that batch (A3). */
-  async function releaseResources(p: PlanRt, taskId: TaskId, slotName: string | null): Promise<void> {
+  /**
+   * Called by the module that wrote TS(null), after the fsync of that batch (A3).
+   * QA-PDF21-4: the slot's work is saved before EVERY release (the pool's `acquire` resets a ready slot, so a slot
+   * released dirty loses its work): at the task's WIP ref while the pool still leases it to the task, else at an orphan
+   * ref. An integrated or done task's slot holds nothing to keep. `presaved` is the result of a save the caller ran
+   * already. QA-PDF21-3: a failed save never releases the slot: it stays leased and one blocking item names it.
+   * Returns whether the slot went back to the pool (true when there was none).
+   */
+  async function releaseResources(p: PlanRt, taskId: TaskId, slotName: string | null, outcome = "released", presaved: SaveResult | null = null): Promise<boolean> {
     releaseLeases(p, taskId);
     const s = slotName ?? p.slotLeases.get(taskId)?.slot ?? null;
-    p.slotLeases.delete(taskId);
-    if (s !== null) {
-      try {
-        await slotsFor(p.planId).release(s);
-      } catch (e) {
-        d.log("warn", "slot release failed", errorText(e));
-      }
+    if (s === null) {
+      p.slotLeases.delete(taskId);
+      return true;
     }
+    const released = await releaseSlotSaved(p, taskId, s, outcome, presaved);
+    if (released) p.slotLeases.delete(taskId);
+    return released;
+  }
+
+  /**
+   * QA-PDF21-4: the one way a slot of the plan goes back to the pool: its work is saved first (`presaved`: the save the
+   * caller ran already); an integrated or done task's slot holds nothing to keep. QA-PDF21-3: a failed save keeps the
+   * slot leased (never released, its lease cache kept) and raises the item that names it. Never throws.
+   */
+  async function releaseSlotSaved(p: PlanRt, taskId: TaskId, s: string, outcome: string, presaved: SaveResult | null = null): Promise<boolean> {
+    const state = own(p.writer.ledger, taskId)?.state;
+    const saved = presaved ?? (state === "integrated" || state === "done" ? "clean" : await snapshotTaskSlot(p, taskId, s, outcome));
+    if (saved === "failed") {
+      await wipHold(p, taskId, s, `its release (${outcome})`);
+      return false;
+    }
+    if (p.slotLeases.get(taskId)?.slot === s) p.slotLeases.delete(taskId);
+    try {
+      await slotsFor(p.planId).release(s);
+    } catch (e) {
+      d.log("warn", "slot release failed", errorText(e));
+    }
+    return true;
   }
 
   /** Releases the task's leases; a throwing registry is logged so the slot release behind it still runs (QA-3.1-12). */
@@ -1166,12 +1219,18 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     // pdf2-1 (b): the slot's work is saved at the task's WIP ref before the park releases it (the policy's own hook,
     // `beforeSlotRelease`, skips a park this saved already).
     const key = `${p.planId}/${taskId}`;
-    if (slotName !== null) await snapshotTaskSlot(p, taskId, slotName, cause);
-    parkSaved.add(key);
+    const saved: SaveResult = slotName === null ? "clean" : await snapshotTaskSlot(p, taskId, slotName, cause);
+    parkSaved.set(key, saved);
     try {
       await p.collab.policy.park(taskId, cause, text);
     } finally {
       parkSaved.delete(key);
+    }
+    if (saved === "failed" && slotName !== null) {
+      // QA-PDF21-3: the work has no ref: the slot is never released here (the policy's hook kept it on the task) and one
+      // blocking item names it.
+      await wipHold(p, taskId, slotName, "the park released it");
+      return;
     }
     const after = own(p.writer.ledger, taskId);
     if (slotName === null || after === null || after.state !== "parked" || after.slot !== null) return;
@@ -1199,8 +1258,10 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
   /** Plans whose repository is a git checkout on disk (WIP refs live in its common directory), by plan id. */
   const wipRepos = new Map<PlanId, boolean>();
-  /** `<plan>/<task>` of the parks `parkTask` is running: their slot's work is saved already. */
-  const parkSaved = new Set<string>();
+  /** `<plan>/<task>` of the parks `parkTask` is running -> the result of the save it ran before (QA-PDF21-3). */
+  const parkSaved = new Map<string, SaveResult>();
+  /** QA-PDF21-7: `<plan>/<task>` of the restore-conflict parks running now: their item offers `WIP_PARK_OPTIONS`. */
+  const restoreParks = new Set<string>();
   /** pdf2-1 (a): the launch request of each open attempt, by `<plan>/<task>#<n>`; a budget resume reuses it. */
   const launchRequests = new Map<string, LaunchRequest>();
 
@@ -1219,39 +1280,83 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   }
 
   /**
-   * Saves the uncommitted work in `slot` at `ref` (a WIP commit with the `Omr-Wip` trailer, never `Omr-Attempt`), then
-   * resets the slot to its HEAD. Never throws: a failure is logged and counted, and false is returned.
+   * QA-PDF21-3: the result of a save before a reset or a release. `saved` (the work has a ref, or already had it) and
+   * `clean` (nothing to save) let the caller go ahead; `failed` forbids both: the work has no ref of its own.
    */
-  async function saveSlotWork(p: PlanRt, slot: { slot: string; path: string }, ref: string, message: string, trailer: string, taskId: TaskId | null): Promise<boolean> {
-    if (!wipCapable(p)) return false;
+  type SaveResult = "saved" | "clean" | "failed";
+  /** QA-PDF21-6: `<plan>/<task>` -> the attempt whose slot holds the task's restored WIP (an undone restore drops the ref). */
+  const wipRestored = new Map<string, number>();
+  /** QA-PDF21-3: `<plan>/<slot>` of the slots whose failed save raised its blocking item already (cleared by a save). */
+  const wipFailRaised = new Set<string>();
+
+  /**
+   * Saves the work in `slot` at `ref` (a WIP commit with the `Omr-Wip` trailer, never `Omr-Attempt`), parented at
+   * `slot.base` when given (QA-PDF21-6: the lease base, so committed work is saved too), then resets the slot to its HEAD.
+   * QA-PDF21-3: a leftover `index.lock` is removed and the step retried once; an `update-ref` that fails twice leaves the
+     * commit at a unique orphan ref and the slot unreset. Never throws: a failure is logged and counted, and `failed` is
+     * returned (the caller must neither reset nor release the slot).
+     * `deferredMetrics` buffers diagnostics for a preflight whose refusal must not write to the ledger.
+   */
+  async function saveSlotWork(p: PlanRt, slot: { slot: string; path: string; base?: string | null }, ref: string, message: string, trailer: string, taskId: TaskId | null, deferredMetrics?: MetricPayload[]): Promise<SaveResult> {
+    if (!wipCapable(p)) return "clean";
+    const o = { cwd: slot.path, timeoutMs: GIT_TIMEOUT_MS };
     try {
-      const r = await snapshotSlotWork(d.git, { cwd: slot.path, ref, message, trailer, timeoutMs: GIT_TIMEOUT_MS });
-      if (r.saved) counter(p, "wip-saved", taskId === null ? { slot: slot.slot, ref } : { taskId, slot: slot.slot, ref });
-      return r.saved;
+      const r = await snapshotSlotWork(d.git, {
+        cwd: slot.path,
+        ref,
+        message,
+        trailer,
+        timeoutMs: GIT_TIMEOUT_MS,
+        ...(slot.base === undefined || slot.base === null ? {} : { base: slot.base }),
+        fallbackRef: orphanRefName(p.planId, slot.slot, d.clock.now(), orphanTag()),
+        removeIndexLock: () => removeIndexLock(d.git, o),
+      });
+      wipFailRaised.delete(`${p.planId}/${slot.slot}`);
+      if (r.saved) counter(p, "wip-saved", taskId === null ? { slot: slot.slot, ref } : { taskId, slot: slot.slot, ref }, deferredMetrics);
+      return r.saved || r.reason === "unchanged" ? "saved" : "clean";
     } catch (e) {
-      d.log("error", `saving the work in slot ${slot.slot} failed`, errorText(e));
-      counter(p, "wip-failed", taskId === null ? { slot: slot.slot } : { taskId, slot: slot.slot });
-      return false;
+      d.log("error", `saving the work in slot ${slot.slot} failed; the slot is kept as it is`, errorText(e));
+      counter(p, "wip-failed", taskId === null ? { slot: slot.slot } : { taskId, slot: slot.slot }, deferredMetrics);
+      return "failed";
     }
   }
 
-  /** pdf2-1 (b): `snapshotWip(slot, plan, task, n, nonce, outcome)` at `refs/heads/omr/<plan>/wip/<task>`. */
-  async function snapshotWip(p: PlanRt, slot: { slot: string; path: string }, taskId: TaskId, n: number, nonce: string, outcome: string): Promise<boolean> {
-    return saveSlotWork(p, slot, wipRefName(p.planId, taskId), `wip(${taskId}): attempt ${n} ${outcome}`, wipTrailer(p.planId, taskId, n, nonce), taskId);
+  /**
+   * pdf2-1 (b): `snapshotWip(slot, plan, task, n, nonce, outcome)` at `refs/heads/omr/<plan>/wip/<task>`.
+   * QA-PDF21-6: a slot that held the restored WIP and is clean now (the child undid it all) drops the ref, so the stale
+   * work is never restored again.
+   */
+  async function snapshotWip(p: PlanRt, slot: { slot: string; path: string; base?: string | null }, taskId: TaskId, n: number, nonce: string, outcome: string, deferredMetrics?: MetricPayload[]): Promise<SaveResult> {
+    const key = `${p.planId}/${taskId}`;
+    const r = await saveSlotWork(p, slot, wipRefName(p.planId, taskId), `wip(${taskId}): attempt ${n} ${outcome}`, wipTrailer(p.planId, taskId, n, nonce), taskId, deferredMetrics);
+    if (r === "saved") wipRestored.delete(key);
+    else if (r === "clean" && wipRestored.has(key)) {
+      wipRestored.delete(key);
+      await dropWip(p, taskId);
+    }
+    return r;
   }
 
-  /** pdf2-1 (b): a dirty slot no task of the plan holds any more goes to `omr/<plan>/orphan/<slot>-<ts>`, never restored. */
-  async function snapshotOrphan(p: PlanRt, slot: { slot: string; path: string }): Promise<boolean> {
+  /**
+   * pdf2-1 (b): a dirty slot no task of the plan holds any more goes to `omr/<plan>/orphan/<slot>-<ts>-<nonce>`, never
+   * restored (QA-PDF21-10: the nonce keeps two saves of one slot in one millisecond apart).
+   */
+  async function snapshotOrphan(p: PlanRt, slot: { slot: string; path: string }, deferredMetrics?: MetricPayload[]): Promise<SaveResult> {
     const ms = d.clock.now();
-    return saveSlotWork(p, slot, orphanRefName(p.planId, slot.slot, ms), `wip(orphan): slot ${slot.slot}`, `${WIP_TRAILER}: ${p.planId}/orphan/0/${ms}`, null);
+    const tag = orphanTag();
+    return saveSlotWork(p, slot, orphanRefName(p.planId, slot.slot, ms, tag), `wip(orphan): slot ${slot.slot}`, `${WIP_TRAILER}: ${p.planId}/orphan/0/${ms}-${tag}`, null, deferredMetrics);
   }
 
-  /** The path of `slotName`: the task's cached lease, else the pool's record; null when neither knows it. */
-  async function slotPathOf(p: PlanRt, taskId: TaskId, slotName: string): Promise<string | null> {
+  /**
+   * The path of `slotName` and its lease base (the commit it was reset to): the task's cached lease, else the pool's
+   * record; null when neither knows it.
+   */
+  async function slotPathOf(p: PlanRt, taskId: TaskId, slotName: string): Promise<{ path: string; base: string | null } | null> {
     const cached = p.slotLeases.get(taskId);
-    if (cached !== undefined && cached.slot === slotName) return cached.path;
+    if (cached !== undefined && cached.slot === slotName) return { path: cached.path, base: cached.commit };
     try {
-      return (await slotsFor(p.planId).get(slotName))?.path ?? null;
+      const rec = await slotsFor(p.planId).get(slotName);
+      return rec === null ? null : { path: rec.path, base: rec.commit ?? null };
     } catch (e) {
       d.log("warn", `slot lookup of ${slotName} failed`, errorText(e));
       return null;
@@ -1260,22 +1365,41 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
   /**
    * pdf2-1 (b): before a reset or a release of `slotName`, which `taskId` still holds: its latest attempt's work goes to the
-   * task's WIP ref. A slot the pool no longer leases to the task is saved as an orphan instead. Never throws.
+   * task's WIP ref (QA-PDF21-6: parented at the lease base, committed work included). A slot the pool no longer leases to
+   * the task is saved as an orphan instead. Never throws; `failed` forbids the reset or release (QA-PDF21-3).
    */
-  async function snapshotTaskSlot(p: PlanRt, taskId: TaskId, slotName: string, outcome: string): Promise<void> {
-    if (!wipCapable(p)) return;
-    const path = await slotPathOf(p, taskId, slotName);
-    if (path === null) return;
+  async function snapshotTaskSlot(p: PlanRt, taskId: TaskId, slotName: string, outcome: string, deferredMetrics?: MetricPayload[]): Promise<SaveResult> {
+    if (!wipCapable(p)) return "clean";
+    const at = await slotPathOf(p, taskId, slotName);
+    if (at === null) return "clean";
     const t = own(p.writer.ledger, taskId);
     const a = t?.attempts[t.attempts.length - 1];
-    if (t === null || a === undefined || !(await slotHeldBy(p, taskId, slotName))) {
-      await snapshotOrphan(p, { slot: slotName, path });
-      return;
-    }
-    await snapshotWip(p, { slot: slotName, path }, taskId, a.n, a.nonce, outcome);
+    if (t === null || a === undefined || !(await slotHeldBy(p, taskId, slotName))) return snapshotOrphan(p, { slot: slotName, path: at.path }, deferredMetrics);
+    return snapshotWip(p, { slot: slotName, path: at.path, base: at.base }, taskId, a.n, a.nonce, outcome, deferredMetrics);
   }
 
-  /** pdf2-1 (b): drops the WIP refs of the plan's integrated, done and cancelled tasks. Never throws. */
+  /**
+   * QA-PDF21-3: a slot whose work could not be saved is neither reset nor released: it stays leased (to `taskId` when one
+   * holds it) and one blocking item names it, once per slot until a save of it succeeds. Never throws.
+   */
+  async function wipHold(p: PlanRt, taskId: TaskId | null, slotName: string, what: string): Promise<void> {
+    const key = `${p.planId}/${slotName}`;
+    counter(p, "wip-hold", taskId === null ? { slot: slotName } : { taskId, slot: slotName });
+    if (wipFailRaised.has(key)) return;
+    wipFailRaised.add(key);
+    await raiseSafe(p, {
+      kind: "failure",
+      severity: "blocking",
+      taskId,
+      text: `the work in slot ${slotName} could not be saved before ${what}; the slot keeps its work and stays leased${taskId === null ? "" : ` to ${taskId}`} (see the log). Fix the slot's git state, then answer`,
+      options: [],
+    });
+  }
+
+  /**
+   * pdf2-1 (b): drops the WIP refs of the plan's integrated and done tasks. Never throws. QA-PDF21-4: a cancelled task's
+   * WIP ref is kept (an abort cancels tasks whose work it just saved); only purge deletes it.
+   */
   async function sweepWip(p: PlanRt): Promise<void> {
     if (!wipCapable(p)) return;
     let names: string[];
@@ -1288,7 +1412,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     if (names.length === 0) return;
     const present = new Set(names);
     for (const t of Object.values(p.writer.ledger.tasks)) {
-      if (t.state !== "integrated" && t.state !== "done" && t.state !== "cancelled") continue;
+      if (t.state !== "integrated" && t.state !== "done") continue;
       let ref: string;
       try {
         ref = wipRefName(p.planId, t.id);
@@ -1299,7 +1423,13 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     }
   }
 
-  /** pdf2-1 (b): drops the task's WIP ref once its own commit is integrated or it is cancelled. Never throws. */
+  /** QA-PDF21-6: the task's final commit landed in its slot: its WIP ref (and the restored marker) go. Never throws. */
+  async function finalCommitWip(p: PlanRt, taskId: TaskId): Promise<void> {
+    wipRestored.delete(`${p.planId}/${taskId}`);
+    await dropWip(p, taskId);
+  }
+
+  /** pdf2-1 (b): drops the task's WIP ref once its own commit landed, is integrated, or the task is done. Never throws. */
   async function dropWip(p: PlanRt, taskId: TaskId): Promise<void> {
     if (!wipCapable(p)) return;
     try {
@@ -1330,13 +1460,16 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
   /**
    * pdf2-1 (b): before `launchStep` resets the slot it acquired. The slot this task held (`acquire` gives it back
-   * unreset): its latest attempt's work goes to the task's WIP ref. Any other dirty slot: an orphan ref, never restored.
+   * unreset): its latest attempt's work goes to the task's WIP ref, parented at `base` (QA-PDF21-6: the commit the slot
+   * was reset to for that lease, so a committed attempt is carried over). Any other dirty slot: an orphan ref, never
+   * restored. QA-PDF21-4: a released slot is saved before its release (`releaseSlotSaved`), since the pool's `acquire`
+   * resets a ready slot before this runs. `failed` forbids the reset (QA-PDF21-3).
    */
-  async function saveBeforeLaunchReset(p: PlanRt, t: TaskNode, slot: SlotLease): Promise<void> {
-    if (!wipCapable(p)) return;
+  async function saveBeforeLaunchReset(p: PlanRt, t: TaskNode, slot: SlotLease, base: string | null): Promise<SaveResult> {
+    if (!wipCapable(p)) return "clean";
     const a = t.attempts[t.attempts.length - 1];
-    if (t.slot === slot.slot && a !== undefined) await snapshotWip(p, slot, t.id, a.n, a.nonce, a.outcome ?? "interrupted");
-    else await snapshotOrphan(p, slot);
+    if (t.slot === slot.slot && a !== undefined) return snapshotWip(p, { slot: slot.slot, path: slot.path, base }, t.id, a.n, a.nonce, a.outcome ?? "interrupted");
+    return snapshotOrphan(p, slot);
   }
 
   /**
@@ -1379,7 +1512,14 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       await abandon();
       return;
     }
-    await parkTask(p, t.id, "exhausted", msg);
+    // QA-PDF21-7: the item offers a way out (`discard-wip` drops the ref on the answer, see `answer`).
+    const key = `${p.planId}/${t.id}`;
+    restoreParks.add(key);
+    try {
+      await parkTask(p, t.id, "exhausted", `${msg}; answer discard-wip to relaunch without it, keep-wip to retry it`);
+    } finally {
+      restoreParks.delete(key);
+    }
   }
 
   /** Raises one inbox item through the policy; never throws. */
@@ -1649,17 +1789,28 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         }
       };
       // 2. slot
+      // QA-PDF21-6: the commit the task's slot was reset to for its last lease (the WIP base), read before `acquire`.
+      const priorBase = t0.slot === null || !wipCapable(p) ? null : ((await slotPathOf(p, taskId, t0.slot))?.base ?? null);
+      let saved: SaveResult = "clean";
       try {
         slot = await slotsFor(p.planId).acquire(p.planId, leaseHolderID(p.planId, taskId), l.integration.head);
         p.slotLeases.set(taskId, slot);
         // pdf2-1 (b): the work left in the slot is saved before the reset (this task's -> its WIP ref, else an orphan ref).
-        await saveBeforeLaunchReset(p, t0, slot);
-        await slotsFor(p.planId).reset(slot.slot, l.integration.head);
+        saved = await saveBeforeLaunchReset(p, t0, slot, priorBase);
+        if (saved !== "failed") await slotsFor(p.planId).reset(slot.slot, l.integration.head);
       } catch (e) {
         const unavailable = errorCode(e) === "E_SLOT_UNAVAILABLE";
         counter(p, "launch-skipped", { reason: unavailable ? "slot-unavailable" : "provision" });
         await abandon();
         if (!unavailable) await provisionFailed(p, taskId, e);
+        return "skipped";
+      }
+      if (saved === "failed") {
+        // QA-PDF21-3: the slot's work has no ref: it is neither reset nor released and stays leased to the task; the
+        // launch is skipped (backoff) and PROVISION_STREAK such skips in a row raise one blocking item naming the slot.
+        counter(p, "launch-skipped", { reason: "wip-save" });
+        releaseToken(p, taskId, n, "other");
+        await provisionFailed(p, taskId, `the work in slot ${slot.slot} could not be saved before its reset; the slot keeps it and stays leased to ${taskId}`);
         return "skipped";
       }
       // 3. leases (a throwing registry must not leak the token and the fresh slot, QA-3.1-12)
@@ -1684,15 +1835,43 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         await abandon();
         return "skipped";
       }
+      // QA-PDF21-5: the verifier's dispatch reference is captured first, at the clean reset commit: a check the restored
+      // work breaks is then this attempt's failure, never a pre-existing one. A begin that throws fails the launch below
+      // (row L4), as it did when it ran there.
+      const nonce = d.clock.randomHex(16);
+      let beginError: { e: unknown } | null = null;
+      try {
+        forgotten.delete(`${p.planId}/${taskId}#${n}`);
+        const gate0 = d.launcher.gate(l.orchestrator.sessionID);
+        const draft: Attempt = {
+          n, nonce, callID: gate0.ok ? gate0.context.callID : null, childSessionID: null, startedAt: d.clock.iso(), endedAt: null,
+          outcome: null, verdict: null, context: "",
+        };
+        await d.verifier.begin?.(t1, slot, draft, planTaskContext(p));
+      } catch (e) {
+        beginError = { e };
+      }
       // pdf2-1 (b): the work of an earlier attempt (the task's WIP ref) comes back as uncommitted changes on the
       // integration head; a conflict resets the slot again and parks the task with the ref kept.
       const back = await restoreWip(p, slot, taskId);
-      if (back.kind === "conflict" || back.kind === "error") {
-        await restoreConflicted(p, t1, n, slot, back.kind === "conflict" ? back.conflicts.slice(0, 20).join(", ") : back.text, abandon);
+      if (back.kind === "restored") wipRestored.set(`${p.planId}/${taskId}`, n);
+      if (back.kind === "error") {
+        // QA-PDF21-7: a transient git error is no conflict: the slot (only the ref's copy in it) is reset again and the
+        // launch is skipped with the backoff; the ref is kept and the next tick retries the restore.
+        try {
+          await slotsFor(p.planId).reset(slot.slot, l.integration.head);
+        } catch (e) {
+          d.log("warn", "slot reset after a failed restore failed", errorText(e));
+        }
+        counter(p, "launch-skipped", { reason: "wip-restore", taskId });
+        await abandon();
+        return "skipped";
+      }
+      if (back.kind === "conflict") {
+        await restoreConflicted(p, t1, n, slot, back.conflicts.slice(0, 20).join(", "), abandon);
         return "skipped";
       }
       const restored = back.kind === "restored" && back.files > 0 ? { attempt: back.attempt, files: back.files } : null;
-      const nonce = d.clock.randomHex(16);
       let expanded: ExpandedTask;
       try {
         const env = await loadExpansionEnv(d.git, { toplevel: l.repo.toplevel, slotPath: slot.path, timeoutMs: GIT_TIMEOUT_MS });
@@ -1769,7 +1948,11 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       let handle: LaunchHandle;
       try {
         forgotten.delete(`${p.planId}/${taskId}#${n}`);
-        await d.verifier.begin?.(own(p.writer.ledger, taskId) ?? t1, slot, attemptOf(p.writer.ledger, taskId, n), planTaskContext(p));
+        // QA-PDF21-5: `begin` ran before the restore (above); its error fails the launch here.
+        if (beginError !== null) throw beginError.e;
+        // A tick that reaches here after dispose began never hands the launcher a new child: the launcher's dispose
+        // settled only the launches it knew, so a later one would keep its confirmation, and dispose, waiting forever.
+        if (p.disposed) throw new ExecutorError("E_DISPOSED", "the runtime is disposing; no new launch");
         handle = d.launcher.launch(req, launchHooks(p, taskId, n, route));
       } catch (e) {
         const code = errorCode(e);
@@ -1812,7 +1995,11 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       handle.completion.then((end) => {
         ref.settled = true;
         // QA-4.2-4: an end inside a same-process adopt's window waits for the new attachment.
-        return track(live(p).then((q) => processEnd(q, taskId, n, end)));
+        return track(live(p).then((q) => processEnd(q, taskId, n, end), (e: unknown) => {
+          // pdf2-1 (a): no attachment processes this end, so no resume takes over the binding its completion held.
+          releaseChildBinding(end);
+          throw e;
+        }));
       }),
     );
     void track(
@@ -1897,6 +2084,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
    */
   function launchHooks(p0: PlanRt, taskId: TaskId, n: number, route: TaskRoute): LaunchHooks {
     return {
+      // pdf2-1 (a): a completed child keeps its binding until `processEnd` decided on a budget resume of that child.
+      holdCompletedBinding: true,
       async onLateChild(): Promise<"adopt" | "refuse"> {
         const p = await live(p0);
         const l = p.writer.ledger;
@@ -2124,6 +2313,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         d.log("error", "child end processing failed", errorText(e));
       } finally {
         if (!resumed) releaseToken(p, taskId, n, "other");
+        // pdf2-1 (a): only a budget resume of this very child takes over the binding its completion held; every other
+        // end drops it (most did so already, before their slot work: `onCompleted`, `budgetEnd`).
+        if (!resumed) releaseChildBinding(end);
         const still = own(p.writer.ledger, taskId);
         const closed = still === null || openAttempt(still, n) === null;
         // QA-4.2-23: the binding of an adopted child goes with its attempt.
@@ -2137,6 +2329,19 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         schedule(p);
       }
     });
+  }
+
+  /**
+   * pdf2-1 (a): drops the binding the launcher held for a `completed` end (`LaunchHooks.holdCompletedBinding`) once no
+   * budget resume takes it over. Idempotent (a launcher that holds nothing for the child ignores it); never throws.
+   */
+  function releaseChildBinding(end: ChildEnd): void {
+    if (end.kind !== "completed") return;
+    try {
+      d.launcher.releaseBinding?.(end.childSessionID);
+    } catch (e) {
+      d.log("warn", "binding release failed", errorText(e));
+    }
   }
 
   /** Processes one child end; true when a budget end resumed the same attempt (pdf2-1 (a): token, slot and leases kept). */
@@ -2167,7 +2372,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     const stopped = end.childSessionID !== null && p.capacityStopped.has(end.childSessionID);
     switch (end.kind) {
       case "completed":
-        if (t.state === "running") return onCompleted(p, t, a, end.text, end.endedAt);
+        if (t.state === "running") return onCompleted(p, t, a, end, end.text, end.endedAt);
         return false;
       case "failed":
         if (t.state !== "running") return false;
@@ -2248,8 +2453,10 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   }
 
   /** Row 15 and its alternatives; true when a budget end resumed the same attempt (pdf2-1 (a)). */
-  async function onCompleted(p: PlanRt, t: TaskNode, a: Attempt, text: string, at: IsoTime): Promise<boolean> {
+  async function onCompleted(p: PlanRt, t: TaskNode, a: Attempt, end: ChildEnd, text: string, at: IsoTime): Promise<boolean> {
     const cls = classifyChildText(text);
+    // pdf2-1 (a): only a budget end may resume this child; every other end drops its binding before it touches the slot.
+    if (cls.kind !== "budget") releaseChildBinding(end);
     if (t.kind === "qa") {
       const parsed = p.collab.qa.parse(text);
       if (parsed.ok) {
@@ -2266,7 +2473,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       return false;
     }
     // pdf2-1 (a): decided before the end releases the token or the slot (processEnd's `finally`, parkTask).
-    if (cls.kind === "budget") return budgetEnd(p, t, a, text);
+    if (cls.kind === "budget") return budgetEnd(p, t, a, end, text);
     if (cls.kind === "escalate" || cls.kind === "ambiguity") {
       await parkTask(p, t.id, cls.kind, text);
       releaseToken(p, t.id, a.n, "other");
@@ -2294,7 +2501,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
    * out, the task parks with `budget-cap`; the slot's work is kept at the task's WIP ref and restored on the next attempt.
    * Runs inside the end's task mutex, before the end releases the token or the slot.
    */
-  async function budgetEnd(p: PlanRt, t: TaskNode, a: Attempt, text: string): Promise<boolean> {
+  async function budgetEnd(p: PlanRt, t: TaskNode, a: Attempt, end: ChildEnd, text: string): Promise<boolean> {
     const l = p.writer.ledger;
     const resumes = a.resumes ?? 0;
     const ph = phaseOf(l, t);
@@ -2302,12 +2509,19 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     const child = a.childSessionID;
     const kept = `the work of attempt ${a.n} is kept and restored on the next attempt`;
     if (resumes < BUDGET_RESUMES && child !== null && l.status === "running" && !p.latch && !p.disposed && gateSame) {
+      // pdf2-1 (a): the binding the end held stays live for this resume; the launcher's resume takes it over.
       const r = await resumeAttempt(p, t, a, child, resumes + 1);
-      if (r === "resumed") return true;
+      if (r === "resumed") {
+        // Only the resumed child's binding is taken over; an end of another session never keeps its binding.
+        if (end.kind === "completed" && end.childSessionID !== child) releaseChildBinding(end);
+        return true;
+      }
+      releaseChildBinding(end);
       if (r === "gone") return false;
       await parkBudget(p, t.id, a.n, `${firstLine(text)}: the resume of attempt ${a.n} failed (${r.why}); ${kept}`);
       return false;
     }
+    releaseChildBinding(end);
     const why = resumes >= BUDGET_RESUMES
       ? `budget cap reached after ${resumes} resume(s)`
       : child === null ? "no child session to resume" : "the plan or the phase gate changed";
@@ -2403,6 +2617,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     };
     let handle: LaunchHandle;
     try {
+      // As for a fresh launch: never a new child once dispose began (its confirmation would hold dispose forever); the
+      // real launcher refuses one with E_DISPOSED too.
+      if (p.disposed) throw new ExecutorError("E_DISPOSED", "the runtime is disposing; no budget resume");
       handle = d.launcher.launch(req, launchHooks(p, taskId, n, req.route));
     } catch (e) {
       const code = errorCode(e);
@@ -2494,6 +2711,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     }
     const slotName = t.slot;
     const learned = edge;
+    // pdf2-1 (b), QA-PDF21-10: the interrupted attempt's work is saved first, while the task still holds its slot; a
+    // failed save (QA-PDF21-3) parks with the slot kept: pending/blocked cannot hold unsaved work.
+    const saved: SaveResult = slotName === null ? "clean" : await snapshotTaskSlot(p, t.id, slotName, "lease-needed");
     const applied = await appendIf(p, (cur) => {
       const c = own(cur, t.id);
       if (c === null || c.state !== "running" || openAttempt(c, a.n) === null) return [];
@@ -2505,18 +2725,27 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       const ev: ExecutorEventInput[] = [
         ae(t.id, a.n, "interrupted", clampEnd(a, at), `lease-needed:${path}`),
         ax(t.id, a.n, evidence),
-        tt(t.id, "running", "ready", "lease-needed", path),
+        saved === "failed"
+          ? tt(t.id, "running", "parked", "ambiguity", "unsaved-slot")
+          : tt(t.id, "running", "ready", "lease-needed", path),
         { type: "task-footprint", taskId: t.id, footprint: fp },
       ];
-      if (learned !== null) ev.push({ type: "edge-added", edge: learned }, tt(t.id, "ready", "pending", "dep-added", path));
-      ev.push(ts(t.id, null, null), ...gateRequeue(cur, c));
+      if (learned !== null) ev.push({ type: "edge-added", edge: learned });
+      if (saved !== "failed") {
+        ev.push(ts(t.id, null, null));
+        if (learned !== null) ev.push(tt(t.id, "ready", "pending", "dep-added", path));
+      }
+      ev.push(...gateRequeue(cur, c));
       return ev;
     });
     releaseToken(p, t.id, a.n, "other");
     if (!applied) return;
-    // pdf2-1 (b): the interrupted attempt's work is saved before the slot goes back to the pool.
-    if (slotName !== null) await snapshotTaskSlot(p, t.id, slotName, "lease-needed");
-    await releaseResources(p, t.id, slotName);
+    if (saved === "failed" && slotName !== null) {
+      releaseLeases(p, t.id);
+      await wipHold(p, t.id, slotName, "its release (lease-needed)");
+      return;
+    }
+    await releaseResources(p, t.id, slotName, "lease-needed", saved);
   }
 
   /** M38: commit in the slot, then verify; PASS enqueues, FAIL goes to the retry decision. */
@@ -2564,9 +2793,16 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         const c = own(cur, taskId);
         return c === null || c.state !== "completed" ? [] : [tt(taskId, "completed", "done", "no-changes"), ts(taskId, null, null)];
       });
-      if (applied) await releaseResources(p, taskId, slotName);
+      if (applied) {
+        // QA-PDF21-6: the task finished without changes: a saved WIP (undone by the child) is never restored again.
+        await finalCommitWip(p, taskId);
+        await releaseResources(p, taskId, slotName);
+      }
       return;
     }
+    // QA-PDF21-6: the task's final commit holds every attempt's work now; the WIP ref is dropped (a later save of this
+    // slot is parented at the lease base again, so the commit is carried over if this attempt fails its verification).
+    await finalCommitWip(p, taskId);
     const verifying = await appendIf(p, (cur) => {
       const c = own(cur, taskId);
       return c === null || c.state !== "completed" ? [] : [ts(taskId, slotName, branch), tt(taskId, "completed", "verifying", "committed")];
@@ -2689,11 +2925,14 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
           withTask(p, id, async () => {
             const t = own(p.writer.ledger, id);
             if (t !== null && t.slot !== null) {
-              await snapshotTaskSlot(p, id, t.slot, "conflict");
-              try {
-                await slotsFor(p.planId).reset(t.slot, p.writer.ledger.integration.head);
-              } catch (e) {
-                d.log("warn", "slot reset after conflict failed", errorText(e));
+              // QA-PDF21-3: a failed save keeps the slot as it is (no reset) and raises the item that names it.
+              if ((await snapshotTaskSlot(p, id, t.slot, "conflict")) === "failed") await wipHold(p, id, t.slot, "its reset after a conflict");
+              else {
+                try {
+                  await slotsFor(p.planId).reset(t.slot, p.writer.ledger.integration.head);
+                } catch (e) {
+                  d.log("warn", "slot reset after conflict failed", errorText(e));
+                }
               }
             }
             await settleCounted(p, id);
@@ -2921,11 +3160,18 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       waker,
       listener: makeListener(ref),
       // pdf2-1 (b): a park the runtime did not start (the queue's, the QA loop's) saves the slot's work too.
+      // QA-PDF21-3: `false` when the work could not be saved: the park keeps the slot on the task and one item names it.
       beforeSlotRelease: async (taskId, slot, cause) => {
         const p = ref.p;
-        if (p === null || p.disposed || parkSaved.has(`${planId}/${taskId}`)) return;
-        await snapshotTaskSlot(p, taskId, slot, cause);
+        if (p === null || p.disposed) return;
+        const done = parkSaved.get(`${planId}/${taskId}`);
+        if (done !== undefined) return done !== "failed";
+        if ((await snapshotTaskSlot(p, taskId, slot, cause)) !== "failed") return true;
+        await wipHold(p, taskId, slot, "the park released it");
+        return false;
       },
+      // QA-PDF21-7: the park after a restore conflict offers to discard the saved work or to keep it.
+      parkOptions: (taskId) => (restoreParks.has(`${planId}/${taskId}`) ? [...WIP_PARK_OPTIONS] : []),
     });
     // QA-4.2-29: one history export per attachment, shared by the capacity restore and the breaker step.
     const history = await exportHistory(planId, "capacity restore failed");
@@ -3417,14 +3663,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     });
     if (!applied) return;
     releaseLeases(p, taskId);
+    // QA-PDF21-4: saved before the release like every other one.
+    if (slotName !== null && (await slotHeldBy(p, taskId, slotName))) await releaseSlotSaved(p, taskId, slotName, "bad-slot");
     p.slotLeases.delete(taskId);
-    if (slotName !== null && (await slotHeldBy(p, taskId, slotName))) {
-      try {
-        await slotsFor(p.planId).release(slotName);
-      } catch (e) {
-        d.log("warn", "slot release failed", errorText(e));
-      }
-    }
   }
 
   /**
@@ -3449,26 +3690,16 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     }
     if (tip === "") return false;
     const stale = t0.slot;
+    // QA-PDF21-4: the stale slot's work (a `completed` task's is not committed yet) is saved before it goes back; a failed
+    // save keeps it and nothing is re-provisioned (the caller raises its item).
+    if (stale !== null && (await slotHeldBy(p, taskId, stale)) && !(await releaseSlotSaved(p, taskId, stale, "reprovision"))) return false;
     p.slotLeases.delete(taskId);
-    if (stale !== null && (await slotHeldBy(p, taskId, stale))) {
-      try {
-        await slotsFor(p.planId).release(stale);
-      } catch (e) {
-        d.log("warn", "slot release failed", errorText(e));
-      }
-    }
     let slot: SlotLease | null = null;
     const undo = async (why: string, e?: unknown): Promise<false> => {
       d.log("warn", `re-provisioning ${taskId} from ${branch}: ${why}`, e === undefined ? "" : errorText(e));
       const s = slot;
+      if (s !== null) await releaseSlotSaved(p, taskId, s.slot, "reprovision-undo");
       p.slotLeases.delete(taskId);
-      if (s !== null) {
-        try {
-          await slotsFor(p.planId).release(s.slot);
-        } catch (e2) {
-          d.log("warn", "slot release failed", errorText(e2));
-        }
-      }
       return false;
     };
     try {
@@ -3569,8 +3800,12 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
   /** R4: `reset --hard HEAD` + `clean -fd` in the task's slot (ignored files kept); idempotent, never throws. */
   async function resetSlotContents(p: PlanRt, t: TaskNode): Promise<void> {
-    // pdf2-1 (b): the slot's work is saved at the task's WIP ref before the reset.
-    if (t.slot !== null) await snapshotTaskSlot(p, t.id, t.slot, "restart");
+    // pdf2-1 (b): the slot's work is saved at the task's WIP ref before the reset. QA-PDF21-3: a failed save keeps the
+    // slot as it is (no reset) and raises the item that names it.
+    if (t.slot !== null && (await snapshotTaskSlot(p, t.id, t.slot, "restart")) === "failed") {
+      await wipHold(p, t.id, t.slot, "its reset (restart)");
+      return;
+    }
     try {
       const lease = await slotLeaseOf(p, t);
       const o = { cwd: lease.path, timeoutMs: GIT_TIMEOUT_MS };
@@ -4178,12 +4413,15 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
   // ---------- rendering
 
+  /** The status board of `l`; `p` is its attachment in this process, or null when the board is read from the store. */
   function renderBoard(l: Readonly<LedgerV1>, p: PlanRt | null): string {
     const by = new Map<TaskState, number>();
     for (const t of Object.values(l.tasks)) by.set(t.state, (by.get(t.state) ?? 0) + 1);
     const out: string[] = [`Plan ${l.planId} [${l.status}] ${l.planPath}`];
-    // QA-3.1-19: a passively attached (refused) plan says why nothing launches.
-    if (p !== null && p.passive && foreignPlans.has(p.planId)) {
+    // QA-3.1-19: a passively attached (refused) plan says why nothing launches. QA-4.2-21: a plan of another toplevel says
+    // so on a board read from the store too (its attachment still in progress, or none), not only once it is attached.
+    const foreign = (p === null || p.passive) && (foreignPlans.has(l.planId) || isForeign(l.repo.toplevel));
+    if (foreign) {
       // QA-4.2-17: a plan of another toplevel is attached passively, never run by this process.
       out.push(`Foreign: this plan belongs to ${l.repo.toplevel}; read-only here; mutate it from a session in that repository`);
     } else if (p !== null && p.passive) {
@@ -4263,7 +4501,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       try {
         const l = p.writer.ledger;
         const config: ExecutorConfig = { ...l.config, slotsDir: l.config.slotsDir ?? defaultSlotsDir(l.repo.toplevel, planId) };
-        await d.checkSlotsDir?.(config.slotsDir ?? defaultSlotsDir(l.repo.toplevel, planId), l.repo.toplevel);
+        await d.checkSlotsDir?.(config.slotsDir ?? defaultSlotsDir(l.repo.toplevel, planId), l.repo.toplevel, planId);
         await p.writer.append([
           { type: "plan-approved", config, by: sessionID },
           { type: "status-changed", from: "awaiting-approval", to: "running", reason: "approved" },
@@ -4300,6 +4538,20 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       requireStatus(p, ["running", "paused"]);
       activeOnly(p);
       const added = d.compiler.addTasks(p.writer.ledger, text);
+      // A ready task cannot park. Refuse the whole fragment if any reopened slot has unsaved work, before journaling
+      // its tasks, edges or transitions; the orchestrator can retry after the task's blocking item is answered.
+      const presaved = new Map<TaskId, { slot: string; saved: SaveResult }>();
+      // Even diagnostic metrics wait until the fragment is accepted: a refusal leaves the ledger untouched.
+      const deferredMetrics: MetricPayload[] = [];
+      for (const id of added.reopened) {
+        const c = own(p.writer.ledger, id);
+        if (c === null || c.state !== "ready" || c.slot === null) continue;
+        const saved = await snapshotTaskSlot(p, id, c.slot, "reopened", deferredMetrics);
+        if (saved === "failed") {
+          throw new ExecutorError("E_PLAN_STATE", `task ${id} holds unsaved work in slot ${c.slot}; answer its item first`);
+        }
+        presaved.set(id, { slot: c.slot, saved });
+      }
       const slots = new Map<TaskId, string>();
       await p.writer.append((cur) => {
         slots.clear();
@@ -4309,15 +4561,23 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         for (const id of added.reopened) {
           const c = own(cur, id);
           if (c === null || c.state !== "ready") continue;
-          ev.push(tt(id, "ready", "pending", "dep-added"));
           if (c.slot !== null) {
+            const pre = presaved.get(id);
+            if (pre === undefined || pre.slot !== c.slot || pre.saved === "failed") {
+              throw new ExecutorError("E_PLAN_STATE", `task ${id} holds unsaved work in slot ${c.slot}; answer its item first`);
+            }
             slots.set(id, c.slot);
             ev.push(ts(id, null, null));
           }
+          ev.push(tt(id, "ready", "pending", "dep-added"));
         }
         return ev;
       });
-      for (const [id, slot] of slots) await releaseResources(p, id, slot);
+      for (const m of deferredMetrics) metric(p, m);
+      for (const [id, slot] of slots) {
+        const pre = presaved.get(id);
+        await releaseResources(p, id, slot, "reopened", pre !== undefined && pre.slot === slot ? pre.saved : null);
+      }
       schedule(p);
       return { added: added.tasks.map((t) => t.id), reopened: [...added.reopened] };
     },
@@ -4325,6 +4585,18 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     async answer(planId, inboxId, text, sessionID) {
       const p = await mine(planId, sessionID);
       const paused = new Set(p.writer.ledger.phases.filter((ph) => ph.paused).map((ph) => ph.id));
+      // QA-PDF21-7: `discard-wip` on a restore-conflict park drops the task's WIP ref before the answer readies the task, so
+      // its next attempt starts clean (no launch can restore the ref in between).
+      const item = p.writer.ledger.inbox.find((x) => x.id === inboxId);
+      if (item !== undefined && item.answer === null && item.taskId !== null && item.options.includes("discard-wip")
+        && text.trim().toLowerCase() === "discard-wip") {
+        const taskId = item.taskId;
+        await withTask(p, taskId, async () => {
+          wipRestored.delete(`${p.planId}/${taskId}`);
+          await dropWip(p, taskId);
+        });
+        counter(p, "wip-discarded", { taskId });
+      }
       await p.collab.policy.answer(inboxId, text);
       const ledger = p.writer.ledger;
       const unpaused = new Set(ledger.phases.filter((ph) => paused.has(ph.id) && !ph.paused).map((ph) => ph.id));

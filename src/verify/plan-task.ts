@@ -2,7 +2,7 @@
 import { realpathSync } from "node:fs";
 import { isAbsolute, posix, resolve, win32 } from "node:path";
 import type { PlanTaskContext, PlanTaskVerdict, PlanTaskVerifier } from "../executor/runtime";
-import { ORCHESTRATOR_SHELL_RE, leaseHolderID, type Attempt, type SlotLease, type TaskNode, type Verdict as SlotVerdict } from "../executor/types";
+import { stripOrchestratorShell, leaseHolderID, type Attempt, type SlotLease, type TaskNode, type Verdict as SlotVerdict } from "../executor/types";
 import { createGitRunner } from "../executor/git";
 import { hardeningArgs } from "../router/git-tools";
 import type { HeadState } from "./head";
@@ -161,13 +161,22 @@ export function createLeaseSelfExemptions(keyOf: (root: string) => string): Leas
   };
 }
 
-/** The DoD of a plan task: its `[acceptance]` block, else the dispatch DoD inference over its text (A-5.1-4). */
+/** The DoD of a plan task: its child-checkable acceptance, else the dispatch DoD inference over its text (A-5.1-4). */
 export function planTaskDoD(task: Pick<TaskNode, "text" | "acceptance" | "title">): DoD {
   const acceptance = task.acceptance !== null && task.acceptance.trim() !== ""
     ? (/\[acceptance\]/i.test(task.acceptance) ? task.acceptance : `[acceptance]\n${task.acceptance}\n[/acceptance]`)
     : undefined;
   const dod = buildDelegationDoD({ prompt: task.text, description: task.title, ...(acceptance !== undefined ? { acceptance } : {}) });
-  return normalizeDoD({ ...dod, criteria: dod.criteria.filter((line) => !ORCHESTRATOR_SHELL_RE.test(line)) });
+  const criteria = dod.criteria.flatMap((line) => {
+    const { kept } = stripOrchestratorShell(line);
+    return kept === null ? [] : [kept];
+  });
+  const stripped = normalizeDoD({ ...dod, criteria });
+  if (stripped.criteria.length > 0 || stripped.checks.length > 0) return stripped;
+  // An empty child-checkable block is not a free pass. Remove embedded blocks too so inference cannot parse
+  // the same shell-only block again; judge the dispatch exactly as a task with no acceptance block.
+  const prompt = task.text.replace(/^\s*\[(acceptance|dod)\]\s*\r?\n[\s\S]*?^\s*\[\/\1\]\s*$/gim, "").trim();
+  return buildDelegationDoD({ prompt, description: task.title });
 }
 
 /** The router's hardened git argv (no hooks, no user config side effects), run in `cwd`. */

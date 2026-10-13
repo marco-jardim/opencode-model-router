@@ -176,6 +176,13 @@ placements, change observation, deterministic checks, independent grader, timeou
 `[acceptance]` block supplies its DoD; a task without an `[acceptance]` block gets the inferred DoD from its text and
 title, not an unchecked pass.
 
+Orchestrator-shell filtering splits each `criteria:` line on semicolons and drops **only the clause** marked
+`(orchestrator shell)`, not the other clauses on that line. The marked clause stays with the orchestrator and is not
+sent to the child or grader. Compilation warns on a mixed line:
+`orchestrator-shell-mixed L<n>: only the marked clause is skipped`. If filtering leaves an acceptance block with no
+criteria and no checks, verification falls back to the inferred DoD from the task's text and title, never an unchecked
+pass.
+
 The **base is the slot reset commit** captured before launch; the **candidate is the slot HEAD** after the router
 commits the child's changes. Before the gate, HEAD must be on the task branch and the base must be an ancestor of the
 candidate. Checks see a fresh snapshot after `cleanForChecks`. The changed-file set is the union of observed files and
@@ -267,7 +274,8 @@ looser value from a project file does not apply. The rule is spelled out in
 
 The executor keeps independent work moving when one task needs help. `ESCALATE:` or an ambiguous child result parks
 that task with a blocking question; exhausted retries or repeatedly unparsable QA output park it with a blocking
-failure. Parking releases its slot and file leases. Pending dependents become blocked (directly `dep-parked`,
+failure. Parking releases its slot and file leases, unless the slot's work could not be saved: then the parked task
+keeps the slot, unreset and unreleased, and one blocking item names it until a save succeeds. Pending dependents become blocked (directly `dep-parked`,
 transitively `dep-blocked`); unrelated tasks may still run. Answering the task's park item makes it ready again and
 passes the answer into its next attempt's context. Dependents become ready only once their dependency edges are
 satisfied, not merely because someone answered a question.
@@ -278,9 +286,14 @@ A `NEED MORE: budget` end resumes the same child session and attempt up to **3 t
 branch. After those resumes it parks as `budget-cap`, rather than starting the work over in another session.
 An interrupted, parked or lost attempt's uncommitted work is kept on `omr/<plan>/wip/<task>` and restored into the
 next attempt on top of the integration head. If restoration conflicts, the task parks and the WIP ref is kept.
+WIP refs are kept until the plan is purged; aborting a plan keeps them too.
 
-Criteria marked `(orchestrator shell)` are run by the orchestrator; they are not sent to the child or the grader.
-Executor launches carry a read cap: a task's explicit `CAP:` is kept, otherwise editing tasks get `CAP:12`.
+A cap written in the plan does not reach the child: executor launches neutralise the task's own directive tokens,
+including any explicit `CAP:`, and directive tokens in shared context are neutralised at compile time, so the shared
+text stored in the ledger stays byte-identical at launch. Editing tasks receive the executor's own `CAP:12` instead,
+placed first: it is the line right after `PLAN CONTEXT`, before the shared context and the task text. The router
+honours the first cap token in a prompt, so the executor's line wins even over a plan token that neutralisation does
+not catch, such as `CAP` and `:5` split across two lines. Tasks that do not edit get no cap line.
 
 The plan base is the base branch tip at compile, resolved in the repository toplevel, not the plan directory's HEAD.
 A detached toplevel HEAD is refused: check out the base branch before compiling. Approval re-reads that branch tip

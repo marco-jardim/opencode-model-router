@@ -397,7 +397,7 @@ describe("createExecutor assembly seams", () => {
     return { executor, host, deps: captured.runtime, compiler: captured.compiler, inner: captured.inner };
   }
 
-  async function queueRig(awaitingApproval = false, integrationHead?: string) {
+  async function queueRig(awaitingApproval = false, integrationHead?: string, slotsDir = "D:/slots/plan-a") {
     const timers = new Map<number, () => void>(); let serial = 0;
     const clock: Clock = { now: () => 1000, iso: () => "2026-10-11T00:00:00.000Z", randomHex: bytes => "a".repeat(bytes * 2),
       setTimer: (_ms, callback) => { const id = ++serial; timers.set(id, callback); return { id }; },
@@ -421,7 +421,7 @@ describe("createExecutor assembly seams", () => {
     // The writer journals a copy of the draft, so a moved integration head must be set before the ledger is created.
     if (integrationHead !== undefined) value.integration.head = integrationHead;
     value.repo.toplevel = prepared.toplevel;
-    value.config.slotsDir = "D:/slots/plan-a";
+    value.config.slotsDir = slotsDir;
     value.integration.worktree = join(value.config.slotsDir, "integration");
     expect(ledgerViolations(value)).toEqual([]);
     const writer = await store.create(value, holderOf("root", process.pid, "queue-test")); writers.push(writer);
@@ -516,7 +516,7 @@ describe("createExecutor assembly seams", () => {
     value.integration.worktree = join(expected, "integration");
     validate.mockReturnValue({ ok: false, reason: "slots point into repo" });
     await expect(h.deps.compiler.compile("PLAN.md", options)).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
-    await expect(h.deps.checkSlotsDir?.(expected, prepared.toplevel)).rejects.toThrow("slots point into repo");
+    await expect(h.deps.checkSlotsDir?.(expected, prepared.toplevel, value.planId)).rejects.toThrow("slots point into repo");
   }, 15_000);
 
   it("compiler git is hardened and bounded; missing exit codes fail closed", async () => {
@@ -531,9 +531,10 @@ describe("createExecutor assembly seams", () => {
 
   it("approval validation re-reads the base branch tip before any integration worktree is created", async () => {
     const h = await queueRig();
+    const validate = h.deps.checkSlotsDir as (slotsDir: string, toplevel: string, planId: string) => Promise<void>;
     const old = h.value.repo.baseCommit, moved = "d".repeat(40);
     h.raw.mockResolvedValue({ code: 0, signal: null, stdout: `${moved}\n`, stderr: "", truncated: false, durationMs: 0 });
-    await expect(h.deps.checkSlotsDir?.(h.value.config.slotsDir!, prepared.toplevel)).rejects.toMatchObject({
+    await expect(validate(h.value.config.slotsDir!, prepared.toplevel, h.value.planId)).rejects.toMatchObject({
       code: "E_STALE_BASE",
       message: `base branch ${h.value.repo.baseBranch} moved ${old}→${moved} since compile; recompile`,
     });
@@ -543,13 +544,29 @@ describe("createExecutor assembly seams", () => {
     expect(h.poolFactory).not.toHaveBeenCalled();
     expect(h.pool.acquireSpecial).not.toHaveBeenCalled();
     h.raw.mockResolvedValue({ code: 0, signal: null, stdout: `${old}\n`, stderr: "", truncated: false, durationMs: 0 });
-    await expect(h.deps.checkSlotsDir?.(h.value.config.slotsDir!, prepared.toplevel)).resolves.toBeUndefined();
+    await expect(validate(h.value.config.slotsDir!, prepared.toplevel, h.value.planId)).resolves.toBeUndefined();
     h.raw.mockResolvedValue({ code: 1, signal: null, stdout: "", stderr: "missing branch", truncated: false, durationMs: 0 });
-    await expect(h.deps.checkSlotsDir?.(h.value.config.slotsDir!, prepared.toplevel)).rejects.toMatchObject({ code: "E_GIT" });
+    await expect(validate(h.value.config.slotsDir!, prepared.toplevel, h.value.planId)).rejects.toMatchObject({ code: "E_GIT" });
+  }, 15_000);
+
+  it("QA-PDF21-10: approval uses the plan id, never the slots directory basename", async () => {
+    const slotsDir = "D:/trusted-slots/legacy-folder";
+    const h = await queueRig(false, undefined, slotsDir);
+    const read = vi.spyOn(h.deps.store, "read").mockImplementation(async id => {
+      if (id !== h.value.planId) throw new ExecutorError("E_PLAN_STATE", `unknown plan ${id}`);
+      return h.value;
+    });
+    h.raw.mockResolvedValue({ code: 0, signal: null, stdout: `${h.value.repo.baseCommit}\n`, stderr: "", truncated: false, durationMs: 0 });
+    const validate = h.deps.checkSlotsDir as (slotsDir: string, toplevel: string, planId: string) => Promise<void>;
+    await expect(validate(slotsDir, prepared.toplevel, h.value.planId)).resolves.toBeUndefined();
+    expect(read).toHaveBeenCalledExactlyOnceWith("plan-a");
+    expect(h.poolFactory).not.toHaveBeenCalled();
+    expect(h.pool.acquireSpecial).not.toHaveBeenCalled();
   }, 15_000);
 
   it("approve refuses a branch moved since compile with E_STALE_BASE, leaving the draft and integration branch untouched", async () => {
-    const h = await queueRig(true);
+    const h = await queueRig(true, undefined, "D:/trusted-slots/legacy-folder");
+    vi.spyOn(h.deps.store, "read").mockImplementation(id => h.store.read(id));
     // The runtime under test opens its own writer; the rig's writer is closed here, not again by the teardown.
     writers.splice(writers.indexOf(h.writer), 1);
     await h.writer.close();

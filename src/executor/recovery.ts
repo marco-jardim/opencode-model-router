@@ -100,6 +100,10 @@ function headerOf(ctx: HostSessionContext | null, sharedContext: string | undefi
   return shared === null ? null : parseLaunchHeader(prompt, shared);
 }
 
+/**
+ * Everything between "PLAN CONTEXT\n" and the blank line before the header line. For an editing task that span starts
+ * with the executor's read-cap line (DF-2-9); `parseLaunchHeader` reads it back as a prompt without the optional line.
+ */
 function inferSharedContext(prompt: string): string | null {
   const open = "PLAN CONTEXT\n";
   if (!prompt.startsWith(open)) return null;

@@ -333,15 +333,20 @@ export function phaseTagName(planId: PlanId, phaseId: PhaseId): string {
 export function wipRefName(planId: PlanId, taskId: TaskId): string {
   return `${planRefPrefix(planId)}wip/${encodeRefId(taskId)}`;
 }
-/** pdf2-1 (b): `omr/<planId>/orphan/<encoded slot>-<ms>`, a dirty slot no task of the plan holds any more. */
-export function orphanRefName(planId: PlanId, slot: string, ms: number): string {
+/**
+ * pdf2-1 (b): `omr/<planId>/orphan/<encoded slot>-<ms>[-<nonce>]`, a dirty slot no task of the plan holds any more, or a
+ * WIP commit whose own ref could not be written. QA-PDF21-10: `nonce` (lower-case letters and digits, others dropped)
+ * keeps two names of the same slot within the same millisecond apart.
+ */
+export function orphanRefName(planId: PlanId, slot: string, ms: number, nonce?: string): string {
   let name: string;
   try {
     name = encodeRefId(slot);
   } catch {
     name = "slot";
   }
-  return `${planRefPrefix(planId)}orphan/${name}-${Math.max(0, Math.floor(ms))}`;
+  const tag = typeof nonce === "string" ? nonce.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 32) : "";
+  return `${planRefPrefix(planId)}orphan/${name}-${Math.max(0, Math.floor(ms))}${tag === "" ? "" : `-${tag}`}`;
 }
 /** pdf2-1 (b): `Omr-Wip: <planId>/<taskId>/<n>/<nonce>`; a WIP commit never carries `Omr-Attempt`. */
 export function wipTrailer(planId: PlanId, taskId: TaskId, n: number, nonce: string): string {
@@ -386,36 +391,95 @@ async function refCommit(git: GitRunner, o: SlotCall, ref: string): Promise<stri
   return r.code === 0 && GIT_ID_PATTERN.test(oid) ? oid : null;
 }
 
+/** QA-PDF21-3: a snapshot step that failed on a leftover `index.lock`. */
+const SLOT_INDEX_LOCK_PATTERN = /index\.lock/i;
+
 /**
- * pdf2-1 (b): saves the slot's uncommitted work (tracked changes and untracked, non-ignored files) at `refs/heads/<ref>`
- * without leaving a trace on the slot's HEAD: `add -A`, `write-tree`, `commit-tree -p <HEAD>` (message, then the
- * trailer as its own paragraph), a compare-and-swap `update-ref`, then `reset --hard <HEAD>`. A clean tree saves
- * nothing; a tree equal to the ref's tree saves nothing (the slot is still reset to HEAD). Throws `E_GIT`.
+ * pdf2-1 (b): saves the slot's work (tracked changes and untracked, non-ignored files) at `refs/heads/<ref>` without
+ * leaving a trace on the slot's HEAD: `add -A`, `write-tree`, `commit-tree -p <base>` (message, then the trailer as its
+ * own paragraph), a compare-and-swap `update-ref`, then `reset --hard <HEAD>`.
+ * QA-PDF21-6: the commit is parented at `base` (the lease's reset commit; default HEAD) and its tree is the worktree, so
+ * work the attempt already committed on top of `base` is saved with the uncommitted rest. Nothing to save (the worktree
+ * equals `base`): `clean`; a tree equal to the ref's tree: `unchanged` (the slot is still reset to HEAD).
+ * QA-PDF21-3: a step that fails on a leftover `index.lock` is retried once after `removeIndexLock` removed it. A failed
+ * `update-ref` is retried once; when it fails again the commit is written to `fallbackRef` (a unique name, create-only),
+ * the slot is NOT reset and `E_GIT` is thrown with `details.commit` and `details.keptAt` (the fallback ref or null).
+ * Throws `E_GIT`; the slot is reset only after the work has a ref.
  */
 export async function snapshotSlotWork(
   git: GitRunner,
-  i: { cwd: string; ref: string; message: string; trailer: string; timeoutMs: number },
+  i: {
+    cwd: string; ref: string; message: string; trailer: string; timeoutMs: number;
+    base?: string; fallbackRef?: string; removeIndexLock?: () => Promise<boolean>;
+  },
 ): Promise<WipSnapshot> {
   const o: SlotCall = { cwd: i.cwd, timeoutMs: i.timeoutMs };
-  const status = await slotMust(git, o, "status", ["status", "--porcelain", "--untracked-files=all"]);
-  if (status.trim() === "") return { saved: false, reason: "clean" };
-  const head = (await slotMust(git, o, "rev-parse", ["rev-parse", "--verify", "HEAD^{commit}"])).trim();
+  let lockRemoved = false;
+  const must = async (op: string, args: readonly string[]): Promise<string> => {
+    let r = await slotRun(git, o, op, args);
+    if (r.code !== 0 && !lockRemoved && i.removeIndexLock !== undefined && SLOT_INDEX_LOCK_PATTERN.test(`${r.stderr}\n${r.stdout}`)) {
+      lockRemoved = true;
+      if (await i.removeIndexLock()) r = await slotRun(git, o, op, args);
+    }
+    if (r.code !== 0) throw gitFailure(op, r);
+    return r.stdout;
+  };
+  const status = await must("status", ["status", "--porcelain", "--untracked-files=all"]);
+  const clean = status.trim() === "";
+  if (clean && i.base === undefined) return { saved: false, reason: "clean" };
+  if (clean) {
+    // Only committed work can be left: a HEAD that cannot be read leaves nothing to compare with the base.
+    const h = await slotRun(git, o, "rev-parse", ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
+    if (h.code !== 0 || !GIT_ID_PATTERN.test(h.stdout.trim())) return { saved: false, reason: "clean" };
+  }
+  const head = (await must("rev-parse", ["rev-parse", "--verify", "HEAD^{commit}"])).trim();
   requireCommit(head, "HEAD");
-  await slotMust(git, o, "add", ["add", "-A"]);
-  const tree = (await slotMust(git, o, "write-tree", ["write-tree"])).trim();
+  let parent = head;
+  if (i.base !== undefined && i.base !== head) {
+    const b = await slotRun(git, o, "rev-parse", ["rev-parse", "--verify", "--quiet", `${i.base}^{commit}`]);
+    const oid = b.stdout.trim();
+    if (b.code === 0 && GIT_ID_PATTERN.test(oid)) parent = oid;
+  }
+  if (status.trim() === "" && parent === head) return { saved: false, reason: "clean" };
+  await must("add", ["add", "-A"]);
+  const tree = (await must("write-tree", ["write-tree"])).trim();
+  const parentTree = (await must("rev-parse", ["rev-parse", "--verify", `${parent}^{tree}`])).trim();
+  if (tree === parentTree) {
+    if (status.trim() !== "") await must("reset", ["reset", "--hard", "--quiet", head]);
+    return { saved: false, reason: "clean" };
+  }
   const old = await refCommit(git, o, i.ref);
   if (old !== null) {
-    const oldTree = (await slotMust(git, o, "rev-parse", ["rev-parse", "--verify", `${old}^{tree}`])).trim();
+    const oldTree = (await must("rev-parse", ["rev-parse", "--verify", `${old}^{tree}`])).trim();
     if (oldTree === tree) {
-      await slotMust(git, o, "reset", ["reset", "--hard", "--quiet", head]);
+      await must("reset", ["reset", "--hard", "--quiet", head]);
       return { saved: false, reason: "unchanged" };
     }
   }
-  const files = splitNul(await slotMust(git, o, "diff", ["diff", "--cached", "--name-only", "-z", "--no-renames", head])).length;
-  const commit = (await slotMust(git, o, "commit-tree", ["commit-tree", tree, "-p", head, "-m", i.message, "-m", i.trailer])).trim();
+  const files = splitNul(await must("diff", ["diff", "--cached", "--name-only", "-z", "--no-renames", parent])).length;
+  const commit = (await must("commit-tree", ["commit-tree", tree, "-p", parent, "-m", i.message, "-m", i.trailer])).trim();
   requireCommit(commit, "WIP commit");
-  await slotMust(git, o, "update-ref", ["update-ref", "--no-deref", `refs/heads/${i.ref}`, commit, old ?? "0".repeat(commit.length)]);
-  await slotMust(git, o, "reset", ["reset", "--hard", "--quiet", head]);
+  const zero = "0".repeat(commit.length);
+  const update = ["update-ref", "--no-deref", `refs/heads/${i.ref}`, commit, old ?? zero];
+  let r = await slotRun(git, o, "update-ref", update);
+  if (r.code !== 0 && (await refCommit(git, o, i.ref).catch(() => null)) !== commit) {
+    r = await slotRun(git, o, "update-ref", update);
+    if (r.code !== 0 && (await refCommit(git, o, i.ref).catch(() => null)) !== commit) {
+      let keptAt: string | null = null;
+      if (i.fallbackRef !== undefined) {
+        try {
+          const f = await slotRun(git, o, "update-ref", ["update-ref", "--no-deref", `refs/heads/${i.fallbackRef}`, commit, zero]);
+          if (f.code === 0) keptAt = i.fallbackRef;
+        } catch {
+          keptAt = null;
+        }
+      }
+      throw new ExecutorError("E_GIT", `git update-ref failed twice; WIP commit ${commit} ${keptAt === null ? "has no ref" : `kept at ${keptAt}`}`, {
+        op: "update-ref", code: r.code, stderr: stripUrlUserinfo(r.stderr).slice(0, 2000), commit, keptAt,
+      });
+    }
+  }
+  await must("reset", ["reset", "--hard", "--quiet", head]);
   return { saved: true, commit, ref: i.ref, files };
 }
 

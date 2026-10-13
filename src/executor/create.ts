@@ -2,7 +2,7 @@
 import { realpathSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import { hostname } from "node:os";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import type { V2Executor, V2ExecutorHost } from "../compat/v2-hooks";
 import { loadConfig, parseModelRef, resolveActiveTiers, resolveRolesRouting, resolveRouting, validateSlotsDir, type RouterHost } from "../router/config";
 import { resolveRoles } from "../router/roles";
@@ -524,10 +524,10 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
       holder, capacity: createCapacityController, collaborators: realCollaborators({ queue: buildQueue, clock, log }),
       pinOrchestrator: host.pinOrchestrator, log,
       config: () => ({ ...resolveRouting(loadConfig(directory), "v2").executor, slotsDir: null }), toplevel,
-      async checkSlotsDir(slotsDir, repoToplevel) {
+      async checkSlotsDir(slotsDir, repoToplevel, planId?: PlanId) {
         checkSlotsDir(slotsDir, repoToplevel);
-        // slotsDir is the per-plan directory (including for a trusted custom root).
-        const ledger = await store.read(basename(slotsDir.replace(/\\/g, "/")));
+        if (planId === undefined) throw new ExecutorError("E_PLAN_STATE", "approval validation requires the plan id");
+        const ledger = await store.read(planId);
         await checkBase(git, ledger.repo);
       },
     });

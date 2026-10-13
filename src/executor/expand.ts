@@ -2,7 +2,8 @@
  * Phase 3.1.4: task expansion (the launch prompt of one plan task attempt).
  *
  * Design memo: docs/qa/critical-path-execution/phase-3.1.md M36 and §8 "expand.ts (3.1.4)".
- * Pure except `loadExpansionEnv`, which reads the worktree list and `core.longpaths` through the `GitRunner` seam.
+ * Pure except optional diagnostic logging and `loadExpansionEnv`, which reads the worktree list and
+ * `core.longpaths` through the `GitRunner` seam.
  * The route line is re-serialized from whitelisted tokens; plan text never reaches it.
  */
 import * as path from "node:path";
@@ -14,8 +15,8 @@ import {
   ABSOLUTE_PATH_PATTERN,
   ExecutorError,
   FINDINGS_FORMAT,
-  ORCHESTRATOR_SHELL_RE,
   formatLaunchPrompt,
+  stripOrchestratorShell,
   type GitRunner,
   type LedgerV1,
   type SlotLease,
@@ -50,6 +51,8 @@ export interface ExpandInput {
   env: ExpansionEnv;
   /** The previous attempt's work restored as uncommitted changes. */
   restored?: { attempt: number; files: number };
+  /** Best-effort diagnostic for ignored route budgets; defaults to a console warning. */
+  log?(message: string, detail?: unknown): void;
 }
 
 /** The expansion: the full launch prompt, the re-serialized route line and the slot-relative check inputs. */
@@ -293,7 +296,7 @@ interface RouteFields {
   budget: number | null;
 }
 
-function parseRouteFields(line: string): RouteFields {
+function parseRouteFields(line: string, log?: ExpandInput["log"]): RouteFields {
   const f: RouteFields = { cls: null, risk: null, scope: null, needs: [], d: null, tier: null, pin: null, budget: null };
   const trimmed = line.trim();
   if (trimmed === "") return f;
@@ -317,6 +320,16 @@ function parseRouteFields(line: string): RouteFields {
       else routeFail("value of pin is outside its token pattern", { value: raw.slice(0, 40) });
       continue;
     }
+    if (key === "budget") {
+      const n = raw !== null && /^\d+$/.test(raw) ? Number(raw) : 0;
+      if (n >= 1 && n <= ROUTE_BUDGET_MAX) f.budget = n;
+      else {
+        try {
+          log?.("route expansion ignored invalid or out-of-range budget", { value: raw?.slice(0, 40) ?? null });
+        } catch { /* logging never fails expansion */ }
+      }
+      continue;
+    }
     if (raw === null || (key !== "needs" && !TOKEN_VALUE_RE.test(raw))) {
       routeFail(`value of ${key} is outside its token pattern`, { key });
     }
@@ -327,12 +340,6 @@ function parseRouteFields(line: string): RouteFields {
       case "scope": if (!isMemberOf(ROUTE_SCOPES, value)) routeFail("unknown scope", { value: value.slice(0, 40) }); f.scope = value; break;
       case "d": if (!isMemberOf(ROUTE_DS, value)) routeFail("unknown d", { value: value.slice(0, 40) }); f.d = value; break;
       case "tier": if (!isMemberOf(ROUTE_TIERS, value)) routeFail("unknown tier", { value: value.slice(0, 40) }); f.tier = value; break;
-      case "budget":
-        if (!/^\d+$/.test(value) || Number(value) < 1 || Number(value) > ROUTE_BUDGET_MAX) {
-          routeFail("budget is outside its range", { value: value.slice(0, 40) });
-        }
-        f.budget = Number(value);
-        break;
       case "needs":
         for (const n of value.split(",")) {
           if (!isMemberOf(ROUTE_NEEDS, n)) routeFail("unknown need", { value: n.slice(0, 40) });
@@ -349,13 +356,14 @@ function parseRouteFields(line: string): RouteFields {
  * The route line sent with the attempt (M36): re-serialized from the whitelisted tokens class, risk, scope, needs, d,
  * `root=<slotPath>` (quoted when the path holds a space), tier, pin and budget. `task.route.tier` and `task.route.pin` (`[tier:X]` gives `tier=X pin`) win over the
  * line's own `tier=`/`pin`. A value outside its token pattern, or holding whitespace, `]` or a line break, fails with
- * E_LAUNCH_TASK. The plan text (title, text, subtasks) is never read here.
+ * E_LAUNCH_TASK, except invalid/out-of-range budgets, which are ignored as by the route compiler. The plan text
+ * (title, text, subtasks) is never read here.
  */
-export function renderRouteLine(task: TaskNode, slotPath: string): string {
+export function renderRouteLine(task: TaskNode, slotPath: string, log: ExpandInput["log"] = console.warn): string {
   if (!ROOT_VALUE_RE.test(slotPath) || /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(slotPath)) {
     routeFail("the slot path is not a usable root= value", { slotPath: slotPath.slice(0, 120) });
   }
-  const f = parseRouteFields(task.route.line);
+  const f = parseRouteFields(task.route.line, log);
   const tier = task.route.tier ?? f.tier;
   if (tier !== null && !isMemberOf(ROUTE_TIERS, tier)) routeFail("unknown tier", { value: String(tier).slice(0, 40) });
   const pin = task.route.pin || f.pin === true;
@@ -415,12 +423,13 @@ export function renderTaskBlock(
   void ledger;
   const rw = (s: string): string => rewriteAbsolutePaths(s, map);
   let skipped = false;
-  const childText = (text: string): string => text.split(/\r\n|\n|\r/).filter((line) => {
-    if (/^\s*criteria\s*:/i.test(line) && ORCHESTRATOR_SHELL_RE.test(line)) {
-      skipped = true;
-      return false;
-    }
-    return true;
+  const childText = (text: string): string => text.split(/\r\n|\n|\r/).flatMap((line) => {
+    const m = /^(\s*criteria\s*:\s*)(.*)$/i.exec(line);
+    if (m === null) return [line];
+    const { kept, dropped } = stripOrchestratorShell(m[2] ?? "");
+    skipped ||= dropped;
+    if (!dropped) return [line];
+    return kept === null ? [] : [`${m[1]}${kept}`];
   }).join("\n");
   const out: string[] = [];
   out.push(`TASK ${task.id}: ${rw(task.title)}`);
@@ -457,8 +466,9 @@ function acceptanceCriteria(block: string): { criteria: string[]; skipped: boole
   for (const raw of block.split(/\r\n|\n|\r/)) {
     const m = /^\s*criteria\s*:\s*(.+?)\s*$/i.exec(raw);
     if (m?.[1] === undefined) continue;
-    if (ORCHESTRATOR_SHELL_RE.test(m[1])) skipped = true;
-    else out.push(m[1]);
+    const { kept, dropped } = stripOrchestratorShell(m[1]);
+    skipped ||= dropped;
+    if (kept !== null) out.push(kept);
   }
   return { criteria: out, skipped };
 }
@@ -495,15 +505,17 @@ export function expandTask(i: ExpandInput): ExpandedTask {
   const task = Object.prototype.hasOwnProperty.call(i.ledger.tasks, i.taskId) ? i.ledger.tasks[i.taskId] : undefined;
   if (task === undefined) fail("task is not in the ledger", { taskId: i.taskId });
   const map = buildPathMap(i.ledger, task, i.slot, i.env);
-  const routeLine = renderRouteLine(task, i.slot.path);
+  const routeLine = renderRouteLine(task, i.slot.path, i.log);
   const taskBlock = renderTaskBlock(i.ledger, task, i.slot, map, i.restored);
-  const planPrompt = formatLaunchPrompt(
+  // TaskNode carries no parsed CAP, and a cap written in the plan is neutralized with the rest of the task text. An editing
+  // task gets the executor's own read-cap line right after "PLAN CONTEXT", before the shared context and the task text, so
+  // it is the first read-cap token the router sees (the first one wins, DF-2-9).
+  const prompt = formatLaunchPrompt(
     i.ledger.sharedContext, // The fixed launch/recovery prefix must match the ledger byte for byte.
     { planId: i.ledger.planId, taskId: i.taskId, attempt: i.attempt, nonce: i.nonce },
     neutralizeDirectives(taskBlock),
+    parseRouteFields(task.route.line).needs.includes("edit"),
   );
-  // TaskNode carries no parsed CAP. Add the router directive only after neutralizing the task's plan text.
-  const prompt = parseRouteFields(task.route.line).needs.includes("edit") ? `${planPrompt}\n\nCAP:12` : planPrompt;
   return {
     prompt,
     routeLine,

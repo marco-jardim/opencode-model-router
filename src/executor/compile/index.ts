@@ -4,10 +4,12 @@ import { posix, win32 } from "node:path";
 import type { RouteLine } from "../../routing/classify/types";
 import type { AnnotatedPlan, PlanStep } from "../../routing/engine";
 import type { DurationModel } from "../../routing/outcomes/durations";
+import { neutralizeDirectives } from "../../verify/pending";
 import {
   EXECUTOR_LIMITS,
   ExecutorError,
   LAUNCH_HEADER_PATTERN,
+  ORCHESTRATOR_SHELL_RE,
   PLAN_ID_PATTERN,
   ledgerViolations,
   type CompileSummary,
@@ -168,7 +170,7 @@ function checkInputs(
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Shared context (D2): worktree paths -> <worktree>, header-shaped lines removed, cap at the last newline.
+// Shared context (D2): paths -> <worktree>, headers removed, directives neutralised, cap at the last newline.
 
 const HEADER_REPLACEMENT = "[header-shaped line removed]";
 
@@ -218,7 +220,7 @@ function sharedContextOf(
   if (removed > 0) {
     warnings.push({ code: "shared-context-header", line: 0, message: `${removed} header-shaped line(s) in the shared context were removed` });
   }
-  text = kept.join("\n");
+  text = neutralizeDirectives(kept.join("\n"));
   const cut = cutAtNewline(text, cap);
   if (cut.length < text.length) {
     warnings.push({ code: "shared-context-truncated", line: 0, message: `shared context cut to ${cut.length} of ${text.length} chars` });
@@ -343,11 +345,12 @@ async function gitText(git: RepoGit, args: readonly string[], cwd: string): Prom
 async function readRepo(deps: CompilerDeps, toplevel: string): Promise<LedgerV1["repo"]> {
   const git = deps.git;
   const common = await gitText(git, ["rev-parse", "--path-format=absolute", "--git-common-dir"], toplevel);
-  const branch = await git.run(["symbolic-ref", "--short", "HEAD"], toplevel);
-  if (branch.code !== 0 || branch.stdout.trim() === "") {
+  const branch = await git.run(["symbolic-ref", "HEAD"], toplevel);
+  const branchRef = branch.stdout.trim();
+  if (branch.code !== 0 || !branchRef.startsWith("refs/heads/") || branchRef === "refs/heads/") {
     throw new ExecutorError("E_INVALID_INPUT", "check out the base branch before compiling a plan (detached HEAD)", null);
   }
-  const baseBranch = branch.stdout.trim();
+  const baseBranch = branchRef.slice("refs/heads/".length);
   // Resolve the branch ref afresh on every compile, never the plan directory's HEAD or a cached base.
   const baseCommit = await gitText(git, ["rev-parse", "--verify", `refs/heads/${baseBranch}^{commit}`], toplevel);
   const abs = /^(?:[A-Za-z]:[\\/]|\\\\|\/)/.test(common) ? common : (/^[A-Za-z]:/.test(toplevel) ? win32.resolve(toplevel, common) : posix.resolve(toplevel, common));
@@ -667,6 +670,14 @@ export function createPlanCompiler(deps: CompilerDeps): PlanCompiler {
     const issues: CompileIssue[] = [];
     const parsed = await annotateUnrouted(parsePlan(text), deps.annotate);
     issues.push(...parsed.warnings);
+    text.split(/\r\n|\n|\r/).forEach((line, i) => {
+      const criteria = /^[ \t]*criteria[ \t]*:(.*)$/i.exec(line)?.[1];
+      if (criteria === undefined) return;
+      const clauses = criteria.split(";").map((clause) => clause.trim()).filter((clause) => clause !== "");
+      if (clauses.some((clause) => ORCHESTRATOR_SHELL_RE.test(clause)) && clauses.some((clause) => !ORCHESTRATOR_SHELL_RE.test(clause))) {
+        issues.push({ code: "orchestrator-shell-mixed", line: i + 1, message: "only the marked clause is skipped" });
+      }
+    });
 
     const sel = selectPhases(parsed, opts, issues);
     const includedIds = new Set(sel.included.map((p) => p.id));

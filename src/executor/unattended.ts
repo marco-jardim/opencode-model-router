@@ -23,9 +23,13 @@ export interface UnattendedDeps {
   log: UnattendedLog;
   /**
    * pdf2-1 (b): called by `park` before the batch that clears the task's slot (`task-slot slot:null`), while the task still
-   * holds `slot`; the runtime saves the slot's work there. Failures are logged; the park goes on.
+   * holds `slot`; the runtime saves the slot's work there. QA-PDF21-3: `false` or a throw means the work could not be
+   * saved: the park goes on but keeps the slot (no `task-slot slot:null`, no lease release), so nothing resets or
+   * releases it; the runtime raises the blocking item that names the slot.
    */
-  beforeSlotRelease?(taskId: TaskId, slot: string, cause: ParkCause): Promise<void>;
+  beforeSlotRelease?(taskId: TaskId, slot: string, cause: ParkCause): Promise<boolean | void>;
+  /** QA-PDF21-7: the options of the park item `park` writes for `taskId` (none by default). */
+  parkOptions?(taskId: TaskId, cause: ParkCause): readonly string[];
 }
 
 export const INBOX_TEXT_MAX = 4000; // U3
@@ -290,13 +294,22 @@ export function createUnattendedPolicy(d: UnattendedDeps): UnattendedPolicy {
     if (t0 === undefined) {
       throw new ExecutorError("E_INVALID_INPUT", `unknown task ${taskId}`, { taskId });
     }
-    // pdf2-1 (b): the slot's work is saved before the batch below clears the slot.
+    // pdf2-1 (b): the slot's work is saved before the batch below clears the slot. QA-PDF21-3: a failed save keeps it on
+    // the parked task (A1-7 lets a parked task hold a slot for this; before that amendment the batch was refused).
+    let keptSlot: string | null = null;
     if (t0.slot !== null && d.beforeSlotRelease !== undefined) {
       try {
-        await d.beforeSlotRelease(taskId, t0.slot, cause);
+        if ((await d.beforeSlotRelease(taskId, t0.slot, cause)) === false) keptSlot = t0.slot;
       } catch (e) {
-        d.log("warn", "saving the slot's work before the park failed", e instanceof Error ? e.message : String(e));
+        keptSlot = t0.slot;
+        d.log("warn", "saving the slot's work before the park failed; the slot is kept", e instanceof Error ? e.message : String(e));
       }
+    }
+    let options: string[] = [];
+    try {
+      options = [...(d.parkOptions?.(taskId, cause) ?? [])];
+    } catch (e) {
+      d.log("warn", "park options failed", e instanceof Error ? e.message : String(e));
     }
     await d.writer.append((l) => {
       out.written = false;
@@ -336,7 +349,7 @@ export function createUnattendedPolicy(d: UnattendedDeps): UnattendedPolicy {
         if (last !== undefined) events.push({ type: "attempt-context", taskId, n: last.n, context: bounded });
         events.push({ type: "task-transition", taskId, from: t.state, to: "parked", trigger: "exhausted", detail: null });
       }
-      if (t.slot !== null) {
+      if (t.slot !== null && t.slot !== keptSlot) {
         events.push({ type: "task-slot", taskId, slot: null, branch: t.branch });
         out.releaseSlot = true;
       }
@@ -352,7 +365,7 @@ export function createUnattendedPolicy(d: UnattendedDeps): UnattendedPolicy {
       const kind = parkItemKind(cause);
       const item: InboxItem = {
         id: formatInboxId(kind.kind, nextInboxNumber(l)), kind: kind.kind, severity: kind.severity, taskId, text: bounded,
-        options: [], answer: null, createdAt: now,
+        options: [...options], answer: null, createdAt: now,
       };
       events.push({ type: "inbox-added", item });
       for (const dep of pendingDependentsClosure(l, taskId)) {

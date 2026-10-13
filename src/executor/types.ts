@@ -680,6 +680,17 @@ export const WIP_TRAILER = "Omr-Wip";
 /** Marker identifying an orchestrator shell session. */
 export const ORCHESTRATOR_SHELL_RE = /\(orchestrator shell\)/i;
 
+/** Remove only semicolon-delimited criteria clauses assigned to the orchestrator's shell. */
+export function stripOrchestratorShell(criterion: string): { kept: string | null; dropped: boolean } {
+  const kept: string[] = [];
+  let dropped = false;
+  for (const clause of criterion.split(";")) {
+    if (ORCHESTRATOR_SHELL_RE.test(clause)) dropped = true;
+    else if (clause.trim() !== "") kept.push(clause.trim());
+  }
+  return { kept: kept.length === 0 ? null : kept.join("; "), dropped };
+}
+
 /** Codes of `ExecutorError` (§8). */
 export type ExecutorErrorCode =
   | "E_INVALID_INPUT" | "E_PLAN_STATE" | "E_NOT_OWNER" | "E_LEDGER_NOT_FOUND" | "E_EXISTS" | "E_SCHEMA_NEWER"
@@ -807,9 +818,13 @@ export function isAttemptResumedEvent(v: unknown): v is Extract<ExecutorEvent, {
 const SLOT_REQUIRED_STATES: readonly TaskState[] = ["dispatched", "running", "completed", "verifying", "verified", "integrating"];
 const BRANCH_REQUIRED_STATES: readonly TaskState[] = ["verifying", "verified", "integrating"];
 
-/** Task states that hold no slot (A1-7 `slot-forbidden`): the slot is released on entering them. */
+/**
+ * Task states that hold no slot (A1-7 `slot-forbidden`): the slot is released on entering them. QA-PDF21-3 amends A1-7 for
+ * `parked`: a park whose slot's work could not be saved keeps the slot on the task (never reset or released while that
+ * work is unsaved), so a parked task may hold a slot; every other park clears it as before.
+ */
 const SLOT_FORBIDDEN_STATES: readonly TaskState[] =
-  ["pending", "blocked", "parked", "done", "cancelled", "integrated", "reverted"];
+  ["pending", "blocked", "done", "cancelled", "integrated", "reverted"];
 
 /** One violated invariant: a stable `code` and the JSON path `at` of the offending value (A1-7). */
 export interface LedgerViolation {
@@ -1077,7 +1092,8 @@ export function isLedgerV1(v: unknown): v is LedgerV1 {
 
 /**
  * Prompt grammar (QA-0.1-21): `prompt = planContext "\n\n" headerLine "\n\n" taskBlock`,
- * `planContext = "PLAN CONTEXT\n" ledger.sharedContext`, `headerLine = header " nonce=" nonce`,
+ * `planContext = "PLAN CONTEXT\n" [EXECUTOR_READ_CAP_LINE "\n"] ledger.sharedContext` (the read-cap line for editing
+ * tasks only, DF-2-9), `headerLine = header " nonce=" nonce`,
  * `header = "[plan " planId ":" taskId "#" attempt "]"` with attempt = `Attempt.n` (D-b). `taskBlock` belongs to 3.1.4.
  * The child's first-context fail-closed check (3.1.7.a) refuses every tool call of an unbound child whose prompt matches.
  * Consumers must import this pattern; never re-derive it (the memo's old task-id lookahead was wrong, QA-1.4-12).
@@ -1111,14 +1127,27 @@ function hasHeaderShapedLine(text: string): boolean {
 }
 
 /**
- * Strict, at the fixed position (A1-7): the prompt starts with `"PLAN CONTEXT\n" + sharedContext + "\n\n"`, the next line matches
- * `LAUNCH_HEADER_PATTERN` in full and is followed by `"\n\n"`. Anything else is null, including a `sharedContext` that itself has a
- * header-shaped line. Recovery (C7) uses this with `ledger.sharedContext`.
+ * The executor's own read-cap line for an editing task (DF-2-9). The router honours the first read-cap token of a prompt,
+ * so this line sits right after the `"PLAN CONTEXT"` line, before the shared context and the task text (both neutralized).
+ */
+export const EXECUTOR_READ_CAP_LINE = "CAP:12";
+
+/** The fixed opening of every launch prompt: `"PLAN CONTEXT\n"`, then the executor's read-cap line when `readCap`. */
+function launchOpening(readCap: boolean): string {
+  return readCap ? `PLAN CONTEXT\n${EXECUTOR_READ_CAP_LINE}\n` : "PLAN CONTEXT\n";
+}
+
+/**
+ * Strict, at the fixed position (A1-7): the prompt starts with `"PLAN CONTEXT\n"`, optionally the executor's read-cap line
+ * (`EXECUTOR_READ_CAP_LINE + "\n"`), then `sharedContext + "\n\n"`; the next line matches `LAUNCH_HEADER_PATTERN` in full and is
+ * followed by `"\n\n"`. Anything else is null, including a `sharedContext` that itself has a header-shaped line. Recovery (C7)
+ * uses this with `ledger.sharedContext`.
  */
 export function parseLaunchHeader(prompt: string, sharedContext: string): LaunchHeaderFields | null {
   if (hasHeaderShapedLine(sharedContext)) return null;
-  const prefix = `PLAN CONTEXT\n${sharedContext}\n\n`;
-  if (!prompt.startsWith(prefix)) return null;
+  // An editing task's prompt carries the executor's read-cap line; every other prompt goes straight to the shared context.
+  const prefix = [launchOpening(true), launchOpening(false)].map(open => `${open}${sharedContext}\n\n`).find(p => prompt.startsWith(p));
+  if (prefix === undefined) return null;
   const rest = prompt.slice(prefix.length);
   const end = rest.indexOf("\n\n");
   if (end < 0) return null;
@@ -1136,17 +1165,18 @@ export function looksLikePlanPrompt(prompt: string): boolean {
 }
 
 /**
- * §7 grammar: `"PLAN CONTEXT\n" + sharedContext + "\n\n" + headerLine + "\n\n" + taskBlock`.
+ * §7 grammar: `"PLAN CONTEXT\n" + [EXECUTOR_READ_CAP_LINE "\n"] + sharedContext + "\n\n" + headerLine + "\n\n" + taskBlock`.
+ * The read-cap line is present only when `readCap` (an editing task); it is then the prompt's first read-cap token (DF-2-9).
  * Throws E_LAUNCH_TASK when `sharedContext` has a header-shaped line, the header fields are invalid, or `taskBlock` does not start with "TASK".
  */
-export function formatLaunchPrompt(sharedContext: string, header: LaunchHeaderFields, taskBlock: string): string {
+export function formatLaunchPrompt(sharedContext: string, header: LaunchHeaderFields, taskBlock: string, readCap = false): string {
   if (hasHeaderShapedLine(sharedContext)) {
     throw new ExecutorError("E_LAUNCH_TASK", "shared context contains a launch-header-shaped line");
   }
   if (!taskBlock.startsWith("TASK")) {
     throw new ExecutorError("E_LAUNCH_TASK", 'task block must start with "TASK"');
   }
-  return `PLAN CONTEXT\n${sharedContext}\n\n${formatLaunchHeader(header)}\n\n${taskBlock}`;
+  return `${launchOpening(readCap)}${sharedContext}\n\n${formatLaunchHeader(header)}\n\n${taskBlock}`;
 }
 
 export type FindingSeverity = "blocking" | "critical" | "major" | "minor" | "nit";
@@ -1657,6 +1687,12 @@ export interface LaunchHooks {
    *  child is prompted. Rt appends with a builder: dispatched with this attempt open -> [AC, TT child-created]; ready with this attempt
    *  latest and lost -> [AA, TT adopt, G1] + forced token; anything else -> throw (refuse). A throw makes the runner interrupt the child. */
   onChildCreated(childSessionID: string): Promise<void>;
+  /**
+   * pdf2-1 (a): a `completed` end keeps the child's role binding (the caller may resume the child for its budget) until
+   * `TaskLauncher.releaseBinding` drops it or a resume of the same child under the same task and attempt takes it over.
+   * Absent or false: every end evicts the binding when the completion settles.
+   */
+  holdCompletedBinding?: boolean;
 }
 
 /** Why a launch was not confirmed (A1-5): "timeout" and "threw" mark the context stale; "task-error" is R1 (counts). */
@@ -1712,6 +1748,11 @@ export interface TaskLauncher {
   /** Requested interrupt: records the request, aborts the executor-owned signal, HostSessions.interrupt(child) if known. Idempotent. */
   cancel(taskId: TaskId, attempt: number, reason: CancelReason): Promise<void>;
   inFlight(): ReadonlyArray<{ taskId: TaskId; attempt: number; childSessionID: string | null; startedAt: IsoTime }>;
+  /**
+   * pdf2-1 (a): evicts the binding a `completed` end held (`LaunchHooks.holdCompletedBinding`) once the caller decided not
+   * to resume `childSessionID`. A no-op when nothing is held for it (a resume took it over, or it was never held).
+   */
+  releaseBinding?(childSessionID: string): void;
   /** Aborts every owned signal; journals nothing (recovery closes those attempts as lost). */
   dispose(): Promise<void>;
 }

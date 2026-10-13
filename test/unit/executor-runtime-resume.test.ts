@@ -1,10 +1,11 @@
 // pdf2-1 (a) budget resume and (b) no lost work: runtime resume, WIP snapshot and restore (real git).
 import { afterEach, describe, expect, it, vi } from "vitest";
+// QA-PDF21 round-1 regressions live in the "QA-PDF21 snapshot safety" describe block (after the rig and `seedWip`).
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync, realpathSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { ROUTER_BUDGET_NOTE_PREFIX } from "../../src/router/prompts";
 import {
   RESUME_PROMPT, classifyChildText, createExecutorRuntime, realCollaborators,
@@ -140,7 +141,7 @@ interface Launch {
   confirm(c: LaunchConfirmation): void;
 }
 
-function draft(r: Repo): LedgerV1 {
+function draft(r: Repo, tasks: LedgerV1["tasks"] = {}): LedgerV1 {
   const value = buildDraft(0, PLAN);
   value.status = "awaiting-approval";
   value.repo = { ...value.repo, toplevel: r.top, baseCommit: r.base };
@@ -151,10 +152,27 @@ function draft(r: Repo): LedgerV1 {
     phase: "p1", state: "pending",
     footprint: { writes: ["a.txt", "b.txt", "c.txt"], reads: [], confidence: "explicit", sources: ["path"] },
   });
+  Object.assign(value.tasks, tasks);
   return value;
 }
 
-async function rig(o: { seed?: (r: Repo) => Promise<void>; foreignOwner?: boolean } = {}) {
+interface RigOptions {
+  seed?: (r: Repo) => Promise<void>;
+  foreignOwner?: boolean;
+  /** QA-PDF21: the runtime's git runner (a fault-injecting wrapper of the real one). */
+  git?: GitRunner;
+  /** QA-PDF21: the verifier's verdicts, in order; "pass" once they run out. */
+  verdicts?: Array<"pass" | "fail">;
+  /** QA-PDF21: the compiler's addTasks. */
+  addTasks?: RuntimeDeps["compiler"]["addTasks"];
+  /** Additional tasks and lease holders for learned-dependency regressions. */
+  tasks?: LedgerV1["tasks"];
+  leaseRegistry?: RuntimeDeps["leaseRegistry"];
+  /** QA-PDF21: the launcher reports its unsettled launches as in flight. */
+  inFlight?: boolean;
+}
+
+async function rig(o: RigOptions = {}) {
   const r = await repo();
   if (o.seed !== undefined) await o.seed(r);
   const store = createLedgerStore({ home: join(r.root, "home") });
@@ -162,8 +180,19 @@ async function rig(o: { seed?: (r: Repo) => Promise<void>; foreignOwner?: boolea
   const launches: Launch[] = [];
   const launcher = { throwNext: null as ExecutorError | null };
   let owner: string | null = null;
+  /** QA-PDF21-4: the acquires that found the slot ready (unleased) and reset it, as the real pool does. */
+  const acquireResets: number[] = [];
+  /** QA-PDF21-5: the slot's status when `begin` captured its reference. */
+  const begunStatus: string[] = [];
   const pool = {
     acquire: vi.fn<SlotPool["acquire"]>(async (id, who, commit) => {
+      // As the real pool (pool.ts acquire): a ready slot is reset to `commit` before it is handed out; the owner's own
+      // leased slot comes back as it is.
+      if (owner === null) {
+        await sh(r.slot, "checkout", "-q", "--detach", "--force", commit);
+        await sh(r.slot, "clean", "-q", "-ffd");
+        acquireResets.push(acquireResets.length + 1);
+      }
       owner = who;
       return { slot: "slot-1", path: r.slot, planId: id, owner: who, commit };
     }),
@@ -196,8 +225,8 @@ async function rig(o: { seed?: (r: Repo) => Promise<void>; foreignOwner?: boolea
   const deps: RuntimeDeps = {
     store, slots: pool, slotsFor: () => pool,
     compiler: {
-      compile: async () => ({ draft: draft(r), summary: { tasks: 1, phases: 1, edges: 0, workMs: 0, criticalPathMs: 0, width: 1, expectedMakespanMs: 0, manual: [], warnings: [] } }),
-      mergeResidue: () => { throw new Error("unexpected residue"); }, addTasks: () => { throw new Error("unexpected addTasks"); }, validate: () => [],
+      compile: async () => ({ draft: draft(r, o.tasks), summary: { tasks: 1, phases: 1, edges: 0, workMs: 0, criticalPathMs: 0, width: 1, expectedMakespanMs: 0, manual: [], warnings: [] } }),
+      mergeResidue: () => { throw new Error("unexpected residue"); }, addTasks: o.addTasks ?? (() => { throw new Error("unexpected addTasks"); }), validate: () => [],
     },
     scheduler: createScheduler(),
     launcher: {
@@ -229,7 +258,7 @@ async function rig(o: { seed?: (r: Repo) => Promise<void>; foreignOwner?: boolea
           l.end({ kind: "interrupted", childSessionID: l.childSessionID, reason, endedAt: clock.iso() });
         }
       },
-      inFlight: () => [],
+      inFlight: () => (o.inFlight === true ? launches.filter((l) => !l.settled).map((l) => ({ taskId: l.req.taskId, attempt: l.req.attempt, childSessionID: l.childSessionID, startedAt: clock.iso() })) : []),
       dispose: async () => {
         for (const l of launches) {
           l.confirm({ kind: "unconfirmed", reason: "threw", error: "disposed" });
@@ -239,15 +268,18 @@ async function rig(o: { seed?: (r: Repo) => Promise<void>; foreignOwner?: boolea
     },
     routes: { route: () => ({ agent: "implementer", model: { providerID: "test", modelID: "test", variant: null }, provider: "test", heavy: false }) },
     verifier: {
-      begin: (task, _slot, attempt) => { begun.push(`${task.id}#${attempt.n}`); },
-      verify: async () => ({ verdict: "pass", findings: "", ref: "proof" }),
+      begin: async (task, slot, attempt) => {
+        begun.push(`${task.id}#${attempt.n}`);
+        begunStatus.push(await status(slot.path));
+      },
+      verify: async () => ({ verdict: o.verdicts?.shift() ?? "pass", findings: "", ref: "proof" }),
     },
-    git,
+    git: o.git ?? git,
     hosts: {
       get: async (id) => ({ id, parentID: null }), context: async () => ({ messages: [] }), activity: async () => "inactive",
       interrupt: async () => {}, synthetic: async () => {}, move: async () => {}, onEvent: () => () => {},
     },
-    clock, leaseRegistry: { acquireWrite: () => ({ ok: true }), holderOf: () => null, releaseTask: () => {} },
+    clock, leaseRegistry: o.leaseRegistry ?? { acquireWrite: () => ({ ok: true }), holderOf: () => null, releaseTask: () => {} },
     recovery: null, holder: (sessionID) => holderOf(sessionID, process.pid, hostname()), capacity: createCapacityController,
     collaborators: (input) => {
       writers.push(input.writer);
@@ -272,7 +304,7 @@ async function rig(o: { seed?: (r: Repo) => Promise<void>; foreignOwner?: boolea
   };
   const pause = (ms = 30): Promise<void> => new Promise((res) => { setTimeout(res, ms); });
   const h = {
-    r, runtime, store, pool, queue, launches, launcher, collabs, begun, ledger, pause, journal,
+    r, runtime, store, pool, queue, launches, launcher, collabs, begun, ledger, pause, journal, acquireResets, begunStatus,
     async start(): Promise<void> {
       await runtime.compile({ path: draft(r).planPath, sessionID: ORCH });
       await runtime.approve(PLAN, ORCH);
@@ -326,6 +358,435 @@ async function seedWip(r: Repo, parent: string, files: Record<string, string>, n
   await sh(r.top, "worktree", "remove", "--force", scratch);
   return commit;
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// QA-PDF21 round 1: snapshot safety (each test fails without its fix)
+// ---------------------------------------------------------------------------------------------------------------
+
+/** A runner over the real git: `fail` makes a matching call fail (code 1) or throw; `spy` sees every call first. */
+function faultyGit(
+  fail: (args: readonly string[], cwd: string) => "fail" | "throw" | null,
+  spy?: (args: readonly string[], cwd: string) => Promise<void>,
+): GitRunner {
+  return {
+    run: async (args, o) => {
+      if (spy !== undefined) await spy(args, o.cwd);
+      const f = fail(args, o.cwd);
+      if (f === "throw") throw new Error(`injected: git ${args[0] ?? ""} could not run`);
+      if (f === "fail") return { code: 1, signal: null, stdout: "", stderr: `fatal: injected failure of git ${args[0] ?? ""}`, truncated: false, durationMs: 0 };
+      return runGit(args, o.cwd);
+    },
+  };
+}
+
+/** A WIP ref of T1 adding b.txt on the base. */
+async function seedB(r: Repo): Promise<void> {
+  await seedWip(r, r.base, { "b.txt": "seeded\n" });
+}
+
+/** A WIP ref of T1 whose change of a.txt conflicts with the base (test 10's seed). */
+async function seedConflict(r: Repo): Promise<void> {
+  const scratch = join(r.root, "side");
+  await sh(r.top, "worktree", "add", "-q", "--detach", scratch, r.base);
+  await writeFile(join(scratch, "a.txt"), "side\n");
+  await sh(scratch, "commit", "-q", "-am", "side");
+  const side = (await sh(scratch, "rev-parse", "HEAD")).trim();
+  await sh(r.top, "worktree", "remove", "--force", scratch);
+  await seedWip(r, side, { "a.txt": "wip\n" });
+}
+
+/** Leaves an `index.lock` in `slot`'s git dir (a git killed mid-step); returns its path. */
+async function lockIndex(slot: string): Promise<string> {
+  const rel = (await sh(slot, "rev-parse", "--git-path", "index.lock")).trim();
+  const path = isAbsolute(rel) ? rel : join(slot, rel);
+  await writeFile(path, "");
+  return path;
+}
+
+/** A git spy recording T1's ledger slot at each `add -A` (a snapshot's or a commit's first write). */
+function slotAtAdd(): { seen: Array<string | null>; ledger: { read: (() => Promise<LedgerV1>) | null }; spy: (args: readonly string[]) => Promise<void> } {
+  const seen: Array<string | null> = [];
+  const ledger: { read: (() => Promise<LedgerV1>) | null } = { read: null };
+  return {
+    seen,
+    ledger,
+    spy: async (args) => {
+      const read = ledger.read;
+      if (read !== null && args[0] === "add" && args[1] === "-A") seen.push((await read()).tasks.T1?.slot ?? null);
+    },
+  };
+}
+
+describe("QA-PDF21 snapshot safety", () => {
+  const trailer = wipTrailer(PLAN, "T1", 1, "qa-nonce");
+  const wipRef = wipRefName(PLAN, "T1");
+  const until = async (fn: () => void | Promise<void>): Promise<void> => {
+    await vi.waitFor(fn, { timeout: WAIT_MS, interval: 20 });
+  };
+
+  it("-3. update-ref fails: one retry, then the commit goes to a unique orphan ref and the slot is not reset", async () => {
+    const r = await repo();
+    await writeFile(join(r.slot, "b.txt"), "unsaved\n");
+    let tries = 0;
+    const g = faultyGit((args) => {
+      if (args[0] !== "update-ref" || !args.includes(`refs/heads/${wipRef}`)) return null;
+      tries += 1;
+      return "fail";
+    });
+    const fallback = orphanRefName(PLAN, "slot-1", 5, "n1");
+    const error = await snapshotSlotWork(g, { cwd: r.slot, ref: wipRef, message: "wip", trailer, timeoutMs: WAIT_MS, fallbackRef: fallback })
+      .then(() => null, (e: unknown) => e);
+    expect(error).toBeInstanceOf(ExecutorError);
+    expect(tries).toBe(2);
+    expect(await refOf(r.top, wipRef)).toBeNull();
+    const kept = await refOf(r.top, fallback);
+    expect(kept).not.toBeNull();
+    expect(await sh(r.top, "show", `${kept ?? ""}:b.txt`)).toBe("unsaved\n");
+    expect(await readFile(join(r.slot, "b.txt"), "utf8")).toBe("unsaved\n");
+  }, TEST_MS);
+
+  it("-3. a leftover index.lock is removed and the failed step retried once", async () => {
+    const r = await repo();
+    await writeFile(join(r.slot, "b.txt"), "behind a lock\n");
+    const lock = await lockIndex(r.slot);
+    let removed = 0;
+    const s = await snapshotSlotWork(git, {
+      cwd: r.slot, ref: wipRef, message: "wip", trailer, timeoutMs: WAIT_MS,
+      removeIndexLock: async () => {
+        removed += 1;
+        await rm(lock, { force: true });
+        return true;
+      },
+    });
+    expect(removed).toBe(1);
+    expect(s.saved).toBe(true);
+    expect(await sh(r.top, "show", `refs/heads/${wipRef}:b.txt`)).toBe("behind a lock\n");
+    expect(await status(r.slot)).toBe("");
+  }, TEST_MS);
+
+  it("-6. a snapshot parented at the lease base holds the committed attempt and the uncommitted rest", async () => {
+    const r = await repo();
+    await writeFile(join(r.slot, "b.txt"), "committed\n");
+    await sh(r.slot, "add", "-A");
+    await sh(r.slot, "commit", "-q", "-m", "attempt 1");
+    await writeFile(join(r.slot, "c.txt"), "uncommitted\n");
+    const s = await snapshotSlotWork(git, { cwd: r.slot, ref: wipRef, message: "wip", trailer, timeoutMs: WAIT_MS, base: r.base });
+    expect(s.saved).toBe(true);
+    expect((await sh(r.top, "rev-parse", `refs/heads/${wipRef}^`)).trim()).toBe(r.base);
+    expect(await sh(r.top, "show", `refs/heads/${wipRef}:b.txt`)).toBe("committed\n");
+    expect(await sh(r.top, "show", `refs/heads/${wipRef}:c.txt`)).toBe("uncommitted\n");
+  }, TEST_MS);
+
+  it("-10. orphan ref names of one slot in one millisecond differ by their nonce", () => {
+    expect(orphanRefName(PLAN, "slot-1", 7, "a1")).toBe(`omr/${PLAN}/orphan/slot-1-7-a1`);
+    expect(orphanRefName(PLAN, "slot-1", 7, "a1")).not.toBe(orphanRefName(PLAN, "slot-1", 7, "b2"));
+  });
+
+  it("-3. a failed snapshot keeps the slot leased, unreset and unreleased, raises one item naming it, and the relaunch waits", async () => {
+    let failAdd = false;
+    const h = await rig({ git: faultyGit((args) => (failAdd && args[0] === "add" && args[1] === "-A" ? "fail" : null)) });
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await writeFile(join(h.r.slot, "b.txt"), "unsaved\n");
+    failAdd = true;
+    await h.end(first, "ses-1", "ESCALATE: need a decision");
+    await untilState(h, "parked");
+    await until(async () => { expect((await h.ledger()).inbox.some((x) => x.text.includes("slot slot-1 could not be saved"))).toBe(true); });
+    const l = await h.ledger();
+    expect(l.tasks.T1?.slot).toBe("slot-1");
+    expect(l.inbox.filter((x) => x.text.includes("could not be saved")).map((x) => x.severity)).toEqual(["blocking"]);
+    expect(h.pool.release).not.toHaveBeenCalled();
+    expect(h.pool.reset).toHaveBeenCalledTimes(1);
+    expect(await refOf(h.r.top, wipRef)).toBeNull();
+    expect(await readFile(join(h.r.slot, "b.txt"), "utf8")).toBe("unsaved\n");
+    // The answered task's relaunch cannot save either: no reset, no launch.
+    await h.answer("go on");
+    await h.pause(500);
+    expect(h.launches).toHaveLength(1);
+    expect(h.pool.reset).toHaveBeenCalledTimes(1);
+    expect(await readFile(join(h.r.slot, "b.txt"), "utf8")).toBe("unsaved\n");
+    // Once git works again the work is saved first, then the slot is reset and the work restored.
+    failAdd = false;
+    await h.launched(2);
+    expect(await readFile(join(h.r.slot, "b.txt"), "utf8")).toBe("unsaved\n");
+    expect(await refOf(h.r.top, wipRef)).not.toBeNull();
+  }, TEST_MS);
+
+  it("-3. a leftover index.lock in the slot does not cost the parked attempt its work", async () => {
+    const h = await rig();
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await writeFile(join(h.r.slot, "b.txt"), "behind a lock\n");
+    await lockIndex(h.r.slot);
+    await h.end(first, "ses-1", "ESCALATE: stuck");
+    await untilState(h, "parked");
+    expect(await sh(h.r.top, "show", `refs/heads/${wipRef}:b.txt`)).toBe("behind a lock\n");
+    expect(h.pool.release).toHaveBeenCalled();
+  }, TEST_MS);
+
+  it("-4. the pool's acquire resets a ready slot, and the released attempt's work still comes back", async () => {
+    const h = await rig();
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await writeFile(join(h.r.slot, "b.txt"), "kept\n");
+    await h.end(first, "ses-1", "ESCALATE: stuck");
+    await untilState(h, "parked");
+    expect(h.pool.release).toHaveBeenCalledTimes(1);
+    await h.answer("go on");
+    await h.launched(2);
+    expect(h.acquireResets).toHaveLength(2);
+    expect(await readFile(join(h.r.slot, "b.txt"), "utf8")).toBe("kept\n");
+    expect(expansion.calls.at(-1)?.restored).toEqual({ attempt: 1, files: 1 });
+  }, TEST_MS);
+
+  it("-4. abort saves a running attempt's work once its cancel settled and keeps the WIP ref; purge deletes it", async () => {
+    const h = await rig({ inFlight: true });
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await writeFile(join(h.r.slot, "b.txt"), "aborted work\n");
+    await h.runtime.abort(PLAN, ORCH);
+    await until(() => { expect(h.pool.release).toHaveBeenCalled(); });
+    expect(first.settled).toBe(true);
+    // The collection (its WIP sweep, then the slots' gc) ran and kept the cancelled task's ref.
+    await until(() => { expect(h.pool.gc).toHaveBeenCalled(); });
+    expect((await h.ledger()).tasks.T1?.state).toBe("cancelled");
+    expect(await sh(h.r.top, "show", `refs/heads/${wipRef}:b.txt`)).toBe("aborted work\n");
+    await h.runtime.purge(PLAN, ORCH);
+    expect(await refOf(h.r.top, wipRef)).toBeNull();
+  }, TEST_MS);
+
+  it("-4. addTasks saves a reopened task's slot before the batch that clears it", async () => {
+    const at = slotAtAdd();
+    const h = await rig({
+      verdicts: ["fail"],
+      addTasks: () => ({ tasks: [], edges: [], reopened: ["T1"] }),
+      git: faultyGit(() => null, at.spy),
+    });
+    at.ledger.read = h.ledger;
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await writeFile(join(h.r.slot, "b.txt"), "attempt 1\n");
+    await h.runtime.pause(PLAN, ORCH);
+    await h.end(first, "ses-1", "DONE: finished");
+    await untilState(h, "ready");
+    expect((await h.ledger()).tasks.T1?.slot).toBe("slot-1");
+    at.seen.length = 0;
+    await h.runtime.addTasks(PLAN, "more work", ORCH);
+    expect(await h.state()).toBe("pending");
+    expect(at.seen[0]).toBe("slot-1");
+    expect(await sh(h.r.top, "show", `refs/heads/${wipRef}:b.txt`)).toBe("attempt 1\n");
+    expect(h.pool.release).toHaveBeenCalled();
+  }, TEST_MS);
+
+  it("addTasks refuses the entire fragment when a reopened task holds unsaved work", async () => {
+    let failAdd = false;
+    const h = await rig({
+      verdicts: ["fail"],
+      addTasks: () => ({
+        tasks: [taskNode("T2", { phase: "p1", state: "pending" })],
+        edges: [{ from: "T2", to: "T1", kind: "learned", confidence: "high", evidence: "new prerequisite" }],
+        reopened: ["T1"],
+      }),
+      git: faultyGit((args) => (failAdd && args[0] === "add" && args[1] === "-A" ? "fail" : null)),
+    });
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await writeFile(join(h.r.slot, "b.txt"), "reopened work\n");
+    await h.runtime.pause(PLAN, ORCH);
+    await h.end(first, "ses-1", "DONE: finished");
+    await untilState(h, "ready");
+    await bounded("paused runtime settled", h.runtime.settled(), WAIT_MS);
+    const before = structuredClone(await h.ledger());
+    const journalStart = h.journal.length;
+    failAdd = true;
+    await expect(h.runtime.addTasks(PLAN, "more work", ORCH)).rejects.toMatchObject({
+      code: "E_PLAN_STATE",
+      message: "task T1 holds unsaved work in slot slot-1; answer its item first",
+    });
+    expect(await h.state()).toBe("ready");
+    const l = await h.ledger();
+    expect(l).toEqual(before);
+    expect(h.journal.slice(journalStart)).toEqual([]);
+    expect(l.tasks.T1?.slot).toBe("slot-1");
+    expect(h.pool.release).not.toHaveBeenCalled();
+    expect(await readFile(join(h.r.slot, "b.txt"), "utf8")).toBe("reopened work\n");
+    failAdd = false;
+    await h.runtime.addTasks(PLAN, "more work", ORCH);
+    expect(await h.state()).toBe("pending");
+    expect((await h.ledger()).tasks.T1?.slot).toBeNull();
+    expect((await h.ledger()).tasks.T2).toBeDefined();
+    expect(await sh(h.r.top, "show", `refs/heads/${wipRef}:b.txt`)).toBe("reopened work\n");
+    expect(h.pool.release).toHaveBeenCalledTimes(1);
+  }, TEST_MS);
+
+  it("-5. begin captures the reference at the clean reset commit, before the restore", async () => {
+    const h = await rig({ seed: seedB });
+    await h.start();
+    await h.launched(1);
+    expect(h.begun).toEqual(["T1#1"]);
+    expect(h.begunStatus).toEqual([""]);
+    expect(await readFile(join(h.r.slot, "b.txt"), "utf8")).toBe("seeded\n");
+  }, TEST_MS);
+
+  it("-6. a verify-fail retry carries the committed attempt over to the next attempt", async () => {
+    const h = await rig({ verdicts: ["fail"] });
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await writeFile(join(h.r.slot, "b.txt"), "attempt 1\n");
+    await h.end(first, "ses-1", "DONE: finished");
+    const second = await h.launched(2);
+    expect(second.req.attempt).toBe(2);
+    expect((await sh(h.r.slot, "rev-parse", "HEAD")).trim()).toBe(h.r.base);
+    expect(await readFile(join(h.r.slot, "b.txt"), "utf8")).toBe("attempt 1\n");
+    expect(expansion.calls.at(-1)).toEqual({ taskId: "T1", attempt: 2, restored: { attempt: 1, files: 1 } });
+  }, TEST_MS);
+
+  it("-6. the task's final commit drops its WIP ref", async () => {
+    const h = await rig({ seed: seedB });
+    await h.start();
+    const first = await h.launched(1);
+    expect(await refOf(h.r.top, wipRef)).not.toBeNull();
+    await h.child(first, "ses-1");
+    await h.end(first, "ses-1", "DONE: finished");
+    await until(() => { expect(h.queue.enqueue).toHaveBeenCalledWith(["T1"]); });
+    expect(await refOf(h.r.top, wipRef)).toBeNull();
+    const head = (await sh(h.r.slot, "rev-parse", "HEAD")).trim();
+    expect(await sh(h.r.slot, "show", `${head}:b.txt`)).toBe("seeded\n");
+  }, TEST_MS);
+
+  it("-6/-10. a restore the child undid drops the WIP ref, so the stale work is not restored again", async () => {
+    const h = await rig({ seed: seedB });
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await sh(h.r.slot, "reset", "-q", "--hard", "HEAD");
+    expect(await status(h.r.slot)).toBe("");
+    await h.end(first, "ses-1", "ESCALATE: nothing worth keeping");
+    await untilState(h, "parked");
+    expect(await refOf(h.r.top, wipRef)).toBeNull();
+    await h.answer("go on");
+    await h.launched(2);
+    expect(expansion.calls.at(-1)?.restored).toBeNull();
+    expect(existsSync(join(h.r.slot, "b.txt"))).toBe(false);
+  }, TEST_MS);
+
+  it("-7. a restore conflict offers discard-wip / keep-wip; discard-wip drops the ref and the task relaunches clean", async () => {
+    const h = await rig({ seed: seedConflict });
+    await h.start();
+    await untilState(h, "parked");
+    const item = (await h.ledger()).inbox.find((x) => x.taskId === "T1" && x.answer === null);
+    if (item === undefined) throw new Error("no park item");
+    expect(item.options).toEqual(["discard-wip", "keep-wip"]);
+    await h.runtime.answer(PLAN, item.id, "discard-wip", ORCH);
+    expect(await refOf(h.r.top, wipRef)).toBeNull();
+    const first = await h.launched(1);
+    expect(first.req.attempt).toBe(2);
+    expect(expansion.calls.at(-1)?.restored).toBeNull();
+    expect(await readFile(join(h.r.slot, "a.txt"), "utf8")).toBe("base\n");
+  }, TEST_MS);
+
+  it("-7. a transient git error in the restore skips the launch with the backoff; no conflict, the ref is kept", async () => {
+    let failPick = 1;
+    const h = await rig({
+      seed: seedB,
+      git: faultyGit((args) => (args[0] === "cherry-pick" && args[1] === "--no-commit" && failPick-- > 0 ? "throw" : null)),
+    });
+    await h.start();
+    const first = await h.launched(1);
+    expect(failPick).toBeLessThan(0);
+    expect(first.req.attempt).toBe(1);
+    expect((await h.ledger()).inbox.filter((x) => x.taskId === "T1")).toHaveLength(0);
+    expect(await readFile(join(h.r.slot, "b.txt"), "utf8")).toBe("seeded\n");
+    expect(await refOf(h.r.top, wipRef)).not.toBeNull();
+  }, TEST_MS);
+
+  it("-10. lease-needed saves the attempt's work while the task still holds its slot", async () => {
+    const at = slotAtAdd();
+    const h = await rig({ git: faultyGit(() => null, at.spy) });
+    at.ledger.read = h.ledger;
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await writeFile(join(h.r.slot, "b.txt"), "half done\n");
+    await h.end(first, "ses-1", "NEED MORE: lease c.txt");
+    await until(async () => { expect(await refOf(h.r.top, wipRef)).not.toBeNull(); });
+    expect(at.seen[0]).toBe("slot-1");
+    expect(await sh(h.r.top, "show", `refs/heads/${wipRef}:b.txt`)).toBe("half done\n");
+    // The teardown's bounded dispose must settle too: a task waiting for its lease never holds disposal up.
+  }, TEST_MS);
+
+  it("lease-needed with a learned dependency parks unsaved work, then retries after its answer and dependency", async () => {
+    let failAdd = false;
+    let held = false;
+    const at = slotAtAdd();
+    const h = await rig({
+      tasks: { T2: taskNode("T2", { phase: "p1", kind: "manual", state: "pending" }) },
+      leaseRegistry: {
+        acquireWrite: () => ({ ok: true }),
+        holderOf: (path) => held && path === "d.txt" ? { holderID: "holder-T2", taskRef: `${PLAN}:T2` } : null,
+        releaseTask: () => {},
+      },
+      git: faultyGit((args) => (failAdd && args[0] === "add" && args[1] === "-A" ? "fail" : null), at.spy),
+    });
+    at.ledger.read = h.ledger;
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await writeFile(join(h.r.slot, "b.txt"), "leased work\n");
+    held = true;
+    failAdd = true;
+    await h.end(first, "ses-1", "NEED MORE: lease d.txt");
+    await untilState(h, "parked");
+    await until(async () => { expect((await h.ledger()).inbox.some((x) => x.text.includes("could not be saved"))).toBe(true); });
+    const parked = await h.ledger();
+    expect(parked.tasks.T1?.slot).toBe("slot-1");
+    expect(parked.tasks.T1?.attempts.at(-1)?.outcome).toBe("interrupted");
+    expect(parked.tasks.T1?.footprint.writes).toContain("d.txt");
+    expect(parked.edges).toContainEqual({
+      from: "T2", to: "T1", kind: "learned", confidence: "high", evidence: "NEED MORE: lease d.txt",
+    });
+    expect(parked.inbox.map((x) => x.severity)).toEqual(["blocking"]);
+    expect(h.pool.release).not.toHaveBeenCalled();
+    expect(h.pool.reset).toHaveBeenCalledTimes(1);
+    expect(at.seen).toEqual(["slot-1"]);
+    expect(await refOf(h.r.top, wipRef)).toBeNull();
+    expect(await readFile(join(h.r.slot, "b.txt"), "utf8")).toBe("leased work\n");
+    h.runtime.onLeaseReleased();
+    await h.pause(200);
+    expect((await h.ledger()).inbox).toHaveLength(1);
+    expect(h.launches).toHaveLength(1);
+
+    // The answer readies the held task, but its learned dependency still forbids a launch.
+    await h.runtime.pause(PLAN, ORCH);
+    failAdd = false;
+    const item = parked.inbox[0];
+    if (item === undefined) throw new Error("no unsaved-work item");
+    await h.runtime.answer(PLAN, item.id, "git fixed; continue", ORCH);
+    expect(await h.state()).toBe("ready");
+    await h.runtime.resume(PLAN, ORCH);
+    await h.pause(200);
+    expect(h.launches).toHaveLength(1);
+    await h.runtime.pause(PLAN, ORCH);
+    held = false;
+    await h.runtime.done(PLAN, "T2", ORCH);
+    await h.runtime.resume(PLAN, ORCH);
+    const second = await h.launched(2);
+    expect(second.req.taskId).toBe("T1");
+    expect(second.req.attempt).toBe(2);
+    expect(at.seen).toContain("slot-1");
+    expect(await sh(h.r.top, "show", `refs/heads/${wipRef}:b.txt`)).toBe("leased work\n");
+    expect(await readFile(join(h.r.slot, "b.txt"), "utf8")).toBe("leased work\n");
+    expect(expansion.calls.at(-1)?.restored).toEqual({ attempt: 1, files: 1 });
+    expect((await h.ledger()).inbox[0]?.answer).toBe("git fixed; continue");
+  }, TEST_MS);
+});
 
 // ---------------------------------------------------------------------------------------------------------------
 // 1. classification
@@ -530,7 +991,8 @@ describe("pdf2-1 (b): no lost work", () => {
     expect(await refOf(h.r.top, wipRefName(PLAN, "T1"))).toBeNull();
     const orphans = (await sh(h.r.top, "for-each-ref", "--format=%(refname)", `refs/heads/omr/${PLAN}/orphan/`)).split(/\r?\n/).filter((x) => x !== "");
     expect(orphans).toHaveLength(1);
-    expect(orphans[0]).toMatch(new RegExp(`^refs/heads/${orphanRefName(PLAN, "slot-1", 0).replace(/-0$/, "")}-\\d+$`));
+    // QA-PDF21-10: `<slot>-<ms>-<nonce>`.
+    expect(orphans[0]).toMatch(new RegExp(`^refs/heads/${orphanRefName(PLAN, "slot-1", 0).replace(/-0$/, "")}-\\d+-[a-z0-9]+$`));
     await h.answer("go on");
     await h.launched(2);
     expect(expansion.calls.at(-1)?.restored).toBeNull();
