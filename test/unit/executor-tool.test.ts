@@ -547,6 +547,80 @@ describe("router_plan: approve: auto skips the stop", () => {
     expect(rt.plans.get("plan-1")?.status).toBe("awaiting-approval");
   });
 
+  describe("QA-4.1-16 (round 3): status and ready on a plan awaiting approval repeat the stop text", () => {
+    const throwing: RouterPlanToolOptions = {
+      approve: () => {
+        throw new Error("config gone");
+      },
+    };
+
+    it("status (board, no planId, inbox view) ends with the stop text unless approve is auto", async () => {
+      for (const opts of [undefined, { approve: () => "ask" as const }, throwing]) {
+        const rt = new FakeRuntime();
+        seedFor(rt, "awaiting-approval");
+        for (const args of [{ action: "status", planId: "p1" }, { action: "status" }, { action: "status", inbox: true }]) {
+          const out = await call(rt, args, OWNER, opts);
+          expect(out.startsWith(`Plan p1 [awaiting-approval] ${PLAN_FILE}`), JSON.stringify(args)).toBe(true);
+          expect(out.endsWith(`\n${askApprovalText("p1")}`), JSON.stringify(args)).toBe(true);
+          expect(out).not.toContain("failed");
+        }
+      }
+      const rt = new FakeRuntime();
+      seedFor(rt, "awaiting-approval");
+      const out = await call(rt, { action: "status", planId: "p1" }, OWNER, auto);
+      expect(out).not.toContain("Stop here.");
+    });
+
+    it("status of a running plan has no stop text and does not read the setting", async () => {
+      let reads = 0;
+      const rt = new FakeRuntime();
+      seedFor(rt, "running");
+      const counting: RouterPlanToolOptions = {
+        approve: () => {
+          reads++;
+          return "ask";
+        },
+      };
+      const out = await call(rt, { action: "status", planId: "p1" }, OWNER, counting);
+      expect(out).not.toContain("Stop here.");
+      expect(out.endsWith("Metrics: launches 0, wakes 0, idle-with-ready 0 ms")).toBe(true);
+      expect(reads).toBe(0);
+    });
+
+    it("the stop text survives a truncated board", async () => {
+      const rt = new FakeRuntime();
+      rt.statusText = `Plan big [awaiting-approval] D:\\p.md\n${"y".repeat(50_000)}`;
+      const out = await call(rt, { action: "status", planId: "big" });
+      expect(out).toContain("status truncated at 40000 chars");
+      expect(out.endsWith(`\n${askApprovalText("big")}`)).toBe(true);
+    });
+
+    it("ready adds the stop text and drops the run-manual-tasks hint while the plan awaits approval", async () => {
+      const rt = new FakeRuntime();
+      seedFor(rt, "awaiting-approval");
+      const out = await call(rt, { action: "ready", planId: "p1" }, OWNER, throwing);
+      expect(out).toBe(`plan p1 ready: launchable 1 (T1); manual 1 (M1).\n${askApprovalText("p1")}`);
+      expect(rt.calls).toEqual(["ready", "status"]);
+      // With approve: auto, or on a running plan, ready is as before.
+      const rt2 = new FakeRuntime();
+      seedFor(rt2, "running");
+      const running = await call(rt2, { action: "ready", planId: "p1" });
+      expect(running).toBe("plan p1 ready: launchable 1 (T1); manual 1 (M1).\nRun each manual task yourself, then report it: router_plan action=done planId=p1 task=<id>.");
+      const rt3 = new FakeRuntime();
+      seedFor(rt3, "awaiting-approval");
+      expect(await call(rt3, { action: "ready", planId: "p1" }, OWNER, auto)).not.toContain("Stop here.");
+    });
+
+    it("ready still answers when the board cannot be read", async () => {
+      const rt = new FakeRuntime();
+      seedFor(rt, "awaiting-approval");
+      rt.throwOn.set("status", new Error("disk gone"));
+      const out = await call(rt, { action: "ready", planId: "p1" });
+      expect(out).toContain("plan p1 ready: launchable 1 (T1); manual 1 (M1).");
+      expect(out).not.toContain("failed");
+    });
+  });
+
   it("a throwing option getter does not escape", async () => {
     const rt = new FakeRuntime();
     const out = await call(rt, { action: "compile", path: PLAN_FILE }, OWNER, { approve: () => { throw new Error("config gone"); } });
@@ -790,6 +864,12 @@ describe("router_plan: a plan owned by another live session", () => {
       expect(out).toContain("That plan belongs to another session; do not act on it.");
       expect(out).not.toContain("another live session");
       expect(out).toContain("action=adopt");
+      // QA-4.1-16 (round 3): adopt-then-approve is no way around the user.
+      expect(out).toContain(
+        "Adoption is only for a running or paused plan whose owning session is gone: then action=adopt planId=<id> takes it over. " +
+          "A plan awaiting approval is never adopted: the user approves it in its own session, or it is compiled again.",
+      );
+      expect(out).not.toContain("If that session is gone, action=adopt");
       expect(JSON.stringify([...rt.plans.values()].map(p => [p.status, [...p.tasks], [...p.inbox]]))).toBe(before);
       expect(rt.deletedRefs).toEqual([]);
     });
@@ -1224,7 +1304,10 @@ describe("createRouterPlanTool", () => {
   it("describes path, approval and ownership as QA-4.1 fixed them", () => {
     const def = createRouterPlanTool(new FakeRuntime());
     // QA-4.1-16: no "unless … auto" clause the model could satisfy with its own belief about the setting.
-    expect(def.description).toContain("approve (planId; only after the user approves; with approve: auto, compile approves by itself)");
+    expect(def.description).toContain(
+      "approve (planId; only after the user approves it after seeing its summary (a request to run it is not approval); " +
+        "with approve: auto, compile and residue approve by itself)",
+    );
     expect(def.description).not.toMatch(/unless/);
     expect(def.description).toContain("A plan owned by another session is refused.");
     expect(def.description).not.toContain("another live session");

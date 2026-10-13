@@ -262,14 +262,17 @@ function fmtSummary(planId: string, s: CompileSummary): string {
 /** What to do next after a refusal, by error code. */
 function hint(code: string): string {
   switch (code) {
-    case "E_NOT_OWNER": return "That plan belongs to another session; do not act on it. If that session is gone, action=adopt planId=<id> takes it over.";
+    // QA-4.1-16 (round 3): adopt is no way around the user's approval.
+    case "E_NOT_OWNER": return "That plan belongs to another session; do not act on it. Adoption is only for a running or paused plan " +
+      "whose owning session is gone: then action=adopt planId=<id> takes it over. A plan awaiting approval is never adopted: " +
+      "the user approves it in its own session, or it is compiled again.";
     case "E_PLAN_STATE": return "The plan is not in a state that allows this; action=status shows its status.";
     case "E_LEDGER_NOT_FOUND": return "No such plan; action=status (without planId) shows the plan of this session.";
     case "E_INVALID_INPUT": return "Fix the input and call again.";
     case "E_COMPILE": return "Fix the plan file at the line named and call action=compile again.";
     case "E_CYCLE": return "Remove one dependency from the cycle.";
     case "E_RESIDUE": return "Re-dispatch the residue prompt, or fix the JSON, and call action=residue again.";
-    case "E_LOCK_HELD": return "Another process holds this plan's lock; retry later or use action=adopt once it is gone.";
+    case "E_LOCK_HELD": return "Another process holds this plan's lock; retry later or, once it is gone, use action=adopt for a running or paused plan (a plan awaiting approval is never adopted).";
     default: return "";
   }
 }
@@ -342,8 +345,39 @@ function projectDir(ctx: RouterPlanContext | undefined): string | null {
 interface RunContext {
   sessionID: string;
   baseDir: string | null;
-  /** Reads `executor.approve`; called only where a draft can complete (compile, residue). */
+  /**
+   * Reads `executor.approve`; called only where a draft can complete (compile, residue) and, through `approvalGuard`,
+   * when status or ready shows a plan awaiting approval.
+   */
   auto: () => boolean;
+}
+
+const AWAITING_APPROVAL_HEAD = /^Plan (\S+) \[awaiting-approval\]/;
+
+/**
+ * QA-4.1-16 (round 3): a model that comes back to a plan awaiting approval through status or ready (after a resume, a
+ * compaction or an adopt) gets the same stop text as after compile. Empty unless the board head says
+ * `[awaiting-approval]`; empty with `approve: auto`. A throwing getter counts as "ask": it never breaks status.
+ */
+function approvalGuard(board: string, rc: RunContext): string {
+  const id = AWAITING_APPROVAL_HEAD.exec(board.split("\n", 1)[0] ?? "")?.[1];
+  if (id === undefined || !validId(id)) return "";
+  let auto = false;
+  try {
+    auto = rc.auto();
+  } catch {
+    auto = false;
+  }
+  return auto ? "" : `\n${askApprovalText(id)}`;
+}
+
+/** The board of `planId`, or "" when it cannot be read (ready then shows no guard, as before). */
+async function boardOrEmpty(runtime: ExecutorRuntime, planId: string, sessionID: string): Promise<string> {
+  try {
+    return await runtime.status(planId, sessionID);
+  } catch {
+    return "";
+  }
 }
 
 async function run(runtime: ExecutorRuntime, a: RouterPlanArgs, rc: RunContext): Promise<string> {
@@ -391,13 +425,17 @@ async function run(runtime: ExecutorRuntime, a: RouterPlanArgs, rc: RunContext):
       const current = sessionPlanId(runtime, sessionID);
       const board = await runtime.status(a.planId ?? current, sessionID);
       const out = a.inbox === true ? inboxSection(board, current) : board;
-      return out.length > MAX_STATUS ? `${out.slice(0, MAX_STATUS)}\n... (status truncated at ${MAX_STATUS} chars)` : out;
+      // The stop text goes after any truncation, so it is never cut off.
+      const shown = out.length > MAX_STATUS ? `${out.slice(0, MAX_STATUS)}\n... (status truncated at ${MAX_STATUS} chars)` : out;
+      return `${shown}${approvalGuard(board, rc)}`;
     }
     case "ready": {
       const r = await runtime.ready(planId);
       const lines = [`plan ${planId} ready: launchable ${r.launchable.length} (${listIds(r.launchable)}); manual ${r.manual.length} (${listIds(r.manual)}).`];
-      if (r.manual.length > 0) lines.push(`Run each manual task yourself, then report it: router_plan action=done planId=${planId} task=<id>.`);
-      return lines.join("\n");
+      // `ready` does not carry the plan status; the board head does (a read-only call). Its failure only drops the guard.
+      const guard = approvalGuard(await boardOrEmpty(runtime, planId, sessionID), rc);
+      if (r.manual.length > 0 && guard === "") lines.push(`Run each manual task yourself, then report it: router_plan action=done planId=${planId} task=<id>.`);
+      return `${lines.join("\n")}${guard}`;
     }
     case "add-tasks": {
       const r = await runtime.addTasks(planId, text, sessionID);
@@ -473,7 +511,8 @@ export function createRouterPlanTool(runtime: ExecutorRuntime, options?: RouterP
   return tool({
     description:
       "Drive the plan executor. Actions: compile (path, phases?, doneBefore?) -> summary or a residue prompt to dispatch; " +
-      "residue (planId, text = architect JSON); approve (planId; only after the user approves; with approve: auto, compile approves by itself); " +
+      "residue (planId, text = architect JSON); approve (planId; only after the user approves it after seeing its summary (a request to run it is not approval); " +
+      "with approve: auto, compile and residue approve by itself); " +
       "status (planId?, inbox?); ready (planId); add-tasks (planId, text); " +
       "answer (planId?, inboxId, text; without planId: this session's running plan); done (planId, task; manual/preflight tasks only); pause|resume|abort|land|adopt (planId); " +
       "gc; export (planId); purge (planId; completed or aborted only). A plan owned by another session is refused.",

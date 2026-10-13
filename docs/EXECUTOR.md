@@ -35,7 +35,7 @@ letting a half-finished task touch your checkout. This page describes what it do
 - **Landing is fast-forward only.** A finished plan lands on your branch by fast-forward, never by a merge commit, and
   only when the checkout is clean (`routing.executor.land`: `ff-when-clean`, or `manual` to leave it to you).
 - **One active plan per process.** A process runs one plan at a time. A plan is owned by the session that runs it; a
-  plan owned by another session is refused, and `adopt` takes over a plan whose session is gone.
+  plan owned by another session is refused, and `adopt` takes over a running or paused plan whose session is gone (a plan awaiting approval is never adopted: the user approves it in its own session, or it is compiled again).
 
 ## `/plan` command
 
@@ -56,7 +56,7 @@ answer text of `/plan answer` is taken as typed, apostrophes included.
 | `/plan resume <planId>` | Resumes a paused plan. | `action=resume` |
 | `/plan abort <planId>` | Stops the plan. Work already integrated stays. | `action=abort` |
 | `/plan land <planId>` | Requests landing of the integration branch. | `action=land` |
-| `/plan adopt <planId>` | Takes over a plan whose owning session is gone. | `action=adopt` |
+| `/plan adopt <planId>` | Takes over a running or paused plan whose owning session is gone. | `action=adopt` |
 
 ## `router_plan` tool
 
@@ -77,7 +77,7 @@ answer text of `/plan answer` is taken as typed, apostrophes included.
 | `resume` | `planId` | Resumes a paused plan. |
 | `abort` | `planId` | Aborts the plan; integrated work stays. |
 | `land` | `planId` | Requests landing (fast-forward only). |
-| `adopt` | `planId` | Takes over a plan whose session is gone. |
+| `adopt` | `planId` | Takes over a running or paused plan whose session is gone; never a plan awaiting approval. |
 | `gc` | none | Removes the slots of finished plans; reports the ones it did not remove. |
 | `export` | `planId` | Returns the plan's ledger as text. |
 | `purge` | `planId` | Removes a completed or aborted plan: slots, `omr/<planId>/` refs and ledger. |
