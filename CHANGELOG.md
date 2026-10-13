@@ -32,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   router recovers a dispatch whose child finished, re-posts a verdict that was reached but not delivered, and keeps
   posted results hidden. A journal that vanishes under a running process is rewritten from memory. OpenCode v1 ignores
   every `routing.background.*` and `routing.leases.*` key and logs one notice per process that names them.
+- **OpenCode v2: plan executor groundwork (not registered yet).** The `routing.executor.*` keys (`slotsDir`,
+  `integrationChecks`, `phaseSuite`, `provision` and `python` are trusted keys: only the global override sets them), the
+  `router_plan` tool and `/plan` command factories, and the executor instructions are in the code, with a user guide
+  ([docs/EXECUTOR.md](docs/EXECUTOR.md)). A later release registers them, so nothing is visible on a host yet. OpenCode
+  v1 ignores every `routing.executor.*` key and logs one notice per process that names them.
 
 ### Changed
 

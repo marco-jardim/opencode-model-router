@@ -845,6 +845,26 @@ describe("loadConfig — global + project override hierarchy", () => {
       "anthropic/global-fast",
     );
   });
+
+  it("QA-4.1-21: a project value valid on its own that conflicts with the global layer drops the project layer, not the global one", () => {
+    // Each file is valid alone; together they break deterministic >= grader >= none.
+    writeGlobal({
+      presets: { anthropic: { fast: { model: "anthropic/global-fast" } } },
+      routing: { detection: { grader: 0.5 } },
+    });
+    writeLocal({ routing: { detection: { none: 0.6 } } });
+    invalidateConfigCache();
+    const cfg = loadConfig();
+    expect(cfg.presets.anthropic!.fast!.model).toBe("anthropic/global-fast");
+    expect(cfg.routing?.detection?.grader).toBe(0.5);
+    expect(cfg.routing?.detection?.none).toBeUndefined();
+    const lines: string[] = (warnSpy.mock.calls as unknown[][]).map((call) => String(call[0]));
+    expect(lines).toContainEqual(expect.stringContaining("combined overrides are invalid"));
+    const dropped = lines.filter((line) => line.includes("dropped override layer"));
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]).toContain(join(".opencode", "opencode-model-router.overrides.jsonc"));
+    expect(dropped[0]).not.toContain(overridePath());
+  });
 });
 
 // ---------------------------------------------------------------------------

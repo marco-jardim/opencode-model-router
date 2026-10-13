@@ -9,8 +9,14 @@ import { scrubText } from "../guard/scrub";
 /** Upper bound of the whole tail in UTF-16 code units: wrapper and overflow line included. */
 export const TURN_STATE_MAX_CHARS = 6000;
 
-/** The reserved provider name of the plan section (order 0..9 is reserved for it). */
+/** The reserved provider name of the plan section. */
 export const PLAN_PROVIDER_NAME = "plan";
+
+/**
+ * The order the v2 adapter registers the plan section at (QA-4.1-14). The executor instructions sort right after it
+ * (`EXECUTOR_INSTRUCTIONS_ORDER = PLAN_PROVIDER_ORDER + 1`, src/executor/instructions.ts).
+ */
+export const PLAN_PROVIDER_ORDER = 60;
 
 /**
  * Phase 1.2 (v2 only): the v2 adapter owns the turn-state registry and hands it to the plugin by calling the function

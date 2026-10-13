@@ -93,7 +93,7 @@ import type { HostBudgetObservation } from "./compat/v2-hooks";
 import { ROUTER_TURN_STATE_ATTACH, TURN_STATE_ROOT, type TurnStateRegistry } from "./compat/turn-state";
 import { ADOPTION_REFUSED, ROUTER_FINISH_ATTACH, type AdoptedRecords, type AdoptionRefused, type FinishApi, type FinishAttach, type FinishInput, type FinishResult, type HeldSink, type InflightJournal, type LeaseGuard, type PersistedRecord, type RestoredDispatch } from "./compat/background";
 import type { DispatchDelta } from "./verify/dispatch";
-import { configuredV2OnlyKeys } from "./router/config";
+import { configAsWritten, configuredV2OnlyKeys, setConfigNoticeHost } from "./router/config";
 
 /** Phase 2.1: the v2-only config keys already announced as ignored on a v1 host (once per key per process). */
 const warnedV2OnlyKeys = new Set<string>();
@@ -754,16 +754,27 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   resolveRouting(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger); // v1 + engine != static: log the notice once, at startup (QA-1.1-8)
   // #84 P2.1 (handoff 1): v1 + any roles key: the "roles delegation requires OpenCode v2" notice, once, at startup.
   resolveRolesRouting(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger);
+  // QA-4.1-9: on v1 the executor validation issues are not logged; the notice below names the keys.
+  setConfigNoticeHost(isV2Host ? "v2" : "v1");
   if (!isV2Host) {
     // Phase 2.1: the background and lease keys exist on v2 only; a v1 host does nothing with them. QA-2.1-12 (AGENTS.md: at most
     // one notice per process for a v2-only feature): one notice names every configured key, and no later instance logs another.
-    const keys = [...configuredV2OnlyKeys(cfg)];
+    // QA-4.1-9: the keys as written (the merged layers), so a value validation dropped is still named.
+    const keys = [...configuredV2OnlyKeys(configAsWritten(cfg))];
     if (keys.length > 0 && warnedV2OnlyKeys.size === 0) {
       for (const key of keys) warnedV2OnlyKeys.add(key);
       // QA-2.1-32: the notice names the features actually configured (leases alone are not "background dispatch").
-      const background = keys.some((key) => key.startsWith("routing.background."));
-      const leases = keys.some((key) => key.startsWith("routing.leases."));
-      const subject = background && leases ? "background dispatch and leases require" : leases ? "leases require" : "background dispatch requires";
+      // QA-4.1-19: a block that is not an object is named whole (`routing.executor`).
+      const names = (block: string): boolean => keys.some((key) => key === `routing.${block}` || key.startsWith(`routing.${block}.`));
+      const background = names("background");
+      const leases = names("leases");
+      const executor = names("executor");
+      const features = [background ? "background dispatch" : "", leases ? "leases" : "", executor ? "the plan executor" : ""].filter((f) => f !== "");
+      const subject = features.length === 0
+        ? "background dispatch requires"
+        : features.length === 1
+          ? `${features[0]} ${leases && !background && !executor ? "require" : "requires"}`
+          : `${features.slice(0, -1).join(", ")} and ${features[features.length - 1]} require`;
       logger.warn(`[router] ${subject} OpenCode v2; ignored: ${keys.join(", ")}`);
     }
   }
