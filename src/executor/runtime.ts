@@ -417,9 +417,10 @@ export interface RuntimeDeps {
   bindings: PlanRoleBindings;
   /**
    * QA-4.2-21: this process's repository toplevel. A plan whose `repo.toplevel` differs (`sameToplevel`) is foreign:
-   * attached passively, never recovered, resumed, ticked or adopted here. Unset: no plan is foreign (3.1 behaviour).
+   * attached passively, never recovered, resumed, ticked or adopted here. Required: an omitted toplevel would let a
+   * foreign plan whose lock is free be driven actively (QA-4.2 NEW-1).
    */
-  toplevel?: string;
+  toplevel: string;
 }
 
 /** What `RuntimeDeps.collaborators` receives for one plan. */
@@ -2437,7 +2438,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     });
   }
 
-  /** Plans whose ledger `reconcile` may classify: `recover()` reported them eligible (same toplevel), or adopted here. */
+  /** Plans `recover()` reported eligible (same toplevel) or adopted here: only these may be taken over by `start()`. */
   const recoverable = new Set<PlanId>();
   /** QA-4.2-17: plans of another toplevel `start()` attached passively; never recovered, resumed or ticked here. */
   const foreignPlans = new Set<PlanId>();
@@ -2454,15 +2455,15 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
   /**
    * QA-4.2-21: a plan of another repository, decided by the plan's own toplevel (never by its absence from a `recover()`
-   * report, which also skips a plan on a transient error). Without a known process toplevel no plan is foreign.
+   * report, which also skips a plan on a transient error).
    */
   function isForeign(toplevel: string): boolean {
-    return d.toplevel !== undefined && !sameToplevel(toplevel, d.toplevel);
+    return !sameToplevel(toplevel, d.toplevel);
   }
 
-  /** Whether `reconcile` may classify `p`: a plan of this repository (or, toplevel unknown, one recover()/adopt vouched for). */
+  /** Whether `reconcile` may classify `p`: a plan of this repository. */
   function reconcilable(p: PlanRt): boolean {
-    return d.toplevel === undefined ? recoverable.has(p.planId) : !isForeign(p.writer.ledger.repo.toplevel);
+    return !isForeign(p.writer.ledger.repo.toplevel);
   }
 
   /** Same-process adopt: the unsettled launch handles of the closed attachment, handed to the new one (D12). */
@@ -3979,7 +3980,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       // signals, the orchestrator's idle flag and the end of a late-adopted child (L12) all come from here.
       if (offEvents === null && !disposed) offEvents = d.hosts.onEvent(onHostEvent);
       // QA-4.2-17/-21: a running or paused plan of another repository (its own toplevel, never its absence from the
-      // recover() report) is attached passively; without a known process toplevel every plan attaches as in 3.1.
+      // recover() report) is attached passively.
       if (d.recovery !== null) {
         try {
           // L2: only the plans recover() reports (same toplevel, running or paused) may be taken over and reconciled.

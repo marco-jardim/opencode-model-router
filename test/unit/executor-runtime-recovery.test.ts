@@ -859,6 +859,163 @@ async function mk(draft: LedgerV1): Promise<Harness> {
   return h;
 }
 
+/** QA-4.2 round 3: coverage of the held-slot R2 path, binding eviction on abort/close and a failed same-process re-attach. */
+describe("QA-4.2 round 3: held-slot R2, binding eviction, failed re-attach", () => {
+  it("a held completed task whose slot record vanished checks its attempt's trailer first (slotVanished): none -> 'slot lost before commit', never re-provisioned", async () => {
+    const plan = planOf([task("T1")]);
+    plan.config = { ...plan.config, maxAttempts: 3 }; // the retry (attempt 2) is awaited below
+    const h = await mk(plan);
+    await completedThenCrash(h);
+    await h.crash();
+    const reg = foreignLease(h);
+    h.engine();
+    await h.runtime.start();
+    await h.runtime.settled();
+    expect(h.state("T1")).toBe("completed");
+    const old = need(h.task("T1").slot, "slot of T1");
+    h.slots.records.delete(old);
+    dropSlotMarker(h, old);
+    h.git.trailerCommit = ""; // no commit carries attempt 1's trailer
+    const mark = h.git.calls.length;
+    reg.held.delete("src/T1.ts");
+    h.runtime.onLeaseReleased();
+    await until(
+      () => h.task("T1").attempts[0]?.context === "slot lost before commit",
+      "T1#1 failed as slot lost before commit",
+      () => ({ state: h.state("T1"), slot: h.task("T1").slot, logs: h.logs }),
+    );
+    // Retried (as for any commit failure): attempt 2 is launched. Never `settled()` here: the relaunched child is live,
+    // so its tracked wait never settles.
+    await h.runOf("T1", 2);
+    const calls = h.git.calls.slice(mark);
+    expect(calls.some((c) => c.args[0] === "log" && c.args.includes("--all"))).toBe(true);
+    expect(calls.some((c) => c.args[0] === "switch" || c.args[0] === "commit")).toBe(false);
+    const ev = await h.events();
+    expect(ev.filter((e) => e.type === "task-transition" && e.taskId === "T1" && e.from === "completed" && e.to === "failed")).toHaveLength(1);
+    expect(h.verifier.calls).toEqual([]);
+  }, 10_000);
+
+  it("a held verifying task whose slot record vanished is re-provisioned without the trailer check and verified (slotVanished)", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await completedThenCrash(h);
+    // Row 21 landed (the commit's batch), the process died before the verdict.
+    const slot = need(h.task("T1").slot, "slot of T1");
+    await h.parts().writer.append([
+      { type: "task-slot", taskId: "T1", slot, branch: taskBranchName(PLAN_ID, "T1") },
+      tr("T1", "completed", "verifying", "committed"),
+    ]);
+    await h.crash();
+    const reg = foreignLease(h);
+    h.engine();
+    await h.runtime.start();
+    await h.runtime.settled();
+    expect(h.state("T1")).toBe("verifying");
+    const old = need(h.task("T1").slot, "slot of T1");
+    h.slots.records.delete(old);
+    dropSlotMarker(h, old);
+    h.git.trailerCommit = ""; // a trailer check would find no commit and fail the attempt
+    const mark = h.git.calls.length;
+    reg.held.delete("src/T1.ts");
+    h.runtime.onLeaseReleased();
+    await until(
+      () => h.parts().queue.enqueued.some((ids) => ids.includes("T1")),
+      "T1 re-provisioned, verified and enqueued",
+      () => ({ state: h.state("T1"), slot: h.task("T1").slot, raised: h.parts().policy.raised.map((i) => i.text), logs: h.logs }),
+    );
+    expect(h.task("T1").slot).not.toBe(old);
+    expect(h.state("T1")).toBe("verified");
+    expect(h.verifier.calls).toEqual(["T1#1"]);
+    // A trailer check would have found no commit (trailerCommit "") and failed the attempt instead.
+    expect(h.task("T1").attempts[0]?.context).not.toBe("slot lost before commit");
+    expect(h.git.calls.slice(mark).some((c) => c.args[0] === "log" && c.args.includes("--all"))).toBe(false);
+  });
+
+  it("an adopt that fails after the old attachment closed, with the plan taken by a live holder meanwhile: the re-attach fails, logged, nothing attached here", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    const e = h.engine();
+    const other: { writer: LedgerWriter | null } = { writer: null };
+    e.adopt = async () => {
+      // Another live process opens the plan between the close of the old attachment and the re-attach.
+      other.writer = await h.otherHolder(4242);
+      throw new ExecutorError("E_LOCK_HELD", "held by a live process");
+    };
+    await expect(h.runtime.adopt(PLAN_ID, "ses-new")).rejects.toMatchObject({ code: "E_LOCK_HELD" });
+    // Never `settled()` here: the T1 child is live and its tracked wait (no attachment processes its end) never settles.
+    const failed = `error: plan ${PLAN_ID} could not be attached again after a failed adopt`;
+    await until(() => h.logs.some((l) => l.startsWith(failed)), "the failed re-attach logged", () => ({ logs: h.logs }));
+    expect(h.logs.filter((l) => l.startsWith(failed))).toHaveLength(1);
+    expect(h.logs.filter((l) => l.includes(`adopt of ${PLAN_ID} failed; the plan is attached again`))).toEqual([]);
+    expect(h.runtime.planLine(ORCH) ?? "").not.toContain(`plan ${PLAN_ID}:`);
+    // The ledger stays with the live holder, under its previous orchestrator.
+    expect(need(other.writer, "the other holder's writer").ledger.orchestrator.sessionID).toBe(ORCH);
+  }, 10_000);
+
+  it("abort evicts the binding of a child recovery adopted and re-bound", async () => {
+    const h = await adoptedAndRebound();
+    expect(h.bindings.evicted).toEqual([]);
+    await h.runtime.abort(PLAN_ID, ORCH);
+    expect(h.ledger().status).toBe("aborted");
+    expect(h.bindings.evicted).toEqual(["ses-c1"]);
+  });
+
+  it("closing the plan (dispose) evicts the binding of a child recovery adopted and re-bound", async () => {
+    const h = await adoptedAndRebound();
+    expect(h.bindings.evicted).toEqual([]);
+    // The process goes away with the child still running: the runtime is disposed, which closes the plan.
+    await h.crash();
+    expect(h.bindings.evicted).toEqual(["ses-c1"]);
+  });
+
+  it("a held task whose slot lookup throws stays held (logged) and resumes on a later retry (retryHeldLeases)", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await completedThenCrash(h);
+    await h.crash();
+    const reg = foreignLease(h);
+    h.engine();
+    await h.runtime.start();
+    await h.runtime.settled();
+    expect(h.state("T1")).toBe("completed");
+    const slot = need(h.task("T1").slot, "slot of T1");
+    const get = h.slots.get.bind(h.slots);
+    h.slots.get = async (s) => {
+      if (s === slot) throw new Error("pool unreadable");
+      return get(s);
+    };
+    reg.held.delete("src/T1.ts");
+    h.runtime.onLeaseReleased();
+    await until(() => h.logs.some((l) => l.startsWith("warn: slot lookup of held T1 failed; retried next tick")), "the failed held lookup logged");
+    await h.runtime.settled();
+    expect(h.state("T1")).toBe("completed");
+    expect(h.task("T1").slot).toBe(slot);
+    expect(h.git.calls.some((c) => c.args[0] === "commit")).toBe(false);
+    expect(h.verifier.calls).toEqual([]);
+    expect(h.parts().queue.enqueued).toEqual([]);
+    // The lookup works again: the next retry rebuilds the leases and the held step (commit-and-verify) runs.
+    h.slots.get = get;
+    h.runtime.onLeaseReleased();
+    await untilEnqueued(h, "T1");
+    expect(h.verifier.calls).toEqual(["T1#1"]);
+    expect(h.task("T1").slot).toBe(slot);
+  });
+});
+
+/** A running T1 whose child (`ses-c1`) recovery adopted after a restart and re-bound through the binding port. */
+async function adoptedAndRebound(): Promise<Harness> {
+  const h = await mk(planOf([task("T1")]));
+  await h.begin();
+  await h.running("T1", 1, "ses-c1");
+  await h.crash();
+  h.hosts.activityValue = "active";
+  h.engine();
+  await h.runtime.start();
+  await h.runtime.settled();
+  expect(h.state("T1")).toBe("running");
+  expect(h.bindings.binds.map((b) => b.childSessionID)).toEqual(["ses-c1"]);
+  return h;
+}
+
 /** Moves the clock in poll steps, letting each poll finish (only while no child of this process is alive). */
 async function advance(h: Harness, ms: number): Promise<void> {
   for (let t = 0; t < ms; t += POLL_MS) {

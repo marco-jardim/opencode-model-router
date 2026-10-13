@@ -261,6 +261,8 @@ async function boot(): Promise<Rig> {
       config: () => executorDefaults(),
       // QA-4.2-23: the same binding port as the launcher's (recovery re-binds adopted children through it).
       bindings: host.bindings,
+      // QA-4.2 NEW-1: the process toplevel is required (the plan's own repository here).
+      toplevel,
     });
     const built = { runtime, launcher };
     rig.executor.value = built;

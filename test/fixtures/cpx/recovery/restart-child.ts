@@ -415,6 +415,7 @@ async function main(): Promise<void> {
     pinOrchestrator: () => () => undefined,
     log,
     config: () => draft.config,
+    toplevel: c.toplevel,
   });
 
   // ---- host events from the test's simulator

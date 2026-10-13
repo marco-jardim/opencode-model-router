@@ -908,6 +908,8 @@ async function mk(draft: LedgerV1): Promise<Harness> {
     config: () => draft.config,
     // QA-4.2-23: the binding port is required; this harness never adopts through recovery, so it only records.
     bindings: { bind: () => undefined, evict: () => undefined },
+    // QA-4.2 NEW-1: the process toplevel is required; every plan of this harness is of this repository.
+    toplevel: REPO,
   };
   let closed = false;
   const h: Harness = {
