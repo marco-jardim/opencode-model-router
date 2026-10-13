@@ -384,7 +384,17 @@ Everything else is work: resolve it, record it, continue.
 rounds, fast-forwarded into `cpx/main` at `a7889e2` (report `docs\qa\critical-path-execution\sync-1.md`). The p51
 worktree created before the sync is recreated from the synced `cpx/main`; the 5.1 pre-flight is redone.
 
-**NEXT ACTION (2026-10-13): Wave 5 — Phase 5.1 (assembly and registration) in `D:\git\omr-cpx-p51`.** Wave 4 closed:
+**NEXT ACTION (2026-10-13): DF-2 pre-flight.** Phase 5.1 merged into `cpx/main` (p51 head `2025224`; report
+`docs\qa\critical-path-execution\phase-5.1.md`): three heavy QA rounds + bounded re-check, ready for DF-2. Owner
+decisions in 5.1: slot verifier over the dispatch engine (option 2), mixed blocks graded in two passes, R11 lineage
+skipped for plan tasks. Post-merge on `cpx/main`: tsc clean, 76 executor/v2/golden/docs/roles files 4132 passed / 4
+skipped. DF-2 pre-flight extras from 5.1: `enforcement.verify.graderTimeoutMs` unset or ≥ 300000; list the 6.1 tasks
+without an `[acceptance]` block; dogfood config needs `routing.delegation: roles` and `routing.leases.mode: enforce`;
+slots under `D:\git\.omr-cpx-slots\<planId>`. Before the DF-2 switch, check `origin/master` for the owner's
+`tiers.json` change and sync it if present (owner: "faça o que achar melhor"). The dogfood build `cpx/df1.3` logs
+"ignoring unknown routing key: routing.repoParents" (2.8.0 key, pre-sync build); DF-2 fixes it.
+
+*(superseded)* **NEXT ACTION (2026-10-13): Wave 5 — Phase 5.1 (assembly and registration) in `D:\git\omr-cpx-p51`.** Wave 4 closed:
 4.1 and 4.2 merged into `cpx/main`. Owed to 5.1: the 4.1 and 4.2 handoffs (`phase-4.1.md`, `phase-4.2.md` `## Handoffs`),
 including the EXECUTOR.md "Unattended operation" / "QA loop" / "Recovery" sections (5.1.4.a) and QA-4.2-36 (one toplevel
 source). Then DF-2, then 6.2.
