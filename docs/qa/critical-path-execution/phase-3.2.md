@@ -829,3 +829,82 @@ Fixtures under `test/fixtures/cpx/integrate/`:
   - The Appendix D metric names for integration: align §5.3 (`rg -n "Appendix D" docs/plans/critical-path-execution-plan.md`).
   - The §3.3 / A1-1 wording of "phase integrated" for M20.
   - The `TaskNode.integrated` shape `{from, to}` used for ranges (`rg -n "integrated:" src/executor/types.ts`).
+
+## Findings
+
+Three QA rounds by [tier:heavy] reviewers, plus a bounded fix round:
+
+| Round | Reviewer session | Commit | Findings | Status |
+|---|---|---|---|---|
+| 1 | `ses_ecd78b6bdffe3dZy0K0H5o91Ed` | `2a1a3f6` | 1 critical (QA-3.2-1), 11 major (-2..-12), 9 minor (-13..-21), 6 nits | fixed in `47de105` |
+| 2 | `ses_ecd1975afffeB5Ln022YbofC82` | `47de105` | 6 major (-22..-27), 9 minor (-28..-36), nits (-37) | fixed in `66dd24f`, coverage `6d77916` |
+| 3 (bounded to the round-2 majors) | `ses_eccedfe13ffeXcwVtAuGD6is5R` | `66dd24f` | -22, -24, -26, -27 fixed, -25 fixed (risk m2), -23 partial; 2 new major fail-open paths (NEW-1, NEW-2); minors m1-m4 | NEW-1, NEW-2, m1 fixed in `e06b3f0` (§0.7: no further round) |
+
+## Fixes
+
+- Round 1 (`47de105`): the phase suite parses failing ids from full runs and fails closed on an unattributable failure with a
+  red base (-1); A-3.2-1 stuck gate (-2); repo lock released on pause/halt (-3); cross-process lock with link-based create,
+  rename heartbeat, two-poll takeover, pid liveness on the same host, compare-and-delete, `lost` checked before git writes
+  (-4); stalled entries per lane (-5); revert checks rerun only the regression ids (-6); a pass needs a complete report
+  (-7); suite preemption capped (-8); missing ref vs git failure (-9); reverted-culprit rebase base (-10); ignored-file
+  landing check on exact paths (-12); abort -> interrupted (-13); case-safe phase tags (-14, A-3.2-2); tags after
+  completion (-15); row-34 `endedAt` and G2 (-16); restart text (-18); task-less phases (-19); hardened land probes (-20);
+  rollback slot ownership (-21); a busy loop between the lanes found while running the tests.
+- Round 2 (`66dd24f`): a rerun that runs nothing is a failure (-22); collection errors make a run incomplete, and
+  flaky/pre-existing need a full run (-23, A-3.2-3); revert checks with no usable file run the whole command, files read
+  from history (-24); double-revert rebase base (-25); one id form, fail-closed probes and regression checks (-26, A-3.2-4);
+  heartbeat/release race (-27); lost-lock latch and CAS-time lock verify (-28); stalled put-back (-29); bounded tag
+  retries after completion (-30); dependent task-less phases woken (-31); cancelled-during-lock-wait tasks dropped (-32);
+  lock-wait report and acquire errors surfaced (-33); stopped queue releases its lock, poll cleared (-34); land no-op
+  first, `from = to = candidate` (-35); abort checks before the fast-forward and the suite close (-36); nits; probes
+  rerun only files that do not fail at the base, new unattributed reason `base-overlap`.
+- Round 3 (`e06b3f0`): a file-scoped bisect runs only when a file rerun at the suite commit failed with a regression id
+  whose file is in the probe set; otherwise full-command probes and `files: []` (green base) or `base-overlap` (red
+  base) (NEW-1); the full-run check runs whenever any id clears, cleared ids reported as flaky (NEW-2); truncated
+  details revert-check the whole command (m1).
+
+## Coverage
+
+Orchestrator run on 2026-10-13 at `e06b3f0` (`executor-integrate-queue`, `executor-integrate-bisect` unit tests and
+the `executor-integrate-git` real-git integration test): 576 passed, `tsc --noEmit` clean.
+
+| File | Statements | Branches | Functions | Lines |
+|---|---|---|---|---|
+| `src/executor/integrate/bisect.ts` | 100 | 95.45 | 100 | 100 |
+| `src/executor/integrate/checks.ts` | 100 | 98.37 | 100 | 100 |
+| `src/executor/integrate/land.ts` | 100 | 98.33 | 100 | 100 |
+| `src/executor/integrate/phase-suite.ts` | 99.21 | 94.65 | 100 | 99 |
+| `src/executor/integrate/queue.ts` | 96.67 | 90.61 | 97.39 | 98.71 |
+
+## Deferred findings
+
+Round-3 minors (bounded round, §0.7):
+- m2: `firstUpstream` takes the oldest journaled upstream; a retry branch rebuilt on a head containing R1 but not R2 and
+  then reused could replay another task's reverted change. Prefer the newest ancestor-of-tip upstream.
+- m3: `release()` swallows a failed compare-and-delete, leaving our lock file; same-host waiters then wait for this
+  process to exit (the 5-minute wait item reports it).
+- m4: a culprit with no ids rebuilt from history after the suite commands failed to resolve gets no regression run.
+- Coverage-run note: a task cancelled after the post-lock re-check but before the `openEntry` batch is applied only
+  logs `not-verified-at-batch` (`queue.ts` ≈1294-1307); not reproduced deterministically.
+
+## Handoffs
+
+- 5.1: create `omr/<plan>/integration` at `baseCommit` and acquire the integration slot before the queue's first
+  `resume()` (QA-3.2-9); build a reverted culprit's retry on its old branch (QA-3.2-10/-25); rebuild state from the
+  ledger at start (listener events are skipped on dispose); kick the queue on a user pause/unpause; wire
+  `RunResolver` over `planRun` (V6) and `LedgerStore.exportPlan` (V2); wire a hardened `GitRunner` into
+  `LanderDeps.run`.
+- 3.1/5.1: the runtime is single-plan per process (A-3.1-1).
+
+## Plan amendments
+
+- A-3.2-1 (QA-3.2-2): a `suite-running`/`suite-failed` gate whose suite now resolves to none/off pauses the phase with a
+  critical item, no gate event.
+- A-3.2-2 (QA-3.2-14): phase tags use the `git.ts` `phase/<encoded id>` helper (plan 3.2.5.a, memo §6).
+- A-3.2-3 (QA-3.2-23): `flaky`/`pre-existing` require a full-command run at the suite commit and a full base run.
+- A-3.2-4 (QA-3.2-26): the revert regression check fails closed when a failing run names none of the regression ids.
+- Memo M6 (a fast-forward refusal halts the lane) and M26 (one-line `revert(...)` message) amended as accepted deviations.
+
+## Verdict
+
+Done at `e06b3f0`. No CHANGELOG entry (nothing is registered until 5.1; memo :30). Merged into `cpx/main`.
