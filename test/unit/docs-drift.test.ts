@@ -1250,7 +1250,7 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     expect(flat).toContain(`At most ${MAX_APPROVALS} approvals and ${MAX_APPROVALS_BYTES / 1024} KiB`);
     expect(flat).toContain(`\`${APPROVALS_FILE_NAME}\``);
     expect(read("docs/CONFIG_REFERENCE.md")).toContain(`\`${APPROVALS_FILE_NAME}\``);
-    const unreleased = /## \[Unreleased\]([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
+    const unreleased = /## \[2\.8\.0\] - 2026-10-13([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
     expect(unreleased).toContain("Approve repositories outside routing.repoParents with /router approve (OpenCode v2, roles mode; inert on v1) (#107).");
     const design = read("docs/design/cross-repo.md").replace(/\s+/g, " ");
     expect(design).toContain("| D29 | 2026-10-12 | Phase 4 channel: a human-typed `/router approve` command instead of a permission ask");
@@ -1326,7 +1326,7 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     expect(protocol).toContain("A check may run in another repository of the read set with cwd= and must then use scope=full");
     expect(protocol).toContain("check: testsPass cwd=\"<repo>\" scope=full");
     // the changelog entry
-    const unreleased = /## \[Unreleased\]([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
+    const unreleased = /## \[2\.8\.0\] - 2026-10-13([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
     for (const item of ["**Checks in other repositories (OpenCode v2, roles mode) (#107).**", "check: testsPass cwd=\"<repo>\" scope=full", "`is not covered by any check root`",
       "never a fail", "is a consumer", "UNVERIFIED", "(link pins)", "`a per-check cwd= is honoured only in roles mode`",
       "A dispatch with per-check keys may be deferred, see \"Deferred verification across repositories\" below.",
@@ -1374,7 +1374,7 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     for (const text of ["### A consumer check with scope=affected", "only static imports"]) expect(verificationFlat, text).toContain(text);
     expect(read("docs/ROLES.md").replace(/\s+/g, " ")).toContain("(./VERIFICATION.md#a-consumer-check-with-scopeaffected)");
     // the changelog entry
-    const unreleased = /## \[Unreleased\]([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
+    const unreleased = /## \[2\.8\.0\] - 2026-10-13([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
     expect(unreleased).toContain("**A consumer `testsPass` with `scope=affected` runs `vitest related` across a link (OpenCode v2, roles mode; inert on v1) (#107).**");
   });
 
@@ -1408,7 +1408,7 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     expect(config).toContain("enables the `root` argument of `router_git_*`");
     expect(config).toContain("also covers the linked worktrees of an excluded repository");
     // the changelog entries
-    const unreleased = /## \[Unreleased\]([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
+    const unreleased = /## \[2\.8\.0\] - 2026-10-13([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
     expect(unreleased).toContain("**`router_git_*` in other repositories (OpenCode v2, roles mode; inert on v1) (#107).**");
     expect(unreleased).toContain("**Worktrees of an excluded repository are refused (OpenCode v2, roles mode) (#107).**");
   });
@@ -1519,7 +1519,7 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     for (const text of ["(./VERIFICATION.md#dependencies-outside-node_modules)", "A link or edge target that is not admitted is named `(not admitted)`"]) expect(roles, text).toContain(text);
     expect(read("docs/CONFIG_REFERENCE.md").replace(/\s+/g, " ")).toContain("No config key turns the edges on or off; see `docs/VERIFICATION.md` → \"Dependencies outside node_modules\".");
     // the changelog entries
-    const unreleased = /## \[Unreleased\]([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
+    const unreleased = /## \[2\.8\.0\] - 2026-10-13([\s\S]*?)\n## \[/.exec(read("CHANGELOG.md"))?.[1]?.replace(/\s+/g, " ") ?? "";
     for (const item of ["**Dependencies outside `node_modules` (OpenCode v2, roles mode; inert on v1) (#107).**", "`<name> (not admitted)`",
       "`links this work root (<via>)`", "`[verify] dispatch perimeter: declared dependency edges were cut by a bound`",
       "**A dependency the producer adds during a deferred dispatch is frozen at return (OpenCode v2, roles mode) (#107).**",
