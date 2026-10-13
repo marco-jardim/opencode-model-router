@@ -254,6 +254,10 @@ interface Setup {
   paused?: boolean;
   qaPatch?: Partial<TaskNode>;
   round?: number;
+  /** Overrides `repo.toplevel` (the fallback root of a fix task's route line). */
+  toplevel?: string;
+  /** Adds a second phase `p2` (same wave) with one pending task `p2.T1`. */
+  otherPhase?: boolean;
 }
 
 function qaDone(id: string, context: string, patch: Partial<TaskNode> = {}): TaskNode {
@@ -273,6 +277,7 @@ async function setup(o: Setup = {}): Promise<Env> {
   const store = createLedgerStore({ home: join(root, "omr-executor"), clock, proc, warn: () => undefined, heartbeatMs: 10_000, staleMs: 60_000, snapshotEvery: 200 });
   const draft = buildDraft(0);
   draft.config.qaMaxRounds = o.max ?? 3;
+  if (o.toplevel !== undefined) draft.repo.toplevel = o.toplevel;
   const ph = draft.phases[0] as PhaseRecord;
   ph.id = PHASE;
   ph.gate = o.gate ?? "qa-running";
@@ -283,6 +288,12 @@ async function setup(o: Setup = {}): Promise<Env> {
   draft.tasks["p1.T1"] = taskNode("p1.T1", { phase: PHASE, state: "integrated", integrated: { from: "a".repeat(40), to: "b".repeat(40) } });
   draft.tasks[qaId] = qaDone(qaId, canonicalFindingsJson(o.report ?? report()), o.qaPatch);
   draft.edges.push({ from: "p1.T1", to: qaId, kind: "structural", confidence: "high", evidence: "phase" });
+  if (o.otherPhase === true) {
+    draft.phases.push({ id: "p2", title: "Phase 2", wave: "w1", dependsOn: [], gate: "pending", qaRound: 1, paused: false, tag: null });
+    const wave = draft.waves[0];
+    if (wave !== undefined) wave.phases.push("p2");
+    draft.tasks["p2.T1"] = taskNode("p2.T1", { phase: "p2" });
+  }
   if (o.template === true) {
     draft.tasks["p1.FIX"] = taskNode("p1.FIX", {
       phase: PHASE, kind: "fix", state: "done", acceptance: "check: testsPass", verify: "deferred",
@@ -477,6 +488,26 @@ describe("onQaResult: next round", () => {
     expect(t.route.line).toBe("class=implement d=deterministic tier=medium pin root=C:/repo");
     expect(t.route).toMatchObject({ tier: "medium", pin: true });
     expect(t.acceptance).toBeNull();
+  });
+
+  const noRoot = { line: "class=review d=none tier=heavy pin", role: "review", tier: "heavy" as const, pin: true };
+
+  it("without a template and with no root= on any task of the phase: the root is the repo toplevel", async () => {
+    const env = await setup({ qaPatch: { route: noRoot } });
+    await env.loop.onQaResult(env.qaId, report(f("A1", "major", ["a.ts"])));
+    expect(env.task(fixTaskId(PHASE, 1, 1)).route.line).toBe("class=implement d=deterministic tier=medium pin root=C:/repo");
+  });
+
+  it("a toplevel with whitespace is quoted in the fallback root token", async () => {
+    const env = await setup({ qaPatch: { route: noRoot }, toplevel: "C:/my repo" });
+    await env.loop.onQaResult(env.qaId, report(f("A1", "major", ["a.ts"])));
+    expect(env.task(fixTaskId(PHASE, 1, 1)).route.line).toBe('class=implement d=deterministic tier=medium pin root="C:/my repo"');
+  });
+
+  it("a quoted root= token on a phase task is reused as written", async () => {
+    const env = await setup({ qaPatch: { route: { ...noRoot, line: 'class=review d=none tier=heavy pin root="C:/a b"' } } });
+    await env.loop.onQaResult(env.qaId, report(f("A1", "major", ["a.ts"])));
+    expect(env.task(fixTaskId(PHASE, 1, 1)).route.line).toBe('class=implement d=deterministic tier=medium pin root="C:/a b"');
   });
 
   it("the re-review task copies the round's qa route line and depends on every fix task", async () => {
@@ -753,5 +784,153 @@ describe("termination", () => {
     await runQa(env, "p1.QA3", canonicalFindingsJson(report(f("N1", "nit", ["a.ts"]))));
     expect(await env.loop.onQaResult("p1.QA3", report(f("N1", "nit", ["a.ts"])))).toBe("passed");
     expect(env.phase()).toMatchObject({ gate: "passed", qaRound: 3 });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Branch top-up (task 4.2.6): union-find shapes, hand-placed cap items, guard arms
+// ---------------------------------------------------------------------------------------------------------------
+
+/** A critical qa-cap item placed by hand (as a restart or a stale writer could leave it). */
+async function addCap(env: Env, taskId: string | null, patch: { severity?: "critical" | "info" } = {}): Promise<void> {
+  await env.writer.append([{
+    type: "inbox-added",
+    item: {
+      id: "R-9", kind: "qa-cap", severity: patch.severity ?? "critical", taskId, text: "cap", options: ["accept", "fix"], answer: null, createdAt: T0,
+    },
+  }]);
+}
+
+describe("groupFindings: union-find shapes", () => {
+  it("a chain of unions is compressed and still yields one group (find walks a depth-3 path)", () => {
+    const g = groupFindings([f("A", "major", ["b.ts", "c.ts"]), f("B", "major", ["a.ts", "b.ts"]), f("C", "major", ["c.ts", "d.ts"])]);
+    expect(g).toHaveLength(1);
+    expect(g[0]?.writes).toEqual(["a.ts", "b.ts", "c.ts", "d.ts"]);
+    expect(g[0]?.findings.map((x) => x.id)).toEqual(["A", "B", "C"]);
+  });
+
+  it("a union whose first file has the larger root re-parents that root under the smaller one", () => {
+    const g = groupFindings([f("A", "major", ["a.ts", "z.ts"]), f("B", "major", ["m.ts", "z.ts"])]);
+    expect(g).toHaveLength(1);
+    expect(g[0]?.writes).toEqual(["a.ts", "m.ts", "z.ts"]);
+  });
+
+  it("two findings on the same files are one group, and a repeated file inside one finding is listed once", () => {
+    const g = groupFindings([f("A", "major", ["a.ts", "./a.ts"]), f("B", "major", ["a.ts"])]);
+    expect(g).toEqual([{ writes: ["a.ts"], findings: [f("A", "major", ["a.ts", "./a.ts"]), f("B", "major", ["a.ts"])] }]);
+  });
+});
+
+describe("normalizeFindingPath: more shapes", () => {
+  it("drops a trailing slash, collapses repeated slashes and inner dots", () => {
+    expect(normalizeFindingPath("src/")).toBe("src");
+    expect(normalizeFindingPath("src//a.ts")).toBe("src/a.ts");
+    expect(normalizeFindingPath("src/./a.ts")).toBe("src/a.ts");
+    expect(normalizeFindingPath("/")).toBeNull();
+  });
+});
+
+describe("onQaResult: guard arms", () => {
+  it("a result for a gate that is not qa-running and has no cap item to read back is E_ILLEGAL_TRANSITION", async () => {
+    const env = await setup({ gate: "awaiting-qa" });
+    const seq = env.ledger().seq;
+    expect((await failure(env.loop.onQaResult(env.qaId, report()))).code).toBe("E_ILLEGAL_TRANSITION");
+    expect(env.ledger().seq).toBe(seq);
+  });
+
+  it("a result after the gate passed reads back as passed, whatever the round", async () => {
+    const env = await setup({ gate: "passed" });
+    expect(await env.loop.onQaResult(env.qaId, report(f("A", "major")))).toBe("passed");
+  });
+});
+
+describe("onAwaitingQa: more arms", () => {
+  it("a cancelled qa task does not hold the gate", async () => {
+    const env = await setup({ gate: "awaiting-qa", qaPatch: { state: "cancelled" } });
+    await env.loop.onAwaitingQa(PHASE);
+    expect(env.phase().gate).toBe("passed");
+  });
+
+  it("a critical cap item that names no task does not hold the gate", async () => {
+    const env = await setup({ gate: "awaiting-qa" });
+    await addCap(env, null);
+    await env.loop.onAwaitingQa(PHASE);
+    expect(env.phase().gate).toBe("passed");
+  });
+
+  it("a critical cap item on a task of another phase does not hold this phase's gate", async () => {
+    const env = await setup({ gate: "awaiting-qa", otherPhase: true });
+    await addCap(env, "p2.T1");
+    await env.loop.onAwaitingQa(PHASE);
+    expect(env.phase().gate).toBe("passed");
+  });
+
+  it("a pending qa task of another phase does not hold this phase's gate", async () => {
+    const env = await setup({ gate: "awaiting-qa", otherPhase: true });
+    await env.writer.append([{
+      type: "task-created",
+      task: qaDone("p2.QA", canonicalFindingsJson(report()), { phase: "p2", state: "pending", attempts: [] }),
+    }]);
+    await env.loop.onAwaitingQa(PHASE);
+    expect(env.phase().gate).toBe("passed");
+  });
+});
+
+describe("onCapAnswer: guard arms", () => {
+  it("an info qa-cap item (a deferred nit) is not an answerable cap", async () => {
+    const env = await setup({ max: 1 });
+    await env.loop.onQaResult(env.qaId, report(f("M1", "minor", ["a.ts"])));
+    expect(caps(env)[0]).toMatchObject({ id: "R-1", severity: "info", answer: "deferred" });
+    expect((await failure(env.loop.onCapAnswer("R-1", "accept"))).code).toBe("E_INVALID_INPUT");
+  });
+
+  it("a critical cap item that names no task is E_INVALID_INPUT", async () => {
+    const env = await setup({ gate: "awaiting-qa" });
+    await addCap(env, null);
+    expect((await failure(env.loop.onCapAnswer("R-9", "accept"))).code).toBe("E_INVALID_INPUT");
+  });
+
+  it("a cap item on a task of another phase is refused: that phase's gate is not awaiting QA", async () => {
+    const env = await setup({ gate: "awaiting-qa", otherPhase: true });
+    await addCap(env, "p2.T1");
+    const seq = env.ledger().seq;
+    expect((await failure(env.loop.onCapAnswer("R-9", "accept"))).code).toBe("E_ILLEGAL_TRANSITION");
+    expect(env.ledger().seq).toBe(seq);
+  });
+
+  it("the gate no longer waiting on the item is E_ILLEGAL_TRANSITION (qa-running, or a task that is not the round's qa task)", async () => {
+    const running = await setup({ gate: "qa-running" });
+    await addCap(running, running.qaId);
+    expect((await failure(running.loop.onCapAnswer("R-9", "accept"))).code).toBe("E_ILLEGAL_TRANSITION");
+    const wrongTask = await setup({ gate: "awaiting-qa" });
+    await addCap(wrongTask, "p1.T1");
+    expect((await failure(wrongTask.loop.onCapAnswer("R-9", "accept"))).code).toBe("E_ILLEGAL_TRANSITION");
+    expect(wrongTask.phase().gate).toBe("awaiting-qa");
+  });
+
+  it("findings that cannot be re-read (no attempt) are E_INVALID_INPUT and the item stays open", async () => {
+    const env = await setup({ gate: "awaiting-qa", qaPatch: { attempts: [] } });
+    await addCap(env, env.qaId);
+    expect((await failure(env.loop.onCapAnswer("R-9", "accept"))).code).toBe("E_INVALID_INPUT");
+    expect(env.ledger().inbox.find((i) => i.id === "R-9")?.answer).toBeNull();
+    expect(env.phase().gate).toBe("awaiting-qa");
+  });
+
+  it("findings that cannot be re-read (the attempt context is not a findings report) are E_INVALID_INPUT", async () => {
+    const env = await setup({ gate: "awaiting-qa" });
+    await env.writer.append([{ type: "attempt-context", taskId: env.qaId, n: 1, context: "no json here" }]);
+    await addCap(env, env.qaId);
+    expect((await failure(env.loop.onCapAnswer("R-9", "fix"))).code).toBe("E_INVALID_INPUT");
+    expect(env.ledger().inbox.find((i) => i.id === "R-9")?.answer).toBeNull();
+    expect(env.phase().gate).toBe("awaiting-qa");
+  });
+
+  it("accept on a phase that is not paused writes no unpause", async () => {
+    const env = await setup({ gate: "awaiting-qa", report: report(f("J1", "major", ["a.ts"])) });
+    await addCap(env, env.qaId);
+    const base = env.ledger().seq;
+    expect(await env.loop.onCapAnswer("R-9", "accept")).toBe("passed");
+    expect(await env.types(base)).toEqual(["inbox-answered", "inbox-added", "gate-changed"]);
+    expect(env.phase()).toMatchObject({ gate: "passed", paused: false });
   });
 });

@@ -89,6 +89,8 @@ class Waker2 {
 /** Delegates to the real writer; can fail the next append and records the order of append / release. */
 class TestWriter implements LedgerWriter {
   failNext = false;
+  /** Runs once, on the next append, against the real writer before the batch is applied (a concurrent writer). */
+  beforeNext: (() => Promise<unknown>) | null = null;
   readonly journal: string[];
   constructor(private readonly inner: LedgerWriter, journal: string[]) {
     this.journal = journal;
@@ -96,6 +98,11 @@ class TestWriter implements LedgerWriter {
   get planId(): string { return this.inner.planId; }
   get ledger(): Readonly<LedgerV1> { return this.inner.ledger; }
   async append(batch: Parameters<LedgerWriter["append"]>[0]): Promise<Readonly<LedgerV1>> {
+    const pre = this.beforeNext;
+    if (pre !== null) {
+      this.beforeNext = null;
+      await pre();
+    }
     if (this.failNext) {
       this.failNext = false;
       throw new ExecutorError("E_LOCK_LOST", "injected append failure");
@@ -969,5 +976,98 @@ describe("recordAttempt: when the breaker trips", () => {
     expect(phaseOf(env).paused).toBe(true);
     expect(await env.policy.answer("B-1", "resume please")).toEqual({ resumed: null });
     expect(phaseOf(env).paused).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Branch top-up (task 4.2.6)
+// ---------------------------------------------------------------------------------------------------------------
+
+describe("branch top-up: pure helpers", () => {
+  it("pendingDependentsClosure ignores an edge to a task that does not exist", () => {
+    const l = buildDraft(0);
+    l.tasks["A"] = task("A", "running");
+    l.edges = [edge("A", "GHOST")];
+    expect(pendingDependentsClosure(l, "A")).toEqual([]);
+  });
+
+  it("two attempts of one task that end at the same instant are ordered by attempt number", async () => {
+    const t = task("A", "failed", { attempts: [failed(1, 5), failed(2, 5)] });
+    const env = await setup({ tasks: [t] });
+    expect(breakerSamples(env.l(), "p1").map((s) => `${s.taskId}#${s.n}`)).toEqual(["A#1", "A#2"]);
+  });
+
+  it("the window starts at the newest breaker item of the phase; items of no task, of a task of no phase and older items do not move it", async () => {
+    const tasks = [...breakerTasks("FFFFF"), task("O", "failed", { phase: null, attempts: [failed(1, 1)] })];
+    const inbox = [
+      item("B-1", { kind: "breaker", severity: "critical", taskId: "B0", answer: "go", createdAt: at(3) }),
+      item("B-2", { kind: "breaker", severity: "critical", taskId: null, answer: "go", createdAt: at(100) }),
+      item("B-3", { kind: "breaker", severity: "critical", taskId: "O", answer: "go", createdAt: at(100) }),
+      item("B-4", { kind: "breaker", severity: "critical", taskId: "B1", answer: "go", createdAt: at(2) }),
+    ];
+    const env = await setup({ tasks, inbox });
+    expect(breakerSamples(env.l(), "p1").map((s) => s.taskId)).toEqual(["B3", "B4"]);
+  });
+});
+
+describe("branch top-up: answer", () => {
+  it("an item answered after it was answered by a concurrent writer is E_INVALID_INPUT and keeps the first answer", async () => {
+    const env = await setup({ tasks: [running("T1")] });
+    const q = await env.policy.park("T1", "escalate", "which?");
+    env.writer.beforeNext = async () => { await env.policy.answer(q.id, "first"); };
+    expect((await rejects(env.policy.answer(q.id, "late"))).code).toBe("E_INVALID_INPUT");
+    expect(itemOf(env, q.id).answer).toBe("first");
+    expect(lastAttempt(T(env, "T1")).context).toBe("first");
+    expect(env.state("T1")).toBe("ready");
+  });
+
+  it("a breaker item that names no task, or a task of no phase, is only answered; the paused phase stays paused", async () => {
+    const env = await setup({
+      tasks: [task("O", "failed", { phase: null, attempts: [failed(1, 5)] })], paused: true,
+      inbox: [
+        item("B-1", { kind: "breaker", severity: "critical", taskId: null }),
+        item("B-2", { kind: "breaker", severity: "critical", taskId: "O" }),
+      ],
+    });
+    expect(await env.policy.answer("B-1", "ok")).toEqual({ resumed: null });
+    expect(await env.policy.answer("B-2", "ok")).toEqual({ resumed: null });
+    expect(itemOf(env, "B-1").answer).toBe("ok");
+    expect(itemOf(env, "B-2").answer).toBe("ok");
+    expect(phaseOf(env).paused).toBe(true);
+  });
+
+  it("a critical item that belongs to no phase does not keep the phase paused after a breaker answer", async () => {
+    const env = await setup({
+      tasks: [task("T1", "failed", { attempts: [failed(1, 5)] })], paused: true,
+      inbox: [
+        item("B-1", { kind: "breaker", severity: "critical", taskId: "T1" }),
+        item("R-2", { kind: "qa-cap", severity: "critical", taskId: null, options: ["accept"] }),
+      ],
+    });
+    await env.policy.answer("B-1", "go");
+    expect(phaseOf(env).paused).toBe(false);
+    expect(itemOf(env, "R-2").answer).toBeNull();
+  });
+});
+
+describe("branch top-up: park", () => {
+  it("a task of no phase parked as qa-unparsable fails its attempt and feeds no breaker (there is no phase to count it in)", async () => {
+    const env = await setup({ tasks: [running("Q9", { phase: null })] });
+    const got = await env.policy.park("Q9", "qa-unparsable", "no json");
+    expect(got).toMatchObject({ kind: "failure", taskId: "Q9" });
+    expect(lastAttempt(T(env, "Q9")).outcome).toBe("failed");
+    expect(phaseOf(env)).toMatchObject({ gate: "pending", paused: false });
+    expect(env.l().inbox.filter((x) => x.kind === "breaker")).toEqual([]);
+    expect(env.waker.calls.map((c) => c.key)).toEqual(["inbox:F-1"]);
+  });
+});
+
+describe("branch top-up: recordAttempt", () => {
+  it("a failure fed for a phase the ledger does not have trips nothing and writes nothing", async () => {
+    const env = await setup({ tasks: breakerTasks("FFF") });
+    const seq = env.l().seq;
+    expect(await env.policy.recordAttempt("nope", lastAttempt(T(env, "B2")))).toEqual({ tripped: false });
+    expect(env.l().seq).toBe(seq);
+    expect(env.waker.calls).toEqual([]);
   });
 });
