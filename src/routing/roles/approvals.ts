@@ -15,6 +15,8 @@ import * as path from "node:path";
 import { configPath, overridePath, statePath } from "../../router/config";
 import { REPO_APPROVAL_CAP_DAYS } from "../../router/roles-config";
 import { permissionMatches } from "../../router/read-only";
+import { resolvePendingJournalDir } from "../../verify/pending";
+import { EXECUTOR_HOME_DIRNAME, resolveExecutorHome } from "../../executor/paths";
 // Static, not `await import`: dynamic imports made a bundle split src/router/config.ts into a chunk where its tiers.json
 // lookup fails. The cycle with admission.ts is safe: each side uses the other only inside functions.
 import * as admission from "./admission";
@@ -470,8 +472,10 @@ function opencodeConfigFileDir(): string | undefined {
  * The protected locations: the opencode config dir (the router's `dirname(overridePath())`, plus
  * `$XDG_CONFIG_HOME/opencode`), `OPENCODE_CONFIG_DIR`, the directory of the `OPENCODE_CONFIG` file and
  * `~/.opencode`, the opencode data, state and cache dirs, this plugin's install dir
- * (`dirname(configPath())`) and the store's dir (equal, ancestor or inside), and the user profile
- * (equal or ancestor). Filesystem roots are checked separately by {@link protectedProblem}.
+ * (`dirname(configPath())`), the store's dir and the router state directory of the pending journal
+ * (`resolvePendingJournalDir`) (equal, ancestor or inside), and the user profile (equal or ancestor).
+ * Filesystem roots are checked separately by {@link protectedProblem}; the executor home, which is per
+ * repository, by {@link inspectCandidate}.
  */
 export function protectedLocations(env: ApprovalsEnv = {}): ProtectedLocation[] {
   const out: ProtectedLocation[] = [];
@@ -490,6 +494,8 @@ export function protectedLocations(env: ApprovalsEnv = {}): ProtectedLocation[] 
   for (const d of opencodeDirs("XDG_CACHE_HOME", ".cache")) add("the opencode cache directory", d);
   add("the plugin install directory", path.dirname(configPath()));
   add("the approvals store directory", path.dirname(approvalsPath(env)));
+  // The pending journal's directory, resolved as the v2 wiring resolves it: its verdict records are re-posted after a restart.
+  add("the router state directory", resolvePendingJournalDir({ homedir: os.homedir(), platform: process.platform, xdgStateHome: process.env.XDG_STATE_HOME }));
   add("the user profile", os.homedir(), "equal-or-ancestor");
   return out;
 }
@@ -622,6 +628,11 @@ export interface IdentityDeps {
   readonly now?: () => number;
   /** Default `process.platform`. */
   readonly platform?: NodeJS.Platform;
+  /**
+   * {@link inspectCandidate} only: the executor home resolved from `dir` (default `resolveExecutorHome`, hardened git);
+   * throws when `dir` has none.
+   */
+  readonly executorHome?: (dir: string) => Promise<string>;
 }
 
 /** Injectable I/O and configuration of {@link inspectCandidate}. */
@@ -714,6 +725,39 @@ function gitDirectoryProblem(real: string, deps: IdentityDeps): string | undefin
   return undefined;
 }
 
+/**
+ * QA-SYNC1-5: whether `text` or `canonical` is the executor home of a repository (`<git common dir>\omr-executor`, which holds
+ * the executor's plan directories and slot markers) or lies inside one. The home is per repository, so it is not a fixed
+ * {@link protectedLocations} entry: every ancestor named {@link EXECUTOR_HOME_DIRNAME} is checked against the home that
+ * `resolveExecutorHome` gives for its parent, exactly as the executor resolves it. Git runs only for such an ancestor.
+ */
+async function executorHomeProblem(text: string, canonical: string, deps: IdentityDeps): Promise<string | undefined> {
+  const resolveHome = deps.executorHome ?? ((dir: string) => resolveExecutorHome(dir));
+  const name = pathKey(EXECUTOR_HOME_DIRNAME);
+  const checked = new Set<string>();
+  for (const candidate of [text, canonical]) {
+    if (candidate === "" || !path.isAbsolute(candidate)) continue;
+    const self = cmpForm(candidate);
+    for (let dir = path.resolve(candidate); ; dir = path.dirname(dir)) {
+      const form = cmpForm(dir);
+      if (pathKey(path.basename(dir)) === name && !checked.has(form)) {
+        checked.add(form);
+        let home: string | undefined;
+        try {
+          home = await resolveHome(path.dirname(dir));
+        } catch {
+          home = undefined;
+        }
+        if (home !== undefined && [cmpForm(home), cmpForm(realOrSelf(home))].some((h) => h === form || h === cmpForm(realOrSelf(dir)))) {
+          return form === self ? `is the executor home (${home})` : `is inside the executor home (${home})`;
+        }
+      }
+      if (path.dirname(dir) === dir) break;
+    }
+  }
+  return undefined;
+}
+
 /** `routing.repoExclude` pattern matching `p` (as given and, on win32, with native separators), or undefined. */
 function excludedBy(p: string, exclude: readonly string[], win: boolean, matches: (input: string, pattern: string) => boolean): string | undefined {
   const forms = win && p.includes("/") ? [p, p.replace(/\//g, "\\")] : [p];
@@ -764,7 +808,8 @@ async function inspectGit(real: string, deps: IdentityDeps, adm: AdmissionModule
 /**
  * What git says about the candidate `text` (SD-P4-4, -8, -9): a problem phrase (to follow the path, as in "D:\x <problem>"), or
  * the identity of its canonical main worktree. Before any git call: {@link rootTextProblem} (admission.ts) on the text and on
- * the canonical form, `routing.repoExclude` on both, {@link protectedProblem}, and `<canonical>\.git` must be a local directory
+ * the canonical form, `routing.repoExclude` on both, {@link protectedProblem}, the executor home (`executorHomeProblem`, git only
+ * for an ancestor named like the executor home), and `<canonical>\.git` must be a local directory
  * (`lstat`: not a link, not a gitfile). Then hardened, bounded git: the canonical form must be the top level, its canonical common
  * dir must be `<canonical>\.git`, and it must have at least one commit. The git part is cached {@link INSPECT_CACHE_MS} per
  * canonical path (`deps.fresh` skips the cached result); the checks before it run every time. Never throws.
@@ -793,6 +838,8 @@ export async function inspectCandidate(text: string, deps: InspectDeps = {}): Pr
     if (byReal !== undefined) return `resolves to ${displaySafe(real)}, which is excluded by routing.repoExclude (${byReal})`;
     const placed = protectedProblem(shown, real, deps.env);
     if (placed !== undefined) return placed;
+    const executorHome = await executorHomeProblem(shown, real, deps);
+    if (executorHome !== undefined) return executorHome;
     const gitDir = gitDirectoryProblem(real, deps);
     if (gitDir !== undefined) return gitDir;
 

@@ -568,6 +568,26 @@ export interface PendingRegistration {
   readonly perimeter?: DeferredPerimeter;
   /** R3 cross-repo P2e: the check placements of a deferred entry (an `undefined` slot: no placement). Absent: none. */
   readonly placements?: readonly (CheckPlacement | undefined)[];
+  /**
+   * QA-SYNC1-3 (held entries, v2): the held gate checks a perimeter (I4) / the dispatch-time head (I7), neither journaled. Only
+   * the fact is journaled (`hadPerimeter` / `hadHead`), so the entry restored after a restart is unverifiable instead of being
+   * re-gated with fewer checks. The live entry is unchanged. Absent: none.
+   */
+  readonly heldPerimeter?: true;
+  readonly heldHead?: true;
+  /**
+   * QA-SYNC1-3 (held entries, v2): the head state read when the dispatch began, journaled as plain data (`dispatchHead`, with
+   * `hadHead`) so the gate re-run after a restart runs the same branch check. Absent: no head (or `heldHead` without a value).
+   */
+  readonly dispatchHead?: DispatchHeadState;
+}
+
+/** QA-SYNC1-3: a journaled dispatch-time head (verify/head.ts HeadState as plain data: `branch` null when detached). */
+export interface DispatchHeadState {
+  readonly root: string;
+  readonly head: string;
+  readonly branch: string | null;
+  readonly reflog?: number;
 }
 
 /** I7 (P0.2): HEAD and branch at return (TreeSnapshot.head / .branch: a short name, null when detached, absent when unknown). */
@@ -661,6 +681,13 @@ export interface PendingEntry {
    * unverifiable with {@link PERIMETER_LOST_REASON}, never a pass. Absent otherwise.
    */
   readonly perimeterLost?: true;
+  /**
+   * QA-SYNC1-3: restored after a restart from a held registration whose gate checked the dispatch-time head (`heldHead`), which
+   * is not journaled: the branch cannot be confirmed, so the entry settles unverifiable with {@link HEAD_LOST_REASON}. Absent otherwise.
+   */
+  readonly headLost?: true;
+  /** QA-SYNC1-3: PendingRegistration.dispatchHead (restored from the journal after a restart). Absent: none. */
+  readonly dispatchHead?: DispatchHeadState;
   readonly createdAt: number;
   readonly state: PendingState;
   /** Set while state is "verifying". */
@@ -902,6 +929,13 @@ interface EntryRecord {
    * is unverifiable ({@link PERIMETER_LOST_REASON}). False for a live registration and for records without the flag.
    */
   readonly perimeterLost: boolean;
+  /** QA-SYNC1-3: PendingRegistration.heldPerimeter / .heldHead (journaled as `hadPerimeter` / `hadHead`); false otherwise. */
+  readonly heldPerimeter: boolean;
+  readonly heldHead: boolean;
+  /** QA-SYNC1-3: PendingRegistration.dispatchHead, as registered or restored (journaled as `dispatchHead`). */
+  readonly dispatchHead: DispatchHeadState | undefined;
+  /** QA-SYNC1-3: restored from a record with `hadHead` but no `dispatchHead` ({@link HEAD_LOST_REASON}). False for a live registration. */
+  readonly headLost: boolean;
   dod: DoD | undefined;
   reference: Promise<ReferenceState>;
   changedFiles: readonly ChangedPath[] | "unavailable";
@@ -1055,6 +1089,27 @@ function restoredPlacements(placements: readonly (CheckPlacement | null)[]): rea
  * statuses) is not journaled, so the entry can no longer be verified as registered (never a pass).
  */
 export const PERIMETER_LOST_REASON = "perimeter lost in restart";
+/**
+ * QA-SYNC1-3: a journaled `dispatchHead`: `root` and `head` non-empty strings, `branch` a non-empty string or null (detached),
+ * `reflog` absent or a non-negative integer, and no other key. Strict: anything else drops the record.
+ */
+function isDispatchHead(value: unknown): value is DispatchHeadState {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  if (keys.some((key) => key !== "root" && key !== "head" && key !== "branch" && key !== "reflog")) return false;
+  const root: unknown = Reflect.get(value, "root");
+  const head: unknown = Reflect.get(value, "head");
+  const branch: unknown = Reflect.get(value, "branch");
+  const reflog: unknown = Reflect.get(value, "reflog");
+  return isNonEmptyString(root) && isNonEmptyString(head) && (branch === null || isNonEmptyString(branch))
+    && (reflog === undefined || (typeof reflog === "number" && Number.isInteger(reflog) && reflog >= 0));
+}
+/** QA-SYNC1-3: a validated journaled head as a frozen HeadState. */
+function restoredDispatchHead(value: DispatchHeadState): DispatchHeadState {
+  return Object.freeze({ root: value.root, head: value.head, branch: value.branch, ...(value.reflog !== undefined ? { reflog: value.reflog } : {}) });
+}
+/** QA-SYNC1-3: a restored held entry whose record says it had a dispatch-time head but carries none (the head cannot be confirmed). */
+export const HEAD_LOST_REASON = "cannot confirm the branch: the dispatch-time head was lost in restart, so the checks could verify another branch. Re-dispatch, or send a fresh [acceptance] block.";
 
 export const REFERENCE_UNRESTORED_REASON = "reference could not be restored after a restart";
 
@@ -2268,7 +2323,10 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
         ...(rec.returnedTree !== undefined ? { returnedTree: { ...rec.returnedTree } } : {}),
         ...(rec.unattributedWriters !== undefined ? { unattributedWriters: [...rec.unattributedWriters] } : {}),
         ...(rec.placements !== undefined ? { placements: rec.placements.map((p) => (p === undefined ? null : { ...p })) } : {}),
-        ...(rec.perimeter !== undefined || rec.perimeterLost ? { hadPerimeter: true } : {}),
+        ...(rec.perimeter !== undefined || rec.perimeterLost || rec.heldPerimeter ? { hadPerimeter: true } : {}),
+        // QA-SYNC1-3: a held gate's dispatch-time head is never journaled either: only the fact that it had one.
+        ...(rec.heldHead || rec.headLost || rec.dispatchHead !== undefined ? { hadHead: true } : {}),
+        ...(rec.dispatchHead !== undefined ? { dispatchHead: { ...rec.dispatchHead } } : {}),
     };
   }
 
@@ -2352,6 +2410,8 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       ...(rec.perimeter !== undefined ? { perimeter: rec.perimeter } : {}),
       ...(rec.placements !== undefined ? { placements: rec.placements } : {}),
       ...(rec.perimeterLost ? { perimeterLost: true as const } : {}),
+      ...(rec.headLost ? { headLost: true as const } : {}),
+      ...(rec.dispatchHead !== undefined ? { dispatchHead: rec.dispatchHead } : {}),
       createdAt: rec.createdAt,
       state: rec.state,
       verifyingSince: rec.verifyingSince,
@@ -2670,6 +2730,10 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       perimeter,
       placements,
       perimeterLost: false,
+      heldPerimeter: reg.heldPerimeter === true,
+      heldHead: reg.heldHead === true,
+      dispatchHead: reg.dispatchHead !== undefined ? Object.freeze({ ...reg.dispatchHead }) : undefined,
+      headLost: false,
       dod: reg.dod,
       reference,
       changedFiles,
@@ -2796,7 +2860,10 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       const crossRepoInvalid = (e.returnedTree !== undefined && !isReturnedTree(e.returnedTree))
         || (e.unattributedWriters !== undefined && !isUnattributedWriters(e.unattributedWriters))
         || (e.placements !== undefined && !isPlacements(e.placements))
-        || (e.hadPerimeter !== undefined && e.hadPerimeter !== true);
+        || (e.hadPerimeter !== undefined && e.hadPerimeter !== true)
+        || (e.hadHead !== undefined && e.hadHead !== true)
+        // QA-SYNC1-3: a journaled head is validated strictly; a head without `hadHead` is malformed too.
+        || (e.dispatchHead !== undefined && (!isDispatchHead(e.dispatchHead) || e.hadHead !== true));
       if (
         parent === undefined || callID === undefined || producer === undefined || parent === producer ||
         !HANDLE_PATTERN.test(handle) || f.state === "verified" || byHandle.has(handle) || byDispatch.has(callID) || crossRepoInvalid
@@ -2814,7 +2881,9 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       }
       const changedFiles = isChangedFiles(e.changedFiles) ? e.changedFiles : "unavailable";
       const restoredRef = deserializeReference(f.reference);
-      const pathWeight = changedFiles === "unavailable" ? 0 : changedFiles.length;
+      const placements = isPlacements(e.placements) ? restoredPlacements(e.placements) : undefined;
+      // QA-SYNC1-10: the weight `register` counts (changed files and placements; a perimeter is never restored).
+      const pathWeight = (changedFiles === "unavailable" ? 0 : changedFiles.length) + (placements !== undefined ? placements.length : 0);
       const refWeight = restoredRef === undefined ? 0 : restoredRef.untracked.size + restoredRef.tracked.size;
       counters.seq += 1;
       const rec: EntryRecord = {
@@ -2857,8 +2926,14 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
         unattributedWriters: isUnattributedWriters(e.unattributedWriters) && e.unattributedWriters.length > 0
           ? Object.freeze([...e.unattributedWriters]) : undefined,
         perimeter: undefined,
-        placements: isPlacements(e.placements) ? restoredPlacements(e.placements) : undefined,
+        placements,
         perimeterLost: e.hadPerimeter === true,
+        heldPerimeter: false,
+        heldHead: false,
+        // QA-SYNC1-3: the dispatch-time head a held gate checked, journaled as plain data; the gate re-run compares it again.
+        dispatchHead: isDispatchHead(e.dispatchHead) ? restoredDispatchHead(e.dispatchHead) : undefined,
+        // `hadHead` without a head value: the branch cannot be confirmed after the restart.
+        headLost: e.hadHead === true && !isDispatchHead(e.dispatchHead),
         holdAttempts: 0,
       };
       const target = session ?? new Map<string, EntryRecord>();

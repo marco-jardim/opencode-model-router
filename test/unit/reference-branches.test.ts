@@ -911,6 +911,46 @@ describe("serialized references and kept dirs (phase 2.1)", () => {
     expect(serializedReferenceLinks({})).toEqual({});
   });
 
+  it("round-trips the link causes and the dispatch-time pins, and rejects malformed pins (QA-SYNC1-9)", () => {
+    const pinned: DispatchRef = {
+      ...ref,
+      captureReasons: [
+        { cause: "external-link", path: "node_modules/lib" },
+        { cause: "root-link", path: "node_modules/self" },
+      ],
+      pins: [
+        {
+          kind: "pinned",
+          root: "/lib",
+          head: "e".repeat(40),
+          fingerprint: "f".repeat(64),
+          ignored: "0".repeat(64),
+          nested: [
+            { kind: "pinned", root: "/dep", head: "1".repeat(40), fingerprint: "2".repeat(64), ignored: "3".repeat(64), nested: [] },
+          ],
+        },
+        { kind: "unpinnable", root: "/other", why: "deep-link" },
+      ],
+    };
+    const wire = JSON.stringify(serializeRef(pinned));
+    expect(deserializeRef(wire)).toEqual(pinned);
+    expect(deserializeRef(JSON.parse(wire))).toEqual(pinned);
+    expect(deserializeRef(JSON.stringify(serializeRef({ ...ref, pins: [] })))).toEqual({ ...ref, pins: [] });
+
+    const base = serializeRef(pinned);
+    const good = base.pins?.[0];
+    expect(good?.kind).toBe("pinned");
+    if (good?.kind !== "pinned") return;
+    expect(deserializeRef({ ...base, pins: "x" })).toBeUndefined();
+    expect(deserializeRef({ ...base, pins: [null] })).toBeUndefined();
+    expect(deserializeRef({ ...base, pins: [{ kind: "unpinnable", root: "/x", why: "bogus" }] })).toBeUndefined();
+    expect(deserializeRef({ ...base, pins: [{ kind: "other", root: "/x" }] })).toBeUndefined();
+    expect(deserializeRef({ ...base, pins: [{ ...good, head: 1 }] })).toBeUndefined();
+    expect(deserializeRef({ ...base, pins: [{ ...good, nested: "x" }] })).toBeUndefined();
+    // pinTarget nests one level only: a nested pin with nested pins of its own is malformed.
+    expect(deserializeRef({ ...base, pins: [{ ...good, nested: [good] }] })).toBeUndefined();
+  });
+
   it("keepReferences marks reference dirs by name or path until released, and ignores other keys", () => {
     const dir = "/tmp/omr-ref-4242-0123456789abcdef";
     const release = keepReferences([dir, "/tmp/not-a-reference"]);

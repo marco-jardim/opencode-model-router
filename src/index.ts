@@ -143,7 +143,7 @@ import { scrubText } from "./guard/scrub";
 import { accept, unverifiableGateResult } from "./verify/gate";
 import { applyDispatchCaveats, createVerificationWiring, resolvePendingTtlMs, dispatchDirectiveText, extractAssistantText, parseRouterVerifyArgs, type DispatchStart, type HandleReport } from "./verify/wiring";
 import { locationOutsideWorkRoots } from "./router/work-roots";
-import { CLAIM_REFRESH_MS, PENDING_INSTANCES_DIRNAME, claimPendingSession, createInstanceClaimToken, createPendingFileJournal, foldDormantRecords, refreshPendingClaims, releasePendingClaim, resolvePendingJournalDir, processedKeyOf, appendRouterFooter, buildLateNoticeBlock, buildPendingListBlock, unattributedRisk, type DormantSession, type LateNotice, type PendingEntry, type SettledVerification } from "./verify/pending";
+import { CLAIM_REFRESH_MS, HEAD_LOST_REASON, PENDING_INSTANCES_DIRNAME, PERIMETER_LOST_REASON, type DispatchHeadState, claimPendingSession, createInstanceClaimToken, createPendingFileJournal, foldDormantRecords, refreshPendingClaims, releasePendingClaim, resolvePendingJournalDir, processedKeyOf, appendRouterFooter, buildLateNoticeBlock, buildPendingListBlock, unattributedRisk, type DormantSession, type LateNotice, type PendingEntry, type SettledVerification } from "./verify/pending";
 import { createDeadline } from "./verify/deterministic";
 import {
   DEFAULT_DELEGATE_PROMPT_TIMEOUT_MS,
@@ -1645,8 +1645,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
    * block's `cwd:`, the order the dispatch-time detection uses, nit 3) still wins inside it, by P2.3's rule (QA-P33F1-1-2); one
    * outside it is refused by the gate. Every other dispatch: the explicit cwd, as before (I1).
    */
-  const verificationScopeOf = (callID: unknown, args: Record<string, unknown> | undefined, dod: { cwd?: string }): VerificationScope =>
-    verificationScope(requestedVerificationCwd(args?.cwd, dod.cwd), typeof callID === "string" ? routedRoleOf(callID)?.verifyRoot : undefined);
+  const verificationScopeOf = (callID: unknown, args: Record<string, unknown> | undefined, dod: { cwd?: string }, restoredWorkRoot?: string): VerificationScope =>
+    verificationScope(requestedVerificationCwd(args?.cwd, dod.cwd), (typeof callID === "string" ? routedRoleFor(callID)?.verifyRoot : undefined) ?? restoredWorkRoot);
   /** The prompt as the orchestrator wrote it: without the router's role dispatch header (P2g.3, OD6) and its nonce line (handoff 18). */
   const withoutNonceLine = (prompt: string): string => stripDispatchHeader(prompt).replace(/\r?\n?OMR_NONCE=[A-Za-z0-9_-]+\s*$/, "");
   /**
@@ -3606,7 +3606,19 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     input: any,
     output: any,
     unbannered: { output: unknown } | undefined,
-    extra?: { delta?: DispatchDelta; dod?: ReturnType<typeof buildDelegationDoD>; graderParentSessionID?: string },
+    // QA-SYNC1-2: `workRoot`, the journaled work root of a dispatch restored after a restart (its routed-role record is gone).
+    // QA-SYNC1-3: `unattributedWriters`, those a restored held entry journaled (the live tally is gone after a restart).
+    extra?: {
+      delta?: DispatchDelta; dod?: ReturnType<typeof buildDelegationDoD>; graderParentSessionID?: string; workRoot?: string;
+      unattributedWriters?: readonly string[];
+      /** QA-SYNC1-3: the journaled dispatch-time head of a restored held entry; the branch check compares it as before. */
+      restoredHead?: DispatchHeadState;
+      /**
+       * QA-SYNC1-3: never deferred. A restored held entry was held because its verification was required at dispatch (only a
+       * required verification is held); it settles in place, never re-classified under the restarted process into a deferral.
+       */
+      noDefer?: true;
+    },
   ): Promise<FinishOutcome> {
     let outcome: FinishOutcome = { kind: "none" };
     if (typeof input?.tool === "string") {
@@ -3633,13 +3645,14 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           });
           // DF2-F1: a role dispatch is verified in its verification root (capture, change set, checks, deferral); a requested
           // cwd outside that root is refused by the gate below, never deferred to run there later.
-          const scope = verificationScopeOf(input.callID, input?.args, dod);
+          const scope = verificationScopeOf(input.callID, input?.args, dod, extra?.workRoot);
           const cwdSource = requestedVerificationCwdSource(input?.args?.cwd, dod.cwd);
           const effectiveCwd = scope.cwd;
           const dispatchID = `task:${input.sessionID}:${input.callID}`;
           // #84 QA-G-B-2-1: a routed role dispatch keeps its child's verification lineage; a resume that CARRIES the acceptance of an
           // earlier attempt is gated at once (never deferred) on the child's cumulative change set (roleAttemptVerification).
-          const routedRole = typeof input.callID === "string" ? routedRoleOf(input.callID) : undefined;
+          // QA-SYNC1-1: a background finish runs after the adapter forgot its record; the copy taken with the call's arguments stands in.
+          const routedRole = typeof input.callID === "string" ? routedRoleFor(input.callID) : undefined;
           const carriedRole = routedRole?.carried === true && childSessionID !== null && routedRole.resumeID === childSessionID;
           // Cross-repo P2a.3 (v2 only): where each check of a routed role dispatch runs. Tier dispatches resolve nothing.
           // P2e.6: valid per-check `cwd=`/`scope=` keys may be deferred (the placements travel with the handle, and router_verify
@@ -3661,7 +3674,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           // deferred (isDeferred). QA-2.4-2: only a proven root orchestrator defers.
           // B2: the reason a deferred finish refused for a branch switch, carried into the artefact below.
           let deferredSwitch: string | undefined;
-          if (!scope.outside && !carriedRole && !placementRefused && isDeferred(dod, start.directives, trivial) && await isProvenRootCaller(orchestratorSessionID)) {
+          if (extra?.noDefer !== true && !scope.outside && !carriedRole && !placementRefused && isDeferred(dod, start.directives, trivial) && await isProvenRootCaller(orchestratorSessionID)) {
             // Section 1.5-16: no gate, no test process; the result goes back now with the
             // footer, which is appended last and never says accepted or verified.
             const finish = await finishDeferred(changedFileStore, {
@@ -3706,7 +3719,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           try {
             // Cross-repo P3a (D23 as amended, QA C1): the dispatch's start (takeDispatch), the `since` of W's ignored-module
             // listing. A start that was never remembered reads as now (the return), which lists nothing older: never stale inputs.
-            verification = await prepareVerification(changedFileStore, dispatchID, childSessionID ?? "", captureRootOf(scope), gateDeadline, start.dispatchedAt);
+            verification = await prepareVerification(changedFileStore, dispatchID, childSessionID ?? "", captureRootOf(scope), gateDeadline, start.dispatchedAt, extra?.restoredHead);
           } catch (error) {
             gateDeadline.dispose();
             throw error;
@@ -3715,6 +3728,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           // lineage records it; its change set may hold the other branch's commits, so it is unavailable.
           if (deferredSwitch !== undefined && verification.branchSwitch === undefined) {
             verification = { ...verification, branchSwitch: deferredSwitch, changeBaseline: "unavailable" as const };
+          }
+          // QA-SYNC1-3: a restored held entry's journaled unattributed writers count as the lineage's own.
+          const restoredWriters = extra?.unattributedWriters;
+          if (restoredWriters !== undefined && restoredWriters.length > 0) {
+            verification = { ...verification, unattributedWriters: [...new Set([...(verification.unattributedWriters ?? []), ...restoredWriters])].sort() };
           }
           // #84 QA-G-B-2-1: the role child's lineage — this attempt starts it (its own block) or is judged on everything the child
           // changed since the attempt that introduced the carried block, against that attempt's reference.
@@ -3880,22 +3898,53 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   const taskArgsByCall = new Map<string, Record<string, unknown>>();
   /** QA-2.1-7: the parent session of a call in flight (same keys and bound), so captureDelta finds the dispatch record. */
   const taskParentByCall = new Map<string, string>();
+  /**
+   * QA-SYNC1-1/-2: the routed-role record of a call in flight (same keys and bound), copied when its arguments are remembered.
+   * The adapter forgets its own record once a background acknowledgement returns; the finish (child end) still needs it.
+   */
+  const routedRoleByCall = new Map<string, NonNullable<ReturnType<typeof routedRoleOf>>>();
+  /** QA-SYNC1-1: the routed-role record of `callID`: the dispatch module's while it keeps it, else the copy kept until the finish. */
+  function routedRoleFor(callID: string): ReturnType<typeof routedRoleOf> {
+    return routedRoleOf(callID) ?? routedRoleByCall.get(callID);
+  }
+  /**
+   * QA-SYNC1-6: finishDispatch verifies this dispatch at once, never deferred: a cwd outside the role's verification root, a refused
+   * check placement, or (v2) a tier dispatch's per-check `cwd=` (OD1=B). The same rules as there; a failed read counts as at once.
+   */
+  function verifiedAtOnce(callID: string, args: Record<string, unknown>, dod: ReturnType<typeof buildDelegationDoD>): boolean {
+    try {
+      const routed = routedRoleFor(callID);
+      if (routed === undefined) return ctx.routerHost === "v2" && tierCheckCwdRefusal(dod) !== undefined;
+      const scope = verificationScopeOf(callID, args, dod);
+      if (scope.outside) return true;
+      return resolveCheckPlacements(dod, scope, { inReadSet: roleReadSetFor(routed) }).refused !== undefined;
+    } catch (error) {
+      logger.warn("[router] the check placements of a dispatch could not be read", { callID, error: describeError(error) });
+      return true;
+    }
+  }
   function rememberTaskArgs(input: any, output: any): void {
     if (!isV2Host || input?.tool !== "task" || typeof input.callID !== "string") return;
     const args = output?.args;
     if (typeof args !== "object" || args === null) return;
     taskArgsByCall.set(input.callID, { ...(args as Record<string, unknown>) });
     if (typeof input.sessionID === "string") taskParentByCall.set(input.callID, input.sessionID);
+    // QA-SYNC1-1: route() ran before this hook (v2 adapter), so the routed-role record is current here.
+    const routed = routedRoleOf(input.callID);
+    if (routed === undefined) routedRoleByCall.delete(input.callID);
+    else routedRoleByCall.set(input.callID, routed);
     while (taskArgsByCall.size > MAX_TASK_ARGS) {
       const oldest = taskArgsByCall.keys().next();
       if (oldest.done === true) break;
       taskArgsByCall.delete(oldest.value);
       taskParentByCall.delete(oldest.value);
+      routedRoleByCall.delete(oldest.value);
     }
   }
   function forgetTaskArgs(callID: string): void {
     taskArgsByCall.delete(callID);
     taskParentByCall.delete(callID);
+    routedRoleByCall.delete(callID);
   }
 
   // ---- Phase 2.1.4.a (v2 only): the finish API ------------------------------------------------------
@@ -4021,6 +4070,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   };
   /** QA-2.1-17: an UNVERIFIABLE line for a finish after a restart that has nothing to verify with. */
   const RESTART_DATA_LOST = "verification data lost in restart";
+  /** QA-SYNC1-3: how long a held registration waits for the dispatch-time head read (started at dispatch, normally settled). */
+  const HELD_HEAD_READ_MS = 2_000;
   /** QA-2.1-31: handles whose restored pending entry the adapter settled after posting the verdict itself (no second post). */
   const directlySettled = new Set<string>();
   type HeldClaim = Extract<ReturnType<typeof pending.markVerifying>, { kind: "claimed" }>;
@@ -4101,7 +4152,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     handle: string,
     callInput: { tool: string; sessionID: string; callID: string; args: Record<string, unknown> },
     scratch: HeldScratch,
-    extra: { delta?: DispatchDelta; dod?: ReturnType<typeof buildDelegationDoD> } | undefined,
+    extra: {
+      delta?: DispatchDelta; dod?: ReturnType<typeof buildDelegationDoD>; workRoot?: string; unattributedWriters?: readonly string[];
+      restoredHead?: DispatchHeadState; noDefer?: true;
+    } | undefined,
     preClaim: HeldClaim | undefined,
   ): void {
     const settleHeld = (outcome: FinishOutcome): Promise<void> | undefined => {
@@ -4157,16 +4211,31 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     const prompt = typeof args.prompt === "string" ? args.prompt : undefined;
     const description = typeof args.description === "string" ? args.description : undefined;
     const dod = entry.dod ?? (prompt === undefined ? undefined : buildDelegationDoD({ prompt, description }));
-    if (dod === undefined || entry.changedFiles === "unavailable") {
-      const text = `${scratch.output.trimEnd()}\n\n${lostLine}`;
+    const settleLost = (reason: string): FinishResult => {
+      const text = `${scratch.output.trimEnd()}\n\n[router] UNVERIFIABLE — ${reason}`;
       rememberHeldText(handle, fin.parentSessionID, text);
-      claim.settle(heldVerification("UNVERIFIABLE", [RESTART_DATA_LOST]));
-      if (entry.hold === undefined) trackHeldGate(postHeldDirect(handle, "UNVERIFIABLE", text, RESTART_DATA_LOST));
+      claim.settle(heldVerification("UNVERIFIABLE", [reason]));
+      if (entry.hold === undefined) trackHeldGate(postHeldDirect(handle, "UNVERIFIABLE", text, reason));
       return heldResult;
-    }
+    };
+    if (dod === undefined || entry.changedFiles === "unavailable") return settleLost(RESTART_DATA_LOST);
+    // QA-SYNC1-3: the perimeter (I4) and the dispatch-time head the gate checked before the restart are not journaled, so a
+    // re-run gate would PASS with fewer checks: an entry that had a perimeter, or whose head cannot be confirmed, is UNVERIFIABLE.
+    if (entry.perimeterLost === true) return settleLost(PERIMETER_LOST_REASON);
+    if (entry.headLost === true) return settleLost(HEAD_LOST_REASON);
     changedFileStore.seed(fin.childSessionID, entry.changedFiles.map((file) => ({ path: file.path, status: file.status ?? "modified" })));
     const gateArgs = typeof args.cwd === "string" || entry.cwd === ctx.directory ? args : { ...args, cwd: entry.cwd };
-    runHeldGate(fin, handle, { tool: "task", sessionID: fin.parentSessionID, callID: fin.callID, args: gateArgs }, scratch, { dod }, claim);
+    // QA-SYNC1-2: the journaled work root stands in for the routed-role record the restart lost.
+    const workRoot = fin.restored?.workRoot;
+    const writers = entry.unattributedWriters;
+    const restoredHead = entry.dispatchHead;
+    runHeldGate(fin, handle, { tool: "task", sessionID: fin.parentSessionID, callID: fin.callID, args: gateArgs }, scratch, {
+      dod, ...(workRoot === undefined ? {} : { workRoot }), ...(writers === undefined ? {} : { unattributedWriters: writers }),
+      ...(restoredHead === undefined ? {} : { restoredHead }),
+      // QA-SYNC1-3: a held entry settles in place: without a dispatch record a re-deferral would register an unattributed
+      // change set (risk high) and post "deferred" instead of the held verdict, which no live held gate does.
+      noDefer: true,
+    }, claim);
     return heldResult;
   }
   const finishApi: FinishApi = {
@@ -4211,6 +4280,9 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         mode = "off";
       }
       if (!shouldVerifyTask("task", mode, cfg.enforcement?.verify?.require)) return { mode: "none", acceptance };
+      // QA-SYNC1-6: a dispatch finishDispatch verifies at once (a refused placement or cwd, the tier per-check `cwd=` refusal)
+      // is never classified deferred, so it is held like any other required verification.
+      if (verifiedAtOnce(callID, args, dod)) return { mode: "required", acceptance };
       const directives = directivesFor(dispatchDirectiveText(prompt, description));
       return { mode: isDeferred(dod, directives, false) ? "deferred" : "required", acceptance };
     },
@@ -4294,6 +4366,23 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           prompt: typeof args.prompt === "string" ? args.prompt : undefined,
           description: typeof args.description === "string" ? args.description : undefined,
         });
+        // QA-SYNC1-3: what the held gate checks that a restart loses (the perimeter, the dispatch-time head) is journaled as a
+        // fact, and the unattributed writers as they are, so a restored entry is never re-gated with fewer checks.
+        const dispatchKey = `task:${fin.parentSessionID}:${fin.callID}`;
+        const writers = changedFileStore.unattributedWritersOf(dispatchKey, fin.childSessionID);
+        const headRead = changedFileStore.baselineHead(dispatchKey);
+        const startHead = headRead === undefined ? undefined
+          : await withTimeout(headRead, HELD_HEAD_READ_MS, "dispatch head").catch(() => undefined);
+        // The head the gate compares the tree with (as prepareVerification: the head read, else the dispatch snapshot's head and
+        // branch) is journaled as plain data, so the gate re-run after a restart runs the same branch check. A head reader whose
+        // read gave nothing (the gate fails closed on it too) is journaled as the fact alone (`hadHead`, restored as headLost).
+        const baseline = changedFileStore.baselineSnapshot(dispatchKey);
+        const dispatchHead: DispatchHeadState | undefined = startHead !== undefined && startHead !== "none"
+          ? { root: startHead.root, head: startHead.head, branch: startHead.branch, ...(startHead.reflog !== undefined ? { reflog: startHead.reflog } : {}) }
+          : startHead === undefined && baseline !== undefined && baseline.branch !== undefined && typeof baseline.head === "string" && baseline.head !== ""
+            ? { root: baseline.root ?? baseline.cwd, head: baseline.head, branch: baseline.branch }
+            : undefined;
+        const heldHead = dispatchHead === undefined && startHead === undefined && headRead !== undefined;
         const reg = pending.register({
           orchestratorSessionID: fin.parentSessionID,
           dispatchID: fin.callID,
@@ -4309,6 +4398,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           risk: unattributedRisk(),
           handle,
           hold: { childSessionID: fin.childSessionID, callID: fin.callID },
+          ...(writers.length > 0 ? { unattributedWriters: writers } : {}),
+          ...(changedFileStore.perimeterOf(dispatchKey) !== undefined ? { heldPerimeter: true as const } : {}),
+          ...(heldHead ? { heldHead: true as const } : {}),
+          ...(dispatchHead !== undefined ? { dispatchHead } : {}),
         });
         if (!reg.ok) logger.warn("[router] held dispatch not registered", { code: reg.code, detail: reg.detail });
         runHeldGate(fin, handle, callInput, scratch, delta === undefined ? undefined : { delta }, undefined);
@@ -4316,7 +4409,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       }
       // DF-1-3: a background completion has no tool context of the orchestrator; its grader launches from the retained context of
       // the parent (C14 launcher A), never from whatever context is current (a role child's denies `subagent`).
-      const outcome = await finishDispatch(callInput, scratch, undefined, { ...(delta === undefined ? {} : { delta }), graderParentSessionID: fin.parentSessionID });
+      const restoredWorkRoot = taskArgsByCall.has(fin.callID) ? undefined : fin.restored?.workRoot;
+      const outcome = await finishDispatch(callInput, scratch, undefined, {
+        ...(delta === undefined ? {} : { delta }), graderParentSessionID: fin.parentSessionID,
+        ...(restoredWorkRoot === undefined ? {} : { workRoot: restoredWorkRoot }),
+      });
       const suffix = suffixOf();
       const verification: FinishResult["verification"] =
         outcome.kind === "deferred" ? { kind: "deferred", handle: outcome.handle }

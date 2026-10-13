@@ -15,7 +15,7 @@ import type { TestsPassRequest } from "../../src/verify/types";
 import { preemptBackgroundVerification } from "../../src/verify/wiring";
 import type { GateResult } from "../../src/verify/gate";
 import type { RouterConfig } from "../../src/router/config";
-import { unattributedRisk } from "../../src/verify/pending";
+import { HEAD_LOST_REASON, unattributedRisk } from "../../src/verify/pending";
 import type { CheckPlacement } from "../../src/verify/types";
 
 // Phase 2.1: the reference GC test below records the order of keepReferences and gcStaleReferences; both pass through to the real
@@ -266,7 +266,8 @@ describe("router_verify on a restored entry whose perimeter was not journaled (h
     producer: "ses_child_perimeter_lost",
     tier: "fast",
     dod: buildDelegationDoD({ prompt: "Refactor the parser.\n[acceptance]\ncheck: testsPass\n[/acceptance]" }),
-    // No change and a testsPass-only DoD: the gate would pass it without a process, so only the flag makes it unverifiable.
+    // No change and a testsPass-only DoD. QA-SYNC1-7: the digests are never journaled, so drift reads "unchecked" and a restored
+    // entry is unverifiable even without the flag; the tests below tell the two apart by their reasons, not by the outcome.
     changedFiles: [],
     changedFilesDropped: 0,
     reference: null,
@@ -292,11 +293,44 @@ describe("router_verify on a restored entry whose perimeter was not journaled (h
     expect(report.text).toContain("perimeter lost in restart");
   });
 
-  it("an old record without the flag is judged as before (control)", async () => {
+  it("an old record without the flag is judged as before (control): unverifiable for its unchecked drift, never for a lost perimeter", async () => {
     const w = createVerificationWiring({ client: fakeClient(), directory: process.cwd(), getConfig: () => cfg(), logger: { warn: () => undefined } });
     expect(w.pending.restore([entryRecord()], { now: Date.now() }).restored).toBe(1);
     const report = await w.verifyHandles(session, { kind: "handles", handles: [handle] });
+    // QA-SYNC1-7: the real outcome — a verdict of a run, unverifiable (drift unchecked), whose reasons name no lost perimeter;
+    // the flagged test above asserts exactly one reason, the lost perimeter, so it fails if the flag stops counting.
+    expect(report.items).toHaveLength(1);
+    expect(report.items[0]).toMatchObject({ kind: "verdict", handle, via: "run", result: { verdict: { pass: false, outcome: "unverifiable" } } });
+    expect(JSON.stringify(report.items[0])).not.toContain("perimeter lost in restart");
     expect(report.text).not.toContain("perimeter lost in restart");
+  });
+
+  it("QA-SYNC1-3: a restored held entry whose gate checked the dispatch-time head (hadHead) settles UNVERIFIABLE on its branch", async () => {
+    const w = createVerificationWiring({ client: fakeClient(), directory: process.cwd(), getConfig: () => cfg(), logger: { warn: () => undefined } });
+    expect(w.pending.restore([entryRecord({ hadHead: true })], { now: Date.now() }).restored).toBe(1);
+    const looked = w.pending.get(session, handle);
+    expect(looked.kind === "found" ? looked.entry.headLost : looked.kind).toBe(true);
+    const report = await w.verifyHandles(session, { kind: "handles", handles: [handle] });
+    expect(report.items).toHaveLength(1);
+    expect(report.items[0]).toMatchObject({
+      kind: "verdict", handle, via: "run",
+      result: { retryable: false, verdict: { pass: false, outcome: "unverifiable", reasons: [HEAD_LOST_REASON] } },
+    });
+  });
+
+  it("QA-SYNC1-10: a restored entry weighs its placements, as register counts them", () => {
+    const w = createVerificationWiring({ client: fakeClient(), directory: process.cwd(), getConfig: () => cfg(), logger: { warn: () => undefined } });
+    const placements = [{ cwd: process.cwd(), top: process.cwd(), foreign: false }, null];
+    expect(w.pending.restore([entryRecord({ placements })], { now: Date.now() }).restored).toBe(1);
+    const looked = w.pending.get(session, handle);
+    expect(looked.kind === "found" ? looked.entry.placements?.length : looked.kind).toBe(2);
+    // No changed files: the whole weight is the two placement slots (0 before the fix).
+    expect(w.pending.stats().weight).toBe(2);
+  });
+
+  it("QA-SYNC1-3: a malformed hadHead drops the record", () => {
+    const w = createVerificationWiring({ client: fakeClient(), directory: process.cwd(), getConfig: () => cfg(), logger: { warn: () => undefined } });
+    expect(w.pending.restore([entryRecord({ hadHead: "yes" })], { now: Date.now() }).restored).toBe(0);
   });
 });
 

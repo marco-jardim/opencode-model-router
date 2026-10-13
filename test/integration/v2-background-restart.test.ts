@@ -17,11 +17,11 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ADOPTION_RETRY_MS } from "../../src/compat/background";
 import { processToken } from "../../src/compat/v2-hooks";
-import { CLAIM_STALE_MS, PENDING_INSTANCES_DIRNAME } from "../../src/verify/pending";
+import { CLAIM_STALE_MS, HEAD_LOST_REASON, PENDING_INSTANCES_DIRNAME, PERIMETER_LOST_REASON, unattributedRisk } from "../../src/verify/pending";
 import { bootBgHost, restoreEnv, type BgHost, type NativeSubagentStub, type SyntheticCall } from "../helpers/v2-bg-host";
 
 let host: BgHost | undefined;
@@ -108,6 +108,84 @@ describe("restart recovery of held results (QA-2.1-17)", () => {
     expect(posts[0]?.text).toContain("lost in restart");
     expect(posts[0]?.text).not.toContain("partial output of a failed child");
   });
+});
+
+describe("QA-SYNC1-3: a restored held entry is never re-gated with fewer checks than before the restart", () => {
+  /** A held pending entry as the previous process journaled it (no change, a testsPass-only DoD from the hold's prompt). */
+  const heldEntry = (handle: string, callID: string, over: Record<string, unknown>): Record<string, unknown> => ({
+    v: 1, kind: "entry", handle, parent: ORCH, child: CHILD, callID, producer: CHILD, tier: "fast",
+    changedFiles: [], changedFilesDropped: 0, reference: null, risk: unattributedRisk(), description: "write c",
+    root: null, cwd: process.cwd(), state: "held", createdAt: Date.now(), dispatchedAt: Date.now(), ...over,
+  });
+  const prompt = "write src/c.ts\n[acceptance]\ncheck: testsPass\n[/acceptance]";
+
+  for (const [flag, reason] of [["hadPerimeter", PERIMETER_LOST_REASON], ["hadHead", HEAD_LOST_REASON]] as const) {
+    it(`an entry journaled with ${flag} posts UNVERIFIABLE "${reason.slice(0, 40)}…", never PASS`, async () => {
+      // Handles are hex (HANDLE_PATTERN): a non-hex handle drops the entry record, and the finish then reads "data lost".
+      const handle = `vrf_${(flag === "hadHead" ? "c" : "f").repeat(24)}`;
+      const callID = `call-sync1-${flag}`;
+      const h = await boot([
+        heldEntry(handle, callID, { [flag]: true }),
+        { v: 1, kind: "hold", handle, parent: ORCH, child: CHILD, callID, label: 'fast "write c"', dispatch: { prompt, description: "write c", subagentType: "fast" }, at: Date.now() },
+        { v: 1, kind: "hold-text", handle, text: "I wrote src/c.ts", status: "succeeded", at: Date.now() },
+      ]);
+      adoptOrchestrator(h);
+      await h.settled();
+      const posts = verdictPosts(h);
+      expect(posts).toHaveLength(1);
+      expect(posts[0]?.text).toContain("I wrote src/c.ts");
+      expect(posts[0]?.text).toContain(`[router] UNVERIFIABLE — ${reason}`);
+      expect(posts[0]?.text).not.toContain("verification data lost in restart");
+      expect(posts[0]?.text).not.toContain("PASS");
+    });
+  }
+
+  it("QA-SYNC1-2: a restored held task is gated in its journaled workRoot: a cwd outside it is refused, naming that root", async () => {
+    const handle = `vrf_${"8".repeat(24)}`;
+    const callID = "call-sync1-workRoot";
+    const workRoot = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-sync1-w-")));
+    const outside = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-sync1-o-")));
+    const h = await boot([
+      heldEntry(handle, callID, { cwd: outside }),
+      {
+        v: 1, kind: "hold", handle, parent: ORCH, child: CHILD, callID, label: 'fast "write w"',
+        dispatch: { prompt, description: "write w", subagentType: "fast", cwd: outside, workRoot }, at: Date.now(),
+      },
+      { v: 1, kind: "hold-text", handle, text: "I wrote src/w.ts", status: "succeeded", at: Date.now() },
+    ]);
+    adoptOrchestrator(h);
+    await h.settled();
+    const posts = verdictPosts(h);
+    expect(posts).toHaveLength(1);
+    // Without the journaled work root the check would run in `outside`; with it, the gate refuses that cwd and names the root.
+    expect(posts[0]?.text).toContain(basename(workRoot));
+    expect(posts[0]?.text).not.toContain("verification data lost in restart");
+    expect(posts[0]?.text).not.toContain("PASS");
+  }, 60_000);
+
+  it("an entry journaled with its dispatch-time head is re-gated with the branch check: a head on another branch is refused", async () => {
+    const handle = `vrf_${"9".repeat(24)}`;
+    const callID = "call-sync1-dispatchHead";
+    // The tree the gate reads now is this checkout (the entry's cwd); the journaled head names another branch at another commit.
+    const dispatchHead = { root: realpathSync.native(process.cwd()), head: "0".repeat(40), branch: "qa-sync1-not-this-branch" };
+    const h = await boot([
+      heldEntry(handle, callID, { hadHead: true, dispatchHead }),
+      { v: 1, kind: "hold", handle, parent: ORCH, child: CHILD, callID, label: 'fast "write c"', dispatch: { prompt, description: "write c", subagentType: "fast" }, at: Date.now() },
+      { v: 1, kind: "hold-text", handle, text: "I wrote src/c.ts", status: "succeeded", at: Date.now() },
+    ]);
+    adoptOrchestrator(h);
+    await h.settled();
+    const posts = verdictPosts(h);
+    expect(posts).toHaveLength(1);
+    expect(posts[0]?.text).toContain("I wrote src/c.ts");
+    // The branch check ran on the restored head (its reason), instead of being skipped or replaced by "lost in restart".
+    expect(posts[0]?.text).toContain("during the dispatch");
+    // A restored held entry settles in place: never re-deferred (a new unattributed handle) by the restarted process.
+    expect(posts[0]?.text).not.toContain("deferred to router_verify");
+    expect(posts[0]?.text).not.toContain(HEAD_LOST_REASON);
+    expect(posts[0]?.text).not.toContain("verification data lost in restart");
+    expect(posts[0]?.text).not.toContain("PASS");
+  }, 60_000);
 });
 
 describe("a refused adoption is tried again at a later sighting, rate-limited (QA-2.1-34)", () => {

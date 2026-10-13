@@ -705,6 +705,16 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
       return dispatches.get(id)?.head;
     },
     /**
+     * QA-SYNC1-3: the unattributed writers `delta(id, childID)` would report (sorted), read without joining `childID` to the
+     * lineage: a held registration journals them, so the gate re-run after a restart keeps them.
+     */
+    unattributedWritersOf(id: string, childID: string): string[] {
+      const d = dispatches.get(id);
+      const writers = new Set<string>(d ? d.writers : []);
+      for (const producer of d ? [...d.producers, childID] : [childID]) for (const tool of writersBySession.get(producer) ?? []) writers.add(tool);
+      return [...writers].sort();
+    },
+    /**
      * QA-3.1-2: how many other dispatches were live at some moment of this one's window so far and
      * work in the git tree at `root` (default: this dispatch's own root, else its cwd). Their edits
      * land in the same working tree, so they are part of this dispatch's tree delta. 0 when untracked.

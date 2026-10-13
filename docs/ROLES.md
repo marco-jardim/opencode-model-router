@@ -175,9 +175,9 @@ name. At dispatch time a grant that would mix them loses its egress, with a note
 Every role dispatch has exactly one **work root**: the session directory, or a git worktree of the same repository
 named on the route line with `root=<absolute path>` (and repeated in ENVIRONMENT). `read`, `glob`, `grep`,
 `router_git_*`, `edit` and `router_run` work inside it only; any other path is denied. A role child gets its task
-without the route line, so the role prompt says: "The work root this dispatch names (its ENVIRONMENT section, or
-`root=`) wins over the working directory in the host's environment block." The host's block can name the parent's
-directory.
+without the route line, so the role prompt says: "The router's `Working directory:` line and the work root in this
+dispatch's ENVIRONMENT win over the working directory in the host's environment block." The host's block can name the
+parent's directory.
 
 - **Resolution.** The `root=` text is normalised and compared with the session directory and with every entry of
   `git worktree list --porcelain` before any filesystem call on it; a match becomes its canonical long form. Anything

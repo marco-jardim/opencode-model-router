@@ -24,7 +24,7 @@ import {
   sanitizeRun,
   workRootProblem,
 } from "../../src/router/roles-config";
-import { ACTION_CLASS, CONTRACT_HEADING, DEFINING_CLASS, HOST_NATIVE_ROLE_NAMES, SHIPPED_ROLE_SPECS } from "../../src/router/roles";
+import { ACTION_CLASS, CONTRACT_HEADING, DEFINING_CLASS, HOST_NATIVE_ROLE_NAMES, SHIPPED_ROLE_SPECS, WORK_ROOT_RULE } from "../../src/router/roles";
 import type { AuthorityAction, RoleSpec } from "../../src/router/roles";
 import { ROLE_DENIED_ACTIONS, ROLE_STEPS_MARGIN, roleAgentSteps } from "../../src/router/role-agents";
 import { GUARD_CUMULATIVE_MULTIPLIER, REFUSAL_CAP, roleGuardProfile, ROUTE_BUDGET_RAISE_MAX, TIER_GUARD_BUDGET } from "../../src/router/guard-profile";
@@ -120,6 +120,15 @@ describe("role dispatch header docs (P2g, OD6)", () => {
     expect(paragraph).toBe("Working directory: <root> (repository app-a, branch feat/login at 3f2c1a9). You are already there — do not ask permission to read or write inside it.");
     expect(flat("docs/ROLES.md")).toContain(paragraph);
     expect(flat("docs/ROLES.md")).toContain("`[router] You are @<role>. Execute this dispatch yourself.`");
+  });
+
+  // QA-SYNC1-11: a role child never sees `root=`; the rule names the router's line and ENVIRONMENT, and ROLES.md quotes it.
+  it("ROLES.md quotes the work-root rule's precedence sentence word for word", () => {
+    const sentence =
+      "The router's `Working directory:` line and the work root in this dispatch's ENVIRONMENT win over the working directory in the host's environment block.";
+    expect(WORK_ROOT_RULE).toContain(sentence);
+    expect(WORK_ROOT_RULE).not.toContain("root=");
+    expect(flat("docs/ROLES.md")).toContain(`the role prompt says: "${sentence}"`);
   });
 
   it("no doc still says the header is built for tier dispatches only", () => {

@@ -844,6 +844,56 @@ async function flushMicrotasks(): Promise<void> {
   for (let i = 0; i < 10; i += 1) await Promise.resolve();
 }
 
+describe("QA-SYNC1-3: a held registration journals its perimeter fact, its dispatch-time head and its unattributed writers", () => {
+  const head = { root: "/repo", head: "0123456789abcdef0123456789abcdef01234567", branch: "feat/x", reflog: 3 };
+
+  /** A held entry registered on a journaled registry (as finishApi.finish does at child end); its journaled `entry` record. */
+  async function heldRecord(over: Partial<PendingRegistration>): Promise<{ records: PendingRecord[]; handle: string; entry: PendingRecord }> {
+    const mem = memoryJournal();
+    const first = registry({ now: () => NOW, persist: mem.journal });
+    const handle = first.reserveHandle("p1");
+    if (handle === undefined) throw new Error("no handle reserved");
+    const reg = first.register(registration(1, "p1", { handle, hold: { childSessionID: "child-p1-1", callID: "call-p1-1" }, ...over }));
+    expect(reg.ok).toBe(true);
+    await flushMicrotasks();
+    const entry = mem.records.find((r) => r.kind === "entry" && r.handle === handle);
+    if (entry === undefined) throw new Error("no entry record journaled");
+    return { records: mem.records, handle, entry };
+  }
+
+  it("writes hadPerimeter, hadHead with the head itself, and the writers to the journal", async () => {
+    const { entry } = await heldRecord({ heldPerimeter: true, dispatchHead: head, unattributedWriters: ["bash", "execute"] });
+    expect(entry.hadPerimeter).toBe(true);
+    expect(entry.hadHead).toBe(true);
+    expect(entry.dispatchHead).toEqual(head);
+    expect(entry.unattributedWriters).toEqual(["bash", "execute"]);
+  });
+
+  it("restores the head as plain data (the branch check runs again), the perimeter as lost, the writers as they were", async () => {
+    const { records, handle } = await heldRecord({ heldPerimeter: true, dispatchHead: head, unattributedWriters: ["bash"] });
+    const fresh = registry({ now: () => NOW, seed: 1000 });
+    expect(fresh.restore(records, { now: NOW }).restored).toBe(1);
+    const looked = fresh.get("p1", handle);
+    if (looked.kind !== "found") throw new Error(`restored entry not found: ${looked.kind}`);
+    expect(looked.entry.dispatchHead).toEqual(head);
+    expect(looked.entry.headLost).toBeUndefined();
+    expect(looked.entry.perimeterLost).toBe(true);
+    expect(looked.entry.unattributedWriters).toEqual(["bash"]);
+  });
+
+  it("a record that had a head but carries no value restores headLost; a malformed head drops the record", async () => {
+    const { records, handle } = await heldRecord({ heldHead: true });
+    const fresh = registry({ now: () => NOW, seed: 1000 });
+    expect(fresh.restore(records, { now: NOW }).restored).toBe(1);
+    const looked = fresh.get("p1", handle);
+    expect(looked.kind === "found" ? looked.entry.headLost : looked.kind).toBe(true);
+    for (const bad of [{ ...head, head: "" }, { ...head, branch: 7 }, { ...head, reflog: -1 }, { ...head, extra: 1 }, "HEAD"]) {
+      const malformed = records.map((r) => (r.kind === "entry" ? { ...r, hadHead: true, dispatchHead: bad } : r));
+      expect(registry({ now: () => NOW, seed: 2000 }).restore(malformed, { now: NOW }).restored).toBe(0);
+    }
+  });
+});
+
 describe("pending registry: the cross-repo registration fields survive a restart", () => {
   const tree = { head: "0123456789abcdef0123456789abcdef01234567", branch: "feat/x", root: "/repo", reflog: 7 };
   const placements = [undefined, { cwd: "/repo/pkg", top: "/repo", foreign: false, scope: "full" as const }];

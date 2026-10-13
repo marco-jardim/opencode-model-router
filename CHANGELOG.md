@@ -30,8 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pending.jsonl` in the per-user state directory (`~/.local/state/opencode-model-router`, or
   `$XDG_STATE_HOME/opencode-model-router` when set, outside Windows), never in the temp directory. After a restart the
   router recovers a dispatch whose child finished, re-posts a verdict that was reached but not delivered, and keeps
-  posted results hidden. A journal that vanishes under a running process is rewritten from memory. OpenCode v1 ignores
-  every `routing.background.*` and `routing.leases.*` key and logs one notice per process that names them.
+  posted results hidden. A restored pending verification keeps its cross-repo checks: the branch and HEAD recorded at
+  return, the unobservable writers and the check placements of a deferred dispatch are journaled and checked again, and
+  a record with a malformed one is dropped. A dispatch's perimeter is not journaled, so `router_verify` on a restored
+  handle whose dispatch had one reports `UNVERIFIABLE` (`perimeter lost in restart`), never `PASS`. A journal that
+  vanishes under a running process is rewritten from memory. OpenCode v1 ignores every `routing.background.*` and
+  `routing.leases.*` key and logs one notice per process that names them.
 - **OpenCode v2: plan executor groundwork (not registered yet).** The `routing.executor.*` keys (`slotsDir`,
   `integrationChecks`, `phaseSuite`, `provision` and `python` are trusted keys: only the global override sets them), the
   `router_plan` tool and `/plan` command factories, and the executor instructions are in the code, with a user guide
@@ -47,12 +51,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **OpenCode v2: a pending verification restored after a restart keeps its cross-repo checks.** The branch and HEAD
-  recorded at return, the unobservable writers and the check placements of a deferred dispatch are written to
-  `pending.jsonl` and checked again when the router restarts; a record with a malformed one is dropped. A dispatch's
-  perimeter cannot be written, so `router_verify` on a restored handle whose dispatch had one reports `UNVERIFIABLE`
-  (`perimeter lost in restart`), never `PASS`. Records written by earlier builds restore as before. OpenCode v1 is
-  unchanged.
+- **OpenCode v2: `/router approve` refuses the router's and the executor's state.** The router state directory that
+  holds `pending.jsonl` (`~/.local/state/opencode-model-router`, or `$XDG_STATE_HOME/opencode-model-router` when set,
+  outside Windows) is a protected location, and so is a repository's executor home (`<git common dir>\omr-executor`,
+  with its plan and slot-marker directories): approving one of them, or a repository inside one, is refused. OpenCode
+  v1 is unchanged.
 - **OpenCode v2: work leases no longer collide across linked worktrees.** Two child sessions that edit the same
   repo-relative path in two worktrees of one repository (`git worktree add`) are both allowed: an ordinary write lease
   is keyed by its checkout, not by the repository, and a write whose target the router cannot read is refused only while
@@ -86,9 +89,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   orchestrator turn, so the kickoff and each wake-up (runs that no user prompt starts) get one row each, even while a
   background dispatch is still open. OpenCode v1 is unchanged.
 - **Role prompts: the dispatch's work root wins over the host's environment block.** The work-root rule of every role
-  prompt now says that the work root a dispatch names (its ENVIRONMENT section, or `root=`) wins over the working
-  directory in the host's environment block (role children get the task without the route line), so a role no longer
-  refuses its work root because the host named the parent's directory.
+  prompt now says that the router's `Working directory:` line and the work root in the dispatch's ENVIRONMENT win over
+  the working directory in the host's environment block (role children get the task without the route line), so a role
+  no longer refuses its work root because the host named the parent's directory.
 - **OpenCode v2: a second booted location no longer settles another location's running dispatch as `lost in
   restart`.** When one host process loads a router instance per location, each instance now keeps a beat file in
   `pending.instances` next to `pending.claims` while it holds a session claim. A new instance refuses to adopt a

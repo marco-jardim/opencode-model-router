@@ -11,6 +11,8 @@
  * - T2.3.3: request → `ESCALATE: authority` → resume widens that child only, the floor is recomputed, the row records it.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ROUTER_FINISH_ATTACH as SYNC1_FINISH_ATTACH, type FinishApi as Sync1FinishApi, type FinishAttach as Sync1FinishAttach } from "../../src/compat/background";
+import { routedRoleOf as sync1RoutedRoleOf } from "../../src/routing/wire/dispatch";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -73,13 +75,18 @@ vi.mock("../../src/verify/wiring", async (importOriginal) => {
 });
 // #84 QA-G-B-2-1: a pass-through spy on the gate — the change set each verification is judged on; `failNext` makes the next gate a
 // FAIL (as a failing test suite would), since no test runner is installed in the temp repositories.
-const gated = vi.hoisted(() => ({ inputs: [] as Array<{ changedFiles: string[] }>, failNext: false }));
+// QA-SYNC1-2: `refused` (the gate's refusedCheck, JSON; "null" when none) and `placed` (checkPlacements given) of each gate input.
+const gated = vi.hoisted(() => ({ inputs: [] as Array<{ changedFiles: string[]; refused: string; placed: boolean }>, failNext: false }));
 vi.mock("../../src/verify/gate", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/verify/gate")>();
   return {
     ...actual,
     accept: async (...a: Parameters<typeof actual.accept>) => {
-      gated.inputs.push({ changedFiles: a[1].changedFiles.map((f) => f.path) });
+      gated.inputs.push({
+        changedFiles: a[1].changedFiles.map((f) => f.path),
+        refused: JSON.stringify(a[0].refusedCheck ?? null),
+        placed: a[0].checkPlacements !== undefined,
+      });
       if (gated.failNext) {
         gated.failNext = false;
         return actual.gateResult({
@@ -1379,7 +1386,22 @@ describe("work roots (I3, P-13): the dispatch's own worktree only", () => {
         return event.input;
       };
       const at = (kind: "start" | "prepare" | "defer", callID: string) => wired.calls.filter((c) => c.kind === kind && c.id === `task:root:${callID}`).map((c) => c.cwd);
-      return { cfg, wt1, sessions, v2, verdicts, finish, resume, at };
+      return { cfg, wt1, sessions, v2, verdicts, finish, resume, at, hooks };
+    };
+    /** QA-SYNC1: the plugin's v2 finish API (the adapter attached it at start; attaching again returns the same object). */
+    const finishApiOf = (hooks: object): Sync1FinishApi => {
+      const attach: unknown = Reflect.get(hooks, SYNC1_FINISH_ATTACH);
+      if (typeof attach !== "function") throw new Error("no finish API on the plugin hooks");
+      const api = (attach as Sync1FinishAttach)({ held: { verdict: async () => undefined }, leaseGate: undefined } as unknown as Parameters<Sync1FinishAttach>[0]);
+      if (api === undefined) throw new Error("the finish API is not attached");
+      return api;
+    };
+    /** QA-SYNC1: the background acknowledgement of `callID` (status running): the adapter forgets its routed-role record. */
+    const acknowledge = async (v2: Awaited<ReturnType<typeof setup>>["v2"], callID: string, child: string, input: Record<string, unknown>): Promise<void> => {
+      await v2.toolHooks["execute.after"]!({
+        sessionID: "root", agent: "build", messageID: "m", id: callID, tool: "subagent", input, status: "completed",
+        result: { output: { status: "running", output: "", sessionID: child }, content: [{ type: "text", text: "running in the background" }] },
+      });
     };
 
     it.skipIf(!hasGit())("(a) after a FAIL, a resume that changes nothing is not accepted on the carried acceptance and records no pass", async () => {
@@ -1423,6 +1445,70 @@ describe("work roots (I3, P-13): the dispatch's own worktree only", () => {
       const text = await finish("fc2", "kc", second, [], "DONE: nothing left");
       expect(at("defer", "fc2")).toEqual([]);
       expect(text).not.toContain("verified: deterministic");
+    }, 60_000);
+
+    it.skipIf(!hasGit())("(d) QA-SYNC1-1/-2: a BACKGROUND resume carrying the acceptance is judged in its root on the cumulative change set, never PASS", async () => {
+      const { wt1, sessions, v2, finish, resume, at, hooks } = await setup();
+      // VERIFY: required gates attempt 1 at its return, which records the lineage's baseline (a deferred attempt 1 records none,
+      // and the carried resume is then judged on an unavailable change set: see (c)).
+      const prompt = `[route class=implement risk=low scope=single needs=edit root=${wt1}]\nVERIFY: required\nWrite the generator\n[acceptance]\ncheck: testsPass\n[/acceptance]`;
+      const first = await dispatch(v2, sessions, "fd1", "kd", "implementer", prompt, wt1, "generator");
+      expect(await catalog(v2, "kd", "implementer")).toContain("edit");
+      await finish("fd1", "kd", first, [join(wt1, "gen.ts")], "DONE: wrote gen.ts:1");
+      const second = await resume("fd2", "kd", "continue");
+      // The background acknowledgement: the adapter forgets its routed-role record before the child ends.
+      await acknowledge(v2, "fd2", "kd", second);
+      expect(sync1RoutedRoleOf("fd2")).toBeUndefined();
+      const api = finishApiOf(hooks);
+      const done = await api.finish({
+        callID: "fd2", parentSessionID: "root", childSessionID: "kd", outputText: "DONE: nothing left",
+        status: "succeeded", mode: "background", endedAt: Date.now(),
+      });
+      // Never deferred (a carried acceptance), and gated on attempt 1's change in the role's root, not passed on nothing.
+      expect(at("defer", "fd2")).toEqual([]);
+      expect(at("prepare", "fd2")).toEqual([wt1]);
+      expect(done.verification.kind).toBe("required");
+      expect(done.verification).not.toEqual({ kind: "required", verdict: "PASS" });
+      expect(norm(gated.inputs.at(-1)?.changedFiles)).toEqual(norm([join(wt1, "gen.ts")]));
+    }, 60_000);
+
+    it.skipIf(!hasGit())("(e) QA-SYNC1-2: a background role dispatch's per-check cwd= is placed in its root, never refused as a tier dispatch", async () => {
+      const { wt1, sessions, v2, finish, at, hooks } = await setup();
+      const prompt = `[route class=implement risk=low scope=single needs=edit root=${wt1}]\nVERIFY: required\nWrite the generator\n[acceptance]\ncheck: testsPass cwd=${wt1} scope=full\n[/acceptance]`;
+      const first = await dispatch(v2, sessions, "fe1", "ke", "implementer", prompt, wt1, "generator");
+      expect(await catalog(v2, "ke", "implementer")).toContain("edit");
+      await acknowledge(v2, "fe1", "ke", first);
+      expect(sync1RoutedRoleOf("fe1")).toBeUndefined();
+      writeFileSync(join(wt1, "gen.ts"), "export const g = 1;\n");
+      await hooks["tool.execute.after"]({ tool: "write", sessionID: "ke", callID: "fe1-w0", args: { filePath: join(wt1, "gen.ts") } }, { title: "", output: "", metadata: {} });
+      const done = await finishApiOf(hooks).finish({
+        callID: "fe1", parentSessionID: "root", childSessionID: "ke", outputText: "DONE: wrote gen.ts:1",
+        status: "succeeded", mode: "background", endedAt: Date.now(),
+      });
+      // Captured and verified in the role's root (W), not the plugin directory; the placement is honoured (not refused). The
+      // verdict itself may be UNVERIFIABLE (no test runner in the temp repository); what matters is that the check was placed.
+      expect(at("prepare", "fe1")).toEqual([wt1]);
+      expect(done.verification.kind).toBe("required");
+      expect(gated.inputs.at(-1)?.refused).toBe("null");
+      expect(gated.inputs.at(-1)?.placed).toBe(true);
+      expect(done.outputText).not.toContain("honoured only in roles mode");
+      expect(norm(gated.inputs.at(-1)?.changedFiles)).toEqual(norm([join(wt1, "gen.ts")]));
+      void finish;
+    }, 60_000);
+
+    it.skipIf(!hasGit())("(f) QA-SYNC1-6: verificationFor classifies a tier dispatch with a per-check cwd= as required (held), never deferred", async () => {
+      const { wt1, hooks } = await setup();
+      const remember = async (callID: string, check: string): Promise<void> => {
+        const args = { subagent_type: "fast", description: "tier work", prompt: `Write the generator\n[acceptance]\ncheck: ${check}\n[/acceptance]` };
+        // The legacy before-hook remembers the call's arguments first; whatever it decides after that does not matter here.
+        await Promise.resolve(hooks["tool.execute.before"]({ tool: "task", sessionID: "root", callID, args }, { args })).catch(() => undefined);
+      };
+      await remember("ff1", `testsPass cwd=${wt1}`);
+      await remember("ff2", "testsPass");
+      const api = finishApiOf(hooks);
+      expect(api.verificationFor("ff1")?.mode).toBe("required");
+      // Control: the same block without the per-check cwd= is deferred (testsPass without VERIFY).
+      expect(api.verificationFor("ff2")?.mode).toBe("deferred");
     }, 60_000);
   });
 });

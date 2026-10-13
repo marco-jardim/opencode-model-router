@@ -93,7 +93,7 @@ import type { DispatchPerimeter, PerimeterEntry } from "./dispatch";
 import { branchSwitched, branchSwitchReason, branchUnconfirmedReason, treeMove, treeMoveReason } from "./branch";
 import { readHead, readHeadState, readReflogWindow, type HeadState, type ReflogEntry } from "./head";
 import { captureReference, DEFAULT_CAPTURE_TIMEOUT_MS, gcStaleReferences, keepReferences, nodeReferenceFs, REF_DIR_PATTERN, serializedReferenceLinks, type DispatchReference } from "./reference";
-import { PERIMETER_LOST_REASON, type PendingRecord } from "./pending";
+import { HEAD_LOST_REASON, PERIMETER_LOST_REASON, type PendingRecord } from "./pending";
 import type { PluginLogger } from "../router/logger";
 import { REFERENCE_NONE } from "./baseline";
 import { scrubText } from "../guard/scrub";
@@ -1107,6 +1107,8 @@ export interface VerificationWiring {
     cwd?: string,
     deadline?: Deadline,
     dispatchStartedAt?: number,
+    /** QA-SYNC1-3: the journaled dispatch-time head of a held entry restored after a restart (the store lost its own). */
+    restoredHead?: HeadState,
   ): Promise<PreparedVerification>;
   /** Session ids currently running a grader prompt, so hooks can skip them. */
   graderSessions: Set<string>;
@@ -2315,6 +2317,8 @@ export function createVerificationWiring(deps: {
     cwd: string | undefined,
     deadline: Deadline | undefined,
     observePerimeter = true,
+    // QA-SYNC1-3: a restored held entry's journaled dispatch-time head stands in for the store's (gone after a restart).
+    restoredHead?: HeadState,
   ): Promise<Omit<PreparedVerification, "reference">> => {
     const base = resolve(directory, cwd || ".");
     // QA-1 F9: the perimeter's gate snapshots start now, concurrently with W's own (never rejects).
@@ -2362,7 +2366,7 @@ export function createVerificationWiring(deps: {
     let headSwitch: string | undefined;
     let headRead = false;
     let gateHead: HeadState | undefined;
-    const baselineHead = store.baselineHead(id);
+    const baselineHead = store.baselineHead(id) ?? (restoredHead !== undefined ? Promise.resolve<HeadState>(restoredHead) : undefined);
     if (baselineHead !== undefined) {
       const bound = deadline ? deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS) : GRADE_SNAPSHOT_TIMEOUT_MS;
       if (bound > 0 && deadline?.signal.aborted !== true) {
@@ -3273,6 +3277,8 @@ export function createVerificationWiring(deps: {
     if (dod === undefined) return { kind: "final", result: { verdict: unverifiableVerdict(ROUTER_VERIFY_RELEASED_REASON), retryable: false } };
     // A restored entry whose registration had a perimeter (never journaled) cannot be judged as registered: never a pass.
     if (entry.perimeterLost === true) return { kind: "final", result: { verdict: unverifiableVerdict(PERIMETER_LOST_REASON), retryable: false } };
+    // QA-SYNC1-3: a restored held entry whose gate checked the dispatch-time head (not journaled) cannot confirm its branch.
+    if (entry.headLost === true) return { kind: "final", result: { verdict: unverifiableVerdict(HEAD_LOST_REASON), retryable: false } };
     // Cross-repo P2e.4b: a placed check whose cwd no longer resolves to the same repository would run elsewhere: nothing runs.
     if (prep.placementDrift !== undefined) return { kind: "final", result: { verdict: unverifiableVerdict(prep.placementDrift), retryable: false } };
     // P2e QA-1 #5b: a placement that could not be checked now: nothing runs; another router_verify may check it.
@@ -3688,8 +3694,8 @@ export function createVerificationWiring(deps: {
         stop.abort();
       };
     },
-    async prepareVerification(store, id, childID, cwd, deadline, dispatchStartedAt?: number) {
-      const change = await observeChange(store, id, childID, cwd, deadline);
+    async prepareVerification(store, id, childID, cwd, deadline, dispatchStartedAt?: number, restoredHead?: HeadState) {
+      const change = await observeChange(store, id, childID, cwd, deadline, undefined, restoredHead);
       const captured = await store.reference(id, deadline?.signal);
       // Cross-repo P2d.3 (P2.6): the pins of the admitted link targets travel with a captured reference (required gate only).
       const pins = captured.kind === "captured" ? await linkPinsAtGate(store, id, deadline) : [];
