@@ -381,14 +381,25 @@ export interface PlanCollaborators {
   qa: QaLoop;
 }
 
+/** Optional attempt observations used by the dispatch-backed plan-task verifier. */
+export interface PlanTaskVerifier extends SlotVerifier {
+  begin?(task: TaskNode, slot: SlotLease, attempt: Attempt): void | Promise<void>;
+  observe?(task: TaskNode, slot: SlotLease, attempt: Attempt): void | Promise<void>;
+  forget?(planId: PlanId, taskId: TaskId, attempt: number): void | Promise<void>;
+}
+
 export interface RuntimeDeps {
   store: LedgerStore;
   compiler: PlanCompiler;
   slots: SlotPool;
+  /** Per-plan pools; legacy callers keep using `slots`. */
+  slotsFor?(planId: PlanId): SlotPool;
+  /** Revalidate the fixed slots directory before approval has any side effects. */
+  checkSlotsDir?(slotsDir: string, toplevel: string): void | Promise<void>;
   scheduler: Scheduler;
   launcher: TaskLauncher;
   routes: RouteResolver;
-  verifier: SlotVerifier;
+  verifier: PlanTaskVerifier;
   git: GitRunner;
   hosts: HostSessions;
   clock: Clock;
@@ -682,6 +693,7 @@ function needsOf(routeLine: string): string[] {
 }
 
 export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
+  const slotsFor = d.slotsFor ?? (() => d.slots);
   const plans = new Map<PlanId, PlanRt>();
   const mutex = new KeyedMutex();
   const pending = new Set<Promise<unknown>>();
@@ -689,6 +701,10 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   /** Fallback step counter per session (QA-3.1-8: `e.stepKey` wins); bounded, and dropped when the session ends. */
   const stepState = new Map<string, { k: number; open: boolean }>();
   let disposed = false;
+  const collected = new Set<PlanId>();
+  const forgotten = new Set<string>();
+  const collecting = new Set<PlanId>();
+  const collectionTimers = new Map<PlanId, { readonly id: number }>();
   /** The process-level activation reservation (QA-3.1-18): the plan whose activation is under way, and its holds. */
   let activating: { planId: PlanId; holds: number } | null = null;
   /** Unsubscribes `onHostEvent` from `hosts.onEvent` (subscribed in `start`, QA-3.1-1). */
@@ -747,7 +763,54 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       applied = ev.length > 0;
       return ev;
     });
+    if (applied) await forgetClosed(p);
     return applied;
+  }
+
+  async function forgetAttempt(p: PlanRt, taskId: TaskId, n: number): Promise<void> {
+    const key = `${p.planId}/${taskId}#${n}`;
+    if (forgotten.has(key)) return;
+    try { await d.verifier.forget?.(p.planId, taskId, n); }
+    catch (e) { d.log("warn", "verifier forget failed", errorText(e)); }
+    forgotten.add(key);
+  }
+
+  async function forgetClosed(p: PlanRt): Promise<void> {
+    if (d.verifier.forget === undefined) return;
+    for (const task of Object.values(p.writer.ledger.tasks)) {
+      const a = task.attempts[task.attempts.length - 1];
+      if (a !== undefined && a.outcome !== null && a.verdict === null && task.state !== "completed" && task.state !== "verifying") {
+        await forgetAttempt(p, task.id, a.n);
+      }
+    }
+  }
+
+  function quiescent(p: PlanRt): boolean {
+    return p.inFlight.size === 0 && ![...p.handles.values()].some((h) => !h.settled)
+      && p.writer.openIntegration().length === 0
+      && p.writer.ledger.phases.every((ph) => ph.gate !== "passed" || ph.tag !== null);
+  }
+
+  /** Finished status is not sufficient: the queue must have closed its entries and phase tags. */
+  async function collectFinished(p: PlanRt): Promise<void> {
+    const status = p.writer.ledger.status;
+    if (disposed || p.disposed || foreignPlans.has(p.planId) || collected.has(p.planId) || collecting.has(p.planId)
+      || (status !== "completed" && status !== "aborted")) return;
+    if (!quiescent(p)) {
+      if (!collectionTimers.has(p.planId)) {
+        const timer = d.clock.setTimer(100, () => {
+          collectionTimers.delete(p.planId);
+          bg("finished slot collection", () => collectFinished(p));
+        });
+        collectionTimers.set(p.planId, timer);
+      }
+      return;
+    }
+    collecting.add(p.planId);
+    try {
+      await slotsFor(p.planId).gc(async (id) => id === p.planId);
+      collected.add(p.planId);
+    } finally { collecting.delete(p.planId); }
   }
 
   function arm(p: PlanRt, ms: number): void {
@@ -781,7 +844,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     p.slotLeases.delete(taskId);
     if (s !== null) {
       try {
-        await d.slots.release(s);
+        await slotsFor(p.planId).release(s);
       } catch (e) {
         d.log("warn", "slot release failed", errorText(e));
       }
@@ -816,7 +879,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       // would hide a record that vanished since). A lookup error is retried next tick.
       let tree: string | null;
       try {
-        tree = (await d.slots.get(t.slot))?.path ?? null;
+        tree = (await slotsFor(p.planId).get(t.slot))?.path ?? null;
       } catch (e) {
         d.log("warn", `slot lookup of held ${id} failed; retried next tick`, errorText(e));
         continue;
@@ -884,7 +947,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     const cached = p.slotLeases.get(t.id);
     if (cached !== undefined) return cached;
     if (t.slot === null) throw new ExecutorError("E_PLAN_STATE", "task holds no slot", t.id);
-    const rec = await d.slots.get(t.slot);
+    const rec = await slotsFor(p.planId).get(t.slot);
     if (rec === null) throw new ExecutorError("E_SLOT_BROKEN", "slot record missing", t.slot);
     const lease: SlotLease = {
       slot: rec.slot,
@@ -993,7 +1056,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     p.slotLeases.delete(taskId);
     if (await slotHeldBy(p, taskId, slotName)) {
       try {
-        await d.slots.release(slotName);
+        await slotsFor(p.planId).release(slotName);
       } catch (e) {
         d.log("warn", "slot release failed", errorText(e));
       }
@@ -1003,7 +1066,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   /** Whether the pool still leases `slotName` to `taskId` (a policy that already returned it leaves nothing to do). */
   async function slotHeldBy(p: PlanRt, taskId: TaskId, slotName: string): Promise<boolean> {
     try {
-      const rec = await d.slots.get(slotName);
+      const rec = await slotsFor(p.planId).get(slotName);
       return rec !== null && rec.owner === leaseHolderID(p.planId, taskId) && rec.state === "leased";
     } catch {
       return true;
@@ -1127,6 +1190,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         } while (p.again && !p.disposed);
       } finally {
         p.ticking = false;
+        await collectFinished(p);
       }
     });
   }
@@ -1277,9 +1341,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       };
       // 2. slot
       try {
-        slot = await d.slots.acquire(p.planId, leaseHolderID(p.planId, taskId), l.integration.head);
+        slot = await slotsFor(p.planId).acquire(p.planId, leaseHolderID(p.planId, taskId), l.integration.head);
         p.slotLeases.set(taskId, slot);
-        await d.slots.reset(slot.slot, l.integration.head);
+        await slotsFor(p.planId).reset(slot.slot, l.integration.head);
       } catch (e) {
         const unavailable = errorCode(e) === "E_SLOT_UNAVAILABLE";
         counter(p, "launch-skipped", { reason: unavailable ? "slot-unavailable" : "provision" });
@@ -1385,6 +1449,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       };
       let handle: LaunchHandle;
       try {
+        forgotten.delete(`${p.planId}/${taskId}#${n}`);
+        await d.verifier.begin?.(own(p.writer.ledger, taskId) ?? t1, slot, attemptOf(p.writer.ledger, taskId, n));
         handle = d.launcher.launch(req, launchHooks(p, taskId, n, route));
       } catch (e) {
         const code = errorCode(e);
@@ -1727,6 +1793,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         const closed = still === null || openAttempt(still, n) === null;
         // QA-4.2-23: the binding of an adopted child goes with its attempt.
         if (closed) evictRebound(p, taskId, n);
+        if (closed) await forgetClosed(p);
         if (end.childSessionID !== null && closed) {
           p.capacityStopped.delete(end.childSessionID);
           forgetSession(end.childSessionID);
@@ -1984,6 +2051,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       lease = await slotLeaseOf(p, t);
       // D11: the attempt's trailer makes the commit idempotent across a crash between the commit and row 21.
       const att = t.attempts.find((x) => x.n === n);
+      if (att !== undefined) await d.verifier.observe?.(t, lease, att);
       r = await commitTaskInSlot(d.git, {
         slot: lease,
         branch,
@@ -2026,10 +2094,12 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     let findings: string;
     let ref: string | null;
     try {
-      await d.slots.cleanForChecks(lease.slot);
       const cur = own(p.writer.ledger, taskId);
       const att = cur === null ? undefined : cur.attempts.find((x) => x.n === n);
       if (cur === null || att === undefined) return;
+      forgotten.delete(`${p.planId}/${taskId}#${n}`);
+      await d.verifier.observe?.(cur, lease, att);
+      await slotsFor(p.planId).cleanForChecks(lease.slot);
       const v = await d.verifier.verify(cur, lease, att);
       verdict = v.verdict;
       findings = v.findings;
@@ -2103,7 +2173,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
             const t = own(p.writer.ledger, id);
             if (t !== null && t.slot !== null) {
               try {
-                await d.slots.reset(t.slot, p.writer.ledger.integration.head);
+                await slotsFor(p.planId).reset(t.slot, p.writer.ledger.integration.head);
               } catch (e) {
                 d.log("warn", "slot reset after conflict failed", errorText(e));
               }
@@ -2811,7 +2881,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     p.slotLeases.delete(taskId);
     if (slotName !== null && (await slotHeldBy(p, taskId, slotName))) {
       try {
-        await d.slots.release(slotName);
+        await slotsFor(p.planId).release(slotName);
       } catch (e) {
         d.log("warn", "slot release failed", errorText(e));
       }
@@ -2843,7 +2913,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     p.slotLeases.delete(taskId);
     if (stale !== null && (await slotHeldBy(p, taskId, stale))) {
       try {
-        await d.slots.release(stale);
+        await slotsFor(p.planId).release(stale);
       } catch (e) {
         d.log("warn", "slot release failed", errorText(e));
       }
@@ -2855,7 +2925,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       p.slotLeases.delete(taskId);
       if (s !== null) {
         try {
-          await d.slots.release(s.slot);
+          await slotsFor(p.planId).release(s.slot);
         } catch (e2) {
           d.log("warn", "slot release failed", errorText(e2));
         }
@@ -2863,9 +2933,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       return false;
     };
     try {
-      slot = await d.slots.acquire(p.planId, leaseHolderID(p.planId, taskId), tip);
+      slot = await slotsFor(p.planId).acquire(p.planId, leaseHolderID(p.planId, taskId), tip);
       p.slotLeases.set(taskId, slot);
-      await d.slots.reset(slot.slot, tip);
+      await slotsFor(p.planId).reset(slot.slot, tip);
       // Detached at the tip: the branch may still be checked out in the stale worktree, and the ref itself stays put.
       const r = await d.git.run(["switch", "--detach", tip], { cwd: slot.path, timeoutMs: GIT_TIMEOUT_MS });
       if (r.code !== 0) return await undo("checkout failed", r.stderr.slice(0, 2000));
@@ -3235,7 +3305,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       let tree: string | null = null;
       if (t.slot !== null) {
         try {
-          tree = (await d.slots.get(t.slot))?.path ?? null;
+          tree = (await slotsFor(p.planId).get(t.slot))?.path ?? null;
         } catch (e) {
           d.log("warn", "slot lookup failed", errorText(e));
         }
@@ -3353,6 +3423,10 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   }
 
   async function mine(planId: PlanId, sessionID: string): Promise<PlanRt> {
+    const ledger = plans.get(planId)?.writer.ledger ?? await d.store.read(planId);
+    if (ledger.orchestrator.sessionID !== sessionID) {
+      throw new ExecutorError("E_NOT_OWNER", `plan ${planId} belongs to another session`, ledger.orchestrator.sessionID);
+    }
     return owned(await planFor(planId, sessionID), sessionID);
   }
 
@@ -3617,6 +3691,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       try {
         const l = p.writer.ledger;
         const config: ExecutorConfig = { ...l.config, slotsDir: l.config.slotsDir ?? defaultSlotsDir(l.repo.toplevel, planId) };
+        await d.checkSlotsDir?.(config.slotsDir ?? defaultSlotsDir(l.repo.toplevel, planId), l.repo.toplevel);
         await p.writer.append([
           { type: "plan-approved", config, by: sessionID },
           { type: "status-changed", from: "awaiting-approval", to: "running", reason: "approved" },
@@ -3802,6 +3877,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         if (slotName !== null) await releaseResources(p, id, slotName);
         else p.leases.releaseTask(id);
       }
+      await forgetClosed(p);
+      await collectFinished(p);
     },
 
     async land(planId, sessionID) {
@@ -3900,7 +3977,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     async gc() {
       return d.slots.gc(async (planId) => {
         const known = plans.get(planId);
-        if (known !== undefined) return known.writer.ledger.status === "completed" || known.writer.ledger.status === "aborted";
+        if (known !== undefined) return (known.writer.ledger.status === "completed" || known.writer.ledger.status === "aborted") && quiescent(known);
         try {
           const l = await d.store.read(planId);
           return l.status === "completed" || l.status === "aborted";
@@ -3921,7 +3998,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       requireStatus(p, ["completed", "aborted"]);
       const toplevel = p.writer.ledger.repo.toplevel;
       await closePlan(p);
-      await d.slots.gc(async (id) => (id === planId ? true : null));
+      await slotsFor(planId).gc(async (id) => (id === planId ? true : null));
       for (const ns of ["heads", "tags"]) {
         const prefix = `refs/${ns}/omr/${planId}/`;
         const r = await d.git.run(["for-each-ref", "--format=%(refname)", prefix], { cwd: toplevel, timeoutMs: GIT_TIMEOUT_MS });
@@ -4028,6 +4105,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
     async dispose() {
       disposed = true;
+      for (const timer of collectionTimers.values()) d.clock.clearTimer(timer);
+      collectionTimers.clear();
       // QA-4.2-4: no waiter of a same-process adopt's window outlives the runtime (dispose waits for their work below).
       for (const planId of [...reattachOpeners.keys()]) openReattach(planId);
       const off = offEvents;
@@ -4048,6 +4127,14 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         p.backoff = null;
         // R1a: the probation poll timer was one of `p.timers`; no poll re-arms after dispose.
         p.probationTimer = null;
+      }
+      // Detach every plan from host feeds synchronously, before any optional verifier hook can yield.
+      if (d.verifier.forget !== undefined) {
+        for (const p of plans.values()) {
+          for (const task of Object.values(p.writer.ledger.tasks)) {
+            for (const attempt of task.attempts) await forgetAttempt(p, task.id, attempt.n);
+          }
+        }
       }
       // A live child's completion settles only when the child ends, so dispose never waits for it: the launcher aborts every
       // owned child first (journals nothing; recovery closes those attempts as lost), then only the work already running is

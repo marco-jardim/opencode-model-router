@@ -79,10 +79,11 @@ import type {
   RestoredDispatch, RestoredHold, RestoredHolds,
 } from "./background";
 import { PENDING_JOURNAL_VANISHED, pendingRecordIdentity } from "../verify/pending";
-import type { ExecutorRuntimeHandle, LeaseRegistryPort } from "../executor/runtime";
+import type { ExecutorRuntimeHandle, LeaseRegistryPort, PlanTaskVerifier } from "../executor/runtime";
+import type { LeaseRegistry } from "../router/leases";
 import type {
   ChildEnd, ChildRunner, DispatchBookkeeping, HostError, HostSessionContext, HostSessionEvent, HostSessions, IsoTime, LaunchRequest, MetricPayload, PlanId, RouteResolver,
-  SlotVerifier, TaskLauncher,
+  TaskLauncher,
 } from "../executor/types";
 import type { PlanRoleBindings } from "../executor/launch";
 import { LAUNCH_HEADER_PATTERN, parseLaunchHeader, type LaunchHeaderFields } from "../executor/types";
@@ -1118,7 +1119,10 @@ export interface V2ExecutorHost {
   /** Decision row, dispatch start and the background in-flight registry; rows tagged `source: "executor"`. */
   bookkeeping: DispatchBookkeeping;
   /** The verification engine as a slot verifier; null when this host has none. */
-  verifier: SlotVerifier | null;
+  verifier: PlanTaskVerifier | null;
+  /** The adapter's shared registry, including its release notification. */
+  leases: { registry: LeaseRegistry; notifyReleased(): void } | null;
+  durations: DurationModel | null;
   /** The Phase 1.3 lease registry; null when this host has none. */
   leaseRegistry: LeaseRegistryPort | null;
   /** The child runner the launcher drives (v2-client); null when the runtime passed to v2-hooks has none. */
@@ -1188,7 +1192,7 @@ export async function registerV2Hooks(
     /** W1: the Phase 1.3 lease registry the executor's leases go through; absent: the executor gets none. */
     leaseRegistry?: LeaseRegistryPort;
     /** W1: the verification engine as a slot verifier; absent: the executor gets none. */
-    slotVerifier?: SlotVerifier;
+    slotVerifier?: PlanTaskVerifier;
   } = {},
 ): Promise<() => Promise<void>> {
   // The old plugin surface uses separate mutable input/output bags. Keep those
@@ -3943,6 +3947,8 @@ export async function registerV2Hooks(
         },
         bookkeeping,
         verifier: options.slotVerifier ?? null,
+        leases: leaseHandle === undefined ? null : { registry: leaseHandle.registry, notifyReleased: () => leaseHandle?.notifyReleased() },
+        durations: durations ?? null,
         leaseRegistry: options.leaseRegistry ?? null,
         runner: childRunner,
         pinOrchestrator: (sessionID) => childRunner.pin(sessionID),
