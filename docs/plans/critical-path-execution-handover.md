@@ -510,6 +510,17 @@ implementations, so the plan now runs on its own data/state dirs (owner decision
   first `resume()`; build a reverted culprit's retry branch from its reverted range (QA-3.2-10). Fixes in flight: C1
   queue `ses_ecd624e77ffeoIQZtM9EeozNfu` [heavy], C2 checks+suite `ses_ecd6212cbffeigzx9yS7CISdyq` [heavy], C3 land +
   real-git `ses_ecd61e810ffewwphrgzcYbShcL`.
+- **Progress (23:15):** p31 QA-3.1 round-1 fixes `badd716` (904/904 green, tsc clean). **QA-3.1 round 2**
+  (`ses_ecd5a78a8ffeVCMcfhfa7u7WUg`, at `badd716`): not accepted — 2 major: QA-3.1-16 M41 never fires on the real
+  host (the v2 host prefixes each child's first message with "You are a subagent spawned by another session."; the
+  round-1 prefix anchor missed it — security regression), QA-3.1-17 pre-confirmation streak counts parallel losses
+  of one capture; minors -18..-23, nits -24..-28. Round-2 fixes (rule: all findings of rounds 1-2) in flight: runtime
+  `ses_ecd3ebf00ffeIuhVk0hX5Trar5` [heavy], adapter+expand+memo+CHANGELOG `ses_ecd3e7f2bffe3LvLNi2QFfPie8` [heavy].
+  p32: C1 queue, C2 checks/suite, C3 land/real-git all returned (uncommitted, tsc clean). Bisect unit file 150/162:
+  the 12 failures are land unit tests stale after C3's land.ts changes (realigning: `ses_ecd6212cbffeigzx9yS7CISdyq`).
+  Queue unit file timed out the orchestrator's 20-min shell run (C1's new lock tests suspected: two-poll takeover /
+  link-based create) — rerun in the background with `--testTimeout=60000 --reporter=verbose` to locate it. Still owed
+  by C1's owner (queue.ts): `abort("dispose")` in `dispose()`, `"base-unparsed"` in the unattributed reason union.
 
 *(superseded)* **NEXT ACTION (2026-10-12 ≈16:30): DF-1.1 re-switch — waiting for the owner restart; then the DF-1.1 self-check and
 re-probes (DF1.4.a with `df1.1`, c runner criterion, d, e), then Wave 3.** `cpx/pdf1-1` merged into `cpx/main` as
