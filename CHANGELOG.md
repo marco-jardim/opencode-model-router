@@ -87,7 +87,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact. With `routing.repoParents`
   set, role dispatches are now deferred by default where they used to be synchronous; a "continue and finish" resume of
   a deferred attempt cannot back a `deterministic` detection (see `docs/ROLES.md`).
-- README: 90-second demo video below the title.
 - **Cross-repo work in roles mode (OpenCode v2; inert on v1) (#107).** New global-only keys `routing.repoParents`,
   `routing.repoDepth` (1–4, default 2) and `routing.repoExclude` name the directories whose repositories role
   dispatches may work in; registration adds `<parent>/*` `external_directory` allow patterns, so new clones need no
@@ -140,11 +139,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact resume whose route line names a different target than the child's bound root is refused too (`this child is
   bound to <work root>; a resume cannot change its work root: dispatch a new child`). A dispatch that declares nothing,
   a delegate's dispatch and a resume that declares nothing or the bound target are unchanged.
-
-### Removed
-
-- **Breaking (requirement): Node.js 20 is no longer supported.** Node.js 20 reached end-of-life in April 2026; the
-  minimum is now Node.js 22 (`engines.node` is `>=22`, and the CI matrix runs Node 22 and 24).
 
 ### Fixed
 
@@ -229,6 +223,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **These verification fixes also change verdicts on OpenCode v1.** v1 shares the verification engine, and the v1
   freeze allows integrity fixes; the changes only make verdicts stricter (a pass can become `unverifiable`, never the
   reverse).
+
+## [2.7.0] - 2026-10-10
+
+### Added
+
+- README: 90-second demo video below the title.
+
+### Removed
+
+- **Breaking (requirement): Node.js 20 is no longer supported.** Node.js 20 reached end-of-life in April 2026; the
+  minimum is now Node.js 22 (`engines.node` is `>=22`, and the CI matrix runs Node 22 and 24).
+
+### Fixed
+
+- A file edited by another writer during verification (for example LF lines appended to a CRLF file) could be
+  misreported as a checkout line-ending conversion, which made the reference approximate and turned a provable
+  rejection into an unverifiable result. The drift diff is now re-taken, limited to those paths, before they are
+  flagged. A re-diffed path gets the dependency and workspace-link drift checks and is then judged like any file
+  edited after dispatch: it is flagged only when the reference's checkout converted it (still the case under
+  `* text=auto` with native CRLF), and a failed re-diff keeps the flag (#88).
 
 ## [2.6.1] - 2026-10-09
 
