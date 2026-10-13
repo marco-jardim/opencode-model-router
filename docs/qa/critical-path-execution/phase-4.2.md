@@ -382,3 +382,97 @@ approve path to 5.1.
   toplevel).
 - The breaker trips easily (2 failures in 5): the plan's choice, documented.
 - Order: 4.2.2 ∥ 4.2.3 ∥ 4.2.4 → 4.2.5 → 4.2.6 → QA.
+
+## Findings
+
+| Round | Reviewer | Commit | Findings | Status |
+|---|---|---|---|---|
+| 1 | `ses_ecc765d40ffe0lJJ0ISC0Mbh2h` | `55f6ab2` | 8 major (QA-4.2-1 v2 host preamble makes every child `mismatch`; -2 no real end state; -3 queue never disposed; -4 ends lost during a same-process adopt; -5 unrelated answer resumes a park; -6 rejected `resume()` silently disables integration; -7 adopt of an awaiting-approval plan; -8 post-child systemic failures invisible to the breaker), 10 minor (-9..-18), 3 nits | fixed in `d468a6f` |
+| 2 | `ses_ecc3eb284ffelBWobgS3Eu9eL3` | `d468a6f` | 3 major (-19 `isCommitFailure` state-dependent, `maxAttempts=1` never trips; -20 R2 re-provisions an earlier attempt's commit; -21 foreignness by absence from `recover()`), 5 minor (-22..-26), 3 nits (-27..-29); `runtime.ts` 84.27 branches | fixed in `4dd943d`; -21 partial (→ -30) |
+| 3 (bounded, §0.7) | `ses_ecc19be2affe4S8VCo2sgAY2n2` | `4dd943d` | -19, -20 fixed; -21 partial; 1 major (QA-4.2-30 an omitted `RuntimeDeps.toplevel` made foreign plans active, regression from `d468a6f`); 8 minor (-31..-38) | -30 fixed in `48db549`; coverage `fbb18a3`; minors deferred |
+| 3 re-check | `ses_ecc19be2affe4S8VCo2sgAY2n2` | `fbb18a3` | -30 closed; new tests and skip lists hold; no blocking/critical/major; 5 minor (-39..-43) | minors deferred |
+
+## Fixes
+
+- Round 1 `d468a6f`: v2 host preamble stripped before the R1 header match (-1); `finished` only on an adapter-reported
+  end, memo R1 rule 5 (-2); queue disposed on close (-3); re-attach barrier for a same-process adopt (-4); park-item
+  answers (-5); a rejected `queue.resume()` pauses the plan with one critical item (-6); **A-4.2-1** no adopt before
+  approval (-7); **A-4.2-2** commit failures feed the breaker (-8); default fix tasks run as `implementer` (-11);
+  case/prefix-folded fix groups (-12); slot lost before commit fails and retries (-13); `breaker-fed` markers at
+  activation (-14); the probation interrupt's own end is `lost "restart"` (-15); lease-held tasks (-16); passive foreign
+  plans (-17); adopted children re-bound (-18); **X11** strict breaker ratio; gate-aware `unblock` (`edgeSatisfied`).
+- Round 2 `4dd943d`: commit failures counted in any later state (-19); attempt trailer checked before R2 re-provisions
+  (-20); foreignness by the plan's toplevel (-21); `breaker-fed` markers for commit and qa-unparsable failures (-22);
+  required `bindings` with eviction (-23); a real end racing the probation interrupt is processed (-24); a failed adopt
+  re-attaches (-25); a held task leaves the hold on a vanished slot and its item names the hold (-26); one shared
+  child-end rule, `childHistoryEnd` (-27); an `idle` without an outcome is no end (-28); one history export per
+  attachment (-29).
+- Round 3 `48db549`: `RuntimeDeps.toplevel` required (-30); held-slot, eviction and re-attach tests.
+- Round 3 `fbb18a3`: `runtime.ts` coverage tests, no source change.
+
+## Coverage
+
+Orchestrator runs on 2026-10-13 at `fbb18a3`: executor/plan set (45 files) 3038 passed / 3 skipped; the 4 runtime test
+files green 3 runs in a row; `tsc --noEmit` clean. Branches/lines: `runtime.ts` 93.17/97.49 (85.95 branches at
+`4dd943d`), `qa-loop.ts` 93.26/99.13, `recovery.ts` 92.43/98.77, `unattended.ts` 93.44/100; per-file gate for
+`src\executor\**` 90. Accepted defensive arms are listed at the end of `test\unit\executor-runtime-coverage-a.test.ts`
+and `-b.test.ts` (A-4.2-3).
+
+- Deviations: the 4.2.3/4.2.4 implementers ran the full `test` script through `router_run`, against plan §0; the 3.2
+  heartbeat test `createRepoLockFactory` "a re-armed heartbeat keeps beating on every period"
+  (`test\unit\executor-integrate-queue.test.ts`) failed once under 12 workers with coverage and passed at 8 (observed,
+  not a 4.2 change).
+
+## Deferred findings
+
+- QA-4.2-31 (r3 minor): a held task whose slot record vanished while its leases are held elsewhere loses the hold and
+  gets a misleading "restore the task branch" item; fails closed, stuck until a restart.
+- QA-4.2-32 (r3 minor): the trailer search uses `log --all` but re-provisions from the branch tip; restrict it to the
+  task branch (also bounds the history walk).
+- QA-4.2-33 (r3 minor): the takeover gate in `start` still uses `recoverable`; a same-repo plan with a stale lock is not
+  attached until adopt or restart.
+- QA-4.2-34 (r3 minor): the qa-unparsable park marker is not added to `p.fed`; one extra harmless evaluation.
+- QA-4.2-35 (r3 minor): `reattachAfterFailedAdopt` attaches without the foreign flag; consistency only.
+- QA-4.2-36 (r3 minor): `RecoveryDeps.toplevel` and `RuntimeDeps.toplevel` are two sources of truth; derive one from the
+  other (5.1 assembly).
+- QA-4.2-37 (r3 minor, pre-existing): compile and approve never check foreignness; a plan file in another repo runs here.
+- QA-4.2-38 (r3 minor): a cancelled commit failure drops out of the breaker window.
+- QA-4.2-39 (re-check minor): `executor-runtime-coverage.test.ts` keeps a stale skip list (arms now covered by `-a`) and
+  an unused `mk` harness.
+- QA-4.2-40 (re-check minor): `adoptChild` re-binds a child the attempt does not record before probation drops the
+  watch; guard on `a.childSessionID === child` and invert the `-b` assertion (the real engine cannot produce the feed).
+- QA-4.2-41 (re-check minor): some negative assertions follow a fixed `pause(20|50)` and can pass vacuously on a slow
+  runner; await `runtime.settled()` where no child is live.
+- QA-4.2-42 (re-check minor): `sameToplevel` uses plain `realpathSync`, so an 8.3 short-name toplevel would mark this
+  repository's plans foreign (fail-closed); use `realpathSync.native`.
+- QA-4.2-43 (re-check minor): skip lists cite raw line numbers; cite function names.
+
+## Handoffs
+
+- 5.1 registration: register `router_plan` (with the approve getter), `/plan`, help `plan:true` and the instructions
+  provider. Assemble via `realCollaborators` with the required `bindings` and `toplevel`, and derive
+  RecoveryDeps.toplevel from the same value (-36).
+- 5.1 approve path: `validateSlotsDir` at approve. Create `omr/<plan>/integration` and its slot before `resume()`.
+- 5.1 leases: `LeaseRegistryPort.holderOf` → `planHolderOf(<plan toplevel>, path)`.
+- 5.1 sessions: a real v2 `activity`. Adopt refuses a live bound session. Adopt and approve are root-only. Rebuild from
+  the ledger at start. Kick the queue on a user pause or unpause.
+- 5.1 revert: a reverted culprit retries on its old branch.
+- 5.1 docs: the EXECUTOR.md "Unattended operation" / "QA loop" / "Recovery" sections, updated for X11 (strict ratio
+  `F > ratio·N`, consecutive `C ≥ n`), A-4.2-1 and A-4.2-2.
+
+## Plan amendments
+
+- **A-4.2-1** (QA-4.2-7): adopt refuses `awaiting-residue` and `awaiting-approval` plans.
+- **A-4.2-2** (QA-4.2-8, -19): commit failures, and "no changes" with declared writes, are breaker failures
+  (`isCommitFailure`).
+- **X11** (round 1, strict breaker ratio): the ratio rule is strict, `F > ratio·N`; consecutive stays `C ≥ n` (amends
+  memo B2).
+- **R1 rule 5** (QA-4.2-2): "finished" counts only from an adapter-reported end.
+- **A-4.2-3** (round 3, `fbb18a3`): uncovered defensive arms in `runtime.ts` are accepted, as listed at the end of
+  `test\unit\executor-runtime-coverage-a.test.ts` and `-b.test.ts`; the per-file gate is met regardless.
+
+## Verdict
+
+Done at `fbb18a3`: three heavy QA rounds plus a bounded round-3 re-check, every blocking/critical/major finding fixed,
+minors dispositioned. Merged into `cpx/main`.
+
