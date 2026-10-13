@@ -1804,6 +1804,8 @@ export async function materialize(
     }
 
     // 5. Discovery of ignored entries; nothing ignored is ever copied.
+    //    A directory-only pattern (`node_modules/`) never matches a symlink, so a symlinked node_modules
+    //    it does not ignore is an untracked entry (inexact via its untracked reason), never a link candidate.
     const ignored = await git(["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"]);
     if (budget.spent()) return await abandon("aborted", "aborted during ignored-file discovery");
     if (!ignored || ignored.code !== 0) return await abandon("error", ignored?.stderr.trim() ?? "ignored-file discovery failed");

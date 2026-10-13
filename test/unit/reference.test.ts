@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFile, spawn, spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import * as fsp from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
@@ -21,6 +22,20 @@ import type { LinkPin } from "../../src/verify/pin";
 
 const isWin = process.platform === "win32";
 const linkType = isWin ? "junction" : "dir";
+/** A real directory symlink (not a junction) needs Developer Mode or SeCreateSymbolicLinkPrivilege on win32 (else EPERM). */
+const dirSymlinksAllowed = ((): boolean => {
+  if (!isWin) return true;
+  const probe = mkdtempSync(join(tmpdir(), "omr-dir-symlink-probe-"));
+  try {
+    mkdirSync(join(probe, "target"));
+    symlinkSync(join(probe, "target"), join(probe, "link"), "dir");
+    return true;
+  } catch {
+    return false;
+  } finally {
+    rmSync(probe, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  }
+})();
 
 type SeamOptions = Parameters<CaptureDeps["argv"]>[2];
 
@@ -940,11 +955,38 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
       await fsp.mkdir(outsideModules, { recursive: true });
       await fsp.mkdir(outsideLib);
       await fsp.symlink(outsideLib, join(outsideModules, "z"), linkType);
+      // `node_modules/` (the fixture's) matches a directory only: a Linux dir symlink is not one, a win32 junction is.
+      // Without the slash the pattern ignores the link on every platform (see the dir-symlink test below).
+      await fsp.writeFile(join(repo, ".gitignore"), "node_modules\n.env\n");
+      await git(repo, "commit", "-q", "-am", "ignore node_modules links too");
       await fsp.rm(join(repo, "node_modules"), { recursive: true, force: true });
       await fsp.symlink(outsideModules, join(repo, "node_modules"), linkType);
       const { reasons } = await reasonsOf("external-link");
       expect(reasons).toEqual([{ cause: "external-link", path: "node_modules/z" }]);
     });
+
+    it.skipIf(!dirSymlinksAllowed)(
+      "C4: a dir-symlinked node_modules under a directory-only `node_modules/` pattern is untracked, not linked -> no external-link",
+      async () => {
+        const outsideModules = join(base, "main checkout", "node_modules");
+        const outsideLib = join(base, "outside lib-z");
+        await fsp.mkdir(outsideModules, { recursive: true });
+        await fsp.mkdir(outsideLib);
+        await fsp.symlink(outsideLib, join(outsideModules, "z"), linkType);
+        await fsp.rm(join(repo, "node_modules"), { recursive: true, force: true });
+        // A real directory symlink (not a junction) on every platform; git's `node_modules/` never matches it.
+        await fsp.symlink(outsideModules, join(repo, "node_modules"), "dir");
+        expect(await git(repo, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory")).not.toMatch(/^node_modules\/?$/m);
+        const handle = await mat(await capture());
+        try {
+          expect(handle.inexactReasons).toEqual([{ cause: "untracked-symlink", path: "node_modules" }]);
+          expect(handle.exact).toBe(false);
+          expect(handle.links).toEqual([join(handle.dir, "packages", "a", "node_modules")]);
+        } finally {
+          await handle.dispose();
+        }
+      },
+    );
 
     it("C5: store-like target directly under node_modules stays exact", async () => {
       const store = join(base, "store", "node_modules", "pkg");
