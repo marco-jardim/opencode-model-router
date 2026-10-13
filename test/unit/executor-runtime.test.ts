@@ -906,6 +906,10 @@ async function mk(draft: LedgerV1): Promise<Harness> {
       logs.push(`${level}: ${msg}${detail === undefined ? "" : ` ${JSON.stringify(detail)}`}`);
     },
     config: () => draft.config,
+    // QA-4.2-23: the binding port is required; this harness never adopts through recovery, so it only records.
+    bindings: { bind: () => undefined, evict: () => undefined },
+    // QA-4.2 NEW-1: the process toplevel is required; every plan of this harness is of this repository.
+    toplevel: REPO,
   };
   let closed = false;
   const h: Harness = {
@@ -1784,7 +1788,12 @@ describe("restart: lease rebuild, slot lookup and capacity restore", () => {
     await until(() => h.parts().policy.raised.length === 1, "lease rebuild item");
     const raised = need(h.parts().policy.raised[0], "raised item");
     expect(raised).toMatchObject({ kind: "failure", severity: "blocking", taskId: "T1" });
-    expect(raised.text).toBe("could not re-take the leases of T1 after restart; held by ses-foreign");
+    // QA-4.2-26: the item also says the task is held and what ends the hold.
+    expect(raised.text).toBe(
+      "could not re-take the leases of T1 after restart; held by ses-foreign. " +
+        "T1 is held (no adopt, commit, verify or enqueue) until its leases are free: finish or abort the holder " +
+        "(or abort T1); it resumes on its own once the leases are released",
+    );
     await until(async () => (await h.counters()).some((c) => c.key === "lease-rebuild-failed" && c.labels.taskId === "T1"), "lease-rebuild-failed counter");
   });
 

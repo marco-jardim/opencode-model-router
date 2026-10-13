@@ -772,3 +772,60 @@ describe("a restored hold whose recovery is skipped (QA-2.1-29)", () => {
     expect(posts[0]?.text).toContain("lost in restart");
   });
 });
+
+describe("a restored executor child's end event has no compat-side effect (phase 4.2 memo section 10)", () => {
+  // Executor-owned attempts are never journaled by the compat layer (adapterRecords skips them), so after a restart the
+  // compat layer knows nothing of an executor child: its end event must not create a record, post to the parent or wake it.
+  const EXEC_CHILD = "exec-child-1";
+  const journalText = (h: BgHost): string => {
+    try {
+      return readFileSync(h.journalPath, "utf8");
+    } catch {
+      return "";
+    }
+  };
+  const parentTail = async (h: BgHost): Promise<string> => {
+    const event = {
+      sessionID: ORCH, agent: "build", model: { providerID: "anthropic", id: "claude-sonnet-5-5" }, options: {},
+      system: [{ type: "text", text: "Host instructions" }], messages: [{ id: "m-user", role: "user", content: [{ type: "text", text: "next" }] }], tools: {},
+    };
+    await h.context(event);
+    return JSON.stringify(event.messages);
+  };
+
+  it("after a restart, session.execution.succeeded of a child nobody journaled leaves the journal, the parent and the wakes untouched", async () => {
+    const handle = `vrf_${"7".repeat(24)}`;
+    // The previous process left one unrelated held result of ORCH: the control that proves this host shows a post when there is one.
+    const h = await boot([
+      { v: 1, kind: "hold", handle, parent: ORCH, child: CHILD, callID: "call-exec-control", dispatch: { prompt: "write src/x.ts" }, at: Date.now() },
+      { v: 1, kind: "hold-text", handle, text: "I wrote src/x.ts", status: "succeeded", at: Date.now() },
+    ], { [EXEC_CHILD]: { parentID: ORCH } });
+    await parentTail(h); // teaches the adapter that ORCH is a root
+    adoptOrchestrator(h);
+    await h.settled();
+    expect(verdictPosts(h)).toHaveLength(1); // the control: the restored hold was settled once
+    await parentTail(h); // drains whatever the adoption queued for the parent's next request
+    const before = { synthetic: h.synthetic.length, steer: h.deliveries.steer, wake: h.deliveries.wake, journal: journalText(h) };
+
+    // The executor child is sighted after the restart, finishes, and its end event arrives.
+    h.emit({ type: "session.created", id: `ev-created-${EXEC_CHILD}`, created: 4, data: { sessionID: EXEC_CHILD, parentID: ORCH } });
+    await h.drain();
+    h.childContext.set(EXEC_CHILD, [{ role: "assistant", content: [{ type: "text", text: "DONE: executor attempt finished" }], finish: "stop", time: { created: 1, completed: 2 } }]);
+    h.emit({ type: "session.execution.succeeded", id: `ev-end-${EXEC_CHILD}-succeeded`, created: 5, data: { sessionID: EXEC_CHILD } });
+    await h.drain();
+    await h.settled();
+
+    // No record: nothing was journaled for the child (no inflight, hold, entry or processed), the journal is byte-identical.
+    expect(journalText(h)).toBe(before.journal);
+    expect(journalText(h)).not.toContain(EXEC_CHILD);
+    // No parent message: no result post, no synthetic entry, no completion notice in the parent's next request.
+    expect(h.synthetic).toHaveLength(before.synthetic);
+    expect(h.synthetic.some((s) => s.text.includes(EXEC_CHILD) || s.text.includes("executor attempt finished"))).toBe(false);
+    expect(verdictPosts(h)).toHaveLength(1);
+    const tail = await parentTail(h);
+    expect(tail).not.toContain(EXEC_CHILD);
+    expect(tail).not.toContain("Completed since your last turn");
+    // No wake: nothing was delivered to the parent as a steer or a wake.
+    expect(h.deliveries).toEqual({ steer: before.steer, wake: before.wake });
+  });
+});

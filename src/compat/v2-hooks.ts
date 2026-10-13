@@ -73,22 +73,17 @@ import type {
 import { PENDING_JOURNAL_VANISHED, pendingRecordIdentity } from "../verify/pending";
 import type { ExecutorRuntimeHandle, LeaseRegistryPort } from "../executor/runtime";
 import type {
-  ChildEnd, ChildRunner, DispatchBookkeeping, HostError, HostSessionEvent, HostSessions, IsoTime, LaunchRequest, MetricPayload, PlanId, RouteResolver,
+  ChildEnd, ChildRunner, DispatchBookkeeping, HostError, HostSessionContext, HostSessionEvent, HostSessions, IsoTime, LaunchRequest, MetricPayload, PlanId, RouteResolver,
   SlotVerifier, TaskLauncher,
 } from "../executor/types";
 import type { PlanRoleBindings } from "../executor/launch";
 import { LAUNCH_HEADER_PATTERN, parseLaunchHeader, type LaunchHeaderFields } from "../executor/types";
+import { withoutHostPreamble } from "../executor/host-preamble";
 import { grantFor } from "../routing/roles/policy";
 import { NEEDS, UNKNOWN_FACTS, type Need } from "../routing/classify/types";
 
 /** §7 grammar (`formatLaunchPrompt`): every launcher prompt starts with this line. */
 const PLAN_CONTEXT_PREFIX = "PLAN CONTEXT\n";
-/**
- * QA-3.1-16: the v2 host puts this exact line (ending in "\n", or "\r\n") before the first user message of every native-subagent
- * child (recorded in docs/qa/role-tier/evidence/roots-handoffs.json, ladder.json), so a launcher prompt reaches the child either
- * at offset 0 or right after this one line; no other leading text counts.
- */
-const HOST_SUBAGENT_PREAMBLE = "You are a subagent spawned by another session.";
 
 /**
  * The status of an executor launch's `runner` trigger. QA-3.1 nit 4: the child's observed end (`execution.*`) decides;
@@ -108,12 +103,75 @@ export function executorRunnerStatus(
   return registry === "succeeded" || registry === "failed" || registry === "interrupted" ? registry : "interrupted";
 }
 
-/** The text after the host's one preamble line when it starts with exactly that line, else the text unchanged (QA-3.1-16). */
-function withoutHostPreamble(text: string): string {
-  for (const eol of ["\n", "\r\n"]) {
-    if (text.startsWith(HOST_SUBAGENT_PREAMBLE + eol)) return text.slice(HOST_SUBAGENT_PREAMBLE.length + eol.length);
+/**
+ * QA-4.2-27: the kind of one entry of a child's host history, with the one precedence every reader of that history uses. The
+ * host's context entries are discriminated by `type` ("user" | "assistant" | "synthetic"); model-facing messages use `role`:
+ * `type: "synthetic"` first, then assistant (either field), then user (either field); anything else (a tool turn) is `other`.
+ */
+export function historyEntryKind(message: unknown): "synthetic" | "assistant" | "user" | "other" {
+  if (message === null || typeof message !== "object") return "other";
+  const m = message as Record<string, unknown>;
+  if (m.type === "synthetic") return "synthetic";
+  if (m.type === "assistant" || m.role === "assistant") return "assistant";
+  if (m.type === "user" || m.role === "user") return "user";
+  return "other";
+}
+
+/** QA-4.2-27: what a child's own history says about its end (`childHistoryEnd`). */
+export type ChildHistoryEnd =
+  /** No entry but synthetic ones. */
+  | { kind: "none" }
+  /** QA-DF1-21: a user or tool turn last, or a step without its end (cut mid-stream or mid-tool-call): it may still run. */
+  | { kind: "open" }
+  /** The newest step ended; `text` is its text, absent when the step has none. */
+  | { kind: "ended"; outcome: "succeeded" | "failed" | "interrupted"; text: string | undefined };
+
+/**
+ * QA-4.2-27: the ONE end rule over a child's own history (QA-2.1-6, QA-2.1-18, QA-DF1-21), shared by the background recovery
+ * (`childEndState`) and the executor's `HostSessions.context` (`executorHostContext`). Synthetic entries are skipped; the newest
+ * other entry decides. An assistant entry with an error failed (interrupted, for an abort, interrupt or cancel); one with a
+ * completion marker (`assistantStepCompleted`: a finish reason other than `tool-calls`, or a completed time, and no open tool
+ * part) succeeded, with or without text. Anything else is not an end.
+ */
+export function childHistoryEnd(history: unknown): ChildHistoryEnd {
+  const entries: readonly unknown[] = Array.isArray(history) ? history : [];
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const message = entries[index];
+    const kind = historyEntryKind(message);
+    if (kind === "synthetic") continue;
+    if (kind !== "assistant") return { kind: "open" };
+    const m = message as { error?: unknown; info?: { error?: unknown } };
+    const text = messageText(message);
+    const error = m.error ?? m.info?.error;
+    if (error !== undefined && error !== null && error !== false) {
+      const described = typeof error === "string" ? error : JSON.stringify(error) ?? "";
+      return { kind: "ended", outcome: /abort|interrupt|cancel/i.test(described) ? "interrupted" : "failed", text };
+    }
+    // QA-2.1-18: text alone is not an end: a child cut mid-step has partial text.
+    if (!assistantStepCompleted(message)) return { kind: "open" };
+    return { kind: "ended", outcome: "succeeded", text };
   }
-  return text;
+  return { kind: "none" };
+}
+
+/**
+ * QA-4.2-2: the executor's `HostSessions.context` over the host's history (amendment to memo R1 rule 5). User and assistant
+ * entries (`historyEntryKind`) keep their role and text; every other entry (synthetic, tool turns) is a non-terminal `assistant`
+ * entry without text, never `idle`. One explicit terminal entry `{ role: "idle", text: null, outcome }` is appended ONLY when
+ * the history shows the child ended (`childHistoryEnd`), with that end's real outcome. QA-4.2-27: a completed step without text
+ * is an end (succeeded), as the live launcher treats it; the runtime then reads an empty result.
+ */
+export function executorHostContext(history: unknown): HostSessionContext {
+  const entries: readonly unknown[] = Array.isArray(history) ? history : [];
+  const messages: HostSessionContext["messages"] = entries.map((m) => {
+    const kind = historyEntryKind(m);
+    if (kind === "user") return { role: "user" as const, text: messageText(m) ?? null, outcome: null };
+    if (kind === "assistant") return { role: "assistant" as const, text: messageText(m) ?? null, outcome: null };
+    return { role: "assistant" as const, text: null, outcome: null };
+  });
+  const end = childHistoryEnd(entries);
+  if (end.kind === "ended") messages.push({ role: "idle", text: null, outcome: end.outcome });
+  return { messages };
 }
 
 /** Translate the router's own v1 tool vocabulary at the v2 boundary. */
@@ -3416,24 +3474,15 @@ export async function registerV2Hooks(
      * which after a restart means lost.
      */
     const childEndState = async (child: string): Promise<ChildEndState> => {
-      const history = await ctx.session.context({ sessionID: child } as Parameters<typeof ctx.session.context>[0]);
-      const messages: readonly unknown[] = Array.isArray(history) ? history : [];
-      for (let index = messages.length - 1; index >= 0; index--) {
-        const message = messages[index] as { type?: unknown; role?: unknown; error?: unknown; info?: { error?: unknown } } | undefined;
-        if (message?.type === "synthetic") continue;
-        // QA-DF1-21: a user or tool turn last, or a step without its end, is an execution that has not ended (`incomplete`).
-        if (message?.type !== "assistant" && message?.role !== "assistant") return { outcome: "lost", incomplete: true };
-        const text = messageText(message);
-        const error = message.error ?? message.info?.error;
-        if (error !== undefined && error !== null && error !== false) {
-          const described = typeof error === "string" ? error : JSON.stringify(error) ?? "";
-          return { outcome: /abort|interrupt|cancel/i.test(described) ? "interrupted" : "failed", ...(text === undefined ? {} : { text }) };
-        }
-        // QA-2.1-18: text alone is not an end: a child cut mid-step has partial text. Without a completion marker it is lost.
-        if (!assistantStepCompleted(message)) return { outcome: "lost", incomplete: true };
-        return text === undefined ? { outcome: "lost" } : { outcome: "succeeded", text };
-      }
-      return { outcome: "lost" };
+      // QA-4.2-27: the shared end rule (`childHistoryEnd`, also the executor's `HostSessions.context`).
+      const end = childHistoryEnd(await ctx.session.context({ sessionID: child } as Parameters<typeof ctx.session.context>[0]));
+      if (end.kind === "none") return { outcome: "lost" };
+      // QA-DF1-21: a user or tool turn last, or a step without its end, is an execution that has not ended (`incomplete`).
+      if (end.kind === "open") return { outcome: "lost", incomplete: true };
+      // Background's own rule on top (QA-2.1-6, kept): a succeeded step without text is a result that never arrived, so the
+      // dispatch is lost and its parent is told to dispatch it again (the executor reads it as an empty result instead).
+      if (end.outcome === "succeeded" && end.text === undefined) return { outcome: "lost" };
+      return { outcome: end.outcome, ...(end.text === undefined ? {} : { text: end.text }) };
     };
     /** QA-2.1-6: one `resume: true` entry tells the parent that a background dispatch was lost in a restart. Never throws. */
     const wakeParentLost = async (attempt: Attempt): Promise<void> => {
@@ -3641,17 +3690,7 @@ export async function registerV2Hooks(
           if (session === null || session === undefined) return null;
           return { id: typeof session.id === "string" ? session.id : sessionID, parentID: typeof session.parentID === "string" && session.parentID !== "" ? session.parentID : null };
         },
-        context: async (sessionID) => {
-          const history: unknown = await ctx.session.context({ sessionID } as Parameters<typeof ctx.session.context>[0]);
-          const messages = Array.isArray(history) ? history : [];
-          return {
-            messages: messages.map((m: unknown) => {
-              const record = typeof m === "object" && m !== null ? m as Record<string, unknown> : {};
-              const kind = record.role ?? record.type;
-              return { role: kind === "assistant" ? "assistant" as const : kind === "user" ? "user" as const : "idle" as const, text: messageText(m) ?? null, outcome: null };
-            }),
-          };
-        },
+        context: async (sessionID) => executorHostContext(await ctx.session.context({ sessionID } as Parameters<typeof ctx.session.context>[0])),
         activity: async () => "unknown",
         interrupt: async (sessionID) => { await ctx.session.interrupt({ sessionID }); },
         synthetic: async (i) => {
