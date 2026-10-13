@@ -39,14 +39,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `UNVERIFIABLE`, and a restored held result settles in place. A journal that vanishes under a running process is
   rewritten from memory. OpenCode v1 ignores every `routing.background.*` and `routing.leases.*` key and logs one
   notice per process that names them.
-- **OpenCode v2: plan executor groundwork (not registered yet).** The `routing.executor.*` keys (`slotsDir`,
-  `integrationChecks`, `phaseSuite`, `provision` and `python` are trusted keys: only the global override sets them), the
-  `router_plan` tool and `/plan` command factories, and the executor instructions are in the code, with a user guide
-  ([docs/EXECUTOR.md](docs/EXECUTOR.md)). A later release registers them, so nothing is visible on a host yet, except
-  that `/router approve` already refuses a repository's executor home (`<git common dir>\omr-executor`, with its plan
-  and slot-marker directories) and any repository inside it; that check runs git within one 15 s bound in all, and
+- **OpenCode v2: plan executor registration.** `/router` lists `/plan`, and `router_plan` resolves the executor at call
+  time. State-changing and authority actions (`compile`, `residue`, `approve`, `adopt`, `abort`, `purge`, `land`,
+  `answer`, `pause`, `resume`, `add-tasks`, `done`, `gc`, and any other state-changing action) require a proven
+  depth-0 session with no parent, with no bound-plan-child exception; failed parent lookups refuse. Read-only
+  `status`, `ready`, `export` and `/plan inbox` allow roots or exactly bound plan children reading only their own
+  explicitly named plan, never another plan. The same rule guards the tool and command. An existing user-defined
+  `/plan` is preserved: v2 checks the host command registry, logs one conflict warning and keeps `router_plan` available;
+  v1 adds no `/plan` notice for that user command. Active plans add executor instructions to router state after the plan
+  section. Assembly requires a git repository, roles delegation, enforced leases and a plan-task verifier with
+  verification enabled; otherwise the tool and command report why the executor is unavailable. The keys, tool and
+  command have a user guide ([docs/EXECUTOR.md](docs/EXECUTOR.md)); `slotsDir`, `integrationChecks`, `phaseSuite`,
+  `provision` and `python` are trusted keys that only the global override sets. `/router approve` refuses a repository's
+  executor home (`<git common dir>\omr-executor`, with its plan and slot-marker directories) and any repository inside
+  it; that check runs git within one 15 s bound in all, and
   refuses a candidate it could not finish in time. OpenCode v1 ignores every `routing.executor.*` key and logs one
-  notice per process that names them.
+  notice per process that names them; a best-effort `/plan` use without a user-defined command shares that notice and
+  adds no output. The v1 tool, command and help maps are unchanged. Breaker answers and QA-cap `accept`/`fix` answers
+  that unpause a phase re-enqueue its verified tasks and wake the integration lanes, without duplicating queued entries
+  or bypassing task leases. Foreign plans attach read-only: startup and failed-adopt recovery check the ledger's
+  repository before opening a writer, so viewing a foreign plan takes no writer lock and changes no writer epoch or
+  journal. Status remains available; mutation requires that repository. The trusted slots root stays allowed after a
+  restart or `/router-reload` while slot and integration worktrees exist; roots inside or above a non-slot checkout are
+  refused, and the default slots drive comes from the location's repository toplevel; a registered worktree whose folder
+  is gone never blocks that allow. One executor runs per process: a plugin copy refused by the process claim waits and
+  assembles once the holder disposes, running recovery once, and is wired into the host exactly like an executor
+  assembled at start (plan state, executor instructions, host events, retry stop, ordered disposal). Plan-task
+  verification is cancelled first at disposal, a verdict decided before disposal is still journaled, manual `gc` of a
+  completed plan waits for pending phase tags, and `purge` creates no directories, removes the empty plan directory and
+  skips collection for an invalid `slotsDir` when the plan holds no slot markers.
 
 ### Changed
 

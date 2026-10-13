@@ -39,6 +39,32 @@ export interface SlotPoolDeps {
 
 type GcDeps = Omit<SlotPoolDeps, "planId" | "maxParallel" | "provisioner" | "onProvision">;
 
+export interface SlotPoolOpenOptions {
+  /**
+   * QA-5.1-22: `false` opens a gc-only handle (purge, a closed plan's gc): no directory is created, a missing slotsDir holds
+   * no slot, no sidecar is rewritten, no slot environment is registered, and nothing is ever leased. Default true.
+   */
+  readonly create?: boolean;
+}
+
+/** The pool `createSlotPool` returns: the SlotPool, its open/close, and the purge's empty-directory removal (QA-5.1-22). */
+export type OpenSlotPool = SlotPool & { open(opts?: SlotPoolOpenOptions): Promise<void>; close(): void; removeEmptyDir(): Promise<boolean> };
+
+/**
+ * QA-5.1-22: how many slot markers (valid or not) plan `planId` still has under `markersDir`. Reads only: a purge that cannot
+ * build the plan's pool (an invalid slotsDir) asks it before skipping the gc.
+ */
+export async function countPlanMarkers(x: { fs: FileSystem; markersDir: string; platform?: NodeJS.Platform }, planId: PlanId): Promise<number> {
+  if (!PLAN_ID_PATTERN.test(planId)) throw new ExecutorError("E_INVALID_INPUT", "invalid plan id", { planId: String(planId).slice(0, 80) });
+  const api = pathApi(x.platform ?? process.platform);
+  const dir = api.join(x.markersDir, planId);
+  const st = await x.fs.lstat(dir);
+  if (st === null) return 0;
+  // Not a directory: unreadable markers count as present (fail closed).
+  if (st.kind !== "dir") return 1;
+  return (await readdirOrEmpty(x.fs, dir)).filter((name) => name.endsWith(".json")).length;
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------------------------------------------
@@ -705,7 +731,7 @@ function keepFor(managers: readonly string[], yarnBerry: boolean): string[] {
   return keep;
 }
 
-export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<void>; close(): void } {
+export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
   const platform = d.platform ?? process.platform;
   const api = pathApi(platform);
   const logger = d.logger;
@@ -1225,15 +1251,17 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
     }
   }
 
-  async function open(): Promise<void> {
+  async function open(opts: SlotPoolOpenOptions = {}): Promise<void> {
     if (opened) return;
     validateSlotsDir();
-    await mkdirp(d.fs, d.slotsDir, platform);
+    // QA-5.1-22: a gc-only handle (`create: false`) creates no directory; a missing slotsDir holds no slot to check.
+    const create = opts.create !== false;
+    if (create) await mkdirp(d.fs, d.slotsDir, platform);
     const st = await d.fs.lstat(d.slotsDir);
-    if (st === null || st.kind !== "dir") {
+    if (st === null ? create : st.kind !== "dir") {
       throw new ExecutorError("E_SLOT_UNAVAILABLE", `slotsDir ${d.slotsDir} is not a real directory`, { slotsDir: d.slotsDir });
     }
-    if (comparable(await d.fs.realpath(d.slotsDir), platform) !== comparable(d.slotsDir, platform)) {
+    if (st !== null && comparable(await d.fs.realpath(d.slotsDir), platform) !== comparable(d.slotsDir, platform)) {
       throw new ExecutorError("E_SLOT_UNAVAILABLE", `slotsDir ${d.slotsDir} resolves through a link`, { slotsDir: d.slotsDir });
     }
     for (const other of await listPlanDirs(fileCtx)) {
@@ -1257,10 +1285,34 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
         continue;
       }
       records.set(rec.slot, rec);
+      // A gc-only handle only collects: no sidecar is rewritten and no slot environment is registered.
+      if (!create) continue;
       if (rec.state !== "retired") await restoreProvisioned(rec);
       if (rec.state === "ready" || rec.state === "leased") syncEnv(rec);
     }
     opened = true;
+    // A gc-only handle never leases a slot.
+    if (!create) closed = true;
+  }
+
+  /**
+   * QA-5.1-22: removes slotsDir (`<root>\<planId>`) when it is a real directory with nothing in it, once a purge's gc left no
+   * slot of the plan. A link, a non-empty or a missing directory is left alone. True when slotsDir is gone.
+   */
+  async function removeEmptyDir(): Promise<boolean> {
+    assertOpen();
+    if (records.size > 0) return false;
+    const st = await d.fs.lstat(d.slotsDir);
+    if (st === null) return true;
+    if (st.kind !== "dir" || (await readdirOrEmpty(d.fs, d.slotsDir)).length > 0) return false;
+    try {
+      await d.fs.rm(d.slotsDir, { recursive: false });
+      return true;
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return true;
+      logger?.warn(`could not remove the empty slots directory ${d.slotsDir}: ${messageOf(error)}`);
+      return false;
+    }
   }
 
   // ---- reads and gc -----------------------------------------------------------------------------------------
@@ -1328,6 +1380,7 @@ export function createSlotPool(d: SlotPoolDeps): SlotPool & { open(): Promise<vo
   return {
     open,
     close,
+    removeEmptyDir,
     async acquire(planId, owner, baseCommit) {
       if (planId !== d.planId) throw new ExecutorError("E_INVALID_INPUT", "plan id differs from the pool's plan", { planId: String(planId).slice(0, 80) });
       if (typeof baseCommit !== "string" || !GIT_ID_PATTERN.test(baseCommit)) {

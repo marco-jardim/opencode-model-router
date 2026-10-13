@@ -5,6 +5,10 @@ import { createV2Runtime } from "./compat/v2-client";
 import { registerV2Hooks } from "./compat/v2-hooks";
 import type { Ingest } from "./routing/outcomes/ingest";
 import type { BudgetSnapshot } from "./guard/enforce";
+import type { PlanTaskVerifier } from "./executor/runtime";
+import { createExecutor, createExecutorAccess, prepareExecutor, type CreateExecutorOptions, type PreparedExecutor } from "./executor/create";
+import { loadConfig, resolveRolesRouting, resolveRouting } from "./router/config";
+import { locationOutsideWorkRoots } from "./router/work-roots";
 
 /** Keep the routing engine shared; translate only the host API at this boundary. */
 export default {
@@ -12,6 +16,16 @@ export default {
   server: ModelRouterPlugin,
   async setup(ctx: Plugin.Context) {
     const runtime = createV2Runtime(ctx);
+    const directory = ctx.location.directory;
+    const access = createExecutorAccess();
+    const cfg = loadConfig(directory), routing = resolveRouting(cfg, "v2"), rolesRouting = resolveRolesRouting(cfg, "v2");
+    const discoveryDisabled = rolesRouting.delegation !== "roles" ? "routing.delegation must be roles at start"
+      : routing.leases.mode !== "enforce" ? "routing.leases.mode must be enforce"
+      : cfg.enforcement?.verify?.require === "never" ? "enforcement.verify.require is never"
+      : locationOutsideWorkRoots(directory, rolesRouting.workRoots) ? "the location is outside routing.workRoots"
+      : null;
+    const prep: Promise<PreparedExecutor> = discoveryDisabled === null ? prepareExecutor(directory)
+      : Promise.resolve({ ok: false, reason: discoveryDisabled });
     // The engine consumes directory/client only. V2 has no legacy HTTP server
     // URL or Bun shell context; do not invent either for the adapter.
     let ingest: Ingest | undefined;
@@ -25,12 +39,17 @@ export default {
     let verifyEnabled: (() => boolean) | undefined;
     // QA-G-A3-2: the plugin's count of a role child's call refused outside its guard (role-authority refusals, permission denials).
     let recordRefusal: ((sessionID: string, agent: string | undefined, tool: string, args: unknown) => string | undefined) | undefined;
+    // Phase 5.1 D8: the plan-task verifier built over this plugin instance's dispatch verification engine.
+    let slotVerifier: PlanTaskVerifier | undefined;
+    let annotate: CreateExecutorOptions["annotate"];
     const input = {
       directory: ctx.location.directory,
       worktree: ctx.location.project.directory,
       client: runtime.client,
       routerChildRunner: runtime.childRunner,
       routerHost: "v2" as const,
+      routerExecutor: access,
+      routerOnPlanAnnotate: (port: NonNullable<typeof annotate>) => { annotate = port; },
       // Step pricing reads the catalog the adapter already queries; the plugin's single telemetry ingest comes back
       // here so the event loop feeds the instance that also receives the verdicts (QA-2.1-7).
       routerCatalog: async () => (await ctx.model.list({ location: { directory: ctx.location.directory } })).data,
@@ -51,12 +70,18 @@ export default {
       routerRoleLive: (agent: string) => roleLive?.(agent),
       routerOnVerifyEnabled: (read: () => boolean) => { verifyEnabled = read; },
       routerOnRefusal: (record: NonNullable<typeof recordRefusal>) => { recordRefusal = record; },
+      routerOnSlotVerifier: (verifier: PlanTaskVerifier) => { slotVerifier = verifier; },
     };
     const hooks = await ModelRouterPlugin(input as unknown as PluginInput);
+    const prepared = await prep;
+    if (!prepared.ok) access.clear(prepared.reason);
+    if (prepared.ok && runtime.childRunner === undefined) access.clear("the child runner is not available");
     return registerV2Hooks(ctx, hooks, runtime, {
+      executor: (host) => createExecutor({ routerHost: "v2", directory }, { host, prepared, access, ...(annotate ? { annotate } : {}) }) ?? null,
       ...(ingest ? { ingest } : {}), ...(isBypassed ? { isBypassed } : {}), ...(budgetSnapshot ? { budgetSnapshot } : {}),
       ...(verifyEnabled ? { routerVerifyEnabled: verifyEnabled } : {}),
       ...(recordRefusal ? { recordRefusal } : {}),
+      ...(slotVerifier ? { slotVerifier } : {}),
       onHostBudget: (observe) => { observeHostBudget = observe; },
       onRoleLive: (isLive) => { roleLive = isLive; },
     });

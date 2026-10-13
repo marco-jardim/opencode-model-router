@@ -1102,17 +1102,21 @@ describe("start and locks (L2)", () => {
     expect((await h.events()).some((e) => JSON.stringify(e).includes("lock-takeover"))).toBe(false);
   });
 
-  it("a plan of another toplevel is never taken over (open as in 3.1, skipped while locked)", async () => {
+  it("a plan of another toplevel is never taken over: attached read-only, never opened, even with a stale lock", async () => {
     const h = await mk(planOf([task("T1")]));
     await h.begin();
     await h.running("T1", 1, "ses-c1");
     await h.crash();
     await h.otherHolder(200); // stale, but the plan is not this process's toplevel
     h.engine("C:/elsewhere");
+    h.deps.toplevel = "C:/elsewhere";
+    const before = await h.store.exportPlan(PLAN_ID), open = vi.spyOn(h.store, "open");
     await h.runtime.start();
     await h.runtime.settled();
 
-    expect(h.logs.some((l) => l.startsWith(`warn: plan ${PLAN_ID} not attached`))).toBe(true);
+    // Phase 5.1 (A2): a foreign plan is decided before any open, so the stale lock is neither contended nor taken.
+    expect(open).not.toHaveBeenCalled();
+    expect(await h.store.exportPlan(PLAN_ID)).toEqual(before);
     expect((await h.events()).some((e) => JSON.stringify(e).includes("lock-takeover"))).toBe(false);
     expect(h.hosts.interrupts).toEqual([]);
   });
@@ -2070,18 +2074,21 @@ describe("QA-4.2-21: foreignness is the plan's own toplevel", () => {
     expect(await h.runtime.status(PLAN_ID, ORCH)).not.toContain("Foreign:");
   });
 
-  it("an action that opens a plan of another repository attaches it passively (no queue resume, no tick)", async () => {
+  it("an action on a plan of another repository attaches a read-only snapshot and refuses mutation (no writer, resume or tick)", async () => {
     const h = await mk(planOf([task("T1")]));
     await h.begin();
     await h.running("T1", 1, "ses-c1");
     await h.crash();
     h.deps.toplevel = "C:/elsewhere";
     const logMark = h.log.length;
-    await h.runtime.pause(PLAN_ID, ORCH);
+    const before = await h.store.exportPlan(PLAN_ID), open = vi.spyOn(h.store, "open");
+    await expect(h.runtime.pause(PLAN_ID, ORCH)).rejects.toThrow(/another repository.*read-only/);
     await h.runtime.settled();
     expect(h.log.slice(logMark).filter((l) => l.startsWith("queue.resume"))).toEqual([]);
     expect(h.launcher.runs).toEqual([]);
-    expect(h.ledger().status).toBe("paused");
+    expect(open).not.toHaveBeenCalled();
+    expect(h.ledger().status).toBe("running");
+    expect(await h.store.exportPlan(PLAN_ID)).toEqual(before);
     expect(await h.runtime.status(PLAN_ID, ORCH)).toContain("Foreign:");
   });
 

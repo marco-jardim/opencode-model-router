@@ -99,7 +99,9 @@ import { configAsWritten, configuredV2OnlyKeys, setConfigNoticeHost } from "./ro
 /** Phase 2.1: the v2-only config keys already announced as ignored on a v1 host (once per key per process). */
 const warnedV2OnlyKeys = new Set<string>();
 import { checkpointLine, formatStatsReply, runStatsCommand } from "./routing/commands/stats";
-import { buildAnnotateDirectives } from "./routing/commands/annotate-plan";
+import { agentInfosForPlan, buildAnnotateDirectives } from "./routing/commands/annotate-plan";
+import { annotateSteps } from "./routing/engine/plan";
+import { classifyMany as classifyPlanSteps } from "./routing/classify";
 import { applyV1Roles, hasExplicitV1Roles, v1AgentInfos } from "./routing/commands/v1-roles";
 import type { HostAgentInfo } from "./routing/engine/types";
 import { createEngineRuntime } from "./routing/wire/runtime";
@@ -142,6 +144,8 @@ import { tool } from "@opencode-ai/plugin";
 import { scrubText } from "./guard/scrub";
 import { accept, unverifiableGateResult } from "./verify/gate";
 import { applyDispatchCaveats, createVerificationWiring, resolvePendingTtlMs, dispatchDirectiveText, extractAssistantText, parseRouterVerifyArgs, type DispatchStart, type HandleReport } from "./verify/wiring";
+import { waitTreeFreeExcept } from "./verify/wiring";
+import { createLeaseSelfExemptions, createPlanTaskVerifier, planTaskGit, planTreeKey } from "./verify/plan-task";
 import { locationOutsideWorkRoots } from "./router/work-roots";
 import { CLAIM_REFRESH_MS, HEAD_LOST_REASON, PENDING_INSTANCES_DIRNAME, PERIMETER_LOST_REASON, type DispatchHeadState, claimPendingSession, createInstanceClaimToken, createPendingFileJournal, foldDormantRecords, refreshPendingClaims, releasePendingClaim, resolvePendingJournalDir, processedKeyOf, appendRouterFooter, buildLateNoticeBlock, buildPendingListBlock, unattributedRisk, type DormantSession, type LateNotice, type PendingEntry, type SettledVerification } from "./verify/pending";
 import { createDeadline } from "./verify/deterministic";
@@ -176,6 +180,9 @@ import type { AttemptRecorder, DelegationFacts } from "./escalate/attempt-record
 import { createDepthTracker, DEPTH_LOOKUP_RETRY_MS } from "./router/depth";
 import { createDepthGuard } from "./router/depth-guard";
 import { applyEffortOverride, createEffortOverrideStore } from "./escalate/effort-override";
+import { createExecutorAccess, lateRuntime, type ExecutorAccess, type CreateExecutorOptions } from "./executor/create";
+import { createRouterPlanTool } from "./executor/tool";
+import { createPlanCommand, parsePlanCommand } from "./executor/command";
 
 // ---------------------------------------------------------------------------
 // Re-exports — type-only re-exports for IDE/test consumers.
@@ -274,7 +281,7 @@ function saveEnforcementMode(mode: "off" | "advisory" | "enforced"): void {
  * `/router` dispatch. Decides and persists here; rendering lives in
  * src/commands/output.ts.
  */
-function buildRouterOutput(cfg: RouterConfig, args: string, projectDir?: string, roles?: Iterable<RoleSpec>, approvals = false): string {
+function buildRouterOutput(cfg: RouterConfig, args: string, projectDir?: string, roles?: Iterable<RoleSpec>, approvals = false, plan = false): string {
   const tokens = (args ?? "").trim().split(/\s+/).filter(Boolean);
   const sub = (tokens[0] ?? "").toLowerCase();
 
@@ -308,7 +315,7 @@ function buildRouterOutput(cfg: RouterConfig, args: string, projectDir?: string,
     // `/router stats` is listed only for a config that has a `routing` block: without one `/router` is what it was (QA-2.4-3).
     // #84 P2.2: the role lines, only when the caller hands roles (roles mode on v2); otherwise the help is what it was.
     // Cross-repo P4.7: `/router approve|repos|revoke`, only where they run (SD-P4-10); otherwise the help is what it was.
-    { stats: cfg.routing !== undefined, ...(roles === undefined ? {} : { roles }), ...(approvals ? { approvals: true } : {}) },
+    { stats: cfg.routing !== undefined, ...(roles === undefined ? {} : { roles }), ...(approvals ? { approvals: true } : {}), ...(plan ? { plan: true } : {}) },
   );
 }
 
@@ -603,6 +610,19 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // every role branch below is skipped there and both stay byte-identical (§2.7, I1, I8).
   // -------------------------------------------------------------------------
   const isV2Host = ctx.routerHost === "v2";
+  // Phase 5.1 D1: the runtime is resolved at each call, after the adapter's synchronous executor factory runs.
+  const executorInput = isV2Host ? ctx as RouterPluginInput & {
+    routerExecutor?: ExecutorAccess;
+    routerOnPlanAnnotate?: (port: NonNullable<CreateExecutorOptions["annotate"]>) => void;
+  } : undefined;
+  const absentExecutor = isV2Host ? createExecutorAccess() : undefined;
+  const executorAccess: ExecutorAccess | undefined = absentExecutor === undefined ? undefined : {
+    runtime: () => (executorInput?.routerExecutor ?? absentExecutor).runtime(),
+    unavailable: () => (executorInput?.routerExecutor ?? absentExecutor).unavailable(),
+    set: (runtime) => (executorInput?.routerExecutor ?? absentExecutor).set(runtime),
+    clear: (reason) => (executorInput?.routerExecutor ?? absentExecutor).clear(reason),
+  };
+  const executorRuntime = executorAccess === undefined ? undefined : lateRuntime(executorAccess);
   /**
    * Cross-repo P2e.6 (OD-P2e-2): a dispatch runs the full scope when the host is OpenCode v2 and the effective testScope is
    * "full"; the deferred finish then never treats an empty change set as nothing to run. Always false on v1. Never throws (an
@@ -990,6 +1010,36 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     }).mode,
     logger: routerWarn,
   });
+  // State-changing executor actions require depth 0, even for an exactly bound plan child.
+  const planRootCallerAllowed = async (sessionID: unknown): Promise<boolean> => {
+    if (!isV2Host || typeof sessionID !== "string" || sessionID === "") return false;
+    try {
+      return await depthTracker.depthOf(sessionID) === 0;
+    } catch {
+      return false;
+    }
+  };
+  const planReadCallerAllowed = (sessionID: unknown, planId: unknown): boolean => {
+    if (!isV2Host || typeof sessionID !== "string" || sessionID === "" || typeof planId !== "string") return false;
+    try {
+      const binding = currentBinding(sessionID, { maxOf: roleMaxOf });
+      return binding?.kind === "exact" && binding.plan !== undefined && binding.plan.planId === planId.trim();
+    } catch {
+      return false;
+    }
+  };
+  // Only this allowlist is read-only; new or unknown actions remain root-only. `/plan inbox` parses as status.
+  const planActionCallerAllowed = async (sessionID: unknown, action: unknown, planId: unknown): Promise<boolean> =>
+    await planRootCallerAllowed(sessionID) ||
+    ((action === "status" || action === "ready" || action === "export") && planReadCallerAllowed(sessionID, planId));
+  const planCallerRefusal = "refused: plan actions require a root orchestrator session; bound plan children may only read their own plan.";
+  const routerPlan = executorRuntime === undefined ? undefined : createRouterPlanTool(executorRuntime, {
+    approve: () => resolveRouting(loadConfig(projectDir), "v2").executor.approve,
+  });
+  const planCommand = executorRuntime === undefined ? undefined : createPlanCommand(executorRuntime);
+  const planCommandMarker = Symbol.for("opencode-model-router.plan-command");
+  let userPlanCommandDefined = false;
+  let warnedPlanCommandConflict = false;
   const effortOverrides = createEffortOverrideStore({ logger: routerWarn });
   let warnedGraderParams = false;
   const depthBanners = new Map<string, string>();
@@ -1128,9 +1178,11 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   }
   /** Late-bound: the lease guard exists only once the v2 adapter attaches (FinishAttach `leaseGate`); the wiring reads it per use. */
   let leaseGateRef: Pick<LeaseGuard, "waitTreeFree"> | undefined;
+  /** Phase 5.1 D11 (v2 only): the plan-task gates' own holders, exempt from the lease wait in their own slot tree. */
+  const planTaskLeaseExemptions = createLeaseSelfExemptions((root) => planTreeKey(root));
   const {
     graderSessions, dispatchGrader, buildGateDeps, disposeChildSession,
-    prepareVerification, startReferenceGc,
+    prepareVerification, startReferenceGc, beginVerificationBounded,
     sweepVerification, disposeVerification,
     startDispatch, takeDispatch, isDeferred: wiringIsDeferred, directivesFor, finishDeferred, applyLineage, pending,
     verifyHandles,
@@ -1148,8 +1200,19 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       pendingRestore: pendingFile.load(),
       // v2 only. Delegating: the guard arrives with the adapter's attach; until then (or without `leases: enforce`) nothing waits.
       leaseGate: {
-        waitTreeFree: async (tree, owner, deadlineMs, signal) =>
-          leaseGateRef === undefined ? { waitedMs: 0, holders: [], fileCount: 0 } : leaseGateRef.waitTreeFree(tree, owner, deadlineMs, signal),
+        waitTreeFree: async (tree, owner, deadlineMs, signal) => {
+          if (leaseGateRef === undefined) return { waitedMs: 0, holders: [], fileCount: 0 };
+          // Phase 5.1 D11: a plan-task gate does not wait for its own task's holders in its own slot tree.
+          const exempt = planTaskLeaseExemptions.exemptFor(tree);
+          if (exempt.size === 0) return leaseGateRef.waitTreeFree(tree, owner, deadlineMs, signal);
+          const gate = leaseGateRef;
+          let fileCount = 0;
+          const probe: Pick<LeaseGuard, "waitTreeFree"> = {
+            waitTreeFree: async (...args) => { const r = await gate.waitTreeFree(...args); fileCount = r.fileCount; return r; },
+          };
+          const wait = await waitTreeFreeExcept(probe, tree, owner, exempt, deadlineMs, signal);
+          return { waitedMs: wait.waitedMs, holders: wait.holders, fileCount: wait.holders.length === 0 ? 0 : fileCount };
+        },
       },
     }),
   });
@@ -1161,6 +1224,25 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   const outsideWorkRoots = isV2Host && locationOutsideWorkRoots(ctx.directory, cfg.routing?.workRoots);
   if (outsideWorkRoots) logger.info?.(`[router] ${ctx.directory} is outside routing.workRoots: the start-up reference GC is skipped`);
   const stopReferenceGc = outsideWorkRoots ? (): void => undefined : startReferenceGc();
+  // Phase 5.1 D8 (v2 only): plan tasks are verified by this instance's dispatch verification engine; v2.ts hands the verifier to
+  // the adapter's executor seam. Nothing is built or handed over on v1.
+  if (isV2Host) {
+    const planTaskVerifier = createPlanTaskVerifier({
+      changedFileStore,
+      beginVerificationBounded,
+      prepareVerification,
+      buildGateDeps,
+      captureBudget: (childSessionID, capReached) => captureBudget(childSessionID, capReached),
+      readCapReached: (childSessionID) => sessionStore.readCapReached(childSessionID),
+      onVerdict: (childSessionID, verdict) => ingest?.onVerdict(childSessionID, verdictOf(verdict), verdictGraderOf(verdict)),
+      abortSession: async (sessionID) => { await ctx.client.session.abort({ path: { id: sessionID } }); },
+      getConfig: () => cfg,
+      git: planTaskGit(),
+      exemptions: planTaskLeaseExemptions,
+      log: (message, detail) => logger.warn(`[verify] ${message}`, detail === undefined ? undefined : { error: describeError(detail) }),
+    });
+    (ctx as RouterPluginInput & { routerOnSlotVerifier?: (verifier: typeof planTaskVerifier) => void }).routerOnSlotVerifier?.(planTaskVerifier);
+  }
 
   // Phase 1.2 (v2 only): the turn-state registry the adapter injects. Without it (v1, or a v2 host that injects none) nothing
   // below is registered or buffered, and the system transform keeps pushing the pending list and the late notices.
@@ -1369,6 +1451,28 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     });
     return annotateRuntime;
   };
+  if (isV2Host) {
+    executorInput?.routerOnPlanAnnotate?.(async (steps) => {
+      const current = loadConfig(projectDir);
+      const runtime = annotatePlanRuntime();
+      const prepared = await runtime?.prepare(current);
+      const routing = prepared?.routing ?? resolveRouting(current, "v2");
+      const classifyDeps = prepared && runtime ? runtime.classifyDeps(prepared) : {
+        cfg: current, settings: { ...routing.classifier, backend: "rules" as const },
+        minClassConfidence: routing.minClassConfidence, backend: null, logger,
+      };
+      let agents: HostAgentInfo[] | null = null;
+      if (prepared && ctx.routerAgents !== undefined) {
+        try { agents = agentInfosForPlan(await ctx.routerAgents()); }
+        catch (error) { logger.warn("[router] executor: the agent list is unavailable; tiers are annotated without it", { error: describeError(error) }); }
+      }
+      return annotateSteps(steps, {
+        cfg: current, routing, agents, store: prepared?.store ?? null, logger,
+        ...(prepared ? { pricing: (model) => prepared.catalog.pricing(model), session: prepared.session } : {}),
+        classifyMany: (inputs) => classifyPlanSteps(inputs, { ...classifyDeps, routeLinePositions: "any" }),
+      });
+    });
+  }
   // v1 only (A28): the host's agent list for the text-only roles line, read through `client.app.agents()` and never fetched unless
   // `routing.roles` is set explicitly. It is refreshed IN THE BACKGROUND (QA-2.4-13): a turn never waits for it. The first turn after start
   // has no list yet and gets the baseline prompt; later turns use the last list, stale while the next one is fetched (every minute). A
@@ -1792,6 +1896,12 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       await logger.flush();
     },
     tool: {
+      ...(isV2Host && routerPlan !== undefined ? { router_plan: {
+        ...routerPlan,
+        execute: async (args, context) => await planActionCallerAllowed(context?.sessionID, args?.action, args?.planId)
+          ? routerPlan.execute(args, context)
+          : `[router_plan] ${planCallerRefusal}`,
+      } } : {}),
       // QA-G-A2-2: a role session's work root must belong to the repository its dispatch listed the worktrees in (this directory's).
       ...gitTools(rolesAtStart ? {
         resolveWorkRoot: resolveWorkRootFor("router_git"), ...(ctx.directory ? { dispatchRepository: ctx.directory } : {}),
@@ -3214,6 +3324,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
 
       // Register commands
       opencodeConfig.command ??= {};
+      // Remember the host command the hook sees; our v2 registration is marked so reloads are not conflicts.
+      userPlanCommandDefined = opencodeConfig.command.plan !== undefined && opencodeConfig.command.plan?.[planCommandMarker] !== true;
       opencodeConfig.command["tiers"] = {
         template: "",
         description: "Show model delegation tiers and rules",
@@ -3281,6 +3393,16 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
         description:
           "Model-router controls (e.g., /router enforce off|advisory|enforced, /router overrides, /router models)",
       };
+      if (isV2Host && planCommand !== undefined) {
+        if (userPlanCommandDefined) {
+          if (!warnedPlanCommandConflict) {
+            warnedPlanCommandConflict = true;
+            logger.warn("[router] /plan command conflict: preserving the user-defined /plan; router_plan remains available");
+          }
+        } else {
+          opencodeConfig.command.plan = { template: "$ARGUMENTS", description: planCommand.description, [planCommandMarker]: true };
+        }
+      }
     },
 
     // -----------------------------------------------------------------------
@@ -3408,6 +3530,31 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     // Handle /tiers, /preset, and /budget commands
     // -----------------------------------------------------------------------
     "command.execute.before": async (input: any, output: any) => {
+      if (input.command === "plan") {
+        if (!isV2Host) {
+          // Best-effort on v1 (the command is deliberately unregistered); share the configured-key notice's process guard.
+          if (!userPlanCommandDefined && warnedV2OnlyKeys.size === 0) {
+            warnedV2OnlyKeys.add("routing.executor");
+            logger.warn("[router] the plan executor requires OpenCode v2; ignored: /plan");
+          }
+          return; // No model-visible part on v1.
+        }
+        if (userPlanCommandDefined) return; // Let the host's /plan run without executor instructions.
+        if (planCommand !== undefined) {
+          const args: string = input.arguments ?? "";
+          const parsed = parsePlanCommand(args);
+          const allowed = parsed.kind !== "call" || await planActionCallerAllowed(
+            input.sessionID, parsed.call.action, "planId" in parsed.call ? parsed.call.planId : undefined,
+          );
+          const text = !allowed
+            ? `[router_plan] ${planCallerRefusal}`
+            : executorAccess?.runtime() === null
+              ? `[router_plan] ${executorAccess.unavailable()}`
+              : planCommand.execute(args);
+          output.parts.push({ type: "text" as const, text });
+        }
+        return;
+      }
       if (input.command === "tiers") {
         try {
           cfg = loadConfig(projectDir);
@@ -3555,7 +3702,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           }
         } else {
           // #84 P2.2: `/router` lists the roles in roles mode on v2 (`rolesNow()` is empty in tiers mode and on v1).
-          text = buildRouterOutput(cfg, args, projectDir, rolesNow().size > 0 ? rolesNow().values() : undefined, approvalsAvailable);
+          text = buildRouterOutput(cfg, args, projectDir, rolesNow().size > 0 ? rolesNow().values() : undefined, approvalsAvailable, isV2Host);
           // On the bare status view, surface stale or missing models inline.
           if (sub === "") {
             text += "\n" + routerStatusLines(cfg, ctx.routerHost === "v2" ? "v2" : "v1", logger, projectDir).join("\n");

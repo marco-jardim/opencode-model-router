@@ -2138,7 +2138,16 @@ export function createNodeFileSystem(): FileSystem {
       }
     },
     rename: (a, b) => nodeFsp.rename(a, b),
-    rm: (p, o) => nodeFsp.rm(p, { recursive: o.recursive, force: true }),
+    async rm(p, o) {
+      try {
+        await nodeFsp.rm(p, { recursive: o.recursive, force: true });
+      } catch (error) {
+        // A non-recursive rm of a directory removes it only when empty (rmdir); node's rm refuses every directory.
+        const code = (error as NodeJS.ErrnoException).code;
+        if (o.recursive || (code !== "ERR_FS_EISDIR" && code !== "EISDIR")) throw error;
+        await nodeFsp.rmdir(p);
+      }
+    },
     async mkdir(p) {
       await nodeFsp.mkdir(p, { recursive: true });
     },

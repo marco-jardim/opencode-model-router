@@ -136,7 +136,7 @@ function fixture() {
   const ctx = {
     location: { directory: "/project", project: { directory: "/project" } },
     agent: { reload: vi.fn(async () => {}), list: vi.fn(async () => ({ data: Object.values(agents) })), transform: vi.fn(async (cb: any) => { transforms.agent = cb; cb(editors.agent); return register(); }) },
-    command: { reload: vi.fn(async () => {}), transform: vi.fn(async (cb: any) => { transforms.command = cb; cb(editors.command); return register(); }) },
+    command: { list: vi.fn(async () => ({ data: Object.values(commands) })), reload: vi.fn(async () => {}), transform: vi.fn(async (cb: any) => { transforms.command = cb; cb(editors.command); return register(); }) },
     tool: {
       transform: vi.fn(async (cb: any) => { transforms.tool = cb; cb(editors.tool); return register(); }),
       hook: vi.fn(async (name: string, cb: any) => { toolHooks[name] = cb; return register(); }),
@@ -171,6 +171,32 @@ function fixture() {
 const call = { sessionID: "child", agent: "fast", messageID: "message", id: "call" };
 
 describe("OpenCode 2 hook adapter", () => {
+  it("QA-5.1-18 preserves a host /plan through registerV2Hooks and warns only once across registry rebuilds", async () => {
+    const f = fixture();
+    const userPlan = { name: "plan", description: "User planning command", execute: vi.fn(async () => {}) };
+    f.commands.plan = userPlan;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await f.start({ config: async (cfg: { command: Record<string, unknown> }) => {
+        cfg.command.plan = { description: "Executor plan", template: "executor" };
+        cfg.command.router = { template: "router" };
+      } });
+      f.transforms.command(f.editors.command);
+      expect(f.ctx.command.list).toHaveBeenCalledOnce();
+      expect(f.commands.plan).toBe(userPlan);
+      expect(f.commands.router).toBeDefined();
+      expect(warn.mock.calls.filter(([message]) => String(message).includes("/plan command conflict"))).toHaveLength(1);
+    } finally { warn.mockRestore(); }
+  });
+
+  it("QA-5.1-18 still registers the executor /plan when the host has none", async () => {
+    const f = fixture();
+    await f.start({ config: async (cfg: { command: Record<string, unknown> }) => {
+      cfg.command.plan = { description: "Executor plan", template: "executor" };
+    } });
+    expect(f.commands.plan.description).toBe("Executor plan");
+  });
+
   it.each([false, true])("filters v2 grep model content and raw structured matches (parts=%s)", async parts => {
     const f = fixture();
     await f.start({ config: async (cfg: { agent: Record<string, unknown> }) => { cfg.agent.fast = { permission: readOnlyPermissions() }; } });
@@ -1350,6 +1376,62 @@ describe("plan executor wiring in the v2 adapter (3.1.7: W2, W4, W5, W6, M41)", 
     expect(w.listeners.size).toBe(0);
     expect(x.runtime.dispose).toHaveBeenCalled();
     expect(x.launcher.dispose).toHaveBeenCalled();
+  });
+
+  it("a handed-over executor is adopted once through the startup path; another, or any after dispose, is refused (QA-5.1-26)", async () => {
+    const x = fakeExecutor();
+    // The factory is refused by the claim (null); the executor comes later through `host.onExecutor`.
+    const factory: V2ExecutorFactory = (host) => { x.factory(host); return null; };
+    const w = await startWired({ executor: factory });
+    const host = x.state.host;
+    if (host === undefined) throw new Error("the factory was not called");
+    const before = w.providers.length;
+    expect(w.listeners.size).toBe(0);
+    w.f.emit({ id: "h0", type: "session.step.started", data: { sessionID: PLAN_CHILD, model: { providerID: "anthropic", id: "claude-x" } } });
+    await w.tick();
+    expect(x.emitted).toEqual([]); // no executor yet: the emitter is a no-op
+    expect(w.f.sessionHooks.retry).toBeUndefined(); // and no retry hook (M3)
+    const retryHooks = () => w.f.ctx.session.hook.mock.calls.filter(([name]) => name === "retry").length;
+    const handed = { runtime: x.runtime as unknown as V2Executor["runtime"], launcher: x.launcher };
+    expect(host.onExecutor(handed)).toBe(true);
+    await w.tick();
+    expect(w.listeners.size).toBe(1);
+    expect(w.providers.length).toBe(before + 2); // the plan line and the executor instructions
+    expect(x.runtime.start).toHaveBeenCalledTimes(1);
+    // Idempotent: the same executor again registers nothing and starts nothing.
+    expect(host.onExecutor(handed)).toBe(true);
+    await w.tick();
+    expect(w.listeners.size).toBe(1);
+    expect(w.providers.length).toBe(before + 2);
+    expect(x.runtime.start).toHaveBeenCalledTimes(1);
+    expect(retryHooks()).toBe(1);
+    // The retry hook stops the host's retry of a plan child only (D13).
+    const stopped = { sessionID: PLAN_CHILD, error: { type: "APIError", message: "rate limited", status: 429 }, decision: { retry: true } };
+    await w.f.sessionHooks.retry!(stopped);
+    expect(stopped.decision).toEqual({ retry: false });
+    const kept = { ...stopped, sessionID: "root-other", decision: { retry: true } };
+    await w.f.sessionHooks.retry!(kept);
+    expect(kept.decision).toEqual({ retry: true });
+    // Another executor while one is adopted: refused, left to its owner.
+    const other = { runtime: { ...x.runtime, start: vi.fn(async () => undefined), dispose: vi.fn(async () => undefined) }, launcher: { dispose: vi.fn(async () => undefined) } };
+    expect(host.onExecutor(other as unknown as V2Executor)).toBe(false);
+    expect(other.runtime.start).not.toHaveBeenCalled();
+    // Wired like one built at start: host events, the router-tool-call feed and the launcher metrics reach it.
+    w.f.emit({ id: "h1", type: "session.step.started", data: { sessionID: PLAN_CHILD, model: { providerID: "anthropic", id: "claude-x" } } });
+    await w.tick();
+    expect(x.emitted).toContainEqual(expect.objectContaining({ type: "step.started", sessionID: PLAN_CHILD }));
+    for (const listener of w.listeners) listener({ sessionID: "root" });
+    expect(x.runtime.onRouterToolCall).toHaveBeenCalledWith("root");
+    host.onLauncherMetric("plan-a", { name: "counter", key: "k", value: 1, labels: {} });
+    expect(x.runtime.recordMetric).toHaveBeenCalledWith("plan-a", { name: "counter", key: "k", value: 1, labels: {} });
+    // W7 disposes the adopted executor (runtime, then launcher) once; after dispose nothing is adopted.
+    await w.cleanup();
+    expect(x.runtime.dispose).toHaveBeenCalledTimes(1);
+    expect(x.launcher.dispose).toHaveBeenCalledTimes(1);
+    expect(x.runtime.dispose.mock.invocationCallOrder[0]).toBeLessThan(x.launcher.dispose.mock.invocationCallOrder[0]!);
+    expect(w.listeners.size).toBe(0);
+    expect(host.onExecutor(other as unknown as V2Executor)).toBe(false);
+    expect(other.runtime.dispose).not.toHaveBeenCalled();
   });
 
   it("session.step.started carries the provider to the emitter; the adapter's stepKey follows the C10 recorded sequence (W4, QA-3.1-8)", async () => {
