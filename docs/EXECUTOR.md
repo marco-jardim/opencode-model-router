@@ -314,8 +314,10 @@ The first unparsable QA result fails the attempt and counts toward retries; the 
 ## Recovery
 
 At start the recovery service scans running and paused plans for this repository, then the runtime reconciles their
-durable ledgers before scheduling. A plan from another repository is passive: this process does not recover, resume
-or tick it. A live writer lock is not taken over. When several plans could run, a running plan is chosen before a
+durable ledgers before scheduling. A plan from another repository is passive and read-only: this process does not
+recover, resume or tick it, acquire its writer lock, change its writer epoch or rotate its journal. Status remains
+available; mutate or adopt it from a session in its own repository. A live writer lock is not taken over.
+When several plans could run, a running plan is chosen before a
 paused one, then by plan id; the others stay passive rather than launching a second plan.
 
 Recovery uses evidence, not a guess that an old child stopped. A recorded child must carry the matching launch header

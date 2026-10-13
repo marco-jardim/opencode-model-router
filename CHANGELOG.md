@@ -61,6 +61,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OpenCode v2: answering a phase pause restarts queued integration.** Breaker answers and QA-cap `accept`/`fix`
+  answers that unpause a phase re-enqueue its verified tasks and wake the integration lanes, without duplicating
+  queued entries or bypassing task leases. Work already queued while the phase was paused no longer stays stuck.
+- **OpenCode v2: foreign plans attach read-only.** Executor startup and failed-adopt recovery check the ledger's
+  repository before opening a writer, so viewing a plan from another repository no longer takes its writer lock,
+  increments its writer epoch or rotates its journal. Status remains available; mutation requires that repository.
 - **OpenCode v2: work leases no longer collide across linked worktrees.** Two child sessions that edit the same
   repo-relative path in two worktrees of one repository (`git worktree add`) are both allowed: an ordinary write lease
   is keyed by its checkout, not by the repository, and a write whose target the router cannot read is refused only while

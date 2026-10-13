@@ -2373,6 +2373,16 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     }
   }
 
+  /** A foreign attachment owns only a snapshot: even opening a real writer rotates its journal and takes a lock. */
+  function readOnlyWriter(ledger: Readonly<LedgerV1>): LedgerWriter {
+    const snapshot = structuredClone(ledger);
+    const refuse = async (): Promise<never> => {
+      throw new ExecutorError("E_PLAN_STATE", `plan ${ledger.planId} belongs to another repository; its attachment is read-only`, { planId: ledger.planId });
+    };
+    return { planId: snapshot.planId, ledger: snapshot, append: refuse, snapshot: refuse,
+      openIntegration: () => [], wakeKeys: () => new Set<string>(), close: async () => {} };
+  }
+
   /** Builds and registers the plan's runtime state (no activation). */
   async function build(writer: LedgerWriter, passive: boolean): Promise<PlanRt> {
     const planId = writer.planId;
@@ -3404,9 +3414,10 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   async function planFor(planId: PlanId, sessionID: string): Promise<PlanRt> {
     const have = plans.get(planId);
     if (have !== undefined) return have;
+    const ledger = await d.store.read(planId);
+    if (isForeign(ledger.repo.toplevel)) return attach(readOnlyWriter(ledger), true, undefined, { foreign: true });
     const writer = await d.store.open(planId, d.holder(sessionID));
-    // QA-4.2-21: a plan of another repository opened by an action is attached passively (no resume, no tick there).
-    return attach(writer, true, undefined, { foreign: isForeign(writer.ledger.repo.toplevel) });
+    return attach(writer, true);
   }
 
   /**
@@ -3416,6 +3427,11 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
    */
   async function reattachAfterFailedAdopt(planId: PlanId, orchestrator: string, onRegistered: () => void): Promise<void> {
     try {
+      const ledger = await d.store.read(planId);
+      if (isForeign(ledger.repo.toplevel)) {
+        await attach(readOnlyWriter(ledger), true, onRegistered, { foreign: true });
+        return;
+      }
       const writer = await d.store.open(planId, d.holder(orchestrator));
       await attach(writer, true, onRegistered);
       d.log("warn", `adopt of ${planId} failed; the plan is attached again for ${orchestrator}`);
@@ -3436,7 +3452,13 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     if (ledger.orchestrator.sessionID !== sessionID) {
       throw new ExecutorError("E_NOT_OWNER", `plan ${planId} belongs to another session`, ledger.orchestrator.sessionID);
     }
-    return owned(await planFor(planId, sessionID), sessionID);
+    const p = owned(await planFor(planId, sessionID), sessionID);
+    // A read-only attachment is safe, but mutation collaborators (abort/answer/purge included) must not run.
+    // planFor re-reads before attachment, so this also covers a snapshot that became foreign between the reads.
+    if (isForeign(p.writer.ledger.repo.toplevel)) {
+      throw new ExecutorError("E_PLAN_STATE", `plan ${planId} belongs to another repository; its attachment is read-only`, { planId });
+    }
+    return p;
   }
 
   function requireStatus(p: PlanRt, ok: readonly LedgerStatus[]): void {
@@ -3641,7 +3663,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     // QA-3.1-19: a passively attached (refused) plan says why nothing launches.
     if (p !== null && p.passive && foreignPlans.has(p.planId)) {
       // QA-4.2-17: a plan of another toplevel is attached passively, never run by this process.
-      out.push(`Foreign: this plan belongs to ${l.repo.toplevel}; only abort, answer, status, pause and purge apply here`);
+      out.push(`Foreign: this plan belongs to ${l.repo.toplevel}; read-only here; mutate it from a session in that repository`);
     } else if (p !== null && p.passive) {
       out.push("Refused: another plan holds this process's active slot; only abort, answer, status, pause, resume and purge apply");
     }
@@ -3692,6 +3714,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         orchestratorSessionID: i.sessionID,
         now: d.clock.iso(),
       });
+      if (isForeign(r.draft.repo.toplevel)) throw new ExecutorError("E_INVALID_INPUT", "the plan belongs to another repository");
       const writer = await d.store.create(r.draft, d.holder(i.sessionID));
       await attach(writer, false);
       return { planId: r.draft.planId, summary: r.summary, residuePrompt: r.residueRequest?.prompt ?? null };
@@ -3779,7 +3802,17 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
     async answer(planId, inboxId, text, sessionID) {
       const p = await mine(planId, sessionID);
+      const paused = new Set(p.writer.ledger.phases.filter((ph) => ph.paused).map((ph) => ph.id));
       await p.collab.policy.answer(inboxId, text);
+      const ledger = p.writer.ledger;
+      const unpaused = new Set(ledger.phases.filter((ph) => paused.has(ph.id) && !ph.paused).map((ph) => ph.id));
+      if (unpaused.size > 0 && !p.passive && !p.latch && ledger.status === "running") {
+        // checkPhase can return before kicking when a phase still has verified work. enqueue dedupes its FIFO
+        // but always kicks the lanes, including when the resumed phase has only pending integration entries.
+        p.collab.queue.enqueue(Object.values(ledger.tasks)
+          .filter((t) => t.state === "verified" && t.phase !== null && unpaused.has(t.phase) && !p.leaseHeld.has(t.id))
+          .map((t) => t.id));
+      }
       schedule(p);
     },
 
@@ -3978,7 +4011,12 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         }
         try {
           await recovery.adopt(planId, sessionID);
-          // L3: `adopt` checked the toplevel; the reopened ledger is reconciled on activation.
+          // Re-check before opening too: an injected/failed recovery or an external snapshot replacement may change it.
+          const adopted = await d.store.read(planId);
+          if (isForeign(adopted.repo.toplevel)) {
+            throw new ExecutorError("E_PLAN_STATE", `plan ${planId} belongs to another repository; its attachment is read-only`, { planId });
+          }
+          // L3: the reopened local ledger is reconciled on activation.
           recoverable.add(planId);
           let writer: LedgerWriter;
           try {
@@ -4109,6 +4147,11 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       for (const e of entries) {
         if (plans.has(e.planId)) continue;
         try {
+          const ledger = await d.store.read(e.planId);
+          if (isForeign(ledger.repo.toplevel)) {
+            await attach(readOnlyWriter(ledger), true, undefined, { foreign: true });
+            continue;
+          }
           const holder = d.holder(e.orchestratorSessionID);
           let writer: LedgerWriter;
           try {
@@ -4119,9 +4162,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
             if (errorCode(err) !== "E_LOCK_HELD" || !recoverable.has(e.planId)) throw err;
             writer = await d.store.takeover(e.planId, holder, RECOVER_TAKEOVER_REASON);
           }
-          // QA-4.2-21: foreign by the plan's own toplevel; a same-repo plan the report missed attaches actively and its
-          // `recoverPlan` reconciles it.
-          await attach(writer, true, undefined, { foreign: isForeign(e.toplevel) });
+          // A same-repo plan the report missed still attaches actively and recoverPlan reconciles it.
+          await attach(writer, true);
         } catch (err) {
           d.log("warn", `plan ${e.planId} not attached`, errorText(err));
         }
