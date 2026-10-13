@@ -122,7 +122,7 @@ export interface StepDetailMap {
   "phase-suite": { v: 1; commit: string; base: string | null; commands: Array<{ label: string; ref: RunCommandRef | null }> }
     | { v: 1; files: string[]; idsUnparsed: boolean; durationMs: number; output: string } | RefusedDetail;
   "suite-rerun": { v: 1; n: 1 | 2; files: string[] } | { v: 1; at: "base"; commit: string; files: string[] }
-    | { v: 1; reproduced?: string[]; durationMs: number; output: string } | RefusedDetail;
+    | { v: 1; reproduced?: string[]; flaky?: string[]; durationMs: number; output: string } | RefusedDetail;
   "revert-build": { v: 1; culprit: RangeDetail; suiteCommit: string; head: string; files: string[] }
     | { v: 1; revertHead: string; reverted: string[] } | { v: 1; at: string; paths: string[]; commands: string[] } | RefusedDetail;
   "revert-checks": { v: 1; base: string; candidate: string; extraFiles: string[] } | CheckDetail | RefusedDetail;
@@ -2078,7 +2078,7 @@ class Queue implements IntegrationQueue {
     const commit = suite.entry.candidate ?? suite.entry.baseHead;
     const resolved = await this.d.suite.resolve(this.ledger, p, commit).catch(() => null);
     // QA-3.2-24: ids from the closing end's failingIds, files from its detail (written since round 2).
-    const files = Array.isArray(detail?.files) ? (detail.files as unknown[]).filter((f): f is string => typeof f === "string") : [];
+    const files = detail?.truncated !== true && Array.isArray(detail?.files) ? (detail.files as unknown[]).filter((f): f is string => typeof f === "string") : []; // m1: truncated -> no files, the revert check runs the whole command
     return { phaseId: p, culprit: { taskId: c.taskId, from: c.from, to: c.to }, suiteCommit: commit, ids: [...suite.failingIds], files,
       commands: resolved !== null && resolved.kind === "runs" ? resolved.commands : [], rerun: null };
   }
@@ -2469,7 +2469,7 @@ class Queue implements IntegrationQueue {
         return;
       }
       const suiteCommit = typeof d?.suiteCommit === "string" ? d.suiteCommit : e.baseHead;
-      const files = Array.isArray(d?.files) ? (d.files as unknown[]).filter((f): f is string => typeof f === "string") : [];
+      const files = d?.truncated !== true && Array.isArray(d?.files) ? (d.files as unknown[]).filter((f): f is string => typeof f === "string") : []; // m1: truncated -> no files
       const ids = [...(first?.failingIds ?? [])];
       const resolved = await this.d.suite.resolve(this.ledger, e.phaseId, suiteCommit).catch(() => null);
       const head = this.ledger.integration.head;

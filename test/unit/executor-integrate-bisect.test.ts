@@ -25,7 +25,7 @@ import type {
 import type {
   LandRequest, RevertRequest, StepDetail, StepJournal, SuiteRunRequest,
 } from "../../src/executor/integrate/queue";
-import { classifyReruns, createPhaseSuiteRunner, interruptedBy, revertMessage } from "../../src/executor/integrate/phase-suite";
+import { classifyReruns, createPhaseSuiteRunner, fileOfSuiteId, interruptedBy, revertMessage } from "../../src/executor/integrate/phase-suite";
 import { PREEMPT_LIMIT } from "../../src/executor/integrate/queue";
 import {
   bisectRanges,
@@ -853,6 +853,10 @@ function runRes(verdict: CommandRunResult["verdict"], o: Partial<CommandRunResul
 }
 function failRes(ids: string[], o: Partial<CommandRunResult> = {}): CommandRunResult {
   return runRes("fail", { ids, files: ["f.test.ts"], output: "out", ...o });
+}
+/** A failure as runCommands reports a full run: each id's file resolved against the slot (`fileOfSuiteId`). */
+function suiteFail(ids: string[], o: Partial<CommandRunResult> = {}): CommandRunResult {
+  return failRes(ids, { files: [...new Set(ids.map(id => fileOfSuiteId("/slot", id)))].sort(), ...o });
 }
 function errRes(reason: CheckErrorReason, message = "m"): CommandRunResult {
   return runRes("error", { error: { reason, message } });
@@ -1743,16 +1747,37 @@ describe("phase suite runner: run", () => {
     expect(log.order).toEqual(["end:failed", "start:suite-rerun", "end:ok", "start:suite-rerun"]);
   });
 
-  it("QA-3.2-23: a red full run after green reruns of the files is no flake: its named ids are reproduced", async () => {
+  it("QA-3.2-23, NEW-1 (a): only the full run reproduces: green base -> full-command probes, culprit with no files", async () => {
+    const A = "a.test.ts > a", B = "b.test.ts > b";
     const { runner, requests } = suiteEnv({
-      runCommands: (r, n) => (n === 1 ? failRes(["a", "b"]) : r.mode === "full" && r.commit === "c3" ? failRes(["b"], { output: "whole" }) : runRes("pass")),
+      // The file reruns are green; only the full commands fail at the suite commit (c3), and at c2 nothing fails.
+      runCommands: (r, n) => (n === 1 ? suiteFail([A, B]) : r.mode === "full" && r.commit === "c3" ? suiteFail([B], { output: "whole" }) : runRes("pass")),
       igit: { revList: async () => ["c1", "c2", "c3"] },
     });
     const { j, log } = journalOf();
-    const verdict = await runner.run(suiteReq(), j);
-    expect(verdict).toMatchObject({ kind: "culprit", ids: ["b"] });
-    expect(log.ends[2]).toMatchObject({ result: "failed", ids: ["b"], detail: { reproduced: ["b"], output: "whole" } });
-    expect(requests[4]).toMatchObject({ commit: "c0", mode: "full" });
+    // The suite commit failed only under the full commands, so the probes run the full commands, the newest range
+    // is blamed on a GREEN full probe at c2 (never on file probes that never failed), and the revert check gets no
+    // files (it runs the whole command).
+    expect(await runner.run(suiteReq(), j)).toEqual({ kind: "culprit", range: { taskId: "T3", from: "c2", to: "c3" }, ids: [B], files: [] });
+    expect(log.ends[2]).toMatchObject({ result: "failed", ids: [B], detail: { reproduced: [B], flaky: [A], output: "whole" } });
+    expect(requests.slice(0, 5).map(r => `${r.commit}:${typeof r.mode === "string" ? r.mode : "files"}`)).toEqual([
+      "c3:full", "c3:files", "c3:files", "c3:full", "c0:full",
+    ]);
+    // Every probe runs the full commands, and c2 (the boundary the culprit rests on) was probed green.
+    expect(requests.length).toBeGreaterThan(5);
+    expect(requests.slice(5).every(r => r.mode === "full")).toBe(true);
+    expect(requests.slice(5).map(r => r.commit)).toContain("c2");
+    expect(log.counters[0]).toEqual({ key: "integration.flaky", value: 1, labels: { where: "suite" } });
+    // From a red base (another id fails there) the same failure cannot be isolated: unattributed, nobody blamed.
+    const red = suiteEnv({
+      runCommands: (r, n) => (n === 1 ? suiteFail([A, B]) : r.commit === "c0" ? suiteFail(["p.test.ts > p"])
+        : r.mode === "full" ? suiteFail([B], { output: "whole" }) : runRes("pass")),
+      igit: { revList: async () => ["c1", "c2", "c3"] },
+    });
+    const rj = journalOf();
+    expect(await red.runner.run(suiteReq(), rj.j)).toEqual({ kind: "unattributed", ids: [B], reason: "base-overlap" });
+    expect(red.requests.map(r => r.commit)).toEqual(["c3", "c3", "c3", "c3", "c0"]);
+    expect(rj.log.order.at(-1)).toBe("start:bisect");
     // A red full run naming none of the original ids reproduces all of them (fail closed).
     const blind = suiteEnv({ runCommands: (r, n) => (n === 1 ? failRes(["a"]) : r.mode === "full" ? runRes("fail", { idsUnparsed: true }) : runRes("pass")) });
     expect(await blind.runner.run(suiteReq({ base: null }), journalOf().j)).toEqual({ kind: "unattributed", ids: ["a"], reason: "no-base" });
@@ -1803,18 +1828,75 @@ describe("phase suite runner: run", () => {
 
   it("QA-3.2-1: a full run that names its ids is attributable end to end: reruns, base and bisect use the ids", async () => {
     // The full run's ids now come from its output (checks.runCommands); the suite carries them to the culprit.
+    const X = "t.test.ts > x", TF = fileOfSuiteId("/slot", "t.test.ts");
     const { runner, requests } = suiteEnv({
-      runCommands: byCommit({ c3: failRes(["t > x"], { files: ["/ci/t.test.ts"] }), c2: failRes(["t > x"], { files: ["/ci/t.test.ts"] }) }),
+      runCommands: byCommit({ c3: suiteFail([X]), c2: suiteFail([X]) }),
       igit: { revList: async () => ["c1", "c2", "c3"] },
     });
     const { j, log } = journalOf();
-    expect(await runner.run(suiteReq(), j)).toEqual({ kind: "culprit", range: { taskId: "T2", from: "c1", to: "c2" }, ids: ["t > x"], files: ["/ci/t.test.ts"] });
-    expect(log.ends[0]).toMatchObject({ result: "failed", ids: ["t > x"], detail: { idsUnparsed: false } });
+    // The file reruns at the suite commit failed WITH the regression id: a file-scoped bisect, culprit with its file.
+    expect(await runner.run(suiteReq(), j)).toEqual({ kind: "culprit", range: { taskId: "T2", from: "c1", to: "c2" }, ids: [X], files: [TF] });
+    expect(log.ends[0]).toMatchObject({ result: "failed", ids: [X], detail: { idsUnparsed: false } });
     // Reruns and probes run the failing file; the base runs the full commands (QA-3.2-23).
     expect(requests.map(r => `${r.commit}:${typeof r.mode === "string" ? r.mode : r.mode.rerun.join(",")}`)).toEqual([
-      "c3:full", "c3:/ci/t.test.ts", "c3:/ci/t.test.ts", "c0:full", ...requests.slice(4).map(r => `${r.commit}:/ci/t.test.ts`),
+      "c3:full", `c3:${TF}`, `c3:${TF}`, "c0:full", ...requests.slice(4).map(r => `${r.commit}:${TF}`),
     ]);
     expect(requests.length).toBeGreaterThan(4);
+  });
+
+  it("NEW-1 (b): probe files are the regression's files minus the base's failing files, never another failing file", async () => {
+    // a (file A) is flaky; r (file R) is the regression, sharing R with p, which already fails at the base.
+    const a = "a.test.ts > a", r = "r.test.ts > r", p = "r.test.ts > p";
+    const { runner, requests } = suiteEnv({
+      runCommands: (q, n) => (n === 1 ? suiteFail([a, p, r])
+        : q.commit === "c0" ? suiteFail([p])
+          : q.commit === "c3" ? suiteFail([p, r]) : runRes("pass")),
+      igit: { revList: async () => ["c1", "c2", "c3"] },
+    });
+    const { j } = journalOf();
+    // The only regression file also fails at the base: no probe set isolates r, so nobody is blamed (the old probe
+    // set, every failing file minus the base's, was [a.test.ts]: green everywhere, the newest range blamed).
+    expect(await runner.run(suiteReq(), j)).toEqual({ kind: "unattributed", ids: [r], reason: "base-overlap" });
+    expect(requests.map(q => q.commit)).toEqual(["c3", "c3", "c3", "c3", "c0"]);
+  });
+
+  it("NEW-1 (c): an unparsed failure of the file reruns keeps the ids reproduced but never seeds a file-scoped bisect", async () => {
+    const X = "x.test.ts > x";
+    const env = (c0: CommandRunResult) => suiteEnv({
+      runCommands: (q, n) => (n === 1 ? suiteFail([X]) : q.commit === "c3" ? runRes("fail", { idsUnparsed: true, output: "ran nothing" })
+        : q.commit === "c0" ? c0 : q.commit === "c2" ? suiteFail([X]) : runRes("pass")),
+      igit: { revList: async () => ["c1", "c2", "c3"] },
+    });
+    // Green base: full-command probes; c2 fails, c1 passes -> T2, and the revert check gets no files.
+    const green = env(runRes("pass"));
+    expect(await green.runner.run(suiteReq(), journalOf().j)).toEqual({ kind: "culprit", range: { taskId: "T2", from: "c1", to: "c2" }, ids: [X], files: [] });
+    expect(green.requests.slice(4).every(q => q.mode === "full")).toBe(true);
+    // Red base (another id): unattributed.
+    const red = env(suiteFail(["o.test.ts > o"]));
+    expect(await red.runner.run(suiteReq(), journalOf().j)).toEqual({ kind: "unattributed", ids: [X], reason: "base-overlap" });
+  });
+
+  it("NEW-2: any id the file reruns clear is checked by the full run; one it reproduces is never pre-existing", async () => {
+    const a = "a.test.ts > a", p = "p.test.ts > p";
+    // The reruns reproduce p and clear a; the full run fails with both; p also fails at the base.
+    const both = suiteEnv({
+      runCommands: (q, n) => (n === 1 ? suiteFail([a, p]) : q.commit === "c0" ? suiteFail([p])
+        : q.mode === "full" ? suiteFail([a, p], { output: "whole" }) : suiteFail([p])),
+      igit: { revList: async () => ["c1", "c2", "c3"] },
+    });
+    const bj = journalOf();
+    // a was reproduced only by the full run (never by a file rerun) and the base is red: unattributed, not pre-existing.
+    expect(await both.runner.run(suiteReq(), bj.j)).toEqual({ kind: "unattributed", ids: [a], reason: "base-overlap" });
+    expect(both.requests.map(q => `${q.commit}:${typeof q.mode === "string" ? q.mode : "files"}`)).toEqual(["c3:full", "c3:files", "c3:files", "c3:full", "c0:full"]);
+    expect(bj.log.ends[2]).toMatchObject({ result: "failed", ids: [a, p], detail: { reproduced: [a, p], output: "whole" } });
+    // The full run clears a too: a is flaky and reported, p is pre-existing.
+    const cleared = suiteEnv({
+      runCommands: (q, n) => (n === 1 ? suiteFail([a, p]) : q.mode === "full" ? suiteFail([p], { output: "whole" }) : suiteFail([p])),
+    });
+    const cj = journalOf();
+    expect(await cleared.runner.run(suiteReq(), cj.j)).toEqual({ kind: "pre-existing", ids: [p] });
+    expect(cj.log.ends[2]).toMatchObject({ result: "failed", ids: [p], detail: { reproduced: [p], flaky: [a] } });
+    expect(cj.log.counters).toEqual([{ key: "integration.flaky", value: 1, labels: { where: "suite" } }]);
   });
 
   it("a failing rerun that names none of the original ids clears none of them (fail closed)", async () => {
@@ -1825,23 +1907,27 @@ describe("phase suite runner: run", () => {
   it("QA-3.2-26: a probe that fails naming none of the regression ids is a failing probe (fail closed)", async () => {
     // c1 fails with another id (or the same failure in another id form): it can no longer read as a pass, so the
     // culprit is the range that ends there, never a later innocent one.
-    const { runner } = suiteEnv({
-      runCommands: byCommit({ c3: failRes(["x"]), c2: failRes(["x"]), c1: failRes(["/abs/f.test.ts > x"]) }),
+    const X = "f.test.ts > x", F = fileOfSuiteId("/slot", "f.test.ts");
+    const { runner, requests } = suiteEnv({
+      runCommands: byCommit({ c3: suiteFail([X]), c2: suiteFail([X]), c1: failRes(["/abs/f.test.ts > x"]) }),
       igit: { revList: async () => ["c1", "c2", "c3"] },
     });
     const { j, log } = journalOf();
-    expect(await runner.run(suiteReq(), j)).toEqual({ kind: "culprit", range: { taskId: "T1", from: "c0", to: "c1" }, ids: ["x"], files: ["f.test.ts"] });
+    expect(await runner.run(suiteReq(), j)).toEqual({ kind: "culprit", range: { taskId: "T1", from: "c0", to: "c1" }, ids: [X], files: [F] });
     expect(log.ends.filter(e => e.result === "failed" && "probes" in e.detail).length).toBeGreaterThan(0);
+    expect(requests.slice(4).every(q => typeof q.mode !== "string" && q.mode.rerun.join() === F)).toBe(true);
   });
 
   it("bisects to the culprit range, probing only the regression ids and never the known base", async () => {
+    const X = "f.test.ts > x", F = fileOfSuiteId("/slot", "f.test.ts");
     const { runner, requests } = suiteEnv({
-      runCommands: byCommit({ c3: failRes(["x"]), c2: failRes(["x", "other"]) }),
+      runCommands: byCommit({ c3: suiteFail([X]), c2: suiteFail([X, "f.test.ts > other"]) }),
       igit: { revList: async () => ["c1", "c2", "c3"] },
     });
     const { j, log } = journalOf();
     const verdict = await runner.run(suiteReq(), j);
-    expect(verdict).toEqual({ kind: "culprit", range: { taskId: "T2", from: "c1", to: "c2" }, ids: ["x"], files: ["f.test.ts"] });
+    expect(verdict).toEqual({ kind: "culprit", range: { taskId: "T2", from: "c1", to: "c2" }, ids: [X], files: [F] });
+    expect(requests.slice(4).every(q => typeof q.mode !== "string" && q.mode.rerun.join() === F)).toBe(true);
     const probed = requests.slice(4).map(r => r.commit);
     expect(probed).not.toContain("c0");
     expect(probed).not.toContain("c3");

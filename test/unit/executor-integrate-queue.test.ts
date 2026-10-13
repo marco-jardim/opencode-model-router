@@ -14,7 +14,7 @@ import { removeDirWhenReleased } from "../helpers/remove-dir.js";
 vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
 import { ExecutorError } from "../../src/executor/types";
 import { createRepoLockFactory } from "../../src/executor/integrate/queue";
-import { createPhaseSuiteRunner } from "../../src/executor/integrate/phase-suite";
+import { createPhaseSuiteRunner, fileOfSuiteId } from "../../src/executor/integrate/phase-suite";
 import {
   AX_MAX_CHARS,
   BackgroundRuns,
@@ -4560,6 +4560,60 @@ describe("QA-3.2-15 / QA-3.2-16: tags after completion, row-34 batch with an in-
 describe("QA-3.2 round 2", () => {
   const okLock = (): RepoLock => ({ lost: new AbortController().signal, release: async () => undefined });
 
+  /** A culprit verdict for T1 whose file list is far over DETAIL_MAX_BYTES, so encodeDetail truncates it (m1). */
+  const manyFiles = Array.from({ length: 2000 }, (_, i) => `t/some/very/long/directory/name/number-${i}.test.ts`);
+  const hugeCulprit = (req: SuiteRunRequest): SuiteVerdict => {
+    const r = req.ranges.find(x => x.taskId === "T1");
+    return r === undefined ? { kind: "passed" } : { kind: "culprit", range: { ...r }, ids: ["test:T1"], files: manyFiles };
+  };
+
+  it("m1: a truncated suite closing detail rebuilds the revert from history with files: [] (the whole command runs)", async () => {
+    const env = await setup({ tasks: 1, batchMax: 1 });
+    env.suite.resolution = RUNS;
+    // The process dies right after the culprit batch, before the revert entry opens.
+    env.suite.onRun = req => { env.writer.crashAfter = env.writer.appends + 1; return hugeCulprit(req); };
+    env.queue.enqueue(["T1"]);
+    await env.until(() => env.w.dead, "the crash after the culprit batch");
+    env.suite.onRun = null;
+    await env.restart();
+    const closing = (await env.events()).filter(isStep).find(e => e.entry.kind === "phase-suite" && e.closes);
+    expect(parseDetail(closing?.detail)).toMatchObject({ truncated: true });
+    await env.queue.resume();
+    await env.until(() => env.state("T1") === "reverted" && env.quiet(), "the revert rebuilt from history");
+    expect(env.suite.reverts).toHaveLength(1);
+    expect(env.suite.reverts[0]?.regression).toMatchObject({ ids: ["test:T1"], files: [] });
+    env.assertInvariants();
+  });
+
+  it("m1: a truncated revert-build start detail gives the resume rerun of the revert files: []", async () => {
+    const env = await setup({ tasks: 1, batchMax: 1 });
+    env.suite.resolution = RUNS;
+    env.suite.onRun = hugeCulprit;
+    const realRevert = env.suite.revert.bind(env.suite);
+    let crashed = false;
+    // The process dies inside the first revert build (its revert-build step stays open).
+    env.suite.revert = async (req, j) => {
+      if (!crashed) {
+        crashed = true;
+        env.w.dead = true;
+        throw new CrashError("crash while building the revert");
+      }
+      return realRevert(req, j);
+    };
+    env.queue.enqueue(["T1"]);
+    await env.until(() => crashed && env.w.dead, "the crash in the revert build");
+    env.suite.onRun = null;
+    await env.restart();
+    const start = (await env.events()).filter(isStep).find(e => e.entry.kind === "revert" && e.step === "revert-build" && e.edge === "start");
+    expect(parseDetail(start?.detail)).toMatchObject({ truncated: true });
+    const report = await env.queue.resume();
+    expect(report.entries).toEqual([expect.objectContaining({ kind: "revert", action: "rerun" })]);
+    await env.until(() => env.state("T1") === "reverted" && env.quiet(), "the rerun revert");
+    expect(env.suite.reverts).toHaveLength(1);
+    expect(env.suite.reverts[0]?.regression).toMatchObject({ ids: ["test:T1"], files: [] });
+    env.assertInvariants();
+  });
+
   it("QA-3.2-24: a revert rebuilt from history after a restart carries the failing files", async () => {
     const env = await setup({ tasks: 1, batchMax: 1 });
     env.suite.resolution = RUNS;
@@ -6191,11 +6245,15 @@ describe("phase-suite runner: run (M21-M24)", () => {
       const e = runnerEnv();
       const c = e.chain(6);
       const culprit = `T${pos}`;
-      e.checks.script = commit => e.w.tasksAt(commit).includes(culprit) ? failRes([`test:${culprit}`], [`t/${culprit}.test.ts`]) : passRes;
+      // Ids as readResult/observeFull produce them (`<file> > <name>`), with the file runCommands reports for them: the
+      // same mapping the runner applies (fileOfSuiteId), so the regression's file is in the probe set (file-scoped bisect).
+      const id = `t/${culprit}.test.ts > ${culprit} works`;
+      const file = fileOfSuiteId(e.ci.path, id);
+      e.checks.script = commit => e.w.tasksAt(commit).includes(culprit) ? failRes([id], [file]) : passRes;
       const j = new JournalSpy("phase-suite");
       e.checks.journal = j;
       const v = await e.runner.run(e.request(c), j);
-      expect(v).toMatchObject({ kind: "culprit", range: { taskId: culprit }, ids: [`test:${culprit}`], files: [`t/${culprit}.test.ts`] });
+      expect(v).toMatchObject({ kind: "culprit", range: { taskId: culprit }, ids: [id], files: [file] });
       if (v.kind !== "culprit") return;
       expect(v.range).toEqual(c.ranges[pos - 1]);
       const probes = e.checks.calls.filter(x => x.commit !== c.tip && x.commit !== e.w.base);
@@ -6204,7 +6262,7 @@ describe("phase-suite runner: run (M21-M24)", () => {
       // QA-3.2-23: the base runs the FULL commands once; reruns and probes run the regression's files only.
       expect(e.checks.calls.filter(x => x.commit === e.w.base).map(x => x.mode)).toEqual(["full"]);
       expect(e.checks.calls.slice(1).filter(x => x.commit !== e.w.base)
-        .every(x => Array.isArray(x.mode) && x.mode.length === 1 && x.mode[0] === `t/${culprit}.test.ts`)).toBe(true);
+        .every(x => Array.isArray(x.mode) && x.mode.length === 1 && x.mode[0] === file)).toBe(true);
       expect(j.log.filter(x => x === "start:bisect")).toHaveLength(probes.length + 1); // + the memo step
       expect(j.open).toBe("bisect");
       expect(j.counters).toEqual([{ key: "integration.bisect.probes", value: probes.length }]);
@@ -6254,21 +6312,26 @@ describe("phase-suite runner: run (M21-M24)", () => {
   it("mixed: only the ids that do not fail at the base are blamed and bisected", async () => {
     const e = runnerEnv();
     const c = e.chain(4);
-    // A rerun runs only the files it names (as the real runner does): `test:old` fails wherever its file runs.
+    // Ids as runCommands reports them (`<file> > <name>`), each mapping (fileOfSuiteId) to its own file; a rerun runs only
+    // the files it names, as the real runner does: the pre-existing `old` fails wherever its file runs.
+    const oldId = "t/old.test.ts > old";
+    const newId = "t/new.test.ts > new";
+    const fileOf = (id: string): string => fileOfSuiteId(e.ci.path, id);
     e.checks.script = (commit, mode) => {
-      const ids = ["test:old"];
-      if (e.w.tasksAt(commit).includes("T3")) ids.push("test:new");
-      const ran = mode === "full" ? ids : ids.filter(i => mode.includes(`t/${i}.ts`));
-      return ran.length === 0 ? passRes : failRes(ran, ran.map(i => `t/${i}.ts`));
+      const ids = [oldId];
+      if (e.w.tasksAt(commit).includes("T3")) ids.push(newId);
+      const ran = mode === "full" ? ids : ids.filter(i => mode.includes(fileOf(i)));
+      return ran.length === 0 ? passRes : failRes(ran, ran.map(fileOf));
     };
     const j = new JournalSpy("phase-suite");
     e.checks.journal = j;
     const v = await e.runner.run(e.request(c), j);
-    // Probes run only the regression's own files: a pre-existing failure never makes a probe fail (QA-3.2-26 fail closed
-    // would otherwise blame the first range).
-    expect(v).toEqual({ kind: "culprit", range: c.ranges[2], ids: ["test:new"], files: ["t/test:new.ts"] });
+    // Probes run only the regression's own file (its file is not among the base-failing ones): a pre-existing failure
+    // never makes a probe fail (QA-3.2-26 fail closed would otherwise blame the first range).
+    expect(v).toEqual({ kind: "culprit", range: c.ranges[2], ids: [newId], files: [fileOf(newId)] });
     const probes = e.checks.calls.filter(x => x.commit !== c.tip && x.commit !== e.w.base);
-    expect(probes.every(x => Array.isArray(x.mode) && x.mode.join() === "t/test:new.ts")).toBe(true);
+    expect(probes.length).toBeGreaterThan(0);
+    expect(probes.every(x => Array.isArray(x.mode) && x.mode.join() === fileOf(newId))).toBe(true);
   });
 
   it("mixed in one file: a regression whose only file also fails at the base cannot be isolated -> unattributed, nobody blamed", async () => {

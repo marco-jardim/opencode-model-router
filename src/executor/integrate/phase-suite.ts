@@ -1,6 +1,7 @@
 /**
  * Phase suite runner (plan 3.2.4, memo 3.2.1 §4.4, M21-M27).
  */
+import * as nodePath from "node:path";
 import {
   CHECK_TRIES, PREEMPT_BUDGET,
   type BackgroundRuns, type CheckErrorReason, type PreemptBudget, type CheckResult, type CommandRunRequest, type CommandRunResult, type IntegrateGit,
@@ -102,6 +103,15 @@ class ProbeStop extends Error {
   }
 }
 
+/**
+ * The test file of a suite failing id, as `runCommands` reports it for a full run (`observeFull`: the id's file part,
+ * before the first " > " or "::", resolved against the slot).
+ */
+export function fileOfSuiteId(slotPath: string, id: string): string {
+  const cuts = [id.indexOf(" > "), id.indexOf("::")].filter(n => n >= 0);
+  return nodePath.resolve(slotPath, cuts.length === 0 ? id : id.slice(0, Math.min(...cuts)));
+}
+
 /** Failure ids of a run for classification: an unparsed failure counts as every id of `original`. */
 function failedIdsOf(r: CommandRunResult, original: readonly string[]): string[] {
   if (r.verdict !== "fail") return [];
@@ -144,6 +154,9 @@ async function runSuite(d: PhaseSuiteDeps, req: SuiteRunRequest, j: StepJournal)
   // is a failure (unparsed), never a pass.
   const rerunFailed: string[][] = [];
   let anyRerunFailed = false;
+  // NEW-1: the original ids a file-scoped rerun at the suite commit failed WITH (a parsed failure naming them). Only
+  // these make the suite commit a known failure for a file-scoped bisect.
+  const fileSeen = new Set<string>();
   let reproduced: string[] = [];
   for (const n of [1, 2] as const) {
     const detail: StepDetail = { v: 1, n, files };
@@ -152,6 +165,7 @@ async function runSuite(d: PhaseSuiteDeps, req: SuiteRunRequest, j: StepJournal)
     if (s.kind !== "ok") return s;
     rerunFailed.push(failedIdsOf(s.value, ids));
     if (s.value.verdict === "fail") anyRerunFailed = true;
+    if (attributable && s.value.verdict === "fail" && !s.value.idsUnparsed) for (const id of s.value.ids) if (ids.includes(id)) fileSeen.add(id);
     if (n === 1) {
       await j.end(s.value.verdict === "fail" ? "failed" : "ok", { v: 1, durationMs: s.value.durationMs, output: s.value.output }, rerunFailed[0] ?? []);
       continue;
@@ -159,18 +173,23 @@ async function runSuite(d: PhaseSuiteDeps, req: SuiteRunRequest, j: StepJournal)
     const classified = classifyReruns(ids, [rerunFailed[0] ?? [], rerunFailed[1] ?? []]);
     let last = s.value;
     reproduced = classified.reproduced;
-    if (attributable && reproduced.length === 0) {
-      // QA-3.2-23: reruns of the failing files alone never clear the failure: one green run of the full commands
-      // (in the same open step) must agree before it is flaky. A red one reproduces the original ids it names (all
-      // of them when it names none).
+    let cleared = classified.flaky;
+    if (attributable && cleared.length > 0) {
+      // QA-3.2-23, NEW-2: reruns of the failing files never clear an id alone. Whenever they cleared any, one run of
+      // the full commands (in the same open step) checks them: an id it fails with is reproduced (by the full run
+      // only, so it never seeds a file-scoped bisect), all of them when it fails naming none; the rest are flaky.
       const whole = await stepped(j, "suite-rerun", detail, () => exec(req.commit, "full"));
       if (whole.kind !== "ok") return whole;
       last = whole.value;
-      reproduced = classifyReruns(ids, [failedIdsOf(last, ids), []]).reproduced;
+      const again = new Set(failedIdsOf(last, ids));
+      reproduced = ids.filter(id => reproduced.includes(id) || again.has(id));
+      cleared = cleared.filter(id => !again.has(id));
     }
     const flaky = attributable ? reproduced.length === 0 : !anyRerunFailed;
-    if (flaky) return { kind: "flaky", ids: classified.flaky }; // the second rerun stays open: the queue closes the entry with it
-    await j.end("failed", { v: 1, reproduced, durationMs: last.durationMs, output: last.output }, reproduced);
+    if (flaky) return { kind: "flaky", ids: cleared }; // the second rerun stays open: the queue closes the entry with it
+    // NEW-2: ids cleared next to a reproduced failure are reported (counter, and the ids in the step detail).
+    if (cleared.length > 0) j.counter("integration.flaky", cleared.length, { where: "suite" });
+    await j.end("failed", { v: 1, reproduced, ...(cleared.length > 0 ? { flaky: cleared } : {}), durationMs: last.durationMs, output: last.output }, reproduced);
   }
 
   // 3. The phase base (M23): failures that also fail there are pre-existing and not bisected. QA-3.2-23: the base runs
@@ -198,17 +217,23 @@ async function runSuite(d: PhaseSuiteDeps, req: SuiteRunRequest, j: StepJournal)
   if (attributable && regression.length === 0) return { kind: "pre-existing", ids: reproduced }; // the base step stays open
   await j.end(baseRun.verdict === "fail" ? "failed" : "ok", { v: 1, durationMs: baseRun.durationMs, output: baseRun.output }, baseRun.verdict === "fail" ? baseRun.ids : []);
 
-  // M22 "bisect using only regression.files": the probes run only the failing files that do not already fail at the base.
-  // With QA-3.2-26 (a failing probe fails, whatever ids it names) a pre-existing failure in a probed file would fail
-  // every probe and blame the first range. When every failing file also fails at the base (a regression sharing a file
-  // with a pre-existing failure), the regression cannot be isolated: fail closed, unattributed, nobody blamed.
-  const baseFiles = new Set(baseRun.verdict === "fail" ? baseRun.files : []);
-  const probeFiles = attributable ? files.filter(f => !baseFiles.has(f)) : [];
-  if (attributable && probeFiles.length === 0) {
+  // NEW-1 (M22 "bisect using only regression.files"): the probe files are the files of the REGRESSION ids, minus the
+  // files that already fail at the base (with QA-3.2-26 a failing probe fails whatever ids it names, so a pre-existing
+  // failure in a probed file would fail every probe). The bisect seeds the suite commit as failing, so a file-scoped
+  // bisect is sound only when a file-scoped rerun there failed WITH a regression id in those files. Otherwise the
+  // probes run the full commands, which is sound only from a green base: the culprit then carries no files, so its
+  // revert check runs the whole command. From a red base nothing can be isolated: unattributed, nobody blamed.
+  const baseRed = baseRun.verdict === "fail";
+  const baseFiles = new Set(baseRed ? baseRun.files : []);
+  const regressionFiles = [...new Set(regression.map(id => fileOfSuiteId(req.slot.path, id)))];
+  const mapped = attributable && regressionFiles.every(f => files.includes(f));
+  const probeFiles = mapped ? regressionFiles.filter(f => !baseFiles.has(f)) : [];
+  const fileScoped = regression.some(id => fileSeen.has(id) && probeFiles.includes(fileOfSuiteId(req.slot.path, id)));
+  if (!fileScoped && baseRed) {
     await memoStep(req.ranges.map(r => r.taskId));
     return { kind: "unattributed", ids: regression, reason: "base-overlap" };
   }
-  const probeMode: CommandRunRequest["mode"] = attributable ? { rerun: probeFiles } : "full";
+  const probeMode: CommandRunRequest["mode"] = fileScoped ? { rerun: probeFiles } : "full";
 
   // 4. Bisect over the phase's ranges, running only the regression.
   let ordered: TaskRange[];
@@ -250,8 +275,9 @@ async function runSuite(d: PhaseSuiteDeps, req: SuiteRunRequest, j: StepJournal)
   j.counter("integration.bisect.probes", probes, { kind: "suite" });
   await memoStep(ordered.map(r => r.taskId));
   if (found.kind === "outside") return { kind: "unattributed", ids: regression, reason: "outside" };
-  // The revert's regression checks run the files the bisect ran (the regression's own files).
-  return { kind: "culprit", range: found.range, ids: regression, files: attributable ? probeFiles : files };
+  // The revert's regression check runs the files the bisect ran (the regression's own files), or with full-command
+  // probes no file at all, so it runs the whole command (NEW-1).
+  return { kind: "culprit", range: found.range, ids: regression, files: fileScoped ? probeFiles : [] };
 }
 
 type BuiltRevert = { kind: "built"; head: string; reverted: string[] } | { kind: "conflict"; at: string; paths: string[] };
