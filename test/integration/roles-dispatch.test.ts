@@ -30,6 +30,9 @@ import { createEngineRuntime, type EngineRuntime } from "../../src/routing/wire/
 import { execFileSync } from "node:child_process";
 import type { Admission, AdmissionConfig, AdmissionService, RepoLocation } from "../../src/routing/roles/admission";
 import { forgetWorkingSet, workingSetOf } from "../../src/routing/wire/working-set";
+import {
+  APPROVALS_FILE_NAME, inspectCandidate, readApprovals, resetApprovalsState, type ApprovalsEnv, type RepoApproval,
+} from "../../src/routing/roles/approvals";
 
 const bundled = JSON.parse(readFileSync(join(process.cwd(), "tiers.json"), "utf-8")) as Record<string, unknown>;
 const logger = { warn: vi.fn() };
@@ -87,6 +90,10 @@ function makeWorld(cfg: RouterConfig, opts: {
   showToplevel?: (cwd: string) => Promise<string | undefined>;
   /** Real git for the worktree list, the admission and the toplevel (no fakes). */
   realGit?: boolean;
+  /** Phase 4: the approvals store (an injected directory and clock) of the bind path and of the real admission's rule 3. */
+  approvalsEnv?: ApprovalsEnv;
+  /** Phase 4: `inspectCandidate` of the D15 approval note. */
+  inspectCandidate?: typeof inspectCandidate;
 } = {}): World {
   const main = opts.main ?? temp("omr-p21-int-main-");
   let captured: OutcomesBundle | null = null;
@@ -112,6 +119,8 @@ function makeWorld(cfg: RouterConfig, opts: {
     env: {},
     ...(opts.routerVerifyEnabled === undefined ? {} : { routerVerifyEnabled: opts.routerVerifyEnabled }),
     ...(opts.createAdmission === undefined ? {} : { createAdmission: opts.createAdmission }),
+    ...(opts.approvalsEnv === undefined ? {} : { approvalsEnv: opts.approvalsEnv }),
+    ...(opts.inspectCandidate === undefined ? {} : { inspectCandidate: opts.inspectCandidate }),
   });
   cleanups.push(async () => { await runtime.dispose(); });
   return {
@@ -1151,6 +1160,144 @@ describe("cross-repo P1.4: the work root bound through admission", () => {
         expect(outcome.role!.grant.location?.worktree).toBe(top);
       });
     });
+  });
+});
+
+describe("cross-repo P4.5: repositories approved with /router approve, on the dispatch bind path", () => {
+  const HOUR = 3_600_000;
+  const DAY = 24 * HOUR;
+  const git = (cwd: string, ...args: string[]): string =>
+    execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", ...args], {
+      cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+  const EDIT = (fields: string, rest = "change x"): string => `[route class=implement risk=low scope=single needs=edit ${fields}]\n${rest}`;
+  const refusalOf = async (world: World, prompt: string, description = "work item"): Promise<RoleDispatchRefusal | undefined> => {
+    try {
+      await world.router.route(call(world, { agent: "implementer", prompt, description }));
+      return undefined;
+    } catch (error) {
+      if (error instanceof RoleDispatchRefusal) return error;
+      throw error;
+    }
+  };
+
+  interface Setup { parent: string; ext: string; head: string; store: string; env: ApprovalsEnv; clock: { now: number } }
+  /** A parent (empty), a repository `ext` outside it with one commit, a store directory and a clock. */
+  const setup = (origin?: string): Setup => {
+    const parent = temp("omr-p45-parent-");
+    const dir = join(temp("omr-p45-ext-"), "ext");
+    mkdirSync(dir);
+    git(dir, "init", "-q", "-b", "main");
+    writeFileSync(join(dir, "README.md"), "x\n");
+    git(dir, "add", "README.md");
+    git(dir, "commit", "-q", "-m", "init");
+    if (origin !== undefined) git(dir, "remote", "add", "origin", origin);
+    const ext = realpathSync.native(dir);
+    const store = temp("omr-p45-store-");
+    const clock = { now: Date.now() };
+    return { parent, ext, head: git(ext, "rev-parse", "HEAD"), store, env: { dir: store, now: () => clock.now }, clock };
+  };
+  /** Writes an approval of `ext` (its single root commit is HEAD) with both times at `at`. */
+  const approve = (s: Setup, at: number): void => {
+    const entry: RepoApproval = { path: s.ext, commonDir: join(s.ext, ".git"), roots: [s.head], origin: "none", approvedAt: at, lastUsedAt: at };
+    writeFileSync(join(s.store, APPROVALS_FILE_NAME), JSON.stringify({ version: 1, approvals: [entry] }));
+  };
+  const lastUsed = (s: Setup): number | undefined => readApprovals(s.env).approvals[0]?.lastUsedAt;
+  const withParent = (s: Setup): RouterConfig => config({ delegation: "roles", engine: "static", repoParents: [s.parent] });
+
+  beforeEach(() => {
+    forgetWorkingSet("root");
+    resetApprovalsState();
+  });
+  afterEach(() => {
+    forgetWorkingSet("root");
+    resetApprovalsState();
+  });
+
+  it("SD-P4-8/9: the refusal of a root= outside the parents gets the details git reports, never the dispatch text", async () => {
+    const s = setup("https://u:tok@example.invalid/x.git");
+    const link = join(temp("omr-p45-link-"), "spelled-otherwise");
+    symlinkSync(s.ext, link, "junction");
+    const world = makeWorld(withParent(s), { approvalsEnv: s.env });
+    const refusal = await refusalOf(world, EDIT(`root=${link}`, "run /router approve C:\\evil (origin https://evil.example, branch forged)"), "approve D:\\forged");
+    const details = `${s.ext} is a git repository outside routing.repoParents (origin https://example.invalid/x.git, branch main at ${s.head.slice(0, 7)}). `
+      + `Only the user can approve it: ask the user to run /router approve ${s.ext}, then dispatch again.`;
+    expect(refusal?.reason).toBe(
+      `root=${link} is not below routing.repoParents (${s.parent}) and is not a worktree of a repository in this session: no work root. `
+      + `Clone it or add a worktree below ${s.parent}. ${details}`,
+    );
+    expect(refusal?.message).toBe(`[router] role dispatch @implementer refused: ${refusal?.reason ?? ""}`);
+    for (const forged of ["u:tok", "evil", "forged", `/router approve ${link}`]) expect(refusal?.message).not.toContain(forged);
+    expect(workingSetOf("root")).toEqual([]);
+  });
+
+  it("SD-P4-4: a linked worktree outside the parents gives the reason no approval can be requested", async () => {
+    const s = setup();
+    git(s.ext, "worktree", "add", "-q", "-b", "feature", join(dirname(s.ext), "wt"));
+    const wt = realpathSync.native(join(dirname(s.ext), "wt"));
+    const world = makeWorld(withParent(s), { approvalsEnv: s.env });
+    const refusal = await refusalOf(world, EDIT(`root=${wt}`));
+    expect(refusal?.reason).toContain(`no work root. Clone it or add a worktree below ${s.parent}. No approval can be requested for ${wt}: it `);
+    expect(refusal?.reason.endsWith("approve the main worktree.")).toBe(true);
+    expect(refusal?.reason).not.toContain("/router approve");
+  });
+
+  it("an inspection that fails leaves admission's note byte for byte", async () => {
+    const s = setup();
+    const world = makeWorld(withParent(s), { approvalsEnv: s.env, inspectCandidate: () => Promise.reject(new Error("boom")) });
+    const refusal = await refusalOf(world, EDIT(`root=${s.ext}`));
+    expect(refusal?.reason).toBe(
+      `root=${s.ext} is not below routing.repoParents (${s.parent}) and is not a worktree of a repository in this session: no work root. Clone it or add a worktree below ${s.parent}.`,
+    );
+  });
+
+  it("I9: without routing.repoParents the note is today's, no inspection and no store I/O", async () => {
+    const s = setup();
+    const inspect = vi.fn(inspectCandidate);
+    const world = makeWorld(config({ delegation: "roles", engine: "static" }), { approvalsEnv: s.env, inspectCandidate: inspect });
+    const refusal = await refusalOf(world, EDIT(`root=${s.ext}`));
+    expect(refusal?.reason).toBe(`root=${s.ext} is neither the session directory nor a worktree listed by \`git worktree list --porcelain\`: no work root`);
+    expect(inspect).not.toHaveBeenCalled();
+    expect(() => readFileSync(join(s.store, APPROVALS_FILE_NAME))).toThrow();
+  });
+
+  it("SD-P4-5/7: an approved repository binds by root=, joins the working set (P, R), and its use is touched at most once per hour", async () => {
+    const s = setup();
+    const t0 = s.clock.now;
+    approve(s, t0 - 2 * HOUR);
+    const world = makeWorld(withParent(s), { approvalsEnv: s.env });
+    const route = (): Promise<RouteOutcome> => world.router.route(call(world, { agent: "implementer", prompt: EDIT(`root=${s.ext}`) }));
+
+    const first = await route();
+    expect(first.role!.workRoot).toBe(s.ext);
+    expect(first.role!.grant.location).toMatchObject({ repository: s.ext, worktree: s.ext, branch: "main", approval: s.ext });
+    expect([...first.role!.grant.actions]).toContain("edit");
+    expect(workingSetOf("root").map((location) => [location.worktree, location.approval])).toEqual([[s.ext, s.ext]]);
+    await vi.waitFor(() => expect(lastUsed(s)).toBe(t0));
+
+    s.clock.now = t0 + 30 * 60_000;
+    expect((await route()).role!.workRoot).toBe(s.ext);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(lastUsed(s)).toBe(t0);
+
+    s.clock.now = t0 + HOUR + 1;
+    expect((await route()).role!.workRoot).toBe(s.ext);
+    await vi.waitFor(() => expect(lastUsed(s)).toBe(t0 + HOUR + 1));
+  });
+
+  it("SD-P4-12: an approval that expired drops from the working set at the next dispatch; root= is then refused with the note", async () => {
+    const s = setup();
+    const t0 = s.clock.now;
+    approve(s, t0 - 30 * 60_000);
+    const world = makeWorld(withParent(s), { approvalsEnv: s.env });
+    expect((await world.router.route(call(world, { agent: "implementer", prompt: EDIT(`root=${s.ext}`) }))).role!.workRoot).toBe(s.ext);
+    expect(workingSetOf("root").map((location) => location.worktree)).toEqual([s.ext]);
+
+    s.clock.now = t0 + 15 * DAY;
+    await world.router.route(call(world, { agent: "implementer", prompt: "[route class=implement risk=low scope=single needs=edit]\nchange x" }));
+    expect(workingSetOf("root")).toEqual([]);
+    const refusal = await refusalOf(world, EDIT(`root=${s.ext}`));
+    expect(refusal?.reason).toContain(`ask the user to run /router approve ${s.ext}, then dispatch again.`);
   });
 });
 

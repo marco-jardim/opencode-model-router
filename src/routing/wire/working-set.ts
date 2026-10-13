@@ -29,3 +29,30 @@ export function workingSetOf(orchestratorSessionID: string): readonly RepoLocati
 export function forgetWorkingSet(orchestratorSessionID: string): void {
   sets.delete(orchestratorSessionID);
 }
+
+/** Comparison key of a path: case-insensitive on Windows. */
+function workingSetKey(p: string, platform: NodeJS.Platform): string {
+  return platform === "win32" ? p.toLowerCase() : p;
+}
+
+/**
+ * Remove one repository from every session's working set (SD-P4-12, `/router revoke`): every entry of the repository whose
+ * main worktree is the canonical path `match` (any of its worktrees), every entry bound to that worktree, and every entry
+ * backed by an approval of that path. Paths compare as text, case-insensitive on win32. Returns the number of entries removed.
+ */
+export function dropFromWorkingSets(match: string, platform: NodeJS.Platform = process.platform): number {
+  const key = workingSetKey(match, platform);
+  const hit = (entry: RepoLocation): boolean =>
+    workingSetKey(entry.repository, platform) === key
+    || workingSetKey(entry.worktree, platform) === key
+    || (entry.approval !== undefined && workingSetKey(entry.approval, platform) === key);
+  let removed = 0;
+  for (const [sessionID, entries] of sets) {
+    const kept = entries.filter((entry) => !hit(entry));
+    if (kept.length === entries.length) continue;
+    removed += entries.length - kept.length;
+    if (kept.length === 0) sets.delete(sessionID);
+    else sets.set(sessionID, kept);
+  }
+  return removed;
+}

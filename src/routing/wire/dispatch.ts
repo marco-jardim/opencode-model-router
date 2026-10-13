@@ -67,7 +67,7 @@ import { realpathSync } from "node:fs";
 import { dirname } from "node:path";
 import type { Admission, AdmissionConfig, AdmissionService, RepoLocation } from "../roles/admission";
 import { buildRoleDispatchHeader, stripDispatchHeader } from "../../router/dispatch-header";
-import { addToWorkingSet, workingSetOf } from "./working-set";
+import { addToWorkingSet, dropFromWorkingSets, workingSetOf } from "./working-set";
 import {
   consumeRunnerDispatch, consumeRunnerDispatchLoose, forgetDispatch, lookupDispatch, rememberDispatch, runnerDescription,
   updateDispatchVerification, type CarriedVerification, type DetectionDepth, type DispatchInput, type DispatchRecord,
@@ -96,6 +96,116 @@ import {
 } from "../outcomes/types";
 import { agentModelRef, type AgentView } from "./host-info";
 import { sessionRulesOf, type EngineRuntime, type Prepared, type RolePrepared, type WireLogger } from "./runtime";
+import {
+  applyApproval, inspectCandidate, isApprovalValid, readApprovals, validApprovals, type ApprovalsEnv, type CandidateIdentity,
+} from "../roles/approvals";
+import { DEFAULT_REPO_APPROVAL_DAYS } from "../../router/roles-config";
+
+// ── Cross-repo Phase 4: repositories approved with `/router approve` (docs/design/cross-repo-phase4-plan.md) ────────────────
+
+/** The approval part of a D15 refusal waits at most this long for `inspectCandidate`; then the note stays as it is (SD-P4-8). */
+export const APPROVAL_NOTE_TIMEOUT_MS = 8_000;
+
+export interface ApprovalNoteOptions {
+  /** `routing.repoExclude`. */
+  readonly exclude?: readonly string[];
+  /** The approvals store environment (tests: an injected directory). */
+  readonly env?: ApprovalsEnv;
+  /** Default {@link inspectCandidate}; tests inject a fake. */
+  readonly inspect?: typeof inspectCandidate;
+  /** Default {@link APPROVAL_NOTE_TIMEOUT_MS}. */
+  readonly timeoutMs?: number;
+}
+
+/** The details of an approvable candidate, every field from git (`inspectCandidate`) and through `displaySafe` (SD-P4-8, -9). */
+function approvalDetails(identity: CandidateIdentity): string {
+  const where = displaySafe(identity.path);
+  const head = displaySafe(identity.head).slice(0, 7) || "unknown";
+  const at = identity.branch === "(detached)" ? `detached at ${head}` : `branch ${displaySafe(identity.branch)} at ${head}`;
+  const command = /\s/.test(where) ? `/router approve "${where}"` : `/router approve ${where}`;
+  return `${where} is a git repository outside routing.repoParents (origin ${displaySafe(identity.origin)}, ${at}). `
+    + `Only the user can approve it: ask the user to run ${command}, then dispatch again.`;
+}
+
+/**
+ * Cross-repo Phase 4 (SD-P4-8, -9): the text appended to the D15 refusal of a dispatch whose admission refusal carries
+ * `approvable` (admission's canonical candidate). Built only from what `inspectCandidate` reports about that candidate — never
+ * from the dispatch text: its path, origin (credentials stripped), branch (or detached) at the short head, and the command the
+ * user types; or, when `inspectCandidate` names a problem, why no approval can be requested. Undefined — the note stays as it
+ * is — when the inspection throws or takes longer than {@link APPROVAL_NOTE_TIMEOUT_MS}. Never throws.
+ */
+export async function approvalNote(approvable: string, opts: ApprovalNoteOptions = {}): Promise<string | undefined> {
+  const inspect = opts.inspect ?? inspectCandidate;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const timedOut = new Promise<undefined>((resolve) => {
+      timer = setTimeout(() => resolve(undefined), opts.timeoutMs ?? APPROVAL_NOTE_TIMEOUT_MS);
+    });
+    const inspected = inspect(approvable, { exclude: opts.exclude ?? [], ...(opts.env === undefined ? {} : { env: opts.env }) });
+    const found = await Promise.race([inspected, timedOut]);
+    if (found === undefined) return undefined;
+    if (typeof found === "string") {
+      const problem = found.trim().replace(/\.+$/, "");
+      return problem === "" ? undefined : `No approval can be requested for ${displaySafe(approvable)}: it ${displaySafe(problem)}.`;
+    }
+    return approvalDetails(found);
+  } catch {
+    return undefined;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
+ * Cross-repo Phase 4 (SD-P4-7): records the use of the approval `approvalPath` after a binding it backs — fire and forget: the
+ * entry's roots come from the store (read without git), `applyApproval` `touch` writes at most once per hour per path, only while
+ * the entry still has those roots and is valid, and never throws. Nothing here can fail the dispatch.
+ */
+export function touchApproval(approvalPath: string, days: number, env: ApprovalsEnv = {}): void {
+  try {
+    const entry = readApprovals(env).approvals.find((candidate) => candidate.path === approvalPath);
+    if (entry === undefined) return;
+    void applyApproval({ kind: "touch", path: entry.path, roots: entry.roots, days }, env).catch(() => undefined);
+  } catch {
+    // a failed touch never fails the dispatch
+  }
+}
+
+/**
+ * Cross-repo Phase 4 (SD-P4-12): `locations` (a working set) without the entries backed by an approval that no longer applies
+ * (revoked, expired, or an unreadable store: fail closed), read from the store without git. The lapsed approvals are dropped from
+ * every working set too (`dropFromWorkingSets`), so the read set shrinks with them. No store I/O when no entry is backed by an
+ * approval.
+ */
+export function pruneLapsedApprovals(
+  locations: readonly RepoLocation[],
+  days: number,
+  env: ApprovalsEnv = {},
+  platform: NodeJS.Platform = process.platform,
+): readonly RepoLocation[] {
+  if (!locations.some((location) => location.approval !== undefined)) return locations;
+  let valid: ReadonlySet<string>;
+  try {
+    const now = (env.now ?? Date.now)();
+    valid = new Set(readApprovals(env).approvals.filter((entry) => isApprovalValid(entry, days, now)).map((entry) => normalizeRootText(entry.path, platform)));
+  } catch {
+    valid = new Set();
+  }
+  const lapsed = new Set<string>();
+  const kept = locations.filter((location) => {
+    if (location.approval === undefined || valid.has(normalizeRootText(location.approval, platform))) return true;
+    lapsed.add(location.approval);
+    return false;
+  });
+  for (const approval of lapsed) {
+    try {
+      dropFromWorkingSets(approval, platform);
+    } catch {
+      // the entries are left out of `known` above in any case
+    }
+  }
+  return kept;
+}
 
 /** A fresh dispatch can be claimed by a `session.created` event for at most this long. */
 export const PENDING_TTL_MS = 120_000;
@@ -268,6 +378,14 @@ export interface DispatchRouterDeps {
    * `createAdmission` (`roles/admission.ts`). Tests inject a fake.
    */
   readonly createAdmission?: (config: AdmissionConfig) => Pick<AdmissionService, "admit" | "resolve">;
+  /**
+   * Cross-repo Phase 4: the approvals store environment of the dispatch bind path (the D15 approval note, `touch` after an
+   * approval-backed binding, pruning lapsed approvals from the working set). Default: the real store. Tests inject a directory
+   * and a clock.
+   */
+  readonly approvalsEnv?: ApprovalsEnv;
+  /** Cross-repo Phase 4 (SD-P4-8): `inspectCandidate` for the D15 approval note; tests inject a fake. */
+  readonly inspectCandidate?: typeof inspectCandidate;
   readonly runtime: EngineRuntime;
   /** `ctx.session.get({ sessionID })`. */
   readonly getSession: (sessionID: string) => Promise<unknown>;
@@ -527,6 +645,11 @@ export interface WorkRootResolution {
   readonly note: string | null;
   /** Cross-repo (P1.4): where the work root lies, when admission bound it. */
   readonly location?: RepoLocation;
+  /**
+   * Cross-repo Phase 4 (SD-P4-8): the canonical candidate of an admission refusal that a human could approve with
+   * `/router approve` (admission's `approvable`). Set only with `workRoot: null`; the dispatch bind path turns it into a note.
+   */
+  readonly approvable?: string;
 }
 
 /**
@@ -608,7 +731,12 @@ export async function resolveRoleWorkRoot(
     } catch (error) {
       result = { ok: false, reason: `admission failed: ${describeError(error)}: no work root.` };
     }
-    if (!result.ok) return { workRoot: null, requested: input.root, note: result.reason };
+    if (!result.ok) {
+      const approvable = result.approvable;
+      return approvable === undefined
+        ? { workRoot: null, requested: input.root, note: result.reason }
+        : { workRoot: null, requested: input.root, note: result.reason, approvable };
+    }
     const resolved = canonical(result.location.worktree);
     if (resolved === null) return { workRoot: null, requested: input.root, note: `${result.location.worktree} does not resolve on disk: no work root` };
     // QA round 1 (F8): the admitted worktree is canonical; one that now resolves elsewhere (a link swapped in since) binds nothing.
@@ -1613,13 +1741,23 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     }
   };
 
-  // Cross-repo (P1.4): one admission per resolved `{ repoParents, repoDepth, repoExclude }` (it caches its git results for 5 s).
+  /** The real admission; with an injected {@link DispatchRouterDeps.approvalsEnv}, its rule 3 reads that store (Phase 4). */
+  const defaultAdmission = async (config: AdmissionConfig): Promise<Pick<AdmissionService, "admit" | "resolve">> => {
+    const { createAdmission, defaultAdmissionDeps } = await import("../roles/admission");
+    const env = deps.approvalsEnv;
+    if (env === undefined) return createAdmission(config);
+    const days = config.approvalDays ?? DEFAULT_REPO_APPROVAL_DAYS;
+    return createAdmission(config, { ...defaultAdmissionDeps({ approvalDays: days }), approvals: () => validApprovals(days, env) });
+  };
+
+  // Cross-repo (P1.4): one admission per resolved `{ repoParents, repoDepth, repoExclude, repoApprovalDays }` (it caches its git
+  // results for 5 s).
   let admissionMemo: { readonly key: string; readonly service: Pick<AdmissionService, "admit" | "resolve"> } | undefined;
   const admissionFor = async (config: AdmissionConfig): Promise<Pick<AdmissionService, "admit" | "resolve">> => {
-    const key = JSON.stringify([config.parents, config.depth, config.exclude]);
+    const key = JSON.stringify([config.parents, config.depth, config.exclude, config.approvalDays ?? null]);
     if (admissionMemo !== undefined && admissionMemo.key === key) return admissionMemo.service;
     // Loaded lazily: admission.ts imports this module, so no import cycle is evaluated at load time.
-    const service = deps.createAdmission !== undefined ? deps.createAdmission(config) : (await import("../roles/admission")).createAdmission(config);
+    const service = deps.createAdmission !== undefined ? deps.createAdmission(config) : await defaultAdmission(config);
     admissionMemo = { key, service };
     return service;
   };
@@ -1640,8 +1778,18 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     const branch = line?.branch ?? undefined;
     if (routing.delegation !== "roles") return undefined;
     if (routing.repoParents.length === 0 && repo === undefined && branch === undefined) return undefined;
-    const admission = await admissionFor({ parents: routing.repoParents, depth: routing.repoDepth, exclude: routing.repoExclude });
-    const known = [...new Set([sessionDirectory, ...workingSetOf(orchestratorSessionID).map((location) => location.worktree)])];
+    const admission = await admissionFor({
+      parents: routing.repoParents,
+      depth: routing.repoDepth,
+      exclude: routing.repoExclude,
+      approvalDays: routing.repoApprovalDays,
+    });
+    // Phase 4 (SD-P4-12): a working-set entry whose approval lapsed (revoked, expired) is dropped before it can admit by rule 2;
+    // a store read without git, only with parents (I9) and only when an entry is backed by an approval.
+    const workingSet = routing.repoParents.length === 0
+      ? workingSetOf(orchestratorSessionID)
+      : pruneLapsedApprovals(workingSetOf(orchestratorSessionID), routing.repoApprovalDays, deps.approvalsEnv, workRootDeps.platform);
+    const known = [...new Set([sessionDirectory, ...workingSet.map((location) => location.worktree)])];
     return { repo, branch, admission, sessionRepository: sessionDirectory, known };
   };
 
@@ -1865,7 +2013,19 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         }
       : await bindWorkRoot(rp.cfg, call.sessionID, sessionDirectory, declaredLine);
     // The note may echo route-line text and filesystem names: escaped before it reaches the orchestrator.
-    if (declaredTarget && root.workRoot === null && root.note !== null && bound?.kind !== "exact") throw new RoleDispatchRefusal(agent, displaySafe(root.note));
+    if (declaredTarget && root.workRoot === null && root.note !== null && bound?.kind !== "exact") {
+      // Phase 4 (SD-P4-8): a candidate a human could approve gets the details git reports about it (never the dispatch text).
+      // Only here, on the dispatch bind path: `declaresBoundTarget` also runs `bindWorkRoot` but only compares, so no git there.
+      const approval = root.approvable === undefined ? undefined : await approvalNote(root.approvable, {
+        exclude: resolveRolesRouting(rp.cfg, "v2").repoExclude,
+        ...(deps.approvalsEnv === undefined ? {} : { env: deps.approvalsEnv }),
+        ...(deps.inspectCandidate === undefined ? {} : { inspect: deps.inspectCandidate }),
+      });
+      throw new RoleDispatchRefusal(agent, displaySafe(approval === undefined ? root.note : `${root.note} ${approval}`));
+    }
+    // Phase 4 (SD-P4-7): a fresh binding backed by an approval records its use (fire and forget, at most once per hour).
+    const approvedBy = declaredTarget && exactBound !== undefined ? undefined : root.location?.approval;
+    if (root.workRoot !== null && approvedBy !== undefined) touchApproval(approvedBy, resolveRolesRouting(rp.cfg, "v2").repoApprovalDays, deps.approvalsEnv);
 
     // 3. classify in the dispatch's own root (QA-G-B-3 (1)): an absolute path inside it is no `external_dir`. A resume of an exactly
     // bound child is classified in its bound root (QA-P33F1-1-1); without a `root=` (the work root is the session directory) or a

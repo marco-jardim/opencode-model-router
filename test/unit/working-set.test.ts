@@ -1,7 +1,7 @@
 /** Cross-repo P1.4: the per-orchestrator working set of bound repository locations. */
 import { afterEach, describe, expect, it } from "vitest";
 import type { RepoLocation } from "../../src/routing/roles/admission";
-import { WORKING_SET_MAX, addToWorkingSet, forgetWorkingSet, workingSetOf } from "../../src/routing/wire/working-set";
+import { WORKING_SET_MAX, addToWorkingSet, dropFromWorkingSets, forgetWorkingSet, workingSetOf } from "../../src/routing/wire/working-set";
 
 const located = (worktree: string, branch: string | null = "main"): RepoLocation => ({
   repository: worktree, name: worktree.split("/").pop() ?? worktree, worktree, branch, head: "abc1234def", worktrees: [],
@@ -46,5 +46,39 @@ describe("working set (cross-repo P1.4)", () => {
     forgetWorkingSet("orch-a");
     expect(workingSetOf("orch-a")).toEqual([]);
     expect(workingSetOf("orch-b")).toHaveLength(1);
+  });
+});
+
+describe("dropFromWorkingSets (cross-repo P4, /router revoke)", () => {
+  const inRepo = (repository: string, worktree: string, approval?: string): RepoLocation => ({
+    ...located(worktree), repository, ...(approval === undefined ? {} : { approval }),
+  });
+
+  it("removes the repository (main worktree, its other worktrees, approval-backed entries) from every session", () => {
+    addToWorkingSet("orch-a", inRepo("/ext/app", "/ext/app", "/ext/app"));
+    addToWorkingSet("orch-a", located("/src/api"));
+    addToWorkingSet("orch-a", inRepo("/ext/app", "/wt/app-feat", "/ext/app"));
+    addToWorkingSet("orch-b", inRepo("/ext/app", "/wt/app-fix"));
+    addToWorkingSet("orch-b", located("/src/lib"));
+    expect(dropFromWorkingSets("/ext/app", "linux")).toBe(3);
+    expect(workingSetOf("orch-a").map((l) => l.worktree)).toEqual(["/src/api"]);
+    expect(workingSetOf("orch-b").map((l) => l.worktree)).toEqual(["/src/lib"]);
+  });
+
+  it("is case-insensitive on win32 only, and an unknown path removes nothing", () => {
+    addToWorkingSet("orch-a", inRepo("D:\\Ext\\App", "D:\\Ext\\App", "D:\\Ext\\App"));
+    expect(dropFromWorkingSets("d:\\ext\\app", "linux")).toBe(0);
+    expect(workingSetOf("orch-a")).toHaveLength(1);
+    expect(dropFromWorkingSets("D:\\other", "win32")).toBe(0);
+    expect(dropFromWorkingSets("d:\\ext\\app", "win32")).toBe(1);
+    expect(workingSetOf("orch-a")).toEqual([]);
+  });
+
+  it("leaves an emptied session with no set and other sessions untouched", () => {
+    addToWorkingSet("orch-a", inRepo("/ext/app", "/ext/app"));
+    addToWorkingSet("orch-b", located("/src/lib"));
+    dropFromWorkingSets("/ext/app", "linux");
+    expect(workingSetOf("orch-a")).toEqual([]);
+    expect(workingSetOf("orch-b").map((l) => l.worktree)).toEqual(["/src/lib"]);
   });
 });
