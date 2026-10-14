@@ -2368,16 +2368,10 @@ export async function registerV2Hooks(
         runMode: startRouting.leases.run,
         seams: { realpath: (path) => realpathSync.native(path), repoKeyOf: leaseRepoKeyOf, now: nowMs },
         snapshotPath, logger: ingestLogger,
+        loadSnapshot: () => JSON.parse(readFileSync(snapshotPath, "utf8")) as unknown,
       });
       leaseHandle = handle;
       bgDisposers.push(() => handle.release());
-      try {
-        const restored = handle.registry.restore(JSON.parse(readFileSync(snapshotPath, "utf8")) as unknown, { dropCompleteHolders: true });
-        if (!restored.ok) ingestLogger.warn("[router] leases: the snapshot was rejected", { error: restored.message });
-        else if (restored.skipped !== undefined) ingestLogger.warn("[router] leases: snapshot lines skipped on restore", { skipped: restored.skipped });
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") ingestLogger.warn("[router] leases: the snapshot could not be restored", { error: String(error) });
-      }
       leaseGuard = createLeaseGuard({
         registry: handle.registry, sessionKind: sessionKindOf, sessionDir: sessionDirectoryOf, gitRootOf: nearestRepository,
         holderLabel,

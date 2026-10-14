@@ -87,6 +87,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   any file (a device path, an 8.3 short name, a drive-relative path) still fails closed against every holder anywhere.
   A refusal names the file under edit and asks for the requester's own path in `NEED MORE: lease` (repo-relative for a
   plan task). Reads were already keyed by the file on disk. OpenCode v1 is unchanged.
+- **OpenCode v2: plugin module copies share one process-wide lease registry.** Snapshot restoration is attempted only
+  once when the registry is created, even if the snapshot is missing or invalid, so a later location cannot overwrite
+  live leases by restoring again.
 - **OpenCode v2: a resumed background dispatch delivers its own answer.** It no longer takes an earlier turn's
   completion as its own result, even when the earlier turn was still being processed when the parent saw it, nor the
   child's earlier answer. Completions are told apart by the message that carries them rather than by their text, so two

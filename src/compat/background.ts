@@ -1901,32 +1901,69 @@ interface SharedLeases {
   listeners: Set<() => void>;
   refs: number;
   logger: Logger;
+  initializing: boolean;
 }
 
-/** Shared registries by snapshot path: every plugin instance of the process sees one set of leases. */
-const SHARED_LEASES = new Map<string, SharedLeases>();
+interface SharedLeaseRegistries {
+  readonly version: 1;
+  readonly registries: Map<string, SharedLeases>;
+}
+
+/** Versioned process state, shared even when plugin instances load separate copies of this module. */
+const SHARED_LEASES_KEY = Symbol.for("opencode-model-router.leases@1");
+
+function isSharedLeaseRegistries(value: unknown): value is SharedLeaseRegistries {
+  if (typeof value !== "object" || value === null) return false;
+  const state = value as Partial<SharedLeaseRegistries>;
+  return state.version === 1 && state.registries instanceof Map;
+}
+
+function sharedLeaseRegistries(): Map<string, SharedLeases> {
+  const existing: unknown = Reflect.get(globalThis, SHARED_LEASES_KEY);
+  if (isSharedLeaseRegistries(existing)) return existing.registries;
+  const state: SharedLeaseRegistries = { version: 1, registries: new Map() };
+  Reflect.set(globalThis, SHARED_LEASES_KEY, state);
+  return state.registries;
+}
 
 /**
- * Acquires the process-wide lease registry (ref-counted). The first acquirer's seams and run mode win. The
- * `until-integrated` snapshot at `snapshotPath` is inert in 2.1 (no such holder exists before 3.1), so nothing
- * touches the filesystem here.
+ * Acquires the process-wide lease registry (ref-counted). The first acquirer's seams, run mode and snapshot win.
+ * Initialization is synchronous: no guard can acquire a live lease before restoration completes, and subsequent
+ * adapters never restore over live state (including when the first snapshot was absent or invalid).
  */
 export function acquireLeaseRegistry(opts: {
   runMode: "annotate" | "refuse";
   seams: LeaseSeams;
   snapshotPath: string;
   logger: Logger;
+  /** Optional synchronous loader, called only when creating the shared registry. */
+  loadSnapshot?(): unknown;
 }): LeaseRegistryHandle {
-  let shared = SHARED_LEASES.get(opts.snapshotPath);
+  const registries = sharedLeaseRegistries();
+  let shared = registries.get(opts.snapshotPath);
   if (shared === undefined) {
     shared = {
       registry: createLeaseRegistry(opts.seams, { runMode: opts.runMode }),
       listeners: new Set(),
       refs: 0,
       logger: opts.logger,
+      initializing: true,
     };
-    SHARED_LEASES.set(opts.snapshotPath, shared);
+    registries.set(opts.snapshotPath, shared);
+    try {
+      if (opts.loadSnapshot !== undefined) {
+        const restored = shared.registry.restore(opts.loadSnapshot(), { dropCompleteHolders: true });
+        if (!restored.ok) warnSafe(shared.logger, "[router] leases: the snapshot was rejected", { error: restored.message });
+        else if (restored.skipped !== undefined) warnSafe(shared.logger, "[router] leases: snapshot lines skipped on restore", { skipped: restored.skipped });
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") warnSafe(shared.logger, "[router] leases: the snapshot could not be restored", { error: String(error) });
+    } finally {
+      shared.initializing = false;
+    }
   }
+  // A synchronous loader must not re-enter acquisition and expose the registry before its restore.
+  if (shared.initializing) throw new Error("lease registry initialization is already in progress");
   shared.refs += 1;
   const state = shared;
   let released = false;
@@ -1951,9 +1988,17 @@ export function acquireLeaseRegistry(opts: {
       if (released) return;
       released = true;
       state.refs -= 1;
-      if (state.refs <= 0 && SHARED_LEASES.get(opts.snapshotPath) === state) SHARED_LEASES.delete(opts.snapshotPath);
+      if (state.refs <= 0 && registries.get(opts.snapshotPath) === state) registries.delete(opts.snapshotPath);
     },
   };
+}
+
+/** Observes an existing, initialized registry without creating one or extending its lifetime. */
+export function peekLeaseRegistry(snapshotPath: string): LeaseRegistry | undefined {
+  const state: unknown = Reflect.get(globalThis, SHARED_LEASES_KEY);
+  if (!isSharedLeaseRegistries(state)) return undefined;
+  const shared = state.registries.get(snapshotPath);
+  return shared?.initializing === false ? shared.registry : undefined;
 }
 
 export interface LeaseGuard {
