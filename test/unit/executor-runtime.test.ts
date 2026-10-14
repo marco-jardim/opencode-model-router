@@ -11,11 +11,11 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createV2Observations, type ObservationRecord, type V2Observations } from "../../src/compat/v2-observations";
+import { checkV2ObservationStream, createV2Observations, type ObservationRecord, type V2Observations } from "../../src/compat/v2-observations";
 import { createCapacityController } from "../../src/executor/capacity.js";
 import { phaseIntegrated } from "../../src/executor/integrate/queue.js";
-import { taskBranchName } from "../../src/executor/git.js";
-import { createLedgerStore } from "../../src/executor/ledger.js";
+import { taskBranchName, type GitOps } from "../../src/executor/git.js";
+import { createLedgerStore, createNodeFileSystem } from "../../src/executor/ledger.js";
 import {
   commitTaskInSlot,
   createExecutorRuntime,
@@ -27,7 +27,7 @@ import {
   type RuntimeDeps,
 } from "../../src/executor/runtime.js";
 import { createScheduler } from "../../src/executor/schedule.js";
-import { defaultSlotsDir } from "../../src/executor/slots/pool.js";
+import { createSlotPool, defaultSlotsDir } from "../../src/executor/slots/pool.js";
 import {
   ExecutorError,
   QA_UNPARSABLE_CONTEXT_PREFIX,
@@ -2221,6 +2221,184 @@ describe("late child adoption and the launch race (M27)", () => {
   });
 });
 
+/** Real pool/marker transitions; only git and provisioning are doubles. No diagnostic pool queries in the runtime. */
+async function physicalPool(h: Harness, maxParallel: number) {
+  const fs = createNodeFileSystem(), heads = new Map<string, string>();
+  // Windows temp roots can contain an 8.3 alias; the real pool deliberately rejects non-canonical roots.
+  const root = await fs.realpath(h.root);
+  const unused = async (): Promise<never> => { throw new Error("unexpected pool git operation"); };
+  const git: GitOps = {
+    planId: PLAN_ID, version: unused, checkRefFormat: unused, worktreeList: unused, worktreeRemove: unused,
+    addAll: unused, commit: unused, rebaseOnto: unused, rebaseAbort: unused, cherryPick: unused, revert: unused,
+    mergeFfOnly: unused, isAncestor: unused, tag: unused, deleteRefs: unused, branchForce: unused,
+    async worktreeAdd(path, commit) { await fs.mkdir(path); heads.set(path, commit); },
+    async verifySlotPointers() { return { gitdir: "unused", common: "unused" }; },
+    async checkoutDetach(path, commit) { heads.set(path, commit); },
+    async revParse(path, rev) { return rev === "HEAD" ? heads.get(path) ?? SHA : rev; },
+    async cleanTracked() {}, async cleanForChecks() {}, async cleanPreview() { return []; },
+    async trackedLinks() { return []; }, async lsFiles() { return []; }, async statusPorcelain() { return []; },
+    async diffNames() { return []; },
+  };
+  const pool = createSlotPool({ planId: PLAN_ID, repoKey: "repo-key", toplevel: REPO,
+    slotsDir: join(root, "physical-slots"), markersDir: join(root, "markers"), executorHome: root,
+    maxParallel, fs, git, clock: h.clock,
+    provisioner: { detect: async () => ({ managers: [], manifests: {}, yarnBerry: false, editable: false, python: null }), provision: async () => {} } });
+  await pool.open();
+  h.deps.slots = pool;
+  return { pool, fs };
+}
+
+describe("physical slot observations", () => {
+  it("G8: provider-free is not slot-launchable while verifying/integrating tasks retain every slot", async () => {
+    const lines: string[] = [], rows: ObservationRecord[] = [];
+    const sink = createV2Observations({ write: line => { lines.push(line); rows.push(JSON.parse(line)); } });
+    const h = await mk(planOf([task("T1"), task("T2"), task("T3")], { config: { maxParallel: 2 } }), sink);
+    const { pool, fs } = await physicalPool(h, 2);
+    const verifying = deferred<void>(), releasing = deferred<void>();
+    const verify = h.verifier.verify.bind(h.verifier);
+    h.verifier.verify = async (t, slot, attempt) => {
+      if (t.id === "T1") await verifying.promise;
+      return verify(t, slot, attempt);
+    };
+    const events = (action: string) => {
+      sink.flush(); // Test barrier only: production captures synchronously and drains writes later.
+      return rows.filter(r => r.family === "scheduler" && r.action === action);
+    };
+    try {
+      await h.begin();
+      const first = await h.running("T1", 1, "child-1"), second = await h.running("T2", 1, "child-2");
+      first.complete("Done."); second.complete("Done.");
+      await until(() => h.state("T1") === "verifying", "T1 verifying with its slot retained");
+      await untilEnqueued(h, "T2");
+      // Q opens its history entry in the same batch as verified -> integrating (A1-3a).
+      await h.parts().writer.append(l => [
+        { type: "integration-step", edge: "start", step: "rebase", result: null, detail: null, failingIds: [], closes: false,
+          entry: { id: `i-${l.seq + 1}`, kind: "task", phaseId: "p1", taskIds: ["T2"], slot: "slot-2",
+            baseHead: l.integration.head, candidate: null } },
+        tr("T2", "verified", "integrating", "dequeued"),
+      ]);
+      const entry = need(h.parts().writer.openIntegration().find(open => open.entry.taskIds.includes("T2")), "T2 integration entry").entry;
+      h.runtime.onRouterToolCall(ORCH);
+      await until(async () => (await h.counters()).some(c => c.key === "launch-skipped" && c.labels.reason === "slot-unavailable"), "slot-unavailable skip");
+      expect(h.state("T3")).toBe("ready");
+      expect(h.launcher.runs).toHaveLength(2);
+      expect(events("capacity-release").filter(r => r.family === "scheduler" && JSON.stringify(r.state).includes('"result":"success"'))).toHaveLength(2);
+      // Red before the fix: the stream only had launch-step-end result=skipped, with no physical-slot reason.
+      expect(events("slot-acquire-result")).toContainEqual(expect.objectContaining({ state: expect.objectContaining({
+        maxParallel: 2, detail: expect.objectContaining({ taskId: "T3", result: "unavailable", slot: null }),
+        slots: expect.arrayContaining([
+          expect.objectContaining({ slot: "slot-1", state: "leased", taskId: "T1" }),
+          expect.objectContaining({ slot: "slot-2", state: "leased", taskId: "T2" }),
+        ]),
+      }) }));
+      expect(events("ledger")).toContainEqual(expect.objectContaining({ state: expect.objectContaining({ tasks: expect.arrayContaining([
+        expect.objectContaining({ id: "T1", state: "verifying", slot: "slot-1" }),
+        expect.objectContaining({ id: "T2", state: "integrating", slot: "slot-2" }),
+        expect.objectContaining({ id: "T3", state: "ready", slot: null }),
+      ]) }) }));
+
+      // Q clears task.slot and the write lease before awaiting the actual marker release.
+      await h.parts().writer.append([
+        { type: "integration-step", edge: "end", entry, step: "rebase", result: "ok", detail: null, failingIds: [], closes: false },
+        { type: "integration-step", edge: "start", entry: { ...entry, candidate: SHA2 }, step: "fast-forward",
+          result: null, detail: null, failingIds: [], closes: false },
+        { type: "integration-step", edge: "end", entry: { ...entry, candidate: SHA2 }, step: "fast-forward",
+          result: "ok", detail: null, failingIds: [], closes: true },
+        { type: "task-integrated", taskId: "T2", from: SHA, to: SHA2 },
+        tr("T2", "integrating", "integrated", "fast-forwarded"),
+        { type: "integration-head", head: SHA2 }, { type: "task-slot", taskId: "T2", slot: null, branch: h.task("T2").branch },
+      ]);
+      expect(h.parts().writer.openIntegration()).toEqual([]);
+      h.parts().leases.releaseTask("T2");
+      const fsync = fs.fsyncDir.bind(fs);
+      fs.fsyncDir = async path => { await releasing.promise; await fsync(path); };
+      const release = pool.release("slot-2");
+      await until(() => events("slot-release-start").length === 1, "physical release started");
+      expect(events("slot-release-complete")).toEqual([]);
+      await expect(pool.acquire(PLAN_ID, `plan:${PLAN_ID}:T3`, SHA2)).rejects.toMatchObject({ code: "E_SLOT_UNAVAILABLE" });
+      releasing.resolve(); await release;
+      expect(events("slot-release-complete")).toContainEqual(expect.objectContaining({ state: expect.objectContaining({
+        detail: expect.objectContaining({ slot: "slot-2", result: "released" }),
+        slots: expect.arrayContaining([expect.objectContaining({ slot: "slot-2", state: "ready", taskId: null })]),
+      }) }));
+      h.runtime.onLeaseReleased();
+      await h.runOf("T3", 1);
+      expect(events("slot-acquire-result")).toContainEqual(expect.objectContaining({ state: expect.objectContaining({
+        detail: expect.objectContaining({ taskId: "T3", slot: "slot-2", result: "reused" }),
+      }) }));
+      const releaseSeq = events("slot-release-complete")[0]!.seq;
+      expect(events("lease-release").some(r => r.seq < releaseSeq)).toBe(true);
+      expect(events("launch").at(-1)!.seq).toBeGreaterThan(releaseSeq);
+    } finally {
+      verifying.resolve(); releasing.resolve();
+      await h.close(); sink.close(); pool.close();
+    }
+    expect(checkV2ObservationStream(lines).length).toBeGreaterThan(0);
+    expect(lines.join("")).not.toContain("physical-slots");
+  });
+
+  it("reports a failed physical release without announcing availability (even after the write lease is gone)", async () => {
+    const rows: ObservationRecord[] = [];
+    const sink = createV2Observations({ write: line => { rows.push(JSON.parse(line)); } });
+    const h = await mk(planOf([task("T1", { footprint: { writes: [], reads: [], confidence: "explicit", sources: [] } })],
+      { config: { maxParallel: 1 } }), sink);
+    const { pool, fs } = await physicalPool(h, 1);
+    h.git.dirty = () => false;
+    await h.begin();
+    const run = await h.running("T1", 1, "child-1");
+    fs.fsyncDir = async () => { throw new Error("private marker path: cannot flush"); };
+    run.complete("Done."); await h.settled();
+    sink.flush();
+    expect(h.registry.releases).toContain(`${PLAN_ID}:T1`);
+    expect(h.logs.some(line => line.includes("slot release failed"))).toBe(true);
+    expect(rows.filter(r => r.family === "scheduler" && r.action === "slot-release-failed")).toContainEqual(expect.objectContaining({
+      state: expect.objectContaining({ maxParallel: 1, detail: expect.objectContaining({ slot: "slot-1" }),
+        slots: expect.arrayContaining([expect.objectContaining({ slot: "slot-1", state: "leased" })]) }),
+    }));
+    expect(rows.some(r => r.family === "scheduler" && r.action === "slot-release-complete")).toBe(false);
+    await expect(pool.acquire(PLAN_ID, `plan:${PLAN_ID}:T2`, SHA)).rejects.toMatchObject({ code: "E_SLOT_UNAVAILABLE" });
+    sink.flush();
+    expect(JSON.stringify(rows)).not.toContain("private marker path");
+  });
+
+  it("keeps physical pool operations and ledger bytes identical off/on/with a throwing observer", async () => {
+    const results: string[] = [];
+    for (const mode of ["off", "on", "broken"] as const) {
+      const rows: ObservationRecord[] = [];
+      const sink = mode === "off" ? undefined : createV2Observations({ write: line => { rows.push(JSON.parse(line)); } });
+      if (mode === "broken" && sink !== undefined) sink.record = () => { throw new Error("broken observer"); };
+      const h = await mk(planOf([task("T1", { footprint: { writes: [], reads: [], confidence: "explicit", sources: [] } })],
+        { config: { maxParallel: 1 } }), sink);
+      const { pool, fs } = await physicalPool(h, 1);
+      const get = vi.spyOn(pool, "get"), list = vi.spyOn(pool, "list"), writes = vi.spyOn(fs, "writeText");
+      h.git.dirty = () => false;
+      await h.begin();
+      const run = await h.running("T1", 1, "child-1");
+      run.complete("Done."); await h.settled();
+      // Observation hooks must not ask the pool extra questions, perform extra I/O, consume clock randomness,
+      // mutate the journal, or change the launch. Compare before the test itself asks for the final record.
+      const calls = { get: [...get.mock.calls], list: [...list.mock.calls], writes: writes.mock.calls.length };
+      const record = await pool.get("slot-1");
+      expect(record).toMatchObject({ state: "ready", owner: null });
+      const req = h.launcher.runs[0]!.req;
+      results.push(JSON.stringify({ task: h.task("T1"), events: await h.events(), calls,
+        record: { ...record, path: "<slot>" }, request: { ...req, workRoot: "<slot>", prompt: req.prompt.replaceAll(req.workRoot, "<slot>") } }));
+      sink?.flush();
+      if (mode === "on") {
+        for (const action of ["slot-acquire-start", "slot-claim", "slot-acquire-result", "slot-state",
+          "slot-provision-start", "slot-provision-end", "slot-reset-start", "slot-reset-end", "slot-release-start", "slot-release-complete"]) {
+          expect(rows.some(r => r.family === "scheduler" && r.action === action), action).toBe(true);
+        }
+        expect(rows.filter(r => r.family === "scheduler" && r.action === "slot-acquire-result")).toContainEqual(expect.objectContaining({
+          state: expect.objectContaining({ detail: { slot: "slot-1", kind: "task", taskId: "T1", mode: "create", result: "created" } }),
+        }));
+      } else expect(rows).toEqual([]);
+      await h.close(); sink?.close(); pool.close();
+    }
+    expect(new Set(results).size).toBe(1);
+  });
+});
+
 describe("metrics", () => {
   it("observations do not change native launches or ledger bytes, including a throwing sink", async () => {
     const results: string[] = [];
@@ -2235,6 +2413,7 @@ describe("metrics", () => {
       await toVerified(h, "T1");
       await h.settled();
       results.push(JSON.stringify({ requests: h.launcher.runs.map((r) => r.req), task: h.task("T1"), log: h.log }));
+      observations?.flush();
       if (mode === "on") {
         const actions = rows.flatMap((r) => r.family === "scheduler" ? [r.action] : []);
         for (const action of ["attach", "ledger", "lease-eligibility", "lease-acquire", "route", "capacity-free", "capacity-reserve", "capacity-release", "launch-prepare", "launch"]) {
@@ -2251,7 +2430,8 @@ describe("metrics", () => {
 
   it("emits every metric variant: launch, wake (sent and debounced), idle-with-ready, capacity, counter, context-age", async () => {
     const rows: ObservationRecord[] = [];
-    const h = await mk(planOf([task("T1")]), createV2Observations({ write: (line) => { rows.push(JSON.parse(line)); } }));
+    const observations = createV2Observations({ write: (line) => { rows.push(JSON.parse(line)); } });
+    const h = await mk(planOf([task("T1")]), observations);
     h.launcher.gateValue = staleGate("stale-context:boot:1");
     await h.begin();
     await until(() => h.hosts.delivered.length === 1, "first wake");
@@ -2259,6 +2439,7 @@ describe("metrics", () => {
     // The orchestrator goes idle while T1 is ready but the gate is closed: the idle-with-ready window opens at T0.
     h.runtime.onHostEvent({ type: "execution.completed", sessionID: ORCH, at: h.clock.iso() });
     // Synchronous raw host transition, before any tick/updateIdle can run or journal a metric.
+    observations.flush();
     expect(rows.filter((r) => r.family === "scheduler" && r.action === "orchestrator").at(-1)).toMatchObject({ state: { orchIdle: true, clockMs: Date.parse(T0) } });
     await h.settled();
 
@@ -2276,6 +2457,7 @@ describe("metrics", () => {
     h.runtime.onRouterToolCall(ORCH);
     await h.runOf("T1", 1);
 
+    observations.flush();
     expect(rows.find((r) => r.family === "scheduler" && r.action === "launch-gate")).toMatchObject({ state: { detail: { ok: false, ready: ["T1"] } } });
     expect(rows.find((r) => r.family === "scheduler" && r.action === "launch-prepare")).toMatchObject({ state: { clockMs: Date.parse(T0) + 5000 } });
 
@@ -3049,11 +3231,13 @@ describe("usage-limit pauses and paused phases", () => {
 
   it("a quota failure pauses the provider, raises one usage-limit item and re-arms the tick; a repeat raises nothing", async () => {
     const rows: ObservationRecord[] = [];
-    const h = await mk(planOf([task("T1")]), createV2Observations({ write: (line) => { rows.push(JSON.parse(line)); } }));
+    const observations = createV2Observations({ write: (line) => { rows.push(JSON.parse(line)); } });
+    const h = await mk(planOf([task("T1")]), observations);
     await h.begin();
     await h.running("T1", 1, "ses-c1");
     h.runtime.onHostEvent({ type: "step.started", sessionID: "ses-c1", providerID: PROVIDER, modelID: "model-1", at: h.clock.iso() });
     h.runtime.onHostEvent({ type: "step.failed", sessionID: "ses-c1", error: QUOTA, at: h.clock.iso() });
+    observations.flush();
     expect(rows.find((r) => r.family === "scheduler" && r.action === "provider")).toMatchObject({ state: { change: "pause", provider: expect.stringMatching(/^provider:[a-f0-9]{64}$/) } });
     await until(() => h.parts().policy.raised.length === 1, "usage-limit item");
 
@@ -3066,11 +3250,13 @@ describe("usage-limit pauses and paused phases", () => {
     expect(h.parts().policy.raised).toHaveLength(1);
     // Advancing time alone must NOT query the controller on behalf of diagnostics. Resume is lazy.
     h.clock.advance(h.ledger().config.capacityPauseMs + 1);
+    observations.flush();
     expect(rows.filter((r) => r.family === "scheduler" && r.action === "provider" && JSON.stringify(r.state).includes('"resume"'))).toHaveLength(0);
     // The running child's retry hook queries capacity even with no ready task. A non-capacity
     // error does not start another quota pause, so this query observes only the expired pause's resume.
     expect(h.runtime.onRetryHook({ sessionID: "ses-c1", stepKey: "after-pause",
       error: { type: "provider.timeout", status: null, message: "transient timeout" } })).toEqual({ stop: false });
+    observations.flush();
     expect(rows.filter((r) => r.family === "scheduler" && r.action === "provider" && JSON.stringify(r.state).includes('"resume"'))).toHaveLength(1);
   });
 

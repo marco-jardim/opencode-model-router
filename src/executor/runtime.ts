@@ -3,7 +3,7 @@
 import { rm } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { observeV2, type ObservationValue, type V2Observations } from "../compat/v2-observations";
-import { observeSchedulerLedger } from "./observations";
+import { attachSlotObservations, detachSlotObservations, observeSchedulerLedger } from "./observations";
 import {
   capacityRestoreFromEvents,
   capacityView,
@@ -2632,6 +2632,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     carriedHandles.delete(planId);
     ref.p = p;
     plans.set(planId, p);
+    attachSlotObservations(d.observations, d.clock, writer);
     observeSchedulerLedger(d.observations, writer.ledger, "attach");
     observe(p, "runtime-attach");
     return p;
@@ -3565,6 +3566,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     p.history = null;
     // QA-4.2-3: the queue's lanes stop and its repo lock goes before the writer closes (adopt, dispose, purge).
     await disposeQueue(p);
+    detachSlotObservations(d.clock, p.writer);
     await p.writer.close();
   }
 
