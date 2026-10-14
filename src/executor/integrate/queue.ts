@@ -8,6 +8,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { link, mkdir, open, readdir, readFile, rename, unlink } from "node:fs/promises";
 import * as nodePath from "node:path";
+import { stripUrlUserinfo } from "../../router/git-tools";
 import {
   AX_MAX_CHARS,
   CHECK_TRIES,
@@ -43,6 +44,7 @@ import {
   type IntegrationStep,
   type IntegrationStepResult,
   type IsoTime,
+  type JsonValue,
   type LeaseService,
   type LedgerV1,
   type LedgerWriter,
@@ -105,7 +107,10 @@ export interface CheckDetail {
   failingFiles: string[]; flakyIds: string[]; note: "no-checks" | null;
   error: { reason: string; message: string } | null; output: string;
 }
-export interface RefusedDetail { v: 1; reason: string; n?: number; message?: string }
+export interface RefusedDetail {
+  v: 1; reason: string; n?: number; message?: string;
+  error?: { code: string; detail: JsonValue };
+}
 export interface StepDetailMap {
   rebase: { v: 1; onto: string; tasks: Array<{ taskId: TaskId; tip: string; upstream: string }> }
     | { v: 1; stacked: RangeDetail[]; deferred: TaskId[] }
@@ -172,6 +177,35 @@ export function tailBytes(s: string, max: number): string {
 
 export function clipText(s: string, max: number = AX_MAX_CHARS): string {
   return s.length <= max ? s : s.slice(0, max - 1) + "\u2026";
+}
+
+/** Keep both Git failure contexts, without letting diagnostics overflow the journal or prevent the infrastructure pause. */
+function refusedError(e: unknown): RefusedDetail {
+  const out: RefusedDetail = { v: 1, reason: "error", message: clipText(stripUrlUserinfo(message(e)), 1000) };
+  if (e instanceof ExecutorError) {
+    let detail: JsonValue;
+    try {
+      // Redact before clipping each string: a byte boundary must not expose a credential suffix.
+      const text = JSON.stringify(e.detail, (_key, value: unknown) => {
+        if (typeof value !== "string") return value;
+        const clean = stripUrlUserinfo(value);
+        let limit = 2048;
+        let bounded = tailBytes(clean, limit);
+        // Bound encoded bytes too, so escaping stderr cannot crowd out either failure context.
+        while (Buffer.byteLength(JSON.stringify(bounded), "utf8") > 2048) {
+          limit = Math.floor(limit / 2);
+          bounded = tailBytes(clean, limit);
+        }
+        return bounded;
+      });
+      detail = Buffer.byteLength(text, "utf8") <= 8192 ? JSON.parse(text) as JsonValue
+        : { truncated: true, tail: tailBytes(text, 4096) };
+    } catch {
+      detail = { unavailable: true };
+    }
+    out.error = { code: e.code, detail };
+  }
+  return out;
 }
 
 export function parseDetail(text: string | null | undefined): Record<string, unknown> | null {
@@ -1893,8 +1927,8 @@ class Queue implements IntegrationQueue {
     if (live === null || this.disposed || this.stopped || this.aborting || this.stalled.get(live.lane) === live) return;
     if (errCode(e) === "E_DISPOSED" || errCode(e) === "E_LOCK_LOST") return;
     try {
-      if (live.open !== null) await this.end(live, "refused", { v: 1, reason: "error", message: clipText(message(e), 1000) }, false);
-      await this.infraPause(live, `Integration entry ${live.entry.id} (${live.entry.kind}) stopped: ${clipText(message(e), 500)}.`);
+      if (live.open !== null) await this.end(live, "refused", refusedError(e), false);
+      await this.infraPause(live, `Integration entry ${live.entry.id} (${live.entry.kind}) stopped: ${clipText(stripUrlUserinfo(message(e)), 500)}.`);
     } catch (inner) {
       this.laneError(inner);
     }
@@ -2900,4 +2934,3 @@ export function latestStartDetail(steps: readonly IntegrationStepEvent[], entryI
   }
   return null;
 }
-

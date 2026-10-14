@@ -898,31 +898,81 @@ describe("GitOps in a slot", () => {
     await expect(slotOps(() => ({ stdout: "xx\0" })).ops.statusPorcelain(slot)).rejects.toMatchObject({ code: "E_GIT" });
   });
 
-  it("rebaseOnto returns the new head, or the conflicts after aborting", async () => {
+  it("rebaseOnto returns the new head", async () => {
     const ok = slotOps(args => (sub(args)[0] === "rev-parse" ? { stdout: `${OID_B}\n` } : undefined));
     await expect(ok.ops.rebaseOnto(slot, OID_A, OID_B)).resolves.toEqual({ ok: true, head: OID_B });
     expect(subs(ok.git)[0]).toEqual(["rebase", "--onto", OID_A, OID_B]);
+  });
+
+  it.each(["rebase-merge", "rebase-apply"])("rebaseOnto reports conflicts after aborting an active %s", async state => {
     const conflict = slotOps(args => {
       const s = sub(args);
       if (s[0] === "rebase" && s[1] === "--onto") return { code: 1 };
       if (s[0] === "diff") return { stdout: "a.txt\0b.txt\0a.txt\0" };
       return undefined;
-    });
+    }, { [join(gitdir, state)]: "dir" });
     await expect(conflict.ops.rebaseOnto(slot, OID_A, OID_B)).resolves.toEqual({ ok: false, conflicts: ["a.txt", "b.txt"] });
     expect(subs(conflict.git).map(s => s.slice(0, 2).join(" "))).toEqual(["rebase --onto", "diff --name-only", "rebase --abort"]);
   });
 
-  it("a failed rebase with no conflicted path is a git failure, and a failing abort is reported", async () => {
-    const none = slotOps(args => (sub(args)[0] === "rebase" && sub(args)[1] === "--onto" ? { code: 1, stderr: "boom" } : undefined));
-    await expect(none.ops.rebaseOnto(slot, OID_A, OID_B)).rejects.toMatchObject({ code: "E_GIT" });
-    const abortFails = slotOps(args => {
+  it.each([1, 128])("a rebase refused before starting (exit %s) keeps its bounded sanitized error and never aborts", async code => {
+    const none = slotOps(args => {
       const s = sub(args);
-      if (s[0] === "rebase" && s[1] === "--onto") return { code: 1 };
-      if (s[0] === "diff") return { stdout: "a.txt\0" };
-      if (s[0] === "rebase" && s[1] === "--abort") return { code: 128 };
+      if (s[0] === "rebase" && s[1] === "--onto") return { code, stderr: `${"é".repeat(3000)}\nfatal: https://alice:secret@example.test/repo?token=private` };
+      if (s[0] === "diff") return { stdout: "pre-existing-conflict.txt\0" };
+      if (s[0] === "rebase" && s[1] === "--abort") return { code: 128, stderr: "fatal: no rebase in progress" };
       return undefined;
     });
-    await expect(abortFails.ops.rebaseOnto(slot, OID_A, OID_B)).rejects.toMatchObject({ code: "E_GIT" });
+    const error: unknown = await none.ops.rebaseOnto(slot, OID_A, OID_B).catch((e: unknown) => e);
+    expect(error).toMatchObject({ code: "E_GIT", message: `git rebase failed (exit ${code})`, detail: {
+      op: "rebase", code, stderr: expect.stringContaining("fatal: https://example.test/repo?token=***"),
+    } });
+    const text = JSON.stringify(error);
+    expect(text).not.toMatch(/alice|secret|private|\uFFFD/);
+    expect(Buffer.byteLength(text, "utf8")).toBeLessThan(2200);
+    expect(subs(none.git)).toEqual([["rebase", "--onto", OID_A, OID_B]]);
+  });
+
+  it("an active failed rebase with no conflicted path is aborted and retains the initiating failure", async () => {
+    const none = slotOps(args => (sub(args)[0] === "rebase" && sub(args)[1] === "--onto" ? { code: 128, stderr: "boom" } : undefined),
+      { [join(gitdir, "rebase-merge")]: "dir" });
+    await expect(none.ops.rebaseOnto(slot, OID_A, OID_B)).rejects.toMatchObject({
+      code: "E_GIT", message: "git rebase failed (exit 128)", detail: { op: "rebase", code: 128, stderr: "boom" },
+    });
+    expect(subs(none.git).map(s => s.slice(0, 2).join(" "))).toEqual(["rebase --onto", "diff --name-only", "rebase --abort"]);
+  });
+
+  it("a real abort failure retains both bounded sanitized errors and never falls back to reset", async () => {
+    const abortFails = slotOps(args => {
+      const s = sub(args);
+      if (s[0] === "rebase" && s[1] === "--onto") return { code: 1, stderr: `${"é".repeat(3000)}\nconflict https://alice:secret@example.test/repo?token=private` };
+      if (s[0] === "diff") return { stdout: "a.txt\0" };
+      if (s[0] === "rebase" && s[1] === "--abort") return { code: 128, stderr: `${"é".repeat(3000)}\nlocked https://bob:hidden@example.test/repo?password=private` };
+      return undefined;
+    }, { [join(gitdir, "rebase-merge")]: "dir" });
+    const error: unknown = await abortFails.ops.rebaseOnto(slot, OID_A, OID_B).catch((e: unknown) => e);
+    expect(error).toMatchObject({ code: "E_GIT", message: "git rebase failed (exit 1); rebase cleanup failed: git rebase --abort failed (exit 128)", detail: {
+      original: { op: "rebase", code: 1, stderr: expect.stringContaining("conflict https://example.test/repo?token=***") },
+      cleanup: { op: "rebase --abort", code: 128, stderr: expect.stringContaining("locked https://example.test/repo?password=***") },
+    } });
+    const text = JSON.stringify(error);
+    expect(text).not.toMatch(/alice|secret|bob|hidden|private|\uFFFD/);
+    expect(Buffer.byteLength(text, "utf8")).toBeLessThan(4400);
+    expect(subs(abortFails.git).map(s => s.slice(0, 2).join(" "))).toEqual(["rebase --onto", "diff --name-only", "rebase --abort"]);
+  });
+
+  it("an abort runner exception also retains the initiating rebase context", async () => {
+    const abortThrows = slotOps(args => {
+      const s = sub(args);
+      if (s[0] === "rebase" && s[1] === "--onto") return { code: 1, stderr: "initiating failure" };
+      if (s[0] === "diff") return { stdout: "a.txt\0" };
+      if (s[0] === "rebase" && s[1] === "--abort") throw Object.assign(new Error("timed out https://alice:secret@example.test/repo"), { code: "ETIMEDOUT" });
+      return undefined;
+    }, { [join(gitdir, "rebase-apply")]: "dir" });
+    await expect(abortThrows.ops.rebaseOnto(slot, OID_A, OID_B)).rejects.toMatchObject({ code: "E_GIT",
+      message: "git rebase failed (exit 1); rebase cleanup failed: git rebase --abort could not run: timed out https://example.test/repo",
+      detail: { original: { op: "rebase", code: 1, stderr: "initiating failure" }, cleanup: { op: "rebase --abort", code: "ETIMEDOUT", stderr: "" } },
+    });
   });
 
   it("rebaseAbort is a no-op unless a rebase is in progress", async () => {

@@ -82,6 +82,7 @@ import type {
   IntegrationQueue,
   IntegrationStep,
   IsoTime,
+  JsonValue,
   LeaseService,
   LedgerV1,
   LedgerWriter,
@@ -3128,6 +3129,67 @@ describe("rejected appends stop both lanes (M7)", () => {
 });
 
 describe("unexpected lane errors (M13a) and stalled entries (M36)", () => {
+  it.each([false, true])("durably retains bounded sanitized rebase diagnostics (cleanup failed: %s) without weakening the critical pause", async cleanupFailed => {
+    const env = await setup({ tasks: 2, batchMax: 1 });
+    const original = { op: "rebase", code: 1,
+      stderr: `${"\0\\\"é".repeat(5000)} initiating failure https://first-user:initial-secret@example.test/repo?token=initial-token` };
+    const cleanup = { op: "rebase --abort", code: 128,
+      stderr: `${"\0\\\"é".repeat(5000)} cleanup failure https://second-user:cleanup-secret@example.test/repo?password=cleanup-token` };
+    env.git.rebaseOnto = async () => {
+      throw new ExecutorError("E_GIT", "git rebase failed: https://message-user:message-secret@example.test/repo?token=message-token",
+        cleanupFailed ? { original, cleanup } : original);
+    };
+    env.queue.enqueue(["T1", "T2"]);
+    await env.until(() => env.ledger.status === "paused", "the infrastructure pause");
+    const events = await env.events(); // Exported from the real store, not just the queue's in-memory history.
+    const refused = events.filter(isStep).find(e => e.step === "rebase" && e.edge === "end" && e.result === "refused");
+    const expectedOriginal = { op: "rebase", code: 1, stderr: expect.stringContaining("initiating failure https://example.test/repo?token=***") };
+    const expectedCleanup = { op: "rebase --abort", code: 128, stderr: expect.stringContaining("cleanup failure https://example.test/repo?password=***") };
+    expect(parseDetail(refused?.detail)).toMatchObject({ v: 1, reason: "error",
+      message: "git rebase failed: https://example.test/repo?token=***",
+      error: { code: "E_GIT", detail: cleanupFailed ? { original: expectedOriginal, cleanup: expectedCleanup } : expectedOriginal },
+    });
+    expect(Buffer.byteLength(refused?.detail ?? "", "utf8")).toBeLessThanOrEqual(DETAIL_MAX_BYTES);
+    expect(JSON.stringify(events)).not.toMatch(/first-user|initial-secret|initial-token|second-user|cleanup-secret|cleanup-token|message-user|message-secret|message-token/);
+    expect(refused?.closes).toBe(false);
+    expect(events.find(e => e.type === "status-changed" && e.to === "paused")).toMatchObject({ reason: "integration-infrastructure" });
+    expect(env.ledger.inbox).toHaveLength(1);
+    expect(env.ledger.inbox[0]).toMatchObject({ kind: "failure", severity: "critical" });
+    expect(env.ledger.inbox[0]?.text).toContain("https://example.test/repo?token=***");
+    expect(env.state("T1")).toBe("integrating");
+    expect(env.state("T2")).toBe("verified");
+    expect(env.writer.openIntegration()).toHaveLength(1);
+    expect(env.w.tip()).toBe(env.w.base);
+    expect(env.w.checkLog).toEqual([]);
+    env.clock.fire();
+    await env.settle();
+    expect(env.state("T2")).toBe("verified");
+    expect(env.writer.openIntegration()).toHaveLength(1);
+    expect((await env.steps("task")).some(s => s.includes("rollback"))).toBe(false);
+    env.assertInvariants();
+  });
+
+  it.each(["oversized", "cyclic"])("%s diagnostic detail cannot overflow the journal or prevent the critical pause", async kind => {
+    const env = await setup({ tasks: 1 });
+    const detail: Record<string, JsonValue> = {};
+    if (kind === "cyclic") detail.self = detail;
+    else detail.items = Array.from({ length: 100 }, () => `${"x".repeat(3000)} https://alice:secret@example.test/repo?token=private`);
+    env.git.rebaseOnto = async () => { throw new ExecutorError("E_GIT", "unexpected diagnostic", detail); };
+    env.queue.enqueue(["T1"]);
+    await env.until(() => env.ledger.status === "paused", "the infrastructure pause");
+    const refused = (await env.events()).filter(isStep).find(e => e.step === "rebase" && e.result === "refused");
+    expect(parseDetail(refused?.detail)).toMatchObject({ reason: "error", message: "unexpected diagnostic", error: {
+      code: "E_GIT", detail: kind === "cyclic" ? { unavailable: true }
+        : { truncated: true, tail: expect.stringContaining("https://example.test/repo?token=***") },
+    } });
+    expect(Buffer.byteLength(refused?.detail ?? "", "utf8")).toBeLessThanOrEqual(DETAIL_MAX_BYTES);
+    expect(refused?.detail).not.toMatch(/alice|secret|private/);
+    expect(env.ledger.inbox[0]).toMatchObject({ kind: "failure", severity: "critical" });
+    expect(env.state("T1")).toBe("integrating");
+    expect(env.writer.openIntegration()).toHaveLength(1);
+    env.assertInvariants();
+  });
+
   it("a throw inside a rebase journals the refusal, pauses with a critical item; once running again the entry is rolled back and integrates", async () => {
     const env = await setup({ tasks: 1 });
     const real = env.git.rebaseOnto.bind(env.git);

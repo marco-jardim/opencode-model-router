@@ -159,7 +159,7 @@ function foldCase(p: string): string {
 
 function tailBytes(text: string, max: number): string {
   const bytes = Buffer.from(text, "utf8");
-  return bytes.length <= max ? text : bytes.subarray(bytes.length - max).toString("utf8");
+  return bytes.length <= max ? text : bytes.subarray(bytes.length - max).toString("utf8").replace(/^\uFFFD+/, "");
 }
 
 function splitNul(text: string): string[] {
@@ -823,7 +823,7 @@ export function createGitOps(d: GitOpsDeps): GitOps {
     return splitNul(r.stdout);
   }
 
-  /** After a failed rebase/cherry-pick/revert: read the conflicted paths, abort, and report them. */
+  /** After a failed cherry-pick/revert: read the conflicted paths, abort, and report them. */
   async function conflictOutcome(op: string, slot: string, failed: ProcessResult, abort: readonly string[], resetFallback: boolean): Promise<Conflict> {
     const listed = await ok(inSlot(slot, { op: `${op} conflicts`, args: ["diff", "--name-only", "--diff-filter=U", "-z"] }), `${op} conflicts`);
     const conflicts = [...new Set(splitNul(listed.stdout))];
@@ -841,12 +841,31 @@ export function createGitOps(d: GitOpsDeps): GitOps {
     requireCommit(upstream, "upstream");
     const r = await inSlot(slot, { op: "rebase", identity: true, args: ["rebase", "--onto", onto, upstream] });
     if (r.code === 0) return { ok: true, head: await revParse(slot, "HEAD") };
-    return conflictOutcome("rebase", slot, r, ["rebase", "--abort"], false);
+    const failed = gitFailure("rebase", r);
+    let conflicts: string[] = [];
+    try {
+      // Git can refuse before starting a rebase. An abort then only masks the initiating failure.
+      if (await rebaseInProgress(slot)) {
+        const listed = await ok(inSlot(slot, { op: "rebase conflicts", args: ["diff", "--name-only", "--diff-filter=U", "-z"] }), "rebase conflicts");
+        conflicts = [...new Set(splitNul(listed.stdout))];
+        await rebaseAbort(slot);
+      }
+    } catch (cleanup) {
+      throw new ExecutorError(cleanup instanceof ExecutorError ? cleanup.code : "E_GIT",
+        `${failed.message}; rebase cleanup failed: ${tailBytes(stripUrlUserinfo(errorText(cleanup)), GIT_STDERR_TAIL_BYTES)}`,
+        { original: failed.detail, cleanup: cleanup instanceof ExecutorError ? cleanup.detail : null });
+    }
+    if (conflicts.length === 0) throw failed;
+    return { ok: false, conflicts };
+  }
+
+  async function rebaseInProgress(slot: string): Promise<boolean> {
+    const { gitdir } = await verifySlotPointers(slot);
+    return await exists(join(gitdir, "rebase-merge")) || await exists(join(gitdir, "rebase-apply"));
   }
 
   async function rebaseAbort(slot: string): Promise<void> {
-    const { gitdir } = await verifySlotPointers(slot);
-    if (!(await exists(join(gitdir, "rebase-merge"))) && !(await exists(join(gitdir, "rebase-apply")))) return;
+    if (!(await rebaseInProgress(slot))) return;
     await ok(inSlot(slot, { op: "rebase --abort", args: ["rebase", "--abort"] }), "rebase --abort");
   }
 
