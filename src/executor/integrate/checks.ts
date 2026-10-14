@@ -39,7 +39,7 @@ export interface ResolvedCommand {
   source: "package-script" | "run-command" | "pytest"; ref: RunCommandRef | null;
   /** Extra environment for the child (scoped test specs). */
   env?: Readonly<Record<string, string>>;
-  /** Working directory override (scoped test specs); default: the check's cwd. */
+  /** Working directory override (resolved commands and scoped test specs); default: the check's cwd. */
   cwd?: string;
 }
 export interface CommandOutput { exitCode: number | null; timedOut: boolean; stdout: string; stderr: string; durationMs: number }

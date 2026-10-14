@@ -777,7 +777,7 @@ interface ChecksOpts {
   acquire?: (o: SlotOptions, n: number) => SlotResult | Promise<SlotResult>;
   /** null: leave the dependency unset, so the default (wiring.preemptBackgroundVerification) runs. */
   preemptForeground?: (() => Promise<void>) | null;
-  resolve?: (ref: RunCommandRef) => { ok: true; command: ResolvedCommand } | { ok: false; reason: string };
+  resolve?: (ref: RunCommandRef, cwd: string) => { ok: true; command: ResolvedCommand } | { ok: false; reason: string };
   config?: Partial<LedgerV1["config"]>;
   allowCommand?: (command: string) => boolean;
   slotMax?: number;
@@ -809,9 +809,9 @@ function checksEnv(o: ChecksOpts = {}) {
     diffNameStatus: async () => { if (o.diffError !== undefined) throw o.diffError; return o.diff ?? []; },
   });
   const resolver: RunResolver = {
-    resolve: async ref => (o.resolve ?? ((r: RunCommandRef) => ({
+    resolve: async (ref, cwd) => (o.resolve ?? ((r: RunCommandRef) => ({
       ok: true as const, command: { label: r.script, file: "npm", args: ["run", r.script, ...r.args], source: "package-script" as const, ref: r },
-    })))(ref),
+    })))(ref, cwd),
   };
   const checks = createIntegrationChecks({
     ledger: () => stub<LedgerV1>({
@@ -906,6 +906,72 @@ function suiteReq(o: Partial<SuiteRunRequest> = {}): SuiteRunRequest {
 }
 
 const lintCfg: Partial<LedgerV1["config"]> = { integrationChecks: [{ script: "lint", args: [] }] };
+
+describe("phase suite execution cwd", () => {
+  it.each(["auto", "configured"] as const)("runs the %s suite, base and probes at their commits in CI, then checks the revert slot", async setting => {
+    const integration = nodePath.resolve("/integration");
+    const ci = { ...slot, slot: "ci", path: nodePath.resolve("/ci") };
+    let integrationHead = "c9"; // Integration has moved on beyond the suite commit under test.
+    const executed: Array<{ label: string; cwd: string; commit: string }> = [];
+    const resolve: NonNullable<ChecksOpts["resolve"]> = (ref, cwd) => ({
+      ok: true, command: { ...cmd, label: ref.script, ref, cwd }, // Like create.ts: retain the resolution cwd.
+    });
+    runnerHooks.planScopedRun = async () => unverifiable;
+    const env = checksEnv({
+      files: { "package.json": PKG_BOTH }, config: lintCfg, resolve,
+      spawn: (command, opts) => {
+        // Match the production spawner too: a command cwd overrides the options cwd a second time.
+        const cwd = command.cwd ?? opts.cwd;
+        const commit = cwd === integration ? integrationHead : env.at();
+        executed.push({ label: command.label, cwd, commit });
+        return commit === "c0" || commit === "c1" || commit === "rh" ? noneOut() : noneOut(1, { stdout: "unparsed failure" });
+      },
+    });
+    const { runner } = suiteEnv({
+      checks: env.checks, resolver: { resolve: async (ref, cwd) => resolve(ref, cwd) },
+      igit: { revList: async (_cwd, _from, to) => to === "c2" ? ["c2"] : ["c1", "c2", "c3"], subject: async () => "change [plan:T2]" },
+      git: { revert: async () => { integrationHead = "rh"; return { ok: true, head: "rh" }; }, revParse: async () => integrationHead },
+    });
+    const ledger = stub<LedgerV1>({
+      integration: stub<LedgerV1["integration"]>({ worktree: integration }),
+      config: stub<LedgerV1["config"]>({ phaseSuite: setting === "auto" ? "auto" : [{ script: "suite", args: [] }] }),
+    });
+    const resolved = await runner.resolve(ledger, "p1", "c3");
+    if (resolved.kind !== "runs") throw new Error("expected suite commands");
+    const verdict = await runner.run(suiteReq({ slot: ci, commands: resolved.commands }), journalOf().j);
+    expect(executed.slice(0, 4).map(({ cwd, commit }) => ({ cwd, commit }))).toEqual(
+      ["c3", "c3", "c3", "c0"].map(commit => ({ cwd: ci.path, commit })),
+    );
+    expect(executed.every(run => run.cwd === ci.path)).toBe(true);
+    expect(new Set(executed.slice(4).map(run => run.commit))).toEqual(new Set(["c1", "c2"]));
+    expect(integrationHead).toBe("c9");
+    expect(verdict).toEqual({ kind: "culprit", range: { taskId: "T2", from: "c1", to: "c2" }, ids: [], files: [] });
+    expect(env.resets.filter(r => r.startsWith("reset:"))).toEqual(executed.map(run => `reset:ci@${run.commit}`));
+
+    // Reuse the resolved suite command for the full-command revert regression; CI is still at a bisect commit.
+    executed.length = 0;
+    expect(await runner.revert({
+      planId: "plan", phaseId: "p1", culprit: { taskId: "T2", from: "c1", to: "c2" }, suiteCommit: "c3", head: "c9",
+      regression: { ids: [], files: [], commands: resolved.commands }, slot: { ...slot, slot: "integration", path: integration },
+    }, journalOf().j)).toEqual({ kind: "ok", revertHead: "rh", reverted: ["c2"] });
+    expect(executed).toEqual(["typecheck", "test", "lint", setting === "auto" ? "test" : "suite"].map(label => ({ label, cwd: integration, commit: "rh" })));
+    expect(env.resets.slice(-4)).toEqual(["reset:integration@c9", "clean:integration", "reset:integration@rh", "clean:integration"]);
+  });
+
+  it("preserves an intentional command cwd instead of changing shared exec semantics", async () => {
+    const override = { ...cmd, cwd: "/slot/pkg" };
+    const { runner } = suiteEnv({ resolver: { resolve: async () => ({ ok: true, command: override }) } });
+    const resolved = await runner.resolve(stub<LedgerV1>({
+      integration: stub<LedgerV1["integration"]>({ worktree: "/integration" }),
+      config: stub<LedgerV1["config"]>({ phaseSuite: [{ script: "test", args: [] }] }),
+    }), "p1", "c3");
+    if (resolved.kind !== "runs") throw new Error("expected suite commands");
+    const { checks, spawned } = checksEnv();
+    expect(await checks.runCommands({ slot, commit: "c3", commands: resolved.commands, mode: "full", priority: "background", signal: new AbortController().signal, prepare: true }))
+      .toMatchObject({ verdict: "pass" });
+    expect(spawned[0]).toMatchObject({ cwd: override.cwd, c: override });
+  });
+});
 
 describe("integration checks: prepare and select", () => {
   it("prepare resets, cleans and verifies the head of the slot", async () => {

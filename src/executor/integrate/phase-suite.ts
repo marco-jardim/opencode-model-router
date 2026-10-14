@@ -333,15 +333,22 @@ async function runRevert(d: PhaseSuiteDeps, req: RevertRequest, j: StepJournal):
   return { kind: "ok", revertHead, reverted };
 }
 
-/** M21: what the phase suite is at `commit`. Reads through git, so no slot is touched before the journal. */
+/** M21: auto discovery reads `commit` through git; command resolution reads the integration tree without touching a slot. */
 async function resolveSuite(d: PhaseSuiteDeps, ledger: Readonly<LedgerV1>, phaseId: PhaseId, commit: string): Promise<SuiteResolution> {
   const setting = ledger.config.phaseSuite;
   if (setting === "off") return { kind: "off" };
   const cwd = ledger.integration.worktree;
+  // Resolution reads the integration tree, but suites, base checks and revert regressions run in their prepared slot.
+  // Drop only the resolver's inherited cwd; intentional overrides (for example scoped test specs) still win in exec.
+  const forSlot = (c: ResolvedCommand): ResolvedCommand => {
+    if (c.cwd !== cwd) return c;
+    const { cwd: _cwd, ...command } = c;
+    return command;
+  };
   if (setting === "auto") {
     try {
       const selection = await d.checks.select(cwd, commit);
-      const commands = selection.tests.map(t => t.full);
+      const commands = selection.tests.map(t => forSlot(t.full));
       return commands.length === 0 ? { kind: "none" } : { kind: "runs", commands };
     } catch (e) {
       return { kind: "refused", reason: `phase ${phaseId} suite selection failed: ${e instanceof Error ? e.message : String(e)}`, ref: null };
@@ -357,7 +364,7 @@ async function resolveSuite(d: PhaseSuiteDeps, ledger: Readonly<LedgerV1>, phase
       return { kind: "refused", reason: e instanceof Error ? e.message : String(e), ref };
     }
     if (!r.ok) return { kind: "refused", reason: r.reason, ref };
-    commands.push(r.command);
+    commands.push(forSlot(r.command));
   }
   return { kind: "runs", commands };
 }
