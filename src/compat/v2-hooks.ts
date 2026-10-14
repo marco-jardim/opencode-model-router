@@ -2054,6 +2054,8 @@ export async function registerV2Hooks(
   const executorLaunches = new Map<string, {
     req: LaunchRequest; callID: string; child: string | null; end?: "succeeded" | "failed" | "interrupted";
   }>();
+  /** Timing-only identities of settled childless launches, for accepted late children; never reopen in-flight work. */
+  const executorLateTimings = new Map<string, string>();
   const executorAttemptKey = (taskId: string, attempt: number): string => `${taskId}#${attempt}`;
   const executorInFlight = {
     /**
@@ -2067,13 +2069,23 @@ export async function registerV2Hooks(
     },
     remember(req: LaunchRequest): void {
       const key = executorAttemptKey(req.taskId, req.attempt);
+      executorLateTimings.delete(key);
       executorLaunches.delete(key);
       executorLaunches.set(key, { req, callID: `executor:${req.planId}:${req.taskId}#${req.attempt}:${req.nonce}`, child: null });
       while (executorLaunches.size > 1000) executorLaunches.delete(executorLaunches.keys().next().value!);
     },
     register(taskId: string, attempt: number, child: string | null): void {
-      const entry = executorLaunches.get(executorAttemptKey(taskId, attempt));
-      if (entry === undefined) return;
+      const key = executorAttemptKey(taskId, attempt);
+      const entry = executorLaunches.get(key);
+      if (entry === undefined) {
+        if (child === null) return;
+        const callID = executorLateTimings.get(key);
+        if (callID === undefined) return;
+        executorLateTimings.delete(key); // consume once, without deciding or acknowledging another in-flight record
+        noteSessionKind(child, "child");
+        timings?.bindChild(callID, child);
+        return;
+      }
       if (inflight.byCall(entry.callID) === undefined) {
         inflight.decide({
           callID: entry.callID, parentSessionID: entry.req.orchestratorSessionID, agent: entry.req.route.agent, role: entry.req.role,
@@ -2095,6 +2107,8 @@ export async function registerV2Hooks(
       executorLaunches.delete(key);
       if (entry === undefined) return;
       if (entry.child === null) {
+        executorLateTimings.set(key, entry.callID);
+        while (executorLateTimings.size > 1000) executorLateTimings.delete(executorLateTimings.keys().next().value!);
         inflight.cancel(entry.callID);
         return;
       }
