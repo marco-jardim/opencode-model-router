@@ -25,13 +25,28 @@ const repositories = ["node-pnpm", "node-npm", "py-pip"] as const;
 const plans = ["throughput", "resilience"] as const;
 const waitFor = waitForHost;
 // Provider work and the pre-run G8 oracle use authored milliseconds, without host slack.
-const HOST_RUN_BUDGET_MS = 90_000;
+// Owner amendment (2026-10-14): the per-host watchdog is derived from the G8 contract instead of a fixed 90 s, which
+// run 12 showed cannot hold a complete run (serial integration alone is ~75–85 s). The G8 assertion still uses the
+// MEASURED serial integration; the per-entry allowance below only sizes the watchdog. Run 12 measured 3.4–4.5 s per
+// task integration entry (throughput npm 11 entries / 40.9 s, pnpm 10 / 45.5 s, pip 10 / 34.2 s).
+const INTEGRATION_ENTRY_ALLOWANCE_MS = 5_000;
+const SETUP_WATCHDOG_MS = 60_000; // host boot through the compiled ledger
+const AUDIT_MARGIN_MS = 60_000; // G1/G2/G3 proofs, background dispatches, integration-head audits and evidence capture
+const HOST_RUN_CEILING_MS = 300_000; // a genuine stall still fails within this bound
 const HOST_RUNS = repositories.length * 3; // throughput + resilience baseline + resilience restart
-const RUN_BUDGET_MS = HOST_RUNS * HOST_RUN_BUDGET_MS + 90_000; // nine host runs plus two bounded G12 subprocesses
+const RUN_BUDGET_MS = HOST_RUNS * HOST_RUN_CEILING_MS + 90_000; // nine host ceilings plus two bounded G12 subprocesses
 const CAPACITY_COOLDOWN_MS = 10_000;
-// Both fixtures previously used a 76,800 ms completion wait. Keep it independent of the G8 oracle.
-const PLAN_COMPLETION_WAIT_MS = 76_800;
 let runDeadline = Number.POSITIVE_INFINITY;
+
+/** Integration entries the run must serialize: every writing task, every phase suite, and one per injected fault. */
+function integratingEntries(script: PlanScript, phases: number): number {
+  return Object.values(script.tasks).filter(task => task.writePath !== undefined).length + phases + script.injections.length;
+}
+
+/** Post-compilation watchdog: the G8 contract with a pre-run serial-integration allowance, plus the audit margin. */
+function executionWatchdogMs(cp: number, work: number, parallel: number, entries: number): number {
+  return Math.ceil(1.3 * Math.max(cp, work / parallel, entries * INTEGRATION_ENTRY_ALLOWANCE_MS)) + AUDIT_MARGIN_MS;
+}
 function provisioningFor(repository: typeof repositories[number], pnpmCli?: string): Pick<ExecutorConfig, "provision" | "python"> {
   const python = process.env.CPX_E2E_PYTHON ?? "auto";
   if (repository === "py-pip") return { python, provision: { pip: [["python", "-m", "venv", "--system-site-packages", ".venv"]] } };
@@ -214,6 +229,18 @@ describe("CPX e2e assertion negative controls", () => {
     // Each case has max(CP, W/p, ΣI) = 100 ms, so the strict limit is exactly 130 ms.
     expect(() => assertThroughput(130, cp, work, 4, serialIntegration, [])).not.toThrow();
     expect(() => assertThroughput(131, cp, work, 4, serialIntegration, [])).toThrow(/G8: independent CP\/W and configured p bound/);
+  });
+  it("the watchdog comes from the G8 contract with a pre-run integration allowance, under an explicit ceiling", () => {
+    const throughput = loadScript("throughput");
+    expect(Object.values(throughput.tasks).filter(task => task.writePath !== undefined), "throughput writers").toHaveLength(20);
+    const entries = integratingEntries(throughput, 4);
+    expect(entries).toBe(24 + throughput.injections.length);
+    // The allowance dominates CP (59 s) and W/p (39 s) for this fixture; without entries the CP term rules.
+    expect(executionWatchdogMs(59_000, 156_000, 4, entries)).toBe(Math.ceil(1.3 * entries * INTEGRATION_ENTRY_ALLOWANCE_MS) + AUDIT_MARGIN_MS);
+    expect(executionWatchdogMs(59_000, 156_000, 4, 0)).toBe(Math.ceil(1.3 * 59_000) + AUDIT_MARGIN_MS);
+    // Run 12's measured ~10.5 s boot-to-approval must fit next to the derived budget under the ceiling.
+    expect(executionWatchdogMs(59_000, 156_000, 4, entries) + 15_000, "derived budget fits the host ceiling").toBeLessThanOrEqual(HOST_RUN_CEILING_MS);
+    expect(RUN_BUDGET_MS).toBe(HOST_RUNS * HOST_RUN_CEILING_MS + 90_000);
   });
   it("G8 accepts 10,000 ms idle but rejects 10,001 ms independently of makespan", () => {
     expect(() => assertThroughput(100, 100, 100, 4, 0, [0, 10_000])).not.toThrow();
@@ -700,7 +727,9 @@ async function drive(name: typeof plans[number], repository: typeof repositories
   let g1Sample: { request: CpxRequest; ledger: LedgerV1; at: number } | undefined;
   const g1Marker = "CPX_E2E_G1_NEXT_TURN";
   let root = "";
-  const watchdog = setTimeout(() => {
+  let hostDeadlineAt = driverStartedAt;
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  const onDeadline = (): void => {
     const deadlineAt = Date.now();
     observations.deadlineAt = deadlineAt;
     observations.deadlineElapsedMs = deadlineAt - driverStartedAt;
@@ -718,7 +747,15 @@ async function drive(name: typeof plans[number], repository: typeof repositories
       controller.abort();
       await host?.stop().catch(() => undefined);
     })();
-  }, Math.min(HOST_RUN_BUDGET_MS, runDeadline - Date.now()));
+  };
+  // Re-arming only moves the deadline; it never exceeds the host ceiling or the aggregate run budget.
+  const armWatchdog = (sinceStartMs: number, reason: string): void => {
+    hostDeadlineAt = Math.min(driverStartedAt + sinceStartMs, driverStartedAt + HOST_RUN_CEILING_MS, runDeadline);
+    observations.watchdog = { reason, deadlineMs: hostDeadlineAt - driverStartedAt, ceilingMs: HOST_RUN_CEILING_MS };
+    if (watchdog !== undefined) clearTimeout(watchdog);
+    watchdog = setTimeout(onDeadline, Math.max(0, hostDeadlineAt - Date.now()));
+  };
+  armWatchdog(SETUP_WATCHDOG_MS, "setup");
   try {
     // The plan/repository labels live in session titles/evidence, not in a MAX_PATH-sensitive host temp prefix.
     host = await timing.span("setup", () => startE2eHost({
@@ -1010,6 +1047,9 @@ async function drive(name: typeof plans[number], repository: typeof repositories
     const bounds = workBounds(script, compiled.edges, compiled);
     observations.compiled = compiled;
     observations.bounds = bounds;
+    const entries = integratingEntries(script, compiled.phases.length);
+    armWatchdog(Date.now() - driverStartedAt + executionWatchdogMs(bounds.cp, bounds.work, script.executor.maxParallel, entries), "contract");
+    obj(observations.watchdog).integratingEntries = entries;
     if (name === "resilience") expect(compiled.edges.some(edge => [edge.from, edge.to].every(id => ["1.1.2", "1.1.3"].includes(id))), "G6: overlap not serialized by compiler").toBe(false);
     await timing.span("approve", () => command(activeHost, root, `approve ${planId}`, { action: "approve", planId }, timing));
     timing.mark("g1.start");
@@ -1199,7 +1239,7 @@ async function drive(name: typeof plans[number], repository: typeof repositories
         }
       }
       return ledger.status === "completed" ? ledger : undefined;
-    }, Math.min(PLAN_COMPLETION_WAIT_MS, runDeadline - Date.now()), 50);
+    }, Math.max(0, hostDeadlineAt - Date.now()), 50);
     await Promise.all(backgrounds);
     expect(restarted, "G9: requested restart checkpoint was reached").toBe(restart);
     if (human) expect(humanAnswered, "G10: scripted orchestrator actually answered").toBe(true);
@@ -1440,7 +1480,7 @@ describe.skipIf(!enabled || !process.env.OPENCODE_V2_BIN)("CPX e2e: both plans o
   for (const repository of repositories) {
     it(`throughput /plan run on ${repository}: G1–G8/G10/G12`, async () => {
       await drive("throughput", repository, false);
-    }, 120_000);
+    }, HOST_RUN_CEILING_MS + 30_000);
     it(`resilience /plan run on ${repository}: G1–G7/G9–G12 and restart equivalence`, async () => {
       const baseline = await drive("resilience", repository, false);
       const recovered = await drive("resilience", repository, true);
@@ -1448,7 +1488,7 @@ describe.skipIf(!enabled || !process.env.OPENCODE_V2_BIN)("CPX e2e: both plans o
       expect(recovered.tree, "G9: same integration branch tree").toBe(baseline.tree);
       expect(recovered.commits, "G9: same logical integration commits/counts, no duplicated effects").toEqual(baseline.commits);
       await writeEvidence(`resilience-${repository}-equivalence`, { baseline: baseline.metrics, recovered: recovered.metrics, assertions: ["restart-equivalent-to-baseline", "no-duplicate-integration-or-completion-effects"], ledgerEqual: true, treeEqual: true, commitEffectsEqual: true });
-    }, 240_000);
+    }, 2 * HOST_RUN_CEILING_MS + 30_000);
   }
 });
 

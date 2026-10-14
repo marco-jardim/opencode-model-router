@@ -141,7 +141,8 @@ export async function collectObservationFiles(directory: string): Promise<Observ
  *
  * Choice: docs/plans/critical-path-execution-plan.md:4225 says "No idle-with-ready interval exceeds 10 s"
  * without defining physical availability. runtime.updateIdle uses provider-selected ready work BEFORE
- * slot acquisition; it never queries the physical pool. We therefore assert A, not the weaker B. Route
+ * slot acquisition; it never queries the physical pool. We therefore assert A, not the weaker B; the owner
+ * confirmed A on 2026-10-14 (time spent waiting for a physical slot counts as idle). Route
  * and capacity-free observations establish queried facts; capacity-init/provider transitions and token
  * lifetimes independently reconstruct capacity (including M14's heavy cap). Unqueried routes/capacity
  * are UNKNOWN, never guessed eligible. Lease selection and launch-gate.ready are not readiness oracles.

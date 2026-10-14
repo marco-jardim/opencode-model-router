@@ -92,13 +92,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CPX e2e G8 idle checks reconstruct maximal episodes from committed v2 observations.** Failed slot/launch
   reservations no longer hide stalls by fragmenting ledger metrics. The unchanged 10,000 ms ceiling applies to
   whole episodes; every ledger fragment must be covered, and missing seals, sequence gaps or dropped events fail
-  closed. Pending owner confirmation, the asserted G8 idle predicate is **A: durable ready work with provider
-  capacity**. The physical-slot-blocked/launchable split (predicate B) is diagnostic only and cannot shorten an
-  asserted episode; the 10,000 ms bound has not been relaxed. Per-host streams are retained before scratch
-  cleanup, including incomplete failure/restart diagnostics.
+  closed. The asserted G8 idle predicate, confirmed by the owner on 2026-10-14, is **A: durable ready work with
+  provider capacity**, so time spent waiting for a physical slot counts as idle. The physical-slot-blocked/launchable
+  split (predicate B) is diagnostic only and cannot shorten an asserted episode; the 10,000 ms bound has not been
+  relaxed. Per-host streams are retained before scratch cleanup, including incomplete failure/restart diagnostics.
 - **CPX e2e smoke throughput checks follow the strict G8 contract:** provider delays and the independent CP/W
   oracle use authored fixture milliseconds, makespan has no additive slack, and idle with ready work is capped at
-  10,000 ms. Existing watchdogs, run budgets and wait/test timeouts are unchanged.
+  10,000 ms. By owner amendment (2026-10-14) the fixed 90 s per-host watchdog, which cannot hold a complete run
+  (measured serial integration alone is ~75–85 s), is replaced by one derived from the contract: a 60 s setup
+  watchdog, then 1.3 × max(CP, W/p, entries × 5 s) plus a 60 s audit margin, capped at 300 s per host. The
+  per-entry allowance only sizes the watchdog; the G8 assertion keeps the measured serial integration.
 - **OpenCode v2: malformed shared lease registry entries no longer disable enforcement.** Entries are validated
   individually; an invalid entry is refused without replacing it or disturbing valid registries. If the registry cannot
   start with leases enforced, lease-checked file, search, git and run tools are refused instead of bypassing enforcement.
