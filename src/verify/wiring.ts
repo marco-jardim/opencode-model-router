@@ -1112,6 +1112,8 @@ export interface VerificationWiring {
     restoredHead?: HeadState,
     /** V2 completion diagnostics only; the caller supplies the parent rather than inferring it from the dispatch key. */
     parentSessionID?: string,
+    /** V2 diagnostics only: lazily supply a non-dispatch source and its retained call id. */
+    captureObservation?: () => { source: string; callID: string },
   ): Promise<PreparedVerification>;
   /** Session ids currently running a grader prompt, so hooks can skip them. */
   graderSessions: Set<string>;
@@ -3713,9 +3715,9 @@ export function createVerificationWiring(deps: {
         stop.abort();
       };
     },
-    async prepareVerification(store, id, childID, cwd, deadline, dispatchStartedAt?: number, restoredHead?: HeadState, parentSessionID?: string) {
+    async prepareVerification(store, id, childID, cwd, deadline, dispatchStartedAt, restoredHead, parentSessionID, captureObservation) {
       if (parentSessionID !== undefined) observeV2(deps.observations, () => ({ family: "completion-effect", effect: "change-set-capture", source: "required-change",
-        ...completionIdentity(parentSessionID, id, childID || null) }));
+        ...completionIdentity(parentSessionID, id, childID || null), ...captureObservation?.() }));
       const change = await observeChange(store, id, childID, cwd, deadline, undefined, restoredHead);
       const captured = await store.reference(id, deadline?.signal);
       // Cross-repo P2d.3 (P2.6): the pins of the admitted link targets travel with a captured reference (required gate only).

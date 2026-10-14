@@ -25,8 +25,10 @@
  *
  * Completion payload: {effect, source, parentSessionID, callID, childSessionID,
  * handle?, outcome?}. The attempt key is the three identity fields, NOT child alone.
- * Count rows per effect AND source: background-delta and deferred-change are distinct
- * capture invocations. Delivery sources distinguish foreground-result, completed-provider,
+ * Count rows per effect AND source: background-delta, deferred-change, required-change
+ * and plan-task-change are distinct capture invocations. Plan-task captures (including
+ * restart fallback) use the attempt's parent, retained callID (or plan verification id
+ * when absent) and childSessionID. Delivery sources distinguish foreground-result, completed-provider,
  * held-synthetic and unheld-synthetic (every retry counts). Rows precede invocations,
  * including failed ones; they do not assert successful persistence/delivery.
  *

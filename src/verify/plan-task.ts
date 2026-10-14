@@ -329,13 +329,16 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
     }
   };
 
-  async function prepare(record: AttemptRecord, childID: string, restoredHead?: Parameters<VerificationWiring["prepareVerification"]>[6]): Promise<{ ok: true; prepared: PreparedVerification } | { ok: false; reason: string }> {
+  async function prepare(record: AttemptRecord, attempt: Attempt, restoredHead?: Parameters<VerificationWiring["prepareVerification"]>[6]): Promise<{ ok: true; prepared: PreparedVerification } | { ok: false; reason: string }> {
     const deadline = createDeadline(resolveVerifyBudget(deps.getConfig()).gateBudgetMs);
     const entry = { deadline, graders: new Set<string>() };
     live.add(entry);
     if (disposing) deadline.abort(PLAN_TASK_SHUTDOWN_REASON);
     try {
-      const prepared = await deps.prepareVerification(deps.changedFileStore, record.id, childID, record.slotPath, deadline, record.startedAt, restoredHead);
+      const prepared = await deps.prepareVerification(
+        deps.changedFileStore, record.id, attempt.childSessionID ?? "", record.slotPath, deadline, record.startedAt, restoredHead,
+        record.orchestratorSessionID, () => ({ source: "plan-task-change", callID: attempt.callID ?? record.id }),
+      );
       return { ok: true, prepared };
     } catch (error) {
       return { ok: false, reason: `the change observation failed: ${scrubText(error instanceof Error ? error.message : String(error))}` };
@@ -376,7 +379,7 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
     const record = records.get(key);
     // No begin record (a restart): verify takes the fail-closed fallback.
     if (record === undefined || record.observed !== undefined) return;
-    record.observed = prepare(record, attempt.childSessionID ?? "");
+    record.observed = prepare(record, attempt);
     // QA-5.1-4: dispose never waits for an observation (its deadline is aborted; verify then cuts).
     try { await untilShutdown(record.observed); } catch { /* cut by dispose */ }
   }
@@ -433,7 +436,7 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
     if (await (deps.perimeterPlanned ?? perimeterWouldBePlanned)(id, slot.path)) {
       return { ok: false, reason: "the attempt's observation was lost in a restart and its perimeter would be planned; the other repositories cannot be judged; unverifiable", dod };
     }
-    const observed = await prepare(record, attempt.childSessionID ?? "", restoredHead);
+    const observed = await prepare(record, attempt, restoredHead);
     if (!observed.ok) return { ok: false, reason: observed.reason, dod };
     if (observed.prepared.perimeter !== undefined && observed.prepared.perimeter.roots.length > 0) {
       return { ok: false, reason: "the attempt's observation was lost in a restart and its perimeter would be planned; the other repositories cannot be judged; unverifiable", dod };
