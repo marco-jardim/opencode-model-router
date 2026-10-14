@@ -2504,6 +2504,43 @@ describe("metrics", () => {
     expect(await h.runtime.status(PLAN_ID, ORCH)).toContain("Metrics: launches 1, wakes 2, idle-with-ready 5000 ms");
   });
 
+  it("keeps idle-with-ready duration equal to its endpoints with an advancing clock", async () => {
+    const h = await mk(planOf([task("T1")]));
+    h.launcher.gateValue = staleGate("stale-context:boot:1");
+    await h.begin();
+    await until(() => h.hosts.delivered.length === 1, "first wake");
+
+    // A millisecond can tick between two reads. Model that without moving the test timers: every now() lands one more
+    // ms later, while a bare iso() keeps the timer time. Separate reads for an endpoint's ms and ISO time then
+    // disagree by a different amount at each endpoint, as the run-13 smoke observed (1,060 vs 1,061 ms).
+    const readNow = h.clock.now.bind(h.clock);
+    let reads = 0;
+    vi.spyOn(h.clock, "now").mockImplementation(() => readNow() + ++reads);
+    vi.spyOn(h.clock, "iso").mockImplementation((ms) => new Date(ms ?? readNow()).toISOString());
+
+    // Same window as the metrics test: idle orchestrator with a stale context, a debounced second wake, then a launch.
+    h.runtime.onHostEvent({ type: "execution.completed", sessionID: ORCH, at: h.clock.iso() });
+    await h.settled();
+    h.launcher.gateValue = staleGate("stale-context:boot:2");
+    h.runtime.onRouterToolCall(ORCH);
+    await h.settled();
+    h.clock.advance(1000);
+    await until(() => h.hosts.delivered.length === 2, "second wake after the debounce");
+    await h.settled();
+    h.clock.advance(4000);
+    h.launcher.gateValue = OK_GATE;
+    h.runtime.onRouterToolCall(ORCH);
+    await h.runOf("T1", 1);
+    h.launcher.gateValue = DISPOSED_GATE;
+    h.launcher.releaseAll();
+    await h.settled();
+
+    const idle = need((await h.metrics()).find((m) => m.name === "idle-with-ready"), "idle-with-ready metric");
+    expect(idle.readyTaskIds).toEqual(["T1"]);
+    expect(idle.ms).toBeGreaterThan(0);
+    expect(Date.parse(idle.toAt) - Date.parse(idle.fromAt)).toBe(idle.ms);
+  });
+
   it("recordMetric for a plan that is not attached journals nothing", async () => {
     const h = await mk(planOf([task("T1")]));
     await h.begin();

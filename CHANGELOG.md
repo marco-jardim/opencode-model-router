@@ -89,6 +89,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OpenCode v2: the executor's idle-with-ready metric reports a duration exactly equal to its endpoints.**
 - **CPX e2e G8 idle checks reconstruct maximal episodes from committed v2 observations.** Failed slot/launch
   reservations no longer hide stalls by fragmenting ledger metrics. The unchanged 10,000 ms ceiling applies to
   whole episodes; every ledger fragment must be covered, and missing seals, sequence gaps or dropped events fail

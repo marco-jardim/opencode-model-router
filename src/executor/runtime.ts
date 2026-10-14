@@ -1270,7 +1270,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       let free = 0;
       const view = viewOf(p, null);
       for (const prov of new Set(ready.map((r) => r.route.provider))) free += p.capacity.limit(prov) > 0 ? view.free(prov, false) : 0;
-      p.idle = { fromMs: d.clock.now(), fromAt: d.clock.iso(), ids: ready.map((r) => r.taskId), free };
+      const t = d.clock.now();
+      p.idle = { fromMs: t, fromAt: d.clock.iso(t), ids: ready.map((r) => r.taskId), free };
     } else if (!hold && p.idle !== null) closeIdle(p);
   }
 
@@ -1278,9 +1279,10 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     const o = p.idle;
     if (o === null) return;
     p.idle = null;
-    const ms = Math.max(0, d.clock.now() - o.fromMs);
+    const t = d.clock.now();
+    const ms = Math.max(0, t - o.fromMs);
     p.counters.idleMs += ms;
-    metric(p, { name: "idle-with-ready", fromAt: o.fromAt, toAt: d.clock.iso(), ms, readyTaskIds: o.ids, free: o.free });
+    metric(p, { name: "idle-with-ready", fromAt: o.fromAt, toAt: d.clock.iso(t), ms, readyTaskIds: o.ids, free: o.free });
   }
 
   // ---------- tick
