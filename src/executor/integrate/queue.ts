@@ -186,8 +186,7 @@ function refusedError(e: unknown): RefusedDetail {
     let detail: JsonValue;
     try {
       // Redact before clipping each string: a byte boundary must not expose a credential suffix.
-      const text = JSON.stringify(e.detail, (_key, value: unknown) => {
-        if (typeof value !== "string") return value;
+      const sanitizeString = (value: string): string => {
         const clean = stripUrlUserinfo(value);
         let limit = 2048;
         let bounded = tailBytes(clean, limit);
@@ -197,6 +196,28 @@ function refusedError(e: unknown): RefusedDetail {
           bounded = tailBytes(clean, limit);
         }
         return bounded;
+      };
+      const copies = new WeakMap<object, Record<string, unknown>>();
+      let remaining = 256; // Bound traversal too, including arrays and objects returned by toJSON.
+      const text = JSON.stringify(e.detail, (_key, value: unknown) => {
+        if (--remaining < 0) throw new Error("Diagnostic traversal limit");
+        if (typeof value === "string") return sanitizeString(value);
+        if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
+        // Reuse copies so JSON.stringify still detects cycles, but permits shared diagnostic objects.
+        const previous = copies.get(value);
+        if (previous) return previous;
+        const copy: Record<string, unknown> = Object.create(null);
+        copies.set(value, copy);
+        for (const key in value) {
+          if (--remaining < 0) throw new Error("Diagnostic traversal limit");
+          if (!Object.hasOwn(value, key)) continue;
+          const base = sanitizeString(key);
+          let cleanKey = base;
+          // Renaming must not overwrite another diagnostic; a null prototype keeps __proto__ inert.
+          for (let n = 2; Object.hasOwn(copy, cleanKey); n++) cleanKey = `${base}#${n}`;
+          copy[cleanKey] = (value as Record<string, unknown>)[key];
+        }
+        return copy;
       });
       detail = Buffer.byteLength(text, "utf8") <= 8192 ? JSON.parse(text) as JsonValue
         : { truncated: true, tail: tailBytes(text, 4096) };

@@ -3169,21 +3169,86 @@ describe("unexpected lane errors (M13a) and stalled entries (M36)", () => {
     env.assertInvariants();
   });
 
-  it.each(["oversized", "cyclic"])("%s diagnostic detail cannot overflow the journal or prevent the critical pause", async kind => {
+  it("diagnostic-key redaction survives collisions and prototype names in the durable refusal", async () => {
+    const env = await setup({ tasks: 1 });
+    const first = "https://fake-credential-user:fake-credential-pass@example.test/repo?token=fake-credential-token";
+    const second = "https://fake-credential-other:fake-credential-other-pass@example.test/repo?token=fake-credential-other-token";
+    const clean = "https://example.test/repo?token=***";
+    const original = { op: "rebase", code: 1, stderr: `initiating failure ${first}`,
+      remotes: { [first]: "first remote", [second]: "second remote", [`${clean}#2`]: "third remote" } };
+    const detail = {
+      original, shared: original,
+      cleanup: { op: "rebase --abort", code: 128, error: `cleanup failure ${second}` },
+      ["__proto__"]: [{ [first]: `prototype diagnostic ${second}` }],
+      constructor: "constructor diagnostic", prototype: "prototype diagnostic", toString: "toString diagnostic",
+    };
+    env.git.rebaseOnto = async () => { throw new ExecutorError("E_GIT", "keyed diagnostic", detail); };
+    env.queue.enqueue(["T1"]);
+    await env.until(() => env.ledger.status === "paused", "the infrastructure pause");
+    const events = await env.events();
+    const refused = events.filter(isStep).find(e => e.step === "rebase" && e.edge === "end" && e.result === "refused");
+    expect(parseDetail(refused?.detail)).toMatchObject({ reason: "error", message: "keyed diagnostic", error: {
+      code: "E_GIT", detail: {
+        original: { op: "rebase", code: 1, stderr: `initiating failure ${clean}`,
+          remotes: { [clean]: "first remote", [`${clean}#2`]: "second remote", [`${clean}#2#2`]: "third remote" } },
+        shared: { op: "rebase", code: 1, stderr: `initiating failure ${clean}` },
+        cleanup: { op: "rebase --abort", code: 128, error: `cleanup failure ${clean}` },
+        ["__proto__"]: [{ [clean]: `prototype diagnostic ${clean}` }],
+        constructor: "constructor diagnostic", prototype: "prototype diagnostic", toString: "toString diagnostic",
+      },
+    } });
+    expect(JSON.stringify(events)).not.toContain("fake-credential-");
+    expect(Buffer.byteLength(refused?.detail ?? "", "utf8")).toBeLessThanOrEqual(DETAIL_MAX_BYTES);
+    expect(refused?.closes).toBe(false);
+    expect(events.find(e => e.type === "status-changed" && e.to === "paused")).toMatchObject({ reason: "integration-infrastructure" });
+    expect(env.ledger.inbox[0]).toMatchObject({ kind: "failure", severity: "critical" });
+    expect(env.state("T1")).toBe("integrating");
+    expect(env.writer.openIntegration()).toHaveLength(1);
+    expect(env.w.tip()).toBe(env.w.base);
+    expect(env.w.checkLog).toEqual([]);
+    env.assertInvariants();
+  });
+
+  it("diagnostic-key clipping redacts before bounding escaped property names", async () => {
+    const env = await setup({ tasks: 1 });
+    const key = `${"\0\\\"é".repeat(5000)} https://fake-credential-user:${"fake-credential-pass".repeat(500)}@example.test/repo?token=fake-credential-token`;
+    const detail = { op: "rebase", code: 1, [key]: "remote failure" };
+    env.git.rebaseOnto = async () => { throw new ExecutorError("E_GIT", "large keyed diagnostic", detail); };
+    env.queue.enqueue(["T1"]);
+    await env.until(() => env.ledger.status === "paused", "the infrastructure pause");
+    const events = await env.events();
+    const refused = events.filter(isStep).find(e => e.step === "rebase" && e.result === "refused");
+    expect(parseDetail(refused?.detail)).toMatchObject({ reason: "error", message: "large keyed diagnostic", error: {
+      code: "E_GIT", detail: { op: "rebase", code: 1 },
+    } });
+    expect(refused?.detail).toContain("https://example.test/repo?token=***");
+    expect(refused?.detail).toContain("remote failure");
+    expect(JSON.stringify(events)).not.toContain("fake-credential-");
+    expect(Buffer.byteLength(refused?.detail ?? "", "utf8")).toBeLessThan(4096);
+    expect(env.ledger.inbox[0]).toMatchObject({ kind: "failure", severity: "critical" });
+    expect(env.state("T1")).toBe("integrating");
+    expect(env.writer.openIntegration()).toHaveLength(1);
+    env.assertInvariants();
+  });
+
+  it.each(["oversized", "excessive-keys", "excessive-items", "cyclic", "throwing-toJSON"])("%s diagnostic detail cannot overflow the journal or prevent the critical pause", async kind => {
     const env = await setup({ tasks: 1 });
     const detail: Record<string, JsonValue> = {};
     if (kind === "cyclic") detail.self = detail;
+    else if (kind === "throwing-toJSON") Object.defineProperty(detail, "toJSON", { value: () => { throw new Error("fake-credential-unavailable"); } });
+    else if (kind === "excessive-keys") for (let n = 0; n < 1000; n++) detail[`item${n}`] = n;
+    else if (kind === "excessive-items") detail.items = Array.from({ length: 1000 }, (_, n) => n);
     else detail.items = Array.from({ length: 100 }, () => `${"x".repeat(3000)} https://alice:secret@example.test/repo?token=private`);
     env.git.rebaseOnto = async () => { throw new ExecutorError("E_GIT", "unexpected diagnostic", detail); };
     env.queue.enqueue(["T1"]);
     await env.until(() => env.ledger.status === "paused", "the infrastructure pause");
     const refused = (await env.events()).filter(isStep).find(e => e.step === "rebase" && e.result === "refused");
     expect(parseDetail(refused?.detail)).toMatchObject({ reason: "error", message: "unexpected diagnostic", error: {
-      code: "E_GIT", detail: kind === "cyclic" ? { unavailable: true }
-        : { truncated: true, tail: expect.stringContaining("https://example.test/repo?token=***") },
+      code: "E_GIT", detail: kind === "oversized" ? { truncated: true, tail: expect.stringContaining("https://example.test/repo?token=***") }
+        : { unavailable: true },
     } });
     expect(Buffer.byteLength(refused?.detail ?? "", "utf8")).toBeLessThanOrEqual(DETAIL_MAX_BYTES);
-    expect(refused?.detail).not.toMatch(/alice|secret|private/);
+    expect(refused?.detail).not.toMatch(/alice|secret|private|fake-credential-/);
     expect(env.ledger.inbox[0]).toMatchObject({ kind: "failure", severity: "critical" });
     expect(env.state("T1")).toBe("integrating");
     expect(env.writer.openIntegration()).toHaveLength(1);
