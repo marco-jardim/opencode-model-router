@@ -792,6 +792,17 @@ async function drive(name: typeof plans[number], repository: typeof repositories
         if (steps.some(step => step.manager === "pnpm" && step.args.some(arg => /[\\/]corepack[\\/]dist[\\/]pnpm\.js$/i.test(arg)))) {
           throw new Error("Offline pnpm prerequisite is missing in RoutingHost's fresh private HOME/cache: auto provisioning selected a Corepack bootstrap shim. Supply a pre-provisioned pnpm executable/CLI on PATH, or set CPX_E2E_PNPM_CLI to its absolute .js/.cjs entry; do not download a package manager inside the smoke. Resolved provisioning: " + json(observations.provisioning));
         }
+        // Slots create `--system-site-packages` venvs, so the interpreter the executor resolves must already have pytest
+        // in its SYSTEM site-packages: a venv never sees the user site. Run 13 resolved `py -3`, whose pytest lived only
+        // in the user site; the phase suite then failed in the CI slot and paused the plan. `-s` mirrors that exclusion.
+        for (const step of steps.filter(candidate => candidate.manager === "pip")) {
+          const module = step.args.indexOf("-m");
+          const interpreter = [...step.args.slice(0, module < 0 ? 0 : module), "-s", "-c", "import pytest"];
+          const probe = spawnSync(step.command, interpreter, { cwd: project, env, encoding: "utf8", windowsHide: true, timeout: 30_000 });
+          if (probe.status !== 0) {
+            throw new Error(`Offline Python prerequisite is missing: the interpreter the executor resolves (${step.command} ${interpreter.slice(0, -3).join(" ")}) cannot import pytest from its system site-packages. Set CPX_E2E_PYTHON to an absolute Python with pytest installed; do not install packages inside the smoke. ${(probe.stderr || probe.error?.message || "").trim()}`);
+          }
+        }
         timing.mark("setup.provision-plan.end");
         timing.mark("setup.observers.start");
         plugins.push(await observeCompactionPlugin(directory));
