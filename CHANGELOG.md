@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **OpenCode v2: opt-in diagnostic observations.** Set `MODEL_ROUTER_V2_OBSERVATIONS=<directory>` to an existing
+  directory before setup to write bounded, sequence-numbered JSONL streams, sealed on adapter disposal. They
+  record dispatch native-argument fingerprints, completion effects, scheduler and physical-slot transitions,
+  without prompt or file content. Off by default and inert on OpenCode v1.
 - **CPX e2e smoke diagnostics:** bounded wrapper/child-command timings and host/setup/launch checkpoints are
   retained with failure evidence before scratch cleanup. These are diagnostic observations only; executor
   behavior, offline checks and G1–G12 bounds are unchanged.
@@ -85,6 +89,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CPX e2e G8 idle checks reconstruct maximal episodes from committed v2 observations.** Failed slot/launch
+  reservations no longer hide stalls by fragmenting ledger metrics. The unchanged 10,000 ms ceiling applies to
+  whole episodes; every ledger fragment must be covered, and missing seals, sequence gaps or dropped events fail
+  closed. Pending owner confirmation, the asserted G8 idle predicate is **A: durable ready work with provider
+  capacity**. The physical-slot-blocked/launchable split (predicate B) is diagnostic only and cannot shorten an
+  asserted episode; the 10,000 ms bound has not been relaxed. Per-host streams are retained before scratch
+  cleanup, including incomplete failure/restart diagnostics.
 - **CPX e2e smoke throughput checks follow the strict G8 contract:** provider delays and the independent CP/W
   oracle use authored fixture milliseconds, makespan has no additive slack, and idle with ready work is capped at
   10,000 ms. Existing watchdogs, run budgets and wait/test timeouts are unchanged.

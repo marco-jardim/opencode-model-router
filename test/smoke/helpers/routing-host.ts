@@ -68,7 +68,7 @@ export interface HostClient {
   plugin: { list(): Promise<{ data: { id: string; state: { status: string; error?: string } }[] }> };
   agent: { list(): Promise<{ data: AgentInfo[] }> };
   command: { list(): Promise<{ data: { name: string }[] }> };
-  debug: { location: { list(): Promise<{ directory: string }[]> } };
+  debug: { location: { list(): Promise<{ directory: string }[]>; evict(input: { location: { directory: string } }): Promise<void> } };
 }
 export interface HookRecord { __t: number; __n?: number; hook: "before" | "after"; iid: string; instance?: string; sessionID: string; callID: string; agent?: string; tool: string; input?: Obj; status?: string; result?: Obj; error?: Obj }
 export interface EventRecord { __t?: number; id?: string; type: string; created?: number; location?: unknown; data?: Obj; __instance?: string; __iid?: string; [key: string]: unknown }
@@ -666,6 +666,8 @@ export interface HostOptions {
   readonly routing?: Obj | null | ((root: string) => Obj);
   /** Use the long (realpath, non-8.3) spelling of the temp root, so the project, worktrees and every path under it are canonical (role work roots refuse 8.3 spellings). */
   readonly longPaths?: boolean;
+  /** Opt-in committed v2 observations, isolated under the host root (never in project/worktrees). */
+  readonly v2Observations?: boolean;
   /** Runs once the (empty) project directory exists and BEFORE the host process starts: e.g. a git repository whose worktrees the router lists at role-agent registration (plugin start). */
   readonly prepare?: (dirs: { readonly root: string; readonly project: string }) => Promise<void>;
   /** Opt-in smoke-only timestamps. Capture also runs on boot failure, before stop and after kill/before scratch removal. */
@@ -735,18 +737,21 @@ export class RoutingHost {
   port = 0;
   envKeys: string[] = [];
   readonly outcomes: string;
+  readonly observationDirectory: string;
   readonly logs: { hooks: string; events: string; dump: string };
   readonly configHome: string;
   private child?: ChildProcess;
   private output = "";
   private teardown?: Promise<Teardown>;
   private launches = 0;
+  private observationsSealed = false;
   /** What `launch()` needs again on `restart()`: fixed at the first boot (config files, env dirs, probe/pre-probe locations). */
   private plan?: { executable: string; env: Record<string, string | undefined>; probeConfig: string; preProbe?: string; preProbeConfig: string };
 
   private constructor(readonly root: string, readonly options: HostOptions) {
     if (options.provider) this.front = new CpxFront(options.provider);
     this.outcomes = path.join(root, "outcomes");
+    this.observationDirectory = path.join(root, "v2-observations");
     this.logs = { hooks: path.join(root, "hooks.jsonl"), events: path.join(root, "events.jsonl"), dump: path.join(root, "dump.json") };
     this.configHome = path.join(root, "home", ".config", "opencode");
   }
@@ -796,6 +801,10 @@ export class RoutingHost {
     for (const [name, dir] of Object.entries({ HOME: "home", USERPROFILE: "home", XDG_CONFIG_HOME: "config", XDG_DATA_HOME: "data", XDG_CACHE_HOME: "cache", XDG_STATE_HOME: "state", APPDATA: "appdata", LOCALAPPDATA: "localappdata", TEMP: "tmp", TMP: "tmp", TMPDIR: "tmp" })) {
       env[name] = path.join(this.root, dir);
       await mkdir(env[name]!, { recursive: true });
+    }
+    if (this.options.v2Observations) {
+      await mkdir(this.observationDirectory, { recursive: true });
+      env.MODEL_ROUTER_V2_OBSERVATIONS = this.observationDirectory;
     }
     this.project = path.join(this.root, "project");
     await mkdir(this.project, { recursive: true });
@@ -934,6 +943,20 @@ export class RoutingHost {
   }
 
   stop(): Promise<Teardown> { return this.teardown ??= this.doStop(); }
+  /** End-of-run only: dispose ALL live adapters so their observation streams receive real end seals.
+   * Awaiting eviction is the adapter's disposal barrier; close() drains the deferred sink before sealing.
+   * flush() alone would not seal it. Collect accepted G8 evidence only AFTER this method resolves.
+   * No further location/session calls may follow: they could start a new, unsealed adapter. Never use this
+   * before the resilience smoke's intentional hard restart (that would change the recovery experiment).
+   */
+  async sealObservations(): Promise<void> {
+    if (!this.options.v2Observations) throw new Error("v2 observations were not enabled");
+    const locations = await this.client.debug.location.list();
+    // Dispose secondary locations first; the project holds the executor until all child adapters are gone.
+    locations.sort((a, b) => Number(a.directory === this.project) - Number(b.directory === this.project));
+    for (const location of locations) await this.client.debug.location.evict({ location });
+    this.observationsSealed = true;
+  }
   private async collectDiagnostics(point: "before-stop" | "after-kill"): Promise<void> {
     const diagnostics = this.options.diagnostics;
     if (!diagnostics) return;
@@ -953,7 +976,7 @@ export class RoutingHost {
     } catch { /* no event log */ }
     seenProjectDirs.add(this.project);
     seenProjectDirs.add(path.join(this.root, "config", "opencode"));
-    if (child && child.exitCode === null) { try { for (const s of await this.everySession()) seenSessionIDs.add(s.id); } catch { /* the host is already gone */ } }
+    if (child && child.exitCode === null && !this.observationsSealed) { try { for (const s of await this.everySession()) seenSessionIDs.add(s.id); } catch { /* the host is already gone */ } }
     const { method, taskkill } = await this.killChild();
     const frontStopped = this.front ? await this.front.stop().then(() => true, () => false) : true;
     const providerStopped = (await this.provider.stop().then(() => true, () => false)) && frontStopped;

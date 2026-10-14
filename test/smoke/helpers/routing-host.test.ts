@@ -18,6 +18,7 @@ import path from "node:path";
 import { pidAlive, removeDirWhenReleased, waitUntil } from "../../helpers/remove-dir";
 import { EVIDENCE_DIR, OPENAI_PROVIDER, ROOT, RoutingHost, arr, evidenceDir, jsonl, obj, str, waitFor, type HostOptions, type Obj } from "./routing-host";
 import { CpxTimings } from "./cpx-timing";
+import { collectObservationFiles } from "./cpx-idle-oracle";
 
 const redirect = vi.hoisted(() => ({ executable: "", script: "" }));
 vi.mock("node:child_process", async importOriginal => {
@@ -32,7 +33,7 @@ vi.mock("node:child_process", async importOriginal => {
 });
 
 /** What the stub records per `serve` launch (`launches.jsonl` next to the script). */
-interface Launch { pid: number; port: number; password: string; cwd: string; home: string; silent: boolean }
+interface Launch { pid: number; port: number; password: string; cwd: string; home: string; silent: boolean; observations?: string }
 
 const NL = "\\n";
 /** `mode.json` next to the script: `{ "silent": true }` makes later launches stay alive WITHOUT printing the listening line. */
@@ -46,7 +47,7 @@ const modeFile = path.join(__dirname, 'mode.json');
 const mode = fs.existsSync(modeFile) ? JSON.parse(fs.readFileSync(modeFile, 'utf8')) : {};
 const port = Number(args[args.indexOf('--port') + 1]);
 const password = process.env.OPENCODE_PASSWORD;
-fs.appendFileSync(path.join(__dirname, 'launches.jsonl'), JSON.stringify({ pid: process.pid, port, password, cwd: process.cwd(), home: process.env.HOME, silent: mode.silent === true }) + '${NL}');
+fs.appendFileSync(path.join(__dirname, 'launches.jsonl'), JSON.stringify({ pid: process.pid, port, password, cwd: process.cwd(), home: process.env.HOME, silent: mode.silent === true, observations: process.env.MODEL_ROUTER_V2_OBSERVATIONS }) + '${NL}');
 const plugin = id => ({ id, state: { status: 'active' } });
 const server = http.createServer((req, res) => {
   if (req.headers.authorization !== 'Basic ' + Buffer.from('opencode:' + password).toString('base64')) { res.writeHead(401).end(); return; }
@@ -97,6 +98,47 @@ const post = (baseURL: string) => fetch(`${baseURL}/messages`, { method: "POST",
 const get = (host: RoutingHost, authorization: string) => fetch(new URL("/api/agent", host.baseUrl), { headers: { authorization } });
 
 // ------------------------------------------------------------ extraPlugins ----
+it("enables observations only by opt-in in a per-host directory outside project/worktrees, never inherited", async () => {
+  const previous = process.env.MODEL_ROUTER_V2_OBSERVATIONS;
+  process.env.MODEL_ROUTER_V2_OBSERVATIONS = path.join(stubDir, "must-not-inherit");
+  try {
+    const plain = await startHost("observations-off");
+    const observed = await startHost("observations-on", { v2Observations: true });
+    const [first, second] = await launches();
+    expect(first!.observations).toBeUndefined();
+    expect(plain.envKeys).not.toContain("MODEL_ROUTER_V2_OBSERVATIONS");
+    expect(second!.observations).toBe(observed.observationDirectory);
+    expect(path.dirname(observed.observationDirectory)).toBe(observed.root);
+    expect(path.dirname(observed.project)).toBe(observed.root);
+    expect(observed.observationDirectory).not.toBe(observed.project);
+    expect((await stat(observed.observationDirectory)).isDirectory()).toBe(true);
+  } finally {
+    if (previous === undefined) delete process.env.MODEL_ROUTER_V2_OBSERVATIONS;
+    else process.env.MODEL_ROUTER_V2_OBSERVATIONS = previous;
+  }
+}, 30_000);
+
+it("seals secondary adapters before the project and captures observation files before scratch removal without reopening adapters", async () => {
+  const captures: unknown[] = [];
+  const host = await startHost("observations-seal", { v2Observations: true, diagnostics: {
+    timing: new CpxTimings(),
+    collect: async (host, point) => { captures.push({ point, files: await collectObservationFiles(host.observationDirectory) }); },
+  } });
+  const file = { file: "raw.jsonl", text: "unsealed failure evidence\n" };
+  await writeFile(path.join(host.observationDirectory, file.file), file.text);
+  const other = path.join(host.root, "slots", "slot-1");
+  const list = vi.spyOn(host.client.debug.location, "list").mockResolvedValue([{ directory: host.project }, { directory: other }]);
+  const evict = vi.spyOn(host.client.debug.location, "evict").mockResolvedValue(undefined);
+  const inventory = vi.spyOn(host, "everySession");
+  await host.sealObservations();
+  expect(list).toHaveBeenCalledOnce();
+  expect(evict.mock.calls).toEqual([[{ location: { directory: other } }], [{ location: { directory: host.project } }]]);
+  await host.stop();
+  expect(captures).toEqual([{ point: "before-stop", files: [file] }, { point: "after-kill", files: [file] }]);
+  expect(inventory).not.toHaveBeenCalled(); // An SDK session read here could create a new, unsealed stream.
+  expect(existsSync(host.root)).toBe(false);
+}, 30_000);
+
 it("writes opencode.json plugins as [preProbe, router, ...extraPlugins, probe]: extras after the router, before the probe", async () => {
   const extraA = path.join(stubDir, "plugin-a");
   const extraB = path.join(stubDir, "plugin-b.mjs");

@@ -7,6 +7,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { RoutingHost, ROOT, arr, obj, jsonl, redact, stopAllHosts, waitFor as waitForHost, type HostOptions, type Obj } from "./helpers/routing-host";
 import { CpxTimings, collectTimingJournal, timedWrapperSource, timingJournalSource, timingObserverSource, TIMING_DIRECTORY, type TimingRecord } from "./helpers/cpx-timing";
+import { assertG8IdleEpisodes, collectObservationFiles, G8_IDLE_CEILING_MS, reconstructIdleEpisodes, type IdleEpisode } from "./helpers/cpx-idle-oracle";
 import type { CpxRequest } from "./helpers/cpx-scripted-provider";
 import type { ExecutorConfig, ExecutorEvent, LedgerV1 } from "../../src/executor/types";
 import { createLedgerStore, createNodeFileSystem } from "../../src/executor/ledger";
@@ -24,7 +25,6 @@ const repositories = ["node-pnpm", "node-npm", "py-pip"] as const;
 const plans = ["throughput", "resilience"] as const;
 const waitFor = waitForHost;
 // Provider work and the pre-run G8 oracle use authored milliseconds, without host slack.
-const G8_IDLE_CEILING_MS = 10_000;
 const HOST_RUN_BUDGET_MS = 90_000;
 const HOST_RUNS = repositories.length * 3; // throughput + resilience baseline + resilience restart
 const RUN_BUDGET_MS = HOST_RUNS * HOST_RUN_BUDGET_MS + 90_000; // nine host runs plus two bounded G12 subprocesses
@@ -648,6 +648,13 @@ async function drive(name: typeof plans[number], repository: typeof repositories
         if (rows.length) diagnostics.outcomeTimings = rows.slice(0, 512); // Existing counters/labels-only production log.
         captured.outcomeTimingsTruncated = rows.length > 512;
       } catch { captured.outcomeTimingsUnavailable = true; }
+      try {
+        // Keep ALL raw streams before scratch cleanup, including unsealed failure/restart tails.
+        // Only reconstructIdleEpisodes can accept them as complete G8 evidence; captures never imply success.
+        const files = await collectObservationFiles(activeHost.observationDirectory);
+        observations.v2Observations = files;
+        captured.v2ObservationFiles = files.length;
+      } catch (error) { captured.v2ObservationsUnavailable = String(error); }
       captured.completedAt = Date.now();
       if (arr(diagnostics.captures).length < 16) arr(diagnostics.captures).push(captured);
     });
@@ -716,6 +723,7 @@ async function drive(name: typeof plans[number], repository: typeof repositories
     // The plan/repository labels live in session titles/evidence, not in a MAX_PATH-sensitive host temp prefix.
     host = await timing.span("setup", () => startE2eHost({
       longPaths: true,
+      v2Observations: true,
       diagnostics: { timing, collect: collectDiagnostics },
       extraPlugins: plugins,
       provider: {},
@@ -1234,7 +1242,9 @@ async function drive(name: typeof plans[number], repository: typeof repositories
       expect(Date.parse(event.metric.toAt) - Date.parse(event.metric.fromAt), "G8: idle duration matches ledger endpoints").toBe(event.metric.ms);
     }
     if (name === "throughput") assertThroughput(makespan, bounds.cp, bounds.work, script.executor.maxParallel, serialIntegration, idle);
-    const metrics = { makespan, CP: bounds.cp, W: bounds.work, p: script.executor.maxParallel, serialIntegration, idle,
+    // Retain the legacy per-fragment assertion as an additional check, never the episode oracle.
+    const idleEpisodes: IdleEpisode[] = [];
+    const metrics = { makespan, CP: bounds.cp, W: bounds.work, p: script.executor.maxParallel, serialIntegration, idle, idleEpisodes,
       durationScale: 1, timingSlackMs: 0, idleSlackMs: 0, idleCeilingMs: G8_IDLE_CEILING_MS,
       efficiency: makespan / Math.max(bounds.cp, bounds.work / script.executor.maxParallel, serialIntegration),
       conflictRate: events.filter(event => event.type === "integration-step" && event.result === "conflict").length / Object.values(final.tasks).filter(task => task.integrated !== null).length,
@@ -1251,7 +1261,6 @@ async function drive(name: typeof plans[number], repository: typeof repositories
       obligation("four-clean-qa-reports", ["1.1.QA", "1.2.QA", "2.1.QA", "2.2.QA"].every(id => cleanQa(final, id)));
       obligation("four-passed-phase-gates", final.phases.length === 4 && final.phases.every(phase => phase.gate === "passed"));
       obligation("non-overlapping-leases", leaseSamples.some(snapshot => arr(snapshot.leases).length > 0) && leaseSamples.every(nonOverlappingLeases));
-      obligation("idle-with-ready-at-most-10000ms", idle.every(ms => ms <= G8_IDLE_CEILING_MS));
       obligation("G8-makespan-bound", Number.isFinite(makespan) && makespan <= 1.3 * Math.max(bounds.cp, bounds.work / script.executor.maxParallel, serialIntegration));
     }
 
@@ -1353,12 +1362,30 @@ async function drive(name: typeof plans[number], repository: typeof repositories
       obligation("no-abandoned-leases", !slotRecords.some(slot => String(slot.slot).startsWith("slot-") && slot.state === "leased") && arr(leaseSnapshot.leases).length === 0);
       obligation("no-live-leases-or-background-calls", arr(leaseSnapshot.leases).length === 0 && backgroundRoots.length === 3 && backgroundSessions.every(session => !Object.hasOwn(activeSessions, session)));
     }
-    expect(Object.keys(tailAudit).sort(), "Every sidecar tail assertion has an assertion or explicit conditional/comparison disposition").toEqual([...script.tailAssertions].sort());
-    observations.tailAudit = tailAudit;
     result = { ledger: normalizedLedger(final), tree, commits, metrics, tailAudit };
+    // Inventory again just before purge, including late metric writes. The sealed oracle also requires
+    // this export's high-water mark to match its last ledger snapshot, so no unseen tail can pass coverage.
+    const idleInventory = name === "throughput" ? await store.exportPlan(immutableId) : undefined;
+    if (idleInventory) observations.idleLedgerInventory = idleInventory;
     front.replyNext({ tool: "router_plan", input: { action: "purge", planId: immutableId } }, { when: request => header(request, "x-proof-session") === root && header(request, "x-proof-kind") === "primary" });
     await activeHost.prompt(root, "Purge the completed fixture plan and its marked slots.");
     expect(await store.list(), "G6/G9: purge leaves no ledger or slot residue").toHaveLength(0);
+    if (name === "throughput") {
+      // After the LAST live-host assertion: eviction disposes adapters and writes real end seals.
+      // A hard restart intentionally cannot supply a sealed stream; resilience remains a separate G9 run.
+      await activeHost.sealObservations();
+      const files = await collectObservationFiles(activeHost.observationDirectory);
+      observations.v2Observations = files;
+      if (!idleInventory) throw new Error("G8: missing ledger fragment inventory");
+      const inventorySeq = Math.max(idleInventory.snapshot.seq, ...idleInventory.events.map(event => event.seq));
+      const oracle = reconstructIdleEpisodes(files, { planId: immutableId, parentSessionID: root, finalLedgerSeq: inventorySeq });
+      idleEpisodes.push(...oracle.episodes);
+      observations.idleOracle = oracle;
+      assertG8IdleEpisodes(idleEpisodes, idleInventory.events.flatMap(event => event.type === "metric" && event.metric.name === "idle-with-ready" ? [event.metric] : []));
+      obligation("idle-with-ready-at-most-10000ms", idleEpisodes.every(episode => episode.ms <= G8_IDLE_CEILING_MS));
+    }
+    expect(Object.keys(tailAudit).sort(), "Every sidecar tail assertion has an assertion or explicit conditional/comparison disposition").toEqual([...script.tailAssertions].sort());
+    observations.tailAudit = tailAudit;
   } catch (error) {
     failure = error;
     timing.mark("driver.failure");
