@@ -12,6 +12,8 @@ export interface SlotDiagnostic {
 export interface IdleEpisode {
   fromMs: number; toMs: number; ms: number; fromSeq: number; toSeq: number;
   readyTaskIds: string[]; endedBy: string;
+  /** Ledger-only closing boundary, tied to this episode's step/launch. NEVER extends predicate A. */
+  metricClose?: { toMs: number; toSeq: number; by: "closing-tick" | "launch-aggregate" };
   /** Predicate B only: NEVER used to shorten/split the asserted predicate-A episode. */
   slotDiagnostics: SlotDiagnostic[];
 }
@@ -23,7 +25,7 @@ interface Graph {
   edges: { from: string; to: string }[];
   phases: { id: string; gate: string; paused: boolean }[];
 }
-interface Step { taskId: string; attempt: number; launch?: number; result?: string }
+interface Step { taskId: string; attempt: number; launch?: number; result?: string; end?: number }
 interface Route { provider: string; heavy: boolean }
 interface Provider { limit: number; paused: boolean; queried: Set<boolean> }
 interface Token extends Route { taskId: string; attempt: number; launched: boolean }
@@ -63,6 +65,14 @@ function list(value: unknown): unknown[] {
 function boolean(value: unknown): boolean {
   requireFact(typeof value === "boolean", "missing boolean");
   return value;
+}
+function tickGate(row: SchedulerRow): { ok: boolean; ready: string[] } | undefined {
+  if (row.action !== "launch-gate") return;
+  const detail = bag(bag(row.state).detail);
+  // Per-task rechecks are not the tick's updateIdle boundary. The selected IDs identify launch
+  // aggregates only; neither they nor gate.ok establish durable readiness/provider eligibility.
+  if (detail.taskId !== undefined || !Array.isArray(detail.ready)) return;
+  return { ok: boolean(detail.ok), ready: detail.ready.map(text) };
 }
 function slotName(value: unknown): string {
   const name = text(value);
@@ -145,7 +155,9 @@ export async function collectObservationFiles(directory: string): Promise<Observ
  * confirmed A on 2026-10-14 (time spent waiting for a physical slot counts as idle). Route
  * and capacity-free observations establish queried facts; capacity-init/provider transitions and token
  * lifetimes independently reconstruct capacity (including M14's heavy cap). Unqueried routes/capacity
- * are UNKNOWN, never guessed eligible. Lease selection and launch-gate.ready are not readiness oracles.
+ * are UNKNOWN, never guessed eligible or unavailable. A separate possible-episode track joins UNKNOWN
+ * spans to adjacent eligible spans and fails closed if their union could exceed 10,000 ms.
+ * Lease selection and launch-gate.ready are not readiness oracles.
  *
  * Provider tokens consume A's capacity only on a confirmed launch, not on provisional reservation:
  * an attempt that never launches must NOT fragment an episode. Actual provider exhaustion/pauses do.
@@ -168,7 +180,9 @@ export async function collectObservationFiles(directory: string): Promise<Observ
  * across restarts. All files (including other adapters' streams) must pass the wire-format completeness
  * check. Hard-restart resilience captures remain diagnostics, not G8 evidence. Runtime boundaries use
  * clockMs; committed graph swaps use at (both epoch ms on the smoke host). No tolerance or ledger idle
- * endpoints are used to infer/extend episodes. Ledger fragments are checked separately, only afterwards.
+ * endpoints are used to infer/extend episodes. Ledger fragments are checked separately, only afterwards:
+ * a step's first closing tick or a launch's completed aggregate can bound delayed metric closure, but
+ * cannot move an independent episode endpoint or forgive a fragment/episode exceeding 10,000 ms.
  */
 export function reconstructIdleEpisodes(files: readonly ObservationFile[], identity: {
   planId: string; parentSessionID: string;
@@ -205,7 +219,17 @@ export function reconstructIdleEpisodes(files: readonly ObservationFile[], ident
   const steps = new Map<number, Step>();
   const pending = new Map<string, Step>();
   const successfulLaunches = new Set<number>();
+  const batches: Step[][] = [];
+  let batch: { selected: Set<string>; steps: Step[] } | undefined;
   for (const row of rows) {
+    const gate = tickGate(row);
+    if (gate && !gate.ok) batch = undefined;
+    else if (gate && gate.ready.length > 0) {
+      batch = { selected: new Set(gate.ready), steps: [] };
+      batches.push(batch.steps);
+    }
+    if (["orchestrator", "abort", "dispose", "detach"].includes(row.action)
+      || (row.action === "schedule" && batch?.steps.every(step => step.end !== undefined))) batch = undefined;
     if (!["launch-prepare", "launch", "launch-step-end"].includes(row.action)) continue;
     const detail = bag(bag(row.state).detail);
     const taskId = text(detail.taskId);
@@ -215,6 +239,7 @@ export function reconstructIdleEpisodes(files: readonly ObservationFile[], ident
       const step: Step = { taskId, attempt };
       pending.set(taskId, step);
       steps.set(row.seq, step); // A skipped slot reservation may reuse the same attempt number.
+      if (batch?.selected.delete(taskId)) batch.steps.push(step);
     } else {
       const step = pending.get(taskId);
       requireFact(step && step.attempt === attempt, `launch step missing open for ${taskId}#${attempt}`);
@@ -224,6 +249,7 @@ export function reconstructIdleEpisodes(files: readonly ObservationFile[], ident
       } else {
         requireFact(detail.result === "launched" || detail.result === "skipped", "unknown launch step result");
         step.result = detail.result;
+        step.end = row.seq;
         if (step.result === "launched") {
           requireFact(step.launch !== undefined, `successful step missing launch for ${taskId}`);
           successfulLaunches.add(step.launch);
@@ -233,6 +259,26 @@ export function reconstructIdleEpisodes(files: readonly ObservationFile[], ident
     }
   }
   requireFact(pending.size === 0, "launch step missing close");
+
+  // updateIdle waits for ALL steps in a tick, including skipped steps. Its following schedule is
+  // the observed post-update boundary. Require both the selecting tick and that continuation;
+  // an isolated launch-step-end or an unrelated later schedule cannot license an extension.
+  const aggregateEnds = new Map<number, Step[]>();
+  for (const batch of batches) if (batch.length > 0) {
+    aggregateEnds.set(Math.max(...batch.map(step => step.end!)), batch);
+  }
+  const launchMetricCloses = new Map<number, NonNullable<IdleEpisode["metricClose"]>>();
+  let previousRuntime: SchedulerRow | undefined;
+  for (const row of rows) {
+    if (row.action === "schedule" && previousRuntime) {
+      for (const step of aggregateEnds.get(previousRuntime.seq) ?? []) {
+        if (step.result === "launched" && step.launch !== undefined) {
+          launchMetricCloses.set(step.launch, { toMs: number(bag(row.state).clockMs), toSeq: row.seq, by: "launch-aggregate" });
+        }
+      }
+    }
+    if (RUNTIME_ACTIONS.has(row.action)) previousRuntime = row;
+  }
 
   let ledger: Graph | undefined;
   let graphAttached = false;
@@ -244,7 +290,7 @@ export function reconstructIdleEpisodes(files: readonly ObservationFile[], ident
   let finalSeen = false;
   let maxParallel: number | undefined;
   let pool: Pool | undefined;
-  const routes = new Map<string, Route>();
+  const routes = new Map<string, Route | null>(); // null is an observed unavailable route, not missing evidence.
   const providers = new Map<string, Provider>();
   const tokens = new Map<string, Token>();
   const provider = (id: string): Provider => {
@@ -260,14 +306,20 @@ export function reconstructIdleEpisodes(files: readonly ObservationFile[], ident
     const normal = Math.max(0, p.limit - held.length);
     return route.heavy ? Math.min(normal, Math.max(0, Math.min(HEAVY_PROVIDER_CAP, p.limit) - held.filter(t => t.heavy).length)) : normal;
   };
-  const eligible = (taskId: string): boolean => {
+  const eligibility = (taskId: string): "eligible" | "unavailable" | "unknown" => {
     const route = routes.get(taskId);
-    return route !== undefined && provider(route.provider).queried.has(route.heavy) && free(route, true) > 0;
+    if (route === null) return "unavailable";
+    if (route === undefined || !provider(route.provider).queried.has(route.heavy)) return "unknown";
+    return free(route, true) > 0 ? "eligible" : "unavailable";
   };
   const preparing = new Map<string, { step: Step; admitted: boolean }>();
   const episodes: IdleEpisode[] = [];
   let open: { fromMs: number; fromSeq: number; ids: Set<string>; slotDiagnostics: SlotDiagnostic[];
     slot: Pick<SlotDiagnostic, "fromMs" | "fromSeq" | "status" | "reason" | "poolSeq"> } | undefined;
+  let stepMetricClose: IdleEpisode | undefined;
+  // Unlike confirmed A episodes, this upper-bound track survives transitions between eligible and
+  // UNKNOWN. Even a same-timestamp UNKNOWN bridge is not evidence of a genuine episode boundary.
+  let possible: { fromMs: number; fromSeq: number; unknown: boolean; hasUnknown: boolean; unknownMs: number } | undefined;
   const readyTasks = (seq: number): string[] => {
     if (!ledger) return [];
     const current = ledger;
@@ -291,9 +343,20 @@ export function reconstructIdleEpisodes(files: readonly ObservationFile[], ident
   const close = (row: SchedulerRow, time: number, reason: string): void => {
     if (!open) return;
     closeSlot(row, time);
-    episodes.push({ fromMs: open.fromMs, toMs: time, ms: time - open.fromMs, fromSeq: open.fromSeq,
-      toSeq: row.seq, readyTaskIds: [...open.ids], endedBy: reason, slotDiagnostics: open.slotDiagnostics });
+    const episode: IdleEpisode = { fromMs: open.fromMs, toMs: time, ms: time - open.fromMs, fromSeq: open.fromSeq,
+      toSeq: row.seq, readyTaskIds: [...open.ids], endedBy: reason, slotDiagnostics: open.slotDiagnostics };
+    if (reason === "launch") episode.metricClose = launchMetricCloses.get(row.seq);
+    if (reason === "orchestrator-step" && row.action === "orchestrator"
+      && bag(bag(row.state).detail).event === "step.started") stepMetricClose = episode;
+    episodes.push(episode);
     open = undefined;
+  };
+  const closePossible = (row: SchedulerRow, time: number): void => {
+    if (!possible) return;
+    const ms = time - possible.fromMs;
+    requireFact(!possible.hasUnknown || ms <= G8_IDLE_CEILING_MS,
+      `unknown eligibility: possible idle-with-ready episode ${ms} ms exceeds 10,000 ms (${possible.fromSeq}..${row.seq}; ${possible.unknownMs} ms unknown)`);
+    possible = undefined;
   };
   for (const row of rows) {
     const state = bag(row.state);
@@ -302,6 +365,7 @@ export function reconstructIdleEpisodes(files: readonly ObservationFile[], ident
     requireFact(isGraph || isRaw || isSlot || RUNTIME_ACTIONS.has(row.action), `unknown scheduler action ${row.action}`);
     const time = isGraph || isRaw ? row.at : number(state.clockMs);
     requireFact(time >= lastTime, `scheduler clock moved backwards at ${row.seq}`);
+    if (possible?.unknown) possible.unknownMs += time - lastTime;
     lastTime = time;
     if (isSlot) pool = poolSnapshot(row);
     else if (isRaw) {
@@ -345,8 +409,14 @@ export function reconstructIdleEpisodes(files: readonly ObservationFile[], ident
           const expected = event === "step.started" ? false
             : ["execution.completed", "execution.failed", "execution.interrupted"].includes(event) ? true : idle;
           requireFact(nextIdle === expected, "orchestrator transition does not match idle state");
+          if (["step.started", "execution.completed", "execution.failed", "execution.interrupted"].includes(event)) stepMetricClose = undefined;
         } else requireFact(nextIdle === idle, "missing orchestrator open/close transition");
         idle = nextIdle;
+      }
+      const gate = tickGate(row);
+      if (gate && stepMetricClose) {
+        if (!idle && !gate.ok) stepMetricClose.metricClose = { toMs: time, toSeq: row.seq, by: "closing-tick" };
+        stepMetricClose = undefined; // Only this step's first tick; never borrow a later turn's close.
       }
       if (row.action === "launch-prepare") {
         const step = steps.get(row.seq)!;
@@ -355,11 +425,11 @@ export function reconstructIdleEpisodes(files: readonly ObservationFile[], ident
       if (row.action === "route") {
         const d = bag(state.detail);
         routes.set(text(d.taskId), { provider: text(d.provider), heavy: boolean(d.heavy) });
-      } else if (row.action === "route-unavailable") routes.delete(text(bag(state.detail).taskId));
+      } else if (row.action === "route-unavailable") routes.set(text(bag(state.detail).taskId), null);
       else if (row.action === "capacity-free") {
         const d = bag(state.detail), route = { provider: text(d.provider), heavy: boolean(d.heavy) };
         // UNROUTABLE also has free=0 observations, but has no real route. Never treat it as a provider.
-        if ([...routes.values()].some(r => r.provider === route.provider)) {
+        if ([...routes.values()].some(r => r?.provider === route.provider)) {
           requireFact(number(d.free) === free(route, false), "provider free query disagrees with observed capacity/tokens");
           provider(route.provider).queried.add(route.heavy);
         }
@@ -384,9 +454,20 @@ export function reconstructIdleEpisodes(files: readonly ObservationFile[], ident
     }
     if (!attached) continue;
     const durable = readyTasks(row.seq);
-    const ready = durable.filter(eligible);
-    const reason = stopped ? "plan-stop" : ledger?.status !== "running" ? `plan-${ledger?.status}`
-      : !idle ? "orchestrator-step" : durable.length === 0 ? "ready-empty" : ready.length === 0 ? "provider-unavailable-or-unknown" : undefined;
+    const candidates = durable.map(id => ({ id, eligibility: eligibility(id) }));
+    const ready = candidates.filter(task => task.eligibility === "eligible").map(task => task.id);
+    const unknown = candidates.some(task => task.eligibility === "unknown");
+    const boundary = stopped ? "plan-stop" : ledger?.status !== "running" ? `plan-${ledger?.status}`
+      : !idle ? "orchestrator-step" : durable.length === 0 ? "ready-empty" : undefined;
+    const impossible = boundary ?? (ready.length === 0 && !unknown ? "provider-unavailable" : undefined);
+    if (successfulLaunches.has(row.seq) || impossible !== undefined) closePossible(row, time);
+    if (impossible === undefined) {
+      possible ??= { fromMs: time, fromSeq: row.seq, unknown: false, hasUnknown: false, unknownMs: 0 };
+      possible.unknown = ready.length === 0;
+      possible.hasUnknown ||= possible.unknown;
+    }
+    if (stopped || ledger?.status !== "running" || successfulLaunches.has(row.seq)) stepMetricClose = undefined;
+    const reason = boundary ?? (ready.length === 0 ? unknown ? "provider-unknown" : "provider-unavailable" : undefined);
     if (successfulLaunches.has(row.seq)) close(row, time, "launch");
     if (reason !== undefined) close(row, time, reason);
     else {
@@ -402,21 +483,26 @@ export function reconstructIdleEpisodes(files: readonly ObservationFile[], ident
   requireFact(attached && detached, "runtime missing open/close");
   requireFact(maxParallel !== undefined, "missing capacity-init");
   requireFact(!open, "idle episode missing close");
+  requireFact(!possible, "possible idle episode missing close");
   requireFact(finalSeen && ledger?.status === "completed", "missing completed plan snapshot");
   requireFact(ledger?.ledgerSeq === identity.finalLedgerSeq, "ledger advanced after fragment inventory; missing ledger tail");
   return { predicate: "A: provider-capacity", stream, episodes, streams: streams.size, records };
 }
 
-/** Coverage is one-way: metrics may omit gaps, but EVERY fragment (even free=0) must be contained in
- * one independently reconstructed episode. A fragment crossing a launch/step boundary is inconsistent
- * evidence, not permission to merge episodes or widen the 10,000 ms ceiling.
+/** Coverage is one-way: metrics may omit gaps, but EVERY fragment (even free=0) must start in one
+ * independently reconstructed episode. Only that episode's observed closing tick/launch aggregate
+ * can cover a delayed ledger endpoint. This NEVER merges/extends episodes or widens either 10,000 ms bound.
  */
 export function assertG8IdleEpisodes(episodes: readonly IdleEpisode[], fragments: readonly IdleFragment[]): void {
   for (const fragment of fragments) {
     const from = Date.parse(fragment.fromAt), to = Date.parse(fragment.toAt);
     requireFact(Number.isFinite(from) && Number.isFinite(to) && to >= from && to - from === fragment.ms
       && fragment.readyTaskIds.length > 0, "invalid ledger idle fragment");
-    requireFact(episodes.some(e => e.fromMs <= from && e.toMs >= to), `ledger idle fragment outside reconstructed episodes: ${fragment.fromAt}..${fragment.toAt}`);
+    // Containment formerly implied this fragment bound; delayed closure must not remove it.
+    requireFact(fragment.ms <= G8_IDLE_CEILING_MS, `ledger idle fragment ${fragment.ms} ms exceeds 10,000 ms`);
+    requireFact(episodes.some(e => e.fromMs <= from && (e.toMs >= to
+      || (from < e.toMs && e.metricClose !== undefined && e.metricClose.toMs >= to))),
+      `ledger idle fragment outside reconstructed episodes: ${fragment.fromAt}..${fragment.toAt}`);
   }
   for (const episode of episodes) {
     requireFact(Number.isFinite(episode.ms) && episode.ms >= 0 && episode.ms === episode.toMs - episode.fromMs, "invalid idle episode");

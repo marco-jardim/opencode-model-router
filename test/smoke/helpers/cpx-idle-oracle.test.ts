@@ -155,6 +155,87 @@ describe("G8 independent maximal idle episodes (no host)", () => {
     else expect(() => assertG8IdleEpisodes(episodes, [])).toThrow(/exceeds 10,000/);
   });
 
+  it("reconciles a step's delayed closing tick without extending the independent episode", () => {
+    const f = fixture();
+    f.orchestrator(5_000, "step.started");
+    f.runtime("schedule", 5_000);
+    f.query(5_005); // The tick does asynchronous work before its launch gate/updateIdle.
+    f.runtime("launch-gate", 5_010, { ok: false, ready: ["a"] });
+    f.commit(5_011, {}); // The metric append becomes a committed graph swap afterwards.
+    f.finish(6_000);
+    const { episodes } = reconstruct(f);
+    expect(episodes.map(e => [e.fromMs - BASE, e.toMs - BASE, e.ms])).toEqual([[0, 5_000, 5_000]]);
+    expect(() => assertG8IdleEpisodes(episodes, [fragment(0, 5_010)])).not.toThrow();
+    expect(() => assertG8IdleEpisodes(episodes, [fragment(0, 5_011)])).toThrow(/fragment outside reconstructed episodes/);
+    expect(() => assertG8IdleEpisodes(episodes, [fragment(5_001, 5_010)])).toThrow(/fragment outside reconstructed episodes/);
+  });
+
+  it.each(["missing", "task-gate", "later-turn"])("rejects a delayed fragment with a %s closing tick", marker => {
+    const f = fixture();
+    f.orchestrator(5_000, "step.started");
+    f.runtime("schedule", 5_000);
+    if (marker === "task-gate") f.runtime("launch-gate", 5_010, { taskId: "a", attempt: 1, ok: false });
+    if (marker === "later-turn") {
+      f.orchestrator(5_005, "execution.completed");
+      f.orchestrator(5_009, "step.started");
+      f.runtime("launch-gate", 5_010, { ok: false, ready: ["a"] });
+    }
+    f.finish(6_000);
+    expect(() => assertG8IdleEpisodes(reconstruct(f).episodes, [fragment(0, 5_010)])).toThrow(/fragment outside reconstructed episodes/);
+  });
+
+  it("reconciles a confirmed launch only at the end of its observed launch-step aggregate", () => {
+    const f = fixture([task(), task("b")]);
+    f.runtime("launch-gate", 4_000, { ok: true, ready: ["a", "b"] });
+    f.prepare(4_000, "a");
+    f.prepare(4_000, "b");
+    f.commit(4_500, { tasks: [task("a", { state: "dispatched" }), task("b")] });
+    f.launch(5_000, "a");
+    f.endStep(5_005, "launched", "a");
+    f.endStep(5_010, "skipped", "b");
+    f.runtime("schedule", 5_010); // Scheduled after the aggregate's updateIdle call.
+    f.finish(6_000);
+    const { episodes } = reconstruct(f);
+    expect(episodes.map(e => [e.fromMs - BASE, e.toMs - BASE])).toEqual([[0, 5_000], [5_000, 6_000]]);
+    expect(() => assertG8IdleEpisodes(episodes, [fragment(0, 5_010)])).not.toThrow();
+    expect(() => assertG8IdleEpisodes(episodes, [fragment(0, 5_011)])).toThrow(/fragment outside reconstructed episodes/);
+  });
+
+  it.each(["route", "capacity-free", "both"])("fails closed on an 11,001 ms sealed interval missing %s evidence", missing => {
+    const f = fixture();
+    f.rows.splice(0, f.rows.length, ...f.rows.filter(row => !(row.action === "route" && missing !== "capacity-free")
+      && !(row.action === "capacity-free" && missing !== "route")));
+    f.finish(11_001);
+    expect(() => assertG8IdleEpisodes(reconstruct(f).episodes, [])).toThrow(/unknown.*11001.*exceeds 10,000/i);
+  });
+
+  it.each([10_001, 6_000])("does not discard a %i ms unknown prefix when the first capacity query arrives", firstQuery => {
+    const f = fixture();
+    f.rows.splice(0, f.rows.length, ...f.rows.filter(row => row.action !== "capacity-free"));
+    f.query(firstQuery);
+    f.finish(11_001);
+    expect(() => assertG8IdleEpisodes(reconstruct(f).episodes, [])).toThrow(/unknown.*11001.*exceeds 10,000/i);
+  });
+
+  it.each([1_000, 10_000])("allows a short %i ms unknown interval without guessing an eligible route", duration => {
+    const f = fixture();
+    f.rows.splice(0, f.rows.length, ...f.rows.filter(row => row.action !== "route" && row.action !== "capacity-free"));
+    f.finish(duration);
+    const { episodes } = reconstruct(f);
+    expect(episodes).toEqual([]);
+    expect(() => assertG8IdleEpisodes(episodes, [])).not.toThrow();
+  });
+
+  it("allows a short unknown prefix adjacent to an eligible span at the exact ceiling", () => {
+    const f = fixture();
+    f.rows.splice(0, f.rows.length, ...f.rows.filter(row => row.action !== "capacity-free"));
+    f.query(4_000);
+    f.finish(10_000);
+    const { episodes } = reconstruct(f);
+    expect(episodes.map(e => [e.fromMs - BASE, e.toMs - BASE])).toEqual([[4_000, 10_000]]);
+    expect(() => assertG8IdleEpisodes(episodes, [])).not.toThrow();
+  });
+
   it("splits at a confirmed launch, not its reservation or provisional dispatched ledger swap", () => {
     const f = fixture([task("a"), task("b")]);
     f.prepare(3_000);
