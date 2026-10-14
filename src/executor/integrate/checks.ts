@@ -624,11 +624,20 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     return { name, label: c.label, exitCode: o.exitCode, timedOut: o.timedOut, durationMs: o.durationMs, scope, flakyIds };
   }
 
+  /** Only scope a known invocation. A ref named `test` can resolve to an unrelated configured command. */
+  function scopedCommand(c: ResolvedCommand): string | null {
+    // The planner derives its own cwd/environment; it cannot prove equivalence with explicit overrides.
+    if (c.cwd !== undefined || c.env !== undefined) return null;
+    if (c.source === "package-script" && c.ref?.script === "test" && c.ref.args.length === 0) return "npm test";
+    return c.source === "pytest" ? c.label : null;
+  }
+
   /** M10/M11: one tests component, scoped to the affected tests, with one confirmation rerun of the failing files. */
   async function runTests(
     t: TestComponent, cwd: string, changed: readonly ChangedPath[], signal: AbortSignal, low: boolean,
   ): Promise<TestOutcome> {
-    const command = t.framework === "node" ? "npm test" : t.full.label;
+    const command = scopedCommand(t.full);
+    if (command === null) return fullTests(t, command, cwd, signal, low);
     const plan = await planScopedRun({
       command, cwd, changedFiles: changed, budget: { maxWorkers: MAX_WORKERS }, fs: nodeFs, search: search(cwd, signal),
     });
@@ -664,10 +673,10 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
   async function runFull(c: ResolvedCommand, cwd: string, signal: AbortSignal, low: boolean) {
     const out = await exec(c, cwd, signal, low);
     const pass = out.exitCode === 0 && !out.timedOut;
-    return { out, pass, seen: pass || out.timedOut ? null : observeFull(out, cwd), output: tail(out.stdout + out.stderr, OUTPUT_TAIL_BYTES) };
+    return { out, pass, seen: pass || out.timedOut ? null : observeFull(out, c.cwd ?? cwd), output: tail(out.stdout + out.stderr, OUTPUT_TAIL_BYTES) };
   }
 
-  async function fullTests(t: TestComponent, command: string, cwd: string, signal: AbortSignal, low: boolean): Promise<TestOutcome> {
+  async function fullTests(t: TestComponent, command: string | null, cwd: string, signal: AbortSignal, low: boolean): Promise<TestOutcome> {
     const f = await runFull(t.full, cwd, signal, low);
     const comp = component("tests", t.full, f.out, "full");
     if (f.pass) return { comp, failing: null };
@@ -675,7 +684,7 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     // planner drops would leave its ids unrun, and an unrun id must never read as flaky).
     const seen = f.seen;
     const failing: Failing = { ids: seen?.ids ?? [], files: seen?.files ?? [], output: f.output };
-    if (seen === null || !seen.complete || (await existing(seen.files)).length < seen.files.length) return { comp, failing };
+    if (command === null || seen === null || !seen.complete || (await existing(seen.files)).length < seen.files.length) return { comp, failing };
     return confirm(t, command, cwd, signal, low, comp, failing);
   }
 
@@ -747,8 +756,9 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
       return { ids: still.length > 0 ? still : [...ids], files: [...files], output };
     };
     const present = await existing(files);
-    if (present.length > 0 && (c.source === "pytest" || c.ref?.script === "test")) {
-      const runner = await detectRunner(c.source === "pytest" ? c.label : "npm test", cwd, nodeFs);
+    const command = scopedCommand(c);
+    if (present.length > 0 && command !== null) {
+      const runner = await detectRunner(command, cwd, nodeFs);
       const plan = isUnverifiable(runner) ? runner : await planRerun(runner, present, cwd, { maxWorkers: MAX_WORKERS }, { fs: nodeFs });
       if (isScopedSpec(plan)) {
         const spec: ResolvedCommand = { ...c, file: plan.file, args: plan.args, env: plan.env, cwd: plan.cwd };
@@ -868,10 +878,9 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
       let unparsed = false;
       let failed = false;
       for (const c of commands) {
-        const isTest = c.source === "pytest" || c.ref?.script === "test";
-        if (typeof req.mode !== "string" && isTest) {
+        const command = scopedCommand(c);
+        if (typeof req.mode !== "string" && command !== null) {
           const wanted = [...new Set(req.mode.rerun.map(fileOfId))].map(f => nodePath.resolve(cwd, f));
-          const command = c.source === "pytest" ? c.label : "npm test";
           const runner = await detectRunner(command, cwd, nodeFs);
           const plan = isUnverifiable(runner) ? runner : await planRerun(runner, wanted, cwd, { maxWorkers: MAX_WORKERS }, { fs: nodeFs });
           if (isNoAffected(plan)) {
@@ -907,7 +916,7 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
           // QA-3.2-1 (1): the failing ids of a full test run come from its output (vitest/jest `FAIL <file> > …`,
           // pytest `FAILED <file>::…`, a jest JSON report). An incomplete inventory, a timeout or output without ids
           // leaves the failure unattributable.
-          const seen = out.timedOut ? null : observeFull(out, cwd);
+          const seen = out.timedOut ? null : observeFull(out, c.cwd ?? cwd);
           if (seen === null) {
             unparsed = true;
             break;

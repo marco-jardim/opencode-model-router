@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { copyFile, mkdir, mkdtemp, realpath, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, realpath, stat, symlink, writeFile } from "node:fs/promises";
 import { delimiter, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { BackgroundRuns, createIntegrateGit, createIntegrationChecks, type ResolvedCommand } from "../../src/executor/integrate/checks";
@@ -193,5 +193,153 @@ describe("prepared execution-slot command resolution", () => {
       source: overrideCwd ? "advanced-integration" : "base" });
     expect(command.cwd).toBe(overrideCwd ? f.integration : undefined);
     expect(command.env.VIRTUAL_ENV).toBe("explicit-venv");
+  }, 30_000);
+});
+
+const CHECK_ID = "check.test.js > check";
+interface ScopedProbe { kind: string; cwd: string; venv: string; pythonpath: string | null; marker: string | null }
+
+/** Real router resolution, registered slots and child processes; the green package test is not the configured check. */
+async function scopedFixture(configured = false, configChanged = false) {
+  await mkdir(resolve("tmp"), { recursive: true });
+  const root = await realpath(await mkdtemp(join(resolve("tmp"), "scoped-command-")));
+  roots.push(root);
+  const repo = join(root, "repo"), integration = join(root, "integration"), ciPath = join(root, "ci");
+  await mkdir(repo);
+  git(repo, "init", "-q");
+  const probe = (kind: string) => `fs.appendFileSync('executed.jsonl', JSON.stringify({ kind: '${kind}', cwd: process.cwd(),
+    venv: process.env.VIRTUAL_ENV, pythonpath: process.env.PYTHONPATH ?? null, marker: process.env.EXPLICIT_CHECK ?? null }) + '\\n');`;
+  const pkg = JSON.stringify({ type: "module", scripts: { test: "vitest run" } });
+  await writeFile(join(repo, "package.json"), pkg);
+  await writeFile(join(repo, "vitest.config.mjs"), "export default { test: { include: ['check.test.js'], maxWorkers: 1 } };\n");
+  const test = [
+    "import fs from 'node:fs'; import { test, expect } from 'vitest';",
+    "test('check', () => {", probe("package"),
+    "expect(process.env.CHECK_FAIL === '1' || fs.existsSync('package-fails')).toBe(false);", "});",
+  ].join("\n");
+  await writeFile(join(repo, "check.test.js"), test);
+  await writeFile(join(repo, "custom-check.cjs"), [
+    "const fs = require('node:fs');", probe("configured"),
+    `console.log(' FAIL  ${CHECK_ID}\\n Tests  1 failed (1)');`, "process.exit(1);",
+  ].join("\n"));
+  const commit = (message: string): string => { git(repo, "add", "."); git(repo, "commit", "-qm", message); return git(repo, "rev-parse", "HEAD"); };
+  const base = commit("base");
+  await writeFile(join(repo, configChanged ? "package.json" : "check.test.js"), `${configChanged ? pkg : test}\n`);
+  const candidate = commit("candidate");
+  git(repo, "worktree", "add", "--detach", integration, base);
+  git(repo, "worktree", "add", "--detach", ciPath, candidate);
+  for (const cwd of [integration, ciPath]) {
+    const bin = join(cwd, "node_modules", ".bin");
+    await mkdir(bin, { recursive: true });
+    await symlink(resolve("node_modules/vitest"), join(cwd, "node_modules", "vitest"), process.platform === "win32" ? "junction" : "dir");
+    if (process.platform === "win32") {
+      await writeFile(join(bin, "vitest.cmd"), `@"${process.execPath}" "%~dp0..\\vitest\\vitest.mjs" %*\r\n`);
+    } else await symlink("../vitest/vitest.mjs", join(bin, "vitest"));
+    registerSlot({ root: cwd, managers: ["pip", "npm"] });
+    registered.push(cwd);
+  }
+  const config: RunConfig = { scripts: ["test"], commands: configured ? { test: { argv: ["node", "custom-check.cjs"] } } : {}, timeoutMs: 15_000 };
+  const resolver = createRunResolver(() => config);
+  const selected = await resolver.resolve({ script: "test", args: [] }, integration);
+  if (!selected.ok) throw new Error(selected.reason);
+  const ci: SlotLease = { slot: "ci", path: ciPath, planId: "plan", owner: "ci", commit: candidate };
+  const pool = stub<SlotPool>({
+    reset: async (_slot, sha) => { git(ciPath, "reset", "--hard", sha); }, cleanForChecks: async () => {},
+    list: async () => [stub<SlotRecord>({ path: ciPath }), stub<SlotRecord>({ path: integration })],
+  });
+  const ops = stub<GitOps>({ revParse: async (cwd, ref) => git(cwd, "rev-parse", ref) });
+  const guard = { assertWriteCwd: async () => {} };
+  const igit = createIntegrateGit({ run: async (args, opts) => gitResult(opts.cwd, args) }, guard);
+  const ledger = stub<LedgerV1>({ planId: "plan", integration: stub<LedgerV1["integration"]>({ worktree: integration }),
+    config: stub<LedgerV1["config"]>({ integrationChecks: "auto", python: "auto" }) });
+  const background = new BackgroundRuns(), clock = stub<Clock>({ now: () => Date.now() }), logger = { warn: () => {} };
+  const executed: Array<{ command: ResolvedCommand; cwd: string; exitCode: number }> = [];
+  const checks = createIntegrationChecks({ ledger: () => ledger, pool, git: ops, igit, resolver, guard, background, clock, logger,
+    preemptForeground: async () => {}, acquire: async () => ({ lost: false, release: async () => {} }),
+    spawn: async (command, opts) => {
+      const result = await runArgv(command.file, command.args, { ...opts, env: command.env, timeoutMs: 15_000 });
+      executed.push({ command, cwd: opts.cwd, exitCode: result.code });
+      return { exitCode: result.code, timedOut: result.timedOut, stdout: result.stdout, stderr: result.stderr, durationMs: 0 };
+    },
+  });
+  const runner = createPhaseSuiteRunner({ checks, igit, git: ops, pool, resolver, background, clock, logger });
+  const journal: StepJournal = {
+    entry: { id: "i-1", kind: "phase-suite", phaseId: "p1", taskIds: [], slot: "ci", baseHead: base, candidate: null },
+    signal: new AbortController().signal, start: async () => {}, end: async () => {}, counter: () => {}, ...guard,
+  };
+  const request = { slot: ci, base, candidate, priority: "foreground" as const, signal: journal.signal };
+  const probes = async (cwd: string): Promise<ScopedProbe[]> => (await readFile(join(cwd, "executed.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line) as ScopedProbe);
+  return { checks, resolver, runner, journal, request, command: selected.command, executed, probes, ci, integration, ciPath, base, candidate };
+}
+
+describe("scoped command identity and context", () => {
+  it.each(["affected", "unchanged", "config"] as const)("runs the configured failing check, not the green package test (%s)", async change => {
+    const f = await scopedFixture(true, change === "config");
+    expect(f.command.source).toBe("run-command");
+    const result = await f.checks.run({ ...f.request, ...(change === "unchanged" ? { base: f.candidate } : {}) });
+    expect(result).toMatchObject({ verdict: "fail", failingIds: [CHECK_ID], failingFiles: [join(f.ciPath, "check.test.js")], flakyIds: [],
+      components: [{ name: "tests", scope: "full", exitCode: 1 }] });
+    expect(f.executed).toHaveLength(1); // Neither an affected-file plan nor a confirmation rerun may replace this command.
+    expect(f.executed[0]).toMatchObject({ cwd: f.ciPath, command: { file: f.command.file, args: ["custom-check.cjs"] } });
+    expect(await f.probes(f.ciPath)).toEqual([{ kind: "configured", cwd: f.ciPath, venv: join(f.ciPath, ".venv"), pythonpath: null, marker: null }]);
+  }, 30_000);
+
+  it("keeps the configured check in both attributable suite reruns", async () => {
+    const f = await scopedFixture(true);
+    const result = await f.runner.run({ planId: "plan", phaseId: "p1", slot: f.ci, commit: f.candidate, base: null, commands: [f.command], ranges: [] }, f.journal);
+    expect(result).toEqual({ kind: "unattributed", ids: [CHECK_ID], reason: "no-base" });
+    expect(f.executed.map(r => r.command.args)).toEqual([["custom-check.cjs"], ["custom-check.cjs"], ["custom-check.cjs"]]);
+    expect((await f.probes(f.ciPath)).map(p => p.kind)).toEqual(["configured", "configured", "configured"]);
+  }, 30_000);
+
+  it.each(["env", "cwd", "both"] as const)("preserves explicit %s in suite file reruns by running the full resolved command", async override => {
+    const f = await scopedFixture();
+    const cwd = override === "env" ? f.ciPath : f.integration;
+    if (override !== "env") await writeFile(join(f.integration, "package-fails"), "fail only in the explicit cwd");
+    const env = { CHECK_FAIL: "1", EXPLICIT_CHECK: "kept", VIRTUAL_ENV: "explicit-venv", PYTHONPATH: "explicit-imports" };
+    const command = { ...f.command, ...(override === "env" ? {} : { cwd }), ...(override === "cwd" ? {} : { env }) };
+    const original = JSON.stringify(command);
+    const result = await f.checks.runCommands({ slot: f.ci, commit: f.candidate, commands: [command], prepare: true, mode: { rerun: [CHECK_ID] },
+      requireRun: true, priority: "background", signal: f.journal.signal });
+    expect(result).toMatchObject({ verdict: "fail", ids: [CHECK_ID], files: [join(cwd, "check.test.js")], idsUnparsed: false, error: null });
+    expect(f.executed).toHaveLength(1);
+    expect(f.executed[0]).toMatchObject({ cwd, command: { file: command.file, args: command.args, resolution: { cwd } } });
+    expect(await f.probes(cwd)).toEqual([{ kind: "package", cwd, venv: override === "cwd" ? join(cwd, ".venv") : "explicit-venv",
+      pythonpath: override === "cwd" ? null : "explicit-imports", marker: override === "cwd" ? null : "kept" }]);
+    expect(JSON.stringify(command)).toBe(original);
+  }, 30_000);
+
+  it("preserves explicit context in revert regression file runs after an ordinary scoped integration check", async () => {
+    const f = await scopedFixture();
+    const command = { ...f.command, cwd: f.integration, env: { CHECK_FAIL: "1", EXPLICIT_CHECK: "regression", VIRTUAL_ENV: "explicit-venv", PYTHONPATH: "explicit-imports" } };
+    const result = await f.checks.run({ ...f.request, extra: { ids: [CHECK_ID], files: [join(f.ciPath, "check.test.js")], commands: [command] } });
+    expect(result).toMatchObject({ verdict: "fail", failingIds: [CHECK_ID], components: [
+      { name: "tests", scope: "spec", exitCode: 0 }, { name: "regression", scope: "full", exitCode: 1 },
+    ] });
+    expect(f.executed).toHaveLength(2);
+    expect(f.executed[1]).toMatchObject({ cwd: f.integration, command: { args: command.args, resolution: { cwd: f.integration } } });
+    expect(await f.probes(f.integration)).toEqual([{ kind: "package", cwd: f.integration, venv: "explicit-venv", pythonpath: "explicit-imports", marker: "regression" }]);
+  }, 30_000);
+
+  it("retains ordinary package-script scoping, confirmation and suite file reruns in the registered execution slot", async () => {
+    const f = await scopedFixture();
+    expect(f.command.source).toBe("package-script");
+    const passing = await f.checks.run(f.request);
+    expect(passing).toMatchObject({ verdict: "pass", components: [{ name: "tests", scope: "spec" }] });
+    await writeFile(join(f.ciPath, "package-fails"), "reproducible");
+    const failing = await f.checks.run(f.request);
+    expect(failing).toMatchObject({ verdict: "fail", failingIds: [CHECK_ID], flakyIds: [], components: [{ name: "tests", scope: "rerun" }] });
+    const rerun = await f.checks.runCommands({ slot: f.ci, commit: f.candidate, commands: [f.command], prepare: true, mode: { rerun: [CHECK_ID] },
+      requireRun: true, priority: "background", signal: f.journal.signal });
+    expect(rerun).toMatchObject({ verdict: "fail", ids: [CHECK_ID], idsUnparsed: false, error: null });
+    expect(f.executed).toHaveLength(4);
+    for (const { command, cwd } of f.executed) {
+      expect(command.args).toContain(join(f.ciPath, "node_modules", "vitest", "vitest.mjs"));
+      expect(command.args.some(arg => arg.startsWith("--outputFile"))).toBe(true);
+      expect(command.resolution?.cwd).toBe(f.ciPath);
+      expect(cwd).toBe(f.ciPath);
+    }
+    expect(await f.probes(f.ciPath)).toEqual(Array.from({ length: 4 }, () => ({ kind: "package", cwd: f.ciPath,
+      venv: join(f.ciPath, ".venv"), pythonpath: null, marker: null })));
   }, 30_000);
 });
