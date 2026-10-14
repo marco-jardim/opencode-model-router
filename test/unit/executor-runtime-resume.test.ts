@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 // QA-PDF21 round-1 regressions live in the "QA-PDF21 snapshot safety" describe block (after the rig and `seedWip`).
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { existsSync, realpathSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
@@ -167,6 +167,7 @@ function draft(r: Repo, tasks: LedgerV1["tasks"] = {}, edges: LedgerV1["edges"] 
 }
 
 interface RigOptions {
+  clock?: RuntimeDeps["clock"];
   seed?: (r: Repo) => Promise<void>;
   foreignOwner?: boolean;
   /** QA-PDF21: the runtime's git runner (a fault-injecting wrapper of the real one). */
@@ -193,7 +194,7 @@ async function rig(o: RigOptions = {}) {
   const r = await repo();
   if (o.seed !== undefined) await o.seed(r);
   const store = createLedgerStore({ home: join(r.root, "home") });
-  const clock = createNodeClock();
+  const clock = o.clock ?? createNodeClock();
   const launches: Launch[] = [];
   const launcher = { throwNext: null as ExecutorError | null };
   let owner: string | null = null;
@@ -245,7 +246,7 @@ async function rig(o: RigOptions = {}) {
   const journal: ExecutorEventInput[] = [];
   const begun: string[] = [];
   const deps: RuntimeDeps = {
-    store, slots: pool, slotsFor: () => pool,
+    store, executorHome: join(r.root, "home"), slots: pool, slotsFor: () => pool,
     compiler: {
       compile: async () => ({ draft: draft(r, o.tasks, o.edges), summary: { tasks: 1, phases: 1, edges: 0, workMs: 0, criticalPathMs: 0, width: 1, expectedMakespanMs: 0, manual: [], warnings: [] } }),
       mergeResidue: () => { throw new Error("unexpected residue"); }, addTasks: o.addTasks ?? (() => { throw new Error("unexpected addTasks"); }), validate: () => [],
@@ -327,6 +328,12 @@ async function rig(o: RigOptions = {}) {
   const pause = (ms = 30): Promise<void> => new Promise((res) => { setTimeout(res, ms); });
   const h = {
     r, runtime, store, pool, queue, launches, launcher, collabs, begun, ledger, pause, journal, acquireResets, begunStatus,
+    async restart(): Promise<ExecutorRuntimeHandle> {
+      await runtime.dispose();
+      const next = createExecutorRuntime(deps);
+      runtimes.push(next);
+      return next;
+    },
     async start(): Promise<void> {
       await runtime.compile({ path: draft(r).planPath, sessionID: ORCH });
       await runtime.approve(PLAN, ORCH);
@@ -904,16 +911,13 @@ describe("QA-PDF21 round 2", () => {
     expect(await readFile(join(h.r.slot, "b.txt"), "utf8")).toBe("attempt 1\n");
   }, TEST_MS);
 
-  it.each([
-    ["a missing slot directory", async (slot: string): Promise<void> => { await rm(slot, { recursive: true, force: true }); }],
-    ["a slot directory that is no repository", async (slot: string): Promise<void> => { await rm(join(slot, ".git"), { force: true }); }],
-  ])("-14. %s holds nothing to save: the park releases the slot and raises no unsaved-work item", async (_what, breakSlot) => {
+  it("-14. only a missing slot directory holds nothing to save", async () => {
     const h = await rig();
     await h.start();
     const first = await h.launched(1);
     await h.child(first, "ses-1");
     await writeFile(join(h.r.slot, "b.txt"), "lost with the slot\n");
-    await breakSlot(h.r.slot);
+    await rm(h.r.slot, { recursive: true, force: true });
     await h.end(first, "ses-1", "ESCALATE: stuck");
     await untilState(h, "parked");
     await until(() => { expect(h.pool.release).toHaveBeenCalledTimes(1); });
@@ -921,6 +925,36 @@ describe("QA-PDF21 round 2", () => {
     expect(l.tasks.T1?.slot).toBeNull();
     expect(l.inbox.some((x) => x.text.includes("could not be saved"))).toBe(false);
     expect(await refOf(h.r.top, wipRef)).toBeNull();
+  }, TEST_MS);
+
+  it("R3-6. missing repository metadata quarantines files and never collects them as clean", async () => {
+    const h = await rig();
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await writeFile(join(h.r.slot, "b.txt"), "irreplaceable\n");
+    await rm(join(h.r.slot, ".git"));
+    await h.end(first, "ses-1", "ESCALATE: stuck");
+    await untilState(h, "parked");
+    await until(async () => { expect(await holdOf(h)).toBeDefined(); });
+    const quarantine = join(h.r.root, "home", "quarantine", PLAN);
+    const entries = await readdir(quarantine);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatch(/^slot-1-\d+/);
+    expect(await readFile(join(quarantine, entries[0]!, "b.txt"), "utf8")).toBe("irreplaceable\n");
+    expect(existsSync(h.r.slot)).toBe(false);
+    expect(h.pool.release).not.toHaveBeenCalled();
+    await h.runtime.abort(PLAN, ORCH);
+    await bounded("abort settled", h.runtime.settled(), WAIT_MS);
+    await expect(h.runtime.gc()).rejects.toMatchObject({ code: "E_PLAN_STATE" });
+    await expect(h.runtime.purge(PLAN, ORCH)).rejects.toMatchObject({ code: "E_PLAN_STATE" });
+    expect(h.pool.gc).not.toHaveBeenCalled();
+    expect((await h.ledger()).inbox.filter((x) => x.text.includes("could not be saved"))).toHaveLength(1);
+    const restarted = await h.restart();
+    await expect(restarted.gc()).rejects.toMatchObject({ code: "E_PLAN_STATE" });
+    await expect(restarted.purge(PLAN, ORCH)).rejects.toMatchObject({ code: "E_PLAN_STATE" });
+    expect(await readFile(join(quarantine, entries[0]!, "b.txt"), "utf8")).toBe("irreplaceable\n");
+    expect((await h.store.read(PLAN)).inbox.filter((x) => x.text.includes("could not be saved"))).toHaveLength(1);
   }, TEST_MS);
 
   it("-15. answering the unsaved-work item saves the slot again and ends its hold", async () => {
@@ -944,6 +978,64 @@ describe("QA-PDF21 round 2", () => {
     expect(await holdOf(h)).toBeUndefined();
   }, TEST_MS);
 
+  it("R3-2. purge waits for abort's background save and rechecks its failed result", async () => {
+    let blocked = false;
+    let entered = false;
+    let release = (): void => {};
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const h = await rig({ inFlight: true, git: faultyGit(
+      (args) => blocked && args[0] === "add" ? "fail" : null,
+      async (args) => { if (blocked && args[0] === "add") { entered = true; await gate; } },
+    ) });
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await writeFile(join(h.r.slot, "b.txt"), "abort in progress\n");
+    blocked = true;
+    await h.runtime.abort(PLAN, ORCH);
+    await until(() => { expect(entered).toBe(true); });
+    let settled = false;
+    const purge = h.runtime.purge(PLAN, ORCH).then(() => null, (e: unknown) => e).finally(() => { settled = true; });
+    try {
+      await h.pause(150);
+      expect(settled).toBe(false);
+      expect(h.pool.gc).not.toHaveBeenCalled();
+    } finally {
+      release();
+    }
+    expect(await bounded("purge refusal", purge, WAIT_MS)).toMatchObject({ code: "E_PLAN_STATE" });
+    expect(await h.store.read(PLAN)).toMatchObject({ status: "aborted" });
+    expect(await readFile(join(h.r.slot, "b.txt"), "utf8")).toBe("abort in progress\n");
+  }, TEST_MS);
+
+  it("R3-2. purge refuses after 30 seconds on the runtime clock when abort cleanup is still pending", async () => {
+    const clock = createNodeClock();
+    let shift = 0;
+    let block = false;
+    let entered = false;
+    let release = (): void => {};
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const h = await rig({ inFlight: true, clock: { ...clock, now: () => clock.now() + shift },
+      git: faultyGit(() => null, async (args) => { if (block && args[0] === "add") { entered = true; await gate; } }),
+    });
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await writeFile(join(h.r.slot, "b.txt"), "pending cleanup\n");
+    block = true;
+    try {
+      await h.runtime.abort(PLAN, ORCH);
+      await until(() => { expect(entered).toBe(true); });
+      const purge = h.runtime.purge(PLAN, ORCH).then(() => null, (e: unknown) => e);
+      await h.pause(100);
+      shift = 30_001;
+      expect(await bounded("bounded purge", purge, WAIT_MS)).toMatchObject({ code: "E_PLAN_STATE", message: expect.stringContaining("cleanup is still pending") });
+      expect(h.pool.gc).not.toHaveBeenCalled();
+      expect(await h.store.read(PLAN)).toMatchObject({ status: "aborted" });
+      expect(await readFile(join(h.r.slot, "b.txt"), "utf8")).toBe("pending cleanup\n");
+    } finally { release(); }
+  }, TEST_MS);
+
   it("-15. after an abort with a failed save, gc and purge refuse while the save fails; a tick saves it, then collects", async () => {
     const s = failingAdd();
     const h = await rig({ inFlight: true, git: s.git });
@@ -965,6 +1057,59 @@ describe("QA-PDF21 round 2", () => {
     h.runtime.onLeaseReleased();
     await until(() => { expect(h.pool.gc).toHaveBeenCalled(); });
     expect(await sh(h.r.top, "show", `refs/heads/${wipRef}:b.txt`)).toBe("aborted work\n");
+  }, TEST_MS);
+
+  it.each(["gc", "purge"] as const)("R3-1. %s retries durable holds in a plan never attached by this runtime", async (action) => {
+    const s = failingAdd();
+    const h = await rig({ inFlight: true, git: s.git });
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await writeFile(join(h.r.slot, "b.txt"), "survives restart\n");
+    s.fail = true;
+    await h.runtime.abort(PLAN, ORCH);
+    await until(async () => { expect(await holdOf(h)).toBeDefined(); });
+    const next = await h.restart();
+    const collect = () => action === "gc" ? next.gc() : next.purge(PLAN, ORCH);
+    await expect(collect()).rejects.toMatchObject({ code: "E_PLAN_STATE", message: expect.stringContaining("slot-1") });
+    expect(h.pool.gc).not.toHaveBeenCalled();
+    expect(await readFile(join(h.r.slot, "b.txt"), "utf8")).toBe("survives restart\n");
+    expect((await h.store.read(PLAN)).inbox.filter((x) => x.text.includes("could not be saved"))).toHaveLength(1);
+    s.fail = false;
+    await collect();
+    expect(h.pool.gc).toHaveBeenCalled();
+    if (action === "gc") expect(await sh(h.r.top, "show", `refs/heads/${wipRef}:b.txt`)).toBe("survives restart\n");
+  }, TEST_MS);
+
+  it("R3-1. a leased marker alone rebuilds the hold after a crash before its inbox item was journaled", async () => {
+    const s = failingAdd();
+    const h = await rig({ inFlight: true, git: s.git });
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await writeFile(join(h.r.slot, "b.txt"), "marker-only work\n");
+    s.fail = true;
+    await h.runtime.abort(PLAN, ORCH);
+    await until(async () => { expect(await holdOf(h)).toBeDefined(); });
+    const next = await h.restart();
+    // Recreate exactly the durable terminal ledger from before wipHold's inbox-added batch; the pool marker remains.
+    const beforeItem = await h.store.read(PLAN);
+    beforeItem.inbox = [];
+    beforeItem.seq = 1;
+    await h.store.remove(PLAN);
+    const writer = await h.store.create(beforeItem, holderOf(ORCH, process.pid, hostname()));
+    await writer.close();
+    h.pool.list.mockImplementation(async () => {
+      const marker = await h.pool.get("slot-1");
+      return marker === null ? [] : [marker];
+    });
+    await expect(next.gc()).rejects.toMatchObject({ code: "E_PLAN_STATE", message: expect.stringContaining("slot-1") });
+    expect(h.pool.gc).not.toHaveBeenCalled();
+    expect(await readFile(join(h.r.slot, "b.txt"), "utf8")).toBe("marker-only work\n");
+    expect((await h.store.read(PLAN)).inbox.filter((x) => x.text.includes("could not be saved"))).toHaveLength(1);
+    s.fail = false;
+    await next.gc();
+    expect(await sh(h.r.top, "show", `refs/heads/${wipRef}:b.txt`)).toBe("marker-only work\n");
   }, TEST_MS);
 
   it("-16. a restore error that persists counts toward the provisioning streak, which raises one item", async () => {

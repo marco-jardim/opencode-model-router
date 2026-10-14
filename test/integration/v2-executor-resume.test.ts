@@ -472,6 +472,14 @@ describe("v2 assembled executor resume and restored work (real launcher, pool an
     expect(git(fixture.repo, "rev-list", "--count", `${fixture.base}..${value.integration.branch}`)).toBe("1");
     expect(git(fixture.repo, "log", "-1", "--format=%B", value.integration.branch)).toMatch(/Omr-Attempt: plan-a\/T1\/2\//);
     await executor.runtime.settled();
+    // The task's integrated batch precedes the queue's phase/plan completion. Runtime.settled() drains runtime
+    // work, not the independently running integration queue; purge has always required a terminal plan.
+    await vi.waitFor(async () => {
+      const ledger = await executor.deps.store.read("plan-a");
+      expect(ledger.status, JSON.stringify({ phases: ledger.phases, inbox: ledger.inbox })).toBe("completed");
+      expect(ledger.phases.map(phase => phase.gate)).toEqual(["passed"]);
+    }, { timeout: WAIT_MS });
+    await executor.runtime.settled();
     // A successful commit normally drops WIP itself. Re-pin the saved snapshot as a recovery residue so purge's
     // deletion assertion is not vacuous (it must remove a ref that actually exists at the purge boundary).
     git(fixture.repo, "update-ref", wipRef, wip);

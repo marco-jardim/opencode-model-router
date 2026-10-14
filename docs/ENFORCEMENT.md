@@ -1,6 +1,6 @@
 # Layer 1: Hard-block execution guard
 
-Converts advisory read-only caps into real hard-blocks for subagent sessions. Opt-in; orchestrator sessions and `mode:"off"` are byte-identical to pre-enforcement routing (GA-1).
+Enforces tool-call budgets, repeat checks and producer read/draft guards for subagent sessions. Numeric `CAP:N` read-only caps remain advisory banners, not hard stops. Hard-blocking is opt-in; orchestrator sessions and `mode:"off"` are byte-identical to pre-enforcement routing (GA-1).
 
 ## Mechanism
 

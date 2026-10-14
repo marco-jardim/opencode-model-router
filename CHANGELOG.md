@@ -69,12 +69,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   completed plan waits for pending phase tags, and `purge` creates no directories, removes the empty plan directory and
   skips collection for an invalid `slotsDir` when the plan holds no slot markers. A `NEED MORE: budget` end resumes
   the same child session as many times as the guard's cumulative call multiplier allows (`BUDGET_RESUMES`), then
-  parks as `budget-cap`; each budget resume starts a new guard round for that child (its per-dispatch budget and read
-  count restart, the cumulative ceiling stays). Plan children are guarded like routed role children: an editing task's
+  parks as `budget-cap`; each budget resume starts a new guard round for that child across plugin locations (its per-dispatch budget and read
+  count restart, the cumulative ceiling stays). A superseded run's late rejection cannot interrupt or unregister its resumed round.
+  Plan children keep their resolved tier for both round budgets and cumulative ceilings. An editing task's
   child gets the executor's `CAP:12` read cap (its `[cap: n/12]` and `CAP REACHED` banners, as a routed child's `CAP`)
   and its route's `budget=` as its call budget; interrupted, parked or lost attempts keep
   their uncommitted work on `omr/<plan>/wip/<task>` for the next attempt; WIP refs remain until purge, including after
-  abort. Orchestrator-shell filtering drops only the semicolon-delimited clause marked `(orchestrator shell)`, not its
+  abort. Unsaved-slot holds are rebuilt after restarts; gc and purge retry saving before collection. Purge waits up to
+  30 seconds for abort cleanup and refuses if it is still pending. Successful clean or presaved releases clear rebuilt
+  holds too, preventing duplicate abort releases; retained gc predicates still refuse any remaining hold.
+  Metadata-less slot directories are quarantined,
+  not counted as clean, and pool gc preserves uncommitted work unless the caller explicitly marks it saved.
+  Orchestrator-shell filtering drops only the semicolon-delimited clause marked `(orchestrator shell)`, not its
   neighbours, and compilation warns on mixed criteria lines. A block left with no criteria and no checks falls back to
   the inferred DoD. A cap written in the plan is neutralised with the task's other directives, and shared-context
   directives are neutralised at compile, keeping the stored text identical at launch; editing tasks receive the

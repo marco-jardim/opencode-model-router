@@ -567,7 +567,7 @@ interface RetireCtx extends FileCtx { git: GitOps; toplevel: string }
  * `git worktree remove` only once the directory is gone, marker deleted. Any failure leaves the marker `retired` and throws.
  * Returns a note when the worktree entry had to be left for manual removal.
  */
-async function retireSlot(x: RetireCtx, rec: SlotRecord, deadline: number, trustedParent: string): Promise<string | null> {
+async function retireSlot(x: RetireCtx, rec: SlotRecord, deadline: number, trustedParent: string, saved?: boolean): Promise<string | null> {
   const read = await readMarkerFile(x, markerPath(x.markersDir, rec.planId, rec.slot));
   if (!read.ok) throw new Error(`marker is ${read.reason}`);
   const cur = read.rec;
@@ -584,6 +584,17 @@ async function retireSlot(x: RetireCtx, rec: SlotRecord, deadline: number, trust
     }
   }
   const reason = slotLockReason(cur.planId, cur.slot);
+  // GC is not permission to discard work. Check before retiring the marker too: a refusal must keep its owner so
+  // a restarted runtime can reconstruct the hold and save it. Invalid metadata is likewise not a clean tree.
+  if (saved === false && await x.fs.lstat(cur.path) !== null) {
+    try {
+      await assertRealSlotDir(x.fs, cur.path, x.platform);
+      await x.git.verifySlotPointers(cur.path);
+      if ((await x.git.statusPorcelain(cur.path)).length > 0) throw new Error("slot has uncommitted changes; save its work before gc");
+    } catch (error) {
+      throw new Error(`unsaved work prevents collection: ${messageOf(error)}`);
+    }
+  }
   await writeMarkerFile(x, { ...cur, state: "retired", owner: null, updatedAt: x.clock.iso() });
 
   let st = await x.fs.lstat(cur.path);
@@ -598,6 +609,7 @@ async function retireSlot(x: RetireCtx, rec: SlotRecord, deadline: number, trust
     try {
       await x.git.verifySlotPointers(cur.path);
     } catch (error) {
+      if (saved === false) throw new Error(`cannot collect unsaved work with invalid git pointers: ${messageOf(error)}`);
       note = `git pointers were invalid (${messageOf(error)}); the worktree entry was dropped by path and lock reason`;
     }
     assertSafeSlotDir(cur.path, cur.slot, trustedParent, x.platform);
@@ -623,7 +635,7 @@ async function retireSlot(x: RetireCtx, rec: SlotRecord, deadline: number, trust
 export async function gcSlots(
   d: GcDeps,
   isFinished: (planId: PlanId) => Promise<boolean | null>,
-  opts: { deadline?: number; trustedSlotsDirs?: readonly string[] } = {},
+  opts: { deadline?: number; trustedSlotsDirs?: readonly string[]; savedSlots?: ReadonlySet<string> } = {},
 ): Promise<{ removed: string[]; reported: string[] }> {
   const platform = d.platform ?? process.platform;
   const api = pathApi(platform);
@@ -682,7 +694,7 @@ export async function gcSlots(
       continue;
     }
     try {
-      const note = await retireSlot(x, rec, deadline, trustedFor.get(comparable(rec.path, platform)) ?? d.slotsDir);
+      const note = await retireSlot(x, rec, deadline, trustedFor.get(comparable(rec.path, platform)) ?? d.slotsDir, opts.savedSlots?.has(rec.path) === true);
       known.delete(comparable(rec.path, platform));
       removed.push(rec.path);
       if (note !== null) reported.push(`${rec.path}: ${note}`);
@@ -1328,7 +1340,7 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
     return found.records.map((r) => r.rec).sort((a, b) => compareSlots(a.slot, b.slot));
   }
 
-  async function gc(isFinished: (planId: PlanId) => Promise<boolean | null>): Promise<{ removed: string[]; reported: string[] }> {
+  async function gc(isFinished: (planId: PlanId) => Promise<boolean | null>, opts: { savedSlots?: ReadonlySet<string> } = {}): Promise<{ removed: string[]; reported: string[] }> {
     assertOpen();
     // A gc that is about to collect this very plan closes the pool first: no new acquire, and provisioning in flight stops.
     // The answer is asked once and reused for this plan below (QA-2.4-26): `false` means gcSlots will not touch this plan's slots.
@@ -1349,7 +1361,7 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
         const out = await gcSlots({
           repoKey: d.repoKey, toplevel: d.toplevel, slotsDir: d.slotsDir, markersDir: d.markersDir, executorHome: d.executorHome,
           git: d.git, fs: d.fs, clock: d.clock, platform, ...(logger === undefined ? {} : { logger }),
-        }, asked);
+        }, asked, opts);
         for (const rec of [...records.values()]) {
           const read = await readMarkerFile(fileCtx, markerPath(d.markersDir, rec.planId, rec.slot));
           if (read.ok) {

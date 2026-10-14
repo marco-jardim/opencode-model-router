@@ -43,7 +43,7 @@ export default {
     // Phase 5.1 D8: the plan-task verifier built over this plugin instance's dispatch verification engine.
     let slotVerifier: PlanTaskVerifier | undefined;
     let annotate: CreateExecutorOptions["annotate"];
-    // QA-PDF21-2-11/-20: the plugin's guard state of executor children (a resume's new round, a bound child's read cap).
+    // Publishes executor child rounds/caps process-wide; the slot-location plugin consumes each new round locally.
     let executorChildGuard: ExecutorChildGuardPort | undefined;
     const input = {
       directory: ctx.location.directory,

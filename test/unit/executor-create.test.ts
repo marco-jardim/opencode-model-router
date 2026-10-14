@@ -397,6 +397,14 @@ describe("createExecutor assembly seams", () => {
     return { executor, host, deps: captured.runtime, compiler: captured.compiler, inner: captured.inner };
   }
 
+  it.each(["medium", "heavy"] as const)("R3-5. the real route resolver preserves the resolved %s tier", async (tier) => {
+    const { deps } = capture();
+    const task = taskNode("T1");
+    task.route = { ...task.route, role: "implementer", tier };
+    expect(await deps.routes.route(task)).toMatchObject({ tier, heavy: tier === "heavy", model: { modelID: tier } });
+    expect(deps.executorHome).toBe(prepared.home);
+  });
+
   async function queueRig(awaitingApproval = false, integrationHead?: string, slotsDir = "D:/slots/plan-a") {
     const timers = new Map<number, () => void>(); let serial = 0;
     const clock: Clock = { now: () => 1000, iso: () => "2026-10-11T00:00:00.000Z", randomHex: bytes => "a".repeat(bytes * 2),
@@ -446,8 +454,8 @@ describe("createExecutor assembly seams", () => {
       heavy: { model: "fixture/heavy", description: "fixture heavy", costRatio: 3 },
     });
     const route = (role: string, tier: LedgerV1["tasks"][string]["route"]["tier"]) => h.deps.routes.route(taskNode("T1", { route: { line: "", role, tier, pin: true } }));
-    expect(route("reviewer", "fast")).toMatchObject({ agent: "reviewer", heavy: true });
-    expect(route("explorer", "heavy")).toMatchObject({ agent: "explorer", heavy: false });
+    expect(route("reviewer", "fast")).toMatchObject({ agent: "reviewer", tier: "heavy", heavy: true });
+    expect(route("explorer", "heavy")).toMatchObject({ agent: "explorer", tier: "medium", heavy: false });
     expect(route("implementer", null).model.modelID).toBeTruthy();
     expect(() => route("missing", "fast")).toThrow("unknown role");
     const fixtureTiers = configModule.resolveActiveTiers(executorConfig());

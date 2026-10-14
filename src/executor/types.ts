@@ -1456,7 +1456,7 @@ export interface SlotPool {
   get(slot: string): Promise<SlotRecord | null>;
   list(planId?: PlanId): Promise<SlotRecord[]>;
   /** Removes only marked slots of completed/aborted plans, or unknown plans after 7 d; never follows links; reports unmarked dirs */
-  gc(isFinished: (planId: PlanId) => Promise<boolean | null>): Promise<{ removed: string[]; reported: string[] }>;
+  gc(isFinished: (planId: PlanId) => Promise<boolean | null>, opts?: { savedSlots?: ReadonlySet<string> }): Promise<{ removed: string[]; reported: string[] }>;
 }
 
 /** Called after the fsync of the corresponding journal batch. */
@@ -1554,6 +1554,8 @@ export interface LeaseService extends LeaseView {
 }
 export interface TaskRoute {
   agent: string;
+  /** Resolved (role-range-clamped) tier, not the role's floor or the task's unvalidated request. */
+  tier?: string;
   model: { providerID: string; modelID: string; variant: string | null };
   provider: string;
   heavy: boolean;

@@ -308,16 +308,16 @@ describe("launch: what the runner receives", () => {
     done.resolve({ sessionID: "child-1", text: "ok" });
   });
 
-  it("QA-PDF21-2-20: binds the child with its route's budget= when the request names one", async () => {
+  it.each(["medium", "heavy"])("R3-5: binds the child with its resolved %s tier and route budget=", async (tier) => {
     const r = rig();
     const done = deferred<{ sessionID: string; text: string }>();
     r.fr.state.script = creating(r, "child-1", done.promise);
-    const req = r.req({ routeBudget: 7 });
+    const req = r.req({ routeBudget: 7, route: { ...r.req().route, tier } });
     const handle = r.launcher.launch(req, r.hooks);
     expect(await handle.confirmation).toMatchObject({ kind: "confirmed", childSessionID: "child-1" });
     await vi.waitFor(() => expect(r.log).toContain("prompted"));
     expect(r.binds).toHaveLength(1);
-    expect(r.binds[0]).toMatchObject({ childSessionID: "child-1", agent: "coder", budget: 7, prompt: req.prompt });
+    expect(r.binds[0]).toMatchObject({ childSessionID: "child-1", agent: "coder", tier, budget: 7, prompt: req.prompt });
     done.resolve({ sessionID: "child-1", text: "ok" });
   });
 

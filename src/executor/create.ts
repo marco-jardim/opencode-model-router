@@ -68,7 +68,7 @@ export class PlanSlotPools {
     release: async () => { throw new ExecutorError("E_PLAN_STATE", "a slot operation requires a plan"); },
     get: async () => null,
     list: async (id) => id === undefined ? (await Promise.all([...this.entries.keys()].map((plan) => this.of(plan).list()))).flat() : this.of(id).list(),
-    gc: (finished) => this.gc(finished),
+    gc: (finished, opts) => this.gc(finished, opts),
   };
 
   of(planId: PlanId): SlotPool {
@@ -79,11 +79,25 @@ export class PlanSlotPools {
       if (entry.closed) return Promise.reject(new ExecutorError("E_PLAN_STATE", `slots of plan ${planId} are closed`));
       entry.pool ??= this.deps.store.read(planId).then(async (ledger) => {
         const pool = this.deps.makePool(ledger);
-        try { await pool.open(); } catch (error) { pool.close(); throw error; }
+        try {
+          if (ledger.status === "completed" || ledger.status === "aborted") await pool.open({ create: false });
+          else await pool.open();
+        }
+        catch (error) { pool.close(); throw error; }
         if (entry.closed) { pool.close(); throw new ExecutorError("E_PLAN_STATE", `slots of plan ${planId} are closed`); }
         return pool;
       });
       return entry.pool;
+    };
+    // An invalid slotsDir with no markers has nothing to save (the purge has the same exception).
+    const inspect = async <T>(read: (pool: OpenPool) => Promise<T>, empty: T): Promise<T> => {
+      if (entry.closed) return empty;
+      try {
+        return await read(await get());
+      } catch (error) {
+        if (error instanceof ExecutorError && error.code === "E_INVALID_INPUT" && await this.deps.markers?.(planId) === 0) return empty;
+        throw error;
+      }
     };
     const view: SlotPool = {
       acquire: async (...args) => (await get()).acquire(...args),
@@ -91,18 +105,20 @@ export class PlanSlotPools {
       reset: async (...args) => (await get()).reset(...args),
       cleanForChecks: async (...args) => (await get()).cleanForChecks(...args),
       release: async (...args) => { if (!entry.closed) await (await get()).release(...args); },
-      get: async (...args) => entry.closed ? null : (await get()).get(...args),
-      list: async (...args) => entry.closed ? [] : (await get()).list(...args),
-      gc: async (finished) => {
+      get: (...args) => inspect((pool) => pool.get(...args), null),
+      list: (...args) => inspect((pool) => pool.list(...args), []),
+      gc: async (finished, opts) => {
         if (entry.closed) {
           // QA-5.1-22: the gc-only handle creates no directory.
           const pool = this.deps.makePool(await this.deps.store.read(planId));
-          try { await pool.open({ create: false }); return await pool.gc(finished); }
+          try { await pool.open({ create: false }); return await pool.gc(finished, opts); }
           finally { pool.close(); }
         }
         const pool = await get();
-        const result = await pool.gc(finished);
-        if (await finished(planId)) { entry.closed = true; pool.close(); }
+        const result = await pool.gc(finished, opts);
+        // A partial collection must keep its markers readable for the next save preflight, even though the pool
+        // itself already fences writes. A successful collection has nothing left to inspect.
+        if (await finished(planId) && result.reported.length === 0) { entry.closed = true; pool.close(); }
         return result;
       },
     };
@@ -112,13 +128,13 @@ export class PlanSlotPools {
     return view;
   }
 
-  async gc(finished: Parameters<SlotPool["gc"]>[0]): ReturnType<SlotPool["gc"]> {
+  async gc(finished: Parameters<SlotPool["gc"]>[0], opts?: Parameters<SlotPool["gc"]>[1]): ReturnType<SlotPool["gc"]> {
     const removed: string[] = [], reported: string[] = [];
     for (const plan of await this.deps.store.list()) {
       if (!sameToplevel(plan.toplevel, this.deps.toplevel)) continue;
       if (plan.status !== "completed" && plan.status !== "aborted" && this.entries.get(plan.planId)?.pool == null) continue;
       try {
-        const result = await this.of(plan.planId).gc(finished);
+        const result = await this.of(plan.planId).gc(finished, opts);
         removed.push(...result.removed); reported.push(...result.reported);
       } catch (error) {
         this.deps.log?.("warn", "slot gc failed", { planId: plan.planId, error: error instanceof Error ? error.message : String(error) });
@@ -401,8 +417,8 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
         const tier = names[Math.max(floor, Math.min(ceiling, requested))];
         const config = tier === undefined ? undefined : tiers[tier];
         const model = config === undefined ? undefined : parseModelRef(config.model);
-        if (model === undefined) throw new ExecutorError("E_INVALID_INPUT", "the task model is unavailable");
-        return { agent: role.agent, model: { providerID: model.providerId, modelID: model.modelId, variant: config?.variant ?? null },
+        if (model === undefined || tier === undefined) throw new ExecutorError("E_INVALID_INPUT", "the task model is unavailable");
+        return { agent: role.agent, tier, model: { providerID: model.providerId, modelID: model.modelId, variant: config?.variant ?? null },
           provider: model.providerId, heavy: tier === "heavy" };
       },
     };
@@ -503,7 +519,7 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
       const now = clock.iso();
       return { sessionID, pid: spawner.pid, hostname: spawner.hostname, startedAt: now, heartbeatAt: now };
     };
-    runtime = createExecutorRuntime({ store, compiler,
+    runtime = createExecutorRuntime({ store, compiler, executorHome: home,
       slots: planPools.facade, slotsFor: (id) => planPools.of(id), purgeSlots: (id, finished) => planPools.purge(id, finished),
       scheduler: createScheduler(), launcher: taskLauncher, routes, verifier: host.verifier, git, hosts: host.hosts, bindings: host.bindings, clock,
       leaseRegistry: { acquireWrite: (owner, writes) => {

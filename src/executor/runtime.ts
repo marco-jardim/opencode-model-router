@@ -1,6 +1,7 @@
 // ExecutorRuntime (plan task 3.1.6): per-plan tick, per-task pipeline, lifecycle rows, liveness, metrics.
 // Plan task 4.2.5: restart recovery (`recoverPlan`), R1a probation watch, integration resume per activation, D11 trailer.
-import { rm } from "node:fs/promises";
+import { lstatSync as slotLstatSync, readdirSync } from "node:fs";
+import { mkdir, rename, rm } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { ROUTER_BUDGET_NOTE_PREFIX } from "../router/prompts";
 import {
@@ -33,7 +34,7 @@ import {
   type ReconcileFeed,
   type RecoveryEngine,
 } from "./recovery";
-import { defaultSlotsDir } from "./slots/pool";
+import { defaultSlotsDir, SLOT_NAME_PATTERN } from "./slots/pool";
 import { BREAKER_FED, breakerSamples, createUnattendedPolicy, isCommitFailure, pendingDependentsClosure } from "./unattended";
 import {
   ABSOLUTE_PATH_PATTERN,
@@ -432,6 +433,8 @@ export interface PlanTaskVerifier extends SlotVerifier {
 
 export interface RuntimeDeps {
   store: LedgerStore;
+  /** Executor storage root; metadata-less slot directories are preserved here, outside the pool. */
+  executorHome?: string;
   compiler: PlanCompiler;
   slots: SlotPool;
   /** Per-plan pools; legacy callers keep using `slots`. */
@@ -1038,6 +1041,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       await wipHold(p, taskId, s, `its release (${outcome})`);
       return false;
     }
+    // Reconstructed holds also cover clean/presaved slots. Those paths need not enter saveSlotWork (which clears
+    // holds after a git snapshot); end the hold here too, before collection can retry this completed release.
+    wipFailRaised.delete(`${p.planId}/${s}`);
     if (p.slotLeases.get(taskId)?.slot === s) p.slotLeases.delete(taskId);
     try {
       await slotsFor(p.planId).release(s);
@@ -1288,15 +1294,15 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   }
 
   /**
-   * QA-PDF21-14: a slot directory that is missing, or holds no repository of its own (no `.git`), counts as gone: it holds
-   * nothing to save. A `.git` that cannot be read safely (a link, a pointer to a network path) is not gone: it is kept.
+   * Only a missing slot directory is gone. Missing repository metadata is not evidence that its files are disposable.
    */
   function slotGone(path: string): boolean {
-    if (path === "") return true;
+    if (path === "") return false;
     try {
-      return gitPointers(path) === undefined;
-    } catch {
+      slotLstatSync(path);
       return false;
+    } catch (e) {
+      return typeof e === "object" && e !== null && "code" in e && e.code === "ENOENT";
     }
   }
 
@@ -1345,6 +1351,28 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   /** QA-PDF21-3: `<plan>/<slot>` of the slots whose failed save raised its blocking item already (cleared by a save). */
   const wipFailRaised = new Set<string>();
 
+  /** The quarantine directory is durable even if the process dies between the rename and journaling its item. */
+  function quarantinedSlots(p: PlanRt): string[] {
+    if (d.executorHome === undefined) return [];
+    try {
+      return readdirSync(join(d.executorHome, "quarantine", p.planId)).flatMap((name) => {
+        const match = /^(slot-\d+|integration|ci)-\d+$/.exec(name);
+        return match?.[1] === undefined ? [] : [match[1]];
+      });
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return [];
+      throw error;
+    }
+  }
+
+  function quarantineHeld(p: PlanRt, slot: string): boolean {
+    try { return quarantinedSlots(p).includes(slot); }
+    catch (error) {
+      d.log("warn", "quarantine cannot be inspected; slot kept", errorText(error));
+      return true;
+    }
+  }
+
   /**
    * Saves the work in `slot` at `ref` (a WIP commit with the `Omr-Wip` trailer, never `Omr-Attempt`), parented at
    * `slot.base` when given (QA-PDF21-6: the lease base, so committed work is saved too), then resets the slot to its HEAD.
@@ -1354,16 +1382,26 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
      * `deferredMetrics` buffers diagnostics for a preflight whose refusal must not write to the ledger.
    */
   async function saveSlotWork(p: PlanRt, slot: { slot: string; path: string; base?: string | null }, ref: string, message: string, trailer: string, taskId: TaskId | null, deferredMetrics?: MetricPayload[]): Promise<SaveResult> {
+    if (quarantineHeld(p, slot.slot)) return "failed";
     if (!wipCapable(p)) return "clean";
     const o = { cwd: slot.path, timeoutMs: GIT_TIMEOUT_MS };
-    // QA-PDF21-14: a missing directory or one that is no repository (no `.git`) holds nothing to save; no git runs there
-    // (git would fail, or climb to an enclosing repository and run `add -A` and `reset --hard` in it).
+    // Never let git climb from a metadata-less slot into an enclosing repository.
     if (slotGone(slot.path)) {
       wipFailRaised.delete(`${p.planId}/${slot.slot}`);
       counter(p, "wip-slot-gone", taskId === null ? { slot: slot.slot } : { taskId, slot: slot.slot }, deferredMetrics);
       return "clean";
     }
     try {
+      if (gitPointers(slot.path) === undefined) {
+        if (d.executorHome === undefined) throw new Error("cannot quarantine a slot without the executor home");
+        const root = join(d.executorHome, "quarantine", p.planId);
+        const destination = join(root, `${slot.slot}-${d.clock.now()}`);
+        await mkdir(root, { recursive: true });
+        await rename(slot.path, destination);
+        d.log("warn", `slot ${slot.slot} quarantined at ${destination}; repository metadata is missing`);
+        await wipHold(p, taskId, slot.slot, `it was quarantined at ${destination} (repository metadata missing)`);
+        return "failed";
+      }
       const r = await snapshotSlotWork(d.git, {
         cwd: slot.path,
         ref,
@@ -1454,8 +1492,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   async function wipHold(p: PlanRt, taskId: TaskId | null, slotName: string, what: string): Promise<string | null> {
     const key = `${p.planId}/${slotName}`;
     counter(p, "wip-hold", taskId === null ? { slot: slotName } : { taskId, slot: slotName });
-    if (wipFailRaised.has(key)) return openWipHoldItem(p, slotName);
     wipFailRaised.add(key);
+    const existing = openWipHoldItem(p, slotName);
+    if (existing !== null) return existing;
     try {
       const item = await p.collab.policy.raise({
         kind: "failure",
@@ -1487,6 +1526,26 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     return [...wipFailRaised].filter((k) => k.startsWith(prefix)).map((k) => k.slice(prefix.length)).sort();
   }
 
+  /** Holds survive process restarts: the journal and still-leased pool markers are the authority, not this cache. */
+  async function rebuildHeldSlots(p: PlanRt): Promise<void> {
+    for (const slot of quarantinedSlots(p)) wipFailRaised.add(`${p.planId}/${slot}`);
+    for (const item of p.writer.ledger.inbox) {
+      const slot = item.answer === null ? wipHoldSlotOf(item.text) : null;
+      if (slot !== null) wipFailRaised.add(`${p.planId}/${slot}`);
+    }
+    for (const task of Object.values(p.writer.ledger.tasks)) {
+      if (task.slot !== null) wipFailRaised.add(`${p.planId}/${task.slot}`);
+    }
+    if (isForeign(p.writer.ledger.repo.toplevel) || !["running", "paused", "completed", "aborted"].includes(p.writer.ledger.status)) return;
+    const terminal = p.writer.ledger.status === "completed" || p.writer.ledger.status === "aborted";
+    let markers: Awaited<ReturnType<SlotPool["list"]>>;
+    try { markers = await slotsFor(p.planId).list(); }
+    catch (error) { throw new ExecutorError("E_PLAN_STATE", `plan ${p.planId}: unsaved slot markers could not be read (${errorText(error)})`, { planId: p.planId }); }
+    for (const marker of markers) {
+      if (marker.planId === p.planId && (terminal || marker.state === "leased")) wipFailRaised.add(`${p.planId}/${marker.slot}`);
+    }
+  }
+
   /**
    * QA-PDF21-15: one more save of a slot a failed save holds (the answer to its item, a collection, a purge, a manual gc).
    * The task the ledger gives the slot to, else the one the pool leases it to, saves it at its WIP ref under its task
@@ -1496,11 +1555,14 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
    */
   async function retryHeldSave(p: PlanRt, slotName: string, outcome: string): Promise<SaveResult> {
     const key = `${p.planId}/${slotName}`;
+    if (!SLOT_NAME_PATTERN.test(slotName) || quarantineHeld(p, slotName)) return "failed";
     let owner: string | null = null;
     let path: string;
     try {
       const rec = await slotsFor(p.planId).get(slotName);
       if (rec === null) {
+        const path = join(p.writer.ledger.config.slotsDir ?? defaultSlotsDir(p.writer.ledger.repo.toplevel, p.planId), slotName);
+        if (!slotGone(path)) return snapshotOrphan(p, { slot: slotName, path });
         wipFailRaised.delete(key);
         return "clean";
       }
@@ -1513,7 +1575,11 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     const tasks = Object.values(p.writer.ledger.tasks);
     const inLedger = tasks.find((t) => t.slot === slotName) ?? null;
     const holder = inLedger ?? tasks.find((t) => leaseHolderID(p.planId, t.id) === owner) ?? null;
-    if (holder === null) return snapshotOrphan(p, { slot: slotName, path });
+    if (holder === null) {
+      const result = await snapshotOrphan(p, { slot: slotName, path });
+      if (result !== "failed") wipFailRaised.delete(key);
+      return result;
+    }
     return withTask(p, holder.id, async () => {
       const r = await snapshotTaskSlot(p, holder.id, slotName, outcome);
       if (r === "failed") return r;
@@ -1536,8 +1602,13 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
    * one that still fails refuses the action (E_PLAN_STATE naming the slot) and its item stays open.
    */
   async function refuseUnsaved(p: PlanRt, action: "purge" | "gc"): Promise<void> {
+    await rebuildHeldSlots(p);
     const failed: string[] = [];
-    for (const slotName of heldSlotsOf(p)) if ((await retryHeldSave(p, slotName, action)) === "failed") failed.push(slotName);
+    for (const slotName of heldSlotsOf(p)) {
+      if ((await retryHeldSave(p, slotName, action)) !== "failed") continue;
+      failed.push(slotName);
+      await wipHold(p, null, slotName, action);
+    }
     if (failed.length === 0) return;
     throw new ExecutorError(
       "E_PLAN_STATE",
@@ -3408,6 +3479,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     for (const [taskId, h] of carriedHandles.get(planId) ?? []) if (!h.settled) p.handles.set(taskId, h);
     carriedHandles.delete(planId);
     ref.p = p;
+    try { await rebuildHeldSlots(p); }
+    catch (error) { d.log("warn", "slot holds will be rechecked before collection", errorText(error)); }
     plans.set(planId, p);
     return p;
   }
@@ -3768,6 +3841,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         childSessionID,
         role: t.route.role,
         agent: route.agent,
+        ...(route.tier === undefined ? {} : { tier: route.tier }),
+        prompt: x.prompt,
+        budget: x.routeBudget ?? null,
         workRoot: x.workRoot,
         grant: needsOf(x.routeLine),
       });
@@ -4922,6 +4998,12 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     async abort(planId, sessionID) {
       const p = await mine(planId, sessionID);
       requireStatus(p, ["compiling", "awaiting-residue", "awaiting-approval", "running", "paused"]);
+      const cleanup = abortReleases.get(p) ?? new Set<TaskId>();
+      abortReleases.set(p, cleanup);
+      // Covers the interval between the terminal ledger batch and registering live-child releases, and saves of
+      // already-ended children too. No real task id contains NUL.
+      cleanup.add("\0abort");
+      try {
       p.latch = true;
       try {
         await p.collab.queue.abort();
@@ -4980,7 +5062,11 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         else p.leases.releaseTask(id);
       }
       await forgetClosed(p);
+      cleanup.delete("\0abort");
       await collectFinished(p);
+      } finally {
+        cleanup.delete("\0abort");
+      }
     },
 
     async land(planId, sessionID) {
@@ -5082,11 +5168,20 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     },
 
     async gc() {
+      // A restarted runtime has not attached terminal plans. Open them before entering the pool's gc so failures
+      // propagate as E_PLAN_STATE (and no pool mutex is held while a save consults its markers).
+      for (const entry of await d.store.list()) {
+        if (entry.status !== "completed" && entry.status !== "aborted") continue;
+        if (plans.has(entry.planId)) continue;
+        const ledger = await d.store.read(entry.planId);
+        if (isForeign(ledger.repo.toplevel)) continue;
+        await attach(await d.store.open(entry.planId, d.holder(ledger.orchestrator.sessionID)));
+      }
       // QA-PDF21-15: a finished plan's slot whose work could not be saved is saved again first; a save that fails again
       // refuses the gc (its worktree would be deleted with the work).
       for (const known of [...plans.values()]) {
         const st = known.writer.ledger.status;
-        if ((st === "completed" || st === "aborted") && !known.disposed) await refuseUnsaved(known, "gc");
+        if ((st === "completed" || st === "aborted") && !known.disposed && idle(known)) await refuseUnsaved(known, "gc");
       }
       // A plan's answer may be asked more than once in one gc (the pool, then its facade): reported once.
       const tagPending = new Set<PlanId>();
@@ -5099,7 +5194,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         if (known !== undefined) {
           const st = known.writer.ledger.status;
           if (st !== "completed" && st !== "aborted") return false;
-          if (!idle(known)) return false;
+          // The pool may retain/recheck this predicate after preflight. A later failed save or a reconstructed hold
+          // must not turn into permission to delete merely because the plan has since reached a terminal status.
+          if (!idle(known) || heldSlotsOf(known).length > 0) return false;
           if (!planTagsSettled(known.writer.ledger)) {
             tagPending.add(planId);
             return false;
@@ -5107,8 +5204,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
           return true;
         }
         try {
-          const l = await d.store.read(planId);
-          return l.status === "completed" || l.status === "aborted";
+          await d.store.read(planId);
+          // A plan not included in the preflight must wait for the next gc, never bypass its unsaved-work check.
+          return false;
         } catch (e) {
           if (errorCode(e) === "E_LEDGER_NOT_FOUND") return null;
           throw e;
@@ -5127,6 +5225,14 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     async purge(planId, sessionID) {
       const p = await mine(planId, sessionID);
       requireStatus(p, ["completed", "aborted"]);
+      // Abort publishes its terminal status before its children and their saves settle. Never close the writer or
+      // remove refs/worktrees underneath that cleanup. The runtime clock also bounds a stuck child/save.
+      const deadline = d.clock.now() + 30_000;
+      while ((!idle(p) || collecting.has(planId)) && d.clock.now() < deadline) {
+        await new Promise<void>((resolve) => { d.clock.setTimer(Math.min(50, deadline - d.clock.now()), resolve); });
+      }
+      if (!idle(p) || collecting.has(planId)) throw new ExecutorError("E_PLAN_STATE", `plan ${planId}: cleanup is still pending; purge refused`, { planId });
+      requireStatus(p, ["completed", "aborted"]);
       // QA-PDF21-15: a slot whose work could not be saved is saved again first; a save that fails again refuses the purge
       // before anything is removed (its worktree would go with the work).
       await refuseUnsaved(p, "purge");
@@ -5136,8 +5242,10 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       // through a gc-only handle (create.ts PlanSlotPools), so a slot a partial gc could not remove is retried here.
       const purged = async (id: PlanId): Promise<boolean | null> => (id === planId ? true : null);
       // QA-5.1-22: an invalid slotsDir with slot markers refuses here, before any ref or the ledger is removed.
-      if (d.purgeSlots !== undefined) await d.purgeSlots(planId, purged);
-      else await slotsFor(planId).gc(purged);
+      const report = d.purgeSlots !== undefined ? await d.purgeSlots(planId, purged) : await slotsFor(planId).gc(purged);
+      if (report.reported.some((note) => /uncommitted changes|unsaved work/.test(note))) {
+        throw new ExecutorError("E_PLAN_STATE", `plan ${planId}: pool refused unsaved work; purge refused`, { planId, reported: report.reported });
+      }
       for (const ns of ["heads", "tags"]) {
         const prefix = `refs/${ns}/omr/${planId}/`;
         const r = await d.git.run(["for-each-ref", "--format=%(refname)", prefix], { cwd: toplevel, timeoutMs: GIT_TIMEOUT_MS });

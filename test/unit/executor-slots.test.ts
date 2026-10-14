@@ -600,6 +600,20 @@ describe("SlotPool lifecycle", () => {
 // ---------------------------------------------------------------------------------------------------------------
 
 describe("QA-5.1-22: gc-only handle and the purge's empty plan directory", () => {
+  it.each([" M", "M ", "??"])("R3-1. gc preserves %s work and its lease unless explicitly saved", async (xy) => {
+    const h = harness();
+    await h.pool.open();
+    const lease = await h.pool.acquire(PLAN, "task-1", C1);
+    h.fs.put(win32.join(lease.path, "precious.txt"), "unsaved");
+    h.git.status = [{ xy, path: "precious.txt", orig: null }];
+    const refused = await h.pool.gc(async () => true);
+    expect(refused.removed).toEqual([]);
+    expect(refused.reported.join("\n")).toContain("uncommitted changes");
+    expect(h.fs.text(win32.join(lease.path, "precious.txt"))).toBe("unsaved");
+    expect(h.marker(lease.slot)).toMatchObject({ state: "leased", owner: "task-1" });
+    expect(await h.pool.gc(async () => true, { savedSlots: new Set([lease.path]) })).toEqual({ removed: [lease.path], reported: [] });
+  });
+
   it("open({ create: false }) creates no directory, never leases, and gcs a missing slotsDir to nothing", async () => {
     const h = harness();
     await h.pool.open({ create: false });
@@ -1417,7 +1431,8 @@ describe("SlotPool gc", () => {
       expect(out.reported[0]).toContain("not a real directory (junction)");
       expect(h.fs.text("D:\\precious\\gold.txt")).toBe("keep");
       expect(h.fs.removed.some(r => key(r.path) === key(slotPath("slot-9")))).toBe(false);
-      expect(h.marker("slot-9").state).toBe("retired");
+      // A refused unsaved-work preflight leaves the marker unchanged as well as preserving the directory.
+      expect(h.marker("slot-9")).toMatchObject({ state: "ready", owner: null });
     });
 
     // Regression: gc validated a marker's path against the marker's own parent, so a forged marker outside slotsDir passed.
@@ -1505,11 +1520,16 @@ describe("SlotPool gc", () => {
   });
 
   // QA-2.4-3: the entry is dropped by path + lock reason even when the pointers were invalid.
-  it("invalid git pointers: the directory is removed, the worktree entry is dropped by path and lock reason, and it is reported", async () => {
+  it("invalid git pointers: gc preserves unknown work unless the caller explicitly saved it", async () => {
     const h = harness();
     const path = await leased(h);
     h.git.badPointers.add(key(path));
-    const out = await h.pool.gc(async () => true);
+    const refused = await h.pool.gc(async () => true);
+    expect(refused.removed).toEqual([]);
+    expect(refused.reported.join("\n")).toContain("unsaved work");
+    expect(await h.fs.lstat(path)).not.toBeNull();
+    expect(h.marker("slot-1").state).toBe("ready");
+    const out = await h.pool.gc(async () => true, { savedSlots: new Set([path]) });
     expect(out.removed).toEqual([path]);
     expect(out.reported[0]).toContain("git pointers were invalid");
     expect(h.git.log).toContain(`remove ${key(path)}`);

@@ -282,11 +282,16 @@ satisfied, not merely because someone answered a question.
 
 ### Interrupted attempts
 
-A `NEED MORE: budget` end resumes the same child session and attempt up to **3 times**, keeping its slot, leases and
+A `NEED MORE: budget` end resumes the same child session and attempt up to **2 times** (`BUDGET_RESUMES`), keeping its slot, leases and
 branch. After those resumes it parks as `budget-cap`, rather than starting the work over in another session.
 An interrupted, parked or lost attempt's uncommitted work is kept on `omr/<plan>/wip/<task>` and restored into the
 next attempt on top of the integration head. If restoration conflicts, the task parks and the WIP ref is kept.
 WIP refs are kept until the plan is purged; aborting a plan keeps them too.
+
+Unsaved-slot holds survive restarts: gc and purge retry their saves and refuse with `E_PLAN_STATE` if saving still
+fails. Purge waits up to 30 seconds for pending abort cleanup before refusing. A missing slot directory has nothing
+left to save; an existing directory without `.git` is moved to `<executorHome>\quarantine\<plan>\<slot>-<ts>` and
+gets one blocking item, never treated as clean. Pool gc also preserves uncommitted work unless explicitly marked saved.
 
 A cap written in the plan does not reach the child: executor launches neutralise the task's own directive tokens,
 including any explicit `CAP:`, and directive tokens in shared context are neutralised at compile time, so the shared

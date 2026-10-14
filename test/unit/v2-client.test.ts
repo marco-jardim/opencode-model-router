@@ -524,6 +524,53 @@ describe("native v2 child runner", () => {
 });
 
 describe("native v2 child runner: resuming a child (Phase 2.3, D11)", () => {
+  it("R3-4. a superseded run's late rejection neither interrupts nor unregisters its resumed round", async () => {
+    const { runtime, toolContext, execute, context } = fixture();
+    let rejectOld!: (error: Error) => void;
+    const late = new Promise<never>((_resolve, reject) => { rejectOld = reject; });
+    let finish!: () => void;
+    const gate = new Promise<void>((resolve) => { finish = resolve; });
+    let ready!: () => void;
+    const started = new Promise<void>((resolve) => { ready = resolve; });
+    let resumedSignal: AbortSignal | undefined;
+    execute.mockImplementationOnce(async (_input, native) => {
+      await native.progress({ sessionID: "child", status: "running" });
+      ready();
+      return late;
+    });
+    execute.mockImplementationOnce(async (_input, native) => {
+      resumedSignal = native.signal;
+      await gate;
+      native.signal.throwIfAborted();
+      return { output: { sessionID: "child", status: "completed", output: "done" } };
+    });
+    const old = runtime.withToolContext(toolContext, () => runtime.childRunner.run({
+      prompt: "first", system: "old round", onCreated: async () => {},
+    })).catch((error: unknown) => error);
+    await started;
+    const resumed = runtime.withToolContext(toolContext, () => runtime.childRunner.run({
+      prompt: "continue", resumeSessionID: "child", system: "new round", onCreated: async () => {},
+    })).catch((error: unknown) => error);
+    try {
+      await vi.waitFor(() => { expect(resumedSignal).toBeDefined(); });
+      rejectOld(new Error("late rejection"));
+      await old;
+      expect(context.session.interrupt).not.toHaveBeenCalled();
+      expect(resumedSignal?.aborted).toBe(false);
+      const system: SessionContext["system"] = [];
+      runtime.applyChildSystem("child", system);
+      expect(system).toEqual([{ type: "text", text: "new round" }]);
+      // A real client abort still finds the resumed controller: old.finally did not remove its registration.
+      await runtime.client.session.abort({ path: { id: "child" } });
+      expect(resumedSignal?.aborted).toBe(true);
+    } finally {
+      rejectOld(new Error("cleanup"));
+      finish();
+      await Promise.all([old, resumed]);
+      await runtime.dispose();
+    }
+  });
+
   it.each(["failed", "aborted", "timeout"])("R2-2: a named %s result confirms the resumed attempt without progress", async (status) => {
     const { runtime, toolContext, execute } = fixture();
     const onConfirmed = vi.fn(async () => {});

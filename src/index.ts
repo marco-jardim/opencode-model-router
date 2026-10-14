@@ -133,6 +133,7 @@ import {
 } from "./router/sessions";
 import type { Cap, SubagentState } from "./router/sessions";
 import { EXECUTOR_READ_CAP_LINE, type ExecutorChildGuardPort } from "./executor/types";
+import { executorChildRound, publishExecutorChildRound } from "./executor/child-guards";
 import { createTrajectoryStore } from "./telemetry/trajectory";
 import { createGuardStore } from "./guard/store";
 import { createIdleTtlSweeper } from "./router/idle-sweep";
@@ -891,6 +892,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
    * its registered fallback model, P-1) and the bound dispatch budget.
    */
   const roleGuardProfileOf = (sessionID: unknown, agent: unknown): GuardProfile | undefined => {
+    if (typeof sessionID === "string") consumeExecutorChildRound(sessionID);
     const spec = roleSpecOf(agent) ?? roleOfSession(sessionID);
     if (spec === undefined || typeof sessionID !== "string") return undefined;
     const routed = routedGuardOf(sessionID);
@@ -899,8 +901,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       profile = roleGuardProfile(spec, routed.tier, routed.routeBudget);
     } else {
       const record = lookupDispatch(sessionID);
-      const tier = record?.agent === spec.agent && typeof record.tier === "string" && record.tier !== "" ? record.tier : spec.tierRange.floor;
-      profile = roleGuardProfile(spec, tier, currentBinding(sessionID, { maxOf: roleMaxOf })?.budget ?? null);
+      const binding = currentBinding(sessionID, { maxOf: roleMaxOf });
+      const tier = binding?.plan !== undefined && binding.tier !== undefined ? binding.tier
+        : record?.agent === spec.agent && typeof record.tier === "string" && record.tier !== "" ? record.tier : spec.tierRange.floor;
+      profile = roleGuardProfile(spec, tier, binding?.budget ?? null);
     }
     // QA-G-A3-2-2 (§2.6): the cumulative limit spans the child's rounds, so it follows the LARGEST round budget the child had
     // (a later round with a smaller budget never shrinks it below what earlier rounds were allowed).
@@ -1330,7 +1334,10 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   // #84 P2.1: the v2 adapter's role path reads the bypass state (the router gate does not run while bypassed, S10/P-9).
   (ctx as RouterPluginInput & { routerOnBypassState?: (read: () => boolean) => void }).routerOnBypassState?.(() => bypassed);
   /** QA-P21-1-3: the budget snapshot of a role child as the signals AND the adapter's budget notice read it (guard + read cap). */
-  const roleBudgetSnapshot = (childSessionID: string) => captureBudget(childSessionID, sessionStore.readCapReached(childSessionID));
+  const roleBudgetSnapshot = (childSessionID: string) => {
+    consumeExecutorChildRound(childSessionID);
+    return captureBudget(childSessionID, sessionStore.readCapReached(childSessionID));
+  };
   (ctx as RouterPluginInput & { routerOnBudgetSnapshot?: (read: typeof roleBudgetSnapshot) => void }).routerOnBudgetSnapshot?.(roleBudgetSnapshot);
   /**
    * QA-G-A3-2 (§2.9 E6, R7 REFUSAL_CAP): a role child's call refused where the guard's before-hook never sees it — the v2
@@ -1735,6 +1742,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
   };
   /** A fresh role child's first call: its exact binding names the dispatch's call, whose cap is registered once. */
   const applyPendingRoleCap = (child: string): void => {
+    consumeExecutorChildRound(child);
     if (pendingRoleCaps.size === 0) return;
     const binding = currentBinding(child, { maxOf: roleMaxOf });
     const callID = binding?.kind === "exact" ? binding.candidates[0] : undefined;
@@ -1749,9 +1757,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
    * cumulative ceiling stays. A cap the launch prompt names replaces the child's previous one.
    */
   const beginExecutorResumeRound = (child: string, agent: string, prompt: string): void => {
-    guardStore.beginDispatch(child);
-    const cap = executorLineCap(prompt);
-    if (!sessionStore.resumeRoleSession(child, cap) && cap !== null) registerRoleCap(child, agent, cap);
+    publishExecutorChildRound(child, agent, executorLineCap(prompt), true);
+    consumeExecutorChildRound(child);
   };
   /**
    * QA-PDF21-2-20: the read cap of a plan child's launch prompt is the executor's own cap line ONLY (`EXECUTOR_READ_CAP_LINE`,
@@ -1767,8 +1774,19 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
    * reaches it, and its role agent is no tier, so `registerFromChatMessage` does not either.
    */
   const applyExecutorChildCap = (child: string, agent: string, prompt: string): void => {
-    const cap = executorLineCap(prompt);
-    if (cap !== null) registerRoleCap(child, agent, cap);
+    publishExecutorChildRound(child, agent, executorLineCap(prompt), false);
+    consumeExecutorChildRound(child);
+  };
+  const executorRoundsSeen = new Map<string, number>();
+  const consumeExecutorChildRound = (child: string): void => {
+    if (!isV2Host) return;
+    const published = executorChildRound(child);
+    if (published === undefined || executorRoundsSeen.get(child) === published.round) return;
+    setBounded(executorRoundsSeen, child, published.round);
+    rememberRoleSession(child, published.agent);
+    sessionStore.markChildSession(child);
+    guardStore.beginDispatch(child);
+    if (!sessionStore.resumeRoleSession(child, published.cap) && published.cap !== null) registerRoleCap(child, published.agent, published.cap);
   };
   // QA-PDF21-2-11/-20: the v2 adapter's executor bookkeeping reaches the guard store and the read-cap state through these.
   (ctx as RouterPluginInput & { routerOnExecutorChildGuard?: (port: ExecutorChildGuardPort) => void }).routerOnExecutorChildGuard?.({
@@ -2766,6 +2784,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     // non-subagent sessions or when enforcement is off (GA-1 preserved).
     // -----------------------------------------------------------------------
     "tool.execute.before": async (input: any, output: any) => {
+      if (typeof input?.sessionID === "string") consumeExecutorChildRound(input.sessionID);
       rememberTaskArgs(input, output); // phase 2.1 (v2 only; a no-op on v1)
       // #84 P2.1: a role child's own call names its role agent (the v2 adapter passes the calling agent). Remembered even while
       // bypassed (the work-root resolver and the authority tool are authority, not routing), and marked a child session: role
@@ -2958,6 +2977,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     // treats them as ground truth rather than advisory system noise.
     // -----------------------------------------------------------------------
     "tool.execute.after": async (input: any, output: any) => {
+      if (typeof input?.sessionID === "string") consumeExecutorChildRound(input.sessionID);
       if (input?.tool === "grep" && typeof output.output === "string") {
         const tier = input.agent ?? pluginAgentSessions.get(input.sessionID) ?? sessionStore.getTier(input.sessionID);
         const definition = tier && getActiveTiers(cfg)[tier];

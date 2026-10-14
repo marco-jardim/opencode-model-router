@@ -2422,7 +2422,7 @@ describe("plan lifecycle methods (status, ready, done, land, answer, gc, exportP
     expect(answers).toEqual(["Q-1=yes"]);
   });
 
-  it("gc hands the slot pool a predicate: attached plans by status, stored plans by ledger, unknown plans as null", async () => {
+  it("gc's predicate refuses detached plans without save preflight, even when their stored status is terminal", async () => {
     const h = await mk(planOf([manualTask("M1")]));
     await h.begin();
     expect(await h.runtime.gc()).toEqual({ removed: [], reported: [] });
@@ -2433,12 +2433,35 @@ describe("plan lifecycle methods (status, ready, done, land, answer, gc, exportP
     await h.runtime.abort(PLAN_ID, ORCH);
     expect(await isDone(PLAN_ID)).toBe(true);
     await h.runtime.dispose();
-    expect(await isDone(PLAN_ID)).toBe(true); // not attached any more: read from the store
+    expect((await h.store.read(PLAN_ID)).status).toBe("aborted");
+    // This old predicate cannot authorize collection from status alone: a new gc must reopen the plan and retry
+    // any durable holds first. The ledger read still distinguishes an unknown plan and propagates I/O failures.
+    expect(await isDone(PLAN_ID)).toBe(false);
 
     h.store.read = async () => {
       throw new Error("io failure");
     };
     await expect(isDone(PLAN_ID)).rejects.toThrow("io failure");
+  });
+
+  it("gc's retained predicate protects a rebuilt hold after the attached plan becomes terminal", async () => {
+    const h = await mk(planOf([manualTask("M1")]));
+    await h.begin();
+    const hold = await h.parts().policy.raise({
+      kind: "failure", severity: "blocking", taskId: null, options: [],
+      text: "the work in slot slot-1 could not be saved before its release (abort); fix the slot's git state",
+    });
+    h.slots.get = async () => { throw new Error("slot marker unavailable"); };
+    await h.restart(); // No in-memory wip-hold state is carried into this runtime.
+    expect(await h.runtime.gc()).toEqual({ removed: [], reported: [] });
+    const isDone = need(h.slots.gcPredicate, "gc predicate");
+    await h.runtime.abort(PLAN_ID, ORCH);
+    expect(h.ledger().status).toBe("aborted");
+    expect(h.ledger().inbox).toContainEqual(hold);
+    expect(await isDone(PLAN_ID)).toBe(false); // Idle and terminal, but the save still cannot run.
+    expect(h.slots.released).toEqual([]);
+    await expect(h.runtime.gc()).rejects.toMatchObject({ code: "E_PLAN_STATE", message: expect.stringContaining("slot-1") });
+    expect(h.ledger().inbox).toEqual([hold]);
   });
 
   it("exportPlan returns the snapshot and the merged events as JSON", async () => {
@@ -4223,12 +4246,16 @@ describe("branch top-up: board, manual kinds, abort leftovers, restart, host fee
     await h.begin();
     await h.running("T1", 1, "ses-c1");
     await h.restart();
+    expect(h.slots.released).toEqual([]);
     await h.runtime.abort(PLAN_ID, ORCH);
     expect(h.state("T1")).toBe("cancelled");
     expect(h.task("T1").slot).toBeNull();
     expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "interrupted" });
     expect(h.slots.released).toEqual(["slot-1"]);
     expect(h.log.some((l) => l.startsWith("launcher.cancel"))).toBe(false);
+    await h.settled();
+    // Collection must not retry a reconstructed hold that abort already saved and released.
+    expect(h.slots.released).toEqual(["slot-1"]);
   });
 
   it("a slot record that is gone at restart rebuilds the task without a tree: no lease re-taken, nothing raised", async () => {

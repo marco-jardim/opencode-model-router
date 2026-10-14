@@ -41,7 +41,7 @@ import {
  * absent: none named); `prompt` is the launch prompt, whose cap line sets the child's read cap (a resume's names none).
  */
 export type PlanBindInput = Parameters<RoleBindings["bind"]>[0] & {
-  planId: PlanId; taskId: TaskId; attempt: number; budget?: number | null; prompt?: string;
+  planId: PlanId; taskId: TaskId; attempt: number; budget?: number | null; prompt?: string; tier?: string;
 };
 
 /**
@@ -432,6 +432,7 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
     d.bindings.bind({
       childSessionID: child, role: req.role, agent: req.route.agent, workRoot: req.workRoot, grant: [...req.grant],
       planId: req.planId, taskId: req.taskId, attempt: req.attempt, prompt: req.prompt,
+      ...(req.route.tier === undefined ? {} : { tier: req.route.tier }),
       // QA-PDF21-2-20: the route `budget=` guards the plan child as it guards a routed role child (absent: kept on a re-bind).
       ...(req.routeBudget !== undefined ? { budget: req.routeBudget } : {}),
     });

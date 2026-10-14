@@ -2029,6 +2029,70 @@ describe("P3.3 global QA round 1 (fix-5)", () => {
 // ---------------------------------------------------------------------------
 
 describe("P3.3 global QA round 2 (fix-8)", () => {
+  it("R3-3. the slot-location plugin consumes the owner's cap and each resumed guard round exactly once", async () => {
+    const { bindPlanChild } = await import("../../src/routing/roles/binding");
+    const { EXECUTOR_READ_CAP_LINE } = await import("../../src/executor/types");
+    const { dir, cfg } = home(ROLES, { MODEL_ROUTER_ENFORCE: "1" });
+    const slotDir = temp("omr-plan-slot-location-");
+    let ownerGuard: import("../../src/executor/types").ExecutorChildGuardPort | undefined;
+    await plugin(dir, "v2", { routerOnExecutorChildGuard: (port: NonNullable<typeof ownerGuard>) => { ownerGuard = port; } });
+    const { hooks } = await plugin(slotDir);
+    const child = "plan-cross-location";
+    const role = resolveRoles(cfg, "v2").get("explorer")!;
+    const budget = role.budget.fast!;
+    const cap = Number(/CAP:(\d+)/.exec(EXECUTOR_READ_CAP_LINE)?.[1]);
+    expect(cap).toBeGreaterThan(0);
+    bindPlanChild({ childSessionID: child, role: role.agent, agent: role.agent, tier: "fast", budget,
+      planId: "plan-locations", taskId: "T1", attempt: 1, workRoot: slotDir, grant: ["read"] });
+    ownerGuard!.applyCap(child, role.agent, `PLAN CONTEXT\n${EXECUTOR_READ_CAP_LINE}\nrest of task`);
+    let n = 0;
+    const read = async (): Promise<string> => {
+      const callID = `cross-${++n}`;
+      const args = { filePath: join(slotDir, `${n}.ts`) };
+      await hooks["tool.execute.before"]({ tool: "read", sessionID: child, agent: role.agent, callID }, { args });
+      const output = { title: "", output: "contents", metadata: {} };
+      await hooks["tool.execute.after"]({ tool: "read", sessionID: child, agent: role.agent, callID, args }, output);
+      return output.output;
+    };
+    expect(await read()).toContain(`[cap: 1/${cap}]`);
+    for (let i = 1; i < budget; i++) {
+      const output = await read();
+      if (i + 1 === cap) expect(output).toContain(`CAP REACHED (${cap}/${cap})`);
+    }
+    await expect(read()).rejects.toThrow(`tool-call budget ${budget} exhausted`);
+    ownerGuard!.beginResumeRound(child, role.agent, "continue and finish");
+    expect(await read()).toContain(`[cap: 1/${cap}]`);
+    expect(await read()).toContain(`[cap: 2/${cap}]`);
+    for (let i = 2; i < budget; i++) await read();
+    await expect(read()).rejects.toThrow(`tool-call budget ${budget} exhausted`);
+  });
+
+  it.each(["medium", "heavy"])("R3-5. a %s plan child uses its resolved tier's budget= and cumulative ceiling", async (tier) => {
+    const { bindPlanChild } = await import("../../src/routing/roles/binding");
+    const { dir, cfg } = home(ROLES, { MODEL_ROUTER_ENFORCE: "1" });
+    let guard: { beginResumeRound(child: string, agent: string, prompt: string): void } | undefined;
+    const { hooks } = await plugin(dir, "v2", { routerOnExecutorChildGuard: (port: NonNullable<typeof guard>) => { guard = port; } });
+    const role = resolveRoles(cfg, "v2").get("implementer")!;
+    const budget = role.budget[tier]! * 2;
+    const child = `plan-tier-${tier}`;
+    bindPlanChild({ childSessionID: child, role: role.agent, agent: role.agent, tier, budget,
+      planId: "plan-tier", taskId: "T1", attempt: 1, workRoot: dir, grant: ["edit"] });
+    for (let round = 0; round < 3; round++) {
+      if (round > 0) guard!.beginResumeRound(child, role.agent, "continue and finish");
+      for (let i = 0; i < budget; i++) {
+        const args = { filePath: join(dir, `tier-${round}-${i}.ts`), oldString: "a", newString: "b" };
+        const callID = `${child}-${round}-${i}`;
+        await hooks["tool.execute.before"]({ tool: "edit", sessionID: child, agent: role.agent, callID }, { args });
+        await hooks["tool.execute.after"]({ tool: "edit", sessionID: child, agent: role.agent, callID, args }, { title: "", output: "edited", metadata: {} });
+      }
+      await expect(hooks["tool.execute.before"]({ tool: "edit", sessionID: child, agent: role.agent, callID: `${child}-${round}-stop` },
+        { args: { filePath: join(dir, "last.ts") } })).rejects.toThrow(`tool-call budget ${budget} exhausted`);
+    }
+    guard!.beginResumeRound(child, role.agent, "continue and finish");
+    await expect(hooks["tool.execute.before"]({ tool: "edit", sessionID: child, agent: role.agent, callID: `${child}-stop` },
+      { args: { filePath: join(dir, "last.ts") } })).rejects.toThrow(`cumulative tool-call budget ${budget * 3} exhausted`);
+  });
+
   it("QA-G-A3-2-2: resumes without budget= keep the fresh dispatch's budget= raise; the cumulative limit follows the largest round", async () => {
     const { dir, cfg } = home(ROLES, { MODEL_ROUTER_ENFORCE: "1" });
     const { hooks } = await plugin(dir);
