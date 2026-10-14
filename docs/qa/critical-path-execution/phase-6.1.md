@@ -35,7 +35,10 @@ Run by the orchestrator on `cpx/main` at `39067ce` (2026-10-13), before approve.
 - **A-DF2-2:** 6.1.2 keeps its directory `Writes:` (the fixture set is not known in advance); it writes ⊤ and runs after
   6.1.1 instead of in parallel. Recorded as a makespan caveat in the 6.1.4 metrics.
 
-## Progress — 2026-10-14 (fallback; not accepted)
+## Historical progress — 2026-10-14 (fallback; not accepted)
+
+The dated entries in this section are historical snapshots. See **Current status** below for the committed corrections,
+round 2 review outcome and outstanding gates; earlier uncommitted/pending statements are not current status.
 
 The owner selected the fallback on **2026-10-13**. **G13 remains unmet** and must be disclosed in the Phase 6.2 PR.
 The pre-flight and amendments above are historical evidence, not a statement that the current worktree is clean:
@@ -73,7 +76,7 @@ the current state is dirty and in progress, with Phase 6.1 acceptance still unre
 - Detached **6.1.4's three green runs at the committed integration head**, **6.1.5 documentation**, and
   **final heavy phase QA** remain pending. The G13 disclosure and Phase 6.2 full-suite obligations above are unchanged.
 
-### Latest progress update — 2026-10-14 (round 1 remediation; not accepted)
+### Round 1 remediation snapshot — 2026-10-14 (historical; not accepted)
 
 This supersedes the in-progress Run 9 and QA-round-1 snapshots above; those entries remain historical evidence.
 
@@ -148,3 +151,28 @@ This supersedes the earlier rebase-fix status: **implementation is complete**, w
 - **Commits for the corrections, fresh smoke evidence and heavy product-correction QA round 2 remain pending.**
   Run 9's initiating cause remains unknown; the other phase gates, G13 disclosure and deferred full-suite obligations
   are unchanged. **Phase 6.1 is still not complete or accepted.**
+
+## Current status — 2026-10-14 (after round 2 review; not accepted)
+
+This supersedes the historical uncommitted/pending status above; those snapshots and their reported check results are
+retained as evidence, not as validation of the remaining round 2 fixes.
+
+- **Committed corrections and notes:** **`4f98c05`** (shared leases), **`7cdb4f4`** (explicit writer grants and CI-slot
+  resolution), **`ffb0475`** (rebase diagnostics), and **`183b984`** (documentation notes). These are existing commits,
+  not pending work.
+- **Heavy product-correction QA round 2 reviewed `183b984`** and verified that the original **one P1 and two P2s were
+  resolved**. It raised four new findings; this was **not a green review or final phase QA**:
+  - **P1 — configured command substitution:** implementation in progress; scoped validation remains pending.
+  - **P2 — scoped override loss:** implementation in progress; scoped validation remains pending.
+  - **P2 — URL credentials in diagnostic keys:** implementation in progress; scoped validation remains pending.
+  - **P3 — stale committed-status documentation:** addressed by this current-status correction. This does not validate
+    any of the three code fixes above.
+- **Remaining product work** is the three round 2 code fixes above, their scoped checks and follow-up review, and fresh
+  smoke evidence. All round 2 findings must be fixed; subsequent QA loops are limited to major/critical blocking issues.
+  No new test results, timings or green smoke result are claimed by this documentation-only edit.
+- **Run 9's initiating cause remains unknown** because its original stderr was lost; the committed rebase diagnostics
+  and targeted regression checks do not establish that cause. **Product automatic-verification timeouts remain
+  unresolved.**
+- **6.1.3 remains unfinished.** Detached **6.1.4's three green runs at the committed integration head**, **6.1.5
+  documentation**, and **final heavy phase QA** remain pending. **G13 remains unmet**; the Phase 6.2 PR disclosure and
+  deferred full-suite obligations are unchanged. **Phase 6.1 is not complete or accepted.**
