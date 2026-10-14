@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { pidAlive, removeDirWhenReleased, waitUntil } from "../../helpers/remove-dir";
 import { EVIDENCE_DIR, OPENAI_PROVIDER, ROOT, RoutingHost, arr, evidenceDir, jsonl, obj, str, waitFor, type HostOptions, type Obj } from "./routing-host";
+import { CpxTimings } from "./cpx-timing";
 
 const redirect = vi.hoisted(() => ({ executable: "", script: "" }));
 vi.mock("node:child_process", async importOriginal => {
@@ -234,6 +235,30 @@ it("a restarted host is not satisfied by the previous child's 'server listening'
 }, 60_000);
 
 // ------------------------------------------------------------- evidenceDir ----
+it("opt-in timing observes setup/launch and captures diagnostics before cleanup, including boot failure", async () => {
+  const timing = new CpxTimings();
+  const captures: { point: string; root: string; marker: string }[] = [];
+  const diagnostics: NonNullable<HostOptions["diagnostics"]> = { timing, collect: async (host, point) => {
+    captures.push({ point, root: host.root, marker: await readFile(path.join(host.project, "marker"), "utf8") });
+    if (point === "after-kill") throw new Error("Diagnostic failure must not prevent scratch cleanup");
+  } };
+  const host = await startHost("diagnostic", { diagnostics, prepare: async ({ project }) => { await writeFile(path.join(project, "marker"), "retained"); } });
+  await host.stop();
+  expect(timing.records.map(row => row.point)).toEqual(expect.arrayContaining(["host.boot.start", "host.prepare.start", "host.prepare.end", "host.spawn.start", "host.listening.observed", "host.catalog.start", "host.catalog.end", "host.launch.end", "host.boot.end"]));
+  expect(captures.map(capture => capture.point)).toEqual(["before-stop", "after-kill"]);
+  expect(captures.every(capture => capture.marker === "retained" && !existsSync(capture.root))).toBe(true);
+  expect(timing.records.some(row => row.point === "host.diagnostics.capture-failed")).toBe(true);
+  expect(JSON.stringify(timing)).not.toMatch(/authorization|password|Basic /i);
+
+  await expect(RoutingHost.start("diagnostic-failed", { diagnostics, prepare: async ({ project }) => {
+    await writeFile(path.join(project, "marker"), "boot failure retained");
+    throw new Error("prepare failed");
+  } })).rejects.toThrow("prepare failed");
+  expect(captures.slice(2).map(capture => capture.point)).toEqual(["before-stop", "after-kill"]);
+  expect(captures.slice(2).every(capture => capture.marker === "boot failure retained" && !existsSync(capture.root))).toBe(true);
+  expect(timing.records.filter(row => row.point === "host.boot.end").at(-1)).toMatchObject({ ok: false });
+}, 30_000);
+
 it("evidenceDir(): the default without OMR_SMOKE_EVIDENCE_DIR (unset or empty), the override when absolute, an error when relative", () => {
   delete process.env.OMR_SMOKE_EVIDENCE_DIR;
   expect(evidenceDir()).toBe(EVIDENCE_DIR);

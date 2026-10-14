@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **CPX e2e smoke diagnostics:** bounded wrapper/child-command timings and host/setup/launch checkpoints are
+  retained with failure evidence before scratch cleanup. These are diagnostic observations only; executor
+  behavior, offline checks and G1–G12 bounds are unchanged.
 - **OpenCode v2: `/router stats` shows a "Dispatch durations" table and an "Orchestrator cache-read share" line** when
   timing logs exist. The logs are written once the router wires the timing recorder.
 - **OpenCode v2: background dispatch.** A subagent dispatch whose predicted duration is long runs in the background
@@ -82,6 +85,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CPX e2e smoke throughput checks follow the strict G8 contract:** provider delays and the independent CP/W
+  oracle use authored fixture milliseconds, makespan has no additive slack, and idle with ready work is capped at
+  10,000 ms. Existing watchdogs, run budgets and wait/test timeouts are unchanged.
 - **OpenCode v2: malformed shared lease registry entries no longer disable enforcement.** Entries are validated
   individually; an invalid entry is refused without replacing it or disturbing valid registries. If the registry cannot
   start with leases enforced, lease-checked file, search, git and run tools are refused instead of bypassing enforcement.

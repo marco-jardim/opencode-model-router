@@ -23,6 +23,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { CpxFront, type CpxProviderOptions } from "./cpx-scripted-provider";
 import { listenOnFetchSafePort, pickFetchSafePort } from "./fetch-safe-port";
+import type { CpxTimings } from "./cpx-timing";
 import { DEFAULT_OUTCOME_TUNING, acquireOutcomes, type OutcomeKey } from "../../../src/routing/outcomes";
 import type { DecisionRow, LogRow, OutcomeEntrySnapshot } from "../../../src/routing/outcomes/types";
 
@@ -667,6 +668,8 @@ export interface HostOptions {
   readonly longPaths?: boolean;
   /** Runs once the (empty) project directory exists and BEFORE the host process starts: e.g. a git repository whose worktrees the router lists at role-agent registration (plugin start). */
   readonly prepare?: (dirs: { readonly root: string; readonly project: string }) => Promise<void>;
+  /** Opt-in smoke-only timestamps. Capture also runs on boot failure, before stop and after kill/before scratch removal. */
+  readonly diagnostics?: { readonly timing: CpxTimings; readonly collect: (host: RoutingHost, point: "before-stop" | "after-kill") => Promise<void> };
   /** Issue #84 P3.1: load {@link PRE_PROBE_PLUGIN} BEFORE the router with this configuration (written to a JSON file it reads). */
   readonly preProbe?: {
     /** The router's context hook fails once for a session whose title contains this (I9 catalog failure). */
@@ -737,6 +740,7 @@ export class RoutingHost {
   private child?: ChildProcess;
   private output = "";
   private teardown?: Promise<Teardown>;
+  private launches = 0;
   /** What `launch()` needs again on `restart()`: fixed at the first boot (config files, env dirs, probe/pre-probe locations). */
   private plan?: { executable: string; env: Record<string, string | undefined>; probeConfig: string; preProbe?: string; preProbeConfig: string };
 
@@ -753,7 +757,8 @@ export class RoutingHost {
     const root = options.longPaths ? realpathSync.native(made) : made;
     const host = new RoutingHost(root, options);
     liveHosts.add(host);
-    try { return await host.boot(); } catch (error) { await host.stop().catch(() => undefined); throw error; }
+    try { return await (options.diagnostics ? options.diagnostics.timing.span("host.boot", () => host.boot()) : host.boot()); }
+    catch (error) { await host.stop().catch(() => undefined); throw error; }
   }
 
   /** Router override file: the smoke preset + the caller's overrides; `routing.outcomes.path` is forced to the temp store. */
@@ -779,9 +784,13 @@ export class RoutingHost {
   }
 
   private async boot(): Promise<this> {
+    const timing = this.options.diagnostics?.timing;
+    timing?.mark("host.executable.start");
     const executable = v2Executable();
     const version = spawnSync(executable, ["--version"], { encoding: "utf8", timeout: 15_000, windowsHide: true });
     if (!/^(?:opencode v)?2\./.test(version.stdout.trim())) throw new Error(`not an OpenCode 2 executable: ${version.stdout} ${version.stderr}`);
+    timing?.mark("host.executable.end");
+    timing?.mark("host.environment.start");
     const env: Record<string, string | undefined> = {};
     for (const [name, value] of Object.entries(process.env)) if (ENV_ALLOWLIST.has(name.toUpperCase())) env[name] = value;
     for (const [name, dir] of Object.entries({ HOME: "home", USERPROFILE: "home", XDG_CONFIG_HOME: "config", XDG_DATA_HOME: "data", XDG_CACHE_HOME: "cache", XDG_STATE_HOME: "state", APPDATA: "appdata", LOCALAPPDATA: "localappdata", TEMP: "tmp", TMP: "tmp", TMPDIR: "tmp" })) {
@@ -790,7 +799,11 @@ export class RoutingHost {
     }
     this.project = path.join(this.root, "project");
     await mkdir(this.project, { recursive: true });
+    timing?.mark("host.environment.end");
+    timing?.mark("host.prepare.start");
     if (this.options.prepare) await this.options.prepare({ root: this.root, project: this.project });
+    timing?.mark("host.prepare.end");
+    timing?.mark("host.config.start");
     await mkdir(this.outcomes, { recursive: true });
     const probe = path.join(this.root, "probe-plugin");
     await mkdir(probe, { recursive: true });
@@ -811,8 +824,10 @@ export class RoutingHost {
     }
     if (this.options.seed && this.options.seed.length > 0) await seedOutcomes(this.outcomes, this.options.seed);
     await this.writeOverrides();
+    timing?.mark("host.provider.start");
     const innerURL = await this.provider.start();
     const baseURL = this.front ? await this.front.start(innerURL) : innerURL;
+    timing?.mark("host.provider.end");
     const root = this.options.rootModel ?? ROOT_MODEL;
     const configDir = path.join(env.XDG_CONFIG_HOME!, "opencode");
     await mkdir(configDir, { recursive: true });
@@ -824,12 +839,16 @@ export class RoutingHost {
       ...obj(typeof this.options.hostConfig === "function" ? this.options.hostConfig(this.root) : this.options.hostConfig),
     }));
     this.plan = { executable, env, probeConfig, preProbe, preProbeConfig };
+    timing?.mark("host.config.end");
     await this.launch();
     return this;
   }
 
   /** Spawns the host process with the fixed {@link plan} and waits until it listens and its plugins are active: a NEW password, port, client and authorization each time. Writes no config file and truncates no log. */
   private async launch(): Promise<void> {
+    const timing = this.options.diagnostics?.timing;
+    const launch = ++this.launches;
+    timing?.mark("host.launch.start", { launch });
     const { executable, env, probeConfig, preProbe, preProbeConfig } = this.plan!;
     const password = randomBytes(24).toString("base64url");
     Object.assign(env, {
@@ -845,25 +864,35 @@ export class RoutingHost {
     if (leaked.length > 0) throw new Error(`credential-shaped variable(s) would reach the host: ${leaked.join(",")}`);
     this.port = await pickFetchSafePort();
     const outputFrom = this.output.length; // `output` accumulates across children: only this child's lines can announce its address
+    timing?.mark("host.spawn.start", { launch });
     const child = spawn(executable, ["serve", "--hostname", "127.0.0.1", "--port", String(this.port), "--print-logs"], { cwd: this.project, env, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
     this.child = child;
+    timing?.mark("host.spawn.returned", { launch, pid: child.pid });
     child.stdout!.on("data", chunk => { this.output += chunk; });
     child.stderr!.on("data", chunk => { this.output += chunk; });
     this.baseUrl = await waitFor("host to listen", () => {
       if (child.exitCode !== null) throw new Error(`OpenCode 2 exited early:\n${this.output}`);
       return /server listening on (http:\/\/127\.0\.0\.1:\d+)/.exec(this.output.slice(outputFrom))?.[1];
     }, 40_000);
+    timing?.mark("host.listening.observed", { launch });
     this.authorization = basic("opencode", password);
+    timing?.mark("host.client.start", { launch });
     this.client = await loadClient(this.baseUrl, this.authorization);
+    timing?.mark("host.client.end", { launch });
+    timing?.mark("host.catalog.start", { launch });
     await this.client.agent.list(); // a catalog read starts the native plugin graph
+    timing?.mark("host.catalog.end", { launch });
     const wanted = [...(preProbe ? ["routing-smoke-preprobe"] : []), ...(this.options.withoutRouter ? ["routing-smoke-probe"] : ["opencode-model-router", "routing-smoke-probe"])];
     for (const id of wanted) {
+      timing?.mark("host.plugin.wait.start", { launch, plugin: id });
       const state = await waitFor(`${id} plugin state`, async () => {
         const found = (await this.client.plugin.list()).data.find(p => p.id === id)?.state;
         return found && (found.status === "active" || found.status === "failed") ? found : undefined;
       }, 40_000);
       if (state.status !== "active") throw new Error(`${id} plugin is ${state.status}: ${state.error ?? ""}\n${this.output}`);
+      timing?.mark("host.plugin.wait.end", { launch, plugin: id });
     }
+    timing?.mark("host.launch.end", { launch });
   }
 
   /**
@@ -905,9 +934,16 @@ export class RoutingHost {
   }
 
   stop(): Promise<Teardown> { return this.teardown ??= this.doStop(); }
+  private async collectDiagnostics(point: "before-stop" | "after-kill"): Promise<void> {
+    const diagnostics = this.options.diagnostics;
+    if (!diagnostics) return;
+    try { await diagnostics.timing.span(`host.diagnostics.${point}`, () => diagnostics.collect(this, point)); }
+    catch { diagnostics.timing.mark("host.diagnostics.capture-failed", { stage: point }); } // Never prevent process cleanup.
+  }
   private async doStop(): Promise<Teardown> {
     const child = this.child;
     const pid = child?.pid;
+    if (this.options.diagnostics) await this.collectDiagnostics("before-stop");
     // Every session id this host ever created, from its own event log (the session list misses children the runner already deleted), plus what it holds now.
     try {
       for (const e of await this.rawEvents()) {
@@ -921,6 +957,7 @@ export class RoutingHost {
     const { method, taskkill } = await this.killChild();
     const frontStopped = this.front ? await this.front.stop().then(() => true, () => false) : true;
     const providerStopped = (await this.provider.stop().then(() => true, () => false)) && frontStopped;
+    if (this.options.diagnostics) await this.collectDiagnostics("after-kill");
     const hostPortClosed = this.port === 0 ? true : await waitFor("host port to close", async () => (await portOpen(this.port)) ? undefined : true, 10_000, 200).catch(() => false);
     liveHosts.delete(this);
     const rootRemoved = await rm(this.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }).then(() => !existsSync(this.root), () => false);
