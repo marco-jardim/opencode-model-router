@@ -2,6 +2,8 @@
 // Plan task 4.2.5: restart recovery (`recoverPlan`), R1a probation watch, integration resume per activation, D11 trailer.
 import { rm } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
+import { observeV2, type ObservationValue, type V2Observations } from "../compat/v2-observations";
+import { observeSchedulerLedger } from "./observations";
 import {
   capacityRestoreFromEvents,
   capacityView,
@@ -414,6 +416,7 @@ export interface PlanTaskVerifier extends SlotVerifier {
 }
 
 export interface RuntimeDeps {
+  observations?: V2Observations;
   store: LedgerStore;
   compiler: PlanCompiler;
   slots: SlotPool;
@@ -781,6 +784,14 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
   // ---------- plumbing
 
+  // Only copies existing facts. In particular NO readySet, gate, route, lease or capacity query here:
+  // capacity.snapshot/limit/free can lazily resume providers. Observing must never do that itself.
+  function observe(p: PlanRt, action: string, detail: () => ObservationValue = () => null): void {
+    observeV2(d.observations, () => ({ family: "scheduler", planId: p.planId, parentSessionID: p.writer.ledger.orchestrator.sessionID, action,
+      state: { clockMs: d.clock.now(), ledgerSeq: p.writer.ledger.seq, orchIdle: p.orchIdle, passive: p.passive,
+        recovering: p.recovering, disposed: p.disposed, latch: p.latch, inFlight: [...p.inFlight], tokens: [...p.tokens.keys()], detail: detail() } }));
+  }
+
   function track<T>(pr: Promise<T>): Promise<T> {
     pending.add(pr);
     const done = (): void => {
@@ -919,6 +930,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     p.tokens.delete(k);
     try {
       p.capacity.release(tok, result);
+      observe(p, "capacity-release", () => ({ taskId, attempt: n, token: tok.id, result }));
     } catch (e) {
       d.log("warn", "capacity release failed", errorText(e));
     }
@@ -1060,20 +1072,33 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     return {
       routeOf(task: TaskNode): TaskRoute {
         try {
-          return base.routeOf(task);
+          const route = base.routeOf(task);
+          observe(p, "route", () => ({ taskId: task.id, provider: route.provider, heavy: route.heavy }));
+          return route;
         } catch (e) {
           failed?.set(task.id, errorText(e));
+          observe(p, "route-unavailable", () => ({ taskId: task.id }));
           return { agent: task.route.role, model: { providerID: UNROUTABLE, modelID: UNROUTABLE, variant: null }, provider: UNROUTABLE, heavy: false };
         }
       },
       free(provider: string, heavy: boolean): number {
-        return provider === UNROUTABLE ? 0 : base.free(provider, heavy);
+        const free = provider === UNROUTABLE ? 0 : base.free(provider, heavy);
+        observe(p, "capacity-free", () => ({ provider, heavy, free }));
+        return free;
       },
     };
   }
 
   function readyOf(p: PlanRt, l: Readonly<LedgerV1>, failed: Map<TaskId, string> | null): ScheduledTask[] {
-    return d.scheduler.readySet(l, p.inFlight, p.leases, viewOf(p, failed));
+    const leases = d.observations === undefined ? p.leases : { holder(path: string) {
+      const holder = p.leases.holder(path);
+      observe(p, "lease-eligibility", () => ({
+        writers: Object.values(l.tasks).filter((t) => t.footprint.writes.includes(path)).map((t) => t.id),
+        holder: holder === null ? null : { planId: holder.planId, taskId: holder.taskId },
+      }));
+      return holder;
+    } };
+    return d.scheduler.readySet(l, p.inFlight, leases, viewOf(p, failed));
   }
 
   /** One backoff tick after a skipped launch step (QA-3.1-6): min(2^k * 1 s, 60 s), one timer per plan. */
@@ -1261,6 +1286,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   // ---------- tick
 
   function schedule(p: PlanRt): void {
+    observe(p, "schedule");
     // A passively attached (refused) plan never ticks (QA-3.1-19); an activation under way neither (4.2.5: recovery and
     // the integration resume come before the first tick, which `recoverPlan`/`activate` schedule themselves).
     if (p.disposed || disposed || p.passive || p.recovering) return;
@@ -1335,6 +1361,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       p.routeRaised = false;
     }
     const gate = d.launcher.gate(l.orchestrator.sessionID);
+    observe(p, "launch-gate", () => ({ ok: gate.ok, ready: ready.map((r) => r.taskId) }));
     if (ready.length === 0 || !gate.ok) {
       if (ready.length > 0 && !gate.ok && gate.wake !== null) await wakeOnce(p, gate.wake.reason, gate.wake.stateKey);
       updateIdle(p, ready, 0);
@@ -1350,6 +1377,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       const n = (own(l, item.taskId)?.attempts.length ?? 0) + 1;
       try {
         p.tokens.set(tokenKey(item.taskId, n), p.capacity.acquire(item.route.provider, item.route.heavy, item.taskId, n));
+        observe(p, "capacity-reserve", () => ({ taskId: item.taskId, attempt: n, provider: item.route.provider, heavy: item.route.heavy,
+          token: p.tokens.get(tokenKey(item.taskId, n))?.id ?? null, force: false }));
       } catch {
         counter(p, "launch-skipped", { reason: "capacity-race" });
         armBackoff(p);
@@ -1373,6 +1402,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
    */
   function startStep(p: PlanRt, taskId: TaskId, fn: () => Promise<"launched" | "skipped">, n: number): Promise<"launched" | "skipped"> {
     p.inFlight.add(taskId);
+    observe(p, "launch-prepare", () => ({ taskId, attempt: n }));
     const attemptsOf = (): number => own(p.writer.ledger, taskId)?.attempts.length ?? 0;
     const before = attemptsOf();
     const run = async (): Promise<"launched" | "skipped"> => {
@@ -1384,6 +1414,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       } finally {
         if (r !== "launched") releaseToken(p, taskId, n, "other");
         p.inFlight.delete(taskId);
+        observe(p, "launch-step-end", () => ({ taskId, attempt: n, result: r }));
       }
       if (r === "launched") launchSucceeded(p);
       else if (attemptsOf() !== before) schedule(p);
@@ -1477,6 +1508,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       }
       // 5. gate re-read (M29)
       const gate = d.launcher.gate(l.orchestrator.sessionID);
+      observe(p, "launch-gate", () => ({ taskId, attempt: n, ok: gate.ok }));
       if (!gate.ok) {
         await abandon();
         return "skipped";
@@ -1538,6 +1570,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       try {
         forgotten.delete(`${p.planId}/${taskId}#${n}`);
         await d.verifier.begin?.(own(p.writer.ledger, taskId) ?? t1, slot, attemptOf(p.writer.ledger, taskId, n), planTaskContext(p));
+        observe(p, "launch", () => ({ taskId, attempt: n, callID: ctx.callID, provider: route.provider, heavy: route.heavy }));
         handle = d.launcher.launch(req, launchHooks(p, taskId, n, route));
       } catch (e) {
         const code = errorCode(e);
@@ -1672,6 +1705,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
           if (adopting) {
             try {
               p.tokens.set(tokenKey(taskId, n), p.capacity.acquire(route.provider, route.heavy, taskId, n, { force: true }));
+              observe(p, "capacity-reserve", () => ({ taskId, attempt: n, provider: route.provider, heavy: route.heavy,
+                token: p.tokens.get(tokenKey(taskId, n))?.id ?? null, force: true }));
             } catch (e) {
               throw new ExecutorError("E_CAPACITY", errorText(e), taskId);
             }
@@ -2339,12 +2374,16 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     const cfg = writer.ledger.config;
     const seed: Record<string, CapacityProviderState> | undefined =
       events === null ? undefined : capacityRestoreFromEvents(events, { maxParallel: cfg.maxParallel, nowMs: d.clock.now() });
+    observeV2(d.observations, () => ({ family: "scheduler", planId, parentSessionID: writer.ledger.orchestrator.sessionID,
+      action: "capacity-init", state: { maxParallel: cfg.maxParallel, providers: Object.entries(seed ?? {}).map(([provider, s]) => ({ provider, ...s })) } }));
     return d.capacity({
       maxParallel: cfg.maxParallel,
       cooldownMs: cfg.capacityCooldownMs,
       pauseMs: cfg.capacityPauseMs,
       clock: d.clock,
       onMetric: (m) => {
+        observeV2(d.observations, () => ({ family: "scheduler", planId, parentSessionID: writer.ledger.orchestrator.sessionID,
+          action: "provider", state: { provider: m.provider, change: m.change, from: m.from, to: m.to, until: m.until } }));
         const target = p ?? plans.get(planId) ?? null;
         if (target !== null) metric(target, m);
       },
@@ -2504,7 +2543,21 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   async function build(writer: LedgerWriter, passive: boolean): Promise<PlanRt> {
     const planId = writer.planId;
     const ref: { p: PlanRt | null } = { p: null };
-    const leases = createLeaseService(planId, d.leaseRegistry);
+    const registry = d.leaseRegistry;
+    const leases = createLeaseService(planId, d.observations === undefined ? registry : {
+      holderOf: (path) => registry.holderOf(path),
+      acquireWrite(holder, writes) {
+        const result = registry.acquireWrite(holder, writes);
+        observeV2(d.observations, () => ({ family: "scheduler", planId, parentSessionID: writer.ledger.orchestrator.sessionID,
+          action: "lease-acquire", state: { taskRef: holder.taskRef, ok: result.ok } }));
+        return result;
+      },
+      releaseTask(taskRef) {
+        registry.releaseTask(taskRef);
+        observeV2(d.observations, () => ({ family: "scheduler", planId, parentSessionID: writer.ledger.orchestrator.sessionID,
+          action: "lease-release", state: { taskRef } }));
+      },
+    });
     const waker = createWaker({
       writer,
       hosts: d.hosts,
@@ -2579,6 +2632,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     carriedHandles.delete(planId);
     ref.p = p;
     plans.set(planId, p);
+    observeSchedulerLedger(d.observations, writer.ledger, "attach");
+    observe(p, "runtime-attach");
     return p;
   }
 
@@ -2590,6 +2645,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
    */
   async function activate(p: PlanRt, existing: boolean): Promise<void> {
     p.recovering = true;
+    observe(p, "activation");
     try {
       const l = p.writer.ledger;
       p.unpin?.();
@@ -2599,6 +2655,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       else await resumeIntegration(p);
     } finally {
       p.recovering = false;
+      observe(p, "activation-end");
     }
     schedule(p);
   }
@@ -2794,6 +2851,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     try {
       const route = viewOf(p, null).routeOf(t);
       p.tokens.set(tokenKey(t.id, n), p.capacity.acquire(route.provider, route.heavy, t.id, n, { force: true }));
+      observe(p, "capacity-reserve", () => ({ taskId: t.id, attempt: n, provider: route.provider, heavy: route.heavy,
+        token: p.tokens.get(tokenKey(t.id, n))?.id ?? null, force: true }));
     } catch (e) {
       d.log("warn", "forced capacity token failed", errorText(e));
     }
@@ -3481,6 +3540,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   async function closePlan(p: PlanRt): Promise<void> {
     p.disposed = true;
     p.latch = true;
+    observe(p, "detach");
     for (const h of p.timers) d.clock.clearTimer(h);
     p.timers.clear();
     p.backoff = null;
@@ -3716,6 +3776,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         if (isOrch) {
           if (e.type === "step.started") p.orchIdle = false;
           else if (e.type === "execution.completed" || e.type === "execution.failed" || e.type === "execution.interrupted") p.orchIdle = true;
+          observe(p, "orchestrator", () => ({ event: e.type }));
           schedule(p);
         }
         const provider = providerBySession.get(sid) ?? "unknown";
@@ -3979,6 +4040,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         if (!retryOnly) await setStatus(p, "paused", "running", "user-resume");
         if (promote) {
           p.passive = false;
+          observe(p, "promote");
           await activate(p, true);
         } else if (!p.integrationResumed) {
           // §9: a halted (or failed) integration resume is retried by the user's resume.
@@ -4017,6 +4079,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       requireStatus(p, ["compiling", "awaiting-residue", "awaiting-approval", "running", "paused"]);
       // Whole-plan cancellation stops progression; unlike a done task, it must not reopen gates or launch QA.
       p.latch = true;
+      observe(p, "abort");
       try {
         await p.collab.queue.abort();
       } catch (e) {
@@ -4353,6 +4416,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         // QA-3.1-25: L17 for every live launch the launcher is about to abort, counted while the plan is still live.
         if (!p.disposed) for (const h of p.handles.values()) if (!h.settled) counter(p, "launch-failed", { row: "L17" });
         p.disposed = true;
+        observe(p, "dispose");
         for (const h of p.timers) d.clock.clearTimer(h);
         p.timers.clear();
         p.backoff = null;
@@ -4416,7 +4480,10 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
     onLeaseReleased() {
       try {
-        for (const p of plans.values()) schedule(p);
+        for (const p of plans.values()) {
+          observe(p, "lease-released-notification");
+          schedule(p);
+        }
       } catch (e) {
         d.log("error", "lease release feed failed", errorText(e));
       }

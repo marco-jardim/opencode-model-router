@@ -2,6 +2,7 @@ import type { PluginInput } from "@opencode-ai/plugin";
 import type { RunnerCatalogModel } from "../escalate/resume";
 import type { CatalogModel, Ingest } from "../routing/outcomes/ingest";
 import type { HostGenerate } from "../routing/classify/types";
+import type { V2Observations } from "./v2-observations";
 
 /** Marks the legacy tool.execute.before output bag when verification starts for
  * that task call. V1 hosts read only output.args, so this symbol is invisible. */
@@ -53,6 +54,8 @@ export type RouterPluginInput = PluginInput & {
   routerChildRunner?: ChildSessionRunner;
   /** Set only by src/v2.ts; absent = v1 host (A3). */
   routerHost?: "v2";
+  /** Diagnostic-only; supplied by v2 setup, never activated on v1. */
+  routerObservations?: V2Observations;
   /**
    * Set only by src/v2.ts: the host model catalog (`ctx.model.list`): prices child steps (A1) and, with its `variants`
    * and `limit`, lets the delegate ladder validate variants and size resumes (D10/D11, Phase 2.3).

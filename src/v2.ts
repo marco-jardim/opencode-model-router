@@ -9,12 +9,14 @@ import type { PlanTaskVerifier } from "./executor/runtime";
 import { createExecutor, createExecutorAccess, prepareExecutor, type CreateExecutorOptions, type PreparedExecutor } from "./executor/create";
 import { loadConfig, resolveRolesRouting, resolveRouting } from "./router/config";
 import { locationOutsideWorkRoots } from "./router/work-roots";
+import { openV2Observations } from "./compat/v2-observations";
 
 /** Keep the routing engine shared; translate only the host API at this boundary. */
 export default {
   id: "opencode-model-router",
   server: ModelRouterPlugin,
   async setup(ctx: Plugin.Context) {
+    const observations = openV2Observations();
     const runtime = createV2Runtime(ctx);
     const directory = ctx.location.directory;
     const access = createExecutorAccess();
@@ -48,6 +50,7 @@ export default {
       client: runtime.client,
       routerChildRunner: runtime.childRunner,
       routerHost: "v2" as const,
+      routerObservations: observations,
       routerExecutor: access,
       routerOnPlanAnnotate: (port: NonNullable<typeof annotate>) => { annotate = port; },
       // Step pricing reads the catalog the adapter already queries; the plugin's single telemetry ingest comes back
@@ -76,8 +79,9 @@ export default {
     const prepared = await prep;
     if (!prepared.ok) access.clear(prepared.reason);
     if (prepared.ok && runtime.childRunner === undefined) access.clear("the child runner is not available");
-    return registerV2Hooks(ctx, hooks, runtime, {
-      executor: (host) => createExecutor({ routerHost: "v2", directory }, { host, prepared, access, ...(annotate ? { annotate } : {}) }) ?? null,
+    const registration = registerV2Hooks(ctx, hooks, runtime, {
+      observations,
+      executor: (host) => createExecutor({ routerHost: "v2", directory }, { host, prepared, access, observations, ...(annotate ? { annotate } : {}) }) ?? null,
       ...(ingest ? { ingest } : {}), ...(isBypassed ? { isBypassed } : {}), ...(budgetSnapshot ? { budgetSnapshot } : {}),
       ...(verifyEnabled ? { routerVerifyEnabled: verifyEnabled } : {}),
       ...(recordRefusal ? { recordRefusal } : {}),
@@ -85,5 +89,10 @@ export default {
       onHostBudget: (observe) => { observeHostBudget = observe; },
       onRoleLive: (isLive) => { roleLive = isLive; },
     });
+    if (observations === undefined) return registration;
+    try {
+      const dispose = await registration;
+      return async () => { try { await dispose(); } finally { observations.close(); } };
+    } catch (error) { observations.close(); throw error; }
   },
 } satisfies Plugin.Plugin & { server: typeof ModelRouterPlugin };

@@ -15,6 +15,7 @@
  */
 import { createHash } from "node:crypto";
 import type { ChildSessionRunner } from "../compat/child-session";
+import { completionIdentity, observeV2, type V2Observations } from "../compat/v2-observations";
 import { access, readdir, readFile as fsReadFile, realpath, stat, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { createBatchCoordinator, type BatchCoordinatorOptions, type BatchPlanner } from "./batch";
@@ -1181,6 +1182,7 @@ function errorText(err: unknown): string {
 }
 
 export function createVerificationWiring(deps: {
+  observations?: V2Observations;
   client: any;
   childRunner?: ChildSessionRunner;
   /** Project root; relative paths in checks resolve against it. */
@@ -2613,6 +2615,8 @@ export function createVerificationWiring(deps: {
       const perimeterSnapshots = store.perimeterOf(input.dispatchID) !== undefined
         ? perimeterSnapshotsAtGate(store, input.dispatchID, deadline).catch(() => undefined)
         : undefined;
+      observeV2(deps.observations, () => ({ family: "completion-effect", effect: "change-set-capture", source: "deferred-change",
+        ...completionIdentity(input.orchestratorSessionID, input.dispatchID, input.producerSessionID) }));
       const observed = await observeChange(store, input.dispatchID, input.producerSessionID, changeCwd, deadline, false);
       // Phase 2.1.4.b / QA-2.1-7: the set frozen at child end holds only the child's tool-observed paths, a subset of the
       // observed change set (which also holds the tree delta, shell edits and commits), so it never replaces it. A delta whose
@@ -2687,6 +2691,8 @@ export function createVerificationWiring(deps: {
         const taken = await untilAborted(digestFiles(paths.map(p => p.path)), deadline.signal, () => undefined);
         if (taken !== undefined) digests = Promise.resolve(taken);
       }
+      observeV2(deps.observations, () => ({ family: "completion-effect", effect: "deferred-register", source: "pending-register",
+        ...completionIdentity(input.orchestratorSessionID, input.dispatchID, input.producerSessionID) }));
       const reg = pending.register({
         orchestratorSessionID: input.orchestratorSessionID,
         dispatchID: input.dispatchID,
@@ -2781,6 +2787,8 @@ export function createVerificationWiring(deps: {
       // An unattributed change set is not queued (nothing could run; it stays listed instead).
       if (background !== undefined && changedFiles !== "unavailable") {
         try {
+          observeV2(deps.observations, () => ({ family: "completion-effect", effect: "verification-enqueue", source: "deferred-background", handle: reg.handle,
+            ...completionIdentity(input.orchestratorSessionID, input.dispatchID, input.producerSessionID) }));
           background.enqueue({ sessionID: input.orchestratorSessionID, handle: reg.handle, files: changedFiles.map(p => p.path) });
         } catch (err) {
           // The handle is registered: the delegation stays unverified and listed, as without background.
@@ -3511,7 +3519,11 @@ export function createVerificationWiring(deps: {
         }
       } catch (error) {
         // Never leave a claim verifying until the reaper: settle what was claimed, retryable.
-        for (const c of claims) c.settle({ verdict: unverifiableVerdict(`verification unavailable: ${errorText(error)}`), retryable: true });
+        for (const c of claims) {
+          observeV2(deps.observations, () => ({ family: "completion-effect", effect: "verification-settle", source: "claim-error", handle: c.entry.handle,
+            ...completionIdentity(c.entry.orchestratorSessionID, c.entry.dispatchID, c.entry.producerSessionID) }));
+          c.settle({ verdict: unverifiableVerdict(`verification unavailable: ${errorText(error)}`), retryable: true });
+        }
         throw error;
       }
 
@@ -3561,6 +3573,8 @@ export function createVerificationWiring(deps: {
         } finally {
           // R4: single use, in a finally; false only when the claim was reaped or disposed.
           claims.forEach((c, i) => {
+            observeV2(deps.observations, () => ({ family: "completion-effect", effect: "verification-settle", source: "verify-handles", handle: c.entry.handle,
+              ...completionIdentity(c.entry.orchestratorSessionID, c.entry.dispatchID, c.entry.producerSessionID) }));
             if (!c.settle(results[i])) logger.debug?.("[verify] router_verify settled a claim that was already reaped", { handle: c.entry.handle });
           });
         }

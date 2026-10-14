@@ -8,6 +8,7 @@ import { constants as nodeFsConstants } from "node:fs";
 type AppendOptions = { fsync: boolean; create?: boolean };
 import { hostname } from "node:os";
 import { join } from "node:path";
+import { observeSchedulerLedger } from "./observations.js";
 import { isPlanId, planDir, SLOT_MARKERS_DIRNAME } from "./paths.js";
 import {
   GATE_TRANSITION_TRIGGERS,
@@ -625,6 +626,8 @@ export interface LedgerProcessInfo {
 }
 
 export interface LedgerStoreDeps {
+  /** v2 diagnostic seam, never enabled by the store itself. */
+  observations?: import("../compat/v2-observations").V2Observations;
   /** The executor home (`resolveExecutorHome`); plans live in `planDir(home, planId)`. */
   home: string;
   /** Default: {@link createNodeFileSystem}. */
@@ -1080,6 +1083,7 @@ function trackerOf(lines: readonly JournalLine[]): HistoryTracker {
 // ---------------------------------------------------------------------------------------------------------------
 
 interface WriterEnv {
+  observations?: import("../compat/v2-observations").V2Observations;
   fs: FileSystem;
   clock: Clock;
   proc: LedgerProcessInfo;
@@ -1315,6 +1319,9 @@ class StoreWriter implements LedgerWriter {
       throw e;
     }
     this.current = work;
+    if (this.env.observations !== undefined && events.some((e) => e.type !== "metric")) {
+      observeSchedulerLedger(this.env.observations, work, "ledger");
+    }
     this.tracker = tracker;
     this.eventsSince += events.length;
     for (const k of tracker.wakeKeys()) this.wakeView.add(k);
@@ -1689,7 +1696,7 @@ export function createLedgerStore(deps: LedgerStoreDeps): LedgerStore {
     if (!isPlanId(planId)) throw new ExecutorError("E_INVALID_INPUT", `invalid plan id ${JSON.stringify(planId)}`, { planId });
     return planDir(deps.home, planId);
   };
-  const envOf = (dir: string): WriterEnv => ({ fs, clock, proc, warn, dir, heartbeatMs, staleMs, snapshotEvery });
+  const envOf = (dir: string): WriterEnv => ({ fs, clock, proc, warn, dir, heartbeatMs, staleMs, snapshotEvery, observations: deps.observations });
   const emit = (warnings: readonly string[]): void => {
     for (const w of warnings) warn(w);
   };

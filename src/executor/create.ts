@@ -26,6 +26,7 @@ import { createLedgerStore, createNodeClock, createNodeFileSystem } from "./ledg
 import { resolveExecutorHome } from "./paths";
 import { createRecoveryService, sameToplevel } from "./recovery";
 import { createExecutorRuntime, realCollaborators, type ExecutorRuntimeHandle, type RuntimeDeps } from "./runtime";
+import type { V2Observations } from "../compat/v2-observations";
 import { createScheduler } from "./schedule";
 import { countPlanMarkers, createSlotPool, defaultSlotsDir, type SlotPoolOpenOptions } from "./slots/pool";
 import { createProvisioner } from "./slots/provision";
@@ -239,6 +240,7 @@ function staticTierDurations(cfg: Parameters<typeof resolveRoles>[0]): DurationM
 }
 
 export interface CreateExecutorOptions {
+  observations?: V2Observations;
   host: V2ExecutorHost;
   prepared: PreparedExecutor;
   access: ExecutorAccess;
@@ -341,7 +343,7 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
     const rawGit = createGitRunner({ mode: "hardened", toplevel });
     const git: RuntimeDeps["git"] = { run: (args, opts) => rawGit.run([...hardeningArgs(), ...args], opts) };
     const userGit = createGitRunner({ mode: "user", toplevel });
-    const store = createLedgerStore({ home });
+    const store = createLedgerStore({ home, observations: options.observations });
     const opsOf = (planId: PlanId) => createGitOps({ git, userGit, fs, planId, toplevel, executorHome: home });
     pools = new PlanSlotPools({
       store, toplevel, log,
@@ -476,6 +478,7 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
       return { sessionID, pid: spawner.pid, hostname: spawner.hostname, startedAt: now, heartbeatAt: now };
     };
     runtime = createExecutorRuntime({ store, compiler,
+      observations: options.observations,
       slots: planPools.facade, slotsFor: (id) => planPools.of(id), purgeSlots: (id, finished) => planPools.purge(id, finished),
       scheduler: createScheduler(), launcher: taskLauncher, routes, verifier: host.verifier, git, hosts: host.hosts, bindings: host.bindings, clock,
       leaseRegistry: { acquireWrite: (owner, writes) => {

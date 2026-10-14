@@ -9,6 +9,7 @@ import type { DurationEstimate } from "../routing/outcomes/durations";
 import { createLeaseRegistry, foldKeyPath, formatRunNote } from "../router/leases";
 import type { LeaseActor, LeaseRegistry, LeaseSeams, Holder, HolderInput } from "../router/leases";
 import { toolTargets } from "../router/tool-paths";
+import { observeV2, type V2Observations } from "./v2-observations";
 
 // ---- constants -------------------------------------------------------------------------------
 
@@ -928,6 +929,7 @@ const MAX_EARLY_VERDICTS = 200;
  * released hold stays in force for the session's life (the host history keeps the original, C4).
  */
 export function createHeldResults(deps: {
+  observations?: V2Observations;
   synthetic: SyntheticFn;
   journal: InflightJournal;
   available: boolean;
@@ -1041,6 +1043,8 @@ export function createHeldResults(deps: {
     let delivered = false;
     for (let attempt = 0; attempt < SYNTHETIC_ATTEMPTS && !delivered; attempt += 1) {
       try {
+        observeV2(deps.observations, () => ({ family: "completion-effect", effect: "annotation-delivery", source: "held-synthetic",
+          parentSessionID: entry.parentSessionID, callID: entry.callID, childSessionID: entry.childSessionID, handle: entry.handle }));
         await deps.synthetic({
           sessionID: entry.parentSessionID,
           text,
@@ -1082,6 +1086,8 @@ export function createHeldResults(deps: {
     let lastError: unknown;
     for (let attempt = 0; attempt < SYNTHETIC_ATTEMPTS; attempt += 1) {
       try {
+        observeV2(deps.observations, () => ({ family: "completion-effect", effect: "annotation-delivery", source: "unheld-synthetic",
+          parentSessionID: rec.parentSessionID, callID: rec.callID, childSessionID: rec.childSessionID, handle: rec.handle }));
         await deps.synthetic({
           sessionID: rec.parentSessionID,
           text: unheldVerdictText(rec.handle, rec.childSessionID, v),
@@ -1419,6 +1425,7 @@ export type Trigger =
   | { kind: "runner"; status: EndFact["outcome"]; text: string; at: number };
 
 export interface CompletionDeps {
+  observations?: V2Observations;
   /** `caller` (QA-PDF12-9): the caller journaled on the attempt being finished, for the context the finish runs in. */
   finish(input: FinishInput, caller: FinishCaller): Promise<FinishResult>;
   /** The child's last assistant message (`ctx.session.context`, C7/O1). */
@@ -1647,6 +1654,8 @@ export function createCompletionProcessor(reg: InFlightRegistry, deps: Completio
     if (deps.captureDelta !== undefined) {
       try {
         // QA-2.1-7: the change-set store keys a dispatch by `task:<parent>:<callID>`; the parent is known here.
+        observeV2(deps.observations, () => ({ family: "completion-effect", effect: "change-set-capture", source: "background-delta",
+          parentSessionID: a.parentSessionID, callID: a.callID, childSessionID: a.childSessionID }));
         delta = await deps.captureDelta(a.callID, a.childSessionID, `task:${a.parentSessionID}:${a.callID}`);
       } catch (error) {
         warnSafe(deps.logger, "[router] change-set capture failed", { callID: a.callID, error: errorText(error) });
@@ -1654,6 +1663,8 @@ export function createCompletionProcessor(reg: InFlightRegistry, deps: Completio
     }
     const notices = await deps.roleCompletion(a, text);
     const holdForGate = status === "succeeded" ? handle : undefined;
+    observeV2(deps.observations, () => ({ family: "completion-effect", effect: "finish-dispatch", source: "background",
+      parentSessionID: a.parentSessionID, callID: a.callID, childSessionID: a.childSessionID }));
     const result = await deps.finish({
       callID: a.callID,
       parentSessionID: a.parentSessionID,
@@ -1794,23 +1805,28 @@ export function createCompletionProcessor(reg: InFlightRegistry, deps: Completio
 
     completedFor(parent) {
       const turn = turnOf(parent);
-      const lines: Array<{ at: number; line: CompletedLine }> = [];
+      const lines: Array<{ at: number; line: CompletedLine; attempt: Attempt; annotated: boolean }> = [];
       for (const a of reg.listForParent(parent)) {
         refresh(a);
         const at = a.endedAt ?? a.at;
         const line = (text: string): CompletedLine => ({ child: a.childSessionID, label: attemptLabel(a), text });
         if (a.state === "child-ended" || a.state === "processing") {
           a.pendingShown = true;
-          lines.push({ at, line: line(PENDING_GUARANTEES_TEXT) });
+          lines.push({ at, line: line(PENDING_GUARANTEES_TEXT), attempt: a, annotated: false });
         } else if (a.state === "annotated" || (a.state === "closed-unknown" && a.annotations.length > 0)) {
           if (a.shownInTurn !== undefined && a.shownInTurn !== turn) continue;
           a.shownInTurn = turn;
           const text = a.annotations.join(" ").replace(/\s+/g, " ").trim();
-          lines.push({ at, line: line(text.length > 0 ? text : "completed") });
+          lines.push({ at, line: line(text.length > 0 ? text : "completed"), attempt: a, annotated: true });
         }
       }
       lines.sort((x, y) => x.at - y.at);
-      return lines.slice(-MAX_COMPLETED_PER_PARENT).map((l) => l.line);
+      return lines.slice(-MAX_COMPLETED_PER_PARENT).map((l) => {
+        // Only returned annotations, never the lines dropped by the provider's cap or a pending placeholder.
+        if (l.annotated) observeV2(deps.observations, () => ({ family: "completion-effect", effect: "annotation-delivery", source: "completed-provider",
+          parentSessionID: l.attempt.parentSessionID, callID: l.attempt.callID, childSessionID: l.attempt.childSessionID }));
+        return l.line;
+      });
     },
 
     endTurn(parent) {

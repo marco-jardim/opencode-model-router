@@ -76,7 +76,12 @@ export interface RootStepTokens {
   readonly cacheWrite: number;
 }
 
+/** Detached identity of one attempted row write; no row reference or payload is exposed to the callback. */
+export type TimingWriteObservation = Readonly<Pick<DispatchTimingRow, "parentSessionID" | "callID" | "childSessionID" | "outcome">>;
+
 export interface TimingRecorderOptions {
+  /** Optional synchronous diagnostic callback, before the actual append (including failed writes). Never affects the append. */
+  readonly onTimingWrite?: (row: TimingWriteObservation) => void;
   /** Outcomes directory; used to create the side logs when `sideLogs` is not given, and as the dedupe namespace. */
   readonly dir: string;
   readonly now: Clock;
@@ -403,6 +408,12 @@ export function createTimingRecorder(options: TimingRecorderOptions): TimingReco
   /** Every append goes through `track`, so `flush` waits for it whoever awaits it (QA-1.1-25). */
   function appendTimingRows(rows: readonly DispatchTimingRow[]): Promise<void> {
     const work = (async (): Promise<void> => {
+      if (options.onTimingWrite !== undefined) for (const row of rows) {
+        try {
+          options.onTimingWrite(Object.freeze({ parentSessionID: row.parentSessionID, callID: row.callID,
+            childSessionID: row.childSessionID, outcome: row.outcome }));
+        } catch { /* Diagnostic callbacks never lose or change a timing row. */ }
+      }
       if (rows.length > 0) checkWrite("timings", await sideLogs.appendTimings(rows));
     })();
     track(work);
@@ -687,6 +698,8 @@ export function createTimingRecorder(options: TimingRecorderOptions): TimingReco
 // ---------------------------------------------------------------------------
 
 export interface AcquireTimingRecorderOptions {
+  /** One actual write is reported to the first live holder with a callback, not once per holder. */
+  readonly onTimingWrite?: (row: TimingWriteObservation) => void;
   readonly dir: string;
   readonly now: Clock;
   readonly logger?: TimingLogger;
@@ -707,12 +720,13 @@ export interface TimingRecorderHolder extends TimingRecorder {
  * Layout/behaviour version of a registry entry; bump it whenever `RegistryEntry` or the recorder it holds changes shape.
  * An entry of another version in the process-wide map is foreign: it is neither reused nor touched (QA-PDF12-4).
  */
-export const TIMING_REGISTRY_VERSION = 2;
+export const TIMING_REGISTRY_VERSION = 3;
 
 interface RegistryEntry {
   readonly version: number;
   readonly recorder: TimingRecorder;
   readonly observers: Set<(row: DispatchTimingRow | OrchestratorTurnRow) => void>;
+  readonly writeObservers: Map<symbol, (row: TimingWriteObservation) => void>;
   refs: number;
 }
 
@@ -760,11 +774,14 @@ export function acquireTimingRecorder(options: AcquireTimingRecorderOptions): Ti
   let entry = currentEntry(registry, id);
   if (entry === undefined) {
     const observers = new Set<(row: DispatchTimingRow | OrchestratorTurnRow) => void>();
+    const writeObservers = new Map<symbol, (row: TimingWriteObservation) => void>();
     const logger = options.logger ?? NOOP_LOGGER;
     const recorder = createTimingRecorder({
       dir: options.dir,
       now: options.now,
       logger,
+      // One actual invocation => ONE stream, even with several plugin copies sharing this recorder.
+      onTimingWrite: (row) => { writeObservers.values().next().value?.(row); },
       ...(options.sideLogs === undefined ? {} : { sideLogs: options.sideLogs }),
       ...(options.turnIdleMs === undefined ? {} : { turnIdleMs: options.turnIdleMs }),
       onRow: (row) => {
@@ -777,7 +794,7 @@ export function acquireTimingRecorder(options: AcquireTimingRecorderOptions): Ti
         }
       },
     });
-    entry = { version: TIMING_REGISTRY_VERSION, recorder, observers, refs: 0 };
+    entry = { version: TIMING_REGISTRY_VERSION, recorder, observers, writeObservers, refs: 0 };
     registry.set(id, entry);
   }
   // QA-PDF12-8: the first acquirer's clock, logger and turnIdleMs apply; every plugin instance passes its own closures, so a
@@ -786,6 +803,8 @@ export function acquireTimingRecorder(options: AcquireTimingRecorderOptions): Ti
   shared.refs += 1;
   const observer = options.onRow;
   if (observer !== undefined) shared.observers.add(observer);
+  const observationHolder = Symbol();
+  if (options.onTimingWrite !== undefined) shared.writeObservers.set(observationHolder, options.onTimingWrite);
   let released = false;
   // When side logs are injected the recorder does not install `onRow` (the injected logs own their observer): a holder's observer then never fires.
   return {
@@ -807,6 +826,7 @@ export function acquireTimingRecorder(options: AcquireTimingRecorderOptions): Ti
       if (released) return;
       released = true;
       if (observer !== undefined) shared.observers.delete(observer);
+      shared.writeObservers.delete(observationHolder);
       shared.refs -= 1;
       if (shared.refs > 0) return;
       if (registry.get(id) === shared) registry.delete(id);

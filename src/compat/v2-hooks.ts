@@ -91,6 +91,7 @@ import { LAUNCH_HEADER_PATTERN, parseLaunchHeader, type LaunchHeaderFields } fro
 import { withoutHostPreamble } from "../executor/host-preamble";
 import { grantFor } from "../routing/roles/policy";
 import { NEEDS, UNKNOWN_FACTS, type Need } from "../routing/classify/types";
+import { observeV2, timingWriteObserver, type V2Observations } from "./v2-observations";
 
 /** §7 grammar (`formatLaunchPrompt`): every launcher prompt starts with this line. */
 const PLAN_CONTEXT_PREFIX = "PLAN CONTEXT\n";
@@ -1165,6 +1166,7 @@ export async function registerV2Hooks(
    * `hostSettleMs`: how long a role dispatch's result waits for the child's execution-end event (default 500 ms).
    */
   options: {
+    observations?: V2Observations;
     ingest?: Ingest; isBypassed?: () => boolean; hostBudget?: HostBudgetObserver; hostSettleMs?: number;
     onHostBudget?: (observe: (childSessionID: string, stepLimit: number | null) => HostBudgetObservation) => void;
     /**
@@ -1963,6 +1965,7 @@ export async function registerV2Hooks(
     void model.load(); // not awaited: until it loads, estimates are the prior (never selects a dispatch)
     const holder = acquireTimingRecorder({
       dir: outcomesDir, now: nowMs, logger: ingestLogger,
+      onTimingWrite: timingWriteObserver(options.observations),
       onRow: (row) => { if (row.kind === "dispatch-timing") model.observe(row); },
     });
     timings = holder;
@@ -2185,6 +2188,7 @@ export async function registerV2Hooks(
     }
   }
   const held: HeldResults = createHeldResults({
+    observations: options.observations,
     synthetic: async (input) => { if (typeof syntheticRaw === "function") await Reflect.apply(syntheticRaw, ctx.session, [input]); },
     journal, available: syntheticOk && compactionRegistered, logger: ingestLogger,
   });
@@ -3576,6 +3580,11 @@ export async function registerV2Hooks(
         }
         // QA-PDF12-6: without the claim, `undefined` keeps the `background` key the input already has (set by the copy that claimed).
         event.input = nativeArgs(event.tool, output.args, original, lostClaim ? undefined : background);
+        if (event.tool === "subagent") observeV2(options.observations, (fingerprint) => ({
+          family: "native-args", callID: event.id, sessionID: String(event.sessionID),
+          before: fingerprint(output.args), after: fingerprint(event.input),
+          backgroundDecision: (lostClaim ? undefined : background) ?? null,
+        }));
       } catch (error) {
         dispatchRouter.onCallFinished(event.id); // the hook chain rejected the call: it will never reach execute.after (2.2)
         inflight.cancel(event.id);
@@ -3783,6 +3792,7 @@ export async function registerV2Hooks(
         }
       };
       processor = executorProcessor = createCompletionProcessor(inflight, { // 3.1.7 W5: also the executor's runner-trigger sink
+        observations: options.observations,
         // QA-PDF12-9: the caller is the one the processor's attempt carries (journaled at decide), not a capped call-id lookup.
         // QA-PDF12-14: only a succeeded completion can launch a grader as the caller, so only it waits for the caller lookups.
         finish: (input, caller) => withinCaller({ parentSessionID: input.parentSessionID, callID: input.callID, ...caller }, () => api.finish(input), input.status === "succeeded"),
@@ -4316,6 +4326,10 @@ export async function registerV2Hooks(
           : structured && typeof structured === "object" && typeof structured.output === "string"
             ? { output: { ...structured, output: final } } : {}),
       };
+      if (event.tool === "subagent") observeV2(options.observations, () => ({
+        family: "completion-effect", effect: "annotation-delivery", source: "foreground-result",
+        parentSessionID: String(event.sessionID), callID: event.id, childSessionID: namedChild ?? null,
+      }));
       } finally {
         role?.finish();
         if (event.tool === "subagent") forgetRoutedRole(event.id);

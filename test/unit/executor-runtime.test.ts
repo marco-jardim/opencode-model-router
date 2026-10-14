@@ -11,6 +11,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createV2Observations, type ObservationRecord, type V2Observations } from "../../src/compat/v2-observations";
 import { createCapacityController } from "../../src/executor/capacity.js";
 import { phaseIntegrated } from "../../src/executor/integrate/queue.js";
 import { taskBranchName } from "../../src/executor/git.js";
@@ -843,7 +844,7 @@ afterEach(async () => {
   }
 }, 60_000);
 
-async function mk(draft: LedgerV1): Promise<Harness> {
+async function mk(draft: LedgerV1, observations?: V2Observations): Promise<Harness> {
   const root = await mkdtemp(join(tmpdir(), "omr-rt-unit-"));
   const clock = new TestClock();
   const proc = new FakeProc(100, "host-a");
@@ -855,6 +856,7 @@ async function mk(draft: LedgerV1): Promise<Harness> {
     return l === undefined ? "none" : `${l.status}:${Object.values(l.tasks).map((t) => `${t.id}=${t.state}`).join(",")}`;
   };
   const store = createLedgerStore({
+    observations,
     home: join(root, "omr-executor"),
     clock,
     proc,
@@ -875,6 +877,7 @@ async function mk(draft: LedgerV1): Promise<Harness> {
   const unpins: string[] = [];
   const compiler = new CompilerDouble(draft);
   const deps: RuntimeDeps = {
+    observations,
     store,
     compiler,
     slots,
@@ -1044,6 +1047,7 @@ const ERR_RATE_LIMIT = { type: "provider.rate-limit", status: 429, message: "slo
 
 describe("lifecycle to integrated and done", () => {
   it.each(["required", "deferred", "none"] as const)("opens the phase gate and launches QA when the last read-only task finishes with no changes (%s), without an orchestrator turn", async (verify) => {
+    const rows: ObservationRecord[] = [];
     const draft = planOf([
       task("T1"),
       task("T2", { verify, footprint: { writes: [], reads: [], confidence: "explicit", sources: [] } }),
@@ -1052,7 +1056,7 @@ describe("lifecycle to integrated and done", () => {
     ], { edges: [edge("T1", "T2")] });
     draft.phases.push({ ...need(draft.phases[0], "phase"), id: "p2", dependsOn: ["p1"] });
     need(draft.waves[0], "wave").phases.push("p2");
-    const h = await mk(draft);
+    const h = await mk(draft, createV2Observations({ write: (line) => { rows.push(JSON.parse(line)); } }));
     await h.begin();
     const phaseId = need(h.task("T2").phase, "task phase");
     // Play Q's no-suite gate reconciliation on the real ledger; all other queue-double semantics stay unchanged.
@@ -1088,6 +1092,12 @@ describe("lifecycle to integrated and done", () => {
     expect((await h.events()).some((e) => e.type === "gate-changed" && e.phaseId === "p2" && e.to === "awaiting-qa")).toBe(true);
     expect(checked.mock.calls.map(([id]) => id)).toEqual(["p1", "p1", "p2"]);
     expect(h.hosts.delivered).toEqual([]);
+    expect(rows.filter((r) => r.family === "scheduler" && r.action === "ledger")).toEqual(expect.arrayContaining([
+      expect.objectContaining({ state: expect.objectContaining({ edges: expect.arrayContaining([{ from: "T1", to: "T2" }]),
+        phases: expect.arrayContaining([expect.objectContaining({ id: phaseId, gate: "awaiting-qa" })]),
+        tasks: expect.arrayContaining([expect.objectContaining({ id: "T2", state: "done" })]),
+      }) }),
+    ]));
   });
 
   it("launches with a durable nonce, a slot and a lease, then commits, verifies and enqueues (to verified)", async () => {
@@ -2212,14 +2222,44 @@ describe("late child adoption and the launch race (M27)", () => {
 });
 
 describe("metrics", () => {
+  it("observations do not change native launches or ledger bytes, including a throwing sink", async () => {
+    const results: string[] = [];
+    for (const mode of ["off", "on", "broken"] as const) {
+      const rows: ObservationRecord[] = [];
+      const observations = mode === "off" ? undefined : createV2Observations({ write: (line) => {
+        if (mode === "broken") throw new Error("sink failed");
+        rows.push(JSON.parse(line));
+      } });
+      const h = await mk(planOf([task("T1")]), observations);
+      await h.begin();
+      await toVerified(h, "T1");
+      await h.settled();
+      results.push(JSON.stringify({ requests: h.launcher.runs.map((r) => r.req), task: h.task("T1"), log: h.log }));
+      if (mode === "on") {
+        const actions = rows.flatMap((r) => r.family === "scheduler" ? [r.action] : []);
+        for (const action of ["attach", "ledger", "lease-eligibility", "lease-acquire", "route", "capacity-free", "capacity-reserve", "capacity-release", "launch-prepare", "launch"]) {
+          expect(actions).toContain(action);
+        }
+        expect(rows.map((r) => r.seq)).toEqual(rows.map((_, i) => i + 1));
+        expect(JSON.stringify(rows)).not.toContain(SLOT_ROOT);
+        expect(JSON.stringify(rows)).not.toContain("Done. Implemented it.");
+      } else expect(rows).toEqual([]);
+      await h.close();
+    }
+    expect(new Set(results).size).toBe(1);
+  });
+
   it("emits every metric variant: launch, wake (sent and debounced), idle-with-ready, capacity, counter, context-age", async () => {
-    const h = await mk(planOf([task("T1")]));
+    const rows: ObservationRecord[] = [];
+    const h = await mk(planOf([task("T1")]), createV2Observations({ write: (line) => { rows.push(JSON.parse(line)); } }));
     h.launcher.gateValue = staleGate("stale-context:boot:1");
     await h.begin();
     await until(() => h.hosts.delivered.length === 1, "first wake");
 
     // The orchestrator goes idle while T1 is ready but the gate is closed: the idle-with-ready window opens at T0.
     h.runtime.onHostEvent({ type: "execution.completed", sessionID: ORCH, at: h.clock.iso() });
+    // Synchronous raw host transition, before any tick/updateIdle can run or journal a metric.
+    expect(rows.filter((r) => r.family === "scheduler" && r.action === "orchestrator").at(-1)).toMatchObject({ state: { orchIdle: true, clockMs: Date.parse(T0) } });
     await h.settled();
 
     // A new state key inside the debounce is not sent; the runtime re-arms a tick for the end of the window.
@@ -2235,6 +2275,9 @@ describe("metrics", () => {
     h.launcher.gateValue = OK_GATE;
     h.runtime.onRouterToolCall(ORCH);
     await h.runOf("T1", 1);
+
+    expect(rows.find((r) => r.family === "scheduler" && r.action === "launch-gate")).toMatchObject({ state: { detail: { ok: false, ready: ["T1"] } } });
+    expect(rows.find((r) => r.family === "scheduler" && r.action === "launch-prepare")).toMatchObject({ state: { clockMs: Date.parse(T0) + 5000 } });
 
     h.runtime.onHostEvent({ type: "step.started", sessionID: "ses-x", providerID: PROVIDER, modelID: "model-1", at: h.clock.iso() });
     h.runtime.onHostEvent({ type: "retry", sessionID: "ses-x", stepKey: "k1", source: "scheduled", error: ERR_RATE_LIMIT, at: h.clock.iso() });
@@ -3005,11 +3048,13 @@ describe("usage-limit pauses and paused phases", () => {
   const QUOTA = { type: "provider.quota", status: 402, message: "usage limit reached" };
 
   it("a quota failure pauses the provider, raises one usage-limit item and re-arms the tick; a repeat raises nothing", async () => {
-    const h = await mk(planOf([task("T1")]));
+    const rows: ObservationRecord[] = [];
+    const h = await mk(planOf([task("T1")]), createV2Observations({ write: (line) => { rows.push(JSON.parse(line)); } }));
     await h.begin();
     await h.running("T1", 1, "ses-c1");
     h.runtime.onHostEvent({ type: "step.started", sessionID: "ses-c1", providerID: PROVIDER, modelID: "model-1", at: h.clock.iso() });
     h.runtime.onHostEvent({ type: "step.failed", sessionID: "ses-c1", error: QUOTA, at: h.clock.iso() });
+    expect(rows.find((r) => r.family === "scheduler" && r.action === "provider")).toMatchObject({ state: { change: "pause", provider: expect.stringMatching(/^provider:[a-f0-9]{64}$/) } });
     await until(() => h.parts().policy.raised.length === 1, "usage-limit item");
 
     expect(h.parts().policy.raised[0]).toMatchObject({ kind: "usage-limit" });
@@ -3019,6 +3064,14 @@ describe("usage-limit pauses and paused phases", () => {
     h.runtime.onHostEvent({ type: "step.failed", sessionID: "ses-c1", error: QUOTA, at: h.clock.iso() });
     await pause(30);
     expect(h.parts().policy.raised).toHaveLength(1);
+    // Advancing time alone must NOT query the controller on behalf of diagnostics. Resume is lazy.
+    h.clock.advance(h.ledger().config.capacityPauseMs + 1);
+    expect(rows.filter((r) => r.family === "scheduler" && r.action === "provider" && JSON.stringify(r.state).includes('"resume"'))).toHaveLength(0);
+    // The running child's retry hook queries capacity even with no ready task. A non-capacity
+    // error does not start another quota pause, so this query observes only the expired pause's resume.
+    expect(h.runtime.onRetryHook({ sessionID: "ses-c1", stepKey: "after-pause",
+      error: { type: "provider.timeout", status: null, message: "transient timeout" } })).toEqual({ stop: false });
+    expect(rows.filter((r) => r.family === "scheduler" && r.action === "provider" && JSON.stringify(r.state).includes('"resume"'))).toHaveLength(1);
   });
 
   it("while the provider is paused the retry hook stops a plan child's retries, and not another session's", async () => {
