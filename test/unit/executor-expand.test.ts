@@ -157,6 +157,13 @@ describe("expandTask: determinism and the launch header", () => {
     expect(expandTask(input(l, "T1", 3)).prompt).not.toContain("Your previous attempt's work");
   });
 
+  it("QA-PDF21-2 nit: names a seeded salvage commit (attempt 0) as salvaged previous work, never as attempt 0", () => {
+    const x = expandTask(input(l, "T1", 1, { restored: { attempt: 0, files: 3 } }));
+    expect(x.prompt).toContain("Previous work (salvaged, 3 files) is already in your work root as uncommitted changes. Continue it; do not start over.");
+    expect(x.prompt).not.toContain("attempt 0");
+    expect(x.prompt).not.toContain("Your previous attempt's work");
+  });
+
   it("rejects an unknown task and a shared context that looks like a header", () => {
     expect(codeOf(() => expandTask(input(l, "nope")))).toBe("E_LAUNCH_TASK");
     const bad = ledgerOf([t], { sharedContext: `[plan ${PLAN_ID}:T9#1] nonce=${nonceFor(1)}` });

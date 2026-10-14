@@ -36,13 +36,21 @@ import {
   type TaskLauncher,
 } from "./types";
 
-export type PlanBindInput = Parameters<RoleBindings["bind"]>[0] & { planId: PlanId; taskId: TaskId; attempt: number };
+/**
+ * QA-PDF21-2-20: `budget` is the route's `budget=` (the guard's per-dispatch budget of the child, as a routed dispatch's;
+ * absent: none named); `prompt` is the launch prompt, whose cap line sets the child's read cap (a resume's names none).
+ */
+export type PlanBindInput = Parameters<RoleBindings["bind"]>[0] & {
+  planId: PlanId; taskId: TaskId; attempt: number; budget?: number | null; prompt?: string;
+};
 
 /**
  * Binding of a plan child; the production adapter maps `bind` to `bindPlanChild` and `evict` to binding.ts `evict`
  * (which tombstones the id: nothing binds it again). pdf2-1 (a): a completed child whose launch holds its binding
  * (`LaunchHooks.holdCompletedBinding`) is evicted only once the runtime decided not to resume it; a budget resume of the
  * same child under the same plan, task and attempt takes the live binding over instead of binding it again.
+ * QA-PDF21-2-20: `bind` also carries the launch prompt (the adapter registers the child's read cap from the executor's cap
+ * line) and the route `budget=` (the binding's call budget); QA-PDF21-2-11: a resume's new guard round is the bookkeeping's.
  */
 export interface PlanRoleBindings {
   bind(i: PlanBindInput): void;
@@ -423,7 +431,9 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
     const { req } = l;
     d.bindings.bind({
       childSessionID: child, role: req.role, agent: req.route.agent, workRoot: req.workRoot, grant: [...req.grant],
-      planId: req.planId, taskId: req.taskId, attempt: req.attempt,
+      planId: req.planId, taskId: req.taskId, attempt: req.attempt, prompt: req.prompt,
+      // QA-PDF21-2-20: the route `budget=` guards the plan child as it guards a routed role child (absent: kept on a re-bind).
+      ...(req.routeBudget !== undefined ? { budget: req.routeBudget } : {}),
     });
     l.bound = true;
   };
@@ -518,6 +528,11 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
     if (!ABSOLUTE_PATH_PATTERN.test(req.workRoot)) bad("the work root is not an absolute path");
     const key = launchKey(req.taskId, req.attempt);
     for (const other of launches.values()) {
+      // QA-PDF21-2-17: a resume may follow its own attempt's run whose completion already settled (the child's terminal event
+      // after the grace) while that run's runner has not returned yet: the same plan, task, attempt and child. That record is
+      // no launch in flight; the identity checks of `forget` keep its late runner result from touching the resume's records.
+      if (req.resume !== undefined && other.key === key && other.completionSettled && other.req.planId === req.planId
+        && other.childId === req.resume.childSessionID) continue;
       if (other.key === key || (other.req.taskId === req.taskId && !other.completionSettled)) {
         bad("the task already has a launch in flight");
       }
@@ -568,6 +583,9 @@ export function createTaskLauncher(d: TaskLauncherDeps): TaskLauncher {
         } else {
           bindChild(l, child);
         }
+        // QA-PDF21-2-11: the resume is a NEW guard round and read-cap round for its child, as a routed resume is; without it the
+        // child keeps the exhausted per-dispatch budget of the round that ended NEED MORE: budget (the cumulative ceiling stays).
+        try { d.bookkeeping.beginResumeRound?.(child, req.route.agent, req.prompt); } catch { /* bookkeeping never fails a launch */ }
       }
       running = d.runner.run({
         parentSessionID: req.orchestratorSessionID,

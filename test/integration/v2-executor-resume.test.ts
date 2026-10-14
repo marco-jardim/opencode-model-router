@@ -14,7 +14,7 @@ import { wipRefName } from "../../src/executor/git";
 import * as ledgerModule from "../../src/executor/ledger";
 import * as provisionModule from "../../src/executor/slots/provision";
 import * as execModule from "../../src/verify/exec";
-import { executorDefaults, isLedgerV1, ledgerViolations, type ChildRunner, type ChildRunRequest, type Clock, type HostSessions, type LedgerV1, type RetainedContextInfo, type TaskNode } from "../../src/executor/types";
+import { BUDGET_RESUMES, executorDefaults, isLedgerV1, ledgerViolations, type ChildRunner, type ExecutorChildGuardPort, type ChildRunRequest, type Clock, type HostSessions, type LedgerV1, type RetainedContextInfo, type TaskNode } from "../../src/executor/types";
 import * as runtimeModule from "../../src/executor/runtime";
 import { planDir } from "../../src/executor/paths";
 import { invalidateConfigCache, validateConfig } from "../../src/router/config";
@@ -146,11 +146,15 @@ async function boot(repo: string, runner?: ChildRunner) {
   };
   const emit = (event: EmittedEvent): void => { queued.push(event); wake(); };
   const v2 = createV2Runtime(ctx as unknown as Parameters<typeof createV2Runtime>[0], { bootID: "0123456789abcdef" });
+  // As src/v2.ts wires it (QA-PDF21-2-11/-20): the plugin's guard state of executor children reaches the adapter.
+  let executorChildGuard: ExecutorChildGuardPort | undefined;
   const hooks = await ModelRouterPlugin({ directory: repo, worktree: repo, routerHost: "v2", client: v2.client,
-    routerExecutor: access } as unknown as Parameters<typeof ModelRouterPlugin>[0]);
+    routerExecutor: access, routerOnExecutorChildGuard: (port: ExecutorChildGuardPort) => { executorChildGuard = port; },
+  } as unknown as Parameters<typeof ModelRouterPlugin>[0]);
   const surface = hooks as unknown as Surface;
   const state: { executor: V2Executor | null; host: V2ExecutorHost | null } = { executor: null, host: null };
   const dispose = await registerV2Hooks(ctx as unknown as Context, hooks, v2, {
+    ...(executorChildGuard ? { executorChildGuard } : {}),
     slotVerifier: { verify: async () => ({ verdict: "pass", findings: "", ref: "fixture-proof" }) },
     executor: host => {
       const ports = runner === undefined ? host : { ...host, runner, knownAgent: () => true };
@@ -164,7 +168,7 @@ async function boot(repo: string, runner?: ChildRunner) {
   let disposal: Promise<void> | null = null;
   const cleanup = () => disposal ??= dispose();
   plugins.push(cleanup);
-  return { access, prepared, surface, state, emit, dispose: cleanup,
+  return { access, prepared, surface, state, emit, dispose: cleanup, hooks: hooks as unknown as Record<string, ((input: unknown, output: unknown) => Promise<void>) | undefined>,
     deps: state.executor === null ? null : assembledDeps[assembledDeps.length - 1] ?? null,
     call: (args: RouterPlanArgs, sessionID = "root") => surface.tool.router_plan!.execute(args, { sessionID, directory: repo }),
   };
@@ -360,7 +364,8 @@ describe("v2 assembled executor resume and restored work (real launcher, pool an
     expect(git(fixture.repo, "log", "-1", "--format=%B", value.integration.branch)).toContain(`Omr-Attempt: plan-a/T1/1/${first.nonce}`);
   }, TEST_MS);
 
-  it("A13: four consecutive budget ends park the single attempt with budget-cap", async () => {
+  it("A13: consecutive budget ends past BUDGET_RESUMES park the single attempt with budget-cap", async () => {
+    const rounds = BUDGET_RESUMES + 1;
     const fixture = await repository();
     const tracked = await configure(fixture.root, fixture.slotsRoot);
     const value = plan(fixture);
@@ -380,15 +385,16 @@ describe("v2 assembled executor resume and restored work (real launcher, pool an
     executor.runtime.onRouterToolCall("root");
     await waitForState(executor, "parked");
     const parked = await executor.deps.store.read("plan-a");
-    expect(child.calls, JSON.stringify({ task: parked.tasks.T1, inbox: parked.inbox })).toHaveLength(4);
-    expect(child.calls.slice(1).map(request => request.resumeSessionID)).toEqual(Array(3).fill(child.sessions[0]));
+    expect(BUDGET_RESUMES).toBeGreaterThanOrEqual(1);
+    expect(child.calls, JSON.stringify({ task: parked.tasks.T1, inbox: parked.inbox })).toHaveLength(rounds);
+    expect(child.calls.slice(1).map(request => request.resumeSessionID)).toEqual(Array(BUDGET_RESUMES).fill(child.sessions[0]));
     expect(new Set(child.sessions).size).toBe(1);
     expect(new Set(child.calls.map(request => request.cwd)).size).toBe(1);
-    expect(child.calls.slice(1).map(request => request.prompt)).toEqual(Array(3).fill(runtimeModule.RESUME_PROMPT));
-    expect(launches.mock.calls.map(([request]) => request.attempt)).toEqual([1, 1, 1, 1]);
+    expect(child.calls.slice(1).map(request => request.prompt)).toEqual(Array(BUDGET_RESUMES).fill(runtimeModule.RESUME_PROMPT));
+    expect(launches.mock.calls.map(([request]) => request.attempt)).toEqual(Array(rounds).fill(1));
     expect(new Set(launches.mock.calls.map(([request]) => request.nonce)).size).toBe(1);
     expect(parked.tasks.T1?.attempts).toHaveLength(1);
-    expect(parked.tasks.T1?.attempts[0]).toMatchObject({ n: 1, resumes: 3, outcome: "interrupted" });
+    expect(parked.tasks.T1?.attempts[0]).toMatchObject({ n: 1, resumes: BUDGET_RESUMES, outcome: "interrupted" });
     expect(parked.inbox.filter(item => item.taskId === "T1" && item.answer === null)).toHaveLength(1);
     expect(parked.inbox.find(item => item.taskId === "T1")?.text).toMatch(/budget cap reached/);
     const exported = await executor.deps.store.exportPlan("plan-a");
@@ -534,5 +540,114 @@ describe("v2 assembled executor resume and restored work (real launcher, pool an
     expect(prompt).toContain(value.sharedContext);
     expect(prompt.indexOf("CAP:12")).toBeLessThan(prompt.indexOf("CAP:none"));
     expect(parseCapDirective(prompt)).toBe(12);
+  }, TEST_MS);
+
+  /**
+   * One guarded call of a plan child through the plugin's real tool hooks (the ones the v2 adapter forwards each call to): the
+   * before-hook decides; an allowed call then runs, and its after-hook records it, as the host's every executed call is.
+   */
+  async function guardedCall(plugin: Awaited<ReturnType<typeof boot>>, sessionID: string, tool: string, n: number) {
+    const args = tool === "read" ? { filePath: `notes-${n}.txt` } : { filePath: "budget.txt", oldString: `old-${n}`, newString: `new-${n}` };
+    const input = { tool, sessionID, callID: `guarded-${n}`, agent: "implementer" };
+    try {
+      await plugin.hooks["tool.execute.before"]!(input, { args });
+    } catch (error) {
+      return { allowed: false, message: String(error), output: "" };
+    }
+    const result = { title: tool, output: `${tool} ${n} done`, metadata: {} };
+    await plugin.hooks["tool.execute.after"]!({ ...input, args }, result);
+    return { allowed: true, message: "", output: result.output };
+  }
+
+  it("QA-PDF21-2-11: a budget resume opens a new guard round, so the resumed child's guarded calls are allowed again", async () => {
+    const fixture = await repository();
+    const tracked = await configure(fixture.root, fixture.slotsRoot);
+    const value = plan(fixture);
+    value.tasks.T1 = assemblyTask("T1", {
+      footprint: { writes: ["budget.txt"], reads: [], confidence: "explicit", sources: ["path"] },
+    });
+    await seed(fixture, value);
+    let plugin: Awaited<ReturnType<typeof boot>> | null = null;
+    let n = 0;
+    const rounds: Array<{ allowed: number; refusal: string }> = [];
+    const child = scriptedRunner(tracked.clock, async (request, sessionID) => {
+      if (request.resumeSessionID === undefined) {
+        // Producing calls only (no read cap, no read/draft stop): the first refusal is the per-dispatch budget's. Each allowed
+        // call is charged by the after-hook (`guardAfterCall`), as each call the host runs is.
+        let allowed = 0, refusal = "";
+        while (allowed < 400) {
+          const result = await guardedCall(plugin!, sessionID, "edit", ++n);
+          if (!result.allowed) { refusal = result.message; break; }
+          allowed += 1;
+        }
+        rounds.push({ allowed, refusal });
+        return "NEED MORE: budget";
+      }
+      const result = await guardedCall(plugin!, sessionID, "edit", ++n);
+      rounds.push({ allowed: result.allowed ? 1 : 0, refusal: result.message });
+      return "DONE: finished";
+    });
+    plugin = await boot(fixture.repo, child.runner);
+    const executor = built(plugin);
+    child.setEmitter(plugin.emit, executor.deps.hosts);
+    child.capture();
+    await executor.runtime.approve("plan-a", "root");
+    executor.runtime.onRouterToolCall("root");
+    await vi.waitFor(() => expect(rounds).toHaveLength(2), { timeout: WAIT_MS });
+    // The first round spent its budget and was refused; the resume is the same child, attempt and nonce.
+    expect(rounds[0]!.allowed).toBeGreaterThan(0);
+    expect(rounds[0]!.allowed).toBeLessThan(400);
+    expect(rounds[0]!.refusal).not.toBe("");
+    // The per-dispatch budget refused it (CLAUSE 3), not the cumulative ceiling, which a new round does not reset.
+    expect(rounds[0]!.refusal).toMatch(/DENIED: tool-call budget \d+ exhausted/);
+    expect(child.calls[1]?.resumeSessionID).toBe(child.sessions[0]);
+    // Without a new guard round the resumed child's first call meets the exhausted budget again.
+    expect(rounds[1], JSON.stringify(rounds)).toEqual({ allowed: 1, refusal: "" });
+  }, TEST_MS);
+
+  it("QA-PDF21-2-20: an editing plan child's read-only calls are capped at the executor's CAP:12 line", async () => {
+    const fixture = await repository();
+    const tracked = await configure(fixture.root, fixture.slotsRoot);
+    const value = plan(fixture);
+    value.tasks.T1 = assemblyTask("T1", {
+      footprint: { writes: ["budget.txt"], reads: [], confidence: "explicit", sources: ["path"] },
+    });
+    await seed(fixture, value);
+    let plugin: Awaited<ReturnType<typeof boot>> | null = null;
+    let n = 0;
+    const outcome: { reads: number; refusedTool: string; refusal: string; banners: string[] } = { reads: -1, refusedTool: "", refusal: "", banners: [] };
+    const gate = childGate();
+    const child = scriptedRunner(tracked.clock, async (request, sessionID) => {
+      let reads = 0;
+      // Three reads, then one producing call (the producer's read/draft stop never fires), up to one read past the cap. The read
+      // cap is the session store's read-only counter, as a routed role child's (QA-P21-2-3): each read's result carries its
+      // banner (`[cap: n/12]`, `CAP REACHED`); the guard refuses no read for it.
+      while (reads < 13) {
+        const tool = n % 4 === 3 ? "edit" : "read";
+        const result = await guardedCall(plugin!, sessionID, tool, n++);
+        if (!result.allowed) { outcome.refusedTool = tool; outcome.refusal = result.message; break; }
+        if (tool === "read") { reads += 1; outcome.banners.push(result.output); }
+      }
+      outcome.reads = reads;
+      await gate.wait(request.signal);
+      return "DONE: read";
+    });
+    plugin = await boot(fixture.repo, child.runner);
+    const executor = built(plugin);
+    child.setEmitter(plugin.emit, executor.deps.hosts);
+    child.capture();
+    await executor.runtime.approve("plan-a", "root");
+    executor.runtime.onRouterToolCall("root");
+    await vi.waitFor(() => expect(outcome.reads).toBeGreaterThanOrEqual(0), { timeout: WAIT_MS });
+    expect(parseCapDirective(child.calls[0]!.prompt)).toBe(12);
+    const shown = JSON.stringify(outcome);
+    expect(outcome, shown).toMatchObject({ reads: 13, refusedTool: "", refusal: "" });
+    // Without the executor's cap the child has no read-only counter: its reads carry no banner at all.
+    expect(outcome.banners[0], shown).toContain("[cap: 1/12]");
+    expect(outcome.banners[10], shown).toContain("[cap: 11/12]");
+    expect(outcome.banners[10], shown).toContain("CAP WARNING: 1 read-only call(s) remaining");
+    expect(outcome.banners[11], shown).toContain("CAP REACHED (12/12)");
+    expect(outcome.banners[12], shown).toContain("CAP REACHED (13/12)");
+    gate.release();
   }, TEST_MS);
 });

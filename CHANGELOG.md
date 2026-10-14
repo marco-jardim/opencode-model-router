@@ -68,7 +68,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verification is cancelled first at disposal, a verdict decided before disposal is still journaled, manual `gc` of a
   completed plan waits for pending phase tags, and `purge` creates no directories, removes the empty plan directory and
   skips collection for an invalid `slotsDir` when the plan holds no slot markers. A `NEED MORE: budget` end resumes
-  the same child session up to three times, then parks as `budget-cap`; interrupted, parked or lost attempts keep
+  the same child session as many times as the guard's cumulative call multiplier allows (`BUDGET_RESUMES`), then
+  parks as `budget-cap`; each budget resume starts a new guard round for that child (its per-dispatch budget and read
+  count restart, the cumulative ceiling stays). Plan children are guarded like routed role children: an editing task's
+  child gets the executor's `CAP:12` read cap (its `[cap: n/12]` and `CAP REACHED` banners, as a routed child's `CAP`)
+  and its route's `budget=` as its call budget; interrupted, parked or lost attempts keep
   their uncommitted work on `omr/<plan>/wip/<task>` for the next attempt; WIP refs remain until purge, including after
   abort. Orchestrator-shell filtering drops only the semicolon-delimited clause marked `(orchestrator shell)`, not its
   neighbours, and compilation warns on mixed criteria lines. A block left with no criteria and no checks falls back to
@@ -82,7 +86,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the ledger's integration head. Disposal no longer waits on a launch begun after it started: once a plan is disposing,
   the runtime hands the launcher no new child and no budget resume. A park whose slot work could not be saved keeps
   the slot on the parked task (the ledger accepts a slot on a parked task for this), so the slot is never reset or
-  released while that work is unsaved.
+  released while that work is unsaved. After an abort, slot collection (automatic or `gc`) waits until each cancelled
+  child's slot was saved and released, or held when its save failed, so a slot is never collected mid-save.
 
 ### Changed
 

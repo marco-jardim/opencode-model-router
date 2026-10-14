@@ -6,6 +6,7 @@ import { registerV2Hooks } from "./compat/v2-hooks";
 import type { Ingest } from "./routing/outcomes/ingest";
 import type { BudgetSnapshot } from "./guard/enforce";
 import type { PlanTaskVerifier } from "./executor/runtime";
+import type { ExecutorChildGuardPort } from "./executor/types";
 import { createExecutor, createExecutorAccess, prepareExecutor, type CreateExecutorOptions, type PreparedExecutor } from "./executor/create";
 import { loadConfig, resolveRolesRouting, resolveRouting } from "./router/config";
 import { locationOutsideWorkRoots } from "./router/work-roots";
@@ -42,6 +43,8 @@ export default {
     // Phase 5.1 D8: the plan-task verifier built over this plugin instance's dispatch verification engine.
     let slotVerifier: PlanTaskVerifier | undefined;
     let annotate: CreateExecutorOptions["annotate"];
+    // QA-PDF21-2-11/-20: the plugin's guard state of executor children (a resume's new round, a bound child's read cap).
+    let executorChildGuard: ExecutorChildGuardPort | undefined;
     const input = {
       directory: ctx.location.directory,
       worktree: ctx.location.project.directory,
@@ -71,6 +74,7 @@ export default {
       routerOnVerifyEnabled: (read: () => boolean) => { verifyEnabled = read; },
       routerOnRefusal: (record: NonNullable<typeof recordRefusal>) => { recordRefusal = record; },
       routerOnSlotVerifier: (verifier: PlanTaskVerifier) => { slotVerifier = verifier; },
+      routerOnExecutorChildGuard: (port: ExecutorChildGuardPort) => { executorChildGuard = port; },
     };
     const hooks = await ModelRouterPlugin(input as unknown as PluginInput);
     const prepared = await prep;
@@ -82,6 +86,7 @@ export default {
       ...(verifyEnabled ? { routerVerifyEnabled: verifyEnabled } : {}),
       ...(recordRefusal ? { recordRefusal } : {}),
       ...(slotVerifier ? { slotVerifier } : {}),
+      ...(executorChildGuard ? { executorChildGuard } : {}),
       onHostBudget: (observe) => { observeHostBudget = observe; },
       onRoleLive: (isLive) => { roleLive = isLive; },
     });

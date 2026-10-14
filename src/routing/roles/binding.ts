@@ -487,6 +487,11 @@ export interface PlanChildBindInput {
   planId: string;
   taskId: string;
   attempt: number;
+  /**
+   * QA-PDF21-2-20: the call budget of the plan child's route (its `budget=`), as a routed dispatch's binding carries; absent or
+   * null: the role's default budget.
+   */
+  budget?: number | null;
 }
 
 /**
@@ -523,7 +528,10 @@ export function bindPlanChild(input: PlanChildBindInput): void {
     grant: { actions, notes: [], workRoot: root },
     candidates: [],
     decisionID: null,
-    budget: null,
+    // QA-PDF21-2-20: the route's `budget=`; a re-bind of the same child that names none keeps the budget it was bound with.
+    budget: input.budget === undefined
+      ? existing?.binding.budget ?? null
+      : typeof input.budget === "number" && Number.isInteger(input.budget) && input.budget > 0 ? input.budget : null,
   };
   reg.inflight.delete(id);
   remember(reg.bound, id, { binding, parentSessionID: undefined, agent: input.agent }, BOUND_MAX);

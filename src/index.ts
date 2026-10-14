@@ -132,6 +132,7 @@ import {
   lastStepContext,
 } from "./router/sessions";
 import type { Cap, SubagentState } from "./router/sessions";
+import { EXECUTOR_READ_CAP_LINE, type ExecutorChildGuardPort } from "./executor/types";
 import { createTrajectoryStore } from "./telemetry/trajectory";
 import { createGuardStore } from "./guard/store";
 import { createIdleTtlSweeper } from "./router/idle-sweep";
@@ -1742,6 +1743,38 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
     pendingRoleCaps.delete(callID);
     registerRoleCap(child, pending.agent, pending.cap);
   };
+  /**
+   * QA-PDF21-2-11: an executor budget resume (a launch with `req.resume`) opens a new guard round and a new read-cap round for
+   * its child, exactly as a routed resume does (`noteRoleDispatch`): the per-dispatch budget and the read counter restart, the
+   * cumulative ceiling stays. A cap the launch prompt names replaces the child's previous one.
+   */
+  const beginExecutorResumeRound = (child: string, agent: string, prompt: string): void => {
+    guardStore.beginDispatch(child);
+    const cap = executorLineCap(prompt);
+    if (!sessionStore.resumeRoleSession(child, cap) && cap !== null) registerRoleCap(child, agent, cap);
+  };
+  /**
+   * QA-PDF21-2-20: the read cap of a plan child's launch prompt is the executor's own cap line ONLY (`EXECUTOR_READ_CAP_LINE`,
+   * right after the "PLAN CONTEXT" line, DF-2-9), parsed by `parseCapDirective`. A prompt without it (a non-editing task, a
+   * resume) names no cap: plan text — even a `CAP` token split across lines, which the line-bound neutralization misses — never
+   * sets one.
+   */
+  const executorLineCap = (prompt: string): Cap | null =>
+    prompt.startsWith(`PLAN CONTEXT\n${EXECUTOR_READ_CAP_LINE}\n`) ? parseCapDirective(EXECUTOR_READ_CAP_LINE) : null;
+  /**
+   * QA-PDF21-2-20: a plan child the executor just bound gets the read cap of its launch prompt's cap line, through the state a
+   * routed role dispatch uses (`registerRoleCap`). A plan child has no parent `task` call, so `applyPendingRoleCap` never
+   * reaches it, and its role agent is no tier, so `registerFromChatMessage` does not either.
+   */
+  const applyExecutorChildCap = (child: string, agent: string, prompt: string): void => {
+    const cap = executorLineCap(prompt);
+    if (cap !== null) registerRoleCap(child, agent, cap);
+  };
+  // QA-PDF21-2-11/-20: the v2 adapter's executor bookkeeping reaches the guard store and the read-cap state through these.
+  (ctx as RouterPluginInput & { routerOnExecutorChildGuard?: (port: ExecutorChildGuardPort) => void }).routerOnExecutorChildGuard?.({
+    beginResumeRound: beginExecutorResumeRound,
+    applyCap: applyExecutorChildCap,
+  });
   /**
    * #84 P3.3 DF2-F1: where the `task` call `callID` is verified. A routed role dispatch (`routedRoleOf`, kept until the adapter's
    * `execute.after` is done) in its `verifyRoot` — the grant's work root (a resume keeps the child's bound root, QA-P33F1-1-1), else

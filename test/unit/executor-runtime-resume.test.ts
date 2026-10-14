@@ -19,19 +19,27 @@ import {
   BUDGET_RESUMES, ExecutorError, WIP_TRAILER,
   TRANSITION_TRIGGERS,
   type ChildEnd, type ExecutorEventInput, type ExpandInput, type GitRunner, type IntegrationQueue, type LaunchConfirmation, type LaunchHooks,
-  type LaunchRequest, type LedgerV1, type ProcessResult, type SlotPool,
+  type InboxItem, type LaunchRequest, type LedgerV1, type ProcessResult, type SlotPool,
 } from "../../src/executor/types";
 import { buildDraft, holderOf, taskNode } from "../fixtures/cpx/ledger/builders";
 import { removeDirWhenReleased } from "../helpers/remove-dir";
-import { runningParkTrigger } from "../../src/executor/unattended";
+import { parkItemOf, runningParkTrigger } from "../../src/executor/unattended";
 
-const expansion = vi.hoisted(() => ({ calls: [] as Array<{ taskId: string; attempt: number; restored: { attempt: number; files: number } | null }> }));
+const expansion = vi.hoisted(() => ({
+  calls: [] as Array<{ taskId: string; attempt: number; restored: { attempt: number; files: number } | null }>,
+  /** QA-PDF21-13: runs inside a launch step after its restore and before its attempt-started batch. */
+  beforeEnv: null as (() => Promise<void>) | null,
+}));
 
 vi.mock("../../src/executor/expand", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/executor/expand")>();
   return {
     ...actual,
-    loadExpansionEnv: async () => ({ worktrees: [], longPaths: true }),
+    loadExpansionEnv: async () => {
+      const hook = expansion.beforeEnv;
+      if (hook !== null) await hook();
+      return { worktrees: [], longPaths: true };
+    },
     expandTask: (i: ExpandInput) => {
       expansion.calls.push({ taskId: i.taskId, attempt: i.attempt, restored: i.restored ?? null });
       const out = { prompt: `TASK ${i.taskId} attempt ${i.attempt} nonce ${i.nonce}`, routeLine: "[route needs=edit,shell]", workRoot: i.slot.path };
@@ -66,6 +74,7 @@ afterEach(async () => {
   } finally {
     vi.restoreAllMocks();
     expansion.calls.length = 0;
+    expansion.beforeEnv = null;
     for (const root of roots.splice(0)) await bounded(`removing ${root}`, removeDirWhenReleased(root), 15_000);
   }
 }, 40_000);
@@ -141,7 +150,7 @@ interface Launch {
   confirm(c: LaunchConfirmation): void;
 }
 
-function draft(r: Repo, tasks: LedgerV1["tasks"] = {}): LedgerV1 {
+function draft(r: Repo, tasks: LedgerV1["tasks"] = {}, edges: LedgerV1["edges"] = []): LedgerV1 {
   const value = buildDraft(0, PLAN);
   value.status = "awaiting-approval";
   value.repo = { ...value.repo, toplevel: r.top, baseCommit: r.base };
@@ -153,6 +162,7 @@ function draft(r: Repo, tasks: LedgerV1["tasks"] = {}): LedgerV1 {
     footprint: { writes: ["a.txt", "b.txt", "c.txt"], reads: [], confidence: "explicit", sources: ["path"] },
   });
   Object.assign(value.tasks, tasks);
+  value.edges = [...value.edges, ...edges];
   return value;
 }
 
@@ -170,6 +180,13 @@ interface RigOptions {
   leaseRegistry?: RuntimeDeps["leaseRegistry"];
   /** QA-PDF21: the launcher reports its unsettled launches as in flight. */
   inFlight?: boolean;
+  /** QA-PDF21-19: dependency edges of the draft. */
+  edges?: LedgerV1["edges"];
+  /**
+   * QA-PDF21-12: as the real pool (pool.ts `work`): the owner's own leased slot comes back with its record's commit (the
+   * one before any reset the runtime runs next), and `reset` and `get` keep that record's commit.
+   */
+  recordCommit?: boolean;
 }
 
 async function rig(o: RigOptions = {}) {
@@ -184,28 +201,33 @@ async function rig(o: RigOptions = {}) {
   const acquireResets: number[] = [];
   /** QA-PDF21-5: the slot's status when `begin` captured its reference. */
   const begunStatus: string[] = [];
+  /** QA-PDF21-12: the commit the slot's record names (`recordCommit`). */
+  let recCommit = r.base;
   const pool = {
     acquire: vi.fn<SlotPool["acquire"]>(async (id, who, commit) => {
       // As the real pool (pool.ts acquire): a ready slot is reset to `commit` before it is handed out; the owner's own
       // leased slot comes back as it is.
+      const same = owner !== null;
       if (owner === null) {
         await sh(r.slot, "checkout", "-q", "--detach", "--force", commit);
         await sh(r.slot, "clean", "-q", "-ffd");
         acquireResets.push(acquireResets.length + 1);
+        recCommit = commit;
       }
       owner = who;
-      return { slot: "slot-1", path: r.slot, planId: id, owner: who, commit };
+      return { slot: "slot-1", path: r.slot, planId: id, owner: who, commit: o.recordCommit === true && same ? recCommit : commit };
     }),
     acquireSpecial: vi.fn<SlotPool["acquireSpecial"]>(async () => { throw new Error("unexpected special slot"); }),
     reset: vi.fn<SlotPool["reset"]>(async (_slot, commit) => {
       await sh(r.slot, "checkout", "-q", "--detach", "--force", commit);
       await sh(r.slot, "clean", "-q", "-ffd");
+      recCommit = commit;
     }),
     cleanForChecks: vi.fn<SlotPool["cleanForChecks"]>(async () => {}),
     release: vi.fn<SlotPool["release"]>(async () => { owner = null; }),
     get: vi.fn<SlotPool["get"]>(async (slot) => slot !== "slot-1" || owner === null ? null : {
       schema: 1, slot: "slot-1", path: r.slot, kind: "task", planId: PLAN, repoKey: "repo", state: "leased",
-      owner: o.foreignOwner === true ? "someone-else" : owner, commit: r.base, managers: [], manifests: {},
+      owner: o.foreignOwner === true ? "someone-else" : owner, commit: o.recordCommit === true ? recCommit : r.base, managers: [], manifests: {},
       createdAt: clock.iso(), updatedAt: clock.iso(),
     }),
     list: vi.fn<SlotPool["list"]>(async () => []),
@@ -225,7 +247,7 @@ async function rig(o: RigOptions = {}) {
   const deps: RuntimeDeps = {
     store, slots: pool, slotsFor: () => pool,
     compiler: {
-      compile: async () => ({ draft: draft(r, o.tasks), summary: { tasks: 1, phases: 1, edges: 0, workMs: 0, criticalPathMs: 0, width: 1, expectedMakespanMs: 0, manual: [], warnings: [] } }),
+      compile: async () => ({ draft: draft(r, o.tasks, o.edges), summary: { tasks: 1, phases: 1, edges: 0, workMs: 0, criticalPathMs: 0, width: 1, expectedMakespanMs: 0, manual: [], warnings: [] } }),
       mergeResidue: () => { throw new Error("unexpected residue"); }, addTasks: o.addTasks ?? (() => { throw new Error("unexpected addTasks"); }), validate: () => [],
     },
     scheduler: createScheduler(),
@@ -327,6 +349,12 @@ async function rig(o: RigOptions = {}) {
     },
     async state(): Promise<string> {
       return (await ledger()).tasks.T1?.state ?? "missing";
+    },
+    /** QA-PDF21-12: moves the plan's integration head (as the queue's `integration-head` event does). */
+    async moveHead(head: string): Promise<void> {
+      const w = writers[writers.length - 1];
+      if (w === undefined) throw new Error("writer missing");
+      await w.append([{ type: "integration-head", head }]);
     },
     async answer(text: string): Promise<void> {
       const l = await ledger();
@@ -605,14 +633,22 @@ describe("QA-PDF21 snapshot safety", () => {
     const before = structuredClone(await h.ledger());
     const journalStart = h.journal.length;
     failAdd = true;
-    await expect(h.runtime.addTasks(PLAN, "more work", ORCH)).rejects.toMatchObject({
-      code: "E_PLAN_STATE",
-      message: "task T1 holds unsaved work in slot slot-1; answer its item first",
-    });
+    const refusal: unknown = await h.runtime.addTasks(PLAN, "more work", ORCH).then(() => null, (e: unknown) => e);
     expect(await h.state()).toBe("ready");
     const l = await h.ledger();
-    expect(l).toEqual(before);
-    expect(h.journal.slice(journalStart)).toEqual([]);
+    // QA-PDF21-13: the item the refusal points at exists (raised before the refusal); nothing of the fragment is journaled.
+    const hold = l.inbox.filter((x) => x.text.includes("slot slot-1 could not be saved"));
+    expect(hold.map((x) => x.severity)).toEqual(["blocking"]);
+    expect(refusal).toMatchObject({
+      code: "E_PLAN_STATE",
+      message: "task T1 holds unsaved work in slot slot-1; answer its item first",
+      // ExecutorError's structured payload is its `detail` (types.ts ExecutorError); the raised item's id is in it.
+      detail: { taskId: "T1", slot: "slot-1", inboxId: hold[0]!.id },
+    });
+    expect(l.tasks).toEqual(before.tasks);
+    expect(l.edges).toEqual(before.edges);
+    // Only the item (and its wake and diagnostics): no task, edge or transition of the fragment.
+    expect(h.journal.slice(journalStart).filter((e) => e.type !== "inbox-added" && e.type !== "metric" && e.type !== "wake")).toEqual([]);
     expect(l.tasks.T1?.slot).toBe("slot-1");
     expect(h.pool.release).not.toHaveBeenCalled();
     expect(await readFile(join(h.r.slot, "b.txt"), "utf8")).toBe("reopened work\n");
@@ -789,6 +825,211 @@ describe("QA-PDF21 snapshot safety", () => {
 });
 
 // ---------------------------------------------------------------------------------------------------------------
+// QA-PDF21 round 2 (each test fails without its fix)
+// ---------------------------------------------------------------------------------------------------------------
+
+/** A commit on `parent` changing `files` (kept at a test ref): an integration head that moved past the base. */
+async function commitOn(r: Repo, parent: string, files: Record<string, string>): Promise<string> {
+  const scratch = join(r.root, `head-${Date.now()}`);
+  await sh(r.top, "worktree", "add", "-q", "--detach", scratch, parent);
+  for (const [name, text] of Object.entries(files)) await writeFile(join(scratch, name), text);
+  await sh(scratch, "commit", "-q", "-am", "integrated");
+  const commit = (await sh(scratch, "rev-parse", "HEAD")).trim();
+  await sh(r.top, "update-ref", "refs/heads/test/moved-head", commit);
+  await sh(r.top, "worktree", "remove", "--force", scratch);
+  return commit;
+}
+
+/** A git runner whose `add -A` fails while `fail` is set. */
+function failingAdd(): { fail: boolean; git: GitRunner } {
+  const s: { fail: boolean; git: GitRunner } = { fail: false, git: git };
+  s.git = faultyGit((args) => (s.fail && args[0] === "add" && args[1] === "-A" ? "fail" : null));
+  return s;
+}
+
+describe("QA-PDF21 round 2", () => {
+  const wipRef = wipRefName(PLAN, "T1");
+  const until = async (fn: () => void | Promise<void>): Promise<void> => {
+    await vi.waitFor(fn, { timeout: WAIT_MS, interval: 20 });
+  };
+  const holdOf = async (h: Awaited<ReturnType<typeof rig>>): Promise<InboxItem | undefined> =>
+    (await h.ledger()).inbox.find((x) => x.answer === null && x.text.includes("slot slot-1 could not be saved"));
+
+  it("-12. a restore conflict after the head moved keeps attempt 1's tree at the WIP ref; keep-wip restores that tree, not the integration delta", async () => {
+    const h = await rig({ verdicts: ["fail"], recordCommit: true });
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await writeFile(join(h.r.slot, "a.txt"), "attempt 1\n");
+    await h.runtime.pause(PLAN, ORCH);
+    await h.end(first, "ses-1", "DONE: finished");
+    await untilState(h, "ready");
+    expect((await h.ledger()).tasks.T1?.slot).toBe("slot-1");
+    // The integration head moves past the base with a change that conflicts with attempt 1.
+    await h.moveHead(await commitOn(h.r, h.r.base, { "a.txt": "integrated\n" }));
+    await h.runtime.resume(PLAN, ORCH);
+    await untilState(h, "parked");
+    expect(await sh(h.r.top, "show", `refs/heads/${wipRef}:a.txt`)).toBe("attempt 1\n");
+    expect((await sh(h.r.top, "rev-parse", `refs/heads/${wipRef}^`)).trim()).toBe(h.r.base);
+    // keep-wip, once the head is back at the base: the next attempt gets attempt 1's tree back.
+    await h.moveHead(h.r.base);
+    const item = (await h.ledger()).inbox.find((x) => x.taskId === "T1" && x.answer === null && x.options.includes("keep-wip"));
+    if (item === undefined) throw new Error("no restore-conflict item");
+    await h.runtime.answer(PLAN, item.id, "keep-wip", ORCH);
+    await h.launched(2);
+    expect(await readFile(join(h.r.slot, "a.txt"), "utf8")).toBe("attempt 1\n");
+    expect(expansion.calls.at(-1)?.restored).toEqual({ attempt: 1, files: 1 });
+  }, TEST_MS);
+
+  it("-13. an addTasks racing a launch waits for the launch step and never resets the slot holding restored work", async () => {
+    const h = await rig({ verdicts: ["fail"], addTasks: () => ({ tasks: [], edges: [], reopened: ["T1"] }) });
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await writeFile(join(h.r.slot, "b.txt"), "attempt 1\n");
+    let racing: Promise<unknown> = Promise.resolve(null);
+    // Between the second launch's restore and its attempt-started batch: an addTasks reopening T1.
+    expansion.beforeEnv = async () => {
+      expansion.beforeEnv = null;
+      racing = h.runtime.addTasks(PLAN, "more work", ORCH).catch((e: unknown) => e);
+      await h.pause(500);
+    };
+    await h.end(first, "ses-1", "DONE: finished");
+    const second = await h.launched(2);
+    expect(second.req.attempt).toBe(2);
+    expect(await readFile(join(h.r.slot, "b.txt"), "utf8")).toBe("attempt 1\n");
+    await bounded("the racing addTasks", racing, WAIT_MS);
+    expect(await h.state()).toBe("dispatched");
+    expect((await h.ledger()).tasks.T1?.slot).toBe("slot-1");
+    expect(await readFile(join(h.r.slot, "b.txt"), "utf8")).toBe("attempt 1\n");
+  }, TEST_MS);
+
+  it.each([
+    ["a missing slot directory", async (slot: string): Promise<void> => { await rm(slot, { recursive: true, force: true }); }],
+    ["a slot directory that is no repository", async (slot: string): Promise<void> => { await rm(join(slot, ".git"), { force: true }); }],
+  ])("-14. %s holds nothing to save: the park releases the slot and raises no unsaved-work item", async (_what, breakSlot) => {
+    const h = await rig();
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await writeFile(join(h.r.slot, "b.txt"), "lost with the slot\n");
+    await breakSlot(h.r.slot);
+    await h.end(first, "ses-1", "ESCALATE: stuck");
+    await untilState(h, "parked");
+    await until(() => { expect(h.pool.release).toHaveBeenCalledTimes(1); });
+    const l = await h.ledger();
+    expect(l.tasks.T1?.slot).toBeNull();
+    expect(l.inbox.some((x) => x.text.includes("could not be saved"))).toBe(false);
+    expect(await refOf(h.r.top, wipRef)).toBeNull();
+  }, TEST_MS);
+
+  it("-15. answering the unsaved-work item saves the slot again and ends its hold", async () => {
+    const s = failingAdd();
+    const h = await rig({ git: s.git });
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await writeFile(join(h.r.slot, "b.txt"), "unsaved\n");
+    s.fail = true;
+    await h.end(first, "ses-1", "ESCALATE: need a decision");
+    await untilState(h, "parked");
+    await until(async () => { expect(await holdOf(h)).toBeDefined(); });
+    const hold = await holdOf(h);
+    if (hold === undefined) throw new Error("no unsaved-work item");
+    expect(await refOf(h.r.top, wipRef)).toBeNull();
+    s.fail = false;
+    await h.runtime.answer(PLAN, hold.id, "git fixed", ORCH);
+    expect(await sh(h.r.top, "show", `refs/heads/${wipRef}:b.txt`)).toBe("unsaved\n");
+    expect(await status(h.r.slot)).toBe("");
+    expect(await holdOf(h)).toBeUndefined();
+  }, TEST_MS);
+
+  it("-15. after an abort with a failed save, gc and purge refuse while the save fails; a tick saves it, then collects", async () => {
+    const s = failingAdd();
+    const h = await rig({ inFlight: true, git: s.git });
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await writeFile(join(h.r.slot, "b.txt"), "aborted work\n");
+    s.fail = true;
+    await h.runtime.abort(PLAN, ORCH);
+    await until(async () => { expect(await holdOf(h)).toBeDefined(); });
+    await h.pause(200);
+    expect(h.pool.gc).not.toHaveBeenCalled();
+    await expect(h.runtime.gc()).rejects.toMatchObject({ code: "E_PLAN_STATE", message: expect.stringContaining("slot-1") });
+    await expect(h.runtime.purge(PLAN, ORCH)).rejects.toMatchObject({ code: "E_PLAN_STATE", message: expect.stringContaining("slot-1") });
+    expect(h.pool.gc).not.toHaveBeenCalled();
+    expect(await readFile(join(h.r.slot, "b.txt"), "utf8")).toBe("aborted work\n");
+    expect(await h.store.read(PLAN)).toMatchObject({ status: "aborted" });
+    s.fail = false;
+    h.runtime.onLeaseReleased();
+    await until(() => { expect(h.pool.gc).toHaveBeenCalled(); });
+    expect(await sh(h.r.top, "show", `refs/heads/${wipRef}:b.txt`)).toBe("aborted work\n");
+  }, TEST_MS);
+
+  it("-16. a restore error that persists counts toward the provisioning streak, which raises one item", async () => {
+    let picks = 0;
+    const h = await rig({
+      seed: seedB,
+      git: faultyGit((args) => {
+        if (args[0] !== "cherry-pick" || args[1] !== "--no-commit") return null;
+        picks += 1;
+        return "throw";
+      }),
+    });
+    await h.start();
+    await vi.waitFor(async () => {
+      h.runtime.onLeaseReleased();
+      expect((await h.ledger()).inbox.some((x) => x.text.includes("consecutive launches could not provision a slot"))).toBe(true);
+    }, { timeout: 20_000, interval: 100 });
+    const items = (await h.ledger()).inbox.filter((x) => x.text.includes("could not provision a slot"));
+    expect(items).toHaveLength(1);
+    expect(items[0]?.text).toContain(`restoring the work of T1 (${wipRef})`);
+    expect(picks).toBeGreaterThanOrEqual(5);
+    expect(h.launches).toHaveLength(0);
+    expect(await refOf(h.r.top, wipRef)).not.toBeNull();
+  }, TEST_MS);
+
+  it("-19. a lease-needed park of unsaved work names its item in the attempt context, blocks its dependents and keeps its file leases", async () => {
+    const s = failingAdd();
+    let held = false;
+    const releaseTask = vi.fn<(holderID: string) => void>();
+    const h = await rig({
+      tasks: {
+        T2: taskNode("T2", { phase: "p1", kind: "manual", state: "pending" }),
+        T3: taskNode("T3", { phase: "p1", state: "pending" }),
+      },
+      edges: [{ from: "T1", to: "T3", kind: "learned", confidence: "high", evidence: "T3 builds on T1" }],
+      leaseRegistry: {
+        acquireWrite: () => ({ ok: true }),
+        holderOf: (path) => held && path === "d.txt" ? { holderID: "holder-T2", taskRef: `${PLAN}:T2` } : null,
+        releaseTask,
+      },
+      git: s.git,
+    });
+    await h.start();
+    const first = await h.launched(1);
+    await h.child(first, "ses-1");
+    await writeFile(join(h.r.slot, "b.txt"), "leased work\n");
+    held = true;
+    s.fail = true;
+    const releases = releaseTask.mock.calls.length;
+    await h.end(first, "ses-1", "NEED MORE: lease d.txt");
+    await untilState(h, "parked");
+    await until(async () => { expect(await holdOf(h)).toBeDefined(); });
+    const l = await h.ledger();
+    const t1 = l.tasks.T1;
+    const hold = await holdOf(h);
+    if (t1 === undefined || hold === undefined) throw new Error("no parked task or item");
+    expect(t1.attempts.at(-1)?.context).toBe(hold.text);
+    expect(parkItemOf(l, t1)?.id).toBe(hold.id);
+    expect(l.tasks.T3?.state).toBe("blocked");
+    expect(t1.slot).toBe("slot-1");
+    expect(releaseTask.mock.calls.length).toBe(releases);
+  }, TEST_MS);
+});
+
+// ---------------------------------------------------------------------------------------------------------------
 // 1. classification
 // ---------------------------------------------------------------------------------------------------------------
 
@@ -840,7 +1081,8 @@ describe("pdf2-1 (a): a budget end resumes the same attempt", () => {
     await writeFile(join(h.r.slot, "b.txt"), "work in progress\n");
     let last = first;
     for (let k = 1; k <= BUDGET_RESUMES; k++) {
-      await h.end(last, "ses-1", k === 2 ? `${ROUTER_BUDGET_NOTE_PREFIX} cap reached` : "NEED MORE: budget");
+      // The last end before the cap is the router's budget note (it counts as a budget end too), whatever BUDGET_RESUMES is.
+      await h.end(last, "ses-1", k === BUDGET_RESUMES ? `${ROUTER_BUDGET_NOTE_PREFIX} cap reached` : "NEED MORE: budget");
       last = await h.launched(k + 1);
       expect(last.req.resume).toEqual({ childSessionID: "ses-1" });
       expect(last.req.attempt).toBe(1);
@@ -872,7 +1114,7 @@ describe("pdf2-1 (a): a budget end resumes the same attempt", () => {
     ]);
     expect(h.journal).toContainEqual(expect.objectContaining({ type: "attempt-ended", taskId: "T1", n: 1, outcome: "interrupted", detail: "budget-cap" }));
     expect(h.journal.filter((e) => e.type === "attempt-resumed")).toEqual(
-      [1, 2, 3].map((resumes) => ({ type: "attempt-resumed", taskId: "T1", n: 1, resumes })),
+      Array.from({ length: BUDGET_RESUMES }, (_, k) => k + 1).map((resumes) => ({ type: "attempt-resumed", taskId: "T1", n: 1, resumes })),
     );
     expect(await refOf(h.r.top, wipRefName(PLAN, "T1"))).not.toBeNull();
   }, TEST_MS);
@@ -980,7 +1222,7 @@ describe("pdf2-1 (b): no lost work", () => {
     expect(await sh(h.r.top, "show", `${wip}:b.txt`)).toBe("precious\n");
   }, TEST_MS);
 
-  it("7. a dirty slot the task no longer holds goes to an orphan ref and is never restored", async () => {
+  it("7. a dirty slot leased to another owner is never touched; once a launch holds it, its work goes to an orphan ref, never restored", async () => {
     const h = await rig({ foreignOwner: true });
     await h.start();
     const first = await h.launched(1);
@@ -989,12 +1231,20 @@ describe("pdf2-1 (b): no lost work", () => {
     await h.end(first, "ses-1", "ESCALATE: stuck");
     await untilState(h, "parked");
     expect(await refOf(h.r.top, wipRefName(PLAN, "T1"))).toBeNull();
-    const orphans = (await sh(h.r.top, "for-each-ref", "--format=%(refname)", `refs/heads/omr/${PLAN}/orphan/`)).split(/\r?\n/).filter((x) => x !== "");
+    const orphanRefs = async (): Promise<string[]> =>
+      (await sh(h.r.top, "for-each-ref", "--format=%(refname)", `refs/heads/omr/${PLAN}/orphan/`)).split(/\r?\n/).filter((x) => x !== "");
+    // QA-PDF21-14: the pool leases the slot to another owner: no save, reset or release runs in that worktree.
+    expect(await orphanRefs()).toEqual([]);
+    expect(await readFile(join(h.r.slot, "b.txt"), "utf8")).toBe("whose?\n");
+    expect(h.pool.release).not.toHaveBeenCalled();
+    await h.answer("go on");
+    await h.launched(2);
+    // The acquire handed the slot to the relaunch: its leftover work went to an orphan ref before the reset.
+    const orphans = await orphanRefs();
     expect(orphans).toHaveLength(1);
     // QA-PDF21-10: `<slot>-<ms>-<nonce>`.
     expect(orphans[0]).toMatch(new RegExp(`^refs/heads/${orphanRefName(PLAN, "slot-1", 0).replace(/-0$/, "")}-\\d+-[a-z0-9]+$`));
-    await h.answer("go on");
-    await h.launched(2);
+    expect(await sh(h.r.top, "show", `${orphans[0] ?? ""}:b.txt`)).toBe("whose?\n");
     expect(expansion.calls.at(-1)?.restored).toBeNull();
     expect(existsSync(join(h.r.slot, "b.txt"))).toBe(false);
   }, TEST_MS);

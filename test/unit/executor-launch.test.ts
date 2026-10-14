@@ -289,7 +289,8 @@ describe("launch: what the runner receives", () => {
     const r = rig();
     const done = deferred<{ sessionID: string; text: string }>();
     r.fr.state.script = creating(r, "child-1", done.promise);
-    const handle = r.launcher.launch(r.req(), r.hooks);
+    const req = r.req();
+    const handle = r.launcher.launch(req, r.hooks);
     const confirmation = await handle.confirmation;
     expect(confirmation).toMatchObject({ kind: "confirmed", childSessionID: "child-1" });
     await vi.waitFor(() => expect(r.log).toContain("prompted"));
@@ -300,8 +301,23 @@ describe("launch: what the runner receives", () => {
     expect(r.binds[0]).toEqual({
       childSessionID: "child-1", role: "implementer", agent: "coder", workRoot: ROOT, grant: ["read", "edit"],
       planId: "plan-one", taskId: "T1", attempt: 1,
+      // QA-PDF21-2-20: the binding carries the launch prompt (its cap line read-caps the child).
+      prompt: req.prompt,
     });
     expect(r.launcher.inFlight()).toEqual([expect.objectContaining({ taskId: "T1", attempt: 1, childSessionID: "child-1" })]);
+    done.resolve({ sessionID: "child-1", text: "ok" });
+  });
+
+  it("QA-PDF21-2-20: binds the child with its route's budget= when the request names one", async () => {
+    const r = rig();
+    const done = deferred<{ sessionID: string; text: string }>();
+    r.fr.state.script = creating(r, "child-1", done.promise);
+    const req = r.req({ routeBudget: 7 });
+    const handle = r.launcher.launch(req, r.hooks);
+    expect(await handle.confirmation).toMatchObject({ kind: "confirmed", childSessionID: "child-1" });
+    await vi.waitFor(() => expect(r.log).toContain("prompted"));
+    expect(r.binds).toHaveLength(1);
+    expect(r.binds[0]).toMatchObject({ childSessionID: "child-1", agent: "coder", budget: 7, prompt: req.prompt });
     done.resolve({ sessionID: "child-1", text: "ok" });
   });
 
@@ -433,6 +449,45 @@ describe("launch: resume the same attempt", () => {
     expect(r.launcher.gate(ORCH).ok).toBe(true);
     expect(r.onChildCreated).not.toHaveBeenCalled();
     expect(r.onLateChild).not.toHaveBeenCalled();
+  });
+
+  it("QA-PDF21-2-11: a resume opens a new guard round for its child before the runner call", async () => {
+    const rounds: string[] = [];
+    const order: string[] = [];
+    const r = rig({ bookkeeping: {
+      decisionRow() {}, recordDispatchStart() {}, registerInFlight() {}, unregisterInFlight() {},
+      beginResumeRound: (child, agent, prompt) => { rounds.push(`${child}|${agent}|${prompt}`); order.push("round"); },
+    } });
+    const done = deferred<{ sessionID: string; text: string }>();
+    r.fr.state.script = async (req) => { order.push("run"); await req.onCreated("child-1"); return done.promise; };
+    r.launcher.launch(r.req({ resume: { childSessionID: "child-1" } }), r.hooks);
+    expect(rounds).toEqual([`child-1|coder|${RESUME_PROMPT}`]);
+    expect(order).toEqual(["round", "run"]);
+    await r.launcher.cancel("T1", 1, "abort");
+    done.reject(new Error("aborted"));
+    await flush();
+  });
+
+  it("QA-PDF21-2-17: a resume may follow its own attempt's run whose completion settled before its runner returned", async () => {
+    const r = rig();
+    const first = deferred<{ sessionID: string; text: string }>();
+    r.fr.state.script = creating(r, "child-1", first.promise);
+    const handle = r.launcher.launch(r.req(), r.hooks);
+    expect(await handle.confirmation).toMatchObject({ kind: "confirmed", childSessionID: "child-1" });
+    r.fh.emit({ type: "execution.completed", sessionID: "child-1", at: r.clock.clock.iso() } as HostSessionEvent);
+    await r.clock.advance(5_000);
+    expect(await handle.completion).toMatchObject({ kind: "completed", childSessionID: "child-1" });
+    // The first run's runner has not returned: its record is that attempt's own settled run, not a launch in flight.
+    const second = deferred<{ sessionID: string; text: string }>();
+    r.fr.state.script = async (req) => { await req.onCreated("child-1"); return second.promise; };
+    const resumed = r.launcher.launch(r.req({ resume: { childSessionID: "child-1" } }), r.hooks);
+    r.fh.emit(step(r));
+    expect(await resumed.confirmation).toMatchObject({ kind: "confirmed", childSessionID: "child-1" });
+    // The first run's late runner result touches nothing of the resume.
+    first.resolve({ sessionID: "child-1", text: "late" });
+    await flush();
+    second.resolve({ sessionID: "child-1", text: "DONE: finished" });
+    expect(await resumed.completion).toMatchObject({ kind: "completed", childSessionID: "child-1", text: "DONE: finished" });
   });
 
   it.each([false, true])("surfaces the runner's E_NO_CONTEXT to the runtime (synchronous: %s)", async (synchronous) => {

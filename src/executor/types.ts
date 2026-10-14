@@ -4,6 +4,9 @@
 // grammar, the findings format and every interface other executor modules are built against. No I/O: the only
 // runtime code is small, pure and dependency-free (canTransition, counting, guards, header, classification).
 
+// QA-PDF21-2-18: the guard's cumulative multiplier (a pure constant) bounds BUDGET_RESUMES.
+import { GUARD_CUMULATIVE_MULTIPLIER } from "../router/guard-profile";
+
 // ---------------------------------------------------------------------------------------------------------------
 // §5 Ledger data
 // ---------------------------------------------------------------------------------------------------------------
@@ -673,8 +676,12 @@ export const LAUNCH_CONFIRM_TIMEOUT_MS = 30_000;
 export const CHILD_END_GRACE_MS = 5_000;
 /** Concurrent heavy-tier children per provider (3.1.3.a). */
 export const HEAVY_CAP_PER_PROVIDER = 2;
-/** Maximum budget resumes of the same attempt. */
-export const BUDGET_RESUMES = 3;
+/**
+ * Maximum budget resumes of the same attempt. QA-PDF21-2-18: derived from the guard's cumulative ceiling (the role budget ×
+ * {@link GUARD_CUMULATIVE_MULTIPLIER}), so every round the attempt may take — the first launch plus each resume — still has a
+ * full per-dispatch budget under that ceiling; one more resume would be refused at its first call.
+ */
+export const BUDGET_RESUMES = GUARD_CUMULATIVE_MULTIPLIER - 1;
 /** Trailer identifying a saved work-in-progress commit. */
 export const WIP_TRAILER = "Omr-Wip";
 /** Marker identifying an orchestrator shell session. */
@@ -1666,7 +1673,11 @@ export interface LaunchRequest {
   attempt: number;
   nonce: string;
   orchestratorSessionID: string;
-  /** Resume of the same attempt; no new child, confirmed on the first step. */
+  /**
+   * Resume of the same attempt; no new child, confirmed on the first step. It opens a new guard round and read-cap round for the
+   * child (`DispatchBookkeeping.beginResumeRound`, QA-PDF21-2-11), and may follow its own attempt's run whose completion settled
+   * before that run's runner returned (QA-PDF21-2-17).
+   */
   resume?: { childSessionID: string };
   /** The gated capture; `attempt-started.attempt.callID === context.callID` (A1-4). */
   context: ContextRef;
@@ -1674,6 +1685,11 @@ export interface LaunchRequest {
   role: string;
   /** Route `needs`. */
   grant: string[];
+  /**
+   * QA-PDF21-2-20 (optional, additive): the route's `budget=` (`routeBudgetOf(expanded.routeLine)`), bound with the child as a
+   * routed dispatch's binding carries it, so the guard raises the child's per-dispatch budget by it. Absent or null: none named.
+   */
+  routeBudget?: number | null;
   /** Slot path. */
   workRoot: string;
   /** §7 grammar; the header must match (planId, taskId, attempt, nonce). */
@@ -1886,6 +1902,22 @@ export interface DispatchBookkeeping {
    * back to a guess when the runner result settles before the child's own end event.
    */
   unregisterInFlight(taskId: TaskId, attempt: number, status?: ChildEnd["kind"]): void;
+  /**
+   * QA-PDF21-2-11 (optional, additive): a launch that resumes its child (`req.resume`) opens a NEW guard round and a new read-cap
+   * round for that child session before the runner call, exactly as a routed resume does: the per-dispatch budget and the read
+   * counter restart, the cumulative ceiling stays. `prompt`: the launch prompt, whose cap line (if any) sets the new round's cap.
+   */
+  beginResumeRound?(childSessionID: string, agent: string, prompt: string): void;
+}
+/**
+ * QA-PDF21-2-11/-20: the plugin's guard state of an executor child, as the v2 adapter's bookkeeping drives it (index.ts hands
+ * it over through `routerOnExecutorChildGuard`). `beginResumeRound`: a resume's new guard round and read-cap round (a routed
+ * resume's `guardStore.beginDispatch` and `resumeRoleSession`). `applyCap`: a freshly bound child's read cap, parsed from its
+ * launch prompt's cap line as a routed role dispatch's is.
+ */
+export interface ExecutorChildGuardPort {
+  beginResumeRound(childSessionID: string, agent: string, prompt: string): void;
+  applyCap(childSessionID: string, agent: string, prompt: string): void;
 }
 /** Deterministic verification of a task in its slot. */
 export interface SlotVerifier {

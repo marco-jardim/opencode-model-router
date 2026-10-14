@@ -83,7 +83,7 @@ import { PENDING_JOURNAL_VANISHED, pendingRecordIdentity } from "../verify/pendi
 import type { ExecutorRuntimeHandle, LeaseRegistryPort, PlanTaskVerifier } from "../executor/runtime";
 import type { LeaseRegistry } from "../router/leases";
 import type {
-  ChildEnd, ChildRunner, DispatchBookkeeping, HostError, HostSessionContext, HostSessionEvent, HostSessions, IsoTime, LaunchRequest, MetricPayload, PlanId, RouteResolver,
+  ChildEnd, ChildRunner, DispatchBookkeeping, ExecutorChildGuardPort, HostError, HostSessionContext, HostSessionEvent, HostSessions, IsoTime, LaunchRequest, MetricPayload, PlanId, RouteResolver,
   TaskLauncher,
 } from "../executor/types";
 import type { PlanRoleBindings } from "../executor/launch";
@@ -1200,6 +1200,11 @@ export async function registerV2Hooks(
     leaseRegistry?: LeaseRegistryPort;
     /** W1: the verification engine as a slot verifier; absent: the executor gets none. */
     slotVerifier?: PlanTaskVerifier;
+    /**
+     * QA-PDF21-2-11/-20: the plugin's guard state of executor children (index.ts `routerOnExecutorChildGuard`): a resume's new
+     * guard round and read-cap round, and a freshly bound child's read cap from its launch prompt's cap line. Absent: neither.
+     */
+    executorChildGuard?: ExecutorChildGuardPort;
   } = {},
 ): Promise<() => Promise<void>> {
   // The old plugin surface uses separate mutable input/output bags. Keep those
@@ -3943,6 +3948,12 @@ export async function registerV2Hooks(
         },
         registerInFlight: (taskId, attempt, child) => executorInFlight.register(taskId, attempt, child),
         unregisterInFlight: (taskId, attempt, status) => executorInFlight.unregister(taskId, attempt, status),
+        // QA-PDF21-2-11: a budget resume opens a new guard round and a new read-cap round for its child, as a routed resume does.
+        // The host's step count starts over with the resumed round too (handoff 22), as a routed resume's does.
+        beginResumeRound: (childSessionID, agent, prompt) => {
+          hostBudget.begin(childSessionID);
+          options.executorChildGuard?.beginResumeRound(childSessionID, agent, prompt);
+        },
       };
       /**
        * QA-3.1-2: a plan child's grant, computed as the role dispatch path computes one (`grantFor`): the role's base actions
@@ -3964,7 +3975,12 @@ export async function registerV2Hooks(
         routes: null,
         bindings: {
           // QA-3.1-2: the launch request's grant holds the route `needs`; the binding gets the role grant they map to.
-          bind: (i) => bindPlanChild({ ...i, grant: planChildGrant(i.agent, i.grant, i.workRoot) }),
+          // QA-PDF21-2-20: the bound child is read-capped by its launch prompt's cap line, as a routed role child by its dispatch's.
+          bind: (i) => {
+            const { prompt, ...binding } = i;
+            bindPlanChild({ ...binding, grant: planChildGrant(i.agent, i.grant, i.workRoot) });
+            if (prompt !== undefined) options.executorChildGuard?.applyCap(i.childSessionID, i.agent, prompt);
+          },
           evict: (childSessionID) => evictBinding(childSessionID),
         },
         bookkeeping,

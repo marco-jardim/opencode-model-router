@@ -59,9 +59,24 @@ export interface ExpandInput {
 export interface ExpandedTask {
   prompt: string;
   routeLine: string;
+  /**
+   * QA-PDF21-2-20 (optional, additive): the route line's `budget=` (`routeBudgetOf(routeLine)`), the launch request's
+   * `routeBudget`; null when the line names none.
+   */
+  routeBudget?: number | null;
   acceptance: string | null;
   verify: string | null;
   workRoot: string;
+}
+
+/**
+ * QA-PDF21-2-20: the `budget=` of a re-serialized route line (`renderRouteLine`: whitelisted tokens, an in-range budget only),
+ * or null when it names none. The launch request carries it into the plan child's binding, as a routed dispatch's binding.
+ */
+export function routeBudgetOf(routeLine: string): number | null {
+  const m = /^\[route [^\]\r\n]*?\bbudget=(\d+)\]$/.exec(routeLine.trim());
+  const n = m?.[1] === undefined ? 0 : Number(m[1]);
+  return Number.isInteger(n) && n >= 1 && n <= ROUTE_BUDGET_MAX ? n : null;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -436,7 +451,11 @@ export function renderTaskBlock(
   const text = childText(task.text);
   if (text.trim() !== "") out.push(rw(text));
   if (restored !== undefined) {
-    out.push("", `Your previous attempt's work (attempt ${restored.attempt}, ${restored.files} files) is already in your work root as uncommitted changes. Continue it; do not start over.`);
+    // QA-PDF21-2 nit: a seeded salvage commit has no attempt of its own (attempt 0): it is named as salvaged work.
+    const origin = restored.attempt === 0
+      ? `Previous work (salvaged, ${restored.files} files)`
+      : `Your previous attempt's work (attempt ${restored.attempt}, ${restored.files} files)`;
+    out.push("", `${origin} is already in your work root as uncommitted changes. Continue it; do not start over.`);
   }
   const subtasks = task.subtasks.map(childText).filter((s) => s.trim() !== "");
   if (subtasks.length > 0) {
@@ -519,6 +538,7 @@ export function expandTask(i: ExpandInput): ExpandedTask {
   return {
     prompt,
     routeLine,
+    routeBudget: routeBudgetOf(routeLine),
     acceptance: task.acceptance === null ? null : rewriteAbsolutePaths(task.acceptance, map),
     verify: task.verify === "none" ? null : task.verify,
     workRoot: i.slot.path,

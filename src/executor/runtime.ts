@@ -34,7 +34,7 @@ import {
   type RecoveryEngine,
 } from "./recovery";
 import { defaultSlotsDir } from "./slots/pool";
-import { BREAKER_FED, breakerSamples, createUnattendedPolicy, isCommitFailure } from "./unattended";
+import { BREAKER_FED, breakerSamples, createUnattendedPolicy, isCommitFailure, pendingDependentsClosure } from "./unattended";
 import {
   ABSOLUTE_PATH_PATTERN,
   BUDGET_RESUMES,
@@ -547,12 +547,30 @@ const PROVISION_STREAK = 5;
  * relaunches clean; `keep-wip` (or any other answer) keeps the ref and the next attempt restores it again.
  */
 export const WIP_PARK_OPTIONS: readonly string[] = ["discard-wip", "keep-wip"];
+/** QA-PDF21-15: the start of the item a failed save raises (`wipHold`); `answer` reads the slot name back from it. */
+export const WIP_HOLD_PREFIX = "the work in slot ";
+
+/** QA-PDF21-15: the slot a wip-hold item names, null for any other item. */
+function wipHoldSlotOf(text: string): string | null {
+  if (!text.startsWith(WIP_HOLD_PREFIX)) return null;
+  const m = /^(\S+) could not be saved before /.exec(text.slice(WIP_HOLD_PREFIX.length));
+  return m?.[1] ?? null;
+}
 
 /** QA-PDF21-10: a process-wide sequence; with the pid it keeps orphan ref names of one slot in one millisecond apart. */
 let orphanSeq = 0;
 function orphanTag(): string {
   orphanSeq += 1;
   return `${process.pid.toString(36)}${orphanSeq.toString(36)}`;
+}
+
+/**
+ * QA-PDF21-12: the lease of a slot just reset to `head`. A cached lease keeps the commit `acquire` returned, which for a
+ * re-acquired slot is the base before the reset; every reset refreshes the cache through this so no later save is parented
+ * at the stale base (and pulls the integration delta into the WIP tree).
+ */
+function leaseAt(lease: SlotLease, head: string): SlotLease {
+  return { ...lease, commit: head };
 }
 /** Consecutive RouteResolver failures (backoff rounds) that raise one inbox item (QA-3.1-22). */
 const ROUTE_STREAK = 5;
@@ -905,9 +923,19 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     return { orchestratorSessionID: p.writer.ledger.orchestrator.sessionID };
   }
 
-  /** No live child, no task in flight and no open integration entry: nothing of the plan still writes its slots. */
+  /**
+   * QA-PDF21-15: the abort's releases still running, by plan: a cancelled child's settled launch is followed by its slot's save,
+   * then its reset and release, or its hold when the save fails. Until that ends the slot is neither collectable nor known held.
+   */
+  const abortReleases = new WeakMap<PlanRt, Set<TaskId>>();
+
+  /**
+   * No live child, no task in flight, no abort release running and no open integration entry: nothing of the plan still
+   * writes its slots.
+   */
   function idle(p: PlanRt): boolean {
-    return p.inFlight.size === 0 && ![...p.handles.values()].some((h) => !h.settled) && p.writer.openIntegration().length === 0;
+    return p.inFlight.size === 0 && ![...p.handles.values()].some((h) => !h.settled) && (abortReleases.get(p)?.size ?? 0) === 0
+      && p.writer.openIntegration().length === 0;
   }
 
   /**
@@ -941,8 +969,10 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     try {
       // pdf2-1 (b): the WIP refs of integrated and done tasks go before the slots (QA-PDF21-4: a cancelled task's stays).
       await sweepWip(p);
-      // QA-PDF21-3: a slot whose work could not be saved is never collected; its item is open, the next collection retries.
-      if ([...wipFailRaised].some((k) => k.startsWith(`${p.planId}/`))) {
+      // QA-PDF21-3: a slot whose work could not be saved is never collected; its item is open. QA-PDF21-15: each collection
+      // (at most one per tick) retries the save of each such slot once, then waits for the next tick or the item's answer.
+      for (const slotName of heldSlotsOf(p)) await retryHeldSave(p, slotName, "collect");
+      if (heldSlotsOf(p).length > 0) {
         d.log("warn", `plan ${p.planId}: a slot holds unsaved work; its slots are not collected`);
         return;
       }
@@ -1213,13 +1243,13 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
    * Parks through the policy (P1). After the fsync the policy released the leases (P3); the runtime returns the slot the
    * park batch cleared to the pool (4.2.5) and forgets its lease. A park that wrote nothing keeps the slot.
    */
-  async function parkTask(p: PlanRt, taskId: TaskId, cause: Parameters<UnattendedPolicy["park"]>[1], text: string): Promise<void> {
+  async function parkTask(p: PlanRt, taskId: TaskId, cause: Parameters<UnattendedPolicy["park"]>[1], text: string, presaved: SaveResult | null = null): Promise<void> {
     const before = own(p.writer.ledger, taskId);
     const slotName = before?.slot ?? null;
     // pdf2-1 (b): the slot's work is saved at the task's WIP ref before the park releases it (the policy's own hook,
-    // `beforeSlotRelease`, skips a park this saved already).
+    // `beforeSlotRelease`, skips a park this saved already). `presaved`: the caller knows the slot holds nothing to save.
     const key = `${p.planId}/${taskId}`;
-    const saved: SaveResult = slotName === null ? "clean" : await snapshotTaskSlot(p, taskId, slotName, cause);
+    const saved: SaveResult = presaved ?? (slotName === null ? "clean" : await snapshotTaskSlot(p, taskId, slotName, cause));
     parkSaved.set(key, saved);
     try {
       await p.collab.policy.park(taskId, cause, text);
@@ -1241,6 +1271,32 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       } catch (e) {
         d.log("warn", "slot release failed", errorText(e));
       }
+    }
+  }
+
+  /**
+   * QA-PDF21-14: whether the pool's record of `slotName` leases it to an owner other than `taskId` (the slot's worktree is
+   * someone else's). False when the record is gone, not leased, or cannot be read.
+   */
+  async function leasedToOther(p: PlanRt, taskId: TaskId, slotName: string): Promise<boolean> {
+    try {
+      const rec = await slotsFor(p.planId).get(slotName);
+      return rec !== null && rec.state === "leased" && rec.owner !== null && rec.owner !== leaseHolderID(p.planId, taskId);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * QA-PDF21-14: a slot directory that is missing, or holds no repository of its own (no `.git`), counts as gone: it holds
+   * nothing to save. A `.git` that cannot be read safely (a link, a pointer to a network path) is not gone: it is kept.
+   */
+  function slotGone(path: string): boolean {
+    if (path === "") return true;
+    try {
+      return gitPointers(path) === undefined;
+    } catch {
+      return false;
     }
   }
 
@@ -1300,6 +1356,13 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   async function saveSlotWork(p: PlanRt, slot: { slot: string; path: string; base?: string | null }, ref: string, message: string, trailer: string, taskId: TaskId | null, deferredMetrics?: MetricPayload[]): Promise<SaveResult> {
     if (!wipCapable(p)) return "clean";
     const o = { cwd: slot.path, timeoutMs: GIT_TIMEOUT_MS };
+    // QA-PDF21-14: a missing directory or one that is no repository (no `.git`) holds nothing to save; no git runs there
+    // (git would fail, or climb to an enclosing repository and run `add -A` and `reset --hard` in it).
+    if (slotGone(slot.path)) {
+      wipFailRaised.delete(`${p.planId}/${slot.slot}`);
+      counter(p, "wip-slot-gone", taskId === null ? { slot: slot.slot } : { taskId, slot: slot.slot }, deferredMetrics);
+      return "clean";
+    }
     try {
       const r = await snapshotSlotWork(d.git, {
         cwd: slot.path,
@@ -1374,6 +1437,12 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     if (at === null) return "clean";
     const t = own(p.writer.ledger, taskId);
     const a = t?.attempts[t.attempts.length - 1];
+    // QA-PDF21-14: a worktree the pool leases to another owner is never touched (no `add -A`, no `reset --hard` in it):
+    // nothing in it is this task's, so there is nothing to save.
+    if (await leasedToOther(p, taskId, slotName)) {
+      counter(p, "wip-foreign-slot", { taskId, slot: slotName }, deferredMetrics);
+      return "clean";
+    }
     if (t === null || a === undefined || !(await slotHeldBy(p, taskId, slotName))) return snapshotOrphan(p, { slot: slotName, path: at.path }, deferredMetrics);
     return snapshotWip(p, { slot: slotName, path: at.path, base: at.base }, taskId, a.n, a.nonce, outcome, deferredMetrics);
   }
@@ -1382,18 +1451,104 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
    * QA-PDF21-3: a slot whose work could not be saved is neither reset nor released: it stays leased (to `taskId` when one
    * holds it) and one blocking item names it, once per slot until a save of it succeeds. Never throws.
    */
-  async function wipHold(p: PlanRt, taskId: TaskId | null, slotName: string, what: string): Promise<void> {
+  async function wipHold(p: PlanRt, taskId: TaskId | null, slotName: string, what: string): Promise<string | null> {
     const key = `${p.planId}/${slotName}`;
     counter(p, "wip-hold", taskId === null ? { slot: slotName } : { taskId, slot: slotName });
-    if (wipFailRaised.has(key)) return;
+    if (wipFailRaised.has(key)) return openWipHoldItem(p, slotName);
     wipFailRaised.add(key);
-    await raiseSafe(p, {
-      kind: "failure",
-      severity: "blocking",
-      taskId,
-      text: `the work in slot ${slotName} could not be saved before ${what}; the slot keeps its work and stays leased${taskId === null ? "" : ` to ${taskId}`} (see the log). Fix the slot's git state, then answer`,
-      options: [],
+    try {
+      const item = await p.collab.policy.raise({
+        kind: "failure",
+        severity: "blocking",
+        taskId,
+        text: wipHoldText(slotName, what, taskId),
+        options: [],
+      });
+      return item.id;
+    } catch (e) {
+      d.log("warn", "inbox raise failed", errorText(e));
+      return openWipHoldItem(p, slotName);
+    }
+  }
+
+  /** QA-PDF21-13: the open item a failed save of `slotName` raised, if any (the newest). */
+  function openWipHoldItem(p: PlanRt, slotName: string): string | null {
+    const inbox = p.writer.ledger.inbox;
+    for (let i = inbox.length - 1; i >= 0; i--) {
+      const x = inbox[i];
+      if (x !== undefined && x.answer === null && wipHoldSlotOf(x.text) === slotName) return x.id;
+    }
+    return null;
+  }
+
+  /** QA-PDF21-15: the slots of the plan whose failed save holds them (their `wipHold` item is raised). */
+  function heldSlotsOf(p: PlanRt): string[] {
+    const prefix = `${p.planId}/`;
+    return [...wipFailRaised].filter((k) => k.startsWith(prefix)).map((k) => k.slice(prefix.length)).sort();
+  }
+
+  /**
+   * QA-PDF21-15: one more save of a slot a failed save holds (the answer to its item, a collection, a purge, a manual gc).
+   * The task the ledger gives the slot to, else the one the pool leases it to, saves it at its WIP ref under its task
+   * mutex (`snapshotTaskSlot`; an orphan ref when no task of the plan holds it). A save that succeeds clears the hold
+   * (`saveSlotWork`); a slot no task holds in the ledger any more then goes back to the pool, the release that failed
+   * before. A slot the pool no longer knows holds nothing: its hold ends. Never throws; returns the save's result.
+   */
+  async function retryHeldSave(p: PlanRt, slotName: string, outcome: string): Promise<SaveResult> {
+    const key = `${p.planId}/${slotName}`;
+    let owner: string | null = null;
+    let path: string;
+    try {
+      const rec = await slotsFor(p.planId).get(slotName);
+      if (rec === null) {
+        wipFailRaised.delete(key);
+        return "clean";
+      }
+      owner = rec.state === "leased" ? rec.owner : null;
+      path = rec.path;
+    } catch (e) {
+      d.log("warn", `slot lookup of the held slot ${slotName} failed`, errorText(e));
+      return "failed";
+    }
+    const tasks = Object.values(p.writer.ledger.tasks);
+    const inLedger = tasks.find((t) => t.slot === slotName) ?? null;
+    const holder = inLedger ?? tasks.find((t) => leaseHolderID(p.planId, t.id) === owner) ?? null;
+    if (holder === null) return snapshotOrphan(p, { slot: slotName, path });
+    return withTask(p, holder.id, async () => {
+      const r = await snapshotTaskSlot(p, holder.id, slotName, outcome);
+      if (r === "failed") return r;
+      wipFailRaised.delete(key);
+      const now = own(p.writer.ledger, holder.id);
+      if ((now === null || now.slot !== slotName) && (await slotHeldBy(p, holder.id, slotName))) {
+        if (p.slotLeases.get(holder.id)?.slot === slotName) p.slotLeases.delete(holder.id);
+        try {
+          await slotsFor(p.planId).release(slotName);
+        } catch (e) {
+          d.log("warn", "slot release failed", errorText(e));
+        }
+      }
+      return r;
     });
+  }
+
+  /**
+   * QA-PDF21-15: before a purge or a manual gc deletes the plan's slots: every slot a failed save holds is saved again;
+   * one that still fails refuses the action (E_PLAN_STATE naming the slot) and its item stays open.
+   */
+  async function refuseUnsaved(p: PlanRt, action: "purge" | "gc"): Promise<void> {
+    const failed: string[] = [];
+    for (const slotName of heldSlotsOf(p)) if ((await retryHeldSave(p, slotName, action)) === "failed") failed.push(slotName);
+    if (failed.length === 0) return;
+    throw new ExecutorError(
+      "E_PLAN_STATE",
+      `plan ${p.planId}: the work in slot ${failed.join(", ")} could not be saved; ${action} refused (fix the slot's git state, then answer its item and retry)`,
+      { planId: p.planId, slots: failed },
+    );
+  }
+
+  /** The text of `wipHold`'s item; `answer` reads the slot back from it (`wipHoldSlotOf`, QA-PDF21-15). */
+  function wipHoldText(slotName: string, what: string, taskId: TaskId | null): string {
+    return `${WIP_HOLD_PREFIX}${slotName} could not be saved before ${what}; the slot keeps its work and stays leased${taskId === null ? "" : ` to ${taskId}`} (see the log). Fix the slot's git state, then answer`;
   }
 
   /**
@@ -1480,6 +1635,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     const head = p.writer.ledger.integration.head;
     try {
       await slotsFor(p.planId).reset(slot.slot, head);
+      // QA-PDF21-12: the cached lease names the commit the slot is at now, never the base before the reset.
+      if (p.slotLeases.get(t.id)?.slot === slot.slot) p.slotLeases.set(t.id, leaseAt(slot, head));
     } catch (e) {
       d.log("warn", `slot reset after a restore conflict failed`, errorText(e));
     }
@@ -1516,7 +1673,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     const key = `${p.planId}/${t.id}`;
     restoreParks.add(key);
     try {
-      await parkTask(p, t.id, "exhausted", `${msg}; answer discard-wip to relaunch without it, keep-wip to retry it`);
+      // QA-PDF21-12: no save: the slot holds only the aborted pick of the WIP ref itself, reset again above. A save there
+      // (at a stale base) would replace the WIP ref through its compare-and-swap.
+      await parkTask(p, t.id, "exhausted", `${msg}; answer discard-wip to relaunch without it, keep-wip to retry it`, "clean");
     } finally {
       restoreParks.delete(key);
     }
@@ -1797,7 +1956,12 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         p.slotLeases.set(taskId, slot);
         // pdf2-1 (b): the work left in the slot is saved before the reset (this task's -> its WIP ref, else an orphan ref).
         saved = await saveBeforeLaunchReset(p, t0, slot, priorBase);
-        if (saved !== "failed") await slotsFor(p.planId).reset(slot.slot, l.integration.head);
+        if (saved !== "failed") {
+          await slotsFor(p.planId).reset(slot.slot, l.integration.head);
+          // QA-PDF21-12: a re-acquired slot's lease names its pre-reset commit; the cache follows the reset.
+          slot = leaseAt(slot, l.integration.head);
+          p.slotLeases.set(taskId, slot);
+        }
       } catch (e) {
         const unavailable = errorCode(e) === "E_SLOT_UNAVAILABLE";
         counter(p, "launch-skipped", { reason: unavailable ? "slot-unavailable" : "provision" });
@@ -1860,11 +2024,14 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         // launch is skipped with the backoff; the ref is kept and the next tick retries the restore.
         try {
           await slotsFor(p.planId).reset(slot.slot, l.integration.head);
+          if (p.slotLeases.get(taskId)?.slot === slot.slot) p.slotLeases.set(taskId, leaseAt(slot, l.integration.head));
         } catch (e) {
           d.log("warn", "slot reset after a failed restore failed", errorText(e));
         }
         counter(p, "launch-skipped", { reason: "wip-restore", taskId });
         await abandon();
+        // QA-PDF21-16: a restore error that persists counts toward the provisioning streak, which raises one item.
+        await provisionFailed(p, taskId, `restoring the work of ${taskId} (${wipRefName(p.planId, taskId)}) in slot ${slot.slot} failed: ${back.text}`);
         return "skipped";
       }
       if (back.kind === "conflict") {
@@ -1942,6 +2109,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         route,
         role: t1.route.role,
         grant: needsOf(expanded.routeLine),
+        routeBudget: expanded.routeBudget ?? null,
         workRoot: expanded.workRoot,
         prompt: expanded.prompt,
       };
@@ -2559,6 +2727,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       route,
       role: t.route.role,
       grant: needsOf(expanded.routeLine),
+      routeBudget: expanded.routeBudget ?? null,
       workRoot: expanded.workRoot,
       prompt: expanded.prompt,
     };
@@ -2714,6 +2883,11 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     // pdf2-1 (b), QA-PDF21-10: the interrupted attempt's work is saved first, while the task still holds its slot; a
     // failed save (QA-PDF21-3) parks with the slot kept: pending/blocked cannot hold unsaved work.
     const saved: SaveResult = slotName === null ? "clean" : await snapshotTaskSlot(p, t.id, slotName, "lease-needed");
+    // QA-PDF21-19: the park of an unsaved slot is a park like `parkTask`'s: the attempt context is its item's text (so
+    // `parkItemOf` picks that item on the answer), its pending dependents are blocked and its file leases are kept with
+    // the slot (as the policy's park keeps them for a kept slot, and `rebuildLeases` rebuilds them after a restart).
+    const holdWhat = "its release (lease-needed)";
+    const holdText = saved === "failed" && slotName !== null ? wipHoldText(slotName, holdWhat, t.id) : null;
     const applied = await appendIf(p, (cur) => {
       const c = own(cur, t.id);
       if (c === null || c.state !== "running" || openAttempt(c, a.n) === null) return [];
@@ -2724,7 +2898,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       };
       const ev: ExecutorEventInput[] = [
         ae(t.id, a.n, "interrupted", clampEnd(a, at), `lease-needed:${path}`),
-        ax(t.id, a.n, evidence),
+        ax(t.id, a.n, holdText ?? evidence),
         saved === "failed"
           ? tt(t.id, "running", "parked", "ambiguity", "unsaved-slot")
           : tt(t.id, "running", "ready", "lease-needed", path),
@@ -2734,6 +2908,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       if (saved !== "failed") {
         ev.push(ts(t.id, null, null));
         if (learned !== null) ev.push(tt(t.id, "ready", "pending", "dep-added", path));
+      } else {
+        for (const dep of pendingDependentsClosure(cur, t.id)) ev.push(tt(dep.id, "pending", "blocked", dep.trigger, t.id));
       }
       ev.push(...gateRequeue(cur, c));
       return ev;
@@ -2741,8 +2917,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     releaseToken(p, t.id, a.n, "other");
     if (!applied) return;
     if (saved === "failed" && slotName !== null) {
-      releaseLeases(p, t.id);
-      await wipHold(p, t.id, slotName, "its release (lease-needed)");
+      // The park's own item (an item of this slot raised before has another text; the policy dedupes an equal open one).
+      wipFailRaised.delete(`${p.planId}/${slotName}`);
+      await wipHold(p, t.id, slotName, holdWhat);
       return;
     }
     await releaseResources(p, t.id, slotName, "lease-needed", saved);
@@ -2928,8 +3105,12 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
               // QA-PDF21-3: a failed save keeps the slot as it is (no reset) and raises the item that names it.
               if ((await snapshotTaskSlot(p, id, t.slot, "conflict")) === "failed") await wipHold(p, id, t.slot, "its reset after a conflict");
               else {
+                const head = p.writer.ledger.integration.head;
                 try {
-                  await slotsFor(p.planId).reset(t.slot, p.writer.ledger.integration.head);
+                  await slotsFor(p.planId).reset(t.slot, head);
+                  // QA-PDF21-12: the cached lease follows the reset (a later save is parented at `head`).
+                  const cached = p.slotLeases.get(id);
+                  if (cached !== undefined && cached.slot === t.slot) p.slotLeases.set(id, leaseAt(cached, head));
                 } catch (e) {
                   d.log("warn", "slot reset after conflict failed", errorText(e));
                 }
@@ -3654,7 +3835,13 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     if (f.slotValid === false) await clearBadSlot(p, t.id);
   }
 
-  /** R2: clears the slot of a ready task whose slot marker is missing or foreign; leases go, the slot only if ours. */
+  /**
+   * R2: clears the slot of a ready task whose slot marker is missing or foreign; leases go, the slot only if ours.
+   * QA-PDF21-14: the slot is gone for this task (a missing directory, no repository, or a marker naming another owner),
+   * so nothing in it is this task's to save: the pool lease is released best-effort WITHOUT a save (a save there fails,
+   * or runs `add -A` and `reset --hard` in another owner's worktree). A kept lease would hand the same slot back to every
+   * launch (`claimTask`), each one skipped.
+   */
   async function clearBadSlot(p: PlanRt, taskId: TaskId): Promise<void> {
     const slotName = own(p.writer.ledger, taskId)?.slot ?? null;
     const applied = await appendIf(p, (cur) => {
@@ -3663,9 +3850,31 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     });
     if (!applied) return;
     releaseLeases(p, taskId);
-    // QA-PDF21-4: saved before the release like every other one.
-    if (slotName !== null && (await slotHeldBy(p, taskId, slotName))) await releaseSlotSaved(p, taskId, slotName, "bad-slot");
     p.slotLeases.delete(taskId);
+    if (slotName !== null) await releaseGoneSlot(p, taskId, slotName);
+  }
+
+  /**
+   * QA-PDF21-14 (R2): returns a slot that is gone for `taskId` to the pool, best-effort and WITHOUT a save: only while the
+   * pool still leases it to the task. Its hold (a failed save of it) ends with it. Never throws.
+   */
+  async function releaseGoneSlot(p: PlanRt, taskId: TaskId, slotName: string): Promise<void> {
+    if (p.slotLeases.get(taskId)?.slot === slotName) p.slotLeases.delete(taskId);
+    let held = false;
+    try {
+      const rec = await slotsFor(p.planId).get(slotName);
+      held = rec !== null && rec.owner === leaseHolderID(p.planId, taskId) && rec.state === "leased";
+    } catch (e) {
+      d.log("warn", `slot lookup of the bad slot ${slotName} failed`, errorText(e));
+    }
+    if (!held) return;
+    wipFailRaised.delete(`${p.planId}/${slotName}`);
+    try {
+      await slotsFor(p.planId).release(slotName);
+      counter(p, "bad-slot-released", { taskId, slot: slotName });
+    } catch (e) {
+      d.log("warn", `releasing the bad slot ${slotName} of ${taskId} failed`, errorText(e));
+    }
   }
 
   /**
@@ -3690,9 +3899,10 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     }
     if (tip === "") return false;
     const stale = t0.slot;
-    // QA-PDF21-4: the stale slot's work (a `completed` task's is not committed yet) is saved before it goes back; a failed
-    // save keeps it and nothing is re-provisioned (the caller raises its item).
-    if (stale !== null && (await slotHeldBy(p, taskId, stale)) && !(await releaseSlotSaved(p, taskId, stale, "reprovision"))) return false;
+    // QA-PDF21-14: the stale slot is gone for this task (its marker is missing or names another owner, or its record
+    // vanished): it goes back to the pool best-effort WITHOUT a save, which would run `add -A` and `reset --hard` in a
+    // worktree that is not this task's (or fail in a missing one and keep the lease forever).
+    if (stale !== null) await releaseGoneSlot(p, taskId, stale);
     p.slotLeases.delete(taskId);
     let slot: SlotLease | null = null;
     const undo = async (why: string, e?: unknown): Promise<false> => {
@@ -3706,6 +3916,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       slot = await slotsFor(p.planId).acquire(p.planId, leaseHolderID(p.planId, taskId), tip);
       p.slotLeases.set(taskId, slot);
       await slotsFor(p.planId).reset(slot.slot, tip);
+      // QA-PDF21-12: the cached lease follows the reset (a re-acquired slot's lease names its pre-reset commit).
+      slot = leaseAt(slot, tip);
+      p.slotLeases.set(taskId, slot);
       // Detached at the tip: the branch may still be checked out in the stale worktree, and the ref itself stays put.
       const r = await d.git.run(["switch", "--detach", tip], { cwd: slot.path, timeoutMs: GIT_TIMEOUT_MS });
       if (r.code !== 0) return await undo("checkout failed", r.stderr.slice(0, 2000));
@@ -4541,16 +4754,24 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       // A ready task cannot park. Refuse the whole fragment if any reopened slot has unsaved work, before journaling
       // its tasks, edges or transitions; the orchestrator can retry after the task's blocking item is answered.
       const presaved = new Map<TaskId, { slot: string; saved: SaveResult }>();
-      // Even diagnostic metrics wait until the fragment is accepted: a refusal leaves the ledger untouched.
+      // Even diagnostic metrics wait until the fragment is accepted: a refusal journals nothing of the fragment, only the
+      // unsaved-work item it points at (QA-PDF21-13).
       const deferredMetrics: MetricPayload[] = [];
       for (const id of added.reopened) {
-        const c = own(p.writer.ledger, id);
-        if (c === null || c.state !== "ready" || c.slot === null) continue;
-        const saved = await snapshotTaskSlot(p, id, c.slot, "reopened", deferredMetrics);
-        if (saved === "failed") {
-          throw new ExecutorError("E_PLAN_STATE", `task ${id} holds unsaved work in slot ${c.slot}; answer its item first`);
+        // QA-PDF21-13: the state check and the save run under the task's mutex, so neither lands between a launch step's
+        // restore and its attempt-started batch (the save's reset would wipe the restored work under the new child).
+        const pre = await withTask(p, id, async () => {
+          const c = own(p.writer.ledger, id);
+          if (c === null || c.state !== "ready" || c.slot === null) return null;
+          return { slot: c.slot, saved: await snapshotTaskSlot(p, id, c.slot, "reopened", deferredMetrics) };
+        });
+        if (pre === null) continue;
+        if (pre.saved === "failed") {
+          // QA-PDF21-13: the item the refusal points at is raised first (the fragment itself journals nothing).
+          const inboxId = await wipHold(p, id, pre.slot, "its release (reopened)");
+          throw new ExecutorError("E_PLAN_STATE", `task ${id} holds unsaved work in slot ${pre.slot}; answer its item first`, { taskId: id, slot: pre.slot, inboxId });
         }
-        presaved.set(id, { slot: c.slot, saved });
+        presaved.set(id, pre);
       }
       const slots = new Map<TaskId, string>();
       await p.writer.append((cur) => {
@@ -4576,7 +4797,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       for (const m of deferredMetrics) metric(p, m);
       for (const [id, slot] of slots) {
         const pre = presaved.get(id);
-        await releaseResources(p, id, slot, "reopened", pre !== undefined && pre.slot === slot ? pre.saved : null);
+        // QA-PDF21-13: under the task's mutex too: a launch step already past its checks finishes (its batch is refused,
+        // the task is pending now) before the slot goes back.
+        await withTask(p, id, () => releaseResources(p, id, slot, "reopened", pre !== undefined && pre.slot === slot ? pre.saved : null));
       }
       schedule(p);
       return { added: added.tasks.map((t) => t.id), reopened: [...added.reopened] };
@@ -4597,7 +4820,15 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         });
         counter(p, "wip-discarded", { taskId });
       }
+      // QA-PDF21-15: the answer to a failed save's item saves the slot again (a success ends its hold); a save that fails
+      // again raises a fresh item once this one is answered, so a held slot always has an open item.
+      const heldSlot = item !== undefined && item.answer === null ? wipHoldSlotOf(item.text) : null;
+      const retried: SaveResult | null = heldSlot === null || !wipFailRaised.has(`${p.planId}/${heldSlot}`) ? null : await retryHeldSave(p, heldSlot, "answer");
       await p.collab.policy.answer(inboxId, text);
+      if (heldSlot !== null && retried === "failed") {
+        wipFailRaised.delete(`${p.planId}/${heldSlot}`);
+        await wipHold(p, item?.taskId ?? null, heldSlot, "the answer to its item");
+      }
       const ledger = p.writer.ledger;
       const unpaused = new Set(ledger.phases.filter((ph) => paused.has(ph.id) && !ph.paused).map((ph) => ph.id));
       if (unpaused.size > 0 && !p.passive && !p.latch && ledger.status === "running") {
@@ -4725,11 +4956,22 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         if (!cancelled.has(f.taskId) || h === undefined || h.n !== f.attempt) continue;
         live.add(f.taskId);
         const slotName = cancelled.get(f.taskId) ?? null;
+        // QA-PDF21-15: the plan is not idle until this release ends (`idle`): a collection between the launch's settling and
+        // the slot's save would remove the worktree with work whose save then fails, before its hold names the slot.
+        const releasing = abortReleases.get(p) ?? new Set<TaskId>();
+        abortReleases.set(p, releasing);
+        releasing.add(f.taskId);
         bg("abort cancel", async () => {
-          await d.launcher.cancel(f.taskId, f.attempt, "abort");
-          await h.completion;
-          await releaseResources(p, f.taskId, slotName);
-          releaseToken(p, f.taskId, f.attempt, "other");
+          try {
+            await d.launcher.cancel(f.taskId, f.attempt, "abort");
+            await h.completion;
+            await releaseResources(p, f.taskId, slotName);
+            releaseToken(p, f.taskId, f.attempt, "other");
+          } finally {
+            releasing.delete(f.taskId);
+            // The finished plan's collection runs now (a held slot is retried there and refuses it), not at the next backoff.
+            bg("finished slot collection", () => collectFinished(p));
+          }
         });
       }
       for (const [id, slotName] of cancelled) {
@@ -4840,6 +5082,12 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     },
 
     async gc() {
+      // QA-PDF21-15: a finished plan's slot whose work could not be saved is saved again first; a save that fails again
+      // refuses the gc (its worktree would be deleted with the work).
+      for (const known of [...plans.values()]) {
+        const st = known.writer.ledger.status;
+        if ((st === "completed" || st === "aborted") && !known.disposed) await refuseUnsaved(known, "gc");
+      }
       // A plan's answer may be asked more than once in one gc (the pool, then its facade): reported once.
       const tagPending = new Set<PlanId>();
       const report = await d.slots.gc(async (planId) => {
@@ -4879,6 +5127,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     async purge(planId, sessionID) {
       const p = await mine(planId, sessionID);
       requireStatus(p, ["completed", "aborted"]);
+      // QA-PDF21-15: a slot whose work could not be saved is saved again first; a save that fails again refuses the purge
+      // before anything is removed (its worktree would go with the work).
+      await refuseUnsaved(p, "purge");
       const toplevel = p.writer.ledger.repo.toplevel;
       await closePlan(p);
       // QA-5.1-11: the full gc runs before the ledger is removed; a pool that collection already closed still answers it

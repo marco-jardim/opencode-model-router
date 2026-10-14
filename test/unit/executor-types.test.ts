@@ -1,6 +1,7 @@
 // test/unit/executor-types.test.ts
 // Phase 1.4 task 1.4.4: unit tests for the cross-phase executor contract in src/executor/types.ts (memo §12).
 import { describe, expect, it } from "vitest";
+import { GUARD_CUMULATIVE_MULTIPLIER } from "../../src/router/guard-profile";
 import {
   ABSOLUTE_PATH_PATTERN,
   ATTEMPT_OUTCOMES,
@@ -353,12 +354,21 @@ describe("constants and enumerations", () => {
     expect([...VERDICTS]).toEqual(["pass", "fail", "unverifiable"]);
   });
 
+  it("QA-PDF21-2-18: every budget round of an attempt fits the guard's cumulative ceiling, and one more would not", () => {
+    // The first launch plus BUDGET_RESUMES resumes, each with a full per-dispatch budget, stay within budget × multiplier.
+    for (const budget of [1, 25, 50]) {
+      const cumulative = budget * GUARD_CUMULATIVE_MULTIPLIER;
+      expect((BUDGET_RESUMES + 1) * budget).toBeLessThanOrEqual(cumulative);
+      expect((BUDGET_RESUMES + 2) * budget).toBeGreaterThan(cumulative);
+    }
+  });
+
   it("exposes the documented numeric constants and patterns", () => {
     expect(LEDGER_SCHEMA).toBe(1);
     expect(LAUNCH_CONFIRM_TIMEOUT_MS).toBe(30_000);
     expect(CHILD_END_GRACE_MS).toBe(5_000);
     expect(HEAVY_CAP_PER_PROVIDER).toBe(2);
-    expect(BUDGET_RESUMES).toBe(3);
+    expect(BUDGET_RESUMES).toBe(GUARD_CUMULATIVE_MULTIPLIER - 1);
     expect(WIP_TRAILER).toBe("Omr-Wip");
     expect(ORCHESTRATOR_SHELL_RE.test("Plan (ORCHESTRATOR SHELL)")).toBe(true);
     expect(ORCHESTRATOR_SHELL_RE.test("orchestrator shell")).toBe(false);
