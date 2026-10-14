@@ -651,6 +651,19 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     expect(source.indexOf("let reruns = 0;")).toBeLessThan(source.indexOf("const withReruns ="));
   });
 
+  it("documents inferred-writer routing and the owner's all-verification-modes M39 amendment", () => {
+    const routing = sectionOf(doc, "## Task routing and write footprints").replace(/\s+/g, " ");
+    expect(routing).toContain("`route-write-conflict`, the task id and source line");
+    expect(routing).toContain("read-only role permissions are not widened");
+    const verification = sectionOf(doc, "## Verification of plan tasks").replace(/\s+/g, " ");
+    expect(verification).toContain("whether `VERIFY` is `required`, `deferred` or `none`");
+    expect(verification).toContain("already-implemented/idempotent explanation is not an exception");
+    expect(verification).toContain("With an empty write footprint, no-change success remains allowed");
+    const amendment = sectionOf(read("docs/qa/critical-path-execution/phase-3.1.md"), "## Owner amendment to M39 (2026-10-14)").replace(/\s+/g, " ");
+    expect(amendment).toContain("supersedes the verification-dependent no-change rule in M39");
+    expect(amendment).toContain("No idempotent/already-implemented exception was authorized");
+  });
+
   it("pins the never-deferred plan-task gate in both code and docs", () => {
     const source = read("src/verify/plan-task.ts");
     // Required dispatch-gate wiring: modeA/trivial:false cannot skip the gate; accept is awaited directly, not deferred.

@@ -71,6 +71,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **OpenCode v2: declared plan writers must produce a diff in every verification mode.** The owner's 2026-10-14
+  amendment to M39 makes a nonempty write footprint with no changes a counted `commit-failed` (`no changes`) for
+  `VERIFY:required`, `deferred` and `none`: bounded retries, then park, never silent `done`. No idempotent exception
+  is allowed. Empty-write no-change success and its phase-gate reconciliation are preserved.
 - **OpenCode v2: per-turn router state moves out of the system prompt.** The pending-verification list, late
   verification notices and the route hint are delivered in a per-turn `<router-state>` message appended after the
   conversation, so the system prompt stays byte-stable across turns. Late notices are repeated every turn until
@@ -84,6 +88,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and line diagnostic instead of being silently overridden. Manual/preflight/QA tasks and `Writes: none` are excluded;
   explorer permissions are unchanged.
 - **OpenCode v2: plan phase suites and base checks run in the CI slot at the commit under test, not the integration worktree's current head.**
+- **OpenCode v2: plan phases no longer stall after a no-change completion.** Tasks that finish without a commit and
+  manual/preflight tasks reported done reconcile their phase gates and dependent phases, so QA launches without another
+  orchestrator turn.
 - **OpenCode v2: work leases no longer collide across linked worktrees.** Two child sessions that edit the same
   repo-relative path in two worktrees of one repository (`git worktree add`) are both allowed: an ordinary write lease
   is keyed by its checkout, not by the repository, and a write whose target the router cannot read is refused only while

@@ -194,6 +194,14 @@ commits the child's changes. Before the gate, HEAD must be on the task branch an
 candidate. Checks see a fresh snapshot after `cleanForChecks`. The changed-file set is the union of observed files and
 the committed diff from base to candidate (including renames), not just the files the child reports.
 
+**Declared writers must produce a diff.** With a nonempty `footprint.writes`, no changes to commit means
+`commit-failed` with detail `no changes`, whether `VERIFY` is `required`, `deferred` or `none`. The failure counts
+toward `routing.executor.maxAttempts` and the circuit breaker; the normal retry path retries while attempts remain,
+then parks exhausted work. A `DONE` claim or an already-implemented/idempotent explanation is not an exception.
+This is the [owner's 2026-10-14 amendment to M39](qa/critical-path-execution/phase-3.1.md#owner-amendment-to-m39-2026-10-14).
+With an empty write footprint, no-change success remains allowed: resources are released and phase gates are
+reconciled, including dependent phases, so eligible QA can launch without another orchestrator turn.
+
 **Plan-task verification is never deferred**, even with `VERIFY:deferred`: the required gate runs synchronously in
 the slot before integration, with no pending handle or deferred footer. A mixed acceptance block is graded in two
 passes: deterministic checks first, then, only after a check pass, the grader judges the criteria. Both must pass; a

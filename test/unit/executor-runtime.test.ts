@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createCapacityController } from "../../src/executor/capacity.js";
+import { phaseIntegrated } from "../../src/executor/integrate/queue.js";
 import { taskBranchName } from "../../src/executor/git.js";
 import { createLedgerStore } from "../../src/executor/ledger.js";
 import {
@@ -1042,6 +1043,53 @@ const ERR_RATE_LIMIT = { type: "provider.rate-limit", status: 429, message: "slo
 // ---------------------------------------------------------------------------------------------------------------
 
 describe("lifecycle to integrated and done", () => {
+  it.each(["required", "deferred", "none"] as const)("opens the phase gate and launches QA when the last read-only task finishes with no changes (%s), without an orchestrator turn", async (verify) => {
+    const draft = planOf([
+      task("T1"),
+      task("T2", { verify, footprint: { writes: [], reads: [], confidence: "explicit", sources: [] } }),
+      task("QA", { kind: "qa", verify: "none", footprint: { writes: [], reads: [], confidence: "explicit", sources: [] } }),
+      task("QA2", { phase: "p2", kind: "qa", verify: "none", footprint: { writes: [], reads: [], confidence: "explicit", sources: [] } }),
+    ], { edges: [edge("T1", "T2")] });
+    draft.phases.push({ ...need(draft.phases[0], "phase"), id: "p2", dependsOn: ["p1"] });
+    need(draft.waves[0], "wave").phases.push("p2");
+    const h = await mk(draft);
+    await h.begin();
+    const phaseId = need(h.task("T2").phase, "task phase");
+    // Play Q's no-suite gate reconciliation on the real ledger; all other queue-double semantics stay unchanged.
+    const checked = vi.spyOn(h.parts().queue, "checkPhase").mockImplementation(async (id) => {
+      const ph = h.ledger().phases.find((p) => p.id === id);
+      if (ph?.gate !== "pending" || !phaseIntegrated(h.ledger(), id)) return;
+      if (h.state("T2") === "done") {
+        expect(h.task("T2").slot).toBeNull();
+        expect(h.slots.byOwner.has(`plan:${PLAN_ID}:T2`)).toBe(false);
+        expect(h.registry.heldBy(`${PLAN_ID}:T2`)).toEqual([]);
+      }
+      await h.parts().writer.append(() => [{
+        type: "gate-changed", phaseId: id, from: "pending", to: "awaiting-qa", trigger: "phase-integrated", qaRound: ph.qaRound,
+      }]);
+      h.parts().listener.onGate(id, "awaiting-qa");
+    });
+    await toVerified(h, "T1");
+    await qIntegrate(h, "T1");
+    h.parts().leases.releaseTask("T1");
+    await h.slots.release("slot-1");
+    await h.parts().queue.checkPhase(phaseId);
+    expect(h.ledger().phases.find((p) => p.id === phaseId)?.gate).toBe("pending");
+    expect(h.launcher.runOf("QA", 1)).toBeUndefined();
+    h.git.dirty = () => false;
+    const last = await h.running("T2", 1, "ses-last");
+    last.complete("DONE: nothing to change");
+    await until(() => h.state("T2") === "done", "last task done");
+    const qa = await h.runOf("QA", 1);
+    expect((await h.events()).some((e) => e.type === "gate-changed" && e.phaseId === phaseId && e.to === "awaiting-qa")).toBe(true);
+    expect(h.ledger().phases.find((p) => p.id === phaseId)?.gate).toBe("qa-running");
+    expect(qa.req.attempt).toBe(1);
+    await h.runOf("QA2", 1);
+    expect((await h.events()).some((e) => e.type === "gate-changed" && e.phaseId === "p2" && e.to === "awaiting-qa")).toBe(true);
+    expect(checked.mock.calls.map(([id]) => id)).toEqual(["p1", "p1", "p2"]);
+    expect(h.hosts.delivered).toEqual([]);
+  });
+
   it("launches with a durable nonce, a slot and a lease, then commits, verifies and enqueues (to verified)", async () => {
     const h = await mk(planOf([task("T1", { route: { line: "[route needs=shell,edit]", role: "implementer", tier: "fast", pin: false } })]));
     await h.begin();
@@ -1106,8 +1154,8 @@ describe("lifecycle to integrated and done", () => {
     expect(h.registry.heldBy("plan-one:T1")).toEqual([]);
   });
 
-  it("a task with nothing to commit and no declared writes goes straight to done and frees its resources", async () => {
-    const h = await mk(planOf([task("T1", { footprint: { writes: [], reads: [], confidence: "explicit", sources: ["path"] } })]));
+  it.each(["required", "deferred", "none"] as const)("a task with nothing to commit and no declared writes goes straight to done and frees its resources (%s)", async (verify) => {
+    const h = await mk(planOf([task("T1", { verify, footprint: { writes: [], reads: [], confidence: "explicit", sources: ["path"] } })]));
     h.git.dirty = () => false;
     await h.begin();
     const run = await h.running("T1", 1, "ses-c1");
@@ -1125,6 +1173,33 @@ describe("lifecycle to integrated and done", () => {
     expect((await h.events()).some((e) => e.type === "task-transition" && e.to === "done" && e.trigger === "no-changes")).toBe(true);
   });
 
+  it.each(["manual", "preflight"] as const)("reporting a %s task done checks its phase and transitive QA-only dependent phases", async (kind) => {
+    const draft = planOf([
+      task("M1", { kind, verify: "none", footprint: { writes: [], reads: [], confidence: "explicit", sources: [] } }),
+      task("Q2", { phase: "p2", kind: "qa", verify: "none", footprint: { writes: [], reads: [], confidence: "explicit", sources: [] } }),
+      task("Q3", { phase: "p3", kind: "qa", verify: "none", footprint: { writes: [], reads: [], confidence: "explicit", sources: [] } }),
+    ]);
+    const phase = need(draft.phases[0], "phase");
+    draft.phases.push({ ...phase, id: "p2", dependsOn: [phase.id] }, { ...phase, id: "p3", dependsOn: ["p2"] });
+    need(draft.waves[0], "wave").phases.push("p2", "p3");
+    const h = await mk(draft);
+    await h.begin();
+    await until(() => h.state("M1") === "ready", "manual/preflight ready");
+    const checked = vi.spyOn(h.parts().queue, "checkPhase").mockImplementation(async (id) => {
+      const ph = need(h.ledger().phases.find((p) => p.id === id), "phase");
+      if (ph.gate !== "pending" || !phaseIntegrated(h.ledger(), id)) return;
+      await h.parts().writer.append(() => [{
+        type: "gate-changed", phaseId: id, from: "pending", to: "awaiting-qa", trigger: "phase-integrated", qaRound: ph.qaRound,
+      }]);
+      h.parts().listener.onGate(id, "awaiting-qa");
+    });
+    await h.runtime.done(PLAN_ID, "M1", ORCH);
+    expect(checked.mock.calls.map(([id]) => id)).toEqual(["p1", "p2", "p3"]);
+    await h.runOf("Q2", 1);
+    await h.runOf("Q3", 1);
+    expect((await h.events()).flatMap((e) => e.type === "gate-changed" && e.to === "awaiting-qa" ? [e.phaseId] : [])).toEqual(["p1", "p2", "p3"]);
+  });
+
   it("a slot release that throws is logged as a warning and the task still ends done", async () => {
     const h = await mk(planOf([task("T1", { footprint: { writes: [], reads: [], confidence: "explicit", sources: ["path"] } })]));
     h.git.dirty = () => false;
@@ -1140,13 +1215,13 @@ describe("lifecycle to integrated and done", () => {
     expect(h.registry.heldBy("plan-one:T1")).toEqual([]);
   });
 
-  it("M39: a required, writing task that produced no changes fails 'no changes' (counted) and is retried", async () => {
-    const h = await mk(planOf([task("T1")]));
+  it.each(["required", "deferred", "none"] as const)("M39 amended: a writing task with no diff fails, counts, retries and parks at the attempt bound (%s)", async (verify) => {
+    const h = await mk(planOf([task("T1", { verify })], { config: { maxAttempts: 2 } }));
     h.git.dirty = () => false;
     await h.begin();
     const run = await h.running("T1", 1, "ses-c1");
     run.complete("Done, I think.");
-    await h.runOf("T1", 2);
+    const second = await h.running("T1", 2, "ses-c2");
 
     const a1 = need(h.task("T1").attempts[0], "attempt 1");
     expect(a1.outcome).toBe("succeeded");
@@ -1154,18 +1229,23 @@ describe("lifecycle to integrated and done", () => {
     expect(h.verifier.calls).toEqual([]);
     expect(h.parts().policy.counted.map((c) => c.n)).toEqual([1]);
     expect((await h.events()).some((e) => e.type === "task-transition" && e.trigger === "commit-failed")).toBe(true);
-    expect(h.state("T1")).toBe("dispatched");
-  });
+    expect(second.req.prompt).toContain("no changes");
 
-  it("M39 variant: with verify 'deferred' the same no-change task is done, not failed", async () => {
-    const h = await mk(planOf([task("T1", { verify: "deferred" })]));
-    h.git.dirty = () => false;
-    await h.begin();
-    const run = await h.running("T1", 1, "ses-c1");
-    run.complete("Done.");
-    await until(() => h.state("T1") === "done", "T1 done");
-    expect(h.task("T1").attempts).toHaveLength(1);
-    expect(h.parts().policy.counted).toEqual([]);
+    second.complete("DONE: already implemented; nothing to change.");
+    await until(() => h.state("T1") === "parked", "T1 parked");
+    await until(() => h.ledger().inbox.length === 1, "park inbox item");
+    await h.settled();
+    expect(h.parts().policy.counted.map((c) => c.n)).toEqual([1, 2]);
+    expect(h.parts().policy.parks).toEqual([{ taskId: "T1", cause: "exhausted", text: "no changes" }]);
+    expect(h.launcher.runs).toHaveLength(2);
+    expect(h.task("T1").attempts.map((a) => a.context)).toEqual(["no changes", "no changes"]);
+    expect(h.task("T1").slot).toBeNull();
+    expect(h.registry.heldBy("plan-one:T1")).toEqual([]);
+    expect(h.parts().queue.enqueued).toEqual([]);
+    expect(h.verifier.calls).toEqual([]);
+    const events = await h.events();
+    expect(events.filter((e) => e.type === "task-transition" && e.from === "completed" && e.to === "failed" && e.trigger === "commit-failed")).toHaveLength(2);
+    expect(events.some((e) => e.type === "task-transition" && e.to === "done")).toBe(false);
   });
 
   it("a qa task whose report parses goes to QaLoop, ends done and frees its slot", async () => {

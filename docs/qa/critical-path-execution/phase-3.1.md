@@ -635,3 +635,19 @@ Other: `WakeReason` has no `plan-refused` (the refusal wake uses `inbox` with ke
 ## Verdict
 
 Done at `49a8526`. `npm run smoke:cpx` on 2026-10-12 at `49a8526` with OpenCode 2.0.26: 5 files, 57/57 passed (561 s). Merged into `cpx/main`.
+
+## Owner amendment to M39 (2026-10-14)
+
+The owner approved fixing the G6 inferred-writer routing defect immediately and chose **fail without a diff**
+for declared writers. This amendment supersedes the verification-dependent no-change rule in M39 above;
+the original memo, test descriptions and recorded results remain historical evidence, not the current policy.
+
+- An ordinary task with a nonempty `footprint.writes` and no changes to commit takes row 23
+  (`commit-failed`, detail `no changes`) for **all** verification modes: `required`, `deferred` and `none`.
+- The failure is counted and uses the existing bounded retry decision: retry while attempts remain, then
+  `policy.park(id, "exhausted", "no changes")`. A child's `DONE` claim does not make it successful.
+  No idempotent/already-implemented exception was authorized.
+- A task with an empty write footprint may still take row 22 (`done`) without a diff. After resource release,
+  its phase and dependent phase gates must be reconciled so eligible QA can start without an orchestrator turn.
+- Regression coverage must exercise all three verification modes, counted failure, retry exhaustion and no
+  silent `done`; the empty-footprint completion and phase-gate regression remain required.

@@ -10,6 +10,7 @@ import {
 } from "./capacity";
 import { expandTask, loadExpansionEnv, type ExpandedTask } from "./expand";
 import { phaseTagName, taskBranchName } from "./git";
+import { dependentPhases } from "./integrate/queue";
 import type { PlanRoleBindings } from "./launch";
 import { createQaLoop } from "./qa-loop";
 import {
@@ -2115,6 +2116,19 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     await releaseResources(p, t.id, slotName);
   }
 
+  /** Non-integrating completions must wake the same phase gates as Q's row 30. */
+  async function checkTaskPhase(p: PlanRt, taskId: TaskId): Promise<void> {
+    const t = own(p.writer.ledger, taskId);
+    if (t === null || t.kind === "qa" || t.phase === null) return;
+    for (const id of [t.phase, ...dependentPhases(p.writer.ledger, [t.phase])]) {
+      try {
+        await p.collab.queue.checkPhase(id);
+      } catch (e) {
+        d.log("warn", `checkPhase ${id} failed`, errorText(e));
+      }
+    }
+  }
+
   /** M38: commit in the slot, then verify; PASS enqueues, FAIL goes to the retry decision. */
   async function commitAndVerify(p: PlanRt, taskId: TaskId, n: number): Promise<void> {
     const t = own(p.writer.ledger, taskId);
@@ -2152,7 +2166,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       return;
     }
     if (!r.changed) {
-      if (t.footprint.writes.length > 0 && t.verify === "required") {
+      // M39 owner amendment: verification policy never makes a declared writer's missing diff a success.
+      if (t.footprint.writes.length > 0) {
         await commitFailed("no changes");
         return;
       }
@@ -2160,7 +2175,10 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         const c = own(cur, taskId);
         return c === null || c.state !== "completed" ? [] : [tt(taskId, "completed", "done", "no-changes"), ts(taskId, null, null)];
       });
-      if (applied) await releaseResources(p, taskId, slotName);
+      if (applied) {
+        await releaseResources(p, taskId, slotName);
+        await checkTaskPhase(p, taskId);
+      }
       return;
     }
     const verifying = await appendIf(p, (cur) => {
@@ -3930,6 +3948,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         return [tt(taskId, "ready", "done", "reported-done")];
       });
       if (!ok) throw new ExecutorError("E_INVALID_INPUT", `${taskId} is not a ready manual or preflight task`, taskId);
+      await checkTaskPhase(p, taskId);
       schedule(p);
     },
 
@@ -3996,6 +4015,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     async abort(planId, sessionID) {
       const p = await mine(planId, sessionID);
       requireStatus(p, ["compiling", "awaiting-residue", "awaiting-approval", "running", "paused"]);
+      // Whole-plan cancellation stops progression; unlike a done task, it must not reopen gates or launch QA.
       p.latch = true;
       try {
         await p.collab.queue.abort();
