@@ -849,7 +849,7 @@ const slot: SlotLease = { slot: "s1", path: "/slot", planId: "plan", owner: "int
 const cmd: ResolvedCommand = { label: "npm test", file: "npm", args: ["test"], source: "package-script", ref: { script: "test", args: [] } };
 
 function runRes(verdict: CommandRunResult["verdict"], o: Partial<CommandRunResult> = {}): CommandRunResult {
-  return { verdict, ids: [], files: [], idsUnparsed: false, output: "", durationMs: 1, error: null, ...o };
+  return { verdict, ids: [], files: [], idsUnparsed: false, scope: "rerun", output: "", durationMs: 1, error: null, ...o };
 }
 function failRes(ids: string[], o: Partial<CommandRunResult> = {}): CommandRunResult {
   return runRes("fail", { ids, files: ["f.test.ts"], output: "out", ...o });
@@ -891,7 +891,12 @@ function suiteEnv(over: {
   const requests: CommandRunRequest[] = [];
   const background = new BackgroundRuns();
   const checks = stub<IntegrationChecks>({
-    runCommands: async req => { requests.push(req); return (over.runCommands ?? (() => runRes("pass")))(req, requests.length); },
+    runCommands: async req => {
+      requests.push(req);
+      const result = (over.runCommands ?? (() => runRes("pass")))(req, requests.length);
+      // These doubles support scoping unless a test explicitly returns a full fallback.
+      return req.mode === "full" ? { ...result, scope: "full" } : result;
+    },
     ...over.checks,
   });
   const runner = createPhaseSuiteRunner({
@@ -1670,7 +1675,7 @@ describe("integration checks: runCommands", () => {
   it("the full mode runs every command and passes", async () => {
     const { checks, spawned } = checksEnv();
     const r = await checks.runCommands(cmdReq({ commands: [lintCmd, testCmd, pyCmd] }));
-    expect(r).toMatchObject({ verdict: "pass", ids: [], files: [], idsUnparsed: false, error: null });
+    expect(r).toMatchObject({ verdict: "pass", ids: [], files: [], idsUnparsed: false, scope: "full", error: null });
     expect(spawned.map(s => s.c.label)).toEqual(["lint", "npm test", "python -m pytest"]);
   });
 
@@ -1691,7 +1696,7 @@ describe("integration checks: runCommands", () => {
     runnerHooks.readResult = async () => report({ failingIds: ["b > y", "a > x"], failingFiles: ["/slot/b", "/slot/a"] });
     const { checks, spawned } = checksEnv({ spawn: () => noneOut(1, { stdout: "boom" }) });
     const r = await checks.runCommands(cmdReq({ mode: { rerun: ["a.test.ts > x", "b.py::T::t", "a.test.ts"] } }));
-    expect(r).toMatchObject({ verdict: "fail", ids: ["a > x", "b > y"], files: ["/slot/a", "/slot/b"], idsUnparsed: false, output: "boom" });
+    expect(r).toMatchObject({ verdict: "fail", ids: ["a > x", "b > y"], files: ["/slot/a", "/slot/b"], idsUnparsed: false, scope: "rerun", output: "boom" });
     expect(planned).toEqual([{ command: "rerun", files: [nodePath.resolve("/slot", "a.test.ts"), nodePath.resolve("/slot", "b.py")] }]);
     expect(spawned[0]).toMatchObject({ cwd: "/slot/rr", c: { args: ["rr"], env: { R: "1" }, label: "npm test" } });
   });
@@ -1703,9 +1708,21 @@ describe("integration checks: runCommands", () => {
     runnerHooks.readResult = async () => report();
     const { checks, spawned } = checksEnv();
     const r = await checks.runCommands(cmdReq({ commands: [pyCmd, lintCmd], mode: { rerun: ["t.py::T::t"] } }));
-    expect(r).toMatchObject({ verdict: "pass", ids: [], files: [], idsUnparsed: false });
+    expect(r).toMatchObject({ verdict: "pass", ids: [], files: [], idsUnparsed: false, scope: "full" });
     expect(detectedFor).toEqual(["python -m pytest"]);
     expect(spawned.map(s => s.c.label)).toEqual(["python -m pytest", "lint"]);
+  });
+
+  it.each([false, true])("a passing full command makes mixed failure evidence unscoped (full first=%s)", async fullFirst => {
+    runnerHooks.detectRunner = async () => detected;
+    runnerHooks.planRerun = async () => scoped({ mode: "rerun", args: ["rr"] });
+    runnerHooks.readResult = async () => report({ failingIds: ["r.test.ts > R"], failingFiles: ["/slot/r.test.ts"] });
+    const { checks, spawned } = checksEnv({ spawn: c => noneOut(c.args.includes("rr") ? 1 : 0) });
+    const commands = fullFirst ? [lintCmd, testCmd] : [testCmd, lintCmd];
+    expect(await checks.runCommands(cmdReq({ commands, mode: { rerun: ["r.test.ts"] } }))).toMatchObject({
+      verdict: "fail", ids: ["r.test.ts > R"], idsUnparsed: false, scope: "full",
+    });
+    expect(spawned.map(s => s.c.args)).toEqual(fullFirst ? [["run", "lint"], ["rr"]] : [["rr"], ["run", "lint"]]);
   });
 
   it("an unparsed or timed out scoped failure marks the ids unparsed; a rerun with nothing affected is skipped", async () => {
@@ -1730,13 +1747,13 @@ describe("integration checks: runCommands", () => {
     for (const res of [report({ complete: false }), report({ collectionError: true })]) {
       runnerHooks.readResult = async () => res;
       const pass = checksEnv({ spawn: () => noneOut(0) });
-      expect(await pass.checks.runCommands(cmdReq({ mode: { rerun: ["a.test.ts > x"] } }))).toMatchObject({ verdict: "pass", idsUnparsed: false });
+      expect(await pass.checks.runCommands(cmdReq({ mode: { rerun: ["a.test.ts > x"] } }))).toMatchObject({ verdict: "pass", idsUnparsed: false, scope: "full" });
       expect(pass.spawned.map(s => s.c.args)).toEqual([["rr"], ["test"]]);
     }
     runnerHooks.readResult = async () => report({ complete: false });
     const fail = checksEnv({ spawn: (_c, _o, k) => (k === 1 ? noneOut(0) : noneOut(1, { stdout: " FAIL  a.test.ts > x\n Tests  1 failed (1)\n" })) });
     expect(await fail.checks.runCommands(cmdReq({ mode: { rerun: ["a.test.ts > x"] } }))).toMatchObject({
-      verdict: "fail", ids: ["a.test.ts > x"], files: [nodePath.resolve("/slot", "a.test.ts")], idsUnparsed: false,
+      verdict: "fail", ids: ["a.test.ts > x"], files: [nodePath.resolve("/slot", "a.test.ts")], idsUnparsed: false, scope: "full",
     });
     // A failing rerun whose report names no id falls back too.
     runnerHooks.readResult = async () => report();
@@ -1765,7 +1782,7 @@ describe("integration checks: runCommands", () => {
     runnerHooks.detectRunner = async () => unverifiable;
     const { checks, spawned } = checksEnv({ spawn: () => noneOut(3, { stdout: "plain" }) });
     const r = await checks.runCommands(cmdReq({ mode: { rerun: ["t"] } }));
-    expect(r).toMatchObject({ verdict: "fail", idsUnparsed: true, output: "plain" });
+    expect(r).toMatchObject({ verdict: "fail", idsUnparsed: true, scope: "full", output: "plain" });
     expect(spawned.map(s => s.c)).toEqual([testCmd]);
   });
 
@@ -2002,6 +2019,22 @@ describe("phase suite runner: run", () => {
     expect(log.counters).toEqual([{ key: "integration.bisect.probes", value: probed.length, labels: { kind: "suite" } }]);
     expect(log.ends.some(e => e.result === "ok" && e.ids?.length === 0)).toBe(true);
     expect(log.starts.at(-1)?.detail).toMatchObject({ probe: "memo", tasks: ["T1", "T2", "T3"] });
+  });
+
+  it.each(["pass", "fail"] as const)("stops a file-scoped bisect when a historical probe falls back to full (%s)", async verdict => {
+    const P = "p.test.ts > P", R = "r.test.ts > R";
+    const { runner, requests } = suiteEnv({
+      runCommands: q => q.commit === "c2" ? suiteFail([P, R]) : q.commit === "c0" ? suiteFail([P])
+        : verdict === "fail" ? suiteFail([P], { scope: "full" }) : runRes("pass", { scope: "full" }),
+      igit: { revList: async () => ["c1", "c2"] },
+    });
+    const { j, log } = journalOf();
+    expect(await runner.run(suiteReq({ commit: "c2", ranges: rangesOf(2) }), j)).toEqual({ kind: "unattributed", ids: [R], reason: "base-overlap" });
+    expect(requests.map(q => q.commit)).toEqual(["c2", "c2", "c2", "c0", "c1"]);
+    expect(requests.at(-1)?.mode).toEqual({ rerun: [fileOfSuiteId(slot.path, R)] });
+    expect(log.ends.at(-1)).toMatchObject({ result: "refused", detail: { reason: "full-command-fallback" } });
+    expect(log.counters).toEqual([{ key: "integration.bisect.probes", value: 1, labels: { kind: "suite" } }]);
+    expect(log.starts.at(-1)?.detail).toMatchObject({ probe: "memo" });
   });
 
   it("bisects an unattributable failure by the verdict alone", async () => {

@@ -38,7 +38,7 @@ Run by the orchestrator on `cpx/main` at `39067ce` (2026-10-13), before approve.
 ## Historical progress — 2026-10-14 (fallback; not accepted)
 
 The dated entries in this section are historical snapshots. See **Current status** below for the committed corrections,
-round 2 review outcome and outstanding gates; earlier uncommitted/pending statements are not current status.
+round 3 scope fix, Run 10 evidence and outstanding gates; earlier uncommitted/pending statements are not current status.
 
 The owner selected the fallback on **2026-10-13**. **G13 remains unmet** and must be disclosed in the Phase 6.2 PR.
 The pre-flight and amendments above are historical evidence, not a statement that the current worktree is clean:
@@ -152,11 +152,10 @@ This supersedes the earlier rebase-fix status: **implementation is complete**, w
   Run 9's initiating cause remains unknown; the other phase gates, G13 disclosure and deferred full-suite obligations
   are unchanged. **Phase 6.1 is still not complete or accepted.**
 
-## Current status — 2026-10-14 (working-tree validation snapshot; not accepted)
+## Round 2 validation snapshot — 2026-10-14 (historical; not accepted)
 
-This **working-tree validation snapshot at HEAD `a066f4d`** supersedes the historical uncommitted/pending status above.
-Pending facts below apply to this dated snapshot, not to later commits; earlier snapshots and results remain historical
-evidence.
+This **historical working-tree validation snapshot at HEAD `a066f4d`** records the round 2 corrections before commit.
+Its pending statements apply only to that snapshot; see **Current status** below for the subsequent commits and evidence.
 
 ### Round 2 corrections
 
@@ -197,3 +196,59 @@ pass or phase acceptance.
 - **6.1.3 remains unfinished.** Detached **6.1.4's three green runs at the committed integration head**, **6.1.5
   documentation**, and **final heavy phase QA** remain pending. **G13 remains unmet**; the Phase 6.2 PR disclosure and
   deferred full-suite obligations are unchanged. **Phase 6.1 is not complete or accepted.**
+
+## Current status — 2026-10-14 (round 3 / Run 10 snapshot; not accepted)
+
+Recorded at **HEAD `20fd7b1`, before the round 3 fix commit**. This is a historical working-tree snapshot, not a claim
+about later commit status; pending statements below apply only to this checkpoint and supersede the earlier snapshots.
+
+### Bounded round 3 review and scope fix
+
+- **Round 2 fixes are committed:** **`f802e9a`** (configured commands and explicit overrides), **`6c39d94`** (diagnostic
+  key redaction), with notes in **`20fd7b1`**. They are no longer pending commits.
+- **Bounded heavy product-correction QA round 3** identified one **major** bisect-scope issue. The **P3 `failingFiles`
+  reporting issue for explicit `cwd` overrides is deferred**. This was not final phase QA or a green review.
+- **The major fix is implemented and awaits commit at this checkpoint.** `src/executor/integrate/checks.ts` reports
+  effective execution scope: any full-command execution makes the aggregate scope `full`, including mixed scoped/full
+  runs. A requested file rerun that executes full commands cannot prove isolated-file evidence.
+- `src/executor/integrate/phase-suite.ts` uses only genuinely scoped reruns as isolation evidence. With a red base and
+  no valid isolation, the regression stays **unattributed**, rather than blaming an unrelated task. A file-scoped bisect
+  also stops unattributed if a historical probe falls back to full commands. **Genuine scoped bisects remain**, including
+  the regression that correctly identifies **T2**, not T1, against a red base.
+
+### Scoped check evidence
+
+Actual parent/producer executions reported for the scope fix, separate from the smoke evidence below:
+
+- **Parent red regression run: six failures.** Five were behavioral wrong-culprit results selecting **T1**; the sixth
+  expected the new scope metadata, not a sixth wrong-culprit observation.
+- **Parent green run:** `executor-execution-slot`, `executor-integrate-bisect`, and `executor-integrate-queue`:
+  **578 tests passed across 3 files; 98.86 s**.
+- **Producer post-fix typecheck: exit 0.** No tests were run for this documentation-only update.
+
+**Automatic verification still times out or remains unattributable.** These scoped results do not establish an automatic
+verifier acceptance, green QA review, smoke pass or phase acceptance.
+
+### Run 10 evidence and attribution limits
+
+- **Run 10 completed: 6 failed, 10 passed, 9 skipped; 566.04 s** (`.cpx-logs/e2e-run10.log`). This is not a green smoke
+  result or validation of the later scope fix; **6.1.3 remains unfinished**.
+- G1 evidence is present in **all six cases**; **actual G6 contender refusals** were observed in the **three resilience
+  cases**. The exported logs contain **zero critical `inbox-added` events**; that is an export-bounded observation, not
+  proof of absence outside the capture.
+- Captured progress continued **within 1.8 s of the 90 s deadlines**, and the **longest observed probe was under 3.6 s**
+  (exports in `.cpx-logs/run10-evidence/`, summaries in `.cpx-logs/run10-summary.json` and
+  `.cpx-logs/run10-lifecycle.json`). **No executor or probe stall is proven.** Timing-attribution investigation is ongoing;
+  **time limits are unchanged**.
+- **Run 9's initiating cause remains unknown** because its original stderr was lost. Run 10 and the diagnostic fixes do
+  not retrospectively establish it.
+
+### Remaining gates and next checkpoint
+
+- The next checkpoint is the **atomic commit of the validated scope fix and notes**; keep commits frequent and atomic
+  before future optimization. **No further broad product-correction review loop**, per owner; this does not replace final
+  phase QA or resolve the deferred P3.
+- Fresh green smoke evidence, detached **6.1.4's three green runs at the committed integration head**, **6.1.5
+  documentation**, and **final heavy phase QA** remain pending. **G13 remains unmet**; disclose it in the Phase 6.2 PR.
+- **Full-suite execution remains deferred to Phase 6.2**; no new full-suite result is claimed. **Phase 6.1 is not complete
+  or accepted.**

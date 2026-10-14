@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { copyFile, mkdir, mkdtemp, readFile, realpath, stat, symlink, writeFile } from "node:fs/promises";
 import { delimiter, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { BackgroundRuns, createIntegrateGit, createIntegrationChecks, type ResolvedCommand } from "../../src/executor/integrate/checks";
+import { BackgroundRuns, createIntegrateGit, createIntegrationChecks, type CommandRunRequest, type CommandRunResult, type ResolvedCommand } from "../../src/executor/integrate/checks";
 import { createPhaseSuiteRunner } from "../../src/executor/integrate/phase-suite";
 import type { StepJournal } from "../../src/executor/integrate/queue";
 import { createRunResolver } from "../../src/executor/integrate/run-resolver";
@@ -197,10 +197,11 @@ describe("prepared execution-slot command resolution", () => {
 });
 
 const CHECK_ID = "check.test.js > check";
+const PREEXISTING_ID = "p.test.ts > P", REGRESSION_ID = "r.test.ts > R";
 interface ScopedProbe { kind: string; cwd: string; venv: string; pythonpath: string | null; marker: string | null }
 
 /** Real router resolution, registered slots and child processes; the green package test is not the configured check. */
-async function scopedFixture(configured = false, configChanged = false) {
+async function scopedFixture(configured = false, configChanged = false, redBase = false) {
   await mkdir(resolve("tmp"), { recursive: true });
   const root = await realpath(await mkdtemp(join(resolve("tmp"), "scoped-command-")));
   roots.push(root);
@@ -211,7 +212,7 @@ async function scopedFixture(configured = false, configChanged = false) {
     venv: process.env.VIRTUAL_ENV, pythonpath: process.env.PYTHONPATH ?? null, marker: process.env.EXPLICIT_CHECK ?? null }) + '\\n');`;
   const pkg = JSON.stringify({ type: "module", scripts: { test: "vitest run" } });
   await writeFile(join(repo, "package.json"), pkg);
-  await writeFile(join(repo, "vitest.config.mjs"), "export default { test: { include: ['check.test.js'], maxWorkers: 1 } };\n");
+  await writeFile(join(repo, "vitest.config.mjs"), `export default { test: { include: ${JSON.stringify(redBase ? ["p.test.ts", "r.test.ts"] : ["check.test.js"])}, maxWorkers: 1 } };\n`);
   const test = [
     "import fs from 'node:fs'; import { test, expect } from 'vitest';",
     "test('check', () => {", probe("package"),
@@ -220,12 +221,24 @@ async function scopedFixture(configured = false, configChanged = false) {
   await writeFile(join(repo, "check.test.js"), test);
   await writeFile(join(repo, "custom-check.cjs"), [
     "const fs = require('node:fs');", probe("configured"),
-    `console.log(' FAIL  ${CHECK_ID}\\n Tests  1 failed (1)');`, "process.exit(1);",
+    ...(redBase ? [
+      `const ids = ['${PREEXISTING_ID}']; if (fs.existsSync('regression.txt')) ids.push('${REGRESSION_ID}');`,
+      "console.log(ids.map(id => ' FAIL  ' + id).join('\\n') + '\\n Tests  ' + ids.length + ' failed (' + ids.length + ')');",
+    ] : [`console.log(' FAIL  ${CHECK_ID}\\n Tests  1 failed (1)');`]), "process.exit(1);",
   ].join("\n"));
+  if (redBase) {
+    await writeFile(join(repo, "p.test.ts"), "import { test, expect } from 'vitest'; test('P', () => expect(true).toBe(false));\n");
+    await writeFile(join(repo, "r.test.ts"), "import fs from 'node:fs'; import { test, expect } from 'vitest'; test('R', () => expect(fs.existsSync('regression.txt')).toBe(false));\n");
+  }
   const commit = (message: string): string => { git(repo, "add", "."); git(repo, "commit", "-qm", message); return git(repo, "rev-parse", "HEAD"); };
   const base = commit("base");
-  await writeFile(join(repo, configChanged ? "package.json" : "check.test.js"), `${configChanged ? pkg : test}\n`);
-  const candidate = commit("candidate");
+  await writeFile(join(repo, redBase ? "unrelated.txt" : configChanged ? "package.json" : "check.test.js"), redBase ? "unrelated" : `${configChanged ? pkg : test}\n`);
+  const middle = commit("candidate");
+  let candidate = middle;
+  if (redBase) {
+    await writeFile(join(repo, "regression.txt"), "introduced by T2, not T1");
+    candidate = commit("regression");
+  }
   git(repo, "worktree", "add", "--detach", integration, base);
   git(repo, "worktree", "add", "--detach", ciPath, candidate);
   for (const cwd of [integration, ciPath]) {
@@ -238,7 +251,10 @@ async function scopedFixture(configured = false, configChanged = false) {
     registerSlot({ root: cwd, managers: ["pip", "npm"] });
     registered.push(cwd);
   }
-  const config: RunConfig = { scripts: ["test"], commands: configured ? { test: { argv: ["node", "custom-check.cjs"] } } : {}, timeoutMs: 15_000 };
+  const config: RunConfig = { scripts: ["test"], commands: {
+    ...(configured ? { test: { argv: ["node", "custom-check.cjs"] } } : {}),
+    ...(redBase ? { suite: { argv: ["node", "custom-check.cjs"] } } : {}),
+  }, timeoutMs: 15_000 };
   const resolver = createRunResolver(() => config);
   const selected = await resolver.resolve({ script: "test", args: [] }, integration);
   if (!selected.ok) throw new Error(selected.reason);
@@ -263,13 +279,20 @@ async function scopedFixture(configured = false, configChanged = false) {
     },
   });
   const runner = createPhaseSuiteRunner({ checks, igit, git: ops, pool, resolver, background, clock, logger });
+  const commandRuns: Array<{ request: CommandRunRequest; result: CommandRunResult }> = [];
+  const runCommands = checks.runCommands;
+  checks.runCommands = async request => {
+    const result = await runCommands(request);
+    commandRuns.push({ request, result });
+    return result;
+  };
   const journal: StepJournal = {
     entry: { id: "i-1", kind: "phase-suite", phaseId: "p1", taskIds: [], slot: "ci", baseHead: base, candidate: null },
     signal: new AbortController().signal, start: async () => {}, end: async () => {}, counter: () => {}, ...guard,
   };
   const request = { slot: ci, base, candidate, priority: "foreground" as const, signal: journal.signal };
   const probes = async (cwd: string): Promise<ScopedProbe[]> => (await readFile(join(cwd, "executed.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line) as ScopedProbe);
-  return { checks, resolver, runner, journal, request, command: selected.command, executed, probes, ci, integration, ciPath, base, candidate };
+  return { checks, resolver, runner, journal, request, command: selected.command, executed, commandRuns, probes, ci, integration, ciPath, base, middle, candidate };
 }
 
 describe("scoped command identity and context", () => {
@@ -301,7 +324,7 @@ describe("scoped command identity and context", () => {
     const original = JSON.stringify(command);
     const result = await f.checks.runCommands({ slot: f.ci, commit: f.candidate, commands: [command], prepare: true, mode: { rerun: [CHECK_ID] },
       requireRun: true, priority: "background", signal: f.journal.signal });
-    expect(result).toMatchObject({ verdict: "fail", ids: [CHECK_ID], files: [join(cwd, "check.test.js")], idsUnparsed: false, error: null });
+    expect(result).toMatchObject({ verdict: "fail", ids: [CHECK_ID], files: [join(cwd, "check.test.js")], idsUnparsed: false, scope: "full", error: null });
     expect(f.executed).toHaveLength(1);
     expect(f.executed[0]).toMatchObject({ cwd, command: { file: command.file, args: command.args, resolution: { cwd } } });
     expect(await f.probes(cwd)).toEqual([{ kind: "package", cwd, venv: override === "cwd" ? join(cwd, ".venv") : "explicit-venv",
@@ -331,7 +354,7 @@ describe("scoped command identity and context", () => {
     expect(failing).toMatchObject({ verdict: "fail", failingIds: [CHECK_ID], flakyIds: [], components: [{ name: "tests", scope: "rerun" }] });
     const rerun = await f.checks.runCommands({ slot: f.ci, commit: f.candidate, commands: [f.command], prepare: true, mode: { rerun: [CHECK_ID] },
       requireRun: true, priority: "background", signal: f.journal.signal });
-    expect(rerun).toMatchObject({ verdict: "fail", ids: [CHECK_ID], idsUnparsed: false, error: null });
+    expect(rerun).toMatchObject({ verdict: "fail", ids: [CHECK_ID], idsUnparsed: false, scope: "rerun", error: null });
     expect(f.executed).toHaveLength(4);
     for (const { command, cwd } of f.executed) {
       expect(command.args).toContain(join(f.ciPath, "node_modules", "vitest", "vitest.mjs"));
@@ -341,5 +364,43 @@ describe("scoped command identity and context", () => {
     }
     expect(await f.probes(f.ciPath)).toEqual(Array.from({ length: 4 }, () => ({ kind: "package", cwd: f.ciPath,
       venv: join(f.ciPath, ".venv"), pythonpath: null, marker: null })));
+  }, 30_000);
+});
+
+describe("red-base suite execution scope", () => {
+  it.each(["configured", "env", "cwd", "mixed-first", "mixed-last"] as const)("does not blame T1 when %s file reruns execute full commands", async kind => {
+    const f = await scopedFixture(kind === "configured", false, true);
+    let commands = [f.command];
+    if (kind === "env") commands = [{ ...f.command, env: { EXPLICIT_CHECK: "kept" } }];
+    if (kind === "cwd") commands = [{ ...f.command, cwd: f.ciPath }];
+    if (kind === "mixed-first" || kind === "mixed-last") {
+      const configured = await f.resolver.resolve({ script: "suite", args: [] }, f.integration);
+      if (!configured.ok) throw new Error(configured.reason);
+      commands = kind === "mixed-first" ? [configured.command, f.command] : [f.command, configured.command];
+    }
+    const ranges = [{ taskId: "T1", from: f.base, to: f.middle }, { taskId: "T2", from: f.middle, to: f.candidate }];
+    const result = await f.runner.run({ planId: "plan", phaseId: "p1", slot: f.ci, commit: f.candidate, base: f.base, commands, ranges }, f.journal);
+    // P already fails at c0 and unrelated c1; only c2 introduces R. A full-command probe at c1 would wrongly blame T1.
+    expect(result).toEqual({ kind: "unattributed", ids: [REGRESSION_ID], reason: "base-overlap" });
+    expect(f.commandRuns.map(r => r.request.commit)).toEqual([f.candidate, f.candidate, f.candidate, f.base]);
+    expect(f.commandRuns.map(r => r.result)).toMatchObject([
+      { verdict: "fail", ids: [PREEXISTING_ID, REGRESSION_ID], idsUnparsed: false, scope: "full" },
+      { verdict: "fail", ids: [PREEXISTING_ID, REGRESSION_ID], idsUnparsed: false, scope: "full" },
+      { verdict: "fail", ids: [PREEXISTING_ID, REGRESSION_ID], idsUnparsed: false, scope: "full" },
+      { verdict: "fail", ids: [PREEXISTING_ID], idsUnparsed: false, scope: "full" },
+    ]);
+    const scoped = f.executed.filter(r => r.command.args.some(arg => arg.startsWith("--outputFile")));
+    if (kind.startsWith("mixed")) expect(scoped).toHaveLength(2); // Only the package component narrows; the aggregate cannot isolate.
+    else expect(scoped).toEqual([]); // No substitution for the configured command or explicit overrides.
+  }, 30_000);
+
+  it("still identifies T2 with genuinely scoped regression isolation and a red base", async () => {
+    const f = await scopedFixture(false, false, true);
+    const ranges = [{ taskId: "T1", from: f.base, to: f.middle }, { taskId: "T2", from: f.middle, to: f.candidate }];
+    const result = await f.runner.run({ planId: "plan", phaseId: "p1", slot: f.ci, commit: f.candidate, base: f.base, commands: [f.command], ranges }, f.journal);
+    expect(result).toEqual({ kind: "culprit", range: ranges[1], ids: [REGRESSION_ID], files: [join(f.ciPath, "r.test.ts")] });
+    expect(f.commandRuns.map(r => r.request.commit)).toEqual([f.candidate, f.candidate, f.candidate, f.base, f.middle]);
+    expect(f.commandRuns.map(r => r.result.scope)).toEqual(["full", "rerun", "rerun", "full", "rerun"]);
+    expect(f.commandRuns.at(-1)).toMatchObject({ request: { mode: { rerun: [join(f.ciPath, "r.test.ts")] } }, result: { verdict: "pass" } });
   }, 30_000);
 });

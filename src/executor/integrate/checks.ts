@@ -77,6 +77,8 @@ export interface CommandRunRequest {
 }
 export interface CommandRunResult {
   verdict: "pass" | "fail" | "error"; ids: string[]; files: string[]; idsUnparsed: boolean;
+  /** Effective scope, not the requested mode: any full-command execution (including a mixed run) makes this full. */
+  scope: "full" | "rerun";
   output: string; durationMs: number; error: { reason: CheckErrorReason; message: string } | null;
 }
 export interface IntegrationChecks {
@@ -855,7 +857,7 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
   async function runCommands(req: CommandRunRequest): Promise<CommandRunResult> {
     const started = d.clock.now();
     const cwd = req.slot.path;
-    const base = { ids: [] as string[], files: [] as string[], idsUnparsed: false, output: "", durationMs: 0, error: null };
+    const base = { ids: [] as string[], files: [] as string[], idsUnparsed: false, scope: "full" as const, output: "", durationMs: 0, error: null };
     const done = (r: Partial<CommandRunResult> & { verdict: CommandRunResult["verdict"] }): CommandRunResult => ({ ...base, ...r, durationMs: d.clock.now() - started });
     if (req.prepare) {
       try {
@@ -877,6 +879,7 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
       let output = "";
       let unparsed = false;
       let failed = false;
+      let scope: CommandRunResult["scope"] = req.mode === "full" ? "full" : "rerun";
       for (const c of commands) {
         const command = scopedCommand(c);
         if (typeof req.mode !== "string" && command !== null) {
@@ -909,6 +912,7 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
             // An incomplete result (or a failure without ids): fall back to the full command below.
           }
         }
+        scope = "full";
         const out = await exec(c, cwd, signal, low);
         if (out.exitCode !== 0 || out.timedOut) {
           failed = true;
@@ -929,7 +933,7 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
         }
       }
       // Every failure path without ids sets `unparsed`, so a parsed failure always names at least one id.
-      return done({ verdict: failed ? "fail" : "pass", ids: [...ids].sort(), files: [...files].sort(), idsUnparsed: failed && unparsed, output });
+      return done({ verdict: failed ? "fail" : "pass", ids: [...ids].sort(), files: [...files].sort(), idsUnparsed: failed && unparsed, scope, output });
     }).catch((e: unknown): Held<CommandRunResult> => ({ ok: false, reason: "spawn", message: errText(e) }));
     if (!held.ok) return done({ verdict: "error", error: { reason: held.reason, message: held.message } });
     return held.value;

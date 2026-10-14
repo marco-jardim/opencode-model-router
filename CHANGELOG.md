@@ -91,6 +91,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and environment overrides are preserved. Configured commands and commands with explicit `cwd` or `env` overrides
   execute unchanged in full instead of being replaced by scoped runs; ordinary equivalent package-script test scoping
   is retained.
+- **OpenCode v2: plan phase bisects distinguish actual file-scoped checks from full-command fallbacks.** A full or
+  mixed run cannot establish isolated-file evidence. With a failing base and no valid isolation, a regression remains
+  unattributed instead of blaming the wrong task; a file-scoped bisect also stops unattributed if a historical probe
+  falls back to full commands. Genuine file-scoped bisects are preserved.
 - **OpenCode v2: explicit plan-writer routes are checked against the selected role's edit grant.** Compilation uses
   the resolved role policy, including configured permission narrowing, rather than class/tier heuristics. A writer
   routed to a general role without an `edit` grant is rejected with a task and line diagnostic; valid edit-capable routes

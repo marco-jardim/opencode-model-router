@@ -2452,6 +2452,8 @@ describe("phase suite and revert", () => {
       expect(env.ledger.inbox[0]?.text).toContain(says);
       expect(env.ledger.inbox[0]?.text).toContain(`(${reason})`);
       expect(env.phase().gate).toBe("suite-running");
+      expect(env.suite.reverts).toHaveLength(0);
+      expect(env.w.tasksAt(env.w.tip())).toEqual(["T1"]);
       env.assertInvariants();
     });
   }
@@ -6268,12 +6270,12 @@ class JournalSpy implements StepJournal {
   }
 }
 
-const passRes: CommandRunResult = { verdict: "pass", ids: [], files: [], idsUnparsed: false, output: "", durationMs: 1, error: null };
+const passRes: CommandRunResult = { verdict: "pass", ids: [], files: [], idsUnparsed: false, scope: "rerun", output: "", durationMs: 1, error: null };
 function failRes(ids: string[], files: string[], over: Partial<CommandRunResult> = {}): CommandRunResult {
-  return { verdict: "fail", ids, files, idsUnparsed: false, output: "red", durationMs: 1, error: null, ...over };
+  return { verdict: "fail", ids, files, idsUnparsed: false, scope: "rerun", output: "red", durationMs: 1, error: null, ...over };
 }
 function errRes(reason: "spawn" | "preempted" | "interrupted" | "prepare"): CommandRunResult {
-  return { verdict: "error", ids: [], files: [], idsUnparsed: false, output: "", durationMs: 1, error: { reason, message: `${reason} (scripted)` } };
+  return { verdict: "error", ids: [], files: [], idsUnparsed: false, scope: "full", output: "", durationMs: 1, error: { reason, message: `${reason} (scripted)` } };
 }
 
 type Mode = "full" | string[];
@@ -6293,7 +6295,8 @@ class RunnerChecks extends ChecksDouble {
     if (this.journal !== null && this.journal.open === null) this.world.violations.push("I4: runCommands outside a journaled step");
     const mode: Mode = req.mode === "full" ? "full" : [...req.mode.rerun];
     this.calls.push({ commit: req.commit, mode, prepare: req.prepare, priority: req.priority, slot: req.slot.slot });
-    return this.script(req.commit, mode, this.calls.length);
+    const result = this.script(req.commit, mode, this.calls.length);
+    return req.mode === "full" ? { ...result, scope: "full" } : result;
   }
 }
 
