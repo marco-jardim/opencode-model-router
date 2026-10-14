@@ -470,6 +470,56 @@ describe("acquireLeaseRegistry: the process-wide registry (ref-counted)", () => 
 });
 
 describe("leases: adapter registry observation and restoration across module copies", () => {
+  it.each([
+    ["null", null, "auto", "annotate"],
+    ["undefined", undefined, "off", "refuse"],
+    ["partial", { initializing: false }, "off", "annotate"],
+    ["invalid registry", { initializing: false, refs: 1, listeners: new Set(), logger: { warn() {} }, registry: {} }, "auto", "refuse"],
+  ] as const)("fails closed for enforced tools when the per-path entry is %s", async (_label, malformed, background, run) => {
+    const home = mkdtempSync(join(tmpdir(), "omr-v2-malformed-lease-"));
+    const snapshotPath = join(home, "outcomes", "leases.json");
+    const key = Symbol.for("opencode-model-router.leases@1");
+    const saved: unknown = Reflect.get(globalThis, key);
+    const registries = new Map<string, unknown>([[snapshotPath, malformed]]);
+    const state = { version: 1, registries };
+    Reflect.set(globalThis, key, state);
+    try {
+      const h = host = await bootBgHost({ home,
+        overrides: { routing: { leases: { mode: "enforce", run }, background: { mode: background } } },
+        sessions: { [ROOT]: {}, [A]: { parentID: ROOT, agent: "general" }, [B]: { parentID: ROOT, agent: "general" } },
+      });
+      const path = file(h, "unchecked.ts");
+      for (const session of [ROOT, A, B]) {
+        for (const event of [
+          edit(session, path), read(session, path),
+          tool(session, "write", { filePath: path, content: "changed" }),
+          tool(session, "patch", { patchText: "" }),
+          tool(session, "glob", { pattern: "**/*.ts" }),
+          tool(session, "grep", { pattern: "needle" }),
+          tool(session, "router_git_diff", {}),
+          tool(session, "router_git_ls_files", {}),
+          tool(session, "router_run", { script: "test", cwd: h.project }),
+        ]) {
+          await expect(h.before(event)).rejects.toThrow("Refused: enforced lease checks are unavailable because the lease registry could not start");
+        }
+      }
+      await expect(h.before(tool(A, "todowrite", { todos: [] }))).resolves.toBeDefined();
+      expect(peekLeaseRegistry(snapshotPath)).toBeUndefined();
+      expect(Reflect.get(globalThis, key)).toBe(state);
+      expect(registries.has(snapshotPath)).toBe(true);
+      expect(registries.get(snapshotPath)).toBe(malformed);
+      await h.dispose();
+      host = undefined;
+      expect(registries.get(snapshotPath)).toBe(malformed);
+    } finally {
+      await host?.dispose();
+      host = undefined;
+      if (saved === undefined) Reflect.deleteProperty(globalThis, key);
+      else Reflect.set(globalThis, key, saved);
+      await removeDirWhenReleased(home);
+    }
+  });
+
   it("a fresh adapter restores plan leases, drops old ad-hoc leases, and retains the restored plan lease through child end", async () => {
     const h = await boot();
     const planned = file(h, "planned.ts");

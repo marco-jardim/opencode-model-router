@@ -2357,6 +2357,7 @@ export async function registerV2Hooks(
   /** 1.3: the process-wide lease registry and the guard over it (every v2 child; roots take none). */
   let leaseHandle: ReturnType<typeof acquireLeaseRegistry> | undefined;
   let leaseGuard: LeaseGuard | undefined;
+  let leaseStartupRefusal: string | undefined;
   const holderLabel = (holderID: string): string => {
     const attempt = inflight.byChild(holderID);
     return attempt === undefined ? `session ${holderID}` : `${attemptLabel(attempt)} (session ${holderID})`;
@@ -2417,7 +2418,9 @@ export async function registerV2Hooks(
       }));
     } catch (error) {
       leaseGuard = undefined;
-      ingestLogger.warn("[router] leases: the lease registry could not start; no lease checks", { error: String(error) });
+      leaseHandle = undefined;
+      leaseStartupRefusal = "[router] Refused: enforced lease checks are unavailable because the lease registry could not start. Repair the shared lease state and restart the plugin.";
+      ingestLogger.warn("[router] leases: the lease registry could not start; enforced file, search, git and run calls are refused", { error: String(error) });
     }
   }
   // Memo §4.1 steps 3-4: the finish API is attached once (with the lease gate when leases are enforced), then the pending journal
@@ -3413,10 +3416,11 @@ export async function registerV2Hooks(
       // Only the tools the guard checks (file tools, `router_git_*`, `router_run`) and the search tools (`glob`/`grep`, whose
       // result the guard filters, so the actor must be resolved before them) reach it: no host call for any other tool.
       const leaseClass = roleActionOf(event.tool);
-      if (leaseGuard !== undefined && (leaseClass === "read" || leaseClass === "edit" || event.tool === "glob" || event.tool === "grep" || event.tool.startsWith("router_git_") || event.tool === "router_run")) {
-        const lease = await leaseGuard.before({ sessionID: String(event.sessionID), tool: event.tool, args, callID: event.id });
-        if (lease.refuse !== undefined) throw refused(lease.refuse, callerRole);
-        if (lease.runNote !== undefined) {
+      if (leaseClass === "read" || leaseClass === "edit" || event.tool === "glob" || event.tool === "grep" || event.tool.startsWith("router_git_") || event.tool === "router_run") {
+        if (leaseStartupRefusal !== undefined) throw refused(leaseStartupRefusal, callerRole);
+        const lease = await leaseGuard?.before({ sessionID: String(event.sessionID), tool: event.tool, args, callID: event.id });
+        if (lease?.refuse !== undefined) throw refused(lease.refuse, callerRole);
+        if (lease?.runNote !== undefined) {
           runNotes.delete(event.id);
           runNotes.set(event.id, lease.runNote);
           while (runNotes.size > 1000) runNotes.delete(runNotes.keys().next().value!);

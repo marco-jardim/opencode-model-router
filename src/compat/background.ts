@@ -1906,7 +1906,7 @@ interface SharedLeases {
 
 interface SharedLeaseRegistries {
   readonly version: 1;
-  readonly registries: Map<string, SharedLeases>;
+  readonly registries: Map<string, unknown>;
 }
 
 /** Versioned process state, shared even when plugin instances load separate copies of this module. */
@@ -1918,7 +1918,25 @@ function isSharedLeaseRegistries(value: unknown): value is SharedLeaseRegistries
   return state.version === 1 && state.registries instanceof Map;
 }
 
-function sharedLeaseRegistries(): Map<string, SharedLeases> {
+/** Validate each entry independently: a malformed neighbour must not replace a live registry or replay its snapshot. */
+function isSharedLeases(value: unknown): value is SharedLeases {
+  if (typeof value !== "object" || value === null) return false;
+  try {
+    const state = value as Partial<SharedLeases>;
+    const registry = state.registry;
+    return state.listeners instanceof Set
+      && typeof state.refs === "number" && Number.isSafeInteger(state.refs)
+      && typeof state.initializing === "boolean" && (state.initializing ? state.refs === 0 : state.refs > 0)
+      && typeof state.logger?.warn === "function"
+      && typeof registry === "object" && registry !== null
+      && ["acquireWrite", "checkRead", "checkRun", "filterSearchResults", "planHolderOf", "release", "releaseTask", "sweep", "snapshot", "restore"]
+        .every(method => typeof Reflect.get(registry, method) === "function");
+  } catch {
+    return false;
+  }
+}
+
+function sharedLeaseRegistries(): Map<string, unknown> {
   const existing: unknown = Reflect.get(globalThis, SHARED_LEASES_KEY);
   if (isSharedLeaseRegistries(existing)) return existing.registries;
   const state: SharedLeaseRegistries = { version: 1, registries: new Map() };
@@ -1940,8 +1958,13 @@ export function acquireLeaseRegistry(opts: {
   loadSnapshot?(): unknown;
 }): LeaseRegistryHandle {
   const registries = sharedLeaseRegistries();
-  let shared = registries.get(opts.snapshotPath);
-  if (shared === undefined) {
+  let shared: SharedLeases;
+  if (registries.has(opts.snapshotPath)) {
+    const existing = registries.get(opts.snapshotPath);
+    // Do not guess whether malformed state still owns live leases. Refuse acquisition without replacing it.
+    if (!isSharedLeases(existing)) throw new Error("lease registry state is invalid");
+    shared = existing;
+  } else {
     shared = {
       registry: createLeaseRegistry(opts.seams, { runMode: opts.runMode }),
       listeners: new Set(),
@@ -1998,7 +2021,7 @@ export function peekLeaseRegistry(snapshotPath: string): LeaseRegistry | undefin
   const state: unknown = Reflect.get(globalThis, SHARED_LEASES_KEY);
   if (!isSharedLeaseRegistries(state)) return undefined;
   const shared = state.registries.get(snapshotPath);
-  return shared?.initializing === false ? shared.registry : undefined;
+  return isSharedLeases(shared) && !shared.initializing ? shared.registry : undefined;
 }
 
 export interface LeaseGuard {

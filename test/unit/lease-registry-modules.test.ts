@@ -45,6 +45,11 @@ function previousSnapshot() {
   return registry.snapshot();
 }
 
+function sharedEntry(overrides: Record<string, unknown> = {}) {
+  return { registry: createLeaseRegistry(seams, { runMode: "annotate" }), listeners: new Set<() => void>(),
+    refs: 1, logger: { warn: vi.fn() }, initializing: false, ...overrides };
+}
+
 describe("process-wide lease registry across separately imported modules", () => {
   it("shares identity, first options and refs, while observation neither creates nor retains a registry", async () => {
     const [a, b] = await copies();
@@ -160,6 +165,95 @@ describe("process-wide lease registry across separately imported modules", () =>
     expect(handle.registry.snapshot().leases).toHaveLength(1);
     await handle.release();
     expect(b.peekLeaseRegistry(opts.snapshotPath)).toBeUndefined();
+  });
+
+  it.each([
+    ["null", () => null],
+    ["undefined", () => undefined],
+    ["primitive", () => 17],
+    ["empty object", () => ({})],
+    ["partial entry", () => ({ initializing: false })],
+    ["missing registry", () => sharedEntry({ registry: undefined })],
+    ["missing registry methods", () => sharedEntry({ registry: {} })],
+    ["non-callable registry method", () => sharedEntry({ registry: { ...createLeaseRegistry(seams, { runMode: "annotate" }), checkRead: null } })],
+    ["invalid listeners", () => sharedEntry({ listeners: [] })],
+    ["invalid logger", () => sharedEntry({ logger: { warn: 17 } })],
+    ["string refs", () => sharedEntry({ refs: "1" })],
+    ["zero live refs", () => sharedEntry({ refs: 0 })],
+    ["negative refs", () => sharedEntry({ refs: -1 })],
+    ["fractional refs", () => sharedEntry({ refs: 0.5 })],
+    ["nonfinite refs", () => sharedEntry({ refs: NaN })],
+    ["invalid initializing", () => sharedEntry({ initializing: "false" })],
+    ["initializing with live refs", () => sharedEntry({ initializing: true })],
+    ["throwing getter", () => Object.defineProperty(sharedEntry(), "registry", { get() { throw new Error("broken entry"); } })],
+  ])("rejects a malformed per-path entry (%s) without replacing it or disturbing another live registry", async (_label, malformed) => {
+    const [a, b] = await copies();
+    const key = Symbol.for("opencode-model-router.leases@1");
+    const saved: unknown = Reflect.get(globalThis, key);
+    const opts = options();
+    const foreign: unknown = malformed();
+    const registries = new Map<string, unknown>([[opts.snapshotPath, foreign]]);
+    const state = { version: 1, registries };
+    Reflect.set(globalThis, key, state);
+    try {
+      const liveOptions = options();
+      const load = vi.fn(() => previousSnapshot());
+      const one = acquire(a, { ...liveOptions, loadSnapshot: load });
+      expect(one.registry.acquireWrite(live, "live.ts").ok).toBe(true);
+      const rejectedLoad = vi.fn(() => empty);
+      for (const module of [a, b]) {
+        expect(module.peekLeaseRegistry(opts.snapshotPath)).toBeUndefined();
+        expect(() => module.acquireLeaseRegistry({ ...opts, loadSnapshot: rejectedLoad })).toThrow("lease registry state is invalid");
+      }
+      expect(rejectedLoad).not.toHaveBeenCalled();
+      expect(Reflect.get(globalThis, key)).toBe(state);
+      expect(registries.has(opts.snapshotPath)).toBe(true);
+      expect(registries.get(opts.snapshotPath)).toBe(foreign);
+      const two = acquire(b, { ...liveOptions, loadSnapshot: rejectedLoad });
+      expect(two.registry).toBe(one.registry);
+      expect(two.registry.snapshot().leases).toHaveLength(2);
+      expect(load).toHaveBeenCalledOnce();
+      expect(rejectedLoad).not.toHaveBeenCalled();
+      await one.release();
+      expect(a.peekLeaseRegistry(liveOptions.snapshotPath)).toBe(two.registry);
+      await two.release();
+      expect(a.peekLeaseRegistry(liveOptions.snapshotPath)).toBeUndefined();
+      expect(registries.size).toBe(1);
+    } finally {
+      if (saved === undefined) Reflect.deleteProperty(globalThis, key);
+      else Reflect.set(globalThis, key, saved);
+    }
+  });
+
+  it("does not replace live leases or restore again when an entry's metadata is corrupted and then repaired", async () => {
+    const [a, b] = await copies();
+    const opts = options();
+    const load = vi.fn(() => previousSnapshot());
+    const one = acquire(a, { ...opts, loadSnapshot: load });
+    const key = Symbol.for("opencode-model-router.leases@1");
+    const state: unknown = Reflect.get(globalThis, key);
+    if (typeof state !== "object" || state === null) throw new Error("missing process state");
+    const registries: unknown = Reflect.get(state, "registries");
+    if (!(registries instanceof Map)) throw new Error("missing process registries");
+    const entry: unknown = registries.get(opts.snapshotPath);
+    if (typeof entry !== "object" || entry === null) throw new Error("missing live entry");
+    const listeners: unknown = Reflect.get(entry, "listeners");
+    Reflect.set(entry, "listeners", null);
+    try {
+      expect(b.peekLeaseRegistry(opts.snapshotPath)).toBeUndefined();
+      expect(() => b.acquireLeaseRegistry({ ...opts, loadSnapshot: load })).toThrow("lease registry state is invalid");
+      expect(registries.get(opts.snapshotPath)).toBe(entry);
+      expect(one.registry.acquireWrite(live, "saved.ts")).toMatchObject({ ok: false, reason: "held" });
+    } finally {
+      Reflect.set(entry, "listeners", listeners);
+    }
+    const two = acquire(b, { ...opts, loadSnapshot: load });
+    expect(two.registry).toBe(one.registry);
+    expect(load).toHaveBeenCalledOnce();
+    await one.release();
+    expect(b.peekLeaseRegistry(opts.snapshotPath)).toBe(two.registry);
+    await two.release();
+    expect(a.peekLeaseRegistry(opts.snapshotPath)).toBeUndefined();
   });
 
   it.each([null, 17, {}, { version: 2, registries: new Map() }, { version: 1, registries: {} }])("replaces foreign global state: %j", async foreign => {
