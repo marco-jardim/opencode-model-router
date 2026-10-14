@@ -1379,12 +1379,20 @@ export interface SlotLease {
   commit: string;
 }
 
+/** A lease returned by one acquisition, with optional proof of that acquisition's completed reset. */
+export interface SlotAcquisition extends SlotLease {
+  /** Full reset at this base: pointer/link checks, checkout/clean, HEAD/status verification and provisioning drift.
+   *  Absent for same-owner/recovery, create/recreate or otherwise unproven acquisitions. This is not a persistent
+   *  cleanliness guarantee: consume it immediately after acquire, and reset if the required base has changed. */
+  readonly verifiedResetBase?: string;
+}
+
 /** Pool of provisioned git worktrees (2.4). */
 export interface SlotPool {
   /** Never waits: a reset, provisioned slot leased to `owner`, or E_SLOT_UNAVAILABLE. Concurrent calls are serialized; never double-leases.
    *  A task that already holds a slot gets the same slot back. err E_SLOT_UNAVAILABLE, E_PROVISION, E_SLOT_BROKEN */
-  acquire(planId: PlanId, owner: string, baseCommit: string): Promise<SlotLease>;
-  acquireSpecial(planId: PlanId, kind: "integration" | "ci"): Promise<SlotLease>;
+  acquire(planId: PlanId, owner: string, baseCommit: string): Promise<SlotAcquisition>;
+  acquireSpecial(planId: PlanId, kind: "integration" | "ci"): Promise<SlotAcquisition>;
   /** Checkout detached + clean tracked; re-provision on manifest drift. */
   reset(slot: string, commit: string): Promise<void>;
   cleanForChecks(slot: string): Promise<void>;

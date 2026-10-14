@@ -2245,8 +2245,86 @@ async function physicalPool(h: Harness, maxParallel: number) {
     provisioner: { detect: async () => ({ managers: [], manifests: {}, yarnBerry: false, editable: false, python: null }), provision: async () => {} } });
   await pool.open();
   h.deps.slots = pool;
-  return { pool, fs };
+  return { pool, fs, git };
 }
+
+describe("launch slot preparation", () => {
+  it.each([false, true])("resets a reused ready slot exactly once before launch (observations=%s)", async (observed) => {
+    const rows: ObservationRecord[] = [];
+    const sink = observed ? createV2Observations({ write: line => { rows.push(JSON.parse(line)); } }) : undefined;
+    const h = await mk(planOf([task("T1")], { config: { maxParallel: 1 } }), sink);
+    const { pool, git } = await physicalPool(h, 1);
+    try {
+      const ready = await pool.acquire(PLAN_ID, `plan:${PLAN_ID}:previous`, SHA2);
+      await pool.release(ready.slot);
+      expect(await pool.get(ready.slot)).toMatchObject({ state: "ready", commit: SHA2 });
+      const checkout = vi.spyOn(git, "checkoutDetach"), clean = vi.spyOn(git, "cleanTracked");
+      const pointers = vi.spyOn(git, "verifySlotPointers"), status = vi.spyOn(git, "statusPorcelain");
+      await h.begin();
+      const run = await h.runOf("T1", 1);
+
+      expect(run.req.workRoot).toBe(ready.path);
+      expect(checkout).toHaveBeenCalledTimes(1);
+      expect(checkout).toHaveBeenCalledWith(ready.path, SHA);
+      expect(clean).toHaveBeenCalledTimes(1);
+      expect(pointers).toHaveBeenCalledTimes(1);
+      expect(status).toHaveBeenCalledTimes(1);
+      expect(await pool.get(ready.slot)).toMatchObject({ state: "leased", owner: `plan:${PLAN_ID}:T1`, commit: SHA });
+      sink?.flush();
+      if (observed) {
+        expect(rows.filter(r => r.family === "scheduler" && r.action === "slot-reset-start")).toHaveLength(1);
+        expect(rows.filter(r => r.family === "scheduler" && r.action === "slot-reset-end")).toHaveLength(1);
+        expect(rows.filter(r => r.family === "scheduler" && r.action === "slot-acquire-result")).toContainEqual(expect.objectContaining({
+          state: expect.objectContaining({ detail: expect.objectContaining({ taskId: "T1", mode: "reset", result: "reused" }) }),
+        }));
+      } else expect(rows).toEqual([]);
+    } finally {
+      await h.close(); sink?.close(); pool.close();
+    }
+  });
+
+  it("resets again to the current integration head when it moved during acquisition", async () => {
+    const h = await mk(planOf([task("T1")], { config: { maxParallel: 1 } }));
+    const { pool, git } = await physicalPool(h, 1);
+    try {
+      const ready = await pool.acquire(PLAN_ID, `plan:${PLAN_ID}:previous`, SHA);
+      await pool.release(ready.slot);
+      const checkout = vi.spyOn(git, "checkoutDetach");
+      const acquire = pool.acquire.bind(pool);
+      vi.spyOn(pool, "acquire").mockImplementation(async (...args) => {
+        const lease = await acquire(...args);
+        await h.parts().writer.append([{ type: "integration-head", head: SHA2 }]);
+        return lease;
+      });
+      await h.begin();
+      await h.runOf("T1", 1);
+
+      expect(checkout.mock.calls).toEqual([[ready.path, SHA], [ready.path, SHA2]]);
+      expect(await pool.get(ready.slot)).toMatchObject({ state: "leased", commit: SHA2 });
+    } finally {
+      await h.close(); pool.close();
+    }
+  });
+
+  it("still resets a same-owner lease even when an earlier acquisition reset it to the same base", async () => {
+    const h = await mk(planOf([task("T1")], { config: { maxParallel: 1 } }));
+    const { pool, git } = await physicalPool(h, 1);
+    try {
+      const ready = await pool.acquire(PLAN_ID, `plan:${PLAN_ID}:previous`, SHA2);
+      await pool.release(ready.slot);
+      const held = await pool.acquire(PLAN_ID, `plan:${PLAN_ID}:T1`, SHA);
+      const checkout = vi.spyOn(git, "checkoutDetach"), reset = vi.spyOn(pool, "reset");
+      await h.begin();
+      const run = await h.runOf("T1", 1);
+
+      expect(run.req.workRoot).toBe(held.path);
+      expect(reset.mock.calls).toEqual([[held.slot, SHA]]);
+      expect(checkout.mock.calls).toEqual([[held.path, SHA]]);
+    } finally {
+      await h.close(); pool.close();
+    }
+  });
+});
 
 describe("physical slot observations", () => {
   it("G8: provider-free is not slot-launchable while verifying/integrating tasks retain every slot", async () => {

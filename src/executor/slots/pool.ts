@@ -10,7 +10,7 @@ import type { ObservationValue } from "../../compat/v2-observations";
 import type { GitOps } from "../git";
 import { observeSlotPool } from "../observations";
 import { ExecutorError, GIT_ID_PATTERN, PLAN_ID_PATTERN, isTaskId } from "../types";
-import type { Clock, FileSystem, PlanId, SlotLease, SlotPool, SlotRecord } from "../types";
+import type { Clock, FileSystem, PlanId, SlotAcquisition, SlotLease, SlotPool, SlotRecord } from "../types";
 import { registerSlot, unregisterSlot } from "./env";
 import type { SlotBin } from "./env";
 import { DEPENDENCY_DIRS, SLOT_SWEEP_MAX_ENTRIES, needsProvision } from "./provision";
@@ -1164,7 +1164,7 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
   }
 
   /** Under the slot mutex: re-reads the record and does the slow work. */
-  async function work(slot: string, mode: ClaimMode, spec: AcquireSpec): Promise<SlotLease> {
+  async function work(slot: string, mode: ClaimMode, spec: AcquireSpec): Promise<SlotAcquisition> {
     const acquired = (record: SlotRecord): SlotLease => {
       const lease = leaseOf(record);
       observe("slot-acquire-result", () => ({ slot, kind: spec.kind, taskId: taskIdOf(spec.owner), mode,
@@ -1202,7 +1202,11 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
         // A special slot is leased at its current HEAD; the queue resets it afterwards.
         rec = await save({ ...rec, commit: await d.git.revParse(rec.path, "HEAD") });
       }
-      return acquired(await driveStage(staged(rec), firstRun));
+      // Only a full reset in this acquisition proves launch cleanliness. Same-owner/recovery and create/recreate
+      // remain unproven, even if their marker already names the requested base.
+      const resetBase = mode === "reset" && rec.state === "resetting" && rec.commit === spec.base ? spec.base : undefined;
+      const lease = acquired(await driveStage(staged(rec), firstRun));
+      return resetBase === undefined ? lease : { ...lease, verifiedResetBase: resetBase };
     } catch (error) {
       const failed = await failStage(slot, error);
       observe("slot-acquire-result", () => ({ slot, kind: spec.kind, taskId: taskIdOf(spec.owner), mode,
@@ -1213,7 +1217,7 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
 
   async function acquireSlot(
     claim: () => Promise<{ slot: string; mode: ClaimMode }>, spec: AcquireSpec,
-  ): Promise<SlotLease> {
+  ): Promise<SlotAcquisition> {
     assertLive();
     observe("slot-acquire-start", () => ({ kind: spec.kind, taskId: taskIdOf(spec.owner) }));
     const scheduled = await poolLock.run(async () => {

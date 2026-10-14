@@ -89,6 +89,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OpenCode v2: executor launches reuse acquisition's verified reset at the current integration head, avoiding a duplicate reset while retaining full preparation for moved heads and unproven leases.**
 - **OpenCode v2: the executor's idle-with-ready metric reports a duration exactly equal to its endpoints.**
 - **CPX e2e G8 idle checks reconstruct maximal episodes from committed v2 observations.** Failed slot/launch
   reservations no longer hide stalls by fragmenting ledger metrics. The unchanged 10,000 ms ceiling applies to

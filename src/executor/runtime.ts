@@ -1461,9 +1461,14 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       };
       // 2. slot
       try {
-        slot = await slotsFor(p.planId).acquire(p.planId, leaseHolderID(p.planId, taskId), l.integration.head);
+        const { verifiedResetBase, ...acquired } = await slotsFor(p.planId).acquire(p.planId, leaseHolderID(p.planId, taskId), l.integration.head);
+        slot = acquired;
         p.slotLeases.set(taskId, slot);
-        await slotsFor(p.planId).reset(slot.slot, l.integration.head);
+        // Acquisition can await provisioning while integration advances. Only its full reset at the current head
+        // replaces launch's reset; never infer cleanliness from a same-owner lease's recorded commit.
+        const head = p.writer.ledger.integration.head;
+        if (verifiedResetBase !== head) await slotsFor(p.planId).reset(slot.slot, head);
+        slot.commit = head; // Keep the cached lease, prompt's base and verifier input aligned with the checkout.
       } catch (e) {
         const unavailable = errorCode(e) === "E_SLOT_UNAVAILABLE";
         counter(p, "launch-skipped", { reason: unavailable ? "slot-unavailable" : "provision" });
