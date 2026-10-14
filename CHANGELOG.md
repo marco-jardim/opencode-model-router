@@ -82,6 +82,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **CPX e2e smoke: amended G8 intrinsic-service oracle (A-6.1-1).** The bound uses the pre-run DAG, authored work,
+  attributable verification/integration/phase-suite service and configured parallelism, with fail-closed evidence
+  checks and raw CP/integration diagnostics retained. Throughput uses the default integration batching; resilience
+  keeps singleton batches.
 - **OpenCode v2: declared plan writers must produce a diff in every verification mode.** The owner's 2026-10-14
   amendment to M39 makes a nonempty write footprint with no changes a counted `commit-failed` (`no changes`) for
   `VERIFY:required`, `deferred` and `none`: bounded retries, then park, never silent `done`. No idempotent exception

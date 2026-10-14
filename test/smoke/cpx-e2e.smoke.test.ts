@@ -8,6 +8,7 @@ import { pathToFileURL } from "node:url";
 import { RoutingHost, ROOT, arr, obj, jsonl, redact, stopAllHosts, waitFor as waitForHost, type HostOptions, type Obj } from "./helpers/routing-host";
 import { CpxTimings, collectTimingJournal, timedWrapperSource, timingJournalSource, timingObserverSource, TIMING_DIRECTORY, type TimingRecord } from "./helpers/cpx-timing";
 import { assertG8IdleEpisodes, collectObservationFiles, G8_IDLE_CEILING_MS, reconstructIdleEpisodes, type IdleEpisode } from "./helpers/cpx-idle-oracle";
+import { assertG8Bound, freezeG8Plan, reconstructG8, workGraph, type GraphEdge, type PhaseGraph } from "./helpers/cpx-g8-oracle";
 import type { CpxRequest } from "./helpers/cpx-scripted-provider";
 import type { ExecutorConfig, ExecutorEvent, LedgerV1 } from "../../src/executor/types";
 import { createLedgerStore, createNodeFileSystem } from "../../src/executor/ledger";
@@ -27,7 +28,7 @@ const waitFor = waitForHost;
 // Provider work and the pre-run G8 oracle use authored milliseconds, without host slack.
 // Owner amendment (2026-10-14): the per-host watchdog is derived from the G8 contract instead of a fixed 90 s, which
 // run 12 showed cannot hold a complete run (serial integration alone is ~75–85 s). The G8 assertion still uses the
-// MEASURED serial integration; the per-entry allowance below only sizes the watchdog. Run 12 measured 3.4–4.5 s per
+// intrinsic service under A-6.1-1; the per-entry allowance below only sizes the watchdog. Run 12 measured 3.4–4.5 s per
 // task integration entry (throughput npm 11 entries / 40.9 s, pnpm 10 / 45.5 s, pip 10 / 34.2 s).
 const INTEGRATION_ENTRY_ALLOWANCE_MS = 5_000;
 const SETUP_WATCHDOG_MS = 60_000; // host boot through the compiled ledger
@@ -85,42 +86,13 @@ export default async function* reporter(events) {
 }
 `;
 
-interface GraphEdge { from: string; to: string }
-interface PhaseGraph {
-  phases: readonly { id: string }[];
-  tasks: Readonly<Record<string, { phase: string | null }>>;
-}
-
 /** Only the pre-run DAG and sidecar durations enter this oracle, never observed launch order. */
 function workBounds(script: PlanScript, edges: readonly GraphEdge[], graph: PhaseGraph = { phases: [], tasks: {} }): { cp: number; work: number } {
-  // compile/estimate.ts:57,75: gates have zero cost; every phase task implicitly precedes its gate.
-  // Keep a separate duration oracle: do not use the compiler's estimates or its cycle-tolerant estimator.
-  const costs = new Map(Object.entries(script.tasks).map(([id, task]) => [id, task.durationMs]));
-  for (const phase of graph.phases) costs.set(`gate:${phase.id}`, 0);
-  const links = [...edges, ...Object.entries(graph.tasks).flatMap(([id, task]) => task.phase === null ? [] : [{ from: id, to: `gate:${task.phase}` }])];
-  for (const edge of links) for (const id of [edge.from, edge.to]) {
-    if (!costs.has(id)) throw new Error(`G5: unknown graph vertex ${id}`);
-  }
-  const visiting = new Set<string>();
-  const longest = new Map<string, number>();
-  const visit = (id: string): number => {
-    const cached = longest.get(id);
-    if (cached !== undefined) return cached;
-    if (visiting.has(id)) throw new Error(`G5: cycle at ${id}`);
-    const cost = costs.get(id);
-    if (cost === undefined) throw new Error(`G5: unknown graph vertex ${id}`);
-    visiting.add(id);
-    const length = cost + Math.max(0, ...links.filter(edge => edge.to === id).map(edge => visit(edge.from)));
-    visiting.delete(id);
-    longest.set(id, length);
-    return length;
-  };
-  return { cp: Math.max(...[...costs.keys()].map(visit)), work: Object.values(script.tasks).reduce((sum, task) => sum + task.durationMs, 0) };
+  const { cp, work } = workGraph(script.tasks, edges, graph, "G5");
+  return { cp, work };
 }
 
-function assertThroughput(makespan: number, cp: number, work: number, configuredParallel: number, serialIntegration: number, idle: readonly number[]): void {
-  expect(Number.isFinite(makespan), "G8: measured makespan").toBe(true);
-  expect(makespan, "G8: independent CP/W and configured p bound").toBeLessThanOrEqual(1.3 * Math.max(cp, work / configuredParallel, serialIntegration));
+function assertIdleFragments(idle: readonly number[]): void {
   for (const interval of idle) {
     expect(interval, "G8: valid nonnegative measured idle").toBeGreaterThanOrEqual(0);
     expect(interval, "G8: idle with ready work at most 10,000 ms").toBeLessThanOrEqual(G8_IDLE_CEILING_MS);
@@ -221,15 +193,6 @@ describe("CPX e2e assertion negative controls", () => {
     expect(() => workBounds(script, [{ from: "gate:missing", to: "a" }], phases)).toThrow(/G5: unknown graph vertex/);
     expect(() => workBounds(script, [{ from: "a", to: "missing-target" }], phases)).toThrow(/G5: unknown graph vertex/);
   });
-  it.each([
-    { dominant: "CP", cp: 100, work: 200, serialIntegration: 50 },
-    { dominant: "W/p", cp: 50, work: 400, serialIntegration: 50 },
-    { dominant: "ΣI", cp: 50, work: 200, serialIntegration: 100 },
-  ])("G8 rejects makespan 1 ms past the strict bound when $dominant dominates", ({ cp, work, serialIntegration }) => {
-    // Each case has max(CP, W/p, ΣI) = 100 ms, so the strict limit is exactly 130 ms.
-    expect(() => assertThroughput(130, cp, work, 4, serialIntegration, [])).not.toThrow();
-    expect(() => assertThroughput(131, cp, work, 4, serialIntegration, [])).toThrow(/G8: independent CP\/W and configured p bound/);
-  });
   it("the watchdog comes from the G8 contract with a pre-run integration allowance, under an explicit ceiling", () => {
     const throughput = loadScript("throughput");
     expect(Object.values(throughput.tasks).filter(task => task.writePath !== undefined), "throughput writers").toHaveLength(20);
@@ -243,8 +206,8 @@ describe("CPX e2e assertion negative controls", () => {
     expect(RUN_BUDGET_MS).toBe(HOST_RUNS * HOST_RUN_CEILING_MS + 90_000);
   });
   it("G8 accepts 10,000 ms idle but rejects 10,001 ms independently of makespan", () => {
-    expect(() => assertThroughput(100, 100, 100, 4, 0, [0, 10_000])).not.toThrow();
-    expect(() => assertThroughput(100, 100, 100, 4, 0, [10_001])).toThrow(/G8: idle with ready work/);
+    expect(() => assertIdleFragments([0, 10_000])).not.toThrow();
+    expect(() => assertIdleFragments([10_001])).toThrow(/G8: idle with ready work/);
   });
   it("G4 rejects rewriting an earlier request", () => {
     const request = (text: string): CpxRequest => ({ index: 0, method: "POST", url: "/v1/messages", headers: {}, body: { system: [], messages: [{ role: "user", content: text }] } });
@@ -478,7 +441,7 @@ function integrationTime(events: readonly ExecutorEvent[]): number {
     }
   }
   expect(open.size, "G7: every integration step closes").toBe(0);
-  // Nested bisect/suite/revert spans must not inflate ΣI (and consequently the G8 bound).
+  // Raw journal-time diagnostic only; nested bisect/suite/revert spans still use union accounting.
   let elapsed = 0;
   let end = Number.NEGATIVE_INFINITY;
   for (const interval of intervals.sort((a, b) => a.from - b.from)) {
@@ -768,7 +731,9 @@ async function drive(name: typeof plans[number], repository: typeof repositories
         engine: "advise", delegation: "roles", repoParents: [directory],
         workRoots: [path.join(directory, "project"), path.join(directory, "slots", "**")],
         leases: { mode: "enforce", run: "refuse" },
-        executor: { ...script.executor, slotsDir: path.join(directory, "slots"), approve: "ask", land: "manual", batchMax: 1,
+        executor: { ...script.executor, slotsDir: path.join(directory, "slots"), approve: "ask", land: "manual",
+          // Throughput exercises the product default (4); G7 resilience needs a singleton `checks` step.
+          ...(name === "resilience" ? { batchMax: 1 } : {}),
           capacityCooldownMs: CAPACITY_COOLDOWN_MS, wakeDebounceMs: 1_000,
           ...provisioning,
           integrationChecks: [{ script: "cpx-local", args: [] }], phaseSuite: [{ script: "cpx-phase", args: [] }] },
@@ -1055,7 +1020,9 @@ async function drive(name: typeof plans[number], repository: typeof repositories
     timing.mark("compile.ledger-observed", { planId });
     const compiled = await store.read(planId);
     assertCompiled(compiled, script);
+    expect(compiled.config.batchMax, "throughput uses default batches; resilience keeps singleton checks").toBe(name === "throughput" ? 4 : 1);
     const bounds = workBounds(script, compiled.edges, compiled);
+    const g8Plan = name === "throughput" ? freezeG8Plan(script.tasks, compiled) : undefined;
     observations.compiled = compiled;
     observations.bounds = bounds;
     const entries = integratingEntries(script, compiled.phases.length);
@@ -1292,12 +1259,12 @@ async function drive(name: typeof plans[number], repository: typeof repositories
       expect(event.metric.free, "G8: reported free capacity cannot exceed configured p").toBeLessThanOrEqual(script.executor.maxParallel);
       expect(Date.parse(event.metric.toAt) - Date.parse(event.metric.fromAt), "G8: idle duration matches ledger endpoints").toBe(event.metric.ms);
     }
-    if (name === "throughput") assertThroughput(makespan, bounds.cp, bounds.work, script.executor.maxParallel, serialIntegration, idle);
+    if (name === "throughput") assertIdleFragments(idle);
     // Retain the legacy per-fragment assertion as an additional check, never the episode oracle.
     const idleEpisodes: IdleEpisode[] = [];
-    const metrics = { makespan, CP: bounds.cp, W: bounds.work, p: script.executor.maxParallel, serialIntegration, idle, idleEpisodes,
+    const metrics = { makespan, rawCP: bounds.cp, W_auth: bounds.work, p: script.executor.maxParallel, rawΣI: serialIntegration, idle, idleEpisodes,
       durationScale: 1, timingSlackMs: 0, idleSlackMs: 0, idleCeilingMs: G8_IDLE_CEILING_MS,
-      efficiency: makespan / Math.max(bounds.cp, bounds.work / script.executor.maxParallel, serialIntegration),
+      rawEfficiency: makespan / Math.max(bounds.cp, bounds.work / script.executor.maxParallel, serialIntegration),
       conflictRate: events.filter(event => event.type === "integration-step" && event.result === "conflict").length / Object.values(final.tasks).filter(task => task.integrated !== null).length,
       reworkRate: Object.values(final.tasks).reduce((count, task) => count + Math.max(0, task.attempts.length - 1), 0) / Object.keys(final.tasks).length,
       capacity: events.filter(event => event.type === "metric" && event.metric.name === "capacity"),
@@ -1312,7 +1279,6 @@ async function drive(name: typeof plans[number], repository: typeof repositories
       obligation("four-clean-qa-reports", ["1.1.QA", "1.2.QA", "2.1.QA", "2.2.QA"].every(id => cleanQa(final, id)));
       obligation("four-passed-phase-gates", final.phases.length === 4 && final.phases.every(phase => phase.gate === "passed"));
       obligation("non-overlapping-leases", leaseSamples.some(snapshot => arr(snapshot.leases).length > 0) && leaseSamples.every(nonOverlappingLeases));
-      obligation("G8-makespan-bound", Number.isFinite(makespan) && makespan <= 1.3 * Math.max(bounds.cp, bounds.work / script.executor.maxParallel, serialIntegration));
     }
 
     if (name === "resilience") {
@@ -1372,7 +1338,9 @@ async function drive(name: typeof plans[number], repository: typeof repositories
 
     // Re-run integration checks at EVERY published head, not just the final branch tip.
     const heads = events.flatMap(event => event.type === "integration-step" && event.edge === "end" && ["fast-forward", "revert-fast-forward"].includes(event.step) && event.result === "ok" && event.entry.candidate ? [event.entry.candidate] : []);
-    expect(heads.length, "G7: actual integrations").toBeGreaterThanOrEqual(20);
+    const integratedTasks = new Set(events.flatMap(event => event.type === "integration-step" && event.step === "fast-forward" && event.edge === "end" && event.result === "ok" ? event.entry.taskIds : []));
+    expect(integratedTasks.size, "G7: actual integrated tasks (a batch publishes one head)").toBeGreaterThanOrEqual(20);
+    expect(heads.length, "G7: actual published heads to audit").toBeGreaterThan(0);
     for (const head of observedHeads) expect(git(activeHost.project, "merge-base", "--is-ancestor", head, final.integration.head), "G7: observed head belongs to checked integration history").toBe("");
     const audit = path.join(activeHost.root, "audit");
     const checkedHeads: { head: string; exit: number | null }[] = [];
@@ -1427,7 +1395,13 @@ async function drive(name: typeof plans[number], repository: typeof repositories
       await activeHost.sealObservations();
       const files = await collectObservationFiles(activeHost.observationDirectory);
       observations.v2Observations = files;
-      if (!idleInventory) throw new Error("G8: missing ledger fragment inventory");
+      if (!idleInventory || !g8Plan) throw new Error("G8: missing frozen plan or ledger inventory");
+      const amended = reconstructG8(g8Plan, final, idleInventory.events, files, serialIntegration);
+      observations.g8Oracle = amended;
+      Object.assign(metrics, amended, { efficiency: amended.makespan / Math.max(amended.CP_eff, amended.W_auth / amended.p, amended["ΣI_service"]) });
+      expect(amended.makespan, "G8: service and idle inventories use the original makespan").toBe(makespan);
+      assertG8Bound(amended);
+      obligation("G8-makespan-bound", amended.makespan <= amended.bound);
       const inventorySeq = Math.max(idleInventory.snapshot.seq, ...idleInventory.events.map(event => event.seq));
       const oracle = reconstructIdleEpisodes(files, { planId: immutableId, parentSessionID: root, finalLedgerSeq: inventorySeq });
       idleEpisodes.push(...oracle.episodes);
