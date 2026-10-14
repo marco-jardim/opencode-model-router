@@ -4,7 +4,7 @@ import type { Clock, LedgerV1, LedgerWriter } from "./types";
 
 /**
  * Service family (v2 opt-in only), amended G8 intrinsic-time oracle:
- * {family:"service",spanKind:"service"|"service-prep"|"service-wait",action:"start"|"end",
+ * {family:"service",spanKind:"service"|"service-prep"|"service-wait"|"service-unattributed",action:"start"|"end",
  *  planId,taskId,attempt,phaseId,entryId,taskIds,component,candidate,operationId,stage,clockMs,durationMs,result}.
  * Task verification identifies taskId+attempt; integration identifies phaseId+entryId and copies ALL entry.taskIds
  * (also for a batch probe/subset). candidate is the checked commit/snapshot identity, null when not yet known.
@@ -23,10 +23,22 @@ import type { Clock, LedgerV1, LedgerWriter } from "./types";
  * release/cleanup and retry backoff are never service. No execution (memo/no-checks/aborted-before-run) means no
  * service pair. Repeated executions/retries have distinct IDs; do not deduplicate by candidate or taskIds.
  * End precedes result publication/cleanup. Exceptions still close pairs. Missing pairs/faulted streams are UNKNOWN,
- * not zero service. Observations neither query for identity nor change admission, scheduling or verification.
+ * not zero service. Unattributed spans (native grading without provider attempt events) are also UNKNOWN, never
+ * zero or intrinsic service. Observations neither query for identity nor change admission, scheduling or verification.
  */
 export interface ServiceObservation {
   start(kind: ServiceSpanKind, stage: string, candidate?: string | null): { end(result: string): void } | undefined;
+  execution(stage: string, candidate?: string | null): ServiceExecution | undefined;
+}
+
+/** Per-call, diagnostic-only process hook. Methods are idempotent and contain observer failures. */
+export interface ServiceExecution {
+  /** A process adapter claims the call BEFORE preparing its executable/environment or refusing a spawn. */
+  prepare(): void;
+  /** Immediately before the actual spawn, after all preparation. */
+  start(): void;
+  /** At process settlement, before result conversion/publication/cleanup; also closes a refused preparation. */
+  end(result: string): void;
 }
 
 const serviceSequences = new WeakMap<V2Observations, number>();
@@ -35,17 +47,18 @@ const serviceSequences = new WeakMap<V2Observations, number>();
 export function serviceObservation(sink: V2Observations | undefined, identity: () => ServiceIdentity,
   now: () => number = () => performance.now()): ServiceObservation | undefined {
   if (sink === undefined) return undefined;
-  return { start(spanKind, stage, candidate) {
+  const open = (spanKind: ServiceSpanKind, stage: string, candidate?: string | null,
+    project = identity, clock = now): ReturnType<ServiceObservation["start"]> => {
     let captured: ServiceIdentity | undefined;
     let operationId = "";
     let started = 0;
     observeV2(sink, () => {
-      captured = { ...identity(), ...(candidate === undefined ? {} : { candidate }) };
+      captured = { ...project(), ...(candidate === undefined ? {} : { candidate }) };
       captured = { ...captured, taskIds: [...captured.taskIds] };
       const n = (serviceSequences.get(sink) ?? 0) + 1;
       serviceSequences.set(sink, n);
       operationId = `service-${n}`;
-      started = now();
+      started = clock();
       return { ...captured, family: "service", spanKind, stage, operationId, action: "start", clockMs: started, durationMs: 0, result: null };
     });
     if (captured === undefined || operationId === "") return undefined;
@@ -59,7 +72,45 @@ export function serviceObservation(sink: V2Observations | undefined, identity: (
         return { ...fields, family: "service", spanKind, stage, operationId, action: "end", clockMs, durationMs: clockMs - started, result };
       });
     } };
-  } };
+  };
+  return {
+    start: open,
+    execution(stage, candidate) {
+      // Defer classification, not the clock/identity. An injected execution-only seam is itself the boundary;
+      // production adapters call prepare/start/end to split preparation from the actual child lifetime.
+      let captured: ServiceIdentity, started: number;
+      try {
+        captured = { ...identity(), ...(candidate === undefined ? {} : { candidate }) };
+        captured = { ...captured, taskIds: [...captured.taskIds] };
+        started = now();
+      } catch (error) {
+        observeV2(sink, () => { throw error; });
+        return undefined;
+      }
+      let phase: "pending" | "preparation" | "execution" | "ended" = "pending";
+      let span: ReturnType<ServiceObservation["start"]>;
+      const begin = (kind: ServiceSpanKind, name: string, clock = now) => open(kind, name, undefined, () => captured, clock);
+      return {
+        prepare() {
+          if (phase !== "pending") return;
+          phase = "preparation";
+          span = begin("service-prep", "process-preparation", () => started);
+        },
+        start() {
+          if (phase === "execution" || phase === "ended") return;
+          span?.end("completed");
+          phase = "execution";
+          span = begin("service", stage);
+        },
+        end(result) {
+          if (phase === "ended") return;
+          if (phase === "pending") span = begin("service", stage, () => started);
+          phase = "ended";
+          span?.end(result);
+        },
+      };
+    },
+  };
 }
 
 /** Same plan-scoped v2 port as physical slots; queue/checks need no runtime or scheduling hook. */

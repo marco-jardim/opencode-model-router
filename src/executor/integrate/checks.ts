@@ -14,7 +14,7 @@ import { observeTests } from "../../verify/baseline";
 import { acquireSlot, type SlotHandle } from "../../verify/slot";
 import type { ExecResult } from "../../verify/types";
 import type { GitOps } from "../git";
-import type { ServiceObservation } from "../observations";
+import type { ServiceExecution, ServiceObservation } from "../observations";
 import {
   ExecutorError,
   type Clock, type GitRunner, type LedgerV1, type RunCommandRef, type SlotLease, type SlotPool,
@@ -46,7 +46,7 @@ export interface ResolvedCommand {
   cwd?: string;
 }
 export interface CommandOutput { exitCode: number | null; timedOut: boolean; stdout: string; stderr: string; durationMs: number }
-export type CommandRunner = (c: ResolvedCommand, o: { cwd: string; signal: AbortSignal; lowPriority: boolean }) => Promise<CommandOutput>;
+export type CommandRunner = (c: ResolvedCommand, o: { cwd: string; signal: AbortSignal; lowPriority: boolean; service?: ServiceExecution }) => Promise<CommandOutput>;
 export interface RunResolver {
   resolve(ref: RunCommandRef, cwd: string): Promise<{ ok: true; command: ResolvedCommand } | { ok: false; reason: string }>;
 }
@@ -608,10 +608,11 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     const context = executions.get(signal);
     if (context === undefined) return d.spawn(command, { cwd: c.cwd ?? cwd, signal, lowPriority: low });
     context?.preparation?.end("completed");
-    const service = context?.observation.start("service", "command", context.candidate);
+    const service = context.observation.execution("command", context.candidate);
     let result = "error";
     try {
-      const out = await d.spawn(command, { cwd: c.cwd ?? cwd, signal, lowPriority: low });
+      const out = await d.spawn(command, { cwd: c.cwd ?? cwd, signal, lowPriority: low,
+        ...(service === undefined ? {} : { service }) });
       result = signal.aborted ? "interrupted" : out.timedOut ? "timed-out" : out.exitCode === 0 ? "pass" : "fail";
       return out;
     } finally {

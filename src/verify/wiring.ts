@@ -1319,6 +1319,7 @@ export function createVerificationWiring(deps: {
       signal: opts?.signal,
       lowPriority: opts?.lowPriority,
       env: opts?.env,
+      ...(opts?.service === undefined ? {} : { service: opts.service }),
     });
 
   const argvSeam: ArgvSeam = (file, args, opts) =>
@@ -1328,6 +1329,7 @@ export function createVerificationWiring(deps: {
       signal: opts?.signal,
       lowPriority: opts?.lowPriority,
       env: opts?.env,
+      ...(opts?.service === undefined ? {} : { service: opts.service }),
     });
 
   // T9 1.3: PlannerFs + unlink over fs.promises. realpath is the native one; fileExists accepts

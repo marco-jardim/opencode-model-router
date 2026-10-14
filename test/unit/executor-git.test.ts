@@ -1,17 +1,21 @@
+import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { hardenedEnvironment } from "../../src/executor/git";
 import {
-  COMMIT_SUBJECT_PATTERN, SLOT_EXCLUDES_CONTENT, commitTypeFor, createGitOps, encodeRefId, executorGitArgs, formatCommitMessage,
+  COMMIT_SUBJECT_PATTERN, SLOT_EXCLUDES_CONTENT, commitTypeFor, createGitOps, createGitRunner, encodeRefId, executorGitArgs, formatCommitMessage,
   integrationBranchName, phaseTagName, planRefPrefix, readCommitIdentity, taskBranchName,
   type GitOps,
 } from "../../src/executor/git";
 import { ExecutorError, type FileSystem, type Footprint, type GitRunner, type ProcessResult } from "../../src/executor/types";
 import { createV2Observations } from "../../src/compat/v2-observations";
 import { serviceObservation } from "../../src/executor/observations";
-import { servicePairs } from "../helpers/service-observations";
+import * as gitTools from "../../src/router/git-tools";
+import { completedServiceProcess, servicePairs } from "../helpers/service-observations";
+
+vi.mock("node:child_process", async original => ({ ...await original<typeof import("node:child_process")>(), spawn: vi.fn() }));
 
 const PLAN = "p-20261010-abc123";
 
@@ -588,6 +592,57 @@ describe("GitOps refs", () => {
 });
 
 describe("GitOps repository reads", () => {
+  it.each(["executable", "environment"] as const)("excludes the production GitRunner's %s preparation from merge service", async preparation => {
+    const run = async (delayMs: number) => {
+      let now = 0;
+      const lines: string[] = [];
+      const sink = createV2Observations({ write: line => { lines.push(line); } });
+      const repo = resolve(".");
+      const guards = vi.spyOn(gitTools, "workRootGuards").mockReturnValue([repo]);
+      const executable = vi.spyOn(gitTools, "gitExecutable").mockImplementation(() => {
+        if (preparation === "executable") now += delayMs;
+        return "git";
+      });
+      const gitEnvironment = gitTools.gitEnvironment;
+      const environment = vi.spyOn(gitTools, "gitEnvironment").mockImplementation(extra => {
+        if (preparation === "environment") now += delayMs;
+        return gitEnvironment(extra);
+      });
+      vi.mocked(spawn).mockImplementation(() => completedServiceProcess(() => { now += 11; }));
+      const production = createGitRunner({ mode: "hardened", toplevel: repo });
+      const git: GitRunner = {
+        // Repository preconditions are doubles; the observed merge uses the REAL runner and spawnBounded.
+        run: async (args, opts) => sub(args)[0] === "merge" ? production.run(args, opts) : result({ stdout: OID_B }),
+      };
+      const ops = createGitOps({ git, userGit: identityRunner(), fs: memoryFs(), planId: PLAN, toplevel: repo, executorHome: HOME });
+      const observation = serviceObservation(sink, () => ({ planId: PLAN, taskId: null, attempt: null,
+        phaseId: "p1", entryId: "i-1", taskIds: ["T1"], component: "fast-forward", candidate: OID_B }), () => now);
+      try {
+        expect(await ops.mergeFfOnly(repo, OID_B, observation)).toEqual({ ok: true, head: OID_B });
+        expect(executable).toHaveBeenCalledOnce();
+        expect(environment).toHaveBeenCalledOnce();
+        expect(spawn).toHaveBeenCalledOnce();
+        sink.close();
+        return { elapsed: now, rows: servicePairs(lines) };
+      } finally {
+        sink.close();
+        guards.mockRestore();
+        executable.mockRestore();
+        environment.mockRestore();
+        vi.mocked(spawn).mockReset();
+      }
+    };
+    const baseline = await run(0);
+    const delayed = await run(2_000);
+    expect(delayed.elapsed - baseline.elapsed).toBe(2_000);
+    for (const result of [baseline, delayed]) {
+      expect(result.rows.filter(r => r.spanKind === "service" && r.action === "end")).toMatchObject([
+        { stage: "merge", candidate: OID_B, durationMs: 11, result: "pass" },
+      ]);
+    }
+    expect(delayed.rows).toContainEqual(expect.objectContaining({ spanKind: "service-prep", action: "end", durationMs: 2_000 }));
+  });
+
   it("revParse peels to a commit and validates the revision and the output", async () => {
     const git = fakeRunner(() => ({ stdout: `${OID_A}\n` }));
     const ops = makeOps(git);

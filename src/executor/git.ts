@@ -81,20 +81,27 @@ export function createGitRunner(o: { mode: "hardened" | "user"; toplevel: string
   let executable: string | undefined;
   return {
     async run(args: readonly string[], p: ProcOpts): Promise<ProcessResult> {
-      if (p.stdin !== undefined) throw new Error("the git runner does not support stdin");
-      executable ??= gitExecutable(workRootGuards(o.toplevel));
-      const env = o.mode === "hardened" ? hardenedEnvironment(p.env) : userEnvironment(p.env);
-      const started = Date.now();
-      const bounds = { env, timeoutMs: p.timeoutMs, maxBytes: p.maxOutputBytes ?? GIT_MAX_OUTPUT_BYTES, settleOnFailure: true };
-      const result = await spawnBounded(executable, args, p.cwd, p.signal === undefined ? bounds : { ...bounds, signal: p.signal });
-      if (result.failure !== undefined) {
-        throw new GitRunnerError(result.failure.endsWith("timed out") ? "ETIMEDOUT" : "ABORT_ERR", result.failure);
+      try { p.service?.prepare(); } catch { /* Diagnostics only. */ }
+      try {
+        if (p.stdin !== undefined) throw new Error("the git runner does not support stdin");
+        executable ??= gitExecutable(workRootGuards(o.toplevel));
+        const env = o.mode === "hardened" ? hardenedEnvironment(p.env) : userEnvironment(p.env);
+        const started = Date.now();
+        const bounds = { env, timeoutMs: p.timeoutMs, maxBytes: p.maxOutputBytes ?? GIT_MAX_OUTPUT_BYTES, settleOnFailure: true,
+          ...(p.service === undefined ? {} : { service: p.service }) };
+        const result = await spawnBounded(executable, args, p.cwd, p.signal === undefined ? bounds : { ...bounds, signal: p.signal });
+        if (result.failure !== undefined) {
+          throw new GitRunnerError(result.failure.endsWith("timed out") ? "ETIMEDOUT" : "ABORT_ERR", result.failure);
+        }
+        if (result.truncated) throw new GitRunnerError("EOUTPUT", `git output exceeds ${bounds.maxBytes} bytes`);
+        return {
+          code: result.code, signal: null, stdout: result.output.toString("utf8"), stderr: result.stderr.toString("utf8"),
+          truncated: false, durationMs: Date.now() - started,
+        };
+      } finally {
+        // Preparation can throw before spawnBounded owns the hook. Its completed child is already closed here.
+        try { p.service?.end("error"); } catch { /* Diagnostics only. */ }
       }
-      if (result.truncated) throw new GitRunnerError("EOUTPUT", `git output exceeds ${bounds.maxBytes} bytes`);
-      return {
-        code: result.code, signal: null, stdout: result.output.toString("utf8"), stderr: result.stderr.toString("utf8"),
-        truncated: false, durationMs: Date.now() - started,
-      };
     },
   };
 }
@@ -465,9 +472,10 @@ export function createGitOps(d: GitOpsDeps): GitOps {
   async function exec(op: string, cwd: string, args: readonly string[], limit: number, diagnostic?: GitService): Promise<ProcessResult> {
     let result: ProcessResult;
     diagnostic?.preparation?.end("completed");
-    const service = diagnostic?.observation.start("service", diagnostic.stage);
+    const service = diagnostic?.observation.execution(diagnostic.stage);
     try {
-      result = await d.git.run(args, { cwd, timeoutMs: limit, maxOutputBytes: GIT_MAX_OUTPUT_BYTES });
+      result = await d.git.run(args, { cwd, timeoutMs: limit, maxOutputBytes: GIT_MAX_OUTPUT_BYTES,
+        ...(service === undefined ? {} : { service }) });
       service?.end(result.code === 0 && !result.truncated ? "pass" : "fail");
     } catch (error) {
       if (error instanceof ExecutorError) throw error;

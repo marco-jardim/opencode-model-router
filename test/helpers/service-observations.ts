@@ -1,5 +1,23 @@
+import { ChildProcess } from "node:child_process";
+import { PassThrough } from "node:stream";
 import { expect } from "vitest";
 import { checkV2ObservationStream, type ServiceObservationData } from "../../src/compat/v2-observations";
+
+/** Only the OS child is doubled: callers still run their real pre-spawn preparation and process lifecycle. */
+export function completedServiceProcess(onClose: () => void, output = "", code = 0): ChildProcess {
+  const child = new ChildProcess();
+  const stdout = new PassThrough(), stderr = new PassThrough();
+  child.stdout = stdout;
+  child.stderr = stderr;
+  queueMicrotask(() => {
+    stdout.end(output);
+    stderr.end();
+    onClose();
+    child.emit("exit", code, null);
+    child.emit("close", code, null);
+  });
+  return child;
+}
 
 /** Also requires a complete, fault-free stream: dropped starts/ends must never look like zero service. */
 export function servicePairs(lines: readonly string[]): ServiceObservationData[] {

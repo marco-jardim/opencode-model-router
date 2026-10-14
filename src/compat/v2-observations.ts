@@ -96,7 +96,7 @@ export interface ServiceIdentity {
   component: "verify" | "rebase" | "checks" | "fast-forward" | "phase-suite";
   candidate: string | null;
 }
-export type ServiceSpanKind = "service" | "service-prep" | "service-wait";
+export type ServiceSpanKind = "service" | "service-prep" | "service-wait" | "service-unattributed";
 export type ServiceObservationData = ServiceIdentity & {
   family: "service"; spanKind: ServiceSpanKind; operationId: string; stage: string;
   action: "start" | "end"; clockMs: number; durationMs: number; result: string | null;

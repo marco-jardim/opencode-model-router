@@ -233,7 +233,9 @@ export function createV2Runtime(ctx: Plugin.Context, options: V2RuntimeOptions =
         serviceAttempted = true;
         try {
           request.onServiceStart?.();
-          service = request.service.start("service", "grading");
+          // Native progress brackets a prompt, not provider attempts. This API exposes no retry/startup
+          // boundaries inside execute, so its elapsed time is insufficient intrinsic-service evidence.
+          service = request.service.start("service-unattributed", "grading");
         } catch { /* Diagnostics only. */ }
       };
       try {

@@ -446,6 +446,7 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
         spawn: async (command, opts) => {
           const start = clock.now();
           const result = await runArgv(command.file, command.args, { cwd: command.cwd ?? opts.cwd, env: command.env,
+            ...(opts.service === undefined ? {} : { service: opts.service }),
             signal: opts.signal, lowPriority: opts.lowPriority, timeoutMs: resolveRolesRouting(loadConfig(directory), "v2").run.timeoutMs });
           return { exitCode: result.code, timedOut: result.timedOut, stdout: result.stdout, stderr: result.stderr, durationMs: clock.now() - start };
         },

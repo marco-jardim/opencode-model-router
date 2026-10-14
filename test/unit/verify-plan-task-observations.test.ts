@@ -1,22 +1,29 @@
+import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createV2Observations, type ObservationRecord, type V2Observations } from "../../src/compat/v2-observations";
 import { leaseHolderID, type Attempt, type SlotLease, type TaskNode } from "../../src/executor/types";
 import type { RouterConfig } from "../../src/router/config";
 import { createChangedFileStore } from "../../src/verify/dispatch";
+import { runShell } from "../../src/verify/exec";
 import { accept, gateResult } from "../../src/verify/gate";
-import { readHeadState } from "../../src/verify/head";
+import { readHead, readHeadState } from "../../src/verify/head";
 import { createLeaseSelfExemptions, createPlanTaskVerifier, planTaskVerificationID, planTreeKey, type PlanTaskGit } from "../../src/verify/plan-task";
 import { snapshotTree } from "../../src/verify/tree";
 import { createVerificationWiring } from "../../src/verify/wiring";
-import { servicePairs } from "../helpers/service-observations";
+import { completedServiceProcess, servicePairs } from "../helpers/service-observations";
 
-// Only I/O and the final gate are doubles: begin/observe/fallback, prepareVerification,
-// observeChange and the change store are the real plan-task -> wiring boundary.
+// Capture tests double the final gate; the candidate regression restores real accept and
+// runShell, doubling only I/O below the real plan-task -> wiring -> deterministic boundary.
+vi.mock("node:child_process", async original => ({ ...await original<typeof import("node:child_process")>(), spawn: vi.fn() }));
 vi.mock("../../src/verify/tree", async (original) => ({ ...await original<typeof import("../../src/verify/tree")>(), snapshotTree: vi.fn() }));
-vi.mock("../../src/verify/head", async (original) => ({ ...await original<typeof import("../../src/verify/head")>(), readHeadState: vi.fn() }));
+vi.mock("../../src/verify/head", async (original) => ({ ...await original<typeof import("../../src/verify/head")>(), readHead: vi.fn(), readHeadState: vi.fn() }));
 vi.mock("../../src/verify/perimeter", async (original) => ({ ...await original<typeof import("../../src/verify/perimeter")>(), planPerimeter: () => undefined }));
 vi.mock("../../src/verify/gate", async (original) => ({ ...await original<typeof import("../../src/verify/gate")>(), accept: vi.fn() }));
+vi.mock("../../src/verify/slot", async original => ({
+  ...await original<typeof import("../../src/verify/slot")>(),
+  acquireSlot: vi.fn(async () => ({ lost: false, release: async () => undefined })),
+}));
 vi.mock("../../src/verify/exec", () => ({
   runArgv: vi.fn(async () => { throw new Error("unexpected verification process"); }),
   runShell: vi.fn(async () => { throw new Error("unexpected verification shell"); }),
@@ -53,11 +60,12 @@ beforeEach(() => {
   vi.mocked(accept).mockResolvedValue(gateResult({ pass: true, outcome: "pass", method: "checker", reasons: ["complete"] }, "explicit"));
 });
 
-function harness(observations?: V2Observations) {
+function harness(observations?: V2Observations, verificationTask = task) {
   const state = { head: BASE, nonce: "" };
   vi.mocked(snapshotTree).mockImplementation(async () => ({
     cwd: root, root, head: state.head, branch, fingerprint: state.head, dirty: false, files: [], digests: new Map(),
   }));
+  vi.mocked(readHead).mockImplementation(async () => ({ root, head: state.head, branch }));
   vi.mocked(readHeadState).mockImplementation(async () => ({ root, head: state.head, branch }));
   const store = createChangedFileStore();
   // delta runs once inside each actual observeChange invocation, not for cached observe calls or gate re-runs.
@@ -89,12 +97,12 @@ function harness(observations?: V2Observations) {
       state.nonce = a.nonce;
       if (!restart) {
         // The child is not known at begin; diagnostics must use the attempt at capture time.
-        await verifier.begin?.(task, slot, { ...a, childSessionID: null }, context);
+        await verifier.begin?.(verificationTask, slot, { ...a, childSessionID: null }, context);
       }
-      await verifier.observe?.(task, slot, a, undefined, context);
-      await verifier.observe?.(task, slot, a, undefined, context);
+      await verifier.observe?.(verificationTask, slot, a, undefined, context);
+      await verifier.observe?.(verificationTask, slot, a, undefined, context);
       state.head = CANDIDATE;
-      return verifier.verify(task, slot, a, context);
+      return verifier.verify(verificationTask, slot, a, context);
     },
     async dispose() {
       await verifier.dispose?.();
@@ -104,6 +112,35 @@ function harness(observations?: V2Observations) {
 }
 
 describe("plan-task capture observations through the real verification wiring", () => {
+  it("binds normal-attempt execution spans from a real deterministic check to the checked candidate", async () => {
+    const realGate = await vi.importActual<typeof import("../../src/verify/gate")>("../../src/verify/gate");
+    const realExec = await vi.importActual<typeof import("../../src/verify/exec")>("../../src/verify/exec");
+    vi.mocked(accept).mockImplementation(realGate.accept);
+    vi.mocked(runShell).mockImplementation(realExec.runShell);
+    vi.mocked(spawn).mockImplementation(() => completedServiceProcess(() => undefined));
+    const lines: string[] = [];
+    const sink = createV2Observations({ write: line => { lines.push(line); } });
+    const h = harness(sink, { ...task, text: 'Check the build.\n[acceptance]\ncheck: buildPasses command="node --version"\n[/acceptance]' });
+    const attempts = [attempt(1, true), attempt(2, true)];
+    try {
+      for (const a of attempts) expect(await h.run(a, false)).toMatchObject({ verdict: "pass", ref: "deterministic" });
+      expect(accept).toHaveBeenCalledTimes(attempts.length);
+      expect(runShell).toHaveBeenCalledTimes(attempts.length);
+      expect(spawn).toHaveBeenCalledTimes(attempts.length);
+      sink.close();
+      expect(servicePairs(lines).filter(r => r.spanKind === "service" && r.action === "end")).toMatchObject(attempts.map(a => ({
+        planId: "p1", taskId: "t1", attempt: a.n, phaseId: null, entryId: null, taskIds: ["t1"],
+        component: "verify", candidate: CANDIDATE, stage: "command", result: "pass",
+      })));
+    } finally {
+      await h.dispose();
+      sink.close();
+      vi.mocked(accept).mockReset();
+      vi.mocked(runShell).mockReset();
+      vi.mocked(spawn).mockReset();
+    }
+  });
+
   it.each([false, true])("records exactly one correctly identified row per capture (restart=%s)", async (restart) => {
     const lines: string[] = [];
     const sink = createV2Observations({ write: (line) => { lines.push(line); } });

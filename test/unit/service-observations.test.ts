@@ -1,12 +1,18 @@
+import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { createV2Observations, type ServiceIdentity, type V2Observations } from "../../src/compat/v2-observations";
+import { BackgroundRuns, createIntegrationChecks } from "../../src/executor/integrate/checks";
 import { serviceObservation } from "../../src/executor/observations";
+import { applySlotEnv, slotEnvFor } from "../../src/executor/slots/env";
 import { resolveVerifyBudget } from "../../src/router/config";
 import { createDeadline, createDirectTestsPassHook, createScopeOpener, runDeterministic } from "../../src/verify/deterministic";
+import { runArgv, runShell } from "../../src/verify/exec";
 import type { RunnerFs, ScopedSpec } from "../../src/verify/runner";
 import type { ExecSeam } from "../../src/verify/types";
-import { servicePairs } from "../helpers/service-observations";
+import { completedServiceProcess, servicePairs } from "../helpers/service-observations";
+
+vi.mock("node:child_process", async original => ({ ...await original<typeof import("node:child_process")>(), spawn: vi.fn() }));
 
 const identity: ServiceIdentity = { planId: "p1", taskId: "T1", attempt: 2, phaseId: "p1", entryId: null,
   taskIds: ["T1"], component: "verify", candidate: "b".repeat(40) };
@@ -88,6 +94,77 @@ describe("intrinsic verification service observations", () => {
     expect(wait.rows).toContainEqual(expect.objectContaining({ spanKind: "service-wait", stage: "verification-slot", action: "end", durationMs: 7_000 }));
     expect(wait.elapsed - baseline.elapsed).toBe(7_000);
     expect(prep.elapsed - baseline.elapsed).toBe(2_000);
+  });
+
+  it.each(["shell", "argv", "integration"] as const)("excludes the real %s runner's pre-spawn slot-env lookup from service", async runner => {
+    const executionIdentity: ServiceIdentity = runner === "integration"
+      ? { ...identity, component: "checks", taskId: null, attempt: null, entryId: "i-1" } : identity;
+    const run = async (envDelayMs: number) => {
+      let now = 0;
+      const lines: string[] = [];
+      const sink = createV2Observations({ write: line => { lines.push(line); } });
+      const service = serviceObservation(sink, () => executionIdentity, () => now);
+      const hookKey = Symbol.for("omr.executor.slotEnvHook");
+      const previous: unknown = Reflect.get(globalThis, hookKey);
+      const lookup = vi.fn((at: string, platform: NodeJS.Platform) => {
+        now += envDelayMs;
+        return slotEnvFor(at, platform);
+      });
+      Reflect.set(globalThis, hookKey, { slotEnvFor: lookup, applySlotEnv });
+      vi.mocked(spawn).mockImplementation(() => completedServiceProcess(() => { now += 11; }));
+      const budget = resolveVerifyBudget({ activePreset: "a", presets: { a: {} }, defaultTier: "medium", rules: [] });
+      const deadline = createDeadline(30_000);
+      const scope = createScopeOpener({
+        service, budget, checkTimeoutMs: 5_000, exec: runShell, argv: runArgv,
+        fs: { fileExists: async () => false, readFile: async () => "", unlink: async () => undefined },
+        acquire: async () => ({ lost: false, release: async () => undefined }),
+      })({ cwd, command: "node --version" });
+      try {
+        if (runner === "integration") {
+          const unexpected = (): never => { throw new Error("unexpected integration preparation I/O"); };
+          const checks = createIntegrationChecks({
+            ledger: unexpected, get pool() { return unexpected(); }, get git() { return unexpected(); }, get igit() { return unexpected(); },
+            resolver: { resolve: unexpected }, guard: { assertWriteCwd: unexpected }, background: new BackgroundRuns(),
+            clock: { now: () => now, iso: unexpected, setTimer: unexpected, clearTimer: unexpected, randomHex: unexpected },
+            logger: { warn: unexpected }, preemptForeground: async () => undefined,
+            acquire: async () => ({ lost: false, release: async () => undefined }),
+            spawn: async (command, opts) => {
+              const result = await runArgv(command.file, command.args, { ...opts, env: { ...command.env }, timeoutMs: 5_000 });
+              return { exitCode: result.code, timedOut: result.timedOut, stdout: result.stdout, stderr: result.stderr, durationMs: 11 };
+            },
+          });
+          expect(await checks.runCommands({
+            observation: service,
+            slot: { slot: "integration", path: cwd, planId: "p1", owner: "integration", commit: "b".repeat(40) },
+            commit: "b".repeat(40), commands: [{ label: "probe", file: "node", args: ["--version"], source: "run-command", ref: null }],
+            mode: "full", priority: "foreground", signal: deadline.signal, prepare: false,
+          })).toMatchObject({ verdict: "pass" });
+        } else {
+          const result = runner === "shell" ? await scope.runShell("node --version", cwd, deadline)
+            : await scope.runLint({ ...spec, runner: "eslint", args: ["--version"] }, deadline);
+          expect(result).toMatchObject({ kind: "ran", exec: { code: 0 } });
+        }
+        expect(lookup).toHaveBeenCalledExactlyOnceWith(cwd, process.platform);
+        expect(spawn).toHaveBeenCalledOnce();
+        sink.close();
+        return { elapsed: now, rows: servicePairs(lines) };
+      } finally {
+        await scope.close();
+        deadline.dispose();
+        sink.close();
+        Reflect.set(globalThis, hookKey, previous);
+        vi.mocked(spawn).mockReset();
+      }
+    };
+    const baseline = await run(0);
+    const delayed = await run(2_000);
+    expect(delayed.elapsed - baseline.elapsed).toBe(2_000);
+    for (const result of [baseline, delayed]) {
+      expect(result.rows.filter(r => r.spanKind === "service" && r.action === "end")).toMatchObject([
+        { ...executionIdentity, stage: "command", durationMs: 11, result: "pass" },
+      ]);
+    }
+    expect(delayed.rows).toContainEqual(expect.objectContaining({ spanKind: "service-prep", action: "end", durationMs: 2_000 }));
   });
 
   it("does not evaluate identities or clocks off, contains projection faults, and freezes pair identity", () => {

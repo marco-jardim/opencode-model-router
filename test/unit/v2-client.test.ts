@@ -471,7 +471,10 @@ describe("native v2 child runner", () => {
     await wiring.disposeVerification();
   });
 
-  it.each([false, true])("G8 grading excludes native session/cwd startup and cleanup; off/on/throwing parity (failure=%s)", async failure => {
+  it.each([
+    { failure: false, retryWaitMs: 0 }, { failure: true, retryWaitMs: 0 },
+    { failure: false, retryWaitMs: 7_000 }, { failure: true, retryWaitMs: 7_000 },
+  ])("G8 grading without host retry events is unattributed, not intrinsic service (failure=$failure, retryWaitMs=$retryWaitMs)", async ({ failure, retryWaitMs }) => {
     const run = async (mode: "off" | "on" | "throw") => {
       const { runtime, context, toolContext, execute } = fixture();
       let now = 0;
@@ -488,7 +491,9 @@ describe("native v2 child runner", () => {
       execute.mockImplementation(async (_input, native) => {
         now += 800; // native child creation, before progress
         await native.progress({ sessionID: "child", status: "running" });
-        now += 17; // intrinsic grading only
+        now += 5; // first provider execution attempt
+        now += retryWaitMs; // host-internal backoff: this host exposes no retry/attempt events
+        now += 12; // remaining provider execution
         if (failure) throw new Error("grading failed");
         return { output: { sessionID: "child", status: "completed", output: "verified result" } };
       });
@@ -510,9 +515,11 @@ describe("native v2 child runner", () => {
       const { rows: _offRows, ...original } = off;
       expect(effects).toEqual(original);
       if (mode === "on") {
+        // Even a run with no actual retry is insufficient: progress alone cannot prove it.
+        expect(rows.filter(r => r.spanKind === "service" && r.stage === "grading")).toEqual([]);
         expect(rows.filter(r => r.action === "end")).toMatchObject([
           { spanKind: "service-prep", stage: "grader-startup", durationMs: 2_000, result: "completed" },
-          { spanKind: "service", stage: "grading", durationMs: 17, result: failure ? "error" : "completed",
+          { spanKind: "service-unattributed", stage: "grading", durationMs: 17 + retryWaitMs, result: failure ? "error" : "completed",
             planId: "p1", taskId: "T1", attempt: 3, candidate: "b".repeat(40) },
         ]);
       }

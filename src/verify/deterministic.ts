@@ -1004,9 +1004,10 @@ export function createScopeOpener(deps: ScopeOpenerDeps): OpenCheckScope {
       deadline.signal.addEventListener("abort", onAbort, { once: true });
       let execResult: ExecResult;
       let threw: string | undefined;
-      const service = deps.service?.start("service", stage, candidate);
+      const service = deps.service?.execution(stage, candidate);
       try {
-        execResult = await launch({ lowPriority: budget.lowPriority, signal: run.signal, timeoutMs: boundMs });
+        execResult = await launch({ lowPriority: budget.lowPriority, signal: run.signal, timeoutMs: boundMs,
+          ...(service === undefined ? {} : { service }) });
         service?.end(run.signal.aborted ? "interrupted" : execResult.timedOut ? "timed-out" : execResult.code === 0 ? "pass" : "fail");
       } catch (err) {
         threw = errorText(err);

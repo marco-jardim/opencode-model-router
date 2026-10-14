@@ -1856,6 +1856,8 @@ export interface ProcessResult {
   durationMs: number;
 }
 export interface ProcOpts {
+  /** Optional v2 diagnostics, forwarded to the lowest process boundary. */
+  service?: import("./observations").ServiceExecution;
   cwd: string;
   timeoutMs: number;
   env?: Readonly<Record<string, string>>;
@@ -1863,7 +1865,7 @@ export interface ProcOpts {
   maxOutputBytes?: number;
   signal?: AbortSignal;
 }
-/** No shell; a non-zero exit is a result; throws only spawn/ETIMEDOUT/EOUTPUT. */
+/** No shell; a non-zero exit is a result; throws only spawn/ETIMEDOUT/EOUTPUT. Preparation adapters preserve `service`. */
 export interface GitRunner {
   run(args: readonly string[], o: ProcOpts): Promise<ProcessResult>;
 }

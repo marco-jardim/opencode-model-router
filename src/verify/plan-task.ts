@@ -466,7 +466,7 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
     try {
       // QA-5.1-14: the grader is parented to the plan's CURRENT orchestrator, as the runtime read it for this verify (an
       // adopt moves the plan; verify refused an unknown one before any gate ran).
-      // The verify service span rides on `prepared.service` (opened by prepare() with this attempt's identity).
+      // The verify service observer rides on `prepared.service`, bound to this attempt's checked candidate.
       const gateDeps = deps.buildGateDeps(parent, graders, prepared, deadline, false, parent);
       gateDeps.deterministic.onFailure = (reason) => completedFailures.push(reason);
       const delegation: Delegation = {
@@ -555,8 +555,14 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
         seen.add(k);
         changedFiles.push(file);
       }
+      const service = prepared.service;
+      const boundService: PreparedVerification["service"] = service === undefined ? undefined : {
+        start: (kind, stage, candidate = checked.candidate) => service.start(kind, stage, candidate),
+        execution: (stage, candidate = checked.candidate) => service.execution(stage, candidate),
+      };
       const gatePrepared: PreparedVerification = {
         ...prepared,
+        ...(boundService === undefined ? {} : { service: boundService }),
         changedFiles,
         // The union is complete: the observed files and every path the candidate commits over the reset commit.
         changeBaseline: prepared.branchSwitch !== undefined ? "unavailable" : "available",
