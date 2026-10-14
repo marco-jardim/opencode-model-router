@@ -96,6 +96,18 @@ export function executorServiceObservation(clock: Clock, planId: string, identit
  * Missing pool facts are UNKNOWN. No scheduler decisions are inferred or changed by this stream.
  */
 
+/**
+ * Runtime idle-close schema (scheduler family, separate from physical-slot actions):
+ * {family:"scheduler",planId,parentSessionID,action:"idle-close",state:{clockMs,ledgerSeq,...,detail:{fromMs,toMs,ms,
+ *  metric:{name:"idle-with-ready",fromAt,toAt,ms,readyTaskIds,free}}}}.
+ * Emitted inside closeIdle at the actual closing continuation, before the asynchronous metric append can run.
+ * clockMs=toMs uses the metric endpoint's single Clock.now() sample; ms=max(0,toMs-fromMs). No extra clock read.
+ * metric is a defensive copy of the full, unchanged ledger payload: correlate by planId, payload and occurrence
+ * order, not by the later journal timestamp. ledgerSeq is the committed watermark at closure, NOT the metric's seq.
+ * A row observes metric creation, not successful journal persistence or scheduling eligibility. Capture is lazy,
+ * exception-contained and inert without the v2 observation sink; it neither queries nor changes scheduler state.
+ */
+
 // Runtime and its lazily-created plan pools already share the injected clock object. Scope the diagnostic port
 // by that identity AND plan, so queue-owned operations are covered too, without wrapping pool methods or adding
 // queries/awaits to assembly. No entry exists off/v1; detach drops the writer/sink, and the clock key is weak.

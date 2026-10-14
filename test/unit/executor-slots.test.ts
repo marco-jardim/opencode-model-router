@@ -511,6 +511,47 @@ describe("SlotPool lifecycle", () => {
     expect(h.marker("slot-1").manifests).not.toEqual(before);
   });
 
+  it.each(["tracked file", "HEAD"] as const)("public reset restores and verifies its requested base after a drift installer changes %s", async (mutation) => {
+    const h = harness();
+    h.git.files["tracked.txt"] = "checked in\n";
+    const checkout = h.git.checkoutDetach.bind(h.git);
+    h.git.checkoutDetach = async (path, commit) => {
+      await checkout(path, commit);
+      h.fs.put(win32.join(path, "requirements.txt"), commit === C1 ? "pytest\n" : "pytest==9\n");
+      h.fs.put(win32.join(path, "tracked.txt"), "checked in\n");
+    };
+    h.git.statusPorcelain = async path => h.fs.text(win32.join(path, "tracked.txt")) === "checked in\n"
+      ? [] : [{ xy: " M", path: "tracked.txt", orig: null }];
+    const provision = h.prov.provision.bind(h.prov);
+    const mutations: Array<{ head: string; status: StatusEntry[] }> = [];
+    h.prov.provision = async (path, detection, opts) => {
+      await provision(path, detection, opts);
+      if (await h.git.revParse(path, "HEAD") !== C2) return;
+      if (mutation === "tracked file") h.fs.put(win32.join(path, "tracked.txt"), "installer mutation\n");
+      else h.git.heads.set(key(path), C3);
+      mutations.push({ head: await h.git.revParse(path, "HEAD"), status: await h.git.statusPorcelain(path) });
+    };
+    await h.pool.open();
+    try {
+      const first = await h.pool.acquire(PLAN, "previous", C1);
+      await h.pool.release(first.slot);
+      const acquired = await h.pool.acquire(PLAN, "task-1", C1);
+      expect(acquired.verifiedResetBase).toBe(C1);
+      await h.pool.reset(acquired.slot, C2);
+
+      expect(h.prov.calls).toHaveLength(2);
+      expect(mutations).toEqual([{
+        head: mutation === "HEAD" ? C3 : C2,
+        status: mutation === "tracked file" ? [{ xy: " M", path: "tracked.txt", orig: null }] : [],
+      }]);
+      expect({ head: await h.git.revParse(acquired.path, "HEAD"), status: await h.git.statusPorcelain(acquired.path) })
+        .toEqual({ head: C2, status: [] });
+      expect(h.marker(acquired.slot)).toMatchObject({ state: "leased", owner: "task-1", commit: C2 });
+    } finally {
+      h.pool.close();
+    }
+  });
+
   it("reset retries once after a delay and then reports the slot as held by a process", async () => {
     const h = harness();
     await h.pool.open();

@@ -1061,15 +1061,19 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
     }
   }
 
-  async function stageReset(rec: SlotRecord): Promise<{ rec: SlotRecord; provisioned: boolean }> {
+  async function stageReset(rec: SlotRecord, verifyAfterProvision = false): Promise<{ rec: SlotRecord; provisioned: boolean }> {
     observe("slot-reset-start", () => ({ slot: rec.slot }));
     try {
       await resetRoutine(rec);
       const drift = await driftProvision(rec);
+      const provisioned = drift.drifted && drift.rec.managers.length > 0;
+      // Public reset is launch's last preparation, including when integration moved after a proven acquisition.
+      // An installer can change HEAD or tracked files: restore and verify once more, without another install.
+      if (verifyAfterProvision && provisioned) await resetRoutine(drift.rec);
       const done = await save({ ...drift.rec, state: drift.rec.owner === null ? "ready" : "leased" });
       syncEnv(done);
       observe("slot-reset-end", () => ({ slot: rec.slot, result: "completed" }));
-      return { rec: done, provisioned: drift.drifted && drift.rec.managers.length > 0 };
+      return { rec: done, provisioned };
     } catch (error) {
       observe("slot-reset-end", () => ({ slot: rec.slot, result: "failed" }));
       throw error;
@@ -1259,7 +1263,7 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
       try {
         if (rec.state === "creating" || rec.state === "provisioning") rec = await driveStage(staged(rec), false);
         const resetting = await save({ ...rec, state: "resetting", commit: oid });
-        await driveStage(staged(resetting), false);
+        await stageReset(staged(resetting), true);
       } catch (error) {
         throw await failStage(slot, error);
       }

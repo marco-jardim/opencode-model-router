@@ -564,6 +564,8 @@ interface PlanRt {
   capacity: CapacityController;
   tokens: Map<string, TokenRef>;
   inFlight: Set<TaskId>;
+  /** Launch steps that have not relinquished their physical-slot reservation (unlike steps finishing cleanup). */
+  slotReservations: Set<TaskId>;
   handles: Map<TaskId, HandleRef>;
   slotLeases: Map<TaskId, SlotLease>;
   offSlotRelease: (() => void) | null;
@@ -792,9 +794,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
   // Only copies existing facts. In particular NO readySet, gate, route, lease or capacity query here:
   // capacity.snapshot/limit/free can lazily resume providers. Observing must never do that itself.
-  function observe(p: PlanRt, action: string, detail: () => ObservationValue = () => null): void {
+  function observe(p: PlanRt, action: string, detail: () => ObservationValue = () => null, clockMs?: number): void {
     observeV2(d.observations, () => ({ family: "scheduler", planId: p.planId, parentSessionID: p.writer.ledger.orchestrator.sessionID, action,
-      state: { clockMs: d.clock.now(), ledgerSeq: p.writer.ledger.seq, orchIdle: p.orchIdle, passive: p.passive,
+      state: { clockMs: clockMs ?? d.clock.now(), ledgerSeq: p.writer.ledger.seq, orchIdle: p.orchIdle, passive: p.passive,
         recovering: p.recovering, disposed: p.disposed, latch: p.latch, inFlight: [...p.inFlight], tokens: [...p.tokens.keys()], detail: detail() } }));
   }
 
@@ -1299,7 +1301,10 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     const t = d.clock.now();
     const ms = Math.max(0, t - o.fromMs);
     p.counters.idleMs += ms;
-    metric(p, { name: "idle-with-ready", fromAt: o.fromAt, toAt: d.clock.iso(t), ms, readyTaskIds: o.ids, free: o.free });
+    const m: MetricPayload = { name: "idle-with-ready", fromAt: o.fromAt, toAt: d.clock.iso(t), ms, readyTaskIds: o.ids, free: o.free };
+    metric(p, m);
+    // Observe this continuation, not the host input or the later append; reuse the metric's one clock sample.
+    observe(p, "idle-close", () => ({ fromMs: o.fromMs, toMs: t, ms, metric: { ...m, readyTaskIds: [...m.readyTaskIds] } }), t);
   }
 
   // ---------- tick
@@ -1418,10 +1423,11 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     // Mirror claimTask: reuse ready slots, create up to maxParallel, or replace broken slots. Same-owner retries
     // keep their existing slot and consume no free slot. An admitted step may still be waiting on its task mutex or
     // git before claiming: subtract those reservations so a second tick cannot admit a lower-priority competitor.
+    // A step that relinquished its slot keeps only its inFlight guard, not a physical reservation during cleanup.
     const owners = new Set(taskSlots.flatMap((s) => s.owner === null ? [] : [s.owner]));
     let freeSlots = Math.max(0, l.config.maxParallel - taskSlots.length)
       + taskSlots.filter((s) => s.state === "ready" || s.state === "broken").length;
-    for (const id of p.inFlight) if (!owners.has(leaseHolderID(p.planId, id))) freeSlots -= 1;
+    for (const id of p.slotReservations) if (!owners.has(leaseHolderID(p.planId, id))) freeSlots -= 1;
     p.slotWaiting = false;
     const steps: Array<Promise<"launched" | "skipped">> = [];
     for (const item of ready) {
@@ -1462,6 +1468,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
    */
   function startStep(p: PlanRt, taskId: TaskId, fn: () => Promise<LaunchStepResult>, n: number): Promise<"launched" | "skipped"> {
     p.inFlight.add(taskId);
+    p.slotReservations.add(taskId);
     observe(p, "launch-prepare", () => ({ taskId, attempt: n }));
     const attemptsOf = (): number => own(p.writer.ledger, taskId)?.attempts.length ?? 0;
     const before = attemptsOf();
@@ -1473,6 +1480,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       } catch (e) {
         d.log("error", "launch step failed", errorText(e));
       } finally {
+        p.slotReservations.delete(taskId);
         if (r !== "launched") releaseToken(p, taskId, n, "other");
         p.inFlight.delete(taskId);
         observe(p, "launch-step-end", () => ({ taskId, attempt: n, result: r === "launched" ? "launched" : "skipped" }));
@@ -1517,6 +1525,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       const route = item.route;
       let slot: SlotLease | null = null;
       const abandon = async (): Promise<void> => {
+        // No further acquire in this step. Drop its reservation BEFORE release can durably notify waiters;
+        // inFlight still prevents this failed task from waking itself while release/cleanup is pending.
+        p.slotReservations.delete(taskId);
         releaseToken(p, taskId, n, "other");
         if (fresh) {
           releaseLeases(p, taskId);
@@ -2661,6 +2672,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       capacity,
       tokens: new Map(),
       inFlight: new Set(),
+      slotReservations: new Set(),
       handles: new Map(),
       slotLeases: new Map(),
       offSlotRelease: null,
