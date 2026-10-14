@@ -305,3 +305,54 @@ Fresh green smoke evidence, detached **6.1.4's three green runs at the committed
 and **final heavy phase QA** remain outstanding. **G13 remains unmet** and must be disclosed in the Phase 6.2 PR; full-suite
 execution remains deferred to Phase 6.2. **Phase 6.1 is not complete or accepted.** No tests were run for this
 documentation-only amendment; docs-drift validation remains with the parent.
+
+## Executor / observation / oracle heavy QA — 2026-10-14 (not accepted)
+
+This checkpoint supersedes the in-progress heavy-QA status above; earlier snapshots remain historical evidence.
+This cycle does not replace final phase QA or establish phase acceptance.
+
+### Round 1 — `5b23547`
+
+Scope: **`1d5f32c`, `eec5f1d`, `5b23547`, `cbdbd3f`, `2381219` and `9e079d8`**.
+
+- **P1:** reset proof after provisioning.
+- **P2:** oracle delayed closure.
+- **P2:** unknown eligibility.
+- **P2:** late-adopted child timing.
+
+Fixed in **`7c57fca`, `d1118a2` and `39a1293`**.
+
+### Round 2 — `b9155d3`
+
+Also included first-round review of **`7c57fca` (slot admission)** and **`8d95663` (service observations)**.
+
+- **P1:** moved-head fallback reset.
+- **P2:** idle closure via inferred timestamps.
+- **P2:** slot-admission rejected by oracle.
+- **P2:** release wake swallowed by finishing step.
+- **P2:** service spans included preparation/retry waits.
+- **P2:** plan-task candidate null.
+
+Fixed in **`7a9c3d9`, `0268f75` and `6edce3c`**. **Unknown eligibility and late adoption were confirmed resolved.**
+
+### Round 3 — bounded review at `6edce3c`
+
+- Scope was **major/critical/blocking only**: **CLEAN at that threshold (verified)**.
+- The new amended G8 oracle in **`681966e`** was also reviewed: **no major/critical/blocking findings**.
+- Lesser items remain deferred, with **no fix requested under the owner rule**:
+  1. **P2:** the oracle does not correlate the verification candidate with the checked candidate.
+  2. **P2:** required-service coverage is component-level, not operation-level.
+  3. **P2:** a service span can include post-exit drain/kill tails on abnormal process lifecycles.
+
+**Service-unattributed grading makes G8 evidence insufficient by design and can block acceptance.** The bounded clean
+result does not mean the deferred items are fixed or that G8 has passed.
+
+### Commit and smoke checkpoint
+
+- **`681966e`:** amended G8 oracle and throughput default batching; resilience keeps **`batchMax: 1`**.
+- **`9e079d8`:** Python pytest prerequisite.
+- **Smoke Run 14 started** with **`CPX_E2E_PYTHON=C:\Users\Marquinho\miniconda3\python.exe`**; **result pending**.
+  No green Run 14 result is claimed.
+
+**Phase 6.1 is not accepted.** Outstanding phase gates, the G13 disclosure and the Phase 6.2 full-suite obligation remain
+unchanged. No tests were run for this documentation-only update.
