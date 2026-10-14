@@ -91,12 +91,14 @@ describe("v2 timing-write observations", () => {
     for (const broken of [false, true]) {
       const rows: ObservationRecord[] = [];
       const append = vi.fn(async () => ({ ok: false as const, error: "write failed" }));
+      const observations = createV2Observations({ write: (line) => { if (broken) throw new Error("sink"); rows.push(JSON.parse(line)); } });
       const r = createTimingRecorder({ dir: "observations", now: () => NOW, logger: capturingLogger(), sideLogs: fakeSideLogs({ appendTimings: append }),
-        onTimingWrite: timingWriteObserver(createV2Observations({ write: (line) => { if (broken) throw new Error("sink"); rows.push(JSON.parse(line)); } })) });
+        onTimingWrite: timingWriteObserver(observations) });
       r.recordDispatchStart(startInput());
       await r.onExecutionOutcome("child-1", "end", "succeeded", NOW + 10);
       await r.onExecutionOutcome("child-1", "end", "succeeded", NOW + 10);
       expect(append).toHaveBeenCalledTimes(1);
+      observations.flush();
       if (broken) expect(rows).toEqual([]);
       else expect(rows).toMatchObject([{ family: "completion-effect", effect: "timing-row-write", callID: "call-1", parentSessionID: "root-1", childSessionID: "child-1" }]);
       await r.dispose();
@@ -114,6 +116,7 @@ describe("v2 timing-write observations", () => {
     await a.release();
     b.recordDispatchStart(startInput({ callID: "call-2" }));
     await b.onExecutionOutcome("child-1", "e2", "succeeded", NOW + 2);
+    observations.flush();
     expect(rows.map((r) => r.family === "completion-effect" ? r.callID : "")).toEqual(["call-1", "call-2"]);
     await b.release();
   });

@@ -233,6 +233,7 @@ describe("registry: decide / acknowledge / claims", () => {
         await r.proc.process("same-child", completion());
       }
       outputs.push(JSON.stringify({ finish: r.finishCalls, records: r.records, posts: r.posts, released: r.released }));
+      observations?.flush();
       if (mode !== "on") expect(rows).toEqual([]);
       else for (const callID of ["observe-1", "observe-2"]) {
         const effects = rows.filter((row) => row.family === "completion-effect" && row.callID === callID);
@@ -247,11 +248,13 @@ describe("registry: decide / acknowledge / claims", () => {
 
   it("counts annotation retries, not the idempotent posted record", async () => {
     const rows: ObservationRecord[] = [];
-    const r = rig({ observations: createV2Observations({ write: (line) => { rows.push(JSON.parse(line)); } }) });
+    const observations = createV2Observations({ write: (line) => { rows.push(JSON.parse(line)); } });
+    const r = rig({ observations });
     await launch(r, "observe-retry", "child-retry", { handle: "vrf_retry" });
     let tries = 0;
     r.behavior.synthetic = async () => { if (++tries < 3) throw new Error("retry"); };
     await r.proc.process("child-retry", completion());
+    observations.flush();
     expect(rows.filter((r) => r.family === "completion-effect" && r.effect === "annotation-delivery")).toHaveLength(3);
     expect(r.records.filter((r) => r.kind === "posted")).toHaveLength(1);
   });

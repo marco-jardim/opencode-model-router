@@ -1,6 +1,8 @@
 /**
- * Read-only v2 diagnostics. No global instance, config key, timer, host call or v1 activation.
+ * Read-only v2 diagnostics. No global instance, config key, host call or v1 activation.
  * The only production creator is v2.ts. Writers receive detached JSON, never live router objects.
+ * Recording only snapshots/enqueues; bounded batches drain on setImmediate, never in a microtask.
+ * Explicit flush/close are synchronous lifecycle barriers, not hot-path operations.
  *
  * Wire format v1: {v, stream, seq, at, family, ...payload}. Families are native-args,
  * completion-effect and scheduler. A final {v, stream, seq, at, kind:"end", ...counts}
@@ -29,7 +31,7 @@
  * including failed ones; they do not assert successful persistence/delivery.
  *
  * Scheduler payload: {planId,parentSessionID,action,state}. Ledger/attach state is
- * {ledgerSeq,status,maxParallel,tasks:[{id,state,kind,phase,p50,attempts:[{n,callID,
+ * {ledgerSeq,status,maxParallel,tasks:[{id,state,kind,phase,p50,slot,attempts:[{n,callID,
  * childSessionID,outcome}]}],edges:[{from,to}],phases:[{id,gate,paused}],
  * writeConflicts:[[taskId,taskId]]}. A graph >256 tasks invalidates the stream, not a
  * silently truncated snapshot. Ledger rows are emitted at the actual committed swap,
@@ -48,6 +50,8 @@
  * Other raw states: capacity-init {maxParallel,providers:[{provider,limit,holdUntilMs,
  * lastSignalAtMs,pausedUntilMs}]}; provider {provider,change,from,to,until};
  * lease-acquire {taskRef,ok}; lease-release {taskRef}.
+ * Physical-slot events are specified in src/executor/observations.ts. Neither
+ * task.slot=null nor provider/write-lease release implies physical pool availability.
  * Provider labels are stream-local keyed tokens, never configuration text. These
  * observations never call updateIdle or query a controller/host just for diagnostics.
  * Unqueried route/lease/gate facts are UNKNOWN, not eligible. Reconstruct from the raw
@@ -61,6 +65,9 @@ import { join } from "node:path";
 export const OBSERVATION_MAX_EVENTS = 50_000;
 export const OBSERVATION_MAX_BYTES = 16 * 1024 * 1024;
 export const OBSERVATION_MAX_ROW_BYTES = 64 * 1024;
+// Room for a UUID, all numeric counters/timestamp (even at their longest JSON spelling), and framing.
+const SEAL_RESERVE_BYTES = 512;
+const DRAIN_MAX_ROWS = 64;
 
 export interface ArgumentFingerprint { type: string; digest: string }
 export interface ArgumentObservation {
@@ -86,8 +93,12 @@ export interface ObservationCounts { attempted: number; written: number; dropped
 export interface V2Observations {
   record(make: (args: (value: unknown) => ArgumentObservation) => ObservationData): void;
   counts(): Readonly<ObservationCounts>;
+  /** Synchronously drain without sealing. For explicit lifecycle/test barriers only, never routing. */
+  flush(): void;
   close(): void;
 }
+
+interface PendingRow { line: string; next?: PendingRow }
 
 const ARG_KEYS = new Set(["prompt", "description", "agent", "subagent_type", "sessionID", "task_id", "model", "background",
   "cwd", "workdir", "workRoot", "variant", "temperature", "maxTokens"]);
@@ -122,10 +133,11 @@ function canonical(value: unknown): string {
 }
 
 export function createV2Observations(options: {
-  /** Synchronous, detached JSONL only. Never awaited or allowed to throw into the caller. */
+  /** Detached JSONL only; called by the deferred drain or explicit flush/close, never record. Faults are counted. */
   write(line: string): void;
   now?: () => number;
   maxEvents?: number;
+  /** Includes the seal; data rows reserve seal space. A cap too small for the seal leaves a failed, incomplete stream. */
   maxBytes?: number;
 }): V2Observations {
   const stream = randomUUID();
@@ -148,34 +160,74 @@ export function createV2Observations(options: {
   const bound = (n: number | undefined, max: number): number => n !== undefined && Number.isFinite(n) ? Math.max(0, Math.min(max, Math.floor(n))) : max;
   const maxEvents = bound(options.maxEvents, OBSERVATION_MAX_EVENTS);
   const maxBytes = bound(options.maxBytes, OBSERVATION_MAX_BYTES);
+  const dataBytes = Math.max(0, maxBytes - SEAL_RESERVE_BYTES);
   let bytes = 0;
   let closed = false;
   let recording = false;
+  let head: PendingRow | undefined;
+  let tail: PendingRow | undefined;
+  let scheduled: ReturnType<typeof setImmediate> | undefined;
   const stamp = (): number => options.now?.() ?? Date.now();
+  const drain = (limit: number): void => {
+    for (let n = 0; head !== undefined && n < limit; n++) {
+      const row = head;
+      head = row.next;
+      if (head === undefined) tail = undefined;
+      try { options.write(row.line); counts.written++; }
+      catch { counts.failed++; }
+    }
+  };
+  const schedule = (): void => {
+    if (scheduled !== undefined || closed || head === undefined) return;
+    scheduled = setImmediate(() => {
+      scheduled = undefined;
+      drain(DRAIN_MAX_ROWS);
+      schedule();
+    });
+    scheduled.unref();
+  };
+  const flush = (): void => {
+    if (scheduled !== undefined) clearImmediate(scheduled);
+    scheduled = undefined;
+    drain(Infinity);
+  };
   return {
     record(make) {
       if (closed) return;
       const seq = ++counts.attempted;
-      if (recording || seq > maxEvents) { counts.dropped++; return; }
+      if (recording || seq > maxEvents || bytes >= dataBytes) { counts.dropped++; return; }
       recording = true;
       try {
         const at = stamp();
         const line = JSON.stringify({ ...make(args), v: 1, stream, seq, at }, (name, value: unknown) =>
           name === "provider" && typeof value === "string" ? `provider:${digest(value)}` : value) + "\n";
         const size = Buffer.byteLength(line);
-        if (size > OBSERVATION_MAX_ROW_BYTES || bytes + size > maxBytes) { counts.dropped++; return; }
+        if (size > OBSERVATION_MAX_ROW_BYTES || bytes + size > dataBytes) { counts.dropped++; return; }
         // Charge failed writes too: even a writer that writes then throws cannot exceed the byte bound.
         bytes += size;
-        options.write(line);
-        counts.written++;
+        // Only detached strings enter this event/byte-bounded queue. Link/unlink are O(1), with no array shifts.
+        const row: PendingRow = { line };
+        if (tail === undefined) head = row;
+        else tail.next = row;
+        tail = row;
+        schedule();
       } catch { counts.failed++; }
       finally { recording = false; }
     },
     counts: () => ({ ...counts }),
+    flush,
     close() {
       if (closed) return;
       closed = true;
-      try { options.write(JSON.stringify({ v: 1, stream, seq: counts.attempted + 1, at: stamp(), kind: "end", ...counts }) + "\n"); }
+      flush(); // Every accepted row (including failed writes) is accounted for before sealing.
+      try {
+        const line = JSON.stringify({ v: 1, stream, seq: counts.attempted + 1, at: stamp(), kind: "end", ...counts }) + "\n";
+        const size = Buffer.byteLength(line);
+        // Tiny caps may not fit even an empty seal: leave the stream incomplete rather than exceed the cap.
+        if (bytes + size > maxBytes) { counts.failed++; return; }
+        bytes += size;
+        options.write(line);
+      }
       catch { counts.failed++; }
     },
   };
@@ -212,7 +264,7 @@ export function openV2Observations(env: NodeJS.ProcessEnv = process.env): V2Obse
       }
     } });
     let closed = false;
-    return { record: sink.record, counts: sink.counts, close() {
+    return { record: sink.record, counts: sink.counts, flush: sink.flush, close() {
       if (closed) return;
       closed = true;
       sink.close();
