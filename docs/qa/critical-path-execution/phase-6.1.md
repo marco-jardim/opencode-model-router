@@ -252,3 +252,56 @@ verifier acceptance, green QA review, smoke pass or phase acceptance.
   documentation**, and **final heavy phase QA** remain pending. **G13 remains unmet**; disclose it in the Phase 6.2 PR.
 - **Full-suite execution remains deferred to Phase 6.2**; no new full-suite result is claimed. **Phase 6.1 is not complete
   or accepted.**
+
+## Owner amendment A-6.1-1 — 2026-10-14
+
+This checkpoint supersedes the earlier current-status and time-limit statements; those dated snapshots remain historical
+evidence. The owner approved **A-6.1-1 (G8 intrinsic-service accounting)** on **2026-10-14**. The plan's amendment log,
+Target, 6.1.3 metrics, 6.1.QA focus, G8 row and Appendix D record the amended contract. This documentation records the
+decision, not a completed oracle implementation, green run or phase acceptance.
+
+### Amended G8 and related owner decisions
+
+- On the **unchanged throughput fixture**, makespan must be at most
+  **1.3 × max(CP_eff, W_auth/configuredMaxParallel, ΣI_service)**. W_auth and task work durations are fixed by the authored
+  script before execution. CP_eff is the longest path of the **pre-run compiled dependency graph**, including semantic
+  phase gates: task costs are authored work plus attributable intrinsic required-verification and integration service;
+  phase-gate costs are intrinsic phase-suite service.
+- Service-accounting boundaries and batch attribution are fixed before execution. A shared batch entry's **full service
+  is assigned to each member**, members must be an **antichain**, and the entry is counted **once in ΣI_service**. Serial
+  integration service uses **union accounting**. Missing or ambiguous service evidence **fails closed**.
+- Queueing, resource waits, launch and preparation delays, cold initialization, idle and driver holds are **excluded from
+  all bound terms**. The QA prohibition is extended, not removed: CP reconstructed from observed launch/integration
+  ordering, task elapsed lifetimes, dependency-release waits or resource-serialization edges remains forbidden, as does
+  observed parallelism. Negative controls must show that launch, queue, resource-wait and preparation padding cannot
+  enlarge any denominator term. Keep **raw CP/ΣI as diagnostics**.
+- The **1.3 factor, configured parallelism, authored workload and idle ceiling are unchanged**. The owner confirmed **G8
+  idle predicate A** on **2026-10-14**: no episode may exceed **10,000 ms**. Authored durations remain **strict, with no
+  additive slack**.
+- The related **2026-10-14 owner watchdog decision** replaces the fixed **90 s** with a contract-derived per-host budget:
+  **60 s setup**, then `1.3 × max(CP, W/p, entries × 5 s) + 60 s` after compilation, with a **300 s ceiling**. CP/W are
+  authored, p is configured, and `entries × 5 s` is a pre-run integration allowance. This harness watchdog is not an
+  additive allowance in the G8 acceptance bound.
+
+### Run 13 remains a historical failure
+
+- **run13 makespan: 173.836 s; legacy bound: 107.354 s — failure.** This result remains historical failure evidence.
+- A deliberately generous **diagnostic ceiling under A-6.1-1 is ≤159.9 s**. Even this diagnostic-only reading leaves
+  **≥ ~12.8 s still to be removed**; it does not establish complete, attributable service evidence or an oracle pass.
+- **run13 must not be retroactively presented as an amended-oracle pass.** New runs must satisfy the implemented amended
+  oracle, its fail-closed evidence requirements and negative controls, and the unchanged idle ceiling.
+
+### Work and review in progress
+
+In-flight work, not completed acceptance evidence:
+
+- Service observations.
+- Priority-preserving slot admission.
+- Amended oracle implementation.
+- Batching default for throughput.
+
+**Heavy QA of `1d5f32c`, `eec5f1d`, `5b23547`, `cbdbd3f`, `2381219` and `9e079d8` is in progress.** No QA pass is claimed.
+Fresh green smoke evidence, detached **6.1.4's three green runs at the committed integration head**, **6.1.5 documentation**
+and **final heavy phase QA** remain outstanding. **G13 remains unmet** and must be disclosed in the Phase 6.2 PR; full-suite
+execution remains deferred to Phase 6.2. **Phase 6.1 is not complete or accepted.** No tests were run for this
+documentation-only amendment; docs-drift validation remains with the parent.

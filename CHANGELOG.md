@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **OpenCode v2: intrinsic service observations for the amended G8 oracle (A-6.1-1).** With the opt-in observations
+  below, verification checks/grading, integration rebase/checks/fast-forward and phase-suite commands emit paired
+  service spans that bracket only their execution; preparation, slot and lease waits, and retry backoff are recorded as
+  separate spans so they cannot inflate a bound term. Off by default and inert on OpenCode v1.
 - **OpenCode v2: opt-in diagnostic observations.** Set `MODEL_ROUTER_V2_OBSERVATIONS=<directory>` to an existing
   directory before setup to write bounded, sequence-numbered JSONL streams, sealed on adapter disposal. They
   record dispatch native-argument fingerprints, completion effects, scheduler and physical-slot transitions,
@@ -89,6 +93,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OpenCode v2: the executor admits tasks to physical slots in critical-path priority order.** A lower-priority
+  task no longer takes the only free slot ahead of a higher-priority ready task, and a durable slot release reschedules
+  slot-blocked tasks at once instead of waiting for their retry backoff.
+- **OpenCode v2: reused executor slots no longer launch dirty or at the wrong base after dependency provisioning.** An
+  acquisition whose reset ran an installer afterwards gives no reset proof, so the launch resets the slot again.
+- **OpenCode v2: executor children adopted after a launch-confirmation timeout get their timing row**, exactly once,
+  without reviving the launch's settled completion effects.
 - **OpenCode v2: executor launches reuse acquisition's verified reset at the current integration head, avoiding a duplicate reset while retaining full preparation for moved heads and unproven leases.**
 - **OpenCode v2: the executor's idle-with-ready metric reports a duration exactly equal to its endpoints.**
 - **CPX e2e G8 idle checks reconstruct maximal episodes from committed v2 observations.** Failed slot/launch

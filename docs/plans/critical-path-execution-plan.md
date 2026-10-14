@@ -60,10 +60,15 @@ The definitive solution has two parts that share one engine:
 
 ### Target (proven in Phase 6.1, gated in §5)
 
-- On a dedicated fixture run with no 429, no question and no restart: makespan ≤ 1.3 × max(CP, W/p, ΣI), where CP and W
-  come from task durations scripted before the run, p is the configured `maxParallel` and ΣI is the measured serial
-  integration time.
-- No idle-with-ready interval longer than 10 s: whenever a ready task and free capacity exist, it is launched (launcher A, ADR 0007 D14). *Amended by A-0.1-2.*
+- *Amended by A-6.1-1 (owner decision 2026-10-14):* on the unchanged dedicated throughput fixture with no 429, no
+  question and no restart: makespan ≤ 1.3 × max(CP_eff, W_auth/configuredMaxParallel, ΣI_service). W_auth and task work
+  durations are fixed by the authored script before execution. CP_eff uses the pre-run compiled dependency graph,
+  including semantic phase gates, weighted by authored work and attributable intrinsic required-verification,
+  integration and phase-suite service as specified in G8 (§5.1). Service boundaries and batch attribution are fixed
+  before execution; serial integration service uses union accounting. Queueing, resource waits, launch and preparation
+  delays, cold initialization, idle and driver holds cannot enlarge any bound term; missing or ambiguous service evidence
+  fails closed. The factor, configured parallelism and authored workload are unchanged; raw CP/ΣI remain diagnostics.
+- No idle-with-ready interval longer than 10 s: whenever a ready task and free capacity exist, it is launched (launcher A, ADR 0007 D14). *Amended by A-0.1-2; A-6.1-1 confirms predicate A (owner decision 2026-10-14) and the unchanged 10,000 ms ceiling.*
 - No file is written by two agents at once.
 - No file in a shared working tree is read through an agent's file or search tools while a child agent holds its write
   lease. A `router_run` started in that tree is annotated as possibly contaminated, or refused under
@@ -4013,9 +4018,19 @@ documentation. The dogfood comparison (§0.12-5) is written in 6.2.0.
   `D:\git\omr-cpx-main\test\fixtures\cpx\e2e\` and `D:\git\omr-cpx-main\test\smoke\helpers\routing-host.ts`.
   - 6.1.3.a Drive `/plan run` with a scripted orchestrator and scripted children for both plans, once per fixture
     repository.
+    *Amended by A-6.1-1 (owner decision 2026-10-14):* the contract-derived per-host watchdog replaces the fixed 90 s:
+    60 s setup; post-compilation `1.3 × max(CP, W/p, entries × 5 s) + 60 s`, with a 300 s ceiling. This is a harness
+    watchdog, not additive slack in G8; authored durations remain strict.
   - 6.1.3.b Assert G1–G12 (§5.1) with measured numbers taken from the ledger's metric events:
-    - makespan, CP and W (scripted durations), ΣI;
-    - idle-with-ready intervals;
+    - makespan, CP_eff, W_auth and ΣI_service under A-6.1-1; W_auth and task work durations are fixed by the authored
+      script before execution, and raw CP/ΣI are retained as diagnostics;
+    - attributable intrinsic service evidence for CP_eff on the pre-run compiled dependency graph, including semantic
+      phase gates, with required-verification and integration service on tasks and phase-suite service on phase gates
+      (G8). Service-accounting boundaries and batch attribution are fixed before execution: a shared batch entry's full
+      service is assigned to each member, members must be an antichain, and the entry is counted once in ΣI_service.
+      Serial integration service uses union accounting. Queueing, resource waits, launch and preparation delays, cold
+      initialization, idle and driver holds are excluded from all bound terms; missing or ambiguous evidence fails closed;
+    - idle-with-ready episodes under predicate A (owner-confirmed 2026-10-14), each at most 10,000 ms;
     - request-prefix equality;
     - lease conflicts;
     - branch greenness after every integration;
@@ -4063,6 +4078,11 @@ documentation. The dogfood comparison (§0.12-5) is written in 6.2.0.
   Adversarial focus:
   - assertions that cannot fail: tautological metrics, a CP computed from the schedule it judges, an observed p used as
     the bound;
+    *Extended by A-6.1-1:* A CP reconstructed from observed launch/integration ordering, task elapsed lifetimes,
+    dependency-release waits or resource-serialization edges remains forbidden. A-6.1-1 permits only explicitly
+    attributable intrinsic operation-service costs as measured weights on the pre-run dependency graph. Observed
+    parallelism remains forbidden. Negative controls must prove that launch, queue, resource-wait and preparation
+    padding cannot enlarge any denominator term.
   - scenarios that skip the hard paths;
   - flakiness;
   - docs describing behavior the code does not have.
@@ -4222,7 +4242,7 @@ Edge cases are those listed in 6.1.2.
 | G5 | **Compilation.** The frozen copies of the three largest plans and of this plan compile with every task id recognized, ≥ 80% write-footprint coverage for editing tasks, zero cycles, and their explicit dependencies present. Unannotated plans compile through the classifier. | 2.3 |
 | G6 | **File safety.** No file is written by two agents at once. In a shared tree, no file is read through an agent's file or search tools while a child agent holds its write lease; a `router_run` there is annotated as possibly contaminated (refused under `routing.leases.run: "refuse"`); plugin verification runs are deferred. Enforced in code and proven by tests, for ad hoc and plan dispatches; observed in real use under DF-1 and DF-2. | 1.3, 2.1, 3.1, 6.1 |
 | G7 | **Integration.** The plan integration branch never points at a commit whose integration checks failed, reverts included. Phase-suite failures are bisected, and the culprit is reverted through a checked slot and reopened automatically. | 3.2, 6.1 |
-| G8 | **Throughput.** On `D:\git\omr-cpx-main\test\fixtures\cpx\e2e\throughput.md`: makespan ≤ 1.3 × max(CP, W/p, ΣI). CP and W come from the durations scripted before the run, p is the configured `maxParallel`, ΣI is the measured serial integration time. No idle-with-ready interval exceeds 10 s. | 3.1, 6.1 |
+| G8 | **Throughput.** Fixture: `D:\git\omr-cpx-main\test\fixtures\cpx\e2e\throughput.md`. *Amended by A-6.1-1 (owner decision 2026-10-14):* On the unchanged throughput fixture, makespan must be at most 1.3 × max(CP_eff, W_auth/configuredMaxParallel, ΣI_service). W_auth and task work durations are fixed by the authored script before execution. CP_eff is the longest path of the pre-run compiled dependency graph, including semantic phase gates, with task costs equal to authored work plus attributable intrinsic required-verification and integration service, and phase-gate costs equal to intrinsic phase-suite service. Service-accounting boundaries and batch attribution are fixed before execution (a shared batch entry's full service is assigned to each member; members must be an antichain; it is counted once in ΣI). Queueing, resource waits, launch and preparation delays, cold initialization, idle and driver holds are excluded from all bound terms. Serial integration service uses union accounting. Missing or ambiguous service evidence fails closed. No idle-with-ready episode (predicate A, owner-confirmed 2026-10-14) may exceed 10,000 ms. The factor, idle ceiling, configured parallelism and authored workload are unchanged. | 3.1, 6.1 |
 | G9 | **Durability.** A host restart mid-plan converges to the same ledger and integration branch as an uninterrupted run, with no task launched or integrated twice. Pending verifications outside plans survive restarts. | 2.1, 2.2, 4.2, 6.1 |
 | G10 | **Unattended.** A question parks only its task and dependents, and independent work continues. QA loops turn findings into fixes and re-reviews automatically. The circuit breaker is the only automatic stop. There are zero polling turns. | 4.2, 6.1 |
 | G11 | **Adaptive capacity.** A 429 burst halves the provider's capacity, which recovers to the cap after successes. A usage-limit error pauses the provider with one inbox item. | 3.1, 6.1 |
@@ -4434,8 +4454,9 @@ asserted in Phase 6.1.
 
 | Metric | Definition | Source |
 |---|---|---|
-| Plan efficiency | makespan / max(CP, W/p, ΣI) | ledger task timestamps, scripted or estimated durations, integration-step events |
-| Idle-with-ready | intervals during which a ready task and free capacity existed with nothing launched | runtime `metric` events |
+| Plan efficiency | makespan / max(CP_eff, W_auth/configuredMaxParallel, ΣI_service), under A-6.1-1 for G8 | ledger makespan, authored script and pre-run compiled dependency graph, attributable intrinsic service observations |
+| Raw CP / ΣI (diagnostics only) | raw CP and raw measured integration time, retained alongside but not substituted for the amended G8 bound terms | authored script, pre-run dependency graph and integration-step events |
+| Idle-with-ready | episodes during which a ready task and free capacity existed with nothing launched; predicate A (owner-confirmed 2026-10-14), at most 10,000 ms for G8 | runtime `metric` events and independent episode evidence |
 | Orchestrator cache-read share | p50 and p10 of cacheRead / (input + cacheRead + cacheWrite) per orchestrator turn | `turns.jsonl` (1.1) |
 | Conflict rate | integration conflicts / integrated tasks | queue events |
 | Rework rate | attempts beyond the first / tasks | ledger attempts |
@@ -4443,6 +4464,15 @@ asserted in Phase 6.1.
 | Capacity events | decreases, pauses, recoveries and retry-hook stops per provider | capacity `metric` events |
 | Retained-context age | age of the retained orchestrator context at each launcher A launch; the largest age at which a launch succeeded (6.2.0 writes it into ADR 0007) | runtime `metric` events (3.1) |
 | Human stops | inbox items of severity blocking or critical, and their time to answer | ledger inbox |
+
+*Amended by A-6.1-1 (owner decision 2026-10-14):* G8 uses strict authored work durations, without additive slack or
+observed parallelism. CP_eff is the longest path of the pre-run compiled dependency graph, including semantic phase
+gates: task costs are authored work plus attributable intrinsic required-verification and integration service; phase-gate
+costs are intrinsic phase-suite service. Service-accounting boundaries and batch attribution are fixed before execution.
+A shared batch entry's full service is assigned to each member, members must be an antichain, and the entry is counted
+once in ΣI_service, using union accounting for serial integration service. Queueing, resource waits, launch and preparation
+delays, cold initialization, idle and driver holds are excluded from all bound terms. Missing or ambiguous service evidence
+fails closed; the 6.1.QA negative controls must show that padding excluded delays cannot enlarge the denominator.
 
 ---
 
@@ -4558,5 +4588,31 @@ Node ≥ 22.18; DF-2 switch procedure and the 24 h pending TTL from DF-1; QA tas
 - **A-2.3-1** (Phase 2.3, approved extensions) — 2.3.3.b: the ownership fallback is reported as `inferred` with an `ownership-assumed` diagnostic; 2.3.3.a: new files are also recognized under another worktree of the repository; 2.3.6.c: `addTasks` is synchronous. Recorded in `docs\qa\critical-path-execution\phase-2.3.md` "Plan amendments".
 - **A-2.4-1** (Phase 2.4 orchestrator decisions) — DV1–DV10 of the 2.4.1 design memo (§0 "Decisions that change the plan text" in `docs\qa\critical-path-execution\phase-2.4.md`) are binding where they change Phase 2.4 and are not copied into the plan (2.4.1); 2.4.6 Writes adds `package.json` (script `smoke:cpx:provision`); 2.4.3.a, 4.1.1.b and the Appendix C `routing.executor.slotsDir` row: the computed slots directory is `defaultSlotsDir(toplevel, planId)` = `<repo drive>:\.omr-slots\<planId>`, exported from `slots\pool.ts`, and the integration slot path is `ledger.integration.worktree`. Recorded in `docs\qa\critical-path-execution\phase-2.4.md` "Plan amendments".
 - **A-2.1-1** (Phase 2.1, memo §15 decisions and QA-2.1-8, -17, -19, -34) — the memo §15 decisions are binding: 2.1.5 Writes adds `src\router\git-tools.ts`; the event loop, not the completion processor, records timing outcomes (2.1.3.c, 2.1.5.c); 2.1 restores the registry-level lease snapshot and 3.1 `LeaseService` rebuilds the plan leases; FAIL verdicts post the foreground-equivalent text (output and findings; 2.1.3.d); the depth banner stays on the ack; background is chosen only for root parents (2.1.3.a); in-flight persistence, the lost-child wake (R18) and `reserveHandle` at the ack belong to 2.1 (2.1.4.c). Added by QA: the pending journal lives in the per-user state directory (`~/.local/state/opencode-model-router`, XDG on non-win32) instead of the outcome store (2.1.4.c and the shared-resources list that named `pending.jsonl`); restart recovery journals the dispatch data with `inflight`/`hold`; per-instance session claims are refreshed every 60 s and stale after 5 min. Recorded in `docs\qa\critical-path-execution\phase-2.1.md` "Plan amendments".
+
+- **A-6.1-1** (Phase 6.1, owner decision **2026-10-14**) — **G8 intrinsic-service accounting.** Applies to the Target,
+  6.1.3 metrics, the extended (not removed) 6.1.QA prohibition, G8 (§5.1) and Appendix D. The amended G8 contract is:
+
+  > On the unchanged throughput fixture, makespan must be at most 1.3 × max(CP_eff, W_auth/configuredMaxParallel,
+  > ΣI_service). W_auth and task work durations are fixed by the authored script before execution. CP_eff is the longest
+  > path of the pre-run compiled dependency graph, including semantic phase gates, with task costs equal to authored work
+  > plus attributable intrinsic required-verification and integration service, and phase-gate costs equal to intrinsic
+  > phase-suite service. Service-accounting boundaries and batch attribution are fixed before execution (a shared batch
+  > entry's full service is assigned to each member; members must be an antichain; it is counted once in ΣI). Queueing,
+  > resource waits, launch and preparation delays, cold initialization, idle and driver holds are excluded from all bound
+  > terms. Serial integration service uses union accounting. Missing or ambiguous service evidence fails closed. No
+  > idle-with-ready episode (predicate A, owner-confirmed 2026-10-14) may exceed 10,000 ms. The factor, idle ceiling,
+  > configured parallelism and authored workload are unchanged.
+
+  Related owner decisions of **2026-10-14**:
+  - The contract-derived **per-host watchdog replaces the fixed 90 s**: **60 s setup**, then the post-compilation budget
+    `1.3 × max(CP, W/p, entries × 5 s) + 60 s`, with a **300 s ceiling**. CP and W come from the authored script, p is
+    configured parallelism, and `entries × 5 s` is a pre-run integration allowance, not measured service or G8 slack.
+  - **G8 idle predicate A is confirmed**, with the unchanged **10,000 ms** ceiling.
+  - **Strict authored durations, with no additive slack.** Neither the watchdog nor A-6.1-1 changes the authored workload,
+    configured parallelism, 1.3 factor or idle ceiling.
+  - Keep **raw CP/ΣI as diagnostics**, alongside the amended terms, never as substitutes for attributable service evidence.
+
+  Recorded in `docs\qa\critical-path-execution\phase-6.1.md`, "Owner amendment A-6.1-1 — 2026-10-14". This is a contract
+  amendment, not a retroactive pass for historical runs.
 
 **Owner execution rules for the implementation session** — §0.14 (continuous iteration, momentary takeover, atomic delegation with [tier:heavy] for complex coding and lighter test runs, bounded QA rounds, pre-flight fix-or-document, Linear not used, worktree reporting), the testing policy (§0.6-9: scoped, accelerated, full suite only in 6.2), the bounded executor QA loop (default 3 rounds), and the handover's kickoff prompt.
