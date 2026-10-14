@@ -6,7 +6,6 @@ import { join } from "node:path";
 import type { V2Executor, V2ExecutorHost } from "../compat/v2-hooks";
 import { loadConfig, parseModelRef, resolveActiveTiers, resolveRolesRouting, resolveRouting, validateSlotsDir, type RouterHost } from "../router/config";
 import { resolveRoles } from "../router/roles";
-import { planRun } from "../router/run-tools";
 import { annotateSteps } from "../routing/engine/plan";
 import { classifyMany } from "../routing/classify";
 import { CLASS_STATIC_TIER } from "../routing/classify/types";
@@ -17,9 +16,10 @@ import { hardeningArgs, spawnBounded, workRootGuards } from "../router/git-tools
 import { createCapacityController } from "./capacity";
 import { createPlanCompiler, type CompilerDeps } from "./compile";
 import { createGitOps, createGitRunner } from "./git";
-import { BackgroundRuns, createIntegrateGit, createIntegrationChecks, createWriteGuard, type RunResolver } from "./integrate/checks";
+import { BackgroundRuns, createIntegrateGit, createIntegrationChecks, createWriteGuard } from "./integrate/checks";
 import { createLander } from "./integrate/land";
 import { createPhaseSuiteRunner } from "./integrate/phase-suite";
+import { createRunResolver } from "./integrate/run-resolver";
 import { createIntegrationQueue, createRepoLockFactory, type IntegrationStepEvent } from "./integrate/queue";
 import { createTaskLauncher } from "./launch";
 import { createLedgerStore, createNodeClock, createNodeFileSystem } from "./ledger";
@@ -190,22 +190,6 @@ export function slotsDirOf(planId: PlanId, toplevel: string, root: string | null
 function checkSlotsDir(slotsDir: string, toplevel: string): void {
   const result = validateSlotsDir(slotsDir, toplevel);
   if (!result.ok) throw new ExecutorError("E_INVALID_INPUT", result.reason);
-}
-
-function runResolver(directory: string): RunResolver {
-  return {
-    async resolve(ref, cwd) {
-      try {
-        const config = resolveRolesRouting(loadConfig(directory), "v2").run;
-        const plan = planRun({ script: ref.script, args: ref.args, cwd }, cwd, config, { platform: process.platform, env: process.env });
-        return { ok: true, command: { label: ref.script, file: plan.executable, args: plan.argv,
-          source: plan.kind === "script" ? "package-script" : "run-command", ref, cwd: plan.cwd,
-          env: Object.fromEntries(Object.entries(plan.env).filter((entry): entry is [string, string] => entry[1] !== undefined)) } };
-      } catch (error) {
-        return { ok: false, reason: error instanceof Error ? error.message : String(error) };
-      }
-    },
-  };
 }
 
 const processClaimKey = Symbol.for("omr.executor.claim.v1");
@@ -400,7 +384,7 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
       const candidates = [...roles.values()].filter((role) => role.enabled).sort((a, b) => a.agent.localeCompare(b.agent));
       const chosen = candidates.find((role) => role.kind === kind) ?? candidates.find((role) => role.kind === "general");
       if (chosen === undefined) throw new ExecutorError("E_INVALID_INPUT", `no enabled role for ${kind}`);
-      return chosen.agent;
+      return chosen;
     };
     const innerCompiler = createPlanCompiler({
       fs,
@@ -438,7 +422,7 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
     let launcherDisposal: Promise<void> | null = null;
     launcher = { ...innerLauncher, dispose: () => launcherDisposal ??= innerLauncher.dispose() };
     const taskLauncher = launcher;
-    const resolver = runResolver(directory);
+    const resolver = createRunResolver(() => resolveRolesRouting(loadConfig(directory), "v2").run);
     const buildQueue: Parameters<typeof realCollaborators>[0]["queue"] = (input) => {
       const planId = input.writer.planId;
       const pool = planPools.of(planId), ops = opsOf(planId);

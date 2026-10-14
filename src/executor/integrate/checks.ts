@@ -37,9 +37,11 @@ export interface Logger { warn(m: string): void }
 export interface ResolvedCommand {
   label: string; file: string; args: readonly string[];
   source: "package-script" | "run-command" | "pytest"; ref: RunCommandRef | null;
+  /** Inherited router plan, not explicit overrides. Re-resolve `ref` after preparing the execution checkout. */
+  resolution?: { cwd: string; env: Readonly<Record<string, string>> };
   /** Extra environment for the child (scoped test specs). */
   env?: Readonly<Record<string, string>>;
-  /** Working directory override (resolved commands and scoped test specs); default: the check's cwd. */
+  /** Explicit working directory override (for example scoped test specs); default: the check's cwd. */
   cwd?: string;
 }
 export interface CommandOutput { exitCode: number | null; timedOut: boolean; stdout: string; stderr: string; durationMs: number }
@@ -487,6 +489,14 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     return r.command;
   }
 
+  async function resolveForSlot(c: ResolvedCommand, cwd: string): Promise<ResolvedCommand> {
+    if (c.resolution === undefined || c.ref === null) return c;
+    // Executable, environment and checkout-dependent authorization all belong to the prepared slot, even when
+    // its path is unchanged (base/bisect/revert). Only explicit overrides survive; never reuse the inherited plan.
+    return { ...await resolveRef(c.ref, c.cwd ?? cwd),
+      ...(c.cwd === undefined ? {} : { cwd: c.cwd }), ...(c.env === undefined ? {} : { env: c.env }) };
+  }
+
   async function select(cwd: string, commit: string): Promise<CheckSelection> {
     const read = (p: string) => d.igit.showFile(cwd, commit, p);
     const [packageJson, pytestIni, conftest, pyproject, setupCfg, toxIni] = await Promise.all([
@@ -566,7 +576,16 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
   }
 
   async function exec(c: ResolvedCommand, cwd: string, signal: AbortSignal, low: boolean): Promise<CommandOutput> {
-    return d.spawn(c, { cwd: c.cwd ?? cwd, signal, lowPriority: low });
+    if (c.resolution === undefined) return d.spawn(c, { cwd: c.cwd ?? cwd, signal, lowPriority: low });
+    const env = { ...c.resolution.env };
+    for (const [key, value] of Object.entries(c.env ?? {})) {
+      // Node keeps only one spelling on Windows; an explicit Path must replace an inherited PATH too.
+      if (process.platform === "win32") for (const inherited of Object.keys(env)) {
+        if (inherited.toUpperCase() === key.toUpperCase()) delete env[inherited];
+      }
+      env[key] = value;
+    }
+    return d.spawn({ ...c, env }, { cwd: c.cwd ?? cwd, signal, lowPriority: low });
   }
 
   function asExec(o: CommandOutput): ExecResult {
@@ -619,7 +638,7 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     }
     // Unscoped or unverifiable: never counted as verified without a run, so the full command decides.
     if (!isScopedSpec(plan)) return fullTests(t, command, cwd, signal, low);
-    const spec: ResolvedCommand = { label: t.full.label, file: plan.file, args: plan.args, source: t.full.source, ref: t.full.ref, env: plan.env, cwd: plan.cwd };
+    const spec: ResolvedCommand = { ...t.full, file: plan.file, args: plan.args, env: plan.env, cwd: plan.cwd };
     const out = await exec(spec, cwd, signal, low);
     const result = await readResult(plan, asExec(out), nodeFs);
     const comp = component("tests", spec, out, "spec");
@@ -669,7 +688,7 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     if (isUnverifiable(runner)) return { comp, failing: first };
     const again = await planRerun(runner, first.files, cwd, { maxWorkers: MAX_WORKERS }, { fs: nodeFs });
     if (!isScopedSpec(again)) return { comp, failing: first };
-    const rerunSpec: ResolvedCommand = { label: t.full.label, file: again.file, args: again.args, source: t.full.source, ref: t.full.ref, env: again.env, cwd: again.cwd };
+    const rerunSpec: ResolvedCommand = { ...t.full, file: again.file, args: again.args, env: again.env, cwd: again.cwd };
     const out = await exec(rerunSpec, cwd, signal, low);
     const result = await readResult(again, asExec(out), nodeFs);
     const sure = !out.timedOut && !result.collectionError;
@@ -768,7 +787,12 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     }
     const extraIds = req.extra?.ids ?? [];
     // QA-3.2-6: regression ids need test commands to rerun them; without the suite's, this commit's tests serve.
-    const regression = extraIds.length > 0 && (req.extra?.commands ?? []).length === 0 ? selection.tests.map(t => t.full) : req.extra?.commands ?? [];
+    let regression = extraIds.length > 0 && (req.extra?.commands ?? []).length === 0 ? selection.tests.map(t => t.full) : req.extra?.commands ?? [];
+    try {
+      regression = await Promise.all(regression.map(c => resolveForSlot(c, cwd)));
+    } catch (e) {
+      return err("resolve", errText(e));
+    }
     if (extraIds.length > 0 && regression.length === 0) return err("resolve", "the regression ids have no test command to rerun them");
     if (selection.typecheck === null && selection.tests.length === 0 && selection.extras.length === 0 && regression.length === 0) {
       return { verdict: "pass", components, flakyIds: [], note: "no-checks", durationMs: elapsed() };
@@ -830,6 +854,12 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
         return done({ verdict: "error", error: { reason: "prepare", message: errText(e) } });
       }
     }
+    let commands: ResolvedCommand[];
+    try {
+      commands = await Promise.all(req.commands.map(c => resolveForSlot(c, cwd)));
+    } catch (e) {
+      return done({ verdict: "error", error: { reason: "resolve", message: errText(e) } });
+    }
     const low = req.priority === "background";
     const held = await underSlot({ signal: req.signal, priority: req.priority, cwd, command: "integration commands", budget: req.preempt }, async (signal): Promise<CommandRunResult> => {
       const ids = new Set<string>();
@@ -837,7 +867,7 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
       let output = "";
       let unparsed = false;
       let failed = false;
-      for (const c of req.commands) {
+      for (const c of commands) {
         const isTest = c.source === "pytest" || c.ref?.script === "test";
         if (typeof req.mode !== "string" && isTest) {
           const wanted = [...new Set(req.mode.rerun.map(fileOfId))].map(f => nodePath.resolve(cwd, f));

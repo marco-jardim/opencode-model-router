@@ -914,7 +914,7 @@ describe("phase suite execution cwd", () => {
     let integrationHead = "c9"; // Integration has moved on beyond the suite commit under test.
     const executed: Array<{ label: string; cwd: string; commit: string }> = [];
     const resolve: NonNullable<ChecksOpts["resolve"]> = (ref, cwd) => ({
-      ok: true, command: { ...cmd, label: ref.script, ref, cwd }, // Like create.ts: retain the resolution cwd.
+      ok: true, command: { ...cmd, label: ref.script, ref, resolution: { cwd, env: {} } },
     });
     runnerHooks.planScopedRun = async () => unverifiable;
     const env = checksEnv({

@@ -25,7 +25,7 @@ import * as checksModule from "../../src/executor/integrate/checks";
 import * as queueModule from "../../src/executor/integrate/queue";
 import * as runToolsModule from "../../src/router/run-tools";
 import * as execModule from "../../src/verify/exec";
-import type { LedgerWriter, IntegrationQueue, Clock } from "../../src/executor/types";
+import type { LedgerWriter, IntegrationQueue, Clock, Tier } from "../../src/executor/types";
 import type { LeaseRegistry } from "../../src/router/leases";
 import { ExecutorError, isLedgerV1, ledgerViolations, type ExecutorRuntime, type TaskLauncher, type SlotPool, type SlotRecord, type LedgerV1 } from "../../src/executor/types";
 import { buildDraft, holderOf, taskNode } from "../fixtures/cpx/ledger/builders";
@@ -535,13 +535,13 @@ describe("createExecutor assembly seams", () => {
     const annotated = await h.compiler.annotate([{ id: "step", text: "Implement src/a.ts" }]);
     expect(JSON.stringify(annotated)).toContain("[route");
     expect(JSON.stringify(annotated)).toContain("step");
-    expect(h.compiler.roleOf(null, "heavy")).toBe("reviewer");
-    expect(h.compiler.roleOf(null, "fast")).toBe("general");
-    expect(h.compiler.roleOf({ class: "implement", pin: false, ignored: [] }, "heavy")).toBe("implementer");
-    expect(h.compiler.roleOf({ pin: false, ignored: [] }, "heavy")).toBe("reviewer");
+    expect(h.compiler.roleOf(null, "heavy").agent).toBe("reviewer");
+    expect(h.compiler.roleOf(null, "fast").agent).toBe("general");
+    expect(h.compiler.roleOf({ class: "implement", pin: false, ignored: [] }, "heavy").agent).toBe("implementer");
+    expect(h.compiler.roleOf({ pin: false, ignored: [] }, "heavy").agent).toBe("reviewer");
     const roles = rolesModule.resolveRoles(executorConfig(), "v2"), general = roles.get("general")!;
     const table = vi.spyOn(rolesModule, "resolveRoles").mockReturnValue(new Map([["general", general]]));
-    expect(h.compiler.roleOf(null, "heavy")).toBe("general");
+    expect(h.compiler.roleOf(null, "heavy").agent).toBe("general");
     table.mockReturnValue(new Map([["general", { ...general, enabled: false }]]));
     expect(() => h.compiler.roleOf(null, "fast")).toThrow("no enabled role");
   }, 15_000);
@@ -553,6 +553,56 @@ describe("createExecutor assembly seams", () => {
     await expect(h.compiler.annotate([])).rejects.toThrow("provided annotator");
     expect(annotate).toHaveBeenCalledExactlyOnceWith([]);
   }, 15_000);
+
+  it.each([
+    ["[route class=other needs=shell tier=medium]", "", "general", "medium"],
+    ["[route tier=medium]", "", "general", "medium"],
+    ["[route class=other needs=shell tier=heavy pin]", "", "general", "heavy"],
+    ["[route tier=heavy]", "[tier:medium] ", "general", "medium"],
+    ["[route needs=edit tier=medium]", "[tier:heavy] ", "reviewer", "heavy"],
+  ] satisfies Array<[string, string, string, Tier]>)("rejects explicit writer routes whose selected role has no edit grant (%s, %s)", async (line, tierTag, agent, tier) => {
+    const h = capture();
+    const text = `# Plan\n\n## Phase 1.1 Work\n\n**Tasks**\n- **1.1.1** ${tierTag}Produce the result.\n  ${line}\n  Writes: \`src/alpha/core.ts\`\n`;
+    const fixture = makeHarness({ inline: { "writer.md": text } });
+    const annotate = vi.fn(h.compiler.annotate);
+    fixture.deps.annotate = annotate;
+    fixture.deps.roleOf = h.compiler.roleOf;
+    const source = parsePlan(text).tasks[0]!;
+    const route = source.route!.fields!;
+    expect(source.tierTag ?? route.tier ?? null).toBe(tier);
+    expect(h.compiler.roleOf(route, tier).agent).toBe(agent);
+    await expect(fixture.compiler.compile(planPathOf("writer.md"), compileOpts(fixture))).rejects.toMatchObject({
+      code: "E_COMPILE",
+      message: expect.stringContaining("task 1.1.1 declares writes but its explicit route is read-only"),
+      detail: { code: "route-write-conflict", line: 6, taskId: "1.1.1" },
+    });
+    expect(annotate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["[route class=other risk=high scope=multi needs=shell,edit d=grader tier=medium pin]", "general"],
+    ["[route needs=edit tier=medium]", "general"],
+    ["[route class=implement needs=shell tier=medium]", "implementer"],
+  ] as const)("keeps explicit writer routes with an effective edit grant verbatim (%s)", async (line, agent) => {
+    const h = capture();
+    const text = `# Plan\n\n## Phase 1.1 Work\n\n**Tasks**\n- **1.1.1** Produce the result.\n  ${line}\n  Writes: \`src/alpha/core.ts\`\n`;
+    const fixture = makeHarness({ inline: { "writer.md": text } });
+    const annotate = vi.fn(h.compiler.annotate);
+    fixture.deps.annotate = annotate;
+    fixture.deps.roleOf = h.compiler.roleOf;
+    const { draft } = await fixture.compiler.compile(planPathOf("writer.md"), compileOpts(fixture));
+    const task = draft.tasks["1.1.1"]!;
+    const route = parseRouteLine(line, { positions: "any" }).line!;
+    expect(task.route).toEqual({ line, role: agent, tier: "medium", pin: route.pin });
+    expect(task.footprint.writes).toEqual(["src/alpha/core.ts"]);
+    const resolved = h.deps.routes.route(task);
+    expect(resolved.agent).toBe(agent);
+    const role = rolesModule.resolveRoles(executorConfig(), "v2").get(resolved.agent)!;
+    const grant = grantFor(role, { class: route.class ?? "other", risk: route.risk ?? "low", scope: route.scope ?? "single",
+      needs: route.needs ?? [], confidence: 1, source: "route-line" }, [], "D:/slots/writer/slot-1", route);
+    expect(grant.actions.has("edit")).toBe(true);
+    expect(annotate).not.toHaveBeenCalled();
+  });
 
   it("G6: unchanged throughput writers 1.1.4/1.1.5 receive editing roles and grants through real rules annotation", async () => {
     const h = capture();
@@ -740,14 +790,14 @@ describe("createExecutor assembly seams", () => {
     expect(warn).toHaveBeenCalledWith("[model-router] executor: queue: queue warning");
   }, 15_000);
 
-  it("run resolver preserves argv/cwd, distinguishes scripts and commands, filters undefined env and reports refusals", async () => {
+  it("run resolver preserves argv and inherited cwd/env under resolution, distinguishes scripts and commands and reports refusals", async () => {
     const h = await queueRig(), resolver = h.checksDeps.resolver;
     const planRun = vi.spyOn(runToolsModule, "planRun");
     for (const kind of ["script", "command"] as const) {
       planRun.mockReturnValue({ kind, name: "typecheck", executable: process.execPath, argv: ["check.js"], cwd: "D:/slot",
         env: { KEEP: "yes", OMIT: undefined }, timeoutMs: 1000 });
       expect(await resolver.resolve({ script: "typecheck", args: [] }, "D:/slot")).toEqual({ ok: true,
-        command: { label: "typecheck", file: process.execPath, args: ["check.js"], cwd: "D:/slot", env: { KEEP: "yes" },
+        command: { label: "typecheck", file: process.execPath, args: ["check.js"], resolution: { cwd: "D:/slot", env: { KEEP: "yes" } },
           source: kind === "script" ? "package-script" : "run-command", ref: { script: "typecheck", args: [] } } });
     }
     for (const error of [new Error("not allowlisted"), "not allowlisted"]) {
