@@ -4,16 +4,22 @@ import { checkV2ObservationStream, type ObservationRecord } from "../../../src/c
 
 export const G8_IDLE_CEILING_MS = 10_000;
 export interface ObservationFile { file: string; text: string }
-export interface IdleFragment { fromAt: string; toAt: string; ms: number; readyTaskIds: readonly string[] }
+export interface IdleFragment {
+  name: "idle-with-ready"; fromAt: string; toAt: string; ms: number; readyTaskIds: readonly string[]; free: number;
+}
+interface IdleClose {
+  planId: string; fromMs: number; toMs: number; toSeq: number; ledgerSeq: number; metric: IdleFragment;
+}
 export interface SlotDiagnostic {
   fromMs: number; toMs: number; ms: number; fromSeq: number; toSeq: number;
   status: "launchable" | "slot-blocked" | "slot-unknown"; reason: string; poolSeq: number | null;
 }
 export interface IdleEpisode {
+  planId: string;
   fromMs: number; toMs: number; ms: number; fromSeq: number; toSeq: number;
   readyTaskIds: string[]; endedBy: string;
-  /** Ledger-only closing boundary, tied to this episode's step/launch. NEVER extends predicate A. */
-  metricClose?: { toMs: number; toSeq: number; by: "closing-tick" | "launch-aggregate" };
+  /** Actual metric-creation observations whose starts lie in this episode. NEVER extends predicate A. */
+  metricCloses: IdleClose[];
   /** Predicate B only: NEVER used to shorten/split the asserted predicate-A episode. */
   slotDiagnostics: SlotDiagnostic[];
 }
@@ -25,7 +31,7 @@ interface Graph {
   edges: { from: string; to: string }[];
   phases: { id: string; gate: string; paused: boolean }[];
 }
-interface Step { taskId: string; attempt: number; launch?: number; result?: string; end?: number }
+interface Step { taskId: string; attempt: number; launch?: number; result?: string }
 interface Route { provider: string; heavy: boolean }
 interface Provider { limit: number; paused: boolean; queried: Set<boolean> }
 interface Token extends Route { taskId: string; attempt: number; launched: boolean }
@@ -41,7 +47,8 @@ const HEAVY_PROVIDER_CAP = 2;
 const RAW_ACTIONS = new Set(["capacity-init", "provider", "lease-acquire", "lease-release"]);
 const RUNTIME_ACTIONS = new Set(["route", "route-unavailable", "capacity-free", "capacity-reserve", "capacity-release",
   "lease-eligibility", "launch-gate", "launch-prepare", "launch", "launch-step-end", "orchestrator", "runtime-attach",
-  "activation", "activation-end", "promote", "schedule", "abort", "dispose", "detach", "lease-released-notification"]);
+  "activation", "activation-end", "promote", "schedule", "abort", "dispose", "detach", "lease-released-notification",
+  "slot-admission", "idle-close"]);
 
 function requireFact(ok: unknown, message: string): asserts ok {
   if (!ok) throw new Error(`G8 observations: ${message}`);
@@ -66,13 +73,27 @@ function boolean(value: unknown): boolean {
   requireFact(typeof value === "boolean", "missing boolean");
   return value;
 }
-function tickGate(row: SchedulerRow): { ok: boolean; ready: string[] } | undefined {
+function checkTickGate(row: SchedulerRow): void {
   if (row.action !== "launch-gate") return;
   const detail = bag(bag(row.state).detail);
-  // Per-task rechecks are not the tick's updateIdle boundary. The selected IDs identify launch
-  // aggregates only; neither they nor gate.ok establish durable readiness/provider eligibility.
+  // Selected IDs and gate.ok are diagnostic only, never readiness or metric-closing boundaries.
   if (detail.taskId !== undefined || !Array.isArray(detail.ready)) return;
-  return { ok: boolean(detail.ok), ready: detail.ready.map(text) };
+  boolean(detail.ok);
+  detail.ready.map(text);
+}
+function idleMetric(value: unknown, source: string): IdleFragment {
+  const m = bag(value);
+  requireFact(Object.keys(m).length === 6 && m.name === "idle-with-ready", `invalid ${source}`);
+  const metric: IdleFragment = { name: "idle-with-ready", fromAt: text(m.fromAt), toAt: text(m.toAt),
+    ms: number(m.ms), readyTaskIds: list(m.readyTaskIds).map(text), free: number(m.free) };
+  const from = Date.parse(metric.fromAt), to = Date.parse(metric.toAt);
+  requireFact(Number.isFinite(from) && Number.isFinite(to) && to >= from && to - from === metric.ms
+    && metric.readyTaskIds.length > 0, `invalid ${source}`);
+  return metric;
+}
+function sameMetric(a: IdleFragment, b: IdleFragment): boolean {
+  return a.name === b.name && a.fromAt === b.fromAt && a.toAt === b.toAt && a.ms === b.ms && a.free === b.free
+    && a.readyTaskIds.length === b.readyTaskIds.length && a.readyTaskIds.every((id, i) => id === b.readyTaskIds[i]);
 }
 function slotName(value: unknown): string {
   const name = text(value);
@@ -157,7 +178,7 @@ export async function collectObservationFiles(directory: string): Promise<Observ
  * lifetimes independently reconstruct capacity (including M14's heavy cap). Unqueried routes/capacity
  * are UNKNOWN, never guessed eligible or unavailable. A separate possible-episode track joins UNKNOWN
  * spans to adjacent eligible spans and fails closed if their union could exceed 10,000 ms.
- * Lease selection and launch-gate.ready are not readiness oracles.
+ * Lease selection, slot-admission and launch-gate.ready are not readiness oracles.
  *
  * Provider tokens consume A's capacity only on a confirmed launch, not on provisional reservation:
  * an attempt that never launches must NOT fragment an episode. Actual provider exhaustion/pauses do.
@@ -181,8 +202,9 @@ export async function collectObservationFiles(directory: string): Promise<Observ
  * check. Hard-restart resilience captures remain diagnostics, not G8 evidence. Runtime boundaries use
  * clockMs; committed graph swaps use at (both epoch ms on the smoke host). No tolerance or ledger idle
  * endpoints are used to infer/extend episodes. Ledger fragments are checked separately, only afterwards:
- * a step's first closing tick or a launch's completed aggregate can bound delayed metric closure, but
- * cannot move an independent episode endpoint or forgive a fragment/episode exceeding 10,000 ms.
+ * each must match an idle-close from this plan by full payload and occurrence order. Only that actual
+ * closing continuation can cover a delayed metric endpoint; neither a launch-gate nor a schedule can.
+ * It cannot move an independent episode endpoint or forgive a fragment/episode exceeding 10,000 ms.
  */
 export function reconstructIdleEpisodes(files: readonly ObservationFile[], identity: {
   planId: string; parentSessionID: string;
@@ -219,17 +241,7 @@ export function reconstructIdleEpisodes(files: readonly ObservationFile[], ident
   const steps = new Map<number, Step>();
   const pending = new Map<string, Step>();
   const successfulLaunches = new Set<number>();
-  const batches: Step[][] = [];
-  let batch: { selected: Set<string>; steps: Step[] } | undefined;
   for (const row of rows) {
-    const gate = tickGate(row);
-    if (gate && !gate.ok) batch = undefined;
-    else if (gate && gate.ready.length > 0) {
-      batch = { selected: new Set(gate.ready), steps: [] };
-      batches.push(batch.steps);
-    }
-    if (["orchestrator", "abort", "dispose", "detach"].includes(row.action)
-      || (row.action === "schedule" && batch?.steps.every(step => step.end !== undefined))) batch = undefined;
     if (!["launch-prepare", "launch", "launch-step-end"].includes(row.action)) continue;
     const detail = bag(bag(row.state).detail);
     const taskId = text(detail.taskId);
@@ -239,7 +251,6 @@ export function reconstructIdleEpisodes(files: readonly ObservationFile[], ident
       const step: Step = { taskId, attempt };
       pending.set(taskId, step);
       steps.set(row.seq, step); // A skipped slot reservation may reuse the same attempt number.
-      if (batch?.selected.delete(taskId)) batch.steps.push(step);
     } else {
       const step = pending.get(taskId);
       requireFact(step && step.attempt === attempt, `launch step missing open for ${taskId}#${attempt}`);
@@ -249,7 +260,6 @@ export function reconstructIdleEpisodes(files: readonly ObservationFile[], ident
       } else {
         requireFact(detail.result === "launched" || detail.result === "skipped", "unknown launch step result");
         step.result = detail.result;
-        step.end = row.seq;
         if (step.result === "launched") {
           requireFact(step.launch !== undefined, `successful step missing launch for ${taskId}`);
           successfulLaunches.add(step.launch);
@@ -259,26 +269,6 @@ export function reconstructIdleEpisodes(files: readonly ObservationFile[], ident
     }
   }
   requireFact(pending.size === 0, "launch step missing close");
-
-  // updateIdle waits for ALL steps in a tick, including skipped steps. Its following schedule is
-  // the observed post-update boundary. Require both the selecting tick and that continuation;
-  // an isolated launch-step-end or an unrelated later schedule cannot license an extension.
-  const aggregateEnds = new Map<number, Step[]>();
-  for (const batch of batches) if (batch.length > 0) {
-    aggregateEnds.set(Math.max(...batch.map(step => step.end!)), batch);
-  }
-  const launchMetricCloses = new Map<number, NonNullable<IdleEpisode["metricClose"]>>();
-  let previousRuntime: SchedulerRow | undefined;
-  for (const row of rows) {
-    if (row.action === "schedule" && previousRuntime) {
-      for (const step of aggregateEnds.get(previousRuntime.seq) ?? []) {
-        if (step.result === "launched" && step.launch !== undefined) {
-          launchMetricCloses.set(step.launch, { toMs: number(bag(row.state).clockMs), toSeq: row.seq, by: "launch-aggregate" });
-        }
-      }
-    }
-    if (RUNTIME_ACTIONS.has(row.action)) previousRuntime = row;
-  }
 
   let ledger: Graph | undefined;
   let graphAttached = false;
@@ -314,9 +304,9 @@ export function reconstructIdleEpisodes(files: readonly ObservationFile[], ident
   };
   const preparing = new Map<string, { step: Step; admitted: boolean }>();
   const episodes: IdleEpisode[] = [];
+  const idleCloses: IdleClose[] = [];
   let open: { fromMs: number; fromSeq: number; ids: Set<string>; slotDiagnostics: SlotDiagnostic[];
     slot: Pick<SlotDiagnostic, "fromMs" | "fromSeq" | "status" | "reason" | "poolSeq"> } | undefined;
-  let stepMetricClose: IdleEpisode | undefined;
   // Unlike confirmed A episodes, this upper-bound track survives transitions between eligible and
   // UNKNOWN. Even a same-timestamp UNKNOWN bridge is not evidence of a genuine episode boundary.
   let possible: { fromMs: number; fromSeq: number; unknown: boolean; hasUnknown: boolean; unknownMs: number } | undefined;
@@ -343,11 +333,9 @@ export function reconstructIdleEpisodes(files: readonly ObservationFile[], ident
   const close = (row: SchedulerRow, time: number, reason: string): void => {
     if (!open) return;
     closeSlot(row, time);
-    const episode: IdleEpisode = { fromMs: open.fromMs, toMs: time, ms: time - open.fromMs, fromSeq: open.fromSeq,
-      toSeq: row.seq, readyTaskIds: [...open.ids], endedBy: reason, slotDiagnostics: open.slotDiagnostics };
-    if (reason === "launch") episode.metricClose = launchMetricCloses.get(row.seq);
-    if (reason === "orchestrator-step" && row.action === "orchestrator"
-      && bag(bag(row.state).detail).event === "step.started") stepMetricClose = episode;
+    const episode: IdleEpisode = { planId: identity.planId, fromMs: open.fromMs, toMs: time, ms: time - open.fromMs,
+      fromSeq: open.fromSeq, toSeq: row.seq, readyTaskIds: [...open.ids], endedBy: reason,
+      metricCloses: [], slotDiagnostics: open.slotDiagnostics };
     episodes.push(episode);
     open = undefined;
   };
@@ -409,14 +397,22 @@ export function reconstructIdleEpisodes(files: readonly ObservationFile[], ident
           const expected = event === "step.started" ? false
             : ["execution.completed", "execution.failed", "execution.interrupted"].includes(event) ? true : idle;
           requireFact(nextIdle === expected, "orchestrator transition does not match idle state");
-          if (["step.started", "execution.completed", "execution.failed", "execution.interrupted"].includes(event)) stepMetricClose = undefined;
         } else requireFact(nextIdle === idle, "missing orchestrator open/close transition");
         idle = nextIdle;
       }
-      const gate = tickGate(row);
-      if (gate && stepMetricClose) {
-        if (!idle && !gate.ok) stepMetricClose.metricClose = { toMs: time, toSeq: row.seq, by: "closing-tick" };
-        stepMetricClose = undefined; // Only this step's first tick; never borrow a later turn's close.
+      checkTickGate(row);
+      if (row.action === "slot-admission") {
+        const d = bag(state.detail);
+        requireFact(ledger.tasks.some(task => task.id === text(d.taskId)) && d.result === "unavailable"
+          && number(d.free) === 0, "invalid slot-admission diagnostic");
+        // Admission is not a pool snapshot, provider query, durable ready set or predicate-A boundary.
+      } else if (row.action === "idle-close") {
+        const d = bag(state.detail), metric = idleMetric(d.metric, "idle-close metric");
+        const fromMs = number(d.fromMs), toMs = number(d.toMs);
+        requireFact(time === toMs && fromMs === Date.parse(metric.fromAt) && toMs === Date.parse(metric.toAt)
+          && number(d.ms) === metric.ms, "idle-close clock/payload mismatch");
+        // state.ledgerSeq was checked against the committed graph above. It is NOT the metric event's seq.
+        idleCloses.push({ planId: row.planId, fromMs, toMs, toSeq: row.seq, ledgerSeq: ledger.ledgerSeq, metric });
       }
       if (row.action === "launch-prepare") {
         const step = steps.get(row.seq)!;
@@ -466,7 +462,6 @@ export function reconstructIdleEpisodes(files: readonly ObservationFile[], ident
       possible.unknown = ready.length === 0;
       possible.hasUnknown ||= possible.unknown;
     }
-    if (stopped || ledger?.status !== "running" || successfulLaunches.has(row.seq)) stepMetricClose = undefined;
     const reason = boundary ?? (ready.length === 0 ? unknown ? "provider-unknown" : "provider-unavailable" : undefined);
     if (successfulLaunches.has(row.seq)) close(row, time, "launch");
     if (reason !== undefined) close(row, time, reason);
@@ -486,26 +481,42 @@ export function reconstructIdleEpisodes(files: readonly ObservationFile[], ident
   requireFact(!possible, "possible idle episode missing close");
   requireFact(finalSeen && ledger?.status === "completed", "missing completed plan snapshot");
   requireFact(ledger?.ledgerSeq === identity.finalLedgerSeq, "ledger advanced after fragment inventory; missing ledger tail");
+  // Associate only AFTER reconstructing A: neither the metric IDs/free nor its endpoints establish eligibility.
+  // A close without a persisted metric need not be consumed; a persisted metric without a close must fail below.
+  for (const closing of idleCloses) {
+    const episode = episodes.find(e => e.planId === closing.planId && e.fromMs <= closing.fromMs
+      && (closing.fromMs < e.toMs || (closing.fromMs === e.toMs && closing.toMs === e.toMs)));
+    episode?.metricCloses.push(closing);
+  }
   return { predicate: "A: provider-capacity", stream, episodes, streams: streams.size, records };
 }
 
 /** Coverage is one-way: metrics may omit gaps, but EVERY fragment (even free=0) must start in one
- * independently reconstructed episode. Only that episode's observed closing tick/launch aggregate
- * can cover a delayed ledger endpoint. This NEVER merges/extends episodes or widens either 10,000 ms bound.
+ * independently reconstructed episode AND match a same-plan idle-close by full payload and occurrence order.
+ * Only that close's exact endpoint can cover a delayed ledger endpoint. This NEVER merges/extends episodes
+ * or widens either 10,000 ms bound. Callers supply the metric inventory in committed ledger order.
  */
 export function assertG8IdleEpisodes(episodes: readonly IdleEpisode[], fragments: readonly IdleFragment[]): void {
-  for (const fragment of fragments) {
-    const from = Date.parse(fragment.fromAt), to = Date.parse(fragment.toAt);
-    requireFact(Number.isFinite(from) && Number.isFinite(to) && to >= from && to - from === fragment.ms
-      && fragment.readyTaskIds.length > 0, "invalid ledger idle fragment");
-    // Containment formerly implied this fragment bound; delayed closure must not remove it.
-    requireFact(fragment.ms <= G8_IDLE_CEILING_MS, `ledger idle fragment ${fragment.ms} ms exceeds 10,000 ms`);
-    requireFact(episodes.some(e => e.fromMs <= from && (e.toMs >= to
-      || (from < e.toMs && e.metricClose !== undefined && e.metricClose.toMs >= to))),
-      `ledger idle fragment outside reconstructed episodes: ${fragment.fromAt}..${fragment.toAt}`);
-  }
   for (const episode of episodes) {
     requireFact(Number.isFinite(episode.ms) && episode.ms >= 0 && episode.ms === episode.toMs - episode.fromMs, "invalid idle episode");
     requireFact(episode.ms <= G8_IDLE_CEILING_MS, `idle-with-ready episode ${episode.ms} ms exceeds 10,000 ms (${episode.fromSeq}..${episode.toSeq})`);
+  }
+  requireFact(new Set(episodes.map(e => e.planId)).size <= 1, "idle episodes span multiple plans");
+  const closes = episodes.flatMap(episode => episode.metricCloses.map(closing => ({ episode, closing })))
+    .sort((a, b) => a.closing.toSeq - b.closing.toSeq);
+  let nextClose = 0;
+  for (const value of fragments) {
+    const fragment = idleMetric(value, "ledger idle fragment");
+    // Containment formerly implied this fragment bound; delayed closure must not remove it.
+    requireFact(fragment.ms <= G8_IDLE_CEILING_MS, `ledger idle fragment ${fragment.ms} ms exceeds 10,000 ms`);
+    const match = closes.findIndex(({ episode, closing }, i) => i >= nextClose
+      && closing.planId === episode.planId && sameMetric(closing.metric, fragment));
+    requireFact(match >= 0, `ledger idle fragment missing matching idle-close: ${fragment.fromAt}..${fragment.toAt}`);
+    const { episode, closing } = closes[match]!;
+    nextClose = match + 1; // One observation per occurrence; never borrow an earlier or already consumed close.
+    const from = Date.parse(fragment.fromAt), to = Date.parse(fragment.toAt);
+    requireFact(episode.fromMs <= from && closing.toMs === to
+      && (episode.toMs >= to || from < episode.toMs),
+      `ledger idle fragment outside reconstructed episodes: ${fragment.fromAt}..${fragment.toAt}`);
   }
 }

@@ -8,8 +8,9 @@ type Task = { id: string; state: string; kind: string; phase: string | null; p50
 const task = (id = "a", extra: Partial<Task> = {}): Task => ({ id, state: "ready", kind: "task", phase: null, p50: 100, slot: null, attempts: [], ...extra });
 type Slot = { slot: string; kind: string; state: string; taskId: string | null };
 const slot = (state: string, taskId: string | null = null, name = "slot-1", kind = "task"): Slot => ({ slot: name, kind, state, taskId });
-const fragment = (from: number, to: number): IdleFragment => ({ fromAt: new Date(BASE + from).toISOString(),
-  toAt: new Date(BASE + to).toISOString(), ms: to - from, readyTaskIds: ["a"] });
+const fragment = (from: number, to: number): IdleFragment & { name: "idle-with-ready"; free: number } => ({
+  name: "idle-with-ready", fromAt: new Date(BASE + from).toISOString(),
+  toAt: new Date(BASE + to).toISOString(), ms: to - from, readyTaskIds: ["a"], free: 4 });
 
 /** Hand-authored wire rows, not the production scheduler or its idle metric implementation. */
 function fixture(tasks = [task()], maxParallel = 4) {
@@ -30,6 +31,10 @@ function fixture(tasks = [task()], maxParallel = 4) {
     add(action, ms, { clockMs: BASE + ms, ledgerSeq: ledger.ledgerSeq, orchIdle: idle, passive: false, recovering: false,
       disposed: action === "detach", latch: action === "detach", inFlight: [...inFlight], tokens: [], detail });
   };
+  const idleClose = (metric: ReturnType<typeof fragment>) => runtime("idle-close", Date.parse(metric.toAt) - BASE, {
+    fromMs: Date.parse(metric.fromAt), toMs: Date.parse(metric.toAt), ms: metric.ms,
+    metric: { ...metric, readyTaskIds: [...metric.readyTaskIds] },
+  });
   const query = (ms: number) => {
     const free = paused ? 0 : Math.max(0, limit - reservations.size);
     runtime("capacity-free", ms, { provider: "provider:fixture", heavy: false, free });
@@ -88,7 +93,7 @@ function fixture(tasks = [task()], maxParallel = 4) {
   routeTasks(-2);
   commit(-1, { status: "running" });
   orchestrator(0, "execution.completed");
-  return { rows, runtime, commit, orchestrator, prepare, endStep, launch, release, files, pool, raw: add, query,
+  return { rows, runtime, commit, orchestrator, prepare, endStep, launch, release, files, pool, raw: add, query, idleClose,
     provider(ms: number, change: string, to = limit) {
       add("provider", ms, { provider: "provider:fixture", change, from: limit, to,
         until: change === "pause" ? new Date(BASE + ms + 1000).toISOString() : null });
@@ -155,19 +160,101 @@ describe("G8 independent maximal idle episodes (no host)", () => {
     else expect(() => assertG8IdleEpisodes(episodes, [])).toThrow(/exceeds 10,000/);
   });
 
+  it("uses idle-close after a wakeOnce delay, not the earlier launch-gate time", () => {
+    const f = fixture();
+    const metric = fragment(0, 5_020);
+    f.orchestrator(5_000, "step.started");
+    f.runtime("schedule", 5_000);
+    f.query(5_005);
+    f.runtime("launch-gate", 5_010, { ok: false, ready: ["a"] });
+    f.commit(5_015, {}); // wakeOnce awaits a write before updateIdle can close the metric.
+    f.idleClose(metric); // This watermark precedes the metric append, not its eventual journal sequence.
+    f.commit(5_021, {});
+    f.finish(6_000);
+    const { episodes } = reconstruct(f);
+    expect(episodes.map(e => [e.fromMs - BASE, e.toMs - BASE, e.ms])).toEqual([[0, 5_000, 5_000]]);
+    expect(() => assertG8IdleEpisodes(episodes, [metric])).not.toThrow();
+    for (const to of [5_010, 5_019, 5_021]) {
+      expect(() => assertG8IdleEpisodes(episodes, [fragment(0, to)])).toThrow(/matching idle-close/);
+    }
+  });
+
+  it("reconciles a launch aggregate with idle-close and no following schedule", () => {
+    const f = fixture([task(), task("b")]);
+    const metric = { ...fragment(0, 5_020), readyTaskIds: ["a", "b"] };
+    f.runtime("launch-gate", 4_000, { ok: true, ready: ["a", "b"] });
+    f.prepare(4_000, "a");
+    f.prepare(4_000, "b");
+    f.commit(4_500, { tasks: [task("a", { state: "dispatched" }), task("b")] });
+    f.launch(5_000, "a");
+    f.endStep(5_005, "launched", "a");
+    f.endStep(5_010, "skipped", "b");
+    f.idleClose(metric);
+    f.finish(6_000);
+    expect(f.rows.some(row => row.action === "schedule")).toBe(false);
+    const { episodes } = reconstruct(f);
+    expect(episodes.map(e => [e.fromMs - BASE, e.toMs - BASE])).toEqual([[0, 5_000], [5_000, 6_000]]);
+    expect(() => assertG8IdleEpisodes(episodes, [metric])).not.toThrow();
+  });
+
+  it.each(["contained", "gate", "schedule"])("rejects a %s fragment without a matching idle-close", boundary => {
+    const f = fixture();
+    if (boundary === "gate") {
+      f.orchestrator(500, "step.started");
+      f.runtime("launch-gate", 1_000, { ok: false, ready: ["a"] });
+    } else if (boundary === "schedule") {
+      f.runtime("launch-gate", 100, { ok: true, ready: ["a"] });
+      f.prepare(100);
+      f.launch(500);
+      f.endStep(1_000, "launched");
+      f.runtime("schedule", 1_000);
+    }
+    f.finish(2_000);
+    const { episodes } = reconstruct(f);
+    expect(() => assertG8IdleEpisodes(episodes, [fragment(0, 1_000)])).toThrow(/matching idle-close/);
+  });
+
+  it.each(["free", "readyTaskIds", "readyTaskIds-order", "fromAt", "toAt"])("rejects an idle-close payload mismatch in %s", field => {
+    const f = fixture([task(), task("b")]);
+    const metric = { ...fragment(0, 1_000), readyTaskIds: ["a", "b"] };
+    f.idleClose(metric);
+    f.finish(2_000);
+    const { episodes } = reconstruct(f);
+    const mismatch = field === "free" ? { ...metric, free: 0 }
+      : field === "readyTaskIds" ? { ...metric, readyTaskIds: ["a"] }
+      : field === "readyTaskIds-order" ? { ...metric, readyTaskIds: ["b", "a"] }
+      : field === "fromAt" ? { ...metric, ...fragment(1, 1_000), readyTaskIds: metric.readyTaskIds }
+      : { ...metric, ...fragment(0, 999), readyTaskIds: metric.readyTaskIds };
+    expect(() => assertG8IdleEpisodes(episodes, [mismatch])).toThrow(/matching idle-close/);
+  });
+
+  it("matches idle-close occurrences once each and in ledger order, including free=0", () => {
+    const f = fixture();
+    const first = { ...fragment(0, 1_000), free: 0 }, second = fragment(1_000, 2_000);
+    f.idleClose(first);
+    f.idleClose(first); // Distinct same-payload occurrences must not be deduplicated.
+    f.idleClose(second);
+    f.finish(3_000);
+    const { episodes } = reconstruct(f);
+    expect(() => assertG8IdleEpisodes(episodes, [first, first, second])).not.toThrow();
+    expect(() => assertG8IdleEpisodes(episodes, [first, first, first])).toThrow(/matching idle-close/);
+    expect(() => assertG8IdleEpisodes(episodes, [second, first])).toThrow(/matching idle-close/);
+  });
+
   it("reconciles a step's delayed closing tick without extending the independent episode", () => {
     const f = fixture();
     f.orchestrator(5_000, "step.started");
     f.runtime("schedule", 5_000);
     f.query(5_005); // The tick does asynchronous work before its launch gate/updateIdle.
     f.runtime("launch-gate", 5_010, { ok: false, ready: ["a"] });
+    f.idleClose(fragment(0, 5_010));
     f.commit(5_011, {}); // The metric append becomes a committed graph swap afterwards.
     f.finish(6_000);
     const { episodes } = reconstruct(f);
     expect(episodes.map(e => [e.fromMs - BASE, e.toMs - BASE, e.ms])).toEqual([[0, 5_000, 5_000]]);
     expect(() => assertG8IdleEpisodes(episodes, [fragment(0, 5_010)])).not.toThrow();
-    expect(() => assertG8IdleEpisodes(episodes, [fragment(0, 5_011)])).toThrow(/fragment outside reconstructed episodes/);
-    expect(() => assertG8IdleEpisodes(episodes, [fragment(5_001, 5_010)])).toThrow(/fragment outside reconstructed episodes/);
+    expect(() => assertG8IdleEpisodes(episodes, [fragment(0, 5_011)])).toThrow(/missing matching idle-close/);
+    expect(() => assertG8IdleEpisodes(episodes, [fragment(5_001, 5_010)])).toThrow(/missing matching idle-close/);
   });
 
   it.each(["missing", "task-gate", "later-turn"])("rejects a delayed fragment with a %s closing tick", marker => {
@@ -181,7 +268,7 @@ describe("G8 independent maximal idle episodes (no host)", () => {
       f.runtime("launch-gate", 5_010, { ok: false, ready: ["a"] });
     }
     f.finish(6_000);
-    expect(() => assertG8IdleEpisodes(reconstruct(f).episodes, [fragment(0, 5_010)])).toThrow(/fragment outside reconstructed episodes/);
+    expect(() => assertG8IdleEpisodes(reconstruct(f).episodes, [fragment(0, 5_010)])).toThrow(/missing matching idle-close/);
   });
 
   it("reconciles a confirmed launch only at the end of its observed launch-step aggregate", () => {
@@ -193,12 +280,13 @@ describe("G8 independent maximal idle episodes (no host)", () => {
     f.launch(5_000, "a");
     f.endStep(5_005, "launched", "a");
     f.endStep(5_010, "skipped", "b");
+    f.idleClose(fragment(0, 5_010));
     f.runtime("schedule", 5_010); // Scheduled after the aggregate's updateIdle call.
     f.finish(6_000);
     const { episodes } = reconstruct(f);
     expect(episodes.map(e => [e.fromMs - BASE, e.toMs - BASE])).toEqual([[0, 5_000], [5_000, 6_000]]);
     expect(() => assertG8IdleEpisodes(episodes, [fragment(0, 5_010)])).not.toThrow();
-    expect(() => assertG8IdleEpisodes(episodes, [fragment(0, 5_011)])).toThrow(/fragment outside reconstructed episodes/);
+    expect(() => assertG8IdleEpisodes(episodes, [fragment(0, 5_011)])).toThrow(/missing matching idle-close/);
   });
 
   it.each(["route", "capacity-free", "both"])("fails closed on an 11,001 ms sealed interval missing %s evidence", missing => {
@@ -240,13 +328,15 @@ describe("G8 independent maximal idle episodes (no host)", () => {
     const f = fixture([task("a"), task("b")]);
     f.prepare(3_000);
     f.commit(5_000, { tasks: [task("a", { state: "dispatched", attempts: [{ n: 1, callID: "call", childSessionID: null, outcome: null }] }), task("b")] });
+    f.idleClose(fragment(0, 5_900));
     f.launch(6_000);
     f.endStep(6_500, "launched");
+    f.idleClose(fragment(6_000, 12_000));
     f.finish(12_000);
     const { episodes } = reconstruct(f);
     expect(episodes.map(e => [e.fromMs - BASE, e.toMs - BASE, e.endedBy])).toEqual([[0, 6_000, "launch"], [6_000, 12_000, "plan-completed"]]);
     expect(() => assertG8IdleEpisodes(episodes, [fragment(0, 5_900), fragment(6_000, 12_000)])).not.toThrow();
-    expect(() => assertG8IdleEpisodes(episodes, [fragment(5_900, 6_100)])).toThrow(/fragment outside reconstructed episodes/);
+    expect(() => assertG8IdleEpisodes(episodes, [fragment(5_900, 6_100)])).toThrow(/missing matching idle-close/);
   });
 
   it("does not treat a throwing launch invocation (step result skipped) as a successful launch", () => {
@@ -335,6 +425,24 @@ describe("G8 independent maximal idle episodes (no host)", () => {
     expect(oracle.episodes.map(e => e.ms)).toEqual([11_001]);
     expect(oracle.episodes[0]!.slotDiagnostics.map(s => [s.status, s.ms])).toEqual([["slot-blocked", 11_000], ["launchable", 1]]);
     expect(() => assertG8IdleEpisodes(oracle.episodes, [fragment(0, 11_001)])).toThrow(/exceeds 10,000/);
+  });
+
+  it.each([5_000, 10_001])("counts %i ms of slot-admission blockage by verifying/integrating tasks as predicate A idle", ms => {
+    const f = fixture([task(), task("b", { state: "verifying", slot: "slot-1" }),
+      task("c", { state: "integrating", slot: "slot-2" })], 2);
+    f.pool(0, "slot-pool-open", { slots: [slot("leased", "b"), slot("leased", "c", "slot-2")] });
+    for (const at of [100, 2_000]) {
+      f.query(at); // Both provider tokens are free; verification/integration still retain the slots.
+      f.runtime("launch-gate", at, { ok: true, ready: ["a"] });
+      f.runtime("slot-admission", at, { taskId: "a", result: "unavailable", free: 0 });
+    }
+    f.finish(ms);
+    const { episodes } = reconstruct(f);
+    expect(episodes.map(e => [e.fromMs - BASE, e.toMs - BASE, e.ms])).toEqual([[0, ms, ms]]);
+    expect(episodes[0]!.readyTaskIds).toEqual(["a"]);
+    expect(episodes[0]!.slotDiagnostics.map(s => [s.status, s.ms])).toEqual([["slot-blocked", ms]]);
+    if (ms <= 10_000) expect(() => assertG8IdleEpisodes(episodes, [])).not.toThrow();
+    else expect(() => assertG8IdleEpisodes(episodes, [])).toThrow(/episode 10001 ms exceeds 10,000/);
   });
 
   it("splits B at claim/preparation and physical completion without fragmenting A", () => {
@@ -446,9 +554,9 @@ describe("G8 independent maximal idle episodes (no host)", () => {
     const { episodes } = reconstruct(f);
     expect(() => reconstructIdleEpisodes(f.files(), { ...f.identity(), finalLedgerSeq: 999 })).toThrow(/missing completed/);
     expect(() => reconstructIdleEpisodes(f.files(), { ...f.identity(), finalLedgerSeq: 1 })).toThrow(/missing ledger tail/);
-    expect(() => assertG8IdleEpisodes(episodes, [fragment(-1, 100)])).toThrow(/fragment outside/);
+    expect(() => assertG8IdleEpisodes(episodes, [fragment(-1, 100)])).toThrow(/missing matching idle-close/);
     expect(() => assertG8IdleEpisodes(episodes, [{ ...fragment(0, 1_000), ms: 1 }])).toThrow(/invalid ledger idle fragment/);
-    expect(() => assertG8IdleEpisodes([], [fragment(0, 1_000)])).toThrow(/fragment outside/);
+    expect(() => assertG8IdleEpisodes([], [fragment(0, 1_000)])).toThrow(/missing matching idle-close/);
   });
 
   it("rejects an idle transition whose runtime payload is missing instead of silently skipping it", () => {
