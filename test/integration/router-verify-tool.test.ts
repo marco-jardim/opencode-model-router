@@ -1285,7 +1285,8 @@ describe("background mode (2.4.5)", () => {
 
   it("an unattributed change set is not queued (nothing could run; it stays listed); a failing enqueue keeps the handle", async () => {
     const rows: ObservationRecord[] = [];
-    const { wiring } = makeWiring({ background: true }, undefined, FAST, createV2Observations({ write: (line) => { rows.push(JSON.parse(line)); } }));
+    const observations = createV2Observations({ write: (line) => { rows.push(JSON.parse(line)); } });
+    const { wiring } = makeWiring({ background: true }, undefined, FAST, observations);
     const queue = queueOf(wiring);
     const finish = (store: ReturnType<typeof createChangedFileStore>, id: string, child: string) =>
       wiring.finishDeferred(store, { dispatchID: id, orchestratorSessionID: "orch", producerSessionID: child, producerTier: "fast", description: "w", cwd: state.root, dod: DOD, dispatchedAt: 0 });
@@ -1308,6 +1309,7 @@ describe("background mode (2.4.5)", () => {
     expect(kept.footer).toContain(`[router] unverified \u00b7 ${kept.handle} \u00b7`);
     expect(wiring.sweepVerification()).toBe(0);
     // Even a throwing invocation is counted; an unattributed dispatch did not invoke enqueue at all.
+    observations.flush();
     expect(rows.filter((r) => r.family === "completion-effect" && r.effect === "verification-enqueue")).toMatchObject([
       { callID: "v", parentSessionID: "orch", childSessionID: "child-v", handle: kept.handle },
     ]);
@@ -1330,6 +1332,7 @@ describe("background mode (2.4.5)", () => {
     expect(queueOf(wiring).stats().runs).toBe(1);
     expect(wiring.pending.get("orch", result.handle)).toMatchObject({ entry: { state: "verified", result: { verdict: { outcome: "pass" } } } });
     expect(inputsOf("a")).toBe(1);
+    observations?.flush();
     if (mode !== "on") expect(rows).toEqual([]);
     else {
       expect(rows.map((r) => r.family === "completion-effect" ? r.effect : "")).toEqual([

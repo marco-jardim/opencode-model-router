@@ -3774,10 +3774,14 @@ export async function registerV2Hooks(
         try {
           // QA-2.1-17: the plugin rebuilds the gate inputs from the journaled dispatch and the restored pending entry, and
           // re-posts a verdict the entry already reached.
-          const result = await withinCaller(hold, () => api.finish({
-            callID: hold.callID, parentSessionID: hold.parentSessionID, childSessionID: hold.childSessionID, outputText: childText,
-            status: "succeeded", mode: "background", heldHandle: hold.handle, endedAt: nowMs(), restored: hold.dispatch,
-          }));
+          const result = await withinCaller(hold, () => {
+            observeV2(options.observations, () => ({ family: "completion-effect", effect: "finish-dispatch", source: "restored-hold",
+              parentSessionID: hold.parentSessionID, callID: hold.callID, childSessionID: hold.childSessionID }));
+            return api.finish({
+              callID: hold.callID, parentSessionID: hold.parentSessionID, childSessionID: hold.childSessionID, outputText: childText,
+              status: "succeeded", mode: "background", heldHandle: hold.handle, endedAt: nowMs(), restored: hold.dispatch,
+            });
+          });
           // The gate runs behind `finish`; it posts the verdict through the HeldSink when it settles.
           if (result.verification.kind === "held") return;
           api.releaseHeld(hold.handle);
@@ -4330,7 +4334,7 @@ export async function registerV2Hooks(
       };
       if (event.tool === "subagent") observeV2(options.observations, () => ({
         family: "completion-effect", effect: "annotation-delivery", source: "foreground-result",
-        parentSessionID: String(event.sessionID), callID: event.id, childSessionID: namedChild ?? null,
+        parentSessionID: String(event.sessionID), callID: event.id, childSessionID: resultChild,
       }));
       } finally {
         role?.finish();
