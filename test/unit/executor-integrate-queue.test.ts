@@ -4,6 +4,9 @@ import { mkdir, mkdtemp, readdir, readFile, unlink, writeFile } from "node:fs/pr
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createV2Observations, type ServiceObservationData } from "../../src/compat/v2-observations";
+import { attachSlotObservations, detachSlotObservations } from "../../src/executor/observations";
+import { servicePairs } from "../helpers/service-observations";
 import { FakeClock, FakeProc } from "../fixtures/cpx/ledger/fakes.js";
 import { removeDirWhenReleased } from "../helpers/remove-dir.js";
 
@@ -18,6 +21,7 @@ import { createPhaseSuiteRunner, fileOfSuiteId } from "../../src/executor/integr
 import {
   AX_MAX_CHARS,
   BackgroundRuns,
+  createIntegrationChecks,
   DETAIL_MAX_BYTES,
   OUTPUT_TAIL_BYTES,
   type ResolvedCommand,
@@ -1736,6 +1740,145 @@ describe("harness sanity", () => {
     expect(env.queue.queued()).toEqual([]);
     env.assertInvariants();
     await env.queue.dispose();
+  });
+});
+
+describe("G8 intrinsic integration and phase-suite service observations", () => {
+  async function observedEntry(mode: "off" | "on" | "throw", tasks: number, preparationMs = 100, waitMs = 300) {
+    const env = await setup({ tasks });
+    const lines: string[] = [], calls: string[] = [];
+    const sink = createV2Observations({ write: line => { lines.push(line); } });
+    if (mode === "throw") sink.record = () => { throw new Error("observer failed"); };
+    attachSlotObservations(mode === "off" ? undefined : sink, env.clock, env.writer);
+    let now = 0;
+    const monotonic = vi.spyOn(performance, "now").mockImplementation(() => now);
+    const poolReset = env.pool.reset.bind(env.pool);
+    vi.spyOn(env.pool, "reset").mockImplementation(async (slot, commit) => {
+      calls.push(`reset:${slot}`); now += preparationMs; await poolReset(slot, commit);
+    });
+    const special = env.pool.acquireSpecial.bind(env.pool);
+    vi.spyOn(env.pool, "acquireSpecial").mockImplementation(async (plan, kind) => {
+      calls.push(`special:${kind}`); now += preparationMs * 2; return special(plan, kind);
+    });
+    const rebase = env.git.rebaseOnto.bind(env.git);
+    const git: GitOps = env.git;
+    // These three doubles model only the actual git process. executor-git.test.ts separately exercises the real
+    // GitOps preparation/cleanup seams, so a pointer/config/reset delay cannot hide inside these stand-ins.
+    vi.spyOn(git, "rebaseOnto").mockImplementation(async (slot, onto, _upstream, observation) => {
+      const service = observation?.start("service", "rebase");
+      try { calls.push("rebase"); now += 7; return await rebase(slot, onto); }
+      finally { service?.end("pass"); }
+    });
+    const merge = env.git.mergeFfOnly.bind(env.git);
+    vi.spyOn(git, "mergeFfOnly").mockImplementation(async (slot, commit, observation) => {
+      const service = observation?.start("service", "merge");
+      try { calls.push("merge"); now += 5; return await merge(slot, commit); }
+      finally { service?.end("pass"); }
+    });
+    const cas = env.git.branchForce.bind(env.git);
+    vi.spyOn(git, "branchForce").mockImplementation(async (branch, commit, old, observation) => {
+      const service = observation?.start("service", "cas");
+      try { calls.push("cas"); now += 3; return await cas(branch, commit, old); }
+      finally { service?.end("pass"); }
+    });
+    const revParse = env.git.revParse.bind(env.git);
+    vi.spyOn(env.git, "revParse").mockImplementation(async (path, rev) => {
+      if (rev === "HEAD" && path.startsWith("C:/slots/")) return env.w.slotCommit.get(path.slice("C:/slots/".length)) ?? "";
+      return revParse(path, rev);
+    });
+    const igit: IntegrateGit = env.igit;
+    vi.spyOn(igit, "showFile").mockImplementation(async (_cwd, _commit, path) => {
+      now += preparationMs;
+      return path === "package.json" ? JSON.stringify({ scripts: { typecheck: "tsc" } }) : null;
+    });
+    const command: ResolvedCommand = { file: "node", args: ["check.js"], label: "mandatory-check", source: "run-command", ref: null };
+    const resolver: RunResolver = { resolve: async () => ({ ok: true, command }) };
+    const background = new BackgroundRuns();
+    const checks = createIntegrationChecks({ ledger: () => env.ledger, pool: env.pool, git: env.git, igit,
+      clock: env.clock, logger: env.logger, guard: env.guard, resolver, background,
+      preemptForeground: async () => { calls.push("preempt"); now += waitMs; },
+      acquire: async () => {
+        calls.push("slot-acquire"); now += waitMs;
+        return { lost: false, release: async () => { calls.push("slot-release"); now += 200; } };
+      },
+      spawn: async (_command, options) => {
+        calls.push(options.lowPriority ? "suite-command" : "check-command");
+        const durationMs = options.lowPriority ? 13 : 11;
+        now += durationMs;
+        return { exitCode: 0, timedOut: false, stdout: "", stderr: "", durationMs };
+      },
+    });
+    vi.spyOn(env.checks, "run").mockImplementation(async req => {
+      const result = await checks.run(req);
+      if (result.verdict === "pass") env.w.passed.add(req.candidate);
+      return result;
+    });
+    const suite = createPhaseSuiteRunner({ checks, igit, git: env.git, pool: env.pool, clock: env.clock,
+      logger: env.logger, resolver, background });
+    vi.spyOn(env.suite, "resolve").mockResolvedValue({ kind: "runs", commands: [command] });
+    vi.spyOn(env.suite, "run").mockImplementation(suite.run);
+    env.locks.beforeAcquire = () => { calls.push("repo-lock"); now += waitMs; };
+    try {
+      const ids = Array.from({ length: tasks }, (_, i) => `T${i + 1}`);
+      env.queue.enqueue(ids);
+      await env.until(() => ids.every(id => env.state(id) === "integrated") && env.phase().gate === "awaiting-qa" && env.quiet());
+      env.assertInvariants();
+      await env.queue.dispose();
+      const signature = await env.signature();
+      const steps = await env.steps();
+      sink.close();
+      return { signature, steps, calls, rows: mode === "on" ? servicePairs(lines) : [],
+        writes: env.w.writes, releases: env.pool.released, listeners: env.listener.calls, elapsed: now };
+    } finally {
+      await env.queue.dispose();
+      detachSlotObservations(env.clock, env.writer);
+      sink.close(); monotonic.mockRestore();
+    }
+  }
+
+  it.each([1, 2])("off/on/throwing parity through the real queue, checks and phase runner (%s tasks)", async tasks => {
+    const off = await observedEntry("off", tasks);
+    for (const mode of ["on", "throw"] as const) {
+      const observed = await observedEntry(mode, tasks);
+      const { rows, ...effects } = observed;
+      const { rows: _offRows, ...offEffects } = off;
+      expect(effects).toEqual(offEffects);
+      if (mode !== "on") continue;
+      const ends = rows.filter(r => r.action === "end" && r.spanKind === "service");
+      expect(ends.map(r => [r.component, r.stage, r.durationMs])).toEqual([
+        ...Array.from({ length: tasks }, () => ["rebase", "rebase", 7]),
+        ["checks", "command", 11], ["fast-forward", "merge", 5], ["fast-forward", "cas", 3], ["phase-suite", "command", 13],
+      ]);
+      const entry = ends.filter(r => r.component !== "phase-suite");
+      expect(new Set(entry.map(r => r.entryId)).size).toBe(1);
+      for (const row of entry) {
+        expect(row).toMatchObject({ planId: PLAN_ID, phaseId: "p1", taskIds: Array.from({ length: tasks }, (_, i) => `T${i + 1}`), result: "pass" });
+        expect(row.candidate).toMatch(/^[0-9a-f]{40}$/);
+        expect(row.entryId).toMatch(/^i-/);
+      }
+      expect(ends.at(-1)).toMatchObject({ planId: PLAN_ID, phaseId: "p1", taskIds: [], result: "pass" });
+      expect(ends.at(-1)?.entryId).not.toBe(entry[0]?.entryId);
+      expect(rows.some(r => r.spanKind === "service-prep" && r.stage === "ci-slot")).toBe(true);
+      expect(rows.some(r => r.spanKind === "service-wait" && r.stage === "background-lane")).toBe(true);
+      expect(rows.some(r => r.spanKind === "service-wait" && r.stage === "repo-lock")).toBe(true);
+    }
+  });
+
+  it("excludes delayed checkout/provisioning and verification-slot waits from checks AND suite service", async () => {
+    const baseline = await observedEntry("on", 2, 0, 0);
+    const prep = await observedEntry("on", 2, 1_000, 0);
+    const wait = await observedEntry("on", 2, 0, 5_000);
+    const intrinsic = (rows: ServiceObservationData[]) => rows.filter(r => r.action === "end" && r.spanKind === "service")
+      .map(r => [r.component, r.stage, r.durationMs]);
+    expect(intrinsic(prep.rows)).toEqual(intrinsic(baseline.rows));
+    expect(intrinsic(wait.rows)).toEqual(intrinsic(baseline.rows));
+    expect(prep.elapsed).toBeGreaterThan(baseline.elapsed + 1_000);
+    expect(wait.elapsed).toBeGreaterThan(baseline.elapsed + 5_000);
+    for (const component of ["checks", "phase-suite"] as const) {
+      expect(wait.rows).toContainEqual(expect.objectContaining({ component, spanKind: "service-wait", action: "end", stage: "verification-slot",
+        durationMs: component === "checks" ? 10_000 : 5_000 }));
+      expect(prep.rows.some(r => r.component === component && r.spanKind === "service-prep" && r.durationMs >= 1_000)).toBe(true);
+    }
   });
 });
 

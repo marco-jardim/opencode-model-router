@@ -5,7 +5,7 @@
  * Explicit flush/close are synchronous lifecycle barriers, not hot-path operations.
  *
  * Wire format v1: {v, stream, seq, at, family, ...payload}. Families are native-args,
- * completion-effect and scheduler. A final {v, stream, seq, at, kind:"end", ...counts}
+ * completion-effect, scheduler and service. A final {v, stream, seq, at, kind:"end", ...counts}
  * seals the stream. Consumers MUST require contiguous seq from 1, an end record, and
  * dropped=failed=0; absence, overflow, serialization faults and writer faults are not evidence.
  *
@@ -52,13 +52,14 @@
  * Other raw states: capacity-init {maxParallel,providers:[{provider,limit,holdUntilMs,
  * lastSignalAtMs,pausedUntilMs}]}; provider {provider,change,from,to,until};
  * lease-acquire {taskRef,ok}; lease-release {taskRef}.
+ * Service execution/preparation/wait pairs are specified in src/executor/observations.ts.
  * Physical-slot events are specified in src/executor/observations.ts. Neither
  * task.slot=null nor provider/write-lease release implies physical pool availability.
  * Provider labels are stream-local keyed tokens, never configuration text. These
  * observations never call updateIdle or query a controller/host just for diagnostics.
  * Unqueried route/lease/gate facts are UNKNOWN, not eligible. Reconstruct from the raw
  * graph + control transitions + original query results; do not use the ready list as
- * the oracle. `at` is epoch ms at observation entry; clockMs is the runtime clock.
+ * the oracle. `at` is epoch ms at observation entry; scheduler clockMs is the runtime clock.
  */
 import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import { closeSync, openSync, writeSync } from "node:fs";
@@ -85,11 +86,27 @@ export type CompletionEffect = "change-set-capture" | "finish-dispatch" | "defer
   | "verification-enqueue" | "verification-settle" | "annotation-delivery" | "timing-row-write";
 type Scalar = string | number | boolean | null;
 export type ObservationValue = Scalar | readonly ObservationValue[] | { readonly [key: string]: ObservationValue };
+export interface ServiceIdentity {
+  planId: string;
+  taskId: string | null;
+  attempt: number | null;
+  phaseId: string | null;
+  entryId: string | null;
+  taskIds: readonly string[];
+  component: "verify" | "rebase" | "checks" | "fast-forward" | "phase-suite";
+  candidate: string | null;
+}
+export type ServiceSpanKind = "service" | "service-prep" | "service-wait";
+export type ServiceObservationData = ServiceIdentity & {
+  family: "service"; spanKind: ServiceSpanKind; operationId: string; stage: string;
+  action: "start" | "end"; clockMs: number; durationMs: number; result: string | null;
+};
 export type ObservationData =
   | { family: "native-args"; callID: string; sessionID: string; before: ArgumentObservation; after: ArgumentObservation;
       backgroundDecision: boolean | null }
   | ({ family: "completion-effect"; effect: CompletionEffect; source: string; handle?: string; outcome?: string } & CompletionIdentity)
-  | { family: "scheduler"; planId: string; parentSessionID: string; action: string; state: ObservationValue };
+  | { family: "scheduler"; planId: string; parentSessionID: string; action: string; state: ObservationValue }
+  | ServiceObservationData;
 export type ObservationRecord = ObservationData & { v: 1; stream: string; seq: number; at: number };
 export interface ObservationCounts { attempted: number; written: number; dropped: number; failed: number }
 export interface V2Observations {
@@ -302,7 +319,7 @@ export function checkV2ObservationStream(lines: readonly string[]): ObservationR
     if (i === lines.length - 1) {
       if (r.kind !== "end" || r.attempted !== i || r.written !== i || r.dropped !== 0 || r.failed !== 0) throw new Error("incomplete observation stream");
     } else {
-      if (r.kind !== undefined || !["native-args", "completion-effect", "scheduler"].includes(String(r.family))) throw new Error("invalid observation family");
+      if (r.kind !== undefined || !["native-args", "completion-effect", "scheduler", "service"].includes(String(r.family))) throw new Error("invalid observation family");
       records.push(row as ObservationRecord);
     }
   }

@@ -1,6 +1,71 @@
-import { observeV2, type ObservationValue, type V2Observations } from "../compat/v2-observations";
+import { observeV2, type ObservationValue, type ServiceIdentity, type ServiceSpanKind, type V2Observations } from "../compat/v2-observations";
 import { pathsOverlap } from "./schedule";
 import type { Clock, LedgerV1, LedgerWriter } from "./types";
+
+/**
+ * Service family (v2 opt-in only), amended G8 intrinsic-time oracle:
+ * {family:"service",spanKind:"service"|"service-prep"|"service-wait",action:"start"|"end",
+ *  planId,taskId,attempt,phaseId,entryId,taskIds,component,candidate,operationId,stage,clockMs,durationMs,result}.
+ * Task verification identifies taskId+attempt; integration identifies phaseId+entryId and copies ALL entry.taskIds
+ * (also for a batch probe/subset). candidate is the checked commit/snapshot identity, null when not yet known.
+ * Pre-entry queue/lane/repo-lock waits have entryId=null (no journal entry exists yet), retaining taskId+attempt
+ * or phaseId and the queued taskIds. Never fabricate a future entry ID or attribute these waits as execution.
+ * operationId is unique within the sink/stream, shared by exactly one start/end pair, including failed attempts.
+ * stage distinguishes command/recheck/grading, rebase, merge and CAS, and named preparation/resource waits.
+ * clockMs uses the process monotonic performance clock (NOT epoch `at` or journal duration); durationMs is zero
+ * on start and end-start on end. result is null on start, a bounded outcome label on end, never output/error text.
+ * Results describe that operation (pass/fail/error/timed-out/interrupted, completed for grading/preparation,
+ * acquired/busy for a slot, dequeued/dropped/disposed/aborted for a queue wait), NOT the published task verdict.
+ * Sum ONLY service intervals: mandatory verification execution/grading, actual rebase, mandatory integration
+ * command execution, checked merge/CAS, and phase-suite command execution. No enclosing journal/gate durations.
+ * Preparation (capture, snapshot/environment, checkout reset/provisioning, planning, grader startup) and resource
+ * waits (leases, repo/verification slots, lanes) are separate, possibly nested, non-service spans. Publication,
+ * release/cleanup and retry backoff are never service. No execution (memo/no-checks/aborted-before-run) means no
+ * service pair. Repeated executions/retries have distinct IDs; do not deduplicate by candidate or taskIds.
+ * End precedes result publication/cleanup. Exceptions still close pairs. Missing pairs/faulted streams are UNKNOWN,
+ * not zero service. Observations neither query for identity nor change admission, scheduling or verification.
+ */
+export interface ServiceObservation {
+  start(kind: ServiceSpanKind, stage: string, candidate?: string | null): { end(result: string): void } | undefined;
+}
+
+const serviceSequences = new WeakMap<V2Observations, number>();
+
+/** Lazy identity and clock; every diagnostic failure is contained, including injected observers/identity thunks. */
+export function serviceObservation(sink: V2Observations | undefined, identity: () => ServiceIdentity,
+  now: () => number = () => performance.now()): ServiceObservation | undefined {
+  if (sink === undefined) return undefined;
+  return { start(spanKind, stage, candidate) {
+    let captured: ServiceIdentity | undefined;
+    let operationId = "";
+    let started = 0;
+    observeV2(sink, () => {
+      captured = { ...identity(), ...(candidate === undefined ? {} : { candidate }) };
+      captured = { ...captured, taskIds: [...captured.taskIds] };
+      const n = (serviceSequences.get(sink) ?? 0) + 1;
+      serviceSequences.set(sink, n);
+      operationId = `service-${n}`;
+      started = now();
+      return { ...captured, family: "service", spanKind, stage, operationId, action: "start", clockMs: started, durationMs: 0, result: null };
+    });
+    if (captured === undefined || operationId === "") return undefined;
+    const fields = captured;
+    let ended = false;
+    return { end(result) {
+      if (ended) return;
+      ended = true;
+      observeV2(sink, () => {
+        const clockMs = now();
+        return { ...fields, family: "service", spanKind, stage, operationId, action: "end", clockMs, durationMs: clockMs - started, result };
+      });
+    } };
+  } };
+}
+
+/** Same plan-scoped v2 port as physical slots; queue/checks need no runtime or scheduling hook. */
+export function executorServiceObservation(clock: Clock, planId: string, identity: () => ServiceIdentity): ServiceObservation | undefined {
+  return serviceObservation(slotObservers.get(clock)?.get(planId)?.sink, identity);
+}
 
 /**
  * Physical-slot schema (scheduler family; separate from provider tokens and write leases):

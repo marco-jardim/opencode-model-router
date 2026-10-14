@@ -93,6 +93,8 @@ export interface MutexRegistry {
 }
 
 export interface DeterministicDeps {
+  /** Read-only v2 intrinsic-execution diagnostics; absent on v1/off. */
+  service?: import("../executor/observations").ServiceObservation;
   /**
    * S5 (deterministic.ts header, T2 P2-P7): plans, runs and rechecks one testsPass request. Called
    * outside `mutex`. Absent -> testsPass is unverifiable, never a run (G5).

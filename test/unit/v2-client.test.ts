@@ -8,6 +8,8 @@ import type { RouterConfig } from "../../src/router/config";
 import * as routerConfig from "../../src/router/config";
 import ModelRouterPlugin from "../../src/index";
 import { ResumeRejectedError, type RouterPluginInput } from "../../src/compat/child-session";
+import { createV2Observations } from "../../src/compat/v2-observations";
+import { servicePairs } from "../helpers/service-observations";
 
 function fixture() {
   const execute = vi.fn(async (_input: unknown, context: ToolContext) => {
@@ -467,6 +469,54 @@ describe("native v2 child runner", () => {
     expect(inFlight.size).toBe(0);
     expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child" }, undefined);
     await wiring.disposeVerification();
+  });
+
+  it.each([false, true])("G8 grading excludes native session/cwd startup and cleanup; off/on/throwing parity (failure=%s)", async failure => {
+    const run = async (mode: "off" | "on" | "throw") => {
+      const { runtime, context, toolContext, execute } = fixture();
+      let now = 0;
+      const clock = vi.spyOn(performance, "now").mockImplementation(() => now);
+      const lines: string[] = [];
+      const sink = createV2Observations({ write: line => { lines.push(line); } });
+      if (mode === "throw") sink.record = () => { throw new Error("observer"); };
+      const cfg: RouterConfig = { activePreset: "p", presets: { p: { medium: { model: "p/model" } } }, rules: [], defaultTier: "medium" };
+      const wiring = createVerificationWiring({ client: runtime.client, childRunner: runtime.childRunner, directory: "/project",
+        getConfig: () => cfg, observations: mode === "off" ? undefined : sink });
+      context.tool.list.mockImplementation(async () => { now += 200; return [{ id: "subagent", execute }]; });
+      context.session.move.mockImplementation(async () => { now += 1_000; });
+      context.session.interrupt.mockImplementation(async () => { now += 500; return { interrupted: true }; });
+      execute.mockImplementation(async (_input, native) => {
+        now += 800; // native child creation, before progress
+        await native.progress({ sessionID: "child", status: "running" });
+        now += 17; // intrinsic grading only
+        if (failure) throw new Error("grading failed");
+        return { output: { sessionID: "child", status: "completed", output: "verified result" } };
+      });
+      try {
+        const gate = wiring.buildGateDeps("parent", undefined, undefined, undefined, false, "parent", () => ({
+          planId: "p1", taskId: "T1", attempt: 3, taskIds: ["T1"], phaseId: "p1", entryId: null, component: "verify", candidate: "b".repeat(40),
+        }));
+        const result = await runtime.withToolContext(toolContext, () => gate.checker.dispatchGrader({
+          tier: "medium", system: "Judge the changes", prompt: "inspect", cwd: "/artifact",
+        })).catch((error: unknown) => error instanceof Error ? error.message : String(error));
+        sink.close();
+        return { result, elapsed: now, moved: context.session.move.mock.calls.length, interrupted: context.session.interrupt.mock.calls.length,
+          executes: execute.mock.calls.length, rows: mode === "on" ? servicePairs(lines) : [] };
+      } finally { await wiring.disposeVerification(); sink.close(); clock.mockRestore(); }
+    };
+    const off = await run("off");
+    for (const mode of ["on", "throw"] as const) {
+      const { rows, ...effects } = await run(mode);
+      const { rows: _offRows, ...original } = off;
+      expect(effects).toEqual(original);
+      if (mode === "on") {
+        expect(rows.filter(r => r.action === "end")).toMatchObject([
+          { spanKind: "service-prep", stage: "grader-startup", durationMs: 2_000, result: "completed" },
+          { spanKind: "service", stage: "grading", durationMs: 17, result: failure ? "error" : "completed",
+            planId: "p1", taskId: "T1", attempt: 3, candidate: "b".repeat(40) },
+        ]);
+      }
+    }
   });
 
   it("drives the shared verified-delegate path through native producer and grader children", async () => {

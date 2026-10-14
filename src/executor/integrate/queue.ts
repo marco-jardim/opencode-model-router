@@ -25,6 +25,8 @@ import {
   type WritePurpose,
 } from "./checks";
 import type { GitOps } from "../git";
+import { executorServiceObservation, type ServiceObservation } from "../observations";
+import type { ServiceIdentity } from "../../compat/v2-observations";
 import {
   ExecutorError,
   TASK_TRANSITIONS,
@@ -1291,6 +1293,11 @@ class Queue implements IntegrationQueue {
 
   private async runTaskEntry(ids: TaskId[], requeue: boolean): Promise<void> {
     const l0 = this.ledger;
+    for (const id of ids) {
+      this.taskWaits.get(id)?.end("dequeued");
+      this.taskWaits.delete(id);
+    }
+    const observation = this.pendingService(l0, ids, l0.tasks[ids[0] ?? ""]?.phase ?? null, "rebase");
     const head = l0.integration.head;
     const lastId = ids[ids.length - 1];
     const slot = lastId === undefined ? null : l0.tasks[lastId]?.slot ?? null;
@@ -1322,7 +1329,11 @@ class Queue implements IntegrationQueue {
       return;
     }
     try {
-      await this.takeLock(null, true);
+      const wait = observation?.start("service-wait", "repo-lock");
+      try {
+        await this.takeLock(null, true);
+        wait?.end("acquired");
+      } finally { wait?.end("error"); }
     } catch (e) {
       // The requeued group was taken off the list by pickSerial: put it back for the next pass.
       if (requeue) this.requeued.unshift({ taskIds: [...ids], phaseId: l0.tasks[ids[0] ?? ""]?.phase ?? null, startSeq: 0 });
@@ -1399,6 +1410,36 @@ class Queue implements IntegrationQueue {
   }
 
   private probes = 0;
+  private taskWaits = new Map<TaskId, NonNullable<ReturnType<ServiceObservation["start"]>>>();
+  private suiteWaits = new Map<PhaseId, NonNullable<ReturnType<ServiceObservation["start"]>>>();
+
+  private pendingService(l: Readonly<LedgerV1>, ids: readonly TaskId[], phaseId: PhaseId | null,
+    component: ServiceIdentity["component"]): ServiceObservation | undefined {
+    return executorServiceObservation(this.d.clock, this.d.planId, () => {
+      const task = l.tasks[ids[0] ?? ""];
+      return { planId: this.d.planId, taskId: task?.id ?? null, attempt: task?.attempts.at(-1)?.n ?? null,
+        phaseId, entryId: null, taskIds: ids, component, candidate: null };
+    });
+  }
+
+  private suiteWaiting(l: Readonly<LedgerV1>, phaseId: PhaseId): void {
+    if (this.suiteWaits.has(phaseId)) return;
+    const wait = this.pendingService(l, [], phaseId, "phase-suite")?.start("service-wait", "background-lane");
+    if (wait !== undefined) this.suiteWaits.set(phaseId, wait);
+  }
+
+  private endWaiting(result: string): void {
+    for (const wait of this.taskWaits.values()) wait.end(result);
+    for (const wait of this.suiteWaits.values()) wait.end(result);
+    this.taskWaits.clear();
+    this.suiteWaits.clear();
+  }
+
+  private service(live: LiveEntry, component: ServiceIdentity["component"], candidate: string | null): ServiceObservation | undefined {
+    return executorServiceObservation(this.d.clock, this.d.planId, () => ({ planId: this.d.planId,
+      taskId: null, attempt: null, phaseId: live.entry.phaseId, entryId: live.entry.id,
+      taskIds: live.entry.taskIds, component, candidate }));
+  }
 
   /** M17: stack T in the slot of T's last task. A conflict on the head is terminal (row 31); against a batch-mate it defers. */
   private async stack(live: LiveEntry, T: readonly TaskId[],
@@ -1417,9 +1458,16 @@ class Queue implements IntegrationQueue {
       const p = plan[i];
       if (p === undefined) continue;
       if (this.ctl.signal.aborted) throw new LaneStop("aborted");
-      await this.guardWrite(live, lease.path, "slot");
-      await this.d.pool.reset(lease.slot, p.tip);
-      const r = await this.d.git.rebaseOnto(lease.path, prev, p.upstream);
+      const observation = this.service(live, "rebase", p.tip);
+      const preparation = observation?.start("service-prep", "checkout-reset");
+      try {
+        await this.guardWrite(live, lease.path, "slot");
+        await this.d.pool.reset(lease.slot, p.tip);
+        preparation?.end("completed");
+      } finally { preparation?.end("error"); }
+      // GitOps observes only the rebase process, after its pointer/config preparation and before conflict cleanup.
+      const r = await (observation === undefined ? this.d.git.rebaseOnto(lease.path, prev, p.upstream)
+        : this.d.git.rebaseOnto(lease.path, prev, p.upstream, observation));
       if (r.ok) {
         stacked.push({ taskId: p.taskId, from: prev, to: r.head });
         prev = r.head;
@@ -1518,7 +1566,9 @@ class Queue implements IntegrationQueue {
     for (;;) {
       await this.start(live, step, { v: 1, base: head, candidate, tasks }, { candidate });
       await this.assertLock(live); // QA-3.2-28: the checks prepare (reset + clean) the slot first
-      const r = await this.d.checks.run({ slot: lease, base: head, candidate, priority: "foreground", extra: null, signal: this.ctl.signal });
+      const observation = this.service(live, "checks", candidate);
+      const r = await this.d.checks.run({ slot: lease, base: head, candidate, priority: "foreground", extra: null, signal: this.ctl.signal,
+        ...(observation === undefined ? {} : { observation }) });
       // QA-3.2-13: once the outer signal fired the run is interrupted whatever it returned: no failed/onFailed during abort.
       if (this.ctl.signal.aborted) throw new LaneStop("checks interrupted");
       const scope = r.components.find(c => c.name === "tests")?.scope ?? "full";
@@ -1664,28 +1714,39 @@ class Queue implements IntegrationQueue {
         ? `The integration branch ref refs/heads/${l.integration.branch} does not exist (journaled head ${head}). The plan is paused.`
         : `The integration branch ${l.integration.branch} is at ${tip}, not at the journaled head ${head}. The plan is paused.`);
     }
-    const lease = await this.integrationSlot();
-    await this.guardWrite(live, wt, "integration");
-    let at: string | null = null;
+    const observation = this.service(live, "fast-forward", candidate);
+    const preparation = observation?.start("service-prep", "integration-checkout");
     try {
-      at = await this.d.git.revParse(wt, "HEAD");
-    } catch {
-      at = null;
-    }
-    const dirty = at === head ? (await this.d.git.statusPorcelain(wt)).length > 0 : true;
-    if (at !== head || dirty) await this.d.pool.reset(lease.slot, head);
+      const lease = await this.integrationSlot();
+      await this.guardWrite(live, wt, "integration");
+      let at: string | null = null;
+      try {
+        at = await this.d.git.revParse(wt, "HEAD");
+      } catch {
+        at = null;
+      }
+      const dirty = at === head ? (await this.d.git.statusPorcelain(wt)).length > 0 : true;
+      if (at !== head || dirty) await this.d.pool.reset(lease.slot, head);
+      preparation?.end("completed");
+    } finally { preparation?.end("error"); }
     // QA-3.2-36: abort() fired: no merge and no CAS; the step stays open and abort() rolls the entry back.
     if (this.ctl.signal.aborted) throw new LaneStop("aborted before the merge");
-    const merged = await this.d.git.mergeFfOnly(wt, candidate);
+    const merged = await (observation === undefined ? this.d.git.mergeFfOnly(wt, candidate)
+      : this.d.git.mergeFfOnly(wt, candidate, observation));
     if (!merged.ok || merged.head !== candidate) {
       await this.halt(live, "ff-refused",
         `git merge --ff-only ${candidate} was refused in the integration worktree (head ${head}). The plan is paused; resume() rolls the entry back.`);
     }
     if (this.ctl.signal.aborted) throw new LaneStop("aborted before the CAS");
     // QA-3.2-28: the lock file is re-read (token compare) right before the CAS, not only the last heartbeat's verdict.
-    await this.assertLock(live, true);
+    const lockCheck = observation?.start("service-prep", "lock-validation");
     try {
-      await this.d.git.branchForce(l.integration.branch, candidate, head);
+      await this.assertLock(live, true);
+      lockCheck?.end("completed");
+    } finally { lockCheck?.end("error"); }
+    try {
+      await (observation === undefined ? this.d.git.branchForce(l.integration.branch, candidate, head)
+        : this.d.git.branchForce(l.integration.branch, candidate, head, observation));
     } catch (e) {
       await this.halt(live, "integration-branch-moved",
         `The compare-and-swap of ${l.integration.branch} from ${head} to ${candidate} failed (${clipText(message(e), 300)}). The plan is paused.`);
@@ -1712,6 +1773,8 @@ class Queue implements IntegrationQueue {
         continue;
       }
       this.fifo.push(id);
+      const wait = this.pendingService(l, [id], t.phase, "rebase")?.start("service-wait", "integration-queue");
+      if (wait !== undefined) this.taskWaits.set(id, wait);
     }
     void this.pokeStalled();
     this.kick();
@@ -1745,6 +1808,7 @@ class Queue implements IntegrationQueue {
       const res: SuiteResolution = phaseHasOwnTasks(l, p) ? await this.d.suite.resolve(l, p, head) : { kind: "none" };
       if (res.kind === "runs") {
         this.suites.push({ phaseId: p, gate: "start" });
+        this.suiteWaiting(l, p);
         this.kick();
         return;
       }
@@ -1767,6 +1831,7 @@ class Queue implements IntegrationQueue {
     if (ph.gate === "suite-running") {
       if (open.some(o => o.entry.kind === "phase-suite") || this.background?.entry.phaseId === p || this.suites.some(s => s.phaseId === p)) return;
       this.suites.push({ phaseId: p, gate: "none" });
+      this.suiteWaiting(l, p);
       this.kick();
       return;
     }
@@ -1774,7 +1839,10 @@ class Queue implements IntegrationQueue {
       if (open.length > 0 || this.reverts.some(r => r.phaseId === p) || this.suites.some(s => s.phaseId === p)) return;
       const pending = await this.revertFromHistory(p);
       if (pending !== null) this.reverts.unshift(pending);
-      else this.suites.push({ phaseId: p, gate: "rerun" });
+      else {
+        this.suites.push({ phaseId: p, gate: "rerun" });
+        this.suiteWaiting(l, p);
+      }
       this.kick();
       return;
     }
@@ -1811,6 +1879,7 @@ class Queue implements IntegrationQueue {
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
+    this.endWaiting("disposed");
     // The reason lets the suite runner report `interrupted by dispose` (not abort).
     this.ctl.abort("dispose");
     this.bgCtl.abort("dispose");
@@ -2014,6 +2083,8 @@ class Queue implements IntegrationQueue {
   }
 
   private async runSuite(p: PhaseId, gate: "start" | "rerun" | "none"): Promise<void> {
+    this.suiteWaits.get(p)?.end("dequeued");
+    this.suiteWaits.delete(p);
     const l = this.ledger;
     const ph = l.phases.find(x => x.id === p);
     if (ph === undefined || ph.paused) return;
@@ -2052,7 +2123,12 @@ class Queue implements IntegrationQueue {
         : gate === "rerun" ? this.gateEvent(lg, p, "suite-failed", "suite-running", "suite-rerun") : []);
     if (gate !== "none" && !this.disposed) this.safe(() => this.d.listener.onGate(p, "suite-running"));
     const startedAt = this.d.clock.now();
-    const ci = await this.d.pool.acquireSpecial(this.d.planId, "ci");
+    const preparation = this.service(live, "phase-suite", head)?.start("service-prep", "ci-slot");
+    let ci: SlotLease;
+    try {
+      ci = await this.d.pool.acquireSpecial(this.d.planId, "ci");
+      preparation?.end("completed");
+    } finally { preparation?.end("error"); }
     try {
       const verdict = await this.d.suite.run({ planId: this.d.planId, phaseId: p, commit: head, base,
         ranges: this.phaseRanges(this.ledger, p), commands: res.commands, slot: ci }, this.journal(live, this.bgCtl.signal));
@@ -2829,6 +2905,7 @@ class Queue implements IntegrationQueue {
         this.serial = null;
         this.background = null;
         this.fifo.length = 0;
+        this.endWaiting("aborted");
         this.requeued.length = 0;
         this.reverts.length = 0;
         this.tags.length = 0;
@@ -2847,6 +2924,8 @@ class Queue implements IntegrationQueue {
   private holdLock = false;
 
   private dropQueued(id: TaskId): void {
+    this.taskWaits.get(id)?.end("dropped");
+    this.taskWaits.delete(id);
     const i = this.fifo.indexOf(id);
     if (i >= 0) this.fifo.splice(i, 1);
   }

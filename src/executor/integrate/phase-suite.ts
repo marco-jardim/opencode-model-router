@@ -15,6 +15,7 @@ import type {
   PhaseSuiteRunner, RevertRequest, RevertVerdict, StepDetail, StepJournal, SuiteResolution, SuiteRunRequest, SuiteVerdict,
 } from "./queue";
 import { COMMIT_SUBJECT_PATTERN, formatCommitMessage, type GitOps } from "../git";
+import { executorServiceObservation } from "../observations";
 import { ExecutorError, type Clock, type IntegrationStep, type LedgerV1, type PhaseId, type PlanId, type SlotPool, type TaskId } from "../types";
 
 export interface PhaseSuiteDeps {
@@ -120,6 +121,9 @@ function failedIdsOf(r: CommandRunResult, original: readonly string[]): string[]
 }
 
 async function runSuite(d: PhaseSuiteDeps, req: SuiteRunRequest, j: StepJournal): Promise<SuiteVerdict> {
+  const observation = executorServiceObservation(d.clock, req.planId, () => ({ planId: req.planId,
+    phaseId: req.phaseId, entryId: j.entry.id, taskId: null, attempt: null, taskIds: j.entry.taskIds,
+    component: "phase-suite", candidate: req.commit }));
   const startDetail: StepDetail = { v: 1, commit: req.commit, base: req.base, commands: req.commands.map(c => ({ label: c.label, ref: c.ref })) };
   // QA-3.2-8 (M38): one preemption budget for the whole suite entry, shared by every run below. Once spent, the
   // entry's runs register with nothing left, so a foreground check waits instead of preempting again.
@@ -128,6 +132,7 @@ async function runSuite(d: PhaseSuiteDeps, req: SuiteRunRequest, j: StepJournal)
     await j.assertWriteCwd(req.slot.path, "slot");
     const r = await d.checks.runCommands({
       slot: req.slot, commit, commands: req.commands, mode, priority: "background", signal: j.signal, prepare: true, preempt, requireRun,
+      ...(observation === undefined ? {} : { observation }),
     });
     if (r.verdict === "error") return { error: r.error ?? { reason: "spawn", message: "the run failed without a reason" } };
     return { error: null, value: r };
@@ -299,6 +304,9 @@ type BuiltRevert = { kind: "built"; head: string; reverted: string[] } | { kind:
  * The runner never fast-forwards; the queue does that on `ok`. The `revert-build` step is open on entry.
  */
 async function runRevert(d: PhaseSuiteDeps, req: RevertRequest, j: StepJournal): Promise<RevertVerdict> {
+  const observation = executorServiceObservation(d.clock, req.planId, () => ({ planId: req.planId,
+    phaseId: req.phaseId, entryId: j.entry.id, taskId: null, attempt: null, taskIds: j.entry.taskIds,
+    component: "checks", candidate: req.head }));
   const cwd = req.slot.path;
   const { culprit } = req;
   const range = { taskId: culprit.taskId, from: culprit.from, to: culprit.to };
@@ -334,6 +342,7 @@ async function runRevert(d: PhaseSuiteDeps, req: RevertRequest, j: StepJournal):
     const r = await d.checks.run({
       slot: req.slot, base: req.head, candidate: revertHead, priority: "foreground", signal: j.signal,
       extra: { ids: [...req.regression.ids], files: [...req.regression.files], commands: [...req.regression.commands] },
+      ...(observation === undefined ? {} : { observation }),
     });
     return r.verdict === "error" ? { error: { reason: r.reason, message: r.message } } : { error: null, value: r };
   });

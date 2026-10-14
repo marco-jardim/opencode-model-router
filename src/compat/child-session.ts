@@ -13,6 +13,9 @@ export const DEPTH_BANNER = Symbol.for("opencode-model-router.depth-banner");
 
 /** A host-owned child lifecycle, so v2 never fabricates REST sessions or IDs. */
 export interface ChildSessionRequest {
+  /** v2-only read-only grading diagnostics, started after the runner's session/cwd preparation. */
+  service?: import("../executor/observations").ServiceObservation;
+  onServiceStart?: () => void;
   parentSessionID?: string;
   cwd?: string;
   agent?: string;

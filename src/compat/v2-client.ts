@@ -226,11 +226,22 @@ export function createV2Runtime(ctx: Plugin.Context, options: V2RuntimeOptions =
       // (Phase 3.2, H4): the host runs no plugin tool hook for a call made through `ctx.tool.list()`, so the router never sees it and the
       // mark is withdrawn below unconsumed; it is defensive, for a host that does hook such calls.
       let withdrawMark: (() => void) | undefined;
+      let service: ReturnType<NonNullable<ChildSessionRequest["service"]>["start"]>;
+      let serviceAttempted = false;
+      const startService = (): void => {
+        if (serviceAttempted || request.service === undefined) return;
+        serviceAttempted = true;
+        try {
+          request.onServiceStart?.();
+          service = request.service.start("service", "grading");
+        } catch { /* Diagnostics only. */ }
+      };
       try {
         // A resumed child is registered here, before the host can run it, exactly like a created one is in `progress`.
         if (resumeID !== undefined) {
           await request.onCreated(resumeID);
           signal.throwIfAborted();
+          startService();
         }
         withdrawMark = markRunnerDispatch({ parentSessionID: toolContext.sessionID, agent: request.agent ?? V2_GRADER_AGENT, prompt: request.prompt });
         const result = await native.execute({
@@ -278,9 +289,13 @@ export function createV2Runtime(ctx: Plugin.Context, options: V2RuntimeOptions =
               try { await toolContext.progress(metadata); }
               catch (error) { if (scope.active) throw error; }
             }
+            // The native host prompts only after this progress callback: child creation, cwd move and
+            // registration are preparation, not grading. This callback adds no host call or await.
+            if (childID !== undefined) startService();
           },
         });
         const output = result.output as { sessionID?: unknown; status?: unknown; output?: unknown } | undefined;
+        service?.end(signal.aborted ? "interrupted" : output?.status === "completed" ? "completed" : "error");
         // A named child confirms an attempted resume even when its result failed or was aborted.
         if (childID && output?.sessionID === childID) await confirmChild(childID);
         signal.throwIfAborted();
@@ -294,6 +309,7 @@ export function createV2Runtime(ctx: Plugin.Context, options: V2RuntimeOptions =
         await confirmChild(childID);
         return { sessionID: childID, text: output.output };
       } catch (error) {
+        service?.end(signal.aborted ? "interrupted" : "error");
         controller.abort();
         if (childID) {
           try { await ctx.session.interrupt({ sessionID: childID }); } catch { /* keep the original dispatch failure */ }

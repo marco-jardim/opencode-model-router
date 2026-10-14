@@ -9,6 +9,7 @@ import { readHeadState } from "../../src/verify/head";
 import { createLeaseSelfExemptions, createPlanTaskVerifier, planTaskVerificationID, planTreeKey, type PlanTaskGit } from "../../src/verify/plan-task";
 import { snapshotTree } from "../../src/verify/tree";
 import { createVerificationWiring } from "../../src/verify/wiring";
+import { servicePairs } from "../helpers/service-observations";
 
 // Only I/O and the final gate are doubles: begin/observe/fallback, prepareVerification,
 // observeChange and the change store are the real plan-task -> wiring boundary.
@@ -119,7 +120,15 @@ describe("plan-task capture observations through the real verification wiring", 
         source: "plan-task-change", parentSessionID: parent,
         callID: a.callID ?? planTaskVerificationID(parent, slot.planId, task.id, a.n), childSessionID: a.childSessionID,
       })));
-      expect(sink.counts()).toEqual({ attempted: attempts.length, written: attempts.length, dropped: 0, failed: 0 });
+      sink.close();
+      const services = servicePairs(lines);
+      expect(services.filter(r => r.action === "end" && r.stage === "change-capture")).toMatchObject(attempts.map(a => ({
+        planId: "p1", taskId: "t1", attempt: a.n, taskIds: ["t1"], component: "verify", spanKind: "service-prep",
+      })));
+      expect(services.filter(r => r.action === "end" && r.stage === "slot-snapshot")).toMatchObject(attempts.map(a => ({
+        planId: "p1", taskId: "t1", attempt: a.n, candidate: CANDIDATE, spanKind: "service-prep",
+      })));
+      expect(sink.counts()).toEqual({ attempted: rows.length, written: rows.length, dropped: 0, failed: 0 });
     } finally {
       await h.dispose();
       sink.close();
@@ -136,7 +145,8 @@ describe("plan-task capture observations through the real verification wiring", 
           expect(await h.run(attempt(1, true), restart)).toMatchObject({ verdict: "pass" });
           expect(h.captures).toHaveBeenCalledTimes(1);
         } finally { await h.dispose(); }
-        expect(record).toHaveBeenCalledTimes(observations === undefined ? 0 : 1);
+        // Capture projection plus two attempted prep starts; a throwing observer never starts a pair.
+        expect(record).toHaveBeenCalledTimes(observations === undefined ? 0 : 3);
       }
     } finally { sink.close(); }
   });

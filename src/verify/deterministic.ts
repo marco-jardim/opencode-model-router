@@ -63,6 +63,7 @@ import { fileKeyOfId } from "./baseline";
 import { isTestPath } from "./risk";
 import { DEFAULT_MATERIALIZE_TIMEOUT_MS, gcStaleReferences, materialize, nodeReferenceFs } from "./reference";
 import { acquireSlot, type SlotHandle } from "./slot";
+import type { ServiceObservation } from "../executor/observations";
 
 // ---------------------------------------------------------------------------
 // MutexRegistry — per-key serialization via promise-chaining
@@ -848,6 +849,7 @@ export interface CheckScope extends VerificationScope {
 export type OpenCheckScope = (meta: Parameters<OpenVerificationScope>[0]) => CheckScope;
 
 export interface ScopeOpenerDeps {
+  service?: ServiceObservation;
   argv: ArgvSeam;
   exec: ExecSeam;
   fs: RunnerFs;
@@ -958,6 +960,7 @@ export function createScopeOpener(deps: ScopeOpenerDeps): OpenCheckScope {
       // at the deadline, even when the wait's own timer fires a few ms before remaining() reads 0.
       const waitMs = deadline.bound(budget.slotWaitMs);
       const cutByDeadline = waitMs < budget.slotWaitMs;
+      const wait = deps.service?.start("service-wait", "verification-slot");
       try {
         const r = await acquire({
           max: budget.maxConcurrentVerifications,
@@ -967,21 +970,25 @@ export function createScopeOpener(deps: ScopeOpenerDeps): OpenCheckScope {
           onLost,
         });
         if ("busy" in r) {
+          wait?.end("busy");
           return {
             ok: false,
             outcome: { kind: "slot-busy", waitedMs: Math.max(0, now() - started), deadlineCut: cutByDeadline || deadline.remaining() === 0 },
           };
         }
+        wait?.end("acquired");
         return { ok: true, handle: r };
       } catch (err) {
         return { ok: false, outcome: { kind: "error", reason: `verification slot failed: ${errorText(err)}` } };
-      }
+      } finally { wait?.end("error"); }
     };
 
     const attempt = async (
       deadline: Deadline,
       launch: (opts: ExecOptions) => Promise<ExecResult>,
       ownMs: number = checkTimeoutMs,
+      stage = "command",
+      candidate?: string,
     ): Promise<Blocked | Spawned> => {
       if (closed) return { kind: "error", reason: "verification scope already closed" };
       holdP ??= acquireHold(deadline);
@@ -997,12 +1004,14 @@ export function createScopeOpener(deps: ScopeOpenerDeps): OpenCheckScope {
       deadline.signal.addEventListener("abort", onAbort, { once: true });
       let execResult: ExecResult;
       let threw: string | undefined;
+      const service = deps.service?.start("service", stage, candidate);
       try {
         execResult = await launch({ lowPriority: budget.lowPriority, signal: run.signal, timeoutMs: boundMs });
+        service?.end(run.signal.aborted ? "interrupted" : execResult.timedOut ? "timed-out" : execResult.code === 0 ? "pass" : "fail");
       } catch (err) {
         threw = errorText(err);
         execResult = { code: -1, stdout: "", stderr: threw };
-      }
+      } finally { service?.end("error"); }
       deadline.signal.removeEventListener("abort", onAbort);
       if (threw !== undefined || execResult.timedOut === true) {
         run.abort(new Error(threw ?? `run exceeded its ${boundMs}ms bound`));
@@ -1060,6 +1069,7 @@ export function createScopeOpener(deps: ScopeOpenerDeps): OpenCheckScope {
       liveCwd: string,
       failingFiles: readonly string[],
       rd: Deadline,
+      candidate: string,
     ): Promise<RecheckOutcome> => {
       if (!ref.exact) return { kind: "approximate", inexactReasons: ref.inexactReasons };
       const platform = host?.platform ?? process.platform;
@@ -1098,7 +1108,7 @@ export function createScopeOpener(deps: ScopeOpenerDeps): OpenCheckScope {
       const a = await attempt(
         rd,
         opts => argv(spec.file, spec.args, { ...opts, cwd: spec.cwd, env: { ...spec.env } }),
-        budget.recheckTimeoutMs,
+        budget.recheckTimeoutMs, "recheck", candidate,
       );
       if (a.kind === "aborted") return { kind: "skipped-deadline", remainingMs: rd.remaining() };
       if (a.kind === "slot-busy") return unusable("error", "the verification slot was not available for the recheck");
@@ -1153,6 +1163,7 @@ export function createScopeOpener(deps: ScopeOpenerDeps): OpenCheckScope {
       }
 
       const rd = deriveDeadline(deadline, budget.recheckTimeoutMs, { now });
+      const preparation = deps.service?.start("service-prep", "reference-materialization");
       try {
         // QA-1.5-10: GC, then materialize, both inside the hold.
         const gc = await seams.gcStaleReferences(reference.root, { ...refDeps, timeoutMs: rd.bound(RECHECK_GC_MS) });
@@ -1170,13 +1181,15 @@ export function createScopeOpener(deps: ScopeOpenerDeps): OpenCheckScope {
             : unusable("materialize-failed", `materialize ${m.reason}: ${m.detail}`);
         }
         const ref = m.reference;
+        preparation?.end("completed");
         try {
-          return await rerunAt(ref, runner, liveCwd, failingFiles, rd);
+          return await rerunAt(ref, runner, liveCwd, failingFiles, rd, reference.commit);
         } finally {
           // T4.l: the rerun tree has exited here; close() waits for this before releasing the slot.
           track(ref.dispose().catch((err: unknown) => logger?.warn(`reference dispose failed: ${errorText(err)}`)));
         }
       } finally {
+        preparation?.end("error");
         rd.dispose();
       }
     };
@@ -1231,6 +1244,7 @@ export function createScopeOpener(deps: ScopeOpenerDeps): OpenCheckScope {
 // -----------------------------------------------------------------------------------------------
 
 export interface DirectTestsPassHookDeps {
+  service?: ServiceObservation;
   openScope: OpenCheckScope;
   /** Built in wiring.ts (2.1.3, T9). */
   plannerFs: PlannerFs;
@@ -1440,9 +1454,11 @@ export function createDirectTestsPassHook(deps: DirectTestsPassHookDeps): TestsP
   return async (req): Promise<TestsPassRun> => {
     let scope: CheckScope | undefined;
     let scoped: ScopedOutcome | undefined;
+    const preparation = deps.service?.start("service-prep", "test-planning");
     try {
       if (req.testScope === "full") {
         scope = deps.openScope({ cwd: req.cwd, command: req.command });
+        preparation?.end("completed");
         scoped = await runFull(req, scope);
       } else {
         // Cross-repo P3a (D23): a cross-link request also passes W's ignored modules (its build output), or is S6 without them.
@@ -1468,6 +1484,7 @@ export function createDirectTestsPassHook(deps: DirectTestsPassHookDeps): TestsP
           return { scoped: { kind: "unverifiable", code: planned.code, reason: planned.reason }, recheck: undefined };
         }
         scope = deps.openScope({ cwd: req.cwd, command: req.command });
+        preparation?.end("completed");
         scoped = await scope.execute(planned, req.deadline);
       }
       return { scoped, recheck: await recheckFor(req, scope, scoped) };
@@ -1476,6 +1493,7 @@ export function createDirectTestsPassHook(deps: DirectTestsPassHookDeps): TestsP
       if (scoped !== undefined) return { scoped, recheck: { kind: "unusable", cause: "error", reason: `the reference recheck errored: ${reason}` } };
       return { scoped: { kind: "error", reason: `testsPass hook errored: ${reason}` }, recheck: undefined };
     } finally {
+      preparation?.end(scoped === undefined ? "no-run" : "error");
       if (scope !== undefined) await closeWithinDeadline(scope, req.deadline, deps.logger);
     }
   };
@@ -1879,9 +1897,14 @@ export async function runDeterministic(dod: DoD, deps: DeterministicDeps): Promi
     }
 
     switch (check.kind) {
-      case "fileExists":
-        result = await runFileExists(check, cd);
+      case "fileExists": {
+        const service = cd.service?.start("service", "file-exists");
+        try {
+          result = await runFileExists(check, cd);
+          service?.end(result.ok ? "pass" : result.unverifiable ? "unverifiable" : "fail");
+        } finally { service?.end("error"); }
         break;
+      }
       case "run":
         result = await runRun(check, cd, allowlist, timeoutMs);
         break;
@@ -1890,9 +1913,14 @@ export async function runDeterministic(dod: DoD, deps: DeterministicDeps): Promi
       case "lintClean":
         result = await runCommandCheck(check, check.kind, cd, allowlist, timeoutMs, placement?.scope, crossLink);
         break;
-      case "schemaMatch":
-        result = await runSchemaMatch(check, cd);
+      case "schemaMatch": {
+        const service = cd.service?.start("service", "schema-match");
+        try {
+          result = await runSchemaMatch(check, cd);
+          service?.end(result.ok ? "pass" : result.unverifiable ? "unverifiable" : "fail");
+        } finally { service?.end("error"); }
         break;
+      }
       default: {
         // Defensive: TypeScript proves this is unreachable; guards runtime extensions.
         const exhaustive: never = check.kind;

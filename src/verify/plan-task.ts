@@ -338,6 +338,8 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
       const prepared = await deps.prepareVerification(
         deps.changedFileStore, record.id, attempt.childSessionID ?? "", record.slotPath, deadline, record.startedAt, restoredHead,
         record.orchestratorSessionID, () => ({ source: "plan-task-change", callID: attempt.callID ?? record.id }),
+        () => ({ planId: record.planId, taskId: record.taskId, attempt: record.n, phaseId: null, entryId: null,
+          taskIds: [record.taskId], component: "verify", candidate: restoredHead?.head ?? null }),
       );
       return { ok: true, prepared };
     } catch (error) {
@@ -464,6 +466,7 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
     try {
       // QA-5.1-14: the grader is parented to the plan's CURRENT orchestrator, as the runtime read it for this verify (an
       // adopt moves the plan; verify refused an unknown one before any gate ran).
+      // The verify service span rides on `prepared.service` (opened by prepare() with this attempt's identity).
       const gateDeps = deps.buildGateDeps(parent, graders, prepared, deadline, false, parent);
       gateDeps.deterministic.onFailure = (reason) => completedFailures.push(reason);
       const delegation: Delegation = {
@@ -530,11 +533,14 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
       // A fresh snapshot after cleanForChecks: the tree the checks run on (materialize's drift check, the lease wait's tree).
       const controller = new AbortController();
       let fresh: PreparedVerification["snapshot"];
+      const preparation = prepared.service?.start("service-prep", "slot-snapshot", checked.candidate);
       try {
         fresh = await withTimeout(snapshotTree(slot.path, controller.signal, { lowPriority: budget.lowPriority }), GIT_MS, "slot snapshot");
+        preparation?.end("completed");
       } catch {
         fresh = undefined;
       } finally {
+        preparation?.end("error");
         controller.abort();
       }
       if (fresh === undefined) return unverifiable(`the slot ${slot.path} could not be snapshotted after cleanForChecks; nothing ran`, record.dod);
@@ -587,7 +593,12 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
           const { res, cut } = await runPass(passDoD, budgetMs, current, task, slot, attempt, artefact, gatePrepared, parent);
           if (disposing || !isTransientPlanTaskResult(res, cut) || reruns >= PLAN_TASK_TRANSIENT_RERUNS) return res;
           // QA-5.1-4: dispose cancels the backoff (the transient result stands; verify already resolved as cut).
-          try { await untilShutdown(sleep(PLAN_TASK_RERUN_BACKOFF_MS[reruns])); } catch { return res; }
+          const backoff = prepared.service?.start("service-wait", "retry-backoff", checked.candidate);
+          let interrupted = true;
+          try {
+            try { await untilShutdown(sleep(PLAN_TASK_RERUN_BACKOFF_MS[reruns])); } catch { return res; }
+            interrupted = false;
+          } finally { backoff?.end(interrupted ? "interrupted" : "completed"); }
           reruns += 1;
         }
       };

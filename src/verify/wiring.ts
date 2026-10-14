@@ -15,7 +15,8 @@
  */
 import { createHash } from "node:crypto";
 import type { ChildSessionRunner } from "../compat/child-session";
-import { completionIdentity, observeV2, type V2Observations } from "../compat/v2-observations";
+import { completionIdentity, observeV2, type ServiceIdentity, type V2Observations } from "../compat/v2-observations";
+import { serviceObservation, type ServiceObservation } from "../executor/observations";
 import { access, readdir, readFile as fsReadFile, realpath, stat, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { createBatchCoordinator, type BatchCoordinatorOptions, type BatchPlanner } from "./batch";
@@ -175,6 +176,8 @@ function graderPromptResponseError(res: unknown): Error | undefined {
 
 /** P0 (deterministic.ts header, T2): what a gate needs from its dispatch. */
 export interface PreparedVerification {
+  /** v2 diagnostics only; never contributes to the verdict. */
+  service?: ServiceObservation;
   /**
    * The producer's changed files: the tool-observed paths of every attempt judged against this
    * dispatch (QA-2.1-1), the paths the current snapshot added since dispatch, and the paths dirty
@@ -1114,6 +1117,7 @@ export interface VerificationWiring {
     parentSessionID?: string,
     /** V2 diagnostics only: lazily supply a non-dispatch source and its retained call id. */
     captureObservation?: () => { source: string; callID: string },
+    serviceIdentity?: () => ServiceIdentity,
   ): Promise<PreparedVerification>;
   /** Session ids currently running a grader prompt, so hooks can skip them. */
   graderSessions: Set<string>;
@@ -1138,7 +1142,7 @@ export interface VerificationWiring {
    * the changed files are "unavailable" and the reference is the untracked default. `deadline`
    * bounds every testsPass step (T3); without it each testsPass check owns one of gateBudgetMs.
    */
-  buildGateDeps(parentSessionID?: string, inFlight?: Set<string>, prepared?: PreparedVerification, deadline?: Deadline, forceLowPriority?: boolean, creatorSessionID?: string | null): GateDeps;
+  buildGateDeps(parentSessionID?: string, inFlight?: Set<string>, prepared?: PreparedVerification, deadline?: Deadline, forceLowPriority?: boolean, creatorSessionID?: string | null, serviceIdentity?: () => ServiceIdentity): GateDeps;
   /**
    * 2.2.3: the idle-TTL sweep's hook into the plugin's one S5 batch coordinator (batch.ts B11):
    * evicts windows with no live member and batches whose seam hung past BATCH_STALE_GRACE_MS.
@@ -1477,6 +1481,7 @@ export function createVerificationWiring(deps: {
     parentSessionID?: string,
     inFlight?: Set<string>,
     creatorSessionID: string | null = parentSessionID ?? null,
+    service?: ServiceObservation,
   ): Promise<{ sessionID: string; text: string; model: string | null }> => {
     // #84 P3.3 fix 2: the model the grader is dispatched on travels with its answer (checker.ts GraderResult.model → the
     // verdict's `grader`), so the outcome signals can check its independence (plan §2.6). Null: the host's default model.
@@ -1487,6 +1492,7 @@ export function createVerificationWiring(deps: {
       const controller = new AbortController();
       const model = tierModel(cfg, req.tier);
       let sid: string | undefined;
+      const preparation = service?.start("service-prep", "grader-startup");
       try {
         const answer = await withTimeout(deps.childRunner.run({
           parentSessionID,
@@ -1495,6 +1501,7 @@ export function createVerificationWiring(deps: {
           system: req.system,
           prompt: req.prompt,
           signal: controller.signal,
+          ...(service === undefined ? {} : { service, onServiceStart: () => preparation?.end("completed") }),
           async onCreated(sessionID) {
             sid = sessionID;
             graderSessions.add(sessionID);
@@ -1504,6 +1511,7 @@ export function createVerificationWiring(deps: {
         }), graderTimeoutMs(req.tier, cfg.enforcement?.verify?.graderTimeoutMs), "grader prompt");
         return { sessionID: answer.sessionID, text: answer.text, model: modelRef(model) };
       } finally {
+        preparation?.end("error");
         controller.abort();
         if (sid) {
           graderSessions.delete(sid);
@@ -1605,7 +1613,10 @@ export function createVerificationWiring(deps: {
     deadline?: Deadline,
     forceLowPriority = false,
     creatorSessionID: string | null = parentSessionID ?? null,
+    serviceIdentity?: () => ServiceIdentity,
   ): GateDeps => {
+    // A plan task's prepared verification already carries its service span; native dispatches carry none.
+    const service = serviceIdentity === undefined ? prepared?.service : serviceObservation(deps.observations, serviceIdentity);
     const cfg = getConfig();
     const resolved = resolveVerifyBudget(cfg);
     // 2.4.5 (section 1.5-19): background runs are low priority whatever `lowPriority` says.
@@ -1618,11 +1629,13 @@ export function createVerificationWiring(deps: {
     const gatePins = prepared?.reference?.kind === "captured" ? prepared.reference.reference.pins : undefined;
     const pinNow = pinNowFor(gatePins !== undefined ? pinAdmissions.get(gatePins) : undefined);
     const openScope = createScopeOpener({
+      service,
       argv: argvSeam, exec: execSeam, fs: fsSeam, budget, checkTimeoutMs: CHECK_TIMEOUT_MS,
       reference: { argv: referenceArgv, pinNow },
     });
     const currentTree = prepared?.snapshot !== undefined ? { currentTree: prepared.snapshot } : {};
     const direct = createDirectTestsPassHook({
+      service,
       openScope,
       plannerFs: fsSeam,
       search: testSearch(budget, deadline),
@@ -1671,6 +1684,7 @@ export function createVerificationWiring(deps: {
           // Phase 2.1 (v2, leases on): wait for the holders of the tree, within a quarter of the gate budget; then run
           // anyway, with the concurrent-dispatches caveat for the holders that remain.
           if (deps.leaseGate !== undefined) {
+            const leaseWait = service?.start("service-wait", "lease");
             try {
               // QA-2.1-11: the producer's own leases never delay its own check.
               const producer = prepared?.producerSessionID;
@@ -1685,9 +1699,10 @@ export function createVerificationWiring(deps: {
               if (wait.holders.length > 0 && prepared !== undefined) {
                 prepared.concurrentDispatches = Math.max(prepared.concurrentDispatches ?? 0, wait.holders.length);
               }
+              leaseWait?.end("completed");
             } catch (err) {
               logger.warn("[verify] lease wait failed; verifying anyway", { error: errorText(err) });
-            }
+            } finally { leaseWait?.end("error"); }
           }
           return await inner(request);
         } finally {
@@ -1697,6 +1712,7 @@ export function createVerificationWiring(deps: {
     }
     return {
       deterministic: {
+        ...(service === undefined ? {} : { service }),
         exec: execSeam,
         fs: fsSeam,
         cwd: directory,
@@ -1714,7 +1730,7 @@ export function createVerificationWiring(deps: {
       },
       checker: {
         dispatchGrader: (req: GraderRequest) =>
-          dispatchGrader(req, parentSessionID, inFlight, creatorSessionID),
+          dispatchGrader(req, parentSessionID, inFlight, creatorSessionID, service),
         ladder: ["fast", "medium", "heavy"],
         minGraderTier: cfg.enforcement?.verify?.minGraderTier ?? null,
       },
@@ -3715,25 +3731,31 @@ export function createVerificationWiring(deps: {
         stop.abort();
       };
     },
-    async prepareVerification(store, id, childID, cwd, deadline, dispatchStartedAt, restoredHead, parentSessionID, captureObservation) {
-      if (parentSessionID !== undefined) observeV2(deps.observations, () => ({ family: "completion-effect", effect: "change-set-capture", source: "required-change",
-        ...completionIdentity(parentSessionID, id, childID || null), ...captureObservation?.() }));
-      const change = await observeChange(store, id, childID, cwd, deadline, undefined, restoredHead);
-      const captured = await store.reference(id, deadline?.signal);
-      // Cross-repo P2d.3 (P2.6): the pins of the admitted link targets travel with a captured reference (required gate only).
-      const pins = captured.kind === "captured" ? await linkPinsAtGate(store, id, deadline) : [];
-      // QA-2 nit: the gate took the dispatch's pins (or its reference was discarded): free them.
-      freeLinkPins(id, pins);
-      const reference: ReferenceState = pins.length > 0 && captured.kind === "captured"
-        ? { kind: "captured", reference: { ...captured.reference, pins } }
-        : captured;
-      // Cross-repo P3a (D23 as amended, QA C1): the dispatch start the caller holds (DispatchStart.dispatchedAt), the `since` of
-      // W's ignored-module listing. Unknown: none listed (toward zero selection, never toward a stale build output).
-      return {
-        ...change,
-        reference,
-        ...(dispatchStartedAt !== undefined && Number.isFinite(dispatchStartedAt) ? { dispatchStartedAt } : {}),
-      };
+    async prepareVerification(store, id, childID, cwd, deadline, dispatchStartedAt, restoredHead, parentSessionID, captureObservation, serviceIdentity) {
+      const service = serviceIdentity === undefined ? undefined : serviceObservation(deps.observations, serviceIdentity);
+      const preparation = service?.start("service-prep", "change-capture");
+      try {
+        if (parentSessionID !== undefined) observeV2(deps.observations, () => ({ family: "completion-effect", effect: "change-set-capture", source: "required-change",
+          ...completionIdentity(parentSessionID, id, childID || null), ...captureObservation?.() }));
+        const change = await observeChange(store, id, childID, cwd, deadline, undefined, restoredHead);
+        const captured = await store.reference(id, deadline?.signal);
+        // Cross-repo P2d.3 (P2.6): the pins of the admitted link targets travel with a captured reference (required gate only).
+        const pins = captured.kind === "captured" ? await linkPinsAtGate(store, id, deadline) : [];
+        // QA-2 nit: the gate took the dispatch's pins (or its reference was discarded): free them.
+        freeLinkPins(id, pins);
+        const reference: ReferenceState = pins.length > 0 && captured.kind === "captured"
+          ? { kind: "captured", reference: { ...captured.reference, pins } }
+          : captured;
+        // Cross-repo P3a (D23 as amended, QA C1): the dispatch start the caller holds (DispatchStart.dispatchedAt), the `since` of
+        // W's ignored-module listing. Unknown: none listed (toward zero selection, never toward a stale build output).
+        preparation?.end("completed");
+        return {
+          ...change,
+          ...(service === undefined ? {} : { service }),
+          reference,
+          ...(dispatchStartedAt !== undefined && Number.isFinite(dispatchStartedAt) ? { dispatchStartedAt } : {}),
+        };
+      } finally { preparation?.end("error"); }
     },
     graderSessions,
     disposeChildSession,

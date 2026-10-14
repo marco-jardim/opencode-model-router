@@ -9,6 +9,9 @@ import {
   type GitOps,
 } from "../../src/executor/git";
 import { ExecutorError, type FileSystem, type Footprint, type GitRunner, type ProcessResult } from "../../src/executor/types";
+import { createV2Observations } from "../../src/compat/v2-observations";
+import { serviceObservation } from "../../src/executor/observations";
+import { servicePairs } from "../helpers/service-observations";
 
 const PLAN = "p-20261010-abc123";
 
@@ -651,6 +654,55 @@ describe("GitOps in a slot", () => {
     const fs = memoryFs({ ...BACK(), ...seed });
     return { git, fs, ops: createGitOps({ git, userGit: user, fs, planId: PLAN, toplevel: top, executorHome: HOME }) };
   }
+
+  it.each([false, true])("G8 git process spans exclude identity/pointer/precondition/result preparation, with parity (failure=%s)", async failure => {
+    const run = async (mode: "off" | "on" | "throw") => {
+      let now = 0;
+      const lines: string[] = [];
+      const sink = createV2Observations({ write: line => { lines.push(line); } });
+      if (mode === "throw") sink.record = () => { throw new Error("observer"); };
+      const user = identityRunner();
+      const userRun = user.run.bind(user);
+      user.run = async (args, options) => { now += 1_000; return userRun(args, options); };
+      const { ops, git, fs } = slotOps(args => {
+        const op = sub(args)[0];
+        if (op === "rebase") {
+          now += 7;
+          if (failure) throw new Error("rebase spawn failed");
+        } else if (op === "merge") now += 5;
+        else if (op === "update-ref") now += 3;
+        else now += 500;
+        if (op === "rev-parse") return { stdout: OID_B };
+        if (op === "symbolic-ref") return { code: 1 };
+        return undefined;
+      }, {}, user);
+      const lstat = fs.lstat.bind(fs);
+      fs.lstat = async path => { now += 1_000; return lstat(path); };
+      const observation = (component: "rebase" | "fast-forward") => serviceObservation(mode === "off" ? undefined : sink,
+        () => ({ planId: PLAN, taskId: null, attempt: null, phaseId: "p1", entryId: "i-1", taskIds: ["T1", "T2"], component, candidate: OID_B }), () => now);
+      try {
+        const rebase = await ops.rebaseOnto(slot, OID_A, OID_B, observation("rebase")).catch((e: unknown) => e instanceof Error ? e.message : String(e));
+        const merge = await ops.mergeFfOnly(top, OID_B, observation("fast-forward"));
+        await ops.branchForce(integrationBranchName(PLAN), OID_B, OID_A, observation("fast-forward"));
+        sink.close();
+        return { rebase, merge, calls: git.calls, userCalls: user.calls, elapsed: now, rows: mode === "on" ? servicePairs(lines) : [] };
+      } finally { sink.close(); }
+    };
+    const off = await run("off");
+    for (const mode of ["on", "throw"] as const) {
+      const { rows, ...effects } = await run(mode);
+      const { rows: _offRows, ...original } = off;
+      expect(effects).toEqual(original);
+      if (mode === "on") {
+        expect(rows.filter(r => r.action === "end" && r.spanKind === "service")).toMatchObject([
+          { stage: "rebase", durationMs: 7, result: failure ? "error" : "pass" },
+          { stage: "merge", durationMs: 5, result: "pass" }, { stage: "cas", durationMs: 3, result: "pass" },
+        ]);
+        expect(rows.some(r => r.spanKind === "service-prep" && r.durationMs >= 1_000)).toBe(true);
+        expect(effects.elapsed).toBeGreaterThan(5_000);
+      }
+    }
+  });
 
   it("verifySlotPointers accepts a linked worktree of this repository", async () => {
     const { ops } = slotOps();

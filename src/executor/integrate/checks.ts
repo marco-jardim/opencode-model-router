@@ -14,6 +14,7 @@ import { observeTests } from "../../verify/baseline";
 import { acquireSlot, type SlotHandle } from "../../verify/slot";
 import type { ExecResult } from "../../verify/types";
 import type { GitOps } from "../git";
+import type { ServiceObservation } from "../observations";
 import {
   ExecutorError,
   type Clock, type GitRunner, type LedgerV1, type RunCommandRef, type SlotLease, type SlotPool,
@@ -61,10 +62,12 @@ export type CheckResult =
   | { verdict: "fail"; components: ComponentResult[]; failingIds: string[]; failingFiles: string[]; flakyIds: string[]; output: string; durationMs: number }
   | { verdict: "error"; reason: CheckErrorReason; message: string; components: ComponentResult[]; durationMs: number };
 export interface CheckRequest {
+  observation?: ServiceObservation;
   slot: SlotLease; base: string; candidate: string; priority: "foreground" | "background";
   extra?: { ids: string[]; files: string[]; commands: ResolvedCommand[] } | null; signal: AbortSignal;
 }
 export interface CommandRunRequest {
+  observation?: ServiceObservation;
   slot: SlotLease; commit: string; commands: readonly ResolvedCommand[];
   mode: "full" | { rerun: readonly string[] }; priority: "foreground" | "background"; signal: AbortSignal; prepare: boolean;
   /** M38: the preemption budget of the suite entry, shared by all of its runs (default: a fresh PREEMPT_BUDGET per run). */
@@ -473,6 +476,10 @@ interface TestOutcome {
 }
 
 export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationChecks {
+  // Each underSlot call owns its signal. Never use a mutable instance-wide "current entry": foreground checks
+  // and the background suite can overlap. Search/planning spawns intentionally do not go through exec below.
+  const executions = new WeakMap<AbortSignal, { observation: ServiceObservation; candidate: string;
+    preparation: ReturnType<ServiceObservation["start"]> }>();
   async function prepare(slot: SlotLease, commit: string): Promise<void> {
     try {
       await d.pool.reset(slot.slot, commit);
@@ -525,7 +532,8 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
 
   /** M12: holds one machine-wide verification slot around `body`, which gets a signal for abort, preemption and a lost slot. */
   async function underSlot<T>(
-    o: { signal: AbortSignal; priority: "foreground" | "background"; cwd: string; command: string; budget?: PreemptBudget | undefined },
+    o: { signal: AbortSignal; priority: "foreground" | "background"; cwd: string; command: string; budget?: PreemptBudget | undefined;
+      observation?: ServiceObservation; candidate: string },
     body: (signal: AbortSignal) => Promise<T>,
   ): Promise<Held<T>> {
     const lost = new AbortController();
@@ -535,6 +543,7 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     const signal = AbortSignal.any([o.signal, lost.signal, own.signal]);
     let handle: SlotHandle | null = null;
     let held: Held<T>;
+    const wait = o.observation?.start("service-wait", "verification-slot", o.candidate);
     try {
       if (o.priority === "foreground") {
         const preempt = d.preemptForeground ?? (async () => { await (await import("../../verify/wiring")).preemptBackgroundVerification(); });
@@ -549,7 +558,10 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
         if (!("busy" in r)) handle = r;
         else if (o.priority === "foreground") d.background.preemptOne();
       }
+      wait?.end(handle === null ? "interrupted" : "acquired");
       if (handle === null) return why(o.signal, lost.signal.aborted, false);
+      if (o.observation !== undefined) executions.set(signal, { observation: o.observation, candidate: o.candidate,
+        preparation: o.observation.start("service-prep", "command-planning", o.candidate) });
       try {
         const value = await body(signal);
         // QA-3.2-13: whatever the body returned, a run whose signal fired (abort, preemption, lost slot) is no result.
@@ -560,6 +572,9 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
         held = why(o.signal, lost.signal.aborted || handle.lost, true);
       }
     } finally {
+      wait?.end("error");
+      executions.get(signal)?.preparation?.end("completed");
+      executions.delete(signal);
       unregister();
       if (handle !== null) await handle.release();
     }
@@ -578,16 +593,31 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
   }
 
   async function exec(c: ResolvedCommand, cwd: string, signal: AbortSignal, low: boolean): Promise<CommandOutput> {
-    if (c.resolution === undefined) return d.spawn(c, { cwd: c.cwd ?? cwd, signal, lowPriority: low });
-    const env = { ...c.resolution.env };
-    for (const [key, value] of Object.entries(c.env ?? {})) {
-      // Node keeps only one spelling on Windows; an explicit Path must replace an inherited PATH too.
-      if (process.platform === "win32") for (const inherited of Object.keys(env)) {
-        if (inherited.toUpperCase() === key.toUpperCase()) delete env[inherited];
+    let command = c;
+    if (c.resolution !== undefined) {
+      const env = { ...c.resolution.env };
+      for (const [key, value] of Object.entries(c.env ?? {})) {
+        // Node keeps only one spelling on Windows; an explicit Path must replace an inherited PATH too.
+        if (process.platform === "win32") for (const inherited of Object.keys(env)) {
+          if (inherited.toUpperCase() === key.toUpperCase()) delete env[inherited];
+        }
+        env[key] = value;
       }
-      env[key] = value;
+      command = { ...c, env };
     }
-    return d.spawn({ ...c, env }, { cwd: c.cwd ?? cwd, signal, lowPriority: low });
+    const context = executions.get(signal);
+    if (context === undefined) return d.spawn(command, { cwd: c.cwd ?? cwd, signal, lowPriority: low });
+    context?.preparation?.end("completed");
+    const service = context?.observation.start("service", "command", context.candidate);
+    let result = "error";
+    try {
+      const out = await d.spawn(command, { cwd: c.cwd ?? cwd, signal, lowPriority: low });
+      result = signal.aborted ? "interrupted" : out.timedOut ? "timed-out" : out.exitCode === 0 ? "pass" : "fail";
+      return out;
+    } finally {
+      service?.end(result);
+      if (context !== undefined) context.preparation = context.observation.start("service-prep", "command-planning", context.candidate);
+    }
   }
 
   function asExec(o: CommandOutput): ExecResult {
@@ -780,7 +810,11 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     const started = d.clock.now();
     const components: ComponentResult[] = [];
     const elapsed = () => d.clock.now() - started;
-    const err = (reason: CheckErrorReason, message: string): CheckResult => ({ verdict: "error", reason, message, components, durationMs: elapsed() });
+    const preparation = req.observation?.start("service-prep", "checkout-and-selection", req.candidate);
+    const err = (reason: CheckErrorReason, message: string): CheckResult => {
+      preparation?.end("error");
+      return { verdict: "error", reason, message, components, durationMs: elapsed() };
+    };
     const cwd = req.slot.path;
     let selection: CheckSelection;
     let changed: ChangedPath[];
@@ -806,11 +840,13 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
       return err("resolve", errText(e));
     }
     if (extraIds.length > 0 && regression.length === 0) return err("resolve", "the regression ids have no test command to rerun them");
+    preparation?.end("completed");
     if (selection.typecheck === null && selection.tests.length === 0 && selection.extras.length === 0 && regression.length === 0) {
       return { verdict: "pass", components, flakyIds: [], note: "no-checks", durationMs: elapsed() };
     }
     const low = req.priority === "background";
-    const held = await underSlot({ signal: req.signal, priority: req.priority, cwd, command: "integration checks" }, async (signal): Promise<CheckResult | null> => {
+    const held = await underSlot({ signal: req.signal, priority: req.priority, cwd, command: "integration checks",
+      observation: req.observation, candidate: req.candidate }, async (signal): Promise<CheckResult | null> => {
       const simple = async (name: "typecheck" | "extra" | "regression", c: ResolvedCommand): Promise<CheckResult | null> => {
         const out = await exec(c, cwd, signal, low);
         components.push(component(name, c, out, "full"));
@@ -858,7 +894,11 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     const started = d.clock.now();
     const cwd = req.slot.path;
     const base = { ids: [] as string[], files: [] as string[], idsUnparsed: false, scope: "full" as const, output: "", durationMs: 0, error: null };
-    const done = (r: Partial<CommandRunResult> & { verdict: CommandRunResult["verdict"] }): CommandRunResult => ({ ...base, ...r, durationMs: d.clock.now() - started });
+    const preparation = req.observation?.start("service-prep", "checkout-and-selection", req.commit);
+    const done = (r: Partial<CommandRunResult> & { verdict: CommandRunResult["verdict"] }): CommandRunResult => {
+      preparation?.end(r.verdict === "error" ? "error" : "completed");
+      return { ...base, ...r, durationMs: d.clock.now() - started };
+    };
     if (req.prepare) {
       try {
         await prepare(req.slot, req.commit);
@@ -872,8 +912,10 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     } catch (e) {
       return done({ verdict: "error", error: { reason: "resolve", message: errText(e) } });
     }
+    preparation?.end("completed");
     const low = req.priority === "background";
-    const held = await underSlot({ signal: req.signal, priority: req.priority, cwd, command: "integration commands", budget: req.preempt }, async (signal): Promise<CommandRunResult> => {
+    const held = await underSlot({ signal: req.signal, priority: req.priority, cwd, command: "integration commands", budget: req.preempt,
+      observation: req.observation, candidate: req.commit }, async (signal): Promise<CommandRunResult> => {
       const ids = new Set<string>();
       const files = new Set<string>();
       let output = "";
