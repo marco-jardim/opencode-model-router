@@ -34,3 +34,41 @@ Run by the orchestrator on `cpx/main` at `39067ce` (2026-10-13), before approve.
   `test\smoke\helpers\scripted-provider.ts` as a write of 6.1.1.
 - **A-DF2-2:** 6.1.2 keeps its directory `Writes:` (the fixture set is not known in advance); it writes ⊤ and runs after
   6.1.1 instead of in parallel. Recorded as a makespan caveat in the 6.1.4 metrics.
+
+## Progress — 2026-10-14 (fallback; not accepted)
+
+The owner selected the fallback on **2026-10-13**. **G13 remains unmet** and must be disclosed in the Phase 6.2 PR.
+The pre-flight and amendments above are historical evidence, not a statement that the current worktree is clean:
+the current state is dirty and in progress, with Phase 6.1 acceptance still unresolved.
+
+### Observed results
+
+- **6.1.3 is unfinished.** Run 8: **6 failed, 10 passed, 9 skipped; 518.58 s**. Run 9 is in progress with
+  diagnostic-only instrumentation capturing arrival/probe timestamps; it is not acceptance evidence yet.
+- Verified run 8 evidence: actual G6 contender refusals in three resilience cases; Node meaningful progress at
+  **89024 / 89565 ms**, both before 90 s; the pip local G1 child was absent from provider capture. Unanswered Q1
+  was not eligible because **2.1.4 had not succeeded**.
+- The parent executed six targeted files: `lease-registry-modules`, `v2-leases`, `executor-compile-parse`,
+  `executor-create`, `executor-integrate-bisect`, and `executor-runtime`: **561 tests passed in 15.66 s**.
+  Separately, docs-drift: **123 tests passed in 3.67 s**. The typecheck tool exited **0**.
+- First commit **`1d8d293`** (lease sharing) was created; read-only commit verification is still pending.
+- Product automatic verification handles time out; these results do **not** establish phase acceptance.
+  No verified Linear usage is recorded.
+
+### Pending gates and forward obligations
+
+- Detached **6.1.4** still requires **three green runs at the committed integration head**.
+- **6.1.5 documentation** and **heavy QA** remain pending; no QA pass is claimed.
+- Full-suite execution is deferred until **Phase 6.2**; no full-suite run is planned before 6.2, and no current
+  full-suite result is claimed. Carry the unmet G13 disclosure into that phase's PR.
+
+### Later progress update — 2026-10-14
+
+- Four product commits have now been created: **`1d8d293`**, **`be3e4a6`**, **`f075c96`**, and **`ac61c34`**.
+  This updates the earlier one-commit snapshot; commit creation does not establish smoke or phase acceptance.
+- **Heavy product-correction QA round 1** is in progress at the fixed commit **`ac61c34`**. This is explicitly
+  **not final phase QA**, and no QA pass is claimed.
+- **Run 9 remains underway**, using the diagnostic-only arrival/probe timestamp instrumentation described above;
+  no completed run 9 result or green smoke gate is claimed. **6.1.3 remains unfinished**.
+- Detached **6.1.4's three green runs at the committed integration head**, **6.1.5 documentation**, and
+  **final heavy phase QA** remain pending. The G13 disclosure and Phase 6.2 full-suite obligations above are unchanged.
