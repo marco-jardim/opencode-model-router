@@ -2084,6 +2084,8 @@ export async function registerV2Hooks(
       if (child !== null && entry.child === null) {
         entry.child = child;
         noteSessionKind(child, "child");
+        // Retained launches bypass the subagent result hook that binds ordinary dispatch timings.
+        timings?.bindChild(entry.callID, child);
         inflight.acknowledge(entry.callID, child, { userBackgrounded: false });
       }
     },
