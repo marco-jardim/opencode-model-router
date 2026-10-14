@@ -169,6 +169,19 @@ answer text of `/plan answer` is taken as typed, apostrophes included.
 | `export` | `planId` | Returns the plan's ledger as text. |
 | `purge` | `planId` | Removes a completed or aborted plan: slots, `omr/<planId>/` refs and ledger. |
 
+## Task routing and write footprints
+
+Tasks without a `[route ...]` line are annotated automatically. Before role selection, an ordinary task's
+nonempty write footprint (from `Writes:` or inferred from phase ownership) takes precedence over an inferred
+read-only class. The compiler uses an edit-capable class and includes `edit` in its needs, preserving its tier,
+pin, risk and existing needs. A `Reads:` label cannot turn a declared writer into an explorer. Explorer and other
+read-only role permissions are not widened.
+
+An explicitly authored read-only route on a writer is not silently replaced: compilation refuses it with
+`route-write-conflict`, the task id and source line. Choose an edit-capable class and `needs=edit`, or correct the
+write declaration. Manual, preflight and QA tasks, and tasks with `Writes: none`, are excluded from this automatic
+writer reconciliation.
+
 ## Verification of plan tasks
 
 Plan tasks use the same dispatch verification engine as `router_verify`: the definition of done (DoD), scope and check

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { posix, win32 } from "node:path";
 
-import type { RouteLine } from "../../routing/classify/types";
+import { NEEDS, type RouteLine } from "../../routing/classify/types";
 import type { AnnotatedPlan, PlanStep } from "../../routing/engine";
 import type { DurationModel } from "../../routing/outcomes/durations";
 import {
@@ -446,6 +446,33 @@ function ownershipOf(parsed: ParsedPlan, phase: string | null): OwnershipInput[]
   return parsed.ownership.filter((r) => r.owners.includes(phase)).map((r) => ({ path: r.path, owners: r.owners, line: r.line }));
 }
 
+/** Footprints outrank inferred intent, never an author's incompatible route. Role maxima stay unchanged. */
+function writerRouteOf(t: ParsedTask, fp: TaskFootprint): ParsedTask["route"] {
+  const route = t.route;
+  if (route === null || t.kind === "manual" || t.kind === "preflight" || t.kind === "qa"
+    || t.writesLine?.none || fp.footprint.writes.length === 0) return route;
+  const fields = route.fields;
+  const readOnlyClass = fields?.class === "search" || fields?.class === "recon" || fields?.class === "design" || fields?.class === "review";
+  if (route.inferred !== true) {
+    // With no class, the executor's heavy-tier fallback selects a read-only reviewer.
+    if (readOnlyClass || (fields?.class === undefined && (t.tierTag ?? fields?.tier) === "heavy")) {
+      throw new ExecutorError("E_COMPILE", `route-write-conflict (line ${t.span.line}): task ${t.id} declares writes but its explicit route is read-only; choose an edit-capable class and needs=edit`,
+        { code: "route-write-conflict", line: t.span.line, taskId: t.id });
+    }
+    return route;
+  }
+  if (fields === null) return route;
+  const cls = readOnlyClass || fields.class === undefined ? "implement" : fields.class;
+  const needs = NEEDS.filter((need) => need === "edit" || fields.needs?.includes(need));
+  // Only engine-generated lines reach here: canonical class/needs tokens, with every other field kept verbatim.
+  let line = route.line;
+  for (const [key, value] of [["class", cls], ["needs", needs.join(",")]]) {
+    const token = new RegExp(`(\\s)${key}=[^\\s\\]]+`);
+    line = token.test(line) ? line.replace(token, `$1${key}=${value}`) : line.replace(/\]$/, ` ${key}=${value}]`);
+  }
+  return { ...route, line, fields: { ...fields, class: cls, needs } };
+}
+
 function nodeOf(
   deps: CompilerDeps,
   t: ParsedTask,
@@ -455,12 +482,13 @@ function nodeOf(
   warnings: CompileIssue[],
 ): TaskNode {
   const manual = t.kind === "manual" || t.kind === "preflight";
-  const fields = t.route?.fields ?? null;
+  const reconciled = writerRouteOf(t, fp);
+  const fields = reconciled?.fields ?? null;
   const tier: Tier | null = t.tierTag ?? (isTier(fields?.tier) ? fields.tier : null);
   const role = manual ? "" : deps.roleOf(fields, tier);
   const route: TaskNode["route"] = manual
     ? { line: "", role: "", tier: null, pin: false }
-    : { line: t.route?.line ?? "", role, tier, pin: fields?.pin ?? false };
+    : { line: reconciled?.line ?? "", role, tier, pin: fields?.pin ?? false };
   let verify: TaskNode["verify"];
   if (manual) verify = "none";
   else if (t.verify !== null) verify = t.verify;

@@ -78,6 +78,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OpenCode v2: inferred plan writers no longer launch as read-only explorers.** Before role selection, explicit
+  or ownership-inferred write footprints reconcile automatically inferred read-only classes and add the `edit` need,
+  keeping the tier, pin, risk and existing needs. Incompatible authored read-only routes fail compilation with a task
+  and line diagnostic instead of being silently overridden. Manual/preflight/QA tasks and `Writes: none` are excluded;
+  explorer permissions are unchanged.
 - **OpenCode v2: plan phase suites and base checks run in the CI slot at the commit under test, not the integration worktree's current head.**
 - **OpenCode v2: work leases no longer collide across linked worktrees.** Two child sessions that edit the same
   repo-relative path in two worktrees of one repository (`git worktree add`) are both allowed: an ordinary write lease

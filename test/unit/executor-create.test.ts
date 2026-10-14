@@ -13,6 +13,10 @@ import * as runtimeModule from "../../src/executor/runtime";
 import * as launchModule from "../../src/executor/launch";
 import * as ledgerModule from "../../src/executor/ledger";
 import * as compilerModule from "../../src/executor/compile";
+import { parsePlan } from "../../src/executor/compile/parse";
+import { parseRouteLine } from "../../src/routing/classify/route-line";
+import { grantFor, GRANT_NOTES } from "../../src/routing/roles/policy";
+import { renderRouteLine } from "../../src/executor/expand";
 import * as rolesModule from "../../src/router/roles";
 import * as poolModule from "../../src/executor/slots/pool";
 import * as provisionModule from "../../src/executor/slots/provision";
@@ -25,6 +29,7 @@ import type { LedgerWriter, IntegrationQueue, Clock } from "../../src/executor/t
 import type { LeaseRegistry } from "../../src/router/leases";
 import { ExecutorError, isLedgerV1, ledgerViolations, type ExecutorRuntime, type TaskLauncher, type SlotPool, type SlotRecord, type LedgerV1 } from "../../src/executor/types";
 import { buildDraft, holderOf, taskNode } from "../fixtures/cpx/ledger/builders";
+import { compileOpts, makeHarness, planPathOf } from "../fixtures/cpx/plans/harness";
 import { removeDirWhenReleased } from "../helpers/remove-dir";
 
 const bundled = JSON.parse(readFileSync(fileURLToPath(new URL("../../tiers.json", import.meta.url)), "utf8")) as Record<string, unknown>;
@@ -548,6 +553,127 @@ describe("createExecutor assembly seams", () => {
     await expect(h.compiler.annotate([])).rejects.toThrow("provided annotator");
     expect(annotate).toHaveBeenCalledExactlyOnceWith([]);
   }, 15_000);
+
+  it("G6: unchanged throughput writers 1.1.4/1.1.5 receive editing roles and grants through real rules annotation", async () => {
+    const h = capture();
+    const text = readFileSync(new URL("../fixtures/cpx/e2e/throughput.md", import.meta.url), "utf8");
+    const parsed = parsePlan(text);
+    const original = await h.compiler.annotate(parsed.tasks.map(t => ({ id: t.id, text: t.body })));
+    const fixture = makeHarness({ inline: { "throughput.md": text } });
+    fixture.deps.annotate = h.compiler.annotate;
+    fixture.deps.roleOf = h.compiler.roleOf;
+    const { draft } = await fixture.compiler.compile(planPathOf("throughput.md"), compileOpts(fixture, {
+      config: { ...fixture.config, crossPhase: "inferred" },
+    }));
+    const roles = rolesModule.resolveRoles(executorConfig(), "v2");
+    const explorer = roles.get("explorer")!;
+    expect(explorer.authority.mode).toBe("fixed");
+    expect(explorer.authority.allow).not.toContain("edit");
+    for (const [id, artifact, reads] of [
+      ["1.1.4", "d", ["a"]],
+      ["1.1.5", "e", ["b", "c"]],
+    ] as const) {
+      const source = parsed.tasks.find(t => t.id === id)!;
+      expect(source.route).toBeNull();
+      expect(source.readsLine).not.toBeNull();
+      const annotation = original.find(t => t.id === id)!;
+      const before = parseRouteLine(annotation.routeLine, { positions: "any" }).line!;
+      expect(["search", "recon"]).toContain(before.class);
+      expect(before.needs).toContain("edit");
+      const task = draft.tasks[id]!;
+      expect(task.footprint.writes).toEqual([`node-pnpm/artifacts/${artifact}.json`]);
+      expect(task.footprint.reads).toEqual(reads.map(name => `node-pnpm/artifacts/${name}.json`));
+      expect(task.route).toMatchObject({ role: "implementer", tier: "medium", pin: before.pin });
+      const root = "D:/slots/throughput/slot-1";
+      const route = parseRouteLine(renderRouteLine(task, root), { positions: "any" }).line!;
+      expect(route).toMatchObject({ class: "implement", risk: before.risk, scope: before.scope, needs: before.needs });
+      const resolved = h.deps.routes.route(task);
+      expect(resolved.agent).toBe("implementer");
+      const facts = { ...annotation.facts, class: route.class!, needs: route.needs! };
+      const grant = grantFor(roles.get(resolved.agent)!, facts, [], root, route);
+      expect(grant.actions.has("edit")).toBe(true);
+      expect(grant.notes).not.toContain(GRANT_NOTES.edit);
+      // Even a widened request cannot give this same writer edit authority while it is an explorer.
+      const denied = grantFor(explorer, facts, ["edit"], root, route);
+      expect(denied.actions.has("edit")).toBe(false);
+      expect(denied.notes).toContain(GRANT_NOTES.edit);
+    }
+  });
+
+  it.each([
+    ["Find references to `src/alpha/core.ts`.", "ownership"],
+    ["Find references to the entry point.", "inferred"],
+  ])("reconciles inferred read-only routing with phase ownership before selecting a role (%s)", async (title, confidence) => {
+    const h = capture();
+    const text = `# Plan\n\n| Phase | Owns (writes) |\n|---|---|\n| 1.1 | \`src/alpha/core.ts\` |\n\n## Phase 1.1 Work\n\n**Tasks**\n- **1.1.1** [tier:heavy] ${title}\n`;
+    const fixture = makeHarness({ inline: { "writer.md": text } });
+    fixture.deps.annotate = h.compiler.annotate;
+    fixture.deps.roleOf = h.compiler.roleOf;
+    const original = await h.compiler.annotate(parsePlan(text).tasks.map(t => ({ id: t.id, text: t.body })));
+    const before = parseRouteLine(original[0]!.routeLine, { positions: "any" }).line!;
+    expect(["search", "recon"]).toContain(before.class);
+    expect(before.needs ?? []).not.toContain("edit");
+    const { draft } = await fixture.compiler.compile(planPathOf("writer.md"), compileOpts(fixture));
+    const task = draft.tasks["1.1.1"]!;
+    const after = parseRouteLine(task.route.line, { positions: "any" }).line!;
+    expect(task.footprint).toMatchObject({ writes: ["src/alpha/core.ts"], confidence });
+    expect(task.route).toMatchObject({ role: "implementer", tier: "heavy", pin: true });
+    expect(after).toMatchObject({ class: "implement", risk: before.risk, scope: before.scope, pin: before.pin, needs: ["edit"] });
+    expect(h.deps.routes.route(task)).toMatchObject({ agent: "implementer", heavy: true });
+  });
+
+  it.each(["search", "recon", "design", "review", "mechanical", "implement", "debug", "other"] as const)(
+    "writer reconciliation preserves metadata and existing needs, and changes only read-only classes (%s)", async (cls) => {
+      const h = capture();
+      const fixture = makeHarness({ inline: { "writer.md": "## Phase 1.1 Work\n\n**Tasks**\n- **1.1.1** Produce the result.\n  Writes: `src/alpha/core.ts`\n" } });
+      fixture.deps.annotate = async steps => {
+        const annotations = await h.compiler.annotate(steps);
+        return Object.assign(annotations.map(a => ({ ...a, tier: "heavy",
+          routeLine: `[route class=${cls} risk=high scope=repo needs=shell,web,network,external_dir d=grader tier=heavy budget=7 pin]`,
+        })), { pinnedCount: annotations.pinnedCount });
+      };
+      fixture.deps.roleOf = h.compiler.roleOf;
+      const { draft } = await fixture.compiler.compile(planPathOf("writer.md"), compileOpts(fixture));
+      const task = draft.tasks["1.1.1"]!;
+      const expected = ["search", "recon", "design", "review"].includes(cls) ? "implement" : cls;
+      expect(task.route).toMatchObject({ role: cls === "other" ? "general" : "implementer", tier: "heavy", pin: true });
+      expect(parseRouteLine(task.route.line, { positions: "any" }).line).toMatchObject({
+        class: expected, risk: "high", scope: "repo", needs: ["shell", "web", "edit", "network", "external_dir"],
+        detection: "grader", tier: "heavy", budget: 7, pin: true,
+      });
+    },
+  );
+
+  it("does not promote manual, preflight, QA or Writes: none tasks to writer roles", async () => {
+    const h = capture();
+    const text = [
+      "# Plan", "", "| Phase | Owns (writes) |", "|---|---|", "| 1.1 | `src/alpha/core.ts` |", "",
+      "## Phase 1.1 Work", "", "**Pre-flight**", "- Find the prerequisites.", "  Writes: `src/preflight.json`", "",
+      "**Tasks**", "- **1.1.1** Orchestrator: handle the manual result.", "  Writes: `src/manual.json`",
+      "- **1.1.2** Find references to the entry point.", "  Writes: none", "  Reads: `src/alpha/core.ts`",
+      "- **1.1.QA** [tier:heavy] QA review the result.", "  Writes: `src/qa.json`", "",
+    ].join("\n");
+    const fixture = makeHarness({ inline: { "excluded.md": text } });
+    const annotate = vi.fn(h.compiler.annotate);
+    fixture.deps.annotate = annotate;
+    fixture.deps.roleOf = h.compiler.roleOf;
+    const { draft } = await fixture.compiler.compile(planPathOf("excluded.md"), compileOpts(fixture));
+    expect(annotate).toHaveBeenCalledOnce();
+    expect(annotate.mock.calls[0]?.[0].map(t => t.id)).toEqual(["1.1.2", "1.1.QA"]);
+    for (const id of ["1.1.PF1", "1.1.1"]) {
+      expect(draft.tasks[id]?.route).toEqual({ line: "", role: "", tier: null, pin: false });
+    }
+    expect(draft.tasks["1.1.2"]?.footprint.writes).toEqual([]);
+    expect(draft.tasks["1.1.2"]?.route.role).toBe("explorer");
+    const qa = draft.tasks["1.1.QA"]!;
+    expect(qa.kind).toBe("qa");
+    expect(qa.footprint.writes).toEqual(["src/qa.json"]);
+    const result = annotate.mock.results[0];
+    if (result?.type !== "return") throw new Error("annotation did not return");
+    const original = await result.value;
+    expect(qa.route.line).toBe(original.find(t => t.id === qa.id)?.routeLine);
+    expect(qa.route.role).toBe("reviewer");
+  });
 
   it("static durations use class priors for role names within that role's tier range", async () => {
     const h = capture(), model = h.compiler.durations;
