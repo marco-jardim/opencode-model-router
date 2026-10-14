@@ -208,6 +208,33 @@ describe("PlanSlotPools lazy facades", () => {
     await expect(pool.facade.release("slot-1")).rejects.toMatchObject({ code: "E_PLAN_STATE" });
   }, 15_000);
 
+  it("forwards durable task-slot release notifications without opening the lazy pool to subscribe", async () => {
+    const { pool, factory } = await rig();
+    const listeners = new Set<() => void>();
+    const make = factory.getMockImplementation()!;
+    factory.mockImplementation(ledger => Object.assign(make(ledger), {
+      onTaskSlotReleased(listener: () => void) {
+        listeners.add(listener);
+        return () => { listeners.delete(listener); };
+      },
+    }));
+    const view = pool.of("plan-a"), notified = vi.fn();
+    const off = view.onTaskSlotReleased?.(notified);
+    expect(factory).not.toHaveBeenCalled();
+    await view.list();
+    for (const listener of listeners) listener();
+    expect(notified).toHaveBeenCalledTimes(1);
+    off?.();
+    for (const listener of listeners) listener();
+    expect(notified).toHaveBeenCalledTimes(1);
+    view.onTaskSlotReleased?.(notified); // A subscriber added after open also receives the pool's notification.
+    for (const listener of listeners) listener();
+    expect(notified).toHaveBeenCalledTimes(2);
+    await view.gc(async () => true);
+    for (const listener of listeners) listener();
+    expect(notified).toHaveBeenCalledTimes(2);
+  });
+
   it("collects same-repository plans only; closed facades fence slot operations but permit gc-only handles", async () => {
     const { pool, made } = await rig();
     const b = pool.of("plan-b");

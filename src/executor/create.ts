@@ -76,12 +76,19 @@ export class PlanSlotPools {
     const have = this.entries.get(planId);
     if (have !== undefined) return have.view;
     const entry = { view: null as SlotPool | null, pool: null as Promise<OpenPool> | null, closed: false };
+    const releaseListeners = new Set<() => void>();
     const get = (): Promise<OpenPool> => {
       if (entry.closed) return Promise.reject(new ExecutorError("E_PLAN_STATE", `slots of plan ${planId} are closed`));
       entry.pool ??= this.deps.store.read(planId).then(async (ledger) => {
         const pool = this.deps.makePool(ledger);
         try { await pool.open(); } catch (error) { pool.close(); throw error; }
         if (entry.closed) { pool.close(); throw new ExecutorError("E_PLAN_STATE", `slots of plan ${planId} are closed`); }
+        pool.onTaskSlotReleased?.(() => {
+          if (entry.closed) return;
+          for (const listener of releaseListeners) {
+            try { listener(); } catch { /* Notification failures must not fail release. */ }
+          }
+        });
         return pool;
       });
       return entry.pool;
@@ -92,6 +99,10 @@ export class PlanSlotPools {
       reset: async (...args) => (await get()).reset(...args),
       cleanForChecks: async (...args) => (await get()).cleanForChecks(...args),
       release: async (...args) => { if (!entry.closed) await (await get()).release(...args); },
+      onTaskSlotReleased(listener) {
+        releaseListeners.add(listener);
+        return () => { releaseListeners.delete(listener); };
+      },
       get: async (...args) => entry.closed ? null : (await get()).get(...args),
       list: async (...args) => entry.closed ? [] : (await get()).list(...args),
       gc: async (finished) => {

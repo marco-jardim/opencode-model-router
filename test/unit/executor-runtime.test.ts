@@ -14,7 +14,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { checkV2ObservationStream, createV2Observations, type ObservationRecord, type V2Observations } from "../../src/compat/v2-observations";
 import { createCapacityController } from "../../src/executor/capacity.js";
 import { phaseIntegrated } from "../../src/executor/integrate/queue.js";
-import { taskBranchName, type GitOps } from "../../src/executor/git.js";
+import { taskBranchName, type GitOps, type StatusEntry } from "../../src/executor/git.js";
 import { createLedgerStore, createNodeFileSystem } from "../../src/executor/ledger.js";
 import {
   commitTaskInSlot,
@@ -28,6 +28,7 @@ import {
 } from "../../src/executor/runtime.js";
 import { createScheduler } from "../../src/executor/schedule.js";
 import { createSlotPool, defaultSlotsDir } from "../../src/executor/slots/pool.js";
+import { detectManagers, type Provisioner } from "../../src/executor/slots/provision.js";
 import {
   ExecutorError,
   QA_UNPARSABLE_CONTEXT_PREFIX,
@@ -302,6 +303,8 @@ class SlotPoolDouble implements SlotPool {
     this.released.push(slot);
     this.log.push(`slots.release:${slot}`);
     for (const [owner, l] of this.byOwner) if (l.slot === slot) this.byOwner.delete(owner);
+    const rec = this.records.get(slot);
+    if (rec?.state === "leased") this.records.set(slot, { ...rec, state: "ready", owner: null });
   }
   async get(slot: string): Promise<SlotRecord | null> {
     return this.records.get(slot) ?? null;
@@ -2239,13 +2242,16 @@ async function physicalPool(h: Harness, maxParallel: number) {
     async trackedLinks() { return []; }, async lsFiles() { return []; }, async statusPorcelain() { return []; },
     async diffNames() { return []; },
   };
+  const provisioner: Provisioner = {
+    detect: async () => ({ managers: [], manifests: {}, yarnBerry: false, editable: false, python: null }),
+    provision: async () => {},
+  };
   const pool = createSlotPool({ planId: PLAN_ID, repoKey: "repo-key", toplevel: REPO,
     slotsDir: join(root, "physical-slots"), markersDir: join(root, "markers"), executorHome: root,
-    maxParallel, fs, git, clock: h.clock,
-    provisioner: { detect: async () => ({ managers: [], manifests: {}, yarnBerry: false, editable: false, python: null }), provision: async () => {} } });
+    maxParallel, fs, git, clock: h.clock, provisioner });
   await pool.open();
   h.deps.slots = pool;
-  return { pool, fs, git };
+  return { pool, fs, git, heads, provisioner };
 }
 
 describe("launch slot preparation", () => {
@@ -2280,6 +2286,68 @@ describe("launch slot preparation", () => {
       } else expect(rows).toEqual([]);
     } finally {
       await h.close(); sink?.close(); pool.close();
+    }
+  });
+
+  it.each(["tracked file", "HEAD"] as const)("launches a clean requested base when drift provisioning changes %s after reset", async (mutation) => {
+    const h = await mk(planOf([task("T1")], { config: { maxParallel: 1 } }));
+    const { pool, fs, git, heads, provisioner } = await physicalPool(h, 1);
+    const movedHead = "e".repeat(40);
+    const filesAt = (commit: string): Record<string, string> => ({
+      "requirements.txt": `example==${commit === SHA2 ? "1" : "2"}.0.0\n`,
+      "tracked.txt": `checked in at ${commit}\n`,
+    });
+    // Model forced checkout and status from the actual on-disk tracked files, not an always-clean stub.
+    const checkoutTree = async (path: string, commit: string): Promise<void> => {
+      heads.set(path, commit);
+      for (const [name, text] of Object.entries(filesAt(commit))) await fs.writeText(join(path, name), text);
+    };
+    const add = git.worktreeAdd.bind(git);
+    git.worktreeAdd = async (path, commit, reason) => { await add(path, commit, reason); await checkoutTree(path, commit); };
+    git.checkoutDetach = checkoutTree;
+    git.lsFiles = async () => Object.keys(filesAt(SHA));
+    git.statusPorcelain = async (path) => {
+      const status: StatusEntry[] = [];
+      for (const [name, text] of Object.entries(filesAt(await git.revParse(path, "HEAD")))) {
+        if (await fs.readText(join(path, name)) !== text) status.push({ xy: " M", path: name, orig: null });
+      }
+      return status;
+    };
+    provisioner.detect = (path, tracked) => detectManagers(path, tracked, fs, { provision: "auto", python: "auto" });
+    const afterProvision: Array<{ head: string; status: StatusEntry[] }> = [];
+    const provision = vi.fn(async (path: string) => {
+      if (await git.revParse(path, "HEAD") !== SHA) return; // The old manifest's initial install is clean.
+      if (mutation === "tracked file") await fs.writeText(join(path, "tracked.txt"), "rewritten by postinstall\n");
+      else await checkoutTree(path, movedHead); // A provisioning override can itself run git.
+      afterProvision.push({ head: await git.revParse(path, "HEAD"), status: await git.statusPorcelain(path) });
+    });
+    provisioner.provision = provision;
+    const verifierBases: Array<{ commit: string; head: string }> = [];
+    h.deps.verifier = {
+      verify: h.verifier.verify.bind(h.verifier),
+      async begin(_task, slot) { verifierBases.push({ commit: slot.commit, head: await git.revParse(slot.path, "HEAD") }); },
+    };
+    try {
+      const ready = await pool.acquire(PLAN_ID, `plan:${PLAN_ID}:previous`, SHA2);
+      await pool.release(ready.slot);
+      const checkout = vi.spyOn(git, "checkoutDetach");
+      await h.begin();
+      const run = await h.runOf("T1", 1);
+
+      expect(provision).toHaveBeenCalledTimes(2); // The new base's real manifest digest must trigger drift provisioning.
+      expect(afterProvision).toEqual([{
+        head: mutation === "HEAD" ? movedHead : SHA,
+        status: mutation === "tracked file" ? [{ xy: " M", path: "tracked.txt", orig: null }] : [],
+      }]);
+      expect(run.req.workRoot).toBe(ready.path);
+      expect(await git.statusPorcelain(run.req.workRoot)).toEqual([]);
+      expect(await git.revParse(run.req.workRoot, "HEAD")).toBe(SHA);
+      expect(await fs.readText(join(run.req.workRoot, "tracked.txt"))).toBe(filesAt(SHA)["tracked.txt"]);
+      expect(run.req.prompt).toContain(`Base commit: ${SHA}`);
+      expect(verifierBases).toEqual([{ commit: SHA, head: SHA }]);
+      expect(checkout.mock.calls).toEqual([[ready.path, SHA], [ready.path, SHA]]);
+    } finally {
+      await h.close(); pool.close();
     }
   });
 
@@ -2326,6 +2394,89 @@ describe("launch slot preparation", () => {
   });
 });
 
+describe("physical slot admission", () => {
+  it("admits only the highest-priority ready task when one physical slot is free, even across ticks", async () => {
+    // Put the lower priority first in plan order; the real scheduler must still prefer T2.
+    const h = await mk(planOf([task("T1"), task("T2", { estimate: { p50: 100, p90: 200, source: "default" } })],
+      { config: { maxParallel: 2 } }));
+    const { pool, git } = await physicalPool(h, 2);
+    const lookup = deferred<void>();
+    try {
+      await pool.acquire(PLAN_ID, `plan:${PLAN_ID}:integrating`, SHA);
+      const free = await pool.acquire(PLAN_ID, `plan:${PLAN_ID}:previous`, SHA);
+      await pool.release(free.slot);
+      const acquire = vi.spyOn(pool, "acquire");
+      const revParse = git.revParse.bind(git);
+      let entered = false;
+      git.revParse = async (path, rev) => {
+        if (!entered && path === REPO && rev === SHA) {
+          entered = true;
+          await lookup.promise; // The highest-priority claim has not reached the pool mutex yet.
+        }
+        return revParse(path, rev);
+      };
+      await h.begin();
+      await until(() => entered, "highest-priority acquisition waiting on git");
+      h.runtime.onRouterToolCall(ORCH);
+      await pause(30);
+      expect(acquire.mock.calls.map(([, owner]) => owner)).toEqual([`plan:${PLAN_ID}:T2`]);
+      lookup.resolve();
+      const run = await h.runOf("T2", 1);
+      expect(run.req.workRoot).toBe(free.path);
+      expect(h.launcher.runs.map(r => r.req.taskId)).toEqual(["T2"]);
+      expect(h.task("T1")).toMatchObject({ state: "ready", attempts: [] });
+    } finally {
+      lookup.resolve();
+      await h.close(); pool.close();
+    }
+  });
+
+  it("does not lose a release that races the physical-slot snapshot before a waiter is recorded", async () => {
+    const h = await mk(planOf([task("T1")], { config: { maxParallel: 1 } }));
+    const { pool } = await physicalPool(h, 1);
+    try {
+      const held = await pool.acquire(PLAN_ID, `plan:${PLAN_ID}:integrating`, SHA);
+      const list = pool.list.bind(pool);
+      vi.spyOn(pool, "list").mockImplementationOnce(async (...args) => {
+        const snapshot = await list(...args);
+        await pool.release(held.slot);
+        return snapshot; // The snapshot still says every slot is busy, but the release has already happened.
+      });
+      const before = h.clock.now();
+      await h.begin();
+      await expect.poll(() => h.launcher.runOf("T1", 1), { timeout: 750, interval: 10 }).toBeDefined();
+      expect(h.clock.now() - before).toBe(0);
+    } finally {
+      await h.close(); pool.close();
+    }
+  });
+
+  it("launches a slot-blocked ready task on physical release without advancing the backoff clock", async () => {
+    const h = await mk(planOf([task("T1")], { config: { maxParallel: 1 } }));
+    const { pool } = await physicalPool(h, 1);
+    try {
+      const held = await pool.acquire(PLAN_ID, `plan:${PLAN_ID}:integrating`, SHA);
+      const timers = vi.spyOn(h.clock, "setTimer");
+      const clearTimer = vi.spyOn(h.clock, "clearTimer");
+      await h.begin();
+      await h.settled();
+      expect(h.launcher.runs).toEqual([]);
+      expect(h.task("T1")).toMatchObject({ state: "ready", attempts: [] });
+      const backoff = timers.mock.results[timers.mock.calls.findIndex(([ms]) => ms === 1000)];
+      expect(backoff?.type).toBe("return");
+      const before = h.clock.now();
+      // No integration callback, lease notification, router turn or timer tick: only the successful physical release.
+      await pool.release(held.slot);
+      await expect.poll(() => h.launcher.runOf("T1", 1), { timeout: 750, interval: 10 }).toBeDefined();
+      expect(h.clock.now() - before).toBe(0);
+      expect(clearTimer).toHaveBeenCalledWith(backoff?.value);
+      expect(h.launcher.runs).toHaveLength(1);
+    } finally {
+      await h.close(); pool.close();
+    }
+  });
+});
+
 describe("physical slot observations", () => {
   it("G8: provider-free is not slot-launchable while verifying/integrating tasks retain every slot", async () => {
     const lines: string[] = [], rows: ObservationRecord[] = [];
@@ -2361,14 +2512,12 @@ describe("physical slot observations", () => {
       expect(h.state("T3")).toBe("ready");
       expect(h.launcher.runs).toHaveLength(2);
       expect(events("capacity-release").filter(r => r.family === "scheduler" && JSON.stringify(r.state).includes('"result":"success"'))).toHaveLength(2);
-      // Red before the fix: the stream only had launch-step-end result=skipped, with no physical-slot reason.
-      expect(events("slot-acquire-result")).toContainEqual(expect.objectContaining({ state: expect.objectContaining({
-        maxParallel: 2, detail: expect.objectContaining({ taskId: "T3", result: "unavailable", slot: null }),
-        slots: expect.arrayContaining([
-          expect.objectContaining({ slot: "slot-1", state: "leased", taskId: "T1" }),
-          expect.objectContaining({ slot: "slot-2", state: "leased", taskId: "T2" }),
-        ]),
+      // Admission now reports the physical-slot wait without starting a doomed acquisition or reserving provider capacity.
+      expect(events("slot-admission")).toContainEqual(expect.objectContaining({ state: expect.objectContaining({
+        detail: { taskId: "T3", result: "unavailable", free: 0 },
       }) }));
+      expect(events("slot-acquire-start").some(r => r.family === "scheduler" && JSON.stringify(r.state).includes('"taskId":"T3"'))).toBe(false);
+      expect(events("capacity-reserve").some(r => r.family === "scheduler" && JSON.stringify(r.state).includes('"taskId":"T3"'))).toBe(false);
       expect(events("ledger")).toContainEqual(expect.objectContaining({ state: expect.objectContaining({ tasks: expect.arrayContaining([
         expect.objectContaining({ id: "T1", state: "verifying", slot: "slot-1" }),
         expect.objectContaining({ id: "T2", state: "integrating", slot: "slot-2" }),
@@ -2399,7 +2548,6 @@ describe("physical slot observations", () => {
         detail: expect.objectContaining({ slot: "slot-2", result: "released" }),
         slots: expect.arrayContaining([expect.objectContaining({ slot: "slot-2", state: "ready", taskId: null })]),
       }) }));
-      h.runtime.onLeaseReleased();
       await h.runOf("T3", 1);
       expect(events("slot-acquire-result")).toContainEqual(expect.objectContaining({ state: expect.objectContaining({
         detail: expect.objectContaining({ taskId: "T3", slot: "slot-2", result: "reused" }),

@@ -744,6 +744,7 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
   const retireCtx: RetireCtx = { ...fileCtx, git: d.git, toplevel: d.toplevel };
 
   const records = new Map<string, SlotRecord>();
+  const releaseListeners = new Set<() => void>();
   const corrupt = new Set<string>();
   const poolLock = new Mutex();
   const slotLocks = new Map<string, Mutex>();
@@ -1060,7 +1061,7 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
     }
   }
 
-  async function stageReset(rec: SlotRecord): Promise<SlotRecord> {
+  async function stageReset(rec: SlotRecord): Promise<{ rec: SlotRecord; provisioned: boolean }> {
     observe("slot-reset-start", () => ({ slot: rec.slot }));
     try {
       await resetRoutine(rec);
@@ -1068,7 +1069,7 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
       const done = await save({ ...drift.rec, state: drift.rec.owner === null ? "ready" : "leased" });
       syncEnv(done);
       observe("slot-reset-end", () => ({ slot: rec.slot, result: "completed" }));
-      return done;
+      return { rec: done, provisioned: drift.drifted && drift.rec.managers.length > 0 };
     } catch (error) {
       observe("slot-reset-end", () => ({ slot: rec.slot, result: "failed" }));
       throw error;
@@ -1084,7 +1085,7 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
         await d.git.verifySlotPointers(rec.path);
         return stageProvision(rec, true);
       case "resetting":
-        return stageReset(rec);
+        return (await stageReset(rec)).rec;
     }
   }
 
@@ -1204,9 +1205,14 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
       }
       // Only a full reset in this acquisition proves launch cleanliness. Same-owner/recovery and create/recreate
       // remain unproven, even if their marker already names the requested base.
-      const resetBase = mode === "reset" && rec.state === "resetting" && rec.commit === spec.base ? spec.base : undefined;
-      const lease = acquired(await driveStage(staged(rec), firstRun));
-      return resetBase === undefined ? lease : { ...lease, verifiedResetBase: resetBase };
+      if (mode === "reset" && rec.state === "resetting" && rec.commit === spec.base) {
+        const reset = await stageReset(staged(rec));
+        const lease = acquired(reset.rec);
+        // Install hooks can dirty tracked files or move HEAD after resetRoutine verified them.
+        // Withhold the proof so launch's forced reset restores the requested base in that case.
+        return reset.provisioned ? lease : { ...lease, verifiedResetBase: spec.base };
+      }
+      return acquired(await driveStage(staged(rec), firstRun));
     } catch (error) {
       const failed = await failStage(slot, error);
       observe("slot-acquire-result", () => ({ slot, kind: spec.kind, taskId: taskIdOf(spec.owner), mode,
@@ -1292,21 +1298,25 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
   async function release(slot: string): Promise<void> {
     assertOpen();
     assertSlot(slot);
-    await slotLock(slot).run(async () => {
+    const released = await slotLock(slot).run(async () => {
       const rec = records.get(slot);
       observe("slot-release-start", () => ({ slot }));
       if (rec === undefined || rec.state !== "leased") {
         observe("slot-release-complete", () => ({ slot, result: "unchanged" }));
-        return;
+        return false;
       }
       try {
         await save({ ...rec, state: "ready", owner: null });
         observe("slot-release-complete", () => ({ slot, result: "released" }));
+        return rec.kind === "task";
       } catch (error) {
         observe("slot-release-failed", () => ({ slot }));
         throw error;
       }
     });
+    if (released) for (const listener of releaseListeners) {
+      try { listener(); } catch { /* A notification cannot undo a successful durable release. */ }
+    }
   }
 
   // ---- open -------------------------------------------------------------------------------------------------
@@ -1456,6 +1466,7 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
   function close(): void {
     if (closed) return;
     closed = true;
+    releaseListeners.clear();
     observe("slot-pool-close");
     abort.abort();
   }
@@ -1486,6 +1497,10 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
     reset,
     cleanForChecks,
     release,
+    onTaskSlotReleased(listener) {
+      releaseListeners.add(listener);
+      return () => { releaseListeners.delete(listener); };
+    },
     async get(slot) {
       const rec = records.get(slot);
       return rec === undefined ? null : cloneRecord(rec);

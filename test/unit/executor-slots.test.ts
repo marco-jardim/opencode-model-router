@@ -426,6 +426,39 @@ describe("SlotPool lifecycle", () => {
     expect(await h.pool.get("slot-9")).toBeNull();
   });
 
+  it("notifies task-slot release only after durability, never on failure, no-op, special slots or unsubscribe", async () => {
+    const h = harness();
+    await h.pool.open();
+    const lease = await h.pool.acquire(PLAN, "task-1", C1);
+    const special = await h.pool.acquireSpecial(PLAN, "integration");
+    let flushed = false;
+    const notifications: boolean[] = [];
+    h.pool.onTaskSlotReleased?.(() => { throw new Error("subscriber failed"); });
+    const off = h.pool.onTaskSlotReleased?.(() => { notifications.push(flushed); });
+    const fsync = h.fs.fsyncDir.bind(h.fs);
+    h.fs.fsyncDir = async () => { throw new Error("flush failed"); };
+    await expect(h.pool.release(lease.slot)).rejects.toThrow("flush failed");
+    expect(notifications).toEqual([]);
+    expect(await h.pool.get(lease.slot)).toMatchObject({ state: "leased" });
+    h.fs.fsyncDir = async path => {
+      expect(notifications).toEqual([]);
+      await fsync(path);
+      flushed = true;
+    };
+    await h.pool.release(lease.slot);
+    expect(notifications).toEqual([true]);
+    h.fs.fsyncDir = fsync;
+    await h.pool.release(lease.slot);
+    await h.pool.release("slot-9");
+    await h.pool.release(special.slot);
+    expect(notifications).toEqual([true]);
+    off?.();
+    const again = await h.pool.acquire(PLAN, "task-2", C1);
+    await h.pool.release(again.slot);
+    expect(notifications).toEqual([true]);
+    h.pool.close();
+  });
+
   it("reuses a ready slot through resetting without reinstalling", async () => {
     const h = harness();
     await h.pool.open();

@@ -1398,6 +1398,9 @@ export interface SlotPool {
   cleanForChecks(slot: string): Promise<void>;
   /** Idempotent. */
   release(slot: string): Promise<void>;
+  /** Subscribe without opening the pool. Called only after a task slot's leased -> ready marker is durable.
+   *  Failed/unchanged releases and special slots do not notify. Returns an unsubscribe function. */
+  onTaskSlotReleased?(listener: () => void): () => void;
   get(slot: string): Promise<SlotRecord | null>;
   list(planId?: PlanId): Promise<SlotRecord[]>;
   /** Removes only marked slots of completed/aborted plans, or unknown plans after 7 d; never follows links; reports unmarked dirs */

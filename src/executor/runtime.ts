@@ -86,6 +86,7 @@ import {
   type Scheduler,
   type SlotLease,
   type SlotPool,
+  type SlotRecord,
   type SlotVerifier,
   type TaskId,
   type TaskLauncher,
@@ -552,6 +553,8 @@ interface HandleRef {
   completion: Promise<ChildEnd>;
 }
 
+type LaunchStepResult = "launched" | "skipped" | "slot-unavailable";
+
 interface PlanRt {
   readonly planId: PlanId;
   writer: LedgerWriter;
@@ -563,6 +566,9 @@ interface PlanRt {
   inFlight: Set<TaskId>;
   handles: Map<TaskId, HandleRef>;
   slotLeases: Map<TaskId, SlotLease>;
+  offSlotRelease: (() => void) | null;
+  slotWaiting: boolean;
+  slotReleaseGeneration: number;
   capacityStopped: Set<string>;
   lostStreak: Map<TaskId, number>;
   latch: boolean;
@@ -1124,6 +1130,17 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     d.clock.clearTimer(h);
   }
 
+  /** The pool notifies only after the physical task slot's release is durable (never at TS(null)). */
+  function taskSlotReleased(p: PlanRt): void {
+    p.slotReleaseGeneration += 1;
+    // A skipped launch returning its own fresh slot must not spin by waking itself. Wake physical waiters only.
+    if (!p.slotWaiting || p.disposed || disposed) return;
+    p.slotWaiting = false;
+    p.skipStreak = 0;
+    clearBackoff(p);
+    schedule(p);
+  }
+
   /**
    * QA-3.1-22: a RouteResolver error is the resolver's, not the task's: uncounted, nothing journaled, retried by the
    * backoff tick. One failure is counted per backoff round (the round that arms the timer), so a burst of ticks inside
@@ -1354,7 +1371,33 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       return;
     }
     const unroutable = new Map<TaskId, string>();
-    const ready = readyOf(p, l, unroutable);
+    let ready = readyOf(p, l, unroutable);
+    const gate = d.launcher.gate(l.orchestrator.sessionID);
+    let taskSlots: SlotRecord[] = [];
+    if (ready.length > 0 && gate.ok) {
+      const slotGeneration = p.slotReleaseGeneration;
+      try {
+        taskSlots = (await slotsFor(p.planId).list(p.planId))
+          .filter((s) => s.kind === "task" && s.planId === p.planId && s.state !== "retired");
+      } catch (e) {
+        counter(p, "launch-skipped", { reason: "provision" });
+        armBackoff(p);
+        await provisionFailed(p, ready[0]!.taskId, e);
+        return;
+      }
+      // A release/integration can happen during the snapshot. Re-read priority, dependencies, leases and capacity
+      // before reserving anything; launchStep still rechecks the retained context and durable launch gates.
+      l = p.writer.ledger;
+      if (p.disposed || p.latch || l.status !== "running") return;
+      // A wake during the snapshot may have newly satisfied a pending dependent. Let the next pass promote it
+      // before admitting an already-ready, lower-priority task into the released slot.
+      if (p.again || slotGeneration !== p.slotReleaseGeneration) {
+        p.again = true;
+        return;
+      }
+      unroutable.clear();
+      ready = readyOf(p, l, unroutable);
+    }
     for (const taskId of [...unroutable.keys()]) if (p.inFlight.has(taskId)) unroutable.delete(taskId);
     // Synchronous up to the raise (counting and the backoff arm happen before its first await): the ready set stays fresh.
     if (unroutable.size > 0) void track(routeFailures(p, unroutable));
@@ -1362,7 +1405,6 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       p.routeFails = 0;
       p.routeRaised = false;
     }
-    const gate = d.launcher.gate(l.orchestrator.sessionID);
     observe(p, "launch-gate", () => ({ ok: gate.ok, ready: ready.map((r) => r.taskId) }));
     if (ready.length === 0 || !gate.ok) {
       if (ready.length > 0 && !gate.ok && gate.wake !== null) await wakeOnce(p, gate.wake.reason, gate.wake.stateKey);
@@ -1373,9 +1415,24 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     // keeps a second tick off a task whose step is running, and `settled()` tracks every step. Each step's capacity token
     // is taken here, synchronously, before the step queues on its task mutex (QA-3.1-23): the next tick's ready set
     // already sees it, so two ticks back to back never schedule more launches than the capacity allows.
-    l = p.writer.ledger;
+    // Mirror claimTask: reuse ready slots, create up to maxParallel, or replace broken slots. Same-owner retries
+    // keep their existing slot and consume no free slot. An admitted step may still be waiting on its task mutex or
+    // git before claiming: subtract those reservations so a second tick cannot admit a lower-priority competitor.
+    const owners = new Set(taskSlots.flatMap((s) => s.owner === null ? [] : [s.owner]));
+    let freeSlots = Math.max(0, l.config.maxParallel - taskSlots.length)
+      + taskSlots.filter((s) => s.state === "ready" || s.state === "broken").length;
+    for (const id of p.inFlight) if (!owners.has(leaseHolderID(p.planId, id))) freeSlots -= 1;
+    p.slotWaiting = false;
     const steps: Array<Promise<"launched" | "skipped">> = [];
     for (const item of ready) {
+      const heldSlot = owners.has(leaseHolderID(p.planId, item.taskId));
+      if (!heldSlot && freeSlots <= 0) {
+        p.slotWaiting = true;
+        counter(p, "launch-skipped", { reason: "slot-unavailable" });
+        observe(p, "slot-admission", () => ({ taskId: item.taskId, result: "unavailable", free: Math.max(0, freeSlots) }));
+        armBackoff(p);
+        continue;
+      }
       const n = (own(l, item.taskId)?.attempts.length ?? 0) + 1;
       try {
         p.tokens.set(tokenKey(item.taskId, n), p.capacity.acquire(item.route.provider, item.route.heavy, item.taskId, n));
@@ -1386,6 +1443,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         armBackoff(p);
         continue;
       }
+      if (!heldSlot) freeSlots -= 1;
       steps.push(startStep(p, item.taskId, () => launchStep(p, item, n), n));
     }
     void track(
@@ -1402,13 +1460,14 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
    * arms the backoff tick instead, so skips never re-tick each other. The capacity token the tick took for attempt `n`
    * (QA-3.1-23) is released by every step that did not launch, also one that threw (release is idempotent).
    */
-  function startStep(p: PlanRt, taskId: TaskId, fn: () => Promise<"launched" | "skipped">, n: number): Promise<"launched" | "skipped"> {
+  function startStep(p: PlanRt, taskId: TaskId, fn: () => Promise<LaunchStepResult>, n: number): Promise<"launched" | "skipped"> {
     p.inFlight.add(taskId);
     observe(p, "launch-prepare", () => ({ taskId, attempt: n }));
     const attemptsOf = (): number => own(p.writer.ledger, taskId)?.attempts.length ?? 0;
     const before = attemptsOf();
+    const slotGeneration = p.slotReleaseGeneration;
     const run = async (): Promise<"launched" | "skipped"> => {
-      let r: "launched" | "skipped" = "skipped";
+      let r: LaunchStepResult = "skipped";
       try {
         r = await fn();
       } catch (e) {
@@ -1416,12 +1475,17 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       } finally {
         if (r !== "launched") releaseToken(p, taskId, n, "other");
         p.inFlight.delete(taskId);
-        observe(p, "launch-step-end", () => ({ taskId, attempt: n, result: r }));
+        observe(p, "launch-step-end", () => ({ taskId, attempt: n, result: r === "launched" ? "launched" : "skipped" }));
       }
       if (r === "launched") launchSucceeded(p);
       else if (attemptsOf() !== before) schedule(p);
-      else armBackoff(p);
-      return r;
+      else if (r === "slot-unavailable" && slotGeneration !== p.slotReleaseGeneration) {
+        // The release tick may have seen this task still inFlight. Retry now that its guard is gone, not after backoff.
+        p.skipStreak = 0;
+        clearBackoff(p);
+        schedule(p);
+      } else armBackoff(p);
+      return r === "launched" ? "launched" : "skipped";
     };
     return track(run());
   }
@@ -1441,7 +1505,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   // ---------- launch step (M37)
 
   /** Step 1 (capacity) ran in the tick: the token of attempt `n` is held (QA-3.1-23); `startStep` frees it on a skip. */
-  async function launchStep(p: PlanRt, item: ScheduledTask, n: number): Promise<"launched" | "skipped"> {
+  async function launchStep(p: PlanRt, item: ScheduledTask, n: number): Promise<LaunchStepResult> {
     return withTask(p, item.taskId, async () => {
       const taskId = item.taskId;
       let l = p.writer.ledger;
@@ -1471,10 +1535,11 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         slot.commit = head; // Keep the cached lease, prompt's base and verifier input aligned with the checkout.
       } catch (e) {
         const unavailable = errorCode(e) === "E_SLOT_UNAVAILABLE";
+        if (unavailable) p.slotWaiting = true;
         counter(p, "launch-skipped", { reason: unavailable ? "slot-unavailable" : "provision" });
         await abandon();
         if (!unavailable) await provisionFailed(p, taskId, e);
-        return "skipped";
+        return unavailable ? "slot-unavailable" : "skipped";
       }
       // 3. leases (a throwing registry must not leak the token and the fresh slot, QA-3.1-12)
       let got: ReturnType<LeaseService["acquireTask"]>;
@@ -2598,6 +2663,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       inFlight: new Set(),
       handles: new Map(),
       slotLeases: new Map(),
+      offSlotRelease: null,
+      slotWaiting: false,
+      slotReleaseGeneration: 0,
       capacityStopped: new Set(),
       lostStreak: new Map(),
       latch: false,
@@ -2655,6 +2723,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     p.recovering = true;
     observe(p, "activation");
     try {
+      p.offSlotRelease ??= slotsFor(p.planId).onTaskSlotReleased?.(() => taskSlotReleased(p)) ?? null;
       const l = p.writer.ledger;
       p.unpin?.();
       p.unpin = d.pinOrchestrator(l.orchestrator.sessionID);
@@ -3548,6 +3617,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   async function closePlan(p: PlanRt): Promise<void> {
     p.disposed = true;
     p.latch = true;
+    p.offSlotRelease?.();
+    p.offSlotRelease = null;
     observe(p, "detach");
     for (const h of p.timers) d.clock.clearTimer(h);
     p.timers.clear();

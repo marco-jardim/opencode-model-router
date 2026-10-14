@@ -268,6 +268,8 @@ class SlotPoolDouble implements SlotPool {
     this.released.push(slot);
     this.log.push(`slots.release:${slot}`);
     for (const [owner, l] of this.byOwner) if (l.slot === slot) this.byOwner.delete(owner);
+    const rec = this.records.get(slot);
+    if (rec?.state === "leased") this.records.set(slot, { ...rec, state: "ready", owner: null });
   }
   async get(slot: string): Promise<SlotRecord | null> {
     return this.records.get(slot) ?? null;
