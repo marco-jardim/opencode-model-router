@@ -88,14 +88,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **OpenCode v2: plan checks re-resolve inherited router commands for the prepared execution slot.** Phase suites,
   base checks, bisect probes and revert regressions refresh the command executable, environment and authorization
   against the checkout under test rather than reusing the integration worktree's resolution. Explicit working-directory
-  and environment overrides are preserved.
+  and environment overrides are preserved. Configured commands and commands with explicit `cwd` or `env` overrides
+  execute unchanged in full instead of being replaced by scoped runs; ordinary equivalent package-script test scoping
+  is retained.
 - **OpenCode v2: explicit plan-writer routes are checked against the selected role's edit grant.** Compilation uses
   the resolved role policy, including configured permission narrowing, rather than class/tier heuristics. A writer
   routed to a general role without an `edit` grant is rejected with a task and line diagnostic; valid edit-capable routes
   remain accepted.
 - **OpenCode v2: failed rebase cleanup preserves the initiating Git error.** Cleanup checks the slot's rebase state
   before aborting and retains the original failure alongside any cleanup error. Integration refusals persist bounded
-  diagnostic details in the journal with URL credentials redacted.
+  diagnostic details in the journal with URL credentials redacted from keys and string values before clipping, with
+  bounded traversal and output handling.
 - **OpenCode v2: inferred plan writers no longer launch as read-only explorers.** Before role selection, explicit
   or ownership-inferred write footprints reconcile automatically inferred read-only classes and add the `edit` need,
   keeping the tier, pin, risk and existing needs. Incompatible authored read-only routes fail compilation with a task

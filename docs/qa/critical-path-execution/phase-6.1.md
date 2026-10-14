@@ -152,27 +152,48 @@ This supersedes the earlier rebase-fix status: **implementation is complete**, w
   Run 9's initiating cause remains unknown; the other phase gates, G13 disclosure and deferred full-suite obligations
   are unchanged. **Phase 6.1 is still not complete or accepted.**
 
-## Current status — 2026-10-14 (after round 2 review; not accepted)
+## Current status — 2026-10-14 (working-tree validation snapshot; not accepted)
 
-This supersedes the historical uncommitted/pending status above; those snapshots and their reported check results are
-retained as evidence, not as validation of the remaining round 2 fixes.
+This **working-tree validation snapshot at HEAD `a066f4d`** supersedes the historical uncommitted/pending status above.
+Pending facts below apply to this dated snapshot, not to later commits; earlier snapshots and results remain historical
+evidence.
+
+### Round 2 corrections
 
 - **Committed corrections and notes:** **`4f98c05`** (shared leases), **`7cdb4f4`** (explicit writer grants and CI-slot
   resolution), **`ffb0475`** (rebase diagnostics), and **`183b984`** (documentation notes). These are existing commits,
   not pending work.
 - **Heavy product-correction QA round 2 reviewed `183b984`** and verified that the original **one P1 and two P2s were
-  resolved**. It raised four new findings; this was **not a green review or final phase QA**:
-  - **P1 — configured command substitution:** implementation in progress; scoped validation remains pending.
-  - **P2 — scoped override loss:** implementation in progress; scoped validation remains pending.
-  - **P2 — URL credentials in diagnostic keys:** implementation in progress; scoped validation remains pending.
-  - **P3 — stale committed-status documentation:** addressed by this current-status correction. This does not validate
-    any of the three code fixes above.
-- **Remaining product work** is the three round 2 code fixes above, their scoped checks and follow-up review, and fresh
-  smoke evidence. All round 2 findings must be fixed; subsequent QA loops are limited to major/critical blocking issues.
-  No new test results, timings or green smoke result are claimed by this documentation-only edit.
+  resolved**. It raised one new P1, two P2s and one P3; this was **not a green review or final phase QA**.
+- **Round 2 P3 — stale committed-status documentation:** already corrected in **`a066f4d`**; not pending work.
+- **Round 2 P1/P2 code corrections are implemented with scoped checks passing; the two fixes await commit in this
+  snapshot:**
+  - **P1 — configured command substitution; P2 — scoped override loss:** `src/executor/integrate/checks.ts` executes
+    configured commands and commands with explicit `cwd` or `env` overrides unchanged in full rather than substituting
+    unsafe scoped runs, including rerun/bisect/revert paths. Ordinary equivalent package-script test scoping is retained.
+  - **P2 — URL credentials in diagnostic keys:** `src/executor/integrate/queue.ts` redacts keys as well as string values
+    before clipping, with bounded traversal and output handling and an unavailable-detail fallback.
+
+### Scoped check evidence
+
+Actual parent executions for the round 2 code corrections:
+
+| Check scope | Result | Duration |
+| --- | --- | --- |
+| `executor-execution-slot` + `executor-integrate-bisect` | 2 files, 195 passed | 61.61 s |
+| `executor-integrate-queue` | 373 passed | 54.08 s |
+
+Producer typechecks passed. No tests were run for this documentation-only update. **Automatic verification still times
+out or remains unattributable**; the scoped results do not establish a router-verification pass, green QA review, smoke
+pass or phase acceptance.
+
+### Remaining gates
+
+- **Pending at this working-tree validation snapshot:** commits for the two code fixes, follow-up product-correction
+  review limited to **major/critical blocking issues**, and fresh smoke evidence from **Run 10**. No Run 10 result or
+  follow-up QA pass is claimed.
 - **Run 9's initiating cause remains unknown** because its original stderr was lost; the committed rebase diagnostics
-  and targeted regression checks do not establish that cause. **Product automatic-verification timeouts remain
-  unresolved.**
+  and targeted regression checks do not establish that cause.
 - **6.1.3 remains unfinished.** Detached **6.1.4's three green runs at the committed integration head**, **6.1.5
   documentation**, and **final heavy phase QA** remain pending. **G13 remains unmet**; the Phase 6.2 PR disclosure and
   deferred full-suite obligations are unchanged. **Phase 6.1 is not complete or accepted.**
