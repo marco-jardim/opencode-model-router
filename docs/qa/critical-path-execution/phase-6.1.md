@@ -72,3 +72,79 @@ the current state is dirty and in progress, with Phase 6.1 acceptance still unre
   no completed run 9 result or green smoke gate is claimed. **6.1.3 remains unfinished**.
 - Detached **6.1.4's three green runs at the committed integration head**, **6.1.5 documentation**, and
   **final heavy phase QA** remain pending. The G13 disclosure and Phase 6.2 full-suite obligations above are unchanged.
+
+### Latest progress update — 2026-10-14 (round 1 remediation; not accepted)
+
+This supersedes the in-progress Run 9 and QA-round-1 snapshots above; those entries remain historical evidence.
+
+- **Heavy product-correction QA round 1 at `ac61c34`** reported **one P1** (CI-slot command/environment resolution)
+  and **two P2s** (explicit writer-route grants and shared lease registry validation). The three corrections below are
+  implemented in the worktree but **not yet committed**. This review was not final phase QA.
+- **Shared leases:** `src/compat/background.ts` validates each shared registry entry independently without replacing
+  an invalid entry or disturbing valid registries. `src/compat/v2-hooks.ts` refuses lease-checked file, search, git and
+  run tools if enforced leases cannot start, rather than disabling enforcement.
+- **CI checks:** `src/executor/integrate/run-resolver.ts` and `checks.ts` separate inherited command resolution from
+  explicit overrides. Checks re-resolve the executable, environment and authorization against the prepared execution
+  checkout, including base/bisect/revert checks, while preserving explicit working-directory and environment overrides.
+- **Explicit writers:** `src/executor/create.ts` supplies the canonical selected `RoleSpec`; `compile/index.ts` checks
+  its `grantFor` result, including configured narrowing. A general role without an `edit` grant is rejected.
+  `test/unit/executor-create.test.ts` covers **five rejected routes and three valid routes**, retaining valid authored
+  routes verbatim.
+
+#### Scoped check evidence
+
+Actual parent/producer executions reported for these corrections, not a full-suite run or validation of all subsequent
+concurrent edits:
+
+| Check scope | Result | Duration |
+| --- | --- | --- |
+| `lease-registry-modules` + `v2-leases` | 78 passed | 7.24 s |
+| `executor-execution-slot` + `executor-integrate-bisect` | 186 passed | 23.77 s |
+| `executor-create` + `executor-compile` filters | 13 files, 650 passed | 6.05 s |
+| Last reported producer typecheck | Exit 0 | 4.2 s |
+
+No tests were run for this documentation-only update. These scoped results do not establish smoke or phase acceptance.
+
+#### Run 9 and remaining gates
+
+- **Run 9 completed: 6 failed, 10 passed, 9 skipped; 540.07 s.** The diagnostic-only instrumentation did not yield a
+  green smoke result; **6.1.3 remains unfinished**.
+- In **`criticali-315`**, task **`1.1.4`** in **slot 4** reported `rebase --abort` exit **128**. The original stderr was
+  lost, so the initiating failure is not established. The source error-masking fix is **underway and not yet validated**;
+  it is separate from the three QA corrections above. **No new smoke run** has followed Run 9.
+- Rebase/error-masking remediation and its checks, commits for the corrections, fresh smoke evidence, and **heavy
+  product-correction QA round 2** remain pending; no QA pass is claimed.
+- Detached **6.1.4's three green runs at the committed integration head**, **6.1.5 documentation**, and **final heavy
+  phase QA** remain pending. **G13 remains unmet**; the Phase 6.2 PR disclosure and deferred full-suite obligations are
+  unchanged. **Phase 6.1 is not complete or accepted.**
+
+#### Rebase diagnostic follow-up — 2026-10-14
+
+This supersedes the earlier rebase-fix status: **implementation is complete**, with scoped validation below.
+
+- `src/executor/git.ts` checks rebase state before aborting and preserves the initiating failure alongside any cleanup
+  error. `src/executor/integrate/queue.ts` persists bounded diagnostic details with URL credentials redacted.
+- **Parent shell, unit checks:** `executor-git` + `executor-integrate-queue`: **493 tests passed across 2 files;
+  45.83 s**.
+- **Parent shell, real Git checks:** the targeted invalid-upstream and conflict-cleanup cases in
+  `test/integration/executor-integrate-git.test.ts`: **2 passed, 33 filtered; 8.77 s**.
+- The first combined **three-file invocation hit an external 200 s timeout without final results**. This is neither a
+  test-pass nor a test-failure result. A separate run of the **whole affected real-Git integration file (35 tests)** is
+  running in the background; **no result is available yet**.
+- **Run 9's initiating cause remains unknown** because its original stderr was lost. The invalid-upstream regression
+  case does not establish the cause of the `criticali-315` failure.
+- Broader rebase validation, fresh smoke evidence and **heavy product-correction QA round 2** remain pending. No new
+  smoke or QA pass is claimed; the other phase gates, G13 disclosure and deferred full-suite obligations above remain
+  unchanged. **Phase 6.1 is still not complete or accepted.**
+
+#### Completed rebase validation — 2026-10-14
+
+- **Parent shell, completed real-Git integration file:** `test/integration/executor-integrate-git.test.ts`:
+  **35 tests passed; 229.63 s**. The completed output in `.cpx-logs/qa-rebase-integration.log` belongs to the parent's
+  background shell run, not this documentation-only edit.
+- **Parent direct `npm run typecheck`: completed clean.**
+- Together with the scoped unit results above, this completes **targeted rebase code validation**, superseding the
+  earlier running/pending-validation snapshot. No repository-wide full-suite result is claimed.
+- **Commits for the corrections, fresh smoke evidence and heavy product-correction QA round 2 remain pending.**
+  Run 9's initiating cause remains unknown; the other phase gates, G13 disclosure and deferred full-suite obligations
+  are unchanged. **Phase 6.1 is still not complete or accepted.**
