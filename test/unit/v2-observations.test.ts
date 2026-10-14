@@ -250,11 +250,11 @@ describe("v2 setup owns the observation sink for its entire lifetime", () => {
     const first = dispose(), second = dispose();
     const settled = Promise.allSettled([first, second]);
     try {
+      expect(cleanup).toHaveBeenCalledTimes(1); // Start cleanup on the disposal stack, before queued events can run.
       await Promise.resolve(); await Promise.resolve();
       expect(closeSync).not.toHaveBeenCalled();
       expect(lines().some((line) => JSON.parse(line).kind === "end")).toBe(false);
       expect(second).toBe(first);
-      expect(cleanup).toHaveBeenCalledTimes(1);
       release();
       const results = await settled;
       expect(results).toEqual(reject ? [

@@ -94,7 +94,8 @@ export default {
       const dispose = await registration;
       let disposal: Promise<void> | undefined;
       // Later cleanup calls can finish before the first drain: every caller must share its seal barrier.
-      return () => disposal ??= Promise.resolve().then(dispose).finally(() => observations.close());
+      // Start cleanup synchronously; the async wrapper converts synchronous throws to rejections.
+      return () => disposal ??= (async () => { await dispose(); })().finally(() => observations.close());
     } catch (error) { observations?.close(); throw error; }
   },
 } satisfies Plugin.Plugin & { server: typeof ModelRouterPlugin };
