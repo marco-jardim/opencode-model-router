@@ -1,0 +1,21 @@
+{
+  "v": 1,
+  "kind": "entry",
+  "handle": "vrf_000000000000000000000001",
+  "parent": "parent",
+  "child": "child-1",
+  "callID": "call-1",
+  "producer": "child-1",
+  "tier": "medium",
+  "dod": null,
+  "changedFiles": [],
+  "changedFilesDropped": 0,
+  "reference": null,
+  "risk": { "level": "low", "reasons": [] },
+  "description": "synthetic delegation",
+  "root": null,
+  "cwd": "/synthetic",
+  "state": "unverified",
+  "createdAt": 1791795600000,
+  "dispatchedAt": 1791795600000
+}
