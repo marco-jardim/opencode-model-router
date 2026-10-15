@@ -373,6 +373,42 @@ describe("authorityFloor — §2.3 matrix", () => {
 // Property tests — grants (I4 and "never outside the role max")
 // ---------------------------------------------------------------------------
 
+describe("authorityFloor — gated matrix", () => {
+  for (const d of DETECTIONS) for (const r of RISKS) for (const s of SCOPES) {
+    it(`gated d=${d} risk=${r} scope=${s} changes only write+exec+grader below high risk`, () => {
+      for (const [, actions] of READ_ROWS) {
+        expect(authorityFloor(grantOf(...actions), d, r, s, { mode: "gated", gateAtReturn: true })).toBe("fast");
+      }
+      for (const [, actions] of WRITE_ROWS) {
+        expect(authorityFloor(grantOf(...actions), d, r, s, { mode: "gated", gateAtReturn: true })).toBe(WRITE_ROW[d][r][s]);
+      }
+      for (const [, actions] of WRITE_EXEC_ROWS) {
+        const g = grantOf(...actions);
+        const want = d === "grader" && r !== "high" ? "medium" : WRITE_EXEC_ROW[d];
+        expect(authorityFloor(g, d, r, s, { mode: "gated", gateAtReturn: true })).toBe(want);
+        expect(authorityFloor(g, d, r, s, { mode: "gated", gateAtReturn: false })).toBe(WRITE_EXEC_ROW[d]);
+      }
+    });
+  }
+
+  it("gated never lowers strict outside the one cell, including arbitrary grants and no return gate", () => {
+    const r = rng(0xf1007);
+    const rank = (tier: string) => ["fast", "medium", "heavy"].indexOf(tier);
+    for (let i = 0; i < 4000; i++) {
+      const g = grantOf(...subset(r, ALL));
+      const d = pick(r, [...DETECTIONS, "unknown" as Detection]);
+      const risk = pick(r, RISKS);
+      const scope = pick(r, SCOPES);
+      const gateAtReturn = r() < 0.5;
+      const strict = authorityFloor(g, d, risk, scope);
+      const gated = authorityFloor(g, d, risk, scope, { mode: "gated", gateAtReturn });
+      const cell = g.actions.has("edit") && g.actions.has("router_run") && d === "grader" && risk !== "high" && gateAtReturn;
+      if (cell) expect([strict, gated]).toEqual(["heavy", "medium"]);
+      else expect(rank(gated)).toBeGreaterThanOrEqual(rank(strict));
+    }
+  });
+});
+
 describe("grantFor — properties", () => {
   const KINDS: readonly RoleKind[] = ["explore", "research", "run", "implement", "review", "design", "general"];
 
@@ -430,6 +466,38 @@ function opts(o: Partial<BoundsOptions> = {}): BoundsOptions {
 }
 
 describe("tierBounds — window", () => {
+  it("strict reasons stay byte-identical, and gated:authority appears only when the authority floor is lowered", () => {
+    for (const [, actions] of [...READ_ROWS, ...WRITE_ROWS, ...WRITE_EXEC_ROWS]) {
+      const g = grantOf(...actions);
+      for (const d of DETECTIONS) for (const risk of RISKS) for (const scope of SCOPES) {
+        const f = facts([], risk, scope);
+        const base = opts({ pinTier: "fast" });
+        const strict = tierBounds(ROLES.implementer, g, f, d, base);
+        expect(tierBounds(ROLES.implementer, g, f, d, { ...base, floorPolicy: { mode: "strict", gateAtReturn: true } })).toEqual(strict);
+        expect(tierBounds(ROLES.implementer, g, f, d, { ...base, floorPolicy: { mode: "gated", gateAtReturn: false } })).toEqual(strict);
+        const gated = tierBounds(ROLES.implementer, g, f, d, { ...base, floorPolicy: { mode: "gated", gateAtReturn: true } });
+        const cell = actions.includes("edit") && actions.includes("router_run") && d === "grader" && risk !== "high";
+        if (cell) expect(gated).toEqual({ floor: "medium", ceiling: "heavy", pinned: "medium", reasons: ["gated:authority", "floor:authority", "lift:authority"] });
+        else expect(gated).toEqual(strict);
+      }
+    }
+    expect(tierBounds(ROLES.implementer, grantOf("edit", "router_run"), facts([], "medium"), "grader", opts())).toEqual({
+      floor: "heavy", ceiling: "heavy", pinned: null, reasons: ["floor:authority"],
+    });
+  });
+
+  it("gated uses effective raise-only risk and still honors configured and running floors", () => {
+    const g = grantOf("edit", "router_run");
+    const base = opts({ floorPolicy: { mode: "gated", gateAtReturn: true } });
+    for (const source of ["classifier", "routeLine"] as const) {
+      const b = tierBounds(ROLES.implementer, g, facts([], "low"), "grader", { ...base, [source]: { risk: "high", scope: "single" } });
+      expect(b).toMatchObject({ floor: "heavy", reasons: ["floor:authority"] });
+    }
+    for (const source of ["floorTier", "runningTier"] as const) {
+      expect(tierBounds(ROLES.implementer, g, facts(), "grader", { ...base, [source]: "heavy" }).floor).toBe("heavy");
+    }
+  });
+
   it("a read-only grant keeps the role range", () => {
     expect(tierBounds(ROLES.implementer, grantOf(...LOCAL), facts(), "none", opts())).toEqual({
       floor: "fast",

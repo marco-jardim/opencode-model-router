@@ -1269,6 +1269,7 @@ describe("docs drift: roles delegation keys (#84)", () => {
     "roleAgents.<name>.tierRange", "roleAgents.<name>.budget", "roleAgents.<name>.deny", "routing.exploration.rate",
     "routing.exploration.requireDetection", "routing.run.scripts", "routing.run.commands", "routing.run.timeoutMs", "routing.workRoots",
     "routing.repoParents", "routing.repoDepth", "routing.repoExclude", "routing.repoApprovalDays",
+    "routing.roleFloor",
   ];
 
   it("documents every key, and a missing one is detected", () => {
@@ -1280,6 +1281,9 @@ describe("docs drift: roles delegation keys (#84)", () => {
   it("the Default column is what resolveRolesRouting applies", () => {
     const cell = (key: string) => keyRow(doc, key)?.[2];
     expect(cell("routing.delegation")).toBe(defaultCell(defaults.delegation));
+    expect(cell("routing.roleFloor")).toBe(defaultCell(defaults.roleFloor));
+    expect(defaults.roleFloor).toBe("strict");
+    expect(keyRow(doc, "routing.roleFloor")?.[4]).toBe("global only (stripped from the project layer)");
     expect(cell("routing.exploration.rate")).toBe(defaultCell(defaults.exploration.rate));
     expect(cell("routing.exploration.requireDetection")).toBe(defaultCell(defaults.exploration.requireDetection));
     expect(cell("routing.run.timeoutMs")).toBe(defaultCell(defaults.run.timeoutMs));
@@ -1299,6 +1303,7 @@ describe("docs drift: roles delegation keys (#84)", () => {
     const block = /<!-- roles-defaults: v2 -->\s*```jsonc\r?\n([\s\S]*?)```/.exec(doc);
     expect(block).not.toBeNull();
     const documented = parseJsonc(block![1]!) as Record<string, unknown>;
+    expect(documented.roleFloor).toBe("strict");
     const { inert: _inert, ...code } = defaults;
     expect(documented).toEqual(JSON.parse(JSON.stringify(code)));
   });
@@ -1500,6 +1505,16 @@ function floorTableProblems(doc: string, floor: typeof authorityFloor): string[]
   return problems;
 }
 
+/** Reuse every strict-table pin for the separately marked gated table, with a live return gate. */
+function gatedFloorTableProblems(doc: string, floor: typeof authorityFloor = authorityFloor): string[] {
+  const marker = "<!-- authority-floor-gated-table -->";
+  const at = doc.indexOf(marker);
+  if (at < 0) return ["no gated floor table"];
+  const table = doc.slice(at).replace(marker, "<!-- authority-floor-table -->");
+  return floorTableProblems(table, (grant, detection, risk, scope) =>
+    floor(grant, detection, risk, scope, { mode: "gated", gateAtReturn: true }));
+}
+
 describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () => {
   const guide = read("docs/ROLES.md");
   const flat = guide.replace(/\r?\n>\s?/g, " ").replace(/\s+/g, " ");
@@ -1532,6 +1547,45 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
 
   it("the floor table of ROLES.md is authorityFloor for every grant, detection, risk and scope", () => {
     expect(floorTableProblems(guide, authorityFloor)).toEqual([]);
+  });
+
+  it("the gated floor table is authorityFloor with a return gate for every grant, detection, risk and scope", () => {
+    expect(gatedFloorTableProblems(guide)).toEqual([]);
+    expect(flat).toContain('`routing.roleFloor: "strict"`, the default');
+    expect(flat).toContain('`routing.roleFloor: "gated"`, opt-in, global only, OpenCode v2 only');
+    expect(flat).toContain("Otherwise the strict table applies.");
+    expect(flat).toContain("Deferred `testsPass` does not qualify.");
+    expect(flat).toContain("`raise:verification-fail:heavy`");
+  });
+
+  it("detects gated table cell and code mutations without weakening the strict-table pins", () => {
+    const cell = "| write + exec | `medium` | `medium`; `heavy` if risk `high` | `heavy` |";
+    const changed = guide.replace(cell, "| write + exec | `medium` | `heavy` | `heavy` |");
+    expect(changed).not.toBe(guide);
+    const problems = gatedFloorTableProblems(changed);
+    expect(problems.length).toBeGreaterThan(0);
+    expect(problems.every((problem) => /^write \+ exec \/ grader \/ (low|medium) \//.test(problem))).toBe(true);
+    expect(floorTableProblems(changed, authorityFloor)).toEqual([]);
+    const strictMutant: typeof authorityFloor = (grant, detection, risk, scope) => authorityFloor(grant, detection, risk, scope);
+    expect(gatedFloorTableProblems(guide, strictMutant)).toEqual(problems.map((problem) => problem.replace("doc heavy, code medium", "doc medium, code heavy")));
+    const noHighRiskGuard: typeof authorityFloor = (grant, detection, risk, scope, policy) =>
+      grant.actions.has("edit") && grant.actions.has("router_run") && detection === "grader"
+        ? "medium" : authorityFloor(grant, detection, risk, scope, policy);
+    const highRisk = gatedFloorTableProblems(guide, noHighRiskGuard);
+    expect(highRisk.length).toBeGreaterThan(0);
+    expect(highRisk.every((problem) => problem.startsWith("write + exec / grader / high /"))).toBe(true);
+    expect(gatedFloorTableProblems(guide.replace(cell, cell.replace("`medium`; `heavy` if risk `high`", "medium-ish"))))
+      .toEqual(["write + exec / grader: unreadable cell medium-ish"]);
+    expect(gatedFloorTableProblems("no table")).toEqual(["no gated floor table"]);
+  });
+
+  it("D4 records the opt-in cell and the FAIL-to-heavy safety net", () => {
+    const d4 = sectionOf(read("docs/adr/0006-role-tier-assurance-delegation.md"), "### D4 — The tier floor is authority × effective detection").replace(/\s+/g, " ");
+    for (const text of ['`routing.roleFloor: "strict" | "gated"` defaults to `strict`', "global-only", "inert on OpenCode v1",
+      "effective detection `grader`", "other than `high`", "verification actually runs at return (not deferred,",
+      "acceptance other than `none`", "`gated:authority`", "FAIL → heavy safety net", "`raise:verification-fail:heavy`"]) {
+      expect(d4, text).toContain(text);
+    }
   });
 
   it("detects a floor cell that differs from the code, a code change and an unreadable cell", () => {
@@ -1632,7 +1686,7 @@ describe("docs drift: roles mode guide, ADR 0006 and changelog (#84 P3.2)", () =
     expect(flat).toContain(denied);
     for (const key of ["routing.delegation", "roleAgents", "routing.exploration.rate", "routing.exploration.requireDetection", "routing.run.scripts",
       "routing.run.commands", "routing.run.timeoutMs", "routing.workRoots", "routing.repoParents", "routing.repoDepth",
-      "routing.repoExclude", "routing.repoApprovalDays"]) expect(guide, key).toContain(`\`${key}`);
+      "routing.repoExclude", "routing.repoApprovalDays", "routing.roleFloor"]) expect(guide, key).toContain(`\`${key}`);
   });
 
   it("cross-repo Phase 4: quotes the /router approve help lines, the refusal note and the reload/restart lines the code emits", async () => {

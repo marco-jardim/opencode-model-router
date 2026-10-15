@@ -591,6 +591,7 @@ The window of a role dispatch is `[floor, ceiling]`:
 - a route-line `tier=` pin is honoured inside the window; below the floor it is lifted (reason `lift:authority` or
   `lift:floor`), above the ceiling it is clamped (`clamp:ceiling`).
 
+**Strict floor (`routing.roleFloor: "strict"`, the default).**
 `authorityFloor(grant, detection, risk, scope)` — the effective detection decides the column:
 
 <!-- authority-floor-table -->
@@ -604,6 +605,26 @@ Write authority goes to the cheapest tier only behind checks the router runs its
 edit + execution never runs on `fast`: an edit can change what a script does, so write + exec is treated like running
 code the agent wrote. After a verification FAIL the router raises the child's floor for its next resume itself; the
 orchestrator never sets `tier=` or `model` for that.
+
+**Gated floor (`routing.roleFloor: "gated"`, opt-in, global only, OpenCode v2 only).**
+This table applies only when verification actually runs **at return**: enforcement is on, not bypassed,
+`verify.require` is not `never`, the verification placement is allowed, verification is not deferred, and the
+effective acceptance is not `none`. Otherwise the strict table applies. Effective detection and risk are unchanged;
+in particular, a criteria-only acceptance needs a route-line `d=grader` claim to count as `grader`.
+
+<!-- authority-floor-gated-table -->
+| Grant contains | `deterministic` | `grader` | `none` |
+|---|---|---|---|
+| no write (local, egress or exec only) | `fast` | `fast` | `fast` |
+| write without exec | `fast` if risk `low` and scope `single`, else `medium` | `medium` | `medium`; `heavy` if risk `high` |
+| write + exec | `medium` | `medium`; `heavy` if risk `high` | `heavy` |
+
+Exactly one cell changes: write + exec with effective `grader` detection and risk below `high` has authority floor
+`medium` instead of `heavy` (bounds reason `gated:authority`). All other floors, including role ranges, configured
+floors and running tiers, still apply. Deferred `testsPass` does not qualify. The safety net is unchanged: a
+verification **FAIL** raises a child that ran on `medium` to `heavy` on its next resume (`raise:verification-fail:heavy`).
+Tier-agent and delegate (non-role) paths stay strict. On OpenCode v1 the key is inert and uses the existing single
+“roles delegation requires OpenCode v2; using tiers” notice.
 
 ## Dynamic authority and the ladder
 

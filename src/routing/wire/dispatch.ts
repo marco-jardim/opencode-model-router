@@ -2132,14 +2132,15 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     const env = deps.env === undefined ? {} : { env: deps.env };
     const verifyRoot = verifyRootOf(grant, sessionDirectory, workRootDeps.realpath);
     const inReadSet = readSetFor(rp.cfg, call.sessionID);
+    // QA-P21-1-2, QA-P21-2 nit 3. QA-G-B-2-1: a carried acceptance is never deferred (its gate runs at the return); its change-set
+    // checks (testsPass, lintClean) can cover the child's earlier attempts only once the attempt that introduced the block was
+    // gated with a known change set (its baseline) — until then the gate cannot back `deterministic`.
+    const deferred = carried === null
+      ? roleGateDeferred(rp.cfg, verifyPrompt, description, { verifyEnabled: deps.routerVerifyEnabled?.() !== false })
+      : (carried.baseline === undefined || carried.baseline.changed === "unavailable") && carriedChecksChangeSet(carried.block);
     const routerGate = roleRouterGate({
       cfg: rp.cfg, bypassed, acceptance, ...env,
-      // QA-P21-1-2, QA-P21-2 nit 3. QA-G-B-2-1: a carried acceptance is never deferred (its gate runs at the return); its change-set
-      // checks (testsPass, lintClean) can cover the child's earlier attempts only once the attempt that introduced the block was
-      // gated with a known change set (its baseline) — until then the gate cannot back `deterministic`.
-      deferred: carried === null
-        ? roleGateDeferred(rp.cfg, verifyPrompt, description, { verifyEnabled: deps.routerVerifyEnabled?.() !== false })
-        : (carried.baseline === undefined || carried.baseline.changed === "unavailable") && carriedChecksChangeSet(carried.block),
+      deferred,
       outsideWorkRoot: roleGateOutsideWorkRoot(grant.workRoot, verifyPrompt, description, args.cwd, inReadSet), // DF2-F1, QA-P33F1-1-1, nit 3
     });
     // QA-G-B-7: the gate verifies nothing at all (enforcement off, /bypass, `require: never`, a cwd outside the root it verifies in)
@@ -2148,6 +2149,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       cfg: rp.cfg, bypassed, ...env, outsideWorkRoot: roleGateOutsideWorkRoot(verifyRoot, verifyPrompt, description, args.cwd, inReadSet),
     });
     const detection = effectiveDetection({ routerGate, claim, acceptance, verifies });
+    const gateAtReturn = verifies && !deferred && acceptance !== "none";
 
     // 6. bounds on the one role tier order (handoff 9); a resume passes the child's running tier. QA-P21-2-2: the raise recorded
     // after a verification FAIL of this child (for this parent) is a raise-only floor, like `floorTier`; consumed on success.
@@ -2156,6 +2158,7 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
     const raised = resumeID === null ? null : pendingResumeRaise(resumeID, call.sessionID);
     const floorTier = higherTier(tiers, rp.cfg.enforcement?.escalate?.floorTier ?? null, raised);
     const bounds = tierBounds(rp.spec, grant, classified, detection, {
+      floorPolicy: { mode: resolveRolesRouting(rp.cfg, "v2").roleFloor, gateAtReturn },
       floorTier,
       runningTier: running?.tier ?? null,
       pinTier: routeLine?.tier ?? null,

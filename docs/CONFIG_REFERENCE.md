@@ -1105,6 +1105,7 @@ The seven shipped role agents (`explorer`, `researcher`, `runner`, `implementer`
 | Key | Type | Default | Values / range | Layers |
 |---|---|---|---|---|
 | `routing.delegation` | `string` | `"tiers"` | `tiers \| roles` | tiers.json, global, project |
+| `routing.roleFloor` | `string` | `"strict"` | `strict \| gated`; invalid values become `strict` with a notice (OpenCode v2 roles mode only; inert on v1) | global only (stripped from the project layer) |
 | `roleAgents` | `Record<string, object>` | `{}` | keys are shipped role names; unknown names are noticed and ignored | tiers.json, global (stripped from the project layer) |
 | `roleAgents.<name>.enabled` | `boolean` | `true` | `false` removes the role; `true` cannot revive a role that is disabled by default | as `roleAgents` |
 | `roleAgents.<name>.description` | `string` | shipped text | non-empty, at most 1000 characters | as `roleAgents` |
@@ -1129,12 +1130,20 @@ The seven shipped role agents (`explorer`, `researcher`, `runner`, `implementer`
 
 **Repository approvals store (`routing.repoApprovalDays`).** A repository outside `routing.repoParents` is approved by a human with `/router approve <path>` (OpenCode v2, roles mode, `routing.repoParents` non-empty; the flow, the checks and the limits are in [`ROLES.md`](./ROLES.md#repositories-outside-routingrepoparents)). Approvals are not a config key: only `/router approve` and `/router revoke` add or remove them (a binding through an approval only moves its `lastUsedAt`, at most once per hour), in `opencode-model-router.repo-approvals.json` next to the router state file (`~/.config/opencode/opencode-model-router.repo-approvals.json`). Format: `{ "version": 1, "approvals": [{ "path", "commonDir", "roots", "origin", "approvedAt", "lastUsedAt" }] }`, where `path` is the canonical path of the main worktree, `commonDir` its git common directory, `roots` its sorted root commits (hex SHAs), `origin` the origin URL without credentials (`none` when there is none), and the times are epoch milliseconds. At most 32 entries and 256 KiB. A file that is not valid as a whole (JSON, version, size, entry count) gives no approvals (fail closed) and one notice; an invalid entry is dropped when read. An approval expires `routing.repoApprovalDays` days after `lastUsedAt`, and 90 days after `approvedAt` at the latest. Writes go through a temporary file and a rename.
 
+**`routing.roleFloor`.** The default `strict` keeps every existing authority floor. Opt-in `gated` lowers only write + exec
+with effective `grader` detection and risk other than `high` from `heavy` to `medium`, and only when the router verifies
+at return (not deferred, acceptance other than `none`). Every other cell stays strict, and other floor sources still
+apply. A verification FAIL raises the resumed child from `medium` to `heavy`. See the two [floor tables](./ROLES.md#tier-floor).
+A project cannot choose its own policy: this key is stripped from the project layer. On v1 it is inert; setting it
+also triggers only the existing once-per-process `roles delegation requires OpenCode v2; using tiers` notice.
+
 Fully resolved defaults (parsed by a test and compared with `resolveRolesRouting`):
 
 <!-- roles-defaults: v2 -->
 ```jsonc
 {
   "delegation": "tiers",
+  "roleFloor": "strict",
   "exploration": { "rate": 0, "requireDetection": "deterministic" },
   "run": {
     "scripts": ["test", "typecheck", "lint", "build"],

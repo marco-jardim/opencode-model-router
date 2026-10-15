@@ -38,7 +38,7 @@ import {
   AUTHORITY_TEXT, markAnnotated, previewAuthority, requestAuthority, requestedAuthority, resetAuthorityForTests,
 } from "../../src/routing/roles/authority";
 import {
-  resetDispatchRouting, roleGateDeferred, roleGateOutsideWorkRoot, roleRouterGate, routedRoleOf, strippedRouteRoot,
+  pendingResumeRaise, resetDispatchRouting, roleGateDeferred, roleGateOutsideWorkRoot, roleRouterGate, routedRoleOf, strippedRouteRoot,
 } from "../../src/routing/wire/dispatch";
 import { canonicalAuthorityPath, requestedVerificationCwd, requestedVerificationCwdSource, verificationScope } from "../../src/routing/roles/work-root";
 import { runSignal } from "../../src/routing/outcomes/signals";
@@ -1674,6 +1674,51 @@ describe("QA round 1 (P2.1)", () => {
     expect(raised.tier).toBe("medium");
     expect(raised.notes).toContain("raise:verification-fail:medium");
     expect((await resume("f3")).notes.some((note) => note.startsWith("raise:"))).toBe(false); // consumed once
+  }, 60_000);
+
+  it("gated floor safety net: a real criteria gate FAIL records raise:verification-fail:heavy and the resume runs on heavy", async () => {
+    const { dir, cfg } = home({ routing: { delegation: "roles", engine: "enforce", roleFloor: "gated" } }, { MODEL_ROUTER_ENFORCE: "1" });
+    const runner = {
+      run: vi.fn(async () => ({ sessionID: "gated-grader", text: '{"pass":false,"reasons":["the change is not minimal"]}' })),
+      dispose: vi.fn(async () => {}),
+    };
+    const { hooks, ingest } = await plugin(dir, "v2", { routerChildRunner: runner });
+    const onVerdict = vi.spyOn(ingest!, "onVerdict");
+    const sessions: Record<string, Record<string, unknown>> = {};
+    const v2 = host(dir, cfg, sessions);
+    await v2.start(hooks);
+    const fresh = {
+      sessionID: "root", agent: "build", messageID: "m", id: "gated-fail", tool: "subagent",
+      input: {
+        agent: "implementer", description: "change x",
+        prompt: "[route class=implement risk=medium scope=single needs=shell,edit d=grader]\nVERIFY:required\nchange x\n[acceptance]\ncriteria: the change is minimal\n[/acceptance]",
+      } as Record<string, unknown>,
+    };
+    await v2.toolHooks["execute.before"](fresh);
+    const first = routedRoleOf(fresh.id)!;
+    expect(first).toMatchObject({ tier: "medium", detection: "grader", window: { floor: "medium" } });
+    sessions["gated-child"] = { id: "gated-child", parentID: "root", agent: "implementer", title: fresh.input.description, location: { directory: dir } };
+    await v2.toolHooks["execute.before"]({ sessionID: "gated-child", agent: "implementer", messageID: "m", id: "gated-read", tool: "read", input: { path: join(dir, "x.ts") } });
+    const finished = parentCall(fresh.id, "gated-child", "implementer", "DONE: updated x", fresh.input);
+    await v2.toolHooks["execute.after"](finished);
+    expect(runner.run).toHaveBeenCalledTimes(1);
+    expect(onVerdict).toHaveBeenCalledWith("gated-child", "fail", { tier: "heavy", model: getActiveTiers(cfg).heavy!.model });
+    expect(resultText(finished)).toContain("NOT ACCEPTED");
+    expect(resultText(finished)).toContain("the router raises it to heavy");
+    expect(pendingResumeRaise("gated-child", "root")).toBe("heavy");
+
+    const resume = {
+      sessionID: "root", agent: "build", messageID: "m", id: "gated-resume", tool: "subagent",
+      input: { agent: "implementer", sessionID: "gated-child", prompt: "address the findings" } as Record<string, unknown>,
+    };
+    await v2.toolHooks["execute.before"](resume);
+    const raised = routedRoleOf(resume.id)!;
+    expect(raised).toMatchObject({ tier: "heavy", window: { floor: "heavy" } });
+    expect(raised.notes).toContain("raise:verification-fail:heavy");
+    expect(raised.grant.actions.has("edit")).toBe(true);
+    expect(raised.grant.actions.has("router_run")).toBe(true);
+    expect(String(resume.input.model).split("#")[0]).toBe(resolveCandidates("heavy", cfg)[0]!.model);
+    expect(pendingResumeRaise("gated-child", "root")).toBeNull();
   }, 60_000);
 
   it("QA-P21-2-3: a role dispatch's own CAP:3 caps its child's reads (banners, CAP REACHED, budget note); no CAP, no cap", async () => {

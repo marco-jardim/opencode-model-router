@@ -358,6 +358,52 @@ describe("role dispatch path", () => {
     expect((await on.router.route(call(on, { agent: "implementer", prompt: criteria, cwd: on.outside }))).role!.detection).toBe("none");
   });
 
+  it("gated: criteria-only acceptance + d=grader + write and exec + medium risk dispatches medium and records gated:authority", async () => {
+    const world = makeWorld({ delegation: "roles", engine: "enforce", roleFloor: "gated" });
+    const prompt = "[route class=implement risk=medium scope=single needs=shell,edit d=grader]\nchange x\n[acceptance]\ncriteria: the change is minimal\n[/acceptance]";
+    const c = call(world, { agent: "implementer", prompt });
+    const outcome = await world.router.route(c);
+    expect(outcome.role).toMatchObject({ detection: "grader", tier: "medium", window: { floor: "medium" } });
+    expect(outcome.role!.grant.actions.has("edit")).toBe(true);
+    expect(outcome.role!.grant.actions.has("router_run")).toBe(true);
+    expect(outcome.model).toBe(tierRef(world.cfg, "medium"));
+    world.router.commit(c.callID, applied(c.args, outcome));
+    expect((await world.rows())[0]).toMatchObject({ tier: "medium", detection: { effective: "grader" }, boundsReasons: ["gated:authority", "floor:authority"] });
+  });
+
+  it.each([
+    { name: "deferred testsPass", directive: "VERIFY:deferred\n", checks: "check: testsPass\n", detection: "grader" },
+    { name: "high effective risk", risk: "high", detection: "grader" },
+    { name: "no d= claim", claim: "", detection: "none" },
+    { name: "enforcement off", enforcement: { mode: "off" }, detection: "none" },
+    { name: "strict default", mode: undefined, detection: "grader" },
+    { name: "explicit strict", mode: "strict", detection: "grader" },
+    { name: "no acceptance", acceptance: false, detection: "none" },
+    { name: "bypassed", bypassed: true, detection: "none" },
+    { name: "verification never", enforcement: { verify: { require: "never" } }, detection: "none" },
+    { name: "verification outside work root", outside: true, detection: "none" },
+  ])("gated exception is not used with $name: write and exec stays heavy", async (scenario) => {
+    const roleFloor = "mode" in scenario ? scenario.mode : "gated";
+    const world = makeWorld({ delegation: "roles", engine: "enforce", ...(roleFloor === undefined ? {} : { roleFloor }) }, {
+      extra: "enforcement" in scenario ? { enforcement: scenario.enforcement } : {},
+      bypassed: "bypassed" in scenario && scenario.bypassed,
+    });
+    const risk = "risk" in scenario ? scenario.risk : "medium";
+    const claim = "claim" in scenario ? scenario.claim : " d=grader";
+    const directive = "directive" in scenario ? scenario.directive : "";
+    const checks = "checks" in scenario ? scenario.checks : "";
+    const acceptance = "acceptance" in scenario && scenario.acceptance === false ? "" : `\n[acceptance]\n${checks}criteria: the change is minimal\n[/acceptance]`;
+    const prompt = `[route class=implement risk=${risk} scope=single needs=shell,edit${claim}]\n${directive}change x${acceptance}`;
+    const c = call(world, { agent: "implementer", prompt, ...("outside" in scenario ? { cwd: world.outside } : {}) });
+    const outcome = await world.router.route(c);
+    expect(outcome.role).toMatchObject({ tier: "heavy", detection: scenario.detection, window: { floor: "heavy" } });
+    expect(outcome.role!.grant.actions.has("edit")).toBe(true);
+    expect(outcome.role!.grant.actions.has("router_run")).toBe(true);
+    expect(outcome.model).toBe(tierRef(world.cfg, "heavy"));
+    world.router.commit(c.callID, applied(c.args, outcome));
+    expect((await world.rows())[0]!.boundsReasons).toEqual(["floor:authority"]);
+  });
+
   it("a delegate's dispatch is not parsed, but runs on the floor rung of the local-only window (QA-P21-1-1)", async () => {
     const world = makeWorld({ delegation: "roles", engine: "enforce" });
     world.session.parentID = "grand-parent";
