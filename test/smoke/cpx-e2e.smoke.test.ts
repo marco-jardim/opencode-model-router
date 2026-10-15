@@ -9,7 +9,7 @@ import { RoutingHost, ROOT, arr, obj, jsonl, redact, stopAllHosts, waitFor as wa
 import { CpxTimings, collectTimingJournal, timedWrapperSource, timingJournalSource, timingObserverSource, TIMING_DIRECTORY, type TimingRecord } from "./helpers/cpx-timing";
 import { assertG8IdleEpisodes, collectObservationFiles, G8_IDLE_CEILING_MS, reconstructIdleEpisodes, type IdleEpisode } from "./helpers/cpx-idle-oracle";
 import { freezeG8Plan, reconstructG8, workGraph, type GraphEdge, type PhaseGraph } from "./helpers/cpx-g8-oracle";
-import type { CpxRequest } from "./helpers/cpx-scripted-provider";
+import type { CpxReply, CpxRequest } from "./helpers/cpx-scripted-provider";
 import type { Attempt, ExecutorConfig, ExecutorEvent, LedgerV1 } from "../../src/executor/types";
 import { createLedgerStore, createNodeFileSystem } from "../../src/executor/ledger";
 import { detectManagers, planProvision } from "../../src/executor/slots/provision";
@@ -148,6 +148,19 @@ function checkpointRecovered(ledger: LedgerV1, taskId: string, interrupted: Atte
     attempts.some(attempt => attempt.n > interrupted.n && attempt.childSessionID !== null && attempt.childSessionID !== interrupted.childSessionID);
 }
 
+/** Only the current wake turn may refresh adopted context; old wake prose is never a polling instruction. */
+function recoveryWakeStatus(request: CpxRequest, root: string, planId: string, seen: Set<string>): { stateKey: string; reply: CpxReply } | undefined {
+  if (header(request, "x-proof-session") !== root || header(request, "x-proof-kind") !== "primary") return undefined;
+  const current = messages(request).filter(message => !tail(message)).at(-1);
+  if (current?.role !== "user") return undefined;
+  const text = typeof current.content === "string" ? current.content : arr(current.content).map(block => obj(block).type === "text" ? String(obj(block).text ?? "") : "").join("\n");
+  const wake = /\[plan ([^\]\s]+)\] stale-context \(([^)\r\n]+)\)\. Call router_plan action=status to see what needs you\./.exec(text);
+  if (!wake || wake[1] !== planId || seen.has(wake[2]!)) return undefined;
+  const stateKey = wake[2]!;
+  seen.add(stateKey);
+  return { stateKey, reply: { tool: "router_plan", input: { action: "status", planId } } };
+}
+
 function planRunningInTail(request: CpxRequest, planId: string): boolean {
   const text = messages(request).filter(tail).map(message => typeof message.content === "string" ? message.content : arr(message.content).map(block => String(obj(block).text ?? "")).join("\n")).join("\n");
   // runtime.planLine: `plan <id>: <done>/<total> done, <count> running, <count> ready`.
@@ -223,6 +236,18 @@ describe("CPX e2e assertion negative controls", () => {
     expect(checkpointRecovered(ledger([closed, replacement]), "checkpoint", interrupted)).toBe(true);
     expect(checkpointRecovered(ledger([{ ...closed, outcome: "interrupted" }, replacement]), "checkpoint", interrupted)).toBe(true);
     expect(checkpointRecovered(ledger([closed, replacement], "paused"), "checkpoint", interrupted)).toBe(false);
+  });
+  it("the bound root answers a current stale-context wake once, ignoring history and other sessions", () => {
+    const root = "root-fixture", planId = "p-fixture", stateKey = "stale-context:fixture";
+    const wake = { role: "user", content: [{ type: "text", text: `[plan ${planId}] stale-context (${stateKey}). Call router_plan action=status to see what needs you.` }] };
+    const request = (history: Obj[], session = root): CpxRequest => ({ index: 0, method: "POST", url: "/v1/messages",
+      headers: { "x-proof-session": session, "x-proof-kind": "primary" }, body: { messages: [...history, { role: "user", content: "<router-state>current state</router-state>" }] } });
+    const seen = new Set<string>();
+    expect(recoveryWakeStatus(request([wake], "other-root"), root, planId, seen), "another session cannot consume the wake").toBeUndefined();
+    expect(recoveryWakeStatus(request([wake, { role: "assistant", content: "Acknowledged" }, { role: "user", content: "Continue independently" }]), root, planId, seen), "historical wake prose is not the current turn").toBeUndefined();
+    expect(recoveryWakeStatus(request([wake]), root, planId, seen), "the first current wake yields one status call").toEqual({ stateKey, reply: { tool: "router_plan", input: { action: "status", planId } } });
+    expect(recoveryWakeStatus(request([wake]), root, planId, seen), "a second identical wake key yields no status call").toBeUndefined();
+    expect(recoveryWakeStatus(request([wake, { role: "assistant", content: [{ type: "tool_use", id: "status", name: "router_plan", input: { action: "status", planId } }] }, { role: "user", content: [{ type: "tool_result", tool_use_id: "status", content: "running" }] }]), root, planId, new Set()), "the tool-result continuation must not re-answer an older wake").toBeUndefined();
   });
   it("auxiliary requests cannot consume a plan child's scripted write", () => {
     const request: CpxRequest = { index: 0, method: "POST", url: "/v1/messages", headers: { "x-proof-kind": "primary" }, body: { messages: [{ role: "user", content: "[plan p-fixture:1.1.4#1] nonce=fixture" }] } };
@@ -789,6 +814,12 @@ async function drive(name: typeof plans[number], repository: typeof repositories
   let heldGraderRequest: CpxRequest | undefined;
   let releaseVerdict = false;
   let restarted = false;
+  let restartWakeFromIndex: number | undefined;
+  let recoveryStatusCallID: string | undefined;
+  const recoveryWakeKeys = new Set<string>();
+  const recoveryStatusTurns: { wakeRequestIndex: number; statusReplyRequestIndex: number; stateKey: string; sessionID: string; arrivedAt: number }[] = [];
+  const restartContext: Obj = { statusTurns: recoveryStatusTurns };
+  if (restart) observations.restartContext = restartContext;
   let g1Child: string | undefined;
   let g1Released = false;
   let g1Sample: { request: CpxRequest; ledger: LedgerV1; at: number } | undefined;
@@ -1010,6 +1041,16 @@ async function drive(name: typeof plans[number], repository: typeof repositories
         return; // RoutingProvider supplies the real PASS grader envelope.
       }
       if (header(request, "x-proof-kind") !== "primary") return; // Titles and other auxiliary generations are not scripted task turns.
+      if (restartWakeFromIndex !== undefined && request.index >= restartWakeFromIndex && planId && recoveryStatusTurns.length === 0) {
+        const wake = recoveryWakeStatus(request, root, planId, recoveryWakeKeys);
+        if (wake) {
+          recoveryStatusTurns.push({ wakeRequestIndex: request.index, statusReplyRequestIndex: request.index, stateKey: wake.stateKey, sessionID: root, arrivedAt: arrivals.get(request.index)! });
+          restartContext.wakeRequestIndex = request.index;
+          timing.mark("host.recovery.status-reply", { requestIndex: request.index, sessionID: root, stateKey: wake.stateKey });
+          front.replyNext(wake.reply, { when: candidate => candidate.index === request.index });
+          return;
+        }
+      }
       const identity = planIdentity(request);
       if (!identity) {
         const child = header(request, "x-proof-session");
@@ -1325,7 +1366,13 @@ async function drive(name: typeof plans[number], repository: typeof repositories
         expect(interrupted.childSessionID, "G9: checkpoint has an actual child before the crash").not.toBeNull();
         // Do not release the orphan's provider response until its original process has been killed.
         await collectDiagnostics(activeHost, "before-restart");
-        await timing.span("host.restart", () => activeHost.restart());
+        const restartHookIndex = (await activeHost.hooks()).length;
+        await timing.span("host.restart", () => {
+          // Arm at the crash boundary: the new host's wake may arrive before restart() finishes booting.
+          restartWakeFromIndex = front.requests.length;
+          restartContext.firstFreshRequestIndex = restartWakeFromIndex;
+          return activeHost.restart();
+        });
         restarted = true;
         const recovered = await timing.span("host.recovery-wait", () => waitFor("G9 automatic recovery reconciles the checkpoint and launches its replacement", async () => {
           const current = await store.read(immutableId);
@@ -1334,6 +1381,28 @@ async function drive(name: typeof plans[number], repository: typeof repositories
           return checkpointRecovered(current, checkpoint.task, interrupted) ? current : undefined;
         }, Math.min(HOST_SLACK_MS, Math.max(0, hostDeadlineAt - Date.now())), 50));
         observations.restartRecovery = recovered;
+        const closed = recovered.tasks[checkpoint.task]!.attempts.find(attempt => attempt.n === interrupted.n && attempt.childSessionID === interrupted.childSessionID)!;
+        const replacement = recovered.tasks[checkpoint.task]!.attempts.find(attempt => attempt.n > interrupted.n && attempt.childSessionID !== null && attempt.childSessionID !== interrupted.childSessionID)!;
+        const hooks = await activeHost.hooks();
+        const routerCalls = hooks.map((hook, index) => ({ hook, index })).filter(({ hook, index }) => index >= restartHookIndex && hook.hook === "before" && hook.sessionID === root && hook.tool.startsWith("router_"));
+        restartContext.orphanClosedAt = closed.endedAt;
+        restartContext.replacementAttemptStart = { taskId: checkpoint.task, n: replacement.n, childSessionID: replacement.childSessionID, startedAt: replacement.startedAt };
+        restartContext.routerCalls = routerCalls;
+        expect(recovered.orchestrator.sessionID, "G9: recovery remains bound to the scripted root").toBe(root);
+        expect(recoveryStatusTurns, "G9: exactly one fresh restart wake gets a status reply").toHaveLength(1);
+        expect(routerCalls, "G9: the bound root's first and only recovery router call refreshes context").toHaveLength(1);
+        const status = routerCalls[0]!;
+        const wake = recoveryStatusTurns[0]!;
+        restartContext.statusToolCallIndex = status.index; // Index in the host's complete before/after hook log, not provider history.
+        restartContext.statusToolCall = status.hook;
+        recoveryStatusCallID = status.hook.callID;
+        expect(front.requests[wake.wakeRequestIndex]?.served, "G9: the wake receives the scripted tool-use response").toBe("scripted");
+        expect(wake.sessionID, "G9: only the bound root answers the wake").toBe(root);
+        expect(status.hook.tool, "G9: wake response invokes router_plan").toBe("router_plan");
+        expect(status.hook.input, "G9: wake response only requests this plan's status").toEqual({ action: "status", planId: immutableId });
+        expect(Date.parse(closed.endedAt!), "G9 ordering: orphan closes before the fresh wake request").toBeLessThanOrEqual(wake.arrivedAt);
+        expect(wake.arrivedAt, "G9 ordering: fresh wake precedes its status tool call").toBeLessThanOrEqual(status.hook.__t);
+        expect(status.hook.__t, "G9 ordering: status refresh precedes replacement attempt start").toBeLessThanOrEqual(Date.parse(replacement.startedAt));
         const resume = () => command(activeHost, root, `resume ${immutableId}`, { action: "resume", planId: immutableId }, timing);
         await resumeObservedPlan(recovered.status, "startup-recovery", resume);
 
@@ -1487,7 +1556,10 @@ async function drive(name: typeof plans[number], repository: typeof repositories
     expect(rootRequests.length, "G4: actual consecutive orchestrator requests").toBeGreaterThan(1);
     rootRequests.forEach(assertCacheLayout);
     for (let index = 1; index < rootRequests.length; index++) assertPrefix(rootRequests[index - 1]!, rootRequests[index]!);
-    const polling = (await activeHost.hooks()).filter(hook => hook.hook === "before" && hook.sessionID === root && hook.tool === "router_plan" && ["status", "ready"].includes(String(hook.input?.action)));
+    const statusCalls = (await activeHost.hooks()).filter(hook => hook.hook === "before" && hook.sessionID === root && hook.tool === "router_plan" && ["status", "ready"].includes(String(hook.input?.action)));
+    expect(statusCalls.filter(hook => hook.callID === recoveryStatusCallID), "G9: exactly the required restart context refresh, absent on baseline").toHaveLength(restart ? 1 : 0);
+    // D14's one wake-driven context refresh is not polling; every other status/ready call still fails G10.
+    const polling = statusCalls.filter(hook => hook.callID !== recoveryStatusCallID);
     expect(polling, "G10: zero orchestrator polling turns").toHaveLength(0);
 
     // Re-run integration checks at EVERY published head, not just the final branch tip.
