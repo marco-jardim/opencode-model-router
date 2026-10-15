@@ -436,7 +436,7 @@ was not run for this change.
   - Pre-existing (not from these commits), recorded by the R2-1 design: an interrupted provisioning stage reruns while its install
     lock is already stale; reverify after a restart can overlap the dead server's verification tree; `resetSlotContents` swallows
     a failed reset.
-- **Open product design item (not fixed):** smoke 17 showed a recovery dependency cycle — a recovered task's reverify needs a
+- **Open product design item (resolved; see [Recovery dependency cycle fix and QA round (2026-10-15)](#recovery-dependency-cycle-fix-and-qa-round-2026-10-15)):** smoke 17 showed a recovery dependency cycle — a recovered task's reverify needs a
   grader, the grader needs a fresh orchestrator context, and the stale-context wake cannot be sent while recovery is in progress.
   It did not recur in runs 18-21 (no task was `verifying` at the kill). The grader-failure reason is now logged (`375a2d5`).
 
@@ -483,3 +483,52 @@ historical evidence. The plan's 6.1.3, 6.1.4 and amendment log record the decisi
 The detached check, documentation, soak and final QA are separate evidence obligations. No completed soak, analyzer
 result, fresh smoke result or phase acceptance is claimed by this amendment. No checks were run for this documentation
 update; docs-drift validation belongs to the orchestrator.
+
+## Recovery dependency cycle fix and QA round (2026-10-15)
+
+The smoke-17 recovery dependency cycle (recorded above as an open product design item) is fixed by a change on
+`cpx/p61` on top of `89b57f6`, together with the QA fixes below. Design:
+
+- Recovery no longer re-verifies, or completes a finished child, inside the global barrier. Each becomes per-task
+  `RecoveredWork` (task, attempt, nonce, state), registered in feed order; the task keeps its slot and leases while it waits.
+- Recovered work is admitted after the barrier through the launcher's context gate, once any current router-tool context
+  of the owning root exists. Until then the runtime requests a stale-context wake even with no ready producer, also on
+  a paused plan. Admission re-checks identity, context and leases under the task mutex and never spends a grader rerun.
+- Each attachment has an `AbortController`. `closePlan` (dispose or adopt) aborts it: that attachment's graders and
+  backoff are cut (verdict marked `cut`, never journaled, no attempt spent) and its pipelines are awaited before the
+  writer closes. The process-wide verifier is not disposed.
+
+Heavy QA verdict: **ship after major fixes**.
+
+| ID | Finding | Status | Fix and regression test, or reason for deferral |
+|---|---|---|---|
+| M1 (major) | A cut observation leaked into the next same-process attachment: `observe` bound the cached observation to the attachment signal, so a cut cached a failed observation that the next attachment's re-verify graded as a counted `unverifiable`. | fixed | The observation is no longer bound to the attachment; only `observe`'s wait is. `verify-plan-task.test.ts`: "M1: an attachment cut during observe caches no failed observation; the next attachment grades the real one without begin". |
+| m1 | The `closePlan` wait for attachment work is not bounded by `PLAN_TASK_ABORT_MS`; non-grader steps keep running. | deferred | Bounded in practice; no infinite wait with the production verifier. |
+| m2 | An in-flight grader dispatch is not in the graders snapshot; `accept()` is abandoned instead of drained. | deferred | Draining needs a redesign of the abort contract; the overlap is with dying check processes of the cut attachment, and the slot is cleaned before the next attachment's checks. Follow-up. |
+| m3 | `processEnd` diverted an end that no recovered work registered (closed attempt, or another work already registered) and skipped the end bookkeeping, so a forced capacity token leaked. | fixed | Only an open attempt's end carried by a registered `end` work is diverted; any other end takes the normal path (queued behind an active recovered pipeline without blocking the caller). `executor-runtime-recovery.test.ts`: "m3: an end that is not registered (its attempt already closed) is not diverted: its forced token is released and its binding evicted". |
+| m4 | A lease-held task deferred all recovered end processing; a failed child's end was never recorded while the leases stayed held. | fixed | The admission hold covers only commit/verify work (a valid-slot re-verify, a completed child's end). "m4: a lease-held task's recovered FAILED child end is recorded at once and releases its token". |
+| m5 | The re-bind map was the "adopted by recovery" marker; a failed `rebindChild` let the adopted child's end after the barrier run without a context (a counted `unverifiable`, the smoke-17 mode). | fixed | A dedicated `adoptedByRecovery` set, marked before the re-bind. "m5/m6: an adopted child's end after the barrier without a root context parks until admission (re-bind ok=false)". |
+| m6 | No coverage for `parkWithoutContext` or for an adopted child's end after the barrier without a context. | fixed (tests) | "m6: a recovered re-verification whose context expires during cleanForChecks re-parks (parkWithoutContext) and verifies once on the next context"; "m5/m6: … (re-bind ok=true)". |
+| m7 | No inbox item, counter or observation for parked recovered work. | deferred | Visibility, not correctness: the work is admitted on the owning root's next router call, and the plan line shows the launch block. Follow-up. |
+| m8 | No `## [Unreleased]` CHANGELOG entry for a user-visible recovery change. | fixed | Fixed entry added (recovery deadlock and adopt cut), with the Added entry for `soak:analyze`. |
+| nits | Stale comments: the `LaunchGate` wake rule (wakes also for unadmitted recovered work), the `PlanTaskVerdict` and verifier `dispose` docs (cuts also cover attachment cuts); log text now "cut by dispose or adopt"; a vacuous timer assertion in the D16 recovery test replaced by gate assertions that can fail; EXECUTOR.md wording ("any current router-tool context of the owning root") and the troubleshooting row (an owner whose session is gone runs `router_plan action=adopt`). | fixed | |
+| nits | The unreachable `requeue-lost` guard in `applyFeed`; a spurious wake for lease-held recovered work; a stranded attempt-2 expectation in the recovery test (QA reference `:1310`); stale `recoveredWork` entries after an abort. | deferred | Deferred for this round by the orchestrator; follow-up. |
+
+Orchestrator checks on the remediated tree: `npm run typecheck` exit 0; vitest on executor-runtime-coverage-b,
+executor-runtime-recovery, executor-runtime-slots, v2-client, verify-plan-task, executor-runtime, executor-recovery,
+verify-plan-task-observations and docs-drift: 9 files, 815 tests passed.
+
+Heavy QA round 2 (remediation only) verdict: **ship**. Every round-1 fix verified; no new critical or major finding. Per
+the project rule, round-2 minors and nits are deferred and recorded here:
+
+| ID | Finding | Status | Reason for deferral |
+|---|---|---|---|
+| N1 (minor) | A new attachment's `observe` returns a cached observation that is still running; the old `snapshotTree` `git status` can briefly hold `index.lock` while the new attachment commits or runs `cleanForChecks`, giving a rare counted `commit-failed`/`verify-fail`. Fix: await the cached observation (cut-aware) before returning. | deferred | Narrow timing window after an adopt; follow-up together with m2. |
+| N2 (minor, pre-existing) | A cut verification's `finally` drops the record and change-store ids, so the next attachment re-verifies through the fail-closed restart fallback (a counted `unverifiable` when the child committed itself or the perimeter would be planned). The M1 test re-calls `begin`, which the runtime never does. | deferred | Same behaviour as before this change; the CHANGELOG entry was narrowed so it does not claim otherwise. |
+| N3 (minor) | An admission identity mismatch drops a parked `end` without its bookkeeping (queue row 34 closing a running dependent while an adopted child's end is parked), leaking the forced capacity token for the rest of the attachment. | deferred | Bounded to one attachment; fix is to route `end` work through `processEndNow` unconditionally. |
+| N4 (nit) | The background queuing added in m3 is effectively reached only by two tests that await `onChildEnd` before resolving the native end. | deferred | Correct and exactly-once per QA; document or revert with the test change later. |
+| N5 (nit) | One unwrapped ~190-character line in `docs/EXECUTOR.md` (recovery paragraph). | deferred | Cosmetic. |
+| N6 (nit) | `registerRecoveredWork` keys by the latest attempt rather than the end's `n`; safe under the ledger rule that the open attempt is the latest. | deferred | Make explicit with `if (a.n !== n) return` in the follow-up. |
+
+The three consecutive green runs of 6.1.3 were earned at earlier heads; they must be re-earned at the new head that
+carries this change. No smoke result is claimed in this section.

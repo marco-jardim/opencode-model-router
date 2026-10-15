@@ -14,7 +14,7 @@ import { createCapacityController } from "../../src/executor/capacity";
 import { createScheduler } from "../../src/executor/schedule";
 import { defaultSlotsDir } from "../../src/executor/slots/pool";
 import { planDir } from "../../src/executor/paths";
-import { ExecutorError, isLedgerV1, ledgerViolations, reviewTaskId, type LedgerV1, type SlotPool, type IntegrationQueue } from "../../src/executor/types";
+import { ExecutorError, isLedgerV1, ledgerViolations, reviewTaskId, type LedgerV1, type SlotPool, type IntegrationQueue, type RetainedContextInfo } from "../../src/executor/types";
 import { buildDraft, holderOf, openAttempt, taskNode } from "../fixtures/cpx/ledger/builders";
 import { removeDirWhenReleased } from "../helpers/remove-dir";
 
@@ -106,6 +106,21 @@ async function rig(checkSlotsDir?: RuntimeDeps["checkSlotsDir"], realAnswers = f
     next = value;
     await runtime.compile({ path: value.planPath, sessionID: value.orchestrator.sessionID });
   } };
+}
+
+/** A fresh launch-context gate per simulated process; only a matching root capture admits recovered verification. */
+function rootRouterCapture(deps: RuntimeDeps): (runtime: ExecutorRuntimeHandle, sessionID: string) => void {
+  const bootID = deps.clock.randomHex(8);
+  let context: RetainedContextInfo | null = null;
+  deps.launcher.gate = (sessionID) => context?.sessionID === sessionID
+    ? { ok: true, context, ageMs: 0 }
+    : { ok: false, reason: "awaiting-first-router-call",
+      wake: { reason: "stale-context", stateKey: `await-router-call:${bootID}:${sessionID}` } };
+  return (runtime, sessionID) => {
+    context = { sessionID, callID: "call-root", messageID: "message-root", agent: "orchestrator",
+      capturedAt: deps.clock.iso(), bootID, epoch: 1 };
+    runtime.onRouterToolCall(sessionID);
+  };
 }
 
 async function queuedAnswerRig(kind: "breaker" | "qa-cap") {
@@ -263,12 +278,14 @@ describe("QA-5.1 runtime fixes", () => {
     // L2: only a plan recover() reports is reconciled; its report's feeds are the first activation's classification.
     const reports = [{ planId: "plan-a", actions: [feed] }] as unknown as Awaited<ReturnType<NonNullable<RuntimeDeps["recovery"]>["recover"]>>;
     h.deps.recovery = { recover: async () => reports, adopt: async () => {}, reconcile: async () => [feed] };
-    // start awaits the recovery, which awaits the hanging verify: only dispose can end it.
-    const starting = h.runtime.start();
+    // D16 recovery-barrier change: start registers the pipeline and returns; the matching root router call admits it.
+    const capture = rootRouterCapture(h.deps);
+    await h.runtime.start();
+    expect(hanging.verify).not.toHaveBeenCalled();
+    capture(h.runtime, value.orchestrator.sessionID);
     await started;
     const t0 = Date.now();
     await h.runtime.dispose();
-    await starting.catch(() => {});
     expect(Date.now() - t0).toBeLessThan(5_000);
     expect(hanging.verify).toHaveBeenCalledOnce();
     const after = await h.store.read("plan-a");
@@ -279,8 +296,11 @@ describe("QA-5.1 runtime fixes", () => {
     expect(recordAttempt).not.toHaveBeenCalled();
     // The next start re-verifies the task (R2) and its verdict is journaled then.
     const verify = vi.fn(async () => ({ verdict: "pass" as const, findings: "", ref: "proof" }));
+    const captureNext = rootRouterCapture(h.deps);
     const next = createExecutorRuntime({ ...h.deps, verifier: { verify } }); runtimes.push(next);
     await next.start();
+    expect(verify).not.toHaveBeenCalled();
+    captureNext(next, value.orchestrator.sessionID);
     await next.settled();
     expect(verify).toHaveBeenCalledOnce();
     const reverified = await h.store.read("plan-a");
@@ -313,10 +333,13 @@ describe("QA-5.1 runtime fixes", () => {
     const feed = { taskId: "T1", from: "verifying", action: "reverify", n: 1, slotValid: true, orphans: [], probation: null, context: null } as unknown as ReconcileFeed;
     const reports = [{ planId: "plan-a", actions: [feed] }] as unknown as Awaited<ReturnType<NonNullable<RuntimeDeps["recovery"]>["recover"]>>;
     h.deps.recovery = { recover: async () => reports, adopt: async () => {}, reconcile: async () => [feed] };
-    const starting = h.runtime.start();
+    // D16: admit the registered recovery pipeline before testing disposal of its already-decided verdict.
+    const capture = rootRouterCapture(h.deps);
+    await h.runtime.start();
+    expect(late.verify).not.toHaveBeenCalled();
+    capture(h.runtime, value.orchestrator.sessionID);
     await started;
     await h.runtime.dispose();
-    await starting.catch(() => {});
     expect(late.verify).toHaveBeenCalledOnce();
     const after = await h.store.read("plan-a");
     expect(after.tasks.T1?.attempts[0]?.verdict).toBe("pass");

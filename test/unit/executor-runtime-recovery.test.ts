@@ -7,10 +7,13 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { Plugin } from "@opencode/plugin";
+import type { ToolContext } from "@opencode/plugin/promise/tool";
+import { createV2Runtime } from "../../src/compat/v2-client.js";
 import { createCapacityController } from "../../src/executor/capacity.js";
 import { createLedgerStore } from "../../src/executor/ledger.js";
 import { taskBranchName } from "../../src/executor/git.js";
-import type { PlanBindInput, PlanRoleBindings } from "../../src/executor/launch.js";
+import { createTaskLauncher, type PlanBindInput, type PlanRoleBindings } from "../../src/executor/launch.js";
 import { createRecoveryService, type RecoveryDeps, type RecoveryEngine } from "../../src/executor/recovery.js";
 import {
   attemptTrailer,
@@ -575,7 +578,7 @@ class LauncherDouble implements TaskLauncher {
     private readonly log: CallLog,
     private readonly clock: Clock,
   ) {}
-  gate(): LaunchGate {
+  gate(_orchestratorSessionID: string): LaunchGate {
     return this.gateValue;
   }
   launch(req: LaunchRequest, hooks: LaunchHooks): LaunchHandle {
@@ -1065,6 +1068,470 @@ async function completedThenCrash(h: Harness): Promise<Attempt> {
 // ---------------------------------------------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------------------------------------------
+
+describe("short recovery barrier and context-admitted pipelines (D16)", () => {
+  async function parked(later = true, finished = false, paused = false) {
+    const draft = planOf([task("T1"), ...(later ? [task("T2")] : [])]);
+    draft.config.maxParallel = 2;
+    const h = await mk(draft);
+    h.deps.self = { pid: 100, hostname: "host-a", token: "before-kill" };
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    if (later) await h.running("T2", 1, "ses-c2");
+    if (finished) h.hosts.say("ses-c1",
+      { role: "assistant", text: "DONE: implemented", outcome: null },
+      { role: "idle", text: null, outcome: "success" });
+    else await h.parts().writer.append([
+      { type: "attempt-ended", taskId: "T1", n: 1, outcome: "succeeded", endedAt: h.clock.iso(), detail: null },
+      tr("T1", "running", "completed", "child-ended"),
+      // Row 21 includes the durable task branch as well as the transition to verifying.
+      { type: "task-slot", taskId: "T1", slot: h.task("T1").slot, branch: taskBranchName(PLAN_ID, "T1") },
+      tr("T1", "completed", "verifying", "committed"),
+    ]);
+    const original = h.task("T1").attempts[0]!;
+    const slot = h.task("T1").slot!;
+    if (paused) await h.runtime.pause(PLAN_ID, ORCH);
+    await h.crash();
+    const nativeEnd = deferred<void>();
+    const parents: string[] = [];
+    const native = vi.fn(async (_args: unknown, ctx: ToolContext) => {
+      parents.push(ctx.sessionID);
+      await ctx.progress({ sessionID: `grader-${parents.length}`, status: "running" });
+      await new Promise<void>((resolve, reject) => {
+        const abort = (): void => reject(new Error("attachment cut"));
+        ctx.signal.addEventListener("abort", abort, { once: true });
+        if (ctx.signal.aborted) abort();
+        void nativeEnd.promise.then(() => { ctx.signal.removeEventListener("abort", abort); resolve(); });
+      });
+      return { output: { sessionID: `grader-${parents.length}`, status: "completed", output: "pass" } };
+    });
+    const toolList = vi.fn(async () => [{ id: "subagent", execute: native }]);
+    const v2 = createV2Runtime({ location: { directory: REPO }, tool: { list: toolList }, session: {
+      interrupt: async () => ({ interrupted: true }), remove: async () => {},
+    } } as unknown as Plugin.Context);
+    const gateLauncher = createTaskLauncher({
+      runner: v2.childRunner, hosts: h.hosts, bindings: h.bindings, clock: h.clock,
+      bookkeeping: { decisionRow() {}, recordDispatchStart() {}, registerInFlight() {}, unregisterInFlight() {} },
+      lifetime: new AbortController().signal, knownAgent: () => true, onMetric() {},
+    });
+    vi.spyOn(h.launcher, "gate").mockImplementation((id) => gateLauncher.gate(id));
+    h.launcher.dispose = () => gateLauncher.dispose();
+    const created = vi.fn(async () => {});
+    const verifierStop = new AbortController();
+    const verify = vi.fn<RuntimeDeps["verifier"]["verify"]>(async (_t, _s, a, ctx) => {
+      const signal = AbortSignal.any([verifierStop.signal, ...(ctx?.signal === undefined ? [] : [ctx.signal])]);
+      try {
+        await v2.childRunner.run({ parentSessionID: ctx!.orchestratorSessionID, prompt: `grade original attempt ${a.n}/${a.nonce}`,
+          signal, onCreated: created });
+        return { verdict: "pass", findings: "", ref: "checker:heavy" };
+      } catch (error) {
+        if (signal.aborted) return { verdict: "unverifiable", findings: "cut", ref: "cut", cut: true };
+        throw error;
+      }
+    });
+    h.deps.verifier = { verify, dispose: async () => { verifierStop.abort(); nativeEnd.resolve(); } };
+    // The runtime captures deps by reference, just as the host's assembled verifier/launcher ports do.
+    const self = { pid: 200, hostname: "host-a", token: "after-kill" };
+    h.engine(REPO, { self, isAlive: () => false });
+    const timers = vi.spyOn(h.clock, "setTimer");
+    const synthetic = vi.spyOn(h.hosts, "synthetic");
+    await h.runtime.start(); // Must return without a root capture or a verdict.
+    await h.runtime.settled();
+    const capture = async (id = ORCH): Promise<void> => {
+      await v2.withToolContext({ sessionID: id, agent: "orchestrator", messageID: `message-${id}`, id: `call-${id}`,
+        signal: new AbortController().signal, progress: async () => {} } as unknown as ToolContext, async () => {
+        h.runtime.onRouterToolCall(id);
+      });
+    };
+    return { h, original, slot, nativeEnd, native, toolList, parents, verify, created, timers, synthetic, capture };
+  }
+
+  it.each([false, true])("reconciles later feeds and wakes once even with only pending verification (later=%s)", async (later) => {
+    const x = await parked(later), { h } = x;
+    expect(h.state("T1")).toBe("verifying");
+    if (later) {
+      expect(h.state("T2")).toBe("ready");
+      expect(h.task("T2").attempts[0]?.outcome).toBe("lost");
+      expect(h.task("T2").attempts[0]?.context).toBe("");
+    }
+    // A sent wake and a completed tick prove activation cleared recovering (no early-tick workaround).
+    expect(x.synthetic).toHaveBeenCalledTimes(1);
+    expect((await h.events()).filter((e) => e.type === "wake" && e.reason === "stale-context")).toHaveLength(1);
+    for (let i = 0; i < 3; i++) h.runtime.onLeaseReleased();
+    await h.runtime.settled();
+    await x.capture("different-root");
+    await h.runtime.settled();
+    expect(x.verify).not.toHaveBeenCalled();
+    expect(x.toolList).not.toHaveBeenCalled();
+    expect(x.created).not.toHaveBeenCalled();
+    // The other root's capture is live, yet it is not the owning root's context: admission stays closed for ORCH.
+    expect(h.launcher.gate("different-root").ok).toBe(true);
+    expect(h.launcher.gate(ORCH)).toMatchObject({ ok: false, reason: "awaiting-first-router-call" });
+    expect(x.synthetic).toHaveBeenCalledTimes(1);
+    expect(h.task("T1").slot).toBe(x.slot);
+    expect(h.slots.released).not.toContain(x.slot);
+    expect(h.parts().leases.holder("src/T1.ts")?.taskId).toBe("T1");
+    expect(h.parts().queue.queued()).toEqual([]);
+
+    await x.capture();
+    await until(() => x.native.mock.calls.length === 1, "the bound root admits recovered verification");
+    expect(x.verify.mock.calls[0]?.[2]).toMatchObject({ n: x.original.n, nonce: x.original.nonce });
+    expect(x.parents).toEqual([ORCH]);
+    if (later) {
+      const replacement = await h.running("T2", 2, "ses-replacement");
+      expect(h.state("T1")).toBe("verifying"); // verifier still held, but the independent replacement launched
+      replacement.end({ kind: "interrupted", childSessionID: "ses-replacement", reason: "dispose", endedAt: h.clock.iso() });
+    }
+    await x.capture();
+    await x.capture();
+    h.runtime.onLeaseReleased();
+    await h.runtime.onChildEnd("T1", 1, { kind: "completed", childSessionID: "ses-c1", text: "duplicate", endedAt: h.clock.iso() });
+    expect(x.verify).toHaveBeenCalledTimes(1);
+    expect(x.created).toHaveBeenCalledTimes(1);
+    expect(h.slots.released).not.toContain(x.slot);
+    x.nativeEnd.resolve();
+    await untilEnqueued(h, "T1");
+    await h.runtime.settled();
+    await x.capture();
+    await x.capture();
+    await h.runtime.settled();
+    expect((await h.events()).filter((e) => e.type === "attempt-verdict" && e.taskId === "T1")).toHaveLength(1);
+    expect(h.parts().policy.counted.filter((a) => a.taskId === "T1" && a.n === 1)).toHaveLength(1);
+    expect(x.verify).toHaveBeenCalledTimes(1);
+    expect(h.parts().queue.queued()).toEqual(["T1"]);
+    expect(h.slots.released).not.toContain(x.slot); // only integration may relinquish it
+    expect(h.launcher.runs.filter((r) => r.req.taskId === "T1")).toHaveLength(0);
+    expect(h.log.indexOf("queue.resume:1")).toBeLessThan(h.log.indexOf(`slots.cleanForChecks:${x.slot}`));
+  });
+
+  it("a recovered FINISHED child's completion pipeline also parks outside the barrier", async () => {
+    const x = await parked(true, true), { h } = x;
+    expect(h.state("T1")).toBe("running");
+    expect(h.state("T2")).toBe("ready");
+    expect(x.verify).not.toHaveBeenCalled();
+    await x.capture();
+    await until(() => x.verify.mock.calls.length === 1, "finished child's commit-and-verify admitted");
+    await h.running("T2", 2, "ses-replacement");
+    await h.runtime.onChildEnd("T1", 1, { kind: "completed", childSessionID: "ses-c1", text: "racing terminal", endedAt: h.clock.iso() });
+    x.nativeEnd.resolve();
+    await untilEnqueued(h, "T1");
+    expect(x.verify).toHaveBeenCalledTimes(1);
+    expect(endsOf(await h.events(), "T1")).toHaveLength(1);
+    expect(h.git.calls.filter((c) => c.args[0] === "commit")).toHaveLength(1);
+    expect(h.parts().queue.queued()).toEqual(["T1"]);
+  });
+
+  it("pending verification of a paused plan also requests its context wake", async () => {
+    const x = await parked(false, false, true), { h } = x;
+    expect(h.ledger().status).toBe("paused");
+    expect(x.synthetic).toHaveBeenCalledTimes(1);
+    expect(x.verify).not.toHaveBeenCalled();
+    await x.capture();
+    await until(() => x.native.mock.calls.length === 1, "paused plan's recovered verifier");
+    x.nativeEnd.resolve();
+    await untilEnqueued(h, "T1");
+    expect(h.ledger().status).toBe("paused");
+  });
+
+  it("registers in task-id order after integration resume, not independent pipeline completion order", async () => {
+    const h = await mk(planOf([task("T2"), task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.running("T2", 1, "ses-c2");
+    for (const id of ["T1", "T2"] as const) await h.parts().writer.append([
+      { type: "attempt-ended", taskId: id, n: 1, outcome: "succeeded", endedAt: h.clock.iso(), detail: null },
+      tr(id, "running", "completed", "child-ended"),
+      { type: "task-slot", taskId: id, slot: h.task(id).slot, branch: taskBranchName(PLAN_ID, id) },
+      tr(id, "completed", "verifying", "committed"),
+    ]);
+    await h.crash();
+    const first = deferred<Awaited<ReturnType<RuntimeDeps["verifier"]["verify"]>>>();
+    const second = deferred<Awaited<ReturnType<RuntimeDeps["verifier"]["verify"]>>>();
+    const order: string[] = [];
+    h.deps.verifier = {
+      verify: async (t) => { order.push(t.id); return t.id === "T1" ? first.promise : second.promise; },
+      dispose: async () => {
+        first.resolve({ verdict: "unverifiable", findings: "cut", ref: "cut", cut: true });
+        second.resolve({ verdict: "unverifiable", findings: "cut", ref: "cut", cut: true });
+      },
+    };
+    h.engine();
+    await h.runtime.start();
+    await until(() => order.length === 2, "both registered pipelines started without awaiting each other's verdict");
+    // D16 recovery amendment: task-id order applies to feed application/registration, never serial-await completion.
+    expect(order).toEqual(["T1", "T2"]);
+    expect(h.parts().queue.resumes).toBe(1);
+    expect(h.parts().queue.queued()).toEqual([]);
+    second.resolve({ verdict: "pass", findings: "", ref: "checker:heavy" });
+    await untilEnqueued(h, "T2");
+    expect(h.state("T1")).toBe("verifying");
+    expect(h.parts().queue.queued()).toEqual(["T2"]);
+    first.resolve({ verdict: "pass", findings: "", ref: "checker:heavy" });
+    await h.runtime.settled();
+    expect(h.parts().queue.queued()).toEqual(["T2", "T1"]);
+    expect(h.slots.released).toEqual([]);
+  });
+
+  it("a real terminal event during integration resume supersedes a stale lost feed without resetting its slot", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.crash();
+    h.hosts.activityValue = "inactive"; // classification says lost; the newer terminal event must win
+    h.engine();
+    h.launcher.gateValue = { ok: false, reason: "awaiting-first-router-call",
+      wake: { reason: "stale-context", stateKey: "await-router-call:restart:ses-0" } };
+    const integration = deferred<void>();
+    const collaborators = h.deps.collaborators;
+    let resuming = false;
+    h.deps.collaborators = (i) => {
+      const c = collaborators(i);
+      const resume = c.queue.resume.bind(c.queue);
+      c.queue.resume = async () => { resuming = true; await integration.promise; return resume(); };
+      return c;
+    };
+    const mark = h.git.calls.length;
+    const starting = h.runtime.start();
+    await until(() => resuming, "integration resume inside the recovery barrier");
+    await h.runtime.onChildEnd("T1", 1, { kind: "completed", childSessionID: "ses-c1", text: "DONE: implemented", endedAt: h.clock.iso() });
+    expect(h.verifier.calls).toEqual([]);
+    integration.resolve();
+    await starting;
+    await h.runtime.settled();
+    expect(h.state("T1")).toBe("running");
+    expect(h.git.verbsSince(mark)).not.toContain("reset --hard HEAD");
+    h.launcher.gateValue = OK_GATE;
+    h.runtime.onRouterToolCall(ORCH);
+    await untilEnqueued(h, "T1");
+    await h.runtime.settled();
+    expect(h.task("T1").attempts[0]).toMatchObject({ outcome: "succeeded", verdict: "pass" });
+    expect(h.verifier.calls).toEqual(["T1#1"]);
+    expect(h.launcher.runs).toEqual([]);
+  });
+
+  it("re-reads queued identity under the task mutex: a later attempt in the same state is not the queued attempt", async () => {
+    const x = await parked(false), { h } = x;
+    const replacementNonce = "f".repeat(32);
+    await h.parts().writer.append([
+      { type: "attempt-verdict", taskId: "T1", n: 1, verdict: "fail", ref: null },
+      tr("T1", "verifying", "failed", "verify-fail", "fail"),
+      tr("T1", "failed", "ready", "retry"),
+      { type: "attempt-started", taskId: "T1", attempt: { ...x.original, n: 2, nonce: replacementNonce, childSessionID: null,
+        endedAt: null, outcome: null, verdict: null } },
+      tr("T1", "ready", "dispatched", "launch"),
+      { type: "attempt-child", taskId: "T1", n: 2, childSessionID: "ses-new-attempt" },
+      tr("T1", "dispatched", "running", "child-created"),
+      { type: "attempt-ended", taskId: "T1", n: 2, outcome: "succeeded", endedAt: h.clock.iso(), detail: null },
+      tr("T1", "running", "completed", "child-ended"),
+      { type: "task-slot", taskId: "T1", slot: h.task("T1").slot, branch: taskBranchName(PLAN_ID, "T1") },
+      tr("T1", "completed", "verifying", "committed"),
+    ]);
+    await x.capture();
+    await h.runtime.settled();
+    expect(h.state("T1")).toBe("verifying");
+    expect(x.verify).not.toHaveBeenCalled();
+    expect(x.created).not.toHaveBeenCalled();
+    expect(h.task("T1").attempts[1]).toMatchObject({ n: 2, nonce: replacementNonce, verdict: null });
+    expect(h.parts().queue.queued()).toEqual([]);
+    expect(h.slots.released).not.toContain(x.slot);
+  });
+
+  it.each([false, true])("disposal discards pending work and cuts active work (active=%s)", async (active) => {
+    const x = await parked(false), { h } = x;
+    if (active) {
+      await x.capture();
+      await until(() => x.native.mock.calls.length === 1, "active recovered verifier");
+    }
+    await h.runtime.dispose();
+    await x.capture();
+    expect(x.verify).toHaveBeenCalledTimes(active ? 1 : 0);
+    if (active) expect(x.verify.mock.calls[0]?.[3]?.signal?.aborted).toBe(true);
+    expect(h.slots.released).not.toContain(x.slot);
+    expect((await h.events()).filter((e) => e.type === "attempt-verdict")).toHaveLength(0);
+    expect((await h.store.read(PLAN_ID)).tasks.T1?.state).toBe("verifying");
+  });
+
+  it.each([false, true])("adoption invalidates old pending/active work and uses the newly bound root (active=%s)", async (active) => {
+    const x = await parked(false), { h } = x;
+    if (active) {
+      await x.capture();
+      await until(() => x.native.mock.calls.length === 1, "old attachment's verifier");
+    }
+    const oldQueue = h.parts().queue;
+    await h.runtime.adopt(PLAN_ID, "new-root");
+    await h.runtime.settled();
+    if (active) expect(x.verify.mock.calls[0]?.[3]?.signal?.aborted).toBe(true);
+    await x.capture(ORCH);
+    await h.runtime.settled();
+    expect(x.verify).toHaveBeenCalledTimes(active ? 1 : 0);
+    expect(h.ledger().orchestrator.sessionID).toBe("new-root");
+    expect(oldQueue.queued()).toEqual([]);
+    expect((await h.events()).filter((e) => e.type === "attempt-verdict")).toHaveLength(0);
+    await x.capture("new-root");
+    await until(() => x.native.mock.calls.length === (active ? 2 : 1), "new root's recovered verifier");
+    x.nativeEnd.resolve();
+    await untilEnqueued(h, "T1");
+    await h.runtime.settled();
+    expect(x.parents).toEqual(active ? [ORCH, "new-root"] : ["new-root"]);
+    expect(h.parts().queue.queued()).toEqual(["T1"]);
+    expect(h.slots.released).not.toContain(x.slot);
+  });
+
+  const NO_CONTEXT: LaunchGate = { ok: false, reason: "no-context", wake: { reason: "stale-context", stateKey: `no-context:${GATE_CONTEXT.bootID}:${ORCH}:1` } };
+
+  /** Wraps the next attachment's capacity controller: the `task#attempt` of every token released, in order. */
+  function trackReleases(h: Harness): string[] {
+    const released: string[] = [];
+    const make = h.deps.capacity.bind(h.deps);
+    h.deps.capacity = (o) => {
+      const c = make(o);
+      const owners = new Map<string, string>();
+      return {
+        limit: (provider) => c.limit(provider),
+        canAcquire: (provider, heavy) => c.canAcquire(provider, heavy),
+        acquire: (provider, heavy, taskId, attempt, opts) => {
+          const token = c.acquire(provider, heavy, taskId, attempt, opts);
+          owners.set(token.id, `${taskId}#${attempt}`);
+          return token;
+        },
+        release: (token, result) => {
+          released.push(owners.get(token.id) ?? token.id);
+          c.release(token, result);
+        },
+        onSignal: (s) => c.onSignal(s),
+        shouldStopRetry: (i) => c.shouldStopRetry(i),
+        pausedUntil: (provider) => c.pausedUntil(provider),
+        snapshot: () => c.snapshot(),
+      };
+    };
+    return released;
+  }
+
+  it.each([true, false])(
+    "m5/m6: an adopted child's end after the barrier without a root context parks until admission (re-bind ok=%s)",
+    async (rebind) => {
+      const h = await mk(planOf([task("T1")]));
+      await h.begin();
+      await h.running("T1", 1, "ses-c1");
+      await h.crash();
+      if (!rebind) h.bindings.bind = (_i: PlanBindInput): void => { throw new Error("binding port down"); };
+      h.hosts.activityValue = "active";
+      h.engine();
+      await h.runtime.start();
+      await h.runtime.settled();
+      expect(h.state("T1")).toBe("running");
+      expect(h.bindings.binds.map((b) => b.childSessionID)).toEqual(rebind ? ["ses-c1"] : []);
+      expect(h.logs.some((l) => l.startsWith("warn: re-binding the adopted child of T1 failed"))).toBe(!rebind);
+      // The barrier is over; the owning root's context expires before the adopted child ends.
+      h.launcher.gateValue = NO_CONTEXT;
+      h.hosts.say("ses-c1", { role: "assistant", text: "DONE: implemented", outcome: null });
+      await h.runtime.onChildEnd("T1", 1, { kind: "completed", childSessionID: "ses-c1", text: "DONE: implemented", endedAt: h.clock.iso() });
+      await h.runtime.settled();
+      // Parked as recovered work: no commit, no verify, nothing journaled (a context-less verify would be counted).
+      expect(h.state("T1")).toBe("running");
+      expect(endsOf(await h.events(), "T1")).toHaveLength(0);
+      expect(h.verifier.calls).toEqual([]);
+      expect(h.git.calls.some((c) => c.args[0] === "commit")).toBe(false);
+      h.launcher.gateValue = OK_GATE;
+      h.runtime.onRouterToolCall(ORCH);
+      await untilEnqueued(h, "T1");
+      await h.runtime.settled();
+      expect(h.verifier.calls).toEqual(["T1#1"]);
+      expect(endsOf(await h.events(), "T1")).toHaveLength(1);
+      expect(h.git.calls.filter((c) => c.args[0] === "commit")).toHaveLength(1);
+      expect(h.bindings.evicted).toEqual(rebind ? ["ses-c1"] : []);
+    },
+  );
+
+  it("m3: an end that is not registered (its attempt already closed) is not diverted: its forced token is released and its binding evicted", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.crash();
+    const released = trackReleases(h);
+    h.hosts.activityValue = "active";
+    h.engine();
+    await h.runtime.start();
+    await h.runtime.settled();
+    expect(h.state("T1")).toBe("running");
+    expect(h.bindings.binds.map((b) => b.childSessionID)).toEqual(["ses-c1"]);
+    expect(released).not.toContain("T1#1"); // the adopted child's forced token is still held
+    h.launcher.gateValue = NO_CONTEXT;
+    // A racing row closes the attempt before the child's own end reaches the runtime.
+    await h.parts().writer.append([
+      { type: "attempt-ended", taskId: "T1", n: 1, outcome: "lost", endedAt: h.clock.iso(), detail: "runner-error" },
+      tr("T1", "running", "ready", "child-lost", "runner-error"),
+    ]);
+    await h.runtime.onChildEnd("T1", 1, { kind: "completed", childSessionID: "ses-c1", text: "late", endedAt: h.clock.iso() });
+    await h.runtime.settled();
+    expect(released).toEqual(["T1#1"]);
+    expect(h.bindings.evicted).toEqual(["ses-c1"]);
+    expect(h.state("T1")).toBe("ready");
+    expect(endsOf(await h.events(), "T1")).toHaveLength(1);
+    expect(h.verifier.calls).toEqual([]);
+    expect(h.launcher.runs).toEqual([]);
+  });
+
+  it("m4: a lease-held task's recovered FAILED child end is recorded at once and releases its token", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    h.hosts.say("ses-c1", { role: "assistant", text: "could not finish", outcome: null }, { role: "idle", text: null, outcome: "error" });
+    await h.crash();
+    const released = trackReleases(h);
+    const reg = foreignLease(h); // the lease rebuild fails: T1 is held
+    h.engine();
+    await h.runtime.start();
+    await h.runtime.settled();
+    // Nothing to commit or verify: the hold does not defer the failed end's own record.
+    expect(h.task("T1").attempts[0]?.outcome).toBe("failed");
+    expect(endsOf(await h.events(), "T1")).toHaveLength(1);
+    expect((await h.events()).filter((e) => e.type === "task-transition" && e.taskId === "T1" && e.from === "running" && e.to === "failed")).toHaveLength(1);
+    expect(released.filter((k) => k === "T1#1")).toHaveLength(1);
+    expect(h.verifier.calls).toEqual([]);
+    expect(h.git.calls.some((c) => c.args[0] === "commit")).toBe(false);
+    expect(reg.held.get("src/T1.ts")?.taskRef).toBe("other-plan:T9");
+    expect(h.launcher.runs).toEqual([]);
+  });
+
+  it("m6: a recovered re-verification whose context expires during cleanForChecks re-parks (parkWithoutContext) and verifies once on the next context", async () => {
+    const h = await mk(planOf([task("T1")]));
+    await completedThenCrash(h);
+    const slot = need(h.task("T1").slot, "slot of T1");
+    await h.parts().writer.append([
+      { type: "task-slot", taskId: "T1", slot, branch: taskBranchName(PLAN_ID, "T1") },
+      tr("T1", "completed", "verifying", "committed"),
+    ]);
+    await h.crash();
+    const clean = h.slots.cleanForChecks.bind(h.slots);
+    let expired = false;
+    h.slots.cleanForChecks = async (s) => {
+      const r = await clean(s);
+      if (!expired) {
+        expired = true;
+        h.launcher.gateValue = NO_CONTEXT; // the context expires between admission and the verifier
+      }
+      return r;
+    };
+    h.engine();
+    await h.runtime.start();
+    await h.runtime.settled();
+    const cleans = (): number => h.log.filter((l) => l === `slots.cleanForChecks:${slot}`).length;
+    expect(expired).toBe(true);
+    expect(cleans()).toBe(1);
+    expect(h.state("T1")).toBe("verifying");
+    expect(h.verifier.calls).toEqual([]);
+    expect((await h.events()).filter((e) => e.type === "attempt-verdict")).toHaveLength(0);
+    h.launcher.gateValue = OK_GATE;
+    h.runtime.onRouterToolCall(ORCH);
+    await untilEnqueued(h, "T1");
+    await h.runtime.settled();
+    expect(cleans()).toBe(2);
+    expect(h.verifier.calls).toEqual(["T1#1"]);
+    expect((await h.events()).filter((e) => e.type === "attempt-verdict" && e.taskId === "T1")).toHaveLength(1);
+    expect((await h.events()).filter((e) => e.type === "task-transition" && e.taskId === "T1" && e.to === "failed")).toHaveLength(0);
+  });
+});
 
 describe("start and locks (L2)", () => {
   it("a stale holder (dead pid, same host) is taken over with reason 'recover' and the plan is reconciled", async () => {

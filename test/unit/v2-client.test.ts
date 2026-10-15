@@ -53,6 +53,24 @@ describe("v2 runner: retained context identity and detached runs (3.1.5)", () =>
     ...over,
   });
 
+  it("raw recovery grader dispatch rejects before lookup/execution/onCreated without its parent's real capture", async () => {
+    const { runtime, context, toolContext, execute } = fixture();
+    const onCreated = vi.fn(async () => {});
+    const request = { parentSessionID: "parent", prompt: "grade recovered attempt 2", onCreated };
+    await expect(runtime.childRunner.run(request)).rejects.toThrow(/active tool context or a retained context matching its parent/);
+    await runtime.withToolContext({ ...toolContext, sessionID: "different-root" } as ToolContext, async () => {
+      await expect(runtime.childRunner.run(request)).rejects.toThrow(/retained context matching its parent/);
+    });
+    expect(context.tool.list).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    expect(onCreated).not.toHaveBeenCalled();
+    await runtime.withToolContext(toolContext, async () => undefined);
+    await expect(runtime.childRunner.run(request)).resolves.toMatchObject({ sessionID: "child" });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(execute.mock.calls[0]?.[1]).toMatchObject({ sessionID: "parent", id: "call", messageID: "message" });
+    expect(onCreated).toHaveBeenCalledTimes(1);
+  });
+
   it("records epoch, capturedAt and bootID per capture and notifies listeners synchronously", async () => {
     const { context, toolContext } = fixture();
     const runtime = createV2Runtime(context as unknown as Plugin.Context, { bootID: "0123456789abcdef", now: () => Date.parse("2026-02-03T04:05:06.000Z") });

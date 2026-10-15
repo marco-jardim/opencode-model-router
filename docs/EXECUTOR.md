@@ -421,6 +421,7 @@ and the task keeps waiting; the executor does not reset a slot a child might sti
 Completed or verifying tasks are reverified; verified tasks are re-enqueued; an integrating task resumes the serial
 integration queue. The router's attempt trailer prevents recovery from making a duplicate commit. Gates, capacity
 state, leases, blocked dependencies and missed breaker failures are rebuilt from durable state before the first tick.
+Recovered verification/completion pipelines run outside that barrier and wait for any current router-tool context of the owning root, requesting a stale-context wake even with no ready producer.
 The verification fallback after a restart remains [fail closed](#verification-of-plan-tasks), so a lost observation
 can cost a counted attempt rather than grant an unchecked pass.
 
@@ -461,7 +462,7 @@ for durable evidence. Do not repair the journal or markers by hand.
 | Lease refusal / contaminated run | Wait for the named holder or answer the parked task's inbox item once the conflict is resolved; repeating the same tool call does not release a lease. |
 | Failed or unverifiable task | Inspect the verification/commit failure and attempt count; fix the cause before exhausting retries or answering a breaker. Missing git identity and a declared writer with no diff are failures, not successful no-ops. |
 | Quiet `running` child after restart | D16 uses launcher liveness plus stored tool history: a provably dead same-host launcher with no tool in flight requeues immediately. An open tool call keeps the 60 s probation because its process tree may survive; do not reset its slot yourself. |
-| Recovery or re-verification cannot progress | Preserve the export and host error evidence. If a grader needs a fresh orchestrator context during recovery, report it rather than forcing a task to passed; a recovery/context dependency cycle remains a known case. |
+| Recovery or re-verification cannot progress | Supply a fresh context with a root `router_plan action=status` call in the owning session; recovered verification waits without spending grader retries. If the owning session is gone, the owner runs `router_plan action=adopt` from their session so the plan gets a live root. If it still cannot progress, preserve the export and host error evidence; never force a task to passed. |
 | Landing or GC refused | Clean/resolve the owner's checkout without discarding work; landing is fast-forward only. GC requires a finished, non-live plan; paused plans deliberately retain slots. |
 
 ## Metrics and observations

@@ -1121,6 +1121,8 @@ describe("reprovisionSlot", () => {
     const stale = await verifyingAfterCrash(h);
     h.git.answers.set("switch", () => ({ code: 1, stderr: "checkout boom" }));
     await h.reattach();
+    // D16 recovery amendment: reattach registers this pipeline; its failed-checkout cleanup is tracked outside the barrier.
+    await h.runtime.settled();
     expect(h.slots.released).toEqual([stale, "slot-2"]);
     expect(h.logs.filter((l) => l.includes(`re-provisioning T1 from ${taskBranchName(PLAN_ID, "T1")}: checkout failed`) && l.includes("checkout boom"))).toHaveLength(1);
     expect(h.parts().policy.raised.filter((i) => i.text.includes(SLOT_LOST_TEXT)).map((i) => i.taskId)).toEqual(["T1"]);
@@ -1134,6 +1136,8 @@ describe("reprovisionSlot", () => {
     const stale = await verifyingAfterCrash(h);
     h.slots.acquireFailure = new Error("pool exhausted");
     await h.reattach();
+    // D16: wait for the registered R2 pipeline, not just feed application/activation.
+    await h.runtime.settled();
     expect(h.slots.released).toEqual([stale]);
     expect(hasLog(h, `warn: re-provisioning T1 from ${taskBranchName(PLAN_ID, "T1")}: slot unavailable`)).toBe(true);
     expect(h.parts().policy.raised.filter((i) => i.text.includes(SLOT_LOST_TEXT))).toHaveLength(1);
@@ -1145,8 +1149,32 @@ describe("reprovisionSlot", () => {
     const stale = await verifyingAfterCrash(h);
     h.registry.held.set("src/T1.ts", { holderID: "holder-x", taskRef: "other-plan/T7" });
     await h.reattach();
+    // D16: the invalid-slot R2 attempt (including its lease-acquisition undo) finishes outside the global barrier.
+    await h.runtime.settled();
     expect(h.logs).toContain(`warn: re-provisioning T1 from ${taskBranchName(PLAN_ID, "T1")}: leases held elsewhere ""`);
     expect(h.slots.released).toEqual([stale, "slot-2"]);
+    expect(h.parts().policy.raised.filter((i) => i.text.includes(SLOT_LOST_TEXT))).toHaveLength(1);
+    expect(h.verifier.calls).toEqual([]);
+  });
+
+  it("a lease-held invalid slot stays untouched until context admission, then retains the R2 acquisition/undo checks", async () => {
+    const h = await mk(planOf([task("T1")]));
+    const stale = await verifyingAfterCrash(h);
+    h.registry.held.set("src/T1.ts", { holderID: "holder-x", taskRef: "other-plan/T7" });
+    h.launcher.gateValue = { ok: false, reason: "awaiting-first-router-call",
+      wake: { reason: "stale-context", stateKey: `await-router-call:recovery:${ORCH}` } };
+    await h.reattach();
+    await h.runtime.settled();
+    expect(h.slots.released).toEqual([]);
+    expect(h.logs.some((l) => l.includes("re-provisioning T1 from"))).toBe(false);
+    expect(h.verifier.calls).toEqual([]);
+    expect(h.task("T1").slot).toBe(stale);
+
+    h.launcher.gateValue = OK_GATE;
+    h.runtime.onRouterToolCall(ORCH);
+    await h.runtime.settled();
+    expect(h.slots.released).toEqual([stale, "slot-2"]);
+    expect(h.logs).toContain(`warn: re-provisioning T1 from ${taskBranchName(PLAN_ID, "T1")}: leases held elsewhere ""`);
     expect(h.parts().policy.raised.filter((i) => i.text.includes(SLOT_LOST_TEXT))).toHaveLength(1);
     expect(h.verifier.calls).toEqual([]);
   });

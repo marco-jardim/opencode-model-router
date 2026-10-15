@@ -289,9 +289,13 @@ export function sameToplevel(a: string, b: string): boolean;
 - `recoverPlan(p)` on every activation of an existing ledger (start, adopt, promotion of a passive plan); `p.recovering`
   makes `schedule` a no-op until it finishes: (1) slot markers + `leases.rebuild` (one item per failure); (2) `feeds =
   reconcile(ledger, tracked nonces)`; (3) interrupt orphans (best effort); (4) `resumeIntegration(p)` (§9); (5) apply
-  feeds in task-id order per the matrix, each requeue-lost after its slot reset, start R1a watches; (6) retry decisions
+  feeds and register task pipelines in task-id order per the matrix, each requeue-lost after its slot reset, start R1a watches; (6) retry decisions
   for failed/conflict/reverted; (7) gate recovery; (8) breaker evaluation per phase with a failure in its window; (9)
   `enqueue(verified)`; (10) `policy.unblock()`; (11) clear `p.recovering`, `schedule`.
+  Re-verification and recovered finished-child completion pipelines run as tracked, per-task serialized work only after
+  this barrier, admitted by the bound orchestrator's live launcher context gate. Independent pipelines need not finish
+  in task-id order. Pending verification alone can request the stale-context wake; no grader rerun is spent waiting
+  for the first root router call. Disposal discards pending work; adoption cuts old-attachment work and re-registers it.
 - Liveness watch: `p.probation: Map<sessionID, {taskId, n, deadlineAt, lastSig, interruptFails}>`; `onHostEvent` marks a
   session alive; the poll timer runs R1a; `dispose` clears timers.
 - D11: `commitTaskInSlot` (`runtime.ts:305-311`) adds the trailer to every commit; on a clean tree read `git log -1

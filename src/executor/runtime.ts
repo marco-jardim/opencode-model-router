@@ -392,12 +392,15 @@ export interface PlanCollaborators {
  */
 export interface PlanTaskContext {
   orchestratorSessionID: string;
+  /** An attachment change cuts old work without disposing the process-wide verifier. */
+  signal?: AbortSignal;
 }
 
 /**
- * QA-5.1-21: a plan-task verdict. `cut: true` marks a verification dispose cut before it decided anything (it judged
- * nothing: the runtime discards it, and the verifier never hands it to `onVerdict`). Any other result is a real verdict,
- * journaled even when it resolves after dispose began.
+ * QA-5.1-21: a plan-task verdict. `cut: true` marks a verification that dispose, or an attachment cut (`closePlan` on
+ * adopt/dispose through `PlanTaskContext.signal`), cut before it decided anything (it judged nothing: the runtime discards
+ * it, and the verifier never hands it to `onVerdict`). Any other result is a real verdict, journaled even when it resolves
+ * after dispose or the attachment cut began.
  */
 export type PlanTaskVerdict = Awaited<ReturnType<SlotVerifier["verify"]>> & { readonly cut?: true };
 
@@ -410,7 +413,9 @@ export interface PlanTaskVerifier extends SlotVerifier {
   forget?(planId: PlanId, taskId: TaskId, attempt: number): void | Promise<void>;
   /**
    * QA-5.1-4: called FIRST by `runtime.dispose`. Cuts every in-flight verification (gate deadlines, grader sessions, backoff
-   * sleeps); each pending `verify` resolves promptly as unverifiable. A verdict cut this way is never journaled.
+   * sleeps); each pending `verify` resolves promptly as unverifiable. A verdict cut this way is never journaled. An
+   * attachment cut (`PlanTaskContext.signal` aborted by `closePlan`) cuts only that attachment's verifications the same way
+   * (graders aborted, verdict marked `cut`) without disposing the process-wide verifier.
    */
   dispose?(): Promise<void>;
   /** QA-5.1-4: whether `dispose` has been called (a verdict returned after it is a cut, never journaled). */
@@ -558,6 +563,16 @@ interface HandleRef {
 
 type LaunchStepResult = "launched" | "skipped" | "slot-unavailable";
 
+/** Recovery registers pipelines in feed order; independent pipelines complete outside the activation barrier. */
+interface RecoveredWork {
+  readonly taskId: TaskId;
+  readonly n: number;
+  readonly nonce: string;
+  readonly state: TaskState;
+  readonly work: { kind: "reverify"; slotValid: boolean | null } | { kind: "end"; end: ChildEnd };
+  started: boolean;
+}
+
 interface PlanRt {
   readonly planId: PlanId;
   writer: LedgerWriter;
@@ -611,6 +626,11 @@ interface PlanRt {
   passive: boolean;
   /** 4.2.5: `recoverPlan` is running; `schedule` is a no-op until it finishes (step 11). */
   recovering: boolean;
+  /** Attachment-local identities; waiting for context retains the task's slot and leases. */
+  recoveredWork: Map<TaskId, RecoveredWork>;
+  /** Work that must observe an attachment cut before its writer closes (including already-decided verdicts). */
+  attachmentWork: Set<Promise<void>>;
+  attachment: AbortController;
   /** §9: `queue.resume()` ran in this activation and did not halt; a user `resume` retries while false. */
   integrationResumed: boolean;
   /** R1a: children adopted on probation, keyed by child session id. */
@@ -629,6 +649,11 @@ interface PlanRt {
   leaseHeld: Set<TaskId>;
   /** QA-4.2-23: children `rebindChild` bound, by task; evicted once their attempt closes (or the plan detaches). */
   rebound: Map<TaskId, { n: number; childSessionID: string }>;
+  /**
+   * Attempts (`tokenKey(taskId, n)`) whose child recovery adopted in this attachment, whether or not `rebindChild`
+   * succeeded: their end after the barrier waits for a root context like any other recovered work.
+   */
+  adoptedByRecovery: Set<string>;
   /**
    * QA-4.2-29: the history export this activation read once (capacity restore, then the breaker step); null when it
    * failed or after the breaker step used it.
@@ -823,12 +848,19 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     return track(pr);
   }
 
-  function bg(label: string, fn: () => Promise<void>): void {
-    void track(
+  function bg(label: string, fn: () => Promise<void>): Promise<void> {
+    return track(
       fn().catch((e: unknown) => {
         d.log("error", `${label} failed`, errorText(e));
       }),
     );
+  }
+
+  function holdAttachment(p: PlanRt, work: Promise<void>): Promise<void> {
+    p.attachmentWork.add(work);
+    const done = (): void => { p.attachmentWork.delete(work); };
+    void work.then(done, done);
+    return work;
   }
 
   function metric(p: PlanRt, m: MetricPayload): void {
@@ -879,7 +911,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
   /** QA-5.1-6/-14: the plan's orchestrator as its ledger names it now (an adopt moves it), handed to each verifier hook. */
   function planTaskContext(p: PlanRt): PlanTaskContext {
-    return { orchestratorSessionID: p.writer.ledger.orchestrator.sessionID };
+    return { orchestratorSessionID: p.writer.ledger.orchestrator.sessionID, signal: p.attachment.signal };
   }
 
   /** No live child, no task in flight and no open integration entry: nothing of the plan still writes its slots. */
@@ -1028,6 +1060,12 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
    */
   function slotVanished(p: PlanRt, taskId: TaskId): void {
     p.slotLeases.delete(taskId);
+    const waiting = p.recoveredWork.get(taskId);
+    if (waiting?.work.kind === "reverify" && !waiting.started) {
+      waiting.work.slotValid = false;
+      schedule(p);
+      return;
+    }
     bg("held task slot lost", () =>
       withTask(p, taskId, async () => {
         const t = own(p.writer.ledger, taskId);
@@ -1040,6 +1078,10 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
   /** QA-4.2-16: the step a lease hold deferred: commit-and-verify, the verifier again, or the queue. */
   function resumeHeldTask(p: PlanRt, taskId: TaskId): void {
+    if (p.recoveredWork.has(taskId)) {
+      schedule(p);
+      return;
+    }
     bg("held task resume", () =>
       withTask(p, taskId, async () => {
         if (p.disposed || p.leaseHeld.has(taskId)) return;
@@ -1072,6 +1114,51 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
 
   function withTask<T>(p: PlanRt, taskId: TaskId, fn: () => Promise<T>): Promise<T> {
     return mutex.run(`${p.planId}/${taskId}`, fn);
+  }
+
+  function registerRecoveredWork(p: PlanRt, t: TaskNode, work: RecoveredWork["work"]): void {
+    const a = t.attempts[t.attempts.length - 1];
+    if (a === undefined || p.disposed || disposed || p.recoveredWork.has(t.id)) return;
+    p.recoveredWork.set(t.id, { taskId: t.id, n: a.n, nonce: a.nonce, state: t.state, work, started: false });
+    schedule(p);
+  }
+
+  /** The launcher's live context gate is also the admission gate for recovered verification (D14). */
+  function admitRecoveredWork(p: PlanRt): void {
+    if (p.recovering || p.disposed || disposed || p.passive) return;
+    for (const w of p.recoveredWork.values()) {
+      // R2 must still try to recover an invalid slot even when the old tree's lease rebuild failed. Re-provisioning
+      // performs its own lease acquisition/undo; only commit/check/verify remains held until leases are back: a
+      // re-verify of a valid slot and a completed child's end (commit then verify). An end that needs no verification
+      // (a failed, lost, capacity-stopped or interrupted child) is recorded at once and releases its token.
+      const held = (): boolean => p.leaseHeld.has(w.taskId)
+        && (w.work.kind === "reverify" ? w.work.slotValid !== false : w.work.end.kind === "completed");
+      if (w.started || held()) continue;
+      if (!d.launcher.gate(p.writer.ledger.orchestrator.sessionID).ok) return;
+      w.started = true; // synchronous reservation: repeated ticks/captures cannot queue a second pipeline
+      holdAttachment(p, bg("recovered task work", () => withTask(p, w.taskId, async () => {
+        let parked = false;
+        try {
+          const t = own(p.writer.ledger, w.taskId);
+          const a = t?.attempts[t.attempts.length - 1];
+          if (disposed || p.disposed || plans.get(p.planId) !== p || p.recoveredWork.get(w.taskId) !== w
+            || t === null || a === undefined || t.state !== w.state || a.n !== w.n || a.nonce !== w.nonce) return;
+          // Context/leases may have changed while this task waited for its mutex. Never spend a grader rerun on admission.
+          if (held() || !d.launcher.gate(p.writer.ledger.orchestrator.sessionID).ok) {
+            parked = true;
+            return;
+          }
+          if (w.work.kind === "reverify") await reverify(p, w.taskId, w.work.slotValid);
+          else await processEndNow(p, w.taskId, w.n, w.work.end);
+        } finally {
+          if (p.recoveredWork.get(w.taskId) === w) {
+            if (parked) w.started = false;
+            else p.recoveredWork.delete(w.taskId);
+          }
+          schedule(p);
+        }
+      })));
+    }
   }
 
   /**
@@ -1339,6 +1426,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     if (p.latch || p.disposed) return;
     // QA-4.2-16: each tick (and so each lease release, which ticks every plan) retries a failed lease rebuild.
     if (p.leaseHeld.size > 0) await retryHeldLeases(p);
+    admitRecoveredWork(p);
     let l = p.writer.ledger;
     if (l.status === "running") {
       const prom = d.scheduler.promotable(l);
@@ -1373,6 +1461,11 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     l = p.writer.ledger;
     if (l.status !== "running") {
       closeIdle(p);
+      // Recovery also re-verifies paused plans. Their pending work needs a root context even without launchable work.
+      if ([...p.recoveredWork.values()].some((w) => !w.started)) {
+        const gate = d.launcher.gate(l.orchestrator.sessionID);
+        if (!gate.ok && gate.wake !== null) await wakeOnce(p, gate.wake.reason, gate.wake.stateKey);
+      }
       if (l.status === "completed" || l.status === "aborted") unpinPlan(p);
       // A plan-completed wake that was debounced or failed is retried by the tick wakeOnce re-armed (M32); idempotent per key.
       if (l.status === "completed") await wakeOnce(p, "plan-completed", `plan-completed:${p.planId}`);
@@ -1415,7 +1508,9 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     }
     observe(p, "launch-gate", () => ({ ok: gate.ok, ready: ready.map((r) => r.taskId) }));
     if (ready.length === 0 || !gate.ok) {
-      if (ready.length > 0 && !gate.ok && gate.wake !== null) await wakeOnce(p, gate.wake.reason, gate.wake.stateKey);
+      if ((ready.length > 0 || [...p.recoveredWork.values()].some((w) => !w.started)) && !gate.ok && gate.wake !== null) {
+        await wakeOnce(p, gate.wake.reason, gate.wake.stateKey);
+      }
       updateIdle(p, ready, 0);
       return;
     }
@@ -1995,25 +2090,47 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   // ---------- completion processing
 
   function processEnd(p: PlanRt, taskId: TaskId, n: number, end: ChildEnd): Promise<void> {
-    return withTask(p, taskId, async () => {
-      try {
-        await handleEnd(p, taskId, n, end);
-      } catch (e) {
-        d.log("error", "child end processing failed", errorText(e));
-      } finally {
-        releaseToken(p, taskId, n, "other");
-        const still = own(p.writer.ledger, taskId);
-        const closed = still === null || openAttempt(still, n) === null;
-        // QA-4.2-23: the binding of an adopted child goes with its attempt.
-        if (closed) evictRebound(p, taskId, n);
-        if (closed) await forgetClosed(p);
-        if (end.childSessionID !== null && closed) {
-          p.capacityStopped.delete(end.childSessionID);
-          forgetSession(end.childSessionID);
-        }
-        schedule(p);
+    // A recovered FINISHED child (or a terminal event racing its feed) must not run commit/verify in the global barrier.
+    // Only an OPEN attempt's end is diverted, and only once a registered end of that attempt carries it: any other end
+    // (closed attempt, another task work already registered) takes the normal path, whose bookkeeping releases its token,
+    // evicts its binding and forgets its session.
+    const t = own(p.writer.ledger, taskId);
+    if (t !== null && openAttempt(t, n) !== null) {
+      const recoveredWithoutContext = p.adoptedByRecovery.has(tokenKey(taskId, n)) && !d.launcher.gate(p.writer.ledger.orchestrator.sessionID).ok;
+      if (p.recovering || p.recoveredWork.has(taskId) || recoveredWithoutContext) {
+        registerRecoveredWork(p, t, { kind: "end", end });
+        const w = p.recoveredWork.get(taskId);
+        if (w !== undefined && w.work.kind === "end" && w.n === n) return Promise.resolve();
       }
-    });
+    }
+    // An admitted recovered pipeline of this task holds its mutex for a whole verification: the end's bookkeeping queues
+    // behind it (tracked: `settled` and dispose wait for it) without making the caller wait for that verification.
+    if (p.recoveredWork.get(taskId)?.started === true) {
+      void bg("child end processing", () => withTask(p, taskId, () => processEndNow(p, taskId, n, end)));
+      return Promise.resolve();
+    }
+    return withTask(p, taskId, () => processEndNow(p, taskId, n, end));
+  }
+
+  async function processEndNow(p: PlanRt, taskId: TaskId, n: number, end: ChildEnd): Promise<void> {
+    try {
+      await handleEnd(p, taskId, n, end);
+    } catch (e) {
+      d.log("error", "child end processing failed", errorText(e));
+    } finally {
+      releaseToken(p, taskId, n, "other");
+      const still = own(p.writer.ledger, taskId);
+      const closed = still === null || openAttempt(still, n) === null;
+      // QA-4.2-23: the binding of an adopted child goes with its attempt.
+      if (closed) evictRebound(p, taskId, n);
+      if (closed) p.adoptedByRecovery.delete(tokenKey(taskId, n));
+      if (closed) await forgetClosed(p);
+      if (end.childSessionID !== null && closed) {
+        p.capacityStopped.delete(end.childSessionID);
+        forgetSession(end.childSessionID);
+      }
+      schedule(p);
+    }
   }
 
   async function handleEnd(p: PlanRt, taskId: TaskId, n: number, end: ChildEnd): Promise<void> {
@@ -2280,6 +2397,7 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       // D11: the attempt's trailer makes the commit idempotent across a crash between the commit and row 21.
       const att = t.attempts.find((x) => x.n === n);
       if (att !== undefined && d.verifier.observe !== undefined) await d.verifier.observe(t, lease, att, await finalTextOf(p, taskId, att), planTaskContext(p));
+      if (p.disposed) return;
       r = await commitTaskInSlot(d.git, {
         slot: lease,
         branch,
@@ -2288,9 +2406,11 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         ...(att === undefined ? {} : { trailer: attemptTrailer(p.planId, taskId, n, att.nonce) }),
       });
     } catch (e) {
+      if (p.disposed) return;
       await commitFailed(errorText(e));
       return;
     }
+    if (p.disposed) return;
     if (!r.changed) {
       // M39 owner amendment: verification policy never makes a declared writer's missing diff a success.
       if (t.footprint.writes.length > 0) {
@@ -2322,23 +2442,35 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   function verifyAttempt(p: PlanRt, taskId: TaskId, n: number, lease: SlotLease): Promise<void> {
     // QA-5.1-21: tracked on every path (a recovery re-verify too, not only an end's processing), so dispose's wait for running
     // work covers the journaling of a verdict that settles after the verifier was cut; `closePlan` runs after that wait.
-    return track(verifyAttemptNow(p, taskId, n, lease));
+    return holdAttachment(p, track(verifyAttemptNow(p, taskId, n, lease)));
   }
 
   async function verifyAttemptNow(p: PlanRt, taskId: TaskId, n: number, lease: SlotLease): Promise<void> {
     // QA-4.2-16: held until the leases are back (`retryHeldLeases` resumes it).
     if (p.leaseHeld.has(taskId)) return;
+    // A context can expire during commit/observation. Re-park this same identity, not a transient grader failure.
+    const parkWithoutContext = (): boolean => {
+      if (!p.recoveredWork.has(taskId) || d.launcher.gate(p.writer.ledger.orchestrator.sessionID).ok) return false;
+      p.recoveredWork.delete(taskId);
+      const t = own(p.writer.ledger, taskId);
+      if (t !== null) registerRecoveredWork(p, t, { kind: "reverify", slotValid: true });
+      return true;
+    };
+    if (p.disposed || parkWithoutContext()) return;
     let verdict: Verdict;
     let findings: string;
     let ref: string | null;
     let cut: boolean;
+    let nonce: string | undefined;
     try {
       const cur = own(p.writer.ledger, taskId);
-      const att = cur === null ? undefined : cur.attempts.find((x) => x.n === n);
-      if (cur === null || att === undefined) return;
+      const att = cur === null ? undefined : cur.attempts[cur.attempts.length - 1];
+      if (cur === null || cur.state !== "verifying" || att === undefined || att.n !== n || att.verdict !== null) return;
+      nonce = att.nonce;
       forgotten.delete(`${p.planId}/${taskId}#${n}`);
       if (d.verifier.observe !== undefined) await d.verifier.observe(cur, lease, att, await finalTextOf(p, taskId, att), planTaskContext(p));
       await slotsFor(p.planId).cleanForChecks(lease.slot);
+      if (p.disposed || parkWithoutContext()) return;
       const v = await d.verifier.verify(cur, lease, att, planTaskContext(p));
       verdict = v.verdict;
       findings = v.findings;
@@ -2352,19 +2484,20 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       cut = disposed || p.disposed || d.verifier.disposing === true;
     }
     finalTexts.delete(`${p.planId}/${taskId}#${n}`);
-    // QA-5.1-4: a verification cut by dispose judged nothing. Nothing is journaled: the task stays `verifying`, which recovery
-    // re-verifies (R2); no failed transition, no attempt used, no breaker sample.
+    // QA-5.1-4: a verification cut by dispose (or by an adopt's attachment cut) judged nothing. Nothing is journaled: the
+    // task stays `verifying`, which recovery re-verifies (R2); no failed transition, no attempt used, no breaker sample.
     // QA-5.1-21: only an explicit cut (`cut: true`) is discarded. A real verdict decided before dispose began, and already
     // handed to the verifier's `onVerdict`, is journaled: the writer stays open until `closePlan`, which dispose runs after
     // the wait for this work.
     if (cut) {
-      d.log("info", `verification of ${p.planId}/${taskId}#${n} cut by dispose; recovery re-verifies it`);
+      d.log("info", `verification of ${p.planId}/${taskId}#${n} cut by dispose or adopt; recovery re-verifies it`);
       return;
     }
     if (verdict === "pass") {
       const ok = await appendIf(p, (cur) => {
         const c = own(cur, taskId);
-        if (c === null || c.state !== "verifying") return [];
+        const a = c?.attempts[c.attempts.length - 1];
+        if (c === null || c.state !== "verifying" || a?.n !== n || a.nonce !== nonce || a.verdict !== null) return [];
         return [{ type: "attempt-verdict", taskId, n, verdict: "pass", ref }, tt(taskId, "verifying", "verified", "verify-pass")];
       });
       if (!ok) return;
@@ -2374,7 +2507,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
     }
     const failed = await appendIf(p, (cur) => {
       const c = own(cur, taskId);
-      if (c === null || c.state !== "verifying") return [];
+      const a = c?.attempts[c.attempts.length - 1];
+      if (c === null || c.state !== "verifying" || a?.n !== n || a.nonce !== nonce || a.verdict !== null) return [];
       return [
         { type: "attempt-verdict", taskId, n, verdict, ref },
         ax(taskId, n, findings),
@@ -2710,12 +2844,16 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       routeRaised: false,
       passive,
       recovering: false,
+      recoveredWork: new Map(),
+      attachmentWork: new Set(),
+      attachment: new AbortController(),
       integrationResumed: false,
       probation: new Map(),
       probationTimer: null,
       interrupting: new Set(),
       leaseHeld: new Set(),
       rebound: new Map(),
+      adoptedByRecovery: new Set(),
       // A passive attachment may never activate: it keeps no export (a later activation reads its own).
       history: passive ? null : history,
       fed: new Set(),
@@ -2973,10 +3111,14 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         await adoptChild(p, t, f);
         return;
       case "requeue-lost":
+        // A terminal event received during the barrier is newer evidence than the read-only classification. Do not
+        // reset its completed work out from under the registered completion pipeline.
+        if (p.recoveredWork.get(t.id)?.work.kind === "end") return;
         await requeueLost(p, t, f);
         return;
       case "reverify":
-        await withTask(p, t.id, () => reverify(p, t.id, f.slotValid));
+        if (t.attempts[t.attempts.length - 1]?.n !== f.n) return;
+        registerRecoveredWork(p, t, { kind: "reverify", slotValid: f.slotValid });
         return;
       case "re-enqueue":
         // R2: a verified task whose slot lost its marker gets its slot back before step 9 re-enqueues it.
@@ -3031,13 +3173,15 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
       }
     }
     restoreHandle(p, t.id, n, child);
+    // Marked before the re-bind: a failed re-bind (only logged) must not let this child's end run without a root context.
+    p.adoptedByRecovery.add(tokenKey(t.id, n));
     // QA-4.2-18: a fresh plugin instance has no binding for the adopted child; re-bind it as the launcher did.
     await rebindChild(p, t, a, child);
     if (f.evidence === "finished") {
       await processEnd(p, t.id, n, endFromContext(child, f.context));
       return;
     }
-    if (f.probation !== null) startProbation(p, child, t.id, n, f.probation, f.context);
+    if (f.probation !== null && p.recoveredWork.get(t.id)?.work.kind !== "end") startProbation(p, child, t.id, n, f.probation, f.context);
   }
 
   /** Registers an adopted child that no launch of this process tracks: its terminal host event ends it (L12 mapper). */
@@ -3637,6 +3781,10 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
   async function closePlan(p: PlanRt): Promise<void> {
     p.disposed = true;
     p.latch = true;
+    p.attachment.abort();
+    p.recoveredWork.clear();
+    // An adopt closes this writer only after old-attachment pipelines have observed their cut.
+    await Promise.allSettled([...p.attachmentWork]);
     p.offSlotRelease?.();
     p.offSlotRelease = null;
     observe(p, "detach");
@@ -4516,6 +4664,8 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
         // QA-3.1-25: L17 for every live launch the launcher is about to abort, counted while the plan is still live.
         if (!p.disposed) for (const h of p.handles.values()) if (!h.settled) counter(p, "launch-failed", { row: "L17" });
         p.disposed = true;
+        p.attachment.abort();
+        p.recoveredWork.clear();
         observe(p, "dispose");
         for (const h of p.timers) d.clock.clearTimer(h);
         p.timers.clear();

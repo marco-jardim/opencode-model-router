@@ -1606,8 +1606,9 @@ export function isContextSupersededError(e: unknown): e is ContextSupersededErro
  * Launch gate (A1-6). `disposed` has no wake; every other non-ok reason has one. Keys:
  * `context-stale` -> `stale-context:<bootID>:<epoch>`; `no-context` (a capture existed in this process and is gone) ->
  * `no-context:<bootID>:<orchestratorSessionID>:<lastEpoch>`; `awaiting-first-router-call` (guard 6) ->
- * `await-router-call:<bootID>:<orchestratorSessionID>`. The runtime wakes iff not ok, `wake !== null` and the ready set
- * computed as if the gate were ok is non-empty.
+ * `await-router-call:<bootID>:<orchestratorSessionID>`. The runtime wakes iff not ok, `wake !== null` and there is work
+ * waiting for a root context: the ready set computed as if the gate were ok is non-empty, or recovered work (a
+ * re-verification or a recovered child's end) has not yet been admitted (also on a paused plan).
  */
 export type LaunchGate =
   | { ok: true; context: RetainedContextInfo; ageMs: number }

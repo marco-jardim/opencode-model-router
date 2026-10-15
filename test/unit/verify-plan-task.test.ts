@@ -1001,6 +1001,101 @@ describe("verifier arms", () => {
     expect(result.findings).not.toMatch(/shutting down/);
   });
 
+  it("an attachment cut aborts its active grader without disposing the verifier or publishing a verdict; adoption can verify anew", async () => {
+    const h = harness();
+    const t = task({ text: "x\n[acceptance]\ncriteria: works\n[/acceptance]" });
+    const v = createPlanTaskVerifier(h.deps);
+    const attachment = new AbortController();
+    const before = { orchestratorSessionID: "orch-old", signal: attachment.signal };
+    let started!: () => void;
+    const running = new Promise<void>((resolve) => { started = resolve; });
+    acceptMock.mockImplementationOnce(async () => {
+      (h.gateDepsCalls[0]![1] as Set<string>).add("grader-old");
+      started();
+      return new Promise<GateResult>(() => {});
+    }).mockImplementation(async () => pass("checker"));
+    await v.begin?.(t, slot(), attempt(), before);
+    h.git.head = CANDIDATE;
+    h.git.branch = t.branch ?? "";
+    await v.observe?.(t, slot(), attempt(), "DONE: implemented", before);
+    const pending = v.verify(t, slot(), attempt(), before);
+    await running;
+    attachment.abort();
+    expect(await pending).toMatchObject({ verdict: "unverifiable", cut: true });
+    expect(v.disposing).toBe(false);
+    expect(h.aborted).toEqual(["grader-old"]);
+    expect((h.gateDepsCalls[0]![3] as { signal: AbortSignal }).signal.aborted).toBe(true);
+    expect(h.verdicts).toEqual([]);
+    expect(h.sleeps).toEqual([]);
+    // The old pipeline has finished cleanup. Re-observe this original attempt under the newly bound orchestrator.
+    h.git.head = BASE;
+    const after = { orchestratorSessionID: "orch-new", signal: new AbortController().signal };
+    await v.begin?.(t, slot(), attempt(), after);
+    await v.observe?.(t, slot(), attempt(), "DONE: implemented", after);
+    h.git.head = CANDIDATE;
+    expect(await v.verify(t, slot(), attempt(), after)).toMatchObject({ verdict: "pass" });
+    expect(h.gateDepsCalls.map((args) => args[0])).toEqual(["orch-old", "orch-new"]);
+    expect(h.verdicts).toEqual(["pass"]);
+  });
+
+  it("an attachment cut interrupts transient backoff without consuming another rerun or publishing", async () => {
+    const h = harness();
+    const attachment = new AbortController();
+    const ctx = { orchestratorSessionID: "orch-old", signal: attachment.signal };
+    const t = task({ text: "x\n[acceptance]\ncriteria: works\n[/acceptance]" });
+    let slept!: () => void;
+    const sleeping = new Promise<void>((resolve) => { slept = resolve; });
+    h.deps.sleep = (ms) => { h.sleeps.push(ms); slept(); return new Promise<void>(() => {}); };
+    const v = createPlanTaskVerifier(h.deps); // The verifier captures its injected sleep at construction.
+    acceptMock.mockImplementation(async () => unverifiable("grader dispatch failed: 503"));
+    await v.begin?.(t, slot(), attempt(), ctx);
+    await v.observe?.(t, slot(), attempt(), undefined, ctx);
+    h.git.head = CANDIDATE;
+    h.git.branch = t.branch ?? "";
+    const pending = v.verify(t, slot(), attempt(), ctx);
+    await sleeping;
+    attachment.abort();
+    expect(await pending).toMatchObject({ cut: true });
+    expect(h.sleeps).toEqual([30_000]); // Real post-admission failure keeps the unchanged bounded transient policy.
+    expect(acceptMock).toHaveBeenCalledTimes(1);
+    expect(h.verdicts).toEqual([]);
+    expect(v.disposing).toBe(false);
+  });
+
+  it("M1: an attachment cut during observe caches no failed observation; the next attachment grades the real one without begin", async () => {
+    acceptMock.mockImplementation(async () => pass("checker"));
+    const h = harness();
+    const t = task({ text: "x\n[acceptance]\ncriteria: works\n[/acceptance]" });
+    const v = createPlanTaskVerifier(h.deps);
+    let observing!: () => void;
+    const started = new Promise<void>((resolve) => { observing = resolve; });
+    let release!: (p: PreparedVerification) => void;
+    h.deps.prepareVerification = (async (...args: unknown[]) => {
+      h.prepareCalls.push(args);
+      observing();
+      return new Promise<PreparedVerification>((resolve) => { release = resolve; });
+    }) as unknown as PlanTaskVerifierDeps["prepareVerification"];
+    const attachment = new AbortController();
+    const before = { orchestratorSessionID: "orch-old", signal: attachment.signal };
+    await v.begin?.(t, slot(), attempt(), before);
+    h.git.head = CANDIDATE;
+    h.git.branch = t.branch ?? "";
+    const observed = v.observe?.(t, slot(), attempt(), "DONE: implemented", before);
+    await started;
+    attachment.abort(); // closePlan/adopt cuts the old attachment while its observation runs
+    await observed; // only the old attachment's wait was cut
+    release(prepared());
+    // The record outlives the attachment: the next attachment re-verifies the same attempt WITHOUT a new begin.
+    const after = { orchestratorSessionID: "orch-new", signal: new AbortController().signal };
+    const result = await v.verify(t, slot(), attempt(), after);
+    expect(result).toMatchObject({ verdict: "pass" });
+    expect(result.findings).not.toMatch(/change observation failed|shutting down/);
+    expect(h.prepareCalls).toHaveLength(1);
+    expect(h.gateDepsCalls.map((args) => args[0])).toEqual(["orch-new"]);
+    expect(h.verdicts).toEqual(["pass"]);
+    expect(v.disposing).toBe(false);
+  });
+
   it("QA-5.1-4: dispose cancels a backoff sleep; the transient result is never re-run nor ingested", async () => {
     acceptMock.mockImplementation(async () => unverifiable("grader dispatch failed: 503"));
     const h = harness();
