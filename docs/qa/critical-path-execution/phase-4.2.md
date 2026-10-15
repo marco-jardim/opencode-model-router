@@ -374,6 +374,9 @@ approve path to 5.1.
 ### 12. Risks and order
 
 - Probation waits up to 60 s per in-flight child after a restart until v2 has a real `activity` (5.1 handoff).
+  *Resolved 2026-10-15 (Phase 6.1):* the host still has no plugin-readable activity signal (`activity` stays `unknown`),
+  but a child whose recorded launcher process is provably dead on this host is now requeued at once (ADR 0007 D16,
+  host contract `C16/D16`); every other case keeps the probation.
 - A hung previous holder's long-silent live child may be interrupted: wasted, never counted or duplicated; an interrupt
   that cannot reach another server process keeps the task waiting with an item.
 - A late child after a `dispatched` requeue could briefly share the slot until the L12 interrupt (C12 makes it unlikely).

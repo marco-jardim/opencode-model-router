@@ -25,6 +25,7 @@ import { createPhaseSuiteRunner } from "../../../../src/executor/integrate/phase
 import { createIntegrationQueue, createRepoLockFactory, type IntegrationStepEvent } from "../../../../src/executor/integrate/queue.js";
 import { createLedgerStore, createNodeFileSystem } from "../../../../src/executor/ledger.js";
 import { createRecoveryService } from "../../../../src/executor/recovery.js";
+import { processIdentity } from "../../../../src/executor/process-identity.js";
 import { createExecutorRuntime, realCollaborators, type CollaboratorInput, type LeaseRegistryPort } from "../../../../src/executor/runtime.js";
 import { createScheduler } from "../../../../src/executor/schedule.js";
 import { createSlotPool } from "../../../../src/executor/slots/pool.js";
@@ -174,6 +175,7 @@ export function scriptedLauncher(c: ChildConfig, clock: Clock): TaskLauncher {
           answer,
           interrupted: 0,
           run: c.run,
+          ...(c.launcherLiveness ? { launcherPid: process.pid } : {}),
         });
         run.sessionID = sid;
         try {
@@ -317,6 +319,7 @@ async function main(): Promise<void> {
   await pool.open();
   const hosts = diskHosts(c.hostRoot, c.activity, c.orchestrator);
   const holder = (sessionID: string): ReturnType<typeof holderOf> => holderOf(sessionID, process.pid, hostname(), clock.iso());
+  const self = c.launcherLiveness ? processIdentity() : undefined;
   const recovery = createRecoveryService({
     store,
     host: hosts,
@@ -335,6 +338,7 @@ async function main(): Promise<void> {
     log,
     livenessMs: c.livenessMs,
     pollMs: c.pollMs,
+    ...(self === undefined ? {} : { launcherLiveness: { self, isAlive: nodeSpawner().isAlive } }),
   });
   const buildQueue = (i: QueueInput): ReturnType<typeof createIntegrationQueue> => {
     const guard = createWriteGuard({ ledger: () => i.writer.ledger, pool, realpath: (p) => realpath(p), platform: process.platform });
@@ -397,6 +401,7 @@ async function main(): Promise<void> {
   };
   const runtime = createExecutorRuntime({
     store,
+    ...(self === undefined ? {} : { self }),
     compiler,
     slots: pool,
     scheduler: createScheduler(),

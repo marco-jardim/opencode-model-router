@@ -80,6 +80,8 @@ export interface ChildConfig {
    * (variant): "active" for a child scripted `alive`, "inactive" for one scripted `dead`, "unknown" otherwise.
    */
   activity: "unknown" | "scripted";
+  /** Separate variant: simulated workers stop with their launcher; wire the v2 launcher-liveness dependency. */
+  launcherLiveness?: boolean;
 }
 
 /** The `activity` a session reports under `mode`. */
@@ -106,6 +108,10 @@ export interface StoredSession {
   interrupted: number;
   /** Which executor run (0 = first process) created it. */
   run: number;
+  /** Only the launcher-liveness variant ties the simulated worker's lifetime to a process. */
+  launcherPid?: number;
+  /** The worker stopped without a terminal host-history entry (e.g. cut mid-tool-call). */
+  stopped?: boolean;
 }
 
 export function sessionsDir(root: string): string {

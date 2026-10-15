@@ -7,6 +7,7 @@
 import { realpathSync } from "node:fs";
 import { withoutHostPreamble } from "./host-preamble.js";
 import { ADOPT_TAKEOVER_REASON } from "./ledger.js";
+import type { ProcessIdentity } from "./process-identity.js";
 import { ExecutorError, LAUNCH_HEADER_PATTERN, parseLaunchHeader } from "./types.js";
 import type {
   Attempt, Clock, HostSessionContext, HostSessions, LedgerStore, LedgerV1, LockHolder, PlanId, ReconcileAction,
@@ -54,6 +55,8 @@ export interface RecoveryDeps {
   log: RecoveryLog;
   livenessMs?: number;
   pollMs?: number;
+  /** v2 only: a dead launcher proves inactivity; every other case keeps the host's unknown answer. */
+  launcherLiveness?: { self: ProcessIdentity; isAlive: (pid: number) => boolean };
 }
 
 /**
@@ -145,19 +148,25 @@ interface ChildRead {
   context: HostSessionContext | null;
 }
 
+type LauncherActivity = (t: TaskNode, a: Attempt, child: string) => Promise<"inactive" | "unknown">;
+
 export function createRecoveryService(d: RecoveryDeps): RecoveryEngine {
   const livenessMs = d.livenessMs ?? RECOVERY_LIVENESS_MS;
   const pollMs = d.pollMs ?? RECOVERY_POLL_MS;
   let recovered = false;
 
-  async function inspect(l: Readonly<LedgerV1>, t: TaskNode, a: Attempt, childId: string): Promise<ChildRead> {
+  async function inspect(l: Readonly<LedgerV1>, t: TaskNode, a: Attempt, childId: string, launcherActivity: LauncherActivity): Promise<ChildRead> {
     const expect = { planId: l.planId, taskId: t.id, n: a.n, nonce: a.nonce };
     try {
       const info = await d.host.get(childId);
       if (info === null) return { evidence: "lost", context: null };
       const ctx = await d.host.context(childId);
       let ev = classifyChild(info, ctx, "unknown", expect, l.sharedContext);
-      if (ev === "unknown") ev = classifyChild(info, ctx, await d.host.activity(childId), expect, l.sharedContext);
+      if (ev === "unknown") {
+        let activity = await d.host.activity(childId);
+        if (activity === "unknown" && d.launcherLiveness !== undefined) activity = await launcherActivity(t, a, childId);
+        ev = classifyChild(info, ctx, activity, expect, l.sharedContext);
+      }
       return { evidence: ev, context: ctx };
     } catch (e) {
       d.log("warn", "recovery: host evidence unavailable; treating the child as unknown", {
@@ -184,7 +193,9 @@ export function createRecoveryService(d: RecoveryDeps): RecoveryEngine {
     }
   }
 
-  async function reconcileTask(l: Readonly<LedgerV1>, t: TaskNode, tracked: ReadonlySet<string>): Promise<ReconcileFeed | null> {
+  async function reconcileTask(
+    l: Readonly<LedgerV1>, t: TaskNode, tracked: ReadonlySet<string>, launcherActivity: LauncherActivity,
+  ): Promise<ReconcileFeed | null> {
     const latest: Attempt | undefined = t.attempts[t.attempts.length - 1];
     const child = latest?.childSessionID ?? null;
     const feed: ReconcileFeed = {
@@ -212,7 +223,7 @@ export function createRecoveryService(d: RecoveryDeps): RecoveryEngine {
     const probation = (): { deadlineAt: number; pollMs: number } => ({ deadlineAt: d.clock.now() + livenessMs, pollMs });
 
     const fromRead = async (a: Attempt, c: string): Promise<ChildRead> => {
-      const r = await inspect(l, t, a, c);
+      const r = await inspect(l, t, a, c, launcherActivity);
       feed.context = r.context;
       if (r.evidence === "mismatch") {
         feed.mismatch = true;
@@ -290,11 +301,45 @@ export function createRecoveryService(d: RecoveryDeps): RecoveryEngine {
   }
 
   async function reconcile(l: Readonly<LedgerV1>, tracked: ReadonlySet<string>): Promise<ReconcileFeed[]> {
+    // History-class metrics survive journal rotation. Read once, lazily, and never touch the store without the v2 dep.
+    let launchers: Promise<Array<Record<string, string>> | null> | undefined;
+    const launcherActivity: LauncherActivity = async (t, a, child) => {
+      const dep = d.launcherLiveness;
+      if (dep === undefined) return "unknown";
+      launchers ??= (async () => {
+        try {
+          const records: Array<Record<string, string>> = [];
+          for (const e of (await d.store.exportPlan(l.planId)).events) {
+            if (e.type === "metric" && e.metric.name === "counter" && e.metric.key === "child-process") records.push(e.metric.labels);
+          }
+          return records;
+        } catch (e) {
+          d.log("warn", "recovery: launcher history unavailable; treating the child as unknown", {
+            planId: l.planId, error: e instanceof Error ? e.message : String(e),
+          });
+          return null;
+        }
+      })();
+      const records = await launchers;
+      if (records === null) return "unknown";
+      const matches = records.filter((r) => r.taskId === t.id && r.n === String(a.n) && r.nonce === a.nonce && r.child === child);
+      if (matches.length !== 1) return "unknown";
+      const r = matches[0]!;
+      // Malformed or ambiguous history is not proof of death.
+      if (r.hostname !== dep.self.hostname || typeof r.pid !== "string" || !/^[1-9]\d*$/.test(r.pid)
+        || typeof r.token !== "string" || r.token === "") return "unknown";
+      const pid = Number(r.pid);
+      if (!Number.isSafeInteger(pid)) return "unknown";
+      const dead = pid === dep.self.pid ? r.token !== dep.self.token : !dep.isAlive(pid);
+      if (!dead) return "unknown";
+      d.log("info", "recovery: child launcher is dead; treating the child as inactive", { taskId: t.id, n: a.n, pid });
+      return "inactive";
+    };
     const out: ReconcileFeed[] = [];
     for (const id of Object.keys(l.tasks).sort()) {
       const t = l.tasks[id];
       if (t === undefined) continue;
-      const f = await reconcileTask(l, t, tracked);
+      const f = await reconcileTask(l, t, tracked, launcherActivity);
       if (f !== null) out.push(f);
     }
     return out;

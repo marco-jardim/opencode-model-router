@@ -14,6 +14,7 @@ import { expandTask, loadExpansionEnv, type ExpandedTask } from "./expand";
 import { phaseTagName, taskBranchName } from "./git";
 import { dependentPhases } from "./integrate/queue";
 import type { PlanRoleBindings } from "./launch";
+import type { ProcessIdentity } from "./process-identity";
 import { createQaLoop } from "./qa-loop";
 import {
   RECOVER_TAKEOVER_REASON,
@@ -418,6 +419,8 @@ export interface PlanTaskVerifier extends SlotVerifier {
 
 export interface RuntimeDeps {
   observations?: V2Observations;
+  /** The process that creates this runtime's children (v2 assembly only). */
+  self?: ProcessIdentity;
   store: LedgerStore;
   compiler: PlanCompiler;
   slots: SlotPool;
@@ -1819,6 +1822,11 @@ export function createExecutorRuntime(d: RuntimeDeps): ExecutorRuntimeHandle {
           }
           if (adopting) counter(p, "launch-failed", { row: applied ? "L12" : "L11" });
           if (!applied) throw new ExecutorError("E_PLAN_STATE", "child refused", { taskId, n });
+          const a = own(p.writer.ledger, taskId)?.attempts.find((a) => a.n === n);
+          if (d.self !== undefined && a !== undefined) {
+            counter(p, "child-process", { taskId, n: String(n), nonce: a.nonce, child: childSessionID,
+              pid: String(d.self.pid), hostname: d.self.hostname, token: d.self.token });
+          }
         });
       },
     };

@@ -71,7 +71,7 @@ forced or moved), then `acquireSpecial(planId, "integration")`; failure throws �
 | `validateSlotsDir` at compile and approve | IN | 5.1.1 | B |
 | Integration branch and slot before `resume()` | IN (`ensureIntegration`) | 5.1.1 | B |
 | `holderOf` → `planHolderOf` | IN | 5.1.1 | B |
-| Real v2 `activity`; adopt refuses a live bound session | DEFERRED (needs an ADR check of the host status API; "unknown" → probation) | follow-up | – |
+| Real v2 `activity`; adopt refuses a live bound session | DEFERRED (needs an ADR check of the host status API; "unknown" → probation). *2026-10-15:* the ADR check found no plugin-readable status API, so `activity` stays `unknown`; a dead-launcher rule (ADR 0007 D16, `C16/D16`) now requeues children whose launching process is provably gone. Adopt-refusal of a live bound session remains deferred. | follow-up | – |
 | Adopt/approve root-only; `router_plan` for orchestrator sessions only | IN (no parent, or a plan child; fail closed) | 5.1.2 | – |
 | Rebuild from the ledger at start | DONE 4.2.5; pinned by A2 | 5.1.5 | B |
 | Queue kick on pause/unpause | plan resume done; breaker unpause tested (A12), fixed in `runtime.ts` only if it fails | 5.1.1/5.1.5 | R |

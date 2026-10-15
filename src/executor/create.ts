@@ -24,6 +24,7 @@ import { createIntegrationQueue, createRepoLockFactory, type IntegrationStepEven
 import { createTaskLauncher } from "./launch";
 import { createLedgerStore, createNodeClock, createNodeFileSystem } from "./ledger";
 import { resolveExecutorHome } from "./paths";
+import { processIdentity } from "./process-identity";
 import { createRecoveryService, sameToplevel } from "./recovery";
 import { createExecutorRuntime, realCollaborators, type ExecutorRuntimeHandle, type RuntimeDeps } from "./runtime";
 import type { V2Observations } from "../compat/v2-observations";
@@ -491,7 +492,8 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
       const now = clock.iso();
       return { sessionID, pid: spawner.pid, hostname: spawner.hostname, startedAt: now, heartbeatAt: now };
     };
-    runtime = createExecutorRuntime({ store, compiler,
+    const self = processIdentity();
+    runtime = createExecutorRuntime({ store, compiler, self,
       observations: options.observations,
       slots: planPools.facade, slotsFor: (id) => planPools.of(id), purgeSlots: (id, finished) => planPools.purge(id, finished),
       scheduler: createScheduler(), launcher: taskLauncher, routes, verifier: host.verifier, git, hosts: host.hosts, bindings: host.bindings, clock,
@@ -509,7 +511,8 @@ function assembleExecutor(context: { directory: string }, options: CreateExecuto
           return holder === null ? null : { holderID: holder.holderID, taskRef: holder.taskRef ?? null };
         },
         releaseTask: (ref) => { leases.registry.releaseTask(ref); leases.notifyReleased(); } },
-      recovery: createRecoveryService({ store, host: host.hosts, toplevel, holder, slotMarker: (slot) => planPools.markerOf(slot), clock, log }),
+      recovery: createRecoveryService({ store, host: host.hosts, toplevel, holder, slotMarker: (slot) => planPools.markerOf(slot), clock, log,
+        launcherLiveness: { self, isAlive: spawner.isAlive } }),
       holder, capacity: createCapacityController, collaborators: realCollaborators({ queue: buildQueue, clock, log }),
       pinOrchestrator: host.pinOrchestrator, log,
       config: () => ({ ...resolveRouting(loadConfig(directory), "v2").executor, slotsDir: null }), toplevel, checkSlotsDir,

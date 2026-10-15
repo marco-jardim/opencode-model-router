@@ -19,6 +19,7 @@ import {
   finishedAnswer,
   listSessions,
   readSession,
+  writeSession,
   type ChildConfig,
   type ChildScript,
   type KillPoint,
@@ -292,7 +293,9 @@ async function makeWorld(tag: string): Promise<World> {
   return { dir, work, repo, c0, home, slotsDir, lockRoot, hostRoot, env, branch };
 }
 
-function configFor(w: World, run: number, o: { kill: ChildConfig["kill"]; scripts: ChildConfig["scripts"]; activity: ChildConfig["activity"] }): string {
+function configFor(w: World, run: number, o: {
+  kill: ChildConfig["kill"]; scripts: ChildConfig["scripts"]; activity: ChildConfig["activity"]; launcherLiveness?: boolean;
+}): string {
   const c: ChildConfig = {
     home: w.home,
     toplevel: w.repo,
@@ -307,9 +310,10 @@ function configFor(w: World, run: number, o: { kill: ChildConfig["kill"]; script
     kill: o.kill,
     scripts: o.scripts,
     work: WORK,
-    livenessMs: LIVENESS_MS,
+    livenessMs: o.launcherLiveness ? 60_000 : LIVENESS_MS,
     pollMs: POLL_MS,
     activity: o.activity,
+    ...(o.launcherLiveness ? { launcherLiveness: true } : {}),
   };
   const p = join(w.dir, `config-${run}.json`);
   writeFileSync(p, JSON.stringify(c, null, 2));
@@ -506,6 +510,7 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 async function finishChild(w: World, sid: string): Promise<void> {
   const s = await readSession(w.hostRoot, sid);
   if (s === null) throw new Error(`no session ${sid}`);
+  if (s.stopped) throw new Error(`stopped worker ${sid} cannot finish`);
   const p = join(s.slotPath, s.file);
   mkdirSync(dirname(p), { recursive: true });
   writeFileSync(p, s.content);
@@ -639,6 +644,57 @@ function control(): Promise<Outcome> {
 // ---------- the tests
 
 describe("executor restart recovery: a real child process killed at K1/K2/K3 and restarted (4.2.6)", () => {
+  it("variant: workers stop when their launcher dies; unknown host activity plus launcher liveness requeues immediately without probation", async () => {
+    const c = await control();
+    const w = await makeWorld("launcher-liveness");
+    const p0 = startExec(configFor(w, 0, {
+      kill: { point: "K3", task: "T1" }, scripts: SCRIPTS, activity: "unknown", launcherLiveness: true,
+    }), w.work, w.env);
+    await p0.waitLine(/^READY K3 /, RUN_MS);
+    await killExec(p0);
+    const alive = (pid: number): boolean => {
+      try { process.kill(pid, 0); return true; }
+      catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
+    };
+    expect(alive(p0.pid)).toBe(false);
+    const atKill = await readLedger(w);
+    // Unlike the existing variants, the simulated host stops every busy worker of this dead launcher. It retains the
+    // mid-tool-call session history, with no terminal entry, and activity remains unknown (as on the v2 adapter).
+    const stopped: StoredSession[] = [];
+    for (const s of await listSessions(w.hostRoot)) {
+      if (s.status !== "busy" || s.launcherPid === undefined || alive(s.launcherPid)) continue;
+      const cut = { ...s, stopped: true };
+      await writeSession(w.hostRoot, cut);
+      stopped.push(cut);
+    }
+    expect(stopped.map((s) => launchKey(s)).sort()).toEqual(["T2#1", "T3#1", "T4#1"]);
+    for (const id of ["T2", "T3", "T4"]) expect(atKill.tasks[id]?.state).toBe("running");
+
+    const p1 = startExec(configFor(w, 1, {
+      kill: null, scripts: {}, activity: "unknown", launcherLiveness: true,
+    }), w.work, w.env);
+    await waitSettled(p1, w);
+    const o = await collect(w, p1);
+    expectClean(o, "launcher-liveness");
+    expectSameAsControl(o, c);
+    expect(o.outcomes).toEqual({ T1: ["1:succeeded"], T2: ["1:lost", "2:succeeded"], T3: ["1:lost", "2:succeeded"], T4: ["1:lost", "2:succeeded"] });
+    expect(o.counted).toEqual({ T1: 1, T2: 1, T3: 1, T4: 1 });
+    for (const s of stopped) {
+      // The probation deadline path interrupts first; this path requeues on the launcher's proof of death, without it.
+      expect((await readSession(w.hostRoot, s.id))?.interrupted).toBe(0);
+      expect((await readSession(w.hostRoot, s.id))?.stopped).toBe(true);
+      const taskId = launchKey(s).split("#")[0]!;
+      expect(o.ledger.tasks[taskId]?.attempts[0]?.outcome).toBe("lost");
+      expect(o.launches[`${taskId}#2`]).toBe(1);
+      expect(p1.err()).toContain(`"taskId":"${taskId}","n":1,"pid":${p0.pid}`);
+    }
+    const events = (await createLedgerStore({ home: w.home }).exportPlan(PLAN)).events;
+    const records = events.flatMap((e) => e.type === "metric" && e.metric.name === "counter" && e.metric.key === "child-process" ? [e.metric.labels] : []);
+    expect(records).toHaveLength(7); // four original children, three replacements; never relabel a recovery adopt
+    for (const s of stopped) expect(records.find((r) => r.child === s.id)?.pid).toBe(String(p0.pid));
+    expect(records.filter((r) => r.n === "2").every((r) => r.pid === String(p1.pid))).toBe(true);
+  }, SLOW);
+
   it("K3 (after `git commit` in a slot, before row 21): D11 reuses the commit; alive/dead/finished children recovered; equals the control run", async () => {
     const c = await control();
     const r = await restartRun("K3", "unknown");

@@ -89,6 +89,8 @@ import type {
 import type { PlanRoleBindings } from "../executor/launch";
 import { LAUNCH_HEADER_PATTERN, parseLaunchHeader, type LaunchHeaderFields } from "../executor/types";
 import { withoutHostPreamble } from "../executor/host-preamble";
+import { processToken } from "../executor/process-identity";
+export { processToken } from "../executor/process-identity";
 import { grantFor } from "../routing/roles/policy";
 import { NEEDS, UNKNOWN_FACTS, type Need } from "../routing/classify/types";
 import { observeV2, timingWriteObserver, type V2Observations } from "./v2-observations";
@@ -1044,21 +1046,6 @@ function completionElementsOf(text: string): CompletionElement[] {
     found.push({ child: m[1] ?? "", state, body: m[3] ?? "" });
   }
   return found;
-}
-
-/** QA-DF1-21: the global slot of this process's journal token (`Symbol.for`: one token for every module copy in the process). */
-const PROCESS_TOKEN_SLOT = Symbol.for("opencode-model-router.v2.process-token");
-/**
- * QA-DF1-21: this process's identity, stamped on the `inflight` records it journals. A record bearing it was written by an
- * instance of this very process (an owning location the host evicted), never by an earlier one: a later process may reuse the
- * pid, never the token.
- */
-export function processToken(): string {
-  const known: unknown = Reflect.get(globalThis, PROCESS_TOKEN_SLOT);
-  if (typeof known === "string") return known;
-  const token = `${process.pid.toString(16)}-${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 10)}`;
-  Reflect.set(globalThis, PROCESS_TOKEN_SLOT, token);
-  return token;
 }
 
 /**

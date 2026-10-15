@@ -2,17 +2,17 @@
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createLedgerStore } from "../../src/executor/ledger.js";
 import { FakeClock, FakeProc } from "../fixtures/cpx/ledger/fakes.js";
 import { removeDirWhenReleased } from "../helpers/remove-dir.js";
 import {
   RECOVERY_LIVENESS_MS, RECOVERY_POLL_MS, classifyChild, createRecoveryService, sameToplevel,
 } from "../../src/executor/recovery.js";
-import type { ReconcileFeed, RecoveryEngine, RecoveryHost } from "../../src/executor/recovery.js";
+import type { ReconcileFeed, RecoveryDeps, RecoveryEngine, RecoveryHost } from "../../src/executor/recovery.js";
 import { formatLaunchPrompt } from "../../src/executor/types.js";
 import type {
-  Attempt, Clock, HostSessionContext, IsoTime, LedgerStore, LedgerV1, LedgerWriter, ReconcileAction, TaskNode, TaskState,
+  Attempt, Clock, ExecutorEvent, HostSessionContext, IsoTime, LedgerStore, LedgerV1, LedgerWriter, ReconcileAction, TaskNode, TaskState,
 } from "../../src/executor/types.js";
 import { PLAN_ID, T0, buildDraft, holderOf, nonceFor, openAttempt, taskNode } from "../fixtures/cpx/ledger/builders.js";
 
@@ -199,15 +199,15 @@ interface Rig {
   svc: RecoveryEngine;
   logs: string[];
 }
-function rig(host: FakeHost = new FakeHost(), store?: LedgerStore): Rig {
+function rig(host: FakeHost = new FakeHost(), store?: LedgerStore, launcherLiveness?: RecoveryDeps["launcherLiveness"]): Rig {
   const markers = new Map<string, { planId: string; taskId: string } | null>();
   const logs: string[] = [];
   const svc = createRecoveryService({
     store: store ?? (new Proxy({}, { get: () => { throw new Error("store not expected"); } }) as LedgerStore),
-    host, toplevel: TOPLEVEL, clock: clockAt(NOW),
+    host, toplevel: TOPLEVEL, clock: clockAt(NOW), launcherLiveness,
     holder: (sessionID) => holderOf(sessionID, 4242, "host-a"),
     slotMarker: async (p) => (markers.has(p) ? (markers.get(p) ?? null) : { planId: PLAN_ID, taskId: p.replace(/^slot-/, "") }),
-    log: (level, msg) => { logs.push(`${level}:${msg}`); },
+    log: (level, msg, detail) => { logs.push(`${level}:${msg}${detail === undefined ? "" : ` ${JSON.stringify(detail)}`}`); },
   });
   return { host, markers, svc, logs };
 }
@@ -220,6 +220,150 @@ async function feedOf(r: Rig, t: TaskNode, tracked: ReadonlySet<string> = new Se
 }
 
 const PROBATION = { deadlineAt: NOW + RECOVERY_LIVENESS_MS, pollMs: RECOVERY_POLL_MS };
+
+describe("reconcile: launcher liveness (v2)", () => {
+  const self = { pid: 222, hostname: "host-a", token: "current-process" };
+  const labels = { taskId: "T1", n: "1", nonce: nonceFor(1), child: "ses-T1-1", pid: "111", hostname: self.hostname, token: "old-process" };
+  function record(patch: Record<string, string> = {}, seq = 1): Extract<ExecutorEvent, { type: "metric" }> {
+    return { type: "metric", seq, at: T0, batch: seq, last: true,
+      metric: { name: "counter", key: "child-process", value: 1, labels: { ...labels, ...patch } } };
+  }
+  function setup(events: ExecutorEvent[] = [record()], alive = false, enabled = true) {
+    const exportPlan = vi.fn(async () => ({ snapshot: ledgerOf(), events }));
+    const store = new Proxy({}, { get: (_t, key) => {
+      if (key === "exportPlan") return exportPlan;
+      throw new Error(`unexpected store access: ${String(key)}`);
+    } }) as LedgerStore;
+    const isAlive = vi.fn((_pid: number) => alive);
+    return { ...rig(new FakeHost(), store, enabled ? { self, isAlive } : undefined), exportPlan, isAlive };
+  }
+  function running(r: Rig, id = "T1", kind: ChildKind = "unknown", ready = false): TaskNode {
+    return taskNode(id, { state: ready ? "ready" : "running", slot: `slot-${id}`,
+      attempts: [attempt(1, { child: child(r.host, id, 1, kind), ...(ready ? { outcome: "lost" as const } : {}) })] });
+  }
+
+  const launcherCases: Array<[string, Record<string, string>, boolean, boolean]> = [
+    ["dead foreign pid on the same host", {}, false, true],
+    ["dead foreign pid even with our token", { token: self.token }, false, true],
+    ["own pid with a different token", { pid: String(self.pid) }, true, true],
+    ["live foreign pid", {}, true, false],
+    ["other host", { hostname: "host-b" }, false, false],
+    ["own pid and different token on another host", { pid: String(self.pid), hostname: "host-b" }, false, false],
+    ["own pid with the same token", { pid: String(self.pid), token: self.token }, false, false],
+    ["another task", { taskId: "T2" }, false, false],
+    ["another attempt", { n: "2" }, false, false],
+    ["another nonce", { nonce: nonceFor(2) }, false, false],
+    ["another child", { child: "ses-other" }, false, false],
+    ["malformed pid", { pid: "not-a-pid" }, false, false],
+    ["missing token", { token: "" }, false, false],
+  ];
+  it.each(launcherCases)("%s", async (_name, patch, alive, inactive) => {
+    const r = setup([record(patch)], alive);
+    expect(await feedOf(r, running(r))).toMatchObject(inactive
+      ? { evidence: "lost", action: "requeue-lost", probation: null }
+      : { evidence: "alive", action: "adopt", probation: PROBATION });
+    expect(r.exportPlan).toHaveBeenCalledTimes(1);
+    expect(r.exportPlan).toHaveBeenCalledWith(PLAN_ID);
+    expect(r.logs.filter((s) => s.startsWith("info:"))).toHaveLength(inactive ? 1 : 0);
+    if (inactive) expect(r.logs[0]).toContain(`"taskId":"T1","n":1,"pid":${patch.pid ?? labels.pid}`);
+    if (patch.pid === String(self.pid) || patch.hostname === "host-b") expect(r.isAlive).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["no launcher", []],
+    ["two different launchers", [record(), record({ pid: "333", token: "another-process" }, 2)]],
+    ["duplicate launcher records", [record(), record({}, 2)]],
+    ["another counter", [{ ...record(), metric: { name: "counter", key: "other", value: 1, labels } }]],
+  ] satisfies Array<[string, ExecutorEvent[]]>)("%s stays unknown", async (_name, events) => {
+    const r = setup(events);
+    expect(await feedOf(r, running(r))).toMatchObject({ evidence: "alive", action: "adopt", probation: PROBATION });
+    expect(r.isAlive).not.toHaveBeenCalled();
+  });
+
+  it("ready/adoptable + dead launcher is lost/none, with no probation", async () => {
+    const r = setup();
+    expect(await feedOf(r, running(r, "T1", "unknown", true))).toMatchObject({ evidence: "lost", action: "none", probation: null });
+  });
+
+  it.each([
+    ["alive", { evidence: "alive", action: "adopt", probation: null }],
+    ["finished", { evidence: "finished", action: "process-result", probation: null }],
+    ["lost", { evidence: "lost", action: "requeue-lost", probation: null }],
+    ["mismatch", { evidence: "lost", action: "requeue-lost", probation: null }],
+  ] satisfies Array<[ChildKind, Partial<ReconcileFeed>]>)("host %s wins without exporting launcher history", async (kind, want) => {
+    const r = setup();
+    expect(await feedOf(r, running(r, "T1", kind))).toMatchObject(want);
+    expect(r.exportPlan).not.toHaveBeenCalled();
+    expect(r.isAlive).not.toHaveBeenCalled();
+  });
+
+  it("host inactive wins over a live launcher without exporting history", async () => {
+    const r = setup([record()], true);
+    const t = running(r);
+    r.host.sessions.get("ses-T1-1")!.activity = "inactive";
+    expect(await feedOf(r, t)).toMatchObject({ evidence: "lost", action: "requeue-lost", probation: null });
+    expect(r.exportPlan).not.toHaveBeenCalled();
+  });
+
+  it("finished context wins even over host inactivity and a dead launcher", async () => {
+    const r = setup();
+    const t = running(r, "T1", "finished");
+    r.host.sessions.get("ses-T1-1")!.activity = "inactive";
+    expect(await feedOf(r, t)).toMatchObject({ evidence: "finished", action: "process-result", probation: null });
+    expect(r.host.calls).not.toContain("activity:ses-T1-1");
+    expect(r.exportPlan).not.toHaveBeenCalled();
+  });
+
+  it("absent dependency never accesses the store, even for unknown children", async () => {
+    const r = setup([record()], false, false);
+    expect(await feedOf(r, running(r))).toMatchObject({ evidence: "alive", action: "adopt", probation: PROBATION });
+    expect(r.exportPlan).not.toHaveBeenCalled();
+  });
+
+  it("a tracked child never consults launcher history", async () => {
+    const r = setup();
+    expect(await feedOf(r, running(r), new Set([nonceFor(1)]))).toMatchObject({ evidence: "alive", action: "none", probation: null });
+    expect(r.host.calls).toEqual([]);
+    expect(r.exportPlan).not.toHaveBeenCalled();
+  });
+
+  it("unavailable host evidence is unknown, not proof that the launcher is dead", async () => {
+    const r = setup();
+    r.host.activity = async () => { throw new Error("activity unavailable"); };
+    expect(await feedOf(r, running(r))).toMatchObject({ evidence: "alive", action: "adopt", probation: PROBATION });
+    expect(r.exportPlan).not.toHaveBeenCalled();
+  });
+
+  it("a failed process probe cannot prove inactivity", async () => {
+    const r = setup();
+    r.isAlive.mockImplementation(() => { throw new Error("process probe unavailable"); });
+    expect(await feedOf(r, running(r))).toMatchObject({ evidence: "alive", action: "adopt", probation: PROBATION });
+    expect(r.logs.some((s) => s.startsWith("warn:"))).toBe(true);
+    expect(r.logs.some((s) => s.startsWith("info:"))).toBe(false);
+  });
+
+  it("exports at most once per reconcile (not once per service), lazily for unknown children only", async () => {
+    const r = setup([record(), record({ taskId: "T2", child: "ses-T2-1" }, 2)]);
+    const l = ledgerOf(running(r), running(r, "T2"));
+    for (let call = 1; call <= 2; call++) {
+      expect((await r.svc.reconcile(l, new Set())).map((f) => [f.evidence, f.action, f.probation]))
+        .toEqual([["lost", "requeue-lost", null], ["lost", "requeue-lost", null]]);
+      expect(r.exportPlan).toHaveBeenCalledTimes(call);
+    }
+    await r.svc.reconcile(ledgerOf(taskNode("T1", { state: "ready" })), new Set());
+    expect(r.exportPlan).toHaveBeenCalledTimes(2);
+  });
+
+  it("failed export is memoised, warns once and leaves all children on probation", async () => {
+    const r = setup();
+    r.exportPlan.mockRejectedValue(new Error("history unavailable"));
+    const feeds = await r.svc.reconcile(ledgerOf(running(r), running(r, "T2")), new Set());
+    for (const f of feeds) expect(f).toMatchObject({ evidence: "alive", action: "adopt", probation: PROBATION });
+    expect(r.exportPlan).toHaveBeenCalledTimes(1);
+    expect(r.logs.filter((s) => s.startsWith("warn:"))).toHaveLength(1);
+    expect(r.logs[0]).toContain("history unavailable");
+  });
+});
 
 describe("reconcile: states that can have a child (matrix)", () => {
   describe("ready, latest attempt closed lost, slot set, child recorded", () => {

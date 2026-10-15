@@ -11,7 +11,7 @@ import { createCapacityController } from "../../src/executor/capacity.js";
 import { createLedgerStore } from "../../src/executor/ledger.js";
 import { taskBranchName } from "../../src/executor/git.js";
 import type { PlanBindInput, PlanRoleBindings } from "../../src/executor/launch.js";
-import { createRecoveryService, type RecoveryEngine } from "../../src/executor/recovery.js";
+import { createRecoveryService, type RecoveryDeps, type RecoveryEngine } from "../../src/executor/recovery.js";
 import {
   attemptTrailer,
   commitTaskInSlot,
@@ -675,7 +675,7 @@ interface Harness {
   running(id: TaskId, n: number, sessionID: string): Promise<RunDouble>;
   events(): Promise<ExecutorEvent[]>;
   /** A fresh RecoveryService (a new process) as `deps.recovery`. */
-  engine(toplevel?: string): RecoveryEngine;
+  engine(toplevel?: string, launcherLiveness?: RecoveryDeps["launcherLiveness"]): RecoveryEngine;
   /** The process dies: the runtime is disposed with its children still running, the next one gets a fresh launcher. */
   crash(): Promise<void>;
   /** `crash`, a fresh recovery engine, then `start()`. */
@@ -804,7 +804,7 @@ async function mk(draft: LedgerV1): Promise<Harness> {
     async events() {
       return (await store.exportPlan(PLAN_ID)).events;
     },
-    engine(toplevel = REPO) {
+    engine(toplevel = REPO, launcherLiveness) {
       const e = createRecoveryService({
         store,
         host: hosts,
@@ -817,6 +817,7 @@ async function mk(draft: LedgerV1): Promise<Harness> {
         },
         livenessMs: LIVENESS_MS,
         pollMs: POLL_MS,
+        launcherLiveness,
       });
       deps.recovery = e;
       // QA-4.2-21: the process's toplevel is the engine's (a foreign-plan test passes another one).
@@ -1123,6 +1124,129 @@ describe("start and locks (L2)", () => {
     expect(await h.store.exportPlan(PLAN_ID)).toEqual(before);
     expect((await h.events()).some((e) => JSON.stringify(e).includes("lock-takeover"))).toBe(false);
     expect(h.hosts.interrupts).toEqual([]);
+  });
+});
+
+describe("launcher identity and immediate restart recovery (v2)", () => {
+  const oldSelf = { pid: 100, hostname: "host-a", token: "old-process" };
+  const newSelf = { pid: 200, hostname: "host-a", token: "new-process" };
+  async function records(h: Harness): Promise<ExecutorEvent[]> {
+    return (await h.events()).filter((e) => e.type === "metric" && e.metric.name === "counter" && e.metric.key === "child-process");
+  }
+
+  it.each([false, true])("attempt-child records its launcher only with self present (self=%s)", async (withSelf) => {
+    const h = await mk(planOf([task("T1")]));
+    if (withSelf) h.deps.self = oldSelf;
+    await h.begin();
+    const run = await h.running("T1", 1, "ses-c1");
+    run.complete("Done.");
+    await untilEnqueued(h, "T1");
+    await h.runtime.settled();
+    const rows = await records(h);
+    expect(rows).toHaveLength(withSelf ? 1 : 0);
+    if (withSelf) expect(rows[0]).toMatchObject({ metric: { name: "counter", key: "child-process", value: 1,
+      labels: { taskId: "T1", n: "1", nonce: run.req.nonce, child: "ses-c1", pid: "100", hostname: "host-a", token: "old-process" } } });
+    await expect(run.hooks.onChildCreated("ses-refused")).rejects.toMatchObject({ code: "E_PLAN_STATE" });
+    expect(await records(h)).toEqual(rows); // refused batches must not acquire a launcher record
+  });
+
+  it.each([false, true])("late-child attempt-adopted records its launcher only with self present (self=%s)", async (withSelf) => {
+    const h = await mk(planOf([task("T1")]));
+    if (withSelf) h.deps.self = oldSelf;
+    await h.begin();
+    const run = await h.runOf("T1", 1);
+    h.launcher.gateValue = DISPOSED_GATE;
+    run.confirmation.resolve({ kind: "unconfirmed", reason: "timeout", error: null });
+    await until(() => h.state("T1") === "ready", "the timed-out launch requeued");
+    expect(await run.hooks.onLateChild("ses-late")).toBe("adopt");
+    await run.child("ses-late");
+    run.complete("Done late.");
+    await untilEnqueued(h, "T1");
+    await h.runtime.settled();
+    expect((await h.events()).filter((e) => e.type === "attempt-adopted")).toHaveLength(1);
+    const rows = await records(h);
+    expect(rows).toHaveLength(withSelf ? 1 : 0);
+    if (withSelf) expect(rows[0]).toMatchObject({ metric: { key: "child-process", value: 1,
+      labels: { taskId: "T1", n: "1", nonce: run.req.nonce, child: "ses-late", pid: "100", hostname: "host-a", token: "old-process" } } });
+  });
+
+  it.each([false, true])("recovery adopt never records the recovering process as launcher (ready=%s)", async (ready) => {
+    const h = await mk(planOf([task("T1")]));
+    h.deps.self = oldSelf;
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    h.launcher.gateValue = DISPOSED_GATE;
+    if (ready) await h.parts().writer.append([
+      { type: "attempt-ended", taskId: "T1", n: 1, outcome: "lost", endedAt: h.clock.iso(), detail: "runner-error" },
+      tr("T1", "running", "ready", "child-lost", "runner-error"),
+    ]);
+    await h.crash(); // drains the original launcher's metric chain
+    const before = await records(h);
+    expect(before).toHaveLength(1);
+    h.deps.self = newSelf;
+    h.hosts.activityValue = "active";
+    h.engine();
+    await h.runtime.start();
+    await h.runtime.settled();
+    expect(h.state("T1")).toBe("running");
+    expect((await h.events()).filter((e) => e.type === "attempt-adopted")).toHaveLength(ready ? 1 : 0);
+    expect(await records(h)).toEqual(before);
+  });
+
+  it.each(["dead foreign pid", "own pid reused"])("%s => inactive: reset, lost/restart uncounted, attempt 2 without advancing the clock or arming probation", async (kind) => {
+    const h = await mk(planOf([task("T1")]));
+    h.deps.self = oldSelf;
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.crash();
+    // A snapshot rotates the journal; the history-class launcher record must still be available.
+    const w = await h.store.open(PLAN_ID, h.deps.holder(ORCH));
+    await w.snapshot();
+    await w.close();
+    const self = kind === "own pid reused" ? { ...newSelf, pid: oldSelf.pid } : newSelf;
+    h.deps.self = self;
+    const isAlive = vi.fn((_pid: number) => false);
+    h.engine(REPO, { self, isAlive });
+    const timers = vi.spyOn(h.clock, "setTimer");
+    const now = h.clock.now(), mark = h.git.calls.length;
+    await h.runtime.start();
+    await h.runOf("T1", 2); // deliberately no clock advance, and no settled() while the new launch is live
+    expect(h.clock.now()).toBe(now);
+    expect(h.task("T1").attempts[0]?.outcome).toBe("lost");
+    const ends = endsOf(await h.events(), "T1");
+    expect(ends).toHaveLength(1);
+    expect(ends[0]).toMatchObject({ outcome: "lost", detail: "restart" });
+    expect(h.parts().policy.counted).toEqual([]);
+    expect(h.git.verbsSince(mark)).toContain("reset --hard HEAD");
+    expect(h.git.verbsSince(mark)).toContain("clean -fd");
+    expect(h.hosts.interrupts).toEqual([]);
+    expect(timers.mock.calls.filter(([ms]) => ms === POLL_MS)).toEqual([]);
+    if (kind === "own pid reused") expect(isAlive).not.toHaveBeenCalled();
+    else expect(isAlive).toHaveBeenCalledWith(oldSelf.pid);
+  });
+
+  it("a live launcher stays unknown: the same probation timer, deadline and uncounted restart end", async () => {
+    const h = await mk(planOf([task("T1")]));
+    h.deps.self = oldSelf;
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    await h.crash();
+    h.deps.self = newSelf;
+    h.engine(REPO, { self: newSelf, isAlive: () => true });
+    const timers = vi.spyOn(h.clock, "setTimer");
+    await h.runtime.start();
+    await h.runtime.settled();
+    expect(timers.mock.calls.some(([ms]) => ms === POLL_MS)).toBe(true);
+    expect(h.task("T1").attempts[0]?.outcome).toBeNull();
+    expect(h.launcher.runs).toEqual([]);
+    await advance(h, LIVENESS_MS - POLL_MS);
+    expect(h.hosts.interrupts).toEqual([]);
+    h.clock.advance(POLL_MS);
+    await h.runOf("T1", 2);
+    expect(h.hosts.interrupts).toEqual(["ses-c1"]);
+    expect(h.task("T1").attempts[0]?.outcome).toBe("lost");
+    expect(endsOf(await h.events(), "T1")[0]).toMatchObject({ outcome: "lost", detail: "restart" });
+    expect(h.parts().policy.counted).toEqual([]);
   });
 });
 
