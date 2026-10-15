@@ -4028,6 +4028,8 @@ documentation. The dogfood comparison (§0.12-5) is written in 6.2.0.
     *Amended by A-6.1-3 (owner decision 2026-10-15):* the remaining `unmeasured` smoke subcases are accepted through
     the real-use soak and gap disclosures in the amendment log, not new synthetic smoke scenarios. G5 stays with 2.3
     and G12's full matrix with 6.2. Absence of evidence is never a pass.
+    *Amended by A-6.1-4 (owner decision 2026-10-15):* at a head that changes `src\` after three greens, the three
+    consecutive greens are two working-worktree runs plus the 6.1.4 clean-checkout run, all on that code.
     - *Amended by A-6.1-2 (owner decision 2026-10-15):* reconstruct and record makespan, CP_eff, W_auth/p, ΣI_service,
       the A-6.1-1 bound, makespan/bound ratio and whether the bound was met; the makespan bound is a measured, disclosed
       metric, not a Phase 6.1 acceptance gate. Disclose these alongside G13 in the Phase 6.2 PR. W_auth and task work
@@ -4061,6 +4063,8 @@ documentation. The dogfood comparison (§0.12-5) is written in 6.2.0.
   *Amended by A-6.1-3 (owner decision 2026-10-15):* this single detached run catches environment leakage on a clean
   checkout (dependencies outside the lockfile, untracked files); runs 19–23 already proved the same code three
   consecutive times in the working worktree. It is not another three-run repeatability gate.
+  *Amended by A-6.1-4 (owner decision 2026-10-15):* after `2b2cb58`, this run is the third of the three consecutive
+  greens at the new head, after two green working-worktree runs.
   Writes: none. Reads: `D:\git\omr-cpx-e2e\`.
 - **6.1.5** [tier:medium] VERIFY:required Documentation.
   [route class=implement risk=low scope=multi needs=edit,shell d=deterministic root=D:\git\omr-cpx-p61 tier=medium pin]
@@ -4681,5 +4685,18 @@ Node ≥ 22.18; DF-2 switch procedure and the 24 h pending TTL from DF-1; QA tas
 
   Recorded in `docs\qa\critical-path-execution\phase-6.1.md`, "Owner amendment A-6.1-3 — 2026-10-15". Earlier dated
   three-detached-run and mandatory-synthetic-subcase statements are historical, superseded by this decision.
+
+- **A-6.1-4** (Phase 6.1, owner decision **2026-10-15**) — **Re-earning the three greens after the recovery-cycle
+  fix.** Applies to 6.1.3's three-consecutive-run criterion and 6.1.4.
+
+  > Commit `2b2cb58` (recovered verification admitted after the root context returns) changed `src\` after runs 21–23
+  > were green at `66efe47`. The three consecutive greens are re-earned at the new head as **two consecutive green
+  > runs in the working worktree plus the single 6.1.4 clean-checkout run**, which counts as the third. All three run
+  > the same code (commits between them may touch only docs); any red resets the count.
+
+  Rationale: the change touches only the executor recovery path and the plan-task verifier's attachment cut; runs
+  19–23 already covered the remaining code, and smoke cost and duration are an owner constraint. The 6.1.4 run keeps
+  its A-6.1-3 purpose (environment leakage on a clean checkout). Recorded in
+  `docs\qa\critical-path-execution\phase-6.1.md`, "Owner amendment A-6.1-4 — 2026-10-15".
 
 **Owner execution rules for the implementation session** — §0.14 (continuous iteration, momentary takeover, atomic delegation with [tier:heavy] for complex coding and lighter test runs, bounded QA rounds, pre-flight fix-or-document, Linear not used, worktree reporting), the testing policy (§0.6-9: scoped, accelerated, full suite only in 6.2), the bounded executor QA loop (default 3 rounds), and the handover's kickoff prompt.

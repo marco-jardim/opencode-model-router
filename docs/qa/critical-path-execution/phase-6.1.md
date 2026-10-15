@@ -532,3 +532,13 @@ the project rule, round-2 minors and nits are deferred and recorded here:
 
 The three consecutive green runs of 6.1.3 were earned at earlier heads; they must be re-earned at the new head that
 carries this change. No smoke result is claimed in this section.
+
+## Owner amendment A-6.1-4 — 2026-10-15
+
+Commit `2b2cb58` (recovered verification admitted after the root context returns) changed `src\` after runs 21–23 were
+green at `66efe47`, so 6.1.3's three consecutive greens must be re-earned at the new head. Owner decision: they are
+**two consecutive green runs of `npm run smoke:cpx:e2e` in the working worktree plus the single 6.1.4 clean-checkout
+run** (detached worktree, `npm ci`), which counts as the third. All three run the same code (commits between them may
+touch only docs); any red resets the count.
+The change touches only the executor recovery path and the plan-task verifier's attachment cut; runs 19–23 covered the
+rest of the code. Recorded in the plan's amendment log.
