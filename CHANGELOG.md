@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **OpenCode v2: role-dispatch decision rows record where their risk came from.** `trace.riskSources` lists the class
+  base risk, the rules estimate, the route line's `risk=` claim, the merged facts, any inherited resume risk and the
+  effective risk, plus an optional bounded vocabulary label (a single word or a table id, never prompt text). Routing
+  is unchanged; older rows stay readable.
 - **OpenCode v2: opt-in `routing.roleFloor: "gated"`** (global only, default `"strict"`). A role dispatch that may edit
   and run commands, whose detection is `grader`, whose risk is not `high`, whose return gate runs and whose role can
   be raised from `medium` straight to `heavy`, gets a `medium` authority floor instead of `heavy` (bounds reason

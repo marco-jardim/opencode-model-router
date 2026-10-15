@@ -48,7 +48,7 @@ import {
 import { buildRoleLadder, roleTierOrder, routerTierIds } from "../engine/ladders";
 import { decideRole } from "../engine/kernel";
 import type { Candidate, ChosenDispatch, Decision, HostAgentInfo, Ladder, RoleLadder } from "../engine/types";
-import { CLASS_IMPLIED_NEEDS, FACT_SOURCES, NEEDS, RISKS, SCOPES, TASK_CLASSES, classify, classifyNeedMatches } from "../classify";
+import { CLASS_BASE_RISK, CLASS_IMPLIED_NEEDS, FACT_SOURCES, NEEDS, RISKS, SCOPES, TASK_CLASSES, classify, classifyNeedMatches, classifyRiskTerm } from "../classify";
 import type { ClassifyResult, Detection, Need, RouteLine, TaskFacts } from "../classify/types";
 import { resolveRolesRouting, resolveVerifyBudget, type RouterConfig } from "../../router/config";
 import { resolveEnforcementMode } from "../../router/enforcement";
@@ -1375,7 +1375,7 @@ function factsOf(facts: TaskFacts): DecisionRow["facts"] {
   return { class: facts.class, risk: facts.risk, scope: facts.scope, needs: [...facts.needs], confidence: facts.confidence, source: facts.source };
 }
 
-function traceOf(result: ClassifyResult, argmin: RouteChoice | null): DecisionTrace {
+function traceOf(result: ClassifyResult, argmin: RouteChoice | null, riskSources?: DecisionTrace["riskSources"]): DecisionTrace {
   const { routeLines, backend, backendSkipped } = result.trace;
   return {
     routeLines: { count: routeLines.count, conflict: routeLines.conflict, edgeOnly: routeLines.edgeOnly },
@@ -1391,6 +1391,7 @@ function traceOf(result: ClassifyResult, argmin: RouteChoice | null): DecisionTr
         },
     ...(backendSkipped === undefined ? {} : { backendSkipped }),
     ...(argmin === null ? {} : { argmin }),
+    ...(riskSources === undefined ? {} : { riskSources }),
   };
 }
 
@@ -2242,6 +2243,8 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
       // QA-P21-1-11: a fresh dispatch has no binding yet (its child binds later; `noteBinding` writes the observed kind then).
       // A resume records the child's current binding.
       const binding = resumed ? currentBinding(resumeID, { maxOf: (name) => roleMaxActions(rp.roles.get(name)) })?.kind : undefined;
+      const riskTerm = classifyRiskTerm({ description, prompt, cwd: classifyCwd }, rp.classifyDeps);
+      const inheritedRisk = RISKS.find((risk) => risk === original?.facts.risk);
       row = {
         v: LOG_ROW_VERSION,
         ts: new Date(safeNow(now)).toISOString(),
@@ -2261,7 +2264,15 @@ export function createDispatchRouter(deps: DispatchRouterDeps): DispatchRouter {
         reason: `${head}; role @${agent} on ${tier} in ${bounds.floor}..${bounds.ceiling}${extra.length > 0 ? ` [${extra.join("; ")}]` : ""}`,
         step: "dispatch",
         resume: resumed,
-        trace: { ...traceOf(result, argmin), needTerms }, // QA-G-B-3 (3)
+        trace: { ...traceOf(result, argmin, {
+          base: CLASS_BASE_RISK[result.trace.rules.class],
+          rules: result.trace.rules.risk,
+          routeLine: routeLine?.risk ?? null,
+          facts: result.facts.risk,
+          ...(inheritedRisk === undefined ? {} : { resumedDispatch: inheritedRisk }),
+          effective: taskFacts.risk,
+          ...(riskTerm === undefined ? {} : { term: riskTerm }),
+        }), needTerms }, // QA-G-B-3 (3)
         detection: {
           effective: detection,
           ...(result.detection !== undefined && result.detection !== null && result.detection !== detection ? { claimed: result.detection } : {}),

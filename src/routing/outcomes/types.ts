@@ -10,6 +10,7 @@
 // ---------------------------------------------------------------------------
 
 import type { Verdict as VerificationVerdict } from "../../verify/types";
+import type { Risk } from "../classify/types";
 
 // ---------------------------------------------------------------------------
 // Primitives
@@ -570,6 +571,21 @@ export interface DecisionTrace {
    * `<need>:resumed-dispatch`. Before any narrowing: `facts.needs` is what was decided.
    */
   readonly needTerms?: readonly string[];
+  /**
+   * Role dispatches only: risk proposals before the raise-only merge. `base` is the rules class's base risk;
+   * `facts` includes any accepted backend raise, and `resumedDispatch` is the inherited risk, when present.
+   * Every proposal equal to `effective` is a joint winner (there is no risk tie-break). Older rows omit this field.
+   */
+  readonly riskSources?: {
+    readonly base: Risk;
+    readonly rules: Risk | null;
+    readonly routeLine: Risk | null;
+    readonly facts: Risk;
+    readonly resumedDispatch?: Risk;
+    readonly effective: Risk;
+    /** A bounded vocabulary label, never surrounding prompt text. */
+    readonly term?: string;
+  };
 }
 
 /**
@@ -578,6 +594,9 @@ export interface DecisionTrace {
  * of any other shape could carry prompt text and is dropped when a row is read.
  */
 export const NEED_TERM_RE = /^[a-z_]+:[a-z0-9=_ -]{1,48}$/;
+
+/** A single bounded high-risk vocabulary word, or its table id for a match that could contain private text. */
+export const RISK_TERM_RE = /^(?:[a-z-]{1,40}|term-[0-9]{1,3})$/;
 
 /** One routed dispatch (2.2) or one ladder attempt (2.3). Fields of §0.11 plus kind/v/decisionID/step/resume. */
 export interface DecisionRow extends LogRowBase {
