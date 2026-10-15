@@ -97,6 +97,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OpenCode v2: the executor's default QA fix task route line is now a well-formed `[route ...]` line**, so a fix task created at runtime without a phase `FIX` template launches instead of failing route rendering.
 - **OpenCode v2: service observations exclude process preparation, mark native grading without provider-attempt events as insufficient evidence, and attribute plan-task checks and grading to the checked candidate.**
 - **OpenCode v2: the executor admits tasks to physical slots in critical-path priority order.** A lower-priority
   task no longer takes the only free slot ahead of a higher-priority ready task, and a durable slot release reschedules

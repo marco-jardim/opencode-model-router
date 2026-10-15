@@ -4,6 +4,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { renderRouteLine } from "../../src/executor/expand.js";
 import { createLedgerStore } from "../../src/executor/ledger.js";
 import {
   createQaLoop, decideRound, extractFindingsText, FIX_ROLE_AGENT, groupFindings, normalizeFindingPath, originalReviewText,
@@ -535,7 +536,7 @@ describe("onQaResult: next round", () => {
     const env = await setup();
     await env.loop.onQaResult(env.qaId, report(f("A1", "major", ["a.ts"])));
     const t = env.task(fixTaskId(PHASE, 1, 1));
-    expect(t.route.line).toBe("class=implement d=deterministic tier=medium pin root=C:/repo");
+    expect(t.route.line).toBe("[route class=implement d=deterministic tier=medium pin root=C:/repo]");
     expect(t.route).toMatchObject({ tier: "medium", pin: true });
     expect(t.acceptance).toBeNull();
   });
@@ -582,19 +583,36 @@ describe("onQaResult: next round", () => {
   it("without a template and with no root= on any task of the phase: the root is the repo toplevel", async () => {
     const env = await setup({ qaPatch: { route: noRoot } });
     await env.loop.onQaResult(env.qaId, report(f("A1", "major", ["a.ts"])));
-    expect(env.task(fixTaskId(PHASE, 1, 1)).route.line).toBe("class=implement d=deterministic tier=medium pin root=C:/repo");
+    expect(env.task(fixTaskId(PHASE, 1, 1)).route.line).toBe("[route class=implement d=deterministic tier=medium pin root=C:/repo]");
   });
 
   it("a toplevel with whitespace is quoted in the fallback root token", async () => {
     const env = await setup({ qaPatch: { route: noRoot }, toplevel: "C:/my repo" });
     await env.loop.onQaResult(env.qaId, report(f("A1", "major", ["a.ts"])));
-    expect(env.task(fixTaskId(PHASE, 1, 1)).route.line).toBe('class=implement d=deterministic tier=medium pin root="C:/my repo"');
+    expect(env.task(fixTaskId(PHASE, 1, 1)).route.line).toBe('[route class=implement d=deterministic tier=medium pin root="C:/my repo"]');
   });
 
   it("a quoted root= token on a phase task is reused as written", async () => {
     const env = await setup({ qaPatch: { route: { ...noRoot, line: 'class=review d=none tier=heavy pin root="C:/a b"' } } });
     await env.loop.onQaResult(env.qaId, report(f("A1", "major", ["a.ts"])));
-    expect(env.task(fixTaskId(PHASE, 1, 1)).route.line).toBe('class=implement d=deterministic tier=medium pin root="C:/a b"');
+    expect(env.task(fixTaskId(PHASE, 1, 1)).route.line).toBe('[route class=implement d=deterministic tier=medium pin root="C:/a b"]');
+  });
+
+  it("renders a launchable route line for a QA fix task without a FIX template (smoke run 14)", async () => {
+    const env = await setup();
+    await env.loop.onQaResult(env.qaId, report(f("A1", "major", ["a.ts"])));
+    const t = env.task(fixTaskId(PHASE, 1, 1));
+    expect(t.route.line).toBe("[route class=implement d=deterministic tier=medium pin root=C:/repo]");
+    expect(() => renderRouteLine(t, "C:/slot")).not.toThrow();
+    expect(renderRouteLine(t, "C:/slot")).toBe("[route class=implement d=deterministic root=C:/slot tier=medium pin]");
+  });
+
+  it("a bracketed phase route line (the production shape) yields a well-formed fix route line", async () => {
+    const env = await setup({ qaPatch: { route: { ...noRoot, line: "[route class=review d=none tier=heavy pin root=C:/repo]" } } });
+    await env.loop.onQaResult(env.qaId, report(f("A1", "major", ["a.ts"])));
+    const t = env.task(fixTaskId(PHASE, 1, 1));
+    expect(t.route.line).toBe("[route class=implement d=deterministic tier=medium pin root=C:/repo]");
+    expect(() => renderRouteLine(t, "C:/slot")).not.toThrow();
   });
 
   it("the re-review task copies the round's qa route line and depends on every fix task", async () => {

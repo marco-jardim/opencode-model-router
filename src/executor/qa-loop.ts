@@ -79,7 +79,7 @@ export function createQaLoop(d: QaLoopDeps): QaLoop {
       const id = fixTaskId(phase.id, round, idx + 1);
       const fileless = g.writes.length === 0;
       (fileless ? filelessIds : fixIds).push(id);
-      const line = template !== null ? template.route.line : `${DEFAULT_FIX_ROUTE_LINE} ${phaseRootToken(l, phase.id)}`;
+      const line = template !== null ? template.route.line : `[route ${DEFAULT_FIX_ROUTE_LINE} ${phaseRootToken(l, phase.id)}]`;
       const route = template !== null ? { ...template.route } : { line, role: FIX_ROLE_AGENT, tier: "medium" as const, pin: true };
       out.push({
         type: "task-created",
@@ -276,6 +276,10 @@ export function decideRound(r: FindingsReport, round: number, qaMaxRounds: numbe
 
 /** U3: at most this many characters of an inbox text, then an ellipsis. */
 const INBOX_TEXT_LIMIT = 4000;
+/**
+ * Body of the default fix route line; the caller appends the phase root token and wraps it in `[route ...]`,
+ * as renderRouteLine requires a whole bracketed line.
+ */
 const DEFAULT_FIX_ROUTE_LINE = "class=implement d=deterministic tier=medium pin";
 /**
  * The role agent a default fix task runs as (QA-4.2-11): class `implement` maps to the role KIND `implement`
@@ -316,7 +320,7 @@ function roundQaTask(l: Readonly<LedgerV1>, phaseId: PhaseId, round: number): Ta
   return null;
 }
 
-const ROOT_TOKEN_RE = /\broot=("[^"]*"|\S+)/;
+const ROOT_TOKEN_RE = /\broot=("[^"]*"|[^\s\]]+)/;
 
 /** The `root=` token of the first route line of the phase's tasks, else one built from the repo toplevel. */
 function phaseRootToken(l: Readonly<LedgerV1>, phaseId: PhaseId): string {
