@@ -261,8 +261,10 @@ class SlotPoolDouble implements SlotPool {
   async reset(slot: string): Promise<void> {
     this.log.push(`slots.reset:${slot}`);
   }
-  async cleanForChecks(slot: string): Promise<void> {
+  async noteCommit(): Promise<void> {}
+  async cleanForChecks(slot: string): Promise<{ drifted: boolean }> {
     this.log.push(`slots.cleanForChecks:${slot}`);
+    return { drifted: false };
   }
   async release(slot: string): Promise<void> {
     this.released.push(slot);

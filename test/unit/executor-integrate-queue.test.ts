@@ -1341,7 +1341,8 @@ class PoolDouble implements SlotPool {
     this.w.slotCommit.set(slot, commit);
     if (slot === "integration") this.w.iwtHead = commit;
   }
-  async cleanForChecks(): Promise<void> {}
+  async noteCommit(): Promise<void> {}
+  async cleanForChecks(): Promise<{ drifted: boolean }> { return { drifted: false }; }
   /** Called synchronously at the start of every release (test hook). */
   onRelease: ((slot: string) => void) | null = null;
   async release(slot: string): Promise<void> {
@@ -2266,6 +2267,52 @@ describe("batches of 4 (M17, M18)", () => {
 });
 
 describe("post-rebase checkout reuse", () => {
+  it("does not retry/reset a failed prepare while immutable reads still hold the slot cwd", async () => {
+    const env = await setup();
+    let releaseShow!: () => void, releaseDiff!: () => void;
+    const showGate = new Promise<void>(resolve => { releaseShow = resolve; });
+    const diffGate = new Promise<void>(resolve => { releaseDiff = resolve; });
+    const igit: IntegrateGit = env.igit;
+    vi.spyOn(igit, "showFile").mockImplementation(async (_cwd, _commit, path) => {
+      if (path === "package.json") throw new Error("show failed");
+      await showGate;
+      return null;
+    });
+    vi.spyOn(env.igit, "diffNameStatus").mockImplementation(async () => { await diffGate; return []; });
+    const clean = vi.spyOn(env.pool, "cleanForChecks").mockRejectedValue(new Error("prepare failed"));
+    const reset = vi.spyOn(env.pool, "reset");
+    const checks = createIntegrationChecks({ ledger: () => env.ledger, pool: env.pool, git: env.git, igit: env.igit,
+      clock: env.clock, logger: env.logger, guard: env.guard, background: new BackgroundRuns(),
+      resolver: { resolve: async () => { throw new Error("unexpected resolve"); } },
+      spawn: async () => { throw new Error("unexpected spawn"); },
+    });
+    const completed: CheckResult[] = [];
+    const run = vi.spyOn(env.checks, "run").mockImplementation(async req => {
+      const result = await checks.run(req);
+      completed.push(result);
+      return result;
+    });
+    env.queue.enqueue(["T1"]);
+    try {
+      await env.until(() => clean.mock.calls.length > 0);
+      // stack() resets the slot before its rebase; no further reset (a retry) may start while the reads hold the cwd.
+      const resetsBeforeFailure = reset.mock.calls.length;
+      expect(completed).toEqual([]);
+      expect(run).toHaveBeenCalledTimes(1);
+      releaseShow();
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(completed).toEqual([]);
+      expect(run).toHaveBeenCalledTimes(1);
+      expect(reset).toHaveBeenCalledTimes(resetsBeforeFailure);
+    } finally { releaseShow(); releaseDiff(); }
+    await env.until(() => env.ledger.status === "paused");
+    expect(completed).toHaveLength(3);
+    for (const result of completed) expect(result).toMatchObject({ verdict: "error", reason: "prepare", message: expect.stringContaining("prepare failed") });
+    expect(env.w.tip()).toBe(env.w.base);
+    env.assertInvariants();
+    await env.queue.dispose();
+  });
+
   it.each([1, 4])("offers reuse for the same slot and candidate just rebased by the queue (%s tasks)", async tasks => {
     const env = await setup({ tasks });
     const run = vi.spyOn(env.checks, "run");

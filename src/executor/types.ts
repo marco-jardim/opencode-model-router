@@ -1395,7 +1395,10 @@ export interface SlotPool {
   acquireSpecial(planId: PlanId, kind: "integration" | "ci"): Promise<SlotAcquisition>;
   /** Checkout detached + clean tracked; re-provision on manifest drift. */
   reset(slot: string, commit: string): Promise<void>;
-  cleanForChecks(slot: string): Promise<void>;
+  /** Persist a leased checkout's commit after the caller has cleaned and verified its HEAD. Does not reset it. */
+  noteCommit(slot: string, commit: string): Promise<void>;
+  /** Clean the checkout and report whether provisioning drift was detected. */
+  cleanForChecks(slot: string): Promise<{ drifted: boolean }>;
   /** Idempotent. */
   release(slot: string): Promise<void>;
   /** Subscribe without opening the pool. Called only after a task slot's leased -> ready marker is durable.

@@ -1270,10 +1270,24 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
     });
   }
 
-  async function cleanForChecks(slot: string): Promise<void> {
+  async function noteCommit(slot: string, commit: string): Promise<void> {
     assertLive();
     assertSlot(slot);
+    if (typeof commit !== "string" || !GIT_ID_PATTERN.test(commit)) {
+      throw new ExecutorError("E_INVALID_INPUT", "commit must be a full git object id", { commit: String(commit).slice(0, 80) });
+    }
     await slotLock(slot).run(async () => {
+      const rec = records.get(slot);
+      if (rec === undefined) throw new ExecutorError("E_INVALID_INPUT", `unknown slot ${slot}`, { slot });
+      if (rec.state !== "leased") throw new ExecutorError("E_INVALID_INPUT", `slot ${slot} is ${rec.state}, not leased`, { slot, state: rec.state });
+      await save({ ...rec, commit });
+    });
+  }
+
+  async function cleanForChecks(slot: string): Promise<{ drifted: boolean }> {
+    assertLive();
+    assertSlot(slot);
+    return slotLock(slot).run(async () => {
       const rec = records.get(slot);
       if (rec === undefined) throw new ExecutorError("E_INVALID_INPUT", `unknown slot ${slot}`, { slot });
       if (rec.state !== "leased") throw new ExecutorError("E_INVALID_INPUT", `slot ${slot} is ${rec.state}, not leased`, { slot, state: rec.state });
@@ -1293,6 +1307,7 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
         await d.git.cleanForChecks(rec.path, keep);
         const drift = await driftProvision(rec);
         if (drift.drifted) syncEnv(await save({ ...drift.rec, state: "leased" }));
+        return { drifted: drift.drifted };
       } catch (error) {
         throw await failStage(slot, error);
       }
@@ -1499,6 +1514,7 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
       return acquireSlot(() => claimSpecial(kind, base), { kind, owner: kind, base });
     },
     reset,
+    noteCommit,
     cleanForChecks,
     release,
     onTaskSlotReleased(listener) {

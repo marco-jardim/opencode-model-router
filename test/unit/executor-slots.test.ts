@@ -4,11 +4,12 @@ import { join, win32 } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { runArgv } from "../../src/verify/exec";
 import type { GitOps, StatusEntry } from "../../src/executor/git";
+import { BackgroundRuns, createIntegrationChecks } from "../../src/executor/integrate/checks";
 import { assertSafeSlotDir, createSlotPool, defaultSlotsDir, gcSlots, isSlotRecord, markerPath, slotLockReason, SLOT_NAME_PATTERN, SLOT_SWEEP_MAX_ENTRIES, UNKNOWN_PLAN_GC_AGE_MS } from "../../src/executor/slots/pool";
 import { applySlotEnv, registerSlot, slotEnvFor, unregisterSlot } from "../../src/executor/slots/env";
 import { detectManagers, SLOT_SWEEP_MAX_ENTRIES as PROVISION_SWEEP_MAX_ENTRIES } from "../../src/executor/slots/provision";
 import type { Detection, Provisioner } from "../../src/executor/slots/provision";
-import { ExecutorError, GIT_ID_PATTERN, type Clock, type ExecutorConfig, type FileSystem, type FsStat, type SlotRecord } from "../../src/executor/types";
+import { ExecutorError, GIT_ID_PATTERN, type Clock, type ExecutorConfig, type FileSystem, type FsStat, type LedgerV1, type SlotRecord } from "../../src/executor/types";
 
 // ---------------------------------------------------------------------------------------------------------------
 // Fakes: file system, clock, git, provisioner
@@ -483,6 +484,53 @@ describe("SlotPool lifecycle", () => {
     expect(again.slot).toBe(b.slot);
   });
 
+  it("persists the candidate commit after checkout reuse and preserves claim affinity", async () => {
+    const h = harness();
+    await h.pool.open();
+    const older = await h.pool.acquire(PLAN, "older", C1);
+    const reused = await h.pool.acquire(PLAN, "reused", C1);
+    h.git.heads.set(key(reused.path), C2); // The integration queue's rebase moved HEAD, not the marker.
+    const checks = createIntegrationChecks({
+      ledger: () => ({ config: { integrationChecks: "auto", python: "auto" } } as LedgerV1),
+      pool: h.pool, git: h.git, clock: h.clock, logger: { warn() {} }, background: new BackgroundRuns(),
+      igit: { showFile: async () => null, diffNameStatus: async () => [] } as unknown as Parameters<typeof createIntegrationChecks>[0]["igit"],
+      guard: { assertWriteCwd: async () => undefined },
+      resolver: { resolve: async () => { throw new Error("unexpected resolve"); } },
+      spawn: async () => { throw new Error("unexpected spawn"); },
+    });
+    const before = h.marker(reused.slot);
+    expect(before.commit).toBe(C1);
+    h.clock.tick(1);
+    expect(await checks.run({ slot: reused, base: C1, candidate: C2, reuseCheckout: true,
+      priority: "foreground", signal: new AbortController().signal })).toMatchObject({ verdict: "pass", note: "no-checks" });
+    expect(h.marker(reused.slot)).toMatchObject({ ...before, commit: C2, updatedAt: expect.any(String) });
+    expect(h.marker(reused.slot).updatedAt).not.toBe(before.updatedAt);
+    expect(await h.pool.get(reused.slot)).toEqual(h.marker(reused.slot));
+    expect(h.git.log.some(line => line.startsWith("checkout "))).toBe(false);
+    await h.pool.release(older.slot);
+    await h.pool.release(reused.slot);
+    expect((await h.pool.acquire(PLAN, "next", C2)).slot).toBe(reused.slot);
+    h.pool.close();
+  });
+
+  it("noteCommit validates the lease and object id and updates memory only after the marker save", async () => {
+    const h = harness();
+    await h.pool.open();
+    const lease = await h.pool.acquire(PLAN, "t", C1);
+    await expect(h.pool.noteCommit(lease.slot, "HEAD")).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
+    await expect(h.pool.noteCommit("slot-9", C2)).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
+    const fsync = h.fs.fsyncDir.bind(h.fs);
+    h.fs.fsyncDir = async () => { throw new Error("marker flush failed"); };
+    await expect(h.pool.noteCommit(lease.slot, C2)).rejects.toThrow("marker flush failed");
+    expect(await h.pool.get(lease.slot)).toMatchObject({ commit: C1 });
+    h.fs.fsyncDir = fsync;
+    await h.pool.noteCommit(lease.slot, C2);
+    expect(h.marker(lease.slot).commit).toBe(C2);
+    await h.pool.release(lease.slot);
+    await expect(h.pool.noteCommit(lease.slot, C3)).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
+    h.pool.close();
+  });
+
   it("returns the same slot to the same owner", async () => {
     const h = harness();
     await h.pool.open();
@@ -616,6 +664,21 @@ describe("SlotPool lifecycle", () => {
     await h.pool.release("slot-1");
     await expect(h.pool.cleanForChecks("slot-1")).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
     await expect(h.pool.cleanForChecks("slot-5")).rejects.toMatchObject({ code: "E_INVALID_INPUT" });
+  });
+
+  it("cleanForChecks reports drift explicitly, including under an unchanged clock", async () => {
+    const h = harness();
+    await h.pool.open();
+    const lease = await h.pool.acquire(PLAN, "t", C1);
+    const before = h.marker(lease.slot);
+    h.clock.iso = () => before.updatedAt;
+    expect(await h.pool.cleanForChecks(lease.slot)).toEqual({ drifted: false });
+    h.fs.put(win32.join(lease.path, "requirements.txt"), "changed\n");
+    expect(await h.pool.cleanForChecks(lease.slot)).toEqual({ drifted: true });
+    expect(h.marker(lease.slot).updatedAt).toBe(before.updatedAt);
+    expect(h.prov.calls).toHaveLength(2);
+    expect(await h.pool.cleanForChecks(lease.slot)).toEqual({ drifted: false });
+    h.pool.close();
   });
 
   it("cleanForChecks sweeps links that are not tracked and leaves the dependency directories", async () => {

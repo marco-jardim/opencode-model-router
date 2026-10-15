@@ -93,7 +93,7 @@ async function fixture(setting: "auto" | "configured" = "configured") {
       git(cwd, "reset", "--hard", sha);
       prepared.push({ cwd, commit: sha });
     },
-    cleanForChecks: async () => {}, // The probe writes nothing; the provisioned, untracked binaries must survive resets.
+    cleanForChecks: async () => ({ drifted: false }), // The probe writes nothing; the provisioned, untracked binaries must survive resets.
     list: async () => [ci, intSlot].map(s => stub<SlotRecord>({ path: s.path })),
   });
   const ops = stub<GitOps>({
@@ -260,7 +260,7 @@ async function scopedFixture(configured = false, configChanged = false, redBase 
   if (!selected.ok) throw new Error(selected.reason);
   const ci: SlotLease = { slot: "ci", path: ciPath, planId: "plan", owner: "ci", commit: candidate };
   const pool = stub<SlotPool>({
-    reset: async (_slot, sha) => { git(ciPath, "reset", "--hard", sha); }, cleanForChecks: async () => {},
+    reset: async (_slot, sha) => { git(ciPath, "reset", "--hard", sha); }, cleanForChecks: async () => ({ drifted: false }),
     list: async () => [stub<SlotRecord>({ path: ciPath }), stub<SlotRecord>({ path: integration })],
   });
   const ops = stub<GitOps>({ revParse: async (cwd, ref) => git(cwd, "rev-parse", ref) });

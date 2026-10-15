@@ -111,6 +111,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OpenCode v2: integration check selection never treats a failed `git show` as a missing file.** Only git's explicit
+  "path does not exist" error means absent; any other read failure fails the check as `prepare`, never a `no-checks`
+  pass. A failed prepare now waits for its overlapped reads before the slot is retried.
+- **OpenCode v2: QA fix tasks get a launchable route line for any repository path.** A repository or phase root that
+  cannot be written safely into a route line (brackets, quotes, separators) is omitted, since the slot root is always
+  appended at launch; fix tasks stored by the earlier build with an unbracketed line launch as well.
 - **OpenCode v2: the executor's default QA fix task route line is now a well-formed `[route ...]` line**, so a fix task created at runtime without a phase `FIX` template launches instead of failing route rendering.
 - **OpenCode v2: service observations exclude process preparation, mark native grading without provider-attempt events as insufficient evidence, and attribute plan-task checks and grading to the checked candidate.**
 - **OpenCode v2: the executor admits tasks to physical slots in critical-path priority order.** A lower-priority

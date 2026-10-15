@@ -223,7 +223,11 @@ export function createIntegrateGit(run: GitRunner, guard: WriteGuard, lstatOf: L
     },
     async showFile(cwd, commit, path) {
       const r = await exec(cwd, ["show", `${commit}:${path}`]);
-      return r.code === 0 ? r.stdout : null;
+      if (r.code === 0) return r.stdout;
+      const error = r.stderr.trim();
+      if (r.code === 128 && (error === `fatal: path '${path}' does not exist in '${commit}'`
+        || error === `fatal: path '${path}' exists on disk, but not in '${commit}'`)) return null;
+      throw new ExecutorError("E_GIT", `git show failed (exit ${r.code ?? r.signal ?? "unknown"})`, { op: "show", code: r.code, stderr: r.stderr.slice(-2048) });
     },
     async subject(cwd, commit) {
       return (await ok(cwd, "log", ["log", "-1", "--format=%s", commit, "--"])).replace(/\r?\n$/, "");
@@ -380,6 +384,12 @@ function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+/** Immutable-object reads must all release their slot cwd before a failed attempt can be retried. */
+async function settledReads<T extends readonly unknown[]>(reads: T) {
+  await Promise.allSettled(reads);
+  return Promise.all(reads);
+}
+
 /** The test file part of a stable failing id (`<file> > a > b`, `<file>::Cls::test`, or a bare file). */
 function fileOfId(id: string): string {
   const gt = id.indexOf(" > ");
@@ -496,17 +506,13 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
 
   async function prepareReused(slot: SlotLease, commit: string): Promise<void> {
     try {
-      const before = await d.pool.get(slot.slot);
-      await d.pool.cleanForChecks(slot.slot);
+      const { drifted } = await d.pool.cleanForChecks(slot.slot);
       const head = await d.git.revParse(slot.path, "HEAD");
-      const after = await d.pool.get(slot.slot);
       // A drift install can change tracked files after the clean. Only a full prepare restores and verifies those.
-      if (head !== commit || before === null || after === null || before.state !== "leased" || after.state !== "leased"
-        || before.updatedAt !== after.updatedAt || before.managers.length !== after.managers.length
-        || before.managers.some((m, i) => m !== after.managers[i])
-        || Object.keys(before.manifests).length !== Object.keys(after.manifests).length
-        || Object.entries(before.manifests).some(([p, hash]) => after.manifests[p] !== hash)) {
+      if (head !== commit || drifted) {
         await prepare(slot, commit);
+      } else {
+        await d.pool.noteCommit(slot.slot, commit);
       }
     } catch (e) {
       if (e instanceof CheckPrepareError) throw e;
@@ -530,9 +536,9 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
 
   async function readSelection(cwd: string, commit: string) {
     const read = (p: string) => d.igit.showFile(cwd, commit, p);
-    const [packageJson, pytestIni, conftest, pyproject, setupCfg, toxIni] = await Promise.all([
+    const [packageJson, pytestIni, conftest, pyproject, setupCfg, toxIni] = await settledReads([
       read("package.json"), read("pytest.ini"), read("conftest.py"), read("pyproject.toml"), read("setup.cfg"), read("tox.ini"),
-    ]);
+    ] as const);
     return { packageJson, pytestIni: pytestIni !== null, conftest: conftest !== null, pyproject, setupCfg, toxIni };
   }
 
@@ -848,12 +854,13 @@ export function createIntegrationChecks(d: IntegrationChecksDeps): IntegrationCh
     let selection: CheckSelection;
     let changed: ChangedPath[];
     // These read immutable commit objects, not the checkout. Handle rejection immediately, but let prepare fail first.
-    const reads = Promise.all([readSelection(cwd, req.candidate), Promise.resolve().then(() => d.igit.diffNameStatus(cwd, req.base, req.candidate))])
+    const reads = settledReads([readSelection(cwd, req.candidate), Promise.resolve().then(() => d.igit.diffNameStatus(cwd, req.base, req.candidate))] as const)
       .then(value => ({ ok: true as const, value }), (error: unknown) => ({ ok: false as const, error }));
     try {
       if (req.reuseCheckout) await prepareReused(req.slot, req.candidate);
       else await prepare(req.slot, req.candidate);
     } catch (e) {
+      await reads;
       return err("prepare", errText(e));
     }
     let extraFiles: string[];

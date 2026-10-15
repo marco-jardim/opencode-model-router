@@ -177,7 +177,8 @@ describe("PlanSlotPools lazy facades", () => {
         records, open: vi.fn(open), close: vi.fn(),
         acquire: vi.fn<SlotPool["acquire"]>(async (planId, owner, commit) => ({ slot: "slot-1", path: records[0]!.path, planId, owner, commit })),
         acquireSpecial: vi.fn<SlotPool["acquireSpecial"]>(async (planId, kind) => ({ slot: kind, path: `C:/slots/${planId}/${kind}`, planId, owner: kind, commit: ledger.repo.baseCommit })),
-        reset: vi.fn<SlotPool["reset"]>(async () => {}), cleanForChecks: vi.fn<SlotPool["cleanForChecks"]>(async () => {}),
+        reset: vi.fn<SlotPool["reset"]>(async () => {}), cleanForChecks: vi.fn<SlotPool["cleanForChecks"]>(async () => ({ drifted: false })),
+        noteCommit: vi.fn<SlotPool["noteCommit"]>(async () => {}),
         release: vi.fn<SlotPool["release"]>(async () => {}), get: vi.fn<SlotPool["get"]>(async () => records[0] ?? null),
         list: vi.fn<SlotPool["list"]>(async () => records), gc: vi.fn<SlotPool["gc"]>(async predicate => ({ removed: await predicate(ledger.planId) ? [ledger.planId] : [], reported: [] })),
       };
@@ -199,11 +200,14 @@ describe("PlanSlotPools lazy facades", () => {
     await a.reset("slot-1", "d".repeat(40)); await a.cleanForChecks("slot-1"); await a.release("slot-1");
     expect(made.get("plan-a")?.reset).toHaveBeenCalledWith("slot-1", "d".repeat(40));
     expect(made.get("plan-a")?.cleanForChecks).toHaveBeenCalledWith("slot-1");
+    await a.noteCommit("slot-1", "d".repeat(40));
+    expect(made.get("plan-a")?.noteCommit).toHaveBeenCalledWith("slot-1", "d".repeat(40));
     expect(made.get("plan-a")?.release).toHaveBeenCalledWith("slot-1");
     expect(await pool.facade.list("plan-a")).toHaveLength(1);
     expect(await pool.facade.list()).toHaveLength(2);
     expect(await pool.facade.get("slot-1")).toBeNull();
     await expect(pool.facade.reset("slot-1", "c".repeat(40))).rejects.toMatchObject({ code: "E_PLAN_STATE" });
+    await expect(pool.facade.noteCommit("slot-1", "c".repeat(40))).rejects.toMatchObject({ code: "E_PLAN_STATE" });
     await expect(pool.facade.cleanForChecks("slot-1")).rejects.toMatchObject({ code: "E_PLAN_STATE" });
     await expect(pool.facade.release("slot-1")).rejects.toMatchObject({ code: "E_PLAN_STATE" });
   }, 15_000);
@@ -385,7 +389,8 @@ describe("createExecutor assembly seams", () => {
       open: vi.fn(async () => {}), close: vi.fn(),
       acquire: vi.fn<SlotPool["acquire"]>(async (planId, owner, commit) => ({ planId, owner, commit, slot: "slot-1", path: "D:/slots/plan-a/slot-1" })),
       acquireSpecial: vi.fn<SlotPool["acquireSpecial"]>(async (planId, kind) => ({ planId, owner: kind, commit: "c".repeat(40), slot: kind, path: `D:/slots/${planId}/${kind}` })),
-      reset: vi.fn<SlotPool["reset"]>(async () => {}), cleanForChecks: vi.fn<SlotPool["cleanForChecks"]>(async () => {}),
+      reset: vi.fn<SlotPool["reset"]>(async () => {}), cleanForChecks: vi.fn<SlotPool["cleanForChecks"]>(async () => ({ drifted: false })),
+      noteCommit: vi.fn<SlotPool["noteCommit"]>(async () => {}),
       release: vi.fn<SlotPool["release"]>(async () => {}), get: vi.fn<SlotPool["get"]>(async () => null),
       list: vi.fn<SlotPool["list"]>(async () => []), gc: vi.fn<SlotPool["gc"]>(async () => ({ removed: [], reported: [] })),
       removeEmptyDir: vi.fn(async () => true),

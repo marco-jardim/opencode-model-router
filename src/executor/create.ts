@@ -65,6 +65,7 @@ export class PlanSlotPools {
     acquire: (id, ...args) => this.of(id).acquire(id, ...args),
     acquireSpecial: (id, ...args) => this.of(id).acquireSpecial(id, ...args),
     reset: async () => { throw new ExecutorError("E_PLAN_STATE", "a slot operation requires a plan"); },
+    noteCommit: async () => { throw new ExecutorError("E_PLAN_STATE", "a slot operation requires a plan"); },
     cleanForChecks: async () => { throw new ExecutorError("E_PLAN_STATE", "a slot operation requires a plan"); },
     release: async () => { throw new ExecutorError("E_PLAN_STATE", "a slot operation requires a plan"); },
     get: async () => null,
@@ -97,6 +98,7 @@ export class PlanSlotPools {
       acquire: async (...args) => (await get()).acquire(...args),
       acquireSpecial: async (...args) => (await get()).acquireSpecial(...args),
       reset: async (...args) => (await get()).reset(...args),
+      noteCommit: async (...args) => (await get()).noteCommit(...args),
       cleanForChecks: async (...args) => (await get()).cleanForChecks(...args),
       release: async (...args) => { if (!entry.closed) await (await get()).release(...args); },
       onTaskSlotReleased(listener) {

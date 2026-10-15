@@ -598,6 +598,33 @@ describe("onQaResult: next round", () => {
     expect(env.task(fixTaskId(PHASE, 1, 1)).route.line).toBe('[route class=implement d=deterministic tier=medium pin root="C:/a b"]');
   });
 
+  it.each(["ROOT=C:/phase", 'root = "C:/phase root"', "RoOt = C:/phase"])("copies the phase root with declaredRoot syntax: %s", async token => {
+    const env = await setup({ qaPatch: { route: { ...noRoot, line: `[route class=review ${token}]` } } });
+    await env.loop.onQaResult(env.qaId, report(f("A1", "major")));
+    const root = token.includes('"') ? 'root="C:/phase root"' : "root=C:/phase";
+    expect(env.task(fixTaskId(PHASE, 1, 1)).route.line).toBe(`[route class=implement d=deterministic tier=medium pin ${root}]`);
+  });
+
+  it.each([
+    "C:\\work\\[x]\\repo", "C:/work/x]/repo", 'C:/work/"x"/repo', "C:/work/x\t/repo", "C:/work/x\u2028/repo",
+  ])("omits an unsanitizable fallback root and still launches: %j", async toplevel => {
+    const env = await setup({ qaPatch: { route: noRoot }, toplevel });
+    await env.loop.onQaResult(env.qaId, report(f("A1", "major")));
+    const t = env.task(fixTaskId(PHASE, 1, 1));
+    expect(t.route.line).toBe("[route class=implement d=deterministic tier=medium pin]");
+    expect(renderRouteLine(t, "C:/slot")).toBe("[route class=implement d=deterministic root=C:/slot tier=medium pin]");
+  });
+
+  it.each(['root="C:\\work\\[x]\\repo"', "root=C:\\work\\[x]\\repo", "root=C:/work/x]/repo", 'root="C:/work/x\t/repo"'])(
+    "omits an unsanitizable root copied from a phase task: %j", async token => {
+      const env = await setup({ qaPatch: { route: { ...noRoot, line: `[route class=review ${token}]` } } });
+      await env.loop.onQaResult(env.qaId, report(f("A1", "major")));
+      const t = env.task(fixTaskId(PHASE, 1, 1));
+      expect(t.route.line).toBe("[route class=implement d=deterministic tier=medium pin]");
+      expect(() => renderRouteLine(t, "C:/slot")).not.toThrow();
+    },
+  );
+
   it("renders a launchable route line for a QA fix task without a FIX template (smoke run 14)", async () => {
     const env = await setup();
     await env.loop.onQaResult(env.qaId, report(f("A1", "major", ["a.ts"])));

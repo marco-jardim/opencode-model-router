@@ -79,7 +79,8 @@ export function createQaLoop(d: QaLoopDeps): QaLoop {
       const id = fixTaskId(phase.id, round, idx + 1);
       const fileless = g.writes.length === 0;
       (fileless ? filelessIds : fixIds).push(id);
-      const line = template !== null ? template.route.line : `[route ${DEFAULT_FIX_ROUTE_LINE} ${phaseRootToken(l, phase.id)}]`;
+      const root = template === null ? phaseRootToken(l, phase.id) : null;
+      const line = template !== null ? template.route.line : `[route ${DEFAULT_FIX_ROUTE_LINE}${root === null ? "" : ` ${root}`}]`;
       const route = template !== null ? { ...template.route } : { line, role: FIX_ROLE_AGENT, tier: "medium" as const, pin: true };
       out.push({
         type: "task-created",
@@ -320,17 +321,26 @@ function roundQaTask(l: Readonly<LedgerV1>, phaseId: PhaseId, round: number): Ta
   return null;
 }
 
-const ROOT_TOKEN_RE = /\broot=("[^"]*"|[^\s\]]+)/;
+const ROOT_TOKEN_RE = /\broot\s*=\s*(?:"([^"]*)"|([^\s]+))/i;
+
+/** A route root must not introduce brackets, quotes, separators or control characters into the generated line. */
+function routeRoot(root: string): string | null {
+  if (!/^(?:[A-Za-z]:[\\/]|\/(?![\\/]))[^\x00-\x1f\x7f\u2028\u2029[\]",;]*$/.test(root)
+    || /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(root)) return null;
+  return /\s/.test(root) ? `root="${root}"` : `root=${root}`;
+}
 
 /** The `root=` token of the first route line of the phase's tasks, else one built from the repo toplevel. */
-function phaseRootToken(l: Readonly<LedgerV1>, phaseId: PhaseId): string {
+function phaseRootToken(l: Readonly<LedgerV1>, phaseId: PhaseId): string | null {
   for (const t of Object.values(l.tasks)) {
     if (t.phase !== phaseId) continue;
-    const m = ROOT_TOKEN_RE.exec(t.route.line);
-    if (m !== null) return `root=${m[1] as string}`;
+    // Remove only the route's closing delimiter, not a bracket inside the root value.
+    const line = t.route.line.trim();
+    const body = line.startsWith("[") && line.endsWith("]") ? line.slice(0, -1) : line;
+    const m = ROOT_TOKEN_RE.exec(body);
+    if (m !== null) return routeRoot(m[1] ?? m[2] ?? "");
   }
-  const top = l.repo.toplevel;
-  return /\s/.test(top) ? `root="${top}"` : `root=${top}`;
+  return routeRoot(l.repo.toplevel);
 }
 
 /** Separates the previous findings from the original phase review instruction in a re-review task text. */
