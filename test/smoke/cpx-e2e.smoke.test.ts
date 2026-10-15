@@ -148,6 +148,20 @@ function checkpointRecovered(ledger: LedgerV1, taskId: string, interrupted: Atte
     attempts.some(attempt => attempt.n > interrupted.n && attempt.childSessionID !== null && attempt.childSessionID !== interrupted.childSessionID);
 }
 
+/** D16: lost attempts do not count; preserve every other subject byte and every integration entry. */
+function normalizedCommitSubjects(subjects: readonly string[], ledger: Pick<LedgerV1, "tasks">): string[] {
+  return subjects.map(subject => {
+    const colon = subject.indexOf(":");
+    const suffix = /\(attempt (\d+)\)$/.exec(subject);
+    if (colon < 0 || !suffix) return subject;
+    const taskId = subject.slice(0, colon);
+    if (!Object.hasOwn(ledger.tasks, taskId)) return subject;
+    const n = Number(suffix[1]);
+    const lost = ledger.tasks[taskId]!.attempts.filter(attempt => attempt.n < n && attempt.outcome === "lost").length;
+    return lost === 0 ? subject : `${subject.slice(0, suffix.index)}(attempt ${n - lost})`;
+  });
+}
+
 /** Only the current wake turn may refresh adopted context; old wake prose is never a polling instruction. */
 function recoveryWakeStatus(request: CpxRequest, root: string, planId: string, seen: Set<string>): { stateKey: string; reply: CpxReply } | undefined {
   if (header(request, "x-proof-session") !== root || header(request, "x-proof-kind") !== "primary") return undefined;
@@ -212,6 +226,32 @@ function assertCacheLayout(request: CpxRequest): void {
 }
 
 describe("CPX e2e assertion negative controls", () => {
+  describe("G9 counted integration commit subjects", () => {
+    const ledger = (attempts: Pick<Attempt, "n" | "outcome">[]): LedgerV1 => ({ tasks: { "2.1.4": { attempts } } } as unknown as LedgerV1);
+    const subject = (n: number): string => `2.1.4: Derive an artifact; recover its interrupted attempt. (attempt ${n})`;
+    it("normalizes a lost attempt 1 followed by integrated attempt 2 to counted attempt 1", () => {
+      const baseline = normalizedCommitSubjects([subject(1)], ledger([{ n: 1, outcome: "succeeded" }]));
+      const recovered = normalizedCommitSubjects([subject(2)], ledger([{ n: 1, outcome: "lost" }, { n: 2, outcome: "succeeded" }]));
+      expect(baseline).toEqual([subject(1)]);
+      expect(recovered).toEqual(baseline);
+    });
+    it.each(["interrupted", "failed"] as const)("keeps counted %s attempt 1, so integrated attempt 2 stays attempt 2", outcome => {
+      expect(normalizedCommitSubjects([subject(2)], ledger([{ n: 1, outcome }, { n: 2, outcome: "succeeded" }]))).toEqual([subject(2)]);
+    });
+    it("subtracts only this task's lost attempts before the integrated attempt", () => {
+      const final = ledger([{ n: 1, outcome: "lost" }, { n: 2, outcome: "failed" }, { n: 3, outcome: "lost" }, { n: 4, outcome: "succeeded" }, { n: 5, outcome: "lost" }]);
+      expect(normalizedCommitSubjects([subject(4)], final)).toEqual([subject(2)]);
+    });
+    it.each([0, 2])("retains %i integrations so missing or duplicated entries still fail equality", count => {
+      const normalized = normalizedCommitSubjects(Array.from({ length: count }, () => subject(2)), ledger([{ n: 1, outcome: "lost" }, { n: 2, outcome: "succeeded" }]));
+      expect(normalized).toHaveLength(count);
+      expect(normalized).not.toEqual([subject(1)]);
+    });
+    it("leaves unknown task IDs and subjects without an attempt suffix unchanged", () => {
+      const subjects = ["unknown: Derive an artifact (attempt 2)", "toString: Unknown task (attempt 2)", "2.1.4: Derive an artifact", "2.1.4: Keep (attempt 2) inside the title", "No task delimiter (attempt 2)"];
+      expect(normalizedCommitSubjects(subjects, ledger([{ n: 1, outcome: "lost" }, { n: 2, outcome: "succeeded" }]))).toEqual(subjects);
+    });
+  });
   it("startup recovery never invokes resume; deliberate resume requires an observed pause", async () => {
     const invocations: string[] = [];
     const resume = async () => { invocations.push("resume"); };
@@ -1588,8 +1628,11 @@ async function drive(name: typeof plans[number], repository: typeof repositories
     } finally { git(activeHost.project, "worktree", "remove", "--force", audit); }
     observations.integrationHeadChecks = checkedHeads;
     // IDs, commit timestamps, and independent-task order may change on a REAL host. Preserve logical effects/counts.
-    const commits = git(activeHost.project, "log", "--format=%s", `${final.repo.baseCommit}..${final.integration.head}`).split("\n")
+    const rawCommits = git(activeHost.project, "log", "--format=%s", `${final.repo.baseCommit}..${final.integration.head}`).split("\n");
+    const commits = normalizedCommitSubjects(rawCommits, final)
       .map(subject => subject.replaceAll(immutableId, "<plan>").replace(/\b[0-9a-f]{7}\.\.[0-9a-f]{7}\b/g, "<range>")).sort();
+    observations.rawCommits = rawCommits;
+    observations.commits = commits;
     const tree = git(activeHost.project, "rev-parse", `${final.integration.head}^{tree}`);
     const markers = path.join(activeHost.project, ".git", "omr-executor", "slots", immutableId);
     const slotRecords = await Promise.all((await readdir(markers)).filter(file => file.endsWith(".json")).map(async file => obj(JSON.parse(await readFile(path.join(markers, file), "utf8")))));
