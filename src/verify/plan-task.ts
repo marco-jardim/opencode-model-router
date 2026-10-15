@@ -570,6 +570,7 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
       };
       const gatePrepared: PreparedVerification = {
         ...prepared,
+        graderDispatchLabel: `${task.id}#${attempt.n}`,
         ...(boundService === undefined ? {} : { service: boundService }),
         changedFiles,
         // The union is complete: the observed files and every path the candidate commits over the reset commit.
@@ -606,6 +607,10 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
         for (;;) {
           const { res, cut } = await runPass(passDoD, budgetMs, current, task, slot, attempt, artefact, gatePrepared, parent);
           if (disposing || !isTransientPlanTaskResult(res, cut) || reruns >= PLAN_TASK_TRANSIENT_RERUNS) return res;
+          const reason = scrubText([...new Set([...res.verdict.reasons, ...(res.verdict.caveats ?? [])])].join("; "))
+            .replace(/\s+/g, " ").trim().slice(0, 200);
+          const label = scrubText(`${task.id}#${attempt.n}`).replace(/\s+/g, " ").trim().slice(0, 200);
+          warn(`plan-task verification retry ${reruns + 1} for ${label}: ${reason}`);
           // QA-5.1-4: dispose cancels the backoff (the transient result stands; verify already resolved as cut).
           const backoff = prepared.service?.start("service-wait", "retry-backoff", checked.candidate);
           let interrupted = true;

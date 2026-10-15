@@ -1,14 +1,16 @@
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { ChildSessionRunner } from "../../src/compat/child-session";
 import { createV2Observations, type ObservationRecord, type V2Observations } from "../../src/compat/v2-observations";
 import { leaseHolderID, type Attempt, type SlotLease, type TaskNode } from "../../src/executor/types";
+import { scrubText } from "../../src/guard/scrub";
 import type { RouterConfig } from "../../src/router/config";
 import { createChangedFileStore } from "../../src/verify/dispatch";
 import { runShell } from "../../src/verify/exec";
 import { accept, gateResult } from "../../src/verify/gate";
 import { readHead, readHeadState } from "../../src/verify/head";
-import { createLeaseSelfExemptions, createPlanTaskVerifier, planTaskVerificationID, planTreeKey, type PlanTaskGit } from "../../src/verify/plan-task";
+import { createLeaseSelfExemptions, createPlanTaskVerifier, planTaskVerificationID, planTreeKey, slotVerdictOf, type PlanTaskGit } from "../../src/verify/plan-task";
 import { snapshotTree } from "../../src/verify/tree";
 import { createVerificationWiring } from "../../src/verify/wiring";
 import { completedServiceProcess, servicePairs } from "../helpers/service-observations";
@@ -60,7 +62,12 @@ beforeEach(() => {
   vi.mocked(accept).mockResolvedValue(gateResult({ pass: true, outcome: "pass", method: "checker", reasons: ["complete"] }, "explicit"));
 });
 
-function harness(observations?: V2Observations, verificationTask = task) {
+function harness(observations?: V2Observations, verificationTask = task, diagnostics: {
+  childRunner?: ChildSessionRunner;
+  warn?: (message: string) => void;
+  log?: (message: string) => void;
+  sleep?: (ms: number) => Promise<void>;
+} = {}) {
   const state = { head: BASE, nonce: "" };
   vi.mocked(snapshotTree).mockImplementation(async () => ({
     cwd: root, root, head: state.head, branch, fingerprint: state.head, dirty: false, files: [], digests: new Map(),
@@ -70,7 +77,10 @@ function harness(observations?: V2Observations, verificationTask = task) {
   const store = createChangedFileStore();
   // delta runs once inside each actual observeChange invocation, not for cached observe calls or gate re-runs.
   const captures = vi.spyOn(store, "delta");
-  const wiring = createVerificationWiring({ client: {}, directory: root, getConfig: () => cfg, observations });
+  const warnings: string[] = [], logs: string[] = [], sleeps: number[] = [];
+  const onVerdict = vi.fn();
+  const wiring = createVerificationWiring({ client: {}, directory: root, getConfig: () => cfg, observations,
+    childRunner: diagnostics.childRunner, logger: { warn: diagnostics.warn ?? (message => { warnings.push(message); }) } });
   const git: PlanTaskGit = async (args) => {
     const command = args.join(" ");
     if (command === "rev-parse --verify --quiet HEAD^{commit}") return { code: 0, stdout: state.head, stderr: "" };
@@ -89,9 +99,12 @@ function harness(observations?: V2Observations, verificationTask = task) {
     captureBudget: () => undefined, readCapReached: () => undefined,
     abortSession: async () => undefined, getConfig: () => cfg, git,
     exemptions: createLeaseSelfExemptions(planTreeKey),
+    onVerdict,
+    log: diagnostics.log ?? (message => { logs.push(message); }),
+    sleep: async ms => { sleeps.push(ms); await diagnostics.sleep?.(ms); },
   });
   return {
-    captures,
+    captures, warnings, logs, sleeps, onVerdict,
     async run(a: Attempt, restart: boolean) {
       state.head = BASE;
       state.nonce = a.nonce;
@@ -112,6 +125,86 @@ function harness(observations?: V2Observations, verificationTask = task) {
 }
 
 describe("plan-task capture observations through the real verification wiring", () => {
+  it.each([
+    "[model-router] v2 child dispatch requires an active tool context or a retained context matching its parent",
+    "[model-router] OpenCode v2's native subagent tool is unavailable",
+    `startup refused\ntoken=secret-123456 ghp_${"s".repeat(30)} ${"x".repeat(300)}`,
+  ])("logs a thrown grader startup reason through real wiring/checker after restart: %s", async message => {
+    const realGate = await vi.importActual<typeof import("../../src/verify/gate")>("../../src/verify/gate");
+    vi.mocked(accept).mockImplementation(realGate.accept);
+    const error = new Error(message);
+    const reason = scrubText(message).replace(/\s+/g, " ").trim().slice(0, 200);
+    const retryReason = scrubText(`grader dispatch failed: ${String(error)}`).replace(/\s+/g, " ").trim().slice(0, 200);
+    const expected = gateResult({ pass: false, outcome: "unverifiable", method: "checker",
+      reasons: [scrubText(`grader dispatch failed: ${String(error)}`)] }, "explicit");
+    // Diagnostics work with observations off, on, or a failed logger; no dispatch error is replaced.
+    for (const mode of ["off", "on", "throw"] as const) {
+      const lines: string[] = [];
+      const sink = createV2Observations({ write: line => { lines.push(line); } });
+      const childRunner: ChildSessionRunner = {
+        run: vi.fn(async () => { throw error; }), dispose: vi.fn(async () => undefined),
+      };
+      const throwingLog = () => { throw new Error("logger failed"); };
+      const h = harness(mode === "off" ? undefined : sink, task, {
+        childRunner, ...(mode === "throw" ? { warn: throwingLog, log: throwingLog } : {}),
+      });
+      vi.mocked(accept).mockClear();
+      try {
+        expect(await h.run(attempt(2, true), true)).toEqual(slotVerdictOf(expected));
+        expect(childRunner.run).toHaveBeenCalledTimes(3);
+        expect(childRunner.dispose).not.toHaveBeenCalled();
+        expect(accept).toHaveBeenCalledTimes(3);
+        expect(h.sleeps).toEqual([30_000, 60_000]);
+        expect(h.onVerdict).toHaveBeenCalledExactlyOnceWith("shared-child", expected.verdict);
+        if (mode !== "throw") {
+          expect(h.warnings).toEqual(Array(3).fill(`[verify] grader dispatch failed for t1#2: ${reason}`));
+          expect(h.logs).toEqual([1, 2].map(n => `plan-task verification retry ${n} for t1#2: ${retryReason}`));
+          expect([...h.warnings, ...h.logs].join(" ")).not.toMatch(/[\r\n]|secret-123456|ghp_/);
+        }
+        expect(reason.length).toBeLessThanOrEqual(200);
+        expect(retryReason.length).toBeLessThanOrEqual(200);
+        sink.close();
+        const rows = servicePairs(lines);
+        expect(rows.filter(r => r.stage === "grader-startup" && r.action === "end")).toMatchObject(
+          mode === "off" ? [] : Array.from({ length: 3 }, () => ({ spanKind: "service-prep", result: "error", taskId: "t1", attempt: 2 })),
+        );
+        expect(rows.filter(r => r.stage === "retry-backoff" && r.action === "end")).toHaveLength(mode === "off" ? 0 : 2);
+        expect(rows.filter(r => r.spanKind === "service")).toEqual([]);
+      } finally { await h.dispose(); sink.close(); }
+    }
+  });
+
+  it("exposes the startup and transient reasons before any verdict is published", async () => {
+    const realGate = await vi.importActual<typeof import("../../src/verify/gate")>("../../src/verify/gate");
+    vi.mocked(accept).mockImplementation(realGate.accept);
+    const lines: string[] = [];
+    const sink = createV2Observations({ write: line => { lines.push(line); } });
+    let sleeping!: () => void;
+    const backoffStarted = new Promise<void>(resolve => { sleeping = resolve; });
+    const childRunner: ChildSessionRunner = {
+      run: vi.fn(async () => { throw new Error("startup token=secret-123456"); }), dispose: async () => undefined,
+    };
+    const h = harness(sink, task, { childRunner, sleep: async () => { sleeping(); await new Promise<void>(() => {}); } });
+    const pending = h.run(attempt(2, true), true);
+    try {
+      await backoffStarted;
+      expect(h.onVerdict).not.toHaveBeenCalled();
+      expect(h.warnings).toEqual(["[verify] grader dispatch failed for t1#2: startup token=[REDACTED]"]);
+      expect(h.logs).toEqual(["plan-task verification retry 1 for t1#2: grader dispatch failed: Error: startup token=[REDACTED]"]);
+      sink.flush();
+      const rows = lines.map((line): ObservationRecord => JSON.parse(line));
+      expect(rows.filter(r => r.family === "service" && r.stage === "grader-startup" && r.action === "end"))
+        .toMatchObject([{ result: "error", taskId: "t1", attempt: 2 }]);
+      await h.dispose();
+      expect(await pending).toMatchObject({ verdict: "unverifiable", cut: true });
+      expect(childRunner.run).toHaveBeenCalledTimes(1);
+      expect(h.sleeps).toEqual([30_000]);
+      expect(h.onVerdict).not.toHaveBeenCalled();
+      sink.close();
+      expect(servicePairs(lines).filter(r => r.stage === "retry-backoff" && r.action === "end")).toMatchObject([{ result: "interrupted" }]);
+    } finally { await h.dispose(); sink.close(); }
+  });
+
   it("binds normal-attempt execution spans from a real deterministic check to the checked candidate", async () => {
     const realGate = await vi.importActual<typeof import("../../src/verify/gate")>("../../src/verify/gate");
     const realExec = await vi.importActual<typeof import("../../src/verify/exec")>("../../src/verify/exec");

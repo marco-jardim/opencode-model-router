@@ -122,7 +122,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **OpenCode v2: diagnostic observations record a scheduler graph row for every committed ledger batch**, including
   metric-only batches, so a runtime row never reports a ledger sequence that no graph row preceded.
 - **OpenCode v2: a plan-task verification that cannot snapshot its slot says why.** The unverifiable result now
-  includes a bounded, scrubbed reason (for example a git timeout or a missing file); it still fails closed.
+  includes a bounded, scrubbed reason (for example a git timeout or a missing file) naming the git stage that failed;
+  it still fails closed. A grader that cannot start, and each transient verification rerun, log their reason.
 - **OpenCode v2: integration check selection never treats a failed `git show` as a missing file.** Only git's explicit
   "path does not exist" error means absent; any other read failure fails the check as `prepare`, never a `no-checks`
   pass. A failed prepare now waits for its overlapped reads before the slot is retried.

@@ -178,6 +178,8 @@ function graderPromptResponseError(res: unknown): Error | undefined {
 export interface PreparedVerification {
   /** v2 diagnostics only; never contributes to the verdict. */
   service?: ServiceObservation;
+  /** Plan-task identity for v2 grader-dispatch failure logs, including when observations are off. */
+  graderDispatchLabel?: string;
   /**
    * The producer's changed files: the tool-observed paths of every attempt judged against this
    * dispatch (QA-2.1-1), the paths the current snapshot added since dispatch, and the paths dirty
@@ -1484,6 +1486,7 @@ export function createVerificationWiring(deps: {
     inFlight?: Set<string>,
     creatorSessionID: string | null = parentSessionID ?? null,
     service?: ServiceObservation,
+    graderDispatchLabel?: string,
   ): Promise<{ sessionID: string; text: string; model: string | null }> => {
     // #84 P3.3 fix 2: the model the grader is dispatched on travels with its answer (checker.ts GraderResult.model → the
     // verdict's `grader`), so the outcome signals can check its independence (plan §2.6). Null: the host's default model.
@@ -1512,6 +1515,13 @@ export function createVerificationWiring(deps: {
           },
         }), graderTimeoutMs(req.tier, cfg.enforcement?.verify?.graderTimeoutMs), "grader prompt");
         return { sessionID: answer.sessionID, text: answer.text, model: modelRef(model) };
+      } catch (error) {
+        // Service results stay low-cardinality; the schema has no free-text reason field.
+        try {
+          const label = graderDispatchLabel === undefined ? "" : ` for ${scrubText(graderDispatchLabel).replace(/\s+/g, " ").trim().slice(0, 200)}`;
+          logger.warn(`[verify] grader dispatch failed${label}: ${errorText(error).replace(/\s+/g, " ").trim().slice(0, 200)}`);
+        } catch { /* Diagnostics must preserve the original dispatch error. */ }
+        throw error;
       } finally {
         preparation?.end("error");
         controller.abort();
@@ -1732,7 +1742,7 @@ export function createVerificationWiring(deps: {
       },
       checker: {
         dispatchGrader: (req: GraderRequest) =>
-          dispatchGrader(req, parentSessionID, inFlight, creatorSessionID, service),
+          dispatchGrader(req, parentSessionID, inFlight, creatorSessionID, service, prepared?.graderDispatchLabel),
         ladder: ["fast", "medium", "heavy"],
         minGraderTier: cfg.enforcement?.verify?.minGraderTier ?? null,
       },

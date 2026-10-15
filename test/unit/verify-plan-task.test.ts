@@ -226,6 +226,8 @@ describe("plan-task verifier (D8)", () => {
     expect(PLAN_TASK_RERUN_BACKOFF_MS).toEqual([30_000, 60_000]);
     // One settled verdict: one breaker sample for the runtime.
     expect(h.verdicts).toEqual(["unverifiable"]);
+    expect(h.logs).toEqual([1, 2].map(n =>
+      `plan-task verification retry ${n} for t1#1: grader dispatch failed: grader prompt timed out after 300000ms`));
   });
 
   it("V3: a transient unverifiable that clears on a re-run takes the re-run's verdict", async () => {
@@ -234,6 +236,33 @@ describe("plan-task verifier (D8)", () => {
     const result = await runAttempt(h, task({ text: "x\n[acceptance]\ncriteria: works\n[/acceptance]" }));
     expect(result.verdict).toBe("pass");
     expect(h.sleeps).toEqual([30_000]);
+    expect(h.logs).toEqual(["plan-task verification retry 1 for t1#1: grader dispatch failed: 503"]);
+  });
+
+  it("bounds and scrubs each transient backoff reason without altering the verdict, reruns or delays", async () => {
+    const reason = `grader dispatch failed: token=secret-123456\n${"x".repeat(300)}`;
+    const transient = unverifiable(reason);
+    acceptMock.mockResolvedValue(transient);
+    const h = harness();
+    const result = await runAttempt(h, task({ text: "x\n[acceptance]\ncriteria: works\n[/acceptance]" }));
+    expect(result).toEqual(slotVerdictOf(transient));
+    expect(acceptMock).toHaveBeenCalledTimes(3);
+    expect(h.sleeps).toEqual([30_000, 60_000]);
+    expect(h.verdicts).toEqual(["unverifiable"]);
+    expect(h.logs).toEqual([1, 2].map(n => `plan-task verification retry ${n} for t1#1: ${
+      `grader dispatch failed: token=[REDACTED] ${"x".repeat(300)}`.slice(0, 200)}`));
+    expect(h.logs.join("\n")).not.toContain("secret-123456");
+    expect(transient.verdict.reasons).toEqual([reason]);
+  });
+
+  it("keeps transient retry behaviour when the warning logger throws", async () => {
+    const transient = unverifiable("grader dispatch failed: native subagent tool is unavailable");
+    acceptMock.mockResolvedValue(transient);
+    const h = harness();
+    h.deps.log = () => { throw new Error("logger failed"); };
+    expect(await runAttempt(h)).toEqual(slotVerdictOf(transient));
+    expect(acceptMock).toHaveBeenCalledTimes(3);
+    expect(h.sleeps).toEqual([30_000, 60_000]);
   });
 
   it("V4: a cut gate aborts the deadline and its grader sessions, then is unverifiable", async () => {
@@ -750,21 +779,25 @@ describe("verifier arms", () => {
     expect(acceptMock).not.toHaveBeenCalled();
   });
 
-  it.each([false, true])("includes the bounded scrubbed snapshot reason and never passes (strict=%s)", async (strict) => {
-    snapshotMock.mockImplementation(async (_cwd: string, _signal: AbortSignal, options: SnapshotOptions) => {
-      options.onError?.(`git timed out after 10000 ms; token=secret-123456 ${"x".repeat(300)}`);
-      return undefined;
-    });
-    const h = harness({ strict });
-    const result = await runAttempt(h);
-    expect(result.verdict).toBe("unverifiable");
-    expect(result.findings).toMatch(/after cleanForChecks \(git timed out after 10000 ms; token=\[REDACTED\]/);
-    expect(result.findings).not.toContain("secret-123456");
-    expect(result.findings.match(/after cleanForChecks \((.*)\); nothing ran$/)?.[1]).toHaveLength(200);
-    expect(snapshotMock).toHaveBeenCalledTimes(1);
-    expect(acceptMock).not.toHaveBeenCalled();
-    expect(h.sleeps).toEqual([]);
-  });
+  it.each([false, true].flatMap(strict =>
+    ["root", "head", "status", "diff-worktree", "diff-index", "index", "untracked-list"].flatMap(stage =>
+      ["git timed out after 10000 ms", "ENOENT: spawn git ENOENT"].map(failure => ({ strict, stage, failure })))))(
+    "includes the bounded scrubbed $stage snapshot reason ($failure) and never passes (strict=$strict)", async ({ strict, stage, failure }) => {
+      snapshotMock.mockImplementation(async (_cwd: string, _signal: AbortSignal, options: SnapshotOptions) => {
+        options.onError?.(`${stage}: ${failure}; token=secret-123456 ${"x".repeat(300)}`);
+        return undefined;
+      });
+      const h = harness({ strict });
+      const result = await runAttempt(h);
+      expect(result.verdict).toBe("unverifiable");
+      expect(result.findings).toContain(`after cleanForChecks (${stage}: ${failure}; token=[REDACTED]`);
+      expect(result.findings).not.toContain("secret-123456");
+      expect(result.findings.match(/after cleanForChecks \((.*)\); nothing ran$/)?.[1]).toHaveLength(200);
+      expect(snapshotMock).toHaveBeenCalledTimes(1);
+      expect(acceptMock).not.toHaveBeenCalled();
+      expect(h.sleeps).toEqual([]);
+    },
+  );
 
   it("reports the slot snapshot timeout without retrying or running checks", async () => {
     vi.useFakeTimers();
