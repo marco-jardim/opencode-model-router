@@ -15,9 +15,11 @@ import { createLedgerStore } from "../../src/executor/ledger.js";
 import type { LedgerV1 } from "../../src/executor/types.js";
 import {
   appendMessages,
+  contextOf,
   eventLine,
   finishedAnswer,
   listSessions,
+  midToolCall,
   readSession,
   writeSession,
   type ChildConfig,
@@ -240,6 +242,7 @@ const WORK: Record<string, { file: string; content: string }> = Object.fromEntri
 /** The kill-point task is T1 (normal); the others are in flight when the process dies. */
 const SCRIPTS: Record<string, ChildScript> = { T2: "alive", T3: "dead", T4: "finish-while-down" };
 const LIVENESS_MS = 1_500;
+const LAUNCHER_LIVENESS_MS = 15_000;
 const POLL_MS = 200;
 const RUN_MS = 420_000;
 const FIXTURE = join(REPO_ROOT, "test", "fixtures", "cpx", "integrate", "node-basic");
@@ -295,6 +298,7 @@ async function makeWorld(tag: string): Promise<World> {
 
 function configFor(w: World, run: number, o: {
   kill: ChildConfig["kill"]; scripts: ChildConfig["scripts"]; activity: ChildConfig["activity"]; launcherLiveness?: boolean;
+  stopAt?: ChildConfig["stopAt"];
 }): string {
   const c: ChildConfig = {
     home: w.home,
@@ -309,8 +313,9 @@ function configFor(w: World, run: number, o: {
     run,
     kill: o.kill,
     scripts: o.scripts,
+    ...(o.stopAt === undefined ? {} : { stopAt: o.stopAt }),
     work: WORK,
-    livenessMs: o.launcherLiveness ? 60_000 : LIVENESS_MS,
+    livenessMs: o.launcherLiveness ? LAUNCHER_LIVENESS_MS : LIVENESS_MS,
     pollMs: POLL_MS,
     activity: o.activity,
     ...(o.launcherLiveness ? { launcherLiveness: true } : {}),
@@ -644,13 +649,16 @@ function control(): Promise<Outcome> {
 // ---------- the tests
 
 describe("executor restart recovery: a real child process killed at K1/K2/K3 and restarted (4.2.6)", () => {
-  it("variant: workers stop when their launcher dies; unknown host activity plus launcher liveness requeues immediately without probation", async () => {
+  it("variant: dead launcher requeues provider-stopped children at once, but a mid-tool child keeps probation", async () => {
     const c = await control();
     const w = await makeWorld("launcher-liveness");
     const p0 = startExec(configFor(w, 0, {
-      kill: { point: "K3", task: "T1" }, scripts: SCRIPTS, activity: "unknown", launcherLiveness: true,
+      kill: { point: "K3", task: "T1" }, scripts: SCRIPTS, activity: "unknown", launcherLiveness: true, stopAt: "provider",
     }), w.work, w.env);
     await p0.waitLine(/^READY K3 /, RUN_MS);
+    // The host simulator advances T4 into a tool while the launcher is still alive; T2/T3 stay at the provider.
+    const t4 = need((await listSessions(w.hostRoot)).find((s) => launchKey(s) === "T4#1"), "T4 session");
+    await appendMessages(w.hostRoot, t4.id, midToolCall(Date.now()));
     await killExec(p0);
     const alive = (pid: number): boolean => {
       try { process.kill(pid, 0); return true; }
@@ -659,7 +667,7 @@ describe("executor restart recovery: a real child process killed at K1/K2/K3 and
     expect(alive(p0.pid)).toBe(false);
     const atKill = await readLedger(w);
     // Unlike the existing variants, the simulated host stops every busy worker of this dead launcher. It retains the
-    // mid-tool-call session history, with no terminal entry, and activity remains unknown (as on the v2 adapter).
+    // provider/mid-tool history with no terminal entry, and activity remains unknown (as on the v2 adapter).
     const stopped: StoredSession[] = [];
     for (const s of await listSessions(w.hostRoot)) {
       if (s.status !== "busy" || s.launcherPid === undefined || alive(s.launcherPid)) continue;
@@ -669,7 +677,12 @@ describe("executor restart recovery: a real child process killed at K1/K2/K3 and
     }
     expect(stopped.map((s) => launchKey(s)).sort()).toEqual(["T2#1", "T3#1", "T4#1"]);
     for (const id of ["T2", "T3", "T4"]) expect(atKill.tasks[id]?.state).toBe("running");
+    for (const s of stopped) {
+      expect(contextOf(s).toolInFlight).toBe(launchKey(s) === "T4#1");
+      expect(contextOf(s).messages.some((m) => m.role === "idle")).toBe(false);
+    }
 
+    const restartAt = Date.now();
     const p1 = startExec(configFor(w, 1, {
       kill: null, scripts: {}, activity: "unknown", launcherLiveness: true,
     }), w.work, w.env);
@@ -680,13 +693,24 @@ describe("executor restart recovery: a real child process killed at K1/K2/K3 and
     expect(o.outcomes).toEqual({ T1: ["1:succeeded"], T2: ["1:lost", "2:succeeded"], T3: ["1:lost", "2:succeeded"], T4: ["1:lost", "2:succeeded"] });
     expect(o.counted).toEqual({ T1: 1, T2: 1, T3: 1, T4: 1 });
     for (const s of stopped) {
-      // The probation deadline path interrupts first; this path requeues on the launcher's proof of death, without it.
-      expect((await readSession(w.hostRoot, s.id))?.interrupted).toBe(0);
-      expect((await readSession(w.hostRoot, s.id))?.stopped).toBe(true);
       const taskId = launchKey(s).split("#")[0]!;
+      const midTool = taskId === "T4";
+      expect((await readSession(w.hostRoot, s.id))?.interrupted).toBe(midTool ? 1 : 0);
+      expect((await readSession(w.hostRoot, s.id))?.stopped).toBe(true);
       expect(o.ledger.tasks[taskId]?.attempts[0]?.outcome).toBe("lost");
       expect(o.launches[`${taskId}#2`]).toBe(1);
-      expect(p1.err()).toContain(`"taskId":"${taskId}","n":1,"pid":${p0.pid}`);
+      const firstEnd = Date.parse(need(o.ledger.tasks[taskId]?.attempts[0]?.endedAt, `${taskId} first end`));
+      const retryAt = Date.parse(need(o.ledger.tasks[taskId]?.attempts[1]?.startedAt, `${taskId} retry start`));
+      expect(retryAt).toBeGreaterThanOrEqual(firstEnd);
+      if (midTool) {
+        expect(firstEnd - restartAt, "mid-tool child keeps the entire liveness probation").toBeGreaterThanOrEqual(LAUNCHER_LIVENESS_MS);
+        expect(retryAt - restartAt, "mid-tool attempt 2 cannot launch before the deadline").toBeGreaterThanOrEqual(LAUNCHER_LIVENESS_MS);
+        expect(p1.err()).toContain('the child stopped with a tool call in flight; keeping the liveness probation {"taskId":"T4","n":1}');
+        expect(p1.err()).not.toContain(`"taskId":"T4","n":1,"pid":${p0.pid}`);
+      } else {
+        expect(firstEnd - restartAt, `${taskId} requeues without the liveness probation`).toBeLessThan(LAUNCHER_LIVENESS_MS);
+        expect(p1.err()).toContain(`"taskId":"${taskId}","n":1,"pid":${p0.pid}`);
+      }
     }
     const events = (await createLedgerStore({ home: w.home }).exportPlan(PLAN)).events;
     const records = events.flatMap((e) => e.type === "metric" && e.metric.name === "counter" && e.metric.key === "child-process" ? [e.metric.labels] : []);

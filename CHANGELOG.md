@@ -120,8 +120,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behind every other slot's provisioning. Claims now queue in call order and await their base lookup inside the claim.
 - **OpenCode v2: after a host restart, the executor requeues a plan child at once when its launching process is
   provably gone.** It records each child's launcher (pid, hostname, per-process token); recovery treats a child as lost
-  without the 60 s liveness probation only when that process is dead on this host (host contract C16). Every other case
-  keeps the probation.
+  without the 60 s liveness probation only when that process is dead on this host and the child was not running a tool
+  when the host stopped (host contract C16). A child stopped inside a tool, whose processes (for example a `router_run`
+  test run) can outlive the host, keeps the probation, as does every other case.
 - **OpenCode v2: diagnostic observations record a scheduler graph row for every committed ledger batch**, including
   metric-only batches, so a runtime row never reports a ledger sequence that no graph row preceded.
 - **OpenCode v2: a plan-task verification that cannot snapshot its slot says why.** The unverifiable result now

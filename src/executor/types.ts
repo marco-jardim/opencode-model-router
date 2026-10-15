@@ -1900,6 +1900,8 @@ export interface FileSystem {
 
 export interface HostSessionContext {
   messages: Array<{ role: "user" | "assistant" | "idle"; text: string | null; outcome: string | null }>;
+  /** Stored history has an open tool call; absent means unknown and is treated as in flight. */
+  toolInFlight?: boolean;
 }
 /**
  * QA-3.1-8: the v2 adapter owns the step key `<sessionID>:<k>` and sets the optional `stepKey` on every step/retry event it

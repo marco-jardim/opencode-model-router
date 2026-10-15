@@ -55,7 +55,7 @@ export interface RecoveryDeps {
   log: RecoveryLog;
   livenessMs?: number;
   pollMs?: number;
-  /** v2 only: a dead launcher proves inactivity; every other case keeps the host's unknown answer. */
+  /** v2 only: a dead launcher proves inactivity only for a running child with no tool in flight; otherwise keep probation. */
   launcherLiveness?: { self: ProcessIdentity; isAlive: (pid: number) => boolean };
 }
 
@@ -164,7 +164,10 @@ export function createRecoveryService(d: RecoveryDeps): RecoveryEngine {
       let ev = classifyChild(info, ctx, "unknown", expect, l.sharedContext);
       if (ev === "unknown") {
         let activity = await d.host.activity(childId);
-        if (activity === "unknown" && d.launcherLiveness !== undefined) activity = await launcherActivity(t, a, childId);
+        if (activity === "unknown" && d.launcherLiveness !== undefined && t.state === "running") {
+          if (ctx?.toolInFlight === false) activity = await launcherActivity(t, a, childId);
+          else d.log("info", "recovery: the child stopped with a tool call in flight; keeping the liveness probation", { taskId: t.id, n: a.n });
+        }
         ev = classifyChild(info, ctx, activity, expect, l.sharedContext);
       }
       return { evidence: ev, context: ctx };

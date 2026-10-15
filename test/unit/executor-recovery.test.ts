@@ -161,7 +161,7 @@ const clockAt = (ms: number): Clock => ({
 function childPrompt(taskId: string, n: number, planId: string = PLAN_ID): string {
   return formatLaunchPrompt(SHARED, { planId, taskId, attempt: n, nonce: nonceFor(n) }, `TASK ${taskId}\ndo it`);
 }
-type ChildKind = "finished" | "alive" | "unknown" | "lost" | "mismatch" | "foreign" | "none";
+type ChildKind = "finished" | "alive" | "unknown" | "unknown-tool" | "lost" | "mismatch" | "foreign" | "none";
 
 /** Registers the child `ses-<taskId>-<n>` in `kind` and returns its id (null for `none`). */
 function child(host: FakeHost, taskId: string, n: number, kind: ChildKind): string | null {
@@ -171,7 +171,8 @@ function child(host: FakeHost, taskId: string, n: number, kind: ChildKind): stri
     case "lost": return id;
     case "finished": host.add(id, { ctx: ctxOf(childPrompt(taskId, n), ["assistant", "idle"]) }); return id;
     case "alive": host.add(id, { ctx: ctxOf(childPrompt(taskId, n), ["assistant"]), activity: "active" }); return id;
-    case "unknown": host.add(id, { ctx: ctxOf(childPrompt(taskId, n), ["assistant"]), activity: "unknown" }); return id;
+    case "unknown": host.add(id, { ctx: { ...ctxOf(childPrompt(taskId, n), ["assistant"]), toolInFlight: false }, activity: "unknown" }); return id;
+    case "unknown-tool": host.add(id, { ctx: { ...ctxOf(childPrompt(taskId, n), ["assistant"]), toolInFlight: true }, activity: "unknown" }); return id;
     case "mismatch": host.add(id, { ctx: ctxOf(childPrompt(taskId, n + 1), ["assistant"]), activity: "active" }); return id;
     case "foreign": host.add(id, { ctx: ctxOf(childPrompt(taskId, n, "plan-two"), ["assistant"]), activity: "active" }); return id;
   }
@@ -280,9 +281,46 @@ describe("reconcile: launcher liveness (v2)", () => {
     expect(r.isAlive).not.toHaveBeenCalled();
   });
 
-  it("ready/adoptable + dead launcher is lost/none, with no probation", async () => {
+  it("ready/adoptable + dead launcher is adopted with probation without exporting history", async () => {
     const r = setup();
-    expect(await feedOf(r, running(r, "T1", "unknown", true))).toMatchObject({ evidence: "lost", action: "none", probation: null });
+    expect(await feedOf(r, running(r, "T1", "unknown", true))).toMatchObject({ evidence: "alive", action: "adopt", probation: PROBATION });
+    expect(r.exportPlan).not.toHaveBeenCalled();
+    expect(r.isAlive).not.toHaveBeenCalled();
+    expect(r.logs).toEqual([]);
+  });
+
+  it.each([true, undefined])("dead launcher + toolInFlight=%s keeps probation without exporting history or probing the process", async (toolInFlight) => {
+    const r = setup();
+    const t = running(r, "T1", "unknown-tool");
+    if (toolInFlight === undefined) delete r.host.sessions.get("ses-T1-1")!.ctx.toolInFlight;
+    expect(await feedOf(r, t)).toMatchObject({ evidence: "alive", action: "adopt", probation: PROBATION });
+    expect(r.exportPlan).not.toHaveBeenCalled();
+    expect(r.isAlive).not.toHaveBeenCalled();
+    expect(r.logs).toEqual([
+      'info:recovery: the child stopped with a tool call in flight; keeping the liveness probation {"taskId":"T1","n":1}',
+    ]);
+  });
+
+  it.each(["win32", "linux", "darwin"])("%s uses the same quiet-running-only fast path", async (platform) => {
+    const descriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { value: platform });
+    try {
+      for (const [kind, ready, quiet, missing] of [
+        ["unknown", false, true, false], ["unknown-tool", false, false, false],
+        ["unknown-tool", false, false, true], ["unknown", true, false, false],
+      ] as const) {
+        const r = setup();
+        const t = running(r, "T1", kind, ready);
+        if (missing) delete r.host.sessions.get("ses-T1-1")!.ctx.toolInFlight;
+        expect(await feedOf(r, t)).toMatchObject(quiet
+          ? { evidence: "lost", action: "requeue-lost", probation: null }
+          : { evidence: "alive", action: "adopt", probation: PROBATION });
+        expect(r.exportPlan).toHaveBeenCalledTimes(quiet ? 1 : 0);
+        expect(r.isAlive).toHaveBeenCalledTimes(quiet ? 1 : 0);
+      }
+    } finally {
+      Object.defineProperty(process, "platform", descriptor);
+    }
   });
 
   it.each([

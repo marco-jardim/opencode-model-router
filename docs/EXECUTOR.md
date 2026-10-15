@@ -375,7 +375,9 @@ context ends with an explicit terminal `idle` entry **with an outcome**; `idle` 
 is adopted and rebound to its role, grant and slot work root. A missing or mismatching child is lost; orphans still
 running for this plan are interrupted. A dispatched attempt with no child is requeued immediately.
 
-A child whose launching process is provably dead on the same host is requeued at once; otherwise the **60 s** liveness probation applies.
+A `running` child whose launching process is provably dead on the same host, and whose stored history shows no tool
+call in flight, is requeued at once; a child stopped inside a tool, whose processes (for example a `router_run` test) can
+outlive the host, gets the **60 s** liveness probation like any other unknown child.
 Unknown liveness enters a **60 s** probation window, polled every **10 s**. A host event or changed context proves
 life; an explicit terminal entry is processed as a result. A silent child past the deadline is interrupted before its
 slot is reset and its attempt requeued as lost. If interruption fails **5 tries**, one blocking failure item is raised

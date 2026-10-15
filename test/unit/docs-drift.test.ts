@@ -697,7 +697,7 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     expect(read("src/executor/runtime.ts")).toContain("const PROBATION_INTERRUPT_FAILS = 5;");
     const recovery = sectionOf(doc, "## Recovery");
     for (const threshold of ["**60 s**", "**10 s**", "**5 tries**"]) expect(recovery).toContain(threshold);
-    expect(recovery).toContain("launching process is provably dead on the same host is requeued at once; otherwise the **60 s** liveness probation applies");
+    expect(recovery.replace(/\s+/g, " ")).toContain("A `running` child whose launching process is provably dead on the same host, and whose stored history shows no tool call in flight, is requeued at once; a child stopped inside a tool, whose processes (for example a `router_run` test) can outlive the host, gets the **60 s** liveness probation like any other unknown child.");
     expect(sectionOf(doc, "## Unattended operation")).toContain("**4000 characters plus an ellipsis**");
     const unattended = sectionOf(doc, "## Unattended operation").replace(/\s+/g, " ");
     expect(unattended).toContain("default **3**, integer range **1–6**");

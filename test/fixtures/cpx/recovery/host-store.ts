@@ -70,6 +70,8 @@ export interface ChildConfig {
   kill: { point: KillPoint; task: string } | null;
   /** Per task: what its first launched child does in this run (`normal` when absent). */
   scripts: Record<string, ChildScript>;
+  /** Where scripted children pause (default: tool); the host simulator can advance them before the kill. */
+  stopAt?: "tool" | "provider";
   /** Per task: the file the child writes in its slot and the text it writes. */
   work: Record<string, { file: string; content: string }>;
   /** R1a seams (memo §10: 1500 / 200). */

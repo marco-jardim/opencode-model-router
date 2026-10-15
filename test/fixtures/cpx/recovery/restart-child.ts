@@ -188,8 +188,10 @@ export function scriptedLauncher(c: ChildConfig, clock: Clock): TaskLauncher {
         resolveConf({ kind: "confirmed", childSessionID: sid, latencyMs: 1 });
         say(`LAUNCH ${req.taskId} ${req.attempt} ${sid} ${script}`);
         if (script !== "normal") {
-          // QA-4.2-2: a scripted child is mid-tool-call when this process is killed (a busy v2 child's real shape): never an end.
-          await appendMessages(c.hostRoot, sid, midToolCall(Date.now()));
+          // QA-4.2-2/R2-1: neither a mid-tool call nor a provider step cut mid-stream is an end.
+          await appendMessages(c.hostRoot, sid, c.stopAt === "provider"
+            ? [{ type: "assistant", text: "partial", time: { created: Date.now() } }]
+            : midToolCall(Date.now()));
           launchedScripted.add(req.taskId);
           releaseHoldIfReady();
           return;

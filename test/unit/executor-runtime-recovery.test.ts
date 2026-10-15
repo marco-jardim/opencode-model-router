@@ -797,7 +797,7 @@ async function mk(draft: LedgerV1): Promise<Harness> {
     },
     async running(id, n, sessionID) {
       const run = await h.runOf(id, n);
-      hosts.contexts.set(sessionID, { messages: [{ role: "user", text: run.req.prompt, outcome: null }] });
+      hosts.contexts.set(sessionID, { messages: [{ role: "user", text: run.req.prompt, outcome: null }], toolInFlight: false });
       await run.child(sessionID);
       return run;
     },
@@ -1223,6 +1223,52 @@ describe("launcher identity and immediate restart recovery (v2)", () => {
     expect(timers.mock.calls.filter(([ms]) => ms === POLL_MS)).toEqual([]);
     if (kind === "own pid reused") expect(isAlive).not.toHaveBeenCalled();
     else expect(isAlive).toHaveBeenCalledWith(oldSelf.pid);
+  });
+
+  it("a dead launcher with a tool in flight keeps probation: no reset or relaunch before the deadline and interrupt", async () => {
+    const h = await mk(planOf([task("T1")]));
+    h.deps.self = oldSelf;
+    await h.begin();
+    await h.running("T1", 1, "ses-c1");
+    h.hosts.contexts.get("ses-c1")!.toolInFlight = true;
+    await h.crash();
+    h.deps.self = newSelf;
+    const isAlive = vi.fn((_pid: number) => false);
+    h.engine(REPO, { self: newSelf, isAlive });
+    const timers = vi.spyOn(h.clock, "setTimer");
+    const now = h.clock.now(), mark = h.git.calls.length;
+    const gate = deferred<void>();
+    h.hosts.interruptImpl = () => gate.promise;
+    await h.runtime.start();
+    await h.runtime.settled();
+    expect(timers.mock.calls.some(([ms]) => ms === POLL_MS)).toBe(true);
+    expect(isAlive).not.toHaveBeenCalled();
+    expect(h.task("T1").attempts[0]?.outcome).toBeNull();
+    expect(h.launcher.runs).toEqual([]);
+    expect(h.git.verbsSince(mark)).not.toContain("reset --hard HEAD");
+    await advance(h, LIVENESS_MS - POLL_MS);
+    h.clock.advance(POLL_MS - 1);
+    await h.runtime.settled();
+    expect(h.clock.now()).toBe(now + LIVENESS_MS - 1);
+    expect(h.hosts.interrupts).toEqual([]);
+    expect(h.launcher.runs).toEqual([]);
+    expect(h.git.verbsSince(mark)).not.toContain("reset --hard HEAD");
+    h.clock.advance(1);
+    await until(() => h.hosts.interrupts.length === 1, "the mid-tool child's deadline interrupt");
+    expect(h.hosts.interrupts).toEqual(["ses-c1"]);
+    expect(h.task("T1").attempts[0]?.outcome).toBeNull();
+    expect(h.launcher.runs).toEqual([]);
+    expect(h.git.verbsSince(mark)).not.toContain("reset --hard HEAD");
+    gate.resolve();
+    await h.runOf("T1", 2);
+    expect(h.clock.now()).toBe(now + LIVENESS_MS);
+    expect(h.git.verbsSince(mark)).toContain("reset --hard HEAD");
+    expect(h.git.verbsSince(mark)).toContain("clean -fd");
+    expect(h.task("T1").attempts[0]?.outcome).toBe("lost");
+    const ends = endsOf(await h.events(), "T1");
+    expect(ends).toHaveLength(1);
+    expect(ends[0]).toMatchObject({ outcome: "lost", detail: "restart" });
+    expect(h.parts().policy.counted).toEqual([]);
   });
 
   it("a live launcher stays unknown: the same probation timer, deadline and uncounted restart end", async () => {

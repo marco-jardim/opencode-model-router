@@ -167,6 +167,23 @@ export function childHistoryEnd(history: unknown): ChildHistoryEnd {
   return { kind: "none" };
 }
 
+/** An open tool can leave processes behind after its launcher dies; only completed/error states prove it closed. */
+export function historyToolInFlight(history: unknown): boolean {
+  const entries: readonly unknown[] = Array.isArray(history) ? history : [];
+  const toolOpen = (part: unknown): boolean => {
+    if (part === null || typeof part !== "object" || (part as Record<string, unknown>).type !== "tool") return false;
+    const state = (part as Record<string, unknown>).state;
+    const status = state !== null && typeof state === "object" ? (state as Record<string, unknown>).status : state ?? (part as Record<string, unknown>).status;
+    return status !== "completed" && status !== "error";
+  };
+  return entries.some((entry) => {
+    if (toolOpen(entry)) return true;
+    if (entry === null || typeof entry !== "object") return false;
+    const m = entry as Record<string, unknown>;
+    return [m.content, m.parts].some((parts) => Array.isArray(parts) && parts.some(toolOpen));
+  });
+}
+
 /**
  * QA-4.2-2: the executor's `HostSessions.context` over the host's history (amendment to memo R1 rule 5). User and assistant
  * entries (`historyEntryKind`) keep their role and text; every other entry (synthetic, tool turns) is a non-terminal `assistant`
@@ -184,7 +201,7 @@ export function executorHostContext(history: unknown): HostSessionContext {
   });
   const end = childHistoryEnd(entries);
   if (end.kind === "ended") messages.push({ role: "idle", text: null, outcome: end.outcome });
-  return { messages };
+  return { messages, toolInFlight: historyToolInFlight(entries) };
 }
 
 /** Translate the router's own v1 tool vocabulary at the v2 boundary. */
