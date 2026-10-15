@@ -106,6 +106,41 @@ describe("Git tree fingerprint adapter", () => {
     const controller = new AbortController(); controller.abort();
     expect(await snapshotTree(process.cwd(), controller.signal)).toBeUndefined();
   });
+  it("reports a failing git call's reason while still returning undefined", async () => {
+    state.error = true;
+    const onError = vi.fn();
+    await expect(snapshotTree(process.cwd(), new AbortController().signal, { onError })).resolves.toBeUndefined();
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError).toHaveBeenCalledWith("git exited with code 1");
+  });
+  it("reports git timeout and spawn errors, with bounded, single-line, scrubbed diagnostics", async () => {
+    const timeout = `git timed out after ${SNAPSHOT_GIT_TIMEOUT_MS} ms`;
+    for (const [error, expected] of [
+      [new Error(timeout), timeout],
+      [Object.assign(new Error("spawn git ENOENT"), { code: "ENOENT" }), "ENOENT: spawn git ENOENT"],
+      ["plain git failure", "plain git failure"],
+    ] as const) {
+      const onError = vi.fn();
+      const git = async () => { throw error; };
+      expect(await snapshotTree(process.cwd(), new AbortController().signal, { git, onError })).toBeUndefined();
+      expect(onError).toHaveBeenCalledWith(expected);
+    }
+    const onError = vi.fn();
+    const git = async () => { throw new Error(`git failed\n${"x".repeat(175)} ghp_${"s".repeat(30)} ${"y".repeat(300)}`); };
+    expect(await snapshotTree(process.cwd(), new AbortController().signal, { git, onError })).toBeUndefined();
+    const reason = onError.mock.calls[0]![0] as string;
+    expect(reason).toHaveLength(200);
+    expect(reason).not.toMatch(/[\r\n]|ghp_/);
+    expect(reason).toContain("[REDACTED]");
+  });
+  it("ignores a throwing diagnostic callback and does not report errors on success", async () => {
+    const onError = vi.fn(() => { throw new Error("diagnostic failed"); });
+    expect(await snapshotTree(process.cwd(), new AbortController().signal, { onError })).toBeDefined();
+    expect(onError).not.toHaveBeenCalled();
+    state.error = true;
+    await expect(snapshotTree(process.cwd(), new AbortController().signal, { onError })).resolves.toBeUndefined();
+    expect(onError).toHaveBeenCalledTimes(1);
+  });
   it("QA-3.1-8: every git process of a snapshot gets lowPriority through the seam (default off)", async () => {
     const seen: SnapshotGitOptions[] = [];
     const git = async (args: readonly string[], opts: SnapshotGitOptions) => {

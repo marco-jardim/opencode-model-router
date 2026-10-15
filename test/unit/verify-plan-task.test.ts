@@ -15,6 +15,7 @@ import { gateResult, type Artefact, type Delegation, type GateDeps, type GateRes
 import { waitTreeFreeExcept, type PreparedVerification } from "../../src/verify/wiring";
 import { execFileSync } from "node:child_process";
 import { RouterTimeoutError } from "../../src/verify/timeout";
+import type { SnapshotOptions } from "../../src/verify/tree";
 import { PLAN_TASK_PERIMETER_ID, planPerimeter } from "../../src/verify/perimeter";
 import * as configModule from "../../src/router/config";
 import { leaseHolderID, type Attempt, type SlotLease, type TaskNode } from "../../src/executor/types";
@@ -738,10 +739,52 @@ describe("verifier arms", () => {
 
   it("a slot that cannot be snapshotted runs nothing", async () => {
     snapshotMock.mockImplementation(async () => undefined);
-    expect((await runAttempt(harness())).findings).toMatch(/could not be snapshotted/);
-    snapshotMock.mockImplementation(async () => { throw new Error("git busy"); });
-    expect((await runAttempt(harness())).findings).toMatch(/could not be snapshotted/);
+    const unavailable = await runAttempt(harness());
+    expect(unavailable.verdict).toBe("unverifiable");
+    expect(unavailable.findings).toMatch(/could not be snapshotted after cleanForChecks; nothing ran/);
+    snapshotMock.mockImplementation(async () => { throw new Error("git busy token=secret-123456"); });
+    const rejected = await runAttempt(harness());
+    expect(rejected.verdict).toBe("unverifiable");
+    expect(rejected.findings).toMatch(/could not be snapshotted after cleanForChecks \(git busy token=\[REDACTED\]\); nothing ran/);
+    expect(rejected.findings).not.toContain("secret-123456");
     expect(acceptMock).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("includes the bounded scrubbed snapshot reason and never passes (strict=%s)", async (strict) => {
+    snapshotMock.mockImplementation(async (_cwd: string, _signal: AbortSignal, options: SnapshotOptions) => {
+      options.onError?.(`git timed out after 10000 ms; token=secret-123456 ${"x".repeat(300)}`);
+      return undefined;
+    });
+    const h = harness({ strict });
+    const result = await runAttempt(h);
+    expect(result.verdict).toBe("unverifiable");
+    expect(result.findings).toMatch(/after cleanForChecks \(git timed out after 10000 ms; token=\[REDACTED\]/);
+    expect(result.findings).not.toContain("secret-123456");
+    expect(result.findings.match(/after cleanForChecks \((.*)\); nothing ran$/)?.[1]).toHaveLength(200);
+    expect(snapshotMock).toHaveBeenCalledTimes(1);
+    expect(acceptMock).not.toHaveBeenCalled();
+    expect(h.sleeps).toEqual([]);
+  });
+
+  it("reports the slot snapshot timeout without retrying or running checks", async () => {
+    vi.useFakeTimers();
+    try {
+      let started!: () => void;
+      const running = new Promise<void>((resolve) => { started = resolve; });
+      snapshotMock.mockImplementation(() => { started(); return new Promise<undefined>(() => {}); });
+      const h = harness();
+      const pending = runAttempt(h);
+      await running;
+      await vi.advanceTimersByTimeAsync(30_000);
+      const result = await pending;
+      expect(result.verdict).toBe("unverifiable");
+      expect(result.findings).toMatch(/after cleanForChecks \(slot snapshot timed out after 30000ms\); nothing ran/);
+      expect(snapshotMock).toHaveBeenCalledTimes(1);
+      expect(acceptMock).not.toHaveBeenCalled();
+      expect(h.sleeps).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("a snapshot without a root: the observed root, else the slot path", async () => {

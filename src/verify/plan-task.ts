@@ -533,17 +533,25 @@ export function createPlanTaskVerifier(deps: PlanTaskVerifierDeps): PlanTaskVeri
       // A fresh snapshot after cleanForChecks: the tree the checks run on (materialize's drift check, the lease wait's tree).
       const controller = new AbortController();
       let fresh: PreparedVerification["snapshot"];
+      let snapshotReason: string | undefined;
       const preparation = prepared.service?.start("service-prep", "slot-snapshot", checked.candidate);
       try {
-        fresh = await withTimeout(snapshotTree(slot.path, controller.signal, { lowPriority: budget.lowPriority }), GIT_MS, "slot snapshot");
+        fresh = await withTimeout(snapshotTree(slot.path, controller.signal, {
+          lowPriority: budget.lowPriority,
+          onError: (reason) => { snapshotReason = reason; },
+        }), GIT_MS, "slot snapshot");
         preparation?.end("completed");
-      } catch {
+      } catch (error) {
+        snapshotReason = error instanceof Error ? error.message : String(error);
         fresh = undefined;
       } finally {
         preparation?.end("error");
         controller.abort();
       }
-      if (fresh === undefined) return unverifiable(`the slot ${slot.path} could not be snapshotted after cleanForChecks; nothing ran`, record.dod);
+      if (fresh === undefined) {
+        const reason = snapshotReason === undefined ? "" : ` (${scrubText(snapshotReason).replace(/\s+/g, " ").trim().slice(0, 200)})`;
+        return unverifiable(`the slot ${slot.path} could not be snapshotted after cleanForChecks${reason}; nothing ran`, record.dod);
+      }
       const root = fresh.root ?? prepared.snapshot?.root ?? slot.path;
       const committed = await committedFiles(slot.path, root, record.base, checked.candidate);
       if (committed === undefined) return unverifiable(`the change between ${record.base} and ${checked.candidate} could not be read; nothing ran`, record.dod);

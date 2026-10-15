@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { lstat, readdir, readFile, readlink, realpath, stat } from "node:fs/promises";
 import { constants as osConstants, setPriority } from "node:os";
 import { extname, join, resolve } from "node:path";
+import { scrubText } from "../guard/scrub";
 import * as tools from "../router/git-tools";
 import { ABSENT_DIGEST, FILE_DIGEST_PREFIX, LINK_DIGEST_PREFIX, type TreeSnapshot, type ChangedFile } from "./dispatch";
 
@@ -173,6 +174,8 @@ export interface SnapshotOptions {
   hardened?: boolean;
   /** The git process seam (tests). Default execGit. */
   git?: SnapshotGit;
+  /** Optional failure diagnostic: scrubbed, single-line, at most 200 chars. Callback errors are ignored. */
+  onError?: (reason: string) => void;
   /**
    * Cross-repo P2.6 (SD11): also compute `TreeSnapshot.ignored`, a bounded digest of the repository's ignored files (nothing
    * under a `node_modules` segment), with the snapshot's own git runner (hardened when `hardened`). QA-2 #9b: "over-bounds" when
@@ -588,8 +591,16 @@ export async function snapshotTree(cwd: string, signal: AbortSignal, options: Sn
       cwd: await realpath(cwd), root: await realpath(root), head, branch, fingerprint: hash.digest("hex"), dirty: files.length > 0, files, digests,
       ...(ignored !== undefined ? { ignored } : {}),
     };
-  } catch {
+  } catch (error) {
     // Not a Git checkout, unreadable file, timeout or concurrent deletion: no baseline.
+    try {
+      if (options.onError !== undefined) {
+        const code = errorCode(error);
+        const message = error instanceof Error ? error.message : String(error);
+        const reason = `${typeof code === "string" || typeof code === "number" ? `${code}: ` : ""}${message}`;
+        options.onError(scrubText(reason).replace(/\s+/g, " ").trim().slice(0, 200) || "snapshot failed");
+      }
+    } catch { /* Diagnostics never turn an unavailable snapshot into a throw. */ }
     return undefined;
   }
 }
