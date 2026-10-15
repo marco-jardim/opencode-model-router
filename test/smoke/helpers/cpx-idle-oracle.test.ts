@@ -13,7 +13,7 @@ const fragment = (from: number, to: number): IdleFragment & { name: "idle-with-r
   toAt: new Date(BASE + to).toISOString(), ms: to - from, readyTaskIds: ["a"], free: 4 });
 
 /** Hand-authored wire rows, not the production scheduler or its idle metric implementation. */
-function fixture(tasks = [task()], maxParallel = 4) {
+function fixture(tasks = [task()], maxParallel = 4, approvalMaxParallel?: number) {
   const rows: { at: number; family: "scheduler"; planId: string; parentSessionID: string; action: string; state: ObservationValue }[] = [];
   let ledger = { ledgerSeq: 1, status: "awaiting-approval", maxParallel, tasks, edges: [] as { from: string; to: string }[],
     phases: [] as { id: string; gate: string; paused: boolean }[], writeConflicts: [] };
@@ -27,8 +27,8 @@ function fixture(tasks = [task()], maxParallel = 4) {
   const add = (action: string, ms: number, state: ObservationValue) => {
     rows.push({ at: BASE + ms, family: "scheduler", planId: "plan", parentSessionID: "parent", action, state: structuredClone(state) });
   };
-  const runtime = (action: string, ms: number, detail: ObservationValue = null) => {
-    add(action, ms, { clockMs: BASE + ms, ledgerSeq: ledger.ledgerSeq, orchIdle: idle, passive: false, recovering: false,
+  const runtime = (action: string, ms: number, detail: ObservationValue = null, recovering = false) => {
+    add(action, ms, { clockMs: BASE + ms, ledgerSeq: ledger.ledgerSeq, orchIdle: idle, passive: false, recovering,
       disposed: action === "detach", latch: action === "detach", inFlight: [...inFlight], tokens: [], detail });
   };
   const idleClose = (metric: ReturnType<typeof fragment>) => runtime("idle-close", Date.parse(metric.toAt) - BASE, {
@@ -90,8 +90,19 @@ function fixture(tasks = [task()], maxParallel = 4) {
   add("capacity-init", -3, { maxParallel, providers: [] });
   add("attach", -2, ledger);
   runtime("runtime-attach", -2);
-  routeTasks(-2);
-  commit(-1, { status: "running" });
+  if (approvalMaxParallel === undefined) {
+    routeTasks(-2);
+    commit(-1, { status: "running" });
+  } else {
+    // Replay the approval batch's two journal events and seq-20 controller replacement.
+    for (let i = 0; i < 15; i++) runtime("schedule", -2);
+    ledger = { ...ledger, ledgerSeq: 3, status: "running", maxParallel: approvalMaxParallel };
+    add("ledger", -1, ledger);
+    limit = approvalMaxParallel;
+    add("capacity-init", -1, { maxParallel: approvalMaxParallel, providers: [] });
+    runtime("activation", -1, null, true);
+    routeTasks(-1);
+  }
   orchestrator(0, "execution.completed");
   return { rows, runtime, commit, orchestrator, prepare, endStep, launch, release, files, pool, raw: add, query, idleClose,
     provider(ms: number, change: string, to = limit) {
@@ -120,6 +131,63 @@ function changeWire(files: ObservationFile[], change: (rows: Record<string, unkn
 }
 
 describe("G8 independent maximal idle episodes (no host)", () => {
+  it("accepts the approval-time controller replacement without changing idle episodes", () => {
+    const baseline = fixture(), f = fixture([task()], 4, 4);
+    baseline.finish(1_000); f.finish(1_000);
+    const episodes = (value: ReturnType<typeof fixture>) => reconstruct(value).episodes.map(e =>
+      [e.fromMs, e.toMs, e.ms, e.readyTaskIds, e.endedBy]);
+    expect(episodes(f)).toEqual(episodes(baseline));
+    expect(reconstruct(f).episodes.map(e => e.ms)).toEqual([1_000]);
+  });
+
+  it.each([1, 6])("applies a changed maxParallel of %i on approval-time replacement", maxParallel => {
+    const f = fixture([task()], 4, maxParallel);
+    f.query(100);
+    f.finish(1_000);
+    expect(reconstruct(f).episodes.map(e => e.ms)).toEqual([1_000]);
+  });
+
+  it.each([false, true])("discards old provider limits, pauses and query facts on replacement (seeded=%s)", seeded => {
+    const f = fixture();
+    f.provider(100, "decrease", 1);
+    f.provider(200, "pause");
+    f.raw("capacity-init", 300, { maxParallel: 6, providers: seeded ? [
+      { provider: "provider:fixture", limit: 2, holdUntilMs: 0, lastSignalAtMs: null, pausedUntilMs: null },
+    ] : [] });
+    f.runtime("capacity-free", 400, { provider: "provider:fixture", heavy: false, free: seeded ? 2 : 6 });
+    f.finish(1_000);
+    expect(reconstruct(f).episodes.map(e => [e.fromMs - BASE, e.toMs - BASE])).toEqual([[0, 200], [400, 1_000]]);
+  });
+
+  it.each([false, true])("rejects controller replacement with a live provider token (force=%s)", force => {
+    const f = fixture();
+    f.runtime("capacity-reserve", 100, { taskId: "a", attempt: 1, provider: "provider:fixture", heavy: false, token: "held", force });
+    f.raw("capacity-init", 200, { maxParallel: 4, providers: [] });
+    f.runtime("capacity-release", 300, { taskId: "a", attempt: 1, token: "held", result: "other" });
+    f.finish(1_000);
+    expect(() => reconstruct(f)).toThrow(/duplicate capacity-init/);
+  });
+
+  it.each(["launched", "skipped"] as const)("rejects controller replacement after a launch invocation even with its token released (%s)", result => {
+    const f = fixture();
+    f.prepare(100);
+    f.launch(200);
+    f.endStep(300, result);
+    if (result === "launched") f.release(400);
+    f.commit(500, { tasks: [task("a", { state: "done" })] });
+    f.raw("capacity-init", 600, { maxParallel: 4, providers: [] });
+    f.finish(1_000);
+    expect(() => reconstruct(f)).toThrow(/duplicate capacity-init/);
+  });
+
+  it.each(["dispatched", "running"])("rejects controller replacement with a %s task even without a token", state => {
+    const f = fixture();
+    f.commit(100, { tasks: [task("a", { state })] });
+    f.raw("capacity-init", 200, { maxParallel: 4, providers: [] });
+    f.finish(1_000);
+    expect(() => reconstruct(f)).toThrow(/duplicate capacity-init/);
+  });
+
   it("requires the deferred sink's disposal/close seal; flush alone cannot produce passing evidence", () => {
     const f = fixture();
     f.finish(1_000);

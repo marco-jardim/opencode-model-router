@@ -82,7 +82,9 @@ features. Reach checkpoints from observed host/ledger events, not fixed sleeps:
 are excluded from throughput W/CP. Background dispatches include acceptance
 blocks for completion verification and write disjoint paths. The driver must
 await all of them before checking the tail. Every named `tailAssertions` entry
-is an assertion obligation for 6.1.3, not an expected result to fabricate. In
-particular check the ad hoc dispatch's annotation exactly once in the tail and
+is an assertion obligation for 6.1.3, not an expected result to fabricate, except
+`G8-makespan-bound`: owner amendment A-6.1-2 makes it measured/disclosed only
+(bound, ratio and met status), not a pass/fail bound assertion. In particular
+check the ad hoc dispatch's annotation exactly once in the tail and
 that none of its IDs appears among the 24 compiled tasks. Throughput has empty
 injections, four empty QA reports and only clean first-attempt completions (G8).

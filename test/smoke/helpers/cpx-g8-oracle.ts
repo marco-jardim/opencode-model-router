@@ -102,7 +102,8 @@ export interface G8Metrics {
 function serviceRow(row: ServiceRow): void {
   fact(text(row.operationId) && text(row.stage) && text(row.planId), "invalid service identity");
   fact(["service", "service-prep", "service-wait", "service-unattributed"].includes(row.spanKind)
-    && ["verify", "rebase", "checks", "fast-forward", "phase-suite"].includes(row.component), "unknown service kind/component");
+    && ["verify", "rebase", "checks", "fast-forward", "phase-suite"].includes(row.component)
+    && (row.spanKind !== "service-unattributed" || row.component === "verify"), "unknown service kind/component");
   fact([row.taskId, row.phaseId, row.entryId, row.candidate].every(v => v === null || text(v)), "invalid service attribution");
   fact(row.attempt === null || (Number.isInteger(row.attempt) && row.attempt > 0), "invalid service attempt");
   fact(Array.isArray(row.taskIds) && row.taskIds.every(text) && new Set(row.taskIds).size === row.taskIds.length, "invalid/duplicate batch membership");

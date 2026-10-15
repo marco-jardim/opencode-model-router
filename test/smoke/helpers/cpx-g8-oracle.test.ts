@@ -379,6 +379,13 @@ describe("G8 recorded metric A-6.1-2 (no host)", () => {
     expect(m.diagnostics).toMatchObject({ serviceSpans: 3, unattributedVerifyMs: 2_000, unattributedSpans: 2 });
   });
 
+  it.each(["rebase", "checks", "fast-forward", "phase-suite"] as const)("rejects service-unattributed for %s", component => {
+    const f = fixture([{ id: "a", durationMs: 100, phase: "p" }]);
+    f.verify("a", 100, 10); f.entry("i", ["a"], 110, 100); f.entry("s", [], 210, 20, "p");
+    for (const row of f.rows) if (row.family === "service" && row.component === component) row.spanKind = "service-unattributed";
+    expect(() => f.measure()).toThrow(/unknown service kind\/component/);
+  });
+
   it("credits only intrinsic service when verify evidence mixes service and unattributed spans", () => {
     const f = unattributedWriter();
     f.span(f.verifyIdentity("t0"), 10_000, 10_500);

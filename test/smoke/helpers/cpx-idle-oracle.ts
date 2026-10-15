@@ -179,6 +179,9 @@ export async function collectObservationFiles(directory: string): Promise<Observ
  * are UNKNOWN, never guessed eligible or unavailable. A separate possible-episode track joins UNKNOWN
  * spans to adjacent eligible spans and fails closed if their union could exceed 10,000 ms.
  * Lease selection, slot-admission and launch-gate.ready are not readiness oracles.
+ * A later capacity-init may replace the controller only before any launch invocation/forced launch,
+ * with no live provider tokens, open preparation or dispatched/running task. Replacement discards
+ * prior provider limits, pauses and query facts, then applies the new maxParallel and provider seeds.
  *
  * Provider tokens consume A's capacity only on a confirmed launch, not on provisional reservation:
  * an attempt that never launches must NOT fragment an episode. Actual provider exhaustion/pauses do.
@@ -279,6 +282,7 @@ export function reconstructIdleEpisodes(files: readonly ObservationFile[], ident
   let lastTime = -Infinity;
   let finalSeen = false;
   let maxParallel: number | undefined;
+  let launchSeen = false;
   let pool: Pool | undefined;
   const routes = new Map<string, Route | null>(); // null is an observed unavailable route, not missing evidence.
   const providers = new Map<string, Provider>();
@@ -358,9 +362,11 @@ export function reconstructIdleEpisodes(files: readonly ObservationFile[], ident
     if (isSlot) pool = poolSnapshot(row);
     else if (isRaw) {
       if (row.action === "capacity-init") {
-        requireFact(maxParallel === undefined, "duplicate capacity-init");
+        requireFact(maxParallel === undefined || (ledger !== undefined && !launchSeen && tokens.size === 0 && preparing.size === 0
+          && ledger.tasks.every(task => task.state !== "dispatched" && task.state !== "running")), "duplicate capacity-init");
         maxParallel = number(state.maxParallel);
         requireFact(Number.isInteger(maxParallel) && maxParallel > 0, "invalid provider capacity");
+        providers.clear();
         for (const value of list(state.providers)) {
           const p = bag(value);
           providers.set(text(p.provider), { limit: number(p.limit), paused: p.pausedUntilMs !== null, queried: new Set() });
@@ -432,13 +438,16 @@ export function reconstructIdleEpisodes(files: readonly ObservationFile[], ident
       } else if (row.action === "capacity-reserve") {
         const d = bag(state.detail), token = text(d.token);
         requireFact(!tokens.has(token), "duplicate capacity reservation");
+        const launched = boolean(d.force);
         tokens.set(token, { provider: text(d.provider), heavy: boolean(d.heavy), taskId: text(d.taskId),
-          attempt: number(d.attempt), launched: boolean(d.force) });
+          attempt: number(d.attempt), launched });
+        launchSeen ||= launched;
       } else if (row.action === "capacity-release") {
         const d = bag(state.detail), token = text(d.token), held = tokens.get(token);
         requireFact(held && held.taskId === d.taskId && held.attempt === d.attempt, "capacity release missing reservation");
         tokens.delete(token);
       }
+      if (row.action === "launch") launchSeen = true;
       if (successfulLaunches.has(row.seq)) {
         const d = bag(state.detail);
         const token = [...tokens.values()].find(t => t.taskId === d.taskId && t.attempt === d.attempt);
