@@ -95,12 +95,13 @@ export interface G8Metrics {
   makespan: number; CP_eff: number; W_auth: number; p: number; "ΣI_service": number; rawCP: number; rawΣI: number;
   vertices: Record<string, VertexCost>; bound: number;
   window: { fromAt: number; toAt: number }; stream: string;
-  diagnostics: { serviceSpans: number; prepMs: number; waitMs: number; entryService: Record<string, number> };
+  diagnostics: { serviceSpans: number; unattributedVerifyMs: number; unattributedSpans: number;
+    prepMs: number; waitMs: number; entryService: Record<string, number> };
 }
 
 function serviceRow(row: ServiceRow): void {
   fact(text(row.operationId) && text(row.stage) && text(row.planId), "invalid service identity");
-  fact(["service", "service-prep", "service-wait"].includes(row.spanKind)
+  fact(["service", "service-prep", "service-wait", "service-unattributed"].includes(row.spanKind)
     && ["verify", "rebase", "checks", "fast-forward", "phase-suite"].includes(row.component), "unknown service kind/component");
   fact([row.taskId, row.phaseId, row.entryId, row.candidate].every(v => v === null || text(v)), "invalid service attribution");
   fact(row.attempt === null || (Number.isInteger(row.attempt) && row.attempt > 0), "invalid service attempt");
@@ -223,9 +224,10 @@ function antichain(plan: G8Plan, ids: readonly string[]): void {
   }
 }
 
-/** A-6.1-1, fresh throughput runs only. The event inventory proves WHICH operations were required;
- * it never supplies their cost. Only service clockMs intervals supply that cost. Prep/wait and enclosing
- * journal durations cannot enlarge a term. ΣI is the union of rebase/checks/fast-forward in the serial
+/** A-6.1-1/A-6.1-2, fresh throughput runs only. The event inventory proves WHICH operations were required;
+ * it never supplies their cost. Only service clockMs intervals supply that cost; unattributed verify is
+ * recognized evidence with zero intrinsic credit. Prep/wait and enclosing journal durations cannot enlarge
+ * a term. ΣI is the union of rebase/checks/fast-forward in the serial
  * task-entry lane; background phase-suite service belongs to gate vertices, not the serial lane.
  */
 export function reconstructG8(plan: G8Plan, final: G8Final, events: readonly ExecutorEvent[], files: readonly ObservationFile[], rawΣI: number): G8Metrics {
@@ -275,7 +277,7 @@ export function reconstructG8(plan: G8Plan, final: G8Final, events: readonly Exe
   const verify = new Map<string, Span[]>();
   for (const span of spans) {
     const row = span.start;
-    if (row.spanKind !== "service") continue;
+    if (row.spanKind !== "service" && row.spanKind !== "service-unattributed") continue;
     // at locates a span in the epoch makespan window; NEVER subtract it for a service cost. All required
     // operations of this fresh run must be enclosed. Crossing a boundary lacks a monotonic calibration:
     // fail closed rather than silently count outside-window time or invent an epoch/performance offset.
@@ -300,7 +302,7 @@ export function reconstructG8(plan: G8Plan, final: G8Final, events: readonly Exe
         && span.end.at <= Date.parse(step.end.at)
         && (row.component === "rebase" || (row.candidate !== null && row.candidate === step.start.entry.candidate))),
       `service lacks matching journal step/candidate ${row.operationId}`);
-      evidence.spans.push(span);
+      if (row.spanKind === "service") evidence.spans.push(span);
     }
   }
   const vertices: Record<string, VertexCost> = {}, entryService: Record<string, number> = {};
@@ -342,7 +344,8 @@ export function reconstructG8(plan: G8Plan, final: G8Final, events: readonly Exe
       fact(![...verify.keys()].some(key => key.startsWith(`${id}#`)) && attributed.length === 0 && integrated.length === 0, `contradictory QA service ${id}`);
     }
     const I_service = attributed.reduce((sum, e) => sum + entryService[e.entry.id]!, 0);
-    const V_service = taskVerify.reduce((sum, s) => sum + (s.end.clockMs - s.start.clockMs), 0);
+    const V_service = taskVerify.filter(s => s.start.spanKind === "service")
+      .reduce((sum, s) => sum + (s.end.clockMs - s.start.clockMs), 0);
     vertices[id] = { authored: task.authored, V_service, I_service, S_service: 0,
       total: task.authored + V_service + I_service, entryIds: attributed.map(e => e.entry.id) };
   }
@@ -357,6 +360,8 @@ export function reconstructG8(plan: G8Plan, final: G8Final, events: readonly Exe
   return { makespan: window.toAt - window.fromAt, CP_eff, W_auth: plan.W_auth, p: plan.p, "ΣI_service": ΣI_service,
     rawCP: plan.rawCP, rawΣI, vertices, bound: 1.3 * Math.max(CP_eff, plan.W_auth / plan.p, ΣI_service), window, stream,
     diagnostics: { serviceSpans: spans.filter(s => s.start.spanKind === "service").length,
+      unattributedVerifyMs: unionMs(spans.filter(s => s.start.spanKind === "service-unattributed" && s.start.component === "verify")),
+      unattributedSpans: spans.filter(s => s.start.spanKind === "service-unattributed").length,
       prepMs: unionMs(spans.filter(s => s.start.spanKind === "service-prep")),
       waitMs: unionMs(spans.filter(s => s.start.spanKind === "service-wait")), entryService } };
 }

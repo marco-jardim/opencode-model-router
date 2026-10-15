@@ -140,6 +140,11 @@ function dominant(term: "CP_eff" | "W/p" | "ΣI_service") {
   }
   return f;
 }
+function unattributedWriter() {
+  const f = dominant("CP_eff");
+  for (const row of f.rows) if (row.family === "service" && row.component === "verify") row.spanKind = "service-unattributed";
+  return f;
+}
 function changeWire(files: ObservationFile[], edit: (rows: Record<string, unknown>[]) => void): ObservationFile[] {
   return files.map(file => {
     const rows: Record<string, unknown>[] = file.text.trimEnd().split("\n").map(line => JSON.parse(line));
@@ -361,5 +366,84 @@ describe("G8 amended intrinsic-service oracle A-6.1-1 (no host)", () => {
     expect(f.measure()).toMatchObject({ CP_eff: 14_000, "ΣI_service": 6_000 });
     f.finish(15_999);
     expect(() => f.measure()).toThrow(/service outside makespan window/);
+  });
+});
+
+describe("G8 recorded metric A-6.1-2 (no host)", () => {
+  it("accepts unattributed verify as zero-credit evidence and unions its diagnostic duration", () => {
+    const f = unattributedWriter();
+    f.span(f.verifyIdentity("t0"), 11_000, 12_000, "service-unattributed", "grading");
+    const m = f.measure();
+    expect(m).toMatchObject({ CP_eff: 11_000, "ΣI_service": 1_000, bound: 14_300 });
+    expect(m.vertices.t0).toMatchObject({ V_service: 0, I_service: 1_000, total: 11_000 });
+    expect(m.diagnostics).toMatchObject({ serviceSpans: 3, unattributedVerifyMs: 2_000, unattributedSpans: 2 });
+  });
+
+  it("credits only intrinsic service when verify evidence mixes service and unattributed spans", () => {
+    const f = unattributedWriter();
+    f.span(f.verifyIdentity("t0"), 10_000, 10_500);
+    f.span(f.verifyIdentity("t0"), 11_500, 12_000);
+    const m = f.measure();
+    expect(m.vertices.t0).toMatchObject({ V_service: 1_000, total: 12_000 });
+    expect(m.diagnostics).toMatchObject({ serviceSpans: 5, unattributedVerifyMs: 2_000, unattributedSpans: 1 });
+  });
+
+  it.each(["absent", "earlier attempt only"])("still rejects a writer with no final-attempt verify evidence: %s", evidence => {
+    const f = unattributedWriter();
+    if (evidence === "absent") {
+      for (let i = f.rows.length - 1; i >= 0; i--) {
+        const row = f.rows[i]!;
+        if (row.family === "service" && row.component === "verify") f.rows.splice(i, 1);
+      }
+    } else {
+      f.finalTasks.t0 = { ...f.finalTasks.t0!, attempts: [{ n: 1, outcome: "succeeded", verdict: "fail" }, { n: 2, outcome: "succeeded", verdict: "pass" }] };
+      for (const event of f.events) if (event.type === "attempt-verdict") event.n = 2;
+    }
+    expect(() => f.measure()).toThrow(/missing verify service for integrated writer/);
+  });
+
+  it.each(["unpaired start", "unpaired end", "pair identity", "duration"])("rejects malformed unattributed verify: %s", fault => {
+    const f = unattributedWriter();
+    if (fault.startsWith("unpaired")) {
+      const action = fault === "unpaired start" ? "end" : "start";
+      f.rows.splice(f.rows.findIndex(row => row.family === "service" && row.component === "verify" && row.action === action), 1);
+    } else {
+      for (const row of f.rows) if (row.family === "service" && row.component === "verify" && row.action === "end") {
+        if (fault === "pair identity") row.candidate = "different";
+        if (fault === "duration") row.durationMs++;
+      }
+    }
+    expect(() => f.measure()).toThrow(/unpaired service|ambiguous paired attribution|service duration mismatch/);
+  });
+
+  it.each(["task", "attempt", "entry", "phase", "members", "window", "verdict"])("keeps unattributed verify %s integrity asserted", fault => {
+    const f = unattributedWriter();
+    for (const row of f.rows) if (row.family === "service" && row.component === "verify") {
+      if (fault === "task") row.taskId = "unknown";
+      if (fault === "attempt") row.attempt = 9;
+      if (fault === "entry") row.entryId = "i0";
+      if (fault === "phase") row.phaseId = "p";
+      if (fault === "members") row.taskIds = ["t0", "other"];
+    }
+    if (fault === "window") f.finish(11_999);
+    if (fault === "verdict") for (const event of f.events) if (event.type === "attempt-verdict") event.at = new Date(BASE + 11_999).toISOString();
+    expect(() => f.measure()).toThrow(/ambiguous verify attribution|unknown verify attempt|service outside makespan window|verify service after verdict/);
+  });
+
+  it.each(["spanKind", "component"])("still rejects an unknown service %s", field => {
+    const f = unattributedWriter();
+    const files = changeWire(f.files(), rows => {
+      for (const row of rows) if (row.family === "service" && row.component === "verify") row[field] = "unknown";
+    });
+    expect(() => reconstructG8(f.plan, f.final, f.inventory(), files, 0)).toThrow(/unknown service kind\/component/);
+  });
+
+  it("keeps the credited-zero bound no larger than the bound with unattributed verify credited", () => {
+    const f = unattributedWriter(), zero = f.measure();
+    for (const row of f.rows) if (row.family === "service" && row.spanKind === "service-unattributed") row.spanKind = "service";
+    const credited = f.measure();
+    expect(credited.vertices.t0?.V_service).toBe(2_000);
+    expect(zero.bound).toBeLessThanOrEqual(credited.bound);
+    expect(zero.bound).toBeLessThan(credited.bound);
   });
 });

@@ -68,6 +68,9 @@ The definitive solution has two parts that share one engine:
   before execution; serial integration service uses union accounting. Queueing, resource waits, launch and preparation
   delays, cold initialization, idle and driver holds cannot enlarge any bound term; missing or ambiguous service evidence
   fails closed. The factor, configured parallelism and authored workload are unchanged; raw CP/ΣI remain diagnostics.
+  *Amended by A-6.1-2 (owner decision 2026-10-15):* the makespan bound is a measured, disclosed metric, not a Phase 6.1
+  acceptance gate. Delegated grading observed as `service-unattributed` is recognized verification evidence with zero
+  intrinsic credit; service-evidence integrity and the idle ceiling below stay asserted. See G8 and the amendment log.
 - No idle-with-ready interval longer than 10 s: whenever a ready task and free capacity exist, it is launched (launcher A, ADR 0007 D14). *Amended by A-0.1-2; A-6.1-1 confirms predicate A (owner decision 2026-10-14) and the unchanged 10,000 ms ceiling.*
 - No file is written by two agents at once.
 - No file in a shared working tree is read through an agent's file or search tools while a child agent holds its write
@@ -4022,14 +4025,19 @@ documentation. The dogfood comparison (§0.12-5) is written in 6.2.0.
     60 s setup; post-compilation `1.3 × max(CP, W/p, entries × 5 s) + 60 s`, with a 300 s ceiling. This is a harness
     watchdog, not additive slack in G8; authored durations remain strict.
   - 6.1.3.b Assert G1–G12 (§5.1) with measured numbers taken from the ledger's metric events:
-    - makespan, CP_eff, W_auth and ΣI_service under A-6.1-1; W_auth and task work durations are fixed by the authored
-      script before execution, and raw CP/ΣI are retained as diagnostics;
+    - *Amended by A-6.1-2 (owner decision 2026-10-15):* reconstruct and record makespan, CP_eff, W_auth/p, ΣI_service,
+      the A-6.1-1 bound, makespan/bound ratio and whether the bound was met; the makespan bound is a measured, disclosed
+      metric, not a Phase 6.1 acceptance gate. Disclose these alongside G13 in the Phase 6.2 PR. W_auth and task work
+      durations are fixed by the authored script before execution, and raw CP/ΣI are retained as diagnostics;
     - attributable intrinsic service evidence for CP_eff on the pre-run compiled dependency graph, including semantic
       phase gates, with required-verification and integration service on tasks and phase-suite service on phase gates
       (G8). Service-accounting boundaries and batch attribution are fixed before execution: a shared batch entry's full
       service is assigned to each member, members must be an antichain, and the entry is counted once in ΣI_service.
       Serial integration service uses union accounting. Queueing, resource waits, launch and preparation delays, cold
-      initialization, idle and driver holds are excluded from all bound terms; missing or ambiguous evidence fails closed;
+      initialization, idle and driver holds are excluded from all bound terms; missing or ambiguous evidence fails closed.
+      *Amended by A-6.1-2:* delegated grading observed as `service-unattributed` is recognized verification evidence at
+      zero intrinsic cost, making the computed bound conservative (never larger than the true bound). Service-evidence
+      integrity (pairing, attribution, makespan window and evidence before the passing verdict) stays asserted;
     - idle-with-ready episodes under predicate A (owner-confirmed 2026-10-14), each at most 10,000 ms;
     - request-prefix equality;
     - lease conflicts;
@@ -4242,7 +4250,7 @@ Edge cases are those listed in 6.1.2.
 | G5 | **Compilation.** The frozen copies of the three largest plans and of this plan compile with every task id recognized, ≥ 80% write-footprint coverage for editing tasks, zero cycles, and their explicit dependencies present. Unannotated plans compile through the classifier. | 2.3 |
 | G6 | **File safety.** No file is written by two agents at once. In a shared tree, no file is read through an agent's file or search tools while a child agent holds its write lease; a `router_run` there is annotated as possibly contaminated (refused under `routing.leases.run: "refuse"`); plugin verification runs are deferred. Enforced in code and proven by tests, for ad hoc and plan dispatches; observed in real use under DF-1 and DF-2. | 1.3, 2.1, 3.1, 6.1 |
 | G7 | **Integration.** The plan integration branch never points at a commit whose integration checks failed, reverts included. Phase-suite failures are bisected, and the culprit is reverted through a checked slot and reopened automatically. | 3.2, 6.1 |
-| G8 | **Throughput.** Fixture: `D:\git\omr-cpx-main\test\fixtures\cpx\e2e\throughput.md`. *Amended by A-6.1-1 (owner decision 2026-10-14):* On the unchanged throughput fixture, makespan must be at most 1.3 × max(CP_eff, W_auth/configuredMaxParallel, ΣI_service). W_auth and task work durations are fixed by the authored script before execution. CP_eff is the longest path of the pre-run compiled dependency graph, including semantic phase gates, with task costs equal to authored work plus attributable intrinsic required-verification and integration service, and phase-gate costs equal to intrinsic phase-suite service. Service-accounting boundaries and batch attribution are fixed before execution (a shared batch entry's full service is assigned to each member; members must be an antichain; it is counted once in ΣI). Queueing, resource waits, launch and preparation delays, cold initialization, idle and driver holds are excluded from all bound terms. Serial integration service uses union accounting. Missing or ambiguous service evidence fails closed. No idle-with-ready episode (predicate A, owner-confirmed 2026-10-14) may exceed 10,000 ms. The factor, idle ceiling, configured parallelism and authored workload are unchanged. | 3.1, 6.1 |
+| G8 | **Throughput.** Fixture: `D:\git\omr-cpx-main\test\fixtures\cpx\e2e\throughput.md`. *Amended by A-6.1-1 (owner decision 2026-10-14):* On the unchanged throughput fixture, the makespan bound is 1.3 × max(CP_eff, W_auth/configuredMaxParallel, ΣI_service). *Amended by A-6.1-2 (owner decision 2026-10-15):* this bound is a measured, disclosed metric, not a Phase 6.1 acceptance gate. Reconstruct and record makespan, CP_eff, W_auth/p, ΣI_service, the bound, ratio and whether it was met; disclose them alongside G13 in the Phase 6.2 PR. Delegated grading observed as `service-unattributed` is recognized verification evidence at zero intrinsic cost, so the computed bound is conservative (never larger than the true bound). W_auth and task work durations are fixed by the authored script before execution. CP_eff is the longest path of the pre-run compiled dependency graph, including semantic phase gates, with task costs equal to authored work plus attributable intrinsic required-verification and integration service, and phase-gate costs equal to intrinsic phase-suite service. Service-accounting boundaries and batch attribution are fixed before execution (a shared batch entry's full service is assigned to each member; members must be an antichain; it is counted once in ΣI). Queueing, resource waits, launch and preparation delays, cold initialization, idle and driver holds are excluded from all bound terms. Serial integration service uses union accounting. Still asserted: service-evidence integrity (pairing, attribution, window, evidence before the passing verdict; missing or ambiguous evidence fails closed) and no idle-with-ready episode (predicate A, owner-confirmed 2026-10-14) may exceed 10,000 ms. The factor, idle ceiling, configured parallelism and authored workload are unchanged. Raw CP/ΣI stay diagnostics. Not a retroactive pass for historical runs. | 3.1, 6.1 |
 | G9 | **Durability.** A host restart mid-plan converges to the same ledger and integration branch as an uninterrupted run, with no task launched or integrated twice. Pending verifications outside plans survive restarts. | 2.1, 2.2, 4.2, 6.1 |
 | G10 | **Unattended.** A question parks only its task and dependents, and independent work continues. QA loops turn findings into fixes and re-reviews automatically. The circuit breaker is the only automatic stop. There are zero polling turns. | 4.2, 6.1 |
 | G11 | **Adaptive capacity.** A 429 burst halves the provider's capacity, which recovers to the cap after successes. A usage-limit error pauses the provider with one inbox item. | 3.1, 6.1 |
@@ -4450,11 +4458,12 @@ integration checks (3.2.3.a).
 ## Appendix D — Metrics
 
 Recorded as ledger `metric` and `integration-step` events by 3.1 and 3.2, rendered by `router_plan action=status`, and
-asserted in Phase 6.1.
+asserted in Phase 6.1 except the G8 makespan bound, which is measured and disclosed under A-6.1-2.
 
 | Metric | Definition | Source |
 |---|---|---|
 | Plan efficiency | makespan / max(CP_eff, W_auth/configuredMaxParallel, ΣI_service), under A-6.1-1 for G8 | ledger makespan, authored script and pre-run compiled dependency graph, attributable intrinsic service observations |
+| G8 bound (measured/disclosed only, A-6.1-2) | 1.3 × max(CP_eff, W_auth/configuredMaxParallel, ΣI_service); record makespan, CP_eff, W_auth/p, ΣI_service, bound, g8Ratio = makespan/bound and g8BoundMet; disclose alongside G13 in the Phase 6.2 PR | throughput smoke's reconstructed service evidence and baseline metrics |
 | Raw CP / ΣI (diagnostics only) | raw CP and raw measured integration time, retained alongside but not substituted for the amended G8 bound terms | authored script, pre-run dependency graph and integration-step events |
 | Idle-with-ready | episodes during which a ready task and free capacity existed with nothing launched; predicate A (owner-confirmed 2026-10-14), at most 10,000 ms for G8 | runtime `metric` events and independent episode evidence |
 | Orchestrator cache-read share | p50 and p10 of cacheRead / (input + cacheRead + cacheWrite) per orchestrator turn | `turns.jsonl` (1.1) |
@@ -4473,6 +4482,14 @@ A shared batch entry's full service is assigned to each member, members must be 
 once in ΣI_service, using union accounting for serial integration service. Queueing, resource waits, launch and preparation
 delays, cold initialization, idle and driver holds are excluded from all bound terms. Missing or ambiguous service evidence
 fails closed; the 6.1.QA negative controls must show that padding excluded delays cannot enlarge the denominator.
+
+*Amended by A-6.1-2 (owner decision 2026-10-15):* the G8 makespan bound is measured and disclosed, not a Phase 6.1
+acceptance gate. The throughput smoke still reconstructs and records every amended term, the bound and ratio for the
+Phase 6.2 PR alongside G13. Delegated grading observed as `service-unattributed` is recognized verification evidence
+credited at zero intrinsic cost; its duration union and span count are diagnostics, and the computed bound is conservative
+(never larger than the true bound). Still asserted: service-evidence integrity (pairing, attribution, window and evidence
+before the passing verdict; missing evidence fails closed) and every idle-with-ready episode (predicate A) ≤ 10,000 ms.
+Raw CP/ΣI stay diagnostics. No factor, parallelism, authored duration, idle ceiling or watchdog change.
 
 ---
 
@@ -4614,5 +4631,24 @@ Node ≥ 22.18; DF-2 switch procedure and the 24 h pending TTL from DF-1; QA tas
 
   Recorded in `docs\qa\critical-path-execution\phase-6.1.md`, "Owner amendment A-6.1-1 — 2026-10-14". This is a contract
   amendment, not a retroactive pass for historical runs.
+
+- **A-6.1-2** (Phase 6.1, owner decision **2026-10-15**) — **G8 makespan bound reclassified as a measured, disclosed
+  metric.** Applies to the Target, 6.1.3.b metrics, G8 (§5.1) and Appendix D; supersedes the makespan acceptance gate in
+  A-6.1-1, not its accounting safeguards.
+
+  > Phase 6.1 acceptance no longer requires makespan ≤ 1.3 × max(CP_eff, W_auth/p, ΣI_service). The throughput smoke
+  > still reconstructs and records makespan, CP_eff, W_auth/p, ΣI_service, the bound and the ratio, and the Phase 6.2 PR
+  > discloses them alongside G13. Still asserted: every idle-with-ready episode (predicate A) ≤ 10,000 ms, and
+  > service-evidence integrity (pairing, attribution, window, missing evidence fails closed). Delegated grading observed as
+  > `service-unattributed` is recognized evidence credited at zero intrinsic cost; the computed bound is therefore
+  > conservative (never larger than the true bound). Rationale (run 14, node-npm): makespan 166,163 ms vs an amended
+  > bound ≤ ~108,900 ms; the serial integration lane costs ~4.3 s/entry of which ~1.24 s is intrinsic service, dominated
+  > by ~36 sequential git process launches; closing the gap needs a speculative merge train that changes invariants
+  > I3/I4 (deferred, separate owner decision). Raw CP/ΣI stay diagnostics. Not a retroactive pass for historical runs.
+
+  The factor 1.3, idle ceiling, configured parallelism, authored workload and watchdog are unchanged. 6.1.3's criterion
+  that every G1–G12 has an assertion that can fail remains true: G8 retains its idle and evidence-integrity assertions.
+  `assertG8Bound` remains a diagnostic predicate and unit-test helper, not a throughput acceptance gate.
+  Recorded in `docs\qa\critical-path-execution\phase-6.1.md`, "Owner amendment A-6.1-2 — 2026-10-15".
 
 **Owner execution rules for the implementation session** — §0.14 (continuous iteration, momentary takeover, atomic delegation with [tier:heavy] for complex coding and lighter test runs, bounded QA rounds, pre-flight fix-or-document, Linear not used, worktree reporting), the testing policy (§0.6-9: scoped, accelerated, full suite only in 6.2), the bounded executor QA loop (default 3 rounds), and the handover's kickoff prompt.

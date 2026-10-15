@@ -356,3 +356,44 @@ result does not mean the deferred items are fixed or that G8 has passed.
 
 **Phase 6.1 is not accepted.** Outstanding phase gates, the G13 disclosure and the Phase 6.2 full-suite obligation remain
 unchanged. No tests were run for this documentation-only update.
+
+## Owner amendment A-6.1-2 — 2026-10-15
+
+The owner reclassified the **G8 makespan bound as a measured, disclosed metric**, like G13, on **2026-10-15**. This
+supersedes A-6.1-1's makespan acceptance gate and the earlier statement that `service-unattributed` grading necessarily
+blocks acceptance; the dated sections above remain historical evidence. It is **not a retroactive pass for historical
+runs**, a green smoke result or Phase 6.1 acceptance.
+
+### Amended acceptance and evidence contract
+
+- Phase 6.1 acceptance **no longer requires makespan ≤ 1.3 × max(CP_eff, W_auth/p, ΣI_service)**. The throughput smoke
+  still reconstructs and records **makespan, CP_eff, W_auth/p, ΣI_service, the bound, g8Ratio = makespan/bound and
+  g8BoundMet**. The Phase 6.2 PR must disclose these alongside G13. **Raw CP/ΣI stay diagnostics.**
+- **Still asserted:** every idle-with-ready episode under **predicate A is ≤ 10,000 ms**, and **service-evidence
+  integrity** (pairing, identity/duration, attribution, makespan window and evidence before the passing verdict). Missing
+  or malformed evidence fails closed. G8 therefore still has assertions that can fail, as required by 6.1.3.
+- Delegated grading observed as **`service-unattributed`** is recognized verification evidence for the writer's final
+  attempt, with the same attribution and integrity checks as `service`, but is **credited at zero intrinsic cost**.
+  `V_service` sums only `service` spans; the unattributed verification duration union and span count are diagnostics.
+  The computed bound is therefore **conservative (never larger than the true bound)**. A writer with neither kind of
+  final-attempt verification evidence still fails closed; genuinely unknown span kinds/components remain rejected.
+- The **1.3 factor, idle ceiling, configured parallelism, authored durations and watchdog are unchanged**.
+  `assertG8Bound` remains available as a diagnostic predicate and for unit tests, not as a throughput acceptance gate.
+
+### Rationale — Run 14, node-npm
+
+- **Makespan: 166,163 ms**, versus an **amended bound ≤ ~108,900 ms**. These numbers motivate the owner decision;
+  they do not establish a reconstructed-oracle pass for Run 14.
+- All **20 writers** had exactly one **`service-unattributed` / `verify` / `grading` pair** and **zero `service` verify
+  spans**. The prior oracle rejected this recognized producer evidence as `unknown service kind/component`.
+- The serial integration lane costs **~4.3 s/entry**, of which **~1.24 s is intrinsic service**, dominated by **~36
+  sequential git process launches**. Closing the gap needs a **speculative merge train changing invariants I3/I4**;
+  that work is **deferred and requires a separate owner decision**, not a relaxation of those invariants here.
+
+The plan's Target, 6.1.3.b, G8 row, Appendix D and amendment log record A-6.1-2. The oracle recognizes zero-credit
+unattributed verification while retaining fail-closed evidence checks; the throughput smoke records the bound result
+and keeps reconstruction and all idle assertions. **G13 remains unmet**, with its Phase 6.2 PR disclosure unchanged.
+Outstanding phase gates and the Phase 6.2 full-suite obligation remain. **No fresh green smoke or phase acceptance is
+claimed by this amendment.** Scoped validation (orchestrator shell, 2026-10-15): `cpx-g8-oracle.test.ts` 55/55 passed
+under `vitest.smoke.config.ts`, `docs-drift.test.ts` 126/126 passed and `npm run typecheck` was clean; the real-host smoke
+was not run for this change.

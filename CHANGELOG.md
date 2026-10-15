@@ -86,6 +86,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   candidate no longer reset it a second time (clean and HEAD check only, falling back to the full prepare on a HEAD
   mismatch or provisioning drift), and the check-selection reads overlap the clean. Bisect probes, reruns, reverts and
   phase suites keep the full prepare.
+- **CPX e2e smoke: the G8 makespan bound is recorded, not asserted (owner amendment A-6.1-2).** The throughput run
+  still reconstructs and records makespan, CP_eff, W_auth/p, ΣI_service, the bound, the ratio and whether it was met;
+  service-evidence integrity and the 10,000 ms idle-with-ready ceiling stay asserted. Delegated grading observed as
+  `service-unattributed` is recognized verification evidence credited at zero intrinsic cost, so the computed bound is
+  conservative.
 - **CPX e2e smoke: amended G8 intrinsic-service oracle (A-6.1-1).** The bound uses the pre-run DAG, authored work,
   attributable verification/integration/phase-suite service and configured parallelism, with fail-closed evidence
   checks and raw CP/integration diagnostics retained. Throughput uses the default integration batching; resilience

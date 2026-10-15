@@ -8,7 +8,7 @@ import { pathToFileURL } from "node:url";
 import { RoutingHost, ROOT, arr, obj, jsonl, redact, stopAllHosts, waitFor as waitForHost, type HostOptions, type Obj } from "./helpers/routing-host";
 import { CpxTimings, collectTimingJournal, timedWrapperSource, timingJournalSource, timingObserverSource, TIMING_DIRECTORY, type TimingRecord } from "./helpers/cpx-timing";
 import { assertG8IdleEpisodes, collectObservationFiles, G8_IDLE_CEILING_MS, reconstructIdleEpisodes, type IdleEpisode } from "./helpers/cpx-idle-oracle";
-import { assertG8Bound, freezeG8Plan, reconstructG8, workGraph, type GraphEdge, type PhaseGraph } from "./helpers/cpx-g8-oracle";
+import { freezeG8Plan, reconstructG8, workGraph, type GraphEdge, type PhaseGraph } from "./helpers/cpx-g8-oracle";
 import type { CpxRequest } from "./helpers/cpx-scripted-provider";
 import type { ExecutorConfig, ExecutorEvent, LedgerV1 } from "../../src/executor/types";
 import { createLedgerStore, createNodeFileSystem } from "../../src/executor/ledger";
@@ -27,8 +27,8 @@ const plans = ["throughput", "resilience"] as const;
 const waitFor = waitForHost;
 // Provider work and the pre-run G8 oracle use authored milliseconds, without host slack.
 // Owner amendment (2026-10-14): the per-host watchdog is derived from the G8 contract instead of a fixed 90 s, which
-// run 12 showed cannot hold a complete run (serial integration alone is ~75–85 s). The G8 assertion still uses the
-// intrinsic service under A-6.1-1; the per-entry allowance below only sizes the watchdog. Run 12 measured 3.4–4.5 s per
+// run 12 showed cannot hold a complete run (serial integration alone is ~75–85 s). The G8 metric still uses the
+// intrinsic service under A-6.1-1/A-6.1-2; the per-entry allowance below only sizes the watchdog. Run 12 measured 3.4–4.5 s per
 // task integration entry (throughput npm 11 entries / 40.9 s, pnpm 10 / 45.5 s, pip 10 / 34.2 s).
 const INTEGRATION_ENTRY_ALLOWANCE_MS = 5_000;
 const SETUP_WATCHDOG_MS = 60_000; // host boot through the compiled ledger
@@ -1398,10 +1398,12 @@ async function drive(name: typeof plans[number], repository: typeof repositories
       if (!idleInventory || !g8Plan) throw new Error("G8: missing frozen plan or ledger inventory");
       const amended = reconstructG8(g8Plan, final, idleInventory.events, files, serialIntegration);
       observations.g8Oracle = amended;
-      Object.assign(metrics, amended, { efficiency: amended.makespan / Math.max(amended.CP_eff, amended.W_auth / amended.p, amended["ΣI_service"]) });
+      const g8BoundMet = amended.makespan <= amended.bound, g8Ratio = amended.makespan / amended.bound;
+      Object.assign(metrics, amended, { "W_auth/p": amended.W_auth / amended.p, g8BoundMet, g8Ratio,
+        efficiency: amended.makespan / Math.max(amended.CP_eff, amended.W_auth / amended.p, amended["ΣI_service"]) });
       expect(amended.makespan, "G8: service and idle inventories use the original makespan").toBe(makespan);
-      assertG8Bound(amended);
-      obligation("G8-makespan-bound", amended.makespan <= amended.bound);
+      console.log(`G8 (A-6.1-2, recorded): makespan=${amended.makespan} bound=${amended.bound} ratio=${g8Ratio} met=${g8BoundMet}`);
+      tailAudit["G8-makespan-bound"] = `A-6.1-2: measured/disclosed only; ratio=${g8Ratio}, met=${g8BoundMet}`;
       const inventorySeq = Math.max(idleInventory.snapshot.seq, ...idleInventory.events.map(event => event.seq));
       const oracle = reconstructIdleEpisodes(files, { planId: immutableId, parentSessionID: root, finalLedgerSeq: inventorySeq });
       idleEpisodes.push(...oracle.episodes);
