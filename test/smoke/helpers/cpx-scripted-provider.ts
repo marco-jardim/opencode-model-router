@@ -42,6 +42,8 @@ export interface CpxRequest {
   served?: "forwarded" | "scripted" | FaultKind;
   /** Elapsed milliseconds from arrival through response completion (or connection close); absent while in flight. */
   durationMs?: number;
+  /** Host-facing connection closed BEFORE the response finished (not a normal completed response). Wall clock for restart evidence. */
+  connectionClosed?: { kind: "connection-closed"; at: number };
 }
 /** Options of a queued fault. */
 export interface FaultOptions {
@@ -275,7 +277,10 @@ export class CpxFront {
       this.requests.push(request);
       const completed = () => { request.durationMs ??= Math.max(0, now() - started); };
       res.once("finish", completed);
-      res.once("close", completed);
+      res.once("close", () => {
+        if (!res.writableFinished) request.connectionClosed = { kind: "connection-closed", at: Date.now() };
+        completed();
+      });
       const wait = typeof this.options.delayMs === "function" ? this.options.delayMs(request) : this.options.delayMs ?? 0;
       if (wait > 0) await (this.options.sleep ?? (ms => new Promise<void>(resolve => setTimeout(resolve, ms))))(wait);
       if (res.destroyed) return; // stop() closed the connection during the delay

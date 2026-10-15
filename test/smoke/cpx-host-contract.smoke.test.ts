@@ -1,4 +1,4 @@
-/** CPX Phase 0.1 (tasks 0.1.2, 0.1.6): OpenCode v2 host-contract smoke: observation + decided-branch assertions for C1-C15 and O1-O6.
+/** CPX Phase 0.1 (tasks 0.1.2, 0.1.6): OpenCode v2 host-contract smoke: observation + decided-branch assertions for C1-C16 and O1-O6.
  *
  *   RUN_OC_SMOKE_CPX=1 OPENCODE_V2_BIN=<abs path to opencode 2> npm run smoke:cpx
  *
@@ -10,7 +10,7 @@
  * `<OBS_DIR>/C<n>.json` BEFORE asserting (also when the scenario throws: `scenarioError`), then asserts the DECIDED branch of ADR 0007
  * ("Host contracts: branch taken") through the `DECISIONS` table at the end of the file: every check is `<contract>/<decision id>` with a
  * message saying what to reopen, all failed checks of a contract are reported together, and the results are in the file's `checks`.
- * Besides C1-C15 the file closes ADR open observations O1-O6: C7 pins the child's final text path (O1), C10 records the 529 error type
+ * Besides C1-C16 the file closes ADR open observations O1-O6: C7 pins the child's final text path (O1), C10 records the 529 error type
  * (O2), C14 launches 8 retained children (O3), C13 / C14b interrupt an ACTIVE root (O4), C15 completes a compaction (O5) and the O6
  * scenario posts `session.synthetic` with `resume`. A host upgrade that changes a decided behaviour fails `npm run smoke:cpx`.
  *
@@ -1805,6 +1805,64 @@ d("O6b plugin-side session API: synthetic with resume, context, interrupt", () =
   }, 300_000);
 });
 
+// ---------------------------------------------------------------------------- C16 ----
+d("C16 launcher liveness: plugins and child runs share the server process", () => {
+  it("kills only the server pid, observes the held child's connection close and checks its retained state after relaunch", async () => {
+    await observeContract("C16", async o => {
+      await withHost("C16", undefined, o, async s => {
+        const { host } = s;
+        const loadedBefore = (await probeLines(s.probeFile)).find(l => l.kind === "loaded");
+        if (loadedBefore) o.relied.push(loadedBefore);
+        const probePid = loadedBefore?.pid;
+        const { pid: serverPid } = await host.client.server.info();
+        Object.assign(o.observed, { probePid, serverPid, killedPid: null, treeKill: false, childClosed: false });
+        const root = await host.newRoot("C16 root");
+        const token = "C16_HELD";
+        const gates = new Gates(host, root, [token]);
+        // Same context summary as C12, plus a full (unclipped) equality check across the restart below.
+        const contextShape = (context: Obj[]): Obj => ({ messageCount: context.length, roles: context.map(m => str(m.role) ?? str(m.type)), containsChildOk: json(context).includes("CHILD_OK"), last: clip(context.at(-1), 600) });
+        try {
+          const { childID } = await host.dispatch(root, childInput(token, true));
+          o.observed.childID = childID;
+          const arrival = await waitFor("C16's held child request", () => gates.arrivals.find(a => a.token === token && a.session === childID), 30_000);
+          const request = front(host).requests[arrival.index]!;
+          const before = await host.client.session.context({ sessionID: childID });
+          const endBefore = terminalOf(await probeLines(s.probeFile), childID);
+          o.observed.before = {
+            held: request.served === undefined && request.connectionClosed === undefined, requestIndex: request.index, heldAt: arrival.at,
+            active: await isActive(host, childID), endEvent: endBefore ? lineBrief(endBefore) : null, contextShape: contextShape(before),
+          };
+          const restartStartedAt = Date.now();
+          o.observed.killedPid = serverPid;
+          // Explicit SDK pid, not a wrapper's pid; no process-tree kill occurs on this restart path.
+          let relaunchStartedAt: number | undefined;
+          await host.restart({ tree: false, serverPid, beforeRelaunch: async () => {
+            // Inspect the FRONT's own premature-close marker with the server DEAD and the gate STILL HELD.
+            // Neither relaunch, release nor teardown may cause this evidence.
+            const closed = await tryWait("C16's held provider connection to close after the pid-only kill", () => request.connectionClosed, B_ABSENCE_WAIT_MS);
+            o.observed.childClosed = closed !== undefined;
+            o.observed.connectionClosed = closed ?? null;
+            relaunchStartedAt = Date.now();
+          } });
+          const restartEndedAt = Date.now();
+          const loadedAfter = await tryWait("C16's probe to load in a new process", async () => (await probeLines(s.probeFile)).find(l => l.kind === "loaded" && l.t >= restartStartedAt && l.pid !== undefined && l.pid !== probePid), 30_000);
+          if (loadedAfter) o.relied.push(loadedAfter);
+          o.observed.restartProcess = { pidAfter: loadedAfter?.pid, newProcess: loadedAfter !== undefined && loadedAfter.pid !== probePid };
+          const releasedAt = Date.now();
+          gates.release(token);
+          o.observed.timing = { restartStartedAt, relaunchStartedAt, restartEndedAt, releasedAt };
+          const end = await tryWait("C16's child terminal event after relaunch and release", async () => terminalOf(await probeLines(s.probeFile), childID), B_ABSENCE_WAIT_MS);
+          if (end) o.relied.push(end);
+          const after = await host.client.session.context({ sessionID: childID });
+          o.observed.afterRelaunch = {
+            endEvent: end ? lineBrief(end) : null, active: await isActive(host, childID), contextShape: contextShape(after), contextUnchanged: json(before) === json(after),
+          };
+        } finally { gates.releaseAll(); }
+      });
+    });
+  }, 300_000);
+});
+
 // ------------------------------------------------------------------ decided branches ----
 const at = (value: unknown, ...keys: (string | number)[]): unknown => keys.reduce<unknown>((acc, key) => (acc !== null && typeof acc === "object" ? Reflect.get(acc, String(key)) : undefined), value);
 const list = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
@@ -2128,6 +2186,17 @@ const DECISIONS: Record<string, (o: Observation) => void> = {
     check(o, "C15/D3", at(v, "hookSawEnvelope") === true && Number(at(v, "completionReplacements")) >= 1, "the compaction hook must see the real completion envelope in event.messages and be able to replace it with the placeholder (D3 held results in compaction)");
     check(o, "C15/D3", at(v, "requestKind") === "compaction" && at(v, "requestHasPlaceholder") === true && at(v, "requestHasEnvelope") === false, "the compaction request must carry the placeholder and NOT the raw completion envelope when a real background completion is in the compacted history");
     check(o, "C15/O5", at(v, "statuses") !== undefined && list(at(v, "statuses")).length >= 1 && at(v, "succeeded") === true, "the compaction of a session holding a real completion must complete: every compaction record has status `completed` and no error");
+  },
+  C16: o => {
+    const ob = o.observed;
+    const serverPid = at(ob, "serverPid");
+    check(o, "C16/D16", typeof serverPid === "number" && Number.isSafeInteger(serverPid) && serverPid > 0 && at(ob, "probePid") === serverPid, "the probe plugin's process.pid must equal client.server.info().pid; launcher liveness is server-process liveness");
+    check(o, "C16/D16", at(ob, "treeKill") === false && at(ob, "killedPid") === serverPid, "the restart must kill only the SDK-reported server pid, never its process tree");
+    check(o, "C16/D16", at(ob, "before", "held") === true && at(ob, "before", "active") === true && at(ob, "before", "endEvent") === null, "scenario precondition: the child must be active at a still-open, held provider request with no terminal event before the kill");
+    check(o, "C16/D16", at(ob, "childClosed") === true && at(ob, "connectionClosed", "kind") === "connection-closed" && Number(at(ob, "connectionClosed", "at")) >= Number(at(ob, "timing", "restartStartedAt")) && Number(at(ob, "connectionClosed", "at")) <= Number(at(ob, "timing", "relaunchStartedAt")), "killing only the server pid must close the held child's provider connection BEFORE relaunch, gate release or teardown");
+    check(o, "C16/D16", at(ob, "restartProcess", "newProcess") === true, "the probe must load in a new process before checking the retained child's state");
+    check(o, "C16/D16", at(ob, "afterRelaunch", "endEvent") === null && at(ob, "afterRelaunch", "active") === false, "after a pid-only kill and relaunch the held child must have no terminal event and must not be in session.active()");
+    check(o, "C16/D16", at(ob, "afterRelaunch", "contextUnchanged") === true && same(at(ob, "before", "contextShape"), at(ob, "afterRelaunch", "contextShape")) && same(at(ob, "afterRelaunch", "contextShape", "roles"), ["user"]) && at(ob, "afterRelaunch", "contextShape", "containsChildOk") === false, "the retained child's stored context must be unchanged and contain only its user message, as in C12 (no resumed response or idle/end message)");
   },
   O6b: o => {
     const ob = o.observed;

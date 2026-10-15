@@ -381,6 +381,7 @@ it("records each forwarded and faulted call's duration, including its scripted d
   expect((await post(url)).status).toBe(529);
   await until("completed request durations", () => front.requests.every(r => r.durationMs !== undefined));
   expect(front.requests.map(r => r.durationMs)).toEqual([25, 70]);
+  expect(front.requests.every(r => r.connectionClosed === undefined)).toBe(true); // Normal response completion is not cancellation evidence.
 });
 
 it("leaves the duration absent while a call is in flight", async () => {
@@ -432,6 +433,7 @@ it("records a cancelled call's duration when its connection closes during the de
   await rejected;
   await until("the closed connection's duration", () => front.requests[0]!.durationMs !== undefined);
   expect(front.requests[0]!.durationMs).toBe(12);
+  expect(front.requests[0]!.connectionClosed).toEqual({ kind: "connection-closed", at: expect.any(Number) });
   release!();
   await tick();
   expect(provider.captures).toHaveLength(0);

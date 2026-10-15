@@ -51,6 +51,7 @@ export interface SessionInfo {
 export interface ModelInfo { id: string; providerID: string; enabled: boolean; status?: string; family?: string; variants: { id: string }[]; cost: unknown; capabilities?: unknown; limit: { context: number; input?: number; output: number } }
 export interface AgentInfo { id: string; mode: string; hidden?: boolean; model?: ModelRef; permissions?: unknown; description?: string }
 export interface HostClient {
+  server: { info(): Promise<{ version: string; pid: number }> };
   session: {
     list(input?: { parentID?: string | null; limit?: number }): Promise<{ data: SessionInfo[] }>;
     create(input: { agent?: string; model?: ModelRef; title?: string; location?: { directory: string }; permissions?: Rule[]; parentID?: string }): Promise<SessionInfo>;
@@ -908,14 +909,24 @@ export class RoutingHost {
    * CPX 0.1.0: stops ONLY the host process (same kill as `stop()`), waits for its port to close, then boots it again with the SAME
    * root, project, HOME/XDG dirs, config files, outcome store and provider (and front). Nothing one-time is redone: no seed, no
    * override/probe/opencode.json rewrite, no log truncation (hooks/events observed before the restart survive). New password,
-   * port, client and authorization. `stop()` still works afterwards.
+   * port, client and authorization. `stop()` still works afterwards. Opt-in `{ tree: false, serverPid }` kills only the
+   * SDK-reported server pid (no descendants); `beforeRelaunch` can observe the kill with the provider still live.
+   * The default kill path is unchanged.
    */
-  async restart(): Promise<void> {
+  async restart(options?: { tree: false; serverPid: number; beforeRelaunch?: () => Promise<void> }): Promise<void> {
     if (this.teardown) throw new Error("RoutingHost.restart(): the host is already stopped");
     if (!this.plan) throw new Error("RoutingHost.restart(): the host never booted");
     const oldPort = this.port;
-    await this.killChild();
+    if (options?.tree === false) {
+      const pid = options.serverPid;
+      if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid) throw new Error("RoutingHost.restart(): invalid server pid");
+      if (process.platform === "win32") {
+        const result = spawnSync("taskkill", ["/PID", String(pid), "/F"], { encoding: "utf8", windowsHide: true });
+        if (result.status !== 0) throw new Error(`RoutingHost.restart(): server-only taskkill failed: ${result.error?.message ?? result.stderr}`);
+      } else process.kill(pid, "SIGKILL");
+    } else await this.killChild();
     await waitFor("old host port to close", async () => (await portOpen(oldPort)) ? undefined : true, 10_000, 200);
+    if (options?.beforeRelaunch) await options.beforeRelaunch();
     await this.launch();
   }
 

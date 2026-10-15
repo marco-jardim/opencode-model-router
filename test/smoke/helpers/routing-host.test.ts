@@ -1,6 +1,6 @@
 /**
  * Unit tests (no real OpenCode host) for the 0.1.0 additions to `routing-host.ts`: `HostOptions.extraPlugins`,
- * `RoutingHost.restart()` (one-time setup vs `launch()`), `HostOptions.provider` (a `CpxFront` in front of the `RoutingProvider`),
+ * `RoutingHost.restart()` (one-time setup vs `launch()`, opt-in pid-only kill), `HostOptions.provider` (a `CpxFront` in front of the `RoutingProvider`),
  * the "server listening" regex applied only to the NEW child's output, `killChild()` (through `restart()`/`stop()`) and `evidenceDir()`.
  *
  * The host process is a STUB: a node script that answers `--version`, prints `server listening on …` for `serve` and serves the two
@@ -20,7 +20,7 @@ import { EVIDENCE_DIR, OPENAI_PROVIDER, ROOT, RoutingHost, arr, evidenceDir, jso
 import { CpxTimings } from "./cpx-timing";
 import { collectObservationFiles } from "./cpx-idle-oracle";
 
-const redirect = vi.hoisted(() => ({ executable: "", script: "" }));
+const redirect = vi.hoisted(() => ({ executable: "", script: "", taskkills: [] as string[][] }));
 vi.mock("node:child_process", async importOriginal => {
   const actual = await importOriginal<typeof import("node:child_process")>();
   const target = (file: string, args: readonly string[]): [string, readonly string[]] =>
@@ -28,12 +28,16 @@ vi.mock("node:child_process", async importOriginal => {
   return {
     ...actual,
     spawn: (file: string, args: readonly string[], options: SpawnOptions) => { const [f, a] = target(file, args); return actual.spawn(f, a, options); },
-    spawnSync: (file: string, args: readonly string[], options: SpawnSyncOptions) => { const [f, a] = target(file, args); return actual.spawnSync(f, a, options); },
+    spawnSync: (file: string, args: readonly string[], options: SpawnSyncOptions) => {
+      if (file === "taskkill") redirect.taskkills.push([...args]);
+      const [f, a] = target(file, args);
+      return actual.spawnSync(f, a, options);
+    },
   };
 });
 
 /** What the stub records per `serve` launch (`launches.jsonl` next to the script). */
-interface Launch { pid: number; port: number; password: string; cwd: string; home: string; silent: boolean; observations?: string }
+interface Launch { pid: number; port: number; password: string; cwd: string; home: string; silent: boolean; observations?: string; descendantPid?: number }
 
 const NL = "\\n";
 /** `mode.json` next to the script: `{ "silent": true }` makes later launches stay alive WITHOUT printing the listening line. */
@@ -45,9 +49,13 @@ const args = process.argv.slice(2);
 if (args[0] === '--version') { process.stdout.write('opencode v2.0.22-stub${NL}'); process.exit(0); }
 const modeFile = path.join(__dirname, 'mode.json');
 const mode = fs.existsSync(modeFile) ? JSON.parse(fs.readFileSync(modeFile, 'utf8')) : {};
+// Windows non-detached children belong to Node/libuv's kill-on-parent-exit job. Detach this STUB-only survivor so
+// its death distinguishes /T from a pid-only kill. Keep its cwd outside the host root, which stop() must remove.
+const descendant = mode.descendant ? require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', detached: process.platform === 'win32', windowsHide: true, cwd: __dirname }) : undefined;
+descendant?.unref();
 const port = Number(args[args.indexOf('--port') + 1]);
 const password = process.env.OPENCODE_PASSWORD;
-fs.appendFileSync(path.join(__dirname, 'launches.jsonl'), JSON.stringify({ pid: process.pid, port, password, cwd: process.cwd(), home: process.env.HOME, silent: mode.silent === true, observations: process.env.MODEL_ROUTER_V2_OBSERVATIONS }) + '${NL}');
+fs.appendFileSync(path.join(__dirname, 'launches.jsonl'), JSON.stringify({ pid: process.pid, port, password, cwd: process.cwd(), home: process.env.HOME, silent: mode.silent === true, observations: process.env.MODEL_ROUTER_V2_OBSERVATIONS, descendantPid: descendant?.pid }) + '${NL}');
 const plugin = id => ({ id, state: { status: 'active' } });
 const server = http.createServer((req, res) => {
   if (req.headers.authorization !== 'Basic ' + Buffer.from('opencode:' + password).toString('base64')) { res.writeHead(401).end(); return; }
@@ -67,6 +75,7 @@ const saved = { bin: process.env.OPENCODE_V2_BIN, evidence: process.env.OMR_SMOK
 const restoreEnv = (name: "OPENCODE_V2_BIN" | "OMR_SMOKE_EVIDENCE_DIR", value: string | undefined) => { if (value === undefined) delete process.env[name]; else process.env[name] = value; };
 
 beforeEach(async () => {
+  redirect.taskkills.length = 0;
   stubDir = await mkdtemp(path.join(tmpdir(), "omr-routing-host-test-"));
   redirect.script = path.join(stubDir, "stub-opencode.cjs");
   redirect.executable = path.join(stubDir, "opencode-stub");
@@ -251,6 +260,53 @@ it("restart() keeps root, project, config files and logs, takes a new port/passw
   expect(existsSync(before.root)).toBe(false);
   expect(await waitUntil(() => !pidAlive(current.pid), 5_000)).toBe(true);
   await expect(host.restart()).rejects.toThrow(/already stopped/);
+}, 60_000);
+
+it("restart({ tree: false, serverPid }) kills only that pid, leaves a descendant alive and retains the sandbox/provider", async () => {
+  await writeFile(modeFile, JSON.stringify({ descendant: true }));
+  try {
+    const host = await startHost("restart-server-only", { provider: {} });
+    const [first] = await launches();
+    expect(first!.descendantPid).toBeDefined();
+    expect(pidAlive(first!.descendantPid!)).toBe(true);
+    const before = { root: host.root, project: host.project, front: host.front, config: await host.hostConfigOnDisk() };
+    await appendFile(host.logs.events, `${JSON.stringify({ type: "before-server-only-kill" })}\n`);
+    // Only the original launch needs a descendant; the replacement remains an ordinary stub host.
+    await writeFile(modeFile, "{}");
+
+    let observedKill = false;
+    await host.restart({ tree: false, serverPid: first!.pid, beforeRelaunch: async () => {
+      expect(await launches()).toHaveLength(1);
+      if (process.platform === "win32") expect(redirect.taskkills).toEqual([["/PID", String(first!.pid), "/F"]]);
+      expect(await waitUntil(() => !pidAlive(first!.pid), 5_000)).toBe(true);
+      expect(pidAlive(first!.descendantPid!)).toBe(true);
+      observedKill = true;
+    } });
+
+    const runs = await launches();
+    expect(observedKill).toBe(true);
+    expect(runs).toHaveLength(2);
+    expect(await waitUntil(() => !pidAlive(first!.pid), 5_000)).toBe(true);
+    expect(pidAlive(first!.descendantPid!)).toBe(true); // /T (or any equivalent tree kill) would fail this assertion.
+    expect(runs[1]!.pid).not.toBe(first!.pid);
+    expect(pidAlive(runs[1]!.pid)).toBe(true);
+    expect(host.root).toBe(before.root);
+    expect(host.project).toBe(before.project);
+    expect(host.front).toBe(before.front);
+    expect(await host.hostConfigOnDisk()).toEqual(before.config);
+    expect(await host.rawEvents()).toEqual([{ type: "before-server-only-kill" }]);
+    expect((await post(anthropicBaseURL(before.config)!)).status).toBe(200);
+    expect((await host.stop()).rootRemoved).toBe(true);
+    if (process.platform === "win32") expect(redirect.taskkills[1]).toEqual(["/PID", String(runs[1]!.pid), "/T", "/F"]);
+    expect(await waitUntil(() => !pidAlive(runs[1]!.pid), 5_000)).toBe(true);
+    expect(pidAlive(first!.descendantPid!)).toBe(true);
+  } finally {
+    // The descendant deliberately survives both restart and stop, so the test owns its cleanup even on assertion/boot failure.
+    for (const run of await launches()) if (run.descendantPid !== undefined && pidAlive(run.descendantPid)) {
+      process.kill(run.descendantPid);
+      expect(await waitUntil(() => !pidAlive(run.descendantPid!), 5_000)).toBe(true);
+    }
+  }
 }, 60_000);
 
 it("a restarted host is not satisfied by the previous child's 'server listening' line", async () => {
