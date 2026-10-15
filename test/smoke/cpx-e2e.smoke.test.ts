@@ -108,6 +108,31 @@ const messages = (request: CpxRequest): Obj[] => arr(obj(request.body).messages)
 const primaryRequests = (requests: readonly CpxRequest[], session: string): CpxRequest[] =>
   requests.filter(request => header(request, "x-proof-session") === session && header(request, "x-proof-kind") === "primary");
 const tail = (message: Obj): boolean => message.role === "user" && json(message.content).includes("<router-state>");
+
+/** Inspect raw history strings, not JSON-escaped text or outcome timing rows. */
+function childVerdicts(history: unknown, childID: string): string[] {
+  if (typeof history === "string") {
+    return (history.match(/<router-verdict\b[^>]*>/g) ?? []).filter(tag => tag.includes(`sessionID="${childID}"`));
+  }
+  if (Array.isArray(history)) return history.flatMap(value => childVerdicts(value, childID));
+  if (history !== null && typeof history === "object") return Object.values(history).flatMap(value => childVerdicts(value, childID));
+  return [];
+}
+function verdictRequest(requests: readonly CpxRequest[], parent: string, childID: string): CpxRequest | undefined {
+  return primaryRequests(requests, parent).find(request => childVerdicts(messages(request).filter(message => !tail(message)), childID).length > 0);
+}
+function assertSinglePassVerdict(history: unknown, childID: string, criterion = "G2"): void {
+  const verdicts = childVerdicts(history, childID);
+  expect(verdicts, `${criterion}: completion-time verdict once for ${childID}`).toHaveLength(1);
+  expect(verdicts.filter(tag => /\bverdict="PASS"/.test(tag)), `${criterion}: completion-time PASS verdict for ${childID}`).toHaveLength(1);
+}
+
+type BackgroundRejection = { error: unknown };
+const firstBackgroundRejection = (first: BackgroundRejection | undefined, error: unknown): BackgroundRejection => first ?? { error };
+function throwBackgroundRejection(first: BackgroundRejection | undefined): void {
+  if (first) throw first.error;
+}
+
 function planRunningInTail(request: CpxRequest, planId: string): boolean {
   const text = messages(request).filter(tail).map(message => typeof message.content === "string" ? message.content : arr(message.content).map(block => String(obj(block).text ?? "")).join("\n")).join("\n");
   // runtime.planLine: `plan <id>: <done>/<total> done, <count> running, <count> ready`.
@@ -181,6 +206,43 @@ describe("CPX e2e assertion negative controls", () => {
     const historical = request("");
     historical.body = { messages: [{ role: "user", content: "plan p-fixture: 0/24 done, 1 running, 3 ready" }] };
     expect(planRunningInTail(historical, "p-fixture"), "G1: historical text is not request-time tail state").toBe(false);
+  });
+  it("G2's verdict wait stays pending on timing alone and requires this child's parent history", () => {
+    const parent = "parent-fixture", child = "child-fixture";
+    const request = (content: string): CpxRequest => ({ index: 0, method: "POST", url: "/v1/messages", headers: { "x-proof-session": parent, "x-proof-kind": "primary" }, body: { messages: [{ role: "user", content }] } });
+    const timingOnly = request(`DONE: local checks pass. The result is held until verification finishes.\n${json({ childSessionID: child, durationMs: 7_000 })}`);
+    expect(verdictRequest([timingOnly], parent, child), "a timing row is not a posted verdict; keep waiting").toBeUndefined();
+    const tag = `<router-verdict handle="vrf_fixture" sessionID="${child}" verdict="PASS">verified</router-verdict>`;
+    const posted = request(tag);
+    expect(verdictRequest([timingOnly, posted], parent, child)).toBe(posted);
+    expect(verdictRequest([posted], parent, "other-child")).toBeUndefined();
+    expect(verdictRequest([posted], "other-parent", child)).toBeUndefined();
+    expect(verdictRequest([{ ...posted, headers: { ...posted.headers, "x-proof-kind": "compaction" } }], parent, child)).toBeUndefined();
+    expect(verdictRequest([request(`<router-state>${tag}</router-state>`)], parent, child), "a dynamic tail is not verdict history").toBeUndefined();
+  });
+  it.each([0, 2])("G2 rejects %i durable PASS verdicts instead of exactly one", count => {
+    const tag = '<router-verdict handle="vrf_fixture" sessionID="child-fixture" verdict="PASS">verified</router-verdict>';
+    const history = Array.from({ length: count }, () => ({ content: [{ type: "text", text: tag }] }));
+    expect(() => assertSinglePassVerdict(history, "child-fixture")).toThrow(/G2: completion-time verdict once/);
+    expect(() => assertSinglePassVerdict([{ text: tag }], "child-fixture")).not.toThrow();
+  });
+  it("G2 rejects a non-PASS verdict even when unrelated prose says verification passed", () => {
+    const history = [{ text: '<router-verdict handle="vrf_fixture" sessionID="child-fixture" verdict="FAIL">verification passed elsewhere</router-verdict>' }];
+    expect(() => assertSinglePassVerdict(history, "child-fixture")).toThrow(/G2: completion-time PASS verdict/);
+  });
+  it("a rejected background operation surfaces its first error before the plan deadline probe", async () => {
+    const original = new Error("G2: original background verdict failure");
+    let rejection: BackgroundRejection | undefined;
+    await Promise.reject(original).catch(error => { rejection = firstBackgroundRejection(rejection, error); });
+    await Promise.reject(new Error("later background failure")).catch(error => { rejection = firstBackgroundRejection(rejection, error); });
+    let planRead = false;
+    await expect(waitFor("negative-control plan deadline", () => {
+      throwBackgroundRejection(rejection);
+      planRead = true;
+      return undefined;
+    }, 0, 0)).rejects.toBe(original);
+    expect(planRead, "the original rejection surfaces on the first probe, before any plan/deadline work").toBe(false);
+    expect(() => throwBackgroundRejection(undefined)).not.toThrow();
   });
   it("the pre-run graph oracle uses precedence, not a measured schedule", () => {
     const script = { ...loadScript("throughput"), tasks: { a: { durationMs: 3_000 }, b: { durationMs: 4_000 }, c: { durationMs: 5_000 } } };
@@ -349,7 +411,7 @@ function nonOverlappingLeases(snapshot: Obj): boolean {
 // Explicit gaps, not fabricated passes. These also appear as named it.skip cases in the smoke output.
 const unmeasured = {
   "G1/prior-and-off": "RoutingHost exposes post-router hooks, not pre-router nativeArgs; these sidecars have no sampled/prior/off control dispatches (covered by smoke:cpx).",
-  "G2/deferred-and-capture": "The sidecars have no VERIFY:deferred dispatch and the real-host API exposes no per-attempt change-set capture/enqueue counters.",
+  "G2/capture-counters": "Deferred delivery is measured by the ad hoc dispatch; the real-host API exposes no per-attempt change-set capture/enqueue counters.",
   "G3/FAIL-and-fallback": "The sidecars contain PASS only; the pinned host supports C4/C15 and has no capability-disable switch. Conditional foreground fallback is checked if absent, not claimed otherwise.",
   "G5/frozen-largest-plans": "This smoke compiles the two e2e plans; frozen-largest-plan classifier cases are a separate compiler suite, not host measurements of these fixtures.",
   "G6/shared-read-and-run": "The lease injection is write/write only; no scripted shared-tree read/search/router_run under another child's lease or deferred plugin verification is supplied.",
@@ -658,6 +720,7 @@ async function drive(name: typeof plans[number], repository: typeof repositories
   let result: RunResult | undefined;
   const backgroundRoots: string[] = [];
   const backgrounds: Promise<void>[] = [];
+  let backgroundRejection: BackgroundRejection | undefined;
   const attempts = new Map<string, AttemptScript>();
   const adHocScripts = new Map<string, AttemptScript>();
   const workRequests = new Map<number, number>();
@@ -683,6 +746,7 @@ async function drive(name: typeof plans[number], repository: typeof repositories
   let burstLeft = script.injections.find(injection => injection.kind === "rate-limit")?.options.times ?? 0;
   let lastFaultAt = 0;
   let heldVerdict = false;
+  let heldGraderRequest: CpxRequest | undefined;
   let releaseVerdict = false;
   let restarted = false;
   let g1Child: string | undefined;
@@ -899,7 +963,10 @@ async function drive(name: typeof plans[number], repository: typeof repositories
         return;
       }
       if (json(obj(request.body).system).includes("independent, skeptical verification grader")) {
-        if (heldVerdict && json(request.body).includes("held.json")) await waitFor("G3 verdict release", () => releaseVerdict ? true : undefined, HOST_SLACK_MS);
+        if (heldVerdict && json(request.body).includes("held.json")) {
+          heldGraderRequest = request;
+          await waitFor("G3 verdict release", () => releaseVerdict ? true : undefined, HOST_SLACK_MS);
+        }
         return; // RoutingProvider supplies the real PASS grader envelope.
       }
       if (header(request, "x-proof-kind") !== "primary") return; // Titles and other auxiliary generations are not scripted task turns.
@@ -1082,6 +1149,10 @@ async function drive(name: typeof plans[number], repository: typeof repositories
       const call = await dispatched;
       if (useBackground || dispatch.userAction) {
         expect(json(call.after.result), "G1/G2: running acknowledgement").toMatch(/Running in the background|status.*running/);
+        if (dispatch.verify === "deferred") {
+          expect(json(call.after.result), "G2: deferred acknowledgement promises an unverified result").toContain("Its result will arrive unverified");
+          expect(json(call.after.result), "G2: deferred result is not held").not.toContain("held until");
+        }
         const childEnd = await waitFor(`actual end event of ${dispatch.id}`, async () => (await activeHost.eventsOf(call.childID)).find(event => TERMINAL.has(event.type)));
         expect(call.after.__t, "G1: real acknowledgement timestamp precedes child end").toBeLessThan(Number(childEnd.__t));
         const next = front.requests.filter(request => header(request, "x-proof-session") === parent && header(request, "x-proof-kind") === "primary").find(request => (arrivals.get(request.index) ?? 0) >= call.after.__t);
@@ -1090,6 +1161,7 @@ async function drive(name: typeof plans[number], repository: typeof repositories
       }
       await waitFor(`end of ${dispatch.id}`, async () => (await activeHost.eventsOf(call.childID)).find(event => TERMINAL.has(event.type)), HOST_SLACK_MS);
       if (required && canHold) {
+        observations.heldGraderRequest = await waitFor("G3 held grader request intercepted", () => heldGraderRequest, HOST_SLACK_MS);
         const requests = () => front.requests.filter(request => header(request, "x-proof-session") === parent);
         const placeholder = await waitFor("G3 permanent context placeholder", () => requests().find(request => /state=\\?"held\\?"/.test(json(request.body))), HOST_SLACK_MS);
         expect(json(placeholder.body), "G3: held output absent").not.toContain(script.defaults.completion);
@@ -1104,12 +1176,15 @@ async function drive(name: typeof plans[number], repository: typeof repositories
         const beforeRelease = requests().length;
         expect(requests().every(request => !json(request.body).includes(script.defaults.completion)), "G3: ALL context/compaction requests before verdict hide output").toBe(true);
         const eventsBeforeRelease = (await activeHost.eventsOf(parent)).length;
+        expect(heldGraderRequest, "G3: grader request intercepted before verdict release").toBeDefined();
+        expect(heldGraderRequest?.durationMs, "G3: intercepted grader is still held before release").toBeUndefined();
         releaseVerdict = true;
-        const verdict = await waitFor("G3 PASS releases output", () => requests().slice(beforeRelease).find(request => json(request.body).includes("<router-verdict")), HOST_SLACK_MS);
+        const verdict = await waitFor("G3 PASS releases output", () => verdictRequest(requests().slice(beforeRelease), parent, call.childID), HOST_SLACK_MS);
         expect(json(verdict.body), "G3: PASS verdict").toMatch(/verdict=\\?"PASS\\?"/);
         expect(json(verdict.body), "G3: PASS posts output").toContain(script.defaults.completion);
         await activeHost.settle(parent);
         const history = await activeHost.client.session.context({ sessionID: parent });
+        assertSinglePassVerdict(history, call.childID, "G3");
         expect((json(history).match(/<router-verdict/g) ?? []).length, "G3: one durable verdict delivery").toBe(1);
         const wakeEvents = (await activeHost.eventsOf(parent)).slice(eventsBeforeRelease).filter(event => event.type === "session.execution.started");
         observations.heldWakeEvents = wakeEvents;
@@ -1127,6 +1202,10 @@ async function drive(name: typeof plans[number], repository: typeof repositories
         obligation("otherwise-foreground-fallback", call.before.input?.background === false && /PASS|verification.*pass/i.test(json(call.after.result)));
         for (const key of ["C4-and-C15-held-through-context-and-compaction", "no-output-before-verdict", "one-verdict-delivery-and-parent-wake"]) tailAudit[key] = "not exercised: required holding unavailable on this host (C4/C15)";
       }
+      if (dispatch.verify === "required" && (useBackground || dispatch.userAction)) {
+        // A timing row and an idle parent can both precede the held-synthetic verdict post.
+        await waitFor(`G2 parent request with verdict for ${dispatch.id}`, () => verdictRequest(front.requests, parent, call.childID), HOST_SLACK_MS);
+      }
       await activeHost.settle(parent);
       const requests = front.requests.filter(request => header(request, "x-proof-session") === parent);
       const compactIndex = requests.find(request => header(request, "x-proof-kind") === "compaction")?.index;
@@ -1141,6 +1220,11 @@ async function drive(name: typeof plans[number], repository: typeof repositories
         const annotated = await waitFor("G2 ad hoc completion annotation", () => requests.concat(front.requests.filter(request => header(request, "x-proof-session") === parent)).find(request => messages(request).some(message => tail(message) && json(message).includes(call.childID) && /Completed since/.test(json(message)))), HOST_SLACK_MS);
         expect(annotated, "G2: completion annotation").toBeDefined();
         expect(front.requests.filter(request => header(request, "x-proof-session") === parent && messages(request).some(message => tail(message) && json(message).includes(call.childID) && /Completed since/.test(json(message)))).length, "G2: annotation exactly once").toBe(1);
+        // The deferred footer is one of the verification annotations of `Completed since` (per-turn router state, never history).
+        if (dispatch.verify === "deferred") {
+          const completedLine = messages(annotated).filter(tail).map(message => json(message)).join("\n");
+          expect(completedLine, "G2: deferred completion annotation carries the unverified handle footer").toContain("[router] unverified · vrf_");
+        }
         obligation("adhoc-tail-annotation-once", front.requests.filter(request => header(request, "x-proof-session") === parent && messages(request).some(message => tail(message) && json(message).includes(call.childID) && /Completed since/.test(json(message)))).length === 1);
       }
       const timings = await waitFor(`G2 timing for ${dispatch.id}`, async () => {
@@ -1152,7 +1236,8 @@ async function drive(name: typeof plans[number], repository: typeof repositories
       expect((await activeHost.hooks()).filter(hook => hook.hook === "after" && hook.callID === call.callID), "G2: dispatch acknowledgement once").toHaveLength(1);
       if (dispatch.verify === "required") {
         const stored = await activeHost.client.session.context({ sessionID: parent });
-        expect(json(stored), "G2: completion-time verification").toMatch(/PASS|verification.*pass/i);
+        if (useBackground || dispatch.userAction) assertSinglePassVerdict(stored, call.childID);
+        else expect(json(stored), "G2: foreground completion-time verification").toMatch(/\bPASS\b/);
         expect(json(stored).match(/<router-verdict/g) ?? [], "G2: completion-time verdict once").toHaveLength(useBackground || dispatch.userAction ? 1 : 0);
       }
       observations[dispatch.id] = { call, requests, timings };
@@ -1166,13 +1251,18 @@ async function drive(name: typeof plans[number], repository: typeof repositories
           return matching.length ? matching : undefined;
         });
         expect(processed, "G2: durable completion effects exactly once").toHaveLength(1);
-        if (dispatch.userAction) obligation("user-backgrounded-verification-at-completion-once", processed.length === 1 && timings.length === 1 && (json(await activeHost.client.session.context({ sessionID: parent })).match(/<router-verdict/g) ?? []).length === 1);
+        if (dispatch.userAction) {
+          const stored = await activeHost.client.session.context({ sessionID: parent });
+          assertSinglePassVerdict(stored, call.childID);
+          obligation("user-backgrounded-verification-at-completion-once", processed.length === 1 && timings.length === 1 && (json(stored).match(/<router-verdict/g) ?? []).length === 1 && childVerdicts(stored, call.childID).filter(tag => /\bverdict="PASS"/.test(tag)).length === 1);
+        }
         observations[dispatch.id] = { call, requests, timings, processed };
       }
     };
 
     const observedHeads = new Set<string>();
     const final = await waitFor("plan completion (no orchestrator polling turns)", async () => {
+      throwBackgroundRejection(backgroundRejection);
       if (front.frontErrors.length || activeHost.provider.errors.length) throw new Error(`Scripted provider failed: ${json([front.frontErrors, activeHost.provider.errors])}`);
       const ledger = await store.read(immutableId);
       recordProgress(ledger);
@@ -1212,7 +1302,7 @@ async function drive(name: typeof plans[number], repository: typeof repositories
         launchedBackgrounds = true;
         for (const dispatch of script.backgroundDispatches ?? []) {
           const operation = background(dispatch);
-          operation.catch(() => undefined); // Observed and rethrown by Promise.all below, not an unhandled rejection.
+          operation.catch(error => { backgroundRejection = firstBackgroundRejection(backgroundRejection, error); });
           backgrounds.push(operation);
         }
       }

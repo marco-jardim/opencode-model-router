@@ -88,3 +88,8 @@ is an assertion obligation for 6.1.3, not an expected result to fabricate, excep
 check the ad hoc dispatch's annotation exactly once in the tail and
 that none of its IDs appears among the 24 compiled tasks. Throughput has empty
 injections, four empty QA reports and only clean first-attempt completions (G8).
+
+Fixture erratum (real-host smoke 15 evidence): the ad hoc dispatch is now
+`VERIFY:deferred` with a `testsPass` acceptance check. Under enforcement the
+product has no per-dispatch "none" mode; the old prompt was required and held,
+so it could never produce the expected `Completed since` annotation.

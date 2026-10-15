@@ -29,7 +29,7 @@ export type Injection = Checkpoint & (
 export interface BackgroundDispatch {
   id: string;
   background: boolean;
-  verify: "none" | "required";
+  verify: "none" | "deferred" | "required";
   prompt: string;
   script: TaskScript;
   userAction?: "background-while-running";

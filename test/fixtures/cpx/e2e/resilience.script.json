@@ -141,8 +141,8 @@
     {
       "id": "adhoc-background",
       "background": true,
-      "verify": "none",
-      "prompt": "CPX_E2E_CALL=adhoc-background\nWrite the declared artifact offline.\nWrites: `node-npm/background/adhoc.json`\nReads: none.\nReturn DONE.",
+      "verify": "deferred",
+      "prompt": "CPX_E2E_CALL=adhoc-background\nVERIFY:deferred\nWrite the declared artifact offline.\nWrites: `node-npm/background/adhoc.json`\nReads: none.\n[acceptance]\ncheck: testsPass\ncriteria: the artifact contains complete=true\n[/acceptance]\nReturn DONE.",
       "script": { "durationMs": 6000, "writePath": "node-npm/background/adhoc.json" }
     },
     {
@@ -157,7 +157,7 @@
       "id": "required-held",
       "background": true,
       "verify": "required",
-      "prompt": "CPX_E2E_CALL=required-held\nVERIFY:required\nWrite the declared artifact offline.\nWrites: `node-npm/background/held.json`\nReads: none.\n[acceptance]\ncheck: fileExists path=node-npm/background/held.json\ncriteria: the artifact contains complete=true\n[/acceptance]\nReturn DONE.",
+      "prompt": "CPX_E2E_CALL=required-held\nVERIFY:required\nWrite the declared artifact offline.\nWrites: `node-npm/background/held.json`\nReads: none.\n[acceptance]\ncriteria: node-npm/background/held.json contains complete=true\n[/acceptance]\nReturn DONE.",
       "script": { "durationMs": 8000, "writePath": "node-npm/background/held.json" },
       "holdVerdictUntil": "context-and-compaction-placeholder-observed"
     }

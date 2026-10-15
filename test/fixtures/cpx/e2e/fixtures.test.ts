@@ -6,6 +6,8 @@ import { describe, expect, it } from "vitest";
 import { parsePlan } from "../../../../src/executor/compile/parse";
 import { Reach } from "../../../../src/executor/compile/edges";
 import { isFindingsReport } from "../../../../src/executor/types";
+import { buildDelegationDoD } from "../../../../src/verify/dispatch";
+import { createVerificationWiring } from "../../../../src/verify/wiring";
 import { compileOpts, makeHarness, planPathOf } from "../plans/harness";
 import { loadScript, scriptedTurns, type PlanScript, type TaskScript } from "./scripts";
 
@@ -212,18 +214,47 @@ describe("offline critical-path e2e fixtures", () => {
       expect(script.tasks[call.id]).toBeUndefined();
       expect(call.prompt).toContain(`CPX_E2E_CALL=${call.id}`);
       checkProviderScript(script, call.script);
-      if (call.verify === "required") {
-        expect(call.prompt).toContain("VERIFY:required");
-        expect(call.prompt).toContain(`check: fileExists path=${call.script.writePath}`);
-      }
+      expect(call.prompt).toContain(`VERIFY:${call.verify}`);
     }
     expect(new Set(calls.map((call) => call.script.writePath)).size).toBe(3);
-    expect(calls[0].background).toBe(true);
+    expect(calls[0]).toMatchObject({ background: true, verify: "deferred" });
+    expect(calls[0].prompt).toMatch(/^check: testsPass$/m);
     expect(calls[1]).toMatchObject({ background: false, verify: "required", userAction: "background-while-running" });
+    expect(calls[1].prompt).toContain(`check: fileExists path=${calls[1].script.writePath}`);
     expect(calls[2]).toMatchObject({ background: true, verify: "required", holdVerdictUntil: "context-and-compaction-placeholder-observed" });
+    expect(calls[2].prompt).not.toMatch(/^\s*check:/m);
     const held = script.injections.find((injection) => injection.kind === "required-verification")!;
     expect(held.onlyWhen).toEqual(["C4", "C15"]);
     expect(held.otherwise).toBe("foreground");
+  });
+
+  it("classifies every background prompt with the enforced product verifier, not its sidecar label", async () => {
+    const wiring = createVerificationWiring({
+      client: {}, directory: root,
+      getConfig: () => ({
+        activePreset: "fixture", presets: { fixture: { medium: { model: "fixture/offline" } } },
+        defaultTier: "medium", rules: [], enforcement: { verify: { require: "always" } },
+      }),
+    });
+    try {
+      for (const call of loadScript("resilience").backgroundDispatches!) {
+        const dod = buildDelegationDoD({ prompt: call.prompt, description: call.id });
+        const directives = wiring.directivesFor(call.prompt);
+        // Enforcement has no per-dispatch "none": a non-deferred DoD runs the required gate.
+        const actual = wiring.isDeferred(dod, directives) ? "deferred" : "required";
+        expect(actual, call.id).toBe(call.verify);
+        if (call.id === "required-held") {
+          expect(dod.kind).toBe("checker");
+          expect(dod.checks).toEqual([]);
+          expect(dod.criteria).toContain("node-npm/background/held.json contains complete=true");
+        } else {
+          expect(dod.kind, call.id).toBe("deterministic");
+          expect(dod.checks.map(check => check.kind), call.id).toContain(call.id === "adhoc-background" ? "testsPass" : "fileExists");
+        }
+      }
+    } finally {
+      await wiring.disposeVerification();
+    }
   });
 
   it("runs both dependency-free Node suites without provisioning", () => {
