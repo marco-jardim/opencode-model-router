@@ -10,7 +10,7 @@ import { CpxTimings, collectTimingJournal, timedWrapperSource, timingJournalSour
 import { assertG8IdleEpisodes, collectObservationFiles, G8_IDLE_CEILING_MS, reconstructIdleEpisodes, type IdleEpisode } from "./helpers/cpx-idle-oracle";
 import { freezeG8Plan, reconstructG8, workGraph, type GraphEdge, type PhaseGraph } from "./helpers/cpx-g8-oracle";
 import type { CpxRequest } from "./helpers/cpx-scripted-provider";
-import type { ExecutorConfig, ExecutorEvent, LedgerV1 } from "../../src/executor/types";
+import type { Attempt, ExecutorConfig, ExecutorEvent, LedgerV1 } from "../../src/executor/types";
 import { createLedgerStore, createNodeFileSystem } from "../../src/executor/ledger";
 import { detectManagers, planProvision } from "../../src/executor/slots/provision";
 import { isSlotRecord } from "../../src/executor/slots/pool";
@@ -133,6 +133,21 @@ function throwBackgroundRejection(first: BackgroundRejection | undefined): void 
   if (first) throw first.error;
 }
 
+/** Startup recovery is automatic; only an explicitly requested, observed pause permits a user resume. */
+async function resumeObservedPlan(status: LedgerV1["status"], intent: "startup-recovery" | "deliberate-pause", resume: () => Promise<void>): Promise<void> {
+  if (intent === "startup-recovery") return;
+  expect(status, "explicit pause observed before /plan resume").toBe("paused");
+  await resume();
+}
+
+function checkpointRecovered(ledger: LedgerV1, taskId: string, interrupted: Attempt): boolean {
+  const attempts = ledger.tasks[taskId]?.attempts ?? [];
+  const original = attempts.find(attempt => attempt.n === interrupted.n && attempt.childSessionID === interrupted.childSessionID);
+  // A retained `running` status alone is not recovery: the orphan must close and a new child must launch.
+  return ledger.status === "running" && (original?.outcome === "lost" || original?.outcome === "interrupted") && original.endedAt !== null &&
+    attempts.some(attempt => attempt.n > interrupted.n && attempt.childSessionID !== null && attempt.childSessionID !== interrupted.childSessionID);
+}
+
 function planRunningInTail(request: CpxRequest, planId: string): boolean {
   const text = messages(request).filter(tail).map(message => typeof message.content === "string" ? message.content : arr(message.content).map(block => String(obj(block).text ?? "")).join("\n")).join("\n");
   // runtime.planLine: `plan <id>: <done>/<total> done, <count> running, <count> ready`.
@@ -184,6 +199,31 @@ function assertCacheLayout(request: CpxRequest): void {
 }
 
 describe("CPX e2e assertion negative controls", () => {
+  it("startup recovery never invokes resume; deliberate resume requires an observed pause", async () => {
+    const invocations: string[] = [];
+    const resume = async () => { invocations.push("resume"); };
+    await resumeObservedPlan("running", "startup-recovery", resume);
+    await resumeObservedPlan("paused", "startup-recovery", resume);
+    expect(invocations, "automatic recovery does not issue a user resume").toEqual([]);
+    await expect(resumeObservedPlan("running", "deliberate-pause", resume)).rejects.toThrow(/explicit pause observed/);
+    expect(invocations, "requesting a pause is not evidence that it happened").toEqual([]);
+    await resumeObservedPlan("paused", "deliberate-pause", resume);
+    expect(invocations, "resume is invoked only after observing the deliberate pause").toEqual(["resume"]);
+  });
+  it("restart recovery needs a reconciled orphan and a replacement child, not a retained running status", () => {
+    const interrupted: Attempt = { n: 1, nonce: "old", callID: "old-call", childSessionID: "old-child", startedAt: "2026-10-15T00:00:00.000Z", endedAt: null, outcome: null, verdict: null, context: "" };
+    const ledger = (attempts: Attempt[], status: LedgerV1["status"] = "running"): LedgerV1 => ({ status, tasks: { checkpoint: { attempts } } } as unknown as LedgerV1);
+    expect(checkpointRecovered(ledger([interrupted]), "checkpoint", interrupted)).toBe(false);
+    const closed: Attempt = { ...interrupted, endedAt: "2026-10-15T00:00:01.000Z", outcome: "lost" };
+    const replacement = { ...interrupted, n: 2, childSessionID: "replacement-child" };
+    expect(checkpointRecovered(ledger([closed]), "checkpoint", interrupted)).toBe(false);
+    expect(checkpointRecovered(ledger([interrupted, replacement]), "checkpoint", interrupted)).toBe(false);
+    expect(checkpointRecovered(ledger([closed, { ...replacement, childSessionID: null }]), "checkpoint", interrupted)).toBe(false);
+    expect(checkpointRecovered(ledger([closed, { ...replacement, childSessionID: interrupted.childSessionID }]), "checkpoint", interrupted)).toBe(false);
+    expect(checkpointRecovered(ledger([closed, replacement]), "checkpoint", interrupted)).toBe(true);
+    expect(checkpointRecovered(ledger([{ ...closed, outcome: "interrupted" }, replacement]), "checkpoint", interrupted)).toBe(true);
+    expect(checkpointRecovered(ledger([closed, replacement], "paused"), "checkpoint", interrupted)).toBe(false);
+  });
   it("auxiliary requests cannot consume a plan child's scripted write", () => {
     const request: CpxRequest = { index: 0, method: "POST", url: "/v1/messages", headers: { "x-proof-kind": "primary" }, body: { messages: [{ role: "user", content: "[plan p-fixture:1.1.4#1] nonce=fixture" }] } };
     expect(planIdentity(request)).toEqual({ id: "1.1.4", attempt: 1 });
@@ -1280,11 +1320,35 @@ async function drive(name: typeof plans[number], repository: typeof repositories
       observedHeads.add(ledger.integration.head);
       if (restart && checkpoint && !restarted && ledger.tasks["2.1.1"]?.state === "integrated" && ledger.tasks[checkpoint.task]?.state === "running") {
         observations.restartCheckpoint = ledger;
+        const interrupted = ledger.tasks[checkpoint.task]!.attempts.at(-1)!;
+        expect(interrupted.outcome, "G9: checkpoint attempt is still in flight before the crash").toBeNull();
+        expect(interrupted.childSessionID, "G9: checkpoint has an actual child before the crash").not.toBeNull();
         // Do not release the orphan's provider response until its original process has been killed.
         await collectDiagnostics(activeHost, "before-restart");
         await timing.span("host.restart", () => activeHost.restart());
         restarted = true;
-        await command(activeHost, root, `resume ${immutableId}`, { action: "resume", planId: immutableId }, timing);
+        const recovered = await timing.span("host.recovery-wait", () => waitFor("G9 automatic recovery reconciles the checkpoint and launches its replacement", async () => {
+          const current = await store.read(immutableId);
+          recordProgress(current);
+          observations.lastLedger = current;
+          return checkpointRecovered(current, checkpoint.task, interrupted) ? current : undefined;
+        }, Math.min(HOST_SLACK_MS, Math.max(0, hostDeadlineAt - Date.now())), 50));
+        observations.restartRecovery = recovered;
+        const resume = () => command(activeHost, root, `resume ${immutableId}`, { action: "resume", planId: immutableId }, timing);
+        await resumeObservedPlan(recovered.status, "startup-recovery", resume);
+
+        // Separate real-host command coverage, AFTER automatic recovery, never a pause before the crash.
+        await command(activeHost, root, `pause ${immutableId}`, { action: "pause", planId: immutableId }, timing);
+        const paused = await waitFor("explicit post-recovery pause observed before resume", async () => {
+          const current = await store.read(immutableId);
+          return current.status === "paused" ? current : undefined;
+        }, Math.min(HOST_SLACK_MS, Math.max(0, hostDeadlineAt - Date.now())), 50);
+        observations.explicitPause = paused;
+        await resumeObservedPlan(paused.status, "deliberate-pause", resume);
+        observations.explicitResume = await waitFor("explicit post-recovery resume observed running", async () => {
+          const current = await store.read(immutableId);
+          return current.status === "running" ? current : undefined;
+        }, Math.min(HOST_SLACK_MS, Math.max(0, hostDeadlineAt - Date.now())), 50);
       }
       if (human && !humanAnswered) {
         const questions = ledger.inbox.filter(item => item.kind === "question" && item.taskId === human.task);
