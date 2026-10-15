@@ -1226,16 +1226,19 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
   }
 
   async function acquireSlot(
-    claim: () => Promise<{ slot: string; mode: ClaimMode }>, spec: AcquireSpec,
+    claim: (base: string) => Promise<{ slot: string; mode: ClaimMode }>, spec: Omit<AcquireSpec, "base">,
+    baseLookup: Promise<string>,
   ): Promise<SlotAcquisition> {
     assertLive();
     observe("slot-acquire-start", () => ({ kind: spec.kind, taskId: taskIdOf(spec.owner) }));
     const scheduled = await poolLock.run(async () => {
       try {
-        const { slot, mode } = await claim();
+        // Queued on the pool mutex before awaiting this caller's lookup, so lookup timing cannot reorder claims.
+        const base = await baseLookup;
+        const { slot, mode } = await claim(base);
         observe("slot-claim", () => ({ slot, kind: spec.kind, taskId: taskIdOf(spec.owner), mode }));
         // Queued on the slot mutex before the pool mutex is released, so nothing runs on this slot ahead of the claim.
-        return { run: slotLock(slot).run(() => work(slot, mode, spec)) };
+        return { run: slotLock(slot).run(() => work(slot, mode, { ...spec, base })) };
       } catch (error) {
         observe("slot-acquire-result", () => ({ slot: null, kind: spec.kind, taskId: taskIdOf(spec.owner), mode: null,
           result: errorCode(error) === "E_SLOT_UNAVAILABLE" ? "unavailable" : "failed" }));
@@ -1503,15 +1506,17 @@ export function createSlotPool(d: SlotPoolDeps): OpenSlotPool {
         throw new ExecutorError("E_INVALID_INPUT", "owner must be 1-128 printable characters", { length: typeof owner === "string" ? owner.length : -1 });
       }
       assertLive();
-      const base = await d.git.revParse(d.toplevel, baseCommit);
-      return acquireSlot(() => claimTask(owner, base), { kind: "task", owner, base });
+      const baseLookup = d.git.revParse(d.toplevel, baseCommit);
+      void baseLookup.catch(() => {}); // A lookup can reject while its claim is still queued.
+      return acquireSlot(base => claimTask(owner, base), { kind: "task", owner }, baseLookup);
     },
     async acquireSpecial(planId, kind) {
       if (planId !== d.planId) throw new ExecutorError("E_INVALID_INPUT", "plan id differs from the pool's plan", { planId: String(planId).slice(0, 80) });
       if (kind !== "integration" && kind !== "ci") throw new ExecutorError("E_INVALID_INPUT", "kind must be integration or ci", { kind: String(kind).slice(0, 40) });
       assertLive();
-      const base = await d.git.revParse(d.toplevel, "HEAD");
-      return acquireSlot(() => claimSpecial(kind, base), { kind, owner: kind, base });
+      const baseLookup = d.git.revParse(d.toplevel, "HEAD");
+      void baseLookup.catch(() => {}); // A lookup can reject while its claim is still queued.
+      return acquireSlot(base => claimSpecial(kind, base), { kind, owner: kind }, baseLookup);
     },
     reset,
     noteCommit,

@@ -237,6 +237,13 @@ function autoClock(start = Date.parse("2026-10-11T00:00:00.000Z")): Clock & { ti
 
 const unused = async (): Promise<never> => { throw new Error("not used by the pool"); };
 
+function deferred<T>(): { promise: Promise<T>; resolve(value: T): void; reject(error: unknown): void } {
+  let resolve: (value: T) => void = () => undefined;
+  let reject: (error: unknown) => void = () => undefined;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
 interface FakeGit extends GitOps {
   log: string[];
   heads: Map<string, string>;
@@ -774,6 +781,82 @@ describe("QA-5.1-22: gc-only handle and the purge's empty plan directory", () =>
 });
 
 describe("SlotPool concurrency", () => {
+  it.each([false, true])("claims four concurrent acquisitions in call order when base lookups finish in reverse (special slots=%s)", async (specials) => {
+    const h = harness({ maxParallel: 4 });
+    await h.pool.open();
+    const bases = [C1, C2, C3, "4".repeat(40)];
+    const lookups = bases.map(() => deferred<string>());
+    const owners = specials ? ["integration", "owner-2", "ci", "owner-4"] : ["owner-1", "owner-2", "owner-3", "owner-4"];
+    const slots = specials ? ["integration", "slot-1", "ci", "slot-2"] : ["slot-1", "slot-2", "slot-3", "slot-4"];
+    const revParse = h.git.revParse.bind(h.git);
+    let calls = 0;
+    h.git.revParse = (cwd, rev) => cwd === TOP ? lookups[calls++]!.promise : revParse(cwd, rev);
+    const attempts = owners.map(owner => owner === "integration" || owner === "ci"
+      ? h.pool.acquireSpecial(PLAN, owner) : h.pool.acquire(PLAN, owner, C1));
+    const settled = Promise.allSettled(attempts);
+    try {
+      expect(calls).toBe(4); // Every lookup starts eagerly, even behind the first pending claim.
+      for (let n = lookups.length - 1; n >= 0; n--) {
+        lookups[n]!.resolve(bases[n]!);
+        await new Promise<void>(resolve => { setImmediate(resolve); });
+      }
+      expect(await settled).toEqual(owners.map((owner, n) => ({ status: "fulfilled", value: expect.objectContaining({
+        slot: slots[n], owner, commit: bases[n],
+      }) })));
+      expect(h.fs.markerWrites.map(text => JSON.parse(text) as SlotRecord).filter(r => r.state === "creating")
+        .map(r => r.owner)).toEqual(owners);
+      for (const [n, slot] of slots.entries()) expect(h.marker(slot)).toMatchObject({ state: "leased", owner: owners[n], commit: bases[n] });
+    } finally {
+      lookups.forEach((lookup, n) => { lookup.resolve(bases[n]!); });
+      await settled;
+      h.pool.close();
+    }
+  });
+
+  it.each(["task", "special"] as const)("handles a queued %s lookup rejection without affecting the next claimer or emitting an unhandled rejection", async (kind) => {
+    const h = harness({ maxParallel: 2 });
+    await h.pool.open();
+    const lookups = Array.from({ length: 3 }, () => deferred<string>());
+    const revParse = h.git.revParse.bind(h.git);
+    let calls = 0;
+    h.git.revParse = (cwd, rev) => cwd === TOP ? lookups[calls++]!.promise : revParse(cwd, rev);
+    const failure = new ExecutorError("E_GIT", "base lookup failed", { op: "rev-parse", code: 128, stderr: "unknown commit" });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (error: unknown): void => { unhandled.push(error); };
+    process.on("unhandledRejection", onUnhandled);
+    const attempts = [
+      h.pool.acquire(PLAN, "first", C1),
+      kind === "task" ? h.pool.acquire(PLAN, "bad", C2) : h.pool.acquireSpecial(PLAN, "integration"),
+      h.pool.acquire(PLAN, "next", C3),
+    ];
+    const settled = Promise.allSettled(attempts);
+    try {
+      expect(calls).toBe(3);
+      lookups[1]!.reject(failure); // Rejected before the pool mutex reaches this caller's lookup.
+      lookups[2]!.resolve(C3);
+      await new Promise<void>(resolve => { setImmediate(resolve); });
+      expect(unhandled).toEqual([]);
+      expect(await h.pool.list()).toEqual([]); // Neither queued caller can overtake the first lookup.
+      lookups[0]!.resolve(C1);
+      expect(await settled).toEqual([
+        { status: "fulfilled", value: expect.objectContaining({ slot: "slot-1", owner: "first", commit: C1 }) },
+        { status: "rejected", reason: failure },
+        { status: "fulfilled", value: expect.objectContaining({ slot: "slot-2", owner: "next", commit: C3 }) },
+      ]);
+      await expect(attempts[1]).rejects.toBe(failure); // Preserve the original error object, code and git detail.
+      await new Promise<void>(resolve => { setImmediate(resolve); });
+      expect(unhandled).toEqual([]);
+      expect((await h.pool.list()).map(r => ({ slot: r.slot, state: r.state, owner: r.owner }))).toEqual([
+        { slot: "slot-1", state: "leased", owner: "first" }, { slot: "slot-2", state: "leased", owner: "next" },
+      ]);
+    } finally {
+      lookups.forEach(lookup => { lookup.resolve(C1); });
+      await settled;
+      process.off("unhandledRejection", onUnhandled);
+      h.pool.close();
+    }
+  });
+
   it("8 acquires on 4 slots: 4 succeed with distinct slots, 4 are refused as unavailable", async () => {
     const h = harness({ maxParallel: 4 });
     await h.pool.open();

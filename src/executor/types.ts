@@ -1389,7 +1389,7 @@ export interface SlotAcquisition extends SlotLease {
 
 /** Pool of provisioned git worktrees (2.4). */
 export interface SlotPool {
-  /** Never waits: a reset, provisioned slot leased to `owner`, or E_SLOT_UNAVAILABLE. Concurrent calls are serialized; never double-leases.
+  /** Never waits: a reset, provisioned slot leased to `owner`, or E_SLOT_UNAVAILABLE. Concurrent calls are claimed in call order; never double-leases.
    *  A task that already holds a slot gets the same slot back. err E_SLOT_UNAVAILABLE, E_PROVISION, E_SLOT_BROKEN */
   acquire(planId: PlanId, owner: string, baseCommit: string): Promise<SlotAcquisition>;
   acquireSpecial(planId: PlanId, kind: "integration" | "ci"): Promise<SlotAcquisition>;

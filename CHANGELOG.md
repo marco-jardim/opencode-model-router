@@ -115,6 +115,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OpenCode v2: plan slots are claimed in launch-priority order.** A slot acquisition took its place in the pool's
+  queue only after its own `git rev-parse` returned, so the highest-priority task could claim the last slot and wait
+  behind every other slot's provisioning. Claims now queue in call order and await their base lookup inside the claim.
 - **OpenCode v2: after a host restart, the executor requeues a plan child at once when its launching process is
   provably gone.** It records each child's launcher (pid, hostname, per-process token); recovery treats a child as lost
   without the 60 s liveness probation only when that process is dead on this host (host contract C16). Every other case

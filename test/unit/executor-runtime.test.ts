@@ -2417,6 +2417,86 @@ describe("launch slot preparation", () => {
 });
 
 describe("physical slot admission", () => {
+  it("preserves ready priority through reverse base lookups, FIFO provisioning and the first launch", async () => {
+    const rows: ObservationRecord[] = [];
+    const sink = createV2Observations({ write: line => { rows.push(JSON.parse(line)); } });
+    // Distinct estimates, with the highest-priority task last in plan order.
+    const h = await mk(planOf([1, 2, 3, 4].map(n => task(`T${n}`, {
+      estimate: { p50: n * 100, p90: n * 200, source: "default" },
+    })), { config: { maxParallel: 4 } }), sink);
+    const { pool, git, provisioner } = await physicalPool(h, 4);
+    const readyOrder = ["T4", "T3", "T2", "T1"];
+    const lookups = readyOrder.map(() => deferred<void>());
+    const releases = readyOrder.map(() => deferred<void>());
+    const handoffs = readyOrder.map(() => deferred<void>());
+    const resolvedLookups: string[] = [], queued: string[] = [], provisioning: string[] = [];
+    const revParse = git.revParse.bind(git);
+    let lookupCalls = 0;
+    git.revParse = async (path, rev) => {
+      if (path === REPO && rev === SHA && lookupCalls < lookups.length) {
+        const n = lookupCalls++;
+        await lookups[n]!.promise;
+        resolvedLookups.push(readyOrder[n]!);
+      }
+      return revParse(path, rev);
+    };
+    // Hand fake git work to provisioning in worktreeAdd call order; unrelated marker fsync timing is not this race.
+    const worktreeAdd = git.worktreeAdd.bind(git);
+    let creationTail = Promise.resolve(), creationCalls = 0;
+    git.worktreeAdd = (...args) => {
+      const n = creationCalls++;
+      const run = creationTail.then(() => worktreeAdd(...args));
+      creationTail = run.then(() => handoffs[n]!.promise);
+      return run;
+    };
+    // Model the machine-wide installer mutex: FIFO entry, one explicitly released install at a time.
+    let provisionTail = Promise.resolve();
+    provisioner.detect = async () => ({ managers: ["pip"], manifests: {}, yarnBerry: false, editable: false, python: null });
+    provisioner.provision = path => {
+      handoffs[queued.length]!.resolve();
+      queued.push(path);
+      const run = provisionTail.then(async () => {
+        const n = provisioning.length;
+        provisioning.push(path);
+        await releases[n]!.promise;
+      });
+      provisionTail = run;
+      return run;
+    };
+    try {
+      const acquire = vi.spyOn(pool, "acquire");
+      await h.begin();
+      await until(() => lookupCalls === 4, "all priority-ordered acquisitions started their base lookups");
+      sink.flush();
+      expect(rows.filter(r => r.family === "scheduler" && r.action === "launch-gate")).toContainEqual(expect.objectContaining({
+        state: expect.objectContaining({ detail: { ok: true, ready: readyOrder } }),
+      }));
+      expect(acquire.mock.calls.map(([, owner]) => owner)).toEqual(readyOrder.map(id => `plan:${PLAN_ID}:${id}`));
+      // On the old code these completions queue T1's claim first: T4 gets slot-4 and the last installer turn.
+      for (const lookup of [...lookups].reverse()) {
+        lookup.resolve();
+        await new Promise<void>(resolve => { setImmediate(resolve); });
+      }
+      expect(resolvedLookups).toEqual([...readyOrder].reverse()); // The top task's lookup really finished last.
+      await until(() => queued.length === 4 && provisioning.length === 1, "four claims queued behind the FIFO installer");
+      const topSlot = need(await pool.get("slot-1"), "highest-priority slot");
+      expect(topSlot).toMatchObject({ owner: `plan:${PLAN_ID}:T4`, state: "provisioning" });
+      expect((await pool.list()).map(r => r.owner)).toEqual(readyOrder.map(id => `plan:${PLAN_ID}:${id}`));
+      expect(queued[0]).toBe(topSlot.path);
+      expect(provisioning).toEqual([topSlot.path]);
+      expect(h.launcher.runs).toEqual([]);
+      releases[0]!.resolve();
+      await until(() => h.launcher.runs.length === 1, "first launch after releasing only one provision");
+      expect(h.launcher.runs.map(run => run.req.taskId)).toEqual(["T4"]);
+      expect(h.launcher.runs[0]!.req.workRoot).toBe(topSlot.path);
+    } finally {
+      lookups.forEach(lookup => { lookup.resolve(); });
+      releases.forEach(release => { release.resolve(); });
+      handoffs.forEach(handoff => { handoff.resolve(); });
+      await h.close(); sink.close(); pool.close();
+    }
+  });
+
   it("does not consume a release wake while the abandoning launch step is still in flight", async () => {
     const rows: ObservationRecord[] = [];
     const sink = createV2Observations({ write: line => { rows.push(JSON.parse(line)); } });
@@ -2506,7 +2586,7 @@ describe("physical slot admission", () => {
       git.revParse = async (path, rev) => {
         if (!entered && path === REPO && rev === SHA) {
           entered = true;
-          await lookup.promise; // The highest-priority claim has not reached the pool mutex yet.
+          await lookup.promise; // Hold the highest-priority acquisition in its base lookup.
         }
         return revParse(path, rev);
       };
