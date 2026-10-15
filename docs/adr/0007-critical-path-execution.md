@@ -1,6 +1,6 @@
 # ADR 0007 — Critical-Path Execution
 
-> **Status:** Accepted (measurements pending Phase 6.1) **Date:** 2026-10-10, revised 2026-10-11 **Wave/Phase:** Critical-Path Execution, Phase 0.1 (tasks 0.1.4, 0.1.FIX)
+> **Status:** Accepted **Date:** 2026-10-15 (original 2026-10-10, revised 2026-10-11) **Wave/Phase:** Critical-Path Execution, Phase 6.1 documentation finalization
 > **Supersedes:** none **Depends on:** ADR 0002 (acceptance gate), ADR 0005 (cost-aware routing engine), ADR 0006 (role × tier × assurance delegation)
 > **Deciders:** owner (Marco Jardim); host observations, adversarial QA round 1 (QA-0.1-1 … QA-0.1-16) and its fixes are recorded in the Phase 0.1 report (`docs/qa/critical-path-execution/phase-0.1.md`)
 > **Plan:** [`../plans/critical-path-execution-plan.md`](../plans/critical-path-execution-plan.md) (amendments A-0.1-2 and A-0.1-3 apply this revision) **Handover:** [`../plans/critical-path-execution-handover.md`](../plans/critical-path-execution-handover.md)
@@ -846,8 +846,10 @@ Each phase implements only the branch named here (plan §0.2).
 
 Phases 2.2, 2.3, 2.4 and 3.2 have no host-contract branch. All hooks are registered on v2 only, in
 `src/compat/v2-hooks.ts`: 2.1 adds the context, compaction, tool and event wiring, and 3.1 adds the retry hook and the
-launch wiring. Phase 5.1 assembles and registers the executor. Phase 6.1 produces the measurements that change this
-ADR's status, and 6.2.0 records the retained-context age proven under DF-2.
+launch wiring. Phase 5.1 assembles and registers the executor. The ADR is Accepted as of 2026-10-15; this accepts the
+decisions, not every global criterion or Phase 6.1 itself. Phase 6.2.0 adds the measured results and retained-context
+age evidence. The Phase 6.2 PR discloses G8's measured bound, unmet G13 and the real-use soak's evidence and gaps under
+plan amendment A-6.1-3; absence of evidence is not a pass.
 
 ## Open observations
 

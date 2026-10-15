@@ -4025,6 +4025,9 @@ documentation. The dogfood comparison (§0.12-5) is written in 6.2.0.
     60 s setup; post-compilation `1.3 × max(CP, W/p, entries × 5 s) + 60 s`, with a 300 s ceiling. This is a harness
     watchdog, not additive slack in G8; authored durations remain strict.
   - 6.1.3.b Assert G1–G12 (§5.1) with measured numbers taken from the ledger's metric events:
+    *Amended by A-6.1-3 (owner decision 2026-10-15):* the remaining `unmeasured` smoke subcases are accepted through
+    the real-use soak and gap disclosures in the amendment log, not new synthetic smoke scenarios. G5 stays with 2.3
+    and G12's full matrix with 6.2. Absence of evidence is never a pass.
     - *Amended by A-6.1-2 (owner decision 2026-10-15):* reconstruct and record makespan, CP_eff, W_auth/p, ΣI_service,
       the A-6.1-1 bound, makespan/bound ratio and whether the bound was met; the makespan bound is a measured, disclosed
       metric, not a Phase 6.1 acceptance gate. Disclose these alongside G13 in the Phase 6.2 PR. W_auth and task work
@@ -4046,15 +4049,18 @@ documentation. The dogfood comparison (§0.12-5) is written in 6.2.0.
   [acceptance]
   cwd: D:\git\omr-cpx-p61
   check: buildPasses
-  criteria: npm run smoke:cpx:e2e (orchestrator shell) is green three consecutive runs; every G1–G12 has an assertion that can fail
+  criteria: npm run smoke:cpx:e2e (orchestrator shell) is green three consecutive runs; every G1–G12 has an assertion that can fail, subject to A-6.1-3's real-use soak and disclosed gaps for the remaining unmeasured subcases
   [/acceptance]
 - **6.1.4** Orchestrator: run the end-to-end smoke on the integrated 6.1 code. Create `D:\git\omr-cpx-e2e` with
   `git -C D:\git\omr-cpx-main worktree add --detach D:\git\omr-cpx-e2e <integration head>` (under DF-2 the head comes
-  from `router_plan action=status`; under the fallback, `cpx/p61`), run `npm ci`, run `npm run smoke:cpx:e2e` three
-  times there, record the Appendix D metrics in the report (under DF-2: in
+  from `router_plan action=status`; under the fallback, `cpx/p61`), run `npm ci`, run `npm run smoke:cpx:e2e` **once**
+  there, record the Appendix D metrics in the report (under DF-2: in
   `$env:LOCALAPPDATA\omr-cpx\handover-df2.md`, per the freeze rule), then remove the worktree. Green: under DF-2 report
   `router_plan action=done task=6.1.4`. Red: `router_plan action=add-tasks` with a fix task that 6.1.4 depends on (or a
   fix in `D:\git\omr-cpx-p61` under the fallback), then rerun.
+  *Amended by A-6.1-3 (owner decision 2026-10-15):* this single detached run catches environment leakage on a clean
+  checkout (dependencies outside the lockfile, untracked files); runs 19–23 already proved the same code three
+  consecutive times in the working worktree. It is not another three-run repeatability gate.
   Writes: none. Reads: `D:\git\omr-cpx-e2e\`.
 - **6.1.5** [tier:medium] VERIFY:required Documentation.
   [route class=implement risk=low scope=multi needs=edit,shell d=deterministic root=D:\git\omr-cpx-p61 tier=medium pin]
@@ -4112,7 +4118,8 @@ documentation. The dogfood comparison (§0.12-5) is written in 6.2.0.
 Edge cases are those listed in 6.1.2.
 
 **Acceptance criteria:**
-- G1–G12 asserted green in three consecutive runs.
+- G1–G12 asserted green in three consecutive working-worktree runs, with the remaining `unmeasured` subcases governed
+  by A-6.1-3's real-use soak, retained 2.3/6.2 assignments and disclosed gaps; no absent evidence counts as a pass.
 - Docs complete and pinned.
 - The ADR is final.
 
@@ -4650,5 +4657,29 @@ Node ≥ 22.18; DF-2 switch procedure and the 24 h pending TTL from DF-1; QA tas
   that every G1–G12 has an assertion that can fail remains true: G8 retains its idle and evidence-integrity assertions.
   `assertG8Bound` remains a diagnostic predicate and unit-test helper, not a throughput acceptance gate.
   Recorded in `docs\qa\critical-path-execution\phase-6.1.md`, "Owner amendment A-6.1-2 — 2026-10-15".
+
+- **A-6.1-3** (Phase 6.1, owner decision **2026-10-15**) — **One clean-checkout smoke and real-use soak.** Applies to
+  6.1.3's remaining `unmeasured` subcases and 6.1.4; does not replace the green working-worktree runs or assert phase
+  acceptance.
+
+  > 6.1.4 runs `npm run smoke:cpx:e2e` **once**, not three times, in the detached worktree after `npm ci`. Its purpose
+  > is to catch environment leakage (dependencies outside the lockfile, untracked files) on a clean checkout, since
+  > runs 19–23 already proved the same code three consecutive times in the working worktree.
+
+  The smoke subcases still listed as `unmeasured` — G1 sampled/prior/off, G2 capture counters, G3 FAIL + forced C15
+  fallback, G5 frozen largest plans, G6 shared-tree read/search/run + deferred plugin verification, G8 idle telemetry
+  completeness, G9 non-plan pending verification across restart, G11 usage-limit pause, G12 full CI and smokes — are
+  not accepted by new synthetic smoke scenarios. Acceptance uses a **soak in real use**:
+
+  - At least **5 working days**, with `MODEL_ROUTER_V2_OBSERVATIONS` enabled on real plans, analysed offline by
+    `scripts\soak-analyze.mjs`.
+  - Each observable criterion (**G1, G2, G6, G8, G9**) needs at least **3 observed occurrences and zero violations**.
+  - Criteria not observed in the window (expected: **G3, G11**) are declared gaps disclosed in the **Phase 6.2 PR**
+    alongside **G13 and G8's bound**. **G5 stays assigned to 2.3** and **G12's full matrix to 6.2**, as before.
+  - The soak also supplies executor dogfood evidence toward G13; **G13 stays unmet until the owner decides**.
+  - The owner may change the soak criteria; **absence of evidence is never a pass**.
+
+  Recorded in `docs\qa\critical-path-execution\phase-6.1.md`, "Owner amendment A-6.1-3 — 2026-10-15". Earlier dated
+  three-detached-run and mandatory-synthetic-subcase statements are historical, superseded by this decision.
 
 **Owner execution rules for the implementation session** — §0.14 (continuous iteration, momentary takeover, atomic delegation with [tier:heavy] for complex coding and lighter test runs, bounded QA rounds, pre-flight fix-or-document, Linear not used, worktree reporting), the testing policy (§0.6-9: scoped, accelerated, full suite only in 6.2), the bounded executor QA loop (default 3 rounds), and the handover's kickoff prompt.

@@ -434,17 +434,45 @@ function executorLeafKeys(defaults: Record<string, unknown>, prefix = ""): strin
   return keys;
 }
 
+/** Parse the actual /plan dispatch switch as well as its help, so a parser-only addition cannot escape the pin. */
+function planParserSubcommands(source: string): string[] {
+  const body = /switch \(sub\) \{([\s\S]*?)\n  \}/.exec(source)?.[1] ?? "";
+  return [...body.matchAll(/^\s*case "([a-z][a-z-]*)":/gm)].map((m) => m[1]!);
+}
+
+/** The private config allowlist, read as source (not evaluated); recurse into blocks such as circuitBreaker. */
+function executorKnownLeafKeys(source: string): string[] {
+  const known = /const ROUTING_KNOWN_KEYS[^=]*= \{([\s\S]*?)\n\};/.exec(source)?.[1] ?? "";
+  const block = (name: string): string[] => {
+    const body = new RegExp(`(?:^|\\n)  ${name}: \\[([^\\]]*)\\]`).exec(known)?.[1] ?? "";
+    return [...body.matchAll(/"([A-Za-z][A-Za-z0-9]*)"/g)].map((m) => m[1]!);
+  };
+  const leaves = (name: string, prefix = ""): string[] => block(name).flatMap((key) =>
+    block(key).length > 0 ? leaves(key, `${prefix}${key}.`) : [`${prefix}${key}`],
+  );
+  return leaves("executor");
+}
+
+const executorDefaultKeys = executorLeafKeys(ROUTING_DEFAULTS.executor as unknown as Record<string, unknown>);
+const executorKnownKeys = executorKnownLeafKeys(read("src/router/config.ts"));
+const executorParserCommands = planParserSubcommands(read("src/executor/command.ts"));
+const executorDocSurface = {
+  commands: [...new Set([...planSubcommands(PLAN_HELP_LINES), ...executorParserCommands])],
+  actions: ROUTER_PLAN_ACTIONS as readonly string[],
+  keys: [...new Set([...executorDefaultKeys, ...executorKnownKeys])],
+};
+
 /** What `doc` lacks of the plan executor surface: one entry per missing command, action or config key. */
-function executorDocProblems(doc: string): string[] {
+function executorDocProblems(doc: string, surface = executorDocSurface): string[] {
   const problems: string[] = [];
-  for (const sub of planSubcommands(PLAN_HELP_LINES)) {
+  for (const sub of surface.commands) {
     if (!doc.includes(`| \`/plan ${sub}`)) problems.push(`/plan ${sub}`);
   }
-  for (const action of ROUTER_PLAN_ACTIONS) {
+  for (const action of surface.actions) {
     if (!doc.includes(`| \`${action}\` |`)) problems.push(`router_plan action ${action}`);
   }
-  for (const key of executorLeafKeys(ROUTING_DEFAULTS.executor as unknown as Record<string, unknown>)) {
-    if (!doc.includes(`\`routing.executor.${key}\``)) problems.push(`routing.executor.${key}`);
+  for (const key of surface.keys) {
+    if (!doc.includes(`| \`routing.executor.${key}\` |`)) problems.push(`routing.executor.${key}`);
   }
   return problems;
 }
@@ -458,6 +486,11 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     );
     expect(ROUTER_PLAN_ACTIONS.length).toBeGreaterThanOrEqual(16);
     expect(executorLeafKeys(ROUTING_DEFAULTS.executor as unknown as Record<string, unknown>)).toContain("circuitBreaker.minAttempts");
+    expect(executorParserCommands.length).toBeGreaterThan(0);
+    expect([...executorParserCommands].sort()).toEqual(planSubcommands(PLAN_HELP_LINES).sort());
+    expect(executorKnownKeys.length).toBeGreaterThan(0);
+    expect([...executorKnownKeys].sort()).toEqual([...executorDefaultKeys].sort());
+    expect(read("src/executor/tool.ts")).toContain("action: tool.schema.enum(ROUTER_PLAN_ACTIONS)");
   });
 
   it("names every /plan subcommand, router_plan action and routing.executor key", () => {
@@ -472,6 +505,59 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
     expect(executorDocProblems(doc.replaceAll("`routing.executor.circuitBreaker.minAttempts`", "`x`"))).toContain(
       "routing.executor.circuitBreaker.minAttempts",
     );
+  });
+
+  it("detects deletion of every source-derived command, action and config table row", () => {
+    const missingRow = (prefix: string) => doc.split(/\r?\n/).filter((line) => !line.startsWith(prefix)).join("\n");
+    for (const sub of executorDocSurface.commands) {
+      expect(executorDocProblems(missingRow(`| \`/plan ${sub}`)), sub).toEqual([`/plan ${sub}`]);
+    }
+    for (const action of executorDocSurface.actions) {
+      expect(executorDocProblems(missingRow(`| \`${action}\` |`)), action).toEqual([`router_plan action ${action}`]);
+    }
+    for (const key of executorDocSurface.keys) {
+      expect(executorDocProblems(missingRow(`| \`routing.executor.${key}\` |`)), key).toEqual([`routing.executor.${key}`]);
+    }
+  });
+
+  it("detects additions to each code surface and extracts nested known keys and parser cases", () => {
+    expect(planParserSubcommands('switch (sub) {\n    case "new-command":\n  }')).toEqual(["new-command"]);
+    expect(executorKnownLeafKeys('const ROUTING_KNOWN_KEYS = {\n  executor: ["newKey", "nested"],\n  nested: ["leaf"],\n};'))
+      .toEqual(["newKey", "nested.leaf"]);
+    expect(executorDocProblems(doc, {
+      commands: [...executorDocSurface.commands, "new-command"],
+      actions: [...executorDocSurface.actions, "new-action"],
+      keys: [...executorDocSurface.keys, ...executorLeafKeys({ newBlock: { newKey: null } })],
+    })).toEqual(["/plan new-command", "router_plan action new-action", "routing.executor.newBlock.newKey"]);
+  });
+
+  it("pins the final safety model, Windows notes, metrics and next-plan checklist", () => {
+    const safety = sectionOf(doc, "## Safety model");
+    for (const id of ["I1", "I2", "I3", "I4", "I5"]) expect(safety).toContain(`| **${id}** |`);
+    expect(safety.replace(/\s+/g, " ")).toContain("claimed in that launch-priority order");
+    const windows = sectionOf(doc, "## Windows notes");
+    for (const note of ["Same drive", "pnpm store", "UV_CACHE_DIR", "core.longpaths", "260 characters"]) expect(windows).toContain(note);
+    expect(sectionOf(doc, "## Troubleshooting")).toContain("60 s probation");
+    const metrics = sectionOf(doc, "## Metrics and observations");
+    for (const note of ["MODEL_ROUTER_V2_OBSERVATIONS", "dropped=failed=0", "g8Ratio = makespan/bound", "10,000 ms", "not a Phase 6.1 acceptance gate"]) {
+      expect(metrics).toContain(note);
+    }
+    expect(sectionOf(doc, "## Owner checklist for the next real plan")).toContain("/plan run <path>");
+    expect(sectionOf(read("README.md"), "## Executing plans")).toContain("docs/EXECUTOR.md");
+    expect(read("docs/ROLES.md")).toContain("[the plan executor guide](EXECUTOR.md)");
+  });
+
+  it("pins ADR 0007's Accepted status and D1–D20 decision list against the binding plan", () => {
+    const plan = read("docs/plans/critical-path-execution-plan.md");
+    const expected = [...plan.matchAll(/^\| D(\d+) \|/gm)].map((m) => Number(m[1]));
+    const decisions = (text: string) => [...text.matchAll(/^### D(\d+) — /gm)].map((m) => Number(m[1]));
+    const adr = read("docs/adr/0007-critical-path-execution.md");
+    expect(expected).toEqual(Array.from({ length: 20 }, (_, i) => i + 1));
+    expect(decisions(adr)).toEqual(expected);
+    expect(adr).toContain("**Status:** Accepted **Date:** 2026-10-15");
+    for (const id of expected) {
+      expect(decisions(adr.replace(`### D${id} — `, `### Missing${id} — `)), `missing D${id}`).not.toEqual(expected);
+    }
   });
 
   it("pins the QA-4.1 operator surface: human approval, path rule, --phases format, --plan, attempts, checks, slotsDir", () => {
@@ -714,7 +800,7 @@ describe("docs drift: plan executor (docs/EXECUTOR.md)", () => {
   });
 
   it("has links that resolve", () => {
-    expect(brokenLinks(["docs/EXECUTOR.md", "docs/OPENCODE_V2.md"], readRepo)).toEqual([]);
+    expect(brokenLinks(["docs/EXECUTOR.md", "docs/OPENCODE_V2.md", "docs/ROLES.md", "docs/adr/0007-critical-path-execution.md"], readRepo)).toEqual([]);
   });
 
   it("describes the executor in the changelog as registered on v2 only, v1 maps unchanged (Phase 5.1.2)", () => {

@@ -819,6 +819,11 @@ needs required verification is backgrounded only where its result can be held. A
 select with a thin outcome store gets no `background` key, so the host default applies; with `off` it is sent as
 before (`background: false` for a role-routed call).
 
+For execution of a written plan, see [the plan executor guide](EXECUTOR.md): `/plan` and `router_plan`, human approval,
+isolated slots, [leases and safety invariants](EXECUTOR.md#safety-model), recovery and the
+[owner checklist](EXECUTOR.md#owner-checklist-for-the-next-real-plan). It requires roles mode at start and enforced
+leases; plain role dispatches do not become plan tasks merely by running in the background.
+
 ## File leases
 
 On OpenCode v2 every child session (a role dispatch or a tier dispatch) takes a lease on the files it writes, for as

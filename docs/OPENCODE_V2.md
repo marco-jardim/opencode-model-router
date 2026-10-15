@@ -291,6 +291,9 @@ integrating them one at a time into an always-green integration branch. It is **
 `routing.executor.*` keys (one notice per process). The `router_plan` tool, the `/plan` command and the executor instructions are registered on OpenCode v2 only; OpenCode v1's tool, command and help maps are unchanged.
 See [EXECUTOR.md](EXECUTOR.md) for the concepts, the `/plan` commands, the `router_plan` actions, the
 `routing.executor.*` configuration and the trust rules.
+Start with its [owner checklist](EXECUTOR.md#owner-checklist-for-the-next-real-plan); the guide also covers
+[safety invariants](EXECUTOR.md#safety-model), [Windows provisioning](EXECUTOR.md#windows-notes) and
+[opt-in observations and G8 metrics](EXECUTOR.md#metrics-and-observations).
 
 ## Validation
 

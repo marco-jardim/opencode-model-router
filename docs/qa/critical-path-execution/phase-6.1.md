@@ -457,3 +457,29 @@ longest idle-with-ready episode ≤ 7.1 s (ceiling 10 s).
 
 **Phase 6.1 is not accepted.** Outstanding: two more consecutive green runs at the final head; the mandatory subcases still listed as
 `unmeasured` in the smoke; 6.1.4 (detached worktree, three green runs); 6.1.5 documentation; final heavy phase QA. G13 remains unmet.
+
+## Owner amendment A-6.1-3 — 2026-10-15
+
+The owner amended the remaining evidence obligations on **2026-10-15**. This supersedes the earlier requirements for
+three detached-worktree runs and new synthetic coverage of the `unmeasured` subcases; earlier sections remain dated
+historical evidence. The plan's 6.1.3, 6.1.4 and amendment log record the decision. This is not phase acceptance.
+
+- **6.1.4:** after `npm ci`, run `npm run smoke:cpx:e2e` **once**, not three times, in the detached worktree at the
+  committed integration head (under the fallback, `cpx/p61`). This catches environment leakage on a clean checkout —
+  dependencies outside the lockfile and untracked files — since runs **19–23** already proved the same code three
+  consecutive times in the working worktree. Record the detached result separately; no detached pass is claimed here.
+- The remaining `unmeasured` smoke subcases are **not accepted by new synthetic smoke scenarios**: G1 sampled/prior/off,
+  G2 capture counters, G3 FAIL + forced C15 fallback, G5 frozen largest plans, G6 shared-tree read/search/run + deferred
+  plugin verification, G8 idle telemetry completeness, G9 non-plan pending verification across restart, G11 usage-limit
+  pause, and G12 full CI and smokes.
+- Acceptance uses a **real-use soak of at least 5 working days**, with `MODEL_ROUTER_V2_OBSERVATIONS` enabled on real
+  plans and offline analysis by `scripts\soak-analyze.mjs`. Each observable criterion (**G1, G2, G6, G8, G9**) requires
+  **at least 3 observed occurrences and zero violations**.
+- Criteria not observed in the window (expected: **G3, G11**) are **declared gaps**, disclosed in the **Phase 6.2 PR**
+  alongside **G13 and G8's bound**. **G5 stays assigned to 2.3** and **G12's full matrix to 6.2**, as before.
+- The soak also serves as executor dogfood evidence toward G13. **G13 remains unmet until the owner decides.** The
+  owner may change the soak criteria; **absence of evidence is never a pass**.
+
+The detached check, documentation, soak and final QA are separate evidence obligations. No completed soak, analyzer
+result, fresh smoke result or phase acceptance is claimed by this amendment. No checks were run for this documentation
+update; docs-drift validation belongs to the orchestrator.
